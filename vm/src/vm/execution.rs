@@ -23,7 +23,7 @@ fn run_from_entrypoint(memory: &mut Memory, entrypoint: u32) -> (i32, i32) {
     registers.0[2] = 0xFFFFFFFFu32; // 4GB
     while pc != 0 {
         let next_instruction = memory.0[&pc];
-        let instruction = Instruction::parse(next_instruction);
+        let instruction = Instruction::parse(next_instruction).unwrap();
         run_instruction(&instruction, &mut registers, &mut pc, memory);
     }
     println!("Final Register Values:\n {}", &registers);

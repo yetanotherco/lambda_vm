@@ -9,7 +9,8 @@ const JUMP_AND_LINK_OPCCODE: u32 = 0b1101111;
 const LOAD_UPPER_IMM_OPCODE: u32 = 0b0110111;
 const ADD_UPPER_IMM_TO_PC: u32 = 0b0010111;
 
-enum Opcode {
+#[derive(Debug)]
+pub enum Opcode {
     Arith,
     ArithImm,
     Load,
@@ -22,7 +23,7 @@ enum Opcode {
 }
 
 impl TryFrom<u32> for Opcode {
-    type Error = ();
+    type Error = InstructionError;
 
     fn try_from(value: u32) -> Result<Self, Self::Error> {
         Ok(match value {
@@ -35,7 +36,7 @@ impl TryFrom<u32> for Opcode {
             JUMP_AND_LINK_OPCCODE => Opcode::JumpAndLink,
             LOAD_UPPER_IMM_OPCODE => Opcode::LoadUpperImm,
             ADD_UPPER_IMM_TO_PC => Opcode::AddUpperImmToPc,
-            _ => panic!("Unknown Opcode: {value}"),
+            _ => return Err(InstructionError::UnknownOpcode(value)),
         })
     }
 }
@@ -86,16 +87,16 @@ pub enum LoadStoreWidth {
 }
 
 impl LoadStoreWidth {
-    fn from_func3(func3: u32) -> LoadStoreWidth {
+    fn from_func3(func3: u32) -> Result<Self, InstructionError> {
         const LOAD_STORE_BYTE_WIDTH: u32 = 0x0;
         const LOAD_STORE_HALF_WIDTH: u32 = 0x1;
         const LOAD_STORE_WORD_WIDTH: u32 = 0x2;
-        match func3 {
+        Ok(match func3 {
             LOAD_STORE_BYTE_WIDTH => LoadStoreWidth::Byte,
             LOAD_STORE_HALF_WIDTH => LoadStoreWidth::Half,
             LOAD_STORE_WORD_WIDTH => LoadStoreWidth::Word,
-            _ => panic!("Invalid Width"),
-        }
+            width => return Err(InstructionError::InvalidLoadStoreWidth(width)),
+        })
     }
 }
 
@@ -171,8 +172,8 @@ const I_TYPE_IMM_MASK: u32 = 0x7ff;
 const U_TYPE_IMM_MASK: u32 = 0xfffff000;
 
 impl Instruction {
-    pub fn parse(instruction: u32) -> Instruction {
-        let opcode = parse_opcode(instruction);
+    pub fn parse(instruction: u32) -> Result<Instruction, InstructionError> {
+        let opcode = parse_opcode(instruction)?;
         match opcode.instruction_format() {
             InstructionFormat::R => parse_r_instruction(instruction, opcode),
             InstructionFormat::I => parse_i_instruction(instruction, opcode),
@@ -184,9 +185,9 @@ impl Instruction {
     }
 }
 
-fn parse_opcode(instruction: u32) -> Opcode {
+fn parse_opcode(instruction: u32) -> Result<Opcode, InstructionError> {
     let opcode = instruction & OPCODE_MASK;
-    Opcode::try_from(opcode).unwrap()
+    Opcode::try_from(opcode)
 }
 
 // Function Identifiers (func7 & func3)
@@ -204,13 +205,13 @@ const SLTU_FUNC_IDENTIFIERS: (u32, u32) = (0x3, 0x00);
 // R-Type Instruction Format
 // |func7 | rs2  | rs1  |funct3|  rd |opcode|
 // |31..25|24..20|19..15|14..12|11..7| 6..0 |
-fn parse_r_instruction(instruction: u32, opcode: Opcode) -> Instruction {
+fn parse_r_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, InstructionError> {
     let func7 = (instruction & FUNC7_MASK) >> 25;
     let func3 = (instruction & FUNC3_MASK) >> 12;
     let rs2 = (instruction & RS2_MASK) >> 20;
     let rs1 = (instruction & RS1_MASK) >> 15;
     let rd = (instruction & RD_MASK) >> 7;
-    match opcode {
+    Ok(match opcode {
         Opcode::Arith => {
             let operation = match (func3, func7) {
                 ADD_FUNC_IDENTIFIERS => ArithOp::Add,
@@ -223,7 +224,7 @@ fn parse_r_instruction(instruction: u32, opcode: Opcode) -> Instruction {
                 SRA_FUNC_IDENTIFIERS => ArithOp::ShiftRightArith,
                 SLT_FUNC_IDENTIFIERS => ArithOp::SetLessThan,
                 SLTU_FUNC_IDENTIFIERS => ArithOp::SetLessThanU,
-                _ => panic!("Unknown  arith opcode identifier"),
+                _ => return Err(InstructionError::UnknownOpcodeFuncIdentifier(opcode, func3)),
             };
             Instruction::Arith {
                 dst: rd,
@@ -232,8 +233,8 @@ fn parse_r_instruction(instruction: u32, opcode: Opcode) -> Instruction {
                 op: operation,
             }
         }
-        _ => panic!("Invalid Instruction Encoding"),
-    }
+        _ => return Err(InstructionError::InvalidInstruction),
+    })
 }
 
 // Function Identifiers (func3)
@@ -249,7 +250,7 @@ const SLTU_FUNC_IDENTIFIER: u32 = 0x3;
 // I-Type Instruction Format
 // | imm  | rs1  |funct3|  rd |opcode|
 // |31..20|19..15|14..12|11..7| 6..0 |
-fn parse_i_instruction(instruction: u32, opcode: Opcode) -> Instruction {
+fn parse_i_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, InstructionError> {
     let func3 = (instruction & FUNC3_MASK) >> 12;
     let rs1 = (instruction & RS1_MASK) >> 15;
     let imm = ((instruction >> 20) & I_TYPE_IMM_MASK) as i32;
@@ -260,7 +261,7 @@ fn parse_i_instruction(instruction: u32, opcode: Opcode) -> Instruction {
     };
 
     let rd = (instruction & RD_MASK) >> 7;
-    match opcode {
+    Ok(match opcode {
         Opcode::ArithImm => {
             let operation = match func3 {
                 ADD_FUNC_IDENTIFIER => ArithOp::Add,
@@ -278,12 +279,12 @@ fn parse_i_instruction(instruction: u32, opcode: Opcode) -> Instruction {
                     match func_id {
                         0x00 => ArithOp::ShiftRightLogical,
                         0x20 => ArithOp::ShiftRightArith,
-                        _ => unimplemented!(),
+                        _ => return Err(InstructionError::UnknownSRVariant(func_id)),
                     }
                 }
                 SLT_FUNC_IDENTIFIER => ArithOp::SetLessThan,
                 SLTU_FUNC_IDENTIFIER => ArithOp::SetLessThanU,
-                _ => panic!("Unknown  arith opcode identifier"),
+                _ => return Err(InstructionError::UnknownOpcodeFuncIdentifier(opcode, func3)),
             };
             Instruction::ArithImm {
                 dst: rd,
@@ -294,7 +295,7 @@ fn parse_i_instruction(instruction: u32, opcode: Opcode) -> Instruction {
         }
         Opcode::JumpAndLinkRegister => {
             if func3 != 0x00 {
-                panic!("Invalid JALR Instruction")
+                return Err(InstructionError::InvalidJALR);
             };
             Instruction::JumpAndLinkRegister {
                 base: rs1,
@@ -306,32 +307,32 @@ fn parse_i_instruction(instruction: u32, opcode: Opcode) -> Instruction {
             dst: rd,
             offset: imm,
             base: rs1,
-            width: LoadStoreWidth::from_func3(func3),
+            width: LoadStoreWidth::from_func3(func3)?,
         },
-        _ => panic!("Invalid Instruction Encoding"),
-    }
+        _ => return Err(InstructionError::InvalidInstruction),
+    })
 }
 
 // S-Type Instruction Format
 // imm[11:5] rs2 rs1 funct3 imm[4:0] opcode
 // |imm[11:5]| rs2  | rs1  |funct3|imm[4:0]|opcode|
 // | 31..25  |24..20|19..15|14..12| 11..7  | 6..0 |
-fn parse_s_instruction(instruction: u32, opcode: Opcode) -> Instruction {
+fn parse_s_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, InstructionError> {
     let func7 = (instruction & FUNC7_MASK) >> 25;
     let func3 = (instruction & FUNC3_MASK) >> 12;
     let rs2 = (instruction & RS2_MASK) >> 20;
     let rs1 = (instruction & RS1_MASK) >> 15;
     let rd = (instruction & RD_MASK) >> 7;
     let imm = func7 | rd;
-    match opcode {
+    Ok(match opcode {
         Opcode::Store => Instruction::Store {
             src: rs2,
             offset: imm,
             base: rs1,
-            width: LoadStoreWidth::from_func3(func3),
+            width: LoadStoreWidth::from_func3(func3)?,
         },
-        _ => panic!("Invalid Instruction Encoding"),
-    }
+        _ => return Err(InstructionError::InvalidInstruction),
+    })
 }
 
 // Function Identifiers (func3)
@@ -345,13 +346,13 @@ const BRANCH_GTU_IDENTIFIER: u32 = 0x7;
 // B-Type Instruction Format
 // |imm[12|10:5]| rs2  | rs1  |funct3|imm[4:1|11]|opcode|
 // |    31..25  |24..20|19..15|14..12|  11..7    | 6..0 |
-fn parse_b_instruction(instruction: u32, opcode: Opcode) -> Instruction {
+fn parse_b_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, InstructionError> {
     let func3 = (instruction & FUNC3_MASK) >> 12;
     let rs2 = (instruction & RS2_MASK) >> 20;
     let rs1 = (instruction & RS1_MASK) >> 15;
     let imm =
         ((instruction >> 20) & 0x7e0) | ((instruction >> 7) & 0x1e) | ((instruction & 0x80) << 4);
-    match opcode {
+    Ok(match opcode {
         Opcode::Branch => {
             let comparison = match func3 {
                 BRANCH_EQ_IDENTIFIER => Comparison::Equal,
@@ -360,7 +361,7 @@ fn parse_b_instruction(instruction: u32, opcode: Opcode) -> Instruction {
                 BRANCH_GE_IDENTIFIER => Comparison::GreaterOrEqual,
                 BRANCH_LTU_IDENTIFIER => Comparison::LessThanUnsigned,
                 BRANCH_GTU_IDENTIFIER => Comparison::GreaterOrEqualUnsigned,
-                _ => unimplemented!(),
+                _ => return Err(InstructionError::UnknownOpcodeFuncIdentifier(opcode, func3)),
             };
             Instruction::Branch {
                 src1: rs1,
@@ -369,14 +370,14 @@ fn parse_b_instruction(instruction: u32, opcode: Opcode) -> Instruction {
                 offset: imm,
             }
         }
-        _ => panic!("Unknown Opcode"),
-    }
+        _ => return Err(InstructionError::InvalidInstruction),
+    })
 }
 
 // J-Type Instruction Format
 // |imm[20|10:1|11|19:12] | rd  |opcode|
 // |         31..12       |11..7| 6..0 |
-fn parse_j_instruction(instruction: u32, opcode: Opcode) -> Instruction {
+fn parse_j_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, InstructionError> {
     let imm =
         instruction & 0xff000 | ((instruction & 0x100000) >> 9) | ((instruction >> 20) & 0x7fe);
     let imm: i32 = if (instruction & SIGN_MASK) != 0 {
@@ -385,24 +386,40 @@ fn parse_j_instruction(instruction: u32, opcode: Opcode) -> Instruction {
         imm as i32
     };
     let rd = (instruction & RD_MASK) >> 7;
-    match opcode {
+    Ok(match opcode {
         Opcode::JumpAndLink => Instruction::JumpAndLink {
             dst: rd,
             offset: imm,
         },
-        _ => unimplemented!(),
-    }
+        _ => return Err(InstructionError::InvalidInstruction),
+    })
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum InstructionError {
+    #[error("Unknown Opcode {0:0x}")]
+    UnknownOpcode(u32),
+    #[error("Unknown func3 component {1:0x} for Instruction with Opcode {0:?}")]
+    UnknownOpcodeFuncIdentifier(Opcode, u32),
+    #[error("Invalid instruction encoding")]
+    InvalidInstruction,
+    #[error("Invalid width for Load/Store instruction: {0:0x}")]
+    InvalidLoadStoreWidth(u32),
+    #[error("Unknown ShiftRight variant: {0:0x}")]
+    UnknownSRVariant(i32),
+    #[error("Invalid JALR Instruction: func3 component is not 0x0")]
+    InvalidJALR,
 }
 
 // U-Type Instruction Format
 // |imm[31:12] | rd  |opcode|
 // | 31..12    |11..7| 6..0 |
-fn parse_u_instruction(instruction: u32, opcode: Opcode) -> Instruction {
+fn parse_u_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, InstructionError> {
     let imm = instruction & U_TYPE_IMM_MASK;
     let rd = (instruction & RD_MASK) >> 7;
-    match opcode {
+    Ok(match opcode {
         Opcode::LoadUpperImm => Instruction::LoadUpperImm { dst: rd, imm },
         Opcode::AddUpperImmToPc => Instruction::AddUpperImmToPc { dst: rd, imm },
-        _ => unimplemented!(),
-    }
+        _ => return Err(InstructionError::InvalidInstruction),
+    })
 }
