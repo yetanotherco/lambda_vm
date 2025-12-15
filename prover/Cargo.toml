@@ -4,3 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+lambdaworks-crypto = { git = "https://github.com/lambdaclass/lambdaworks.git" }
+lambdaworks-math = { git = "https://github.com/lambdaclass/lambdaworks.git" }
+stark-platinum-prover = { git = "https://github.com/lambdaclass/lambdaworks.git" }
