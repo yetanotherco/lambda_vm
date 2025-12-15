@@ -64,7 +64,7 @@ impl Opcode {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub enum ArithOp {
     Add,
     Sub,
@@ -78,7 +78,7 @@ pub enum ArithOp {
     SetLessThanU,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum LoadStoreWidth {
     Byte,
     Half,
@@ -99,7 +99,7 @@ impl LoadStoreWidth {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum Comparison {
     Equal,
     NotEqual,
