@@ -155,7 +155,7 @@ pub enum Instruction {
         src1: u32,
         src2: u32,
         cond: Comparison,
-        offset: u32,
+        offset: i32,
     },
     LoadUpperImm {
         dst: u32,
@@ -179,6 +179,7 @@ const U_TYPE_IMM_MASK: u32 = 0xfffff000;
 
 impl Instruction {
     pub fn parse(instruction: u32) -> Instruction {
+        println!("Parsing instruction: 0x{:08x}", instruction);
         let opcode = parse_opcode(instruction);
         match opcode.instruction_format() {
             InstructionFormat::R => parse_r_instruction(instruction, opcode),
@@ -334,7 +335,7 @@ fn parse_i_instruction(instruction: u32, opcode: Opcode) -> Instruction {
 // |imm[11:5]| rs2  | rs1  |funct3|imm[4:0]|opcode|
 // | 31..25  |24..20|19..15|14..12| 11..7  | 6..0 |
 fn parse_s_instruction(instruction: u32, opcode: Opcode) -> Instruction {
-    let func7 = (instruction & FUNC7_MASK) >> 25;
+    let func7 = ((instruction & FUNC7_MASK) >> 25) << 5;
     let func3 = (instruction & FUNC3_MASK) >> 12;
     let rs2 = (instruction & RS2_MASK) >> 20;
     let rs1 = (instruction & RS1_MASK) >> 15;
@@ -366,8 +367,14 @@ fn parse_b_instruction(instruction: u32, opcode: Opcode) -> Instruction {
     let func3 = (instruction & FUNC3_MASK) >> 12;
     let rs2 = (instruction & RS2_MASK) >> 20;
     let rs1 = (instruction & RS1_MASK) >> 15;
-    let imm =
-        ((instruction >> 20) & 0x7e0) | ((instruction >> 7) & 0x1e) | ((instruction & 0x80) << 4);
+    let imm = (((instruction >> 20) & 0x7e0)
+        | ((instruction >> 7) & 0x1e)
+        | ((instruction & 0x80) << 4)) as i32;
+    let imm: i32 = if (instruction & SIGN_MASK) != 0 {
+        imm + 0xFFFFF000u32 as i32
+    } else {
+        imm
+    };
     match opcode {
         Opcode::Branch => {
             let comparison = match func3 {
