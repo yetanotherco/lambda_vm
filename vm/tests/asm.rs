@@ -427,3 +427,28 @@ fn test_auipc() {
 fn test_auipc_offset() {
     run_program_and_check_output("./program_artifacts/asm/auipc_offset.elf", 0x00011074);
 }
+
+#[test]
+fn test_mul() {
+    run_program_and_check_output("./program_artifacts/asm/mul.elf", 200);
+}
+
+#[test]
+fn test_div_zero() {
+    run_program_and_check_output("./program_artifacts/asm/div_zero.elf", u32::MAX as i32);
+}
+
+#[test]
+fn test_divu_zero() {
+    run_program_and_check_output("./program_artifacts/asm/divu_zero.elf", u32::MAX as i32);
+}
+
+#[test]
+fn test_rem_zero() {
+    run_program_and_check_output("./program_artifacts/asm/rem_zero.elf", 10);
+}
+
+#[test]
+fn test_remu_zero() {
+    run_program_and_check_output("./program_artifacts/asm/remu_zero.elf", 10);
+}
