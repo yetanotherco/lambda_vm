@@ -1,4 +1,4 @@
-use executor::{cpu::execution::run_program, elf::Elf};
+use executor::{elf::Elf, vm::execution::run_program};
 
 fn main() {
     println!("Reading elf");

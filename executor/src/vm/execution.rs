@@ -3,7 +3,7 @@ use std::{
     fmt::{Debug, Display},
 };
 
-use crate::cpu::{instruction::decoding::Instruction, logs::Log};
+use crate::vm::{instruction::decoding::Instruction, logs::Log};
 
 pub fn run_program(instruction_map: BTreeMap<u32, u32>, entrypoint: u32) -> ((i32, i32), Vec<Log>) {
     let mut memory = Memory::default();

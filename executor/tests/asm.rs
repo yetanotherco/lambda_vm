@@ -1,4 +1,4 @@
-use executor::{cpu::execution::run_program, elf::Elf};
+use executor::{elf::Elf, vm::execution::run_program};
 
 fn run_program_and_check_output(elf_path: &str, expected_output: i32) {
     println!("Testing {}", elf_path);
