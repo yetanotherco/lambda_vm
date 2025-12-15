@@ -35,9 +35,11 @@ impl Instruction {
             }
             Instruction::JumpAndLinkRegister { dst, base, offset } => {
                 let new_pc = (registers.0[*base as usize] as i32 + offset) as u32;
-                (new_pc, *dst, pc)
+                (new_pc, *dst, pc + REGULAR_PC_UPDATE)
             }
-            Instruction::JumpAndLink { dst, offset } => ((pc as i32 + offset) as u32, *dst, pc),
+            Instruction::JumpAndLink { dst, offset } => {
+                ((pc as i32 + offset) as u32, *dst, pc + REGULAR_PC_UPDATE)
+            }
             Instruction::Store {
                 src,
                 offset,
