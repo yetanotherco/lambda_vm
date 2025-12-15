@@ -418,3 +418,176 @@ pub fn new_sub_constraint(
         )),
     ]
 }
+
+#[derive(Clone)]
+pub struct AddFourCarryBitConstraint {
+    carry_idx: CarryIndex,
+    flags_idx: Vec<usize>,
+    lhs_start_idx: usize,
+    res_start_idx: usize,
+    constraint_idx: usize,
+}
+
+impl AddFourCarryBitConstraint {
+    /// Creates a new carry bit constraint.
+    ///
+    /// # Arguments
+    /// * `carry_idx` - Which carry to constrain (Zero or One)
+    /// * `flags_idx` - Columns containing activation flags
+    /// * `lhs_start_idx` - Starting column index for left operand's 4 limbs
+    /// * `res_start_idx` - Starting column index for result's 4 limbs
+    /// * `constraint_idx` - Unique constraint identifier
+    fn new(
+        carry_idx: CarryIndex,
+        flags_idx: Vec<usize>,
+        lhs_start_idx: usize,
+        res_start_idx: usize,
+        constraint_idx: usize,
+    ) -> Self {
+        Self {
+            carry_idx,
+            flags_idx,
+            lhs_start_idx,
+            res_start_idx,
+            constraint_idx,
+        }
+    }
+}
+
+impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>
+    for AddFourCarryBitConstraint
+{
+    fn degree(&self) -> usize {
+        3
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    fn exemptions_period(&self) -> Option<usize> {
+        None
+    }
+
+    fn periodic_exemptions_offset(&self) -> Option<usize> {
+        None
+    }
+
+    fn end_exemptions(&self) -> usize {
+        0
+    }
+
+    /// Evaluates the carry bit constraint: `flag * carry * (carry - 1) = 0`
+    ///
+    /// This ensures that when the instruction flag is active (flag = 1), the computed
+    /// carry bit must be binary (0 or 1). When the flag is inactive (flag = 0),
+    /// the constraint is trivially satisfied regardless of carry value.
+    ///
+    /// This method is called during both by the Prover and Verifier.
+    /// Prover to work with base field elements while the verifier
+    /// operates in a larger extension field.
+    fn evaluate(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<
+            Babybear31PrimeField,
+            Degree4BabyBearU32ExtensionField,
+        >,
+        transition_evaluations: &mut [FieldElement<Degree4BabyBearU32ExtensionField>],
+    ) {
+        match evaluation_context {
+            TransitionEvaluationContext::Prover {
+                frame,
+                periodic_values: _periodic_values,
+                rap_challenges: _rap_challenges,
+            } => {
+                let step = frame.get_evaluation_step(0);
+
+                // Sum all activation flags
+                let flag = self
+                    .flags_idx
+                    .iter()
+                    .fold(FieldElement::<Babybear31PrimeField>::zero(), |acc, &idx| {
+                        acc + step.get_main_evaluation_element(0, idx)
+                    });
+
+                let lhs_0 = step.get_main_evaluation_element(0, self.lhs_start_idx);
+                let rhs_0 = FieldElement::<Babybear31PrimeField>::from(4);
+                let res_0 = step.get_main_evaluation_element(0, self.res_start_idx);
+
+                let one = FieldElement::<Babybear31PrimeField>::one();
+                let inverse = FieldElement::<Babybear31PrimeField>::from(INV_65536);
+                let carry_0 = (lhs_0 + rhs_0 - res_0) * inverse;
+
+                let bit_constraint: FieldElement<Babybear31PrimeField> = match self.carry_idx {
+                    CarryIndex::Zero => flag * carry_0 * (carry_0 - one),
+                    CarryIndex::One => {
+                        // Compute the high word using the first 2 operand limbs.
+                        let lhs_1 = step.get_main_evaluation_element(0, self.lhs_start_idx + 1);
+                        let rhs_1 = FieldElement::<Babybear31PrimeField>::zero();
+                        let res_1 = step.get_main_evaluation_element(0, self.res_start_idx + 1);
+                        let carry_1 = (lhs_1 + rhs_1 - res_1 + carry_0) * inverse;
+                        flag * carry_1 * (carry_1 - one)
+                    }
+                };
+                transition_evaluations[self.constraint_idx()] = bit_constraint.to_extension();
+            }
+
+            TransitionEvaluationContext::Verifier {
+                frame,
+                periodic_values: _periodic_values,
+                rap_challenges: _rap_challenges,
+            } => {
+                let step = frame.get_evaluation_step(0);
+
+                let flag = self.flags_idx.iter().fold(
+                    FieldElement::<Degree4BabyBearU32ExtensionField>::zero(),
+                    |acc, &idx| acc + step.get_main_evaluation_element(0, idx),
+                );
+
+                let lhs_0 = step.get_main_evaluation_element(0, self.lhs_start_idx);
+                let rhs_0 = FieldElement::<Degree4BabyBearU32ExtensionField>::from(4);
+                let res_0 = step.get_main_evaluation_element(0, self.res_start_idx);
+
+                let one = FieldElement::<Degree4BabyBearU32ExtensionField>::one();
+                let inverse = FieldElement::<Degree4BabyBearU32ExtensionField>::from(INV_65536);
+                let carry_0 = (lhs_0 + rhs_0 - res_0) * inverse;
+
+                let bit_constraint = match self.carry_idx {
+                    CarryIndex::Zero => flag * carry_0 * (carry_0 - one),
+                    CarryIndex::One => {
+                        let lhs_1 = step.get_main_evaluation_element(0, self.lhs_start_idx + 1);
+                        let rhs_1 = FieldElement::<Degree4BabyBearU32ExtensionField>::zero();
+                        let res_1 = step.get_main_evaluation_element(0, self.res_start_idx + 1);
+                        let carry_1 = (lhs_1 + rhs_1 - res_1 + carry_0) * inverse;
+                        flag * carry_1 * (carry_1 - one)
+                    }
+                };
+                transition_evaluations[self.constraint_idx()] = bit_constraint
+            }
+        }
+    }
+}
+
+pub fn new_add_four_constraint(
+    flags_idx: Vec<usize>,
+    lhs_start_idx: usize,
+    res_start_idx: usize,
+    constraint_idx_start: usize,
+) -> Vec<Box<dyn TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>>> {
+    vec![
+        Box::new(AddFourCarryBitConstraint::new(
+            CarryIndex::Zero,
+            flags_idx.clone(),
+            lhs_start_idx,
+            res_start_idx,
+            constraint_idx_start,
+        )),
+        Box::new(AddFourCarryBitConstraint::new(
+            CarryIndex::One,
+            flags_idx,
+            lhs_start_idx,
+            res_start_idx,
+            constraint_idx_start + 1,
+        )),
+    ]
+}
