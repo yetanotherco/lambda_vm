@@ -1,8 +1,6 @@
-# Null VM
+# Lambda VM
 
 Verifiable VM made in collaboration with [Lambdaclass](https://lambdaclass.com/) and [3MI Labs](https://www.3milabs.tech/)
-
-Non-null name TBD
 
 We are developing an open-source verifiable virtual machine that allows users to prove the correctness of the execution of a given program with an input stream.
 
