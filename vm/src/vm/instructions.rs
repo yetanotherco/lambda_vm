@@ -179,7 +179,6 @@ const U_TYPE_IMM_MASK: u32 = 0xfffff000;
 
 impl Instruction {
     pub fn parse(instruction: u32) -> Instruction {
-        println!("Parsing instruction: 0x{:08x}", instruction);
         let opcode = parse_opcode(instruction);
         match opcode.instruction_format() {
             InstructionFormat::R => parse_r_instruction(instruction, opcode),
