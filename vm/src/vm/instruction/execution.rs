@@ -34,7 +34,7 @@ impl Instruction {
                 (pc + REGULAR_PC_UPDATE, *dst, res)
             }
             Instruction::JumpAndLinkRegister { dst, base, offset } => {
-                let new_pc = (registers.0[*base as usize] as i32 + offset) as u32;
+                let new_pc = ((registers.0[*base as usize] as i32 + offset) & !1) as u32;
                 (new_pc, *dst, pc + REGULAR_PC_UPDATE)
             }
             Instruction::JumpAndLink { dst, offset } => {
@@ -78,12 +78,12 @@ impl Instruction {
                 offset,
             } => {
                 let (a, b) = (registers.0[*src1 as usize], registers.0[*src2 as usize]);
-                let pc_offset = if cond.apply(a, b) {
-                    *offset
+                let new_pc = if cond.apply(a, b) {
+                    (pc as i32 + *offset) as u32
                 } else {
-                    REGULAR_PC_UPDATE
+                    pc + REGULAR_PC_UPDATE
                 };
-                (pc + pc_offset, 0, 0)
+                (new_pc, 0, 0)
             }
             Instruction::LoadUpperImm { dst, imm } => (pc + REGULAR_PC_UPDATE, *dst, *imm),
             Instruction::AddUpperImmToPc { dst, imm } => (pc + REGULAR_PC_UPDATE, *dst, pc + *imm),

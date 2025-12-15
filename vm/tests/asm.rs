@@ -265,6 +265,11 @@ fn test_slli_max_max() {
 }
 
 #[test]
+fn test_slli_not_arith() {
+    run_program_and_check_output("./program_artifacts/asm/slli_not_arith.elf", 2);
+}
+
+#[test]
 fn test_srli() {
     run_program_and_check_output("./program_artifacts/asm/srli.elf", 0);
 }
@@ -297,4 +302,127 @@ fn test_srli_max() {
 #[test]
 fn test_srli_max_max() {
     run_program_and_check_output("./program_artifacts/asm/srli_max_max.elf", 0x00000001);
+}
+
+#[test]
+fn test_srai() {
+    run_program_and_check_output("./program_artifacts/asm/srai.elf", 0);
+}
+
+#[test]
+fn test_srai_one() {
+    run_program_and_check_output("./program_artifacts/asm/srai_one.elf", 0);
+}
+
+#[test]
+fn test_srai_one_one() {
+    run_program_and_check_output("./program_artifacts/asm/srai_one_one.elf", 0);
+}
+
+#[test]
+fn test_srai_two_one() {
+    run_program_and_check_output("./program_artifacts/asm/srai_two_one.elf", 1);
+}
+
+#[test]
+fn test_srai_max() {
+    run_program_and_check_output("./program_artifacts/asm/srai_max.elf", 0xFFFFFFFFu32 as i32);
+}
+
+#[test]
+fn test_srai_negative() {
+    run_program_and_check_output(
+        "./program_artifacts/asm/srai_negative.elf",
+        0xFFFFFFF8u32 as i32,
+    );
+}
+
+#[test]
+fn test_jal() {
+    run_program_and_check_output("./program_artifacts/asm/jal.elf", 1);
+}
+
+#[test]
+fn test_jal_next() {
+    run_program_and_check_output("./program_artifacts/asm/jal_next.elf", 0);
+}
+
+#[test]
+fn test_jal_prev() {
+    run_program_and_check_output("./program_artifacts/asm/jal_prev.elf", 2);
+}
+
+#[test]
+fn test_jal_ret() {
+    run_program_and_check_output("./program_artifacts/asm/jal_ret.elf", 0x0001007c);
+}
+
+#[test]
+fn test_jalr() {
+    run_program_and_check_output("./program_artifacts/asm/jalr.elf", 1);
+}
+
+#[test]
+fn test_jalr_neg() {
+    run_program_and_check_output("./program_artifacts/asm/jalr_neg.elf", 2);
+}
+
+#[test]
+fn test_jalr_ret() {
+    run_program_and_check_output("./program_artifacts/asm/jalr_ret.elf", 0x0001007c);
+}
+
+#[test]
+fn test_jalr_odd() {
+    run_program_and_check_output("./program_artifacts/asm/jalr_odd.elf", 1);
+}
+
+#[test]
+fn test_jalr_odd_reg() {
+    run_program_and_check_output("./program_artifacts/asm/jalr_odd_reg.elf", 1);
+}
+
+#[test]
+fn test_bne() {
+    run_program_and_check_output("./program_artifacts/asm/bne.elf", 2);
+}
+
+#[test]
+fn test_bne_true() {
+    run_program_and_check_output("./program_artifacts/asm/bne_true.elf", 1);
+}
+
+#[test]
+fn test_bne_neg() {
+    run_program_and_check_output("./program_artifacts/asm/bne_neg.elf", 3);
+}
+
+#[test]
+fn test_loop_5() {
+    run_program_and_check_output("./program_artifacts/asm/loop_5.elf", 5);
+}
+
+#[test]
+fn test_lw_sw() {
+    run_program_and_check_output("./program_artifacts/asm/lw_sw.elf", 1);
+}
+
+#[test]
+fn test_lw_sw_offset() {
+    run_program_and_check_output("./program_artifacts/asm/lw_sw_offset.elf", 1);
+}
+
+#[test]
+fn test_lw_sw_offset_odd() {
+    run_program_and_check_output("./program_artifacts/asm/lw_sw_offset_odd.elf", 1);
+}
+
+#[test]
+fn test_auipc() {
+    run_program_and_check_output("./program_artifacts/asm/auipc.elf", 0x00010074);
+}
+
+#[test]
+fn test_auipc_offset() {
+    run_program_and_check_output("./program_artifacts/asm/auipc_offset.elf", 0x00011074);
 }
