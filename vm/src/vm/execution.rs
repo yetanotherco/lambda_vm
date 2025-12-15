@@ -4,7 +4,10 @@ use std::{
 };
 
 use crate::vm::{
-    instruction::decoding::{Instruction, InstructionError},
+    instruction::{
+        decoding::{Instruction, InstructionError},
+        execution::ExecutionError,
+    },
     logs::Log,
 };
 
@@ -34,7 +37,7 @@ fn run_from_entrypoint(
     while pc != 0 {
         let next_instruction = memory.0[&pc];
         let instruction = Instruction::parse(next_instruction)?;
-        let log = instruction.run(&mut pc, &mut registers, memory);
+        let log = instruction.run(&mut pc, &mut registers, memory)?;
         logs.push(log);
     }
     println!("Final Register Values:\n {}", &registers);
@@ -82,4 +85,6 @@ impl Display for Registers {
 pub enum ExecutorError {
     #[error("Failed to decode instruction: {0}")]
     Instruction(#[from] InstructionError),
+    #[error("Failed to execute instruction: {0}")]
+    ExecutionError(#[from] ExecutionError),
 }

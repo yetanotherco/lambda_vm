@@ -8,28 +8,39 @@ const REGULAR_PC_UPDATE: u32 = 4;
 
 impl Instruction {
     /// Runs the given instruction and returns its execution log
-    pub fn run(self, pc: &mut u32, registers: &mut Registers, memory: &mut Memory) -> Log {
+    pub fn run(
+        self,
+        pc: &mut u32,
+        registers: &mut Registers,
+        memory: &mut Memory,
+    ) -> Result<Log, ExecutionError> {
         println!("registers: {:?}", &registers);
         println!("Executing instruction at 0x{:08x}: {:?}", *pc, self);
-        let (new_pc, updated_register, new_register_value) = self.execute(*pc, registers, memory);
+        let (new_pc, updated_register, new_register_value) =
+            self.execute(*pc, registers, memory)?;
         *pc = new_pc;
         if updated_register != 0 {
             registers.0[updated_register as usize] = new_register_value;
         }
-        Log {
+        Ok(Log {
             instruction: self,
             updated_register_value: new_register_value,
             updated_pc: *pc,
-        }
+        })
     }
 
     /// Executes the given instruction returning the new value of pc, the register to be updated and the new value of said register
-    fn execute(&self, pc: u32, registers: &Registers, memory: &mut Memory) -> (u32, u32, u32) {
-        match self {
+    fn execute(
+        &self,
+        pc: u32,
+        registers: &Registers,
+        memory: &mut Memory,
+    ) -> Result<(u32, u32, u32), ExecutionError> {
+        Ok(match self {
             Instruction::ArithImm { dst, src, imm, op } => {
                 let op1 = registers.0[*src as usize] as i32;
                 if matches!(op, ArithOp::Sub) {
-                    panic!("SubImm not supported");
+                    return Err(ExecutionError::SubImmNotSupported);
                 }
                 let res = op.apply(op1, *imm) as u32;
                 (pc + REGULAR_PC_UPDATE, *dst, res)
@@ -70,7 +81,7 @@ impl Instruction {
                         memory.0.insert(addr, value);
                     }
                     LoadStoreWidth::ByteUnsigned => {
-                        panic!("Store does not support ByteUnsigned width");
+                        return Err(ExecutionError::StoreBytesUnsignedNotSupported);
                     }
                 };
                 (pc + REGULAR_PC_UPDATE, 0, 0)
@@ -131,7 +142,7 @@ impl Instruction {
                 let res = op.apply(a, b) as u32;
                 (pc + REGULAR_PC_UPDATE, *dst, res)
             }
-        }
+        })
     }
 }
 
@@ -163,4 +174,12 @@ impl Comparison {
             Comparison::GreaterOrEqualUnsigned => a >= b,
         }
     }
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum ExecutionError {
+    #[error("Sub immediate instruction is not supported")]
+    SubImmNotSupported,
+    #[error("Store bytes unsigned instruction is not supported")]
+    StoreBytesUnsignedNotSupported,
 }
