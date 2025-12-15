@@ -309,21 +309,21 @@ fn parse_i_instruction(instruction: u32, opcode: Opcode) -> Instruction {
                 offset: imm,
             }
         }
-        Opcode::Load => {
-            match func3 {
-                LOAD_BYTE_UNSIGNED_FUNC=> Instruction::LoadByteUnsigned {
-                    dst: rd,
-                    offset: imm,
-                    base: rs1,
-                },
-                LOAD_STORE_BYTE_WIDTH | LOAD_STORE_HALF_WIDTH | LOAD_STORE_WORD_WIDTH => Instruction::Load {
+        Opcode::Load => match func3 {
+            LOAD_BYTE_UNSIGNED_FUNC => Instruction::LoadByteUnsigned {
+                dst: rd,
+                offset: imm,
+                base: rs1,
+            },
+            LOAD_STORE_BYTE_WIDTH | LOAD_STORE_HALF_WIDTH | LOAD_STORE_WORD_WIDTH => {
+                Instruction::Load {
                     dst: rd,
                     offset: imm,
                     base: rs1,
                     width: LoadStoreWidth::from_func3(func3),
-                },
-                _ => panic!("Invalid Load Instruction"),
+                }
             }
+            _ => panic!("Invalid Load Instruction"),
         },
         _ => panic!("Invalid Instruction Encoding"),
     }

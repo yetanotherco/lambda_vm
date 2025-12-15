@@ -121,20 +121,18 @@ fn run_instruction(
                     let aligned_addr = addr - (addr % 4);
                     let aligned_value = value << ((addr % 4) * 8);
                     let previous_value = memory.0.get(&aligned_addr).cloned().unwrap_or(0);
-                    let new_value =
-                        (previous_value & !(0xFF << ((addr % 4) * 8))) | aligned_value;
-                    memory
-                        .0
-                        .insert(aligned_addr, new_value);
-                },
+                    let new_value = (previous_value & !(0xFF << ((addr % 4) * 8))) | aligned_value;
+                    memory.0.insert(aligned_addr, new_value);
+                }
                 LoadStoreWidth::Half => todo!(),
                 LoadStoreWidth::Word => {
-                    if addr % 4 != 0 {
-                        unimplemented!("Store at unaligned memory by word at address 0x{:08x}", addr);
+                    if !addr.is_multiple_of(4) {
+                        unimplemented!(
+                            "Store at unaligned memory by word at address 0x{:08x}",
+                            addr
+                        );
                     }
-                    memory
-                        .0
-                        .insert(addr, value);
+                    memory.0.insert(addr, value);
                 }
             };
         }
@@ -145,7 +143,7 @@ fn run_instruction(
             width,
         } => {
             let addr = (registers.0[*base as usize] as i32 + *offset) as u32;
-            if addr % 4 != 0 {
+            if !addr.is_multiple_of(4) {
                 unimplemented!("Load at unaligned memory at address 0x{:08x}", addr);
             }
             let value = if !memory.0.contains_key(&addr) {
@@ -164,7 +162,7 @@ fn run_instruction(
             let addr = (registers.0[*base as usize] as i32 + *offset) as u32;
             let aligned_addr = addr - (addr % 4);
             let value = memory.0[&aligned_addr];
-            let value = (value & (0xFF << ((addr % 4) * 8))) as u32;
+            let value = value & (0xFF << ((addr % 4) * 8));
             registers.0[*dst as usize] = value;
         }
         Instruction::Branch {
