@@ -1,3 +1,5 @@
+use std::ops::Rem;
+
 use crate::vm::{
     execution::{Memory, Registers},
     instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth},
@@ -116,6 +118,14 @@ impl ArithOp {
             ArithOp::ShiftRightArith => a >> b,
             ArithOp::SetLessThan => (a < b) as i32,
             ArithOp::SetLessThanU => ((a as u32) < (b as u32)) as i32,
+            ArithOp::Mul => (a as i64 * b as i64) as i32,
+            ArithOp::MulHigh => ((a as i64 * b as i64) >> 32) as i32,
+            ArithOp::MulHighSignedUnsigned => ((a as i64 * (b as u32) as i64) >> 32) as i32, //?
+            ArithOp::MulHighUnsigned => ((a as u64 * b as u64) >> 32) as i32,
+            ArithOp::Div => a / b,
+            ArithOp::DivUnsigned => (a as u32 / b as u32) as i32,
+            ArithOp::Remainder => a.rem(b),
+            ArithOp::RemainderUnsigned => (a as u32).rem(b as u32) as i32,
         }
     }
 }
