@@ -4,12 +4,14 @@ use lambdaworks_math::field::{
 
 type FE = FieldElement<Babybear31PrimeField>;
 
-// In this example we build a cpu table with four rows. Each row has the following instruction:
-// ADD, LOAD, STORE, SUB.
+// In this example we build a cpu table with eight rows. With the following instruction:
+// ADD, LOAD, STORE, SUB, JARL
 // ADD: rv1 + rv2.
 // LOAD: Copy value from address `rs1 + imm` to `rsd`.
 // STORE: Copy rv2 to address `rs1 + imm`.
 // SUB: rv2 - rv1.
+// JARL: res = pc + 4.
+// Rows from 6-8 are padded with zeros.
 pub fn build_cpu_columns_example() -> Vec<Vec<FE>> {
     let mut columns = Vec::new();
     // Timestamp: A word2L column containing the values 4 * i for i = 1,...
@@ -19,9 +21,13 @@ pub fn build_cpu_columns_example() -> Vec<Vec<FE>> {
         FE::from(&8u32),
         FE::from(&12u32),
         FE::from(&16u32),
+        FE::from(&20u32),
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
     ];
     // Column index: 1
-    let timestamp_2 = vec![FE::zero(); 4];
+    let timestamp_2 = vec![FE::zero(); 8];
 
     columns.push(timestamp_1);
     columns.push(timestamp_2);
@@ -35,26 +41,30 @@ pub fn build_cpu_columns_example() -> Vec<Vec<FE>> {
         FE::from(&8u32),
         FE::from(&12u32),
         FE::from(&16u32),
+        FE::from(&20u32),
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
     ];
     // Column index: 3
-    let pc_2 = vec![FE::zero(); 4];
+    let pc_2 = vec![FE::zero(); 8];
 
     columns.push(pc_1);
     columns.push(pc_2);
 
     // Index of source register 1.
     // Column index: 4
-    let rs_1 = vec![FE::from(&1), FE::from(&2), FE::from(&3), FE::from(&4)];
+    let rs_1 = vec![FE::zero(); 8];
     columns.push(rs_1);
 
     // Index of source register 2.
     // Column index: 5
-    let rs_2 = vec![FE::from(&5), FE::from(&6), FE::from(&7), FE::from(&8)];
+    let rs_2 = vec![FE::zero(); 8];
     columns.push(rs_2);
 
     // Index of destination register.
     // Column index: 6
-    let rd = vec![FE::from(&9), FE::from(&10), FE::from(&11), FE::from(&12)];
+    let rd = vec![FE::zero(); 8];
     columns.push(rd);
 
     // Flag: Whether the result should be written to `rd`.
@@ -63,19 +73,37 @@ pub fn build_cpu_columns_example() -> Vec<Vec<FE>> {
     // LOAD writes and STORE doesn't `rd` (See Page 34).
     // https://docs.riscv.org/reference/isa/_attachments/riscv-unprivileged.pdf>
     // Column index: 7
-    let write_register = vec![FE::one(), FE::one(), FE::zero(), FE::one()];
+    let write_register = vec![
+        FE::one(),
+        FE::one(),
+        FE::zero(),
+        FE::one(),
+        FE::one(),
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
+    ];
     columns.push(write_register);
 
     // Does the memory access (read or write) touch at least 2 bytes.
     // Flag.
     // Column index: 8
-    let memory_2_bytes = vec![FE::zero(), FE::zero(), FE::zero(), FE::zero()];
+    let memory_2_bytes = vec![FE::zero(); 8];
     columns.push(memory_2_bytes);
 
     // Does the memory access (read or write) touch 4 bytes.
     // Flag.
     // Column index: 9
-    let memory_4_bytes = vec![FE::zero(), FE::zero(), FE::one(), FE::zero()];
+    let memory_4_bytes = vec![
+        FE::zero(),
+        FE::zero(),
+        FE::one(),
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
+    ];
     columns.push(memory_4_bytes);
 
     // The 32-bit version of the immediate.
@@ -88,89 +116,156 @@ pub fn build_cpu_columns_example() -> Vec<Vec<FE>> {
         FE::one(),
         FE::from(&((1 << 12) - 1)),
         FE::zero(),
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
     ];
     // Column index: 11
-    let imm_2 = vec![FE::zero(); 4];
+    let imm_2 = vec![FE::zero(); 8];
 
     columns.push(imm_1);
     columns.push(imm_2);
 
     // Flag to indicate signed or unsigned input interpretation.
     // Column index: 12
-    let signed = vec![FE::zero(), FE::one(), FE::one(), FE::zero()];
+    let signed = vec![
+        FE::zero(),
+        FE::one(),
+        FE::one(),
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
+    ];
     columns.push(signed);
 
     // Flag: multi-purpose selector used by different ALU operations for different purposes.
     // In our example: Currently is not used for neither ADD, SUB, LOAD or STORE.
     // Column index: 13
-    let mp_selector = vec![FE::zero(), FE::zero(), FE::zero(), FE::zero()];
+    let mp_selector = vec![FE::zero(); 8];
     columns.push(mp_selector);
 
     // Flag that selects which output of MUL (lo/hi) or DIV (quo/rem) is wanted.
     // Column index: 14
-    let muldiv_selector = vec![FE::zero(), FE::zero(), FE::zero(), FE::zero()];
+    let muldiv_selector = vec![FE::zero(); 8];
     columns.push(muldiv_selector);
 
     // One-hot 17 columns of flags:
     // Instructions in this example: add, load, store, sub.
     // Column index: 15
-    let add = vec![FE::one(), FE::zero(), FE::zero(), FE::zero()];
+    let add = vec![
+        FE::one(),
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
+    ];
     columns.push(add);
     // Column index: 16
-    let sub = vec![FE::zero(), FE::zero(), FE::zero(), FE::one()];
+    let sub = vec![
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
+        FE::one(),
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
+    ];
     columns.push(sub);
     // Column index: 17
-    let slt = vec![FE::zero(), FE::zero(), FE::zero(), FE::zero()];
+    let slt = vec![FE::zero(); 8];
     columns.push(slt);
     // Column index: 18
-    let and = vec![FE::zero(), FE::zero(), FE::zero(), FE::zero()];
+    let and = vec![FE::zero(); 8];
     columns.push(and);
     // Column index: 19
-    let or = vec![FE::zero(), FE::zero(), FE::zero(), FE::zero()];
+    let or = vec![FE::zero(); 8];
     columns.push(or);
     // Column index: 20
-    let xor = vec![FE::zero(), FE::zero(), FE::zero(), FE::zero()];
+    let xor = vec![FE::zero(); 8];
     columns.push(xor);
     // Column index: 21
-    let sl = vec![FE::zero(), FE::zero(), FE::zero(), FE::zero()];
+    let sl = vec![FE::zero(); 8];
     columns.push(sl);
     // Column index: 22
-    let sr = vec![FE::zero(), FE::zero(), FE::zero(), FE::zero()];
+    let sr = vec![FE::zero(); 8];
     columns.push(sr);
     // Column index: 23
-    let jalr = vec![FE::zero(), FE::zero(), FE::zero(), FE::zero()];
+    let jalr = vec![
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
+        FE::one(),
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
+    ];
     columns.push(jalr);
     // Column index: 24
-    let beq = vec![FE::zero(), FE::zero(), FE::zero(), FE::zero()];
+    let beq = vec![FE::zero(); 8];
     columns.push(beq);
     // Column index: 25
-    let blt = vec![FE::zero(), FE::zero(), FE::zero(), FE::zero()];
+    let blt = vec![FE::zero(); 8];
     columns.push(blt);
     // Column index: 26
-    let load = vec![FE::zero(), FE::one(), FE::zero(), FE::zero()];
+    let load = vec![
+        FE::zero(),
+        FE::one(),
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
+    ];
     columns.push(load);
     // Column index: 27
-    let store = vec![FE::zero(), FE::zero(), FE::one(), FE::zero()];
+    let store = vec![
+        FE::zero(),
+        FE::zero(),
+        FE::one(),
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
+    ];
     columns.push(store);
     // Column index: 28
-    let mul = vec![FE::zero(), FE::zero(), FE::zero(), FE::zero()];
+    let mul = vec![FE::zero(); 8];
     columns.push(mul);
     // Column index: 29
-    let divrem = vec![FE::zero(), FE::zero(), FE::zero(), FE::zero()];
+    let divrem = vec![FE::zero(); 8];
     columns.push(divrem);
     // Column index: 30
-    let ecall = vec![FE::zero(), FE::zero(), FE::zero(), FE::zero()];
+    let ecall = vec![FE::zero(); 8];
     columns.push(ecall);
     // Column index: 31
-    let ebreak = vec![FE::zero(), FE::zero(), FE::zero(), FE::zero()];
+    let ebreak = vec![FE::zero(); 8];
     columns.push(ebreak);
 
     // ----- End Decode Columns -----
 
     // Column index: 32
-    let next_pc_1 = vec![FE::from(8), FE::from(12), FE::from(16), FE::from(20)];
+    let next_pc_1 = vec![
+        FE::from(8),
+        FE::from(12),
+        FE::from(16),
+        FE::from(20),
+        FE::from(24),
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
+    ];
     // Column index: 333
-    let next_pc_2 = vec![FE::zero(); 4];
+    let next_pc_2 = vec![FE::zero(); 8];
 
     columns.push(next_pc_1);
     columns.push(next_pc_2);
@@ -182,13 +277,17 @@ pub fn build_cpu_columns_example() -> Vec<Vec<FE>> {
         FE::from(&20u32),
         FE::from(&30u32),
         FE::from(&40u32),
+        FE::from(&50u32),
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
     ];
     // Column index: 35
-    let rv1_2 = vec![FE::zero(); 4];
+    let rv1_2 = vec![FE::zero(); 8];
     // Column index: 36
-    let rv1_3 = vec![FE::zero(); 4];
+    let rv1_3 = vec![FE::zero(); 8];
     // Column index: 37
-    let rv1_4 = vec![FE::zero(); 4];
+    let rv1_4 = vec![FE::zero(); 8];
 
     columns.push(rv1_1);
     columns.push(rv1_2);
@@ -202,13 +301,17 @@ pub fn build_cpu_columns_example() -> Vec<Vec<FE>> {
         FE::from(&60u32),
         FE::from(&70u32),
         FE::from(&10u32),
+        FE::from(&20u32),
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
     ];
     // Column index: 39
-    let rv2_2 = vec![FE::zero(); 4];
+    let rv2_2 = vec![FE::zero(); 8];
     // Column index: 10
-    let rv2_3 = vec![FE::zero(); 4];
+    let rv2_3 = vec![FE::zero(); 8];
     // Column index: 41
-    let rv2_4 = vec![FE::zero(); 4];
+    let rv2_4 = vec![FE::zero(); 8];
 
     columns.push(rv2_1);
     columns.push(rv2_2);
@@ -222,9 +325,13 @@ pub fn build_cpu_columns_example() -> Vec<Vec<FE>> {
         FE::from(&1u32),  // LOAD: copy a value from memory to `rd`.
         FE::zero(),
         FE::from(&30u32), // rv1 - rv2 = 40 - 10
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
     ];
     // Column index: 43
-    let rvd_2 = vec![FE::zero(); 4];
+    let rvd_2 = vec![FE::zero(); 8];
 
     columns.push(rvd_1);
     columns.push(rvd_2);
@@ -237,13 +344,17 @@ pub fn build_cpu_columns_example() -> Vec<Vec<FE>> {
         FE::one(),                  // LOAD -> imm
         FE::from(&((1 << 12) - 1)), // STORE -> imm
         FE::from(&10),              // SUB -> rv2
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
     ];
     // Column index: 45
-    let arg2_2 = vec![FE::zero(); 4];
+    let arg2_2 = vec![FE::zero(); 8];
     // Column index: 46
-    let arg2_3 = vec![FE::zero(); 4];
+    let arg2_3 = vec![FE::zero(); 8];
     // Column index: 47
-    let arg2_4 = vec![FE::zero(); 4];
+    let arg2_4 = vec![FE::zero(); 8];
 
     columns.push(arg2_1);
     columns.push(arg2_2);
@@ -257,13 +368,17 @@ pub fn build_cpu_columns_example() -> Vec<Vec<FE>> {
         FE::from(&21u32),   // rv1 + imm = 20 + 1.
         FE::from(&4125u32), // rv1 + imm = 30 + 2^12 - 1 = 4125.
         FE::from(&30u32),   // rv2 - rv1 = 40 - 10 = 30
+        FE::from(&24u32),   // pc + 4 = 20 + 4 = 24
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
     ];
     // Column index: 49
-    let res_2 = vec![FE::zero(); 4];
+    let res_2 = vec![FE::zero(); 8];
     // Column index: 50
-    let res_3 = vec![FE::zero(); 4];
+    let res_3 = vec![FE::zero(); 8];
     // Column index: 51
-    let res_4 = vec![FE::zero(); 4];
+    let res_4 = vec![FE::zero(); 8];
 
     columns.push(res_1);
     columns.push(res_2);
@@ -272,12 +387,12 @@ pub fn build_cpu_columns_example() -> Vec<Vec<FE>> {
 
     // Flag: Wether rv1 and arg2 are equal.
     // Column index: 52
-    let is_equal = vec![FE::zero(), FE::zero(), FE::zero(), FE::zero()];
+    let is_equal = vec![FE::zero(); 8];
     columns.push(is_equal);
 
     // Flag: Whether a branch is taken.
     // Column index: 53
-    let branch_cond = vec![FE::zero(), FE::zero(), FE::zero(), FE::zero()];
+    let branch_cond = vec![FE::zero(); 8];
     columns.push(branch_cond);
 
     columns
