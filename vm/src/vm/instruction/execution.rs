@@ -78,15 +78,7 @@ impl Instruction {
                 offset,
             } => {
                 let (a, b) = (registers.0[*src1 as usize], registers.0[*src2 as usize]);
-                let cmp_result = match cond {
-                    Comparison::Equal => a == b,
-                    Comparison::NotEqual => a != b,
-                    Comparison::LessThan => (a as i32) < (b as i32),
-                    Comparison::GreaterOrEqual => (a as i32) >= (b as i32),
-                    Comparison::LessThanUnsigned => a < b,
-                    Comparison::GreaterOrEqualUnsigned => a >= b,
-                };
-                let pc_offset = if cmp_result {
+                let pc_offset = if cond.apply(a, b) {
                     *offset
                 } else {
                     REGULAR_PC_UPDATE
@@ -123,6 +115,19 @@ impl ArithOp {
             ArithOp::ShiftRightArith => a >> b,
             ArithOp::SetLessThan => (a < b) as i32,
             ArithOp::SetLessThanU => ((a as u32) < (b as u32)) as i32,
+        }
+    }
+}
+
+impl Comparison {
+    fn apply(&self, a: u32, b: u32) -> bool {
+        match self {
+            Comparison::Equal => a == b,
+            Comparison::NotEqual => a != b,
+            Comparison::LessThan => (a as i32) < (b as i32),
+            Comparison::GreaterOrEqual => (a as i32) >= (b as i32),
+            Comparison::LessThanUnsigned => a < b,
+            Comparison::GreaterOrEqualUnsigned => a >= b,
         }
     }
 }
