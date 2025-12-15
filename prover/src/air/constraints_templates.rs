@@ -433,7 +433,7 @@ pub fn new_sub_constraint(
 ///
 /// Carry 0:
 /// lhs_0 = lhs[0] + 256 * lhs[1]
-/// rhs_0 =
+/// rhs_0 = 4
 /// res_0 = res[0] + 256 * res[1]
 ///
 /// carry_0 = (lhs_0 + rhs_0 - res_0) / 65536
@@ -441,10 +441,10 @@ pub fn new_sub_constraint(
 ///
 /// Carry 1:
 /// lhs_1 = lhs[2] + 256 * lhs[3]
-/// rhs_1 = rhs[2] + 256 * rhs[3]
+/// rhs_1 = 0
 /// res_1 = res[2] + 256 * res[3]
 ///
-/// carry_1 = (lhs_1 + rhs_1 - res_1 + carry_0) / 65536
+/// carry_1 = (lhs_1 - res_1 + carry_0) / 65536
 /// constraint: flag * carry_1 * (carry_1 - 1) = 0
 ///
 /// The `flag` factor allows selective activation: the constraint is only enforced when one
@@ -466,7 +466,7 @@ impl AddFourCarryBitConstraint {
     /// # Arguments
     /// * `carry_idx` - Which carry to constrain (Zero or One)
     /// * `flags_idx` - Columns containing activation flags
-    /// * `lhs_start_idx` - Starting column index for left operand's 4 limbs
+    /// * `lhs_start_idx` - Starting column index for left operand's 2 limbs
     /// * `res_start_idx` - Starting column index for result's 4 limbs
     /// * `constraint_idx` - Unique constraint identifier
     fn new(
