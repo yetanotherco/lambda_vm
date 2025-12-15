@@ -3,7 +3,7 @@ use std::{
     fmt::{Debug, Display},
 };
 
-use crate::vm::instructions::{ArithOp, Comparison, Instruction, LoadStoreWidth};
+use crate::cpu::instructions::{ArithOp, Comparison, Instruction, LoadStoreWidth};
 
 pub fn run_program(instruction_map: BTreeMap<u32, u32>, entrypoint: u32) -> (i32, i32) {
     let mut memory = Memory::default();
