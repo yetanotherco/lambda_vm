@@ -1,5 +1,3 @@
-use crate::vm::logs::Log;
-
 // Opcodes
 const ARITH_OPCODE: u32 = 0b0110011;
 const ARITH_IMM_OPCODE: u32 = 0b0010011;
