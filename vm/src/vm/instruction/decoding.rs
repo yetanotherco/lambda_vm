@@ -65,7 +65,7 @@ impl Opcode {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub enum ArithOp {
     Add,
     Sub,
@@ -84,7 +84,7 @@ const LOAD_STORE_HALF_WIDTH: u32 = 0x1;
 const LOAD_STORE_WORD_WIDTH: u32 = 0x2;
 const LOAD_BYTE_UNSIGNED_FUNC: u32 = 0x4;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum LoadStoreWidth {
     Byte,
     Half,
@@ -104,7 +104,7 @@ impl LoadStoreWidth {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum Comparison {
     Equal,
     NotEqual,
