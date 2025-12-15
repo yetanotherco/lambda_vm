@@ -89,6 +89,7 @@ pub enum LoadStoreWidth {
     Byte,
     Half,
     Word,
+    ByteUnsigned,
 }
 
 impl LoadStoreWidth {
@@ -97,6 +98,7 @@ impl LoadStoreWidth {
             LOAD_STORE_BYTE_WIDTH => LoadStoreWidth::Byte,
             LOAD_STORE_HALF_WIDTH => LoadStoreWidth::Half,
             LOAD_STORE_WORD_WIDTH => LoadStoreWidth::Word,
+            LOAD_BYTE_UNSIGNED_FUNC => LoadStoreWidth::ByteUnsigned,
             width => return Err(InstructionError::InvalidLoadStoreWidth(width)),
         })
     }
@@ -146,11 +148,6 @@ pub enum Instruction {
         offset: i32,
         base: u32,
         width: LoadStoreWidth,
-    },
-    LoadByteUnsigned {
-        dst: u32,
-        offset: i32,
-        base: u32,
     },
     Branch {
         src1: u32,
@@ -313,21 +310,11 @@ fn parse_i_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, 
                 offset: imm,
             }
         }
-        Opcode::Load => match func3 {
-            LOAD_BYTE_UNSIGNED_FUNC => Instruction::LoadByteUnsigned {
-                dst: rd,
-                offset: imm,
-                base: rs1,
-            },
-            LOAD_STORE_BYTE_WIDTH | LOAD_STORE_HALF_WIDTH | LOAD_STORE_WORD_WIDTH => {
-                Instruction::Load {
-                    dst: rd,
-                    offset: imm,
-                    base: rs1,
-                    width: LoadStoreWidth::from_func3(func3)?,
-                }
-            }
-            _ => panic!("Invalid Load Instruction"),
+        Opcode::Load => Instruction::Load {
+            dst: rd,
+            offset: imm,
+            base: rs1,
+            width: LoadStoreWidth::from_func3(func3)?,
         },
         _ => return Err(InstructionError::InvalidInstruction),
     })
