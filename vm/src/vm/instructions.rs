@@ -269,7 +269,10 @@ fn parse_i_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, 
                 OR_FUNC_IDENTIFIER => ArithOp::Or,
                 AND_FUNC_IDENTIFIER => ArithOp::And,
                 SHL_FUNC_IDENTIFIER => {
-                    assert!(imm >> 5 == 0);
+                    let func_id = imm >> 5;
+                    if !(func_id == 0) {
+                        return Err(InstructionError::UnknownSLVariant(func_id));
+                    }
                     imm &= 0x1F;
                     ArithOp::ShiftLeftLogical
                 }
@@ -407,6 +410,8 @@ pub enum InstructionError {
     InvalidLoadStoreWidth(u32),
     #[error("Unknown ShiftRight variant: {0:0x}")]
     UnknownSRVariant(i32),
+    #[error("Unknown ShiftLeftvariant: {0:0x}")]
+    UnknownSLVariant(i32),
     #[error("Invalid JALR Instruction: func3 component is not 0x0")]
     InvalidJALR,
 }
