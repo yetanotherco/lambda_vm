@@ -13,32 +13,54 @@ const ELF_CURRENT_VERSION: u8 = 1;
 
 #[derive(Debug)]
 pub struct ExecutableHeader {
-    _e_ident: [u8; EI_NIDENT], /* Magic number and other info */
-    e_type: u16,               /* Object file type */
-    e_machine: u16,            /* Architecture */
-    _e_version: u32,           /* Object file version */
-    e_entry: u32,              /* Entry point virtual address */
-    e_phoff: u32,              /* Program header table file offset */
-    _e_shoff: u32,             /* Section header table file offset */
-    _e_flags: u32,             /* Processor-specific flags */
-    _e_ehsize: u16,            /* ELF header size in bytes */
-    e_phentsize: u16,          /* Program header table entry size */
-    e_phnum: u16,              /* Program header table entry count */
-    _e_shentsize: u16,         /* Section header table entry size */
-    _e_shnum: u16,             /* Section header table entry count */
-    _e_shstrndx: u16,          /* Section header string table index */
+    /// Magic number and other info
+    _e_ident: [u8; EI_NIDENT],
+    /// Object file type
+    e_type: u16,
+    /// Architecture
+    e_machine: u16,
+    /// Object file version
+    _e_version: u32,
+    /// Entry point virtual address
+    e_entry: u32,
+    /// Program header table file offset
+    e_phoff: u32,
+    /// Section header table file offset
+    _e_shoff: u32,
+    /// Processor-specific flags
+    _e_flags: u32,
+    /// ELF header size in bytes
+    _e_ehsize: u16,
+    /// Program header table entry size
+    e_phentsize: u16,
+    /// Program header table entry count
+    e_phnum: u16,
+    /// Section header table entry size
+    _e_shentsize: u16,
+    /// Section header table entry count
+    _e_shnum: u16,
+    /// Section header string table index
+    _e_shstrndx: u16,
 }
 
 #[derive(Debug)]
 pub struct ProgramHeader {
-    p_type: u32,   /* Segment type */
-    p_offset: u32, /* Segment file offset */
-    p_vaddr: u32,  /* Segment virtual address */
-    _p_paddr: u32, /* Segment physical address */
-    p_filesz: u32, /* Segment size in file */
-    p_memsz: u32,  /* Segment size in memory */
-    _p_flags: u32, /* Segment flags */
-    _p_align: u32, /* Segment alignment */
+    /// Segment type
+    p_type: u32,
+    /// Segment file offset
+    p_offset: u32,
+    /// Segment virtual address
+    p_vaddr: u32,
+    /// Segment physical address
+    _p_paddr: u32,
+    /// Segment size in file
+    p_filesz: u32,
+    /// Segment size in memory
+    p_memsz: u32,
+    /// Segment flags
+    _p_flags: u32,
+    /// Segment alignment
+    _p_align: u32,
 }
 
 #[derive(Debug)]
