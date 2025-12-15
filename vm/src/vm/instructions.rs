@@ -398,6 +398,19 @@ fn parse_j_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, 
     })
 }
 
+// U-Type Instruction Format
+// |imm[31:12] | rd  |opcode|
+// | 31..12    |11..7| 6..0 |
+fn parse_u_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, InstructionError> {
+    let imm = instruction & U_TYPE_IMM_MASK;
+    let rd = (instruction & RD_MASK) >> 7;
+    Ok(match opcode {
+        Opcode::LoadUpperImm => Instruction::LoadUpperImm { dst: rd, imm },
+        Opcode::AddUpperImmToPc => Instruction::AddUpperImmToPc { dst: rd, imm },
+        _ => return Err(InstructionError::InvalidInstruction),
+    })
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum InstructionError {
     #[error("Unknown Opcode {0:0x}")]
@@ -414,17 +427,4 @@ pub enum InstructionError {
     UnknownSLVariant(i32),
     #[error("Invalid JALR Instruction: func3 component is not 0x0")]
     InvalidJALR,
-}
-
-// U-Type Instruction Format
-// |imm[31:12] | rd  |opcode|
-// | 31..12    |11..7| 6..0 |
-fn parse_u_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, InstructionError> {
-    let imm = instruction & U_TYPE_IMM_MASK;
-    let rd = (instruction & RD_MASK) >> 7;
-    Ok(match opcode {
-        Opcode::LoadUpperImm => Instruction::LoadUpperImm { dst: rd, imm },
-        Opcode::AddUpperImmToPc => Instruction::AddUpperImmToPc { dst: rd, imm },
-        _ => return Err(InstructionError::InvalidInstruction),
-    })
 }
