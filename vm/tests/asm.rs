@@ -412,7 +412,7 @@ fn test_lw_sw_offset() {
     run_program_and_check_output("./program_artifacts/asm/lw_sw_offset.elf", 1);
 }
 
-#[ignore="Unaligned memory access not properly implemented yet"]
+#[ignore = "Unaligned memory access not properly implemented yet"]
 #[test]
 fn test_lw_sw_offset_odd() {
     run_program_and_check_output("./program_artifacts/asm/lw_sw_offset_odd.elf", 1);
