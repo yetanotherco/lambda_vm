@@ -18,6 +18,7 @@ impl Instruction {
         println!("Executing instruction at 0x{:08x}: {:?}", *pc, self);
         let log = self.execute(*pc, registers, memory)?;
         // Cleanup zero register in case it was written to
+        // TODO: The `Register` struct should handle this, this is a quick and dirty solution
         registers.0[0] = 0;
         *pc = log.next_pc;
         Ok(log)
