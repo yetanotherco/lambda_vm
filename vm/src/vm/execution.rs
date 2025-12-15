@@ -94,7 +94,7 @@ fn run_instruction(
             registers.0[*dst as usize] = res as u32;
         }
         Instruction::JumpAndLinkRegister { dst, base, offset } => {
-            let new_pc = (registers.0[*base as usize] as i32 + offset) as u32;
+            let new_pc = ((registers.0[*base as usize] as i32 + offset) & !1) as u32;
             if *dst != 0 {
                 registers.0[*dst as usize] = *pc;
             }
@@ -154,7 +154,8 @@ fn run_instruction(
             };
             if cmp_result {
                 *pc -= 4;
-                *pc += offset
+                let new_pc = (*pc as i32 + offset) as u32;
+                *pc = new_pc;
             }
         }
         Instruction::LoadUpperImm { dst, imm } => registers.0[*dst as usize] = *imm,
