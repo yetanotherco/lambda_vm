@@ -1,6 +1,8 @@
 use crate::vm::instruction::decoding::Instruction;
 
 /// Log containing the executed instruction and the new value of the updated register
+/// Uses zero as default value if the ibstruction doesn't use either of src1, src2 or dst
+/// Note that values written to dst register zero will be ignored
 /// In case of JALR instruction: value of base will be at src1_val
 /// In case of Store instruction: value of base will be at src1_val and value to be stored will be at src2_val
 /// In case of Load instruction: value of base will be at src1_val
