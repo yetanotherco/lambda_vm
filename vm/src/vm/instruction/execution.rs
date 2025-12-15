@@ -19,6 +19,7 @@ impl Instruction {
         Log {
             instruction: self,
             updated_register_value: new_register_value,
+            updated_pc: *pc,
         }
     }
 

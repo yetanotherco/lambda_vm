@@ -4,4 +4,5 @@ use crate::vm::instruction::decoding::Instruction;
 pub struct Log {
     pub instruction: Instruction,
     pub updated_register_value: u32,
+    pub updated_pc: u32,
 }
