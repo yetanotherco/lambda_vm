@@ -1,2 +1,3 @@
 pub mod execution;
-pub mod instructions;
+pub mod instruction;
+pub mod logs;
