@@ -1,5 +1,3 @@
-use std::ops::Rem;
-
 use crate::vm::{
     execution::{Memory, Registers},
     instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth},
