@@ -34,3 +34,8 @@ fn test_if() {
 fn test_fibonacci() {
     run_program_and_check_output("./program_artifacts/rust/fibonacci.elf", 1597);
 }
+
+#[test]
+fn test_fibonacci_iterative() {
+    run_program_and_check_output("./program_artifacts/rust/fibonacci_iterative.elf", 1597);
+}
