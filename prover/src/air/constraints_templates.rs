@@ -375,3 +375,46 @@ pub fn new_add_constraint(
         )),
     ]
 }
+
+/// Creates a pair of carry bit constraints for a complete 32-bit substraction operation.
+///
+/// This uses the same constraints than addition
+/// check that: lhs - rhs  = res is equivalent to: res + rhs = lhs
+///
+/// This helper function creates both constraints with sequential constraint indices.
+///
+/// ## Arguments
+/// * `flags_idx` - Column indices for instruction selector flags
+/// * `lhs_start_idx` - Starting column for left operand (requires 4 consecutive columns)
+/// * `rhs_start_idx` - Starting column for right operand (requires 4 consecutive columns)
+/// * `res_start_idx` - Starting column for result (requires 4 consecutive columns)
+/// * `constraint_idx_start` - Starting constraint index (will use idx and idx+1)
+///
+/// ## Returns
+/// A vector of two boxed constraints: [carry_0_constraint, carry_1_constraint]
+pub fn new_sub_constraint(
+    flags_idx: Vec<usize>,
+    lhs_start_idx: usize,
+    rhs_start_idx: usize,
+    res_start_idx: usize,
+    constraint_idx_start: usize,
+) -> Vec<Box<dyn TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>>> {
+    vec![
+        Box::new(CarryBitConstraint::new(
+            CarryIndex::Zero,
+            flags_idx.clone(),
+            res_start_idx,
+            rhs_start_idx,
+            lhs_start_idx,
+            constraint_idx_start,
+        )),
+        Box::new(CarryBitConstraint::new(
+            CarryIndex::One,
+            flags_idx,
+            res_start_idx,
+            rhs_start_idx,
+            lhs_start_idx,
+            constraint_idx_start + 1,
+        )),
+    ]
+}

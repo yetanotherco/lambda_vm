@@ -201,7 +201,7 @@ pub fn build_cpu_columns_example() -> Vec<Vec<FE>> {
         FE::from(&50u32),
         FE::from(&60u32),
         FE::from(&70u32),
-        FE::from(&80u32),
+        FE::from(&10u32),
     ];
     // Column index: 39
     let rv2_2 = vec![FE::zero(); 4];
@@ -221,7 +221,7 @@ pub fn build_cpu_columns_example() -> Vec<Vec<FE>> {
         FE::from(&60u32), // rv1 + rv2 = 10 + 50
         FE::from(&1u32),  // LOAD: copy a value from memory to `rd`.
         FE::zero(),
-        FE::from(&40u32), // rv2 - rv1 = 80 - 40
+        FE::from(&30u32), // rv1 - rv2 = 40 - 10
     ];
     // Column index: 43
     let rvd_2 = vec![FE::zero(); 4];
@@ -236,7 +236,7 @@ pub fn build_cpu_columns_example() -> Vec<Vec<FE>> {
         FE::from(&50),              // ADD -> rv2
         FE::one(),                  // LOAD -> imm
         FE::from(&((1 << 12) - 1)), // STORE -> imm
-        FE::from(&80),              // SUB -> rv2
+        FE::from(&10),              // SUB -> rv2
     ];
     // Column index: 45
     let arg2_2 = vec![FE::zero(); 4];
@@ -256,7 +256,7 @@ pub fn build_cpu_columns_example() -> Vec<Vec<FE>> {
         FE::from(&60u32),   // rv1 + rv2 = 10 + 50
         FE::from(&21u32),   // rv1 + imm = 20 + 1.
         FE::from(&4125u32), // rv1 + imm = 30 + 2^12 - 1 = 4125.
-        FE::from(&40u32),   // rv2 - rv1 = 80 - 40
+        FE::from(&30u32),   // rv2 - rv1 = 40 - 10 = 30
     ];
     // Column index: 49
     let res_2 = vec![FE::zero(); 4];

@@ -1,4 +1,6 @@
-use crate::air::constraints_templates::{new_add_constraint, new_bit_constraints};
+use crate::air::constraints_templates::{
+    new_add_constraint, new_bit_constraints, new_sub_constraint,
+};
 
 use lambdaworks_math::field::{
     element::FieldElement,
@@ -13,6 +15,44 @@ use stark_platinum_prover::{
     trace::TraceTable,
     traits::AIR,
 };
+
+// CPU Columns indeces:
+// const TIMESTAMP: usize = 0;
+// const PC: usize = 2;
+// const RS: usize = 4;
+// const RD: usize = 6;
+const WRITE_REGISTER: usize = 7;
+const MEMORY_2BYTES: usize = 8;
+const MEMORY_4BYTES: usize = 9;
+// const IMM: usize = 10;
+const SIGNED: usize = 12;
+const MP_SELECTOR: usize = 13;
+const MULDIV_SELECTOR: usize = 14;
+const ADD: usize = 15;
+const SUB: usize = 16;
+const SLT: usize = 17;
+const AND: usize = 18;
+const OR: usize = 19;
+const XOR: usize = 20;
+const SL: usize = 21;
+const SR: usize = 22;
+const JALR: usize = 23;
+const BEQ: usize = 24;
+const BLT: usize = 25;
+const LOAD: usize = 26;
+const STORE: usize = 27;
+const MUL: usize = 28;
+const DIVREM: usize = 29;
+const ECALL: usize = 30;
+const EBREAK: usize = 31;
+// const NEXT_PC: usize = 32;
+const RV_ONE: usize = 34;
+// const RV_TWO: usize = 38;
+// const RVD: usize = 42;
+const ARG_TWO: usize = 44;
+const RES: usize = 48;
+// const IS_EQUAL: usize = 52;
+// const BRANCH_COND: usize = 53;
 
 type FE = FieldElement<Babybear31PrimeField>;
 
@@ -47,24 +87,56 @@ impl AIR for CPUTableAIR {
         // - decode flags like `write_register`, `signed`, `mp_selector`, `muldiv_selector`
         // - the one-hot instruction flags (ADD, SUB, ..., EBREAK)
         let bit_columns_index_to_constraint = [
-            7, 8, 9, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+            WRITE_REGISTER,
+            MEMORY_2BYTES,
+            MEMORY_4BYTES,
+            SIGNED,
+            MP_SELECTOR,
+            MULDIV_SELECTOR,
+            ADD,
+            SUB,
+            SLT,
+            AND,
+            OR,
+            XOR,
+            SL,
+            SR,
+            JALR,
+            BEQ,
+            BLT,
+            LOAD,
+            STORE,
+            MUL,
+            DIVREM,
+            ECALL,
+            EBREAK,
         ];
         let bit_constraints = new_bit_constraints(&bit_columns_index_to_constraint, 0);
 
-        let next_index = bit_columns_index_to_constraint.len();
+        let mut next_index = bit_columns_index_to_constraint.len();
         // Add constraint
         // Enforces that lhs (Word4L) + rhs (Word4L) = res (Word4L), with carry bits constrained.
         // It is enforced only on rows where the selected instruction flags are active.
         let add_constraints = new_add_constraint(
-            vec![15, 26, 27], // flags_idx,
-            34,               // lhs_start_idx,
-            44,               // rhs_start_idx,
-            48,               // res_start_idx,
-            next_index,       // constraint_idx_start,
+            vec![ADD, LOAD, STORE], // flags_idx,
+            RV_ONE,                 // lhs_start_idx,
+            ARG_TWO,                // rhs_start_idx,
+            RES,                    // res_start_idx,
+            next_index,             // constraint_idx_start,
+        );
+        next_index += 2;
+
+        let sub_constraints = new_sub_constraint(
+            vec![SUB, BEQ], // flags_idx,
+            RV_ONE,         // lhs_start_idx,
+            ARG_TWO,        // rhs_start_idx,
+            RES,            // res_start_idx,
+            next_index,     // constraint_idx_start,
         );
 
         let mut constraints = bit_constraints;
         constraints.extend(add_constraints);
+        constraints.extend(sub_constraints);
 
         let num_transition_constraints = constraints.len();
 
