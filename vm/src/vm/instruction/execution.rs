@@ -65,7 +65,8 @@ impl Instruction {
                         let value = value & 0xFF;
                         let aligned_addr = addr - (addr % 4);
                         let aligned_value = value << ((addr % 4) * 8);
-                        let previous_value = memory.0.get(&aligned_addr).cloned().unwrap_or(0);
+                        let previous_value =
+                            memory.0.get(&aligned_addr).cloned().unwrap_or_default();
                         let new_value =
                             (previous_value & !(0xFF << ((addr % 4) * 8))) | aligned_value;
                         memory.0.insert(aligned_addr, new_value);
@@ -100,11 +101,7 @@ impl Instruction {
                         if !addr.is_multiple_of(4) {
                             unimplemented!("Load at unaligned memory at address 0x{:08x}", addr);
                         }
-                        let value = if !memory.0.contains_key(&addr) {
-                            0
-                        } else {
-                            memory.0[&addr]
-                        };
+                        let value = memory.0.get(&addr).cloned().unwrap_or_default();
                         (pc + REGULAR_PC_UPDATE, *dst, value)
                     }
                     LoadStoreWidth::ByteUnsigned => {
