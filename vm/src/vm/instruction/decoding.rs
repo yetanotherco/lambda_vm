@@ -149,7 +149,7 @@ pub enum Instruction {
         src1: u32,
         src2: u32,
         cond: Comparison,
-        offset: u32,
+        offset: i32,
     },
     LoadUpperImm {
         dst: u32,
@@ -353,8 +353,14 @@ fn parse_b_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, 
     let func3 = (instruction & FUNC3_MASK) >> 12;
     let rs2 = (instruction & RS2_MASK) >> 20;
     let rs1 = (instruction & RS1_MASK) >> 15;
-    let imm =
-        ((instruction >> 20) & 0x7e0) | ((instruction >> 7) & 0x1e) | ((instruction & 0x80) << 4);
+    let imm = (((instruction >> 20) & 0x7e0)
+        | ((instruction >> 7) & 0x1e)
+        | ((instruction & 0x80) << 4)) as i32;
+    let imm: i32 = if (instruction & SIGN_MASK) != 0 {
+        imm + 0xFFFFF000u32 as i32
+    } else {
+        imm
+    };
     Ok(match opcode {
         Opcode::Branch => {
             let comparison = match func3 {
