@@ -1,4 +1,4 @@
-use crate::vm::instruction::decoding::Instruction;
+use crate::cpu::instruction::decoding::Instruction;
 
 /// Log containing the executed instruction and the new value of the updated register
 pub struct Log {

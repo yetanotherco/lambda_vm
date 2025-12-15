@@ -1,4 +1,4 @@
-use crate::vm::{
+use crate::cpu::{
     execution::{Memory, Registers},
     instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth},
     logs::Log,
