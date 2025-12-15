@@ -9,7 +9,8 @@ fn run_program_and_check_output(elf_path: &str, expected_output: i32) {
         println!("0x{:08x}: 0x{:08x}", addr, word);
     });
 
-    let (results, _logs) = run_program(program.image, program.entry_point);
+    let (results, _logs) =
+        run_program(program.image, program.entry_point).expect("Failed to run program");
 
     assert!(results.0 == expected_output);
 }
@@ -31,15 +32,5 @@ fn test_if() {
 
 #[test]
 fn test_fibonacci() {
-    println!("Testing fibonacci.elf");
-    let elf_data = std::fs::read("./program_artifacts/rust/fibonacci.elf").unwrap();
-    let program = Elf::load(&elf_data).unwrap();
-    println!("Program entry: 0x{:08x}", program.entry_point);
-    program.image.iter().for_each(|(addr, word)| {
-        println!("0x{:08x}: 0x{:08x}", addr, word);
-    });
-
-    let (results, _logs) = run_program(program.image, program.entry_point);
-
-    assert!(results.0 == 1597);
+    run_program_and_check_output("./program_artifacts/rust/fibonacci.elf", 1597);
 }
