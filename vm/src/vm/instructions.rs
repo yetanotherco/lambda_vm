@@ -270,7 +270,7 @@ fn parse_i_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, 
                 AND_FUNC_IDENTIFIER => ArithOp::And,
                 SHL_FUNC_IDENTIFIER => {
                     let func_id = imm >> 5;
-                    if !(func_id == 0) {
+                    if func_id != 0 {
                         return Err(InstructionError::UnknownSLVariant(func_id));
                     }
                     imm &= 0x1F;
