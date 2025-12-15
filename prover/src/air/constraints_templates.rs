@@ -334,7 +334,7 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
 
 /// Creates a pair of carry bit constraints for a complete 32-bit addition operation.
 ///
-/// A full 32-bit addition with 8-bit limb decomposition requires validating two carry bits:
+/// A full 32-bit addition with 16-bit limb decomposition requires validating two carry bits:
 /// - Carry from the low word (bits 0-15)
 /// - Carry from the high word (bits 16-31)
 ///
