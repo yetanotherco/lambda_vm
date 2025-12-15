@@ -55,7 +55,8 @@ impl Instruction {
                         let aligned_addr = addr - (addr % 4);
                         let aligned_value = value << ((addr % 4) * 8);
                         let previous_value = memory.0.get(&aligned_addr).cloned().unwrap_or(0);
-                        let new_value = (previous_value & !(0xFF << ((addr % 4) * 8))) | aligned_value;
+                        let new_value =
+                            (previous_value & !(0xFF << ((addr % 4) * 8))) | aligned_value;
                         memory.0.insert(aligned_addr, new_value);
                     }
                     LoadStoreWidth::Half => todo!(),
