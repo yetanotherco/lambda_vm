@@ -65,7 +65,7 @@ impl Opcode {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub enum ArithOp {
     Add,
     Sub,
@@ -87,28 +87,32 @@ pub enum ArithOp {
     RemainderUnsigned,
 }
 
-#[derive(Debug)]
+const LOAD_STORE_BYTE_WIDTH: u32 = 0x0;
+const LOAD_STORE_HALF_WIDTH: u32 = 0x1;
+const LOAD_STORE_WORD_WIDTH: u32 = 0x2;
+const LOAD_BYTE_UNSIGNED_FUNC: u32 = 0x4;
+
+#[derive(Debug, Clone, Copy)]
 pub enum LoadStoreWidth {
     Byte,
     Half,
     Word,
+    ByteUnsigned,
 }
 
 impl LoadStoreWidth {
-    fn from_func3(func3: u32) -> Result<Self, InstructionError> {
-        const LOAD_STORE_BYTE_WIDTH: u32 = 0x0;
-        const LOAD_STORE_HALF_WIDTH: u32 = 0x1;
-        const LOAD_STORE_WORD_WIDTH: u32 = 0x2;
+    fn from_func3(func3: u32) -> Result<LoadStoreWidth, InstructionError> {
         Ok(match func3 {
             LOAD_STORE_BYTE_WIDTH => LoadStoreWidth::Byte,
             LOAD_STORE_HALF_WIDTH => LoadStoreWidth::Half,
             LOAD_STORE_WORD_WIDTH => LoadStoreWidth::Word,
+            LOAD_BYTE_UNSIGNED_FUNC => LoadStoreWidth::ByteUnsigned,
             width => return Err(InstructionError::InvalidLoadStoreWidth(width)),
         })
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum Comparison {
     Equal,
     NotEqual,
@@ -345,7 +349,7 @@ fn parse_i_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, 
 // |imm[11:5]| rs2  | rs1  |funct3|imm[4:0]|opcode|
 // | 31..25  |24..20|19..15|14..12| 11..7  | 6..0 |
 fn parse_s_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, InstructionError> {
-    let func7 = (instruction & FUNC7_MASK) >> 25;
+    let func7 = ((instruction & FUNC7_MASK) >> 25) << 5;
     let func3 = (instruction & FUNC3_MASK) >> 12;
     let rs2 = (instruction & RS2_MASK) >> 20;
     let rs1 = (instruction & RS1_MASK) >> 15;
