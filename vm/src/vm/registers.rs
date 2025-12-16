@@ -36,7 +36,7 @@ impl Registers {
 
     /// Read the return values (aka registers a0 & a1)
     pub fn read_return_values(&self) -> (u32, u32) {
-        (self.0[10], self.0[11])
+        (self.0[9], self.0[10])
     }
 }
 
