@@ -1,7 +1,8 @@
 use crate::vm::{
-    execution::{Memory, Registers},
+    execution::Memory,
     instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth},
     logs::Log,
+    registers::Registers,
 };
 
 const REGULAR_PC_UPDATE: u32 = 4;
@@ -17,9 +18,6 @@ impl Instruction {
         println!("registers: {:?}", &registers);
         println!("Executing instruction at 0x{:08x}: {:?}", *pc, self);
         let log = self.execute(*pc, registers, memory)?;
-        // Cleanup zero register in case it was written to
-        // TODO: The `Register` struct should handle this, this is a quick and dirty solution
-        registers.0[0] = 0;
         *pc = log.next_pc;
         Ok(log)
     }
@@ -33,12 +31,12 @@ impl Instruction {
     ) -> Result<Log, ExecutionError> {
         Ok(match self {
             Instruction::ArithImm { dst, src, imm, op } => {
-                let op1 = registers.0[src as usize] as i32;
+                let op1 = registers.read(src) as i32;
                 if matches!(op, ArithOp::Sub) {
                     return Err(ExecutionError::SubImmNotSupported);
                 }
                 let res = op.apply(op1, imm) as u32;
-                registers.0[dst as usize] = res;
+                registers.write(dst, res);
                 Log {
                     instruction: self,
                     current_pc: pc,
@@ -49,9 +47,9 @@ impl Instruction {
                 }
             }
             Instruction::JumpAndLinkRegister { dst, base, offset } => {
-                let base_value = registers.0[base as usize];
+                let base_value = registers.read(base);
                 let new_pc = ((base_value as i32 + offset) & !1) as u32;
-                registers.0[dst as usize] = pc + REGULAR_PC_UPDATE;
+                registers.write(dst, pc + REGULAR_PC_UPDATE);
                 Log {
                     instruction: self,
                     current_pc: pc,
@@ -62,7 +60,7 @@ impl Instruction {
                 }
             }
             Instruction::JumpAndLink { dst, offset } => {
-                registers.0[dst as usize] = pc + REGULAR_PC_UPDATE;
+                registers.write(dst, pc + REGULAR_PC_UPDATE);
                 Log {
                     instruction: self,
                     current_pc: pc,
@@ -78,8 +76,8 @@ impl Instruction {
                 base,
                 width,
             } => {
-                let read_value = registers.0[src as usize];
-                let base = registers.0[base as usize];
+                let read_value = registers.read(src);
+                let base = registers.read(base);
                 let addr = base + offset;
                 match width {
                     LoadStoreWidth::Byte => {
@@ -121,7 +119,7 @@ impl Instruction {
                 base,
                 width,
             } => {
-                let base = registers.0[base as usize];
+                let base = registers.read(base);
                 let addr = (base as i32 + offset) as u32;
                 let value = match width {
                     LoadStoreWidth::Byte => todo!(),
@@ -138,7 +136,7 @@ impl Instruction {
                         value & (0xFF << ((addr % 4) * 8))
                     }
                 };
-                registers.0[dst as usize] = value;
+                registers.write(dst, value);
                 Log {
                     instruction: self,
                     current_pc: pc,
@@ -154,7 +152,7 @@ impl Instruction {
                 cond,
                 offset,
             } => {
-                let (a, b) = (registers.0[src1 as usize], registers.0[src2 as usize]);
+                let (a, b) = (registers.read(src1), registers.read(src2));
                 let new_pc = if cond.apply(a, b) {
                     (pc as i32 + offset) as u32
                 } else {
@@ -170,7 +168,7 @@ impl Instruction {
                 }
             }
             Instruction::LoadUpperImm { dst, imm } => {
-                registers.0[dst as usize] = imm;
+                registers.write(dst, imm);
                 Log {
                     instruction: self,
                     current_pc: pc,
@@ -181,7 +179,7 @@ impl Instruction {
                 }
             }
             Instruction::AddUpperImmToPc { dst, imm } => {
-                registers.0[dst as usize] = pc + imm;
+                registers.write(dst, pc + imm);
                 Log {
                     instruction: self,
                     current_pc: pc,
@@ -197,10 +195,10 @@ impl Instruction {
                 src2,
                 op,
             } => {
-                let a = registers.0[src1 as usize];
-                let b = registers.0[src2 as usize];
+                let a = registers.read(src1);
+                let b = registers.read(src2);
                 let res = op.apply(a as i32, b as i32) as u32;
-                registers.0[dst as usize] = res;
+                registers.write(dst, res);
                 Log {
                     instruction: self,
                     current_pc: pc,
