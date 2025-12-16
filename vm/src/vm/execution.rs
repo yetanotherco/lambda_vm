@@ -9,7 +9,7 @@ use crate::vm::{
         execution::ExecutionError,
     },
     logs::Log,
-    memory::Memory,
+    memory::{Memory, MemoryError},
 };
 
 pub fn run_program(
@@ -17,14 +17,18 @@ pub fn run_program(
     entrypoint: u32,
 ) -> Result<((i32, i32), Vec<Log>), ExecutorError> {
     let mut memory = Memory::default();
-    load_program(instruction_map, &mut memory);
+    load_program(instruction_map, &mut memory)?;
     run_from_entrypoint(&mut memory, entrypoint)
 }
 
-fn load_program(instruction_map: BTreeMap<u32, u32>, memory: &mut Memory) {
+fn load_program(
+    instruction_map: BTreeMap<u32, u32>,
+    memory: &mut Memory,
+) -> Result<(), MemoryError> {
     for (addr, instruction) in instruction_map {
-        memory.store_word(addr, instruction);
+        memory.store_word(addr, instruction)?;
     }
+    Ok(())
 }
 
 fn run_from_entrypoint(
@@ -36,7 +40,7 @@ fn run_from_entrypoint(
     registers.0[2] = 0xFFFFFFFCu32; // 4GB (Multiple of 4)
     let mut logs = Vec::new();
     while pc != 0 {
-        let next_instruction = memory.load_word(pc);
+        let next_instruction = memory.load_word(pc)?;
         let instruction = Instruction::parse(next_instruction)?;
         let log = instruction.run(&mut pc, &mut registers, memory)?;
         logs.push(log);
@@ -84,4 +88,6 @@ pub enum ExecutorError {
     Instruction(#[from] InstructionError),
     #[error("Failed to execute instruction: {0}")]
     ExecutionError(#[from] ExecutionError),
+    #[error("Memory error: {0}")]
+    MemoryError(#[from] MemoryError),
 }

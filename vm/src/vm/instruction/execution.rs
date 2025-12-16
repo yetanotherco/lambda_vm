@@ -89,10 +89,10 @@ impl Instruction {
                     }
                     LoadStoreWidth::Half => {
                         let value = read_value & 0xFFFF;
-                        memory.store_half(addr, value as u16);
+                        memory.store_half(addr, value as u16)?;
                     }
                     LoadStoreWidth::Word => {
-                        memory.store_word(addr, read_value);
+                        memory.store_word(addr, read_value)?;
                     }
                     LoadStoreWidth::ByteUnsigned => {
                         return Err(ExecutionError::StoreBytesUnsignedNotSupported);
@@ -121,7 +121,7 @@ impl Instruction {
                 let value = match width {
                     LoadStoreWidth::Byte => memory.load_byte(addr) as u32,
                     LoadStoreWidth::Half => memory.load_half(addr)? as u32,
-                    LoadStoreWidth::Word => memory.load_word(addr),
+                    LoadStoreWidth::Word => memory.load_word(addr)?,
                     LoadStoreWidth::ByteUnsigned => memory.load_byte(addr) as u32,
                     LoadStoreWidth::HalfUnsigned => memory.load_half(addr)? as u32,
                 };
