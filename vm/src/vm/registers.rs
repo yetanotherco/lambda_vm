@@ -11,7 +11,7 @@ impl Default for Registers {
     fn default() -> Self {
         let mut registers = Registers(Default::default());
         // Initialize stack pointer according to available memory size
-        registers.0[2] = STACK_MEMORY_SIZE;
+        registers.0[1] = STACK_MEMORY_SIZE;
         registers
     }
 }
