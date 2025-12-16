@@ -1,7 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    fmt::{Debug, Display},
-};
+use std::{collections::BTreeMap, fmt::Debug};
 
 use crate::vm::{
     instruction::{
@@ -33,7 +30,6 @@ fn run_from_entrypoint(
 ) -> Result<((i32, i32), Vec<Log>), ExecutorError> {
     let mut pc = entrypoint;
     let mut registers = Registers::default();
-    registers.0[2] = 0xFFFFFFFCu32; // 4GB (Multiple of 4)
     let mut logs = Vec::new();
     while pc != 0 {
         let next_instruction = memory.0[&pc];
@@ -42,7 +38,8 @@ fn run_from_entrypoint(
         logs.push(log);
     }
     println!("Final Register Values:\n {}", &registers);
-    let return_values = (registers.0[10] as i32, registers.0[11] as i32);
+    let return_values = registers.read_return_values();
+    let return_values = (return_values.0 as i32, return_values.1 as i32);
     println!("Return Values: {return_values:?}");
     Ok((return_values, logs))
 }
