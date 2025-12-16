@@ -134,7 +134,9 @@ pub enum CarryIndex {
 
 /// Enforces correct carry bit values in multi-limb addition operations.
 ///
-/// For 32-bit addition split into two 16-bit words (each composed of two 8-bit limbs):
+/// As the input is a 4-limb word, we cast it into two 16-bit words:
+/// CAST(a, word2L) -> a[i] + 256 * a[i + 1]
+/// Then we compute the carries to be constrained.
 ///
 /// Carry 0:
 /// lhs_0 = lhs[0] + 256 * lhs[1]
@@ -430,9 +432,12 @@ pub fn new_sub_constraint(
 }
 
 /// Enforces correct carry bit values for adding 4 to a 32-bit table value.
+/// - lhs is a 2-limb word
+/// - rhs is the constant 4, casted to a 2-limb word.
+/// - res is a 4-limb word, casted to a 2-limb word
 ///
 /// Carry 0:
-/// lhs_0 = lhs[0] + 256 * lhs[1]
+/// lhs_0 = lhs[0]
 /// rhs_0 = 4
 /// res_0 = res[0] + 256 * res[1]
 ///
@@ -440,7 +445,7 @@ pub fn new_sub_constraint(
 /// constraint: carry_0 * (carry_0 - 1) = 0
 ///
 /// Carry 1:
-/// lhs_1 = lhs[2] + 256 * lhs[3]
+/// lhs_1 = lhs[1]
 /// rhs_1 = 0
 /// res_1 = res[2] + 256 * res[3]
 ///
