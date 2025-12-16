@@ -53,7 +53,7 @@ impl Display for Registers {
             .zip(REGISTER_NAMES)
             .map(|(reg, name)| format!("{name}: {reg}"))
             .collect::<Vec<String>>()
-            .join(",");
+            .join(", ");
         writeln!(f, "[{}]", registers)
     }
 }
