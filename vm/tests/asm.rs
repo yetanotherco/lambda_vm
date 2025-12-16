@@ -440,15 +440,19 @@ fn test_mul_max() {
 
 #[test]
 fn test_mulh_max() {
-    run_program_and_check_output(
-        "./program_artifacts/asm/mulh_max.elf",
-        4294967294_u32 as i32,
-    );
+    run_program_and_check_output("./program_artifacts/asm/mulh_max.elf", 99);
 }
 
 #[test]
-fn test_mulu() {
-    run_program_and_check_output("./program_artifacts/asm/mulu.elf", 200);
+fn test_mulhu_max() {
+    run_program_and_check_output(
+        "./program_artifacts/asm/mulhu_max.elf",
+        4294967294_u32 as i32,
+    );
+}
+#[test]
+fn test_mulhsu_max() {
+    run_program_and_check_output("./program_artifacts/asm/mulhsu_max.elf", -100);
 }
 
 #[test]
@@ -459,6 +463,11 @@ fn test_div_zero() {
 #[test]
 fn test_divu_zero() {
     run_program_and_check_output("./program_artifacts/asm/divu_zero.elf", u32::MAX as i32);
+}
+
+#[test]
+fn test_divu() {
+    run_program_and_check_output("./program_artifacts/asm/divu.elf", 2147483647);
 }
 
 #[test]
