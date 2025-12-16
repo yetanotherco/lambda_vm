@@ -89,12 +89,6 @@ impl Instruction {
                     }
                     LoadStoreWidth::Half => todo!(),
                     LoadStoreWidth::Word => {
-                        if !addr.is_multiple_of(4) {
-                            unimplemented!(
-                                "Store at unaligned memory by word at address 0x{:08x}",
-                                addr
-                            );
-                        }
                         memory.store_word(addr, read_value);
                     }
                     LoadStoreWidth::ByteUnsigned => {
@@ -121,12 +115,7 @@ impl Instruction {
                 let value = match width {
                     LoadStoreWidth::Byte => todo!(),
                     LoadStoreWidth::Half => todo!(),
-                    LoadStoreWidth::Word => {
-                        if !addr.is_multiple_of(4) {
-                            unimplemented!("Load at unaligned memory at address 0x{:08x}", addr);
-                        }
-                        memory.load_word(addr)
-                    }
+                    LoadStoreWidth::Word => memory.load_word(addr),
                     LoadStoreWidth::ByteUnsigned => memory.load_byte(addr) as u32,
                 };
                 registers.0[dst as usize] = value;
