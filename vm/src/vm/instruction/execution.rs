@@ -8,38 +8,69 @@ const REGULAR_PC_UPDATE: u32 = 4;
 
 impl Instruction {
     /// Runs the given instruction and returns its execution log
-    pub fn run(self, pc: &mut u32, registers: &mut Registers, memory: &mut Memory) -> Log {
+    pub fn run(
+        self,
+        pc: &mut u32,
+        registers: &mut Registers,
+        memory: &mut Memory,
+    ) -> Result<Log, ExecutionError> {
         println!("registers: {:?}", &registers);
         println!("Executing instruction at 0x{:08x}: {:?}", *pc, self);
-        let (new_pc, updated_register, new_register_value) = self.execute(*pc, registers, memory);
-        *pc = new_pc;
-        if updated_register != 0 {
-            registers.0[updated_register as usize] = new_register_value;
-        }
-        Log {
-            instruction: self,
-            updated_register_value: new_register_value,
-            updated_pc: *pc,
-        }
+        let log = self.execute(*pc, registers, memory)?;
+        // Cleanup zero register in case it was written to
+        // TODO: The `Register` struct should handle this, this is a quick and dirty solution
+        registers.0[0] = 0;
+        *pc = log.next_pc;
+        Ok(log)
     }
 
     /// Executes the given instruction returning the new value of pc, the register to be updated and the new value of said register
-    fn execute(&self, pc: u32, registers: &Registers, memory: &mut Memory) -> (u32, u32, u32) {
-        match self {
+    fn execute(
+        self,
+        pc: u32,
+        registers: &mut Registers,
+        memory: &mut Memory,
+    ) -> Result<Log, ExecutionError> {
+        Ok(match self {
             Instruction::ArithImm { dst, src, imm, op } => {
-                let op1 = registers.0[*src as usize] as i32;
+                let op1 = registers.0[src as usize] as i32;
                 if matches!(op, ArithOp::Sub) {
-                    panic!("SubImm not supported");
+                    return Err(ExecutionError::SubImmNotSupported);
                 }
-                let res = op.apply(op1, *imm) as u32;
-                (pc + REGULAR_PC_UPDATE, *dst, res)
+                let res = op.apply(op1, imm) as u32;
+                registers.0[dst as usize] = res;
+                Log {
+                    instruction: self,
+                    current_pc: pc,
+                    next_pc: pc + REGULAR_PC_UPDATE,
+                    src1_val: op1 as u32,
+                    src2_val: 0,
+                    dst_val: res,
+                }
             }
             Instruction::JumpAndLinkRegister { dst, base, offset } => {
-                let new_pc = ((registers.0[*base as usize] as i32 + offset) & !1) as u32;
-                (new_pc, *dst, pc + REGULAR_PC_UPDATE)
+                let base_value = registers.0[base as usize];
+                let new_pc = ((base_value as i32 + offset) & !1) as u32;
+                registers.0[dst as usize] = pc + REGULAR_PC_UPDATE;
+                Log {
+                    instruction: self,
+                    current_pc: pc,
+                    next_pc: new_pc,
+                    src1_val: base_value,
+                    src2_val: 0,
+                    dst_val: pc + REGULAR_PC_UPDATE,
+                }
             }
             Instruction::JumpAndLink { dst, offset } => {
-                ((pc as i32 + offset) as u32, *dst, pc + REGULAR_PC_UPDATE)
+                registers.0[dst as usize] = pc + REGULAR_PC_UPDATE;
+                Log {
+                    instruction: self,
+                    current_pc: pc,
+                    next_pc: (pc as i32 + offset) as u32,
+                    src1_val: 0,
+                    src2_val: 0,
+                    dst_val: pc + REGULAR_PC_UPDATE,
+                }
             }
             Instruction::Store {
                 src,
@@ -47,16 +78,42 @@ impl Instruction {
                 base,
                 width,
             } => {
-                let value = registers.0[*src as usize];
-                let value = match width {
-                    LoadStoreWidth::Byte => todo!(),
+                let read_value = registers.0[src as usize];
+                let base = registers.0[base as usize];
+                let addr = base + offset;
+                match width {
+                    LoadStoreWidth::Byte => {
+                        let value = read_value & 0xFF;
+                        let aligned_addr = addr - (addr % 4);
+                        let aligned_value = value << ((addr % 4) * 8);
+                        let previous_value =
+                            memory.0.get(&aligned_addr).cloned().unwrap_or_default();
+                        let new_value =
+                            (previous_value & !(0xFF << ((addr % 4) * 8))) | aligned_value;
+                        memory.0.insert(aligned_addr, new_value);
+                    }
                     LoadStoreWidth::Half => todo!(),
-                    LoadStoreWidth::Word => value,
+                    LoadStoreWidth::Word => {
+                        if !addr.is_multiple_of(4) {
+                            unimplemented!(
+                                "Store at unaligned memory by word at address 0x{:08x}",
+                                addr
+                            );
+                        }
+                        memory.0.insert(addr, read_value);
+                    }
+                    LoadStoreWidth::ByteUnsigned => {
+                        return Err(ExecutionError::StoreBytesUnsignedNotSupported);
+                    }
                 };
-                memory
-                    .0
-                    .insert(registers.0[*base as usize] + *offset, value);
-                (pc + REGULAR_PC_UPDATE, 0, 0)
+                Log {
+                    instruction: self,
+                    current_pc: pc,
+                    next_pc: pc + REGULAR_PC_UPDATE,
+                    src1_val: base,
+                    src2_val: read_value,
+                    dst_val: 0,
+                }
             }
             Instruction::Load {
                 dst,
@@ -64,13 +121,32 @@ impl Instruction {
                 base,
                 width,
             } => {
-                let value = memory.0[&((registers.0[*base as usize] as i32 + *offset) as u32)];
+                let base = registers.0[base as usize];
+                let addr = (base as i32 + offset) as u32;
                 let value = match width {
                     LoadStoreWidth::Byte => todo!(),
                     LoadStoreWidth::Half => todo!(),
-                    LoadStoreWidth::Word => value,
+                    LoadStoreWidth::Word => {
+                        if !addr.is_multiple_of(4) {
+                            unimplemented!("Load at unaligned memory at address 0x{:08x}", addr);
+                        }
+                        memory.0.get(&addr).cloned().unwrap_or_default()
+                    }
+                    LoadStoreWidth::ByteUnsigned => {
+                        let aligned_addr = addr - (addr % 4);
+                        let value = memory.0[&aligned_addr];
+                        value & (0xFF << ((addr % 4) * 8))
+                    }
                 };
-                (pc + REGULAR_PC_UPDATE, *dst, value)
+                registers.0[dst as usize] = value;
+                Log {
+                    instruction: self,
+                    current_pc: pc,
+                    next_pc: pc + REGULAR_PC_UPDATE,
+                    src1_val: base,
+                    src2_val: 0,
+                    dst_val: value,
+                }
             }
             Instruction::Branch {
                 src1,
@@ -78,28 +154,63 @@ impl Instruction {
                 cond,
                 offset,
             } => {
-                let (a, b) = (registers.0[*src1 as usize], registers.0[*src2 as usize]);
+                let (a, b) = (registers.0[src1 as usize], registers.0[src2 as usize]);
                 let new_pc = if cond.apply(a, b) {
-                    (pc as i32 + *offset) as u32
+                    (pc as i32 + offset) as u32
                 } else {
                     pc + REGULAR_PC_UPDATE
                 };
-                (new_pc, 0, 0)
+                Log {
+                    instruction: self,
+                    current_pc: pc,
+                    next_pc: new_pc,
+                    src1_val: a,
+                    src2_val: b,
+                    dst_val: 0,
+                }
             }
-            Instruction::LoadUpperImm { dst, imm } => (pc + REGULAR_PC_UPDATE, *dst, *imm),
-            Instruction::AddUpperImmToPc { dst, imm } => (pc + REGULAR_PC_UPDATE, *dst, pc + *imm),
+            Instruction::LoadUpperImm { dst, imm } => {
+                registers.0[dst as usize] = imm;
+                Log {
+                    instruction: self,
+                    current_pc: pc,
+                    next_pc: pc + REGULAR_PC_UPDATE,
+                    src1_val: 0,
+                    src2_val: 0,
+                    dst_val: imm,
+                }
+            }
+            Instruction::AddUpperImmToPc { dst, imm } => {
+                registers.0[dst as usize] = pc + imm;
+                Log {
+                    instruction: self,
+                    current_pc: pc,
+                    next_pc: pc + REGULAR_PC_UPDATE,
+                    src1_val: 0,
+                    src2_val: 0,
+                    dst_val: pc + imm,
+                }
+            }
             Instruction::Arith {
                 dst,
                 src1,
                 src2,
                 op,
             } => {
-                let a = registers.0[*src1 as usize] as i32;
-                let b = registers.0[*src2 as usize] as i32;
-                let res = op.apply(a, b) as u32;
-                (pc + REGULAR_PC_UPDATE, *dst, res)
+                let a = registers.0[src1 as usize];
+                let b = registers.0[src2 as usize];
+                let res = op.apply(a as i32, b as i32) as u32;
+                registers.0[dst as usize] = res;
+                Log {
+                    instruction: self,
+                    current_pc: pc,
+                    next_pc: pc + REGULAR_PC_UPDATE,
+                    src1_val: a,
+                    src2_val: b,
+                    dst_val: res,
+                }
             }
-        }
+        })
     }
 }
 
@@ -131,4 +242,12 @@ impl Comparison {
             Comparison::GreaterOrEqualUnsigned => a >= b,
         }
     }
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum ExecutionError {
+    #[error("Sub immediate instruction is not supported")]
+    SubImmNotSupported,
+    #[error("Store bytes unsigned instruction is not supported")]
+    StoreBytesUnsignedNotSupported,
 }
