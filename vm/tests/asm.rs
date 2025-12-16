@@ -476,6 +476,16 @@ fn test_rem_zero() {
 }
 
 #[test]
+fn test_rem() {
+    run_program_and_check_output("./program_artifacts/asm/rem.elf", -13);
+}
+
+#[test]
 fn test_remu_zero() {
     run_program_and_check_output("./program_artifacts/asm/remu_zero.elf", 10);
+}
+
+#[test]
+fn test_remu() {
+    run_program_and_check_output("./program_artifacts/asm/remu.elf", 25);
 }
