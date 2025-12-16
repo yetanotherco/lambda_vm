@@ -1,7 +1,8 @@
 use crate::vm::{
-    execution::{Memory, Registers},
+    execution::Registers,
     instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth},
     logs::Log,
+    memory::Memory,
 };
 
 const REGULAR_PC_UPDATE: u32 = 4;
@@ -84,13 +85,7 @@ impl Instruction {
                 match width {
                     LoadStoreWidth::Byte => {
                         let value = read_value & 0xFF;
-                        let aligned_addr = addr - (addr % 4);
-                        let aligned_value = value << ((addr % 4) * 8);
-                        let previous_value =
-                            memory.0.get(&aligned_addr).cloned().unwrap_or_default();
-                        let new_value =
-                            (previous_value & !(0xFF << ((addr % 4) * 8))) | aligned_value;
-                        memory.0.insert(aligned_addr, new_value);
+                        memory.store_byte(addr, value as u8);
                     }
                     LoadStoreWidth::Half => todo!(),
                     LoadStoreWidth::Word => {
@@ -100,7 +95,7 @@ impl Instruction {
                                 addr
                             );
                         }
-                        memory.0.insert(addr, read_value);
+                        memory.store_word(addr, read_value);
                     }
                     LoadStoreWidth::ByteUnsigned => {
                         return Err(ExecutionError::StoreBytesUnsignedNotSupported);
@@ -130,13 +125,9 @@ impl Instruction {
                         if !addr.is_multiple_of(4) {
                             unimplemented!("Load at unaligned memory at address 0x{:08x}", addr);
                         }
-                        memory.0.get(&addr).cloned().unwrap_or_default()
+                        memory.load_word(addr)
                     }
-                    LoadStoreWidth::ByteUnsigned => {
-                        let aligned_addr = addr - (addr % 4);
-                        let value = memory.0[&aligned_addr];
-                        value & (0xFF << ((addr % 4) * 8))
-                    }
+                    LoadStoreWidth::ByteUnsigned => memory.load_byte(addr) as u32,
                 };
                 registers.0[dst as usize] = value;
                 Log {

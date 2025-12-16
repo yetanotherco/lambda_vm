@@ -9,6 +9,7 @@ use crate::vm::{
         execution::ExecutionError,
     },
     logs::Log,
+    memory::Memory,
 };
 
 pub fn run_program(
@@ -22,7 +23,7 @@ pub fn run_program(
 
 fn load_program(instruction_map: BTreeMap<u32, u32>, memory: &mut Memory) {
     for (addr, instruction) in instruction_map {
-        memory.0.insert(addr, instruction);
+        memory.store_word(addr, instruction);
     }
 }
 
@@ -35,7 +36,7 @@ fn run_from_entrypoint(
     registers.0[2] = 0xFFFFFFFCu32; // 4GB (Multiple of 4)
     let mut logs = Vec::new();
     while pc != 0 {
-        let next_instruction = memory.0[&pc];
+        let next_instruction = memory.load_word(pc);
         let instruction = Instruction::parse(next_instruction)?;
         let log = instruction.run(&mut pc, &mut registers, memory)?;
         logs.push(log);
@@ -45,10 +46,6 @@ fn run_from_entrypoint(
     println!("Return Values: {return_values:?}");
     Ok((return_values, logs))
 }
-
-// Toy Memory, TODO: Make expandable memory
-#[derive(Default, Debug)]
-pub struct Memory(pub BTreeMap<u32, u32>);
 
 #[derive(Default, Debug)]
 pub struct Registers(pub [u32; 32]);
