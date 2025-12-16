@@ -47,5 +47,5 @@ fn test_byte() {
 
 #[test]
 fn test_byte_signed() {
-    run_program_and_check_output("./program_artifacts/rust/byte_signed.elf", 0x0A);
+    run_program_and_check_output("./program_artifacts/rust/byte_signed.elf", -8);
 }
