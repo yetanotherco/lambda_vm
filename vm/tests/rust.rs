@@ -49,3 +49,8 @@ fn test_byte() {
 fn test_byte_signed() {
     run_program_and_check_output("./program_artifacts/rust/byte_signed.elf", -8);
 }
+
+#[test]
+fn test_half() {
+    run_program_and_check_output("./program_artifacts/rust/half.elf", 0xDEAD);
+}

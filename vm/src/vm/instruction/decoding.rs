@@ -83,6 +83,7 @@ const LOAD_STORE_BYTE_WIDTH: u32 = 0x0;
 const LOAD_STORE_HALF_WIDTH: u32 = 0x1;
 const LOAD_STORE_WORD_WIDTH: u32 = 0x2;
 const LOAD_BYTE_UNSIGNED_FUNC: u32 = 0x4;
+const LOAD_HALF_UNSIGNED_FUNC: u32 = 0x5;
 
 #[derive(Debug, Clone, Copy)]
 pub enum LoadStoreWidth {
@@ -90,6 +91,7 @@ pub enum LoadStoreWidth {
     Half,
     Word,
     ByteUnsigned,
+    HalfUnsigned,
 }
 
 impl LoadStoreWidth {
@@ -99,6 +101,7 @@ impl LoadStoreWidth {
             LOAD_STORE_HALF_WIDTH => LoadStoreWidth::Half,
             LOAD_STORE_WORD_WIDTH => LoadStoreWidth::Word,
             LOAD_BYTE_UNSIGNED_FUNC => LoadStoreWidth::ByteUnsigned,
+            LOAD_HALF_UNSIGNED_FUNC => LoadStoreWidth::HalfUnsigned,
             width => return Err(InstructionError::InvalidLoadStoreWidth(width)),
         })
     }

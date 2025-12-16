@@ -38,7 +38,7 @@ impl Memory {
         self.0.insert(address, bytes);
     }
     pub fn load_half(&self, address: u32) -> u16 {
-        if !address.is_multiple_of(4) {
+        if !address.is_multiple_of(2) {
             unimplemented!(
                 "Unaligned load half memory access at address 0x{:08x}",
                 address
@@ -50,9 +50,9 @@ impl Memory {
         u16::from_le_bytes(value.try_into().unwrap())
     }
     pub fn store_half(&mut self, address: u32, value: u16) {
-        if !address.is_multiple_of(4) {
+        if !address.is_multiple_of(2) {
             unimplemented!(
-                "Unaligned load half memory access at address 0x{:08x}",
+                "Unaligned store half memory access at address 0x{:08x}",
                 address
             );
         }
