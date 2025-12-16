@@ -39,3 +39,13 @@ fn test_fibonacci() {
 fn test_fibonacci_iterative() {
     run_program_and_check_output("./program_artifacts/rust/fibonacci_iterative.elf", 1597);
 }
+
+#[test]
+fn test_byte() {
+    run_program_and_check_output("./program_artifacts/rust/byte.elf", 0xDE);
+}
+
+#[test]
+fn test_byte_signed() {
+    run_program_and_check_output("./program_artifacts/rust/byte_signed.elf", 0x0A);
+}

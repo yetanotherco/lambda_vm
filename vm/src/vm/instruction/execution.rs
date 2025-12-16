@@ -113,7 +113,7 @@ impl Instruction {
                 let base = registers.0[base as usize];
                 let addr = (base as i32 + offset) as u32;
                 let value = match width {
-                    LoadStoreWidth::Byte => todo!(),
+                    LoadStoreWidth::Byte => memory.load_byte(addr) as u32,
                     LoadStoreWidth::Half => todo!(),
                     LoadStoreWidth::Word => memory.load_word(addr),
                     LoadStoreWidth::ByteUnsigned => memory.load_byte(addr) as u32,

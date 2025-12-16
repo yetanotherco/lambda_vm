@@ -25,7 +25,7 @@ impl Memory {
             );
         }
         let bytes = self.0.get(&address).cloned().unwrap_or_default();
-        u32::from_be_bytes(bytes)
+        u32::from_le_bytes(bytes)
     }
     pub fn store_word(&mut self, address: u32, value: u32) {
         if !address.is_multiple_of(4) {
@@ -34,7 +34,7 @@ impl Memory {
                 address
             );
         }
-        let bytes = value.to_be_bytes();
+        let bytes = value.to_le_bytes();
         self.0.insert(address, bytes);
     }
     pub fn load_half(&self, address: u32) -> u16 {
@@ -47,7 +47,7 @@ impl Memory {
         let aligned_address = address - address % 4;
         let bytes = self.0.get(&aligned_address).cloned().unwrap_or_default();
         let value = &bytes[(address % 4) as usize..(address % 4) as usize + 2];
-        u16::from_be_bytes(value.try_into().unwrap())
+        u16::from_le_bytes(value.try_into().unwrap())
     }
     pub fn store_half(&mut self, address: u32, value: u16) {
         if !address.is_multiple_of(4) {
@@ -61,7 +61,7 @@ impl Memory {
             .0
             .entry(aligned_address)
             .or_insert_with(|| [0, 0, 0, 0]);
-        let bytes = value.to_be_bytes();
+        let bytes = value.to_le_bytes();
         entry[(address % 4) as usize] = bytes[0];
         entry[(address % 4) as usize + 1] = bytes[1];
     }
