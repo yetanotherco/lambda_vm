@@ -2,7 +2,7 @@
 .Lfunc_end0:
 	.globl	main
 main:
-	addi	a2, zero, -10
+	addi	a2, zero, 10
 	addi	a3, zero, 20
 	mul    a0, a2, a3
 	jalr	zero, 0(ra)

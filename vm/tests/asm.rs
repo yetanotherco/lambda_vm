@@ -430,7 +430,25 @@ fn test_auipc_offset() {
 
 #[test]
 fn test_mul() {
-    run_program_and_check_output("./program_artifacts/asm/mul.elf", 200);
+    run_program_and_check_output("./program_artifacts/asm/mul.elf", -200);
+}
+
+#[test]
+fn test_mul_max() {
+    run_program_and_check_output("./program_artifacts/asm/mul_max.elf", 1);
+}
+
+#[test]
+fn test_mulh_max() {
+    run_program_and_check_output(
+        "./program_artifacts/asm/mulh_max.elf",
+        4294967294_u32 as i32,
+    );
+}
+
+#[test]
+fn test_mulu() {
+    run_program_and_check_output("./program_artifacts/asm/mulu.elf", 200);
 }
 
 #[test]

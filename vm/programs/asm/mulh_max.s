@@ -2,9 +2,9 @@
 .Lfunc_end0:
 	.globl	main
 main:
-	addi	a2, zero, -10
-	addi	a3, zero, 20
-	mul    a0, a2, a3
+	addi	a2, zero, 0xFFFFFFFF
+	addi	a3, zero, 0xFFFFFFFF
+	mulh    a0, a2, a3
 	jalr	zero, 0(ra)
 .Lfunc_end1:
 	.size	main, .Lfunc_end1-main
