@@ -120,10 +120,10 @@ impl Instruction {
                 let addr = (base as i32 + offset) as u32;
                 let value = match width {
                     LoadStoreWidth::Byte => memory.load_byte(addr) as u32,
-                    LoadStoreWidth::Half => memory.load_half(addr) as u32,
+                    LoadStoreWidth::Half => memory.load_half(addr)? as u32,
                     LoadStoreWidth::Word => memory.load_word(addr),
                     LoadStoreWidth::ByteUnsigned => memory.load_byte(addr) as u32,
-                    LoadStoreWidth::HalfUnsigned => memory.load_half(addr) as u32,
+                    LoadStoreWidth::HalfUnsigned => memory.load_half(addr)? as u32,
                 };
                 registers.0[dst as usize] = value;
                 Log {
@@ -239,4 +239,6 @@ pub enum ExecutionError {
     StoreBytesUnsignedNotSupported,
     #[error("Store half unsigned instruction is not supported")]
     StoreHalfUnsignedNotSupported,
+    #[error("Memory error: {0}")]
+    MemoryError(#[from] crate::vm::memory::MemoryError),
 }

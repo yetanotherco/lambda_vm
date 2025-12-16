@@ -37,7 +37,7 @@ impl Memory {
         let bytes = value.to_le_bytes();
         self.0.insert(address, bytes);
     }
-    pub fn load_half(&self, address: u32) -> u16 {
+    pub fn load_half(&self, address: u32) -> Result<u16, MemoryError> {
         if !address.is_multiple_of(2) {
             unimplemented!(
                 "Unaligned load half memory access at address 0x{:08x}",
@@ -47,7 +47,9 @@ impl Memory {
         let aligned_address = address - address % 4;
         let bytes = self.0.get(&aligned_address).cloned().unwrap_or_default();
         let value = &bytes[(address % 4) as usize..(address % 4) as usize + 2];
-        u16::from_le_bytes(value.try_into().unwrap())
+        Ok(u16::from_le_bytes(
+            value.try_into().map_err(|_| MemoryError::LoadHalf)?,
+        ))
     }
     pub fn store_half(&mut self, address: u32, value: u16) {
         if !address.is_multiple_of(2) {
@@ -65,4 +67,10 @@ impl Memory {
         entry[(address % 4) as usize] = bytes[0];
         entry[(address % 4) as usize + 1] = bytes[1];
     }
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum MemoryError {
+    #[error("Failed to convert bytes to u16")]
+    LoadHalf,
 }
