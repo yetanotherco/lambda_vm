@@ -1,4 +1,4 @@
-use crate::air::constraints_templates::{
+use crate::constraints::constraints_templates::{
     new_add_constraint, new_bit_constraints, new_sub_constraint,
 };
 

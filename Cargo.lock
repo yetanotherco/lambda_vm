@@ -277,6 +277,7 @@ dependencies = [
  "lambdaworks-crypto",
  "lambdaworks-math",
  "stark-platinum-prover",
+ "vm",
 ]
 
 [[package]]

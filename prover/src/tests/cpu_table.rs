@@ -286,7 +286,7 @@ pub fn build_cpu_columns_example() -> Vec<Vec<FE>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::air::cpu_air::{CPUTableAIR, build_cpu_trace};
+    use crate::constraints::cpu_air::{CPUTableAIR, build_cpu_trace};
     use lambdaworks_crypto::fiat_shamir::default_transcript::DefaultTranscript;
     use lambdaworks_math::field::fields::fft_friendly::quartic_babybear_u32::Degree4BabyBearU32ExtensionField;
     use stark_platinum_prover::{
