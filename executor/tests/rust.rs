@@ -59,3 +59,8 @@ fn test_half() {
 fn test_half_signed() {
     run_program_and_check_output("./program_artifacts/rust/half_signed.elf", 0xBEEF - 0xDEAD);
 }
+
+#[test]
+fn test_complex() {
+    run_program_and_check_output("./program_artifacts/rust/complex.elf", 65536);
+}
