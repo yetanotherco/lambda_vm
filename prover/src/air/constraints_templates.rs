@@ -541,7 +541,7 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
 
                 let imm = step.get_main_evaluation_element(0, self.imm_start_index);
 
-                let one = FieldElement::<Babybear31PrimeField>::one();
+                let one = FieldElement::<Degree4BabyBearU32ExtensionField>::one();
 
                 let store = step.get_main_evaluation_element(0, self.store_index);
                 let load = step.get_main_evaluation_element(0, self.load_index);
@@ -549,8 +549,7 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
                 let blt = step.get_main_evaluation_element(0, self.blt_index);
 
                 let constraint = (one - store - load) * rv2 + (one - beq - blt) * imm - arg2;
-                transition_evaluations[self.constraint_idx()] = constraint.to_extension();
-                
+                transition_evaluations[self.constraint_idx()] = constraint;   
             }
         }
     }
