@@ -37,12 +37,14 @@ jobs:
 
       - name: Build programs
         if: ${{ steps.cache.outputs.cache-hit != 'true' }}
-        #TODO: Uncomment once we build programs on the CI, for now we just commit the compiled programs
+        # TODO: Uncomment once we build programs on the CI, for now we just commit the compiled program artifacts
         #run: |
-        #   cd vm && make -j compile-programs-rust
+        #   cd vm && make -j compile-bench
         #   mkdir -p ${{ matrix.branch }}_programs
         #   cp vm/program_artifacts/bench/*.elf ${{ matrix.branch }}_programs
-        run: cp vm/program_artifacts/bench/*.elf ${{ matrix.branch }}_programs
+        run: |
+          mkdir -p ${{ matrix.branch }}_programs
+          cp vm/program_artifacts/bench/*.elf ${{ matrix.branch }}_programs
 
       - name: Export benchmark hashes
         id: export-hashes

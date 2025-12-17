@@ -18,5 +18,5 @@ fn fib(n: u32) -> u32 {
 
 #[unsafe(no_mangle)]
 pub fn main() -> u32 {
-    fib(1000)
+    fib(50)
 }
