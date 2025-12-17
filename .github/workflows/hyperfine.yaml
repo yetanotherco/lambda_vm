@@ -53,8 +53,7 @@ jobs:
   build-binaries:
     strategy:
       matrix:
-        branch: [head, head]
-        # branch: [base, head] TODO: uncomment
+        branch: [base, head]
     name: Build cli for ${{ matrix.branch }}
     runs-on: ubuntu-24.04
     steps:
