@@ -1,7 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    fmt::{Debug, Display},
-};
+use std::{collections::BTreeMap, fmt::Debug};
 
 use crate::vm::{
     instruction::{
@@ -10,6 +7,7 @@ use crate::vm::{
     },
     logs::Log,
     memory::{Memory, MemoryError},
+    registers::Registers,
 };
 
 pub fn run_program(
@@ -37,7 +35,6 @@ fn run_from_entrypoint(
 ) -> Result<((i32, i32), Vec<Log>), ExecutorError> {
     let mut pc = entrypoint;
     let mut registers = Registers::default();
-    registers.0[2] = 0xFFFFFFFCu32; // 4GB (Multiple of 4)
     let mut logs = Vec::new();
     while pc != 0 {
         let next_instruction = memory.load_word(pc)?;
@@ -46,40 +43,10 @@ fn run_from_entrypoint(
         logs.push(log);
     }
     println!("Final Register Values:\n {}", &registers);
-    let return_values = (registers.0[10] as i32, registers.0[11] as i32);
+    let return_values = registers.read_return_values();
+    let return_values = (return_values.0 as i32, return_values.1 as i32);
     println!("Return Values: {return_values:?}");
     Ok((return_values, logs))
-}
-
-#[derive(Default, Debug)]
-pub struct Registers(pub [u32; 32]);
-// Registers:
-// 0x zero
-// a0-ax function arguments: 0x10 -etc
-// 0x1 return address (ra)
-//
-impl Display for Registers {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "Registers:")?;
-        writeln!(f, "Zero(zero): {}", self.0[0])?;
-        writeln!(f, "ReturnAddress(ra): {}", self.0[1])?;
-        writeln!(f, "StackPointer(sp): {}", self.0[2])?;
-        // Not used for now
-        // writeln!(f, "GlobalPointer(gp): {}", self.0[2])?;
-        // writeln!(f, "ThreadPointer(tp): {}", self.0[3])?;
-        let function_arguments = self.0[10..17]
-            .iter()
-            .enumerate()
-            .map(|(i, val)| match i {
-                i @ 0..=1 => format!("a{i} (return value {i}) : {val} "),
-                i => format!("a{i}: {val} "),
-            })
-            .collect::<Vec<_>>()
-            .concat();
-        writeln!(f, "FunctionArguments: {function_arguments}")?;
-        // TODO: Add other registers as we use them
-        Ok(())
-    }
 }
 
 #[derive(thiserror::Error, Debug)]
