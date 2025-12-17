@@ -8,6 +8,10 @@ use stark_platinum_prover::{
     constraints::transition::TransitionConstraint, traits::TransitionEvaluationContext,
 };
 
+use crate::air::utils::{
+    get_four_limbs, get_four_limbs_extension, get_two_limbs, get_two_limbs_extension,
+};
+
 pub const INV_65536: u64 = 2013235201;
 
 /// Enforces that a specific trace column contains only binary values (0 or 1).
@@ -493,21 +497,9 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
             } => {
                 let step = frame.get_evaluation_step(0);
 
-                let two_fifty_six = FieldElement::<Babybear31PrimeField>::from(256);
+                let arg2 = get_two_limbs(step, self.arg2_start_index);
 
-                let arg2 = step.get_main_evaluation_element(0, self.arg2_start_index)
-                    + two_fifty_six
-                        * step.get_main_evaluation_element(0, self.arg2_start_index + 1);
-
-                let rv2 = step.get_main_evaluation_element(0, self.rv2_start_index)
-                    + two_fifty_six * step.get_main_evaluation_element(0, self.rv2_start_index + 1)
-                    + two_fifty_six
-                        * two_fifty_six
-                        * step.get_main_evaluation_element(0, self.rv2_start_index + 2)
-                    + two_fifty_six
-                        * two_fifty_six
-                        * two_fifty_six
-                        * step.get_main_evaluation_element(0, self.rv2_start_index + 3);
+                let rv2 = get_four_limbs(step, self.rv2_start_index);
 
                 let imm = step.get_main_evaluation_element(0, self.imm_start_index);
 
@@ -529,21 +521,9 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
             } => {
                 let step = frame.get_evaluation_step(0);
 
-                let two_fifty_six = FieldElement::<Babybear31PrimeField>::from(256);
+                let arg2 = get_two_limbs_extension(step, self.arg2_start_index);
 
-                let arg2 = step.get_main_evaluation_element(0, self.arg2_start_index)
-                    + two_fifty_six
-                        * step.get_main_evaluation_element(0, self.arg2_start_index + 1);
-
-                let rv2 = step.get_main_evaluation_element(0, self.rv2_start_index)
-                    + two_fifty_six * step.get_main_evaluation_element(0, self.rv2_start_index + 1)
-                    + two_fifty_six
-                        * two_fifty_six
-                        * step.get_main_evaluation_element(0, self.rv2_start_index + 2)
-                    + two_fifty_six
-                        * two_fifty_six
-                        * two_fifty_six
-                        * step.get_main_evaluation_element(0, self.rv2_start_index + 3);
+                let rv2 = get_four_limbs_extension(step, self.rv2_start_index);
 
                 let imm = step.get_main_evaluation_element(0, self.imm_start_index);
 
