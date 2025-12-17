@@ -409,6 +409,10 @@ pub struct Arg2ValidityColumnIndexes {
     pub blt_index: usize,
 }
 
+/// Enforces the validity of arg2.
+///
+/// The constraint enforces:
+/// (1 - load - store) * rv2 + (1 - beq - blt) * imm - arg2 = 0
 #[derive(Clone)]
 pub struct Arg2ValidityConstraint {
     arg2_start_index: usize,
@@ -419,6 +423,14 @@ pub struct Arg2ValidityConstraint {
 }
 
 impl Arg2ValidityConstraint {
+    /// Creates a new arg2 validity constraint.
+    ///
+    /// # Arguments
+    /// * `arg2_start_index` - Starting column index for arg2's 2 limbs
+    /// * `rv2_start_index` - Starting column index for rv2's 4 limbs
+    /// * `imm_start_index` - Starting column index for imm 1 limb
+    /// * `column_indexes` - Column indexes for LOAD, STORE, BEQ, BLT
+    /// * `constraint_idx` - Unique constraint identifier
     fn new(
         arg2_start_index: usize,
         rv2_start_index: usize,
@@ -459,6 +471,11 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
         0
     }
 
+    /// Evaluates the arg2 validity constraint: `(1 - load - store) * rv2 + (1 - beq - blt) * imm - arg2 = 0`
+    ///
+    /// This method is called during both by the Prover and Verifier.
+    /// Prover to work with base field elements while the verifier
+    /// operates in a larger extension field.
     fn evaluate(
         &self,
         evaluation_context: &TransitionEvaluationContext<
@@ -519,6 +536,17 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
     }
 }
 
+/// Creates a arg2 validity constraint.
+///
+/// ## Arguments
+/// * `arg2_start_index` - Starting column for arg2's 2 limbs
+/// * `rv2_start_index` - Starting column for rv2's 4 limbs
+/// * `imm_start_index` - Starting column for imm 1 limb
+/// * `column_indexes` - Column indexes for LOAD, STORE, BEQ, BLT
+/// * `constraint_idx_start` - Starting constraint index (will use idx and idx+1)
+///
+/// ## Returns
+/// A boxed argv2 validity constraint.
 pub fn new_arg2_validity_constraint(
     arg2_start_index: usize,
     rv2_start_index: usize,
