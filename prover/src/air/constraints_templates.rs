@@ -420,37 +420,35 @@ pub fn new_sub_constraint(
 }
 
 #[derive(Clone)]
+pub struct Arg2ValidityColumnIndexes {
+    pub load_index: usize,
+    pub store_index: usize,
+    pub beq_index: usize,
+    pub blt_index: usize,
+}
+
+#[derive(Clone)]
 pub struct Arg2ValidityConstraint {
     arg2_start_index: usize,
     rv2_start_index: usize,
     imm_start_index: usize,
-    load_index: usize,
-    store_index: usize,
-    beq_index: usize,
-    blt_index: usize,
+    column_indexes: Arg2ValidityColumnIndexes,
     constraint_idx: usize,
 }
-
 
 impl Arg2ValidityConstraint {
     fn new(
         arg2_start_index: usize,
         rv2_start_index: usize,
         imm_start_index: usize,
-        store_index: usize,
-        load_index: usize,
-        beq_index: usize,
-        blt_index: usize,
+        column_indexes: Arg2ValidityColumnIndexes,
         constraint_idx: usize,
     ) -> Self {
         Self {
             arg2_start_index,
             rv2_start_index,
             imm_start_index,
-            load_index,
-            store_index,
-            beq_index,
-            blt_index,
+            column_indexes,
             constraint_idx,
         }
     }
@@ -498,23 +496,27 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
                 let two_fifty_six = FieldElement::<Babybear31PrimeField>::from(256);
 
                 let arg2 = step.get_main_evaluation_element(0, self.arg2_start_index)
-                    + two_fifty_six * step.get_main_evaluation_element(0, self.arg2_start_index + 1);
+                    + two_fifty_six
+                        * step.get_main_evaluation_element(0, self.arg2_start_index + 1);
 
                 let rv2 = step.get_main_evaluation_element(0, self.rv2_start_index)
                     + two_fifty_six * step.get_main_evaluation_element(0, self.rv2_start_index + 1)
-                    + two_fifty_six * two_fifty_six
+                    + two_fifty_six
+                        * two_fifty_six
                         * step.get_main_evaluation_element(0, self.rv2_start_index + 2)
-                    + two_fifty_six * two_fifty_six * two_fifty_six *
-                        step.get_main_evaluation_element(0, self.rv2_start_index + 3);
+                    + two_fifty_six
+                        * two_fifty_six
+                        * two_fifty_six
+                        * step.get_main_evaluation_element(0, self.rv2_start_index + 3);
 
                 let imm = step.get_main_evaluation_element(0, self.imm_start_index);
 
                 let one = FieldElement::<Babybear31PrimeField>::one();
 
-                let store = step.get_main_evaluation_element(0, self.store_index);
-                let load = step.get_main_evaluation_element(0, self.load_index);
-                let beq = step.get_main_evaluation_element(0, self.beq_index);
-                let blt = step.get_main_evaluation_element(0, self.blt_index);
+                let store = step.get_main_evaluation_element(0, self.column_indexes.store_index);
+                let load = step.get_main_evaluation_element(0, self.column_indexes.load_index);
+                let beq = step.get_main_evaluation_element(0, self.column_indexes.beq_index);
+                let blt = step.get_main_evaluation_element(0, self.column_indexes.blt_index);
 
                 let constraint = (one - store - load) * rv2 + (one - beq - blt) * imm - arg2;
                 transition_evaluations[self.constraint_idx()] = constraint.to_extension();
@@ -530,26 +532,30 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
                 let two_fifty_six = FieldElement::<Babybear31PrimeField>::from(256);
 
                 let arg2 = step.get_main_evaluation_element(0, self.arg2_start_index)
-                    + two_fifty_six * step.get_main_evaluation_element(0, self.arg2_start_index + 1);
+                    + two_fifty_six
+                        * step.get_main_evaluation_element(0, self.arg2_start_index + 1);
 
                 let rv2 = step.get_main_evaluation_element(0, self.rv2_start_index)
                     + two_fifty_six * step.get_main_evaluation_element(0, self.rv2_start_index + 1)
-                    + two_fifty_six * two_fifty_six
+                    + two_fifty_six
+                        * two_fifty_six
                         * step.get_main_evaluation_element(0, self.rv2_start_index + 2)
-                    + two_fifty_six * two_fifty_six * two_fifty_six *
-                        step.get_main_evaluation_element(0, self.rv2_start_index + 3);
+                    + two_fifty_six
+                        * two_fifty_six
+                        * two_fifty_six
+                        * step.get_main_evaluation_element(0, self.rv2_start_index + 3);
 
                 let imm = step.get_main_evaluation_element(0, self.imm_start_index);
 
                 let one = FieldElement::<Babybear31PrimeField>::one();
 
-                let store = step.get_main_evaluation_element(0, self.store_index);
-                let load = step.get_main_evaluation_element(0, self.load_index);
-                let beq = step.get_main_evaluation_element(0, self.beq_index);
-                let blt = step.get_main_evaluation_element(0, self.blt_index);
+                let store = step.get_main_evaluation_element(0, self.column_indexes.store_index);
+                let load = step.get_main_evaluation_element(0, self.column_indexes.load_index);
+                let beq = step.get_main_evaluation_element(0, self.column_indexes.beq_index);
+                let blt = step.get_main_evaluation_element(0, self.column_indexes.blt_index);
 
                 let constraint = (one - store - load) * rv2 + (one - beq - blt) * imm - arg2;
-                transition_evaluations[self.constraint_idx()] = constraint;   
+                transition_evaluations[self.constraint_idx()] = constraint;
             }
         }
     }
@@ -559,17 +565,14 @@ pub fn new_arg2_validity_constraint(
     arg2_start_index: usize,
     rv2_start_index: usize,
     imm_start_index: usize,
-    load_index: usize,
-    store_index: usize,
-    beq_index: usize,
-    blt_index: usize,
+    column_indexes: Arg2ValidityColumnIndexes,
     constraint_idx: usize,
 ) -> Box<dyn TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>> {
-    Box::new(Arg2ValidityConstraint::new(arg2_start_index, rv2_start_index, imm_start_index,load_index,store_index ,beq_index ,blt_index, constraint_idx))
-        as Box<
-            dyn TransitionConstraint<
-                Babybear31PrimeField,
-                Degree4BabyBearU32ExtensionField,
-            >,
-        >
+    Box::new(Arg2ValidityConstraint::new(
+        arg2_start_index,
+        rv2_start_index,
+        imm_start_index,
+        column_indexes,
+        constraint_idx,
+    )) as Box<dyn TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>>
 }

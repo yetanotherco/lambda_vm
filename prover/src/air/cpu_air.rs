@@ -1,5 +1,6 @@
 use crate::air::constraints_templates::{
-    new_add_constraint, new_arg2_validity_constraint, new_bit_constraints, new_sub_constraint
+    Arg2ValidityColumnIndexes, new_add_constraint, new_arg2_validity_constraint,
+    new_bit_constraints, new_sub_constraint,
 };
 
 use lambdaworks_math::field::{
@@ -140,10 +141,12 @@ impl AIR for CPUTableAIR {
             ARG_TWO,
             RV_TWO,
             IMM,
-            LOAD,
-            STORE,
-            BEQ,
-            BLT,
+            Arg2ValidityColumnIndexes {
+                load_index: LOAD,
+                store_index: STORE,
+                beq_index: BEQ,
+                blt_index: BLT,
+            },
             next_index,
         );
 
