@@ -61,6 +61,6 @@ fn test_half_signed() {
 }
 
 #[test]
-fn test_complex() {
+fn test_rlp() {
     run_program_and_check_output("./program_artifacts/rust/rlp.elf", 65536);
 }
