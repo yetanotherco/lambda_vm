@@ -1,6 +1,6 @@
 [workspace]
 members = [
-  "vm",
+  "executor",
   "prover",
   "bin/cli",
 ]
