@@ -541,7 +541,7 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
 
                 let imm = step.get_main_evaluation_element(0, self.imm_start_index);
 
-                let one = FieldElement::<Degree4BabyBearU32ExtensionField>::one();
+                let one = FieldElement::<Babybear31PrimeField>::one();
 
                 let store = step.get_main_evaluation_element(0, self.store_index);
                 let load = step.get_main_evaluation_element(0, self.load_index);
@@ -553,4 +553,23 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
             }
         }
     }
+}
+
+pub fn new_arg2_validity_constraint(
+    arg2_start_index: usize,
+    rv2_start_index: usize,
+    imm_start_index: usize,
+    load_index: usize,
+    store_index: usize,
+    beq_index: usize,
+    blt_index: usize,
+    constraint_idx: usize,
+) -> Box<dyn TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>> {
+    Box::new(Arg2ValidityConstraint::new(arg2_start_index, rv2_start_index, imm_start_index,load_index,store_index ,beq_index ,blt_index, constraint_idx))
+        as Box<
+            dyn TransitionConstraint<
+                Babybear31PrimeField,
+                Degree4BabyBearU32ExtensionField,
+            >,
+        >
 }
