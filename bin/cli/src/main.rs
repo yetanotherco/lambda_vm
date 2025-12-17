@@ -1,4 +1,4 @@
-use vm::{elf::Elf, vm::execution::run_program};
+use executor::{elf::Elf, vm::execution::run_program};
 
 fn main() {
     let mut args = std::env::args();
