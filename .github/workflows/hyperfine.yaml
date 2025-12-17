@@ -64,15 +64,15 @@ jobs:
           path: bin/cli-${{ matrix.branch }}
           key: binary-${{ github.event.pull_request[matrix.branch].sha }}
 
-      - name: Install Rust
-        if: ${{ steps.cache.outputs.cache-hit != 'true' }}
-        uses: ./.github/actions/setup-rust
-
       - name: Checkout
         if: ${{ steps.cache.outputs.cache-hit != 'true' }}
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request[matrix.branch].sha }}
+
+      - name: Install Rust
+        if: ${{ steps.cache.outputs.cache-hit != 'true' }}
+        uses: ./.github/actions/setup-rust
 
       - name: Fetch Rust cache
         if: ${{ steps.cache.outputs.cache-hit != 'true' }}
