@@ -66,7 +66,7 @@ jobs:
 
       - name: Install Rust
         if: ${{ steps.cache.outputs.cache-hit != 'true' }}
-        uses: ./.github/actions/setup-rust
+        uses: .github/actions/setup-rust
 
       - name: Checkout
         if: ${{ steps.cache.outputs.cache-hit != 'true' }}
