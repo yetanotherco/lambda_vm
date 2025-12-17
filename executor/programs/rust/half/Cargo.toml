@@ -1,7 +1,7 @@
 [workspace]
 
 [package]
-name = "fibonacci_iterative"
+name = "half"
 version = "0.1.0"
 edition = "2024"
 
