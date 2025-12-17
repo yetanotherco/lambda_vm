@@ -25,7 +25,9 @@ jobs:
       - name: Checkout base commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request[matrix.branch].sha }}
+          # TODO: uncomment
+          # ref: ${{ github.event.pull_request[matrix.branch].sha }}
+          ref: ${{ github.event.pull_request[head].sha }}
 
       - name: Fetch from cache
         uses: actions/cache@v4
@@ -68,7 +70,9 @@ jobs:
         if: ${{ steps.cache.outputs.cache-hit != 'true' }}
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request[matrix.branch].sha }}
+          # TODO: uncomment
+          # ref: ${{ github.event.pull_request[matrix.branch].sha }}
+          ref: ${{ github.event.pull_request[head].sha }}
 
       - name: Install Rust
         if: ${{ steps.cache.outputs.cache-hit != 'true' }}
