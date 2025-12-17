@@ -83,7 +83,7 @@ jobs:
         if: ${{ steps.cache.outputs.cache-hit != 'true' }}
         run: |
           cargo build --release --bin cli
-          mkdir bin
+          mkdir bench-bin
           cp target/release/cli bin/cli-${{ matrix.branch }}
 
   run-hyperfine:
@@ -102,13 +102,13 @@ jobs:
       - name: Fetch base binary
         uses: actions/cache/restore@v4
         with:
-          path: bin/cli-base
+          path: bench-bin/cli-base
           key: binary-${{ github.event.pull_request.base.sha }}
 
       - name: Fetch HEAD binary
         uses: actions/cache/restore@v4
         with:
-          path: bin/cli-head
+          path: bench-bin/cli-head
           key: binary-${{ github.event.pull_request.head.sha }}
 
       - name: Fetch base programs
