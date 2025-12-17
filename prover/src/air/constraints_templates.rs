@@ -502,14 +502,6 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
         self.constraint_idx
     }
 
-    fn exemptions_period(&self) -> Option<usize> {
-        None
-    }
-
-    fn periodic_exemptions_offset(&self) -> Option<usize> {
-        None
-    }
-
     fn end_exemptions(&self) -> usize {
         0
     }
