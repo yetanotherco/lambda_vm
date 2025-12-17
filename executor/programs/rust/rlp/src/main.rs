@@ -1,6 +1,9 @@
 #![no_std]
 #![no_main]
 
+// Disclaimer: This rlp test program was obtained from ethrex repository
+// https://github.com/lambdaclass/ethrex/blob/main/crates/common/rlp/decode.rs
+
 use core::panic::PanicInfo;
 
 #[panic_handler]
