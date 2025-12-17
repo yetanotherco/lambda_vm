@@ -1,4 +1,4 @@
-use vm::{
+use executor::{
     elf::Elf,
     vm::execution::{ExecutorError, run_program},
 };
