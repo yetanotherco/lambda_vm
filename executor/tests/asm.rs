@@ -428,3 +428,65 @@ fn test_auipc() {
 fn test_auipc_offset() {
     run_program_and_check_output("./program_artifacts/asm/auipc_offset.elf", 0x00011074);
 }
+
+#[test]
+fn test_mul() {
+    run_program_and_check_output("./program_artifacts/asm/mul.elf", -200);
+}
+
+#[test]
+fn test_mul_max() {
+    run_program_and_check_output("./program_artifacts/asm/mul_max.elf", 1);
+}
+
+#[test]
+fn test_mulh_max() {
+    run_program_and_check_output("./program_artifacts/asm/mulh_max.elf", 99);
+}
+
+#[test]
+fn test_mulhu_max() {
+    run_program_and_check_output(
+        "./program_artifacts/asm/mulhu_max.elf",
+        4294967294_u32 as i32,
+    );
+}
+#[test]
+fn test_mulhsu_max() {
+    run_program_and_check_output("./program_artifacts/asm/mulhsu_max.elf", -100);
+}
+
+#[test]
+fn test_div_zero() {
+    run_program_and_check_output("./program_artifacts/asm/div_zero.elf", u32::MAX as i32);
+}
+
+#[test]
+fn test_divu_zero() {
+    run_program_and_check_output("./program_artifacts/asm/divu_zero.elf", u32::MAX as i32);
+}
+
+#[test]
+fn test_divu() {
+    run_program_and_check_output("./program_artifacts/asm/divu.elf", 2147483647);
+}
+
+#[test]
+fn test_rem_zero() {
+    run_program_and_check_output("./program_artifacts/asm/rem_zero.elf", 10);
+}
+
+#[test]
+fn test_rem() {
+    run_program_and_check_output("./program_artifacts/asm/rem.elf", -13);
+}
+
+#[test]
+fn test_remu_zero() {
+    run_program_and_check_output("./program_artifacts/asm/remu_zero.elf", 10);
+}
+
+#[test]
+fn test_remu() {
+    run_program_and_check_output("./program_artifacts/asm/remu.elf", 25);
+}

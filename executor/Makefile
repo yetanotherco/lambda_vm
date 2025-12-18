@@ -43,7 +43,6 @@ $(RUST_ARTIFACTS_DIR)/%.elf: $(RUST_PROGRAMS_DIR)/%/Cargo.toml
 			-Z build-std=core,compiler_builtins \
 			-- --emit asm -C debuginfo=0 -C link-arg=-e -C link-arg=main
 	cp $(RUST_PROGRAMS_DIR)/$*/target/riscv32im-unknown-none-elf/debug/$* $@
-	rm -rf $(RUST_PROGRAMS_DIR)/$*/target
 
 # Compile rust benches
 $(BENCH_ARTIFACTS_DIR)/%.elf: $(BENCH_PROGRAMS_DIR)/%/Cargo.toml

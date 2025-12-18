@@ -77,12 +77,21 @@ pub enum ArithOp {
     ShiftRightArith,
     SetLessThan,
     SetLessThanU,
+    Mul,
+    MulHigh,
+    MulHighSignedUnsigned,
+    MulHighUnsigned,
+    Div,
+    DivUnsigned,
+    Remainder,
+    RemainderUnsigned,
 }
 
 const LOAD_STORE_BYTE_WIDTH: u32 = 0x0;
 const LOAD_STORE_HALF_WIDTH: u32 = 0x1;
 const LOAD_STORE_WORD_WIDTH: u32 = 0x2;
 const LOAD_BYTE_UNSIGNED_FUNC: u32 = 0x4;
+const LOAD_HALF_UNSIGNED_FUNC: u32 = 0x5;
 
 #[derive(Debug, Clone, Copy)]
 pub enum LoadStoreWidth {
@@ -90,6 +99,7 @@ pub enum LoadStoreWidth {
     Half,
     Word,
     ByteUnsigned,
+    HalfUnsigned,
 }
 
 impl LoadStoreWidth {
@@ -99,6 +109,7 @@ impl LoadStoreWidth {
             LOAD_STORE_HALF_WIDTH => LoadStoreWidth::Half,
             LOAD_STORE_WORD_WIDTH => LoadStoreWidth::Word,
             LOAD_BYTE_UNSIGNED_FUNC => LoadStoreWidth::ByteUnsigned,
+            LOAD_HALF_UNSIGNED_FUNC => LoadStoreWidth::HalfUnsigned,
             width => return Err(InstructionError::InvalidLoadStoreWidth(width)),
         })
     }
@@ -205,6 +216,14 @@ const SRL_FUNC_IDENTIFIERS: (u32, u32) = (0x5, 0x00);
 const SRA_FUNC_IDENTIFIERS: (u32, u32) = (0x5, 0x20);
 const SLT_FUNC_IDENTIFIERS: (u32, u32) = (0x2, 0x00);
 const SLTU_FUNC_IDENTIFIERS: (u32, u32) = (0x3, 0x00);
+const MUL_FUNC_IDENTIFIERS: (u32, u32) = (0x0, 0x01);
+const MUL_H_FUNC_IDENTIFIERS: (u32, u32) = (0x1, 0x01);
+const MUL_H_S_U_FUNC_IDENTIFIERS: (u32, u32) = (0x2, 0x01);
+const MUL_H_U_FUNC_IDENTIFIERS: (u32, u32) = (0x3, 0x01);
+const DIV_FUNC_IDENTIFIERS: (u32, u32) = (0x4, 0x01);
+const DIV_U_FUNC_IDENTIFIERS: (u32, u32) = (0x5, 0x01);
+const REM_FUNC_IDENTIFIERS: (u32, u32) = (0x6, 0x01);
+const REM_U_FUNC_IDENTIFIERS: (u32, u32) = (0x7, 0x01);
 
 // R-Type Instruction Format
 // |func7 | rs2  | rs1  |funct3|  rd |opcode|
@@ -228,6 +247,14 @@ fn parse_r_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, 
                 SRA_FUNC_IDENTIFIERS => ArithOp::ShiftRightArith,
                 SLT_FUNC_IDENTIFIERS => ArithOp::SetLessThan,
                 SLTU_FUNC_IDENTIFIERS => ArithOp::SetLessThanU,
+                MUL_FUNC_IDENTIFIERS => ArithOp::Mul,
+                MUL_H_FUNC_IDENTIFIERS => ArithOp::MulHigh,
+                MUL_H_S_U_FUNC_IDENTIFIERS => ArithOp::MulHighSignedUnsigned,
+                MUL_H_U_FUNC_IDENTIFIERS => ArithOp::MulHighUnsigned,
+                DIV_FUNC_IDENTIFIERS => ArithOp::Div,
+                DIV_U_FUNC_IDENTIFIERS => ArithOp::DivUnsigned,
+                REM_FUNC_IDENTIFIERS => ArithOp::Remainder,
+                REM_U_FUNC_IDENTIFIERS => ArithOp::RemainderUnsigned,
                 _ => return Err(InstructionError::UnknownOpcodeFuncIdentifier(opcode, func3)),
             };
             Instruction::Arith {
