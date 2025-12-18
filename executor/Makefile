@@ -7,7 +7,6 @@ RUST_ARTIFACTS_DIR=./program_artifacts/rust
 BENCH_PROGRAMS_DIR=./programs/bench
 BENCH_ARTIFACTS_DIR=./program_artifacts/bench
 
-
 ASM_PROGRAMS = $(wildcard $(ASM_PROGRAMS_DIR)/*.s)
 ARTIFACTS_ASM = $(patsubst $(ASM_PROGRAMS_DIR)/%.s, $(ASM_ARTIFACTS_DIR)/%.elf, $(ASM_PROGRAMS))
 
@@ -23,9 +22,9 @@ compile-programs-asm: clean-asm $(ARTIFACTS_ASM)
 
 compile-programs-rust: clean-rust $(RUST_ARTIFACTS)
 
-compile-bench: clean-benche $(BENCH_ARTIFACTS)
+compile-bench: clean-bench $(BENCH_ARTIFACTS)
 
-compile-programs: compile-programs-asm compile-programs-rust
+compile-programs: compile-programs-asm compile-programs-rust compile-bench
 
 # Compile assembly .s -> .o
 $(ASM_ARTIFACTS_DIR)/%.o: $(ASM_PROGRAMS_DIR)/%.s
@@ -62,11 +61,11 @@ clean-rust:
 	-rm -rf $(RUST_ARTIFACTS_DIR)
 	mkdir -p $(RUST_ARTIFACTS_DIR)
 
-clean-benche:
+clean-bench:
 	-rm -rf $(BENCH_ARTIFACTS_DIR)
 	mkdir -p $(BENCH_ARTIFACTS_DIR)
 
-clean: clean-asm clean-rust clean-rust-bench
+clean: clean-asm clean-rust clean-bench
 
 test: compile-programs test-no-compile
 

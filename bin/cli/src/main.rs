@@ -7,5 +7,5 @@ fn main() {
     let program = Elf::load(&elf_data).expect("Failed to load elf program");
     let (_logs, _) =
         run_program(program.image, program.entry_point).expect("Failed to run program");
-    // TODO: Prove program
+    // TODO: Prove program execution using logs
 }
