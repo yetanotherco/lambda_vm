@@ -152,7 +152,7 @@ jobs:
               fi
             done
           fi
-          ls && \
+          ls \
           find target_programs -name '*.elf' -exec basename -s .elf '{}' '+' | \
           sort | xargs -I '{program}' \
           ./bench-bin/cli-{bin} target_programs/{program}.elf \
