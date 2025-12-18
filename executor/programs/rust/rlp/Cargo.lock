@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "half"
+name = "rlp"
 version = "0.1.0"
