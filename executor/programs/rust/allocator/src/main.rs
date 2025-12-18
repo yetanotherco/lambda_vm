@@ -20,10 +20,11 @@ fn panic(_info: &PanicInfo) -> ! {
 pub fn main() -> u32 {
     {
         use core::mem::MaybeUninit;
+        use core::ptr::addr_of_mut;
         const HEAP_SIZE: usize = 1024;
         static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
-        #[allow(static_mut_refs)]
-        unsafe { HEAP.init(HEAP_MEM.as_ptr() as usize, HEAP_SIZE) }
+        let heap_ptr = addr_of_mut!(HEAP_MEM) as *mut u8;
+        unsafe { HEAP.init(heap_ptr as usize, HEAP_SIZE) }
     }
     let hello = String::from("Hello World");
     return hello.len() as u32;
