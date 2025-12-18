@@ -1,8 +1,15 @@
 use crate::utils::{i32_to_4_limbs, u32_to_2_limbs, u32_to_4_limbs};
+use lambdaworks_math::field::{
+    element::FieldElement, fields::fft_friendly::babybear_u32::Babybear31PrimeField,
+};
 use vm::vm::{
-    instruction::decoding::{ArithOp, Instruction},
+    instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth},
     logs::Log,
 };
+
+use stark_platinum_prover::trace::TraceTable;
+
+type FE = FieldElement<Babybear31PrimeField>;
 
 pub struct CpuTable {
     pub rows: Vec<CpuTableRow>,
@@ -10,46 +17,46 @@ pub struct CpuTable {
 
 #[derive(Default)]
 pub struct CpuTableRow {
-    pub timestamp: [u32; 2],
-    pub pc: [u32; 2],
-    pub rs1: u32,
-    pub rs2: u32,
-    pub rd: u32,
-    pub write_register: u32,
-    pub memory_2bytes: u32,
-    pub memory_4bytes: u32,
-    pub imm: [u32; 2],
-    pub signed: u32,
-    pub mp_selector: u32,
-    pub muldiv_selector: u32,
+    pub timestamp: [FE; 2],
+    pub pc: [FE; 2],
+    pub rs1: FE,
+    pub rs2: FE,
+    pub rd: FE,
+    pub write_register: FE,
+    pub memory_2bytes: FE,
+    pub memory_4bytes: FE,
+    pub imm: [FE; 2],
+    pub signed: FE,
+    pub mp_selector: FE,
+    pub muldiv_selector: FE,
 
-    pub add: u32,
-    pub sub: u32,
-    pub slt: u32,
-    pub and: u32,
-    pub or: u32,
-    pub xor: u32,
-    pub sl: u32,
-    pub sr: u32,
-    pub jalr: u32,
-    pub beq: u32,
-    pub blt: u32,
-    pub load: u32,
-    pub store: u32,
-    pub mul: u32,
-    pub divrem: u32,
-    pub ecall: u32,
-    pub ebreak: u32,
+    pub add: FE,
+    pub sub: FE,
+    pub slt: FE,
+    pub and: FE,
+    pub or: FE,
+    pub xor: FE,
+    pub sl: FE,
+    pub sr: FE,
+    pub jalr: FE,
+    pub beq: FE,
+    pub blt: FE,
+    pub load: FE,
+    pub store: FE,
+    pub mul: FE,
+    pub divrem: FE,
+    pub ecall: FE,
+    pub ebreak: FE,
 
-    pub next_pc: [u32; 2],
-    pub rv1: [u32; 4],
-    pub rv2: [u32; 4],
-    pub rvd: [u32; 2],
-    pub arg2: [u32; 4],
-    pub res: [u32; 4],
+    pub next_pc: [FE; 2],
+    pub rv1: [FE; 4],
+    pub rv2: [FE; 4],
+    pub rvd: [FE; 2],
+    pub arg2: [FE; 4],
+    pub res: [FE; 4],
 
-    pub is_equal: u32,
-    pub branch_cond: u32,
+    pub is_equal: FE,
+    pub branch_cond: FE,
 }
 
 impl CpuTable {
@@ -83,90 +90,186 @@ impl CpuTableRow {
                 src2,
                 op,
             } => {
-                row.rd = dst;
-                row.rs1 = src1;
-                row.rs2 = src2;
+                row.rd = FE::from(&dst);
+                row.rs1 = FE::from(&src1);
+                row.rs2 = FE::from(&src2);
                 row.arg2 = row.rv2;
                 if dst != 0 {
-                    row.write_register = 1u32;
+                    row.write_register = FE::one();
                 }
                 match op {
-                    ArithOp::Add => row.add = 1u32,
-                    ArithOp::Sub => row.sub = 1u32,
-                    ArithOp::Xor => row.xor = 1u32,
-                    ArithOp::Or => row.or = 1u32,
-                    ArithOp::And => row.and = 1u32,
-                    ArithOp::ShiftLeftLogical => row.sl = 1u32,
-                    ArithOp::ShiftRightLogical => row.sr = 1u32,
+                    ArithOp::Add => row.add = FE::one(),
+                    ArithOp::Sub => row.sub = FE::one(),
+                    ArithOp::Xor => row.xor = FE::one(),
+                    ArithOp::Or => row.or = FE::one(),
+                    ArithOp::And => row.and = FE::one(),
+                    ArithOp::ShiftLeftLogical => row.sl = FE::one(),
+                    ArithOp::ShiftRightLogical => row.sr = FE::one(),
                     ArithOp::ShiftRightArith => {
-                        row.sr = 1u32;
-                        row.signed = 1u32;
+                        row.sr = FE::one();
+                        row.signed = FE::one();
                     }
                     ArithOp::SetLessThan => {
-                        row.slt = 1u32;
-                        row.signed = 1u32;
+                        row.slt = FE::one();
+                        row.signed = FE::one();
                     }
-                    ArithOp::SetLessThanU => row.slt = 1u32,
+                    ArithOp::SetLessThanU => row.slt = FE::one(),
                 }
             }
 
             Instruction::ArithImm { dst, src, imm, op } => {
-                row.rd = dst;
-                row.rs1 = src;
+                row.rd = FE::from(&dst);
+                row.rs1 = FE::from(&src);
+                row.rs2 = FE::zero();
                 row.arg2 = i32_to_4_limbs(imm);
                 if dst != 0 {
-                    row.write_register = 1u32;
+                    row.write_register = FE::one();
                 }
                 match op {
-                    ArithOp::Add => row.add = 1u32,
-                    ArithOp::Sub => row.sub = 1u32,
-                    ArithOp::Xor => row.xor = 1u32,
-                    ArithOp::Or => row.or = 1u32,
-                    ArithOp::And => row.and = 1u32,
-                    ArithOp::ShiftLeftLogical => row.sl = 1u32,
-                    ArithOp::ShiftRightLogical => row.sr = 1u32,
+                    ArithOp::Add => row.add = FE::one(),
+                    ArithOp::Sub => row.sub = FE::one(),
+                    ArithOp::Xor => row.xor = FE::one(),
+                    ArithOp::Or => row.or = FE::one(),
+                    ArithOp::And => row.and = FE::one(),
+                    ArithOp::ShiftLeftLogical => row.sl = FE::one(),
+                    ArithOp::ShiftRightLogical => row.sr = FE::one(),
                     ArithOp::ShiftRightArith => {
-                        row.sr = 1u32;
-                        row.signed = 1u32;
+                        row.sr = FE::one();
+                        row.signed = FE::one();
                     }
                     ArithOp::SetLessThan => {
-                        row.slt = 1u32;
-                        row.signed = 1u32;
+                        row.slt = FE::one();
+                        row.signed = FE::one();
                     }
-                    ArithOp::SetLessThanU => row.slt = 1u32,
+                    ArithOp::SetLessThanU => row.slt = FE::one(),
                 }
             }
 
             Instruction::JumpAndLink { dst, offset } => {
-                todo!()
+                row.jalr = FE::one();
+                row.rd = FE::from(&dst);
+                // REVISAR!! Notion dice: PC index = 255.
+                row.rs1 = FE::from(&255u32);
+                row.imm = u32_to_2_limbs(offset as u32);
+                if dst != 0 {
+                    row.write_register = FE::one();
+                }
             }
 
-            Instruction::JumpAndLinkRegister { base, dst, offset } => todo!(),
+            Instruction::JumpAndLinkRegister { base, dst, offset } => {
+                row.jalr = FE::one();
+                row.rd = FE::from(&dst);
+                row.rs1 = FE::from(&base);
+                row.imm = u32_to_2_limbs(offset as u32);
+                row.arg2 = row.rv1;
+                if dst != 0 {
+                    row.write_register = FE::one();
+                }
+            }
 
             Instruction::Store {
                 src,
                 offset,
                 base,
                 width,
-            } => todo!(),
+            } => {
+                row.store = FE::one();
+                row.rs1 = FE::from(&base);
+                row.rs2 = FE::from(&src);
+                row.imm = u32_to_2_limbs(offset as u32);
+
+                match width {
+                    LoadStoreWidth::Half => row.memory_2bytes = FE::one(),
+                    LoadStoreWidth::Word => {
+                        row.memory_2bytes = FE::one();
+                        row.memory_4bytes = FE::one();
+                    }
+                    _ => (),
+                }
+            }
 
             Instruction::Load {
                 dst,
                 offset,
                 base,
                 width,
-            } => todo!(),
+            } => {
+                row.load = FE::one();
+                row.rd = FE::from(&dst);
+                row.rs1 = FE::from(&base);
+                row.imm = u32_to_2_limbs(offset as u32);
+
+                if dst != 0 {
+                    row.write_register = FE::one();
+                }
+
+                match width {
+                    LoadStoreWidth::Half => row.memory_2bytes = FE::one(),
+                    LoadStoreWidth::Word => {
+                        row.memory_2bytes = FE::one();
+                        row.memory_4bytes = FE::one();
+                    }
+                    _ => (),
+                }
+            }
 
             Instruction::Branch {
                 src1,
                 src2,
                 cond,
                 offset,
-            } => todo!(),
+            } => {
+                row.rs1 = FE::from(&src1);
+                row.rs2 = FE::from(&src2);
+                row.imm = u32_to_2_limbs(offset as u32);
+                row.arg2 = row.rv2;
+                match cond {
+                    Comparison::Equal => row.beq = FE::one(),
+                    Comparison::NotEqual => {
+                        row.beq = FE::one();
+                        row.mp_selector = FE::one()
+                    }
+                    Comparison::LessThan => {
+                        row.blt = FE::one();
+                        row.signed = FE::one();
+                    }
+                    Comparison::LessThanUnsigned => row.blt = FE::one(),
+                    Comparison::GreaterOrEqual => {
+                        row.blt = FE::one();
+                        row.signed = FE::one();
+                        row.mp_selector = FE::one()
+                    }
+                    Comparison::GreaterOrEqualUnsigned => {
+                        row.blt = FE::one();
+                        row.mp_selector = FE::one()
+                    }
+                }
+            }
 
-            Instruction::LoadUpperImm { dst, imm } => todo!(),
+            Instruction::LoadUpperImm { dst, imm } => {
+                row.add = FE::one();
+                row.rd = FE::from(&dst);
+                row.rs1 = FE::zero();
+                row.rs2 = FE::zero();
+                row.imm = u32_to_2_limbs(imm << 12);
+                row.arg2 = u32_to_4_limbs(imm << 12);
+                if dst != 0 {
+                    row.write_register = FE::one();
+                }
+            }
 
-            Instruction::AddUpperImmToPc { dst, imm } => todo!(),
+            Instruction::AddUpperImmToPc { dst, imm } => {
+                row.add = FE::one();
+                row.rd = FE::from(&dst);
+                row.rs1 = FE::from(&255u32);
+                row.rs2 = FE::zero();
+                row.imm = u32_to_2_limbs(imm << 12);
+                row.arg2 = u32_to_4_limbs(imm << 12);
+                row.rv1 = u32_to_4_limbs(log.current_pc);
+                if dst != 0 {
+                    row.write_register = FE::one();
+                }
+            }
         }
         row
     }
