@@ -63,7 +63,7 @@ jobs:
         uses: actions/cache@v4
         id: cache
         with:
-          path: bin/cli-${{ matrix.branch }}
+          path: bench-bin/cli-${{ matrix.branch }}
           key: binary-${{ github.event.pull_request.head.sha }}
           # TODO: uncomment
           #key: binary-${{ github.event.pull_request[matrix.branch].sha }}
