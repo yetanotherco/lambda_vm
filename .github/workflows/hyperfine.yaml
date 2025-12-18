@@ -158,7 +158,7 @@ jobs:
           -L bin "$BINS" -n "{bin} {program}" \
           -s "cat ./bench-bin/cli-{bin} target_programs/{program}.elf" \
           "./bench-bin/cli-{bin} target_programs/{program}.elf"
-          echo "benchmark_count=$(ls target_programs/*.md | wc -l)" >> $GITHUB_OUTPUT
+          echo "benchmark_count=$(find target_programs/*.md | wc -l)" >> $GITHUB_OUTPUT
 
       - name: Print tables
         if: steps.run-benchmarks.outputs.benchmark_count != 0
