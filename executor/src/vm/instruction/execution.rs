@@ -165,14 +165,14 @@ impl Instruction {
                 }
             }
             Instruction::AddUpperImmToPc { dst, imm } => {
-                registers.write(dst, pc + imm);
+                registers.write(dst, pc.wrapping_add(imm));
                 Log {
                     instruction: self,
                     current_pc: pc,
                     next_pc: pc + REGULAR_PC_UPDATE,
                     src1_val: 0,
                     src2_val: 0,
-                    dst_val: pc + imm,
+                    dst_val: pc.wrapping_add(imm),
                 }
             }
             Instruction::Arith {
