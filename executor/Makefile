@@ -1,3 +1,5 @@
+UNAME := $(shell uname)
+
 ASM_PROGRAMS_DIR=./programs/asm
 ASM_ARTIFACTS_DIR=./program_artifacts/asm
 
@@ -57,3 +59,23 @@ test-rust: compile-programs-rust
 
 test-no-compile:
 	cargo test
+
+.PHONY: deps
+deps:
+ifeq ($(UNAME), Linux)
+deps: deps-linux
+endif
+ifeq ($(UNAME), Darwin)
+deps: deps-macos
+endif
+
+.PHONY: deps-linux
+deps-linux:
+	@# TODO
+	@echo "not yet implemented"
+	@exit 1
+
+.PHONY: deps-macos
+deps-macos:
+	brew tap riscv-software-src/riscv       
+	brew install riscv-software-src/riscv/riscv-gnu-toolchain
