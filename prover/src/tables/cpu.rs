@@ -2,18 +2,13 @@ use crate::utils::{i32_to_4_limbs, u32_to_2_limbs, u32_to_4_limbs};
 use lambdaworks_math::field::{
     element::FieldElement, fields::fft_friendly::babybear_u32::Babybear31PrimeField,
 };
+use stark_platinum_prover::trace::TraceTable;
 use vm::vm::{
     instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth},
     logs::Log,
 };
 
-use stark_platinum_prover::trace::TraceTable;
-
 type FE = FieldElement<Babybear31PrimeField>;
-
-pub struct CpuTable {
-    pub rows: Vec<CpuTableRow>,
-}
 
 #[derive(Default)]
 pub struct CpuTableRow {
@@ -57,17 +52,6 @@ pub struct CpuTableRow {
 
     pub is_equal: FE,
     pub branch_cond: FE,
-}
-
-impl CpuTable {
-    pub fn from_logs(logs: Vec<Log>) -> Self {
-        let rows = logs
-            .into_iter()
-            .enumerate()
-            .map(|(i, log)| CpuTableRow::from_log(log, (i * 4) as u32))
-            .collect();
-        CpuTable { rows }
-    }
 }
 
 impl CpuTableRow {
@@ -148,7 +132,7 @@ impl CpuTableRow {
             Instruction::JumpAndLink { dst, offset } => {
                 row.jalr = FE::one();
                 row.rd = FE::from(&dst);
-                // REVISAR!! Notion dice: PC index = 255.
+                // TODO: Check PC index = 255.
                 row.rs1 = FE::from(&255u32);
                 row.imm = u32_to_2_limbs(offset as u32);
                 if dst != 0 {
@@ -273,4 +257,78 @@ impl CpuTableRow {
         }
         row
     }
+
+    pub fn to_vec(self) -> Vec<FE> {
+        let mut row = Vec::with_capacity(54);
+
+        // timestamp[2]
+        row.extend_from_slice(&self.timestamp);
+        // pc[2]
+        row.extend_from_slice(&self.pc);
+        row.push(self.rs1);
+        row.push(self.rs2);
+        row.push(self.rd);
+        row.push(self.write_register);
+        row.push(self.memory_2bytes);
+        row.push(self.memory_4bytes);
+        // imm[2]
+        row.extend_from_slice(&self.imm);
+        row.push(self.signed);
+        row.push(self.mp_selector);
+        row.push(self.muldiv_selector);
+
+        row.push(self.add);
+        row.push(self.sub);
+        row.push(self.slt);
+        row.push(self.and);
+        row.push(self.or);
+        row.push(self.xor);
+        row.push(self.sl);
+        row.push(self.sr);
+        row.push(self.jalr);
+        row.push(self.beq);
+        row.push(self.blt);
+        row.push(self.load);
+        row.push(self.store);
+        row.push(self.mul);
+        row.push(self.divrem);
+        row.push(self.ecall);
+        row.push(self.ebreak);
+
+        // next_pc[2]
+        row.extend_from_slice(&self.next_pc);
+        // rv1[4]
+        row.extend_from_slice(&self.rv1);
+        // rv2[4]
+        row.extend_from_slice(&self.rv2);
+        // rvd[2]
+        row.extend_from_slice(&self.rvd);
+        // arg2[4]
+        row.extend_from_slice(&self.arg2);
+        // res[4]
+        row.extend_from_slice(&self.res);
+
+        row.push(self.is_equal);
+        row.push(self.branch_cond);
+
+        debug_assert_eq!(row.len(), 54, "CpuTableRow length mismatch");
+        row
+    }
+}
+
+pub fn cpu_trace_from_logs(
+    logs: Vec<Log>,
+) -> TraceTable<Babybear31PrimeField, Babybear31PrimeField> {
+    const NUM_COLUMNS: usize = 54;
+
+    let main_data: Vec<FE> = logs
+        .into_iter()
+        .enumerate()
+        .flat_map(|(i, log)| {
+            let timestamp = (i * 4) as u32;
+            CpuTableRow::from_log(log, timestamp).to_vec()
+        })
+        .collect();
+
+    TraceTable::new_main(main_data, NUM_COLUMNS, 1)
 }
