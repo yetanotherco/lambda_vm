@@ -165,14 +165,14 @@ impl Instruction {
                 }
             }
             Instruction::AddUpperImmToPc { dst, imm } => {
-                registers.write(dst, pc + imm);
+                registers.write(dst, pc.wrapping_add(imm));
                 Log {
                     instruction: self,
                     current_pc: pc,
-                    next_pc: pc + REGULAR_PC_UPDATE,
+                    next_pc: pc.wrapping_add(REGULAR_PC_UPDATE),
                     src1_val: 0,
                     src2_val: 0,
-                    dst_val: pc + imm,
+                    dst_val: pc.wrapping_add(imm),
                 }
             }
             Instruction::Arith {
@@ -194,6 +194,22 @@ impl Instruction {
                     dst_val: res,
                 }
             }
+            Instruction::CSR {
+                csr: _,
+                src: _,
+                dst: _,
+                op: _,
+            } => {
+                // Todo: CSR are currently no-ops
+                Log {
+                    instruction: self,
+                    current_pc: pc,
+                    next_pc: pc + REGULAR_PC_UPDATE,
+                    src1_val: 0,
+                    src2_val: 0,
+                    dst_val: 0,
+                }
+            }
         })
     }
 }
@@ -202,7 +218,7 @@ impl ArithOp {
     fn apply(&self, a: i32, b: i32) -> i32 {
         match self {
             ArithOp::Add => a.wrapping_add(b),
-            ArithOp::Sub => a - b,
+            ArithOp::Sub => a.wrapping_sub(b),
             ArithOp::Xor => a ^ b,
             ArithOp::Or => a | b,
             ArithOp::And => a & b,

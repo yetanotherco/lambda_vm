@@ -31,7 +31,7 @@ $(RUST_ARTIFACTS_DIR)/%.elf: $(RUST_PROGRAMS_DIR)/%/Cargo.toml
 	cd $(RUST_PROGRAMS_DIR)/$* && \
 		cargo +nightly rustc \
 			--target riscv32im-unknown-none-elf \
-			-Z build-std=core,compiler_builtins \
+			-Z build-std=core,compiler_builtins,alloc \
 			-- --emit asm -C debuginfo=0 -C link-arg=-e -C link-arg=main
 	cp $(RUST_PROGRAMS_DIR)/$*/target/riscv32im-unknown-none-elf/debug/$* $@
 

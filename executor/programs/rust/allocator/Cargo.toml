@@ -1,0 +1,10 @@
+[workspace]
+
+[package]
+name = "allocator"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+embedded-alloc = "0.6"
+riscv = { version = "0.15", features = ["critical-section-single-hart"] }
