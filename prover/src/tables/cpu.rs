@@ -1,12 +1,11 @@
-use crate::utils::{u32_to_2_limbs, u32_to_4_limbs};
-use lambdaworks_math::elliptic_curve::edwards::curves::tiny_jub_jub::TinyJubJubEdwards;
+use crate::utils::{i32_to_4_limbs, u32_to_2_limbs, u32_to_4_limbs};
 use vm::vm::{
     instruction::decoding::{ArithOp, Instruction},
     logs::Log,
 };
 
 pub struct CpuTable {
-    rows: Vec<CpuTableRow>,
+    pub rows: Vec<CpuTableRow>,
 }
 
 #[derive(Default)]
@@ -53,13 +52,16 @@ pub struct CpuTableRow {
     pub branch_cond: u32,
 }
 
-// impl CpuTable {
-//     /// Build a CPU table from a vector of Log entries
-//     pub fn from_logs(logs: Vec<Log>) -> Self {
-//         let rows = logs.into_iter().map(CpuTableRow::from_log).collect();
-//         CpuTable { rows }
-//     }
-// }
+impl CpuTable {
+    pub fn from_logs(logs: Vec<Log>) -> Self {
+        let rows = logs
+            .into_iter()
+            .enumerate()
+            .map(|(i, log)| CpuTableRow::from_log(log, (i * 4) as u32))
+            .collect();
+        CpuTable { rows }
+    }
+}
 
 impl CpuTableRow {
     pub fn from_log(log: Log, timestamp: u32) -> Self {
@@ -85,7 +87,9 @@ impl CpuTableRow {
                 row.rs1 = src1;
                 row.rs2 = src2;
                 row.arg2 = row.rv2;
-
+                if dst != 0 {
+                    row.write_register = 1u32;
+                }
                 match op {
                     ArithOp::Add => row.add = 1u32,
                     ArithOp::Sub => row.sub = 1u32,
@@ -107,7 +111,30 @@ impl CpuTableRow {
             }
 
             Instruction::ArithImm { dst, src, imm, op } => {
-                todo!()
+                row.rd = dst;
+                row.rs1 = src;
+                row.arg2 = i32_to_4_limbs(imm);
+                if dst != 0 {
+                    row.write_register = 1u32;
+                }
+                match op {
+                    ArithOp::Add => row.add = 1u32,
+                    ArithOp::Sub => row.sub = 1u32,
+                    ArithOp::Xor => row.xor = 1u32,
+                    ArithOp::Or => row.or = 1u32,
+                    ArithOp::And => row.and = 1u32,
+                    ArithOp::ShiftLeftLogical => row.sl = 1u32,
+                    ArithOp::ShiftRightLogical => row.sr = 1u32,
+                    ArithOp::ShiftRightArith => {
+                        row.sr = 1u32;
+                        row.signed = 1u32;
+                    }
+                    ArithOp::SetLessThan => {
+                        row.slt = 1u32;
+                        row.signed = 1u32;
+                    }
+                    ArithOp::SetLessThanU => row.slt = 1u32,
+                }
             }
 
             Instruction::JumpAndLink { dst, offset } => {

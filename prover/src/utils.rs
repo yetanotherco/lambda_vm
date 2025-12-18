@@ -13,6 +13,22 @@ pub fn u32_to_4_limbs(x: u32) -> [u32; 4] {
     ]
 }
 
+// TODO: Revisar la logica de como guardar integers in la tabla.
+pub fn i32_to_2_limbs(x: i32) -> [u32; 2] {
+    let unsigned = x as u32;
+    [unsigned & 0xFFFF, (unsigned >> 16) & 0xFFFF]
+}
+
+pub fn i32_to_4_limbs(x: i32) -> [u32; 4] {
+    let unsigned = x as u32;
+    [
+        unsigned & 0xFF,
+        (unsigned >> 8) & 0xFF,
+        (unsigned >> 16) & 0xFF,
+        (unsigned >> 24) & 0xFF,
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
