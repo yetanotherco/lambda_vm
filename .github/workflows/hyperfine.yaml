@@ -136,7 +136,7 @@ jobs:
           sudo swapoff -a
           mkdir target_programs
           if [ 'modified' = ${{ matrix.program_state }} ]; then
-            BINS=head
+            BINS="head"
             for f in head_programs/*.elf; do
               # Only run new or modified benchmarks
               if ! cmp -s ${f/head/base} $f; then
