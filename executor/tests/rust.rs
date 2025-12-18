@@ -61,6 +61,11 @@ fn test_half_signed() {
 }
 
 #[test]
+fn test_rlp() {
+    run_program_and_check_output("./program_artifacts/rust/rlp.elf", 65536);
+}
+
+#[test]
 fn test_allocator() {
     run_program_and_check_output("./program_artifacts/rust/allocator.elf", 11);
 }

@@ -240,29 +240,23 @@ pub fn build_cpu_columns_example() -> Vec<Vec<FE>> {
     ];
     // Column index: 45
     let arg2_2 = vec![FE::zero(); 4];
-    // Column index: 46
-    let arg2_3 = vec![FE::zero(); 4];
-    // Column index: 47
-    let arg2_4 = vec![FE::zero(); 4];
 
     columns.push(arg2_1);
     columns.push(arg2_2);
-    columns.push(arg2_3);
-    columns.push(arg2_4);
 
     // The word2L ALU result.
-    // Column index: 48
+    // Column index: 46
     let res_1 = vec![
         FE::from(&60u32),   // rv1 + rv2 = 10 + 50
         FE::from(&21u32),   // rv1 + imm = 20 + 1.
         FE::from(&4125u32), // rv1 + imm = 30 + 2^12 - 1 = 4125.
         FE::from(&30u32),   // rv2 - rv1 = 40 - 10 = 30
     ];
-    // Column index: 49
+    // Column index: 47
     let res_2 = vec![FE::zero(); 4];
-    // Column index: 50
+    // Column index: 48
     let res_3 = vec![FE::zero(); 4];
-    // Column index: 51
+    // Column index: 49
     let res_4 = vec![FE::zero(); 4];
 
     columns.push(res_1);
@@ -271,12 +265,12 @@ pub fn build_cpu_columns_example() -> Vec<Vec<FE>> {
     columns.push(res_4);
 
     // Flag: Wether rv1 and arg2 are equal.
-    // Column index: 52
+    // Column index: 50
     let is_equal = vec![FE::zero(), FE::zero(), FE::zero(), FE::zero()];
     columns.push(is_equal);
 
     // Flag: Whether a branch is taken.
-    // Column index: 53
+    // Column index: 51
     let branch_cond = vec![FE::zero(), FE::zero(), FE::zero(), FE::zero()];
     columns.push(branch_cond);
 
@@ -297,6 +291,7 @@ mod tests {
     #[test]
     fn test_prove_cpu_table() {
         let columns = build_cpu_columns_example();
+        println!("columns: {:?}", columns.len());
         let mut trace = build_cpu_trace(columns);
         let proof_options = ProofOptions::default_test_options();
 

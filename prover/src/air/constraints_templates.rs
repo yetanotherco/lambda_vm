@@ -134,11 +134,13 @@ pub enum CarryIndex {
 
 /// Enforces correct carry bit values in multi-limb addition operations.
 ///
-/// For 32-bit addition split into two 16-bit words (each composed of two 8-bit limbs):
+/// As the lhs and res inputs are 4-limb words, we cast them into two 16-bit words:
+/// CAST(a, word2L) -> a[i] + 256 * a[i + 1]
+/// Then we compute the carries to be constrained.
 ///
 /// Carry 0:
 /// lhs_0 = lhs[0] + 256 * lhs[1]
-/// rhs_0 = rhs[0] + 256 * rhs[1]
+/// rhs_0 = rhs[1]
 /// res_0 = res[0] + 256 * res[1]
 ///
 /// carry_0 = (lhs_0 + rhs_0 - res_0) / 65536
@@ -146,7 +148,7 @@ pub enum CarryIndex {
 ///
 /// Carry 1:
 /// lhs_1 = lhs[2] + 256 * lhs[3]
-/// rhs_1 = rhs[2] + 256 * rhs[3]
+/// rhs_1 = rhs[1]
 /// res_1 = res[2] + 256 * res[3]
 ///
 /// carry_1 = (lhs_1 + rhs_1 - res_1 + carry_0) / 65536
@@ -173,7 +175,7 @@ impl CarryBitConstraint {
     /// * `carry_idx` - Which carry to constrain (Zero or One)
     /// * `flags_idx` - Columns containing activation flags
     /// * `lhs_start_idx` - Starting column index for left operand's 4 limbs
-    /// * `rhs_start_idx` - Starting column index for right operand's 4 limbs
+    /// * `rhs_start_idx` - Starting column index for right operand's 2 limbs
     /// * `res_start_idx` - Starting column index for result's 4 limbs
     /// * `constraint_idx` - Unique constraint identifier
     fn new(
@@ -204,14 +206,6 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
 
     fn constraint_idx(&self) -> usize {
         self.constraint_idx
-    }
-
-    fn exemptions_period(&self) -> Option<usize> {
-        None
-    }
-
-    fn periodic_exemptions_offset(&self) -> Option<usize> {
-        None
     }
 
     fn end_exemptions(&self) -> usize {
@@ -256,8 +250,7 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
                 // Compute the low word using the first 2 operand limbs.
                 let lhs_0 = step.get_main_evaluation_element(0, self.lhs_start_idx)
                     + two_fifty_six * step.get_main_evaluation_element(0, self.lhs_start_idx + 1);
-                let rhs_0 = step.get_main_evaluation_element(0, self.rhs_start_idx)
-                    + two_fifty_six * step.get_main_evaluation_element(0, self.rhs_start_idx + 1);
+                let rhs_0 = step.get_main_evaluation_element(0, self.rhs_start_idx);
                 let res_0 = step.get_main_evaluation_element(0, self.res_start_idx)
                     + two_fifty_six * step.get_main_evaluation_element(0, self.res_start_idx + 1);
 
@@ -272,9 +265,7 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
                         let lhs_1 = step.get_main_evaluation_element(0, self.lhs_start_idx + 2)
                             + two_fifty_six
                                 * step.get_main_evaluation_element(0, self.lhs_start_idx + 3);
-                        let rhs_1 = step.get_main_evaluation_element(0, self.rhs_start_idx + 2)
-                            + two_fifty_six
-                                * step.get_main_evaluation_element(0, self.rhs_start_idx + 3);
+                        let rhs_1 = step.get_main_evaluation_element(0, self.rhs_start_idx + 1);
                         let res_1 = step.get_main_evaluation_element(0, self.res_start_idx + 2)
                             + two_fifty_six
                                 * step.get_main_evaluation_element(0, self.res_start_idx + 3);
@@ -301,8 +292,7 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
 
                 let lhs_0 = step.get_main_evaluation_element(0, self.lhs_start_idx)
                     + two_fifty_six * step.get_main_evaluation_element(0, self.lhs_start_idx + 1);
-                let rhs_0 = step.get_main_evaluation_element(0, self.rhs_start_idx)
-                    + two_fifty_six * step.get_main_evaluation_element(0, self.rhs_start_idx + 1);
+                let rhs_0 = step.get_main_evaluation_element(0, self.rhs_start_idx);
                 let res_0 = step.get_main_evaluation_element(0, self.res_start_idx)
                     + two_fifty_six * step.get_main_evaluation_element(0, self.res_start_idx + 1);
 
@@ -316,9 +306,7 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
                         let lhs_1 = step.get_main_evaluation_element(0, self.lhs_start_idx + 2)
                             + two_fifty_six
                                 * step.get_main_evaluation_element(0, self.lhs_start_idx + 3);
-                        let rhs_1 = step.get_main_evaluation_element(0, self.rhs_start_idx + 2)
-                            + two_fifty_six
-                                * step.get_main_evaluation_element(0, self.rhs_start_idx + 3);
+                        let rhs_1 = step.get_main_evaluation_element(0, self.rhs_start_idx + 1);
                         let res_1 = step.get_main_evaluation_element(0, self.res_start_idx + 2)
                             + two_fifty_six
                                 * step.get_main_evaluation_element(0, self.res_start_idx + 3);
@@ -343,7 +331,7 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
 /// ## Arguments
 /// * `flags_idx` - Column indices for instruction selector flags
 /// * `lhs_start_idx` - Starting column for left operand (requires 4 consecutive columns)
-/// * `rhs_start_idx` - Starting column for right operand (requires 4 consecutive columns)
+/// * `rhs_start_idx` - Starting column for right operand (requires 2 consecutive columns)
 /// * `res_start_idx` - Starting column for result (requires 4 consecutive columns)
 /// * `constraint_idx_start` - Starting constraint index (will use idx and idx+1)
 ///
@@ -386,7 +374,7 @@ pub fn new_add_constraint(
 /// ## Arguments
 /// * `flags_idx` - Column indices for instruction selector flags
 /// * `lhs_start_idx` - Starting column for left operand (requires 4 consecutive columns)
-/// * `rhs_start_idx` - Starting column for right operand (requires 4 consecutive columns)
+/// * `rhs_start_idx` - Starting column for right operand (requires 2 consecutive columns)
 /// * `res_start_idx` - Starting column for result (requires 4 consecutive columns)
 /// * `constraint_idx_start` - Starting constraint index (will use idx and idx+1)
 ///
