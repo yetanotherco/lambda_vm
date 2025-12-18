@@ -6,6 +6,28 @@ We are developing an open-source verifiable virtual machine that allows users to
 
 Right now, this is a project under development and experimentation and must not be used in production!
 
+## Getting Started
+
+### Dependencies
+
+- Rust 1.90.0
+- Risc-V toolchain (To run executor tests)
+
+### Setup executor
+
+```sh
+cd executor
+make deps
+```
+
+**Note:** At the moment, `make deps` only works on macOS.
+
+Then, you can check that the executor works by running:
+
+```sh
+make test
+```
+
 ## Design choices
 
 - The Instruction Set Architecture is RISCV64IM
