@@ -3,7 +3,7 @@ use lambdaworks_math::field::fields::fft_friendly::{
 };
 use stark_platinum_prover::{fri::FieldElement, table::TableView};
 
-pub(crate) fn get_two_limbs(
+pub(crate) fn compute_element_from_two_limbs_starting_at(
     step: &TableView<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>,
     index: usize,
 ) -> FieldElement<Babybear31PrimeField> {
@@ -12,7 +12,7 @@ pub(crate) fn get_two_limbs(
         + two_fifty_six * step.get_main_evaluation_element(0, index + 1)
 }
 
-pub(crate) fn get_four_limbs(
+pub(crate) fn compute_element_from_four_limbs_starting_at(
     step: &TableView<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>,
     index: usize,
 ) -> FieldElement<Babybear31PrimeField> {
@@ -26,7 +26,7 @@ pub(crate) fn get_four_limbs(
             * step.get_main_evaluation_element(0, index + 3)
 }
 
-pub(crate) fn get_two_limbs_extension(
+pub(crate) fn compute_element_from_two_limbs_starting_at_extension(
     step: &TableView<Degree4BabyBearU32ExtensionField, Degree4BabyBearU32ExtensionField>,
     index: usize,
 ) -> FieldElement<Degree4BabyBearU32ExtensionField> {
@@ -35,7 +35,7 @@ pub(crate) fn get_two_limbs_extension(
         + two_fifty_six * step.get_main_evaluation_element(0, index + 1)
 }
 
-pub(crate) fn get_four_limbs_extension(
+pub(crate) fn compute_element_from_four_limbs_starting_at_extension(
     step: &TableView<Degree4BabyBearU32ExtensionField, Degree4BabyBearU32ExtensionField>,
     index: usize,
 ) -> FieldElement<Degree4BabyBearU32ExtensionField> {

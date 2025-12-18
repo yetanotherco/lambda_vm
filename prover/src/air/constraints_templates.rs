@@ -9,7 +9,10 @@ use stark_platinum_prover::{
 };
 
 use crate::air::utils::{
-    get_four_limbs, get_four_limbs_extension, get_two_limbs, get_two_limbs_extension,
+    compute_element_from_four_limbs_starting_at,
+    compute_element_from_four_limbs_starting_at_extension,
+    compute_element_from_two_limbs_starting_at,
+    compute_element_from_two_limbs_starting_at_extension,
 };
 
 pub const INV_65536: u64 = 2013235201;
@@ -256,9 +259,9 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
                     });
 
                 // Compute the low word using the first 2 operand limbs.
-                let lhs_0 = get_two_limbs(step, self.lhs_start_idx);
-                let rhs_0 = get_two_limbs(step, self.rhs_start_idx);
-                let res_0 = get_two_limbs(step, self.res_start_idx);
+                let lhs_0 = compute_element_from_two_limbs_starting_at(step, self.lhs_start_idx);
+                let rhs_0 = compute_element_from_two_limbs_starting_at(step, self.rhs_start_idx);
+                let res_0 = compute_element_from_two_limbs_starting_at(step, self.res_start_idx);
 
                 let one = FieldElement::<Babybear31PrimeField>::one();
                 let inverse = FieldElement::<Babybear31PrimeField>::from(INV_65536);
@@ -268,9 +271,18 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
                     CarryIndex::Zero => flag * carry_0 * (carry_0 - one),
                     CarryIndex::One => {
                         // Compute the high word using the first 2 operand limbs.
-                        let lhs_1 = get_two_limbs(step, self.lhs_start_idx + 2);
-                        let rhs_1 = get_two_limbs(step, self.rhs_start_idx + 2);
-                        let res_1 = get_two_limbs(step, self.res_start_idx + 2);
+                        let lhs_1 = compute_element_from_two_limbs_starting_at(
+                            step,
+                            self.lhs_start_idx + 2,
+                        );
+                        let rhs_1 = compute_element_from_two_limbs_starting_at(
+                            step,
+                            self.rhs_start_idx + 2,
+                        );
+                        let res_1 = compute_element_from_two_limbs_starting_at(
+                            step,
+                            self.res_start_idx + 2,
+                        );
                         let carry_1 = (lhs_1 + rhs_1 - res_1 + carry_0) * inverse;
                         flag * carry_1 * (carry_1 - one)
                     }
@@ -290,9 +302,12 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
                     |acc, &idx| acc + step.get_main_evaluation_element(0, idx),
                 );
 
-                let lhs_0 = get_two_limbs_extension(step, self.lhs_start_idx);
-                let rhs_0 = get_two_limbs_extension(step, self.rhs_start_idx);
-                let res_0 = get_two_limbs_extension(step, self.res_start_idx);
+                let lhs_0 =
+                    compute_element_from_two_limbs_starting_at_extension(step, self.lhs_start_idx);
+                let rhs_0 =
+                    compute_element_from_two_limbs_starting_at_extension(step, self.rhs_start_idx);
+                let res_0 =
+                    compute_element_from_two_limbs_starting_at_extension(step, self.res_start_idx);
 
                 let one = FieldElement::<Degree4BabyBearU32ExtensionField>::one();
                 let inverse = FieldElement::<Degree4BabyBearU32ExtensionField>::from(INV_65536);
@@ -301,9 +316,18 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
                 let bit_constraint = match self.carry_idx {
                     CarryIndex::Zero => flag * carry_0 * (carry_0 - one),
                     CarryIndex::One => {
-                        let lhs_1 = get_two_limbs_extension(step, self.lhs_start_idx + 2);
-                        let rhs_1 = get_two_limbs_extension(step, self.rhs_start_idx + 2);
-                        let res_1 = get_two_limbs_extension(step, self.res_start_idx + 2);
+                        let lhs_1 = compute_element_from_two_limbs_starting_at_extension(
+                            step,
+                            self.lhs_start_idx + 2,
+                        );
+                        let rhs_1 = compute_element_from_two_limbs_starting_at_extension(
+                            step,
+                            self.rhs_start_idx + 2,
+                        );
+                        let res_1 = compute_element_from_two_limbs_starting_at_extension(
+                            step,
+                            self.res_start_idx + 2,
+                        );
                         let carry_1 = (lhs_1 + rhs_1 - res_1 + carry_0) * inverse;
                         flag * carry_1 * (carry_1 - one)
                     }
@@ -492,9 +516,9 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
             } => {
                 let step = frame.get_evaluation_step(0);
 
-                let arg2 = get_two_limbs(step, self.arg2_start_index);
+                let arg2 = compute_element_from_two_limbs_starting_at(step, self.arg2_start_index);
 
-                let rv2 = get_four_limbs(step, self.rv2_start_index);
+                let rv2 = compute_element_from_four_limbs_starting_at(step, self.rv2_start_index);
 
                 let imm = step.get_main_evaluation_element(0, self.imm_start_index);
 
@@ -516,9 +540,15 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
             } => {
                 let step = frame.get_evaluation_step(0);
 
-                let arg2 = get_two_limbs_extension(step, self.arg2_start_index);
+                let arg2 = compute_element_from_two_limbs_starting_at_extension(
+                    step,
+                    self.arg2_start_index,
+                );
 
-                let rv2 = get_four_limbs_extension(step, self.rv2_start_index);
+                let rv2 = compute_element_from_four_limbs_starting_at_extension(
+                    step,
+                    self.rv2_start_index,
+                );
 
                 let imm = step.get_main_evaluation_element(0, self.imm_start_index);
 
