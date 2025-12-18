@@ -89,7 +89,7 @@ jobs:
         run: |
           cargo build --release --bin cli
           mkdir bench-bin
-          cp target/release/cli bin/cli-${{ matrix.branch }}
+          cp target/release/cli bench-bin/cli-${{ matrix.branch }}
 
   run-hyperfine:
     strategy:
