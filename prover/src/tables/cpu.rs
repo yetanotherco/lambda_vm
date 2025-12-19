@@ -261,7 +261,6 @@ impl CpuTableRow {
                 }
             }
         }
-        println!("Row: {:?}", row);
         row
     }
 
