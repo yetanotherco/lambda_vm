@@ -397,7 +397,6 @@ pub fn new_sub_constraint(
     res_start_idx: usize,
     constraint_idx_start: usize,
 ) -> Vec<Box<dyn TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>>> {
-    let a = 1;
     vec![
         Box::new(CarryBitConstraint::new(
             CarryIndex::Zero,

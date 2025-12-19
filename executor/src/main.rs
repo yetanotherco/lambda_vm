@@ -4,8 +4,6 @@ use executor::{
 };
 
 fn main() -> Result<(), ExecutorError> {
-    let a = 1;
-
     println!("Reading elf");
     let elf_data = std::fs::read("./program_artifacts/asm/basic_program.elf").unwrap();
     let program = Elf::load(&elf_data).unwrap();
