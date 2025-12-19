@@ -1,3 +1,5 @@
+use executor::vm::instruction::decoding::{ArithOp, Instruction};
+use executor::vm::logs::Log;
 use lambdaworks_math::field::{
     element::FieldElement, fields::fft_friendly::babybear_u32::Babybear31PrimeField,
 };
@@ -277,10 +279,67 @@ pub fn build_cpu_columns_example() -> Vec<Vec<FE>> {
     columns
 }
 
+pub fn get_add_logs() -> Vec<Log> {
+    vec![
+        Log {
+            instruction: Instruction::ArithImm {
+                dst: 12,
+                src: 0,
+                imm: 10,
+                op: ArithOp::Add,
+            },
+            current_pc: 65652,
+            next_pc: 65656,
+            src1_val: 0,
+            src2_val: 0,
+            dst_val: 10,
+        },
+        Log {
+            instruction: Instruction::ArithImm {
+                dst: 13,
+                src: 0,
+                imm: 20,
+                op: ArithOp::Add,
+            },
+            current_pc: 65656,
+            next_pc: 65660,
+            src1_val: 0,
+            src2_val: 0,
+            dst_val: 20,
+        },
+        Log {
+            instruction: Instruction::Arith {
+                dst: 10,
+                src1: 12,
+                src2: 13,
+                op: ArithOp::Add,
+            },
+            current_pc: 65660,
+            next_pc: 65664,
+            src1_val: 10,
+            src2_val: 20,
+            dst_val: 30,
+        },
+        Log {
+            instruction: Instruction::JumpAndLinkRegister {
+                base: 1,
+                dst: 0,
+                offset: 0,
+            },
+            current_pc: 65664,
+            next_pc: 0,
+            src1_val: 0,
+            src2_val: 0,
+            dst_val: 65668,
+        },
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::constraints::cpu_air::{CPUTableAIR, build_cpu_trace};
+    use crate::tables::cpu::cpu_trace_from_logs;
     use lambdaworks_crypto::fiat_shamir::default_transcript::DefaultTranscript;
     use lambdaworks_math::field::fields::fft_friendly::quartic_babybear_u32::Degree4BabyBearU32ExtensionField;
     use stark_platinum_prover::{
@@ -291,8 +350,30 @@ mod tests {
     #[test]
     fn test_prove_cpu_table() {
         let columns = build_cpu_columns_example();
-        println!("columns: {:?}", columns.len());
         let mut trace = build_cpu_trace(columns);
+        let proof_options = ProofOptions::default_test_options();
+
+        let proof = Prover::<CPUTableAIR>::prove(
+            &mut trace,
+            &(),
+            &proof_options,
+            DefaultTranscript::<Degree4BabyBearU32ExtensionField>::new(&[]),
+        )
+        .unwrap();
+
+        assert!(Verifier::<CPUTableAIR>::verify(
+            &proof,
+            &(),
+            &proof_options,
+            DefaultTranscript::<Degree4BabyBearU32ExtensionField>::new(&[]),
+        ));
+    }
+
+    #[test]
+    fn test_cpu_table_from_add_logs() {
+        let logs = get_add_logs();
+        let mut trace = cpu_trace_from_logs(logs);
+
         let proof_options = ProofOptions::default_test_options();
 
         let proof = Prover::<CPUTableAIR>::prove(

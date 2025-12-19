@@ -281,10 +281,10 @@ dependencies = [
 name = "prover"
 version = "0.1.0"
 dependencies = [
+ "executor",
  "lambdaworks-crypto",
  "lambdaworks-math",
  "stark-platinum-prover",
- "vm",
 ]
 
 [[package]]

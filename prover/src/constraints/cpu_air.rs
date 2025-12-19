@@ -142,7 +142,7 @@ impl AIR for CPUTableAIR {
 
         let context = AirContext {
             proof_options: proof_options.clone(),
-            trace_columns: 52,
+            trace_columns: 54,
             transition_offsets: vec![0],
             num_transition_constraints,
         };
@@ -180,7 +180,7 @@ impl AIR for CPUTableAIR {
     }
 
     fn trace_layout(&self) -> (usize, usize) {
-        (52, 0)
+        (54, 0)
     }
 
     fn pub_inputs(&self) -> &Self::PublicInputs {

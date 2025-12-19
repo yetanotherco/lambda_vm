@@ -1,12 +1,15 @@
 use crate::utils::{i32_to_4_limbs, u32_to_2_limbs, u32_to_4_limbs};
-use lambdaworks_math::field::{
-    element::FieldElement, fields::fft_friendly::babybear_u32::Babybear31PrimeField,
-};
-use stark_platinum_prover::trace::TraceTable;
-use vm::vm::{
+use executor::vm::{
     instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth},
     logs::Log,
 };
+use lambdaworks_math::field::{
+    element::FieldElement,
+    fields::fft_friendly::{
+        babybear_u32::Babybear31PrimeField, quartic_babybear_u32::Degree4BabyBearU32ExtensionField,
+    },
+};
+use stark_platinum_prover::trace::TraceTable;
 
 type FE = FieldElement<Babybear31PrimeField>;
 
@@ -98,6 +101,7 @@ impl CpuTableRow {
                         row.signed = FE::one();
                     }
                     ArithOp::SetLessThanU => row.slt = FE::one(),
+                    _ => todo!(),
                 }
             }
 
@@ -126,6 +130,7 @@ impl CpuTableRow {
                         row.signed = FE::one();
                     }
                     ArithOp::SetLessThanU => row.slt = FE::one(),
+                    _ => todo!(),
                 }
             }
 
@@ -318,7 +323,7 @@ impl CpuTableRow {
 
 pub fn cpu_trace_from_logs(
     logs: Vec<Log>,
-) -> TraceTable<Babybear31PrimeField, Babybear31PrimeField> {
+) -> TraceTable<Babybear31PrimeField, Degree4BabyBearU32ExtensionField> {
     const NUM_COLUMNS: usize = 54;
 
     let main_data: Vec<FE> = logs
