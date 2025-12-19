@@ -76,6 +76,7 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
                 let flag = step.get_main_evaluation_element(0, self.column_idx);
                 let one = FieldElement::<Babybear31PrimeField>::one();
                 let bit_constraint = flag * (flag - one);
+                println!("Bit constraint: {:?}", bit_constraint);
                 transition_evaluations[self.constraint_idx()] = bit_constraint.to_extension();
             }
 
@@ -273,6 +274,7 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
                         flag * carry_1 * (carry_1 - one)
                     }
                 };
+                println!("Carry: {:?}", bit_constraint);
                 transition_evaluations[self.constraint_idx()] = bit_constraint.to_extension();
             }
 
