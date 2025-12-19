@@ -1,6 +1,6 @@
 use crate::air::constraints_templates::{
     Arg2ValidityColumnIndexes, new_add_constraint, new_arg2_validity_constraint,
-    new_bit_constraints, new_sub_constraint,
+    new_bit_constraints, new_sub_constraint, new_add_four_constraint
 };
 
 use lambdaworks_math::field::{
@@ -19,7 +19,7 @@ use stark_platinum_prover::{
 
 // CPU Columns indeces:
 // const TIMESTAMP: usize = 0;
-// const PC: usize = 2;
+const PC: usize = 2;
 // const RS: usize = 4;
 // const RD: usize = 6;
 const WRITE_REGISTER: usize = 7;
@@ -134,6 +134,15 @@ impl AIR for CPUTableAIR {
             RES,            // res_start_idx,
             next_index,     // constraint_idx_start,
         );
+        next_index += 2;
+
+        // Enforces RES = PC + 4 in a JALR instruction
+        let next_pc_value_constraint = new_add_four_constraint(
+            JALR,       // flags_idx,
+            PC,         // rhs_start_idx,
+            RES,        // res_start_idx,
+            next_index, // constraint_idx_start,
+        );
 
         next_index += 2;
 
@@ -153,6 +162,7 @@ impl AIR for CPUTableAIR {
         let mut constraints = bit_constraints;
         constraints.extend(add_constraints);
         constraints.extend(sub_constraints);
+        constraints.extend(next_pc_value_constraint);
         constraints.push(arg2_validity_constraint);
 
         let num_transition_constraints = constraints.len();
