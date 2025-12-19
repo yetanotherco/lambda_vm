@@ -445,7 +445,7 @@ pub fn new_sub_constraint(
 #[derive(Clone)]
 pub struct AddFourCarryBitConstraint {
     carry_idx: CarryIndex,
-    flags_idx: Vec<usize>,
+    flag_idx: usize,
     lhs_start_idx: usize,
     res_start_idx: usize,
     constraint_idx: usize,
@@ -462,14 +462,14 @@ impl AddFourCarryBitConstraint {
     /// * `constraint_idx` - Unique constraint identifier
     fn new(
         carry_idx: CarryIndex,
-        flags_idx: Vec<usize>,
+        flag_idx: usize,
         lhs_start_idx: usize,
         res_start_idx: usize,
         constraint_idx: usize,
     ) -> Self {
         Self {
             carry_idx,
-            flags_idx,
+            flag_idx,
             lhs_start_idx,
             res_start_idx,
             constraint_idx,
@@ -516,16 +516,9 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
                 rap_challenges: _rap_challenges,
             } => {
                 let step = frame.get_evaluation_step(0);
-
                 let two_fifty_six = FieldElement::<Babybear31PrimeField>::from(256);
 
-                // Sum all activation flags
-                let flag = self
-                    .flags_idx
-                    .iter()
-                    .fold(FieldElement::<Babybear31PrimeField>::zero(), |acc, &idx| {
-                        acc + step.get_main_evaluation_element(0, idx)
-                    });
+                let flag = step.get_main_evaluation_element(0, self.flag_idx);
 
                 let lhs_0 = step.get_main_evaluation_element(0, self.lhs_start_idx);
                 let rhs_0 = FieldElement::<Babybear31PrimeField>::from(4);
@@ -558,13 +551,9 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
                 rap_challenges: _rap_challenges,
             } => {
                 let step = frame.get_evaluation_step(0);
-
                 let two_fifty_six = FieldElement::<Babybear31PrimeField>::from(256);
 
-                let flag = self.flags_idx.iter().fold(
-                    FieldElement::<Degree4BabyBearU32ExtensionField>::zero(),
-                    |acc, &idx| acc + step.get_main_evaluation_element(0, idx),
-                );
+                let flag = step.get_main_evaluation_element(0, self.flag_idx);
 
                 let lhs_0 = step.get_main_evaluation_element(0, self.lhs_start_idx);
                 let rhs_0 = FieldElement::<Degree4BabyBearU32ExtensionField>::from(4);
@@ -606,7 +595,7 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
 /// This helper function creates both constraints with sequential constraint indices.
 ///
 /// ## Arguments
-/// * `flags_idx` - Column indices for instruction selector flags
+/// * `flag_idx` - Column index for instruction selector flag
 /// * `lhs_start_idx` - Starting column for left operand (requires 2 consecutive columns)
 /// * `res_start_idx` - Starting column for result (requires 4 consecutive columns)
 /// * `constraint_idx_start` - Starting constraint index (will use idx and idx+1)
@@ -614,7 +603,7 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
 /// ## Returns
 /// A vector of two boxed constraints: [carry_0_constraint, carry_1_constraint]
 pub fn new_add_four_constraint(
-    flags_idx: Vec<usize>,
+    flag_idx: usize,
     lhs_start_idx: usize,
     res_start_idx: usize,
     constraint_idx_start: usize,
@@ -622,14 +611,14 @@ pub fn new_add_four_constraint(
     vec![
         Box::new(AddFourCarryBitConstraint::new(
             CarryIndex::Zero,
-            flags_idx.clone(),
+            flag_idx,
             lhs_start_idx,
             res_start_idx,
             constraint_idx_start,
         )),
         Box::new(AddFourCarryBitConstraint::new(
             CarryIndex::One,
-            flags_idx,
+            flag_idx,
             lhs_start_idx,
             res_start_idx,
             constraint_idx_start + 1,

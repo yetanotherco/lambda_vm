@@ -137,7 +137,7 @@ impl AIR for CPUTableAIR {
 
         // Enforces RES = PC + 4 in a JALR instruction
         let next_pc_value_constraint = new_add_four_constraint(
-            vec![JALR], // flags_idx,
+            JALR,       // flags_idx,
             PC,         // rhs_start_idx,
             RES,        // res_start_idx,
             next_index, // constraint_idx_start,
