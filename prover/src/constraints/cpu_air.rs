@@ -19,7 +19,8 @@ use stark_platinum_prover::{
 // CPU Columns indeces:
 // const TIMESTAMP: usize = 0;
 const PC: usize = 2;
-// const RS: usize = 4;
+// const RS1: usize = 4;
+// const RS2: usize = 5;
 // const RD: usize = 6;
 const WRITE_REGISTER: usize = 7;
 const MEMORY_2BYTES: usize = 8;
@@ -152,7 +153,7 @@ impl AIR for CPUTableAIR {
 
         let context = AirContext {
             proof_options: proof_options.clone(),
-            trace_columns: 54,
+            trace_columns: 52,
             transition_offsets: vec![0],
             num_transition_constraints,
         };
@@ -190,7 +191,7 @@ impl AIR for CPUTableAIR {
     }
 
     fn trace_layout(&self) -> (usize, usize) {
-        (54, 0)
+        (52, 0)
     }
 
     fn pub_inputs(&self) -> &Self::PublicInputs {

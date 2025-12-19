@@ -50,7 +50,7 @@ pub struct CpuTableRow {
     pub rv1: [FE; 4],
     pub rv2: [FE; 4],
     pub rvd: [FE; 2],
-    pub arg2: [FE; 4],
+    pub arg2: [FE; 2],
     pub res: [FE; 4],
 
     pub is_equal: FE,
@@ -80,7 +80,7 @@ impl CpuTableRow {
                 row.rd = FE::from(&dst);
                 row.rs1 = FE::from(&src1);
                 row.rs2 = FE::from(&src2);
-                row.arg2 = row.rv2;
+                row.arg2 = u32_to_2_limbs(log.src2_val);
                 if dst != 0 {
                     row.write_register = FE::one();
                 }
@@ -110,7 +110,7 @@ impl CpuTableRow {
                 row.rs1 = FE::from(&src);
                 row.rs2 = FE::zero();
                 row.imm = i32_to_2_limbs(imm);
-                row.arg2 = i32_to_4_limbs(imm);
+                row.arg2 = i32_to_2_limbs(imm);
                 if dst != 0 {
                     row.write_register = FE::one();
                 }
@@ -151,7 +151,7 @@ impl CpuTableRow {
                 row.rd = FE::from(&dst);
                 row.rs1 = FE::from(&base);
                 row.imm = u32_to_2_limbs(offset as u32);
-                row.arg2 = row.rv1;
+                row.arg2 = u32_to_2_limbs(log.src1_val);
                 if dst != 0 {
                     row.write_register = FE::one();
                 }
@@ -212,7 +212,7 @@ impl CpuTableRow {
                 row.rs1 = FE::from(&src1);
                 row.rs2 = FE::from(&src2);
                 row.imm = u32_to_2_limbs(offset as u32);
-                row.arg2 = row.rv2;
+                row.arg2 = u32_to_2_limbs(log.src2_val);
                 match cond {
                     Comparison::Equal => row.beq = FE::one(),
                     Comparison::NotEqual => {
@@ -242,7 +242,7 @@ impl CpuTableRow {
                 row.rs1 = FE::zero();
                 row.rs2 = FE::zero();
                 row.imm = u32_to_2_limbs(imm << 12);
-                row.arg2 = u32_to_4_limbs(imm << 12);
+                row.arg2 = u32_to_2_limbs(imm << 12);
                 if dst != 0 {
                     row.write_register = FE::one();
                 }
@@ -254,7 +254,7 @@ impl CpuTableRow {
                 row.rs1 = FE::from(&255u32);
                 row.rs2 = FE::zero();
                 row.imm = u32_to_2_limbs(imm << 12);
-                row.arg2 = u32_to_4_limbs(imm << 12);
+                row.arg2 = u32_to_2_limbs(imm << 12);
                 row.rv1 = u32_to_4_limbs(log.current_pc);
                 if dst != 0 {
                     row.write_register = FE::one();
@@ -310,7 +310,7 @@ impl CpuTableRow {
         row.extend_from_slice(&self.rv2);
         // rvd[2]
         row.extend_from_slice(&self.rvd);
-        // arg2[4]
+        // arg2[2]
         row.extend_from_slice(&self.arg2);
         // res[4]
         row.extend_from_slice(&self.res);
@@ -318,7 +318,7 @@ impl CpuTableRow {
         row.push(self.is_equal);
         row.push(self.branch_cond);
 
-        debug_assert_eq!(row.len(), 54, "CpuTableRow length mismatch");
+        debug_assert_eq!(row.len(), 52, "CpuTableRow length mismatch");
         row
     }
 }
@@ -326,7 +326,7 @@ impl CpuTableRow {
 pub fn cpu_trace_from_logs(
     logs: Vec<Log>,
 ) -> TraceTable<Babybear31PrimeField, Degree4BabyBearU32ExtensionField> {
-    const NUM_COLUMNS: usize = 54;
+    const NUM_COLUMNS: usize = 52;
 
     let main_data: Vec<FE> = logs
         .into_iter()
