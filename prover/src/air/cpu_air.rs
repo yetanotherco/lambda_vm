@@ -50,9 +50,9 @@ const RV_ONE: usize = 34;
 // const RV_TWO: usize = 38;
 // const RVD: usize = 42;
 const ARG_TWO: usize = 44;
-const RES: usize = 48;
-// const IS_EQUAL: usize = 52;
-// const BRANCH_COND: usize = 53;
+const RES: usize = 46;
+// const IS_EQUAL: usize = 50;
+// const BRANCH_COND: usize = 51;
 
 type FE = FieldElement<Babybear31PrimeField>;
 
@@ -152,7 +152,7 @@ impl AIR for CPUTableAIR {
 
         let context = AirContext {
             proof_options: proof_options.clone(),
-            trace_columns: 54,
+            trace_columns: 52,
             transition_offsets: vec![0],
             num_transition_constraints,
         };
@@ -190,7 +190,7 @@ impl AIR for CPUTableAIR {
     }
 
     fn trace_layout(&self) -> (usize, usize) {
-        (54, 0)
+        (52, 0)
     }
 
     fn pub_inputs(&self) -> &Self::PublicInputs {
