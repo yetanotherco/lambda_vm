@@ -393,9 +393,7 @@ fn parse_i_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, 
                     dst: rs1,
                     op: CsrOp::CSRRW,
                 },
-                CSRRC_FUNC_IDENTIFIER
-                | CSRRWI_FUNC_IDENTIFIER
-                | CSRRSI_FUNC_IDENTIFIER => {
+                CSRRC_FUNC_IDENTIFIER | CSRRWI_FUNC_IDENTIFIER | CSRRSI_FUNC_IDENTIFIER => {
                     // For now, we do not support these CSR instructions
                     return Err(InstructionError::InvalidSystemInstruction(func3));
                 }
