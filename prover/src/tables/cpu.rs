@@ -1,4 +1,4 @@
-use crate::utils::{i32_to_4_limbs, u32_to_2_limbs, u32_to_4_limbs};
+use crate::utils::{i32_to_2_limbs, i32_to_4_limbs, u32_to_2_limbs, u32_to_4_limbs};
 use executor::vm::{
     instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth},
     logs::Log,
@@ -13,7 +13,7 @@ use stark_platinum_prover::trace::TraceTable;
 
 type FE = FieldElement<Babybear31PrimeField>;
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct CpuTableRow {
     pub timestamp: [FE; 2],
     pub pc: [FE; 2],
@@ -109,6 +109,7 @@ impl CpuTableRow {
                 row.rd = FE::from(&dst);
                 row.rs1 = FE::from(&src);
                 row.rs2 = FE::zero();
+                row.imm = i32_to_2_limbs(imm);
                 row.arg2 = i32_to_4_limbs(imm);
                 if dst != 0 {
                     row.write_register = FE::one();
@@ -260,6 +261,7 @@ impl CpuTableRow {
                 }
             }
         }
+        println!("Row: {:?}", row);
         row
     }
 
