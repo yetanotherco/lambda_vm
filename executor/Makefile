@@ -1,3 +1,5 @@
+UNAME := $(shell uname)
+
 ASM_PROGRAMS_DIR=./programs/asm
 ASM_ARTIFACTS_DIR=./program_artifacts/asm
 
@@ -37,11 +39,19 @@ $(ASM_ARTIFACTS_DIR)/%.elf: $(ASM_ARTIFACTS_DIR)/%.o
 # Compile rust
 $(RUST_ARTIFACTS_DIR)/%.elf: $(RUST_PROGRAMS_DIR)/%/Cargo.toml
 	cd $(RUST_PROGRAMS_DIR)/$* && \
+		cargo build \
+			--target riscv32im-unknown-none-elf
+	cp $(RUST_PROGRAMS_DIR)/$*/target/riscv32im-unknown-none-elf/debug/$* $@
+
+# Compile rust benches
+$(BENCH_ARTIFACTS_DIR)/%.elf: $(BENCH_PROGRAMS_DIR)/%/Cargo.toml
+	cd $(BENCH_PROGRAMS_DIR)/$* && \
 		cargo +nightly rustc \
 			--target riscv32im-unknown-none-elf \
 			-Z build-std=core,compiler_builtins \
 			-- --emit asm -C debuginfo=0 -C link-arg=-e -C link-arg=main
-	cp $(RUST_PROGRAMS_DIR)/$*/target/riscv32im-unknown-none-elf/debug/$* $@
+	cp $(BENCH_PROGRAMS_DIR)/$*/target/riscv32im-unknown-none-elf/debug/$* $@
+	rm -rf $(BENCH_PROGRAMS_DIR)/$*/target
 
 # Compile rust benches
 $(BENCH_ARTIFACTS_DIR)/%.elf: $(BENCH_PROGRAMS_DIR)/%/Cargo.toml
@@ -79,3 +89,23 @@ test-rust: compile-programs-rust
 
 test-no-compile:
 	cargo test
+
+.PHONY: deps
+deps:
+ifeq ($(UNAME), Linux)
+deps: deps-linux
+endif
+ifeq ($(UNAME), Darwin)
+deps: deps-macos
+endif
+
+.PHONY: deps-linux
+deps-linux:
+	@# TODO
+	@echo "not yet implemented"
+	@exit 1
+
+.PHONY: deps-macos
+deps-macos:
+	brew tap riscv-software-src/riscv       
+	brew install riscv-software-src/riscv/riscv-gnu-toolchain
