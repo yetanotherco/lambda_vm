@@ -31,10 +31,8 @@ $(ASM_ARTIFACTS_DIR)/%.elf: $(ASM_ARTIFACTS_DIR)/%.o
 # Compile rust
 $(RUST_ARTIFACTS_DIR)/%.elf: $(RUST_PROGRAMS_DIR)/%/Cargo.toml
 	cd $(RUST_PROGRAMS_DIR)/$* && \
-		cargo +nightly rustc \
-			--target riscv32im-unknown-none-elf \
-			-Z build-std=core,compiler_builtins \
-			-- --emit asm -C debuginfo=0 -C link-arg=-e -C link-arg=main
+		cargo build \
+			--target riscv32im-unknown-none-elf
 	cp $(RUST_PROGRAMS_DIR)/$*/target/riscv32im-unknown-none-elf/debug/$* $@
 
 clean-asm:
