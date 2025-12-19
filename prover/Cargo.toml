@@ -7,3 +7,4 @@ edition = "2024"
 lambdaworks-crypto = { git = "https://github.com/lambdaclass/lambdaworks.git" }
 lambdaworks-math = { git = "https://github.com/lambdaclass/lambdaworks.git" }
 stark-platinum-prover = { git = "https://github.com/lambdaclass/lambdaworks.git" }
+lazy_static = "1.5.0"
