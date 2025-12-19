@@ -1,9 +1,11 @@
 #![no_main]
 
-#[unsafe(no_mangle)]
-pub extern "C" fn sys_alloc_aligned(nwords: usize, align: usize) -> *mut u8 {
-    core::ptr::null_mut()
-}
+use embedded_alloc::LlffHeap as Heap;
+use riscv as _;
+
+#[global_allocator]
+static HEAP: Heap = Heap::empty();
+
 
 #[unsafe(no_mangle)]
 pub extern "C" fn sys_write(_: i32, _: *const u8, _: usize) -> isize {
@@ -95,6 +97,14 @@ pub extern "C" fn __atomic_compare_exchange_8(
 
 #[unsafe(export_name = "main")]
 pub fn main() -> i32 {
+    {
+        use core::mem::MaybeUninit;
+        use core::ptr::addr_of_mut;
+        const HEAP_SIZE: usize = 1024;
+        static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
+        let heap_ptr = addr_of_mut!(HEAP_MEM) as *mut u8;
+        unsafe { HEAP.init(heap_ptr as usize, HEAP_SIZE) }
+    }
     let vector = vec![1, 2, 3, 4, 5];
     return vector.iter().sum();
 }

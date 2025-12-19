@@ -77,5 +77,5 @@ fn test_ethereum_types() {
 
 #[test]
 fn test_vector() {
-    //run_program_and_check_output("./program_artifacts/rust/vector.elf", 15);
+    run_program_and_check_output("./program_artifacts/rust/vector.elf", 15);
 }
