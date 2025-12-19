@@ -52,6 +52,7 @@ jobs:
 
       - name: Post results to Slack
         env:
-          SLACK_WEBHOOK: ${{ secrets.LOC_SLACK_WEBHOOK }}
+          SLACK_WEBHOOK:
+            ${{ github.event_name == 'workflow_dispatch' && secrets.LOC_SLACK_WEBHOOK_TEST || secrets.LOC_SLACK_WEBHOOK }}
         run: |
           sh .github/scripts/publish_loc.sh "$SLACK_WEBHOOK"
