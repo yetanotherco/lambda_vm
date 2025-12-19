@@ -350,7 +350,7 @@ pub fn build_cpu_columns_example() -> Vec<Vec<FE>> {
         FE::zero(),
     ];
     // Column index: 45
-    let arg2_2 = vec![FE::zero(); 4];
+    let arg2_2 = vec![FE::zero(); 8];
 
     columns.push(arg2_1);
     columns.push(arg2_2);
@@ -406,7 +406,6 @@ mod tests {
     #[test]
     fn test_prove_cpu_table() {
         let columns = build_cpu_columns_example();
-        println!("columns: {:?}", columns.len());
         let mut trace = build_cpu_trace(columns);
         let proof_options = ProofOptions::default_test_options();
 

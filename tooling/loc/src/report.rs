@@ -17,7 +17,7 @@ pub struct LinesOfCodeReporterOptions {
 
 #[derive(Default, Serialize, Deserialize, Clone)]
 pub struct LinesOfCodeReport {
-    pub null_vm: usize,
+    pub lambda_vm: usize,
     pub crates: Vec<(String, usize)>,
 }
 
@@ -56,10 +56,10 @@ pub fn pr_message(
 
         total_lines_changed += loc_diff.abs();
 
-        // remove "null-vm/" and everything before it
-        const NULL_VM_PREFIX: &str = "null-vm/";
-        let file_path_printable = if let Some(idx) = file_path.find(NULL_VM_PREFIX) {
-            &file_path[idx + NULL_VM_PREFIX.len()..]
+        // remove "lambda_vm/" and everything before it
+        const LAMBDA_VM_PREFIX: &str = "lambda_vm/";
+        let file_path_printable = if let Some(idx) = file_path.find(LAMBDA_VM_PREFIX) {
+            &file_path[idx + LAMBDA_VM_PREFIX.len()..]
         } else {
             file_path
         };
@@ -141,7 +141,7 @@ fn pr_message_summary(
 }
 
 pub fn slack_message(old_report: LinesOfCodeReport, new_report: LinesOfCodeReport) -> String {
-    let diff_total = new_report.null_vm.abs_diff(old_report.null_vm);
+    let diff_total = new_report.lambda_vm.abs_diff(old_report.lambda_vm);
 
     let crates_mrkdwn =
         new_report
@@ -193,7 +193,7 @@ pub fn slack_message(old_report: LinesOfCodeReport, new_report: LinesOfCodeRepor
             "type": "section",
             "text": {{
                 "type": "mrkdwn",
-                "text": "*null-vm (total):* {} {}"
+                "text": "*lambda_vm (total):* {} {}"
             }}
         }},
         {{
@@ -212,8 +212,8 @@ pub fn slack_message(old_report: LinesOfCodeReport, new_report: LinesOfCodeRepor
         }}
     ]
 }}"#,
-        new_report.null_vm,
-        match new_report.null_vm.cmp(&old_report.null_vm) {
+        new_report.lambda_vm,
+        match new_report.lambda_vm.cmp(&old_report.lambda_vm) {
             std::cmp::Ordering::Greater => format!("(+{diff_total})"),
             std::cmp::Ordering::Less => format!("(-{diff_total})"),
             std::cmp::Ordering::Equal => "".to_string(),
@@ -223,7 +223,7 @@ pub fn slack_message(old_report: LinesOfCodeReport, new_report: LinesOfCodeRepor
 }
 
 pub fn github_step_summary(old_report: LinesOfCodeReport, new_report: LinesOfCodeReport) -> String {
-    let diff_total = new_report.null_vm.abs_diff(old_report.null_vm);
+    let diff_total = new_report.lambda_vm.abs_diff(old_report.lambda_vm);
 
     let crates_github =
         new_report
@@ -253,17 +253,17 @@ pub fn github_step_summary(old_report: LinesOfCodeReport, new_report: LinesOfCod
 
     format!(
         r#"```
-null-vm loc summary
+lambda_vm loc summary
 ====================
-null-vm (total): {} {}
+lambda_vm (total): {} {}
 
-null-vm crates loc
+lambda_vm crates loc
 =================
 {}
 ```"#,
 
-        new_report.null_vm,
-        if new_report.null_vm > old_report.null_vm {
+        new_report.lambda_vm,
+        if new_report.lambda_vm > old_report.lambda_vm {
             format!("(+{diff_total})")
         } else {
             format!("(-{diff_total})")
@@ -277,8 +277,8 @@ pub fn shell_summary(new_report: LinesOfCodeReport) -> String {
         "{}\n{}\n{} {}\n{} {}",
         "Lines of Code".bold(),
         "=============".bold(),
-        "null-vm (total):".bold(),
-        new_report.null_vm,
+        "lambda_vm (total):".bold(),
+        new_report.lambda_vm,
         "crates:".bold(),
         new_report.crates.iter().map(|(name, loc)| format!("{}: {}", name, loc)).collect::<Vec<_>>().join(", "),
     )
