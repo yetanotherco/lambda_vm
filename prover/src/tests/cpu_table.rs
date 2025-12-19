@@ -372,7 +372,7 @@ pub fn build_cpu_columns_example() -> Vec<Vec<FE>> {
         FE::from(&4125u32), // rv1 + imm = 30 + 2^12 - 1 = 4125.
         FE::from(&30u32),   // rv2 - rv1 = 40 - 10 = 30
         FE::from(&24u32),   // pc + 4 = 20 + 4 = 24
-        - FE::from(&15u32), 
+        -FE::from(&15u32),
         FE::zero(),
         FE::zero(),
     ];

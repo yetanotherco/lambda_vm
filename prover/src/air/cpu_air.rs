@@ -146,7 +146,7 @@ impl AIR for CPUTableAIR {
 
         next_index += 2;
 
-        let arg2_validity_constraint = new_arg2_validity_constraint(
+        let arg2_validity_constraints = new_arg2_validity_constraint(
             ARG_TWO,
             RV_TWO,
             IMM,
@@ -163,7 +163,7 @@ impl AIR for CPUTableAIR {
         constraints.extend(add_constraints);
         constraints.extend(sub_constraints);
         constraints.extend(next_pc_value_constraint);
-        constraints.push(arg2_validity_constraint);
+        constraints.extend(arg2_validity_constraints);
 
         let num_transition_constraints = constraints.len();
 

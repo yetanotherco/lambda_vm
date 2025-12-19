@@ -9,8 +9,6 @@ use stark_platinum_prover::{
 };
 
 use crate::air::utils::{
-    compute_element_from_four_limbs_starting_at,
-    compute_element_from_four_limbs_starting_at_extension,
     compute_element_from_two_limbs_starting_at,
     compute_element_from_two_limbs_starting_at_extension,
 };
@@ -513,11 +511,11 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
             } => {
                 let step = frame.get_evaluation_step(0);
 
-                let arg2 = compute_element_from_two_limbs_starting_at(step, self.arg2_start_index);
+                let arg2 = step.get_main_evaluation_element(0, self.arg2_start_index);
 
-                let rv2 = compute_element_from_four_limbs_starting_at(step, self.rv2_start_index);
+                let rv2 = compute_element_from_two_limbs_starting_at(step, self.rv2_start_index);
 
-                let imm = compute_element_from_two_limbs_starting_at(step, self.imm_start_index);
+                let imm = step.get_main_evaluation_element(0, self.imm_start_index);
 
                 let one = FieldElement::<Babybear31PrimeField>::one();
 
@@ -527,7 +525,6 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
                 let blt = step.get_main_evaluation_element(0, self.column_indexes.blt_index);
 
                 let constraint = (one - store - load) * rv2 + (one - beq - blt) * imm - arg2;
-                println!("Constraint arg2 validity: {:?}, store: {}, load {}, rv2 {}, beq {}, blt {}, imm {}, arg2 {}", constraint.representative(),store.representative(), load.representative(), rv2.representative(), beq.representative(), blt.representative(), imm.representative(), arg2.representative());
                 transition_evaluations[self.constraint_idx()] = constraint.to_extension();
             }
 
@@ -538,17 +535,14 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
             } => {
                 let step = frame.get_evaluation_step(0);
 
-                let arg2 = compute_element_from_two_limbs_starting_at_extension(
-                    step,
-                    self.arg2_start_index,
-                );
+                let arg2 = step.get_main_evaluation_element(0, self.arg2_start_index);
 
-                let rv2 = compute_element_from_four_limbs_starting_at_extension(
+                let rv2 = compute_element_from_two_limbs_starting_at_extension(
                     step,
                     self.rv2_start_index,
                 );
 
-                let imm = compute_element_from_two_limbs_starting_at_extension(step, self.imm_start_index);
+                let imm = step.get_main_evaluation_element(0, self.imm_start_index);
 
                 let one = FieldElement::<Babybear31PrimeField>::one();
 
@@ -581,14 +575,29 @@ pub fn new_arg2_validity_constraint(
     imm_start_index: usize,
     column_indexes: Arg2ValidityColumnIndexes,
     constraint_idx: usize,
-) -> Box<dyn TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>> {
-    Box::new(Arg2ValidityConstraint::new(
-        arg2_start_index,
-        rv2_start_index,
-        imm_start_index,
-        column_indexes,
-        constraint_idx,
-    )) as Box<dyn TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>>
+) -> Vec<Box<dyn TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>>> {
+    vec![
+        Box::new(Arg2ValidityConstraint::new(
+            arg2_start_index,
+            rv2_start_index,
+            imm_start_index,
+            column_indexes.clone(),
+            constraint_idx,
+        ))
+            as Box<
+                dyn TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>,
+            >,
+        Box::new(Arg2ValidityConstraint::new(
+            arg2_start_index + 1,
+            rv2_start_index + 2,
+            imm_start_index + 1,
+            column_indexes,
+            constraint_idx + 1,
+        ))
+            as Box<
+                dyn TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>,
+            >,
+    ]
 }
 
 /// Enforces correct carry bit values for adding 4 to a 32-bit table value.

@@ -16,36 +16,10 @@ pub(crate) fn compute_element_from_two_limbs_starting_at(
         + *TWO_FIFTY_SIX * step.get_main_evaluation_element(0, index + 1)
 }
 
-pub(crate) fn compute_element_from_four_limbs_starting_at(
-    step: &TableView<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>,
-    index: usize,
-) -> FieldElement<Babybear31PrimeField> {
-    step.get_main_evaluation_element(0, index)
-        + *TWO_FIFTY_SIX * step.get_main_evaluation_element(0, index + 1)
-        + *TWO_FIFTY_SIX * *TWO_FIFTY_SIX * step.get_main_evaluation_element(0, index + 2)
-        + *TWO_FIFTY_SIX
-            * *TWO_FIFTY_SIX
-            * *TWO_FIFTY_SIX
-            * step.get_main_evaluation_element(0, index + 3)
-}
-
 pub(crate) fn compute_element_from_two_limbs_starting_at_extension(
     step: &TableView<Degree4BabyBearU32ExtensionField, Degree4BabyBearU32ExtensionField>,
     index: usize,
 ) -> FieldElement<Degree4BabyBearU32ExtensionField> {
     step.get_main_evaluation_element(0, index)
         + *TWO_FIFTY_SIX * step.get_main_evaluation_element(0, index + 1)
-}
-
-pub(crate) fn compute_element_from_four_limbs_starting_at_extension(
-    step: &TableView<Degree4BabyBearU32ExtensionField, Degree4BabyBearU32ExtensionField>,
-    index: usize,
-) -> FieldElement<Degree4BabyBearU32ExtensionField> {
-    step.get_main_evaluation_element(0, index)
-        + *TWO_FIFTY_SIX * step.get_main_evaluation_element(0, index + 1)
-        + *TWO_FIFTY_SIX * *TWO_FIFTY_SIX * step.get_main_evaluation_element(0, index + 2)
-        + *TWO_FIFTY_SIX
-            * *TWO_FIFTY_SIX
-            * *TWO_FIFTY_SIX
-            * step.get_main_evaluation_element(0, index + 3)
 }
