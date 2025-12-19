@@ -1,6 +1,6 @@
 use crate::air::constraints_templates::{
-    Arg2ValidityColumnIndexes, new_add_constraint, new_arg2_validity_constraint,
-    new_bit_constraints, new_sub_constraint, new_add_four_constraint
+    Arg2ValidityColumnIndexes, new_add_constraint, new_add_four_constraint,
+    new_arg2_validity_constraint, new_bit_constraints, new_sub_constraint,
 };
 
 use lambdaworks_math::field::{
