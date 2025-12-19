@@ -202,7 +202,7 @@ impl ArithOp {
     fn apply(&self, a: i32, b: i32) -> i32 {
         match self {
             ArithOp::Add => a.wrapping_add(b),
-            ArithOp::Sub => a - b,
+            ArithOp::Sub => a.wrapping_sub(b),
             ArithOp::Xor => a ^ b,
             ArithOp::Or => a | b,
             ArithOp::And => a & b,
