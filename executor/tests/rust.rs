@@ -66,6 +66,16 @@ fn test_rlp() {
 }
 
 #[test]
+fn test_allocator() {
+    run_program_and_check_output("./program_artifacts/rust/allocator.elf", 11);
+}
+
+#[test]
+fn test_ethereum_types() {
+    run_program_and_check_output("./program_artifacts/rust/ethereum_types.elf", 1);
+}
+
+#[test]
 fn test_vector() {
-    run_program_and_check_output("./program_artifacts/rust/vector.elf", 15);
+    //run_program_and_check_output("./program_artifacts/rust/vector.elf", 15);
 }

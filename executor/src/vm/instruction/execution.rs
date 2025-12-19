@@ -169,7 +169,7 @@ impl Instruction {
                 Log {
                     instruction: self,
                     current_pc: pc,
-                    next_pc: pc + REGULAR_PC_UPDATE,
+                    next_pc: pc.wrapping_add(REGULAR_PC_UPDATE),
                     src1_val: 0,
                     src2_val: 0,
                     dst_val: pc.wrapping_add(imm),
@@ -192,6 +192,22 @@ impl Instruction {
                     src1_val: a,
                     src2_val: b,
                     dst_val: res,
+                }
+            }
+            Instruction::CSR {
+                csr: _,
+                src: _,
+                dst: _,
+                op: _,
+            } => {
+                // Todo: CSR are currently no-ops
+                Log {
+                    instruction: self,
+                    current_pc: pc,
+                    next_pc: pc + REGULAR_PC_UPDATE,
+                    src1_val: 0,
+                    src2_val: 0,
+                    dst_val: 0,
                 }
             }
         })
