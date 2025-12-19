@@ -61,7 +61,7 @@ fn main() {
     let repo_crates_path = repo_path.join(""); // TODO: change to "crates" when crates directory exists
     let config = Config::default();
 
-    let null_vm_loc = count_loc(repo_path, &config).unwrap();
+    let lambda_vm_loc = count_loc(repo_path, &config).unwrap();
     let crates_loc = count_crates_loc(&repo_crates_path, &config);
 
     spinner.success("Lines of code calculated!");
@@ -69,13 +69,13 @@ fn main() {
     let mut spinner = Spinner::new(Dots, "Generating report...", Color::Cyan);
 
     let new_report = LinesOfCodeReport {
-        null_vm: null_vm_loc.code,
+        lambda_vm: lambda_vm_loc.code,
         crates: crates_loc,
     };
 
     if opts.detailed {
         let mut current_detailed_loc_report = HashMap::new();
-        for report in null_vm_loc.reports {
+        for report in lambda_vm_loc.reports {
             let file_path = report.name;
             current_detailed_loc_report
                 .entry(file_path.as_os_str().to_str().unwrap().to_owned())
