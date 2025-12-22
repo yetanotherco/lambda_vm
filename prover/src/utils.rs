@@ -20,10 +20,18 @@ pub fn u32_to_4_limbs(x: u32) -> [FE; 4] {
 
 // TODO: Revisar la logica de como guardar integers in la tabla.
 pub fn i32_to_2_limbs(x: i32) -> [FE; 2] {
-    let unsigned = x as u32;
-    [unsigned & 0xFFFF, (unsigned >> 16) & 0xFFFF].map(FE::new)
+    let a = {
+        if x < 0 {
+            let u = -x;
+            -FE::new(u as u32)
+        } else {
+            FE::new(x as u32)
+        }
+    };
+    [a, FE::zero()]
 }
 
+// TODO: Revisar!
 pub fn i32_to_4_limbs(x: i32) -> [FE; 4] {
     let unsigned = x as u32;
     [
