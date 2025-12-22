@@ -103,6 +103,8 @@ This project is under active development. Our primary objective is to have a fir
 
 The first version is going to use the primitives contained in [lambdaworks](https://github.com/lambdaclass/lambdaworks)
 
+**Total estimated duration:** 5 weeks
+
 | Feature                     | Description                        | Status       | Duration | Version |
 |---------------------------- |------------------------------------|--------------| ---------| ------- |
 | Documentation               | Explain how everything works       | In progress  | 4 weeks | all versions |
@@ -114,9 +116,10 @@ The first version is going to use the primitives contained in [lambdaworks](http
 | Basic FRI                   | FRI proximity test                 | ✔️  | 1 week  | v0 |
 | Basic constraints           | Simple API for defining constraints for AIR | ✔️  | 1 week | v0 |
 | Basic AIR                   | Algebraic intermediate representation for computations | ✔️  | 1 week | v0 |      
-| ---------------------- |------------- |----------------- | --------------- |------------------ |
-| Total estimated duration         |              |                   |                |        5 weeks        |
+
 ## Executor
+
+**Total estimated duration:** 24 weeks
 
 | Feature                     | Description                        | Status       | Duration | Version |
 |---------------------------- |------------------------------------|--------------| ---------| ------- |
@@ -150,6 +153,8 @@ The first version is going to use the primitives contained in [lambdaworks](http
 
 ## Trace generator
 
+**Total estimated duration:** 24 weeks
+
 | Feature                     | Description                       | Status       | Duration | Version |
 |---------------------------- |-----------------------------------|--------------| -------- | ------- |
 | Documentation               | Document trace generation and constraints | In progress | 8 weeks | all versions |
@@ -175,6 +180,8 @@ The first version is going to use the primitives contained in [lambdaworks](http
 
 ## Proof system
 
+**Total estimated duration:** 18 weeks
+
 | Feature                     | Description                       | Status       | Duration | Version |
 |---------------------------- |-----------------------------------|--------------| -------- | ------- |
 | Documentation               | Prepare comprehensive documentation on proof system | In progress   | 4 weeks | all versions |
@@ -186,8 +193,11 @@ The first version is going to use the primitives contained in [lambdaworks](http
 | Multi-FRI                   | Perform FRI using MTMT | Planned | 2 weeks | v1 |
 | Adjust parameters           | Adjust parameters for 128 bits of security | Planned | 1 week | v1 |
 | Recursion | Allow for n-1 recursion tree to compress proof size | Planned | 4 weeks | v2 |
+| More efficient lookups | Implement better lookup arguments | 4 weeks | v2 |
 
 ## Verifier
+
+**Total estimated duration:** 6 weeks
 
 | Feature | Description | Status | Duration | Version |
 | ------ | -------- |--------| -----------| ------- |
@@ -196,6 +206,8 @@ The first version is going to use the primitives contained in [lambdaworks](http
 |Optimize Ethereum verifier | Optimize gas cost for verifier | Planned | 2 weeks | v2 |
 
 ## GPU and performance
+
+**Total estimated duration:** 24 weeks
 
 | Feature                     | Description                       | Status       | Version |
 |---------------------------- |-----------------------------------|--------------| ------ |
