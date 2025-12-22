@@ -114,7 +114,8 @@ The first version is going to use the primitives contained in [lambdaworks](http
 | Basic FRI                   | FRI proximity test                 | ✔️  | 1 week  | v0 |
 | Basic constraints           | Simple API for defining constraints for AIR | ✔️  | 1 week | v0 |
 | Basic AIR                   | Algebraic intermediate representation for computations | ✔️  | 1 week | v0 |      
-
+| ---------------------- |------------- |----------------- | --------------- |------------------ |
+| Total estimated duration         |              |                   |                |        5 weeks        |
 ## Executor
 
 | Feature                     | Description                        | Status       | Duration | Version |
