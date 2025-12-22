@@ -1,6 +1,6 @@
+use super::Fp;
 use super::parameters::*;
 use super::utils::*;
-use super::Fp;
 use crate::alloc::vec::Vec;
 use core::iter;
 use lambdaworks_math::field::errors::FieldError;
@@ -505,7 +505,7 @@ mod tests {
         ],
     ];
     fn rand_field_element<R: Rng>(rng: &mut R) -> Fp {
-        Fp::from(rng.gen::<u64>())
+        Fp::from(rng.r#gen::<u64>())
     }
 
     #[test]

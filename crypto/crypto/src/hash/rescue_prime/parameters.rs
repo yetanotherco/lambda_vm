@@ -956,8 +956,8 @@ pub fn get_mds_matrix(level: &SecurityLevel) -> MdsMatrix {
 impl MdsVector {
     pub fn as_slice(&self) -> &[Fp] {
         match self {
-            MdsVector::Mds128(ref vec) => vec,
-            MdsVector::Mds160(ref vec) => vec,
+            MdsVector::Mds128(vec) => vec,
+            MdsVector::Mds160(vec) => vec,
         }
     }
 }
