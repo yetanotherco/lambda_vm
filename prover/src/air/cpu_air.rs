@@ -8,7 +8,7 @@ use lambdaworks_math::field::{
         babybear_u32::Babybear31PrimeField, quartic_babybear_u32::Degree4BabyBearU32ExtensionField,
     },
 };
-use stark_platinum_prover::{
+use stark::{
     constraints::{boundary::BoundaryConstraints, transition::TransitionConstraint},
     context::AirContext,
     proof::options::ProofOptions,

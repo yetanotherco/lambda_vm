@@ -347,7 +347,7 @@ mod tests {
         ));
         // Send proof of work
         transcript.append_bytes(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x30, 0x4d]); // Eight bytes
-                                                                                    // Sample query indices
+        // Sample query indices
         assert_eq!(transcript.sample_u64(8), 0);
     }
 

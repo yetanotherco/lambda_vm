@@ -4,7 +4,7 @@ use super::{
     fri::fri_decommit::FriDecommitment,
     grinding,
     proof::{options::ProofOptions, stark::StarkProof},
-    traits::{TransitionEvaluationContext, AIR},
+    traits::{AIR, TransitionEvaluationContext},
 };
 use crate::{config::Commitment, proof::stark::DeepPolynomialOpening};
 use lambdaworks_crypto::{fiat_shamir::is_transcript::IsTranscript, merkle_tree::proof::Proof};

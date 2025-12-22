@@ -8,14 +8,15 @@ use lambdaworks_math::field::fields::fft_friendly::{
 };
 
 use crate::{
+    Felt252,
     examples::{
         bit_flags::{self, BitFlagsAIR},
         dummy_air::{self, DummyAIR},
         fibonacci_2_cols_shifted::{self, Fibonacci2ColsShifted},
         fibonacci_2_columns::{self, Fibonacci2ColsAIR},
-        fibonacci_rap::{fibonacci_rap_trace, FibonacciRAP, FibonacciRAPPublicInputs},
+        fibonacci_rap::{FibonacciRAP, FibonacciRAPPublicInputs, fibonacci_rap_trace},
         quadratic_air::{self, QuadraticAIR, QuadraticPublicInputs},
-        read_only_memory::{sort_rap_trace, ReadOnlyPublicInputs, ReadOnlyRAP},
+        read_only_memory::{ReadOnlyPublicInputs, ReadOnlyRAP, sort_rap_trace},
         simple_fibonacci::{self, FibonacciAIR, FibonacciPublicInputs},
         simple_periodic_cols::{self, SimplePeriodicAIR, SimplePeriodicPublicInputs}, //         simple_periodic_cols::{self, SimplePeriodicAIR, SimplePeriodicPublicInputs},
     },
@@ -23,11 +24,10 @@ use crate::{
     prover::{IsStarkProver, Prover},
     transcript::StoneProverTranscript,
     verifier::{IsStarkVerifier, Verifier},
-    Felt252,
 };
 
 use crate::examples::read_only_memory_logup::{
-    read_only_logup_trace, LogReadOnlyPublicInputs, LogReadOnlyRAP,
+    LogReadOnlyPublicInputs, LogReadOnlyRAP, read_only_logup_trace,
 };
 
 #[test_log::test]

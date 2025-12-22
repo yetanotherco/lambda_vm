@@ -8,7 +8,7 @@ use crate::{
     context::AirContext,
     proof::options::ProofOptions,
     trace::TraceTable,
-    traits::{TransitionEvaluationContext, AIR},
+    traits::{AIR, TransitionEvaluationContext},
 };
 use lambdaworks_crypto::fiat_shamir::is_transcript::IsTranscript;
 use lambdaworks_math::field::traits::IsPrimeField;

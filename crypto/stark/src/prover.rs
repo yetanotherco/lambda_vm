@@ -22,7 +22,7 @@ use crate::debug::validate_trace;
 use crate::fri;
 use crate::proof::stark::{DeepPolynomialOpenings, PolynomialOpenings};
 use crate::table::Table;
-use crate::trace::{columns2rows, LDETraceTable};
+use crate::trace::{LDETraceTable, columns2rows};
 
 use super::config::{BatchedMerkleTree, Commitment};
 use super::constraints::evaluator::ConstraintEvaluator;
@@ -1091,6 +1091,7 @@ mod tests {
     }
 
     use crate::{
+        Felt252,
         examples::{
             fibonacci_2_cols_shifted::{self, Fibonacci2ColsShifted},
             simple_fibonacci::{self, FibonacciPublicInputs},
@@ -1098,7 +1099,6 @@ mod tests {
         proof::options::ProofOptions,
         transcript::StoneProverTranscript,
         verifier::{Challenges, IsStarkVerifier, Verifier},
-        Felt252,
     };
 
     use super::*;
@@ -1244,8 +1244,8 @@ mod tests {
         proof
     }
 
-    fn stone_compatibility_case_1_challenges(
-    ) -> Challenges<Fibonacci2ColsShifted<Stark252PrimeField>> {
+    fn stone_compatibility_case_1_challenges()
+    -> Challenges<Fibonacci2ColsShifted<Stark252PrimeField>> {
         let (proof, public_inputs, options, seed) = proof_parts_stone_compatibility_case_1();
 
         let air = Fibonacci2ColsShifted::new(proof.trace_length, &public_inputs, &options);
@@ -1641,8 +1641,8 @@ mod tests {
         proof
     }
 
-    fn stone_compatibility_case_2_challenges(
-    ) -> Challenges<Fibonacci2ColsShifted<Stark252PrimeField>> {
+    fn stone_compatibility_case_2_challenges()
+    -> Challenges<Fibonacci2ColsShifted<Stark252PrimeField>> {
         let (proof, public_inputs, options, seed) = proof_parts_stone_compatibility_case_2();
 
         let air = Fibonacci2ColsShifted::new(proof.trace_length, &public_inputs, &options);

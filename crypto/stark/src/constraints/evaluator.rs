@@ -3,7 +3,7 @@ use super::boundary::BoundaryConstraints;
 use crate::debug::check_boundary_polys_divisibility;
 use crate::domain::Domain;
 use crate::trace::LDETraceTable;
-use crate::traits::{TransitionEvaluationContext, AIR};
+use crate::traits::{AIR, TransitionEvaluationContext};
 use crate::{frame::Frame, prover::evaluate_polynomial_on_lde_domain};
 use itertools::Itertools;
 #[cfg(not(feature = "parallel"))]

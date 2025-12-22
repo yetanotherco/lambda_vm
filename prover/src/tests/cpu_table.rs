@@ -398,7 +398,7 @@ mod tests {
     use crate::air::cpu_air::{CPUTableAIR, build_cpu_trace};
     use lambdaworks_crypto::fiat_shamir::default_transcript::DefaultTranscript;
     use lambdaworks_math::field::fields::fft_friendly::quartic_babybear_u32::Degree4BabyBearU32ExtensionField;
-    use stark_platinum_prover::{
+    use stark::{
         proof::options::ProofOptions,
         prover::{IsStarkProver, Prover},
         verifier::{IsStarkVerifier, Verifier},

@@ -1,15 +1,14 @@
 [package]
 name = "stark"
-
-[lib]
-crate-type = ["cdylib", "rlib"]
+version = "0.1.0"
+edition = "2024"
 
 [dependencies]
-lambdaworks-crypto = { git = "https://github.com/lambdaclass/lambdaworks.git" }
-lambdaworks-math = { git = "https://github.com/lambdaclass/lambdaworks.git" }
-
-miden-core = { git = "https://github.com/lambdaclass/miden-vm", optional = true }
-
+lambdaworks-math = {git = "https://github.com/lambdaclass/lambdaworks.git", features = [
+    "std",
+    "lambdaworks-serde-binary",
+] }
+lambdaworks-crypto = {git = "https://github.com/lambdaclass/lambdaworks.git", features = ["std", "serde"] }
 rand = "0.8.5"
 thiserror = "1.0.38"
 log = "0.4.17"
@@ -44,48 +43,6 @@ test_fiat_shamir = []
 instruments = []                                                     # This enables timing prints in prover and verifier
 parallel = ["dep:rayon", "lambdaworks-crypto/parallel"]
 wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "dep:web-sys"]
-winter_compatibility = ["miden-core"]
 
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dev-dependencies]
 proptest = "1.2.0"
-
-[package.metadata.wasm-pack.profile.dev]
-# Should `wasm-opt` be used to further optimize the wasm binary generated after
-# the Rust compiler has finished? Using `wasm-opt` can often further decrease
-# binary size or do clever tricks that haven't made their way into LLVM yet.
-#
-# Configuration is set to `false` by default for the dev profile, but it can
-# be set to an array of strings which are explicit arguments to pass to
-# `wasm-opt`. For example `['-Os']` would optimize for size while `['-O4']`
-# would execute very expensive optimizations passes
-wasm-opt = ['-O']
-
-[package.metadata.wasm-pack.profile.dev.wasm-bindgen]
-# Should we enable wasm-bindgen's debug assertions in its generated JS glue?
-debug-js-glue = true
-# Should wasm-bindgen demangle the symbols in the "name" custom section
-demangle-name-section = true
-# Should we emit the DWARF debug info custom sections
-dwarf-debug-info = false
-# Should we omit the default import path
-omit-default-module-path = false
-
-[package.metadata.wasm-pack.profile.profiling]
-wasm-opt = ['-O']
-
-[package.metadata.wasm-pack.profile.profiling.wasm-bindgen]
-debug-js-glue = false
-demangle-name-section = true
-dwarf-debug-info = false
-omit-default-module-path = false
-
-# `wasm-opt` is on by default in for the release profile, but it can be
-# disabled by setting it to `false`
-[package.metadata.wasm-pack.profile.release]
-wasm-opt = false
-
-[package.metadata.wasm-pack.profile.release.wasm-bindgen]
-debug-js-glue = false
-demangle-name-section = true
-dwarf-debug-info = false
-omit-default-module-path = false

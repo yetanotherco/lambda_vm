@@ -1,10 +1,10 @@
 use crate::{
+    Felt252,
     constraints::{boundary::BoundaryConstraints, transition::TransitionConstraint},
     context::AirContext,
     proof::options::ProofOptions,
     trace::TraceTable,
-    traits::{TransitionEvaluationContext, AIR},
-    Felt252,
+    traits::{AIR, TransitionEvaluationContext},
 };
 use lambdaworks_math::field::{
     element::FieldElement, fields::fft_friendly::stark_252_prime_field::Stark252PrimeField,

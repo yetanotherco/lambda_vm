@@ -4,9 +4,7 @@ use lambdaworks_math::field::{
         babybear_u32::Babybear31PrimeField, quartic_babybear_u32::Degree4BabyBearU32ExtensionField,
     },
 };
-use stark_platinum_prover::{
-    constraints::transition::TransitionConstraint, traits::TransitionEvaluationContext,
-};
+use stark::{constraints::transition::TransitionConstraint, traits::TransitionEvaluationContext};
 
 pub const INV_65536: u64 = 2013235201;
 

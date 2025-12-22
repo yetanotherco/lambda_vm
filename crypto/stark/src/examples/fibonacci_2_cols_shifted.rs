@@ -6,7 +6,7 @@ use crate::{
     context::AirContext,
     proof::options::ProofOptions,
     trace::TraceTable,
-    traits::{TransitionEvaluationContext, AIR},
+    traits::{AIR, TransitionEvaluationContext},
 };
 use lambdaworks_math::{
     field::{element::FieldElement, traits::IsFFTField},

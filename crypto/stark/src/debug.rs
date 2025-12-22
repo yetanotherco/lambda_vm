@@ -1,5 +1,5 @@
 use super::domain::Domain;
-use super::traits::{TransitionEvaluationContext, AIR};
+use super::traits::{AIR, TransitionEvaluationContext};
 use crate::{frame::Frame, trace::LDETraceTable};
 use lambdaworks_math::{
     field::{

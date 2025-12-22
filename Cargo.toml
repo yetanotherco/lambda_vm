@@ -2,4 +2,7 @@
 members = [
   "executor",
   "prover",
-]
+  "crypto/stark",
+  ]
+
+resolver = "2"
