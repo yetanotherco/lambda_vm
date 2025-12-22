@@ -116,6 +116,7 @@ The first version is going to use the primitives contained in [lambdaworks](http
 | Minimal CPU                 | Minimal CPU that can perform basic operations | In progress | |
 | Fibonacci opcodes I         | Opcodes needed to run Fibonacci part I (`addi`, `sw`, `beq`, `jal`, `jalr`) | In Progress | 1 week |
 | Fibonacci opcodes II         | Opcodes needed to run Fibonacci part II (`auipc`, `bltu`, `lui`, `sb`, `slli`) | In Progress | 1 week |
+| Compute decoding table | Decoding table indexed by pc | 1 week |
 | Basic logging        | Basic logs for minimal opcodes | In progress | 2 weeks |
 | RISCV64 CPU                 | Minimal version of the CPU with 52 RISCV instructions | Planned | |
 | RISCV64IM CPU               | Working executor for RV64 virtual machine with 65 RISCV instructions | Planned | |
