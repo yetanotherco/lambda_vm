@@ -113,7 +113,7 @@ The first version is going to use the primitives contained in [lambdaworks](http
 | Feature                     | Description                        | Status       | Duration |
 |---------------------------- |------------------------------------|--------------| ---------|
 | Documentation               | Explain how the executor works     | In progress  |  4 weeks |
-| Minimal CPU                 | Minimal CPU that can perform basic operations | In progress | |
+| Minimal CPU                 | Minimal CPU that can perform basic operations | In progress | 6 weeks |
 | Fibonacci operations I         | Operations needed to run Fibonacci part I (`addi`, `sw`, `beq`, `jal`, `jalr`) | In Progress | 1 week |
 | Fibonacci operations II         | Operations needed to run Fibonacci part II (`auipc`, `bltu`, `lui`, `sb`, `slli`) | In Progress | 1 week |
 | Compute decoding table | Decoding table indexed by pc | 1 week |
@@ -130,10 +130,11 @@ The first version is going to use the primitives contained in [lambdaworks](http
 | Division operations | Operations related to division (`div`, `divu`, `rem`, `remu`) | Planned | 1 week |
 | CPU with coprocessors       | Add coprocessors for special cryptographic operations   | Planned | 10 weeks |
 | System instructions | `ecall`, `ebreak` | Planned | 1 week |
-| Big Integer arithmetic | Table for big integer arithmetic | Planned | 1 week |
-| Elliptic curve addition | Table for EC operations | Planned | 2 weeks  |
-| Poseidon hash | Table for Poseidon hash | Planned | 3 weeks |
-| Keccak hash | Table for Keccak hash | Planned | 3 weeks |
+| Big Integer arithmetic | Big integer arithmetic syscall | Planned | 1 week |
+| Elliptic curve addition | EC operations syscall | Planned | 2 weeks  |
+| Poseidon hash | Poseidon hash syscall | Planned | 3 weeks |
+| Keccak hash | Keccak hash syscall | Planned | 3 weeks |
+| SHA256 | SHA 256 syscall | Planned 2 weeks |
 | Pairing | Table for pairings | Planned? | ? |
 
 ## Trace generator
@@ -141,14 +142,15 @@ The first version is going to use the primitives contained in [lambdaworks](http
 | Feature                     | Description                       | Status       | Duration |
 |---------------------------- |-----------------------------------|--------------| -------- |
 | Documentation               | Document trace generation and constraints | In progress | 8 weeks |
-| CPU                         | Implement CPU table with constraints | In progress | |
+| CPU                         | Implement CPU table with constraints | In progress | 5 weeks |
 | Define basic CPU constraints | Add basic type constraints for CPU | In progress | 1 week|
 | Decoder table | Implement decoder table | Planned | 1 week |
 | Link decoder table and CPU | Use lookup to connect tables | Planned | 1 week |
 | Constraints for updating pc | Implement constraints for updating pc | In progress | 1 week |
-| ALU                         | Implement ALU tables with constraints| Not started | |
+| ALU                         | Implement ALU tables with constraints| Not started | 6 weeks |
 | Range checkers | Implement rangecheck for u16 and u8 | Planned | 1 week |
-| Bitwise operations | Implement tables for u8 bitwise operations | Planned | 1 week |
+| Bitwise operations (and, xor, or) | Implement tables for u8 bitwise operations | Planned | 1 week |
+| Shift operations | Implement tables for shift operations | Planned | 1 week |
 | Multiplication table | Implement table for multiplication table | Planned | 1 week |
 | Division and remainder | Implement table for integer division operations | 1 week |
 | Memory                      | Implement memory table with constraints | Planned | 2 weeks |
@@ -157,6 +159,7 @@ The first version is going to use the primitives contained in [lambdaworks](http
 | Elliptic curve addition | Table for EC operations | Planned | 2 weeks  |
 | Poseidon hash | Table for Poseidon hash | Planned | 3 weeks |
 | Keccak hash | Table for Keccak hash | Planned | 3 weeks |
+| SHA256 | Table for SHA256 | Planned | 3 weeks |
 | Pairing | Table for pairings | Planned? | |
 
 ## Proof system
