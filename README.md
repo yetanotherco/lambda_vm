@@ -80,7 +80,7 @@ This project is under active development. Our primary objective is to have a fir
 ### Theory
 - Diego
 - Manuel
-- 3MILabs
+- 3MILabs (Cyprien, Robin y Erik)
 
 ### Applied cryptography
 - Colo
@@ -112,13 +112,18 @@ The first version is going to use the primitives contained in [lambdaworks](http
 
 | Feature                     | Description                        | Status       | Duration |
 |---------------------------- |------------------------------------|--------------| ---------|
-| Documentation               | Explain how the executor works     | In progress  |   |
+| Documentation               | Explain how the executor works     | In progress  |  4 weeks |
 | Minimal CPU                 | Minimal CPU that can perform basic operations | In progress | |
 | Fibonacci opcodes I         | Opcodes needed to run Fibonacci part I (`addi`, `sw`, `beq`, `jal`, `jalr`) | In Progress | 1 week |
 | Fibonacci opcodes II         | Opcodes needed to run Fibonacci part II (`auipc`, `bltu`, `lui`, `sb`, `slli`) | In Progress | 1 week |
 | Compute decoding table | Decoding table indexed by pc | 1 week |
 | Basic logging        | Basic logs for minimal opcodes | In progress | 2 weeks |
 | RISCV64 CPU                 | Minimal version of the CPU with 52 RISCV instructions | Planned | |
+| Control flow opcodes | Implement remaining control flow operations (`bne`, `blt`, `bge`, `bgeu`) | Planned | 1 week |
+| Store operations | Remaining store operations (`sh`, `sw`, `sd`) | Planned | 1 week |
+| Load operations | Remaining load operations (`lb`, `lh`, `lw`, `ld`, `lbu`, `lhu`, `lwu`) | Planned | 1 week |
+| Integer arithmetic | Operations (`add`, `sub`, `sll`, `slt`, `sltu`, `xor`, `srl`, `sra`, `or`, `and`) | Planned | 1 week |
+| 32-bit word operations | RV64 32-bit operations (`addw`, `subw`, `sllw`, `srlw`, `sraw`, `addiw`, `slliw`, `srliw`, `sraiw`) | Planned | 1 week |
 | RISCV64IM CPU               | Working executor for RV64 virtual machine with 65 RISCV instructions | Planned | |
 | CPU with coprocessors       | Add coprocessors for special cryptographic operations   | Planned | |
 
@@ -127,7 +132,7 @@ The first version is going to use the primitives contained in [lambdaworks](http
 
 | Feature                     | Description                       | Status       | Duration |
 |---------------------------- |-----------------------------------|--------------| -------- |
-| Documentation               | Document trace generation and constraints | In progress | |
+| Documentation               | Document trace generation and constraints | In progress | 8 weeks |
 | CPU                         | Implement CPU table with constraints | In progress | |
 | Define basic CPU constraints | Add basic type constraints for CPU | In progress | 1 week|
 | Decoder table | Implement decoder table | Planned | 1 week |
@@ -137,13 +142,14 @@ The first version is going to use the primitives contained in [lambdaworks](http
 | Range checkers | Implement rangecheck for u16 and u8 | Planned | 1 week |
 | Bitwise operations | Implement tables for u8 bitwise operations | Planned | 1 week |
 | Multiplication table | Implement table for multiplication table | Planned | 1 week |
+| Division and remainder | Implement table for integer division operations | 1 week |
 | Memory                      | Implement memory table with constraints | Not started | |
 | Syscalls                    | Tables for coprocessors | Planned | |
-| Big Integer arithmetic | Table for big integer arithmetic | Planned |
-| Elliptic curve addition | Table for EC operations | Planned |
-| Poseidon hash | Table for Poseidon hash | Planned |
-| Keccak hash | Table for Keccak hash | Planned |
-| Pairing | Table for pairings | Planned? |
+| Big Integer arithmetic | Table for big integer arithmetic | Planned | 1 week |
+| Elliptic curve addition | Table for EC operations | Planned | 2 weeks  |
+| Poseidon hash | Table for Poseidon hash | Planned | |
+| Keccak hash | Table for Keccak hash | Planned | |
+| Pairing | Table for pairings | Planned? | |
 
 ## Proof system
 
@@ -153,8 +159,8 @@ The first version is going to use the primitives contained in [lambdaworks](http
 | Lookup arguments            | Linking tables via lookup arguments | In progress | 2 weeks |
 | Lookup - I | Accept multitables | In progress | 1 week |
 | Lookup - II | Perform argument with constraints | In progress | 1 week |
-| Multi-table Merkle trees (MTMT)   | Merkle tree that can be used to commit to polynomials of various sizes | In progress | |
-| Multi-FRI                   | Perform FRI using MTMT | Planned | |
+| Multi-table Merkle trees (MTMT)   | Merkle tree that can be used to commit to polynomials of various sizes | In progress | 2 weeks |
+| Multi-FRI                   | Perform FRI using MTMT | Planned | 2 weeks |
 | Adjust parameters           | Adjust parameters for 128 bits of security | Planned | 1 week |
 
 ## GPU and performance
