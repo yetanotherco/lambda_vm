@@ -3,6 +3,7 @@ members = [
   "executor",
   "prover",
   "crypto/stark",
-  ]
+  "bin/cli",
+]
 
 resolver = "2"
