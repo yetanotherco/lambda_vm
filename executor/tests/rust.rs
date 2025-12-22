@@ -79,3 +79,8 @@ fn test_ethereum_types() {
 fn test_vector() {
     run_program_and_check_output("./program_artifacts/rust/vector.elf", 15);
 }
+
+#[test]
+fn test_hashmap() {
+    run_program_and_check_output("./program_artifacts/rust/hashmap.elf", 3);
+}
