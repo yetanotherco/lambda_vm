@@ -1,12 +1,12 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion};
-use lambdaworks_math::field::fields::binary::field::{BinaryFieldError, TowerFieldElement};
+use math::field::fields::binary::field::{BinaryFieldError, TowerFieldElement};
 use rand::Rng;
 
 pub fn rand_element(num_level: usize) -> TowerFieldElement {
     let mut rng = rand::thread_rng();
-    let value = rng.gen::<u128>();
+    let value = rng.r#gen::<u128>();
     TowerFieldElement::new(value, num_level)
 }
 
@@ -85,7 +85,7 @@ fn binary_inv_bench(c: &mut Criterion, num_levels: usize) {
     let mut rng = rand::thread_rng();
     let values: Vec<TowerFieldElement> = (0..samples)
         .map(|_| {
-            let non_zero_val = rng.gen::<u128>() | 1;
+            let non_zero_val = rng.r#gen::<u128>() | 1;
             let a = TowerFieldElement::new(non_zero_val, num_levels);
             assert!(
                 !a.is_zero(),

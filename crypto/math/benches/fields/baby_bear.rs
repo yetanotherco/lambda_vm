@@ -1,11 +1,11 @@
 use criterion::Criterion;
 use std::hint::black_box;
 
-use lambdaworks_math::field::fields::fft_friendly::{
+use math::field::fields::fft_friendly::{
     quartic_babybear::Degree4BabyBearExtensionField,
     quartic_babybear_u32::Degree4BabyBearU32ExtensionField,
 };
-use lambdaworks_math::field::{
+use math::field::{
     element::FieldElement,
     fields::{
         fft_friendly::babybear::Babybear31PrimeField,
@@ -17,8 +17,8 @@ use p3_baby_bear::BabyBear;
 use p3_field::extension::BinomialExtensionField;
 use p3_field::{Field, PrimeCharacteristicRing};
 
-use rand::random;
 use rand::Rng;
+use rand::random;
 
 pub type U32Babybear31PrimeField = U32MontgomeryBackendPrimeField<2013265921>;
 pub type F = FieldElement<U32Babybear31PrimeField>;
@@ -84,7 +84,7 @@ pub fn rand_babybear_u32_fp4_elements(num: usize) -> Vec<(Fp4Eu32, Fp4Eu32)> {
     result
 }
 fn random_baby_bear<R: Rng>(rng: &mut R) -> BabyBear {
-    BabyBear::new(rng.gen::<u32>())
+    BabyBear::new(rng.r#gen::<u32>())
 }
 fn rand_babybear_elements_p3(num: usize) -> Vec<(BabyBear, BabyBear)> {
     let mut rng = rand::thread_rng();

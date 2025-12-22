@@ -464,7 +464,7 @@ dependencies = [
  "criterion 0.4.0",
  "digest",
  "iai-callgrind",
- "lambdaworks-math",
+ "math",
  "rand 0.8.5",
  "rand_chacha 0.3.1",
  "rayon",
