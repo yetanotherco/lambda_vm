@@ -1,6 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use lambdaworks_crypto::hash::pedersen::Pedersen;
-use lambdaworks_crypto::hash::pedersen::PedersenStarkCurve;
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use crypto::hash::pedersen::Pedersen;
+use crypto::hash::pedersen::PedersenStarkCurve;
 use lambdaworks_math::field::element::FieldElement;
 use lambdaworks_math::field::fields::fft_friendly::stark_252_prime_field::Stark252PrimeField;
 use lambdaworks_math::traits::ByteConversion;

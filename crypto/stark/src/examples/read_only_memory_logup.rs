@@ -14,8 +14,8 @@ use crate::{
     trace::TraceTable,
     traits::{AIR, TransitionEvaluationContext},
 };
+use crypto::fiat_shamir::is_transcript::IsTranscript;
 use itertools::Itertools;
-use lambdaworks_crypto::fiat_shamir::is_transcript::IsTranscript;
 use lambdaworks_math::{
     field::{
         element::FieldElement,

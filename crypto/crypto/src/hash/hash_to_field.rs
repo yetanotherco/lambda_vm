@@ -56,8 +56,8 @@ fn os2ip<M: IsModulus<UnsignedInteger<N>> + Clone, const N: usize>(
 
 /// Builds a `FieldElement` for `2^(N*16)`, where `N` is the number of limbs of the `UnsignedInteger`
 /// used for the prime field.
-fn build_two_to_the_nth<M: IsModulus<UnsignedInteger<N>> + Clone, const N: usize>(
-) -> FieldElement<MontgomeryBackendPrimeField<M, N>> {
+fn build_two_to_the_nth<M: IsModulus<UnsignedInteger<N>> + Clone, const N: usize>()
+-> FieldElement<MontgomeryBackendPrimeField<M, N>> {
     // The hex used to build the FieldElement is a 1 followed by N * 16 zeros
     let mut two_to_the_nth = String::with_capacity(N * 16);
     for _ in 0..two_to_the_nth.capacity() - 1 {

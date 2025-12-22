@@ -4,7 +4,7 @@ use lambdaworks_math::{
     field::{element::FieldElement, traits::HasDefaultTranscript},
     traits::ByteConversion,
 };
-use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
+use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng};
 use sha3::{Digest, Keccak256};
 
 pub struct DefaultTranscript<F: HasDefaultTranscript> {

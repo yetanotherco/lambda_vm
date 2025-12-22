@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use lambdaworks_crypto::merkle_tree::proof::Proof;
+use crypto::merkle_tree::proof::Proof;
 use lambdaworks_math::{
     field::{
         element::FieldElement,

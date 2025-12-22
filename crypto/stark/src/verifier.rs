@@ -7,7 +7,7 @@ use super::{
     traits::{AIR, TransitionEvaluationContext},
 };
 use crate::{config::Commitment, proof::stark::DeepPolynomialOpening};
-use lambdaworks_crypto::{fiat_shamir::is_transcript::IsTranscript, merkle_tree::proof::Proof};
+use crypto::{fiat_shamir::is_transcript::IsTranscript, merkle_tree::proof::Proof};
 use lambdaworks_math::{
     fft::cpu::bit_reversing::reverse_index,
     field::{

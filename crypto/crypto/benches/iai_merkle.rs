@@ -1,5 +1,5 @@
 use core::hint::black_box;
-use lambdaworks_crypto::{
+use crypto::{
     hash::sha3::Sha3Hasher,
     merkle_tree::{backends::field_element::FieldElementBackend, merkle::MerkleTree},
 };

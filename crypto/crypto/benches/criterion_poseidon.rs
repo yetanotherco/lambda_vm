@@ -1,6 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use lambdaworks_crypto::hash::poseidon::starknet::PoseidonCairoStark252;
-use lambdaworks_crypto::hash::poseidon::Poseidon;
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use crypto::hash::poseidon::Poseidon;
+use crypto::hash::poseidon::starknet::PoseidonCairoStark252;
 use lambdaworks_math::field::element::FieldElement;
 use lambdaworks_math::field::fields::fft_friendly::stark_252_prime_field::Stark252PrimeField;
 use lambdaworks_math::traits::ByteConversion;

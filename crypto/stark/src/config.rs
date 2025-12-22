@@ -1,4 +1,4 @@
-use lambdaworks_crypto::merkle_tree::{
+use crypto::merkle_tree::{
     backends::types::{BatchKeccak256Backend, Keccak256Backend},
     merkle::MerkleTree,
 };

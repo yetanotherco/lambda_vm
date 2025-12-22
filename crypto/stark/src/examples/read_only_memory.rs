@@ -10,7 +10,7 @@ use crate::{
     trace::TraceTable,
     traits::{AIR, TransitionEvaluationContext},
 };
-use lambdaworks_crypto::fiat_shamir::is_transcript::IsTranscript;
+use crypto::fiat_shamir::is_transcript::IsTranscript;
 use lambdaworks_math::field::traits::IsPrimeField;
 use lambdaworks_math::{
     field::{element::FieldElement, traits::IsFFTField},

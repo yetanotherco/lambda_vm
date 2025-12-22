@@ -1,4 +1,4 @@
-use lambdaworks_crypto::merkle_tree::proof::Proof;
+use crypto::merkle_tree::proof::Proof;
 use lambdaworks_math::field::element::FieldElement;
 use lambdaworks_math::field::traits::IsField;
 
