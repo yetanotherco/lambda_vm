@@ -117,7 +117,7 @@ impl<'t, F: IsField> Table<F> {
 
     /// Given a step size, converts the given table into a `Frame`.
     pub fn into_frame(&'t self, main_trace_columns: usize, step_size: usize) -> Frame<'t, F, F> {
-        debug_assert!(self.height % step_size == 0);
+        debug_assert!(self.height.is_multiple_of(step_size));
         let steps = (0..self.height)
             .step_by(step_size)
             .map(|initial_row_idx| {

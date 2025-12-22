@@ -117,7 +117,6 @@ where
 
         // If there is an exemptions period defined for this constraint, the evaluations are calculated directly
         // by computing P_exemptions(x) / Zerofier(x)
-        #[expect(clippy::incompatible_msrv)]
         if let Some(exemptions_period) = self.exemptions_period() {
             // FIXME: Rather than making this assertions here, it would be better to handle these
             // errors or make these checks when the AIR is initialized.
@@ -219,7 +218,6 @@ where
     ) -> FieldElement<E> {
         let end_exemptions_poly = self.end_exemptions_poly(trace_primitive_root, trace_length);
 
-        #[expect(clippy::incompatible_msrv)]
         if let Some(exemptions_period) = self.exemptions_period() {
             debug_assert!(exemptions_period.is_multiple_of(self.period()));
 

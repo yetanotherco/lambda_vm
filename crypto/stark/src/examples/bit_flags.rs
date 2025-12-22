@@ -207,13 +207,10 @@ pub fn bit_prefix_flag_trace(num_steps: usize) -> TraceTable<StarkField, StarkFi
     .map(|t| Felt252::from(*t))
     .collect();
 
-    let mut data: Vec<Felt252> = iter::repeat(step).take(num_steps).flatten().collect();
+    let mut data: Vec<Felt252> = iter::repeat_n(step, num_steps).flatten().collect();
     data[0] = Felt252::from(1030);
 
     let mut dummy_column = (0..16).map(Felt252::from).collect();
-    dummy_column = iter::repeat(dummy_column)
-        .take(num_steps)
-        .flatten()
-        .collect();
+    dummy_column = iter::repeat_n(dummy_column, num_steps).flatten().collect();
     TraceTable::from_columns_main(vec![data, dummy_column], 16)
 }

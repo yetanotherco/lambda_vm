@@ -123,7 +123,7 @@ where
     }
 
     pub fn num_steps(&self) -> usize {
-        debug_assert!((self.main_table.height % self.step_size) == 0);
+        debug_assert!(self.main_table.height.is_multiple_of(self.step_size));
         self.main_table.height / self.step_size
     }
 
@@ -298,7 +298,7 @@ where
     }
 
     pub fn num_steps(&self) -> usize {
-        debug_assert!((self.main_table.height % self.lde_step_size) == 0);
+        debug_assert!(self.main_table.height.is_multiple_of(self.lde_step_size));
         self.main_table.height / self.lde_step_size
     }
 

@@ -82,7 +82,7 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
 {
     if !fri_layers.is_empty() {
-        let query_list = iotas
+        iotas
             .iter()
             .map(|iota_s| {
                 let mut layers_evaluations_sym = Vec::new();
@@ -104,9 +104,7 @@ where
                     layers_evaluations_sym,
                 }
             })
-            .collect();
-
-        query_list
+            .collect()
     } else {
         vec![]
     }
