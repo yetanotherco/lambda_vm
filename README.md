@@ -118,7 +118,7 @@ The first version is going to use the primitives contained in [lambdaworks](http
 | Fibonacci operations II         | Operations needed to run Fibonacci part II (`auipc`, `bltu`, `lui`, `sb`, `slli`) | ✔️  | 1 week |
 | Compute decoding table | Decoding table indexed by pc | 1 week |
 | Basic logging        | Basic logs for minimal opcodes | ✔️  | 2 weeks |
-| RISCV64 CPU                 | Minimal version of the CPU with 52 RISCV instructions | Planned | 8 weeks |
+| RISCV64 CPU                 | Minimal version of the CPU with 52 RISCV instructions* | Planned | 8 weeks |
 | Control flow opcodes | Implement remaining control flow operations (`bne`, `blt`, `bge`, `bgeu`) | ✔️ | 1 week |
 | Store operations | Remaining store operations (`sh`, `sw`, `sd`) | ✔️  | 1 week |
 | Load operations | Remaining load operations (`lb`, `lh`, `lw`, `ld`, `lbu`, `lhu`, `lwu`) | ✔️  | 1 week |
@@ -126,8 +126,8 @@ The first version is going to use the primitives contained in [lambdaworks](http
 | Integer arithmetic - immediate | Operations (`addi`, `subi`, `slli`, `slti`, `sltui`, `xori`, `srli`, `srai`, `ori`, `andi`) | ✔️  | 1 week |
 | 32-bit word operations | RV64 32-bit operations (`addw`, `subw`, `sllw`, `srlw`, `sraw`, `addiw`, `slliw`, `srliw`, `sraiw`) | Planned | 1 week |
 | RISCV64IM CPU               | Working executor for RV64 virtual machine with 65 RISCV instructions | Planned | |
-| Multiplication operations | Operations related to multiplication (`mul`, `mulh`, `mulhsu`, `mulhu`) | Planned | 1 week |
-| Division operations | Operations related to division (`div`, `divu`, `rem`, `remu`) | Planned | 1 week |
+| Multiplication operations | Operations related to multiplication (`mul`, `mulh`, `mulhsu`, `mulhu`) | ✔️ | 1 week |
+| Division operations | Operations related to division (`div`, `divu`, `rem`, `remu`) | ✔️ | 1 week |
 | CPU with coprocessors       | Add coprocessors for special cryptographic operations   | Planned | 10 weeks |
 | System instructions | `ecall`, `ebreak` | Planned | 1 week |
 | Big Integer arithmetic | Big integer arithmetic syscall | Planned | 1 week |
@@ -136,6 +136,8 @@ The first version is going to use the primitives contained in [lambdaworks](http
 | Keccak hash | Keccak hash syscall | Planned | 3 weeks |
 | SHA256 | SHA 256 syscall | Planned 2 weeks |
 | Pairing | Table for pairings | Planned? | ? |
+
+*few operations remain to be implemented
 
 ## Trace generator
 
