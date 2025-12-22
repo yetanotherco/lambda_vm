@@ -96,49 +96,54 @@ This project is under active development. Our primary objective is to have a fir
 
 The first version is going to use the primitives contained in [lambdaworks](https://github.com/lambdaclass/lambdaworks)
 
-| Feature                     | Description                        | Status       |
-|---------------------------- |------------------------------------|--------------|
-| Documentation               | Explain how everything works       | In progress  |
-| Field                       | Basic field type                   | First version|
-| Poseidon hash               | Implement Poseidon-2 hash          | Planned      |
-| Keccak                      | Implement Keccak hash function     | Planned      |
-| CPU FFT                     | Radix-2 Fast-Fourier transform in CPU | First version |
-| Basic Merkle commitment     | Merkle tree                        | First version |
-| Basic FRI                   | FRI proximity test                 | First version |
-| Basic constraints           | Simple API for defining constraints for AIR | First version |
-| Basic AIR                   | Algebraic intermediate representation for computations | First version |       
+| Feature                     | Description                        | Status       | Duration |
+|---------------------------- |------------------------------------|--------------| ---------|
+| Documentation               | Explain how everything works       | In progress  | 4 weeks |
+| Field                       | Basic field type                   | First version| 1 week |
+| Poseidon hash               | Implement Poseidon-2 hash          | Planned      | 1 week |
+| Keccak                      | Implement Keccak hash function     | Planned      | 1 week |
+| CPU FFT                     | Radix-2 Fast-Fourier transform in CPU | First version | 1 week |
+| Basic Merkle commitment     | Merkle tree                        | First version | 1 week |
+| Basic FRI                   | FRI proximity test                 | First version | 1 week  |
+| Basic constraints           | Simple API for defining constraints for AIR | First version | 1 week |
+| Basic AIR                   | Algebraic intermediate representation for computations | First version | 1 week |       
 
 ## Executor
 
-| Feature                     | Description                        | Status       |
-|---------------------------- |------------------------------------|--------------|
-| Documentation               | Explain how the executor works     | In progress  |
-| Minimal CPU                 | Minimal CPU that can perform basic operations | In progress |
-| RISCV64 CPU                 | Minimal version of the CPU with 52 RISCV instructions | Planned |
-| RISCV64IM CPU               | Working executor for RV64 virtual machine | Planned |
-| CPU with coprocessors       | Add coprocessors for special cryptographic operations   | Planned |
+| Feature                     | Description                        | Status       | Duration |
+|---------------------------- |------------------------------------|--------------| ---------|
+| Documentation               | Explain how the executor works     | In progress  |   |
+| Minimal CPU                 | Minimal CPU that can perform basic operations | In progress | |
+| Fibonacci opcodes I         | Opcodes needed to run Fibonacci part I (`addi`, `sw`, `beq`, `jal`, `jalr`) | In Progress | 1 week |
+| Fibonacci opcodes II         | Opcodes needed to run Fibonacci part II (`auipc`, `bltu`, `lui`, `sb`, `slli`) | In Progress | 1 week |
+| Basic logging        | Basic logs for minimal opcodes | In progress | 2 weeks |
+| RISCV64 CPU                 | Minimal version of the CPU with 52 RISCV instructions | Planned | |
+| RISCV64IM CPU               | Working executor for RV64 virtual machine with 65 RISCV instructions | Planned | |
+| CPU with coprocessors       | Add coprocessors for special cryptographic operations   | Planned | |
 
 
 ## Trace generator
 
-| Feature                     | Description                       | Status       |
-|---------------------------- |-----------------------------------|--------------|
-| Documentation               | Document trace generation and constraints | In progress |
-| CPU                         | Implement CPU table with constraints | In progress |
-| ALU                         | Implement ALU tables with constraints| Not started |
-| Memory                      | Implement memory table with constraints | Not started |
-| Syscalls                    | Tables for coprocessors | Planned |
+| Feature                     | Description                       | Status       | Duration |
+|---------------------------- |-----------------------------------|--------------| -------- |
+| Documentation               | Document trace generation and constraints | In progress | |
+| CPU                         | Implement CPU table with constraints | In progress | |
+| ALU                         | Implement ALU tables with constraints| Not started | |
+| Memory                      | Implement memory table with constraints | Not started | |
+| Syscalls                    | Tables for coprocessors | Planned | |
 
 
 ## Proof system
 
-| Feature                     | Description                       | Status       |
-|---------------------------- |-----------------------------------|--------------|
-| Documentation               | Prepare comprehensive documentation on proof system | In progress   |
-| Lookup arguments            | Linking tables via lookup arguments | In progress |
-| Multi-table Merkle trees (MTMT)   | Merkle tree that can be used to commit to polynomials of various sizes | In progress
-| Multi-FRI                   | Perform FRI using MTMT | Planned |
-| Adjust parameters           | Adjust parameters for 128 bits of security | Planned |
+| Feature                     | Description                       | Status       | Duration |
+|---------------------------- |-----------------------------------|--------------| -------- |
+| Documentation               | Prepare comprehensive documentation on proof system | In progress   | |
+| Lookup arguments            | Linking tables via lookup arguments | In progress | 2 weeks |
+| Lookup - I | Accept multitables | In progress | 1 week |
+| Lookup - II | Perform argument with constraints | In progress | 1 week |
+| Multi-table Merkle trees (MTMT)   | Merkle tree that can be used to commit to polynomials of various sizes | In progress | |
+| Multi-FRI                   | Perform FRI using MTMT | Planned | |
+| Adjust parameters           | Adjust parameters for 128 bits of security | Planned | 1 week |
 
 ## GPU and performance
 
