@@ -1,6 +1,6 @@
 use const_random::const_random;
 use iai_callgrind::black_box;
-use u64_utils::{rand_field_elements, rand_poly, FE};
+use u64_utils::{FE, rand_field_elements, rand_poly};
 
 mod utils;
 use utils::u64_utils;

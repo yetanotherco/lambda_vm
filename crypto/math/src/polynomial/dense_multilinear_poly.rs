@@ -1,6 +1,6 @@
 use crate::{
     field::{element::FieldElement, traits::IsField},
-    polynomial::{error::MultilinearError, Polynomial},
+    polynomial::{Polynomial, error::MultilinearError},
 };
 use alloc::{vec, vec::Vec};
 use core::ops::{Add, Index, Mul};

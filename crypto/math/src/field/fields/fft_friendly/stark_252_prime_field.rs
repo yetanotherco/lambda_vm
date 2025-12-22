@@ -4,7 +4,7 @@ use crate::{
         fields::montgomery_backed_prime_fields::{IsModulus, U256PrimeField},
         traits::IsFFTField,
     },
-    unsigned_integer::element::{UnsignedInteger, U256},
+    unsigned_integer::element::{U256, UnsignedInteger},
 };
 
 #[derive(Clone, Debug, Hash, Copy)]

@@ -11,7 +11,9 @@ use crate::field::{
 use crate::traits::ByteConversion;
 use crate::unsigned_integer::element::U384;
 
-pub const BLS12381_PRIME_FIELD_ORDER: U384 = U384::from_hex_unchecked("1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaab");
+pub const BLS12381_PRIME_FIELD_ORDER: U384 = U384::from_hex_unchecked(
+    "1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaab",
+);
 
 // FPBLS12381
 #[derive(Clone, Debug)]
@@ -320,8 +322,8 @@ mod tests {
         // base = 1 + u + (1 + u)v + (1 + u)v^2 + ((1+u) + (1 + u)v + (1+ u)v^2)w
         let element_ones =
             Fp12E::from_coefficients(&["1", "1", "1", "1", "1", "1", "1", "1", "1", "1", "1", "1"]);
-        let element_ones_squared =
-            Fp12E::from_coefficients(&["1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaa1",
+        let element_ones_squared = Fp12E::from_coefficients(&[
+            "1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaa1",
             "c",
             "1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaa5",
             "c",
@@ -332,7 +334,8 @@ mod tests {
             "1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaa7",
             "c",
             "0",
-            "c"]);
+            "c",
+        ]);
         assert_eq!(element_ones.pow(2_u16), element_ones_squared);
         assert_eq!(element_ones.square(), element_ones_squared);
     }
@@ -342,18 +345,20 @@ mod tests {
         let element_sequence =
             Fp12E::from_coefficients(&["1", "2", "5", "6", "9", "a", "3", "4", "7", "8", "b", "c"]);
 
-        let element_sequence_squared = Fp12E::from_coefficients(&["1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffa87d",
-        "199",
-        "1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffa851",
-        "20b",
-        "1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffa955",
-        "1cd",
-        "1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffa845",
-        "1e8",
-        "1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffa8a9",
-        "202",
-        "1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaa5d",
-        "16c"]);
+        let element_sequence_squared = Fp12E::from_coefficients(&[
+            "1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffa87d",
+            "199",
+            "1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffa851",
+            "20b",
+            "1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffa955",
+            "1cd",
+            "1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffa845",
+            "1e8",
+            "1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffa8a9",
+            "202",
+            "1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaa5d",
+            "16c",
+        ]);
 
         assert_eq!(element_sequence.pow(2_u16), element_sequence_squared);
         assert_eq!(element_sequence.square(), element_sequence_squared);
@@ -374,7 +379,7 @@ mod tests {
             "0",
             "0",
             "0",
-            "0"
+            "0",
         ]);
         let expectedy = Fp12E::from_coefficients(&[
             "0",
@@ -388,7 +393,7 @@ mod tests {
             "ce5d527727d6e118cc9cdc6da2e351aadfd9baa8cbdd3a76d429a695160d12c923ac9cc3baca289e193548608b82801",
             "606c4a02ea734cc32acd2b02bc28b99cb3e287e85a763af267492ab572e99ab3f370d275cec1da1aaa9075ff05f79be",
             "0",
-            "0"
+            "0",
         ]);
         let [g_to_fp12_x, g_to_fp12_y] = g.to_fp12_unnormalized();
         assert_eq!(g_to_fp12_x, expectedx);

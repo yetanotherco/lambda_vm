@@ -41,10 +41,14 @@ impl IsEllipticCurve for BLS12377Curve {
         // SAFETY:
         // - These values are mathematically verified and known to be valid points on BLS12-377.
         // - `unwrap()` is safe because we **ensure** the input values satisfy the curve equation.
-        let point= Self::PointRepresentation::new([
-            FieldElement::<Self::BaseField>::new_base("8848defe740a67c8fc6225bf87ff5485951e2caa9d41bb188282c8bd37cb5cd5481512ffcd394eeab9b16eb21be9ef"),
-            FieldElement::<Self::BaseField>::new_base("1914a69c5102eff1f674f5d30afeec4bd7fb348ca3e52d96d182ad44fb82305c2fe3d3634a9591afd82de55559c8ea6"),
-            FieldElement::one()
+        let point = Self::PointRepresentation::new([
+            FieldElement::<Self::BaseField>::new_base(
+                "8848defe740a67c8fc6225bf87ff5485951e2caa9d41bb188282c8bd37cb5cd5481512ffcd394eeab9b16eb21be9ef",
+            ),
+            FieldElement::<Self::BaseField>::new_base(
+                "1914a69c5102eff1f674f5d30afeec4bd7fb348ca3e52d96d182ad44fb82305c2fe3d3634a9591afd82de55559c8ea6",
+            ),
+            FieldElement::one(),
         ]);
         point.unwrap()
     }
@@ -79,11 +83,14 @@ pub const ENDO_U: BLS12377TwistCurveFieldElement =
     ]);
 
 /// y-coordinate of 𝜁 ∘ 𝜋_q ∘ 𝜁⁻¹, where 𝜁 is the isomorphism u:E'(𝔽ₚ₆) −> E(𝔽ₚ₁₂) from the twist to E
-pub const ENDO_V: BLS12377TwistCurveFieldElement =
-    BLS12377TwistCurveFieldElement::const_from_raw([
-        FieldElement::from_hex_unchecked("1680A40796537CAC0C534DB1A79BEB1400398F50AD1DEC1BCE649CF436B0F6299588459BFF27D8E6E76D5ECF1391C63"),
+pub const ENDO_V: BLS12377TwistCurveFieldElement = BLS12377TwistCurveFieldElement::const_from_raw(
+    [
+        FieldElement::from_hex_unchecked(
+            "1680A40796537CAC0C534DB1A79BEB1400398F50AD1DEC1BCE649CF436B0F6299588459BFF27D8E6E76D5ECF1391C63",
+        ),
         FieldElement::from_hex_unchecked("0"),
-    ]);
+    ],
+);
 
 impl ShortWeierstrassProjectivePoint<BLS12377Curve> {
     /// Returns 𝜙(P) = (𝑥, 𝑦) ⇒ (𝛽𝑥, 𝑦), where 𝛽 is the Cube Root of Unity in the base prime field
@@ -154,14 +161,22 @@ mod tests {
     type Fp2 = FieldElement<Degree2ExtensionField>;
 
     fn point_1() -> ShortWeierstrassProjectivePoint<BLS12377Curve> {
-        let x = FpE::new_base("134e4cc122cb62a06767fb98e86f2d5f77e2a12fefe23bb0c4c31d1bd5348b88d6f5e5dee2b54db4a2146cc9f249eea");
-        let y = FpE::new_base("17949c29effee7a9f13f69b1c28eccd78c1ed12b47068836473481ff818856594fd9c1935e3d9e621901a2d500257a2");
+        let x = FpE::new_base(
+            "134e4cc122cb62a06767fb98e86f2d5f77e2a12fefe23bb0c4c31d1bd5348b88d6f5e5dee2b54db4a2146cc9f249eea",
+        );
+        let y = FpE::new_base(
+            "17949c29effee7a9f13f69b1c28eccd78c1ed12b47068836473481ff818856594fd9c1935e3d9e621901a2d500257a2",
+        );
         BLS12377Curve::create_point_from_affine(x, y).unwrap()
     }
 
     fn point_1_times_5() -> ShortWeierstrassProjectivePoint<BLS12377Curve> {
-        let x = FpE::new_base("3c852d5aab73fbb51e57fbf5a0a8b5d6513ec922b2611b7547bfed74cba0dcdfc3ad2eac2733a4f55d198ec82b9964");
-        let y = FpE::new_base("a71425e68e55299c64d7eada9ae9c3fb87a9626b941d17128b64685fc07d0e635f3c3a512903b4e0a43e464045967b");
+        let x = FpE::new_base(
+            "3c852d5aab73fbb51e57fbf5a0a8b5d6513ec922b2611b7547bfed74cba0dcdfc3ad2eac2733a4f55d198ec82b9964",
+        );
+        let y = FpE::new_base(
+            "a71425e68e55299c64d7eada9ae9c3fb87a9626b941d17128b64685fc07d0e635f3c3a512903b4e0a43e464045967b",
+        );
         BLS12377Curve::create_point_from_affine(x, y).unwrap()
     }
 
@@ -209,8 +224,12 @@ mod tests {
         let point_1 = point_1().to_affine();
 
         // Create point 2
-        let x = FpE::new_base("134e4cc122cb62a06767fb98e86f2d5f77e2a12fefe23bb0c4c31d1bd5348b88d6f5e5dee2b54db4a2146cc9f249eea") * FpE::from(2);
-        let y = FpE::new_base("17949c29effee7a9f13f69b1c28eccd78c1ed12b47068836473481ff818856594fd9c1935e3d9e621901a2d500257a2") * FpE::from(2);
+        let x = FpE::new_base(
+            "134e4cc122cb62a06767fb98e86f2d5f77e2a12fefe23bb0c4c31d1bd5348b88d6f5e5dee2b54db4a2146cc9f249eea",
+        ) * FpE::from(2);
+        let y = FpE::new_base(
+            "17949c29effee7a9f13f69b1c28eccd78c1ed12b47068836473481ff818856594fd9c1935e3d9e621901a2d500257a2",
+        ) * FpE::from(2);
         let z = FpE::from(2);
         let point_2 = ShortWeierstrassProjectivePoint::<BLS12377Curve>::new([x, y, z]).unwrap();
 
@@ -223,8 +242,18 @@ mod tests {
     #[test]
     fn create_valid_point_works() {
         let p = point_1();
-        assert_eq!(*p.x(), FpE::new_base("134e4cc122cb62a06767fb98e86f2d5f77e2a12fefe23bb0c4c31d1bd5348b88d6f5e5dee2b54db4a2146cc9f249eea"));
-        assert_eq!(*p.y(), FpE::new_base("17949c29effee7a9f13f69b1c28eccd78c1ed12b47068836473481ff818856594fd9c1935e3d9e621901a2d500257a2"));
+        assert_eq!(
+            *p.x(),
+            FpE::new_base(
+                "134e4cc122cb62a06767fb98e86f2d5f77e2a12fefe23bb0c4c31d1bd5348b88d6f5e5dee2b54db4a2146cc9f249eea"
+            )
+        );
+        assert_eq!(
+            *p.y(),
+            FpE::new_base(
+                "17949c29effee7a9f13f69b1c28eccd78c1ed12b47068836473481ff818856594fd9c1935e3d9e621901a2d500257a2"
+            )
+        );
         assert_eq!(*p.z(), FpE::new_base("1"));
     }
 

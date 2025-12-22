@@ -8,7 +8,7 @@ use crate::{
 };
 use cudarc::{
     driver::{
-        safe::CudaSlice, safe::DeviceSlice, CudaDevice, CudaFunction, LaunchAsync, LaunchConfig,
+        CudaDevice, CudaFunction, LaunchAsync, LaunchConfig, safe::CudaSlice, safe::DeviceSlice,
     },
     nvrtc::safe::Ptx,
 };

@@ -725,16 +725,24 @@ mod tests {
 
     #[cfg(feature = "alloc")]
     fn point() -> ShortWeierstrassProjectivePoint<BLS12381Curve> {
-        let x = FEE::new_base("36bb494facde72d0da5c770c4b16d9b2d45cfdc27604a25a1a80b020798e5b0dbd4c6d939a8f8820f042a29ce552ee5");
-        let y = FEE::new_base("7acf6e49cc000ff53b06ee1d27056734019c0a1edfa16684da41ebb0c56750f73bc1b0eae4c6c241808a5e485af0ba0");
+        let x = FEE::new_base(
+            "36bb494facde72d0da5c770c4b16d9b2d45cfdc27604a25a1a80b020798e5b0dbd4c6d939a8f8820f042a29ce552ee5",
+        );
+        let y = FEE::new_base(
+            "7acf6e49cc000ff53b06ee1d27056734019c0a1edfa16684da41ebb0c56750f73bc1b0eae4c6c241808a5e485af0ba0",
+        );
         BLS12381Curve::create_point_from_affine(x, y).unwrap()
     }
 
     #[cfg(feature = "alloc")]
     #[test]
     fn operate_with_works_jacobian() {
-        let x = FEE::new_base("36bb494facde72d0da5c770c4b16d9b2d45cfdc27604a25a1a80b020798e5b0dbd4c6d939a8f8820f042a29ce552ee5");
-        let y = FEE::new_base("7acf6e49cc000ff53b06ee1d27056734019c0a1edfa16684da41ebb0c56750f73bc1b0eae4c6c241808a5e485af0ba0");
+        let x = FEE::new_base(
+            "36bb494facde72d0da5c770c4b16d9b2d45cfdc27604a25a1a80b020798e5b0dbd4c6d939a8f8820f042a29ce552ee5",
+        );
+        let y = FEE::new_base(
+            "7acf6e49cc000ff53b06ee1d27056734019c0a1edfa16684da41ebb0c56750f73bc1b0eae4c6c241808a5e485af0ba0",
+        );
         let p = ShortWeierstrassJacobianPoint::<BLS12381Curve>::from_affine(x, y).unwrap();
 
         assert_eq!(p.operate_with(&p), p.double());
@@ -743,8 +751,12 @@ mod tests {
     #[cfg(feature = "alloc")]
     #[test]
     fn operate_with_self_works_jacobian() {
-        let x = FEE::new_base("36bb494facde72d0da5c770c4b16d9b2d45cfdc27604a25a1a80b020798e5b0dbd4c6d939a8f8820f042a29ce552ee5");
-        let y = FEE::new_base("7acf6e49cc000ff53b06ee1d27056734019c0a1edfa16684da41ebb0c56750f73bc1b0eae4c6c241808a5e485af0ba0");
+        let x = FEE::new_base(
+            "36bb494facde72d0da5c770c4b16d9b2d45cfdc27604a25a1a80b020798e5b0dbd4c6d939a8f8820f042a29ce552ee5",
+        );
+        let y = FEE::new_base(
+            "7acf6e49cc000ff53b06ee1d27056734019c0a1edfa16684da41ebb0c56750f73bc1b0eae4c6c241808a5e485af0ba0",
+        );
         let p = ShortWeierstrassJacobianPoint::<BLS12381Curve>::from_affine(x, y).unwrap();
 
         assert_eq!(
@@ -942,8 +954,12 @@ mod tests {
 
     #[test]
     fn test_jacobian_vs_projective_operation() {
-        let x = FEE::new_base("36bb494facde72d0da5c770c4b16d9b2d45cfdc27604a25a1a80b020798e5b0dbd4c6d939a8f8820f042a29ce552ee5");
-        let y = FEE::new_base("7acf6e49cc000ff53b06ee1d27056734019c0a1edfa16684da41ebb0c56750f73bc1b0eae4c6c241808a5e485af0ba0");
+        let x = FEE::new_base(
+            "36bb494facde72d0da5c770c4b16d9b2d45cfdc27604a25a1a80b020798e5b0dbd4c6d939a8f8820f042a29ce552ee5",
+        );
+        let y = FEE::new_base(
+            "7acf6e49cc000ff53b06ee1d27056734019c0a1edfa16684da41ebb0c56750f73bc1b0eae4c6c241808a5e485af0ba0",
+        );
 
         let p = ShortWeierstrassJacobianPoint::<BLS12381Curve>::from_affine(x.clone(), y.clone())
             .unwrap();
@@ -966,8 +982,12 @@ mod tests {
 
     #[test]
     fn test_multiplication_by_order_projective() {
-        let x = FEE::new_base("36bb494facde72d0da5c770c4b16d9b2d45cfdc27604a25a1a80b020798e5b0dbd4c6d939a8f8820f042a29ce552ee5");
-        let y = FEE::new_base("7acf6e49cc000ff53b06ee1d27056734019c0a1edfa16684da41ebb0c56750f73bc1b0eae4c6c241808a5e485af0ba0");
+        let x = FEE::new_base(
+            "36bb494facde72d0da5c770c4b16d9b2d45cfdc27604a25a1a80b020798e5b0dbd4c6d939a8f8820f042a29ce552ee5",
+        );
+        let y = FEE::new_base(
+            "7acf6e49cc000ff53b06ee1d27056734019c0a1edfa16684da41ebb0c56750f73bc1b0eae4c6c241808a5e485af0ba0",
+        );
 
         let p = ShortWeierstrassProjectivePoint::<BLS12381Curve>::from_affine(x.clone(), y.clone())
             .unwrap();
@@ -984,8 +1004,12 @@ mod tests {
 
     #[test]
     fn test_multiplication_by_order_jacobian() {
-        let x = FEE::new_base("36bb494facde72d0da5c770c4b16d9b2d45cfdc27604a25a1a80b020798e5b0dbd4c6d939a8f8820f042a29ce552ee5");
-        let y = FEE::new_base("7acf6e49cc000ff53b06ee1d27056734019c0a1edfa16684da41ebb0c56750f73bc1b0eae4c6c241808a5e485af0ba0");
+        let x = FEE::new_base(
+            "36bb494facde72d0da5c770c4b16d9b2d45cfdc27604a25a1a80b020798e5b0dbd4c6d939a8f8820f042a29ce552ee5",
+        );
+        let y = FEE::new_base(
+            "7acf6e49cc000ff53b06ee1d27056734019c0a1edfa16684da41ebb0c56750f73bc1b0eae4c6c241808a5e485af0ba0",
+        );
 
         let p = ShortWeierstrassJacobianPoint::<BLS12381Curve>::from_affine(x.clone(), y.clone())
             .unwrap();

@@ -11,7 +11,10 @@ pub enum MSMError {
 impl Display for MSMError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            MSMError::LengthMismatch(cs, points) => write!(f, "`cs` and `points` must be of the same length to compute `msm`. Got: {cs} and {points}"),
+            MSMError::LengthMismatch(cs, points) => write!(
+                f,
+                "`cs` and `points` must be of the same length to compute `msm`. Got: {cs} and {points}"
+            ),
         }
     }
 }

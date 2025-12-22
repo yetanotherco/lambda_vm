@@ -22,17 +22,17 @@ use num_traits::Num;
     feature = "lambdaworks-serde-binary",
     feature = "lambdaworks-serde-string"
 ))]
+use serde::Deserialize;
+#[cfg(any(
+    feature = "lambdaworks-serde-binary",
+    feature = "lambdaworks-serde-string"
+))]
 use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 #[cfg(any(
     feature = "lambdaworks-serde-binary",
     feature = "lambdaworks-serde-string"
 ))]
 use serde::ser::{Serialize, SerializeStruct, Serializer};
-#[cfg(any(
-    feature = "lambdaworks-serde-binary",
-    feature = "lambdaworks-serde-string"
-))]
-use serde::Deserialize;
 
 use super::fields::montgomery_backed_prime_fields::{IsModulus, MontgomeryBackendPrimeField};
 use super::traits::{IsPrimeField, IsSubFieldOf, LegendreSymbol};
@@ -817,9 +817,9 @@ mod tests {
     use crate::field::fields::montgomery_backed_prime_fields::U384PrimeField;
     use crate::field::fields::u64_prime_field::U64PrimeField;
     use crate::field::test_fields::u64_test_field::U64TestField;
+    use crate::unsigned_integer::element::U384;
     #[cfg(feature = "alloc")]
     use crate::unsigned_integer::element::UnsignedInteger;
-    use crate::unsigned_integer::element::U384;
     #[cfg(feature = "alloc")]
     use alloc::vec::Vec;
     use num_bigint::BigUint;

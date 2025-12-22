@@ -1,8 +1,8 @@
 use super::{
     curve::BLS12377Curve,
     field_extension::{
-        mul_fp2_by_nonresidue, sparse_fp12_mul, BLS12377PrimeField, Degree12ExtensionField,
-        Degree2ExtensionField, Degree4ExtensionField,
+        BLS12377PrimeField, Degree2ExtensionField, Degree4ExtensionField, Degree12ExtensionField,
+        mul_fp2_by_nonresidue, sparse_fp12_mul,
     },
     twist::BLS12377TwistCurve,
 };
@@ -83,18 +83,22 @@ pub const GAMMA_22: FpE = FpE::from_hex_unchecked(
     "0x9b3af05dd14f6ec619aaf7d34594aabc5ed1347970dec00452217cc900000008508c00000000001",
 );
 
-pub const GAMMA_23: FpE =
-    FpE::from_hex_unchecked("0x1ae3a4617c510eac63b05c06ca1493b1a22d9f300f5138f1ef3622fba094800170b5d44300000008508c00000000000");
+pub const GAMMA_23: FpE = FpE::from_hex_unchecked(
+    "0x1ae3a4617c510eac63b05c06ca1493b1a22d9f300f5138f1ef3622fba094800170b5d44300000008508c00000000000",
+);
 
-pub const GAMMA_24: FpE =
-    FpE::from_hex_unchecked("0x1ae3a4617c510eabc8756ba8f8c524eb8882a75cc9bc8e359064ee822fb5bffd1e945779fffffffffffffffffffffff");
+pub const GAMMA_24: FpE = FpE::from_hex_unchecked(
+    "0x1ae3a4617c510eabc8756ba8f8c524eb8882a75cc9bc8e359064ee822fb5bffd1e945779fffffffffffffffffffffff",
+);
 
-pub const GAMMA_25: FpE =
-    FpE::from_hex_unchecked("0x1ae3a4617c510eabc8756ba8f8c524eb8882a75cc9bc8e359064ee822fb5bffd1e94577a00000000000000000000000");
+pub const GAMMA_25: FpE = FpE::from_hex_unchecked(
+    "0x1ae3a4617c510eabc8756ba8f8c524eb8882a75cc9bc8e359064ee822fb5bffd1e94577a00000000000000000000000",
+);
 
 /// The inverse of two in Fp as a constant.
-pub const TWO_INV: FpE =
-    FpE::from_hex_unchecked("D71D230BE28875631D82E03650A49D8D116CF9807A89C78F79B117DD04A4000B85AEA2180000004284600000000001");
+pub const TWO_INV: FpE = FpE::from_hex_unchecked(
+    "D71D230BE28875631D82E03650A49D8D116CF9807A89C78F79B117DD04A4000B85AEA2180000004284600000000001",
+);
 
 #[derive(Clone)]
 pub struct BLS12377AtePairing;

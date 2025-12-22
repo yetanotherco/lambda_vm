@@ -1,8 +1,8 @@
 use super::{
     curve::BN254Curve,
     field_extension::{
-        mul_fp2_by_nonresidue, BN254PrimeField, Degree12ExtensionField, Degree2ExtensionField,
-        Degree4ExtensionField,
+        BN254PrimeField, Degree2ExtensionField, Degree4ExtensionField, Degree12ExtensionField,
+        mul_fp2_by_nonresidue,
     },
     twist::BN254TwistCurve,
 };

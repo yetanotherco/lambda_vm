@@ -333,8 +333,12 @@ mod tests {
         // Valig G2 point coordinates:
         let x_0 = BLS12381FieldElement::from_hex_unchecked("02");
         let x_1 = BLS12381FieldElement::from_hex_unchecked("0");
-        let y_0 = BLS12381FieldElement::from_hex_unchecked("013a59858b6809fca4d9a3b6539246a70051a3c88899964a42bc9a69cf9acdd9dd387cfa9086b894185b9a46a402be73");
-        let y_1 = BLS12381FieldElement::from_hex_unchecked("02d27e0ec3356299a346a09ad7dc4ef68a483c3aed53f9139d2f929a3eecebf72082e5e58c6da24ee32e03040c406d4f");
+        let y_0 = BLS12381FieldElement::from_hex_unchecked(
+            "013a59858b6809fca4d9a3b6539246a70051a3c88899964a42bc9a69cf9acdd9dd387cfa9086b894185b9a46a402be73",
+        );
+        let y_1 = BLS12381FieldElement::from_hex_unchecked(
+            "02d27e0ec3356299a346a09ad7dc4ef68a483c3aed53f9139d2f929a3eecebf72082e5e58c6da24ee32e03040c406d4f",
+        );
 
         let x: FieldElement<Degree2ExtensionField> = FieldElement::new([x_0, x_1]);
         let y: FieldElement<Degree2ExtensionField> = FieldElement::new([y_0, y_1]);
@@ -362,8 +366,12 @@ mod tests {
         // Valig G2 point coordinates:
         let x_0 = BLS12381FieldElement::from_hex_unchecked("02");
         let x_1 = BLS12381FieldElement::from_hex_unchecked("0");
-        let y_0 = BLS12381FieldElement::from_hex_unchecked("013a59858b6809fca4d9a3b6539246a70051a3c88899964a42bc9a69cf9acdd9dd387cfa9086b894185b9a46a402be73");
-        let y_1 = BLS12381FieldElement::from_hex_unchecked("02d27e0ec3356299a346a09ad7dc4ef68a483c3aed53f9139d2f929a3eecebf72082e5e58c6da24ee32e03040c406d4f");
+        let y_0 = BLS12381FieldElement::from_hex_unchecked(
+            "013a59858b6809fca4d9a3b6539246a70051a3c88899964a42bc9a69cf9acdd9dd387cfa9086b894185b9a46a402be73",
+        );
+        let y_1 = BLS12381FieldElement::from_hex_unchecked(
+            "02d27e0ec3356299a346a09ad7dc4ef68a483c3aed53f9139d2f929a3eecebf72082e5e58c6da24ee32e03040c406d4f",
+        );
 
         let x: FieldElement<Degree2ExtensionField> = FieldElement::new([x_0, x_1]);
         let y: FieldElement<Degree2ExtensionField> = FieldElement::new([y_0, y_1]);

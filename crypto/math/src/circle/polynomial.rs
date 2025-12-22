@@ -3,7 +3,7 @@ extern crate alloc;
 use super::{
     cfft::{cfft, icfft, order_cfft_result_naive, order_icfft_input_naive},
     cosets::Coset,
-    twiddles::{get_twiddles, TwiddlesConfig},
+    twiddles::{TwiddlesConfig, get_twiddles},
 };
 use crate::{
     fft::cpu::bit_reversing::in_place_bit_reverse_permute,

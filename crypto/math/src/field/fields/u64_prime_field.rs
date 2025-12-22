@@ -348,8 +348,8 @@ mod tests {
     }
 
     #[test]
-    fn field_element_as_group_element_multiplication_by_scalar_works_as_multiplication_in_finite_fields(
-    ) {
+    fn field_element_as_group_element_multiplication_by_scalar_works_as_multiplication_in_finite_fields()
+     {
         let a = FE::new(3);
         let b = FE::new(12);
         assert_eq!(a * b, a.operate_with_self(12_u16));

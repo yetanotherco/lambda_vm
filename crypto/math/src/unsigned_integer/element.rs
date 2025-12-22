@@ -1081,7 +1081,7 @@ impl<const NUM_LIMBS: usize> Arbitrary for UnsignedInteger<NUM_LIMBS> {
 #[cfg(test)]
 mod tests_u384 {
     use crate::traits::ByteConversion;
-    use crate::unsigned_integer::element::{UnsignedInteger, U256, U384};
+    use crate::unsigned_integer::element::{U256, U384, UnsignedInteger};
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
     #[cfg(feature = "proptest")]
@@ -1312,7 +1312,9 @@ mod tests_u384 {
 
     #[test]
     fn construct_new_integer_from_hex_8() {
-        let a = U384::from_hex_unchecked("140f5177b90b4f96b61bb8ccb4f298ad2b20aaa5cf482b239e2897a787faf4660cc95597854beb235f6144d9e91f4b14");
+        let a = U384::from_hex_unchecked(
+            "140f5177b90b4f96b61bb8ccb4f298ad2b20aaa5cf482b239e2897a787faf4660cc95597854beb235f6144d9e91f4b14",
+        );
         assert_eq!(
             a.limbs,
             [
@@ -1491,7 +1493,9 @@ mod tests_u384 {
 
     #[test]
     fn equality_works_8() {
-        let a = U384::from_hex_unchecked("140f5177b90b4f96b61bb8ccb4f298ad2b20aaa5cf482b239e2897a787faf4660cc95597854beb235f6144d9e91f4b14");
+        let a = U384::from_hex_unchecked(
+            "140f5177b90b4f96b61bb8ccb4f298ad2b20aaa5cf482b239e2897a787faf4660cc95597854beb235f6144d9e91f4b14",
+        );
         let b = U384 {
             limbs: [
                 1445463580056702870,
@@ -1528,7 +1532,9 @@ mod tests_u384 {
 
     #[test]
     fn const_ne_works_2() {
-        let a = U384::from_hex_unchecked("140f5177b90b4f96b61bb8ccb4f298ad2b20aaa5cf482b239e2897a787faf4660cc95597854beb235f6144d9e91f4b14");
+        let a = U384::from_hex_unchecked(
+            "140f5177b90b4f96b61bb8ccb4f298ad2b20aaa5cf482b239e2897a787faf4660cc95597854beb235f6144d9e91f4b14",
+        );
         let b = U384 {
             limbs: [
                 1445463580056702870,
@@ -1616,25 +1622,43 @@ mod tests_u384 {
 
     #[test]
     fn add_two_384_bit_integers_8() {
-        let a = U384::from_hex_unchecked("07df9c74fa9d5aafa74a87dbbf93215659d8a3e1706d4b06de9512284802580eb36ae12ea59f90db5b1799d0970a42e");
-        let b = U384::from_hex_unchecked("d515e54973f0643a6a9957579c1f84020a6a91d5d5f27b75401c7538d2c9ea9cafff44a2c606877d46c49a3433cc85e");
-        let c = U384::from_hex_unchecked("dcf581be6e8dbeea11e3df335bb2a558644335b7465fc67c1eb187611acc42ab636a25d16ba61858a1dc3404cad6c8c");
+        let a = U384::from_hex_unchecked(
+            "07df9c74fa9d5aafa74a87dbbf93215659d8a3e1706d4b06de9512284802580eb36ae12ea59f90db5b1799d0970a42e",
+        );
+        let b = U384::from_hex_unchecked(
+            "d515e54973f0643a6a9957579c1f84020a6a91d5d5f27b75401c7538d2c9ea9cafff44a2c606877d46c49a3433cc85e",
+        );
+        let c = U384::from_hex_unchecked(
+            "dcf581be6e8dbeea11e3df335bb2a558644335b7465fc67c1eb187611acc42ab636a25d16ba61858a1dc3404cad6c8c",
+        );
         assert_eq!(a + b, c);
     }
 
     #[test]
     fn add_two_384_bit_integers_9() {
-        let a = U384::from_hex_unchecked("92977527a0f8ba00d18c1b2f1900d965d4a70e5f5f54468ffb2d4d41519385f24b078a0e7d0281d5ad0c36724dc4233");
-        let b = U384::from_hex_unchecked("46facf9953a9494822bf18836ffd7e55c48b30aa81e17fa1ace0b473015307e4622b8bd6fa68ef654796a183abde842");
-        let c = U384::from_hex_unchecked("d99244c0f4a20348f44b33b288fe57bb99323f09e135c631a80e01b452e68dd6ad3315e5776b713af4a2d7f5f9a2a75");
+        let a = U384::from_hex_unchecked(
+            "92977527a0f8ba00d18c1b2f1900d965d4a70e5f5f54468ffb2d4d41519385f24b078a0e7d0281d5ad0c36724dc4233",
+        );
+        let b = U384::from_hex_unchecked(
+            "46facf9953a9494822bf18836ffd7e55c48b30aa81e17fa1ace0b473015307e4622b8bd6fa68ef654796a183abde842",
+        );
+        let c = U384::from_hex_unchecked(
+            "d99244c0f4a20348f44b33b288fe57bb99323f09e135c631a80e01b452e68dd6ad3315e5776b713af4a2d7f5f9a2a75",
+        );
         assert_eq!(a + b, c);
     }
 
     #[test]
     fn add_two_384_bit_integers_10() {
-        let a = U384::from_hex_unchecked("07df9c74fa9d5aafa74a87dbbf93215659d8a3e1706d4b06de9512284802580eb36ae12ea59f90db5b1799d0970a42e");
-        let b = U384::from_hex_unchecked("d515e54973f0643a6a9957579c1f84020a6a91d5d5f27b75401c7538d2c9ea9cafff44a2c606877d46c49a3433cc85e");
-        let c_expected = U384::from_hex_unchecked("dcf581be6e8dbeea11e3df335bb2a558644335b7465fc67c1eb187611acc42ab636a25d16ba61858a1dc3404cad6c8c");
+        let a = U384::from_hex_unchecked(
+            "07df9c74fa9d5aafa74a87dbbf93215659d8a3e1706d4b06de9512284802580eb36ae12ea59f90db5b1799d0970a42e",
+        );
+        let b = U384::from_hex_unchecked(
+            "d515e54973f0643a6a9957579c1f84020a6a91d5d5f27b75401c7538d2c9ea9cafff44a2c606877d46c49a3433cc85e",
+        );
+        let c_expected = U384::from_hex_unchecked(
+            "dcf581be6e8dbeea11e3df335bb2a558644335b7465fc67c1eb187611acc42ab636a25d16ba61858a1dc3404cad6c8c",
+        );
         let (c, overflow) = U384::add(&a, &b);
         assert_eq!(c, c_expected);
         assert!(!overflow);
@@ -1642,9 +1666,15 @@ mod tests_u384 {
 
     #[test]
     fn add_two_384_bit_integers_11() {
-        let a = U384::from_hex_unchecked("92977527a0f8ba00d18c1b2f1900d965d4a70e5f5f54468ffb2d4d41519385f24b078a0e7d0281d5ad0c36724dc4233");
-        let b = U384::from_hex_unchecked("46facf9953a9494822bf18836ffd7e55c48b30aa81e17fa1ace0b473015307e4622b8bd6fa68ef654796a183abde842");
-        let c_expected = U384::from_hex_unchecked("d99244c0f4a20348f44b33b288fe57bb99323f09e135c631a80e01b452e68dd6ad3315e5776b713af4a2d7f5f9a2a75");
+        let a = U384::from_hex_unchecked(
+            "92977527a0f8ba00d18c1b2f1900d965d4a70e5f5f54468ffb2d4d41519385f24b078a0e7d0281d5ad0c36724dc4233",
+        );
+        let b = U384::from_hex_unchecked(
+            "46facf9953a9494822bf18836ffd7e55c48b30aa81e17fa1ace0b473015307e4622b8bd6fa68ef654796a183abde842",
+        );
+        let c_expected = U384::from_hex_unchecked(
+            "d99244c0f4a20348f44b33b288fe57bb99323f09e135c631a80e01b452e68dd6ad3315e5776b713af4a2d7f5f9a2a75",
+        );
         let (c, overflow) = U384::add(&a, &b);
         assert_eq!(c, c_expected);
         assert!(!overflow);
@@ -1652,9 +1682,15 @@ mod tests_u384 {
 
     #[test]
     fn add_two_384_bit_integers_12_with_overflow() {
-        let a = U384::from_hex_unchecked("b07bc844363dd56467d9ebdd5929e9bb34a8e2577db77df6cf8f2ac45bd3d0bc2fc3078d265fe761af51d6aec5b59428");
-        let b = U384::from_hex_unchecked("cbbc474761bb7995ff54e25fa5d30295604fe3545d0cde405e72d8c0acebb119e9158131679b6c34483a3dafb49deeea");
-        let c_expected = U384::from_hex_unchecked("7c380f8b97f94efa672ece3cfefcec5094f8c5abdac45c372e02038508bf81d618d888be8dfb5395f78c145e7a538312");
+        let a = U384::from_hex_unchecked(
+            "b07bc844363dd56467d9ebdd5929e9bb34a8e2577db77df6cf8f2ac45bd3d0bc2fc3078d265fe761af51d6aec5b59428",
+        );
+        let b = U384::from_hex_unchecked(
+            "cbbc474761bb7995ff54e25fa5d30295604fe3545d0cde405e72d8c0acebb119e9158131679b6c34483a3dafb49deeea",
+        );
+        let c_expected = U384::from_hex_unchecked(
+            "7c380f8b97f94efa672ece3cfefcec5094f8c5abdac45c372e02038508bf81d618d888be8dfb5395f78c145e7a538312",
+        );
         let (c, overflow) = U384::add(&a, &b);
         assert_eq!(c, c_expected);
         assert!(overflow);
@@ -1662,7 +1698,9 @@ mod tests_u384 {
 
     #[test]
     fn double_384_bit_integer_12_with_overflow() {
-        let a = U384::from_hex_unchecked("b07bc844363dd56467d9ebdd5929e9bb34a8e2577db77df6cf8f2ac45bd3d0bc2fc3078d265fe761af51d6aec5b59428");
+        let a = U384::from_hex_unchecked(
+            "b07bc844363dd56467d9ebdd5929e9bb34a8e2577db77df6cf8f2ac45bd3d0bc2fc3078d265fe761af51d6aec5b59428",
+        );
         assert_eq!(U384::double(&a), U384::add(&a, &a));
     }
 
@@ -1730,17 +1768,29 @@ mod tests_u384 {
 
     #[test]
     fn sub_two_384_bit_integers_8() {
-        let a = U384::from_hex_unchecked("07df9c74fa9d5aafa74a87dbbf93215659d8a3e1706d4b06de9512284802580eb36ae12ea59f90db5b1799d0970a42e");
-        let b = U384::from_hex_unchecked("d515e54973f0643a6a9957579c1f84020a6a91d5d5f27b75401c7538d2c9ea9cafff44a2c606877d46c49a3433cc85e");
-        let c = U384::from_hex_unchecked("dcf581be6e8dbeea11e3df335bb2a558644335b7465fc67c1eb187611acc42ab636a25d16ba61858a1dc3404cad6c8c");
+        let a = U384::from_hex_unchecked(
+            "07df9c74fa9d5aafa74a87dbbf93215659d8a3e1706d4b06de9512284802580eb36ae12ea59f90db5b1799d0970a42e",
+        );
+        let b = U384::from_hex_unchecked(
+            "d515e54973f0643a6a9957579c1f84020a6a91d5d5f27b75401c7538d2c9ea9cafff44a2c606877d46c49a3433cc85e",
+        );
+        let c = U384::from_hex_unchecked(
+            "dcf581be6e8dbeea11e3df335bb2a558644335b7465fc67c1eb187611acc42ab636a25d16ba61858a1dc3404cad6c8c",
+        );
         assert_eq!(c - a, b);
     }
 
     #[test]
     fn sub_two_384_bit_integers_9() {
-        let a = U384::from_hex_unchecked("92977527a0f8ba00d18c1b2f1900d965d4a70e5f5f54468ffb2d4d41519385f24b078a0e7d0281d5ad0c36724dc4233");
-        let b = U384::from_hex_unchecked("46facf9953a9494822bf18836ffd7e55c48b30aa81e17fa1ace0b473015307e4622b8bd6fa68ef654796a183abde842");
-        let c = U384::from_hex_unchecked("d99244c0f4a20348f44b33b288fe57bb99323f09e135c631a80e01b452e68dd6ad3315e5776b713af4a2d7f5f9a2a75");
+        let a = U384::from_hex_unchecked(
+            "92977527a0f8ba00d18c1b2f1900d965d4a70e5f5f54468ffb2d4d41519385f24b078a0e7d0281d5ad0c36724dc4233",
+        );
+        let b = U384::from_hex_unchecked(
+            "46facf9953a9494822bf18836ffd7e55c48b30aa81e17fa1ace0b473015307e4622b8bd6fa68ef654796a183abde842",
+        );
+        let c = U384::from_hex_unchecked(
+            "d99244c0f4a20348f44b33b288fe57bb99323f09e135c631a80e01b452e68dd6ad3315e5776b713af4a2d7f5f9a2a75",
+        );
         assert_eq!(c - a, b);
     }
 
@@ -1757,7 +1807,9 @@ mod tests_u384 {
     #[test]
     fn sub_two_384_bit_integers_11_with_overflow() {
         let a = U384::from_u64(334);
-        let b_expected = U384::from_hex_unchecked("fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffd66");
+        let b_expected = U384::from_hex_unchecked(
+            "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffd66",
+        );
         let c = U384::from_u64(1000);
         let (b, underflow) = U384::sub(&a, &c);
         assert!(underflow);
@@ -1774,8 +1826,12 @@ mod tests_u384 {
         assert!(U384::from_u64(2) > U384::from_u64(1));
         assert!(U384::from_u64(1) <= U384::from_u64(2));
 
-        let a = U384::from_hex_unchecked("92977527a0f8ba00d18c1b2f1900d965d4a70e5f5f54468ffb2d4d41519385f24b078a0e7d0281d5ad0c36724dc4233");
-        let c = U384::from_hex_unchecked("d99244c0f4a20348f44b33b288fe57bb99323f09e135c631a80e01b452e68dd6ad3315e5776b713af4a2d7f5f9a2a75");
+        let a = U384::from_hex_unchecked(
+            "92977527a0f8ba00d18c1b2f1900d965d4a70e5f5f54468ffb2d4d41519385f24b078a0e7d0281d5ad0c36724dc4233",
+        );
+        let c = U384::from_hex_unchecked(
+            "d99244c0f4a20348f44b33b288fe57bb99323f09e135c631a80e01b452e68dd6ad3315e5776b713af4a2d7f5f9a2a75",
+        );
 
         assert!(&a <= &a);
         assert!(&a >= &a);
@@ -1832,7 +1888,9 @@ mod tests_u384 {
 
     #[test]
     fn mul_two_384_bit_integers_works_5() {
-        let a = U384::from_hex_unchecked("7ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff8");
+        let a = U384::from_hex_unchecked(
+            "7ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff8",
+        );
         let b = U384::from_hex_unchecked("2");
         let c_expected = U384::from_hex_unchecked(
             "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0",
@@ -1843,7 +1901,9 @@ mod tests_u384 {
     #[test]
     #[should_panic]
     fn mul_two_384_bit_integers_works_6() {
-        let a = U384::from_hex_unchecked("800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
+        let a = U384::from_hex_unchecked(
+            "800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        );
         let b = U384::from_hex_unchecked("2");
         let _c = a * b;
     }
@@ -1863,12 +1923,18 @@ mod tests_u384 {
 
     #[test]
     fn mul_two_384_bit_integers_works_8_hi_lo() {
-        let a = U384::from_hex_unchecked("5e2d939b602a50911232731d04fe6f40c05f97da0602307099fb991f9b414e2d52bef130349ec18db1a0215ea6caf76");
-        let b = U384::from_hex_unchecked("3f3ad1611ab58212f92a2484e9560935b9ac4615fe61cfed1a4861e193a74d20c94f9f88d8b2cc089543c3f699969d9");
+        let a = U384::from_hex_unchecked(
+            "5e2d939b602a50911232731d04fe6f40c05f97da0602307099fb991f9b414e2d52bef130349ec18db1a0215ea6caf76",
+        );
+        let b = U384::from_hex_unchecked(
+            "3f3ad1611ab58212f92a2484e9560935b9ac4615fe61cfed1a4861e193a74d20c94f9f88d8b2cc089543c3f699969d9",
+        );
         let hi_expected = U384::from_hex_unchecked(
             "1742daad9c7861dd3499e7ece65467e337937b27e20d641b225bfe00323d33ed62715654eadc092b057a5f19f2ad6c",
         );
-        let lo_expected = U384::from_hex_unchecked("9969c0417b9304d9c16b046c860447d3533999e16710d2e90a44959a168816c015ffb44b987e8cbb82bd46b08d9e2106");
+        let lo_expected = U384::from_hex_unchecked(
+            "9969c0417b9304d9c16b046c860447d3533999e16710d2e90a44959a168816c015ffb44b987e8cbb82bd46b08d9e2106",
+        );
         let (hi, lo) = U384::mul(&a, &b);
         assert_eq!(hi, hi_expected);
         assert_eq!(lo, lo_expected);
@@ -1876,7 +1942,9 @@ mod tests_u384 {
 
     #[test]
     fn mul_two_384_bit_integers_works_9_hi_lo() {
-        let a = U384::from_hex_unchecked("800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
+        let a = U384::from_hex_unchecked(
+            "800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        );
         let b = U384::from_hex_unchecked("2");
         let hi_expected = U384::from_hex_unchecked("1");
         let lo_expected = U384::from_hex_unchecked("0");
@@ -1918,7 +1986,9 @@ mod tests_u384 {
         let a = U384::from_hex_unchecked(
             "03303f4d6c2d1caf0c24a6b0239b679a8390aa99bead76bc0093b1bc1a8101f5ce",
         );
-        let b = U384::from_hex_unchecked("6607e9ad85a395e18494d604736cf35072155337d5aed7801276378350203eb9c0000000000000000000000000000000");
+        let b = U384::from_hex_unchecked(
+            "6607e9ad85a395e18494d604736cf35072155337d5aed7801276378350203eb9c0000000000000000000000000000000",
+        );
         assert_eq!(&a << 125, b);
     }
 
@@ -1966,13 +2036,17 @@ mod tests_u384 {
         let a = U384::from_hex_unchecked(
             "03303f4d6c2d1caf0c24a6b0239b679a8390aa99bead76bc0093b1bc1a8101f5ce",
         );
-        let b = U384::from_hex_unchecked("6607e9ad85a395e18494d604736cf35072155337d5aed7801276378350203eb9c0000000000000000000000000000000");
+        let b = U384::from_hex_unchecked(
+            "6607e9ad85a395e18494d604736cf35072155337d5aed7801276378350203eb9c0000000000000000000000000000000",
+        );
         assert_eq!(&b >> 125, a);
     }
 
     #[test]
     fn shift_right_on_384_bit_integer_works_5() {
-        let a = U384::from_hex_unchecked("ba6ab46f9a9a2f20e4061b67ce4d8c3da98091cf990d7b14ef47ffe27370abbdeb6a3ce9f9cbf5df1b2430114c8558eb");
+        let a = U384::from_hex_unchecked(
+            "ba6ab46f9a9a2f20e4061b67ce4d8c3da98091cf990d7b14ef47ffe27370abbdeb6a3ce9f9cbf5df1b2430114c8558eb",
+        );
         let b =
             U384::from_hex_unchecked("174d568df35345e41c80c36cf9c9b187b5301239f321af629de8fffc4e6");
         assert_eq!(a >> 151, b);
@@ -1989,14 +2063,18 @@ mod tests_u384 {
 
     #[test]
     fn shift_right_on_384_bit_integer_works_7() {
-        let a = U384::from_hex_unchecked("6a9ce35d8940a5ebd29604ce9a182ade76f03f7e9965760b84a8cfd1d3dd2e612669fe000e58b2af688fd90");
+        let a = U384::from_hex_unchecked(
+            "6a9ce35d8940a5ebd29604ce9a182ade76f03f7e9965760b84a8cfd1d3dd2e612669fe000e58b2af688fd90",
+        );
         let b = U384::from_hex_unchecked("6a9ce35d8940a5ebd29604ce9a182ade76f03f7");
         assert_eq!(&a >> (64 * 3), b);
     }
 
     #[test]
     fn shift_right_on_384_bit_integer_works_8() {
-        let a = U384::from_hex_unchecked("5322c128ec84081b6c376c108ebd7fd36bbd44f71ee5e6ad6bcb3dd1c5265bd7db75c90b2665a0826d17600f0e9");
+        let a = U384::from_hex_unchecked(
+            "5322c128ec84081b6c376c108ebd7fd36bbd44f71ee5e6ad6bcb3dd1c5265bd7db75c90b2665a0826d17600f0e9",
+        );
         let b =
             U384::from_hex_unchecked("5322c128ec84081b6c376c108ebd7fd36bbd44f71ee5e6ad6bcb3dd1c52");
         assert_eq!(&a >> (64 * 2), b);
@@ -2086,10 +2164,22 @@ mod tests_u384 {
 
     #[test]
     fn test_square_0() {
-        let a = U384::from_hex_unchecked("362e35606447fb568704026c25da7a304bc7bd0aea36a61d77d4151395078cfa332b9d4928a60721eece725bbc81e158");
+        let a = U384::from_hex_unchecked(
+            "362e35606447fb568704026c25da7a304bc7bd0aea36a61d77d4151395078cfa332b9d4928a60721eece725bbc81e158",
+        );
         let (hi, lo) = U384::square(&a);
-        assert_eq!(lo, U384::from_hex_unchecked("11724caeb10c4bce5319097d74aed2246e2942b56b7365b5b2f8ceb3bb847db4828862043299d798577996e210bce40"));
-        assert_eq!(hi, U384::from_hex_unchecked("b7786dbe41375b7ff64dbdc65152ef7d3fdbf499485e26486201cdbfb71b5673c77eb355a1274d08cbfbc1a4cdfdfad"));
+        assert_eq!(
+            lo,
+            U384::from_hex_unchecked(
+                "11724caeb10c4bce5319097d74aed2246e2942b56b7365b5b2f8ceb3bb847db4828862043299d798577996e210bce40"
+            )
+        );
+        assert_eq!(
+            hi,
+            U384::from_hex_unchecked(
+                "b7786dbe41375b7ff64dbdc65152ef7d3fdbf499485e26486201cdbfb71b5673c77eb355a1274d08cbfbc1a4cdfdfad"
+            )
+        );
     }
 
     #[test]
@@ -2120,7 +2210,12 @@ mod tests_u384 {
     fn test_square_3() {
         let a = U384::from_limbs([0, 0, 0, u64::MAX, 0, 0]);
         let (hi, lo) = U384::square(&a);
-        assert_eq!(lo, U384::from_hex_unchecked("fffffffffffffffe00000000000000010000000000000000000000000000000000000000000000000000000000000000"));
+        assert_eq!(
+            lo,
+            U384::from_hex_unchecked(
+                "fffffffffffffffe00000000000000010000000000000000000000000000000000000000000000000000000000000000"
+            )
+        );
         assert_eq!(hi, U384::from_hex_unchecked("0"));
     }
 
@@ -2139,7 +2234,12 @@ mod tests_u384 {
     fn test_square_5() {
         let a = U384::from_limbs([0, 0, u64::MAX, u64::MAX, u64::MAX, u64::MAX]);
         let (hi, lo) = U384::square(&a);
-        assert_eq!(lo, U384::from_hex_unchecked("fffffffffffffffffffffffffffffffe0000000000000000000000000000000000000000000000000000000000000001"));
+        assert_eq!(
+            lo,
+            U384::from_hex_unchecked(
+                "fffffffffffffffffffffffffffffffe0000000000000000000000000000000000000000000000000000000000000001"
+            )
+        );
         assert_eq!(
             hi,
             U384::from_hex_unchecked("ffffffffffffffffffffffffffffffff")
@@ -2150,7 +2250,12 @@ mod tests_u384 {
     fn test_square_6() {
         let a = U384::from_limbs([0, u64::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX]);
         let (hi, lo) = U384::square(&a);
-        assert_eq!(lo, U384::from_hex_unchecked("fffffffffffffffe00000000000000000000000000000000000000000000000000000000000000000000000000000001"));
+        assert_eq!(
+            lo,
+            U384::from_hex_unchecked(
+                "fffffffffffffffe00000000000000000000000000000000000000000000000000000000000000000000000000000001"
+            )
+        );
         assert_eq!(
             hi,
             U384::from_hex_unchecked(
@@ -2164,14 +2269,19 @@ mod tests_u384 {
         let a = U384::from_limbs([u64::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX]);
         let (hi, lo) = U384::square(&a);
         assert_eq!(lo, U384::from_hex_unchecked("1"));
-        assert_eq!(hi, U384::from_hex_unchecked("fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe"));
+        assert_eq!(
+            hi,
+            U384::from_hex_unchecked(
+                "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe"
+            )
+        );
     }
 }
 
 #[cfg(test)]
 mod tests_u256 {
     use crate::unsigned_integer::element::ByteConversion;
-    use crate::unsigned_integer::element::{UnsignedInteger, U256};
+    use crate::unsigned_integer::element::{U256, UnsignedInteger};
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
     #[cfg(feature = "proptest")]

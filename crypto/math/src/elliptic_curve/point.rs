@@ -141,8 +141,8 @@ impl<E: IsEllipticCurve> Eq for JacobianPoint<E> {}
 mod tests {
     use crate::cyclic_group::IsGroup;
     use crate::elliptic_curve::short_weierstrass::curves::test_curve_1::{
-        TestCurve1, TestCurvePrimeField, TestCurveQuadraticNonResidue,
-        TEST_CURVE_1_MAIN_SUBGROUP_ORDER,
+        TEST_CURVE_1_MAIN_SUBGROUP_ORDER, TestCurve1, TestCurvePrimeField,
+        TestCurveQuadraticNonResidue,
     };
     use crate::elliptic_curve::short_weierstrass::curves::test_curve_2::TestCurve2;
     use crate::field::element::FieldElement;

@@ -156,20 +156,12 @@ where
 
     #[inline(always)]
     fn sub(a: &Self::BaseType, b: &Self::BaseType) -> Self::BaseType {
-        if b <= a {
-            a - b
-        } else {
-            M::MODULUS - (b - a)
-        }
+        if b <= a { a - b } else { M::MODULUS - (b - a) }
     }
 
     #[inline(always)]
     fn neg(a: &Self::BaseType) -> Self::BaseType {
-        if a == &Self::ZERO {
-            *a
-        } else {
-            M::MODULUS - a
-        }
+        if a == &Self::ZERO { *a } else { M::MODULUS - a }
     }
 
     #[inline(always)]
@@ -239,11 +231,7 @@ where
                 }
             }
 
-            if u == one {
-                Ok(b)
-            } else {
-                Ok(c)
-            }
+            if u == one { Ok(b) } else { Ok(c) }
         }
     }
 
@@ -445,10 +433,10 @@ mod tests_u384_prime_fields {
     #[cfg(feature = "alloc")]
     use crate::traits::ByteConversion;
     use crate::unsigned_integer::element::U384;
-    use crate::unsigned_integer::element::{UnsignedInteger, U256};
+    use crate::unsigned_integer::element::{U256, UnsignedInteger};
 
     use rand::Rng;
-    use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
+    use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng};
 
     #[derive(Clone, Debug)]
     struct U384Modulus23;
@@ -886,9 +874,9 @@ mod tests_u256_prime_fields {
     #[cfg(feature = "alloc")]
     use crate::traits::ByteConversion;
     use crate::unsigned_integer::element::U256;
-    use crate::unsigned_integer::element::{UnsignedInteger, U64};
+    use crate::unsigned_integer::element::{U64, UnsignedInteger};
     use rand::Rng;
-    use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
+    use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng};
 
     use super::U64PrimeField;
 

@@ -107,20 +107,12 @@ impl<const MODULUS: u32> IsField for U32MontgomeryBackendPrimeField<MODULUS> {
 
     #[inline(always)]
     fn sub(a: &Self::BaseType, b: &Self::BaseType) -> Self::BaseType {
-        if b <= a {
-            a - b
-        } else {
-            MODULUS - (b - a)
-        }
+        if b <= a { a - b } else { MODULUS - (b - a) }
     }
 
     #[inline(always)]
     fn neg(a: &Self::BaseType) -> Self::BaseType {
-        if a == &Self::ZERO {
-            *a
-        } else {
-            MODULUS - a
-        }
+        if a == &Self::ZERO { *a } else { MODULUS - a }
     }
 
     /// Computes multiplicative inverse using Fermat's Little Theorem

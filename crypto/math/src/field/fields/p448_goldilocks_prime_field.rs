@@ -9,8 +9,9 @@ pub struct P448GoldilocksPrimeField;
 pub type U448 = UnsignedInteger<7>;
 
 /// Goldilocks Prime p = 2^448 - 2^224 - 1
-pub const P448_GOLDILOCKS_PRIME_FIELD_ORDER: U448 =
-    U448::from_hex_unchecked("fffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+pub const P448_GOLDILOCKS_PRIME_FIELD_ORDER: U448 = U448::from_hex_unchecked(
+    "fffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+);
 
 /// 448-bit unsigned integer represented as
 /// a size 8 `u64` array `limbs` of 56-bit words.

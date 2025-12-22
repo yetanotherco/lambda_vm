@@ -4,7 +4,7 @@ use crate::{
         fields::montgomery_backed_prime_fields::{IsModulus, MontgomeryBackendPrimeField},
         traits::IsFFTField,
     },
-    unsigned_integer::element::{UnsignedInteger, U64},
+    unsigned_integer::element::{U64, UnsignedInteger},
 };
 
 pub type U64MontgomeryBackendPrimeField<T> = MontgomeryBackendPrimeField<T, 1>;
