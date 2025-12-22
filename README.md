@@ -168,7 +168,7 @@ The first version is going to use the primitives contained in [lambdaworks](http
 | Bitwise operations (and, xor, or) | Implement tables for u8 bitwise operations | Planned | 1 week | v1 |
 | Shift operations | Implement tables for shift operations | Planned | 1 week | v1 |
 | Multiplication table | Implement table for multiplication table | Planned | 1 week | v1 |
-| Division and remainder | Implement table for integer division operations | 1 week | v1 |
+| Division and remainder | Implement table for integer division operations | Planned | 1 week | v1 |
 | Memory                      | Implement memory table with constraints | Planned | 2 weeks | v1 |
 | Syscalls                    | Tables for coprocessors | Planned | | v2|
 | Big Integer arithmetic | Table for big integer arithmetic | Planned | 1 week |v2|
