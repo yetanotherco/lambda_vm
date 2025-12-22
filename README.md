@@ -137,7 +137,7 @@ The first version is going to use the primitives contained in [lambdaworks](http
 | Integer arithmetic - immediate | Operations (`addi`, `subi`, `slli`, `slti`, `sltui`, `xori`, `srli`, `srai`, `ori`, `andi`) | ✔️  | 1 week | v1 |
 | 32-bit word operations | RV64 32-bit operations (`addw`, `subw`, `sllw`, `srlw`, `sraw`, `addiw`, `slliw`, `srliw`, `sraiw`) | Planned | 1 week | v1 |
 | Input/Output | Pass input and output | Planned | 1 week | v1 |
-| RISCV64IM CPU               | Working executor for RV64 virtual machine with 65 RISCV instructions | Planned | | v1 |
+| RISCV64IM CPU               | Working executor for RV64 virtual machine with 65 RISCV instructions | Planned |  | v1 |
 | Multiplication operations | Operations related to multiplication (`mul`, `mulh`, `mulhsu`, `mulhu`) | ✔️ | 1 week | v1 |
 | Division operations | Operations related to division (`div`, `divu`, `rem`, `remu`) | ✔️ | 1 week | v1 |
 | CPU with coprocessors       | Add coprocessors for special cryptographic operations   | Planned | 10 weeks | v2 |
@@ -146,7 +146,7 @@ The first version is going to use the primitives contained in [lambdaworks](http
 | Elliptic curve addition | EC operations syscall | Planned | 2 weeks  | v2 |
 | Poseidon hash | Poseidon hash syscall | Planned | 3 weeks | v2 |
 | Keccak hash | Keccak hash syscall | Planned | 3 weeks | v2 |
-| SHA256 | SHA 256 syscall | Planned 2 weeks | v2 |
+| SHA256 | SHA 256 syscall | Planned | 2 weeks | v2 |
 | Pairing | Table for pairings | Planned? | ? | v2 |
 
 *few operations remain to be implemented
@@ -176,7 +176,7 @@ The first version is going to use the primitives contained in [lambdaworks](http
 | Poseidon hash | Table for Poseidon hash | Planned | 3 weeks | v2 |
 | Keccak hash | Table for Keccak hash | Planned | 3 weeks | v2 |
 | SHA256 | Table for SHA256 | Planned | 3 weeks | v2 |
-| Pairing | Table for pairings | Planned? | | v2 |
+| Pairing | Table for pairings | Planned? |  | v2 |
 
 ## Proof system
 
@@ -188,12 +188,12 @@ The first version is going to use the primitives contained in [lambdaworks](http
 | Lookup arguments            | Linking tables via lookup arguments | In progress | 2 weeks | v0 |
 | Lookup - I | Accept multitables | In progress | 1 week | v0 |
 | Lookup - II | Perform argument with constraints | In progress | 1 week | v0 |
-| Public input | Add public input using Lookup | 1 week | v1 |
+| Public input | Add public input using Lookup | Planned | 1 week | v1 |
 | Multi-table Merkle trees (MTMT)   | Merkle tree that can be used to commit to polynomials of various sizes | In progress | 2 weeks | v1 |
 | Multi-FRI                   | Perform FRI using MTMT | Planned | 2 weeks | v1 |
 | Adjust parameters           | Adjust parameters for 128 bits of security | Planned | 1 week | v1 |
 | Recursion | Allow for n-1 recursion tree to compress proof size | Planned | 4 weeks | v2 |
-| More efficient lookups | Implement better lookup arguments | 4 weeks | v2 |
+| More efficient lookups | Implement better lookup arguments | Planned | 4 weeks | v2 |
 
 ## Verifier
 
