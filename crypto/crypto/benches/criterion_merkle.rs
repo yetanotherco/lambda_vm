@@ -1,7 +1,7 @@
 use core::time::Duration;
 use criterion::{Criterion, criterion_group, criterion_main};
 use crypto::merkle_tree::{backends::field_element::FieldElementBackend, merkle::MerkleTree};
-use lambdaworks_math::{
+use math::{
     field::element::FieldElement,
     field::fields::fft_friendly::stark_252_prime_field::Stark252PrimeField,
 };
