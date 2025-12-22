@@ -80,7 +80,7 @@ mod tests {
     use crate::cyclic_group::IsGroup;
     use crate::elliptic_curve::short_weierstrass::traits::IsShortWeierstrass;
     use crate::elliptic_curve::traits::IsEllipticCurve;
-    use rand::{rngs::StdRng, Rng, SeedableRng};
+    use rand::{Rng, SeedableRng, rngs::StdRng};
 
     #[test]
     /// We took the q1 point of the test two_pairs_of_points_match_1 from pairing.rs
@@ -188,8 +188,8 @@ mod tests {
     #[test]
     fn test_sqrt_qfe_random() {
         let mut rng = StdRng::seed_from_u64(42);
-        let a_val: u64 = rng.gen();
-        let b_val: u64 = rng.gen();
+        let a_val: u64 = rng.r#gen();
+        let b_val: u64 = rng.r#gen();
         let a = BN254TwistCurveFieldElement::new([
             BN254FieldElement::from(a_val),
             BN254FieldElement::from(b_val),

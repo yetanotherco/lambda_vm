@@ -324,18 +324,18 @@ mod tests {
     #[test]
     fn scalar_mul_depends_on_scalar_mod_r() {
         let r = FrConfig::MODULUS;
-        let gen = GrumpkinCurve::generator();
-        let gen_neg = gen.neg();
-        let g = gen.operate_with_self(r);
+        let r#gen = GrumpkinCurve::generator();
+        let gen_neg = r#gen.neg();
+        let g = r#gen.operate_with_self(r);
 
         let r_sub_one = r - U256::from(1u64);
-        let op3 = gen.operate_with_self(r_sub_one);
+        let op3 = r#gen.operate_with_self(r_sub_one);
 
         // random scalar value
         let s = U256::from(3u64);
         let blinded_scalar = (s * r) + s;
-        let op1 = gen.operate_with_self(s);
-        let op2 = gen.operate_with_self(blinded_scalar);
+        let op1 = r#gen.operate_with_self(s);
+        let op2 = r#gen.operate_with_self(blinded_scalar);
 
         assert_eq!(op1, op2);
         assert_eq!(g, G::neutral_element());
