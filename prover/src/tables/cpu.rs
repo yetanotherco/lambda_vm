@@ -326,8 +326,12 @@ pub fn cpu_trace_from_logs(
     logs: Vec<Log>,
 ) -> TraceTable<Babybear31PrimeField, Degree4BabyBearU32ExtensionField> {
     const NUM_COLUMNS: usize = 52;
+    const MIN_ROWS: usize = 4;
 
-    let main_data: Vec<FE> = logs
+    let num_logs = logs.len();
+    let target_rows = num_logs.max(MIN_ROWS).next_power_of_two();
+
+    let mut main_data: Vec<FE> = logs
         .into_iter()
         .enumerate()
         .flat_map(|(i, log)| {
@@ -335,6 +339,8 @@ pub fn cpu_trace_from_logs(
             CpuTableRow::from_log(log, timestamp).to_vec()
         })
         .collect();
+
+    main_data.resize(target_rows * NUM_COLUMNS, FE::zero());
 
     TraceTable::new_main(main_data, NUM_COLUMNS, 1)
 }

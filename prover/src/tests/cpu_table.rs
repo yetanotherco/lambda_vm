@@ -450,6 +450,36 @@ pub fn get_add_logs() -> Vec<Log> {
     ]
 }
 
+pub fn get_basic_rust_logs() -> Vec<Log> {
+    vec![
+        Log {
+            instruction: Instruction::ArithImm {
+                dst: 10,
+                src: 0,
+                imm: 0,
+                op: ArithOp::Add,
+            },
+            current_pc: 69844,
+            next_pc: 69848,
+            src1_val: 0,
+            src2_val: 0,
+            dst_val: 0,
+        },
+        Log {
+            instruction: Instruction::JumpAndLinkRegister {
+                base: 1,
+                dst: 0,
+                offset: 0,
+            },
+            current_pc: 69848,
+            next_pc: 0,
+            src1_val: 0,
+            src2_val: 0,
+            dst_val: 69852,
+        },
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,7 +516,7 @@ mod tests {
 
     #[test]
     fn test_cpu_table_from_add_logs() {
-        let logs = get_add_logs();
+        let logs = get_basic_rust_logs();
         let mut trace = cpu_trace_from_logs(logs);
 
         let proof_options = ProofOptions::default_test_options();
