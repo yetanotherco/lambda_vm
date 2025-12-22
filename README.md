@@ -44,10 +44,6 @@ Following [ethrex](https://github.com/lambdaclass/ethrex):
 - Have few abstractions. Do not generalize until you absolutely need it. Repeating code two or three times can be fine.
 - Prioritize code readability and maintainability over premature optimizations.
 
-## Roadmap
-
-This project is under active development. Our primary objective is to have a first working version for the virtual machine. The first roadmap for the project can be found [here](./docs/roadmap.md). Priorities and features might change as we continue developing.
-
 ## Documentation
 
 Full documentation can be found in [docs](./docs/). It is currently a work in progress, we expect that as more features and components become ready, they will be included in the docs.
@@ -77,7 +73,24 @@ You can run it with
 
 # Roadmap for the virtual machine
 
-This is a tentative list of features that are going to be implemented in the near future. Soon we will provide rough estimates on the time each task should take to implement. This may change according to the project's needs.
+This project is under active development. Our primary objective is to have a first working version for the virtual machine. The first roadmap for the project can be found [here](./docs/roadmap.md). Priorities and features might change as we continue developing.
+
+## Teams
+
+### Theory
+- Diego
+- Manuel
+- 3MILabs
+
+### Applied cryptography
+- Colo
+- Juan
+- Nicole
+
+### Engineering
+- Mauro
+- Federica
+- Gianluca
 
 ## Basic building blocks
 
