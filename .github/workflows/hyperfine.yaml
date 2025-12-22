@@ -48,7 +48,7 @@ jobs:
 
       - name: Export benchmark hashes
         id: export-hashes
-        run: echo "benchmark-hashes-${{ matrix.branch }}=${{ hashFiles( 'cairo_programs/benchmarks/*.cairo' ) }}" >> "$GITHUB_OUTPUT"
+        run: echo "benchmark-hashes-${{ matrix.branch }}=${{ hashFiles( 'executor/program_artifacts/bench/*.elf' ) }}" >> "$GITHUB_OUTPUT"
 
   build-binaries:
     strategy:
