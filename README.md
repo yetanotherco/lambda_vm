@@ -99,14 +99,14 @@ The first version is going to use the primitives contained in [lambdaworks](http
 | Feature                     | Description                        | Status       | Duration |
 |---------------------------- |------------------------------------|--------------| ---------|
 | Documentation               | Explain how everything works       | In progress  | 4 weeks |
-| Field                       | Basic field type                   | First version| 1 week |
+| Field                       | Basic field type                   | ✔️  | 1 week |
 | Poseidon hash               | Implement Poseidon-2 hash          | Planned      | 1 week |
 | Keccak                      | Implement Keccak hash function     | Planned      | 1 week |
-| CPU FFT                     | Radix-2 Fast-Fourier transform in CPU | First version | 1 week |
-| Basic Merkle commitment     | Merkle tree                        | First version | 1 week |
-| Basic FRI                   | FRI proximity test                 | First version | 1 week  |
-| Basic constraints           | Simple API for defining constraints for AIR | First version | 1 week |
-| Basic AIR                   | Algebraic intermediate representation for computations | First version | 1 week |       
+| CPU FFT                     | Radix-2 Fast-Fourier transform in CPU | ✔️ | 1 week |
+| Basic Merkle commitment     | Merkle tree                        | ✔️  | 1 week |
+| Basic FRI                   | FRI proximity test                 | ✔️  | 1 week  |
+| Basic constraints           | Simple API for defining constraints for AIR | ✔️  | 1 week |
+| Basic AIR                   | Algebraic intermediate representation for computations | ✔️  | 1 week |       
 
 ## Executor
 
@@ -114,16 +114,16 @@ The first version is going to use the primitives contained in [lambdaworks](http
 |---------------------------- |------------------------------------|--------------| ---------|
 | Documentation               | Explain how the executor works     | In progress  |  4 weeks |
 | Minimal CPU                 | Minimal CPU that can perform basic operations | In progress | 6 weeks |
-| Fibonacci operations I         | Operations needed to run Fibonacci part I (`addi`, `sw`, `beq`, `jal`, `jalr`) | In Progress | 1 week |
-| Fibonacci operations II         | Operations needed to run Fibonacci part II (`auipc`, `bltu`, `lui`, `sb`, `slli`) | In Progress | 1 week |
+| Fibonacci operations I         | Operations needed to run Fibonacci part I (`addi`, `sw`, `beq`, `jal`, `jalr`) | ✔️  | 1 week |
+| Fibonacci operations II         | Operations needed to run Fibonacci part II (`auipc`, `bltu`, `lui`, `sb`, `slli`) | ✔️  | 1 week |
 | Compute decoding table | Decoding table indexed by pc | 1 week |
-| Basic logging        | Basic logs for minimal opcodes | In progress | 2 weeks |
+| Basic logging        | Basic logs for minimal opcodes | ✔️  | 2 weeks |
 | RISCV64 CPU                 | Minimal version of the CPU with 52 RISCV instructions | Planned | 8 weeks |
-| Control flow opcodes | Implement remaining control flow operations (`bne`, `blt`, `bge`, `bgeu`) | Planned | 1 week |
-| Store operations | Remaining store operations (`sh`, `sw`, `sd`) | Planned | 1 week |
-| Load operations | Remaining load operations (`lb`, `lh`, `lw`, `ld`, `lbu`, `lhu`, `lwu`) | Planned | 1 week |
-| Integer arithmetic | Operations (`add`, `sub`, `sll`, `slt`, `sltu`, `xor`, `srl`, `sra`, `or`, `and`) | Planned | 1 week |
-| Integer arithmetic - immediate | Operations (`addi`, `subi`, `slli`, `slti`, `sltui`, `xori`, `srli`, `srai`, `ori`, `andi`) | Planned | 1 week |
+| Control flow opcodes | Implement remaining control flow operations (`bne`, `blt`, `bge`, `bgeu`) | ✔️ | 1 week |
+| Store operations | Remaining store operations (`sh`, `sw`, `sd`) | ✔️  | 1 week |
+| Load operations | Remaining load operations (`lb`, `lh`, `lw`, `ld`, `lbu`, `lhu`, `lwu`) | ✔️  | 1 week |
+| Integer arithmetic | Operations (`add`, `sub`, `sll`, `slt`, `sltu`, `xor`, `srl`, `sra`, `or`, `and`) | ✔️  | 1 week |
+| Integer arithmetic - immediate | Operations (`addi`, `subi`, `slli`, `slti`, `sltui`, `xori`, `srli`, `srai`, `ori`, `andi`) | ✔️  | 1 week |
 | 32-bit word operations | RV64 32-bit operations (`addw`, `subw`, `sllw`, `srlw`, `sraw`, `addiw`, `slliw`, `srliw`, `sraiw`) | Planned | 1 week |
 | RISCV64IM CPU               | Working executor for RV64 virtual machine with 65 RISCV instructions | Planned | |
 | Multiplication operations | Operations related to multiplication (`mul`, `mulh`, `mulhsu`, `mulhu`) | Planned | 1 week |
@@ -175,6 +175,14 @@ The first version is going to use the primitives contained in [lambdaworks](http
 | Adjust parameters           | Adjust parameters for 128 bits of security | Planned | 1 week |
 | Recursion | Allow for n-1 recursion tree to compress proof size | Planned | 4 weeks |
 
+## Verifier
+
+| Feature | Description | Status | Duration |
+| ------ | -------- |--------| -----------|
+|Ethereum verifier | Solidity verifier for the vm | Planned | 2 weeks |
+|Verifier | Verifier for the vm | Planned | 2 weeks |
+|Optimize Ethereum verifier | Optimize gas cost for verifier | Planned | 2 weeks |
+
 ## GPU and performance
 
 | Feature                     | Description                       | Status       |
@@ -182,8 +190,15 @@ The first version is going to use the primitives contained in [lambdaworks](http
 | Fields                      | Improve field performance using assembly | Planned |
 | GPU-Fast-Fourier transform      | Implement GPU version of FFT | Planned |
 | GPU-Merkle tree                 | Implement GPU version for Merkle trees | Planned |
-| Parallel trace generation   | Use GPU for fast trace generation | Planned |
+| Parallel witness generation   | Use GPU for fast witness generation | Planned |
 | GPU-FRI | Perform FRI on GPU | Planned |
+
+### Milestones
+
+- Minimal CPU: able to prove simple computations, but not all operations supported
+- RV64IM vm: prove general RV64IM code 
+- Full vm: supports coprocessors for expensive operations
+- GPU vm: leverages GPU for fast proving
   
 ## Acknowledgements
 
