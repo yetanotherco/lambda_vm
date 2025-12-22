@@ -4,6 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-lambdaworks-math = { git = "https://github.com/lambdaclass/lambdaworks.git" }
 stark = { path = "../crypto/stark" }
 crypto = { path = "../crypto/crypto" }
+math = { path = "../crypto/math" }

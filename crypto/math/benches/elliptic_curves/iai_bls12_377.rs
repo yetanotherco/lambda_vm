@@ -1,5 +1,5 @@
 use criterion::black_box;
-use lambdaworks_math::{
+use math::{
     cyclic_group::IsGroup,
     elliptic_curve::{
         short_weierstrass::{
@@ -8,15 +8,15 @@ use lambdaworks_math::{
         traits::IsEllipticCurve,
     },
 };
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 #[allow(dead_code)]
 type G1 = ShortWeierstrassProjectivePoint<BLS12377Curve>;
 
 #[allow(dead_code)]
 pub fn rand_points_g1() -> (G1, G1, u128, u128) {
     let mut rng = StdRng::seed_from_u64(42);
-    let a_val = rng.gen();
-    let b_val = rng.gen();
+    let a_val = rng.r#gen();
+    let b_val = rng.r#gen();
     let a = BLS12377Curve::generator().operate_with_self(a_val);
     let b = BLS12377Curve::generator().operate_with_self(b_val);
     (a, b, a_val, b_val)

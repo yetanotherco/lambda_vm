@@ -1,5 +1,5 @@
 use const_random::const_random;
-use lambdaworks_math::{
+use math::{
     field::{
         element::FieldElement,
         fields::{
@@ -8,8 +8,8 @@ use lambdaworks_math::{
         },
     },
     polynomial::{
-        dense_multilinear_poly::DenseMultilinearPolynomial,
-        sparse_multilinear_poly::SparseMultilinearPolynomial, Polynomial,
+        Polynomial, dense_multilinear_poly::DenseMultilinearPolynomial,
+        sparse_multilinear_poly::SparseMultilinearPolynomial,
     },
 };
 use rand::random;

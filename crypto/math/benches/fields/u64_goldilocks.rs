@@ -1,9 +1,7 @@
 use std::hint::black_box;
 
 use criterion::Criterion;
-use lambdaworks_math::field::{
-    element::FieldElement, fields::u64_goldilocks_field::Goldilocks64Field,
-};
+use math::field::{element::FieldElement, fields::u64_goldilocks_field::Goldilocks64Field};
 use rand::Rng;
 use rand::SeedableRng;
 
@@ -13,7 +11,7 @@ pub fn rand_field_elements(num: usize) -> Vec<(F, F)> {
     let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(9001);
     let mut result = Vec::with_capacity(num);
     for _ in 0..result.capacity() {
-        result.push((F::new(rng.gen::<u64>()), F::new(rng.gen::<u64>())));
+        result.push((F::new(rng.r#gen::<u64>()), F::new(rng.r#gen::<u64>())));
     }
     result
 }

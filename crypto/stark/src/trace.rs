@@ -1,8 +1,8 @@
 use crate::table::Table;
 use itertools::Itertools;
-use lambdaworks_math::fft::errors::FFTError;
-use lambdaworks_math::field::traits::{IsField, IsSubFieldOf};
-use lambdaworks_math::{
+use math::fft::errors::FFTError;
+use math::field::traits::{IsField, IsSubFieldOf};
+use math::{
     field::{element::FieldElement, traits::IsFFTField},
     polynomial::Polynomial,
 };

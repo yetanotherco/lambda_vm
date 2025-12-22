@@ -1,7 +1,7 @@
 use std::hint::black_box;
 
 use criterion::Criterion;
-use lambdaworks_math::{
+use math::{
     field::{
         element::FieldElement,
         fields::{
@@ -12,7 +12,7 @@ use lambdaworks_math::{
         },
     },
     unsigned_integer::{
-        element::{UnsignedInteger, U64},
+        element::{U64, UnsignedInteger},
         montgomery::MontgomeryAlgorithms,
     },
 };
@@ -26,10 +26,10 @@ pub fn rand_field_elements(num: usize) -> Vec<(F, F)> {
     let mut result = Vec::with_capacity(num);
     for _ in 0..result.capacity() {
         let rand_a = UnsignedInteger {
-            limbs: [rng.gen::<u64>()],
+            limbs: [rng.r#gen::<u64>()],
         };
         let rand_b = UnsignedInteger {
-            limbs: [rng.gen::<u64>()],
+            limbs: [rng.r#gen::<u64>()],
         };
         result.push((F::new(rand_a), F::new(rand_b)));
     }

@@ -1,8 +1,8 @@
-use super::utils::{rand_dense_multilinear_poly, rand_field_elements, FE};
+use super::utils::{FE, rand_dense_multilinear_poly, rand_field_elements};
 use const_random::const_random;
 use core::hint::black_box;
 use criterion::Criterion;
-use lambdaworks_math::polynomial::dense_multilinear_poly::DenseMultilinearPolynomial;
+use math::polynomial::dense_multilinear_poly::DenseMultilinearPolynomial;
 
 pub fn dense_multilinear_polynomial_benchmarks(c: &mut Criterion) {
     let mut group = c.benchmark_group("Polynomial");

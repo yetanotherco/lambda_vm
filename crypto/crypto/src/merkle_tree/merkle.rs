@@ -103,7 +103,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lambdaworks_math::field::{element::FieldElement, fields::u64_prime_field::U64PrimeField};
+    use math::field::{element::FieldElement, fields::u64_prime_field::U64PrimeField};
 
     use crate::merkle_tree::{merkle::MerkleTree, test_merkle::TestBackend};
 

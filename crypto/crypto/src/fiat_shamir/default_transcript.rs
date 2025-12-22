@@ -1,6 +1,6 @@
 use super::is_transcript::IsTranscript;
 use core::marker::PhantomData;
-use lambdaworks_math::{
+use math::{
     field::{element::FieldElement, traits::HasDefaultTranscript},
     traits::ByteConversion,
 };
@@ -77,7 +77,7 @@ mod tests {
     use super::*;
 
     use alloc::vec::Vec;
-    use lambdaworks_math::{
+    use math::{
         elliptic_curve::short_weierstrass::curves::bls12_381::default_types::FrField,
         field::fields::fft_friendly::{
             babybear_u32::Babybear31PrimeField,

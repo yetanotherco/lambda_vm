@@ -1,10 +1,10 @@
-use lambdaworks_math::elliptic_curve::short_weierstrass::traits::IsShortWeierstrass;
-use lambdaworks_math::elliptic_curve::short_weierstrass::{
+use math::elliptic_curve::short_weierstrass::traits::IsShortWeierstrass;
+use math::elliptic_curve::short_weierstrass::{
     curves::stark_curve::StarkCurve, point::ShortWeierstrassProjectivePoint as Point,
 };
-use lambdaworks_math::elliptic_curve::traits::IsEllipticCurve;
-use lambdaworks_math::field::fields::fft_friendly::stark_252_prime_field::Stark252PrimeField;
-use lambdaworks_math::field::traits::IsPrimeField;
+use math::elliptic_curve::traits::IsEllipticCurve;
+use math::field::fields::fft_friendly::stark_252_prime_field::Stark252PrimeField;
+use math::field::traits::IsPrimeField;
 
 use crate::hash::pedersen::constants::*;
 

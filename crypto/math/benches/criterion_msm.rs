@@ -1,5 +1,5 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use lambdaworks_math::{
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use math::{
     cyclic_group::IsGroup,
     elliptic_curve::{
         short_weierstrass::curves::bls12_381::curve::BLS12381Curve, traits::IsEllipticCurve,
@@ -8,7 +8,7 @@ use lambdaworks_math::{
     msm::{naive, pippenger},
     unsigned_integer::element::UnsignedInteger,
 };
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 
 type F = <BLS12381Curve as IsEllipticCurve>::BaseField;
 type FP = <BLS12381Curve as IsEllipticCurve>::PointRepresentation;
@@ -21,11 +21,11 @@ pub fn generate_cs_and_points(msm_size: usize) -> (Vec<UI>, Vec<FP>) {
     let g = BLS12381Curve::generator();
 
     let cs: Vec<_> = (0..msm_size)
-        .map(|_| F::from_base_type(UI::from_limbs(rng.gen())))
+        .map(|_| F::from_base_type(UI::from_limbs(rng.r#gen())))
         .collect();
 
     let points: Vec<_> = (0..msm_size)
-        .map(|_| g.operate_with_self(F::from_base_type(UI::from_limbs(rng.gen()))))
+        .map(|_| g.operate_with_self(F::from_base_type(UI::from_limbs(rng.r#gen()))))
         .collect();
 
     (cs, points)

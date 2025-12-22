@@ -1,14 +1,14 @@
 use super::domain::Domain;
 use super::traits::{AIR, TransitionEvaluationContext};
 use crate::{frame::Frame, trace::LDETraceTable};
-use lambdaworks_math::{
+use log::{error, info};
+use math::{
     field::{
         element::FieldElement,
         traits::{IsFFTField, IsField},
     },
     polynomial::Polynomial,
 };
-use log::{error, info};
 
 /// Validates that the trace is valid with respect to the supplied AIR constraints
 pub fn validate_trace<A: AIR>(

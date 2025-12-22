@@ -922,20 +922,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lambdaworks-math"
-version = "0.13.0"
-source = "git+https://github.com/lambdaclass/lambdaworks.git#e17bcc29450cdd6d908e82ca998b20823253722a"
-dependencies = [
- "getrandom 0.2.16",
- "num-bigint",
- "num-traits",
- "rand 0.8.5",
- "rayon",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1421,7 +1407,7 @@ name = "prover"
 version = "0.1.0"
 dependencies = [
  "crypto",
- "lambdaworks-math",
+ "math",
  "stark",
 ]
 
@@ -1827,8 +1813,8 @@ dependencies = [
  "env_logger",
  "hex",
  "itertools 0.11.0",
- "lambdaworks-math",
  "log",
+ "math",
  "num-integer",
  "proptest",
  "rand 0.8.5",

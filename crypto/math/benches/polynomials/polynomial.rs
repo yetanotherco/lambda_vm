@@ -1,10 +1,8 @@
-use super::utils::{rand_complex_mersenne_poly, rand_field_elements, rand_poly, FE};
+use super::utils::{FE, rand_complex_mersenne_poly, rand_field_elements, rand_poly};
 use const_random::const_random;
 use core::hint::black_box;
 use criterion::Criterion;
-use lambdaworks_math::{
-    field::fields::mersenne31::extensions::Degree2ExtensionField, polynomial::Polynomial,
-};
+use math::{field::fields::mersenne31::extensions::Degree2ExtensionField, polynomial::Polynomial};
 
 pub fn polynomial_benchmarks(c: &mut Criterion) {
     let mut group = c.benchmark_group("Polynomial");

@@ -1,6 +1,6 @@
 #![allow(dead_code)] // clippy has false positive in benchmarks
 use core::hint::black_box;
-use lambdaworks_math::field::traits::RootsConfig;
+use math::field::traits::RootsConfig;
 
 mod utils;
 use utils::fft_functions;

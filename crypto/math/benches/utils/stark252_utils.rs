@@ -1,4 +1,4 @@
-use lambdaworks_math::{
+use math::{
     fft::cpu::{bit_reversing::in_place_bit_reverse_permute, roots_of_unity::get_twiddles},
     field::{
         element::FieldElement, fields::fft_friendly::stark_252_prime_field::Stark252PrimeField,

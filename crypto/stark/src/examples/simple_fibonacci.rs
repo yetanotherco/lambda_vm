@@ -8,7 +8,7 @@ use crate::{
     trace::TraceTable,
     traits::{AIR, TransitionEvaluationContext},
 };
-use lambdaworks_math::field::{element::FieldElement, traits::IsFFTField};
+use math::field::{element::FieldElement, traits::IsFFTField};
 use std::marker::PhantomData;
 
 #[derive(Clone)]

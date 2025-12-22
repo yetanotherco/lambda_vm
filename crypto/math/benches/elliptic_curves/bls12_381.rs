@@ -1,11 +1,11 @@
-use criterion::{black_box, Criterion};
-use lambdaworks_math::{
+use criterion::{Criterion, black_box};
+use math::{
     cyclic_group::IsGroup,
     elliptic_curve::{
         short_weierstrass::{
             curves::bls12_381::{
                 curve::BLS12381Curve,
-                pairing::{final_exponentiation, miller, BLS12381AtePairing},
+                pairing::{BLS12381AtePairing, final_exponentiation, miller},
                 twist::BLS12381TwistCurve,
             },
             traits::Compress,
@@ -13,13 +13,13 @@ use lambdaworks_math::{
         traits::{IsEllipticCurve, IsPairing},
     },
 };
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 
 #[allow(dead_code)]
 pub fn bls12_381_elliptic_curve_benchmarks(c: &mut Criterion) {
     let mut rng = StdRng::seed_from_u64(42);
-    let a_val: u128 = rng.gen();
-    let b_val: u128 = rng.gen();
+    let a_val: u128 = rng.r#gen();
+    let b_val: u128 = rng.r#gen();
     let a_g1 = BLS12381Curve::generator().operate_with_self(a_val);
     let b_g1 = BLS12381Curve::generator().operate_with_self(b_val);
 

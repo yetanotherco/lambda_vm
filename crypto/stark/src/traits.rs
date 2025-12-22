@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crypto::fiat_shamir::is_transcript::IsTranscript;
-use lambdaworks_math::{
+use math::{
     field::{
         element::FieldElement,
         traits::{IsFFTField, IsField, IsSubFieldOf},

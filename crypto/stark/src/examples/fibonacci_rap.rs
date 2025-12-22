@@ -11,7 +11,7 @@ use crate::{
     traits::{AIR, TransitionEvaluationContext},
 };
 use crypto::fiat_shamir::is_transcript::IsTranscript;
-use lambdaworks_math::{
+use math::{
     field::{element::FieldElement, traits::IsFFTField},
     helpers::resize_to_next_power_of_two,
     traits::ByteConversion,
@@ -315,7 +315,7 @@ pub fn fibonacci_rap_trace<F: IsFFTField>(
 #[cfg(test)]
 mod test {
     use super::*;
-    use lambdaworks_math::field::fields::u64_prime_field::FE17;
+    use math::field::fields::u64_prime_field::FE17;
 
     #[test]
     fn test_build_fibonacci_rap_trace() {

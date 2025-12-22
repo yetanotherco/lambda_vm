@@ -1,6 +1,6 @@
 use super::Fp;
 use alloc::vec::Vec;
-use lambdaworks_math::field::errors::FieldError;
+use math::field::errors::FieldError;
 
 // Auxiliary algorithms based on the reference implementation in Sage
 // https://github.com/ASDiscreteMathematics/rpo/tree/master/reference_implementation

@@ -1,6 +1,6 @@
 use core::marker::PhantomData;
 
-use lambdaworks_math::field::{element::FieldElement, traits::IsField};
+use math::field::{element::FieldElement, traits::IsField};
 
 use super::{merkle::MerkleTree, traits::IsMerkleTreeBackend};
 

@@ -1,6 +1,6 @@
 #![allow(dead_code)] // clippy has false positive in benchmarks
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
-use lambdaworks_math::field::traits::RootsConfig;
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use math::field::traits::RootsConfig;
 use utils::fft_functions;
 use utils::stark252_utils;
 

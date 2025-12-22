@@ -2,7 +2,7 @@ use super::utils::{rand_field_elements, rand_sparse_multilinear_poly};
 use const_random::const_random;
 use core::hint::black_box;
 use criterion::Criterion;
-use lambdaworks_math::polynomial::sparse_multilinear_poly::SparseMultilinearPolynomial;
+use math::polynomial::sparse_multilinear_poly::SparseMultilinearPolynomial;
 use rand::random;
 
 pub fn sparse_multilinear_polynomial_benchmarks(c: &mut Criterion) {

@@ -1,4 +1,4 @@
-use lambdaworks_math::{
+use math::{
     field::{element::FieldElement, traits::IsField},
     polynomial::Polynomial,
 };

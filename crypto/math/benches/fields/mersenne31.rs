@@ -1,7 +1,7 @@
 use std::hint::black_box;
 
 use criterion::Criterion;
-use lambdaworks_math::field::{
+use math::field::{
     element::FieldElement,
     fields::mersenne31::{
         extensions::{Degree2ExtensionField, Degree4ExtensionField},

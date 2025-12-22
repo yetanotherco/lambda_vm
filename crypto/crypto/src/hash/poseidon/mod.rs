@@ -1,5 +1,5 @@
 use alloc::{borrow::ToOwned, vec::Vec};
-use lambdaworks_math::field::element::FieldElement as FE;
+use math::field::element::FieldElement as FE;
 
 pub mod parameters;
 pub mod starknet;
@@ -100,7 +100,7 @@ impl<P: PermutationParameters> Poseidon for P {
 mod tests {
     use super::*;
     use crate::hash::poseidon::starknet::PoseidonCairoStark252;
-    use lambdaworks_math::field::{
+    use math::field::{
         element::FieldElement, fields::fft_friendly::stark_252_prime_field::Stark252PrimeField,
     };
 

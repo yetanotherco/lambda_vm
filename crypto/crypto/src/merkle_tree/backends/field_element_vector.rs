@@ -4,7 +4,7 @@ use crate::hash::poseidon::Poseidon;
 use crate::merkle_tree::traits::IsMerkleTreeBackend;
 use alloc::vec::Vec;
 use digest::{Digest, Output};
-use lambdaworks_math::{
+use math::{
     field::{element::FieldElement, traits::IsField},
     traits::AsBytes,
 };
@@ -83,7 +83,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use lambdaworks_math::field::{
+    use math::field::{
         element::FieldElement, fields::fft_friendly::stark_252_prime_field::Stark252PrimeField,
     };
     use sha2::Sha512;

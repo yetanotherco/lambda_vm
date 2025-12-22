@@ -1,13 +1,14 @@
-use criterion::{black_box, Criterion};
-use lambdaworks_math::{
+use criterion::{Criterion, black_box};
+use math::{
     cyclic_group::IsGroup,
     elliptic_curve::{
         short_weierstrass::curves::bn_254::{
             curve::BN254Curve,
-            field_extension::{BN254PrimeField, Degree12ExtensionField, Degree2ExtensionField},
+            field_extension::{BN254PrimeField, Degree2ExtensionField, Degree12ExtensionField},
             pairing::{
-                cyclotomic_pow_x, cyclotomic_square, final_exponentiation_naive,
-                final_exponentiation_optimized, miller_naive, miller_optimized, BN254AtePairing, X,
+                BN254AtePairing, X, cyclotomic_pow_x, cyclotomic_square,
+                final_exponentiation_naive, final_exponentiation_optimized, miller_naive,
+                miller_optimized,
             },
             twist::BN254TwistCurve,
         },
@@ -16,7 +17,7 @@ use lambdaworks_math::{
     },
     field::element::FieldElement,
 };
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 
 type FpE = FieldElement<BN254PrimeField>;
 type Fp2E = FieldElement<Degree2ExtensionField>;
@@ -26,8 +27,8 @@ type G2 = ShortWeierstrassProjectivePoint<BN254TwistCurve>;
 #[allow(dead_code)]
 pub fn bn_254_elliptic_curve_benchmarks(c: &mut Criterion) {
     let mut rng = StdRng::seed_from_u64(42);
-    let a_val: u128 = rng.gen();
-    let b_val: u128 = rng.gen();
+    let a_val: u128 = rng.r#gen();
+    let b_val: u128 = rng.r#gen();
     let a_g1 = BN254Curve::generator().operate_with_self(a_val);
     let b_g1 = BN254Curve::generator().operate_with_self(b_val);
 
@@ -127,7 +128,7 @@ pub fn bn_254_elliptic_curve_benchmarks(c: &mut Criterion) {
             let mut g2_points: Vec<G2> = Vec::new();
 
             for _ in 0..num_pairs {
-                let a_val: u128 = rng.gen();
+                let a_val: u128 = rng.r#gen();
                 let g1 = BN254Curve::generator().operate_with_self(a_val);
                 let g2 = BN254TwistCurve::generator().operate_with_self(a_val);
                 g1_points.push(g1);

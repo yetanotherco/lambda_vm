@@ -1,17 +1,17 @@
-use criterion::{black_box, Criterion};
-use lambdaworks_math::{
+use criterion::{Criterion, black_box};
+use math::{
     cyclic_group::IsGroup,
     elliptic_curve::{
         short_weierstrass::curves::bls12_377::curve::BLS12377Curve, traits::IsEllipticCurve,
     },
 };
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 
 #[allow(dead_code)]
 pub fn bls12_377_elliptic_curve_benchmarks(c: &mut Criterion) {
     let mut rng = StdRng::seed_from_u64(42);
-    let a_val: u128 = rng.gen();
-    let b_val: u128 = rng.gen();
+    let a_val: u128 = rng.r#gen();
+    let b_val: u128 = rng.r#gen();
     let a = BLS12377Curve::generator().operate_with_self(a_val);
     let b = BLS12377Curve::generator().operate_with_self(b_val);
 

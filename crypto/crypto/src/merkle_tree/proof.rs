@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 #[cfg(feature = "alloc")]
-use lambdaworks_math::traits::Serializable;
-use lambdaworks_math::{errors::DeserializationError, traits::Deserializable};
+use math::traits::Serializable;
+use math::{errors::DeserializationError, traits::Deserializable};
 
 use super::traits::IsMerkleTreeBackend;
 
@@ -73,9 +73,9 @@ mod tests {
     #[cfg(feature = "alloc")]
     use super::Proof;
     use alloc::vec::Vec;
-    use lambdaworks_math::field::{element::FieldElement, fields::u64_prime_field::U64PrimeField};
+    use math::field::{element::FieldElement, fields::u64_prime_field::U64PrimeField};
     #[cfg(feature = "alloc")]
-    use lambdaworks_math::traits::{Deserializable, Serializable};
+    use math::traits::{Deserializable, Serializable};
 
     use crate::merkle_tree::{merkle::MerkleTree, test_merkle::TestBackend};
 

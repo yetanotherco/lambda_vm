@@ -1,4 +1,4 @@
-use lambdaworks_math::{
+use math::{
     field::element::FieldElement,
     field::fields::fft_friendly::u64_goldilocks::U64GoldilocksPrimeField, polynomial::Polynomial,
 };

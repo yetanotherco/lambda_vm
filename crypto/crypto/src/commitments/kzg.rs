@@ -1,7 +1,7 @@
 use super::traits::IsCommitmentScheme;
 use alloc::{borrow::ToOwned, vec::Vec};
 use core::{marker::PhantomData, mem};
-use lambdaworks_math::{
+use math::{
     cyclic_group::IsGroup,
     elliptic_curve::traits::IsPairing,
     errors::DeserializationError,

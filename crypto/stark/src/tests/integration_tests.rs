@@ -1,9 +1,9 @@
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
-use lambdaworks_math::field::{
+use math::field::{
     element::FieldElement, fields::fft_friendly::stark_252_prime_field::Stark252PrimeField,
 };
 
-use lambdaworks_math::field::fields::fft_friendly::{
+use math::field::fields::fft_friendly::{
     babybear::Babybear31PrimeField, quartic_babybear::Degree4BabyBearExtensionField,
 };
 

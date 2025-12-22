@@ -3,7 +3,7 @@ use super::parameters::*;
 use super::utils::*;
 use crate::alloc::vec::Vec;
 use core::iter;
-use lambdaworks_math::field::errors::FieldError;
+use math::field::errors::FieldError;
 
 // Implementation of the Rescue Prime Optimized hash function.
 // https://eprint.iacr.org/2022/1577

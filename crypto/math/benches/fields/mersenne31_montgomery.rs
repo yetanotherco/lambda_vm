@@ -1,7 +1,7 @@
 use std::hint::black_box;
 
 use criterion::Criterion;
-use lambdaworks_math::{
+use math::{
     field::{
         element::FieldElement,
         fields::{
@@ -12,7 +12,7 @@ use lambdaworks_math::{
         },
     },
     unsigned_integer::{
-        element::{UnsignedInteger, U64},
+        element::{U64, UnsignedInteger},
         montgomery::MontgomeryAlgorithms,
     },
 };
