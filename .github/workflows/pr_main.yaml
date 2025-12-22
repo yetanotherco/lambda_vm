@@ -59,7 +59,7 @@ jobs:
 
       - name: Run rust tests
         run: |
-          cd executor && make test-rust
+          cd executor && rustup target add riscv32im-unknown-none-elf && make test-rust
 
       - name: Run prover tests
         run: |
