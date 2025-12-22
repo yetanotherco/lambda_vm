@@ -1,27 +1,36 @@
 name: 'Setup Rust Environment'
 description: 'Sets up Rust and caches dependencies'
-inputs:
-  components:
-    description: "Rust components to install (e.g., rustfmt, clippy)"
-    required: false
-    default: ""
 runs:
   using: "composite"
   steps:
-    - name: Extract Rust version from rust-toolchain.toml
-      id: rustver
-      shell: bash
-      run: |
-        rust_version=$(grep -E '^[[:space:]]*channel[[:space:]]*=' rust-toolchain.toml \
-                 | sed -E 's/.*"([^"]+)".*/\1/')
-        echo "rust_version=${rust_version}" >>"$GITHUB_OUTPUT"
-        echo "Rust version: ${rust_version}"
+
+    - name: Restore Rust toolchain cache
+      id: rust-cache
+      uses: actions/cache@v4
+      with:
+        path: $HOME/lambda_rust
+        key: rust-src-${{ runner.os }}-149354
 
     - name: Install Rust
-      uses: dtolnay/rust-toolchain@master
-      with:
-        toolchain: ${{ steps.rustver.outputs.rust_version }}
-        components: ${{ inputs.components }}
+      if: steps.rust-cache.outputs.cache-hit != 'true'
+      run: |
+        git clone https://github.com/rust-lang/rust.git
+        cd rust
+        cat <<'EOF' > bootstrap.toml
+        # See bootstrap.example.toml for documentation of available options
+        #
+        profile = "dist"  # Includes one of the default files in src/bootstrap/defaults
+        change-id = 149354
+        rust.lld = true
+        EOF
+        export DESTDIR="$HOME/lambda_rust"
+        ./x.py build && ./x.py install
+    
+    - name: Add Rust to PATH
+      run: echo "$HOME/lambda_rust/usr/local/bin" >> $GITHUB_PATH
 
-    - name: Add Rust Cache
-      uses: Swatinem/rust-cache@v2
+    - name: Upload Rust toolchain artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: rust-toolchain
+        path: $HOME/lambda_rust
