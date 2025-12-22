@@ -118,7 +118,7 @@ The first version is going to use the primitives contained in [lambdaworks](http
 | Fibonacci operations II         | Operations needed to run Fibonacci part II (`auipc`, `bltu`, `lui`, `sb`, `slli`) | In Progress | 1 week |
 | Compute decoding table | Decoding table indexed by pc | 1 week |
 | Basic logging        | Basic logs for minimal opcodes | In progress | 2 weeks |
-| RISCV64 CPU                 | Minimal version of the CPU with 52 RISCV instructions | Planned | |
+| RISCV64 CPU                 | Minimal version of the CPU with 52 RISCV instructions | Planned | 8 weeks |
 | Control flow opcodes | Implement remaining control flow operations (`bne`, `blt`, `bge`, `bgeu`) | Planned | 1 week |
 | Store operations | Remaining store operations (`sh`, `sw`, `sd`) | Planned | 1 week |
 | Load operations | Remaining load operations (`lb`, `lh`, `lw`, `ld`, `lbu`, `lhu`, `lwu`) | Planned | 1 week |
@@ -128,13 +128,13 @@ The first version is going to use the primitives contained in [lambdaworks](http
 | RISCV64IM CPU               | Working executor for RV64 virtual machine with 65 RISCV instructions | Planned | |
 | Multiplication operations | Operations related to multiplication (`mul`, `mulh`, `mulhsu`, `mulhu`) | Planned | 1 week |
 | Division operations | Operations related to division (`div`, `divu`, `rem`, `remu`) | Planned | 1 week |
-| CPU with coprocessors       | Add coprocessors for special cryptographic operations   | Planned | |
+| CPU with coprocessors       | Add coprocessors for special cryptographic operations   | Planned | 10 weeks |
 | System instructions | `ecall`, `ebreak` | Planned | 1 week |
 | Big Integer arithmetic | Table for big integer arithmetic | Planned | 1 week |
 | Elliptic curve addition | Table for EC operations | Planned | 2 weeks  |
-| Poseidon hash | Table for Poseidon hash | Planned | |
-| Keccak hash | Table for Keccak hash | Planned | |
-| Pairing | Table for pairings | Planned? | |
+| Poseidon hash | Table for Poseidon hash | Planned | 3 weeks |
+| Keccak hash | Table for Keccak hash | Planned | 3 weeks |
+| Pairing | Table for pairings | Planned? | ? |
 
 ## Trace generator
 
@@ -155,8 +155,8 @@ The first version is going to use the primitives contained in [lambdaworks](http
 | Syscalls                    | Tables for coprocessors | Planned | |
 | Big Integer arithmetic | Table for big integer arithmetic | Planned | 1 week |
 | Elliptic curve addition | Table for EC operations | Planned | 2 weeks  |
-| Poseidon hash | Table for Poseidon hash | Planned | |
-| Keccak hash | Table for Keccak hash | Planned | |
+| Poseidon hash | Table for Poseidon hash | Planned | 3 weeks |
+| Keccak hash | Table for Keccak hash | Planned | 3 weeks |
 | Pairing | Table for pairings | Planned? | |
 
 ## Proof system
@@ -170,7 +170,7 @@ The first version is going to use the primitives contained in [lambdaworks](http
 | Multi-table Merkle trees (MTMT)   | Merkle tree that can be used to commit to polynomials of various sizes | In progress | 2 weeks |
 | Multi-FRI                   | Perform FRI using MTMT | Planned | 2 weeks |
 | Adjust parameters           | Adjust parameters for 128 bits of security | Planned | 1 week |
-| Recursion | Allow for n-1 recursion tree to compress proof size | Planned | |
+| Recursion | Allow for n-1 recursion tree to compress proof size | Planned | 4 weeks |
 
 ## GPU and performance
 
@@ -182,7 +182,6 @@ The first version is going to use the primitives contained in [lambdaworks](http
 | Parallel trace generation   | Use GPU for fast trace generation | Planned |
 | GPU-FRI | Perform FRI on GPU | Planned |
   
-
 ## Acknowledgements
 
 This project would not be possible without the contributions made by various teams who developed the core cryptographic primitives and designs and we have learnt and drawn inspiration from them.
