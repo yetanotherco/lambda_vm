@@ -129,6 +129,7 @@ The first version is going to use the primitives contained in [lambdaworks](http
 | Multiplication operations | Operations related to multiplication (`mul`, `mulh`, `mulhsu`, `mulhu`) | Planned | 1 week |
 | Division operations | Operations related to division (`div`, `divu`, `rem`, `remu`) | Planned | 1 week |
 | CPU with coprocessors       | Add coprocessors for special cryptographic operations   | Planned | |
+| System instructions | `ecall`, `ebreak` | Planned | 1 week |
 | Big Integer arithmetic | Table for big integer arithmetic | Planned | 1 week |
 | Elliptic curve addition | Table for EC operations | Planned | 2 weeks  |
 | Poseidon hash | Table for Poseidon hash | Planned | |
