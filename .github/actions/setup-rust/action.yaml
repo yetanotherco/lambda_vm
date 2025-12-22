@@ -15,6 +15,7 @@ runs:
       if: steps.rust-cache.outputs.cache-hit != 'true'
       shell: bash
       run: |
+        cd $HOME
         git clone https://github.com/rust-lang/rust.git
         cd rust
         cat <<'EOF' > bootstrap.toml
