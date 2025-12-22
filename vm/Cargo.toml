@@ -1,9 +1,0 @@
-[package]
-name = "vm"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-elf = "0.7.4"
-hashbrown = { version = "0.14.5", features = ["serde", "inline-more"] }
-thiserror = "1.0.68"
