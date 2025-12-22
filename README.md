@@ -129,10 +129,21 @@ The first version is going to use the primitives contained in [lambdaworks](http
 |---------------------------- |-----------------------------------|--------------| -------- |
 | Documentation               | Document trace generation and constraints | In progress | |
 | CPU                         | Implement CPU table with constraints | In progress | |
+| Define basic CPU constraints | Add basic type constraints for CPU | In progress | 1 week|
+| Decoder table | Implement decoder table | Planned | 1 week |
+| Link decoder table and CPU | Use lookup to connect tables | Planned | 1 week |
+| Constraints for updating pc | Implement constraints for updating pc | In progress | 1 week |
 | ALU                         | Implement ALU tables with constraints| Not started | |
+| Range checkers | Implement rangecheck for u16 and u8 | Planned | 1 week |
+| Bitwise operations | Implement tables for u8 bitwise operations | Planned | 1 week |
+| Multiplication table | Implement table for multiplication table | Planned | 1 week |
 | Memory                      | Implement memory table with constraints | Not started | |
 | Syscalls                    | Tables for coprocessors | Planned | |
-
+| Big Integer arithmetic | Table for big integer arithmetic | Planned |
+| Elliptic curve addition | Table for EC operations | Planned |
+| Poseidon hash | Table for Poseidon hash | Planned |
+| Keccak hash | Table for Keccak hash | Planned |
+| Pairing | Table for pairings | Planned? |
 
 ## Proof system
 
