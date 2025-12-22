@@ -116,7 +116,7 @@ The first version is going to use the primitives contained in [lambdaworks](http
 | Minimal CPU                 | Minimal CPU that can perform basic operations | In progress | 6 weeks |
 | Fibonacci operations I         | Operations needed to run Fibonacci part I (`addi`, `sw`, `beq`, `jal`, `jalr`) | ✔️  | 1 week |
 | Fibonacci operations II         | Operations needed to run Fibonacci part II (`auipc`, `bltu`, `lui`, `sb`, `slli`) | ✔️  | 1 week |
-| Compute decoding table | Decoding table indexed by pc | 1 week |
+| Compute decoding table | Decoding table indexed by pc | Planned | 1 week |
 | Basic logging        | Basic logs for minimal opcodes | ✔️  | 2 weeks |
 | RISCV64 CPU                 | Minimal version of the CPU with 52 RISCV instructions* | Planned | 8 weeks |
 | Control flow opcodes | Implement remaining control flow operations (`bne`, `blt`, `bge`, `bgeu`) | ✔️ | 1 week |
@@ -125,6 +125,7 @@ The first version is going to use the primitives contained in [lambdaworks](http
 | Integer arithmetic | Operations (`add`, `sub`, `sll`, `slt`, `sltu`, `xor`, `srl`, `sra`, `or`, `and`) | ✔️  | 1 week |
 | Integer arithmetic - immediate | Operations (`addi`, `subi`, `slli`, `slti`, `sltui`, `xori`, `srli`, `srai`, `ori`, `andi`) | ✔️  | 1 week |
 | 32-bit word operations | RV64 32-bit operations (`addw`, `subw`, `sllw`, `srlw`, `sraw`, `addiw`, `slliw`, `srliw`, `sraiw`) | Planned | 1 week |
+| Input/Output | Pass input and output | Planned | 1 week |
 | RISCV64IM CPU               | Working executor for RV64 virtual machine with 65 RISCV instructions | Planned | |
 | Multiplication operations | Operations related to multiplication (`mul`, `mulh`, `mulhsu`, `mulhu`) | ✔️ | 1 week |
 | Division operations | Operations related to division (`div`, `divu`, `rem`, `remu`) | ✔️ | 1 week |
@@ -172,6 +173,7 @@ The first version is going to use the primitives contained in [lambdaworks](http
 | Lookup arguments            | Linking tables via lookup arguments | In progress | 2 weeks |
 | Lookup - I | Accept multitables | In progress | 1 week |
 | Lookup - II | Perform argument with constraints | In progress | 1 week |
+| Public input | Add public input using Lookup | 1 week |
 | Multi-table Merkle trees (MTMT)   | Merkle tree that can be used to commit to polynomials of various sizes | In progress | 2 weeks |
 | Multi-FRI                   | Perform FRI using MTMT | Planned | 2 weeks |
 | Adjust parameters           | Adjust parameters for 128 bits of security | Planned | 1 week |
