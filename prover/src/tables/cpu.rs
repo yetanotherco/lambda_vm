@@ -1,4 +1,4 @@
-use crate::utils::{i32_to_2_limbs, u32_to_2_limbs, u32_to_4_limbs};
+use crate::utils::{i32_to_2_limbs, i32_to_4_limbs, u32_to_2_limbs, u32_to_4_limbs};
 use executor::vm::{
     instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth},
     logs::Log,
@@ -10,10 +10,78 @@ use lambdaworks_math::field::{
     },
 };
 use stark_platinum_prover::trace::TraceTable;
+use std::fmt;
 
 type FE = FieldElement<Babybear31PrimeField>;
 
-#[derive(Default, Debug)]
+impl fmt::Debug for CpuTableRow {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn fe_to_decimal_string(fe: &FE) -> String {
+            let hex = fe.to_hex_str();
+            let hex = hex.strip_prefix("0x").unwrap_or(&hex);
+
+            let value = u128::from_str_radix(hex, 16).expect("invalid hex string");
+
+            value.to_string()
+        }
+
+        // Helper to format a single FE
+        fn fe(fe: &FE) -> String {
+            format!("{}", fe_to_decimal_string(fe))
+        }
+
+        // Helpers for arrays
+        fn fe2(a: &[FE; 2]) -> Vec<String> {
+            a.iter().map(fe).collect()
+        }
+
+        fn fe4(a: &[FE; 4]) -> Vec<String> {
+            a.iter().map(fe).collect()
+        }
+
+        f.debug_struct("CpuTableRow")
+            .field("timestamp", &fe2(&self.timestamp))
+            .field("pc", &fe2(&self.pc))
+            .field("rs1", &fe(&self.rs1))
+            .field("rs2", &fe(&self.rs2))
+            .field("rd", &fe(&self.rd))
+            .field("write_register", &fe(&self.write_register))
+            .field("memory_2bytes", &fe(&self.memory_2bytes))
+            .field("memory_4bytes", &fe(&self.memory_4bytes))
+            .field("imm", &fe2(&self.imm))
+            .field("signed", &fe(&self.signed))
+            .field("mp_selector", &fe(&self.mp_selector))
+            .field("muldiv_selector", &fe(&self.muldiv_selector))
+            .field("add", &fe(&self.add))
+            .field("sub", &fe(&self.sub))
+            .field("slt", &fe(&self.slt))
+            .field("and", &fe(&self.and))
+            .field("or", &fe(&self.or))
+            .field("xor", &fe(&self.xor))
+            .field("sl", &fe(&self.sl))
+            .field("sr", &fe(&self.sr))
+            .field("jalr", &fe(&self.jalr))
+            .field("beq", &fe(&self.beq))
+            .field("blt", &fe(&self.blt))
+            .field("load", &fe(&self.load))
+            .field("store", &fe(&self.store))
+            .field("mul", &fe(&self.mul))
+            .field("divrem", &fe(&self.divrem))
+            .field("ecall", &fe(&self.ecall))
+            .field("ebreak", &fe(&self.ebreak))
+            .field("next_pc", &fe2(&self.next_pc))
+            .field("rv1", &fe4(&self.rv1))
+            .field("rv2", &fe4(&self.rv2))
+            .field("rvd", &fe2(&self.rvd))
+            .field("arg2", &fe2(&self.arg2))
+            .field("res", &fe4(&self.res))
+            .field("is_equal", &fe(&self.is_equal))
+            .field("branch_cond", &fe(&self.branch_cond))
+            .finish()
+    }
+}
+
+#[derive(Default)]
 pub struct CpuTableRow {
     pub timestamp: [FE; 2],
     pub pc: [FE; 2],
@@ -166,7 +234,10 @@ impl CpuTableRow {
                 row.store = FE::one();
                 row.rs1 = FE::from(&base);
                 row.rs2 = FE::from(&src);
-                row.imm = u32_to_2_limbs(offset as u32);
+                // Fix this afer changing STORE instruction.
+                row.imm = i32_to_2_limbs(offset as i32);
+                row.arg2 = i32_to_2_limbs(offset as i32);
+                row.res = u32_to_4_limbs(log.src1_val + offset);
 
                 match width {
                     LoadStoreWidth::Half => row.memory_2bytes = FE::one(),
@@ -187,7 +258,9 @@ impl CpuTableRow {
                 row.load = FE::one();
                 row.rd = FE::from(&dst);
                 row.rs1 = FE::from(&base);
-                row.imm = u32_to_2_limbs(offset as u32);
+                row.imm = i32_to_2_limbs(offset);
+                row.arg2 = i32_to_2_limbs(offset);
+                row.res = i32_to_4_limbs(log.src1_val as i32 + offset);
 
                 if dst != 0 {
                     row.write_register = FE::one();
@@ -241,24 +314,21 @@ impl CpuTableRow {
                 row.rd = FE::from(&dst);
                 row.rs1 = FE::zero();
                 row.rs2 = FE::zero();
-                row.imm = u32_to_2_limbs(imm << 12);
-                row.arg2 = u32_to_2_limbs(imm << 12);
-                if dst != 0 {
-                    row.write_register = FE::one();
-                }
+                row.imm = u32_to_2_limbs(imm);
+                row.arg2 = u32_to_2_limbs(imm);
+                row.write_register = FE::one();
             }
 
             Instruction::AddUpperImmToPc { dst, imm } => {
                 row.add = FE::one();
                 row.rd = FE::from(&dst);
+                // TODO: Revisar.
                 row.rs1 = FE::from(&255u32);
                 row.rs2 = FE::zero();
-                row.imm = u32_to_2_limbs(imm << 12);
-                row.arg2 = u32_to_2_limbs(imm << 12);
+                row.imm = u32_to_2_limbs(imm);
+                row.arg2 = u32_to_2_limbs(imm);
                 row.rv1 = u32_to_4_limbs(log.current_pc);
-                if dst != 0 {
-                    row.write_register = FE::one();
-                }
+                row.write_register = FE::one();
             }
         }
         row
