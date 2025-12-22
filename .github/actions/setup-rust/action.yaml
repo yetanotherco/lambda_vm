@@ -13,6 +13,7 @@ runs:
 
     - name: Install Rust
       if: steps.rust-cache.outputs.cache-hit != 'true'
+      shell: bash
       run: |
         git clone https://github.com/rust-lang/rust.git
         cd rust
@@ -27,6 +28,7 @@ runs:
         ./x.py build && ./x.py install
     
     - name: Add Rust to PATH
+      shell: bash
       run: echo "$HOME/lambda_rust/usr/local/bin" >> $GITHUB_PATH
 
     - name: Upload Rust toolchain artifact
