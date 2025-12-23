@@ -99,5 +99,5 @@ deps-linux:
 
 .PHONY: deps-macos
 deps-macos:
-	brew tap riscv-software-src/riscv       
+	brew tap riscv-software-src/riscv
 	brew install riscv-software-src/riscv/riscv-gnu-toolchain

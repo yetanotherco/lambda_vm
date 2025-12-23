@@ -55,3 +55,7 @@ jobs:
       - name: Run rust tests
         run: |
           cd executor && make test-rust
+
+      - name: Run prover tests
+        run: |
+          cd prover && cargo test
