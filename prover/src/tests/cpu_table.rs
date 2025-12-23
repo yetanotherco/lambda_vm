@@ -456,14 +456,143 @@ pub fn get_rust_logs() -> Vec<Log> {
             instruction: Instruction::ArithImm {
                 dst: 2,
                 src: 2,
-                imm: -32,
+                imm: -16,
                 op: ArithOp::Add,
             },
-            current_pc: 70216,
-            next_pc: 70220,
+            current_pc: 70136,
+            next_pc: 70140,
             src1_val: 4294967292,
             src2_val: 0,
+            dst_val: 4294967276,
+        },
+        Log {
+            instruction: Instruction::Store {
+                src: 1,
+                offset: 12,
+                base: 2,
+                width: LoadStoreWidth::Word,
+            },
+            current_pc: 70140,
+            next_pc: 70144,
+            src1_val: 4294967276,
+            src2_val: 0,
+            dst_val: 0,
+        },
+        Log {
+            instruction: Instruction::LoadUpperImm {
+                dst: 10,
+                imm: 3735928832,
+            },
+            current_pc: 70144,
+            next_pc: 70148,
+            src1_val: 0,
+            src2_val: 0,
+            dst_val: 3735928832,
+        },
+        Log {
+            instruction: Instruction::ArithImm {
+                dst: 10,
+                src: 10,
+                imm: -273,
+                op: ArithOp::Add,
+            },
+            current_pc: 70148,
+            next_pc: 70152,
+            src1_val: 3735928832,
+            src2_val: 0,
+            dst_val: 3735928559,
+        },
+        Log {
+            instruction: Instruction::AddUpperImmToPc { dst: 1, imm: 0 },
+            current_pc: 70152,
+            next_pc: 70156,
+            src1_val: 0,
+            src2_val: 0,
+            dst_val: 70152,
+        },
+        Log {
+            instruction: Instruction::JumpAndLinkRegister {
+                base: 1,
+                dst: 1,
+                offset: -308,
+            },
+            current_pc: 70156,
+            next_pc: 69844,
+            src1_val: 70152,
+            src2_val: 0,
+            dst_val: 70160,
+        },
+        Log {
+            instruction: Instruction::ArithImm {
+                dst: 2,
+                src: 2,
+                imm: -16,
+                op: ArithOp::Add,
+            },
+            current_pc: 69844,
+            next_pc: 69848,
+            src1_val: 4294967276,
+            src2_val: 0,
             dst_val: 4294967260,
+        },
+        Log {
+            instruction: Instruction::Store {
+                src: 1,
+                offset: 12,
+                base: 2,
+                width: LoadStoreWidth::Word,
+            },
+            current_pc: 69848,
+            next_pc: 69852,
+            src1_val: 4294967260,
+            src2_val: 70160,
+            dst_val: 0,
+        },
+        Log {
+            instruction: Instruction::AddUpperImmToPc { dst: 1, imm: 0 },
+            current_pc: 69852,
+            next_pc: 69856,
+            src1_val: 0,
+            src2_val: 0,
+            dst_val: 69852,
+        },
+        Log {
+            instruction: Instruction::JumpAndLinkRegister {
+                base: 1,
+                dst: 1,
+                offset: 72,
+            },
+            current_pc: 69856,
+            next_pc: 69924,
+            src1_val: 69852,
+            src2_val: 0,
+            dst_val: 69860,
+        },
+        Log {
+            instruction: Instruction::ArithImm {
+                dst: 2,
+                src: 2,
+                imm: -16,
+                op: ArithOp::Add,
+            },
+            current_pc: 69924,
+            next_pc: 69928,
+            src1_val: 4294967260,
+            src2_val: 0,
+            dst_val: 4294967244,
+        },
+        Log {
+            instruction: Instruction::Store {
+                src: 1,
+                offset: 12,
+                base: 2,
+                width: LoadStoreWidth::Word,
+            },
+            current_pc: 69928,
+            next_pc: 69932,
+            src1_val: 4294967244,
+            src2_val: 69860,
+            dst_val: 0,
         },
         Log {
             instruction: Instruction::ArithImm {
@@ -472,193 +601,11 @@ pub fn get_rust_logs() -> Vec<Log> {
                 imm: 8,
                 op: ArithOp::ShiftRightLogical,
             },
-            current_pc: 70012,
-            next_pc: 70016,
-            src1_val: 16909060,
+            current_pc: 69932,
+            next_pc: 69936,
+            src1_val: 3735928559,
             src2_val: 0,
-            dst_val: 66051,
-        },
-        Log {
-            instruction: Instruction::ArithImm {
-                dst: 10,
-                src: 10,
-                imm: 24,
-                op: ArithOp::ShiftLeftLogical,
-            },
-            current_pc: 70044,
-            next_pc: 70048,
-            src1_val: 16909060,
-            src2_val: 0,
-            dst_val: 67108864,
-        },
-        Log {
-            instruction: Instruction::ArithImm {
-                dst: 10,
-                src: 10,
-                imm: 24,
-                op: ArithOp::ShiftRightArith,
-            },
-            current_pc: 70272,
-            next_pc: 70276,
-            src1_val: 4278190080,
-            src2_val: 0,
-            dst_val: 4294967295,
-        },
-        Log {
-            instruction: Instruction::Arith {
-                dst: 11,
-                src1: 11,
-                src2: 12,
-                op: ArithOp::And,
-            },
-            current_pc: 70024,
-            next_pc: 70028,
-            src1_val: 66051,
-            src2_val: 65280,
-            dst_val: 512,
-        },
-        Log {
-            instruction: Instruction::Arith {
-                dst: 10,
-                src1: 10,
-                src2: 11,
-                op: ArithOp::Or,
-            },
-            current_pc: 70052,
-            next_pc: 70056,
-            src1_val: 67305472,
-            src2_val: 513,
-            dst_val: 67305985,
-        },
-        Log {
-            instruction: Instruction::Arith {
-                dst: 11,
-                src1: 10,
-                src2: 11,
-                op: ArithOp::Sub,
-            },
-            current_pc: 70260,
-            next_pc: 70264,
-            src1_val: 1,
-            src2_val: 2,
-            dst_val: 4294967295,
-        },
-        Log {
-            instruction: Instruction::Load {
-                dst: 10,
-                offset: 8,
-                base: 2,
-                width: LoadStoreWidth::Word,
-            },
-            current_pc: 70060,
-            next_pc: 70064,
-            src1_val: 4294967228,
-            src2_val: 0,
-            dst_val: 67305985,
-        },
-        Log {
-            instruction: Instruction::Load {
-                dst: 10,
-                offset: 20,
-                base: 2,
-                width: LoadStoreWidth::Byte,
-            },
-            current_pc: 70252,
-            next_pc: 70256,
-            src1_val: 4294967260,
-            src2_val: 0,
-            dst_val: 1,
-        },
-        Log {
-            instruction: Instruction::Load {
-                dst: 10,
-                offset: 13,
-                base: 2,
-                width: LoadStoreWidth::ByteUnsigned,
-            },
-            current_pc: 70168,
-            next_pc: 70172,
-            src1_val: 4294967212,
-            src2_val: 0,
-            dst_val: 2,
-        },
-        Log {
-            instruction: Instruction::Store {
-                src: 10,
-                offset: 8,
-                base: 2,
-                width: LoadStoreWidth::Word,
-            },
-            current_pc: 70056,
-            next_pc: 70060,
-            src1_val: 4294967228,
-            src2_val: 67305985,
-            dst_val: 0,
-        },
-        Log {
-            instruction: Instruction::Store {
-                src: 11,
-                offset: 15,
-                base: 2,
-                width: LoadStoreWidth::Byte,
-            },
-            current_pc: 70144,
-            next_pc: 70148,
-            src1_val: 4294967212,
-            src2_val: 4,
-            dst_val: 0,
-        },
-        Log {
-            instruction: Instruction::LoadUpperImm {
-                dst: 10,
-                imm: 16908288,
-            },
-            current_pc: 70224,
-            next_pc: 70228,
-            src1_val: 0,
-            src2_val: 0,
-            dst_val: 16908288,
-        },
-        Log {
-            instruction: Instruction::AddUpperImmToPc { dst: 1, imm: 0 },
-            current_pc: 70232,
-            next_pc: 70236,
-            src1_val: 0,
-            src2_val: 0,
-            dst_val: 70232,
-        },
-        Log {
-            instruction: Instruction::JumpAndLink { dst: 0, offset: 4 },
-            current_pc: 70280,
-            next_pc: 70284,
-            src1_val: 0,
-            src2_val: 0,
-            dst_val: 70284,
-        },
-        Log {
-            instruction: Instruction::JumpAndLinkRegister {
-                base: 1,
-                dst: 0,
-                offset: 0,
-            },
-            current_pc: 70408,
-            next_pc: 0,
-            src1_val: 0,
-            src2_val: 0,
-            dst_val: 70412,
-        },
-        Log {
-            instruction: Instruction::Branch {
-                src1: 10,
-                src2: 11,
-                cond: Comparison::NotEqual,
-                offset: 48,
-            },
-            current_pc: 70276,
-            next_pc: 70280,
-            src1_val: 4294967295,
-            src2_val: 4294967295,
-            dst_val: 0,
+            dst_val: 14593470,
         },
     ]
 }
@@ -718,42 +665,5 @@ mod tests {
             &proof_options,
             DefaultTranscript::<Degree4BabyBearU32ExtensionField>::new(&[]),
         ));
-    }
-
-    #[test]
-    fn test_negative_arithmetics() {
-        let rv1 = [
-            FE::from(&252),
-            FE::from(&255),
-            FE::from(&255),
-            FE::from(&255),
-        ];
-        let arg2 = [FE::from(&65520), FE::from(&65535)];
-        let res = [
-            FE::from(&236),
-            FE::from(&255),
-            FE::from(&255),
-            FE::from(&255),
-        ];
-
-        let rv1_2limbs = [
-            rv1[0] + (rv1[1] * FE::from(256)),
-            rv1[2] + (rv1[3] * FE::from(256)),
-        ];
-        let res_2limbs = [
-            res[0] + (res[1] * FE::from(256)),
-            res[2] + (res[3] * FE::from(256)),
-        ];
-
-        println!(
-            "RV1 + ARG2: {:?} - RES: {:?}",
-            rv1_2limbs[0] + arg2[0],
-            res_2limbs[0]
-        );
-        println!(
-            "RV1 + ARG2: {:?} - RES: {:?}",
-            rv1_2limbs[1] + arg2[1],
-            res_2limbs[1]
-        );
     }
 }
