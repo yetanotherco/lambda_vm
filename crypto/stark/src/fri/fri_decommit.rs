@@ -1,6 +1,6 @@
-use lambdaworks_crypto::merkle_tree::proof::Proof;
-use lambdaworks_math::field::element::FieldElement;
-use lambdaworks_math::field::traits::IsField;
+use crypto::merkle_tree::proof::Proof;
+use math::field::element::FieldElement;
+use math::field::traits::IsField;
 
 use crate::config::Commitment;
 

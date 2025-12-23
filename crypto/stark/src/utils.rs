@@ -1,5 +1,5 @@
-use lambdaworks_crypto::merkle_tree::proof::Proof;
-use lambdaworks_math::errors::DeserializationError;
+use crypto::merkle_tree::proof::Proof;
+use math::errors::DeserializationError;
 
 use super::config::Commitment;
 

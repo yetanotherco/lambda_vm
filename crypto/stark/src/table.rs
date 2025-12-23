@@ -1,5 +1,5 @@
 use crate::frame::Frame;
-use lambdaworks_math::field::{
+use math::field::{
     element::FieldElement,
     traits::{IsField, IsSubFieldOf},
 };

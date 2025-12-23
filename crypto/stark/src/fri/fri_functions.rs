@@ -1,5 +1,5 @@
 use super::Polynomial;
-use lambdaworks_math::{
+use math::{
     field::{element::FieldElement, traits::IsField},
     polynomial,
 };
@@ -32,11 +32,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::fold_polynomial;
-    use lambdaworks_math::field::element::FieldElement;
-    use lambdaworks_math::field::fields::u64_prime_field::U64PrimeField;
+    use math::field::element::FieldElement;
+    use math::field::fields::u64_prime_field::U64PrimeField;
     const MODULUS: u64 = 293;
     type FE = FieldElement<U64PrimeField<MODULUS>>;
-    use lambdaworks_math::polynomial::Polynomial;
+    use math::polynomial::Polynomial;
 
     #[test]
     fn test_fold() {
