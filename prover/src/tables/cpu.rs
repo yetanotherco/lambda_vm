@@ -149,6 +149,7 @@ impl CpuTableRow {
                 row.rd = FE::from(&dst);
                 row.rs1 = FE::from(&base);
                 row.imm = i32_to_2_limbs(offset);
+                row.arg2 = i32_to_2_limbs(offset);
                 if dst != 0 {
                     row.write_register = FE::one();
                 }
