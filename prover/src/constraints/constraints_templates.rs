@@ -8,7 +8,7 @@ use stark_platinum_prover::{
     constraints::transition::TransitionConstraint, traits::TransitionEvaluationContext,
 };
 
-use crate::air::utils::{
+use crate::constraints::utils::{
     compute_element_from_two_limbs_starting_at,
     compute_element_from_two_limbs_starting_at_extension,
 };
