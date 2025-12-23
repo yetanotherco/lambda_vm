@@ -373,9 +373,7 @@ fn parse_i_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, 
         },
         Opcode::System => {
             match func3 {
-                ECALL_EBREAK_FUNC_IDENTIFIER => {
-                    Instruction::EcallEbreak
-                }
+                ECALL_EBREAK_FUNC_IDENTIFIER => Instruction::EcallEbreak,
                 CSRRCI_FUNC_IDENTIFIER => Instruction::CSR {
                     csr,
                     src: rd,

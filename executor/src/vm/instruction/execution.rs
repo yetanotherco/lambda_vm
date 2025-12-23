@@ -217,7 +217,7 @@ impl Instruction {
                 let len = registers.read(11)?;
                 let mut bytes = vec![];
                 for i in 0..len {
-                   bytes.push(memory.load_byte(pointer + i) as u8);
+                    bytes.push(memory.load_byte(pointer + i));
                 }
                 let value = str::from_utf8(&bytes).unwrap();
                 println!("PRINT VM: {}", value);
