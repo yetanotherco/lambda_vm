@@ -193,6 +193,7 @@ pub enum Instruction {
         dst: u32,
         op: CsrOp,
     },
+    EcallEbreak,
 }
 
 const OPCODE_MASK: u32 = 0x0000007f;
@@ -373,7 +374,7 @@ fn parse_i_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, 
         Opcode::System => {
             match func3 {
                 ECALL_EBREAK_FUNC_IDENTIFIER => {
-                    return Err(InstructionError::InvalidSystemInstruction(func3));
+                    Instruction::EcallEbreak
                 }
                 CSRRCI_FUNC_IDENTIFIER => Instruction::CSR {
                     csr,
