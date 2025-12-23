@@ -150,7 +150,7 @@ Total weeks: 80
 
 - Diego
 - Manuel
-- 3MILabs (Cyprien, Robin y Erik)
+- 3MILabs (Cyprien, Robin, and Erik)
 
 #### Implementation
 - Mauro
