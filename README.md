@@ -76,26 +76,6 @@ You can run it with
 
 This project is under active development. Our primary objective is to have a first working version for the virtual machine. The first roadmap for the project can be found [here](./docs/roadmap.md). Priorities and features might change as we continue developing.
 
-### Teams
-
-#### Theory
-
-- Diego
-- Manuel
-- 3MILabs (Cyprien, Robin y Erik)
-
-#### Applied cryptography
-
-- Colo
-- Juan
-- Nicole
-
-#### Engineering
-
-- Mauro
-- Federica
-- Gianluca
-
 #### Milestones
 
 - v0: VM that can prove fibonacci with lookups
@@ -109,12 +89,16 @@ Total weeks: 80
 
 ### Executor
 
+#### Engineering
+- Mauro
+- Gianluca
+
 **Total estimated duration:** 16 weeks
 
 | Feature                     | Description                        | Status       | Duration | Version |
 |---------------------------- |------------------------------------|--------------| ---------| ------- |
 | Documentation               | Explain how the executor works     | In progress  |  1 weeks | all versions |
-| 32-bits CPU                 | CPU with all operations | Done | 1 week | v0 |
+| 32-bits CPU                 | CPU with all operations | Done | - | v0 |
 | Public Inputs / Private Inputs | Support for public and private inputs in the VM | planned | 2 weeks | v1 |
 | STD Support                 | Implement all STD operations, compile get_rand | Planned | 3 weeks | v1 |
 | System instructions | `ecall`, `ebreak` | Planned | 1 week | v2 |
@@ -132,6 +116,11 @@ Total weeks: 80
 *few operations remain to be implemented
 
 ### Trace and Constraints generator
+
+#### Engineering
+- Mauro
+- Federica
+- Colo
 
 **Total estimated duration:** 37 weeks
 
@@ -158,6 +147,17 @@ Total weeks: 80
 | Syscall - Pairing / FP | Table for pairings | Planned | 3 weeks | v2 |
 
 ### Core Proof system
+
+#### Theory
+
+- Diego
+- Manuel
+- 3MILabs (Cyprien, Robin y Erik)
+
+#### Implementation
+- Mauro
+- Juan
+- Nicole
 
 **Total estimated duration:** 18 weeks
 
