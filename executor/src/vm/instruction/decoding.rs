@@ -193,6 +193,7 @@ pub enum Instruction {
         dst: u32,
         op: CsrOp,
     },
+    EcallEbreak,
 }
 
 const OPCODE_MASK: u32 = 0x0000007f;
@@ -313,7 +314,7 @@ fn parse_i_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, 
     let csr = (instruction >> 20) & I_TYPE_IMM_MASK;
     let imm = csr as i32;
     let mut imm: i32 = if (instruction & SIGN_MASK) != 0 {
-        imm - (1 << 11)
+        imm.wrapping_sub(1 << 11)
     } else {
         imm
     };
@@ -372,9 +373,7 @@ fn parse_i_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, 
         },
         Opcode::System => {
             match func3 {
-                ECALL_EBREAK_FUNC_IDENTIFIER => {
-                    return Err(InstructionError::InvalidSystemInstruction(func3));
-                }
+                ECALL_EBREAK_FUNC_IDENTIFIER => Instruction::EcallEbreak,
                 CSRRCI_FUNC_IDENTIFIER => Instruction::CSR {
                     csr,
                     src: rd,
@@ -387,10 +386,13 @@ fn parse_i_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, 
                     dst: rs1,
                     op: CsrOp::CSRRS,
                 },
-                CSRRW_FUNC_IDENTIFIER
-                | CSRRC_FUNC_IDENTIFIER
-                | CSRRWI_FUNC_IDENTIFIER
-                | CSRRSI_FUNC_IDENTIFIER => {
+                CSRRW_FUNC_IDENTIFIER => Instruction::CSR {
+                    csr,
+                    src: rd,
+                    dst: rs1,
+                    op: CsrOp::CSRRW,
+                },
+                CSRRC_FUNC_IDENTIFIER | CSRRWI_FUNC_IDENTIFIER | CSRRSI_FUNC_IDENTIFIER => {
                     // For now, we do not support these CSR instructions
                     return Err(InstructionError::InvalidSystemInstruction(func3));
                 }
@@ -442,7 +444,7 @@ fn parse_b_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, 
         | ((instruction >> 7) & 0x1e)
         | ((instruction & 0x80) << 4)) as i32;
     let imm: i32 = if (instruction & SIGN_MASK) != 0 {
-        imm + 0xFFFFF000u32 as i32
+        imm.wrapping_add(0xFFFFF000u32 as i32)
     } else {
         imm
     };
@@ -475,7 +477,7 @@ fn parse_j_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, 
     let imm =
         instruction & 0xff000 | ((instruction & 0x100000) >> 9) | ((instruction >> 20) & 0x7fe);
     let imm: i32 = if (instruction & SIGN_MASK) != 0 {
-        imm as i32 - (1 << 20)
+        (imm as i32).wrapping_sub(1 << 20)
     } else {
         imm as i32
     };

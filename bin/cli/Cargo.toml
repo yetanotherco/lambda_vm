@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 executor = { path = "../../executor" }
+clap = { version = "4.3.10", features = ["derive"] }
