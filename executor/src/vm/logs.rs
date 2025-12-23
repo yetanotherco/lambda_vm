@@ -6,6 +6,7 @@ use crate::vm::instruction::decoding::Instruction;
 /// In case of JALR instruction: value of base will be at src1_val
 /// In case of Store instruction: value of base will be at src1_val and value to be stored will be at src2_val
 /// In case of Load instruction: value of base will be at src1_val
+#[derive(Debug, Clone)]
 pub struct Log {
     /// Executed Instruction
     pub instruction: Instruction,

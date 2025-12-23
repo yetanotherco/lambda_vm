@@ -215,6 +215,7 @@ impl CpuTableRow {
                 row.rs2 = FE::from(&src2);
                 row.imm = u32_to_2_limbs(offset as u32);
                 row.arg2 = u32_to_2_limbs(log.src2_val);
+                row.res = u32_to_4_limbs(log.src1_val.wrapping_sub(log.src2_val));
                 match cond {
                     Comparison::Equal => row.beq = FE::one(),
                     Comparison::NotEqual => {
