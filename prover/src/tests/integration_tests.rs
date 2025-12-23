@@ -15,8 +15,6 @@ pub fn run_program_and_prover(elf_path: &str) {
     let (_results, logs) =
         run_program(program.image, program.entry_point).expect("Failed to run program");
 
-    println!("Logs: {:?}", logs);
-
     let mut trace = cpu_trace_from_logs(logs);
 
     let proof_options = ProofOptions::default_test_options();
