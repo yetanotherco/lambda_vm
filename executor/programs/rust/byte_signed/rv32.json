@@ -1,0 +1,25 @@
+{
+  "arch": "riscv32",
+  "cpu": "generic-rv32",
+  "crt-objects-fallback": "false",
+  "data-layout": "e-m:e-p:32:32-i64:64-n32-S128",
+  "eh-frame-header": false,
+  "emit-debug-gdb-scripts": false,
+  "features": "+m",
+  "linker": "rust-lld",
+  "linker-flavor": "gnu-lld",
+  "llvm-abiname": "ilp32",
+  "llvm-target": "riscv32",
+  "max-atomic-width": 64,
+  "metadata": {
+    "description": "LambdaVM",
+    "host_tools": false,
+    "std": null,
+    "tier": 3
+  },
+  "os": "zkvm",
+  "panic-strategy": "abort",
+  "relocation-model": "static",
+  "singlethread": true,
+  "target-pointer-width": 32
+}
