@@ -82,8 +82,15 @@ impl ElfProgram {
         let phentsize = ehdr.e_phentsize as usize;
         let phnum = ehdr.e_phnum as usize;
         for i in 0..phnum {
-            let offset = phoff + i * phentsize;
-            let phdr = ProgramHeader::parse(&input[offset..offset + phentsize])?;
+            let offset = phoff
+                .checked_add(i.checked_mul(phentsize).ok_or(ElfError::InvalidProgram)?)
+                .ok_or(ElfError::InvalidProgram)?;
+            let phdr = ProgramHeader::parse(
+                &input[offset
+                    ..offset
+                        .checked_add(phentsize)
+                        .ok_or(ElfError::InvalidProgram)?],
+            )?;
             phdrs.push(phdr);
         }
         Ok(phdrs)
@@ -214,6 +221,8 @@ pub enum ElfError {
     Casting,
     #[error("Program Header size is invalid")]
     ProgramHeaderSize,
+    #[error("Invalid program")]
+    InvalidProgram,
 }
 
 impl Elf {
@@ -250,11 +259,23 @@ impl Elf {
                     image.insert(addr, 0);
                 } else {
                     let mut word = 0;
-                    let len = (program_header.p_filesz - i).min(WORD_SIZE);
+                    let len = (program_header
+                        .p_filesz
+                        .checked_sub(i)
+                        .ok_or(ElfError::InvalidProgram)?)
+                    .min(WORD_SIZE);
                     for j in 0..len {
-                        let offset = (program_header.p_offset + i + j) as usize;
+                        let offset = (program_header
+                            .p_offset
+                            .checked_add(i)
+                            .ok_or(ElfError::InvalidProgram)?
+                            .checked_add(j)
+                            .ok_or(ElfError::InvalidProgram)?)
+                            as usize;
                         let byte = input.get(offset).ok_or(ElfError::InvalidOffset)?;
-                        word |= (*byte as u32) << (j * 8);
+                        word |= (*byte as u32)
+                            .checked_shl(j.checked_mul(8).ok_or(ElfError::InvalidProgram)?)
+                            .ok_or(ElfError::InvalidProgram)?;
                     }
                     image.insert(addr, word);
                 }

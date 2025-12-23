@@ -18,20 +18,27 @@ impl Default for Registers {
 
 impl Registers {
     /// Read the current value of the given register
-    pub fn read(&self, register: u32) -> u32 {
+    pub fn read(&self, register: u32) -> Result<u32, RegisterError> {
+        if register > 31 {
+            return Err(RegisterError::InvalidRegister(register));
+        }
         if register == 0 {
-            0
+            Ok(0)
         } else {
-            self.0[register as usize - 1]
+            Ok(self.0[register as usize - 1])
         }
     }
 
     /// Update the value of the given register
     /// Writes to register zero are a no-op
-    pub fn write(&mut self, register: u32, value: u32) {
+    pub fn write(&mut self, register: u32, value: u32) -> Result<(), RegisterError> {
+        if register > 31 {
+            return Err(RegisterError::InvalidRegister(register));
+        }
         if register != 0 {
             self.0[register as usize - 1] = value
         }
+        Ok(())
     }
 
     /// Read the return values (aka registers a0 & a1)
@@ -56,4 +63,10 @@ impl Display for Registers {
             .join(", ");
         writeln!(f, "[{}]", registers)
     }
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum RegisterError {
+    #[error("Invalid register number: {0}")]
+    InvalidRegister(u32),
 }
