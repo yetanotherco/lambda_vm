@@ -138,9 +138,7 @@ impl CpuTableRow {
             Instruction::JumpAndLink { dst, offset } => {
                 row.jalr = FE::one();
                 row.rd = FE::from(&dst);
-                // TODO: Check PC index = 255.
-                row.rs1 = FE::from(&255u32);
-                row.imm = u32_to_2_limbs(offset as u32);
+                row.imm = i32_to_2_limbs(offset);
                 if dst != 0 {
                     row.write_register = FE::one();
                 }
@@ -150,8 +148,7 @@ impl CpuTableRow {
                 row.jalr = FE::one();
                 row.rd = FE::from(&dst);
                 row.rs1 = FE::from(&base);
-                row.imm = u32_to_2_limbs(offset as u32);
-                row.arg2 = u32_to_2_limbs(log.src1_val);
+                row.imm = i32_to_2_limbs(offset);
                 if dst != 0 {
                     row.write_register = FE::one();
                 }
