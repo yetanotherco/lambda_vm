@@ -30,15 +30,9 @@ runs:
         [build]
         docs = false
         EOF
-        export DESTDIR="$HOME/lambda_rust"
         ./x.py build --stage 1
+        DESTDIR="$HOME/lambda_rust" ./x.py install --stage 1
     
     - name: Add Rust to PATH
       shell: bash
       run: echo "$HOME/lambda_rust/usr/local/bin" >> $GITHUB_PATH
-
-    - name: Upload Rust toolchain artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: rust-toolchain
-        path: $HOME/lambda_rust
