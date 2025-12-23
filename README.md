@@ -113,8 +113,6 @@ Total weeks: 80
 | Perf tools for guest programs | Flamegraphs, cycle counts, and tools to optimize guests | Planned | 2 weeks | v2 |
 | RISCV64IM CPU               | Migration to 64 bits | Planned | 1 week | ??? |
 
-*few operations remain to be implemented
-
 ### Trace and Constraints generator
 
 #### Engineering
