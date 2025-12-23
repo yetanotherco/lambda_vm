@@ -104,13 +104,13 @@ Total weeks: 80
 | System instructions | `ecall`, `ebreak` | Planned | 1 week | v2 |
 | CPU with coprocessors       | Add coprocessors for special cryptographic operations   | Planned | 1 week | v2 |
 | Big Integer arithmetic | Big integer arithmetic syscall | Planned | 3 days | v2 |
-| Elliptic curve addition | EC operations syscall | Planned | 3 days  | v3 |
-| Poseidon hash | Poseidon hash syscall | Planned | 3 days | v3 |
-| Keccak hash | Keccak hash syscall | Planned | 3 days | v3 |
-| SHA256 | SHA 256 syscall | Planned | 3 days | v3 |
-| Pairing | Table for pairings | Planned | 3 days | v3 |
-| Recursion Experiments | Try naive recursion, and explore how it behaves | Planned | 1 week | v3 |
-| Perf tools for guest programs | Flamegraphs, cycle counts, and tools to optimize guests | Planned | 2 weeks | v3 |
+| Elliptic curve addition | EC operations syscall | Planned | 3 days  | v2 |
+| Poseidon hash | Poseidon hash syscall | Planned | 3 days | v2 |
+| Keccak hash | Keccak hash syscall | Planned | 3 days | v2 |
+| SHA256 | SHA 256 syscall | Planned | 3 days | v2 |
+| Pairing | Table for pairings | Planned | 3 days | v2 |
+| Recursion Experiments | Try naive recursion, and explore how it behaves | Planned | 1 week | v2 |
+| Perf tools for guest programs | Flamegraphs, cycle counts, and tools to optimize guests | Planned | 2 weeks | v2 |
 | RISCV64IM CPU               | Migration to 64 bits | Planned | 1 week | ??? |
 
 *few operations remain to be implemented
