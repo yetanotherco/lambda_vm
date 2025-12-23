@@ -3,7 +3,7 @@ use crypto::{
     hash::sha3::Sha3Hasher,
     merkle_tree::{backends::field_element::FieldElementBackend, merkle::MerkleTree},
 };
-use lambdaworks_math::{
+use math::{
     field::element::FieldElement,
     field::fields::fft_friendly::stark_252_prime_field::Stark252PrimeField,
 };

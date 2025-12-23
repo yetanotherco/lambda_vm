@@ -8,7 +8,7 @@ use crate::{
     trace::TraceTable,
     traits::{AIR, TransitionEvaluationContext},
 };
-use lambdaworks_math::{
+use math::{
     field::{element::FieldElement, traits::IsFFTField},
     traits::AsBytes,
 };
@@ -266,7 +266,7 @@ pub fn compute_trace<F: IsFFTField>(
 
 #[cfg(test)]
 mod tests {
-    use lambdaworks_math::field::{
+    use math::field::{
         element::FieldElement, fields::fft_friendly::stark_252_prime_field::Stark252PrimeField,
     };
 

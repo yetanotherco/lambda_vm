@@ -1,7 +1,7 @@
 use super::traits::IsCommitmentScheme;
 use alloc::{borrow::ToOwned, vec::Vec};
 use core::{marker::PhantomData, mem};
-use lambdaworks_math::{
+use math::{
     cyclic_group::IsGroup,
     elliptic_curve::traits::IsPairing,
     errors::DeserializationError,
@@ -277,7 +277,7 @@ impl<const N: usize, F: IsPrimeField<RepresentativeType = UnsignedInteger<N>>, P
 mod tests {
     use alloc::vec::Vec;
     use core::slice;
-    use lambdaworks_math::{
+    use math::{
         cyclic_group::IsGroup,
         elliptic_curve::{
             short_weierstrass::{

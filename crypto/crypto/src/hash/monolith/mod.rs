@@ -1,7 +1,5 @@
 use alloc::vec::Vec;
-use lambdaworks_math::field::{
-    fields::mersenne31::field::MERSENNE_31_PRIME_FIELD_ORDER, traits::IsField,
-};
+use math::field::{fields::mersenne31::field::MERSENNE_31_PRIME_FIELD_ORDER, traits::IsField};
 use sha3::{
     Shake128, Shake128Reader,
     digest::{ExtendableOutput, Update},

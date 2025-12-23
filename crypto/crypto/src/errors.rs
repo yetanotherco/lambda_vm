@@ -1,14 +1,14 @@
 use std::io;
 
-use lambdaworks_math::errors::DeserializationError;
+use math::errors::DeserializationError;
 
 #[derive(Debug)]
 pub enum SrsFromFileError {
     FileError(io::Error),
-    DeserializationError(lambdaworks_math::errors::DeserializationError),
+    DeserializationError(math::errors::DeserializationError),
 }
 
-impl From<lambdaworks_math::errors::DeserializationError> for SrsFromFileError {
+impl From<math::errors::DeserializationError> for SrsFromFileError {
     fn from(err: DeserializationError) -> SrsFromFileError {
         match err {
             DeserializationError::InvalidAmountOfBytes => {

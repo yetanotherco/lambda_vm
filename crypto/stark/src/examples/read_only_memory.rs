@@ -11,8 +11,8 @@ use crate::{
     traits::{AIR, TransitionEvaluationContext},
 };
 use crypto::fiat_shamir::is_transcript::IsTranscript;
-use lambdaworks_math::field::traits::IsPrimeField;
-use lambdaworks_math::{
+use math::field::traits::IsPrimeField;
+use math::{
     field::{element::FieldElement, traits::IsFFTField},
     traits::ByteConversion,
 };
@@ -404,7 +404,7 @@ pub fn sort_rap_trace<F: IsFFTField + IsPrimeField>(
 #[cfg(test)]
 mod test {
     use super::*;
-    use lambdaworks_math::field::fields::u64_prime_field::FE17;
+    use math::field::fields::u64_prime_field::FE17;
 
     #[test]
     fn test_sort_rap_trace() {

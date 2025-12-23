@@ -10,7 +10,7 @@ use crate::{
     trace::TraceTable,
     traits::{AIR, TransitionEvaluationContext},
 };
-use lambdaworks_math::field::{element::FieldElement, traits::IsFFTField};
+use math::field::{element::FieldElement, traits::IsFFTField};
 
 #[derive(Clone)]
 struct QuadraticConstraint<F: IsFFTField> {

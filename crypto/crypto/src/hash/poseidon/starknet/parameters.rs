@@ -1,5 +1,5 @@
 use crate::hash::poseidon::PermutationParameters;
-use lambdaworks_math::field::{
+use math::field::{
     element::FieldElement as FE, fields::fft_friendly::stark_252_prime_field::Stark252PrimeField,
 };
 

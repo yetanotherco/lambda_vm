@@ -8,7 +8,7 @@ crate-type = ["cdylib", "rlib"]
 
 
 [dependencies]
-lambdaworks-math = {git = "https://github.com/lambdaclass/lambdaworks.git", features = [
+math = { path = "../math", features = [
     "std",
     "lambdaworks-serde-binary",
 ] }

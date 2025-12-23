@@ -1,6 +1,6 @@
 use crate::{table::TableView, trace::LDETraceTable};
 use itertools::Itertools;
-use lambdaworks_math::field::traits::{IsField, IsSubFieldOf};
+use math::field::traits::{IsField, IsSubFieldOf};
 
 /// A frame represents a collection of trace steps.
 /// The collected steps are all the necessary steps for

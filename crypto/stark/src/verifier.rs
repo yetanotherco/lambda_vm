@@ -8,7 +8,9 @@ use super::{
 };
 use crate::{config::Commitment, proof::stark::DeepPolynomialOpening};
 use crypto::{fiat_shamir::is_transcript::IsTranscript, merkle_tree::proof::Proof};
-use lambdaworks_math::{
+#[cfg(not(feature = "test_fiat_shamir"))]
+use log::error;
+use math::{
     fft::cpu::bit_reversing::reverse_index,
     field::{
         element::FieldElement,
@@ -16,8 +18,6 @@ use lambdaworks_math::{
     },
     traits::AsBytes,
 };
-#[cfg(not(feature = "test_fiat_shamir"))]
-use log::error;
 use std::marker::PhantomData;
 #[cfg(feature = "instruments")]
 use std::time::Instant;

@@ -1,5 +1,5 @@
 use alloc::{string::String, vec::Vec};
-use lambdaworks_math::{
+use math::{
     field::{
         element::FieldElement,
         fields::montgomery_backed_prime_fields::{IsModulus, MontgomeryBackendPrimeField},
@@ -69,7 +69,7 @@ fn build_two_to_the_nth<M: IsModulus<UnsignedInteger<N>> + Clone, const N: usize
 #[cfg(test)]
 mod tests {
     use alloc::vec::Vec;
-    use lambdaworks_math::{
+    use math::{
         field::{
             element::FieldElement,
             fields::montgomery_backed_prime_fields::{IsModulus, MontgomeryBackendPrimeField},

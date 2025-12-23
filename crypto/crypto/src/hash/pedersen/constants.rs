@@ -1,4 +1,4 @@
-use lambdaworks_math::elliptic_curve::short_weierstrass::{
+use math::elliptic_curve::short_weierstrass::{
     curves::stark_curve::StarkCurve, point::ShortWeierstrassProjectivePoint,
 };
 

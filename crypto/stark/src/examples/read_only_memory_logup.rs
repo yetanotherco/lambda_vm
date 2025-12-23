@@ -16,7 +16,7 @@ use crate::{
 };
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use itertools::Itertools;
-use lambdaworks_math::{
+use math::{
     field::{
         element::FieldElement,
         traits::{IsFFTField, IsField, IsPrimeField, IsSubFieldOf},
@@ -573,7 +573,7 @@ pub fn read_only_logup_trace<
 #[cfg(test)]
 mod test {
     use super::*;
-    use lambdaworks_math::field::fields::{
+    use math::field::fields::{
         fft_friendly::{
             babybear::Babybear31PrimeField, quartic_babybear::Degree4BabyBearExtensionField,
         },

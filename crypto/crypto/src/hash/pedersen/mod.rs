@@ -1,4 +1,4 @@
-use lambdaworks_math::{
+use math::{
     elliptic_curve::short_weierstrass::point::ShortWeierstrassProjectivePoint as Point,
     field::{
         element::FieldElement as FE,

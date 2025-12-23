@@ -1,5 +1,5 @@
 use crypto::merkle_tree::{merkle::MerkleTree, traits::IsMerkleTreeBackend};
-use lambdaworks_math::{
+use math::{
     field::{element::FieldElement, traits::IsField},
     traits::AsBytes,
 };
