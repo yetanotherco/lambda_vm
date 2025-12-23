@@ -1,12 +1,10 @@
-use lambdaworks_math::field::{
+use math::field::{
     element::FieldElement,
     fields::fft_friendly::{
         babybear_u32::Babybear31PrimeField, quartic_babybear_u32::Degree4BabyBearU32ExtensionField,
     },
 };
-use stark_platinum_prover::{
-    constraints::transition::TransitionConstraint, traits::TransitionEvaluationContext,
-};
+use stark::{constraints::transition::TransitionConstraint, traits::TransitionEvaluationContext};
 
 use crate::constraints::utils::{
     compute_element_from_two_limbs_starting_at,

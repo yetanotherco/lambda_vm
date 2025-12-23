@@ -3,13 +3,13 @@ use executor::vm::{
     instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth},
     logs::Log,
 };
-use lambdaworks_math::field::{
+use math::field::{
     element::FieldElement,
     fields::fft_friendly::{
         babybear_u32::Babybear31PrimeField, quartic_babybear_u32::Degree4BabyBearU32ExtensionField,
     },
 };
-use stark_platinum_prover::trace::TraceTable;
+use stark::trace::TraceTable;
 
 type FE = FieldElement<Babybear31PrimeField>;
 

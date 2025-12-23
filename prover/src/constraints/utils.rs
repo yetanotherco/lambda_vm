@@ -1,7 +1,7 @@
-use lambdaworks_math::field::fields::fft_friendly::{
+use math::field::fields::fft_friendly::{
     babybear_u32::Babybear31PrimeField, quartic_babybear_u32::Degree4BabyBearU32ExtensionField,
 };
-use stark_platinum_prover::{fri::FieldElement, table::TableView};
+use stark::{fri::FieldElement, table::TableView};
 
 lazy_static::lazy_static! {
     pub static ref TWO_FIFTY_SIX: FieldElement<Babybear31PrimeField> =
