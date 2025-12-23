@@ -133,7 +133,7 @@ Total weeks: 80
 
 ### Trace and Constraints generator
 
-**Total estimated duration:** 39 weeks
+**Total estimated duration:** 37 weeks
 
 ** This includes the linking with the executor
 
@@ -145,11 +145,11 @@ Total weeks: 80
 | Link decoder table and CPU | Use lookup to connect tables | Planned | 1 week | v0 |
 | Constraints for updating pc | Implement constraints for updating pc | In progress | 1 week | v0 |
 | ALU - Range checkers | Implement rangecheck for u16 and u8 | Planned | 2 week | v0 |
+| Memory                      | Implement memory table with constraints | Planned | 2 weeks | v0 |
 | ALU - Bitwise operations (and, xor, or) | Implement tables for u8 bitwise operations | Planned | 2 week | v1 |
 | ALU - Shift operations | Implement tables for shift operations | Planned | 2 week | v1 |
 | ALU - Multiplication table | Implement table for multiplication table | Planned | 2 week | v1 |
 | ALU - Division and remainder | Implement table for integer division operations | Planned | 2 week | v1 |
-| Memory                      | Implement memory table with constraints | Planned | 4 weeks | v1 |
 | Syscall - Initial - Big Integer arithmetic | Table for big integer arithmetic | Planned | 3 week |v2|
 | Syscall - Elliptic curve addition | Table for EC operations | Planned | 3 weeks  | v2|
 | Syscall - Poseidon hash | Table for Poseidon hash | Planned | 3 weeks | v2 |
@@ -167,7 +167,7 @@ Total weeks: 80
 | Lookup arguments            | Linking tables via lookup arguments | In progress | 2 weeks | v0 |
 | Lookup - I | Accept multitables | In progress | 1 week | v0 |
 | Lookup - II | Perform argument with constraints | In progress | 1 week | v0 |
-| Public input | Add public input using Lookup | Planned | 1 week | v1 |
+| Public input | Add public input using Lookup | Planned | 1 week | v0 |
 | Poseidon hash               | Adapt Poseidon for Goldilocks      | Planned      | 3 days   | v1 |
 | Multi-table Merkle trees (MTMT)   | Merkle tree that can be used to commit to polynomials of various sizes | In progress | 2 weeks | v2 |
 | Multi-FRI                   | Perform FRI using MTMT | Planned | 2 weeks | v2 |
