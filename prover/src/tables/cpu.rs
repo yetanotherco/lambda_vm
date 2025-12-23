@@ -262,6 +262,13 @@ impl CpuTableRow {
                 row.rv1 = u32_to_4_limbs(log.current_pc);
                 row.write_register = FE::one();
             }
+
+            Instruction::CSR {
+                csr: _,
+                src: _,
+                dst: _,
+                op: _,
+            } => {}
         }
         row
     }

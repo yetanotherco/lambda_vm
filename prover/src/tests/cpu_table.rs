@@ -1,4 +1,4 @@
-use executor::vm::instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth};
+use executor::vm::instruction::decoding::{ArithOp, Instruction, LoadStoreWidth};
 use executor::vm::logs::Log;
 use lambdaworks_math::field::{
     element::FieldElement, fields::fft_friendly::babybear_u32::Babybear31PrimeField,
