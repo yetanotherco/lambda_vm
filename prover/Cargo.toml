@@ -7,3 +7,4 @@ edition = "2024"
 stark = { path = "../crypto/stark" }
 crypto = { path = "../crypto/crypto" }
 math = { path = "../crypto/math" }
+executor = { path = "../executor" }

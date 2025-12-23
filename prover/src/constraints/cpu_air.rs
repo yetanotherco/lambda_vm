@@ -1,4 +1,4 @@
-use crate::air::constraints_templates::{
+use crate::constraints::constraints_templates::{
     new_add_constraint, new_add_four_constraint, new_bit_constraints, new_sub_constraint,
 };
 
@@ -19,7 +19,8 @@ use stark::{
 // CPU Columns indeces:
 // const TIMESTAMP: usize = 0;
 const PC: usize = 2;
-// const RS: usize = 4;
+// const RS1: usize = 4;
+// const RS2: usize = 5;
 // const RD: usize = 6;
 const WRITE_REGISTER: usize = 7;
 const MEMORY_2BYTES: usize = 8;
