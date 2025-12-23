@@ -101,7 +101,7 @@ Total weeks: 80
 | 32-bits CPU                 | CPU with all operations | Done | - | v0 |
 | Public Inputs / Private Inputs | Support for public and private inputs in the VM | planned | 2 weeks | v1 |
 | STD Support                 | Implement all STD operations, compile get_rand | Planned | 3 weeks | v1 |
-| System instructions | `ecall`, `ebreak` | Planned | 1 week | v2 |
+| System instructions | `ecall`, `ebreak` | Planned | 1 week | v1 |
 | CPU with coprocessors       | Add coprocessors for special cryptographic operations   | Planned | 1 week | v2 |
 | Big Integer arithmetic | Big integer arithmetic syscall | Planned | 3 days | v2 |
 | Elliptic curve addition | EC operations syscall | Planned | 3 days  | v2 |
