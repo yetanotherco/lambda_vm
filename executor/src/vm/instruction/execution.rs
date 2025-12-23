@@ -15,8 +15,6 @@ impl Instruction {
         registers: &mut Registers,
         memory: &mut Memory,
     ) -> Result<Log, ExecutionError> {
-        // println!("registers: {}", &registers);
-        // println!("Executing instruction at 0x{:08x}: {:?}", *pc, self);
         let log = self.execute(*pc, registers, memory)?;
         *pc = log.next_pc;
         Ok(log)
@@ -205,6 +203,26 @@ impl Instruction {
                     instruction: self,
                     current_pc: pc,
                     next_pc: pc.wrapping_add(REGULAR_PC_UPDATE),
+                    src1_val: 0,
+                    src2_val: 0,
+                    dst_val: 0,
+                }
+            }
+            Instruction::EcallEbreak => {
+                // For now this is just a mechanism to print
+                // It is not the correct implementation of ecall/ebreak
+                let pointer = registers.read(10)?;
+                let len = registers.read(11)?;
+                let mut bytes = vec![];
+                for i in 0..len {
+                    bytes.push(memory.load_byte(pointer + i));
+                }
+                let value = str::from_utf8(&bytes).unwrap();
+                println!("PRINT VM: {}", value);
+                Log {
+                    instruction: self,
+                    current_pc: pc,
+                    next_pc: pc + REGULAR_PC_UPDATE,
                     src1_val: 0,
                     src2_val: 0,
                     dst_val: 0,
