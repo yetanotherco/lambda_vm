@@ -8,3 +8,4 @@ stark = { path = "../crypto/stark" }
 crypto = { path = "../crypto/crypto" }
 math = { path = "../crypto/math" }
 executor = { path = "../executor" }
+lazy_static = "1.5.0"
