@@ -2,13 +2,11 @@ pub mod fri_commitment;
 pub mod fri_decommit;
 mod fri_functions;
 
-use lambdaworks_crypto::fiat_shamir::is_transcript::IsTranscript;
-use lambdaworks_math::field::traits::{IsFFTField, IsField};
-use lambdaworks_math::traits::AsBytes;
-use lambdaworks_math::{
-    fft::cpu::bit_reversing::in_place_bit_reverse_permute, field::traits::IsSubFieldOf,
-};
-pub use lambdaworks_math::{
+use crypto::fiat_shamir::is_transcript::IsTranscript;
+use math::field::traits::{IsFFTField, IsField};
+use math::traits::AsBytes;
+use math::{fft::cpu::bit_reversing::in_place_bit_reverse_permute, field::traits::IsSubFieldOf};
+pub use math::{
     field::{element::FieldElement, fields::u64_prime_field::U64PrimeField},
     polynomial::Polynomial,
 };

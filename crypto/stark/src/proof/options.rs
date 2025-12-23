@@ -1,5 +1,5 @@
 use super::errors::InsecureOptionError;
-use lambdaworks_math::field::traits::IsPrimeField;
+use math::field::traits::IsPrimeField;
 
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::wasm_bindgen;
@@ -156,7 +156,7 @@ impl ProofOptions {
 
 #[cfg(test)]
 mod tests {
-    use lambdaworks_math::field::fields::{
+    use math::field::fields::{
         fft_friendly::stark_252_prime_field::Stark252PrimeField, u64_prime_field::F17,
     };
 

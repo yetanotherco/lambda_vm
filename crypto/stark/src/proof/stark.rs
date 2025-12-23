@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use lambdaworks_crypto::merkle_tree::proof::Proof;
-use lambdaworks_math::{
+use crypto::merkle_tree::proof::Proof;
+use math::{
     field::{
         element::FieldElement,
         fields::fft_friendly::stark_252_prime_field::Stark252PrimeField,

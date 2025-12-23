@@ -2,17 +2,17 @@ use std::marker::PhantomData;
 #[cfg(feature = "instruments")]
 use std::time::Instant;
 
-use lambdaworks_crypto::fiat_shamir::is_transcript::IsTranscript;
-use lambdaworks_math::fft::cpu::bit_reversing::{in_place_bit_reverse_permute, reverse_index};
-use lambdaworks_math::fft::errors::FFTError;
+use crypto::fiat_shamir::is_transcript::IsTranscript;
+use math::fft::cpu::bit_reversing::{in_place_bit_reverse_permute, reverse_index};
+use math::fft::errors::FFTError;
 
-use lambdaworks_math::field::traits::{IsField, IsSubFieldOf};
-use lambdaworks_math::traits::AsBytes;
-use lambdaworks_math::{
+use log::info;
+use math::field::traits::{IsField, IsSubFieldOf};
+use math::traits::AsBytes;
+use math::{
     field::{element::FieldElement, traits::IsFFTField},
     polynomial::Polynomial,
 };
-use log::info;
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
@@ -1102,7 +1102,7 @@ mod tests {
     };
 
     use super::*;
-    use lambdaworks_math::{
+    use math::{
         field::{
             element::FieldElement, fields::fft_friendly::stark_252_prime_field::Stark252PrimeField,
             traits::IsFFTField,

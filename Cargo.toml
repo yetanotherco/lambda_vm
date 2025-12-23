@@ -3,6 +3,8 @@ members = [
   "executor",
   "prover",
   "crypto/stark",
+  "crypto/crypto",
+  "crypto/math",
   "bin/cli",
 ]
 

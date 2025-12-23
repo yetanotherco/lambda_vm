@@ -1,5 +1,5 @@
-use lambdaworks_crypto::fiat_shamir::is_transcript::IsTranscript;
-use lambdaworks_math::{
+use crypto::fiat_shamir::is_transcript::IsTranscript;
+use math::{
     field::{
         element::FieldElement, fields::fft_friendly::stark_252_prime_field::Stark252PrimeField,
         traits::IsFFTField,
@@ -146,7 +146,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use lambdaworks_math::field::{
+    use math::field::{
         element::FieldElement, fields::fft_friendly::stark_252_prime_field::Stark252PrimeField,
     };
 

@@ -7,8 +7,8 @@ use crate::traits::{AIR, TransitionEvaluationContext};
 use crate::{frame::Frame, prover::evaluate_polynomial_on_lde_domain};
 use itertools::Itertools;
 #[cfg(not(feature = "parallel"))]
-use lambdaworks_math::polynomial::Polynomial;
-use lambdaworks_math::{fft::errors::FFTError, field::element::FieldElement, traits::AsBytes};
+use math::polynomial::Polynomial;
+use math::{fft::errors::FFTError, field::element::FieldElement, traits::AsBytes};
 #[cfg(feature = "parallel")]
 use rayon::{
     iter::IndexedParallelIterator,

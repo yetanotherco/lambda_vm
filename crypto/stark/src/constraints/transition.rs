@@ -4,9 +4,9 @@ use crate::domain::Domain;
 use crate::prover::evaluate_polynomial_on_lde_domain;
 use crate::traits::TransitionEvaluationContext;
 use itertools::Itertools;
-use lambdaworks_math::field::element::FieldElement;
-use lambdaworks_math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
-use lambdaworks_math::polynomial::Polynomial;
+use math::field::element::FieldElement;
+use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
+use math::polynomial::Polynomial;
 
 /// TransitionConstraint represents the behaviour that a transition constraint
 /// over the computation that wants to be proven must comply with.
