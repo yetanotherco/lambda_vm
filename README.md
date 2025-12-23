@@ -167,7 +167,7 @@ Total weeks: 80
 | Lookup arguments            | Linking tables via lookup arguments | In progress | 2 weeks | v0 |
 | Lookup - I | Accept multitables | In progress | 1 week | v0 |
 | Lookup - II | Perform argument with constraints | In progress | 1 week | v0 |
-| Public input | Add public input using Lookup | Planned | 1 week | v1 |
+| Public input | Add public input using Lookup | Planned | 1 week | v0 |
 | Poseidon hash               | Adapt Poseidon for Goldilocks      | Planned      | 3 days   | v1 |
 | Multi-table Merkle trees (MTMT)   | Merkle tree that can be used to commit to polynomials of various sizes | In progress | 2 weeks | v2 |
 | Multi-FRI                   | Perform FRI using MTMT | Planned | 2 weeks | v2 |
