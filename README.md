@@ -76,26 +76,6 @@ You can run it with
 
 This project is under active development. Our primary objective is to have a first working version for the virtual machine. The first roadmap for the project can be found [here](./docs/roadmap.md). Priorities and features might change as we continue developing.
 
-### Teams
-
-#### Theory
-
-- Diego
-- Manuel
-- 3MILabs (Cyprien, Robin y Erik)
-
-#### Applied cryptography
-
-- Colo
-- Juan
-- Nicole
-
-#### Engineering
-
-- Mauro
-- Federica
-- Gianluca
-
 #### Milestones
 
 - v0: VM that can prove fibonacci with lookups
@@ -109,12 +89,16 @@ Total weeks: 80
 
 ### Executor
 
+#### Engineering
+- Mauro
+- Gianluca
+
 **Total estimated duration:** 16 weeks
 
 | Feature                     | Description                        | Status       | Duration | Version |
 |---------------------------- |------------------------------------|--------------| ---------| ------- |
 | Documentation               | Explain how the executor works     | In progress  |  1 weeks | all versions |
-| 32-bits CPU                 | CPU with all operations | Done | 1 week | v0 |
+| 32-bits CPU                 | CPU with all operations | Done | - | v0 |
 | Public Inputs / Private Inputs | Support for public and private inputs in the VM | planned | 2 weeks | v1 |
 | STD Support                 | Implement all STD operations, compile get_rand | Planned | 3 weeks | v1 |
 | System instructions | `ecall`, `ebreak` | Planned | 1 week | v2 |
@@ -133,7 +117,12 @@ Total weeks: 80
 
 ### Trace and Constraints generator
 
-**Total estimated duration:** 39 weeks
+#### Engineering
+- Mauro
+- Federica
+- Colo
+
+**Total estimated duration:** 37 weeks
 
 ** This includes the linking with the executor
 
@@ -145,11 +134,11 @@ Total weeks: 80
 | Link decoder table and CPU | Use lookup to connect tables | Planned | 1 week | v0 |
 | Constraints for updating pc | Implement constraints for updating pc | In progress | 1 week | v0 |
 | ALU - Range checkers | Implement rangecheck for u16 and u8 | Planned | 2 week | v0 |
+| Memory                      | Implement memory table with constraints | Planned | 2 weeks | v0 |
 | ALU - Bitwise operations (and, xor, or) | Implement tables for u8 bitwise operations | Planned | 2 week | v1 |
 | ALU - Shift operations | Implement tables for shift operations | Planned | 2 week | v1 |
 | ALU - Multiplication table | Implement table for multiplication table | Planned | 2 week | v1 |
 | ALU - Division and remainder | Implement table for integer division operations | Planned | 2 week | v1 |
-| Memory                      | Implement memory table with constraints | Planned | 4 weeks | v1 |
 | Syscall - Initial - Big Integer arithmetic | Table for big integer arithmetic | Planned | 3 week |v2|
 | Syscall - Elliptic curve addition | Table for EC operations | Planned | 3 weeks  | v2|
 | Syscall - Poseidon hash | Table for Poseidon hash | Planned | 3 weeks | v2 |
@@ -159,6 +148,17 @@ Total weeks: 80
 
 ### Core Proof system
 
+#### Theory
+
+- Diego
+- Manuel
+- 3MILabs (Cyprien, Robin y Erik)
+
+#### Implementation
+- Mauro
+- Juan
+- Nicole
+
 **Total estimated duration:** 18 weeks
 
 | Feature                     | Description                       | Status       | Duration | Version |
@@ -167,7 +167,7 @@ Total weeks: 80
 | Lookup arguments            | Linking tables via lookup arguments | In progress | 2 weeks | v0 |
 | Lookup - I | Accept multitables | In progress | 1 week | v0 |
 | Lookup - II | Perform argument with constraints | In progress | 1 week | v0 |
-| Public input | Add public input using Lookup | Planned | 1 week | v1 |
+| Public input | Add public input using Lookup | Planned | 1 week | v0 |
 | Poseidon hash               | Adapt Poseidon for Goldilocks      | Planned      | 3 days   | v1 |
 | Multi-table Merkle trees (MTMT)   | Merkle tree that can be used to commit to polynomials of various sizes | In progress | 2 weeks | v2 |
 | Multi-FRI                   | Perform FRI using MTMT | Planned | 2 weeks | v2 |

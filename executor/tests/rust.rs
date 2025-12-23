@@ -10,7 +10,7 @@ fn run_program_and_check_output(elf_path: &str, expected_output: i32) {
     });
 
     let (results, _logs) =
-        run_program(program.image, program.entry_point).expect("Failed to run program");
+        run_program(program.image, program.entry_point, true).expect("Failed to run program");
 
     assert!(results.0 == expected_output);
 }
@@ -90,3 +90,7 @@ fn test_asm() {
     run_program_and_check_output("./program_artifacts/rust/asm.elf", 42);
 }
 
+#[test]
+fn test_print() {
+    run_program_and_check_output("./program_artifacts/rust/print.elf", 1);
+}
