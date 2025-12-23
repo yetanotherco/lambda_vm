@@ -122,7 +122,7 @@ Total weeks: 80
 
 **Total estimated duration:** 37 weeks
 
-** This includes the linking with the executor
+*This includes the linking with the executor*
 
 | Feature                     | Description                       | Status       | Duration | Version |
 |---------------------------- |-----------------------------------|--------------| -------- | ------- |
