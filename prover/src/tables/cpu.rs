@@ -261,12 +261,7 @@ impl CpuTableRow {
                 }
             }
 
-            Instruction::CSR {
-                csr: _,
-                src: _,
-                dst: _,
-                op: _,
-            } => {}
+            _ => {}
         }
         row
     }
