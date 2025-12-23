@@ -54,10 +54,10 @@ mod tests {
         run_program_and_prover("../executor/program_artifacts/rust/if.elf");
     }
 
-    // #[test]
-    // fn test_fibonacci() {
-    //     run_program_and_prover("../executor/program_artifacts/rust/fibonacci.elf");
-    // }
+    #[test]
+    fn test_fibonacci() {
+        run_program_and_prover("../executor/program_artifacts/rust/fibonacci.elf");
+    }
 
     #[test]
     fn test_fibonacci_iterative() {
@@ -84,8 +84,8 @@ mod tests {
         run_program_and_prover("../executor/program_artifacts/rust/half_signed.elf");
     }
 
-    // #[test]
-    // fn test_rlp() {
-    //     run_program_and_prover("../executor/program_artifacts/rust/rlp.elf");
-    // }
+    #[test]
+    fn test_rlp() {
+        run_program_and_prover("../executor/program_artifacts/rust/rlp.elf");
+    }
 }
