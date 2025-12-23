@@ -145,11 +145,11 @@ Total weeks: 80
 | Link decoder table and CPU | Use lookup to connect tables | Planned | 1 week | v0 |
 | Constraints for updating pc | Implement constraints for updating pc | In progress | 1 week | v0 |
 | ALU - Range checkers | Implement rangecheck for u16 and u8 | Planned | 2 week | v0 |
+| Memory                      | Implement memory table with constraints | Planned | 2 weeks | v0 |
 | ALU - Bitwise operations (and, xor, or) | Implement tables for u8 bitwise operations | Planned | 2 week | v1 |
 | ALU - Shift operations | Implement tables for shift operations | Planned | 2 week | v1 |
 | ALU - Multiplication table | Implement table for multiplication table | Planned | 2 week | v1 |
 | ALU - Division and remainder | Implement table for integer division operations | Planned | 2 week | v1 |
-| Memory                      | Implement memory table with constraints | Planned | 4 weeks | v1 |
 | Syscall - Initial - Big Integer arithmetic | Table for big integer arithmetic | Planned | 3 week |v2|
 | Syscall - Elliptic curve addition | Table for EC operations | Planned | 3 weeks  | v2|
 | Syscall - Poseidon hash | Table for Poseidon hash | Planned | 3 weeks | v2 |
