@@ -5,9 +5,10 @@ const LOAD_OPCODE: u32 = 0b0000011;
 const STORE_OPCODE: u32 = 0b0100011;
 const BRANCH_OPCODE: u32 = 0b1100011;
 const JUMP_AND_LINK_REGISTER_OPCCODE: u32 = 0b1100111;
-const JUMP_AND_LINK_OPCCODE: u32 = 0b1101111;
+const JUMP_AND_LINK_OPCODE: u32 = 0b1101111;
 const LOAD_UPPER_IMM_OPCODE: u32 = 0b0110111;
 const ADD_UPPER_IMM_TO_PC: u32 = 0b0010111;
+const SYSTEM_OPCODE: u32 = 0b1110011;
 
 #[derive(Debug)]
 pub enum Opcode {
@@ -20,6 +21,7 @@ pub enum Opcode {
     JumpAndLink,
     LoadUpperImm,
     AddUpperImmToPc,
+    System,
 }
 
 impl TryFrom<u32> for Opcode {
@@ -33,9 +35,10 @@ impl TryFrom<u32> for Opcode {
             STORE_OPCODE => Opcode::Store,
             BRANCH_OPCODE => Opcode::Branch,
             JUMP_AND_LINK_REGISTER_OPCCODE => Opcode::JumpAndLinkRegister,
-            JUMP_AND_LINK_OPCCODE => Opcode::JumpAndLink,
+            JUMP_AND_LINK_OPCODE => Opcode::JumpAndLink,
             LOAD_UPPER_IMM_OPCODE => Opcode::LoadUpperImm,
             ADD_UPPER_IMM_TO_PC => Opcode::AddUpperImmToPc,
+            SYSTEM_OPCODE => Opcode::System,
             _ => return Err(InstructionError::UnknownOpcode(value)),
         })
     }
@@ -54,7 +57,7 @@ impl Opcode {
     fn instruction_format(&self) -> InstructionFormat {
         match self {
             &Opcode::Arith => InstructionFormat::R,
-            &Opcode::ArithImm | &Opcode::Load | &Opcode::JumpAndLinkRegister => {
+            &Opcode::ArithImm | &Opcode::Load | &Opcode::JumpAndLinkRegister | &Opcode::System => {
                 InstructionFormat::I
             }
             &Opcode::Store => InstructionFormat::S,
@@ -125,6 +128,16 @@ pub enum Comparison {
     GreaterOrEqualUnsigned,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum CsrOp {
+    CSRRW,
+    CSRRS,
+    CSRRC,
+    CSRRWI,
+    CSRRSI,
+    CSRRCI,
+}
+
 #[derive(Debug)]
 pub enum Instruction {
     Arith {
@@ -173,6 +186,12 @@ pub enum Instruction {
     AddUpperImmToPc {
         dst: u32,
         imm: u32,
+    },
+    CSR {
+        csr: u32,
+        src: u32,
+        dst: u32,
+        op: CsrOp,
     },
 }
 
@@ -277,6 +296,13 @@ const SHL_FUNC_IDENTIFIER: u32 = 0x1;
 const SR_FUNC_IDENTIFIER: u32 = 0x5;
 const SLT_FUNC_IDENTIFIER: u32 = 0x2;
 const SLTU_FUNC_IDENTIFIER: u32 = 0x3;
+const CSRRW_FUNC_IDENTIFIER: u32 = 0x1;
+const CSRRS_FUNC_IDENTIFIER: u32 = 0x2;
+const CSRRC_FUNC_IDENTIFIER: u32 = 0x3;
+const CSRRWI_FUNC_IDENTIFIER: u32 = 0x5;
+const CSRRSI_FUNC_IDENTIFIER: u32 = 0x6;
+const CSRRCI_FUNC_IDENTIFIER: u32 = 0x7;
+const ECALL_EBREAK_FUNC_IDENTIFIER: u32 = 0x0;
 
 // I-Type Instruction Format
 // | imm  | rs1  |funct3|  rd |opcode|
@@ -284,9 +310,10 @@ const SLTU_FUNC_IDENTIFIER: u32 = 0x3;
 fn parse_i_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, InstructionError> {
     let func3 = (instruction & FUNC3_MASK) >> 12;
     let rs1 = (instruction & RS1_MASK) >> 15;
-    let imm = ((instruction >> 20) & I_TYPE_IMM_MASK) as i32;
+    let csr = (instruction >> 20) & I_TYPE_IMM_MASK;
+    let imm = csr as i32;
     let mut imm: i32 = if (instruction & SIGN_MASK) != 0 {
-        imm - (1 << 11)
+        imm.wrapping_sub(1 << 11)
     } else {
         imm
     };
@@ -343,6 +370,36 @@ fn parse_i_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, 
             base: rs1,
             width: LoadStoreWidth::from_func3(func3)?,
         },
+        Opcode::System => {
+            match func3 {
+                ECALL_EBREAK_FUNC_IDENTIFIER => {
+                    return Err(InstructionError::InvalidSystemInstruction(func3));
+                }
+                CSRRCI_FUNC_IDENTIFIER => Instruction::CSR {
+                    csr,
+                    src: rd,
+                    dst: rs1,
+                    op: CsrOp::CSRRCI,
+                },
+                CSRRS_FUNC_IDENTIFIER => Instruction::CSR {
+                    csr,
+                    src: rd,
+                    dst: rs1,
+                    op: CsrOp::CSRRS,
+                },
+                CSRRW_FUNC_IDENTIFIER => Instruction::CSR {
+                    csr,
+                    src: rd,
+                    dst: rs1,
+                    op: CsrOp::CSRRW,
+                },
+                CSRRC_FUNC_IDENTIFIER | CSRRWI_FUNC_IDENTIFIER | CSRRSI_FUNC_IDENTIFIER => {
+                    // For now, we do not support these CSR instructions
+                    return Err(InstructionError::InvalidSystemInstruction(func3));
+                }
+                _ => return Err(InstructionError::UnknownOpcodeFuncIdentifier(opcode, func3)),
+            }
+        }
         _ => return Err(InstructionError::InvalidInstruction),
     })
 }
@@ -388,7 +445,7 @@ fn parse_b_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, 
         | ((instruction >> 7) & 0x1e)
         | ((instruction & 0x80) << 4)) as i32;
     let imm: i32 = if (instruction & SIGN_MASK) != 0 {
-        imm + 0xFFFFF000u32 as i32
+        imm.wrapping_add(0xFFFFF000u32 as i32)
     } else {
         imm
     };
@@ -421,7 +478,7 @@ fn parse_j_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, 
     let imm =
         instruction & 0xff000 | ((instruction & 0x100000) >> 9) | ((instruction >> 20) & 0x7fe);
     let imm: i32 = if (instruction & SIGN_MASK) != 0 {
-        imm as i32 - (1 << 20)
+        (imm as i32).wrapping_sub(1 << 20)
     } else {
         imm as i32
     };
@@ -464,4 +521,6 @@ pub enum InstructionError {
     UnknownSLVariant(i32),
     #[error("Invalid JALR Instruction: func3 component is not 0x0")]
     InvalidJALR,
+    #[error("Invalid system instruction encoding with func3: {0:0x}")]
+    InvalidSystemInstruction(u32),
 }
