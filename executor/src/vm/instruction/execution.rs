@@ -15,8 +15,6 @@ impl Instruction {
         registers: &mut Registers,
         memory: &mut Memory,
     ) -> Result<Log, ExecutionError> {
-        println!("registers: {}", &registers);
-        println!("Executing instruction at 0x{:08x}: {:?}", *pc, self);
         let log = self.execute(*pc, registers, memory)?;
         *pc = log.next_pc;
         Ok(log)
