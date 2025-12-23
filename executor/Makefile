@@ -46,12 +46,9 @@ $(RUST_ARTIFACTS_DIR)/%.elf: $(RUST_PROGRAMS_DIR)/%/Cargo.toml
 # Compile rust benches
 $(BENCH_ARTIFACTS_DIR)/%.elf: $(BENCH_PROGRAMS_DIR)/%/Cargo.toml
 	cd $(BENCH_PROGRAMS_DIR)/$* && \
-		cargo +nightly rustc \
-			--target riscv32im-unknown-none-elf \
-			-Z build-std=core,compiler_builtins \
-			-- --emit asm -C debuginfo=0 -C link-arg=-e -C link-arg=main
+		cargo build \
+			--target riscv32im-unknown-none-elf
 	cp $(BENCH_PROGRAMS_DIR)/$*/target/riscv32im-unknown-none-elf/debug/$* $@
-	rm -rf $(BENCH_PROGRAMS_DIR)/$*/target
 
 clean-asm:
 	-rm -rf $(ASM_ARTIFACTS_DIR)
@@ -97,5 +94,5 @@ deps-linux:
 
 .PHONY: deps-macos
 deps-macos:
-	brew tap riscv-software-src/riscv       
+	brew tap riscv-software-src/riscv
 	brew install riscv-software-src/riscv/riscv-gnu-toolchain
