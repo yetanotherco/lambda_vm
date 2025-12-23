@@ -213,8 +213,8 @@ impl Instruction {
             Instruction::EcallEbreak => {
                 // For now this is just a mechanism to print
                 // It is not the correct implementation of ecall/ebreak
-                let pointer = registers.read(10);
-                let len = registers.read(11);
+                let pointer = registers.read(10)?;
+                let len = registers.read(11)?;
                 let mut bytes = vec![];
                 for i in 0..len {
                    bytes.push(memory.load_byte(pointer + i) as u8);
