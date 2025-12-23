@@ -48,11 +48,11 @@ $(RUST_ARTIFACTS_DIR)/%.elf: $(RUST_PROGRAMS_DIR)/%/Cargo.toml
 # Compile rust benches
 $(BENCH_ARTIFACTS_DIR)/%.elf: $(BENCH_PROGRAMS_DIR)/%/Cargo.toml
 	cd $(BENCH_PROGRAMS_DIR)/$* && \
-		cargo +nightly rustc \
-			--target riscv32im-unknown-none-elf \
-			-Z build-std=core,compiler_builtins \
-			-- --emit asm -C debuginfo=0 -C link-arg=-e -C link-arg=main
-	cp $(BENCH_PROGRAMS_DIR)/$*/target/riscv32im-unknown-none-elf/debug/$* $@
+		cargo +nightly build \
+			--target rv32.json \
+			-Z build-std=core,alloc,std,compiler_builtins,panic_abort \
+			-Z build-std-features=compiler-builtins-mem 
+	cp $(BENCH_PROGRAMS_DIR)/$*/target/rv32/debug/$* $@
 	rm -rf $(BENCH_PROGRAMS_DIR)/$*/target
 
 clean-asm:
