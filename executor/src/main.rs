@@ -11,6 +11,6 @@ fn main() -> Result<(), ExecutorError> {
     program.image.iter().for_each(|(addr, word)| {
         println!("0x{addr:08x}: 0x{word:08x}");
     });
-    run_program(program.image, program.entry_point)?;
+    run_program(program.image, program.entry_point, true)?;
     Ok(())
 }
