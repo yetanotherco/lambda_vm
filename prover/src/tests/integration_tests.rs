@@ -1,8 +1,8 @@
 use crate::{constraints::cpu_air::CPUTableAIR, tables::cpu::cpu_trace_from_logs};
+use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use executor::{elf::Elf, vm::execution::run_program};
-use lambdaworks_crypto::fiat_shamir::default_transcript::DefaultTranscript;
-use lambdaworks_math::field::fields::fft_friendly::quartic_babybear_u32::Degree4BabyBearU32ExtensionField;
-use stark_platinum_prover::{
+use math::field::fields::fft_friendly::quartic_babybear_u32::Degree4BabyBearU32ExtensionField;
+use stark::{
     proof::options::ProofOptions,
     prover::{IsStarkProver, Prover},
     verifier::{IsStarkVerifier, Verifier},
