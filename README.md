@@ -133,7 +133,7 @@ Total weeks: 80
 
 ### Trace and Constraints generator
 
-**Total estimated duration:** 39 weeks
+**Total estimated duration:** 37 weeks
 
 ** This includes the linking with the executor
 
