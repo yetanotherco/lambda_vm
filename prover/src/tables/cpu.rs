@@ -245,19 +245,20 @@ impl CpuTableRow {
                 row.rs2 = FE::zero();
                 row.imm = u32_to_2_limbs(imm);
                 row.arg2 = u32_to_2_limbs(imm);
-                row.write_register = FE::one();
+                if dst != 0 {
+                    row.write_register = FE::one();
+                }
             }
 
             Instruction::AddUpperImmToPc { dst, imm } => {
                 row.add = FE::one();
                 row.rd = FE::from(&dst);
-                // TODO: Revisar.
-                row.rs1 = FE::from(&255u32);
-                row.rs2 = FE::zero();
                 row.imm = u32_to_2_limbs(imm);
                 row.arg2 = u32_to_2_limbs(imm);
                 row.rv1 = u32_to_4_limbs(log.current_pc);
-                row.write_register = FE::one();
+                if dst != 0 {
+                    row.write_register = FE::one();
+                }
             }
 
             Instruction::CSR {
