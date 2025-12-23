@@ -1,5 +1,6 @@
 use crate::constraints::constraints_templates::{
-    new_add_constraint, new_add_four_constraint, new_bit_constraints, new_sub_constraint,
+    Arg2ValidityColumnIndexes, new_add_constraint, new_add_four_constraint,
+    new_arg2_validity_constraint, new_bit_constraints, new_sub_constraint,
 };
 
 use math::field::{
@@ -25,7 +26,7 @@ const PC: usize = 2;
 const WRITE_REGISTER: usize = 7;
 const MEMORY_2BYTES: usize = 8;
 const MEMORY_4BYTES: usize = 9;
-// const IMM: usize = 10;
+const IMM: usize = 10;
 const SIGNED: usize = 12;
 const MP_SELECTOR: usize = 13;
 const MULDIV_SELECTOR: usize = 14;
@@ -48,7 +49,7 @@ const ECALL: usize = 30;
 const EBREAK: usize = 31;
 // const NEXT_PC: usize = 32;
 const RV_ONE: usize = 34;
-// const RV_TWO: usize = 38;
+const RV_TWO: usize = 38;
 // const RVD: usize = 42;
 const ARG_TWO: usize = 44;
 const RES: usize = 46;
@@ -144,10 +145,26 @@ impl AIR for CPUTableAIR {
             next_index, // constraint_idx_start,
         );
 
+        next_index += 2;
+
+        let arg2_validity_constraints = new_arg2_validity_constraint(
+            ARG_TWO,
+            RV_TWO,
+            IMM,
+            Arg2ValidityColumnIndexes {
+                load_index: LOAD,
+                store_index: STORE,
+                beq_index: BEQ,
+                blt_index: BLT,
+            },
+            next_index,
+        );
+
         let mut constraints = bit_constraints;
         constraints.extend(add_constraints);
         constraints.extend(sub_constraints);
         constraints.extend(next_pc_value_constraint);
+        constraints.extend(arg2_validity_constraints);
 
         let num_transition_constraints = constraints.len();
 
