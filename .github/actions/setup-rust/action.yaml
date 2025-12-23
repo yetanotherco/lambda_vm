@@ -4,6 +4,9 @@ runs:
   using: "composite"
   steps:
 
+    - name: Free Disk Space
+      uses: ./.github/actions/free-disk
+
     - name: Restore Rust toolchain cache
       id: rust-cache
       uses: actions/cache@v4
@@ -24,9 +27,11 @@ runs:
         profile = "dist"  # Includes one of the default files in src/bootstrap/defaults
         change-id = 149354
         rust.lld = true
+        [build]
+        docs = false
         EOF
         export DESTDIR="$HOME/lambda_rust"
-        ./x.py build && ./x.py install
+        ./x.py build --stage 1
     
     - name: Add Rust to PATH
       shell: bash
