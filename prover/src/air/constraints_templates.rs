@@ -478,14 +478,6 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
         self.constraint_idx
     }
 
-    fn exemptions_period(&self) -> Option<usize> {
-        None
-    }
-
-    fn periodic_exemptions_offset(&self) -> Option<usize> {
-        None
-    }
-
     fn end_exemptions(&self) -> usize {
         0
     }
@@ -524,7 +516,7 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
                 let beq = step.get_main_evaluation_element(0, self.column_indexes.beq_index);
                 let blt = step.get_main_evaluation_element(0, self.column_indexes.blt_index);
 
-                let constraint = (one - store - load) * rv2 + (one - beq - blt) * imm - arg2;
+                let constraint = (one - (store + load)) * rv2 + (one - (beq + blt)) * imm - arg2;
                 transition_evaluations[self.constraint_idx()] = constraint.to_extension();
             }
 
@@ -551,7 +543,7 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
                 let beq = step.get_main_evaluation_element(0, self.column_indexes.beq_index);
                 let blt = step.get_main_evaluation_element(0, self.column_indexes.blt_index);
 
-                let constraint = (one - store - load) * rv2 + (one - beq - blt) * imm - arg2;
+                let constraint = (one - (store + load)) * rv2 + (one - (beq + blt)) * imm - arg2;
                 transition_evaluations[self.constraint_idx()] = constraint;
             }
         }
