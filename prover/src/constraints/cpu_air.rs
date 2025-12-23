@@ -2,13 +2,13 @@ use crate::constraints::constraints_templates::{
     new_add_constraint, new_add_four_constraint, new_bit_constraints, new_sub_constraint,
 };
 
-use lambdaworks_math::field::{
+use math::field::{
     element::FieldElement,
     fields::fft_friendly::{
         babybear_u32::Babybear31PrimeField, quartic_babybear_u32::Degree4BabyBearU32ExtensionField,
     },
 };
-use stark_platinum_prover::{
+use stark::{
     constraints::{boundary::BoundaryConstraints, transition::TransitionConstraint},
     context::AirContext,
     proof::options::ProofOptions,

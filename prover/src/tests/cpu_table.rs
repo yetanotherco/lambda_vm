@@ -1,6 +1,6 @@
 use executor::vm::instruction::decoding::{ArithOp, Instruction, LoadStoreWidth};
 use executor::vm::logs::Log;
-use lambdaworks_math::field::{
+use math::field::{
     element::FieldElement, fields::fft_friendly::babybear_u32::Babybear31PrimeField,
 };
 
@@ -615,9 +615,9 @@ mod tests {
     use super::*;
     use crate::constraints::cpu_air::{CPUTableAIR, build_cpu_trace};
     use crate::tables::cpu::cpu_trace_from_logs;
-    use lambdaworks_crypto::fiat_shamir::default_transcript::DefaultTranscript;
-    use lambdaworks_math::field::fields::fft_friendly::quartic_babybear_u32::Degree4BabyBearU32ExtensionField;
-    use stark_platinum_prover::{
+    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+    use math::field::fields::fft_friendly::quartic_babybear_u32::Degree4BabyBearU32ExtensionField;
+    use stark::{
         proof::options::ProofOptions,
         prover::{IsStarkProver, Prover},
         verifier::{IsStarkVerifier, Verifier},
