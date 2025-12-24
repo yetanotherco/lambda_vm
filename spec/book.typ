@@ -6,7 +6,8 @@
 #book-meta(
   title: "Lambda VM specification",
   summary: [
-    #chapter("variables.typ")[Variables]
+    #chapter("variables.typ")[Variables],
+    #chapter("shift.typ")[SHIFT chip],
   ]
 )
 

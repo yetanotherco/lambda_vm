@@ -103,6 +103,11 @@ subtypes = ["Half", "Half", "Half"]
 desc = "Three halfwords"
 
 [[variables.types]]
+label = "Half[4]"
+subtypes = ["Half", "Half", "Half", "Half"]
+desc = "Four halfwords"
+
+[[variables.types]]
 label = "Half[8]"
 subtypes = ["Half", "Half", "Half", "Half", "Half", "Half", "Half", "Half"]
 desc = "Eight halfwords"

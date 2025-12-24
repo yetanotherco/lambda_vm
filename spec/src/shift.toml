@@ -1,0 +1,219 @@
+name = "SHIFT"
+
+# Input
+
+[[variables.input]]
+name = "in"
+type = "DWordHL"
+desc = "The word being shifted"
+
+[[variables.input]]
+name = "shift"
+type = "BaseField"
+desc = "Number of bits to shift `in` by."
+
+[[variables.input]]
+name = "direction"
+type = "Bit"
+desc = "Whether to shift left (0) or right (1)."
+
+[[variables.input]]
+name = "signed"
+type = "Bit"
+desc = "Whether to interpret `in` as a signed integer."
+
+
+# Output
+
+[[variables.output]]
+name = "shifted"
+type = "DWordHL"
+desc = "`in <</>> (shift % 64)`"
+
+
+# Auxiliary
+[[variables.auxiliary]]
+name = "bit_shift"
+type = "Byte"
+desc = "`shift && 0x0F`"
+
+[[variables.auxiliary]]
+name = "limb_shift_odd"
+type = "Byte"
+desc = "`shift && 0x10`"
+
+[[variables.auxiliary]]
+name = "limb_shift_even"
+type = "Byte"
+desc = "`shift && 0x20`"
+
+[[variables.auxiliary]]
+name = "bit_shifted_uncarried"
+type = "Half[4]"
+desc = "result of left/right shifting the individual limbs of `in` by `bit_shift`, i.e., without the carry values."
+
+[[variables.auxiliary]]
+name = "carry"
+type = "Half[3]"
+desc = "the carry values left/right shifting `in` by `bit_shift`. Note: one fewer limb is needed, since the last carry is shifted off."
+
+# Virtual
+
+[[variables.virtual]]
+name = "left"
+type = "Bit"
+desc = "Whether to perform a left-shift."
+poly = ["not", "direction"]
+
+[[variables.virtual]]
+name = "right"
+type = "Bit"
+desc = "Whether to perform a right-shift."
+poly = "direction"
+
+[[variables.virtual]]
+name = "bit_shifted"
+type = "DWordHL"
+desc = "`in <</>> (shift % 16)`"
+poly = ["+", ["idx", "bit_shifted_uncarried", "i"],  ["idx", "carry", "i"]]
+
+# Multiplicities
+
+[[variables.multiplicity]]
+name = "μ"
+type = "Bit"
+desc = ""
+
+
+
+
+# Constraints
+
+[[constraint_groups]]
+name = "defs"
+
+[[constraints.defs]]
+kind = "interaction"
+tag = "AND_BYTE"
+input = ["shift", "0x0F"]
+output = "bit_shift"
+ref = "shift:c:bit_shift"
+multiplicity = "μ"
+
+[[constraints.defs]]
+kind = "interaction"
+tag = "AND_BYTE"
+input = ["shift", "0x10"]
+output = "limb_shift_odd"
+ref = "shift:c:limb_shift_odd"
+multiplicity = "μ"
+
+[[constraints.defs]]
+kind = "interaction"
+tag = "AND_BYTE"
+input = ["shift", "0x20"]
+output = "limb_shift_even"
+ref = "shift:c:limb_shift_even"
+multiplicity = "μ"
+
+
+[[constraint_groups]]
+name = "intra_limb_left_shifting"
+
+[[constraints.intra_limb_left_shifting]]
+kind = "interaction"
+tag = "HWSL"
+input = [["idx", "in", "i"], "bit_shift"]
+output = ["idx", "bit_shifted_uncarried", "i"]
+range = ["i", 0, 3]
+multiplicity = "μ - direction"
+ref = "shift:c:hwsl"
+
+
+[[constraints.intra_limb_left_shifting]]
+kind = "interaction"
+tag = "HWSLC"
+input = [["idx", "in", "i"], "bit_shift"]
+output = ["idx", "carry", "i"]
+range = ["i", 0, 2]
+multiplicity = "μ - direction"
+ref = "shift:c:hwsl"
+
+[[constraints.intra_limb_left_shifting]]
+kind = "arith"
+constraint = "$#`left` => #`carry[3]` = 0$"
+poly = ["*", "left", ["idx", "carry", 3]]
+ref = "shift:c:left_zero_carry"
+
+
+[[constraint_groups]]
+name = "intra_limb_right_shifting"
+
+[[constraints.intra_limb_right_shifting]]
+kind = "interaction"
+tag = "HWSR"
+input = [["idx", "in", "i"], "bit_shift"]
+output = ["idx", "bit_shifted_uncarried", "i"]
+range = ["i", 0, 3]
+multiplicity = "direction"
+ref = "shift:c:hwsr"
+
+[[constraints.intra_limb_right_shifting]]
+kind = "interaction"
+tag = "HWSRC"
+input = [["idx", "in", "i"], "bit_shift"]
+output = ["idx", "carry", "i"]
+range = ["i", 1, 3]
+multiplicity = "direction"
+ref = "shift:c:hwsrc"
+
+[[constraints.intra_limb_right_shifting]]
+kind = "arith"
+constraint = "$#`left` => #`carry[0]` = 0$"
+poly = ["*", "left", ["idx", "carry", 0]]
+ref = "shift:c:right_zero_carry"
+
+
+[[constraint_groups]]
+name = "limb_left_shifting"
+
+[[constraints.limb_left_shifting]]
+kind = "arith"
+constraint = "$#`left` and #`!limb_shift_odd` and #`!limb_shift_even` => #`shifted[i]` = #`bit_shifted[i]`$"
+poly = ["*", "left", ["-", 16, "limb_shift_odd"], ["-", 32, "limb_shift_even"], ["-", ["idx", "shifted", "i"], ["idx", "bit_shifted", "i"]]]
+range = ["i", 0, 3]
+
+[[constraints.limb_left_shifting]]
+kind = "arith"
+constraint = "$#`left` and #`limb_shift_odd` and #`!limb_shift_even` => #`shifted[i]` = #`bit_shifted[i-1]`$"
+poly = ["*", "left", "limb_shift_odd", ["-", 32, "limb_shift_even"], ["-", ["idx", "shifted", "i"], ["idx", "bit_shifted", "i-1"]]]
+range = ["i", 1, 3]
+
+[[constraints.limb_left_shifting]]
+kind = "arith"
+constraint = "$#`left` and #`limb_shift_odd` and #`!limb_shift_even` => #`shifted[0]` = 0$"
+poly = ["*", "left", "limb_shift_odd", ["-", 32, "limb_shift_even"], ["idx", "shifted", 0]]
+
+[[constraints.limb_left_shifting]]
+kind = "arith"
+constraint = "$#`left` and #`!limb_shift_odd` and #`limb_shift_even` => #`shifted[i]` = #`bit_shifted[i-2]`$"
+poly = ["*", "left", ["-", 16, "limb_shift_odd"], "limb_shift_even", ["-", ["idx", "shifted", "i"], ["idx", "bit_shifted", "i-2"]]]
+range = ["i", 2, 3]
+
+[[constraints.limb_left_shifting]]
+kind = "arith"
+constraint = "$#`left` and #`!limb_shift_odd` and #`limb_shift_even` => #`shifted[i]` = 0$"
+poly = ["*", "left", ["-", 16, "limb_shift_odd"], "limb_shift_even", ["idx", "shifted", "i"]]
+range = ["i", 0, 2]
+
+
+[[constraints.limb_left_shifting]]
+kind = "arith"
+constraint = "$#`left` and #`limb_shift_odd` and #`limb_shift_even` => #`shifted[3]` = #`bit_shifted[0]`$"
+poly = ["*", "left", "limb_shift_odd", "limb_shift_even", ["-", ["idx", "shifted", 3], ["idx", "bit_shifted", 0]]]
+
+[[constraints.limb_left_shifting]]
+kind = "arith"
+constraint = "$#`left` and #`limb_shift_odd` and #`limb_shift_even` => #`shifted[i]` = 0$"
+poly = ["*", "left", "limb_shift_odd", "limb_shift_even", ["idx", "shifted", "i"]]
+range = ["i", 0, 3]
