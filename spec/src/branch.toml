@@ -1,0 +1,110 @@
+name = "BRANCH"
+
+
+# Input
+
+[[variables.input]]
+name = "pc"
+type = "DWordWL"
+desc = "The current pc, used as base address when `!JALR`"
+
+[[variables.input]]
+name = "offset"
+type = "Word"
+desc = "The offset from the base address to jump to"
+
+[[variables.input]]
+name = "register"
+type = "DWordWL"
+desc = "The base address to use when `JALR`"
+
+[[variables.input]]
+name = "JALR"
+type = "Bit"
+desc = "Selects between `pc` and `register` as base address, needed for the `JALR` instruction"
+
+
+# Output
+
+[[variables.output]]
+name = "next_pc_high"
+type = "Half[3]"
+desc = "The upper part of the next pc"
+
+
+# Auxiliary
+
+[[variables.auxiliary]]
+name = "raw_add_low"
+type = "Byte[2]"
+desc = "The low part of the raw addition"
+
+[[variables.auxiliary]]
+name = "masked_add_low"
+type = "Byte"
+desc = "The low part of `raw_add_low`, with it's LSB cleared"
+
+
+# Virtual
+
+[[variables.virtual]]
+name = "add_result"
+type = "DWordWL"
+desc = "The combination of `next_pc_high` and `raw_add_low` to constrain the addition"
+polys = [
+  ["+", ["*", ["^", 2, 16], ["idx", "next_pc_high", 0]], ["*", ["^", 2, 8], ["idx", "raw_add_low", 1]], ["idx", "raw_add_low", 0]],
+  ["+", ["*", ["^", 2, 16], ["idx", "next_pc_high", 2]], ["idx", "next_pc_high", 1]],
+]
+
+
+# Multiplicity
+
+[[variables.multiplicity]]
+name = "μ"
+type = "Bit"
+desc = ""
+
+
+
+[[constraint_groups]]
+name = "all"
+
+[[constraints.all]]
+kind = "template"
+tag = "ADD"
+input = ["pc", "offset"] # TODO: offset should be "extended" to DWord
+output = "add_result"
+cond = ["not", "JALR"]
+
+[[constraints.all]]
+kind = "template"
+tag = "ADD"
+input = ["register", "offset"] # TODO: offset should still be extended
+output = "add_result"
+cond = "JALR"
+
+[[constraints.all]]
+kind = "interaction"
+tag = "IS_BYTE"
+input = [["idx", "raw_add_low", "i"]]
+range = ["i", 0, 1]
+multiplicity = "μ"
+
+[[constraints.all]]
+kind = "interaction"
+tag = "AND_BYTE"
+input = [["idx", "raw_add_low", 0]]
+output = "masked_add_low"
+multiplicity = "μ"
+
+
+[[constraint_groups]]
+name = "output"
+desc = "Each row contributes the following to the LogUp sum"
+
+[[constraints.output]]
+kind = "interaction"
+tag = "BRANCH"
+input = ["pc", "offset", "register", "JALR"]
+output = ["+", ["*", ["^", 2, 16], "next_pc_high"], ["*", ["^", 2, 8], ["idx", "raw_add_low", 1]], "masked_add_low"] # TODO: cleanup
+multiplicity = "-μ"

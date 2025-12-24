@@ -8,6 +8,7 @@
     #chapter("variables.typ")[Variables]
     #chapter("is_bit.typ")[IS_BIT template]
     #chapter("cpu.typ")[CPU chip]
+    #chapter("branch.typ")[BRANCH]
   ]
 )
 
