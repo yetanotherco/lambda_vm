@@ -51,7 +51,7 @@ precomputed = "true"
 [[variables.output]]
 name = "ZERO"
 type = "Bit"
-desc = "whether $#`X` = 0 and #`Y` = 0$"
+desc = "whether $#`X` = 0$, $#`Y` = 0$ and $#`Z` = 0$."
 precomputed = "true"
 
 [[variables.output]]
@@ -163,7 +163,7 @@ multiplicity = ["-", "μ_MSB16"]
 [[constraints.contributions]]
 kind = "interaction"
 tag = "ZERO"
-input = [["+", "X", ["*", 256, "Y"]]]
+input = [["+", "X", ["*", 256, "Y"], ["*", 65536, "Z"]]]
 output = "ZERO"
 multiplicity = ["-", "μ_ZERO"]
 
