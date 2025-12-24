@@ -38,5 +38,5 @@ The following ideas may prove to be optimizations for the #bitwise chip:
 + Drop `MSB8` column, and instead define the `MSB8` lookup as `MSB8<X> := MSB16[256X]`.
   Note: currently, `MSB8` also implicity range checks the input `X` (the lookup fails if `X` is not a `Byte`).
   This optimization should only be executed when all chips leveraging `MSB8` do _not_ need this implicit range check.
-+ Place the 16-bit (`AND`, `OR`, `XOR`, `MSB16`, `ZERO`, etc.) and 20-bit (`HWSL`, `HWSLC`, `IS_B20`) lookups in separate tables.
++ Place the 16-bit (`AND`, `OR`, `XOR`, `MSB16`, etc.) and 20-bit (`HWSL`, `HWSLC`, `IS_B20`, `ZERO`) lookups in separate tables.
 + Combine `HWSL` and `HWSLC` into a single lookup (see also \#119).

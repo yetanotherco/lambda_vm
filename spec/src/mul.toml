@@ -130,6 +130,7 @@ iter = ["i", 0, 3]
 [[assumptions]]
 desc = "`IS_HALF[rhs[i]]`"
 iter = ["i", 0, 3]
+ref = "mul:a:rhs"
 
 # Constraints
 

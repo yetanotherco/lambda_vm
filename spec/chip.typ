@@ -156,7 +156,7 @@
       (table.header(level:2, table.cell(colspan: 4, emph(cat))), table.hline(stroke: .6pt))
       for var in vars {
         (
-          [#raw(var.name)], 
+          [#raw(var.name)],
           [#type_to_code(var.type)], 
           table.cell(colspan: 2, [#eval(var.desc, mode: "markup")])
         )
