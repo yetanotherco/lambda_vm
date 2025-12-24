@@ -1,0 +1,162 @@
+name = "LT"
+
+
+# Input
+
+[[variables.input]]
+name = "lhs"
+type = "DWordHHW"
+desc = "The left operand"
+
+[[variables.input]]
+name = "rhs"
+type = "DWordHHW"
+desc = "The right operand"
+
+[[variables.input]]
+name = "signed"
+type = "Bit"
+desc = "whether to interpret `lhs` and `rhs` as signed integers"
+
+# Output
+
+[[variables.output]]
+name = "lt"
+type = "Bit"
+desc = "Whether $#`lhs` < #`rhs`$, taking `signed` into account"
+
+
+# Auxiliary
+
+[[variables.auxiliary]]
+name = "signed_lt"
+type = "Bit"
+desc = "Whether $#`lhs` < #`rhs`$, as signed integers"
+
+[[variables.auxiliary]]
+name = "lhs_sub_rhs"
+type = "DWordHL"
+desc = "$#`lhs` - #`rhs`$"
+
+[[variables.auxiliary]]
+name = "lhs_msb"
+type = "Bit"
+desc = "The most significant bit of `lhs`"
+
+[[variables.auxiliary]]
+name = "rhs_msb"
+type = "Bit"
+desc = "The most significant bit of `rhs`"
+
+[[variables.auxiliary]]
+name = "lhs_sub_rhs_msb"
+type = "Bit"
+desc = "The most significant bit of $#`lhs` - #`rhs`$"
+
+
+# Virtual
+
+[[variables.virtual]]
+name = "carry"
+type = "Bit[3]"
+desc = "The carry of subtracting limbs of `rhs` from those of `lhs`"
+polys = [
+  ["/", ["-", ["+", ["idx", "rhs", 0], ["idx", "lhs_sub_rhs", 0]], ["idx", "lhs", 0]], ["^", 2, 32]],
+  ["/", ["-", ["+", ["idx", "rhs", 1], ["idx", "lhs_sub_rhs", 1], ["idx", "carry", 0]], ["idx", "lhs", 1]], ["^", 2, 16]],
+  ["/", ["-", ["+", ["idx", "rhs", 2], ["idx", "lhs_sub_rhs", 2], ["idx", "carry", 1]], ["idx", "lhs", 2]], ["^", 2, 16]]
+]
+
+[[variables.virtual]]
+name = "unsigned_lt"
+type = "Bit"
+desc = "Whether $#`lhs` < #`rhs`$, as unsigned integers"
+poly = ["idx", "carry", 2]
+
+
+# Multiplicity
+
+[[variables.multiplicity]]
+name = "μ"
+type = "Bit"
+desc = ""
+
+
+[[assumptions]]
+desc = "`IS_HALFWORD[lhs[i]]` and `IS_WORD[lhs[0]]`"
+range = ["i", 1, 2]
+ref = "lt:a:range_lhs"
+
+[[assumptions]]
+desc = "`IS_HALFWORD[rhs[i]]` and `IS_WORD[rhs[0]]`"
+range = ["i", 1, 2]
+ref = "lt:a:range_rhs"
+
+[[assumptions]]
+desc = "`IS_BIT[signed]`"
+ref = "lt:a:range_signed"
+
+
+[[constraint_groups]]
+name = "defs"
+desc = "Enforce that variables have been correctly computed"
+
+[[constraints.defs]]
+kind = "interaction"
+tag = "MSB16"
+input = [["idx", "lhs", 2]]
+output = "lhs_msb"
+multiplicity = "μ"
+ref = "lt:c:lhs_msb"
+
+[[constraints.defs]]
+kind = "interaction"
+tag = "MSB16"
+input = [["idx", "rhs", 2]]
+output = "rhs_msb"
+multiplicity = "μ"
+ref = "lt:c:rhs_msb"
+
+[[constraints.defs]]
+kind = "interaction"
+tag = "MSB16"
+input = [["idx", "lsb_sub_rhs", 2]]
+output = "lhs_sub_rhs_msb"
+multiplicity = "μ"
+ref = "lt:c:lhs_sub_rhs_msb"
+
+[[constraints.defs]]
+kind = "arith"
+constraint = "$#`lt` = #`signed` dot #`signed_lt` + (1 - #`signed`) dot #`unsigned_lt`$"
+desc = "where some shorthand means something"
+poly = ["+", ["-", "lt"], ["*", "signed", "signed_lt"], ["*", ["-", 1, "signed"], "unsigned_lt"]]
+
+
+[[constraint_groups]]
+name = "sub"
+desc = "Constrain the subtraction"
+
+[[constraints.sub]]
+kind = "template"
+tag = "IS_BIT"
+input = [["idx", "carry", "i"]]
+range = ["i", 0, 1]
+
+[[constraints.sub]]
+kind = "interaction"
+tag = "IS_HALFWORD"
+input = [["idx", "lhs_sub_rhs", "i"]]
+range = ["i", 0, 3]
+multiplicity = "μ"
+ref = "lt:c:lhs_sub_rhs_range"
+
+
+[[constraint_groups]]
+name = "output"
+desc = "Each row contributes the following to the LogUp sum"
+
+[[constraints.output]]
+kind = "interaction"
+tag = "LT"
+input = ["lhs", "rhs", "signed"]
+output = "lt"
+multiplicity = "-μ"
