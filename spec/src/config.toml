@@ -1,0 +1,113 @@
+[metadata]
+version = 1
+
+[[variables.types]]
+label = "BaseField"
+subtypes = ["BaseField"]
+desc = "Variable that can assume any value in the base field."
+
+[[variables.types]]
+label = "Bit"
+subtypes = ["BaseField"]
+desc = "Variable that can only assume values in the set ${0,1}$."
+
+[[variables.types]]
+label = "B4"
+subtypes = ["BaseField"]
+desc = "Variable that can only assume values in the range $[0, 2^4)$."
+
+[[variables.types]]
+label = "Byte"
+subtypes = ["BaseField"]
+count = 1
+desc = "Variable that can only assume values in the range $[0, 2^8)$."
+
+[[variables.types]]
+label = "Half"
+subtypes = ["BaseField"]
+desc = "Variable that can only assume values in the range $[0, 2^16)$."
+
+[[variables.types]]
+label = "Word"
+subtypes = ["BaseField"]
+desc = "Variable that can only assume values in the range $[0, 2^32)$."
+
+[[variables.types]]
+label = "WordHL"
+subtypes = ["Half", "Half"]
+desc = """\
+       Variable that can only assume values in the range $[0, 2^32)$. \\
+       Represented as an array of two `Half` variables.\
+       """
+
+[[variables.types]]
+label = "WordBL"
+subtypes = ["Byte", "Byte", "Byte", "Byte"]
+desc = """\
+       Variable that can only assume values in the range $[0, 2^32)$. \\
+       Represented as an array of four `Byte` variables.\
+       """
+
+[[variables.types]]
+label = "DWordBL"
+subtypes = ["Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte"]
+desc = """\
+       Variable that can only assume values in the range $[0, 2^64)$. \\
+       Represented as an array of eight `Byte` variables.\
+       """
+
+[[variables.types]]
+label = "DWordHL"
+subtypes = ["Half", "Half", "Half", "Half"]
+desc = """\
+       Variable that can only assume values in the range $[0, 2^64)$. \\
+       Represented as an array of four `Half` variables.\
+       """
+
+[[variables.types]]
+label = "DWordWL"
+subtypes = ["Word", "Word"]
+desc = """\
+       Variable that can only assume values in the range $[0, 2^64)$. \\
+       Represented as an array of two `Word` variables.\
+       """
+
+[[variables.types]]
+label = "DWordHHW"
+subtypes = ["Word", "Half", "Half"]
+desc = """\
+       Variable that can only assume values in the range $[0, 2^64)$. \\
+       Represented as a `Word` and two `Half` variables.\
+       The `Word` is the least significant digit.
+       """
+
+# TODO: Having to define these manually will get tedious
+[[variables.types]]
+label = "Bit[3]"
+subtypes = ["Bit", "Bit", "Bit"]
+desc = "Three bits"
+
+[[variables.types]]
+label = "Byte[2]"
+subtypes = ["Byte", "Byte"]
+desc = "Two bytes"
+
+[[variables.types]]
+label = "Byte[8]"
+subtypes = ["Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte"]
+desc = "Eight bytes"
+
+[[variables.types]]
+label = "Half[3]"
+subtypes = ["Half", "Half", "Half"]
+desc = "Three halfwords"
+
+[[variables.types]]
+label = "Half[8]"
+subtypes = ["Half", "Half", "Half", "Half", "Half", "Half", "Half", "Half"]
+desc = "Eight halfwords"
+
+
+[variables.categories]
+all = ["input", "output", "auxiliary", "virtual", "multiplicity"]
+instantiated = ["input", "output", "auxiliary", "multiplicity"]

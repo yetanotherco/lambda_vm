@@ -6,7 +6,7 @@
 #book-meta(
   title: "Lambda VM specification",
   summary: [
-    #prefix-chapter("sample_page.typ")[Sample page]
+    #chapter("variables.typ")[Variables]
   ]
 )
 
