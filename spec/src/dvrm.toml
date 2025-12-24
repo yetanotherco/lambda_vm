@@ -1,0 +1,334 @@
+name = "DVRM"
+
+# Input
+
+[[variables.input]]
+name = "n"
+type = "DWordHL"
+desc = "The numerator"
+
+[[variables.input]]
+name = "d"
+type = "DWordHL"
+desc = "The denominator"
+
+[[variables.input]]
+name = "signed"
+type = "Bit"
+desc = "Whether to interpret the input as signed integers"
+
+
+# Output
+
+[[variables.output]]
+name = "q"
+type = "DWordHL"
+desc = "The quotient; $#`n` / #`d`$ rounded towards zero."
+
+[[variables.output]]
+name = "r"
+type = "DWordHL"
+desc = "The remainder; $#`n` - #`q` #`d`$."
+
+# Auxiliary
+
+[[variables.auxiliary]]
+name = "div_by_zero"
+type = "Bit"
+desc = "Whether $#`d`=0$."
+
+[[variables.auxiliary]]
+name = "overflow"
+type = "Bit"
+desc = "Whether $#`n` = -2^63$ and $#`d`=-1$."
+
+[[variables.auxiliary]]
+name = "n_sub_r"
+type = "DWordHL"
+desc = "$#`n`-#`r`$."
+
+[[variables.auxiliary]]
+name = "n_sub_r_msb"
+type = "Bit"
+desc = "The most significant bit of `n_sub_r`."
+
+[[variables.auxiliary]]
+name = "n_sub_r_is_negative"
+type = "Bit"
+desc = "Whether `n_sub_r` is negative"
+
+[[variables.auxiliary]]
+name = "signed_q"
+type = "Bit"
+desc = "Whether to interpret `q` as a signed integer"
+
+[[variables.auxiliary]]
+name = "abs_r"
+type = "DWordHL"
+desc = "Absolute value of `r`."
+
+[[variables.auxiliary]]
+name = "abs_d"
+type = "DWordHL"
+desc = "Absolute value of `d`."
+
+[[variables.auxiliary]]
+name = "r_is_negative"
+type = "Bit"
+desc = "Whether `r` is negative."
+
+[[variables.auxiliary]]
+name = "n_is_negative"
+type = "Bit"
+desc = "Whether `n` is negative."
+
+[[variables.auxiliary]]
+name = "d_is_negative"
+type = "Bit"
+desc = "Whether `d` is negative."
+
+# Virtual
+
+[[variables.virtual]]
+name = "extended_n_sub_r"
+type = ["Half", 8]
+desc = "sign-extended value of `n_sub_r`."
+def = {idx="i", polys = [
+  {range=[0, 3], poly=["idx", "n_sub_r", "i"]},
+  {range=[4, 7], poly=["*", 0xFFFF, "n_sub_r_is_negative"]}
+]}
+
+
+# Multiplicities
+
+[[variables.multiplicity]]
+name = "μ_q"
+type = "BaseField"
+desc = ""
+
+[[variables.multiplicity]]
+name = "μ_r"
+type = "BaseField"
+desc = ""
+
+
+# Assumptions
+
+[[assumptions]]
+desc = "`IS_HALF[n[i]]`"
+range = ["i", 0, 3]
+ref = "lt:a:range_n"
+
+[[assumptions]]
+desc = "`IS_HALF[d[i]]`"
+range = ["i", 0, 3]
+ref = "lt:a:range_d"
+
+[[assumptions]]
+desc = "`IS_HALF[q[i]]`"
+range = ["i", 0, 3]
+ref = "lt:a:range_q"
+
+[[assumptions]]
+desc = "`IS_HALF[r[i]]`"
+range = ["i", 0, 3]
+ref = "lt:a:range_r"
+
+# Constraints
+
+[[constraint_groups]]
+name = "defs"
+
+[[constraints.defs]]
+kind = "template"
+tag = "IsZero"
+input = ["d"]
+output = "div_by_zero"
+ref = "dvrm:c:div_by_zero"
+cond = ["+", "μ_q", "μ_r"]
+
+[[constraints.defs]]
+kind = "template"
+tag = "IsEqual"
+input = [["=", "signed", 1], ["=", ["idx", "n", "0:3"], "[0, 0, 0]"], ["=", ["-", ["idx", "n", 3], ["*", 128, "n_is_negative"]], 0], ["=", "n_is_negative", 1]]
+output = "overflow"
+cond = ["+", "μ_q", "μ_r"]
+ref = "dvrm:c:overflow"
+
+[[constraints.defs]]
+kind = "template"
+tag = "SUB"
+input = ["n", "r"]
+output = "n_sub_r"
+ref = "dvrm:c:n_sub_r"
+
+[[constraints.defs]]
+kind = "interaction"
+tag = "MSB16"
+input = [["idx", "n_sub_r", 3]]
+output = "n_sub_r_msb"
+multiplicity = ["+", "μ_q", "μ_r"]
+ref = "dvrm:c:n_sub_r_msb"
+
+[[constraints.defs]]
+kind = "arith"
+constraint = "$#`n_sub_r_is_negative` = #`signed` dot #`n_sub_r_msb`$"
+poly = ["-", ["*", "signed", "n_sub_r_msb"], "n_sub_r_is_negative"]
+ref = "dvrm:c:n_sub_r_is_negative"
+
+[[constraints.defs]]
+kind = "interaction"
+tag = "MSB16"
+input = [["idx", "n", 3]]
+output = "n_is_negative"
+multiplicity = "signed"
+ref = "dvrm:c:n_is_negative_if_signed"
+
+[[constraints.defs]]
+kind = "arith"
+constraint = "$!#`signed` => #`n_is_negative` = 0$"
+poly = ["*", ["-", 1, "signed"], "n_is_negative"]
+ref = "dvrm:c:n_is_negative_if_not_signed"
+
+[[constraints.defs]]
+kind = "interaction"
+tag = "MSB16"
+input = [["idx", "d", 3]]
+output = "d_is_negative"
+multiplicity = "signed"
+ref = "dvrm:c:d_is_negative_if_signed"
+
+[[constraints.defs]]
+kind = "arith"
+constraint = "$!#`signed` => #`d_is_negative` = 0$"
+poly = ["*", ["-", 1, "signed"], "d_is_negative"]
+ref = "dvrm:c:d_is_negative_if_not_signed"
+
+[[constraints.defs]]
+kind = "interaction"
+tag = "MSB16"
+input = [["idx", "r", 3]]
+output = "r_is_negative"
+multiplicity = "signed"
+ref = "dvrm:c:r_is_negative_if_signed"
+
+[[constraints.defs]]
+kind = "arith"
+constraint = "$!#`signed` => #`r_is_negative` = 0$"
+poly = ["*", ["-", 1, "signed"], "r_is_negative"]
+ref = "dvrm:c:r_is_negative_if_not_signed"
+
+[[constraint_groups]]
+name = "equality"
+
+[[constraints.equality]]
+kind = "arith"
+constraint = "$#`signed_q` = #`signed` dot (1- #`overflow` )$"
+poly = ["-", ["*", "signed", ["-", 1, "overflow"]], "signed_q"]
+ref = "dvrm:c:signed_q"
+
+[[constraints.equality]]
+kind = "interaction"
+tag = "MUL"
+input = ["d", "signed", "q", "signed_q", 0]
+output = ["idx", "extended_n_sub_r", "0:4"]
+multiplicity = ["+", "μ_q", "μ_r"]
+ref = "dvrm:c:mul_lower"
+
+[[constraints.equality]]
+kind = "interaction"
+tag = "MUL"
+input = ["d", "signed", "q", "signed_q", 1]
+output = ["idx", "extended_n_sub_r", "4:8"]
+multiplicity = ["+", "μ_q", "μ_r"]
+ref = "dvrm:c:mul_upper"
+
+
+[[constraint_groups]]
+name = "abs_diff"
+
+[[constraints.abs_diff]]
+kind = "template"
+tag = "SUB"
+input = [0, "r"]
+output = "abs_r"
+cond = "r_is_negative"
+ref = "dvrm:c:abs_r_if_negative"
+
+[[constraints.abs_diff]]
+kind = "arith"
+constraint = "$!#`r_is_negative` => #`abs_r[i]`=#`r[i]`$"
+range = ["i", 0, 3]
+poly = ["*", ["-", 1, "r_is_negative"], ["-", ["idx", "abs_r", "i"], ["idx", "r", "i"]]]
+ref = "dvrm:c:abs_r_if_nonnegative"
+
+[[constraints.abs_diff]]
+kind = "template"
+tag = "SUB"
+input = [0, "d"]
+output = "abs_d"
+cond = "d_is_negative"
+ref = "dvrm:c:abs_d_if_negative"
+
+[[constraints.abs_diff]]
+kind = "arith"
+constraint = "$!#`d_is_negative` => #`abs_d[i]`=#`d[i]`$"
+range = ["i", 0, 3]
+poly = ["*", ["-", 1, "d_is_negative"], ["-", ["idx", "abs_d", "i"], ["idx", "d", "i"]]]
+ref = "dvrm:c:abs_d_if_nonnegative"
+
+
+[[constraint_groups]]
+name = "div_by_zero"
+
+
+[[constraints.div_by_zero]]
+kind = "arith"
+range = ["i", 0, 3]
+constraint = "$#`div_by_zero` => #`q[i]` = 65535$"
+poly = ["*", "div_by_zero", ["-", ["idx", "q", "i"], 65535]]
+ref = "dvrm:c:q_if_div_by_zero"
+
+
+[[constraints.div_by_zero]]
+kind = "arith"
+range = ["i", 0, 3]
+constraint = "$#`div_by_zero` => #`r[i]` = #`n[i]`$"
+poly = ["*", "div_by_zero", ["-", ["idx", "r", "i"], ["idx", "n", "i"]]]
+ref = "dvrm:c:r_if_div_by_zero"
+
+
+[[constraint_groups]]
+name = "overflow"
+
+[[constraints.overflow]]
+kind = "arith"
+range = ["i", 0, 3]
+constraint = "$#`overflow` => #`q[i]` = #`n[i]`$"
+poly = ["*", "overflow", ["-", ["idx", "q", "i"], ["idx", "n", "i"]]]
+ref = "dvrm:c:q_if_overflow"
+
+[[constraints.overflow]]
+kind = "arith"
+range = ["i", 0, 3]
+constraint = "$#`overflow` => #`r[i]` = 0$"
+poly = ["*", "overflow", ["idx", "r", "i"]]
+ref = "dvrm:c:r_if_overflow"
+
+[[constraint_groups]]
+name = "output"
+desc = "Each row contributes the following to the LogUp sum"
+
+[[constraints.output]]
+kind = "interaction"
+tag = "DVRM"
+input = ["n", "d", "signed", "0"]
+output = "q"
+multiplicity = "-μ_q"
+
+[[constraints.output]]
+kind = "interaction"
+tag = "DVRM"
+input = ["n", "d", "signed", "1"]
+output = "r"
+multiplicity = "-μ_r"
