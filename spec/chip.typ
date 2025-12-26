@@ -43,9 +43,11 @@
   ), caption: [Column overview of #chip.name chip.])
 }
 
-#let cref(constraint) = {
+#let cref(constraint, body) = {
   if "ref" in constraint {
-    label(constraint.ref)
+    [#body#label(constraint.ref)]
+  } else {
+    body
   }
 }
 
@@ -69,7 +71,7 @@
     let index = if "range" in assumption { "." + assumption.range.at(0) } else { "" }
     let lbl = [#chip.name\-A]
     show figure: (it) => align(left, block[#lbl#context it.counter.display()#index])
-    [#figure(kind: "assumption", numbering: (i) => [#lbl#i#index], supplement: [], [])#cref(assumption)]
+    cref(assumption)[#figure(kind: "assumption", numbering: (i) => [#lbl#i#index], supplement: [], [])]
   }
 
   figure(table(
@@ -102,7 +104,7 @@
     let prefix = if "prefix" in group { group.prefix }
     let lbl = [#chip.name\-C#prefix]
     show figure: (it) => align(left, block[#lbl#context it.counter.display()#index])
-    [#figure(kind: "constraint", numbering: (i) => [#lbl#i#index], supplement: [], [])#cref(constraint)]
+    cref(constraint)[#figure(kind: "constraint", numbering: (i) => [#lbl#i#index], supplement: [], [])]
   }
 
   /// Generates a representation of `constraint`
@@ -112,7 +114,7 @@
     if kind == "interaction" {
       raw(constraint.tag) + `[` + args_interaction_like(constraint.input, constraint.at("output", default: none)) + `]`
     } else if kind == "arith" {
-      [#eval(constraint.constraint)]
+      [#eval(constraint.constraint, mode: "markup")]
     } else if kind == "template" {
       raw(constraint.tag) + `<` + args_interaction_like(constraint.input, constraint.at("output", default: none)) + `>`
     } else {
@@ -120,9 +122,14 @@
     }
   }
 
-  // Whether constraints has polynomial constraints
+  // Whether constraint has polynomial constraints
   let has_polynomial_constraints(constraint) = {
-    constraint.at("kind") == "arith" and ("poly" in constraint or "polys" in constraint)
+    constraint.kind == "arith" and ("poly" in constraint or "polys" in constraint)
+  }
+
+  // Whether constraint has a "desc" field we need to render separately
+  let has_extra_description(constraint) = {
+    constraint.kind == "arith" and "desc" in constraint
   }
 
   // Rendering polynomial constraints
@@ -137,6 +144,11 @@
     (..for poly in polys {
       ([_polynomial constraint_], [], $#expr_to_math(poly) = 0$, [])
     },)
+  }
+
+  // Rendering the additional "desc" field for arith constraints
+  let render_extra_description(constraint) = {
+    ([_description_], [], eval(constraint.desc, mode: "markup"), [])
   }
 
   figure(table(
@@ -154,6 +166,9 @@
           [#repr_constraint(constraint)],
           [#expr_to_math(constraint.at("multiplicity", default: ""))],
         )
+        if has_extra_description(constraint) {
+          render_extra_description(constraint)
+        }
         if has_polynomial_constraints(constraint) {
           render_polynomial_constraints(constraint)
         }
