@@ -54,8 +54,8 @@ desc = "result of left/right shifting the individual limbs of `in` by `bit_shift
 
 [[variables.auxiliary]]
 name = "carry"
-type = "Half[3]"
-desc = "the carry values left/right shifting `in` by `bit_shift`. Note: one fewer limb is needed, since the last carry is shifted off."
+type = "Half[4]"
+desc = "the carry values of left/right shifting `in` by `bit_shift`."
 
 # Virtual
 
@@ -63,7 +63,7 @@ desc = "the carry values left/right shifting `in` by `bit_shift`. Note: one fewe
 name = "left"
 type = "Bit"
 desc = "Whether to perform a left-shift."
-poly = ["not", "direction"]
+poly = ["-", "μ", "direction"]
 
 [[variables.virtual]]
 name = "right"
@@ -116,6 +116,12 @@ output = "limb_shift_even"
 ref = "shift:c:limb_shift_even"
 multiplicity = "μ"
 
+[[constraints.defs]]
+kind = "arith"
+constraint = "$#`direction` => #`μ`$"
+poly = ["*", "direction", ["-", 1, "μ"]]
+ref = "shift:c:direction_implies_mu"
+
 
 [[constraint_groups]]
 name = "intra_limb_left_shifting"
@@ -126,23 +132,22 @@ tag = "HWSL"
 input = [["idx", "in", "i"], "bit_shift"]
 output = ["idx", "bit_shifted_uncarried", "i"]
 range = ["i", 0, 3]
-multiplicity = "μ - direction"
+multiplicity = "left"
 ref = "shift:c:hwsl"
-
 
 [[constraints.intra_limb_left_shifting]]
 kind = "interaction"
 tag = "HWSLC"
-input = [["idx", "in", "i"], "bit_shift"]
+input = [["idx", "in", ["-", "i", 1]], "bit_shift"]
 output = ["idx", "carry", "i"]
-range = ["i", 0, 2]
-multiplicity = "μ - direction"
+range = ["i", 1, 3]
+multiplicity = "left"
 ref = "shift:c:hwsl"
 
 [[constraints.intra_limb_left_shifting]]
 kind = "arith"
-constraint = "$#`left` => #`carry[3]` = 0$"
-poly = ["*", "left", ["idx", "carry", 3]]
+constraint = "$#`left` => #`carry[0]` = 0$"
+poly = ["*", "left", ["idx", "carry", 0]]
 ref = "shift:c:left_zero_carry"
 
 
@@ -155,22 +160,22 @@ tag = "HWSR"
 input = [["idx", "in", "i"], "bit_shift"]
 output = ["idx", "bit_shifted_uncarried", "i"]
 range = ["i", 0, 3]
-multiplicity = "direction"
+multiplicity = "right"
 ref = "shift:c:hwsr"
 
 [[constraints.intra_limb_right_shifting]]
 kind = "interaction"
 tag = "HWSRC"
-input = [["idx", "in", "i"], "bit_shift"]
+input = [["idx", "in", ["+", "i", 1]], "bit_shift"]
 output = ["idx", "carry", "i"]
-range = ["i", 1, 3]
-multiplicity = "direction"
+range = ["i", 0, 2]
+multiplicity = "right"
 ref = "shift:c:hwsrc"
 
 [[constraints.intra_limb_right_shifting]]
 kind = "arith"
-constraint = "$#`left` => #`carry[0]` = 0$"
-poly = ["*", "left", ["idx", "carry", 0]]
+constraint = "$#`right` => #`carry[3]` = 0$"
+poly = ["*", "right", ["idx", "carry", 3]]
 ref = "shift:c:right_zero_carry"
 
 
@@ -186,7 +191,7 @@ range = ["i", 0, 3]
 [[constraints.limb_left_shifting]]
 kind = "arith"
 constraint = "$#`left` and #`limb_shift_odd` and #`!limb_shift_even` => #`shifted[i]` = #`bit_shifted[i-1]`$"
-poly = ["*", "left", "limb_shift_odd", ["-", 32, "limb_shift_even"], ["-", ["idx", "shifted", "i"], ["idx", "bit_shifted", "i-1"]]]
+poly = ["*", "left", "limb_shift_odd", ["-", 32, "limb_shift_even"], ["-", ["idx", "shifted", "i"], ["idx", "bit_shifted", ["-", "i", 1]]]]
 range = ["i", 1, 3]
 
 [[constraints.limb_left_shifting]]
@@ -197,15 +202,14 @@ poly = ["*", "left", "limb_shift_odd", ["-", 32, "limb_shift_even"], ["idx", "sh
 [[constraints.limb_left_shifting]]
 kind = "arith"
 constraint = "$#`left` and #`!limb_shift_odd` and #`limb_shift_even` => #`shifted[i]` = #`bit_shifted[i-2]`$"
-poly = ["*", "left", ["-", 16, "limb_shift_odd"], "limb_shift_even", ["-", ["idx", "shifted", "i"], ["idx", "bit_shifted", "i-2"]]]
+poly = ["*", "left", ["-", 16, "limb_shift_odd"], "limb_shift_even", ["-", ["idx", "shifted", "i"], ["idx", "bit_shifted", ["-", "i", 2]]]]
 range = ["i", 2, 3]
 
 [[constraints.limb_left_shifting]]
 kind = "arith"
 constraint = "$#`left` and #`!limb_shift_odd` and #`limb_shift_even` => #`shifted[i]` = 0$"
 poly = ["*", "left", ["-", 16, "limb_shift_odd"], "limb_shift_even", ["idx", "shifted", "i"]]
-range = ["i", 0, 2]
-
+range = ["i", 0, 1]
 
 [[constraints.limb_left_shifting]]
 kind = "arith"
@@ -216,4 +220,4 @@ poly = ["*", "left", "limb_shift_odd", "limb_shift_even", ["-", ["idx", "shifted
 kind = "arith"
 constraint = "$#`left` and #`limb_shift_odd` and #`limb_shift_even` => #`shifted[i]` = 0$"
 poly = ["*", "left", "limb_shift_odd", "limb_shift_even", ["idx", "shifted", "i"]]
-range = ["i", 0, 3]
+range = ["i", 0, 2]
