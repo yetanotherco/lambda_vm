@@ -135,7 +135,7 @@
     }
 
     (..for poly in polys {
-      ([_polynomial constraint_], [], $#expr_to_math(poly) = 0$, [])
+      (table.cell(colspan: 2, align: right, emph("polynomial constraint")), $#expr_to_math(poly) = 0$, [])
     },)
   }
 
