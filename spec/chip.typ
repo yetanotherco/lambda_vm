@@ -20,6 +20,7 @@
 /// Generates a table listing `chip`'s columns.
 #let render_chip_column_table(chip, config) = {
   // Group variables by category
+  show figure: set block(breakable: true)
   figure(table(
     columns: (auto, auto, 1fr),
     inset: 6pt,
@@ -98,6 +99,9 @@
   }
   assert(groups.all(group => group in all_groups), message: "unknown group")
 
+  // Find the group definition in the constraint_groups
+  let lookup_group(name) = chip.constraint_groups.filter((g) => g.name == name).at(0, default: (name: name))
+
   /// Render the contraint's tag.
   let tag(constraint, group) = {
     let index = if "range" in constraint { "." + constraint.range.at(0) } else { "" }
@@ -116,7 +120,10 @@
     } else if kind == "arith" {
       [#eval(constraint.constraint, mode: "markup")]
     } else if kind == "template" {
-      raw(constraint.tag) + `<` + args_interaction_like(constraint.input, constraint.at("output", default: none)) + `>`
+      let cond = if "cond" in constraint {
+        $#expr_to_math(constraint.cond) arrow.r.double$ + " "
+      }
+      cond + raw(constraint.tag) + `<` + args_interaction_like(constraint.input, constraint.at("output", default: none)) + `>`
     } else {
       assert(false, message: "illegal constraint format: " + kind)
     }
@@ -151,6 +158,7 @@
     ([_description_], [], eval(constraint.desc, mode: "markup"), [])
   }
 
+  show figure: set block(breakable: true)
   figure(table(
     columns: (auto, auto, 1fr, auto),
     inset: 6pt,
@@ -161,7 +169,7 @@
     ..for group in groups {
       for constraint in chip.constraints.at(group) {
         (
-          [#tag(constraint, group)],
+          [#tag(constraint, lookup_group(group))],
           [#interval(constraint)],
           [#repr_constraint(constraint)],
           [#expr_to_math(constraint.at("multiplicity", default: ""))],
