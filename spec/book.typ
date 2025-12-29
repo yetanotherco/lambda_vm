@@ -1,4 +1,3 @@
-
 #import "@preview/shiroa:0.3.1": *
 
 #show: book
@@ -8,6 +7,7 @@
   summary: [
     #chapter("variables.typ")[Variables]
     #chapter("is_bit.typ")[IS_BIT template]
+    #chapter("cpu.typ")[CPU chip]
   ]
 )
 
