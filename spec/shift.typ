@@ -5,7 +5,7 @@
   total_nr_variables,
   total_nr_instantiated_columns,
   render_constraint_table,
-  render_chip_assumptions
+  render_chip_assumptions,
 )
 
 #let config = load_config()
@@ -24,11 +24,12 @@ The `SHIFT` chip is comprised of #nr_variables variables that are expressed usin
 // #render_chip_assumptions(chip, config)
 
 == Constraints
-#render_constraint_table(chip, config, groups:("defs", ))
-
-#render_constraint_table(chip, config, groups:("intra_limb_left_shifting", "intra_limb_right_shifting"))
-
-#render_constraint_table(chip, config, groups:("limb_left_shifting", ))
+#render_constraint_table(chip, config, groups: "defs")
+#render_constraint_table(chip, config, groups: "intra_limb_left_shifting")
+#render_constraint_table(chip, config, groups: "intra_limb_right_shifting")
+#render_constraint_table(chip, config, groups: "limb_shifting")
+#render_constraint_table(chip, config, groups: "limb_left_shifting")
+#render_constraint_table(chip, config, groups: "limb_right_shifting")
 
 // #render_constraint_table(chip, config, groups:("equality", ))
 
