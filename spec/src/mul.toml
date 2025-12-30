@@ -1,0 +1,177 @@
+name = "MUL"
+
+
+# Input
+
+[[variables.input]]
+name = "lhs"
+type = "DWordHL"
+desc = "the left hand operator."
+
+[[variables.input]]
+name = "lhs_signed"
+type = "Bit"
+desc = "whether to interpret `lhs` as a signed integer (1) or not (0)."
+
+[[variables.input]]
+name = "rhs"
+type = "DWordHL"
+desc = "the right hand operator."
+
+[[variables.input]]
+name = "rhs_signed"
+type = "Bit"
+desc = "whether to interpret `rhs` as a signed integer (1) or not (0)."
+
+
+# Output
+
+[[variables.output]]
+name = "res"
+type = "QuadHL"
+desc = "the (extended) multiplication result"
+
+# Auxiliary
+
+[[variables.auxiliary]]
+name = "lhs_msb"
+type = "Bit"
+desc = "the most significant bit of `lhs`"
+
+[[variables.auxiliary]]
+name = "rhs_msb"
+type = "Bit"
+desc = "the most significant bit of `rhs`"
+
+[[variables.auxiliary]]
+name = "raw_product"
+type = "Half[8]"
+desc = "raw multiplication output"
+
+# Virtual
+
+[[variables.virtual]]
+name = "lhs_ext"
+type = "Half[8]"
+desc = "sign-extended value of `lhs`"
+polys = [ 
+    ["idx", "lhs", 0],
+    ["idx", "lhs", 1],
+    ["idx", "lhs", 2],
+    ["idx", "lhs", 3],
+    ["*", 65535, "lhs_signed", "lhs_msb"],
+    ["*", 65535, "lhs_signed", "lhs_msb"],
+    ["*", 65535, "lhs_signed", "lhs_msb"],
+    ["*", 65535, "lhs_signed", "lhs_msb"],
+]
+
+[[variables.virtual]]
+name = "rhs_ext"
+type = "Half[8]"
+desc = "sign-extended value of `rhs`"
+polys = [ 
+    ["idx", "rhs", 0],
+    ["idx", "rhs", 1],
+    ["idx", "rhs", 2],
+    ["idx", "rhs", 3],
+    ["*", 65535, "rhs_signed", "rhs_msb"],
+    ["*", 65535, "rhs_signed", "rhs_msb"],
+    ["*", 65535, "rhs_signed", "rhs_msb"],
+    ["*", 65535, "rhs_signed", "rhs_msb"],
+]
+
+[[variables.virtual]]
+name = "carry"
+type = "Half[8]"
+desc = "carry values"
+polys = [
+    ["/", ["-", ["idx", "raw_product", 0], ["idx", "res", 0]], 65535],
+    ["/", ["-", ["+", ["idx", "raw_product", 1], ["idx", "carry", 0]], ["idx", "res", 1]], 65535],
+    ["/", ["-", ["+", ["idx", "raw_product", 2], ["idx", "carry", 1]], ["idx", "res", 2]], 65535],
+    ["/", ["-", ["+", ["idx", "raw_product", 3], ["idx", "carry", 2]], ["idx", "res", 3]], 65535],
+    ["/", ["-", ["+", ["idx", "raw_product", 4], ["idx", "carry", 3]], ["idx", "res", 4]], 65535],
+    ["/", ["-", ["+", ["idx", "raw_product", 5], ["idx", "carry", 4]], ["idx", "res", 5]], 65535],
+    ["/", ["-", ["+", ["idx", "raw_product", 6], ["idx", "carry", 5]], ["idx", "res", 6]], 65535],
+    ["/", ["-", ["+", ["idx", "raw_product", 7], ["idx", "carry", 6]], ["idx", "res", 7]], 65535],
+]
+
+
+# Multiplicity
+
+[[variables.multiplicity]]
+name = "μ_lo"
+type = "BaseField"
+desc = ""
+
+[[variables.multiplicity]]
+name = "μ_hi"
+type = "BaseField"
+desc = ""
+
+# Assumptions
+
+[[assumptions]]
+desc = "IS_HALF[lhs[i]]"
+range = ["i", 0, 3]
+
+[[assumptions]]
+desc = "IS_HALF[rhs[i]]"
+range = ["i", 0, 3]
+
+
+# Constraints
+
+[[constraint_groups]]
+name = "def"
+
+[[constraints.def]]
+kind = "interaction"
+tag = "MSB16"
+input = [["idx", "lhs", 3]]
+output = "lhs_msb"
+multiplicity = ["+", "μ_lo", "μ_hi"]
+ref = "mul:c:lhs_msb"
+
+[[constraints.def]]
+kind = "interaction"
+tag = "MSB16"
+input = [["idx", "rhs", 3]]
+output = "rhs_msb"
+multiplicity = ["+", "μ_lo", "μ_hi"]
+ref = "mul:c:rhs_msb"
+
+[[constraints.def]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "carry", "i"]]
+range = ["i", 0, 7]
+multiplicity = ["+", "μ_lo", "μ_hi"]
+ref = "mul:c:carry"
+
+[[constraint_groups]]
+name = "prod"
+
+[[constraints.prod]]
+kind = "arith"
+constraint = "$#`raw_product[i]` = sum_(j=0)^i #`lhs_ext[i]` dot #`rhs_ext[i - j]`$"
+poly = ["-", ["idx", "raw_product", "i"], ["sum", ["j", 0, "i"], ["*", ["idx", "lhs_ext", "i"], ["idx", "rhs_ext", ["-", "i", "j"]]]]]
+range = ["i", 0, 7]
+
+[[constraint_groups]]
+name = "lookup"
+
+[[constraints.lookup]]
+kind = "interaction"
+tag = "MUL"
+input = ["lhs", "lhs_signed", "rhs", "rhs_signed", "0"]
+output = ["idx", "res", "0:4"]
+multiplicity = ["-", "μ_lo"]
+ref = "mul:c:lookup_lo"
+
+[[constraints.lookup]]
+kind = "interaction"
+tag = "MUL"
+input = ["lhs", "lhs_signed", "rhs", "rhs_signed", "1"]
+output = ["idx", "res", "4:8"]
+multiplicity = ["-", "μ_hi"]
+ref = "mul:c:lookup_hi"

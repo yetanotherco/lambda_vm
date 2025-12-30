@@ -7,6 +7,7 @@
   title: "Lambda VM specification",
   summary: [
     #chapter("variables.typ")[Variables]
+    #chapter("mul.typ")[MUL chip]
   ]
 )
 
