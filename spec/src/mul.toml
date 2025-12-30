@@ -28,7 +28,7 @@ desc = "whether to interpret `rhs` as a signed integer (1) or not (0)."
 
 [[variables.output]]
 name = "res"
-type = "QuadHL"
+type = "QuadWL"
 desc = "the (extended) multiplication result"
 
 # Auxiliary
@@ -82,17 +82,13 @@ polys = [
 
 [[variables.virtual]]
 name = "carry"
-type = "Half[8]"
+type = "B20[4]"
 desc = "carry values"
 polys = [
-    ["/", ["-", ["idx", "raw_product", 0], ["idx", "res", 0]], 65535],
-    ["/", ["-", ["+", ["idx", "raw_product", 1], ["idx", "carry", 0]], ["idx", "res", 1]], 65535],
-    ["/", ["-", ["+", ["idx", "raw_product", 2], ["idx", "carry", 1]], ["idx", "res", 2]], 65535],
-    ["/", ["-", ["+", ["idx", "raw_product", 3], ["idx", "carry", 2]], ["idx", "res", 3]], 65535],
-    ["/", ["-", ["+", ["idx", "raw_product", 4], ["idx", "carry", 3]], ["idx", "res", 4]], 65535],
-    ["/", ["-", ["+", ["idx", "raw_product", 5], ["idx", "carry", 4]], ["idx", "res", 5]], 65535],
-    ["/", ["-", ["+", ["idx", "raw_product", 6], ["idx", "carry", 5]], ["idx", "res", 6]], 65535],
-    ["/", ["-", ["+", ["idx", "raw_product", 7], ["idx", "carry", 6]], ["idx", "res", 7]], 65535],
+    ["/", ["-", ["+", ["idx", "raw_product", 0], ["*", 65536, ["idx",  "raw_product", 1]]], ["idx", "res", 0]], 4294967295],
+    ["/", ["-", ["+", ["idx", "raw_product", 2], ["*", 65536, ["idx",  "raw_product", 3]], ["idx", "carry", 0]], ["idx", "res", 1]], 4294967295],
+    ["/", ["-", ["+", ["idx", "raw_product", 4], ["*", 65536, ["idx",  "raw_product", 5]], ["idx", "carry", 1]], ["idx", "res", 2]], 4294967295],
+    ["/", ["-", ["+", ["idx", "raw_product", 6], ["*", 65536, ["idx",  "raw_product", 7]], ["idx", "carry", 2]], ["idx", "res", 3]], 4294967295],
 ]
 
 
@@ -142,7 +138,7 @@ ref = "mul:c:rhs_msb"
 
 [[constraints.def]]
 kind = "interaction"
-tag = "IS_HALF"
+tag = "IS_B20"
 input = [["idx", "carry", "i"]]
 range = ["i", 0, 7]
 multiplicity = ["+", "μ_lo", "μ_hi"]
