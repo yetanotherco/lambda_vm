@@ -89,6 +89,14 @@ desc = """\
        Represented as an array of eight `Half` variables.\
        """
 
+[[variables.types]]
+label = "QuadWL"
+subtypes = ["Word", "Word", "Word", "Word"]
+desc = """\
+       Variable that can only assume values in the range $[0, 2^128)$. \\
+       Represented as an array of four `Word` variables.\
+       """
+
 # TODO: Having to define these manually will get tedious
 [[variables.types]]
 label = "Bit[3]"
