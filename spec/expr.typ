@@ -129,7 +129,7 @@
   if type(typ) == array {
     check_array_type(typ)
     return raw(typ.at(0) + "[" + str(typ.at(1)) + "]")
-  } else if type(typ) == string {
+  } else if type(typ) == str {
     return raw(typ)
   } else {
     assert(false, message: "Unknown format for type: " + repr(typ))
