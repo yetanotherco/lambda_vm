@@ -143,7 +143,7 @@
 
   // Whether constraint has a "desc" field we need to render separately
   let has_extra_description(constraint) = {
-    constraint.kind == "arith" and "desc" in constraint
+    "desc" in constraint
   }
 
   // Rendering polynomial constraints
