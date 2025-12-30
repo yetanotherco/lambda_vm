@@ -91,10 +91,10 @@ name = "carry"
 type = "B20[4]"
 desc = "carry values"
 polys = [
-    ["/", ["-", ["idx", "raw_product", 0], ["idx", "res", 0]], ["^", 2, 32]],
-    ["/", ["-", ["+", ["idx", "raw_product", 1], ["idx", "carry", 0]], ["idx", "res", 1]], ["^", 2, 32]],
-    ["/", ["-", ["+", ["idx", "raw_product", 2], ["idx", "carry", 1]], ["idx", "res", 2]], ["^", 2, 32]],
-    ["/", ["-", ["+", ["idx", "raw_product", 3], ["idx", "carry", 2]], ["idx", "res", 3]], ["^", 2, 32]],
+    ["*", ["^", 2, -32], ["-", ["idx", "raw_product", 0], ["idx", "res", 0]]],
+    ["*", ["^", 2, -32], ["-", ["+", ["idx", "raw_product", 1], ["idx", "carry", 0]], ["idx", "res", 1]]],
+    ["*", ["^", 2, -32], ["-", ["+", ["idx", "raw_product", 2], ["idx", "carry", 1]], ["idx", "res", 2]]],
+    ["*", ["^", 2, -32], ["-", ["+", ["idx", "raw_product", 3], ["idx", "carry", 2]], ["idx", "res", 3]]],
 ]
 
 
