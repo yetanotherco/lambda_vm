@@ -16,19 +16,21 @@
 // To limit the number of parentheses that are placed in an expression,
 // the formatter passes `pp` (for Parent Precedence) to each recursive subcall,
 // and wraps itself in parentheses when `pp < expr.precedence`.
-//
-// Precedence values:
-// 0 : ^
-// 1 : neg (e.g., 5 =>  -5)
-// 2 : *
-// 3 : /
-// 4 : not (e.g., 5 => 1-5)
-// 5 : +
-// 6 : -
-// 7 : []
-// 8 : =
-// 10: <the void outside every expression>
-#let MAX_PRECEDENCE = 10
+
+#let PREC = (
+  "MIN": -1, // <the most secret heart of any expression>
+  "pow": 0,  // ^
+  "neg": 1,  // Unary -
+  "mul": 2,  // *
+  "div": 3,  // /
+  "not": 4,  // not
+  "add": 5,  // +
+  "sub": 6,  // -
+  "idx": 7,  // []
+  "cast": 8, // cast
+  "eq": 9,   // =
+  "MAX": 10, // <the void outside every expression>
+)
 
 // Mutual recursion through a trick from https://github.com/typst/typst/issues/744
 #let make_expr_formatter(dict, empty: none, var: raw, num: str) = {
@@ -45,7 +47,7 @@
       }))(pp, res, expr)
     }
   }
-  res.with(MAX_PRECEDENCE)
+  res.with(PREC.MAX)
 }
 
 // Wrap code `expr` if `apply = true`
@@ -60,23 +62,24 @@
 // Typeset an expression as code
 #let expr_to_code = make_expr_formatter(
   (
-    "idx": (pp, rec, e) => rec(0, e.at(1)) + `[` + rec(10, e.at(2)) + `]`,
-    "not": (pp, rec, e) => cwrap(`1 - ` + rec(4, e.at(1)), pp < 4),
-    "+": (pp, rec, e) => cwrap(e.slice(1).map(rec.with(5)).join(` + `), pp < 5),
-    "*": (pp, rec, e) => cwrap(e.slice(1).map(rec.with(2)).join(` ` + sym.dot + ` `), pp < 2),
-    "/": (pp, rec, e) => cwrap(rec(3, e.at(1)), pp < 3) + ` / ` + rec(3, e.at(2)),
+    "idx": (pp, rec, e) => rec(PREC.MIN, e.at(1)) + `[` + rec(PREC.MAX, e.at(2)) + `]`,
+    "not": (pp, rec, e) => cwrap(`1 - ` + rec(PREC.not, e.at(1)), pp < PREC.not),
+    "+": (pp, rec, e) => cwrap(e.slice(1).map(rec.with(PREC.add)).join(` + `), pp < PREC.add),
+    "*": (pp, rec, e) => cwrap(e.slice(1).map(rec.with(PREC.mul)).join(` ` + sym.dot + ` `), pp < PREC.mul),
+    "/": (pp, rec, e) => cwrap(rec(PREC.div, e.at(1)), pp < PREC.div) + ` / ` + rec(PREC.div, e.at(2)),
     "^": (pp, rec, e) => {
       assert(type(e.at(1)) == int and type(e.at(2)) == int, message: "Can only exponentiate constants")
-      rec(0, e.at(1)) + `^` + rec(0, e.at(2))
+      // technically wrong associativity, but it's a constant
+      rec(PREC.pow, e.at(1)) + `^` + rec(PREC.pow, e.at(2))
     },
-    "=": (pp, rec, e) => rec(8, e.at(1)) + ` = ` + rec(8, e.at(2)),
+    "=": (pp, rec, e) => rec(PREC.eq, e.at(1)) + ` = ` + rec(PREC.eq, e.at(2)),
     "-": (pp, rec, e) => {
       if e.len() == 2 {
         // Negation
-        cwrap(`-` + rec(1, e.at(1)), pp < 1)
+        cwrap(`-` + rec(PREC.neg, e.at(1)), pp < PREC.neg)
       } else {
         // Subtraction
-        cwrap(e.slice(1).map(rec.with(6)).join(` - `), pp < 6)
+        cwrap(e.slice(1).map(rec.with(PREC.sub)).join(` - `), pp < PREC.sub)
       }
     },
   ),
@@ -94,23 +97,23 @@
 // Typeset an expression as math
 #let expr_to_math = make_expr_formatter(
   (
-    "idx": (pp, rec, e) => $#rec(7, e.at(1))_(#rec(7, e.at(2)))$,
-    "not": (pp, rec, e) => mwrap($1 - #rec(4, e.at(1))$, pp < 4),
-    "+": (pp, rec, e) => mwrap($#e.slice(1).map(rec.with(5)).join($+$)$, pp < 5),
-    "*": (pp, rec, e) => mwrap($#e.slice(1).map(rec.with(3)).join($dot$)$, pp < 3),
-    "/": (pp, rec, e) => $#rec(3, e.at(1)) / #rec(3, e.at(2))$,
+    "idx": (pp, rec, e) => $#rec(PREC.idx, e.at(1))_(#rec(PREC.idx, e.at(2)))$,
+    "not": (pp, rec, e) => mwrap($1 - #rec(PREC.not, e.at(1))$, pp < PREC.not),
+    "+": (pp, rec, e) => mwrap($#e.slice(1).map(rec.with(PREC.add)).join($+$)$, pp < PREC.add),
+    "*": (pp, rec, e) => mwrap($#e.slice(1).map(rec.with(PREC.mul)).join($dot$)$, pp < PREC.mul),
+    "/": (pp, rec, e) => $#rec(PREC.div, e.at(1)) / #rec(PREC.div, e.at(2))$,
     "^": (pp, rec, e) => {
       assert(type(e.at(1)) == int and type(e.at(2)) == int, message: "Can only exponentiate constants")
       $#e.at(1)^#e.at(2)$
     },
-    "=": (pp, rec, e) => $#rec(8, e.at(1)) = #rec(8, e.at(2))$,
+    "=": (pp, rec, e) => $#rec(PREC.eq, e.at(1)) = #rec(PREC.eq, e.at(2))$,
     "-": (pp, rec, e) => {
       if e.len() == 2 {
         // Negation
-        mwrap($-#rec(1, e.at(1))$, pp < 1)
+        mwrap($-#rec(PREC.neg, e.at(1))$, pp < PREC.neg)
       } else {
         // Subtraction
-        mwrap($#e.slice(1).map(rec.with(6)).join($-$)$, pp < 6)
+        mwrap($#e.slice(1).map(rec.with(PREC.sub)).join($-$)$, pp < PREC.sub)
       }
     },
   ),
