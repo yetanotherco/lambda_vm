@@ -133,7 +133,7 @@ multiplicity = "μ"
 kind = "interaction"
 tag = "AND_BYTE"
 input = ["shift", "0x30"]
-output = ["+", ["-", 1, "limb_shift_0"], ["*", 15, "limb_shift_1"], ["*", 31, "limb_shift_1"], ["*", 47, "limb_shift_1"]]
+output = ["+", ["-", 1, "limb_shift_0"], ["*", 15, "limb_shift_1"], ["*", 31, "limb_shift_2"], ["*", 47, "limb_shift_3"]]
 ref = "shift:c:limb_shift_x"
 multiplicity = "μ"
 
