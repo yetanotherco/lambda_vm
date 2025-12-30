@@ -97,7 +97,7 @@
     "idx": (pp, rec, e) => $#rec(7, e.at(1))_(#rec(7, e.at(2)))$,
     "not": (pp, rec, e) => mwrap($1 - #rec(4, e.at(1))$, pp < 4),
     "+": (pp, rec, e) => mwrap($#e.slice(1).map(rec.with(5)).join($+$)$, pp < 5),
-    "sum": (pp, rec, e) => mwrap($sum_(#e.at(1).at(0)=#e.at(1).at(1))^#e.at(1).at(2) #e.slice(2).map(rec.with(5)).join($+$)$, pp < 5),
+    "sum": (pp, rec, e) => mwrap($sum_(#e.at(1).at(0)=#e.at(1).at(1))^#rec(10, e.at(1).at(2)) #e.slice(2).map(rec.with(5)).join($+$)$, pp < 5),
     "*": (pp, rec, e) => mwrap($#e.slice(1).map(rec.with(3)).join($dot$)$, pp < 3),
     "/": (pp, rec, e) => $#rec(3, e.at(1)) / #rec(3, e.at(2))$,
     "^": (pp, rec, e) => {
