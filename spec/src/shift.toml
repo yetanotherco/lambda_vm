@@ -58,14 +58,9 @@ type = "Half[4]"
 desc = "the carry values of left/right shifting `in` by `bit_shift`."
 
 [[variables.auxiliary]]
-name = "msb"
+name = "is_negative"
 type = "Bit"
-desc = "the most significant bit of `in`."
-
-[[variables.auxiliary]]
-name = "extension"
-type = "Half"
-desc = "sign extension of `in`."
+desc = "whether `in` is negative."
 
 [[variables.auxiliary]]
 name = "limb_shift_1"
@@ -89,6 +84,12 @@ name = "limb_shift_0"
 type = "Bit"
 desc = "Whether $floor.l #`bit_shift` / 16 floor.r = 0 mod 4$."
 poly = ["/", ["*", ["-", 16, "limb_shift_odd"], ["-", 32, "limb_shift_even"]], 512]
+
+[[variables.virtual]]
+name = "extension"
+type = "Half"
+desc = "sign extension of `in`."
+poly = ["*", 65535, "is_negative"]
 
 [[variables.virtual]]
 name = "left"
@@ -233,15 +234,14 @@ ref = "shift:c:hwsrc"
 kind = "interaction"
 tag = "MSB16"
 input = [["idx", "in", 3]]
-output = "msb"
-multiplicity = "right"
-ref = "shift:c:msb"
+output = "is_negative"
+multiplicity = "signed"
+ref = "shift:c:is_negative"
 
 [[constraints.intra_limb_right_shifting]]
 kind = "arith"
-constraint = "$#`extension` = 65535 dot #`signed` dot #`msb`$"
-poly = ["-", "extension", ["*", 65535, "signed", "msb"]]
-ref = "shift:c:extension"
+constraint = "$#`!signed` => #`is_negative` = 0$"
+poly = ["*", ["-", 1, "signed"], "is_negative"]
 
 [[constraints.intra_limb_right_shifting]]
 kind = "interaction"
