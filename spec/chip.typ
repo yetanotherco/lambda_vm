@@ -1,4 +1,4 @@
-#import "expr.typ": expr_to_code, expr_to_math
+#import "expr.typ": expr_to_code, expr_to_math, type_to_code
 
 /// Computes the total number of variables in a `chip`
 #let total_nr_variables(chip) = {
@@ -13,7 +13,14 @@
   .filter(pair => pair.at(0) in config.variables.categories.instantiated)
   .map(pair => pair.at(1))
   .flatten()
-  .map(var => config.variables.types.filter(type => type.label == var.type).at(0).subtypes.len())
+  .map(var => {
+    let (label, factor) = if type(var.type) == array {
+      (var.type.at(0), var.type.at(1))
+    } else {
+      (var.type, 1)
+    }
+    config.variables.types.filter(type => type.label == label).first().subtypes.len() * factor
+  })
   .sum()
 }
 
@@ -31,7 +38,7 @@
     ..for (cat, vars) in chip.variables.pairs() {
       ([#emph(cat)], [], [], table.hline(stroke: .6pt))
       for var in vars {
-        ([#raw(var.name)], [#raw(var.type)], [#eval(var.desc, mode: "markup")])
+        ([#raw(var.name)], [#type_to_code(var.type)], [#eval(var.desc, mode: "markup")])
         for (i, poly) in var.at("polys", default: ()).enumerate() {
           (if i == 0 { emph[def] }, [], expr_to_math(("=", ("idx", var.name, i), poly)))
         }
