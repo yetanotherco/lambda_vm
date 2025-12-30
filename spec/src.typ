@@ -38,12 +38,16 @@
     assert(category in config.variables.categories.all)
   }
 
+  let all_labels = config.variables.types.map(type => type.label);
   for var in chip.variables.values().flatten() {
+    let type_label = if type(var.type) == array {
+      var.type.at(0)
+    } else {
+      var.type
+    }
+
     // Check that all variable types are valid
-    assert(
-      var.type in config.variables.types.map(type => type.label),
-      message: "found invalid var type:" + var.type,
-    )
+    assert(type_label in all_labels, message: "found invalid var type:" + repr(var.type))
   }
 }
 

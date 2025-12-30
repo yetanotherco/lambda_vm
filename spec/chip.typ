@@ -13,12 +13,28 @@
   .filter(pair => pair.at(0) in config.variables.categories.instantiated)
   .map(pair => pair.at(1))
   .flatten()
-  .map(var => config.variables.types.filter(type => type.label == var.type).at(0).subtypes.len())
+  .map(var => {
+    let (label, factor) = if type(var.type) == array {
+      (var.type.at(0), var.type.at(1))
+    } else {
+      (var.type, 1)
+    }
+    config.variables.types.filter(type => type.label == label).first().subtypes.len() * factor
+  })
   .sum()
 }
 
 /// Generates a table listing `chip`'s columns.
 #let render_chip_column_table(chip, config) = {
+  // Displays a variable type
+  let render_type(type_) = {
+    if type(type_) == array {
+      raw(type_.at(0) + "[" + str(type_.at(1)) + "]")
+    } else {
+      raw(type_)
+    }
+  }
+
   // Group variables by category
   figure(table(
     columns: (auto, auto, 1fr),
@@ -30,7 +46,7 @@
     ..for (cat, vars) in chip.variables.pairs() {
       ([#emph(cat)], [], [], table.hline(stroke: .6pt))
       for var in vars {
-        ([#raw(var.name)], [#raw(var.type)], [#eval(var.desc, mode: "markup")])
+        ([#raw(var.name)], [#render_type(var.type)], [#eval(var.desc, mode: "markup")])
         for (i, poly) in var.at("polys", default: ()).enumerate() {
           (if i == 0 { emph[def] }, [], expr_to_math(("=", ("idx", var.name, i), poly)))
         }
