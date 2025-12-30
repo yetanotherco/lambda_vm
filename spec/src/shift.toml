@@ -39,12 +39,12 @@ desc = "`shift && 0x0F`"
 
 [[variables.auxiliary]]
 name = "bit_shifted_uncarried"
-type = "Half[4]"
+type = ["Half", 4]
 desc = "result of left/right shifting the individual limbs of `in` by `bit_shift`, i.e., without the carry values."
 
 [[variables.auxiliary]]
 name = "carry"
-type = "Half[4]"
+type = ["Half", 4]
 desc = "the carry values of left/right shifting `in` by `bit_shift`."
 
 [[variables.auxiliary]]
