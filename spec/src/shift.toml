@@ -38,16 +38,6 @@ type = "Byte"
 desc = "`shift && 0x0F`"
 
 [[variables.auxiliary]]
-name = "limb_shift_odd"
-type = "Byte"
-desc = "`shift && 0x10`"
-
-[[variables.auxiliary]]
-name = "limb_shift_even"
-type = "Byte"
-desc = "`shift && 0x20`"
-
-[[variables.auxiliary]]
 name = "bit_shifted_uncarried"
 type = "Half[4]"
 desc = "result of left/right shifting the individual limbs of `in` by `bit_shift`, i.e., without the carry values."
@@ -63,27 +53,26 @@ type = "Bit"
 desc = "whether `in` is negative."
 
 [[variables.auxiliary]]
+name = "limb_shift_0"
+type = "Bit"
+desc = "Whether $floor.l #`bit_shift` / 16 floor.r equiv 0 mod 4$."
+
+[[variables.auxiliary]]
 name = "limb_shift_1"
 type = "Bit"
-desc = "Whether $floor.l #`bit_shift` / 16 floor.r = 1 mod 4$."
+desc = "Whether $floor.l #`bit_shift` / 16 floor.r equiv 1 mod 4$."
 
 [[variables.auxiliary]]
 name = "limb_shift_2"
 type = "Bit"
-desc = "Whether $floor.l #`bit_shift` / 16 floor.r = 2 mod 4$."
+desc = "Whether $floor.l #`bit_shift` / 16 floor.r equiv 2 mod 4$."
 
 [[variables.auxiliary]]
 name = "limb_shift_3"
 type = "Bit"
-desc = "Whether $floor.l #`bit_shift` / 16 floor.r = 3 mod 4$."
+desc = "Whether $floor.l #`bit_shift` / 16 floor.r equiv 3 mod 4$."
 
 # Virtual
-
-[[variables.virtual]]
-name = "limb_shift_0"
-type = "Bit"
-desc = "Whether $floor.l #`bit_shift` / 16 floor.r = 0 mod 4$."
-poly = ["/", ["*", ["-", 16, "limb_shift_odd"], ["-", 32, "limb_shift_even"]], 512]
 
 [[variables.virtual]]
 name = "extension"
@@ -143,37 +132,40 @@ multiplicity = "μ"
 [[constraints.defs]]
 kind = "interaction"
 tag = "AND_BYTE"
-input = ["shift", "0x10"]
-output = "limb_shift_odd"
-ref = "shift:c:limb_shift_odd"
+input = ["shift", "0x30"]
+output = ["+", ["-", 1, "limb_shift_0"], ["*", 15, "limb_shift_1"], ["*", 31, "limb_shift_1"], ["*", 47, "limb_shift_1"]]
+ref = "shift:c:limb_shift_x"
 multiplicity = "μ"
 
 [[constraints.defs]]
-kind = "interaction"
-tag = "AND_BYTE"
-input = ["shift", "0x20"]
-output = "limb_shift_even"
-ref = "shift:c:limb_shift_even"
-multiplicity = "μ"
+kind = "template"
+tag = "IS_BIT"
+input = ["limb_shift_0"]
+ref = "shift:c:limb_shift_0_is_bit"
 
 [[constraints.defs]]
-kind = "arith"
-constraint = "$#`limb_shift_1` = (#`limb_shift_odd` dot (32 - #`limb_shift_even`)) / 512$"
-poly = ["-", ["*", 512, "limb_shift_1"], ["*", "limb_shift_odd", ["-", 32, "limb_shift_even"]]]
-ref = "shift:c:limb_shift_1"
+kind = "template"
+tag = "IS_BIT"
+input = ["limb_shift_1"]
+ref = "shift:c:limb_shift_1_is_bit"
 
 [[constraints.defs]]
-kind = "arith"
-constraint = "$#`limb_shift_2` = ((16 - #`limb_shift_odd`) dot #`limb_shift_even`) / 512$"
-poly = ["-", ["*", 512, "limb_shift_2"], ["*", ["-", 16, "limb_shift_odd"], "limb_shift_even"]]
-ref = "shift:c:limb_shift_2"
+kind = "template"
+tag = "IS_BIT"
+input = ["limb_shift_2"]
+ref = "shift:c:limb_shift_2_is_bit"
 
 [[constraints.defs]]
-kind = "arith"
-constraint = "$#`limb_shift_3` = (#`limb_shift_odd` dot #`limb_shift_even`) / 512$"
-poly = ["-", ["*", 512, "limb_shift_3"], ["*", "limb_shift_odd", "limb_shift_even"]]
-ref = "shift:c:limb_shift_3"
+kind = "template"
+tag = "IS_BIT"
+input = ["limb_shift_3"]
+ref = "shift:c:limb_shift_3_is_bit"
 
+[[constraints.defs]]
+kind = "template"
+tag = "IS_BIT"
+input = [["+", "limb_shift_0", "limb_shift_1", "limb_shift_2", "limb_shift_3"]]
+ref = "shift:c:limb_shift_sum_is_bit"
 
 [[constraint_groups]]
 name = "intra_limb_left_shifting"
