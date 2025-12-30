@@ -28,8 +28,9 @@ The `SHIFT` chip is comprised of #nr_variables variables that are expressed usin
 
 = Constraints
 == Definitions
-Constrain the auxiliary variables `bit_shift`, `limb_shift_0`, `limb_shift_1`, `limb_shift_2` and `limb_shift_3` according to their definitions.
+Constrain the auxiliary variables `bit_shift`, and `limb_shift` according to their definitions.
 #render_constraint_table(chip, config, groups: "defs")
+*Note*: although exactly $1$ of the bits in `limb_shift` should equal $1$ while the others are zero, this does not have to be constrained explicitly: @shift:c:limb_shift_is_bit enforces that all values are bits, while @shift:c:limb_shift_lookup can be satisfied if and only if exactly one of the four values equals $1$.
 
 == Left shifting
 #render_constraint_table(chip, config, groups: "intra_limb_left_shifting")

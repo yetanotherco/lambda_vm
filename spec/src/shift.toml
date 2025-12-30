@@ -38,6 +38,11 @@ type = "Byte"
 desc = "`shift && 0x0F`"
 
 [[variables.auxiliary]]
+name = "limb_shift"
+type = ["Bit", 4]
+desc = "One-hot vector indicating whether $floor.l #`shift` / 16 floor.r equiv i mod 4$."
+
+[[variables.auxiliary]]
 name = "bit_shifted_uncarried"
 type = ["Half", 4]
 desc = "result of left/right shifting the individual limbs of `in` by `bit_shift`, i.e., without the carry values."
@@ -51,26 +56,6 @@ desc = "the carry values of left/right shifting `in` by `bit_shift`."
 name = "is_negative"
 type = "Bit"
 desc = "whether `in` is negative."
-
-[[variables.auxiliary]]
-name = "limb_shift_0"
-type = "Bit"
-desc = "Whether $floor.l #`bit_shift` / 16 floor.r equiv 0 mod 4$."
-
-[[variables.auxiliary]]
-name = "limb_shift_1"
-type = "Bit"
-desc = "Whether $floor.l #`bit_shift` / 16 floor.r equiv 1 mod 4$."
-
-[[variables.auxiliary]]
-name = "limb_shift_2"
-type = "Bit"
-desc = "Whether $floor.l #`bit_shift` / 16 floor.r equiv 2 mod 4$."
-
-[[variables.auxiliary]]
-name = "limb_shift_3"
-type = "Bit"
-desc = "Whether $floor.l #`bit_shift` / 16 floor.r equiv 3 mod 4$."
 
 # Virtual
 
@@ -133,39 +118,16 @@ multiplicity = "μ"
 kind = "interaction"
 tag = "AND_BYTE"
 input = ["shift", "0x30"]
-output = ["+", ["-", 1, "limb_shift_0"], ["*", 15, "limb_shift_1"], ["*", 31, "limb_shift_2"], ["*", 47, "limb_shift_3"]]
-ref = "shift:c:limb_shift_x"
+output = ["+", ["-", 1, ["idx", "limb_shift", 0]], ["*", 15, ["idx", "limb_shift", 1]], ["*", 31, ["idx", "limb_shift", 2]], ["*", 47, ["idx", "limb_shift", 3]]]
+ref = "shift:c:limb_shift_lookup"
 multiplicity = "μ"
 
 [[constraints.defs]]
 kind = "template"
 tag = "IS_BIT"
-input = ["limb_shift_0"]
-ref = "shift:c:limb_shift_0_is_bit"
-
-[[constraints.defs]]
-kind = "template"
-tag = "IS_BIT"
-input = ["limb_shift_1"]
-ref = "shift:c:limb_shift_1_is_bit"
-
-[[constraints.defs]]
-kind = "template"
-tag = "IS_BIT"
-input = ["limb_shift_2"]
-ref = "shift:c:limb_shift_2_is_bit"
-
-[[constraints.defs]]
-kind = "template"
-tag = "IS_BIT"
-input = ["limb_shift_3"]
-ref = "shift:c:limb_shift_3_is_bit"
-
-[[constraints.defs]]
-kind = "template"
-tag = "IS_BIT"
-input = [["+", "limb_shift_0", "limb_shift_1", "limb_shift_2", "limb_shift_3"]]
-ref = "shift:c:limb_shift_sum_is_bit"
+input = [["idx", "limb_shift", "i"]]
+range = ["i", 0, 4]
+ref = "shift:c:limb_shift_is_bit"
 
 [[constraint_groups]]
 name = "intra_limb_left_shifting"
@@ -249,8 +211,8 @@ name = "limb_shifting"
 
 [[constraints.limb_shifting]]
 kind = "arith"
-constraint = "$#`limb_shift_0` => #`shifted[i]` = #`bit_shifted[i]`$"
-poly = ["*", "limb_shift_0", ["-", ["idx", "shifted", "i"], ["idx", "bit_shifted", "i"]]]
+constraint = "$#`limb_shift[0]` => #`shifted[i]` = #`bit_shifted[i]`$"
+poly = ["*", ["idx", "limb_shift", 0], ["-", ["idx", "shifted", "i"], ["idx", "bit_shifted", "i"]]]
 range = ["i", 0, 3]
 
 
@@ -259,40 +221,40 @@ name = "limb_left_shifting"
 
 [[constraints.limb_left_shifting]]
 kind = "arith"
-constraint = "$#`left` and #`limb_shift_1` => #`shifted[i]` = #`bit_shifted[i-1]`$"
-poly = ["*", "left", "limb_shift_1", ["-", ["idx", "shifted", "i"], ["idx", "bit_shifted", ["-", "i", 1]]]]
+constraint = "$#`left` and #`limb_shift[1]` => #`shifted[i]` = #`bit_shifted[i-1]`$"
+poly = ["*", "left", ["idx", "limb_shift", 1], ["-", ["idx", "shifted", "i"], ["idx", "bit_shifted", ["-", "i", 1]]]]
 range = ["i", 1, 3]
 
 
 [[constraints.limb_left_shifting]]
 kind = "arith"
-constraint = "$#`left` and #`limb_shift_2` => #`shifted[i]` = #`bit_shifted[i-2]`$"
-poly = ["*", "left", "limb_shift_2", ["-", ["idx", "shifted", "i"], ["idx", "bit_shifted", ["-", "i", 2]]]]
+constraint = "$#`left` and #`limb_shift[2]` => #`shifted[i]` = #`bit_shifted[i-2]`$"
+poly = ["*", "left", ["idx", "limb_shift", 2], ["-", ["idx", "shifted", "i"], ["idx", "bit_shifted", ["-", "i", 2]]]]
 range = ["i", 2, 3]
 
 
 [[constraints.limb_left_shifting]]
 kind = "arith"
-constraint = "$#`left` and #`limb_shift_3` => #`shifted[3]` = #`bit_shifted[0]`$"
-poly = ["*", "left", "limb_shift_3", ["-", ["idx", "shifted", 3], ["idx", "bit_shifted", 0]]]
+constraint = "$#`left` and #`limb_shift[3]` => #`shifted[3]` = #`bit_shifted[0]`$"
+poly = ["*", "left", ["idx", "limb_shift", 3], ["-", ["idx", "shifted", 3], ["idx", "bit_shifted", 0]]]
 
 [[constraint_groups]]
 name = "limb_left_shifting_zero"
 
 [[constraints.limb_left_shifting_zero]]
 kind = "arith"
-constraint = "$#`left` and (#`limb_shift_1` or #`limb_shift_2` or #`limb_shift_3`) => #`shifted[0]` = 0$"
-poly = ["*", "left", ["+", "limb_shift_1", "limb_shift_2", "limb_shift_3"], ["idx", "shifted", 0]]
+constraint = "$#`left` and (#`limb_shift[1]` or #`limb_shift[2]` or #`limb_shift[3]`) => #`shifted[0]` = 0$"
+poly = ["*", "left", ["+", ["idx", "limb_shift", 1], ["idx", "limb_shift", 2], ["idx", "limb_shift", 3]], ["idx", "shifted", 0]]
 
 [[constraints.limb_left_shifting_zero]]
 kind = "arith"
-constraint = "$#`left` and (#`limb_shift_2` or #`limb_shift_3`) => #`shifted[1]` = 0$"
-poly = ["*", "left", ["+", "limb_shift_2", "limb_shift_3"], ["idx", "shifted", 1]]
+constraint = "$#`left` and (#`limb_shift[2]` or #`limb_shift[3]`) => #`shifted[1]` = 0$"
+poly = ["*", "left", ["+", ["idx", "limb_shift", 2], ["idx", "limb_shift", 3]], ["idx", "shifted", 1]]
 
 [[constraints.limb_left_shifting_zero]]
 kind = "arith"
-constraint = "$#`left` and #`limb_shift_3` => #`shifted[2]` = 0$"
-poly = ["*", "left", "limb_shift_3", ["idx", "shifted", 2]]
+constraint = "$#`left` and #`limb_shift[3]` => #`shifted[2]` = 0$"
+poly = ["*", "left", ["idx", "limb_shift", 3], ["idx", "shifted", 2]]
 
 
 [[constraint_groups]]
@@ -300,38 +262,38 @@ name = "limb_right_shifting"
 
 [[constraints.limb_right_shifting]]
 kind = "arith"
-constraint = "$#`right` and #`limb_shift_1` => #`shifted[i]` = #`bit_shifted[i+1]`$"
-poly = ["*", "right", "limb_shift_1", ["-", ["idx", "shifted", "i"], ["idx", "bit_shifted", ["+", "i", 1]]]]
+constraint = "$#`right` and #`limb_shift[1]` => #`shifted[i]` = #`bit_shifted[i+1]`$"
+poly = ["*", "right", ["idx", "limb_shift", 1], ["-", ["idx", "shifted", "i"], ["idx", "bit_shifted", ["+", "i", 1]]]]
 range = ["i", 0, 2]
 
 [[constraints.limb_right_shifting]]
 kind = "arith"
-constraint = "$#`right` and #`limb_shift_2` => #`shifted[i]` = #`bit_shifted[i+2]`$"
-poly = ["*", "right", "limb_shift_2", ["-", ["idx", "shifted", "i"], ["idx", "bit_shifted", ["-", "i", 2]]]]
+constraint = "$#`right` and #`limb_shift[2]` => #`shifted[i]` = #`bit_shifted[i+2]`$"
+poly = ["*", "right", ["idx", "limb_shift", 2], ["-", ["idx", "shifted", "i"], ["idx", "bit_shifted", ["-", "i", 2]]]]
 range = ["i", 0, 1]
 
 [[constraints.limb_right_shifting]]
 kind = "arith"
-constraint = "$#`right` and #`limb_shift_3` => #`shifted[0]` = #`bit_shifted[3]`$"
-poly = ["*", "right", "limb_shift_3", ["-", ["idx", "shifted", 0], ["idx", "bit_shifted", 3]]]
+constraint = "$#`right` and #`limb_shift[3]` => #`shifted[0]` = #`bit_shifted[3]`$"
+poly = ["*", "right", ["idx", "limb_shift", 3], ["-", ["idx", "shifted", 0], ["idx", "bit_shifted", 3]]]
 
 [[constraint_groups]]
 name = "limb_right_shifting_extension"
 
 [[constraints.limb_right_shifting_extension]]
 kind = "arith"
-constraint = "$#`right` and (#`limb_shift_1` or #`limb_shift_2` or #`limb_shift_3`) => #`shifted[3]` = #`extension`$"
-poly = ["*", "right", ["+", "limb_shift_1", "limb_shift_2", "limb_shift_3"], ["-", ["idx", "shifted", 3], "extension"]]
+constraint = "$#`right` and (#`limb_shift[1]` or #`limb_shift[2]` or #`limb_shift[3]`) => #`shifted[3]` = #`extension`$"
+poly = ["*", "right", ["+", ["idx", "limb_shift", 1], ["idx", "limb_shift", 2], ["idx", "limb_shift", 3]], ["-", ["idx", "shifted", 3], "extension"]]
 
 [[constraints.limb_right_shifting_extension]]
 kind = "arith"
-constraint = "$#`right` and (#`limb_shift_2` or #`limb_shift_3`) => #`shifted[2]` = #`extension`$"
-poly = ["*", "right", ["+", "limb_shift_2", "limb_shift_3"], ["-", ["idx", "shifted", 2], "extension"]]
+constraint = "$#`right` and (#`limb_shift[2]` or #`limb_shift[3]`) => #`shifted[2]` = #`extension`$"
+poly = ["*", "right", ["+", ["idx", "limb_shift", 2], ["idx", "limb_shift", 3]], ["-", ["idx", "shifted", 2], "extension"]]
 
 [[constraints.limb_right_shifting_extension]]
 kind = "arith"
-constraint = "$#`right` and #`limb_shift_3` => #`shifted[1]` = #`extension`$"
-poly = ["*", "right", "limb_shift_3", ["-", ["idx", "shifted", 1], "extension"]]
+constraint = "$#`right` and #`limb_shift[3]` => #`shifted[1]` = #`extension`$"
+poly = ["*", "right", ["idx", "limb_shift", 3], ["-", ["idx", "shifted", 1], "extension"]]
 
 
 # Lookups
