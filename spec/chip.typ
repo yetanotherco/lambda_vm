@@ -26,15 +26,6 @@
 
 /// Generates a table listing `chip`'s columns.
 #let render_chip_column_table(chip, config) = {
-  // Displays a variable type
-  let render_type(type_) = {
-    if type(type_) == array {
-      raw(type_.at(0) + "[" + str(type_.at(1)) + "]")
-    } else {
-      raw(type_)
-    }
-  }
-
   // Group variables by category
   figure(table(
     columns: (auto, auto, 1fr),
@@ -46,7 +37,7 @@
     ..for (cat, vars) in chip.variables.pairs() {
       ([#emph(cat)], [], [], table.hline(stroke: .6pt))
       for var in vars {
-        ([#raw(var.name)], [#render_type(var.type)], [#eval(var.desc, mode: "markup")])
+        ([#raw(var.name)], [#type_to_code(var.type)], [#eval(var.desc, mode: "markup")])
         for (i, poly) in var.at("polys", default: ()).enumerate() {
           (if i == 0 { emph[def] }, [], expr_to_math(("=", ("idx", var.name, i), poly)))
         }

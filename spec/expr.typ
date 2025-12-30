@@ -117,3 +117,24 @@
   var: v => if v.len() == 1 { $#v$ } else { $#raw(v)$ },
   num: n => math.equation[#n],
 )
+
+// Check that a type expression is structurally valid, without validating against a set of known base types
+#let check_array_type(typ) = {
+  assert(type(typ.at(0)) == str, message: "Array types need to have a regular type as base")
+  assert(type(typ.at(1)) == int, message: "Array types need to have a constant dimension")
+}
+
+// Render a type to code
+#let type_to_code(typ) = {
+  if type(typ) == array {
+    check_array_type(typ)
+    return raw(typ.at(0) + "[" + str(typ.at(1)) + "]")
+  } else if type(typ) == string {
+    return raw(typ)
+  } else {
+    assert(false, message: "Unknown format for type: " + repr(typ))
+  }
+}
+
+// Render a type to math
+#let type_to_math(typ) = render_type_to_code(typ) // The code version looks reasonable enough in math too
