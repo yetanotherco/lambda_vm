@@ -20,6 +20,7 @@
 /// Generates a table listing `chip`'s columns.
 #let render_chip_column_table(chip, config) = {
   // Group variables by category
+  show figure: set block(breakable: true)
   figure(table(
     columns: (auto, auto, 1fr),
     inset: 6pt,
@@ -43,9 +44,11 @@
   ), caption: [Column overview of #chip.name chip.])
 }
 
-#let cref(constraint) = {
-  if "ref" in constraint {
-    label(constraint.ref)
+#let cref(obj, body) = {
+  if "ref" in obj {
+    [#body#label(obj.ref)]
+  } else {
+    body
   }
 }
 
@@ -69,7 +72,7 @@
     let index = if "range" in assumption { "." + assumption.range.at(0) } else { "" }
     let lbl = [#chip.name\-A]
     show figure: (it) => align(left, block[#lbl#context it.counter.display()#index])
-    [#figure(kind: "assumption", numbering: (i) => [#lbl#i#index], supplement: [], [])#cref(assumption)]
+    cref(assumption)[#figure(kind: "assumption", numbering: (i) => [#lbl#i#index], supplement: [], [])]
   }
 
   figure(table(
@@ -96,13 +99,16 @@
   }
   assert(groups.all(group => group in all_groups), message: "unknown group")
 
+  // Find the group definition in the constraint_groups
+  let lookup_group(name) = chip.constraint_groups.filter((g) => g.name == name).at(0, default: (name: name))
+
   /// Render the contraint's tag.
   let tag(constraint, group) = {
     let index = if "range" in constraint { "." + constraint.range.at(0) } else { "" }
     let prefix = if "prefix" in group { group.prefix }
     let lbl = [#chip.name\-C#prefix]
     show figure: (it) => align(left, block[#lbl#context it.counter.display()#index])
-    [#figure(kind: "constraint", numbering: (i) => [#lbl#i#index], supplement: [], [])#cref(constraint)]
+    cref(constraint)[#figure(kind: "constraint", numbering: (i) => [#lbl#i#index], supplement: [], [])]
   }
 
   /// Generates a representation of `constraint`
@@ -112,17 +118,25 @@
     if kind == "interaction" {
       raw(constraint.tag) + `[` + args_interaction_like(constraint.input, constraint.at("output", default: none)) + `]`
     } else if kind == "arith" {
-      [#eval(constraint.constraint)]
+      [#eval(constraint.constraint, mode: "markup")]
     } else if kind == "template" {
-      raw(constraint.tag) + `<` + args_interaction_like(constraint.input, constraint.at("output", default: none)) + `>`
+      let cond = if "cond" in constraint {
+        $#expr_to_math(constraint.cond) arrow.r.double$ + " "
+      }
+      cond + raw(constraint.tag) + `<` + args_interaction_like(constraint.input, constraint.at("output", default: none)) + `>`
     } else {
       assert(false, message: "illegal constraint format: " + kind)
     }
   }
 
-  // Whether constraints has polynomial constraints
+  // Whether constraint has polynomial constraints
   let has_polynomial_constraints(constraint) = {
-    constraint.at("kind") == "arith" and ("poly" in constraint or "polys" in constraint)
+    constraint.kind == "arith" and ("poly" in constraint or "polys" in constraint)
+  }
+
+  // Whether constraint has a "desc" field we need to render separately
+  let has_extra_description(constraint) = {
+    constraint.kind == "arith" and "desc" in constraint
   }
 
   // Rendering polynomial constraints
@@ -139,6 +153,12 @@
     },)
   }
 
+  // Rendering the additional "desc" field for arith constraints
+  let render_extra_description(constraint) = {
+    ([_description_], [], eval(constraint.desc, mode: "markup"), [])
+  }
+
+  show figure: set block(breakable: true)
   figure(table(
     columns: (auto, auto, 1fr, auto),
     inset: 6pt,
@@ -149,11 +169,14 @@
     ..for group in groups {
       for constraint in chip.constraints.at(group) {
         (
-          [#tag(constraint, group)],
+          [#tag(constraint, lookup_group(group))],
           [#interval(constraint)],
           [#repr_constraint(constraint)],
           [#expr_to_math(constraint.at("multiplicity", default: ""))],
         )
+        if has_extra_description(constraint) {
+          render_extra_description(constraint)
+        }
         if has_polynomial_constraints(constraint) {
           render_polynomial_constraints(constraint)
         }

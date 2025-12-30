@@ -40,8 +40,8 @@
     } else if type(expr) == int {
       num(expr)
     } else if type(expr) == array {
-      (dict.at(expr.at(0), default: (e) => {
-        assert(false, "Invalid expression: " + repr(e))
+      (dict.at(expr.at(0), default: (pp, rec, e) => {
+        assert(false, message: "Invalid expression: " + repr(e))
       }))(pp, res, expr)
     }
   }
