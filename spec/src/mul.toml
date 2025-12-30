@@ -45,7 +45,7 @@ desc = "the most significant bit of `rhs`"
 
 [[variables.auxiliary]]
 name = "raw_product"
-type = "Half[8]"
+type = "B51[4]"
 desc = "raw multiplication output"
 
 # Virtual
@@ -59,10 +59,10 @@ polys = [
     ["idx", "lhs", 1],
     ["idx", "lhs", 2],
     ["idx", "lhs", 3],
-    ["*", 65535, "lhs_signed", "lhs_msb"],
-    ["*", 65535, "lhs_signed", "lhs_msb"],
-    ["*", 65535, "lhs_signed", "lhs_msb"],
-    ["*", 65535, "lhs_signed", "lhs_msb"],
+    ["*", "0xFFFF", "lhs_signed", "lhs_msb"],
+    ["*", "0xFFFF", "lhs_signed", "lhs_msb"],
+    ["*", "0xFFFF", "lhs_signed", "lhs_msb"],
+    ["*", "0xFFFF", "lhs_signed", "lhs_msb"],
 ]
 
 [[variables.virtual]]
@@ -74,21 +74,27 @@ polys = [
     ["idx", "rhs", 1],
     ["idx", "rhs", 2],
     ["idx", "rhs", 3],
-    ["*", 65535, "rhs_signed", "rhs_msb"],
-    ["*", 65535, "rhs_signed", "rhs_msb"],
-    ["*", 65535, "rhs_signed", "rhs_msb"],
-    ["*", 65535, "rhs_signed", "rhs_msb"],
+    ["*", "0xFFFF", "rhs_signed", "rhs_msb"],
+    ["*", "0xFFFF", "rhs_signed", "rhs_msb"],
+    ["*", "0xFFFF", "rhs_signed", "rhs_msb"],
+    ["*", "0xFFFF", "rhs_signed", "rhs_msb"],
 ]
+
+[[variables.virtual]]
+name = "limb_product"
+type = "B35[8]"
+desc = "raw multiplication output"
+poly = ["sum", ["j", 0, "i"], ["*", ["idx", "lhs_ext", "i"], ["idx", "rhs_ext", ["-", "i", "j"]]]]
 
 [[variables.virtual]]
 name = "carry"
 type = "B20[4]"
 desc = "carry values"
 polys = [
-    ["/", ["-", ["+", ["idx", "raw_product", 0], ["*", 65536, ["idx",  "raw_product", 1]]], ["idx", "res", 0]], 4294967295],
-    ["/", ["-", ["+", ["idx", "raw_product", 2], ["*", 65536, ["idx",  "raw_product", 3]], ["idx", "carry", 0]], ["idx", "res", 1]], 4294967295],
-    ["/", ["-", ["+", ["idx", "raw_product", 4], ["*", 65536, ["idx",  "raw_product", 5]], ["idx", "carry", 1]], ["idx", "res", 2]], 4294967295],
-    ["/", ["-", ["+", ["idx", "raw_product", 6], ["*", 65536, ["idx",  "raw_product", 7]], ["idx", "carry", 2]], ["idx", "res", 3]], 4294967295],
+    ["/", ["-", ["idx", "raw_product", 0], ["idx", "res", 0]], ["^", 2, 32]],
+    ["/", ["-", ["+", ["idx", "raw_product", 1], ["idx", "carry", 0]], ["idx", "res", 1]], ["^", 2, 32]],
+    ["/", ["-", ["+", ["idx", "raw_product", 2], ["idx", "carry", 1]], ["idx", "res", 2]], ["^", 2, 32]],
+    ["/", ["-", ["+", ["idx", "raw_product", 3], ["idx", "carry", 2]], ["idx", "res", 3]], ["^", 2, 32]],
 ]
 
 
@@ -149,9 +155,9 @@ name = "prod"
 
 [[constraints.prod]]
 kind = "arith"
-constraint = "$#`raw_product[i]` = sum_(j=0)^i #`lhs_ext[i]` dot #`rhs_ext[i - j]`$"
-poly = ["-", ["idx", "raw_product", "i"], ["sum", ["j", 0, "i"], ["*", ["idx", "lhs_ext", "i"], ["idx", "rhs_ext", ["-", "i", "j"]]]]]
-range = ["i", 0, 7]
+constraint = "$#`raw_product[i]` = #`limb_product[2i]` + 2^32 dot #`limb_product[2i + 1]`$"
+poly = ["-", ["+", ["idx", "limb_product", "2i"], ["*", ["^", 2, 32], ["idx", "limb_product", "2i+1"]]], ["idx", "raw_product", "i"]]
+range = ["i", 0, 3]
 
 [[constraint_groups]]
 name = "lookup"

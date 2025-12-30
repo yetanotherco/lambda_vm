@@ -54,6 +54,16 @@ desc = """\
        """
 
 [[variables.types]]
+label = "B35"
+subtypes = ["BaseField"]
+desc = "Variable that can only assume values in the range $[0, 2^35)$."
+
+[[variables.types]]
+label = "B51"
+subtypes = ["BaseField"]
+desc = "Variable that can only assume values in the range $[0, 2^51)$."
+
+[[variables.types]]
 label = "DWordBL"
 subtypes = ["Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte"]
 desc = """\
@@ -132,6 +142,16 @@ desc = "Eight halfwords"
 label = "B20[4]"
 subtypes = ["B20", "B20", "B20", "B20"]
 desc = "Four B20s"
+
+[[variables.types]]
+label = "B35[8]"
+subtypes = ["B35", "B35", "B35", "B35", "B35", "B35", "B35", "B35"]
+desc = "Eight B35s"
+
+[[variables.types]]
+label = "B51[4]"
+subtypes = ["B51", "B51", "B51", "B51"]
+desc = "Four B51s"
 
 
 [variables.categories]
