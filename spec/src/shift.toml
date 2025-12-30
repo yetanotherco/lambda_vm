@@ -117,6 +117,14 @@ desc = ""
 
 
 
+# Assumptions
+
+[[assumptions]]
+desc = "`IS_HALFWORD[in[i]]`"
+range = ["i", 0, 3]
+ref = "shift:a:range_in"
+
+
 
 # Constraints
 

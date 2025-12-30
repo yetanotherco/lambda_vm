@@ -23,8 +23,8 @@
 The `SHIFT` chip is comprised of #nr_variables variables that are expressed using #nr_columns columns:
 #render_chip_column_table(chip, config)
 
-// == Assumptions
-// #render_chip_assumptions(chip, config)
+= Assumptions
+#render_chip_assumptions(chip, config)
 
 = Constraints
 == Definitions
