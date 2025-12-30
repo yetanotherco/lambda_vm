@@ -1,4 +1,4 @@
-#import "expr.typ": expr_to_code, expr_to_math
+#import "expr.typ": expr_to_code, expr_to_math, type_to_code
 
 /// Computes the total number of variables in a `chip`
 #let total_nr_variables(chip) = {
