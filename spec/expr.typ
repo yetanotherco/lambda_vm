@@ -1,4 +1,30 @@
-// Grammar
+// Types and array types
+// <type> ::= str
+//          | [str, int]
+
+// Check that a type expression is structurally valid, without validating against a set of known base types
+#let check_array_type(typ) = {
+  assert(type(typ.at(0)) == str, message: "Array types need to have a regular type as base")
+  assert(type(typ.at(1)) == int, message: "Array types need to have a constant dimension")
+}
+
+// Render a type to code
+#let type_to_code(typ) = {
+  if type(typ) == array {
+    check_array_type(typ)
+    return raw(typ.at(0) + "[" + str(typ.at(1)) + "]")
+  } else if type(typ) == str {
+    return raw(typ)
+  } else {
+    assert(false, message: "Unknown format for type: " + repr(typ))
+  }
+}
+
+// Render a type to math
+#let type_to_math(typ) = type_to_code(typ) // The code version looks reasonable enough in math too
+
+
+// Expression grammar
 // <expr> ::= ()                           ; ""
 //          | var                          ; str(var)
 //          | int                          ; int
@@ -11,6 +37,7 @@
 //          | ["=", expr1, expr2]          ; expr1 = expr2
 //          | ["-", expr]                  ; -expr
 //          | ["-", expr1, expr2, ...]     ; expr1 - expr2 - ...
+//          | ["cast", expr, type]         ; expr as type
 // 
 // 
 // To limit the number of parentheses that are placed in an expression,
@@ -82,6 +109,10 @@
         cwrap(e.slice(1).map(rec.with(PREC.sub)).join(` - `), pp < PREC.sub)
       }
     },
+    "cast": (pp, rec, e) => {
+      assert(e.len() == 3, message: "Invalid type cast: " + repr(e))
+      cwrap(rec(PREC.cast, e.at(1)) + ` as ` + type_to_code(e.at(2)), pp < PREC.cast)
+    },
   ),
 )
 
@@ -116,28 +147,11 @@
         mwrap($#e.slice(1).map(rec.with(PREC.sub)).join($-$)$, pp < PREC.sub)
       }
     },
+    "cast": (pp, rec, e) => {
+      assert(e.len() == 3, message: "Invalid type cast: " + repr(e))
+      cwrap($#rec(PREC.cast, e.at(1)) colon.double #type_to_math(e.at(2))$, pp < PREC.cast)
+    },
   ),
   var: v => if v.len() == 1 { $#v$ } else { $#raw(v)$ },
   num: n => math.equation[#n],
 )
-
-// Check that a type expression is structurally valid, without validating against a set of known base types
-#let check_array_type(typ) = {
-  assert(type(typ.at(0)) == str, message: "Array types need to have a regular type as base")
-  assert(type(typ.at(1)) == int, message: "Array types need to have a constant dimension")
-}
-
-// Render a type to code
-#let type_to_code(typ) = {
-  if type(typ) == array {
-    check_array_type(typ)
-    return raw(typ.at(0) + "[" + str(typ.at(1)) + "]")
-  } else if type(typ) == str {
-    return raw(typ)
-  } else {
-    assert(false, message: "Unknown format for type: " + repr(typ))
-  }
-}
-
-// Render a type to math
-#let type_to_math(typ) = render_type_to_code(typ) // The code version looks reasonable enough in math too
