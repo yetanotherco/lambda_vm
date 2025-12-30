@@ -85,6 +85,12 @@ desc = "Whether $floor.l #`bit_shift` / 16 floor.r = 3 mod 4$."
 # Virtual
 
 [[variables.virtual]]
+name = "limb_shift_0"
+type = "Bit"
+desc = "Whether $floor.l #`bit_shift` / 16 floor.r = 0 mod 4$."
+poly = ["/", ["*", ["-", 16, "limb_shift_odd"], ["-", 32, "limb_shift_even"]], 512]
+
+[[variables.virtual]]
 name = "left"
 type = "Bit"
 desc = "Whether to perform a left-shift."
@@ -144,19 +150,19 @@ multiplicity = "μ"
 [[constraints.defs]]
 kind = "arith"
 constraint = "$#`limb_shift_1` = (#`limb_shift_odd` dot (32 - #`limb_shift_even`)) / 512$"
-poly = ["-", "limb_shift_1", ["/", ["*", "limb_shift_odd", ["-", 32, "limb_shift_even"]], 512]]
+poly = ["-", ["*", 512, "limb_shift_1"], ["*", "limb_shift_odd", ["-", 32, "limb_shift_even"]]]
 ref = "shift:c:limb_shift_1"
 
 [[constraints.defs]]
 kind = "arith"
 constraint = "$#`limb_shift_2` = ((16 - #`limb_shift_odd`) dot #`limb_shift_even`) / 512$"
-poly = ["-", "limb_shift_2", ["/", ["*", ["-", 16, "limb_shift_odd"], "limb_shift_even"], 512]]
+poly = ["-", ["*", 512, "limb_shift_2"], ["*", ["-", 16, "limb_shift_odd"], "limb_shift_even"]]
 ref = "shift:c:limb_shift_2"
 
 [[constraints.defs]]
 kind = "arith"
 constraint = "$#`limb_shift_3` = (#`limb_shift_odd` dot #`limb_shift_even`) / 512$"
-poly = ["-", "limb_shift_3", ["/", ["*", "limb_shift_odd", "limb_shift_even"], 512]]
+poly = ["-", ["*", 512, "limb_shift_3"], ["*", "limb_shift_odd", "limb_shift_even"]]
 ref = "shift:c:limb_shift_3"
 
 
@@ -243,8 +249,8 @@ name = "limb_shifting"
 
 [[constraints.limb_shifting]]
 kind = "arith"
-constraint = "$#`!limb_shift_odd` and #`!limb_shift_even` => #`shifted[i]` = #`bit_shifted[i]`$"
-poly = ["*", ["-", 16, "limb_shift_odd"], ["-", 32, "limb_shift_even"], ["-", ["idx", "shifted", "i"], ["idx", "bit_shifted", "i"]]]
+constraint = "$#`limb_shift_0` => #`shifted[i]` = #`bit_shifted[i]`$"
+poly = ["*", "limb_shift_0", ["-", ["idx", "shifted", "i"], ["idx", "bit_shifted", "i"]]]
 range = ["i", 0, 3]
 
 
