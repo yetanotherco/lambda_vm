@@ -81,6 +81,14 @@ desc = """\
        The `Word` is the least significant digit.
        """
 
+[[variables.types]]
+label = "QuadHL"
+subtypes = ["Half", "Half", "Half", "Half", "Half", "Half", "Half", "Half"]
+desc = """\
+       Variable that can only assume values in the range $[0, 2^128)$. \\
+       Represented as an array of eight `Half` variables.\
+       """
+
 # TODO: Having to define these manually will get tedious
 [[variables.types]]
 label = "Bit[3]"
