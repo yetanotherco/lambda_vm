@@ -44,9 +44,9 @@
   ), caption: [Column overview of #chip.name chip.])
 }
 
-#let cref(constraint, body) = {
-  if "ref" in constraint {
-    [#body#label(constraint.ref)]
+#let cref(obj, body) = {
+  if "ref" in obj {
+    [#body#label(obj.ref)]
   } else {
     body
   }
