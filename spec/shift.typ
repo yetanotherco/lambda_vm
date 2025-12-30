@@ -43,3 +43,6 @@ While this would mean that the three are no longer `Bit`s, this fact does not im
 #render_constraint_table(chip, config, groups: "intra_limb_right_shifting")
 #render_constraint_table(chip, config, groups: "limb_right_shifting")
 #render_constraint_table(chip, config, groups: "limb_right_shifting_extension")
+
+== Lookup
+#render_constraint_table(chip, config, groups: "lookups")

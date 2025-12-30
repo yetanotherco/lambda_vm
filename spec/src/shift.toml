@@ -340,3 +340,17 @@ poly = ["*", "right", ["+", "limb_shift_2", "limb_shift_3"], ["-", ["idx", "shif
 kind = "arith"
 constraint = "$#`right` and #`limb_shift_3` => #`shifted[1]` = #`extension`$"
 poly = ["*", "right", "limb_shift_3", ["-", ["idx", "shifted", 1], "extension"]]
+
+
+# Lookups
+
+[[constraint_groups]]
+name = "lookups"
+
+[[constraints.lookups]]
+kind = "interaction"
+tag = "SHIFT"
+input = ["in", "shift", "direction", "signed"]
+output = "shifted"
+multiplicity = "-μ"
+ref = "shift:c:lookup"
