@@ -28,6 +28,11 @@ subtypes = ["BaseField"]
 desc = "Variable that can only assume values in the range $[0, 2^16)$."
 
 [[variables.types]]
+label = "B20"
+subtypes = ["BaseField"]
+desc = "Variable that can only assume values in the range $[0, 2^20)$."
+
+[[variables.types]]
 label = "Word"
 subtypes = ["BaseField"]
 desc = "Variable that can only assume values in the range $[0, 2^32)$."
@@ -122,6 +127,11 @@ desc = "Three halfwords"
 label = "Half[8]"
 subtypes = ["Half", "Half", "Half", "Half", "Half", "Half", "Half", "Half"]
 desc = "Eight halfwords"
+
+[[variables.types]]
+label = "B20[4]"
+subtypes = ["B20", "B20", "B20", "B20"]
+desc = "Four B20s"
 
 
 [variables.categories]
