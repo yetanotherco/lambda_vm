@@ -38,8 +38,17 @@
     assert(category in config.variables.categories.all)
   }
 
+  // Check that either `poly` or `polys` is set, but not both
+  let all_vars = chip.variables.values().flatten()
+  for var in all_vars {
+    assert(
+      "poly" not in var or "polys" not in var, 
+      message: "both 'poly' and 'polys' defined defined for " + repr(var.name)
+    )
+  }
+
   let all_labels = config.variables.types.map(type => type.label);
-  for var in chip.variables.values().flatten() {
+  for var in all_vars {
     let type_label = if type(var.type) == array {
       var.type.at(0)
     } else {

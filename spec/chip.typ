@@ -44,12 +44,12 @@
   }
 
   // Render definition `def`
-  let render_definition(def) = {
+  let render_definition(def, var_name) = {
     if type(def) == dictionary {
       (
         [],
         table.cell(align: right, emph[definition]), 
-        expr_to_math((":=", ("idx", var.name, def.idx), def.poly)),
+        expr_to_math((":=", ("idx", var_name, def.idx), def.poly)),
         render_def_range(def.idx, def.range)
       )
     } else {
@@ -63,7 +63,7 @@
 
   // Render definition `defs`
   // It is assumed that `defs` has several entries.
-  let render_indexed_definitions(var_name, defs) = {
+  let render_indexed_definitions(defs, var_name) = {
     (
       [],
       table.cell(align: right, emph[definition]), 
@@ -97,13 +97,13 @@
           table.cell(colspan: 2, [#eval(var.desc, mode: "markup")])
         )
         if "polys" in var {
-          render_indexed_definitions(var.polys)
+          render_indexed_definitions(var.polys, var.name)
         }
         if "poly" in var {
-          render_definition(var.poly)
+          render_definition(var.poly, var.name)
         }
       }
-      (table.cell(colspan: 4, []))
+      (table.cell(colspan: 4, []), )
     },
   ), caption: [Column overview of #chip.name chip.])
 }
