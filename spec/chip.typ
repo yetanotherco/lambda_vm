@@ -31,12 +31,11 @@
   let render_def_range(idx, range) = {
     if type(range) == array {
       if range.len() == 1 {
-      [#raw(idx) `=` #range.at(0)]
-      }
-      if range.len() == 2 {
+        [#raw(idx) `=` #range.at(0)]
+      } else if range.len() == 2 {
         [#raw(idx) #sym.in `[`#range.at(0)`,`#range.at(1)`]`]
       } else {
-        assert(false, message: "invalid range: " + repr(range))
+        assert(false, message: "invalid range: " + repr(range) + repr(range.len()))
       }
     } else {
       [#raw(idx) `=` #range]
