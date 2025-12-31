@@ -70,7 +70,7 @@ The interactions with the wider system.
 === Input and output to the ALU
 
 We constrain `arg1`, `arg2` and `rvd` to correspond to the wanted values,
-including the appropriate sign/zero extension, depending on `word_instruction`.
+including the appropriate sign/zero extension, depending on `word_instr`.
 
 #render_constraint_table(chip, config, groups: "ext")
 

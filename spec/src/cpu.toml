@@ -57,18 +57,24 @@ type = "Bit"
 desc = "Whether the instruction is of C type, i.e., whether it is 2 bytes long instead of 4"
 
 # TODO: Should this just be a word? (CHECK: effect on computation/extension of arg2)
-# TODO: make sure decode correctly extends this (may be zero for unsigned and word_instruction?)
+# TODO: make sure decode correctly extends this (may be zero for unsigned and word_instr?)
 [[variables.input]]
 name = "imm"
 type = "DWordWL"
 desc = "The fully extended 64-bit version of the immediate"
 
 [[variables.input]]
+name = "signed"
+type = "Bit"
+desc = "Indicates whether we're dealing with a signed or unsigned instruction"
+
+[[variables.input]]
 name = "mp_selector"
 type = "Bit"
 desc = """Multi-purpose selector used by different ALU operations for different purposes. Currently, it is used
     - by the `MUL` chip to select between `MUL`/`MULH` and `MULH[S]U`, and
-    - as flag for inverting the condition of conditional branches (see `branch_cond`)"""
+    - as flag for inverting the condition of conditional branches (see `branch_cond`)
+    - as direction (left or right) for `SHIFT`"""
 
 [[variables.input]]
 name = "muldiv_selector"
@@ -76,7 +82,7 @@ type = "Bit"
 desc = "Selects which output of `MUL` (lo/hi) or `DIV` (quo/rem) is wanted"
 
 [[variables.input]]
-name = "word_instruction"
+name = "word_instr"
 type = "Bit"
 desc = "Whether the instruction is a \\*W instruction, requiring the inputs and outputs to be (sign) extended"
 
@@ -234,28 +240,29 @@ poly = ["+",
     ["*", ["^", 2, 2], "memory_4bytes"],
     ["*", ["^", 2, 3], "memory_8bytes"],
     ["*", ["^", 2, 4], "c_type_instruction"],
-    ["*", ["^", 2, 5], "mp_selector"],
-    ["*", ["^", 2, 6], "muldiv_selector"],
-    ["*", ["^", 2, 7], "word_instruction"],
-    ["*", ["^", 2, 8], "ADD"],
-    ["*", ["^", 2, 9], "SUB"],
-    ["*", ["^", 2, 10], "SLT"],
-    ["*", ["^", 2, 11], "AND"],
-    ["*", ["^", 2, 12], "OR"],
-    ["*", ["^", 2, 13], "XOR"],
-    ["*", ["^", 2, 14], "SHIFT"],
-    ["*", ["^", 2, 15], "JALR"],
-    ["*", ["^", 2, 16], "BEQ"],
-    ["*", ["^", 2, 17], "BLT"],
-    ["*", ["^", 2, 18], "LOAD"],
-    ["*", ["^", 2, 19], "STORE"],
-    ["*", ["^", 2, 20], "MUL"],
-    ["*", ["^", 2, 21], "DIVREM"],
-    ["*", ["^", 2, 22], "ECALL"],
-    ["*", ["^", 2, 23], "EBREAK"],
-    ["*", ["^", 2, 24], "rs1"],
-    ["*", ["^", 2, 32], "rs2"],
-    ["*", ["^", 2, 40], "rd"],
+    ["*", ["^", 2, 5], "signed"],
+    ["*", ["^", 2, 6], "mp_selector"],
+    ["*", ["^", 2, 7], "muldiv_selector"],
+    ["*", ["^", 2, 8], "word_instr"],
+    ["*", ["^", 2, 9], "ADD"],
+    ["*", ["^", 2, 10], "SUB"],
+    ["*", ["^", 2, 11], "SLT"],
+    ["*", ["^", 2, 12], "AND"],
+    ["*", ["^", 2, 13], "OR"],
+    ["*", ["^", 2, 14], "XOR"],
+    ["*", ["^", 2, 15], "SHIFT"],
+    ["*", ["^", 2, 16], "JALR"],
+    ["*", ["^", 2, 17], "BEQ"],
+    ["*", ["^", 2, 18], "BLT"],
+    ["*", ["^", 2, 19], "LOAD"],
+    ["*", ["^", 2, 20], "STORE"],
+    ["*", ["^", 2, 21], "MUL"],
+    ["*", ["^", 2, 22], "DIVREM"],
+    ["*", ["^", 2, 23], "ECALL"],
+    ["*", ["^", 2, 24], "EBREAK"],
+    ["*", ["^", 2, 25], "rs1"],
+    ["*", ["^", 2, 33], "rs2"],
+    ["*", ["^", 2, 41], "rd"],
 ]
 
 
@@ -313,6 +320,12 @@ ref = "cpu:c:range_c_kind_instruction"
 [[constraints.range]]
 kind = "template"
 tag = "IS_BIT"
+input = ["signed"]
+ref = "cpu:c:range_signed"
+
+[[constraints.range]]
+kind = "template"
+tag = "IS_BIT"
 input = ["mp_selector"]
 ref = "cpu:c:range_mp_selector"
 
@@ -325,8 +338,8 @@ ref = "cpu:c:range_muldiv_selector"
 [[constraints.range]]
 kind = "template"
 tag = "IS_BIT"
-input = ["word_instruction"]
-ref = "cpu:c:range_word_instruction"
+input = ["word_instr"]
+ref = "cpu:c:range_word_instr"
 
 [[constraints.range]]
 kind = "template"
@@ -438,6 +451,24 @@ input = ["rs2"]
 kind = "interaction"
 tag = "IS_BYTE"
 input = ["rd"]
+
+[[constraints.range]]
+kind = "interaction"
+tag = "IS_BYTE"
+input = [["idx", "arg1", "i"]]
+range = ["i", 0, 7]
+
+[[constraints.range]]
+kind = "interaction"
+tag = "IS_BYTE"
+input = [["idx", "arg2", "i"]]
+range = ["i", 0, 7]
+
+[[constraints.range]]
+kind = "interaction"
+tag = "IS_BYTE"
+input = [["idx", "res", "i"]]
+range = ["i", 0, 7]
 
 
 [[constraint_groups]]
@@ -599,15 +630,15 @@ prefix = "E"
 
 [[constraints.ext]]
 kind = "arith"
-constraint = "$(#`rv1_sign_bit` or #`arg2_sign_bit` or #`res_sign_bit`) => #`word_instruction`$"
-poly = ["*", ["+", "rv1_sign_bit", "arg2_sign_bit", "res_sign_bit"], ["not", "word_instruction"]]
+constraint = "$(#`rv1_sign_bit` or #`arg2_sign_bit` or #`res_sign_bit`) => #`word_instr`$"
+poly = ["*", ["+", "rv1_sign_bit", "arg2_sign_bit", "res_sign_bit"], ["not", "word_instr"]]
 
 [[constraints.ext]]
 kind = "interaction"
 tag = "MSB16"
 input = [["idx", "rv1", 1]]
 output = "rv1_sign_bit"
-multiplicity = "word_instruction"
+multiplicity = "word_instr"
 
 [[constraints.ext]]
 kind = "arith"
@@ -616,15 +647,15 @@ poly = ["-", ["idx", ["cast", "arg1", "DWordWL"], 0], ["idx", ["cast", "rv1", "D
 
 [[constraints.ext]]
 kind = "arith"
-constraint = "$#`arg1[4:]` = #`rv1[2]` dot (1 - #`word_instruction`) + (2^(32) - 1) dot #`rv1_sign_bit` dot #`signed`$"
-poly = ["-", ["idx", ["cast", "arg1", "DWordWL"], 1], ["*", ["not", "word_instruction"], ["idx", "rv1", 2]], ["*", "signed", "rv1_sign_bit", ["-", ["^", 2, 32], 1]]]
+constraint = "$#`arg1[4:]` = #`rv1[2]` dot (1 - #`word_instr`) + (2^(32) - 1) dot #`rv1_sign_bit` dot #`signed`$"
+poly = ["-", ["idx", ["cast", "arg1", "DWordWL"], 1], ["*", ["not", "word_instr"], ["idx", "rv1", 2]], ["*", "signed", "rv1_sign_bit", ["-", ["^", 2, 32], 1]]]
 
 [[constraints.ext]]
 kind = "interaction"
 tag = "MSB16"
 input = [["idx", "rv2", 1]]
 output = "arg2_sign_bit"
-multiplicity = "word_instruction"
+multiplicity = "word_instr"
 
 [[constraints.ext]]
 kind = "arith"
@@ -633,15 +664,15 @@ poly = ["-", ["idx", ["cast", "arg2", "DWordWL"], 0], ["*", ["-", 1, "STORE", "L
 
 [[constraints.ext]]
 kind = "arith"
-constraint = "$#`arg2[4:]` = (1 - #`STORE` - #`LOAD`) dot ((1 - #`word_instruction`) dot #`rv2[2]` + #`signed` dot #`arg2_sign_bit` dot (2^(32) - 1)) + (1 - #`BEQ` - #`BLT`) dot #`imm[1]`$"
-poly = ["-", ["idx", ["cast", "arg2", "DWordWL"], 1], ["*", ["-", 1, "STORE", "LOAD"], ["not", "word_instruction"], ["idx", "rv2", 2]], ["*", ["-", 1, "STORE", "LOAD"], "signed", "arg2_sign_bit", ["-", ["^", 2, 32], 1]], ["*", ["-", 1, "BEQ", "BLT"], ["idx", "imm", 1]]]
+constraint = "$#`arg2[4:]` = (1 - #`STORE` - #`LOAD`) dot ((1 - #`word_instr`) dot #`rv2[2]` + #`signed` dot #`arg2_sign_bit` dot (2^(32) - 1)) + (1 - #`BEQ` - #`BLT`) dot #`imm[1]`$"
+poly = ["-", ["idx", ["cast", "arg2", "DWordWL"], 1], ["*", ["-", 1, "STORE", "LOAD"], ["not", "word_instr"], ["idx", "rv2", 2]], ["*", ["-", 1, "STORE", "LOAD"], "signed", "arg2_sign_bit", ["-", ["^", 2, 32], 1]], ["*", ["-", 1, "BEQ", "BLT"], ["idx", "imm", 1]]]
 
 [[constraints.ext]]
 kind = "interaction"
 tag = "MSB8"
 input = [["idx", "res", 3]]
 output = "res_sign_bit"
-multiplicity = "word_instruction"
+multiplicity = "word_instr"
 
 [[constraints.ext]]
 kind = "arith"
@@ -650,9 +681,9 @@ poly = ["*", ["not", "LOAD"], ["-", ["idx", "rvd", 0], ["idx", ["cast", "res", "
 
 [[constraints.ext]]
 kind = "arith"
-constraint = "$#`!LOAD` => #`rvd[1]` = (1 - #`word_instruction`) dot #`res[4:]` + #`res_sign_bit` dot (2^(32) - 1)$"
-desc = "_Sign_ extend the output if it wasn't a `LOAD`. Only `LOAD` has both `write_register = 1` and `rvd ≠ res`. `LOAD` and `word_instruction` are disjoint"
-poly = ["*", ["not", "LOAD"], ["-", ["idx", "rvd", 1], ["*", ["not", "word_instruction"], ["idx", ["cast", "res", "DWordWL"], 1]], ["*", "res_sign_bit", ["-", ["^", 2, 32], 1]]]]
+constraint = "$#`!LOAD` => #`rvd[1]` = (1 - #`word_instr`) dot #`res[4:]` + #`res_sign_bit` dot (2^(32) - 1)$"
+desc = "_Sign_ extend the output if it wasn't a `LOAD`. Only `LOAD` has both `write_register = 1` and `rvd ≠ res`. `LOAD` and `word_instr` are disjoint"
+poly = ["*", ["not", "LOAD"], ["-", ["idx", "rvd", 1], ["*", ["not", "word_instr"], ["idx", ["cast", "res", "DWordWL"], 1]], ["*", "res_sign_bit", ["-", ["^", 2, 32], 1]]]]
 
 
 
