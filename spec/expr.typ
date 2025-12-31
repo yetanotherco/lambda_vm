@@ -55,7 +55,7 @@
   "sub": 6,  // -
   "idx": 7,  // []
   "cast": 8, // cast
-  "eq": 9,   // =
+  "eq": 9,   // = and :=
   "MAX": 10, // <the void outside every expression>
 )
 
@@ -100,6 +100,7 @@
       rec(PREC.pow, e.at(1)) + `^` + rec(PREC.pow, e.at(2))
     },
     "=": (pp, rec, e) => rec(PREC.eq, e.at(1)) + ` = ` + rec(PREC.eq, e.at(2)),
+    ":=": (pp, rec, e) => rec(PREC.eq, e.at(1)) + ` := ` + rec(PREC.eq, e.at(2)),
     "-": (pp, rec, e) => {
       if e.len() == 2 {
         // Negation
@@ -138,6 +139,7 @@
       $#e.at(1)^#e.at(2)$
     },
     "=": (pp, rec, e) => $#rec(PREC.eq, e.at(1)) = #rec(PREC.eq, e.at(2))$,
+    ":=": (pp, rec, e) => $#rec(PREC.eq, e.at(1)) := #rec(PREC.eq, e.at(2))$,
     "-": (pp, rec, e) => {
       if e.len() == 2 {
         // Negation
