@@ -26,27 +26,84 @@
 
 /// Generates a table listing `chip`'s columns.
 #let render_chip_column_table(chip, config) = {
+
+  // Render a definition's range
+  let render_def_range(idx, range) = {
+    if type(range) == array {
+      if range.len() == 1 {
+      [#raw(idx) `=` #range.at(0)]
+      }
+      if range.len() == 2 {
+        [#raw(idx) #sym.in `[`#range.at(0)`,`#range.at(1)`]`]
+      } else {
+        assert(false, message: "invalid range: " + repr(range))
+      }
+    } else {
+      [#raw(idx) `=` #range]
+    }
+  }
+
+  // Render definition `def`
+  let render_definition(def) = {
+    if type(def) == dictionary {
+      (
+        [],
+        table.cell(align: right, emph[definition]), 
+        expr_to_math((":=", ("idx", var.name, def.idx), def.poly)),
+        render_def_range(def.idx, def.range)
+      )
+    } else {
+      (
+        [],
+        table.cell(align: right, emph[definition]), 
+        table.cell(colspan: 2, expr_to_math(def))
+      )
+    }
+  }
+
+  // Render definition `defs`
+  // It is assumed that `defs` has several entries.
+  let render_indexed_definitions(var_name, defs) = {
+    (
+      [],
+      table.cell(align: right, emph[definition]), 
+      table.cell(colspan: 2, expr_to_math(("idx", var_name, defs.idx)))
+    )
+    for (i, def) in defs.entries.enumerate() {
+      (
+        [],
+        [],              
+        [#expr_to_math((":=", "  ", def.poly))],
+        [#render_def_range(defs.idx, def.range)], 
+      )
+    }
+  }
+
   // Group variables by category
   show figure: set block(breakable: true)
   figure(table(
-    columns: (auto, auto, 1fr),
+    columns: (auto, auto, 1fr, auto),
     inset: 6pt,
     align: left + top,
     stroke: none,
-    table.header([*Label*], [*Type*], [*Description*]),
+    table.header([*Label*], [*Type*], table.cell(colspan: 2, [*Description*])),
     table.hline(stroke: stroke(thickness: 2pt)),
     ..for (cat, vars) in chip.variables.pairs() {
-      ([#emph(cat)], [], [], table.hline(stroke: .6pt))
+      (table.cell(colspan: 4, emph(cat)), table.hline(stroke: .6pt))
       for var in vars {
-        ([#raw(var.name)], [#type_to_code(var.type)], [#eval(var.desc, mode: "markup")])
-        for (i, poly) in var.at("polys", default: ()).enumerate() {
-          (if i == 0 { emph[def] }, [], expr_to_math(("=", ("idx", var.name, i), poly)))
+        (
+          [#raw(var.name)], 
+          [#type_to_code(var.type)], 
+          table.cell(colspan: 2, [#eval(var.desc, mode: "markup")])
+        )
+        if "polys" in var {
+          render_indexed_definitions(var.polys)
         }
         if "poly" in var {
-          (emph[def], [], expr_to_math(var.poly))
+          render_definition(var.poly)
         }
       }
-      ([], [], [])
+      (table.cell(colspan: 4, []))
     },
   ), caption: [Column overview of #chip.name chip.])
 }
