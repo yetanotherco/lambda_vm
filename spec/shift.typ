@@ -32,16 +32,12 @@ Constrain the auxiliary variables `bit_shift`, and `limb_shift` according to the
 #render_constraint_table(chip, config, groups: "defs")
 *Note*: although exactly $1$ of the bits in `limb_shift` should equal $1$ while the others are zero, this does not have to be constrained explicitly: @shift:c:limb_shift_is_bit enforces that all values are bits, while @shift:c:limb_shift_lookup can be satisfied if and only if exactly one of the four values equals $1$.
 
-== Left shifting
+== Intra limb shifting
 #render_constraint_table(chip, config, groups: "intra_limb_left_shifting")
-#render_constraint_table(chip, config, groups: "limb_shifting")
-#render_constraint_table(chip, config, groups: "limb_left_shifting")
-#render_constraint_table(chip, config, groups: "limb_left_shifting_zero")
-
-== Right shifting
 #render_constraint_table(chip, config, groups: "intra_limb_right_shifting")
-#render_constraint_table(chip, config, groups: "limb_right_shifting")
-#render_constraint_table(chip, config, groups: "limb_right_shifting_extension")
+
+== Limb shifting
+#render_constraint_table(chip, config, groups: "limb_shifting")
 
 == Lookup
 #render_constraint_table(chip, config, groups: "lookups")
