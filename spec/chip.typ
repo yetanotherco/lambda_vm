@@ -217,7 +217,7 @@
 
   // Rendering the additional "desc" field for arith constraints
   let render_extra_description(constraint) = {
-    ([_description_], [], eval(constraint.desc, mode: "markup"), [])
+    (table.cell(align: right, colspan: 2, [_description_]), eval(constraint.desc, mode: "markup"), [])
   }
 
   show figure: set block(breakable: true)
