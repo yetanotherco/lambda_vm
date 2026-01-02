@@ -48,14 +48,14 @@
   "MIN": -1, // <the most secret heart of any expression>
   "pow": 0,  // ^
   "neg": 1,  // Unary -
-  "mul": 2,  // *
-  "div": 3,  // /
-  "not": 4,  // not
-  "add": 5,  // +
-  "sub": 6,  // -
-  "idx": 7,  // []
-  "cast": 8, // cast
-  "eq": 9,   // = and :=
+  "cast": 2, // cast
+  "mul": 3,  // *
+  "div": 4,  // /
+  "not": 5,  // not
+  "add": 6,  // +
+  "sub": 7,  // -
+  "idx": 8,  // []
+  "eq": 9,   // = and :-
   "MAX": 10, // <the void outside every expression>
 )
 
