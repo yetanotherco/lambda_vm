@@ -1,4 +1,4 @@
-#import "/book.typ": book-page
+#import "/book.typ": book-page, rj
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   render_chip_column_table,
@@ -21,6 +21,7 @@ The `BRANCH` chip is comprised of #nr_variables variables that are expressed usi
 
 == Constraints
 
+#rj[Check correspondence with CPU for passing in `offset` as word or dword]
 We constrain `next_pc` to be `base_address + offset`,
 where `base_address` is `pc` when `JALR = 0` and `register` otherwise.
 #render_constraint_table(chip, config, groups: "all")
