@@ -16,7 +16,7 @@ desc = "The right operand"
 [[variables.input]]
 name = "signed"
 type = "Bit"
-desc = "whether to interpret `lhs` and `rhs` as signed integers"
+desc = "whether to interpret `lhs` and `rhs` as signed integers (1) or not (0)"
 
 # Output
 
@@ -58,12 +58,12 @@ desc = "The most significant bit of $#`lhs` - #`rhs`$"
 
 [[variables.virtual]]
 name = "carry"
-type = "Bit[3]"
+type = ["Bit", 3]
 desc = "The carry of subtracting limbs of `rhs` from those of `lhs`"
 polys = [
-  ["/", ["-", ["+", ["idx", "rhs", 0], ["idx", "lhs_sub_rhs", 0]], ["idx", "lhs", 0]], ["^", 2, 32]],
-  ["/", ["-", ["+", ["idx", "rhs", 1], ["idx", "lhs_sub_rhs", 1], ["idx", "carry", 0]], ["idx", "lhs", 1]], ["^", 2, 16]],
-  ["/", ["-", ["+", ["idx", "rhs", 2], ["idx", "lhs_sub_rhs", 2], ["idx", "carry", 1]], ["idx", "lhs", 2]], ["^", 2, 16]]
+  ["*", ["^", 2, -32], ["-", ["+", ["idx", "rhs", 0], ["idx", ["cast", "lhs_sub_rhs", "DWordWL"], 0]], ["idx", "lhs", 0]]],
+  ["*", ["^", 2, -16], ["-", ["+", ["idx", "rhs", 1], ["idx", "lhs_sub_rhs", 2], ["idx", "carry", 0]], ["idx", "lhs", 1]]],
+  ["*", ["^", 2, -16], ["-", ["+", ["idx", "rhs", 2], ["idx", "lhs_sub_rhs", 3], ["idx", "carry", 1]], ["idx", "lhs", 2]]]
 ]
 
 [[variables.virtual]]
@@ -127,8 +127,13 @@ ref = "lt:c:lhs_sub_rhs_msb"
 [[constraints.defs]]
 kind = "arith"
 constraint = "$#`lt` = #`signed` dot #`signed_lt` + (1 - #`signed`) dot #`unsigned_lt`$"
-desc = "where some shorthand means something"
 poly = ["+", ["-", "lt"], ["*", "signed", "signed_lt"], ["*", ["-", 1, "signed"], "unsigned_lt"]]
+
+[[constraints.defs]]
+kind = "arith"
+constraint = "$(1 - a) dot b + a dot b dot c + (1 - a) dot (1 - b) dot c$"
+desc = "Where $a = #`lhs_msb`$, $b = #`rhs_msb`$ and $c = #`lhs_sub_rhs_msb`$"
+poly = ["+", ["*", ["not", "lhs_msb"], "rhs_msb"], ["*", "lhs_msb", "rhs_msb", "lhs_sub_rhs_msb"], ["*", ["not", "lhs_msb"], ["not", "rhs_msb"], "lhs_sub_rhs_msb"]]
 
 
 [[constraint_groups]]
@@ -139,7 +144,7 @@ desc = "Constrain the subtraction"
 kind = "template"
 tag = "IS_BIT"
 input = [["idx", "carry", "i"]]
-range = ["i", 0, 1]
+range = ["i", 0, 2]
 
 [[constraints.sub]]
 kind = "interaction"
