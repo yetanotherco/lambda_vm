@@ -44,37 +44,39 @@
 
   // Render definition `def`
   let render_definition(def, var_name) = {
-    if type(def) == dictionary {
+    if type(def) in (array, str) {
+      return (
+        [],
+        table.cell(align: right, emph[definition]), 
+        table.cell(colspan: 2, expr_to_math(def))
+      )
+    }
+
+    assert(type(def) == dictionary, message: "invalid definition: " + repr(def))
+
+    if "poly" in def {
       (
         [],
         table.cell(align: right, emph[definition]), 
         expr_to_math((":=", ("idx", var_name, def.idx), def.poly)),
         render_def_range(def.idx, def.range)
       )
-    } else {
+    } else if "polys" in def {
       (
         [],
         table.cell(align: right, emph[definition]), 
-        table.cell(colspan: 2, expr_to_math(def))
+        table.cell(colspan: 2, expr_to_math(("idx", var_name, def.idx)))
       )
-    }
-  }
-
-  // Render definition `defs`
-  // It is assumed that `defs` has several entries.
-  let render_indexed_definitions(defs, var_name) = {
-    (
-      [],
-      table.cell(align: right, emph[definition]), 
-      table.cell(colspan: 2, expr_to_math(("idx", var_name, defs.idx)))
-    )
-    for (i, def) in defs.polys.enumerate() {
-      (
-        [],
-        [],              
-        [#expr_to_math((":=", "  ", def.poly))],
-        [#render_def_range(defs.idx, def.range)], 
-      )
+      for (i, poly) in def.polys.enumerate() {
+        (
+          [],
+          [],              
+          expr_to_math((":=", "  ", poly.poly)),
+          render_def_range(def.idx, poly.range), 
+        )
+      }
+    } else {
+      assert(false, message: "invalid definition: " + repr(def))
     }
   }
 
@@ -95,9 +97,6 @@
           [#type_to_code(var.type)], 
           table.cell(colspan: 2, [#eval(var.desc, mode: "markup")])
         )
-        if "defs" in var {
-          render_indexed_definitions(var.defs, var.name)
-        }
         if "def" in var {
           render_definition(var.def, var.name)
         }
