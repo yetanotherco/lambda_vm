@@ -60,17 +60,16 @@ desc = "The most significant bit of $#`lhs` - #`rhs`$"
 name = "carry"
 type = ["Bit", 3]
 desc = "The carry of subtracting limbs of `rhs` from those of `lhs`"
-polys = [
-  ["*", ["^", 2, -32], ["-", ["+", ["idx", "rhs", 0], ["idx", ["cast", "lhs_sub_rhs", "DWordWL"], 0]], ["idx", "lhs", 0]]],
-  ["*", ["^", 2, -16], ["-", ["+", ["idx", "rhs", 1], ["idx", "lhs_sub_rhs", 2], ["idx", "carry", 0]], ["idx", "lhs", 1]]],
-  ["*", ["^", 2, -16], ["-", ["+", ["idx", "rhs", 2], ["idx", "lhs_sub_rhs", 3], ["idx", "carry", 1]], ["idx", "lhs", 2]]]
-]
+def = {idx = "i", polys = [
+  {range = [0], poly = ["*", ["^", 2, -32], ["-", ["+", ["idx", "rhs", 0], ["idx", ["cast", "lhs_sub_rhs", "DWordWL"], 0]], ["idx", "lhs", 0]]]},
+  {range = [1, 2], poly = ["*", ["^", 2, -16], ["-", ["+", ["idx", "rhs", "i"], ["idx", "lhs_sub_rhs", ["+", "i", 1]], ["idx", "carry", ["-", "i", 1]]], ["idx", "lhs", "i"]]]},
+]}
 
 [[variables.virtual]]
 name = "unsigned_lt"
 type = "Bit"
 desc = "Whether $#`lhs` < #`rhs`$, as unsigned integers"
-poly = ["idx", "carry", 2]
+def = ["idx", "carry", 2]
 
 
 # Multiplicity
