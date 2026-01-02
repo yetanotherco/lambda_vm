@@ -136,6 +136,5 @@ desc = "Each row contributes the following to the LogUp sum"
 kind = "interaction"
 tag = "BRANCH"
 input = ["pc", "offset", "register", "JALR"]
-# TODO? Update with summation notation once it lands
 output = "next_pc"
 multiplicity = "-μ"
