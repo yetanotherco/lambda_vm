@@ -211,7 +211,7 @@
     }
 
     (..for poly in polys {
-      ([_polynomial constraint_], [], $#expr_to_math(poly) = 0$, [])
+      (table.cell(align: right, colspan: 2, [_polynomial constraint_]), $#expr_to_math(poly) = 0$, [])
     },)
   }
 
