@@ -63,25 +63,25 @@ desc = "whether `in` is negative."
 name = "extension"
 type = "Half"
 desc = "sign extension of `in`."
-poly = ["*", 65535, "is_negative"]
+def = ["*", 65535, "is_negative"]
 
 [[variables.virtual]]
 name = "left"
 type = "Bit"
 desc = "Whether to perform a left-shift."
-poly = ["-", "μ", "direction"]
+def = ["-", "μ", "direction"]
 
 [[variables.virtual]]
 name = "right"
 type = "Bit"
 desc = "Whether to perform a right-shift."
-poly = "direction"
+def = "direction"
 
 [[variables.virtual]]
 name = "bit_shifted"
 type = "DWordHL"
 desc = "`in <</>> (shift % 16)`"
-poly = ["+", ["idx", "bit_shifted_uncarried", "i"],  ["idx", "carry", "i"]]
+def = {idx="i", range=[0, 3], poly=["+", ["idx", "bit_shifted_uncarried", "i"],  ["idx", "carry", "i"]]}
 
 # Multiplicities
 

@@ -26,27 +26,82 @@
 
 /// Generates a table listing `chip`'s columns.
 #let render_chip_column_table(chip, config) = {
+
+  // Render a definition's range
+  let render_def_range(idx, range) = {
+    if type(range) == array {
+      if range.len() == 1 {
+        [#raw(idx) `=` #range.at(0)]
+      } else if range.len() == 2 {
+        [#raw(idx) #sym.in `[`#range.at(0)`,`#range.at(1)`]`]
+      } else {
+        assert(false, message: "invalid range: " + repr(range) + repr(range.len()))
+      }
+    } else {
+      [#raw(idx) `=` #range]
+    }
+  }
+
+  // Render definition `def`
+  let render_definition(def, var_name) = {
+    if type(def) in (array, str) {
+      return (
+        [],
+        table.cell(align: right, emph[definition]), 
+        table.cell(colspan: 2, expr_to_math(def))
+      )
+    }
+
+    assert(type(def) == dictionary, message: "invalid definition: " + repr(def))
+
+    if "poly" in def {
+      (
+        [],
+        table.cell(align: right, emph[definition]), 
+        expr_to_math((":=", ("idx", var_name, def.idx), def.poly)),
+        render_def_range(def.idx, def.range)
+      )
+    } else if "polys" in def {
+      (
+        [],
+        table.cell(align: right, emph[definition]), 
+        table.cell(colspan: 2, expr_to_math(("idx", var_name, def.idx)))
+      )
+      for (i, poly) in def.polys.enumerate() {
+        (
+          [],
+          [],              
+          expr_to_math((":=", "  ", poly.poly)),
+          render_def_range(def.idx, poly.range), 
+        )
+      }
+    } else {
+      assert(false, message: "invalid definition: " + repr(def))
+    }
+  }
+
   // Group variables by category
   show figure: set block(breakable: true)
   figure(table(
-    columns: (auto, auto, 1fr),
+    columns: (auto, auto, 1fr, auto),
     inset: 6pt,
     align: left + top,
     stroke: none,
-    table.header([*Label*], [*Type*], [*Description*]),
+    table.header([*Label*], [*Type*], table.cell(colspan: 2, [*Description*])),
     table.hline(stroke: stroke(thickness: 2pt)),
     ..for (cat, vars) in chip.variables.pairs() {
-      ([#emph(cat)], [], [], table.hline(stroke: .6pt))
+      (table.cell(colspan: 4, emph(cat)), table.hline(stroke: .6pt))
       for var in vars {
-        ([#raw(var.name)], [#type_to_code(var.type)], [#eval(var.desc, mode: "markup")])
-        for (i, poly) in var.at("polys", default: ()).enumerate() {
-          (if i == 0 { emph[def] }, [], expr_to_math(("=", ("idx", var.name, i), poly)))
-        }
-        if "poly" in var {
-          (emph[def], [], expr_to_math(var.poly))
+        (
+          [#raw(var.name)], 
+          [#type_to_code(var.type)], 
+          table.cell(colspan: 2, [#eval(var.desc, mode: "markup")])
+        )
+        if "def" in var {
+          render_definition(var.def, var.name)
         }
       }
-      ([], [], [])
+      (table.cell(colspan: 4, []), )
     },
   ), caption: [Column overview of #chip.name chip.])
 }
@@ -143,7 +198,7 @@
 
   // Whether constraint has a "desc" field we need to render separately
   let has_extra_description(constraint) = {
-    constraint.kind == "arith" and "desc" in constraint
+    "desc" in constraint
   }
 
   // Rendering polynomial constraints
