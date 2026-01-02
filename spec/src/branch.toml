@@ -31,30 +31,39 @@ name = "next_pc_high"
 type = ["Half", 3]
 desc = "The upper part of the next pc"
 
+[[variables.output]]
+name = "next_pc_low"
+type = ["Byte", 2]
+desc = "The lower part of the next pc"
+
 
 # Auxiliary
 
 [[variables.auxiliary]]
-name = "raw_add_low"
-type = ["Byte", 2]
-desc = "The low part of the raw addition"
-
-[[variables.auxiliary]]
-name = "masked_add_low"
+name = "unmasked_low_byte"
 type = "Byte"
-desc = "The low part of `raw_add_low`, with it's LSB cleared"
+desc = "The low byte of the next pc, before masking the LSB. Used to constraint the raw addition."
 
 
 # Virtual
 
 [[variables.virtual]]
-name = "add_result"
+name = "next_pc_unmasked"
 type = "DWordWL"
-desc = "The combination of `next_pc_high` and `raw_add_low` to constrain the addition"
-polys = [
-  ["+", ["*", ["^", 2, 16], ["idx", "next_pc_high", 0]], ["*", ["^", 2, 8], ["idx", "raw_add_low", 1]], ["idx", "raw_add_low", 0]],
-  ["+", ["*", ["^", 2, 16], ["idx", "next_pc_high", 2]], ["idx", "next_pc_high", 1]],
-]
+desc = "The combination of `next_pc_high`, `next_pc_low[1]` and `unmasked_low_byte` to constrain the addition. This is the computed value for the next pc, before masking off the LSB as required by the ISA."
+def = {idx = "i", polys = [
+  {range = [0], poly = ["+", ["*", ["^", 2, 16], ["idx", "next_pc_high", 0]], ["*", ["^", 2, 8], ["idx", "next_pc_low", 1]], ["idx", "unmasked_low_byte", 0]]},
+  {range = [1], poly = ["+", ["*", ["^", 2, 16], ["idx", "next_pc_high", 2]], ["idx", "next_pc_high", 1]]},
+]}
+
+[[variables.virtual]]
+name = "next_pc"
+type = "DWordWL"
+desc = "The computed next pc, after masking off the LSB as required by the ISA."
+def = {idx = "i", polys = [
+  {range = [0], poly = ["+", ["*", ["^", 2, 16], ["idx", "next_pc_high", 0]], ["*", ["^", 2, 8], ["idx", "next_pc_low", 1]], ["idx", "next_pc_low", 0]]},
+  {range = [1], poly = ["+", ["*", ["^", 2, 16], ["idx", "next_pc_high", 2]], ["idx", "next_pc_high", 1]]},
+]}
 
 
 # Multiplicity
@@ -65,6 +74,21 @@ type = "Bit"
 desc = ""
 
 
+[[assumptions]]
+desc = "`pc` is range checked, `IS_WORD[pc[i]]`"
+range = ["i", 0, 1]
+
+[[assumptions]]
+desc = "`offset` is range checked, `IS_WORD[offset]`"
+
+[[assumptions]]
+desc = "`register` is range checked, `IS_WORD[register[i]]`"
+range = ["i", 0, 1]
+
+[[assumptions]]
+desc = "`IS_BIT<JALR>`"
+
+
 
 [[constraint_groups]]
 name = "all"
@@ -73,28 +97,34 @@ name = "all"
 kind = "template"
 tag = "ADD"
 input = ["pc", ["cast", "offset", "DWordWL"]]
-output = "add_result"
+output = "next_pc_unmasked"
 cond = ["not", "JALR"]
 
 [[constraints.all]]
 kind = "template"
 tag = "ADD"
 input = ["register", ["cast", "offset", "DWordWL"]]
-output = "add_result"
+output = "next_pc_unmasked"
 cond = "JALR"
 
 [[constraints.all]]
 kind = "interaction"
 tag = "IS_BYTE"
-input = [["idx", "raw_add_low", "i"]]
-range = ["i", 0, 1]
+input = [["idx", "next_pc_low", 1]]
 multiplicity = "μ"
 
 [[constraints.all]]
 kind = "interaction"
 tag = "AND_BYTE"
-input = [["idx", "raw_add_low", 0]]
-output = "masked_add_low"
+input = [["idx", "unmasked_low_byte", 0], 254]
+output = ["idx", "next_pc_low", 0]
+multiplicity = "μ"
+
+[[constraints.all]]
+kind = "interaction"
+tag = "IS_HALFWORD"
+input = [["idx", "next_pc_high", "i"]]
+range = ["i", 0, 2]
 multiplicity = "μ"
 
 
@@ -107,5 +137,5 @@ kind = "interaction"
 tag = "BRANCH"
 input = ["pc", "offset", "register", "JALR"]
 # TODO? Update with summation notation once it lands
-output = ["+", ["*", ["^", 2, 48], ["idx", "next_pc_high", 2]], ["*", ["^", 2, 32], ["idx", "next_pc_high", 1]], ["*", ["^", 2, 16], ["idx", "next_pc_high", 0]], ["*", ["^", 2, 8], ["idx", "raw_add_low", 1]], "masked_add_low"]
+output = "next_pc"
 multiplicity = "-μ"
