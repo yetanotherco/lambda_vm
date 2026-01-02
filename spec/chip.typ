@@ -68,7 +68,7 @@
       table.cell(align: right, emph[definition]), 
       table.cell(colspan: 2, expr_to_math(("idx", var_name, defs.idx)))
     )
-    for (i, def) in defs.entries.enumerate() {
+    for (i, def) in defs.polys.enumerate() {
       (
         [],
         [],              
@@ -95,11 +95,11 @@
           [#type_to_code(var.type)], 
           table.cell(colspan: 2, [#eval(var.desc, mode: "markup")])
         )
-        if "polys" in var {
-          render_indexed_definitions(var.polys, var.name)
+        if "defs" in var {
+          render_indexed_definitions(var.defs, var.name)
         }
-        if "poly" in var {
-          render_definition(var.poly, var.name)
+        if "def" in var {
+          render_definition(var.def, var.name)
         }
       }
       (table.cell(colspan: 4, []), )
