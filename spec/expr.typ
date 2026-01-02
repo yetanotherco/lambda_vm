@@ -55,7 +55,7 @@
   "add": 6,  // +
   "sub": 7,  // -
   "idx": 8,  // []
-  "eq": 9,   // = and :-
+  "eq": 9,   // = and :=
   "MAX": 10, // <the void outside every expression>
 )
 
