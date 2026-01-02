@@ -38,8 +38,18 @@
     assert(category in config.variables.categories.all)
   }
 
+  // Check that `def` is only contained in `virtual` variables
+  let non_virtual_vars = chip.variables.pairs().filter(x => x.first() != "virtual").map(x => x.last()).flatten();
+  for var in non_virtual_vars {
+    assert(
+      "def" not in var,
+      message: "illegal `def` in non-virtual var: " + repr(var.name)
+    )
+  }
+
+  let all_vars = chip.variables.values().flatten()
   let all_labels = config.variables.types.map(type => type.label);
-  for var in chip.variables.values().flatten() {
+  for var in all_vars {
     let type_label = if type(var.type) == array {
       var.type.at(0)
     } else {
