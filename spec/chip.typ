@@ -160,6 +160,7 @@
     groups = (groups,)
   }
   assert(groups.all(group => group in all_groups), message: "unknown group")
+  let selected_constraints = chip.constraints.pairs().filter(p => p.first() in groups).map(p => p.last()).flatten();
 
   // Find the group definition in the constraint_groups
   let lookup_group(name) = chip.constraint_groups.filter((g) => g.name == name).at(0, default: (name: name))
@@ -220,13 +221,26 @@
     (table.cell(align: right, colspan: 2, [_description_]), eval(constraint.desc, mode: "markup"), [])
   }
 
+  // Whether there is at least one constraint with a range
+  // This can be used to see whether the "Range" label should be displayed
+  let do_display_range = selected_constraints.any(x => "range" in x)
+
+  // Whether there is at least one constraint with a multiplicity
+  // This can be used to see whether the "Multiplicity" label should be displayed
+  let do_display_multiplicity = selected_constraints.any(x => "multiplicity" in x)
+
   show figure: set block(breakable: true)
   figure(table(
     columns: (auto, auto, 1fr, auto),
     inset: 6pt,
     align: (top + left, top + left, top + left, top + center),
     stroke: none,
-    table.header([*Tag*], [*Range*], [*Description*], [*Multiplicity*]),
+    table.header(
+      [*Tag*], 
+      if do_display_range {[*Range*]} else {[]}, 
+      [*Description*], 
+      if do_display_multiplicity {[*Multiplicity*]} else {[]},
+    ),
     table.hline(stroke: stroke(thickness: 2pt)),
     ..for group in groups {
       for constraint in chip.constraints.at(group) {
