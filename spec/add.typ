@@ -1,0 +1,38 @@
+#import "/book.typ": book-page, et
+#import "/src.typ": load_config, load_chip
+#import "/chip.typ": render_chip_column_table, render_chip_assumptions, render_constraint_table
+
+#show: book-page.with(title: "ADD/SUB")
+
+#let config = load_config()
+#let chip = load_chip("src/add.toml", config)
+
+#let add = raw(chip.name)
+
+#let highlighted_code(code) = {
+  box(
+    inset: (left: 4pt, right: 4pt), 
+    outset: (top: 4pt, bottom: 4pt), 
+    radius: 2pt,
+    fill: luma(230), 
+    raw(code))
+}
+
+= #add template
+#add is a constraint template that is used to assert that the variable `sum` is the sum of the variables `lhs` and `rhs`, under the condition that `cond` is non-zero.
+
+== Notation
+The #add constraint template has the following interface:
+#block(radius: 5pt, width: 100%, inset: 1.5em, fill: luma(230), raw("cond => ADD<sum; lhs, rhs>"))
+where `cond` is any value described by an expression _of degree at most $1$_.
+Note that #highlighted_code("ADD<sum; lhs, rhs>") can be used to denote the _unconditional_ application of the #add template to `lhs`, `rhs`, and `sum`.
+
+== Variables
+#render_chip_column_table(chip, config)
+
+== Assumptions
+#render_chip_assumptions(chip, config)
+
+== Constraints
+This template introduces the following constraints
+#render_constraint_table(chip, config)

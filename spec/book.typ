@@ -8,6 +8,7 @@
   summary: [
     #chapter("variables.typ")[Variables]
     #chapter("is_bit.typ")[IS_BIT template]
+    #chapter("add.typ")[ADD template]
   ]
 )
 
