@@ -7,6 +7,7 @@
   title: "Lambda VM specification",
   summary: [
     #chapter("variables.typ")[Variables]
+    #chapter("is_bit.typ")[IS_BIT template]
   ]
 )
 
