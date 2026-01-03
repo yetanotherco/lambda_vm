@@ -14,8 +14,6 @@
 #show: book-page.with(title: "SHIFT chip")
 
 
-#outline()
-
 = Columns
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
@@ -26,18 +24,41 @@ The `SHIFT` chip is comprised of #nr_variables variables that are expressed usin
 = Assumptions
 #render_chip_assumptions(chip, config)
 
+= About
+This chip is designed to enforce that 
+$ 
+#`out` := cases(
+  #`in` #`<<` #`s` " if" #`direction` = 0,
+  #`in` #`>>` #`s` " if" #`direction` = 1 and #`signed` = 0,
+  #`in` #`>>>` #`s` "if" #`direction` = 1 and #`signed` = 1,
+) 
+$
+where
+$ 
+#`s` := cases(
+  #`shift` mod 32 "if" #`word_instr` = 1,
+  #`shift` mod 64 "if" #`word_instr` = 0,
+) 
+$
+Here, `<<` and `>>` denote the _logical_ left and right shift operations, while `>>>` denotes the _arithmetic_ right shift operation.
+
+Note that, while they share many similarities, these six different operations are sufficiently different that the resulting compact design is rather complex.
+Pay close attention as we work through the constraints put in place to enforce `out` is the correct value. 
+
+
 = Constraints
-== Definitions
-Constrain the auxiliary variables `bit_shift`, and `limb_shift` according to their definitions.
 #render_constraint_table(chip, config, groups: "defs")
-*Note*: although exactly $1$ of the bits in `limb_shift` should equal $1$ while the others are zero, this does not have to be constrained explicitly: @shift:c:limb_shift_is_bit enforces that all values are bits, while @shift:c:limb_shift_lookup can be satisfied if and only if exactly one of the four values equals $1$.
 
-== Intra limb shifting
-#render_constraint_table(chip, config, groups: "intra_limb_left_shifting")
-#render_constraint_table(chip, config, groups: "intra_limb_right_shifting")
+== Left shift
+Left shifting, when `bit_shift != 0`.
+#render_constraint_table(chip, config, groups: "intra_limb_left_shift")
 
-== Limb shifting
+== Right shift
+Right shifting, when `bit_shift != 0`.
+#render_constraint_table(chip, config, groups: "logical_right")
+
+== Full-limb shifting
 #render_constraint_table(chip, config, groups: "limb_shifting")
 
-== Lookup
+== Lookups
 #render_constraint_table(chip, config, groups: "lookups")
