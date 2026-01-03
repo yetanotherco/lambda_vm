@@ -35,7 +35,10 @@
 #let _check_chip(chip, config) = {
   // Check that all variable categories are valid
   for category in chip.variables.keys() {
-    assert(category in config.variables.categories.all)
+    assert(
+      category in config.variables.categories.all, 
+      message: "invalid category: " + repr(category)
+    )
   }
 
   // Check that `def` is only contained in `virtual` variables

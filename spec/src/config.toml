@@ -82,5 +82,5 @@ desc = """\
        """
 
 [variables.categories]
-all = ["input", "output", "auxiliary", "virtual", "multiplicity"]
+all = ["input", "output", "auxiliary", "virtual", "multiplicity", "condition"]
 instantiated = ["input", "output", "auxiliary", "multiplicity"]
