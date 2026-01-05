@@ -647,11 +647,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(Verifier::<CPUTableAIR>::verify(
+        assert!(Verifier::verify(
             &proof,
-            &(),
-            &proof_options,
-            DefaultTranscript::<Degree4BabyBearU32ExtensionField>::new(&[]),
+            &air,
+            &mut DefaultTranscript::<Degree4BabyBearU32ExtensionField>::new(&[]),
         ));
     }
 
@@ -671,11 +670,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(Verifier::<CPUTableAIR>::verify(
+        assert!(Verifier::verify(
             &proof,
-            &(),
-            &proof_options,
-            DefaultTranscript::<Degree4BabyBearU32ExtensionField>::new(&[]),
+            &air,
+            &mut DefaultTranscript::<Degree4BabyBearU32ExtensionField>::new(&[]),
         ));
     }
 }

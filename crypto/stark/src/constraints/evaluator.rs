@@ -6,7 +6,7 @@ use crate::trace::LDETraceTable;
 use crate::traits::{AIR, TransitionEvaluationContext};
 use crate::{frame::Frame, prover::evaluate_polynomial_on_lde_domain};
 use itertools::Itertools;
-use math::field::traits::{IsFFTField, IsSubFieldOf};
+use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 #[cfg(not(feature = "parallel"))]
 use math::polynomial::Polynomial;
 use math::{fft::errors::FFTError, field::element::FieldElement};
@@ -22,7 +22,7 @@ use std::time::Instant;
 
 pub struct ConstraintEvaluator<
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: Send + Sync + IsFFTField,
+    FieldExtension: Send + Sync + IsField,
     PI,
 > {
     boundary_constraints: BoundaryConstraints<FieldExtension>,
@@ -31,7 +31,7 @@ pub struct ConstraintEvaluator<
 impl<Field, FieldExtension, PI> ConstraintEvaluator<Field, FieldExtension, PI>
 where
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: Send + Sync + IsFFTField,
+    FieldExtension: Send + Sync + IsField,
 {
     pub fn new(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,

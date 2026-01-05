@@ -31,11 +31,10 @@ pub fn run_program_and_prover(elf_path: &str) {
     )
     .unwrap();
 
-    assert!(Verifier::<CPUTableAIR>::verify(
+    assert!(Verifier::verify(
         &proof,
-        &(),
-        &proof_options,
-        DefaultTranscript::<Degree4BabyBearU32ExtensionField>::new(&[]),
+        &air,
+        &mut DefaultTranscript::<Degree4BabyBearU32ExtensionField>::new(&[]),
     ));
 }
 
