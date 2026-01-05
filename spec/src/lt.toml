@@ -29,11 +29,6 @@ desc = "Whether $#`lhs` < #`rhs`$, taking `signed` into account"
 # Auxiliary
 
 [[variables.auxiliary]]
-name = "signed_lt"
-type = "Bit"
-desc = "Whether $#`lhs` < #`rhs`$, as signed integers"
-
-[[variables.auxiliary]]
 name = "lhs_sub_rhs"
 type = "DWordHL"
 desc = "$#`lhs` - #`rhs`$"
@@ -48,28 +43,22 @@ name = "rhs_msb"
 type = "Bit"
 desc = "The most significant bit of `rhs`"
 
-[[variables.auxiliary]]
-name = "lhs_sub_rhs_msb"
-type = "Bit"
-desc = "The most significant bit of $#`lhs` - #`rhs`$"
-
-
 # Virtual
 
 [[variables.virtual]]
 name = "carry"
-type = ["Bit", 3]
+type = ["Bit", 2]
 desc = "The carry of subtracting limbs of `rhs` from those of `lhs`"
 def = {idx = "i", polys = [
   {range = [0], poly = ["*", ["^", 2, -32], ["-", ["+", ["idx", "rhs", 0], ["idx", ["cast", "lhs_sub_rhs", "DWordWL"], 0]], ["idx", "lhs", 0]]]},
-  {range = [1, 2], poly = ["*", ["^", 2, -16], ["-", ["+", ["idx", "rhs", "i"], ["idx", "lhs_sub_rhs", ["+", "i", 1]], ["idx", "carry", ["-", "i", 1]]], ["idx", "lhs", "i"]]]},
+  {range = [1], poly = ["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "rhs", "DWordWL"], 1], ["idx", ["cast", "lhs_sub_rhs", "DWordWL"], 1], ["idx", "carry", 0]], ["idx", ["cast", "lhs", "DWordWL"], 1]]]},
 ]}
 
 [[variables.virtual]]
 name = "unsigned_lt"
 type = "Bit"
 desc = "Whether $#`lhs` < #`rhs`$, as unsigned integers"
-def = ["idx", "carry", 2]
+def = ["idx", "carry", 1]
 
 
 # Multiplicity
@@ -116,23 +105,11 @@ multiplicity = "μ"
 ref = "lt:c:rhs_msb"
 
 [[constraints.defs]]
-kind = "interaction"
-tag = "MSB16"
-input = [["idx", "lsb_sub_rhs", 3]]
-output = "lhs_sub_rhs_msb"
-multiplicity = "μ"
-ref = "lt:c:lhs_sub_rhs_msb"
-
-[[constraints.defs]]
 kind = "arith"
-constraint = "$#`lt` = #`signed` dot #`signed_lt` + (1 - #`signed`) dot #`unsigned_lt`$"
-poly = ["-", "lt", ["*", "signed", "signed_lt"], ["*", ["-", 1, "signed"], "unsigned_lt"]]
-
-[[constraints.defs]]
-kind = "arith"
-constraint = "$#`signed_lt` = a (1 - b) + a b c + (1 - a) (1 - b) c$"
-desc = "Where $a = #`lhs_msb`$, $b = #`rhs_msb`$ and $c = #`lhs_sub_rhs_msb`$"
-poly = ["-", "signed_lt", ["*", "lhs_msb", ["not", "rhs_msb"]], ["*", "lhs_msb", "rhs_msb", "lhs_sub_rhs_msb"], ["*", ["not", "lhs_msb"], ["not", "rhs_msb"], "lhs_sub_rhs_msb"]]
+constraint = "$#`lt` = #`signed` dot (A dot (1 - B) + A dot C + (1 - B) dot C) + (1 - #`signed`) dot #`unsigned_lt`$"
+desc = "Where $A = #`lhs_msb`$, $B = #`rhs_msb`$ and $C = #`carry[1]`$"
+poly = ["-", "lt", ["*", "signed", ["+", ["*", "lhs_msb", ["not", "rhs_msb"]], ["*", "lhs_msb", ["idx", "carry", 1]], ["*", ["not", "rhs_msb"], ["idx", "carry", 1]]]], ["*", ["-", 1, "signed"], "unsigned_lt"]]
+ref = "lt:c:lt"
 
 
 [[constraint_groups]]
@@ -143,7 +120,7 @@ desc = "Constrain the subtraction"
 kind = "template"
 tag = "IS_BIT"
 input = [["idx", "carry", "i"]]
-range = ["i", 0, 2]
+range = ["i", 0, 1]
 
 [[constraints.sub]]
 kind = "interaction"
