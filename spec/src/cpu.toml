@@ -530,7 +530,7 @@ range = ["i", 0, 7]
 [[constraints.alu]]
 kind = "interaction"
 tag = "SHIFT"
-input = [["cast", "arg1", "DWordHL"], ["idx", "arg2", 0], "mp_selector", "signed"]
+input = [["cast", "arg1", "DWordHL"], ["idx", "arg2", 0], "mp_selector", "signed", "word_instr"]
 output = ["cast", "res", "DWordHL"]
 multiplicity = "SHIFT"
 
