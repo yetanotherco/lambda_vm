@@ -94,3 +94,8 @@ fn test_asm() {
 fn test_print() {
     run_program_and_check_output("./program_artifacts/rust/print.elf", 1);
 }
+
+#[test]
+fn test_stdout() {
+    run_program_and_check_output("./program_artifacts/rust/stdout.elf", 1);
+}
