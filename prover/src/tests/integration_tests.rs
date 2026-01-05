@@ -1,4 +1,4 @@
-use crate::{constraints::cpu_air::CPUTableAIR, tables::cpu::cpu_trace_from_logs};
+use crate::{constraints::cpu_air::CPUTableAIR, tables::trace::Trace};
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use executor::{elf::Elf, vm::execution::run_program};
 use math::field::fields::fft_friendly::quartic_babybear_u32::Degree4BabyBearU32ExtensionField;
@@ -15,12 +15,12 @@ pub fn run_program_and_prover(elf_path: &str) {
     let (_results, logs) =
         run_program(program.image, program.entry_point, false).expect("Failed to run program");
 
-    let mut trace = cpu_trace_from_logs(logs);
+    let mut trace = Trace::generate_trace_from_logs(logs);
 
     let proof_options = ProofOptions::default_test_options();
 
     let proof = Prover::<CPUTableAIR>::prove(
-        &mut trace,
+        &mut trace.cpu_trace_table,
         &(),
         &proof_options,
         DefaultTranscript::<Degree4BabyBearU32ExtensionField>::new(&[]),

@@ -4,14 +4,12 @@ use executor::vm::{
     logs::Log,
 };
 use math::field::{
-    element::FieldElement,
-    fields::fft_friendly::{
-        babybear_u32::Babybear31PrimeField, quartic_babybear_u32::Degree4BabyBearU32ExtensionField,
-    },
+    element::FieldElement, fields::fft_friendly::babybear_u32::Babybear31PrimeField,
 };
-use stark::trace::TraceTable;
 
 type FE = FieldElement<Babybear31PrimeField>;
+
+pub const NUM_COLUMNS: usize = 52;
 
 #[derive(Default)]
 pub struct CpuTableRow {
@@ -58,7 +56,7 @@ pub struct CpuTableRow {
 }
 
 impl CpuTableRow {
-    pub fn from_log(log: Log, timestamp: u32) -> Self {
+    pub fn from_log(log: &Log, timestamp: u32) -> Self {
         let mut row = Self {
             timestamp: u32_to_2_limbs(timestamp),
             pc: u32_to_2_limbs(log.current_pc),
@@ -325,27 +323,11 @@ impl CpuTableRow {
         debug_assert_eq!(row.len(), 52, "CpuTableRow length mismatch");
         row
     }
-}
 
-pub fn cpu_trace_from_logs(
-    logs: Vec<Log>,
-) -> TraceTable<Babybear31PrimeField, Degree4BabyBearU32ExtensionField> {
-    const NUM_COLUMNS: usize = 52;
-    const MIN_ROWS: usize = 4;
-
-    let num_logs = logs.len();
-    let target_rows = num_logs.max(MIN_ROWS).next_power_of_two();
-
-    let mut main_data: Vec<FE> = logs
-        .into_iter()
-        .enumerate()
-        .flat_map(|(i, log)| {
-            let timestamp = (i * 4) as u32;
-            CpuTableRow::from_log(log, timestamp).to_vec()
-        })
-        .collect();
-
-    main_data.resize(target_rows * NUM_COLUMNS, FE::zero());
-
-    TraceTable::new_main(main_data, NUM_COLUMNS, 1)
+    pub fn pad_to_next_power_of_two(table: &mut Vec<FE>) {
+        const MIN_ROWS: usize = 4;
+        let num_rows = table.len() / NUM_COLUMNS;
+        let target_rows = num_rows.max(MIN_ROWS).next_power_of_two();
+        table.resize(target_rows * NUM_COLUMNS, FE::zero());
+    }
 }
