@@ -1,4 +1,4 @@
-#import "/book.typ": book-page
+#import "/book.typ": book-page, rj
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   render_chip_assumptions,
@@ -26,6 +26,7 @@ We assume the inputs `lhs`, `rhs` and `signed` are appropriately range checked.
 
 == Constraints
 We first constrain that all variables correspond to their definition.
+#rj[Explain formulae properly, including sign bit logic and how overflow only matters if signs differ]
 
 #render_constraint_table(chip, config, groups: "defs")
 
