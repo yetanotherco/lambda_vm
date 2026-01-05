@@ -3,8 +3,12 @@ use math::field::{
     fields::fft_friendly::{
         babybear_u32::Babybear31PrimeField, quartic_babybear_u32::Degree4BabyBearU32ExtensionField,
     },
+    traits::{IsField, IsSubFieldOf},
 };
-use stark::{constraints::transition::TransitionConstraint, traits::TransitionEvaluationContext};
+use stark::{
+    constraints::transition::TransitionConstraint, table::TableView,
+    traits::TransitionEvaluationContext,
+};
 
 use crate::constraints::utils::{
     compute_element_from_two_limbs_starting_at,
@@ -30,6 +34,17 @@ impl BitConstraint {
             column_idx,
             constraint_idx,
         }
+    }
+
+    fn compute_bit_constraint<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        let flag = step.get_main_evaluation_element(0, self.column_idx);
+        let one = FieldElement::<F>::one();
+
+        flag * (flag - one)
     }
 }
 
@@ -75,10 +90,7 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
                 periodic_values: _periodic_values,
                 rap_challenges: _rap_challenges,
             } => {
-                let step = frame.get_evaluation_step(0);
-                let flag = step.get_main_evaluation_element(0, self.column_idx);
-                let one = FieldElement::<Babybear31PrimeField>::one();
-                let bit_constraint = flag * (flag - one);
+                let bit_constraint = self.compute_bit_constraint(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx()] = bit_constraint.to_extension();
             }
 
@@ -87,10 +99,7 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
                 periodic_values: _periodic_values,
                 rap_challenges: _rap_challenges,
             } => {
-                let step = frame.get_evaluation_step(0);
-                let flag = step.get_main_evaluation_element(0, self.column_idx);
-                let one = FieldElement::<Degree4BabyBearU32ExtensionField>::one();
-                let bit_constraint = flag * (flag - one);
+                let bit_constraint = self.compute_bit_constraint(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx()] = bit_constraint;
             }
         }
