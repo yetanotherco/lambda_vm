@@ -99,7 +99,42 @@ impl CpuTableRow {
                         row.signed = FE::one();
                     }
                     ArithOp::SetLessThanU => row.slt = FE::one(),
-                    _ => todo!(),
+                    ArithOp::Mul => {
+                        row.mul = FE::one();
+                        row.mp_selector = FE::one();
+                        row.signed = FE::one();
+                    }
+                    ArithOp::MulHigh => {
+                        row.mul = FE::one();
+                        row.muldiv_selector = FE::one();
+                        row.signed = FE::one();
+                    }
+                    ArithOp::MulHighSignedUnsigned => {
+                        row.mul = FE::one();
+                        row.muldiv_selector = FE::one();
+                        row.mp_selector = FE::one();
+                        row.signed = FE::one();
+                    }
+                    ArithOp::MulHighUnsigned => {
+                        row.mul = FE::one();
+                        row.muldiv_selector = FE::one();
+                    }
+                    ArithOp::Div => {
+                        row.divrem = FE::one();
+                        row.signed = FE::one();
+                    }
+                    ArithOp::DivUnsigned => {
+                        row.divrem = FE::one();
+                    }
+                    ArithOp::Remainder => {
+                        row.divrem = FE::one();
+                        row.muldiv_selector = FE::one();
+                        row.signed = FE::one();
+                    }
+                    ArithOp::RemainderUnsigned => {
+                        row.divrem = FE::one();
+                        row.muldiv_selector = FE::one();
+                    }
                 }
             }
 
