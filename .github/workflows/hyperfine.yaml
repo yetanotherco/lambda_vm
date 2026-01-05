@@ -126,6 +126,7 @@ jobs:
       - name: Benchmark ${{ matrix.program_state }} programs
         id: run-benchmarks
         run: |
+          sudo swapoff -a
           mkdir target_programs
           if [ 'modified' = ${{ matrix.program_state }} ]; then
             BINS="head"
