@@ -221,7 +221,8 @@ impl Instruction {
                         for i in 0..len {
                             bytes.push(memory.load_byte(pointer + i));
                         }
-                        let value = str::from_utf8(&bytes).map_err(|_| ExecutionError::IncorrectMessage)?;
+                        let value =
+                            str::from_utf8(&bytes).map_err(|_| ExecutionError::IncorrectMessage)?;
                         println!("PRINT VM: {}", value);
                     }
                     2 => {
@@ -232,7 +233,8 @@ impl Instruction {
                         for i in 0..len {
                             bytes.push(memory.load_byte(pointer + i));
                         }
-                        let value = str::from_utf8(&bytes).map_err(|_| ExecutionError::IncorrectMessage)?;
+                        let value =
+                            str::from_utf8(&bytes).map_err(|_| ExecutionError::IncorrectMessage)?;
                         return Err(ExecutionError::Panic(value.to_owned()));
                     }
                     _ => {
