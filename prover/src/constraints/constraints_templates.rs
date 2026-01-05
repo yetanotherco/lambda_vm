@@ -444,6 +444,27 @@ impl Arg2ValidityConstraint {
             constraint_idx,
         }
     }
+
+    fn compute_arg2_validity_constraint<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        let arg2 = step.get_main_evaluation_element(0, self.arg2_start_index);
+
+        let rv2 = compute_element_from_two_limbs_starting_at(step, self.rv2_start_index);
+
+        let imm = step.get_main_evaluation_element(0, self.imm_start_index);
+
+        let one = FieldElement::<F>::one();
+
+        let store = step.get_main_evaluation_element(0, self.column_indexes.store_index);
+        let load = step.get_main_evaluation_element(0, self.column_indexes.load_index);
+        let beq = step.get_main_evaluation_element(0, self.column_indexes.beq_index);
+        let blt = step.get_main_evaluation_element(0, self.column_indexes.blt_index);
+
+        (one.clone() - (store + load)) * rv2 + (one - (beq + blt)) * imm - arg2
+    }
 }
 
 impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>
@@ -480,22 +501,8 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
                 periodic_values: _periodic_values,
                 rap_challenges: _rap_challenges,
             } => {
-                let step = frame.get_evaluation_step(0);
-
-                let arg2 = step.get_main_evaluation_element(0, self.arg2_start_index);
-
-                let rv2 = compute_element_from_two_limbs_starting_at(step, self.rv2_start_index);
-
-                let imm = step.get_main_evaluation_element(0, self.imm_start_index);
-
-                let one = FieldElement::<Babybear31PrimeField>::one();
-
-                let store = step.get_main_evaluation_element(0, self.column_indexes.store_index);
-                let load = step.get_main_evaluation_element(0, self.column_indexes.load_index);
-                let beq = step.get_main_evaluation_element(0, self.column_indexes.beq_index);
-                let blt = step.get_main_evaluation_element(0, self.column_indexes.blt_index);
-
-                let constraint = (one - (store + load)) * rv2 + (one - (beq + blt)) * imm - arg2;
+                let constraint =
+                    self.compute_arg2_validity_constraint(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx()] = constraint.to_extension();
             }
 
@@ -504,25 +511,8 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
                 periodic_values: _periodic_values,
                 rap_challenges: _rap_challenges,
             } => {
-                let step = frame.get_evaluation_step(0);
-
-                let arg2 = step.get_main_evaluation_element(0, self.arg2_start_index);
-
-                let rv2 = compute_element_from_two_limbs_starting_at_extension(
-                    step,
-                    self.rv2_start_index,
-                );
-
-                let imm = step.get_main_evaluation_element(0, self.imm_start_index);
-
-                let one = FieldElement::<Babybear31PrimeField>::one();
-
-                let store = step.get_main_evaluation_element(0, self.column_indexes.store_index);
-                let load = step.get_main_evaluation_element(0, self.column_indexes.load_index);
-                let beq = step.get_main_evaluation_element(0, self.column_indexes.beq_index);
-                let blt = step.get_main_evaluation_element(0, self.column_indexes.blt_index);
-
-                let constraint = (one - (store + load)) * rv2 + (one - (beq + blt)) * imm - arg2;
+                let constraint =
+                    self.compute_arg2_validity_constraint(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx()] = constraint;
             }
         }
