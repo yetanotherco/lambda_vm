@@ -27,13 +27,12 @@ pub fn run_program_and_prover(elf_path: &str) {
     )
     .unwrap();
 
-    let ver = Verifier::<CPUTableAIR>::verify(
+    assert!(Verifier::<CPUTableAIR>::verify(
         &proof,
         &(),
         &proof_options,
         DefaultTranscript::<Degree4BabyBearU32ExtensionField>::new(&[]),
-    );
-    println!("verification: {}", ver);
+    ));
 }
 
 #[cfg(test)]
