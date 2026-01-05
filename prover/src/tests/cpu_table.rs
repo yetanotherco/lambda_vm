@@ -119,7 +119,7 @@ pub fn build_cpu_columns_example() -> Vec<Vec<FE>> {
         FE::from(&((1 << 12) - 1)),
         FE::zero(),
         FE::zero(),
-        FE::zero(),
+        FE::from(&15u32),
         FE::zero(),
         FE::zero(),
     ];
@@ -211,7 +211,16 @@ pub fn build_cpu_columns_example() -> Vec<Vec<FE>> {
     ];
     columns.push(jalr);
     // Column index: 24
-    let beq = vec![FE::zero(); 8];
+    let beq = vec![
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
+        FE::zero(),
+        FE::one(),
+        FE::zero(),
+        FE::zero(),
+    ];
     columns.push(beq);
     // Column index: 25
     let blt = vec![FE::zero(); 8];
@@ -304,7 +313,7 @@ pub fn build_cpu_columns_example() -> Vec<Vec<FE>> {
         FE::from(&70u32),
         FE::from(&10u32),
         FE::from(&20u32),
-        FE::zero(),
+        FE::from(&15u32),
         FE::zero(),
         FE::zero(),
     ];
@@ -346,8 +355,8 @@ pub fn build_cpu_columns_example() -> Vec<Vec<FE>> {
         FE::one(),                  // LOAD -> imm
         FE::from(&((1 << 12) - 1)), // STORE -> imm
         FE::from(&10),              // SUB -> rv2
-        FE::zero(),
-        FE::zero(),
+        FE::from(&20u32),
+        FE::from(&15u32),
         FE::zero(),
         FE::zero(),
     ];
@@ -365,7 +374,7 @@ pub fn build_cpu_columns_example() -> Vec<Vec<FE>> {
         FE::from(&4125u32), // rv1 + imm = 30 + 2^12 - 1 = 4125.
         FE::from(&30u32),   // rv2 - rv1 = 40 - 10 = 30
         FE::from(&24u32),   // pc + 4 = 20 + 4 = 24
-        FE::zero(),
+        -FE::from(&15u32),
         FE::zero(),
         FE::zero(),
     ];
