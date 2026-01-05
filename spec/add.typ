@@ -19,7 +19,7 @@
 }
 
 = #add template
-#add is a constraint template that is used to assert that the variable `sum` is the sum of the variables `lhs` and `rhs`, under the condition that `cond` is non-zero.
+#add is a constraint template that is used to assert that $#`sum` = #`lhs` + #`rhs` mod 2^64$, under the condition that `cond` is non-zero.
 
 == Notation
 The #add constraint template has the following interface:
