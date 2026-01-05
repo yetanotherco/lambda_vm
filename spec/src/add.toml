@@ -25,10 +25,10 @@ desc = "$#`lhs` + #`rhs`$"
 [[variables.virtual]]
 name = "carry"
 desc = "Carry values used to constrain the addition"
-type = ["Bit", 4]
+type = ["Bit", 2]
 def = {idx="i", polys=[
     {range=0, poly=["*", ["^", 2, -32], ["-", ["+", ["idx", "lhs", 0], ["idx", "rhs", 0]], ["idx", "sum", 0]]]},
-    {range=[1, 3], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", "lhs", "i"], ["idx", "rhs", "i"], ["idx", "carry", ["-", "i", 1]]], ["idx", "sum", "i"]]]},
+    {range=1, poly=["*", ["^", 2, -32], ["-", ["+", ["idx", "lhs", 1], ["idx", "rhs", 1], ["idx", "carry", 0]], ["idx", "sum", 1]]]},
 ]}
 
 
