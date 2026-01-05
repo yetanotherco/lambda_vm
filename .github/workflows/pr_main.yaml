@@ -48,15 +48,14 @@ jobs:
       - name: Setup Rust Environment
         uses: ./.github/actions/setup-rust
 
-      # Commented until rust fork is published
-      #- name: Run asm tests 
-      #  run: |
-      #    cd executor && make test-asm-no-compile
+      - name: Run asm tests 
+        run: |
+          cd executor && make test-asm-no-compile
 
-      #- name: Run rust tests
-      #  run: |
-      #    cd executor && make test-rust
+      - name: Run rust tests
+        run: |
+          cd executor && make test-rust
 
-      #- name: Run prover tests
-      #  run: |
-      #    cd prover && cargo test
+      - name: Run prover tests
+        run: |
+          cd prover && cargo test
