@@ -160,7 +160,7 @@
     groups = (groups,)
   }
   assert(groups.all(group => group in all_groups), message: "unknown group")
-  let selected_constraints = groups.map(g => chip.constraints.at(g)).flatten();
+  let selected_constraints = groups.map(g => (g: chip.constraints.at(g))).join()
 
   // Find the group definition in the constraint_groups
   let lookup_group(name) = chip.constraint_groups.filter((g) => g.name == name).at(0, default: (name: name))
@@ -223,11 +223,11 @@
 
   // Whether there is at least one constraint with a range
   // This can be used to see whether the "Range" label should be displayed
-  let do_display_range = selected_constraints.any(x => "range" in x)
+  let do_display_range = selected_constraints.values().flatten().any(x => "range" in x)
 
   // Whether there is at least one constraint with a multiplicity
   // This can be used to see whether the "Multiplicity" label should be displayed
-  let do_display_multiplicity = selected_constraints.any(x => "multiplicity" in x)
+  let do_display_multiplicity = selected_constraints.values().flatten().any(x => "multiplicity" in x)
 
   show figure: set block(breakable: true)
   figure(table(
@@ -242,8 +242,8 @@
       if do_display_multiplicity {[*Multiplicity*]} else {[]},
     ),
     table.hline(stroke: stroke(thickness: 2pt)),
-    ..for group in groups {
-      for constraint in chip.constraints.at(group) {
+    ..for (group, group_constraints) in selected_constraints.pairs() {
+      for constraint in group_constraints {
         (
           [#tag(constraint, lookup_group(group))],
           [#interval(constraint)],
@@ -257,6 +257,6 @@
           render_polynomial_constraints(constraint)
         }
       }
-    },
+    }
   ), caption: [Constraint overview of #chip.name chip.])
 }
