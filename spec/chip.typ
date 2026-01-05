@@ -134,7 +134,7 @@
     let index = if "range" in assumption { "." + assumption.range.at(0) } else { "" }
     let lbl = [#chip.name\-A]
     show figure: (it) => align(left, block[#lbl#context it.counter.display()#index])
-    cref(assumption)[#figure(kind: "assumption", numbering: (i) => [#lbl#i#index], supplement: [], [])]
+    cref(assumption)[#figure(kind: "assumption", numbering: (i) => [#lbl#i], supplement: [], [])]
   }
 
   figure(table(
@@ -171,7 +171,7 @@
     let prefix = if "prefix" in group { group.prefix }
     let lbl = [#chip.name\-C#prefix]
     show figure: (it) => align(left, block[#lbl#context it.counter.display()#index])
-    cref(constraint)[#figure(kind: "constraint", numbering: (i) => [#lbl#i#index], supplement: [], [])]
+    cref(constraint)[#figure(kind: "constraint", numbering: (i) => [#lbl#i], supplement: [], [])]
   }
 
   /// Generates a representation of `constraint`
