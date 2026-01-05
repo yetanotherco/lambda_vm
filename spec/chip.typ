@@ -71,7 +71,7 @@
         (
           [],
           [],              
-          expr_to_math((":=", "  ", poly.poly)),
+          table.cell(inset: (left: 1.5em), expr_to_math((":=", "", poly.poly))),
           render_def_range(def.idx, poly.range), 
         )
       }
