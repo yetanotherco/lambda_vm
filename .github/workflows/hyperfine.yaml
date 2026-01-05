@@ -87,6 +87,7 @@ jobs:
 
   run-hyperfine:
     strategy:
+      fail-fast: false
       matrix:
         program_state: [modified, unmodified]
     name: Run benchmarks for ${{ matrix.program_state }} programs
