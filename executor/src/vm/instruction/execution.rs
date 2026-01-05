@@ -6,6 +6,8 @@ use crate::vm::{
 };
 
 const REGULAR_PC_UPDATE: u32 = 4;
+const PRINT_SYSCALL: u32 = 1;
+const PANIC_SYSCALL: u32 = 2;
 
 impl Instruction {
     /// Runs the given instruction and returns its execution log
@@ -211,7 +213,7 @@ impl Instruction {
             Instruction::EcallEbreak => {
                 let syscall_number = registers.read(17)?; // a7
                 match syscall_number {
-                    1 => {
+                    PRINT_SYSCALL => {
                         // print
                         // For now this is just a mechanism to print
                         // It is not the correct implementation of ecall/ebreak
@@ -225,7 +227,7 @@ impl Instruction {
                             str::from_utf8(&bytes).map_err(|_| ExecutionError::IncorrectMessage)?;
                         println!("PRINT VM: {}", value);
                     }
-                    2 => {
+                    PANIC_SYSCALL => {
                         // panic
                         let pointer = registers.read(10)?;
                         let len = registers.read(11)?;
