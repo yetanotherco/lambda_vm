@@ -78,8 +78,22 @@ subtypes = ["Word", "Half", "Half"]
 desc = """\
        Variable that can only assume values in the range $[0, 2^64)$. \\
        Represented as a `Word` and two `Half` variables.\
-       The `Word` is the least significant digit.
+       The `Word` is the *least* significant digit.
        """
+
+[[variables.types]]
+label = "DWordWHH"
+subtypes = ["Half", "Half", "Word"]
+desc = """\
+       Variable that can only assume values in the range $[0, 2^64)$. \\
+       Represented as a `Word` and two `Half` variables.\
+       The `Word` is the *most* significant digit.
+       """
+
+[[variables.types]]
+label = "Timestamp"
+subtypes = ["DWordWL"]
+desc = "A preprocessed column holding timestamps as `DWordWL`. Row `i` of the column contains the value $2^2 dot (i + 1)$. Used in the CPU chip, see there for more details about the magic number."
 
 [variables.categories]
 all = ["input", "output", "auxiliary", "virtual", "multiplicity", "condition"]
