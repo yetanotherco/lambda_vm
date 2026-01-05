@@ -10,10 +10,7 @@ use stark::{
     traits::TransitionEvaluationContext,
 };
 
-use crate::constraints::utils::{
-    compute_element_from_two_limbs_starting_at,
-    compute_element_from_two_limbs_starting_at_extension,
-};
+use crate::constraints::utils::compute_element_from_two_limbs_starting_at;
 
 pub const INV_65536: u64 = 2013235201;
 
@@ -619,6 +616,36 @@ impl AddFourCarryBitConstraint {
             constraint_idx,
         }
     }
+
+    fn compute_add_four_carry_bit_constraint<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        let flag = step.get_main_evaluation_element(0, self.flag_idx);
+
+        let lhs_0 = step.get_main_evaluation_element(0, self.lhs_start_idx);
+        let rhs_0 = FieldElement::<F>::from(4);
+        let res_0 = compute_element_from_two_limbs_starting_at(step, self.res_start_idx);
+
+        let one = FieldElement::<F>::one();
+        let inverse = FieldElement::<F>::from(INV_65536);
+        let carry_0 = (lhs_0 + rhs_0 - res_0) * inverse.clone();
+
+        match self.carry_idx {
+            CarryIndex::Zero => flag * carry_0.clone() * (carry_0 - one),
+            CarryIndex::One => {
+                // Compute the high word using the first 2 operand limbs.
+                let lhs_1 = step.get_main_evaluation_element(0, self.lhs_start_idx + 1);
+                let rhs_1 = FieldElement::<F>::zero();
+                let res_1 =
+                    compute_element_from_two_limbs_starting_at(step, self.res_start_idx + 2);
+
+                let carry_1 = (lhs_1 + rhs_1 - res_1 + carry_0) * inverse;
+                flag * carry_1.clone() * (carry_1 - one)
+            }
+        }
+    }
 }
 
 impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>
@@ -659,33 +686,8 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
                 periodic_values: _periodic_values,
                 rap_challenges: _rap_challenges,
             } => {
-                let step = frame.get_evaluation_step(0);
-
-                let flag = step.get_main_evaluation_element(0, self.flag_idx);
-
-                let lhs_0 = step.get_main_evaluation_element(0, self.lhs_start_idx);
-                let rhs_0 = FieldElement::<Babybear31PrimeField>::from(4);
-                let res_0 = compute_element_from_two_limbs_starting_at(step, self.res_start_idx);
-
-                let one = FieldElement::<Babybear31PrimeField>::one();
-                let inverse = FieldElement::<Babybear31PrimeField>::from(INV_65536);
-                let carry_0 = (lhs_0 + rhs_0 - res_0) * inverse;
-
-                let bit_constraint: FieldElement<Babybear31PrimeField> = match self.carry_idx {
-                    CarryIndex::Zero => flag * carry_0 * (carry_0 - one),
-                    CarryIndex::One => {
-                        // Compute the high word using the first 2 operand limbs.
-                        let lhs_1 = step.get_main_evaluation_element(0, self.lhs_start_idx + 1);
-                        let rhs_1 = FieldElement::<Babybear31PrimeField>::zero();
-                        let res_1 = compute_element_from_two_limbs_starting_at(
-                            step,
-                            self.res_start_idx + 2,
-                        );
-
-                        let carry_1 = (lhs_1 + rhs_1 - res_1 + carry_0) * inverse;
-                        flag * carry_1 * (carry_1 - one)
-                    }
-                };
+                let bit_constraint =
+                    self.compute_add_four_carry_bit_constraint(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx()] = bit_constraint.to_extension();
             }
 
@@ -694,32 +696,8 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
                 periodic_values: _periodic_values,
                 rap_challenges: _rap_challenges,
             } => {
-                let step = frame.get_evaluation_step(0);
-
-                let flag = step.get_main_evaluation_element(0, self.flag_idx);
-
-                let lhs_0 = step.get_main_evaluation_element(0, self.lhs_start_idx);
-                let rhs_0 = FieldElement::<Degree4BabyBearU32ExtensionField>::from(4);
-                let res_0 =
-                    compute_element_from_two_limbs_starting_at_extension(step, self.res_start_idx);
-
-                let one = FieldElement::<Degree4BabyBearU32ExtensionField>::one();
-                let inverse = FieldElement::<Degree4BabyBearU32ExtensionField>::from(INV_65536);
-                let carry_0 = (lhs_0 + rhs_0 - res_0) * inverse;
-
-                let bit_constraint = match self.carry_idx {
-                    CarryIndex::Zero => flag * carry_0 * (carry_0 - one),
-                    CarryIndex::One => {
-                        let lhs_1 = step.get_main_evaluation_element(0, self.lhs_start_idx + 1);
-                        let rhs_1 = FieldElement::<Degree4BabyBearU32ExtensionField>::zero();
-                        let res_1 = compute_element_from_two_limbs_starting_at_extension(
-                            step,
-                            self.res_start_idx + 2,
-                        );
-                        let carry_1 = (lhs_1 + rhs_1 - res_1 + carry_0) * inverse;
-                        flag * carry_1 * (carry_1 - one)
-                    }
-                };
+                let bit_constraint =
+                    self.compute_add_four_carry_bit_constraint(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx()] = bit_constraint
             }
         }
