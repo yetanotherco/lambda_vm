@@ -2,7 +2,7 @@ pub mod fri_commitment;
 pub mod fri_decommit;
 mod fri_functions;
 
-use crypto::fiat_shamir::is_transcript::IsTranscript;
+use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use math::field::traits::{IsFFTField, IsField};
 use math::traits::AsBytes;
 use math::{fft::cpu::bit_reversing::in_place_bit_reverse_permute, field::traits::IsSubFieldOf};
@@ -20,7 +20,7 @@ use self::fri_functions::fold_polynomial;
 pub fn commit_phase<F: IsFFTField + IsSubFieldOf<E>, E: IsField>(
     number_layers: usize,
     p_0: Polynomial<FieldElement<E>>,
-    transcript: &mut impl IsTranscript<E>,
+    transcript: &mut impl IsStarkTranscript<E, F>,
     coset_offset: &FieldElement<F>,
     domain_size: usize,
 ) -> (
