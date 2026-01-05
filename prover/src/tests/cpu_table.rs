@@ -626,6 +626,7 @@ mod tests {
     use crate::tables::cpu::cpu_trace_from_logs;
     use crypto::fiat_shamir::default_transcript::DefaultTranscript;
     use math::field::fields::fft_friendly::quartic_babybear_u32::Degree4BabyBearU32ExtensionField;
+    use stark::traits::AIR;
     use stark::{
         proof::options::ProofOptions,
         prover::{IsStarkProver, Prover},
@@ -637,11 +638,12 @@ mod tests {
         let mut trace = build_cpu_trace(columns);
         let proof_options = ProofOptions::default_test_options();
 
-        let proof = Prover::<CPUTableAIR>::prove(
+        let air = CPUTableAIR::new(trace.num_rows(), &(), &proof_options);
+
+        let proof = Prover::<Babybear31PrimeField, Degree4BabyBearU32ExtensionField, _>::prove(
+            &air,
             &mut trace,
-            &(),
-            &proof_options,
-            DefaultTranscript::<Degree4BabyBearU32ExtensionField>::new(&[]),
+            &mut DefaultTranscript::<Degree4BabyBearU32ExtensionField>::new(&[]),
         )
         .unwrap();
 
@@ -660,11 +662,12 @@ mod tests {
 
         let proof_options = ProofOptions::default_test_options();
 
-        let proof = Prover::<CPUTableAIR>::prove(
+        let air = CPUTableAIR::new(trace.num_rows(), &(), &proof_options);
+
+        let proof = Prover::<Babybear31PrimeField, Degree4BabyBearU32ExtensionField, _>::prove(
+            &air,
             &mut trace,
-            &(),
-            &proof_options,
-            DefaultTranscript::<Degree4BabyBearU32ExtensionField>::new(&[]),
+            &mut DefaultTranscript::<Degree4BabyBearU32ExtensionField>::new(&[]),
         )
         .unwrap();
 

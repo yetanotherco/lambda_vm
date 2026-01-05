@@ -7,7 +7,7 @@ use super::{
     traits::{AIR, TransitionEvaluationContext},
 };
 use crate::{config::Commitment, proof::stark::DeepPolynomialOpening};
-use crypto::{fiat_shamir::is_transcript::IsTranscript, merkle_tree::proof::Proof};
+use crypto::{fiat_shamir::is_transcript::IsStarkTranscript, merkle_tree::proof::Proof};
 #[cfg(not(feature = "test_fiat_shamir"))]
 use log::error;
 use math::{
@@ -63,7 +63,7 @@ pub trait IsStarkVerifier<A: AIR> {
     fn sample_query_indexes(
         number_of_queries: usize,
         domain: &Domain<A::Field>,
-        transcript: &mut impl IsTranscript<A::FieldExtension>,
+        transcript: &mut impl IsStarkTranscript<A::FieldExtension, A::Field>,
     ) -> Vec<usize> {
         let domain_size = domain.lde_roots_of_unity_coset.len() as u64;
         (0..number_of_queries)
@@ -76,7 +76,7 @@ pub trait IsStarkVerifier<A: AIR> {
         air: &A,
         proof: &StarkProof<A::Field, A::FieldExtension>,
         domain: &Domain<A::Field>,
-        transcript: &mut impl IsTranscript<A::FieldExtension>,
+        transcript: &mut impl IsStarkTranscript<A::FieldExtension, A::Field>,
     ) -> Challenges<A>
     where
         FieldElement<A::Field>: AsBytes,
@@ -143,7 +143,7 @@ pub trait IsStarkVerifier<A: AIR> {
 
         let num_terms_composition_poly = proof.composition_poly_parts_ood_evaluation.len();
         let num_terms_trace =
-            air.context().transition_offsets.len() * A::STEP_SIZE * air.context().trace_columns;
+            air.context().transition_offsets.len() * air.step_size() * air.context().trace_columns;
         let gamma = transcript.sample_field_element();
 
         // <<<< Receive challenges: 𝛾, 𝛾'
@@ -155,7 +155,7 @@ pub trait IsStarkVerifier<A: AIR> {
         let trace_term_coeffs: Vec<_> = deep_composition_coefficients
             .drain(..num_terms_trace)
             .collect::<Vec<_>>()
-            .chunks(air.context().transition_offsets.len() * A::STEP_SIZE)
+            .chunks(air.context().transition_offsets.len() * air.step_size())
             .map(|chunk| chunk.to_vec())
             .collect();
 
@@ -273,7 +273,7 @@ pub trait IsStarkVerifier<A: AIR> {
             proof.trace_ood_evaluations.width - air.num_auxiliary_rap_columns();
 
         let ood_frame =
-            (proof.trace_ood_evaluations).into_frame(num_main_trace_columns, A::STEP_SIZE);
+            (proof.trace_ood_evaluations).into_frame(num_main_trace_columns, air.step_size());
         let transition_evaluation_context = TransitionEvaluationContext::new_verifier(
             &ood_frame,
             &periodic_values,
@@ -718,7 +718,7 @@ pub trait IsStarkVerifier<A: AIR> {
         proof: &StarkProof<A::Field, A::FieldExtension>,
         pub_input: &A::PublicInputs,
         proof_options: &ProofOptions,
-        mut transcript: impl IsTranscript<A::FieldExtension>,
+        mut transcript: impl IsStarkTranscript<A::FieldExtension, A::Field>,
     ) -> bool
     where
         FieldElement<A::Field>: AsBytes + Sync + Send,
