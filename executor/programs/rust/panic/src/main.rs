@@ -37,6 +37,17 @@ pub extern "C" fn sys_write(fildes: i32, buf: *const u8, size: usize) -> isize {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sys_panic(msg_ptr: *const u8, len: usize) {
     print_string("Sys panic called\n");
+    unsafe {
+        asm!(
+            "mv a0, {ptr}",
+            "mv a1, {len}",
+            "mv a7, {syscall_number}", // syscall number for panic
+            "ecall",
+            ptr = in(reg) msg_ptr,
+            len = in(reg) len,
+            syscall_number = in(reg) 2,
+        )
+    }
 }
 
 fn load_64(ptr: *const u8) -> u64 {
@@ -187,6 +198,6 @@ pub fn main() -> i32 {
         let heap_ptr = addr_of_mut!(HEAP_MEM) as *mut u8;
         unsafe { HEAP.init(heap_ptr as usize, HEAP_SIZE) }
     }
-    stdout().write(b"Hello from sys_write!\n").unwrap();
+    panic!("This is a panic test");
     return 1;
 }

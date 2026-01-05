@@ -1,6 +1,6 @@
 use executor::{elf::Elf, vm::execution::run_program};
 
-fn run_program_and_check_output(elf_path: &str, expected_output: i32) {
+fn run_program_without_expect(elf_path: &str) -> Result<((i32, i32), Vec<executor::vm::logs::Log>), executor::vm::execution::ExecutorError> {
     println!("Testing {}", elf_path);
     let elf_data = std::fs::read(elf_path).unwrap();
     let program = Elf::load(&elf_data).unwrap();
@@ -9,8 +9,12 @@ fn run_program_and_check_output(elf_path: &str, expected_output: i32) {
         println!("0x{:08x}: 0x{:08x}", addr, word);
     });
 
+    run_program(program.image, program.entry_point, true)
+}
+
+fn run_program_and_check_output(elf_path: &str, expected_output: i32) {
     let (results, _logs) =
-        run_program(program.image, program.entry_point, true).expect("Failed to run program");
+        run_program_without_expect(elf_path).expect("Failed to run program");
 
     assert!(results.0 == expected_output);
 }
@@ -98,4 +102,15 @@ fn test_print() {
 #[test]
 fn test_stdout() {
     run_program_and_check_output("./program_artifacts/rust/stdout.elf", 1);
+}
+
+#[test]
+fn test_panic() {
+    let result = run_program_without_expect("./program_artifacts/rust/panic.elf");
+    assert!(result.is_err());
+    if let Err(executor::vm::execution::ExecutorError::ExecutionError(executor::vm::instruction::execution::ExecutionError::Panic(msg))) = result {
+        assert_eq!(msg, "This is a panic test");
+    } else {
+        panic!("Expected panic error");
+    }
 }

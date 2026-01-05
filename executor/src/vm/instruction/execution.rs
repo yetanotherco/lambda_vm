@@ -209,16 +209,36 @@ impl Instruction {
                 }
             }
             Instruction::EcallEbreak => {
-                // For now this is just a mechanism to print
-                // It is not the correct implementation of ecall/ebreak
-                let pointer = registers.read(10)?;
-                let len = registers.read(11)?;
-                let mut bytes = vec![];
-                for i in 0..len {
-                    bytes.push(memory.load_byte(pointer + i));
+                let syscall_number = registers.read(17)?; // a7
+                match syscall_number {
+                    1 => {
+                        // print
+                        // For now this is just a mechanism to print
+                        // It is not the correct implementation of ecall/ebreak
+                        let pointer = registers.read(10)?;
+                        let len = registers.read(11)?;
+                        let mut bytes = vec![];
+                        for i in 0..len {
+                            bytes.push(memory.load_byte(pointer + i));
+                        }
+                        let value = str::from_utf8(&bytes).map_err(|_| ExecutionError::IncorrectMessage)?;
+                        println!("PRINT VM: {}", value);
+                    }
+                    2 => {
+                        // panic
+                        let pointer = registers.read(10)?;
+                        let len = registers.read(11)?;
+                        let mut bytes = vec![];
+                        for i in 0..len {
+                            bytes.push(memory.load_byte(pointer + i));
+                        }
+                        let value = str::from_utf8(&bytes).map_err(|_| ExecutionError::IncorrectMessage)?;
+                        return Err(ExecutionError::Panic(value.to_owned()));
+                    }
+                    _ => {
+                        return Err(ExecutionError::UnknownSyscall(syscall_number));
+                    }
                 }
-                let value = str::from_utf8(&bytes).unwrap();
-                println!("PRINT VM: {}", value);
                 Log {
                     instruction: self,
                     current_pc: pc,
@@ -310,4 +330,10 @@ pub enum ExecutionError {
     MemoryError(#[from] crate::vm::memory::MemoryError),
     #[error("Register error: {0}")]
     RegisterError(#[from] crate::vm::registers::RegisterError),
+    #[error("Unknown syscall number: {0}")]
+    UnknownSyscall(u32),
+    #[error("Panic called with message: {0}")]
+    Panic(String),
+    #[error("Incorrect message encoding")]
+    IncorrectMessage,
 }
