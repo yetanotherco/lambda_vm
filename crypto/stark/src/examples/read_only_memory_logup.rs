@@ -14,7 +14,7 @@ use crate::{
     trace::TraceTable,
     traits::{AIR, TransitionEvaluationContext},
 };
-use crypto::fiat_shamir::is_transcript::IsTranscript;
+use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use itertools::Itertools;
 use math::{
     field::{
@@ -379,7 +379,9 @@ where
     type FieldExtension = E;
     type PublicInputs = LogReadOnlyPublicInputs<F>;
 
-    const STEP_SIZE: usize = 1;
+    fn step_size(&self) -> usize {
+        1
+    }
 
     fn new(
         trace_length: usize,
@@ -413,9 +415,7 @@ where
         &self,
         trace: &mut TraceTable<Self::Field, Self::FieldExtension>,
         challenges: &[FieldElement<E>],
-    ) where
-        Self::FieldExtension: IsFFTField,
-    {
+    ) {
         // Main table
         let main_segment_cols = trace.columns_main();
         let a = &main_segment_cols[0];
@@ -453,7 +453,7 @@ where
 
     fn build_rap_challenges(
         &self,
-        transcript: &mut impl IsTranscript<Self::FieldExtension>,
+        transcript: &mut dyn IsStarkTranscript<Self::FieldExtension, Self::Field>,
     ) -> Vec<FieldElement<Self::FieldExtension>> {
         vec![
             transcript.sample_field_element(),

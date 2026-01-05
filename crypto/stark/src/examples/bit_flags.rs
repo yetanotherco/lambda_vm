@@ -9,7 +9,6 @@ use crate::{
 use math::field::{
     element::FieldElement, fields::fft_friendly::stark_252_prime_field::Stark252PrimeField,
 };
-use std::iter;
 
 type StarkField = Stark252PrimeField;
 
@@ -136,7 +135,9 @@ impl AIR for BitFlagsAIR {
     type FieldExtension = StarkField;
     type PublicInputs = ();
 
-    const STEP_SIZE: usize = 16;
+    fn step_size(&self) -> usize {
+        16
+    }
 
     fn new(
         trace_length: usize,
@@ -207,10 +208,12 @@ pub fn bit_prefix_flag_trace(num_steps: usize) -> TraceTable<StarkField, StarkFi
     .map(|t| Felt252::from(*t))
     .collect();
 
-    let mut data: Vec<Felt252> = iter::repeat_n(step, num_steps).flatten().collect();
+    let mut data: Vec<Felt252> = std::iter::repeat_n(step, num_steps).flatten().collect();
     data[0] = Felt252::from(1030);
 
     let mut dummy_column = (0..16).map(Felt252::from).collect();
-    dummy_column = iter::repeat_n(dummy_column, num_steps).flatten().collect();
+    dummy_column = std::iter::repeat_n(dummy_column, num_steps)
+        .flatten()
+        .collect();
     TraceTable::from_columns_main(vec![data, dummy_column], 16)
 }
