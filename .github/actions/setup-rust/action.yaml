@@ -13,12 +13,6 @@ runs:
       with:
         path: /home/runner/lambda_rust
         key: rust-src-${{ runner.os }}-149354
-    
-    - name: Print home directory contents and path
-      shell: bash
-      run: |
-        echo $HOME
-        ls -la $HOME
 
     - name: Install Rust
       if: steps.rust-cache.outputs.cache-hit != 'true'
