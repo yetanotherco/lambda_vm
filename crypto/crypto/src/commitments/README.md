@@ -78,15 +78,15 @@ KZG commitments can be used to commit to polynomials and later prove evaluations
 First, you need to load or create a Structured Reference String (SRS) and initialize the KZG instance:
 
 ```rust
-use lambdaworks_crypto::commitments::kzg::{KateZaveruchaGoldberg, StructuredReferenceString};
-use lambdaworks_crypto::commitments::traits::IsCommitmentScheme;
-use lambdaworks_math::elliptic_curve::short_weierstrass::curves::bls12_381::{
+use crypto::commitments::kzg::{KateZaveruchaGoldberg, StructuredReferenceString};
+use crypto::commitments::traits::IsCommitmentScheme;
+use math::elliptic_curve::short_weierstrass::curves::bls12_381::{
     curve::BLS12381Curve,
     default_types::{FrElement, FrField},
     pairing::BLS12381AtePairing,
     twist::BLS12381TwistCurve,
 };
-use lambdaworks_math::elliptic_curve::short_weierstrass::point::ShortWeierstrassProjectivePoint;
+use math::elliptic_curve::short_weierstrass::point::ShortWeierstrassProjectivePoint;
 
 // Load SRS from a file
 let srs_file = "path/to/srs.bin";
@@ -101,8 +101,8 @@ let kzg = KateZaveruchaGoldberg::<FrField, BLS12381AtePairing>::new(srs);
 To commit to a polynomial, you first create the polynomial and then use the `commit` method:
 
 ```rust
-use lambdaworks_math::field::element::FieldElement;
-use lambdaworks_math::polynomial::Polynomial;
+use math::field::element::FieldElement;
+use math::polynomial::Polynomial;
 
 // Create a polynomial p(x) = x + 1
 let p = Polynomial::<FrElement>::new(&[FieldElement::one(), FieldElement::one()]);
