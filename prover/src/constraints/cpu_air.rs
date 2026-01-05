@@ -77,8 +77,6 @@ impl AIR for CPUTableAIR {
     type FieldExtension = Degree4BabyBearU32ExtensionField;
     type PublicInputs = ();
 
-    const STEP_SIZE: usize = 1;
-
     fn new(
         trace_length: usize,
         _pub_inputs: &Self::PublicInputs,
@@ -213,6 +211,10 @@ impl AIR for CPUTableAIR {
 
     fn pub_inputs(&self) -> &Self::PublicInputs {
         &()
+    }
+
+    fn step_size(&self) -> usize {
+        1
     }
 }
 

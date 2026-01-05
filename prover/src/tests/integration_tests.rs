@@ -1,10 +1,13 @@
 use crate::{constraints::cpu_air::CPUTableAIR, tables::trace::Trace};
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use executor::{elf::Elf, vm::execution::run_program};
-use math::field::fields::fft_friendly::quartic_babybear_u32::Degree4BabyBearU32ExtensionField;
+use math::field::fields::fft_friendly::{
+    babybear_u32::Babybear31PrimeField, quartic_babybear_u32::Degree4BabyBearU32ExtensionField,
+};
 use stark::{
     proof::options::ProofOptions,
     prover::{IsStarkProver, Prover},
+    traits::AIR,
     verifier::{IsStarkVerifier, Verifier},
 };
 
@@ -27,11 +30,10 @@ pub fn run_program_and_prover(elf_path: &str) {
     )
     .unwrap();
 
-    assert!(Verifier::<CPUTableAIR>::verify(
+    assert!(Verifier::verify(
         &proof,
-        &(),
-        &proof_options,
-        DefaultTranscript::<Degree4BabyBearU32ExtensionField>::new(&[]),
+        &air,
+        &mut DefaultTranscript::<Degree4BabyBearU32ExtensionField>::new(&[]),
     ));
 }
 
