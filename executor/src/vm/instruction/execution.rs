@@ -6,6 +6,8 @@ use crate::vm::{
 };
 
 const REGULAR_PC_UPDATE: u32 = 4;
+const PRINT_SYSCALL: u32 = 1;
+const PANIC_SYSCALL: u32 = 2;
 
 impl Instruction {
     /// Runs the given instruction and returns its execution log
@@ -15,8 +17,6 @@ impl Instruction {
         registers: &mut Registers,
         memory: &mut Memory,
     ) -> Result<Log, ExecutionError> {
-        println!("registers: {}", &registers);
-        println!("Executing instruction at 0x{:08x}: {:?}", *pc, self);
         let log = self.execute(*pc, registers, memory)?;
         *pc = log.next_pc;
         Ok(log)
@@ -210,6 +210,48 @@ impl Instruction {
                     dst_val: 0,
                 }
             }
+            Instruction::EcallEbreak => {
+                let syscall_number = registers.read(17)?; // a7
+                match syscall_number {
+                    PRINT_SYSCALL => {
+                        // print
+                        // For now this is just a mechanism to print
+                        // It is not the correct implementation of ecall/ebreak
+                        let pointer = registers.read(10)?;
+                        let len = registers.read(11)?;
+                        let mut bytes = vec![];
+                        for i in 0..len {
+                            bytes.push(memory.load_byte(pointer + i));
+                        }
+                        let value =
+                            str::from_utf8(&bytes).map_err(|_| ExecutionError::IncorrectMessage)?;
+                        println!("PRINT VM: {}", value);
+                    }
+                    PANIC_SYSCALL => {
+                        // panic
+                        let pointer = registers.read(10)?;
+                        let len = registers.read(11)?;
+                        let mut bytes = vec![];
+                        for i in 0..len {
+                            bytes.push(memory.load_byte(pointer + i));
+                        }
+                        let value =
+                            str::from_utf8(&bytes).map_err(|_| ExecutionError::IncorrectMessage)?;
+                        return Err(ExecutionError::Panic(value.to_owned()));
+                    }
+                    _ => {
+                        return Err(ExecutionError::UnknownSyscall(syscall_number));
+                    }
+                }
+                Log {
+                    instruction: self,
+                    current_pc: pc,
+                    next_pc: pc + REGULAR_PC_UPDATE,
+                    src1_val: 0,
+                    src2_val: 0,
+                    dst_val: 0,
+                }
+            }
         })
     }
 }
@@ -292,4 +334,10 @@ pub enum ExecutionError {
     MemoryError(#[from] crate::vm::memory::MemoryError),
     #[error("Register error: {0}")]
     RegisterError(#[from] crate::vm::registers::RegisterError),
+    #[error("Unknown syscall number: {0}")]
+    UnknownSyscall(u32),
+    #[error("Panic called with message: {0}")]
+    Panic(String),
+    #[error("Incorrect message encoding")]
+    IncorrectMessage,
 }
