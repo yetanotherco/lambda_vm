@@ -162,9 +162,7 @@ impl IsSubFieldOf<Degree2GoldilocksExtensionField> for U64GoldilocksPrimeField {
         b: &<Degree2GoldilocksExtensionField as IsField>::BaseType,
     ) -> Result<<Degree2GoldilocksExtensionField as IsField>::BaseType, FieldError> {
         let b_inv = Degree2GoldilocksExtensionField::inv(b)?;
-        Ok(<Self as IsSubFieldOf<Degree2GoldilocksExtensionField>>::mul(
-            a, &b_inv,
-        ))
+        Ok(<Self as IsSubFieldOf<Degree2GoldilocksExtensionField>>::mul(a, &b_inv))
     }
 
     fn sub(
@@ -391,9 +389,7 @@ impl IsSubFieldOf<Degree3GoldilocksExtensionField> for U64GoldilocksPrimeField {
         b: &<Degree3GoldilocksExtensionField as IsField>::BaseType,
     ) -> Result<<Degree3GoldilocksExtensionField as IsField>::BaseType, FieldError> {
         let b_inv = Degree3GoldilocksExtensionField::inv(b)?;
-        Ok(<Self as IsSubFieldOf<Degree3GoldilocksExtensionField>>::mul(
-            a, &b_inv,
-        ))
+        Ok(<Self as IsSubFieldOf<Degree3GoldilocksExtensionField>>::mul(a, &b_inv))
     }
 
     fn sub(
@@ -420,7 +416,6 @@ impl IsSubFieldOf<Degree3GoldilocksExtensionField> for U64GoldilocksPrimeField {
 
 /// Field element type for the cubic extension of Goldilocks
 pub type Fp3E = FieldElement<Degree3GoldilocksExtensionField>;
-
 
 #[cfg(test)]
 mod tests {
@@ -733,5 +728,4 @@ mod tests {
         let result = (a / b).unwrap();
         assert_eq!(result * b, a);
     }
-
 }
