@@ -15,7 +15,7 @@ use crate::{
 };
 
 // List of airs and their associated table
-type Airs<'a, F, E, PI> = Vec<(
+pub type Airs<'a, F, E, PI> = Vec<(
     &'a dyn AIR<Field = F, FieldExtension = E, PublicInputs = PI>,
     &'a mut TraceTable<F, E>,
 )>;

@@ -14,7 +14,7 @@ use crate::{
 };
 
 // List of airs and their associated proof
-type AirsAndProofs<'a, F, E, PI> = Vec<(
+pub type AirsAndProofs<'a, F, E, PI> = Vec<(
     &'a dyn AIR<Field = F, FieldExtension = E, PublicInputs = PI>,
     &'a StarkProof<F, E>,
 )>;

@@ -1,14 +1,17 @@
-use crate::{constraints::cpu_air::CPUTableAIR, tables::trace::Trace};
+use crate::{
+    constraints::{cpu_air::CPUTableAIR, decode_air::DecodeTableAIR},
+    tables::trace::Trace,
+};
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use executor::{elf::Elf, vm::execution::run_program};
 use math::field::fields::fft_friendly::{
     babybear_u32::Babybear31PrimeField, quartic_babybear_u32::Degree4BabyBearU32ExtensionField,
 };
 use stark::{
+    multi_table_prover::{Airs, multi_prove},
+    multi_table_verifier::{AirsAndProofs, multi_verify},
     proof::options::ProofOptions,
-    prover::{IsStarkProver, Prover},
     traits::AIR,
-    verifier::{IsStarkVerifier, Verifier},
 };
 
 pub fn run_program_and_prover(elf_path: &str) {
@@ -22,15 +25,28 @@ pub fn run_program_and_prover(elf_path: &str) {
 
     let proof_options = ProofOptions::default_test_options();
 
-    let proof = Prover::<CPUTableAIR>::prove(
-        &mut trace.cpu_trace_table,
-        &(),
-        &proof_options,
-        DefaultTranscript::<Degree4BabyBearU32ExtensionField>::new(&[]),
+    let cpu_air = CPUTableAIR::new(trace.cpu_trace_table.num_rows(), &(), &proof_options);
+    let decode_air = DecodeTableAIR::new(trace.decode_trace_table.num_rows(), &(), &proof_options);
+
+    let airs: Airs<_, _, _> = vec![
+        (&cpu_air, &mut trace.cpu_trace_table),
+        (&decode_air, &mut trace.decode_trace_table),
+    ];
+
+    let proof = multi_prove(
+        airs,
+        &mut DefaultTranscript::<Degree4BabyBearU32ExtensionField>::new(&[]),
     )
     .unwrap();
 
-    assert!(Verifier::verify(
+    let air_and_proof: AirsAndProofs = vec![()];
+
+    // pub type AirsAndProofs<'a, F, E, PI> = Vec<(
+    //     &'a dyn AIR<Field = F, FieldExtension = E, PublicInputs = PI>,
+    //     &'a StarkProof<F, E>,
+    // )>;
+
+    assert!(multi_verify(
         &proof,
         &air,
         &mut DefaultTranscript::<Degree4BabyBearU32ExtensionField>::new(&[]),
