@@ -11,7 +11,7 @@ pub fn print_string(s: &str) {
             "ecall",
             ptr = in(reg) s.as_ptr(),
             len = in(reg) s.len(),
-            syscall_number = in(reg) 1,
+            syscall_number = in(reg) 1usize,
         );
     }
 }
@@ -43,7 +43,7 @@ pub unsafe extern "C" fn sys_panic(msg_ptr: *const u8, len: usize) {
             "ecall",
             ptr = in(reg) msg_ptr,
             len = in(reg) len,
-            syscall_number = in(reg) 2,
+            syscall_number = in(reg) 2usize,
         )
     }
 }
