@@ -53,3 +53,7 @@ cuda = ["dep:cudarc", "dep:lambdaworks-gpu"]
 
 [target.wasm32-unknown-unknown.dependencies]
 getrandom = { version = "0.2.15", features = ["js"] }
+
+[[bench]]
+name = "fft_bench"
+harness = false
