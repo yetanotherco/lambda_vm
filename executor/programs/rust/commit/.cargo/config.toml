@@ -1,0 +1,5 @@
+[target.rv32]
+rustflags = [
+  "-C", "link-arg=-e",
+  "-C", "link-arg=main"
+]

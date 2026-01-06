@@ -11,6 +11,7 @@ enum SyscallNumbers {
     Print = 1,
     Panic = 2,
     Commit = 3,
+    GetPrivateInputs = 4,
 }
 
 impl TryFrom<u32> for SyscallNumbers {
@@ -20,6 +21,7 @@ impl TryFrom<u32> for SyscallNumbers {
             1 => Ok(SyscallNumbers::Print),
             2 => Ok(SyscallNumbers::Panic),
             3 => Ok(SyscallNumbers::Commit),
+            4 => Ok(SyscallNumbers::GetPrivateInputs),
             _ => Err(()),
         }
     }
@@ -262,6 +264,14 @@ impl Instruction {
                         let pointer = registers.read(10)?;
                         let len = registers.read(11)?;
                         memory.commit_public_output(pointer, len)?;
+                    }
+                    SyscallNumbers::GetPrivateInputs => {
+                        // get private inputs
+                        let pointer = registers.read(10)?;
+                        let private_inputs = memory.load_private_inputs()?;
+                        for (i, byte) in private_inputs.iter().enumerate() {
+                            memory.store_byte(pointer + i as u32, *byte);
+                        }
                     }
                 }
                 Log {

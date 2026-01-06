@@ -3,6 +3,8 @@ use std::collections::BTreeMap;
 // TODO: Correctly define this
 const MAX_PUBLIC_OUTPUT_COMMIT_SIZE: u32 = 1024;
 const PUBLIC_OUTPUT_START_INDEX: u32 = 0;
+const MAX_PRIVATE_INPUT_SIZE: u32 = 1024;
+const PRIVATE_INPUT_START_INDEX: u32 = PUBLIC_OUTPUT_START_INDEX + MAX_PUBLIC_OUTPUT_COMMIT_SIZE;
 
 #[derive(Default, Debug)]
 pub struct Memory(BTreeMap<u32, [u8; 4]>);
@@ -86,6 +88,27 @@ impl Memory {
         }
         Ok(return_values)
     }
+
+    pub fn store_private_inputs(&mut self, inputs: Vec<u8>) -> Result<(), MemoryError> {
+        if inputs.len() as u32 > MAX_PRIVATE_INPUT_SIZE {
+            return Err(MemoryError::PrivateInputSizeExceeded);
+        }
+        self.store_word(PRIVATE_INPUT_START_INDEX, inputs.len() as u32)?;
+        for (i, byte) in inputs.iter().enumerate() {
+            self.store_byte(PRIVATE_INPUT_START_INDEX + 4 + i as u32, *byte);
+        }
+        Ok(())
+    }
+
+    pub fn load_private_inputs(&self) -> Result<Vec<u8>, MemoryError> {
+        let size = self.load_word(PRIVATE_INPUT_START_INDEX)?;
+        let mut inputs = size.to_le_bytes().to_vec();
+        for i in 0..size {
+            let byte = self.load_byte(PRIVATE_INPUT_START_INDEX + 4 + i);
+            inputs.push(byte);
+        }
+        Ok(inputs)
+    }
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -96,4 +119,6 @@ pub enum MemoryError {
     UnalignedAccess,
     #[error("Public output commit size exceeded")]
     CommitSizeExceeded,
+    #[error("Private input size exceeded")]
+    PrivateInputSizeExceeded,
 }

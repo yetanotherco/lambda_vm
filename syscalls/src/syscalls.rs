@@ -1,10 +1,14 @@
 use core::arch::asm;
 use core::ptr;
 
+// TODO: This should be properly defined
+const MAX_PRIVATE_INPUT_SIZE: usize = 1024;
+
 enum SyscallNumbers {
     Print = 1,
     Panic = 2,
     Commit = 3,
+    GetPrivateInputs = 4,
 }
 
 /// This is a template for printing in the vm
@@ -215,4 +219,33 @@ pub fn commit(slice: &[u8]) {
             syscall_number = in(reg) SyscallNumbers::Commit as usize,
         )
     }
+}
+
+pub fn get_private_input() -> Result<Vec<u8>, SyscallError> {
+    print_string("get_private_input called\n");
+    let mut dest = vec![0u8; MAX_PRIVATE_INPUT_SIZE];
+    unsafe {
+        asm!(
+            "mv a0, {ptr}",
+            "mv a7, {syscall_number}", // syscall number for get_private_input
+            "ecall",
+            ptr = in(reg) dest.as_mut_ptr(),
+            syscall_number = in(reg) SyscallNumbers::GetPrivateInputs as usize,
+        )
+    }
+    let len = u32::from_le_bytes(
+        dest[0..4]
+            .try_into()
+            .map_err(|_| SyscallError::WrongPrivateInputSize)?,
+    ) as usize;
+    dest.drain(0..4);
+    dest.truncate(len);
+
+    Ok(dest)
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum SyscallError {
+    #[error("Wrong private input size")]
+    WrongPrivateInputSize,
 }

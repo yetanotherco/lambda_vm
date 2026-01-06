@@ -19,8 +19,10 @@ pub fn run_program(
     instruction_map: BTreeMap<u32, u32>,
     entrypoint: u32,
     verbose: bool,
+    private_inputs: Vec<u8>,
 ) -> Result<(ReturnValues, Vec<Log>), ExecutorError> {
     let mut memory = Memory::default();
+    memory.store_private_inputs(private_inputs)?;
     load_program(instruction_map, &mut memory)?;
     run_from_entrypoint(&mut memory, entrypoint, verbose)
 }
