@@ -10,6 +10,8 @@ pub mod stark_101_prime_field;
 pub mod stark_252_prime_field;
 /// Implemenation of the Goldilocks Prime Field p = 2^64 - 2^32 + 1
 pub mod u64_goldilocks;
+/// Implementation of the quadratic and cubic extensions of the Goldilocks field
+pub mod extensions_goldilocks;
 /// Implemenation of the Mersenne Prime field p = 2^31 - 1
 pub mod u64_mersenne_montgomery_field;
 
