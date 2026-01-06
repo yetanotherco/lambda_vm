@@ -160,7 +160,7 @@
     groups = (groups,)
   }
   assert(groups.all(group => group in all_groups), message: "unknown group")
-  let selected_constraints = groups.map(g => (g: chip.constraints.at(g))).join()
+  let selected_constraints = groups.map(g => ((g): chip.constraints.at(g))).join()
 
   // Find the group definition in the constraint_groups
   let lookup_group(name) = chip.constraint_groups.filter((g) => g.name == name).at(0, default: (name: name))
