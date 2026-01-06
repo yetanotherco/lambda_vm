@@ -1,6 +1,12 @@
 use core::arch::asm;
 use core::ptr;
 
+enum SyscallNumbers {
+    Print = 1,
+    Panic = 2,
+    Commit = 3,
+}
+
 /// This is a template for printing in the vm
 pub fn print_string(s: &str) {
     unsafe {
@@ -11,13 +17,13 @@ pub fn print_string(s: &str) {
             "ecall",
             ptr = in(reg) s.as_ptr(),
             len = in(reg) s.len(),
-            syscall_number = in(reg) 1usize,
+            syscall_number = in(reg) SyscallNumbers::Print as usize,
         );
     }
 }
 
 /// # Safety
-/// 
+///
 /// This function should not be called by the user
 /// It is only for rust std internal uses
 #[unsafe(no_mangle)]
@@ -29,7 +35,7 @@ pub unsafe extern "C" fn sys_write(_fildes: i32, buf: *const u8, size: usize) ->
 }
 
 /// # Safety
-/// 
+///
 /// This function should not be called by the user
 /// It is only for rust std internal uses
 #[unsafe(no_mangle)]
@@ -43,7 +49,7 @@ pub unsafe extern "C" fn sys_panic(msg_ptr: *const u8, len: usize) {
             "ecall",
             ptr = in(reg) msg_ptr,
             len = in(reg) len,
-            syscall_number = in(reg) 2usize,
+            syscall_number = in(reg) SyscallNumbers::Panic as usize,
         )
     }
 }
@@ -59,7 +65,7 @@ fn load_64(ptr: *const u8) -> u64 {
 }
 
 /// # Safety
-/// 
+///
 /// This function should not be called by the user
 /// It is only for rust std internal uses
 #[unsafe(no_mangle)]
@@ -74,7 +80,7 @@ pub extern "C" fn __atomic_load_8(ptr: *const u64, _order: i32) -> u64 {
 }
 
 /// # Safety
-/// 
+///
 /// This function should not be called by the user
 /// It is only for rust std internal uses
 #[unsafe(no_mangle)]
@@ -88,7 +94,7 @@ pub unsafe extern "C" fn __atomic_fetch_add_4(ptr: *mut u32, val: u32, _order: i
 }
 
 /// # Safety
-/// 
+///
 /// This function should not be called by the user
 /// It is only for rust std internal uses
 #[unsafe(no_mangle)]
@@ -98,7 +104,7 @@ pub extern "C" fn __atomic_fetch_and_1(_ptr: *mut u8, _val: u8, _order: i32) -> 
 }
 
 /// # Safety
-/// 
+///
 /// This function should not be called by the user
 /// It is only for rust std internal uses
 #[unsafe(no_mangle)]
@@ -108,7 +114,7 @@ pub extern "C" fn __atomic_fetch_sub_4(_ptr: *mut u32, _val: u32, _order: i32) -
 }
 
 /// # Safety
-/// 
+///
 /// This function should not be called by the user
 /// It is only for rust std internal uses
 #[unsafe(no_mangle)]
@@ -118,7 +124,7 @@ pub unsafe extern "C" fn __atomic_load_4(ptr: *const u32, _order: i32) -> u32 {
 }
 
 /// # Safety
-/// 
+///
 /// This function should not be called by the user
 /// It is only for rust std internal uses
 #[unsafe(no_mangle)]
@@ -128,7 +134,7 @@ pub unsafe extern "C" fn __atomic_load_1(ptr: *const u8, _order: i32) -> u8 {
 }
 
 /// # Safety
-/// 
+///
 /// This function should not be called by the user
 /// It is only for rust std internal uses
 #[unsafe(no_mangle)]
@@ -137,7 +143,7 @@ pub extern "C" fn __atomic_store_1(_ptr: *mut u8, _val: u8, _order: i32) {
 }
 
 /// # Safety
-/// 
+///
 /// This function should not be called by the user
 /// It is only for rust std internal uses
 #[unsafe(no_mangle)]
@@ -151,7 +157,7 @@ pub unsafe extern "C" fn __atomic_fetch_or_1(ptr: *mut u8, val: u8, _order: i32)
 }
 
 /// # Safety
-/// 
+///
 /// This function should not be called by the user
 /// It is only for rust std internal uses
 #[unsafe(no_mangle)]
@@ -178,7 +184,7 @@ pub unsafe extern "C" fn __atomic_compare_exchange_8(
 }
 
 /// # Safety
-/// 
+///
 /// This function should not be called by the user
 /// It is only for rust std internal uses
 #[unsafe(no_mangle)]
@@ -188,10 +194,25 @@ pub extern "C" fn sys_rand(_buf: *mut u8, _len: usize) -> isize {
 }
 
 /// # Safety
-/// 
+///
 /// This function should not be called by the user
 /// It is only for rust std internal uses
 #[unsafe(no_mangle)]
 pub extern "C" fn __atomic_store_8(_ptr: *mut u8, _val: u8, _order: i32) {
     print_string("__atomic_store_8 called\n");
+}
+
+pub fn commit(slice: &[u8]) {
+    print_string("commit called\n");
+    unsafe {
+        asm!(
+            "mv a0, {ptr}",
+            "mv a1, {len}",
+            "mv a7, {syscall_number}", // syscall number for commit
+            "ecall",
+            ptr = in(reg) slice.as_ptr(),
+            len = in(reg) slice.len(),
+            syscall_number = in(reg) SyscallNumbers::Commit as usize,
+        )
+    }
 }

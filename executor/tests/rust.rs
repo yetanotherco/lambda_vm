@@ -1,8 +1,11 @@
-use executor::{elf::Elf, vm::execution::run_program};
+use executor::{
+    elf::Elf,
+    vm::execution::{ReturnValues, run_program},
+};
 
 fn run_program_without_expect(
     elf_path: &str,
-) -> Result<((i32, i32), Vec<executor::vm::logs::Log>), executor::vm::execution::ExecutorError> {
+) -> Result<(ReturnValues, Vec<executor::vm::logs::Log>), executor::vm::execution::ExecutorError> {
     println!("Testing {}", elf_path);
     let elf_data = std::fs::read(elf_path).unwrap();
     let program = Elf::load(&elf_data).unwrap();
@@ -14,10 +17,16 @@ fn run_program_without_expect(
     run_program(program.image, program.entry_point, true)
 }
 
+fn run_program_and_check_public_output(elf_path: &str, expected_output: Vec<u8>) {
+    let (results, _logs) = run_program_without_expect(elf_path).expect("Failed to run program");
+
+    assert!(results.memory_values == expected_output);
+}
+
 fn run_program_and_check_output(elf_path: &str, expected_output: i32) {
     let (results, _logs) = run_program_without_expect(elf_path).expect("Failed to run program");
 
-    assert!(results.0 == expected_output);
+    assert!(results.register_values.0 == expected_output);
 }
 
 #[test]
@@ -72,7 +81,10 @@ fn test_rlp() {
 
 #[test]
 fn test_allocator() {
-    run_program_and_check_output("./program_artifacts/rust/allocator.elf", 11);
+    run_program_and_check_public_output(
+        "./program_artifacts/rust/allocator.elf",
+        b"Hello World".to_vec(),
+    );
 }
 
 #[test]
@@ -82,7 +94,10 @@ fn test_ethereum_types() {
 
 #[test]
 fn test_vector() {
-    run_program_and_check_output("./program_artifacts/rust/vector.elf", 15);
+    run_program_and_check_public_output(
+        "./program_artifacts/rust/vector.elf",
+        [1, 2, 3, 4, 5].to_vec(),
+    );
 }
 
 #[test]

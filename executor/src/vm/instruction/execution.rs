@@ -6,8 +6,24 @@ use crate::vm::{
 };
 
 const REGULAR_PC_UPDATE: u32 = 4;
-const PRINT_SYSCALL: u32 = 1;
-const PANIC_SYSCALL: u32 = 2;
+
+enum SyscallNumbers {
+    Print = 1,
+    Panic = 2,
+    Commit = 3,
+}
+
+impl TryFrom<u32> for SyscallNumbers {
+    type Error = ();
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(SyscallNumbers::Print),
+            2 => Ok(SyscallNumbers::Panic),
+            3 => Ok(SyscallNumbers::Commit),
+            _ => Err(()),
+        }
+    }
+}
 
 impl Instruction {
     /// Runs the given instruction and returns its execution log
@@ -212,8 +228,10 @@ impl Instruction {
             }
             Instruction::EcallEbreak => {
                 let syscall_number = registers.read(17)?; // a7
+                let syscall_number = SyscallNumbers::try_from(syscall_number)
+                    .map_err(|_| ExecutionError::UnknownSyscall(syscall_number))?;
                 match syscall_number {
-                    PRINT_SYSCALL => {
+                    SyscallNumbers::Print => {
                         // print
                         // For now this is just a mechanism to print
                         // It is not the correct implementation of ecall/ebreak
@@ -227,7 +245,7 @@ impl Instruction {
                             str::from_utf8(&bytes).map_err(|_| ExecutionError::IncorrectMessage)?;
                         println!("PRINT VM: {}", value);
                     }
-                    PANIC_SYSCALL => {
+                    SyscallNumbers::Panic => {
                         // panic
                         let pointer = registers.read(10)?;
                         let len = registers.read(11)?;
@@ -239,8 +257,11 @@ impl Instruction {
                             str::from_utf8(&bytes).map_err(|_| ExecutionError::IncorrectMessage)?;
                         return Err(ExecutionError::Panic(value.to_owned()));
                     }
-                    _ => {
-                        return Err(ExecutionError::UnknownSyscall(syscall_number));
+                    SyscallNumbers::Commit => {
+                        // commit
+                        let pointer = registers.read(10)?;
+                        let len = registers.read(11)?;
+                        memory.commit_public_output(pointer, len)?;
                     }
                 }
                 Log {
