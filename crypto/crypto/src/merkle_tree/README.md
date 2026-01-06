@@ -46,11 +46,11 @@ The implementation in this codebase includes:
 Here's a basic example of creating a Merkle tree with field elements:
 
 ```rust
-use lambdaworks_crypto::merkle_tree::{
+use crypto::merkle_tree::{
     merkle::MerkleTree,
     backends::field_element::FieldElementBackend,
 };
-use lambdaworks_math::field::{
+use math::field::{
     element::FieldElement,
     fields::fft_friendly::stark_252_prime_field::Stark252PrimeField,
 };
@@ -72,12 +72,12 @@ let merkle_tree = MerkleTree::<FieldElementBackend<F, Keccak256, 32>>::build(&va
 The `BatchPoseidonTree` backend is specifically designed for efficient batch hashing using the Poseidon hash function, which is particularly useful in zero-knowledge proof systems. This backend provides optimized performance for vectors of field elements.
 
 ```rust
-use lambdaworks_crypto::merkle_tree::{
+use crypto::merkle_tree::{
     merkle::MerkleTree,
     backends::field_element_vector::BatchPoseidonTree,
 };
-use lambdaworks_crypto::hash::poseidon::starknet::PoseidonCairoStark252;
-use lambdaworks_math::field::{
+use crypto::hash::poseidon::starknet::PoseidonCairoStark252;
+use math::field::{
     element::FieldElement,
     fields::fft_friendly::stark_252_prime_field::Stark252PrimeField,
 };
@@ -149,11 +149,11 @@ assert!(is_valid, "Proof verification failed");
 If you need to hash vectors of field elements:
 
 ```rust
-use lambdaworks_crypto::merkle_tree::{
+use crypto::merkle_tree::{
     merkle::MerkleTree,
     backends::field_element_vector::FieldElementVectorBackend,
 };
-use lambdaworks_math::field::{
+use math::field::{
     element::FieldElement,
     fields::fft_friendly::stark_252_prime_field::Stark252PrimeField,
 };
@@ -192,12 +192,12 @@ Proofs can be serialized and deserialized for storage or transmission. Note that
 
 ```rust
 // This requires the 'alloc' feature to be enabled
-use lambdaworks_crypto::merkle_tree::{
+use crypto::merkle_tree::{
     merkle::MerkleTree,
     proof::Proof,
     // For testing, you might use a simpler backend like TestBackend
 };
-use lambdaworks_math::traits::{Deserializable, Serializable};
+use math::traits::{Deserializable, Serializable};
 
 // Serialize the proof
 let serialized_proof = proof.serialize();
