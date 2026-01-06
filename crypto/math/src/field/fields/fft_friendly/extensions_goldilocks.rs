@@ -29,8 +29,7 @@ impl HasQuadraticNonResidue<U64GoldilocksPrimeField> for U64GoldilocksPrimeField
 }
 
 /// Field element type for the quadratic extension of Goldilocks
-pub type Degree2GoldilocksExtensionFieldElement =
-    FieldElement<Degree2GoldilocksExtensionField>;
+pub type Degree2GoldilocksExtensionFieldElement = FieldElement<Degree2GoldilocksExtensionField>;
 
 // =====================================================
 // CUBIC EXTENSION (Fp3)
@@ -56,8 +55,7 @@ pub type Degree3GoldilocksExtensionField =
     CubicExtensionField<U64GoldilocksPrimeField, GoldilocksCubicNonResidue>;
 
 /// Field element type for the cubic extension of Goldilocks
-pub type Degree3GoldilocksExtensionFieldElement =
-    FieldElement<Degree3GoldilocksExtensionField>;
+pub type Degree3GoldilocksExtensionFieldElement = FieldElement<Degree3GoldilocksExtensionField>;
 
 #[cfg(test)]
 mod tests {
@@ -328,8 +326,14 @@ mod tests {
 
     #[test]
     fn test_fp2_large_values() {
-        let a = Fp2E::new([FpE::from(18446744069414584300u64), FpE::from(12345678901234567u64)]);
-        let b = Fp2E::new([FpE::from(9876543210987654u64), FpE::from(11111111111111111u64)]);
+        let a = Fp2E::new([
+            FpE::from(18446744069414584300u64),
+            FpE::from(12345678901234567u64),
+        ]);
+        let b = Fp2E::new([
+            FpE::from(9876543210987654u64),
+            FpE::from(11111111111111111u64),
+        ]);
 
         // Test that a * a^-1 = 1
         let a_inv = a.inv().unwrap();
