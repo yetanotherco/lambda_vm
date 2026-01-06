@@ -99,44 +99,6 @@ impl IsField for Degree2GoldilocksExtensionField {
     fn double(a: &Self::BaseType) -> Self::BaseType {
         [a[0].double(), a[1].double()]
     }
-
-    fn pow<T>(a: &Self::BaseType, mut exponent: T) -> Self::BaseType
-    where
-        T: crate::unsigned_integer::traits::IsUnsignedInteger,
-    {
-        let zero = T::from(0);
-        let one = T::from(1);
-
-        if exponent == zero {
-            return Self::one();
-        }
-        if exponent == one {
-            return *a;
-        }
-
-        let mut result = *a;
-
-        while exponent & one == zero {
-            result = Self::square(&result);
-            exponent >>= 1;
-            if exponent == zero {
-                return result;
-            }
-        }
-
-        let mut base = result;
-        exponent >>= 1;
-
-        while exponent != zero {
-            base = Self::square(&base);
-            if exponent & one == one {
-                result = <Self as IsField>::mul(&result, &base);
-            }
-            exponent >>= 1;
-        }
-
-        result
-    }
 }
 
 impl IsSubFieldOf<Degree2GoldilocksExtensionField> for U64GoldilocksPrimeField {
@@ -324,44 +286,6 @@ impl IsField for Degree3GoldilocksExtensionField {
 
     fn double(a: &Self::BaseType) -> Self::BaseType {
         [a[0].double(), a[1].double(), a[2].double()]
-    }
-
-    fn pow<T>(a: &Self::BaseType, mut exponent: T) -> Self::BaseType
-    where
-        T: crate::unsigned_integer::traits::IsUnsignedInteger,
-    {
-        let zero = T::from(0);
-        let one = T::from(1);
-
-        if exponent == zero {
-            return Self::one();
-        }
-        if exponent == one {
-            return *a;
-        }
-
-        let mut result = *a;
-
-        while exponent & one == zero {
-            result = Self::square(&result);
-            exponent >>= 1;
-            if exponent == zero {
-                return result;
-            }
-        }
-
-        let mut base = result;
-        exponent >>= 1;
-
-        while exponent != zero {
-            base = Self::square(&base);
-            if exponent & one == one {
-                result = <Self as IsField>::mul(&result, &base);
-            }
-            exponent >>= 1;
-        }
-
-        result
     }
 }
 
@@ -727,5 +651,113 @@ mod tests {
 
         let result = (a / b).unwrap();
         assert_eq!(result * b, a);
+    }
+
+    // =====================================================
+    // BATCH INVERSE TESTS
+    // =====================================================
+
+    #[test]
+    fn test_fp2_batch_inverse() {
+        let a = Fp2E::new([FpE::from(2u64), FpE::from(3u64)]);
+        let b = Fp2E::new([FpE::from(4u64), FpE::from(5u64)]);
+        let c = Fp2E::new([FpE::from(6u64), FpE::from(7u64)]);
+        let d = Fp2E::new([FpE::from(8u64), FpE::from(9u64)]);
+
+        let original = [a, b, c, d];
+        let mut to_invert = original.clone();
+
+        Fp2E::inplace_batch_inverse(&mut to_invert).unwrap();
+
+        // Verify each element was correctly inverted
+        for (inv, orig) in to_invert.iter().zip(original.iter()) {
+            assert_eq!(*inv * *orig, Fp2E::one());
+        }
+    }
+
+    #[test]
+    fn test_fp2_batch_inverse_single_element() {
+        let a = Fp2E::new([FpE::from(12u64), FpE::from(5u64)]);
+        let mut to_invert = [a];
+
+        Fp2E::inplace_batch_inverse(&mut to_invert).unwrap();
+
+        assert_eq!(to_invert[0] * a, Fp2E::one());
+        assert_eq!(to_invert[0], a.inv().unwrap());
+    }
+
+    #[test]
+    fn test_fp2_batch_inverse_empty() {
+        let mut empty: [Fp2E; 0] = [];
+        assert!(Fp2E::inplace_batch_inverse(&mut empty).is_ok());
+    }
+
+    #[test]
+    fn test_fp3_batch_inverse() {
+        let a = Fp3E::new([FpE::from(2u64), FpE::from(3u64), FpE::from(4u64)]);
+        let b = Fp3E::new([FpE::from(5u64), FpE::from(6u64), FpE::from(7u64)]);
+        let c = Fp3E::new([FpE::from(8u64), FpE::from(9u64), FpE::from(10u64)]);
+        let d = Fp3E::new([FpE::from(11u64), FpE::from(12u64), FpE::from(13u64)]);
+
+        let original = [a, b, c, d];
+        let mut to_invert = original.clone();
+
+        Fp3E::inplace_batch_inverse(&mut to_invert).unwrap();
+
+        // Verify each element was correctly inverted
+        for (inv, orig) in to_invert.iter().zip(original.iter()) {
+            assert_eq!(*inv * *orig, Fp3E::one());
+        }
+    }
+
+    #[test]
+    fn test_fp3_batch_inverse_single_element() {
+        let a = Fp3E::new([FpE::from(12u64), FpE::from(5u64), FpE::from(7u64)]);
+        let mut to_invert = [a];
+
+        Fp3E::inplace_batch_inverse(&mut to_invert).unwrap();
+
+        assert_eq!(to_invert[0] * a, Fp3E::one());
+        assert_eq!(to_invert[0], a.inv().unwrap());
+    }
+
+    #[test]
+    fn test_fp3_batch_inverse_empty() {
+        let mut empty: [Fp3E; 0] = [];
+        assert!(Fp3E::inplace_batch_inverse(&mut empty).is_ok());
+    }
+
+    #[test]
+    fn test_fp2_batch_inverse_large() {
+        // Test with larger batch
+        let elements: Vec<Fp2E> = (1u64..=20)
+            .map(|i| Fp2E::new([FpE::from(i), FpE::from(i + 100)]))
+            .collect();
+
+        let original = elements.clone();
+        let mut to_invert = elements;
+
+        Fp2E::inplace_batch_inverse(&mut to_invert).unwrap();
+
+        for (inv, orig) in to_invert.iter().zip(original.iter()) {
+            assert_eq!(*inv * *orig, Fp2E::one());
+        }
+    }
+
+    #[test]
+    fn test_fp3_batch_inverse_large() {
+        // Test with larger batch
+        let elements: Vec<Fp3E> = (1u64..=20)
+            .map(|i| Fp3E::new([FpE::from(i), FpE::from(i + 100), FpE::from(i + 200)]))
+            .collect();
+
+        let original = elements.clone();
+        let mut to_invert = elements;
+
+        Fp3E::inplace_batch_inverse(&mut to_invert).unwrap();
+
+        for (inv, orig) in to_invert.iter().zip(original.iter()) {
+            assert_eq!(*inv * *orig, Fp3E::one());
+        }
     }
 }
