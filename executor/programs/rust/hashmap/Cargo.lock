@@ -48,6 +48,13 @@ checksum = "361a90feb7004eca4019fb28352a9465666b24f840f5c3cddf0ff13920590b89"
 name = "hashmap"
 version = "0.1.0"
 dependencies = [
+ "lambda-vm-syscalls",
+]
+
+[[package]]
+name = "lambda-vm-syscalls"
+version = "0.1.0"
+dependencies = [
  "embedded-alloc",
  "riscv",
 ]

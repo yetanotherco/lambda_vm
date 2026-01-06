@@ -45,6 +45,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "361a90feb7004eca4019fb28352a9465666b24f840f5c3cddf0ff13920590b89"
 
 [[package]]
+name = "lambda-vm-syscalls"
+version = "0.1.0"
+dependencies = [
+ "embedded-alloc",
+ "riscv",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.178"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -126,8 +134,7 @@ dependencies = [
 name = "stdout"
 version = "0.1.0"
 dependencies = [
- "embedded-alloc",
- "riscv",
+ "lambda-vm-syscalls",
 ]
 
 [[package]]

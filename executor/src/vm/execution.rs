@@ -42,8 +42,8 @@ fn run_from_entrypoint(
         let next_instruction = memory.load_word(pc)?;
         let instruction = Instruction::parse(next_instruction)?;
         if verbose {
-            println!("registers: {}", &registers);
-            println!("Executing instruction at 0x{:08x}: {:?}", pc, instruction);
+            //println!("registers: {}", &registers);
+            //println!("Executing instruction at 0x{:08x}: {:?}", pc, instruction);
         }
         let log = instruction.run(&mut pc, &mut registers, memory)?;
         logs.push(log);
