@@ -10,6 +10,7 @@ use crate::field::{
 // =====================================================
 // QUADRATIC EXTENSION (Fp2)
 // =====================================================
+// The non-residue was taken from [Plonky3](https://github.com/Plonky3/Plonky3/blob/main/goldilocks/src/extension.rs)
 // The quadratic extension is constructed using x^2 - 7,
 // where 7 is a quadratic non-residue in the Goldilocks field.
 // This means Fp2 = Fp[x] / (x^2 - 7)
