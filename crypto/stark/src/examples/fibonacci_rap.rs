@@ -10,7 +10,7 @@ use crate::{
     trace::TraceTable,
     traits::{AIR, TransitionEvaluationContext},
 };
-use crypto::fiat_shamir::is_transcript::IsTranscript;
+use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use math::{
     field::{element::FieldElement, traits::IsFFTField},
     helpers::resize_to_next_power_of_two,
@@ -173,7 +173,9 @@ where
     type FieldExtension = F;
     type PublicInputs = FibonacciRAPPublicInputs<Self::Field>;
 
-    const STEP_SIZE: usize = 1;
+    fn step_size(&self) -> usize {
+        1
+    }
 
     fn new(
         trace_length: usize,
@@ -235,7 +237,7 @@ where
 
     fn build_rap_challenges(
         &self,
-        transcript: &mut impl IsTranscript<Self::Field>,
+        transcript: &mut dyn IsStarkTranscript<Self::Field, Self::Field>,
     ) -> Vec<FieldElement<Self::FieldExtension>> {
         vec![transcript.sample_field_element()]
     }

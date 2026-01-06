@@ -6,6 +6,8 @@ use crate::vm::{
 };
 
 const REGULAR_PC_UPDATE: u32 = 4;
+const PRINT_SYSCALL: u32 = 1;
+const PANIC_SYSCALL: u32 = 2;
 
 enum SyscallNumbers {
     Print = 1,
