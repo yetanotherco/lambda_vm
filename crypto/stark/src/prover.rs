@@ -877,8 +877,57 @@ pub trait IsStarkProver<
     }
 
     // FIXME remove unwrap() calls and return errors
-    /// Generates a STARK proof for the trace `main_trace` with public inputs `pub_inputs`.
-    /// Warning: the transcript must be safely initializated before passing it to this method.
+    /// Generates STARK proofs for one or more AIRs with a shared transcript.
+    ///
+    /// This unified function handles both single-table and multi-table proving.
+    /// For protocols like LogUp where challenges must be shared across tables,
+    /// all tables are passed together.
+    ///
+    /// The function executes Round 1 for all AIRs first (committing all traces to the transcript),
+    /// then executes Rounds 2-4 for each AIR sequentially. This ensures proper Fiat-Shamir challenge
+    /// generation across all tables.
+    ///
+    /// Warning: the transcript must be safely initialized before passing it to this method.
+    fn multi_prove(
+        airs: &mut [(
+            &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+            &mut TraceTable<Field, FieldExtension>,
+        )],
+        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+    ) -> Result<Vec<StarkProof<Field, FieldExtension>>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+        FieldExtension: IsFFTField,
+        PI: Send + Sync,
+    {
+        info!("Started proof generation...");
+
+        let mut round_1_results: Vec<Round1<Field, FieldExtension>> = Vec::new();
+        let mut domains = Vec::new();
+
+        // Execute Round 1 for all AIRs first to ensure all trace commitments
+        // are in the transcript before generating challenges for Round 2
+        for (air, table) in &mut *airs {
+            let domain = new_domain(*air);
+            let round_1_result =
+                Self::round_1_randomized_air_with_preprocessing(*air, *table, &domain, transcript)?;
+            round_1_results.push(round_1_result);
+            domains.push(domain);
+        }
+
+        // Execute Rounds 2-4 for each AIR
+        let mut proofs = Vec::new();
+        for (((air, _), round_1_result), domain) in airs.iter().zip(round_1_results).zip(domains) {
+            let proof = Self::after_round_1(*air, &round_1_result, transcript, &domain)?;
+            proofs.push(proof);
+        }
+
+        Ok(proofs)
+    }
+
+    /// Convenience method to generate a STARK proof for a single AIR/trace.
+    /// This is equivalent to calling `prove` with a single-element slice.
     fn prove(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         trace: &mut TraceTable<Field, FieldExtension>,
@@ -887,32 +936,29 @@ pub trait IsStarkProver<
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
-        FieldExtension: IsField,
+        FieldExtension: IsFFTField,
+        PI: Send + Sync,
+    {
+        let mut airs = [(air, trace)];
+        Self::multi_prove(&mut airs, transcript).map(|mut proofs| proofs.remove(0))
+    }
+
+    // FIXME remove unwrap() calls and return errors
+    /// Generates a STARK proof for the trace `main_trace` with public inputs `pub_inputs`.
+    /// Warning: the transcript must be safely initializated before passing it to this method.
+    fn after_round_1(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        round_1_result: &Round1<Field, FieldExtension>,
+        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+        domain: &Domain<Field>,
+    ) -> Result<StarkProof<Field, FieldExtension>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldExtension: IsFFTField,
+        FieldElement<FieldExtension>: AsBytes,
+        PI: Send + Sync,
     {
         info!("Started proof generation...");
-        #[cfg(feature = "instruments")]
-        println!("- Started round 0: Air Initialization");
-        #[cfg(feature = "instruments")]
-        let timer0 = Instant::now();
-
-        let domain = new_domain(air);
-
-        #[cfg(feature = "instruments")]
-        let elapsed0 = timer0.elapsed();
-        #[cfg(feature = "instruments")]
-        println!("  Time spent: {:?}", elapsed0);
-
-        // ===================================
-        // ==========|   Round 1   |==========
-        // ===================================
-
-        #[cfg(feature = "instruments")]
-        println!("- Started round 1: RAP");
-        #[cfg(feature = "instruments")]
-        let timer1 = Instant::now();
-
-        let round_1_result =
-            Self::round_1_randomized_air_with_preprocessing(air, trace, &domain, transcript)?;
 
         #[cfg(debug_assertions)]
         validate_trace(
@@ -926,10 +972,6 @@ pub trait IsStarkProver<
             &domain,
             &round_1_result.rap_challenges,
         );
-        #[cfg(feature = "instruments")]
-        let elapsed1 = timer1.elapsed();
-        #[cfg(feature = "instruments")]
-        println!("  Time spent: {:?}", elapsed1);
 
         // ===================================
         // ==========|   Round 2   |==========
@@ -1044,11 +1086,9 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         {
-            let total_time = elapsed1 + elapsed2 + elapsed3 + elapsed4;
+            let total_time = elapsed2 + elapsed3 + elapsed4;
             println!(
-                " Fraction of proving time per round: {:.4} {:.4} {:.4} {:.4} {:.4}",
-                elapsed0.as_nanos() as f64 / total_time.as_nanos() as f64,
-                elapsed1.as_nanos() as f64 / total_time.as_nanos() as f64,
+                " Fraction of proving time per round: {:.4} {:.4} {:.4}",
                 elapsed2.as_nanos() as f64 / total_time.as_nanos() as f64,
                 elapsed3.as_nanos() as f64 / total_time.as_nanos() as f64,
                 elapsed4.as_nanos() as f64 / total_time.as_nanos() as f64
@@ -1061,7 +1101,7 @@ pub trait IsStarkProver<
             // [t]
             lde_trace_main_merkle_root: round_1_result.main.lde_trace_merkle_root,
             // [t]
-            lde_trace_aux_merkle_root: round_1_result.aux.map(|x| x.lde_trace_merkle_root),
+            lde_trace_aux_merkle_root: round_1_result.aux.as_ref().map(|x| x.lde_trace_merkle_root),
             // tⱼ(zgᵏ)
             trace_ood_evaluations: round_3_result.trace_ood_evaluations,
             // [H₁] and [H₂]
