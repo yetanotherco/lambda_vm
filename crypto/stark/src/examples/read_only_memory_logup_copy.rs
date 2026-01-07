@@ -8,9 +8,8 @@ use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
         lookup::{
-            Air, AirLogic, AuxiliaryColumnBuildData, AuxiliaryTraceBuildData,
-            LookUpAirLogicWrapper, LookUpPublicInputs, LookupPublicInputsPerAuxColumn,
-            PermutationColumns,
+            AirWithLookup, AuxiliaryColumnBuildData, AuxiliaryTraceBuildData, LookUpPublicInputs,
+            LookupPublicInputsPerAuxColumn,
         },
         transition::TransitionConstraint,
     },
@@ -352,10 +351,10 @@ pub fn read_only_logup_air<'a, F, E>(
     trace_length: usize,
     pub_inputs: LookUpPublicInputs<F>,
     proof_options: &ProofOptions,
-) -> Air<LookUpAirLogicWrapper<ReadOnlyAirLogic, F, E>, &'a (), F, E>
+) -> AirWithLookup<F, E>
 where
-    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
-    E: IsField + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
 {
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![
         Box::new(ContinuityConstraint::new()),
@@ -370,14 +369,6 @@ where
         num_transition_constraints: transition_constraints.len(),
     };
 
-    let columns = PermutationColumns {
-        a: 0,
-        v: 1,
-        a_s: 2,
-        v_s: 3,
-        m: 4,
-    };
-
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         columns: vec![AuxiliaryColumnBuildData {
             flag_columns: vec![4],           // m
@@ -385,26 +376,17 @@ where
         }],
     };
 
-    Air {
+    AirWithLookup::create(
+        auxiliary_trace_build_data,
+        pub_inputs,
         context,
         trace_length,
-        pub_inputs: &(),
-        step_size: 1,
-        trace_layout: (5, 1),
+        16,
+        (5, 1),
         transition_constraints,
-        logic: ReadOnlyAirLogic {},
-    }
-    .into_lookup(columns, auxiliary_trace_build_data, pub_inputs)
+    )
 }
 
-pub struct ReadOnlyAirLogic {}
-
-impl<F, E> AirLogic<F, E> for ReadOnlyAirLogic
-where
-    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
-    E: IsField + Send + Sync,
-{
-}
 /// AIR for a continuous read-only memory using the LogUp Lookup Argument.
 /// To accompany the understanding of this code you can see corresponding post in blog.lambdaclass.com.
 pub struct LogReadOnlyRAP<F, E>

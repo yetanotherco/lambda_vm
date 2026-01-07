@@ -18,61 +18,53 @@ use crate::{
 };
 
 /// Struct representing AIR content with the generic L identifying individual Air behaviour
-pub struct AirWithLookup<F: IsFFTField + IsSubFieldOf<E> + Send + Sync, E: IsField + Send + Sync> {
+pub struct Air<
+    L: AirLogic<F, E>,
+    PI,
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
+    E: IsField + Send + Sync,
+> {
     pub context: AirContext,
     pub trace_length: usize,
-    pub pub_inputs: LookUpPublicInputs<F>,
+    pub pub_inputs: PI,
     pub step_size: usize,
     pub trace_layout: (usize, usize),
     pub transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
-    pub auxiliary_trace_build_data: AuxiliaryTraceBuildData,
+    pub logic: L,
 }
 
-impl<F: IsFFTField + IsSubFieldOf<E> + Send + Sync + 'static, E: IsField + Send + Sync + 'static>
-    AirWithLookup<F, E>
-{
-    pub fn create(
-        auxiliary_trace_build_data: AuxiliaryTraceBuildData,
-        pub_inputs: LookUpPublicInputs<F>,
-        context: AirContext,
-        trace_length: usize,
-        step_size: usize,
-        trace_layout: (usize, usize),
-        mut transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
-    ) -> Self {
-        // PermutationConstraint being used as placeholder
-        transition_constraints.push(Box::new(PermutationConstraint::<F, E>::new(
-            // TODO: should be infered from AuxiliaryTraceBuildData
-            PermutationColumns {
-                a: 0,
-                v: 0,
-                a_s: 0,
-                v_s: 0,
-                m: 0,
-            },
-        )));
-        Self {
-            context,
-            trace_length,
-            pub_inputs,
-            step_size,
-            trace_layout,
-            transition_constraints,
-            auxiliary_trace_build_data,
-        }
+/// Trait containing inidivial AIR behaviour
+pub trait AirLogic<F: IsFFTField + IsSubFieldOf<E> + Send + Sync, E: IsField + Send + Sync> {
+    fn build_auxiliary_trace(
+        &self,
+        _trace: &mut TraceTable<F, E>,
+        _challenges: &[FieldElement<E>],
+    ) {
+    }
+
+    fn build_rap_challenges(
+        &self,
+        _transcript: &mut dyn IsStarkTranscript<E, F>,
+    ) -> Vec<FieldElement<E>> {
+        vec![]
+    }
+    fn boundary_constraints(&self, _rap_challenges: &[FieldElement<E>]) -> BoundaryConstraints<E> {
+        BoundaryConstraints::from_constraints(vec![])
     }
 }
 
-impl<F, E> crate::traits::AIR for AirWithLookup<F, E>
+impl<L, PI, F, E> crate::traits::AIR for Air<L, PI, F, E>
 where
+    L: AirLogic<F, E> + Send + Sync,
     F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
     E: IsField + Send + Sync,
+    PI: Send + Sync,
 {
     type Field = F;
 
     type FieldExtension = E;
 
-    type PublicInputs = LookUpPublicInputs<F>;
+    type PublicInputs = PI;
 
     fn step_size(&self) -> usize {
         self.step_size
@@ -99,6 +91,13 @@ where
         self.trace_length() * 2
     }
 
+    fn boundary_constraints(
+        &self,
+        rap_challenges: &[FieldElement<Self::FieldExtension>],
+    ) -> BoundaryConstraints<Self::FieldExtension> {
+        self.logic.boundary_constraints(rap_challenges)
+    }
+
     fn context(&self) -> &AirContext {
         &self.context
     }
@@ -117,6 +116,78 @@ where
         &self.transition_constraints
     }
 
+    fn build_auxiliary_trace(
+        &self,
+        main_trace: &mut TraceTable<Self::Field, Self::FieldExtension>,
+        rap_challenges: &[FieldElement<Self::FieldExtension>],
+    ) {
+        self.logic.build_auxiliary_trace(main_trace, rap_challenges);
+    }
+
+    fn build_rap_challenges(
+        &self,
+        transcript: &mut dyn IsStarkTranscript<Self::FieldExtension, Self::Field>,
+    ) -> Vec<FieldElement<Self::FieldExtension>> {
+        self.logic.build_rap_challenges(transcript)
+    }
+}
+
+impl<L, PI, F, E> Air<L, PI, F, E>
+where
+    L: AirLogic<F, E> + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+{
+    /// Transform a regular Air into a LookUpAir by adding the common LookUp behaviour to it.
+    /// Logic added:
+    /// - Transition constraints: based off of `columns` argument
+    /// - Auxiliary trace build logic: based off of `auxiliary_trace_build_data`. This also asumes the AIR has no previous auxiliary trace build logic, this could be changed if needed
+    /// - Boundary Constraints: ???
+    pub fn into_lookup(
+        mut self,
+        columns: PermutationColumns, // TODO: Could we infer these columns from the aux build data?
+        auxiliary_trace_build_data: AuxiliaryTraceBuildData,
+        lookup_public_inputs: LookUpPublicInputs<F>,
+    ) -> Air<LookUpAirLogicWrapper<L, F, E>, PI, F, E> {
+        // PermutationConstraint being used as placeholder
+        self.transition_constraints
+            .push(Box::new(PermutationConstraint::<F, E>::new(columns)));
+        Air {
+            context: self.context,
+            trace_length: self.trace_length,
+            pub_inputs: self.pub_inputs,
+            step_size: self.step_size,
+            trace_layout: self.trace_layout,
+            transition_constraints: self.transition_constraints,
+            logic: LookUpAirLogicWrapper {
+                auxiliary_trace_build_data,
+                public_inputs: lookup_public_inputs,
+                logic: self.logic,
+                phantom: PhantomData::<(F, E)>,
+            },
+        }
+    }
+}
+
+/// A wrapper for Air logic which extends the received AirLogic with generic LookUp behaviour
+pub struct LookUpAirLogicWrapper<L, F, E>
+where
+    L: AirLogic<F, E> + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+{
+    auxiliary_trace_build_data: AuxiliaryTraceBuildData,
+    public_inputs: LookUpPublicInputs<F>, // TODO: check if this is okay here
+    logic: L,
+    phantom: PhantomData<(F, E)>,
+}
+
+impl<L, F, E> AirLogic<F, E> for LookUpAirLogicWrapper<L, F, E>
+where
+    L: AirLogic<F, E> + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+{
     fn build_auxiliary_trace(&self, trace: &mut TraceTable<F, E>, challenges: &[FieldElement<E>]) {
         // Ignores build_auxiliary_trace logic from wrapped air (assumption: only lookups use auxiliary columns)
         // Uses the same challenges for all auxiliary columns (We should use the same challenges for auxiliary columns used for lookups between table pairs, the first solution was to use the same rap challenges for all auxilary columns across tables, we need to checkk if this is safe)
@@ -130,16 +201,16 @@ where
     // TODO: remove from trait and sample them in prove
     fn build_rap_challenges(
         &self,
-        _transcript: &mut dyn IsStarkTranscript<E, F>,
+        transcript: &mut dyn IsStarkTranscript<E, F>,
     ) -> Vec<FieldElement<E>> {
         // Assumption: only lookups use aux trace, only lookups use rap challenges, logic from wrapped air is ignores
         // This method shall be removed and rap challenges shall be sampled only once for all airs in prove methdod after comitting
         vec![]
     }
-    fn boundary_constraints(&self, _rap_challenges: &[FieldElement<E>]) -> BoundaryConstraints<E> {
+    fn boundary_constraints(&self, rap_challenges: &[FieldElement<E>]) -> BoundaryConstraints<E> {
         let mut boundary_constraints = vec![];
         for (pub_inputs, aux_column_build_data) in self
-            .pub_inputs
+            .public_inputs
             .columns
             .iter()
             .zip(&self.auxiliary_trace_build_data.columns)
