@@ -34,6 +34,11 @@ use super::proof::stark::{DeepPolynomialOpening, StarkProof};
 use super::trace::TraceTable;
 use super::traits::AIR;
 
+type AirAndTrace<'a, Field, FieldExtension, PI> = (
+    &'a dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+    &'a mut TraceTable<Field, FieldExtension>,
+);
+
 /// A default STARK prover implementing `IsStarkProver`.
 pub struct Prover<
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
@@ -887,10 +892,7 @@ pub trait IsStarkProver<
     ///
     /// Warning: the transcript must be safely initialized before passing it to this method.
     fn multi_prove(
-        airs: &mut [(
-            &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
-            &mut TraceTable<Field, FieldExtension>,
-        )],
+        airs: &mut [AirAndTrace<'_, Field, FieldExtension, PI>],
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
     ) -> Result<Vec<StarkProof<Field, FieldExtension>>, ProvingError>
     where
@@ -967,7 +969,7 @@ pub trait IsStarkProver<
                 .as_ref()
                 .map(|a| &a.trace_polys)
                 .unwrap_or(&vec![]),
-            &domain,
+            domain,
             &round_1_result.rap_challenges,
         );
 
@@ -1000,8 +1002,8 @@ pub trait IsStarkProver<
 
         let round_2_result = Self::round_2_compute_composition_polynomial(
             air,
-            &domain,
-            &round_1_result,
+            domain,
+            round_1_result,
             &transition_coefficients,
             &boundary_coefficients,
         )?;
@@ -1031,8 +1033,8 @@ pub trait IsStarkProver<
 
         let round_3_result = Self::round_3_evaluate_polynomials_in_out_of_domain_element(
             air,
-            &domain,
-            &round_1_result,
+            domain,
+            round_1_result,
             &round_2_result,
             &z,
         );
@@ -1069,8 +1071,8 @@ pub trait IsStarkProver<
         // to simulate the interactions with the verifier.
         let round_4_result = Self::round_4_compute_and_run_fri_on_the_deep_composition_polynomial(
             air,
-            &domain,
-            &round_1_result,
+            domain,
+            round_1_result,
             &round_2_result,
             &round_3_result,
             &z,

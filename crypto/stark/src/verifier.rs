@@ -22,6 +22,11 @@ use std::marker::PhantomData;
 #[cfg(feature = "instruments")]
 use std::time::Instant;
 
+type AirAndProof<'a, Field, FieldExtension, PI> = (
+    &'a dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+    &'a StarkProof<Field, FieldExtension>,
+);
+
 /// A default STARK verifier implementing `IsStarkVerifier`.
 pub struct Verifier<
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
@@ -199,13 +204,13 @@ pub trait IsStarkVerifier<
         // Receive grinding value
         let security_bits = air.context().proof_options.grinding_factor;
         let mut grinding_seed = [0u8; 32];
-        if security_bits > 0 {
-            if let Some(nonce_value) = proof.nonce {
-                grinding_seed = transcript.state();
-                transcript.append_bytes(&nonce_value.to_be_bytes());
-            }
+        if security_bits > 0
+            && let Some(nonce_value) = proof.nonce
+        {
+            grinding_seed = transcript.state();
+            transcript.append_bytes(&nonce_value.to_be_bytes());
         }
-
+    
         // FRI query phase
         // <<<< Send challenges 𝜄ₛ (iota_s)
         let number_of_queries = air.options().fri_number_of_queries;
@@ -734,10 +739,7 @@ pub trait IsStarkVerifier<
     ///
     /// Warning: the transcript must be safely initialized before passing it to this method.
     fn multi_verify(
-        airs_and_proofs: &[(
-            &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
-            &StarkProof<Field, FieldExtension>,
-        )],
+        airs_and_proofs: &[AirAndProof<'_, Field, FieldExtension, PI>],
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
     ) -> bool
     where
@@ -904,11 +906,10 @@ pub trait IsStarkVerifier<
         // Receive grinding value
         let security_bits = air.context().proof_options.grinding_factor;
         let mut grinding_seed = [0u8; 32];
-        if security_bits > 0 {
-            if let Some(nonce_value) = proof.nonce {
-                grinding_seed = transcript.state();
-                transcript.append_bytes(&nonce_value.to_be_bytes());
-            }
+        if security_bits > 0
+         && let Some(nonce_value) = proof.nonce {
+            grinding_seed = transcript.state();
+            transcript.append_bytes(&nonce_value.to_be_bytes());
         }
 
         // FRI query phase
@@ -958,7 +959,7 @@ pub trait IsStarkVerifier<
         // verify grinding
         let security_bits = air.context().proof_options.grinding_factor;
         if security_bits > 0 {
-            let nonce_is_valid = proof.nonce.map_or(false, |nonce_value| {
+            let nonce_is_valid = proof.nonce.is_some_and(|nonce_value| {
                 grinding::is_valid_nonce(&challenges.grinding_seed, nonce_value, security_bits)
             });
 
