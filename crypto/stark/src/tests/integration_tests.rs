@@ -46,6 +46,19 @@ fn test_prove_fib() {
         FibonacciAIR::<Stark252PrimeField>::new(trace.num_rows(), &pub_inputs, &proof_options);
 
     let proof = Prover::prove(&air, &mut trace, &mut StoneProverTranscript::new(&[])).unwrap();
+
+    ///// Verifier no tiene el codigo de antes
+
+    // El prover me "hintea" cuales public inputs
+
+    let pub_inputs = FibonacciPublicInputs {
+        a0: Felt252::zero(),
+        a1: Felt252::one(),
+    };
+
+    let air =
+        FibonacciAIR::<Stark252PrimeField>::new(trace.num_rows(), &pub_inputs, &proof_options);
+
     assert!(Verifier::verify(
         &proof,
         &air,

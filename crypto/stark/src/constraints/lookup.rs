@@ -1,12 +1,16 @@
 use std::marker::PhantomData;
 
+use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use math::field::{
     element::FieldElement,
     traits::{IsFFTField, IsField, IsSubFieldOf},
 };
 
 use crate::{
-    constraints::transition::TransitionConstraint, table::TableView,
+    constraints::{boundary::BoundaryConstraints, transition::TransitionConstraint},
+    context::AirContext,
+    table::TableView,
+    trace::TraceTable,
     traits::TransitionEvaluationContext,
 };
 
@@ -52,9 +56,180 @@ use crate::{
 // * Don't fully automatize it but add helper functions to aid the process: aka functions to define transition & boundary constraints common to all lookup airs
 //
 //
+// Por que AIR es un trait y no un struct? Todos los implementors tienen los mismos fields (context, trace_lengh, inputs, constraints)
+// Capaz podriamos separar los fields del air de su behaviour quedando algo mas sencillo:
 //
 //
+pub struct Air<
+    L: AirLogic<F, E>,
+    PI,
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
+    E: IsField + Send + Sync,
+> {
+    pub context: AirContext,
+    pub trace_length: usize,
+    pub pub_inputs: PI,
+    pub step_size: usize,
+    pub transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
+    pub logic: PhantomData<L>,
+}
+
+pub trait AirLogic<F: IsFFTField + IsSubFieldOf<E> + Send + Sync, E: IsField + Send + Sync> {
+    fn build_auxiliary_trace(_trace: &mut TraceTable<F, E>, _challenges: &[FieldElement<E>]) {}
+
+    fn build_rap_challenges(_transcript: &mut dyn IsStarkTranscript<E, F>) -> Vec<FieldElement<E>> {
+        vec![]
+    }
+    fn boundary_constraints(_rap_challenges: &[FieldElement<E>]) -> BoundaryConstraints<E> {
+        BoundaryConstraints::from_constraints(vec![])
+    }
+}
 //
+// Y en lugar de tener diferentes structs que implementan AIR tendriamos funciones que crean AIRS con distintas constraints y logicas
+// Los metodos default de AIR que no usamos pasarian a ser metodos de struct Air
+// Ya no es necesario tener un new comun a todos los AIR porque nuestros prove y verify reciben un air
+// Esto nos da mas flexibilidad y nos permite hacer el wrapper de lookups ya que podemos modificar y agregarle constraints al air
+//
+
+impl<L, PI, F, E> crate::traits::AIR for Air<L, PI, F, E>
+where
+    L: AirLogic<F, E> + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
+    E: IsField + Send + Sync,
+    PI: Send + Sync,
+{
+    type Field = F;
+
+    type FieldExtension = E;
+
+    type PublicInputs = PI;
+
+    fn step_size(&self) -> usize {
+        self.step_size
+    }
+
+    fn new(
+        trace_length: usize,
+        pub_inputs: &Self::PublicInputs,
+        proof_options: &crate::proof::options::ProofOptions,
+    ) -> Self
+    where
+        Self: Sized,
+    {
+        unreachable!("THIS SHOULD NO LONGER BE USED")
+    }
+
+    fn trace_layout(&self) -> (usize, usize) {
+        todo!() // Add to struct or infer
+    }
+
+    fn composition_poly_degree_bound(&self) -> usize {
+        todo!() // Add to struct or infer
+    }
+
+    fn boundary_constraints(
+        &self,
+        rap_challenges: &[FieldElement<Self::FieldExtension>],
+    ) -> BoundaryConstraints<Self::FieldExtension> {
+        L::boundary_constraints(rap_challenges)
+    }
+
+    fn context(&self) -> &AirContext {
+        &self.context
+    }
+
+    fn trace_length(&self) -> usize {
+        self.trace_length
+    }
+
+    fn pub_inputs(&self) -> &Self::PublicInputs {
+        &self.pub_inputs
+    }
+
+    fn transition_constraints(
+        &self,
+    ) -> &Vec<Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>> {
+        &self.transition_constraints
+    }
+
+    fn build_auxiliary_trace(
+        &self,
+        main_trace: &mut TraceTable<Self::Field, Self::FieldExtension>,
+        rap_challenges: &[FieldElement<Self::FieldExtension>],
+    ) {
+        L::build_auxiliary_trace(main_trace, rap_challenges);
+    }
+
+    fn build_rap_challenges(
+        &self,
+        transcript: &mut dyn IsStarkTranscript<Self::FieldExtension, Self::Field>,
+    ) -> Vec<FieldElement<Self::FieldExtension>> {
+        L::build_rap_challenges(transcript)
+    }
+}
+
+impl<L, PI, F, E> Air<L, PI, F, E>
+where
+    L: AirLogic<F, E> + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+{
+    pub fn into_lookup(
+        mut self,
+        columns: PermutationColumns,
+    ) -> Air<LookUpAirLogicWrapper<L, F, E>, PI, F, E> {
+        self.transition_constraints
+            .push(Box::new(PermutationConstraint::<F, E>::new(columns)));
+        Air {
+            context: self.context,
+            trace_length: self.trace_length,
+            pub_inputs: self.pub_inputs,
+            step_size: self.step_size,
+            transition_constraints: self.transition_constraints,
+            logic: PhantomData::<LookUpAirLogicWrapper<L, F, E>>,
+        }
+    }
+}
+
+pub struct LookUpAirLogicWrapper<L, F, E>
+where
+    L: AirLogic<F, E> + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+{
+    phanton: PhantomData<(L, F, E)>,
+}
+
+impl<L, F, E> AirLogic<F, E> for LookUpAirLogicWrapper<L, F, E>
+where
+    L: AirLogic<F, E> + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+{
+    fn build_auxiliary_trace(trace: &mut TraceTable<F, E>, challenges: &[FieldElement<E>]) {
+        L::build_auxiliary_trace(trace, challenges);
+        // TODO: Add common lookup auxiliary trace logic
+        // I NEED TO KNOW:
+        // for each aux column:
+        // - What will its index be (maybe)
+        // - Which columns make up the flags
+        // - Which columns make up the values
+    }
+
+    fn build_rap_challenges(transcript: &mut dyn IsStarkTranscript<E, F>) -> Vec<FieldElement<E>> {
+        L::build_rap_challenges(transcript)
+        // Do we need more rap challneges for the added boundary constraints??\
+        // We will only use rap challenges for building auxiliary trace, not for anything else
+        // We must use the same rap challenges for all tables
+        // This method shall be removed and rap challenges shall be sampled only once for all airs in prove methdo AFTER COMITTING!!!
+    }
+    fn boundary_constraints(rap_challenges: &[FieldElement<E>]) -> BoundaryConstraints<E> {
+        let mut boundary_constraints = L::boundary_constraints(rap_challenges);
+        // TODO: Add boundary constraints
+        // Are these constraints dependant on the columns we use? aka do they differ between each lookup table?
+        boundary_constraints
+    }
+}
 
 // Impl (failing) of wrapper solution
 // use std::marker::PhantomData;
@@ -162,7 +337,7 @@ pub struct PermutationConstraint<
     E: IsField + Send + Sync,
 > {
     phantom: PhantomData<(F, E)>,
-    columns: PermutationColumns, // TODO: If we use fewer columns this could also be const generic
+    columns: PermutationColumns,
 }
 impl<F, E> PermutationConstraint<F, E>
 where
