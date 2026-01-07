@@ -18,13 +18,12 @@ pub struct ReturnValues {
 pub fn run_program(
     instruction_map: BTreeMap<u32, u32>,
     entrypoint: u32,
-    verbose: bool,
     private_inputs: Vec<u8>,
 ) -> Result<(ReturnValues, Vec<Log>), ExecutorError> {
     let mut memory = Memory::default();
     memory.store_private_inputs(private_inputs)?;
     load_program(instruction_map, &mut memory)?;
-    run_from_entrypoint(&mut memory, entrypoint, verbose)
+    run_from_entrypoint(&mut memory, entrypoint)
 }
 
 fn load_program(
@@ -40,7 +39,6 @@ fn load_program(
 fn run_from_entrypoint(
     memory: &mut Memory,
     entrypoint: u32,
-    verbose: bool,
 ) -> Result<(ReturnValues, Vec<Log>), ExecutorError> {
     let mut pc = entrypoint;
     let mut registers = Registers::default();
@@ -48,10 +46,6 @@ fn run_from_entrypoint(
     while pc != 0 {
         let next_instruction = memory.load_word(pc)?;
         let instruction = Instruction::parse(next_instruction)?;
-        if verbose {
-            //println!("registers: {}", &registers);
-            //println!("Executing instruction at 0x{:08x}: {:?}", pc, instruction);
-        }
         let log = instruction.run(&mut pc, &mut registers, memory)?;
         logs.push(log);
     }
