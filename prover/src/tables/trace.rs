@@ -9,6 +9,9 @@ use math::field::{
         babybear_u32::Babybear31PrimeField, quartic_babybear_u32::Degree4BabyBearU32ExtensionField,
     },
 };
+use std::collections::HashMap;
+
+use crate::tables::decode::DecodeKey;
 use stark::trace::TraceTable;
 
 type FE = FieldElement<Babybear31PrimeField>;
@@ -23,10 +26,27 @@ impl Trace {
         let mut cpu_table: Vec<FE> = Vec::new();
         let mut decode_table: Vec<FE> = Vec::new();
 
+        let mut decode_map: HashMap<DecodeKey, (DecodeTableRow, usize)> = HashMap::new();
+
         for (i, log) in logs.iter().enumerate() {
             let timestamp = (i * 4) as u32;
+
             cpu_table.extend(CpuTableRow::from_log(log, timestamp).to_vec());
-            decode_table.extend(DecodeTableRow::from_log(log).to_vec());
+
+            let decode_row = DecodeTableRow::from_log(log);
+            let key = DecodeTableRow::to_key(&decode_row);
+
+            decode_map
+                .entry(key)
+                .and_modify(|(_existing_row, multiplicity)| {
+                    *multiplicity += 1;
+                })
+                .or_insert((decode_row, 1));
+        }
+
+        for (_key, (mut row, multiplicity)) in decode_map {
+            row.set_multiplicity(multiplicity);
+            decode_table.extend(row.to_vec());
         }
 
         pad_to_next_power_of_two(&mut cpu_table, cpu::NUM_COLUMNS);

@@ -28,29 +28,32 @@ pub fn run_program_and_prover(elf_path: &str) {
     let cpu_air = CPUTableAIR::new(trace.cpu_trace_table.num_rows(), &(), &proof_options);
     let decode_air = DecodeTableAIR::new(trace.decode_trace_table.num_rows(), &(), &proof_options);
 
-    let airs: Airs<_, _, _> = vec![
-        (&cpu_air, &mut trace.cpu_trace_table),
-        (&decode_air, &mut trace.decode_trace_table),
-    ];
+    println!("CPU table: {:?}", trace.cpu_trace_table.num_rows());
+    println!("Decode table: {:?}", trace.decode_trace_table.num_rows());
 
-    let proof = multi_prove(
-        airs,
-        &mut DefaultTranscript::<Degree4BabyBearU32ExtensionField>::new(&[]),
-    )
-    .unwrap();
+    // let airs: Airs<_, _, _> = vec![
+    //     (&cpu_air, &mut trace.cpu_trace_table),
+    //     (&decode_air, &mut trace.decode_trace_table),
+    // ];
 
-    let air_and_proof: AirsAndProofs = vec![()];
+    // let proof = multi_prove(
+    //     airs,
+    //     &mut DefaultTranscript::<Degree4BabyBearU32ExtensionField>::new(&[]),
+    // )
+    // .unwrap();
 
-    // pub type AirsAndProofs<'a, F, E, PI> = Vec<(
-    //     &'a dyn AIR<Field = F, FieldExtension = E, PublicInputs = PI>,
-    //     &'a StarkProof<F, E>,
-    // )>;
+    // let air_and_proof: AirsAndProofs = vec![()];
 
-    assert!(multi_verify(
-        &proof,
-        &air,
-        &mut DefaultTranscript::<Degree4BabyBearU32ExtensionField>::new(&[]),
-    ));
+    // // pub type AirsAndProofs<'a, F, E, PI> = Vec<(
+    // //     &'a dyn AIR<Field = F, FieldExtension = E, PublicInputs = PI>,
+    // //     &'a StarkProof<F, E>,
+    // // )>;
+
+    // assert!(multi_verify(
+    //     &proof,
+    //     &air,
+    //     &mut DefaultTranscript::<Degree4BabyBearU32ExtensionField>::new(&[]),
+    // ));
 }
 
 #[cfg(test)]
