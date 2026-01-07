@@ -210,7 +210,7 @@ pub trait IsStarkVerifier<
             grinding_seed = transcript.state();
             transcript.append_bytes(&nonce_value.to_be_bytes());
         }
-    
+
         // FRI query phase
         // <<<< Send challenges 𝜄ₛ (iota_s)
         let number_of_queries = air.options().fri_number_of_queries;
@@ -907,7 +907,8 @@ pub trait IsStarkVerifier<
         let security_bits = air.context().proof_options.grinding_factor;
         let mut grinding_seed = [0u8; 32];
         if security_bits > 0
-         && let Some(nonce_value) = proof.nonce {
+            && let Some(nonce_value) = proof.nonce
+        {
             grinding_seed = transcript.state();
             transcript.append_bytes(&nonce_value.to_be_bytes());
         }
