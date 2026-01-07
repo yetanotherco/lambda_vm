@@ -164,12 +164,6 @@ output = "is_negative"
 multiplicity = "signed"
 ref = "shift:c:is_negative_if_signed"
 
-[[constraints.is_negative]]
-kind = "arith"
-constraint = "$#`!signed` => #`is_negative` = 0$"
-poly = ["*", ["not", "signed"], "is_negative"]
-ref = "shift:c:is_negative_if_unsigned"
-
 
 [[constraint_groups]]
 name = "bit_shift"

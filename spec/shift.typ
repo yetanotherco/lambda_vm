@@ -74,9 +74,7 @@ Lastly, `X` and `Y` are combined in the right way to form the limbs of `output`.
 #render_constraint_table(chip, config, groups: "limb_shifting")
 
 === Miscellaneous 
-To make sure `left` is actually a `Bit`, we introduce constraint @shift:c:direction_implies_mu. 
-Moreover, @shift:c:is_negative_if_signed is included to compute if `in` is negative.
-Since `in` cannot be negative in the unsigned case, @shift:c:is_negative_if_unsigned constrains that `is_negative` will be $0$ in that case.
+To make sure `left` is actually a `Bit`, we introduce constraint @shift:c:direction_implies_mu.
 #render_constraint_table(chip, config, groups: "left_flag")
 #render_constraint_table(chip, config, groups: "is_negative")
 
