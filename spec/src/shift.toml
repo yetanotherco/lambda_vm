@@ -71,7 +71,7 @@ desc = "One-hot vector indicating whether $floor.l #`shift` / 16 floor.r equiv i
 # Virtual
 
 [[variables.virtual]]
-name = "extensions"
+name = "extension"
 type = "Half"
 desc = "sign extension of `in`."
 def = ["*", 65535, "is_negative"]
