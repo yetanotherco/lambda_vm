@@ -27,8 +27,7 @@ fn test_mul_quadratic() {
     let a = Fee::new([FE::from(12), FE::from(5)]);
     let b = Fee::new([-FE::from(4), FE::from(2)]);
     let expected_result = Fee::new([
-        FE::from(12) * (-FE::from(4))
-            + FE::from(5) * FE::from(2) * Babybear31PrimeField::residue(),
+        FE::from(12) * (-FE::from(4)) + FE::from(5) * FE::from(2) * Babybear31PrimeField::residue(),
         FE::from(12) * FE::from(2) + FE::from(5) * (-FE::from(4)),
     ]);
     assert_eq!(a * b, expected_result);

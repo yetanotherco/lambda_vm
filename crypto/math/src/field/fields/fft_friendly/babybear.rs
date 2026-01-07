@@ -46,4 +46,3 @@ impl FieldElement<Babybear31PrimeField> {
         limbs[0].to_be_bytes()
     }
 }
-

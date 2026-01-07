@@ -8,3 +8,6 @@ pub mod fft_friendly_quartic_babybear_tests;
 pub mod fft_friendly_quartic_babybear_u32_tests;
 pub mod fft_friendly_stark_252_tests;
 pub mod fft_friendly_u64_goldilocks_tests;
+pub mod unsigned_integer_montgomery_tests;
+pub mod unsigned_integer_u256_tests;
+pub mod unsigned_integer_u384_tests;

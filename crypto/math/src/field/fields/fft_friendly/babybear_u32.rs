@@ -22,4 +22,3 @@ impl IsFFTField for Babybear31PrimeField {
         "babybear31"
     }
 }
-

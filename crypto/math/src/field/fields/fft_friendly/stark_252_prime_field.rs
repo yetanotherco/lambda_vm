@@ -95,4 +95,3 @@ impl Ord for FieldElement<Stark252PrimeField> {
         self.representative().cmp(&other.representative())
     }
 }
-

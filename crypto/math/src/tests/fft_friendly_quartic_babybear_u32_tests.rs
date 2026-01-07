@@ -117,8 +117,7 @@ fn test_mul_group_generator_pow_order_is_one() {
 
 #[test]
 fn test_two_adic_primitve_root_of_unity() {
-    let generator =
-        Fp4E::new(Degree4BabyBearU32ExtensionField::TWO_ADIC_PRIMITVE_ROOT_OF_UNITY);
+    let generator = Fp4E::new(Degree4BabyBearU32ExtensionField::TWO_ADIC_PRIMITVE_ROOT_OF_UNITY);
     assert_eq!(
         generator.pow(2u64.pow(Degree4BabyBearU32ExtensionField::TWO_ADICITY as u32)),
         Fp4E::one()
@@ -191,8 +190,7 @@ mod test_babybear_31_fft {
         let len = poly.coeff_len().next_power_of_two();
         let order = (len * blowup_factor).trailing_zeros();
         let twiddles =
-            get_powers_of_primitive_root_coset(order.into(), len * blowup_factor, &offset)
-                .unwrap();
+            get_powers_of_primitive_root_coset(order.into(), len * blowup_factor, &offset).unwrap();
 
         let fft_eval =
             Polynomial::evaluate_offset_fft::<F>(&poly, blowup_factor, None, &offset).unwrap();

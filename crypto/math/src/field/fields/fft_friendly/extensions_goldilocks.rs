@@ -340,4 +340,3 @@ impl IsSubFieldOf<Degree3GoldilocksExtensionField> for U64GoldilocksPrimeField {
 
 /// Field element type for the cubic extension of Goldilocks
 pub type Fp3E = FieldElement<Degree3GoldilocksExtensionField>;
-

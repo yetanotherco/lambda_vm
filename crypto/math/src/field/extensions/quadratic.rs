@@ -212,4 +212,3 @@ impl<F: IsField, Q: Clone + Debug + HasQuadraticNonResidue<F>>
     FieldElement<QuadraticExtensionField<F, Q>>
 {
 }
-

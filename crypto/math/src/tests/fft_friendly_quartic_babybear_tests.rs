@@ -1,6 +1,8 @@
 use crate::field::{
     element::FieldElement,
-    fields::fft_friendly::{babybear::Babybear31PrimeField, quartic_babybear::Degree4BabyBearExtensionField},
+    fields::fft_friendly::{
+        babybear::Babybear31PrimeField, quartic_babybear::Degree4BabyBearExtensionField,
+    },
     traits::IsFFTField,
 };
 
@@ -159,8 +161,7 @@ mod test_babybear_31_fft {
         let len = poly.coeff_len().next_power_of_two();
         let order = (len * blowup_factor).trailing_zeros();
         let twiddles =
-            get_powers_of_primitive_root_coset(order.into(), len * blowup_factor, &offset)
-                .unwrap();
+            get_powers_of_primitive_root_coset(order.into(), len * blowup_factor, &offset).unwrap();
 
         let fft_eval =
             Polynomial::evaluate_offset_fft::<F>(&poly, blowup_factor, None, &offset).unwrap();

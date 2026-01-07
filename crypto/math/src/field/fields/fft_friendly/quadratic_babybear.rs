@@ -16,4 +16,3 @@ impl HasQuadraticNonResidue<Babybear31PrimeField> for Babybear31PrimeField {
 /// Field element type for the quadratic extension of Babybear
 pub type QuadraticBabybearFieldElement =
     QuadraticExtensionFieldElement<Babybear31PrimeField, Babybear31PrimeField>;
-

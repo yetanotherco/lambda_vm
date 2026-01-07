@@ -362,4 +362,3 @@ impl HasDefaultTranscript for Degree4BabyBearExtensionField {
         FieldElement::<Self>::new(coeffs)
     }
 }
-

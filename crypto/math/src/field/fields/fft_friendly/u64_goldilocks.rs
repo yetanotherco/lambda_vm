@@ -42,4 +42,3 @@ impl Ord for FieldElement<U64GoldilocksPrimeField> {
         self.representative().cmp(&other.representative())
     }
 }
-

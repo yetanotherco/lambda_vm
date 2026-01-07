@@ -1,9 +1,7 @@
 use crate::field::{
     element::FieldElement,
     fields::fft_friendly::{
-        extensions_goldilocks::{
-            Degree2GoldilocksExtensionField, Degree3GoldilocksExtensionField, Fp2E, Fp3E,
-        },
+        extensions_goldilocks::{Fp2E, Fp3E},
         u64_goldilocks::U64GoldilocksPrimeField,
     },
 };
