@@ -17,8 +17,12 @@ use crate::{
     traits::TransitionEvaluationContext,
 };
 
-/// Struct representing AIR content with the generic L identifying individual Air behaviour
-pub struct AirWithLookup<F: IsFFTField + IsSubFieldOf<E> + Send + Sync, E: IsField + Send + Sync> {
+/// Struct representing and AIR with Lookup. Contains own implementation of boundary constraints and auxiliary trace building
+pub struct AirWithLookup<
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
+    E: IsField + Send + Sync,
+    B: BoundaryConstraintBuilder<F, E>,
+> {
     pub context: AirContext,
     pub trace_length: usize,
     pub pub_inputs: LookUpPublicInputs<F>,
@@ -26,11 +30,16 @@ pub struct AirWithLookup<F: IsFFTField + IsSubFieldOf<E> + Send + Sync, E: IsFie
     pub trace_layout: (usize, usize),
     pub transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
     pub auxiliary_trace_build_data: AuxiliaryTraceBuildData,
+    pub boundary_constraint_builder: PhantomData<B>,
 }
 
-impl<F: IsFFTField + IsSubFieldOf<E> + Send + Sync + 'static, E: IsField + Send + Sync + 'static>
-    AirWithLookup<F, E>
+impl<
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    B: BoundaryConstraintBuilder<F, E>,
+> AirWithLookup<F, E, B>
 {
+    /// Creates a new AirWithLookup adding LookUp-specific transition constraints to existing constraints
     pub fn create(
         auxiliary_trace_build_data: AuxiliaryTraceBuildData,
         pub_inputs: LookUpPublicInputs<F>,
@@ -59,14 +68,16 @@ impl<F: IsFFTField + IsSubFieldOf<E> + Send + Sync + 'static, E: IsField + Send 
             trace_layout,
             transition_constraints,
             auxiliary_trace_build_data,
+            boundary_constraint_builder: PhantomData::<B>,
         }
     }
 }
 
-impl<F, E> crate::traits::AIR for AirWithLookup<F, E>
+impl<F, E, B> crate::traits::AIR for AirWithLookup<F, E, B>
 where
     F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
     E: IsField + Send + Sync,
+    B: BoundaryConstraintBuilder<F, E>,
 {
     type Field = F;
 
@@ -136,7 +147,7 @@ where
         // This method shall be removed and rap challenges shall be sampled only once for all airs in prove methdod after comitting
         vec![]
     }
-    fn boundary_constraints(&self, _rap_challenges: &[FieldElement<E>]) -> BoundaryConstraints<E> {
+    fn boundary_constraints(&self, rap_challenges: &[FieldElement<E>]) -> BoundaryConstraints<E> {
         let mut boundary_constraints = vec![];
         for (pub_inputs, aux_column_build_data) in self
             .pub_inputs
@@ -147,6 +158,7 @@ where
             boundary_constraints
                 .extend(build_boundary_constraint(pub_inputs, aux_column_build_data));
         }
+        boundary_constraints.extend(B::boundary_constraints(&self.pub_inputs, rap_challenges));
         BoundaryConstraints::from_constraints(boundary_constraints)
     }
 }
@@ -177,6 +189,27 @@ where
 {
     pub flags: Vec<FieldElement<F>>,
     pub values: Vec<FieldElement<F>>,
+}
+
+pub trait BoundaryConstraintBuilder<
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
+    E: IsField + Send + Sync,
+>: Send + Sync
+{
+    fn boundary_constraints(
+        _pub_inputs: &LookUpPublicInputs<F>,
+        _rap_challenges: &[FieldElement<E>],
+    ) -> Vec<BoundaryConstraint<E>> {
+        vec![]
+    }
+}
+
+pub struct NullBoundaryConstraintBuilder {}
+impl<F, E> BoundaryConstraintBuilder<F, E> for NullBoundaryConstraintBuilder
+where
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
+    E: IsField + Send + Sync,
+{
 }
 
 /// Helper method to build a single auxiliary trace column for lookups

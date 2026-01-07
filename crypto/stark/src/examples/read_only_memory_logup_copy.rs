@@ -9,7 +9,7 @@ use crate::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
         lookup::{
             AirWithLookup, AuxiliaryColumnBuildData, AuxiliaryTraceBuildData, LookUpPublicInputs,
-            LookupPublicInputsPerAuxColumn,
+            LookupPublicInputsPerAuxColumn, NullBoundaryConstraintBuilder,
         },
         transition::TransitionConstraint,
     },
@@ -351,7 +351,7 @@ pub fn read_only_logup_air<'a, F, E>(
     trace_length: usize,
     pub_inputs: LookUpPublicInputs<F>,
     proof_options: &ProofOptions,
-) -> AirWithLookup<F, E>
+) -> AirWithLookup<F, E, NullBoundaryConstraintBuilder>
 where
     F: IsFFTField + IsSubFieldOf<E> + Send + Sync + 'static,
     E: IsField + Send + Sync + 'static,
