@@ -8,8 +8,8 @@ pub unsafe extern "C" fn _start() -> ! {
     unsafe extern "C" {
         unsafe fn main();
     }
+    init_allocator();
     unsafe {
-        init_allocator();
         main();
         sys_halt();
     }
