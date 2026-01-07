@@ -142,7 +142,7 @@ name = "left_flag"
 
 [[constraints.left_flag]]
 kind = "arith"
-desc = "enforces `left` is `Bit`; cheaper than `IS_BIT<left>`."
+desc = "enforces `left` is `Bit`."
 constraint = "$#`direction` => #`μ` = 1$"
 poly = ["*", "direction", ["not", "μ"]]
 ref = "shift:c:direction_implies_mu"
