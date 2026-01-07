@@ -106,7 +106,7 @@ ref = "lt:c:rhs_msb"
 
 [[constraints.defs]]
 kind = "arith"
-constraint = "$#`lt` = #`signed` dot (A dot (1 - B) + A dot C + (1 - B) dot C) + (1 - #`signed`) dot #`unsigned_lt`$"
+constraint = "$#`lt` = #`signed` dot (A (1 - B) + A C + (1 - B) C) + (1 - #`signed`) dot #`unsigned_lt`$"
 desc = "Where $A = #`lhs_msb`$, $B = #`rhs_msb`$ and $C = #`carry[1]`$"
 poly = ["-", "lt", ["*", "signed", ["+", ["*", "lhs_msb", ["not", "rhs_msb"]], ["*", "lhs_msb", ["idx", "carry", 1]], ["*", ["not", "rhs_msb"], ["idx", "carry", 1]]]], ["*", ["-", 1, "signed"], "unsigned_lt"]]
 ref = "lt:c:lt"
