@@ -9,7 +9,7 @@ desc = "The value being shifted"
 
 [[variables.input]]
 name = "shift"
-type = "BaseField"
+type = "Byte"
 desc = "Number of bits to shift `in` by."
 
 [[variables.input]]
