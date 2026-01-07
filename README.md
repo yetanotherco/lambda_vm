@@ -24,16 +24,14 @@ rustup self uninstall
 ```
 
 ```sh
-git clone https://github.com/rust-lang/rust.git #todo: use our fork
-cd rust && git checkout lambda-vm
+git clone https://github.com/yetanotherco/rust.git
+cd rust
 ```
 Add `bootstrap.toml` file:
 
 ```toml
-# See bootstrap.example.toml for documentation of available options
-#
-profile = "dist"  # Includes one of the default files in src/bootstrap/defaults
-change-id = 149354
+profile = "dist"
+change-id = 149355
 rust.lld = true
 ```
 
