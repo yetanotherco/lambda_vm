@@ -57,26 +57,90 @@ The `SHIFT` chip is comprised of #nr_variables variables that are expressed usin
 == Assumptions
 #render_chip_assumptions(chip, config)
 
+== Explanation
+This chip has a rather complex design as a result of designing it to fit in as few columns possible.
+We briefly discuss the intricacies of the design, attempting to illustrate on its correctness.
+
+The chip's design revolves around a two-phase shifting process:
+1. shift `in` by $#`shift` mod 16$ bits, 
+2. shift that result by $`shift` mod 64$ (or $mod 32$ if $ #`word_instr` = 1$).
+The intermediate value representing the state between the two phases is stored in the scratch variables `X` and `Y`.
+The definition of `shifted` describes how one can combine the `X`, `Y` and `extension` variables to constructed the output value as described using `Half`-limbs.
+The output variable `out` is equivalent to `shifted`, but expressed using `Word`-limbs.
+
+=== First phase
+We zoom in on the first step.
+Here, we make use of the two lookup operations 
+- $#`HWSL[x: Half, y: B4]` := (#`x` #`<<` #`y`) mod 2^16$, and
+- $#`HWSLC[x: Half, y: B4]` := #`x` #`>>` (16-#`y`)$
+Note here that one can use these two lookups to compute `out: Half[4] := in << y` as:
+$
+  #`out[`i#`]` = cases(
+    #`HWSL[in[`0#`], y]` &"if" i = 0,
+    #`HWSL[in[`i#`], y] || HWSLC[in[`i-1#`], y]` &"if" i > 0   
+  )
+$
+as long as $#`y` < 16$.
+Observing that 
+$#`HWSL[x,` 16-#`y]` = (#`x` #`<<` (16-#`y`)) mod 2^16$, and
+$#`HWSLC[x,` 16-#`y]` = #`x` #`>>` #`y`$ for $#`y` in [1, 15]$,
+one can also use these lookups to compute `out := in >> y` as
+$
+  #`out[`i#`]` = cases(
+    #`HWSLC[in[`i#`],` 16-#`y] || HWSL[in[`i+1#`], y]` &"if" i < 3,
+    #`HWSL[in[`3#`],` 16-#`y]` &"if" i = 3
+  )
+$
+as long as $0 < #`y` < 16$.
+
+Observe now that the values being looked up are (almost) only independent from the direction of the shift: only the shift-amount varies slightly.
+When we now define
+$
+  #`bit_shift` := cases(
+    #`shift` mod 16 & "when shifting left",
+    (16-#`shift`) mod 16 & "when shifting right"
+  ),  
+$
+it only takes some rearranging and combining of the values $#`X[`i#`] := HWSL[in[`i#`], bit_shift]`$ and $#`Y[`i#`] := HWSLC[in[`i#`], bit_shift]`$ to form the limbs of $#`in <</>> shift` mod 16$.
+In the exceptional case that `right = 1` and $#`shift` = 0 mod 16$, the limbs of $#`in <</>> shift` mod 16$ simply match those of `in`.
+
+=== Second phase
+Note that, since we're operating on 16-bit limbs, all the limbs in $#`in <</>> shift`$ must also occur somewhere in $#`in <</>> shift` mod 16$.
+The number of full-limbs we still need to shift is determined by the fifth and sixth least significant bit of `shift`.
+With `limb_shift` containing a unary decoding of the integer represented by these two bits, we find that the intermediate value needs to be shifted over by $i$ limbs (to the `left` or `right`) when $#`limb_shift[`i#`]` = 1$.
+These things combined yield `shifted`'s definition.
+
+Of course, when $#`word_instr` = 1$ and, thus, only $#`shift` mod 32$ should be considered, the bit-mask for the lookup constraining `limb_shift` is adjusted appropriately (see @shift:c:limb_shift_lookup).
+
+=== Arithmetic right shift
+Lastly, we discuss the case of performing the _arithmetic_ right shift.
+Here, `extension` is constrained to contain a repetition of `in`'s most significant bit.
+Copies of this variable are used for any full limbs shifted in when $#`right` = #`signed` = 1$.
+Moreover, `X[4]` contains a copy of `extension` shifted over by the right number of bits, to allow the construction of $#`in >>> shift` mod 16$ as the appropriate intermediate.
+
 == Constraints
 First, we constraint `bit_shift` based on whether we are left or right-shifting.
+@shift:c:zbs makes sure `zbs` is set to `1` if and only if `bit_shift = 0`. 
+This flag is used to indicate the special case that $#`right` = 1$ and $#`shift` = 0 mod 16$.
 #render_constraint_table(chip, config, groups: "bit_shift")
 
-Next, we apply shift the limbs of `in` left and right, storing them in `X` and `Y` respectively.
-When `right`-shifting and `bit_shift = 0`, the output is incorrect.
-As such, we override `Y[i] := in[i]` and `X[i] := 0`.
+Next, we shift the limbs of `in` left and right by the appropriate amount, storing the results in `X` and `Y` respectively.
+When `zbs = 1`, the output cannot be used to compose $#`in >>/>>> shift` mod 16$.
+To resolve this, we override `Y[i] := in[i]` and `X[i] := 0` in this case.
 
-The case of `left`-shifting and `bit_shift = 0` will be used for padding rows.
-To prevent unnecessary lookups in padding rows, we also override `X[i] := in[i]` and `Y[i] := 0` in this case.
+The case of `left`-shifting and $#`bit_shift` = 0$ will be used for padding rows.
+To prevent unnecessary lookups in padding rows, we override $#`X[i]` := #`in[i]`$ and $#`Y[i]` := 0$ here.
 #render_constraint_table(chip, config, groups: "intra_limb_shift")
 
 === Full-limb shifting
-Lastly, `X` and `Y` are combined in the right way to form the limbs of `output`.
+Next, we only have to constrain that `limb_shift` is a proper unary encoding of the fifth (and sixth if `word_instr = 0`) bit of `shift`.
+Hereafter, one must only check that `out` is the proper cast of `shifted` into a `DWordWL`.
 #render_constraint_table(chip, config, groups: "limb_shifting")
 
 === Miscellaneous 
-To make sure `left` is actually a `Bit`, we introduce constraint @shift:c:direction_implies_mu.
-#render_constraint_table(chip, config, groups: "left_flag")
-#render_constraint_table(chip, config, groups: "is_negative")
+#render_constraint_table(chip, config, groups: ("left_flag", "is_negative"))
+*Note*: `is_negative` is not used when `signed = 0`.
+As such, there is no problem with it being unconstrained in this case.
 
 === Lookups
 This chip adds the following interaction to the lookup.
