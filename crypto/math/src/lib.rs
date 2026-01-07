@@ -18,3 +18,6 @@ pub mod fft;
 pub mod msm;
 #[cfg(feature = "alloc")]
 pub mod polynomial;
+
+#[cfg(test)]
+pub mod tests;
