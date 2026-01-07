@@ -14,7 +14,52 @@ use crate::{
     traits::TransitionEvaluationContext,
 };
 
-/// Struct representing AIR content with the generic L identifying individual Air behaviour
+// struct LookupConstraint<F: IsFFTField + IsSubFieldOf<E> + Send + Sync, E: IsField + Send + Sync, PI>
+// {
+//     column_a: usize,
+//     column_b: usize,
+//     phantom: PhantomData<(F, E, PI)>,
+// }
+
+// impl<F: IsFFTField + IsSubFieldOf<E> + Send + Sync, E: IsField + Send + Sync, PI>
+//     LookupConstraint<F, E, PI>
+// {
+//     expand_trace -> generar columna auxiliar en ambas tablas (simil build_auxiliary_constraint)
+//     add_constraints -> genera las transition constraints
+//     get_boundary_constraint (public value) -> boundary constraint que genera los public values
+//     check_public_values -> verifier checkea ambos public values
+//     fn build_auxiliary_trace();
+// }
+
+// trait AirWithLookup {
+//     add_transition_constraints()
+//     add_boundary()
+// }
+
+// impl AIR for AirWithLookup {
+//     build_auxiliary_trace(),
+//     add_transition_constraints()
+
+// }
+
+// struct MyAIR {
+//     transition_constrainsts
+// }
+
+// al multi-verify pasarle que indices de public values y de que tablas checkear
+//
+// Potential solutions
+//
+// * Trait AirWithLookup that implements AIR -> yields conflicting impl with other AIR implementations
+// * Struct LookupAIRWrapper<A: AIR> that implements AIR and adds the lookup constraints to already existing air -> we cannot add transition constraints to the underlying air
+// nor can we add them on `transition_constraints()` method as it returns a reference
+// * Don't fully automatize it but add helper functions to aid the process: aka functions to define transition & boundary constraints common to all lookup airs
+//
+//
+// Por que AIR es un trait y no un struct? Todos los implementors tienen los mismos fields (context, trace_lengh, inputs, constraints)
+// Capaz podriamos separar los fields del air de su behaviour quedando algo mas sencillo:
+//
+//
 pub struct Air<
     L: AirLogic<F, E>,
     PI,
@@ -30,7 +75,6 @@ pub struct Air<
     pub logic: L,
 }
 
-/// Trait containing inidivial AIR behaviour
 pub trait AirLogic<F: IsFFTField + IsSubFieldOf<E> + Send + Sync, E: IsField + Send + Sync> {
     fn build_auxiliary_trace(
         &self,
@@ -45,10 +89,16 @@ pub trait AirLogic<F: IsFFTField + IsSubFieldOf<E> + Send + Sync, E: IsField + S
     ) -> Vec<FieldElement<E>> {
         vec![]
     }
-    fn boundary_constraints(&self, _rap_challenges: &[FieldElement<E>]) -> BoundaryConstraints<E> {
+    fn boundary_constraints(&self, rap_challenges: &[FieldElement<E>]) -> BoundaryConstraints<E> {
         BoundaryConstraints::from_constraints(vec![])
     }
 }
+//
+// Y en lugar de tener diferentes structs que implementan AIR tendriamos funciones que crean AIRS con distintas constraints y logicas
+// Los metodos default de AIR que no usamos pasarian a ser metodos de struct Air
+// Ya no es necesario tener un new comun a todos los AIR porque nuestros prove y verify reciben un air
+// Esto nos da mas flexibilidad y nos permite hacer el wrapper de lookups ya que podemos modificar y agregarle constraints al air
+//
 
 impl<L, PI, F, E> crate::traits::AIR for Air<L, PI, F, E>
 where
@@ -68,15 +118,13 @@ where
     }
 
     fn new(
-        _trace_length: usize,
-        _pub_inputs: &Self::PublicInputs,
-        _proof_options: &crate::proof::options::ProofOptions,
+        trace_length: usize,
+        pub_inputs: &Self::PublicInputs,
+        proof_options: &crate::proof::options::ProofOptions,
     ) -> Self
     where
         Self: Sized,
     {
-        // Each individual Air should implement their own constructor
-        // ie: instead of using BitFlagAir::new we should use new_bitflag_air() -> Air
         unreachable!("THIS SHOULD NO LONGER BE USED")
     }
 
@@ -135,17 +183,11 @@ where
     F: IsFFTField + IsSubFieldOf<E> + Send + Sync + 'static,
     E: IsField + Send + Sync + 'static,
 {
-    /// Transform a regular Air into a LookUpAir by adding the common LookUp behaviour to it.
-    /// Logic added:
-    /// - Transition constraints: based off of `columns` argument
-    /// - Auxiliary trace build logic: based off of `auxiliary_trace_build_data`. This also asumes the AIR has no previous auxiliary trace build logic, this could be changed if needed
-    /// - Boundary Constraints: ???
     pub fn into_lookup(
         mut self,
         columns: PermutationColumns, // TODO: Could we infer these columns from the aux build data?
         auxiliary_trace_build_data: AuxiliaryTraceBuildData,
     ) -> Air<LookUpAirLogicWrapper<L, F, E>, PI, F, E> {
-        // PermutationConstraint being used as placeholder
         self.transition_constraints
             .push(Box::new(PermutationConstraint::<F, E>::new(columns)));
         Air {
@@ -164,7 +206,6 @@ where
     }
 }
 
-/// A wrapper for Air logic which extends the received AirLogic with generic LookUp behaviour
 pub struct LookUpAirLogicWrapper<L, F, E>
 where
     L: AirLogic<F, E> + Send + Sync,
@@ -183,20 +224,26 @@ where
     E: IsField + Send + Sync + 'static,
 {
     fn build_auxiliary_trace(&self, trace: &mut TraceTable<F, E>, challenges: &[FieldElement<E>]) {
-        // Ignores build_auxiliary_trace logic from wrapped air (assumption: only lookups use auxiliary columns)
-        // Uses the same challenges for all auxiliary columns (We should use the same challenges for auxiliary columns used for lookups between table pairs, the first solution was to use the same rap challenges for all auxilary columns across tables, we need to checkk if this is safe)
+        //L::build_auxiliary_trace(trace, challenges); not gonna be used
+        // TODO: Add common lookup auxiliary trace logic
+        // I NEED TO KNOW:
+        // for each aux column:
+        // - What will its index be (maybe)
+        // - Which columns make up the flags
+        // - Which columns make up the values
         for (aux_column_idx, aux_column_build_data) in &self.auxiliary_trace_build_data.columns {
             build_auxiliary_trace_column(*aux_column_idx, aux_column_build_data, trace, challenges);
         }
     }
 
-    // TODO: remove from trait and sample them in prove
     fn build_rap_challenges(
         &self,
         transcript: &mut dyn IsStarkTranscript<E, F>,
     ) -> Vec<FieldElement<E>> {
-        // Assumption: only lookups use aux trace, only lookups use rap challenges, logic from wrapped air is ignores
-        // This method shall be removed and rap challenges shall be sampled only once for all airs in prove methdod after comitting
+        // Do we need more rap challneges for the added boundary constraints??\
+        // We will only use rap challenges for building auxiliary trace, not for anything else
+        // We must use the same rap challenges for all tables
+        // This method shall be removed and rap challenges shall be sampled only once for all airs in prove methdo AFTER COMITTING!!!
         vec![]
     }
     fn boundary_constraints(&self, rap_challenges: &[FieldElement<E>]) -> BoundaryConstraints<E> {
@@ -207,18 +254,15 @@ where
     }
 }
 
-/// Struct representing how each lookup air should build its auxiliary columns
 pub struct AuxiliaryTraceBuildData {
     pub columns: Vec<(usize, AuxiliaryColumnBuildData)>,
 }
 
-/// Struct representing how to build a given auxiliary column
 pub struct AuxiliaryColumnBuildData {
     pub flag_columns: Vec<usize>,
     pub value_columns: Vec<usize>,
 }
 
-/// Helper method to build a single auxiliary trace column for lookups
 fn build_auxiliary_trace_column<F, E>(
     aux_column_idx: usize,
     aux_column_build_data: &AuxiliaryColumnBuildData,
@@ -271,8 +315,102 @@ fn build_auxiliary_trace_column<F, E>(
     }
 }
 
-// Placeholder constraint, not the one used for lookups
-//
+// Impl (failing) of wrapper solution
+// use std::marker::PhantomData;
+
+// use math::field::{
+//     element::FieldElement,
+//     traits::{IsFFTField, IsField, IsSubFieldOf},
+// };
+
+// use crate::{
+//     constraints::transition::TransitionConstraint,
+//     context::AirContext,
+//     traits::{AIR, TransitionEvaluationContext},
+// };
+
+// /// Wrapper for AIRS using lookups
+// /// PR
+// pub struct LookupAIRWrapper<A>
+// where
+//     A: AIR,
+// {
+//     air: A,
+// }
+
+// impl<A> AIR for LookupAIRWrapper<A>
+// where
+//     A: AIR,
+// {
+//     type Field = A::Field;
+
+//     type FieldExtension = A::FieldExtension;
+
+//     type PublicInputs = A::PublicInputs;
+
+//     fn step_size(&self) -> usize {
+//         self.air.step_size()
+//     }
+
+//     fn new(
+//         trace_length: usize,
+//         pub_inputs: &Self::PublicInputs,
+//         proof_options: &crate::proof::options::ProofOptions,
+//     ) -> Self
+//     where
+//         Self: Sized,
+//     {
+//         Self {
+//             air: A::new(trace_length, pub_inputs, proof_options),
+//         }
+//     }
+
+//     fn trace_layout(&self) -> (usize, usize) {
+//         self.air.trace_layout() //TODO: check if we need to modify
+//     }
+
+//     fn composition_poly_degree_bound(&self) -> usize {
+//         self.air.composition_poly_degree_bound() //TODO: check if we need to modify
+//     }
+
+//     fn boundary_constraints(
+//         &self,
+//         rap_challenges: &[FieldElement<Self::FieldExtension>],
+//     ) -> super::boundary::BoundaryConstraints<Self::FieldExtension> {
+//         let mut constraints = self.air.boundary_constraints(rap_challenges);
+//         // TODO: add boundary constraints here
+//         constraints
+//     }
+
+//     fn context(&self) -> &AirContext {
+//         self.air.context()
+//     }
+
+//     fn trace_length(&self) -> usize {
+//         self.air.trace_length()
+//     }
+
+//     fn pub_inputs(&self) -> &Self::PublicInputs {
+//         self.air.pub_inputs()
+//     }
+
+//     fn transition_constraints(
+//         &self,
+//     ) -> &Vec<Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>> {
+//         let mut tc: Vec<Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>> = vec![];
+//         // TODO: add constraints
+//         tc.push(Box::new(PermutationConstraint::new(PermutationColumns {
+//             a: 0,
+//             v: 0,
+//             a_s: 0,
+//             v_s: 0,
+//             m: 0,
+//         })));
+//         tc.extend(self.air.transition_constraints().into_iter().cloned());
+//         &tc
+//     }
+// }
+
 // Transition constraint that ensures that the sorted columns are a permutation of the original ones.
 /// We are using the LogUp construction described in:
 /// <https://0xpolygonmiden.github.io/miden-vm/design/lookups/logup.html>.
