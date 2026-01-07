@@ -1,3 +1,5 @@
+pub mod bls12_381_tests;
+pub mod bn_254_tests;
 pub mod extensions_cubic_tests;
 pub mod extensions_quadratic_tests;
 pub mod fft_friendly_babybear_tests;
@@ -11,7 +13,9 @@ pub mod fft_friendly_u64_goldilocks_tests;
 pub mod fft_tests;
 pub mod field_element_tests;
 pub mod montgomery_backed_prime_fields_tests;
+pub mod msm_tests;
 pub mod polynomial_tests;
+pub mod short_weierstrass_point_tests;
 pub mod u64_prime_field_tests;
 pub mod unsigned_integer_montgomery_tests;
 pub mod unsigned_integer_u256_tests;
