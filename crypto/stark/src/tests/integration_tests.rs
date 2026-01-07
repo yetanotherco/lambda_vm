@@ -349,7 +349,7 @@ fn test_multi_prove_fib_3_tables() {
     let air_2 = FibonacciAIR::new(16, &pub_inputs_2, &proof_options);
     let air_3 = FibonacciAIR::new(32, &pub_inputs_3, &proof_options);
 
-    let mut airs: Vec<(
+    let airs: Vec<(
         &dyn AIR<
             Field = Stark252PrimeField,
             FieldExtension = Stark252PrimeField,
@@ -361,7 +361,7 @@ fn test_multi_prove_fib_3_tables() {
         (&air_2, &mut trace_2),
         (&air_3, &mut trace_3),
     ];
-    let proofs = Prover::multi_prove(&mut airs, &mut StoneProverTranscript::new(&[])).unwrap();
+    let proofs = Prover::multi_prove(airs, &mut StoneProverTranscript::new(&[])).unwrap();
 
     let airs_and_proofs: Vec<(
         &dyn AIR<
@@ -457,7 +457,7 @@ fn test_multi_prove_2_tables_small_field() {
         &proof_options,
     );
 
-    let mut airs: Vec<(
+    let airs: Vec<(
         &dyn AIR<
             Field = Babybear31PrimeField,
             FieldExtension = Degree4BabyBearExtensionField,
@@ -467,7 +467,7 @@ fn test_multi_prove_2_tables_small_field() {
     )> = vec![(&air_1, &mut trace_1), (&air_2, &mut trace_2)];
 
     let proofs = Prover::multi_prove(
-        &mut airs,
+        airs,
         &mut DefaultTranscript::<Degree4BabyBearExtensionField>::new(&[]),
     )
     .unwrap();
@@ -496,12 +496,12 @@ fn test_multi_prove_different_airs() {
     let air_1 = DummyAIR::new(trace_1.num_rows(), &(), &proof_options);
     let air_2 = BitFlagsAIR::new(trace_2.num_rows(), &(), &proof_options);
 
-    let mut airs: Vec<(
+    let airs: Vec<(
         &dyn AIR<Field = Stark252PrimeField, FieldExtension = Stark252PrimeField, PublicInputs = ()>,
         &mut _,
     )> = vec![(&air_1, &mut trace_1), (&air_2, &mut trace_2)];
 
-    let proofs = Prover::multi_prove(&mut airs, &mut StoneProverTranscript::new(&[])).unwrap();
+    let proofs = Prover::multi_prove(airs, &mut StoneProverTranscript::new(&[])).unwrap();
 
     let airs_and_proofs: Vec<(
         &dyn AIR<Field = Stark252PrimeField, FieldExtension = Stark252PrimeField, PublicInputs = ()>,

@@ -892,7 +892,7 @@ pub trait IsStarkProver<
     ///
     /// Warning: the transcript must be safely initialized before passing it to this method.
     fn multi_prove(
-        airs: &mut [AirAndTrace<'_, Field, FieldExtension, PI>],
+        mut airs: Vec<AirAndTrace<'_, Field, FieldExtension, PI>>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
     ) -> Result<Vec<StarkProof<Field, FieldExtension>>, ProvingError>
     where
@@ -939,8 +939,8 @@ pub trait IsStarkProver<
         FieldExtension: IsFFTField,
         PI: Send + Sync,
     {
-        let mut airs = [(air, trace)];
-        Self::multi_prove(&mut airs, transcript).map(|mut proofs| proofs.remove(0))
+        let airs = vec![(air, trace)];
+        Self::multi_prove(airs, transcript).map(|mut proofs| proofs.remove(0))
     }
 
     // FIXME remove unwrap() calls and return errors
