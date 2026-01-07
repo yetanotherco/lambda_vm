@@ -33,7 +33,7 @@ desc = "Whether this is a Word-instruction (1) or not (0)."
 [[variables.output]]
 name = "shifted"
 type = "DWordHL"
-desc = "`in <</>> (shift % 64)`"
+desc = "$#`in <</>>/>>>` (#`shift` mod 32 dot (2 - #`word_instr`))$"
 
 
 # Auxiliary
