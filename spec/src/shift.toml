@@ -31,10 +31,9 @@ desc = "Whether this is a Word-instruction (1) or not (0)."
 # Output
 
 [[variables.output]]
-name = "shifted"
-type = "DWordHL"
+name = "out"
+type = "DWordWL"
 desc = "$#`in <</>>/>>>` (#`shift` mod 32 dot (2 - #`word_instr`))$"
-
 
 # Auxiliary
 
@@ -102,6 +101,12 @@ name = "intra_limb_right"
 type = "DWordHL"
 desc = "`in >>> (shift % 16)` if `right` and `signed`;\\ `in >> (shift % 16)` if `right` and `!signed`"
 def = {idx="i", range=[0, 3], poly=["+", ["idx", "Y", "i"], ["idx", "X", ["+", "i", 1]]]}
+
+[[variables.virtual]]
+name = "shifted"
+type = "DWordHL"
+desc = "$#`in <</>>/>>>` (#`shift` mod 32 dot (2 - #`word_instr`))$"
+def = {idx="i", range=[0, 3], poly=["+", ["*", "left", ["sum", ["=", "j", 0], "i", ["*", ["idx", "limb_shift", "j"], ["idx", "intra_limb_left", ["-", "i", "j"]]]]], ["*", "right", ["+", ["sum", ["=", "j", 0], ["-", 3, "i"], ["*", ["idx", "limb_shift", "j"], ["idx", "intra_limb_right", ["+", "i", "j"]]]], ["*", "extension", ["sum", ["=", "j", ["-", 3, "i"]], 3, ["idx", "limb_shift", "j"]]]]]]}
 
 # Multiplicities
 
@@ -257,9 +262,10 @@ multiplicity = "μ"
 
 [[constraints.limb_shifting]]
 kind = "arith"
-constraint = "$#`shifted[i]` = #`left` dot sum_(j=0)^i #`limb_shift[j]` dot #`intra_limb_left[i-j]` + #`right` dot (sum_(j=0)^(3-i) #`limb_shift[j]` dot #`intra_limb_right[i+j]` + #`extension` dot sum_(j=3-i)^3 #`limb_shift[j]`)$"
-poly = ["-", ["idx", "shifted", "i"], ["+", ["*", "left", ["sum", ["=", "j", 0], "i", ["*", ["idx", "limb_shift", "j"], ["idx", "intra_limb_left", ["-", "i", "j"]]]]], ["*", "right", ["+", ["sum", ["=", "j", 0], ["-", 3, "i"], ["*", ["idx", "limb_shift", "j"], ["idx", "intra_limb_right", ["+", "i", "j"]]]], ["*", "extension", ["sum", ["=", "j", ["-", 3, "i"]], 3, ["idx", "limb_shift", "j"]]]]]]]
-range = ["i", 0, 3]
+constraint = "$#`out[:2]` = #`shifted[:4]`$"
+poly = ["-", ["idx", "out", "i"], ["idx", ["cast", "shifted", "DWordWL"], "i"]]
+range = ["i", 0, 1]
+ref = "shift:c:out_eq_shifted"
 
 
 # Lookups
@@ -271,6 +277,6 @@ name = "lookups"
 kind = "interaction"
 tag = "SHIFT"
 input = ["in", "shift", "direction", "signed", "word_instr"]
-output = "shifted"
+output = "out"
 multiplicity = "-μ"
 ref = "shift:c:lookup"
