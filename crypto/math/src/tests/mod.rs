@@ -1,4 +1,8 @@
 pub mod fft_friendly_babybear_tests;
+pub mod fft_friendly_babybear_u32_tests;
+pub mod fft_friendly_extensions_goldilocks_tests;
 pub mod fft_friendly_quadratic_babybear_tests;
+pub mod fft_friendly_quartic_babybear_tests;
+pub mod fft_friendly_quartic_babybear_u32_tests;
 pub mod fft_friendly_stark_252_tests;
 pub mod fft_friendly_u64_goldilocks_tests;
