@@ -172,7 +172,7 @@ name = "bit_shift"
 [[constraints.bit_shift]]
 kind = "interaction"
 tag = "AND_BYTE"
-input = ["shift", "0x0F"]
+input = ["shift", 0x0F]
 output = "bit_shift"
 ref = "shift:c:bit_shift_if_left"
 multiplicity = "left"
@@ -180,7 +180,7 @@ multiplicity = "left"
 [[constraints.bit_shift]]
 kind = "interaction"
 tag = "AND_BYTE"
-input = [["-", ["^", 2, 8], "shift"], "0x0F"]
+input = [["-", ["^", 2, 8], "shift"], 0x0F]
 output = "bit_shift"
 ref = "shift:c:bit_shift_if_right"
 multiplicity = "right"
@@ -250,7 +250,7 @@ name = "limb_shifting"
 [[constraints.limb_shifting]]
 kind = "interaction"
 tag = "AND_BYTE"
-input = ["shift", ["+", "0x10", ["*", "0x20", ["not", "word_instr"]]]]
+input = ["shift", ["-", 0x30, ["*", 0x20, "word_instr"]]]
 output = ["+", ["-", 1, ["idx", "limb_shift", 0]], ["*", 15, ["idx", "limb_shift", 1]], ["*", 31, ["idx", "limb_shift", 2]], ["*", 47, ["idx", "limb_shift", 3]]]
 ref = "shift:c:limb_shift_lookup"
 multiplicity = "μ"
