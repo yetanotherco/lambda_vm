@@ -120,7 +120,7 @@ impl ShortWeierstrassProjectivePoint<BLS12381TwistCurve> {
     /// - This function assumes `self` is a valid point on the BLS12-381 **twist** curve.
     /// - The conjugation operation preserves validity.
     /// - `unwrap()` is used because `psi()` is defined to **always return a valid point**.
-    fn psi(&self) -> Self {
+    pub fn psi(&self) -> Self {
         let [x, y, z] = self.coordinates();
         // SAFETY:
         // - `conjugate()` preserves the validity of the field element.
