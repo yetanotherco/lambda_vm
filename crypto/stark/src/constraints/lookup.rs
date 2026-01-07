@@ -71,16 +71,24 @@ pub struct Air<
     pub pub_inputs: PI,
     pub step_size: usize,
     pub transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
-    pub logic: PhantomData<L>,
+    pub logic: L,
 }
 
 pub trait AirLogic<F: IsFFTField + IsSubFieldOf<E> + Send + Sync, E: IsField + Send + Sync> {
-    fn build_auxiliary_trace(_trace: &mut TraceTable<F, E>, _challenges: &[FieldElement<E>]) {}
+    fn build_auxiliary_trace(
+        &self,
+        _trace: &mut TraceTable<F, E>,
+        _challenges: &[FieldElement<E>],
+    ) {
+    }
 
-    fn build_rap_challenges(_transcript: &mut dyn IsStarkTranscript<E, F>) -> Vec<FieldElement<E>> {
+    fn build_rap_challenges(
+        &self,
+        _transcript: &mut dyn IsStarkTranscript<E, F>,
+    ) -> Vec<FieldElement<E>> {
         vec![]
     }
-    fn boundary_constraints(_rap_challenges: &[FieldElement<E>]) -> BoundaryConstraints<E> {
+    fn boundary_constraints(&self, rap_challenges: &[FieldElement<E>]) -> BoundaryConstraints<E> {
         BoundaryConstraints::from_constraints(vec![])
     }
 }
@@ -131,7 +139,7 @@ where
         &self,
         rap_challenges: &[FieldElement<Self::FieldExtension>],
     ) -> BoundaryConstraints<Self::FieldExtension> {
-        L::boundary_constraints(rap_challenges)
+        self.logic.boundary_constraints(rap_challenges)
     }
 
     fn context(&self) -> &AirContext {
@@ -157,14 +165,14 @@ where
         main_trace: &mut TraceTable<Self::Field, Self::FieldExtension>,
         rap_challenges: &[FieldElement<Self::FieldExtension>],
     ) {
-        L::build_auxiliary_trace(main_trace, rap_challenges);
+        self.logic.build_auxiliary_trace(main_trace, rap_challenges);
     }
 
     fn build_rap_challenges(
         &self,
         transcript: &mut dyn IsStarkTranscript<Self::FieldExtension, Self::Field>,
     ) -> Vec<FieldElement<Self::FieldExtension>> {
-        L::build_rap_challenges(transcript)
+        self.logic.build_rap_challenges(transcript)
     }
 }
 
@@ -177,6 +185,7 @@ where
     pub fn into_lookup(
         mut self,
         columns: PermutationColumns,
+        auxiliary_trace_build_data: AuxiliaryTraceBuildData,
     ) -> Air<LookUpAirLogicWrapper<L, F, E>, PI, F, E> {
         self.transition_constraints
             .push(Box::new(PermutationConstraint::<F, E>::new(columns)));
@@ -186,7 +195,11 @@ where
             pub_inputs: self.pub_inputs,
             step_size: self.step_size,
             transition_constraints: self.transition_constraints,
-            logic: PhantomData::<LookUpAirLogicWrapper<L, F, E>>,
+            logic: LookUpAirLogicWrapper {
+                auxiliary_trace_build_data,
+                logic: self.logic,
+                phantom: PhantomData::<(F, E)>,
+            },
         }
     }
 }
@@ -197,7 +210,9 @@ where
     F: IsFFTField + IsSubFieldOf<E> + Send + Sync + 'static,
     E: IsField + Send + Sync + 'static,
 {
-    phanton: PhantomData<(L, F, E)>,
+    auxiliary_trace_build_data: AuxiliaryTraceBuildData,
+    logic: L,
+    phantom: PhantomData<(F, E)>,
 }
 
 impl<L, F, E> AirLogic<F, E> for LookUpAirLogicWrapper<L, F, E>
@@ -206,8 +221,8 @@ where
     F: IsFFTField + IsSubFieldOf<E> + Send + Sync + 'static,
     E: IsField + Send + Sync + 'static,
 {
-    fn build_auxiliary_trace(trace: &mut TraceTable<F, E>, challenges: &[FieldElement<E>]) {
-        L::build_auxiliary_trace(trace, challenges);
+    fn build_auxiliary_trace(&self, trace: &mut TraceTable<F, E>, challenges: &[FieldElement<E>]) {
+        //L::build_auxiliary_trace(trace, challenges); not gonna be used
         // TODO: Add common lookup auxiliary trace logic
         // I NEED TO KNOW:
         // for each aux column:
@@ -216,19 +231,31 @@ where
         // - Which columns make up the values
     }
 
-    fn build_rap_challenges(transcript: &mut dyn IsStarkTranscript<E, F>) -> Vec<FieldElement<E>> {
-        L::build_rap_challenges(transcript)
+    fn build_rap_challenges(
+        &self,
+        transcript: &mut dyn IsStarkTranscript<E, F>,
+    ) -> Vec<FieldElement<E>> {
         // Do we need more rap challneges for the added boundary constraints??\
         // We will only use rap challenges for building auxiliary trace, not for anything else
         // We must use the same rap challenges for all tables
         // This method shall be removed and rap challenges shall be sampled only once for all airs in prove methdo AFTER COMITTING!!!
+        vec![]
     }
-    fn boundary_constraints(rap_challenges: &[FieldElement<E>]) -> BoundaryConstraints<E> {
-        let mut boundary_constraints = L::boundary_constraints(rap_challenges);
+    fn boundary_constraints(&self, rap_challenges: &[FieldElement<E>]) -> BoundaryConstraints<E> {
+        let mut boundary_constraints = self.logic.boundary_constraints(rap_challenges);
         // TODO: Add boundary constraints
         // Are these constraints dependant on the columns we use? aka do they differ between each lookup table?
         boundary_constraints
     }
+}
+
+pub struct AuxiliaryTraceBuildData {
+    columns: Vec<(usize, AuxiliaryColumnBuildData)>,
+}
+
+pub struct AuxiliaryColumnBuildData {
+    pub flag_columns: Vec<usize>,
+    pub value_columns: Vec<usize>,
 }
 
 // Impl (failing) of wrapper solution
