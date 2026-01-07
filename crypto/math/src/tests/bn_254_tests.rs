@@ -77,6 +77,46 @@ mod field_extension_tests {
         let a = FpE::from(3);
         assert_eq!(a.pow(BN254_PRIME_FIELD_ORDER), a);
     }
+
+    #[test]
+    fn mul_fp2_by_nonresidue2_is_correct() {
+        use crate::elliptic_curve::short_weierstrass::curves::bn_254::field_extension::{
+            LevelTwoResidue, mul_fp2_by_nonresidue,
+        };
+        use crate::field::extensions::quadratic::HasQuadraticNonResidue;
+
+        let a = Fp2E::new([FpE::from(2), FpE::from(4)]);
+        assert_eq!(
+            &a * <LevelTwoResidue as HasQuadraticNonResidue<Degree2ExtensionField>>::residue(),
+            mul_fp2_by_nonresidue(&a)
+        )
+    }
+
+    #[test]
+    fn sparse_fp12_mul_multiplies_correctly() {
+        use crate::elliptic_curve::short_weierstrass::curves::bn_254::field_extension::sparse_fp12_mul;
+
+        let a = Fp12E::new([Fp6E::from(2), Fp6E::from(3)]);
+        let b = Fp12E::new([
+            Fp6E::new([Fp2E::from(4), Fp2E::zero(), Fp2E::zero()]),
+            Fp6E::new([Fp2E::from(2), Fp2E::from(5), Fp2E::zero()]),
+        ]);
+        assert_eq!(sparse_fp12_mul(&a, &b), a * b)
+    }
+
+    #[test]
+    fn mul_fp6_by_nonresidue_is_correct() {
+        use crate::elliptic_curve::short_weierstrass::curves::bn_254::field_extension::{
+            LevelThreeResidue, mul_fp6_by_nonresidue,
+        };
+        use crate::field::extensions::quadratic::HasQuadraticNonResidue;
+
+        let a = Fp6E::from(3);
+        assert_eq!(
+            mul_fp6_by_nonresidue(&a),
+            a * <LevelThreeResidue as HasQuadraticNonResidue<Degree6ExtensionField>>::residue()
+        )
+    }
 }
 
 #[cfg(test)]
@@ -257,6 +297,16 @@ mod curve_tests {
         expected = expected.conjugate();
         assert_eq!(a, expected);
     }
+
+    #[test]
+    fn apply_12_times_phi_is_identity() {
+        let q = BN254TwistCurve::generator();
+        let mut result = q.phi();
+        for _ in 1..12 {
+            result = result.phi();
+        }
+        assert_eq!(q, result)
+    }
 }
 
 #[cfg(test)]
@@ -386,6 +436,74 @@ mod compression_tests {
         let mut input_bytes: [u8; 65] = [0; 65];
         let result = BN254Curve::decompress_g2_point(&mut input_bytes);
         assert!(result.is_err());
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn g2_compress_decompress_is_identity_3() {
+        use crate::elliptic_curve::traits::FromAffine;
+        use crate::unsigned_integer::element::U256;
+
+        let g = G2Point::from_affine(
+            Fp2E::new([
+                FpE::new(U256::from_hex_unchecked(
+                    "1800deef121f1e76426a00665e5c4479674322d4f75edadd46debd5cd992f6ed",
+                )),
+                FpE::new(U256::from_hex_unchecked(
+                    "198e9393920d483a7260bfb731fb5d25f1aa493335a9e71297e485b7aef312c2",
+                )),
+            ]),
+            Fp2E::new([
+                FpE::new(U256::from_hex_unchecked(
+                    "12c85ea5db8c6deb4aab71808dcb408fe3d1e7690c43d37b4ce6cc0166fa7daa",
+                )),
+                FpE::new(U256::from_hex_unchecked(
+                    "090689d0585ff075ec9e99ad690c3395bc4b313370b38ef355acdadcd122975b",
+                )),
+            ]),
+        )
+        .unwrap();
+
+        let mut compressed_g_slice: [u8; 64] = BN254Curve::compress_g2_point(&g);
+
+        let decompressed_g = BN254Curve::decompress_g2_point(&mut compressed_g_slice).unwrap();
+
+        assert_eq!(g, decompressed_g);
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn g2_compress_decompress_is_identity_4() {
+        use crate::elliptic_curve::traits::FromAffine;
+        use crate::unsigned_integer::element::UnsignedInteger;
+
+        let g = G2Point::from_affine(
+            Fp2E::new([
+                FpE::new(crate::unsigned_integer::element::U256::from_hex_unchecked(
+                    "3010c68cb50161b7d1d96bb71edfec9880171954e56871abf3d93cc94d745fa1",
+                )),
+                FpE::new(crate::unsigned_integer::element::U256::from_hex_unchecked(
+                    "0476be093a6d2b4bbf907172049874af11e1b6267606e00804d3ff0037ec57fd",
+                )),
+            ]),
+            Fp2E::new([
+                FpE::new(crate::unsigned_integer::element::U256::from_hex_unchecked(
+                    "01b33461f39d9e887dbb100f170a2345dde3c07e256d1dfa2b657ba5cd030427",
+                )),
+                FpE::new(crate::unsigned_integer::element::U256::from_hex_unchecked(
+                    "14c059d74e5b6c4ec14ae5864ebe23a71781d86c29fb8fb6cce94f70d3de7a21",
+                )),
+            ]),
+        )
+        .unwrap();
+        // calculate g point operate with itself
+        let g_2 = g.operate_with_self(UnsignedInteger::<4>::from("2"));
+
+        let mut compressed_g2_slice: [u8; 64] = BN254Curve::compress_g2_point(&g_2);
+
+        let decompressed_g2 = BN254Curve::decompress_g2_point(&mut compressed_g2_slice).unwrap();
+
+        assert_eq!(g_2, decompressed_g2);
     }
 }
 

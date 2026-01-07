@@ -253,6 +253,17 @@ mod pairing_tests {
     }
 
     #[test]
+    fn test_double_accumulate_line_doubles_point_correctly_2() {
+        let g1 = BLS12381Curve::generator();
+        let g2 = BLS12381TwistCurve::generator();
+        let mut r = g2.clone();
+        let mut f = FieldElement::one();
+        double_accumulate_line(&mut r, &g1, &mut f);
+        let expected_r = g2.operate_with(&g2);
+        assert_eq!(r.to_affine(), expected_r.to_affine());
+    }
+
+    #[test]
     fn test_add_accumulate_line_adds_points_correctly() {
         let g1 = BLS12381Curve::generator();
         let g = BLS12381TwistCurve::generator();
@@ -562,6 +573,77 @@ mod compression_tests {
             BLS12381Curve::decompress_g2_point(&mut compressed_g_neg_slice).unwrap();
 
         assert_eq!(g_neg, decompressed_g_neg);
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn test_compress_g2() {
+        use crate::{
+            elliptic_curve::short_weierstrass::{
+                curves::bls12_381::{
+                    field_extension::Degree2ExtensionField, twist::BLS12381TwistCurve,
+                },
+                traits::Compress,
+            },
+            field::element::FieldElement,
+        };
+
+        // Valid G2 point coordinates:
+        let x_0 = BLS12381FieldElement::from_hex_unchecked("02");
+        let x_1 = BLS12381FieldElement::from_hex_unchecked("0");
+        let y_0 = BLS12381FieldElement::from_hex_unchecked(
+            "013a59858b6809fca4d9a3b6539246a70051a3c88899964a42bc9a69cf9acdd9dd387cfa9086b894185b9a46a402be73",
+        );
+        let y_1 = BLS12381FieldElement::from_hex_unchecked(
+            "02d27e0ec3356299a346a09ad7dc4ef68a483c3aed53f9139d2f929a3eecebf72082e5e58c6da24ee32e03040c406d4f",
+        );
+
+        let x: FieldElement<Degree2ExtensionField> = FieldElement::new([x_0, x_1]);
+        let y: FieldElement<Degree2ExtensionField> = FieldElement::new([y_0, y_1]);
+
+        let point = BLS12381TwistCurve::create_point_from_affine(x, y).unwrap();
+
+        let compress_point = BLS12381Curve::compress_g2_point(&point);
+
+        let mut valid_compressed_point = [0_u8; 96];
+        valid_compressed_point[0] |= 1 << 7;
+        valid_compressed_point[95] |= 1 << 1;
+
+        assert_eq!(compress_point, valid_compressed_point);
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn test_decompress_g2() {
+        use crate::{
+            elliptic_curve::short_weierstrass::curves::bls12_381::{
+                field_extension::Degree2ExtensionField, twist::BLS12381TwistCurve,
+            },
+            field::element::FieldElement,
+        };
+
+        let mut compressed_point = [0_u8; 96];
+        compressed_point[0] |= 1 << 7;
+        compressed_point[95] |= 1 << 1;
+
+        // Valid G2 point coordinates:
+        let x_0 = BLS12381FieldElement::from_hex_unchecked("02");
+        let x_1 = BLS12381FieldElement::from_hex_unchecked("0");
+        let y_0 = BLS12381FieldElement::from_hex_unchecked(
+            "013a59858b6809fca4d9a3b6539246a70051a3c88899964a42bc9a69cf9acdd9dd387cfa9086b894185b9a46a402be73",
+        );
+        let y_1 = BLS12381FieldElement::from_hex_unchecked(
+            "02d27e0ec3356299a346a09ad7dc4ef68a483c3aed53f9139d2f929a3eecebf72082e5e58c6da24ee32e03040c406d4f",
+        );
+
+        let x: FieldElement<Degree2ExtensionField> = FieldElement::new([x_0, x_1]);
+        let y: FieldElement<Degree2ExtensionField> = FieldElement::new([y_0, y_1]);
+
+        let valid_g2_point = BLS12381TwistCurve::create_point_from_affine(x, y).unwrap();
+
+        let decompressed_point = BLS12381Curve::decompress_g2_point(&mut compressed_point).unwrap();
+
+        assert_eq!(valid_g2_point, decompressed_point);
     }
 }
 
