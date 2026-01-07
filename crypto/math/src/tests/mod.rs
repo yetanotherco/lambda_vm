@@ -1,3 +1,4 @@
+pub mod binary_field_tests;
 pub mod bls12_381_tests;
 pub mod bn_254_tests;
 pub mod extensions_cubic_tests;
@@ -16,6 +17,8 @@ pub mod montgomery_backed_prime_fields_tests;
 pub mod msm_tests;
 pub mod polynomial_tests;
 pub mod short_weierstrass_point_tests;
+pub mod test_fields_tests;
+pub mod u64_goldilocks_field_tests;
 pub mod u64_prime_field_tests;
 pub mod unsigned_integer_montgomery_tests;
 pub mod unsigned_integer_u256_tests;
