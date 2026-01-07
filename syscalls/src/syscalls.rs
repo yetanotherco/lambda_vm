@@ -102,9 +102,13 @@ pub unsafe extern "C" fn __atomic_fetch_add_4(ptr: *mut u32, val: u32, _order: i
 /// This function should not be called by the user
 /// It is only for rust std internal uses
 #[unsafe(no_mangle)]
-pub extern "C" fn __atomic_fetch_and_1(_ptr: *mut u8, _val: u8, _order: i32) -> u8 {
+pub extern "C" fn __atomic_fetch_and_1(ptr: *mut u8, val: u8, _order: i32) -> u8 {
     print_string("__atomic_fetch_and_1 called\n");
-    0
+    unsafe {
+        let old = *ptr;
+        *ptr = old & val;
+        old
+    }
 }
 
 /// # Safety
@@ -112,9 +116,13 @@ pub extern "C" fn __atomic_fetch_and_1(_ptr: *mut u8, _val: u8, _order: i32) -> 
 /// This function should not be called by the user
 /// It is only for rust std internal uses
 #[unsafe(no_mangle)]
-pub extern "C" fn __atomic_fetch_sub_4(_ptr: *mut u32, _val: u32, _order: i32) -> u32 {
+pub extern "C" fn __atomic_fetch_sub_4(ptr: *mut u32, val: u32, _order: i32) -> u32 {
     print_string("__atomic_fetch_sub_4 called\n");
-    0
+    unsafe {
+        let old = *ptr;
+        *ptr = old.wrapping_sub(val);
+        old
+    }
 }
 
 /// # Safety
@@ -142,8 +150,11 @@ pub unsafe extern "C" fn __atomic_load_1(ptr: *const u8, _order: i32) -> u8 {
 /// This function should not be called by the user
 /// It is only for rust std internal uses
 #[unsafe(no_mangle)]
-pub extern "C" fn __atomic_store_1(_ptr: *mut u8, _val: u8, _order: i32) {
+pub extern "C" fn __atomic_store_1(ptr: *mut u8, val: u8, _order: i32) {
     print_string("__atomic_store_1 called\n");
+    unsafe {
+        *ptr = val;
+    }
 }
 
 /// # Safety
@@ -202,8 +213,11 @@ pub extern "C" fn sys_rand(_buf: *mut u8, _len: usize) -> isize {
 /// This function should not be called by the user
 /// It is only for rust std internal uses
 #[unsafe(no_mangle)]
-pub extern "C" fn __atomic_store_8(_ptr: *mut u8, _val: u8, _order: i32) {
+pub extern "C" fn __atomic_store_8(ptr: *mut u64, val: u64, _order: i32) {
     print_string("__atomic_store_8 called\n");
+    unsafe {
+        ptr::write_unaligned(ptr, val);
+    }
 }
 
 pub fn commit(slice: &[u8]) {
