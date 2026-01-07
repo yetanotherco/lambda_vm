@@ -880,8 +880,6 @@ pub trait IsStarkProver<
     /// Generates STARK proofs for one or more AIRs with a shared transcript.
     ///
     /// This unified function handles both single-table and multi-table proving.
-    /// For protocols like LogUp where challenges must be shared across tables,
-    /// all tables are passed together.
     ///
     /// The function executes Round 1 for all AIRs first (committing all traces to the transcript),
     /// then executes Rounds 2-4 for each AIR sequentially. This ensures proper Fiat-Shamir challenge
@@ -919,15 +917,15 @@ pub trait IsStarkProver<
         // Execute Rounds 2-4 for each AIR
         let mut proofs = Vec::new();
         for (((air, _), round_1_result), domain) in airs.iter().zip(round_1_results).zip(domains) {
-            let proof = Self::after_round_1(*air, &round_1_result, transcript, &domain)?;
+            let proof = Self::prove_rounds_2_to_4(*air, &round_1_result, transcript, &domain)?;
             proofs.push(proof);
         }
 
         Ok(proofs)
     }
 
-    /// Convenience method to generate a STARK proof for a single AIR/trace.
-    /// This is equivalent to calling `prove` with a single-element slice.
+    /// Generate a STARK proof for a single AIR/trace.
+    /// This is equivalent to calling `multi_prove` with a single-element slice.
     fn prove(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         trace: &mut TraceTable<Field, FieldExtension>,
@@ -944,9 +942,9 @@ pub trait IsStarkProver<
     }
 
     // FIXME remove unwrap() calls and return errors
-    /// Generates a STARK proof for the trace `main_trace` with public inputs `pub_inputs`.
+    /// Executes rounds 2-4 and generates a STARK proof for the trace `main_trace` with public inputs `pub_inputs`.
     /// Warning: the transcript must be safely initializated before passing it to this method.
-    fn after_round_1(
+    fn prove_rounds_2_to_4(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         round_1_result: &Round1<Field, FieldExtension>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
