@@ -7,7 +7,10 @@ use math::field::{
 };
 
 use crate::{
-    constraints::{boundary::BoundaryConstraints, transition::TransitionConstraint},
+    constraints::{
+        boundary::{BoundaryConstraint, BoundaryConstraints},
+        transition::TransitionConstraint,
+    },
     context::AirContext,
     table::TableView,
     trace::TraceTable,
@@ -144,6 +147,7 @@ where
         mut self,
         columns: PermutationColumns, // TODO: Could we infer these columns from the aux build data?
         auxiliary_trace_build_data: AuxiliaryTraceBuildData,
+        lookup_public_inputs: LookUpPublicInputs<F>,
     ) -> Air<LookUpAirLogicWrapper<L, F, E>, PI, F, E> {
         // PermutationConstraint being used as placeholder
         self.transition_constraints
@@ -157,6 +161,7 @@ where
             transition_constraints: self.transition_constraints,
             logic: LookUpAirLogicWrapper {
                 auxiliary_trace_build_data,
+                public_inputs: lookup_public_inputs,
                 logic: self.logic,
                 phantom: PhantomData::<(F, E)>,
             },
@@ -172,6 +177,7 @@ where
     E: IsField + Send + Sync + 'static,
 {
     auxiliary_trace_build_data: AuxiliaryTraceBuildData,
+    public_inputs: LookUpPublicInputs<F>, // TODO: check if this is okay here
     logic: L,
     phantom: PhantomData<(F, E)>,
 }
@@ -185,8 +191,10 @@ where
     fn build_auxiliary_trace(&self, trace: &mut TraceTable<F, E>, challenges: &[FieldElement<E>]) {
         // Ignores build_auxiliary_trace logic from wrapped air (assumption: only lookups use auxiliary columns)
         // Uses the same challenges for all auxiliary columns (We should use the same challenges for auxiliary columns used for lookups between table pairs, the first solution was to use the same rap challenges for all auxilary columns across tables, we need to checkk if this is safe)
-        for (aux_column_idx, aux_column_build_data) in &self.auxiliary_trace_build_data.columns {
-            build_auxiliary_trace_column(*aux_column_idx, aux_column_build_data, trace, challenges);
+        for (aux_column_idx, aux_column_build_data) in
+            self.auxiliary_trace_build_data.columns.iter().enumerate()
+        {
+            build_auxiliary_trace_column(aux_column_idx, aux_column_build_data, trace, challenges);
         }
     }
 
@@ -200,22 +208,46 @@ where
         vec![]
     }
     fn boundary_constraints(&self, rap_challenges: &[FieldElement<E>]) -> BoundaryConstraints<E> {
-        let mut boundary_constraints = self.logic.boundary_constraints(rap_challenges);
-        // TODO: Add boundary constraints
-        // Are these constraints dependant on the columns we use? aka do they differ between each lookup table?
-        boundary_constraints
+        let mut boundary_constraints = vec![];
+        for (pub_inputs, aux_column_build_data) in self
+            .public_inputs
+            .columns
+            .iter()
+            .zip(&self.auxiliary_trace_build_data.columns)
+        {
+            boundary_constraints
+                .extend(build_boundary_constraint(pub_inputs, aux_column_build_data));
+        }
+        BoundaryConstraints::from_constraints(boundary_constraints)
     }
 }
 
 /// Struct representing how each lookup air should build its auxiliary columns
 pub struct AuxiliaryTraceBuildData {
-    pub columns: Vec<(usize, AuxiliaryColumnBuildData)>,
+    pub columns: Vec<AuxiliaryColumnBuildData>,
 }
 
 /// Struct representing how to build a given auxiliary column
 pub struct AuxiliaryColumnBuildData {
     pub flag_columns: Vec<usize>,
     pub value_columns: Vec<usize>,
+}
+
+/// Public inputs related to each lookup aux column
+pub struct LookUpPublicInputs<F>
+where
+    F: IsFFTField + Send + Sync,
+{
+    pub columns: Vec<LookupPublicInputsPerAuxColumn<F>>,
+}
+
+// TODO: check this
+pub struct LookupPublicInputsPerAuxColumn<F>
+where
+    F: IsFFTField + Send + Sync,
+{
+    pub flags: Vec<FieldElement<F>>,
+    pub values: Vec<FieldElement<F>>,
 }
 
 /// Helper method to build a single auxiliary trace column for lookups
@@ -225,8 +257,8 @@ fn build_auxiliary_trace_column<F, E>(
     trace: &mut TraceTable<F, E>,
     challenges: &[FieldElement<E>],
 ) where
-    F: IsFFTField + IsSubFieldOf<E> + Send + Sync + 'static,
-    E: IsField + Send + Sync + 'static,
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
+    E: IsField + Send + Sync,
 {
     // Main table
     let main_segment_cols = trace.columns_main();
@@ -269,6 +301,31 @@ fn build_auxiliary_trace_column<F, E>(
     for (i, aux_elem) in aux_col.iter().enumerate().take(trace.num_rows()) {
         trace.set_aux(i, aux_column_idx, aux_elem.clone())
     }
+}
+
+fn build_boundary_constraint<'a, F, E>(
+    pub_inputs: &LookupPublicInputsPerAuxColumn<F>,
+    aux_column_build_data: &AuxiliaryColumnBuildData,
+) -> Vec<BoundaryConstraint<E>>
+where
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
+    E: IsField + Send + Sync,
+{
+    // Add constraints for starting value of each flag & value column
+    aux_column_build_data
+        .flag_columns
+        .iter()
+        .zip(pub_inputs.flags.iter())
+        .chain(
+            aux_column_build_data
+                .value_columns
+                .iter()
+                .zip(pub_inputs.values.iter()),
+        )
+        .map(|(column, starting_value)| {
+            BoundaryConstraint::new_main(*column, 0, starting_value.clone().to_extension())
+        })
+        .collect()
 }
 
 // Placeholder constraint, not the one used for lookups

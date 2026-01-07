@@ -9,7 +9,8 @@ use crate::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
         lookup::{
             Air, AirLogic, AuxiliaryColumnBuildData, AuxiliaryTraceBuildData,
-            LookUpAirLogicWrapper, PermutationColumns,
+            LookUpAirLogicWrapper, LookUpPublicInputs, LookupPublicInputsPerAuxColumn,
+            PermutationColumns,
         },
         transition::TransitionConstraint,
     },
@@ -349,9 +350,9 @@ where
 
 pub fn read_only_logup_air<'a, F, E>(
     trace_length: usize,
-    pub_inputs: &'a LogReadOnlyPublicInputs<F>,
+    pub_inputs: LookUpPublicInputs<F>,
     proof_options: &ProofOptions,
-) -> Air<LookUpAirLogicWrapper<ReadOnlyAirLogic, F, E>, &'a LogReadOnlyPublicInputs<F>, F, E>
+) -> Air<LookUpAirLogicWrapper<ReadOnlyAirLogic, F, E>, &'a (), F, E>
 where
     F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
     E: IsField + Send + Sync,
@@ -378,25 +379,22 @@ where
     };
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        columns: vec![(
-            0,
-            AuxiliaryColumnBuildData {
-                flag_columns: vec![4],           // m
-                value_columns: vec![0, 1, 2, 3], // a, v, a_sorted, v_sorted
-            },
-        )],
+        columns: vec![AuxiliaryColumnBuildData {
+            flag_columns: vec![4],           // m
+            value_columns: vec![0, 1, 2, 3], // a, v, a_sorted, v_sorted
+        }],
     };
 
     Air {
         context,
         trace_length,
-        pub_inputs,
+        pub_inputs: &(),
         step_size: 1,
         trace_layout: (5, 1),
         transition_constraints,
         logic: ReadOnlyAirLogic {},
     }
-    .into_lookup(columns, auxiliary_trace_build_data)
+    .into_lookup(columns, auxiliary_trace_build_data, pub_inputs)
 }
 
 pub struct ReadOnlyAirLogic {}
@@ -431,6 +429,20 @@ where
     pub v_sorted_0: FieldElement<F>,
     // The multiplicity of (a_sorted_0, v_sorted_0)
     pub m0: FieldElement<F>,
+}
+
+impl<F> Into<LookUpPublicInputs<F>> for LogReadOnlyPublicInputs<F>
+where
+    F: IsFFTField + Send + Sync,
+{
+    fn into(self) -> LookUpPublicInputs<F> {
+        LookUpPublicInputs {
+            columns: vec![LookupPublicInputsPerAuxColumn {
+                flags: vec![self.m0],
+                values: vec![self.a0, self.v0, self.a_sorted_0, self.v_sorted_0],
+            }],
+        }
+    }
 }
 
 impl<F, E> AIR for LogReadOnlyRAP<F, E>
