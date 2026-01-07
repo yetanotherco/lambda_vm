@@ -397,7 +397,8 @@ mod pairing_tests {
         Degree2ExtensionField, Degree12ExtensionField,
     };
     use crate::elliptic_curve::short_weierstrass::curves::bn_254::pairing::{
-        BN254AtePairing, X, cyclotomic_pow_x, cyclotomic_square, frobenius, miller_optimized,
+        BN254AtePairing, TWO_INV, X, cyclotomic_pow_x, cyclotomic_square, frobenius,
+        frobenius_cube, frobenius_square, miller_optimized,
     };
     use crate::elliptic_curve::short_weierstrass::curves::bn_254::twist::BN254TwistCurve;
     use crate::elliptic_curve::short_weierstrass::point::ShortWeierstrassProjectivePoint;
@@ -585,6 +586,264 @@ mod pairing_tests {
         let f_easy = &frobenius(&frobenius(&f_easy_aux)) * f_easy_aux;
         assert_eq!(cyclotomic_pow_x(&f_easy), f_easy.pow(X));
     }
+
+    #[test]
+    fn apply_6_times_frobenius_square_is_identity() {
+        let f = Fp12E::from_coefficients(&[
+            "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12",
+        ]);
+        let mut result = frobenius_square(&f);
+        for _ in 1..6 {
+            result = frobenius_square(&result);
+        }
+        assert_eq!(f, result)
+    }
+
+    #[test]
+    fn apply_4_times_frobenius_cube_is_identity() {
+        let f = Fp12E::from_coefficients(&[
+            "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12",
+        ]);
+        let mut result = frobenius_cube(&f);
+        for _ in 1..4 {
+            result = frobenius_cube(&result);
+        }
+        assert_eq!(f, result)
+    }
+
+    #[test]
+    fn two_pairs_of_points_match_2() {
+        let p1 = G1Point::from_affine(
+            FpE::new(U256::from_hex_unchecked(
+                "105456a333e6d636854f987ea7bb713dfd0ae8371a72aea313ae0c32c0bf1016",
+            )),
+            FpE::new(U256::from_hex_unchecked(
+                "0cf031d41b41557f3e7e3ba0c51bebe5da8e6ecd855ec50fc87efcdeac168bcc",
+            )),
+        )
+        .unwrap();
+
+        let q1 = G2Point::from_affine(
+            Fp2E::new([
+                FpE::new(U256::from_hex_unchecked(
+                    "3010c68cb50161b7d1d96bb71edfec9880171954e56871abf3d93cc94d745fa1",
+                )),
+                FpE::new(U256::from_hex_unchecked(
+                    "0476be093a6d2b4bbf907172049874af11e1b6267606e00804d3ff0037ec57fd",
+                )),
+            ]),
+            Fp2E::new([
+                FpE::new(U256::from_hex_unchecked(
+                    "01b33461f39d9e887dbb100f170a2345dde3c07e256d1dfa2b657ba5cd030427",
+                )),
+                FpE::new(U256::from_hex_unchecked(
+                    "14c059d74e5b6c4ec14ae5864ebe23a71781d86c29fb8fb6cce94f70d3de7a21",
+                )),
+            ]),
+        )
+        .unwrap();
+
+        let p2 = G1Point::from_affine(
+            FpE::new(U256::from_hex_unchecked(
+                "0000000000000000000000000000000000000000000000000000000000000001",
+            )),
+            FpE::new(U256::from_hex_unchecked(
+                "0000000000000000000000000000000000000000000000000000000000000002",
+            )),
+        )
+        .unwrap();
+
+        let q2 = G2Point::from_affine(
+            Fp2E::new([
+                FpE::new(U256::from_hex_unchecked(
+                    "290158a80cd3d66530f74dc94c94adb88f5cdb481acca997b6e60071f08a115f",
+                )),
+                FpE::new(U256::from_hex_unchecked(
+                    "1a2c3013d2ea92e13c800cde68ef56a294b883f6ac35d25f587c09b1b3c635f7",
+                )),
+            ]),
+            Fp2E::new([
+                FpE::new(U256::from_hex_unchecked(
+                    "29d1691530ca701b4a106054688728c9972c8512e9789e9567aae23e302ccd75",
+                )),
+                FpE::new(U256::from_hex_unchecked(
+                    "2f997f3dbd66a7afe07fe7862ce239edba9e05c5afff7f8a1259c9733b2dfbb9",
+                )),
+            ]),
+        )
+        .unwrap();
+
+        let result = BN254AtePairing::compute_batch(&[(&p1, &q1), (&p2, &q2)]).unwrap();
+        assert_eq!(result, Fp12E::one());
+    }
+
+    #[test]
+    fn two_pairs_of_points_fail() {
+        let p1 = G1Point::from_affine(
+            FpE::new(U256::from_hex_unchecked(
+                "0000000000000000000000000000000000000000000000000000000000000001",
+            )),
+            FpE::new(U256::from_hex_unchecked(
+                "0000000000000000000000000000000000000000000000000000000000000002",
+            )),
+        )
+        .unwrap();
+
+        let q1 = G2Point::from_affine(
+            Fp2E::new([
+                FpE::new(U256::from_hex_unchecked(
+                    "1800deef121f1e76426a00665e5c4479674322d4f75edadd46debd5cd992f6ed",
+                )),
+                FpE::new(U256::from_hex_unchecked(
+                    "198e9393920d483a7260bfb731fb5d25f1aa493335a9e71297e485b7aef312c2",
+                )),
+            ]),
+            Fp2E::new([
+                FpE::new(U256::from_hex_unchecked(
+                    "12c85ea5db8c6deb4aab71808dcb408fe3d1e7690c43d37b4ce6cc0166fa7daa",
+                )),
+                FpE::new(U256::from_hex_unchecked(
+                    "090689d0585ff075ec9e99ad690c3395bc4b313370b38ef355acdadcd122975b",
+                )),
+            ]),
+        )
+        .unwrap();
+
+        let p2 = G1Point::from_affine(
+            FpE::new(U256::from_hex_unchecked(
+                "0000000000000000000000000000000000000000000000000000000000000001",
+            )),
+            FpE::new(U256::from_hex_unchecked(
+                "0000000000000000000000000000000000000000000000000000000000000002",
+            )),
+        )
+        .unwrap();
+
+        let q2 = G2Point::from_affine(
+            Fp2E::new([
+                FpE::new(U256::from_hex_unchecked(
+                    "1800deef121f1e76426a00665e5c4479674322d4f75edadd46debd5cd992f6ed",
+                )),
+                FpE::new(U256::from_hex_unchecked(
+                    "198e9393920d483a7260bfb731fb5d25f1aa493335a9e71297e485b7aef312c2",
+                )),
+            ]),
+            Fp2E::new([
+                FpE::new(U256::from_hex_unchecked(
+                    "12c85ea5db8c6deb4aab71808dcb408fe3d1e7690c43d37b4ce6cc0166fa7daa",
+                )),
+                FpE::new(U256::from_hex_unchecked(
+                    "090689d0585ff075ec9e99ad690c3395bc4b313370b38ef355acdadcd122975b",
+                )),
+            ]),
+        )
+        .unwrap();
+
+        let result = BN254AtePairing::compute_batch(&[(&p1, &q1), (&p2, &q2)]).unwrap();
+        assert!(result != Fp12E::one());
+    }
+
+    #[test]
+    fn three_pairs_of_points_fail() {
+        let p1 = G1Point::from_affine(
+            FpE::new(U256::from_hex_unchecked(
+                "105456a333e6d636854f987ea7bb713dfd0ae8371a72aea313ae0c32c0bf1016",
+            )),
+            FpE::new(U256::from_hex_unchecked(
+                "0cf031d41b41557f3e7e3ba0c51bebe5da8e6ecd855ec50fc87efcdeac168bcc",
+            )),
+        )
+        .unwrap();
+
+        let q1 = G2Point::from_affine(
+            Fp2E::new([
+                FpE::new(U256::from_hex_unchecked(
+                    "3010c68cb50161b7d1d96bb71edfec9880171954e56871abf3d93cc94d745fa1",
+                )),
+                FpE::new(U256::from_hex_unchecked(
+                    "0476be093a6d2b4bbf907172049874af11e1b6267606e00804d3ff0037ec57fd",
+                )),
+            ]),
+            Fp2E::new([
+                FpE::new(U256::from_hex_unchecked(
+                    "01b33461f39d9e887dbb100f170a2345dde3c07e256d1dfa2b657ba5cd030427",
+                )),
+                FpE::new(U256::from_hex_unchecked(
+                    "14c059d74e5b6c4ec14ae5864ebe23a71781d86c29fb8fb6cce94f70d3de7a21",
+                )),
+            ]),
+        )
+        .unwrap();
+
+        let p2 = G1Point::from_affine(
+            FpE::new(U256::from_hex_unchecked(
+                "0000000000000000000000000000000000000000000000000000000000000001",
+            )),
+            FpE::new(U256::from_hex_unchecked(
+                "0000000000000000000000000000000000000000000000000000000000000002",
+            )),
+        )
+        .unwrap();
+
+        let q2 = G2Point::from_affine(
+            Fp2E::new([
+                FpE::new(U256::from_hex_unchecked(
+                    "290158a80cd3d66530f74dc94c94adb88f5cdb481acca997b6e60071f08a115f",
+                )),
+                FpE::new(U256::from_hex_unchecked(
+                    "1a2c3013d2ea92e13c800cde68ef56a294b883f6ac35d25f587c09b1b3c635f7",
+                )),
+            ]),
+            Fp2E::new([
+                FpE::new(U256::from_hex_unchecked(
+                    "0692e55db067300e6e3fe56218fa2f940054e57e7ef92bf7d475a9d8a8502fd2",
+                )),
+                FpE::new(U256::from_hex_unchecked(
+                    "00cacf3523caf879d7d05e30549f1e6fdce364cbb8724b0329c6c2a39d4f018e",
+                )),
+            ]),
+        )
+        .unwrap();
+
+        let p3 = G1Point::from_affine(
+            FpE::new(U256::from_hex_unchecked(
+                "0000000000000000000000000000000000000000000000000000000000000001",
+            )),
+            FpE::new(U256::from_hex_unchecked(
+                "0000000000000000000000000000000000000000000000000000000000000002",
+            )),
+        )
+        .unwrap();
+
+        let q3 = G2Point::from_affine(
+            Fp2E::new([
+                FpE::new(U256::from_hex_unchecked(
+                    "1800deef121f1e76426a00665e5c4479674322d4f75edadd46debd5cd992f6ed",
+                )),
+                FpE::new(U256::from_hex_unchecked(
+                    "198e9393920d483a7260bfb731fb5d25f1aa493335a9e71297e485b7aef312c2",
+                )),
+            ]),
+            Fp2E::new([
+                FpE::new(U256::from_hex_unchecked(
+                    "12c85ea5db8c6deb4aab71808dcb408fe3d1e7690c43d37b4ce6cc0166fa7daa",
+                )),
+                FpE::new(U256::from_hex_unchecked(
+                    "090689d0585ff075ec9e99ad690c3395bc4b313370b38ef355acdadcd122975b",
+                )),
+            ]),
+        )
+        .unwrap();
+
+        let result = BN254AtePairing::compute_batch(&[(&p1, &q1), (&p2, &q2), (&p3, &q3)]).unwrap();
+        assert!(result != Fp12E::one());
+    }
+
+    #[test]
+    fn constant_two_inv_is_two_inverse() {
+        assert_eq!(TWO_INV, FpE::from(2).inv().unwrap());
+        assert_eq!(TWO_INV * FpE::from(2), FpE::one());
+    }
 }
 
 #[cfg(test)]
@@ -688,5 +947,138 @@ mod twist_tests {
         let q = BN254TwistCurve::create_point_from_affine(qx, qy).unwrap();
         let expected = BN254TwistCurve::create_point_from_affine(expectedx, expectedy).unwrap();
         assert_eq!(p.operate_with(&q), expected);
+    }
+}
+
+#[cfg(test)]
+mod sqrt_tests {
+    use crate::cyclic_group::IsGroup;
+    use crate::elliptic_curve::short_weierstrass::curves::bn_254::curve::BN254FieldElement;
+    use crate::elliptic_curve::short_weierstrass::curves::bn_254::field_extension::Degree2ExtensionField;
+    use crate::elliptic_curve::short_weierstrass::curves::bn_254::sqrt::sqrt_qfe;
+    use crate::elliptic_curve::short_weierstrass::curves::bn_254::twist::BN254TwistCurve;
+    use crate::elliptic_curve::short_weierstrass::traits::IsShortWeierstrass;
+    use crate::elliptic_curve::traits::IsEllipticCurve;
+    use crate::field::element::FieldElement;
+    use rand::{Rng, SeedableRng, rngs::StdRng};
+
+    type BN254TwistCurveFieldElement = FieldElement<Degree2ExtensionField>;
+
+    #[test]
+    /// We took the q1 point of the test two_pairs_of_points_match_1 from pairing.rs
+    /// to get the values of x and y.
+    fn test_sqrt_qfe() {
+        // Coordinate x of q.
+        let x = BN254TwistCurveFieldElement::new([
+            BN254FieldElement::from_hex_unchecked(
+                "1800deef121f1e76426a00665e5c4479674322d4f75edadd46debd5cd992f6ed",
+            ),
+            BN254FieldElement::from_hex_unchecked(
+                "198e9393920d483a7260bfb731fb5d25f1aa493335a9e71297e485b7aef312c2",
+            ),
+        ]);
+
+        let qfe_b = BN254TwistCurve::b();
+        // The equation of the twisted curve is y^2 = x^3 + 3 /(9+u)
+        let y_square = x.square() * &x + qfe_b;
+        let y = sqrt_qfe(&y_square, 0).unwrap();
+
+        // Coordinate y of q.
+        let y_expected = BN254TwistCurveFieldElement::new([
+            BN254FieldElement::from_hex_unchecked(
+                "12c85ea5db8c6deb4aab71808dcb408fe3d1e7690c43d37b4ce6cc0166fa7daa",
+            ),
+            BN254FieldElement::from_hex_unchecked(
+                "090689d0585ff075ec9e99ad690c3395bc4b313370b38ef355acdadcd122975b",
+            ),
+        ]);
+
+        let value_y = y.value();
+        let value_y_expected = y_expected.value();
+
+        assert_eq!(value_y[0].clone(), value_y_expected[0].clone());
+        assert_eq!(value_y[1].clone(), value_y_expected[1].clone());
+    }
+
+    #[test]
+    /// We took the q1 point of the test two_pairs_of_points_match_2 from pairing.rs
+    fn test_sqrt_qfe_2() {
+        let x = BN254TwistCurveFieldElement::new([
+            BN254FieldElement::from_hex_unchecked(
+                "3010c68cb50161b7d1d96bb71edfec9880171954e56871abf3d93cc94d745fa1",
+            ),
+            BN254FieldElement::from_hex_unchecked(
+                "0476be093a6d2b4bbf907172049874af11e1b6267606e00804d3ff0037ec57fd",
+            ),
+        ]);
+
+        let qfe_b = BN254TwistCurve::b();
+
+        let y_square = x.pow(3_u64) + qfe_b;
+        let y = sqrt_qfe(&y_square, 0).unwrap();
+
+        let y_expected = BN254TwistCurveFieldElement::new([
+            BN254FieldElement::from_hex_unchecked(
+                "01b33461f39d9e887dbb100f170a2345dde3c07e256d1dfa2b657ba5cd030427",
+            ),
+            BN254FieldElement::from_hex_unchecked(
+                "14c059d74e5b6c4ec14ae5864ebe23a71781d86c29fb8fb6cce94f70d3de7a21",
+            ),
+        ]);
+
+        let value_y = y.value();
+        let value_y_expected = y_expected.value();
+
+        assert_eq!(value_y[0].clone(), value_y_expected[0].clone());
+        assert_eq!(value_y[1].clone(), value_y_expected[1].clone());
+    }
+
+    #[test]
+    fn test_sqrt_qfe_3() {
+        let g = BN254TwistCurve::generator().to_affine();
+        let y = &g.coordinates()[1];
+        let y_square = &y.square();
+        let y_result = sqrt_qfe(y_square, 0).unwrap();
+
+        assert_eq!(y_result, y.clone());
+    }
+
+    #[test]
+    fn test_sqrt_qfe_4() {
+        let g = BN254TwistCurve::generator()
+            .operate_with_self(2_u16)
+            .to_affine();
+        let y = &g.coordinates()[1];
+        let y_square = &y.square();
+        let y_result = sqrt_qfe(y_square, 0).unwrap();
+
+        assert_eq!(y_result, y.clone());
+    }
+
+    #[test]
+    fn test_sqrt_qfe_5() {
+        let a = BN254TwistCurveFieldElement::new([
+            BN254FieldElement::from(3),
+            BN254FieldElement::from(4),
+        ]);
+        let a_square = a.square();
+        let a_result = sqrt_qfe(&a_square, 0).unwrap();
+
+        assert_eq!(a_result, a);
+    }
+
+    #[test]
+    fn test_sqrt_qfe_random() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let a_val: u64 = rng.r#gen();
+        let b_val: u64 = rng.r#gen();
+        let a = BN254TwistCurveFieldElement::new([
+            BN254FieldElement::from(a_val),
+            BN254FieldElement::from(b_val),
+        ]);
+        let a_square = a.square();
+        let a_result = sqrt_qfe(&a_square, 0).unwrap();
+
+        assert_eq!(a_result, a);
     }
 }

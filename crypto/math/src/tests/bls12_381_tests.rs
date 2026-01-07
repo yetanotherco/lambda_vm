@@ -152,7 +152,8 @@ mod pairing_tests {
     use crate::elliptic_curve::short_weierstrass::curves::bls12_381::curve::BLS12381Curve;
     use crate::elliptic_curve::short_weierstrass::curves::bls12_381::field_extension::Degree12ExtensionField;
     use crate::elliptic_curve::short_weierstrass::curves::bls12_381::pairing::{
-        BLS12381AtePairing, X, cyclotomic_pow_x, cyclotomic_square, frobenius, miller,
+        BLS12381AtePairing, X, add_accumulate_line, cyclotomic_pow_x, cyclotomic_square,
+        double_accumulate_line, frobenius, frobenius_square, miller,
     };
     use crate::elliptic_curve::short_weierstrass::curves::bls12_381::twist::BLS12381TwistCurve;
     use crate::elliptic_curve::short_weierstrass::point::ShortWeierstrassProjectivePoint;
@@ -239,6 +240,43 @@ mod pairing_tests {
         let f_easy_aux = f.conjugate() * f.inv().unwrap();
         let f_easy = &frobenius(&frobenius(&f_easy_aux)) * f_easy_aux;
         assert_eq!(cyclotomic_pow_x(&f_easy), f_easy.pow(X));
+    }
+
+    #[test]
+    fn test_double_accumulate_line_doubles_point_correctly() {
+        let g1 = BLS12381Curve::generator();
+        let g2 = BLS12381TwistCurve::generator();
+        let mut r = g2.clone();
+        let mut f = FieldElement::one();
+        double_accumulate_line(&mut r, &g1, &mut f);
+        assert_eq!(r, g2.operate_with(&g2));
+    }
+
+    #[test]
+    fn test_add_accumulate_line_adds_points_correctly() {
+        let g1 = BLS12381Curve::generator();
+        let g = BLS12381TwistCurve::generator();
+        let a: u64 = 12;
+        let b: u64 = 23;
+        let g2 = g.operate_with_self(a).to_affine();
+        let g3 = g.operate_with_self(b).to_affine();
+        let expected = g.operate_with_self(a + b);
+        let mut r = g2;
+        let mut f = FieldElement::one();
+        add_accumulate_line(&mut r, &g3, &g1, &mut f);
+        assert_eq!(r, expected);
+    }
+
+    #[test]
+    fn apply_6_times_frobenius_square_is_identity() {
+        let f = Fp12E::from_coefficients(&[
+            "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12",
+        ]);
+        let mut result = frobenius_square(&f);
+        for _ in 1..6 {
+            result = frobenius_square(&result);
+        }
+        assert_eq!(f, result)
     }
 }
 
@@ -631,5 +669,66 @@ mod twist_tests {
         let q = BLS12381TwistCurve::create_point_from_affine(qx, qy).unwrap();
         let expected = BLS12381TwistCurve::create_point_from_affine(expectedx, expectedy).unwrap();
         assert_eq!(p.operate_with(&q), expected);
+    }
+}
+
+#[cfg(test)]
+mod sqrt_tests {
+    use crate::elliptic_curve::short_weierstrass::curves::bls12_381::curve::BLS12381FieldElement;
+    use crate::elliptic_curve::short_weierstrass::curves::bls12_381::field_extension::Degree2ExtensionField;
+    use crate::elliptic_curve::short_weierstrass::curves::bls12_381::sqrt::sqrt_qfe;
+    use crate::field::element::FieldElement;
+
+    type BLS12381TwistCurveFieldElement = FieldElement<Degree2ExtensionField>;
+
+    #[test]
+    fn test_sqrt_qfe() {
+        let c1 = BLS12381FieldElement::from_hex(
+            "0x13e02b6052719f607dacd3a088274f65596bd0d09920b61ab5da61bbdc7f5049334cf11213945d57e5ac7d055d042b7e",
+        ).unwrap();
+        let c0 = BLS12381FieldElement::from_hex(
+        "0x024aa2b2f08f0a91260805272dc51051c6e47ad4fa403b02b4510b647ae3d1770bac0326a805bbefd48056c8c121bdb8"
+        ).unwrap();
+        let qfe = BLS12381TwistCurveFieldElement::new([c0, c1]);
+
+        let b1 = BLS12381FieldElement::from_hex("0x4").unwrap();
+        let b0 = BLS12381FieldElement::from_hex("0x4").unwrap();
+        let qfe_b = BLS12381TwistCurveFieldElement::new([b0, b1]);
+
+        let cubic_value = qfe.pow(3_u64) + qfe_b;
+        let root = sqrt_qfe(&cubic_value, 0).unwrap();
+
+        let c0_expected = BLS12381FieldElement::from_hex("0x0ce5d527727d6e118cc9cdc6da2e351aadfd9baa8cbdd3a76d429a695160d12c923ac9cc3baca289e193548608b82801").unwrap();
+        let c1_expected = BLS12381FieldElement::from_hex("0x0606c4a02ea734cc32acd2b02bc28b99cb3e287e85a763af267492ab572e99ab3f370d275cec1da1aaa9075ff05f79be").unwrap();
+        let qfe_expected = BLS12381TwistCurveFieldElement::new([c0_expected, c1_expected]);
+
+        let value_root = root.value();
+        let value_qfe_expected = qfe_expected.value();
+
+        assert_eq!(value_root[0].clone(), value_qfe_expected[0].clone());
+        assert_eq!(value_root[1].clone(), value_qfe_expected[1].clone());
+    }
+
+    #[test]
+    fn test_sqrt_qfe_2() {
+        let c0 = BLS12381FieldElement::from_hex("0x02").unwrap();
+        let c1 = BLS12381FieldElement::from_hex("0x00").unwrap();
+        let qfe = BLS12381TwistCurveFieldElement::new([c0, c1]);
+
+        let c0_expected = BLS12381FieldElement::from_hex("0x013a59858b6809fca4d9a3b6539246a70051a3c88899964a42bc9a69cf9acdd9dd387cfa9086b894185b9a46a402be73").unwrap();
+        let c1_expected = BLS12381FieldElement::from_hex("0x02d27e0ec3356299a346a09ad7dc4ef68a483c3aed53f9139d2f929a3eecebf72082e5e58c6da24ee32e03040c406d4f").unwrap();
+        let qfe_expected = BLS12381TwistCurveFieldElement::new([c0_expected, c1_expected]);
+
+        let b1 = BLS12381FieldElement::from_hex("0x4").unwrap();
+        let b0 = BLS12381FieldElement::from_hex("0x4").unwrap();
+        let qfe_b = BLS12381TwistCurveFieldElement::new([b0, b1]);
+
+        let root = sqrt_qfe(&(qfe.pow(3_u64) + qfe_b), 0).unwrap();
+
+        let value_root = root.value();
+        let value_qfe_expected = qfe_expected.value();
+
+        assert_eq!(value_root[0].clone(), value_qfe_expected[0].clone());
+        assert_eq!(value_root[1].clone(), value_qfe_expected[1].clone());
     }
 }

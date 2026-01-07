@@ -208,7 +208,7 @@ pub fn double_accumulate_line(
     ]);
 }
 
-fn add_accumulate_line(
+pub fn add_accumulate_line(
     t: &mut ShortWeierstrassProjectivePoint<BLS12381TwistCurve>,
     q: &ShortWeierstrassProjectivePoint<BLS12381TwistCurve>,
     p: &ShortWeierstrassProjectivePoint<BLS12381Curve>,
@@ -323,7 +323,7 @@ pub fn frobenius(f: &Fp12E) -> Fp12E {
     Fp12E::new([c1, c2]) //c1 + c2 * w
 }
 
-fn frobenius_square(
+pub fn frobenius_square(
     f: &FieldElement<Degree12ExtensionField>,
 ) -> FieldElement<Degree12ExtensionField> {
     let [a, b] = f.value();
