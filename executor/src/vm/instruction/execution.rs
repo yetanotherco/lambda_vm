@@ -1,5 +1,3 @@
-use rand::Rng;
-
 use crate::vm::{
     instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth},
     logs::Log,
@@ -14,7 +12,6 @@ enum SyscallNumbers {
     Panic = 2,
     Commit = 3,
     GetPrivateInputs = 4,
-    Random = 5,
 }
 
 impl TryFrom<u32> for SyscallNumbers {
@@ -25,7 +22,6 @@ impl TryFrom<u32> for SyscallNumbers {
             2 => Ok(SyscallNumbers::Panic),
             3 => Ok(SyscallNumbers::Commit),
             4 => Ok(SyscallNumbers::GetPrivateInputs),
-            5 => Ok(SyscallNumbers::Random),
             _ => Err(()),
         }
     }
@@ -275,16 +271,6 @@ impl Instruction {
                         let private_inputs = memory.load_private_inputs()?;
                         for (i, byte) in private_inputs.iter().enumerate() {
                             memory.store_byte(pointer + i as u32, *byte);
-                        }
-                    }
-                    SyscallNumbers::Random => {
-                        // get private inputs
-                        let pointer = registers.read(10)?;
-                        let len = registers.read(11)? as usize;
-                        let mut rng = rand::rng();
-                        for i in 0..len {
-                            let byte: u8 = rng.random();
-                            memory.store_byte(pointer + i as u32, byte);
                         }
                     }
                 }

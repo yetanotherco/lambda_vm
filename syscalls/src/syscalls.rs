@@ -9,7 +9,6 @@ enum SyscallNumbers {
     Panic = 2,
     Commit = 3,
     GetPrivateInputs = 4,
-    Random = 5,
 }
 
 /// This is a template for printing in the vm
@@ -186,27 +185,6 @@ pub unsafe extern "C" fn __atomic_compare_exchange_8(
             false
         }
     }
-}
-
-/// # Safety
-///
-/// This function should not be called by the user
-/// It is only for rust std internal uses
-#[unsafe(no_mangle)]
-pub extern "C" fn sys_rand(buf: *mut u8, len: usize) -> isize {
-    print_string("sys_rand called\n");
-    unsafe {
-        asm!(
-            "mv a0, {ptr}",
-            "mv a1, {len}",
-            "mv a7, {syscall_number}", // syscall number for rand
-            "ecall",
-            ptr = in(reg) buf,
-            len = in(reg) len,
-            syscall_number = in(reg) SyscallNumbers::Random as usize,
-        );
-    }
-    len.try_into().unwrap_or(-1)
 }
 
 /// # Safety
