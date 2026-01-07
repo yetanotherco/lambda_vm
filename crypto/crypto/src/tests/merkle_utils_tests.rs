@@ -1,7 +1,10 @@
 use alloc::vec::Vec;
 use math::field::{element::FieldElement, fields::u64_prime_field::U64PrimeField};
 
-use crate::merkle_tree::{traits::IsMerkleTreeBackend, utils::{build, complete_until_power_of_two}};
+use crate::merkle_tree::{
+    traits::IsMerkleTreeBackend,
+    utils::{build, complete_until_power_of_two},
+};
 use crate::tests::merkle_tests::TestBackend;
 
 const MODULUS: u64 = 13;

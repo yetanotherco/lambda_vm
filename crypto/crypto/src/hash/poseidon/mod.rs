@@ -95,4 +95,3 @@ impl<P: PermutationParameters> Poseidon for P {
         state[0].clone()
     }
 }
-

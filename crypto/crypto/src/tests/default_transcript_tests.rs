@@ -57,30 +57,15 @@ type Fp4E = FieldElement<Degree4BabyBearU32ExtensionField>;
 #[test]
 fn quartic_baby_bear_transcript_distinguish_different_fe() {
     let mut transcript_1 = DefaultTranscript::<Degree4BabyBearU32ExtensionField>::default();
-    transcript_1.append_field_element(&Fp4E::new([
-        FE::one(),
-        FE::zero(),
-        FE::zero(),
-        FE::zero(),
-    ]));
+    transcript_1.append_field_element(&Fp4E::new([FE::one(), FE::zero(), FE::zero(), FE::zero()]));
     let sample_1 = transcript_1.sample_field_element();
 
     let mut transcript_2 = DefaultTranscript::<Degree4BabyBearU32ExtensionField>::default();
-    transcript_2.append_field_element(&Fp4E::new([
-        FE::zero(),
-        FE::zero(),
-        FE::zero(),
-        FE::one(),
-    ]));
+    transcript_2.append_field_element(&Fp4E::new([FE::zero(), FE::zero(), FE::zero(), FE::one()]));
     let sample_2 = transcript_2.sample_field_element();
 
     let mut transcript_3 = DefaultTranscript::<Degree4BabyBearU32ExtensionField>::default();
-    transcript_3.append_field_element(&Fp4E::new([
-        FE::one(),
-        FE::zero(),
-        FE::zero(),
-        FE::zero(),
-    ]));
+    transcript_3.append_field_element(&Fp4E::new([FE::one(), FE::zero(), FE::zero(), FE::zero()]));
     let sample_3 = transcript_3.sample_field_element();
 
     assert!(sample_1 != sample_2);

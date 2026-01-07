@@ -69,4 +69,3 @@ where
         level_begin_index = new_level_begin_index;
     }
 }
-

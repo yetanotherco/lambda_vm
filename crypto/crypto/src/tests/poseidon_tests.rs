@@ -1,5 +1,5 @@
-use crate::hash::poseidon::starknet::PoseidonCairoStark252;
 use crate::hash::poseidon::Poseidon;
+use crate::hash::poseidon::starknet::PoseidonCairoStark252;
 use math::field::{
     element::FieldElement, fields::fft_friendly::stark_252_prime_field::Stark252PrimeField,
 };

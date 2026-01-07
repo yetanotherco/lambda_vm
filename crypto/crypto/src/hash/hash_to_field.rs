@@ -65,4 +65,3 @@ fn build_two_to_the_nth<M: IsModulus<UnsignedInteger<N>> + Clone, const N: usize
     }
     FieldElement::from_hex_unchecked(&two_to_the_nth) + FieldElement::one()
 }
-
