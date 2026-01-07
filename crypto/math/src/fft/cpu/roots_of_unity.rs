@@ -39,7 +39,11 @@ impl<F: IsFFTField> TwiddleCache<F> {
 
     /// Gets twiddle factors from cache, computing and caching them if not present.
     /// This is the primary interface for twiddle factor retrieval.
-    pub fn get_or_compute(&self, order: u64, config: RootsConfig) -> Result<Vec<FieldElement<F>>, FFTError> {
+    pub fn get_or_compute(
+        &self,
+        order: u64,
+        config: RootsConfig,
+    ) -> Result<Vec<FieldElement<F>>, FFTError> {
         // First, try to read from cache
         {
             let read_guard = self.cache.read().unwrap();

@@ -238,8 +238,8 @@ pub fn in_place_nr_2radix_fft_parallel<F, E>(
                 let w = &twiddles[group];
 
                 // Process butterflies in parallel within this group
-                let (left, right) = input[first_in_group..first_in_group + group_size]
-                    .split_at_mut(half_group);
+                let (left, right) =
+                    input[first_in_group..first_in_group + group_size].split_at_mut(half_group);
 
                 left.par_iter_mut()
                     .zip(right.par_iter_mut())
@@ -300,7 +300,11 @@ pub fn in_place_nr_4radix_fft_parallel<F, E>(
                     );
 
                     for i in 0..quarter_group {
-                        let (j, k, l) = (i + quarter_group, i + 2 * quarter_group, i + 3 * quarter_group);
+                        let (j, k, l) = (
+                            i + quarter_group,
+                            i + 2 * quarter_group,
+                            i + 3 * quarter_group,
+                        );
 
                         let zw1 = w1 * &chunk[k];
                         let tw1 = w1 * &chunk[l];
