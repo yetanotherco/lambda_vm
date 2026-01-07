@@ -31,31 +31,34 @@ between two options, depending on the input flag `signed`.
 In the case of unsigned comparison, we simply need `unsigned_lt`, indicating
 that a wraparound (carry bit) modulo $2^64$ is needed to go from `rhs` to `lhs` via addition.
 For the case of signed comparison, we first need some case analysis.
-We can conclude that $a < b$ exactly when any of the following disjoint events happens.
 
-- $(a < 0) and (b >= 0)$
-- $(a < 0) and (b < 0) and (a < b)$
-- $(a >= 0) and (b >= 0) and (a < b)$
+We split $a < b$ into four disjoint cases, conditioned on the sign of $a$ and $b$.
+Recall that the sign of a number in two's complement can be read off from the MSB,
+being $1$ for a negative number and $0$ for a positive one.
+For this analysis, we denote the MSB of `lhs` as $A$ and the MSB of `rhs` as $B$.
 
-We represent can the comparisons of inputs to zero as the MSB or sign bits,
-which we shall denote as $A$ for `lhs` and $B$ for `rhs`.
-From this, we obtain the boolean formula $A dash(B) or A B C or dash(A) dash(B) C$,
-where we let $C$ also denote the indicator of $(a - b < 0) and (A == B)$.
-Since our cases were disjoint, this can be computed as the binary-valued polynomial
++ $dash(A) and B and (a < b)$
++ $A and dash(B) and (a < b)$
++ $A and B and (a < b)$
++ $dash(A) and dash(B) and (a < b)$
+
+The first case is evidently false, while the second case simplifies to $A and dash(B)$.
+For the third and fourth case, observe that when $A = B$, the $<$ relation is preserved
+by the modular correspondence between $[-2^(31), 2^(31))$ and $[0, 2^(64))$.
+Importantly, this modular correspondence is merely a reinterpretation of the
+bits or values of $a$ and $b$, due to the representation in two's complement.
+Hence, we can introduce the value $C = #`unsigned_lt`$, that accurately represents
+the relation $a < b$ when $A = B$.
+
+Combining our three remaining cases, we obtain the boolean formula $A dash(B) or A B C or dash(A) dash(B) C$.
+Since the cases are disjoint, this can be computed as the binary-valued polynomial
 $P(A, B, C) = A (1 - B) + A B C + (1 - A) (1 - B) C$.
 
-Observe that after modular reduction to the range $[0, 2^64)$,
-when $A == B$, the ordering $a < b$ is preserved, so $C$ can be expressed
----just as in the unsigned case--- by the overflow of the addition.
-
 The polynomial $P$ can be simplified to a total degree of two.
-We claim that the polynomial $Q(A, B, C) = A dot (1 - B) + A dot C + (1 - B) dot C$
+We claim that the polynomial $Q(A, B, C) = A (1 - B) + A C + (1 - B) C$
 is, for the purposes of this chip, equivalent to $P$.
-Through exhaustive checking, one can verify that the only binary input
-for which $P(A, B, C) != Q(A, B, C)$, is the triple $(A, B, C) = (1, 0, 1)$.
-This, however, corresponds to the case where $a > b$ in the reduction to $[0, 2^64)$,
-*and* an overflow is said to occur to go $b$ to $a$ by addition,
-which is a contradiction with the correctness of the addition.
+An exhaustive check shows that $P(A, B, C) != Q(A, B, C)$, only for the triple $(A, B, C) = (1, 0, 1)$.
+This is however impossible due to the correctness of `ADD`.
 In more detail, if we let $s$ be the (range-checked) difference $a - b$
 (so the equivalent of the #`lhs_sub_rhs` column),
 and $x'$ be the most significant word of $x$,
