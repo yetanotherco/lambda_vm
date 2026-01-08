@@ -7,5 +7,3 @@ Usage:
     cargo run --bin cli COMPILED_PROGRAM_ELF
 ```
  You can supply any compiled elf file, you can find some at `executor/program_artifacts`.
-
-You may also add the flag `--verbose` to print out the register values before each step and the instruction to be executed.

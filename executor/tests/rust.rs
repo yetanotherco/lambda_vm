@@ -15,7 +15,7 @@ fn run_program_without_expect(
         println!("0x{:08x}: 0x{:08x}", addr, word);
     });
 
-    run_program(program.image, program.entry_point, true, private_inputs)
+    run_program(program.image, program.entry_point, private_inputs)
 }
 
 fn run_program_and_check_public_output(
