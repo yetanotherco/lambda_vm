@@ -246,14 +246,13 @@ fn build_auxiliary_trace_column<F, E>(
         .collect::<Vec<_>>();
 
     // Challenges
-    // TODO: check how to obtain more challenges as needed
     let z = challenges[0].clone();
     let alpha = &challenges[1];
-    // Coefficients for value column
+    // Coefficients for each value column
     let coeffs: Vec<FieldElement<E>> = (0..values.len()).map(|i| alpha.pow(i)).collect();
 
     let trace_len = trace.num_rows();
-    let mut aux_col = Vec::new();
+    let mut aux_col: Vec<FieldElement<E>> = Vec::new();
 
     // fingerprint = v[0] * alpha^0 + v[1] * alpha^1 +...+ value[n] * alpha^n + z
     // Where v are the values for each row and n the number of value columns
@@ -266,8 +265,9 @@ fn build_auxiliary_trace_column<F, E>(
         + z.clone())
     .inv()
     .unwrap();
-    // TODO: use all flags
-    let flag = &flags[0][0];
+    // Sum of all flags
+    let flag: FieldElement<F> = flags.iter().map(|flag_column| flag_column[0].clone()).sum();
+    // Fill first aux column row (should be overwritten next)
     aux_col.push(flag * fingerprint_inv.clone());
 
     for i in 0..trace_len - 1 {
@@ -281,7 +281,13 @@ fn build_auxiliary_trace_column<F, E>(
             + z.clone())
         .inv()
         .unwrap();
-        aux_col.push(&aux_col[i] + &flags[0][i + 1] * fingerprint_inv);
+        // Sum of all flags
+        let flag: FieldElement<F> = flags
+            .iter()
+            .map(|flag_column| flag_column[i + 1].clone())
+            .sum();
+        // Fill the auxiliary column row
+        aux_col.push(&aux_col[i] + flag * fingerprint_inv);
     }
 
     for (i, aux_elem) in aux_col.iter().enumerate().take(trace.num_rows()) {
