@@ -652,27 +652,4 @@ mod tests {
             &mut DefaultTranscript::<Degree4BabyBearU32ExtensionField>::new(&[]),
         ));
     }
-
-    //     #[test]
-    //     fn test_cpu_table_from_logs() {
-    //         let logs = get_rust_logs();
-    //         let mut trace = cpu_trace_from_logs(logs);
-
-    //         let proof_options = ProofOptions::default_test_options();
-
-    //         let proof = Prover::<CPUTableAIR>::prove(
-    //             &mut trace,
-    //             &(),
-    //             &proof_options,
-    //             DefaultTranscript::<Degree4BabyBearU32ExtensionField>::new(&[]),
-    //         )
-    //         .unwrap();
-
-    //         assert!(Verifier::<CPUTableAIR>::verify(
-    //             &proof,
-    //             &(),
-    //             &proof_options,
-    //             DefaultTranscript::<Degree4BabyBearU32ExtensionField>::new(&[]),
-    //         ));
-    //     }
 }
