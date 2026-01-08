@@ -27,6 +27,16 @@ The #add constraint template has the following interface:
 where `cond` is any value described by an expression _of degree at most $1$_.
 Note that #highlighted_code("ADD<sum; lhs, rhs>") can be used to denote the _unconditional_ application of the #add template to `lhs`, `rhs`, and `sum`.
 
+#let sub = raw("SUB")
+=== #sub
+For ease of notation, we moreover introduce the #sub constraint template.
+It's interface
+#block(radius: 5pt, width: 100%, inset: 1.5em, fill: luma(230), raw("cond => SUB<diff; lhs, rhs>"))
+maps onto the #add template as 
+#block(radius: 5pt, width: 100%, inset: 1.5em, fill: luma(230), raw("cond => ADD<lhs; rhs, diff>"))
+It constrains that $#`diff` = #`lhs` - #`rhs` mod 2^64$ when the expression `cond` is non-zero.
+As with #add, #highlighted_code("SUB<diff; lhs, rhs>") can be used to denote the _unconditional_ application of the template.
+
 == Variables
 #render_chip_column_table(chip, config)
 
