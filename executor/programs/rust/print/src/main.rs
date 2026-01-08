@@ -17,9 +17,11 @@ pub fn print_string(s: &str) {
         asm!(
             "mv a0, {ptr}",
             "mv a1, {len}",
+            "mv a7, {syscall_number}", // syscall number for print
             "ecall",
             ptr = in(reg) s.as_ptr(),
             len = in(reg) s.len(),
+            syscall_number = in(reg) 1,
         );
     }
 }

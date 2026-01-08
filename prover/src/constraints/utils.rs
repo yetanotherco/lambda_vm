@@ -1,5 +1,6 @@
-use math::field::fields::fft_friendly::{
-    babybear_u32::Babybear31PrimeField, quartic_babybear_u32::Degree4BabyBearU32ExtensionField,
+use math::field::{
+    fields::fft_friendly::babybear_u32::Babybear31PrimeField,
+    traits::{IsField, IsSubFieldOf},
 };
 use stark::{fri::FieldElement, table::TableView};
 
@@ -8,18 +9,16 @@ lazy_static::lazy_static! {
         FieldElement::<Babybear31PrimeField>::from(256);
 }
 
-pub(crate) fn compute_element_from_two_limbs_starting_at(
-    step: &TableView<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>,
+pub(crate) fn compute_element_from_two_limbs_starting_at<F, E>(
+    step: &TableView<F, E>,
     index: usize,
-) -> FieldElement<Babybear31PrimeField> {
-    step.get_main_evaluation_element(0, index)
-        + *TWO_FIFTY_SIX * step.get_main_evaluation_element(0, index + 1)
-}
+) -> FieldElement<F>
+where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+{
+    let two_fifty_six = FieldElement::<F>::from(256);
 
-pub(crate) fn compute_element_from_two_limbs_starting_at_extension(
-    step: &TableView<Degree4BabyBearU32ExtensionField, Degree4BabyBearU32ExtensionField>,
-    index: usize,
-) -> FieldElement<Degree4BabyBearU32ExtensionField> {
     step.get_main_evaluation_element(0, index)
-        + *TWO_FIFTY_SIX * step.get_main_evaluation_element(0, index + 1)
+        + two_fifty_six * step.get_main_evaluation_element(0, index + 1)
 }
