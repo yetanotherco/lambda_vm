@@ -22,14 +22,14 @@ pub struct AirWithLookup<
     E: IsField + Send + Sync,
     B: BoundaryConstraintBuilder<F, E>,
 > {
-    pub context: AirContext,
-    pub trace_length: usize,
-    pub pub_inputs: LookUpPublicInputs<F>,
-    pub step_size: usize,
-    pub trace_layout: (usize, usize),
-    pub transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
-    pub auxiliary_trace_build_data: AuxiliaryTraceBuildData,
-    pub boundary_constraint_builder: PhantomData<B>,
+    context: AirContext,
+    trace_length: usize,
+    pub_inputs: LookUpPublicInputs<F>,
+    step_size: usize,
+    trace_layout: (usize, usize),
+    transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
+    auxiliary_trace_build_data: AuxiliaryTraceBuildData,
+    boundary_constraint_builder: PhantomData<B>,
 }
 
 impl<

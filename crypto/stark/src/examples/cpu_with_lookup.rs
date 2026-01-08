@@ -1,5 +1,3 @@
-use std::marker::PhantomData;
-
 use crate::{
     constraints::{
         lookup::{
@@ -32,31 +30,34 @@ pub fn new_cpu_air_with_lookup(
         num_transition_constraints: transition_constraints.len(),
     };
 
-    AirWithLookup {
+    let step_size = 1;
+    let trace_layout = (5, 3);
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: vec![
+            // Interaction with ADD table
+            TableInteraction {
+                // ADD flag column
+                flag_columns: vec![0],
+                // values a , b, c
+                value_columns: vec![2, 3, 4],
+            },
+            // Interaction with MUL table
+            TableInteraction {
+                // MUL flag column
+                flag_columns: vec![1],
+                // values a , b, c
+                value_columns: vec![2, 3, 4],
+            },
+        ],
+    };
+
+    AirWithLookup::create(
+        auxiliary_trace_build_data,
+        pub_inputs,
         context,
         trace_length,
-        pub_inputs,
-        step_size: 1,
-        trace_layout: (5, 3),
+        step_size,
+        trace_layout,
         transition_constraints,
-        auxiliary_trace_build_data: AuxiliaryTraceBuildData {
-            interactions: vec![
-                // Interaction with ADD table
-                TableInteraction {
-                    // ADD flag column
-                    flag_columns: vec![0],
-                    // values a , b, c
-                    value_columns: vec![2, 3, 4],
-                },
-                // Interaction with MUL table
-                TableInteraction {
-                    // MUL flag column
-                    flag_columns: vec![1],
-                    // values a , b, c
-                    value_columns: vec![2, 3, 4],
-                },
-            ],
-        },
-        boundary_constraint_builder: PhantomData::<NullBoundaryConstraintBuilder>,
-    }
+    )
 }

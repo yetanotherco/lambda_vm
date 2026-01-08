@@ -1,5 +1,3 @@
-use std::marker::PhantomData;
-
 use crate::{
     constraints::{
         lookup::{
@@ -32,24 +30,28 @@ pub fn new_add_air_with_lookup(
         num_transition_constraints: transition_constraints.len(),
     };
 
-    AirWithLookup {
+    let step_size = 1;
+    let trace_layout = (4, 2);
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: vec![
+            // Interaction with CPU table
+            TableInteraction {
+                // multiplicity column
+                flag_columns: vec![3],
+                // values a , b, c
+                value_columns: vec![0, 1, 2],
+            },
+        ],
+    };
+
+    AirWithLookup::create(
+        auxiliary_trace_build_data,
+        pub_inputs,
         context,
         trace_length,
-        pub_inputs,
-        step_size: 1,
-        trace_layout: (4, 2),
+        step_size,
+        trace_layout,
         transition_constraints,
-        auxiliary_trace_build_data: AuxiliaryTraceBuildData {
-            interactions: vec![
-                // Interaction with CPU table
-                TableInteraction {
-                    // multiplicity column
-                    flag_columns: vec![3],
-                    // values a , b, c
-                    value_columns: vec![0, 1, 2],
-                },
-            ],
-        },
-        boundary_constraint_builder: PhantomData::<NullBoundaryConstraintBuilder>,
-    }
+    )
 }
