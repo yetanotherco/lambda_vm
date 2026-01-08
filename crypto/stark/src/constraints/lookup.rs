@@ -157,9 +157,9 @@ where
         &self,
         _transcript: &mut dyn IsStarkTranscript<E, F>,
     ) -> Vec<FieldElement<E>> {
-        // Assumption: only lookups use aux trace, only lookups use rap challenges, logic from wrapped air is ignores
-        // This method shall be removed and rap challenges shall be sampled only once for all airs in prove methdod after comitting
-        vec![]
+        // TODO: rap challenges should be built beforehand for each interaction pair, not built here
+        // Toy values used for intial testing
+        vec![FieldElement::one(), FieldElement::one()]
     }
     fn boundary_constraints(&self, rap_challenges: &[FieldElement<E>]) -> BoundaryConstraints<E> {
         let mut boundary_constraints = vec![];

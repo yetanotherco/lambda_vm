@@ -17,7 +17,7 @@ use math::field::fields::fft_friendly::{
 type F = Babybear31PrimeField;
 type E = Degree4BabyBearExtensionField;
 
-pub fn new_mul_air_with_lookup(
+pub fn new_cpu_air_with_lookup(
     trace_length: usize,
     pub_inputs: LookUpPublicInputs<F>,
     proof_options: &ProofOptions,
@@ -27,7 +27,7 @@ pub fn new_mul_air_with_lookup(
 
     let context = AirContext {
         proof_options: proof_options.clone(),
-        trace_columns: 5,
+        trace_columns: 8,
         transition_offsets: vec![0, 1],
         num_transition_constraints: transition_constraints.len(),
     };

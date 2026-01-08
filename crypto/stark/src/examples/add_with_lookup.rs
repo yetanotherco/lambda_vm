@@ -27,7 +27,7 @@ pub fn new_add_air_with_lookup(
 
     let context = AirContext {
         proof_options: proof_options.clone(),
-        trace_columns: 5,
+        trace_columns: 6,
         transition_offsets: vec![0, 1],
         num_transition_constraints: transition_constraints.len(),
     };
@@ -37,7 +37,7 @@ pub fn new_add_air_with_lookup(
         trace_length,
         pub_inputs,
         step_size: 1,
-        trace_layout: (3, 2),
+        trace_layout: (4, 2),
         transition_constraints,
         auxiliary_trace_build_data: AuxiliaryTraceBuildData {
             interactions: vec![
