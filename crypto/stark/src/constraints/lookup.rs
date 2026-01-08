@@ -260,15 +260,15 @@ fn build_auxiliary_trace_column<F, E>(
     let trace_len = trace.num_rows();
     let mut aux_col: Vec<FieldElement<E>> = Vec::new();
 
-    // fingerprint = v[0] * alpha^0 + v[1] * alpha^1 +...+ value[n] * alpha^n + z
+    // fingerprint = z - (v[0] * alpha^0 + v[1] * alpha^1 +...+ value[n] * alpha^n)
     // Where v are the values for each row and n the number of value columns
     // We calculate the first fingerprint separately using the values from the first row
-    let fingerprint_inv: FieldElement<E> = (values
+    let fingerprint_inv: FieldElement<E> = (-(values
         .iter()
         .zip(coeffs.iter())
         .map(|(v, coeff)| v[0].clone() * coeff)
         .sum::<FieldElement<E>>()
-        + z.clone())
+        + z.clone()))
     .inv()
     .unwrap();
     // Sum of all flags
@@ -277,13 +277,13 @@ fn build_auxiliary_trace_column<F, E>(
     aux_col.push(flag * fingerprint_inv.clone());
 
     for i in 0..trace_len - 1 {
-        // fingerprint = v[0] * alpha^0 + v[1] * alpha^1 +...+ value[n] * alpha^n + z
+        // fingerprint = z - (v[0] * alpha^0 + v[1] * alpha^1 +...+ value[n] * alpha^n)
         // Where v are the values for each row and n the number of value columns
-        let fingerprint_inv: FieldElement<E> = (values
+        let fingerprint_inv: FieldElement<E> = (-(values
             .iter()
             .zip(coeffs.iter())
             .map(|(v, coeff)| v[i].clone() * coeff)
-            .sum::<FieldElement<E>>()
+            .sum::<FieldElement<E>>())
             + z.clone())
         .inv()
         .unwrap();
