@@ -8,15 +8,13 @@ use executor::{elf::Elf, vm::execution::run_program};
 struct Args {
     #[arg(value_parser, value_hint=ValueHint::FilePath)]
     filename: PathBuf,
-    #[arg(long = "verbose", value_parser)]
-    verbose: bool,
 }
 
 fn main() {
     let args = Args::parse_from(std::env::args());
     let elf_data = std::fs::read(args.filename).expect("Failed to read elf file");
     let program = Elf::load(&elf_data).expect("Failed to load elf program");
-    let (_, _logs) = run_program(program.image, program.entry_point, args.verbose, vec![])
-        .expect("Failed to run program");
+    let (_, _logs) =
+        run_program(program.image, program.entry_point, vec![]).expect("Failed to run program");
     // TODO: Prove program execution using logs
 }
