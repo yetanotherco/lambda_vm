@@ -42,7 +42,7 @@ impl<
     pub fn create(
         auxiliary_trace_build_data: AuxiliaryTraceBuildData,
         pub_inputs: LookUpPublicInputs<F>,
-        context: AirContext,
+        mut context: AirContext,
         trace_length: usize,
         step_size: usize,
         trace_layout: (usize, usize),
@@ -63,6 +63,8 @@ impl<
             auxiliary_trace_build_data.interactions.len(),
         );
         transition_constraints.push(Box::new(grand_sum_constraint));
+        // Update context
+        context.num_transition_constraints = transition_constraints.len();
         Self {
             context,
             trace_length,
