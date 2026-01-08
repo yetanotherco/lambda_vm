@@ -8,10 +8,10 @@ use math::field::fields::fft_friendly::{
     babybear_u32::Babybear31PrimeField, quartic_babybear_u32::Degree4BabyBearU32ExtensionField,
 };
 use stark::{
-    multi_table_prover::{Airs, multi_prove},
-    multi_table_verifier::{AirsAndProofs, multi_verify},
     proof::options::ProofOptions,
+    prover::{IsStarkProver, Prover},
     traits::AIR,
+    verifier::{IsStarkVerifier, Verifier},
 };
 
 pub fn run_program_and_prover(elf_path: &str) {
@@ -31,29 +31,37 @@ pub fn run_program_and_prover(elf_path: &str) {
     println!("CPU table: {:?}", trace.cpu_trace_table.num_rows());
     println!("Decode table: {:?}", trace.decode_trace_table.num_rows());
 
-    // let airs: Airs<_, _, _> = vec![
-    //     (&cpu_air, &mut trace.cpu_trace_table),
-    //     (&decode_air, &mut trace.decode_trace_table),
-    // ];
+    let airs: Vec<(
+        &dyn AIR<
+            Field = Babybear31PrimeField,
+            FieldExtension = Degree4BabyBearU32ExtensionField,
+            PublicInputs = (),
+        >,
+        &mut _,
+    )> = vec![
+        (&cpu_air, &mut trace.cpu_trace_table),
+        (&decode_air, &mut trace.decode_trace_table),
+    ];
 
-    // let proof = multi_prove(
-    //     airs,
-    //     &mut DefaultTranscript::<Degree4BabyBearU32ExtensionField>::new(&[]),
-    // )
-    // .unwrap();
+    let proofs = Prover::multi_prove(
+        airs,
+        &mut DefaultTranscript::<Degree4BabyBearU32ExtensionField>::new(&[]),
+    )
+    .unwrap();
 
-    // let air_and_proof: AirsAndProofs = vec![()];
+    let airs_and_proofs: Vec<(
+        &dyn AIR<
+            Field = Babybear31PrimeField,
+            FieldExtension = Degree4BabyBearU32ExtensionField,
+            PublicInputs = (),
+        >,
+        &_,
+    )> = vec![(&cpu_air, &proofs[0]), (&decode_air, &proofs[1])];
 
-    // // pub type AirsAndProofs<'a, F, E, PI> = Vec<(
-    // //     &'a dyn AIR<Field = F, FieldExtension = E, PublicInputs = PI>,
-    // //     &'a StarkProof<F, E>,
-    // // )>;
-
-    // assert!(multi_verify(
-    //     &proof,
-    //     &air,
-    //     &mut DefaultTranscript::<Degree4BabyBearU32ExtensionField>::new(&[]),
-    // ));
+    assert!(Verifier::multi_verify(
+        &airs_and_proofs,
+        &mut DefaultTranscript::<Degree4BabyBearU32ExtensionField>::new(&[]),
+    ));
 }
 
 #[cfg(test)]
