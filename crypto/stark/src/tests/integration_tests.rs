@@ -663,16 +663,11 @@ fn test_multi_airs_log_up() {
 
     // TODO: This should be done by the prover.
     let cpu_look_up_value = cpu_trace.aux_table.get(7, 2);
-    let add_look_up_value = add_trace.aux_table.get(3, 1);
-    let mul_look_up_value = mul_trace.aux_table.get(3, 1);
-    dbg!(
-        cpu_look_up_value.to_hex_str(),
-        add_look_up_value.to_hex_str(),
-        mul_look_up_value.to_hex_str()
-    );
+    let add_look_up_value = -add_trace.aux_table.get(3, 1);
+    let mul_look_up_value = -mul_trace.aux_table.get(3, 1);
 
     let look_up_values: Vec<&FieldElement<Degree4BabyBearExtensionField>> =
-        vec![cpu_look_up_value, add_look_up_value, mul_look_up_value];
+        vec![cpu_look_up_value, &add_look_up_value, &mul_look_up_value];
 
     let airs_and_proofs: Vec<(
         &dyn AIR<
