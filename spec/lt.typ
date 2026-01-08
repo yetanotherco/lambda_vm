@@ -35,7 +35,8 @@ For the case of signed comparison, we first need some case analysis.
 We split $a < b$ into four disjoint cases, conditioned on the sign of $a$ and $b$.
 Recall that the sign of a number in two's complement can be read off from the MSB,
 being $1$ for a negative number and $0$ for a positive one.
-For this analysis, we denote the MSB of `lhs` as $A$ and the MSB of `rhs` as $B$.
+For this analysis, we denote the MSB of $a$ as $A$ and the MSB of $b$ as $B$.
+The four disjoint cases then become:
 
 + $dash(A) and B and (a < b)$
 + $A and dash(B) and (a < b)$
@@ -51,19 +52,19 @@ Hence, we can introduce the value $C = #`unsigned_lt`$, that accurately represen
 the relation $a < b$ when $A = B$.
 
 Combining our three remaining cases, we obtain the boolean formula $A dash(B) or A B C or dash(A) dash(B) C$.
-Since the cases are disjoint, this can be computed as the binary-valued polynomial
+Since the cases are disjoint, this can be computed with the binary-valued polynomial
 $P(A, B, C) = A (1 - B) + A B C + (1 - A) (1 - B) C$.
 
 The polynomial $P$ can be simplified to a total degree of two.
 We claim that the polynomial $Q(A, B, C) = A (1 - B) + A C + (1 - B) C$
 is, for the purposes of this chip, equivalent to $P$.
-An exhaustive check shows that $P(A, B, C) != Q(A, B, C)$, only for the triple $(A, B, C) = (1, 0, 1)$.
-This is however impossible due to the correctness of `ADD`.
+An exhaustive check shows that $P(A, B, C) != Q(A, B, C)$ only for the triple $(A, B, C) = (1, 0, 1)$.
+This is, however, impossible due to the correctness of `ADD`.
 In more detail, if we let $s$ be the (range-checked) difference $a - b$
 (so the equivalent of the #`lhs_sub_rhs` column),
-and $x'$ be the most significant word of $x$,
+and $x'$ denote the most significant word of a variable $x$,
 we need $c dot 2^32 + a' = b' + s' + #`carry[0]`$, by the definition of `carry`.
-However, the left hand side of this, is at least $3 dot 2^31$, as $(A, C) = (1, 1)$,
+However, the left hand side of this is at least $3 dot 2^31$, as $(A, C) = (1, 1)$,
 and the right hand side is at most $(2^31 - 1) + (2^32 - 1) + 1 = 3 dot 2^31 - 1$.
 Therefore, we can use $Q$ to constrain `lt` when `signed = 1`.
 

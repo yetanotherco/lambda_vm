@@ -48,7 +48,7 @@ desc = "The most significant bit of `rhs`"
 [[variables.virtual]]
 name = "carry"
 type = ["Bit", 2]
-desc = "The carry of subtracting limbs of `rhs` from those of `lhs`"
+desc = "The carry for adding `lhs_sub_rhs` back to `rhs`"
 def = {idx = "i", polys = [
   {range = [0], poly = ["*", ["^", 2, -32], ["-", ["+", ["idx", "rhs", 0], ["idx", ["cast", "lhs_sub_rhs", "DWordWL"], 0]], ["idx", "lhs", 0]]]},
   {range = [1], poly = ["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "rhs", "DWordWL"], 1], ["idx", ["cast", "lhs_sub_rhs", "DWordWL"], 1], ["idx", "carry", 0]], ["idx", ["cast", "lhs", "DWordWL"], 1]]]},
