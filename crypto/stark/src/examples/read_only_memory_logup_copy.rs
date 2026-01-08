@@ -8,8 +8,8 @@ use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
         lookup::{
-            AirWithLookup, AuxiliaryColumnBuildData, AuxiliaryTraceBuildData, LookUpPublicInputs,
-            LookupPublicInputsPerAuxColumn, NullBoundaryConstraintBuilder,
+            AirWithLookup, AuxiliaryTraceBuildData, LookUpPublicInputs,
+            LookupPublicInputsPerInteraction, NullBoundaryConstraintBuilder, TableInteraction,
         },
         transition::TransitionConstraint,
     },
@@ -370,7 +370,7 @@ where
     };
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        columns: vec![AuxiliaryColumnBuildData {
+        interactions: vec![TableInteraction {
             flag_columns: vec![4],           // m
             value_columns: vec![0, 1, 2, 3], // a, v, a_sorted, v_sorted
         }],
@@ -419,7 +419,7 @@ where
 {
     fn into(self) -> LookUpPublicInputs<F> {
         LookUpPublicInputs {
-            columns: vec![LookupPublicInputsPerAuxColumn {
+            columns: vec![LookupPublicInputsPerInteraction {
                 flags: vec![self.m0],
                 values: vec![self.a0, self.v0, self.a_sorted_0, self.v_sorted_0],
             }],

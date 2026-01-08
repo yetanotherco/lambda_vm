@@ -12,7 +12,6 @@ use crate::{
         transition::TransitionConstraint,
     },
     context::AirContext,
-    table::TableView,
     trace::TraceTable,
     traits::TransitionEvaluationContext,
 };
@@ -49,17 +48,21 @@ impl<
         trace_layout: (usize, usize),
         mut transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
     ) -> Self {
-        // PermutationConstraint being used as placeholder
-        transition_constraints.push(Box::new(PermutationConstraint::<F, E>::new(
-            // TODO: should be infered from AuxiliaryTraceBuildData
-            PermutationColumns {
-                a: 0,
-                v: 0,
-                a_s: 0,
-                v_s: 0,
-                m: 0,
-            },
-        )));
+        // Add a transition constraint for each auxiliary column representing a table interaction
+        for (i, interaction) in auxiliary_trace_build_data.interactions.iter().enumerate() {
+            let constraint = LookupTransitionConstraint::new(
+                interaction.clone(),
+                i,
+                transition_constraints.len() + i,
+            );
+            transition_constraints.push(Box::new(constraint));
+        }
+        // Add a transition constraint for the grand sum auxiliary constraint (sum of all previous aux columns)
+        let grand_sum_constraint = LookupGrandSumTransitionConstraint::new(
+            transition_constraints.len(),
+            auxiliary_trace_build_data.interactions.len(),
+        );
+        transition_constraints.push(Box::new(grand_sum_constraint));
         Self {
             context,
             trace_length,
@@ -179,6 +182,7 @@ pub struct AuxiliaryTraceBuildData {
 }
 
 /// Struct representing how to build a given auxiliary column
+#[derive(Clone)]
 pub struct TableInteraction {
     pub flag_columns: Vec<usize>,
     pub value_columns: Vec<usize>,
@@ -320,53 +324,41 @@ where
         .collect()
 }
 
-// Placeholder constraint, not the one used for lookups
-//
-// Transition constraint that ensures that the sorted columns are a permutation of the original ones.
-/// We are using the LogUp construction described in:
-/// <https://0xpolygonmiden.github.io/miden-vm/design/lookups/logup.html>.
-/// See also our post of LogUp argument in blog.lambdaclass.com.
-#[derive(Clone)]
-pub struct PermutationConstraint<
-    F: IsSubFieldOf<E> + IsFFTField + Send + Sync,
-    E: IsField + Send + Sync,
-> {
-    phantom: PhantomData<(F, E)>,
-    columns: PermutationColumns,
+// Constraint for each auxiliary column representing a table interaction
+struct LookupTransitionConstraint {
+    // Indicates columns with flags and values used to build the auxiliary column
+    interaction: TableInteraction,
+    // Index of the auxiliary column
+    interaction_number: usize,
+    // Index of the constraint
+    constraint_idx: usize,
 }
-impl<F, E> PermutationConstraint<F, E>
-where
-    F: IsSubFieldOf<E> + IsFFTField + Send + Sync,
-    E: IsField + Send + Sync,
-{
-    pub fn new(columns: PermutationColumns) -> Self {
+
+impl LookupTransitionConstraint {
+    pub fn new(
+        interaction: TableInteraction,
+        interaction_number: usize,
+        constraint_idx: usize,
+    ) -> Self {
         Self {
-            columns,
-            phantom: PhantomData::<(F, E)>,
+            interaction,
+            interaction_number,
+            constraint_idx,
         }
     }
 }
 
-#[derive(Clone)]
-pub struct PermutationColumns {
-    pub a: usize,
-    pub v: usize,
-    pub a_s: usize,
-    pub v_s: usize,
-    pub m: usize,
-}
-
-impl<F, E> TransitionConstraint<F, E> for PermutationConstraint<F, E>
+impl<F, E> TransitionConstraint<F, E> for LookupTransitionConstraint
 where
-    F: IsSubFieldOf<E> + IsFFTField + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
     E: IsField + Send + Sync,
 {
     fn degree(&self) -> usize {
-        3
+        2
     }
 
     fn constraint_idx(&self) -> usize {
-        2
+        self.constraint_idx
     }
 
     fn end_exemptions(&self) -> usize {
@@ -378,71 +370,205 @@ where
         evaluation_context: &TransitionEvaluationContext<F, E>,
         transition_evaluations: &mut [FieldElement<E>],
     ) {
-        // In both evaluation contexts, Prover and Verfier will evaluate the transition polynomial in the same way.
-        // The only difference is that the Prover's Frame has base field and field extension elements,
-        // while the Verfier's Frame has only field extension elements.
-        let res = match evaluation_context {
+        match evaluation_context {
             TransitionEvaluationContext::Prover {
                 frame,
+                periodic_values: _periodic_values,
                 rap_challenges,
-                ..
-            } => compute_permutation_constraint(
-                frame.get_evaluation_step(0),
-                frame.get_evaluation_step(1),
-                rap_challenges,
-                self.columns.clone(),
-            ),
+            } => {
+                let first_step = frame.get_evaluation_step(0);
+                let second_step = frame.get_evaluation_step(1);
+
+                // Auxiliary frame elements
+                let s0 = first_step.get_aux_evaluation_element(0, self.interaction_number);
+                let s1 = second_step.get_aux_evaluation_element(0, self.interaction_number);
+
+                let z = &rap_challenges[0];
+                let alpha = &rap_challenges[1];
+
+                // Main frame elements
+                let flag: FieldElement<F> = self
+                    .interaction
+                    .flag_columns
+                    .iter()
+                    .map(|c| second_step.get_main_evaluation_element(0, *c).clone())
+                    .sum();
+                let values = self
+                    .interaction
+                    .value_columns
+                    .iter()
+                    .map(|c| second_step.get_main_evaluation_element(0, *c))
+                    .collect::<Vec<_>>();
+
+                // Coefficients for each value column
+                let coeffs: Vec<FieldElement<E>> =
+                    (0..values.len()).map(|i| alpha.pow(i)).collect();
+
+                // fingerprint = v[0] * alpha^0 + v[1] * alpha^1 +...+ value[n] * alpha^n + z
+                // Where v are the values for each row and n the number of value columns
+                let fingerprint: FieldElement<E> = values
+                    .iter()
+                    .zip(coeffs.iter())
+                    .map(|(v, coeff)| *v * coeff)
+                    .sum::<FieldElement<E>>()
+                    + z.clone();
+
+                // We are using the following LogUp equation:
+                // s1 = s0 + flag / fingerprint
+                // 0 =  s0 * fingerprint + flag - s1 * fingerprint
+                // Since constraints must be expressed without division, we multiply each term by sorted_term * unsorted_term:
+                let res = flag + s0 * &fingerprint - s1 * fingerprint;
+
+                // The eval always exists, except if the constraint idx were incorrectly defined.
+                if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx) {
+                    *eval = res;
+                }
+            }
+
             TransitionEvaluationContext::Verifier {
                 frame,
+                periodic_values: _periodic_values,
                 rap_challenges,
-                ..
-            } => compute_permutation_constraint(
-                frame.get_evaluation_step(0),
-                frame.get_evaluation_step(1),
-                rap_challenges,
-                self.columns.clone(),
-            ),
-        };
+            } => {
+                let first_step = frame.get_evaluation_step(0);
+                let second_step = frame.get_evaluation_step(1);
 
-        // The eval always exists, except if the constraint idx were incorrectly defined.
-        if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx()) {
-            *eval = res;
+                // Auxiliary frame elements
+                let s0 = first_step.get_aux_evaluation_element(0, 0);
+                let s1 = second_step.get_aux_evaluation_element(0, 0);
+
+                let z = &rap_challenges[0];
+                let alpha = &rap_challenges[1];
+
+                // Main frame elements
+                let flag: FieldElement<E> = self
+                    .interaction
+                    .flag_columns
+                    .iter()
+                    .map(|c| second_step.get_main_evaluation_element(0, *c).clone())
+                    .sum();
+                let values = self
+                    .interaction
+                    .value_columns
+                    .iter()
+                    .map(|c| second_step.get_main_evaluation_element(0, *c))
+                    .collect::<Vec<_>>();
+
+                // Coefficients for each value column
+                let coeffs: Vec<FieldElement<E>> =
+                    (0..values.len()).map(|i| alpha.pow(i)).collect();
+
+                // fingerprint = v[0] * alpha^0 + v[1] * alpha^1 +...+ value[n] * alpha^n + z
+                // Where v are the values for each row and n the number of value columns
+                let fingerprint: FieldElement<E> = values
+                    .iter()
+                    .zip(coeffs.iter())
+                    .map(|(v, coeff)| *v * coeff)
+                    .sum::<FieldElement<E>>()
+                    + z.clone();
+
+                // We are using the following LogUp equation:
+                // s1 = s0 + flag / fingerprint
+                // 0 =  s0 * fingerprint + flag - s1 * fingerprint
+                // Since constraints must be expressed without division, we multiply each term by sorted_term * unsorted_term:
+                let res = flag + s0 * &fingerprint - s1 * fingerprint;
+
+                // The eval always exists, except if the constraint idx were incorrectly defined.
+                if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx) {
+                    *eval = res;
+                }
+            }
         }
     }
 }
 
-fn compute_permutation_constraint<F, E>(
-    first_step: &TableView<'_, F, E>,
-    second_step: &TableView<'_, F, E>,
-    rap_challenges: &[FieldElement<E>],
-    columns: PermutationColumns,
-) -> FieldElement<E>
+/// Constraint for the last auxiliary column
+struct LookupGrandSumTransitionConstraint {
+    // Index of the constraint
+    constraint_idx: usize,
+    // Amount of interactions -> we could infer this from the amount of aux columns
+    interaction_amount: usize,
+}
+
+impl LookupGrandSumTransitionConstraint {
+    pub fn new(constraint_idx: usize, interaction_amount: usize) -> Self {
+        Self {
+            constraint_idx,
+            interaction_amount,
+        }
+    }
+}
+
+impl<F, E> TransitionConstraint<F, E> for LookupGrandSumTransitionConstraint
 where
-    F: IsSubFieldOf<E> + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
     E: IsField + Send + Sync,
 {
-    // Auxiliary frame elements
-    let s0 = first_step.get_aux_evaluation_element(0, 0);
-    let s1 = second_step.get_aux_evaluation_element(0, 0);
+    fn degree(&self) -> usize {
+        2
+    }
 
-    // Challenges
-    let z = &rap_challenges[0];
-    let alpha = &rap_challenges[1];
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
 
-    // Main frame elements
-    let a1 = second_step.get_main_evaluation_element(0, columns.a);
-    let v1 = second_step.get_main_evaluation_element(0, columns.v);
-    let a_sorted_1 = second_step.get_main_evaluation_element(0, columns.a_s);
-    let v_sorted_1 = second_step.get_main_evaluation_element(0, columns.v_s);
-    let m = second_step.get_main_evaluation_element(0, columns.m);
+    fn end_exemptions(&self) -> usize {
+        1
+    }
 
-    let unsorted_term = -(a1 + v1 * alpha) + z;
-    let sorted_term = -(a_sorted_1 + v_sorted_1 * alpha) + z;
+    fn evaluate(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<F, E>,
+        transition_evaluations: &mut [FieldElement<E>],
+    ) {
+        match evaluation_context {
+            TransitionEvaluationContext::Prover { frame, .. } => {
+                let first_step = frame.get_evaluation_step(0);
+                let second_step = frame.get_evaluation_step(1);
 
-    // We are using the following LogUp equation:
-    // s1 = s0 + m / sorted_term - 1/unsorted_term.
-    // Since constraints must be expressed without division, we multiply each term by sorted_term * unsorted_term:
-    s0 * &unsorted_term * &sorted_term + m * &unsorted_term
-        - &sorted_term
-        - s1 * unsorted_term * sorted_term
+                // Auxiliary frame elements
+                let grand_sum_0 = first_step.get_aux_evaluation_element(0, self.interaction_amount);
+                let grand_sum_1 =
+                    second_step.get_aux_evaluation_element(0, self.interaction_amount);
+
+                let interaction_values_sum: FieldElement<E> = (0..self.interaction_amount)
+                    .map(|i| first_step.get_aux_evaluation_element(0, i).clone())
+                    .sum();
+
+                // Check that the grand sum on the second row is equal to the grand_sum on the second row + the sum of all other auxiliary columns in the first row
+                // Aka that we correctly built the grand sum auxiliary column
+
+                let res = grand_sum_1 - grand_sum_0 - interaction_values_sum;
+
+                // The eval always exists, except if the constraint idx were incorrectly defined.
+                if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx) {
+                    *eval = res;
+                }
+            }
+
+            TransitionEvaluationContext::Verifier { frame, .. } => {
+                let first_step = frame.get_evaluation_step(0);
+                let second_step = frame.get_evaluation_step(1);
+
+                // Auxiliary frame elements
+                let grand_sum_0 = first_step.get_aux_evaluation_element(0, self.interaction_amount);
+                let grand_sum_1 =
+                    second_step.get_aux_evaluation_element(0, self.interaction_amount);
+
+                let interaction_values_sum: FieldElement<E> = (0..self.interaction_amount)
+                    .map(|i| first_step.get_aux_evaluation_element(0, i).clone())
+                    .sum();
+
+                // Check that the grand sum on the second row is equal to the grand_sum on the second row + the sum of all other auxiliary columns in the first row
+                // Aka that we correctly built the grand sum auxiliary column
+
+                let res = grand_sum_1 - grand_sum_0 - interaction_values_sum;
+
+                // The eval always exists, except if the constraint idx were incorrectly defined.
+                if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx) {
+                    *eval = res;
+                }
+            }
+        }
+    }
 }
