@@ -45,7 +45,7 @@ desc = "Whether `in` is negative"
 [[variables.auxiliary]]
 name = "bit_shift"
 type = "Byte"
-desc = "Value by which to shift `in` to obtain `bit_shifted`"
+desc = "Value by which to shift `in` to obtain `X` and `Y`"
 
 [[variables.auxiliary]]
 name = "zbs"
