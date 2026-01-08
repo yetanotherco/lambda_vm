@@ -77,7 +77,7 @@ Note here that one can use these two lookups to compute `out: Half[4] := in << y
 $
   #`out[`i#`]` = cases(
     #`HWSL[in[`0#`], y]` &"if" i = 0,
-    #`HWSL[in[`i#`], y] || HWSLC[in[`i-1#`], y]` &"if" i > 0   
+    #`HWSL[in[`i#`], y] | HWSLC[in[`i-1#`], y]` &"if" i > 0   
   )
 $
 as long as $#`y` < 16$.
@@ -87,13 +87,13 @@ $#`HWSLC[x,` 16-#`y]` = #`x` #`>>` #`y`$ for $#`y` in [1, 15]$,
 one can also use these lookups to compute `out := in >> y` as
 $
   #`out[`i#`]` = cases(
-    #`HWSLC[in[`i#`],` 16-#`y] || HWSL[in[`i+1#`], y]` &"if" i < 3,
+    #`HWSLC[in[`i#`],` 16-#`y] | HWSL[in[`i+1#`], y]` &"if" i < 3,
     #`HWSL[in[`3#`],` 16-#`y]` &"if" i = 3
   )
 $
 as long as $0 < #`y` < 16$.
 
-Observe now that the values being looked up are (almost) only independent from the direction of the shift: only the shift-amount varies slightly.
+Observe now that the values being looked up are (almost) independent from the direction of the shift: only the shift-amount varies slightly.
 When we now define
 $
   #`bit_shift` := cases(
@@ -102,10 +102,10 @@ $
   ),  
 $
 it only takes some rearranging and combining of the values $#`X[`i#`] := HWSL[in[`i#`], bit_shift]`$ and $#`Y[`i#`] := HWSLC[in[`i#`], bit_shift]`$ to form the limbs of $#`in <</>> shift` mod 16$.
-In the exceptional case that `right = 1` and $#`shift` = 0 mod 16$, the limbs of $#`in <</>> shift` mod 16$ simply match those of `in`.
+In the remaining case that `right = 1` and $#`shift` = 0 mod 16$, the limbs of $#`in <</>> shift` mod 16$ simply match those of `in`.
 
 === Second phase
-Note that, since we're operating on 16-bit limbs, all the limbs in $#`in <</>> shift`$ must also occur somewhere in $#`in <</>> shift` mod 16$.
+Since we're operating on 16-bit limbs, all the limbs in $#`in <</>> shift`$ must also occur somewhere in $#`in <</>> shift` mod 16$.
 The number of full-limbs we still need to shift is determined by the fifth and sixth least significant bit of `shift`.
 With `limb_shift` containing a unary decoding of the integer represented by these two bits, we find that the intermediate value needs to be shifted over by $i$ limbs (to the `left` or `right`) when $#`limb_shift[`i#`]` = 1$.
 These things combined yield `shifted`'s definition.
