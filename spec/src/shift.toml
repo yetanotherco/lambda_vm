@@ -247,6 +247,13 @@ ref = "shift:c:zbs_implies_Y"
 name = "limb_shifting"
 
 [[constraints.limb_shifting]]
+kind = "template"
+tag = "IS_BIT"
+input = [["idx", "limb_shift", "i"]]
+range = ["i", 0, 3]
+ref = "shift:c:limb_shift_is_bit"
+
+[[constraints.limb_shifting]]
 kind = "interaction"
 tag = "AND_BYTE"
 input = ["shift", ["-", 0x30, ["*", 0x20, "word_instr"]]]
