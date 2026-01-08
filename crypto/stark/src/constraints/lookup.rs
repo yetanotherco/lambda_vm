@@ -129,8 +129,8 @@ where
     }
 
     fn build_auxiliary_trace(&self, trace: &mut TraceTable<F, E>, challenges: &[FieldElement<E>]) {
-        // Ignores build_auxiliary_trace logic from wrapped air (assumption: only lookups use auxiliary columns)
-        // Uses the same challenges for all auxiliary columns (We should use the same challenges for auxiliary columns used for lookups between table pairs, the first solution was to use the same rap challenges for all auxilary columns across tables, we need to checkk if this is safe)
+        // Build an auxiliary column for each table interaction
+        // (FIXME) Uses the same challenges for all auxiliary columns (We should use the same challenges for auxiliary columns used for lookups between table pairs, the first solution was to use the same rap challenges for all auxilary columns across tables, we need to checkk if this is safe)
         for (aux_column_idx, aux_column_build_data) in self
             .auxiliary_trace_build_data
             .interactions
@@ -139,7 +139,12 @@ where
         {
             build_auxiliary_trace_column(aux_column_idx, aux_column_build_data, trace, challenges);
         }
-        // TODO: Add total summ column
+        // Build grand sum auxiliary column
+        let grand_sum_aux_idx = self.auxiliary_trace_build_data.interactions.len();
+        for i in 0..trace.num_rows() {
+            let grand_sum = trace.columns_aux().iter().map(|col| col[i].clone()).sum();
+            trace.set_aux(i, grand_sum_aux_idx, grand_sum)
+        }
     }
 
     // TODO: remove from trait and sample them in prove
@@ -234,35 +239,49 @@ fn build_auxiliary_trace_column<F, E>(
         .iter()
         .map(|i| &main_segment_cols[*i])
         .collect::<Vec<_>>();
-    let a = values[0];
-    let v = &main_segment_cols[1];
-    let a_sorted = &main_segment_cols[2];
-    let v_sorted = &main_segment_cols[3];
-    let m = &main_segment_cols[4]; // flag
-    // let flags = table_interaction.flag_columns.iter().map(|i| &main_segment_cols[*i]);
+    let flags = table_interaction
+        .flag_columns
+        .iter()
+        .map(|i| &main_segment_cols[*i])
+        .collect::<Vec<_>>();
 
     // Challenges
     // TODO: check how to obtain more challenges as needed
-    let z = &challenges[0];
+    let z = challenges[0].clone();
     let alpha = &challenges[1];
+    // Coefficients for value column
+    let coeffs: Vec<FieldElement<E>> = (0..values.len()).map(|i| alpha.pow(i)).collect();
 
     let trace_len = trace.num_rows();
     let mut aux_col = Vec::new();
 
-    // TODO: Check what the logic should be for more terms
-    // s_0 = m_0/(z - (a'_0 + α * v'_0) - 1/(z - (a_0 + α * v_0)
-    let unsorted_term = (-(&a[0] + &v[0] * alpha) + z).inv().unwrap();
-    let sorted_term = (-(&a_sorted[0] + &v_sorted[0] * alpha) + z).inv().unwrap();
-    aux_col.push(&m[0] * sorted_term - unsorted_term);
+    // fingerprint = v[0] * alpha^0 + v[1] * alpha^1 +...+ value[n] * alpha^n + z
+    // Where v are the values for each row and n the number of value columns
+    // We calculate the first fingerprint separately using the values from the first row
+    let fingerprint_inv: FieldElement<E> = (values
+        .iter()
+        .zip(coeffs.iter())
+        .map(|(v, coeff)| v[0].clone() * coeff)
+        .sum::<FieldElement<E>>()
+        + z.clone())
+    .inv()
+    .unwrap();
+    // TODO: use all flags
+    let flag = &flags[0][0];
+    aux_col.push(flag * fingerprint_inv.clone());
 
-    // Apply the same equation given in the permutation transition contraint to the rest of the trace.
-    // s_{i+1} = s_i + m_{i+1}/(z - (a'_{i+1} + α * v'_{i+1}) - 1/(z - (a_{i+1} + α * v_{i+1})
     for i in 0..trace_len - 1 {
-        let unsorted_term = (-(&a[i + 1] + &v[i + 1] * alpha) + z).inv().unwrap();
-        let sorted_term = (-(&a_sorted[i + 1] + &v_sorted[i + 1] * alpha) + z)
-            .inv()
-            .unwrap();
-        aux_col.push(&aux_col[i] + &m[i + 1] * sorted_term - unsorted_term);
+        // fingerprint = v[0] * alpha^0 + v[1] * alpha^1 +...+ value[n] * alpha^n + z
+        // Where v are the values for each row and n the number of value columns
+        let fingerprint_inv: FieldElement<E> = (values
+            .iter()
+            .zip(coeffs.iter())
+            .map(|(v, coeff)| v[i].clone() * coeff)
+            .sum::<FieldElement<E>>()
+            + z.clone())
+        .inv()
+        .unwrap();
+        aux_col.push(&aux_col[i] + &flags[0][i + 1] * fingerprint_inv);
     }
 
     for (i, aux_elem) in aux_col.iter().enumerate().take(trace.num_rows()) {
