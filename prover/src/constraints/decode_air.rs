@@ -8,13 +8,8 @@ use stark::{
     constraints::{boundary::BoundaryConstraints, transition::TransitionConstraint},
     context::AirContext,
     proof::options::ProofOptions,
-    trace::TraceTable,
     traits::AIR,
 };
-
-type FE = FieldElement<Babybear31PrimeField>;
-
-type DecodeTraceTable = TraceTable<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>;
 
 pub struct DecodeTableAIR {
     context: AirContext,

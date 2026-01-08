@@ -1,4 +1,4 @@
-use crate::utils::{i32_to_2_limbs, i32_to_4_limbs, u32_to_2_limbs, u32_to_4_limbs};
+use crate::utils::{i32_to_2_limbs, u32_to_2_limbs};
 use executor::vm::{
     instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth},
     logs::Log,
