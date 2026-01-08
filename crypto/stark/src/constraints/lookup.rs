@@ -131,11 +131,15 @@ where
     fn build_auxiliary_trace(&self, trace: &mut TraceTable<F, E>, challenges: &[FieldElement<E>]) {
         // Ignores build_auxiliary_trace logic from wrapped air (assumption: only lookups use auxiliary columns)
         // Uses the same challenges for all auxiliary columns (We should use the same challenges for auxiliary columns used for lookups between table pairs, the first solution was to use the same rap challenges for all auxilary columns across tables, we need to checkk if this is safe)
-        for (aux_column_idx, aux_column_build_data) in
-            self.auxiliary_trace_build_data.columns.iter().enumerate()
+        for (aux_column_idx, aux_column_build_data) in self
+            .auxiliary_trace_build_data
+            .interactions
+            .iter()
+            .enumerate()
         {
             build_auxiliary_trace_column(aux_column_idx, aux_column_build_data, trace, challenges);
         }
+        // TODO: Add total summ column
     }
 
     // TODO: remove from trait and sample them in prove
@@ -153,7 +157,7 @@ where
             .pub_inputs
             .columns
             .iter()
-            .zip(&self.auxiliary_trace_build_data.columns)
+            .zip(&self.auxiliary_trace_build_data.interactions)
         {
             boundary_constraints
                 .extend(build_boundary_constraint(pub_inputs, aux_column_build_data));
@@ -163,13 +167,14 @@ where
     }
 }
 
-/// Struct representing how each lookup air should build its auxiliary columns
+/// Struct representing how each lookup air should build its auxiliary column
+/// The auxiliary column is built from data used by each table interaction
 pub struct AuxiliaryTraceBuildData {
-    pub columns: Vec<AuxiliaryColumnBuildData>,
+    pub interactions: Vec<TableInteraction>,
 }
 
 /// Struct representing how to build a given auxiliary column
-pub struct AuxiliaryColumnBuildData {
+pub struct TableInteraction {
     pub flag_columns: Vec<usize>,
     pub value_columns: Vec<usize>,
 }
@@ -179,11 +184,11 @@ pub struct LookUpPublicInputs<F>
 where
     F: IsFFTField + Send + Sync,
 {
-    pub columns: Vec<LookupPublicInputsPerAuxColumn<F>>,
+    pub columns: Vec<LookupPublicInputsPerInteraction<F>>,
 }
 
 // TODO: check this
-pub struct LookupPublicInputsPerAuxColumn<F>
+pub struct LookupPublicInputsPerInteraction<F>
 where
     F: IsFFTField + Send + Sync,
 {
@@ -215,7 +220,7 @@ where
 /// Helper method to build a single auxiliary trace column for lookups
 fn build_auxiliary_trace_column<F, E>(
     aux_column_idx: usize,
-    aux_column_build_data: &AuxiliaryColumnBuildData,
+    table_interaction: &TableInteraction,
     trace: &mut TraceTable<F, E>,
     challenges: &[FieldElement<E>],
 ) where
@@ -224,7 +229,7 @@ fn build_auxiliary_trace_column<F, E>(
 {
     // Main table
     let main_segment_cols = trace.columns_main();
-    let values = aux_column_build_data
+    let values = table_interaction
         .value_columns
         .iter()
         .map(|i| &main_segment_cols[*i])
@@ -234,7 +239,7 @@ fn build_auxiliary_trace_column<F, E>(
     let a_sorted = &main_segment_cols[2];
     let v_sorted = &main_segment_cols[3];
     let m = &main_segment_cols[4]; // flag
-    // let flags = aux_column_build_data.flag_columns.iter().map(|i| &main_segment_cols[*i]);
+    // let flags = table_interaction.flag_columns.iter().map(|i| &main_segment_cols[*i]);
 
     // Challenges
     // TODO: check how to obtain more challenges as needed
@@ -266,20 +271,20 @@ fn build_auxiliary_trace_column<F, E>(
 }
 
 fn build_boundary_constraint<'a, F, E>(
-    pub_inputs: &LookupPublicInputsPerAuxColumn<F>,
-    aux_column_build_data: &AuxiliaryColumnBuildData,
+    pub_inputs: &LookupPublicInputsPerInteraction<F>,
+    table_interaction: &TableInteraction,
 ) -> Vec<BoundaryConstraint<E>>
 where
     F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
     E: IsField + Send + Sync,
 {
     // Add constraints for starting value of each flag & value column
-    aux_column_build_data
+    table_interaction
         .flag_columns
         .iter()
         .zip(pub_inputs.flags.iter())
         .chain(
-            aux_column_build_data
+            table_interaction
                 .value_columns
                 .iter()
                 .zip(pub_inputs.values.iter()),
