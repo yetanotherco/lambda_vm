@@ -282,7 +282,7 @@ fn build_auxiliary_trace_column<F, E>(
         let fingerprint_inv: FieldElement<E> = (-(values
             .iter()
             .zip(coeffs.iter())
-            .map(|(v, coeff)| v[i].clone() * coeff)
+            .map(|(v, coeff)| v[i + 1].clone() * coeff)
             .sum::<FieldElement<E>>())
             + z.clone())
         .inv()
