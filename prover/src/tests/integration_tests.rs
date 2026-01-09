@@ -16,7 +16,7 @@ pub fn run_program_and_prover(elf_path: &str) {
     let program = Elf::load(&elf_data).unwrap();
 
     let (_results, logs) =
-        run_program(program.image, program.entry_point, false).expect("Failed to run program");
+        run_program(program.image, program.entry_point, vec![]).expect("Failed to run program");
 
     let mut trace = cpu_trace_from_logs(logs);
 
