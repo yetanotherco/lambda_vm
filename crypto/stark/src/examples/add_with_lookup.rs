@@ -17,7 +17,7 @@ type E = Degree4BabyBearExtensionField;
 pub fn new_add_air_with_lookup(
     trace: &TraceTable<F, E>,
     proof_options: &ProofOptions,
-) -> AirWithLookup<F, E, NullBoundaryConstraintBuilder> {
+) -> AirWithLookup<F, E, NullBoundaryConstraintBuilder, ()> {
     // TODO: define add-specific constraints here
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
 
@@ -41,5 +41,6 @@ pub fn new_add_air_with_lookup(
         proof_options,
         step_size,
         transition_constraints,
+        (),
     )
 }

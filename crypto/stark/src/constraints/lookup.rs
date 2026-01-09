@@ -22,11 +22,12 @@ use crate::{
 pub struct AirWithLookup<
     F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
     E: IsField + Send + Sync,
-    B: BoundaryConstraintBuilder<F, E>,
+    B: BoundaryConstraintBuilder<F, E, PI>,
+    PI,
 > {
     context: AirContext,
     trace_length: usize,
-    pub_inputs: LookUpPublicInputs<F>,
+    pub_inputs: LookUpPublicInputs<F, PI>,
     step_size: usize,
     trace_layout: (usize, usize),
     transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
@@ -37,16 +38,19 @@ pub struct AirWithLookup<
 impl<
     F: IsFFTField + IsSubFieldOf<E> + Send + Sync + 'static,
     E: IsField + Send + Sync + 'static,
-    B: BoundaryConstraintBuilder<F, E>,
-> AirWithLookup<F, E, B>
+    B: BoundaryConstraintBuilder<F, E, PI>,
+    PI,
+> AirWithLookup<F, E, B, PI>
 {
     /// Creates a new AirWithLookup adding LookUp-specific transition constraints to existing constraints
+    /// If no boundary constraints are needed, use `NullBoundaryConstraintBuilder` as B and () as PI
     pub fn create(
         trace: &TraceTable<F, E>,
         auxiliary_trace_build_data: AuxiliaryTraceBuildData,
         proof_options: &ProofOptions,
         step_size: usize,
         mut transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
+        pub_inputs: PI,
     ) -> Self {
         // Add a transition constraint for each auxiliary column representing a table interaction
         for (i, interaction) in auxiliary_trace_build_data.interactions.iter().enumerate() {
@@ -82,7 +86,8 @@ impl<
         };
 
         // Create public inputs
-        let pub_inputs = LookUpPublicInputs::from_trace(trace, &auxiliary_trace_build_data);
+        let pub_inputs =
+            LookUpPublicInputs::from_trace(trace, &auxiliary_trace_build_data, pub_inputs);
 
         Self {
             context,
@@ -97,17 +102,18 @@ impl<
     }
 }
 
-impl<F, E, B> crate::traits::AIR for AirWithLookup<F, E, B>
+impl<F, E, B, PI> crate::traits::AIR for AirWithLookup<F, E, B, PI>
 where
     F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
     E: IsField + Send + Sync,
-    B: BoundaryConstraintBuilder<F, E>,
+    B: BoundaryConstraintBuilder<F, E, PI>,
+    PI: Send + Sync,
 {
     type Field = F;
 
     type FieldExtension = E;
 
-    type PublicInputs = LookUpPublicInputs<F>;
+    type PublicInputs = LookUpPublicInputs<F, PI>;
 
     fn step_size(&self) -> usize {
         self.step_size
@@ -198,7 +204,10 @@ where
                 i,
             ));
         }
-        boundary_constraints.extend(B::boundary_constraints(&self.pub_inputs, rap_challenges));
+        boundary_constraints.extend(B::boundary_constraints(
+            &self.pub_inputs.inner,
+            rap_challenges,
+        ));
         BoundaryConstraints::from_constraints(boundary_constraints)
     }
 }
@@ -217,11 +226,13 @@ pub struct TableInteraction {
 }
 
 /// Public inputs related to each lookup aux column
-pub struct LookUpPublicInputs<F>
+pub struct LookUpPublicInputs<F, PI>
 where
     F: IsField + Send + Sync,
 {
     pub interactions: Vec<LookupPublicInputsPerInteraction<F>>,
+    // PublicInputs used by other AIR boundary constraints defined in `BoundaryConstraintBuilder` trait
+    pub inner: PI,
 }
 
 // TODO: We may need to make this generic over PublicInput for airs that use other public inputs
@@ -235,14 +246,16 @@ where
     pub initial_values: Vec<FieldElement<F>>,
 }
 
-impl<F> LookUpPublicInputs<F>
+impl<F, PI> LookUpPublicInputs<F, PI>
 where
     F: IsField + Send + Sync,
 {
-    // Obtain the LookUpPublicInputs from the trace
+    /// Obtain the LookUpPublicInputs from the trace
+    /// The `inner_public_inputs` received will we the ones used by the `BoundaryConstraintBuilder`, can be ignored if using `NullBoundaryConstraintBuilder`
     pub fn from_trace<E>(
         trace: &TraceTable<F, E>,
         aux_trace_build_data: &AuxiliaryTraceBuildData,
+        inner_public_inputs: PI,
     ) -> Self
     where
         F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
@@ -268,6 +281,7 @@ where
         }
         Self {
             interactions: lookup_interactions,
+            inner: inner_public_inputs,
         }
     }
 }
@@ -275,10 +289,11 @@ where
 pub trait BoundaryConstraintBuilder<
     F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
     E: IsField + Send + Sync,
+    PI,
 >: Send + Sync
 {
     fn boundary_constraints(
-        _pub_inputs: &LookUpPublicInputs<F>,
+        _pub_inputs: &PI,
         _rap_challenges: &[FieldElement<E>],
     ) -> Vec<BoundaryConstraint<E>> {
         vec![]
@@ -286,7 +301,7 @@ pub trait BoundaryConstraintBuilder<
 }
 
 pub struct NullBoundaryConstraintBuilder {}
-impl<F, E> BoundaryConstraintBuilder<F, E> for NullBoundaryConstraintBuilder
+impl<F, E, PI> BoundaryConstraintBuilder<F, E, PI> for NullBoundaryConstraintBuilder
 where
     F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
     E: IsField + Send + Sync,
