@@ -7,7 +7,9 @@
   summary: [
     #chapter("variables.typ")[Variables]
     #chapter("is_bit.typ")[IS_BIT template]
+    #chapter("add.typ")[ADD template]
     #chapter("cpu.typ")[CPU chip]
+    #chapter("shift.typ")[SHIFT chip]
     #chapter("branch.typ")[BRANCH]
     #chapter("lt.typ")[LT]
     #chapter("mul.typ")[MUL chip]
