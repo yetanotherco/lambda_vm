@@ -111,6 +111,10 @@ range = ["i", 0, 3]
 desc = "`IS_HALF[rhs[i]]`"
 range = ["i", 0, 3]
 
+[[assumptions]]
+desc = "`IS_WORD[res[i]]`"
+range = ["i", 0, 3]
+
 
 # Constraints
 
