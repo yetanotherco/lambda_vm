@@ -31,22 +31,6 @@ pub mod instruction {
     pub const EBREAK: u32 = 1 << 16;
 }
 
-#[derive(Hash, Eq, PartialEq, Clone)]
-pub struct DecodeKey {
-    pub pc: [FE; 2],
-    pub rs1: FE,
-    pub rs2: FE,
-    pub rd: FE,
-    pub write_register: FE,
-    pub memory_2bytes: FE,
-    pub memory_4bytes: FE,
-    pub imm: [FE; 2],
-    pub signed: FE,
-    pub mp_selector: FE,
-    pub muldiv_selector: FE,
-    pub instruction: FE,
-}
-
 #[derive(Default)]
 pub struct DecodeTableRow {
     pub pc: [FE; 2],
@@ -332,22 +316,5 @@ impl DecodeTableRow {
         row.push(self.multiplicity);
 
         row
-    }
-
-    pub fn to_key(&self) -> DecodeKey {
-        DecodeKey {
-            pc: self.pc,
-            rs1: self.rs1,
-            rs2: self.rs2,
-            rd: self.rd,
-            write_register: self.write_register,
-            memory_2bytes: self.memory_2bytes,
-            memory_4bytes: self.memory_4bytes,
-            imm: self.imm,
-            signed: self.signed,
-            mp_selector: self.mp_selector,
-            muldiv_selector: self.muldiv_selector,
-            instruction: self.instruction,
-        }
     }
 }
