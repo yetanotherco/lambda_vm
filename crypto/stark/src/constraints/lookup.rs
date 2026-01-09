@@ -12,6 +12,7 @@ use crate::{
         transition::TransitionConstraint,
     },
     context::AirContext,
+    table::TableView,
     trace::TraceTable,
     traits::TransitionEvaluationContext,
 };
@@ -523,46 +524,33 @@ where
         evaluation_context: &TransitionEvaluationContext<F, E>,
         transition_evaluations: &mut [FieldElement<E>],
     ) {
-        match evaluation_context {
+        fn evaluate_grand_sum_constraint<'a, A: IsSubFieldOf<B>, B: IsField>(
+            step: &TableView<'a, A, B>,
+            aux_column_idx: usize,
+        ) -> FieldElement<B> {
+            // Auxiliary frame elements
+            let grand_sum = step.get_aux_evaluation_element(0, aux_column_idx);
+
+            let interaction_values_sum: FieldElement<B> = (0..aux_column_idx)
+                .map(|i| step.get_aux_evaluation_element(0, i).clone())
+                .sum();
+
+            // Check that the grand sum is equal to the sum of all other auxiliary columns in the same row
+            // Aka that we correctly built the grand sum auxiliary column
+            grand_sum - interaction_values_sum
+        }
+        let res = match evaluation_context {
             TransitionEvaluationContext::Prover { frame, .. } => {
-                let step = frame.get_evaluation_step(0);
-
-                // Auxiliary frame elements
-                let grand_sum = step.get_aux_evaluation_element(0, self.interaction_amount);
-
-                let interaction_values_sum: FieldElement<E> = (0..self.interaction_amount)
-                    .map(|i| step.get_aux_evaluation_element(0, i).clone())
-                    .sum();
-
-                // Check that the grand sum is equal to the sum of all other auxiliary columns in the same row
-                // Aka that we correctly built the grand sum auxiliary column
-                let res = grand_sum - interaction_values_sum;
-
-                // The eval always exists, except if the constraint idx were incorrectly defined.
-                if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx) {
-                    *eval = res;
-                }
+                evaluate_grand_sum_constraint(frame.get_evaluation_step(0), self.interaction_amount)
             }
 
             TransitionEvaluationContext::Verifier { frame, .. } => {
-                let step = frame.get_evaluation_step(0);
-
-                // Auxiliary frame elements
-                let grand_sum = step.get_aux_evaluation_element(0, self.interaction_amount);
-
-                let interaction_values_sum: FieldElement<E> = (0..self.interaction_amount)
-                    .map(|i| step.get_aux_evaluation_element(0, i).clone())
-                    .sum();
-
-                // Check that the grand sum is equal to the sum of all other auxiliary columns in the same row
-                // Aka that we correctly built the grand sum auxiliary column
-                let res = grand_sum - interaction_values_sum;
-
-                // The eval always exists, except if the constraint idx were incorrectly defined.
-                if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx) {
-                    *eval = res;
-                }
+                evaluate_grand_sum_constraint(frame.get_evaluation_step(0), self.interaction_amount)
             }
+        };
+        // The eval always exists, except if the constraint idx were incorrectly defined.
+        if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx) {
+            *eval = res;
         }
     }
 }
