@@ -635,7 +635,7 @@ fn test_multi_airs_log_up() {
         &dyn AIR<
             Field = Babybear31PrimeField,
             FieldExtension = Degree4BabyBearExtensionField,
-            PublicInputs = LookUpPublicInputs<Babybear31PrimeField>,
+            PublicInputs = LookUpPublicInputs<Babybear31PrimeField, ()>,
         >,
         &mut TraceTable<Babybear31PrimeField, Degree4BabyBearExtensionField>,
     )> = vec![
@@ -675,7 +675,7 @@ fn test_multi_airs_log_up() {
         &dyn AIR<
             Field = Babybear31PrimeField,
             FieldExtension = Degree4BabyBearExtensionField,
-            PublicInputs = LookUpPublicInputs<Babybear31PrimeField>,
+            PublicInputs = LookUpPublicInputs<Babybear31PrimeField, ()>,
         >,
         &_,
     )> = vec![
