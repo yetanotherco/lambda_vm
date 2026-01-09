@@ -8,10 +8,10 @@ use math::field::fields::fft_friendly::{
     babybear::Babybear31PrimeField, quartic_babybear::Degree4BabyBearExtensionField,
 };
 
-use crate::constraints::lookup::LookUpPublicInputs;
-use crate::examples::add_with_lookup::new_add_air_with_lookup;
-use crate::examples::cpu_with_lookup::new_cpu_air_with_lookup;
-use crate::examples::mul_with_lookup::new_mul_air_with_lookup;
+use crate::examples::multi_table_lookup::new_add_air_with_lookup;
+use crate::examples::multi_table_lookup::new_cpu_air_with_lookup;
+use crate::examples::multi_table_lookup::new_mul_air_with_lookup;
+use crate::lookup::LookUpPublicInputs;
 use crate::trace::TraceTable;
 use crate::traits::AIR;
 use crate::{
