@@ -27,6 +27,7 @@ use crate::trace::{LDETraceTable, columns2rows};
 
 use super::config::{BatchedMerkleTree, Commitment};
 use super::constraints::evaluator::ConstraintEvaluator;
+use super::constraints::simple::{EvalPrecomputes, evaluate_constraints};
 use super::domain::Domain;
 use super::fri::fri_decommit::FriDecommitment;
 use super::grinding;
@@ -447,23 +448,58 @@ pub trait IsStarkProver<
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         domain: &Domain<Field>,
         round_1_result: &Round1<Field, FieldExtension>,
-        transition_coefficients: &[FieldElement<FieldExtension>],
-        boundary_coefficients: &[FieldElement<FieldExtension>],
+        beta: &FieldElement<FieldExtension>,
     ) -> Result<Round2<FieldExtension>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        // Compute the evaluations of the composition polynomial on the LDE domain.
-        let evaluator = ConstraintEvaluator::new(air, &round_1_result.rap_challenges);
-        let constraint_evaluations = evaluator.evaluate(
-            air,
-            &round_1_result.lde_trace,
-            domain,
-            transition_coefficients,
-            boundary_coefficients,
-            &round_1_result.rap_challenges,
-        );
+        let constraint_evaluations = if air.use_legacy_evaluator() {
+            // Use legacy evaluator for Stone prover compatibility
+            let num_transition = air.num_transition_constraints();
+            let num_boundary = air
+                .boundary_constraints(&round_1_result.rap_challenges)
+                .constraints
+                .len();
+            let transition_coefficients: Vec<_> =
+                (0..num_transition).map(|i| beta.pow(i as u64)).collect();
+            let boundary_coefficients: Vec<_> = (0..num_boundary)
+                .map(|i| beta.pow((num_transition + i) as u64))
+                .collect();
+
+            let evaluator = ConstraintEvaluator::new(air, &round_1_result.rap_challenges);
+            evaluator.evaluate(
+                air,
+                &round_1_result.lde_trace,
+                domain,
+                &transition_coefficients,
+                &boundary_coefficients,
+                &round_1_result.rap_challenges,
+            )
+        } else {
+            // Use new simplified constraint system
+            let constraints = air.constraints(&round_1_result.rap_challenges);
+            let frame_offsets = air.context().transition_offsets.clone();
+
+            // Create precomputes for efficient evaluation
+            let precomputes = EvalPrecomputes::new(
+                domain,
+                beta,
+                constraints.num_constraints(),
+                &constraints.exemption_counts(),
+                &constraints.boundary_rows(),
+            );
+
+            // Evaluate all constraints on the LDE domain
+            let eval_result = evaluate_constraints(
+                &constraints,
+                &round_1_result.lde_trace,
+                &precomputes,
+                domain,
+                &frame_offsets,
+            );
+            eval_result.quotient_evals
+        };
 
         // Get coefficients of the composition poly H
         let composition_poly =
@@ -984,29 +1020,9 @@ pub trait IsStarkProver<
 
         // <<<< Receive challenge: 𝛽
         let beta = transcript.sample_field_element();
-        let num_boundary_constraints = air
-            .boundary_constraints(&round_1_result.rap_challenges)
-            .constraints
-            .len();
 
-        let num_transition_constraints = air.context().num_transition_constraints;
-
-        let mut coefficients: Vec<_> =
-            core::iter::successors(Some(FieldElement::one()), |x| Some(x * &beta))
-                .take(num_boundary_constraints + num_transition_constraints)
-                .collect();
-
-        let transition_coefficients: Vec<_> =
-            coefficients.drain(..num_transition_constraints).collect();
-        let boundary_coefficients = coefficients;
-
-        let round_2_result = Self::round_2_compute_composition_polynomial(
-            air,
-            domain,
-            round_1_result,
-            &transition_coefficients,
-            &boundary_coefficients,
-        )?;
+        let round_2_result =
+            Self::round_2_compute_composition_polynomial(air, domain, round_1_result, &beta)?;
 
         // >>>> Send commitments: [H₁], [H₂]
         transcript.append_bytes(&round_2_result.composition_poly_root);
@@ -1276,7 +1292,7 @@ mod tests {
 
         let transcript_init_seed = [0xca, 0xfe, 0xca, 0xfe];
 
-        let air = Fibonacci2ColsShifted::<Stark252PrimeField>::new(
+        let air = Fibonacci2ColsShifted::<Stark252PrimeField>::new_stone_compatible(
             trace.num_rows(),
             &pub_inputs,
             &proof_options,
@@ -1675,7 +1691,7 @@ mod tests {
 
         let transcript_init_seed = [0xfa, 0xfa, 0xfa, 0xee];
 
-        let air = Fibonacci2ColsShifted::<Stark252PrimeField>::new(
+        let air = Fibonacci2ColsShifted::<Stark252PrimeField>::new_stone_compatible(
             trace.num_rows(),
             &pub_inputs,
             &proof_options,

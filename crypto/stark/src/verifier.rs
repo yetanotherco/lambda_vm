@@ -1,12 +1,11 @@
 use super::{
-    config::BatchedMerkleTreeBackend,
-    domain::Domain,
-    fri::fri_decommit::FriDecommitment,
-    grinding,
-    proof::stark::StarkProof,
-    traits::{AIR, TransitionEvaluationContext},
+    config::BatchedMerkleTreeBackend, domain::Domain, fri::fri_decommit::FriDecommitment, grinding,
+    proof::stark::StarkProof, traits::AIR,
 };
-use crate::{config::Commitment, domain::new_domain, proof::stark::DeepPolynomialOpening};
+use crate::{
+    config::Commitment, domain::new_domain, frame::Frame, proof::stark::DeepPolynomialOpening,
+    traits::TransitionEvaluationContext,
+};
 use crypto::{fiat_shamir::is_transcript::IsStarkTranscript, merkle_tree::proof::Proof};
 #[cfg(not(feature = "test_fiat_shamir"))]
 use log::error;
@@ -121,16 +120,20 @@ pub trait IsStarkVerifier<
 
         // <<<< Receive challenge: 𝛽
         let beta = transcript.sample_field_element();
-        let num_boundary_constraints = air.boundary_constraints(&rap_challenges).constraints.len();
 
-        let num_transition_constraints = air.context().num_transition_constraints;
+        // Use new simplified constraint system for constraint count
+        let constraints = air.constraints(&rap_challenges);
+        let num_transition =
+            constraints.degree_1.len() + constraints.degree_2.len() + constraints.degree_3.len();
+        let num_boundary = constraints.boundary.len();
+        let num_constraints = num_transition + num_boundary;
 
-        let mut coefficients: Vec<_> = (0..num_boundary_constraints + num_transition_constraints)
-            .map(|i| beta.pow(i))
-            .collect();
+        let coefficients: Vec<_> = (0..num_constraints).map(|i| beta.pow(i)).collect();
 
-        let transition_coeffs: Vec<_> = coefficients.drain(..num_transition_constraints).collect();
-        let boundary_coeffs = coefficients;
+        // For backward compatibility with Challenges struct, split into transition and boundary
+        // New system orders: degree_1, degree_2, degree_3, then boundary
+        let transition_coeffs: Vec<_> = coefficients[..num_transition].to_vec();
+        let boundary_coeffs: Vec<_> = coefficients[num_transition..].to_vec();
 
         // <<<< Receive commitments: [H₁], [H₂]
         transcript.append_bytes(&proof.composition_poly_root);
@@ -238,96 +241,234 @@ pub trait IsStarkVerifier<
         domain: &Domain<Field>,
         challenges: &Challenges<FieldExtension>,
     ) -> bool {
-        let boundary_constraints = air.boundary_constraints(&challenges.rap_challenges);
+        // Use legacy evaluation path for Stone prover compatibility
+        if air.use_legacy_evaluator() {
+            return Self::step_2_verify_legacy(air, proof, domain, challenges);
+        }
 
+        let constraints = air.constraints(&challenges.rap_challenges);
         let trace_length = air.trace_length();
-        let number_of_b_constraints = boundary_constraints.constraints.len();
+        let z = &challenges.z;
+        let g = &domain.trace_primitive_root;
+        let n = trace_length;
 
-        #[allow(clippy::type_complexity)]
-        let (boundary_c_i_evaluations_num, mut boundary_c_i_evaluations_den): (
-            Vec<FieldElement<FieldExtension>>,
-            Vec<FieldElement<FieldExtension>>,
-        ) = (0..number_of_b_constraints)
-            .map(|index| {
-                let step = boundary_constraints.constraints[index].step;
-                let is_aux = boundary_constraints.constraints[index].is_aux;
-                let point = &domain.trace_primitive_root.pow(step as u64);
-                let column_idx = boundary_constraints.constraints[index].col;
-                let trace_evaluation = if is_aux {
-                    let column_idx = air.trace_layout().0 + column_idx;
-                    &proof.trace_ood_evaluations.get_row(0)[column_idx]
-                } else {
-                    &proof.trace_ood_evaluations.get_row(0)[column_idx]
-                };
-                let boundary_zerofier_challenges_z_den = -point + &challenges.z;
-
-                let boundary_quotient_ood_evaluation_num =
-                    -&boundary_constraints.constraints[index].value + trace_evaluation;
-
-                (
-                    boundary_quotient_ood_evaluation_num,
-                    boundary_zerofier_challenges_z_den,
-                )
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .unzip();
-
-        FieldElement::inplace_batch_inverse(&mut boundary_c_i_evaluations_den).unwrap();
-
-        let boundary_quotient_ood_evaluation: FieldElement<FieldExtension> =
-            boundary_c_i_evaluations_num
-                .iter()
-                .zip(&boundary_c_i_evaluations_den)
-                .zip(&challenges.boundary_coeffs)
-                .map(|((num, den), beta)| num * den * beta)
-                .fold(FieldElement::<FieldExtension>::zero(), |acc, x| acc + x);
-
-        let periodic_values = air
-            .get_periodic_column_polynomials()
-            .iter()
-            .map(|poly| poly.evaluate(&challenges.z))
-            .collect::<Vec<FieldElement<FieldExtension>>>();
-
+        // Build frame from OOD evaluations
         let num_main_trace_columns =
             proof.trace_ood_evaluations.width - air.num_auxiliary_rap_columns();
-
         let ood_frame =
             (proof.trace_ood_evaluations).into_frame(num_main_trace_columns, air.step_size());
-        let transition_evaluation_context = TransitionEvaluationContext::new_verifier(
-            &ood_frame,
-            &periodic_values,
-            &challenges.rap_challenges,
-        );
-        let transition_ood_frame_evaluations =
-            air.compute_transition(&transition_evaluation_context);
 
-        let mut denominators =
-            vec![FieldElement::<FieldExtension>::zero(); air.num_transition_constraints()];
-        air.transition_constraints().iter().for_each(|c| {
-            denominators[c.constraint_idx()] =
-                c.evaluate_zerofier(&challenges.z, &domain.trace_primitive_root, trace_length);
-        });
+        // Compute values at z
+        let zerofier_z = z.pow(n) - FieldElement::<FieldExtension>::one();
+        let zerofier_inv_z = zerofier_z.inv().unwrap();
+        let trace_deg = n - 1;
+        let x_td = z.pow(trace_deg);
+        let x_2td = z.pow(2 * trace_deg);
 
-        let transition_c_i_evaluations_sum = itertools::izip!(
-            transition_ood_frame_evaluations,
-            &challenges.transition_coeffs,
-            denominators
-        )
-        .fold(FieldElement::zero(), |acc, (eval, beta, denominator)| {
-            acc + beta * eval * &denominator
-        });
+        let max_degree = constraints.max_degree();
+        let legacy_eval = constraints.use_legacy_evaluation;
+        let legacy_ordering = constraints.use_legacy_ordering;
+        let mut acc = FieldElement::<FieldExtension>::zero();
 
-        let composition_poly_ood_evaluation =
-            &boundary_quotient_ood_evaluation + transition_c_i_evaluations_sum;
+        // Helper to compute exemption polynomial at z: Π_{i=0}^{k-1} (z - g^{n-1-i})
+        let compute_exemption_at_z = |end_exemptions: usize| -> FieldElement<FieldExtension> {
+            (0..end_exemptions).fold(FieldElement::one(), |prod, i| {
+                let omega_exp = g.pow((n - 1 - i) as u64);
+                prod * (z - &omega_exp.to_extension())
+            })
+        };
+
+        // Helper to evaluate a transition constraint
+        let eval_transition =
+            |c: &crate::constraints::simple::TransitionConstraint<Field, FieldExtension>,
+             beta: &FieldElement<FieldExtension>,
+             degree: usize|
+             -> FieldElement<FieldExtension> {
+                let c_eval: FieldElement<FieldExtension> = (c.evaluate_ext)(&ood_frame);
+                let exempt_z = compute_exemption_at_z(c.end_exemptions);
+                let corrected = if legacy_eval {
+                    &exempt_z * &c_eval
+                } else {
+                    match (max_degree, degree) {
+                        (3, 1) => &exempt_z * &x_2td * &c_eval,
+                        (2, 1) | (3, 2) => &exempt_z * &x_td * &c_eval,
+                        _ => &exempt_z * &c_eval,
+                    }
+                };
+                beta * &corrected
+            };
+
+        // Helper to evaluate a boundary constraint
+        let n_fe = FieldElement::<FieldExtension>::from(n as u64);
+        let eval_boundary =
+            |bc: &crate::constraints::simple::BoundaryConstraint<FieldExtension>,
+             beta: &FieldElement<FieldExtension>|
+             -> FieldElement<FieldExtension> {
+                let omega_j = g.pow(bc.row as u64);
+                let omega_j_ext: FieldElement<FieldExtension> = omega_j.to_extension();
+
+                // Get trace value at z from OOD evaluations
+                let trace_val: FieldElement<FieldExtension> = if bc.is_aux {
+                    let col_idx = num_main_trace_columns + bc.col;
+                    proof.trace_ood_evaluations.get_row(0)[col_idx].clone()
+                } else {
+                    proof.trace_ood_evaluations.get_row(0)[bc.col].clone()
+                };
+
+                let c_eval = &trace_val - &bc.value;
+
+                let corrected = if legacy_eval {
+                    // Legacy: simple zerofier 1/(z - g^row)
+                    let zerofier_inv = (z - &omega_j_ext).inv().unwrap();
+                    &zerofier_inv * &c_eval
+                } else {
+                    // New: Lagrange basis with degree correction
+                    let omega_neg_j = g.pow((n - bc.row) as u64);
+                    let omega_neg_j_ext: FieldElement<FieldExtension> = omega_neg_j.to_extension();
+                    let n_inv = n_fe.inv().unwrap();
+                    let denom = (z - &omega_j_ext) * &omega_neg_j_ext * &n_inv;
+                    let lagrange_z = &zerofier_z * denom.inv().unwrap();
+                    match max_degree {
+                        3 => &lagrange_z * &x_td * &c_eval,
+                        _ => &lagrange_z * &c_eval,
+                    }
+                };
+                beta * &corrected
+            };
+
+        if legacy_ordering {
+            // Legacy ordering: transition first, then boundary
+            let mut beta_idx = 0;
+
+            for c in &constraints.degree_1 {
+                acc = acc + eval_transition(c, &challenges.transition_coeffs[beta_idx], 1);
+                beta_idx += 1;
+            }
+            for c in &constraints.degree_2 {
+                acc = acc + eval_transition(c, &challenges.transition_coeffs[beta_idx], 2);
+                beta_idx += 1;
+            }
+            for c in &constraints.degree_3 {
+                acc = acc + eval_transition(c, &challenges.transition_coeffs[beta_idx], 3);
+                beta_idx += 1;
+            }
+            for (bc_idx, bc) in constraints.boundary.iter().enumerate() {
+                acc = acc + eval_boundary(bc, &challenges.boundary_coeffs[bc_idx]);
+            }
+        } else {
+            // New ordering: degree_1, degree_2, degree_3, boundary
+            let mut beta_idx = 0;
+
+            for c in &constraints.degree_1 {
+                acc = acc + eval_transition(c, &challenges.transition_coeffs[beta_idx], 1);
+                beta_idx += 1;
+            }
+            for c in &constraints.degree_2 {
+                acc = acc + eval_transition(c, &challenges.transition_coeffs[beta_idx], 2);
+                beta_idx += 1;
+            }
+            for c in &constraints.degree_3 {
+                acc = acc + eval_transition(c, &challenges.transition_coeffs[beta_idx], 3);
+                beta_idx += 1;
+            }
+            for (bc_idx, bc) in constraints.boundary.iter().enumerate() {
+                acc = acc + eval_boundary(bc, &challenges.boundary_coeffs[bc_idx]);
+            }
+        }
+
+        // Divide by zerofier
+        let composition_poly_ood_evaluation = &zerofier_inv_z * acc;
 
         let composition_poly_claimed_ood_evaluation = proof
             .composition_poly_parts_ood_evaluation
             .iter()
             .rev()
-            .fold(FieldElement::zero(), |acc, coeff| {
-                acc * &challenges.z + coeff
-            });
+            .fold(FieldElement::zero(), |acc, coeff| acc * z + coeff);
+
+        composition_poly_claimed_ood_evaluation == composition_poly_ood_evaluation
+    }
+
+    /// Legacy verification path for Stone prover compatibility.
+    /// Uses the old transition_constraints and boundary_constraints methods.
+    fn step_2_verify_legacy(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        proof: &StarkProof<Field, FieldExtension>,
+        domain: &Domain<Field>,
+        challenges: &Challenges<FieldExtension>,
+    ) -> bool {
+        let trace_length = air.trace_length();
+        let z = &challenges.z;
+        let g = &domain.trace_primitive_root;
+
+        // Build frame from OOD evaluations (all elements in extension field)
+        let num_main_trace_columns =
+            proof.trace_ood_evaluations.width - air.num_auxiliary_rap_columns();
+        let ood_frame: Frame<FieldExtension, FieldExtension> = proof
+            .trace_ood_evaluations
+            .into_frame(num_main_trace_columns, air.step_size());
+
+        // Compute transition constraint evaluations
+        let evaluation_context = TransitionEvaluationContext::new_verifier(
+            &ood_frame,
+            &[], // No periodic values at OOD point
+            &challenges.rap_challenges,
+        );
+        let transition_evaluations = air.compute_transition(&evaluation_context);
+
+        // For each transition constraint, compute the zerofier quotient at z
+        let mut transition_acc = FieldElement::<FieldExtension>::zero();
+        for (idx, constraint) in air.transition_constraints().iter().enumerate() {
+            let eval = &transition_evaluations[idx];
+            let end_exemptions = constraint.end_exemptions();
+
+            // Compute exemption polynomial at z: Π_{i=0}^{k-1} (z - g^{n-1-i})
+            let mut exempt_z = FieldElement::<FieldExtension>::one();
+            for i in 0..end_exemptions {
+                let omega_exp = g.pow((trace_length - 1 - i) as u64);
+                exempt_z = exempt_z * (z - &omega_exp.to_extension());
+            }
+
+            // Zerofier for transition: (z^n - 1) / exemption_poly
+            // So quotient = eval * exempt_z / (z^n - 1)
+            // But old system multiplies eval by exempt_z / zerofier directly
+            let zerofier_z = z.pow(trace_length) - FieldElement::<FieldExtension>::one();
+            let quotient = eval * &exempt_z * zerofier_z.inv().unwrap();
+
+            transition_acc = transition_acc + &challenges.transition_coeffs[idx] * &quotient;
+        }
+
+        // Compute boundary constraint evaluations
+        let boundary_constraints = air.boundary_constraints(&challenges.rap_challenges);
+        let mut boundary_acc = FieldElement::<FieldExtension>::zero();
+        for (idx, bc) in boundary_constraints.constraints.iter().enumerate() {
+            let omega_j = g.pow(bc.step as u64);
+            let omega_j_ext: FieldElement<FieldExtension> = omega_j.to_extension();
+
+            // Get trace value at z from OOD evaluations
+            let trace_val: FieldElement<FieldExtension> = if bc.is_aux {
+                let col_idx = num_main_trace_columns + bc.col;
+                proof.trace_ood_evaluations.get_row(0)[col_idx].clone()
+            } else {
+                proof.trace_ood_evaluations.get_row(0)[bc.col].clone()
+            };
+
+            let c_eval = &trace_val - &bc.value;
+            // Zerofier inverse: 1 / (z - g^row)
+            let zerofier_inv = (z - &omega_j_ext).inv().unwrap();
+            let quotient = &zerofier_inv * &c_eval;
+
+            boundary_acc = boundary_acc + &challenges.boundary_coeffs[idx] * &quotient;
+        }
+
+        // Total composition polynomial evaluation at z
+        let composition_poly_ood_evaluation = transition_acc + boundary_acc;
+
+        // Compare with claimed evaluation
+        let composition_poly_claimed_ood_evaluation = proof
+            .composition_poly_parts_ood_evaluation
+            .iter()
+            .rev()
+            .fold(FieldElement::zero(), |acc, coeff| acc * z + coeff);
 
         composition_poly_claimed_ood_evaluation == composition_poly_ood_evaluation
     }
@@ -823,16 +964,19 @@ pub trait IsStarkVerifier<
 
         // <<<< Receive challenge: 𝛽
         let beta = transcript.sample_field_element();
-        let num_boundary_constraints = air.boundary_constraints(&rap_challenges).constraints.len();
 
-        let num_transition_constraints = air.context().num_transition_constraints;
+        // Use new simplified constraint system for constraint count
+        let constraints = air.constraints(&rap_challenges);
+        let num_transition =
+            constraints.degree_1.len() + constraints.degree_2.len() + constraints.degree_3.len();
+        let num_boundary = constraints.boundary.len();
+        let num_constraints = num_transition + num_boundary;
 
-        let mut coefficients: Vec<_> = (0..num_boundary_constraints + num_transition_constraints)
-            .map(|i| beta.pow(i))
-            .collect();
+        let coefficients: Vec<_> = (0..num_constraints).map(|i| beta.pow(i)).collect();
 
-        let transition_coeffs: Vec<_> = coefficients.drain(..num_transition_constraints).collect();
-        let boundary_coeffs = coefficients;
+        // New system orders: degree_1, degree_2, degree_3, then boundary
+        let transition_coeffs: Vec<_> = coefficients[..num_transition].to_vec();
+        let boundary_coeffs: Vec<_> = coefficients[num_transition..].to_vec();
 
         // <<<< Receive commitments: [H₁], [H₂]
         transcript.append_bytes(&proof.composition_poly_root);

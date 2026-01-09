@@ -1,5 +1,6 @@
 use super::domain::Domain;
 use super::traits::{AIR, TransitionEvaluationContext};
+use crate::constraints::simple::Constraints;
 use crate::{frame::Frame, trace::LDETraceTable};
 use log::{error, info};
 use math::field::traits::IsSubFieldOf;
@@ -117,6 +118,76 @@ pub fn validate_trace<
         })
     }
     info!("Constraints validation check ended");
+    ret
+}
+
+/// Validates that the trace is valid with respect to the new simplified constraint system.
+/// This function evaluates both transition and boundary constraints directly on the trace,
+/// showing that they evaluate to zero for a valid trace.
+pub fn validate_trace_with_simple_constraints<
+    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
+    FieldExtension: Send + Sync + IsField,
+>(
+    constraints: &Constraints<Field, FieldExtension>,
+    lde_trace: &LDETraceTable<Field, FieldExtension>,
+    frame_offsets: &[usize],
+) -> bool {
+    info!("Starting simple constraints validation over trace...");
+    let mut ret = true;
+
+    // Validate boundary constraints
+    for bc in &constraints.boundary {
+        let trace_val: FieldElement<FieldExtension> = if bc.is_aux {
+            lde_trace.get_aux(bc.row, bc.col).clone()
+        } else {
+            lde_trace.get_main(bc.row, bc.col).clone().to_extension()
+        };
+
+        if trace_val != bc.value {
+            ret = false;
+            error!(
+                "Boundary constraint '{}' failed - Expected {:?} at col {}, row {}, found {:?}",
+                bc.name, bc.value, bc.col, bc.row, trace_val
+            );
+        }
+    }
+
+    // Validate transition constraints
+    let trace_length = lde_trace.num_steps();
+
+    // Collect all transition constraints with their degrees and exemptions
+    let all_transitions: Vec<(
+        &crate::constraints::simple::TransitionConstraint<Field, FieldExtension>,
+        usize,
+    )> = constraints
+        .degree_1
+        .iter()
+        .map(|c| (c, c.end_exemptions))
+        .chain(constraints.degree_2.iter().map(|c| (c, c.end_exemptions)))
+        .chain(constraints.degree_3.iter().map(|c| (c, c.end_exemptions)))
+        .collect();
+
+    for step in 0..trace_length {
+        let frame = Frame::read_step_from_lde(lde_trace, step, frame_offsets);
+
+        for (constraint, end_exemptions) in &all_transitions {
+            // Skip exempted steps at the end
+            if step >= trace_length - end_exemptions {
+                continue;
+            }
+
+            let eval = (constraint.evaluate)(&frame);
+            if eval != FieldElement::zero() {
+                ret = false;
+                error!(
+                    "Transition constraint '{}' failed at step {} - expected 0, got {:?}",
+                    constraint.name, step, eval
+                );
+            }
+        }
+    }
+
+    info!("Simple constraints validation check ended");
     ret
 }
 

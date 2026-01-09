@@ -1,6 +1,9 @@
 use crate::{
     constraints::{
-        boundary::{BoundaryConstraint, BoundaryConstraints},
+        boundary::{BoundaryConstraint as OldBoundaryConstraint, BoundaryConstraints},
+        simple::{
+            BoundaryConstraint, Constraints, TransitionConstraint as SimpleTransitionConstraint,
+        },
         transition::TransitionConstraint,
     },
     context::AirContext,
@@ -162,6 +165,23 @@ where
     trace_length: usize,
     pub_inputs: PublicInputs<F>,
     transition_constraints: Vec<Box<dyn TransitionConstraint<F, F>>>,
+    stone_compatible: bool,
+}
+
+impl<F: IsFFTField> Fibonacci2ColsShifted<F> {
+    /// Create an AIR with Stone-compatible constraint evaluation
+    pub fn new_stone_compatible(
+        trace_length: usize,
+        pub_inputs: &PublicInputs<F>,
+        proof_options: &ProofOptions,
+    ) -> Self
+    where
+        F: Send + Sync + 'static,
+    {
+        let mut air = Self::new(trace_length, pub_inputs, proof_options);
+        air.stone_compatible = true;
+        air
+    }
 }
 
 /// The AIR for to a 2 column trace, where each column is a Fibonacci sequence and the
@@ -204,6 +224,7 @@ where
             context,
             pub_inputs: pub_inputs.clone(),
             transition_constraints,
+            stone_compatible: false,
         }
     }
 
@@ -211,14 +232,85 @@ where
         &self,
         _rap_challenges: &[FieldElement<Self::FieldExtension>],
     ) -> BoundaryConstraints<Self::Field> {
-        let initial_condition = BoundaryConstraint::new_main(0, 0, FieldElement::one());
-        let claimed_value_constraint = BoundaryConstraint::new_main(
+        let initial_condition = OldBoundaryConstraint::new_main(0, 0, FieldElement::one());
+        let claimed_value_constraint = OldBoundaryConstraint::new_main(
             0,
             self.pub_inputs.claimed_index,
             self.pub_inputs.claimed_value.clone(),
         );
 
         BoundaryConstraints::from_constraints(vec![initial_condition, claimed_value_constraint])
+    }
+
+    fn constraints(
+        &self,
+        _rap_challenges: &[FieldElement<Self::FieldExtension>],
+    ) -> Constraints<Self::Field, Self::FieldExtension> {
+        let claimed_value = self.pub_inputs.claimed_value.clone();
+        let claimed_index = self.pub_inputs.claimed_index;
+
+        Constraints {
+            degree_1: vec![
+                // Constraint 1: a1[0] = a0[1] (next row's col 0 equals current row's col 1)
+                SimpleTransitionConstraint {
+                    name: "shifted_fib_1",
+                    evaluate: |frame| {
+                        let row0 = frame.get_evaluation_step(0);
+                        let row1 = frame.get_evaluation_step(1);
+
+                        let a0_1 = row0.get_main_evaluation_element(0, 1);
+                        let a1_0 = row1.get_main_evaluation_element(0, 0);
+
+                        a1_0 - a0_1
+                    },
+                    evaluate_ext: |frame| {
+                        let row0 = frame.get_evaluation_step(0);
+                        let row1 = frame.get_evaluation_step(1);
+
+                        let a0_1 = row0.get_main_evaluation_element(0, 1);
+                        let a1_0 = row1.get_main_evaluation_element(0, 0);
+
+                        a1_0 - a0_1
+                    },
+                    end_exemptions: 1,
+                },
+                // Constraint 2: a1[1] = a0[0] + a0[1] (next row's col 1 equals sum of current row)
+                SimpleTransitionConstraint {
+                    name: "shifted_fib_2",
+                    evaluate: |frame| {
+                        let row0 = frame.get_evaluation_step(0);
+                        let row1 = frame.get_evaluation_step(1);
+
+                        let a0_0 = row0.get_main_evaluation_element(0, 0);
+                        let a0_1 = row0.get_main_evaluation_element(0, 1);
+                        let a1_1 = row1.get_main_evaluation_element(0, 1);
+
+                        a1_1 - a0_0 - a0_1
+                    },
+                    evaluate_ext: |frame| {
+                        let row0 = frame.get_evaluation_step(0);
+                        let row1 = frame.get_evaluation_step(1);
+
+                        let a0_0 = row0.get_main_evaluation_element(0, 0);
+                        let a0_1 = row0.get_main_evaluation_element(0, 1);
+                        let a1_1 = row1.get_main_evaluation_element(0, 1);
+
+                        a1_1 - a0_0 - a0_1
+                    },
+                    end_exemptions: 1,
+                },
+            ],
+            degree_2: vec![],
+            degree_3: vec![],
+            boundary: vec![
+                // Initial condition: col 0, row 0 = 1
+                BoundaryConstraint::new_main("initial", 0, 0, FieldElement::one()),
+                // Claimed value: col 0, row claimed_index = claimed_value
+                BoundaryConstraint::new_main("claimed", 0, claimed_index, claimed_value),
+            ],
+            use_legacy_ordering: self.stone_compatible,
+            use_legacy_evaluation: self.stone_compatible,
+        }
     }
 
     fn transition_constraints(
@@ -241,6 +333,10 @@ where
 
     fn trace_layout(&self) -> (usize, usize) {
         (2, 0)
+    }
+
+    fn use_legacy_evaluator(&self) -> bool {
+        self.stone_compatible
     }
 
     fn pub_inputs(&self) -> &Self::PublicInputs {

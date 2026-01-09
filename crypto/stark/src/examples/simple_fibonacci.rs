@@ -1,6 +1,9 @@
 use crate::{
     constraints::{
-        boundary::{BoundaryConstraint, BoundaryConstraints},
+        boundary::{BoundaryConstraint as OldBoundaryConstraint, BoundaryConstraints},
+        simple::{
+            BoundaryConstraint, Constraints, TransitionConstraint as SimpleTransitionConstraint,
+        },
         transition::TransitionConstraint,
     },
     context::AirContext,
@@ -79,7 +82,7 @@ where
     context: AirContext,
     trace_length: usize,
     pub_inputs: FibonacciPublicInputs<F>,
-    constraints: Vec<Box<dyn TransitionConstraint<F, F>>>,
+    old_constraints: Vec<Box<dyn TransitionConstraint<F, F>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -108,21 +111,21 @@ where
         pub_inputs: &Self::PublicInputs,
         proof_options: &ProofOptions,
     ) -> Self {
-        let constraints: Vec<Box<dyn TransitionConstraint<F, F>>> =
+        let old_constraints: Vec<Box<dyn TransitionConstraint<F, F>>> =
             vec![Box::new(FibConstraint::new())];
 
         let context = AirContext {
             proof_options: proof_options.clone(),
             trace_columns: 1,
             transition_offsets: vec![0, 1, 2],
-            num_transition_constraints: constraints.len(),
+            num_transition_constraints: old_constraints.len(),
         };
 
         Self {
             pub_inputs: pub_inputs.clone(),
             context,
             trace_length,
-            constraints,
+            old_constraints,
         }
     }
 
@@ -131,17 +134,64 @@ where
     }
 
     fn transition_constraints(&self) -> &Vec<Box<dyn TransitionConstraint<F, F>>> {
-        &self.constraints
+        &self.old_constraints
     }
 
     fn boundary_constraints(
         &self,
         _rap_challenges: &[FieldElement<Self::Field>],
     ) -> BoundaryConstraints<Self::Field> {
-        let a0 = BoundaryConstraint::new_simple_main(0, self.pub_inputs.a0.clone());
-        let a1 = BoundaryConstraint::new_simple_main(1, self.pub_inputs.a1.clone());
+        let a0 = OldBoundaryConstraint::new_simple_main(0, self.pub_inputs.a0.clone());
+        let a1 = OldBoundaryConstraint::new_simple_main(1, self.pub_inputs.a1.clone());
 
         BoundaryConstraints::from_constraints(vec![a0, a1])
+    }
+
+    /// New simplified constraints implementation
+    fn constraints(
+        &self,
+        _rap_challenges: &[FieldElement<Self::FieldExtension>],
+    ) -> Constraints<Self::Field, Self::FieldExtension> {
+        let a0 = self.pub_inputs.a0.clone();
+        let a1 = self.pub_inputs.a1.clone();
+
+        Constraints {
+            degree_1: vec![SimpleTransitionConstraint {
+                name: "fib_transition",
+                evaluate: |frame| {
+                    let step0 = frame.get_evaluation_step(0);
+                    let step1 = frame.get_evaluation_step(1);
+                    let step2 = frame.get_evaluation_step(2);
+
+                    let a0 = step0.get_main_evaluation_element(0, 0);
+                    let a1 = step1.get_main_evaluation_element(0, 0);
+                    let a2 = step2.get_main_evaluation_element(0, 0);
+
+                    a2 - a1 - a0
+                },
+                // Same function for verifier (F == E for fibonacci)
+                evaluate_ext: |frame| {
+                    let step0 = frame.get_evaluation_step(0);
+                    let step1 = frame.get_evaluation_step(1);
+                    let step2 = frame.get_evaluation_step(2);
+
+                    let a0 = step0.get_main_evaluation_element(0, 0);
+                    let a1 = step1.get_main_evaluation_element(0, 0);
+                    let a2 = step2.get_main_evaluation_element(0, 0);
+
+                    a2 - a1 - a0
+                },
+                end_exemptions: 2,
+            }],
+            degree_2: vec![],
+            degree_3: vec![],
+            boundary: vec![
+                BoundaryConstraint::new_main("init_a0", 0, 0, a0), // col 0, row 0
+                BoundaryConstraint::new_main("init_a1", 0, 1, a1), // col 0, row 1
+            ],
+            use_legacy_ordering: false,
+            use_legacy_evaluation: false,
+        }
     }
 
     fn context(&self) -> &AirContext {

@@ -62,10 +62,13 @@ impl<T: Clone> Cyclic<T> {
 // Constraint definitions
 // ============================================================================
 
-/// A transition constraint evaluation function.
-/// Takes a frame (view of consecutive trace rows) and returns the constraint value.
-/// Should return zero when the constraint is satisfied.
+/// A transition constraint evaluation function for the prover.
+/// Takes a frame with main trace in base field F and aux trace in extension E.
 pub type TransitionEvalFn<F, E> = fn(&Frame<F, E>) -> FieldElement<E>;
+
+/// A transition constraint evaluation function for the verifier.
+/// Takes a frame where all values are in the extension field E.
+pub type TransitionEvalExtFn<E> = fn(&Frame<E, E>) -> FieldElement<E>;
 
 /// A transition constraint with metadata for debugging and evaluation.
 pub struct TransitionConstraint<F, E>
@@ -75,8 +78,10 @@ where
 {
     /// Human-readable name for debugging
     pub name: &'static str,
-    /// Evaluation function
+    /// Evaluation function for prover (Frame<F, E>)
     pub evaluate: TransitionEvalFn<F, E>,
+    /// Evaluation function for verifier (Frame<E, E>)
+    pub evaluate_ext: TransitionEvalExtFn<E>,
     /// Number of rows at the end to skip (exemptions)
     pub end_exemptions: usize,
 }
@@ -128,6 +133,11 @@ impl<E: IsField> BoundaryConstraint<E> {
 /// - The correction factors cycle with period blowup_factor
 ///
 /// Boundary constraints are effectively degree 2 (trace * Lagrange basis).
+///
+/// Compatibility flags:
+/// - `use_legacy_ordering`: Process transition constraints before boundary (old ordering)
+/// - `use_legacy_evaluation`: Use simple zerofier for boundary instead of Lagrange basis,
+///    and skip degree adjustment (for Stone prover compatibility)
 pub struct Constraints<F, E>
 where
     F: IsSubFieldOf<E>,
@@ -141,6 +151,10 @@ where
     pub degree_3: Vec<TransitionConstraint<F, E>>,
     /// Boundary constraints (effectively degree 2)
     pub boundary: Vec<BoundaryConstraint<E>>,
+    /// Use legacy ordering: transition constraints before boundary (for Stone compatibility)
+    pub use_legacy_ordering: bool,
+    /// Use legacy evaluation: simple zerofier for boundary, no degree adjustment (for Stone compatibility)
+    pub use_legacy_evaluation: bool,
 }
 
 impl<F, E> Default for Constraints<F, E>
@@ -164,6 +178,20 @@ where
             degree_2: Vec::new(),
             degree_3: Vec::new(),
             boundary: Vec::new(),
+            use_legacy_ordering: false,
+            use_legacy_evaluation: false,
+        }
+    }
+
+    /// Create constraints with legacy mode enabled (for Stone prover compatibility)
+    pub fn new_legacy() -> Self {
+        Self {
+            degree_1: Vec::new(),
+            degree_2: Vec::new(),
+            degree_3: Vec::new(),
+            boundary: Vec::new(),
+            use_legacy_ordering: true,
+            use_legacy_evaluation: true,
         }
     }
 
@@ -177,14 +205,12 @@ where
         self.degree_1.len() + self.degree_2.len() + self.degree_3.len()
     }
 
-    /// Maximum transition constraint degree (1, 2, or 3)
-    /// Note: Boundary constraints are handled separately since their Lagrange
-    /// polynomial structure already includes the (x^n - 1) factor which cancels
-    /// with the zerofier, giving them different degree characteristics.
+    /// Maximum constraint degree (1, 2, or 3)
+    /// Boundary constraints are treated as degree 2 for degree correction purposes.
     pub fn max_degree(&self) -> usize {
         if !self.degree_3.is_empty() {
             3
-        } else if !self.degree_2.is_empty() {
+        } else if !self.degree_2.is_empty() || !self.boundary.is_empty() {
             2
         } else if !self.degree_1.is_empty() {
             1
@@ -221,7 +247,6 @@ where
 // ============================================================================
 
 /// Precomputed values for efficient constraint evaluation.
-/// All cyclic values have period = blowup_factor.
 /// Values are stored in the base field F for efficient F*E multiplications.
 pub struct EvalPrecomputes<F: IsFFTField, E: IsField> {
     /// Beta powers: β^0, β^1, ..., β^{num_constraints-1}
@@ -229,25 +254,27 @@ pub struct EvalPrecomputes<F: IsFFTField, E: IsField> {
     pub beta_powers: Vec<FieldElement<E>>,
 
     /// (x^n - 1)^{-1} evaluated on LDE domain - cycles with period blowup_factor
-    /// Since x^n at h·ω^j = h^n · (ω^n)^j, and ω^n has order blowup_factor,
-    /// the vanishing poly only takes blowup_factor distinct values.
     pub vanishing_inv: Cyclic<FieldElement<F>>,
 
-    /// x^n evaluated on LDE domain - cycles with period blowup_factor
+    /// x^{trace_degree} = x^{n-1} evaluated on LDE domain
     /// Used for degree correction of degree-2 constraints
-    pub x_pow_n: Cyclic<FieldElement<F>>,
+    pub x_pow_trace_deg: Vec<FieldElement<F>>,
 
-    /// x^{2n} evaluated on LDE domain - cycles with period blowup_factor
+    /// x^{2*trace_degree} = x^{2(n-1)} evaluated on LDE domain
     /// Used for degree correction of degree-1 constraints
-    pub x_pow_2n: Cyclic<FieldElement<F>>,
+    pub x_pow_2_trace_deg: Vec<FieldElement<F>>,
 
     /// Exemption polynomial evaluations: Π(x - g^{n-1-i}) for i in 0..k
-    /// Indexed by exemption count. These don't cycle nicely. (in base field F)
+    /// Indexed by exemption count (in base field F)
     pub exemptions: HashMap<usize, Vec<FieldElement<F>>>,
 
     /// Lagrange basis polynomial evaluations for boundary rows
     /// L_row(x) where L_row(g^row) = 1 and L_row(g^i) = 0 for i != row (in base field F)
     pub lagrange: HashMap<usize, Vec<FieldElement<F>>>,
+
+    /// Simple boundary zerofier inverse: 1/(x - g^row) for legacy mode
+    /// Indexed by row (in base field F)
+    pub boundary_zerofier_inv: HashMap<usize, Vec<FieldElement<F>>>,
 }
 
 impl<F: IsFFTField, E: IsField> EvalPrecomputes<F, E>
@@ -273,13 +300,13 @@ where
         let omega_n = omega.pow(n);
 
         // Beta powers: β^0, β^1, ..., β^{num_constraints-1}
-        let beta_powers: Vec<_> = std::iter::successors(Some(FieldElement::<E>::one()), |prev| {
-            Some(prev * beta)
-        })
-        .take(num_constraints)
-        .collect();
+        let beta_powers: Vec<_> =
+            std::iter::successors(Some(FieldElement::<E>::one()), |prev| Some(prev * beta))
+                .take(num_constraints)
+                .collect();
 
         // Vanishing inverse: (h^n · (ω^n)^j - 1)^{-1} for j = 0..bf
+        // This cycles with period blowup_factor
         let h_n = h.pow(n);
         let mut vanishing_vals: Vec<FieldElement<F>> =
             std::iter::successors(Some(FieldElement::<F>::one()), |prev| Some(prev * &omega_n))
@@ -290,21 +317,18 @@ where
             .expect("vanishing polynomial values should be invertible");
         let vanishing_inv = Cyclic::new(vanishing_vals);
 
-        // x^n: h^n · (ω^n)^j for j = 0..bf
-        let x_pow_n_vals: Vec<FieldElement<F>> =
-            std::iter::successors(Some(h_n.clone()), |prev| Some(prev * &omega_n))
-                .take(bf)
-                .collect();
-        let x_pow_n = Cyclic::new(x_pow_n_vals);
+        // x^{trace_degree} = x^{n-1} evaluated at all LDE points
+        // trace_degree = n - 1, doesn't cycle nicely so we compute all values
+        let trace_deg = n - 1;
+        let lde_size = n * bf;
+        let lde_points = &domain.lde_roots_of_unity_coset;
 
-        // x^{2n}: h^{2n} · (ω^n)^{2j} for j = 0..bf
-        let h_2n = h.pow(2 * n);
-        let omega_2n = &omega_n * &omega_n;
-        let x_pow_2n_vals: Vec<FieldElement<F>> =
-            std::iter::successors(Some(h_2n), |prev| Some(prev * &omega_2n))
-                .take(bf)
-                .collect();
-        let x_pow_2n = Cyclic::new(x_pow_2n_vals);
+        let x_pow_trace_deg: Vec<FieldElement<F>> =
+            lde_points.iter().map(|x| x.pow(trace_deg)).collect();
+
+        // x^{2*trace_degree} = x^{2(n-1)} evaluated at all LDE points
+        let x_pow_2_trace_deg: Vec<FieldElement<F>> =
+            lde_points.iter().map(|x| x.pow(2 * trace_deg)).collect();
 
         // Exemption polynomials (in F)
         let exemptions = Self::compute_exemptions(domain, g, exemption_counts);
@@ -312,13 +336,20 @@ where
         // Lagrange basis polynomials (in F)
         let lagrange = Self::compute_lagrange_bases(domain, g, boundary_rows);
 
+        // Simple boundary zerofier inverse: 1/(x - g^row) for legacy mode
+        let boundary_zerofier_inv = Self::compute_boundary_zerofier_inv(domain, g, boundary_rows);
+
+        // Suppress unused variable warning
+        let _ = lde_size;
+
         Self {
             beta_powers,
             vanishing_inv,
-            x_pow_n,
-            x_pow_2n,
+            x_pow_trace_deg,
+            x_pow_2_trace_deg,
             exemptions,
             lagrange,
+            boundary_zerofier_inv,
         }
     }
 
@@ -408,6 +439,34 @@ where
 
         result
     }
+
+    /// Compute simple boundary zerofier inverse: 1/(x - g^row) for legacy mode.
+    /// This is the simple zerofier used in the old constraint system.
+    fn compute_boundary_zerofier_inv(
+        domain: &Domain<F>,
+        g: &FieldElement<F>,
+        boundary_rows: &[usize],
+    ) -> HashMap<usize, Vec<FieldElement<F>>> {
+        let lde_points = &domain.lde_roots_of_unity_coset;
+
+        let mut result = HashMap::new();
+
+        for &row in boundary_rows {
+            let g_row = g.pow(row);
+
+            // Compute (x - g^row) for each LDE point
+            let mut zerofier_vals: Vec<FieldElement<F>> =
+                lde_points.iter().map(|x| x - &g_row).collect();
+
+            // Batch invert to get 1/(x - g^row)
+            FieldElement::inplace_batch_inverse(&mut zerofier_vals)
+                .expect("Boundary zerofier values should be invertible");
+
+            result.insert(row, zerofier_vals);
+        }
+
+        result
+    }
 }
 
 // ============================================================================
@@ -434,6 +493,138 @@ pub struct EvalResult<E: IsField> {
 }
 
 // ============================================================================
+// Single-point constraint evaluation (shared by sequential and parallel versions)
+// ============================================================================
+
+/// Evaluate all constraints at a single point on the LDE domain.
+///
+/// This is the core evaluation function used by both sequential and parallel evaluators.
+/// It computes:
+///   [Σ β^i · C_i(x) · exempt_i(x) · deg_corr_i(x)] / (x^n - 1)
+///
+/// Modes:
+/// - Default: degree_1, degree_2, degree_3, boundary ordering with Lagrange basis and degree adjustment
+/// - Legacy ordering: transition constraints (all degrees) get beta^0..beta^{n-1}, boundary gets the rest
+/// - Legacy evaluation: simple zerofier 1/(x-g^row) instead of Lagrange, no degree adjustment
+#[inline]
+pub fn evaluate_at_point<F, E>(
+    constraints: &Constraints<F, E>,
+    lde_trace: &LDETraceTable<F, E>,
+    precomputes: &EvalPrecomputes<F, E>,
+    frame_offsets: &[usize],
+    point_idx: usize,
+    max_degree: usize,
+) -> FieldElement<E>
+where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField,
+{
+    let frame = Frame::read_from_lde(lde_trace, point_idx, frame_offsets);
+
+    let inv_z = precomputes.vanishing_inv.get(point_idx);
+    let x_td = &precomputes.x_pow_trace_deg[point_idx];
+    let x_2td = &precomputes.x_pow_2_trace_deg[point_idx];
+
+    let legacy_eval = constraints.use_legacy_evaluation;
+    let legacy_ordering = constraints.use_legacy_ordering;
+
+    let mut acc = FieldElement::<E>::zero();
+
+    // Helper to evaluate a transition constraint
+    let eval_transition = |c: &TransitionConstraint<F, E>,
+                           beta: &FieldElement<E>,
+                           degree: usize|
+     -> FieldElement<E> {
+        let c_eval = (c.evaluate)(&frame);
+        let exempt = &precomputes.exemptions[&c.end_exemptions][point_idx];
+        let corrected = if legacy_eval {
+            // Legacy: just exempt * c_eval (no degree adjustment)
+            exempt * &c_eval
+        } else {
+            // New: apply degree correction based on constraint degree
+            match (max_degree, degree) {
+                (3, 1) => exempt * x_2td * &c_eval,
+                (2, 1) | (3, 2) => exempt * x_td * &c_eval,
+                _ => exempt * &c_eval,
+            }
+        };
+        beta * &corrected
+    };
+
+    // Helper to evaluate a boundary constraint
+    let eval_boundary = |bc: &BoundaryConstraint<E>, beta: &FieldElement<E>| -> FieldElement<E> {
+        let trace_val: FieldElement<E> = if bc.is_aux {
+            lde_trace.get_aux(point_idx, bc.col).clone()
+        } else {
+            lde_trace.get_main(point_idx, bc.col).clone().to_extension()
+        };
+        let c_eval = trace_val - &bc.value;
+
+        let corrected = if legacy_eval {
+            // Legacy: use simple zerofier inverse 1/(x - g^row)
+            let zerofier_inv = &precomputes.boundary_zerofier_inv[&bc.row][point_idx];
+            zerofier_inv * &c_eval
+        } else {
+            // New: use Lagrange basis with degree correction
+            let lagrange = &precomputes.lagrange[&bc.row][point_idx];
+            match max_degree {
+                3 => lagrange * x_td * &c_eval,
+                _ => lagrange * &c_eval,
+            }
+        };
+        beta * &corrected
+    };
+
+    if legacy_ordering {
+        // Legacy ordering: transition constraints first (all degrees), then boundary
+        // Beta powers: transition 0..num_transition, boundary num_transition..total
+        let mut beta_idx = 0;
+
+        // All transition constraints (degree_1, degree_2, degree_3)
+        for c in &constraints.degree_1 {
+            acc = acc + eval_transition(c, &precomputes.beta_powers[beta_idx], 1);
+            beta_idx += 1;
+        }
+        for c in &constraints.degree_2 {
+            acc = acc + eval_transition(c, &precomputes.beta_powers[beta_idx], 2);
+            beta_idx += 1;
+        }
+        for c in &constraints.degree_3 {
+            acc = acc + eval_transition(c, &precomputes.beta_powers[beta_idx], 3);
+            beta_idx += 1;
+        }
+
+        // Then boundary constraints
+        for bc in &constraints.boundary {
+            acc = acc + eval_boundary(bc, &precomputes.beta_powers[beta_idx]);
+            beta_idx += 1;
+        }
+    } else {
+        // New ordering: degree_1, degree_2, degree_3, boundary (same as iteration order)
+        let mut beta_idx = 0;
+
+        for c in &constraints.degree_1 {
+            acc = acc + eval_transition(c, &precomputes.beta_powers[beta_idx], 1);
+            beta_idx += 1;
+        }
+        for c in &constraints.degree_2 {
+            acc = acc + eval_transition(c, &precomputes.beta_powers[beta_idx], 2);
+            beta_idx += 1;
+        }
+        for c in &constraints.degree_3 {
+            acc = acc + eval_transition(c, &precomputes.beta_powers[beta_idx], 3);
+            beta_idx += 1;
+        }
+        for bc in &constraints.boundary {
+            acc = acc + eval_boundary(bc, &precomputes.beta_powers[beta_idx]);
+            beta_idx += 1;
+        }
+    }
+
+    inv_z * acc
+}
+
+// ============================================================================
 // Constraint evaluation
 // ============================================================================
 
@@ -445,7 +636,7 @@ pub struct EvalResult<E: IsField> {
 /// Where:
 /// - C_i(x) is the constraint evaluation (should be 0 on trace domain)
 /// - exempt_i(x) is the exemption polynomial (handles end exemptions)
-/// - deg_corr_i(x) = x^{(max_deg - deg_i) * n} ensures all terms have same degree
+/// - deg_corr_i(x) = x^{(max_deg - deg_i) * trace_deg} ensures all terms have same degree
 /// - β^i is the random linear combination coefficient
 pub fn evaluate_constraints<F, E>(
     constraints: &Constraints<F, E>,
@@ -459,98 +650,24 @@ where
     E: IsField,
 {
     let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
-
     let max_degree = constraints.max_degree();
-    let mut quotient_evals = Vec::with_capacity(lde_size);
-    let failures = Vec::new();
 
-    for point_idx in 0..lde_size {
-        let frame = Frame::read_from_lde(lde_trace, point_idx, frame_offsets);
-
-        // Get cycling values for this point
-        let inv_z = precomputes.vanishing_inv.get(point_idx);
-        let x_n = precomputes.x_pow_n.get(point_idx);
-        let x_2n = precomputes.x_pow_2n.get(point_idx);
-
-        let mut acc = FieldElement::<E>::zero();
-        let mut beta_idx = 0;
-
-        // Degree corrections: x^{(max_deg - d) * n}
-        // For max_degree = 3: deg1 gets x^{2n}, deg2 gets x^n, deg3 gets 1
-        // For max_degree = 2: deg1 gets x^n, deg2 gets 1
-        // For max_degree = 1: deg1 gets 1
-        //
-        // The correction ensures all constraint contributions have the same
-        // effective degree after dividing by the zerofier.
-
-        // Degree 1 constraints
-        for c in &constraints.degree_1 {
-            let c_eval = (c.evaluate)(&frame);
-            let exempt = &precomputes.exemptions[&c.end_exemptions][point_idx];
-
-            // Degree correction: x^{(max_deg - 1) * n}
-            // Use F * E multiplication (base field on left)
-            let corrected = match max_degree {
-                3 => exempt * x_2n * &c_eval,
-                2 => exempt * x_n * &c_eval,
-                _ => exempt * &c_eval,
-            };
-
-            acc = acc + &precomputes.beta_powers[beta_idx] * &corrected;
-            beta_idx += 1;
-        }
-
-        // Degree 2 constraints
-        for c in &constraints.degree_2 {
-            let c_eval = (c.evaluate)(&frame);
-            let exempt = &precomputes.exemptions[&c.end_exemptions][point_idx];
-
-            // Degree correction: x^{(max_deg - 2) * n}
-            let corrected = match max_degree {
-                3 => exempt * x_n * &c_eval,
-                _ => exempt * &c_eval,
-            };
-
-            acc = acc + &precomputes.beta_powers[beta_idx] * &corrected;
-            beta_idx += 1;
-        }
-
-        // Degree 3 constraints (no correction needed, they define max_degree)
-        for c in &constraints.degree_3 {
-            let c_eval = (c.evaluate)(&frame);
-            let exempt = &precomputes.exemptions[&c.end_exemptions][point_idx];
-
-            acc = acc + &precomputes.beta_powers[beta_idx] * (exempt * &c_eval);
-            beta_idx += 1;
-        }
-
-        // Boundary constraints (effectively degree 2)
-        // Correction: x^{(max_deg - 2) * n}
-        for bc in &constraints.boundary {
-            let trace_val: FieldElement<E> = if bc.is_aux {
-                lde_trace.get_aux(point_idx, bc.col).clone()
-            } else {
-                lde_trace.get_main(point_idx, bc.col).clone().to_extension()
-            };
-            let c_eval = trace_val - &bc.value;
-            let lagrange = &precomputes.lagrange[&bc.row][point_idx];
-
-            let corrected = match max_degree {
-                3 => lagrange * x_n * &c_eval,
-                _ => lagrange * &c_eval,
-            };
-
-            acc = acc + &precomputes.beta_powers[beta_idx] * &corrected;
-            beta_idx += 1;
-        }
-
-        // Divide by vanishing polynomial
-        quotient_evals.push(inv_z * acc);
-    }
+    let quotient_evals: Vec<_> = (0..lde_size)
+        .map(|point_idx| {
+            evaluate_at_point(
+                constraints,
+                lde_trace,
+                precomputes,
+                frame_offsets,
+                point_idx,
+                max_degree,
+            )
+        })
+        .collect();
 
     EvalResult {
         quotient_evals,
-        failures,
+        failures: Vec::new(),
     }
 }
 
@@ -580,7 +697,7 @@ pub mod parallel {
         let quotient_evals: Vec<_> = (0..lde_size)
             .into_par_iter()
             .map(|point_idx| {
-                evaluate_single_point(
+                evaluate_at_point(
                     constraints,
                     lde_trace,
                     precomputes,
@@ -593,82 +710,8 @@ pub mod parallel {
 
         EvalResult {
             quotient_evals,
-            failures: Vec::new(), // Parallel version doesn't collect failures for performance
+            failures: Vec::new(),
         }
-    }
-
-    fn evaluate_single_point<F, E>(
-        constraints: &Constraints<F, E>,
-        lde_trace: &LDETraceTable<F, E>,
-        precomputes: &EvalPrecomputes<F, E>,
-        frame_offsets: &[usize],
-        point_idx: usize,
-        max_degree: usize,
-    ) -> FieldElement<E>
-    where
-        F: IsFFTField + IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let frame = Frame::read_from_lde(lde_trace, point_idx, frame_offsets);
-
-        let inv_z = precomputes.vanishing_inv.get(point_idx);
-        let x_n = precomputes.x_pow_n.get(point_idx);
-        let x_2n = precomputes.x_pow_2n.get(point_idx);
-
-        let mut acc = FieldElement::<E>::zero();
-        let mut beta_idx = 0;
-
-        // Degree 1 constraints
-        for c in &constraints.degree_1 {
-            let c_eval = (c.evaluate)(&frame);
-            let exempt = &precomputes.exemptions[&c.end_exemptions][point_idx];
-            let corrected = match max_degree {
-                3 => exempt * x_2n * &c_eval,
-                2 => exempt * x_n * &c_eval,
-                _ => exempt * &c_eval,
-            };
-            acc = acc + &precomputes.beta_powers[beta_idx] * &corrected;
-            beta_idx += 1;
-        }
-
-        // Degree 2 constraints
-        for c in &constraints.degree_2 {
-            let c_eval = (c.evaluate)(&frame);
-            let exempt = &precomputes.exemptions[&c.end_exemptions][point_idx];
-            let corrected = match max_degree {
-                3 => exempt * x_n * &c_eval,
-                _ => exempt * &c_eval,
-            };
-            acc = acc + &precomputes.beta_powers[beta_idx] * &corrected;
-            beta_idx += 1;
-        }
-
-        // Degree 3 constraints
-        for c in &constraints.degree_3 {
-            let c_eval = (c.evaluate)(&frame);
-            let exempt = &precomputes.exemptions[&c.end_exemptions][point_idx];
-            acc = acc + &precomputes.beta_powers[beta_idx] * (exempt * &c_eval);
-            beta_idx += 1;
-        }
-
-        // Boundary constraints
-        for bc in &constraints.boundary {
-            let trace_val: FieldElement<E> = if bc.is_aux {
-                lde_trace.get_aux(point_idx, bc.col).clone()
-            } else {
-                lde_trace.get_main(point_idx, bc.col).clone().to_extension()
-            };
-            let c_eval = trace_val - &bc.value;
-            let lagrange = &precomputes.lagrange[&bc.row][point_idx];
-            let corrected = match max_degree {
-                3 => lagrange * x_n * &c_eval,
-                _ => lagrange * &c_eval,
-            };
-            acc = acc + &precomputes.beta_powers[beta_idx] * &corrected;
-            beta_idx += 1;
-        }
-
-        inv_z * acc
     }
 }
 
@@ -722,6 +765,7 @@ mod tests {
         constraints.degree_1.push(TransitionConstraint {
             name: "test",
             evaluate: |_| FE::zero(),
+            evaluate_ext: |_| FE::zero(),
             end_exemptions: 1,
         });
         assert_eq!(constraints.max_degree(), 1);
@@ -729,6 +773,7 @@ mod tests {
         constraints.degree_2.push(TransitionConstraint {
             name: "test2",
             evaluate: |_| FE::zero(),
+            evaluate_ext: |_| FE::zero(),
             end_exemptions: 1,
         });
         assert_eq!(constraints.max_degree(), 2);
@@ -736,6 +781,7 @@ mod tests {
         constraints.degree_3.push(TransitionConstraint {
             name: "test3",
             evaluate: |_| FE::zero(),
+            evaluate_ext: |_| FE::zero(),
             end_exemptions: 1,
         });
         assert_eq!(constraints.max_degree(), 3);
@@ -748,16 +794,19 @@ mod tests {
         constraints.degree_1.push(TransitionConstraint {
             name: "test1",
             evaluate: |_| FE::zero(),
+            evaluate_ext: |_| FE::zero(),
             end_exemptions: 1,
         });
         constraints.degree_1.push(TransitionConstraint {
             name: "test2",
             evaluate: |_| FE::zero(),
+            evaluate_ext: |_| FE::zero(),
             end_exemptions: 2,
         });
         constraints.degree_2.push(TransitionConstraint {
             name: "test3",
             evaluate: |_| FE::zero(),
+            evaluate_ext: |_| FE::zero(),
             end_exemptions: 1, // duplicate
         });
 
@@ -823,12 +872,9 @@ mod tests {
         let coset_offset = FE::from(7u64); // arbitrary non-zero offset
 
         let trace_primitive_root = F::get_primitive_root_of_unity(root_order as u64).unwrap();
-        let trace_roots_of_unity = get_powers_of_primitive_root_coset(
-            root_order as u64,
-            trace_length,
-            &FE::one(),
-        )
-        .unwrap();
+        let trace_roots_of_unity =
+            get_powers_of_primitive_root_coset(root_order as u64, trace_length, &FE::one())
+                .unwrap();
 
         let lde_root_order = (trace_length * blowup_factor).trailing_zeros();
         let lde_roots_of_unity_coset = get_powers_of_primitive_root_coset(
@@ -876,11 +922,24 @@ mod tests {
 
                     a2 - a1 - a0
                 },
+                evaluate_ext: |frame| {
+                    let step0 = frame.get_evaluation_step(0);
+                    let step1 = frame.get_evaluation_step(1);
+                    let step2 = frame.get_evaluation_step(2);
+
+                    let a0 = step0.get_main_evaluation_element(0, 0);
+                    let a1 = step1.get_main_evaluation_element(0, 0);
+                    let a2 = step2.get_main_evaluation_element(0, 0);
+
+                    a2 - a1 - a0
+                },
                 end_exemptions: 2,
             }],
             degree_2: vec![],
             degree_3: vec![],
             boundary: vec![], // No boundary constraints for this test
+            use_legacy_ordering: false,
+            use_legacy_evaluation: false,
         };
 
         let beta = FE::from(42u64);
@@ -906,11 +965,9 @@ mod tests {
 
         assert_eq!(result.quotient_evals.len(), trace_length * blowup_factor);
 
-        let quotient_poly = Polynomial::interpolate_offset_fft(
-            &result.quotient_evals,
-            &domain.coset_offset,
-        )
-        .unwrap();
+        let quotient_poly =
+            Polynomial::interpolate_offset_fft(&result.quotient_evals, &domain.coset_offset)
+                .unwrap();
 
         // For transition constraints only:
         // - Constraint C(x) has degree 1 (linear in trace values)
@@ -958,6 +1015,17 @@ mod tests {
 
                     a2 - a1 - a0
                 },
+                evaluate_ext: |frame| {
+                    let step0 = frame.get_evaluation_step(0);
+                    let step1 = frame.get_evaluation_step(1);
+                    let step2 = frame.get_evaluation_step(2);
+
+                    let a0 = step0.get_main_evaluation_element(0, 0);
+                    let a1 = step1.get_main_evaluation_element(0, 0);
+                    let a2 = step2.get_main_evaluation_element(0, 0);
+
+                    a2 - a1 - a0
+                },
                 end_exemptions: 2,
             }],
             degree_2: vec![],
@@ -966,6 +1034,8 @@ mod tests {
                 BoundaryConstraint::new_main("init_a0", 0, 0, a0),
                 BoundaryConstraint::new_main("init_a1", 0, 1, a1),
             ],
+            use_legacy_ordering: false,
+            use_legacy_evaluation: false,
         };
 
         let beta = FE::from(42u64);
@@ -997,11 +1067,9 @@ mod tests {
 
         assert_eq!(result.quotient_evals.len(), trace_length * blowup_factor);
 
-        let quotient_poly = Polynomial::interpolate_offset_fft(
-            &result.quotient_evals,
-            &domain.coset_offset,
-        )
-        .unwrap();
+        let quotient_poly =
+            Polynomial::interpolate_offset_fft(&result.quotient_evals, &domain.coset_offset)
+                .unwrap();
 
         let degree = quotient_poly.degree();
         println!("Full quotient degree: {}", degree);
@@ -1021,7 +1089,7 @@ mod tests {
     }
 
     #[test]
-    fn test_precomputes_cyclic_values() {
+    fn test_precomputes_values() {
         let trace_length = 8;
         let blowup_factor = 4;
         let domain = create_test_domain(trace_length, blowup_factor);
@@ -1029,7 +1097,6 @@ mod tests {
         let beta = FE::from(123u64);
         let precomputes = EvalPrecomputes::<F, F>::new(&domain, &beta, 3, &[1, 2], &[0]);
 
-        // Test that cyclic values actually cycle
         let lde_size = trace_length * blowup_factor;
 
         // Vanishing inverse should cycle with period blowup_factor
@@ -1037,25 +1104,33 @@ mod tests {
             assert_eq!(
                 precomputes.vanishing_inv.get(i),
                 precomputes.vanishing_inv.get(i % blowup_factor),
-                "Vanishing inverse should cycle at index {}", i
+                "Vanishing inverse should cycle at index {}",
+                i
             );
         }
 
-        // x^n should cycle with period blowup_factor
-        for i in 0..lde_size {
-            assert_eq!(
-                precomputes.x_pow_n.get(i),
-                precomputes.x_pow_n.get(i % blowup_factor),
-                "x^n should cycle at index {}", i
-            );
-        }
+        // x^{trace_deg} should have lde_size values
+        assert_eq!(
+            precomputes.x_pow_trace_deg.len(),
+            lde_size,
+            "x^{{trace_deg}} should have lde_size values"
+        );
 
-        // x^(2n) should cycle with period blowup_factor
-        for i in 0..lde_size {
+        // x^{2*trace_deg} should have lde_size values
+        assert_eq!(
+            precomputes.x_pow_2_trace_deg.len(),
+            lde_size,
+            "x^{{2*trace_deg}} should have lde_size values"
+        );
+
+        // Verify x^{trace_deg} is computed correctly: x^{n-1} at each LDE point
+        let trace_deg = trace_length - 1;
+        for (i, x) in domain.lde_roots_of_unity_coset.iter().enumerate() {
+            let expected = x.pow(trace_deg);
             assert_eq!(
-                precomputes.x_pow_2n.get(i),
-                precomputes.x_pow_2n.get(i % blowup_factor),
-                "x^(2n) should cycle at index {}", i
+                precomputes.x_pow_trace_deg[i], expected,
+                "x^{{trace_deg}} mismatch at index {}",
+                i
             );
         }
     }

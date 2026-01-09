@@ -9,7 +9,10 @@ use math::{
     polynomial::Polynomial,
 };
 
-use crate::{constraints::transition::TransitionConstraint, domain::Domain};
+use crate::{
+    constraints::simple::Constraints as SimpleConstraints,
+    constraints::transition::TransitionConstraint, domain::Domain,
+};
 
 use super::{
     constraints::boundary::BoundaryConstraints, context::AirContext, frame::Frame,
@@ -109,6 +112,12 @@ pub trait AIR: Send + Sync {
         aux_trace_columns != 0
     }
 
+    /// Returns true if this AIR should use the legacy evaluator for Stone prover compatibility.
+    /// Override this to return true for AIRs that need to match Stone prover intermediate values.
+    fn use_legacy_evaluator(&self) -> bool {
+        false
+    }
+
     fn num_auxiliary_rap_columns(&self) -> usize {
         self.trace_layout().1
     }
@@ -190,6 +199,17 @@ pub trait AIR: Send + Sync {
     fn transition_constraints(
         &self,
     ) -> &Vec<Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>>;
+
+    /// Returns the simplified constraints for this AIR.
+    /// This is the new constraint system that replaces the old transition_constraints and boundary_constraints methods.
+    fn constraints(
+        &self,
+        _rap_challenges: &[FieldElement<Self::FieldExtension>],
+    ) -> SimpleConstraints<Self::Field, Self::FieldExtension> {
+        // Default implementation returns empty constraints
+        // Override this method to use the new constraint system
+        SimpleConstraints::new()
+    }
 
     fn transition_zerofier_evaluations(
         &self,
