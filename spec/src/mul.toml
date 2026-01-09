@@ -161,7 +161,7 @@ ref = "mul:c:rhs_signed_implies_mu"
 kind = "interaction"
 tag = "IS_B19"
 input = [["idx", "carry", "i"]]
-range = ["i", 0, 7]
+range = ["i", 0, 3]
 multiplicity = "μ_sum"
 ref = "mul:c:carry"
 
