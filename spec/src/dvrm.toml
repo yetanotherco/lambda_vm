@@ -183,46 +183,25 @@ poly = ["-", ["*", "signed", "n_sub_r_msb"], "n_sub_r_is_negative"]
 ref = "dvrm:c:n_sub_r_is_negative"
 
 [[constraints.defs]]
-kind = "interaction"
-tag = "MSB16"
-input = [["idx", "n", 3]]
+kind = "template"
+tag = "SIGN"
+input = [["idx", "n", 3], "signed"]
 output = "n_is_negative"
-multiplicity = "signed"
-ref = "dvrm:c:n_is_negative_if_signed"
+ref = "dvrm:c:n_is_negative"
 
 [[constraints.defs]]
-kind = "arith"
-constraint = "$!#`signed` => #`n_is_negative` = 0$"
-poly = ["*", ["-", 1, "signed"], "n_is_negative"]
-ref = "dvrm:c:n_is_negative_if_not_signed"
-
-[[constraints.defs]]
-kind = "interaction"
-tag = "MSB16"
-input = [["idx", "d", 3]]
+kind = "template"
+tag = "SIGN"
+input = [["idx", "d", 3], "signed"]
 output = "d_is_negative"
-multiplicity = "signed"
-ref = "dvrm:c:d_is_negative_if_signed"
+ref = "dvrm:c:d_is_negative"
 
 [[constraints.defs]]
-kind = "arith"
-constraint = "$!#`signed` => #`d_is_negative` = 0$"
-poly = ["*", ["-", 1, "signed"], "d_is_negative"]
-ref = "dvrm:c:d_is_negative_if_not_signed"
-
-[[constraints.defs]]
-kind = "interaction"
-tag = "MSB16"
-input = [["idx", "r", 3]]
+kind = "template"
+tag = "SIGN"
+input = [["idx", "r", 3], "signed"]
 output = "r_is_negative"
-multiplicity = "signed"
-ref = "dvrm:c:r_is_negative_if_signed"
-
-[[constraints.defs]]
-kind = "arith"
-constraint = "$!#`signed` => #`r_is_negative` = 0$"
-poly = ["*", ["-", 1, "signed"], "r_is_negative"]
-ref = "dvrm:c:r_is_negative_if_not_signed"
+ref = "dvrm:c:r_is_negative"
 
 [[constraint_groups]]
 name = "equality"
