@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-lambdaworks-crypto = { git = "https://github.com/lambdaclass/lambdaworks.git" }
-lambdaworks-math = { git = "https://github.com/lambdaclass/lambdaworks.git" }
-stark-platinum-prover = { git = "https://github.com/lambdaclass/lambdaworks.git" }
+stark = { path = "../crypto/stark" }
+crypto = { path = "../crypto/crypto" }
+math = { path = "../crypto/math" }
+executor = { path = "../executor" }
+lazy_static = "1.5.0"
