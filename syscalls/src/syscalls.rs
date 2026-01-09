@@ -58,16 +58,6 @@ pub unsafe extern "C" fn sys_panic(msg_ptr: *const u8, len: usize) {
     }
 }
 
-/// # Safety
-///
-/// This function should not be called by the user
-/// It is only for rust std internal uses
-#[unsafe(no_mangle)]
-pub extern "C" fn sys_rand(_buf: *mut u8, _len: usize) -> isize {
-    print_string("sys_rand called\n");
-    0
-}
-
 pub fn commit(slice: &[u8]) {
     print_string("commit called\n");
     unsafe {
