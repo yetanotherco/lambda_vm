@@ -142,7 +142,7 @@ name = "prod"
 [[constraints.prod]]
 kind = "arith"
 constraint = "$#`raw_product[i]` = #`limb_product[2i]` + 2^32 dot #`limb_product[2i + 1]`$"
-poly = ["-", ["+", ["idx", "limb_product", "2i"], ["*", ["^", 2, 32], ["idx", "limb_product", "2i+1"]]], ["idx", "raw_product", "i"]]
+poly = ["-", ["+", ["idx", "limb_product", ["*", 2, "i"]], ["*", ["^", 2, 32], ["idx", "limb_product", ["+", ["*", 2, "i"], 1]]]], ["idx", "raw_product", "i"]]
 range = ["i", 0, 3]
 
 [[constraint_groups]]
