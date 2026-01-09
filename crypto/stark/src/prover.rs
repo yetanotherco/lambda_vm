@@ -350,13 +350,11 @@ pub trait IsStarkProver<
             .unwrap()
     }
 
-    /// Returns the result of the first round of the STARK Prove protocol.
-    fn round_1_randomized_air_with_preprocessing(
-        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+    fn round_1_commitment(
         trace: &mut TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
-    ) -> Result<Round1<Field, FieldExtension>, ProvingError>
+    ) -> Result<(Round1CommitmentData<Field>, Vec<Vec<FieldElement<Field>>>), ProvingError>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
@@ -367,13 +365,30 @@ pub trait IsStarkProver<
             return Err(ProvingError::EmptyCommitment);
         };
 
-        let main = Round1CommitmentData::<Field> {
-            trace_polys,
-            lde_trace_merkle_tree: main_merkle_tree,
-            lde_trace_merkle_root: main_merkle_root,
-        };
+        Ok((
+            Round1CommitmentData::<Field> {
+                trace_polys,
+                lde_trace_merkle_tree: main_merkle_tree,
+                lde_trace_merkle_root: main_merkle_root,
+            },
+            evaluations,
+        ))
+    }
 
-        let rap_challenges = air.build_rap_challenges(transcript);
+    /// Returns the result of the first round of the STARK Prove protocol.
+    fn round_1_randomized_air_with_preprocessing_from_commitment(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        trace: &mut TraceTable<Field, FieldExtension>,
+        domain: &Domain<Field>,
+        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+        commitment: Round1CommitmentData<Field>,
+        evaluations: Vec<Vec<FieldElement<Field>>>,
+        rap_challenges: Vec<FieldElement<FieldExtension>>,
+    ) -> Result<Round1<Field, FieldExtension>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
         let (aux, aux_evaluations) = if air.has_trace_interaction() {
             air.build_auxiliary_trace(trace, &rap_challenges);
             let Some((
@@ -405,10 +420,34 @@ pub trait IsStarkProver<
 
         Ok(Round1 {
             lde_trace,
-            main,
+            main: commitment,
             aux,
             rap_challenges,
         })
+    }
+
+    /// Returns the result of the first round of the STARK Prove protocol.
+    fn round_1_randomized_air_with_preprocessing(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        trace: &mut TraceTable<Field, FieldExtension>,
+        domain: &Domain<Field>,
+        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+    ) -> Result<Round1<Field, FieldExtension>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        let (commitment, evaluations) = Self::round_1_commitment(trace, domain, transcript)?;
+        let rap_challenges = air.build_rap_challenges(transcript);
+        Self::round_1_randomized_air_with_preprocessing_from_commitment(
+            air,
+            trace,
+            domain,
+            transcript,
+            commitment,
+            evaluations,
+            rap_challenges,
+        )
     }
 
     /// Returns the Merkle tree and the commitment to the evaluations of the parts of the
@@ -914,6 +953,72 @@ pub trait IsStarkProver<
                 Self::round_1_randomized_air_with_preprocessing(*air, *table, &domain, transcript)?;
             round_1_results.push(round_1_result);
             domains.push(domain);
+        }
+
+        // Execute Rounds 2-4 for each AIR
+        let mut proofs = Vec::new();
+        for (((air, _), round_1_result), domain) in airs.iter().zip(round_1_results).zip(domains) {
+            let proof = Self::prove_rounds_2_to_4(*air, &round_1_result, transcript, &domain)?;
+            proofs.push(proof);
+        }
+
+        Ok(proofs)
+    }
+
+    // FIXME remove unwrap() calls and return errors
+    /// Generates STARK proofs for one or more AIRs with a shared transcript.
+    ///
+    /// This unified function handles both single-table and multi-table proving.
+    ///
+    /// The function executes Round 1 for all AIRs first (committing all traces to the transcript),
+    /// then executes Rounds 2-4 for each AIR sequentially. This ensures proper Fiat-Shamir challenge
+    /// generation across all tables.
+    ///
+    /// Warning: the transcript must be safely initialized before passing it to this method.
+    fn multi_lookup_prove(
+        mut airs: Vec<AirAndTrace<'_, Field, FieldExtension, PI>>,
+        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+    ) -> Result<Vec<StarkProof<Field, FieldExtension>>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+        FieldExtension: IsFFTField,
+        PI: Send + Sync,
+    {
+        info!("Started proof generation...");
+
+        let mut round_1_results: Vec<Round1<Field, FieldExtension>> = Vec::new();
+        let mut domains = Vec::new();
+
+        // Execute Round 1 for all AIRs first to ensure all trace commitments
+        // are in the transcript before generating challenges for Round 2
+        let mut round_1_commitments = Vec::new();
+        // Perform all commitments before sampling rap challenges
+        for (air, table) in &mut *airs {
+            let domain = new_domain(*air);
+            round_1_commitments.push(Self::round_1_commitment(*table, &domain, transcript)?);
+            domains.push(domain);
+        }
+        // Sample rap challenges to be used by all airs
+        let rap_challenges = vec![
+            transcript.sample_field_element(),
+            transcript.sample_field_element(),
+        ];
+        for (((air, table), domain), (commitment, evaluations)) in airs
+            .iter_mut()
+            .zip(domains.iter())
+            .zip(round_1_commitments.into_iter())
+        {
+            let round_1_result = Self::round_1_randomized_air_with_preprocessing_from_commitment(
+                *air,
+                *table,
+                &domain,
+                transcript,
+                commitment,
+                evaluations,
+                rap_challenges.clone(),
+            )?;
+            round_1_results.push(round_1_result);
         }
 
         // Execute Rounds 2-4 for each AIR
