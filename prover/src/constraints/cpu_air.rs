@@ -54,7 +54,7 @@ const RV_TWO: usize = 38;
 const ARG_TWO: usize = 44;
 const RES: usize = 46;
 // const IS_EQUAL: usize = 50;
-// const BRANCH_COND: usize = 51;
+const BRANCH_COND: usize = 51;
 
 type FE = FieldElement<Babybear31PrimeField>;
 
@@ -137,7 +137,7 @@ impl AIR for CPUTableAIR {
 
         // Enforces RES = PC + 4 in a JALR instruction
         let next_pc_value_constraint = new_add_four_constraint(
-            vec![JALR], // flags_idx,
+            JALR,       // flag_idx,
             PC,         // rhs_start_idx,
             RES,        // res_start_idx,
             next_index, // constraint_idx_start,
@@ -161,21 +161,18 @@ impl AIR for CPUTableAIR {
 
         // Enforces NEXT_PC = PC + 4 for non-jump instructions
         let regular_pc_update_constraint = new_add_four_constraint(
-            // flags_idx,
-            vec![
-                ADD, SUB, SLT, AND, OR, XOR, SL, SR, LOAD, STORE, MUL, DIVREM,
-            ],
-            PC,         // rhs_start_idx,
-            NEXT_PC,    // res_start_idx,
-            next_index, // constraint_idx_start,
+            BRANCH_COND, // flag_idx,
+            PC,          // rhs_start_idx,
+            NEXT_PC,     // res_start_idx,
+            next_index,  // constraint_idx_start,
         );
-        // next_index += 2;
 
         let mut constraints = bit_constraints;
         constraints.extend(add_constraints);
         constraints.extend(sub_constraints);
         constraints.extend(next_pc_value_constraint);
         constraints.extend(arg2_validity_constraints);
+        constraints.extend(regular_pc_update_constraint);
 
         let num_transition_constraints = constraints.len();
 
