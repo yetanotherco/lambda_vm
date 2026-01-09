@@ -484,7 +484,6 @@ where
         let c4 = BoundaryConstraint::new_main(3, 0, v_sorted_0.clone().to_extension());
         let c5 = BoundaryConstraint::new_main(4, 0, m0.clone().to_extension());
 
-        // paramos
         // Auxiliary boundary constraints
         let unsorted_term = (-(a0 + v0 * alpha) + z).inv().unwrap();
         let sorted_term = (-(a_sorted_0 + v_sorted_0 * alpha) + z).inv().unwrap();
