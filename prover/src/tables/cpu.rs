@@ -186,6 +186,7 @@ impl CpuTableRow {
                 row.rs1 = FE::from(&base);
                 row.imm = i32_to_2_limbs(offset);
                 row.arg2 = i32_to_2_limbs(offset);
+                row.branch_cond = FE::one();
                 if dst != 0 {
                     row.write_register = FE::one();
                 }
@@ -253,25 +254,48 @@ impl CpuTableRow {
                 row.imm = u32_to_2_limbs(offset as u32);
                 row.arg2 = u32_to_2_limbs(log.src2_val);
                 row.res = u32_to_4_limbs(log.src1_val.wrapping_sub(log.src2_val));
+
                 match cond {
-                    Comparison::Equal => row.beq = FE::one(),
+                    Comparison::Equal => {
+                        row.beq = FE::one();
+                        if log.src1_val == log.src2_val {
+                            row.branch_cond = FE::one()
+                        }
+                    }
                     Comparison::NotEqual => {
                         row.beq = FE::one();
-                        row.mp_selector = FE::one()
+                        row.mp_selector = FE::one();
+                        if log.src1_val != log.src2_val {
+                            row.branch_cond = FE::one()
+                        }
                     }
                     Comparison::LessThan => {
                         row.blt = FE::one();
                         row.signed = FE::one();
+                        if log.src1_val < log.src2_val {
+                            row.branch_cond = FE::one()
+                        }
                     }
-                    Comparison::LessThanUnsigned => row.blt = FE::one(),
+                    Comparison::LessThanUnsigned => {
+                        row.blt = FE::one();
+                        if log.src1_val < log.src2_val {
+                            row.branch_cond = FE::one()
+                        }
+                    }
                     Comparison::GreaterOrEqual => {
                         row.blt = FE::one();
                         row.signed = FE::one();
-                        row.mp_selector = FE::one()
+                        row.mp_selector = FE::one();
+                        if log.src1_val >= log.src2_val {
+                            row.branch_cond = FE::one()
+                        }
                     }
                     Comparison::GreaterOrEqualUnsigned => {
                         row.blt = FE::one();
-                        row.mp_selector = FE::one()
+                        row.mp_selector = FE::one();
+                        if log.src1_val >= log.src2_val {
+                            row.branch_cond = FE::one()
+                        }
                     }
                 }
             }
@@ -300,6 +324,13 @@ impl CpuTableRow {
             }
 
             _ => {}
+        }
+        // Cast RV1 into 2 limbs
+        let rv1_0 = row.rv1[0] + FE::from(256) * row.rv1[1];
+        let rv1_1 = row.rv1[2] + FE::from(256) * row.rv1[3];
+        // row.rv1 == row.arg2
+        if rv1_0 == row.arg2[0] && rv1_1 == row.arg2[1] {
+            row.is_equal = FE::one();
         }
         row
     }
