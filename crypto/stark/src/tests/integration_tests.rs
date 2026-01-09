@@ -8,7 +8,7 @@ use math::field::fields::fft_friendly::{
     babybear::Babybear31PrimeField, quartic_babybear::Degree4BabyBearExtensionField,
 };
 
-use crate::constraints::lookup::{LookUpPublicInputs, LookupPublicInputsPerInteraction};
+use crate::constraints::lookup::LookUpPublicInputs;
 use crate::examples::add_with_lookup::new_add_air_with_lookup;
 use crate::examples::cpu_with_lookup::new_cpu_air_with_lookup;
 use crate::examples::mul_with_lookup::new_mul_air_with_lookup;
@@ -627,66 +627,15 @@ fn test_multi_airs_log_up() {
 
     let proof_options = ProofOptions::default_test_options();
 
-    let cpu_public_inputs = LookUpPublicInputs {
-        columns: vec![
-            // Interaction with ADD table
-            LookupPublicInputsPerInteraction {
-                flags: vec![cpu_trace.get_main(0, 0).clone()],
-                values: vec![
-                    cpu_trace.get_main(0, 2).clone(),
-                    cpu_trace.get_main(0, 3).clone(),
-                    cpu_trace.get_main(0, 4).clone(),
-                ],
-            },
-            // Interaction with MUL table
-            LookupPublicInputsPerInteraction {
-                flags: vec![cpu_trace.get_main(0, 1).clone()],
-                values: vec![
-                    cpu_trace.get_main(0, 2).clone(),
-                    cpu_trace.get_main(0, 3).clone(),
-                    cpu_trace.get_main(0, 4).clone(),
-                ],
-            },
-        ],
-    };
-
-    let add_public_inputs = LookUpPublicInputs {
-        columns: vec![
-            // Interaction with CPU table
-            LookupPublicInputsPerInteraction {
-                flags: vec![add_trace.get_main(0, 3).clone()],
-                values: vec![
-                    add_trace.get_main(0, 0).clone(),
-                    add_trace.get_main(0, 1).clone(),
-                    add_trace.get_main(0, 2).clone(),
-                ],
-            },
-        ],
-    };
-
-    let mul_public_inputs = LookUpPublicInputs {
-        columns: vec![
-            // Interaction with CPU table
-            LookupPublicInputsPerInteraction {
-                flags: vec![mul_trace.get_main(0, 3).clone()],
-                values: vec![
-                    mul_trace.get_main(0, 0).clone(),
-                    mul_trace.get_main(0, 1).clone(),
-                    mul_trace.get_main(0, 2).clone(),
-                ],
-            },
-        ],
-    };
-
-    let cpu_air = new_cpu_air_with_lookup(cpu_trace.num_rows(), cpu_public_inputs, &proof_options);
-    let add_air = new_add_air_with_lookup(add_trace.num_rows(), add_public_inputs, &proof_options);
-    let mul_air = new_mul_air_with_lookup(mul_trace.num_rows(), mul_public_inputs, &proof_options);
+    let cpu_air = new_cpu_air_with_lookup(&cpu_trace, &proof_options);
+    let add_air = new_add_air_with_lookup(&add_trace, &proof_options);
+    let mul_air = new_mul_air_with_lookup(&mul_trace, &proof_options);
 
     let airs: Vec<(
         &dyn AIR<
             Field = Babybear31PrimeField,
             FieldExtension = Degree4BabyBearExtensionField,
-            PublicInputs = LookUpPublicInputs<Babybear31PrimeField>,
+            PublicInputs = LookUpPublicInputs<Babybear31PrimeField, Degree4BabyBearExtensionField>,
         >,
         &mut TraceTable<Babybear31PrimeField, Degree4BabyBearExtensionField>,
     )> = vec![
@@ -726,7 +675,7 @@ fn test_multi_airs_log_up() {
         &dyn AIR<
             Field = Babybear31PrimeField,
             FieldExtension = Degree4BabyBearExtensionField,
-            PublicInputs = LookUpPublicInputs<Babybear31PrimeField>,
+            PublicInputs = LookUpPublicInputs<Babybear31PrimeField, Degree4BabyBearExtensionField>,
         >,
         &_,
     )> = vec![

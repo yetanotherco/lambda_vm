@@ -1,13 +1,13 @@
 use crate::{
     constraints::{
         lookup::{
-            AirWithLookup, AuxiliaryTraceBuildData, LookUpPublicInputs,
-            NullBoundaryConstraintBuilder, TableInteraction,
+            AirWithLookup, AuxiliaryTraceBuildData, NullBoundaryConstraintBuilder, TableInteraction,
         },
         transition::TransitionConstraint,
     },
     context::AirContext,
     proof::options::ProofOptions,
+    trace::TraceTable,
 };
 use math::field::fields::fft_friendly::{
     babybear::Babybear31PrimeField, quartic_babybear::Degree4BabyBearExtensionField,
@@ -16,8 +16,7 @@ type F = Babybear31PrimeField;
 type E = Degree4BabyBearExtensionField;
 
 pub fn new_add_air_with_lookup(
-    trace_length: usize,
-    pub_inputs: LookUpPublicInputs<F>,
+    trace: &TraceTable<F, E>,
     proof_options: &ProofOptions,
 ) -> AirWithLookup<F, E, NullBoundaryConstraintBuilder> {
     // TODO: define add-specific constraints here
@@ -46,10 +45,9 @@ pub fn new_add_air_with_lookup(
     };
 
     AirWithLookup::create(
+        trace,
         auxiliary_trace_build_data,
-        pub_inputs,
         context,
-        trace_length,
         step_size,
         trace_layout,
         transition_constraints,

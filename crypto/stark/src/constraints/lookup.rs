@@ -25,7 +25,7 @@ pub struct AirWithLookup<
 > {
     context: AirContext,
     trace_length: usize,
-    pub_inputs: LookUpPublicInputs<F>,
+    pub_inputs: LookUpPublicInputs<F, E>,
     step_size: usize,
     trace_layout: (usize, usize),
     transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
@@ -41,10 +41,9 @@ impl<
 {
     /// Creates a new AirWithLookup adding LookUp-specific transition constraints to existing constraints
     pub fn create(
+        trace: &TraceTable<F, E>,
         auxiliary_trace_build_data: AuxiliaryTraceBuildData,
-        pub_inputs: LookUpPublicInputs<F>,
         mut context: AirContext,
-        trace_length: usize,
         step_size: usize,
         trace_layout: (usize, usize),
         mut transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
@@ -66,9 +65,11 @@ impl<
         transition_constraints.push(Box::new(grand_sum_constraint));
         // Update context
         context.num_transition_constraints = transition_constraints.len();
+        // Create public inputs
+        let pub_inputs = LookUpPublicInputs::from_trace(trace, &auxiliary_trace_build_data);
         Self {
             context,
-            trace_length,
+            trace_length: trace.num_rows(),
             pub_inputs,
             step_size,
             trace_layout,
@@ -89,7 +90,7 @@ where
 
     type FieldExtension = E;
 
-    type PublicInputs = LookUpPublicInputs<F>;
+    type PublicInputs = LookUpPublicInputs<F, E>;
 
     fn step_size(&self) -> usize {
         self.step_size
@@ -164,14 +165,19 @@ where
     }
     fn boundary_constraints(&self, rap_challenges: &[FieldElement<E>]) -> BoundaryConstraints<E> {
         let mut boundary_constraints = vec![];
-        for (pub_inputs, aux_column_build_data) in self
+        for (i, (pub_inputs, aux_column_build_data)) in self
             .pub_inputs
-            .columns
+            .interactions
             .iter()
             .zip(&self.auxiliary_trace_build_data.interactions)
+            .enumerate()
         {
-            boundary_constraints
-                .extend(build_boundary_constraint(pub_inputs, aux_column_build_data));
+            boundary_constraints.extend(build_boundary_constraint(
+                pub_inputs,
+                rap_challenges,
+                aux_column_build_data,
+                i,
+            ));
         }
         boundary_constraints.extend(B::boundary_constraints(&self.pub_inputs, rap_challenges));
         BoundaryConstraints::from_constraints(boundary_constraints)
@@ -192,20 +198,64 @@ pub struct TableInteraction {
 }
 
 /// Public inputs related to each lookup aux column
-pub struct LookUpPublicInputs<F>
+pub struct LookUpPublicInputs<F, E>
 where
-    F: IsFFTField + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
+    E: IsField,
 {
-    pub columns: Vec<LookupPublicInputsPerInteraction<F>>,
+    pub interactions: Vec<LookupPublicInputsPerInteraction<F, E>>,
 }
 
-// TODO: check this
-pub struct LookupPublicInputsPerInteraction<F>
+// TODO: We may need to make this generic over PublicInput for airs that use other public inputs
+pub struct LookupPublicInputsPerInteraction<F, E>
 where
-    F: IsFFTField + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
+    E: IsField,
 {
-    pub flags: Vec<FieldElement<F>>,
-    pub values: Vec<FieldElement<F>>,
+    // First value of the flag columns
+    pub initial_flags: Vec<FieldElement<F>>,
+    // First value of the value columns
+    pub initial_values: Vec<FieldElement<F>>,
+    // Last value on the grand sum aux column
+    pub grand_sum_total: FieldElement<E>,
+}
+
+impl<F, E> LookUpPublicInputs<F, E>
+where
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
+    E: IsField,
+{
+    // Obtain the LookUpPublicInputs from the trace
+    pub fn from_trace(
+        trace: &TraceTable<F, E>,
+        aux_trace_build_data: &AuxiliaryTraceBuildData,
+    ) -> Self {
+        let mut lookup_interactions = vec![];
+        for interaction in aux_trace_build_data.interactions.iter() {
+            // Obtain starting values for flag columns
+            let initial_flags = interaction
+                .flag_columns
+                .iter()
+                .map(|col| trace.get_main(0, *col).clone())
+                .collect();
+            let initial_values = interaction
+                .value_columns
+                .iter()
+                .map(|col| trace.get_main(0, *col).clone())
+                .collect();
+            let grand_sum_total = trace
+                .get_aux(trace.num_rows() - 1, trace.num_aux_columns - 1)
+                .clone();
+            lookup_interactions.push(LookupPublicInputsPerInteraction {
+                initial_flags,
+                initial_values,
+                grand_sum_total,
+            })
+        }
+        Self {
+            interactions: lookup_interactions,
+        }
+    }
 }
 
 pub trait BoundaryConstraintBuilder<
@@ -214,7 +264,7 @@ pub trait BoundaryConstraintBuilder<
 >: Send + Sync
 {
     fn boundary_constraints(
-        _pub_inputs: &LookUpPublicInputs<F>,
+        _pub_inputs: &LookUpPublicInputs<F, E>,
         _rap_challenges: &[FieldElement<E>],
     ) -> Vec<BoundaryConstraint<E>> {
         vec![]
@@ -303,28 +353,58 @@ fn build_auxiliary_trace_column<F, E>(
 }
 
 fn build_boundary_constraint<F, E>(
-    pub_inputs: &LookupPublicInputsPerInteraction<F>,
+    pub_inputs: &LookupPublicInputsPerInteraction<F, E>,
+    rap_challenges: &[FieldElement<E>],
     table_interaction: &TableInteraction,
+    interaction_number: usize,
 ) -> Vec<BoundaryConstraint<E>>
 where
     F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
     E: IsField + Send + Sync,
 {
     // Add constraints for starting value of each flag & value column
-    table_interaction
+    let mut constraints: Vec<BoundaryConstraint<E>> = table_interaction
         .flag_columns
         .iter()
-        .zip(pub_inputs.flags.iter())
+        .zip(pub_inputs.initial_flags.iter())
         .chain(
             table_interaction
                 .value_columns
                 .iter()
-                .zip(pub_inputs.values.iter()),
+                .zip(pub_inputs.initial_values.iter()),
         )
         .map(|(column, starting_value)| {
             BoundaryConstraint::new_main(*column, 0, starting_value.clone().to_extension())
         })
-        .collect()
+        .collect();
+    // Add constraint for first fingerprint
+    // Challenges
+    let z = &rap_challenges[0];
+    let alpha = &rap_challenges[1];
+    // Coefficients for each value column
+    let coeffs: Vec<FieldElement<E>> = (0..pub_inputs.initial_values.len())
+        .map(|i| alpha.pow(i))
+        .collect();
+    // fingerprint = z - (v[0] * alpha^0 + v[1] * alpha^1 +...+ value[n] * alpha^n)
+    // Where v are the values for each row and n the number of value columns
+    let fingerprint_inv: FieldElement<E> = (-(pub_inputs
+        .initial_values
+        .iter()
+        .zip(coeffs.iter())
+        .map(|(v, coeff)| v.clone() * coeff.clone())
+        .sum::<FieldElement<E>>())
+        + z)
+        .inv()
+        .unwrap();
+
+    // Sum of all flags
+    let flag: FieldElement<F> = pub_inputs.initial_flags.iter().cloned().sum();
+    constraints.push(BoundaryConstraint::new_aux(
+        interaction_number,
+        0,
+        flag * fingerprint_inv,
+    ));
+    constraints
 }
 
 // Constraint for each auxiliary column representing a table interaction
