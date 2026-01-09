@@ -104,7 +104,7 @@ impl AIR for CPUTableAIR {
             constraint_index,   // constraint_idx_start,
         );
 
-        let (arg2_validity_constraints, _) = new_arg2_validity_constraint(
+        let (arg2_validity_constraints, constraint_index) = new_arg2_validity_constraint(
             CpuTableRow::ARG2_0,
             CpuTableRow::RV2_0,
             CpuTableRow::IMM_0,
@@ -118,11 +118,11 @@ impl AIR for CPUTableAIR {
         );
 
         // Enforces NEXT_PC = PC + 4 for non-jump instructions
-        let regular_pc_update_constraint = new_add_four_constraint(
-            BRANCH_COND, // flag_idx,
-            PC,          // rhs_start_idx,
-            NEXT_PC,     // res_start_idx,
-            next_index,  // constraint_idx_start,
+        let (regular_pc_update_constraint, _) = new_add_four_constraint(
+            CpuTableRow::BRANCH_COND, // flag_idx,
+            CpuTableRow::PC_0,        // rhs_start_idx,
+            CpuTableRow::NEXT_PC_0,   // res_start_idx,
+            constraint_index,         // constraint_idx_start,
         );
 
         let mut constraints = bit_constraints;

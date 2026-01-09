@@ -749,7 +749,7 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
 /// ## Returns
 /// A vector of two boxed constraints: [carry_0_constraint, carry_1_constraint]
 pub fn new_add_four_constraint(
-    flags_idx: usize,
+    flag_idx: usize,
     lhs_start_idx: usize,
     res_start_idx: usize,
     constraint_index: usize,
