@@ -302,7 +302,7 @@ fn build_auxiliary_trace_column<F, E>(
     }
 }
 
-fn build_boundary_constraint<'a, F, E>(
+fn build_boundary_constraint<F, E>(
     pub_inputs: &LookupPublicInputsPerInteraction<F>,
     table_interaction: &TableInteraction,
 ) -> Vec<BoundaryConstraint<E>>
