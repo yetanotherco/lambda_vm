@@ -34,7 +34,10 @@ iai-callgrind = "0.3.1"
 proptest = "1.1.0"
 pprof = { version = "0.13.0", features = ["criterion", "flamegraph"] }
 p3-baby-bear = { git = "https://github.com/Plonky3/Plonky3" }
+p3-goldilocks = { git = "https://github.com/Plonky3/Plonky3" }
 p3-field = { git = "https://github.com/Plonky3/Plonky3" }
+p3-dft = { git = "https://github.com/Plonky3/Plonky3" }
+p3-matrix = { git = "https://github.com/Plonky3/Plonky3" }
 rand = { version = "0.8.5", features = ["std"] }
 
 [features]
@@ -53,3 +56,11 @@ cuda = ["dep:cudarc", "dep:lambdaworks-gpu"]
 
 [target.wasm32-unknown-unknown.dependencies]
 getrandom = { version = "0.2.15", features = ["js"] }
+
+[[bench]]
+name = "field_ops_benchmark"
+harness = false
+
+[[bench]]
+name = "fft_benchmark"
+harness = false
