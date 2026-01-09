@@ -113,21 +113,27 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
 /// A vector of boxed `BitConstraint` trait objects, one for each specified column.
 pub fn new_bit_constraints(
     column_idx: &[usize],
-    constraint_idx_start: usize,
-) -> Vec<Box<dyn TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>>> {
-    column_idx
-        .iter()
-        .enumerate()
-        .map(|(i, &column_idx)| {
-            Box::new(BitConstraint::new(column_idx, constraint_idx_start + i))
-                as Box<
-                    dyn TransitionConstraint<
-                        Babybear31PrimeField,
-                        Degree4BabyBearU32ExtensionField,
-                    >,
-                >
-        })
-        .collect()
+    constraint_index: usize,
+) -> (
+    Vec<Box<dyn TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>>>,
+    usize,
+) {
+    (
+        column_idx
+            .iter()
+            .enumerate()
+            .map(|(i, &column_idx)| {
+                Box::new(BitConstraint::new(column_idx, constraint_index + i))
+                    as Box<
+                        dyn TransitionConstraint<
+                                Babybear31PrimeField,
+                                Degree4BabyBearU32ExtensionField,
+                            >,
+                    >
+            })
+            .collect(),
+        constraint_index + column_idx.len(),
+    )
 }
 
 /// Identifies which carry bit (from a two-word addition) to constrain.
@@ -326,26 +332,32 @@ pub fn new_add_constraint(
     lhs_start_idx: usize,
     rhs_start_idx: usize,
     res_start_idx: usize,
-    constraint_idx_start: usize,
-) -> Vec<Box<dyn TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>>> {
-    vec![
-        Box::new(CarryBitConstraint::new(
-            CarryIndex::Zero,
-            flags_idx.clone(),
-            lhs_start_idx,
-            rhs_start_idx,
-            res_start_idx,
-            constraint_idx_start,
-        )),
-        Box::new(CarryBitConstraint::new(
-            CarryIndex::One,
-            flags_idx,
-            lhs_start_idx,
-            rhs_start_idx,
-            res_start_idx,
-            constraint_idx_start + 1,
-        )),
-    ]
+    constraint_index: usize,
+) -> (
+    Vec<Box<dyn TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>>>,
+    usize,
+) {
+    (
+        vec![
+            Box::new(CarryBitConstraint::new(
+                CarryIndex::Zero,
+                flags_idx.clone(),
+                lhs_start_idx,
+                rhs_start_idx,
+                res_start_idx,
+                constraint_index,
+            )),
+            Box::new(CarryBitConstraint::new(
+                CarryIndex::One,
+                flags_idx,
+                lhs_start_idx,
+                rhs_start_idx,
+                res_start_idx,
+                constraint_index + 1,
+            )),
+        ],
+        constraint_index + 2,
+    )
 }
 
 /// Creates a pair of carry bit constraints for a complete 32-bit substraction operation.
@@ -374,26 +386,32 @@ pub fn new_sub_constraint(
     lhs_start_idx: usize,
     rhs_start_idx: usize,
     res_start_idx: usize,
-    constraint_idx_start: usize,
-) -> Vec<Box<dyn TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>>> {
-    vec![
-        Box::new(CarryBitConstraint::new(
-            CarryIndex::Zero,
-            flags_idx.clone(),
-            res_start_idx,
-            rhs_start_idx,
-            lhs_start_idx,
-            constraint_idx_start,
-        )),
-        Box::new(CarryBitConstraint::new(
-            CarryIndex::One,
-            flags_idx,
-            res_start_idx,
-            rhs_start_idx,
-            lhs_start_idx,
-            constraint_idx_start + 1,
-        )),
-    ]
+    constraint_index: usize,
+) -> (
+    Vec<Box<dyn TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>>>,
+    usize,
+) {
+    (
+        vec![
+            Box::new(CarryBitConstraint::new(
+                CarryIndex::Zero,
+                flags_idx.clone(),
+                res_start_idx,
+                rhs_start_idx,
+                lhs_start_idx,
+                constraint_index,
+            )),
+            Box::new(CarryBitConstraint::new(
+                CarryIndex::One,
+                flags_idx,
+                res_start_idx,
+                rhs_start_idx,
+                lhs_start_idx,
+                constraint_index + 1,
+            )),
+        ],
+        constraint_index + 2,
+    )
 }
 
 #[derive(Clone)]
@@ -532,30 +550,36 @@ pub fn new_arg2_validity_constraint(
     rv2_start_index: usize,
     imm_start_index: usize,
     column_indexes: Arg2ValidityColumnIndexes,
-    constraint_idx: usize,
-) -> Vec<Box<dyn TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>>> {
-    vec![
-        Box::new(Arg2ValidityConstraint::new(
-            arg2_start_index,
-            rv2_start_index,
-            imm_start_index,
-            column_indexes.clone(),
-            constraint_idx,
-        ))
-            as Box<
-                dyn TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>,
-            >,
-        Box::new(Arg2ValidityConstraint::new(
-            arg2_start_index + 1,
-            rv2_start_index + 2,
-            imm_start_index + 1,
-            column_indexes,
-            constraint_idx + 1,
-        ))
-            as Box<
-                dyn TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>,
-            >,
-    ]
+    constraint_index: usize,
+) -> (
+    Vec<Box<dyn TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>>>,
+    usize,
+) {
+    (
+        vec![
+            Box::new(Arg2ValidityConstraint::new(
+                arg2_start_index,
+                rv2_start_index,
+                imm_start_index,
+                column_indexes.clone(),
+                constraint_index,
+            ))
+                as Box<
+                    dyn TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>,
+                >,
+            Box::new(Arg2ValidityConstraint::new(
+                arg2_start_index + 1,
+                rv2_start_index + 2,
+                imm_start_index + 1,
+                column_indexes,
+                constraint_index + 1,
+            ))
+                as Box<
+                    dyn TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>,
+                >,
+        ],
+        constraint_index + 2,
+    )
 }
 
 /// Enforces correct carry bit values for adding 4 to a 32-bit table value.
@@ -728,22 +752,28 @@ pub fn new_add_four_constraint(
     flag_idx: usize,
     lhs_start_idx: usize,
     res_start_idx: usize,
-    constraint_idx_start: usize,
-) -> Vec<Box<dyn TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>>> {
-    vec![
-        Box::new(AddFourCarryBitConstraint::new(
-            CarryIndex::Zero,
-            flag_idx,
-            lhs_start_idx,
-            res_start_idx,
-            constraint_idx_start,
-        )),
-        Box::new(AddFourCarryBitConstraint::new(
-            CarryIndex::One,
-            flag_idx,
-            lhs_start_idx,
-            res_start_idx,
-            constraint_idx_start + 1,
-        )),
-    ]
+    constraint_index: usize,
+) -> (
+    Vec<Box<dyn TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>>>,
+    usize,
+) {
+    (
+        vec![
+            Box::new(AddFourCarryBitConstraint::new(
+                CarryIndex::Zero,
+                flag_idx,
+                lhs_start_idx,
+                res_start_idx,
+                constraint_index,
+            )),
+            Box::new(AddFourCarryBitConstraint::new(
+                CarryIndex::One,
+                flag_idx,
+                lhs_start_idx,
+                res_start_idx,
+                constraint_index + 1,
+            )),
+        ],
+        constraint_index + 2,
+    )
 }

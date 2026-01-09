@@ -7,5 +7,4 @@ edition = "2024"
 
 [dependencies]
 ethereum-types = { version = "0.15.1", default-features = false}
-embedded-alloc = "0.6"
-riscv = { version = "0.15", features = ["critical-section-single-hart"] }
+lambda-vm-syscalls = { path = "../../../../syscalls" }
