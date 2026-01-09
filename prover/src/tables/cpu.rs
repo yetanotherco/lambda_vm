@@ -58,6 +58,61 @@ pub struct CpuTableRow {
 }
 
 impl CpuTableRow {
+    pub const NUM_COLUMNS: usize = 52;
+
+    pub const TIMESTAMP_0: usize = 0;
+    pub const TIMESTAMP_1: usize = 1;
+    pub const PC_0: usize = 2;
+    pub const PC_1: usize = 3;
+    pub const RS1: usize = 4;
+    pub const RS2: usize = 5;
+    pub const RD: usize = 6;
+    pub const WRITE_REGISTER: usize = 7;
+    pub const MEMORY_2BYTES: usize = 8;
+    pub const MEMORY_4BYTES: usize = 9;
+    pub const IMM_0: usize = 10;
+    pub const IMM_1: usize = 11;
+    pub const SIGNED: usize = 12;
+    pub const MP_SELECTOR: usize = 13;
+    pub const MULDIV_SELECTOR: usize = 14;
+    pub const ADD: usize = 15;
+    pub const SUB: usize = 16;
+    pub const SLT: usize = 17;
+    pub const AND: usize = 18;
+    pub const OR: usize = 19;
+    pub const XOR: usize = 20;
+    pub const SL: usize = 21;
+    pub const SR: usize = 22;
+    pub const JALR: usize = 23;
+    pub const BEQ: usize = 24;
+    pub const BLT: usize = 25;
+    pub const LOAD: usize = 26;
+    pub const STORE: usize = 27;
+    pub const MUL: usize = 28;
+    pub const DIVREM: usize = 29;
+    pub const ECALL: usize = 30;
+    pub const EBREAK: usize = 31;
+    pub const NEXT_PC_0: usize = 32;
+    pub const NEXT_PC_1: usize = 33;
+    pub const RV1_0: usize = 34;
+    pub const RV1_1: usize = 35;
+    pub const RV1_2: usize = 36;
+    pub const RV1_3: usize = 37;
+    pub const RV2_0: usize = 38;
+    pub const RV2_1: usize = 39;
+    pub const RV2_2: usize = 40;
+    pub const RV2_3: usize = 41;
+    pub const RVD_0: usize = 42;
+    pub const RVD_1: usize = 43;
+    pub const ARG2_0: usize = 44;
+    pub const ARG2_1: usize = 45;
+    pub const RES_0: usize = 46;
+    pub const RES_1: usize = 47;
+    pub const RES_2: usize = 48;
+    pub const RES_3: usize = 49;
+    pub const IS_EQUAL: usize = 50;
+    pub const BRANCH_COND: usize = 51;
+
     pub fn from_log(log: Log, timestamp: u32) -> Self {
         let mut row = Self {
             timestamp: u32_to_2_limbs(timestamp),
