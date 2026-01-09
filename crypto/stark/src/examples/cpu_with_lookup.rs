@@ -5,7 +5,6 @@ use crate::{
         },
         transition::TransitionConstraint,
     },
-    context::AirContext,
     proof::options::ProofOptions,
     trace::TraceTable,
 };
@@ -21,13 +20,6 @@ pub fn new_cpu_air_with_lookup(
 ) -> AirWithLookup<F, E, NullBoundaryConstraintBuilder> {
     // TODO: define cpu-specific constraints here
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
-
-    let context = AirContext {
-        proof_options: proof_options.clone(),
-        trace_columns: 8,
-        transition_offsets: vec![0, 1],
-        num_transition_constraints: transition_constraints.len(),
-    };
 
     let step_size = 1;
     let trace_layout = (5, 3);
@@ -53,7 +45,7 @@ pub fn new_cpu_air_with_lookup(
     AirWithLookup::create(
         trace,
         auxiliary_trace_build_data,
-        context,
+        proof_options,
         step_size,
         trace_layout,
         transition_constraints,

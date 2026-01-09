@@ -12,6 +12,7 @@ use crate::{
         transition::TransitionConstraint,
     },
     context::AirContext,
+    proof::options::ProofOptions,
     table::TableView,
     trace::TraceTable,
     traits::TransitionEvaluationContext,
@@ -43,7 +44,7 @@ impl<
     pub fn create(
         trace: &TraceTable<F, E>,
         auxiliary_trace_build_data: AuxiliaryTraceBuildData,
-        mut context: AirContext,
+        proof_options: &ProofOptions,
         step_size: usize,
         trace_layout: (usize, usize),
         mut transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
@@ -63,8 +64,17 @@ impl<
             auxiliary_trace_build_data.interactions.len(),
         );
         transition_constraints.push(Box::new(grand_sum_constraint));
-        // Update context
-        context.num_transition_constraints = transition_constraints.len();
+        // Create context
+        let context = AirContext {
+            proof_options: proof_options.clone(),
+            // trace_columns = main columns + one aux column per lookup interaction + 1 aux column for grand sum
+            trace_columns: trace.num_main_columns
+                + auxiliary_trace_build_data.interactions.len()
+                + 1,
+            // All lookup transition constraints will evaluate at most 2 rows at a time
+            transition_offsets: vec![0, 1],
+            num_transition_constraints: transition_constraints.len(),
+        };
         // Create public inputs
         let pub_inputs = LookUpPublicInputs::from_trace(trace, &auxiliary_trace_build_data);
         Self {
