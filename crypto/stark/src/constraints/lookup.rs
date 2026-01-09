@@ -159,7 +159,6 @@ where
 
     fn build_auxiliary_trace(&self, trace: &mut TraceTable<F, E>, challenges: &[FieldElement<E>]) {
         // Build an auxiliary column for each table interaction
-        // (FIXME) Uses the same challenges for all auxiliary columns (We should use the same challenges for auxiliary columns used for lookups between table pairs, the first solution was to use the same rap challenges for all auxilary columns across tables, we need to checkk if this is safe)
         for (aux_column_idx, aux_column_build_data) in self
             .auxiliary_trace_build_data
             .interactions
@@ -178,15 +177,14 @@ where
         }
     }
 
-    // TODO: remove from trait and sample them in prove
     fn build_rap_challenges(
         &self,
         _transcript: &mut dyn IsStarkTranscript<E, F>,
     ) -> Vec<FieldElement<E>> {
-        // TODO: rap challenges should be built beforehand for each interaction pair, not built here
+        // TODO: rap challenges should be built beforehand, not here
         // Toy values used for intial testing
         vec![FieldElement::one(), FieldElement::one()]
-        // unreachable!("AirWithLookUp should not create their own rap challenges")
+        // unreachable!("AirWithLookUp should not create its own rap challenges")
     }
     fn boundary_constraints(&self, rap_challenges: &[FieldElement<E>]) -> BoundaryConstraints<E> {
         let mut boundary_constraints = vec![];
@@ -197,7 +195,7 @@ where
             .zip(&self.auxiliary_trace_build_data.interactions)
             .enumerate()
         {
-            boundary_constraints.extend(build_boundary_constraint(
+            boundary_constraints.extend(build_boundary_constraints(
                 pub_inputs,
                 rap_challenges,
                 aux_column_build_data,
@@ -212,30 +210,33 @@ where
     }
 }
 
-/// Struct representing how each lookup air should build its auxiliary column
-/// The auxiliary column is built from data used by each table interaction
+/// Struct representing how each lookup air should build its auxiliary trace
+/// Contains a list of all lookup interactions
 pub struct AuxiliaryTraceBuildData {
     pub interactions: Vec<TableInteraction>,
 }
 
-/// Struct representing how to build a given auxiliary column
+/// Struct representing a lookup interaction for a given table
+/// Contains the flag and value columns involved in said interaction
 #[derive(Clone)]
 pub struct TableInteraction {
     pub flag_columns: Vec<usize>,
     pub value_columns: Vec<usize>,
 }
 
-/// Public inputs related to each lookup aux column
+/// Public inputs for an AirWithLookup
+/// Contains the initial values for each column involved in a look up interaction for each interaction
+/// Also contains an inner public input of generic type `PI` which shall be used by the `BoundaryConstraintBuilder`
 pub struct LookUpPublicInputs<F, PI>
 where
     F: IsField + Send + Sync,
 {
-    pub interactions: Vec<LookupPublicInputsPerInteraction<F>>,
+    interactions: Vec<LookupPublicInputsPerInteraction<F>>,
     // PublicInputs used by other AIR boundary constraints defined in `BoundaryConstraintBuilder` trait
     pub inner: PI,
 }
 
-// TODO: We may need to make this generic over PublicInput for airs that use other public inputs
+/// Initial values for each flag and value involved in a look up interaction
 pub struct LookupPublicInputsPerInteraction<F>
 where
     F: IsField + Send + Sync,
@@ -286,6 +287,8 @@ where
     }
 }
 
+/// Trait representing boundary constraint building behaviour.
+///  Should be defined when creating an `AirWithLookup` if the AIR requires its own boundary constraints aside from the lookup ones
 pub trait BoundaryConstraintBuilder<
     F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
     E: IsField + Send + Sync,
@@ -300,6 +303,7 @@ pub trait BoundaryConstraintBuilder<
     }
 }
 
+/// NoOp implementor of `BoundaryConstraintBuilder` for `AirWithLookup`s than don't use other boundary constraints
 pub struct NullBoundaryConstraintBuilder {}
 impl<F, E, PI> BoundaryConstraintBuilder<F, E, PI> for NullBoundaryConstraintBuilder
 where
@@ -308,7 +312,7 @@ where
 {
 }
 
-/// Helper method to build a single auxiliary trace column for lookups
+/// Builds an auxiliary trace column from the given table interaction
 fn build_auxiliary_trace_column<F, E>(
     aux_column_idx: usize,
     table_interaction: &TableInteraction,
@@ -381,7 +385,8 @@ fn build_auxiliary_trace_column<F, E>(
     }
 }
 
-fn build_boundary_constraint<F, E>(
+/// Builds the boundary constraints for a given table interaction
+fn build_boundary_constraints<F, E>(
     pub_inputs: &LookupPublicInputsPerInteraction<F>,
     rap_challenges: &[FieldElement<E>],
     table_interaction: &TableInteraction,
@@ -437,6 +442,7 @@ where
 }
 
 // Constraint for each auxiliary column representing a table interaction
+// Checks the calculation of the next auxiliary column value based on the next row's flags and values
 struct LookupTransitionConstraint {
     // Indicates columns with flags and values used to build the auxiliary column
     interaction: TableInteraction,
@@ -559,6 +565,7 @@ where
 }
 
 /// Constraint for the last auxiliary column
+/// Checks that the grand sum column is the sum of all previous auxiliary columns
 struct LookupGrandSumTransitionConstraint {
     // Index of the constraint
     constraint_idx: usize,
