@@ -98,6 +98,12 @@ def = {idx="i", polys = [
   {range=[4, 7], poly=["*", 0xFFFF, "n_sub_r_is_negative"]}
 ]}
 
+[[variables.virtual]]
+name = "μ_sum"
+type = "BaseField"
+desc = "sum of multiplicities"
+def = ["+", "μ_q", "μ_r"]
+
 
 # Multiplicities
 
@@ -145,14 +151,14 @@ tag = "IsZero"
 input = ["d"]
 output = "div_by_zero"
 ref = "dvrm:c:div_by_zero"
-cond = ["+", "μ_q", "μ_r"]
+cond = "μ_sum"
 
 [[constraints.defs]]
 kind = "template"
 tag = "IsEqual"
 input = [["=", "signed", 1], ["=", ["idx", "n", "0:3"], "[0, 0, 0]"], ["=", ["-", ["idx", "n", 3], ["*", 128, "n_is_negative"]], 0], ["=", "n_is_negative", 1]]
 output = "overflow"
-cond = ["+", "μ_q", "μ_r"]
+cond = "μ_sum"
 ref = "dvrm:c:overflow"
 
 [[constraints.defs]]
@@ -167,7 +173,7 @@ kind = "interaction"
 tag = "MSB16"
 input = [["idx", "n_sub_r", 3]]
 output = "n_sub_r_msb"
-multiplicity = ["+", "μ_q", "μ_r"]
+multiplicity = "μ_sum"
 ref = "dvrm:c:n_sub_r_msb"
 
 [[constraints.defs]]
@@ -232,7 +238,7 @@ kind = "interaction"
 tag = "MUL"
 input = ["d", "signed", "q", "signed_q", 0]
 output = ["idx", "extended_n_sub_r", "0:4"]
-multiplicity = ["+", "μ_q", "μ_r"]
+multiplicity = "μ_sum"
 ref = "dvrm:c:mul_lower"
 
 [[constraints.equality]]
@@ -240,7 +246,7 @@ kind = "interaction"
 tag = "MUL"
 input = ["d", "signed", "q", "signed_q", 1]
 output = ["idx", "extended_n_sub_r", "4:8"]
-multiplicity = ["+", "μ_q", "μ_r"]
+multiplicity = "μ_sum"
 ref = "dvrm:c:mul_upper"
 
 
