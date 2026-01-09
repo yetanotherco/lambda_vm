@@ -65,6 +65,23 @@ pub struct DecodeTableRow {
 }
 
 impl DecodeTableRow {
+    pub const NUM_COLUMNS: usize = 15;
+    pub const PC_0: usize = 0;
+    pub const PC_1: usize = 1;
+    pub const RS1: usize = 2;
+    pub const RS2: usize = 3;
+    pub const RD: usize = 4;
+    pub const WRITE_REGISTER: usize = 5;
+    pub const MEMORY_2BYTES: usize = 6;
+    pub const MEMORY_4BYTES: usize = 7;
+    pub const IMM_0: usize = 8;
+    pub const IMM_1: usize = 9;
+    pub const SIGNED: usize = 10;
+    pub const MP_SELECTOR: usize = 11;
+    pub const MULDIV_SELECTOR: usize = 12;
+    pub const INSTRUCTION: usize = 13;
+    pub const MULTIPLICITY: usize = 14;
+
     pub fn from_log(log: &Log) -> Self {
         let mut row = Self {
             pc: u32_to_2_limbs(log.current_pc),

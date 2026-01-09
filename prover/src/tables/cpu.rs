@@ -111,7 +111,7 @@ impl CpuTableRow {
     pub const IS_EQUAL: usize = 50;
     pub const BRANCH_COND: usize = 51;
 
-    pub fn from_log(log: Log, timestamp: u32) -> Self {
+    pub fn from_log(log: &Log, timestamp: u32) -> Self {
         let mut row = Self {
             timestamp: u32_to_2_limbs(timestamp),
             pc: u32_to_2_limbs(log.current_pc),

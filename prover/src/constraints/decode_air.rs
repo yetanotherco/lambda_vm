@@ -11,6 +11,8 @@ use stark::{
     traits::AIR,
 };
 
+use crate::tables::decode::DecodeTableRow;
+
 pub struct DecodeTableAIR {
     context: AirContext,
     constraints:
@@ -33,7 +35,7 @@ impl AIR for DecodeTableAIR {
 
         let context = AirContext {
             proof_options: proof_options.clone(),
-            trace_columns: 15,
+            trace_columns: DecodeTableRow::NUM_COLUMNS,
             transition_offsets: vec![0],
             num_transition_constraints,
         };
@@ -71,7 +73,7 @@ impl AIR for DecodeTableAIR {
     }
 
     fn trace_layout(&self) -> (usize, usize) {
-        (15, 0)
+        (DecodeTableRow::NUM_COLUMNS, 0)
     }
 
     fn pub_inputs(&self) -> &Self::PublicInputs {
