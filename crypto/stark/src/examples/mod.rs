@@ -9,6 +9,5 @@ pub mod mul_with_lookup;
 pub mod quadratic_air;
 pub mod read_only_memory;
 pub mod read_only_memory_logup;
-pub mod read_only_memory_logup_copy;
 pub mod simple_fibonacci;
 pub mod simple_periodic_cols;

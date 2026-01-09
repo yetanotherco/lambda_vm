@@ -1,4 +1,5 @@
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use math::field::{
     element::FieldElement, fields::fft_friendly::stark_252_prime_field::Stark252PrimeField,
 };
@@ -661,13 +662,26 @@ fn test_multi_airs_log_up() {
     )
     .unwrap();
 
-    // TODO: This should be done by the prover.
-    let cpu_look_up_value = cpu_trace.aux_table.get(7, 2);
-    let add_look_up_value = -add_trace.aux_table.get(3, 1);
-    let mul_look_up_value = -mul_trace.aux_table.get(3, 1);
+    // TODO: This check should be done by the prover.
 
-    let look_up_values: Vec<&FieldElement<Degree4BabyBearExtensionField>> =
-        vec![cpu_look_up_value, &add_look_up_value, &mul_look_up_value];
+    // Fetch the grand sum total for the given lookup table (aka the last value on the last aux colu)
+    fn grand_sum<F, E>(trace: &TraceTable<F, E>) -> &FieldElement<E>
+    where
+        F: IsSubFieldOf<E> + IsFFTField,
+        E: IsField,
+    {
+        trace
+            .aux_table
+            .get(trace.num_rows() - 1, trace.num_aux_columns - 1)
+    }
+
+    let cpu_look_up_value = grand_sum(&cpu_trace);
+    let add_look_up_value = grand_sum(&add_trace);
+    let mul_look_up_value = grand_sum(&mul_trace);
+
+    let sum = cpu_look_up_value - add_look_up_value - mul_look_up_value;
+
+    assert!(sum == FieldElement::<Degree4BabyBearExtensionField>::zero());
 
     let airs_and_proofs: Vec<(
         &dyn AIR<
@@ -682,8 +696,7 @@ fn test_multi_airs_log_up() {
         (&mul_air, &proofs[2]),
     ];
 
-    assert!(Verifier::look_up_verify(
-        &look_up_values,
+    assert!(Verifier::multi_verify(
         &airs_and_proofs,
         &mut DefaultTranscript::<Degree4BabyBearExtensionField>::new(&[]),
     ));
