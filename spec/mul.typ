@@ -28,5 +28,4 @@ The `MUL` chip is comprised of #nr_variables variables that are expressed using 
 = Constraints
 #render_constraint_table(chip, config, groups: "def")
 #render_constraint_table(chip, config, groups: "prod")
-*Note*: by the definition of `raw_product`, all components of the sum are of degree at most three.
 #render_constraint_table(chip, config, groups: "lookup")
