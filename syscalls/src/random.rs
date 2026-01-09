@@ -18,7 +18,7 @@ lazy_static! {
 /// This function should not be called by the user
 /// It is only for rust std internal uses
 #[unsafe(no_mangle)]
-pub extern "C" fn sys_rand(buf: *mut u8, len: usize) {
+pub unsafe extern "C" fn sys_rand(buf: *mut u8, len: usize) {
     print_string("sys_rand called\n");
     print_string("WARNING: Using sys_rand is insecure\n");
 
