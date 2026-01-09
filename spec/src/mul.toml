@@ -136,12 +136,6 @@ poly = ["*", ["not", "lhs_signed"], "lhs_is_negative"]
 ref = "mul:c:lhs_is_negative_if_unsigned"
 
 [[constraints.def]]
-kind = "arith"
-constraint = "$#`lhs_signed` => #`μ_sum`$"
-poly = ["*", "lhs_signed", ["not", "μ_sum"]]
-ref = "mul:c:lhs_signed_implies_mu"
-
-[[constraints.def]]
 kind = "interaction"
 tag = "MSB16"
 input = [["idx", "rhs", 3]]
@@ -154,12 +148,6 @@ kind = "arith"
 constraint = "$#`!rhs_signed` => #`rhs_is_negative` = 0$"
 poly = ["*", ["not", "rhs_signed"], "rhs_is_negative"]
 ref = "mul:c:rhs_is_negative_if_unsigned"
-
-[[constraints.def]]
-kind = "arith"
-constraint = "$#`rhs_signed` => #`μ_sum`$"
-poly = ["*", "rhs_signed", ["not", "μ_sum"]]
-ref = "mul:c:rhs_signed_implies_mu"
 
 [[constraints.def]]
 kind = "interaction"
