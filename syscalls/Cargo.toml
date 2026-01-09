@@ -7,3 +7,6 @@ edition = "2024"
 embedded-alloc = "0.6"
 riscv = { version = "0.15", features = ["critical-section-single-hart"] }
 thiserror = "1.0"
+getrandom = "0.3.4"
+lazy_static = "1.5.0"
+rand = "0.9.2"

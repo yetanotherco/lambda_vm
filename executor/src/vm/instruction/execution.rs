@@ -12,6 +12,7 @@ enum SyscallNumbers {
     Panic = 2,
     Commit = 3,
     GetPrivateInputs = 4,
+    Halt = 5,
 }
 
 impl TryFrom<u32> for SyscallNumbers {
@@ -22,6 +23,7 @@ impl TryFrom<u32> for SyscallNumbers {
             2 => Ok(SyscallNumbers::Panic),
             3 => Ok(SyscallNumbers::Commit),
             4 => Ok(SyscallNumbers::GetPrivateInputs),
+            5 => Ok(SyscallNumbers::Halt),
             _ => Err(()),
         }
     }
@@ -272,6 +274,17 @@ impl Instruction {
                         for (i, byte) in private_inputs.iter().enumerate() {
                             memory.store_byte(pointer + i as u32, *byte);
                         }
+                    }
+                    SyscallNumbers::Halt => {
+                        // halt
+                        return Ok(Log {
+                            instruction: self,
+                            current_pc: pc,
+                            next_pc: 0, // We halt by setting pc to 0
+                            src1_val: 0,
+                            src2_val: 0,
+                            dst_val: 0,
+                        });
                     }
                 }
                 Log {
