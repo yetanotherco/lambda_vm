@@ -53,7 +53,7 @@ impl<
             let constraint = LookupTransitionConstraint::new(
                 interaction.clone(),
                 i,
-                transition_constraints.len() + i,
+                transition_constraints.len(),
             );
             transition_constraints.push(Box::new(constraint));
         }
