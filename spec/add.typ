@@ -25,12 +25,12 @@
 The #add constraint template has the following interface:
 #block(radius: 5pt, width: 100%, inset: 1.5em, fill: luma(230), raw("cond => ADD<sum; lhs, rhs>"))
 where `cond` is any value described by an expression _of degree at most $1$_.
-Note that #highlighted_code("ADD<sum; lhs, rhs>") can be used to denote the _unconditional_ application of the #add template to `lhs`, `rhs`, and `sum`.
+#highlighted_code("ADD<sum; lhs, rhs>") can be used to denote the _unconditional_ application of the #add template to `lhs`, `rhs`, and `sum`.
 
 #let sub = raw("SUB")
 === #sub
 For ease of notation, we moreover introduce the #sub constraint template.
-It's interface
+Its interface
 #block(radius: 5pt, width: 100%, inset: 1.5em, fill: luma(230), raw("cond => SUB<diff; lhs, rhs>"))
 maps onto the #add template as 
 #block(radius: 5pt, width: 100%, inset: 1.5em, fill: luma(230), raw("cond => ADD<lhs; rhs, diff>"))
