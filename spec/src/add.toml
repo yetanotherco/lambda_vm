@@ -36,17 +36,17 @@ def = {idx="i", polys=[
 
 [[assumptions]]
 desc = "`IS_WORD[lhs[i]]`"
-range = ["i", 0, 3]
+range = ["i", 0, 1]
 ref = "add:a:lhs"
 
 [[assumptions]]
 desc = "`IS_WORD[rhs[i]]`"
-range = ["i", 0, 3]
+range = ["i", 0, 1]
 ref = "add:a:rhs"
 
 [[assumptions]]
 desc = "`IS_WORD[sum[i]]`"
-range = ["i", 0, 3]
+range = ["i", 0, 1]
 ref = "add:a:sum"
 
 # Constraints
@@ -58,7 +58,7 @@ name = "all"
 kind = "template"
 tag = "IS_BIT"
 input = [["idx", "carry", "i"]]
-range = ["i", 0, 3]
+range = ["i", 0, 1]
 cond = "cond"
 ref = "add:c:carry"
 
