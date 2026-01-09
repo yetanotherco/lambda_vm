@@ -763,6 +763,44 @@ pub trait IsStarkVerifier<
         true
     }
 
+    /// Verifies one or more STARK proofs with their corresponding AIRs.
+    ///
+    /// The function replays Round 1 for all proofs first (to match the prover's transcript state),
+    /// then verifies each proof sequentially.
+    ///
+    /// Warning: the transcript must be safely initialized before passing it to this method.
+    fn multi_lookup_verify(
+        airs_and_proofs: &[AirAndProof<'_, Field, FieldExtension, PI>],
+        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+    ) -> bool
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    {
+        // First, replay round 1 for all tables so the transcript state matches the prover,
+        // which commits to all traces before sampling any further randomness.
+        for (_, proof) in airs_and_proofs {
+            transcript.append_bytes(&proof.lde_trace_main_merkle_root);
+        }
+        // Sample rap challenges to be used by all airs
+        let rap_challenges = vec![
+            transcript.sample_field_element(),
+            transcript.sample_field_element(),
+        ];
+
+        for (_, proof) in airs_and_proofs {
+            transcript.append_bytes(&proof.lde_trace_main_merkle_root);
+        }
+
+        // Verify each proof
+        for (air, proof) in airs_and_proofs.iter() {
+            if !Self::verify_rounds_2_to_4(*air, proof, transcript, rap_challenges.clone()) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Verify a single STARK proof.
     /// This is equivalent to calling `multi_verify` with a single-element slice.
     fn verify(

@@ -1004,6 +1004,7 @@ pub trait IsStarkProver<
             transcript.sample_field_element(),
             transcript.sample_field_element(),
         ];
+
         for (((air, table), domain), (commitment, evaluations)) in airs
             .iter_mut()
             .zip(domains.iter())

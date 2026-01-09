@@ -181,10 +181,7 @@ where
         &self,
         _transcript: &mut dyn IsStarkTranscript<E, F>,
     ) -> Vec<FieldElement<E>> {
-        // TODO: rap challenges should be built beforehand, not here
-        // Toy values used for intial testing
-        vec![FieldElement::one(), FieldElement::one()]
-        // unreachable!("AirWithLookUp should not create its own rap challenges")
+        unreachable!("AirWithLookUp should not create its own rap challenges")
     }
     fn boundary_constraints(&self, rap_challenges: &[FieldElement<E>]) -> BoundaryConstraints<E> {
         let mut boundary_constraints = vec![];

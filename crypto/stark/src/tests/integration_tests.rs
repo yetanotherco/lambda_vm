@@ -644,7 +644,7 @@ fn test_multi_airs_log_up() {
         (&mul_air, &mut mul_trace),
     ];
 
-    let proofs = Prover::multi_prove(
+    let proofs = Prover::multi_lookup_prove(
         airs,
         &mut DefaultTranscript::<Degree4BabyBearExtensionField>::new(&[]),
     )
@@ -684,7 +684,7 @@ fn test_multi_airs_log_up() {
         (&mul_air, &proofs[2]),
     ];
 
-    assert!(Verifier::multi_verify(
+    assert!(Verifier::multi_lookup_verify(
         &airs_and_proofs,
         &mut DefaultTranscript::<Degree4BabyBearExtensionField>::new(&[]),
     ));
