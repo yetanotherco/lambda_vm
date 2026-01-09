@@ -26,7 +26,7 @@ pub struct AirWithLookup<
 > {
     context: AirContext,
     trace_length: usize,
-    pub_inputs: LookUpPublicInputs<F, E>,
+    pub_inputs: LookUpPublicInputs<F>,
     step_size: usize,
     trace_layout: (usize, usize),
     transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
@@ -107,7 +107,7 @@ where
 
     type FieldExtension = E;
 
-    type PublicInputs = LookUpPublicInputs<F, E>;
+    type PublicInputs = LookUpPublicInputs<F>;
 
     fn step_size(&self) -> usize {
         self.step_size
@@ -217,38 +217,37 @@ pub struct TableInteraction {
 }
 
 /// Public inputs related to each lookup aux column
-pub struct LookUpPublicInputs<F, E>
+pub struct LookUpPublicInputs<F>
 where
-    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
-    E: IsField,
+    F: IsField + Send + Sync,
 {
-    pub interactions: Vec<LookupPublicInputsPerInteraction<F, E>>,
+    pub interactions: Vec<LookupPublicInputsPerInteraction<F>>,
 }
 
 // TODO: We may need to make this generic over PublicInput for airs that use other public inputs
-pub struct LookupPublicInputsPerInteraction<F, E>
+pub struct LookupPublicInputsPerInteraction<F>
 where
-    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
-    E: IsField,
+    F: IsField + Send + Sync,
 {
     // First value of the flag columns
     pub initial_flags: Vec<FieldElement<F>>,
     // First value of the value columns
     pub initial_values: Vec<FieldElement<F>>,
-    // Last value on the grand sum aux column
-    pub grand_sum_total: FieldElement<E>,
 }
 
-impl<F, E> LookUpPublicInputs<F, E>
+impl<F> LookUpPublicInputs<F>
 where
-    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
-    E: IsField,
+    F: IsField + Send + Sync,
 {
     // Obtain the LookUpPublicInputs from the trace
-    pub fn from_trace(
+    pub fn from_trace<E>(
         trace: &TraceTable<F, E>,
         aux_trace_build_data: &AuxiliaryTraceBuildData,
-    ) -> Self {
+    ) -> Self
+    where
+        F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
+        E: IsField + Send + Sync,
+    {
         let mut lookup_interactions = vec![];
         for interaction in aux_trace_build_data.interactions.iter() {
             // Obtain starting values for flag columns
@@ -262,13 +261,9 @@ where
                 .iter()
                 .map(|col| trace.get_main(0, *col).clone())
                 .collect();
-            let grand_sum_total = trace
-                .get_aux(trace.num_rows() - 1, trace.num_aux_columns - 1)
-                .clone();
             lookup_interactions.push(LookupPublicInputsPerInteraction {
                 initial_flags,
                 initial_values,
-                grand_sum_total,
             })
         }
         Self {
@@ -283,7 +278,7 @@ pub trait BoundaryConstraintBuilder<
 >: Send + Sync
 {
     fn boundary_constraints(
-        _pub_inputs: &LookUpPublicInputs<F, E>,
+        _pub_inputs: &LookUpPublicInputs<F>,
         _rap_challenges: &[FieldElement<E>],
     ) -> Vec<BoundaryConstraint<E>> {
         vec![]
@@ -372,7 +367,7 @@ fn build_auxiliary_trace_column<F, E>(
 }
 
 fn build_boundary_constraint<F, E>(
-    pub_inputs: &LookupPublicInputsPerInteraction<F, E>,
+    pub_inputs: &LookupPublicInputsPerInteraction<F>,
     rap_challenges: &[FieldElement<E>],
     table_interaction: &TableInteraction,
     interaction_number: usize,
