@@ -13,9 +13,6 @@
 
 #show: book-page.with(title: "MUL chip")
 
-
-#outline()
-
 = Columns
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)

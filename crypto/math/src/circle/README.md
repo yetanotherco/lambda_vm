@@ -57,9 +57,9 @@ The CFFT algorithm uses what we called a Standard Coset. A Standard Coset is a C
 In `coset.rs` you will find our implementation for the Circle Group over the Mersenne-31 Prime Field. You can use it in the following way:
 
 ```rust
-use lambdaworks_math::circle::cosets::Coset;
-use lambdaworks_math::circle::point::CirclePoint;
-use lambdaworks_math::field::fields::mersenne31::field::Mersenne31Field;
+use math::circle::cosets::Coset;
+use math::circle::point::CirclePoint;
+use math::field::fields::mersenne31::field::Mersenne31Field;
 
 // Create a standard coset of size 2^k
 let log_2_size = 3; // k = 3, for a coset of size 8.
@@ -112,11 +112,11 @@ After the FFT:
 ### Working with Circle group points
 
 ```rust
-use lambdaworks_math::field::{
+use math::field::{
     element::FieldElement,
     fields::mersenne31::field::Mersenne31Field,
 };
-use lambdaworks_math::circle::point::CirclePoint;
+use math::circle::point::CirclePoint;
 
 // Create a valid point in the Circle group, i.e a point (x, y) 
 // that satisfies x^2 + y^2 = 1
@@ -138,11 +138,11 @@ let point4 = point1 * 8; // Scalar multiplication
 ### Polynomial evaluation and interpolation using CFFT
 
 ```rust
-use lambdaworks_math::field::{
+use math::field::{
     element::FieldElement,
     fields::mersenne31::field::Mersenne31Field,
 };
-use lambdaworks_math::circle::polynomial::{evaluate_cfft, interpolate_cfft};
+use math::circle::polynomial::{evaluate_cfft, interpolate_cfft};
 
 // Define polynomial coefficients
 let coefficients: Vec<FieldElement<Mersenne31Field>> = (0..8)
@@ -159,16 +159,16 @@ let recovered_coefficients = interpolate_cfft(evaluations);
 ### Using CFFT directly
 
 ```rust
-use lambdaworks_math::field::{
+use math::field::{
     element::FieldElement,
     fields::mersenne31::field::Mersenne31Field,
 };
-use lambdaworks_math::circle::{
+use math::circle::{
     cfft::{cfft, icfft},
     cosets::Coset,
     twiddles::{get_twiddles, TwiddlesConfig},
 };
-use lambdaworks_math::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
+use math::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
 
 // Prepare data (must be a power of 2 in length)
 let mut data: Vec<FieldElement<Mersenne31Field>> = (0..8)
@@ -202,4 +202,3 @@ icfft(&mut data, inverse_twiddles);
 - [Circle FFT Paper](https://eprint.iacr.org/2024/278)
 - [Anatomy of a STARK](https://aszepieniec.github.io/stark-anatomy/) - Detailed explanation of STARKs
 - [STARKs, Part I: Proofs with Polynomials](https://vitalik.ca/general/2017/11/09/starks_part_1.html) - Vitalik Buterin's series on STARKs
-

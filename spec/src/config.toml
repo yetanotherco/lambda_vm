@@ -93,7 +93,7 @@ subtypes = ["Word", "Half", "Half"]
 desc = """\
        Variable that can only assume values in the range $[0, 2^64)$. \\
        Represented as a `Word` and two `Half` variables.\
-       The `Word` is the least significant digit.
+       The `Word` is the *least* significant digit.
        """
 
 [[variables.types]]
@@ -112,48 +112,20 @@ desc = """\
        Represented as an array of four `Word` variables.\
        """
 
-# TODO: Having to define these manually will get tedious
 [[variables.types]]
-label = "Bit[3]"
-subtypes = ["Bit", "Bit", "Bit"]
-desc = "Three bits"
+label = "DWordWHH"
+subtypes = ["Half", "Half", "Word"]
+desc = """\
+       Variable that can only assume values in the range $[0, 2^64)$. \\
+       Represented as a `Word` and two `Half` variables.\
+       The `Word` is the *most* significant digit.
+       """
 
 [[variables.types]]
-label = "Byte[2]"
-subtypes = ["Byte", "Byte"]
-desc = "Two bytes"
-
-[[variables.types]]
-label = "Byte[8]"
-subtypes = ["Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte", "Byte"]
-desc = "Eight bytes"
-
-[[variables.types]]
-label = "Half[3]"
-subtypes = ["Half", "Half", "Half"]
-desc = "Three halfwords"
-
-[[variables.types]]
-label = "Half[8]"
-subtypes = ["Half", "Half", "Half", "Half", "Half", "Half", "Half", "Half"]
-desc = "Eight halfwords"
-
-[[variables.types]]
-label = "B20[4]"
-subtypes = ["B20", "B20", "B20", "B20"]
-desc = "Four B20s"
-
-[[variables.types]]
-label = "B35[8]"
-subtypes = ["B35", "B35", "B35", "B35", "B35", "B35", "B35", "B35"]
-desc = "Eight B35s"
-
-[[variables.types]]
-label = "B51[4]"
-subtypes = ["B51", "B51", "B51", "B51"]
-desc = "Four B51s"
-
+label = "Timestamp"
+subtypes = ["DWordWL"]
+desc = "A preprocessed column holding timestamps as `DWordWL`. Row `i` of the column contains the value $2^2 dot (i + 1)$. Used in the CPU chip, see there for more details about the magic number."
 
 [variables.categories]
-all = ["input", "output", "auxiliary", "virtual", "multiplicity"]
+all = ["input", "output", "auxiliary", "virtual", "multiplicity", "condition"]
 instantiated = ["input", "output", "auxiliary", "multiplicity"]

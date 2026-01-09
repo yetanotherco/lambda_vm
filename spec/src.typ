@@ -35,15 +35,32 @@
 #let _check_chip(chip, config) = {
   // Check that all variable categories are valid
   for category in chip.variables.keys() {
-    assert(category in config.variables.categories.all)
+    assert(
+      category in config.variables.categories.all, 
+      message: "invalid category: " + repr(category)
+    )
   }
 
-  for var in chip.variables.values().flatten() {
-    // Check that all variable types are valid
+  // Check that `def` is only contained in `virtual` variables
+  let non_virtual_vars = chip.variables.pairs().filter(x => x.first() != "virtual").map(x => x.last()).flatten();
+  for var in non_virtual_vars {
     assert(
-      var.type in config.variables.types.map(type => type.label),
-      message: "found invalid var type:" + var.type,
+      "def" not in var,
+      message: "illegal `def` in non-virtual var: " + repr(var.name)
     )
+  }
+
+  let all_vars = chip.variables.values().flatten()
+  let all_labels = config.variables.types.map(type => type.label);
+  for var in all_vars {
+    let type_label = if type(var.type) == array {
+      var.type.at(0)
+    } else {
+      var.type
+    }
+
+    // Check that all variable types are valid
+    assert(type_label in all_labels, message: "found invalid var type:" + repr(var.type))
   }
 }
 

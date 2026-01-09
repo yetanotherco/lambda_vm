@@ -45,57 +45,43 @@ desc = "the most significant bit of `rhs`"
 
 [[variables.auxiliary]]
 name = "raw_product"
-type = "B51[4]"
+type = ["B51", 4]
 desc = "raw multiplication output"
 
 # Virtual
 
 [[variables.virtual]]
 name = "lhs_ext"
-type = "Half[8]"
+type = ["Half", 8]
 desc = "sign-extended value of `lhs`"
-polys = [ 
-    ["idx", "lhs", 0],
-    ["idx", "lhs", 1],
-    ["idx", "lhs", 2],
-    ["idx", "lhs", 3],
-    ["*", "0xFFFF", "lhs_signed", "lhs_msb"],
-    ["*", "0xFFFF", "lhs_signed", "lhs_msb"],
-    ["*", "0xFFFF", "lhs_signed", "lhs_msb"],
-    ["*", "0xFFFF", "lhs_signed", "lhs_msb"],
-]
+def = {idx="i", polys=[
+    {range=[0, 3], poly=["idx", "lhs", "i"]},
+    {range=[4, 7], poly=["*", 0xFFFF, "lhs_signed", "lhs_msb"]},
+]}
 
 [[variables.virtual]]
 name = "rhs_ext"
-type = "Half[8]"
+type = ["Half", 8]
 desc = "sign-extended value of `rhs`"
-polys = [ 
-    ["idx", "rhs", 0],
-    ["idx", "rhs", 1],
-    ["idx", "rhs", 2],
-    ["idx", "rhs", 3],
-    ["*", "0xFFFF", "rhs_signed", "rhs_msb"],
-    ["*", "0xFFFF", "rhs_signed", "rhs_msb"],
-    ["*", "0xFFFF", "rhs_signed", "rhs_msb"],
-    ["*", "0xFFFF", "rhs_signed", "rhs_msb"],
-]
+def = {idx="i", polys=[
+    {range=[0, 3], poly=["idx", "rhs", "i"]},
+    {range=[4, 7], poly=["*", 0xFFFF, "rhs_signed", "rhs_msb"]},
+]}
 
 [[variables.virtual]]
 name = "limb_product"
-type = "B35[8]"
+type = ["B35", 8]
 desc = "raw multiplication output"
-poly = ["sum", ["j", 0, "i"], ["*", ["idx", "lhs_ext", "i"], ["idx", "rhs_ext", ["-", "i", "j"]]]]
+def = ["sum", ["=", "j", 0], "i", ["*", ["idx", "lhs_ext", "i"], ["idx", "rhs_ext", ["-", "i", "j"]]]]
 
 [[variables.virtual]]
 name = "carry"
-type = "B20[4]"
+type = ["B20", 4]
 desc = "carry values"
-polys = [
-    ["*", ["^", 2, -32], ["-", ["idx", "raw_product", 0], ["idx", "res", 0]]],
-    ["*", ["^", 2, -32], ["-", ["+", ["idx", "raw_product", 1], ["idx", "carry", 0]], ["idx", "res", 1]]],
-    ["*", ["^", 2, -32], ["-", ["+", ["idx", "raw_product", 2], ["idx", "carry", 1]], ["idx", "res", 2]]],
-    ["*", ["^", 2, -32], ["-", ["+", ["idx", "raw_product", 3], ["idx", "carry", 2]], ["idx", "res", 3]]],
-]
+def = {idx="i", polys=[
+    {range=0, poly=["*", ["^", 2, -32], ["-", ["idx", "raw_product", 0], ["idx", "res", 0]]]},
+    {range=[1, 3], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", "raw_product", "i"], ["idx", "carry", ["-", "i", 1]]], ["idx", "res", "i"]]]},
+]}
 
 
 # Multiplicity
@@ -113,11 +99,11 @@ desc = ""
 # Assumptions
 
 [[assumptions]]
-desc = "IS_HALF[lhs[i]]"
+desc = "`IS_HALF[lhs[i]]`"
 range = ["i", 0, 3]
 
 [[assumptions]]
-desc = "IS_HALF[rhs[i]]"
+desc = "`IS_HALF[rhs[i]]`"
 range = ["i", 0, 3]
 
 
