@@ -142,7 +142,15 @@
         pp <= PREC.sub
       )
     },
-    "*": (pp, rec, e) => mwrap($#e.slice(1).map(rec.with(PREC.mul)).join($dot$)$, pp < PREC.mul),
+    "*": (pp, rec, e) => {
+      if e.len() == 3 and type(e.at(1)) == int and type(e.at(2)) == str and e.at(2).len() == 1 {
+        // multiplication of a constant with one-letter variable. 
+        // Dropping the "dot"
+        mwrap($#e.slice(1).map(rec.with(PREC.mul)).join($$)$, pp < PREC.mul)
+      } else {
+        mwrap($#e.slice(1).map(rec.with(PREC.mul)).join($dot$)$, pp < PREC.mul)
+      }
+    },
     "/": (pp, rec, e) => $#rec(PREC.div, e.at(1)) / #rec(PREC.div, e.at(2))$,
     "^": (pp, rec, e) => {
       assert(type(e.at(1)) == int and type(e.at(2)) == int, message: "Can only exponentiate constants")
