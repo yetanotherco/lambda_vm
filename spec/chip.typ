@@ -90,7 +90,7 @@
     table.header([*Label*], [*Type*], table.cell(colspan: 2, [*Description*])),
     table.hline(stroke: stroke(thickness: 2pt)),
     ..for (cat, vars) in chip.variables.pairs() {
-      (table.cell(colspan: 4, emph(cat)), table.hline(stroke: .6pt))
+      (table.header(level:2, table.cell(colspan: 4, emph(cat))), table.hline(stroke: .6pt))
       for var in vars {
         (
           [#raw(var.name)], 
