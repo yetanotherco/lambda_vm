@@ -317,7 +317,7 @@ fn build_auxiliary_trace_column<F, E>(
         .collect::<Vec<_>>();
 
     // Challenges
-    let z = challenges[0].clone();
+    let z = &challenges[0];
     let alpha = &challenges[1];
     // Coefficients for each value column
     let coeffs: Vec<FieldElement<E>> = (0..values.len()).map(|i| alpha.pow(i)).collect();
@@ -331,15 +331,15 @@ fn build_auxiliary_trace_column<F, E>(
     let fingerprint_inv: FieldElement<E> = (-(values
         .iter()
         .zip(coeffs.iter())
-        .map(|(v, coeff)| v[0].clone() * coeff.clone())
+        .map(|(v, coeff)| &v[0] * coeff)
         .sum::<FieldElement<E>>())
-        + z.clone())
-    .inv()
-    .unwrap();
+        + z)
+        .inv()
+        .unwrap();
     // Sum of all flags
     let flag: FieldElement<F> = flags.iter().map(|flag_column| flag_column[0].clone()).sum();
     // Fill first aux column row (should be overwritten next)
-    aux_col.push(flag * fingerprint_inv.clone());
+    aux_col.push(flag * fingerprint_inv);
 
     for i in 0..trace_len - 1 {
         // fingerprint = z - (v[0] * alpha^0 + v[1] * alpha^1 +...+ value[n] * alpha^n)
@@ -347,11 +347,11 @@ fn build_auxiliary_trace_column<F, E>(
         let fingerprint_inv: FieldElement<E> = (-(values
             .iter()
             .zip(coeffs.iter())
-            .map(|(v, coeff)| v[i + 1].clone() * coeff)
+            .map(|(v, coeff)| &v[i + 1] * coeff)
             .sum::<FieldElement<E>>())
-            + z.clone())
-        .inv()
-        .unwrap();
+            + z)
+            .inv()
+            .unwrap();
         // Sum of all flags
         let flag: FieldElement<F> = flags
             .iter()
@@ -405,7 +405,7 @@ where
         .initial_values
         .iter()
         .zip(coeffs.iter())
-        .map(|(v, coeff)| v.clone() * coeff.clone())
+        .map(|(v, coeff)| v * coeff)
         .sum::<FieldElement<E>>())
         + z)
         .inv()
@@ -503,7 +503,7 @@ where
                 .zip(coeffs.iter())
                 .map(|(v, coeff)| *v * coeff)
                 .sum::<FieldElement<B>>())
-                + z.clone();
+                + z;
 
             // We are using the following LogUp equation:
             // s1 = s0 + flag / fingerprint
