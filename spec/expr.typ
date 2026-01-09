@@ -31,6 +31,7 @@
 //          | ["idx", expr1, expr2]        ; expr1[expr2]
 //          | ["not", expr]                ; !expr
 //          | ["+", expr1, expr2, ...]     ; expr1 + expr2 + ...
+//          | ["sum", expr1, expr2, expr3] ; Σ_expr1^expr2 expr3
 //          | ["*", expr1, expr2, ...]     ; expr1 * expr2 * ...
 //          | ["/", expr1, expr2]          ; expr1 / expr2
 //          | ["^", expr1, expr2]          ; expr1^expr2
@@ -51,12 +52,13 @@
   "cast": 2, // cast
   "mul": 3,  // *
   "div": 4,  // /
-  "not": 5,  // not
-  "add": 6,  // +
-  "sub": 7,  // -
-  "idx": 8,  // []
-  "eq": 9,   // = and :=
-  "MAX": 10, // <the void outside every expression>
+  "sum": 5,  // Σ
+  "not": 6,  // not
+  "add": 7,  // +
+  "sub": 8,  // -
+  "idx": 9,  // []
+  "eq": 10,   // = and :=
+  "MAX": 11, // <the void outside every expression>
 )
 
 // Mutual recursion through a trick from https://github.com/typst/typst/issues/744
@@ -92,6 +94,7 @@
     "idx": (pp, rec, e) => rec(PREC.MIN, e.at(1)) + `[` + rec(PREC.MAX, e.at(2)) + `]`,
     "not": (pp, rec, e) => cwrap(`1 - ` + rec(PREC.not, e.at(1)), pp < PREC.not),
     "+": (pp, rec, e) => cwrap(e.slice(1).map(rec.with(PREC.add)).join(` + `), pp < PREC.add),
+    "sum": (pp, rec, e) => assert(false, message: "sum is unsupported in code."),
     "*": (pp, rec, e) => cwrap(e.slice(1).map(rec.with(PREC.mul)).join(` ` + sym.dot + ` `), pp < PREC.mul),
     "/": (pp, rec, e) => cwrap(rec(PREC.div, e.at(1)), pp < PREC.div) + ` / ` + rec(PREC.div, e.at(2)),
     "^": (pp, rec, e) => {
@@ -132,6 +135,13 @@
     "idx": (pp, rec, e) => $#rec(PREC.idx, e.at(1))_(#rec(PREC.idx, e.at(2)))$,
     "not": (pp, rec, e) => mwrap($1 - #rec(PREC.not, e.at(1))$, pp < PREC.not),
     "+": (pp, rec, e) => mwrap($#e.slice(1).map(rec.with(PREC.add)).join($+$)$, pp < PREC.add),
+    "sum": (pp, rec, e) => {
+      assert(e.len() == 4, message: "invalid sum:" + repr(e))
+      mwrap(
+        $sum_(#rec(PREC.MAX, e.at(1)))^#rec(PREC.MAX, e.at(2)) #rec(if pp <= PREC.sub {PREC.MAX} else {PREC.sum}, e.at(3))$, 
+        pp <= PREC.sub
+      )
+    },
     "*": (pp, rec, e) => mwrap($#e.slice(1).map(rec.with(PREC.mul)).join($dot$)$, pp < PREC.mul),
     "/": (pp, rec, e) => $#rec(PREC.div, e.at(1)) / #rec(PREC.div, e.at(2))$,
     "^": (pp, rec, e) => {
