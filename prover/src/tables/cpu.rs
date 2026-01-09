@@ -230,6 +230,7 @@ impl CpuTableRow {
                 row.rd = FE::from(&dst);
                 row.imm = i32_to_2_limbs(offset);
                 row.arg2 = i32_to_2_limbs(offset);
+                row.branch_cond = FE::one();
                 if dst != 0 {
                     row.write_register = FE::one();
                 }
