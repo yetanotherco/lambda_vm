@@ -37,7 +37,7 @@ fn run_from_entrypoint(
 ) -> Result<((i32, i32), Vec<Log>), ExecutorError> {
     let mut pc = entrypoint;
     let mut registers = Registers::default();
-    let mut logs = Vec::new();
+    let mut logs = Vec::new(); 
     while pc != 0 {
         let next_instruction = memory.load_word(pc)?;
         let instruction = Instruction::parse(next_instruction)?;
