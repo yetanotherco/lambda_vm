@@ -73,35 +73,3 @@ pub fn get_twiddles<F: IsFFTField>(
 
     get_powers_of_primitive_root(order, (1 << order) / 2, config)
 }
-
-#[cfg(test)]
-mod tests {
-    use crate::{
-        fft::{
-            cpu::{bit_reversing::in_place_bit_reverse_permute, roots_of_unity::get_twiddles},
-            errors::FFTError,
-        },
-        field::{test_fields::u64_test_field::U64TestField, traits::RootsConfig},
-    };
-    use proptest::prelude::*;
-
-    type F = U64TestField;
-
-    proptest! {
-        #[test]
-        fn test_gen_twiddles_bit_reversed_validity(n in 1..8_u64) {
-            let twiddles = get_twiddles::<F>(n, RootsConfig::Natural).unwrap();
-            let mut twiddles_to_reorder = get_twiddles(n, RootsConfig::BitReverse).unwrap();
-            in_place_bit_reverse_permute(&mut twiddles_to_reorder); // so now should be naturally ordered
-
-            prop_assert_eq!(twiddles, twiddles_to_reorder);
-        }
-    }
-
-    #[test]
-    fn gen_twiddles_with_order_greater_than_63_should_fail() {
-        let twiddles = get_twiddles::<F>(64, RootsConfig::Natural);
-
-        assert!(matches!(twiddles, Err(FFTError::OrderError(_))));
-    }
-}

@@ -1,0 +1,4 @@
+[target.rv32]
+rustflags = [
+  "-C", "passes=lower-atomic" # TODO: check rust version to pass lower-atomic or loweratomic
+]

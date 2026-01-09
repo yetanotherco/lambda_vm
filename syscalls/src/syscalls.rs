@@ -8,6 +8,7 @@ enum SyscallNumbers {
     Panic = 2,
     Commit = 3,
     GetPrivateInputs = 4,
+    Halt = 5,
 }
 
 /// This is a template for printing in the vm
@@ -99,4 +100,16 @@ pub fn get_private_input() -> Result<Vec<u8>, SyscallError> {
 pub enum SyscallError {
     #[error("Wrong private input size")]
     WrongPrivateInputSize,
+}
+
+pub fn sys_halt() -> ! {
+    print_string("sys_halt called\n");
+    unsafe {
+        asm!(
+            "mv a7, {syscall_number}", // syscall number for halt
+            "ecall",
+            syscall_number = in(reg) SyscallNumbers::Halt as usize,
+        );
+    }
+    unreachable!()
 }

@@ -170,6 +170,21 @@ fn test_commit_sum() {
 }
 
 #[test]
+fn test_serde() {
+    #[derive(serde::Serialize)]
+    struct MyData {
+        val: i32,
+        values: Vec<u8>,
+    }
+    let my_data = MyData {
+        val: 42,
+        values: vec![1, 2, 3, 4, 5],
+    };
+    let serialized = serde_json::to_vec(&my_data).unwrap();
+    run_program_and_check_public_output("./program_artifacts/rust/serde.elf", serialized, vec![]);
+}
+
+#[test]
 fn test_random() {
     let result = run_program_without_expect("./program_artifacts/rust/random.elf", vec![]);
     assert!(result.is_err());
