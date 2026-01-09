@@ -548,10 +548,10 @@ where
                 let step = frame.get_evaluation_step(0);
 
                 // Auxiliary frame elements
-                let grand_sum = step.get_aux_evaluation_element(0, dbg!(self.interaction_amount));
+                let grand_sum = step.get_aux_evaluation_element(0, self.interaction_amount);
 
                 let interaction_values_sum: FieldElement<E> = (0..self.interaction_amount)
-                    .map(|i| step.get_aux_evaluation_element(0, dbg!(i)).clone())
+                    .map(|i| step.get_aux_evaluation_element(0, i).clone())
                     .sum();
 
                 // Check that the grand sum is equal to the sum of all other auxiliary columns in the same row
