@@ -148,6 +148,7 @@ output = "div_by_zero"
 ref = "dvrm:c:div_by_zero"
 cond = "μ_sum"
 
+# TODO: drop `signed` from here; it is implied by `n_is_negative`
 [[constraints.defs]]
 kind = "template"
 tag = "IsEqual"
@@ -228,6 +229,14 @@ ref = "dvrm:c:mul_upper"
 name = "abs_diff"
 
 [[constraints.abs_diff]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "abs_r", "i"]]
+range = ["i", 0, 3]
+multiplicity = "μ_sum"
+ref = "dvrm:c:abs_r_range_check"
+
+[[constraints.abs_diff]]
 kind = "template"
 tag = "SUB"
 input = [0, "r"]
@@ -241,6 +250,14 @@ constraint = "$!#`r_is_negative` => #`abs_r[i]`=#`r[i]`$"
 range = ["i", 0, 3]
 poly = ["*", ["-", 1, "r_is_negative"], ["-", ["idx", "abs_r", "i"], ["idx", "r", "i"]]]
 ref = "dvrm:c:abs_r_if_nonnegative"
+
+[[constraints.abs_diff]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "abs_d", "i"]]
+range = ["i", 0, 3]
+multiplicity = "μ_sum"
+ref = "dvrm:c:abs_d_range_check"
 
 [[constraints.abs_diff]]
 kind = "template"
