@@ -436,8 +436,8 @@ where
                 let second_step = frame.get_evaluation_step(1);
 
                 // Auxiliary frame elements
-                let s0 = first_step.get_aux_evaluation_element(0, 0);
-                let s1 = second_step.get_aux_evaluation_element(0, 0);
+                let s0 = first_step.get_aux_evaluation_element(0, self.interaction_number);
+                let s1 = second_step.get_aux_evaluation_element(0, self.interaction_number);
 
                 let z = &rap_challenges[0];
                 let alpha = &rap_challenges[1];
