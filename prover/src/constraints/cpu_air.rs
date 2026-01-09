@@ -2,6 +2,7 @@ use crate::constraints::constraints_templates::{
     Arg2ValidityColumnIndexes, new_add_constraint, new_add_four_constraint,
     new_arg2_validity_constraint, new_bit_constraints, new_sub_constraint,
 };
+use crate::tables::cpu::CpuTableRow;
 
 use math::field::{
     element::FieldElement,
@@ -16,45 +17,6 @@ use stark::{
     trace::TraceTable,
     traits::AIR,
 };
-
-// CPU Columns indeces:
-// const TIMESTAMP: usize = 0;
-const PC: usize = 2;
-// const RS1: usize = 4;
-// const RS2: usize = 5;
-// const RD: usize = 6;
-const WRITE_REGISTER: usize = 7;
-const MEMORY_2BYTES: usize = 8;
-const MEMORY_4BYTES: usize = 9;
-const IMM: usize = 10;
-const SIGNED: usize = 12;
-const MP_SELECTOR: usize = 13;
-const MULDIV_SELECTOR: usize = 14;
-const ADD: usize = 15;
-const SUB: usize = 16;
-const SLT: usize = 17;
-const AND: usize = 18;
-const OR: usize = 19;
-const XOR: usize = 20;
-const SL: usize = 21;
-const SR: usize = 22;
-const JALR: usize = 23;
-const BEQ: usize = 24;
-const BLT: usize = 25;
-const LOAD: usize = 26;
-const STORE: usize = 27;
-const MUL: usize = 28;
-const DIVREM: usize = 29;
-const ECALL: usize = 30;
-const EBREAK: usize = 31;
-// const NEXT_PC: usize = 32;
-const RV_ONE: usize = 34;
-const RV_TWO: usize = 38;
-// const RVD: usize = 42;
-const ARG_TWO: usize = 44;
-const RES: usize = 46;
-// const IS_EQUAL: usize = 50;
-// const BRANCH_COND: usize = 51;
 
 type FE = FieldElement<Babybear31PrimeField>;
 
@@ -82,80 +44,77 @@ impl AIR for CPUTableAIR {
         _pub_inputs: &Self::PublicInputs,
         proof_options: &ProofOptions,
     ) -> Self {
+        let constraint_index = 0;
         // Bit constraints:
         // Enforce that these columns are binary. They include:
         // - decode flags like `write_register`, `signed`, `mp_selector`, `muldiv_selector`
         // - the one-hot instruction flags (ADD, SUB, ..., EBREAK)
         let bit_columns_index_to_constraint = [
-            WRITE_REGISTER,
-            MEMORY_2BYTES,
-            MEMORY_4BYTES,
-            SIGNED,
-            MP_SELECTOR,
-            MULDIV_SELECTOR,
-            ADD,
-            SUB,
-            SLT,
-            AND,
-            OR,
-            XOR,
-            SL,
-            SR,
-            JALR,
-            BEQ,
-            BLT,
-            LOAD,
-            STORE,
-            MUL,
-            DIVREM,
-            ECALL,
-            EBREAK,
+            CpuTableRow::WRITE_REGISTER,
+            CpuTableRow::MEMORY_2BYTES,
+            CpuTableRow::MEMORY_4BYTES,
+            CpuTableRow::SIGNED,
+            CpuTableRow::MP_SELECTOR,
+            CpuTableRow::MULDIV_SELECTOR,
+            CpuTableRow::ADD,
+            CpuTableRow::SUB,
+            CpuTableRow::SLT,
+            CpuTableRow::AND,
+            CpuTableRow::OR,
+            CpuTableRow::XOR,
+            CpuTableRow::SL,
+            CpuTableRow::SR,
+            CpuTableRow::JALR,
+            CpuTableRow::BEQ,
+            CpuTableRow::BLT,
+            CpuTableRow::LOAD,
+            CpuTableRow::STORE,
+            CpuTableRow::MUL,
+            CpuTableRow::DIVREM,
+            CpuTableRow::ECALL,
+            CpuTableRow::EBREAK,
         ];
-        let bit_constraints = new_bit_constraints(&bit_columns_index_to_constraint, 0);
+        let (bit_constraints, constraint_index) =
+            new_bit_constraints(&bit_columns_index_to_constraint, constraint_index);
 
-        let mut next_index = bit_columns_index_to_constraint.len();
         // Add constraint
         // Enforces that lhs (Word4L) + rhs (Word4L) = res (Word4L), with carry bits constrained.
         // It is enforced only on rows where the selected instruction flags are active.
-        let add_constraints = new_add_constraint(
-            vec![ADD, LOAD, STORE], // flags_idx,
-            RV_ONE,                 // lhs_start_idx,
-            ARG_TWO,                // rhs_start_idx,
-            RES,                    // res_start_idx,
-            next_index,             // constraint_idx_start,
+        let (add_constraints, constraint_index) = new_add_constraint(
+            vec![CpuTableRow::ADD, CpuTableRow::LOAD, CpuTableRow::STORE], // flags_idx,
+            CpuTableRow::RV1_0,                                            // lhs_start_idx,
+            CpuTableRow::ARG2_0,                                           // rhs_start_idx,
+            CpuTableRow::RES_0,                                            // res_start_idx,
+            constraint_index,                                              // constraint_idx_start,
         );
-        next_index += 2;
 
-        let sub_constraints = new_sub_constraint(
-            vec![SUB, BEQ], // flags_idx,
-            RV_ONE,         // lhs_start_idx,
-            ARG_TWO,        // rhs_start_idx,
-            RES,            // res_start_idx,
-            next_index,     // constraint_idx_start,
+        let (sub_constraints, constraint_index) = new_sub_constraint(
+            vec![CpuTableRow::SUB, CpuTableRow::BEQ], // flags_idx,
+            CpuTableRow::RV1_0,                       // lhs_start_idx,
+            CpuTableRow::ARG2_0,                      // rhs_start_idx,
+            CpuTableRow::RES_0,                       // res_start_idx,
+            constraint_index,                         // constraint_idx_start,
         );
-        next_index += 2;
 
         // Enforces RES = PC + 4 in a JALR instruction
-        let next_pc_value_constraint = new_add_four_constraint(
-            JALR,       // flags_idx,
-            PC,         // rhs_start_idx,
-            RES,        // res_start_idx,
-            next_index, // constraint_idx_start,
+        let (next_pc_value_constraint, constraint_index) = new_add_four_constraint(
+            CpuTableRow::JALR,  // flags_idx,
+            CpuTableRow::PC_0,  // rhs_start_idx,
+            CpuTableRow::RES_0, // res_start_idx,
+            constraint_index,   // constraint_idx_start,
         );
 
-        next_index += 2;
-
-        let arg2_validity_constraints = new_arg2_validity_constraint(
-            ARG_TWO,
-            RV_TWO,
-            IMM,
+        let (arg2_validity_constraints, _) = new_arg2_validity_constraint(
+            CpuTableRow::ARG2_0,
+            CpuTableRow::RV2_0,
+            CpuTableRow::IMM_0,
             Arg2ValidityColumnIndexes {
-                load_index: LOAD,
-                store_index: STORE,
-                beq_index: BEQ,
-                blt_index: BLT,
+                load_index: CpuTableRow::LOAD,
+                store_index: CpuTableRow::STORE,
+                beq_index: CpuTableRow::BEQ,
+                blt_index: CpuTableRow::BLT,
             },
-            next_index,
+            constraint_index,
         );
 
         let mut constraints = bit_constraints;
@@ -168,7 +127,7 @@ impl AIR for CPUTableAIR {
 
         let context = AirContext {
             proof_options: proof_options.clone(),
-            trace_columns: 52,
+            trace_columns: CpuTableRow::NUM_COLUMNS,
             transition_offsets: vec![0],
             num_transition_constraints,
         };
@@ -206,7 +165,7 @@ impl AIR for CPUTableAIR {
     }
 
     fn trace_layout(&self) -> (usize, usize) {
-        (52, 0)
+        (CpuTableRow::NUM_COLUMNS, 0)
     }
 
     fn pub_inputs(&self) -> &Self::PublicInputs {
