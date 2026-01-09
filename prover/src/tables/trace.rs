@@ -21,7 +21,7 @@ pub struct Trace {
 }
 
 impl Trace {
-    pub fn generate_trace_from_logs(logs: Vec<Log>) -> Trace {
+    pub fn generate_trace_from_logs(logs: Vec<Log>) -> Self {
         let mut cpu_table: Vec<FE> = Vec::new();
         let mut decode_table: Vec<FE> = Vec::new();
 
@@ -37,7 +37,7 @@ impl Trace {
                 .or_insert_with(|| (DecodeTableRow::from_log(log), 1));
         }
 
-        for (_key, (mut row, multiplicity)) in decode_map {
+        for (mut row, multiplicity) in decode_map.into_values() {
             row.set_multiplicity(multiplicity);
             decode_table.extend(row.to_vec());
         }

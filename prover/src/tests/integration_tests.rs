@@ -28,9 +28,6 @@ pub fn run_program_and_prover(elf_path: &str) {
     let cpu_air = CPUTableAIR::new(trace.cpu_trace_table.num_rows(), &(), &proof_options);
     let decode_air = DecodeTableAIR::new(trace.decode_trace_table.num_rows(), &(), &proof_options);
 
-    println!("CPU table: {:?}", trace.cpu_trace_table.num_rows());
-    println!("Decode table: {:?}", trace.decode_trace_table.num_rows());
-
     let airs: Vec<(
         &dyn AIR<
             Field = Babybear31PrimeField,
