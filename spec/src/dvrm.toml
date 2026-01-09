@@ -257,6 +257,15 @@ range = ["i", 0, 3]
 poly = ["*", ["-", 1, "d_is_negative"], ["-", ["idx", "abs_d", "i"], ["idx", "d", "i"]]]
 ref = "dvrm:c:abs_d_if_nonnegative"
 
+# TODO: alternatively, we could set `1-div_by_zero` as the output, and use a different multiplicity.
+[[constraints.abs_diff]]
+kind = "interaction"
+tag = "LT"
+input = ["abs_r", "abs_d"]
+output = 1
+multiplicity = ["not", "div_by_zero"]
+ref ="dvrm:c:abs_r_lt_abs_d"
+
 
 [[constraint_groups]]
 name = "div_by_zero"
