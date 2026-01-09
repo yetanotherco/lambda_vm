@@ -431,19 +431,6 @@ pub fn cpu_trace_from_logs(
         .enumerate()
         .flat_map(|(i, log)| {
             let timestamp = (i * 4) as u32;
-            match log.instruction {
-                Instruction::Branch {
-                    src1,
-                    src2,
-                    cond,
-                    offset,
-                } => {
-                    println!("--------------");
-                    println!("Current PC: {}", log.current_pc);
-                    println!("Next PC: {}", log.next_pc);
-                }
-                _ => {}
-            }
             CpuTableRow::from_log(log, timestamp).to_vec()
         })
         .collect();

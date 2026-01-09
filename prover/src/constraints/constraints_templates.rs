@@ -614,6 +614,7 @@ pub struct AddFourCarryBitConstraint {
     lhs_start_idx: usize,
     res_start_idx: usize,
     constraint_idx: usize,
+    is_flag_negated: bool,
 }
 
 impl AddFourCarryBitConstraint {
@@ -631,6 +632,7 @@ impl AddFourCarryBitConstraint {
         lhs_start_idx: usize,
         res_start_idx: usize,
         constraint_idx: usize,
+        is_flag_negated: bool,
     ) -> Self {
         Self {
             carry_idx,
@@ -638,6 +640,7 @@ impl AddFourCarryBitConstraint {
             lhs_start_idx,
             res_start_idx,
             constraint_idx,
+            is_flag_negated,
         }
     }
 
@@ -646,7 +649,10 @@ impl AddFourCarryBitConstraint {
         F: IsSubFieldOf<E>,
         E: IsField,
     {
-        let flag = step.get_main_evaluation_element(0, self.flag_idx);
+        let mut flag = step.get_main_evaluation_element(0, self.flag_idx).clone();
+        if self.is_flag_negated {
+            flag = FieldElement::<F>::one() - flag;
+        }
 
         let lhs_0 = step.get_main_evaluation_element(0, self.lhs_start_idx);
         let rhs_0 = FieldElement::<F>::from(4);
@@ -745,6 +751,7 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
 /// * `lhs_start_idx` - Starting column for left operand (requires 2 consecutive columns)
 /// * `res_start_idx` - Starting column for result (requires 4 consecutive columns)
 /// * `constraint_idx_start` - Starting constraint index (will use idx and idx+1)
+/// * `is_flag_negated` - Whether the flag should be negated
 ///
 /// ## Returns
 /// A vector of two boxed constraints: [carry_0_constraint, carry_1_constraint]
@@ -753,6 +760,7 @@ pub fn new_add_four_constraint(
     lhs_start_idx: usize,
     res_start_idx: usize,
     constraint_index: usize,
+    is_flag_negated: bool,
 ) -> (
     Vec<Box<dyn TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>>>,
     usize,
@@ -765,6 +773,7 @@ pub fn new_add_four_constraint(
                 lhs_start_idx,
                 res_start_idx,
                 constraint_index,
+                is_flag_negated,
             )),
             Box::new(AddFourCarryBitConstraint::new(
                 CarryIndex::One,
@@ -772,6 +781,7 @@ pub fn new_add_four_constraint(
                 lhs_start_idx,
                 res_start_idx,
                 constraint_index + 1,
+                is_flag_negated,
             )),
         ],
         constraint_index + 2,

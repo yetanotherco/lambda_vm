@@ -102,6 +102,7 @@ impl AIR for CPUTableAIR {
             CpuTableRow::PC_0,  // rhs_start_idx,
             CpuTableRow::RES_0, // res_start_idx,
             constraint_index,   // constraint_idx_start,
+            false,              // is_flag_negated
         );
 
         let (arg2_validity_constraints, constraint_index) = new_arg2_validity_constraint(
@@ -123,6 +124,7 @@ impl AIR for CPUTableAIR {
             CpuTableRow::PC_0,        // rhs_start_idx,
             CpuTableRow::NEXT_PC_0,   // res_start_idx,
             constraint_index,         // constraint_idx_start,
+            true,                     // is_flag_negated
         );
 
         let mut constraints = bit_constraints;
