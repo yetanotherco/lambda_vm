@@ -373,114 +373,78 @@ where
         evaluation_context: &TransitionEvaluationContext<F, E>,
         transition_evaluations: &mut [FieldElement<E>],
     ) {
-        match evaluation_context {
+        fn evaluate_lookup_constraint<'a, A: IsSubFieldOf<B>, B: IsField>(
+            first_step: &TableView<'a, A, B>,
+            second_step: &TableView<'a, A, B>,
+            aux_column_idx: usize,
+            interaction: &TableInteraction,
+            rap_challenges: &&[FieldElement<B>],
+        ) -> FieldElement<B> {
+            // Auxiliary frame elements
+            let s0 = first_step.get_aux_evaluation_element(0, aux_column_idx);
+            let s1 = second_step.get_aux_evaluation_element(0, aux_column_idx);
+
+            let z = &rap_challenges[0];
+            let alpha = &rap_challenges[1];
+
+            // Main frame elements
+            let flag: FieldElement<A> = interaction
+                .flag_columns
+                .iter()
+                .map(|c| second_step.get_main_evaluation_element(0, *c).clone())
+                .sum();
+            let values = interaction
+                .value_columns
+                .iter()
+                .map(|c| second_step.get_main_evaluation_element(0, *c))
+                .collect::<Vec<_>>();
+
+            // Coefficients for each value column
+            let coeffs: Vec<FieldElement<B>> = (0..values.len()).map(|i| alpha.pow(i)).collect();
+
+            // fingerprint = z - (v[0] * alpha^0 + v[1] * alpha^1 +...+ value[n] * alpha^n)
+            // Where v are the values for each row and n the number of value columns
+            let fingerprint: FieldElement<B> = (-values
+                .iter()
+                .zip(coeffs.iter())
+                .map(|(v, coeff)| *v * coeff)
+                .sum::<FieldElement<B>>())
+                + z.clone();
+
+            // We are using the following LogUp equation:
+            // s1 = s0 + flag / fingerprint
+            // 0 =  s0 * fingerprint + flag - s1 * fingerprint
+            // Since constraints must be expressed without division, we multiply each term by sorted_term * unsorted_term:
+            flag + s0 * &fingerprint - s1 * fingerprint
+        }
+
+        let res = match evaluation_context {
             TransitionEvaluationContext::Prover {
                 frame,
-                periodic_values: _periodic_values,
                 rap_challenges,
-            } => {
-                let first_step = frame.get_evaluation_step(0);
-                let second_step = frame.get_evaluation_step(1);
-
-                // Auxiliary frame elements
-                let s0 = first_step.get_aux_evaluation_element(0, self.interaction_number);
-                let s1 = second_step.get_aux_evaluation_element(0, self.interaction_number);
-
-                let z = &rap_challenges[0];
-                let alpha = &rap_challenges[1];
-
-                // Main frame elements
-                let flag: FieldElement<F> = self
-                    .interaction
-                    .flag_columns
-                    .iter()
-                    .map(|c| second_step.get_main_evaluation_element(0, *c).clone())
-                    .sum();
-                let values = self
-                    .interaction
-                    .value_columns
-                    .iter()
-                    .map(|c| second_step.get_main_evaluation_element(0, *c))
-                    .collect::<Vec<_>>();
-
-                // Coefficients for each value column
-                let coeffs: Vec<FieldElement<E>> =
-                    (0..values.len()).map(|i| alpha.pow(i)).collect();
-
-                // fingerprint = z - (v[0] * alpha^0 + v[1] * alpha^1 +...+ value[n] * alpha^n)
-                // Where v are the values for each row and n the number of value columns
-                let fingerprint: FieldElement<E> = (-values
-                    .iter()
-                    .zip(coeffs.iter())
-                    .map(|(v, coeff)| *v * coeff)
-                    .sum::<FieldElement<E>>())
-                    + z.clone();
-
-                // We are using the following LogUp equation:
-                // s1 = s0 + flag / fingerprint
-                // 0 =  s0 * fingerprint + flag - s1 * fingerprint
-                // Since constraints must be expressed without division, we multiply each term by sorted_term * unsorted_term:
-                let res = flag + s0 * &fingerprint - s1 * fingerprint;
-
-                // The eval always exists, except if the constraint idx were incorrectly defined.
-                if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx) {
-                    *eval = res;
-                }
-            }
-
+                ..
+            } => evaluate_lookup_constraint(
+                frame.get_evaluation_step(0),
+                frame.get_evaluation_step(1),
+                self.interaction_number,
+                &self.interaction,
+                rap_challenges,
+            ),
             TransitionEvaluationContext::Verifier {
                 frame,
-                periodic_values: _periodic_values,
                 rap_challenges,
-            } => {
-                let first_step = frame.get_evaluation_step(0);
-                let second_step = frame.get_evaluation_step(1);
-
-                // Auxiliary frame elements
-                let s0 = first_step.get_aux_evaluation_element(0, self.interaction_number);
-                let s1 = second_step.get_aux_evaluation_element(0, self.interaction_number);
-
-                let z = &rap_challenges[0];
-                let alpha = &rap_challenges[1];
-
-                // Main frame elements
-                let flag: FieldElement<E> = self
-                    .interaction
-                    .flag_columns
-                    .iter()
-                    .map(|c| second_step.get_main_evaluation_element(0, *c).clone())
-                    .sum();
-                let values = self
-                    .interaction
-                    .value_columns
-                    .iter()
-                    .map(|c| second_step.get_main_evaluation_element(0, *c))
-                    .collect::<Vec<_>>();
-
-                // Coefficients for each value column
-                let coeffs: Vec<FieldElement<E>> =
-                    (0..values.len()).map(|i| alpha.pow(i)).collect();
-
-                // fingerprint = z - (v[0] * alpha^0 + v[1] * alpha^1 +...+ value[n] * alpha^n)
-                // Where v are the values for each row and n the number of value columns
-                let fingerprint: FieldElement<E> = (-values
-                    .iter()
-                    .zip(coeffs.iter())
-                    .map(|(v, coeff)| *v * coeff)
-                    .sum::<FieldElement<E>>())
-                    + z.clone();
-
-                // We are using the following LogUp equation:
-                // s1 = s0 + flag / fingerprint
-                // 0 =  s0 * fingerprint + flag - s1 * fingerprint
-                // Since constraints must be expressed without division, we multiply each term by sorted_term * unsorted_term:
-                let res = flag + s0 * &fingerprint - s1 * fingerprint;
-
-                // The eval always exists, except if the constraint idx were incorrectly defined.
-                if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx) {
-                    *eval = res;
-                }
-            }
+                ..
+            } => evaluate_lookup_constraint(
+                frame.get_evaluation_step(0),
+                frame.get_evaluation_step(1),
+                self.interaction_number,
+                &self.interaction,
+                rap_challenges,
+            ),
+        };
+        // The eval always exists, except if the constraint idx were incorrectly defined.
+        if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx) {
+            *eval = res;
         }
     }
 }
