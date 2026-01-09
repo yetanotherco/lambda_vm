@@ -1,19 +1,7 @@
-#![no_std]
 #![no_main]
 
 use ethereum_types::U256;
-use core::panic::PanicInfo;
-use embedded_alloc::LlffHeap as Heap;
-
-#[global_allocator]
-static HEAP: Heap = Heap::empty();
-
-use riscv as _;
-
-#[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    loop {}
-}
+use lambda_vm_syscalls as syscalls;
 
 pub fn u256_from_big_endian(slice: &[u8]) -> U256 {
     let mut padded = [0u8; 32];
@@ -43,14 +31,7 @@ pub fn u256_to_big_endian(value: U256) -> [u8; 32] {
 
 #[unsafe(export_name = "main")]
 pub fn main() -> u8 {
-    {
-        use core::mem::MaybeUninit;
-        use core::ptr::addr_of_mut;
-        const HEAP_SIZE: usize = 1024;
-        static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
-        let heap_ptr = addr_of_mut!(HEAP_MEM) as *mut u8;
-        unsafe { HEAP.init(heap_ptr as usize, HEAP_SIZE) }
-    }
+    syscalls::allocator::init_allocator();
     
     let a = u256_to_big_endian(U256::one());
     let b = U256::one().to_big_endian();

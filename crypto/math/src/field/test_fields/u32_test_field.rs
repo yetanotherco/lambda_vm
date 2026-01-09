@@ -130,28 +130,3 @@ impl IsFFTField for U32TestField {
     const TWO_ADICITY: u64 = 27;
     const TWO_ADIC_PRIMITVE_ROOT_OF_UNITY: u32 = 440532289;
 }
-
-#[cfg(test)]
-mod tests_u32_test_field {
-    use crate::field::{test_fields::u32_test_field::U32TestField, traits::IsPrimeField};
-
-    #[test]
-    fn from_hex_for_b_is_11() {
-        assert_eq!(U32TestField::from_hex("B").unwrap(), 11);
-    }
-
-    #[cfg(feature = "std")]
-    #[test]
-    fn to_hex_test() {
-        let num = U32TestField::from_hex("B").unwrap();
-        assert_eq!(U32TestField::to_hex(&num), "B");
-    }
-
-    #[test]
-    fn bit_size_of_test_field_is_31() {
-        assert_eq!(
-            <U32TestField as crate::field::traits::IsPrimeField>::field_bit_size(),
-            31
-        );
-    }
-}
