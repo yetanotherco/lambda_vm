@@ -164,6 +164,13 @@ output = "n_sub_r"
 ref = "dvrm:c:n_sub_r"
 
 [[constraints.defs]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "n_sub_r", "i"]]
+range = ["i", 0, 3]
+ref = "dvrm:c:n_sub_r_range"
+
+[[constraints.defs]]
 kind = "template"
 tag = "SIGN"
 input = [["idx", "n_sub_r", 3], "signed"]
