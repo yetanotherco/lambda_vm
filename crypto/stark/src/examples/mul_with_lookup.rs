@@ -22,7 +22,6 @@ pub fn new_mul_air_with_lookup(
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
 
     let step_size = 1;
-    let trace_layout = (4, 2);
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![
@@ -41,7 +40,6 @@ pub fn new_mul_air_with_lookup(
         auxiliary_trace_build_data,
         proof_options,
         step_size,
-        trace_layout,
         transition_constraints,
     )
 }

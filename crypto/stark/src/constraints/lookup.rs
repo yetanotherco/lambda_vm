@@ -46,7 +46,6 @@ impl<
         auxiliary_trace_build_data: AuxiliaryTraceBuildData,
         proof_options: &ProofOptions,
         step_size: usize,
-        trace_layout: (usize, usize),
         mut transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
     ) -> Self {
         // Add a transition constraint for each auxiliary column representing a table interaction
@@ -64,19 +63,24 @@ impl<
             auxiliary_trace_build_data.interactions.len(),
         );
         transition_constraints.push(Box::new(grand_sum_constraint));
+
+        // Create Layout
+        // one aux column per lookup interaction + 1 aux column for grand sum
+        let num_aux_columns = auxiliary_trace_build_data.interactions.len() + 1;
+        let trace_layout = (trace.num_main_columns, num_aux_columns);
+
         // Create context
         let context = AirContext {
             proof_options: proof_options.clone(),
-            // trace_columns = main columns + one aux column per lookup interaction + 1 aux column for grand sum
-            trace_columns: trace.num_main_columns
-                + auxiliary_trace_build_data.interactions.len()
-                + 1,
+            trace_columns: trace_layout.0 + trace_layout.1,
             // All lookup transition constraints will evaluate at most 2 rows at a time
             transition_offsets: vec![0, 1],
             num_transition_constraints: transition_constraints.len(),
         };
+
         // Create public inputs
         let pub_inputs = LookUpPublicInputs::from_trace(trace, &auxiliary_trace_build_data);
+
         Self {
             context,
             trace_length: trace.num_rows(),
