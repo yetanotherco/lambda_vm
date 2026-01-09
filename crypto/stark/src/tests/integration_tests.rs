@@ -526,7 +526,7 @@ type ExtFE = FieldElement<Degree4BabyBearExtensionField>;
 #[test_log::test]
 fn test_multi_airs_log_up() {
     // CPU Trace
-    // ADD | MUL | a | b  | c   | aux add | aux mul | aux total ?
+    // ADD | MUL | a | b  | c   | aux add | aux mul | aux total
     // 1   | 0   | 1 | 10 | 11  | 0       | 0       | 0
     // 0   | 1   | 2 | 20 | 40  | 0       | 0       | 0
     // 1   | 0   | 3 | 30 | 33  | 0       | 0       | 0
@@ -594,34 +594,34 @@ fn test_multi_airs_log_up() {
     let mut cpu_trace = TraceTable::from_columns(main_columns, aux_columns, 1);
 
     // ADD Trace
-    // a | b  | c  | m | aux cpu | aux total
-    // 1 | 10 | 11 | 1 |  0       | 0
-    // 3 | 30 | 33 | 1 |  0       | 0
-    // 5 | 50 | 55 | 1 |  0       | 0
-    // 6 | 60 | 66 | 1 |  0       | 0
+    // a | b  | c  | m | aux cpu
+    // 1 | 10 | 11 | 1 |  0
+    // 3 | 30 | 33 | 1 |  0
+    // 5 | 50 | 55 | 1 |  0
+    // 6 | 60 | 66 | 1 |  0
     let a_column = vec![FE::from(1), FE::from(3), FE::from(5), FE::from(6)];
     let b_column = vec![FE::from(10), FE::from(30), FE::from(50), FE::from(60)];
     let c_column = vec![FE::from(11), FE::from(33), FE::from(55), FE::from(66)];
     let m_column = vec![FE::one(), FE::one(), FE::one(), FE::one()];
     let mut add_trace = TraceTable::from_columns(
         vec![a_column, b_column, c_column, m_column],
-        vec![vec![ExtFE::zero(); 4], vec![ExtFE::zero(); 4]],
+        vec![vec![ExtFE::zero(); 4]],
         1,
     );
 
     // MUL Trace
-    // a | b  | c   | m | aux cpu | aux total
-    // 2 | 20 | 40  | 1 |   0       | 0
-    // 4 | 40 | 160 | 1 |   0       | 0
-    // 7 | 70 | 490 | 1 |   0       | 0
-    // 8 | 80 | 640 | 1 |   0       | 0
+    // a | b  | c   | m | aux cpu
+    // 2 | 20 | 40  | 1 |   0
+    // 4 | 40 | 160 | 1 |   0
+    // 7 | 70 | 490 | 1 |   0
+    // 8 | 80 | 640 | 1 |   0
     let a_column = vec![FE::from(2), FE::from(4), FE::from(7), FE::from(8)];
     let b_column = vec![FE::from(20), FE::from(40), FE::from(70), FE::from(80)];
     let c_column = vec![FE::from(40), FE::from(160), FE::from(490), FE::from(640)];
     let m_column = vec![FE::one(), FE::one(), FE::one(), FE::one()];
     let mut mul_trace = TraceTable::from_columns(
         vec![a_column, b_column, c_column, m_column],
-        vec![vec![ExtFE::zero(); 4], vec![ExtFE::zero(); 4]],
+        vec![vec![ExtFE::zero(); 4]],
         1,
     );
 

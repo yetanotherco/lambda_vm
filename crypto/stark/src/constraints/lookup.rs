@@ -57,16 +57,19 @@ impl<
             );
             transition_constraints.push(Box::new(constraint));
         }
-        // Add a transition constraint for the grand sum auxiliary constraint (sum of all previous aux columns)
-        let grand_sum_constraint = LookupGrandSumTransitionConstraint::new(
-            transition_constraints.len(),
-            auxiliary_trace_build_data.interactions.len(),
-        );
-        transition_constraints.push(Box::new(grand_sum_constraint));
+        // Add a transition constraint for the grand sum auxiliary constraint (sum of all previous aux columns) if we have more than one interaction
+        if auxiliary_trace_build_data.interactions.len() > 1 {
+            let grand_sum_constraint = LookupGrandSumTransitionConstraint::new(
+                transition_constraints.len(),
+                auxiliary_trace_build_data.interactions.len(),
+            );
+            transition_constraints.push(Box::new(grand_sum_constraint));
+        }
 
         // Create Layout
-        // one aux column per lookup interaction + 1 aux column for grand sum
-        let num_aux_columns = auxiliary_trace_build_data.interactions.len() + 1;
+        // one aux column per lookup interaction + 1 aux column for grand sum (if we have more than one interaction)
+        let num_aux_columns = auxiliary_trace_build_data.interactions.len()
+            + (auxiliary_trace_build_data.interactions.len() > 1) as usize;
         let trace_layout = (trace.num_main_columns, num_aux_columns);
 
         // Create context
@@ -118,9 +121,8 @@ where
     where
         Self: Sized,
     {
-        // Each individual Air should implement their own constructor
-        // ie: instead of using BitFlagAir::new we should use new_bitflag_air() -> Air
-        unreachable!("THIS SHOULD NO LONGER BE USED")
+        // AirWithLookup should be created using `create` method
+        unreachable!("AirWithLookUp should only be created by `create` method")
     }
 
     fn trace_layout(&self) -> (usize, usize) {
@@ -160,11 +162,13 @@ where
         {
             build_auxiliary_trace_column(aux_column_idx, aux_column_build_data, trace, challenges);
         }
-        // Build grand sum auxiliary column
+        // Build grand sum auxiliary column (if we have more than 1 interaction)
         let grand_sum_aux_idx = self.auxiliary_trace_build_data.interactions.len();
-        for i in 0..trace.num_rows() {
-            let grand_sum = trace.columns_aux().iter().map(|col| col[i].clone()).sum();
-            trace.set_aux(i, grand_sum_aux_idx, grand_sum)
+        if grand_sum_aux_idx > 1 {
+            for i in 0..trace.num_rows() {
+                let grand_sum = trace.columns_aux().iter().map(|col| col[i].clone()).sum();
+                trace.set_aux(i, grand_sum_aux_idx, grand_sum)
+            }
         }
     }
 
@@ -176,6 +180,7 @@ where
         // TODO: rap challenges should be built beforehand for each interaction pair, not built here
         // Toy values used for intial testing
         vec![FieldElement::one(), FieldElement::one()]
+        // unreachable!("AirWithLookUp should not create their own rap challenges")
     }
     fn boundary_constraints(&self, rap_challenges: &[FieldElement<E>]) -> BoundaryConstraints<E> {
         let mut boundary_constraints = vec![];
