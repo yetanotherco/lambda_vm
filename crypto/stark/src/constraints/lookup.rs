@@ -460,13 +460,13 @@ where
                 let coeffs: Vec<FieldElement<E>> =
                     (0..values.len()).map(|i| alpha.pow(i)).collect();
 
-                // fingerprint = v[0] * alpha^0 + v[1] * alpha^1 +...+ value[n] * alpha^n + z
+                // fingerprint = z - (v[0] * alpha^0 + v[1] * alpha^1 +...+ value[n] * alpha^n)
                 // Where v are the values for each row and n the number of value columns
-                let fingerprint: FieldElement<E> = values
+                let fingerprint: FieldElement<E> = (-values
                     .iter()
                     .zip(coeffs.iter())
                     .map(|(v, coeff)| *v * coeff)
-                    .sum::<FieldElement<E>>()
+                    .sum::<FieldElement<E>>())
                     + z.clone();
 
                 // We are using the following LogUp equation:
