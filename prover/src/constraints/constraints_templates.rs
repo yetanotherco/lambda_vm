@@ -718,6 +718,7 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
             } => {
                 let bit_constraint =
                     self.compute_add_four_carry_bit_constraint(frame.get_evaluation_step(0));
+                println!("Bit constraint: {:?}", bit_constraint);
                 transition_evaluations[self.constraint_idx()] = bit_constraint.to_extension();
             }
 

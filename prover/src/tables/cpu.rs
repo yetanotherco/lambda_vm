@@ -13,7 +13,7 @@ use stark::trace::TraceTable;
 
 type FE = FieldElement<Babybear31PrimeField>;
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct CpuTableRow {
     pub timestamp: [FE; 2],
     pub pc: [FE; 2],
@@ -431,7 +431,13 @@ pub fn cpu_trace_from_logs(
         .enumerate()
         .flat_map(|(i, log)| {
             let timestamp = (i * 4) as u32;
-            CpuTableRow::from_log(log, timestamp).to_vec()
+            println!(
+                "Log instruction: {:?} - Current PC: {:?} - Next PC: {:?}",
+                log.instruction, log.current_pc, log.next_pc
+            );
+            let row = CpuTableRow::from_log(log, timestamp);
+            println!("Row: {:?}", row);
+            row.to_vec()
         })
         .collect();
 
