@@ -525,22 +525,18 @@ where
     ) {
         match evaluation_context {
             TransitionEvaluationContext::Prover { frame, .. } => {
-                let first_step = frame.get_evaluation_step(0);
-                let second_step = frame.get_evaluation_step(1);
+                let step = frame.get_evaluation_step(0);
 
                 // Auxiliary frame elements
-                let grand_sum_0 = first_step.get_aux_evaluation_element(0, self.interaction_amount);
-                let grand_sum_1 =
-                    second_step.get_aux_evaluation_element(0, self.interaction_amount);
+                let grand_sum = step.get_aux_evaluation_element(0, dbg!(self.interaction_amount));
 
                 let interaction_values_sum: FieldElement<E> = (0..self.interaction_amount)
-                    .map(|i| first_step.get_aux_evaluation_element(0, i).clone())
+                    .map(|i| step.get_aux_evaluation_element(0, dbg!(i)).clone())
                     .sum();
 
-                // Check that the grand sum on the second row is equal to the grand_sum on the second row + the sum of all other auxiliary columns in the first row
+                // Check that the grand sum is equal to the sum of all other auxiliary columns in the same row
                 // Aka that we correctly built the grand sum auxiliary column
-
-                let res = grand_sum_1 - grand_sum_0 - interaction_values_sum;
+                let res = grand_sum - interaction_values_sum;
 
                 // The eval always exists, except if the constraint idx were incorrectly defined.
                 if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx) {
@@ -549,22 +545,18 @@ where
             }
 
             TransitionEvaluationContext::Verifier { frame, .. } => {
-                let first_step = frame.get_evaluation_step(0);
-                let second_step = frame.get_evaluation_step(1);
+                let step = frame.get_evaluation_step(0);
 
                 // Auxiliary frame elements
-                let grand_sum_0 = first_step.get_aux_evaluation_element(0, self.interaction_amount);
-                let grand_sum_1 =
-                    second_step.get_aux_evaluation_element(0, self.interaction_amount);
+                let grand_sum = step.get_aux_evaluation_element(0, dbg!(self.interaction_amount));
 
                 let interaction_values_sum: FieldElement<E> = (0..self.interaction_amount)
-                    .map(|i| first_step.get_aux_evaluation_element(0, i).clone())
+                    .map(|i| step.get_aux_evaluation_element(0, dbg!(i)).clone())
                     .sum();
 
-                // Check that the grand sum on the second row is equal to the grand_sum on the second row + the sum of all other auxiliary columns in the first row
+                // Check that the grand sum is equal to the sum of all other auxiliary columns in the same row
                 // Aka that we correctly built the grand sum auxiliary column
-
-                let res = grand_sum_1 - grand_sum_0 - interaction_values_sum;
+                let res = grand_sum - interaction_values_sum;
 
                 // The eval always exists, except if the constraint idx were incorrectly defined.
                 if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx) {
