@@ -71,7 +71,7 @@
         (
           [],
           [],              
-          expr_to_math((":=", "  ", poly.poly)),
+          table.cell(inset: (left: 1.5em), expr_to_math((":=", "", poly.poly))),
           render_def_range(def.idx, poly.range), 
         )
       }
@@ -134,7 +134,7 @@
     let index = if "range" in assumption { "." + assumption.range.at(0) } else { "" }
     let lbl = [#chip.name\-A]
     show figure: (it) => align(left, block[#lbl#context it.counter.display()#index])
-    cref(assumption)[#figure(kind: "assumption", numbering: (i) => [#lbl#i#index], supplement: [], [])]
+    cref(assumption)[#figure(kind: chip.name + "assumption", numbering: (i) => [#lbl#i], supplement: [], [])]
   }
 
   figure(table(
@@ -160,6 +160,7 @@
     groups = (groups,)
   }
   assert(groups.all(group => group in all_groups), message: "unknown group")
+  let selected_constraints = groups.map(g => ((g): chip.constraints.at(g))).join()
 
   // Find the group definition in the constraint_groups
   let lookup_group(name) = chip.constraint_groups.filter((g) => g.name == name).at(0, default: (name: name))
@@ -170,7 +171,7 @@
     let prefix = if "prefix" in group { group.prefix }
     let lbl = [#chip.name\-C#prefix]
     show figure: (it) => align(left, block[#lbl#context it.counter.display()#index])
-    cref(constraint)[#figure(kind: "constraint", numbering: (i) => [#lbl#i#index], supplement: [], [])]
+    cref(constraint)[#figure(kind: chip.name + "constraint", numbering: (i) => [#lbl#i], supplement: [], [])]
   }
 
   /// Generates a representation of `constraint`
@@ -220,16 +221,29 @@
     (table.cell(align: right, colspan: 2, [_description_]), eval(constraint.desc, mode: "markup"), [])
   }
 
+  // Whether there is at least one constraint with a range
+  // This can be used to see whether the "Range" label should be displayed
+  let do_display_range = selected_constraints.values().flatten().any(x => "range" in x)
+
+  // Whether there is at least one constraint with a multiplicity
+  // This can be used to see whether the "Multiplicity" label should be displayed
+  let do_display_multiplicity = selected_constraints.values().flatten().any(x => "multiplicity" in x)
+
   show figure: set block(breakable: true)
   figure(table(
     columns: (auto, auto, 1fr, auto),
     inset: 6pt,
     align: (top + left, top + left, top + left, top + center),
     stroke: none,
-    table.header([*Tag*], [*Range*], [*Description*], [*Multiplicity*]),
+    table.header(
+      [*Tag*], 
+      if do_display_range {[*Range*]} else {[]}, 
+      [*Description*], 
+      if do_display_multiplicity {[*Multiplicity*]} else {[]},
+    ),
     table.hline(stroke: stroke(thickness: 2pt)),
-    ..for group in groups {
-      for constraint in chip.constraints.at(group) {
+    ..for (group, group_constraints) in selected_constraints.pairs() {
+      for constraint in group_constraints {
         (
           [#tag(constraint, lookup_group(group))],
           [#interval(constraint)],
@@ -243,6 +257,6 @@
           render_polynomial_constraints(constraint)
         }
       }
-    },
+    }
   ), caption: [Constraint overview of #chip.name chip.])
 }

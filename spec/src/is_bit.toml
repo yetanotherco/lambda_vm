@@ -1,0 +1,20 @@
+name = "IS_BIT"
+
+[[variables.condition]]
+name = "cond"
+type = "BaseField"
+desc = "Whether the constraint should be applied ($eq.not 0$) or not ($0$)."
+
+[[variables.input]]
+name = "X"
+type = "BaseField"
+desc = "Value for which to assert that it lies in the range ${0, 1}$."
+
+[[constraint_groups]]
+name = "all"
+
+[[constraints.all]]
+kind = "arith"
+constraint = "$#`cond` => #`X` (1-#`X`) = 0$"
+poly = ["*", "cond", "X", ["not", "X"]]
+ref = "isbit:c:isbit"

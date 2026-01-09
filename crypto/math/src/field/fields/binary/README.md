@@ -76,7 +76,7 @@ The method `new` handles possible overflows in this way:
 - If the value input doesn't fit in the level given, then we take just the less significant bits that fit in that level and set it as the element's `value`.
 
 ```rust
-use lambdaworks_math::field::fields::binary::field::TowerFieldElement;
+use math::field::fields::binary::field::TowerFieldElement;
 
 // Create elements at different tower levels
 let element_level_0 = TowerFieldElement::new(1, 0);  // Element '1' in GF(2)
@@ -96,7 +96,7 @@ let from_u64 = TowerFieldElement::from(42u64);
 ### Basic Operations
 
 ```rust
-use lambdaworks_math::field::fields::binary::field::TowerFieldElement;
+use math::field::fields::binary::field::TowerFieldElement;
 
 // Create two elements
 let a = TowerFieldElement::new(5, 2);  // '0101' in GF(2^4)
@@ -122,7 +122,7 @@ let a_cubed = a.pow(3);
 ### Working with Different Levels
 
 ```rust
-use lambdaworks_math::field::fields::binary::field::TowerFieldElement;
+use math::field::fields::binary::field::TowerFieldElement;
 
 // Elements at different levels
 let a = TowerFieldElement::new(3, 1);  // Level 1: GF(2^2)
