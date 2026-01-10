@@ -139,6 +139,53 @@ inline void butterfly_radix2(
     b = new_b;
 }
 
+/// Radix-4 butterfly: processes 4 elements in one operation
+/// Reduces number of stages by half compared to radix-2
+///
+/// This matches the CPU implementation in fft.rs:
+/// - w1 = twiddles[group]
+/// - w2 = twiddles[2 * group]
+/// - w3 = twiddles[2 * group + 1]
+///
+/// Butterfly formula:
+/// zw1 = w1 * z
+/// tw1 = w1 * t
+/// a = w2 * (y + tw1)
+/// b = w3 * (y - tw1)
+/// x' = x + zw1 + a
+/// y' = x + zw1 - a
+/// z' = x - zw1 + b
+/// t' = x - zw1 - b
+inline void butterfly_radix4(
+    thread ulong& x,    // input[i]
+    thread ulong& y,    // input[i + group_size/4]
+    thread ulong& z,    // input[i + group_size/2]
+    thread ulong& t,    // input[i + 3*group_size/4]
+    ulong w1,           // twiddles[group]
+    ulong w2,           // twiddles[2 * group]
+    ulong w3            // twiddles[2 * group + 1]
+) {
+    // Compute intermediate values
+    ulong zw1 = goldilocks_mul(w1, z);
+    ulong tw1 = goldilocks_mul(w1, t);
+
+    ulong y_plus_tw1 = goldilocks_add(y, tw1);
+    ulong y_minus_tw1 = goldilocks_sub(y, tw1);
+
+    ulong a = goldilocks_mul(w2, y_plus_tw1);
+    ulong b = goldilocks_mul(w3, y_minus_tw1);
+
+    // Compute x + zw1 and x - zw1 (reused in outputs)
+    ulong x_plus_zw1 = goldilocks_add(x, zw1);
+    ulong x_minus_zw1 = goldilocks_sub(x, zw1);
+
+    // Compute outputs
+    x = goldilocks_add(x_plus_zw1, a);   // x' = x + zw1 + a
+    y = goldilocks_sub(x_plus_zw1, a);   // y' = x + zw1 - a
+    z = goldilocks_add(x_minus_zw1, b);  // z' = x - zw1 + b
+    t = goldilocks_sub(x_minus_zw1, b);  // t' = x - zw1 - b
+}
+
 // =============================================================================
 // FFT Kernels
 // =============================================================================
@@ -191,6 +238,68 @@ kernel void fft_radix2_stage(
     // Store results
     data[i] = a;
     data[i_half] = b;
+}
+
+/// Single stage of radix-4 FFT (equivalent to two radix-2 stages)
+/// Each thread handles one radix-4 butterfly (4 elements)
+///
+/// This matches the CPU implementation twiddle indexing:
+/// - w1 = twiddles[group]
+/// - w2 = twiddles[2 * group]
+/// - w3 = twiddles[2 * group + 1]
+///
+/// Parameters:
+///   - data: Input/output buffer of field elements
+///   - twiddles: Pre-computed twiddle factors (bit-reversed order)
+///   - n: Total number of elements
+///   - group_count: Number of radix-4 groups in this stage
+///   - group_size: Size of each group (must be multiple of 4)
+kernel void fft_radix4_stage(
+    device ulong* data [[buffer(0)]],
+    device const ulong* twiddles [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    constant uint& group_count [[buffer(3)]],
+    constant uint& group_size [[buffer(4)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    // Each thread handles one radix-4 butterfly (4 elements)
+    uint butterflies_per_group = group_size / 4;
+    uint total_butterflies = group_count * butterflies_per_group;
+
+    if (tid >= total_butterflies) {
+        return;
+    }
+
+    // Determine which group and position within group
+    uint group = tid / butterflies_per_group;
+    uint pos = tid % butterflies_per_group;
+
+    // Calculate indices for the 4 elements (matching CPU indexing)
+    uint first_in_group = group * group_size;
+    uint i = first_in_group + pos;
+    uint j = i + group_size / 4;
+    uint k = i + group_size / 2;
+    uint l = i + 3 * group_size / 4;
+
+    // Get twiddle factors (matching CPU: twiddles[group], twiddles[2*group], twiddles[2*group+1])
+    ulong w1 = twiddles[group];
+    ulong w2 = twiddles[2 * group];
+    ulong w3 = twiddles[2 * group + 1];
+
+    // Load values
+    ulong x = data[i];
+    ulong y = data[j];
+    ulong z = data[k];
+    ulong t = data[l];
+
+    // Perform radix-4 butterfly
+    butterfly_radix4(x, y, z, t, w1, w2, w3);
+
+    // Store results
+    data[i] = x;
+    data[j] = y;
+    data[k] = z;
+    data[l] = t;
 }
 
 /// Bit-reverse permutation kernel
@@ -362,4 +471,64 @@ kernel void test_butterfly(
 
     a_vals[tid] = a;
     b_vals[tid] = b;
+}
+
+// =============================================================================
+// Stockham FFT - Auto-sort algorithm with better memory access patterns
+// =============================================================================
+
+/// Stockham radix-2 FFT stage (out-of-place, self-sorting)
+/// This algorithm avoids the need for bit-reversal permutation and has
+/// more coalesced memory access patterns suitable for GPUs.
+///
+/// Input is read from src, output is written to dst.
+/// After all stages, result is in natural order.
+kernel void fft_stockham_stage(
+    device const ulong* src [[buffer(0)]],
+    device ulong* dst [[buffer(1)]],
+    device const ulong* twiddles [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    constant uint& stage [[buffer(4)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= n / 2) {
+        return;
+    }
+
+    // Compute butterfly indices for Stockham FFT
+    // At stage s (0-indexed), butterflies process elements with stride 2^s
+    uint butterfly_size = 1u << (stage + 1);
+    uint half_size = 1u << stage;
+
+    // Thread tid handles the tid-th butterfly
+    // Determine which butterfly and position within butterfly
+    uint butterfly_idx = tid / half_size;
+    uint pos_in_butterfly = tid % half_size;
+
+    // Source indices (contiguous read for better coalescing)
+    uint src_even = butterfly_idx * half_size + pos_in_butterfly;
+    uint src_odd = src_even + (n / 2);
+
+    // Destination indices (interleaved write)
+    uint dst_base = butterfly_idx * butterfly_size + pos_in_butterfly;
+    uint dst_lo = dst_base;
+    uint dst_hi = dst_base + half_size;
+
+    // Get twiddle factor
+    // For Stockham FFT, twiddle index is pos_in_butterfly * (n / butterfly_size)
+    uint twiddle_idx = pos_in_butterfly * (n / butterfly_size);
+    ulong w = twiddles[twiddle_idx];
+
+    // Load values
+    ulong a = src[src_even];
+    ulong b = src[src_odd];
+
+    // Butterfly: (a, b) -> (a + w*b, a - w*b)
+    ulong wb = goldilocks_mul(w, b);
+    ulong sum = goldilocks_add(a, wb);
+    ulong diff = goldilocks_sub(a, wb);
+
+    // Store results
+    dst[dst_lo] = sum;
+    dst[dst_hi] = diff;
 }

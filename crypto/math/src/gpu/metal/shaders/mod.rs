@@ -8,10 +8,12 @@ use metal::{ComputePipelineState, Device, Library};
 
 /// Names of the kernel functions in the Metal shader
 pub const KERNEL_FFT_RADIX2_STAGE: &str = "fft_radix2_stage";
+pub const KERNEL_FFT_RADIX4_STAGE: &str = "fft_radix4_stage";
 pub const KERNEL_BIT_REVERSE_PERMUTE: &str = "bit_reverse_permute";
 pub const KERNEL_GENERATE_TWIDDLES: &str = "generate_twiddles";
 pub const KERNEL_FFT_RADIX2_SMALL: &str = "fft_radix2_small";
 pub const KERNEL_CANONICALIZE: &str = "canonicalize_buffer";
+pub const KERNEL_FFT_STOCKHAM_STAGE: &str = "fft_stockham_stage";
 pub const KERNEL_TEST_MULTIPLY: &str = "test_multiply";
 pub const KERNEL_TEST_ADD: &str = "test_add";
 pub const KERNEL_TEST_BUTTERFLY: &str = "test_butterfly";
@@ -20,6 +22,8 @@ pub const KERNEL_TEST_BUTTERFLY: &str = "test_butterfly";
 pub struct FFTPipelines {
     /// Pipeline for single FFT stage (radix-2)
     pub fft_radix2_stage: ComputePipelineState,
+    /// Pipeline for single FFT stage (radix-4)
+    pub fft_radix4_stage: ComputePipelineState,
     /// Pipeline for bit-reverse permutation
     pub bit_reverse_permute: ComputePipelineState,
     /// Pipeline for twiddle factor generation
@@ -28,6 +32,8 @@ pub struct FFTPipelines {
     pub fft_radix2_small: ComputePipelineState,
     /// Pipeline for canonicalization
     pub canonicalize: ComputePipelineState,
+    /// Pipeline for Stockham FFT stage (auto-sorting, out-of-place)
+    pub fft_stockham_stage: ComputePipelineState,
 }
 
 impl FFTPipelines {
@@ -35,10 +41,12 @@ impl FFTPipelines {
     pub fn new(device: &Device, library: &Library) -> Result<Self, MetalError> {
         Ok(Self {
             fft_radix2_stage: create_pipeline(device, library, KERNEL_FFT_RADIX2_STAGE)?,
+            fft_radix4_stage: create_pipeline(device, library, KERNEL_FFT_RADIX4_STAGE)?,
             bit_reverse_permute: create_pipeline(device, library, KERNEL_BIT_REVERSE_PERMUTE)?,
             generate_twiddles: create_pipeline(device, library, KERNEL_GENERATE_TWIDDLES)?,
             fft_radix2_small: create_pipeline(device, library, KERNEL_FFT_RADIX2_SMALL)?,
             canonicalize: create_pipeline(device, library, KERNEL_CANONICALIZE)?,
+            fft_stockham_stage: create_pipeline(device, library, KERNEL_FFT_STOCKHAM_STAGE)?,
         })
     }
 }
