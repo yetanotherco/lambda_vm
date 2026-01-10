@@ -28,6 +28,8 @@ pub enum MetalError {
     TwiddleGenerationFailed(String),
     /// Data transfer failed
     DataTransferFailed(String),
+    /// Invalid input
+    InvalidInput(String),
 }
 
 impl fmt::Display for MetalError {
@@ -65,6 +67,9 @@ impl fmt::Display for MetalError {
             }
             MetalError::DataTransferFailed(msg) => {
                 write!(f, "Data transfer failed: {}", msg)
+            }
+            MetalError::InvalidInput(msg) => {
+                write!(f, "Invalid input: {}", msg)
             }
         }
     }

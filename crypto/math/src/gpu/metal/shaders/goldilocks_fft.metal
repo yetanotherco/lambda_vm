@@ -474,6 +474,228 @@ kernel void test_butterfly(
 }
 
 // =============================================================================
+// Poseidon2 Hash Function for Merkle Trees
+// =============================================================================
+
+// Poseidon2 parameters for Goldilocks width 8
+constant uint POSEIDON2_WIDTH = 8;
+constant uint POSEIDON2_EXTERNAL_ROUNDS_BEGIN = 4;
+constant uint POSEIDON2_EXTERNAL_ROUNDS_END = 4;
+constant uint POSEIDON2_INTERNAL_ROUNDS = 22;
+
+// Diagonal elements for internal diffusion matrix
+constant ulong MATRIX_DIAG_8[8] = {
+    0xa98811a1fed4e3a5UL, 0x1cc48b54f377e2a0UL,
+    0xe40cd4f6c5609a26UL, 0x11de79ebca97a4a3UL,
+    0x9177c73d8b7e929cUL, 0x2a6fe8085797e791UL,
+    0x3de6e93329f8d5adUL, 0x3f7af9125da962feUL
+};
+
+// External round constants - initial 4 rounds
+constant ulong EXT_RC_INIT[4][8] = {
+    { 0xdd5743e7f2a5a5d9UL, 0xcb3a864e58ada44bUL, 0xffa2449ed32f8cdcUL, 0x42025f65d6bd13eeUL,
+      0x7889175e25506323UL, 0x34b98bb03d24b737UL, 0xbdcc535ecc4faa2aUL, 0x5b20ad869fc0d033UL },
+    { 0xf1dda5b9259dfcb4UL, 0x27515210be112d59UL, 0x4227d1718c766c3fUL, 0x26d333161a5bd794UL,
+      0x49b938957bf4b026UL, 0x4a56b5938b213669UL, 0x1120426b48c8353dUL, 0x6b323c3f10a56cadUL },
+    { 0xce57d6245ddca6b2UL, 0xb1fc8d402bba1eb1UL, 0xb5c5096ca959bd04UL, 0x6db55cd306d31f7fUL,
+      0xc49d293a81cb9641UL, 0x1ce55a4fe979719fUL, 0xa92e60a9d178a4d1UL, 0x002cc64973bcfd8cUL },
+    { 0xcea721cce82fb11bUL, 0xe5b55eb8098ece81UL, 0x4e30525c6f1ddd66UL, 0x43c6702827070987UL,
+      0xaca68430a7b5762aUL, 0x3674238634df9c93UL, 0x88cee1c825e33433UL, 0xde99ae8d74b57176UL }
+};
+
+// External round constants - terminal 4 rounds
+constant ulong EXT_RC_TERM[4][8] = {
+    { 0x014ef1197d341346UL, 0x9725e20825d07394UL, 0xfdb25aef2c5bae3bUL, 0xbe5402dc598c971eUL,
+      0x93a5711f04cdca3dUL, 0xc45a9a5b2f8fb97bUL, 0xfe8946a924933545UL, 0x2af997a27369091cUL },
+    { 0xaa62c88e0b294011UL, 0x058eb9d810ce9f74UL, 0xb3cb23eced349ae4UL, 0xa3648177a77b4a84UL,
+      0x43153d905992d95dUL, 0xf4e2a97cda44aa4bUL, 0x5baa2702b908682fUL, 0x082923bdf4f750d1UL },
+    { 0x98ae09a325893803UL, 0xf8a6475077968838UL, 0xceb0735bf00b2c5fUL, 0x0a1a5d953888e072UL,
+      0x2fcb190489f94475UL, 0xb5be06270dec69fcUL, 0x739cb934b09acf8bUL, 0x537750b75ec7f25bUL },
+    { 0xe9dd318bae1f3961UL, 0xf7462137299efe1aUL, 0xb1f6b8eee9adb940UL, 0xbdebcc8a809dfe6bUL,
+      0x40fc1f791b178113UL, 0x3ac1c3362d014864UL, 0x9a016184bdb8aebaUL, 0x95f2394459fbc25eUL }
+};
+
+// Internal round constants (22 values)
+constant ulong INT_RC[22] = {
+    0x488897d85ff51f56UL, 0x1140737ccb162218UL, 0xa7eeb9215866ed35UL, 0x9bd2976fee49fcc9UL,
+    0xc0c8f0de580a3fccUL, 0x4fb2dae6ee8fc793UL, 0x343a89f35f37395bUL, 0x223b525a77ca72c8UL,
+    0x56ccb62574aaa918UL, 0xc4d507d8027af9edUL, 0xa080673cf0b7e95cUL, 0xf0184884eb70dcf8UL,
+    0x044f10b0cb3d5c69UL, 0xe9e3f7993938f186UL, 0x1b761c80e772f459UL, 0x606cec607a1b5facUL,
+    0x14a0c2e1d45f03cdUL, 0x4eace8855398574fUL, 0xf905ca7103eff3e6UL, 0xf8c8f8d20862c059UL,
+    0xb524fe8bdd678e5aUL, 0xfbb7865901a1ec41UL
+};
+
+/// Poseidon2 S-box: x^7
+inline ulong poseidon2_sbox(ulong x) {
+    ulong x2 = goldilocks_mul(x, x);
+    ulong x4 = goldilocks_mul(x2, x2);
+    ulong x6 = goldilocks_mul(x4, x2);
+    return goldilocks_mul(x6, x);
+}
+
+/// Apply Horizen Labs 4x4 MDS matrix to 4 elements
+/// Matrix: [[5,7,1,3], [4,6,1,1], [1,3,5,7], [1,1,4,6]]
+inline void apply_hl_mat4(thread ulong* x) {
+    ulong t0 = goldilocks_add(x[0], x[1]);
+    ulong t1 = goldilocks_add(x[2], x[3]);
+    ulong x1_double = goldilocks_add(x[1], x[1]);
+    ulong x3_double = goldilocks_add(x[3], x[3]);
+    ulong t2 = goldilocks_add(x1_double, t1);
+    ulong t3 = goldilocks_add(x3_double, t0);
+    ulong t1_double = goldilocks_add(t1, t1);
+    ulong t4 = goldilocks_add(goldilocks_add(t1_double, t1_double), t3);
+    ulong t0_double = goldilocks_add(t0, t0);
+    ulong t5 = goldilocks_add(goldilocks_add(t0_double, t0_double), t2);
+    ulong t6 = goldilocks_add(t3, t5);
+    ulong t7 = goldilocks_add(t2, t4);
+
+    x[0] = t6;
+    x[1] = t5;
+    x[2] = t7;
+    x[3] = t4;
+}
+
+/// External linear layer for width 8
+inline void poseidon2_external_linear(thread ulong* state) {
+    // Apply HL M4 to each half
+    ulong first_half[4] = { state[0], state[1], state[2], state[3] };
+    ulong second_half[4] = { state[4], state[5], state[6], state[7] };
+
+    apply_hl_mat4(first_half);
+    apply_hl_mat4(second_half);
+
+    // Copy back
+    for (uint i = 0; i < 4; i++) {
+        state[i] = first_half[i];
+        state[i + 4] = second_half[i];
+    }
+
+    // Diffuse across halves
+    for (uint i = 0; i < 4; i++) {
+        ulong sum = goldilocks_add(state[i], state[i + 4]);
+        state[i] = goldilocks_add(state[i], sum);
+        state[i + 4] = goldilocks_add(state[i + 4], sum);
+    }
+}
+
+/// Internal linear layer: y[i] = diag[i] * x[i] + sum(x)
+inline void poseidon2_internal_linear(thread ulong* state) {
+    ulong sum = 0;
+    for (uint i = 0; i < POSEIDON2_WIDTH; i++) {
+        sum = goldilocks_add(sum, state[i]);
+    }
+    for (uint i = 0; i < POSEIDON2_WIDTH; i++) {
+        ulong diag_x = goldilocks_mul(MATRIX_DIAG_8[i], state[i]);
+        state[i] = goldilocks_add(diag_x, sum);
+    }
+}
+
+/// External round: ARC + Sbox (all) + Linear
+inline void poseidon2_external_round(thread ulong* state, const constant ulong* rc) {
+    for (uint i = 0; i < POSEIDON2_WIDTH; i++) {
+        state[i] = goldilocks_add(state[i], rc[i]);
+    }
+    for (uint i = 0; i < POSEIDON2_WIDTH; i++) {
+        state[i] = poseidon2_sbox(state[i]);
+    }
+    poseidon2_external_linear(state);
+}
+
+/// Internal round: ARC[0] + Sbox[0] + Linear
+inline void poseidon2_internal_round(thread ulong* state, ulong rc) {
+    state[0] = goldilocks_add(state[0], rc);
+    state[0] = poseidon2_sbox(state[0]);
+    poseidon2_internal_linear(state);
+}
+
+/// Full Poseidon2 permutation
+inline void poseidon2_permute(thread ulong* state) {
+    // Initial linear layer
+    poseidon2_external_linear(state);
+
+    // Initial external rounds
+    for (uint r = 0; r < POSEIDON2_EXTERNAL_ROUNDS_BEGIN; r++) {
+        poseidon2_external_round(state, EXT_RC_INIT[r]);
+    }
+
+    // Internal rounds
+    for (uint r = 0; r < POSEIDON2_INTERNAL_ROUNDS; r++) {
+        poseidon2_internal_round(state, INT_RC[r]);
+    }
+
+    // Terminal external rounds
+    for (uint r = 0; r < POSEIDON2_EXTERNAL_ROUNDS_END; r++) {
+        poseidon2_external_round(state, EXT_RC_TERM[r]);
+    }
+}
+
+/// Hash two field elements using Poseidon2 (for Merkle tree internal nodes)
+inline ulong poseidon2_compress(ulong left, ulong right) {
+    ulong state[8] = { left, right, 0, 0, 0, 0, 0, 2 }; // Domain separation = 2
+    poseidon2_permute(state);
+    return goldilocks_canonicalize(state[0]);
+}
+
+// =============================================================================
+// Merkle Tree Kernels
+// =============================================================================
+
+/// Hash leaves kernel: each thread hashes one leaf (single field element)
+kernel void merkle_hash_leaves(
+    device const ulong* input [[buffer(0)]],
+    device ulong* output [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= n) return;
+
+    // Hash single element using Poseidon2
+    ulong state[8] = { input[tid], 0, 0, 0, 0, 0, 0, 1 }; // Domain separation = 1
+    poseidon2_permute(state);
+    output[tid] = goldilocks_canonicalize(state[0]);
+}
+
+/// Build one level of Merkle tree: hash pairs of nodes
+kernel void merkle_build_level(
+    device const ulong* prev_level [[buffer(0)]],
+    device ulong* next_level [[buffer(1)]],
+    constant uint& num_pairs [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= num_pairs) return;
+
+    ulong left = prev_level[2 * tid];
+    ulong right = prev_level[2 * tid + 1];
+    next_level[tid] = poseidon2_compress(left, right);
+}
+
+/// Hash leaves in batches (multiple elements per leaf)
+/// Each thread handles one leaf which is a vector of field elements
+kernel void merkle_hash_leaf_batch(
+    device const ulong* input [[buffer(0)]],
+    device ulong* output [[buffer(1)]],
+    constant uint& num_leaves [[buffer(2)]],
+    constant uint& elements_per_leaf [[buffer(3)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= num_leaves) return;
+
+    uint start = tid * elements_per_leaf;
+
+    // Initialize state with domain separation based on input length
+    ulong state[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+
+    // Absorb elements (simple version: XOR into state)
+    for (uint i = 0; i < elements_per_leaf && i < 7; i++) {
+        state[i] = input[start + i];
+    }
+    state[7] = (ulong)elements_per_leaf; // Domain separation
+
+    poseidon2_permute(state);
+    output[tid] = goldilocks_canonicalize(state[0]);
+}
+
+// =============================================================================
 // Stockham FFT - Auto-sort algorithm with better memory access patterns
 // =============================================================================
 

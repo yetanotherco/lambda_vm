@@ -18,6 +18,11 @@ pub const KERNEL_TEST_MULTIPLY: &str = "test_multiply";
 pub const KERNEL_TEST_ADD: &str = "test_add";
 pub const KERNEL_TEST_BUTTERFLY: &str = "test_butterfly";
 
+// Merkle tree kernels (Poseidon2)
+pub const KERNEL_MERKLE_HASH_LEAVES: &str = "merkle_hash_leaves";
+pub const KERNEL_MERKLE_BUILD_LEVEL: &str = "merkle_build_level";
+pub const KERNEL_MERKLE_HASH_LEAF_BATCH: &str = "merkle_hash_leaf_batch";
+
 /// Container for all FFT compute pipelines.
 pub struct FFTPipelines {
     /// Pipeline for single FFT stage (radix-2)
@@ -47,6 +52,27 @@ impl FFTPipelines {
             fft_radix2_small: create_pipeline(device, library, KERNEL_FFT_RADIX2_SMALL)?,
             canonicalize: create_pipeline(device, library, KERNEL_CANONICALIZE)?,
             fft_stockham_stage: create_pipeline(device, library, KERNEL_FFT_STOCKHAM_STAGE)?,
+        })
+    }
+}
+
+/// Container for Merkle tree compute pipelines.
+pub struct MerklePipelines {
+    /// Pipeline for hashing leaves (single element per leaf)
+    pub hash_leaves: ComputePipelineState,
+    /// Pipeline for building tree levels (hash pairs)
+    pub build_level: ComputePipelineState,
+    /// Pipeline for hashing batched leaves (multiple elements per leaf)
+    pub hash_leaf_batch: ComputePipelineState,
+}
+
+impl MerklePipelines {
+    /// Create all Merkle tree pipelines from a compiled shader library.
+    pub fn new(device: &Device, library: &Library) -> Result<Self, MetalError> {
+        Ok(Self {
+            hash_leaves: create_pipeline(device, library, KERNEL_MERKLE_HASH_LEAVES)?,
+            build_level: create_pipeline(device, library, KERNEL_MERKLE_BUILD_LEVEL)?,
+            hash_leaf_batch: create_pipeline(device, library, KERNEL_MERKLE_HASH_LEAF_BATCH)?,
         })
     }
 }
