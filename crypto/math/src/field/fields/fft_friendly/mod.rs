@@ -21,6 +21,9 @@ pub mod u64_goldilocks_asm;
 /// Differential fuzzing for ARM64 assembly Goldilocks operations
 #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
 pub mod goldilocks_asm_fuzzing;
+/// ARM64 assembly-optimized Goldilocks extension field operations (Fp2, Fp3)
+#[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+pub mod goldilocks_extensions_asm;
 /// Implemenation of the Mersenne Prime field p = 2^31 - 1
 pub mod u64_mersenne_montgomery_field;
 

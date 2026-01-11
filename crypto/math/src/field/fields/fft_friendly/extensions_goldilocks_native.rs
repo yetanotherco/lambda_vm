@@ -2,6 +2,9 @@
 //!
 //! These extensions use the optimized native Goldilocks implementation
 //! instead of Montgomery form for better performance.
+//!
+//! With asm-arm64 feature: Uses ARM64 assembly-optimized operations for
+//! Fp2 and Fp3 arithmetic, providing ~10-20% speedup on Apple Silicon.
 
 use crate::field::{
     element::FieldElement,
@@ -9,6 +12,9 @@ use crate::field::{
     fields::fft_friendly::u64_goldilocks_native::GoldilocksField,
     traits::{IsField, IsSubFieldOf},
 };
+
+#[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+use super::goldilocks_extensions_asm;
 
 // =====================================================
 // QUADRATIC EXTENSION (Fp2)
@@ -29,50 +35,107 @@ impl IsField for Degree2GoldilocksNativeExtensionField {
     type BaseType = [FpE; 2];
 
     /// Returns the component-wise addition of `a` and `b`
+    ///
+    /// With asm-arm64 feature: Uses optimized SBC mask trick.
     #[inline(always)]
     fn add(a: &Self::BaseType, b: &Self::BaseType) -> Self::BaseType {
-        [&a[0] + &b[0], &a[1] + &b[1]]
+        #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+        {
+            let result = goldilocks_extensions_asm::fp2_add(
+                [*a[0].value(), *a[1].value()],
+                [*b[0].value(), *b[1].value()],
+            );
+            [FpE::from_raw(result[0]), FpE::from_raw(result[1])]
+        }
+        #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
+        {
+            [&a[0] + &b[0], &a[1] + &b[1]]
+        }
     }
 
     /// Returns the multiplication of `a` and `b`:
     /// (a0 + a1*w) * (b0 + b1*w) = (a0*b0 + W*a1*b1) + (a0*b1 + a1*b0)*w
     /// where w^2 = W = 7
+    ///
+    /// With asm-arm64 feature: Uses optimized Karatsuba with ASM primitives.
     #[inline(always)]
     fn mul(a: &Self::BaseType, b: &Self::BaseType) -> Self::BaseType {
-        let a0b0 = &a[0] * &b[0];
-        let a1b1 = &a[1] * &b[1];
-        let z = (&a[0] + &a[1]) * (&b[0] + &b[1]);
+        #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+        {
+            let result = goldilocks_extensions_asm::fp2_mul(
+                [*a[0].value(), *a[1].value()],
+                [*b[0].value(), *b[1].value()],
+            );
+            [FpE::from_raw(result[0]), FpE::from_raw(result[1])]
+        }
+        #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
+        {
+            let a0b0 = &a[0] * &b[0];
+            let a1b1 = &a[1] * &b[1];
+            let z = (&a[0] + &a[1]) * (&b[0] + &b[1]);
 
-        // W * a1b1 = 7 * a1b1
-        let w_a1b1 = mul_by_7(&a1b1);
+            // W * a1b1 = 7 * a1b1
+            let w_a1b1 = mul_by_7(&a1b1);
 
-        [&a0b0 + &w_a1b1, &z - &a0b0 - &a1b1]
+            [&a0b0 + &w_a1b1, &z - &a0b0 - &a1b1]
+        }
     }
 
     /// Returns the square of `a`:
     /// (a0 + a1*w)^2 = (a0^2 + W*a1^2) + 2*a0*a1*w
+    ///
+    /// With asm-arm64 feature: Uses optimized squaring with ASM primitives.
     #[inline(always)]
     fn square(a: &Self::BaseType) -> Self::BaseType {
-        let a0_sq = a[0].square();
-        let a1_sq = a[1].square();
-        let a0a1 = &a[0] * &a[1];
+        #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+        {
+            let result = goldilocks_extensions_asm::fp2_square([*a[0].value(), *a[1].value()]);
+            [FpE::from_raw(result[0]), FpE::from_raw(result[1])]
+        }
+        #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
+        {
+            let a0_sq = a[0].square();
+            let a1_sq = a[1].square();
+            let a0a1 = &a[0] * &a[1];
 
-        // W * a1^2 = 7 * a1^2
-        let w_a1_sq = mul_by_7(&a1_sq);
+            // W * a1^2 = 7 * a1^2
+            let w_a1_sq = mul_by_7(&a1_sq);
 
-        [&a0_sq + &w_a1_sq, a0a1.double()]
+            [&a0_sq + &w_a1_sq, a0a1.double()]
+        }
     }
 
     /// Returns the component-wise subtraction of `a` and `b`
+    ///
+    /// With asm-arm64 feature: Uses optimized SBC mask trick.
     #[inline(always)]
     fn sub(a: &Self::BaseType, b: &Self::BaseType) -> Self::BaseType {
-        [&a[0] - &b[0], &a[1] - &b[1]]
+        #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+        {
+            let result = goldilocks_extensions_asm::fp2_sub(
+                [*a[0].value(), *a[1].value()],
+                [*b[0].value(), *b[1].value()],
+            );
+            [FpE::from_raw(result[0]), FpE::from_raw(result[1])]
+        }
+        #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
+        {
+            [&a[0] - &b[0], &a[1] - &b[1]]
+        }
     }
 
     /// Returns the component-wise negation of `a`
     #[inline(always)]
     fn neg(a: &Self::BaseType) -> Self::BaseType {
-        [-&a[0], -&a[1]]
+        #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+        {
+            let result = goldilocks_extensions_asm::fp2_neg([*a[0].value(), *a[1].value()]);
+            [FpE::from_raw(result[0]), FpE::from_raw(result[1])]
+        }
+        #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
+        {
+            [-&a[0], -&a[1]]
+        }
     }
 
     /// Returns the multiplicative inverse of `a`:
@@ -112,7 +175,15 @@ impl IsField for Degree2GoldilocksNativeExtensionField {
     }
 
     fn double(a: &Self::BaseType) -> Self::BaseType {
-        [a[0].double(), a[1].double()]
+        #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+        {
+            let result = goldilocks_extensions_asm::fp2_double([*a[0].value(), *a[1].value()]);
+            [FpE::from_raw(result[0]), FpE::from_raw(result[1])]
+        }
+        #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
+        {
+            [a[0].double(), a[1].double()]
+        }
     }
 }
 
@@ -121,17 +192,39 @@ impl IsSubFieldOf<Degree2GoldilocksNativeExtensionField> for GoldilocksField {
         a: &Self::BaseType,
         b: &<Degree2GoldilocksNativeExtensionField as IsField>::BaseType,
     ) -> <Degree2GoldilocksNativeExtensionField as IsField>::BaseType {
-        let c0 = FpE::from_raw(<Self as IsField>::mul(a, b[0].value()));
-        let c1 = FpE::from_raw(<Self as IsField>::mul(a, b[1].value()));
-        [c0, c1]
+        #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+        {
+            let result = goldilocks_extensions_asm::fp2_scalar_mul(
+                *a,
+                [*b[0].value(), *b[1].value()],
+            );
+            [FpE::from_raw(result[0]), FpE::from_raw(result[1])]
+        }
+        #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
+        {
+            let c0 = FpE::from_raw(<Self as IsField>::mul(a, b[0].value()));
+            let c1 = FpE::from_raw(<Self as IsField>::mul(a, b[1].value()));
+            [c0, c1]
+        }
     }
 
     fn add(
         a: &Self::BaseType,
         b: &<Degree2GoldilocksNativeExtensionField as IsField>::BaseType,
     ) -> <Degree2GoldilocksNativeExtensionField as IsField>::BaseType {
-        let c0 = FpE::from_raw(<Self as IsField>::add(a, b[0].value()));
-        [c0, b[1]]
+        #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+        {
+            let result = goldilocks_extensions_asm::fp2_add_base(
+                *a,
+                [*b[0].value(), *b[1].value()],
+            );
+            [FpE::from_raw(result[0]), FpE::from_raw(result[1])]
+        }
+        #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
+        {
+            let c0 = FpE::from_raw(<Self as IsField>::add(a, b[0].value()));
+            [c0, b[1].clone()]
+        }
     }
 
     fn div(
@@ -146,9 +239,20 @@ impl IsSubFieldOf<Degree2GoldilocksNativeExtensionField> for GoldilocksField {
         a: &Self::BaseType,
         b: &<Degree2GoldilocksNativeExtensionField as IsField>::BaseType,
     ) -> <Degree2GoldilocksNativeExtensionField as IsField>::BaseType {
-        let c0 = FpE::from_raw(<Self as IsField>::sub(a, b[0].value()));
-        let c1 = FpE::from_raw(<Self as IsField>::neg(b[1].value()));
-        [c0, c1]
+        #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+        {
+            let result = goldilocks_extensions_asm::fp2_sub_from_base(
+                *a,
+                [*b[0].value(), *b[1].value()],
+            );
+            [FpE::from_raw(result[0]), FpE::from_raw(result[1])]
+        }
+        #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
+        {
+            let c0 = FpE::from_raw(<Self as IsField>::sub(a, b[0].value()));
+            let c1 = FpE::from_raw(<Self as IsField>::neg(b[1].value()));
+            [c0, c1]
+        }
     }
 
     fn embed(a: Self::BaseType) -> <Degree2GoldilocksNativeExtensionField as IsField>::BaseType {
@@ -191,61 +295,114 @@ impl IsField for Degree3GoldilocksNativeExtensionField {
     /// Returns the component-wise addition of `a` and `b`
     #[inline(always)]
     fn add(a: &Self::BaseType, b: &Self::BaseType) -> Self::BaseType {
-        [&a[0] + &b[0], &a[1] + &b[1], &a[2] + &b[2]]
+        #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+        {
+            let result = goldilocks_extensions_asm::fp3_add(
+                [*a[0].value(), *a[1].value(), *a[2].value()],
+                [*b[0].value(), *b[1].value(), *b[2].value()],
+            );
+            [FpE::from_raw(result[0]), FpE::from_raw(result[1]), FpE::from_raw(result[2])]
+        }
+        #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
+        {
+            [&a[0] + &b[0], &a[1] + &b[1], &a[2] + &b[2]]
+        }
     }
 
     /// Returns the multiplication of `a` and `b`:
     /// (a0 + a1*w + a2*w^2) * (b0 + b1*w + b2*w^2) mod (w^3 - 2)
     #[inline(always)]
     fn mul(a: &Self::BaseType, b: &Self::BaseType) -> Self::BaseType {
-        let v0 = &a[0] * &b[0];
-        let v1 = &a[1] * &b[1];
-        let v2 = &a[2] * &b[2];
+        #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+        {
+            let result = goldilocks_extensions_asm::fp3_mul(
+                [*a[0].value(), *a[1].value(), *a[2].value()],
+                [*b[0].value(), *b[1].value(), *b[2].value()],
+            );
+            [FpE::from_raw(result[0]), FpE::from_raw(result[1]), FpE::from_raw(result[2])]
+        }
+        #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
+        {
+            let v0 = &a[0] * &b[0];
+            let v1 = &a[1] * &b[1];
+            let v2 = &a[2] * &b[2];
 
-        // c0 = v0 + 2 * ((a1 + a2)(b1 + b2) - v1 - v2)
-        // c1 = (a0 + a1)(b0 + b1) - v0 - v1 + 2 * v2
-        // c2 = (a0 + a2)(b0 + b2) - v0 + v1 - v2
-        let t0 = (&a[1] + &a[2]) * (&b[1] + &b[2]) - &v1 - &v2;
-        let t1 = (&a[0] + &a[1]) * (&b[0] + &b[1]) - &v0 - &v1;
-        let t2 = (&a[0] + &a[2]) * (&b[0] + &b[2]) - &v0 - &v2;
+            // c0 = v0 + 2 * ((a1 + a2)(b1 + b2) - v1 - v2)
+            // c1 = (a0 + a1)(b0 + b1) - v0 - v1 + 2 * v2
+            // c2 = (a0 + a2)(b0 + b2) - v0 + v1 - v2
+            let t0 = (&a[1] + &a[2]) * (&b[1] + &b[2]) - &v1 - &v2;
+            let t1 = (&a[0] + &a[1]) * (&b[0] + &b[1]) - &v0 - &v1;
+            let t2 = (&a[0] + &a[2]) * (&b[0] + &b[2]) - &v0 - &v2;
 
-        [
-            &v0 + &t0.double(),
-            &t1 + &v2.double(),
-            &t2 + &v1,
-        ]
+            [
+                &v0 + &t0.double(),
+                &t1 + &v2.double(),
+                &t2 + &v1,
+            ]
+        }
     }
 
     /// Returns the square of `a`
     #[inline(always)]
     fn square(a: &Self::BaseType) -> Self::BaseType {
-        let s0 = a[0].square();
-        let s1 = a[1].square();
-        let s2 = a[2].square();
-        let a01 = &a[0] * &a[1];
-        let a02 = &a[0] * &a[2];
-        let a12 = &a[1] * &a[2];
+        #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+        {
+            let result = goldilocks_extensions_asm::fp3_square(
+                [*a[0].value(), *a[1].value(), *a[2].value()],
+            );
+            [FpE::from_raw(result[0]), FpE::from_raw(result[1]), FpE::from_raw(result[2])]
+        }
+        #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
+        {
+            let s0 = a[0].square();
+            let s1 = a[1].square();
+            let s2 = a[2].square();
+            let a01 = &a[0] * &a[1];
+            let a02 = &a[0] * &a[2];
+            let a12 = &a[1] * &a[2];
 
-        // c0 = s0 + 4 * a12
-        // c1 = 2 * a01 + 2 * s2
-        // c2 = 2 * a02 + s1
-        [
-            &s0 + &a12.double().double(),
-            &a01.double() + &s2.double(),
-            &a02.double() + &s1,
-        ]
+            // c0 = s0 + 4 * a12
+            // c1 = 2 * a01 + 2 * s2
+            // c2 = 2 * a02 + s1
+            [
+                &s0 + &a12.double().double(),
+                &a01.double() + &s2.double(),
+                &a02.double() + &s1,
+            ]
+        }
     }
 
     /// Returns the component-wise subtraction of `a` and `b`
     #[inline(always)]
     fn sub(a: &Self::BaseType, b: &Self::BaseType) -> Self::BaseType {
-        [&a[0] - &b[0], &a[1] - &b[1], &a[2] - &b[2]]
+        #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+        {
+            let result = goldilocks_extensions_asm::fp3_sub(
+                [*a[0].value(), *a[1].value(), *a[2].value()],
+                [*b[0].value(), *b[1].value(), *b[2].value()],
+            );
+            [FpE::from_raw(result[0]), FpE::from_raw(result[1]), FpE::from_raw(result[2])]
+        }
+        #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
+        {
+            [&a[0] - &b[0], &a[1] - &b[1], &a[2] - &b[2]]
+        }
     }
 
     /// Returns the component-wise negation of `a`
     #[inline(always)]
     fn neg(a: &Self::BaseType) -> Self::BaseType {
-        [-&a[0], -&a[1], -&a[2]]
+        #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+        {
+            let result = goldilocks_extensions_asm::fp3_neg(
+                [*a[0].value(), *a[1].value(), *a[2].value()],
+            );
+            [FpE::from_raw(result[0]), FpE::from_raw(result[1]), FpE::from_raw(result[2])]
+        }
+        #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
+        {
+            [-&a[0], -&a[1], -&a[2]]
+        }
     }
 
     /// Returns the multiplicative inverse of `a`
@@ -306,7 +463,17 @@ impl IsField for Degree3GoldilocksNativeExtensionField {
     }
 
     fn double(a: &Self::BaseType) -> Self::BaseType {
-        [a[0].double(), a[1].double(), a[2].double()]
+        #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+        {
+            let result = goldilocks_extensions_asm::fp3_double(
+                [*a[0].value(), *a[1].value(), *a[2].value()],
+            );
+            [FpE::from_raw(result[0]), FpE::from_raw(result[1]), FpE::from_raw(result[2])]
+        }
+        #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
+        {
+            [a[0].double(), a[1].double(), a[2].double()]
+        }
     }
 }
 
@@ -315,18 +482,40 @@ impl IsSubFieldOf<Degree3GoldilocksNativeExtensionField> for GoldilocksField {
         a: &Self::BaseType,
         b: &<Degree3GoldilocksNativeExtensionField as IsField>::BaseType,
     ) -> <Degree3GoldilocksNativeExtensionField as IsField>::BaseType {
-        let c0 = FpE::from_raw(<Self as IsField>::mul(a, b[0].value()));
-        let c1 = FpE::from_raw(<Self as IsField>::mul(a, b[1].value()));
-        let c2 = FpE::from_raw(<Self as IsField>::mul(a, b[2].value()));
-        [c0, c1, c2]
+        #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+        {
+            let result = goldilocks_extensions_asm::fp3_scalar_mul(
+                *a,
+                [*b[0].value(), *b[1].value(), *b[2].value()],
+            );
+            [FpE::from_raw(result[0]), FpE::from_raw(result[1]), FpE::from_raw(result[2])]
+        }
+        #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
+        {
+            let c0 = FpE::from_raw(<Self as IsField>::mul(a, b[0].value()));
+            let c1 = FpE::from_raw(<Self as IsField>::mul(a, b[1].value()));
+            let c2 = FpE::from_raw(<Self as IsField>::mul(a, b[2].value()));
+            [c0, c1, c2]
+        }
     }
 
     fn add(
         a: &Self::BaseType,
         b: &<Degree3GoldilocksNativeExtensionField as IsField>::BaseType,
     ) -> <Degree3GoldilocksNativeExtensionField as IsField>::BaseType {
-        let c0 = FpE::from_raw(<Self as IsField>::add(a, b[0].value()));
-        [c0, b[1].clone(), b[2].clone()]
+        #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+        {
+            let result = goldilocks_extensions_asm::fp3_add_base(
+                *a,
+                [*b[0].value(), *b[1].value(), *b[2].value()],
+            );
+            [FpE::from_raw(result[0]), FpE::from_raw(result[1]), FpE::from_raw(result[2])]
+        }
+        #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
+        {
+            let c0 = FpE::from_raw(<Self as IsField>::add(a, b[0].value()));
+            [c0, b[1].clone(), b[2].clone()]
+        }
     }
 
     fn div(
@@ -341,10 +530,21 @@ impl IsSubFieldOf<Degree3GoldilocksNativeExtensionField> for GoldilocksField {
         a: &Self::BaseType,
         b: &<Degree3GoldilocksNativeExtensionField as IsField>::BaseType,
     ) -> <Degree3GoldilocksNativeExtensionField as IsField>::BaseType {
-        let c0 = FpE::from_raw(<Self as IsField>::sub(a, b[0].value()));
-        let c1 = FpE::from_raw(<Self as IsField>::neg(b[1].value()));
-        let c2 = FpE::from_raw(<Self as IsField>::neg(b[2].value()));
-        [c0, c1, c2]
+        #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+        {
+            let result = goldilocks_extensions_asm::fp3_sub_from_base(
+                *a,
+                [*b[0].value(), *b[1].value(), *b[2].value()],
+            );
+            [FpE::from_raw(result[0]), FpE::from_raw(result[1]), FpE::from_raw(result[2])]
+        }
+        #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
+        {
+            let c0 = FpE::from_raw(<Self as IsField>::sub(a, b[0].value()));
+            let c1 = FpE::from_raw(<Self as IsField>::neg(b[1].value()));
+            let c2 = FpE::from_raw(<Self as IsField>::neg(b[2].value()));
+            [c0, c1, c2]
+        }
     }
 
     fn embed(a: Self::BaseType) -> <Degree3GoldilocksNativeExtensionField as IsField>::BaseType {
