@@ -6,6 +6,17 @@ edition = "2024"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[[bin]]
+name = "prove_profile"
+path = "src/bin/prove_profile.rs"
+
+# Enable debug symbols in release for profiling
+[profile.release]
+debug = true
+
+[profile.bench]
+debug = true
+
 
 [dependencies]
 math = { path = "../math", features = [
