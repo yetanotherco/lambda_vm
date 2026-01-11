@@ -55,6 +55,8 @@ lambdaworks-serde-string = ["dep:serde", "dep:serde_json", "alloc"]
 proptest = ["dep:proptest"]
 instruments = []
 
+# assembly optimizations
+asm-arm64 = []  # ARM64 assembly optimizations for Apple Silicon (M1/M2/M3)
 
 # gpu
 cuda = ["dep:cudarc", "dep:lambdaworks-gpu"]
@@ -69,4 +71,8 @@ harness = false
 
 [[bench]]
 name = "fft_benchmark"
+harness = false
+
+[[bench]]
+name = "asm_benchmark"
 harness = false

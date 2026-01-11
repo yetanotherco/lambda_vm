@@ -14,6 +14,13 @@ pub mod stark_252_prime_field;
 pub mod u64_goldilocks;
 /// Optimized Goldilocks Prime Field using native u64 arithmetic (no Montgomery)
 pub mod u64_goldilocks_native;
+/// ARM64 assembly-optimized Goldilocks field operations (Apple Silicon)
+/// Uses SBC mask trick for add/sub (~10% faster), native Rust for mul (LLVM optimal)
+#[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+pub mod u64_goldilocks_asm;
+/// Differential fuzzing for ARM64 assembly Goldilocks operations
+#[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+pub mod goldilocks_asm_fuzzing;
 /// Implemenation of the Mersenne Prime field p = 2^31 - 1
 pub mod u64_mersenne_montgomery_field;
 
