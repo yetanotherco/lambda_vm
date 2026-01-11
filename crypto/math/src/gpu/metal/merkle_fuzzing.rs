@@ -6,7 +6,7 @@
 use super::merkle::MetalMerkleTree;
 use super::MetalError;
 use crate::field::element::FieldElement;
-use crate::field::fields::fft_friendly::u64_goldilocks_native::GoldilocksField;
+use crate::field::fields::fft_friendly::u64_goldilocks_native::{GoldilocksField, GOLDILOCKS_PRIME};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -15,9 +15,6 @@ use alloc::vec::Vec;
 use std::time::Instant;
 
 type Fp = FieldElement<GoldilocksField>;
-
-/// Goldilocks prime modulus
-const GOLDILOCKS_PRIME: u64 = 0xFFFFFFFF00000001;
 
 // =============================================================================
 // CPU Poseidon2 Implementation for comparison

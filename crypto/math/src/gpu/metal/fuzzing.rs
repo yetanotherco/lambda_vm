@@ -7,7 +7,7 @@
 use crate::fft::cpu::ops::fft as cpu_fft_impl;
 use crate::fft::cpu::roots_of_unity::get_twiddles;
 use crate::field::element::FieldElement;
-use crate::field::fields::fft_friendly::u64_goldilocks_native::GoldilocksField;
+use crate::field::fields::fft_friendly::u64_goldilocks_native::{GoldilocksField, GOLDILOCKS_PRIME};
 use crate::field::traits::RootsConfig;
 use crate::gpu::metal::{MetalError, MetalFFT};
 use alloc::format;
@@ -16,9 +16,6 @@ use alloc::vec::Vec;
 
 #[cfg(feature = "std")]
 use std::time::Instant;
-
-/// Goldilocks prime modulus
-const GOLDILOCKS_PRIME: u64 = 0xFFFFFFFF00000001;
 
 /// Result of a differential fuzzing test
 #[derive(Debug)]

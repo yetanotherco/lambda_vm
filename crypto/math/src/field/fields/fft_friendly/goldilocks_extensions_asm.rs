@@ -10,105 +10,15 @@
 //!
 //! Note: These functions work with raw u64 values, not FieldElement wrappers.
 
-use core::arch::asm;
+// Re-export base field operations from the primary ASM module
+pub use super::u64_goldilocks_asm::{
+    add_fast, sub_fast, mul, reduce128, double, neg, EPSILON, GOLDILOCKS_PRIME,
+};
 
-/// The Goldilocks prime: p = 2^64 - 2^32 + 1
-pub const GOLDILOCKS_PRIME: u64 = 0xFFFF_FFFF_0000_0001;
-
-/// EPSILON = 2^32 - 1 (used for modular reduction)
-pub const EPSILON: u64 = 0xFFFF_FFFF;
-
-/// Quadratic non-residue for Fp2: W = 7 (x^2 - 7 is irreducible)
-pub const FP2_NON_RESIDUE: u64 = 7;
-
-/// Cubic non-residue for Fp3: W = 2 (x^3 - 2 is irreducible)
-pub const FP3_NON_RESIDUE: u64 = 2;
-
-// =====================================================
-// BASE FIELD OPERATIONS (imported from u64_goldilocks_asm)
-// =====================================================
-
-/// Optimized addition using SBC mask trick.
-#[inline(always)]
-pub fn add_fast(a: u64, b: u64) -> u64 {
-    let result: u64;
-    unsafe {
-        asm!(
-            "adds {result}, {a}, {b}",
-            "sbc {mask}, xzr, xzr",
-            "bic {adj}, {epsilon}, {mask}",
-            "add {result}, {result}, {adj}",
-            a = in(reg) a,
-            b = in(reg) b,
-            epsilon = in(reg) EPSILON,
-            mask = out(reg) _,
-            adj = out(reg) _,
-            result = out(reg) result,
-            options(pure, nomem, nostack),
-        );
-    }
-    result
-}
-
-/// Optimized subtraction using SBC mask trick.
-#[inline(always)]
-pub fn sub_fast(a: u64, b: u64) -> u64 {
-    let result: u64;
-    unsafe {
-        asm!(
-            "subs {result}, {a}, {b}",
-            "sbc {mask}, xzr, xzr",
-            "and {adj}, {epsilon}, {mask}",
-            "sub {result}, {result}, {adj}",
-            a = in(reg) a,
-            b = in(reg) b,
-            epsilon = in(reg) EPSILON,
-            mask = out(reg) _,
-            adj = out(reg) _,
-            result = out(reg) result,
-            options(pure, nomem, nostack),
-        );
-    }
-    result
-}
-
-/// Reduce a 128-bit value modulo the Goldilocks prime.
-#[inline(always)]
-fn reduce128(x: u128) -> u64 {
-    let x_lo = x as u64;
-    let x_hi = (x >> 64) as u64;
-    let x_hi_hi = x_hi >> 32;
-    let x_hi_lo = x_hi & EPSILON;
-
-    let (t0, borrow) = x_lo.overflowing_sub(x_hi_hi);
-    let t0 = if borrow { t0.wrapping_sub(EPSILON) } else { t0 };
-    let t1 = (x_hi_lo << 32).wrapping_sub(x_hi_lo);
-    let (result, carry) = t0.overflowing_add(t1);
-    if carry { result.wrapping_add(EPSILON) } else { result }
-}
-
-/// Base field multiplication.
-#[inline(always)]
-pub fn mul(a: u64, b: u64) -> u64 {
-    reduce128((a as u128) * (b as u128))
-}
-
-/// Base field squaring.
+/// Base field squaring (uses native Rust for optimal performance).
 #[inline(always)]
 pub fn square(a: u64) -> u64 {
     reduce128((a as u128) * (a as u128))
-}
-
-/// Double a value: 2a mod p.
-#[inline(always)]
-pub fn double(a: u64) -> u64 {
-    add_fast(a, a)
-}
-
-/// Negate a value: -a mod p.
-#[inline(always)]
-pub fn neg(a: u64) -> u64 {
-    if a == 0 { 0 } else { sub_fast(0, a) }
 }
 
 // =====================================================

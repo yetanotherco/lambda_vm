@@ -22,11 +22,8 @@ use crate::field::fields::fft_friendly::u64_goldilocks_native::GoldilocksField;
 use alloc::vec::Vec;
 use metal::{Buffer, MTLSize};
 
-/// Threshold for using shared memory FFT kernel
-const SHARED_MEMORY_THRESHOLD: usize = 1 << 13; // 8192 elements
-
 /// Threshold for switching from Stockham to Mixed-radix algorithm.
-/// Benchmarks show Stockham is faster for sizes ≤ 2^13, mixed-radix for larger.
+/// Benchmarks show Stockham is faster for sizes <= 2^13, mixed-radix for larger.
 const STOCKHAM_THRESHOLD: usize = 1 << 13; // 8192 elements
 
 /// FFT algorithm variants for benchmarking
@@ -441,6 +438,9 @@ impl MetalFFT {
     }
 
     /// Execute FFT using shared memory kernel (for small sizes).
+    /// Note: Currently unused - Stockham is faster for small sizes.
+    /// Kept for potential future optimization or alternative algorithm benchmarking.
+    #[allow(dead_code)]
     fn execute_fft_small(
         &self,
         data_buffer: &Buffer,

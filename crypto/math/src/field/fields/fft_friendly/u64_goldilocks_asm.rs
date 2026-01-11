@@ -123,6 +123,7 @@ pub fn mul(a: u64, b: u64) -> u64 {
 /// Reduce a 128-bit value modulo the Goldilocks prime.
 ///
 /// Uses native Rust which LLVM optimizes effectively.
+/// Uses shift instead of multiply for EPSILON computation (faster).
 #[inline(always)]
 pub fn reduce128(x: u128) -> u64 {
     let x_lo = x as u64;

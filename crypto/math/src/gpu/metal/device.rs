@@ -4,7 +4,6 @@
 
 use super::errors::MetalError;
 use alloc::string::ToString;
-use alloc::sync::Arc;
 use metal::{Buffer, CommandQueue, Device, Library, MTLResourceOptions};
 
 /// Maximum supported FFT size (2^24 = 16M elements)
@@ -137,11 +136,11 @@ impl MetalState {
 }
 
 /// Thread-safe wrapper for MetalState.
-pub type SharedMetalState = Arc<MetalState>;
+pub type SharedMetalState = alloc::sync::Arc<MetalState>;
 
 /// Create a shared Metal state that can be used across threads.
 pub fn create_shared_state() -> Result<SharedMetalState, MetalError> {
-    Ok(Arc::new(MetalState::new()?))
+    Ok(alloc::sync::Arc::new(MetalState::new()?))
 }
 
 #[cfg(test)]
