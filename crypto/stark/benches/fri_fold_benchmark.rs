@@ -3,7 +3,7 @@ use math::field::element::FieldElement;
 use math::field::fields::fft_friendly::babybear_u32::Babybear31PrimeField;
 use math::polynomial::Polynomial;
 use rand::Rng;
-use stark::fri::fri_functions::{fold_polynomial, fold_polynomial_original, fold_polynomial_scaled};
+use stark::fri::fri_functions::{fold_polynomial, fold_polynomial_doubled, fold_polynomial_original};
 
 type FE = FieldElement<Babybear31PrimeField>;
 
@@ -37,10 +37,10 @@ fn bench_fold_polynomial(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark comparing scalar * fold vs fused fold_polynomial_scaled
+/// Benchmark comparing scalar * fold vs fused fold_polynomial_doubled
 /// This simulates the FRI commit phase pattern where each fold is multiplied by 2
-fn bench_scaled_fold(c: &mut Criterion) {
-    let mut group = c.benchmark_group("fri_fold_scaled");
+fn bench_doubled_fold(c: &mut Criterion) {
+    let mut group = c.benchmark_group("fri_fold_doubled");
 
     let two = FE::from(2);
 
@@ -51,19 +51,19 @@ fn bench_scaled_fold(c: &mut Criterion) {
         let poly = generate_random_polynomial(size - 1);
         let beta = FE::new(12345);
 
-        // Original pattern: scalar * fold_original
-        group.bench_with_input(BenchmarkId::new("scalar_x_original", size), &size, |b, _| {
+        // Original pattern: 2 * fold_original
+        group.bench_with_input(BenchmarkId::new("mul2_x_original", size), &size, |b, _| {
             b.iter(|| black_box(&two * fold_polynomial_original(&poly, &beta)))
         });
 
-        // Separate pattern: scalar * fold_optimized
-        group.bench_with_input(BenchmarkId::new("scalar_x_optimized", size), &size, |b, _| {
+        // Separate pattern: 2 * fold_optimized
+        group.bench_with_input(BenchmarkId::new("mul2_x_optimized", size), &size, |b, _| {
             b.iter(|| black_box(&two * fold_polynomial(&poly, &beta)))
         });
 
-        // Fused pattern: fold_polynomial_scaled
-        group.bench_with_input(BenchmarkId::new("fused_scaled", size), &size, |b, _| {
-            b.iter(|| black_box(fold_polynomial_scaled(&poly, &beta, &two)))
+        // Fused with double(): fold_polynomial_doubled (most efficient)
+        group.bench_with_input(BenchmarkId::new("fused_doubled", size), &size, |b, _| {
+            b.iter(|| black_box(fold_polynomial_doubled(&poly, &beta)))
         });
     }
 
@@ -84,7 +84,7 @@ fn bench_multiple_folds(c: &mut Criterion) {
     let two = FE::from(2);
 
     // Original pattern: 2 * fold_original (what commit_phase used to do)
-    group.bench_function("original_scaled_chain", |b| {
+    group.bench_function("mul2_original_chain", |b| {
         b.iter(|| {
             let mut current = poly.clone();
             for beta in &betas {
@@ -95,7 +95,7 @@ fn bench_multiple_folds(c: &mut Criterion) {
     });
 
     // Optimized pattern: 2 * fold_optimized
-    group.bench_function("optimized_scaled_chain", |b| {
+    group.bench_function("mul2_optimized_chain", |b| {
         b.iter(|| {
             let mut current = poly.clone();
             for beta in &betas {
@@ -105,12 +105,12 @@ fn bench_multiple_folds(c: &mut Criterion) {
         })
     });
 
-    // Fused pattern: fold_polynomial_scaled (what commit_phase now does)
-    group.bench_function("fused_scaled_chain", |b| {
+    // Fused with double(): fold_polynomial_doubled (what commit_phase now does)
+    group.bench_function("fused_doubled_chain", |b| {
         b.iter(|| {
             let mut current = poly.clone();
             for beta in &betas {
-                current = fold_polynomial_scaled(&current, beta, &two);
+                current = fold_polynomial_doubled(&current, beta);
             }
             black_box(current)
         })
@@ -119,6 +119,6 @@ fn bench_multiple_folds(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_fold_polynomial, bench_scaled_fold, bench_multiple_folds);
+criterion_group!(benches, bench_fold_polynomial, bench_doubled_fold, bench_multiple_folds);
 
 criterion_main!(benches);

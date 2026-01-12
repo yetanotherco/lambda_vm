@@ -37,13 +37,12 @@ where
     Polynomial::new(&result)
 }
 
-/// Optimized FRI fold with fused scalar multiplication: scalar * (P_even(x) + beta * P_odd(x))
-/// This avoids creating an intermediate polynomial and then scaling it.
-/// Used in FRI commit phase where each fold is multiplied by 2.
-pub fn fold_polynomial_scaled<F>(
+/// Optimized FRI fold with fused doubling: 2 * (P_even(x) + beta * P_odd(x))
+/// Uses double() which is more efficient than multiplication by 2.
+/// This is the pattern used in FRI commit phase.
+pub fn fold_polynomial_doubled<F>(
     poly: &Polynomial<FieldElement<F>>,
     beta: &FieldElement<F>,
-    scalar: &FieldElement<F>,
 ) -> Polynomial<FieldElement<F>>
 where
     F: IsField,
@@ -58,17 +57,17 @@ where
     let result_len = (n + 1) / 2;
     let mut result = Vec::with_capacity(result_len);
 
-    // Process pairs: result[i] = scalar * (coef[2i] + beta * coef[2i+1])
+    // Process pairs: result[i] = 2 * (coef[2i] + beta * coef[2i+1])
     let mut i = 0;
     while i + 1 < n {
         let folded = &coef[i] + &(&coef[i + 1] * beta);
-        result.push(&folded * scalar);
+        result.push(folded.double());
         i += 2;
     }
 
     // Handle last coefficient if n is odd (no pair)
     if n % 2 == 1 {
-        result.push(&coef[n - 1] * scalar);
+        result.push(coef[n - 1].double());
     }
 
     Polynomial::new(&result)

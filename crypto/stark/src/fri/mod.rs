@@ -15,7 +15,7 @@ use crate::config::{BatchedMerkleTree, BatchedMerkleTreeBackend};
 
 use self::fri_commitment::FriLayer;
 use self::fri_decommit::FriDecommitment;
-use self::fri_functions::fold_polynomial_scaled;
+use self::fri_functions::fold_polynomial_doubled;
 
 pub fn commit_phase<F: IsFFTField + IsSubFieldOf<E>, E: IsField>(
     number_layers: usize,
@@ -38,17 +38,14 @@ where
 
     let mut coset_offset = coset_offset.clone();
 
-    // Precompute constant to avoid repeated field element construction
-    let two: FieldElement<E> = FieldElement::<F>::from(2).to_extension();
-
     for _ in 1..number_layers {
         // <<<< Receive challenge 𝜁ₖ₋₁
         let zeta = transcript.sample_field_element();
         coset_offset = coset_offset.square();
         domain_size /= 2;
 
-        // Compute layer polynomial and domain (fused scalar multiplication)
-        current_poly = fold_polynomial_scaled(&current_poly, &zeta, &two);
+        // Compute layer polynomial and domain (uses double() for efficiency)
+        current_poly = fold_polynomial_doubled(&current_poly, &zeta);
         let current_layer = new_fri_layer(&current_poly, &coset_offset, domain_size);
 
         // Copy root (small hash) before moving layer to avoid clone
@@ -62,7 +59,7 @@ where
     // <<<< Receive challenge: 𝜁ₙ₋₁
     let zeta = transcript.sample_field_element();
 
-    let last_poly = fold_polynomial_scaled(&current_poly, &zeta, &two);
+    let last_poly = fold_polynomial_doubled(&current_poly, &zeta);
 
     let last_value = last_poly
         .coefficients()
