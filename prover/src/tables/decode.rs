@@ -123,7 +123,7 @@ impl DecodeTableRow {
                         row.muldiv_selector = FE::one();
                     }
                     ArithOp::Div => {
-                        row.instruction = FE::one();
+                        row.instruction = FE::from(&instruction::DIVREM);
                         row.signed = FE::one();
                     }
                     ArithOp::DivUnsigned => {
@@ -313,6 +313,7 @@ impl DecodeTableRow {
         row.push(self.signed);
         row.push(self.mp_selector);
         row.push(self.muldiv_selector);
+        row.push(self.instruction);
         row.push(self.multiplicity);
 
         row
