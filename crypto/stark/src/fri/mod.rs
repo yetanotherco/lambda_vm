@@ -18,11 +18,11 @@ use self::fri_decommit::FriDecommitment;
 use self::fri_functions::fold_polynomial_doubled;
 
 pub fn commit_phase<F: IsFFTField + IsSubFieldOf<E>, E: IsField>(
-    number_layers: usize,
-    p_0: Polynomial<FieldElement<E>>,
+    num_layers: usize,
+    initial_poly: Polynomial<FieldElement<E>>,
     transcript: &mut impl IsStarkTranscript<E, F>,
-    coset_offset: &FieldElement<F>,
-    domain_size: usize,
+    initial_offset: &FieldElement<F>,
+    initial_domain_size: usize,
 ) -> (
     FieldElement<E>,
     Vec<FriLayer<E, BatchedMerkleTreeBackend<E>>>,
@@ -31,82 +31,64 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
-    let mut domain_size = domain_size;
+    let mut layers = Vec::with_capacity(num_layers);
+    let mut current_poly = initial_poly;
+    let mut coset_offset = initial_offset.clone();
+    let mut domain_size = initial_domain_size;
 
-    let mut fri_layer_list = Vec::with_capacity(number_layers);
-    let mut current_poly = p_0;
-
-    let mut coset_offset = coset_offset.clone();
-
-    for _ in 1..number_layers {
-        // <<<< Receive challenge 𝜁ₖ₋₁
+    for _ in 1..num_layers {
         let zeta = transcript.sample_field_element();
         coset_offset = coset_offset.square();
         domain_size /= 2;
 
-        // Compute layer polynomial and domain (uses double() for efficiency)
         current_poly = fold_polynomial_doubled(&current_poly, &zeta);
-        let current_layer = new_fri_layer(&current_poly, &coset_offset, domain_size);
+        let layer = new_fri_layer(&current_poly, &coset_offset, domain_size);
 
-        // Copy root (small hash) before moving layer to avoid clone
-        let new_data = current_layer.merkle_tree.root.clone();
-        fri_layer_list.push(current_layer);
-
-        // >>>> Send commitment: [pₖ]
-        transcript.append_bytes(&new_data);
+        transcript.append_bytes(&layer.merkle_tree.root);
+        layers.push(layer);
     }
 
-    // <<<< Receive challenge: 𝜁ₙ₋₁
     let zeta = transcript.sample_field_element();
-
-    let last_poly = fold_polynomial_doubled(&current_poly, &zeta);
-
-    let last_value = last_poly
+    let final_poly = fold_polynomial_doubled(&current_poly, &zeta);
+    let final_value = final_poly
         .coefficients()
         .first()
-        .unwrap_or(&FieldElement::zero())
-        .clone();
+        .cloned()
+        .unwrap_or_else(FieldElement::zero);
 
-    // >>>> Send value: pₙ
-    transcript.append_field_element(&last_value);
+    transcript.append_field_element(&final_value);
 
-    (last_value, fri_layer_list)
+    (final_value, layers)
 }
 
 pub fn query_phase<F: IsField>(
-    fri_layers: &[FriLayer<F, BatchedMerkleTreeBackend<F>>],
-    iotas: &[usize],
+    layers: &[FriLayer<F, BatchedMerkleTreeBackend<F>>],
+    query_indices: &[usize],
 ) -> Vec<FriDecommitment<F>>
 where
     FieldElement<F>: AsBytes + Sync + Send,
 {
-    if fri_layers.is_empty() {
+    if layers.is_empty() {
         return vec![];
     }
 
-    let num_layers = fri_layers.len();
-
-    iotas
+    query_indices
         .iter()
-        .map(|iota_s| {
-            // Pre-allocate with exact capacity
-            let mut layers_evaluations_sym = Vec::with_capacity(num_layers);
-            let mut layers_auth_paths_sym = Vec::with_capacity(num_layers);
+        .map(|&initial_index| {
+            let mut evaluations = Vec::with_capacity(layers.len());
+            let mut auth_paths = Vec::with_capacity(layers.len());
+            let mut index = initial_index;
 
-            let mut index = *iota_s;
-            for layer in fri_layers {
-                // symmetric element
-                let evaluation_sym = layer.evaluation[index ^ 1].clone();
-                let auth_path_sym = layer.merkle_tree.get_proof_by_pos(index >> 1).unwrap();
-                layers_evaluations_sym.push(evaluation_sym);
-                layers_auth_paths_sym.push(auth_path_sym);
-
+            for layer in layers {
+                let symmetric_index = index ^ 1;
+                evaluations.push(layer.evaluation[symmetric_index].clone());
+                auth_paths.push(layer.merkle_tree.get_proof_by_pos(index >> 1).unwrap());
                 index >>= 1;
             }
 
             FriDecommitment {
-                layers_auth_paths: layers_auth_paths_sym,
-                layers_evaluations_sym,
+                layers_auth_paths: auth_paths,
+                layers_evaluations_sym: evaluations,
             }
         })
         .collect()
@@ -116,29 +98,24 @@ pub fn new_fri_layer<F: IsFFTField + IsSubFieldOf<E>, E: IsField>(
     poly: &Polynomial<FieldElement<E>>,
     coset_offset: &FieldElement<F>,
     domain_size: usize,
-) -> crate::fri::fri_commitment::FriLayer<E, BatchedMerkleTreeBackend<E>>
+) -> FriLayer<E, BatchedMerkleTreeBackend<E>>
 where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
     let mut evaluation =
-        Polynomial::evaluate_offset_fft(poly, 1, Some(domain_size), coset_offset).unwrap(); // TODO: return error
+        Polynomial::evaluate_offset_fft(poly, 1, Some(domain_size), coset_offset).unwrap();
 
     in_place_bit_reverse_permute(&mut evaluation);
 
-    // Pre-allocate with exact capacity to avoid reallocations
-    // FRI uses power-of-2 sizes, so chunks_exact is safe
-    let num_leaves = evaluation.len() / 2;
-    let to_commit: Vec<Vec<FieldElement<E>>> = evaluation
+    let leaves: Vec<Vec<FieldElement<E>>> = evaluation
         .chunks_exact(2)
         .map(|chunk| vec![chunk[0].clone(), chunk[1].clone()])
         .collect();
-    debug_assert_eq!(to_commit.len(), num_leaves);
 
-    let merkle_tree = BatchedMerkleTree::build(&to_commit).unwrap();
+    let merkle_tree = BatchedMerkleTree::build(&leaves).unwrap();
 
-    // Use from_owned to avoid cloning the evaluation vector
-    FriLayer::from_owned(
+    FriLayer::new(
         evaluation,
         merkle_tree,
         coset_offset.clone().to_extension(),
