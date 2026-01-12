@@ -11,12 +11,10 @@ runs:
       shell: bash
       run: |
         cd $HOME
-        mkdir lambda_rust
-        cd lambda_rust
-        wget https://lambda.alignedlayer.com/my_rust.tar.gz 
-        tar -xzvf my_rust.tar.gz
-        rm my_rust.tar.gz
+        wget https://lambda.alignedlayer.com/lambda_rust.tar.gz 
+        tar -xzvf lambda_rust.tar.gz
+        rm lambda_rust.tar.gz
     
     - name: Add Rust to PATH
       shell: bash
-      run: echo "$HOME/lambda_rust/my_rust/usr/local/bin" >> $GITHUB_PATH
+      run: echo "$HOME/lambda_rust/usr/local/bin" >> $GITHUB_PATH
