@@ -7,31 +7,15 @@ runs:
     - name: Free Disk Space
       uses: ./.github/actions/free-disk
 
-    - name: Restore Rust toolchain cache
-      id: rust-cache
-      uses: actions/cache@v4
-      with:
-        path: /home/runner/lambda_rust
-        key: rust-src-${{ runner.os }}-149355
-
-    - name: Install Rust
-      if: steps.rust-cache.outputs.cache-hit != 'true'
+    - name: Download Rust
       shell: bash
       run: |
         cd $HOME
-        git clone https://github.com/yetanotherco/rust.git
-        cd rust
-        cat <<'EOF' > bootstrap.toml
-        # See bootstrap.example.toml for documentation of available options
-        #
-        profile = "dist"  # Includes one of the default files in src/bootstrap/defaults
-        change-id = 149355
-        rust.lld = true
-        [build]
-        docs = false
-        EOF
-        ./x.py build --stage 1
-        DESTDIR="$HOME/lambda_rust" ./x.py install --stage 1
+        mkdir lambda_rust
+        cd lambda_rust
+        wget https://lambda.alignedlayer.com/my_rust.tar.gz 
+        tar -xzvf my_rust.tar.gz
+        rm my_rust.tar.gz
     
     - name: Add Rust to PATH
       shell: bash
