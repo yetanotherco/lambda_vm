@@ -77,3 +77,11 @@ harness = false
 [[bench]]
 name = "asm_benchmark"
 harness = false
+
+[[bench]]
+name = "fft_components_benchmark"
+harness = false
+
+[[bench]]
+name = "fp2_alternatives_benchmark"
+harness = false
