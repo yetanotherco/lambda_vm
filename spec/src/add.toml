@@ -27,26 +27,25 @@ name = "carry"
 desc = "Carry values used to constrain the addition"
 type = ["Bit", 2]
 def = {idx="i", polys=[
-    {range=0, poly=["*", ["^", 2, -32], ["-", ["+", ["idx", "lhs", 0], ["idx", "rhs", 0]], ["idx", "sum", 0]]]},
-    {range=1, poly=["*", ["^", 2, -32], ["-", ["+", ["idx", "lhs", 1], ["idx", "rhs", 1], ["idx", "carry", 0]], ["idx", "sum", 1]]]},
+    {iter=0, poly=["*", ["^", 2, -32], ["-", ["+", ["idx", "lhs", 0], ["idx", "rhs", 0]], ["idx", "sum", 0]]]},
+    {iter=1, poly=["*", ["^", 2, -32], ["-", ["+", ["idx", "lhs", 1], ["idx", "rhs", 1], ["idx", "carry", 0]], ["idx", "sum", 1]]]},
 ]}
-
 
 # Assumptions
 
 [[assumptions]]
 desc = "`IS_WORD[lhs[i]]`"
-range = ["i", 0, 1]
+iter = ["i", 0, 1]
 ref = "add:a:lhs"
 
 [[assumptions]]
 desc = "`IS_WORD[rhs[i]]`"
-range = ["i", 0, 1]
+iter = ["i", 0, 1]
 ref = "add:a:rhs"
 
 [[assumptions]]
 desc = "`IS_WORD[sum[i]]`"
-range = ["i", 0, 1]
+iter = ["i", 0, 1]
 ref = "add:a:sum"
 
 # Constraints
@@ -58,7 +57,6 @@ name = "all"
 kind = "template"
 tag = "IS_BIT"
 input = [["idx", "carry", "i"]]
-range = ["i", 0, 1]
+iter = ["i", 0, 1]
 cond = "cond"
 ref = "add:c:carry"
-

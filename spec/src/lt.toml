@@ -50,8 +50,8 @@ name = "carry"
 type = ["Bit", 2]
 desc = "The carry for adding `lhs_sub_rhs` back to `rhs`"
 def = {idx = "i", polys = [
-  {range = [0], poly = ["*", ["^", 2, -32], ["-", ["+", ["idx", "rhs", 0], ["idx", ["cast", "lhs_sub_rhs", "DWordWL"], 0]], ["idx", "lhs", 0]]]},
-  {range = [1], poly = ["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "rhs", "DWordWL"], 1], ["idx", ["cast", "lhs_sub_rhs", "DWordWL"], 1], ["idx", "carry", 0]], ["idx", ["cast", "lhs", "DWordWL"], 1]]]},
+  {iter = 0, poly = ["*", ["^", 2, -32], ["-", ["+", ["idx", "rhs", 0], ["idx", ["cast", "lhs_sub_rhs", "DWordWL"], 0]], ["idx", "lhs", 0]]]},
+  {iter = 1, poly = ["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "rhs", "DWordWL"], 1], ["idx", ["cast", "lhs_sub_rhs", "DWordWL"], 1], ["idx", "carry", 0]], ["idx", ["cast", "lhs", "DWordWL"], 1]]]},
 ]}
 
 [[variables.virtual]]
@@ -71,12 +71,12 @@ desc = ""
 
 [[assumptions]]
 desc = "`IS_HALFWORD[lhs[i]]` and `IS_WORD[lhs[0]]`"
-range = ["i", 1, 2]
+iter = ["i", 1, 2]
 ref = "lt:a:range_lhs"
 
 [[assumptions]]
 desc = "`IS_HALFWORD[rhs[i]]` and `IS_WORD[rhs[0]]`"
-range = ["i", 1, 2]
+iter = ["i", 1, 2]
 ref = "lt:a:range_rhs"
 
 [[assumptions]]
@@ -120,13 +120,13 @@ desc = "Constrain the subtraction"
 kind = "template"
 tag = "IS_BIT"
 input = [["idx", "carry", "i"]]
-range = ["i", 0, 1]
+iter = ["i", 0, 1]
 
 [[constraints.sub]]
 kind = "interaction"
 tag = "IS_HALFWORD"
 input = [["idx", "lhs_sub_rhs", "i"]]
-range = ["i", 0, 3]
+iter = ["i", 0, 3]
 multiplicity = "μ"
 ref = "lt:c:lhs_sub_rhs_range"
 
