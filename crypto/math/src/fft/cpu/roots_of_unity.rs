@@ -17,6 +17,7 @@ use std::sync::RwLock;
 /// This cache is thread-safe and can be shared across multiple FFT computations.
 /// Twiddles are stored by (order, config) pairs.
 #[cfg(feature = "std")]
+#[allow(clippy::type_complexity)]
 pub struct TwiddleCache<F: IsFFTField> {
     cache: RwLock<HashMap<(u64, RootsConfig), Vec<FieldElement<F>>>>,
 }
