@@ -288,12 +288,18 @@ impl CpuTableRow {
                 }
 
                 match width {
-                    LoadStoreWidth::Half => row.memory_2bytes = FE::one(),
+                    LoadStoreWidth::Byte => row.signed = FE::one(),
+                    LoadStoreWidth::Half => {
+                        row.memory_2bytes = FE::one();
+                        row.signed = FE::one();
+                    }
                     LoadStoreWidth::Word => {
                         row.memory_2bytes = FE::one();
                         row.memory_4bytes = FE::one();
+                        row.signed = FE::one();
                     }
-                    _ => (),
+                    LoadStoreWidth::ByteUnsigned => (),
+                    LoadStoreWidth::HalfUnsigned => row.memory_2bytes = FE::one(),
                 }
             }
 
