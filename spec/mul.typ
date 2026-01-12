@@ -44,29 +44,25 @@ $
 where the limbs of `lhs_ext` and `rhs_ext` are treated as _unsigned_ integers.
 Note that by setting the extension limbs of `lhs` and/or `rhs` to $0$ when the integer is unsigned or signed and positive, the second formula still applies.
 Observe that we can rewrite this formula as
+#show math.equation: set block(breakable: true)
 $
   &(sum_(j=0)^7 2^(16j) dot #`lhs_ext`_j) dot (sum_(i=0)^7 2^(16i) dot #`rhs_ext`_i) mod 2^128 \
   &equiv sum_(j=0)^7 sum_(i=0)^7 2^(16(i+j)) dot #`lhs_ext`_j dot #`rhs_ext`_i mod 2^128 \
   &stackrel(triangle, equiv) sum_(j=0)^7 sum_(i=0)^(7-j) 2^(16(i+j)) dot #`lhs_ext`_j dot #`rhs_ext`_i mod 2^128 \
   &stackrel(square, equiv) sum_(j=0)^7 sum_(i=j)^(7) 2^(16i) dot #`lhs_ext`_j dot #`rhs_ext`_(i-j) mod 2^128 \
   &stackrel(penta, equiv) sum_(i=0)^7 sum_(j=0)^(i) 2^(16i) dot #`lhs_ext`_j dot #`rhs_ext`_(i-j) mod 2^128 \
-  &equiv sum_(i=0)^7 2^(16i) dot sum_(j=0)^(i) #`lhs_ext`_j dot #`rhs_ext`_(i-j) mod 2^128 \
+//   &equiv sum_(i=0)^7 2^(16i) dot sum_(j=0)^(i) #`lhs_ext`_j dot #`rhs_ext`_(i-j) mod 2^128 \
+  &equiv sum_(i=0)^3 sum_(k=0)^1 sum_(j=0)^(2i+k) 2^(16(2i+k)) dot #`lhs_ext`_j dot #`rhs_ext`_(2i+k-j) mod 2^128 \
+  &equiv sum_(i=0)^3 2^(32i) dot sum_(k=0)^1 2^(16k) dot sum_(j=0)^(2i+k) #`lhs_ext`_j dot #`rhs_ext`_(2i+k-j) mod 2^128
 $
 where at step
 - $triangle$ we can ignore $j > 7-i$, since that makes $2^(16(i+j)) equiv 0 mod 2^128$,
-- $square$ we rewrite the summation that $i$ iterates from $j$ to 7, rather than $0$ to $7-j$, and
+- $square$ we rewrite the second summation such that $i$ iterates from $j$ to 7, rather than $0$ to $7-j$, and
 - $penta$ we swap the sums.
-Note that `limb_product` is defined as the second summation in this last formula.
-We can rewrite this as
-$
-  &sum_(i=0)^7 2^(16i) dot #`limb_product`_i mod 2^128 \
-  &equiv sum_(i=0)^3 sum_(k=0)^1 2^(16(2i+k)) dot #`limb_product`_(2i+k) mod 2^128 \
-  &equiv sum_(i=0)^3 2^(32i) dot sum_(k=0)^1 2^(16k) dot #`limb_product`_(2i+k) mod 2^128 \
-$
-where we now capture the second summation in the variable `raw_product` (see @mul:c:raw_product).
 
-At this point, the limbs in `raw_product` may require up to 51 bits to be represented.
-The last step is then to carry the overflow of each limb to the next, ensuring `res` represents the same value as `raw_product`, but with limbs in the range $[0, 2^32)$.
+Note that `raw_product` captures the second summation in this last formula (see @mul:c:raw_product).
+However, the limbs in `raw_product` may require up to 51 bits to be represented.
+What remains then is to carry the overflow of each limb to the next, ensuring `res` represents the same value as `raw_product`, but with limbs in the range $[0, 2^32)$.
 This is simply constrained by `carry`'s definition and @mul:c:carry.
 From these two, we gather that
 $
@@ -81,7 +77,7 @@ We constrain `lhs_is_negative` and `rhs_is_negative` according to their definiti
 #render_constraint_table(chip, config, groups: "def")
 
 == Product
-@mul:c:raw_product defines `raw_product` in terms of the input values `lhs` and `rhs`.
+@mul:c:raw_product defines `raw_product` in terms of the (sign extended) input values `lhs` and `rhs`.
 #render_constraint_table(chip, config, groups: "prod")
 
 == Lookup
