@@ -448,6 +448,11 @@ impl CpuTableRow {
         row
     }
 
+    /// Temporary workaround to pad rows that satisfy all constraints.
+    ///
+    /// This function generates rows filled with zeros, except for `branch_cond`,
+    /// which is set to 1. This ensures that the constraint enforcing
+    /// `next_pc = pc + 4` holds when no branch condition is active.
     pub fn get_valid_rows_flattened(num_of_rows: usize) -> Vec<FE> {
         let row_len = Self::NUM_COLUMNS;
         let mut res = Vec::with_capacity(num_of_rows * row_len);
