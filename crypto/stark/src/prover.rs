@@ -31,9 +31,9 @@ use super::constraints::evaluator::ConstraintEvaluator;
 use super::domain::Domain;
 use super::fri::fri_decommit::FriDecommitment;
 use super::grinding;
+use super::lookup::BusPublicInputs;
 use super::proof::stark::{DeepPolynomialOpening, MultiProof, StarkProof};
 use super::trace::TraceTable;
-use super::lookup::BusPublicInputs;
 use super::traits::AIR;
 
 type AirAndTrace<'a, Field, FieldExtension, PI> = (
@@ -41,10 +41,7 @@ type AirAndTrace<'a, Field, FieldExtension, PI> = (
     &'a mut TraceTable<Field, FieldExtension>,
 );
 
-type MainCommitment<Field> = (
-    Round1CommitmentData<Field>,
-    Vec<Vec<FieldElement<Field>>>,
-);
+type MainCommitment<Field> = (Round1CommitmentData<Field>, Vec<Vec<FieldElement<Field>>>);
 
 /// A default STARK prover implementing `IsStarkProver`.
 pub struct Prover<
@@ -484,12 +481,13 @@ pub trait IsStarkProver<
         FieldElement<FieldExtension>: AsBytes,
     {
         // Compute the evaluations of the composition polynomial on the LDE domain.
-        let bus_interactions = if round_1_result.bus_interactions.is_empty() { None } else { Some(&round_1_result.bus_interactions[..]) };
-        let evaluator = ConstraintEvaluator::new(
-            air,
-            &round_1_result.rap_challenges,
-            bus_interactions,
-        );
+        let bus_interactions = if round_1_result.bus_interactions.is_empty() {
+            None
+        } else {
+            Some(&round_1_result.bus_interactions[..])
+        };
+        let evaluator =
+            ConstraintEvaluator::new(air, &round_1_result.rap_challenges, bus_interactions);
         let constraint_evaluations = evaluator.evaluate(
             air,
             &round_1_result.lde_trace,
@@ -1072,12 +1070,13 @@ pub trait IsStarkProver<
 
         // <<<< Receive challenge: 𝛽
         let beta = transcript.sample_field_element();
-        let bus_interactions = if round_1_result.bus_interactions.is_empty() { None } else { Some(&round_1_result.bus_interactions[..]) };
+        let bus_interactions = if round_1_result.bus_interactions.is_empty() {
+            None
+        } else {
+            Some(&round_1_result.bus_interactions[..])
+        };
         let num_boundary_constraints = air
-            .boundary_constraints(
-                &round_1_result.rap_challenges,
-                bus_interactions,
-            )
+            .boundary_constraints(&round_1_result.rap_challenges, bus_interactions)
             .constraints
             .len();
 

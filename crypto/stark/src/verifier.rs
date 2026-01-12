@@ -7,7 +7,9 @@ use super::{
     traits::{AIR, TransitionEvaluationContext},
 };
 use crate::{
-    config::Commitment, domain::new_domain, lookup::LOGUP_NUM_CHALLENGES,
+    config::Commitment,
+    domain::new_domain,
+    lookup::LOGUP_NUM_CHALLENGES,
     proof::stark::{DeepPolynomialOpening, MultiProof},
 };
 use crypto::{fiat_shamir::is_transcript::IsStarkTranscript, merkle_tree::proof::Proof};
@@ -119,7 +121,11 @@ pub trait IsStarkVerifier<
 
         // <<<< Receive challenge: 𝛽
         let beta = transcript.sample_field_element();
-        let bus_interactions = if proof.bus_interactions.is_empty() { None } else { Some(&proof.bus_interactions[..]) };
+        let bus_interactions = if proof.bus_interactions.is_empty() {
+            None
+        } else {
+            Some(&proof.bus_interactions[..])
+        };
         let num_boundary_constraints = air
             .boundary_constraints(&rap_challenges, bus_interactions)
             .constraints
@@ -240,7 +246,11 @@ pub trait IsStarkVerifier<
         domain: &Domain<Field>,
         challenges: &Challenges<FieldExtension>,
     ) -> bool {
-        let bus_interactions = if proof.bus_interactions.is_empty() { None } else { Some(&proof.bus_interactions[..]) };
+        let bus_interactions = if proof.bus_interactions.is_empty() {
+            None
+        } else {
+            Some(&proof.bus_interactions[..])
+        };
         let boundary_constraints =
             air.boundary_constraints(&challenges.rap_challenges, bus_interactions);
 
@@ -870,7 +880,11 @@ pub trait IsStarkVerifier<
 
         // <<<< Receive challenge: 𝛽
         let beta = transcript.sample_field_element();
-        let bus_interactions = if proof.bus_interactions.is_empty() { None } else { Some(&proof.bus_interactions[..]) };
+        let bus_interactions = if proof.bus_interactions.is_empty() {
+            None
+        } else {
+            Some(&proof.bus_interactions[..])
+        };
         let num_boundary_constraints = air
             .boundary_constraints(&rap_challenges, bus_interactions)
             .constraints

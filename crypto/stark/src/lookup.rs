@@ -306,10 +306,7 @@ where
         }
 
         // User-defined boundary constraints
-        boundary_constraints.extend(B::boundary_constraints(
-            &self.pub_inputs,
-            rap_challenges,
-        ));
+        boundary_constraints.extend(B::boundary_constraints(&self.pub_inputs, rap_challenges));
 
         BoundaryConstraints::from_constraints(boundary_constraints)
     }
