@@ -422,3 +422,254 @@ fn test_powers_of_two() {
         }
     }
 }
+
+// ============== EXTENSION FIELD ASM TESTS ==============
+// Tests for Fp2 and Fp3 operations using ASM-optimized base field ops
+
+mod extension_asm_tests {
+    use crate::field::fields::fft_friendly::goldilocks_extensions_asm::{
+        mul_by_6, mul_by_7, mul_by_4,
+        fp2_add, fp2_sub, fp2_mul, fp2_square, fp2_neg, fp2_double,
+        fp2_conjugate, fp2_norm, fp2_scalar_mul,
+        fp3_add, fp3_sub, fp3_mul, fp3_square, fp3_neg, fp3_double, fp3_scalar_mul,
+    };
+    use crate::field::fields::fft_friendly::u64_goldilocks_asm::{
+        mul, sub_fast, GOLDILOCKS_PRIME,
+    };
+
+    fn canonicalize(x: u64) -> u64 {
+        if x >= GOLDILOCKS_PRIME { x - GOLDILOCKS_PRIME } else { x }
+    }
+
+    // ============== MULTIPLY BY CONSTANT TESTS ==============
+
+    #[test]
+    fn test_mul_by_4() {
+        let test_values = [5u64, 100, GOLDILOCKS_PRIME - 1, 1, 0, 123456789];
+        for a in test_values {
+            let result = mul_by_4(a);
+            let expected = mul(a, 4);
+            assert_eq!(
+                canonicalize(result), canonicalize(expected),
+                "mul_by_4 mismatch for a={}", a
+            );
+        }
+    }
+
+    #[test]
+    fn test_mul_by_6() {
+        let test_values = [5u64, 100, GOLDILOCKS_PRIME - 1, 1, 0, 123456789];
+        for a in test_values {
+            let result = mul_by_6(a);
+            let expected = mul(a, 6);
+            assert_eq!(
+                canonicalize(result), canonicalize(expected),
+                "mul_by_6 mismatch for a={}", a
+            );
+        }
+    }
+
+    #[test]
+    fn test_mul_by_7() {
+        let test_values = [5u64, 100, GOLDILOCKS_PRIME - 1, 1, 0, 123456789];
+        for a in test_values {
+            let result = mul_by_7(a);
+            let expected = mul(a, 7);
+            assert_eq!(
+                canonicalize(result), canonicalize(expected),
+                "mul_by_7 mismatch for a={}", a
+            );
+        }
+    }
+
+    // ============== FP2 TESTS ==============
+
+    #[test]
+    fn test_fp2_add() {
+        let a = [3u64, 4u64];
+        let b = [1u64, 2u64];
+        let c = fp2_add(a, b);
+        assert_eq!(canonicalize(c[0]), 4);
+        assert_eq!(canonicalize(c[1]), 6);
+    }
+
+    #[test]
+    fn test_fp2_sub() {
+        let a = [10u64, 8u64];
+        let b = [3u64, 2u64];
+        let c = fp2_sub(a, b);
+        assert_eq!(canonicalize(c[0]), 7);
+        assert_eq!(canonicalize(c[1]), 6);
+    }
+
+    #[test]
+    fn test_fp2_mul() {
+        let a = [3u64, 4u64];
+        let b = [1u64, 2u64];
+        // (3 + 4w)(1 + 2w) = 3 + 6w + 4w + 8w^2 = 3 + 10w + 8*7 = 59 + 10w
+        let c = fp2_mul(a, b);
+        assert_eq!(canonicalize(c[0]), 59);
+        assert_eq!(canonicalize(c[1]), 10);
+    }
+
+    #[test]
+    fn test_fp2_square() {
+        let a = [3u64, 4u64];
+        // (3 + 4w)^2 = 9 + 24w + 16w^2 = 9 + 24w + 112 = 121 + 24w
+        let c = fp2_square(a);
+        assert_eq!(canonicalize(c[0]), 121);
+        assert_eq!(canonicalize(c[1]), 24);
+
+        // Verify square equals mul(a, a)
+        let c_mul = fp2_mul(a, a);
+        assert_eq!(canonicalize(c[0]), canonicalize(c_mul[0]));
+        assert_eq!(canonicalize(c[1]), canonicalize(c_mul[1]));
+    }
+
+    #[test]
+    fn test_fp2_neg() {
+        let a = [3u64, 4u64];
+        let neg_a = fp2_neg(a);
+        let sum = fp2_add(a, neg_a);
+        assert_eq!(canonicalize(sum[0]), 0);
+        assert_eq!(canonicalize(sum[1]), 0);
+    }
+
+    #[test]
+    fn test_fp2_double() {
+        let a = [5u64, 7u64];
+        let doubled = fp2_double(a);
+        let added = fp2_add(a, a);
+        assert_eq!(canonicalize(doubled[0]), canonicalize(added[0]));
+        assert_eq!(canonicalize(doubled[1]), canonicalize(added[1]));
+    }
+
+    #[test]
+    fn test_fp2_conjugate() {
+        let a = [3u64, 4u64];
+        let conj = fp2_conjugate(a);
+        assert_eq!(canonicalize(conj[0]), 3);
+        // -4 mod p = p - 4
+        assert_eq!(canonicalize(conj[1]), GOLDILOCKS_PRIME - 4);
+    }
+
+    #[test]
+    fn test_fp2_norm() {
+        let a = [3u64, 4u64];
+        // norm = 3^2 - 7*4^2 = 9 - 112 = -103 mod p
+        let norm = fp2_norm(a);
+        let expected = sub_fast(9, 112);
+        assert_eq!(canonicalize(norm), canonicalize(expected));
+    }
+
+    #[test]
+    fn test_fp2_scalar_mul() {
+        let a = [3u64, 4u64];
+        let scalar = 5u64;
+        let result = fp2_scalar_mul(scalar, a);
+        assert_eq!(canonicalize(result[0]), 15);
+        assert_eq!(canonicalize(result[1]), 20);
+    }
+
+    #[test]
+    fn test_fp2_mul_one() {
+        let a = [5u64, 7u64];
+        let one = [1u64, 0u64];
+        let result = fp2_mul(a, one);
+        assert_eq!(canonicalize(result[0]), canonicalize(a[0]));
+        assert_eq!(canonicalize(result[1]), canonicalize(a[1]));
+    }
+
+    #[test]
+    fn test_fp2_mul_commutativity() {
+        let a = [5u64, 7u64];
+        let b = [13u64, 17u64];
+        let ab = fp2_mul(a, b);
+        let ba = fp2_mul(b, a);
+        assert_eq!(canonicalize(ab[0]), canonicalize(ba[0]));
+        assert_eq!(canonicalize(ab[1]), canonicalize(ba[1]));
+    }
+
+    // ============== FP3 TESTS ==============
+
+    #[test]
+    fn test_fp3_add() {
+        let a = [1u64, 2u64, 3u64];
+        let b = [4u64, 5u64, 6u64];
+        let c = fp3_add(a, b);
+        assert_eq!(canonicalize(c[0]), 5);
+        assert_eq!(canonicalize(c[1]), 7);
+        assert_eq!(canonicalize(c[2]), 9);
+    }
+
+    #[test]
+    fn test_fp3_sub() {
+        let a = [10u64, 8u64, 6u64];
+        let b = [3u64, 2u64, 1u64];
+        let c = fp3_sub(a, b);
+        assert_eq!(canonicalize(c[0]), 7);
+        assert_eq!(canonicalize(c[1]), 6);
+        assert_eq!(canonicalize(c[2]), 5);
+    }
+
+    #[test]
+    fn test_fp3_neg() {
+        let a = [3u64, 4u64, 5u64];
+        let neg_a = fp3_neg(a);
+        let sum = fp3_add(a, neg_a);
+        assert_eq!(canonicalize(sum[0]), 0);
+        assert_eq!(canonicalize(sum[1]), 0);
+        assert_eq!(canonicalize(sum[2]), 0);
+    }
+
+    #[test]
+    fn test_fp3_double() {
+        let a = [5u64, 7u64, 11u64];
+        let doubled = fp3_double(a);
+        let added = fp3_add(a, a);
+        assert_eq!(canonicalize(doubled[0]), canonicalize(added[0]));
+        assert_eq!(canonicalize(doubled[1]), canonicalize(added[1]));
+        assert_eq!(canonicalize(doubled[2]), canonicalize(added[2]));
+    }
+
+    #[test]
+    fn test_fp3_square_equals_mul() {
+        let a = [5u64, 7u64, 11u64];
+        let sq = fp3_square(a);
+        let mul_result = fp3_mul(a, a);
+        assert_eq!(canonicalize(sq[0]), canonicalize(mul_result[0]));
+        assert_eq!(canonicalize(sq[1]), canonicalize(mul_result[1]));
+        assert_eq!(canonicalize(sq[2]), canonicalize(mul_result[2]));
+    }
+
+    #[test]
+    fn test_fp3_scalar_mul() {
+        let a = [2u64, 3u64, 4u64];
+        let scalar = 5u64;
+        let result = fp3_scalar_mul(scalar, a);
+        assert_eq!(canonicalize(result[0]), 10);
+        assert_eq!(canonicalize(result[1]), 15);
+        assert_eq!(canonicalize(result[2]), 20);
+    }
+
+    #[test]
+    fn test_fp3_mul_commutativity() {
+        let a = [5u64, 7u64, 11u64];
+        let b = [13u64, 17u64, 19u64];
+        let ab = fp3_mul(a, b);
+        let ba = fp3_mul(b, a);
+        assert_eq!(canonicalize(ab[0]), canonicalize(ba[0]));
+        assert_eq!(canonicalize(ab[1]), canonicalize(ba[1]));
+        assert_eq!(canonicalize(ab[2]), canonicalize(ba[2]));
+    }
+
+    #[test]
+    fn test_fp3_mul_one() {
+        let a = [5u64, 7u64, 11u64];
+        let one = [1u64, 0u64, 0u64];
+        let result = fp3_mul(a, one);
+        assert_eq!(canonicalize(result[0]), canonicalize(a[0]));
+        assert_eq!(canonicalize(result[1]), canonicalize(a[1]));
+        assert_eq!(canonicalize(result[2]), canonicalize(a[2]));
+    }
+}

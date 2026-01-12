@@ -566,12 +566,13 @@ pub type Fp3E = FieldElement<Degree3GoldilocksNativeExtensionField>;
 // =====================================================
 
 /// Multiply a field element by 7 (the quadratic non-residue).
-/// Uses 7 = 8 - 1 = (x << 3) - x for efficiency.
+/// Uses 7 = 1 + 2 + 4 for efficiency (2 doubles + 2 adds, saves one double vs 8-1).
 #[inline(always)]
 fn mul_by_7(a: &FpE) -> FpE {
-    // 7 * a = 8 * a - a = (a << 3) - a
-    let a8 = a.double().double().double();
-    a8 - *a
+    // 7 * a = a + 2a + 4a
+    let a2 = a.double();
+    let a4 = a2.double();
+    *a + a2 + a4
 }
 
 #[cfg(test)]
