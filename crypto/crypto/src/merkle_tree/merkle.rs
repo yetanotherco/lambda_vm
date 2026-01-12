@@ -1,8 +1,8 @@
 use core::fmt::Display;
 
-use alloc::vec::Vec;
-
 use super::{proof::Proof, traits::IsMerkleTreeBackend, utils::*};
+use alloc::vec::Vec;
+use std::collections::HashSet;
 
 #[derive(Debug)]
 pub enum Error {
@@ -98,5 +98,45 @@ where
         }
 
         Ok(merkle_path)
+    }
+    pub fn get_batch_proof(&self, pos_list: &[usize]) -> Vec<B::Node> {
+        let leaves_indices = pos_list
+            .iter()
+            .map(|pos| pos + self.nodes.len() / 2)
+            .collect::<Vec<usize>>();
+        let batch_auth_path_positions = self.get_batch_auth_path_positions(&leaves_indices);
+
+        let batch_auth_path_nodes = batch_auth_path_positions
+            .iter()
+            .map(|pos| self.nodes[*pos].clone())
+            .collect();
+        batch_auth_path_nodes
+    }
+
+    fn get_batch_auth_path_positions(&self, leaf_positions: &[usize]) -> Vec<usize> {
+        let mut auth_set = HashSet::<usize>::new();
+        // Add all the leaves to the set of obtainable nodes, because we already have them.
+        let mut obtainable_nodes_by_level: HashSet<usize> =
+            leaf_positions.iter().cloned().collect();
+
+        let num_levels = (self.nodes.len() as f32).log2().ceil() as usize;
+
+        for _ in 0..num_levels - 1 {
+            let mut parent_level_obtainable_positions = HashSet::new();
+            for pos in &obtainable_nodes_by_level {
+                let sibling_pos = get_sibiling_pos(*pos);
+
+                let sibling_is_obtainable = obtainable_nodes_by_level.contains(&sibling_pos)
+                    || auth_set.contains(&sibling_pos);
+                if !sibling_is_obtainable {
+                    auth_set.insert(sibling_pos);
+                }
+                parent_level_obtainable_positions.insert(get_parent_pos(*pos));
+            }
+
+            obtainable_nodes_by_level = parent_level_obtainable_positions;
+        }
+
+        auth_set.into_iter().collect()
     }
 }

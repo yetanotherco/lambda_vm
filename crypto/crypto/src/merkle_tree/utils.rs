@@ -20,6 +20,25 @@ pub fn parent_index(node_index: usize) -> usize {
     }
 }
 
+pub fn get_sibiling_pos(node_index: usize) -> usize {
+    if node_index.is_multiple_of(2) {
+        if node_index == 0 {
+            return node_index;
+        }
+        node_index - 1
+    } else {
+        node_index + 1
+    }
+}
+
+pub fn get_parent_pos(node_index: usize) -> usize {
+    if node_index.is_multiple_of(2) {
+        (node_index - 1) / 2
+    } else {
+        node_index / 2
+    }
+}
+
 // The list of values is completed repeating the last value to a power of two length
 pub fn complete_until_power_of_two<T: Clone>(mut values: Vec<T>) -> Vec<T> {
     while !is_power_of_two(values.len()) {

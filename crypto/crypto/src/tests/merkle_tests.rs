@@ -76,3 +76,33 @@ fn build_merkle_tree_from_a_single_value() {
 fn build_empty_tree_should_not_panic() {
     assert!(MerkleTree::<TestBackend<U64PF>>::build(&[]).is_none());
 }
+#[test]
+fn batch_proof_len_is_expected() {
+    let values: Vec<FE> = (1..=8).map(FE::new).collect();
+    let merkle_tree = MerkleTree::<TestBackend<U64PF>>::build(&values).unwrap();
+    assert_eq!(merkle_tree.get_batch_proof(&[0, 5]).len(), 4);
+}
+#[test]
+fn batch_proof_is_expected() {
+    const MODULUS: u64 = 70;
+    type U64PF = U64PrimeField<MODULUS>;
+    type FE = FieldElement<U64PF>;
+
+    let values: Vec<FE> = (1..=8).map(FE::new).collect();
+    let merkle_tree = MerkleTree::<TestBackend<U64PF>>::build(&values).unwrap();
+    let batch_proof = merkle_tree.get_batch_proof(&[0, 1]);
+    assert_eq!(batch_proof, vec![FE::new(14), FE::new(52)]);
+}
+
+#[test]
+fn batch_proof_len_is_expected_for_long_pos_list() {
+    const MODULUS: u64 = 70;
+    type U64PF = U64PrimeField<MODULUS>;
+    type FE = FieldElement<U64PF>;
+
+    let values: Vec<FE> = (1..=16).map(FE::new).collect();
+    let merkle_tree = MerkleTree::<TestBackend<U64PF>>::build(&values).unwrap();
+    let pos_list = (0..=9).collect::<Vec<usize>>();
+    let batch_proof = merkle_tree.get_batch_proof(&pos_list);
+    assert_eq!(batch_proof.len(), 2);
+}
