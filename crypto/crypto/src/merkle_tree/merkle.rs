@@ -2,7 +2,7 @@ use core::fmt::Display;
 
 use super::{proof::Proof, traits::IsMerkleTreeBackend, utils::*};
 use alloc::vec::Vec;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 #[derive(Debug)]
 pub enum Error {
@@ -114,7 +114,7 @@ where
     }
 
     fn get_batch_auth_path_positions(&self, leaf_positions: &[usize]) -> Vec<usize> {
-        let mut auth_set = HashSet::<usize>::new();
+        let mut auth_set = BTreeSet::<usize>::new();
         // Add all the leaves to the set of obtainable nodes, because we already have them.
         let mut obtainable_nodes_by_level: HashSet<usize> =
             leaf_positions.iter().cloned().collect();
@@ -137,6 +137,6 @@ where
             obtainable_nodes_by_level = parent_level_obtainable_positions;
         }
 
-        auth_set.into_iter().collect()
+        auth_set.into_iter().rev().collect()
     }
 }
