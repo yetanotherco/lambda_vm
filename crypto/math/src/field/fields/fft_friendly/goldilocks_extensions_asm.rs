@@ -260,29 +260,87 @@ pub fn fp3_scalar_mul(scalar: u64, a: [u64; 3]) -> [u64; 3] {
 }
 
 // =====================================================
-// SUBFIELD OPERATIONS
+// SUBFIELD OPERATIONS (Fp2)
 // =====================================================
+// All operations support both argument orders with zero overhead.
 
-/// Add base field element to Fp2: [a + b0, b1]
+/// Add base field element to Fp2: base + ext = [a + b0, b1]
 #[inline(always)]
 pub fn fp2_add_base(a: u64, b: [u64; 2]) -> [u64; 2] {
     [add_fast(a, b[0]), b[1]]
 }
 
-/// Subtract Fp2 from base field element: [a - b0, -b1]
+/// Add Fp2 to base field element: ext + base = [a0 + b, a1]
+/// Same as fp2_add_base due to commutativity.
+#[inline(always)]
+pub fn fp2_ext_add_base(a: [u64; 2], b: u64) -> [u64; 2] {
+    [add_fast(a[0], b), a[1]]
+}
+
+/// Subtract Fp2 from base field element: base - ext = [a - b0, -b1]
 #[inline(always)]
 pub fn fp2_sub_from_base(a: u64, b: [u64; 2]) -> [u64; 2] {
     [sub_fast(a, b[0]), neg(b[1])]
 }
 
-/// Add base field element to Fp3: [a + b0, b1, b2]
+/// Subtract base field element from Fp2: ext - base = [a0 - b, a1]
+#[inline(always)]
+pub fn fp2_ext_sub_base(a: [u64; 2], b: u64) -> [u64; 2] {
+    [sub_fast(a[0], b), a[1]]
+}
+
+/// Multiply base field element by Fp2: base * ext = [a*b0, a*b1]
+#[inline(always)]
+pub fn fp2_mul_ext(a: u64, b: [u64; 2]) -> [u64; 2] {
+    [mul(a, b[0]), mul(a, b[1])]
+}
+
+/// Multiply Fp2 by base field element: ext * base = [a0*b, a1*b]
+/// Same as fp2_mul_ext due to commutativity.
+#[inline(always)]
+pub fn fp2_ext_mul_base(a: [u64; 2], b: u64) -> [u64; 2] {
+    [mul(a[0], b), mul(a[1], b)]
+}
+
+// =====================================================
+// SUBFIELD OPERATIONS (Fp3)
+// =====================================================
+// All operations support both argument orders with zero overhead.
+
+/// Add base field element to Fp3: base + ext = [a + b0, b1, b2]
 #[inline(always)]
 pub fn fp3_add_base(a: u64, b: [u64; 3]) -> [u64; 3] {
     [add_fast(a, b[0]), b[1], b[2]]
 }
 
-/// Subtract Fp3 from base field element: [a - b0, -b1, -b2]
+/// Add Fp3 to base field element: ext + base = [a0 + b, a1, a2]
+/// Same as fp3_add_base due to commutativity.
+#[inline(always)]
+pub fn fp3_ext_add_base(a: [u64; 3], b: u64) -> [u64; 3] {
+    [add_fast(a[0], b), a[1], a[2]]
+}
+
+/// Subtract Fp3 from base field element: base - ext = [a - b0, -b1, -b2]
 #[inline(always)]
 pub fn fp3_sub_from_base(a: u64, b: [u64; 3]) -> [u64; 3] {
     [sub_fast(a, b[0]), neg(b[1]), neg(b[2])]
+}
+
+/// Subtract base field element from Fp3: ext - base = [a0 - b, a1, a2]
+#[inline(always)]
+pub fn fp3_ext_sub_base(a: [u64; 3], b: u64) -> [u64; 3] {
+    [sub_fast(a[0], b), a[1], a[2]]
+}
+
+/// Multiply base field element by Fp3: base * ext = [a*b0, a*b1, a*b2]
+#[inline(always)]
+pub fn fp3_mul_ext(a: u64, b: [u64; 3]) -> [u64; 3] {
+    [mul(a, b[0]), mul(a, b[1]), mul(a, b[2])]
+}
+
+/// Multiply Fp3 by base field element: ext * base = [a0*b, a1*b, a2*b]
+/// Same as fp3_mul_ext due to commutativity.
+#[inline(always)]
+pub fn fp3_ext_mul_base(a: [u64; 3], b: u64) -> [u64; 3] {
+    [mul(a[0], b), mul(a[1], b), mul(a[2], b)]
 }
