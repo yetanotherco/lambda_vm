@@ -50,7 +50,7 @@ Only the elements corresponding to the `writeN` bits are guaranteed"""
 [[variables.auxiliary]]
 name = "address_add"
 type = ["DWordHL", 7]
-desc = "`base_address + i + 1`"
+desc = "`address_add[i] = base_address + i + 1`"
 
 [[variables.auxiliary]]
 name = "old_timestamp"
@@ -80,7 +80,7 @@ desc = "Whether we are performing a write (and hence not return `out`)"
 
 [[assumptions]]
 desc = "`IS_WORD[base_address[i]]`"
-range = ["i", 0, 7]
+range = ["i", 0, 1]
 
 [[assumptions]]
 desc = "`IS_BIT<write2>`"
