@@ -39,7 +39,7 @@ $(ASM_ARTIFACTS_DIR)/%.elf: $(ASM_ARTIFACTS_DIR)/%.o
 # Compile rust
 $(RUST_ARTIFACTS_DIR)/%.elf: $(RUST_PROGRAMS_DIR)/%/Cargo.toml
 	cd $(RUST_PROGRAMS_DIR)/$* && \
-		cargo build \
+		cargo +nightly build \
 			--target riscv32im-lambda-vm-elf \
 			-Z build-std=core,alloc,std,compiler_builtins,panic_abort \
 			-Z build-std-features=compiler-builtins-mem 
@@ -48,7 +48,7 @@ $(RUST_ARTIFACTS_DIR)/%.elf: $(RUST_PROGRAMS_DIR)/%/Cargo.toml
 # Compile rust benches
 $(BENCH_ARTIFACTS_DIR)/%.elf: $(BENCH_PROGRAMS_DIR)/%/Cargo.toml
 	cd $(BENCH_PROGRAMS_DIR)/$* && \
-		cargo build \
+		cargo +nightly build \
 			--target riscv32im-lambda-vm-elf \
 			-Z build-std=core,compiler_builtins \
 			-Z build-std-features=compiler-builtins-mem 
