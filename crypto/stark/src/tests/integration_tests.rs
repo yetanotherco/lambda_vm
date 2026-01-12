@@ -509,3 +509,4 @@ fn test_multi_prove_different_airs() {
         &mut StoneProverTranscript::new(&[]),
     ));
 }
+

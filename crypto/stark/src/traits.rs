@@ -9,9 +9,7 @@ use math::{
     polynomial::Polynomial,
 };
 
-use crate::{
-    constraints::transition::TransitionConstraint, domain::Domain, lookup::BusPublicInputs,
-};
+use crate::{constraints::transition::TransitionConstraint, domain::Domain, lookup::BusPublicInputs};
 
 use super::{
     constraints::boundary::BoundaryConstraints, context::AirContext, frame::Frame,

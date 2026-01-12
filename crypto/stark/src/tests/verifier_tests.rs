@@ -14,7 +14,8 @@ use math::field::fields::fft_friendly::{
 
 use crate::constraints::transition::TransitionConstraint;
 use crate::lookup::{
-    AirWithBuses, AuxiliaryTraceBuildData, NullBoundaryConstraintBuilder, TableInteraction,
+    AirWithBuses, AuxiliaryTraceBuildData, NullBoundaryConstraintBuilder,
+    TableInteraction,
 };
 use crate::proof::options::ProofOptions;
 use crate::proof::stark::MultiProof;
@@ -148,7 +149,11 @@ fn test_verify_serialized_multi_table_proofs() {
             (&mul_air, &mut mul_trace),
         ];
 
-        Prover::multi_prove(airs, &mut DefaultTranscript::<E>::new(&[])).unwrap()
+        Prover::multi_prove(
+            airs,
+            &mut DefaultTranscript::<E>::new(&[]),
+        )
+        .unwrap()
     };
 
     // =========================================================================
@@ -189,8 +194,11 @@ fn test_verify_serialized_multi_table_proofs() {
     );
 
     // Verify the proofs
-    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
-        vec![&cpu_air, &add_air, &mul_air];
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
+        &cpu_air,
+        &add_air,
+        &mul_air,
+    ];
 
     assert!(
         Verifier::multi_verify(
@@ -215,25 +223,18 @@ fn create_cpu_air_for_prover(
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![
             TableInteraction {
-                multiplicity_column: 0,
+                flag_columns: vec![0],
                 value_columns: vec![2, 3, 4],
                 is_sender: true,
             },
             TableInteraction {
-                multiplicity_column: 1,
+                flag_columns: vec![1],
                 value_columns: vec![2, 3, 4],
                 is_sender: true,
             },
         ],
     };
-    AirWithBuses::create(
-        trace,
-        auxiliary_trace_build_data,
-        proof_options,
-        1,
-        transition_constraints,
-        (),
-    )
+    AirWithBuses::create(trace, auxiliary_trace_build_data, proof_options, 1, transition_constraints, ())
 }
 
 /// Creates a CPU AIR for the verifier (no trace needed)
@@ -246,12 +247,12 @@ fn create_cpu_air_for_verifier(
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![
             TableInteraction {
-                multiplicity_column: 0,
+                flag_columns: vec![0],
                 value_columns: vec![2, 3, 4],
                 is_sender: true,
             },
             TableInteraction {
-                multiplicity_column: 1,
+                flag_columns: vec![1],
                 value_columns: vec![2, 3, 4],
                 is_sender: true,
             },
@@ -276,19 +277,12 @@ fn create_add_air_for_prover(
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![TableInteraction {
-            multiplicity_column: 3,
+            flag_columns: vec![3],
             value_columns: vec![0, 1, 2],
             is_sender: false,
         }],
     };
-    AirWithBuses::create(
-        trace,
-        auxiliary_trace_build_data,
-        proof_options,
-        1,
-        transition_constraints,
-        (),
-    )
+    AirWithBuses::create(trace, auxiliary_trace_build_data, proof_options, 1, transition_constraints, ())
 }
 
 /// Creates an ADD AIR for the verifier
@@ -300,7 +294,7 @@ fn create_add_air_for_verifier(
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![TableInteraction {
-            multiplicity_column: 3,
+            flag_columns: vec![3],
             value_columns: vec![0, 1, 2],
             is_sender: false,
         }],
@@ -324,19 +318,12 @@ fn create_mul_air_for_prover(
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![TableInteraction {
-            multiplicity_column: 3,
+            flag_columns: vec![3],
             value_columns: vec![0, 1, 2],
             is_sender: false,
         }],
     };
-    AirWithBuses::create(
-        trace,
-        auxiliary_trace_build_data,
-        proof_options,
-        1,
-        transition_constraints,
-        (),
-    )
+    AirWithBuses::create(trace, auxiliary_trace_build_data, proof_options, 1, transition_constraints, ())
 }
 
 /// Creates a MUL AIR for the verifier
@@ -348,7 +335,7 @@ fn create_mul_air_for_verifier(
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![TableInteraction {
-            multiplicity_column: 3,
+            flag_columns: vec![3],
             value_columns: vec![0, 1, 2],
             is_sender: false,
         }],
