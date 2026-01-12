@@ -625,7 +625,7 @@ impl AddFourCarryBitConstraint {
     ///
     /// # Arguments
     /// * `carry_idx` - Which carry to constrain: `CarryIndex::Zero` for low word (bits 0-15),
-    ///                 `CarryIndex::One` for high word (bits 16-31)
+    ///   `CarryIndex::One` for high word (bits 16-31)
     /// * `flag` - Tuple of (column_index, is_negated):
     ///   - `column_index`: Column containing the activation flag
     ///   - `is_negated`: If true, constraint activates when flag = 0; if false, when flag = 1

@@ -453,7 +453,7 @@ impl CpuTableRow {
         let mut res = Vec::with_capacity(num_of_rows * row_len);
 
         for _ in 0..num_of_rows {
-            res.extend(std::iter::repeat(FE::zero()).take(Self::NUM_COLUMNS - 1));
+            res.extend(std::iter::repeat_n(FE::zero(), Self::NUM_COLUMNS - 1));
             res.push(FE::one());
         }
         res
