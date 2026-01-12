@@ -51,6 +51,10 @@ wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "dep:web-sys"]
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dev-dependencies]
 proptest = "1.2.0"
 
+[[bench]]
+name = "fri_fold_benchmark"
+harness = false
+
 [package.metadata.wasm-pack.profile.dev]
 # Should `wasm-opt` be used to further optimize the wasm binary generated after
 # the Rust compiler has finished? Using `wasm-opt` can often further decrease
