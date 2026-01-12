@@ -19,4 +19,4 @@ runs:
     
     - name: Add Rust to PATH
       shell: bash
-      run: echo "$HOME/lambda_rust/usr/local/bin" >> $GITHUB_PATH
+      run: echo "$HOME/lambda_rust/my_rust/usr/local/bin" >> $GITHUB_PATH
