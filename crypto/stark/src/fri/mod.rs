@@ -74,39 +74,42 @@ where
 }
 
 pub fn query_phase<F: IsField>(
-    fri_layers: &Vec<FriLayer<F, BatchedMerkleTreeBackend<F>>>,
+    fri_layers: &[FriLayer<F, BatchedMerkleTreeBackend<F>>],
     iotas: &[usize],
 ) -> Vec<FriDecommitment<F>>
 where
     FieldElement<F>: AsBytes + Sync + Send,
 {
-    if !fri_layers.is_empty() {
-        iotas
-            .iter()
-            .map(|iota_s| {
-                let mut layers_evaluations_sym = Vec::new();
-                let mut layers_auth_paths_sym = Vec::new();
-
-                let mut index = *iota_s;
-                for layer in fri_layers {
-                    // symmetric element
-                    let evaluation_sym = layer.evaluation[index ^ 1].clone();
-                    let auth_path_sym = layer.merkle_tree.get_proof_by_pos(index >> 1).unwrap();
-                    layers_evaluations_sym.push(evaluation_sym);
-                    layers_auth_paths_sym.push(auth_path_sym);
-
-                    index >>= 1;
-                }
-
-                FriDecommitment {
-                    layers_auth_paths: layers_auth_paths_sym,
-                    layers_evaluations_sym,
-                }
-            })
-            .collect()
-    } else {
-        vec![]
+    if fri_layers.is_empty() {
+        return vec![];
     }
+
+    let num_layers = fri_layers.len();
+
+    iotas
+        .iter()
+        .map(|iota_s| {
+            // Pre-allocate with exact capacity
+            let mut layers_evaluations_sym = Vec::with_capacity(num_layers);
+            let mut layers_auth_paths_sym = Vec::with_capacity(num_layers);
+
+            let mut index = *iota_s;
+            for layer in fri_layers {
+                // symmetric element
+                let evaluation_sym = layer.evaluation[index ^ 1].clone();
+                let auth_path_sym = layer.merkle_tree.get_proof_by_pos(index >> 1).unwrap();
+                layers_evaluations_sym.push(evaluation_sym);
+                layers_auth_paths_sym.push(auth_path_sym);
+
+                index >>= 1;
+            }
+
+            FriDecommitment {
+                layers_auth_paths: layers_auth_paths_sym,
+                layers_evaluations_sym,
+            }
+        })
+        .collect()
 }
 
 pub fn new_fri_layer<F: IsFFTField + IsSubFieldOf<E>, E: IsField>(
@@ -123,15 +126,20 @@ where
 
     in_place_bit_reverse_permute(&mut evaluation);
 
-    let mut to_commit = Vec::new();
-    for chunk in evaluation.chunks(2) {
-        to_commit.push(vec![chunk[0].clone(), chunk[1].clone()]);
-    }
+    // Pre-allocate with exact capacity to avoid reallocations
+    // FRI uses power-of-2 sizes, so chunks_exact is safe
+    let num_leaves = evaluation.len() / 2;
+    let to_commit: Vec<Vec<FieldElement<E>>> = evaluation
+        .chunks_exact(2)
+        .map(|chunk| vec![chunk[0].clone(), chunk[1].clone()])
+        .collect();
+    debug_assert_eq!(to_commit.len(), num_leaves);
 
     let merkle_tree = BatchedMerkleTree::build(&to_commit).unwrap();
 
-    FriLayer::new(
-        &evaluation,
+    // Use from_owned to avoid cloning the evaluation vector
+    FriLayer::from_owned(
+        evaluation,
         merkle_tree,
         coset_offset.clone().to_extension(),
         domain_size,
