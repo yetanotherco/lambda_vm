@@ -15,7 +15,7 @@ use crate::config::{BatchedMerkleTree, BatchedMerkleTreeBackend};
 
 use self::fri_commitment::FriLayer;
 use self::fri_decommit::FriDecommitment;
-use self::fri_functions::fold_polynomial;
+use self::fri_functions::fold_polynomial_scaled;
 
 pub fn commit_phase<F: IsFFTField + IsSubFieldOf<E>, E: IsField>(
     number_layers: usize,
@@ -34,10 +34,12 @@ where
     let mut domain_size = domain_size;
 
     let mut fri_layer_list = Vec::with_capacity(number_layers);
-    let mut current_layer: FriLayer<E, BatchedMerkleTreeBackend<E>>;
     let mut current_poly = p_0;
 
     let mut coset_offset = coset_offset.clone();
+
+    // Precompute constant to avoid repeated field element construction
+    let two: FieldElement<E> = FieldElement::<F>::from(2).to_extension();
 
     for _ in 1..number_layers {
         // <<<< Receive challenge 𝜁ₖ₋₁
@@ -45,20 +47,22 @@ where
         coset_offset = coset_offset.square();
         domain_size /= 2;
 
-        // Compute layer polynomial and domain
-        current_poly = FieldElement::<F>::from(2) * fold_polynomial(&current_poly, &zeta);
-        current_layer = new_fri_layer(&current_poly, &coset_offset, domain_size);
-        let new_data = &current_layer.merkle_tree.root;
-        fri_layer_list.push(current_layer.clone()); // TODO: remove this clone
+        // Compute layer polynomial and domain (fused scalar multiplication)
+        current_poly = fold_polynomial_scaled(&current_poly, &zeta, &two);
+        let current_layer = new_fri_layer(&current_poly, &coset_offset, domain_size);
+
+        // Copy root (small hash) before moving layer to avoid clone
+        let new_data = current_layer.merkle_tree.root.clone();
+        fri_layer_list.push(current_layer);
 
         // >>>> Send commitment: [pₖ]
-        transcript.append_bytes(new_data);
+        transcript.append_bytes(&new_data);
     }
 
     // <<<< Receive challenge: 𝜁ₙ₋₁
     let zeta = transcript.sample_field_element();
 
-    let last_poly = FieldElement::<F>::from(2) * fold_polynomial(&current_poly, &zeta);
+    let last_poly = fold_polynomial_scaled(&current_poly, &zeta, &two);
 
     let last_value = last_poly
         .coefficients()
