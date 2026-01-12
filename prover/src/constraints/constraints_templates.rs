@@ -583,14 +583,15 @@ pub fn new_arg2_validity_constraint(
 }
 
 /// Enforces correct carry bit values for adding 4 to a 32-bit table value.
-/// - lhs is a 2-limb word
-/// - rhs is the constant 4, casted to a 2-limb word.
-/// - res is a 4-limb word, casted to a 2-limb word
+/// - `lhs`: A 2-limb word (each limb is 16 bits)
+/// - `rhs`: The constant 4, treated as a 2-limb word [4, 0]
+/// - `res`: Either a 2-limb or 4-limb word (2 limbs of 16 bits, or 4 limbs of 8 bits)
 ///
 /// Carry 0:
 /// lhs_0 = lhs[0]
 /// rhs_0 = 4
-/// res_0 = res[0] + 256 * res[1]
+/// res_0 = res[0] + 256 * res[1]  (when using 4 limbs)
+///      or res[0]                  (when using 2 limbs)
 ///
 /// carry_0 = (lhs_0 + rhs_0 - res_0) / 65536
 /// constraint: carry_0 * (carry_0 - 1) = 0
@@ -598,49 +599,56 @@ pub fn new_arg2_validity_constraint(
 /// Carry 1:
 /// lhs_1 = lhs[1]
 /// rhs_1 = 0
-/// res_1 = res[2] + 256 * res[3]
+/// res_1 = res[2] + 256 * res[3]  (when using 4 limbs)
+///      or res[1]                  (when using 2 limbs)
 ///
 /// carry_1 = (lhs_1 - res_1 + carry_0) / 65536
 /// constraint: flag * carry_1 * (carry_1 - 1) = 0
 ///
-/// The `flag` factor allows selective activation: the constraint is only enforced when one
-/// flag column is active. (No more than 1 flag can be active at the same time)
+/// ## Flag-Based Activation
+/// The `flag` parameter controls when the constraint is enforced:
+/// - When `flag.1 = false`: constraint active when column `flag.0` equals 1
+/// - When `flag.1 = true`: constraint active when column `flag.0` equals 0 (negated flag)
 ///
 /// Constraint Degree 3 (cubic), due to the multiplication of three terms: `flag * carry * (carry - 1)`.
 #[derive(Clone)]
 pub struct AddFourCarryBitConstraint {
     carry_idx: CarryIndex,
-    flag_idx: usize,
-    lhs_start_idx: usize,
-    res_start_idx: usize,
+    flag: (usize, bool),
+    lhs: (usize, usize),
+    res: (usize, usize),
     constraint_idx: usize,
-    is_flag_negated: bool,
 }
 
 impl AddFourCarryBitConstraint {
     /// Creates a new carry bit constraint.
     ///
     /// # Arguments
-    /// * `carry_idx` - Which carry to constrain (Zero or One)
-    /// * `flags_idx` - Columns containing activation flags
-    /// * `lhs_start_idx` - Starting column index for left operand's 2 limbs
-    /// * `res_start_idx` - Starting column index for result's 4 limbs
-    /// * `constraint_idx` - Unique constraint identifier
+    /// * `carry_idx` - Which carry to constrain: `CarryIndex::Zero` for low word (bits 0-15),
+    ///                 `CarryIndex::One` for high word (bits 16-31)
+    /// * `flag` - Tuple of (column_index, is_negated):
+    ///   - `column_index`: Column containing the activation flag
+    ///   - `is_negated`: If true, constraint activates when flag = 0; if false, when flag = 1
+    /// * `lhs` - Tuple of (start_index, num_limbs):
+    ///   - `start_index`: Starting column for left operand
+    ///   - `num_limbs`: Number of limbs (should always be 2 for 32-bit values)
+    /// * `res` - Tuple of (start_index, num_limbs):
+    ///   - `start_index`: Starting column for result
+    ///   - `num_limbs`: Number of limbs (2 for 16-bit limbs, 4 for 8-bit limbs)
+    /// * `constraint_idx` - Unique constraint identifier for the constraint system
     fn new(
         carry_idx: CarryIndex,
-        flag_idx: usize,
-        lhs_start_idx: usize,
-        res_start_idx: usize,
+        flag: (usize, bool),
+        lhs: (usize, usize),
+        res: (usize, usize),
         constraint_idx: usize,
-        is_flag_negated: bool,
     ) -> Self {
         Self {
             carry_idx,
-            flag_idx,
-            lhs_start_idx,
-            res_start_idx,
+            flag,
+            lhs,
+            res,
             constraint_idx,
-            is_flag_negated,
         }
     }
 
@@ -649,14 +657,18 @@ impl AddFourCarryBitConstraint {
         F: IsSubFieldOf<E>,
         E: IsField,
     {
-        let mut flag = step.get_main_evaluation_element(0, self.flag_idx).clone();
-        if self.is_flag_negated {
+        let mut flag = step.get_main_evaluation_element(0, self.flag.0).clone();
+        if self.flag.1 {
             flag = FieldElement::<F>::one() - flag;
         }
 
-        let lhs_0 = step.get_main_evaluation_element(0, self.lhs_start_idx);
+        let lhs_0 = step.get_main_evaluation_element(0, self.lhs.0);
         let rhs_0 = FieldElement::<F>::from(4);
-        let res_0 = compute_element_from_two_limbs_starting_at(step, self.res_start_idx);
+        let res_0 = match self.res.1 {
+            2 => step.get_main_evaluation_element(0, self.res.0),
+            4 => &compute_element_from_two_limbs_starting_at(step, self.res.0),
+            _ => panic!("Invalid number of limbs"),
+        };
 
         let one = FieldElement::<F>::one();
         let inverse = FieldElement::<F>::from(INV_65536);
@@ -666,10 +678,14 @@ impl AddFourCarryBitConstraint {
             CarryIndex::Zero => flag * carry_0.clone() * (carry_0 - one),
             CarryIndex::One => {
                 // Compute the high word using the first 2 operand limbs.
-                let lhs_1 = step.get_main_evaluation_element(0, self.lhs_start_idx + 1);
+                let lhs_1 = step.get_main_evaluation_element(0, self.lhs.0 + 1);
                 let rhs_1 = FieldElement::<F>::zero();
-                let res_1 =
-                    compute_element_from_two_limbs_starting_at(step, self.res_start_idx + 2);
+                // let res_1 = compute_element_from_two_limbs_starting_at(step, self.res.0 + 2);
+                let res_1 = match self.res.1 {
+                    2 => step.get_main_evaluation_element(0, self.res.0 + 1),
+                    4 => &compute_element_from_two_limbs_starting_at(step, self.res.0 + 2),
+                    _ => unreachable!(),
+                };
 
                 let carry_1 = (lhs_1 + rhs_1 - res_1 + carry_0) * inverse;
                 flag * carry_1.clone() * (carry_1 - one)
@@ -718,7 +734,6 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
             } => {
                 let bit_constraint =
                     self.compute_add_four_carry_bit_constraint(frame.get_evaluation_step(0));
-                println!("Bit constraint: {:?}", bit_constraint);
                 transition_evaluations[self.constraint_idx()] = bit_constraint.to_extension();
             }
 
@@ -738,30 +753,37 @@ impl TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField
 /// Creates the carry bit constraints required for adding 4 to a 32-bit table value.
 ///
 /// The operands use the following limb representation:
-/// - `lhs` is represented as 2 limbs of 16 bits each
-/// - `res` is represented as 4 limbs of 8 bits each
+/// - **lhs**: Always 2 limbs of 16 bits each (covering bits 0-31)
+/// - **res**: Either 2 limbs of 16 bits or 4 limbs of 8 bits (flexible representation)
 ///
-/// Requires validating two carry bits:
-/// - Carry from the low word (bits 0-15)
-/// - Carry from the high word (bits 16-31)
+/// Two constraints are created with sequential indices:
+/// 1. **Carry 0**: Validates carry from low word (bits 0-15) → uses `constraint_index`
+/// 2. **Carry 1**: Validates carry from high word (bits 16-31) → uses `constraint_index + 1`
 ///
 /// This helper function creates both constraints with sequential constraint indices.
 ///
 /// ## Arguments
-/// * `flag_idx` - Column index for instruction selector flag
-/// * `lhs_start_idx` - Starting column for left operand (requires 2 consecutive columns)
-/// * `res_start_idx` - Starting column for result (requires 4 consecutive columns)
-/// * `constraint_idx_start` - Starting constraint index (will use idx and idx+1)
-/// * `is_flag_negated` - Whether the flag should be negated
+/// * `flag` - Tuple of (column_index, is_negated):
+///   - `column_index`: Column containing the instruction selector flag
+///   - `is_negated`: If true, activates when flag = 0; if false, activates when flag = 1
+/// * `lhs` - Tuple of (start_index, num_limbs):
+///   - `start_index`: Starting column for left operand (2 consecutive columns)
+///   - `num_limbs`: Number of limbs (should be 2 for 32-bit values)
+/// * `res` - Tuple of (start_index, num_limbs):
+///   - `start_index`: Starting column for result
+///   - `num_limbs`: Number of limbs (2 for 16-bit limbs, 4 for 8-bit limbs)
+/// * `constraint_index` - Starting constraint index (function uses `constraint_index` and `constraint_index + 1`)
 ///
 /// ## Returns
-/// A vector of two boxed constraints: [carry_0_constraint, carry_1_constraint]
+/// A tuple containing:
+/// - `Vec<Box<dyn TransitionConstraint>>`: Vector with two constraints [carry_0, carry_1]
+/// - `usize`: Next available constraint index (`constraint_index + 2`)
+///
 pub fn new_add_four_constraint(
-    flag_idx: usize,
-    lhs_start_idx: usize,
-    res_start_idx: usize,
+    flag: (usize, bool),
+    lhs: (usize, usize),
+    res: (usize, usize),
     constraint_index: usize,
-    is_flag_negated: bool,
 ) -> (
     Vec<Box<dyn TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>>>,
     usize,
@@ -770,19 +792,17 @@ pub fn new_add_four_constraint(
         vec![
             Box::new(AddFourCarryBitConstraint::new(
                 CarryIndex::Zero,
-                flag_idx,
-                lhs_start_idx,
-                res_start_idx,
+                flag,
+                lhs,
+                res,
                 constraint_index,
-                is_flag_negated,
             )),
             Box::new(AddFourCarryBitConstraint::new(
                 CarryIndex::One,
-                flag_idx,
-                lhs_start_idx,
-                res_start_idx,
+                flag,
+                lhs,
+                res,
                 constraint_index + 1,
-                is_flag_negated,
             )),
         ],
         constraint_index + 2,

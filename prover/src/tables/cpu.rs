@@ -328,7 +328,7 @@ impl CpuTableRow {
                     Comparison::LessThan => {
                         row.blt = FE::one();
                         row.signed = FE::one();
-                        if log.src1_val < log.src2_val {
+                        if (log.src1_val as i32) < (log.src2_val as i32) {
                             row.branch_cond = FE::one()
                         }
                     }
@@ -342,7 +342,7 @@ impl CpuTableRow {
                         row.blt = FE::one();
                         row.signed = FE::one();
                         row.mp_selector = FE::one();
-                        if log.src1_val >= log.src2_val {
+                        if (log.src1_val as i32) >= (log.src2_val as i32) {
                             row.branch_cond = FE::one()
                         }
                     }
@@ -447,6 +447,17 @@ impl CpuTableRow {
         debug_assert_eq!(row.len(), 52, "CpuTableRow length mismatch");
         row
     }
+
+    pub fn get_valid_rows_flattened(num_of_rows: usize) -> Vec<FE> {
+        let row_len = Self::NUM_COLUMNS;
+        let mut res = Vec::with_capacity(num_of_rows * row_len);
+
+        for _ in 0..num_of_rows {
+            res.extend(std::iter::repeat(FE::zero()).take(Self::NUM_COLUMNS - 1));
+            res.push(FE::one());
+        }
+        res
+    }
 }
 
 pub fn cpu_trace_from_logs(
@@ -463,17 +474,15 @@ pub fn cpu_trace_from_logs(
         .enumerate()
         .flat_map(|(i, log)| {
             let timestamp = (i * 4) as u32;
-            println!(
-                "Log instruction: {:?} - Current PC: {:?} - Next PC: {:?}",
-                log.instruction, log.current_pc, log.next_pc
-            );
             let row = CpuTableRow::from_log(log, timestamp);
-            println!("Row: {:?}", row);
+            println!("branch_cond: {}", row.branch_cond.representative());
             row.to_vec()
         })
         .collect();
 
-    main_data.resize(target_rows * NUM_COLUMNS, FE::zero());
+    main_data.extend(CpuTableRow::get_valid_rows_flattened(
+        target_rows - num_logs,
+    ));
 
     TraceTable::new_main(main_data, NUM_COLUMNS, 1)
 }

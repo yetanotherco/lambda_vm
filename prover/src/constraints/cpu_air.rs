@@ -77,9 +77,9 @@ impl AIR for CPUTableAIR {
         let (bit_constraints, constraint_index) =
             new_bit_constraints(&bit_columns_index_to_constraint, constraint_index);
 
-        // Add constraint
-        // Enforces that lhs (Word4L) + rhs (Word4L) = res (Word4L), with carry bits constrained.
-        // It is enforced only on rows where the selected instruction flags are active.
+        // // Add constraint
+        // // Enforces that lhs (Word4L) + rhs (Word4L) = res (Word4L), with carry bits constrained.
+        // // It is enforced only on rows where the selected instruction flags are active.
         let (add_constraints, constraint_index) = new_add_constraint(
             vec![CpuTableRow::ADD, CpuTableRow::LOAD, CpuTableRow::STORE], // flags_idx,
             CpuTableRow::RV1_0,                                            // lhs_start_idx,
@@ -96,13 +96,12 @@ impl AIR for CPUTableAIR {
             constraint_index,                         // constraint_idx_start,
         );
 
-        // Enforces RES = PC + 4 in a JALR instruction
+        // // Enforces RES = PC + 4 in a JALR instruction
         let (next_pc_value_constraint, constraint_index) = new_add_four_constraint(
-            CpuTableRow::JALR,  // flags_idx,
-            CpuTableRow::PC_0,  // rhs_start_idx,
-            CpuTableRow::RES_0, // res_start_idx,
-            constraint_index,   // constraint_idx_start,
-            false,              // is_flag_negated
+            (CpuTableRow::JALR, false), // flags_idx,
+            (CpuTableRow::PC_0, 2),     // rhs_start_idx,
+            (CpuTableRow::RES_0, 4),    // res_start_idx,
+            constraint_index,           // constraint_idx_start,
         );
 
         let (arg2_validity_constraints, constraint_index) = new_arg2_validity_constraint(
@@ -120,11 +119,10 @@ impl AIR for CPUTableAIR {
 
         // Enforces NEXT_PC = PC + 4 for non-jump instructions
         let (regular_pc_update_constraint, _) = new_add_four_constraint(
-            CpuTableRow::BRANCH_COND, // flag_idx,
-            CpuTableRow::PC_0,        // rhs_start_idx,
-            CpuTableRow::NEXT_PC_0,   // res_start_idx,
-            constraint_index,         // constraint_idx_start,
-            true,                     // is_flag_negated
+            (CpuTableRow::BRANCH_COND, true), // flag_idx,
+            (CpuTableRow::PC_0, 2),           // rhs_start_idx,
+            (CpuTableRow::NEXT_PC_0, 2),      // res_start_idx,
+            constraint_index,                 // constraint_idx_start,
         );
 
         let mut constraints = bit_constraints;
