@@ -2,7 +2,7 @@ use core::marker::PhantomData;
 
 use math::field::{element::FieldElement, fields::u64_prime_field::U64PrimeField, traits::IsField};
 
-use crate::merkle_tree::{merkle::MerkleTree, traits::IsMerkleTreeBackend};
+use crate::merkle_tree::{merkle::MerkleTree, proof::BatchProof, traits::IsMerkleTreeBackend};
 
 pub type TestMerkleTree<F> = MerkleTree<FieldElement<F>>;
 
@@ -80,7 +80,7 @@ fn build_empty_tree_should_not_panic() {
 fn batch_proof_len_is_expected() {
     let values: Vec<FE> = (1..=8).map(FE::new).collect();
     let merkle_tree = MerkleTree::<TestBackend<U64PF>>::build(&values).unwrap();
-    assert_eq!(merkle_tree.get_batch_proof(&[0, 5]).len(), 4);
+    assert_eq!(merkle_tree.get_batch_proof(&[0, 5]).path.len(), 4);
 }
 #[test]
 fn batch_proof_is_expected() {
@@ -91,7 +91,10 @@ fn batch_proof_is_expected() {
     let values: Vec<FE> = (1..=8).map(FE::new).collect();
     let merkle_tree = MerkleTree::<TestBackend<U64PF>>::build(&values).unwrap();
     let batch_proof = merkle_tree.get_batch_proof(&[0, 1]);
-    assert_eq!(batch_proof, vec![FE::new(14), FE::new(52)]);
+    let expected_batch_proof = BatchProof {
+        path: vec![FE::new(14), FE::new(52)],
+    };
+    assert_eq!(batch_proof.path, expected_batch_proof.path);
 }
 
 #[test]
@@ -104,5 +107,5 @@ fn batch_proof_len_is_expected_for_long_pos_list() {
     let merkle_tree = MerkleTree::<TestBackend<U64PF>>::build(&values).unwrap();
     let pos_list = (0..=9).collect::<Vec<usize>>();
     let batch_proof = merkle_tree.get_batch_proof(&pos_list);
-    assert_eq!(batch_proof.len(), 2);
+    assert_eq!(batch_proof.path.len(), 2);
 }

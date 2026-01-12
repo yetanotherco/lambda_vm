@@ -1,5 +1,7 @@
 use core::fmt::Display;
 
+use crate::merkle_tree::proof::BatchProof;
+
 use super::{proof::Proof, traits::IsMerkleTreeBackend, utils::*};
 use alloc::vec::Vec;
 use std::collections::{BTreeSet, HashSet};
@@ -99,23 +101,37 @@ where
 
         Ok(merkle_path)
     }
-    pub fn get_batch_proof(&self, pos_list: &[usize]) -> Vec<B::Node> {
-        let leaves_indices = pos_list
+
+    /// Given a list of indices, returns a batch proof containing the nodes needed to verify all the leaves in those
+    /// indices belong to the tree.
+    /// It Optimizes the number of nodes in the proof since the verifier can create some of them using
+    /// the leaves and the parent node known by hashing.
+    pub fn get_batch_proof(&self, pos_list: &[usize]) -> BatchProof<B::Node> {
+        // Since the nodes in the merkle tree are indexed from the root to the leaves, we redefine the indices
+        // of the leaves.
+        let leaf_positions = pos_list
             .iter()
             .map(|pos| pos + self.nodes.len() / 2)
             .collect::<Vec<usize>>();
-        let batch_auth_path_positions = self.get_batch_auth_path_positions(&leaves_indices);
+        // We get the positions of the nodes for the batch proof.
+        let batch_auth_path_positions = self.get_batch_auth_path_positions(&leaf_positions);
 
+        // We get the nodes for the batch proof.
         let batch_auth_path_nodes = batch_auth_path_positions
             .iter()
             .map(|pos| self.nodes[*pos].clone())
             .collect();
-        batch_auth_path_nodes
+
+        BatchProof {
+            path: batch_auth_path_nodes,
+        }
     }
 
+    /// Given a list of leaf positions, returns the indices of the nodes needed to verify all those leaves
+    /// belong to the tree.
     fn get_batch_auth_path_positions(&self, leaf_positions: &[usize]) -> Vec<usize> {
-        let mut auth_set = BTreeSet::<usize>::new();
-        // Add all the leaves to the set of obtainable nodes, because we already have them.
+        let mut auth_path_set = BTreeSet::<usize>::new();
+        // We add all the leaves to the set of obtainable nodes, because we already have them.
         let mut obtainable_nodes_by_level: HashSet<usize> =
             leaf_positions.iter().cloned().collect();
 
@@ -125,18 +141,19 @@ where
             let mut parent_level_obtainable_positions = HashSet::new();
             for pos in &obtainable_nodes_by_level {
                 let sibling_pos = get_sibiling_pos(*pos);
-
+                // A sibling is obtainable if it is another leaf, it is a parent of known nodes or it is
+                // already in the authentication path set.
                 let sibling_is_obtainable = obtainable_nodes_by_level.contains(&sibling_pos)
-                    || auth_set.contains(&sibling_pos);
+                    || auth_path_set.contains(&sibling_pos);
                 if !sibling_is_obtainable {
-                    auth_set.insert(sibling_pos);
+                    auth_path_set.insert(sibling_pos);
                 }
                 parent_level_obtainable_positions.insert(get_parent_pos(*pos));
             }
-
+            // In the next layer, all parents of known nodes are obtainable.
             obtainable_nodes_by_level = parent_level_obtainable_positions;
         }
 
-        auth_set.into_iter().rev().collect()
+        auth_path_set.into_iter().rev().collect()
     }
 }
