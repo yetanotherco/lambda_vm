@@ -85,3 +85,7 @@ harness = false
 [[bench]]
 name = "fp2_alternatives_benchmark"
 harness = false
+
+[[bench]]
+name = "fft_extension_benchmark"
+harness = false
