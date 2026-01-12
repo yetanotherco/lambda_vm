@@ -114,6 +114,7 @@ range = ["i", 0, 3]
 [[assumptions]]
 desc = "`IS_WORD[res[i]]`"
 range = ["i", 0, 3]
+ref = "mul:a:res"
 
 
 # Constraints
@@ -152,6 +153,7 @@ kind = "arith"
 constraint = "$#`raw_product[i]` = #`limb_product[2i]` + 2^16 dot #`limb_product[2i + 1]`$"
 poly = ["-", ["+", ["idx", "limb_product", ["*", 2, "i"]], ["*", ["^", 2, 16], ["idx", "limb_product", ["+", ["*", 2, "i"], 1]]]], ["idx", "raw_product", "i"]]
 range = ["i", 0, 3]
+ref = "mul:c:raw_product"
 
 [[constraint_groups]]
 name = "lookup"
