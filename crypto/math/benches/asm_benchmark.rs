@@ -6,7 +6,9 @@
 //!
 //! Run with: cargo bench --features asm-arm64 -- asm
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput, BenchmarkId};
+use criterion::{criterion_group, criterion_main, Criterion};
+#[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+use criterion::{black_box, BenchmarkId, Throughput};
 
 #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
 mod asm_benches {

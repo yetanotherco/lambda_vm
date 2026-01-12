@@ -26,7 +26,6 @@ use super::goldilocks_extensions_asm;
 
 type FpE = FieldElement<GoldilocksField>;
 
-
 /// Degree 2 extension field of native Goldilocks
 #[derive(Copy, Clone, Debug)]
 pub struct Degree2GoldilocksNativeExtensionField;
@@ -49,7 +48,7 @@ impl IsField for Degree2GoldilocksNativeExtensionField {
         }
         #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
         {
-            [&a[0] + &b[0], &a[1] + &b[1]]
+            [a[0] + b[0], a[1] + b[1]]
         }
     }
 
@@ -70,14 +69,14 @@ impl IsField for Degree2GoldilocksNativeExtensionField {
         }
         #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
         {
-            let a0b0 = &a[0] * &b[0];
-            let a1b1 = &a[1] * &b[1];
-            let z = (&a[0] + &a[1]) * (&b[0] + &b[1]);
+            let a0b0 = a[0] * b[0];
+            let a1b1 = a[1] * b[1];
+            let z = (a[0] + a[1]) * (b[0] + b[1]);
 
             // W * a1b1 = 7 * a1b1
             let w_a1b1 = mul_by_7(&a1b1);
 
-            [&a0b0 + &w_a1b1, &z - &a0b0 - &a1b1]
+            [a0b0 + w_a1b1, z - a0b0 - a1b1]
         }
     }
 
@@ -96,12 +95,12 @@ impl IsField for Degree2GoldilocksNativeExtensionField {
         {
             let a0_sq = a[0].square();
             let a1_sq = a[1].square();
-            let a0a1 = &a[0] * &a[1];
+            let a0a1 = a[0] * a[1];
 
             // W * a1^2 = 7 * a1^2
             let w_a1_sq = mul_by_7(&a1_sq);
 
-            [&a0_sq + &w_a1_sq, a0a1.double()]
+            [a0_sq + w_a1_sq, a0a1.double()]
         }
     }
 
@@ -120,7 +119,7 @@ impl IsField for Degree2GoldilocksNativeExtensionField {
         }
         #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
         {
-            [&a[0] - &b[0], &a[1] - &b[1]]
+            [a[0] - b[0], a[1] - b[1]]
         }
     }
 
@@ -144,9 +143,9 @@ impl IsField for Degree2GoldilocksNativeExtensionField {
         let a0_sq = a[0].square();
         let a1_sq = a[1].square();
         let w_a1_sq = mul_by_7(&a1_sq);
-        let norm = &a0_sq - &w_a1_sq;
+        let norm = a0_sq - w_a1_sq;
         let norm_inv = norm.inv()?;
-        Ok([&a[0] * &norm_inv, -&a[1] * &norm_inv])
+        Ok([a[0] * norm_inv, -a[1] * norm_inv])
     }
 
     fn div(a: &Self::BaseType, b: &Self::BaseType) -> Result<Self::BaseType, FieldError> {
@@ -223,7 +222,7 @@ impl IsSubFieldOf<Degree2GoldilocksNativeExtensionField> for GoldilocksField {
         #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
         {
             let c0 = FpE::from_raw(<Self as IsField>::add(a, b[0].value()));
-            [c0, b[1].clone()]
+            [c0, b[1]]
         }
     }
 
@@ -273,7 +272,7 @@ pub type Fp2E = FieldElement<Degree2GoldilocksNativeExtensionField>;
 impl Fp2E {
     /// Returns the conjugate of self: conjugate(a0 + a1*w) = a0 - a1*w
     pub fn conjugate(&self) -> Self {
-        Self::new([self.value()[0].clone(), -&self.value()[1]])
+        Self::new([self.value()[0], -self.value()[1]])
     }
 }
 
@@ -305,7 +304,7 @@ impl IsField for Degree3GoldilocksNativeExtensionField {
         }
         #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
         {
-            [&a[0] + &b[0], &a[1] + &b[1], &a[2] + &b[2]]
+            [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
         }
     }
 
@@ -323,21 +322,21 @@ impl IsField for Degree3GoldilocksNativeExtensionField {
         }
         #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
         {
-            let v0 = &a[0] * &b[0];
-            let v1 = &a[1] * &b[1];
-            let v2 = &a[2] * &b[2];
+            let v0 = a[0] * b[0];
+            let v1 = a[1] * b[1];
+            let v2 = a[2] * b[2];
 
             // c0 = v0 + 2 * ((a1 + a2)(b1 + b2) - v1 - v2)
             // c1 = (a0 + a1)(b0 + b1) - v0 - v1 + 2 * v2
             // c2 = (a0 + a2)(b0 + b2) - v0 + v1 - v2
-            let t0 = (&a[1] + &a[2]) * (&b[1] + &b[2]) - &v1 - &v2;
-            let t1 = (&a[0] + &a[1]) * (&b[0] + &b[1]) - &v0 - &v1;
-            let t2 = (&a[0] + &a[2]) * (&b[0] + &b[2]) - &v0 - &v2;
+            let t0 = (a[1] + a[2]) * (b[1] + b[2]) - v1 - v2;
+            let t1 = (a[0] + a[1]) * (b[0] + b[1]) - v0 - v1;
+            let t2 = (a[0] + a[2]) * (b[0] + b[2]) - v0 - v2;
 
             [
-                &v0 + &t0.double(),
-                &t1 + &v2.double(),
-                &t2 + &v1,
+                v0 + t0.double(),
+                t1 + v2.double(),
+                t2 + v1,
             ]
         }
     }
@@ -357,17 +356,17 @@ impl IsField for Degree3GoldilocksNativeExtensionField {
             let s0 = a[0].square();
             let s1 = a[1].square();
             let s2 = a[2].square();
-            let a01 = &a[0] * &a[1];
-            let a02 = &a[0] * &a[2];
-            let a12 = &a[1] * &a[2];
+            let a01 = a[0] * a[1];
+            let a02 = a[0] * a[2];
+            let a12 = a[1] * a[2];
 
             // c0 = s0 + 4 * a12
             // c1 = 2 * a01 + 2 * s2
             // c2 = 2 * a02 + s1
             [
-                &s0 + &a12.double().double(),
-                &a01.double() + &s2.double(),
-                &a02.double() + &s1,
+                s0 + a12.double().double(),
+                a01.double() + s2.double(),
+                a02.double() + s1,
             ]
         }
     }
@@ -385,7 +384,7 @@ impl IsField for Degree3GoldilocksNativeExtensionField {
         }
         #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
         {
-            [&a[0] - &b[0], &a[1] - &b[1], &a[2] - &b[2]]
+            [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
         }
     }
 
@@ -401,7 +400,7 @@ impl IsField for Degree3GoldilocksNativeExtensionField {
         }
         #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
         {
-            [-&a[0], -&a[1], -&a[2]]
+            [-a[0], -a[1], -a[2]]
         }
     }
 
@@ -412,28 +411,28 @@ impl IsField for Degree3GoldilocksNativeExtensionField {
         let a2_sq = a[2].square();
 
         // Compute the norm: N = a0^3 + 2*a1^3 + 4*a2^3 - 6*a0*a1*a2
-        let a0_cubed = &a0_sq * &a[0];
-        let a1_cubed = &a1_sq * &a[1];
-        let a2_cubed = &a2_sq * &a[2];
-        let a0a1a2 = &a[0] * &a[1] * &a[2];
+        let a0_cubed = a0_sq * a[0];
+        let a1_cubed = a1_sq * a[1];
+        let a2_cubed = a2_sq * a[2];
+        let a0a1a2 = a[0] * a[1] * a[2];
 
         // N = a0^3 + 2*a1^3 + 4*a2^3 - 6*a0*a1*a2
-        let norm = &a0_cubed + &a1_cubed.double() + &a2_cubed.double().double()
-            - &(&a0a1a2.double() + &a0a1a2).double();
+        let norm = a0_cubed + a1_cubed.double() + a2_cubed.double().double()
+            - (a0a1a2.double() + a0a1a2).double();
 
         let norm_inv = norm.inv()?;
 
         // inv[0] = (a0^2 - 2*a1*a2) / N
         // inv[1] = (2*a2^2 - a0*a1) / N
         // inv[2] = (a1^2 - a0*a2) / N
-        let a1a2 = &a[1] * &a[2];
-        let a0a1 = &a[0] * &a[1];
-        let a0a2 = &a[0] * &a[2];
+        let a1a2 = a[1] * a[2];
+        let a0a1 = a[0] * a[1];
+        let a0a2 = a[0] * a[2];
 
         Ok([
-            (&a0_sq - &a1a2.double()) * &norm_inv,
-            (&a2_sq.double() - &a0a1) * &norm_inv,
-            (&a1_sq - &a0a2) * &norm_inv,
+            (a0_sq - a1a2.double()) * norm_inv,
+            (a2_sq.double() - a0a1) * norm_inv,
+            (a1_sq - a0a2) * norm_inv,
         ])
     }
 
@@ -514,7 +513,7 @@ impl IsSubFieldOf<Degree3GoldilocksNativeExtensionField> for GoldilocksField {
         #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
         {
             let c0 = FpE::from_raw(<Self as IsField>::add(a, b[0].value()));
-            [c0, b[1].clone(), b[2].clone()]
+            [c0, b[1], b[2]]
         }
     }
 
@@ -572,7 +571,7 @@ pub type Fp3E = FieldElement<Degree3GoldilocksNativeExtensionField>;
 fn mul_by_7(a: &FpE) -> FpE {
     // 7 * a = 8 * a - a = (a << 3) - a
     let a8 = a.double().double().double();
-    &a8 - a
+    a8 - *a
 }
 
 #[cfg(test)]

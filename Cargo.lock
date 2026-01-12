@@ -1136,6 +1136,7 @@ dependencies = [
  "p3-field",
  "p3-goldilocks",
  "p3-matrix",
+ "p3-util",
  "pprof",
  "proptest",
  "rand 0.8.5",

@@ -18,7 +18,6 @@ use crate::field::{element::FieldElement, errors::FieldError, traits::IsField};
 #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
 use super::u64_goldilocks_asm;
 
-
 /// The Goldilocks prime: p = 2^64 - 2^32 + 1
 pub const GOLDILOCKS_PRIME: u64 = 0xFFFF_FFFF_0000_0001;
 
@@ -107,16 +106,11 @@ impl IsField for GoldilocksField {
     /// Negation: -a = p - a (or 0 if a = 0)
     #[inline(always)]
     fn neg(a: &u64) -> u64 {
-        if *a == 0 {
+        let canonical = canonicalize(*a);
+        if canonical == 0 {
             0
         } else {
-            // First canonicalize, then negate
-            let canonical = canonicalize(*a);
-            if canonical == 0 {
-                0
-            } else {
-                GOLDILOCKS_PRIME - canonical
-            }
+            GOLDILOCKS_PRIME - canonical
         }
     }
 

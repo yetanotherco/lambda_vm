@@ -233,7 +233,6 @@ fn bench_bit_reversal(c: &mut Criterion) {
 // ============== COMPONENT 4: FFT Butterflies Only ==============
 fn bench_fft_butterflies(c: &mut Criterion) {
     use criterion::BatchSize;
-    use math::field::traits::IsFFTField;
     let mut group = c.benchmark_group("fft_butterflies_only");
 
     for log_size in [10, 12, 14, 16] {
@@ -252,10 +251,6 @@ fn bench_fft_butterflies(c: &mut Criterion) {
             RootsConfig::BitReverse,
         )
         .unwrap();
-
-        // Get primitive root for on-the-fly FFT
-        let native_primitive_root =
-            GoldilocksNative::get_primitive_root_of_unity(log_size as u64).unwrap();
 
         group.bench_with_input(
             BenchmarkId::new("lambda_montgomery", log_size),
@@ -280,25 +275,6 @@ fn bench_fft_butterflies(c: &mut Criterion) {
                     || generate_lambda_native_vec(size),
                     |mut data| {
                         math::fft::cpu::fft::in_place_nr_2radix_fft(&mut data, &native_twiddles);
-                        data
-                    },
-                    BatchSize::SmallInput,
-                )
-            },
-        );
-
-        // On-the-fly twiddle generation variant
-        group.bench_with_input(
-            BenchmarkId::new("lambda_native_on_the_fly", log_size),
-            &log_size,
-            |b, _| {
-                b.iter_batched(
-                    || generate_lambda_native_vec(size),
-                    |mut data| {
-                        math::fft::cpu::fft::in_place_nr_2radix_fft_on_the_fly(
-                            &mut data,
-                            &native_primitive_root,
-                        );
                         data
                     },
                     BatchSize::SmallInput,

@@ -60,18 +60,18 @@ impl Poseidon2 {
         self.external_linear_layer();
 
         // Initial external rounds (after initial linear layer)
-        for round in 0..EXTERNAL_ROUNDS_BEGIN {
-            self.external_round(&EXTERNAL_ROUND_CONSTANTS_INIT[round]);
+        for round_constants in EXTERNAL_ROUND_CONSTANTS_INIT.iter().take(EXTERNAL_ROUNDS_BEGIN) {
+            self.external_round(round_constants);
         }
 
         // Internal rounds
-        for round in 0..INTERNAL_ROUNDS {
-            self.internal_round(INTERNAL_ROUND_CONSTANTS[round]);
+        for &round_constant in INTERNAL_ROUND_CONSTANTS.iter().take(INTERNAL_ROUNDS) {
+            self.internal_round(round_constant);
         }
 
         // Terminal external rounds (no initial linear layer)
-        for round in 0..EXTERNAL_ROUNDS_END {
-            self.external_round(&EXTERNAL_ROUND_CONSTANTS_TERM[round]);
+        for round_constants in EXTERNAL_ROUND_CONSTANTS_TERM.iter().take(EXTERNAL_ROUNDS_END) {
+            self.external_round(round_constants);
         }
     }
 
@@ -88,13 +88,13 @@ impl Poseidon2 {
     /// External round: AddRoundConstants + S-box (all elements) + External Linear Layer
     fn external_round(&mut self, round_constants: &[u64; WIDTH]) {
         // Add round constants
-        for i in 0..WIDTH {
-            self.state[i] = &self.state[i] + &Fp::from(round_constants[i]);
+        for (state_elem, &rc) in self.state.iter_mut().zip(round_constants.iter()) {
+            *state_elem = &*state_elem + &Fp::from(rc);
         }
 
         // Apply S-box to all elements
-        for i in 0..WIDTH {
-            self.state[i] = Self::sbox(&self.state[i]);
+        for state_elem in &mut self.state {
+            *state_elem = Self::sbox(state_elem);
         }
 
         // External linear layer (MDS)
@@ -152,17 +152,15 @@ impl Poseidon2 {
     /// For width 8: apply 4x4 MDS to state[0..4] and state[4..8], then diffuse
     fn external_linear_layer(&mut self) {
         // Apply HL M4 to each 4-element chunk
-        let mut first_half: [Fp; 4] = core::array::from_fn(|i| self.state[i].clone());
-        let mut second_half: [Fp; 4] = core::array::from_fn(|i| self.state[i + 4].clone());
+        let mut first_half: [Fp; 4] = core::array::from_fn(|i| self.state[i]);
+        let mut second_half: [Fp; 4] = core::array::from_fn(|i| self.state[i + 4]);
 
         Self::apply_hl_mat4(&mut first_half);
         Self::apply_hl_mat4(&mut second_half);
 
         // Copy results back
-        for i in 0..4 {
-            self.state[i] = first_half[i].clone();
-            self.state[i + 4] = second_half[i].clone();
-        }
+        self.state[..4].copy_from_slice(&first_half);
+        self.state[4..8].copy_from_slice(&second_half);
 
         // Diffuse across blocks: add column sums back to each element
         // stored[l] = state[l] + state[4+l] for each column l
@@ -180,15 +178,15 @@ impl Poseidon2 {
     fn internal_linear_layer(&mut self) {
         // Compute sum of all elements
         let mut sum = Fp::zero();
-        for i in 0..WIDTH {
-            sum = &sum + &self.state[i];
+        for state_elem in &self.state {
+            sum = &sum + state_elem;
         }
 
         // Apply: y_i = (diag_i - 1) * x_i + sum
         // Which equals: y_i = diag_i * x_i + sum - x_i = diag_i * x_i + (sum of other elements)
-        for i in 0..WIDTH {
-            let diag = Fp::from(MATRIX_DIAG_8[i]);
-            self.state[i] = &(&diag * &self.state[i]) + &sum;
+        for (state_elem, &diag_val) in self.state.iter_mut().zip(MATRIX_DIAG_8.iter()) {
+            let diag = Fp::from(diag_val);
+            *state_elem = &(&diag * &*state_elem) + &sum;
         }
     }
 
@@ -199,22 +197,22 @@ impl Poseidon2 {
     /// Hash two field elements and return a single field element
     pub fn hash(x: &Fp, y: &Fp) -> Fp {
         let mut hasher = Self::new();
-        hasher.state[0] = x.clone();
-        hasher.state[1] = y.clone();
+        hasher.state[0] = *x;
+        hasher.state[1] = *y;
         // Domain separation: set capacity element to 2 (for 2 inputs)
         hasher.state[WIDTH - 1] = Fp::from(2u64);
         hasher.permute();
-        hasher.state[0].clone()
+        hasher.state[0]
     }
 
     /// Hash a single field element
     pub fn hash_single(x: &Fp) -> Fp {
         let mut hasher = Self::new();
-        hasher.state[0] = x.clone();
+        hasher.state[0] = *x;
         // Domain separation: set capacity element to 1 (for 1 input)
         hasher.state[WIDTH - 1] = Fp::from(1u64);
         hasher.permute();
-        hasher.state[0].clone()
+        hasher.state[0]
     }
 
     /// Hash multiple field elements using sponge construction
@@ -224,7 +222,7 @@ impl Poseidon2 {
         // Pad input with 1 followed by 0s (if necessary)
         let mut values = inputs.to_vec();
         values.push(Fp::from(1u64)); // Padding
-        while values.len() % RATE != 0 {
+        while !values.len().is_multiple_of(RATE) {
             values.push(Fp::zero());
         }
 
@@ -238,7 +236,7 @@ impl Poseidon2 {
         }
 
         // Squeeze phase: return first element
-        hasher.state[0].clone()
+        hasher.state[0]
     }
 
     /// Compress two digests into one (for Merkle tree internal nodes)
@@ -357,21 +355,15 @@ mod tests {
         let mut hasher = Poseidon2::new();
 
         // Set some initial state
-        for i in 0..WIDTH {
-            hasher.state[i] = Fp::from(i as u64);
+        for (i, state_elem) in hasher.state.iter_mut().enumerate() {
+            *state_elem = Fp::from(i as u64);
         }
 
-        let initial_state = hasher.state.clone();
+        let initial_state = hasher.state;
         hasher.permute();
 
         // State should change after permutation
-        let mut all_same = true;
-        for i in 0..WIDTH {
-            if hasher.state[i] != initial_state[i] {
-                all_same = false;
-                break;
-            }
-        }
+        let all_same = hasher.state.iter().zip(initial_state.iter()).all(|(a, b)| a == b);
         assert!(!all_same, "State should change after permutation");
     }
 

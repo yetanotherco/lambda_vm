@@ -12,7 +12,6 @@ use math::polynomial::Polynomial;
 use p3_baby_bear::BabyBear;
 use p3_goldilocks::Goldilocks;
 use p3_dft::{Radix2Dit, TwoAdicSubgroupDft};
-use p3_field::PrimeCharacteristicRing;
 use p3_matrix::dense::RowMajorMatrix;
 
 type LambdaBabyBear = FieldElement<Babybear31PrimeField>;

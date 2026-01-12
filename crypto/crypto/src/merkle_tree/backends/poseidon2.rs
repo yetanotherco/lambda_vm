@@ -60,7 +60,7 @@ impl IsMerkleTreeBackend for BatchPoseidon2Backend {
         #[cfg(not(feature = "parallel"))]
         let iter = unhashed_leaves.iter();
 
-        iter.map(|leaf| Self::hash_data(leaf)).collect()
+        iter.map(Self::hash_data).collect()
     }
 
     fn hash_new_parent(left: &Self::Node, right: &Self::Node) -> Self::Node {

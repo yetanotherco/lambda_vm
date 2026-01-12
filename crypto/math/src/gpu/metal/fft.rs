@@ -249,7 +249,6 @@ impl MetalFFT {
         Ok(output_raw.into_iter().map(FieldElement::from).collect())
     }
 
-
     /// Execute FFT using mixed-radix approach (radix-4 + radix-2).
     /// Radix-4 processes 2 stages at once, reducing kernel dispatch overhead by half.
     /// Falls back to radix-2 for the final stage if log_n is odd.
