@@ -6,7 +6,10 @@ use super::{
     proof::stark::StarkProof,
     traits::{AIR, TransitionEvaluationContext},
 };
-use crate::{config::Commitment, domain::new_domain, proof::stark::DeepPolynomialOpening};
+use crate::{
+    config::Commitment, domain::new_domain, lookup::LOGUP_NUM_CHALLENGES,
+    proof::stark::{DeepPolynomialOpening, MultiProof},
+};
 use crypto::{fiat_shamir::is_transcript::IsStarkTranscript, merkle_tree::proof::Proof};
 #[cfg(not(feature = "test_fiat_shamir"))]
 use log::error;
@@ -21,11 +24,6 @@ use math::{
 use std::marker::PhantomData;
 #[cfg(feature = "instruments")]
 use std::time::Instant;
-
-type AirAndProof<'a, Field, FieldExtension, PI> = (
-    &'a dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
-    &'a StarkProof<Field, FieldExtension>,
-);
 
 /// A default STARK verifier implementing `IsStarkVerifier`.
 pub struct Verifier<
@@ -121,7 +119,11 @@ pub trait IsStarkVerifier<
 
         // <<<< Receive challenge: 𝛽
         let beta = transcript.sample_field_element();
-        let num_boundary_constraints = air.boundary_constraints(&rap_challenges).constraints.len();
+        let bus_interactions = if proof.bus_interactions.is_empty() { None } else { Some(&proof.bus_interactions[..]) };
+        let num_boundary_constraints = air
+            .boundary_constraints(&rap_challenges, bus_interactions)
+            .constraints
+            .len();
 
         let num_transition_constraints = air.context().num_transition_constraints;
 
@@ -238,7 +240,9 @@ pub trait IsStarkVerifier<
         domain: &Domain<Field>,
         challenges: &Challenges<FieldExtension>,
     ) -> bool {
-        let boundary_constraints = air.boundary_constraints(&challenges.rap_challenges);
+        let bus_interactions = if proof.bus_interactions.is_empty() { None } else { Some(&proof.bus_interactions[..]) };
+        let boundary_constraints =
+            air.boundary_constraints(&challenges.rap_challenges, bus_interactions);
 
         let trace_length = air.trace_length();
         let number_of_b_constraints = boundary_constraints.constraints.len();
@@ -734,32 +738,101 @@ pub trait IsStarkVerifier<
 
     /// Verifies one or more STARK proofs with their corresponding AIRs.
     ///
-    /// The function replays Round 1 for all proofs first (to match the prover's transcript state),
-    /// then verifies each proof sequentially.
+    /// # Multi-Table Verification with LogUp
     ///
-    /// Warning: the transcript must be safely initialized before passing it to this method.
+    /// When verifying multiple tables that communicate via LogUp, the verifier
+    /// must replay the transcript in the same order as the prover to derive
+    /// identical challenges. This function ensures:
+    ///
+    /// 1. **Replay main trace commitments**: All commitments are appended to
+    ///    the transcript in the same order as the prover.
+    /// 2. **Sample shared LogUp challenges**: The same (z, α) challenges the
+    ///    prover used are derived from the transcript.
+    /// 3. **Replay auxiliary trace commitments**: Complete the Round 1 replay.
+    /// 4. **Verify each proof**: Standard STARK verification for each AIR.
+    ///
+    /// # Warning
+    ///
+    /// The transcript must be safely initialized before passing it to this method.
+    /// The AIRs must be in the same order as the proofs in the MultiProof.
     fn multi_verify(
-        airs_and_proofs: &[AirAndProof<'_, Field, FieldExtension, PI>],
+        airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
+        multi_proof: &MultiProof<Field, FieldExtension>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        // First, replay round 1 for all tables so the transcript state matches the prover,
-        // which commits to all traces before sampling any further randomness.
-        let mut rap_challenges_vec = Vec::new();
-        for (air, proof) in airs_and_proofs {
-            let rap_challenges = Self::replay_round_1(*air, proof, transcript);
-            rap_challenges_vec.push(rap_challenges);
+        // Check if any AIR uses LogUp (has auxiliary trace for running sums)
+        let needs_logup_challenges = airs.iter().any(|air| air.has_trace_interaction());
+
+        // =====================================================================
+        // Round 1, Phase A: Replay main trace commitments
+        // =====================================================================
+
+        for proof in &multi_proof.proofs {
+            transcript.append_bytes(&proof.lde_trace_main_merkle_root);
         }
 
-        // Verify each proof
-        for ((air, proof), rap_challenges) in airs_and_proofs.iter().zip(rap_challenges_vec) {
-            if !Self::verify_rounds_2_to_4(*air, proof, transcript, rap_challenges) {
+        // =====================================================================
+        // Round 1, Phase B: Sample shared LogUp challenges
+        // =====================================================================
+        // Must match exactly what the prover sampled.
+
+        let logup_challenges: Vec<FieldElement<FieldExtension>> = if needs_logup_challenges {
+            (0..LOGUP_NUM_CHALLENGES)
+                .map(|_| transcript.sample_field_element())
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // =====================================================================
+        // Round 1, Phase C: Replay auxiliary trace commitments
+        // =====================================================================
+
+        for proof in &multi_proof.proofs {
+            if let Some(root) = proof.lde_trace_aux_merkle_root {
+                transcript.append_bytes(&root);
+            }
+        }
+
+        // =====================================================================
+        // Rounds 2-4: Verify each proof
+        // =====================================================================
+
+        for (air, proof) in airs.iter().zip(&multi_proof.proofs) {
+            if !Self::verify_rounds_2_to_4(*air, proof, transcript, logup_challenges.clone()) {
                 return false;
             }
         }
+
+        // =====================================================================
+        // Bus Balance Check: Σ sender_values - Σ receiver_values = 0
+        // =====================================================================
+        // For LogUp, the sum of sender contributions minus receiver contributions must equal zero.
+        // This ensures that every value "sent" on the bus was "received" exactly once.
+
+        if needs_logup_challenges {
+            let mut total = FieldElement::<FieldExtension>::zero();
+            for proof in &multi_proof.proofs {
+                for interaction in &proof.bus_interactions {
+                    if interaction.is_sender {
+                        total = total + &interaction.final_accumulated;
+                    } else {
+                        total = total - &interaction.final_accumulated;
+                    }
+                }
+            }
+
+            if total != FieldElement::zero() {
+                #[cfg(not(feature = "test_fiat_shamir"))]
+                error!("LogUp bus does not balance: sender and receiver values do not match");
+                return false;
+            }
+        }
+
         true
     }
 
@@ -774,34 +847,8 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        Self::multi_verify(&[(air, proof)], transcript)
-    }
-
-    /// Replays round 1 of the protocol for a given proof, appending the main and auxiliary
-    /// trace commitments to the transcript and returning the RAP challenges.
-    fn replay_round_1(
-        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
-        proof: &StarkProof<Field, FieldExtension>,
-        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
-    ) -> Vec<FieldElement<FieldExtension>>
-    where
-        FieldElement<Field>: AsBytes,
-        FieldElement<FieldExtension>: AsBytes,
-    {
-        // ===================================
-        // ==========|   Round 1   |==========
-        // ===================================
-
-        // <<<< Receive commitments:[tⱼ]
-        transcript.append_bytes(&proof.lde_trace_main_merkle_root);
-
-        let rap_challenges = air.build_rap_challenges(transcript);
-
-        if let Some(root) = proof.lde_trace_aux_merkle_root {
-            transcript.append_bytes(&root);
-        }
-
-        rap_challenges
+        let multi_proof = MultiProof::new(vec![proof.clone()]);
+        Self::multi_verify(&[air], &multi_proof, transcript)
     }
 
     /// Replays rounds 2, 3 and 4 of the protocol for a given proof, assuming round 1 has
@@ -823,7 +870,11 @@ pub trait IsStarkVerifier<
 
         // <<<< Receive challenge: 𝛽
         let beta = transcript.sample_field_element();
-        let num_boundary_constraints = air.boundary_constraints(&rap_challenges).constraints.len();
+        let bus_interactions = if proof.bus_interactions.is_empty() { None } else { Some(&proof.bus_interactions[..]) };
+        let num_boundary_constraints = air
+            .boundary_constraints(&rap_challenges, bus_interactions)
+            .constraints
+            .len();
 
         let num_transition_constraints = air.context().num_transition_constraints;
 
