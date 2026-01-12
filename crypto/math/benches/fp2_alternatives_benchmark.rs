@@ -1,4 +1,4 @@
-//! Benchmark comparing different Fp2 multiplication strategies.
+//! Benchmark for Fp2 and Fp3 extension field operations.
 //!
 //! Run with: cargo bench -p math --features asm-arm64 --bench fp2_alternatives_benchmark
 
@@ -8,10 +8,7 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughpu
 mod fp2_benches {
     use super::*;
     use math::field::fields::fft_friendly::goldilocks_extensions_asm::{
-        fp2_mul, fp2_mul_direct, fp2_mul_fused, fp2_mul_karatsuba_delayed,
-        fp2_mul_karatsuba_u128_mul7, mul_by_7, mul_by_7_u128,
-        fp3_mul, fp3_mul_delayed,
-        GOLDILOCKS_PRIME,
+        fp2_mul, fp2_square, fp3_mul, fp3_square, mul_by_7, GOLDILOCKS_PRIME,
     };
 
     const BATCH_SIZE: usize = 10_000;
@@ -56,14 +53,13 @@ mod fp2_benches {
         (0..count).map(|_| next()).collect()
     }
 
-    // ============== MUL_BY_7 BENCHMARKS ==============
     pub fn bench_mul_by_7(c: &mut Criterion) {
-        let mut group = c.benchmark_group("mul_by_7_strategies");
+        let mut group = c.benchmark_group("mul_by_7");
         group.throughput(Throughput::Elements(BATCH_SIZE as u64));
 
         let values = generate_u64_values(BATCH_SIZE, 11111);
 
-        group.bench_function("current_doubles_adds", |b| {
+        group.bench_function("u128_shift", |b| {
             b.iter(|| {
                 for v in &values {
                     black_box(mul_by_7(*v));
@@ -71,26 +67,17 @@ mod fp2_benches {
             })
         });
 
-        group.bench_function("u128_shift", |b| {
-            b.iter(|| {
-                for v in &values {
-                    black_box(mul_by_7_u128(*v));
-                }
-            })
-        });
-
         group.finish();
     }
 
-    // ============== FP2 MULTIPLICATION BENCHMARKS ==============
-    pub fn bench_fp2_mul_strategies(c: &mut Criterion) {
-        let mut group = c.benchmark_group("fp2_mul_strategies");
+    pub fn bench_fp2_operations(c: &mut Criterion) {
+        let mut group = c.benchmark_group("fp2_operations");
         group.throughput(Throughput::Elements(BATCH_SIZE as u64));
 
         let pairs = generate_fp2_pairs(BATCH_SIZE, 12345);
+        let elements: Vec<[u64; 2]> = pairs.iter().map(|(a, _)| *a).collect();
 
-        // Current implementation: Karatsuba with field ops
-        group.bench_function("current_karatsuba", |b| {
+        group.bench_function("mul", |b| {
             b.iter(|| {
                 for (a, b_val) in &pairs {
                     black_box(fp2_mul(*a, *b_val));
@@ -98,38 +85,10 @@ mod fp2_benches {
             })
         });
 
-        // Alt 1: Direct (Plonky3-style)
-        group.bench_function("alt1_direct", |b| {
+        group.bench_function("square", |b| {
             b.iter(|| {
-                for (a, b_val) in &pairs {
-                    black_box(fp2_mul_direct(*a, *b_val));
-                }
-            })
-        });
-
-        // Alt 2: Fully fused with *7 in u128
-        group.bench_function("alt2_fused", |b| {
-            b.iter(|| {
-                for (a, b_val) in &pairs {
-                    black_box(fp2_mul_fused(*a, *b_val));
-                }
-            })
-        });
-
-        // Alt 3: Karatsuba with delayed reduction
-        group.bench_function("alt3_karatsuba_delayed", |b| {
-            b.iter(|| {
-                for (a, b_val) in &pairs {
-                    black_box(fp2_mul_karatsuba_delayed(*a, *b_val));
-                }
-            })
-        });
-
-        // Alt 4: Karatsuba with u128 mul_by_7
-        group.bench_function("alt4_karatsuba_u128_mul7", |b| {
-            b.iter(|| {
-                for (a, b_val) in &pairs {
-                    black_box(fp2_mul_karatsuba_u128_mul7(*a, *b_val));
+                for a in &elements {
+                    black_box(fp2_square(*a));
                 }
             })
         });
@@ -137,15 +96,14 @@ mod fp2_benches {
         group.finish();
     }
 
-    // ============== FP3 MULTIPLICATION BENCHMARKS ==============
-    pub fn bench_fp3_mul_strategies(c: &mut Criterion) {
-        let mut group = c.benchmark_group("fp3_mul_strategies");
+    pub fn bench_fp3_operations(c: &mut Criterion) {
+        let mut group = c.benchmark_group("fp3_operations");
         group.throughput(Throughput::Elements(BATCH_SIZE as u64));
 
         let pairs = generate_fp3_pairs(BATCH_SIZE, 54321);
+        let elements: Vec<[u64; 3]> = pairs.iter().map(|(a, _)| *a).collect();
 
-        // Current implementation
-        group.bench_function("current_karatsuba", |b| {
+        group.bench_function("mul", |b| {
             b.iter(|| {
                 for (a, b_val) in &pairs {
                     black_box(fp3_mul(*a, *b_val));
@@ -153,11 +111,10 @@ mod fp2_benches {
             })
         });
 
-        // Delayed reduction
-        group.bench_function("delayed_reduction", |b| {
+        group.bench_function("square", |b| {
             b.iter(|| {
-                for (a, b_val) in &pairs {
-                    black_box(fp3_mul_delayed(*a, *b_val));
+                for a in &elements {
+                    black_box(fp3_square(*a));
                 }
             })
         });
@@ -166,7 +123,6 @@ mod fp2_benches {
     }
 }
 
-// Non-ARM64 stub
 #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
 mod fp2_benches {
     use super::*;
@@ -174,15 +130,15 @@ mod fp2_benches {
     pub fn bench_mul_by_7(_c: &mut Criterion) {
         println!("This benchmark requires --features asm-arm64 on ARM64 platform");
     }
-    pub fn bench_fp2_mul_strategies(_c: &mut Criterion) {}
-    pub fn bench_fp3_mul_strategies(_c: &mut Criterion) {}
+    pub fn bench_fp2_operations(_c: &mut Criterion) {}
+    pub fn bench_fp3_operations(_c: &mut Criterion) {}
 }
 
 criterion_group!(
     fp2_benches_group,
     fp2_benches::bench_mul_by_7,
-    fp2_benches::bench_fp2_mul_strategies,
-    fp2_benches::bench_fp3_mul_strategies,
+    fp2_benches::bench_fp2_operations,
+    fp2_benches::bench_fp3_operations,
 );
 
 criterion_main!(fp2_benches_group);
