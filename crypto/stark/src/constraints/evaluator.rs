@@ -5,7 +5,6 @@ use crate::domain::Domain;
 use crate::lookup::BusPublicInputs;
 use crate::trace::LDETraceTable;
 use crate::traits::{AIR, TransitionEvaluationContext};
-use crate::lookup::BusPublicInputs;
 use crate::{frame::Frame, prover::evaluate_polynomial_on_lde_domain};
 use itertools::Itertools;
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
