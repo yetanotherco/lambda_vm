@@ -12,7 +12,7 @@ use math::{
 
 use crate::{
     config::Commitment,
-    domain::Domain,
+    domain::VerifierDomain,
     fri::fri_decommit::FriDecommitment,
     table::Table,
     traits::AIR,
@@ -453,7 +453,7 @@ impl StoneCompatibleSerializer {
     {
         let mut transcript = StoneProverTranscript::new(&public_inputs.as_bytes());
         let air = A::new(proof.trace_length, public_inputs, proof_options);
-        let domain = Domain::<Stark252PrimeField>::new(&air);
+        let domain = VerifierDomain::<Stark252PrimeField>::new(&air);
         let challenges = Verifier::step_1_replay_rounds_and_recover_challenges(
             &air,
             proof,
