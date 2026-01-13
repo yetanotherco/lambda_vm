@@ -112,7 +112,10 @@ where
             num_transition_constraints: constraints.len(),
         };
 
-        Self { context, constraints }
+        Self {
+            context,
+            constraints,
+        }
     }
 
     fn composition_poly_degree_bound(&self, trace_length: usize) -> usize {

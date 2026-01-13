@@ -38,7 +38,7 @@ impl AIR for CPUTableAIR {
     type FieldExtension = Degree4BabyBearU32ExtensionField;
     type PublicInputs = ();
 
-    fn new(_pub_inputs: &Self::PublicInputs, proof_options: &ProofOptions) -> Self {
+    fn new(proof_options: &ProofOptions) -> Self {
         let constraint_index = 0;
         // Bit constraints:
         // Enforce that these columns are binary. They include:
@@ -141,6 +141,7 @@ impl AIR for CPUTableAIR {
 
     fn boundary_constraints(
         &self,
+        _pub_inputs: &Self::PublicInputs,
         _rap_challenges: &[FieldElement<Self::FieldExtension>],
         _bus_interactions: Option<&[stark::lookup::BusPublicInputs<Self::FieldExtension>]>,
         _trace_length: usize,
@@ -158,10 +159,6 @@ impl AIR for CPUTableAIR {
 
     fn trace_layout(&self) -> (usize, usize) {
         (CpuTableRow::NUM_COLUMNS, 0)
-    }
-
-    fn pub_inputs(&self) -> &Self::PublicInputs {
-        &()
     }
 
     fn step_size(&self) -> usize {

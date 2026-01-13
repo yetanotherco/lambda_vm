@@ -128,7 +128,12 @@ pub trait IsStarkVerifier<
         };
         let trace_length = proof.trace_length;
         let num_boundary_constraints = air
-            .boundary_constraints(&proof.public_inputs, &rap_challenges, bus_interactions, trace_length)
+            .boundary_constraints(
+                &proof.public_inputs,
+                &rap_challenges,
+                bus_interactions,
+                trace_length,
+            )
             .constraints
             .len();
 
@@ -253,8 +258,12 @@ pub trait IsStarkVerifier<
             Some(&proof.bus_interactions[..])
         };
         let trace_length = proof.trace_length;
-        let boundary_constraints =
-            air.boundary_constraints(&proof.public_inputs, &challenges.rap_challenges, bus_interactions, trace_length);
+        let boundary_constraints = air.boundary_constraints(
+            &proof.public_inputs,
+            &challenges.rap_challenges,
+            bus_interactions,
+            trace_length,
+        );
         let number_of_b_constraints = boundary_constraints.constraints.len();
 
         #[allow(clippy::type_complexity)]
@@ -888,7 +897,12 @@ pub trait IsStarkVerifier<
         };
         let trace_length = proof.trace_length;
         let num_boundary_constraints = air
-            .boundary_constraints(&proof.public_inputs, &rap_challenges, bus_interactions, trace_length)
+            .boundary_constraints(
+                &proof.public_inputs,
+                &rap_challenges,
+                bus_interactions,
+                trace_length,
+            )
             .constraints
             .len();
 

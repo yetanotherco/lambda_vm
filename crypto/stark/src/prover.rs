@@ -1019,10 +1019,8 @@ pub trait IsStarkProver<
         // =====================================================================
 
         let mut proofs = Vec::new();
-        for (((air, _, pub_inputs), round_1_result), domain) in air_trace_pairs
-            .iter()
-            .zip(round_1_results)
-            .zip(domains)
+        for (((air, _, pub_inputs), round_1_result), domain) in
+            air_trace_pairs.iter().zip(round_1_results).zip(domains)
         {
             let proof =
                 Self::prove_rounds_2_to_4(*air, *pub_inputs, &round_1_result, transcript, &domain)?;
@@ -1266,7 +1264,7 @@ mod tests {
         Felt252,
         examples::{
             fibonacci_2_cols_shifted::{self, Fibonacci2ColsShifted},
-            simple_fibonacci::{self, FibonacciPublicInputs},
+            simple_fibonacci::{self},
         },
         proof::options::ProofOptions,
         transcript::StoneProverTranscript,
@@ -1373,7 +1371,11 @@ mod tests {
     }
 
     fn proof_parts_stone_compatibility_case_1() -> (
-        StarkProof<Stark252PrimeField, Stark252PrimeField, fibonacci_2_cols_shifted::PublicInputs<Stark252PrimeField>>,
+        StarkProof<
+            Stark252PrimeField,
+            Stark252PrimeField,
+            fibonacci_2_cols_shifted::PublicInputs<Stark252PrimeField>,
+        >,
         Fibonacci2ColsShifted<Stark252PrimeField>,
         ProofOptions,
         [u8; 4],
@@ -1416,7 +1418,11 @@ mod tests {
         )
     }
 
-    fn stone_compatibility_case_1_proof() -> StarkProof<Stark252PrimeField, Stark252PrimeField, fibonacci_2_cols_shifted::PublicInputs<Stark252PrimeField>> {
+    fn stone_compatibility_case_1_proof() -> StarkProof<
+        Stark252PrimeField,
+        Stark252PrimeField,
+        fibonacci_2_cols_shifted::PublicInputs<Stark252PrimeField>,
+    > {
         let (proof, _, _, _, _) = proof_parts_stone_compatibility_case_1();
         proof
     }
@@ -1777,7 +1783,11 @@ mod tests {
     }
 
     fn proof_parts_stone_compatibility_case_2() -> (
-        StarkProof<Stark252PrimeField, Stark252PrimeField, fibonacci_2_cols_shifted::PublicInputs<Stark252PrimeField>>,
+        StarkProof<
+            Stark252PrimeField,
+            Stark252PrimeField,
+            fibonacci_2_cols_shifted::PublicInputs<Stark252PrimeField>,
+        >,
         ProofOptions,
         [u8; 4],
     ) {
@@ -1811,7 +1821,11 @@ mod tests {
         (proof, proof_options, transcript_init_seed)
     }
 
-    fn stone_compatibility_case_2_proof() -> StarkProof<Stark252PrimeField, Stark252PrimeField, fibonacci_2_cols_shifted::PublicInputs<Stark252PrimeField>> {
+    fn stone_compatibility_case_2_proof() -> StarkProof<
+        Stark252PrimeField,
+        Stark252PrimeField,
+        fibonacci_2_cols_shifted::PublicInputs<Stark252PrimeField>,
+    > {
         let (proof, _, _) = proof_parts_stone_compatibility_case_2();
         proof
     }
