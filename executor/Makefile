@@ -39,20 +39,20 @@ $(ASM_ARTIFACTS_DIR)/%.elf: $(ASM_ARTIFACTS_DIR)/%.o
 # Compile rust
 $(RUST_ARTIFACTS_DIR)/%.elf: $(RUST_PROGRAMS_DIR)/%/Cargo.toml
 	cd $(RUST_PROGRAMS_DIR)/$* && \
-		cargo +nightly build --release \
-			--target rv32.json \
+		cargo build build --release \
+			--target riscv32im-lambda-vm-elf \
 			-Z build-std=core,alloc,std,compiler_builtins,panic_abort \
 			-Z build-std-features=compiler-builtins-mem 
-	cp $(RUST_PROGRAMS_DIR)/$*/target/rv32/release/$* $@
+	cp $(RUST_PROGRAMS_DIR)/$*/target/riscv32im-lambda-vm-elf/release/$* $@
 
 # Compile rust benches
 $(BENCH_ARTIFACTS_DIR)/%.elf: $(BENCH_PROGRAMS_DIR)/%/Cargo.toml
 	cd $(BENCH_PROGRAMS_DIR)/$* && \
-		cargo +nightly build \
-			--target rv32.json \
-			-Z build-std=core,alloc,std,compiler_builtins,panic_abort \
+		cargo build \
+			--target riscv32im-lambda-vm-elf \
+			-Z build-std=core,compiler_builtins \
 			-Z build-std-features=compiler-builtins-mem 
-	cp $(BENCH_PROGRAMS_DIR)/$*/target/rv32/debug/$* $@
+	cp $(BENCH_PROGRAMS_DIR)/$*/target/riscv32im-lambda-vm-elf/debug/$* $@
 	rm -rf $(BENCH_PROGRAMS_DIR)/$*/target
 
 clean-asm:
