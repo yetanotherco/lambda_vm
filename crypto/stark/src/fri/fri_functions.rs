@@ -138,13 +138,22 @@ mod tests {
         ]);
         let beta = FE::new(4);
 
-        assert_eq!(fold_polynomial_legacy(&p0, &beta), fold_polynomial(&p0, &beta));
+        assert_eq!(
+            fold_polynomial_legacy(&p0, &beta),
+            fold_polynomial(&p0, &beta)
+        );
 
         let p4 = Polynomial::new(&[FE::new(1), FE::new(2), FE::new(3), FE::new(4)]);
-        assert_eq!(fold_polynomial_legacy(&p4, &beta), fold_polynomial(&p4, &beta));
+        assert_eq!(
+            fold_polynomial_legacy(&p4, &beta),
+            fold_polynomial(&p4, &beta)
+        );
 
         let p2 = Polynomial::new(&[FE::new(10), FE::new(20)]);
-        assert_eq!(fold_polynomial_legacy(&p2, &beta), fold_polynomial(&p2, &beta));
+        assert_eq!(
+            fold_polynomial_legacy(&p2, &beta),
+            fold_polynomial(&p2, &beta)
+        );
     }
 
     #[test]

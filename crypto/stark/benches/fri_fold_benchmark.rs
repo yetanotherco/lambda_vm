@@ -1,4 +1,4 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use math::field::element::FieldElement;
 use math::field::fields::fft_friendly::babybear_u32::Babybear31PrimeField;
 use math::polynomial::Polynomial;
