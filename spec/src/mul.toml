@@ -7,21 +7,25 @@ name = "MUL"
 name = "lhs"
 type = "DWordHL"
 desc = "the left hand operator."
+pad = 0
 
 [[variables.input]]
 name = "lhs_signed"
 type = "Bit"
 desc = "whether to interpret `lhs` as a signed integer (1) or not (0)."
+pad = 0
 
 [[variables.input]]
 name = "rhs"
 type = "DWordHL"
 desc = "the right hand operator."
+pad = 0
 
 [[variables.input]]
 name = "rhs_signed"
 type = "Bit"
 desc = "whether to interpret `rhs` as a signed integer (1) or not (0)."
+pad = 0
 
 
 # Output
@@ -30,6 +34,7 @@ desc = "whether to interpret `rhs` as a signed integer (1) or not (0)."
 name = "res"
 type = "QuadWL"
 desc = "the (extended) multiplication result"
+pad = 0
 
 # Auxiliary
 
@@ -37,16 +42,19 @@ desc = "the (extended) multiplication result"
 name = "lhs_is_negative"
 type = "Bit"
 desc = "whether `lhs` is negative (1) or not (0)"
+pad = 0
 
 [[variables.auxiliary]]
 name = "rhs_is_negative"
 type = "Bit"
 desc = "whether `rhs` is negative (1) or not (0)"
+pad = 0
 
 [[variables.auxiliary]]
 name = "raw_product"
 type = ["B51", 4]
 desc = "raw multiplication output"
+pad = 0
 
 # Virtual
 
@@ -89,11 +97,13 @@ def = ["+", "μ_lo", "μ_hi"]
 name = "μ_lo"
 type = "BaseField"
 desc = ""
+pad = 0
 
 [[variables.multiplicity]]
 name = "μ_hi"
 type = "BaseField"
 desc = ""
+pad = 0
 
 # Assumptions
 
