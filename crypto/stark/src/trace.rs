@@ -7,7 +7,7 @@ use math::{
     polynomial::Polynomial,
 };
 #[cfg(feature = "parallel")]
-use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
+use rayon::prelude::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
 /// A two-dimensional representation of an execution trace of the STARK
 /// protocol.
@@ -372,25 +372,48 @@ where
 
 pub fn columns2rows<F>(columns: Vec<Vec<F>>) -> Vec<Vec<F>>
 where
-    F: Clone,
+    F: Clone + Send + Sync,
 {
     columns2rows_ref(&columns)
 }
 
 /// Converts column-major data to row-major without consuming the input.
 /// More efficient when the caller still needs the original column data.
+///
+/// Uses parallel iteration when the `parallel` feature is enabled.
 pub fn columns2rows_ref<F>(columns: &[Vec<F>]) -> Vec<Vec<F>>
 where
-    F: Clone,
+    F: Clone + Send + Sync,
 {
+    if columns.is_empty() {
+        return Vec::new();
+    }
+
     let num_rows = columns[0].len();
     let num_cols = columns.len();
 
-    (0..num_rows)
+    #[cfg(feature = "parallel")]
+    let result = (0..num_rows)
+        .into_par_iter()
         .map(|row_index| {
-            (0..num_cols)
-                .map(|col_index| columns[col_index][row_index].clone())
-                .collect()
+            let mut row = Vec::with_capacity(num_cols);
+            for column in columns {
+                row.push(column[row_index].clone());
+            }
+            row
         })
-        .collect()
+        .collect();
+
+    #[cfg(not(feature = "parallel"))]
+    let result = (0..num_rows)
+        .map(|row_index| {
+            let mut row = Vec::with_capacity(num_cols);
+            for column in columns {
+                row.push(column[row_index].clone());
+            }
+            row
+        })
+        .collect();
+
+    result
 }

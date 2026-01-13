@@ -15,7 +15,9 @@ use math::{
 };
 
 #[cfg(feature = "parallel")]
-use rayon::prelude::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use rayon::prelude::{
+    IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator, ParallelSlice,
+};
 
 #[cfg(debug_assertions)]
 use crate::debug::validate_trace;
@@ -417,6 +419,8 @@ pub trait IsStarkProver<
 
     /// Returns the Merkle tree and the commitment to the evaluations of the parts of the
     /// composition polynomial.
+    ///
+    /// Optimized to use parallel transpose and avoid unnecessary clones.
     fn commit_composition_polynomial(
         lde_composition_poly_parts_evaluations: &[Vec<FieldElement<FieldExtension>>],
     ) -> Option<(BatchedMerkleTree<FieldExtension>, Commitment)>
@@ -424,24 +428,33 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        // TODO: Remove clones
-        let mut lde_composition_poly_evaluations = Vec::new();
-        for i in 0..lde_composition_poly_parts_evaluations[0].len() {
-            let mut row = Vec::new();
-            for evaluation in lde_composition_poly_parts_evaluations.iter() {
-                row.push(evaluation[i].clone());
-            }
-            lde_composition_poly_evaluations.push(row);
-        }
+        // Transpose from column-major to row-major (parallelized)
+        let mut lde_composition_poly_evaluations =
+            columns2rows_ref(lde_composition_poly_parts_evaluations);
 
         in_place_bit_reverse_permute(&mut lde_composition_poly_evaluations);
 
-        let mut lde_composition_poly_evaluations_merged = Vec::new();
-        for chunk in lde_composition_poly_evaluations.chunks(2) {
-            let (mut chunk0, chunk1) = (chunk[0].clone(), &chunk[1]);
-            chunk0.extend_from_slice(chunk1);
-            lde_composition_poly_evaluations_merged.push(chunk0);
-        }
+        // Merge consecutive pairs of rows for commitment
+        // Use parallel iteration when available
+        #[cfg(feature = "parallel")]
+        let lde_composition_poly_evaluations_merged: Vec<_> = lde_composition_poly_evaluations
+            .par_chunks(2)
+            .map(|chunk| {
+                let mut merged = chunk[0].clone();
+                merged.extend_from_slice(&chunk[1]);
+                merged
+            })
+            .collect();
+
+        #[cfg(not(feature = "parallel"))]
+        let lde_composition_poly_evaluations_merged: Vec<_> = lde_composition_poly_evaluations
+            .chunks(2)
+            .map(|chunk| {
+                let mut merged = chunk[0].clone();
+                merged.extend_from_slice(&chunk[1]);
+                merged
+            })
+            .collect();
 
         Self::batch_commit_extension(&lde_composition_poly_evaluations_merged)
     }
@@ -477,6 +490,22 @@ pub trait IsStarkProver<
         let number_of_parts = air.composition_poly_degree_bound() / air.trace_length();
         let composition_poly_parts = composition_poly.break_in_parts(number_of_parts);
 
+        // Evaluate composition polynomial parts on LDE domain (parallelized)
+        #[cfg(feature = "parallel")]
+        let lde_composition_poly_parts_evaluations: Vec<_> = composition_poly_parts
+            .par_iter()
+            .map(|part| {
+                evaluate_polynomial_on_lde_domain(
+                    part,
+                    domain.blowup_factor,
+                    domain.interpolation_domain_size,
+                    &domain.coset_offset,
+                )
+                .unwrap()
+            })
+            .collect();
+
+        #[cfg(not(feature = "parallel"))]
         let lde_composition_poly_parts_evaluations: Vec<_> = composition_poly_parts
             .iter()
             .map(|part| {
