@@ -207,7 +207,7 @@ fn test_memory() {
     }
     run_program_and_check_public_output(
         "./program_artifacts/rust/memory.elf",
-        output[(size - 1000) as usize ..].to_vec(),
+        output[(size - 1000) as usize..].to_vec(),
         size.to_be_bytes().to_vec(),
     );
 }
