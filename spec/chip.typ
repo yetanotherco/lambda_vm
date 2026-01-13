@@ -80,12 +80,12 @@
     let idx = def.at("idx", default: none)
     let gather_indices(obj) = iters_of(obj, name: idx).map(it => it.first())
     let index_all(expr, indices) = {
-      if indices.len() == 0 {
-        expr
-      } else {
-        index_all(("idx", expr, indices.first()), indices.slice(1))
+      for index in indices {
+        expr = ("idx", expr, index)
       }
+      expr
     }
+
     if "poly" in def {
       // assert(false, message: repr(index_all(var_name, gather_indices(def))))
       (
