@@ -52,8 +52,8 @@ name = "next_pc_unmasked"
 type = "DWordWL"
 desc = "The combination of `next_pc_high`, `next_pc_low[1]` and `unmasked_low_byte` to constrain the addition. This is the computed value for the next pc, before masking off the LSB as required by the ISA."
 def = {idx = "i", polys = [
-  {range = [0], poly = ["+", ["*", ["^", 2, 16], ["idx", "next_pc_high", 0]], ["*", ["^", 2, 8], ["idx", "next_pc_low", 1]], ["idx", "unmasked_low_byte", 0]]},
-  {range = [1], poly = ["+", ["*", ["^", 2, 16], ["idx", "next_pc_high", 2]], ["idx", "next_pc_high", 1]]},
+  {iter = 0, poly = ["+", ["*", ["^", 2, 16], ["idx", "next_pc_high", 0]], ["*", ["^", 2, 8], ["idx", "next_pc_low", 1]], ["idx", "unmasked_low_byte", 0]]},
+  {iter = 1, poly = ["+", ["*", ["^", 2, 16], ["idx", "next_pc_high", 2]], ["idx", "next_pc_high", 1]]},
 ]}
 
 [[variables.virtual]]
@@ -61,8 +61,8 @@ name = "next_pc"
 type = "DWordWL"
 desc = "The computed next pc, after masking off the LSB as required by the ISA."
 def = {idx = "i", polys = [
-  {range = [0], poly = ["+", ["*", ["^", 2, 16], ["idx", "next_pc_high", 0]], ["*", ["^", 2, 8], ["idx", "next_pc_low", 1]], ["idx", "next_pc_low", 0]]},
-  {range = [1], poly = ["+", ["*", ["^", 2, 16], ["idx", "next_pc_high", 2]], ["idx", "next_pc_high", 1]]},
+  {iter = 0, poly = ["+", ["*", ["^", 2, 16], ["idx", "next_pc_high", 0]], ["*", ["^", 2, 8], ["idx", "next_pc_low", 1]], ["idx", "next_pc_low", 0]]},
+  {iter = 1, poly = ["+", ["*", ["^", 2, 16], ["idx", "next_pc_high", 2]], ["idx", "next_pc_high", 1]]},
 ]}
 
 
@@ -76,14 +76,14 @@ desc = ""
 
 [[assumptions]]
 desc = "`pc` is range checked, `IS_WORD[pc[i]]`"
-range = ["i", 0, 1]
+iter = ["i", 0, 1]
 
 [[assumptions]]
 desc = "`offset` is range checked, `IS_WORD[offset]`"
 
 [[assumptions]]
 desc = "`register` is range checked, `IS_WORD[register[i]]`"
-range = ["i", 0, 1]
+iter = ["i", 0, 1]
 
 [[assumptions]]
 desc = "`IS_BIT<JALR>`"
@@ -124,7 +124,7 @@ multiplicity = "μ"
 kind = "interaction"
 tag = "IS_HALFWORD"
 input = [["idx", "next_pc_high", "i"]]
-range = ["i", 0, 2]
+iter = ["i", 0, 2]
 multiplicity = "μ"
 
 

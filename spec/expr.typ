@@ -31,6 +31,7 @@
 //          | ["idx", expr1, expr2]        ; expr1[expr2]
 //          | ["not", expr]                ; !expr
 //          | ["+", expr1, expr2, ...]     ; expr1 + expr2 + ...
+//          | ["sum", expr1, expr2, expr3] ; Σ_expr1^expr2 expr3
 //          | ["*", expr1, expr2, ...]     ; expr1 * expr2 * ...
 //          | ["/", expr1, expr2]          ; expr1 / expr2
 //          | ["^", expr1, expr2]          ; expr1^expr2
@@ -51,12 +52,13 @@
   "cast": 2, // cast
   "mul": 3,  // *
   "div": 4,  // /
-  "not": 5,  // not
-  "add": 6,  // +
-  "sub": 7,  // -
-  "idx": 8,  // []
-  "eq": 9,   // = and :=
-  "MAX": 10, // <the void outside every expression>
+  "sum": 5,  // Σ
+  "not": 6,  // not
+  "add": 7,  // +
+  "sub": 8,  // -
+  "idx": 9,  // []
+  "eq": 10,   // = and :=
+  "MAX": 11, // <the void outside every expression>
 )
 
 // Mutual recursion through a trick from https://github.com/typst/typst/issues/744
@@ -92,6 +94,7 @@
     "idx": (pp, rec, e) => rec(PREC.MIN, e.at(1)) + `[` + rec(PREC.MAX, e.at(2)) + `]`,
     "not": (pp, rec, e) => cwrap(`1 - ` + rec(PREC.not, e.at(1)), pp < PREC.not),
     "+": (pp, rec, e) => cwrap(e.slice(1).map(rec.with(PREC.add)).join(` + `), pp < PREC.add),
+    "sum": (pp, rec, e) => assert(false, message: "sum is unsupported in code."),
     "*": (pp, rec, e) => cwrap(e.slice(1).map(rec.with(PREC.mul)).join(` ` + sym.dot + ` `), pp < PREC.mul),
     "/": (pp, rec, e) => cwrap(rec(PREC.div, e.at(1)), pp < PREC.div) + ` / ` + rec(PREC.div, e.at(2)),
     "^": (pp, rec, e) => {
@@ -126,13 +129,40 @@
   }
 }
 
+#let flat_idxs(expr) = {
+  if expr.at(0) != "idx" {
+    (expr, ())
+  } else {
+    let (sub, gathered) = flat_idxs(expr.at(1))
+    (sub, gathered + (expr.at(2),))
+  }
+}
+
 // Typeset an expression as math
 #let expr_to_math = make_expr_formatter(
   (
-    "idx": (pp, rec, e) => $#rec(PREC.idx, e.at(1))_(#rec(PREC.idx, e.at(2)))$,
+    "idx": (pp, rec, e) => {
+      let (val, idxs) = flat_idxs(e)
+      $#rec(PREC.idx, val)_(#idxs.map(idx => rec(PREC.idx, idx)).join($, $))$
+    },
     "not": (pp, rec, e) => mwrap($1 - #rec(PREC.not, e.at(1))$, pp < PREC.not),
     "+": (pp, rec, e) => mwrap($#e.slice(1).map(rec.with(PREC.add)).join($+$)$, pp < PREC.add),
-    "*": (pp, rec, e) => mwrap($#e.slice(1).map(rec.with(PREC.mul)).join($dot$)$, pp < PREC.mul),
+    "sum": (pp, rec, e) => {
+      assert(e.len() == 4, message: "invalid sum:" + repr(e))
+      mwrap(
+        $sum_(#rec(PREC.MAX, e.at(1)))^#rec(PREC.MAX, e.at(2)) #rec(if pp <= PREC.sub {PREC.MAX} else {PREC.sum}, e.at(3))$, 
+        pp <= PREC.sub
+      )
+    },
+    "*": (pp, rec, e) => {
+      if e.len() == 3 and type(e.at(1)) == int and type(e.at(2)) == str and e.at(2).len() == 1 {
+        // multiplication of a constant with one-letter variable. 
+        // Dropping the "dot"
+        mwrap($#e.slice(1).map(rec.with(PREC.mul)).join($$)$, pp < PREC.mul)
+      } else {
+        mwrap($#e.slice(1).map(rec.with(PREC.mul)).join($dot$)$, pp < PREC.mul)
+      }
+    },
     "/": (pp, rec, e) => $#rec(PREC.div, e.at(1)) / #rec(PREC.div, e.at(2))$,
     "^": (pp, rec, e) => {
       assert(type(e.at(1)) == int and type(e.at(2)) == int, message: "Can only exponentiate constants")

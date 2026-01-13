@@ -456,19 +456,19 @@ input = ["rd"]
 kind = "interaction"
 tag = "IS_BYTE"
 input = [["idx", "arg1", "i"]]
-range = ["i", 0, 7]
+iter = ["i", 0, 7]
 
 [[constraints.range]]
 kind = "interaction"
 tag = "IS_BYTE"
 input = [["idx", "arg2", "i"]]
-range = ["i", 0, 7]
+iter = ["i", 0, 7]
 
 [[constraints.range]]
 kind = "interaction"
 tag = "IS_BYTE"
 input = [["idx", "res", "i"]]
-range = ["i", 0, 7]
+iter = ["i", 0, 7]
 
 
 [[constraint_groups]]
@@ -501,7 +501,7 @@ multiplicity = ["+", "SLT", "BLT"]
 kind = "arith"
 constraint = "$#`SLT` + #`BLT` => #`res[i]` = 0$"
 poly = ["*", ["+", "SLT", "BLT"], ["idx", "res", "i"]]
-range = ["i", 1, 7]
+iter = ["i", 1, 7]
 
 [[constraints.alu]]
 kind = "interaction"
@@ -509,7 +509,7 @@ tag = "AND_BYTE"
 input = [["idx", "arg1", "i"], ["idx", "arg2", "i"]]
 output = ["idx", "res", "i"]
 multiplicity = "AND"
-range = ["i", 0, 7]
+iter = ["i", 0, 7]
 
 [[constraints.alu]]
 kind = "interaction"
@@ -517,7 +517,7 @@ tag = "OR_BYTE"
 input = [["idx", "arg1", "i"], ["idx", "arg2", "i"]]
 output = ["idx", "res", "i"]
 multiplicity = "OR"
-range = ["i", 0, 7]
+iter = ["i", 0, 7]
 
 [[constraints.alu]]
 kind = "interaction"
@@ -525,7 +525,7 @@ tag = "XOR_BYTE"
 input = [["idx", "arg1", "i"], ["idx", "arg2", "i"]]
 output = ["idx", "res", "i"]
 multiplicity = "XOR"
-range = ["i", 0, 7]
+iter = ["i", 0, 7]
 
 [[constraints.alu]]
 kind = "interaction"
