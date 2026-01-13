@@ -106,6 +106,10 @@ desc = "`IS_BIT<write8>`"
 [[assumptions]]
 desc = "`IS_BIT<write2 + write4 + write8>`"
 
+[[assumptions]]
+desc = "`IS_HALFWORD[timestamp[i]]`"
+iter = ["i", 0, 3]
+
 
 [[constraint_groups]]
 name = "consistency"
@@ -149,6 +153,15 @@ tag = "IS_HALFWORD"
 input = [["idx", ["idx", "address_add", "i"], "j"]]
 iters = [
   ["i", 0, 6],
+  ["j", 0, 3],
+]
+
+[[constraints.consistency]]
+kind = "interaction"
+tag = "IS_HALFWORD"
+input = [["idx", ["idx", "old_timestamp", "i"], "j"]]
+iters = [
+  ["i", 0, 7],
   ["j", 0, 3],
 ]
 
