@@ -624,12 +624,12 @@ pub trait IsStarkProver<
         let z_power = z.pow(round_2_result.composition_poly_parts.len());
 
         // Evaluate H_i in z^N for all i, where N is the number of parts the composition poly was
-        // broken into.
-        let composition_poly_parts_ood_evaluation: Vec<_> = round_2_result
-            .composition_poly_parts
-            .iter()
-            .map(|part| part.evaluate(&z_power))
-            .collect();
+        // broken into. Uses precomputed powers for efficient batch evaluation.
+        let composition_poly_parts_ood_evaluation: Vec<_> =
+            math::polynomial::evaluate_polynomials_at_point(
+                &round_2_result.composition_poly_parts,
+                &z_power,
+            );
 
         // Returns the Out of Domain Frame for the given trace polynomials, out of domain evaluation point (called `z` in the literature),
         // frame offsets given by the AIR and primitive root used for interpolating the trace polynomials.

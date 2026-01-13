@@ -7,6 +7,45 @@ pub mod dense_multilinear_poly;
 mod error;
 pub mod sparse_multilinear_poly;
 
+/// Precomputes powers of x: `[1, x, x^2, x^3, ..., x^(n-1)]`
+/// This is useful for batch polynomial evaluation at the same point.
+pub fn precompute_powers<F: IsField>(x: &FieldElement<F>, n: usize) -> Vec<FieldElement<F>> {
+    if n == 0 {
+        return vec![];
+    }
+    let mut powers = Vec::with_capacity(n);
+    powers.push(FieldElement::one());
+    for i in 1..n {
+        let prev = &powers[i - 1];
+        powers.push(prev * x);
+    }
+    powers
+}
+
+/// Evaluates multiple polynomials at the same point using precomputed powers.
+/// More efficient than calling `evaluate` on each polynomial individually.
+pub fn evaluate_polynomials_at_point<F, E>(
+    polynomials: &[Polynomial<FieldElement<F>>],
+    x: &FieldElement<E>,
+) -> Vec<FieldElement<E>>
+where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+{
+    if polynomials.is_empty() {
+        return vec![];
+    }
+    // Find the maximum degree among all polynomials
+    let max_len = polynomials.iter().map(|p| p.coeff_len()).max().unwrap_or(0);
+    // Precompute powers once
+    let powers = precompute_powers(x, max_len);
+    // Evaluate each polynomial using the precomputed powers
+    polynomials
+        .iter()
+        .map(|p| p.evaluate_with_powers(&powers))
+        .collect()
+}
+
 /// Represents the polynomial c_0 + c_1 * X + c_2 * X^2 + ... + c_n * X^n
 /// as a vector of coefficients `[c_0, c_1, ... , c_n]`
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,6 +156,29 @@ impl<F: IsField> Polynomial<FieldElement<F>> {
     /// Returns a vector y such that y[i] = P(input[i])
     pub fn evaluate_slice(&self, input: &[FieldElement<F>]) -> Vec<FieldElement<F>> {
         input.iter().map(|x| self.evaluate(x)).collect()
+    }
+
+    /// Evaluates a polynomial using precomputed powers of the evaluation point.
+    /// This is more efficient than `evaluate` when evaluating multiple polynomials
+    /// at the same point, as the powers only need to be computed once.
+    ///
+    /// `powers` should contain `[1, x, x^2, x^3, ..., x^n]` where n >= degree of polynomial.
+    /// Use `precompute_powers` to generate this vector.
+    pub fn evaluate_with_powers<E>(&self, powers: &[FieldElement<E>]) -> FieldElement<E>
+    where
+        E: IsField,
+        F: IsSubFieldOf<E>,
+    {
+        debug_assert!(
+            powers.len() >= self.coefficients.len(),
+            "Not enough powers for polynomial evaluation"
+        );
+        self.coefficients
+            .iter()
+            .zip(powers.iter())
+            .fold(FieldElement::zero(), |acc, (coeff, power)| {
+                acc + coeff * power
+            })
     }
 
     /// Returns the degree of a polynomial, which corresponds to the highest power of x^d
