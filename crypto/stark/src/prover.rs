@@ -5,6 +5,7 @@ use std::time::Instant;
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use math::fft::cpu::bit_reversing::{in_place_bit_reverse_permute, reverse_index};
 use math::fft::errors::FFTError;
+use math::fft::polynomial::{evaluate_offset_fft_with_twiddles, get_evaluation_twiddles};
 
 use log::info;
 use math::field::traits::{IsField, IsSubFieldOf};
@@ -330,6 +331,7 @@ pub trait IsStarkProver<
 
     /// Evaluate polynomials `trace_polys` over the domain `domain`.
     /// The i-th entry of the returned vector contains the evaluations of the i-th polynomial in `trace_polys`.
+    /// Uses pre-computed twiddle factors for efficiency when evaluating multiple polynomials.
     fn compute_lde_trace_evaluations<E>(
         trace_polys: &[Polynomial<FieldElement<E>>],
         domain: &Domain<Field>,
@@ -337,7 +339,19 @@ pub trait IsStarkProver<
     where
         E: IsSubFieldOf<FieldExtension>,
         Field: IsSubFieldOf<E>,
+        FieldElement<Field>: Send + Sync,
     {
+        if trace_polys.is_empty() {
+            return Vec::new();
+        }
+
+        // Compute the target FFT length (same for all polynomials with same degree)
+        let target_len = domain.interpolation_domain_size.next_power_of_two() * domain.blowup_factor;
+        let order = target_len.trailing_zeros();
+
+        // Pre-compute twiddles once for all polynomials
+        let twiddles = get_evaluation_twiddles::<Field>(order).unwrap();
+
         #[cfg(not(feature = "parallel"))]
         let trace_polys_iter = trace_polys.iter();
         #[cfg(feature = "parallel")]
@@ -345,15 +359,23 @@ pub trait IsStarkProver<
 
         trace_polys_iter
             .map(|poly| {
-                evaluate_polynomial_on_lde_domain(
+                let evaluations = evaluate_offset_fft_with_twiddles(
                     poly,
-                    domain.blowup_factor,
-                    domain.interpolation_domain_size,
+                    &twiddles,
+                    target_len,
                     &domain.coset_offset,
                 )
+                .unwrap();
+
+                // Handle step-by if needed (usually step = 1)
+                let step = evaluations.len() / (domain.interpolation_domain_size * domain.blowup_factor);
+                if step == 1 {
+                    evaluations
+                } else {
+                    evaluations.into_iter().step_by(step).collect()
+                }
             })
-            .collect::<Result<Vec<Vec<FieldElement<E>>>, FFTError>>()
-            .unwrap()
+            .collect()
     }
 
     /// Returns the result of the first round of the STARK Prove protocol.

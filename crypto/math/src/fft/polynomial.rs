@@ -230,3 +230,66 @@ where
     let scale_factor = FieldElement::from(fft_evals.len() as u64).inv().unwrap();
     Ok(Polynomial::new(&coeffs).scale_coeffs(&scale_factor))
 }
+
+/// Evaluates a single polynomial using FFT with pre-computed twiddles.
+/// This is more efficient when evaluating multiple polynomials of the same size,
+/// as twiddles only need to be computed once.
+pub fn evaluate_fft_with_twiddles<F, E>(
+    coeffs: &[FieldElement<E>],
+    twiddles: &[FieldElement<F>],
+) -> Result<Vec<FieldElement<E>>, FFTError>
+where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField,
+{
+    ops::fft(coeffs, twiddles)
+}
+
+/// Computes twiddle factors for FFT evaluation of the given order.
+/// Use this with `evaluate_fft_with_twiddles` to evaluate multiple polynomials efficiently.
+pub fn get_evaluation_twiddles<F: IsFFTField>(order: u32) -> Result<Vec<FieldElement<F>>, FFTError> {
+    roots_of_unity::get_twiddles::<F>(order.into(), RootsConfig::BitReverse)
+}
+
+/// Computes twiddle factors for FFT interpolation of the given order.
+/// Use this with `interpolate_fft_with_twiddles` to interpolate multiple polynomials efficiently.
+pub fn get_interpolation_twiddles<F: IsFFTField>(
+    order: u32,
+) -> Result<Vec<FieldElement<F>>, FFTError> {
+    roots_of_unity::get_twiddles::<F>(order.into(), RootsConfig::BitReverseInversed)
+}
+
+/// Interpolates a single polynomial using FFT with pre-computed twiddles.
+/// This is more efficient when interpolating multiple polynomials of the same size,
+/// as twiddles only need to be computed once.
+pub fn interpolate_fft_with_twiddles<F, E>(
+    fft_evals: &[FieldElement<E>],
+    twiddles: &[FieldElement<F>],
+) -> Result<Polynomial<FieldElement<E>>, FFTError>
+where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField,
+{
+    let coeffs = ops::fft(fft_evals, twiddles)?;
+    let scale_factor = FieldElement::from(fft_evals.len() as u64).inv().unwrap();
+    Ok(Polynomial::new(&coeffs).scale_coeffs(&scale_factor))
+}
+
+/// Evaluates a polynomial with an offset using pre-computed twiddles.
+/// The polynomial is scaled by the offset before FFT evaluation.
+/// This is more efficient when evaluating multiple polynomials of the same size.
+pub fn evaluate_offset_fft_with_twiddles<F, E>(
+    poly: &Polynomial<FieldElement<E>>,
+    twiddles: &[FieldElement<F>],
+    target_len: usize,
+    offset: &FieldElement<F>,
+) -> Result<Vec<FieldElement<E>>, FFTError>
+where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField,
+{
+    let scaled = poly.scale(offset);
+    let mut coeffs = scaled.coefficients().to_vec();
+    coeffs.resize(target_len, FieldElement::zero());
+    ops::fft(&coeffs, twiddles)
+}

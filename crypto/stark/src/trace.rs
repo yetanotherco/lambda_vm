@@ -1,6 +1,7 @@
 use crate::table::Table;
 use itertools::Itertools;
 use math::fft::errors::FFTError;
+use math::fft::polynomial::{get_interpolation_twiddles, interpolate_fft_with_twiddles};
 use math::field::traits::{IsField, IsSubFieldOf};
 use math::{
     field::{element::FieldElement, traits::IsFFTField},
@@ -184,14 +185,23 @@ where
     where
         S: IsFFTField + IsSubFieldOf<F>,
         FieldElement<F>: Send + Sync,
+        FieldElement<S>: Send + Sync,
     {
         let columns = self.columns_main();
+        if columns.is_empty() {
+            return Vec::new();
+        }
+
+        // Pre-compute twiddles once for all columns (they all have the same length)
+        let order = columns[0].len().trailing_zeros();
+        let twiddles = get_interpolation_twiddles::<S>(order).unwrap();
+
         #[cfg(feature = "parallel")]
         let iter = columns.par_iter();
         #[cfg(not(feature = "parallel"))]
         let iter = columns.iter();
 
-        iter.map(|col| Polynomial::interpolate_fft::<S>(col))
+        iter.map(|col| interpolate_fft_with_twiddles::<S, F>(col, &twiddles))
             .collect::<Result<Vec<Polynomial<FieldElement<F>>>, FFTError>>()
             .unwrap()
     }
@@ -200,14 +210,23 @@ where
     where
         S: IsFFTField + IsSubFieldOf<F>,
         FieldElement<E>: Send + Sync,
+        FieldElement<F>: Send + Sync,
     {
         let columns = self.columns_aux();
+        if columns.is_empty() {
+            return Vec::new();
+        }
+
+        // Pre-compute twiddles once for all columns (they all have the same length)
+        let order = columns[0].len().trailing_zeros();
+        let twiddles = get_interpolation_twiddles::<F>(order).unwrap();
+
         #[cfg(feature = "parallel")]
         let iter = columns.par_iter();
         #[cfg(not(feature = "parallel"))]
         let iter = columns.iter();
 
-        iter.map(|col| Polynomial::interpolate_fft::<F>(col))
+        iter.map(|col| interpolate_fft_with_twiddles::<F, E>(col, &twiddles))
             .collect::<Result<Vec<Polynomial<FieldElement<E>>>, FFTError>>()
             .unwrap()
     }

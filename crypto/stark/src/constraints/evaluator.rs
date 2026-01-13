@@ -13,7 +13,7 @@ use math::{fft::errors::FFTError, field::element::FieldElement};
 #[cfg(feature = "parallel")]
 use rayon::{
     iter::IndexedParallelIterator,
-    prelude::{IntoParallelIterator, ParallelIterator},
+    prelude::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator},
 };
 
 use std::marker::PhantomData;
@@ -56,10 +56,15 @@ where
     ) -> Vec<FieldElement<FieldExtension>> {
         let boundary_constraints = &self.boundary_constraints;
         let number_of_b_constraints = boundary_constraints.constraints.len();
+
+        // Parallelize boundary zerofier inverse evaluations
+        #[cfg(feature = "parallel")]
+        let boundary_constraints_iter = boundary_constraints.constraints.par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let boundary_constraints_iter = boundary_constraints.constraints.iter();
+
         let boundary_zerofiers_inverse_evaluations: Vec<Vec<FieldElement<Field>>> =
-            boundary_constraints
-                .constraints
-                .iter()
+            boundary_constraints_iter
                 .map(|bc| {
                     let point = &domain.trace_primitive_root.pow(bc.step as u64);
                     let mut evals = domain
@@ -78,9 +83,14 @@ where
         #[cfg(feature = "instruments")]
         let timer = Instant::now();
 
-        let lde_periodic_columns = air
-            .get_periodic_column_polynomials()
-            .iter()
+        // Parallelize periodic column evaluations
+        let periodic_polys = air.get_periodic_column_polynomials();
+        #[cfg(feature = "parallel")]
+        let periodic_polys_iter = periodic_polys.par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let periodic_polys_iter = periodic_polys.iter();
+
+        let lde_periodic_columns = periodic_polys_iter
             .map(|poly| {
                 evaluate_polynomial_on_lde_domain(
                     poly,
@@ -101,9 +111,13 @@ where
         #[cfg(feature = "instruments")]
         let timer = Instant::now();
 
-        let boundary_polys_evaluations = boundary_constraints
-            .constraints
-            .iter()
+        // Parallelize boundary polynomial evaluations
+        #[cfg(feature = "parallel")]
+        let boundary_polys_iter = boundary_constraints.constraints.par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let boundary_polys_iter = boundary_constraints.constraints.iter();
+
+        let boundary_polys_evaluations: Vec<Vec<FieldElement<FieldExtension>>> = boundary_polys_iter
             .map(|constraint| {
                 if constraint.is_aux {
                     (0..lde_trace.num_rows())
@@ -121,7 +135,7 @@ where
                         .collect_vec()
                 }
             })
-            .collect_vec();
+            .collect();
 
         #[cfg(feature = "instruments")]
         println!("     Created boundary polynomials: {:#?}", timer.elapsed());
