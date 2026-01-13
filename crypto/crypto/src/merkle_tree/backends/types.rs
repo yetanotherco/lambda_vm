@@ -3,6 +3,9 @@ use sha3::{Keccak256, Keccak512, Sha3_256, Sha3_512};
 
 use super::{field_element::FieldElementBackend, field_element_vector::FieldElementVectorBackend};
 
+// Re-export Poseidon2 backends for convenience
+pub use super::poseidon2::{BatchPoseidon2Backend, Poseidon2Backend};
+
 // Field element backend definitions
 
 // - With 256 bit

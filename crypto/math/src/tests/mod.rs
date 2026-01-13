@@ -23,3 +23,5 @@ pub mod u64_prime_field_tests;
 pub mod unsigned_integer_montgomery_tests;
 pub mod unsigned_integer_u256_tests;
 pub mod unsigned_integer_u384_tests;
+#[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+pub mod goldilocks_asm_tests;

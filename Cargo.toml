@@ -10,3 +10,11 @@ members = [
 ]
 
 resolver = "2"
+
+# Enable debug symbols in release builds for profiling
+# This allows flamegraph and samply to show meaningful function names
+[profile.release]
+debug = true
+
+[profile.bench]
+debug = true
