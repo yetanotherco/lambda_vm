@@ -107,8 +107,8 @@ desc = "`IS_BIT<write8>`"
 desc = "`IS_BIT<write2 + write4 + write8>`"
 
 [[assumptions]]
-desc = "`IS_HALFWORD[timestamp[i]]`"
-iter = ["i", 0, 3]
+desc = "`IS_WORD[timestamp[i]]`"
+iter = ["i", 0, 1]
 
 
 [[constraint_groups]]
@@ -158,15 +158,6 @@ iters = [
 
 [[constraints.consistency]]
 kind = "interaction"
-tag = "IS_HALFWORD"
-input = [["idx", ["idx", "old_timestamp", "i"], "j"]]
-iters = [
-  ["i", 0, 7],
-  ["j", 0, 3],
-]
-
-[[constraints.consistency]]
-kind = "interaction"
 tag = "LT"
 input = [["idx", "old_timestamp", 0], "timestamp"]
 output = 1
@@ -198,7 +189,7 @@ multiplicity = "write8"
 
 [[constraint_groups]]
 name = "overflow"
-prefix = "O"
+prefix = "R"
 
 [[constraints.overflow]]
 kind = "interaction"

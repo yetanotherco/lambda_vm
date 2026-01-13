@@ -28,6 +28,11 @@ The `MEMW` chip is comprised of #nr_variables variables that are expressed using
 
 #render_constraint_table(chip, config, groups: "consistency")
 
+As long as `timestamp` is properly range-checked, the presence of `old_timestamp`
+in the memory argument automatically ensures appropriate range checking
+(as long as no external entities provide negative multiplicities without range checking the timestamp).
+This ensures the assumptions for `LT` are satisfied.
+
 We additionally also check that the address does not overflow
 for more significant bytes of the access.
 #render_constraint_table(chip, config, groups: "overflow")
@@ -46,4 +51,4 @@ This chip contributes the following to the lookup argument.
 - MEMB chip that deals does a one-byte write to remove old_timestamp from here (uncertain tradeoffs)
 - Compute `base_address[1] + 1` once and have high words of `address_add` as Words
 - Improve overflow trapping somehow so we don't need `LT` (could tie into previous one by checking carry bit of the +1)
-- Check if `old_timestamp` is already range_checked by inclusion in the memory argument
+- Adding `μ_sum`/`w2`/`w4`/`write8` multiplicities to the `IS_HALFWORD` lookups may make some GKR things faster if there are known zeroes.
