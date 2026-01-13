@@ -7,16 +7,19 @@ name = "LT"
 name = "lhs"
 type = "DWordHHW"
 desc = "The left operand"
+pad = 0
 
 [[variables.input]]
 name = "rhs"
 type = "DWordHHW"
 desc = "The right operand"
+pad = 0
 
 [[variables.input]]
 name = "signed"
 type = "Bit"
 desc = "whether to interpret `lhs` and `rhs` as signed integers (1) or not (0)"
+pad = 0
 
 # Output
 
@@ -24,6 +27,7 @@ desc = "whether to interpret `lhs` and `rhs` as signed integers (1) or not (0)"
 name = "lt"
 type = "Bit"
 desc = "Whether $#`lhs` < #`rhs`$, taking `signed` into account"
+pad = 0
 
 
 # Auxiliary
@@ -32,16 +36,19 @@ desc = "Whether $#`lhs` < #`rhs`$, taking `signed` into account"
 name = "lhs_sub_rhs"
 type = "DWordHL"
 desc = "$#`lhs` - #`rhs`$"
+pad = 0
 
 [[variables.auxiliary]]
 name = "lhs_msb"
 type = "Bit"
 desc = "The most significant bit of `lhs`"
+pad = 0
 
 [[variables.auxiliary]]
 name = "rhs_msb"
 type = "Bit"
 desc = "The most significant bit of `rhs`"
+pad = 0
 
 # Virtual
 
@@ -50,8 +57,8 @@ name = "carry"
 type = ["Bit", 2]
 desc = "The carry for adding `lhs_sub_rhs` back to `rhs`"
 def = {idx = "i", polys = [
-  {range = [0], poly = ["*", ["^", 2, -32], ["-", ["+", ["idx", "rhs", 0], ["idx", ["cast", "lhs_sub_rhs", "DWordWL"], 0]], ["idx", "lhs", 0]]]},
-  {range = [1], poly = ["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "rhs", "DWordWL"], 1], ["idx", ["cast", "lhs_sub_rhs", "DWordWL"], 1], ["idx", "carry", 0]], ["idx", ["cast", "lhs", "DWordWL"], 1]]]},
+  {iter = 0, poly = ["*", ["^", 2, -32], ["-", ["+", ["idx", "rhs", 0], ["idx", ["cast", "lhs_sub_rhs", "DWordWL"], 0]], ["idx", "lhs", 0]]]},
+  {iter = 1, poly = ["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "rhs", "DWordWL"], 1], ["idx", ["cast", "lhs_sub_rhs", "DWordWL"], 1], ["idx", "carry", 0]], ["idx", ["cast", "lhs", "DWordWL"], 1]]]},
 ]}
 
 [[variables.virtual]]
@@ -67,16 +74,17 @@ def = ["idx", "carry", 1]
 name = "μ"
 type = "Bit"
 desc = ""
+pad = 0
 
 
 [[assumptions]]
 desc = "`IS_HALFWORD[lhs[i]]` and `IS_WORD[lhs[0]]`"
-range = ["i", 1, 2]
+iter = ["i", 1, 2]
 ref = "lt:a:range_lhs"
 
 [[assumptions]]
 desc = "`IS_HALFWORD[rhs[i]]` and `IS_WORD[rhs[0]]`"
-range = ["i", 1, 2]
+iter = ["i", 1, 2]
 ref = "lt:a:range_rhs"
 
 [[assumptions]]
@@ -120,13 +128,13 @@ desc = "Constrain the subtraction"
 kind = "template"
 tag = "IS_BIT"
 input = [["idx", "carry", "i"]]
-range = ["i", 0, 1]
+iter = ["i", 0, 1]
 
 [[constraints.sub]]
 kind = "interaction"
 tag = "IS_HALFWORD"
 input = [["idx", "lhs_sub_rhs", "i"]]
-range = ["i", 0, 3]
+iter = ["i", 0, 3]
 multiplicity = "μ"
 ref = "lt:c:lhs_sub_rhs_range"
 

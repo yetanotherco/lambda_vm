@@ -129,10 +129,22 @@
   }
 }
 
+#let flat_idxs(expr) = {
+  if expr.at(0) != "idx" {
+    (expr, ())
+  } else {
+    let (sub, gathered) = flat_idxs(expr.at(1))
+    (sub, gathered + (expr.at(2),))
+  }
+}
+
 // Typeset an expression as math
 #let expr_to_math = make_expr_formatter(
   (
-    "idx": (pp, rec, e) => $#rec(PREC.idx, e.at(1))_(#rec(PREC.idx, e.at(2)))$,
+    "idx": (pp, rec, e) => {
+      let (val, idxs) = flat_idxs(e)
+      $#rec(PREC.idx, val)_(#idxs.map(idx => rec(PREC.idx, idx)).join($, $))$
+    },
     "not": (pp, rec, e) => mwrap($1 - #rec(PREC.not, e.at(1))$, pp < PREC.not),
     "+": (pp, rec, e) => mwrap($#e.slice(1).map(rec.with(PREC.add)).join($+$)$, pp < PREC.add),
     "sum": (pp, rec, e) => {
@@ -153,8 +165,8 @@
     },
     "/": (pp, rec, e) => $#rec(PREC.div, e.at(1)) / #rec(PREC.div, e.at(2))$,
     "^": (pp, rec, e) => {
-      assert(type(e.at(1)) == int and type(e.at(2)) == int, message: "Can only exponentiate constants")
-      $#e.at(1)^#e.at(2)$
+      assert(type(e.at(1)) == int, message: "Can only exponentiate constants")
+      $#e.at(1)^#rec(PREC.MAX, e.at(2))$
     },
     "=": (pp, rec, e) => $#rec(PREC.eq, e.at(1)) = #rec(PREC.eq, e.at(2))$,
     ":=": (pp, rec, e) => $#rec(PREC.eq, e.at(1)) := #rec(PREC.eq, e.at(2))$,
