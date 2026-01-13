@@ -66,6 +66,8 @@ wget https://lambda.alignedlayer.com/lambda_rust.tar.gz
 
 Then unzip it.
 
+Note that your system may prevent execution because the binaries were compiled on another machine. You may need to grant explicit permission to run them.
+
 ##### Add to path
 
 Add the rust directory to your path
