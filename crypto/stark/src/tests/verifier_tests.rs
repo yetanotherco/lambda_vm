@@ -128,7 +128,7 @@ fn test_verify_serialized_multi_table_proofs() {
         let mul_air = create_mul_air(&proof_options);
 
         // Generate proofs
-        let airs: Vec<(
+        let air_trace_pairs: Vec<(
             &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
             &mut crate::trace::TraceTable<F, E>,
         )> = vec![
@@ -137,7 +137,7 @@ fn test_verify_serialized_multi_table_proofs() {
             (&mul_air, &mut mul_trace),
         ];
 
-        Prover::multi_prove(airs, &mut DefaultTranscript::<E>::new(&[])).unwrap()
+        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap()
     };
 
     // =========================================================================

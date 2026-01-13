@@ -127,7 +127,7 @@ fn test_multi_airs_log_up() {
     let add_air = new_add_air_with_lookup(&proof_options);
     let mul_air = new_mul_air_with_lookup(&proof_options);
 
-    let airs: Vec<(
+    let air_trace_pairs: Vec<(
         &dyn AIR<
             Field = Babybear31PrimeField,
             FieldExtension = Degree4BabyBearExtensionField,
@@ -141,7 +141,7 @@ fn test_multi_airs_log_up() {
     ];
 
     let multi_proof = Prover::multi_prove(
-        airs,
+        air_trace_pairs,
         &mut DefaultTranscript::<Degree4BabyBearExtensionField>::new(&[]),
     )
     .unwrap();
@@ -263,7 +263,7 @@ fn test_multi_airs_log_up_cheating_wrong_value_detected() {
     let add_air = new_add_air_with_lookup(&proof_options);
     let mul_air = new_mul_air_with_lookup(&proof_options);
 
-    let airs: Vec<(
+    let air_trace_pairs: Vec<(
         &dyn AIR<
             Field = Babybear31PrimeField,
             FieldExtension = Degree4BabyBearExtensionField,
@@ -277,7 +277,7 @@ fn test_multi_airs_log_up_cheating_wrong_value_detected() {
     ];
 
     let multi_proof = Prover::multi_prove(
-        airs,
+        air_trace_pairs,
         &mut DefaultTranscript::<Degree4BabyBearExtensionField>::new(&[]),
     )
     .unwrap();
@@ -399,7 +399,7 @@ fn test_multi_airs_log_up_cheating_wrong_multiplicity_detected() {
     let add_air = new_add_air_with_lookup(&proof_options);
     let mul_air = new_mul_air_with_lookup(&proof_options);
 
-    let airs: Vec<(
+    let air_trace_pairs: Vec<(
         &dyn AIR<
             Field = Babybear31PrimeField,
             FieldExtension = Degree4BabyBearExtensionField,
@@ -413,7 +413,7 @@ fn test_multi_airs_log_up_cheating_wrong_multiplicity_detected() {
     ];
 
     let multi_proof = Prover::multi_prove(
-        airs,
+        air_trace_pairs,
         &mut DefaultTranscript::<Degree4BabyBearExtensionField>::new(&[]),
     )
     .unwrap();

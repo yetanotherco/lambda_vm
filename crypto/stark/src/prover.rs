@@ -36,7 +36,7 @@ use super::proof::stark::{DeepPolynomialOpening, MultiProof, StarkProof};
 use super::trace::TraceTable;
 use super::traits::AIR;
 
-type AirAndTrace<'a, Field, FieldExtension, PI> = (
+type AirTracePair<'a, Field, FieldExtension, PI> = (
     &'a dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
     &'a mut TraceTable<Field, FieldExtension>,
 );
@@ -940,7 +940,7 @@ pub trait IsStarkProver<
     ///
     /// The transcript must be safely initialized before passing it to this method.
     fn multi_prove(
-        mut airs: Vec<AirAndTrace<'_, Field, FieldExtension, PI>>,
+        mut air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
     ) -> Result<MultiProof<Field, FieldExtension>, ProvingError>
     where
@@ -952,7 +952,9 @@ pub trait IsStarkProver<
         info!("Started proof generation...");
 
         // Check if any AIR uses LogUp (has auxiliary trace for running sums)
-        let needs_logup_challenges = airs.iter().any(|(air, _)| air.has_trace_interaction());
+        let needs_logup_challenges = air_trace_pairs
+            .iter()
+            .any(|(air, _)| air.has_trace_interaction());
 
         // =====================================================================
         // Round 1, Phase A: Commit all main traces
@@ -963,10 +965,10 @@ pub trait IsStarkProver<
         let mut domains = Vec::new();
         let mut main_commitments: Vec<MainCommitment<Field>> = Vec::new();
 
-        for (air, table) in &*airs {
-            let trace_length = table.num_rows();
+        for (air, trace) in &*air_trace_pairs {
+            let trace_length = trace.num_rows();
             let domain = new_domain(*air, trace_length);
-            let (main, evaluations) = Self::round_1_commit_main_trace(*table, &domain, transcript)?;
+            let (main, evaluations) = Self::round_1_commit_main_trace(*trace, &domain, transcript)?;
             main_commitments.push((main, evaluations));
             domains.push(domain);
         }
@@ -991,12 +993,14 @@ pub trait IsStarkProver<
         // Each AIR builds its LogUp running-sum columns using the shared challenges.
 
         let mut round_1_results: Vec<Round1<Field, FieldExtension>> = Vec::new();
-        for (((air, table), (main, main_evaluations)), domain) in
-            airs.iter_mut().zip(main_commitments).zip(domains.iter())
+        for (((air, trace), (main, main_evaluations)), domain) in air_trace_pairs
+            .iter_mut()
+            .zip(main_commitments)
+            .zip(domains.iter())
         {
             let round_1_result = Self::round_1_build_auxiliary_trace(
                 *air,
-                *table,
+                *trace,
                 domain,
                 transcript,
                 main,
@@ -1011,7 +1015,11 @@ pub trait IsStarkProver<
         // =====================================================================
 
         let mut proofs = Vec::new();
-        for (((air, _), round_1_result), domain) in airs.iter().zip(round_1_results).zip(domains) {
+        for (((air, _), round_1_result), domain) in air_trace_pairs
+            .iter()
+            .zip(round_1_results)
+            .zip(domains)
+        {
             let proof = Self::prove_rounds_2_to_4(*air, &round_1_result, transcript, &domain)?;
             proofs.push(proof);
         }
@@ -1032,8 +1040,9 @@ pub trait IsStarkProver<
         FieldExtension: IsFFTField,
         PI: Send + Sync,
     {
-        let airs = vec![(air, trace)];
-        Self::multi_prove(airs, transcript).map(|mut multi_proof| multi_proof.proofs.remove(0))
+        let air_trace_pairs = vec![(air, trace)];
+        Self::multi_prove(air_trace_pairs, transcript)
+            .map(|mut multi_proof| multi_proof.proofs.remove(0))
     }
 
     // FIXME remove unwrap() calls and return errors
