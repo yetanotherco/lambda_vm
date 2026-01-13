@@ -36,6 +36,7 @@ fn main() {
     let mut log_trace_size = 14; // Default: 2^14 = 16384 rows
     let mut iterations = 1;
     let mut verify = true;
+    let mut fri_queries = 100; // Default: 100 queries
 
     let mut i = 1;
     while i < args.len() {
@@ -50,6 +51,12 @@ fn main() {
                 i += 1;
                 if i < args.len() {
                     iterations = args[i].parse().unwrap_or(1);
+                }
+            }
+            "--queries" | "-q" => {
+                i += 1;
+                if i < args.len() {
+                    fri_queries = args[i].parse().unwrap_or(100);
                 }
             }
             "--no-verify" => {
@@ -72,6 +79,7 @@ fn main() {
 
     println!("=== STARK Prover Profiling ===");
     println!("Trace size: 2^{} = {} rows", log_trace_size, trace_size);
+    println!("FRI queries: {}", fri_queries);
     println!("Iterations: {}", iterations);
     println!("Verify: {}", verify);
     println!();
@@ -82,13 +90,13 @@ fn main() {
             println!("--- Iteration {} ---", iter + 1);
         }
 
-        run_fibonacci_proof(trace_size, verify);
+        run_fibonacci_proof(trace_size, verify, fri_queries);
 
         println!();
     }
 }
 
-fn run_fibonacci_proof(trace_size: usize, do_verify: bool) {
+fn run_fibonacci_proof(trace_size: usize, do_verify: bool, fri_queries: usize) {
     // Setup
     let setup_start = Instant::now();
 
@@ -97,7 +105,12 @@ fn run_fibonacci_proof(trace_size: usize, do_verify: bool) {
         a1: Felt::one(),
     };
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions {
+        blowup_factor: 4,
+        fri_number_of_queries: fri_queries,
+        coset_offset: 3,
+        grinding_factor: 1,
+    };
 
     // Generate trace
     let trace_start = Instant::now();
@@ -149,6 +162,7 @@ fn print_help() {
     println!();
     println!("Options:");
     println!("  -s, --log-trace-size <N>  Log2 of trace size (default: 14, meaning 2^14 rows)");
+    println!("  -q, --queries <N>         Number of FRI queries (default: 100)");
     println!("  -n, --iterations <N>      Number of iterations (default: 1)");
     println!("      --no-verify           Skip verification");
     println!("  -h, --help                Print this help");
