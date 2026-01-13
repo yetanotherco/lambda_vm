@@ -123,9 +123,9 @@ fn test_multi_airs_log_up() {
 
     let proof_options = ProofOptions::default_test_options();
 
-    let cpu_air = new_cpu_air_with_lookup(&cpu_trace, &proof_options);
-    let add_air = new_add_air_with_lookup(&add_trace, &proof_options);
-    let mul_air = new_mul_air_with_lookup(&mul_trace, &proof_options);
+    let cpu_air = new_cpu_air_with_lookup(&proof_options);
+    let add_air = new_add_air_with_lookup(&proof_options);
+    let mul_air = new_mul_air_with_lookup(&proof_options);
 
     let airs: Vec<(
         &dyn AIR<
@@ -259,9 +259,9 @@ fn test_multi_airs_log_up_cheating_wrong_value_detected() {
 
     let proof_options = ProofOptions::default_test_options();
 
-    let cpu_air = new_cpu_air_with_lookup(&cpu_trace, &proof_options);
-    let add_air = new_add_air_with_lookup(&add_trace, &proof_options);
-    let mul_air = new_mul_air_with_lookup(&mul_trace, &proof_options);
+    let cpu_air = new_cpu_air_with_lookup(&proof_options);
+    let add_air = new_add_air_with_lookup(&proof_options);
+    let mul_air = new_mul_air_with_lookup(&proof_options);
 
     let airs: Vec<(
         &dyn AIR<
@@ -395,9 +395,9 @@ fn test_multi_airs_log_up_cheating_wrong_multiplicity_detected() {
 
     let proof_options = ProofOptions::default_test_options();
 
-    let cpu_air = new_cpu_air_with_lookup(&cpu_trace, &proof_options);
-    let add_air = new_add_air_with_lookup(&add_trace, &proof_options);
-    let mul_air = new_mul_air_with_lookup(&mul_trace, &proof_options);
+    let cpu_air = new_cpu_air_with_lookup(&proof_options);
+    let add_air = new_add_air_with_lookup(&proof_options);
+    let mul_air = new_mul_air_with_lookup(&proof_options);
 
     let airs: Vec<(
         &dyn AIR<

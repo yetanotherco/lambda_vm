@@ -117,25 +117,6 @@ impl<
             boundary_constraint_builder: PhantomData::<B>,
         }
     }
-
-    /// Convenience constructor that extracts `num_main_columns` from the trace.
-    pub fn from_trace(
-        trace: &TraceTable<F, E>,
-        auxiliary_trace_build_data: AuxiliaryTraceBuildData,
-        proof_options: &ProofOptions,
-        step_size: usize,
-        transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
-        pub_inputs: PI,
-    ) -> Self {
-        Self::new(
-            trace.num_main_columns,
-            auxiliary_trace_build_data,
-            proof_options,
-            step_size,
-            transition_constraints,
-            pub_inputs,
-        )
-    }
 }
 
 impl<F, E, B, PI> crate::traits::AIR for AirWithBuses<F, E, B, PI>
