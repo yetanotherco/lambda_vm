@@ -14,6 +14,7 @@ use crate::{
     config::Commitment,
     domain::Domain,
     fri::fri_decommit::FriDecommitment,
+    lookup::BusPublicInputs,
     table::Table,
     traits::AIR,
     transcript::StoneProverTranscript,
@@ -23,6 +24,7 @@ use crate::{
 use super::options::ProofOptions;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound = "")]
 pub struct PolynomialOpenings<F: IsField> {
     pub proof: Proof<Commitment>,
     pub proof_sym: Proof<Commitment>,
@@ -31,6 +33,7 @@ pub struct PolynomialOpenings<F: IsField> {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound = "")]
 pub struct DeepPolynomialOpening<F: IsSubFieldOf<E>, E: IsField> {
     pub composition_poly: PolynomialOpenings<E>,
     pub main_trace_polys: PolynomialOpenings<F>,
@@ -39,7 +42,8 @@ pub struct DeepPolynomialOpening<F: IsSubFieldOf<E>, E: IsField> {
 
 pub type DeepPolynomialOpenings<F, E> = Vec<DeepPolynomialOpening<F, E>>;
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound = "")]
 pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField> {
     // Length of the execution trace
     pub trace_length: usize,
@@ -66,6 +70,26 @@ pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField> {
     pub deep_poly_openings: DeepPolynomialOpenings<F, E>,
     // nonce obtained from grinding
     pub nonce: Option<u64>,
+    // Bus interaction public inputs for each interaction in this table.
+    // Contains initial and final aux column values, used for:
+    // 1. Boundary constraints on aux columns (row 0 and last row)
+    // 2. Bus balance check: Σ sender_values - Σ receiver_values = 0 across all tables
+    pub bus_interactions: Vec<BusPublicInputs<E>>,
+}
+
+/// A collection of STARK proofs for multiple AIRs.
+/// Used for multi-table proving where tables are linked via bus (LogUp).
+/// Returned by `Prover::multi_prove` and verified by `Verifier::multi_verify`.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound = "")]
+pub struct MultiProof<F: IsSubFieldOf<E>, E: IsField> {
+    pub proofs: Vec<StarkProof<F, E>>,
+}
+
+impl<F: IsSubFieldOf<E>, E: IsField> MultiProof<F, E> {
+    pub fn new(proofs: Vec<StarkProof<F, E>>) -> Self {
+        Self { proofs }
+    }
 }
 
 /// Serializer compatible with Stone prover

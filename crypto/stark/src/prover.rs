@@ -21,6 +21,7 @@ use rayon::prelude::{IndexedParallelIterator, IntoParallelRefIterator, ParallelI
 use crate::debug::validate_trace;
 use crate::domain::new_domain;
 use crate::fri;
+use crate::lookup::LOGUP_NUM_CHALLENGES;
 use crate::proof::stark::{DeepPolynomialOpenings, PolynomialOpenings};
 use crate::table::Table;
 use crate::trace::{LDETraceTable, columns2rows};
@@ -30,7 +31,8 @@ use super::constraints::evaluator::ConstraintEvaluator;
 use super::domain::Domain;
 use super::fri::fri_decommit::FriDecommitment;
 use super::grinding;
-use super::proof::stark::{DeepPolynomialOpening, StarkProof};
+use super::lookup::BusPublicInputs;
+use super::proof::stark::{DeepPolynomialOpening, MultiProof, StarkProof};
 use super::trace::TraceTable;
 use super::traits::AIR;
 
@@ -38,6 +40,8 @@ type AirAndTrace<'a, Field, FieldExtension, PI> = (
     &'a dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
     &'a mut TraceTable<Field, FieldExtension>,
 );
+
+type MainCommitment<Field> = (Round1CommitmentData<Field>, Vec<Vec<FieldElement<Field>>>);
 
 /// A default STARK prover implementing `IsStarkProver`.
 pub struct Prover<
@@ -93,6 +97,8 @@ where
     pub(crate) aux: Option<Round1CommitmentData<FieldExtension>>,
     /// The challenges of the RAP round.
     pub(crate) rap_challenges: Vec<FieldElement<FieldExtension>>,
+    /// Bus interaction public inputs (initial and final aux column values for each interaction).
+    pub(crate) bus_interactions: Vec<BusPublicInputs<FieldExtension>>,
 }
 
 impl<Field, FieldExtension> Round1<Field, FieldExtension>
@@ -350,13 +356,15 @@ pub trait IsStarkProver<
             .unwrap()
     }
 
-    /// Returns the result of the first round of the STARK Prove protocol.
-    fn round_1_randomized_air_with_preprocessing(
-        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
-        trace: &mut TraceTable<Field, FieldExtension>,
+    /// Phase 1a of Round 1: Commit only the main trace to the transcript.
+    /// Returns the main trace commitment data and LDE evaluations.
+    /// Does NOT sample RAP challenges or build auxiliary trace.
+    #[allow(clippy::type_complexity)]
+    fn round_1_commit_main_trace(
+        trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
-    ) -> Result<Round1<Field, FieldExtension>, ProvingError>
+    ) -> Result<(Round1CommitmentData<Field>, Vec<Vec<FieldElement<Field>>>), ProvingError>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
@@ -373,9 +381,27 @@ pub trait IsStarkProver<
             lde_trace_merkle_root: main_merkle_root,
         };
 
-        let rap_challenges = air.build_rap_challenges(transcript);
-        let (aux, aux_evaluations) = if air.has_trace_interaction() {
-            air.build_auxiliary_trace(trace, &rap_challenges);
+        Ok((main, evaluations))
+    }
+
+    /// Phase 1c of Round 1: Build and commit auxiliary trace using pre-sampled challenges.
+    /// This is called after all main traces are committed and shared challenges are sampled.
+    #[allow(clippy::type_complexity)]
+    fn round_1_build_auxiliary_trace(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        trace: &mut TraceTable<Field, FieldExtension>,
+        domain: &Domain<Field>,
+        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+        main: Round1CommitmentData<Field>,
+        main_evaluations: Vec<Vec<FieldElement<Field>>>,
+        rap_challenges: Vec<FieldElement<FieldExtension>>,
+    ) -> Result<Round1<Field, FieldExtension>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        let (aux, aux_evaluations, bus_interactions) = if air.has_trace_interaction() {
+            let bus_interactions = air.build_auxiliary_trace(trace, &rap_challenges);
             let Some((
                 aux_trace_polys,
                 aux_trace_polys_evaluations,
@@ -385,19 +411,18 @@ pub trait IsStarkProver<
             else {
                 return Err(ProvingError::EmptyCommitment);
             };
-            let aux_evaluations = aux_trace_polys_evaluations;
             let aux = Some(Round1CommitmentData::<FieldExtension> {
                 trace_polys: aux_trace_polys,
                 lde_trace_merkle_tree: aux_merkle_tree,
                 lde_trace_merkle_root: aux_merkle_root,
             });
-            (aux, aux_evaluations)
+            (aux, aux_trace_polys_evaluations, bus_interactions)
         } else {
-            (None, Vec::new())
+            (None, Vec::new(), Vec::new())
         };
 
         let lde_trace = LDETraceTable::from_columns(
-            evaluations,
+            main_evaluations,
             aux_evaluations,
             air.step_size(),
             domain.blowup_factor,
@@ -408,6 +433,7 @@ pub trait IsStarkProver<
             main,
             aux,
             rap_challenges,
+            bus_interactions,
         })
     }
 
@@ -455,7 +481,13 @@ pub trait IsStarkProver<
         FieldElement<FieldExtension>: AsBytes,
     {
         // Compute the evaluations of the composition polynomial on the LDE domain.
-        let evaluator = ConstraintEvaluator::new(air, &round_1_result.rap_challenges);
+        let bus_interactions = if round_1_result.bus_interactions.is_empty() {
+            None
+        } else {
+            Some(&round_1_result.bus_interactions[..])
+        };
+        let evaluator =
+            ConstraintEvaluator::new(air, &round_1_result.rap_challenges, bus_interactions);
         let constraint_evaluations = evaluator.evaluate(
             air,
             &round_1_result.lde_trace,
@@ -884,17 +916,27 @@ pub trait IsStarkProver<
     // FIXME remove unwrap() calls and return errors
     /// Generates STARK proofs for one or more AIRs with a shared transcript.
     ///
-    /// This unified function handles both single-table and multi-table proving.
+    /// # Multi-Table Proving with LogUp
     ///
-    /// The function executes Round 1 for all AIRs first (committing all traces to the transcript),
-    /// then executes Rounds 2-4 for each AIR sequentially. This ensures proper Fiat-Shamir challenge
-    /// generation across all tables.
+    /// When proving multiple tables that communicate via LogUp (lookup arguments),
+    /// all tables must use the **same** random challenges (z, α) for the LogUp bus
+    /// to balance correctly. This function ensures challenge sharing by:
     ///
-    /// Warning: the transcript must be safely initialized before passing it to this method.
+    /// 1. **Commit all main traces**: All main trace commitments go into the
+    ///    transcript before any challenges are sampled.
+    /// 2. **Sample shared LogUp challenges**: The challenges (z, α) are sampled
+    ///    once from the transcript and shared by all AIRs.
+    /// 3. **Build auxiliary traces**: Each AIR builds its LogUp running-sum
+    ///    columns using the shared challenges.
+    /// 4. **Rounds 2-4**: Standard STARK protocol rounds for each AIR.
+    ///
+    /// # Warning
+    ///
+    /// The transcript must be safely initialized before passing it to this method.
     fn multi_prove(
         mut airs: Vec<AirAndTrace<'_, Field, FieldExtension, PI>>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
-    ) -> Result<Vec<StarkProof<Field, FieldExtension>>, ProvingError>
+    ) -> Result<MultiProof<Field, FieldExtension>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
@@ -903,27 +945,71 @@ pub trait IsStarkProver<
     {
         info!("Started proof generation...");
 
-        let mut round_1_results: Vec<Round1<Field, FieldExtension>> = Vec::new();
-        let mut domains = Vec::new();
+        // Check if any AIR uses LogUp (has auxiliary trace for running sums)
+        let needs_logup_challenges = airs.iter().any(|(air, _)| air.has_trace_interaction());
 
-        // Execute Round 1 for all AIRs first to ensure all trace commitments
-        // are in the transcript before generating challenges for Round 2
-        for (air, table) in &mut *airs {
+        // =====================================================================
+        // Round 1, Phase A: Commit all main traces
+        // =====================================================================
+        // All main trace commitments must be in the transcript before sampling
+        // LogUp challenges. This ensures the challenges depend on ALL tables.
+
+        let mut domains = Vec::new();
+        let mut main_commitments: Vec<MainCommitment<Field>> = Vec::new();
+
+        for (air, table) in &*airs {
             let domain = new_domain(*air);
-            let round_1_result =
-                Self::round_1_randomized_air_with_preprocessing(*air, *table, &domain, transcript)?;
-            round_1_results.push(round_1_result);
+            let (main, evaluations) = Self::round_1_commit_main_trace(*table, &domain, transcript)?;
+            main_commitments.push((main, evaluations));
             domains.push(domain);
         }
 
-        // Execute Rounds 2-4 for each AIR
+        // =====================================================================
+        // Round 1, Phase B: Sample shared LogUp challenges
+        // =====================================================================
+        // For the LogUp bus to balance (sum of fingerprints = 0), all tables
+        // must use identical (z, α) challenges. We sample them ONCE here.
+
+        let logup_challenges: Vec<FieldElement<FieldExtension>> = if needs_logup_challenges {
+            (0..LOGUP_NUM_CHALLENGES)
+                .map(|_| transcript.sample_field_element())
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // =====================================================================
+        // Round 1, Phase C: Build and commit auxiliary traces
+        // =====================================================================
+        // Each AIR builds its LogUp running-sum columns using the shared challenges.
+
+        let mut round_1_results: Vec<Round1<Field, FieldExtension>> = Vec::new();
+        for (((air, table), (main, main_evaluations)), domain) in
+            airs.iter_mut().zip(main_commitments).zip(domains.iter())
+        {
+            let round_1_result = Self::round_1_build_auxiliary_trace(
+                *air,
+                *table,
+                domain,
+                transcript,
+                main,
+                main_evaluations,
+                logup_challenges.clone(),
+            )?;
+            round_1_results.push(round_1_result);
+        }
+
+        // =====================================================================
+        // Rounds 2-4: Standard STARK protocol for each AIR
+        // =====================================================================
+
         let mut proofs = Vec::new();
         for (((air, _), round_1_result), domain) in airs.iter().zip(round_1_results).zip(domains) {
             let proof = Self::prove_rounds_2_to_4(*air, &round_1_result, transcript, &domain)?;
             proofs.push(proof);
         }
 
-        Ok(proofs)
+        Ok(MultiProof::new(proofs))
     }
 
     /// Generate a STARK proof for a single AIR/trace.
@@ -940,7 +1026,7 @@ pub trait IsStarkProver<
         PI: Send + Sync,
     {
         let airs = vec![(air, trace)];
-        Self::multi_prove(airs, transcript).map(|mut proofs| proofs.remove(0))
+        Self::multi_prove(airs, transcript).map(|mut multi_proof| multi_proof.proofs.remove(0))
     }
 
     // FIXME remove unwrap() calls and return errors
@@ -984,8 +1070,13 @@ pub trait IsStarkProver<
 
         // <<<< Receive challenge: 𝛽
         let beta = transcript.sample_field_element();
+        let bus_interactions = if round_1_result.bus_interactions.is_empty() {
+            None
+        } else {
+            Some(&round_1_result.bus_interactions[..])
+        };
         let num_boundary_constraints = air
-            .boundary_constraints(&round_1_result.rap_challenges)
+            .boundary_constraints(&round_1_result.rap_challenges, bus_interactions)
             .constraints
             .len();
 
@@ -1120,6 +1211,8 @@ pub trait IsStarkProver<
             deep_poly_openings: round_4_result.deep_poly_openings,
             // nonce obtained from grinding
             nonce: round_4_result.nonce,
+            // Bus interaction public inputs (for boundary constraints and bus balance check)
+            bus_interactions: round_1_result.bus_interactions.clone(),
 
             trace_length: air.trace_length(),
         })

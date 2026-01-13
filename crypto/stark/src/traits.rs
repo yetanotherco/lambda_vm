@@ -9,7 +9,9 @@ use math::{
     polynomial::Polynomial,
 };
 
-use crate::{constraints::transition::TransitionConstraint, domain::Domain};
+use crate::{
+    constraints::transition::TransitionConstraint, domain::Domain, lookup::BusPublicInputs,
+};
 
 use super::{
     constraints::boundary::BoundaryConstraints, context::AirContext, frame::Frame,
@@ -91,7 +93,8 @@ pub trait AIR: Send + Sync {
         &self,
         _main_trace: &mut TraceTable<Self::Field, Self::FieldExtension>,
         _rap_challenges: &[FieldElement<Self::FieldExtension>],
-    ) {
+    ) -> Vec<BusPublicInputs<Self::FieldExtension>> {
+        Vec::new()
     }
 
     fn build_rap_challenges(
@@ -135,6 +138,7 @@ pub trait AIR: Send + Sync {
     fn boundary_constraints(
         &self,
         rap_challenges: &[FieldElement<Self::FieldExtension>],
+        bus_interactions: Option<&[BusPublicInputs<Self::FieldExtension>]>,
     ) -> BoundaryConstraints<Self::FieldExtension>;
 
     fn context(&self) -> &AirContext;

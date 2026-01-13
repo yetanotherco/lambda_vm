@@ -63,7 +63,8 @@ pub fn validate_trace<
         .collect();
 
     // --------- VALIDATE BOUNDARY CONSTRAINTS ------------
-    air.boundary_constraints(rap_challenges)
+    // Note: We pass None for aux_hints because debug validation doesn't need the LogUp hints
+    air.boundary_constraints(rap_challenges, None)
         .constraints
         .iter()
         .for_each(|constraint| {
