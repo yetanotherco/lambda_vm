@@ -1,4 +1,5 @@
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use math::field::{
     element::FieldElement, fields::fft_friendly::stark_252_prime_field::Stark252PrimeField,
 };
@@ -7,6 +8,11 @@ use math::field::fields::fft_friendly::{
     babybear::Babybear31PrimeField, quartic_babybear::Degree4BabyBearExtensionField,
 };
 
+use crate::examples::multi_table_lookup::new_add_air_with_lookup;
+use crate::examples::multi_table_lookup::new_cpu_air_with_lookup;
+use crate::examples::multi_table_lookup::new_mul_air_with_lookup;
+use crate::lookup::LookUpPublicInputs;
+use crate::trace::TraceTable;
 use crate::traits::AIR;
 use crate::{
     Felt252,
@@ -511,5 +517,175 @@ fn test_multi_prove_different_airs() {
     assert!(Verifier::multi_verify(
         &airs_and_proofs,
         &mut StoneProverTranscript::new(&[]),
+    ));
+}
+
+type FE = FieldElement<Babybear31PrimeField>;
+type ExtFE = FieldElement<Degree4BabyBearExtensionField>;
+
+#[test_log::test]
+fn test_multi_airs_log_up() {
+    // CPU Trace
+    // ADD | MUL | a | b  | c   | aux add | aux mul | aux total
+    // 1   | 0   | 1 | 10 | 11  | 0       | 0       | 0
+    // 0   | 1   | 2 | 20 | 40  | 0       | 0       | 0
+    // 1   | 0   | 3 | 30 | 33  | 0       | 0       | 0
+    // 0   | 1   | 4 | 40 | 160 | 0       | 0       | 0
+    // 1   | 0   | 5 | 50 | 55  | 0       | 0       | 0
+    // 1   | 0   | 6 | 60 | 66  | 0       | 0       | 0
+    // 0   | 1   | 7 | 70 | 490 | 0       | 0       | 0
+    // 0   | 1   | 8 | 80 | 640 | 0       | 0       | 0
+    let add_column = vec![
+        FE::one(),
+        FE::zero(),
+        FE::one(),
+        FE::zero(),
+        FE::one(),
+        FE::one(),
+        FE::zero(),
+        FE::zero(),
+    ];
+    let mul_column = vec![
+        FE::zero(),
+        FE::one(),
+        FE::zero(),
+        FE::one(),
+        FE::zero(),
+        FE::zero(),
+        FE::one(),
+        FE::one(),
+    ];
+    let a_column = vec![
+        FE::from(1),
+        FE::from(2),
+        FE::from(3),
+        FE::from(4),
+        FE::from(5),
+        FE::from(6),
+        FE::from(7),
+        FE::from(8),
+    ];
+    let b_column = vec![
+        FE::from(10),
+        FE::from(20),
+        FE::from(30),
+        FE::from(40),
+        FE::from(50),
+        FE::from(60),
+        FE::from(70),
+        FE::from(80),
+    ];
+    let c_column = vec![
+        FE::from(11),
+        FE::from(40),
+        FE::from(33),
+        FE::from(160),
+        FE::from(55),
+        FE::from(66),
+        FE::from(490),
+        FE::from(640),
+    ];
+    let main_columns = vec![add_column, mul_column, a_column, b_column, c_column];
+    let aux_columns = vec![
+        vec![ExtFE::zero(); 8],
+        vec![ExtFE::zero(); 8],
+        vec![ExtFE::zero(); 8],
+    ];
+    let mut cpu_trace = TraceTable::from_columns(main_columns, aux_columns, 1);
+
+    // ADD Trace
+    // a | b  | c  | m | aux cpu
+    // 1 | 10 | 11 | 1 |  0
+    // 3 | 30 | 33 | 1 |  0
+    // 5 | 50 | 55 | 1 |  0
+    // 6 | 60 | 66 | 1 |  0
+    let a_column = vec![FE::from(1), FE::from(3), FE::from(5), FE::from(6)];
+    let b_column = vec![FE::from(10), FE::from(30), FE::from(50), FE::from(60)];
+    let c_column = vec![FE::from(11), FE::from(33), FE::from(55), FE::from(66)];
+    let m_column = vec![FE::one(), FE::one(), FE::one(), FE::one()];
+    let mut add_trace = TraceTable::from_columns(
+        vec![a_column, b_column, c_column, m_column],
+        vec![vec![ExtFE::zero(); 4]],
+        1,
+    );
+
+    // MUL Trace
+    // a | b  | c   | m | aux cpu
+    // 2 | 20 | 40  | 1 |   0
+    // 4 | 40 | 160 | 1 |   0
+    // 7 | 70 | 490 | 1 |   0
+    // 8 | 80 | 640 | 1 |   0
+    let a_column = vec![FE::from(2), FE::from(4), FE::from(7), FE::from(8)];
+    let b_column = vec![FE::from(20), FE::from(40), FE::from(70), FE::from(80)];
+    let c_column = vec![FE::from(40), FE::from(160), FE::from(490), FE::from(640)];
+    let m_column = vec![FE::one(), FE::one(), FE::one(), FE::one()];
+    let mut mul_trace = TraceTable::from_columns(
+        vec![a_column, b_column, c_column, m_column],
+        vec![vec![ExtFE::zero(); 4]],
+        1,
+    );
+
+    let proof_options = ProofOptions::default_test_options();
+
+    let cpu_air = new_cpu_air_with_lookup(&cpu_trace, &proof_options);
+    let add_air = new_add_air_with_lookup(&add_trace, &proof_options);
+    let mul_air = new_mul_air_with_lookup(&mul_trace, &proof_options);
+
+    let airs: Vec<(
+        &dyn AIR<
+            Field = Babybear31PrimeField,
+            FieldExtension = Degree4BabyBearExtensionField,
+            PublicInputs = LookUpPublicInputs<Babybear31PrimeField, ()>,
+        >,
+        &mut TraceTable<Babybear31PrimeField, Degree4BabyBearExtensionField>,
+    )> = vec![
+        (&cpu_air, &mut cpu_trace),
+        (&add_air, &mut add_trace),
+        (&mul_air, &mut mul_trace),
+    ];
+
+    let proofs = Prover::multi_prove(
+        airs,
+        &mut DefaultTranscript::<Degree4BabyBearExtensionField>::new(&[]),
+    )
+    .unwrap();
+
+    // TODO: This check should be done by the prover.
+
+    // Fetch the grand sum total for the given lookup table (aka the last value on the last aux colu)
+    fn grand_sum<F, E>(trace: &TraceTable<F, E>) -> &FieldElement<E>
+    where
+        F: IsSubFieldOf<E> + IsFFTField,
+        E: IsField,
+    {
+        trace
+            .aux_table
+            .get(trace.num_rows() - 1, trace.num_aux_columns - 1)
+    }
+
+    let cpu_look_up_value = grand_sum(&cpu_trace);
+    let add_look_up_value = grand_sum(&add_trace);
+    let mul_look_up_value = grand_sum(&mul_trace);
+
+    let sum = cpu_look_up_value - add_look_up_value - mul_look_up_value;
+
+    assert!(sum == FieldElement::<Degree4BabyBearExtensionField>::zero());
+
+    let airs_and_proofs: Vec<(
+        &dyn AIR<
+            Field = Babybear31PrimeField,
+            FieldExtension = Degree4BabyBearExtensionField,
+            PublicInputs = LookUpPublicInputs<Babybear31PrimeField, ()>,
+        >,
+        &_,
+    )> = vec![
+        (&cpu_air, &proofs[0]),
+        (&add_air, &proofs[1]),
+        (&mul_air, &proofs[2]),
+    ];
+
+    assert!(Verifier::multi_verify(
+        &airs_and_proofs,
+        &mut DefaultTranscript::<Degree4BabyBearExtensionField>::new(&[]),
     ));
 }

@@ -3,6 +3,7 @@ pub mod dummy_air;
 pub mod fibonacci_2_cols_shifted;
 pub mod fibonacci_2_columns;
 pub mod fibonacci_rap;
+pub mod multi_table_lookup;
 pub mod quadratic_air;
 pub mod read_only_memory;
 pub mod read_only_memory_logup;
