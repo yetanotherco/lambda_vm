@@ -22,7 +22,7 @@ pub fn run_program_and_prover(elf_path: &str) {
 
     let proof_options = ProofOptions::default_test_options();
 
-    let air = CPUTableAIR::new(trace.num_rows(), &(), &proof_options);
+    let air = CPUTableAIR::new(&(), &proof_options);
 
     let proof = Prover::<Babybear31PrimeField, Degree4BabyBearU32ExtensionField, _>::prove(
         &air,

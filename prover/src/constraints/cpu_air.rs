@@ -31,7 +31,6 @@ pub struct CPUTableAIR {
     context: AirContext,
     constraints:
         Vec<Box<dyn TransitionConstraint<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>>>,
-    trace_length: usize,
 }
 
 impl AIR for CPUTableAIR {
@@ -39,11 +38,7 @@ impl AIR for CPUTableAIR {
     type FieldExtension = Degree4BabyBearU32ExtensionField;
     type PublicInputs = ();
 
-    fn new(
-        trace_length: usize,
-        _pub_inputs: &Self::PublicInputs,
-        proof_options: &ProofOptions,
-    ) -> Self {
+    fn new(_pub_inputs: &Self::PublicInputs, proof_options: &ProofOptions) -> Self {
         let constraint_index = 0;
         // Bit constraints:
         // Enforce that these columns are binary. They include:
@@ -134,7 +129,6 @@ impl AIR for CPUTableAIR {
 
         Self {
             context,
-            trace_length,
             constraints,
         }
     }
@@ -149,6 +143,7 @@ impl AIR for CPUTableAIR {
         &self,
         _rap_challenges: &[FieldElement<Self::FieldExtension>],
         _bus_interactions: Option<&[stark::lookup::BusPublicInputs<Self::FieldExtension>]>,
+        _trace_length: usize,
     ) -> BoundaryConstraints<Self::FieldExtension> {
         BoundaryConstraints::from_constraints(vec![])
     }
@@ -157,12 +152,8 @@ impl AIR for CPUTableAIR {
         &self.context
     }
 
-    fn composition_poly_degree_bound(&self) -> usize {
-        self.trace_length * 2
-    }
-
-    fn trace_length(&self) -> usize {
-        self.trace_length
+    fn composition_poly_degree_bound(&self, trace_length: usize) -> usize {
+        trace_length * 2
     }
 
     fn trace_layout(&self) -> (usize, usize) {

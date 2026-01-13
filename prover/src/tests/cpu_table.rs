@@ -638,7 +638,7 @@ mod tests {
         let mut trace = build_cpu_trace(columns);
         let proof_options = ProofOptions::default_test_options();
 
-        let air = CPUTableAIR::new(trace.num_rows(), &(), &proof_options);
+        let air = CPUTableAIR::new(&(), &proof_options);
 
         let proof = Prover::<Babybear31PrimeField, Degree4BabyBearU32ExtensionField, _>::prove(
             &air,
@@ -661,7 +661,7 @@ mod tests {
 
         let proof_options = ProofOptions::default_test_options();
 
-        let air = CPUTableAIR::new(trace.num_rows(), &(), &proof_options);
+        let air = CPUTableAIR::new(&(), &proof_options);
 
         let proof = Prover::<Babybear31PrimeField, Degree4BabyBearU32ExtensionField, _>::prove(
             &air,
