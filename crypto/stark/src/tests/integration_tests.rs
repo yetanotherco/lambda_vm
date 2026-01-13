@@ -42,9 +42,9 @@ fn test_prove_fib() {
         a1: Felt252::one(),
     };
 
-    let air = FibonacciAIR::<Stark252PrimeField>::new(&pub_inputs, &proof_options);
+    let air = FibonacciAIR::<Stark252PrimeField>::new(&proof_options);
 
-    let proof = Prover::prove(&air, &mut trace, &mut StoneProverTranscript::new(&[])).unwrap();
+    let proof = Prover::prove(&air, &mut trace, &pub_inputs, &mut StoneProverTranscript::new(&[])).unwrap();
     assert!(Verifier::verify(
         &proof,
         &air,
@@ -63,9 +63,9 @@ fn test_prove_simple_periodic_8() {
         a1: Felt252::from(8),
     };
 
-    let air = SimplePeriodicAIR::<Stark252PrimeField>::new(&pub_inputs, &proof_options);
+    let air = SimplePeriodicAIR::<Stark252PrimeField>::new(&proof_options);
 
-    let proof = Prover::prove(&air, &mut trace, &mut StoneProverTranscript::new(&[])).unwrap();
+    let proof = Prover::prove(&air, &mut trace, &pub_inputs, &mut StoneProverTranscript::new(&[])).unwrap();
     assert!(Verifier::verify(
         &proof,
         &air,
@@ -84,9 +84,9 @@ fn test_prove_simple_periodic_32() {
         a1: Felt252::from(32768),
     };
 
-    let air = SimplePeriodicAIR::<Stark252PrimeField>::new(&pub_inputs, &proof_options);
+    let air = SimplePeriodicAIR::<Stark252PrimeField>::new(&proof_options);
 
-    let proof = Prover::prove(&air, &mut trace, &mut StoneProverTranscript::new(&[])).unwrap();
+    let proof = Prover::prove(&air, &mut trace, &pub_inputs, &mut StoneProverTranscript::new(&[])).unwrap();
 
     assert!(Verifier::verify(
         &proof,
@@ -105,9 +105,9 @@ fn test_prove_fib_2_cols() {
         a1: Felt252::one(),
     };
 
-    let air = Fibonacci2ColsAIR::<Stark252PrimeField>::new(&pub_inputs, &proof_options);
+    let air = Fibonacci2ColsAIR::<Stark252PrimeField>::new(&proof_options);
 
-    let proof = Prover::prove(&air, &mut trace, &mut StoneProverTranscript::new(&[])).unwrap();
+    let proof = Prover::prove(&air, &mut trace, &pub_inputs, &mut StoneProverTranscript::new(&[])).unwrap();
 
     assert!(Verifier::verify(
         &proof,
@@ -129,9 +129,9 @@ fn test_prove_fib_2_cols_shifted() {
         claimed_index,
     };
 
-    let air = Fibonacci2ColsShifted::<Stark252PrimeField>::new(&pub_inputs, &proof_options);
+    let air = Fibonacci2ColsShifted::<Stark252PrimeField>::new(&proof_options);
 
-    let proof = Prover::prove(&air, &mut trace, &mut StoneProverTranscript::new(&[])).unwrap();
+    let proof = Prover::prove(&air, &mut trace, &pub_inputs, &mut StoneProverTranscript::new(&[])).unwrap();
 
     assert!(Verifier::verify(
         &proof,
@@ -150,9 +150,9 @@ fn test_prove_quadratic() {
         a0: Felt252::from(3),
     };
 
-    let air = QuadraticAIR::<Stark252PrimeField>::new(&pub_inputs, &proof_options);
+    let air = QuadraticAIR::<Stark252PrimeField>::new(&proof_options);
 
-    let proof = Prover::prove(&air, &mut trace, &mut StoneProverTranscript::new(&[])).unwrap();
+    let proof = Prover::prove(&air, &mut trace, &pub_inputs, &mut StoneProverTranscript::new(&[])).unwrap();
 
     assert!(Verifier::verify(
         &proof,
@@ -174,9 +174,9 @@ fn test_prove_rap_fib() {
         a1: Felt252::one(),
     };
 
-    let air = FibonacciRAP::<Stark252PrimeField>::new(&pub_inputs, &proof_options);
+    let air = FibonacciRAP::<Stark252PrimeField>::new(&proof_options);
 
-    let proof = Prover::prove(&air, &mut trace, &mut StoneProverTranscript::new(&[])).unwrap();
+    let proof = Prover::prove(&air, &mut trace, &pub_inputs, &mut StoneProverTranscript::new(&[])).unwrap();
 
     assert!(Verifier::verify(
         &proof,
@@ -192,9 +192,9 @@ fn test_prove_dummy() {
 
     let proof_options = ProofOptions::default_test_options();
 
-    let air = DummyAIR::new(&(), &proof_options);
+    let air = DummyAIR::new(&proof_options);
 
-    let proof = Prover::prove(&air, &mut trace, &mut StoneProverTranscript::new(&[])).unwrap();
+    let proof = Prover::prove(&air, &mut trace, &(), &mut StoneProverTranscript::new(&[])).unwrap();
 
     assert!(Verifier::verify(
         &proof,
@@ -208,9 +208,9 @@ fn test_prove_bit_flags() {
     let mut trace = bit_flags::bit_prefix_flag_trace(32);
     let proof_options = ProofOptions::default_test_options();
 
-    let air = BitFlagsAIR::new(&(), &proof_options);
+    let air = BitFlagsAIR::new(&proof_options);
 
-    let proof = Prover::prove(&air, &mut trace, &mut StoneProverTranscript::new(&[])).unwrap();
+    let proof = Prover::prove(&air, &mut trace, &(), &mut StoneProverTranscript::new(&[])).unwrap();
 
     assert!(Verifier::verify(
         &proof,
@@ -251,9 +251,9 @@ fn test_prove_read_only_memory() {
     let mut trace = sort_rap_trace(address_col, value_col);
     let proof_options = ProofOptions::default_test_options();
 
-    let air = ReadOnlyRAP::<Stark252PrimeField>::new(&pub_inputs, &proof_options);
+    let air = ReadOnlyRAP::<Stark252PrimeField>::new(&proof_options);
 
-    let proof = Prover::prove(&air, &mut trace, &mut StoneProverTranscript::new(&[])).unwrap();
+    let proof = Prover::prove(&air, &mut trace, &pub_inputs, &mut StoneProverTranscript::new(&[])).unwrap();
 
     assert!(Verifier::verify(
         &proof,
@@ -296,13 +296,13 @@ fn test_prove_log_read_only_memory() {
     let proof_options = ProofOptions::default_test_options();
 
     let air = LogReadOnlyRAP::<Babybear31PrimeField, Degree4BabyBearExtensionField>::new(
-        &pub_inputs,
         &proof_options,
     );
 
     let proof = Prover::prove(
         &air,
         &mut trace,
+        &pub_inputs,
         &mut DefaultTranscript::<Degree4BabyBearExtensionField>::new(&[]),
     )
     .unwrap();
@@ -334,9 +334,9 @@ fn test_multi_prove_fib_3_tables() {
         a1: Felt252::one(),
     };
 
-    let air_1 = FibonacciAIR::new(&pub_inputs_1, &proof_options);
-    let air_2 = FibonacciAIR::new(&pub_inputs_2, &proof_options);
-    let air_3 = FibonacciAIR::new(&pub_inputs_3, &proof_options);
+    let air_1 = FibonacciAIR::new(&proof_options);
+    let air_2 = FibonacciAIR::new(&proof_options);
+    let air_3 = FibonacciAIR::new(&proof_options);
 
     let air_trace_pairs: Vec<(
         &dyn AIR<
@@ -345,10 +345,11 @@ fn test_multi_prove_fib_3_tables() {
             PublicInputs = FibonacciPublicInputs<Stark252PrimeField>,
         >,
         &mut _,
+        &_,
     )> = vec![
-        (&air_1, &mut trace_1),
-        (&air_2, &mut trace_2),
-        (&air_3, &mut trace_3),
+        (&air_1, &mut trace_1, &pub_inputs_1),
+        (&air_2, &mut trace_2, &pub_inputs_2),
+        (&air_3, &mut trace_3, &pub_inputs_3),
     ];
     let multi_proof =
         Prover::multi_prove(air_trace_pairs, &mut StoneProverTranscript::new(&[])).unwrap();
@@ -433,11 +434,9 @@ fn test_multi_prove_2_tables_small_field() {
     let proof_options = ProofOptions::default_test_options();
 
     let air_1 = LogReadOnlyRAP::<Babybear31PrimeField, Degree4BabyBearExtensionField>::new(
-        &pub_inputs_1,
         &proof_options,
     );
     let air_2 = LogReadOnlyRAP::<Babybear31PrimeField, Degree4BabyBearExtensionField>::new(
-        &pub_inputs_2,
         &proof_options,
     );
 
@@ -448,7 +447,8 @@ fn test_multi_prove_2_tables_small_field() {
             PublicInputs = LogReadOnlyPublicInputs<Babybear31PrimeField>,
         >,
         &mut _,
-    )> = vec![(&air_1, &mut trace_1), (&air_2, &mut trace_2)];
+        &_,
+    )> = vec![(&air_1, &mut trace_1, &pub_inputs_1), (&air_2, &mut trace_2, &pub_inputs_2)];
 
     let multi_proof = Prover::multi_prove(
         air_trace_pairs,
@@ -477,13 +477,14 @@ fn test_multi_prove_different_airs() {
     let mut trace_2 = bit_flags::bit_prefix_flag_trace(32);
     let proof_options = ProofOptions::default_test_options();
 
-    let air_1 = DummyAIR::new(&(), &proof_options);
-    let air_2 = BitFlagsAIR::new(&(), &proof_options);
+    let air_1 = DummyAIR::new(&proof_options);
+    let air_2 = BitFlagsAIR::new(&proof_options);
 
     let air_trace_pairs: Vec<(
         &dyn AIR<Field = Stark252PrimeField, FieldExtension = Stark252PrimeField, PublicInputs = ()>,
         &mut _,
-    )> = vec![(&air_1, &mut trace_1), (&air_2, &mut trace_2)];
+        &_,
+    )> = vec![(&air_1, &mut trace_1, &()), (&air_2, &mut trace_2, &())];
 
     let multi_proof =
         Prover::multi_prove(air_trace_pairs, &mut StoneProverTranscript::new(&[])).unwrap();

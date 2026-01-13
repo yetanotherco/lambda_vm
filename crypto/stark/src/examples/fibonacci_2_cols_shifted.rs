@@ -159,7 +159,6 @@ where
     F: IsFFTField,
 {
     context: AirContext,
-    pub_inputs: PublicInputs<F>,
     transition_constraints: Vec<Box<dyn TransitionConstraint<F, F>>>,
 }
 
@@ -179,7 +178,7 @@ where
         1
     }
 
-    fn new(pub_inputs: &Self::PublicInputs, proof_options: &ProofOptions) -> Self {
+    fn new(proof_options: &ProofOptions) -> Self {
         let transition_constraints: Vec<
             Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>,
         > = vec![
@@ -196,13 +195,13 @@ where
 
         Self {
             context,
-            pub_inputs: pub_inputs.clone(),
             transition_constraints,
         }
     }
 
     fn boundary_constraints(
         &self,
+        pub_inputs: &Self::PublicInputs,
         _rap_challenges: &[FieldElement<Self::FieldExtension>],
         _bus_interactions: Option<&[crate::lookup::BusPublicInputs<Self::FieldExtension>]>,
         _trace_length: usize,
@@ -210,8 +209,8 @@ where
         let initial_condition = BoundaryConstraint::new_main(0, 0, FieldElement::one());
         let claimed_value_constraint = BoundaryConstraint::new_main(
             0,
-            self.pub_inputs.claimed_index,
-            self.pub_inputs.claimed_value.clone(),
+            pub_inputs.claimed_index,
+            pub_inputs.claimed_value.clone(),
         );
 
         BoundaryConstraints::from_constraints(vec![initial_condition, claimed_value_constraint])
@@ -233,10 +232,6 @@ where
 
     fn trace_layout(&self) -> (usize, usize) {
         (2, 0)
-    }
-
-    fn pub_inputs(&self) -> &Self::PublicInputs {
-        &self.pub_inputs
     }
 }
 

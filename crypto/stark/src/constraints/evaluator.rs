@@ -36,12 +36,13 @@ where
 {
     pub fn new(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        pub_inputs: &PI,
         rap_challenges: &[FieldElement<FieldExtension>],
         bus_interactions: Option<&[BusPublicInputs<FieldExtension>]>,
         trace_length: usize,
     ) -> Self {
         let boundary_constraints =
-            air.boundary_constraints(rap_challenges, bus_interactions, trace_length);
+            air.boundary_constraints(pub_inputs, rap_challenges, bus_interactions, trace_length);
 
         Self {
             boundary_constraints,

@@ -39,7 +39,6 @@ pub fn new_cpu_air_with_lookup(
         proof_options,
         1,
         transition_constraints,
-        (),
     )
 }
 
@@ -65,7 +64,6 @@ pub fn new_mul_air_with_lookup(
         proof_options,
         1,
         transition_constraints,
-        (),
     )
 }
 
@@ -91,6 +89,5 @@ pub fn new_add_air_with_lookup(
         proof_options,
         1,
         transition_constraints,
-        (),
     )
 }

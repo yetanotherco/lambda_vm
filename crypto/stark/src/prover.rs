@@ -36,9 +36,11 @@ use super::proof::stark::{DeepPolynomialOpening, MultiProof, StarkProof};
 use super::trace::TraceTable;
 use super::traits::AIR;
 
+/// A triple of (AIR, TraceTable, PublicInputs) for proving.
 type AirTracePair<'a, Field, FieldExtension, PI> = (
     &'a dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
     &'a mut TraceTable<Field, FieldExtension>,
+    &'a PI,
 );
 
 type MainCommitment<Field> = (Round1CommitmentData<Field>, Vec<Vec<FieldElement<Field>>>);
@@ -471,6 +473,7 @@ pub trait IsStarkProver<
     /// Returns the result of the second round of the STARK Prove protocol.
     fn round_2_compute_composition_polynomial(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        pub_inputs: &PI,
         domain: &Domain<Field>,
         round_1_result: &Round1<Field, FieldExtension>,
         transition_coefficients: &[FieldElement<FieldExtension>],
@@ -489,6 +492,7 @@ pub trait IsStarkProver<
         let trace_length = domain.interpolation_domain_size;
         let evaluator = ConstraintEvaluator::new(
             air,
+            pub_inputs,
             &round_1_result.rap_challenges,
             bus_interactions,
             trace_length,
@@ -942,19 +946,19 @@ pub trait IsStarkProver<
     fn multi_prove(
         mut air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
-    ) -> Result<MultiProof<Field, FieldExtension>, ProvingError>
+    ) -> Result<MultiProof<Field, FieldExtension, PI>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
         FieldExtension: IsFFTField,
-        PI: Send + Sync,
+        PI: Send + Sync + Clone,
     {
         info!("Started proof generation...");
 
         // Check if any AIR uses LogUp (has auxiliary trace for running sums)
         let needs_logup_challenges = air_trace_pairs
             .iter()
-            .any(|(air, _)| air.has_trace_interaction());
+            .any(|(air, _, _)| air.has_trace_interaction());
 
         // =====================================================================
         // Round 1, Phase A: Commit all main traces
@@ -965,7 +969,7 @@ pub trait IsStarkProver<
         let mut domains = Vec::new();
         let mut main_commitments: Vec<MainCommitment<Field>> = Vec::new();
 
-        for (air, trace) in &*air_trace_pairs {
+        for (air, trace, _pub_inputs) in &*air_trace_pairs {
             let trace_length = trace.num_rows();
             let domain = new_domain(*air, trace_length);
             let (main, evaluations) = Self::round_1_commit_main_trace(*trace, &domain, transcript)?;
@@ -993,7 +997,7 @@ pub trait IsStarkProver<
         // Each AIR builds its LogUp running-sum columns using the shared challenges.
 
         let mut round_1_results: Vec<Round1<Field, FieldExtension>> = Vec::new();
-        for (((air, trace), (main, main_evaluations)), domain) in air_trace_pairs
+        for (((air, trace, _pub_inputs), (main, main_evaluations)), domain) in air_trace_pairs
             .iter_mut()
             .zip(main_commitments)
             .zip(domains.iter())
@@ -1015,12 +1019,13 @@ pub trait IsStarkProver<
         // =====================================================================
 
         let mut proofs = Vec::new();
-        for (((air, _), round_1_result), domain) in air_trace_pairs
+        for (((air, _, pub_inputs), round_1_result), domain) in air_trace_pairs
             .iter()
             .zip(round_1_results)
             .zip(domains)
         {
-            let proof = Self::prove_rounds_2_to_4(*air, &round_1_result, transcript, &domain)?;
+            let proof =
+                Self::prove_rounds_2_to_4(*air, *pub_inputs, &round_1_result, transcript, &domain)?;
             proofs.push(proof);
         }
 
@@ -1032,15 +1037,16 @@ pub trait IsStarkProver<
     fn prove(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         trace: &mut TraceTable<Field, FieldExtension>,
+        pub_inputs: &PI,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
-    ) -> Result<StarkProof<Field, FieldExtension>, ProvingError>
+    ) -> Result<StarkProof<Field, FieldExtension, PI>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
         FieldExtension: IsFFTField,
-        PI: Send + Sync,
+        PI: Send + Sync + Clone,
     {
-        let air_trace_pairs = vec![(air, trace)];
+        let air_trace_pairs = vec![(air, trace, pub_inputs)];
         Self::multi_prove(air_trace_pairs, transcript)
             .map(|mut multi_proof| multi_proof.proofs.remove(0))
     }
@@ -1050,21 +1056,23 @@ pub trait IsStarkProver<
     /// Warning: the transcript must be safely initializated before passing it to this method.
     fn prove_rounds_2_to_4(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        pub_inputs: &PI,
         round_1_result: &Round1<Field, FieldExtension>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
         domain: &Domain<Field>,
-    ) -> Result<StarkProof<Field, FieldExtension>, ProvingError>
+    ) -> Result<StarkProof<Field, FieldExtension, PI>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
         FieldExtension: IsFFTField,
         FieldElement<FieldExtension>: AsBytes,
-        PI: Send + Sync,
+        PI: Send + Sync + Clone,
     {
         info!("Started proof generation...");
 
         #[cfg(debug_assertions)]
         validate_trace(
             air,
+            pub_inputs,
             &round_1_result.main.trace_polys,
             round_1_result
                 .aux
@@ -1094,6 +1102,7 @@ pub trait IsStarkProver<
         let trace_length = domain.interpolation_domain_size;
         let num_boundary_constraints = air
             .boundary_constraints(
+                pub_inputs,
                 &round_1_result.rap_challenges,
                 bus_interactions,
                 trace_length,
@@ -1114,6 +1123,7 @@ pub trait IsStarkProver<
 
         let round_2_result = Self::round_2_compute_composition_polynomial(
             air,
+            pub_inputs,
             domain,
             round_1_result,
             &transition_coefficients,
@@ -1209,7 +1219,7 @@ pub trait IsStarkProver<
 
         info!("End proof generation");
 
-        Ok(StarkProof::<Field, FieldExtension> {
+        Ok(StarkProof {
             // [t]
             lde_trace_main_merkle_root: round_1_result.main.lde_trace_merkle_root,
             // [t]
@@ -1234,7 +1244,8 @@ pub trait IsStarkProver<
             nonce: round_4_result.nonce,
             // Bus interaction public inputs (for boundary constraints and bus balance check)
             bus_interactions: round_1_result.bus_interactions.clone(),
-
+            // Public inputs for boundary constraints
+            public_inputs: pub_inputs.clone(),
             trace_length: domain.interpolation_domain_size,
         })
     }
@@ -1273,10 +1284,6 @@ mod tests {
 
     #[test]
     fn test_domain_constructor() {
-        let pub_inputs = FibonacciPublicInputs {
-            a0: Felt252::one(),
-            a1: Felt252::one(),
-        };
         let trace = simple_fibonacci::fibonacci_trace([Felt252::from(1), Felt252::from(1)], 8);
         let trace_length = trace.num_rows();
         let coset_offset = 3;
@@ -1291,7 +1298,7 @@ mod tests {
         };
 
         let domain = Domain::new(
-            &simple_fibonacci::FibonacciAIR::new(&pub_inputs, &proof_options),
+            &simple_fibonacci::FibonacciAIR::new(&proof_options),
             trace_length,
         );
         assert_eq!(domain.blowup_factor, 2);
@@ -1366,7 +1373,7 @@ mod tests {
     }
 
     fn proof_parts_stone_compatibility_case_1() -> (
-        StarkProof<Stark252PrimeField, Stark252PrimeField>,
+        StarkProof<Stark252PrimeField, Stark252PrimeField, fibonacci_2_cols_shifted::PublicInputs<Stark252PrimeField>>,
         Fibonacci2ColsShifted<Stark252PrimeField>,
         ProofOptions,
         [u8; 4],
@@ -1390,12 +1397,13 @@ mod tests {
 
         let transcript_init_seed = [0xca, 0xfe, 0xca, 0xfe];
 
-        let air = Fibonacci2ColsShifted::<Stark252PrimeField>::new(&pub_inputs, &proof_options);
+        let air = Fibonacci2ColsShifted::<Stark252PrimeField>::new(&proof_options);
         let trace_length = trace.num_rows();
 
         let proof = Prover::prove(
             &air,
             &mut trace,
+            &pub_inputs,
             &mut StoneProverTranscript::new(&transcript_init_seed),
         )
         .unwrap();
@@ -1408,7 +1416,7 @@ mod tests {
         )
     }
 
-    fn stone_compatibility_case_1_proof() -> StarkProof<Stark252PrimeField, Stark252PrimeField> {
+    fn stone_compatibility_case_1_proof() -> StarkProof<Stark252PrimeField, Stark252PrimeField, fibonacci_2_cols_shifted::PublicInputs<Stark252PrimeField>> {
         let (proof, _, _, _, _) = proof_parts_stone_compatibility_case_1();
         proof
     }
@@ -1769,8 +1777,7 @@ mod tests {
     }
 
     fn proof_parts_stone_compatibility_case_2() -> (
-        StarkProof<Stark252PrimeField, Stark252PrimeField>,
-        fibonacci_2_cols_shifted::PublicInputs<Stark252PrimeField>,
+        StarkProof<Stark252PrimeField, Stark252PrimeField, fibonacci_2_cols_shifted::PublicInputs<Stark252PrimeField>>,
         ProofOptions,
         [u8; 4],
     ) {
@@ -1792,26 +1799,27 @@ mod tests {
 
         let transcript_init_seed = [0xfa, 0xfa, 0xfa, 0xee];
 
-        let air = Fibonacci2ColsShifted::<Stark252PrimeField>::new(&pub_inputs, &proof_options);
+        let air = Fibonacci2ColsShifted::<Stark252PrimeField>::new(&proof_options);
 
         let proof = Prover::prove(
             &air,
             &mut trace,
+            &pub_inputs,
             &mut StoneProverTranscript::new(&transcript_init_seed),
         )
         .unwrap();
-        (proof, pub_inputs, proof_options, transcript_init_seed)
+        (proof, proof_options, transcript_init_seed)
     }
 
-    fn stone_compatibility_case_2_proof() -> StarkProof<Stark252PrimeField, Stark252PrimeField> {
-        let (proof, _, _, _) = proof_parts_stone_compatibility_case_2();
+    fn stone_compatibility_case_2_proof() -> StarkProof<Stark252PrimeField, Stark252PrimeField, fibonacci_2_cols_shifted::PublicInputs<Stark252PrimeField>> {
+        let (proof, _, _) = proof_parts_stone_compatibility_case_2();
         proof
     }
 
     fn stone_compatibility_case_2_challenges() -> Challenges<Stark252PrimeField> {
-        let (proof, public_inputs, options, seed) = proof_parts_stone_compatibility_case_2();
+        let (proof, options, seed) = proof_parts_stone_compatibility_case_2();
 
-        let air = Fibonacci2ColsShifted::new(&public_inputs, &options);
+        let air = Fibonacci2ColsShifted::new(&options);
         let domain = Domain::new(&air, proof.trace_length);
         Verifier::step_1_replay_rounds_and_recover_challenges(
             &air,

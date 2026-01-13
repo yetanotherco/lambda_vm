@@ -131,10 +131,11 @@ fn test_verify_serialized_multi_table_proofs() {
         let air_trace_pairs: Vec<(
             &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
             &mut crate::trace::TraceTable<F, E>,
+            &(),
         )> = vec![
-            (&cpu_air, &mut cpu_trace),
-            (&add_air, &mut add_trace),
-            (&mul_air, &mut mul_trace),
+            (&cpu_air, &mut cpu_trace, &()),
+            (&add_air, &mut add_trace, &()),
+            (&mul_air, &mut mul_trace, &()),
         ];
 
         Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap()
@@ -149,7 +150,7 @@ fn test_verify_serialized_multi_table_proofs() {
     // At this point, the prover's data is dropped (out of scope above)
     // The verifier only has the serialized data
 
-    let received_proofs: MultiProof<F, E> =
+    let received_proofs: MultiProof<F, E, ()> =
         serde_cbor::from_slice(&serialized).expect("Failed to deserialize proofs");
 
     // =========================================================================
@@ -207,7 +208,6 @@ fn create_cpu_air(
         proof_options,
         1,
         transition_constraints,
-        (),
     )
 }
 
@@ -228,7 +228,6 @@ fn create_add_air(
         proof_options,
         1,
         transition_constraints,
-        (),
     )
 }
 
@@ -249,6 +248,5 @@ fn create_mul_air(
         proof_options,
         1,
         transition_constraints,
-        (),
     )
 }

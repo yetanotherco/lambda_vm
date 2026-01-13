@@ -77,7 +77,6 @@ where
     F: IsFFTField,
 {
     context: AirContext,
-    pub_inputs: FibonacciPublicInputs<F>,
     constraints: Vec<Box<dyn TransitionConstraint<F, F>>>,
 }
 
@@ -102,7 +101,7 @@ where
         1
     }
 
-    fn new(pub_inputs: &Self::PublicInputs, proof_options: &ProofOptions) -> Self {
+    fn new(proof_options: &ProofOptions) -> Self {
         let constraints: Vec<Box<dyn TransitionConstraint<F, F>>> =
             vec![Box::new(FibConstraint::new())];
 
@@ -113,11 +112,7 @@ where
             num_transition_constraints: constraints.len(),
         };
 
-        Self {
-            pub_inputs: pub_inputs.clone(),
-            context,
-            constraints,
-        }
+        Self { context, constraints }
     }
 
     fn composition_poly_degree_bound(&self, trace_length: usize) -> usize {
@@ -130,12 +125,13 @@ where
 
     fn boundary_constraints(
         &self,
+        pub_inputs: &Self::PublicInputs,
         _rap_challenges: &[FieldElement<Self::Field>],
         _bus_interactions: Option<&[crate::lookup::BusPublicInputs<Self::FieldExtension>]>,
         _trace_length: usize,
     ) -> BoundaryConstraints<Self::Field> {
-        let a0 = BoundaryConstraint::new_simple_main(0, self.pub_inputs.a0.clone());
-        let a1 = BoundaryConstraint::new_simple_main(1, self.pub_inputs.a1.clone());
+        let a0 = BoundaryConstraint::new_simple_main(0, pub_inputs.a0.clone());
+        let a1 = BoundaryConstraint::new_simple_main(1, pub_inputs.a1.clone());
 
         BoundaryConstraints::from_constraints(vec![a0, a1])
     }
@@ -146,10 +142,6 @@ where
 
     fn trace_layout(&self) -> (usize, usize) {
         (1, 0)
-    }
-
-    fn pub_inputs(&self) -> &Self::PublicInputs {
-        &self.pub_inputs
     }
 }
 

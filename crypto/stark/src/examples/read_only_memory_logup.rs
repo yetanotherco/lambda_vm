@@ -351,7 +351,6 @@ where
     E: IsField + Send + Sync,
 {
     context: AirContext,
-    pub_inputs: LogReadOnlyPublicInputs<F>,
     transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
 }
 
@@ -382,7 +381,7 @@ where
         1
     }
 
-    fn new(pub_inputs: &Self::PublicInputs, proof_options: &ProofOptions) -> Self {
+    fn new(proof_options: &ProofOptions) -> Self {
         let transition_constraints: Vec<
             Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>,
         > = vec![
@@ -400,7 +399,6 @@ where
 
         Self {
             context,
-            pub_inputs: pub_inputs.clone(),
             transition_constraints,
         }
     }
@@ -463,15 +461,16 @@ where
 
     fn boundary_constraints(
         &self,
+        pub_inputs: &Self::PublicInputs,
         rap_challenges: &[FieldElement<Self::FieldExtension>],
         _bus_interactions: Option<&[crate::lookup::BusPublicInputs<Self::FieldExtension>]>,
         trace_length: usize,
     ) -> BoundaryConstraints<Self::FieldExtension> {
-        let a0 = &self.pub_inputs.a0;
-        let v0 = &self.pub_inputs.v0;
-        let a_sorted_0 = &self.pub_inputs.a_sorted_0;
-        let v_sorted_0 = &self.pub_inputs.v_sorted_0;
-        let m0 = &self.pub_inputs.m0;
+        let a0 = &pub_inputs.a0;
+        let v0 = &pub_inputs.v0;
+        let a_sorted_0 = &pub_inputs.a_sorted_0;
+        let v_sorted_0 = &pub_inputs.v_sorted_0;
+        let m0 = &pub_inputs.m0;
         let z = &rap_challenges[0];
         let alpha = &rap_challenges[1];
 
@@ -512,10 +511,6 @@ where
     // Since we have a transition constraint of degree 3, we need the bound to be two times the trace length.
     fn composition_poly_degree_bound(&self, trace_length: usize) -> usize {
         trace_length * 2
-    }
-
-    fn pub_inputs(&self) -> &Self::PublicInputs {
-        &self.pub_inputs
     }
 }
 

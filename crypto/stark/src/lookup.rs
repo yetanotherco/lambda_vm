@@ -51,12 +51,11 @@ pub struct AirWithBuses<
     PI,
 > {
     context: AirContext,
-    pub_inputs: PI,
     step_size: usize,
     trace_layout: (usize, usize),
     transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
     auxiliary_trace_build_data: AuxiliaryTraceBuildData,
-    boundary_constraint_builder: PhantomData<B>,
+    boundary_constraint_builder: PhantomData<(B, PI)>,
 }
 
 impl<
@@ -74,7 +73,6 @@ impl<
         proof_options: &ProofOptions,
         step_size: usize,
         mut transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
-        pub_inputs: PI,
     ) -> Self {
         // Add a transition constraint for each auxiliary column representing a table interaction
         for (i, interaction) in auxiliary_trace_build_data.interactions.iter().enumerate() {
@@ -109,12 +107,11 @@ impl<
 
         Self {
             context,
-            pub_inputs,
             step_size,
             trace_layout,
             transition_constraints,
             auxiliary_trace_build_data,
-            boundary_constraint_builder: PhantomData::<B>,
+            boundary_constraint_builder: PhantomData,
         }
     }
 }
@@ -136,10 +133,7 @@ where
         self.step_size
     }
 
-    fn new(
-        _pub_inputs: &Self::PublicInputs,
-        _proof_options: &crate::proof::options::ProofOptions,
-    ) -> Self
+    fn new(_proof_options: &crate::proof::options::ProofOptions) -> Self
     where
         Self: Sized,
     {
@@ -157,10 +151,6 @@ where
 
     fn context(&self) -> &AirContext {
         &self.context
-    }
-
-    fn pub_inputs(&self) -> &Self::PublicInputs {
-        &self.pub_inputs
     }
 
     fn transition_constraints(
@@ -219,6 +209,7 @@ where
     }
     fn boundary_constraints(
         &self,
+        pub_inputs: &Self::PublicInputs,
         rap_challenges: &[FieldElement<E>],
         bus_interactions: Option<&[BusPublicInputs<E>]>,
         trace_length: usize,
@@ -244,7 +235,7 @@ where
         }
 
         // User-defined boundary constraints
-        boundary_constraints.extend(B::boundary_constraints(&self.pub_inputs, rap_challenges));
+        boundary_constraints.extend(B::boundary_constraints(pub_inputs, rap_challenges));
 
         BoundaryConstraints::from_constraints(boundary_constraints)
     }

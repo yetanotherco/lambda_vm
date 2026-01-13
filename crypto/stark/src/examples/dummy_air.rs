@@ -147,7 +147,7 @@ impl AIR for DummyAIR {
         1
     }
 
-    fn new(_pub_inputs: &Self::PublicInputs, proof_options: &ProofOptions) -> Self {
+    fn new(proof_options: &ProofOptions) -> Self {
         let transition_constraints: Vec<
             Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>,
         > = vec![
@@ -170,6 +170,7 @@ impl AIR for DummyAIR {
 
     fn boundary_constraints(
         &self,
+        _pub_inputs: &Self::PublicInputs,
         _rap_challenges: &[FieldElement<Self::Field>],
         _bus_interactions: Option<&[crate::lookup::BusPublicInputs<Self::FieldExtension>]>,
         _trace_length: usize,
@@ -196,10 +197,6 @@ impl AIR for DummyAIR {
 
     fn trace_layout(&self) -> (usize, usize) {
         (2, 0)
-    }
-
-    fn pub_inputs(&self) -> &Self::PublicInputs {
-        &()
     }
 }
 

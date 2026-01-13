@@ -140,7 +140,6 @@ where
     F: IsFFTField,
 {
     context: AirContext,
-    pub_inputs: FibonacciPublicInputs<F>,
     constraints: Vec<Box<dyn TransitionConstraint<F, F>>>,
 }
 
@@ -158,7 +157,7 @@ where
         1
     }
 
-    fn new(pub_inputs: &Self::PublicInputs, proof_options: &ProofOptions) -> Self {
+    fn new(proof_options: &ProofOptions) -> Self {
         let constraints: Vec<Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>> = vec![
             Box::new(FibTransition1::new()),
             Box::new(FibTransition2::new()),
@@ -174,18 +173,18 @@ where
         Self {
             context,
             constraints,
-            pub_inputs: pub_inputs.clone(),
         }
     }
 
     fn boundary_constraints(
         &self,
+        pub_inputs: &Self::PublicInputs,
         _rap_challenges: &[FieldElement<Self::Field>],
         _bus_interactions: Option<&[crate::lookup::BusPublicInputs<Self::FieldExtension>]>,
         _trace_length: usize,
     ) -> BoundaryConstraints<Self::Field> {
-        let a0 = BoundaryConstraint::new_main(0, 0, self.pub_inputs.a0.clone());
-        let a1 = BoundaryConstraint::new_main(1, 0, self.pub_inputs.a1.clone());
+        let a0 = BoundaryConstraint::new_main(0, 0, pub_inputs.a0.clone());
+        let a1 = BoundaryConstraint::new_main(1, 0, pub_inputs.a1.clone());
 
         BoundaryConstraints::from_constraints(vec![a0, a1])
     }
@@ -204,10 +203,6 @@ where
 
     fn trace_layout(&self) -> (usize, usize) {
         (2, 0)
-    }
-
-    fn pub_inputs(&self) -> &Self::PublicInputs {
-        &self.pub_inputs
     }
 }
 

@@ -81,7 +81,7 @@ pub trait AIR: Send + Sync {
 
     fn step_size(&self) -> usize;
 
-    fn new(pub_inputs: &Self::PublicInputs, proof_options: &ProofOptions) -> Self
+    fn new(proof_options: &ProofOptions) -> Self
     where
         Self: Sized;
 
@@ -133,6 +133,7 @@ pub trait AIR: Send + Sync {
 
     fn boundary_constraints(
         &self,
+        pub_inputs: &Self::PublicInputs,
         rap_challenges: &[FieldElement<Self::FieldExtension>],
         bus_interactions: Option<&[BusPublicInputs<Self::FieldExtension>]>,
         trace_length: usize,
@@ -161,8 +162,6 @@ pub trait AIR: Send + Sync {
     fn num_transition_constraints(&self) -> usize {
         self.context().num_transition_constraints
     }
-
-    fn pub_inputs(&self) -> &Self::PublicInputs;
 
     fn get_periodic_column_values(&self) -> Vec<Vec<FieldElement<Self::Field>>> {
         vec![]

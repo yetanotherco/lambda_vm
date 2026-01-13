@@ -138,7 +138,7 @@ impl AIR for BitFlagsAIR {
         16
     }
 
-    fn new(_pub_inputs: &Self::PublicInputs, proof_options: &ProofOptions) -> Self {
+    fn new(proof_options: &ProofOptions) -> Self {
         let bit_constraint = Box::new(BitConstraint::new());
         let flag_constraint = Box::new(ZeroFlagConstraint::new());
         let constraints: Vec<Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>> =
@@ -167,6 +167,7 @@ impl AIR for BitFlagsAIR {
 
     fn boundary_constraints(
         &self,
+        _pub_inputs: &Self::PublicInputs,
         _rap_challenges: &[FieldElement<Self::FieldExtension>],
         _bus_interactions: Option<&[crate::lookup::BusPublicInputs<Self::FieldExtension>]>,
         _trace_length: usize,
@@ -184,10 +185,6 @@ impl AIR for BitFlagsAIR {
 
     fn trace_layout(&self) -> (usize, usize) {
         (1, 0)
-    }
-
-    fn pub_inputs(&self) -> &Self::PublicInputs {
-        &()
     }
 }
 

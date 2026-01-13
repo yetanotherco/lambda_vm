@@ -134,10 +134,11 @@ fn test_multi_airs_log_up() {
             PublicInputs = (),
         >,
         &mut TraceTable<Babybear31PrimeField, Degree4BabyBearExtensionField>,
+        &(),
     )> = vec![
-        (&cpu_air, &mut cpu_trace),
-        (&add_air, &mut add_trace),
-        (&mul_air, &mut mul_trace),
+        (&cpu_air, &mut cpu_trace, &()),
+        (&add_air, &mut add_trace, &()),
+        (&mul_air, &mut mul_trace, &()),
     ];
 
     let multi_proof = Prover::multi_prove(
@@ -270,10 +271,11 @@ fn test_multi_airs_log_up_cheating_wrong_value_detected() {
             PublicInputs = (),
         >,
         &mut TraceTable<Babybear31PrimeField, Degree4BabyBearExtensionField>,
+        &(),
     )> = vec![
-        (&cpu_air, &mut cpu_trace),
-        (&add_air, &mut add_trace),
-        (&mul_air, &mut mul_trace),
+        (&cpu_air, &mut cpu_trace, &()),
+        (&add_air, &mut add_trace, &()),
+        (&mul_air, &mut mul_trace, &()),
     ];
 
     let multi_proof = Prover::multi_prove(
@@ -406,10 +408,11 @@ fn test_multi_airs_log_up_cheating_wrong_multiplicity_detected() {
             PublicInputs = (),
         >,
         &mut TraceTable<Babybear31PrimeField, Degree4BabyBearExtensionField>,
+        &(),
     )> = vec![
-        (&cpu_air, &mut cpu_trace),
-        (&add_air, &mut add_trace),
-        (&mul_air, &mut mul_trace),
+        (&cpu_air, &mut cpu_trace, &()),
+        (&add_air, &mut add_trace, &()),
+        (&mul_air, &mut mul_trace, &()),
     ];
 
     let multi_proof = Prover::multi_prove(

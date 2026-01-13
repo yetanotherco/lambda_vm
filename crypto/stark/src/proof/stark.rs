@@ -43,8 +43,8 @@ pub struct DeepPolynomialOpening<F: IsSubFieldOf<E>, E: IsField> {
 pub type DeepPolynomialOpenings<F, E> = Vec<DeepPolynomialOpening<F, E>>;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(bound = "")]
-pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField> {
+#[serde(bound = "PI: serde::Serialize + serde::de::DeserializeOwned")]
+pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     // Length of the execution trace
     pub trace_length: usize,
     // Commitments of the trace columns
@@ -75,19 +75,21 @@ pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField> {
     // 1. Boundary constraints on aux columns (row 0 and last row)
     // 2. Bus balance check: Σ sender_values - Σ receiver_values = 0 across all tables
     pub bus_interactions: Vec<BusPublicInputs<E>>,
+    // Public inputs used for boundary constraints
+    pub public_inputs: PI,
 }
 
 /// A collection of STARK proofs for multiple AIRs.
 /// Used for multi-table proving where tables are linked via bus (LogUp).
 /// Returned by `Prover::multi_prove` and verified by `Verifier::multi_verify`.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-#[serde(bound = "")]
-pub struct MultiProof<F: IsSubFieldOf<E>, E: IsField> {
-    pub proofs: Vec<StarkProof<F, E>>,
+#[serde(bound = "PI: serde::Serialize + serde::de::DeserializeOwned")]
+pub struct MultiProof<F: IsSubFieldOf<E>, E: IsField, PI> {
+    pub proofs: Vec<StarkProof<F, E, PI>>,
 }
 
-impl<F: IsSubFieldOf<E>, E: IsField> MultiProof<F, E> {
-    pub fn new(proofs: Vec<StarkProof<F, E>>) -> Self {
+impl<F: IsSubFieldOf<E>, E: IsField, PI> MultiProof<F, E, PI> {
+    pub fn new(proofs: Vec<StarkProof<F, E, PI>>) -> Self {
         Self { proofs }
     }
 }
@@ -97,14 +99,13 @@ impl<F: IsSubFieldOf<E>, E: IsField> MultiProof<F, E> {
 pub struct StoneCompatibleSerializer;
 
 impl StoneCompatibleSerializer {
-    pub fn serialize_proof<A>(
-        proof: &StarkProof<Stark252PrimeField, Stark252PrimeField>,
-        public_inputs: &A::PublicInputs,
+    pub fn serialize_proof<A, PI>(
+        proof: &StarkProof<Stark252PrimeField, Stark252PrimeField, PI>,
         options: &ProofOptions,
     ) -> Vec<u8>
     where
-        A: AIR<Field = Stark252PrimeField, FieldExtension = Stark252PrimeField>,
-        A::PublicInputs: AsBytes,
+        A: AIR<Field = Stark252PrimeField, FieldExtension = Stark252PrimeField, PublicInputs = PI>,
+        PI: AsBytes,
     {
         let mut output = Vec::new();
 
@@ -114,7 +115,8 @@ impl StoneCompatibleSerializer {
         Self::append_fri_commit_phase_commitments(proof, &mut output);
         Self::append_proof_of_work_nonce(proof, &mut output);
 
-        let fri_query_indexes = Self::get_fri_query_indexes::<A>(proof, public_inputs, options);
+        let fri_query_indexes =
+            Self::get_fri_query_indexes::<A, PI>(proof, &proof.public_inputs, options);
         Self::append_fri_query_phase_first_layer(proof, &fri_query_indexes, &mut output);
         Self::append_fri_query_phase_inner_layers(proof, &fri_query_indexes, &mut output);
 
@@ -123,8 +125,8 @@ impl StoneCompatibleSerializer {
 
     /// Appends the root bytes of the Merkle tree for the main trace, and if there is a RAP round,
     /// it also appends the root bytes of the Merkle tree for the extended columns.
-    fn append_trace_commitment(
-        proof: &StarkProof<Stark252PrimeField, Stark252PrimeField>,
+    fn append_trace_commitment<PI>(
+        proof: &StarkProof<Stark252PrimeField, Stark252PrimeField, PI>,
         output: &mut Vec<u8>,
     ) {
         output.extend_from_slice(&proof.lde_trace_main_merkle_root);
@@ -135,8 +137,8 @@ impl StoneCompatibleSerializer {
     }
 
     /// Appends the root bytes of the Merkle tree for the composition polynomial.
-    fn append_composition_polynomial_commitment(
-        proof: &StarkProof<Stark252PrimeField, Stark252PrimeField>,
+    fn append_composition_polynomial_commitment<PI>(
+        proof: &StarkProof<Stark252PrimeField, Stark252PrimeField, PI>,
         output: &mut Vec<u8>,
     ) {
         output.extend_from_slice(&proof.composition_poly_root);
@@ -151,8 +153,8 @@ impl StoneCompatibleSerializer {
     /// t_1(z), ..., t_1(g^K z), t_2(z), ..., t_2(g^K z), ..., t_m(g z), ..., t_m(g^K z), H_1(z^s), ..., H_s(z^s).
     ///
     /// Here, K is the length of the frame size.
-    fn append_out_of_domain_evaluations(
-        proof: &StarkProof<Stark252PrimeField, Stark252PrimeField>,
+    fn append_out_of_domain_evaluations<PI>(
+        proof: &StarkProof<Stark252PrimeField, Stark252PrimeField, PI>,
         output: &mut Vec<u8>,
     ) {
         for i in 0..proof.trace_ood_evaluations.width {
@@ -167,8 +169,8 @@ impl StoneCompatibleSerializer {
     }
 
     /// Appends the commitments to the inner layers of FRI followed by the element of the last layer.
-    fn append_fri_commit_phase_commitments(
-        proof: &StarkProof<Stark252PrimeField, Stark252PrimeField>,
+    fn append_fri_commit_phase_commitments<PI>(
+        proof: &StarkProof<Stark252PrimeField, Stark252PrimeField, PI>,
         output: &mut Vec<u8>,
     ) {
         output.extend_from_slice(
@@ -185,8 +187,8 @@ impl StoneCompatibleSerializer {
 
     /// Appends the proof of work nonce in case there is one. There could be none if the `grinding_factor`
     /// was set to 0 during proof generation. In that case nothing is appended.
-    fn append_proof_of_work_nonce(
-        proof: &StarkProof<Stark252PrimeField, Stark252PrimeField>,
+    fn append_proof_of_work_nonce<PI>(
+        proof: &StarkProof<Stark252PrimeField, Stark252PrimeField, PI>,
         output: &mut Vec<u8>,
     ) {
         if let Some(nonce_value) = proof.nonce {
@@ -219,8 +221,8 @@ impl StoneCompatibleSerializer {
     /// If there are 6 queries [3, 1, 5, 2, 1, 3], then this method appends the
     /// following to the output:
     /// `BT_1 | BT_2 | BT_3 | BT_5 | TraceMergedPaths | BH_1 | BH_2 | BH_3 | BH_5 | CompositionMergedPaths`
-    fn append_fri_query_phase_first_layer(
-        proof: &StarkProof<Stark252PrimeField, Stark252PrimeField>,
+    fn append_fri_query_phase_first_layer<PI>(
+        proof: &StarkProof<Stark252PrimeField, Stark252PrimeField, PI>,
         fri_query_indexes: &[usize],
         output: &mut Vec<u8>,
     ) {
@@ -340,8 +342,8 @@ impl StoneCompatibleSerializer {
     /// Z_1 | MergedPathsLayer_1 | Z_2 | MergedPathsLayer_2 | ... | Z_n | MergedPathsLayer_n,
     ///
     /// where n is the total number of FRI layers.
-    fn append_fri_query_phase_inner_layers(
-        proof: &StarkProof<Stark252PrimeField, Stark252PrimeField>,
+    fn append_fri_query_phase_inner_layers<PI>(
+        proof: &StarkProof<Stark252PrimeField, Stark252PrimeField, PI>,
         fri_query_indexes: &[usize],
         output: &mut Vec<u8>,
     ) {
@@ -466,17 +468,17 @@ impl StoneCompatibleSerializer {
         }
         result
     }
-    fn get_fri_query_indexes<A>(
-        proof: &StarkProof<Stark252PrimeField, Stark252PrimeField>,
-        public_inputs: &A::PublicInputs,
+    fn get_fri_query_indexes<A, PI>(
+        proof: &StarkProof<Stark252PrimeField, Stark252PrimeField, PI>,
+        public_inputs: &PI,
         proof_options: &ProofOptions,
     ) -> Vec<usize>
     where
-        A: AIR<Field = Stark252PrimeField, FieldExtension = Stark252PrimeField>,
-        A::PublicInputs: AsBytes,
+        A: AIR<Field = Stark252PrimeField, FieldExtension = Stark252PrimeField, PublicInputs = PI>,
+        PI: AsBytes,
     {
         let mut transcript = StoneProverTranscript::new(&public_inputs.as_bytes());
-        let air = A::new(public_inputs, proof_options);
+        let air = A::new(proof_options);
         let domain = Domain::<Stark252PrimeField>::new(&air, proof.trace_length);
         let challenges = Verifier::step_1_replay_rounds_and_recover_challenges(
             &air,
