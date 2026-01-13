@@ -70,7 +70,7 @@ def = {idx="i", polys=[
 
 [[variables.virtual]]
 name = "carry"
-type = ["B19", 4]
+type = ["B20", 4]
 desc = "carry values"
 def = {idx="i", polys=[
     {range=0, poly=["*", ["^", 2, -32], ["-", ["idx", "raw_product", 0], ["idx", "res", 0]]]},
@@ -132,7 +132,7 @@ ref = "mul:c:rhs_is_negative"
 
 [[constraints.def]]
 kind = "interaction"
-tag = "IS_B19"
+tag = "IS_B20"
 input = [["idx", "carry", "i"]]
 range = ["i", 0, 3]
 multiplicity = "μ_sum"

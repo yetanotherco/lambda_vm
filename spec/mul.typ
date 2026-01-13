@@ -62,17 +62,24 @@ where at step
 - $square$ we rewrite the second summation such that $i$ iterates from $j$ to 7, rather than $0$ to $7-j$, and
 - $penta$ we swap the sums.
 
-Note that `raw_product` captures the second summation in this last formula (see @mul:c:raw_product).
-However, the limbs in `raw_product` may require up to 51 bits to be represented.
-What remains then is to carry the overflow of each limb to the next, ensuring `res` represents the same value as `raw_product`, but with limbs in the range $[0, 2^32)$.
-This is simply constrained by `carry`'s definition and @mul:c:carry.
-From these two, we gather that
+We let `raw_product` capture the second summation in this last formula (see @mul:c:raw_product).
+By construction, $#`raw_product`_i < 2^51$ for all $i in [0, 3]$, far exceeding the 32-bits that fit in a single `Word`-limb.
+What remains then is to reduce each limb of `raw_product` $mod 2^32$, carrying the overflow of each limb to the next, constructing the output `res` in doing so.
+
+This reduce-and-carry operation is constrained @mul:a:res and @mul:c:carry, combined with `carry`'s eloquent definition.
+@mul:c:carry and `carry`'s definition enforce that
 $
-  #`raw_product`_0 - #`res`_0 in { i dot 2^32 | i in [0, 2^19) }
+  forall i in [0, 3]: #`raw_product`_i + #`carry`_(i-1) - #`res`_i in { k dot 2^32 | k in [0, 2^20) }
 $
-With @mul:a:res in place, $#`res`_0$ can only assume one value: the unique multiple of $2^32$ that is smaller than or equal to $#`raw_product`_0$.
-In other words, $#`res`_0$ is constrained to equal $#`raw_product`_0 mod 2^32$.
-The correctness of $#`res`_i$ for $i in [1, 3]$ follows analogously.
+with $#`carry`_(-1) = 0$ for simplicity.
+In other words: $#`res`_i >= #`raw_product`_i + #`carry`_(i-1) mod 2^32$.
+With @mul:a:res forcing $#`res`_i < 2^32$, $#`res`_i$ can only assume one value: $#`raw_product`_i + #`carry`_(i-1) mod 2^32$.
+
+*Note*: one may have observed that @mul:c:carry requires $#`carry`_i in [0, 2^20)$, while no limb of a valid carry value would ever exceed $2^19$.
+This is indeed the case.
+However, there is some slack in how tight one has to constrain the `carry` values.
+In fact, in this situation it suffices to assert that $#`carry`_i < frac(p, 2^32, style: "skewed") approx 2^31$, where $p$ denotes the field's modulus.
+Given that other chips also use 20-bit lookups, using `IS_B20` makes for a simpler design.
 
 === Definitions
 We constrain `lhs_is_negative` and `rhs_is_negative` according to their definition; `carry` is appropriately range checked.
