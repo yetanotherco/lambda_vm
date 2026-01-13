@@ -28,6 +28,10 @@ The `MEMW` chip is comprised of #nr_variables variables that are expressed using
 
 #render_constraint_table(chip, config, groups: "consistency")
 
+We additionally also check that the address does not overflow
+for more significant bytes of the access.
+#render_constraint_table(chip, config, groups: "overflow")
+
 The chip adds the following tuples to the lookup argument,
 to effectuate that part of the memory argument.
 #render_constraint_table(chip, config, groups: "memory")
@@ -36,4 +40,9 @@ This chip contributes the following to the lookup argument.
 #render_constraint_table(chip, config, groups: "output")
 
 
+== Future optimization ideas
 
+- Fast path for aligned memory access where all bytes have the same old timestamp
+- MEMB chip that deals does a one-byte write to remove old_timestamp from here (uncertain tradeoffs)
+- Compute `base_address[1] + 1` once and have high words of `address_add` as Words
+- Improve overflow trapping somehow so we don't need `LT` (could tie into previous one by checking carry bit of the +1)

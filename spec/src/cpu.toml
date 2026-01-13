@@ -38,17 +38,17 @@ desc = "Whether to write back to the destination register"
 [[variables.input]]
 name = "memory_2bytes"
 type = "Bit"
-desc = "Whether the memory access (read or write) touches at least 2 bytes"
+desc = "Whether the memory access (read or write) touches exactly 2 bytes"
 
 [[variables.input]]
 name = "memory_4bytes"
 type = "Bit"
-desc = "Whether the memory access (read or write) touches at least 4 bytes"
+desc = "Whether the memory access (read or write) touches exactly 4 bytes"
 
 [[variables.input]]
 name = "memory_8bytes"
 type = "Bit"
-desc = "Whether the memory access (read or write) touches at least 8 bytes"
+desc = "Whether the memory access (read or write) touches exactly 8 bytes"
 
 # TODO: Are there usecases where it's nicer to just have this as a length constant?
 [[variables.input]]

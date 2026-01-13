@@ -25,17 +25,17 @@ desc = "The timestamp at which this memory access is said to occur"
 [[variables.input]]
 name = "write2"
 type = "Bit"
-desc = "Whether to write at least 2 values"
+desc = "Whether to write exactly 2 values"
 
 [[variables.input]]
 name = "write4"
 type = "Bit"
-desc = "Whether to write at least 4 values"
+desc = "Whether to write exactly 4 values"
 
 [[variables.input]]
 name = "write8"
 type = "Bit"
-desc = "Whether to write 8 values"
+desc = "Whether to write exactly 8 values"
 
 # Output
 
@@ -58,6 +58,18 @@ type = ["DWordWL", 8]
 desc = "The timestamp at which the address was last accessed"
 
 # Virtual
+
+[[variables.virtual]]
+name = "w2"
+type = "Bit"
+desc = "writing at least 2 bytes"
+def = ["+", "write2", "write4", "write8"]
+
+[[variables.virtual]]
+name = "w4"
+type = "Bit"
+desc = "writing at least 4 bytes"
+def = ["+", "write4", "write8"]
 
 [[variables.virtual]]
 name = "μ_sum"
@@ -92,10 +104,7 @@ desc = "`IS_BIT<write4>`"
 desc = "`IS_BIT<write8>`"
 
 [[assumptions]]
-desc = "`write4 => write2`"
-
-[[assumptions]]
-desc = "`write8 => write4`"
+desc = "`IS_BIT<write2 + write4 + write8>`"
 
 
 [[constraint_groups]]
@@ -108,19 +117,33 @@ input = ["μ_sum"]
 
 [[constraints.consistency]]
 kind = "arith"
-constraint = "$#`write2` => #`μ_sum`$"
-poly = ["*", "write2", ["not", "μ_sum"]]
+constraint = "$#`w2` => #`μ_sum`$"
+poly = ["*", "w2", ["not", "μ_sum"]]
 
-# TODO: does it make sense to add writeX multiplicities?
+[[constraints.consistency]]
+kind = "template"
+tag = "ADD"
+input = ["base_address", 1]
+output = ["cast", ["idx", "address_add", 0], "DWordWL"]
+multiplicity = "w2"
+
 [[constraints.consistency]]
 kind = "template"
 tag = "ADD"
 input = ["base_address", ["+", "i", 1]]
-output = ["idx", "address_add", "i"]
-range = ["i", 0, 6]
+output = ["cast", ["idx", "address_add", "i"], "DWordWL"]
+range = ["i", 1, 2]
+multiplicity = "w4"
+
+[[constraints.consistency]]
+kind = "template"
+tag = "ADD"
+input = ["base_address", ["+", "i", 1]]
+output = ["cast", ["idx", "address_add", "i"], "DWordWL"]
+range = ["i", 3, 6]
+multiplicity = "write8"
 
 # TODO: whoops, double loop
-# TODO: does it make sense to add writeX multiplicities?
 [[constraints.consistency]]
 kind = "interaction"
 tag = "IS_HALFWORD"
@@ -139,7 +162,7 @@ kind = "interaction"
 tag = "LT"
 input = [["idx", "old_timestamp", 1], "timestamp"]
 output = 1
-multiplicity = "write2"
+multiplicity = "w2"
 
 [[constraints.consistency]]
 kind = "interaction"
@@ -147,7 +170,7 @@ tag = "LT"
 input = [["idx", "old_timestamp", "i"], "timestamp"]
 output = 1
 range = ["i", 2, 3]
-multiplicity = "write4"
+multiplicity = "w4"
 
 [[constraints.consistency]]
 kind = "interaction"
@@ -155,6 +178,32 @@ tag = "LT"
 input = [["idx", "old_timestamp", "i"], "timestamp"]
 output = 1
 range = ["i", 4, 7]
+multiplicity = "write8"
+
+
+[[constraint_groups]]
+name = "overflow"
+prefix = "O"
+
+[[constraints.overflow]]
+kind = "interaction"
+tag = "LT"
+input = ["base_address", ["cast", ["idx", "address_add", 0], "DWordWL"]]
+output = 1
+multiplicity = "write2"
+
+[[constraints.overflow]]
+kind = "interaction"
+tag = "LT"
+input = ["base_address", ["cast", ["idx", "address_add", 2], "DWordWL"]]
+output = 1
+multiplicity = "write4"
+
+[[constraints.overflow]]
+kind = "interaction"
+tag = "LT"
+input = ["base_address", ["cast", ["idx", "address_add", 6], "DWordWL"]]
+output = 1
 multiplicity = "write8"
 
 
@@ -178,26 +227,26 @@ multiplicity = ["-", "μ_sum"]
 kind = "interaction"
 tag = "memory"
 input = ["is_register", ["idx", "address_add", 0], ["idx", "old_timestamp", 1], ["idx", "old", 1]]
-multiplicity = "write2"
+multiplicity = "w2"
 
 [[constraints.memory]]
 kind = "interaction"
 tag = "memory"
 input = ["is_register", ["idx", "address_add", 0], "timestamp", ["idx", "value", 1]]
-multiplicity = ["-", "write2"]
+multiplicity = ["-", "w2"]
 
 [[constraints.memory]]
 kind = "interaction"
 tag = "memory"
 input = ["is_register", ["idx", "address_add", ["-", "i", 1]], ["idx", "old_timestamp", "i"], ["idx", "old", "i"]]
-multiplicity = "write4"
+multiplicity = "w4"
 range = ["i", 2, 3]
 
 [[constraints.memory]]
 kind = "interaction"
 tag = "memory"
 input = ["is_register", ["idx", "address_add", ["-", "i", 1]], "timestamp", ["idx", "value", "i"]]
-multiplicity = ["-", "write4"]
+multiplicity = ["-", "w4"]
 range = ["i", 2, 3]
 
 [[constraints.memory]]
