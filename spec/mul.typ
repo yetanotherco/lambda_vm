@@ -51,12 +51,11 @@ $
   &stackrel(triangle, equiv) sum_(j=0)^7 sum_(i=0)^(7-j) 2^(16(i+j)) dot #`lhs_ext`_j dot #`rhs_ext`_i mod 2^128 \
   &stackrel(square, equiv) sum_(j=0)^7 sum_(i=j)^(7) 2^(16i) dot #`lhs_ext`_j dot #`rhs_ext`_(i-j) mod 2^128 \
   &stackrel(penta, equiv) sum_(i=0)^7 sum_(j=0)^(i) 2^(16i) dot #`lhs_ext`_j dot #`rhs_ext`_(i-j) mod 2^128 \
-//   &equiv sum_(i=0)^7 2^(16i) dot sum_(j=0)^(i) #`lhs_ext`_j dot #`rhs_ext`_(i-j) mod 2^128 \
   &equiv sum_(i=0)^3 sum_(k=0)^1 sum_(j=0)^(2i+k) 2^(16(2i+k)) dot #`lhs_ext`_j dot #`rhs_ext`_(2i+k-j) mod 2^128 \
   &equiv sum_(i=0)^3 2^(32i) dot sum_(k=0)^1 2^(16k) dot sum_(j=0)^(2i+k) #`lhs_ext`_j dot #`rhs_ext`_(2i+k-j) mod 2^128
 $
 where at step
-- $triangle$ we can ignore $j > 7-i$, since that makes $2^(16(i+j)) equiv 0 mod 2^128$,
+- $triangle$ we can ignore $i > 7-j$, since that makes $2^(16(i+j)) equiv 0 mod 2^128$,
 - $square$ we rewrite the second summation such that $i$ iterates from $j$ to 7, rather than $0$ to $7-j$, and
 - $penta$ we swap the sums.
 
