@@ -66,7 +66,7 @@ We let `raw_product` capture the second summation in this last formula (see @mul
 By construction, $#`raw_product`_i < 2^51$ for all $i in [0, 3]$, far exceeding the 32-bits that fit in a single `Word`-limb.
 What remains then is to reduce each limb of `raw_product` $mod 2^32$, carrying the overflow of each limb to the next, constructing the output `res` in doing so.
 
-This reduce-and-carry operation is constrained @mul:a:res and @mul:c:carry, combined with `carry`'s eloquent definition.
+This reduce-and-carry operation is constrained @mul:a:res and @mul:c:carry, combined with `carry`'s definition.
 @mul:c:carry and `carry`'s definition enforce that
 $
   forall i in [0, 3]: #`raw_product`_i + #`carry`_(i-1) - #`res`_i in { k dot 2^32 | k in [0, 2^20) }
