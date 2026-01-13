@@ -258,9 +258,9 @@ impl CpuTableRow {
                 row.rs1 = FE::from(&base);
                 row.rs2 = FE::from(&src);
                 // Fix this afer changing STORE instruction.
-                row.imm = i32_to_2_limbs(offset as i32);
-                row.arg2 = i32_to_2_limbs(offset as i32);
-                row.res = u32_to_4_limbs(log.src1_val + offset);
+                row.imm = i32_to_2_limbs(offset);
+                row.arg2 = i32_to_2_limbs(offset);
+                row.res = i32_to_4_limbs(log.src1_val as i32 + offset);
 
                 match width {
                     LoadStoreWidth::Half => row.memory_2bytes = FE::one(),
