@@ -127,33 +127,41 @@ where
         }
     }
 
-    /// Given a list of leaf positions, returns the indices of the nodes needed to verify all those leaves
-    /// belong to the tree.
+    /// Returns the internal indices of nodes needed in the batch proof.
+    ///
+    /// The algorithm works level-by-level from leaves to root:
+    /// - For each node we can obtain, check if its sibling is also obtainable
+    /// - If not, the sibling must be included in the proof
+    /// - Parents of obtainable nodes become obtainable in the next level
     fn get_batch_auth_path_positions(&self, leaf_positions: &[usize]) -> Vec<usize> {
         let mut auth_path_set = BTreeSet::<usize>::new();
-        // We add all the leaves to the set of obtainable nodes, because we already have them.
-        let mut obtainable_nodes_by_level: HashSet<usize> =
-            leaf_positions.iter().cloned().collect();
+        let mut obtainable: HashSet<usize> = leaf_positions.iter().cloned().collect();
 
-        let num_levels = (self.nodes.len() as f32).log2().ceil() as usize;
+        // Number of levels in tree (integer math, avoids float precision issues)
+        let num_levels = (usize::BITS - self.nodes.len().leading_zeros()) as usize;
 
         for _ in 0..num_levels - 1 {
-            let mut parent_level_obtainable_positions = HashSet::new();
-            for pos in &obtainable_nodes_by_level {
-                let sibling_pos = get_sibiling_pos(*pos);
-                // A sibling is obtainable if it is another leaf, it is a parent of known nodes or it is
-                // already in the authentication path set.
-                let sibling_is_obtainable = obtainable_nodes_by_level.contains(&sibling_pos)
+            let mut next_obtainable = HashSet::with_capacity(obtainable.len());
+
+            for &pos in &obtainable {
+                let sibling_pos = get_sibiling_pos(pos);
+
+                // If sibling not obtainable, include it in the proof
+                let sibling_is_obtainable = obtainable.contains(&sibling_pos)
                     || auth_path_set.contains(&sibling_pos);
+                    
                 if !sibling_is_obtainable {
                     auth_path_set.insert(sibling_pos);
                 }
-                parent_level_obtainable_positions.insert(get_parent_pos(*pos));
+
+                // Parent becomes obtainable (computable from both children)
+                next_obtainable.insert(get_parent_pos(pos));
             }
-            // In the next layer, all parents of known nodes are obtainable.
-            obtainable_nodes_by_level = parent_level_obtainable_positions;
+
+            obtainable = next_obtainable;
         }
 
+        // Descending order to match verification consumption order
         auth_path_set.into_iter().rev().collect()
     }
 }
