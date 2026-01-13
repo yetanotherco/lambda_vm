@@ -39,7 +39,7 @@ $(ASM_ARTIFACTS_DIR)/%.elf: $(ASM_ARTIFACTS_DIR)/%.o
 # Compile rust
 $(RUST_ARTIFACTS_DIR)/%.elf: $(RUST_PROGRAMS_DIR)/%/Cargo.toml
 	cd $(RUST_PROGRAMS_DIR)/$* && \
-		cargo build build --release \
+		cargo build --release \
 			--target riscv32im-lambda-vm-elf \
 			-Z build-std=core,alloc,std,compiler_builtins,panic_abort \
 			-Z build-std-features=compiler-builtins-mem 
