@@ -49,6 +49,32 @@
   }).map(clean_iter)
 }
 
+#let render_chip_padding_table(chip, config) = {
+  // Whether `var` is a preprocessed variable.
+  let is_preprocessed(var) = {
+    config.variables.types
+    .filter(t => t.label == var.type)
+    .all(t => t.at("preprocessed", default: false))
+  }
+
+  let instantiated_vars = config.variables.categories.instantiated.map(c => chip.variables.at(c)).flatten()
+
+  show figure: set block(breakable: true)
+  figure(table(
+    columns: (auto, auto, auto),
+    inset: 6pt,
+    align: (right + top, center + top, left + top),
+    stroke: none,
+    table.header([*Column*], [], [*Padding value*]),
+    table.hline(stroke: stroke(thickness: 2pt)),
+    ..for var in instantiated_vars {
+      if not is_preprocessed(var) {
+        ([#raw(var.name)], [$:=$], [#expr_to_math(var.pad)],)
+      }
+    },
+  ), caption: [Overview of padding values for #chip.name chip.])
+}
+
 /// Generates a table listing `chip`'s columns.
 #let render_chip_column_table(chip, config) = {
 
