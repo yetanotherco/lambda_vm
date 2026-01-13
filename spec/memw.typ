@@ -46,3 +46,4 @@ This chip contributes the following to the lookup argument.
 - MEMB chip that deals does a one-byte write to remove old_timestamp from here (uncertain tradeoffs)
 - Compute `base_address[1] + 1` once and have high words of `address_add` as Words
 - Improve overflow trapping somehow so we don't need `LT` (could tie into previous one by checking carry bit of the +1)
+- Check if `old_timestamp` is already range_checked by inclusion in the memory argument
