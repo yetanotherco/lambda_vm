@@ -374,6 +374,15 @@ pub fn columns2rows<F>(columns: Vec<Vec<F>>) -> Vec<Vec<F>>
 where
     F: Clone,
 {
+    columns2rows_ref(&columns)
+}
+
+/// Converts column-major data to row-major without consuming the input.
+/// More efficient when the caller still needs the original column data.
+pub fn columns2rows_ref<F>(columns: &[Vec<F>]) -> Vec<Vec<F>>
+where
+    F: Clone,
+{
     let num_rows = columns[0].len();
     let num_cols = columns.len();
 

@@ -23,7 +23,7 @@ use crate::domain::new_domain;
 use crate::fri;
 use crate::proof::stark::{DeepPolynomialOpenings, PolynomialOpenings};
 use crate::table::Table;
-use crate::trace::{LDETraceTable, columns2rows};
+use crate::trace::{LDETraceTable, columns2rows_ref};
 
 use super::config::{BatchedMerkleTree, Commitment};
 use super::constraints::evaluator::ConstraintEvaluator;
@@ -102,22 +102,14 @@ where
     FieldElement<Field>: AsBytes,
     FieldElement<FieldExtension>: AsBytes,
 {
-    /// Returns the full list of the polynomials interpolating the trace. It includes both
-    /// main and auxiliary trace polynomials. The main trace polynomials are casted to
-    /// polynomials with coefficients over `Self::FieldExtension`.
-    fn all_trace_polys(&self) -> Vec<Polynomial<FieldElement<FieldExtension>>> {
-        let mut trace_polys: Vec<_> = self
-            .main
-            .trace_polys
-            .clone()
-            .into_iter()
-            .map(|poly| poly.to_extension())
-            .collect();
+    /// Returns references to the main trace polynomials (in base field).
+    fn main_trace_polys(&self) -> &[Polynomial<FieldElement<Field>>] {
+        &self.main.trace_polys
+    }
 
-        if let Some(aux) = &self.aux {
-            trace_polys.extend_from_slice(&aux.trace_polys.to_owned())
-        }
-        trace_polys
+    /// Returns references to the auxiliary trace polynomials (in extension field), if any.
+    fn aux_trace_polys(&self) -> Option<&[Polynomial<FieldElement<FieldExtension>>]> {
+        self.aux.as_ref().map(|aux| aux.trace_polys.as_slice())
     }
 }
 
@@ -246,22 +238,28 @@ pub trait IsStarkProver<
         let trace_polys = trace.compute_trace_polys_main::<Field>();
 
         // Evaluate those polynomials t_j on the large domain D_LDE.
-        let lde_trace_evaluations =
+        let mut lde_trace_evaluations =
             Self::compute_lde_trace_evaluations::<Field>(&trace_polys, domain);
 
-        let mut lde_trace_permuted = lde_trace_evaluations.clone();
-        for col in lde_trace_permuted.iter_mut() {
+        // Bit-reverse permute in-place for Merkle commitment
+        // (bit-reverse is self-inverse, so we can restore by permuting again)
+        for col in lde_trace_evaluations.iter_mut() {
             in_place_bit_reverse_permute(col);
         }
 
-        // Compute commitment.
-        let lde_trace_permuted_rows = columns2rows(lde_trace_permuted);
+        // Compute commitment using reference (doesn't consume data)
+        let lde_trace_permuted_rows = columns2rows_ref(&lde_trace_evaluations);
 
         let (lde_trace_merkle_tree, lde_trace_merkle_root) =
             Self::batch_commit_main(&lde_trace_permuted_rows)?;
 
         // >>>> Send commitment.
         transcript.append_bytes(&lde_trace_merkle_root);
+
+        // Restore original (unpermuted) order by applying bit-reverse again
+        for col in lde_trace_evaluations.iter_mut() {
+            in_place_bit_reverse_permute(col);
+        }
 
         Some((
             trace_polys,
@@ -298,21 +296,27 @@ pub trait IsStarkProver<
         let trace_polys = trace.compute_trace_polys_aux::<Field>();
 
         // Evaluate those polynomials t_j on the large domain D_LDE.
-        let lde_trace_evaluations = Self::compute_lde_trace_evaluations(&trace_polys, domain);
+        let mut lde_trace_evaluations = Self::compute_lde_trace_evaluations(&trace_polys, domain);
 
-        let mut lde_trace_permuted = lde_trace_evaluations.clone();
-        for col in lde_trace_permuted.iter_mut() {
+        // Bit-reverse permute in-place for Merkle commitment
+        // (bit-reverse is self-inverse, so we can restore by permuting again)
+        for col in lde_trace_evaluations.iter_mut() {
             in_place_bit_reverse_permute(col);
         }
 
-        // Compute commitment.
-        let lde_trace_permuted_rows = columns2rows(lde_trace_permuted);
+        // Compute commitment using reference (doesn't consume data)
+        let lde_trace_permuted_rows = columns2rows_ref(&lde_trace_evaluations);
 
         let (lde_trace_merkle_tree, lde_trace_merkle_root) =
             Self::batch_commit_extension(&lde_trace_permuted_rows)?;
 
         // >>>> Send commitment.
         transcript.append_bytes(&lde_trace_merkle_root);
+
+        // Restore original (unpermuted) order by applying bit-reverse again
+        for col in lde_trace_evaluations.iter_mut() {
+            in_place_bit_reverse_permute(col);
+        }
 
         Some((
             trace_polys,
@@ -588,8 +592,10 @@ pub trait IsStarkProver<
         let gammas = deep_composition_coefficients;
 
         // Compute p₀ (deep composition polynomial)
+        // Uses separate main/aux trace polys to avoid unnecessary field extension conversions
         let deep_composition_poly = Self::compute_deep_composition_poly(
-            &round_1_result.all_trace_polys(),
+            round_1_result.main_trace_polys(),
+            round_1_result.aux_trace_polys(),
             round_2_result,
             round_3_result,
             z,
@@ -655,9 +661,13 @@ pub trait IsStarkProver<
     /// Returns the DEEP composition polynomial that the prover then commits to using
     /// FRI. This polynomial is a linear combination of the trace polynomial and the
     /// composition polynomial, with coefficients sampled by the verifier (i.e. using Fiat-Shamir).
+    ///
+    /// This version avoids unnecessary field extension conversions by processing main trace
+    /// polynomials (in base field) and auxiliary trace polynomials (in extension field) separately.
     #[allow(clippy::too_many_arguments)]
     fn compute_deep_composition_poly(
-        trace_polys: &[Polynomial<FieldElement<FieldExtension>>],
+        main_trace_polys: &[Polynomial<FieldElement<Field>>],
+        aux_trace_polys: Option<&[Polynomial<FieldElement<FieldExtension>>]>,
         round_2_result: &Round2<FieldExtension>,
         round_3_result: &Round3<FieldExtension>,
         z: &FieldElement<FieldExtension>,
@@ -691,15 +701,17 @@ pub trait IsStarkProver<
         // ∑ ⱼₖ [ 𝛾ₖ ( tⱼ − tⱼ(z) ) / ( X − zgᵏ )]
 
         let trace_evaluations_columns = &trace_frame_evaluations.columns();
+        let num_main = main_trace_polys.len();
 
+        // Process main trace polynomials (base field) - no conversion needed
         #[cfg(feature = "parallel")]
-        let trace_terms = trace_polys
+        let main_trace_terms = main_trace_polys
             .par_iter()
             .enumerate()
             .fold(Polynomial::zero, |trace_terms, (i, t_j)| {
                 let gammas_i = &trace_terms_gammas[i];
                 let trace_evaluations_i = &trace_evaluations_columns[i];
-                Self::compute_trace_term(
+                Self::compute_trace_term_base(
                     &trace_terms,
                     t_j,
                     gammas_i,
@@ -710,14 +722,14 @@ pub trait IsStarkProver<
             .reduce(Polynomial::zero, |a, b| a + b);
 
         #[cfg(not(feature = "parallel"))]
-        let trace_terms =
-            trace_polys
+        let main_trace_terms =
+            main_trace_polys
                 .iter()
                 .enumerate()
                 .fold(Polynomial::zero(), |trace_terms, (i, t_j)| {
                     let gammas_i = &trace_terms_gammas[i];
                     let trace_evaluations_i = &trace_evaluations_columns[i];
-                    Self::compute_trace_term(
+                    Self::compute_trace_term_base(
                         &trace_terms,
                         t_j,
                         gammas_i,
@@ -726,14 +738,87 @@ pub trait IsStarkProver<
                     )
                 });
 
-        h_terms + trace_terms
+        // Process auxiliary trace polynomials (extension field) if present
+        let aux_trace_terms = if let Some(aux_polys) = aux_trace_polys {
+            #[cfg(feature = "parallel")]
+            let result = aux_polys
+                .par_iter()
+                .enumerate()
+                .fold(Polynomial::zero, |trace_terms, (i, t_j)| {
+                    let gammas_i = &trace_terms_gammas[num_main + i];
+                    let trace_evaluations_i = &trace_evaluations_columns[num_main + i];
+                    Self::compute_trace_term_ext(
+                        &trace_terms,
+                        t_j,
+                        gammas_i,
+                        trace_evaluations_i,
+                        (z, primitive_root),
+                    )
+                })
+                .reduce(Polynomial::zero, |a, b| a + b);
+
+            #[cfg(not(feature = "parallel"))]
+            let result =
+                aux_polys
+                    .iter()
+                    .enumerate()
+                    .fold(Polynomial::zero(), |trace_terms, (i, t_j)| {
+                        let gammas_i = &trace_terms_gammas[num_main + i];
+                        let trace_evaluations_i = &trace_evaluations_columns[num_main + i];
+                        Self::compute_trace_term_ext(
+                            &trace_terms,
+                            t_j,
+                            gammas_i,
+                            trace_evaluations_i,
+                            (z, primitive_root),
+                        )
+                    });
+            result
+        } else {
+            Polynomial::zero()
+        };
+
+        h_terms + main_trace_terms + aux_trace_terms
     }
 
-    // FIXME: FIX THIS DOCS!
-    /// Adds to `accumulator` the term corresponding to the trace polynomial `t_j` of the Deep
-    /// composition polynomial. That is, returns `accumulator + \sum_i \gamma_i \frac{ t_j - t_j(zg^i) }{ X - zg^i }`,
-    /// where `i` ranges from `T * j` to `T * j + T - 1`, where `T` is the number of offsets in every frame.
-    fn compute_trace_term(
+    /// Adds to `accumulator` the term corresponding to a base field trace polynomial `t_j` of the Deep
+    /// composition polynomial. Uses mixed-field operations to avoid converting base field polynomials
+    /// to extension field.
+    ///
+    /// Uses `ruffini_division` which directly computes `(P - P(b)) / (X - b)` with mixed-field support.
+    fn compute_trace_term_base(
+        accumulator: &Polynomial<FieldElement<FieldExtension>>,
+        trace_term_poly: &Polynomial<FieldElement<Field>>,
+        trace_terms_gammas: &[FieldElement<FieldExtension>],
+        trace_frame_evaluations: &[FieldElement<FieldExtension>],
+        (z, primitive_root): (&FieldElement<FieldExtension>, &FieldElement<Field>),
+    ) -> Polynomial<FieldElement<FieldExtension>>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        let trace_int = trace_frame_evaluations
+            .iter()
+            .enumerate()
+            .zip(trace_terms_gammas)
+            .fold(
+                Polynomial::zero(),
+                |trace_agg, ((offset, _trace_term_poly_evaluation), trace_gamma)| {
+                    // z_shifted = z * g^offset where g is the primitive root
+                    let z_shifted = primitive_root.pow(offset) * z;
+                    // ruffini_division computes (P - P(z_shifted)) / (X - z_shifted) directly
+                    // with F: IsSubFieldOf<FieldExtension> support
+                    let poly = trace_term_poly.ruffini_division(&z_shifted);
+                    trace_agg + &poly * trace_gamma
+                },
+            );
+
+        accumulator + trace_int
+    }
+
+    /// Adds to `accumulator` the term corresponding to an extension field trace polynomial `t_j` of the Deep
+    /// composition polynomial. Used for auxiliary trace polynomials which are already in extension field.
+    fn compute_trace_term_ext(
         accumulator: &Polynomial<FieldElement<FieldExtension>>,
         trace_term_poly: &Polynomial<FieldElement<FieldExtension>>,
         trace_terms_gammas: &[FieldElement<FieldExtension>],
@@ -750,12 +835,11 @@ pub trait IsStarkProver<
             .zip(trace_terms_gammas)
             .fold(
                 Polynomial::zero(),
-                |trace_agg, ((offset, trace_term_poly_evaluation), trace_gamma)| {
-                    // @@@ this can be pre-computed
+                |trace_agg, ((offset, _trace_term_poly_evaluation), trace_gamma)| {
                     let z_shifted = primitive_root.pow(offset) * z;
-                    let mut poly = trace_term_poly - trace_term_poly_evaluation;
-                    poly.ruffini_division_inplace(&z_shifted);
-                    trace_agg + poly * trace_gamma
+                    // ruffini_division computes (P - P(z_shifted)) / (X - z_shifted) directly
+                    let poly = trace_term_poly.ruffini_division(&z_shifted);
+                    trace_agg + &poly * trace_gamma
                 },
             );
 
