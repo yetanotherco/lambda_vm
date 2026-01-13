@@ -6,6 +6,7 @@
   total_nr_instantiated_columns,
   render_constraint_table,
   render_chip_assumptions,
+  render_chip_padding_table,
 )
 
 #let config = load_config()
@@ -92,3 +93,9 @@ We constrain `lhs_is_negative` and `rhs_is_negative` according to their definiti
 === Lookup
 The #mul chip contributes the following to the lookup:
 #render_constraint_table(chip, config, groups: "lookup")
+
+== Padding
+
+The table can be padded to the next power of two with the following value assignments:
+
+#render_chip_padding_table(chip, config)

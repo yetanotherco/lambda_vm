@@ -6,26 +6,31 @@ name = "SHIFT"
 name = "in"
 type = "DWordHL"
 desc = "The value being shifted"
+pad = 0
 
 [[variables.input]]
 name = "shift"
 type = "Byte"
 desc = "Number of bits to shift `in` by."
+pad = 0
 
 [[variables.input]]
 name = "direction"
 type = "Bit"
 desc = "Whether to shift left (0) or right (1)."
+pad = 0
 
 [[variables.input]]
 name = "signed"
 type = "Bit"
 desc = "Whether to interpret `in` as a signed integer."
+pad = 0
 
 [[variables.input]]
 name = "word_instr"
 type = "Bit"
 desc = "Whether this is a Word-instruction (1) or not (0)."
+pad = 0
 
 
 # Output
@@ -34,6 +39,7 @@ desc = "Whether this is a Word-instruction (1) or not (0)."
 name = "out"
 type = "DWordWL"
 desc = "$#`in <</>>/>>>` (#`shift` mod 32 dot (2 - #`word_instr`))$"
+pad = 0
 
 # Auxiliary
 
@@ -41,31 +47,37 @@ desc = "$#`in <</>>/>>>` (#`shift` mod 32 dot (2 - #`word_instr`))$"
 name = "is_negative"
 type = "Bit"
 desc = "Whether `in` is negative"
+pad = 0
 
 [[variables.auxiliary]]
 name = "bit_shift"
 type = "Byte"
 desc = "Value by which to shift `in` to obtain `X` and `Y`"
+pad = 0
 
 [[variables.auxiliary]]
 name = "zbs"
 type = "Bit"
 desc = "Whether `bit_shift` is zero (1) or not (0)."
+pad = 1
 
 [[variables.auxiliary]]
 name = "X"
 type = ["Half", 5]
 desc = "scratch variable."
+pad = 0 # TODO: array
 
 [[variables.auxiliary]]
 name = "Y"
 type = ["Half", 4]
 desc = "scratch variable."
+pad = 0 # TODO: array
 
 [[variables.auxiliary]]
 name = "limb_shift"
 type = ["Bit", 4]
 desc = "One-hot vector indicating whether $floor.l #`shift` / 16 floor.r equiv i mod s$, where $s = 2$ when $#`word_instr` = 1$ and $4$ otherwise."
+pad = 0 # TODO: array
 
 # Virtual
 
@@ -114,6 +126,7 @@ def = {idx="i", range=[0, 3], poly=["+", ["*", "left", ["sum", ["=", "j", 0], "i
 name = "μ"
 type = "Bit"
 desc = ""
+pad = 0
 
 
 

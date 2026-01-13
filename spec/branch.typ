@@ -6,6 +6,7 @@
   total_nr_variables,
   total_nr_instantiated_columns,
   render_constraint_table,
+  render_chip_padding_table,
 )
 
 #let config = load_config()
@@ -36,3 +37,8 @@ The range checks on `unmasked_low_byte` and `next_pc_low[0]` are performed impli
 This chip contributes the following to the lookup argument.
 #render_constraint_table(chip, config, groups: "output")
 
+== Padding
+
+The table can be padded to the next power of two with the following value assignments:
+
+#render_chip_padding_table(chip, config)
