@@ -104,21 +104,21 @@ name = "intra_limb_left"
 type = "DWordHL"
 desc = "`in << (shift % 16)` if `left`"
 def = {idx="i", polys=[
-    {range=0, poly=["idx", "X", 0]},
-    {range=[1, 3], poly=["+", ["idx", "X", "i"], ["idx", "Y", ["-", "i", 1]]]},
+    {iter=0, poly=["idx", "X", 0]},
+    {iter=[1, 3], poly=["+", ["idx", "X", "i"], ["idx", "Y", ["-", "i", 1]]]},
 ]}
 
 [[variables.virtual]]
 name = "intra_limb_right"
 type = "DWordHL"
 desc = "`in >>> (shift % 16)` if `right` and `signed`;\\ `in >> (shift % 16)` if `right` and `!signed`"
-def = {idx="i", range=[0, 3], poly=["+", ["idx", "Y", "i"], ["idx", "X", ["+", "i", 1]]]}
+def = {idx="i", iter=[0, 3], poly=["+", ["idx", "Y", "i"], ["idx", "X", ["+", "i", 1]]]}
 
 [[variables.virtual]]
 name = "shifted"
 type = "DWordHL"
 desc = "$#`in <</>>/>>>` (#`shift` mod 32 dot (2 - #`word_instr`))$"
-def = {idx="i", range=[0, 3], poly=["+", ["*", "left", ["sum", ["=", "j", 0], "i", ["*", ["idx", "limb_shift", "j"], ["idx", "intra_limb_left", ["-", "i", "j"]]]]], ["*", "right", ["+", ["sum", ["=", "j", 0], ["-", 3, "i"], ["*", ["idx", "limb_shift", "j"], ["idx", "intra_limb_right", ["+", "i", "j"]]]], ["*", "extension", ["sum", ["=", "j", ["-", 3, "i"]], 3, ["idx", "limb_shift", "j"]]]]]]}
+def = {idx="i", iter=[0, 3], poly=["+", ["*", "left", ["sum", ["=", "j", 0], "i", ["*", ["idx", "limb_shift", "j"], ["idx", "intra_limb_left", ["-", "i", "j"]]]]], ["*", "right", ["+", ["sum", ["=", "j", 0], ["-", 3, "i"], ["*", ["idx", "limb_shift", "j"], ["idx", "intra_limb_right", ["+", "i", "j"]]]], ["*", "extension", ["sum", ["=", "j", ["-", 3, "i"]], 3, ["idx", "limb_shift", "j"]]]]]]}
 
 # Multiplicities
 
@@ -134,7 +134,7 @@ pad = 0
 
 [[assumptions]]
 desc = "`IS_HALFWORD[in[i]]`"
-range = ["i", 0, 3]
+iter = ["i", 0, 3]
 ref = "shift:a:range_in"
 
 [[assumptions]]
@@ -214,7 +214,7 @@ kind = "interaction"
 tag = "HWSL"
 input = [["idx", "in", "i"], "bit_shift"]
 output = ["idx", "X", "i"]
-range = ["i", 0, 3]
+iter = ["i", 0, 3]
 ref = "shift:c:hwsl_if_not_zero"
 multiplicity = ["not", "zbs"]
 
@@ -222,7 +222,7 @@ multiplicity = ["not", "zbs"]
 kind = "arith"
 constraint = "$#`zbs` => #`X[i]` = #`in[i]` dot #`left`$"
 poly = ["*", "zbs", ["-", ["idx", "X", "i"], ["*", ["idx", "in", "i"], "left"]]]
-range = ["i", 0, 3]
+iter = ["i", 0, 3]
 ref = "shift:c:zbs_implies_X"
 
 [[constraints.intra_limb_shift]]
@@ -244,7 +244,7 @@ kind = "interaction"
 tag = "HWSLC"
 input = [["idx", "in", "i"], "bit_shift"]
 output = ["idx", "Y", "i"]
-range = ["i", 0, 3]
+iter = ["i", 0, 3]
 ref = "shift:c:hwslc_if_not_zero"
 multiplicity = ["not", "zbs"]
 
@@ -252,7 +252,7 @@ multiplicity = ["not", "zbs"]
 kind = "arith"
 constraint = "$#`zbs` => #`Y[i]` = #`in[i]` dot #`right`$"
 poly = ["*", "zbs", ["-", ["idx", "Y", "i"], ["*", ["idx", "in", "i"], "right"]]]
-range = ["i", 0, 3]
+iter = ["i", 0, 3]
 ref = "shift:c:zbs_implies_Y"
 
 
@@ -263,7 +263,7 @@ name = "limb_shifting"
 kind = "template"
 tag = "IS_BIT"
 input = [["idx", "limb_shift", "i"]]
-range = ["i", 0, 3]
+iter = ["i", 0, 3]
 ref = "shift:c:limb_shift_is_bit"
 
 [[constraints.limb_shifting]]
@@ -278,7 +278,7 @@ multiplicity = "μ"
 kind = "arith"
 constraint = "$#`out[:2]` = #`shifted[:4]`$"
 poly = ["-", ["idx", "out", "i"], ["idx", ["cast", "shifted", "DWordWL"], "i"]]
-range = ["i", 0, 1]
+iter = ["i", 0, 1]
 ref = "shift:c:out_eq_shifted"
 
 
