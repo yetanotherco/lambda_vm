@@ -215,12 +215,12 @@ fn create_cpu_air_for_prover(
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![
             TableInteraction {
-                flag_columns: vec![0],
+                multiplicity_column: 0,
                 value_columns: vec![2, 3, 4],
                 is_sender: true,
             },
             TableInteraction {
-                flag_columns: vec![1],
+                multiplicity_column: 1,
                 value_columns: vec![2, 3, 4],
                 is_sender: true,
             },
@@ -246,12 +246,12 @@ fn create_cpu_air_for_verifier(
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![
             TableInteraction {
-                flag_columns: vec![0],
+                multiplicity_column: 0,
                 value_columns: vec![2, 3, 4],
                 is_sender: true,
             },
             TableInteraction {
-                flag_columns: vec![1],
+                multiplicity_column: 1,
                 value_columns: vec![2, 3, 4],
                 is_sender: true,
             },
@@ -276,7 +276,7 @@ fn create_add_air_for_prover(
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![TableInteraction {
-            flag_columns: vec![3],
+            multiplicity_column: 3,
             value_columns: vec![0, 1, 2],
             is_sender: false,
         }],
@@ -300,7 +300,7 @@ fn create_add_air_for_verifier(
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![TableInteraction {
-            flag_columns: vec![3],
+            multiplicity_column: 3,
             value_columns: vec![0, 1, 2],
             is_sender: false,
         }],
@@ -324,7 +324,7 @@ fn create_mul_air_for_prover(
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![TableInteraction {
-            flag_columns: vec![3],
+            multiplicity_column: 3,
             value_columns: vec![0, 1, 2],
             is_sender: false,
         }],
@@ -348,7 +348,7 @@ fn create_mul_air_for_verifier(
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![TableInteraction {
-            flag_columns: vec![3],
+            multiplicity_column: 3,
             value_columns: vec![0, 1, 2],
             is_sender: false,
         }],

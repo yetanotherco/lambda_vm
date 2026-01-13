@@ -23,17 +23,17 @@ pub fn new_cpu_air_with_lookup(
         interactions: vec![
             // Interaction with ADD table (CPU sends to ADD bus)
             TableInteraction {
-                // ADD flag column
-                flag_columns: vec![0],
-                // values a , b, c
+                // ADD multiplicity column
+                multiplicity_column: 0,
+                // values a, b, c
                 value_columns: vec![2, 3, 4],
                 is_sender: true,
             },
             // Interaction with MUL table (CPU sends to MUL bus)
             TableInteraction {
-                // MUL flag column
-                flag_columns: vec![1],
-                // values a , b, c
+                // MUL multiplicity column
+                multiplicity_column: 1,
+                // values a, b, c
                 value_columns: vec![2, 3, 4],
                 is_sender: true,
             },
@@ -63,8 +63,8 @@ pub fn new_mul_air_with_lookup(
             // Interaction with CPU table (MUL table receives from MUL bus)
             TableInteraction {
                 // multiplicity column
-                flag_columns: vec![3],
-                // values a , b, c
+                multiplicity_column: 3,
+                // values a, b, c
                 value_columns: vec![0, 1, 2],
                 is_sender: false,
             },
@@ -95,8 +95,8 @@ pub fn new_add_air_with_lookup(
             // Interaction with CPU table (ADD table receives from ADD bus)
             TableInteraction {
                 // multiplicity column
-                flag_columns: vec![3],
-                // values a , b, c
+                multiplicity_column: 3,
+                // values a, b, c
                 value_columns: vec![0, 1, 2],
                 is_sender: false,
             },

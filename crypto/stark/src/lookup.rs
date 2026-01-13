@@ -318,11 +318,14 @@ pub struct AuxiliaryTraceBuildData {
     pub interactions: Vec<TableInteraction>,
 }
 
-/// Struct representing a lookup interaction for a given table
-/// Contains the flag and value columns involved in said interaction
+/// Struct representing a lookup interaction for a given table.
+/// Contains the multiplicity and value columns involved in said interaction.
 #[derive(Clone)]
 pub struct TableInteraction {
-    pub flag_columns: Vec<usize>,
+    /// Column index containing the multiplicity for this interaction.
+    /// Can be a binary flag (0 or 1) or a general multiplicity (0, 1, 2, ...).
+    /// Determines how many times each row contributes to the bus.
+    pub multiplicity_column: usize,
     pub value_columns: Vec<usize>,
     /// Whether this side of the interaction is a sender (true) or receiver (false).
     /// Senders contribute positive values to the bus sum, receivers contribute negative.
@@ -391,11 +394,7 @@ fn build_auxiliary_trace_column<F, E>(
         .iter()
         .map(|i| &main_segment_cols[*i])
         .collect::<Vec<_>>();
-    let flags = table_interaction
-        .flag_columns
-        .iter()
-        .map(|i| &main_segment_cols[*i])
-        .collect::<Vec<_>>();
+    let multiplicity = &main_segment_cols[table_interaction.multiplicity_column];
 
     // LogUp challenges (must be shared across all tables for bus to balance)
     let z = &challenges[LOGUP_CHALLENGE_Z];
@@ -417,10 +416,8 @@ fn build_auxiliary_trace_column<F, E>(
         + z)
         .inv()
         .unwrap();
-    // Sum of all flags
-    let flag: FieldElement<F> = flags.iter().map(|flag_column| flag_column[0].clone()).sum();
-    // Fill first aux column row (should be overwritten next)
-    aux_col.push(flag * fingerprint_inv);
+    // Fill first aux column row
+    aux_col.push(&multiplicity[0] * fingerprint_inv);
 
     for i in 0..trace_len - 1 {
         // fingerprint = z - (v[0] * alpha^0 + v[1] * alpha^1 +...+ value[n] * alpha^n)
@@ -433,13 +430,8 @@ fn build_auxiliary_trace_column<F, E>(
             + z)
             .inv()
             .unwrap();
-        // Sum of all flags
-        let flag: FieldElement<F> = flags
-            .iter()
-            .map(|flag_column| flag_column[i + 1].clone())
-            .sum();
         // Fill the auxiliary column row
-        aux_col.push(&aux_col[i] + flag * fingerprint_inv);
+        aux_col.push(&aux_col[i] + &multiplicity[i + 1] * fingerprint_inv);
     }
 
     for (i, aux_elem) in aux_col.iter().enumerate().take(trace.num_rows()) {
@@ -448,9 +440,9 @@ fn build_auxiliary_trace_column<F, E>(
 }
 
 // Constraint for each auxiliary column representing a table interaction
-// Checks the calculation of the next auxiliary column value based on the next row's flags and values
+// Checks the calculation of the next auxiliary column value based on the next row's multiplicity and values
 struct LookupTransitionConstraint {
-    // Indicates columns with flags and values used to build the auxiliary column
+    // Indicates columns with multiplicity and values used to build the auxiliary column
     interaction: TableInteraction,
     // Index of the auxiliary column
     interaction_number: usize,
@@ -509,11 +501,9 @@ where
             let alpha = &rap_challenges[LOGUP_CHALLENGE_ALPHA];
 
             // Main frame elements
-            let flag: FieldElement<A> = interaction
-                .flag_columns
-                .iter()
-                .map(|c| second_step.get_main_evaluation_element(0, *c).clone())
-                .sum();
+            let multiplicity: FieldElement<A> = second_step
+                .get_main_evaluation_element(0, interaction.multiplicity_column)
+                .clone();
             let values = interaction
                 .value_columns
                 .iter()
@@ -533,10 +523,10 @@ where
                 + z;
 
             // We are using the following LogUp equation:
-            // s1 = s0 + flag / fingerprint
-            // 0 =  s0 * fingerprint + flag - s1 * fingerprint
-            // Since constraints must be expressed without division, we multiply each term by sorted_term * unsorted_term:
-            flag + s0 * &fingerprint - s1 * fingerprint
+            // s1 = s0 + multiplicity / fingerprint
+            // 0 = s0 * fingerprint + multiplicity - s1 * fingerprint
+            // Since constraints must be expressed without division, we rearrange:
+            multiplicity + s0 * &fingerprint - s1 * fingerprint
         }
 
         let res = match evaluation_context {
