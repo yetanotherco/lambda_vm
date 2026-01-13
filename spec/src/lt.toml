@@ -7,16 +7,19 @@ name = "LT"
 name = "lhs"
 type = "DWordHHW"
 desc = "The left operand"
+pad = 0
 
 [[variables.input]]
 name = "rhs"
 type = "DWordHHW"
 desc = "The right operand"
+pad = 0
 
 [[variables.input]]
 name = "signed"
 type = "Bit"
 desc = "whether to interpret `lhs` and `rhs` as signed integers (1) or not (0)"
+pad = 0
 
 # Output
 
@@ -24,6 +27,7 @@ desc = "whether to interpret `lhs` and `rhs` as signed integers (1) or not (0)"
 name = "lt"
 type = "Bit"
 desc = "Whether $#`lhs` < #`rhs`$, taking `signed` into account"
+pad = 0
 
 
 # Auxiliary
@@ -32,16 +36,19 @@ desc = "Whether $#`lhs` < #`rhs`$, taking `signed` into account"
 name = "lhs_sub_rhs"
 type = "DWordHL"
 desc = "$#`lhs` - #`rhs`$"
+pad = 0
 
 [[variables.auxiliary]]
 name = "lhs_msb"
 type = "Bit"
 desc = "The most significant bit of `lhs`"
+pad = 0
 
 [[variables.auxiliary]]
 name = "rhs_msb"
 type = "Bit"
 desc = "The most significant bit of `rhs`"
+pad = 0
 
 # Virtual
 
@@ -67,6 +74,7 @@ def = ["idx", "carry", 1]
 name = "μ"
 type = "Bit"
 desc = ""
+pad = 0
 
 
 [[assumptions]]

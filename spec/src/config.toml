@@ -94,6 +94,7 @@ desc = """\
 label = "Timestamp"
 subtypes = ["DWordWL"]
 desc = "A preprocessed column holding timestamps as `DWordWL`. Row `i` of the column contains the value $2^2 dot (i + 1)$. Used in the CPU chip, see there for more details about the magic number."
+preprocessed = true
 
 [variables.categories]
 all = ["input", "output", "auxiliary", "virtual", "multiplicity", "condition"]
