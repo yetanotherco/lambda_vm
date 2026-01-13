@@ -29,6 +29,7 @@ The `MUL` chip is comprised of #nr_variables variables that are expressed using 
 }
 
 == Assumptions
+The following range checks are assumed to be performed/enforced outside of this chip:
 #render_chip_assumptions(chip, config)
 
 == Constraints
@@ -39,13 +40,13 @@ $
 (sum_(j=0)^3 2^(16j) dot #`lhs`_j) dot (sum_(i=0)^3 2^(16i) dot #`rhs`_i) mod 2^128.
 $
 If `lhs` and `rhs` are signed instead, the computation remains nearly identical: 
-one must sign extend `lhs` and `rhs` to twice their size --- forming `lhs_ext` and `rhs_ext` respectively --- and compute
+based on their signs, one must either zero or one-extend `lhs` and `rhs` --- forming `lhs_ext` and `rhs_ext` respectively --- and compute their product $mod 2^128$:
 $
 (sum_(j=0)^7 2^(16j) dot #`lhs_ext`_j) dot (sum_(i=0)^7 2^(16i) dot #`rhs_ext`_i) mod 2^128.
 $
-where the limbs of `lhs_ext` and `rhs_ext` are treated as _unsigned_ integers.
-Note that by setting the extension limbs of `lhs` and/or `rhs` to $0$ when the integer is unsigned or signed and positive, the second formula still applies.
-Observe that we can rewrite this formula as
+where `lhs_ext` and `rhs_ext` are treated as _unsigned_ integers.
+Note that by setting the extension limbs of `lhs` and/or `rhs` to $0$ when the integer is (i) unsigned or (ii) signed and non-negative, this second formula still applies.
+For the purposes of constraining the multiplication operation, we rewrite this formula as
 #show math.equation: set block(breakable: true)
 $
   &(sum_(j=0)^7 2^(16j) dot #`lhs_ext`_j) dot (sum_(i=0)^7 2^(16i) dot #`rhs_ext`_i) mod 2^128 \
