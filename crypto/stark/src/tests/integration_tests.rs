@@ -63,8 +63,7 @@ fn test_prove_simple_periodic_8() {
         a1: Felt252::from(8),
     };
 
-    let air =
-        SimplePeriodicAIR::<Stark252PrimeField>::new(&pub_inputs, &proof_options);
+    let air = SimplePeriodicAIR::<Stark252PrimeField>::new(&pub_inputs, &proof_options);
 
     let proof = Prover::prove(&air, &mut trace, &mut StoneProverTranscript::new(&[])).unwrap();
     assert!(Verifier::verify(
@@ -85,8 +84,7 @@ fn test_prove_simple_periodic_32() {
         a1: Felt252::from(32768),
     };
 
-    let air =
-        SimplePeriodicAIR::<Stark252PrimeField>::new(&pub_inputs, &proof_options);
+    let air = SimplePeriodicAIR::<Stark252PrimeField>::new(&pub_inputs, &proof_options);
 
     let proof = Prover::prove(&air, &mut trace, &mut StoneProverTranscript::new(&[])).unwrap();
 
@@ -297,8 +295,10 @@ fn test_prove_log_read_only_memory() {
     let mut trace = read_only_logup_trace(address_col, value_col);
     let proof_options = ProofOptions::default_test_options();
 
-    let air =
-        LogReadOnlyRAP::<Babybear31PrimeField, Degree4BabyBearExtensionField>::new(&pub_inputs, &proof_options);
+    let air = LogReadOnlyRAP::<Babybear31PrimeField, Degree4BabyBearExtensionField>::new(
+        &pub_inputs,
+        &proof_options,
+    );
 
     let proof = Prover::prove(
         &air,
@@ -431,10 +431,14 @@ fn test_multi_prove_2_tables_small_field() {
     let mut trace_2 = read_only_logup_trace(address_col_2, value_col_2);
     let proof_options = ProofOptions::default_test_options();
 
-    let air_1 =
-        LogReadOnlyRAP::<Babybear31PrimeField, Degree4BabyBearExtensionField>::new(&pub_inputs_1, &proof_options);
-    let air_2 =
-        LogReadOnlyRAP::<Babybear31PrimeField, Degree4BabyBearExtensionField>::new(&pub_inputs_2, &proof_options);
+    let air_1 = LogReadOnlyRAP::<Babybear31PrimeField, Degree4BabyBearExtensionField>::new(
+        &pub_inputs_1,
+        &proof_options,
+    );
+    let air_2 = LogReadOnlyRAP::<Babybear31PrimeField, Degree4BabyBearExtensionField>::new(
+        &pub_inputs_2,
+        &proof_options,
+    );
 
     let airs: Vec<(
         &dyn AIR<

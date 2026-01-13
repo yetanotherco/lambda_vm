@@ -1084,7 +1084,11 @@ pub trait IsStarkProver<
         };
         let trace_length = domain.interpolation_domain_size;
         let num_boundary_constraints = air
-            .boundary_constraints(&round_1_result.rap_challenges, bus_interactions, trace_length)
+            .boundary_constraints(
+                &round_1_result.rap_challenges,
+                bus_interactions,
+                trace_length,
+            )
             .constraints
             .len();
 
@@ -1386,7 +1390,13 @@ mod tests {
             &mut StoneProverTranscript::new(&transcript_init_seed),
         )
         .unwrap();
-        (proof, air, proof_options, transcript_init_seed, trace_length)
+        (
+            proof,
+            air,
+            proof_options,
+            transcript_init_seed,
+            trace_length,
+        )
     }
 
     fn stone_compatibility_case_1_proof() -> StarkProof<Stark252PrimeField, Stark252PrimeField> {

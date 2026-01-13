@@ -120,10 +120,7 @@ where
         1
     }
 
-    fn new(
-        pub_inputs: &Self::PublicInputs,
-        proof_options: &ProofOptions,
-    ) -> Self {
+    fn new(pub_inputs: &Self::PublicInputs, proof_options: &ProofOptions) -> Self {
         let transition_constraints: Vec<
             Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>,
         > = vec![Box::new(PeriodicConstraint::new())];
@@ -153,10 +150,7 @@ where
         trace_length: usize,
     ) -> BoundaryConstraints<Self::Field> {
         let a0 = BoundaryConstraint::new_simple_main(0, self.pub_inputs.a0.clone());
-        let a1 = BoundaryConstraint::new_simple_main(
-            trace_length - 1,
-            self.pub_inputs.a1.clone(),
-        );
+        let a1 = BoundaryConstraint::new_simple_main(trace_length - 1, self.pub_inputs.a1.clone());
 
         BoundaryConstraints::from_constraints(vec![a0, a1])
     }

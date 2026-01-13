@@ -102,10 +102,7 @@ where
         1
     }
 
-    fn new(
-        pub_inputs: &Self::PublicInputs,
-        proof_options: &ProofOptions,
-    ) -> Self {
+    fn new(pub_inputs: &Self::PublicInputs, proof_options: &ProofOptions) -> Self {
         let constraints: Vec<Box<dyn TransitionConstraint<F, F>>> =
             vec![Box::new(FibConstraint::new())];
 

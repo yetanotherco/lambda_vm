@@ -147,10 +147,7 @@ impl AIR for DummyAIR {
         1
     }
 
-    fn new(
-        _pub_inputs: &Self::PublicInputs,
-        proof_options: &ProofOptions,
-    ) -> Self {
+    fn new(_pub_inputs: &Self::PublicInputs, proof_options: &ProofOptions) -> Self {
         let transition_constraints: Vec<
             Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>,
         > = vec![
