@@ -15,13 +15,10 @@ enum SyscallNumbers {
 pub fn print_string(s: &str) {
     unsafe {
         asm!(
-            "mv a0, {ptr}",
-            "mv a1, {len}",
-            "mv a7, {syscall_number}", // syscall number for print
             "ecall",
-            ptr = in(reg) s.as_ptr(),
-            len = in(reg) s.len(),
-            syscall_number = in(reg) SyscallNumbers::Print as usize,
+            in("a0") s.as_ptr(),
+            in("a1") s.len(),
+            in("a7") SyscallNumbers::Print as usize,
         );
     }
 }
@@ -47,13 +44,10 @@ pub unsafe extern "C" fn sys_panic(msg_ptr: *const u8, len: usize) {
     print_string("Sys panic called\n");
     unsafe {
         asm!(
-            "mv a0, {ptr}",
-            "mv a1, {len}",
-            "mv a7, {syscall_number}", // syscall number for panic
             "ecall",
-            ptr = in(reg) msg_ptr,
-            len = in(reg) len,
-            syscall_number = in(reg) SyscallNumbers::Panic as usize,
+            in("a0") msg_ptr,
+            in("a1") len,
+            in("a7") SyscallNumbers::Panic as usize,
         )
     }
 }
@@ -62,13 +56,10 @@ pub fn commit(slice: &[u8]) {
     print_string("commit called\n");
     unsafe {
         asm!(
-            "mv a0, {ptr}",
-            "mv a1, {len}",
-            "mv a7, {syscall_number}", // syscall number for commit
             "ecall",
-            ptr = in(reg) slice.as_ptr(),
-            len = in(reg) slice.len(),
-            syscall_number = in(reg) SyscallNumbers::Commit as usize,
+            in("a0") slice.as_ptr(),
+            in("a1") slice.len(),
+            in("a7") SyscallNumbers::Commit as usize,
         )
     }
 }
@@ -78,11 +69,9 @@ pub fn get_private_input() -> Result<Vec<u8>, SyscallError> {
     let mut dest = vec![0u8; MAX_PRIVATE_INPUT_SIZE];
     unsafe {
         asm!(
-            "mv a0, {ptr}",
-            "mv a7, {syscall_number}", // syscall number for get_private_input
             "ecall",
-            ptr = in(reg) dest.as_mut_ptr(),
-            syscall_number = in(reg) SyscallNumbers::GetPrivateInputs as usize,
+            in("a0") dest.as_mut_ptr(),
+            in("a7") SyscallNumbers::GetPrivateInputs as usize,
         )
     }
     let len = u32::from_le_bytes(
@@ -106,9 +95,8 @@ pub fn sys_halt() -> ! {
     print_string("sys_halt called\n");
     unsafe {
         asm!(
-            "mv a7, {syscall_number}", // syscall number for halt
             "ecall",
-            syscall_number = in(reg) SyscallNumbers::Halt as usize,
+            in("a7") SyscallNumbers::Halt as usize,
         );
     }
     unreachable!()
