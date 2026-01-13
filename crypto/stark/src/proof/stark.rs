@@ -476,8 +476,8 @@ impl StoneCompatibleSerializer {
         A::PublicInputs: AsBytes,
     {
         let mut transcript = StoneProverTranscript::new(&public_inputs.as_bytes());
-        let air = A::new(proof.trace_length, public_inputs, proof_options);
-        let domain = Domain::<Stark252PrimeField>::new(&air);
+        let air = A::new(public_inputs, proof_options);
+        let domain = Domain::<Stark252PrimeField>::new(&air, proof.trace_length);
         let challenges = Verifier::step_1_replay_rounds_and_recover_challenges(
             &air,
             proof,

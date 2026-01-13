@@ -76,7 +76,6 @@ where
     F: IsFFTField,
 {
     context: AirContext,
-    trace_length: usize,
     pub_inputs: QuadraticPublicInputs<F>,
     constraints: Vec<Box<dyn TransitionConstraint<F, F>>>,
 }
@@ -102,7 +101,6 @@ where
     }
 
     fn new(
-        trace_length: usize,
         pub_inputs: &Self::PublicInputs,
         proof_options: &ProofOptions,
     ) -> Self {
@@ -117,7 +115,6 @@ where
         };
 
         Self {
-            trace_length,
             context,
             pub_inputs: pub_inputs.clone(),
             constraints,
@@ -128,6 +125,7 @@ where
         &self,
         _rap_challenges: &[FieldElement<Self::Field>],
         _bus_interactions: Option<&[crate::lookup::BusPublicInputs<Self::FieldExtension>]>,
+        _trace_length: usize,
     ) -> BoundaryConstraints<Self::Field> {
         let a0 = BoundaryConstraint::new_simple_main(0, self.pub_inputs.a0.clone());
 
@@ -144,16 +142,12 @@ where
         &self.context
     }
 
-    fn composition_poly_degree_bound(&self) -> usize {
-        2 * self.trace_length()
+    fn composition_poly_degree_bound(&self, trace_length: usize) -> usize {
+        2 * trace_length
     }
 
     fn trace_layout(&self) -> (usize, usize) {
         (1, 0)
-    }
-
-    fn trace_length(&self) -> usize {
-        self.trace_length
     }
 
     fn pub_inputs(&self) -> &Self::PublicInputs {

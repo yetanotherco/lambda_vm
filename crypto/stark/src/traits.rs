@@ -81,11 +81,7 @@ pub trait AIR: Send + Sync {
 
     fn step_size(&self) -> usize;
 
-    fn new(
-        trace_length: usize,
-        pub_inputs: &Self::PublicInputs,
-        proof_options: &ProofOptions,
-    ) -> Self
+    fn new(pub_inputs: &Self::PublicInputs, proof_options: &ProofOptions) -> Self
     where
         Self: Sized;
 
@@ -116,7 +112,7 @@ pub trait AIR: Send + Sync {
         self.trace_layout().1
     }
 
-    fn composition_poly_degree_bound(&self) -> usize;
+    fn composition_poly_degree_bound(&self, trace_length: usize) -> usize;
 
     /// The method called by the prover to evaluate the transitions corresponding to an evaluation frame.
     /// In the case of the prover, the main evaluation table of the frame takes values in
@@ -139,11 +135,10 @@ pub trait AIR: Send + Sync {
         &self,
         rap_challenges: &[FieldElement<Self::FieldExtension>],
         bus_interactions: Option<&[BusPublicInputs<Self::FieldExtension>]>,
+        trace_length: usize,
     ) -> BoundaryConstraints<Self::FieldExtension>;
 
     fn context(&self) -> &AirContext;
-
-    fn trace_length(&self) -> usize;
 
     fn options(&self) -> &ProofOptions {
         &self.context().proof_options
@@ -157,8 +152,7 @@ pub trait AIR: Send + Sync {
         FieldElement::from(self.options().coset_offset)
     }
 
-    fn trace_primitive_root(&self) -> FieldElement<Self::Field> {
-        let trace_length = self.trace_length();
+    fn trace_primitive_root(&self, trace_length: usize) -> FieldElement<Self::Field> {
         let root_of_unity_order = u64::from(trace_length.trailing_zeros());
 
         Self::Field::get_primitive_root_of_unity(root_of_unity_order).unwrap()
@@ -174,13 +168,16 @@ pub trait AIR: Send + Sync {
         vec![]
     }
 
-    fn get_periodic_column_polynomials(&self) -> Vec<Polynomial<FieldElement<Self::Field>>> {
+    fn get_periodic_column_polynomials(
+        &self,
+        trace_length: usize,
+    ) -> Vec<Polynomial<FieldElement<Self::Field>>> {
         let mut result = Vec::new();
         for periodic_column in self.get_periodic_column_values() {
             let values: Vec<_> = periodic_column
                 .iter()
                 .cycle()
-                .take(self.trace_length())
+                .take(trace_length)
                 .cloned()
                 .collect();
             let poly =

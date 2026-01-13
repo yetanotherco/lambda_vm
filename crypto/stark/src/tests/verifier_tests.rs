@@ -171,22 +171,10 @@ fn test_verify_serialized_multi_table_proofs() {
 
     let proof_options = ProofOptions::default_test_options();
 
-    // Reconstruct AIRs - verifier knows the structure, only needs trace_length from proof
-    let cpu_air = create_cpu_air_for_verifier(
-        received_proofs.proofs[0].trace_length,
-        5, // CPU has 5 main columns - verifier knows this
-        &proof_options,
-    );
-    let add_air = create_add_air_for_verifier(
-        received_proofs.proofs[1].trace_length,
-        4, // ADD has 4 main columns - verifier knows this
-        &proof_options,
-    );
-    let mul_air = create_mul_air_for_verifier(
-        received_proofs.proofs[2].trace_length,
-        4, // MUL has 4 main columns - verifier knows this
-        &proof_options,
-    );
+    // Reconstruct AIRs - verifier knows the structure (columns, interactions)
+    let cpu_air = create_cpu_air_for_verifier(5, &proof_options); // CPU has 5 main columns
+    let add_air = create_add_air_for_verifier(4, &proof_options); // ADD has 4 main columns
+    let mul_air = create_mul_air_for_verifier(4, &proof_options); // MUL has 4 main columns
 
     // Verify the proofs
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
@@ -226,7 +214,7 @@ fn create_cpu_air_for_prover(
             },
         ],
     };
-    AirWithBuses::create(
+    AirWithBuses::from_trace(
         trace,
         auxiliary_trace_build_data,
         proof_options,
@@ -238,7 +226,6 @@ fn create_cpu_air_for_prover(
 
 /// Creates a CPU AIR for the verifier (no trace needed)
 fn create_cpu_air_for_verifier(
-    trace_length: usize,
     num_main_columns: usize,
     proof_options: &ProofOptions,
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
@@ -257,8 +244,7 @@ fn create_cpu_air_for_verifier(
             },
         ],
     };
-    AirWithBuses::create_for_verification(
-        trace_length,
+    AirWithBuses::new(
         num_main_columns,
         auxiliary_trace_build_data,
         proof_options,
@@ -281,7 +267,7 @@ fn create_add_air_for_prover(
             is_sender: false,
         }],
     };
-    AirWithBuses::create(
+    AirWithBuses::from_trace(
         trace,
         auxiliary_trace_build_data,
         proof_options,
@@ -293,7 +279,6 @@ fn create_add_air_for_prover(
 
 /// Creates an ADD AIR for the verifier
 fn create_add_air_for_verifier(
-    trace_length: usize,
     num_main_columns: usize,
     proof_options: &ProofOptions,
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
@@ -305,8 +290,7 @@ fn create_add_air_for_verifier(
             is_sender: false,
         }],
     };
-    AirWithBuses::create_for_verification(
-        trace_length,
+    AirWithBuses::new(
         num_main_columns,
         auxiliary_trace_build_data,
         proof_options,
@@ -329,7 +313,7 @@ fn create_mul_air_for_prover(
             is_sender: false,
         }],
     };
-    AirWithBuses::create(
+    AirWithBuses::from_trace(
         trace,
         auxiliary_trace_build_data,
         proof_options,
@@ -341,7 +325,6 @@ fn create_mul_air_for_prover(
 
 /// Creates a MUL AIR for the verifier
 fn create_mul_air_for_verifier(
-    trace_length: usize,
     num_main_columns: usize,
     proof_options: &ProofOptions,
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
@@ -353,8 +336,7 @@ fn create_mul_air_for_verifier(
             is_sender: false,
         }],
     };
-    AirWithBuses::create_for_verification(
-        trace_length,
+    AirWithBuses::new(
         num_main_columns,
         auxiliary_trace_build_data,
         proof_options,

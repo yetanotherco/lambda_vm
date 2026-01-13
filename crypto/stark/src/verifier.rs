@@ -126,8 +126,9 @@ pub trait IsStarkVerifier<
         } else {
             Some(&proof.bus_interactions[..])
         };
+        let trace_length = proof.trace_length;
         let num_boundary_constraints = air
-            .boundary_constraints(&rap_challenges, bus_interactions)
+            .boundary_constraints(&rap_challenges, bus_interactions, trace_length)
             .constraints
             .len();
 
@@ -251,10 +252,9 @@ pub trait IsStarkVerifier<
         } else {
             Some(&proof.bus_interactions[..])
         };
+        let trace_length = proof.trace_length;
         let boundary_constraints =
-            air.boundary_constraints(&challenges.rap_challenges, bus_interactions);
-
-        let trace_length = air.trace_length();
+            air.boundary_constraints(&challenges.rap_challenges, bus_interactions, trace_length);
         let number_of_b_constraints = boundary_constraints.constraints.len();
 
         #[allow(clippy::type_complexity)]
@@ -298,7 +298,7 @@ pub trait IsStarkVerifier<
                 .fold(FieldElement::<FieldExtension>::zero(), |acc, x| acc + x);
 
         let periodic_values = air
-            .get_periodic_column_polynomials()
+            .get_periodic_column_polynomials(trace_length)
             .iter()
             .map(|poly| poly.evaluate(&challenges.z))
             .collect::<Vec<FieldElement<FieldExtension>>>();
@@ -885,8 +885,9 @@ pub trait IsStarkVerifier<
         } else {
             Some(&proof.bus_interactions[..])
         };
+        let trace_length = proof.trace_length;
         let num_boundary_constraints = air
-            .boundary_constraints(&rap_challenges, bus_interactions)
+            .boundary_constraints(&rap_challenges, bus_interactions, trace_length)
             .constraints
             .len();
 
@@ -1007,7 +1008,7 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        let domain = new_domain(air);
+        let domain = new_domain(air, proof.trace_length);
 
         // Verify there are enough queries
         if proof.query_list.len() < air.options().fri_number_of_queries {

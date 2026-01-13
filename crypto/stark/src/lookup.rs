@@ -51,7 +51,6 @@ pub struct AirWithBuses<
     PI,
 > {
     context: AirContext,
-    trace_length: usize,
     pub_inputs: PI,
     step_size: usize,
     trace_layout: (usize, usize),
@@ -67,10 +66,9 @@ impl<
     PI,
 > AirWithBuses<F, E, B, PI>
 {
-    /// Creates an AirWithBuses for verification without needing the actual trace.
-    /// Use this on the verifier side when you only have the public inputs and proof metadata.
-    pub fn create_for_verification(
-        trace_length: usize,
+    /// Creates an AirWithBuses with LogUp-specific transition constraints.
+    /// If no boundary constraints are needed, use `NullBoundaryConstraintBuilder` as B and () as PI.
+    pub fn new(
         num_main_columns: usize,
         auxiliary_trace_build_data: AuxiliaryTraceBuildData,
         proof_options: &ProofOptions,
@@ -111,7 +109,6 @@ impl<
 
         Self {
             context,
-            trace_length,
             pub_inputs,
             step_size,
             trace_layout,
@@ -121,59 +118,23 @@ impl<
         }
     }
 
-    /// Creates a new AirWithBuses adding LookUp-specific transition constraints to existing constraints
-    /// If no boundary constraints are needed, use `NullBoundaryConstraintBuilder` as B and () as PI
-    pub fn create(
+    /// Convenience constructor that extracts `num_main_columns` from the trace.
+    pub fn from_trace(
         trace: &TraceTable<F, E>,
         auxiliary_trace_build_data: AuxiliaryTraceBuildData,
         proof_options: &ProofOptions,
         step_size: usize,
-        mut transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
+        transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
         pub_inputs: PI,
     ) -> Self {
-        // Add a transition constraint for each auxiliary column representing a table interaction
-        for (i, interaction) in auxiliary_trace_build_data.interactions.iter().enumerate() {
-            let constraint = LookupTransitionConstraint::new(
-                interaction.clone(),
-                i,
-                transition_constraints.len(),
-            );
-            transition_constraints.push(Box::new(constraint));
-        }
-        // Add a transition constraint for the grand sum auxiliary constraint (sum of all previous aux columns) if we have more than one interaction
-        if auxiliary_trace_build_data.interactions.len() > 1 {
-            let grand_sum_constraint = LookupGrandSumTransitionConstraint::new(
-                transition_constraints.len(),
-                auxiliary_trace_build_data.interactions.len(),
-            );
-            transition_constraints.push(Box::new(grand_sum_constraint));
-        }
-
-        // Create Layout
-        // one aux column per lookup interaction + 1 aux column for grand sum (if we have more than one interaction)
-        let num_aux_columns = auxiliary_trace_build_data.interactions.len()
-            + (auxiliary_trace_build_data.interactions.len() > 1) as usize;
-        let trace_layout = (trace.num_main_columns, num_aux_columns);
-
-        // Create context
-        let context = AirContext {
-            proof_options: proof_options.clone(),
-            trace_columns: trace_layout.0 + trace_layout.1,
-            // All lookup transition constraints will evaluate at most 2 rows at a time
-            transition_offsets: vec![0, 1],
-            num_transition_constraints: transition_constraints.len(),
-        };
-
-        Self {
-            context,
-            trace_length: trace.num_rows(),
-            pub_inputs,
-            step_size,
-            trace_layout,
-            transition_constraints,
+        Self::new(
+            trace.num_main_columns,
             auxiliary_trace_build_data,
-            boundary_constraint_builder: PhantomData::<B>,
-        }
+            proof_options,
+            step_size,
+            transition_constraints,
+            pub_inputs,
+        )
     }
 }
 
@@ -195,31 +156,26 @@ where
     }
 
     fn new(
-        _trace_length: usize,
         _pub_inputs: &Self::PublicInputs,
         _proof_options: &crate::proof::options::ProofOptions,
     ) -> Self
     where
         Self: Sized,
     {
-        // AirWithBuses should be created using `create` method
-        unreachable!("AirWithLookUp should only be created by `create` method")
+        // AirWithBuses should be created using `AirWithBuses::new` method
+        unreachable!("AirWithBuses should only be created via AirWithBuses::new()")
     }
 
     fn trace_layout(&self) -> (usize, usize) {
         self.trace_layout
     }
 
-    fn composition_poly_degree_bound(&self) -> usize {
-        self.trace_length() * 2
+    fn composition_poly_degree_bound(&self, trace_length: usize) -> usize {
+        trace_length * 2
     }
 
     fn context(&self) -> &AirContext {
         &self.context
-    }
-
-    fn trace_length(&self) -> usize {
-        self.trace_length
     }
 
     fn pub_inputs(&self) -> &Self::PublicInputs {
@@ -284,6 +240,7 @@ where
         &self,
         rap_challenges: &[FieldElement<E>],
         bus_interactions: Option<&[BusPublicInputs<E>]>,
+        trace_length: usize,
     ) -> BoundaryConstraints<E> {
         let mut boundary_constraints = vec![];
 
@@ -299,7 +256,7 @@ where
                 // Constraint for last row: aux column must end with final_accumulated
                 boundary_constraints.push(BoundaryConstraint::new_aux(
                     i,
-                    self.trace_length - 1,
+                    trace_length - 1,
                     interaction.final_accumulated.clone(),
                 ));
             }

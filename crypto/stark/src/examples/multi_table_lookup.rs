@@ -40,7 +40,7 @@ pub fn new_cpu_air_with_lookup(
         ],
     };
 
-    AirWithBuses::create(
+    AirWithBuses::from_trace(
         trace,
         auxiliary_trace_build_data,
         proof_options,
@@ -71,7 +71,7 @@ pub fn new_mul_air_with_lookup(
         ],
     };
 
-    AirWithBuses::create(
+    AirWithBuses::from_trace(
         trace,
         auxiliary_trace_build_data,
         proof_options,
@@ -103,7 +103,7 @@ pub fn new_add_air_with_lookup(
         ],
     };
 
-    AirWithBuses::create(
+    AirWithBuses::from_trace(
         trace,
         auxiliary_trace_build_data,
         proof_options,

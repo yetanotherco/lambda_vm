@@ -77,7 +77,6 @@ where
     F: IsFFTField,
 {
     context: AirContext,
-    trace_length: usize,
     pub_inputs: FibonacciPublicInputs<F>,
     constraints: Vec<Box<dyn TransitionConstraint<F, F>>>,
 }
@@ -104,7 +103,6 @@ where
     }
 
     fn new(
-        trace_length: usize,
         pub_inputs: &Self::PublicInputs,
         proof_options: &ProofOptions,
     ) -> Self {
@@ -121,13 +119,12 @@ where
         Self {
             pub_inputs: pub_inputs.clone(),
             context,
-            trace_length,
             constraints,
         }
     }
 
-    fn composition_poly_degree_bound(&self) -> usize {
-        self.trace_length()
+    fn composition_poly_degree_bound(&self, trace_length: usize) -> usize {
+        trace_length
     }
 
     fn transition_constraints(&self) -> &Vec<Box<dyn TransitionConstraint<F, F>>> {
@@ -138,6 +135,7 @@ where
         &self,
         _rap_challenges: &[FieldElement<Self::Field>],
         _bus_interactions: Option<&[crate::lookup::BusPublicInputs<Self::FieldExtension>]>,
+        _trace_length: usize,
     ) -> BoundaryConstraints<Self::Field> {
         let a0 = BoundaryConstraint::new_simple_main(0, self.pub_inputs.a0.clone());
         let a1 = BoundaryConstraint::new_simple_main(1, self.pub_inputs.a1.clone());
@@ -147,10 +145,6 @@ where
 
     fn context(&self) -> &AirContext {
         &self.context
-    }
-
-    fn trace_length(&self) -> usize {
-        self.trace_length
     }
 
     fn trace_layout(&self) -> (usize, usize) {

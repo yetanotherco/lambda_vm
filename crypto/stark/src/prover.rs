@@ -486,8 +486,13 @@ pub trait IsStarkProver<
         } else {
             Some(&round_1_result.bus_interactions[..])
         };
-        let evaluator =
-            ConstraintEvaluator::new(air, &round_1_result.rap_challenges, bus_interactions);
+        let trace_length = domain.interpolation_domain_size;
+        let evaluator = ConstraintEvaluator::new(
+            air,
+            &round_1_result.rap_challenges,
+            bus_interactions,
+            trace_length,
+        );
         let constraint_evaluations = evaluator.evaluate(
             air,
             &round_1_result.lde_trace,
@@ -502,7 +507,8 @@ pub trait IsStarkProver<
             Polynomial::interpolate_offset_fft(&constraint_evaluations, &domain.coset_offset)
                 .unwrap();
 
-        let number_of_parts = air.composition_poly_degree_bound() / air.trace_length();
+        let trace_length = domain.interpolation_domain_size;
+        let number_of_parts = air.composition_poly_degree_bound(trace_length) / trace_length;
         let composition_poly_parts = composition_poly.break_in_parts(number_of_parts);
 
         let lde_composition_poly_parts_evaluations: Vec<_> = composition_poly_parts
@@ -958,7 +964,8 @@ pub trait IsStarkProver<
         let mut main_commitments: Vec<MainCommitment<Field>> = Vec::new();
 
         for (air, table) in &*airs {
-            let domain = new_domain(*air);
+            let trace_length = table.num_rows();
+            let domain = new_domain(*air, trace_length);
             let (main, evaluations) = Self::round_1_commit_main_trace(*table, &domain, transcript)?;
             main_commitments.push((main, evaluations));
             domains.push(domain);
@@ -1075,8 +1082,9 @@ pub trait IsStarkProver<
         } else {
             Some(&round_1_result.bus_interactions[..])
         };
+        let trace_length = domain.interpolation_domain_size;
         let num_boundary_constraints = air
-            .boundary_constraints(&round_1_result.rap_challenges, bus_interactions)
+            .boundary_constraints(&round_1_result.rap_challenges, bus_interactions, trace_length)
             .constraints
             .len();
 
@@ -1214,7 +1222,7 @@ pub trait IsStarkProver<
             // Bus interaction public inputs (for boundary constraints and bus balance check)
             bus_interactions: round_1_result.bus_interactions.clone(),
 
-            trace_length: air.trace_length(),
+            trace_length: domain.interpolation_domain_size,
         })
     }
 }
@@ -1269,11 +1277,10 @@ mod tests {
             grinding_factor,
         };
 
-        let domain = Domain::new(&simple_fibonacci::FibonacciAIR::new(
+        let domain = Domain::new(
+            &simple_fibonacci::FibonacciAIR::new(&pub_inputs, &proof_options),
             trace_length,
-            &pub_inputs,
-            &proof_options,
-        ));
+        );
         assert_eq!(domain.blowup_factor, 2);
         assert_eq!(domain.interpolation_domain_size, trace_length);
         assert_eq!(domain.root_order, trace_length.trailing_zeros());
@@ -1350,6 +1357,7 @@ mod tests {
         Fibonacci2ColsShifted<Stark252PrimeField>,
         ProofOptions,
         [u8; 4],
+        usize,
     ) {
         let mut trace = fibonacci_2_cols_shifted::compute_trace(FieldElement::one(), 4);
 
@@ -1369,11 +1377,8 @@ mod tests {
 
         let transcript_init_seed = [0xca, 0xfe, 0xca, 0xfe];
 
-        let air = Fibonacci2ColsShifted::<Stark252PrimeField>::new(
-            trace.num_rows(),
-            &pub_inputs,
-            &proof_options,
-        );
+        let air = Fibonacci2ColsShifted::<Stark252PrimeField>::new(&pub_inputs, &proof_options);
+        let trace_length = trace.num_rows();
 
         let proof = Prover::prove(
             &air,
@@ -1381,18 +1386,18 @@ mod tests {
             &mut StoneProverTranscript::new(&transcript_init_seed),
         )
         .unwrap();
-        (proof, air, proof_options, transcript_init_seed)
+        (proof, air, proof_options, transcript_init_seed, trace_length)
     }
 
     fn stone_compatibility_case_1_proof() -> StarkProof<Stark252PrimeField, Stark252PrimeField> {
-        let (proof, _, _, _) = proof_parts_stone_compatibility_case_1();
+        let (proof, _, _, _, _) = proof_parts_stone_compatibility_case_1();
         proof
     }
 
     fn stone_compatibility_case_1_challenges() -> Challenges<Stark252PrimeField> {
-        let (proof, air, _, seed) = proof_parts_stone_compatibility_case_1();
+        let (proof, air, _, seed, trace_length) = proof_parts_stone_compatibility_case_1();
 
-        let domain = Domain::new(&air);
+        let domain = Domain::new(&air, trace_length);
         Verifier::step_1_replay_rounds_and_recover_challenges(
             &air,
             &proof,
@@ -1403,7 +1408,7 @@ mod tests {
 
     #[test]
     fn stone_compatibility_case_1_proof_is_valid() {
-        let (proof, air, _options, seed) = proof_parts_stone_compatibility_case_1();
+        let (proof, air, _options, seed, _) = proof_parts_stone_compatibility_case_1();
         assert!(Verifier::verify(
             &proof,
             &air,
@@ -1768,11 +1773,7 @@ mod tests {
 
         let transcript_init_seed = [0xfa, 0xfa, 0xfa, 0xee];
 
-        let air = Fibonacci2ColsShifted::<Stark252PrimeField>::new(
-            trace.num_rows(),
-            &pub_inputs,
-            &proof_options,
-        );
+        let air = Fibonacci2ColsShifted::<Stark252PrimeField>::new(&pub_inputs, &proof_options);
 
         let proof = Prover::prove(
             &air,
@@ -1791,8 +1792,8 @@ mod tests {
     fn stone_compatibility_case_2_challenges() -> Challenges<Stark252PrimeField> {
         let (proof, public_inputs, options, seed) = proof_parts_stone_compatibility_case_2();
 
-        let air = Fibonacci2ColsShifted::new(proof.trace_length, &public_inputs, &options);
-        let domain = Domain::new(&air);
+        let air = Fibonacci2ColsShifted::new(&public_inputs, &options);
+        let domain = Domain::new(&air, proof.trace_length);
         Verifier::step_1_replay_rounds_and_recover_challenges(
             &air,
             &proof,

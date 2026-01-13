@@ -127,7 +127,6 @@ impl TransitionConstraint<StarkField, StarkField> for ZeroFlagConstraint {
 pub struct BitFlagsAIR {
     context: AirContext,
     constraints: Vec<Box<dyn TransitionConstraint<StarkField, StarkField>>>,
-    trace_length: usize,
 }
 
 impl AIR for BitFlagsAIR {
@@ -140,7 +139,6 @@ impl AIR for BitFlagsAIR {
     }
 
     fn new(
-        trace_length: usize,
         _pub_inputs: &Self::PublicInputs,
         proof_options: &ProofOptions,
     ) -> Self {
@@ -160,7 +158,6 @@ impl AIR for BitFlagsAIR {
 
         Self {
             context,
-            trace_length,
             constraints,
         }
     }
@@ -175,6 +172,7 @@ impl AIR for BitFlagsAIR {
         &self,
         _rap_challenges: &[FieldElement<Self::FieldExtension>],
         _bus_interactions: Option<&[crate::lookup::BusPublicInputs<Self::FieldExtension>]>,
+        _trace_length: usize,
     ) -> BoundaryConstraints<Self::FieldExtension> {
         BoundaryConstraints::from_constraints(vec![])
     }
@@ -183,12 +181,8 @@ impl AIR for BitFlagsAIR {
         &self.context
     }
 
-    fn composition_poly_degree_bound(&self) -> usize {
-        self.trace_length * 2
-    }
-
-    fn trace_length(&self) -> usize {
-        self.trace_length
+    fn composition_poly_degree_bound(&self, trace_length: usize) -> usize {
+        trace_length * 2
     }
 
     fn trace_layout(&self) -> (usize, usize) {

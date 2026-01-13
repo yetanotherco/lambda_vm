@@ -351,7 +351,6 @@ where
     E: IsField + Send + Sync,
 {
     context: AirContext,
-    trace_length: usize,
     pub_inputs: LogReadOnlyPublicInputs<F>,
     transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
 }
@@ -384,7 +383,6 @@ where
     }
 
     fn new(
-        trace_length: usize,
         pub_inputs: &Self::PublicInputs,
         proof_options: &ProofOptions,
     ) -> Self {
@@ -405,7 +403,6 @@ where
 
         Self {
             context,
-            trace_length,
             pub_inputs: pub_inputs.clone(),
             transition_constraints,
         }
@@ -471,6 +468,7 @@ where
         &self,
         rap_challenges: &[FieldElement<Self::FieldExtension>],
         _bus_interactions: Option<&[crate::lookup::BusPublicInputs<Self::FieldExtension>]>,
+        trace_length: usize,
     ) -> BoundaryConstraints<Self::FieldExtension> {
         let a0 = &self.pub_inputs.a0;
         let v0 = &self.pub_inputs.v0;
@@ -495,7 +493,7 @@ where
         let c_aux1 = BoundaryConstraint::new_aux(0, 0, p0_value);
         let c_aux2 = BoundaryConstraint::new_aux(
             0,
-            self.trace_length - 1,
+            trace_length - 1,
             FieldElement::<Self::FieldExtension>::zero(),
         );
 
@@ -515,12 +513,8 @@ where
     // The prover use this function to define the number of parts of the composition polynomial.
     // The number of parts will be: composition_poly_degree_bound() / trace_length().
     // Since we have a transition constraint of degree 3, we need the bound to be two times the trace length.
-    fn composition_poly_degree_bound(&self) -> usize {
-        self.trace_length() * 2
-    }
-
-    fn trace_length(&self) -> usize {
-        self.trace_length
+    fn composition_poly_degree_bound(&self, trace_length: usize) -> usize {
+        trace_length * 2
     }
 
     fn pub_inputs(&self) -> &Self::PublicInputs {
