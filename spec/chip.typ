@@ -96,9 +96,9 @@
       )
     } else if "polys" in def {
       assert(
-        def.polys.all(poly =>
-          gather_indices(poly) == gather_indices(def.polys.first())
-        ), message: "Can only do multiple polys if they're indexed identically")
+        def.polys.map(gather_indices).dedup().len() == 1,
+        message: "Can only do multiple polys if they're indexed identically"
+      )
       (
         [],
         table.cell(align: right, emph[definition]), 
