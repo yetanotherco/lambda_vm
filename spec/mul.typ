@@ -72,7 +72,7 @@ $
   forall i in [0, 3]: #`raw_product`_i + #`carry`_(i-1) - #`res`_i in { k dot 2^32 | k in [0, 2^20) }
 $
 with $#`carry`_(-1) = 0$ for simplicity.
-In other words: $#`res`_i >= #`raw_product`_i + #`carry`_(i-1) mod 2^32$.
+In other words: $#`res`_i equiv #`raw_product`_i + #`carry`_(i-1) (mod 2^32)$.
 With @mul:a:res forcing $#`res`_i < 2^32$, $#`res`_i$ can only assume one value: $#`raw_product`_i + #`carry`_(i-1) mod 2^32$.
 
 *Note*: one may have observed that @mul:c:carry requires $#`carry`_i in [0, 2^20)$, while no limb of a valid carry value would ever exceed $2^19$.

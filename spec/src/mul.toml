@@ -79,7 +79,7 @@ def = {idx="i", polys=[
 
 [[variables.virtual]]
 name = "μ_sum"
-type = "Bit"
+type = "BaseField"
 desc = "sum of multiplicies"
 def = ["+", "μ_lo", "μ_hi"]
 
