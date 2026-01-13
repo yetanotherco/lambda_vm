@@ -959,7 +959,7 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let mut openings = Vec::new();
+        let mut openings = Vec::with_capacity(indexes_to_open.len());
 
         for index in indexes_to_open.iter() {
             let main_trace_opening = Self::open_trace_polys::<Field>(
@@ -1016,8 +1016,9 @@ pub trait IsStarkProver<
     {
         info!("Started proof generation...");
 
-        let mut round_1_results: Vec<Round1<Field, FieldExtension>> = Vec::new();
-        let mut domains = Vec::new();
+        let num_airs = airs.len();
+        let mut round_1_results: Vec<Round1<Field, FieldExtension>> = Vec::with_capacity(num_airs);
+        let mut domains = Vec::with_capacity(num_airs);
 
         // Execute Round 1 for all AIRs first to ensure all trace commitments
         // are in the transcript before generating challenges for Round 2
@@ -1030,7 +1031,7 @@ pub trait IsStarkProver<
         }
 
         // Execute Rounds 2-4 for each AIR
-        let mut proofs = Vec::new();
+        let mut proofs = Vec::with_capacity(num_airs);
         for (((air, _), round_1_result), domain) in airs.iter().zip(round_1_results).zip(domains) {
             let proof = Self::prove_rounds_2_to_4(*air, &round_1_result, transcript, &domain)?;
             proofs.push(proof);
