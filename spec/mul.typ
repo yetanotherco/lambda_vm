@@ -15,7 +15,9 @@
 
 #let mul = raw(chip.name)
 
-= Columns
+= #mul chip
+
+== Columns
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
 
@@ -26,12 +28,12 @@ The `MUL` chip is comprised of #nr_variables variables that are expressed using 
  $mat(delim: #none, top; bottom)$
 }
 
-= Assumptions
+== Assumptions
 #render_chip_assumptions(chip, config)
 
-= Constraints
+== Constraints
 
-== Overview
+=== Overview
 When `lhs` and `rhs` are _unsigned_ integers, computing their product $mod 2^128$ comes down to evaluating
 $
 (sum_(j=0)^3 2^(16j) dot #`lhs`_j) dot (sum_(i=0)^3 2^(16i) dot #`rhs`_i) mod 2^128.
@@ -71,14 +73,14 @@ With @mul:a:res in place, $#`res`_0$ can only assume one value: the unique multi
 In other words, $#`res`_0$ is constrained to equal $#`raw_product`_0 mod 2^32$.
 The correctness of $#`res`_i$ for $i in [1, 3]$ follows analogously.
 
-== Definitions
+=== Definitions
 We constrain `lhs_is_negative` and `rhs_is_negative` according to their definition; `carry` is appropriately range checked.
 #render_constraint_table(chip, config, groups: "def")
 
-== Product
+=== Product
 @mul:c:raw_product defines `raw_product` in terms of the (sign extended) input values `lhs` and `rhs`.
 #render_constraint_table(chip, config, groups: "prod")
 
-== Lookup
+=== Lookup
 The #mul chip contributes the following to the lookup:
 #render_constraint_table(chip, config, groups: "lookup")
