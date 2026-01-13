@@ -153,8 +153,8 @@
     },
     "/": (pp, rec, e) => $#rec(PREC.div, e.at(1)) / #rec(PREC.div, e.at(2))$,
     "^": (pp, rec, e) => {
-      assert(type(e.at(1)) == int and type(e.at(2)) == int, message: "Can only exponentiate constants")
-      $#e.at(1)^#e.at(2)$
+      assert(type(e.at(1)) == int, message: "Can only exponentiate constants")
+      $#e.at(1)^#rec(PREC.MAX, e.at(2))$
     },
     "=": (pp, rec, e) => $#rec(PREC.eq, e.at(1)) = #rec(PREC.eq, e.at(2))$,
     ":=": (pp, rec, e) => $#rec(PREC.eq, e.at(1)) := #rec(PREC.eq, e.at(2))$,
