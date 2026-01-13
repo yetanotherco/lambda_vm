@@ -94,7 +94,7 @@ pub trait IsStarkVerifier<
     /// Returns the list of challenges sent to the prover.
     fn step_1_replay_rounds_and_recover_challenges(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
-        proof: &StarkProof<Field, FieldExtension>,
+        proof: &StarkProof<Field, FieldExtension, PI>,
         domain: &Domain<Field>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
     ) -> Challenges<FieldExtension>
@@ -126,8 +126,14 @@ pub trait IsStarkVerifier<
         } else {
             Some(&proof.bus_interactions[..])
         };
+        let trace_length = proof.trace_length;
         let num_boundary_constraints = air
-            .boundary_constraints(&rap_challenges, bus_interactions)
+            .boundary_constraints(
+                &proof.public_inputs,
+                &rap_challenges,
+                bus_interactions,
+                trace_length,
+            )
             .constraints
             .len();
 
@@ -242,7 +248,7 @@ pub trait IsStarkVerifier<
     /// See https://lambdaclass.github.io/lambdaworks/starks/protocol.html#step-2-verify-claimed-composition-polynomial
     fn step_2_verify_claimed_composition_polynomial(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
-        proof: &StarkProof<Field, FieldExtension>,
+        proof: &StarkProof<Field, FieldExtension, PI>,
         domain: &Domain<Field>,
         challenges: &Challenges<FieldExtension>,
     ) -> bool {
@@ -251,10 +257,13 @@ pub trait IsStarkVerifier<
         } else {
             Some(&proof.bus_interactions[..])
         };
-        let boundary_constraints =
-            air.boundary_constraints(&challenges.rap_challenges, bus_interactions);
-
-        let trace_length = air.trace_length();
+        let trace_length = proof.trace_length;
+        let boundary_constraints = air.boundary_constraints(
+            &proof.public_inputs,
+            &challenges.rap_challenges,
+            bus_interactions,
+            trace_length,
+        );
         let number_of_b_constraints = boundary_constraints.constraints.len();
 
         #[allow(clippy::type_complexity)]
@@ -298,7 +307,7 @@ pub trait IsStarkVerifier<
                 .fold(FieldElement::<FieldExtension>::zero(), |acc, x| acc + x);
 
         let periodic_values = air
-            .get_periodic_column_polynomials()
+            .get_periodic_column_polynomials(trace_length)
             .iter()
             .map(|poly| poly.evaluate(&challenges.z))
             .collect::<Vec<FieldElement<FieldExtension>>>();
@@ -350,7 +359,7 @@ pub trait IsStarkVerifier<
     /// openings of the trace polynomials and the composition polynomial parts. It then uses these to verify that the
     /// FRI decommitments are valid and correspond to the Deep composition polynomial.
     fn step_3_verify_fri(
-        proof: &StarkProof<Field, FieldExtension>,
+        proof: &StarkProof<Field, FieldExtension, PI>,
         domain: &Domain<Field>,
         challenges: &Challenges<FieldExtension>,
     ) -> bool
@@ -430,7 +439,7 @@ pub trait IsStarkVerifier<
     /// Verify opening Open(tⱼ(D_LDE), 𝜐) and Open(tⱼ(D_LDE), -𝜐) for all trace polynomials tⱼ,
     /// where 𝜐 and -𝜐 are the elements corresponding to the index challenge `iota`.
     fn verify_trace_openings(
-        proof: &StarkProof<Field, FieldExtension>,
+        proof: &StarkProof<Field, FieldExtension, PI>,
         deep_poly_openings: &DeepPolynomialOpening<Field, FieldExtension>,
         iota: usize,
     ) -> bool
@@ -509,7 +518,7 @@ pub trait IsStarkVerifier<
     /// parts at the domain elements and their symmetric counterparts corresponding to all the FRI query
     /// index challenges.
     fn step_4_verify_trace_and_composition_openings(
-        proof: &StarkProof<Field, FieldExtension>,
+        proof: &StarkProof<Field, FieldExtension, PI>,
         challenges: &Challenges<FieldExtension>,
     ) -> bool
     where
@@ -565,7 +574,7 @@ pub trait IsStarkVerifier<
     /// `deep_composition_evaluation`: precomputed value of p₀(𝜐), where p₀ is the deep composition polynomial.
     /// `deep_composition_evaluation_sym`: precomputed value of p₀(-𝜐), where p₀ is the deep composition polynomial.
     fn verify_query_and_sym_openings(
-        proof: &StarkProof<Field, FieldExtension>,
+        proof: &StarkProof<Field, FieldExtension, PI>,
         zetas: &[FieldElement<FieldExtension>],
         iota: usize,
         fri_decommitment: &FriDecommitment<FieldExtension>,
@@ -641,7 +650,7 @@ pub trait IsStarkVerifier<
     fn reconstruct_deep_composition_poly_evaluations_for_all_queries(
         challenges: &Challenges<FieldExtension>,
         domain: &Domain<Field>,
-        proof: &StarkProof<Field, FieldExtension>,
+        proof: &StarkProof<Field, FieldExtension, PI>,
     ) -> DeepPolynomialEvaluations<FieldExtension> {
         let mut deep_poly_evaluations = Vec::new();
         let mut deep_poly_evaluations_sym = Vec::new();
@@ -696,7 +705,7 @@ pub trait IsStarkVerifier<
     }
 
     fn reconstruct_deep_composition_poly_evaluation(
-        proof: &StarkProof<Field, FieldExtension>,
+        proof: &StarkProof<Field, FieldExtension, PI>,
         evaluation_point: &FieldElement<Field>,
         primitive_root: &FieldElement<Field>,
         challenges: &Challenges<FieldExtension>,
@@ -767,7 +776,7 @@ pub trait IsStarkVerifier<
     /// The AIRs must be in the same order as the proofs in the MultiProof.
     fn multi_verify(
         airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
-        multi_proof: &MultiProof<Field, FieldExtension>,
+        multi_proof: &MultiProof<Field, FieldExtension, PI>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
     ) -> bool
     where
@@ -849,13 +858,14 @@ pub trait IsStarkVerifier<
     /// Verify a single STARK proof.
     /// This is equivalent to calling `multi_verify` with a single-element slice.
     fn verify(
-        proof: &StarkProof<Field, FieldExtension>,
+        proof: &StarkProof<Field, FieldExtension, PI>,
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        PI: Clone,
     {
         let multi_proof = MultiProof::new(vec![proof.clone()]);
         Self::multi_verify(&[air], &multi_proof, transcript)
@@ -865,7 +875,7 @@ pub trait IsStarkVerifier<
     /// already been replayed and the RAP challenges are known.
     fn replay_rounds_after_round_1(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
-        proof: &StarkProof<Field, FieldExtension>,
+        proof: &StarkProof<Field, FieldExtension, PI>,
         domain: &Domain<Field>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
         rap_challenges: Vec<FieldElement<FieldExtension>>,
@@ -885,8 +895,14 @@ pub trait IsStarkVerifier<
         } else {
             Some(&proof.bus_interactions[..])
         };
+        let trace_length = proof.trace_length;
         let num_boundary_constraints = air
-            .boundary_constraints(&rap_challenges, bus_interactions)
+            .boundary_constraints(
+                &proof.public_inputs,
+                &rap_challenges,
+                bus_interactions,
+                trace_length,
+            )
             .constraints
             .len();
 
@@ -999,7 +1015,7 @@ pub trait IsStarkVerifier<
     /// Verifies a single table after round 1 has been replayed.
     fn verify_rounds_2_to_4(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
-        proof: &StarkProof<Field, FieldExtension>,
+        proof: &StarkProof<Field, FieldExtension, PI>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
         rap_challenges: Vec<FieldElement<FieldExtension>>,
     ) -> bool
@@ -1007,7 +1023,7 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        let domain = new_domain(air);
+        let domain = new_domain(air, proof.trace_length);
 
         // Verify there are enough queries
         if proof.query_list.len() < air.options().fri_number_of_queries {

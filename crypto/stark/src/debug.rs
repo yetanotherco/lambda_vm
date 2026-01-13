@@ -18,6 +18,7 @@ pub fn validate_trace<
     PI,
 >(
     air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+    pub_inputs: &PI,
     main_trace_polys: &[Polynomial<FieldElement<Field>>],
     aux_trace_polys: &[Polynomial<FieldElement<FieldExtension>>],
     domain: &Domain<Field>,
@@ -50,7 +51,7 @@ pub fn validate_trace<
         LDETraceTable::from_columns(main_trace_columns, aux_trace_columns, air.step_size(), 1);
 
     let periodic_columns: Vec<_> = air
-        .get_periodic_column_polynomials()
+        .get_periodic_column_polynomials(domain.interpolation_domain_size)
         .iter()
         .map(|poly| {
             Polynomial::<FieldElement<Field>>::evaluate_fft::<Field>(
@@ -64,7 +65,8 @@ pub fn validate_trace<
 
     // --------- VALIDATE BOUNDARY CONSTRAINTS ------------
     // Note: We pass None for aux_hints because debug validation doesn't need the LogUp hints
-    air.boundary_constraints(rap_challenges, None)
+    let trace_length = domain.interpolation_domain_size;
+    air.boundary_constraints(pub_inputs, rap_challenges, None, trace_length)
         .constraints
         .iter()
         .for_each(|constraint| {

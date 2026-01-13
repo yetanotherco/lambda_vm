@@ -19,15 +19,15 @@ pub struct Domain<F: IsFFTField> {
 }
 
 impl<F: IsFFTField> Domain<F> {
-    pub fn new<A>(air: &A) -> Self
+    pub fn new<A>(air: &A, trace_length: usize) -> Self
     where
         A: AIR<Field = F>,
     {
         // Initial definitions
         let blowup_factor = air.options().blowup_factor as usize;
         let coset_offset = FieldElement::from(air.options().coset_offset);
-        let interpolation_domain_size = air.trace_length();
-        let root_order = air.trace_length().trailing_zeros();
+        let interpolation_domain_size = trace_length;
+        let root_order = trace_length.trailing_zeros();
         // * Generate Coset
         let trace_primitive_root = F::get_primitive_root_of_unity(root_order as u64).unwrap();
         let trace_roots_of_unity = get_powers_of_primitive_root_coset(
@@ -37,10 +37,10 @@ impl<F: IsFFTField> Domain<F> {
         )
         .unwrap();
 
-        let lde_root_order = (air.trace_length() * blowup_factor).trailing_zeros();
+        let lde_root_order = (trace_length * blowup_factor).trailing_zeros();
         let lde_roots_of_unity_coset = get_powers_of_primitive_root_coset(
             lde_root_order as u64,
-            air.trace_length() * blowup_factor,
+            trace_length * blowup_factor,
             &coset_offset,
         )
         .unwrap();
@@ -59,6 +59,7 @@ impl<F: IsFFTField> Domain<F> {
 
 pub fn new_domain<Field, FieldExtension, PI>(
     air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+    trace_length: usize,
 ) -> Domain<Field>
 where
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
@@ -67,8 +68,8 @@ where
     // Initial definitions
     let blowup_factor = air.options().blowup_factor as usize;
     let coset_offset = FieldElement::from(air.options().coset_offset);
-    let interpolation_domain_size = air.trace_length();
-    let root_order = air.trace_length().trailing_zeros();
+    let interpolation_domain_size = trace_length;
+    let root_order = trace_length.trailing_zeros();
     // * Generate Coset
     let trace_primitive_root = Field::get_primitive_root_of_unity(root_order as u64).unwrap();
     let trace_roots_of_unity = get_powers_of_primitive_root_coset(
@@ -78,10 +79,10 @@ where
     )
     .unwrap();
 
-    let lde_root_order = (air.trace_length() * blowup_factor).trailing_zeros();
+    let lde_root_order = (trace_length * blowup_factor).trailing_zeros();
     let lde_roots_of_unity_coset = get_powers_of_primitive_root_coset(
         lde_root_order as u64,
-        air.trace_length() * blowup_factor,
+        trace_length * blowup_factor,
         &coset_offset,
     )
     .unwrap();

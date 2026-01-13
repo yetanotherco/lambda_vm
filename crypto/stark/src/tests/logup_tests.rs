@@ -123,25 +123,26 @@ fn test_multi_airs_log_up() {
 
     let proof_options = ProofOptions::default_test_options();
 
-    let cpu_air = new_cpu_air_with_lookup(&cpu_trace, &proof_options);
-    let add_air = new_add_air_with_lookup(&add_trace, &proof_options);
-    let mul_air = new_mul_air_with_lookup(&mul_trace, &proof_options);
+    let cpu_air = new_cpu_air_with_lookup(&proof_options);
+    let add_air = new_add_air_with_lookup(&proof_options);
+    let mul_air = new_mul_air_with_lookup(&proof_options);
 
-    let airs: Vec<(
+    let air_trace_pairs: Vec<(
         &dyn AIR<
             Field = Babybear31PrimeField,
             FieldExtension = Degree4BabyBearExtensionField,
             PublicInputs = (),
         >,
         &mut TraceTable<Babybear31PrimeField, Degree4BabyBearExtensionField>,
+        &(),
     )> = vec![
-        (&cpu_air, &mut cpu_trace),
-        (&add_air, &mut add_trace),
-        (&mul_air, &mut mul_trace),
+        (&cpu_air, &mut cpu_trace, &()),
+        (&add_air, &mut add_trace, &()),
+        (&mul_air, &mut mul_trace, &()),
     ];
 
     let multi_proof = Prover::multi_prove(
-        airs,
+        air_trace_pairs,
         &mut DefaultTranscript::<Degree4BabyBearExtensionField>::new(&[]),
     )
     .unwrap();
@@ -259,25 +260,26 @@ fn test_multi_airs_log_up_cheating_wrong_value_detected() {
 
     let proof_options = ProofOptions::default_test_options();
 
-    let cpu_air = new_cpu_air_with_lookup(&cpu_trace, &proof_options);
-    let add_air = new_add_air_with_lookup(&add_trace, &proof_options);
-    let mul_air = new_mul_air_with_lookup(&mul_trace, &proof_options);
+    let cpu_air = new_cpu_air_with_lookup(&proof_options);
+    let add_air = new_add_air_with_lookup(&proof_options);
+    let mul_air = new_mul_air_with_lookup(&proof_options);
 
-    let airs: Vec<(
+    let air_trace_pairs: Vec<(
         &dyn AIR<
             Field = Babybear31PrimeField,
             FieldExtension = Degree4BabyBearExtensionField,
             PublicInputs = (),
         >,
         &mut TraceTable<Babybear31PrimeField, Degree4BabyBearExtensionField>,
+        &(),
     )> = vec![
-        (&cpu_air, &mut cpu_trace),
-        (&add_air, &mut add_trace),
-        (&mul_air, &mut mul_trace),
+        (&cpu_air, &mut cpu_trace, &()),
+        (&add_air, &mut add_trace, &()),
+        (&mul_air, &mut mul_trace, &()),
     ];
 
     let multi_proof = Prover::multi_prove(
-        airs,
+        air_trace_pairs,
         &mut DefaultTranscript::<Degree4BabyBearExtensionField>::new(&[]),
     )
     .unwrap();
@@ -395,25 +397,26 @@ fn test_multi_airs_log_up_cheating_wrong_multiplicity_detected() {
 
     let proof_options = ProofOptions::default_test_options();
 
-    let cpu_air = new_cpu_air_with_lookup(&cpu_trace, &proof_options);
-    let add_air = new_add_air_with_lookup(&add_trace, &proof_options);
-    let mul_air = new_mul_air_with_lookup(&mul_trace, &proof_options);
+    let cpu_air = new_cpu_air_with_lookup(&proof_options);
+    let add_air = new_add_air_with_lookup(&proof_options);
+    let mul_air = new_mul_air_with_lookup(&proof_options);
 
-    let airs: Vec<(
+    let air_trace_pairs: Vec<(
         &dyn AIR<
             Field = Babybear31PrimeField,
             FieldExtension = Degree4BabyBearExtensionField,
             PublicInputs = (),
         >,
         &mut TraceTable<Babybear31PrimeField, Degree4BabyBearExtensionField>,
+        &(),
     )> = vec![
-        (&cpu_air, &mut cpu_trace),
-        (&add_air, &mut add_trace),
-        (&mul_air, &mut mul_trace),
+        (&cpu_air, &mut cpu_trace, &()),
+        (&add_air, &mut add_trace, &()),
+        (&mul_air, &mut mul_trace, &()),
     ];
 
     let multi_proof = Prover::multi_prove(
-        airs,
+        air_trace_pairs,
         &mut DefaultTranscript::<Degree4BabyBearExtensionField>::new(&[]),
     )
     .unwrap();

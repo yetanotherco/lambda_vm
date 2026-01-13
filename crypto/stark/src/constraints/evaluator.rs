@@ -36,10 +36,13 @@ where
 {
     pub fn new(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        pub_inputs: &PI,
         rap_challenges: &[FieldElement<FieldExtension>],
         bus_interactions: Option<&[BusPublicInputs<FieldExtension>]>,
+        trace_length: usize,
     ) -> Self {
-        let boundary_constraints = air.boundary_constraints(rap_challenges, bus_interactions);
+        let boundary_constraints =
+            air.boundary_constraints(pub_inputs, rap_challenges, bus_interactions, trace_length);
 
         Self {
             boundary_constraints,
@@ -80,8 +83,9 @@ where
         #[cfg(feature = "instruments")]
         let timer = Instant::now();
 
+        let trace_length = domain.interpolation_domain_size;
         let lde_periodic_columns = air
-            .get_periodic_column_polynomials()
+            .get_periodic_column_polynomials(trace_length)
             .iter()
             .map(|poly| {
                 evaluate_polynomial_on_lde_domain(

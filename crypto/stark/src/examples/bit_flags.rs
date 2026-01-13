@@ -127,7 +127,6 @@ impl TransitionConstraint<StarkField, StarkField> for ZeroFlagConstraint {
 pub struct BitFlagsAIR {
     context: AirContext,
     constraints: Vec<Box<dyn TransitionConstraint<StarkField, StarkField>>>,
-    trace_length: usize,
 }
 
 impl AIR for BitFlagsAIR {
@@ -139,11 +138,7 @@ impl AIR for BitFlagsAIR {
         16
     }
 
-    fn new(
-        trace_length: usize,
-        _pub_inputs: &Self::PublicInputs,
-        proof_options: &ProofOptions,
-    ) -> Self {
+    fn new(proof_options: &ProofOptions) -> Self {
         let bit_constraint = Box::new(BitConstraint::new());
         let flag_constraint = Box::new(ZeroFlagConstraint::new());
         let constraints: Vec<Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>> =
@@ -160,7 +155,6 @@ impl AIR for BitFlagsAIR {
 
         Self {
             context,
-            trace_length,
             constraints,
         }
     }
@@ -173,8 +167,10 @@ impl AIR for BitFlagsAIR {
 
     fn boundary_constraints(
         &self,
+        _pub_inputs: &Self::PublicInputs,
         _rap_challenges: &[FieldElement<Self::FieldExtension>],
         _bus_interactions: Option<&[crate::lookup::BusPublicInputs<Self::FieldExtension>]>,
+        _trace_length: usize,
     ) -> BoundaryConstraints<Self::FieldExtension> {
         BoundaryConstraints::from_constraints(vec![])
     }
@@ -183,20 +179,12 @@ impl AIR for BitFlagsAIR {
         &self.context
     }
 
-    fn composition_poly_degree_bound(&self) -> usize {
-        self.trace_length * 2
-    }
-
-    fn trace_length(&self) -> usize {
-        self.trace_length
+    fn composition_poly_degree_bound(&self, trace_length: usize) -> usize {
+        trace_length * 2
     }
 
     fn trace_layout(&self) -> (usize, usize) {
         (1, 0)
-    }
-
-    fn pub_inputs(&self) -> &Self::PublicInputs {
-        &()
     }
 }
 
