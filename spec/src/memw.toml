@@ -92,7 +92,7 @@ desc = "Whether we are performing a write (and hence not return `out`)"
 
 [[assumptions]]
 desc = "`IS_WORD[base_address[i]]`"
-range = ["i", 0, 1]
+iter = ["i", 0, 1]
 
 [[assumptions]]
 desc = "`IS_BIT<write2>`"
@@ -132,7 +132,7 @@ kind = "template"
 tag = "ADD"
 input = ["base_address", ["+", "i", 1]]
 output = ["cast", ["idx", "address_add", "i"], "DWordWL"]
-range = ["i", 1, 2]
+iter = ["i", 1, 2]
 multiplicity = "w4"
 
 [[constraints.consistency]]
@@ -140,15 +140,17 @@ kind = "template"
 tag = "ADD"
 input = ["base_address", ["+", "i", 1]]
 output = ["cast", ["idx", "address_add", "i"], "DWordWL"]
-range = ["i", 3, 6]
+iter = ["i", 3, 6]
 multiplicity = "write8"
 
-# TODO: whoops, double loop
 [[constraints.consistency]]
 kind = "interaction"
 tag = "IS_HALFWORD"
 input = [["idx", ["idx", "address_add", "i"], "j"]]
-range = ["TODO", 0, 28]
+iters = [
+  ["i", 0, 6],
+  ["j", 0, 3],
+]
 
 [[constraints.consistency]]
 kind = "interaction"
@@ -169,7 +171,7 @@ kind = "interaction"
 tag = "LT"
 input = [["idx", "old_timestamp", "i"], "timestamp"]
 output = 1
-range = ["i", 2, 3]
+iter = ["i", 2, 3]
 multiplicity = "w4"
 
 [[constraints.consistency]]
@@ -177,7 +179,7 @@ kind = "interaction"
 tag = "LT"
 input = [["idx", "old_timestamp", "i"], "timestamp"]
 output = 1
-range = ["i", 4, 7]
+iter = ["i", 4, 7]
 multiplicity = "write8"
 
 
@@ -240,28 +242,28 @@ kind = "interaction"
 tag = "memory"
 input = ["is_register", ["idx", "address_add", ["-", "i", 1]], ["idx", "old_timestamp", "i"], ["idx", "old", "i"]]
 multiplicity = "w4"
-range = ["i", 2, 3]
+iter = ["i", 2, 3]
 
 [[constraints.memory]]
 kind = "interaction"
 tag = "memory"
 input = ["is_register", ["idx", "address_add", ["-", "i", 1]], "timestamp", ["idx", "value", "i"]]
 multiplicity = ["-", "w4"]
-range = ["i", 2, 3]
+iter = ["i", 2, 3]
 
 [[constraints.memory]]
 kind = "interaction"
 tag = "memory"
 input = ["is_register", ["idx", "address_add", ["-", "i", 1]], ["idx", "old_timestamp", "i"], ["idx", "old", "i"]]
 multiplicity = "write8"
-range = ["i", 4, 7]
+iter = ["i", 4, 7]
 
 [[constraints.memory]]
 kind = "interaction"
 tag = "memory"
 input = ["is_register", ["idx", "address_add", ["-", "i", 1]], "timestamp", ["idx", "value", "i"]]
 multiplicity = ["-", "write8"]
-range = ["i", 4, 7]
+iter = ["i", 4, 7]
 
 
 [[constraint_groups]]
