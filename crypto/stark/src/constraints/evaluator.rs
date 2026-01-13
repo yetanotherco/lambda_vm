@@ -66,16 +66,16 @@ where
         let boundary_zerofiers_inverse_evaluations: Vec<Vec<FieldElement<Field>>> =
             boundary_constraints_iter
                 .map(|bc| {
-                    let point = &domain.trace_primitive_root.pow(bc.step as u64);
-                    let mut evals = domain
+                    let point = domain.trace_primitive_root.pow(bc.step as u64);
+                    let mut evals: Vec<FieldElement<Field>> = domain
                         .lde_roots_of_unity_coset
                         .iter()
-                        .map(|v| v.clone() - point)
-                        .collect::<Vec<FieldElement<Field>>>();
+                        .map(|v| v - &point)
+                        .collect();
                     FieldElement::inplace_batch_inverse(&mut evals).unwrap();
                     evals
                 })
-                .collect::<Vec<Vec<FieldElement<Field>>>>();
+                .collect();
 
         #[cfg(all(debug_assertions, not(feature = "parallel")))]
         let boundary_polys: Vec<Polynomial<FieldElement<Field>>> = Vec::new();
@@ -101,6 +101,24 @@ where
             })
             .collect::<Result<Vec<Vec<FieldElement<Field>>>, FFTError>>()
             .unwrap();
+
+        // Pre-transpose periodic columns to row-major format to avoid per-iteration allocation
+        // lde_periodic_columns is column-major: Vec<Vec<FieldElement>> where outer = columns
+        // lde_periodic_rows is row-major: Vec<Vec<FieldElement>> where outer = rows
+        let num_periodic_cols = lde_periodic_columns.len();
+        let lde_periodic_rows: Vec<Vec<FieldElement<Field>>> = if num_periodic_cols > 0 {
+            let num_rows = lde_periodic_columns[0].len();
+            (0..num_rows)
+                .map(|row_idx| {
+                    lde_periodic_columns
+                        .iter()
+                        .map(|col| col[row_idx].clone())
+                        .collect()
+                })
+                .collect()
+        } else {
+            vec![vec![]; domain.lde_roots_of_unity_coset.len()]
+        };
 
         #[cfg(feature = "instruments")]
         println!(
@@ -202,15 +220,13 @@ where
             .map(|(i, boundary)| {
                 let frame = Frame::read_from_lde(lde_trace, i, &air.context().transition_offsets);
 
-                let periodic_values: Vec<_> = lde_periodic_columns
-                    .iter()
-                    .map(|col| col[i].clone())
-                    .collect();
+                // Use pre-transposed row-major periodic values (no allocation per iteration)
+                let periodic_values = &lde_periodic_rows[i];
 
                 // Compute all the transition constraints at this point of the LDE domain.
                 let transition_evaluation_context = TransitionEvaluationContext::new_prover(
                     &frame,
-                    &periodic_values,
+                    periodic_values,
                     rap_challenges,
                 );
                 let evaluations_transition = air.compute_transition(&transition_evaluation_context);

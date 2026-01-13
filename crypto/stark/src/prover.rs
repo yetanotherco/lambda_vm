@@ -237,12 +237,25 @@ pub trait IsStarkProver<
         FieldElement<FieldExtension>: AsBytes,
         Field: IsSubFieldOf<FieldExtension>,
     {
+        #[cfg(feature = "instruments")]
+        let timer = Instant::now();
+
         // Interpolate columns of `trace`.
         let trace_polys = trace.compute_trace_polys_main::<Field>();
+
+        #[cfg(feature = "instruments")]
+        println!("     Trace interpolation (main): {:#?}", timer.elapsed());
+        #[cfg(feature = "instruments")]
+        let timer = Instant::now();
 
         // Evaluate those polynomials t_j on the large domain D_LDE.
         let mut lde_trace_evaluations =
             Self::compute_lde_trace_evaluations::<Field>(&trace_polys, domain);
+
+        #[cfg(feature = "instruments")]
+        println!("     LDE evaluation (main): {:#?}", timer.elapsed());
+        #[cfg(feature = "instruments")]
+        let timer = Instant::now();
 
         // Bit-reverse permute in-place for Merkle commitment
         // (bit-reverse is self-inverse, so we can restore by permuting again)
@@ -255,6 +268,12 @@ pub trait IsStarkProver<
 
         let (lde_trace_merkle_tree, lde_trace_merkle_root) =
             Self::batch_commit_main(&lde_trace_permuted_rows)?;
+
+        #[cfg(feature = "instruments")]
+        println!(
+            "     Merkle tree construction (main): {:#?}",
+            timer.elapsed()
+        );
 
         // >>>> Send commitment.
         transcript.append_bytes(&lde_trace_merkle_root);
@@ -389,6 +408,11 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
+        #[cfg(feature = "instruments")]
+        println!("- Started round 1: Interpolate and commit trace");
+        #[cfg(feature = "instruments")]
+        let timer1 = Instant::now();
+
         let Some((trace_polys, evaluations, main_merkle_tree, main_merkle_root)) =
             Self::interpolate_and_commit_main(trace, domain, transcript)
         else {
@@ -431,6 +455,11 @@ pub trait IsStarkProver<
             domain.blowup_factor,
         );
 
+        #[cfg(feature = "instruments")]
+        let elapsed1 = timer1.elapsed();
+        #[cfg(feature = "instruments")]
+        println!("  Time spent: {:?}", elapsed1);
+
         Ok(Round1 {
             lde_trace,
             main,
@@ -458,11 +487,13 @@ pub trait IsStarkProver<
 
         // Merge consecutive pairs of rows for commitment
         // Use parallel iteration when available
+        // Optimization: pre-allocate with correct capacity instead of clone + extend
         #[cfg(feature = "parallel")]
         let lde_composition_poly_evaluations_merged: Vec<_> = lde_composition_poly_evaluations
             .par_chunks(2)
             .map(|chunk| {
-                let mut merged = chunk[0].clone();
+                let mut merged = Vec::with_capacity(chunk[0].len() + chunk[1].len());
+                merged.extend_from_slice(&chunk[0]);
                 merged.extend_from_slice(&chunk[1]);
                 merged
             })
@@ -472,7 +503,8 @@ pub trait IsStarkProver<
         let lde_composition_poly_evaluations_merged: Vec<_> = lde_composition_poly_evaluations
             .chunks(2)
             .map(|chunk| {
-                let mut merged = chunk[0].clone();
+                let mut merged = Vec::with_capacity(chunk[0].len() + chunk[1].len());
+                merged.extend_from_slice(&chunk[0]);
                 merged.extend_from_slice(&chunk[1]);
                 merged
             })
@@ -504,10 +536,21 @@ pub trait IsStarkProver<
             &round_1_result.rap_challenges,
         );
 
+        #[cfg(feature = "instruments")]
+        let timer = Instant::now();
+
         // Get coefficients of the composition poly H
         let composition_poly =
             Polynomial::interpolate_offset_fft(&constraint_evaluations, &domain.coset_offset)
                 .unwrap();
+
+        #[cfg(feature = "instruments")]
+        println!(
+            "     Composition poly interpolation: {:#?}",
+            timer.elapsed()
+        );
+        #[cfg(feature = "instruments")]
+        let timer = Instant::now();
 
         let number_of_parts = air.composition_poly_degree_bound() / air.trace_length();
         let composition_poly_parts = composition_poly.break_in_parts(number_of_parts);
@@ -541,11 +584,22 @@ pub trait IsStarkProver<
             })
             .collect();
 
+        #[cfg(feature = "instruments")]
+        println!("     Composition poly LDE: {:#?}", timer.elapsed());
+        #[cfg(feature = "instruments")]
+        let timer = Instant::now();
+
         let Some((composition_poly_merkle_tree, composition_poly_root)) =
             Self::commit_composition_polynomial(&lde_composition_poly_parts_evaluations)
         else {
             return Err(ProvingError::EmptyCommitment);
         };
+
+        #[cfg(feature = "instruments")]
+        println!(
+            "     Composition poly Merkle tree: {:#?}",
+            timer.elapsed()
+        );
 
         Ok(Round2 {
             lde_composition_poly_evaluations: lde_composition_poly_parts_evaluations,

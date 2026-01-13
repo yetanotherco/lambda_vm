@@ -50,13 +50,50 @@ The first version is going to use the primitives contained in [lambdaworks](http
 | Multi-FRI                   | Perform FRI using MTMT | Planned |
 | Adjust parameters           | Adjust parameters for 128 bits of security | Planned |
 
-## GPU and performance
+## Prover Optimizations
+
+Based on profiling at 2^20 trace (1M rows), here are the bottlenecks and optimization priorities:
+
+### Profiling Results (10.66s total prove time)
+
+| Component | Time | % | Priority |
+|-----------|------|---|----------|
+| Merkle tree construction (total) | 2.76s | 25.9% | P1 |
+| FRI protocol | 1.77s | 16.6% | P2 |
+| LDE evaluations (total) | 1.65s | 15.5% | P3 |
+| Constraint evaluation | 1.65s | 15.5% | P4 |
+| Composition poly interpolation | 852ms | 8.0% | P5 |
+
+Verifier is highly optimized: ~232μs (constant time regardless of trace size).
+
+### CPU Optimizations
+
+| Feature | Description | Status |
+|---------|-------------|--------|
+| Lightweight verifier domain | Avoid O(n) domain allocation in verifier | Done |
+| Mathematical OOD sampling | O(log n) membership check vs O(n) search | Done |
+| Pre-computed FFT twiddles | Reuse twiddles across polynomial operations | Done |
+| Parallel constraint evaluation | Use rayon for constraint evaluation | Done |
+| Vec capacity pre-allocation | Reduce allocations in hot paths | Done |
+| Batch domain element computation | Incremental multiplication (not beneficial) | Tested |
+
+### Optimization Priorities
+
+| Priority | Feature | Description | Expected Impact | Status |
+|----------|---------|-------------|-----------------|--------|
+| P1 | Parallel Merkle hashing | Parallelize leaf hashing in Merkle tree construction | ~20% total speedup | Planned |
+| P2 | FRI optimization | Profile and optimize FRI inner loop (FFTs, hashing) | ~15% total speedup | Planned |
+| P3 | SIMD field operations | Use AVX2/AVX-512 for field arithmetic | ~10-20% speedup | Planned |
+| P4 | Better hash function | Replace SHA256 with Poseidon or BLAKE3 | Faster Merkle trees | Planned |
+| P5 | Circle STARK | Consider Circle STARK for FFT-friendly fields | Architecture change | Research |
+
+## GPU and Performance
 
 | Feature                     | Description                       | Status       |
 |---------------------------- |-----------------------------------|--------------|
 | Fields                      | Improve field performance using assembly | Planned |
 | GPU-Fast-Fourier transform      | Implement GPU version of FFT | Planned |
-| GPU-Merkle tree                 | Implement GPU version for Merkle trees | Planned |
+| GPU-Merkle tree                 | Implement GPU version for Merkle trees (highest impact) | Planned |
 | Parallel trace generation   | Use GPU for fast trace generation | Planned |
 | GPU-FRI | Perform FRI on GPU | Planned |
   

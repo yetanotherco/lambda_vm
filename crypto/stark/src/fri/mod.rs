@@ -11,6 +11,9 @@ pub use math::{
     polynomial::Polynomial,
 };
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 use crate::config::{BatchedMerkleTree, BatchedMerkleTreeBackend};
 
 use self::fri_commitment::FriLayer;
@@ -72,26 +75,30 @@ where
         return vec![];
     }
 
-    query_indices
-        .iter()
-        .map(|&initial_index| {
-            let mut evaluations = Vec::with_capacity(layers.len());
-            let mut auth_paths = Vec::with_capacity(layers.len());
-            let mut index = initial_index;
+    // Parallelize query processing - each query is independent
+    #[cfg(feature = "parallel")]
+    let iter = query_indices.par_iter();
+    #[cfg(not(feature = "parallel"))]
+    let iter = query_indices.iter();
 
-            for layer in layers {
-                let symmetric_index = index ^ 1;
-                evaluations.push(layer.evaluation[symmetric_index].clone());
-                auth_paths.push(layer.merkle_tree.get_proof_by_pos(index >> 1).unwrap());
-                index >>= 1;
-            }
+    iter.map(|&initial_index| {
+        let mut evaluations = Vec::with_capacity(layers.len());
+        let mut auth_paths = Vec::with_capacity(layers.len());
+        let mut index = initial_index;
 
-            FriDecommitment {
-                layers_auth_paths: auth_paths,
-                layers_evaluations_sym: evaluations,
-            }
-        })
-        .collect()
+        for layer in layers {
+            let symmetric_index = index ^ 1;
+            evaluations.push(layer.evaluation[symmetric_index].clone());
+            auth_paths.push(layer.merkle_tree.get_proof_by_pos(index >> 1).unwrap());
+            index >>= 1;
+        }
+
+        FriDecommitment {
+            layers_auth_paths: auth_paths,
+            layers_evaluations_sym: evaluations,
+        }
+    })
+    .collect()
 }
 
 pub fn new_fri_layer<F: IsFFTField + IsSubFieldOf<E>, E: IsField>(

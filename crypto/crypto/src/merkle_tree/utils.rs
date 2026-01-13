@@ -22,9 +22,15 @@ pub fn parent_index(node_index: usize) -> usize {
 
 // The list of values is completed repeating the last value to a power of two length
 pub fn complete_until_power_of_two<T: Clone>(mut values: Vec<T>) -> Vec<T> {
-    while !is_power_of_two(values.len()) {
-        values.push(values[values.len() - 1].clone());
+    let len = values.len();
+    if is_power_of_two(len) {
+        return values;
     }
+    // Calculate target size in one step instead of looping
+    let target_len = len.next_power_of_two();
+    // Clone last value once and use resize to fill remaining slots
+    let last = values.last().unwrap().clone();
+    values.resize(target_len, last);
     values
 }
 
