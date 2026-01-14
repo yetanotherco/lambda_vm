@@ -193,12 +193,12 @@ fn create_cpu_air(
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![
             TableInteraction {
-                multiplicity_column: 0,
+                multiplicity_column: Some(0),
                 value_columns: vec![2, 3, 4],
                 is_sender: true,
             },
             TableInteraction {
-                multiplicity_column: 1,
+                multiplicity_column: Some(1),
                 value_columns: vec![2, 3, 4],
                 is_sender: true,
             },
@@ -219,7 +219,7 @@ fn create_add_air(
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![TableInteraction {
-            multiplicity_column: 3,
+            multiplicity_column: Some(3),
             value_columns: vec![0, 1, 2],
             is_sender: false,
         }],
@@ -239,7 +239,7 @@ fn create_mul_air(
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![TableInteraction {
-            multiplicity_column: 3,
+            multiplicity_column: Some(3),
             value_columns: vec![0, 1, 2],
             is_sender: false,
         }],

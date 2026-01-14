@@ -17,7 +17,6 @@ use crate::{
 };
 
 type FE = FieldElement<Babybear31PrimeField>;
-type ExtFE = FieldElement<Degree4BabyBearExtensionField>;
 
 #[test_log::test]
 fn test_multi_airs_log_up() {
@@ -82,12 +81,7 @@ fn test_multi_airs_log_up() {
         FE::from(640),
     ];
     let main_columns = vec![add_column, mul_column, a_column, b_column, c_column];
-    let aux_columns = vec![
-        vec![ExtFE::zero(); 8],
-        vec![ExtFE::zero(); 8],
-        vec![ExtFE::zero(); 8],
-    ];
-    let mut cpu_trace = TraceTable::from_columns(main_columns, aux_columns, 1);
+    let mut cpu_trace = TraceTable::from_columns_main(main_columns, 1);
 
     // ADD Trace
     // a | b  | c  | m | aux cpu
@@ -99,12 +93,8 @@ fn test_multi_airs_log_up() {
     let b_column = vec![FE::from(10), FE::from(30), FE::from(50), FE::from(60)];
     let c_column = vec![FE::from(11), FE::from(33), FE::from(55), FE::from(66)];
     let m_column = vec![FE::one(), FE::one(), FE::one(), FE::one()];
-    // ADD has 1 interaction, so needs 2 aux columns: 1 term + 1 accumulated
-    let mut add_trace = TraceTable::from_columns(
-        vec![a_column, b_column, c_column, m_column],
-        vec![vec![ExtFE::zero(); 4], vec![ExtFE::zero(); 4]],
-        1,
-    );
+    let mut add_trace =
+        TraceTable::from_columns_main(vec![a_column, b_column, c_column, m_column], 1);
 
     // MUL Trace
     // a | b  | c   | m | aux cpu
@@ -116,12 +106,8 @@ fn test_multi_airs_log_up() {
     let b_column = vec![FE::from(20), FE::from(40), FE::from(70), FE::from(80)];
     let c_column = vec![FE::from(40), FE::from(160), FE::from(490), FE::from(640)];
     let m_column = vec![FE::one(), FE::one(), FE::one(), FE::one()];
-    // MUL has 1 interaction, so needs 2 aux columns: 1 term + 1 accumulated
-    let mut mul_trace = TraceTable::from_columns(
-        vec![a_column, b_column, c_column, m_column],
-        vec![vec![ExtFE::zero(); 4], vec![ExtFE::zero(); 4]],
-        1,
-    );
+    let mut mul_trace =
+        TraceTable::from_columns_main(vec![a_column, b_column, c_column, m_column], 1);
 
     let proof_options = ProofOptions::default_test_options();
 
@@ -225,12 +211,7 @@ fn test_multi_airs_log_up_cheating_wrong_value_detected() {
         FE::from(640),
     ];
     let main_columns = vec![add_column, mul_column, a_column, b_column, c_column];
-    let aux_columns = vec![
-        vec![ExtFE::zero(); 8],
-        vec![ExtFE::zero(); 8],
-        vec![ExtFE::zero(); 8],
-    ];
-    let mut cpu_trace = TraceTable::from_columns(main_columns, aux_columns, 1);
+    let mut cpu_trace = TraceTable::from_columns_main(main_columns, 1);
 
     // CHEATING ADD Trace - wrong value in first row!
     // CPU sent (1, 10, 11) but ADD table has (1, 10, 99) - MISMATCH!
@@ -243,22 +224,16 @@ fn test_multi_airs_log_up_cheating_wrong_value_detected() {
         FE::from(66),
     ];
     let m_column = vec![FE::one(), FE::one(), FE::one(), FE::one()];
-    let mut add_trace = TraceTable::from_columns(
-        vec![a_column, b_column, c_column, m_column],
-        vec![vec![ExtFE::zero(); 4], vec![ExtFE::zero(); 4]],
-        1,
-    );
+    let mut add_trace =
+        TraceTable::from_columns_main(vec![a_column, b_column, c_column, m_column], 1);
 
     // MUL Trace - correct values
     let a_column = vec![FE::from(2), FE::from(4), FE::from(7), FE::from(8)];
     let b_column = vec![FE::from(20), FE::from(40), FE::from(70), FE::from(80)];
     let c_column = vec![FE::from(40), FE::from(160), FE::from(490), FE::from(640)];
     let m_column = vec![FE::one(), FE::one(), FE::one(), FE::one()];
-    let mut mul_trace = TraceTable::from_columns(
-        vec![a_column, b_column, c_column, m_column],
-        vec![vec![ExtFE::zero(); 4], vec![ExtFE::zero(); 4]],
-        1,
-    );
+    let mut mul_trace =
+        TraceTable::from_columns_main(vec![a_column, b_column, c_column, m_column], 1);
 
     let proof_options = ProofOptions::default_test_options();
 
@@ -362,12 +337,7 @@ fn test_multi_airs_log_up_cheating_wrong_multiplicity_detected() {
         FE::from(640),
     ];
     let main_columns = vec![add_column, mul_column, a_column, b_column, c_column];
-    let aux_columns = vec![
-        vec![ExtFE::zero(); 8],
-        vec![ExtFE::zero(); 8],
-        vec![ExtFE::zero(); 8],
-    ];
-    let mut cpu_trace = TraceTable::from_columns(main_columns, aux_columns, 1);
+    let mut cpu_trace = TraceTable::from_columns_main(main_columns, 1);
 
     // CHEATING ADD Trace - wrong multiplicity!
     // First row claims multiplicity=2, but CPU only sent it once
@@ -380,22 +350,16 @@ fn test_multi_airs_log_up_cheating_wrong_multiplicity_detected() {
         FE::one(),
         FE::one(),
     ];
-    let mut add_trace = TraceTable::from_columns(
-        vec![a_column, b_column, c_column, m_column],
-        vec![vec![ExtFE::zero(); 4], vec![ExtFE::zero(); 4]],
-        1,
-    );
+    let mut add_trace =
+        TraceTable::from_columns_main(vec![a_column, b_column, c_column, m_column], 1);
 
     // MUL Trace - correct
     let a_column = vec![FE::from(2), FE::from(4), FE::from(7), FE::from(8)];
     let b_column = vec![FE::from(20), FE::from(40), FE::from(70), FE::from(80)];
     let c_column = vec![FE::from(40), FE::from(160), FE::from(490), FE::from(640)];
     let m_column = vec![FE::one(), FE::one(), FE::one(), FE::one()];
-    let mut mul_trace = TraceTable::from_columns(
-        vec![a_column, b_column, c_column, m_column],
-        vec![vec![ExtFE::zero(); 4], vec![ExtFE::zero(); 4]],
-        1,
-    );
+    let mut mul_trace =
+        TraceTable::from_columns_main(vec![a_column, b_column, c_column, m_column], 1);
 
     let proof_options = ProofOptions::default_test_options();
 
