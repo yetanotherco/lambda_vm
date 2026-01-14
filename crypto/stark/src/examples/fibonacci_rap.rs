@@ -149,8 +149,6 @@ where
     F: IsFFTField,
 {
     context: AirContext,
-    trace_length: usize,
-    pub_inputs: FibonacciRAPPublicInputs<F>,
     transition_constraints: Vec<Box<dyn TransitionConstraint<F, F>>>,
 }
 
@@ -177,11 +175,7 @@ where
         1
     }
 
-    fn new(
-        trace_length: usize,
-        pub_inputs: &Self::PublicInputs,
-        proof_options: &ProofOptions,
-    ) -> Self {
+    fn new(proof_options: &ProofOptions) -> Self {
         let transition_constraints: Vec<
             Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>,
         > = vec![
@@ -198,8 +192,6 @@ where
 
         Self {
             context,
-            trace_length,
-            pub_inputs: pub_inputs.clone(),
             transition_constraints,
         }
     }
@@ -208,7 +200,7 @@ where
         &self,
         trace: &mut TraceTable<Self::Field, Self::FieldExtension>,
         challenges: &[FieldElement<F>],
-    ) {
+    ) -> Vec<crate::lookup::BusPublicInputs<Self::FieldExtension>> {
         let main_segment_cols = trace.columns_main();
         let not_perm = &main_segment_cols[0];
         let perm = &main_segment_cols[1];
@@ -233,6 +225,8 @@ where
         for (i, aux_elem) in aux_col.iter().enumerate().take(trace.num_rows()) {
             trace.set_aux(i, 0, aux_elem.clone())
         }
+
+        Vec::new()
     }
 
     fn build_rap_challenges(
@@ -248,7 +242,10 @@ where
 
     fn boundary_constraints(
         &self,
+        _pub_inputs: &Self::PublicInputs,
         _rap_challenges: &[FieldElement<Self::FieldExtension>],
+        _bus_interactions: Option<&[crate::lookup::BusPublicInputs<Self::FieldExtension>]>,
+        _trace_length: usize,
     ) -> BoundaryConstraints<Self::FieldExtension> {
         // Main boundary constraints
         let a0 =
@@ -272,16 +269,8 @@ where
         &self.context
     }
 
-    fn composition_poly_degree_bound(&self) -> usize {
-        self.trace_length()
-    }
-
-    fn trace_length(&self) -> usize {
-        self.trace_length
-    }
-
-    fn pub_inputs(&self) -> &Self::PublicInputs {
-        &self.pub_inputs
+    fn composition_poly_degree_bound(&self, trace_length: usize) -> usize {
+        trace_length
     }
 }
 

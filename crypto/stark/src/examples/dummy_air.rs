@@ -135,7 +135,6 @@ where
 
 pub struct DummyAIR {
     context: AirContext,
-    trace_length: usize,
     transition_constraints: Vec<Box<dyn TransitionConstraint<StarkField, StarkField>>>,
 }
 
@@ -148,11 +147,7 @@ impl AIR for DummyAIR {
         1
     }
 
-    fn new(
-        trace_length: usize,
-        _pub_inputs: &Self::PublicInputs,
-        proof_options: &ProofOptions,
-    ) -> Self {
+    fn new(proof_options: &ProofOptions) -> Self {
         let transition_constraints: Vec<
             Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>,
         > = vec![
@@ -169,14 +164,16 @@ impl AIR for DummyAIR {
 
         Self {
             context,
-            trace_length,
             transition_constraints,
         }
     }
 
     fn boundary_constraints(
         &self,
+        _pub_inputs: &Self::PublicInputs,
         _rap_challenges: &[FieldElement<Self::Field>],
+        _bus_interactions: Option<&[crate::lookup::BusPublicInputs<Self::FieldExtension>]>,
+        _trace_length: usize,
     ) -> BoundaryConstraints<Self::Field> {
         let a0 = BoundaryConstraint::new_main(1, 0, FieldElement::<Self::Field>::one());
         let a1 = BoundaryConstraint::new_main(1, 1, FieldElement::<Self::Field>::one());
@@ -194,20 +191,12 @@ impl AIR for DummyAIR {
         &self.context
     }
 
-    fn composition_poly_degree_bound(&self) -> usize {
-        self.trace_length * 2
+    fn composition_poly_degree_bound(&self, trace_length: usize) -> usize {
+        trace_length * 2
     }
 
     fn trace_layout(&self) -> (usize, usize) {
         (2, 0)
-    }
-
-    fn trace_length(&self) -> usize {
-        self.trace_length
-    }
-
-    fn pub_inputs(&self) -> &Self::PublicInputs {
-        &()
     }
 }
 

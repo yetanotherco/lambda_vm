@@ -26,8 +26,6 @@ jobs:
 
       - name: Setup Rust Environment
         uses: ./.github/actions/setup-rust
-        with:
-          components: rustfmt, clippy
 
       - name: Run cargo check
         run: cargo check
@@ -51,16 +49,13 @@ jobs:
       - name: Setup Rust Environment
         uses: ./.github/actions/setup-rust
 
-      - name: Install rust nightly
-        run: rustup component add rust-src --toolchain nightly-x86_64-unknown-linux-gnu
-
-      - name: Run asm tests
+      - name: Run asm tests 
         run: |
           cd executor && make test-asm-no-compile
 
       - name: Run rust tests
         run: |
-          cd executor && rustup target add riscv32im-unknown-none-elf && make test-rust
+          cd executor && make test-rust
 
       - name: Run prover tests
         run: |
