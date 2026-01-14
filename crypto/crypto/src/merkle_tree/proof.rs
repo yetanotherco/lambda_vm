@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 #[cfg(feature = "alloc")]
 use math::traits::Serializable;
 use math::{errors::DeserializationError, traits::Deserializable};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
 use super::{
     traits::IsMerkleTreeBackend,
@@ -72,6 +72,9 @@ where
     }
 }
 
+/// Stores a all the nodes needed to prove the inclusion of multiple leaves.
+/// Internally, the necessary hashes are stored from bottom (leaves) to top (root) and
+/// from left to right.
 #[derive(Debug, Clone)]
 pub struct BatchProof<T: PartialEq + Eq> {
     pub path: Vec<T>,
@@ -100,7 +103,7 @@ impl<T: PartialEq + Eq + Clone> BatchProof<T> {
             return false;
         }
 
-        // Index of the first leaf as it is ordered in the tree struct (from top to bottom)
+        // Index of the first leaf as it is ordered in the tree struct (from top to bottom).
         let first_leaf_index = num_leaves - 1;
         // We zip the input positions with the input values.
         // We need to convert leaf positions to internal tree indices by adding the index of the first leaf.
@@ -114,7 +117,7 @@ impl<T: PartialEq + Eq + Clone> BatchProof<T> {
         let mut proof_path_iter = self.path.iter();
 
         let num_levels = (2 * num_leaves).ilog2();
-        // Process level by level, same as get_batch_auth_path_positions
+        // Process level by level, same as `get_batch_auth_path_positions`.
         for _ in 0..num_levels - 1 {
             let mut next_level_known_nodes: BTreeMap<usize, T> = BTreeMap::new();
 
@@ -153,8 +156,6 @@ impl<T: PartialEq + Eq + Clone> BatchProof<T> {
         // Verify: root computed correctly and all proof nodes consumed.
         proof_path_iter.next().is_none()
             && current_level_known_nodes.len() == 1
-            && current_level_known_nodes
-                .get(&0)
-                .map_or(false, |h| h == root_hash)
+            && (current_level_known_nodes.get(&0) == Some(root_hash))
     }
 }

@@ -102,8 +102,8 @@ where
         Ok(merkle_path)
     }
 
-    /// Given a list of indices, returns a batch proof containing the nodes needed to verify all the leaves in those
-    /// indices belong to the tree.
+    /// Given a list of indices, returns a batch proof containing the nodes needed to verify taht all the leaves
+    /// in those indices belong to the tree.
     /// It Optimizes the number of nodes in the proof since the verifier can create some of them using
     /// the leaves and the parent node known by hashing.
     pub fn get_batch_proof(&self, pos_list: &[usize]) -> BatchProof<B::Node> {
@@ -130,9 +130,9 @@ where
     /// Returns the internal indices of nodes needed in the batch proof.
     ///
     /// The algorithm works level-by-level from leaves to root:
-    /// - For each node we can obtain, check if its sibling is also obtainable
-    /// - If not, the sibling must be included in the proof
-    /// - Parents of obtainable nodes become obtainable in the next level
+    /// - For each node we can obtain, check if its sibling is also obtainable.
+    /// - If not, the sibling must be included in the proof.
+    /// - Parents of obtainable nodes become obtainable in the next level.
     fn get_batch_auth_path_positions(&self, leaf_positions: &[usize]) -> Vec<usize> {
         let mut auth_path_set = BTreeSet::<usize>::new();
         let mut obtainable: HashSet<usize> = leaf_positions.iter().cloned().collect();
