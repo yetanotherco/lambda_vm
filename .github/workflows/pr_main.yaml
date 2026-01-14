@@ -10,7 +10,6 @@ on:
 permissions:
   contents: read
   actions: write
-  pull-requests: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
@@ -39,35 +38,9 @@ jobs:
         run: |
           cargo fmt --all -- --check
 
-  changes:
-    runs-on: ubuntu-latest
-    outputs:
-      executor: ${{ steps.filter.outputs.executor }}
-      prover: ${{ steps.filter.outputs.prover }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
-        id: filter
-        with:
-          filters: |
-            executor:
-              - 'executor/**'
-              - 'Cargo.lock'
-              - 'Cargo.toml'
-              - 'rust-toolchain.toml'
-              - '.github/actions/**'
-            prover:
-              - 'prover/**'
-              - 'crypto/**'
-              - 'executor/**'
-              - 'Cargo.lock'
-              - 'Cargo.toml'
-              - 'rust-toolchain.toml'
-              - '.github/actions/**'
-
-  test-executor:
-    needs: changes
-    if: needs.changes.outputs.executor == 'true'
+  test:
+    # "Test" is a required check, don't change the name
+    name: Test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout sources
@@ -75,42 +48,27 @@ jobs:
 
       - name: Setup Rust Environment
         uses: ./.github/actions/setup-rust
+
+      - name: Cache compiled Rust ELF artifacts
+        id: cache-elfs
+        uses: actions/cache@v4
+        with:
+          path: executor/program_artifacts/rust
+          key: elf-artifacts-${{ hashFiles('executor/programs/rust/**') }}
+
+      - name: Compile Rust programs to ELF
+        if: steps.cache-elfs.outputs.cache-hit != 'true'
+        run: |
+          cd executor && make compile-programs-rust
 
       - name: Run asm tests
         run: |
           cd executor && make test-asm-no-compile
 
-      - name: Run rust tests
+      - name: Run rust tests (no compile)
         run: |
-          cd executor && make test-rust
-
-  test-prover:
-    needs: changes
-    if: needs.changes.outputs.prover == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v4
-
-      - name: Setup Rust Environment
-        uses: ./.github/actions/setup-rust
+          cd executor && cargo test --test rust
 
       - name: Run prover tests
         run: |
           cd prover && cargo test
-
-  # "Test" is a required check, don't change the name
-  # This aggregator job always runs and reports the final status
-  test:
-    name: Test
-    needs: [test-executor, test-prover]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check test results
-        run: |
-          if [[ "${{ needs.test-executor.result }}" == "failure" || "${{ needs.test-prover.result }}" == "failure" ]]; then
-            echo "One or more test jobs failed"
-            exit 1
-          fi
-          echo "All test jobs passed or were skipped"
