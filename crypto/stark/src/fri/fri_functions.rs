@@ -3,6 +3,7 @@ use math::field::{element::FieldElement, traits::IsField};
 
 /// FRI polynomial folding: computes P_even(x) + beta * P_odd(x)
 /// where P(x) = P_even(x^2) + x * P_odd(x^2)
+#[allow(unused)]
 pub fn fold_polynomial<F>(
     poly: &Polynomial<FieldElement<F>>,
     beta: &FieldElement<F>,
@@ -32,6 +33,7 @@ where
 /// FRI polynomial folding with fused doubling: 2 * (P_even(x) + beta * P_odd(x))
 ///
 /// Uses `double()` which is more efficient than multiplication by 2.
+#[allow(unused)]
 pub fn fold_polynomial_doubled<F>(
     poly: &Polynomial<FieldElement<F>>,
     beta: &FieldElement<F>,
