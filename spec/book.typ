@@ -13,6 +13,7 @@
     #chapter("branch.typ")[BRANCH]
     #chapter("lt.typ")[LT]
     #chapter("mul.typ")[MUL chip]
+    #chapter("bitwise.typ")[BITWISE]
   ]
 )
 
