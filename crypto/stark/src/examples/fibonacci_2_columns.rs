@@ -180,7 +180,7 @@ where
         &self,
         pub_inputs: &Self::PublicInputs,
         _rap_challenges: &[FieldElement<Self::Field>],
-        _bus_interactions: Option<&[crate::lookup::BusPublicInputs<Self::FieldExtension>]>,
+        _bus_interaction: Option<&crate::lookup::BusPublicInputs<Self::FieldExtension>>,
         _trace_length: usize,
     ) -> BoundaryConstraints<Self::Field> {
         let a0 = BoundaryConstraint::new_main(0, 0, pub_inputs.a0.clone());

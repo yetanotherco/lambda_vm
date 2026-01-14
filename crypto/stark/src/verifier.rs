@@ -121,17 +121,12 @@ pub trait IsStarkVerifier<
 
         // <<<< Receive challenge: 𝛽
         let beta = transcript.sample_field_element();
-        let bus_interactions = if proof.bus_interactions.is_empty() {
-            None
-        } else {
-            Some(&proof.bus_interactions[..])
-        };
         let trace_length = proof.trace_length;
         let num_boundary_constraints = air
             .boundary_constraints(
                 &proof.public_inputs,
                 &rap_challenges,
-                bus_interactions,
+                proof.bus_interaction.as_ref(),
                 trace_length,
             )
             .constraints
@@ -252,16 +247,11 @@ pub trait IsStarkVerifier<
         domain: &Domain<Field>,
         challenges: &Challenges<FieldExtension>,
     ) -> bool {
-        let bus_interactions = if proof.bus_interactions.is_empty() {
-            None
-        } else {
-            Some(&proof.bus_interactions[..])
-        };
         let trace_length = proof.trace_length;
         let boundary_constraints = air.boundary_constraints(
             &proof.public_inputs,
             &challenges.rap_challenges,
-            bus_interactions,
+            proof.bus_interaction.as_ref(),
             trace_length,
         );
         let number_of_b_constraints = boundary_constraints.constraints.len();
@@ -837,7 +827,7 @@ pub trait IsStarkVerifier<
         if needs_logup_challenges {
             let mut total = FieldElement::<FieldExtension>::zero();
             for proof in &multi_proof.proofs {
-                for interaction in &proof.bus_interactions {
+                if let Some(interaction) = &proof.bus_interaction {
                     total = total + &interaction.final_accumulated;
                 }
             }
@@ -887,17 +877,12 @@ pub trait IsStarkVerifier<
 
         // <<<< Receive challenge: 𝛽
         let beta = transcript.sample_field_element();
-        let bus_interactions = if proof.bus_interactions.is_empty() {
-            None
-        } else {
-            Some(&proof.bus_interactions[..])
-        };
         let trace_length = proof.trace_length;
         let num_boundary_constraints = air
             .boundary_constraints(
                 &proof.public_inputs,
                 &rap_challenges,
-                bus_interactions,
+                proof.bus_interaction.as_ref(),
                 trace_length,
             )
             .constraints

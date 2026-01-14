@@ -203,7 +203,7 @@ where
         &self,
         pub_inputs: &Self::PublicInputs,
         _rap_challenges: &[FieldElement<Self::FieldExtension>],
-        _bus_interactions: Option<&[crate::lookup::BusPublicInputs<Self::FieldExtension>]>,
+        _bus_interaction: Option<&crate::lookup::BusPublicInputs<Self::FieldExtension>>,
         _trace_length: usize,
     ) -> BoundaryConstraints<Self::Field> {
         let initial_condition = BoundaryConstraint::new_main(0, 0, FieldElement::one());

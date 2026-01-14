@@ -89,8 +89,8 @@ pub trait AIR: Send + Sync {
         &self,
         _main_trace: &mut TraceTable<Self::Field, Self::FieldExtension>,
         _rap_challenges: &[FieldElement<Self::FieldExtension>],
-    ) -> Vec<BusPublicInputs<Self::FieldExtension>> {
-        Vec::new()
+    ) -> Option<BusPublicInputs<Self::FieldExtension>> {
+        None
     }
 
     fn build_rap_challenges(
@@ -135,7 +135,7 @@ pub trait AIR: Send + Sync {
         &self,
         pub_inputs: &Self::PublicInputs,
         rap_challenges: &[FieldElement<Self::FieldExtension>],
-        bus_interactions: Option<&[BusPublicInputs<Self::FieldExtension>]>,
+        bus_interaction: Option<&BusPublicInputs<Self::FieldExtension>>,
         trace_length: usize,
     ) -> BoundaryConstraints<Self::FieldExtension>;
 
