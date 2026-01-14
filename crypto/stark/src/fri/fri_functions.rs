@@ -1,9 +1,8 @@
 use super::Polynomial;
-use math::{
-    field::{element::FieldElement, traits::IsField},
-    polynomial,
-};
+use math::field::{element::FieldElement, traits::IsField};
 
+/// FRI polynomial folding: computes P_even(x) + beta * P_odd(x)
+/// where P(x) = P_even(x^2) + x * P_odd(x^2)
 pub fn fold_polynomial<F>(
     poly: &Polynomial<FieldElement<F>>,
     beta: &FieldElement<F>,
@@ -11,35 +10,98 @@ pub fn fold_polynomial<F>(
 where
     F: IsField,
 {
-    let coef = poly.coefficients();
-    let even_coef: Vec<FieldElement<F>> = coef.iter().step_by(2).cloned().collect();
+    let coefficients = poly.coefficients();
+    if coefficients.is_empty() {
+        return Polynomial::new(&[]);
+    }
 
-    // odd coeficients of poly are multiplied by beta
-    let odd_coef_mul_beta: Vec<FieldElement<F>> = coef
-        .iter()
-        .skip(1)
-        .step_by(2)
-        .map(|v| (v.clone()) * beta)
-        .collect();
+    let mut result = Vec::with_capacity(coefficients.len().div_ceil(2));
 
-    let (even_poly, odd_poly) = polynomial::pad_with_zero_coefficients(
-        &Polynomial::new(&even_coef),
-        &Polynomial::new(&odd_coef_mul_beta),
-    );
-    even_poly + odd_poly
+    for chunk in coefficients.chunks(2) {
+        let folded = if chunk.len() == 2 {
+            &chunk[0] + &(&chunk[1] * beta)
+        } else {
+            chunk[0].clone()
+        };
+        result.push(folded);
+    }
+
+    Polynomial::new(&result)
+}
+
+/// FRI polynomial folding with fused doubling: 2 * (P_even(x) + beta * P_odd(x))
+///
+/// Uses `double()` which is more efficient than multiplication by 2.
+pub fn fold_polynomial_doubled<F>(
+    poly: &Polynomial<FieldElement<F>>,
+    beta: &FieldElement<F>,
+) -> Polynomial<FieldElement<F>>
+where
+    F: IsField,
+{
+    let coefficients = poly.coefficients();
+    if coefficients.is_empty() {
+        return Polynomial::new(&[]);
+    }
+
+    let mut result = Vec::with_capacity(coefficients.len().div_ceil(2));
+
+    for chunk in coefficients.chunks(2) {
+        let folded = if chunk.len() == 2 {
+            (&chunk[0] + &(&chunk[1] * beta)).double()
+        } else {
+            chunk[0].double()
+        };
+        result.push(folded);
+    }
+
+    Polynomial::new(&result)
+}
+
+/// In-place FRI polynomial folding with fused doubling: 2 * (P_even(x) + beta * P_odd(x))
+///
+/// This modifies the polynomial in place, avoiding memory allocation.
+/// The polynomial degree is halved after this operation.
+pub fn fold_polynomial_doubled_inplace<F>(
+    poly: &mut Polynomial<FieldElement<F>>,
+    beta: &FieldElement<F>,
+) where
+    F: IsField,
+{
+    let coefficients = &mut poly.coefficients;
+    if coefficients.is_empty() {
+        return;
+    }
+
+    let new_len = coefficients.len().div_ceil(2);
+
+    // Fold in place: process pairs and write results back to the beginning
+    for i in 0..new_len {
+        let idx = i * 2;
+        let folded = if idx + 1 < coefficients.len() {
+            (&coefficients[idx] + &(&coefficients[idx + 1] * beta)).double()
+        } else {
+            coefficients[idx].double()
+        };
+        coefficients[i] = folded;
+    }
+
+    // Truncate to the new length
+    coefficients.truncate(new_len);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::fold_polynomial;
+    use super::{fold_polynomial, fold_polynomial_doubled, fold_polynomial_doubled_inplace};
     use math::field::element::FieldElement;
     use math::field::fields::u64_prime_field::U64PrimeField;
-    const MODULUS: u64 = 293;
-    type FE = FieldElement<U64PrimeField<MODULUS>>;
     use math::polynomial::Polynomial;
 
+    const MODULUS: u64 = 293;
+    type FE = FieldElement<U64PrimeField<MODULUS>>;
+
     #[test]
-    fn test_fold() {
+    fn test_fold_power_of_2() {
         let p0 = Polynomial::new(&[
             FE::new(3),
             FE::new(1),
@@ -47,21 +109,79 @@ mod tests {
             FE::new(7),
             FE::new(3),
             FE::new(5),
+            FE::new(4),
+            FE::new(2),
         ]);
         let beta = FE::new(4);
         let p1 = fold_polynomial(&p0, &beta);
         assert_eq!(
             p1,
-            Polynomial::new(&[FE::new(7), FE::new(30), FE::new(23),])
+            Polynomial::new(&[FE::new(7), FE::new(30), FE::new(23), FE::new(12)])
         );
 
         let gamma = FE::new(3);
         let p2 = fold_polynomial(&p1, &gamma);
-        assert_eq!(p2, Polynomial::new(&[FE::new(97), FE::new(23),]));
+        assert_eq!(p2, Polynomial::new(&[FE::new(97), FE::new(59)]));
 
         let delta = FE::new(2);
         let p3 = fold_polynomial(&p2, &delta);
-        assert_eq!(p3, Polynomial::new(&[FE::new(143)]));
+        assert_eq!(p3, Polynomial::new(&[FE::new(215)]));
         assert_eq!(p3.degree(), 0);
+    }
+
+    #[test]
+    fn test_fold_size_2() {
+        let p2 = Polynomial::new(&[FE::new(10), FE::new(20)]);
+        let beta = FE::new(3);
+        let result = fold_polynomial(&p2, &beta);
+        assert_eq!(result, Polynomial::new(&[FE::new(70)]));
+    }
+
+    #[test]
+    fn test_inplace_matches_regular() {
+        let p0 = Polynomial::new(&[
+            FE::new(3),
+            FE::new(1),
+            FE::new(2),
+            FE::new(7),
+            FE::new(3),
+            FE::new(5),
+            FE::new(4),
+            FE::new(2),
+        ]);
+        let beta = FE::new(4);
+
+        // Test that in-place matches regular folding with doubling
+        let expected = fold_polynomial_doubled(&p0, &beta);
+        let mut p_inplace = p0.clone();
+        fold_polynomial_doubled_inplace(&mut p_inplace, &beta);
+        assert_eq!(p_inplace, expected);
+
+        // Test multiple folds
+        let gamma = FE::new(3);
+        let expected2 = fold_polynomial_doubled(&expected, &gamma);
+        fold_polynomial_doubled_inplace(&mut p_inplace, &gamma);
+        assert_eq!(p_inplace, expected2);
+
+        let delta = FE::new(2);
+        let expected3 = fold_polynomial_doubled(&expected2, &delta);
+        fold_polynomial_doubled_inplace(&mut p_inplace, &delta);
+        assert_eq!(p_inplace, expected3);
+    }
+
+    #[test]
+    fn test_inplace_empty() {
+        let mut p: Polynomial<FE> = Polynomial::new(&[]);
+        let beta = FE::new(4);
+        fold_polynomial_doubled_inplace(&mut p, &beta);
+        assert!(p.coefficients.is_empty());
+    }
+
+    #[test]
+    fn test_inplace_single() {
+        let mut p = Polynomial::new(&[FE::new(5)]);
+        let beta = FE::new(4);
+        fold_polynomial_doubled_inplace(&mut p, &beta);
+        assert_eq!(p, Polynomial::new(&[FE::new(10)])); // 5 * 2 = 10
     }
 }

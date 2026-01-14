@@ -11,11 +11,11 @@ pub use math::{
     polynomial::Polynomial,
 };
 
-use crate::config::{BatchedMerkleTree, BatchedMerkleTreeBackend};
+use crate::config::{FriLayerMerkleTree, FriLayerMerkleTreeBackend};
 
 use self::fri_commitment::FriLayer;
 use self::fri_decommit::FriDecommitment;
-use self::fri_functions::fold_polynomial;
+use self::fri_functions::fold_polynomial_doubled_inplace;
 
 pub fn commit_phase<F: IsFFTField + IsSubFieldOf<E>, E: IsField>(
     number_layers: usize,
@@ -25,7 +25,7 @@ pub fn commit_phase<F: IsFFTField + IsSubFieldOf<E>, E: IsField>(
     domain_size: usize,
 ) -> (
     FieldElement<E>,
-    Vec<FriLayer<E, BatchedMerkleTreeBackend<E>>>,
+    Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>>,
 )
 where
     FieldElement<F>: AsBytes + Sync + Send,
@@ -34,7 +34,7 @@ where
     let mut domain_size = domain_size;
 
     let mut fri_layer_list = Vec::with_capacity(number_layers);
-    let mut current_layer: FriLayer<E, BatchedMerkleTreeBackend<E>>;
+    let mut current_layer: FriLayer<E, FriLayerMerkleTreeBackend<E>>;
     let mut current_poly = p_0;
 
     let mut coset_offset = coset_offset.clone();
@@ -45,8 +45,8 @@ where
         coset_offset = coset_offset.square();
         domain_size /= 2;
 
-        // Compute layer polynomial and domain
-        current_poly = FieldElement::<F>::from(2) * fold_polynomial(&current_poly, &zeta);
+        // In-place folding avoids memory allocation
+        fold_polynomial_doubled_inplace(&mut current_poly, &zeta);
         current_layer = new_fri_layer(&current_poly, &coset_offset, domain_size);
         let new_data = &current_layer.merkle_tree.root;
         fri_layer_list.push(current_layer.clone()); // TODO: remove this clone
@@ -58,9 +58,10 @@ where
     // <<<< Receive challenge: 𝜁ₙ₋₁
     let zeta = transcript.sample_field_element();
 
-    let last_poly = FieldElement::<F>::from(2) * fold_polynomial(&current_poly, &zeta);
+    // Final fold - still in-place
+    fold_polynomial_doubled_inplace(&mut current_poly, &zeta);
 
-    let last_value = last_poly
+    let last_value = current_poly
         .coefficients()
         .first()
         .unwrap_or(&FieldElement::zero())
@@ -73,7 +74,7 @@ where
 }
 
 pub fn query_phase<F: IsField>(
-    fri_layers: &Vec<FriLayer<F, BatchedMerkleTreeBackend<F>>>,
+    fri_layers: &Vec<FriLayer<F, FriLayerMerkleTreeBackend<F>>>,
     iotas: &[usize],
 ) -> Vec<FriDecommitment<F>>
 where
@@ -112,7 +113,7 @@ pub fn new_fri_layer<F: IsFFTField + IsSubFieldOf<E>, E: IsField>(
     poly: &Polynomial<FieldElement<E>>,
     coset_offset: &FieldElement<F>,
     domain_size: usize,
-) -> crate::fri::fri_commitment::FriLayer<E, BatchedMerkleTreeBackend<E>>
+) -> FriLayer<E, FriLayerMerkleTreeBackend<E>>
 where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
@@ -122,12 +123,13 @@ where
 
     in_place_bit_reverse_permute(&mut evaluation);
 
-    let mut to_commit = Vec::new();
-    for chunk in evaluation.chunks(2) {
-        to_commit.push(vec![chunk[0].clone(), chunk[1].clone()]);
-    }
+    // Use fixed-size arrays instead of Vec for each pair (avoids allocation per pair)
+    let leaves: Vec<[FieldElement<E>; 2]> = evaluation
+        .chunks_exact(2)
+        .map(|chunk| [chunk[0].clone(), chunk[1].clone()])
+        .collect();
 
-    let merkle_tree = BatchedMerkleTree::build(&to_commit).unwrap();
+    let merkle_tree = FriLayerMerkleTree::build(&leaves).unwrap();
 
     FriLayer::new(
         &evaluation,
