@@ -13,19 +13,15 @@ use std::collections::HashMap;
 #[cfg(feature = "std")]
 use std::sync::RwLock;
 
+type TwiddleCacheIndex = (u64, RootsConfig);
+
 /// A cache for storing pre-computed twiddle factors.
 /// This cache is thread-safe and can be shared across multiple FFT computations.
 /// Twiddles are stored by (order, config) pairs.
 #[cfg(feature = "std")]
+#[derive(Default)]
 pub struct TwiddleCache<F: IsFFTField> {
-    cache: RwLock<HashMap<(u64, RootsConfig), Vec<FieldElement<F>>>>,
-}
-
-#[cfg(feature = "std")]
-impl<F: IsFFTField> Default for TwiddleCache<F> {
-    fn default() -> Self {
-        Self::new()
-    }
+    cache: RwLock<HashMap<TwiddleCacheIndex, Vec<FieldElement<F>>>>,
 }
 
 #[cfg(feature = "std")]
