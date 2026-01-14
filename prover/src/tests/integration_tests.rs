@@ -25,8 +25,8 @@ pub fn run_program_and_prover(elf_path: &str) {
 
     let proof_options = ProofOptions::default_test_options();
 
-    let cpu_air = CPUTableAIR::new(trace.cpu_trace_table.num_rows(), &(), &proof_options);
-    let decode_air = DecodeTableAIR::new(trace.decode_trace_table.num_rows(), &(), &proof_options);
+    let cpu_air = CPUTableAIR::new(&proof_options);
+    let decode_air = DecodeTableAIR::new(&proof_options);
 
     let airs: Vec<(
         &dyn AIR<
@@ -35,9 +35,10 @@ pub fn run_program_and_prover(elf_path: &str) {
             PublicInputs = (),
         >,
         &mut _,
+        &(),
     )> = vec![
-        (&cpu_air, &mut trace.cpu_trace_table),
-        (&decode_air, &mut trace.decode_trace_table),
+        (&cpu_air, &mut trace.cpu_trace_table, &()),
+        (&decode_air, &mut trace.decode_trace_table, &()),
     ];
 
     let proofs = Prover::multi_prove(
@@ -46,17 +47,17 @@ pub fn run_program_and_prover(elf_path: &str) {
     )
     .unwrap();
 
-    let airs_and_proofs: Vec<(
+    let airs: Vec<
         &dyn AIR<
             Field = Babybear31PrimeField,
             FieldExtension = Degree4BabyBearU32ExtensionField,
             PublicInputs = (),
         >,
-        &_,
-    )> = vec![(&cpu_air, &proofs[0]), (&decode_air, &proofs[1])];
+    > = vec![&cpu_air, &decode_air];
 
     assert!(Verifier::multi_verify(
-        &airs_and_proofs,
+        &airs,
+        &proofs,
         &mut DefaultTranscript::<Degree4BabyBearU32ExtensionField>::new(&[]),
     ));
 }
