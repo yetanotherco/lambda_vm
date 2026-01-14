@@ -828,26 +828,23 @@ pub trait IsStarkVerifier<
         }
 
         // =====================================================================
-        // Bus Balance Check: Σ sender_values - Σ receiver_values = 0
+        // Bus Balance Check: Σ accumulated_values = 0
         // =====================================================================
-        // For LogUp, the sum of sender contributions minus receiver contributions must equal zero.
-        // This ensures that every value "sent" on the bus was "received" exactly once.
+        // For LogUp, each table has one accumulated column that sums all its terms.
+        // The sign (sender vs receiver) is already baked into the accumulated values,
+        // so the bus balances when the sum of all accumulated values equals zero.
 
         if needs_logup_challenges {
             let mut total = FieldElement::<FieldExtension>::zero();
             for proof in &multi_proof.proofs {
                 for interaction in &proof.bus_interactions {
-                    if interaction.is_sender {
-                        total = total + &interaction.final_accumulated;
-                    } else {
-                        total = total - &interaction.final_accumulated;
-                    }
+                    total = total + &interaction.final_accumulated;
                 }
             }
 
             if total != FieldElement::zero() {
                 #[cfg(not(feature = "test_fiat_shamir"))]
-                error!("LogUp bus does not balance: sender and receiver values do not match");
+                error!("LogUp bus does not balance: sum of accumulated values is not zero");
                 return false;
             }
         }
