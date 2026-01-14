@@ -3,6 +3,14 @@ use crate::field::{
     traits::{IsFFTField, IsField, IsSubFieldOf},
 };
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
+/// Minimum number of groups to trigger parallel execution.
+/// Below this threshold, sequential execution is faster due to parallelization overhead.
+#[cfg(feature = "parallel")]
+const PARALLEL_THRESHOLD: usize = 8;
+
 /// In-Place Radix-2 NR DIT FFT algorithm over a slice of two-adic field elements.
 /// It's required that the twiddle factors are in bit-reverse order. Else this function will not
 /// return fourier transformed values.
@@ -32,25 +40,65 @@ where
     // (group size).
 
     while group_count < input.len() {
-        #[allow(clippy::needless_range_loop)] // the suggestion would obfuscate a bit the algorithm
-        for group in 0..group_count {
-            let first_in_group = group * group_size;
-            let first_in_next_group = first_in_group + group_size / 2;
-
-            let w = &twiddles[group]; // a twiddle factor is used per group
-
-            for i in first_in_group..first_in_next_group {
-                let wi = w * &input[i + group_size / 2];
-
-                let y0 = &input[i] + &wi;
-                let y1 = &input[i] - &wi;
-
-                input[i] = y0;
-                input[i + group_size / 2] = y1;
+        #[cfg(feature = "parallel")]
+        {
+            if group_count >= PARALLEL_THRESHOLD {
+                // Parallel execution: each group works on disjoint memory regions
+                input
+                    .par_chunks_mut(group_size)
+                    .zip(twiddles.par_iter().take(group_count))
+                    .for_each(|(chunk, w)| {
+                        let half = group_size / 2;
+                        for i in 0..half {
+                            let wi = w * &chunk[i + half];
+                            let y0 = &chunk[i] + &wi;
+                            let y1 = &chunk[i] - &wi;
+                            chunk[i] = y0;
+                            chunk[i + half] = y1;
+                        }
+                    });
+            } else {
+                // Sequential execution for small group counts
+                fft_stage_sequential(input, twiddles, group_count, group_size);
             }
         }
+        #[cfg(not(feature = "parallel"))]
+        {
+            fft_stage_sequential(input, twiddles, group_count, group_size);
+        }
+
         group_count *= 2;
         group_size /= 2;
+    }
+}
+
+/// Sequential FFT stage helper function
+#[inline]
+fn fft_stage_sequential<F, E>(
+    input: &mut [FieldElement<E>],
+    twiddles: &[FieldElement<F>],
+    group_count: usize,
+    group_size: usize,
+) where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField,
+{
+    #[allow(clippy::needless_range_loop)]
+    for group in 0..group_count {
+        let first_in_group = group * group_size;
+        let first_in_next_group = first_in_group + group_size / 2;
+
+        let w = &twiddles[group];
+
+        for i in first_in_group..first_in_next_group {
+            let wi = w * &input[i + group_size / 2];
+
+            let y0 = &input[i] + &wi;
+            let y1 = &input[i] - &wi;
+
+            input[i] = y0;
+            input[i + group_size / 2] = y1;
+        }
     }
 }
 
@@ -138,42 +186,98 @@ where
     // by 4 (group size).
 
     while group_count < input.len() {
-        #[allow(clippy::needless_range_loop)] // the suggestion would obfuscate a bit the algorithm
-        for group in 0..group_count {
-            let first_in_group = group * group_size;
-            let first_in_next_group = first_in_group + group_size / 4;
+        #[cfg(feature = "parallel")]
+        {
+            if group_count >= PARALLEL_THRESHOLD {
+                // Parallel execution: each group works on disjoint memory regions
+                input
+                    .par_chunks_mut(group_size)
+                    .enumerate()
+                    .for_each(|(group, chunk)| {
+                        let (w1, w2, w3) = (
+                            &twiddles[group],
+                            &twiddles[2 * group],
+                            &twiddles[2 * group + 1],
+                        );
+                        let quarter = group_size / 4;
+                        for i in 0..quarter {
+                            let (j, k, l) = (i + quarter, i + 2 * quarter, i + 3 * quarter);
 
-            let (w1, w2, w3) = (
-                &twiddles[group],
-                &twiddles[2 * group],
-                &twiddles[2 * group + 1],
-            );
+                            let zw1 = w1 * &chunk[k];
+                            let tw1 = w1 * &chunk[l];
+                            let a = w2 * (&chunk[j] + &tw1);
+                            let b = w3 * (&chunk[j] - &tw1);
 
-            for i in first_in_group..first_in_next_group {
-                let (j, k, l) = (
-                    i + group_size / 4,
-                    i + group_size / 2,
-                    i + 3 * group_size / 4,
-                );
+                            let x = &chunk[i] + &zw1 + &a;
+                            let y = &chunk[i] + &zw1 - &a;
+                            let z = &chunk[i] - &zw1 + &b;
+                            let t = &chunk[i] - &zw1 - &b;
 
-                let zw1 = w1 * &input[k];
-                let tw1 = w1 * &input[l];
-                let a = w2 * (&input[j] + &tw1);
-                let b = w3 * (&input[j] - &tw1);
-
-                let x = &input[i] + &zw1 + &a;
-                let y = &input[i] + &zw1 - &a;
-                let z = &input[i] - &zw1 + &b;
-                let t = &input[i] - &zw1 - &b;
-
-                input[i] = x;
-                input[j] = y;
-                input[k] = z;
-                input[l] = t;
+                            chunk[i] = x;
+                            chunk[j] = y;
+                            chunk[k] = z;
+                            chunk[l] = t;
+                        }
+                    });
+            } else {
+                // Sequential execution for small group counts
+                fft4_stage_sequential(input, twiddles, group_count, group_size);
             }
         }
+        #[cfg(not(feature = "parallel"))]
+        {
+            fft4_stage_sequential(input, twiddles, group_count, group_size);
+        }
+
         group_count *= 4;
         group_size /= 4;
+    }
+}
+
+/// Sequential Radix-4 FFT stage helper function
+#[inline]
+fn fft4_stage_sequential<F, E>(
+    input: &mut [FieldElement<E>],
+    twiddles: &[FieldElement<F>],
+    group_count: usize,
+    group_size: usize,
+) where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField,
+{
+    #[allow(clippy::needless_range_loop)]
+    for group in 0..group_count {
+        let first_in_group = group * group_size;
+        let first_in_next_group = first_in_group + group_size / 4;
+
+        let (w1, w2, w3) = (
+            &twiddles[group],
+            &twiddles[2 * group],
+            &twiddles[2 * group + 1],
+        );
+
+        for i in first_in_group..first_in_next_group {
+            let (j, k, l) = (
+                i + group_size / 4,
+                i + group_size / 2,
+                i + 3 * group_size / 4,
+            );
+
+            let zw1 = w1 * &input[k];
+            let tw1 = w1 * &input[l];
+            let a = w2 * (&input[j] + &tw1);
+            let b = w3 * (&input[j] - &tw1);
+
+            let x = &input[i] + &zw1 + &a;
+            let y = &input[i] + &zw1 - &a;
+            let z = &input[i] - &zw1 + &b;
+            let t = &input[i] - &zw1 - &b;
+
+            input[i] = x;
+            input[j] = y;
+            input[k] = z;
+            input[l] = t;
+        }
     }
 }
 
