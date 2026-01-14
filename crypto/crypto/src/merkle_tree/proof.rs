@@ -105,14 +105,23 @@ impl<T: PartialEq + Eq + Clone> BatchProof<T> {
 
         // Index of the first leaf as it is ordered in the tree struct (from top to bottom).
         let first_leaf_index = num_leaves - 1;
-        // We zip the input positions with the input values.
-        // We need to convert leaf positions to internal tree indices by adding the index of the first leaf.
-        // We also need to hash all the values to obtain the leaf nodes.
-        let mut current_level_known_nodes: BTreeMap<usize, T> = pos_list
-            .iter()
-            .zip(values.iter())
-            .map(|(&pos, value)| (pos + first_leaf_index, B::hash_data(value)))
-            .collect();
+
+        // Build map of position → hashed value, validating that duplicate positions have the same value.
+        let mut current_level_known_nodes: BTreeMap<usize, T> = BTreeMap::new();
+        for (&pos, value) in pos_list.iter().zip(values.iter()) {
+            let tree_index = pos + first_leaf_index;
+            let hashed_value = B::hash_data(value);
+
+            if let Some(existing) = current_level_known_nodes.get(&tree_index) {
+                // Duplicate position: values must be the same
+                if existing != &hashed_value {
+                    return false;
+                }
+                // Same value, skip (deduplicate)
+            } else {
+                current_level_known_nodes.insert(tree_index, hashed_value);
+            }
+        }
 
         let mut proof_path_iter = self.path.iter();
 

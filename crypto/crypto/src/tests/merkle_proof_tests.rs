@@ -194,3 +194,105 @@ fn batch_proof_verify_fails_with_wrong_leaves_values() {
         8
     ));
 }
+
+#[test]
+fn batch_proof_duplicate_positions_are_deduplicated() {
+    const MODULUS: u64 = 70;
+    type U64PF = U64PrimeField<MODULUS>;
+    type FE = FieldElement<U64PF>;
+
+    let values: Vec<FE> = (1..=8).map(FE::new).collect();
+    let merkle_tree = MerkleTree::<TestBackend<U64PF>>::build(&values).unwrap();
+
+    // Position 0 appears twice - should be deduplicated in proof generation
+    let pos_list_with_duplicates = vec![0, 0, 1];
+    let batch_proof = merkle_tree.get_batch_proof(&pos_list_with_duplicates);
+
+    // Compare with clean version (no duplicates)
+    let pos_list_clean = vec![0, 1];
+    let batch_proof_clean = merkle_tree.get_batch_proof(&pos_list_clean);
+
+    // Both proofs should have the same path since duplicates are deduplicated
+    assert_eq!(batch_proof.path, batch_proof_clean.path);
+}
+
+#[test]
+fn batch_proof_duplicate_positions_with_conflicting_values_fails() {
+    const MODULUS: u64 = 70;
+    type U64PF = U64PrimeField<MODULUS>;
+    type FE = FieldElement<U64PF>;
+
+    let values: Vec<FE> = (1..=8).map(FE::new).collect();
+    let merkle_tree = MerkleTree::<TestBackend<U64PF>>::build(&values).unwrap();
+
+    let pos_list = vec![0, 1];
+    let batch_proof = merkle_tree.get_batch_proof(&pos_list);
+
+    // Duplicate position with different values should fail
+    let pos_list_duplicated = vec![0, 0, 1];
+    let values_conflicting = vec![FE::new(999), values[0], values[1]];
+
+    let result = batch_proof.verify::<TestBackend<U64PF>>(
+        &merkle_tree.root,
+        &pos_list_duplicated,
+        &values_conflicting,
+        8,
+    );
+    assert!(!result, "Conflicting values for same position should fail");
+}
+
+#[test]
+fn batch_proof_duplicate_positions_with_same_values_passes() {
+    const MODULUS: u64 = 70;
+    type U64PF = U64PrimeField<MODULUS>;
+    type FE = FieldElement<U64PF>;
+
+    let values: Vec<FE> = (1..=8).map(FE::new).collect();
+    let merkle_tree = MerkleTree::<TestBackend<U64PF>>::build(&values).unwrap();
+
+    let pos_list = vec![0, 1];
+    let batch_proof = merkle_tree.get_batch_proof(&pos_list);
+
+    // Duplicate position with same value should pass (deduplicated)
+    let pos_list_duplicated = vec![0, 0, 1];
+    let values_same = vec![values[0], values[0], values[1]];
+
+    let result = batch_proof.verify::<TestBackend<U64PF>>(
+        &merkle_tree.root,
+        &pos_list_duplicated,
+        &values_same,
+        8,
+    );
+    assert!(result, "Same values for duplicate position should pass");
+}
+
+#[test]
+fn batch_proof_all_leaves_has_empty_path() {
+    const MODULUS: u64 = 512;
+    type U64PF = U64PrimeField<MODULUS>;
+    type FE = FieldElement<U64PF>;
+
+    let values: Vec<FE> = (1..=16).map(FE::new).collect();
+    let merkle_tree = MerkleTree::<TestBackend<U64PF>>::build(&values).unwrap();
+
+    // Prove all leaves - no extra nodes needed since all parents are computable
+    let pos_list: Vec<usize> = (0..16).collect();
+    let batch_proof = merkle_tree.get_batch_proof(&pos_list);
+
+    // When proving all leaves, proof path should be empty
+    // because every sibling is already known (it's another leaf we're proving)
+    assert_eq!(
+        batch_proof.path.len(),
+        0,
+        "Proving all leaves should require no additional proof nodes"
+    );
+
+    // Verification should still work
+    let leaves_to_verify: Vec<FE> = pos_list.iter().map(|&i| values[i]).collect();
+    assert!(batch_proof.verify::<TestBackend<U64PF>>(
+        &merkle_tree.root,
+        &pos_list,
+        &leaves_to_verify,
+        16
+    ));
+}
