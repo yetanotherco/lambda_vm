@@ -6,6 +6,9 @@ use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use math::field::traits::{IsFFTField, IsField};
 use math::traits::AsBytes;
 use math::{fft::cpu::bit_reversing::in_place_bit_reverse_permute, field::traits::IsSubFieldOf};
+
+#[cfg(feature = "parallel")]
+use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 pub use math::{
     field::{element::FieldElement, fields::u64_prime_field::U64PrimeField},
     polynomial::Polynomial,
@@ -73,39 +76,45 @@ where
 }
 
 pub fn query_phase<F: IsField>(
-    fri_layers: &Vec<FriLayer<F, BatchedMerkleTreeBackend<F>>>,
+    fri_layers: &[FriLayer<F, BatchedMerkleTreeBackend<F>>],
     iotas: &[usize],
 ) -> Vec<FriDecommitment<F>>
 where
     FieldElement<F>: AsBytes + Sync + Send,
 {
-    if !fri_layers.is_empty() {
-        iotas
-            .iter()
-            .map(|iota_s| {
-                let mut layers_evaluations_sym = Vec::new();
-                let mut layers_auth_paths_sym = Vec::new();
-
-                let mut index = *iota_s;
-                for layer in fri_layers {
-                    // symmetric element
-                    let evaluation_sym = layer.evaluation[index ^ 1].clone();
-                    let auth_path_sym = layer.merkle_tree.get_proof_by_pos(index >> 1).unwrap();
-                    layers_evaluations_sym.push(evaluation_sym);
-                    layers_auth_paths_sym.push(auth_path_sym);
-
-                    index >>= 1;
-                }
-
-                FriDecommitment {
-                    layers_auth_paths: layers_auth_paths_sym,
-                    layers_evaluations_sym,
-                }
-            })
-            .collect()
-    } else {
-        vec![]
+    if fri_layers.is_empty() {
+        return vec![];
     }
+
+    let num_layers = fri_layers.len();
+
+    #[cfg(feature = "parallel")]
+    let iter = iotas.into_par_iter();
+    #[cfg(not(feature = "parallel"))]
+    let iter = iotas.iter();
+
+    iter.map(|iota_s| {
+        // Pre-allocate with exact capacity
+        let mut layers_evaluations_sym = Vec::with_capacity(num_layers);
+        let mut layers_auth_paths_sym = Vec::with_capacity(num_layers);
+
+        let mut index = *iota_s;
+        for layer in fri_layers {
+            // symmetric element
+            let evaluation_sym = layer.evaluation[index ^ 1].clone();
+            let auth_path_sym = layer.merkle_tree.get_proof_by_pos(index >> 1).unwrap();
+            layers_evaluations_sym.push(evaluation_sym);
+            layers_auth_paths_sym.push(auth_path_sym);
+
+            index >>= 1;
+        }
+
+        FriDecommitment {
+            layers_auth_paths: layers_auth_paths_sym,
+            layers_evaluations_sym,
+        }
+    })
+    .collect()
 }
 
 pub fn new_fri_layer<F: IsFFTField + IsSubFieldOf<E>, E: IsField>(
