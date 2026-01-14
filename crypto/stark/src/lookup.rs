@@ -254,7 +254,8 @@ pub struct TableInteraction {
     /// Column index containing the multiplicity for this interaction.
     /// Can be a binary flag (0 or 1) or a general multiplicity (0, 1, 2, ...).
     /// Determines how many times each row contributes to the bus.
-    pub multiplicity_column: usize,
+    /// If None, a constant multiplicity of 1 is used for all rows.
+    pub multiplicity_column: Option<usize>,
     pub value_columns: Vec<usize>,
     /// Whether this side of the interaction is a sender (true) or receiver (false).
     /// Senders contribute positive values to the bus sum, receivers contribute negative.
@@ -323,7 +324,18 @@ fn build_auxiliary_trace_column<F, E>(
         .iter()
         .map(|i| &main_segment_cols[*i])
         .collect::<Vec<_>>();
-    let multiplicity = &main_segment_cols[table_interaction.multiplicity_column];
+
+    let trace_len = trace.num_rows();
+
+    // Handle optional multiplicity column - use constant 1 if None
+    let multiplicity_owned: Vec<FieldElement<F>>;
+    let multiplicity: &[FieldElement<F>] = match table_interaction.multiplicity_column {
+        Some(col) => &main_segment_cols[col],
+        None => {
+            multiplicity_owned = vec![FieldElement::one(); trace_len];
+            &multiplicity_owned
+        }
+    };
 
     // LogUp challenges (must be shared across all tables for bus to balance)
     let z = &challenges[LOGUP_CHALLENGE_Z];
@@ -331,7 +343,6 @@ fn build_auxiliary_trace_column<F, E>(
     // Coefficients for each value column
     let coeffs: Vec<FieldElement<E>> = (0..values.len()).map(|i| alpha.pow(i)).collect();
 
-    let trace_len = trace.num_rows();
     let mut aux_col: Vec<FieldElement<E>> = Vec::new();
 
     // fingerprint = z - (v[0] * alpha^0 + v[1] * alpha^1 +...+ value[n] * alpha^n)
@@ -429,10 +440,11 @@ where
             let z = &rap_challenges[LOGUP_CHALLENGE_Z];
             let alpha = &rap_challenges[LOGUP_CHALLENGE_ALPHA];
 
-            // Main frame elements
-            let multiplicity: FieldElement<A> = second_step
-                .get_main_evaluation_element(0, interaction.multiplicity_column)
-                .clone();
+            // Main frame elements - handle optional multiplicity
+            let multiplicity = match interaction.multiplicity_column {
+                Some(col) => second_step.get_main_evaluation_element(0, col).clone(),
+                None => FieldElement::<A>::one(),
+            };
             let values = interaction
                 .value_columns
                 .iter()
