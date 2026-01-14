@@ -313,6 +313,10 @@ where
 /// compute a transition.
 /// Example: For a simple Fibonacci computation, if t(x) is the trace polynomial of
 /// the computation, this will output evaluations t(x), t(g * x), t(g^2 * z).
+/// Returns the Out of Domain Frame for the given trace polynomials.
+///
+/// Uses precomputed powers for efficient batch evaluation of multiple polynomials
+/// at each evaluation point.
 pub fn get_trace_evaluations<F, E>(
     main_trace_polys: &[Polynomial<FieldElement<F>>],
     aux_trace_polys: &[Polynomial<FieldElement<E>>],
@@ -325,6 +329,8 @@ where
     F: IsSubFieldOf<E>,
     E: IsField,
 {
+    use math::polynomial::precompute_powers;
+
     let evaluation_points = frame_offsets
         .iter()
         .flat_map(|offset| {
@@ -335,25 +341,37 @@ where
         .map(|exponent| primitive_root.pow(exponent) * x)
         .collect_vec();
 
-    let main_evaluations = evaluation_points
+    // Find max polynomial degree once for power precomputation
+    let max_main_len = main_trace_polys
         .iter()
-        .map(|eval_point| {
-            main_trace_polys
-                .iter()
-                .map(|main_poly| main_poly.evaluate(eval_point))
-                .collect_vec()
-        })
-        .collect_vec();
+        .map(|p| p.coeff_len())
+        .max()
+        .unwrap_or(0);
+    let max_aux_len = aux_trace_polys
+        .iter()
+        .map(|p| p.coeff_len())
+        .max()
+        .unwrap_or(0);
+    let max_len = max_main_len.max(max_aux_len);
 
-    let aux_evaluations = evaluation_points
+    // Evaluate all polynomials (main and aux) at each point using precomputed powers
+    // Powers are computed once per evaluation point and reused for all polynomials
+    let (main_evaluations, aux_evaluations): (Vec<_>, Vec<_>) = evaluation_points
         .iter()
         .map(|eval_point| {
-            aux_trace_polys
+            // Precompute powers once for both main and aux polynomials at this point
+            let powers = precompute_powers(eval_point, max_len);
+            let main_evals = main_trace_polys
                 .iter()
-                .map(|aux_poly| aux_poly.evaluate(eval_point))
-                .collect_vec()
+                .map(|main_poly| main_poly.evaluate_with_powers(&powers))
+                .collect_vec();
+            let aux_evals = aux_trace_polys
+                .iter()
+                .map(|aux_poly| aux_poly.evaluate_with_powers(&powers))
+                .collect_vec();
+            (main_evals, aux_evals)
         })
-        .collect_vec();
+        .unzip();
 
     debug_assert_eq!(main_evaluations.len(), aux_evaluations.len());
     let mut main_evaluations = main_evaluations;
