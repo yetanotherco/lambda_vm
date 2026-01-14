@@ -10,6 +10,7 @@ use math::field::{
 /// Since this struct is a representation of a two-dimensional table, all rows should have the same
 /// length.
 #[derive(Clone, Default, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(bound = "")]
 pub struct Table<F: IsField> {
     pub data: Vec<FieldElement<F>>,
     pub width: usize,
