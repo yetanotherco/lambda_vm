@@ -7,12 +7,12 @@ use math::field::traits::{IsFFTField, IsField};
 use math::traits::AsBytes;
 use math::{fft::cpu::bit_reversing::in_place_bit_reverse_permute, field::traits::IsSubFieldOf};
 
-#[cfg(feature = "parallel")]
-use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 pub use math::{
     field::{element::FieldElement, fields::u64_prime_field::U64PrimeField},
     polynomial::Polynomial,
 };
+#[cfg(feature = "parallel")]
+use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 
 use crate::config::{BatchedMerkleTree, BatchedMerkleTreeBackend};
 
