@@ -354,6 +354,8 @@ fn build_auxiliary_trace_column<F, E>(
     // fingerprint = z - (v[0] * alpha^0 + v[1] * alpha^1 +...+ value[n] * alpha^n)
     // Where v are the values for each row and n the number of value columns
     // We calculate the first fingerprint separately using the values from the first row
+    // Fingerprint can only be zero if z equals the linear combination of values,
+    // which happens with negligible probability since z is randomly sampled over the extension field
     let fingerprint_inv: FieldElement<E> = (-(values
         .iter()
         .zip(coeffs.iter())
@@ -361,7 +363,7 @@ fn build_auxiliary_trace_column<F, E>(
         .sum::<FieldElement<E>>())
         + z)
         .inv()
-        .unwrap();
+        .expect("fingerprint is zero - probability of sampling zero is negligible");
     // Fill first aux column row
     aux_col.push(&multiplicity[0] * fingerprint_inv);
 
@@ -375,7 +377,7 @@ fn build_auxiliary_trace_column<F, E>(
             .sum::<FieldElement<E>>())
             + z)
             .inv()
-            .unwrap();
+            .expect("fingerprint is zero - probability of sampling zero is negligible");
         // Fill the auxiliary column row
         aux_col.push(&aux_col[i] + &multiplicity[i + 1] * fingerprint_inv);
     }
