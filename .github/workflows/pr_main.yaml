@@ -61,8 +61,6 @@ jobs:
         with:
           path: executor/program_artifacts/rust
           key: elf-artifacts-${{ hashFiles('executor/programs/rust/**') }}
-          restore-keys: |
-            elf-artifacts-
 
       - name: Compile Rust programs to ELF
         if: steps.cache-elfs.outputs.cache-hit != 'true'
