@@ -71,7 +71,7 @@ desc = "selects which output of `MUL` (lo/hi) or `DVRM` (quo/rem) is wanted."
 [[variables.output]]
 name = "word_instr"
 type = "Bit"
-desc = "Whether the instruction is a `*W` instruction, requiring the inputs and outputs to be (sign) extended"
+desc = "Whether the instruction is a `*W` instruction, requiring the inputs and outputs to be (sign) extended."
 
 [[variables.output]]
 name = "one_hot"
