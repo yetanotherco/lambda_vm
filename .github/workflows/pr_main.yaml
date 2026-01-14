@@ -27,6 +27,9 @@ jobs:
       - name: Setup Rust Environment
         uses: ./.github/actions/setup-rust
 
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+
       - name: Run cargo check
         run: cargo check
 
@@ -48,6 +51,9 @@ jobs:
 
       - name: Setup Rust Environment
         uses: ./.github/actions/setup-rust
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
 
       - name: Cache compiled Rust ELF artifacts
         id: cache-elfs
