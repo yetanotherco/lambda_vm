@@ -137,8 +137,8 @@ where
         let mut auth_path_set = BTreeSet::<usize>::new();
         let mut obtainable: HashSet<usize> = leaf_positions.iter().cloned().collect();
 
-        // Number of levels in tree (integer math, avoids float precision issues)
-        let num_levels = (usize::BITS - self.nodes.len().leading_zeros()) as usize;
+        // Number of levels in tree
+        let num_levels = (self.nodes.len() + 1).ilog2();
 
         for _ in 0..num_levels - 1 {
             let mut next_obtainable = HashSet::with_capacity(obtainable.len());
@@ -147,9 +147,9 @@ where
                 let sibling_pos = get_sibiling_pos(pos);
 
                 // If sibling not obtainable, include it in the proof
-                let sibling_is_obtainable = obtainable.contains(&sibling_pos)
-                    || auth_path_set.contains(&sibling_pos);
-                    
+                let sibling_is_obtainable =
+                    obtainable.contains(&sibling_pos) || auth_path_set.contains(&sibling_pos);
+
                 if !sibling_is_obtainable {
                     auth_path_set.insert(sibling_pos);
                 }
