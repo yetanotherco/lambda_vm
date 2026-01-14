@@ -97,6 +97,7 @@ jobs:
 
       - name: Run prover tests
         run: |
+          cd executor && compile-programs-rust
           cd prover && cargo test
 
   # "Test" is a required check, don't change the name
