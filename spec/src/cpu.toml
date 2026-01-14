@@ -582,7 +582,6 @@ kind = "interaction"
 tag = "MEMW"
 input = [1, ["*", 2, "rd"], "rvd", ["+", "timestamp", 2], 1, 0, 0]
 
-# TODO: no types available, so no casting yet
 [[constraints.mem]]
 kind = "interaction"
 tag = "LOAD"
