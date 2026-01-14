@@ -95,7 +95,15 @@
     "not": (pp, rec, e) => cwrap(`1 - ` + rec(PREC.not, e.at(1)), pp < PREC.not),
     "+": (pp, rec, e) => cwrap(e.slice(1).map(rec.with(PREC.add)).join(` + `), pp < PREC.add),
     "sum": (pp, rec, e) => assert(false, message: "sum is unsupported in code."),
-    "*": (pp, rec, e) => cwrap(e.slice(1).map(rec.with(PREC.mul)).join(` ` + sym.dot + ` `), pp < PREC.mul),
+    "*": (pp, rec, e) => {
+      if e.len() == 3 and type(e.at(1)) == int and type(e.at(2)) == str and e.at(2).len() == 1 {
+        // multiplication of a constant with one-letter variable. 
+        // Dropping the "dot"
+        cwrap(e.slice(1).map(rec.with(PREC.mul)).join(``), pp < PREC.mul)
+      } else {
+        cwrap(e.slice(1).map(rec.with(PREC.mul)).join(` ` + sym.dot + ` `), pp < PREC.mul)
+      }
+    },
     "/": (pp, rec, e) => cwrap(rec(PREC.div, e.at(1)), pp < PREC.div) + ` / ` + rec(PREC.div, e.at(2)),
     "^": (pp, rec, e) => {
       assert(type(e.at(1)) == int and type(e.at(2)) == int, message: "Can only exponentiate constants")
