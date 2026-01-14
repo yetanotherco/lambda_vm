@@ -1,6 +1,6 @@
 use super::{
     config::BatchedMerkleTreeBackend,
-    domain::Domain,
+    domain::VerifierDomain,
     fri::fri_decommit::FriDecommitment,
     grinding,
     proof::stark::StarkProof,
@@ -8,7 +8,7 @@ use super::{
 };
 use crate::{
     config::Commitment,
-    domain::new_domain,
+    domain::new_verifier_domain,
     lookup::LOGUP_NUM_CHALLENGES,
     proof::stark::{DeepPolynomialOpening, MultiProof},
 };
@@ -82,10 +82,10 @@ pub trait IsStarkVerifier<
 {
     fn sample_query_indexes(
         number_of_queries: usize,
-        domain: &Domain<Field>,
+        domain: &VerifierDomain<Field>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
     ) -> Vec<usize> {
-        let domain_size = domain.lde_roots_of_unity_coset.len() as u64;
+        let domain_size = domain.lde_length as u64;
         (0..number_of_queries)
             .map(|_| (transcript.sample_u64(domain_size >> 1)) as usize)
             .collect::<Vec<usize>>()
@@ -95,7 +95,7 @@ pub trait IsStarkVerifier<
     fn step_1_replay_rounds_and_recover_challenges(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         proof: &StarkProof<Field, FieldExtension, PI>,
-        domain: &Domain<Field>,
+        domain: &VerifierDomain<Field>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
     ) -> Challenges<FieldExtension>
     where
@@ -154,9 +154,10 @@ pub trait IsStarkVerifier<
         // ===================================
 
         // >>>> Send challenge: z
-        let z = transcript.sample_z_ood(
-            &domain.lde_roots_of_unity_coset,
-            &domain.trace_roots_of_unity,
+        let z = transcript.sample_z_ood_with_domain_params(
+            domain.trace_length,
+            domain.lde_length,
+            &domain.coset_offset,
         );
 
         // <<<< Receive values: tⱼ(zgᵏ)
@@ -249,7 +250,7 @@ pub trait IsStarkVerifier<
     fn step_2_verify_claimed_composition_polynomial(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         proof: &StarkProof<Field, FieldExtension, PI>,
-        domain: &Domain<Field>,
+        domain: &VerifierDomain<Field>,
         challenges: &Challenges<FieldExtension>,
     ) -> bool {
         let bus_interactions = if proof.bus_interactions.is_empty() {
@@ -360,7 +361,7 @@ pub trait IsStarkVerifier<
     /// FRI decommitments are valid and correspond to the Deep composition polynomial.
     fn step_3_verify_fri(
         proof: &StarkProof<Field, FieldExtension, PI>,
-        domain: &Domain<Field>,
+        domain: &VerifierDomain<Field>,
         challenges: &Challenges<FieldExtension>,
     ) -> bool
     where
@@ -403,21 +404,19 @@ pub trait IsStarkVerifier<
     /// Returns the field element element of the domain `domain` corresponding to the given FRI query index challenge `iota`.
     fn query_challenge_to_evaluation_point(
         iota: usize,
-        domain: &Domain<Field>,
+        domain: &VerifierDomain<Field>,
     ) -> FieldElement<Field> {
-        domain.lde_roots_of_unity_coset
-            [reverse_index(iota * 2, domain.lde_roots_of_unity_coset.len() as u64)]
-        .clone()
+        let index = reverse_index(iota * 2, domain.lde_length as u64);
+        domain.lde_coset_element(index)
     }
 
     /// Returns the symmetric field element element of the domain `domain` corresponding to the given FRI query index challenge `iota`.
     fn query_challenge_to_evaluation_point_sym(
         iota: usize,
-        domain: &Domain<Field>,
+        domain: &VerifierDomain<Field>,
     ) -> FieldElement<Field> {
-        domain.lde_roots_of_unity_coset
-            [reverse_index(iota * 2 + 1, domain.lde_roots_of_unity_coset.len() as u64)]
-        .clone()
+        let index = reverse_index(iota * 2 + 1, domain.lde_length as u64);
+        domain.lde_coset_element(index)
     }
 
     /// Verifies the validity of the opening proof.
@@ -649,7 +648,7 @@ pub trait IsStarkVerifier<
 
     fn reconstruct_deep_composition_poly_evaluations_for_all_queries(
         challenges: &Challenges<FieldExtension>,
-        domain: &Domain<Field>,
+        domain: &VerifierDomain<Field>,
         proof: &StarkProof<Field, FieldExtension, PI>,
     ) -> DeepPolynomialEvaluations<FieldExtension> {
         let mut deep_poly_evaluations = Vec::new();
@@ -876,7 +875,7 @@ pub trait IsStarkVerifier<
     fn replay_rounds_after_round_1(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         proof: &StarkProof<Field, FieldExtension, PI>,
-        domain: &Domain<Field>,
+        domain: &VerifierDomain<Field>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
         rap_challenges: Vec<FieldElement<FieldExtension>>,
     ) -> Challenges<FieldExtension>
@@ -923,9 +922,10 @@ pub trait IsStarkVerifier<
         // ===================================
 
         // >>>> Send challenge: z
-        let z = transcript.sample_z_ood(
-            &domain.lde_roots_of_unity_coset,
-            &domain.trace_roots_of_unity,
+        let z = transcript.sample_z_ood_with_domain_params(
+            domain.trace_length,
+            domain.lde_length,
+            &domain.coset_offset,
         );
 
         // <<<< Receive values: tⱼ(zgᵏ)
@@ -1023,7 +1023,7 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        let domain = new_domain(air, proof.trace_length);
+        let domain = new_verifier_domain(air, proof.trace_length);
 
         // Verify there are enough queries
         if proof.query_list.len() < air.options().fri_number_of_queries {

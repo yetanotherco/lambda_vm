@@ -28,7 +28,7 @@ use crate::trace::{LDETraceTable, columns2rows};
 
 use super::config::{BatchedMerkleTree, Commitment};
 use super::constraints::evaluator::ConstraintEvaluator;
-use super::domain::Domain;
+use super::domain::{Domain, VerifierDomain};
 use super::fri::fri_decommit::FriDecommitment;
 use super::grinding;
 use super::lookup::BusPublicInputs;
@@ -1430,7 +1430,7 @@ mod tests {
     fn stone_compatibility_case_1_challenges() -> Challenges<Stark252PrimeField> {
         let (proof, air, _, seed, trace_length) = proof_parts_stone_compatibility_case_1();
 
-        let domain = Domain::new(&air, trace_length);
+        let domain = VerifierDomain::new(&air, trace_length);
         Verifier::step_1_replay_rounds_and_recover_challenges(
             &air,
             &proof,
@@ -1834,7 +1834,7 @@ mod tests {
         let (proof, options, seed) = proof_parts_stone_compatibility_case_2();
 
         let air = Fibonacci2ColsShifted::new(&options);
-        let domain = Domain::new(&air, proof.trace_length);
+        let domain = VerifierDomain::new(&air, proof.trace_length);
         Verifier::step_1_replay_rounds_and_recover_challenges(
             &air,
             &proof,
