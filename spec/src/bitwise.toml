@@ -57,13 +57,13 @@ precomputed = "true"
 [[variables.output]]
 name = "SLL"
 type = "Half"
-desc = "`X||Y` left-shifted by `Z`: $((#`X` + 256#`Y`) #`<<` #`Z`) mod 2^16$"
+desc = "`X||Y` logically left-shifted by `Z`: $((#`X` + 256#`Y`) #`<<` #`Z`) mod 2^16$"
 precomputed = "true"
 
 [[variables.output]]
 name = "SLLC"
 type = "Half"
-desc = "`X||Y` right-shifted by `Z`: $(#`X` + 256#`Y`) #`>>` (16 - #`Z`)$"
+desc = "`X||Y` logically right-shifted by `Z`: $(#`X` + 256#`Y`) #`>>` (16 - #`Z`)$"
 precomputed = "true"
 
 [[variables.multiplicity]]
@@ -189,12 +189,12 @@ multiplicity = ["-", "μ_IS_B20"]
 kind = "interaction"
 tag = "HWSL"
 input = [["+", "X", ["*", 256, "Y"]], "Z"]
-output = "HWSL"
+output = "SLL"
 multiplicity = ["-", "μ_HWSL"]
 
 [[constraints.contributions]]
 kind = "interaction"
 tag = "HWSLC"
 input = [["+", "X", ["*", 256, "Y"]], "Z"]
-output = "HWSLC"
+output = "SLLC"
 multiplicity = ["-", "μ_HWSLC"]
