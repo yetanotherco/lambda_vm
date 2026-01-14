@@ -354,6 +354,8 @@ fn build_logup_term_column<F, E>(
 
     for row in 0..trace_len {
         // fingerprint = z - (v[0] * alpha^0 + v[1] * alpha^1 +...+ value[n] * alpha^n)
+        // Fingerprint can only be zero if z equals the linear combination of values,
+        // which happens with negligible probability since z is randomly sampled over the extension field
         let fingerprint: FieldElement<E> = -(values
             .iter()
             .zip(coeffs.iter())
@@ -364,7 +366,11 @@ fn build_logup_term_column<F, E>(
         // term = sign * multiplicity / fingerprint
         // Convert multiplicity from base field F to extension field E
         let mult_ext: FieldElement<E> = multiplicity[row].clone().to_extension();
-        let term = &sign * mult_ext * fingerprint.inv().unwrap();
+        let term = &sign
+            * mult_ext
+            * fingerprint
+                .inv()
+                .expect("fingerprint is zero - probability of sampling zero is negligible");
         trace.set_aux(row, aux_column_idx, term);
     }
 }
