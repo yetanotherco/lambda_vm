@@ -55,7 +55,7 @@ jobs:
               - 'Cargo.lock'
               - 'Cargo.toml'
               - 'rust-toolchain.toml'
-              - '.github/actions/**'
+              - '.github/workflows/**'
             prover:
               - 'prover/**'
               - 'crypto/**'
@@ -63,7 +63,7 @@ jobs:
               - 'Cargo.lock'
               - 'Cargo.toml'
               - 'rust-toolchain.toml'
-              - '.github/actions/**'
+              - '.github/workflows/**'
 
   test-executor:
     needs: changes
