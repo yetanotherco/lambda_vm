@@ -28,7 +28,7 @@ use crate::trace::{LDETraceTable, columns2rows};
 
 use super::config::{BatchedMerkleTree, Commitment};
 use super::constraints::evaluator::ConstraintEvaluator;
-use super::domain::{Domain, VerifierDomain};
+use super::domain::Domain;
 use super::fri::fri_decommit::FriDecommitment;
 use super::grinding;
 use super::lookup::BusPublicInputs;
@@ -1251,6 +1251,7 @@ pub trait IsStarkProver<
 
 #[cfg(test)]
 mod tests {
+    use crate::domain::VerifierDomain;
     use std::num::ParseIntError;
 
     fn decode_hex(s: &str) -> Result<Vec<u8>, ParseIntError> {
