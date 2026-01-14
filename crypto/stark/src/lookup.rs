@@ -187,7 +187,7 @@ where
             .iter()
             .enumerate()
         {
-            build_term_column(i, interaction, trace, challenges);
+            build_logup_term_column(i, interaction, trace, challenges);
         }
 
         // Build accumulated column (sums all term columns across rows)
@@ -318,7 +318,7 @@ where
 /// Each row contains: sign * multiplicity[i] / fingerprint[i]
 /// where sign = +1 for senders, -1 for receivers.
 /// This is NOT accumulated - just the individual term for each row.
-fn build_term_column<F, E>(
+fn build_logup_term_column<F, E>(
     aux_column_idx: usize,
     table_interaction: &TableInteraction,
     trace: &mut TraceTable<F, E>,
