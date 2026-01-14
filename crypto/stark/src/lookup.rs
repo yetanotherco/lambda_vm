@@ -380,10 +380,8 @@ fn build_logup_term_column<F, E>(
             + z;
 
         // term = sign * multiplicity / fingerprint
-        // Convert multiplicity from base field F to extension field E
-        let mult_ext: FieldElement<E> = multiplicity[row].clone().to_extension();
-        let term = &sign
-            * mult_ext
+        let term = &multiplicity[row]
+            * &sign
             * fingerprint
                 .inv()
                 .expect("fingerprint is zero - probability of sampling zero is negligible");
@@ -510,9 +508,7 @@ where
 
             // Constraint: term * fingerprint = sign * multiplicity
             // Rearranged: term * fingerprint - sign * multiplicity = 0
-            // Convert multiplicity from base field A to extension field B
-            let mult_ext: FieldElement<B> = multiplicity.to_extension();
-            term * &fingerprint - sign * mult_ext
+            term * &fingerprint - multiplicity * sign
         }
 
         let res = match evaluation_context {
