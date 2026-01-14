@@ -27,7 +27,7 @@ Of these, the _input_ and _output_ variables (#nr_precomputed in total) are prec
 #render_chip_column_table(chip, config)
 
 *Note*: This table contains one row for every possible value of `(X, Y, Z)`.
-As such, it has length $2^5 dot 2^5 dot 2^4 = 2^(20)$.
+As such, it has length $2^8 dot 2^8 dot 2^4 = 2^(20)$.
 
 == Lookup
 This chip adds the following interactions to the lookup:
