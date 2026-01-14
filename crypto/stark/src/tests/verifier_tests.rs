@@ -99,24 +99,26 @@ fn test_verify_serialized_multi_table_proofs() {
             crate::trace::TraceTable::from_columns(cpu_main_columns, cpu_aux_columns, 1);
 
         // ADD Trace (4 rows, 4 main columns)
+        // 1 interaction = 1 term column + 1 accumulated column = 2 aux columns
         let add_a = vec![FE::from(1), FE::from(3), FE::from(5), FE::from(6)];
         let add_b = vec![FE::from(10), FE::from(30), FE::from(50), FE::from(60)];
         let add_c = vec![FE::from(11), FE::from(33), FE::from(55), FE::from(66)];
         let add_m = vec![FE::one(), FE::one(), FE::one(), FE::one()];
         let mut add_trace = crate::trace::TraceTable::from_columns(
             vec![add_a, add_b, add_c, add_m],
-            vec![vec![ExtFE::zero(); 4]],
+            vec![vec![ExtFE::zero(); 4], vec![ExtFE::zero(); 4]],
             1,
         );
 
         // MUL Trace (4 rows, 4 main columns)
+        // 1 interaction = 1 term column + 1 accumulated column = 2 aux columns
         let mul_a = vec![FE::from(2), FE::from(4), FE::from(7), FE::from(8)];
         let mul_b = vec![FE::from(20), FE::from(40), FE::from(70), FE::from(80)];
         let mul_c = vec![FE::from(40), FE::from(160), FE::from(490), FE::from(640)];
         let mul_m = vec![FE::one(), FE::one(), FE::one(), FE::one()];
         let mut mul_trace = crate::trace::TraceTable::from_columns(
             vec![mul_a, mul_b, mul_c, mul_m],
-            vec![vec![ExtFE::zero(); 4]],
+            vec![vec![ExtFE::zero(); 4], vec![ExtFE::zero(); 4]],
             1,
         );
 
