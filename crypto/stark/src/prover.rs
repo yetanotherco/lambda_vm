@@ -764,21 +764,20 @@ pub trait IsStarkProver<
             .reduce(Polynomial::zero, |a, b| a + b);
 
         #[cfg(not(feature = "parallel"))]
-        let main_trace_terms =
-            main_trace_polys
-                .iter()
-                .enumerate()
-                .fold(Polynomial::zero(), |trace_terms, (i, t_j)| {
-                    let gammas_i = &trace_terms_gammas[i];
-                    let trace_evaluations_i = &trace_evaluations_columns[i];
-                    Self::compute_trace_term_base(
-                        &trace_terms,
-                        t_j,
-                        gammas_i,
-                        trace_evaluations_i,
-                        (z, primitive_root),
-                    )
-                });
+        let main_trace_terms = main_trace_polys.iter().enumerate().fold(
+            Polynomial::zero(),
+            |trace_terms, (i, t_j)| {
+                let gammas_i = &trace_terms_gammas[i];
+                let trace_evaluations_i = &trace_evaluations_columns[i];
+                Self::compute_trace_term_base(
+                    &trace_terms,
+                    t_j,
+                    gammas_i,
+                    trace_evaluations_i,
+                    (z, primitive_root),
+                )
+            },
+        );
 
         // Process auxiliary trace polynomials (extension field) if present
         let aux_trace_terms = if let Some(aux_polys) = aux_trace_polys {
