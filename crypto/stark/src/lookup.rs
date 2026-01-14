@@ -164,6 +164,12 @@ where
         trace: &mut TraceTable<F, E>,
         challenges: &[FieldElement<E>],
     ) -> Vec<BusPublicInputs<E>> {
+        // Allocate aux table if not already present
+        let (_, num_aux_columns) = self.trace_layout();
+        if num_aux_columns > 0 && trace.num_aux_columns == 0 {
+            trace.allocate_aux_table(num_aux_columns);
+        }
+
         let last_row = trace.num_rows() - 1;
         let mut bus_interactions = Vec::new();
 
