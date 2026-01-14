@@ -83,7 +83,8 @@ impl<
         let num_interactions = auxiliary_trace_build_data.interactions.len();
 
         // Add a term constraint for each interaction
-        // Each term constraint checks: term[i] * fingerprint[i] = sign * multiplicity[i]
+        // Each term constraint verifies: term[i] = sign * multiplicity[i] / fingerprint[i]
+        // Rearranged as: term[i] * fingerprint[i] - sign * multiplicity[i] = 0
         for (i, interaction) in auxiliary_trace_build_data.interactions.iter().enumerate() {
             let constraint =
                 LookupTermConstraint::new(interaction.clone(), i, transition_constraints.len());
@@ -322,9 +323,15 @@ where
 }
 
 /// Builds a term column for a table interaction.
-/// Each row contains: sign * multiplicity[i] / fingerprint[i]
-/// where sign = +1 for senders, -1 for receivers.
-/// This is NOT accumulated - just the individual term for each row.
+///
+/// Each row contains the LogUp quotient: `term[i] = sign * multiplicity[i] / fingerprint[i]`
+///
+/// where:
+/// - `fingerprint[i] = z - (v0 + v1*α + v2*α² + ...)`
+/// - `sign = +1` for senders, `-1` for receivers
+/// - `multiplicity` = number of times this row contributes to the bus
+///
+/// This is NOT accumulated - just the individual contribution for each row.
 fn build_logup_term_column<F, E>(
     aux_column_idx: usize,
     table_interaction: &TableInteraction,
@@ -417,9 +424,14 @@ fn build_accumulated_column<F, E>(
 }
 
 /// Constraint for each term column.
-/// Checks that: aux_k[i] * fingerprint[i] = sign * multiplicity[i]
-/// where sign = +1 for senders, -1 for receivers.
-/// This is NOT a running sum - just verifying each term is correctly computed.
+///
+/// Verifies: `term[i] = sign * multiplicity[i] / fingerprint[i]`
+///
+/// Rearranged to avoid division: `term[i] * fingerprint[i] - sign * multiplicity[i] = 0`
+///
+/// where:
+/// - `fingerprint[i] = z - (v0 + v1*α + v2*α² + ...)`
+/// - `sign = +1` for senders, `-1` for receivers
 struct LookupTermConstraint {
     // Indicates columns with multiplicity and values used to compute the term
     interaction: TableInteraction,
@@ -541,8 +553,12 @@ where
 }
 
 /// Constraint for the accumulated column.
-/// Checks that: acc[i+1] = acc[i] + sum of all term columns at row i+1
-/// This is the running sum that accumulates all terms across all interactions.
+///
+/// Verifies: `acc[i+1] = acc[i] + sum_k(term_k[i+1])`
+///
+/// Rearranged: `acc[i+1] - acc[i] - sum_k(term_k[i+1]) = 0`
+///
+/// where `term_k[i] = sign * multiplicity[i] / fingerprint[i]` for the k-th interaction.
 struct LookupAccumulatedConstraint {
     // Index of the constraint
     constraint_idx: usize,
