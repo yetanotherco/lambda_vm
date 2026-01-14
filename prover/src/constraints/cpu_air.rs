@@ -143,7 +143,7 @@ impl AIR for CPUTableAIR {
         &self,
         _pub_inputs: &Self::PublicInputs,
         _rap_challenges: &[FieldElement<Self::FieldExtension>],
-        _bus_interactions: Option<&[stark::lookup::BusPublicInputs<Self::FieldExtension>]>,
+        _bus_interaction: Option<&stark::lookup::BusPublicInputs<Self::FieldExtension>>,
         _trace_length: usize,
     ) -> BoundaryConstraints<Self::FieldExtension> {
         BoundaryConstraints::from_constraints(vec![])
