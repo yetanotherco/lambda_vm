@@ -652,8 +652,9 @@ pub trait IsStarkVerifier<
         domain: &Domain<Field>,
         proof: &StarkProof<Field, FieldExtension, PI>,
     ) -> DeepPolynomialEvaluations<FieldExtension> {
-        let mut deep_poly_evaluations = Vec::new();
-        let mut deep_poly_evaluations_sym = Vec::new();
+        let num_queries = challenges.iotas.len();
+        let mut deep_poly_evaluations = Vec::with_capacity(num_queries);
+        let mut deep_poly_evaluations_sym = Vec::with_capacity(num_queries);
         for (i, iota) in challenges.iotas.iter().enumerate() {
             let primitive_root =
                 &Field::get_primitive_root_of_unity(domain.root_order as u64).unwrap();
