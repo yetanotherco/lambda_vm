@@ -27,6 +27,9 @@ jobs:
       - name: Setup Rust Environment
         uses: ./.github/actions/setup-rust
 
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+
       - name: Run cargo check
         run: cargo check
 
@@ -49,12 +52,17 @@ jobs:
       - name: Setup Rust Environment
         uses: ./.github/actions/setup-rust
 
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+
       - name: Cache compiled Rust ELF artifacts
         id: cache-elfs
         uses: actions/cache@v4
         with:
           path: executor/program_artifacts/rust
           key: elf-artifacts-${{ hashFiles('executor/programs/rust/**') }}
+          restore-keys: |
+            elf-artifacts-
 
       - name: Compile Rust programs to ELF
         if: steps.cache-elfs.outputs.cache-hit != 'true'
