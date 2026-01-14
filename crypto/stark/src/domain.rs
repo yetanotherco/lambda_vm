@@ -69,7 +69,6 @@ pub struct VerifierDomain<F: IsFFTField> {
     pub(crate) trace_primitive_root: FieldElement<F>,
     pub(crate) lde_primitive_root: FieldElement<F>,
     pub(crate) coset_offset: FieldElement<F>,
-    pub(crate) blowup_factor: usize,
 }
 
 impl<F: IsFFTField> VerifierDomain<F> {
@@ -95,7 +94,6 @@ impl<F: IsFFTField> VerifierDomain<F> {
             trace_primitive_root,
             lde_primitive_root,
             coset_offset,
-            blowup_factor,
         }
     }
 
@@ -175,6 +173,5 @@ where
         trace_primitive_root,
         lde_primitive_root,
         coset_offset,
-        blowup_factor,
     }
 }
