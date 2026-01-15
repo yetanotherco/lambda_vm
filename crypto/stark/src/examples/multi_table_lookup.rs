@@ -20,15 +20,9 @@ pub fn new_cpu_air_with_lookup(
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![
             // Interaction with ADD table (CPU sends to ADD bus)
-            BusInteraction::sender(
-                Some(0),
-                vec![Packing::Direct.at(2), Packing::Direct.at(3), Packing::Direct.at(4)],
-            ),
+            BusInteraction::sender(Some(0), Packing::Direct.columns(&[2, 3, 4])),
             // Interaction with MUL table (CPU sends to MUL bus)
-            BusInteraction::sender(
-                Some(1),
-                vec![Packing::Direct.at(2), Packing::Direct.at(3), Packing::Direct.at(4)],
-            ),
+            BusInteraction::sender(Some(1), Packing::Direct.columns(&[2, 3, 4])),
         ],
     };
 
@@ -49,10 +43,7 @@ pub fn new_mul_air_with_lookup(
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![
             // Interaction with CPU table (MUL table receives from MUL bus)
-            BusInteraction::receiver(
-                Some(3),
-                vec![Packing::Direct.at(0), Packing::Direct.at(1), Packing::Direct.at(2)],
-            ),
+            BusInteraction::receiver(Some(3), Packing::Direct.columns(&[0, 1, 2])),
         ],
     };
 
@@ -73,10 +64,7 @@ pub fn new_add_air_with_lookup(
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![
             // Interaction with CPU table (ADD table receives from ADD bus)
-            BusInteraction::receiver(
-                Some(3),
-                vec![Packing::Direct.at(0), Packing::Direct.at(1), Packing::Direct.at(2)],
-            ),
+            BusInteraction::receiver(Some(3), Packing::Direct.columns(&[0, 1, 2])),
         ],
     };
 

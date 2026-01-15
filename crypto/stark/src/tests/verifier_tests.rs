@@ -178,14 +178,8 @@ fn create_cpu_air(
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![
-            BusInteraction::sender(
-                Some(0),
-                vec![Packing::Direct.at(2), Packing::Direct.at(3), Packing::Direct.at(4)],
-            ),
-            BusInteraction::sender(
-                Some(1),
-                vec![Packing::Direct.at(2), Packing::Direct.at(3), Packing::Direct.at(4)],
-            ),
+            BusInteraction::sender(Some(0), Packing::Direct.columns(&[2, 3, 4])),
+            BusInteraction::sender(Some(1), Packing::Direct.columns(&[2, 3, 4])),
         ],
     };
     AirWithBuses::new(
@@ -202,10 +196,7 @@ fn create_add_air(
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: vec![BusInteraction::receiver(
-            Some(3),
-            vec![Packing::Direct.at(0), Packing::Direct.at(1), Packing::Direct.at(2)],
-        )],
+        interactions: vec![BusInteraction::receiver(Some(3), Packing::Direct.columns(&[0, 1, 2]))],
     };
     AirWithBuses::new(
         4, // ADD: a, b, c, multiplicity
@@ -221,10 +212,7 @@ fn create_mul_air(
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: vec![BusInteraction::receiver(
-            Some(3),
-            vec![Packing::Direct.at(0), Packing::Direct.at(1), Packing::Direct.at(2)],
-        )],
+        interactions: vec![BusInteraction::receiver(Some(3), Packing::Direct.columns(&[0, 1, 2]))],
     };
     AirWithBuses::new(
         4, // MUL: a, b, c, multiplicity

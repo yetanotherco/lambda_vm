@@ -143,16 +143,21 @@ impl Packing {
         }
     }
 
-    /// Creates a TypedValue starting at the given column.
+    /// Creates TypedValues at the given start columns.
+    ///
+    /// Each element in `start_columns` becomes a separate TypedValue using this packing.
     ///
     /// # Example
     /// ```ignore
-    /// Packing::Direct.at(0)   // column 0
-    /// Packing::DWordWL.at(1)  // columns 1, 2
-    /// Packing::Word4L.at(3)   // columns 3, 4, 5, 6
+    /// Packing::Direct.columns(&[0, 1, 2])  // 3 direct values at columns 0, 1, 2
+    /// Packing::DWordWL.columns(&[0, 2])    // 2 DWordWL values: cols 0-1 and cols 2-3
+    /// Packing::DWordHHW.columns(&[0])      // 1 DWordHHW value at cols 0, 1, 2
     /// ```
-    pub fn at(self, start_column: usize) -> TypedValue {
-        TypedValue::new(start_column, self)
+    pub fn columns(self, start_columns: &[usize]) -> Vec<TypedValue> {
+        start_columns
+            .iter()
+            .map(|&col| TypedValue::new(col, self))
+            .collect()
     }
 
     /// Combines column values into bus elements using powers of 2.
@@ -274,8 +279,8 @@ impl TypedValue {
     ///
     /// Prefer using `Packing::at()` instead:
     /// ```ignore
-    /// Packing::Direct.at(0)
-    /// Packing::DWordWL.at(1)
+    /// Packing::Direct.columns(0)
+    /// Packing::DWordWL.columns(1)
     /// ```
     pub fn new(start_column: usize, bus_type: Packing) -> Self {
         Self {
@@ -1065,14 +1070,10 @@ mod tests {
         // Create trace
         let mut trace: TraceTable<F, E> = TraceTable::from_columns_main(columns, 1);
 
-        // Define a typed interaction using Single type (no combining)
+        // Define a typed interaction using Direct (no combining)
         let interaction = BusInteraction::sender(
             Some(0), // multiplicity column
-            vec![
-                Packing::Direct.at(1), // a
-                Packing::Direct.at(2), // b
-                Packing::Direct.at(3), // c
-            ],
+            Packing::Direct.columns(&[1, 2, 3]), // a, b, c
         );
 
         let build_data = AuxiliaryTraceBuildData {
@@ -1128,14 +1129,8 @@ mod tests {
         let mut trace: TraceTable<F, E> = TraceTable::from_columns_main(columns, 1);
 
         // Define interaction with DWordWL types
-        let interaction = BusInteraction::sender(
-            Some(0),
-            vec![
-                Packing::DWordWL.at(1), // lhs: columns 1,2
-                Packing::DWordWL.at(3), // rhs: columns 3,4
-                Packing::DWordWL.at(5), // sum: columns 5,6
-            ],
-        );
+        // lhs: columns 1,2 | rhs: columns 3,4 | sum: columns 5,6
+        let interaction = BusInteraction::sender(Some(0), Packing::DWordWL.columns(&[1, 3, 5]));
 
         let build_data = AuxiliaryTraceBuildData {
             interactions: vec![interaction],
