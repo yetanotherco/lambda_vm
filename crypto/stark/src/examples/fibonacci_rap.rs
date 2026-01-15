@@ -244,7 +244,7 @@ where
         &self,
         _pub_inputs: &Self::PublicInputs,
         _rap_challenges: &[FieldElement<Self::FieldExtension>],
-        _bus_interaction: Option<&crate::lookup::BusPublicInputs<Self::FieldExtension>>,
+        _bus_public_inputs: Option<&crate::lookup::BusPublicInputs<Self::FieldExtension>>,
         _trace_length: usize,
     ) -> BoundaryConstraints<Self::FieldExtension> {
         // Main boundary constraints

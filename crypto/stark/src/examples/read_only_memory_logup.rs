@@ -463,7 +463,7 @@ where
         &self,
         pub_inputs: &Self::PublicInputs,
         rap_challenges: &[FieldElement<Self::FieldExtension>],
-        _bus_interaction: Option<&crate::lookup::BusPublicInputs<Self::FieldExtension>>,
+        _bus_public_inputs: Option<&crate::lookup::BusPublicInputs<Self::FieldExtension>>,
         trace_length: usize,
     ) -> BoundaryConstraints<Self::FieldExtension> {
         let a0 = &pub_inputs.a0;

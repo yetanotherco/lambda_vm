@@ -74,7 +74,7 @@ pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     // Contains initial and final aux column values, used for:
     // 1. Boundary constraints on aux columns (row 0 and last row)
     // 2. Bus balance check: Σ final_accumulated across all tables = 0
-    pub bus_interaction: Option<BusPublicInputs<E>>,
+    pub bus_public_inputs: Option<BusPublicInputs<E>>,
     // Public inputs used for boundary constraints
     pub public_inputs: PI,
 }

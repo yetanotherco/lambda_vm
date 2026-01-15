@@ -126,7 +126,7 @@ pub trait IsStarkVerifier<
             .boundary_constraints(
                 &proof.public_inputs,
                 &rap_challenges,
-                proof.bus_interaction.as_ref(),
+                proof.bus_public_inputs.as_ref(),
                 trace_length,
             )
             .constraints
@@ -251,7 +251,7 @@ pub trait IsStarkVerifier<
         let boundary_constraints = air.boundary_constraints(
             &proof.public_inputs,
             &challenges.rap_challenges,
-            proof.bus_interaction.as_ref(),
+            proof.bus_public_inputs.as_ref(),
             trace_length,
         );
         let number_of_b_constraints = boundary_constraints.constraints.len();
@@ -827,7 +827,7 @@ pub trait IsStarkVerifier<
         if needs_logup_challenges {
             let mut total = FieldElement::<FieldExtension>::zero();
             for proof in &multi_proof.proofs {
-                if let Some(interaction) = &proof.bus_interaction {
+                if let Some(interaction) = &proof.bus_public_inputs {
                     total = total + &interaction.final_accumulated;
                 }
             }
@@ -882,7 +882,7 @@ pub trait IsStarkVerifier<
             .boundary_constraints(
                 &proof.public_inputs,
                 &rap_challenges,
-                proof.bus_interaction.as_ref(),
+                proof.bus_public_inputs.as_ref(),
                 trace_length,
             )
             .constraints

@@ -222,14 +222,14 @@ where
         &self,
         pub_inputs: &Self::PublicInputs,
         rap_challenges: &[FieldElement<E>],
-        bus_interaction: Option<&BusPublicInputs<E>>,
+        bus_public_inputs: Option<&BusPublicInputs<E>>,
         trace_length: usize,
     ) -> BoundaryConstraints<E> {
         let mut boundary_constraints = vec![];
 
         // Boundary constraints for the accumulated column only
         // (term columns are fully determined by main trace and don't need boundary constraints)
-        if let Some(acc_interaction) = bus_interaction {
+        if let Some(acc_interaction) = bus_public_inputs {
             // The accumulated column is at index = num_interactions
             let acc_col_idx = self.auxiliary_trace_build_data.interactions.len();
 

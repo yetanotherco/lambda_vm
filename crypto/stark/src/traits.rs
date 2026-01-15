@@ -135,7 +135,7 @@ pub trait AIR: Send + Sync {
         &self,
         pub_inputs: &Self::PublicInputs,
         rap_challenges: &[FieldElement<Self::FieldExtension>],
-        bus_interaction: Option<&BusPublicInputs<Self::FieldExtension>>,
+        bus_public_inputs: Option<&BusPublicInputs<Self::FieldExtension>>,
         trace_length: usize,
     ) -> BoundaryConstraints<Self::FieldExtension>;
 

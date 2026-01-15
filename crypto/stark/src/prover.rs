@@ -100,7 +100,7 @@ where
     /// The challenges of the RAP round.
     pub(crate) rap_challenges: Vec<FieldElement<FieldExtension>>,
     /// Bus interaction public inputs (initial and final aux column values).
-    pub(crate) bus_interaction: Option<BusPublicInputs<FieldExtension>>,
+    pub(crate) bus_public_inputs: Option<BusPublicInputs<FieldExtension>>,
 }
 
 impl<Field, FieldExtension> Round1<Field, FieldExtension>
@@ -402,8 +402,8 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let (aux, aux_evaluations, bus_interaction) = if air.has_trace_interaction() {
-            let bus_interaction = air.build_auxiliary_trace(trace, &rap_challenges);
+        let (aux, aux_evaluations, bus_public_inputs) = if air.has_trace_interaction() {
+            let bus_public_inputs = air.build_auxiliary_trace(trace, &rap_challenges);
             let Some((
                 aux_trace_polys,
                 aux_trace_polys_evaluations,
@@ -418,7 +418,7 @@ pub trait IsStarkProver<
                 lde_trace_merkle_tree: aux_merkle_tree,
                 lde_trace_merkle_root: aux_merkle_root,
             });
-            (aux, aux_trace_polys_evaluations, bus_interaction)
+            (aux, aux_trace_polys_evaluations, bus_public_inputs)
         } else {
             (None, Vec::new(), None)
         };
@@ -435,7 +435,7 @@ pub trait IsStarkProver<
             main,
             aux,
             rap_challenges,
-            bus_interaction,
+            bus_public_inputs,
         })
     }
 
@@ -489,7 +489,7 @@ pub trait IsStarkProver<
             air,
             pub_inputs,
             &round_1_result.rap_challenges,
-            round_1_result.bus_interaction.as_ref(),
+            round_1_result.bus_public_inputs.as_ref(),
             trace_length,
         );
         let constraint_evaluations = evaluator.evaluate(
@@ -1092,7 +1092,7 @@ pub trait IsStarkProver<
             .boundary_constraints(
                 pub_inputs,
                 &round_1_result.rap_challenges,
-                round_1_result.bus_interaction.as_ref(),
+                round_1_result.bus_public_inputs.as_ref(),
                 trace_length,
             )
             .constraints
@@ -1231,7 +1231,7 @@ pub trait IsStarkProver<
             // nonce obtained from grinding
             nonce: round_4_result.nonce,
             // Bus interaction public inputs (for boundary constraints and bus balance check)
-            bus_interaction: round_1_result.bus_interaction.clone(),
+            bus_public_inputs: round_1_result.bus_public_inputs.clone(),
             // Public inputs for boundary constraints
             public_inputs: pub_inputs.clone(),
             trace_length: domain.interpolation_domain_size,

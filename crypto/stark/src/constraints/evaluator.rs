@@ -38,11 +38,11 @@ where
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         pub_inputs: &PI,
         rap_challenges: &[FieldElement<FieldExtension>],
-        bus_interaction: Option<&BusPublicInputs<FieldExtension>>,
+        bus_public_inputs: Option<&BusPublicInputs<FieldExtension>>,
         trace_length: usize,
     ) -> Self {
         let boundary_constraints =
-            air.boundary_constraints(pub_inputs, rap_challenges, bus_interaction, trace_length);
+            air.boundary_constraints(pub_inputs, rap_challenges, bus_public_inputs, trace_length);
 
         Self {
             boundary_constraints,
