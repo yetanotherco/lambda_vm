@@ -68,6 +68,14 @@ pub const LOGUP_NUM_CHALLENGES: usize = 2;
 /// - How many columns it consumes
 /// - How many bus elements it produces
 /// - The shift factors (powers of 2) used for combining
+///
+/// This enum covers all **unique combining patterns**. Composite spec types
+/// like `QuadWL` (4 words) or `QuadHL` (8 halves) don't need their own variants -
+/// they're just multiple applications of existing packings:
+/// - `QuadWL` = 4 × `Direct`
+/// - `QuadHL` = 4 × `Word2L`
+///
+/// The bus only cares about the combining math, not semantic type names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Packing {
     /// Direct: single field element, no combining.
