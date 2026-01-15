@@ -1,7 +1,7 @@
-//! Tests for invalid LogUp bus interactions.
+//! Soundness tests: invalid proofs are rejected.
 //!
-//! These tests verify that the verifier correctly rejects invalid proofs
-//! that violate the bus balance invariant.
+//! These tests verify that the verifier correctly rejects proofs that violate
+//! the bus balance invariant.
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
@@ -23,30 +23,28 @@ type E = Degree4BabyBearExtensionField;
 type FE = FieldElement<F>;
 
 // =============================================================================
-// Value manipulation attacks
+// Value manipulation
 // =============================================================================
 
-/// Cheating: receiver has wrong result value.
-/// CPU sends (1, 10, 11) but ADD table claims (1, 10, 99).
+/// Wrong result value: CPU sends (1, 10, 11) but ADD claims (1, 10, 99).
 #[test_log::test]
-fn test_cheating_wrong_result_value() {
+fn test_wrong_result_value() {
     let mut cpu_trace = TraceTable::from_columns_main(
         vec![
             vec![FE::one(), FE::zero(), FE::zero(), FE::zero()],
             vec![FE::zero(); 4],
             vec![FE::from(1), FE::zero(), FE::zero(), FE::zero()],
             vec![FE::from(10), FE::zero(), FE::zero(), FE::zero()],
-            vec![FE::from(11), FE::zero(), FE::zero(), FE::zero()], // CPU claims 1+10=11
+            vec![FE::from(11), FE::zero(), FE::zero(), FE::zero()],
         ],
         1,
     );
 
-    // CHEAT: ADD table has wrong result
     let mut add_trace = TraceTable::from_columns_main(
         vec![
             vec![FE::from(1), FE::zero(), FE::zero(), FE::zero()],
             vec![FE::from(10), FE::zero(), FE::zero(), FE::zero()],
-            vec![FE::from(99), FE::zero(), FE::zero(), FE::zero()], // WRONG! Should be 11
+            vec![FE::from(99), FE::zero(), FE::zero(), FE::zero()], // WRONG
             vec![FE::one(), FE::zero(), FE::zero(), FE::zero()],
         ],
         1,
@@ -83,34 +81,32 @@ fn test_cheating_wrong_result_value() {
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
 
-    // Verifier MUST reject
-    assert!(
-        !Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
-        "Verifier should reject proof with wrong result value"
-    );
+    assert!(!Verifier::multi_verify(
+        &airs,
+        &multi_proof,
+        &mut DefaultTranscript::<E>::new(&[])
+    ));
 }
 
-/// Cheating: off-by-one error (subtle attack).
-/// CPU sends (5, 3, 8) but ADD table claims (5, 3, 9).
+/// Off-by-one error: CPU sends (5, 3, 8) but ADD claims (5, 3, 9).
 #[test_log::test]
-fn test_cheating_off_by_one() {
+fn test_off_by_one() {
     let mut cpu_trace = TraceTable::from_columns_main(
         vec![
             vec![FE::one(), FE::zero(), FE::zero(), FE::zero()],
             vec![FE::zero(); 4],
             vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
             vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
-            vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()], // 5 + 3 = 8
+            vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
         ],
         1,
     );
 
-    // CHEAT: off by one
     let mut add_trace = TraceTable::from_columns_main(
         vec![
             vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
             vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
-            vec![FE::from(9), FE::zero(), FE::zero(), FE::zero()], // WRONG! Should be 8
+            vec![FE::from(9), FE::zero(), FE::zero(), FE::zero()], // WRONG: should be 8
             vec![FE::one(), FE::zero(), FE::zero(), FE::zero()],
         ],
         1,
@@ -147,91 +143,89 @@ fn test_cheating_off_by_one() {
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
 
-    assert!(
-        !Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
-        "Verifier should reject off-by-one error"
-    );
+    assert!(!Verifier::multi_verify(
+        &airs,
+        &multi_proof,
+        &mut DefaultTranscript::<E>::new(&[])
+    ));
 }
 
-/// Cheating: swapped operands.
-/// CPU sends (5, 3, 8) but ADD table claims (3, 5, 8).
+/// Swapped operands: CPU sends (5, 3, 8) but ADD claims (3, 5, 8).
 #[test_log::test]
-fn test_cheating_swapped_operands() {
-    let mut cpu_trace = TraceTable::from_columns_main(
-        vec![
-            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()],
-            vec![FE::zero(); 4],
-            vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()], // a = 5
-            vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()], // b = 3
-            vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
-        ],
-        1,
-    );
-
-    // CHEAT: operands swapped
-    let mut add_trace = TraceTable::from_columns_main(
-        vec![
-            vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()], // SWAPPED: was 5
-            vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()], // SWAPPED: was 3
-            vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
-            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()],
-        ],
-        1,
-    );
-
-    let mut mul_trace = TraceTable::from_columns_main(
-        vec![
-            vec![FE::zero(); 4],
-            vec![FE::zero(); 4],
-            vec![FE::zero(); 4],
-            vec![FE::zero(); 4],
-        ],
-        1,
-    );
-
-    let proof_options = ProofOptions::default_test_options();
-    let cpu_air = new_cpu_air_with_lookup(&proof_options);
-    let add_air = new_add_air_with_lookup(&proof_options);
-    let mul_air = new_mul_air_with_lookup(&proof_options);
-
-    let air_trace_pairs: Vec<(
-        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
-        _,
-        _,
-    )> = vec![
-        (&cpu_air, &mut cpu_trace, &()),
-        (&add_air, &mut add_trace, &()),
-        (&mul_air, &mut mul_trace, &()),
-    ];
-
-    let multi_proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
-
-    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
-        vec![&cpu_air, &add_air, &mul_air];
-
-    assert!(
-        !Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
-        "Verifier should reject swapped operands"
-    );
-}
-
-/// Cheating: only one column is wrong.
-/// CPU sends (5, 3, 8) but ADD table claims (5, 4, 8) - only 'b' differs.
-#[test_log::test]
-fn test_cheating_single_column_wrong() {
+fn test_swapped_operands() {
     let mut cpu_trace = TraceTable::from_columns_main(
         vec![
             vec![FE::one(), FE::zero(), FE::zero(), FE::zero()],
             vec![FE::zero(); 4],
             vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
-            vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()], // b = 3
+            vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
             vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
         ],
         1,
     );
 
-    // CHEAT: only 'b' is different
+    let mut add_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()], // SWAPPED
+            vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()], // SWAPPED
+            vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()],
+        ],
+        1,
+    );
+
+    let mut mul_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::zero(); 4],
+            vec![FE::zero(); 4],
+            vec![FE::zero(); 4],
+            vec![FE::zero(); 4],
+        ],
+        1,
+    );
+
+    let proof_options = ProofOptions::default_test_options();
+    let cpu_air = new_cpu_air_with_lookup(&proof_options);
+    let add_air = new_add_air_with_lookup(&proof_options);
+    let mul_air = new_mul_air_with_lookup(&proof_options);
+
+    let air_trace_pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&cpu_air, &mut cpu_trace, &()),
+        (&add_air, &mut add_trace, &()),
+        (&mul_air, &mut mul_trace, &()),
+    ];
+
+    let multi_proof =
+        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        vec![&cpu_air, &add_air, &mul_air];
+
+    assert!(!Verifier::multi_verify(
+        &airs,
+        &multi_proof,
+        &mut DefaultTranscript::<E>::new(&[])
+    ));
+}
+
+/// Single column wrong: CPU sends (5, 3, 8) but ADD claims (5, 4, 8).
+#[test_log::test]
+fn test_single_column_wrong() {
+    let mut cpu_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::zero(); 4],
+            vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
+        ],
+        1,
+    );
+
     let mut add_trace = TraceTable::from_columns_main(
         vec![
             vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
@@ -273,23 +267,23 @@ fn test_cheating_single_column_wrong() {
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
 
-    assert!(
-        !Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
-        "Verifier should reject when single column is wrong"
-    );
+    assert!(!Verifier::multi_verify(
+        &airs,
+        &multi_proof,
+        &mut DefaultTranscript::<E>::new(&[])
+    ));
 }
 
 // =============================================================================
-// Multiplicity manipulation attacks
+// Multiplicity manipulation
 // =============================================================================
 
-/// Cheating: receiver claims higher multiplicity than sent.
-/// CPU sends once, ADD claims multiplicity=2.
+/// Over-reported multiplicity: CPU sends once, ADD claims multiplicity=2.
 #[test_log::test]
-fn test_cheating_over_report_multiplicity() {
+fn test_over_report_multiplicity() {
     let mut cpu_trace = TraceTable::from_columns_main(
         vec![
-            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()], // sends once
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()],
             vec![FE::zero(); 4],
             vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
             vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
@@ -298,13 +292,12 @@ fn test_cheating_over_report_multiplicity() {
         1,
     );
 
-    // CHEAT: claims multiplicity=2 but CPU only sent once
     let mut add_trace = TraceTable::from_columns_main(
         vec![
             vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
             vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
             vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
-            vec![FE::from(2), FE::zero(), FE::zero(), FE::zero()], // CHEAT: mult=2
+            vec![FE::from(2), FE::zero(), FE::zero(), FE::zero()], // WRONG: mult=2
         ],
         1,
     );
@@ -340,17 +333,16 @@ fn test_cheating_over_report_multiplicity() {
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
 
-    assert!(
-        !Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
-        "Verifier should reject over-reported multiplicity"
-    );
+    assert!(!Verifier::multi_verify(
+        &airs,
+        &multi_proof,
+        &mut DefaultTranscript::<E>::new(&[])
+    ));
 }
 
-/// Cheating: receiver claims lower multiplicity than sent.
-/// CPU sends twice, ADD claims multiplicity=1.
+/// Under-reported multiplicity: CPU sends twice, ADD claims multiplicity=1.
 #[test_log::test]
-fn test_cheating_under_report_multiplicity() {
-    // CPU sends (5,3,8) twice
+fn test_under_report_multiplicity() {
     let mut cpu_trace = TraceTable::from_columns_main(
         vec![
             vec![FE::one(), FE::one(), FE::zero(), FE::zero()], // sends twice
@@ -362,13 +354,12 @@ fn test_cheating_under_report_multiplicity() {
         1,
     );
 
-    // CHEAT: claims multiplicity=1 but CPU sent twice
     let mut add_trace = TraceTable::from_columns_main(
         vec![
             vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
             vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
             vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
-            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()], // CHEAT: mult=1, should be 2
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()], // WRONG: mult=1, should be 2
         ],
         1,
     );
@@ -404,19 +395,19 @@ fn test_cheating_under_report_multiplicity() {
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
 
-    assert!(
-        !Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
-        "Verifier should reject under-reported multiplicity"
-    );
+    assert!(!Verifier::multi_verify(
+        &airs,
+        &multi_proof,
+        &mut DefaultTranscript::<E>::new(&[])
+    ));
 }
 
-/// Cheating: receiver sets multiplicity=0 to skip receiving.
-/// CPU sends, but ADD doesn't receive (mult=0).
+/// Zero multiplicity skip: CPU sends, ADD sets multiplicity=0 to skip.
 #[test_log::test]
-fn test_cheating_zero_multiplicity_skip() {
+fn test_zero_multiplicity_skip() {
     let mut cpu_trace = TraceTable::from_columns_main(
         vec![
-            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()], // sends once
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()],
             vec![FE::zero(); 4],
             vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
             vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
@@ -425,13 +416,12 @@ fn test_cheating_zero_multiplicity_skip() {
         1,
     );
 
-    // CHEAT: ADD sets multiplicity=0, effectively not receiving
     let mut add_trace = TraceTable::from_columns_main(
         vec![
             vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
             vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
             vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
-            vec![FE::zero(), FE::zero(), FE::zero(), FE::zero()], // CHEAT: mult=0
+            vec![FE::zero(), FE::zero(), FE::zero(), FE::zero()], // WRONG: mult=0
         ],
         1,
     );
@@ -467,25 +457,24 @@ fn test_cheating_zero_multiplicity_skip() {
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
 
-    assert!(
-        !Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
-        "Verifier should reject when receiver skips with zero multiplicity"
-    );
+    assert!(!Verifier::multi_verify(
+        &airs,
+        &multi_proof,
+        &mut DefaultTranscript::<E>::new(&[])
+    ));
 }
 
 // =============================================================================
-// Structural attacks (missing sender/receiver)
+// Structural (missing sender/receiver)
 // =============================================================================
 
-/// Cheating: receiver without matching sender.
-/// ADD table receives something that CPU never sent.
+/// Phantom receive: ADD receives something CPU never sent.
 #[test_log::test]
-fn test_cheating_phantom_receive() {
-    // CPU sends nothing (all flags = 0)
+fn test_phantom_receive() {
     let mut cpu_trace = TraceTable::from_columns_main(
         vec![
             vec![FE::zero(); 4], // no ADD operations
-            vec![FE::zero(); 4], // no MUL operations
+            vec![FE::zero(); 4],
             vec![FE::zero(); 4],
             vec![FE::zero(); 4],
             vec![FE::zero(); 4],
@@ -493,13 +482,12 @@ fn test_cheating_phantom_receive() {
         1,
     );
 
-    // CHEAT: ADD claims to receive something that was never sent
     let mut add_trace = TraceTable::from_columns_main(
         vec![
-            vec![FE::from(999), FE::zero(), FE::zero(), FE::zero()], // phantom operation
+            vec![FE::from(999), FE::zero(), FE::zero(), FE::zero()], // phantom
             vec![FE::from(888), FE::zero(), FE::zero(), FE::zero()],
             vec![FE::from(1887), FE::zero(), FE::zero(), FE::zero()],
-            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()], // CHEAT: receiving phantom
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()], // WRONG: receiving phantom
         ],
         1,
     );
@@ -535,20 +523,19 @@ fn test_cheating_phantom_receive() {
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
 
-    assert!(
-        !Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
-        "Verifier should reject phantom receive (no matching sender)"
-    );
+    assert!(!Verifier::multi_verify(
+        &airs,
+        &multi_proof,
+        &mut DefaultTranscript::<E>::new(&[])
+    ));
 }
 
-/// Cheating: sender without matching receiver.
-/// CPU sends to ADD but ADD table doesn't receive.
+/// Missing receiver: CPU sends but ADD has completely different values.
 #[test_log::test]
-fn test_cheating_missing_receiver() {
-    // CPU sends to ADD
+fn test_missing_receiver() {
     let mut cpu_trace = TraceTable::from_columns_main(
         vec![
-            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()], // sends to ADD
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()],
             vec![FE::zero(); 4],
             vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
             vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
@@ -557,7 +544,6 @@ fn test_cheating_missing_receiver() {
         1,
     );
 
-    // CHEAT: ADD doesn't receive (wrong values, so fingerprint won't match)
     let mut add_trace = TraceTable::from_columns_main(
         vec![
             vec![FE::from(100), FE::zero(), FE::zero(), FE::zero()], // completely different
@@ -599,37 +585,31 @@ fn test_cheating_missing_receiver() {
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
 
-    assert!(
-        !Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
-        "Verifier should reject when receiver doesn't match sender"
-    );
+    assert!(!Verifier::multi_verify(
+        &airs,
+        &multi_proof,
+        &mut DefaultTranscript::<E>::new(&[])
+    ));
 }
 
-// NOTE: "Wrong bus" test removed because the current implementation doesn't include
-// bus IDs in fingerprints. Buses are distinguished by which tables participate in
-// send/receive, not by explicit IDs. If values match, fingerprints match regardless
-// of the conceptual "bus". This is correct behavior for the current architecture.
-
 // =============================================================================
-// Complex multi-row attacks
+// Complex scenarios
 // =============================================================================
 
-/// Cheating: one of multiple operations has wrong value.
-/// CPU sends 4 ADD operations, but ADD table has one wrong.
+/// One of many wrong: 4 ADD operations, but one has wrong result.
 #[test_log::test]
-fn test_cheating_one_of_many_wrong() {
+fn test_one_of_many_wrong() {
     let mut cpu_trace = TraceTable::from_columns_main(
         vec![
             vec![FE::one(), FE::one(), FE::one(), FE::one()], // 4 ADD ops
             vec![FE::zero(); 4],
             vec![FE::from(1), FE::from(2), FE::from(3), FE::from(4)],
             vec![FE::from(10), FE::from(20), FE::from(30), FE::from(40)],
-            vec![FE::from(11), FE::from(22), FE::from(33), FE::from(44)], // correct results
+            vec![FE::from(11), FE::from(22), FE::from(33), FE::from(44)],
         ],
         1,
     );
 
-    // CHEAT: third row has wrong result
     let mut add_trace = TraceTable::from_columns_main(
         vec![
             vec![FE::from(1), FE::from(2), FE::from(3), FE::from(4)],
@@ -671,16 +651,16 @@ fn test_cheating_one_of_many_wrong() {
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
 
-    assert!(
-        !Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
-        "Verifier should reject when one of many operations is wrong"
-    );
+    assert!(!Verifier::multi_verify(
+        &airs,
+        &multi_proof,
+        &mut DefaultTranscript::<E>::new(&[])
+    ));
 }
 
-/// Full scenario from original tests: CPU + ADD + MUL with wrong ADD result.
+/// Full scenario with wrong ADD result.
 #[test_log::test]
-fn test_cheating_full_scenario_wrong_add_result() {
-    // Standard CPU trace with mixed ADD and MUL
+fn test_full_scenario_wrong_add() {
     let mut cpu_trace = TraceTable::from_columns_main(
         vec![
             vec![
@@ -737,7 +717,6 @@ fn test_cheating_full_scenario_wrong_add_result() {
         1,
     );
 
-    // CHEAT: ADD table has wrong result in first row
     let mut add_trace = TraceTable::from_columns_main(
         vec![
             vec![FE::from(1), FE::from(3), FE::from(5), FE::from(6)],
@@ -748,7 +727,6 @@ fn test_cheating_full_scenario_wrong_add_result() {
         1,
     );
 
-    // MUL table is correct
     let mut mul_trace = TraceTable::from_columns_main(
         vec![
             vec![FE::from(2), FE::from(4), FE::from(7), FE::from(8)],
@@ -780,15 +758,16 @@ fn test_cheating_full_scenario_wrong_add_result() {
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
 
-    assert!(
-        !Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
-        "Verifier should reject wrong ADD result in full scenario"
-    );
+    assert!(!Verifier::multi_verify(
+        &airs,
+        &multi_proof,
+        &mut DefaultTranscript::<E>::new(&[])
+    ));
 }
 
-/// Full scenario: CPU + ADD + MUL with wrong MUL result.
+/// Full scenario with wrong MUL result.
 #[test_log::test]
-fn test_cheating_full_scenario_wrong_mul_result() {
+fn test_full_scenario_wrong_mul() {
     let mut cpu_trace = TraceTable::from_columns_main(
         vec![
             vec![
@@ -845,7 +824,6 @@ fn test_cheating_full_scenario_wrong_mul_result() {
         1,
     );
 
-    // ADD table is correct
     let mut add_trace = TraceTable::from_columns_main(
         vec![
             vec![FE::from(1), FE::from(3), FE::from(5), FE::from(6)],
@@ -856,7 +834,6 @@ fn test_cheating_full_scenario_wrong_mul_result() {
         1,
     );
 
-    // CHEAT: MUL table has wrong result
     let mut mul_trace = TraceTable::from_columns_main(
         vec![
             vec![FE::from(2), FE::from(4), FE::from(7), FE::from(8)],
@@ -888,8 +865,9 @@ fn test_cheating_full_scenario_wrong_mul_result() {
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
 
-    assert!(
-        !Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
-        "Verifier should reject wrong MUL result in full scenario"
-    );
+    assert!(!Verifier::multi_verify(
+        &airs,
+        &multi_proof,
+        &mut DefaultTranscript::<E>::new(&[])
+    ));
 }
