@@ -14,6 +14,7 @@
     #chapter("memw.typ")[MEMW]
     #chapter("lt.typ")[LT]
     #chapter("mul.typ")[MUL chip]
+    #chapter("load.typ")[LOAD chip]
     #chapter("bitwise.typ")[BITWISE]
   ]
 )
