@@ -19,6 +19,17 @@ use crate::{
 };
 
 // =============================================================================
+// Shift Constants for Type Combining
+// =============================================================================
+
+/// 2^8 - shift for combining bytes
+pub const SHIFT_8: u64 = 256;
+/// 2^16 - shift for combining halves
+pub const SHIFT_16: u64 = 65536;
+/// 2^32 - shift for combining words
+pub const SHIFT_32: u64 = 4294967296;
+
+// =============================================================================
 // LogUp Challenge Indices
 // =============================================================================
 // The LogUp protocol requires two random challenges sampled via Fiat-Shamir:
@@ -42,6 +53,271 @@ pub const LOGUP_CHALLENGE_ALPHA: usize = 1;
 
 /// Number of challenges required by the LogUp protocol.
 pub const LOGUP_NUM_CHALLENGES: usize = 2;
+
+// =============================================================================
+// Bus Types
+// =============================================================================
+
+/// Defines how multiple columns (limbs) are combined into bus elements.
+///
+/// Values are combined in two stages:
+/// 1. **Casting** (powers of 2): Combine limbs within a type (e.g., 4 bytes → 1 word)
+/// 2. **Bus fingerprint** (powers of α): Combine all typed values into one fingerprint
+///
+/// Each variant specifies:
+/// - How many columns it consumes
+/// - How many bus elements it produces
+/// - The shift factors (powers of 2) used for combining
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BusType {
+    /// Single field element, no combining.
+    /// Columns: 1, Bus elements: 1
+    /// Used for: Bit, Byte, Half, Word, B4, B20, etc.
+    Single,
+
+    /// Two 16-bit halves → one 32-bit word.
+    /// Columns: 2, Bus elements: 1
+    /// Combination: h₀ + 2¹⁶·h₁
+    Word2L,
+
+    /// Four 8-bit bytes → one 32-bit word.
+    /// Columns: 4, Bus elements: 1
+    /// Combination: b₀ + 2⁸·b₁ + 2¹⁶·b₂ + 2²⁴·b₃
+    Word4L,
+
+    /// Two 32-bit words → two bus elements (no combining within, just grouping).
+    /// Columns: 2, Bus elements: 2
+    /// Each word stays as-is: [w₀, w₁]
+    /// Note: For bus, these become w₀ + α·w₁
+    DWordWL,
+
+    /// Four 16-bit halves → two bus elements (pairs combined).
+    /// Columns: 4, Bus elements: 2
+    /// Combination: [h₀ + 2¹⁶·h₁, h₂ + 2¹⁶·h₃]
+    DWordHL,
+
+    /// Eight 8-bit bytes → two bus elements (quads combined).
+    /// Columns: 8, Bus elements: 2
+    /// Combination: [b₀ + 2⁸·b₁ + 2¹⁶·b₂ + 2²⁴·b₃, b₄ + 2⁸·b₅ + 2¹⁶·b₆ + 2²⁴·b₇]
+    DWordBL,
+
+    /// Word + Half + Half → two bus elements.
+    /// Columns: 3, Bus elements: 2
+    /// Layout: [Word (LSB), Half, Half (MSB)]
+    /// Combination: [w₀, h₀ + 2¹⁶·h₁]
+    DWordHHW,
+
+    /// Half + Half + Word → two bus elements.
+    /// Columns: 3, Bus elements: 2
+    /// Layout: [Half (LSB), Half, Word (MSB)]
+    /// Combination: [h₀ + 2¹⁶·h₁, w₀]
+    DWordWHH,
+}
+
+impl BusType {
+    /// Returns the number of trace columns this type consumes.
+    pub fn num_columns(&self) -> usize {
+        match self {
+            BusType::Single => 1,
+            BusType::Word2L => 2,
+            BusType::Word4L => 4,
+            BusType::DWordWL => 2,
+            BusType::DWordHL => 4,
+            BusType::DWordBL => 8,
+            BusType::DWordHHW => 3,
+            BusType::DWordWHH => 3,
+        }
+    }
+
+    /// Returns the number of bus elements this type produces after combining.
+    pub fn num_bus_elements(&self) -> usize {
+        match self {
+            BusType::Single => 1,
+            BusType::Word2L => 1,
+            BusType::Word4L => 1,
+            BusType::DWordWL => 2,
+            BusType::DWordHL => 2,
+            BusType::DWordBL => 2,
+            BusType::DWordHHW => 2,
+            BusType::DWordWHH => 2,
+        }
+    }
+
+    /// Creates a TypedValue starting at the given column.
+    ///
+    /// # Example
+    /// ```ignore
+    /// BusType::Single.at(0)   // column 0
+    /// BusType::DWordWL.at(1)  // columns 1, 2
+    /// BusType::Word4L.at(3)   // columns 3, 4, 5, 6
+    /// ```
+    pub fn at(self, start_column: usize) -> TypedValue {
+        TypedValue::new(start_column, self)
+    }
+
+    /// Combines column values into bus elements using powers of 2.
+    ///
+    /// # Arguments
+    /// * `columns` - Slice of field elements from the trace columns
+    ///
+    /// # Returns
+    /// Vector of combined bus elements
+    ///
+    /// # Panics
+    /// If `columns.len() != self.num_columns()`
+    pub fn combine<E: IsField>(&self, columns: &[FieldElement<E>]) -> Vec<FieldElement<E>> {
+        assert_eq!(
+            columns.len(),
+            self.num_columns(),
+            "BusType {:?} expects {} columns, got {}",
+            self,
+            self.num_columns(),
+            columns.len()
+        );
+
+        match self {
+            BusType::Single => {
+                vec![columns[0].clone()]
+            }
+
+            BusType::Word2L => {
+                // h₀ + 2¹⁶·h₁
+                let shift_16 = FieldElement::<E>::from(SHIFT_16);
+                vec![&columns[0] + &columns[1] * &shift_16]
+            }
+
+            BusType::Word4L => {
+                // b₀ + 2⁸·b₁ + 2¹⁶·b₂ + 2²⁴·b₃
+                let shift_8 = FieldElement::<E>::from(SHIFT_8);
+                let shift_16 = FieldElement::<E>::from(SHIFT_16);
+                let shift_24 = &shift_8 * &shift_16;
+                vec![
+                    &columns[0]
+                        + &columns[1] * &shift_8
+                        + &columns[2] * &shift_16
+                        + &columns[3] * &shift_24,
+                ]
+            }
+
+            BusType::DWordWL => {
+                // Two words, no combining - each stays as bus element
+                // [w₀, w₁]
+                vec![columns[0].clone(), columns[1].clone()]
+            }
+
+            BusType::DWordHL => {
+                // [h₀ + 2¹⁶·h₁, h₂ + 2¹⁶·h₃]
+                let shift_16 = FieldElement::<E>::from(SHIFT_16);
+                vec![
+                    &columns[0] + &columns[1] * &shift_16,
+                    &columns[2] + &columns[3] * &shift_16,
+                ]
+            }
+
+            BusType::DWordBL => {
+                // [b₀ + 2⁸·b₁ + 2¹⁶·b₂ + 2²⁴·b₃, b₄ + 2⁸·b₅ + 2¹⁶·b₆ + 2²⁴·b₇]
+                let shift_8 = FieldElement::<E>::from(SHIFT_8);
+                let shift_16 = FieldElement::<E>::from(SHIFT_16);
+                let shift_24 = &shift_8 * &shift_16;
+                vec![
+                    &columns[0]
+                        + &columns[1] * &shift_8
+                        + &columns[2] * &shift_16
+                        + &columns[3] * &shift_24,
+                    &columns[4]
+                        + &columns[5] * &shift_8
+                        + &columns[6] * &shift_16
+                        + &columns[7] * &shift_24,
+                ]
+            }
+
+            BusType::DWordHHW => {
+                // [Word (LSB), Half, Half (MSB)]
+                // → [w₀, h₀ + 2¹⁶·h₁]
+                let shift_16 = FieldElement::<E>::from(SHIFT_16);
+                vec![
+                    columns[0].clone(),
+                    &columns[1] + &columns[2] * &shift_16,
+                ]
+            }
+
+            BusType::DWordWHH => {
+                // [Half (LSB), Half, Word (MSB)]
+                // → [h₀ + 2¹⁶·h₁, w₀]
+                let shift_16 = FieldElement::<E>::from(SHIFT_16);
+                vec![
+                    &columns[0] + &columns[1] * &shift_16,
+                    columns[2].clone(),
+                ]
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Typed Value
+// =============================================================================
+
+/// A typed value for bus interactions.
+///
+/// Specifies which trace columns hold the limbs and how to combine them.
+#[derive(Debug, Clone)]
+pub struct TypedValue {
+    /// Starting column index in the trace
+    pub start_column: usize,
+    /// How to interpret and combine the columns
+    pub bus_type: BusType,
+}
+
+impl TypedValue {
+    /// Creates a new typed value.
+    ///
+    /// Prefer using `BusType::at()` instead:
+    /// ```ignore
+    /// BusType::Single.at(0)
+    /// BusType::DWordWL.at(1)
+    /// ```
+    pub fn new(start_column: usize, bus_type: BusType) -> Self {
+        Self {
+            start_column,
+            bus_type,
+        }
+    }
+
+    /// Returns the number of columns this value spans.
+    pub fn num_columns(&self) -> usize {
+        self.bus_type.num_columns()
+    }
+
+    /// Returns the number of bus elements this value produces.
+    pub fn num_bus_elements(&self) -> usize {
+        self.bus_type.num_bus_elements()
+    }
+
+    /// Returns the column indices this value uses.
+    pub fn column_indices(&self) -> Vec<usize> {
+        (self.start_column..self.start_column + self.num_columns()).collect()
+    }
+
+    /// Extracts column values from a row and combines them.
+    ///
+    /// # Arguments
+    /// * `get_column` - Function to get column value by index
+    ///
+    /// # Returns
+    /// Vector of combined bus elements
+    pub fn combine_from<E: IsField, F: Fn(usize) -> FieldElement<E>>(
+        &self,
+        get_column: F,
+    ) -> Vec<FieldElement<E>> {
+        let columns: Vec<_> = self.column_indices().iter().map(|&i| get_column(i)).collect();
+        self.bus_type.combine(&columns)
+    }
+}
+
+// =============================================================================
+// AirWithBuses
+// =============================================================================
 
 /// Struct representing an AIR with Lookup. Contains own implementation of boundary constraints and auxiliary trace building
 pub struct AirWithBuses<
@@ -261,7 +537,11 @@ pub struct AuxiliaryTraceBuildData {
 }
 
 /// Struct representing a lookup interaction for a given table.
-/// Contains the multiplicity and value columns involved in said interaction.
+/// Contains the multiplicity and typed values involved in said interaction.
+///
+/// Values are combined in two stages:
+/// 1. **Casting** (powers of 2): Combine limbs within each TypedValue
+/// 2. **Bus fingerprint** (powers of α): Combine all bus elements into one fingerprint
 #[derive(Clone)]
 pub struct TableInteraction {
     /// Column index containing the multiplicity for this interaction.
@@ -269,11 +549,42 @@ pub struct TableInteraction {
     /// Determines how many times each row contributes to the bus.
     /// If None, a constant multiplicity of 1 is used for all rows.
     pub multiplicity_column: Option<usize>,
-    pub value_columns: Vec<usize>,
+    /// Typed values that make up this interaction
+    pub values: Vec<TypedValue>,
     /// Whether this side of the interaction is a sender (true) or receiver (false).
     /// Senders contribute positive values to the bus sum, receivers contribute negative.
     /// For bus balance: Σ sender_values - Σ receiver_values = 0
     pub is_sender: bool,
+}
+
+impl TableInteraction {
+    /// Creates a new table interaction.
+    pub fn new(
+        multiplicity_column: Option<usize>,
+        values: Vec<TypedValue>,
+        is_sender: bool,
+    ) -> Self {
+        Self {
+            multiplicity_column,
+            values,
+            is_sender,
+        }
+    }
+
+    /// Creates a sender interaction.
+    pub fn sender(multiplicity_column: Option<usize>, values: Vec<TypedValue>) -> Self {
+        Self::new(multiplicity_column, values, true)
+    }
+
+    /// Creates a receiver interaction.
+    pub fn receiver(multiplicity_column: Option<usize>, values: Vec<TypedValue>) -> Self {
+        Self::new(multiplicity_column, values, false)
+    }
+
+    /// Returns total number of bus elements (for α power computation).
+    pub fn num_bus_elements(&self) -> usize {
+        self.values.iter().map(|v| v.num_bus_elements()).sum()
+    }
 }
 
 /// Public inputs for a table's accumulated LogUp column.
@@ -325,7 +636,7 @@ where
 /// Each row contains the LogUp quotient: `term[i] = sign * multiplicity[i] / fingerprint[i]`
 ///
 /// where:
-/// - `fingerprint[i] = z - (v0 + v1*α + v2*α² + ...)`
+/// - `fingerprint[i] = z - (v0 + v1*α + v2*α² + ...)` (bus elements after type combining)
 /// - `sign = +1` for senders, `-1` for receivers
 /// - `multiplicity` = number of times this row contributes to the bus
 ///
@@ -339,14 +650,7 @@ fn build_logup_term_column<F, E>(
     F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
     E: IsField + Send + Sync,
 {
-    // Main table
     let main_segment_cols = trace.columns_main();
-    let values = table_interaction
-        .value_columns
-        .iter()
-        .map(|i| &main_segment_cols[*i])
-        .collect::<Vec<_>>();
-
     let trace_len = trace.num_rows();
 
     // Handle optional multiplicity column - use constant 1 if None
@@ -362,8 +666,11 @@ fn build_logup_term_column<F, E>(
     // LogUp challenges (must be shared across all tables for bus to balance)
     let z = &challenges[LOGUP_CHALLENGE_Z];
     let alpha = &challenges[LOGUP_CHALLENGE_ALPHA];
-    // Coefficients for each value column
-    let coeffs: Vec<FieldElement<E>> = (0..values.len()).map(|i| alpha.pow(i)).collect();
+
+    // Precompute powers of alpha for all bus elements
+    let num_bus_elements = table_interaction.num_bus_elements();
+    let alpha_powers: Vec<FieldElement<E>> =
+        (0..num_bus_elements).map(|i| alpha.pow(i)).collect();
 
     // Sign: +1 for senders, -1 for receivers
     // This bakes the sign into the term so the accumulated column can just sum everything
@@ -374,15 +681,29 @@ fn build_logup_term_column<F, E>(
     };
 
     for row in 0..trace_len {
-        // fingerprint = z - (v[0] * alpha^0 + v[1] * alpha^1 +...+ value[n] * alpha^n)
-        // Fingerprint can only be zero if z equals the linear combination of values,
-        // which happens with negligible probability since z is randomly sampled over the extension field
-        let fingerprint: FieldElement<E> = -(values
+        // Stage 1: Combine each typed value's columns using powers of 2
+        // Stage 2: Flatten all bus elements and combine with powers of α
+        let bus_elements: Vec<FieldElement<E>> = table_interaction
+            .values
             .iter()
-            .zip(coeffs.iter())
-            .map(|(v, coeff)| &v[row] * coeff)
-            .sum::<FieldElement<E>>())
-            + z;
+            .flat_map(|tv| {
+                let columns: Vec<FieldElement<E>> = tv
+                    .column_indices()
+                    .iter()
+                    .map(|&col| main_segment_cols[col][row].clone().to_extension())
+                    .collect();
+                tv.bus_type.combine(&columns)
+            })
+            .collect();
+
+        // fingerprint = z - (v[0] * alpha^0 + v[1] * alpha^1 + ... + v[n] * alpha^n)
+        let linear_combination: FieldElement<E> = bus_elements
+            .iter()
+            .zip(alpha_powers.iter())
+            .map(|(v, coeff)| v * coeff)
+            .sum();
+
+        let fingerprint = z - &linear_combination;
 
         // term = sign * multiplicity / fingerprint
         let term = &multiplicity[row]
@@ -428,7 +749,7 @@ fn build_accumulated_column<F, E>(
 /// Rearranged to avoid division: `term[i] * fingerprint[i] - sign * multiplicity[i] = 0`
 ///
 /// where:
-/// - `fingerprint[i] = z - (v0 + v1*α + v2*α² + ...)`
+/// - `fingerprint[i] = z - (v0 + v1*α + v2*α² + ...)` (bus elements after type combining)
 /// - `sign = +1` for senders, `-1` for receivers
 struct LookupTermConstraint {
     // Indicates columns with multiplicity and values used to compute the term
@@ -492,20 +813,31 @@ where
                 Some(col) => step.get_main_evaluation_element(0, col).clone(),
                 None => FieldElement::<A>::one(),
             };
-            let values = interaction
-                .value_columns
+
+            // Stage 1: Combine each typed value's columns using powers of 2
+            // Stage 2: Flatten all bus elements
+            let bus_elements: Vec<FieldElement<B>> = interaction
+                .values
                 .iter()
-                .map(|c| step.get_main_evaluation_element(0, *c))
-                .collect::<Vec<_>>();
+                .flat_map(|tv| {
+                    let columns: Vec<FieldElement<B>> = tv
+                        .column_indices()
+                        .iter()
+                        .map(|&col| step.get_main_evaluation_element(0, col).clone().to_extension())
+                        .collect();
+                    tv.bus_type.combine(&columns)
+                })
+                .collect();
 
-            // Coefficients for each value column
-            let coeffs: Vec<FieldElement<B>> = (0..values.len()).map(|i| alpha.pow(i)).collect();
+            // Coefficients for each bus element
+            let coeffs: Vec<FieldElement<B>> =
+                (0..bus_elements.len()).map(|i| alpha.pow(i)).collect();
 
-            // fingerprint = z - (v[0] * alpha^0 + v[1] * alpha^1 +...+ value[n] * alpha^n)
-            let fingerprint: FieldElement<B> = (-values
+            // fingerprint = z - (v[0] * alpha^0 + v[1] * alpha^1 + ... + v[n] * alpha^n)
+            let fingerprint: FieldElement<B> = (-bus_elements
                 .iter()
                 .zip(coeffs.iter())
-                .map(|(v, coeff)| *v * coeff)
+                .map(|(v, coeff)| v * coeff)
                 .sum::<FieldElement<B>>())
                 + z;
 
@@ -636,5 +968,193 @@ where
         if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx) {
             *eval = res;
         }
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trace::TraceTable;
+    use crate::traits::AIR;
+    use math::field::fields::fft_friendly::{
+        babybear_u32::Babybear31PrimeField,
+        quartic_babybear_u32::Degree4BabyBearU32ExtensionField,
+    };
+
+    type F = Babybear31PrimeField;
+    type E = Degree4BabyBearU32ExtensionField;
+    type FE = FieldElement<F>;
+
+    #[test]
+    fn test_word4l_combine() {
+        // 4 bytes: [0x12, 0x34, 0x56, 0x78]
+        // Expected: 0x78563412 (little-endian)
+        let bytes = vec![
+            FE::from(0x12u64),
+            FE::from(0x34u64),
+            FE::from(0x56u64),
+            FE::from(0x78u64),
+        ];
+        let combined = BusType::Word4L.combine(&bytes);
+        assert_eq!(combined.len(), 1);
+        // 0x12 + 0x34*256 + 0x56*65536 + 0x78*16777216 = 2018915346
+        assert_eq!(combined[0], FE::from(0x78563412u64));
+    }
+
+    #[test]
+    fn test_dword_hl_combine() {
+        // 4 halves: [0x1234, 0x5678, 0x9ABC, 0xDEF0]
+        // Expected: [0x56781234, 0xDEF09ABC]
+        let halves = vec![
+            FE::from(0x1234u64),
+            FE::from(0x5678u64),
+            FE::from(0x9ABCu64),
+            FE::from(0xDEF0u64),
+        ];
+        let combined = BusType::DWordHL.combine(&halves);
+        assert_eq!(combined.len(), 2);
+        assert_eq!(combined[0], FE::from(0x56781234u64));
+        assert_eq!(combined[1], FE::from(0xDEF09ABCu64));
+    }
+
+    #[test]
+    fn test_dword_hhw_combine() {
+        // [Word, Half, Half] where Word is LSB
+        // columns: [0xAABBCCDD, 0x1234, 0x5678]
+        // Expected: [0xAABBCCDD, 0x56781234]
+        let cols = vec![
+            FE::from(0xAABBCCDDu64),
+            FE::from(0x1234u64),
+            FE::from(0x5678u64),
+        ];
+        let combined = BusType::DWordHHW.combine(&cols);
+        assert_eq!(combined.len(), 2);
+        assert_eq!(combined[0], FE::from(0xAABBCCDDu64));
+        assert_eq!(combined[1], FE::from(0x56781234u64));
+    }
+
+    /// Test that typed interactions work with a simple sender/receiver pair.
+    #[test]
+    fn test_typed_air_with_buses_simple() {
+        // Create a simple trace with 4 rows
+        // Columns: [mult, a, b, c] where c = a + b (conceptually)
+        let num_rows = 4;
+        let num_cols = 4;
+
+        let mut columns: Vec<Vec<FE>> = vec![vec![FE::zero(); num_rows]; num_cols];
+
+        // Fill with test data
+        // Row 0: mult=1, a=10, b=20, c=30
+        // Row 1: mult=1, a=5, b=15, c=20
+        // Row 2: mult=0, a=0, b=0, c=0 (padding)
+        // Row 3: mult=0, a=0, b=0, c=0 (padding)
+        columns[0][0] = FE::from(1u64); // mult
+        columns[1][0] = FE::from(10u64); // a
+        columns[2][0] = FE::from(20u64); // b
+        columns[3][0] = FE::from(30u64); // c
+
+        columns[0][1] = FE::from(1u64);
+        columns[1][1] = FE::from(5u64);
+        columns[2][1] = FE::from(15u64);
+        columns[3][1] = FE::from(20u64);
+
+        // Create trace
+        let mut trace: TraceTable<F, E> = TraceTable::from_columns_main(columns, 1);
+
+        // Define a typed interaction using Single type (no combining)
+        let interaction = TableInteraction::sender(
+            Some(0), // multiplicity column
+            vec![
+                BusType::Single.at(1), // a
+                BusType::Single.at(2), // b
+                BusType::Single.at(3), // c
+            ],
+        );
+
+        let build_data = AuxiliaryTraceBuildData {
+            interactions: vec![interaction],
+        };
+
+        // Create AIR
+        let proof_options = ProofOptions::default_test_options();
+        let air = AirWithBuses::<F, E, NullBoundaryConstraintBuilder, ()>::new(
+            num_cols,
+            build_data,
+            &proof_options,
+            1,
+            vec![],
+        );
+
+        // Verify layout
+        assert_eq!(air.trace_layout(), (4, 2)); // 4 main, 2 aux (1 term + 1 acc)
+
+        // Build auxiliary trace with dummy challenges
+        let z = FieldElement::<E>::from(12345u64);
+        let alpha = FieldElement::<E>::from(67890u64);
+        let challenges = vec![z, alpha];
+
+        let bus_public_inputs = air.build_auxiliary_trace(&mut trace, &challenges);
+
+        // Should have bus public inputs
+        assert!(bus_public_inputs.is_some());
+        let bpi = bus_public_inputs.unwrap();
+
+        // Final accumulated should be non-zero (we have 2 rows with mult=1)
+        assert_ne!(bpi.final_accumulated, FieldElement::<E>::zero());
+    }
+
+    /// Test with DWordWL type (2 columns combined)
+    #[test]
+    fn test_typed_interaction_dword_wl() {
+        // Columns: [mult, lhs_lo, lhs_hi, rhs_lo, rhs_hi, sum_lo, sum_hi]
+        let num_rows = 4;
+        let num_cols = 7;
+
+        let mut columns: Vec<Vec<FE>> = vec![vec![FE::zero(); num_rows]; num_cols];
+
+        // Row 0: 100 + 200 = 300 (as 64-bit split into two 32-bit words)
+        columns[0][0] = FE::from(1u64); // mult
+        columns[1][0] = FE::from(100u64); // lhs_lo
+        columns[2][0] = FE::from(0u64); // lhs_hi
+        columns[3][0] = FE::from(200u64); // rhs_lo
+        columns[4][0] = FE::from(0u64); // rhs_hi
+        columns[5][0] = FE::from(300u64); // sum_lo
+        columns[6][0] = FE::from(0u64); // sum_hi
+
+        let mut trace: TraceTable<F, E> = TraceTable::from_columns_main(columns, 1);
+
+        // Define interaction with DWordWL types
+        let interaction = TableInteraction::sender(
+            Some(0),
+            vec![
+                BusType::DWordWL.at(1), // lhs: columns 1,2
+                BusType::DWordWL.at(3), // rhs: columns 3,4
+                BusType::DWordWL.at(5), // sum: columns 5,6
+            ],
+        );
+
+        let build_data = AuxiliaryTraceBuildData {
+            interactions: vec![interaction],
+        };
+
+        let proof_options = ProofOptions::default_test_options();
+        let air = AirWithBuses::<F, E, NullBoundaryConstraintBuilder, ()>::new(
+            num_cols,
+            build_data,
+            &proof_options,
+            1,
+            vec![],
+        );
+
+        let z = FieldElement::<E>::from(99999u64);
+        let alpha = FieldElement::<E>::from(11111u64);
+        let challenges = vec![z, alpha];
+
+        let bus_public_inputs = air.build_auxiliary_trace(&mut trace, &challenges);
+        assert!(bus_public_inputs.is_some());
     }
 }

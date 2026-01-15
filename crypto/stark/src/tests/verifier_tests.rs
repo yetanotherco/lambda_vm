@@ -14,7 +14,8 @@ use math::field::fields::fft_friendly::{
 
 use crate::constraints::transition::TransitionConstraint;
 use crate::lookup::{
-    AirWithBuses, AuxiliaryTraceBuildData, NullBoundaryConstraintBuilder, TableInteraction,
+    AirWithBuses, AuxiliaryTraceBuildData, BusType, NullBoundaryConstraintBuilder,
+    TableInteraction,
 };
 use crate::proof::options::ProofOptions;
 use crate::proof::stark::MultiProof;
@@ -177,16 +178,14 @@ fn create_cpu_air(
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![
-            TableInteraction {
-                multiplicity_column: Some(0),
-                value_columns: vec![2, 3, 4],
-                is_sender: true,
-            },
-            TableInteraction {
-                multiplicity_column: Some(1),
-                value_columns: vec![2, 3, 4],
-                is_sender: true,
-            },
+            TableInteraction::sender(
+                Some(0),
+                vec![BusType::Single.at(2), BusType::Single.at(3), BusType::Single.at(4)],
+            ),
+            TableInteraction::sender(
+                Some(1),
+                vec![BusType::Single.at(2), BusType::Single.at(3), BusType::Single.at(4)],
+            ),
         ],
     };
     AirWithBuses::new(
@@ -203,11 +202,10 @@ fn create_add_air(
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: vec![TableInteraction {
-            multiplicity_column: Some(3),
-            value_columns: vec![0, 1, 2],
-            is_sender: false,
-        }],
+        interactions: vec![TableInteraction::receiver(
+            Some(3),
+            vec![BusType::Single.at(0), BusType::Single.at(1), BusType::Single.at(2)],
+        )],
     };
     AirWithBuses::new(
         4, // ADD: a, b, c, multiplicity
@@ -223,11 +221,10 @@ fn create_mul_air(
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: vec![TableInteraction {
-            multiplicity_column: Some(3),
-            value_columns: vec![0, 1, 2],
-            is_sender: false,
-        }],
+        interactions: vec![TableInteraction::receiver(
+            Some(3),
+            vec![BusType::Single.at(0), BusType::Single.at(1), BusType::Single.at(2)],
+        )],
     };
     AirWithBuses::new(
         4, // MUL: a, b, c, multiplicity
