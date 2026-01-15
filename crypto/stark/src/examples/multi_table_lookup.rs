@@ -1,8 +1,8 @@
 use crate::{
     constraints::transition::TransitionConstraint,
     lookup::{
-        AirWithBuses, AuxiliaryTraceBuildData, BusType, NullBoundaryConstraintBuilder,
-        TableInteraction,
+        AirWithBuses, AuxiliaryTraceBuildData, Packing, NullBoundaryConstraintBuilder,
+        BusInteraction,
     },
     proof::options::ProofOptions,
 };
@@ -20,14 +20,14 @@ pub fn new_cpu_air_with_lookup(
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![
             // Interaction with ADD table (CPU sends to ADD bus)
-            TableInteraction::sender(
+            BusInteraction::sender(
                 Some(0),
-                vec![BusType::Single.at(2), BusType::Single.at(3), BusType::Single.at(4)],
+                vec![Packing::Direct.at(2), Packing::Direct.at(3), Packing::Direct.at(4)],
             ),
             // Interaction with MUL table (CPU sends to MUL bus)
-            TableInteraction::sender(
+            BusInteraction::sender(
                 Some(1),
-                vec![BusType::Single.at(2), BusType::Single.at(3), BusType::Single.at(4)],
+                vec![Packing::Direct.at(2), Packing::Direct.at(3), Packing::Direct.at(4)],
             ),
         ],
     };
@@ -49,9 +49,9 @@ pub fn new_mul_air_with_lookup(
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![
             // Interaction with CPU table (MUL table receives from MUL bus)
-            TableInteraction::receiver(
+            BusInteraction::receiver(
                 Some(3),
-                vec![BusType::Single.at(0), BusType::Single.at(1), BusType::Single.at(2)],
+                vec![Packing::Direct.at(0), Packing::Direct.at(1), Packing::Direct.at(2)],
             ),
         ],
     };
@@ -73,9 +73,9 @@ pub fn new_add_air_with_lookup(
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![
             // Interaction with CPU table (ADD table receives from ADD bus)
-            TableInteraction::receiver(
+            BusInteraction::receiver(
                 Some(3),
-                vec![BusType::Single.at(0), BusType::Single.at(1), BusType::Single.at(2)],
+                vec![Packing::Direct.at(0), Packing::Direct.at(1), Packing::Direct.at(2)],
             ),
         ],
     };

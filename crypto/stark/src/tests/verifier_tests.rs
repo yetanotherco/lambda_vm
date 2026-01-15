@@ -14,8 +14,8 @@ use math::field::fields::fft_friendly::{
 
 use crate::constraints::transition::TransitionConstraint;
 use crate::lookup::{
-    AirWithBuses, AuxiliaryTraceBuildData, BusType, NullBoundaryConstraintBuilder,
-    TableInteraction,
+    AirWithBuses, AuxiliaryTraceBuildData, Packing, NullBoundaryConstraintBuilder,
+    BusInteraction,
 };
 use crate::proof::options::ProofOptions;
 use crate::proof::stark::MultiProof;
@@ -178,13 +178,13 @@ fn create_cpu_air(
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![
-            TableInteraction::sender(
+            BusInteraction::sender(
                 Some(0),
-                vec![BusType::Single.at(2), BusType::Single.at(3), BusType::Single.at(4)],
+                vec![Packing::Direct.at(2), Packing::Direct.at(3), Packing::Direct.at(4)],
             ),
-            TableInteraction::sender(
+            BusInteraction::sender(
                 Some(1),
-                vec![BusType::Single.at(2), BusType::Single.at(3), BusType::Single.at(4)],
+                vec![Packing::Direct.at(2), Packing::Direct.at(3), Packing::Direct.at(4)],
             ),
         ],
     };
@@ -202,9 +202,9 @@ fn create_add_air(
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: vec![TableInteraction::receiver(
+        interactions: vec![BusInteraction::receiver(
             Some(3),
-            vec![BusType::Single.at(0), BusType::Single.at(1), BusType::Single.at(2)],
+            vec![Packing::Direct.at(0), Packing::Direct.at(1), Packing::Direct.at(2)],
         )],
     };
     AirWithBuses::new(
@@ -221,9 +221,9 @@ fn create_mul_air(
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: vec![TableInteraction::receiver(
+        interactions: vec![BusInteraction::receiver(
             Some(3),
-            vec![BusType::Single.at(0), BusType::Single.at(1), BusType::Single.at(2)],
+            vec![Packing::Direct.at(0), Packing::Direct.at(1), Packing::Direct.at(2)],
         )],
     };
     AirWithBuses::new(

@@ -69,11 +69,11 @@ pub const LOGUP_NUM_CHALLENGES: usize = 2;
 /// - How many bus elements it produces
 /// - The shift factors (powers of 2) used for combining
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BusType {
-    /// Single field element, no combining.
+pub enum Packing {
+    /// Direct: single field element, no combining.
     /// Columns: 1, Bus elements: 1
     /// Used for: Bit, Byte, Half, Word, B4, B20, etc.
-    Single,
+    Direct,
 
     /// Two 16-bit halves → one 32-bit word.
     /// Columns: 2, Bus elements: 1
@@ -114,32 +114,32 @@ pub enum BusType {
     DWordWHH,
 }
 
-impl BusType {
+impl Packing {
     /// Returns the number of trace columns this type consumes.
     pub fn num_columns(&self) -> usize {
         match self {
-            BusType::Single => 1,
-            BusType::Word2L => 2,
-            BusType::Word4L => 4,
-            BusType::DWordWL => 2,
-            BusType::DWordHL => 4,
-            BusType::DWordBL => 8,
-            BusType::DWordHHW => 3,
-            BusType::DWordWHH => 3,
+            Packing::Direct => 1,
+            Packing::Word2L => 2,
+            Packing::Word4L => 4,
+            Packing::DWordWL => 2,
+            Packing::DWordHL => 4,
+            Packing::DWordBL => 8,
+            Packing::DWordHHW => 3,
+            Packing::DWordWHH => 3,
         }
     }
 
     /// Returns the number of bus elements this type produces after combining.
     pub fn num_bus_elements(&self) -> usize {
         match self {
-            BusType::Single => 1,
-            BusType::Word2L => 1,
-            BusType::Word4L => 1,
-            BusType::DWordWL => 2,
-            BusType::DWordHL => 2,
-            BusType::DWordBL => 2,
-            BusType::DWordHHW => 2,
-            BusType::DWordWHH => 2,
+            Packing::Direct => 1,
+            Packing::Word2L => 1,
+            Packing::Word4L => 1,
+            Packing::DWordWL => 2,
+            Packing::DWordHL => 2,
+            Packing::DWordBL => 2,
+            Packing::DWordHHW => 2,
+            Packing::DWordWHH => 2,
         }
     }
 
@@ -147,9 +147,9 @@ impl BusType {
     ///
     /// # Example
     /// ```ignore
-    /// BusType::Single.at(0)   // column 0
-    /// BusType::DWordWL.at(1)  // columns 1, 2
-    /// BusType::Word4L.at(3)   // columns 3, 4, 5, 6
+    /// Packing::Direct.at(0)   // column 0
+    /// Packing::DWordWL.at(1)  // columns 1, 2
+    /// Packing::Word4L.at(3)   // columns 3, 4, 5, 6
     /// ```
     pub fn at(self, start_column: usize) -> TypedValue {
         TypedValue::new(start_column, self)
@@ -169,24 +169,24 @@ impl BusType {
         assert_eq!(
             columns.len(),
             self.num_columns(),
-            "BusType {:?} expects {} columns, got {}",
+            "Packing {:?} expects {} columns, got {}",
             self,
             self.num_columns(),
             columns.len()
         );
 
         match self {
-            BusType::Single => {
+            Packing::Direct => {
                 vec![columns[0].clone()]
             }
 
-            BusType::Word2L => {
+            Packing::Word2L => {
                 // h₀ + 2¹⁶·h₁
                 let shift_16 = FieldElement::<E>::from(SHIFT_16);
                 vec![&columns[0] + &columns[1] * &shift_16]
             }
 
-            BusType::Word4L => {
+            Packing::Word4L => {
                 // b₀ + 2⁸·b₁ + 2¹⁶·b₂ + 2²⁴·b₃
                 let shift_8 = FieldElement::<E>::from(SHIFT_8);
                 let shift_16 = FieldElement::<E>::from(SHIFT_16);
@@ -199,13 +199,13 @@ impl BusType {
                 ]
             }
 
-            BusType::DWordWL => {
+            Packing::DWordWL => {
                 // Two words, no combining - each stays as bus element
                 // [w₀, w₁]
                 vec![columns[0].clone(), columns[1].clone()]
             }
 
-            BusType::DWordHL => {
+            Packing::DWordHL => {
                 // [h₀ + 2¹⁶·h₁, h₂ + 2¹⁶·h₃]
                 let shift_16 = FieldElement::<E>::from(SHIFT_16);
                 vec![
@@ -214,7 +214,7 @@ impl BusType {
                 ]
             }
 
-            BusType::DWordBL => {
+            Packing::DWordBL => {
                 // [b₀ + 2⁸·b₁ + 2¹⁶·b₂ + 2²⁴·b₃, b₄ + 2⁸·b₅ + 2¹⁶·b₆ + 2²⁴·b₇]
                 let shift_8 = FieldElement::<E>::from(SHIFT_8);
                 let shift_16 = FieldElement::<E>::from(SHIFT_16);
@@ -231,7 +231,7 @@ impl BusType {
                 ]
             }
 
-            BusType::DWordHHW => {
+            Packing::DWordHHW => {
                 // [Word (LSB), Half, Half (MSB)]
                 // → [w₀, h₀ + 2¹⁶·h₁]
                 let shift_16 = FieldElement::<E>::from(SHIFT_16);
@@ -241,7 +241,7 @@ impl BusType {
                 ]
             }
 
-            BusType::DWordWHH => {
+            Packing::DWordWHH => {
                 // [Half (LSB), Half, Word (MSB)]
                 // → [h₀ + 2¹⁶·h₁, w₀]
                 let shift_16 = FieldElement::<E>::from(SHIFT_16);
@@ -266,18 +266,18 @@ pub struct TypedValue {
     /// Starting column index in the trace
     pub start_column: usize,
     /// How to interpret and combine the columns
-    pub bus_type: BusType,
+    pub bus_type: Packing,
 }
 
 impl TypedValue {
     /// Creates a new typed value.
     ///
-    /// Prefer using `BusType::at()` instead:
+    /// Prefer using `Packing::at()` instead:
     /// ```ignore
-    /// BusType::Single.at(0)
-    /// BusType::DWordWL.at(1)
+    /// Packing::Direct.at(0)
+    /// Packing::DWordWL.at(1)
     /// ```
-    pub fn new(start_column: usize, bus_type: BusType) -> Self {
+    pub fn new(start_column: usize, bus_type: Packing) -> Self {
         Self {
             start_column,
             bus_type,
@@ -533,7 +533,7 @@ where
 /// Struct representing how each lookup air should build its auxiliary trace
 /// Contains a list of all lookup interactions
 pub struct AuxiliaryTraceBuildData {
-    pub interactions: Vec<TableInteraction>,
+    pub interactions: Vec<BusInteraction>,
 }
 
 /// Struct representing a lookup interaction for a given table.
@@ -543,7 +543,7 @@ pub struct AuxiliaryTraceBuildData {
 /// 1. **Casting** (powers of 2): Combine limbs within each TypedValue
 /// 2. **Bus fingerprint** (powers of α): Combine all bus elements into one fingerprint
 #[derive(Clone)]
-pub struct TableInteraction {
+pub struct BusInteraction {
     /// Column index containing the multiplicity for this interaction.
     /// Can be a binary flag (0 or 1) or a general multiplicity (0, 1, 2, ...).
     /// Determines how many times each row contributes to the bus.
@@ -557,7 +557,7 @@ pub struct TableInteraction {
     pub is_sender: bool,
 }
 
-impl TableInteraction {
+impl BusInteraction {
     /// Creates a new table interaction.
     pub fn new(
         multiplicity_column: Option<usize>,
@@ -643,7 +643,7 @@ where
 /// This is NOT accumulated - just the individual contribution for each row.
 fn build_logup_term_column<F, E>(
     aux_column_idx: usize,
-    table_interaction: &TableInteraction,
+    table_interaction: &BusInteraction,
     trace: &mut TraceTable<F, E>,
     challenges: &[FieldElement<E>],
 ) where
@@ -753,7 +753,7 @@ fn build_accumulated_column<F, E>(
 /// - `sign = +1` for senders, `-1` for receivers
 struct LookupTermConstraint {
     // Indicates columns with multiplicity and values used to compute the term
-    interaction: TableInteraction,
+    interaction: BusInteraction,
     // Index of the term column (aux column)
     term_column_idx: usize,
     // Index of the constraint
@@ -762,7 +762,7 @@ struct LookupTermConstraint {
 
 impl LookupTermConstraint {
     pub fn new(
-        interaction: TableInteraction,
+        interaction: BusInteraction,
         term_column_idx: usize,
         constraint_idx: usize,
     ) -> Self {
@@ -799,7 +799,7 @@ where
         fn evaluate_term_constraint<'a, A: IsSubFieldOf<B>, B: IsField>(
             step: &TableView<'a, A, B>,
             term_column_idx: usize,
-            interaction: &TableInteraction,
+            interaction: &BusInteraction,
             rap_challenges: &&[FieldElement<B>],
         ) -> FieldElement<B> {
             // Term column value
@@ -999,7 +999,7 @@ mod tests {
             FE::from(0x56u64),
             FE::from(0x78u64),
         ];
-        let combined = BusType::Word4L.combine(&bytes);
+        let combined = Packing::Word4L.combine(&bytes);
         assert_eq!(combined.len(), 1);
         // 0x12 + 0x34*256 + 0x56*65536 + 0x78*16777216 = 2018915346
         assert_eq!(combined[0], FE::from(0x78563412u64));
@@ -1015,7 +1015,7 @@ mod tests {
             FE::from(0x9ABCu64),
             FE::from(0xDEF0u64),
         ];
-        let combined = BusType::DWordHL.combine(&halves);
+        let combined = Packing::DWordHL.combine(&halves);
         assert_eq!(combined.len(), 2);
         assert_eq!(combined[0], FE::from(0x56781234u64));
         assert_eq!(combined[1], FE::from(0xDEF09ABCu64));
@@ -1031,7 +1031,7 @@ mod tests {
             FE::from(0x1234u64),
             FE::from(0x5678u64),
         ];
-        let combined = BusType::DWordHHW.combine(&cols);
+        let combined = Packing::DWordHHW.combine(&cols);
         assert_eq!(combined.len(), 2);
         assert_eq!(combined[0], FE::from(0xAABBCCDDu64));
         assert_eq!(combined[1], FE::from(0x56781234u64));
@@ -1066,12 +1066,12 @@ mod tests {
         let mut trace: TraceTable<F, E> = TraceTable::from_columns_main(columns, 1);
 
         // Define a typed interaction using Single type (no combining)
-        let interaction = TableInteraction::sender(
+        let interaction = BusInteraction::sender(
             Some(0), // multiplicity column
             vec![
-                BusType::Single.at(1), // a
-                BusType::Single.at(2), // b
-                BusType::Single.at(3), // c
+                Packing::Direct.at(1), // a
+                Packing::Direct.at(2), // b
+                Packing::Direct.at(3), // c
             ],
         );
 
@@ -1128,12 +1128,12 @@ mod tests {
         let mut trace: TraceTable<F, E> = TraceTable::from_columns_main(columns, 1);
 
         // Define interaction with DWordWL types
-        let interaction = TableInteraction::sender(
+        let interaction = BusInteraction::sender(
             Some(0),
             vec![
-                BusType::DWordWL.at(1), // lhs: columns 1,2
-                BusType::DWordWL.at(3), // rhs: columns 3,4
-                BusType::DWordWL.at(5), // sum: columns 5,6
+                Packing::DWordWL.at(1), // lhs: columns 1,2
+                Packing::DWordWL.at(3), // rhs: columns 3,4
+                Packing::DWordWL.at(5), // sum: columns 5,6
             ],
         );
 
