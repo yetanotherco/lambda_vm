@@ -712,18 +712,21 @@ fn build_logup_term_column<F, E>(
     };
 
     for (row, multiplicity) in multiplicities.iter().enumerate() {
-        // Stage 1: Combine each typed value's columns using powers of 2
-        // Stage 2: Flatten all bus elements and combine with powers of α
+        // Stage 1: Combine each typed value's columns using powers of 2 (in base field)
+        // Stage 2: Convert to extension and combine with powers of α
         let bus_elements: Vec<FieldElement<E>> = table_interaction
             .values
             .iter()
             .flat_map(|tv| {
-                let columns: Vec<FieldElement<E>> = tv
+                // Combine in base field (cheaper)
+                let columns: Vec<FieldElement<F>> = tv
                     .column_indices()
                     .iter()
-                    .map(|&col| main_segment_cols[col][row].clone().to_extension())
+                    .map(|&col| main_segment_cols[col][row].clone())
                     .collect();
-                tv.bus_type.combine(&columns)
+                let combined = tv.bus_type.combine(&columns);
+                // Convert to extension only after combining
+                combined.into_iter().map(|v| v.to_extension())
             })
             .collect();
 
@@ -841,22 +844,21 @@ where
                 None => FieldElement::<A>::one(),
             };
 
-            // Stage 1: Combine each typed value's columns using powers of 2
-            // Stage 2: Flatten all bus elements
+            // Stage 1: Combine each typed value's columns using powers of 2 (in base field)
+            // Stage 2: Convert to extension and flatten all bus elements
             let bus_elements: Vec<FieldElement<B>> = interaction
                 .values
                 .iter()
                 .flat_map(|tv| {
-                    let columns: Vec<FieldElement<B>> = tv
+                    // Combine in base field (cheaper)
+                    let columns: Vec<FieldElement<A>> = tv
                         .column_indices()
                         .iter()
-                        .map(|&col| {
-                            step.get_main_evaluation_element(0, col)
-                                .clone()
-                                .to_extension()
-                        })
+                        .map(|&col| step.get_main_evaluation_element(0, col).clone())
                         .collect();
-                    tv.bus_type.combine(&columns)
+                    let combined = tv.bus_type.combine(&columns);
+                    // Convert to extension only after combining
+                    combined.into_iter().map(|v| v.to_extension())
                 })
                 .collect();
 
