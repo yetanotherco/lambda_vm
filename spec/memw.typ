@@ -24,6 +24,11 @@ The `MEMW` chip is comprised of #nr_variables variables that are expressed using
 
 #render_chip_assumptions(chip, config)
 
+Our assumptions do not explicitly cover any range checks for the `is_register` and `value` columns,
+as these are not necessary for the correctness of this chip in isolation.
+These properties are necessary for the consistency of the system as a whole, and therefore
+we document it here, keeping the type information as a reading help.
+
 == Constraints
 
 #render_constraint_table(chip, config, groups: "consistency")
@@ -33,7 +38,7 @@ in the memory argument automatically ensures appropriate range checking
 (as long as no external entities provide negative multiplicities without range checking the timestamp).
 This ensures the assumptions for `LT` are satisfied.
 
-We additionally also check that the address does not overflow
+We additionally check that the address does not overflow
 for more significant bytes of the access.
 #render_constraint_table(chip, config, groups: "overflow")
 
