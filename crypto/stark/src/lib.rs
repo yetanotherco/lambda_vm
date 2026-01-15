@@ -11,6 +11,8 @@ pub mod frame;
 pub mod fri;
 pub mod grinding;
 pub mod lookup;
+pub mod lookup_typed;
+pub mod lookup_types;
 pub mod proof;
 pub mod prover;
 pub mod table;
