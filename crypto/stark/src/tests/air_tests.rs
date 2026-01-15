@@ -1,3 +1,5 @@
+//! Tests for various AIR implementations (Fibonacci, periodic, RAP, memory, etc.).
+
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::{
     element::FieldElement, fields::fft_friendly::stark_252_prime_field::Stark252PrimeField,

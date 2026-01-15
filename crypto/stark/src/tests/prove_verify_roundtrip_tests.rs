@@ -1,10 +1,7 @@
-//! Tests that verify the prover-verifier separation works correctly.
+//! Roundtrip tests: proof serialization and prover-verifier separation.
 //!
-//! These tests simulate a realistic scenario where:
-//! 1. The prover generates proofs and serializes them
-//! 2. The proofs are "transmitted" (serialized/deserialized)
-//! 3. The verifier creates the AIR from scratch (without the prover's trace)
-//! 4. The verifier deserializes the proofs and verifies them
+//! These tests verify that proofs survive serialization/deserialization
+//! and can be verified independently from the prover.
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
@@ -14,7 +11,7 @@ use math::field::fields::fft_friendly::{
 
 use crate::constraints::transition::TransitionConstraint;
 use crate::lookup::{
-    AirWithBuses, AuxiliaryTraceBuildData, NullBoundaryConstraintBuilder, TableInteraction,
+    AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, NullBoundaryConstraintBuilder, Packing,
 };
 use crate::proof::options::ProofOptions;
 use crate::proof::stark::MultiProof;
@@ -177,16 +174,8 @@ fn create_cpu_air(
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![
-            TableInteraction {
-                multiplicity_column: Some(0),
-                value_columns: vec![2, 3, 4],
-                is_sender: true,
-            },
-            TableInteraction {
-                multiplicity_column: Some(1),
-                value_columns: vec![2, 3, 4],
-                is_sender: true,
-            },
+            BusInteraction::sender(Some(0), Packing::Direct.columns(&[2, 3, 4])),
+            BusInteraction::sender(Some(1), Packing::Direct.columns(&[2, 3, 4])),
         ],
     };
     AirWithBuses::new(
@@ -203,11 +192,10 @@ fn create_add_air(
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: vec![TableInteraction {
-            multiplicity_column: Some(3),
-            value_columns: vec![0, 1, 2],
-            is_sender: false,
-        }],
+        interactions: vec![BusInteraction::receiver(
+            Some(3),
+            Packing::Direct.columns(&[0, 1, 2]),
+        )],
     };
     AirWithBuses::new(
         4, // ADD: a, b, c, multiplicity
@@ -223,11 +211,10 @@ fn create_mul_air(
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: vec![TableInteraction {
-            multiplicity_column: Some(3),
-            value_columns: vec![0, 1, 2],
-            is_sender: false,
-        }],
+        interactions: vec![BusInteraction::receiver(
+            Some(3),
+            Packing::Direct.columns(&[0, 1, 2]),
+        )],
     };
     AirWithBuses::new(
         4, // MUL: a, b, c, multiplicity

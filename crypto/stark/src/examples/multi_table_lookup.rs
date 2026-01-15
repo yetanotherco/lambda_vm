@@ -1,7 +1,8 @@
 use crate::{
     constraints::transition::TransitionConstraint,
     lookup::{
-        AirWithBuses, AuxiliaryTraceBuildData, NullBoundaryConstraintBuilder, TableInteraction,
+        AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, NullBoundaryConstraintBuilder,
+        Packing,
     },
     proof::options::ProofOptions,
 };
@@ -19,17 +20,9 @@ pub fn new_cpu_air_with_lookup(
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![
             // Interaction with ADD table (CPU sends to ADD bus)
-            TableInteraction {
-                multiplicity_column: Some(0),
-                value_columns: vec![2, 3, 4],
-                is_sender: true,
-            },
+            BusInteraction::sender(Some(0), Packing::Direct.columns(&[2, 3, 4])),
             // Interaction with MUL table (CPU sends to MUL bus)
-            TableInteraction {
-                multiplicity_column: Some(1),
-                value_columns: vec![2, 3, 4],
-                is_sender: true,
-            },
+            BusInteraction::sender(Some(1), Packing::Direct.columns(&[2, 3, 4])),
         ],
     };
 
@@ -50,11 +43,7 @@ pub fn new_mul_air_with_lookup(
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![
             // Interaction with CPU table (MUL table receives from MUL bus)
-            TableInteraction {
-                multiplicity_column: Some(3),
-                value_columns: vec![0, 1, 2],
-                is_sender: false,
-            },
+            BusInteraction::receiver(Some(3), Packing::Direct.columns(&[0, 1, 2])),
         ],
     };
 
@@ -75,11 +64,7 @@ pub fn new_add_air_with_lookup(
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![
             // Interaction with CPU table (ADD table receives from ADD bus)
-            TableInteraction {
-                multiplicity_column: Some(3),
-                value_columns: vec![0, 1, 2],
-                is_sender: false,
-            },
+            BusInteraction::receiver(Some(3), Packing::Direct.columns(&[0, 1, 2])),
         ],
     };
 
