@@ -138,11 +138,37 @@ fn test_dword_bl() {
     assert_eq!(combined[1], FE::from(0x88776655u64));
 }
 
+#[test]
+fn test_dword_wl() {
+    // 2 words → 2 bus elements (no combining, 2× Direct)
+    // columns: [0x11223344, 0x55667788]
+    // Expected: [0x11223344, 0x55667788] (pass-through)
+    let words = vec![FE::from(0x11223344u64), FE::from(0x55667788u64)];
+    let combined = Packing::DWordWL.combine(&words);
+    assert_eq!(combined.len(), 2);
+    assert_eq!(combined[0], FE::from(0x11223344u64));
+    assert_eq!(combined[1], FE::from(0x55667788u64));
+}
+
 // =============================================================================
 // Compound delegation tests
 // =============================================================================
 // These tests verify that compound packings produce identical results
 // to manually applying the primitives they're built from.
+
+#[test]
+fn test_dword_wl_equals_two_direct() {
+    let words = vec![FE::from(0x11223344u64), FE::from(0x55667788u64)];
+
+    // Compound
+    let compound_result = Packing::DWordWL.combine(&words);
+
+    // Manual: 2× Direct
+    let mut manual_result = Packing::Direct.combine(&words[0..1]);
+    manual_result.extend(Packing::Direct.combine(&words[1..2]));
+
+    assert_eq!(compound_result, manual_result);
+}
 
 #[test]
 fn test_dword_hl_equals_two_word2l() {

@@ -99,14 +99,12 @@ pub enum Packing {
 
     // =========================================================================
     // Compound packings - built from primitives above
+    // Sorted by: output count, then input count
     // =========================================================================
-    /// 4 halves → 2 words. **Compound: 2× Word2L.**
-    /// Columns: 4, Bus elements: 2
-    DWordHL,
-
-    /// 8 bytes → 2 words. **Compound: 2× Word4L.**
-    /// Columns: 8, Bus elements: 2
-    DWordBL,
+    /// 2 words → 2 bus elements. **Compound: 2× Direct.**
+    /// Columns: 2, Bus elements: 2
+    /// No combining, just groups two words together.
+    DWordWL,
 
     /// [Word, Half, Half] → 2 elements. **Compound: Direct + Word2L.**
     /// Columns: 3, Bus elements: 2
@@ -117,6 +115,14 @@ pub enum Packing {
     /// Columns: 3, Bus elements: 2
     /// Layout: Word is MSB.
     DWordWHH,
+
+    /// 4 halves → 2 words. **Compound: 2× Word2L.**
+    /// Columns: 4, Bus elements: 2
+    DWordHL,
+
+    /// 8 bytes → 2 words. **Compound: 2× Word4L.**
+    /// Columns: 8, Bus elements: 2
+    DWordBL,
 
     /// 8 halves → 4 words. **Compound: 4× Word2L.**
     /// Columns: 8, Bus elements: 4
@@ -131,11 +137,12 @@ impl Packing {
             Packing::Direct => 1,
             Packing::Word2L => 2,
             Packing::Word4L => 4,
-            // Compounds
-            Packing::DWordHL => 4,  // 2× Word2L
-            Packing::DWordBL => 8,  // 2× Word4L
+            // Compounds (sorted by output count, then input count)
+            Packing::DWordWL => 2,  // 2× Direct
             Packing::DWordHHW => 3, // Direct + Word2L
             Packing::DWordWHH => 3, // Word2L + Direct
+            Packing::DWordHL => 4,  // 2× Word2L
+            Packing::DWordBL => 8,  // 2× Word4L
             Packing::QuadHL => 8,   // 4× Word2L
         }
     }
@@ -147,11 +154,12 @@ impl Packing {
             Packing::Direct => 1,
             Packing::Word2L => 1,
             Packing::Word4L => 1,
-            // Compounds
-            Packing::DWordHL => 2,  // 2× Word2L
-            Packing::DWordBL => 2,  // 2× Word4L
+            // Compounds (sorted by output count, then input count)
+            Packing::DWordWL => 2,  // 2× Direct
             Packing::DWordHHW => 2, // Direct + Word2L
             Packing::DWordWHH => 2, // Word2L + Direct
+            Packing::DWordHL => 2,  // 2× Word2L
+            Packing::DWordBL => 2,  // 2× Word4L
             Packing::QuadHL => 4,   // 4× Word2L
         }
     }
@@ -225,18 +233,12 @@ impl Packing {
 
             // =================================================================
             // Compounds - delegate to primitives
+            // (sorted by output count, then input count)
             // =================================================================
-            Packing::DWordHL => {
-                // 2× Word2L
-                let mut result = Packing::Word2L.combine(&columns[0..2]);
-                result.extend(Packing::Word2L.combine(&columns[2..4]));
-                result
-            }
-
-            Packing::DWordBL => {
-                // 2× Word4L
-                let mut result = Packing::Word4L.combine(&columns[0..4]);
-                result.extend(Packing::Word4L.combine(&columns[4..8]));
+            Packing::DWordWL => {
+                // 2× Direct
+                let mut result = Packing::Direct.combine(&columns[0..1]);
+                result.extend(Packing::Direct.combine(&columns[1..2]));
                 result
             }
 
@@ -251,6 +253,20 @@ impl Packing {
                 // Word2L + Direct
                 let mut result = Packing::Word2L.combine(&columns[0..2]);
                 result.extend(Packing::Direct.combine(&columns[2..3]));
+                result
+            }
+
+            Packing::DWordHL => {
+                // 2× Word2L
+                let mut result = Packing::Word2L.combine(&columns[0..2]);
+                result.extend(Packing::Word2L.combine(&columns[2..4]));
+                result
+            }
+
+            Packing::DWordBL => {
+                // 2× Word4L
+                let mut result = Packing::Word4L.combine(&columns[0..4]);
+                result.extend(Packing::Word4L.combine(&columns[4..8]));
                 result
             }
 
