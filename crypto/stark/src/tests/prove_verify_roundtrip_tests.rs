@@ -1,10 +1,7 @@
-//! Tests that verify the prover-verifier separation works correctly.
+//! Roundtrip tests: proof serialization and prover-verifier separation.
 //!
-//! These tests simulate a realistic scenario where:
-//! 1. The prover generates proofs and serializes them
-//! 2. The proofs are "transmitted" (serialized/deserialized)
-//! 3. The verifier creates the AIR from scratch (without the prover's trace)
-//! 4. The verifier deserializes the proofs and verifies them
+//! These tests verify that proofs survive serialization/deserialization
+//! and can be verified independently from the prover.
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
