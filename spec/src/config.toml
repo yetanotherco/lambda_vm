@@ -59,6 +59,11 @@ subtypes = ["BaseField"]
 desc = "Variable that can only assume values in the range $[0, 2^35)$."
 
 [[variables.types]]
+label = "B49"
+subtypes = ["BaseField"]
+desc = "Variable that can only assume values in the range $[0, 2^49)$."
+
+[[variables.types]]
 label = "B51"
 subtypes = ["BaseField"]
 desc = "Variable that can only assume values in the range $[0, 2^51)$."
