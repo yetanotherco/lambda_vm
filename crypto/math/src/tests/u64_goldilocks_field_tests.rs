@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::field::errors::FieldError;
-    use crate::field::fields::u64_goldilocks_field::{Goldilocks64Field, reduce_128};
+    use crate::field::fields::goldilocks::{reduce_128, Goldilocks64Field};
     use crate::field::traits::{IsField, IsPrimeField};
     type F = Goldilocks64Field;
 

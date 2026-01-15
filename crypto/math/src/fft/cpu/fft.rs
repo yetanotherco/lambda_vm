@@ -182,12 +182,13 @@ mod tests {
     use crate::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
     use crate::fft::cpu::roots_of_unity::get_twiddles;
     use crate::fft::test_helpers::naive_matrix_dft_test;
-    use crate::field::{test_fields::u64_test_field::U64TestField, traits::RootsConfig};
+    use crate::field::fields::goldilocks::Goldilocks64Field;
+    use crate::field::traits::RootsConfig;
     use proptest::{collection, prelude::*};
 
     use super::*;
 
-    type F = U64TestField;
+    type F = Goldilocks64Field;
     type FE = FieldElement<F>;
 
     prop_compose! {

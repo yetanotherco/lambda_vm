@@ -1,55 +1,34 @@
 use core::fmt::{self, Display};
 
+use crate::errors::ByteConversionError;
 use crate::traits::ByteConversion;
 use crate::{
     errors::CreationError,
     field::{
         element::FieldElement,
         errors::FieldError,
-        extensions::quadratic::{HasQuadraticNonResidue, QuadraticExtensionField},
-        traits::{IsField, IsPrimeField},
+        traits::{IsFFTField, IsField, IsPrimeField},
     },
 };
 
-/// Goldilocks Prime Field F_p where p = 2^64 - 2^32 + 1;
+/// Goldilocks Prime Field F_p where p = 2^64 - 2^32 + 1
+///
+/// This is an FFT-friendly field with two-adicity of 32.
+/// The implementation uses optimized native u64 arithmetic.
+///
+/// NOTE: This implementation was inspired by and borrows from the work done by the Plonky3 team
+/// https://github.com/Plonky3/Plonky3/blob/main/goldilocks/src/lib.rs
 #[derive(Debug, Clone, Copy, Hash, PartialOrd, Ord, PartialEq, Eq)]
 pub struct Goldilocks64Field;
 
 impl Goldilocks64Field {
+    /// The field order: p = 2^64 - 2^32 + 1 = 0xFFFFFFFF00000001
     pub const ORDER: u64 = 0xFFFF_FFFF_0000_0001;
-    // Two's complement of `ORDER` i.e. `2^64 - ORDER = 2^32 - 1`
+
+    /// Two's complement of `ORDER` i.e. `2^64 - ORDER = 2^32 - 1`
     pub const NEG_ORDER: u64 = Self::ORDER.wrapping_neg();
 }
 
-impl ByteConversion for u64 {
-    #[cfg(feature = "alloc")]
-    fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
-        unimplemented!()
-    }
-
-    #[cfg(feature = "alloc")]
-    fn to_bytes_le(&self) -> alloc::vec::Vec<u8> {
-        unimplemented!()
-    }
-
-    fn from_bytes_be(_bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
-    where
-        Self: Sized,
-    {
-        unimplemented!()
-    }
-
-    fn from_bytes_le(_bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
-    where
-        Self: Sized,
-    {
-        unimplemented!()
-    }
-}
-
-//NOTE: This implementation was inspired by and borrows from the work done by the Plonky3 team
-//https://github.com/Plonky3/Plonky3/blob/main/goldilocks/src/lib.rs
-// Thank you for pushing this technology forward.
 impl IsField for Goldilocks64Field {
     type BaseType = u64;
 
@@ -79,7 +58,7 @@ impl IsField for Goldilocks64Field {
         Self::sub(&Self::ORDER, &Self::representative(a))
     }
 
-    /// Returns the multiplicative inverse of `a`.
+    /// Returns the multiplicative inverse of `a` using addition chain.
     fn inv(a: &u64) -> Result<u64, FieldError> {
         if *a == Self::zero() || *a == Self::ORDER {
             return Err(FieldError::InvZeroError);
@@ -91,58 +70,47 @@ impl IsField for Goldilocks64Field {
         // a^111
         let t3 = Self::mul(&Self::square(&t2), a);
 
-        // compute base^111111 (6 ones) by repeatedly squaring t3 3 times and multiplying by t3
+        // compute base^111111 (6 ones)
         let t6 = exp_acc::<3>(&t3, &t3);
         let t60 = Self::square(&t6);
         let t7 = Self::mul(&t60, a);
 
         // compute base^111111111111 (12 ones)
-        // repeatedly square t6 6 times and multiply by t6
         let t12 = exp_acc::<5>(&t60, &t6);
 
         // compute base^111111111111111111111111 (24 ones)
-        // repeatedly square t12 12 times and multiply by t12
         let t24 = exp_acc::<12>(&t12, &t12);
 
         // compute base^1111111111111111111111111111111 (31 ones)
-        // repeatedly square t24 6 times and multiply by t6 first. then square t30 and multiply by base
         let t31 = exp_acc::<7>(&t24, &t7);
 
         // compute base^111111111111111111111111111111101111111111111111111111111111111
-        // repeatedly square t31 32 times and multiply by t31
         let t63 = exp_acc::<32>(&t31, &t31);
 
         Ok(Self::mul(&Self::square(&t63), a))
     }
 
-    /// Returns the division of `a` and `b`.
     fn div(a: &u64, b: &u64) -> Result<u64, FieldError> {
         let b_inv = &Self::inv(b)?;
         Ok(Self::mul(a, b_inv))
     }
 
-    /// Returns a boolean indicating whether `a` and `b` are equal or not.
     fn eq(a: &u64, b: &u64) -> bool {
         Self::representative(a) == Self::representative(b)
     }
 
-    /// Returns the additive neutral element.
     fn zero() -> u64 {
         0u64
     }
 
-    /// Returns the multiplicative neutral element.
     fn one() -> u64 {
         1u64
     }
 
-    /// Returns the element `x * 1` where 1 is the multiplicative neutral element.
     fn from_u64(x: u64) -> u64 {
         Self::representative(&x)
     }
 
-    /// Takes as input an element of BaseType and returns the internal representation
-    /// of that element in the field.
     fn from_base_type(x: u64) -> u64 {
         Self::representative(&x)
     }
@@ -160,7 +128,7 @@ impl IsPrimeField for Goldilocks64Field {
     }
 
     fn field_bit_size() -> usize {
-        ((self::Goldilocks64Field::ORDER - 1).ilog2() + 1) as usize
+        64
     }
 
     fn from_hex(hex_string: &str) -> Result<Self::BaseType, CreationError> {
@@ -182,9 +150,28 @@ impl IsPrimeField for Goldilocks64Field {
     }
 }
 
+/// IsFFTField implementation for Goldilocks64Field
+///
+/// The field order is p = 2^64 - 2^32 + 1
+/// p - 1 = 2^64 - 2^32 = 2^32 * (2^32 - 1)
+/// So the two-adicity is 32.
+///
+/// The primitive 2^32-th root of unity was taken from Plonky3:
+/// https://github.com/Plonky3/Plonky3/blob/main/goldilocks/src/lib.rs
+impl IsFFTField for Goldilocks64Field {
+    const TWO_ADICITY: u64 = 32;
+
+    /// 2^32-th primitive root of unity: 1753635133440165772
+    const TWO_ADIC_PRIMITVE_ROOT_OF_UNITY: u64 = 1753635133440165772;
+
+    fn field_name() -> &'static str {
+        "goldilocks64"
+    }
+}
+
+/// Reduces a 128-bit product to a 64-bit field element
 #[inline(always)]
 pub fn reduce_128(x: u128) -> u64 {
-    //possibly split apart into separate function to ensure inline
     let (x_lo, x_hi) = (x as u64, (x >> 64) as u64);
     let x_hi_hi = x_hi >> 32;
     let x_hi_lo = x_hi & Goldilocks64Field::NEG_ORDER;
@@ -196,7 +183,6 @@ pub fn reduce_128(x: u128) -> u64 {
 
     let t1 = x_hi_lo * Goldilocks64Field::NEG_ORDER;
     let (res_wrapped, carry) = t0.overflowing_add(t1);
-    // Below cannot overflow unless the assumption if x + y < 2**64 + ORDER is incorrect.
     res_wrapped + Goldilocks64Field::NEG_ORDER * u64::from(carry)
 }
 
@@ -214,13 +200,100 @@ fn exp_power_of_2<const POWER_LOG: usize>(base: &u64) -> u64 {
     res
 }
 
-pub type Goldilocks64ExtensionField = QuadraticExtensionField<Goldilocks64Field, Goldilocks64Field>;
+impl ByteConversion for u64 {
+    #[cfg(feature = "alloc")]
+    fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
+        self.to_be_bytes().to_vec()
+    }
 
-impl HasQuadraticNonResidue<Goldilocks64Field> for Goldilocks64Field {
-    // Verifiable in Sage with
-    // `R.<x> = GF(p)[]; assert (x^2 - 7).is_irreducible()`
-    fn residue() -> FieldElement<Goldilocks64Field> {
-        FieldElement::from(Goldilocks64Field::from_u64(7u64))
+    #[cfg(feature = "alloc")]
+    fn to_bytes_le(&self) -> alloc::vec::Vec<u8> {
+        self.to_le_bytes().to_vec()
+    }
+
+    fn from_bytes_be(bytes: &[u8]) -> Result<Self, ByteConversionError>
+    where
+        Self: Sized,
+    {
+        if bytes.len() < 8 {
+            return Err(ByteConversionError::FromBEBytesError);
+        }
+        Ok(u64::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
+    }
+
+    fn from_bytes_le(bytes: &[u8]) -> Result<Self, ByteConversionError>
+    where
+        Self: Sized,
+    {
+        if bytes.len() < 8 {
+            return Err(ByteConversionError::FromLEBytesError);
+        }
+        Ok(u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
+    }
+}
+
+impl FieldElement<Goldilocks64Field> {
+    pub fn to_bytes_le_array(&self) -> [u8; 8] {
+        self.representative().to_le_bytes()
+    }
+
+    pub fn to_bytes_be_array(&self) -> [u8; 8] {
+        self.representative().to_be_bytes()
+    }
+}
+
+impl ByteConversion for FieldElement<Goldilocks64Field> {
+    #[cfg(feature = "alloc")]
+    fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
+        self.representative().to_be_bytes().to_vec()
+    }
+
+    #[cfg(feature = "alloc")]
+    fn to_bytes_le(&self) -> alloc::vec::Vec<u8> {
+        self.representative().to_le_bytes().to_vec()
+    }
+
+    fn from_bytes_be(bytes: &[u8]) -> Result<Self, ByteConversionError>
+    where
+        Self: Sized,
+    {
+        if bytes.len() < 8 {
+            return Err(ByteConversionError::FromBEBytesError);
+        }
+        let value = u64::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]);
+        Ok(Self::new(Goldilocks64Field::from_base_type(value)))
+    }
+
+    fn from_bytes_le(bytes: &[u8]) -> Result<Self, ByteConversionError>
+    where
+        Self: Sized,
+    {
+        if bytes.len() < 8 {
+            return Err(ByteConversionError::FromLEBytesError);
+        }
+        let value = u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]);
+        Ok(Self::new(Goldilocks64Field::from_base_type(value)))
+    }
+}
+
+#[allow(clippy::non_canonical_partial_ord_impl)]
+impl PartialOrd for FieldElement<Goldilocks64Field> {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        self.representative().partial_cmp(&other.representative())
+    }
+}
+
+impl Ord for FieldElement<Goldilocks64Field> {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.representative().cmp(&other.representative())
     }
 }
 

@@ -7,8 +7,8 @@ mod tests {
         babybear_u32::Babybear31PrimeField, stark_252_prime_field::Stark252PrimeField,
     };
     use crate::field::fields::montgomery_backed_prime_fields::{IsModulus, U384PrimeField};
+    use crate::field::fields::goldilocks::Goldilocks64Field;
     use crate::field::fields::u64_prime_field::U64PrimeField;
-    use crate::field::test_fields::u64_test_field::U64TestField;
     use crate::unsigned_integer::element::U384;
     #[cfg(feature = "alloc")]
     use crate::unsigned_integer::element::UnsignedInteger;
@@ -22,12 +22,12 @@ mod tests {
     #[test]
     fn test_std_iter_sum_field_element() {
         let n = 164;
-        const MODULUS: u64 = 18446744069414584321;
+        const MODULUS: u64 = 18446744069414584321; // Goldilocks prime
         assert_eq!(
             (0..n)
-                .map(|x| { FieldElement::<U64TestField>::from(x) })
-                .sum::<FieldElement<U64TestField>>()
-                .to_raw(),
+                .map(|x| { FieldElement::<Goldilocks64Field>::from(x) })
+                .sum::<FieldElement<Goldilocks64Field>>()
+                .representative(),
             ((n - 1) as f64 / 2. * ((n - 1) as f64 + 1.)) as u64 % MODULUS
         );
     }
@@ -37,9 +37,9 @@ mod tests {
         let n = 0;
         assert_eq!(
             (0..n)
-                .map(|x| { FieldElement::<U64TestField>::from(x) })
-                .sum::<FieldElement<U64TestField>>()
-                .to_raw(),
+                .map(|x| { FieldElement::<Goldilocks64Field>::from(x) })
+                .sum::<FieldElement<Goldilocks64Field>>()
+                .representative(),
             0
         );
     }

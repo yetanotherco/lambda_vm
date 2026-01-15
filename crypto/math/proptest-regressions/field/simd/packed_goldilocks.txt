@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d371b1368fdd518cd6d34ab6a51a2150534ac1716ea51f630047254e6b421db8 # shrinks to a = PackedGoldilocks2(0, 18166856992678596702), b = PackedGoldilocks2(0, 7211013949525861092), c = PackedGoldilocks2(0, 4323130498185757896)
+cc df7ceb238f96f18a01cbc7d6a0528de598f0c1b00e16121ef4de63d3beb2fedf # shrinks to a = PackedGoldilocks2(0, 11249552248224563414), b = PackedGoldilocks2(0, 3198538038204768457), c = PackedGoldilocks2(0, 9355536025704287449)
+cc bd527eca1bf9027ad8a7db977d8a9fca7f32989f957cc86c55cc287a79bd8512 # shrinks to a0 = 0, a1 = 12965670261367596991, b0 = 0, b1 = 16825042904497414507

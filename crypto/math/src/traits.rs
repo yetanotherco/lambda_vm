@@ -49,6 +49,32 @@ impl AsBytes for u64 {
     }
 }
 
+impl ByteConversion for u32 {
+    #[cfg(feature = "alloc")]
+    fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
+        self.to_be_bytes().to_vec()
+    }
+
+    #[cfg(feature = "alloc")]
+    fn to_bytes_le(&self) -> alloc::vec::Vec<u8> {
+        self.to_le_bytes().to_vec()
+    }
+
+    fn from_bytes_be(bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError> {
+        if bytes.len() < 4 {
+            return Err(crate::errors::ByteConversionError::FromBEBytesError);
+        }
+        Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn from_bytes_le(bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError> {
+        if bytes.len() < 4 {
+            return Err(crate::errors::ByteConversionError::FromLEBytesError);
+        }
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+}
+
 /// Deserialize function without args
 pub trait Deserializable {
     fn deserialize(bytes: &[u8]) -> Result<Self, DeserializationError>

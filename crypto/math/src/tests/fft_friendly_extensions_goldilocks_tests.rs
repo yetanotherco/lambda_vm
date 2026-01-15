@@ -1,12 +1,9 @@
 use crate::field::{
     element::FieldElement,
-    fields::fft_friendly::{
-        extensions_goldilocks::{Fp2E, Fp3E},
-        u64_goldilocks::U64GoldilocksPrimeField,
-    },
+    fields::goldilocks::{Fp2E, Fp3E, Goldilocks64Field},
 };
 
-type FpE = FieldElement<U64GoldilocksPrimeField>;
+type FpE = FieldElement<Goldilocks64Field>;
 
 // =====================================================
 // QUADRATIC EXTENSION TESTS
@@ -328,7 +325,7 @@ fn test_fp2_batch_inverse() {
     let d = Fp2E::new([FpE::from(8u64), FpE::from(9u64)]);
 
     let original = [a, b, c, d];
-    let mut to_invert = original.clone();
+    let mut to_invert = original;
 
     Fp2E::inplace_batch_inverse(&mut to_invert).unwrap();
 
@@ -363,7 +360,7 @@ fn test_fp3_batch_inverse() {
     let d = Fp3E::new([FpE::from(11u64), FpE::from(12u64), FpE::from(13u64)]);
 
     let original = [a, b, c, d];
-    let mut to_invert = original.clone();
+    let mut to_invert = original;
 
     Fp3E::inplace_batch_inverse(&mut to_invert).unwrap();
 

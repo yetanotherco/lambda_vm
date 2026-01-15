@@ -1250,6 +1250,7 @@ pub trait IsStarkProver<
 }
 
 #[cfg(test)]
+#[allow(clippy::type_complexity)]
 mod tests {
     use std::num::ParseIntError;
 

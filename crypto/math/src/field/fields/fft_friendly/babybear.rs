@@ -23,8 +23,6 @@ pub type Babybear31PrimeField =
 // 21^(2^24)=1 mod 2013265921
 // 2^27(2^4-1)+1 where n=27 (two-adicity) and k=2^4+1
 
-//In the future we should allow this with cuda feature, and just dispatch it to the CPU until the implementation is done
-#[cfg(not(feature = "cuda"))]
 impl IsFFTField for Babybear31PrimeField {
     const TWO_ADICITY: u64 = 24;
 
