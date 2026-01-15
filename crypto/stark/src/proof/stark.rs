@@ -70,11 +70,11 @@ pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     pub deep_poly_openings: DeepPolynomialOpenings<F, E>,
     // nonce obtained from grinding
     pub nonce: Option<u64>,
-    // Bus interaction public inputs for each interaction in this table.
+    // Bus interaction public inputs for the accumulated column.
     // Contains initial and final aux column values, used for:
     // 1. Boundary constraints on aux columns (row 0 and last row)
-    // 2. Bus balance check: Σ sender_values - Σ receiver_values = 0 across all tables
-    pub bus_interactions: Vec<BusPublicInputs<E>>,
+    // 2. Bus balance check: Σ final_accumulated across all tables = 0
+    pub bus_public_inputs: Option<BusPublicInputs<E>>,
     // Public inputs used for boundary constraints
     pub public_inputs: PI,
 }

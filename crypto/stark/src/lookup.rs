@@ -173,7 +173,7 @@ where
         &self,
         trace: &mut TraceTable<F, E>,
         challenges: &[FieldElement<E>],
-    ) -> Vec<BusPublicInputs<E>> {
+    ) -> Option<BusPublicInputs<E>> {
         // Allocate aux table if not already present
         let (_, num_aux_columns) = self.trace_layout();
         if num_aux_columns > 0 && trace.num_aux_columns == 0 {
@@ -183,7 +183,7 @@ where
         let num_interactions = self.auxiliary_trace_build_data.interactions.len();
 
         if num_interactions == 0 {
-            return vec![];
+            return None;
         }
 
         // Build term columns (one per interaction)
@@ -203,10 +203,10 @@ where
 
         // Return single BusPublicInputs for the accumulated column
         let last_row = trace.num_rows() - 1;
-        vec![BusPublicInputs {
+        Some(BusPublicInputs {
             initial_value: trace.get_aux(0, acc_col_idx).clone(),
             final_accumulated: trace.get_aux(last_row, acc_col_idx).clone(),
-        }]
+        })
     }
 
     fn build_rap_challenges(
@@ -222,16 +222,14 @@ where
         &self,
         pub_inputs: &Self::PublicInputs,
         rap_challenges: &[FieldElement<E>],
-        bus_interactions: Option<&[BusPublicInputs<E>]>,
+        bus_public_inputs: Option<&BusPublicInputs<E>>,
         trace_length: usize,
     ) -> BoundaryConstraints<E> {
         let mut boundary_constraints = vec![];
 
         // Boundary constraints for the accumulated column only
         // (term columns are fully determined by main trace and don't need boundary constraints)
-        if let Some(interactions) = bus_interactions
-            && let Some(acc_interaction) = interactions.first()
-        {
+        if let Some(acc_interaction) = bus_public_inputs {
             // The accumulated column is at index = num_interactions
             let acc_col_idx = self.auxiliary_trace_build_data.interactions.len();
 
