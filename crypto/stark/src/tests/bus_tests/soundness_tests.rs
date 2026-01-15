@@ -1050,6 +1050,177 @@ fn test_packing_mismatch_shift_constant() {
     );
 }
 
+/// Compound packing mismatch: sender uses DWordHHW, receiver uses DWordWHH.
+/// Both consume 3 columns but interpret them differently:
+/// - DWordHHW: [Word, Half, Half] → [w, h0 + 2^16*h1]
+/// - DWordWHH: [Half, Half, Word] → [h0 + 2^16*h1, w]
+///
+/// Same raw values, different layout interpretation = different fingerprints.
+#[test_log::test]
+fn test_compound_mismatch_dwordhhw_vs_dwordwhh() {
+    use crate::lookup::{
+        AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, NullBoundaryConstraintBuilder,
+        Packing,
+    };
+
+    fn sender_air_dwordhhw(
+        proof_options: &ProofOptions,
+    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+        let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+            interactions: vec![
+                // DWordHHW: [Word, Half, Half] at columns 1, 2, 3
+                BusInteraction::sender(Some(0), Packing::DWordHHW.columns(&[1])),
+            ],
+        };
+        AirWithBuses::new(4, auxiliary_trace_build_data, proof_options, 1, vec![])
+    }
+
+    fn receiver_air_dwordwhh(
+        proof_options: &ProofOptions,
+    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+        let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+            interactions: vec![
+                // DWordWHH: [Half, Half, Word] at columns 1, 2, 3
+                BusInteraction::receiver(Some(0), Packing::DWordWHH.columns(&[1])),
+            ],
+        };
+        AirWithBuses::new(4, auxiliary_trace_build_data, proof_options, 1, vec![])
+    }
+
+    // Trace with values that expose the layout difference
+    // Column 1: 0x1000 (could be Word or Half)
+    // Column 2: 0x2000 (could be Half)
+    // Column 3: 0x3000 (could be Half or Word)
+    let mut sender_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(0x1000u64), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(0x2000u64), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(0x3000u64), FE::zero(), FE::zero(), FE::zero()],
+        ],
+        1,
+    );
+
+    let mut receiver_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(0x1000u64), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(0x2000u64), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(0x3000u64), FE::zero(), FE::zero(), FE::zero()],
+        ],
+        1,
+    );
+
+    // Sender DWordHHW: [0x1000, 0x2000 + 0x3000*2^16] = [0x1000, 0x30002000]
+    // Receiver DWordWHH: [0x1000 + 0x2000*2^16, 0x3000] = [0x20001000, 0x3000]
+    // Completely different bus elements!
+
+    let proof_options = ProofOptions::default_test_options();
+    let sender = sender_air_dwordhhw(&proof_options);
+    let receiver = receiver_air_dwordwhh(&proof_options);
+
+    let air_trace_pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&sender, &mut sender_trace, &()),
+        (&receiver, &mut receiver_trace, &()),
+    ];
+
+    let multi_proof =
+        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        vec![&sender, &receiver];
+
+    assert!(
+        !Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
+        "Compound layout mismatch (DWordHHW vs DWordWHH) should cause verification failure"
+    );
+}
+
+/// Compound vs primitive mismatch: sender uses DWordHL (compound), receiver
+/// uses the equivalent 2× Word2L manually. Should PASS because they're equivalent!
+#[test_log::test]
+fn test_compound_equals_primitive_expansion() {
+    use crate::lookup::{
+        AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, NullBoundaryConstraintBuilder,
+        Packing,
+    };
+
+    fn sender_air_compound(
+        proof_options: &ProofOptions,
+    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+        let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+            interactions: vec![
+                // DWordHL (compound): 4 halves at columns 1-4
+                BusInteraction::sender(Some(0), Packing::DWordHL.columns(&[1])),
+            ],
+        };
+        AirWithBuses::new(5, auxiliary_trace_build_data, proof_options, 1, vec![])
+    }
+
+    fn receiver_air_primitives(
+        proof_options: &ProofOptions,
+    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+        let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+            interactions: vec![
+                // Equivalent: 2× Word2L at columns 1-2 and 3-4
+                BusInteraction::receiver(Some(0), Packing::Word2L.columns(&[1, 3])),
+            ],
+        };
+        AirWithBuses::new(5, auxiliary_trace_build_data, proof_options, 1, vec![])
+    }
+
+    let mut sender_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(0x1111u64), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(0x2222u64), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(0x3333u64), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(0x4444u64), FE::zero(), FE::zero(), FE::zero()],
+        ],
+        1,
+    );
+
+    let mut receiver_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(0x1111u64), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(0x2222u64), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(0x3333u64), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(0x4444u64), FE::zero(), FE::zero(), FE::zero()],
+        ],
+        1,
+    );
+
+    let proof_options = ProofOptions::default_test_options();
+    let sender = sender_air_compound(&proof_options);
+    let receiver = receiver_air_primitives(&proof_options);
+
+    let air_trace_pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&sender, &mut sender_trace, &()),
+        (&receiver, &mut receiver_trace, &()),
+    ];
+
+    let multi_proof =
+        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        vec![&sender, &receiver];
+
+    // This should PASS - compound and primitive expansion are equivalent
+    assert!(
+        Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
+        "Compound should be equivalent to its primitive expansion"
+    );
+}
+
 // =============================================================================
 // Complex scenarios
 // =============================================================================

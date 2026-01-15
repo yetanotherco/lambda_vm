@@ -102,6 +102,138 @@ fn test_dword_hhw() {
 }
 
 #[test]
+fn test_dword_whh() {
+    // [Half, Half, Word] where Word is MSB
+    // columns: [0x1234, 0x5678, 0xAABBCCDD]
+    // Expected: [0x56781234, 0xAABBCCDD]
+    let cols = vec![
+        FE::from(0x1234u64),
+        FE::from(0x5678u64),
+        FE::from(0xAABBCCDDu64),
+    ];
+    let combined = Packing::DWordWHH.combine(&cols);
+    assert_eq!(combined.len(), 2);
+    assert_eq!(combined[0], FE::from(0x56781234u64));
+    assert_eq!(combined[1], FE::from(0xAABBCCDDu64));
+}
+
+#[test]
+fn test_dword_bl() {
+    // 8 bytes → 2 words (2× Word4L)
+    let bytes = vec![
+        FE::from(0x11u64),
+        FE::from(0x22u64),
+        FE::from(0x33u64),
+        FE::from(0x44u64),
+        FE::from(0x55u64),
+        FE::from(0x66u64),
+        FE::from(0x77u64),
+        FE::from(0x88u64),
+    ];
+    let combined = Packing::DWordBL.combine(&bytes);
+    assert_eq!(combined.len(), 2);
+    // First word: 0x11 + 0x22*2^8 + 0x33*2^16 + 0x44*2^24 = 0x44332211
+    assert_eq!(combined[0], FE::from(0x44332211u64));
+    // Second word: 0x55 + 0x66*2^8 + 0x77*2^16 + 0x88*2^24 = 0x88776655
+    assert_eq!(combined[1], FE::from(0x88776655u64));
+}
+
+// =============================================================================
+// Compound delegation tests
+// =============================================================================
+// These tests verify that compound packings produce identical results
+// to manually applying the primitives they're built from.
+
+#[test]
+fn test_dword_hl_equals_two_word2l() {
+    let halves = vec![
+        FE::from(0x1234u64),
+        FE::from(0x5678u64),
+        FE::from(0x9ABCu64),
+        FE::from(0xDEF0u64),
+    ];
+
+    // Compound
+    let compound_result = Packing::DWordHL.combine(&halves);
+
+    // Manual: 2× Word2L
+    let mut manual_result = Packing::Word2L.combine(&halves[0..2]);
+    manual_result.extend(Packing::Word2L.combine(&halves[2..4]));
+
+    assert_eq!(compound_result, manual_result);
+}
+
+#[test]
+fn test_dword_bl_equals_two_word4l() {
+    let bytes: Vec<FE> = (1u64..=8).map(FE::from).collect();
+
+    // Compound
+    let compound_result = Packing::DWordBL.combine(&bytes);
+
+    // Manual: 2× Word4L
+    let mut manual_result = Packing::Word4L.combine(&bytes[0..4]);
+    manual_result.extend(Packing::Word4L.combine(&bytes[4..8]));
+
+    assert_eq!(compound_result, manual_result);
+}
+
+#[test]
+fn test_dword_hhw_equals_direct_plus_word2l() {
+    let cols = vec![
+        FE::from(0xAABBCCDDu64),
+        FE::from(0x1234u64),
+        FE::from(0x5678u64),
+    ];
+
+    // Compound
+    let compound_result = Packing::DWordHHW.combine(&cols);
+
+    // Manual: Direct + Word2L
+    let mut manual_result = Packing::Direct.combine(&cols[0..1]);
+    manual_result.extend(Packing::Word2L.combine(&cols[1..3]));
+
+    assert_eq!(compound_result, manual_result);
+}
+
+#[test]
+fn test_dword_whh_equals_word2l_plus_direct() {
+    let cols = vec![
+        FE::from(0x1234u64),
+        FE::from(0x5678u64),
+        FE::from(0xAABBCCDDu64),
+    ];
+
+    // Compound
+    let compound_result = Packing::DWordWHH.combine(&cols);
+
+    // Manual: Word2L + Direct
+    let mut manual_result = Packing::Word2L.combine(&cols[0..2]);
+    manual_result.extend(Packing::Direct.combine(&cols[2..3]));
+
+    assert_eq!(compound_result, manual_result);
+}
+
+#[test]
+fn test_quad_hl_equals_four_word2l() {
+    let halves: Vec<FE> = (1u64..=8).map(|x| FE::from(x * 0x1111)).collect();
+
+    // Compound
+    let compound_result = Packing::QuadHL.combine(&halves);
+
+    // Manual: 4× Word2L
+    let mut manual_result = Packing::Word2L.combine(&halves[0..2]);
+    manual_result.extend(Packing::Word2L.combine(&halves[2..4]));
+    manual_result.extend(Packing::Word2L.combine(&halves[4..6]));
+    manual_result.extend(Packing::Word2L.combine(&halves[6..8]));
+
+    assert_eq!(compound_result, manual_result);
+}
+
+// =============================================================================
+// AIR layout tests
+// =============================================================================
+
+#[test]
 fn test_air_layout_single_interaction() {
     type E = math::field::fields::fft_friendly::quartic_babybear::Degree4BabyBearExtensionField;
 
