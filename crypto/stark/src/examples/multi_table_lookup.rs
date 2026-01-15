@@ -1,8 +1,8 @@
 use crate::{
     constraints::transition::TransitionConstraint,
     lookup::{
-        AirWithBuses, AuxiliaryTraceBuildData, Packing, NullBoundaryConstraintBuilder,
-        BusInteraction,
+        AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, NullBoundaryConstraintBuilder,
+        Packing,
     },
     proof::options::ProofOptions,
 };

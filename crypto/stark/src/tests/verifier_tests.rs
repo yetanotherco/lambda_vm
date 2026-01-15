@@ -14,8 +14,7 @@ use math::field::fields::fft_friendly::{
 
 use crate::constraints::transition::TransitionConstraint;
 use crate::lookup::{
-    AirWithBuses, AuxiliaryTraceBuildData, Packing, NullBoundaryConstraintBuilder,
-    BusInteraction,
+    AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, NullBoundaryConstraintBuilder, Packing,
 };
 use crate::proof::options::ProofOptions;
 use crate::proof::stark::MultiProof;
@@ -196,7 +195,10 @@ fn create_add_air(
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: vec![BusInteraction::receiver(Some(3), Packing::Direct.columns(&[0, 1, 2]))],
+        interactions: vec![BusInteraction::receiver(
+            Some(3),
+            Packing::Direct.columns(&[0, 1, 2]),
+        )],
     };
     AirWithBuses::new(
         4, // ADD: a, b, c, multiplicity
@@ -212,7 +214,10 @@ fn create_mul_air(
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: vec![BusInteraction::receiver(Some(3), Packing::Direct.columns(&[0, 1, 2]))],
+        interactions: vec![BusInteraction::receiver(
+            Some(3),
+            Packing::Direct.columns(&[0, 1, 2]),
+        )],
     };
     AirWithBuses::new(
         4, // MUL: a, b, c, multiplicity

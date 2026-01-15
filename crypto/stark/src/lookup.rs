@@ -248,20 +248,14 @@ impl Packing {
                 // [Word (LSB), Half, Half (MSB)]
                 // → [w₀, h₀ + 2¹⁶·h₁]
                 let shift_16 = FieldElement::<E>::from(SHIFT_16);
-                vec![
-                    columns[0].clone(),
-                    &columns[1] + &columns[2] * &shift_16,
-                ]
+                vec![columns[0].clone(), &columns[1] + &columns[2] * &shift_16]
             }
 
             Packing::DWordWHH => {
                 // [Half (LSB), Half, Word (MSB)]
                 // → [h₀ + 2¹⁶·h₁, w₀]
                 let shift_16 = FieldElement::<E>::from(SHIFT_16);
-                vec![
-                    &columns[0] + &columns[1] * &shift_16,
-                    columns[2].clone(),
-                ]
+                vec![&columns[0] + &columns[1] * &shift_16, columns[2].clone()]
             }
         }
     }
@@ -323,7 +317,11 @@ impl TypedValue {
         &self,
         get_column: F,
     ) -> Vec<FieldElement<E>> {
-        let columns: Vec<_> = self.column_indices().iter().map(|&i| get_column(i)).collect();
+        let columns: Vec<_> = self
+            .column_indices()
+            .iter()
+            .map(|&i| get_column(i))
+            .collect();
         self.bus_type.combine(&columns)
     }
 }
@@ -667,12 +665,12 @@ fn build_logup_term_column<F, E>(
     let trace_len = trace.num_rows();
 
     // Handle optional multiplicity column - use constant 1 if None
-    let multiplicity_owned: Vec<FieldElement<F>>;
-    let multiplicity: &[FieldElement<F>] = match table_interaction.multiplicity_column {
+    let multiplicities_owned: Vec<FieldElement<F>>;
+    let multiplicities: &[FieldElement<F>] = match table_interaction.multiplicity_column {
         Some(col) => &main_segment_cols[col],
         None => {
-            multiplicity_owned = vec![FieldElement::one(); trace_len];
-            &multiplicity_owned
+            multiplicities_owned = vec![FieldElement::one(); trace_len];
+            &multiplicities_owned
         }
     };
 
@@ -682,8 +680,7 @@ fn build_logup_term_column<F, E>(
 
     // Precompute powers of alpha for all bus elements
     let num_bus_elements = table_interaction.num_bus_elements();
-    let alpha_powers: Vec<FieldElement<E>> =
-        (0..num_bus_elements).map(|i| alpha.pow(i)).collect();
+    let alpha_powers: Vec<FieldElement<E>> = (0..num_bus_elements).map(|i| alpha.pow(i)).collect();
 
     // Sign: +1 for senders, -1 for receivers
     // This bakes the sign into the term so the accumulated column can just sum everything
@@ -693,7 +690,7 @@ fn build_logup_term_column<F, E>(
         -FieldElement::<E>::one()
     };
 
-    for row in 0..trace_len {
+    for (row, multiplicity) in multiplicities.iter().enumerate() {
         // Stage 1: Combine each typed value's columns using powers of 2
         // Stage 2: Flatten all bus elements and combine with powers of α
         let bus_elements: Vec<FieldElement<E>> = table_interaction
@@ -719,7 +716,7 @@ fn build_logup_term_column<F, E>(
         let fingerprint = z - &linear_combination;
 
         // term = sign * multiplicity / fingerprint
-        let term = &multiplicity[row]
+        let term = multiplicity
             * &sign
             * fingerprint
                 .inv()
@@ -774,11 +771,7 @@ struct LookupTermConstraint {
 }
 
 impl LookupTermConstraint {
-    pub fn new(
-        interaction: BusInteraction,
-        term_column_idx: usize,
-        constraint_idx: usize,
-    ) -> Self {
+    pub fn new(interaction: BusInteraction, term_column_idx: usize, constraint_idx: usize) -> Self {
         Self {
             interaction,
             term_column_idx,
@@ -836,7 +829,11 @@ where
                     let columns: Vec<FieldElement<B>> = tv
                         .column_indices()
                         .iter()
-                        .map(|&col| step.get_main_evaluation_element(0, col).clone().to_extension())
+                        .map(|&col| {
+                            step.get_main_evaluation_element(0, col)
+                                .clone()
+                                .to_extension()
+                        })
                         .collect();
                     tv.bus_type.combine(&columns)
                 })
@@ -994,8 +991,7 @@ mod tests {
     use crate::trace::TraceTable;
     use crate::traits::AIR;
     use math::field::fields::fft_friendly::{
-        babybear_u32::Babybear31PrimeField,
-        quartic_babybear_u32::Degree4BabyBearU32ExtensionField,
+        babybear_u32::Babybear31PrimeField, quartic_babybear_u32::Degree4BabyBearU32ExtensionField,
     };
 
     type F = Babybear31PrimeField;
@@ -1080,7 +1076,7 @@ mod tests {
 
         // Define a typed interaction using Direct (no combining)
         let interaction = BusInteraction::sender(
-            Some(0), // multiplicity column
+            Some(0),                             // multiplicity column
             Packing::Direct.columns(&[1, 2, 3]), // a, b, c
         );
 
