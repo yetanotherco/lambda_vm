@@ -20,7 +20,7 @@ jobs:
     # "Lint" is a required check, don't change the name
     name: Lint
     runs-on: ubuntu-latest
-    if: github.event_name != 'push' || !contains(github.event.head_commit.message, 'Merge pull request')
+    if: github.event_name != 'push' || github.actor != 'github-merge-queue[bot]'
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
@@ -46,7 +46,7 @@ jobs:
     # "Test" is a required check, don't change the name
     name: Test
     runs-on: ubuntu-latest
-    if: github.event_name != 'push' || !contains(github.event.head_commit.message, 'Merge pull request')
+    if: github.event_name != 'push' || github.actor != 'github-merge-queue[bot]'
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
