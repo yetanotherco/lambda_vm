@@ -17,19 +17,19 @@ pad = 0
 [[variables.input]]
 name = "read2"
 type = "Bit"
-desc = "Whether to read exactly 2 values"
+desc = "Whether to read exactly 2 bytes"
 pad = 0
 
 [[variables.input]]
 name = "read4"
 type = "Bit"
-desc = "Whether to read exactly 4 values"
+desc = "Whether to read exactly 4 bytes"
 pad = 0
 
 [[variables.input]]
 name = "read8"
 type = "Bit"
-desc = "Whether to read exactly 8 values"
+desc = "Whether to read exactly 8 bytes"
 pad = 0
 
 [[variables.input]]
@@ -56,6 +56,12 @@ pad = 0
 
 # Virtual
 
+[[variables.virtual]]
+name = "read1"
+type = "Bit"
+desc = "Whether to read exactly 1 byte"
+def = ["-", "μ", "read2", "read4", "read8"]
+
 # Multiplicity
 
 [[variables.multiplicity]]
@@ -68,6 +74,9 @@ pad = 0
 [[assumptions]]
 desc = "`IS_WORD[base_address[i]]`"
 iter = ["i", 0, 1]
+
+[[assumptions]]
+desc = "`IS_BIT<signed>`"
 
 [[assumptions]]
 desc = "`IS_BIT<read2>`"
@@ -104,6 +113,13 @@ multiplicity = "μ"
 [[constraints.all]]
 kind = "interaction"
 tag = "MSB8"
+input = [["idx", "res", 0]]
+output = "sign_bit"
+multiplicity = "read1"
+
+[[constraints.all]]
+kind = "interaction"
+tag = "MSB8"
 input = [["idx", "res", 1]]
 output = "sign_bit"
 multiplicity = "read2"
@@ -129,7 +145,7 @@ iter = ["i", 2, 3]
 
 [[constraints.all]]
 kind = "arith"
-constraint = "$!(#`read2` + #`read4` + #`read8`) => #`res`_i = #`signed` dot #`sign_bit` dot 255$"
+constraint = "$!(#`read2` + #`read4` + #`read8`) => #`res`_1 = #`signed` dot #`sign_bit` dot 255$"
 poly = ["*", ["-", 1, "read2", "read4", "read8"], ["-", ["idx", "res", 1], ["*", "signed", "sign_bit", 255]]]
 
 
