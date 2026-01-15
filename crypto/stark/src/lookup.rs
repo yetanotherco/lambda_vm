@@ -67,6 +67,12 @@ impl<
 {
     /// Creates an AirWithBuses with LogUp-specific transition constraints.
     /// If no boundary constraints are needed, use `NullBoundaryConstraintBuilder` as B and () as PI.
+    ///
+    /// Auxiliary column layout:
+    /// - Columns 0..N-1: Term columns (one per interaction), each containing ±m[i]/fp[i]
+    /// - Column N: Accumulated column, containing the running sum of all terms
+    ///
+    /// Total aux columns = N + 1 where N is the number of interactions.
     pub fn new(
         num_main_columns: usize,
         auxiliary_trace_build_data: AuxiliaryTraceBuildData,
@@ -74,27 +80,31 @@ impl<
         step_size: usize,
         mut transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
     ) -> Self {
-        // Add a transition constraint for each auxiliary column representing a table interaction
+        let num_interactions = auxiliary_trace_build_data.interactions.len();
+
+        // Add a term constraint for each interaction
+        // Each term constraint verifies: term[i] = sign * multiplicity[i] / fingerprint[i]
+        // Rearranged as: term[i] * fingerprint[i] - sign * multiplicity[i] = 0
         for (i, interaction) in auxiliary_trace_build_data.interactions.iter().enumerate() {
-            let constraint = LookupTransitionConstraint::new(
-                interaction.clone(),
-                i,
-                transition_constraints.len(),
-            );
+            let constraint =
+                LookupTermConstraint::new(interaction.clone(), i, transition_constraints.len());
             transition_constraints.push(Box::new(constraint));
         }
-        // Add a transition constraint for the grand sum auxiliary constraint (sum of all previous aux columns) if we have more than one interaction
-        if auxiliary_trace_build_data.interactions.len() > 1 {
-            let grand_sum_constraint = LookupGrandSumTransitionConstraint::new(
-                transition_constraints.len(),
-                auxiliary_trace_build_data.interactions.len(),
-            );
-            transition_constraints.push(Box::new(grand_sum_constraint));
+
+        // Add the accumulated constraint (always, even for 1 interaction)
+        // This checks: acc[i+1] = acc[i] + sum of all terms at row i+1
+        if num_interactions > 0 {
+            let accumulated_constraint =
+                LookupAccumulatedConstraint::new(transition_constraints.len(), num_interactions);
+            transition_constraints.push(Box::new(accumulated_constraint));
         }
 
-        // Create Layout
-        let num_aux_columns = auxiliary_trace_build_data.interactions.len()
-            + (auxiliary_trace_build_data.interactions.len() > 1) as usize;
+        // Create Layout: N term columns + 1 accumulated column
+        let num_aux_columns = if num_interactions > 0 {
+            num_interactions + 1
+        } else {
+            0
+        };
         let trace_layout = (num_main_columns, num_aux_columns);
 
         // Create context
@@ -163,39 +173,40 @@ where
         &self,
         trace: &mut TraceTable<F, E>,
         challenges: &[FieldElement<E>],
-    ) -> Vec<BusPublicInputs<E>> {
-        let last_row = trace.num_rows() - 1;
-        let mut bus_interactions = Vec::new();
+    ) -> Option<BusPublicInputs<E>> {
+        // Allocate aux table if not already present
+        let (_, num_aux_columns) = self.trace_layout();
+        if num_aux_columns > 0 && trace.num_aux_columns == 0 {
+            trace.allocate_aux_table(num_aux_columns);
+        }
 
-        // Build aux column for each interaction
+        let num_interactions = self.auxiliary_trace_build_data.interactions.len();
+
+        if num_interactions == 0 {
+            return None;
+        }
+
+        // Build term columns (one per interaction)
+        // Each term column contains: sign * m[i] / fp[i]
         for (i, interaction) in self
             .auxiliary_trace_build_data
             .interactions
             .iter()
             .enumerate()
         {
-            build_auxiliary_trace_column(i, interaction, trace, challenges);
-            // Collect both initial (row 0) and final (last row) values
-            bus_interactions.push(BusPublicInputs {
-                initial_value: trace.get_aux(0, i).clone(),
-                final_accumulated: trace.get_aux(last_row, i).clone(),
-                is_sender: interaction.is_sender,
-            });
+            build_logup_term_column(i, interaction, trace, challenges);
         }
 
-        // If there are multiple interactions, build the grand sum column
-        if self.auxiliary_trace_build_data.interactions.len() > 1 {
-            let grand_sum_col_idx = self.auxiliary_trace_build_data.interactions.len();
-            for row in 0..trace.num_rows() {
-                let mut grand_sum = FieldElement::<E>::zero();
-                for i in 0..self.auxiliary_trace_build_data.interactions.len() {
-                    grand_sum = grand_sum + trace.get_aux(row, i);
-                }
-                trace.set_aux(row, grand_sum_col_idx, grand_sum);
-            }
-        }
+        // Build accumulated column (sums all term columns across rows)
+        let acc_col_idx = num_interactions;
+        build_accumulated_column(acc_col_idx, num_interactions, trace);
 
-        bus_interactions
+        // Return single BusPublicInputs for the accumulated column
+        let last_row = trace.num_rows() - 1;
+        Some(BusPublicInputs {
+            initial_value: trace.get_aux(0, acc_col_idx).clone(),
+            final_accumulated: trace.get_aux(last_row, acc_col_idx).clone(),
+        })
     }
 
     fn build_rap_challenges(
@@ -211,27 +222,29 @@ where
         &self,
         pub_inputs: &Self::PublicInputs,
         rap_challenges: &[FieldElement<E>],
-        bus_interactions: Option<&[BusPublicInputs<E>]>,
+        bus_public_inputs: Option<&BusPublicInputs<E>>,
         trace_length: usize,
     ) -> BoundaryConstraints<E> {
         let mut boundary_constraints = vec![];
 
-        // Boundary constraints for aux columns (from bus interactions in proof)
-        if let Some(interactions) = bus_interactions {
-            for (i, interaction) in interactions.iter().enumerate() {
-                // Constraint for row 0: aux column must start with initial_value
-                boundary_constraints.push(BoundaryConstraint::new_aux(
-                    i,
-                    0,
-                    interaction.initial_value.clone(),
-                ));
-                // Constraint for last row: aux column must end with final_accumulated
-                boundary_constraints.push(BoundaryConstraint::new_aux(
-                    i,
-                    trace_length - 1,
-                    interaction.final_accumulated.clone(),
-                ));
-            }
+        // Boundary constraints for the accumulated column only
+        // (term columns are fully determined by main trace and don't need boundary constraints)
+        if let Some(acc_interaction) = bus_public_inputs {
+            // The accumulated column is at index = num_interactions
+            let acc_col_idx = self.auxiliary_trace_build_data.interactions.len();
+
+            // Constraint for row 0: accumulated column must start with initial_value
+            boundary_constraints.push(BoundaryConstraint::new_aux(
+                acc_col_idx,
+                0,
+                acc_interaction.initial_value.clone(),
+            ));
+            // Constraint for last row: accumulated column must end with final_accumulated
+            boundary_constraints.push(BoundaryConstraint::new_aux(
+                acc_col_idx,
+                trace_length - 1,
+                acc_interaction.final_accumulated.clone(),
+            ));
         }
 
         // User-defined boundary constraints
@@ -263,23 +276,23 @@ pub struct TableInteraction {
     pub is_sender: bool,
 }
 
-/// Public inputs for a single bus interaction.
-/// Contains the initial and final aux column values needed for boundary constraints
+/// Public inputs for a table's accumulated LogUp column.
+/// Contains the initial and final values needed for boundary constraints
 /// and bus balance verification.
+///
+/// Each table has exactly one BusPublicInputs, representing its accumulated column.
+/// The sign (sender vs receiver) is already baked into the accumulated values,
+/// so the bus balance check is simply: Σ final_accumulated across all tables = 0
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(bound = "")]
 pub struct BusPublicInputs<E>
 where
     E: IsField,
 {
-    /// Aux column value at row 0 (initial fingerprint)
+    /// Accumulated column value at row 0
     pub initial_value: FieldElement<E>,
-    /// Aux column value at last row (accumulated sum)
+    /// Accumulated column value at last row (total sum of all terms)
     pub final_accumulated: FieldElement<E>,
-    /// Whether this interaction is a sender (true) or receiver (false).
-    /// Senders contribute positive values to the bus sum, receivers contribute negative.
-    /// For bus balance: Σ sender_values - Σ receiver_values = 0
-    pub is_sender: bool,
 }
 
 /// Trait representing boundary constraint building behaviour.
@@ -307,8 +320,17 @@ where
 {
 }
 
-/// Builds an auxiliary trace column from the given table interaction
-fn build_auxiliary_trace_column<F, E>(
+/// Builds a term column for a table interaction.
+///
+/// Each row contains the LogUp quotient: `term[i] = sign * multiplicity[i] / fingerprint[i]`
+///
+/// where:
+/// - `fingerprint[i] = z - (v0 + v1*α + v2*α² + ...)`
+/// - `sign = +1` for senders, `-1` for receivers
+/// - `multiplicity` = number of times this row contributes to the bus
+///
+/// This is NOT accumulated - just the individual contribution for each row.
+fn build_logup_term_column<F, E>(
     aux_column_idx: usize,
     table_interaction: &TableInteraction,
     trace: &mut TraceTable<F, E>,
@@ -343,74 +365,101 @@ fn build_auxiliary_trace_column<F, E>(
     // Coefficients for each value column
     let coeffs: Vec<FieldElement<E>> = (0..values.len()).map(|i| alpha.pow(i)).collect();
 
-    let mut aux_col: Vec<FieldElement<E>> = Vec::new();
+    // Sign: +1 for senders, -1 for receivers
+    // This bakes the sign into the term so the accumulated column can just sum everything
+    let sign = if table_interaction.is_sender {
+        FieldElement::<E>::one()
+    } else {
+        -FieldElement::<E>::one()
+    };
 
-    // fingerprint = z - (v[0] * alpha^0 + v[1] * alpha^1 +...+ value[n] * alpha^n)
-    // Where v are the values for each row and n the number of value columns
-    // We calculate the first fingerprint separately using the values from the first row
-    let fingerprint_inv: FieldElement<E> = (-(values
-        .iter()
-        .zip(coeffs.iter())
-        .map(|(v, coeff)| &v[0] * coeff)
-        .sum::<FieldElement<E>>())
-        + z)
-        .inv()
-        .unwrap();
-    // Fill first aux column row
-    aux_col.push(&multiplicity[0] * fingerprint_inv);
-
-    for i in 0..trace_len - 1 {
+    for row in 0..trace_len {
         // fingerprint = z - (v[0] * alpha^0 + v[1] * alpha^1 +...+ value[n] * alpha^n)
-        // Where v are the values for each row and n the number of value columns
-        let fingerprint_inv: FieldElement<E> = (-(values
+        // Fingerprint can only be zero if z equals the linear combination of values,
+        // which happens with negligible probability since z is randomly sampled over the extension field
+        let fingerprint: FieldElement<E> = -(values
             .iter()
             .zip(coeffs.iter())
-            .map(|(v, coeff)| &v[i + 1] * coeff)
+            .map(|(v, coeff)| &v[row] * coeff)
             .sum::<FieldElement<E>>())
-            + z)
-            .inv()
-            .unwrap();
-        // Fill the auxiliary column row
-        aux_col.push(&aux_col[i] + &multiplicity[i + 1] * fingerprint_inv);
-    }
+            + z;
 
-    for (i, aux_elem) in aux_col.iter().enumerate().take(trace.num_rows()) {
-        trace.set_aux(i, aux_column_idx, aux_elem.clone())
+        // term = sign * multiplicity / fingerprint
+        let term = &multiplicity[row]
+            * &sign
+            * fingerprint
+                .inv()
+                .expect("fingerprint is zero - probability of sampling zero is negligible");
+        trace.set_aux(row, aux_column_idx, term);
     }
 }
 
-// Constraint for each auxiliary column representing a table interaction
-// Checks the calculation of the next auxiliary column value based on the next row's multiplicity and values
-struct LookupTransitionConstraint {
-    // Indicates columns with multiplicity and values used to build the auxiliary column
+/// Builds the accumulated column that sums all term columns across rows.
+/// acc[0] = sum of all term columns at row 0
+/// acc[i] = acc[i-1] + sum of all term columns at row i
+fn build_accumulated_column<F, E>(
+    acc_column_idx: usize,
+    num_term_columns: usize,
+    trace: &mut TraceTable<F, E>,
+) where
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
+    E: IsField + Send + Sync,
+{
+    let trace_len = trace.num_rows();
+    let mut accumulated = FieldElement::<E>::zero();
+
+    for row in 0..trace_len {
+        // Sum all term columns for this row
+        let mut row_sum = FieldElement::<E>::zero();
+        for term_col in 0..num_term_columns {
+            row_sum = row_sum + trace.get_aux(row, term_col);
+        }
+
+        // Add to running accumulated value
+        accumulated += row_sum;
+        trace.set_aux(row, acc_column_idx, accumulated.clone());
+    }
+}
+
+/// Constraint for each term column.
+///
+/// Verifies: `term[i] = sign * multiplicity[i] / fingerprint[i]`
+///
+/// Rearranged to avoid division: `term[i] * fingerprint[i] - sign * multiplicity[i] = 0`
+///
+/// where:
+/// - `fingerprint[i] = z - (v0 + v1*α + v2*α² + ...)`
+/// - `sign = +1` for senders, `-1` for receivers
+struct LookupTermConstraint {
+    // Indicates columns with multiplicity and values used to compute the term
     interaction: TableInteraction,
-    // Index of the auxiliary column
-    interaction_number: usize,
+    // Index of the term column (aux column)
+    term_column_idx: usize,
     // Index of the constraint
     constraint_idx: usize,
 }
 
-impl LookupTransitionConstraint {
+impl LookupTermConstraint {
     pub fn new(
         interaction: TableInteraction,
-        interaction_number: usize,
+        term_column_idx: usize,
         constraint_idx: usize,
     ) -> Self {
         Self {
             interaction,
-            interaction_number,
+            term_column_idx,
             constraint_idx,
         }
     }
 }
 
-impl<F, E> TransitionConstraint<F, E> for LookupTransitionConstraint
+impl<F, E> TransitionConstraint<F, E> for LookupTermConstraint
 where
     F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
     E: IsField + Send + Sync,
 {
     fn degree(&self) -> usize {
-        2
+        2 // aux * fingerprint (fingerprint is linear in main trace values)
     }
 
     fn constraint_idx(&self) -> usize {
@@ -418,7 +467,7 @@ where
     }
 
     fn end_exemptions(&self) -> usize {
-        1
+        0 // Check all rows including the last
     }
 
     fn evaluate(
@@ -426,36 +475,33 @@ where
         evaluation_context: &TransitionEvaluationContext<F, E>,
         transition_evaluations: &mut [FieldElement<E>],
     ) {
-        fn evaluate_lookup_constraint<'a, A: IsSubFieldOf<B>, B: IsField>(
-            first_step: &TableView<'a, A, B>,
-            second_step: &TableView<'a, A, B>,
-            aux_column_idx: usize,
+        fn evaluate_term_constraint<'a, A: IsSubFieldOf<B>, B: IsField>(
+            step: &TableView<'a, A, B>,
+            term_column_idx: usize,
             interaction: &TableInteraction,
             rap_challenges: &&[FieldElement<B>],
         ) -> FieldElement<B> {
-            // Auxiliary frame elements
-            let s0 = first_step.get_aux_evaluation_element(0, aux_column_idx);
-            let s1 = second_step.get_aux_evaluation_element(0, aux_column_idx);
+            // Term column value
+            let term = step.get_aux_evaluation_element(0, term_column_idx);
 
             let z = &rap_challenges[LOGUP_CHALLENGE_Z];
             let alpha = &rap_challenges[LOGUP_CHALLENGE_ALPHA];
 
             // Main frame elements - handle optional multiplicity
-            let multiplicity = match interaction.multiplicity_column {
-                Some(col) => second_step.get_main_evaluation_element(0, col).clone(),
+            let multiplicity: FieldElement<A> = match interaction.multiplicity_column {
+                Some(col) => step.get_main_evaluation_element(0, col).clone(),
                 None => FieldElement::<A>::one(),
             };
             let values = interaction
                 .value_columns
                 .iter()
-                .map(|c| second_step.get_main_evaluation_element(0, *c))
+                .map(|c| step.get_main_evaluation_element(0, *c))
                 .collect::<Vec<_>>();
 
             // Coefficients for each value column
             let coeffs: Vec<FieldElement<B>> = (0..values.len()).map(|i| alpha.pow(i)).collect();
 
             // fingerprint = z - (v[0] * alpha^0 + v[1] * alpha^1 +...+ value[n] * alpha^n)
-            // Where v are the values for each row and n the number of value columns
             let fingerprint: FieldElement<B> = (-values
                 .iter()
                 .zip(coeffs.iter())
@@ -463,11 +509,16 @@ where
                 .sum::<FieldElement<B>>())
                 + z;
 
-            // We are using the following LogUp equation:
-            // s1 = s0 + multiplicity / fingerprint
-            // 0 = s0 * fingerprint + multiplicity - s1 * fingerprint
-            // Since constraints must be expressed without division, we rearrange:
-            multiplicity + s0 * &fingerprint - s1 * fingerprint
+            // Sign: +1 for senders, -1 for receivers
+            let sign = if interaction.is_sender {
+                FieldElement::<B>::one()
+            } else {
+                -FieldElement::<B>::one()
+            };
+
+            // Constraint: term * fingerprint = sign * multiplicity
+            // Rearranged: term * fingerprint - sign * multiplicity = 0
+            term * &fingerprint - multiplicity * sign
         }
 
         let res = match evaluation_context {
@@ -475,10 +526,9 @@ where
                 frame,
                 rap_challenges,
                 ..
-            } => evaluate_lookup_constraint(
+            } => evaluate_term_constraint(
                 frame.get_evaluation_step(0),
-                frame.get_evaluation_step(1),
-                self.interaction_number,
+                self.term_column_idx,
                 &self.interaction,
                 rap_challenges,
             ),
@@ -486,46 +536,53 @@ where
                 frame,
                 rap_challenges,
                 ..
-            } => evaluate_lookup_constraint(
+            } => evaluate_term_constraint(
                 frame.get_evaluation_step(0),
-                frame.get_evaluation_step(1),
-                self.interaction_number,
+                self.term_column_idx,
                 &self.interaction,
                 rap_challenges,
             ),
         };
-        // The eval always exists, except if the constraint idx were incorrectly defined.
+
         if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx) {
             *eval = res;
         }
     }
 }
 
-/// Constraint for the last auxiliary column
-/// Checks that the grand sum column is the sum of all previous auxiliary columns
-struct LookupGrandSumTransitionConstraint {
+/// Constraint for the accumulated column.
+///
+/// Verifies: `acc[i+1] = acc[i] + sum_k(term_k[i+1])`
+///
+/// Rearranged: `acc[i+1] - acc[i] - sum_k(term_k[i+1]) = 0`
+///
+/// where `term_k[i] = sign * multiplicity[i] / fingerprint[i]` for the k-th interaction.
+struct LookupAccumulatedConstraint {
     // Index of the constraint
     constraint_idx: usize,
-    // Amount of interactions -> we could infer this from the amount of aux columns
-    interaction_amount: usize,
+    // Number of term columns (one per interaction)
+    num_term_columns: usize,
+    // Index of the accumulated column (= num_term_columns)
+    acc_column_idx: usize,
 }
 
-impl LookupGrandSumTransitionConstraint {
-    pub fn new(constraint_idx: usize, interaction_amount: usize) -> Self {
+impl LookupAccumulatedConstraint {
+    pub fn new(constraint_idx: usize, num_term_columns: usize) -> Self {
         Self {
             constraint_idx,
-            interaction_amount,
+            num_term_columns,
+            acc_column_idx: num_term_columns,
         }
     }
 }
 
-impl<F, E> TransitionConstraint<F, E> for LookupGrandSumTransitionConstraint
+impl<F, E> TransitionConstraint<F, E> for LookupAccumulatedConstraint
 where
     F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
     E: IsField + Send + Sync,
 {
     fn degree(&self) -> usize {
-        2
+        1 // Just additions, no multiplications with main trace
     }
 
     fn constraint_idx(&self) -> usize {
@@ -533,7 +590,7 @@ where
     }
 
     fn end_exemptions(&self) -> usize {
-        1
+        1 // Last row doesn't have a "next row"
     }
 
     fn evaluate(
@@ -541,31 +598,41 @@ where
         evaluation_context: &TransitionEvaluationContext<F, E>,
         transition_evaluations: &mut [FieldElement<E>],
     ) {
-        fn evaluate_grand_sum_constraint<'a, A: IsSubFieldOf<B>, B: IsField>(
-            step: &TableView<'a, A, B>,
-            aux_column_idx: usize,
+        fn evaluate_accumulated_constraint<'a, A: IsSubFieldOf<B>, B: IsField>(
+            first_step: &TableView<'a, A, B>,
+            second_step: &TableView<'a, A, B>,
+            acc_column_idx: usize,
+            num_term_columns: usize,
         ) -> FieldElement<B> {
-            // Auxiliary frame elements
-            let grand_sum = step.get_aux_evaluation_element(0, aux_column_idx);
+            // Accumulated column values
+            let acc_curr = first_step.get_aux_evaluation_element(0, acc_column_idx);
+            let acc_next = second_step.get_aux_evaluation_element(0, acc_column_idx);
 
-            let interaction_values_sum: FieldElement<B> = (0..aux_column_idx)
-                .map(|i| step.get_aux_evaluation_element(0, i).clone())
+            // Sum of all term columns at the next step
+            let terms_sum: FieldElement<B> = (0..num_term_columns)
+                .map(|i| second_step.get_aux_evaluation_element(0, i).clone())
                 .sum();
 
-            // Check that the grand sum is equal to the sum of all other auxiliary columns in the same row
-            // Aka that we correctly built the grand sum auxiliary column
-            grand_sum - interaction_values_sum
+            // Constraint: acc[i+1] = acc[i] + sum of terms at row i+1
+            // Rearranged: acc[i+1] - acc[i] - terms_sum = 0
+            acc_next - acc_curr - terms_sum
         }
-        let res = match evaluation_context {
-            TransitionEvaluationContext::Prover { frame, .. } => {
-                evaluate_grand_sum_constraint(frame.get_evaluation_step(0), self.interaction_amount)
-            }
 
-            TransitionEvaluationContext::Verifier { frame, .. } => {
-                evaluate_grand_sum_constraint(frame.get_evaluation_step(0), self.interaction_amount)
-            }
+        let res = match evaluation_context {
+            TransitionEvaluationContext::Prover { frame, .. } => evaluate_accumulated_constraint(
+                frame.get_evaluation_step(0),
+                frame.get_evaluation_step(1),
+                self.acc_column_idx,
+                self.num_term_columns,
+            ),
+            TransitionEvaluationContext::Verifier { frame, .. } => evaluate_accumulated_constraint(
+                frame.get_evaluation_step(0),
+                frame.get_evaluation_step(1),
+                self.acc_column_idx,
+                self.num_term_columns,
+            ),
         };
-        // The eval always exists, except if the constraint idx were incorrectly defined.
+
         if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx) {
             *eval = res;
         }

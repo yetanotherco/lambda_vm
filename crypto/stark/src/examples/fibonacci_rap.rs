@@ -200,7 +200,7 @@ where
         &self,
         trace: &mut TraceTable<Self::Field, Self::FieldExtension>,
         challenges: &[FieldElement<F>],
-    ) -> Vec<crate::lookup::BusPublicInputs<Self::FieldExtension>> {
+    ) -> Option<crate::lookup::BusPublicInputs<Self::FieldExtension>> {
         let main_segment_cols = trace.columns_main();
         let not_perm = &main_segment_cols[0];
         let perm = &main_segment_cols[1];
@@ -226,7 +226,7 @@ where
             trace.set_aux(i, 0, aux_elem.clone())
         }
 
-        Vec::new()
+        None
     }
 
     fn build_rap_challenges(
@@ -244,7 +244,7 @@ where
         &self,
         _pub_inputs: &Self::PublicInputs,
         _rap_challenges: &[FieldElement<Self::FieldExtension>],
-        _bus_interactions: Option<&[crate::lookup::BusPublicInputs<Self::FieldExtension>]>,
+        _bus_public_inputs: Option<&crate::lookup::BusPublicInputs<Self::FieldExtension>>,
         _trace_length: usize,
     ) -> BoundaryConstraints<Self::FieldExtension> {
         // Main boundary constraints
