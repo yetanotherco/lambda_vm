@@ -28,6 +28,11 @@ subtypes = ["BaseField"]
 desc = "Variable that can only assume values in the range $[0, 2^16)$."
 
 [[variables.types]]
+label = "B20"
+subtypes = ["BaseField"]
+desc = "Variable that can only assume values in the range $[0, 2^20)$."
+
+[[variables.types]]
 label = "Word"
 subtypes = ["BaseField"]
 desc = "Variable that can only assume values in the range $[0, 2^32)$."
@@ -47,6 +52,16 @@ desc = """\
        Variable that can only assume values in the range $[0, 2^32)$. \\
        Represented as an array of four `Byte` variables.\
        """
+
+[[variables.types]]
+label = "B35"
+subtypes = ["BaseField"]
+desc = "Variable that can only assume values in the range $[0, 2^35)$."
+
+[[variables.types]]
+label = "B51"
+subtypes = ["BaseField"]
+desc = "Variable that can only assume values in the range $[0, 2^51)$."
 
 [[variables.types]]
 label = "DWordBL"
@@ -82,6 +97,22 @@ desc = """\
        """
 
 [[variables.types]]
+label = "QuadHL"
+subtypes = ["Half", "Half", "Half", "Half", "Half", "Half", "Half", "Half"]
+desc = """\
+       Variable that can only assume values in the range $[0, 2^128)$. \\
+       Represented as an array of eight `Half` variables.\
+       """
+
+[[variables.types]]
+label = "QuadWL"
+subtypes = ["Word", "Word", "Word", "Word"]
+desc = """\
+       Variable that can only assume values in the range $[0, 2^128)$. \\
+       Represented as an array of four `Word` variables.\
+       """
+
+[[variables.types]]
 label = "DWordWHH"
 subtypes = ["Half", "Half", "Word"]
 desc = """\
@@ -94,6 +125,7 @@ desc = """\
 label = "Timestamp"
 subtypes = ["DWordWL"]
 desc = "A preprocessed column holding timestamps as `DWordWL`. Row `i` of the column contains the value $2^2 dot (i + 1)$. Used in the CPU chip, see there for more details about the magic number."
+preprocessed = true
 
 [variables.categories]
 all = ["input", "output", "auxiliary", "virtual", "multiplicity", "condition"]

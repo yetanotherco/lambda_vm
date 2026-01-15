@@ -3,9 +3,10 @@
 #import "/chip.typ": (
   render_chip_assumptions,
   render_chip_column_table,
-  total_nr_variables,
-  total_nr_instantiated_columns,
+  render_chip_padding_table,
   render_constraint_table,
+  total_nr_instantiated_columns,
+  total_nr_variables,
 )
 
 #let config = load_config()
@@ -77,3 +78,9 @@ And then we constrain the subtraction.
 The chip contributes the following to the lookup argument.
 
 #render_constraint_table(chip, config, groups: "output")
+
+== Padding
+
+The table can be padded to the next power of two with the following value assignments:
+
+#render_chip_padding_table(chip, config)

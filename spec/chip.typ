@@ -49,6 +49,32 @@
   }).map(clean_iter)
 }
 
+#let render_chip_padding_table(chip, config) = {
+  // Whether `var` is a preprocessed variable.
+  let is_preprocessed(var) = {
+    config.variables.types
+    .filter(t => t.label == var.type)
+    .all(t => t.at("preprocessed", default: false))
+  }
+
+  let instantiated_vars = config.variables.categories.instantiated.map(c => chip.variables.at(c)).flatten()
+
+  show figure: set block(breakable: true)
+  figure(table(
+    columns: (auto, auto, auto),
+    inset: 6pt,
+    align: (right + top, center + top, left + top),
+    stroke: none,
+    table.header([*Column*], [], [*Padding value*]),
+    table.hline(stroke: stroke(thickness: 2pt)),
+    ..for var in instantiated_vars {
+      if not is_preprocessed(var) {
+        ([#raw(var.name)], [$:=$], [#expr_to_math(var.pad)],)
+      }
+    },
+  ), caption: [Overview of padding values for #chip.name chip.])
+}
+
 /// Generates a table listing `chip`'s columns.
 #let render_chip_column_table(chip, config) = {
 
@@ -80,12 +106,12 @@
     let idx = def.at("idx", default: none)
     let gather_indices(obj) = iters_of(obj, name: idx).map(it => it.first())
     let index_all(expr, indices) = {
-      if indices.len() == 0 {
-        expr
-      } else {
-        index_all(("idx", expr, indices.first()), indices.slice(1))
+      for index in indices {
+        expr = ("idx", expr, index)
       }
+      expr
     }
+
     if "poly" in def {
       // assert(false, message: repr(index_all(var_name, gather_indices(def))))
       (
@@ -96,9 +122,9 @@
       )
     } else if "polys" in def {
       assert(
-        def.polys.all(poly =>
-          gather_indices(poly) == gather_indices(def.polys.first())
-        ), message: "Can only do multiple polys if they're indexed identically")
+        def.polys.map(gather_indices).dedup().len() == 1,
+        message: "Can only do multiple polys if they're indexed identically"
+      )
       (
         [],
         table.cell(align: right, emph[definition]), 
