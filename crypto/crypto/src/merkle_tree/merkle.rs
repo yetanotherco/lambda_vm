@@ -108,12 +108,14 @@ where
     /// Given a list of indices, returns a batch proof containing the nodes needed to verify that all the leaves
     /// in those indices belong to the tree.
     /// It optimizes the number of nodes in the proof since the verifier can create some of them using
-    /// the leaves and the parent node known by hashing.
+    /// the leaves and the parent nodes known by hashing.
     ///
     /// # Proof Structure
-    /// The proof contains sibling nodes ordered by **descending tree index**:
-    /// - Nodes closer to leaves (higher indices) appear first
-    /// - Nodes closer to root (lower indices) appear last
+    /// The proof contains the nodes in **descending order by tree index**, that is, from bottom to
+    /// top and from right to left:
+    /// - Higher indices (closer to leaves) come first.
+    /// - Lower indices (closer to root) come last.
+    /// - Within the same level, nodes are ordered from right to left (higher index first).
     ///
     /// This ordering matches the verification consumption order, which processes
     /// level-by-level from leaves to root.
@@ -155,32 +157,27 @@ where
         })
     }
 
-    /// Returns the internal indices of nodes needed in the batch proof.
+    /// Returns the internal tree indices of nodes needed in the batch proof of the given
+    /// leaf positions.
     ///
-    /// The algorithm works level-by-level from leaves to root:
-    /// - For each node we can obtain, check if its sibling is also obtainable.
-    /// - If not, the sibling must be included in the proof.
-    /// - Parents of obtainable nodes become obtainable in the next level.
-    ///
-    /// # How BTreeSet affects ordering
-    /// We use `BTreeSet` to collect sibling indices. BTreeSet always maintains elements
-    /// in **ascending order** (smaller indices first), regardless of insertion order.
-    ///
-    /// At the end, we call `.into_iter().rev()` to reverse the order, producing indices
-    /// in **descending order** (larger indices first). This means:
-    /// - Nodes closer to leaves (higher indices) come first in the proof
-    /// - Nodes closer to root (lower indices) come last
+    /// # Result Order:
+    /// The resulting indices are in descending order, that is, from bottom to
+    /// top and from right to left:
+    /// - Higher indices (closer to leaves) come first.
+    /// - Lower indices (closer to root) come last.
+    /// - Within the same level, nodes are ordered from right to left (higher index first).
     ///
     /// This ordering is critical because the verifier consumes proof nodes level-by-level
     /// starting from leaves, so it needs leaf-level siblings first.
     fn get_batch_auth_path_positions(&self, leaf_positions: &[usize]) -> Vec<usize> {
-        // BTreeSet keeps indices sorted in ascending order (e.g., {4, 8, 12, 13, 15, 29})
+        // BTreeSet always maintains elements in ascending order (smaller indices first), regardless of insertion order.
         let mut auth_path_set = BTreeSet::<usize>::new();
         let mut obtainable: BTreeSet<usize> = leaf_positions.iter().cloned().collect();
 
         // Number of levels in tree
         let num_levels = (self.nodes.len() + 1).ilog2();
 
+        // Iter lefevel-by-level from leaves to root.
         for _ in 0..num_levels - 1 {
             let mut next_obtainable = BTreeSet::new();
 
@@ -203,8 +200,8 @@ where
             obtainable = next_obtainable;
         }
 
-        // Reverse to get descending order: [29, 15, 13, 12, 8, 4]
-        // This puts leaf-level siblings first, which the verifier needs first
+        // Reverse to get descending order (larger indices first).
+        // This makes the proof ordered from bottom (nodes closer to leaves) to top (nodes loser to root).
         auth_path_set.into_iter().rev().collect()
     }
 }

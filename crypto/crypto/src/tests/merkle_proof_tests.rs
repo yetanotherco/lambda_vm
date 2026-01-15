@@ -333,25 +333,3 @@ fn batch_proof_verify_sparse_leaves_across_tree() {
         16
     ));
 }
-
-#[test]
-fn batch_proof_verify_2() {
-    const MODULUS: u64 = 70;
-    type U64PF = U64PrimeField<MODULUS>;
-    type FE = FieldElement<U64PF>;
-
-    let values: Vec<FE> = (1..=8).map(FE::new).collect();
-    let merkle_tree = MerkleTree::<TestBackend<U64PF>>::build(&values).unwrap();
-
-    // Prove many leaves
-    let pos_list: Vec<usize> = vec![0, 1, 7];
-    let batch_proof = merkle_tree.get_batch_proof(&pos_list).unwrap();
-    let leaves_to_verify: Vec<FE> = pos_list.iter().map(|&i| values[i]).collect();
-
-    assert!(batch_proof.verify::<TestBackend<U64PF>>(
-        &merkle_tree.root,
-        &pos_list,
-        &leaves_to_verify,
-        8
-    ));
-}

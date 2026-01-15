@@ -74,7 +74,7 @@ where
 /// Stores all the nodes needed to prove the inclusion of multiple leaves.
 ///
 /// # Proof Ordering
-/// The `path` contains sibling nodes in **descending order by tree index**:
+/// The `path` contains the nodes in **descending order by tree index**:
 /// - Higher indices (closer to leaves) come first
 /// - Lower indices (closer to root) come last
 /// - Within the same level, nodes are ordered from right to left (higher index first)
@@ -92,7 +92,7 @@ impl<T: PartialEq + Eq + Clone> BatchProof<T> {
     ///
     /// # Arguments
     /// * `root_hash` - The expected Merkle root
-    /// * `pos_list` - Leaf positions (0-indexed from left)
+    /// * `pos_list` - Leaf positions (0-indexed from left to right)
     /// * `values` - The leaf values at those positions (not hashed)
     /// * `num_leaves` - Total number of leaves in the tree (must be a power of 2)
     pub fn verify<B>(
@@ -112,7 +112,12 @@ impl<T: PartialEq + Eq + Clone> BatchProof<T> {
         // Index of the first leaf as it is ordered in the tree struct (from top to bottom).
         let first_leaf_index = num_leaves - 1;
 
-        // Build map of position → hashed value, validating that duplicate positions have the same value.
+        // Build map of `position → hashed value`, validating that duplicate positions have the same value.
+        // Since the nodes in the tree are indexed from the root to the leaves, we need to redefine the
+        // given indices of the leaves.
+        // We also need to hash all the given leaf values.
+        // BTreeMap always maintains elements in ascending order, so here the leaves are ordered from
+        // left (smaller index) to right (larger index).
         let mut current_level_known_nodes: BTreeMap<usize, T> = BTreeMap::new();
         for (&pos, value) in pos_list.iter().zip(values.iter()) {
             let tree_index = pos + first_leaf_index;
@@ -132,13 +137,12 @@ impl<T: PartialEq + Eq + Clone> BatchProof<T> {
         let mut proof_path_iter = self.path.iter();
 
         let num_levels = (2 * num_leaves).ilog2();
-        // Process level by level, same as `get_batch_auth_path_positions`.
+        // Process level by level, from bottom to top, same as `get_batch_auth_path_positions`.
         for _ in 0..num_levels - 1 {
             let mut next_level_known_nodes: BTreeMap<usize, T> = BTreeMap::new();
 
-            // Process each known node in DESCENDING order to match proof generation order.
-            // The proof is generated with BTreeSet (ascending) then .rev() (descending),
-            // so we must consume in descending order to match.
+            // Process each known node from right to left to match the order of the proof.
+            // Since in `current_level_known_nodes` the nodes are ordered from left to right we take `.rev()`.
             for (pos, value) in current_level_known_nodes.iter().rev() {
                 let parent_pos = get_parent_pos(*pos);
 

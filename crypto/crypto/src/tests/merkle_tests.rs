@@ -98,7 +98,7 @@ fn batch_proof_is_expected() {
 }
 
 #[test]
-fn batch_proof_path_contains_expected_elements() {
+fn batch_proof_larger_path_contains_expected_elements() {
     const MODULUS: u64 = 70;
     type U64PF = U64PrimeField<MODULUS>;
     type FE = FieldElement<U64PF>;
@@ -107,9 +107,10 @@ fn batch_proof_path_contains_expected_elements() {
     let merkle_tree = MerkleTree::<TestBackend<U64PF>>::build(&values).unwrap();
     let batch_proof = merkle_tree.get_batch_proof(&[1, 8, 9, 15]).unwrap();
 
-    // The proof stores sibling nodes in descending order by tree index
+    // The proof stores nodes in descending order by tree index
     // - Higher indices (closer to leaves) come first
     // - Lower indices (closer to root) come last
+    // - In same level, nodes are ordered form right (larger indices) to left (smaller indices).
     let expected_batch_proof = BatchProof {
         path: vec![
             FE::new(30), // index 29 - leaf level sibling
