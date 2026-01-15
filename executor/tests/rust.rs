@@ -2,17 +2,26 @@ use executor::{
     elf::Elf,
     vm::execution::{ReturnValues, run_program},
 };
+use tracing::{debug, trace};
+use tracing_subscriber::EnvFilter;
+
+fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .try_init();
+}
 
 fn run_program_without_expect(
     elf_path: &str,
     private_inputs: Vec<u8>,
 ) -> Result<(ReturnValues, Vec<executor::vm::logs::Log>), executor::vm::execution::ExecutorError> {
-    println!("Testing {}", elf_path);
+    init_tracing();
+    debug!("Testing {}", elf_path);
     let elf_data = std::fs::read(elf_path).unwrap();
     let program = Elf::load(&elf_data).unwrap();
-    println!("Program entry: 0x{:08x}", program.entry_point);
+    debug!("Program entry: {:#010x}", program.entry_point);
     program.image.iter().for_each(|(addr, word)| {
-        println!("0x{:08x}: 0x{:08x}", addr, word);
+        trace!("{:#010x}: {:#010x}", addr, word);
     });
 
     run_program(program.image, program.entry_point, private_inputs)

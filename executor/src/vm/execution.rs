@@ -1,5 +1,7 @@
 use std::{collections::BTreeMap, fmt::Debug};
 
+use tracing::debug;
+
 use crate::vm::{
     instruction::{
         decoding::{Instruction, InstructionError},
@@ -49,10 +51,10 @@ fn run_from_entrypoint(
         let log = instruction.run(&mut pc, &mut registers, memory)?;
         logs.push(log);
     }
-    println!("Final Register Values:\n {}", &registers);
+    debug!("Final register values:\n{}", &registers);
     let memory_return_value = memory.read_return_value()?;
     let registers_return_values = registers.read_return_values();
-    println!("Registers Return Values: {registers_return_values:?}");
+    debug!("Register return values: {:?}", registers_return_values);
     Ok((
         ReturnValues {
             memory_values: memory_return_value,

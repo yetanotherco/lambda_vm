@@ -612,6 +612,8 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2173,6 +2175,7 @@ dependencies = [
  "once_cell",
  "regex-automata",
  "sharded-slab",
+ "smallvec",
  "thread_local",
  "tracing",
  "tracing-core",
