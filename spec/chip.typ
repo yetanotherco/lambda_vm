@@ -113,6 +113,7 @@
     }
 
     if "poly" in def {
+      // assert(false, message: repr(index_all(var_name, gather_indices(def))))
       (
         [],
         table.cell(align: right, emph[definition]), 
