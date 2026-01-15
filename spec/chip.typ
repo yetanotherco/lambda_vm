@@ -57,7 +57,7 @@
     .all(t => t.at("preprocessed", default: false))
   }
 
-  let instantiated_vars = config.variables.categories.instantiated.map(c => chip.variables.at(c)).flatten()
+  let instantiated_vars = config.variables.categories.instantiated.map(c => chip.variables.at(c, default: ())).flatten()
 
   show figure: set block(breakable: true)
   figure(table(
@@ -197,6 +197,7 @@
     cref(assumption)[#figure(kind: chip.name + "assumption", numbering: (i) => [#lbl#i], supplement: [], [])]
   }
 
+  show figure: set block(breakable: true)
   figure(table(
     columns: (auto, auto, 1fr),
     inset: 6pt,
