@@ -168,9 +168,9 @@ impl<T: PartialEq + Eq + Clone> BatchProof<T> {
 
                 // Compute parent hash.
                 let parent_hash = if pos % 2 == 1 {
-                    B::hash_new_parent(value, &sibling_hash)
+                    B::hash_new_parent(value, sibling_hash)
                 } else {
-                    B::hash_new_parent(&sibling_hash, value)
+                    B::hash_new_parent(sibling_hash, value)
                 };
 
                 next_level_known_nodes.insert(parent_pos, parent_hash);

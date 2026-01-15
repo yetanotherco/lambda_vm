@@ -128,7 +128,7 @@ where
             return Err(Error::EmptyPositionList);
         }
 
-        let num_leaves = (self.nodes.len() + 1) / 2;
+        let num_leaves = (self.nodes.len() + 1).div_ceil(2);
 
         // Validate all positions are within bounds
         for &pos in pos_list {
