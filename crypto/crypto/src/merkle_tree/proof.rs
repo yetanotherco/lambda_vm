@@ -157,11 +157,11 @@ impl<T: PartialEq + Eq + Clone> BatchProof<T> {
                 };
 
                 // Get sibling value: from known nodes or from proof path.
-                let sibling_hash = if current_level_known_nodes.contains_key(&sibling_pos) {
-                    current_level_known_nodes.get(&sibling_pos).unwrap().clone()
+                let sibling_hash = if let Some(hash) = current_level_known_nodes.get(&sibling_pos) {
+                    hash
                 } else {
                     match proof_path_iter.next() {
-                        Some(h) => h.clone(),
+                        Some(h) => h,
                         None => return false,
                     }
                 };
