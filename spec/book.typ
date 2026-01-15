@@ -9,6 +9,7 @@
     #chapter("is_bit.typ")[IS_BIT template]
     #chapter("add.typ")[ADD template]
     #chapter("decode.typ")[DECODE chip]
+    #chapter("decode_uncompressed.typ")[DECODE (uncompressed) chip]
     #chapter("cpu.typ")[CPU chip]
     #chapter("shift.typ")[SHIFT chip]
     #chapter("branch.typ")[BRANCH]

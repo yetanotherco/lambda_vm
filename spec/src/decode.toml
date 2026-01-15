@@ -4,84 +4,53 @@ name = "DECODE"
 name = "pc"
 type = "DWordWL"
 desc = "value of the program counter this instruction is associated with."
+pad = 0
 
 [[variables.output]]
-name = "rs1"
-type = "Byte"
-desc = "index of source register 1."
-
-[[variables.output]]
-name = "rs2"
-type = "Byte"
-desc = "index of source register 2."
-
-[[variables.output]]
-name = "rd"
-type = "Byte"
-desc = "index of destination register."
-
-[[variables.output]]
-name = "write_register"
-type = "Bit"
-desc = "whether the result should be written to `rd` ($=0$ for memory write and when $#`rd` = #`x0`$."
-
-[[variables.output]]
-name = "memory_2bytes"
-type = "Bit"
-desc = "whether the memory access (read or write) touches at least $2$ bytes."
-
-[[variables.output]]
-name = "memory_4bytes"
-type = "Bit"
-desc = "whether the memory access (read or write) touches at least $4$ bytes."
-
-[[variables.output]]
-name = "memory_8bytes"
-type = "Bit"
-desc = "whether the memory access (read or write) touches at least $8$ bytes."
-
-[[variables.output]]
-name = "c_type"
-type = "Bit"
-desc = "Whether the instruction is of type `C`, i.e., whether it is $2$ bytes long instead of $4$."
+name = "packed_decode"
+type = "B49"
+desc = """Ordered concatenation of several small variables.
+The `decode (uncompressed)` section explains the purpose of each variable.\\
+A list of each variable and the bit(-range) in which it is located:\\
+[0:7] `rs1`, \\
+[8:15] `rs2`, \\
+[16:23] `rd`, \\
+[24] `write_register`, \\
+[25] `memory_2bytes`, \\
+[26] `memory_4bytes`, \\
+[27] `memory_8bytes`, \\
+[28] `c_type`, \\
+[29] `signed`, \\
+[30] `mp_selector`, \\
+[31] `muldiv_selector`, \\
+[32] `word_instr`, \\
+[33] `ADD`, \\
+[34] `SUB`, \\
+[35] `SLT`, \\
+[36] `AND`, \\
+[37] `OR`, \\
+[38] `XOR`, \\
+[39] `SHIFT`, \\
+[40] `JALR`, \\
+[41] `BEQ`, \\
+[42] `BLT`, \\
+[43] `LOAD`, \\
+[44] `STORE`, \\
+[45] `MUL`, \\
+[46] `DIVREM`, \\
+[47] `ECALL`, \\
+[48] `EBREAK`. \\
+"""
+pad = 0
 
 [[variables.output]]
 name = "imm"
 type = "DWordWL"
 desc = "the *fully extended (!)* 64-bit version of the immediate."
-
-[[variables.output]]
-name = "signed"
-type = "Bit"
-desc = "selector used to indicate signed or unsigned input interpretation. Currently, this is used to choose between <TODO>."
-
-[[variables.output]]
-name = "mp_selector"
-type = "Bit"
-desc = """Multi-purpose selector used by different ALU operations for different purposes. Currently, it is used
-    - by the `MUL` chip to select between `MUL`/`MULH` and `MULH[S]U`, and
-    - as flag for inverting the condition of conditional branches (see `branch_cond`)
-    - as direction (left or right) for `SHIFT`"""
-
-[[variables.output]]
-name = "muldiv_selector"
-type = "Bit"
-desc = "selects which output of `MUL` (lo/hi) or `DVRM` (quo/rem) is wanted."
-
-[[variables.output]]
-name = "word_instr"
-type = "Bit"
-desc = "Whether the instruction is a `*W` instruction, requiring the inputs and outputs to be (sign) extended."
-
-[[variables.output]]
-name = "one_hot"
-type = ["Bit", 16]
-desc = "A 16-column vector comprised of the flags `(ADD, SUB, SLT, AND, OR, XOR, SHIFT, JALR, BEQ, BLT, LOAD, STORE, MUL, DIVREM, ECALL, EBREAK)`. The vector is 'one-hot', meaning that in every row exactly one element is $1$; the others are $0$."
+pad = 0
 
 [[variables.multiplicity]]
 name = "μ"
 type = "BaseField"
 desc = "The multiplicity with which this instruction is looked up in the `CPU` table."
-
-
-
+pad = 0
