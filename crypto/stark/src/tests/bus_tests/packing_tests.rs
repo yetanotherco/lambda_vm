@@ -63,6 +63,29 @@ fn test_dword_hl() {
 }
 
 #[test]
+fn test_quad_hl() {
+    // 8 halves: [0x1111, 0x2222, 0x3333, 0x4444, 0x5555, 0x6666, 0x7777, 0x8888]
+    // Expected: 4 words via 4× Word2L
+    // [0x22221111, 0x44443333, 0x66665555, 0x88887777]
+    let halves = vec![
+        FE::from(0x1111u64),
+        FE::from(0x2222u64),
+        FE::from(0x3333u64),
+        FE::from(0x4444u64),
+        FE::from(0x5555u64),
+        FE::from(0x6666u64),
+        FE::from(0x7777u64),
+        FE::from(0x8888u64),
+    ];
+    let combined = Packing::QuadHL.combine(&halves);
+    assert_eq!(combined.len(), 4);
+    assert_eq!(combined[0], FE::from(0x22221111u64));
+    assert_eq!(combined[1], FE::from(0x44443333u64));
+    assert_eq!(combined[2], FE::from(0x66665555u64));
+    assert_eq!(combined[3], FE::from(0x88887777u64));
+}
+
+#[test]
 fn test_dword_hhw() {
     // [Word, Half, Half] where Word is LSB
     // columns: [0xAABBCCDD, 0x1234, 0x5678]

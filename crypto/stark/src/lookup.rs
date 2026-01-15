@@ -64,82 +64,95 @@ pub const LOGUP_NUM_CHALLENGES: usize = 2;
 /// 1. **Casting** (powers of 2): Combine limbs within a type (e.g., 4 bytes → 1 word)
 /// 2. **Bus fingerprint** (powers of α): Combine all typed values into one fingerprint
 ///
-/// Each variant specifies:
-/// - How many columns it consumes
-/// - How many bus elements it produces
-/// - The shift factors (powers of 2) used for combining
+/// ## Primitive vs Compound Packings
 ///
-/// This enum covers all **unique combining patterns**. Composite spec types
-/// like `QuadWL` (4 words) or `QuadHL` (8 halves) don't need their own variants -
-/// they're just multiple applications of existing packings:
-/// - `QuadWL` = 4 × `Direct`
-/// - `QuadHL` = 4 × `Word2L`
+/// **Primitive** packings define unique combining formulas:
+/// - `Direct`, `Word2L`, `Word4L`
 ///
-/// The bus only cares about the combining math, not semantic type names.
+/// **Compound** packings are built from primitives (for convenience):
+/// - `DWordHL` = 2× Word2L
+/// - `DWordBL` = 2× Word4L
+/// - `DWordHHW` = Direct + Word2L
+/// - `DWordWHH` = Word2L + Direct
+/// - `QuadHL` = 4× Word2L
+///
+/// Compound packings delegate to primitives internally.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Packing {
-    /// Direct: single field element, no combining.
+    // =========================================================================
+    // Primitive packings - define unique combining formulas
+    // =========================================================================
+    /// Single field element, no combining.
     /// Columns: 1, Bus elements: 1
     /// Used for: Bit, Byte, Half, Word, B4, B20, etc.
     Direct,
 
     /// Two 16-bit halves → one 32-bit word.
     /// Columns: 2, Bus elements: 1
-    /// Combination: h₀ + 2¹⁶·h₁
+    /// Formula: h₀ + 2¹⁶·h₁
     Word2L,
 
     /// Four 8-bit bytes → one 32-bit word.
     /// Columns: 4, Bus elements: 1
-    /// Combination: b₀ + 2⁸·b₁ + 2¹⁶·b₂ + 2²⁴·b₃
+    /// Formula: b₀ + 2⁸·b₁ + 2¹⁶·b₂ + 2²⁴·b₃
     Word4L,
 
-    /// Four 16-bit halves → two bus elements (pairs combined).
+    // =========================================================================
+    // Compound packings - built from primitives above
+    // =========================================================================
+    /// 4 halves → 2 words. **Compound: 2× Word2L.**
     /// Columns: 4, Bus elements: 2
-    /// Combination: [h₀ + 2¹⁶·h₁, h₂ + 2¹⁶·h₃]
     DWordHL,
 
-    /// Eight 8-bit bytes → two bus elements (quads combined).
+    /// 8 bytes → 2 words. **Compound: 2× Word4L.**
     /// Columns: 8, Bus elements: 2
-    /// Combination: [b₀ + 2⁸·b₁ + 2¹⁶·b₂ + 2²⁴·b₃, b₄ + 2⁸·b₅ + 2¹⁶·b₆ + 2²⁴·b₇]
     DWordBL,
 
-    /// Word + Half + Half → two bus elements.
+    /// [Word, Half, Half] → 2 elements. **Compound: Direct + Word2L.**
     /// Columns: 3, Bus elements: 2
-    /// Layout: [Word (LSB), Half, Half (MSB)]
-    /// Combination: [w₀, h₀ + 2¹⁶·h₁]
+    /// Layout: Word is LSB.
     DWordHHW,
 
-    /// Half + Half + Word → two bus elements.
+    /// [Half, Half, Word] → 2 elements. **Compound: Word2L + Direct.**
     /// Columns: 3, Bus elements: 2
-    /// Layout: [Half (LSB), Half, Word (MSB)]
-    /// Combination: [h₀ + 2¹⁶·h₁, w₀]
+    /// Layout: Word is MSB.
     DWordWHH,
+
+    /// 8 halves → 4 words. **Compound: 4× Word2L.**
+    /// Columns: 8, Bus elements: 4
+    QuadHL,
 }
 
 impl Packing {
     /// Returns the number of trace columns this type consumes.
     pub fn num_columns(&self) -> usize {
         match self {
+            // Primitives
             Packing::Direct => 1,
             Packing::Word2L => 2,
             Packing::Word4L => 4,
-            Packing::DWordHL => 4,
-            Packing::DWordBL => 8,
-            Packing::DWordHHW => 3,
-            Packing::DWordWHH => 3,
+            // Compounds
+            Packing::DWordHL => 4,  // 2× Word2L
+            Packing::DWordBL => 8,  // 2× Word4L
+            Packing::DWordHHW => 3, // Direct + Word2L
+            Packing::DWordWHH => 3, // Word2L + Direct
+            Packing::QuadHL => 8,   // 4× Word2L
         }
     }
 
     /// Returns the number of bus elements this type produces after combining.
     pub fn num_bus_elements(&self) -> usize {
         match self {
+            // Primitives
             Packing::Direct => 1,
             Packing::Word2L => 1,
             Packing::Word4L => 1,
-            Packing::DWordHL => 2,
-            Packing::DWordBL => 2,
-            Packing::DWordHHW => 2,
-            Packing::DWordWHH => 2,
+            // Compounds
+            Packing::DWordHL => 2,  // 2× Word2L
+            Packing::DWordBL => 2,  // 2× Word4L
+            Packing::DWordHHW => 2, // Direct + Word2L
+            Packing::DWordWHH => 2, // Word2L + Direct
+            Packing::QuadHL => 4,   // 4× Word2L
         }
     }
 
@@ -162,6 +175,9 @@ impl Packing {
 
     /// Combines column values into bus elements using powers of 2.
     ///
+    /// Primitive packings define the combining formulas.
+    /// Compound packings delegate to primitives.
+    ///
     /// # Arguments
     /// * `columns` - Slice of field elements from the trace columns
     ///
@@ -181,6 +197,9 @@ impl Packing {
         );
 
         match self {
+            // =================================================================
+            // Primitives - define the actual combining formulas
+            // =================================================================
             Packing::Direct => {
                 vec![columns[0].clone()]
             }
@@ -204,44 +223,44 @@ impl Packing {
                 ]
             }
 
+            // =================================================================
+            // Compounds - delegate to primitives
+            // =================================================================
             Packing::DWordHL => {
-                // [h₀ + 2¹⁶·h₁, h₂ + 2¹⁶·h₃]
-                let shift_16 = FieldElement::<E>::from(SHIFT_16);
-                vec![
-                    &columns[0] + &columns[1] * &shift_16,
-                    &columns[2] + &columns[3] * &shift_16,
-                ]
+                // 2× Word2L
+                let mut result = Packing::Word2L.combine(&columns[0..2]);
+                result.extend(Packing::Word2L.combine(&columns[2..4]));
+                result
             }
 
             Packing::DWordBL => {
-                // [b₀ + 2⁸·b₁ + 2¹⁶·b₂ + 2²⁴·b₃, b₄ + 2⁸·b₅ + 2¹⁶·b₆ + 2²⁴·b₇]
-                let shift_8 = FieldElement::<E>::from(SHIFT_8);
-                let shift_16 = FieldElement::<E>::from(SHIFT_16);
-                let shift_24 = &shift_8 * &shift_16;
-                vec![
-                    &columns[0]
-                        + &columns[1] * &shift_8
-                        + &columns[2] * &shift_16
-                        + &columns[3] * &shift_24,
-                    &columns[4]
-                        + &columns[5] * &shift_8
-                        + &columns[6] * &shift_16
-                        + &columns[7] * &shift_24,
-                ]
+                // 2× Word4L
+                let mut result = Packing::Word4L.combine(&columns[0..4]);
+                result.extend(Packing::Word4L.combine(&columns[4..8]));
+                result
             }
 
             Packing::DWordHHW => {
-                // [Word (LSB), Half, Half (MSB)]
-                // → [w₀, h₀ + 2¹⁶·h₁]
-                let shift_16 = FieldElement::<E>::from(SHIFT_16);
-                vec![columns[0].clone(), &columns[1] + &columns[2] * &shift_16]
+                // Direct + Word2L
+                let mut result = Packing::Direct.combine(&columns[0..1]);
+                result.extend(Packing::Word2L.combine(&columns[1..3]));
+                result
             }
 
             Packing::DWordWHH => {
-                // [Half (LSB), Half, Word (MSB)]
-                // → [h₀ + 2¹⁶·h₁, w₀]
-                let shift_16 = FieldElement::<E>::from(SHIFT_16);
-                vec![&columns[0] + &columns[1] * &shift_16, columns[2].clone()]
+                // Word2L + Direct
+                let mut result = Packing::Word2L.combine(&columns[0..2]);
+                result.extend(Packing::Direct.combine(&columns[2..3]));
+                result
+            }
+
+            Packing::QuadHL => {
+                // 4× Word2L
+                let mut result = Packing::Word2L.combine(&columns[0..2]);
+                result.extend(Packing::Word2L.combine(&columns[2..4]));
+                result.extend(Packing::Word2L.combine(&columns[4..6]));
+                result.extend(Packing::Word2L.combine(&columns[6..8]));
+                result
             }
         }
     }
