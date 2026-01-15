@@ -63,17 +63,6 @@ fn test_dword_hl() {
 }
 
 #[test]
-fn test_dword_wl() {
-    // 2 words: [0x12345678, 0xDEADBEEF]
-    // Expected: [0x12345678, 0xDEADBEEF] (no combining, just 2 bus elements)
-    let words = vec![FE::from(0x12345678u64), FE::from(0xDEADBEEFu64)];
-    let combined = Packing::DWordWL.combine(&words);
-    assert_eq!(combined.len(), 2);
-    assert_eq!(combined[0], FE::from(0x12345678u64));
-    assert_eq!(combined[1], FE::from(0xDEADBEEFu64));
-}
-
-#[test]
 fn test_dword_hhw() {
     // [Word, Half, Half] where Word is LSB
     // columns: [0xAABBCCDD, 0x1234, 0x5678]

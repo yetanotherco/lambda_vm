@@ -765,6 +765,295 @@ fn test_full_scenario_wrong_add() {
     ));
 }
 
+// =============================================================================
+// Packing mismatch (wrong formula)
+// =============================================================================
+// These tests verify that using different Packing interpretations on sender vs
+// receiver causes verification to fail, even when raw column values match.
+//
+// The fingerprint formula depends on Packing:
+// - Direct: z - (v0 + v1*α + v2*α² + ...)
+// - Word2L: z - (v0 + 2^16*v1)     (combines columns, then uses α)
+//
+// If sender uses Direct and receiver uses Word2L, fingerprints differ!
+
+/// Packing mismatch: sender uses Direct (3 separate elements), receiver uses
+/// Word2L which combines first two columns differently.
+///
+/// Sender interprets columns [0,1,2] as: v0 + v1*α + v2*α²
+/// Receiver with Word2L interprets [0,1] as: (v0 + 2^16*v1) then + v2*α
+///
+/// Even with matching values, the fingerprint formulas differ!
+#[test_log::test]
+fn test_packing_mismatch_direct_vs_word2l() {
+    use crate::lookup::{
+        AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, NullBoundaryConstraintBuilder,
+        Packing,
+    };
+
+    fn sender_air_direct(
+        proof_options: &ProofOptions,
+    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+        let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+            interactions: vec![
+                // Sender uses Direct: 2 separate elements
+                BusInteraction::sender(Some(0), Packing::Direct.columns(&[1, 2])),
+            ],
+        };
+        AirWithBuses::new(3, auxiliary_trace_build_data, proof_options, 1, vec![])
+    }
+
+    fn receiver_air_word2l(
+        proof_options: &ProofOptions,
+    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+        let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+            interactions: vec![
+                // Receiver uses Word2L: combines 2 columns into 1 element
+                // Formula: (v0 + 2^16 * v1) - different from v0 + α*v1
+                BusInteraction::receiver(Some(0), Packing::Word2L.columns(&[1])),
+            ],
+        };
+        AirWithBuses::new(
+            3, // multiplicity, col1, col2
+            auxiliary_trace_build_data,
+            proof_options,
+            1,
+            vec![],
+        )
+    }
+
+    // Trace with identical raw values
+    let mut sender_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()], // multiplicity
+            vec![FE::from(100), FE::zero(), FE::zero(), FE::zero()], // value 1
+            vec![FE::from(200), FE::zero(), FE::zero(), FE::zero()], // value 2
+        ],
+        1,
+    );
+
+    let mut receiver_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()], // multiplicity
+            vec![FE::from(100), FE::zero(), FE::zero(), FE::zero()], // SAME value 1
+            vec![FE::from(200), FE::zero(), FE::zero(), FE::zero()], // SAME value 2
+        ],
+        1,
+    );
+
+    let proof_options = ProofOptions::default_test_options();
+    let sender = sender_air_direct(&proof_options);
+    let receiver = receiver_air_word2l(&proof_options);
+
+    let air_trace_pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&sender, &mut sender_trace, &()),
+        (&receiver, &mut receiver_trace, &()),
+    ];
+
+    let multi_proof =
+        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        vec![&sender, &receiver];
+
+    // Verification MUST fail because fingerprint formulas differ!
+    // Sender: z - (100 + 200*α)
+    // Receiver: z - (100 + 200*2^16) = z - (100 + 13107200)
+    assert!(
+        !Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
+        "Packing mismatch should cause verification failure"
+    );
+}
+
+/// Different element count due to combining: sender uses 3 Direct elements,
+/// receiver uses Word2L (combines 2→1) + Direct, producing only 2 bus elements.
+///
+/// Sender: [v0, v1, v2] → z - (v0 + α*v1 + α²*v2)
+/// Receiver: [v0 + 2^16*v1, v2] → z - ((v0 + 2^16*v1) + α*v2)
+///
+/// Different number of α powers = different fingerprint!
+#[test_log::test]
+fn test_packing_mismatch_element_count() {
+    use crate::lookup::{
+        AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, NullBoundaryConstraintBuilder,
+        Packing,
+    };
+
+    fn sender_air_3_direct(
+        proof_options: &ProofOptions,
+    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+        let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+            interactions: vec![
+                // Sender uses 3 Direct elements: produces [col1, col2, col3]
+                // Fingerprint: z - (col1 + α*col2 + α²*col3)
+                BusInteraction::sender(Some(0), Packing::Direct.columns(&[1, 2, 3])),
+            ],
+        };
+        AirWithBuses::new(4, auxiliary_trace_build_data, proof_options, 1, vec![])
+    }
+
+    fn receiver_air_word2l_direct(
+        proof_options: &ProofOptions,
+    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+        let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+            interactions: vec![
+                // Receiver uses Word2L (combines cols 1,2 into 1 element) + Direct (col 3)
+                // Produces 2 bus elements: [(col1 + 2^16*col2), col3]
+                // Fingerprint: z - ((col1 + 2^16*col2) + α*col3)
+                BusInteraction::receiver(
+                    Some(0),
+                    vec![
+                        Packing::Word2L.columns(&[1])[0].clone(),
+                        Packing::Direct.columns(&[3])[0].clone(),
+                    ],
+                ),
+            ],
+        };
+        AirWithBuses::new(4, auxiliary_trace_build_data, proof_options, 1, vec![])
+    }
+
+    let mut sender_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(10), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(20), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(30), FE::zero(), FE::zero(), FE::zero()],
+        ],
+        1,
+    );
+
+    let mut receiver_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(10), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(20), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(30), FE::zero(), FE::zero(), FE::zero()],
+        ],
+        1,
+    );
+
+    let proof_options = ProofOptions::default_test_options();
+    let sender = sender_air_3_direct(&proof_options);
+    let receiver = receiver_air_word2l_direct(&proof_options);
+
+    let air_trace_pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&sender, &mut sender_trace, &()),
+        (&receiver, &mut receiver_trace, &()),
+    ];
+
+    let multi_proof =
+        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        vec![&sender, &receiver];
+
+    // Sender: z - (10 + 20*α + 30*α²)  [3 bus elements]
+    // Receiver: z - ((10 + 20*65536) + 30*α) = z - (1310730 + 30*α)  [2 bus elements]
+    // Different fingerprints!
+    assert!(
+        !Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
+        "Element count mismatch (3 vs 2 bus elements) should cause verification failure"
+    );
+}
+
+/// Wrong shift constant: Word2L uses 2^16, if receiver used a different shift
+/// the fingerprints would differ. We simulate this by having sender use
+/// Word4L (which uses 2^8 shifts) while receiver expects values that were
+/// combined with 2^16 shifts.
+#[test_log::test]
+fn test_packing_mismatch_shift_constant() {
+    use crate::lookup::{
+        AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, NullBoundaryConstraintBuilder,
+        Packing,
+    };
+
+    fn sender_air_word4l(
+        proof_options: &ProofOptions,
+    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+        let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+            interactions: vec![
+                // Word4L: b0 + 2^8*b1 + 2^16*b2 + 2^24*b3
+                BusInteraction::sender(Some(0), Packing::Word4L.columns(&[1])),
+            ],
+        };
+        AirWithBuses::new(5, auxiliary_trace_build_data, proof_options, 1, vec![])
+    }
+
+    fn receiver_air_dwordhl(
+        proof_options: &ProofOptions,
+    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+        let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+            interactions: vec![
+                // DWordHL: [h0 + 2^16*h1, h2 + 2^16*h3] - different shift pattern!
+                BusInteraction::receiver(Some(0), Packing::DWordHL.columns(&[1])),
+            ],
+        };
+        AirWithBuses::new(5, auxiliary_trace_build_data, proof_options, 1, vec![])
+    }
+
+    // Use small values so the different shift formulas give clearly different results
+    let mut sender_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(1), FE::zero(), FE::zero(), FE::zero()], // b0
+            vec![FE::from(2), FE::zero(), FE::zero(), FE::zero()], // b1
+            vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()], // b2
+            vec![FE::from(4), FE::zero(), FE::zero(), FE::zero()], // b3
+        ],
+        1,
+    );
+
+    // Word4L: 1 + 2*256 + 3*65536 + 4*16777216 = 1 + 512 + 196608 + 67108864 = 67305985
+    // DWordHL: [1 + 2*65536, 3 + 4*65536] = [131073, 262147] → different!
+
+    let mut receiver_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(1), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(2), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(4), FE::zero(), FE::zero(), FE::zero()],
+        ],
+        1,
+    );
+
+    let proof_options = ProofOptions::default_test_options();
+    let sender = sender_air_word4l(&proof_options);
+    let receiver = receiver_air_dwordhl(&proof_options);
+
+    let air_trace_pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&sender, &mut sender_trace, &()),
+        (&receiver, &mut receiver_trace, &()),
+    ];
+
+    let multi_proof =
+        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        vec![&sender, &receiver];
+
+    assert!(
+        !Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
+        "Different shift constants (Word4L vs DWordHL) should cause verification failure"
+    );
+}
+
+// =============================================================================
+// Complex scenarios
+// =============================================================================
+
 /// Full scenario with wrong MUL result.
 #[test_log::test]
 fn test_full_scenario_wrong_mul() {

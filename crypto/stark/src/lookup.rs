@@ -93,12 +93,6 @@ pub enum Packing {
     /// Combination: b₀ + 2⁸·b₁ + 2¹⁶·b₂ + 2²⁴·b₃
     Word4L,
 
-    /// Two 32-bit words → two bus elements (no combining within, just grouping).
-    /// Columns: 2, Bus elements: 2
-    /// Each word stays as-is: [w₀, w₁]
-    /// Note: For bus, these become w₀ + α·w₁
-    DWordWL,
-
     /// Four 16-bit halves → two bus elements (pairs combined).
     /// Columns: 4, Bus elements: 2
     /// Combination: [h₀ + 2¹⁶·h₁, h₂ + 2¹⁶·h₃]
@@ -129,7 +123,6 @@ impl Packing {
             Packing::Direct => 1,
             Packing::Word2L => 2,
             Packing::Word4L => 4,
-            Packing::DWordWL => 2,
             Packing::DWordHL => 4,
             Packing::DWordBL => 8,
             Packing::DWordHHW => 3,
@@ -143,7 +136,6 @@ impl Packing {
             Packing::Direct => 1,
             Packing::Word2L => 1,
             Packing::Word4L => 1,
-            Packing::DWordWL => 2,
             Packing::DWordHL => 2,
             Packing::DWordBL => 2,
             Packing::DWordHHW => 2,
@@ -158,7 +150,7 @@ impl Packing {
     /// # Example
     /// ```ignore
     /// Packing::Direct.columns(&[0, 1, 2])  // 3 direct values at columns 0, 1, 2
-    /// Packing::DWordWL.columns(&[0, 2])    // 2 DWordWL values: cols 0-1 and cols 2-3
+    /// Packing::DWordHL.columns(&[0, 4])    // 2 DWordHL values: cols 0-3 and cols 4-7
     /// Packing::DWordHHW.columns(&[0])      // 1 DWordHHW value at cols 0, 1, 2
     /// ```
     pub fn columns(self, start_columns: &[usize]) -> Vec<TypedValue> {
@@ -210,12 +202,6 @@ impl Packing {
                         + &columns[2] * &shift_16
                         + &columns[3] * &shift_24,
                 ]
-            }
-
-            Packing::DWordWL => {
-                // Two words, no combining - each stays as bus element
-                // [w₀, w₁]
-                vec![columns[0].clone(), columns[1].clone()]
             }
 
             Packing::DWordHL => {
@@ -279,10 +265,10 @@ pub struct TypedValue {
 impl TypedValue {
     /// Creates a new typed value.
     ///
-    /// Prefer using `Packing::at()` instead:
+    /// Prefer using `Packing::columns()` instead:
     /// ```ignore
-    /// Packing::Direct.columns(0)
-    /// Packing::DWordWL.columns(1)
+    /// Packing::Direct.columns(&[0])
+    /// Packing::Word2L.columns(&[1])
     /// ```
     pub fn new(start_column: usize, bus_type: Packing) -> Self {
         Self {
