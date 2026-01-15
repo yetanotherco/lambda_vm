@@ -77,10 +77,6 @@ jobs:
         run: |
           cd executor && cargo test --test rust
 
-      - name: Run prover tests
+      - name: Run prover and crypto tests
         run: |
-          cd prover && cargo test
-
-      - name: Run crypto tests
-        run: |
-          cargo test -p stark -p crypto
+          cargo test -p prover -p stark -p crypto
