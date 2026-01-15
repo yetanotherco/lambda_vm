@@ -70,7 +70,7 @@ where
                     let mut evals = domain
                         .lde_roots_of_unity_coset
                         .iter()
-                        .map(|v| v.clone() - point)
+                        .map(|v| v - point)
                         .collect::<Vec<FieldElement<Field>>>();
                     FieldElement::inplace_batch_inverse(&mut evals).unwrap();
                     evals
