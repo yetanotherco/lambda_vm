@@ -2,6 +2,7 @@ use alloc::vec::Vec;
 use math::field::{element::FieldElement, fields::u64_prime_field::U64PrimeField};
 
 use crate::merkle_tree::merkle::MerkleTree;
+use crate::merkle_tree::proof::BatchProof;
 use crate::tests::merkle_tests::TestBackend;
 
 /// Small field useful for starks, sometimes called min i goldilocks
@@ -74,7 +75,7 @@ fn batch_proof_verify_adjacent_leaves() {
 
     // Prove adjacent leaves (0 and 1 are siblings)
     let pos_list = vec![0, 1];
-    let batch_proof = merkle_tree.get_batch_proof(&pos_list);
+    let batch_proof = merkle_tree.get_batch_proof(&pos_list).unwrap();
     let leaves_to_verify: Vec<FE> = pos_list.iter().map(|&i| values[i]).collect();
 
     assert!(batch_proof.verify::<TestBackend<U64PF>>(
@@ -96,7 +97,7 @@ fn batch_proof_verify_non_adjacent_leaves() {
 
     // Prove non-adjacent leaves (0 and 5)
     let pos_list = vec![0, 5];
-    let batch_proof = merkle_tree.get_batch_proof(&pos_list);
+    let batch_proof = merkle_tree.get_batch_proof(&pos_list).unwrap();
     let leaves_to_verify: Vec<FE> = pos_list.iter().map(|&i| values[i]).collect();
 
     assert!(batch_proof.verify::<TestBackend<U64PF>>(
@@ -118,7 +119,7 @@ fn batch_proof_verify_single_leaf() {
 
     // Prove single leaf
     let pos_list = vec![3];
-    let batch_proof = merkle_tree.get_batch_proof(&pos_list);
+    let batch_proof = merkle_tree.get_batch_proof(&pos_list).unwrap();
     let leaves_to_verify: Vec<FE> = pos_list.iter().map(|&i| values[i]).collect();
 
     assert!(batch_proof.verify::<TestBackend<U64PF>>(
@@ -140,7 +141,7 @@ fn batch_proof_verify_many_leaves() {
 
     // Prove many leaves
     let pos_list: Vec<usize> = (0..=9).collect();
-    let batch_proof = merkle_tree.get_batch_proof(&pos_list);
+    let batch_proof = merkle_tree.get_batch_proof(&pos_list).unwrap();
     let leaves_to_verify: Vec<FE> = pos_list.iter().map(|&i| values[i]).collect();
 
     assert!(batch_proof.verify::<TestBackend<U64PF>>(
@@ -161,7 +162,7 @@ fn batch_proof_verify_fails_with_wrong_root() {
     let merkle_tree = MerkleTree::<TestBackend<U64PF>>::build(&values).unwrap();
 
     let pos_list = vec![0, 1];
-    let batch_proof = merkle_tree.get_batch_proof(&pos_list);
+    let batch_proof = merkle_tree.get_batch_proof(&pos_list).unwrap();
     let leaves_to_verify: Vec<FE> = pos_list.iter().map(|&i| values[i]).collect();
 
     let wrong_root = FE::new(999);
@@ -183,7 +184,7 @@ fn batch_proof_verify_fails_with_wrong_leaves_values() {
     let merkle_tree = MerkleTree::<TestBackend<U64PF>>::build(&values).unwrap();
 
     let pos_list = vec![0, 1];
-    let batch_proof = merkle_tree.get_batch_proof(&pos_list);
+    let batch_proof = merkle_tree.get_batch_proof(&pos_list).unwrap();
     // Use wrong values
     let wrong_leaves = vec![FE::new(999), FE::new(998)];
 
@@ -206,11 +207,13 @@ fn batch_proof_duplicate_positions_are_deduplicated() {
 
     // Position 0 appears twice - should be deduplicated in proof generation
     let pos_list_with_duplicates = vec![0, 0, 1];
-    let batch_proof = merkle_tree.get_batch_proof(&pos_list_with_duplicates);
+    let batch_proof = merkle_tree
+        .get_batch_proof(&pos_list_with_duplicates)
+        .unwrap();
 
     // Compare with clean version (no duplicates)
     let pos_list_clean = vec![0, 1];
-    let batch_proof_clean = merkle_tree.get_batch_proof(&pos_list_clean);
+    let batch_proof_clean = merkle_tree.get_batch_proof(&pos_list_clean).unwrap();
 
     // Both proofs should have the same path since duplicates are deduplicated
     assert_eq!(batch_proof.path, batch_proof_clean.path);
@@ -226,7 +229,7 @@ fn batch_proof_duplicate_positions_with_conflicting_values_fails() {
     let merkle_tree = MerkleTree::<TestBackend<U64PF>>::build(&values).unwrap();
 
     let pos_list = vec![0, 1];
-    let batch_proof = merkle_tree.get_batch_proof(&pos_list);
+    let batch_proof = merkle_tree.get_batch_proof(&pos_list).unwrap();
 
     // Duplicate position with different values should fail
     let pos_list_duplicated = vec![0, 0, 1];
@@ -251,7 +254,7 @@ fn batch_proof_duplicate_positions_with_same_values_passes() {
     let merkle_tree = MerkleTree::<TestBackend<U64PF>>::build(&values).unwrap();
 
     let pos_list = vec![0, 1];
-    let batch_proof = merkle_tree.get_batch_proof(&pos_list);
+    let batch_proof = merkle_tree.get_batch_proof(&pos_list).unwrap();
 
     // Duplicate position with same value should pass (deduplicated)
     let pos_list_duplicated = vec![0, 0, 1];
@@ -277,7 +280,7 @@ fn batch_proof_all_leaves_has_empty_path() {
 
     // Prove all leaves - no extra nodes needed since all parents are computable
     let pos_list: Vec<usize> = (0..16).collect();
-    let batch_proof = merkle_tree.get_batch_proof(&pos_list);
+    let batch_proof = merkle_tree.get_batch_proof(&pos_list).unwrap();
 
     // When proving all leaves, proof path should be empty
     // because every sibling is already known (it's another leaf we're proving)
@@ -294,5 +297,61 @@ fn batch_proof_all_leaves_has_empty_path() {
         &pos_list,
         &leaves_to_verify,
         16
+    ));
+}
+
+#[test]
+fn batch_proof_verify_sparse_leaves_across_tree() {
+    const MODULUS: u64 = 70;
+    type U64PF = U64PrimeField<MODULUS>;
+    type FE = FieldElement<U64PF>;
+
+    let values: Vec<FE> = (1..=16).map(FE::new).collect();
+    let merkle_tree = MerkleTree::<TestBackend<U64PF>>::build(&values).unwrap();
+    let batch_proof = merkle_tree.get_batch_proof(&[1, 8, 9, 15]).unwrap();
+
+    // Verify the proof structure is as expected
+    let expected_batch_proof = BatchProof {
+        path: vec![
+            FE::new(30), // index 29 - leaf level sibling
+            FE::new(2),  // index 15 - leaf level sibling
+            FE::new(54), // index 13 - internal node
+            FE::new(46), // index 12 - internal node
+            FE::new(14), // index 8  - internal node
+            FE::new(52), // index 4  - internal node (closest to root)
+        ],
+    };
+    assert_eq!(batch_proof.path, expected_batch_proof.path);
+
+    // Verify the proof validates correctly
+    let pos_list = &[1, 8, 9, 15];
+    let leaves_to_verify: Vec<FE> = pos_list.iter().map(|&i| values[i]).collect();
+    assert!(batch_proof.verify::<TestBackend<U64PF>>(
+        &merkle_tree.root,
+        pos_list,
+        &leaves_to_verify,
+        16
+    ));
+}
+
+#[test]
+fn batch_proof_verify_2() {
+    const MODULUS: u64 = 70;
+    type U64PF = U64PrimeField<MODULUS>;
+    type FE = FieldElement<U64PF>;
+
+    let values: Vec<FE> = (1..=8).map(FE::new).collect();
+    let merkle_tree = MerkleTree::<TestBackend<U64PF>>::build(&values).unwrap();
+
+    // Prove many leaves
+    let pos_list: Vec<usize> = vec![0, 1, 7];
+    let batch_proof = merkle_tree.get_batch_proof(&pos_list).unwrap();
+    let leaves_to_verify: Vec<FE> = pos_list.iter().map(|&i| values[i]).collect();
+
+    assert!(batch_proof.verify::<TestBackend<U64PF>>(
+        &merkle_tree.root,
+        &pos_list,
+        &leaves_to_verify,
+        8
     ));
 }

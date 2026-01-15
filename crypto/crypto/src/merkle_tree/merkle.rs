@@ -3,16 +3,19 @@ use core::fmt::Display;
 use crate::merkle_tree::proof::BatchProof;
 
 use super::{proof::Proof, traits::IsMerkleTreeBackend, utils::*};
-use alloc::vec::Vec;
-use std::collections::{BTreeSet, HashSet};
+use alloc::{collections::BTreeSet, vec::Vec};
 
 #[derive(Debug)]
 pub enum Error {
     OutOfBounds,
+    EmptyPositionList,
 }
 impl Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "Accessed node was out of bound")
+        match self {
+            Error::OutOfBounds => write!(f, "Accessed node was out of bound"),
+            Error::EmptyPositionList => write!(f, "Position list cannot be empty"),
+        }
     }
 }
 
@@ -102,11 +105,36 @@ where
         Ok(merkle_path)
     }
 
-    /// Given a list of indices, returns a batch proof containing the nodes needed to verify taht all the leaves
+    /// Given a list of indices, returns a batch proof containing the nodes needed to verify that all the leaves
     /// in those indices belong to the tree.
-    /// It Optimizes the number of nodes in the proof since the verifier can create some of them using
+    /// It optimizes the number of nodes in the proof since the verifier can create some of them using
     /// the leaves and the parent node known by hashing.
-    pub fn get_batch_proof(&self, pos_list: &[usize]) -> BatchProof<B::Node> {
+    ///
+    /// # Proof Structure
+    /// The proof contains sibling nodes ordered by **descending tree index**:
+    /// - Nodes closer to leaves (higher indices) appear first
+    /// - Nodes closer to root (lower indices) appear last
+    ///
+    /// This ordering matches the verification consumption order, which processes
+    /// level-by-level from leaves to root.
+    ///
+    /// # Errors
+    /// - `Error::EmptyPositionList` if `pos_list` is empty
+    /// - `Error::OutOfBounds` if any position in `pos_list` is >= number of leaves
+    pub fn get_batch_proof(&self, pos_list: &[usize]) -> Result<BatchProof<B::Node>, Error> {
+        if pos_list.is_empty() {
+            return Err(Error::EmptyPositionList);
+        }
+
+        let num_leaves = (self.nodes.len() + 1) / 2;
+
+        // Validate all positions are within bounds
+        for &pos in pos_list {
+            if pos >= num_leaves {
+                return Err(Error::OutOfBounds);
+            }
+        }
+
         // Since the nodes in the merkle tree are indexed from the root to the leaves, we redefine the indices
         // of the leaves.
         let leaf_positions = pos_list
@@ -122,9 +150,9 @@ where
             .map(|pos| self.nodes[*pos].clone())
             .collect();
 
-        BatchProof {
+        Ok(BatchProof {
             path: batch_auth_path_nodes,
-        }
+        })
     }
 
     /// Returns the internal indices of nodes needed in the batch proof.
@@ -133,25 +161,39 @@ where
     /// - For each node we can obtain, check if its sibling is also obtainable.
     /// - If not, the sibling must be included in the proof.
     /// - Parents of obtainable nodes become obtainable in the next level.
+    ///
+    /// # How BTreeSet affects ordering
+    /// We use `BTreeSet` to collect sibling indices. BTreeSet always maintains elements
+    /// in **ascending order** (smaller indices first), regardless of insertion order.
+    ///
+    /// At the end, we call `.into_iter().rev()` to reverse the order, producing indices
+    /// in **descending order** (larger indices first). This means:
+    /// - Nodes closer to leaves (higher indices) come first in the proof
+    /// - Nodes closer to root (lower indices) come last
+    ///
+    /// This ordering is critical because the verifier consumes proof nodes level-by-level
+    /// starting from leaves, so it needs leaf-level siblings first.
     fn get_batch_auth_path_positions(&self, leaf_positions: &[usize]) -> Vec<usize> {
+        // BTreeSet keeps indices sorted in ascending order (e.g., {4, 8, 12, 13, 15, 29})
         let mut auth_path_set = BTreeSet::<usize>::new();
-        let mut obtainable: HashSet<usize> = leaf_positions.iter().cloned().collect();
+        let mut obtainable: BTreeSet<usize> = leaf_positions.iter().cloned().collect();
 
         // Number of levels in tree
         let num_levels = (self.nodes.len() + 1).ilog2();
 
         for _ in 0..num_levels - 1 {
-            let mut next_obtainable = HashSet::with_capacity(obtainable.len());
+            let mut next_obtainable = BTreeSet::new();
 
             for &pos in &obtainable {
-                let sibling_pos = get_sibiling_pos(pos);
+                // Check sibling (None only for root, which shouldn't appear here)
+                if let Some(sibling_pos) = get_sibling_pos(pos) {
+                    // If sibling not obtainable, include it in the proof
+                    let sibling_is_obtainable =
+                        obtainable.contains(&sibling_pos) || auth_path_set.contains(&sibling_pos);
 
-                // If sibling not obtainable, include it in the proof
-                let sibling_is_obtainable =
-                    obtainable.contains(&sibling_pos) || auth_path_set.contains(&sibling_pos);
-
-                if !sibling_is_obtainable {
-                    auth_path_set.insert(sibling_pos);
+                    if !sibling_is_obtainable {
+                        auth_path_set.insert(sibling_pos);
+                    }
                 }
 
                 // Parent becomes obtainable (computable from both children)
@@ -161,7 +203,8 @@ where
             obtainable = next_obtainable;
         }
 
-        // Descending order to match verification consumption order
+        // Reverse to get descending order: [29, 15, 13, 12, 8, 4]
+        // This puts leaf-level siblings first, which the verifier needs first
         auth_path_set.into_iter().rev().collect()
     }
 }

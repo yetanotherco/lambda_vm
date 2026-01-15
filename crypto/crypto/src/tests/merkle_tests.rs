@@ -80,7 +80,7 @@ fn build_empty_tree_should_not_panic() {
 fn batch_proof_len_is_expected() {
     let values: Vec<FE> = (1..=8).map(FE::new).collect();
     let merkle_tree = MerkleTree::<TestBackend<U64PF>>::build(&values).unwrap();
-    assert_eq!(merkle_tree.get_batch_proof(&[0, 5]).path.len(), 4);
+    assert_eq!(merkle_tree.get_batch_proof(&[0, 5]).unwrap().path.len(), 4);
 }
 #[test]
 fn batch_proof_is_expected() {
@@ -90,9 +90,35 @@ fn batch_proof_is_expected() {
 
     let values: Vec<FE> = (1..=8).map(FE::new).collect();
     let merkle_tree = MerkleTree::<TestBackend<U64PF>>::build(&values).unwrap();
-    let batch_proof = merkle_tree.get_batch_proof(&[0, 1]);
+    let batch_proof = merkle_tree.get_batch_proof(&[0, 1]).unwrap();
     let expected_batch_proof = BatchProof {
         path: vec![FE::new(14), FE::new(52)],
+    };
+    assert_eq!(batch_proof.path, expected_batch_proof.path);
+}
+
+#[test]
+fn batch_proof_path_contains_expected_elements() {
+    const MODULUS: u64 = 70;
+    type U64PF = U64PrimeField<MODULUS>;
+    type FE = FieldElement<U64PF>;
+
+    let values: Vec<FE> = (1..=16).map(FE::new).collect();
+    let merkle_tree = MerkleTree::<TestBackend<U64PF>>::build(&values).unwrap();
+    let batch_proof = merkle_tree.get_batch_proof(&[1, 8, 9, 15]).unwrap();
+
+    // The proof stores sibling nodes in descending order by tree index
+    // - Higher indices (closer to leaves) come first
+    // - Lower indices (closer to root) come last
+    let expected_batch_proof = BatchProof {
+        path: vec![
+            FE::new(30), // index 29 - leaf level sibling
+            FE::new(2),  // index 15 - leaf level sibling
+            FE::new(54), // index 13 - internal node
+            FE::new(46), // index 12 - internal node
+            FE::new(14), // index 8  - internal node
+            FE::new(52), // index 4  - internal node (closest to root)
+        ],
     };
     assert_eq!(batch_proof.path, expected_batch_proof.path);
 }
@@ -106,6 +132,6 @@ fn batch_proof_len_is_expected_for_long_pos_list() {
     let values: Vec<FE> = (1..=16).map(FE::new).collect();
     let merkle_tree = MerkleTree::<TestBackend<U64PF>>::build(&values).unwrap();
     let pos_list = (0..=9).collect::<Vec<usize>>();
-    let batch_proof = merkle_tree.get_batch_proof(&pos_list);
+    let batch_proof = merkle_tree.get_batch_proof(&pos_list).unwrap();
     assert_eq!(batch_proof.path.len(), 2);
 }
