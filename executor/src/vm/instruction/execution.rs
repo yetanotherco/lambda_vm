@@ -136,8 +136,8 @@ impl Instruction {
                 let base = registers.read(base)?;
                 let addr = (base as i32).wrapping_add(offset) as u32;
                 let value = match width {
-                    LoadStoreWidth::Byte => memory.load_byte(addr) as u32,
-                    LoadStoreWidth::Half => memory.load_half(addr)? as u32,
+                    LoadStoreWidth::Byte => memory.load_byte(addr) as i8 as i32 as u32,
+                    LoadStoreWidth::Half => memory.load_half(addr)? as i16 as i32 as u32,
                     LoadStoreWidth::Word => memory.load_word(addr)?,
                     LoadStoreWidth::ByteUnsigned => memory.load_byte(addr) as u32,
                     LoadStoreWidth::HalfUnsigned => memory.load_half(addr)? as u32,
