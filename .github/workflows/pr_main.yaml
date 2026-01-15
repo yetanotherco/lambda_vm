@@ -80,3 +80,7 @@ jobs:
       - name: Run prover tests
         run: |
           cd prover && cargo test
+
+      - name: Run crypto tests
+        run: |
+          cargo test -p stark -p crypto
