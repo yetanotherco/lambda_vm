@@ -41,13 +41,9 @@ compile-bench: clean-bench $(BENCH_ARTIFACTS)
 
 compile-programs: compile-programs-asm compile-programs-rust compile-bench
 
-# Compile assembly .s -> .o
-$(ASM_ARTIFACTS_DIR)/%.o: $(ASM_PROGRAMS_DIR)/%.s
-	clang --target=riscv32 -c $< -o $@
-
-# Link assembly .o -> .elf
-$(ASM_ARTIFACTS_DIR)/%.elf: $(ASM_ARTIFACTS_DIR)/%.o
-	riscv64-unknown-elf-ld -m elf32lriscv $< -o $@ -e main
+# Compile and link assembly directly with clang (uses lld)
+$(ASM_ARTIFACTS_DIR)/%.elf: $(ASM_PROGRAMS_DIR)/%.s
+	clang --target=riscv32 -fuse-ld=lld -nostdlib -Wl,-e,main $< -o $@
 
 # Compile rust
 $(RUST_ARTIFACTS_DIR)/%.elf: $(RUST_PROGRAMS_DIR)/%/Cargo.toml

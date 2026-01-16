@@ -2,3 +2,6 @@
 .idea
 .vscode
 .DS_Store
+
+# Compiled ELF artifacts (built by CI/make)
+executor/program_artifacts/
