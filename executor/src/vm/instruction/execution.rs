@@ -72,7 +72,7 @@ impl Instruction {
                 if matches!(op, ArithOp::Sub) {
                     return Err(ExecutionError::SubImmNotSupported);
                 }
-                let res32 = op.apply_word(op1, imm);
+                let res32 = op.apply_word(op1, imm)?;
                 let res = res32 as i64 as u64; // Sign-extend to 64 bits
                 registers.write(dst, res)?;
                 Log {
@@ -260,7 +260,7 @@ impl Instruction {
                 // W-suffix: operate on lower 32 bits, sign-extend result to 64 bits
                 let a = registers.read(src1)? as i32;
                 let b = registers.read(src2)? as i32;
-                let res32 = op.apply_word(a, b);
+                let res32 = op.apply_word(a, b)?;
                 let res = res32 as i64 as u64; // Sign-extend to 64 bits
                 registers.write(dst, res)?;
                 Log {
@@ -415,8 +415,8 @@ impl ArithOp {
     }
 
     /// 32-bit arithmetic operations with sign extension (RV64 W-suffix)
-    fn apply_word(&self, a: i32, b: i32) -> i32 {
-        match self {
+    fn apply_word(&self, a: i32, b: i32) -> Result<i32, ExecutionError> {
+        Ok(match self {
             ArithOp::Add => a.wrapping_add(b),
             ArithOp::Sub => a.wrapping_sub(b),
             // W-suffix shifts use 5-bit shift amount
@@ -455,8 +455,8 @@ impl ArithOp {
                 }
             }
             // These operations are not valid for W-suffix instructions
-            _ => panic!("Invalid W-suffix operation: {:?}", self),
-        }
+            _ => return Err(ExecutionError::InvalidWSuffixOperation(*self)),
+        })
     }
 }
 
@@ -493,4 +493,6 @@ pub enum ExecutionError {
     Panic(String),
     #[error("Incorrect message encoding")]
     IncorrectMessage,
+    #[error("Invalid W-suffix operation: {0:?}")]
+    InvalidWSuffixOperation(ArithOp),
 }

@@ -45,7 +45,7 @@ pub unsafe extern "C" fn sys_write(_fildes: i32, buf: *const u8, size: usize) ->
     size.try_into().unwrap_or(-1)
 }
 
-#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+#[cfg(target_arch = "riscv64")]
 /// # Safety
 ///
 /// This function should not be called by the user
@@ -63,7 +63,7 @@ pub unsafe extern "C" fn sys_panic(msg_ptr: *const u8, len: usize) {
     }
 }
 
-#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+#[cfg(target_arch = "riscv64")]
 pub fn commit(slice: &[u8]) {
     print_string("commit called\n");
     unsafe {
@@ -76,7 +76,7 @@ pub fn commit(slice: &[u8]) {
     }
 }
 
-#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+#[cfg(target_arch = "riscv64")]
 pub fn get_private_input() -> Result<Vec<u8>, SyscallError> {
     print_string("get_private_input called\n");
     let mut dest = vec![0u8; MAX_PRIVATE_INPUT_SIZE];
@@ -103,7 +103,7 @@ pub enum SyscallError {
     WrongPrivateInputSize,
 }
 
-#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+#[cfg(target_arch = "riscv64")]
 pub fn sys_halt() -> ! {
     print_string("sys_halt called\n");
     unsafe {
@@ -115,7 +115,7 @@ pub fn sys_halt() -> ! {
     unreachable!()
 }
 
-#[cfg(not(any(target_arch = "riscv32", target_arch = "riscv64")))]
+#[cfg(not(target_arch = "riscv64"))]
 pub fn sys_halt() -> ! {
-    unimplemented!("syscalls are only implemented for riscv32/riscv64 targets");
+    unimplemented!("syscalls are only implemented for riscv64 targets");
 }
