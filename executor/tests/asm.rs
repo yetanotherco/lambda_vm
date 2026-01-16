@@ -497,6 +497,12 @@ fn test_rem() {
 }
 
 #[test]
+fn test_rem_overflow() {
+    // i64::MIN % -1 = 0 (division would overflow, but remainder is 0)
+    run_program_and_check_output("./program_artifacts/asm/rem_overflow.elf", 0);
+}
+
+#[test]
 fn test_remu_zero() {
     run_program_and_check_output("./program_artifacts/asm/remu_zero.elf", 10);
 }
@@ -505,4 +511,364 @@ fn test_remu_zero() {
 fn test_remu() {
     // -1 (as unsigned 64-bit) % 55 = 0xFFFFFFFFFFFFFFFF % 55 = 15
     run_program_and_check_output("./program_artifacts/asm/remu.elf", 15);
+}
+
+// ==================== W-suffix Instructions (RV64 specific) ====================
+
+#[test]
+fn test_addw() {
+    // 0x7FFFFFFF + 1 = 0x80000000, sign-extends to 0xFFFFFFFF80000000
+    run_program_and_check_output("./program_artifacts/asm/addw.elf", i32::MIN as i64);
+}
+
+#[test]
+fn test_addw_pos() {
+    // Simple positive: 10 + 20 = 30
+    run_program_and_check_output("./program_artifacts/asm/addw_pos.elf", 30);
+}
+
+#[test]
+fn test_subw() {
+    // 10 - 20 = -10
+    run_program_and_check_output("./program_artifacts/asm/subw.elf", -10);
+}
+
+#[test]
+fn test_subw_overflow() {
+    // 0x80000000 - 1 = 0x7FFFFFFF
+    run_program_and_check_output("./program_artifacts/asm/subw_overflow.elf", i32::MAX as i64);
+}
+
+#[test]
+fn test_addiw() {
+    // 0x7FFFFFFF + 1 = 0x80000000, sign-extends to 0xFFFFFFFF80000000
+    run_program_and_check_output("./program_artifacts/asm/addiw.elf", i32::MIN as i64);
+}
+
+#[test]
+fn test_addiw_neg() {
+    // 100 + (-50) = 50
+    run_program_and_check_output("./program_artifacts/asm/addiw_neg.elf", 50);
+}
+
+#[test]
+fn test_sllw() {
+    // 1 << 31 = 0x80000000, sign-extends to 0xFFFFFFFF80000000
+    run_program_and_check_output("./program_artifacts/asm/sllw.elf", i32::MIN as i64);
+}
+
+#[test]
+fn test_sllw_wrap() {
+    // shift amount uses only lower 5 bits: 33 & 0x1F = 1, so 1 << 1 = 2
+    run_program_and_check_output("./program_artifacts/asm/sllw_wrap.elf", 2);
+}
+
+#[test]
+fn test_srlw() {
+    // 0x80000000 >> 1 = 0x40000000 (logical, no sign extension of shift)
+    run_program_and_check_output("./program_artifacts/asm/srlw.elf", 0x40000000);
+}
+
+#[test]
+fn test_sraw() {
+    // 0x80000000 >> 1 (arithmetic) = 0xC0000000, sign-extends to 0xFFFFFFFFC0000000
+    run_program_and_check_output("./program_artifacts/asm/sraw.elf", 0xFFFFFFFFC0000000u64 as i64);
+}
+
+#[test]
+fn test_slliw() {
+    // 1 << 31 = 0x80000000, sign-extends to 0xFFFFFFFF80000000
+    run_program_and_check_output("./program_artifacts/asm/slliw.elf", i32::MIN as i64);
+}
+
+#[test]
+fn test_srliw() {
+    // 0x80000000 >> 1 = 0x40000000
+    run_program_and_check_output("./program_artifacts/asm/srliw.elf", 0x40000000);
+}
+
+#[test]
+fn test_sraiw() {
+    // 0x80000000 >> 1 (arithmetic) = 0xC0000000, sign-extends to 0xFFFFFFFFC0000000
+    run_program_and_check_output("./program_artifacts/asm/sraiw.elf", 0xFFFFFFFFC0000000u64 as i64);
+}
+
+#[test]
+fn test_mulw() {
+    // 100000 * 30000 = 3000000000 = 0xB2D05E00, sign-extends to negative
+    run_program_and_check_output("./program_artifacts/asm/mulw.elf", 0xFFFFFFFFB2D05E00u64 as i64);
+}
+
+#[test]
+fn test_mulw_neg() {
+    // -10 * 20 = -200
+    run_program_and_check_output("./program_artifacts/asm/mulw_neg.elf", -200);
+}
+
+#[test]
+fn test_divw() {
+    // -100 / 7 = -14
+    run_program_and_check_output("./program_artifacts/asm/divw.elf", -14);
+}
+
+#[test]
+fn test_divw_zero() {
+    // Division by zero returns -1
+    run_program_and_check_output("./program_artifacts/asm/divw_zero.elf", -1);
+}
+
+#[test]
+fn test_divw_overflow() {
+    // i32::MIN / -1 would overflow, RISC-V returns i32::MIN
+    run_program_and_check_output("./program_artifacts/asm/divw_overflow.elf", i32::MIN as i64);
+}
+
+#[test]
+fn test_divuw_zero() {
+    // DIVUW by zero returns 0xFFFFFFFF, sign-extended to -1
+    run_program_and_check_output("./program_artifacts/asm/divuw_zero.elf", -1);
+}
+
+#[test]
+fn test_divuw() {
+    // 0xFFFFFFFF / 2 = 0x7FFFFFFF (as 32-bit unsigned)
+    run_program_and_check_output("./program_artifacts/asm/divuw.elf", 0x7FFFFFFF);
+}
+
+#[test]
+fn test_remw() {
+    // -100 % 7 = -2
+    run_program_and_check_output("./program_artifacts/asm/remw.elf", -2);
+}
+
+#[test]
+fn test_remw_zero() {
+    // REMW by zero returns dividend
+    run_program_and_check_output("./program_artifacts/asm/remw_zero.elf", 42);
+}
+
+#[test]
+fn test_remw_overflow() {
+    // i32::MIN % -1 = 0 (division would overflow, but remainder is 0)
+    run_program_and_check_output("./program_artifacts/asm/remw_overflow.elf", 0);
+}
+
+#[test]
+fn test_remuw_zero() {
+    // REMUW by zero returns dividend
+    run_program_and_check_output("./program_artifacts/asm/remuw_zero.elf", 42);
+}
+
+#[test]
+fn test_remuw() {
+    // 0xFFFFFFFF % 7 = 3
+    run_program_and_check_output("./program_artifacts/asm/remuw.elf", 3);
+}
+
+// ==================== 64-bit Load/Store ====================
+
+#[test]
+fn test_ld_sd() {
+    // Store and load 0x123456789ABCDEF0
+    run_program_and_check_output("./program_artifacts/asm/ld_sd.elf", 0x123456789ABCDEF0u64 as i64);
+}
+
+#[test]
+fn test_ld_sd_offset() {
+    // Store and load with offset
+    run_program_and_check_output(
+        "./program_artifacts/asm/ld_sd_offset.elf",
+        0xDEADBEEFCAFEBABEu64 as i64,
+    );
+}
+
+#[test]
+fn test_ld_sd_neg() {
+    // Store and load -1
+    run_program_and_check_output("./program_artifacts/asm/ld_sd_neg.elf", -1);
+}
+
+#[test]
+fn test_lwu() {
+    // LWU zero-extends: 0xFFFFFFFF -> 0x00000000FFFFFFFF
+    run_program_and_check_output("./program_artifacts/asm/lwu.elf", 0xFFFFFFFF);
+}
+
+#[test]
+fn test_lw_sign_extend() {
+    // LW sign-extends: 0x80000000 -> 0xFFFFFFFF80000000
+    run_program_and_check_output("./program_artifacts/asm/lw_sign_extend.elf", i32::MIN as i64);
+}
+
+#[test]
+fn test_lwu_vs_lw() {
+    // LWU zero-extends: 0x80000000 -> 0x0000000080000000
+    run_program_and_check_output("./program_artifacts/asm/lwu_vs_lw.elf", 0x80000000u64 as i64);
+}
+
+// ==================== Missing Branch Instructions ====================
+
+#[test]
+fn test_beq() {
+    // BEQ taken: 10 == 10, result = 3
+    run_program_and_check_output("./program_artifacts/asm/beq.elf", 3);
+}
+
+#[test]
+fn test_beq_false() {
+    // BEQ not taken: 10 != 20, result = 2
+    run_program_and_check_output("./program_artifacts/asm/beq_false.elf", 2);
+}
+
+#[test]
+fn test_blt() {
+    // BLT taken: -10 < 10, result = 3
+    run_program_and_check_output("./program_artifacts/asm/blt.elf", 3);
+}
+
+#[test]
+fn test_blt_false() {
+    // BLT not taken: 10 is not < 10, result = 2
+    run_program_and_check_output("./program_artifacts/asm/blt_false.elf", 2);
+}
+
+#[test]
+fn test_bge() {
+    // BGE taken: 10 >= 10, result = 3
+    run_program_and_check_output("./program_artifacts/asm/bge.elf", 3);
+}
+
+#[test]
+fn test_bge_greater() {
+    // BGE taken: 20 >= 10, result = 3
+    run_program_and_check_output("./program_artifacts/asm/bge_greater.elf", 3);
+}
+
+#[test]
+fn test_bge_false() {
+    // BGE not taken: -10 < 10, result = 2
+    run_program_and_check_output("./program_artifacts/asm/bge_false.elf", 2);
+}
+
+#[test]
+fn test_bltu() {
+    // BLTU taken: 5 < 10 (unsigned), result = 3
+    run_program_and_check_output("./program_artifacts/asm/bltu.elf", 3);
+}
+
+#[test]
+fn test_bltu_neg() {
+    // BLTU not taken: -1 (0xFFFF...) is NOT < 10 unsigned, result = 2
+    run_program_and_check_output("./program_artifacts/asm/bltu_neg.elf", 2);
+}
+
+#[test]
+fn test_bgeu() {
+    // BGEU taken: 10 >= 10 (unsigned), result = 3
+    run_program_and_check_output("./program_artifacts/asm/bgeu.elf", 3);
+}
+
+#[test]
+fn test_bgeu_neg() {
+    // BGEU taken: -1 (0xFFFF...) >= 10 unsigned, result = 3
+    run_program_and_check_output("./program_artifacts/asm/bgeu_neg.elf", 3);
+}
+
+// ==================== LUI Instruction ====================
+
+#[test]
+fn test_lui() {
+    // LUI: 0x12345 << 12 = 0x12345000
+    run_program_and_check_output("./program_artifacts/asm/lui.elf", 0x12345000);
+}
+
+#[test]
+fn test_lui_neg() {
+    // LUI: 0x80000 << 12 = 0x80000000, sign-extends to 0xFFFFFFFF80000000
+    run_program_and_check_output("./program_artifacts/asm/lui_neg.elf", i32::MIN as i64);
+}
+
+#[test]
+fn test_lui_max() {
+    // LUI: 0x7FFFF << 12 = 0x7FFFF000
+    run_program_and_check_output("./program_artifacts/asm/lui_max.elf", 0x7FFFF000);
+}
+
+// ==================== 64-bit Edge Cases ====================
+
+#[test]
+fn test_add_64bit() {
+    // 0x100000000 + 0x100000000 = 0x200000000
+    run_program_and_check_output("./program_artifacts/asm/add_64bit.elf", 0x200000000i64);
+}
+
+#[test]
+fn test_slli_64() {
+    // 1 << 32 = 0x100000000
+    run_program_and_check_output("./program_artifacts/asm/slli_64.elf", 0x100000000i64);
+}
+
+#[test]
+fn test_slli_63() {
+    // 1 << 63 = i64::MIN
+    run_program_and_check_output("./program_artifacts/asm/slli_63.elf", i64::MIN);
+}
+
+#[test]
+fn test_srli_64() {
+    // 0x123456789ABCDEF0 >> 32 = 0x12345678
+    run_program_and_check_output("./program_artifacts/asm/srli_64.elf", 0x12345678);
+}
+
+#[test]
+fn test_srai_64() {
+    // 0x8000000000000000 >> 32 (arithmetic) = 0xFFFFFFFF80000000
+    run_program_and_check_output(
+        "./program_artifacts/asm/srai_64.elf",
+        0xFFFFFFFF80000000u64 as i64,
+    );
+}
+
+#[test]
+fn test_mul_64bit() {
+    // 0x100000000 * 2 = 0x200000000
+    run_program_and_check_output("./program_artifacts/asm/mul_64bit.elf", 0x200000000i64);
+}
+
+#[test]
+fn test_div_overflow() {
+    // i64::MIN / -1 returns i64::MIN (RISC-V behavior for overflow)
+    run_program_and_check_output("./program_artifacts/asm/div_overflow.elf", i64::MIN);
+}
+
+#[test]
+fn test_mulh_64bit() {
+    // 0x100000000 * 0x100000000 = 0x10000000000000000 (128-bit), upper 64 = 1
+    run_program_and_check_output("./program_artifacts/asm/mulh_64bit.elf", 1);
+}
+
+// ==================== SUB Register-Register ====================
+
+#[test]
+fn test_sub() {
+    // 30 - 10 = 20
+    run_program_and_check_output("./program_artifacts/asm/sub.elf", 20);
+}
+
+#[test]
+fn test_sub_neg_result() {
+    // 10 - 30 = -20
+    run_program_and_check_output("./program_artifacts/asm/sub_neg_result.elf", -20);
+}
+
+#[test]
+fn test_sub_64bit() {
+    // 0x200000000 - 0x100000000 = 0x100000000
+    run_program_and_check_output("./program_artifacts/asm/sub_64bit.elf", 0x100000000i64);
+}
+
+#[test]
+fn test_sub_underflow() {
+    // 0 - 1 = -1
+    run_program_and_check_output("./program_artifacts/asm/sub_underflow.elf", -1);
 }
