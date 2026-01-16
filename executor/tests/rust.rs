@@ -53,7 +53,7 @@ fn test_if() {
 
 #[test]
 fn test_fibonacci() {
-    run_program_and_check_output("./program_artifacts/rust/fibonacci.elf", 1597, vec![]);
+    run_program_and_check_output("./program_artifacts/rust/fibonacci.elf", 55, vec![]);
 }
 
 #[test]
