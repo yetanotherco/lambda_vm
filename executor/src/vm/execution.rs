@@ -22,8 +22,21 @@ pub fn run_program(
 ) -> Result<(ReturnValues, Vec<Log>), ExecutorError> {
     let mut memory = Memory::default();
     memory.store_private_inputs(private_inputs)?;
+    // Pre-decode all instructions
+    let decoded_instructions = predecode_instructions(&instruction_map);
     load_program(instruction_map, &mut memory)?;
-    run_from_entrypoint(&mut memory, entrypoint)
+    run_from_entrypoint(&mut memory, entrypoint, &decoded_instructions)
+}
+
+fn predecode_instructions(instruction_map: &BTreeMap<u32, u32>) -> BTreeMap<u32, Instruction> {
+    let mut decoded = BTreeMap::new();
+    for (&addr, &raw) in instruction_map {
+        // Skip addresses that don't contain valid instructions (data sections)
+        if let Ok(instr) = Instruction::parse(raw) {
+            decoded.insert(addr, instr);
+        }
+    }
+    decoded
 }
 
 fn load_program(
@@ -39,13 +52,20 @@ fn load_program(
 fn run_from_entrypoint(
     memory: &mut Memory,
     entrypoint: u32,
+    decoded_instructions: &BTreeMap<u32, Instruction>,
 ) -> Result<(ReturnValues, Vec<Log>), ExecutorError> {
     let mut pc = entrypoint;
     let mut registers = Registers::default();
     let mut logs = Vec::new();
     while pc != 0 {
-        let next_instruction = memory.load_word(pc)?;
-        let instruction = Instruction::parse(next_instruction)?;
+        // Use pre-decoded instruction if available, otherwise fall back to parsing
+        let instruction = match decoded_instructions.get(&pc) {
+            Some(&instr) => instr,
+            None => {
+                let next_instruction = memory.load_word(pc)?;
+                Instruction::parse(next_instruction)?
+            }
+        };
         let log = instruction.run(&mut pc, &mut registers, memory)?;
         logs.push(log);
     }

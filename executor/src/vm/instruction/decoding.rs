@@ -138,7 +138,7 @@ pub enum CsrOp {
     CSRRCI,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum Instruction {
     Arith {
         dst: u32,
