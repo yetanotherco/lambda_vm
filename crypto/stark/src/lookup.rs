@@ -574,8 +574,20 @@ pub struct AuxiliaryTraceBuildData {
 /// Values are combined in two stages:
 /// 1. **Casting** (powers of 2): Combine limbs within each TypedValue
 /// 2. **Bus fingerprint** (powers of α): Combine all bus elements into one fingerprint
+///
+/// The `bus_id` distinguishes different buses. Senders and receivers must use
+/// the same `bus_id` for their fingerprints to match. Define bus IDs as an enum:
+/// ```ignore
+/// #[repr(u64)]
+/// enum BusId { Add, Mul, Sub }  // auto-increments: 0, 1, 2
+///
+/// BusInteraction::sender(BusId::Add, Some(0), Packing::Direct.columns(&[1, 2, 3]))
+/// ```
 #[derive(Clone)]
 pub struct BusInteraction {
+    /// Bus identifier. Senders and receivers on the same bus must use the same ID.
+    /// Different buses can have different IDs to prevent cross-bus consumption.
+    pub bus_id: u64,
     /// Column index containing the multiplicity for this interaction.
     /// Can be a binary flag (0 or 1) or a general multiplicity (0, 1, 2, ...).
     /// Determines how many times each row contributes to the bus.
@@ -591,12 +603,20 @@ pub struct BusInteraction {
 
 impl BusInteraction {
     /// Creates a new table interaction.
+    ///
+    /// # Arguments
+    /// * `bus_id` - Unique identifier for the bus. Can be a raw `u64` or an enum with `Into<u64>`
+    /// * `multiplicity_column` - Column index for multiplicity, or None for constant 1
+    /// * `values` - Typed values that make up this interaction
+    /// * `is_sender` - true for sender, false for receiver
     pub fn new(
+        bus_id: impl Into<u64>,
         multiplicity_column: Option<usize>,
         values: Vec<TypedValue>,
         is_sender: bool,
     ) -> Self {
         Self {
+            bus_id: bus_id.into(),
             multiplicity_column,
             values,
             is_sender,
@@ -604,18 +624,37 @@ impl BusInteraction {
     }
 
     /// Creates a sender interaction.
-    pub fn sender(multiplicity_column: Option<usize>, values: Vec<TypedValue>) -> Self {
-        Self::new(multiplicity_column, values, true)
+    ///
+    /// # Arguments
+    /// * `bus_id` - Unique identifier for the bus
+    /// * `multiplicity_column` - Column index for multiplicity, or None for constant 1
+    /// * `values` - Typed values to send
+    pub fn sender(
+        bus_id: impl Into<u64>,
+        multiplicity_column: Option<usize>,
+        values: Vec<TypedValue>,
+    ) -> Self {
+        Self::new(bus_id, multiplicity_column, values, true)
     }
 
     /// Creates a receiver interaction.
-    pub fn receiver(multiplicity_column: Option<usize>, values: Vec<TypedValue>) -> Self {
-        Self::new(multiplicity_column, values, false)
+    ///
+    /// # Arguments
+    /// * `bus_id` - Must match the sender's bus_id
+    /// * `multiplicity_column` - Column index for multiplicity, or None for constant 1
+    /// * `values` - Typed values to receive
+    pub fn receiver(
+        bus_id: impl Into<u64>,
+        multiplicity_column: Option<usize>,
+        values: Vec<TypedValue>,
+    ) -> Self {
+        Self::new(bus_id, multiplicity_column, values, false)
     }
 
     /// Returns total number of bus elements (for α power computation).
+    /// Includes the bus_id as the first element.
     pub fn num_bus_elements(&self) -> usize {
-        self.values.iter().map(|v| v.num_bus_elements()).sum()
+        1 + self.values.iter().map(|v| v.num_bus_elements()).sum::<usize>()
     }
 }
 
@@ -712,25 +751,26 @@ fn build_logup_term_column<F, E>(
     };
 
     for (row, multiplicity) in multiplicities.iter().enumerate() {
-        // Stage 1: Combine each typed value's columns using powers of 2 (in base field)
-        // Stage 2: Convert to extension and combine with powers of α
-        let bus_elements: Vec<FieldElement<E>> = table_interaction
-            .values
-            .iter()
-            .flat_map(|tv| {
-                // Combine in base field (cheaper)
-                let columns: Vec<FieldElement<F>> = tv
-                    .column_indices()
-                    .iter()
-                    .map(|&col| main_segment_cols[col][row].clone())
-                    .collect();
-                let combined = tv.bus_type.combine(&columns);
-                // Convert to extension only after combining
-                combined.into_iter().map(|v| v.to_extension())
-            })
-            .collect();
+        // Bus elements: [bus_id, ...typed_values...]
+        // bus_id is first element to distinguish different buses
+        let mut bus_elements: Vec<FieldElement<E>> =
+            vec![FieldElement::from(table_interaction.bus_id)];
 
-        // fingerprint = z - (v[0] * alpha^0 + v[1] * alpha^1 + ... + v[n] * alpha^n)
+        // Stage 1: Combine each typed value's columns using powers of 2 (in base field)
+        // Stage 2: Convert to extension and append to bus_elements
+        bus_elements.extend(table_interaction.values.iter().flat_map(|tv| {
+            // Combine in base field (cheaper)
+            let columns: Vec<FieldElement<F>> = tv
+                .column_indices()
+                .iter()
+                .map(|&col| main_segment_cols[col][row].clone())
+                .collect();
+            let combined = tv.bus_type.combine(&columns);
+            // Convert to extension only after combining
+            combined.into_iter().map(|v| v.to_extension())
+        }));
+
+        // fingerprint = z - (bus_id + v[0]*α + v[1]*α² + ... + v[n]*α^(n+1))
         let linear_combination: FieldElement<E> = bus_elements
             .iter()
             .zip(alpha_powers.iter())
@@ -844,29 +884,30 @@ where
                 None => FieldElement::<A>::one(),
             };
 
-            // Stage 1: Combine each typed value's columns using powers of 2 (in base field)
-            // Stage 2: Convert to extension and flatten all bus elements
-            let bus_elements: Vec<FieldElement<B>> = interaction
-                .values
-                .iter()
-                .flat_map(|tv| {
-                    // Combine in base field (cheaper)
-                    let columns: Vec<FieldElement<A>> = tv
-                        .column_indices()
-                        .iter()
-                        .map(|&col| step.get_main_evaluation_element(0, col).clone())
-                        .collect();
-                    let combined = tv.bus_type.combine(&columns);
-                    // Convert to extension only after combining
-                    combined.into_iter().map(|v| v.to_extension())
-                })
-                .collect();
+            // Bus elements: [bus_id, ...typed_values...]
+            // bus_id is first element to distinguish different buses
+            let mut bus_elements: Vec<FieldElement<B>> =
+                vec![FieldElement::from(interaction.bus_id)];
 
-            // Coefficients for each bus element
+            // Stage 1: Combine each typed value's columns using powers of 2 (in base field)
+            // Stage 2: Convert to extension and append to bus_elements
+            bus_elements.extend(interaction.values.iter().flat_map(|tv| {
+                // Combine in base field (cheaper)
+                let columns: Vec<FieldElement<A>> = tv
+                    .column_indices()
+                    .iter()
+                    .map(|&col| step.get_main_evaluation_element(0, col).clone())
+                    .collect();
+                let combined = tv.bus_type.combine(&columns);
+                // Convert to extension only after combining
+                combined.into_iter().map(|v| v.to_extension())
+            }));
+
+            // Coefficients for each bus element (including bus_id)
             let coeffs: Vec<FieldElement<B>> =
                 (0..bus_elements.len()).map(|i| alpha.pow(i)).collect();
 
-            // fingerprint = z - (v[0] * alpha^0 + v[1] * alpha^1 + ... + v[n] * alpha^n)
+            // fingerprint = z - (bus_id + v[0]*α + v[1]*α² + ... + v[n]*α^(n+1))
             let fingerprint: FieldElement<B> = (-bus_elements
                 .iter()
                 .zip(coeffs.iter())

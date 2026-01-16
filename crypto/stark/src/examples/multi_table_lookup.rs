@@ -12,6 +12,19 @@ use math::field::fields::fft_friendly::{
 type F = Babybear31PrimeField;
 type E = Degree4BabyBearExtensionField;
 
+/// Bus IDs for the multi-table lookup example
+#[repr(u64)]
+pub enum BusId {
+    Add,
+    Mul,
+}
+
+impl From<BusId> for u64 {
+    fn from(id: BusId) -> u64 {
+        id as u64
+    }
+}
+
 pub fn new_cpu_air_with_lookup(
     proof_options: &ProofOptions,
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
@@ -20,9 +33,9 @@ pub fn new_cpu_air_with_lookup(
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![
             // Interaction with ADD table (CPU sends to ADD bus)
-            BusInteraction::sender(Some(0), Packing::Direct.columns(&[2, 3, 4])),
+            BusInteraction::sender(BusId::Add, Some(0), Packing::Direct.columns(&[2, 3, 4])),
             // Interaction with MUL table (CPU sends to MUL bus)
-            BusInteraction::sender(Some(1), Packing::Direct.columns(&[2, 3, 4])),
+            BusInteraction::sender(BusId::Mul, Some(1), Packing::Direct.columns(&[2, 3, 4])),
         ],
     };
 
@@ -43,7 +56,7 @@ pub fn new_mul_air_with_lookup(
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![
             // Interaction with CPU table (MUL table receives from MUL bus)
-            BusInteraction::receiver(Some(3), Packing::Direct.columns(&[0, 1, 2])),
+            BusInteraction::receiver(BusId::Mul, Some(3), Packing::Direct.columns(&[0, 1, 2])),
         ],
     };
 
@@ -64,7 +77,7 @@ pub fn new_add_air_with_lookup(
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![
             // Interaction with CPU table (ADD table receives from ADD bus)
-            BusInteraction::receiver(Some(3), Packing::Direct.columns(&[0, 1, 2])),
+            BusInteraction::receiver(BusId::Add, Some(3), Packing::Direct.columns(&[0, 1, 2])),
         ],
     };
 
