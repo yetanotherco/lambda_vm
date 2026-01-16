@@ -3,8 +3,10 @@ use std::collections::BTreeMap;
 // TODO: Correctly define this
 const MAX_PUBLIC_OUTPUT_COMMIT_SIZE: u64 = 1024;
 const PUBLIC_OUTPUT_START_INDEX: u64 = 0;
-const MAX_PRIVATE_INPUT_SIZE: u64 = 1024;
-const PRIVATE_INPUT_START_INDEX: u64 = PUBLIC_OUTPUT_START_INDEX + MAX_PUBLIC_OUTPUT_COMMIT_SIZE;
+// Ported from main: increased from 1024 to support larger inputs (ethrex)
+const MAX_PRIVATE_INPUT_SIZE: u64 = 6700000;
+// Ported from main: fixed high address to avoid overlap with program memory
+const PRIVATE_INPUT_START_INDEX: u64 = 0xFF000000;
 
 #[derive(Default, Debug)]
 pub struct Memory(BTreeMap<u64, [u8; 4]>);

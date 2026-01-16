@@ -28,7 +28,7 @@ fn run_program_and_check_public_output(
     let (results, _logs) =
         run_program_without_expect(elf_path, private_inputs).expect("Failed to run program");
 
-    assert!(results.memory_values == expected_output);
+    assert_eq!(results.memory_values, expected_output);
 }
 
 fn run_program_and_check_output(elf_path: &str, expected_output: i64, private_inputs: Vec<u8>) {
@@ -211,5 +211,38 @@ fn test_memory() {
         "./program_artifacts/rust/memory.elf",
         output[(size - 1000) as usize..].to_vec(),
         size.to_be_bytes().to_vec(),
+    );
+}
+
+#[test]
+fn test_keccak() {
+    use tiny_keccak::Hasher;
+    let input_a = b"hello world";
+    let input_b = b"!";
+    let mut output = [0u8; 32];
+    let mut hasher = tiny_keccak::Keccak::v256();
+    hasher.update(input_a);
+    hasher.update(input_b);
+    hasher.finalize(&mut output);
+    run_program_and_check_public_output(
+        "./program_artifacts/rust/keccak.elf",
+        output.to_vec(),
+        vec![],
+    );
+}
+
+#[ignore = "Ignored until the vm is fast enough to run this test"]
+#[test]
+fn test_ethrex() {
+    use guest_program::{execution::execution_program, input::ProgramInput};
+    use rkyv::rancor::Error;
+    use std::fs;
+    let inputs = fs::read("tests/ethrex_hoodi.bin").unwrap();
+    let input = rkyv::from_bytes::<ProgramInput, Error>(&inputs).unwrap();
+    let output = execution_program(input).unwrap();
+    run_program_and_check_public_output(
+        "./program_artifacts/rust/ethrex.elf",
+        output.encode(),
+        inputs,
     );
 }
