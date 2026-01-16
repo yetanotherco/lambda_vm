@@ -199,7 +199,7 @@ impl DecodeTableRow {
                 row.rs1 = FE::from(&base);
                 row.rs2 = FE::from(&src);
                 // Fix this afer changing STORE instruction.
-                row.imm = i32_to_2_limbs(offset as i32);
+                row.imm = i32_to_2_limbs(offset);
 
                 match width {
                     LoadStoreWidth::Byte => row.signed = FE::one(),
