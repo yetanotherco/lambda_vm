@@ -266,7 +266,8 @@ fn test_quad_hl_equals_four_word2l() {
 fn test_air_layout_single_interaction() {
     type E = math::field::fields::fft_friendly::quartic_babybear::Degree4BabyBearExtensionField;
 
-    let interaction = BusInteraction::sender(TEST_BUS, Some(0), Packing::Direct.columns(&[1, 2, 3]));
+    let interaction =
+        BusInteraction::sender(TEST_BUS, Some(0), Packing::Direct.columns(&[1, 2, 3]));
     let build_data = AuxiliaryTraceBuildData {
         interactions: vec![interaction],
     };

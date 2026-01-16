@@ -654,7 +654,11 @@ impl BusInteraction {
     /// Returns total number of bus elements (for α power computation).
     /// Includes the bus_id as the first element.
     pub fn num_bus_elements(&self) -> usize {
-        1 + self.values.iter().map(|v| v.num_bus_elements()).sum::<usize>()
+        1 + self
+            .values
+            .iter()
+            .map(|v| v.num_bus_elements())
+            .sum::<usize>()
     }
 }
 
