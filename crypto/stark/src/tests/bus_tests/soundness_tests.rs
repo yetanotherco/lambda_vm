@@ -890,7 +890,10 @@ fn test_packing_mismatch_element_count() {
             interactions: vec![
                 // Sender uses 3 Direct elements: produces [col1, col2, col3]
                 // Fingerprint: z - (col1 + α*col2 + α²*col3)
-                BusInteraction::sender(Multiplicity::Column(0), Packing::Direct.columns(&[1, 2, 3])),
+                BusInteraction::sender(
+                    Multiplicity::Column(0),
+                    Packing::Direct.columns(&[1, 2, 3]),
+                ),
             ],
         };
         AirWithBuses::new(4, auxiliary_trace_build_data, proof_options, 1, vec![])

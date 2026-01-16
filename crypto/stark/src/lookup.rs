@@ -731,9 +731,7 @@ fn build_logup_term_column<F, E>(
             Multiplicity::Sum(col_a, col_b) => {
                 &main_segment_cols[*col_a][row] + &main_segment_cols[*col_b][row]
             }
-            Multiplicity::Negated(col) => {
-                FieldElement::<F>::one() - &main_segment_cols[*col][row]
-            }
+            Multiplicity::Negated(col) => FieldElement::<F>::one() - &main_segment_cols[*col][row],
         };
         // Stage 1: Combine each typed value's columns using powers of 2 (in base field)
         // Stage 2: Convert to extension and combine with powers of α
