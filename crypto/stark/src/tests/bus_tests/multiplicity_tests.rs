@@ -166,8 +166,8 @@ fn test_multiplicity_sum() {
     // Row 3: flag_a=0, flag_b=0, sends (40, 400) with mult=0 (no contribution)
     let mut sender_trace = TraceTable::from_columns_main(
         vec![
-            vec![FE::one(), FE::zero(), FE::one(), FE::zero()],  // flag_a
-            vec![FE::zero(), FE::one(), FE::one(), FE::zero()],  // flag_b
+            vec![FE::one(), FE::zero(), FE::one(), FE::zero()], // flag_a
+            vec![FE::zero(), FE::one(), FE::one(), FE::zero()], // flag_b
             vec![FE::from(10), FE::from(20), FE::from(30), FE::from(40)], // value_a
             vec![FE::from(100), FE::from(200), FE::from(300), FE::from(400)], // value_b
         ],
@@ -180,7 +180,7 @@ fn test_multiplicity_sum() {
         vec![
             vec![FE::from(10), FE::from(20), FE::from(30), FE::zero()], // value_a
             vec![FE::from(100), FE::from(200), FE::from(300), FE::zero()], // value_b
-            vec![FE::one(), FE::one(), FE::from(2), FE::zero()], // multiplicity
+            vec![FE::one(), FE::one(), FE::from(2), FE::zero()],        // multiplicity
         ],
         1,
     );
@@ -243,9 +243,10 @@ fn test_multiplicity_negated() {
     ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
         let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-            interactions: vec![
-                BusInteraction::receiver(Multiplicity::Column(2), Packing::Direct.columns(&[0, 1])),
-            ],
+            interactions: vec![BusInteraction::receiver(
+                Multiplicity::Column(2),
+                Packing::Direct.columns(&[0, 1]),
+            )],
         };
         AirWithBuses::new(
             3, // columns: value_a, value_b, multiplicity
@@ -277,7 +278,7 @@ fn test_multiplicity_negated() {
         vec![
             vec![FE::from(10), FE::from(30), FE::from(40), FE::zero()], // value_a
             vec![FE::from(100), FE::from(300), FE::from(400), FE::zero()], // value_b
-            vec![FE::one(), FE::one(), FE::one(), FE::zero()], // multiplicity
+            vec![FE::one(), FE::one(), FE::one(), FE::zero()],          // multiplicity
         ],
         1,
     );
