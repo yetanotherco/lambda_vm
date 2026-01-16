@@ -23,6 +23,10 @@ First remove rust if you already have it installed
 rustup self uninstall
 ```
 
+You can install it from source or use our pre-installed binaries
+
+##### Install from source
+
 ```sh
 git clone https://github.com/yetanotherco/rust.git
 cd rust
@@ -45,6 +49,26 @@ Run the rust installation
 ```sh
 ./x.py build && ./x.py install
 ```
+
+##### Download pre-installed binaries
+
+For mac
+
+```sh
+wget lambda.alignedlayer.com/lambda_rust_mac.zip
+```
+
+For linux
+
+```sh
+wget https://lambda.alignedlayer.com/lambda_rust.tar.gz
+```
+
+Then unzip it.
+
+Note that your system may prevent execution because the binaries were compiled on another machine. You may need to grant explicit permission to run them.
+
+##### Add to path
 
 Add the rust directory to your path
 
