@@ -568,6 +568,33 @@ pub struct AuxiliaryTraceBuildData {
     pub interactions: Vec<BusInteraction>,
 }
 
+// =============================================================================
+// Multiplicity
+// =============================================================================
+
+/// Specifies how to compute the multiplicity for a bus interaction.
+///
+/// The multiplicity determines how many times each row contributes to the bus.
+/// Different use cases require different ways to compute this value.
+#[derive(Clone, Debug)]
+pub enum Multiplicity {
+    /// Constant multiplicity of 1 for all rows.
+    /// Use when every row participates exactly once.
+    One,
+
+    /// Read multiplicity from a single column (index).
+    Column(usize),
+
+    /// Sum of two columns: `col_a + col_b`.
+    /// Useful when multiple flags indicate participation.
+    Sum(usize, usize),
+
+    /// Negation of a bit column: `1 - col_value`.
+    /// The column must contain only 0 or 1.
+    /// Useful for "all rows except those marked by this flag".
+    Negated(usize),
+}
+
 /// Struct representing a lookup interaction for a given table.
 /// Contains the multiplicity and typed values involved in said interaction.
 ///
@@ -576,11 +603,9 @@ pub struct AuxiliaryTraceBuildData {
 /// 2. **Bus fingerprint** (powers of α): Combine all bus elements into one fingerprint
 #[derive(Clone)]
 pub struct BusInteraction {
-    /// Column index containing the multiplicity for this interaction.
-    /// Can be a binary flag (0 or 1) or a general multiplicity (0, 1, 2, ...).
+    /// How to compute the multiplicity for this interaction.
     /// Determines how many times each row contributes to the bus.
-    /// If None, a constant multiplicity of 1 is used for all rows.
-    pub multiplicity_column: Option<usize>,
+    pub multiplicity: Multiplicity,
     /// Typed values that make up this interaction
     pub values: Vec<TypedValue>,
     /// Whether this side of the interaction is a sender (true) or receiver (false).
@@ -591,26 +616,22 @@ pub struct BusInteraction {
 
 impl BusInteraction {
     /// Creates a new table interaction.
-    pub fn new(
-        multiplicity_column: Option<usize>,
-        values: Vec<TypedValue>,
-        is_sender: bool,
-    ) -> Self {
+    pub fn new(multiplicity: Multiplicity, values: Vec<TypedValue>, is_sender: bool) -> Self {
         Self {
-            multiplicity_column,
+            multiplicity,
             values,
             is_sender,
         }
     }
 
     /// Creates a sender interaction.
-    pub fn sender(multiplicity_column: Option<usize>, values: Vec<TypedValue>) -> Self {
-        Self::new(multiplicity_column, values, true)
+    pub fn sender(multiplicity: Multiplicity, values: Vec<TypedValue>) -> Self {
+        Self::new(multiplicity, values, true)
     }
 
     /// Creates a receiver interaction.
-    pub fn receiver(multiplicity_column: Option<usize>, values: Vec<TypedValue>) -> Self {
-        Self::new(multiplicity_column, values, false)
+    pub fn receiver(multiplicity: Multiplicity, values: Vec<TypedValue>) -> Self {
+        Self::new(multiplicity, values, false)
     }
 
     /// Returns total number of bus elements (for α power computation).
@@ -685,16 +706,6 @@ fn build_logup_term_column<F, E>(
     let main_segment_cols = trace.columns_main();
     let trace_len = trace.num_rows();
 
-    // Handle optional multiplicity column - use constant 1 if None
-    let multiplicities_owned: Vec<FieldElement<F>>;
-    let multiplicities: &[FieldElement<F>] = match table_interaction.multiplicity_column {
-        Some(col) => &main_segment_cols[col],
-        None => {
-            multiplicities_owned = vec![FieldElement::one(); trace_len];
-            &multiplicities_owned
-        }
-    };
-
     // LogUp challenges (must be shared across all tables for bus to balance)
     let z = &challenges[LOGUP_CHALLENGE_Z];
     let alpha = &challenges[LOGUP_CHALLENGE_ALPHA];
@@ -711,7 +722,18 @@ fn build_logup_term_column<F, E>(
         -FieldElement::<E>::one()
     };
 
-    for (row, multiplicity) in multiplicities.iter().enumerate() {
+    for row in 0..trace_len {
+        // Compute multiplicity based on the Multiplicity variant
+        let multiplicity: FieldElement<F> = match &table_interaction.multiplicity {
+            Multiplicity::One => FieldElement::<F>::one(),
+            Multiplicity::Column(col) => main_segment_cols[*col][row].clone(),
+            Multiplicity::Sum(col_a, col_b) => {
+                &main_segment_cols[*col_a][row] + &main_segment_cols[*col_b][row]
+            }
+            Multiplicity::Negated(col) => {
+                FieldElement::<F>::one() - &main_segment_cols[*col][row]
+            }
+        };
         // Stage 1: Combine each typed value's columns using powers of 2 (in base field)
         // Stage 2: Convert to extension and combine with powers of α
         let bus_elements: Vec<FieldElement<E>> = table_interaction
@@ -838,10 +860,17 @@ where
             let z = &rap_challenges[LOGUP_CHALLENGE_Z];
             let alpha = &rap_challenges[LOGUP_CHALLENGE_ALPHA];
 
-            // Main frame elements - handle optional multiplicity
-            let multiplicity: FieldElement<A> = match interaction.multiplicity_column {
-                Some(col) => step.get_main_evaluation_element(0, col).clone(),
-                None => FieldElement::<A>::one(),
+            // Compute multiplicity based on the Multiplicity variant
+            let multiplicity: FieldElement<A> = match &interaction.multiplicity {
+                Multiplicity::One => FieldElement::<A>::one(),
+                Multiplicity::Column(col) => step.get_main_evaluation_element(0, *col).clone(),
+                Multiplicity::Sum(col_a, col_b) => {
+                    step.get_main_evaluation_element(0, *col_a)
+                        + step.get_main_evaluation_element(0, *col_b)
+                }
+                Multiplicity::Negated(col) => {
+                    FieldElement::<A>::one() - step.get_main_evaluation_element(0, *col)
+                }
             };
 
             // Stage 1: Combine each typed value's columns using powers of 2 (in base field)
