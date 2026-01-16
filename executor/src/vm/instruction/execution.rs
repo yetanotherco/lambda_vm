@@ -98,7 +98,7 @@ impl Instruction {
             } => {
                 let read_value = registers.read(src)?;
                 let base = registers.read(base)?;
-                let addr = base.wrapping_add(offset);
+                let addr = (base as i32).wrapping_add(offset) as u32;
                 match width {
                     LoadStoreWidth::Byte => {
                         let value = read_value & 0xFF;

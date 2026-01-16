@@ -197,3 +197,17 @@ fn test_random() {
         panic!("Expected rand error");
     }
 }
+
+#[test]
+fn test_memory() {
+    let mut output = vec![];
+    let size = 100000u32;
+    for _ in 0..size {
+        output.push(1);
+    }
+    run_program_and_check_public_output(
+        "./program_artifacts/rust/memory.elf",
+        output[(size - 1000) as usize..].to_vec(),
+        size.to_be_bytes().to_vec(),
+    );
+}
