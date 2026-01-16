@@ -2,6 +2,7 @@ pub mod bit_flags;
 pub mod dummy_air;
 pub mod fibonacci_2_cols_shifted;
 pub mod fibonacci_2_columns;
+pub mod fibonacci_multi_column;
 pub mod fibonacci_rap;
 pub mod multi_table_lookup;
 pub mod quadratic_air;
