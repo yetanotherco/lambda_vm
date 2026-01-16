@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 // TODO: Correctly define this
 const MAX_PUBLIC_OUTPUT_COMMIT_SIZE: u32 = 1024;
 const PUBLIC_OUTPUT_START_INDEX: u32 = 0;
-const MAX_PRIVATE_INPUT_SIZE: u32 = 1024;
-const PRIVATE_INPUT_START_INDEX: u32 = PUBLIC_OUTPUT_START_INDEX + MAX_PUBLIC_OUTPUT_COMMIT_SIZE;
+const MAX_PRIVATE_INPUT_SIZE: u32 = 6700000;
+const PRIVATE_INPUT_START_INDEX: u32 = 0xFF000000;
 
 #[derive(Default, Debug)]
 pub struct Memory(BTreeMap<u32, [u8; 4]>);

@@ -3,7 +3,7 @@ use core::arch::asm;
 
 #[cfg(target_arch = "riscv32")]
 // TODO: This should be properly defined
-const MAX_PRIVATE_INPUT_SIZE: usize = 1024;
+const MAX_PRIVATE_INPUT_SIZE: usize = 6700000;
 
 #[cfg(target_arch = "riscv32")]
 enum SyscallNumbers {
