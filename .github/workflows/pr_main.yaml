@@ -81,7 +81,7 @@ jobs:
       - name: Compile Rust programs to ELF
         if: steps.cache-rust-elfs.outputs.cache-hit != 'true'
         run: |
-          cd executor && make -j4 compile-programs-rust
+          cd executor && make compile-programs-rust
 
       - name: Run asm tests
         run: |
