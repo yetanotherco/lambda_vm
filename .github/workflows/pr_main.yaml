@@ -76,7 +76,7 @@ jobs:
           path: |
             executor/program_artifacts/rust
             executor/shared_target
-          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv32im-lambda-vm-elf.json') }}
+          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json') }}
 
       - name: Compile Rust programs to ELF
         if: steps.cache-rust-elfs.outputs.cache-hit != 'true'
