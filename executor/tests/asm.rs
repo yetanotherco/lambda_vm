@@ -303,13 +303,19 @@ fn test_srli_two_one() {
 #[test]
 fn test_srli_max() {
     // -1 (as unsigned) >> 4 = 0x0FFFFFFFFFFFFFFF in 64-bit
-    run_program_and_check_output("./program_artifacts/asm/srli_max.elf", 0x0FFFFFFFFFFFFFFFu64 as i64);
+    run_program_and_check_output(
+        "./program_artifacts/asm/srli_max.elf",
+        0x0FFFFFFFFFFFFFFFu64 as i64,
+    );
 }
 
 #[test]
 fn test_srli_max_max() {
     // -1 (as unsigned) >> 31 = 0x1FFFFFFFF in 64-bit
-    run_program_and_check_output("./program_artifacts/asm/srli_max_max.elf", 0x1FFFFFFFFu64 as i64);
+    run_program_and_check_output(
+        "./program_artifacts/asm/srli_max_max.elf",
+        0x1FFFFFFFFu64 as i64,
+    );
 }
 
 #[test]

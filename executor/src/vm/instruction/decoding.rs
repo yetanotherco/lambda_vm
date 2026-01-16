@@ -113,7 +113,7 @@ pub enum LoadStoreWidth {
     Byte,
     Half,
     Word,
-    DoubleWord,    // RV64: LD/SD
+    DoubleWord, // RV64: LD/SD
     ByteUnsigned,
     HalfUnsigned,
     WordUnsigned, // RV64: LWU

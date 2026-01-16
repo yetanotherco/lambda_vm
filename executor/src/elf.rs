@@ -6,7 +6,7 @@ const ET_EXEC: u16 = 2;
 const PT_LOAD: u32 = 1;
 const MAX_PROGRAM_HEADERS: usize = 256;
 const EXECUTABLE_HEADER_SIZE: usize = 64; // 64-bit ELF header is 64 bytes
-const PROGRAM_HEADER_SIZE: usize = 56;    // 64-bit program header is 56 bytes
+const PROGRAM_HEADER_SIZE: usize = 56; // 64-bit program header is 56 bytes
 const ELF_64_BIT: u8 = 2;
 const ELF_LITTLE_ENDIAN: u8 = 1;
 const ELF_CURRENT_VERSION: u8 = 1;
@@ -132,11 +132,7 @@ impl ExecutableHeader {
         // 58-59: e_shentsize
         // 60-61: e_shnum
         // 62-63: e_shstrndx
-        let e_type = u16::from_le_bytes(
-            input[16..18]
-                .try_into()
-                .map_err(|_| ElfError::Casting)?,
-        );
+        let e_type = u16::from_le_bytes(input[16..18].try_into().map_err(|_| ElfError::Casting)?);
         let e_machine =
             u16::from_le_bytes(input[18..20].try_into().map_err(|_| ElfError::Casting)?);
         let e_version =
