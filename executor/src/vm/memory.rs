@@ -1,4 +1,42 @@
-use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::hash::{BuildHasher, Hasher};
+
+/// Fast hasher for u32 keys - uses the key directly as the hash value.
+/// This avoids the overhead of SipHash for integer keys.
+#[derive(Default)]
+pub struct U32Hasher(u64);
+
+impl Hasher for U32Hasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.wrapping_shl(8).wrapping_add(b as u64);
+        }
+    }
+
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.0 = i as u64;
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Default, Clone)]
+pub struct U32BuildHasher;
+
+impl BuildHasher for U32BuildHasher {
+    type Hasher = U32Hasher;
+    #[inline]
+    fn build_hasher(&self) -> U32Hasher {
+        U32Hasher(0)
+    }
+}
+
+pub type U32HashMap<V> = HashMap<u32, V, U32BuildHasher>;
 
 // TODO: Correctly define this
 const MAX_PUBLIC_OUTPUT_COMMIT_SIZE: u32 = 1024;
@@ -7,7 +45,7 @@ const MAX_PRIVATE_INPUT_SIZE: u32 = 1024;
 const PRIVATE_INPUT_START_INDEX: u32 = PUBLIC_OUTPUT_START_INDEX + MAX_PUBLIC_OUTPUT_COMMIT_SIZE;
 
 #[derive(Default, Debug)]
-pub struct Memory(BTreeMap<u32, [u8; 4]>);
+pub struct Memory(U32HashMap<[u8; 4]>);
 
 impl Memory {
     pub fn load_byte(&self, address: u32) -> u8 {
