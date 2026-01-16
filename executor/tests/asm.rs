@@ -572,7 +572,10 @@ fn test_srlw() {
 #[test]
 fn test_sraw() {
     // 0x80000000 >> 1 (arithmetic) = 0xC0000000, sign-extends to 0xFFFFFFFFC0000000
-    run_program_and_check_output("./program_artifacts/asm/sraw.elf", 0xFFFFFFFFC0000000u64 as i64);
+    run_program_and_check_output(
+        "./program_artifacts/asm/sraw.elf",
+        0xFFFFFFFFC0000000u64 as i64,
+    );
 }
 
 #[test]
@@ -590,13 +593,19 @@ fn test_srliw() {
 #[test]
 fn test_sraiw() {
     // 0x80000000 >> 1 (arithmetic) = 0xC0000000, sign-extends to 0xFFFFFFFFC0000000
-    run_program_and_check_output("./program_artifacts/asm/sraiw.elf", 0xFFFFFFFFC0000000u64 as i64);
+    run_program_and_check_output(
+        "./program_artifacts/asm/sraiw.elf",
+        0xFFFFFFFFC0000000u64 as i64,
+    );
 }
 
 #[test]
 fn test_mulw() {
     // 100000 * 30000 = 3000000000 = 0xB2D05E00, sign-extends to negative
-    run_program_and_check_output("./program_artifacts/asm/mulw.elf", 0xFFFFFFFFB2D05E00u64 as i64);
+    run_program_and_check_output(
+        "./program_artifacts/asm/mulw.elf",
+        0xFFFFFFFFB2D05E00u64 as i64,
+    );
 }
 
 #[test]
@@ -670,7 +679,10 @@ fn test_remuw() {
 #[test]
 fn test_ld_sd() {
     // Store and load 0x123456789ABCDEF0
-    run_program_and_check_output("./program_artifacts/asm/ld_sd.elf", 0x123456789ABCDEF0u64 as i64);
+    run_program_and_check_output(
+        "./program_artifacts/asm/ld_sd.elf",
+        0x123456789ABCDEF0u64 as i64,
+    );
 }
 
 #[test]
@@ -697,13 +709,19 @@ fn test_lwu() {
 #[test]
 fn test_lw_sign_extend() {
     // LW sign-extends: 0x80000000 -> 0xFFFFFFFF80000000
-    run_program_and_check_output("./program_artifacts/asm/lw_sign_extend.elf", i32::MIN as i64);
+    run_program_and_check_output(
+        "./program_artifacts/asm/lw_sign_extend.elf",
+        i32::MIN as i64,
+    );
 }
 
 #[test]
 fn test_lwu_vs_lw() {
     // LWU zero-extends: 0x80000000 -> 0x0000000080000000
-    run_program_and_check_output("./program_artifacts/asm/lwu_vs_lw.elf", 0x80000000u64 as i64);
+    run_program_and_check_output(
+        "./program_artifacts/asm/lwu_vs_lw.elf",
+        0x80000000u64 as i64,
+    );
 }
 
 // ==================== Missing Branch Instructions ====================
