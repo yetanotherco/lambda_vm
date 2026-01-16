@@ -51,7 +51,7 @@ RV64_TARGET_SPEC=$(CURDIR)/programs/riscv64im-lambda-vm-elf.json
 # Compile rust (64-bit)
 $(RUST_ARTIFACTS_DIR)/%.elf: $(RUST_PROGRAMS_DIR)/%/Cargo.toml
 	cd $(RUST_PROGRAMS_DIR)/$* && \
-		cargo +nightly build --release \
+		rustup run nightly cargo build --release \
 			--target $(RV64_TARGET_SPEC) \
 			-Z build-std=core,alloc,std,compiler_builtins,panic_abort \
 			-Z build-std-features=compiler-builtins-mem
@@ -60,7 +60,7 @@ $(RUST_ARTIFACTS_DIR)/%.elf: $(RUST_PROGRAMS_DIR)/%/Cargo.toml
 # Compile rust benches (64-bit)
 $(BENCH_ARTIFACTS_DIR)/%.elf: $(BENCH_PROGRAMS_DIR)/%/Cargo.toml
 	cd $(BENCH_PROGRAMS_DIR)/$* && \
-		cargo +nightly build \
+		rustup run nightly cargo build \
 			--target $(RV64_TARGET_SPEC) \
 			-Z build-std=core,compiler_builtins \
 			-Z build-std-features=compiler-builtins-mem
