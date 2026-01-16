@@ -2,6 +2,7 @@ use super::boundary::BoundaryConstraints;
 #[cfg(all(debug_assertions, not(feature = "parallel")))]
 use crate::debug::check_boundary_polys_divisibility;
 use crate::domain::Domain;
+use crate::lookup::BusPublicInputs;
 use crate::trace::LDETraceTable;
 use crate::traits::{AIR, TransitionEvaluationContext};
 use crate::{frame::Frame, prover::evaluate_polynomial_on_lde_domain};
@@ -35,9 +36,13 @@ where
 {
     pub fn new(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        pub_inputs: &PI,
         rap_challenges: &[FieldElement<FieldExtension>],
+        bus_public_inputs: Option<&BusPublicInputs<FieldExtension>>,
+        trace_length: usize,
     ) -> Self {
-        let boundary_constraints = air.boundary_constraints(rap_challenges);
+        let boundary_constraints =
+            air.boundary_constraints(pub_inputs, rap_challenges, bus_public_inputs, trace_length);
 
         Self {
             boundary_constraints,
@@ -65,7 +70,7 @@ where
                     let mut evals = domain
                         .lde_roots_of_unity_coset
                         .iter()
-                        .map(|v| v.clone() - point)
+                        .map(|v| v - point)
                         .collect::<Vec<FieldElement<Field>>>();
                     FieldElement::inplace_batch_inverse(&mut evals).unwrap();
                     evals
@@ -78,8 +83,9 @@ where
         #[cfg(feature = "instruments")]
         let timer = Instant::now();
 
+        let trace_length = domain.interpolation_domain_size;
         let lde_periodic_columns = air
-            .get_periodic_column_polynomials()
+            .get_periodic_column_polynomials(trace_length)
             .iter()
             .map(|poly| {
                 evaluate_polynomial_on_lde_domain(
