@@ -28,31 +28,30 @@ compile-bench: clean-bench $(BENCH_ARTIFACTS)
 
 compile-programs: compile-programs-asm compile-programs-rust compile-bench
 
-# Compile assembly .s -> .o
-$(ASM_ARTIFACTS_DIR)/%.o: $(ASM_PROGRAMS_DIR)/%.s
-	clang --target=riscv32 -c $< -o $@
+# Compile and link assembly directly with clang (64-bit)
+$(ASM_ARTIFACTS_DIR)/%.elf: $(ASM_PROGRAMS_DIR)/%.s
+	clang --target=riscv64 -fuse-ld=lld -nostdlib -Wl,-e,main $< -o $@
 
-# Link assembly .o -> .elf
-$(ASM_ARTIFACTS_DIR)/%.elf: $(ASM_ARTIFACTS_DIR)/%.o
-	riscv64-unknown-elf-ld -m elf32lriscv $< -o $@ -e main
+# Custom RV64IM target spec location
+RV64_TARGET_SPEC=$(CURDIR)/programs/riscv64im-lambda-vm-elf.json
 
-# Compile rust
+# Compile rust (64-bit)
 $(RUST_ARTIFACTS_DIR)/%.elf: $(RUST_PROGRAMS_DIR)/%/Cargo.toml
 	cd $(RUST_PROGRAMS_DIR)/$* && \
-		cargo build --release \
-			--target riscv32im-lambda-vm-elf \
-			-Z build-std=core,alloc,std,compiler_builtins,panic_abort \
-			-Z build-std-features=compiler-builtins-mem 
-	cp $(RUST_PROGRAMS_DIR)/$*/target/riscv32im-lambda-vm-elf/release/$* $@
+		cargo +nightly build --release \
+			--target $(RV64_TARGET_SPEC) \
+			-Z build-std=core,alloc,compiler_builtins,panic_abort \
+			-Z build-std-features=compiler-builtins-mem
+	cp $(RUST_PROGRAMS_DIR)/$*/target/riscv64im-lambda-vm-elf/release/$* $@
 
-# Compile rust benches
+# Compile rust benches (64-bit)
 $(BENCH_ARTIFACTS_DIR)/%.elf: $(BENCH_PROGRAMS_DIR)/%/Cargo.toml
 	cd $(BENCH_PROGRAMS_DIR)/$* && \
-		cargo build \
-			--target riscv32im-lambda-vm-elf \
+		cargo +nightly build \
+			--target $(RV64_TARGET_SPEC) \
 			-Z build-std=core,compiler_builtins \
-			-Z build-std-features=compiler-builtins-mem 
-	cp $(BENCH_PROGRAMS_DIR)/$*/target/riscv32im-lambda-vm-elf/debug/$* $@
+			-Z build-std-features=compiler-builtins-mem
+	cp $(BENCH_PROGRAMS_DIR)/$*/target/riscv64im-lambda-vm-elf/debug/$* $@
 	rm -rf $(BENCH_PROGRAMS_DIR)/$*/target
 
 clean-asm:

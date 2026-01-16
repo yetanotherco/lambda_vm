@@ -1,12 +1,15 @@
 use executor::{elf::Elf, vm::execution::run_program};
 
-fn run_program_and_check_output(elf_path: &str, expected_output: i32) {
+// NOTE: These tests require 64-bit RISC-V ELF files (RV64IM).
+// The test ELF files need to be recompiled with a 64-bit toolchain.
+// Until then, these tests will fail with "Not a 64-bit ELF" error.
+fn run_program_and_check_output(elf_path: &str, expected_output: i64) {
     println!("Testing {}", elf_path);
     let elf_data = std::fs::read(elf_path).unwrap();
     let program = Elf::load(&elf_data).unwrap();
-    println!("Program entry: 0x{:08x}", program.entry_point);
+    println!("Program entry: 0x{:016x}", program.entry_point);
     program.image.iter().for_each(|(addr, word)| {
-        println!("0x{:08x}: 0x{:08x}", addr, word);
+        println!("0x{:016x}: 0x{:08x}", addr, word);
     });
     let (results, _logs) =
         run_program(program.image, program.entry_point, vec![]).expect("Failed to run program");
@@ -71,22 +74,24 @@ fn test_add_neg() {
 
 #[test]
 fn test_add_max() {
-    run_program_and_check_output("./program_artifacts/asm/add_max.elf", i32::MAX);
+    run_program_and_check_output("./program_artifacts/asm/add_max.elf", i32::MAX as i64);
 }
 
 #[test]
 fn test_add_max_plus_one() {
-    run_program_and_check_output("./program_artifacts/asm/add_max_plus_one.elf", i32::MIN);
+    // i64::MAX + 1 overflows to i64::MIN
+    run_program_and_check_output("./program_artifacts/asm/add_max_plus_one.elf", i64::MIN);
 }
 
 #[test]
 fn test_add_min() {
-    run_program_and_check_output("./program_artifacts/asm/add_min.elf", i32::MIN);
+    run_program_and_check_output("./program_artifacts/asm/add_min.elf", i32::MIN as i64);
 }
 
 #[test]
 fn test_add_min_minus_one() {
-    run_program_and_check_output("./program_artifacts/asm/add_min_minus_one.elf", i32::MAX);
+    // i64::MIN - 1 overflows to i64::MAX
+    run_program_and_check_output("./program_artifacts/asm/add_min_minus_one.elf", i64::MAX);
 }
 
 #[test]
@@ -111,7 +116,8 @@ fn test_andi_one_and_two() {
 
 #[test]
 fn test_andi_max() {
-    run_program_and_check_output("./program_artifacts/asm/andi_max.elf", 0xFFFFFFFFu32 as i32);
+    // andi with -1 immediate on -1 value = -1
+    run_program_and_check_output("./program_artifacts/asm/andi_max.elf", -1);
 }
 
 #[test]
@@ -146,7 +152,8 @@ fn test_ori_three_and_five() {
 
 #[test]
 fn test_ori_max() {
-    run_program_and_check_output("./program_artifacts/asm/ori_max.elf", 0xFFFFFFFFu32 as i32);
+    // ori with -1 immediate on -1 value = -1
+    run_program_and_check_output("./program_artifacts/asm/ori_max.elf", -1);
 }
 
 #[test]
@@ -166,7 +173,8 @@ fn test_xori_one_and_one() {
 
 #[test]
 fn test_xori_max() {
-    run_program_and_check_output("./program_artifacts/asm/xori_max.elf", 0xFFFFFFFFu32 as i32);
+    // xori zero with -1 immediate = -1
+    run_program_and_check_output("./program_artifacts/asm/xori_max.elf", -1);
 }
 
 #[test]
@@ -246,23 +254,20 @@ fn test_slli_ff_four() {
 
 #[test]
 fn test_slli_max() {
-    run_program_and_check_output("./program_artifacts/asm/slli_max.elf", 0xFFFFFFF0u32 as i32);
+    // -1 << 4 = -16 in 64-bit
+    run_program_and_check_output("./program_artifacts/asm/slli_max.elf", -16);
 }
 
 #[test]
 fn test_slli_max_half() {
-    run_program_and_check_output(
-        "./program_artifacts/asm/slli_max_half.elf",
-        0xFFFF8000u32 as i32,
-    );
+    // -1 << 15 = -32768 in 64-bit
+    run_program_and_check_output("./program_artifacts/asm/slli_max_half.elf", -32768);
 }
 
 #[test]
 fn test_slli_max_max() {
-    run_program_and_check_output(
-        "./program_artifacts/asm/slli_max_max.elf",
-        0x80000000u32 as i32,
-    );
+    // -1 << 31 = -2147483648 in 64-bit
+    run_program_and_check_output("./program_artifacts/asm/slli_max_max.elf", -2147483648);
 }
 
 #[test]
@@ -297,12 +302,14 @@ fn test_srli_two_one() {
 
 #[test]
 fn test_srli_max() {
-    run_program_and_check_output("./program_artifacts/asm/srli_max.elf", 0x0FFFFFFFu32 as i32);
+    // -1 (as unsigned) >> 4 = 0x0FFFFFFFFFFFFFFF in 64-bit
+    run_program_and_check_output("./program_artifacts/asm/srli_max.elf", 0x0FFFFFFFFFFFFFFFu64 as i64);
 }
 
 #[test]
 fn test_srli_max_max() {
-    run_program_and_check_output("./program_artifacts/asm/srli_max_max.elf", 0x00000001);
+    // -1 (as unsigned) >> 31 = 0x1FFFFFFFF in 64-bit
+    run_program_and_check_output("./program_artifacts/asm/srli_max_max.elf", 0x1FFFFFFFFu64 as i64);
 }
 
 #[test]
@@ -327,15 +334,14 @@ fn test_srai_two_one() {
 
 #[test]
 fn test_srai_max() {
-    run_program_and_check_output("./program_artifacts/asm/srai_max.elf", 0xFFFFFFFFu32 as i32);
+    // -1 >> 1 (arithmetic) = -1 in 64-bit
+    run_program_and_check_output("./program_artifacts/asm/srai_max.elf", -1);
 }
 
 #[test]
 fn test_srai_negative() {
-    run_program_and_check_output(
-        "./program_artifacts/asm/srai_negative.elf",
-        0xFFFFFFF8u32 as i32,
-    );
+    // -16 >> 1 (arithmetic) = -8 in 64-bit
+    run_program_and_check_output("./program_artifacts/asm/srai_negative.elf", -8);
 }
 
 #[test]
@@ -355,7 +361,7 @@ fn test_jal_prev() {
 
 #[test]
 fn test_jal_ret() {
-    run_program_and_check_output("./program_artifacts/asm/jal_ret.elf", 0x0001007c);
+    run_program_and_check_output("./program_artifacts/asm/jal_ret.elf", 0x11160);
 }
 
 #[test]
@@ -370,7 +376,7 @@ fn test_jalr_neg() {
 
 #[test]
 fn test_jalr_ret() {
-    run_program_and_check_output("./program_artifacts/asm/jalr_ret.elf", 0x0001007c);
+    run_program_and_check_output("./program_artifacts/asm/jalr_ret.elf", 0x11160);
 }
 
 #[test]
@@ -421,12 +427,12 @@ fn test_lw_sw_offset_odd() {
 
 #[test]
 fn test_auipc() {
-    run_program_and_check_output("./program_artifacts/asm/auipc.elf", 0x00010074);
+    run_program_and_check_output("./program_artifacts/asm/auipc.elf", 0x11158);
 }
 
 #[test]
 fn test_auipc_offset() {
-    run_program_and_check_output("./program_artifacts/asm/auipc_offset.elf", 0x00011074);
+    run_program_and_check_output("./program_artifacts/asm/auipc_offset.elf", 0x12158);
 }
 
 #[test]
@@ -446,10 +452,10 @@ fn test_mulh_max() {
 
 #[test]
 fn test_mulhu_max() {
-    run_program_and_check_output(
-        "./program_artifacts/asm/mulhu_max.elf",
-        4294967294_u32 as i32,
-    );
+    // mulhu of -1 * -1 in 64-bit gives the upper 64 bits of 128-bit result
+    // (-1) * (-1) as unsigned = 0xFFFFFFFFFFFFFFFE_0000000000000001
+    // Upper 64 bits = 0xFFFFFFFFFFFFFFFE = -2
+    run_program_and_check_output("./program_artifacts/asm/mulhu_max.elf", -2);
 }
 #[test]
 fn test_mulhsu_max() {
@@ -458,17 +464,20 @@ fn test_mulhsu_max() {
 
 #[test]
 fn test_div_zero() {
-    run_program_and_check_output("./program_artifacts/asm/div_zero.elf", u32::MAX as i32);
+    // Division by zero returns -1 in RISC-V
+    run_program_and_check_output("./program_artifacts/asm/div_zero.elf", -1);
 }
 
 #[test]
 fn test_divu_zero() {
-    run_program_and_check_output("./program_artifacts/asm/divu_zero.elf", u32::MAX as i32);
+    // Division by zero returns all-ones in RISC-V
+    run_program_and_check_output("./program_artifacts/asm/divu_zero.elf", -1);
 }
 
 #[test]
 fn test_divu() {
-    run_program_and_check_output("./program_artifacts/asm/divu.elf", 2147483647);
+    // -1 (as unsigned 64-bit) / 2 = 0x7FFFFFFFFFFFFFFF
+    run_program_and_check_output("./program_artifacts/asm/divu.elf", i64::MAX);
 }
 
 #[test]
@@ -488,5 +497,6 @@ fn test_remu_zero() {
 
 #[test]
 fn test_remu() {
-    run_program_and_check_output("./program_artifacts/asm/remu.elf", 25);
+    // -1 (as unsigned 64-bit) % 55 = 0xFFFFFFFFFFFFFFFF % 55 = 15
+    run_program_and_check_output("./program_artifacts/asm/remu.elf", 15);
 }
