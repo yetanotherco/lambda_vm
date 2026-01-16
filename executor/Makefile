@@ -9,6 +9,8 @@ RUST_ARTIFACTS_DIR=./program_artifacts/rust
 BENCH_PROGRAMS_DIR=./programs/bench
 BENCH_ARTIFACTS_DIR=./program_artifacts/bench
 
+SHARED_TARGET_DIR=./shared_target
+
 ASM_PROGRAMS = $(wildcard $(ASM_PROGRAMS_DIR)/*.s)
 ARTIFACTS_ASM = $(patsubst $(ASM_PROGRAMS_DIR)/%.s, $(ASM_ARTIFACTS_DIR)/%.elf, $(ASM_PROGRAMS))
 
@@ -33,50 +35,54 @@ prepare-test-data:
 		echo "ethrex_hoodi.bin already exists"; \
 	fi
 
-compile-programs-asm: clean-asm $(ARTIFACTS_ASM)
+compile-programs-asm: $(ARTIFACTS_ASM)
 
-compile-programs-rust: clean-rust $(RUST_ARTIFACTS)
+compile-programs-rust: $(RUST_ARTIFACTS)
 
-compile-bench: clean-bench $(BENCH_ARTIFACTS)
+compile-bench: $(BENCH_ARTIFACTS)
 
 compile-programs: compile-programs-asm compile-programs-rust compile-bench
 
 # Compile and link assembly directly with clang (uses lld)
 $(ASM_ARTIFACTS_DIR)/%.elf: $(ASM_PROGRAMS_DIR)/%.s
+	@mkdir -p $(ASM_ARTIFACTS_DIR)
 	clang --target=riscv32 -fuse-ld=lld -nostdlib -Wl,-e,main $< -o $@
 
 # Compile rust
 $(RUST_ARTIFACTS_DIR)/%.elf: $(RUST_PROGRAMS_DIR)/%/Cargo.toml
+	@mkdir -p $(RUST_ARTIFACTS_DIR)
 	cd $(RUST_PROGRAMS_DIR)/$* && \
+		CARGO_TARGET_DIR=$(abspath $(SHARED_TARGET_DIR)) \
 		cargo build --release \
 			--target riscv32im-lambda-vm-elf \
 			-Z build-std=core,alloc,std,compiler_builtins,panic_abort \
-			-Z build-std-features=compiler-builtins-mem 
-	cp $(RUST_PROGRAMS_DIR)/$*/target/riscv32im-lambda-vm-elf/release/$* $@
+			-Z build-std-features=compiler-builtins-mem
+	cp $(SHARED_TARGET_DIR)/riscv32im-lambda-vm-elf/release/$* $@
 
 # Compile rust benches
 $(BENCH_ARTIFACTS_DIR)/%.elf: $(BENCH_PROGRAMS_DIR)/%/Cargo.toml
+	@mkdir -p $(BENCH_ARTIFACTS_DIR)
 	cd $(BENCH_PROGRAMS_DIR)/$* && \
+		CARGO_TARGET_DIR=$(abspath $(SHARED_TARGET_DIR)) \
 		cargo build \
 			--target riscv32im-lambda-vm-elf \
 			-Z build-std=core,compiler_builtins \
-			-Z build-std-features=compiler-builtins-mem 
-	cp $(BENCH_PROGRAMS_DIR)/$*/target/riscv32im-lambda-vm-elf/debug/$* $@
-	rm -rf $(BENCH_PROGRAMS_DIR)/$*/target
+			-Z build-std-features=compiler-builtins-mem
+	cp $(SHARED_TARGET_DIR)/riscv32im-lambda-vm-elf/debug/$* $@
 
 clean-asm:
 	-rm -rf $(ASM_ARTIFACTS_DIR)
-	mkdir -p $(ASM_ARTIFACTS_DIR)
 
 clean-rust:
 	-rm -rf $(RUST_ARTIFACTS_DIR)
-	mkdir -p $(RUST_ARTIFACTS_DIR)
 
 clean-bench:
 	-rm -rf $(BENCH_ARTIFACTS_DIR)
-	mkdir -p $(BENCH_ARTIFACTS_DIR)
 
-clean: clean-asm clean-rust clean-bench
+clean-shared:
+	-rm -rf $(SHARED_TARGET_DIR)
+
+clean: clean-asm clean-rust clean-bench clean-shared
 
 test: compile-programs test-no-compile
 
