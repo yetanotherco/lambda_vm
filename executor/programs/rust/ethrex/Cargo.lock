@@ -418,9 +418,9 @@ checksum = "e629a66d692cb9ff1a1c664e41771b3dcaf961985a9774c0eb0bd1b51cf60a48"
 
 [[package]]
 name = "cc"
-version = "1.2.52"
+version = "1.2.53"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd4932aefd12402b36c60956a4fe0035421f544799057659ff86f923657aada3"
+checksum = "755d2fce177175ffca841e9a06afdb2c4ab0f593d53b4dee48147dfaade85932"
 dependencies = [
  "find-msvc-tools",
  "shlex",
@@ -911,7 +911,7 @@ dependencies = [
 [[package]]
 name = "ethrex-blockchain"
 version = "9.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?branch=crypto-default-features#3a4527330ae522f9a84b4bbb0e8d2ed8c8c6ebe9"
+source = "git+https://github.com/lambdaclass/ethrex.git?branch=crypto-default-features#fb57741edd1bea8fe7151b6dbcdf740e52d4cbd3"
 dependencies = [
  "bytes",
  "ethrex-common",
@@ -932,7 +932,7 @@ dependencies = [
 [[package]]
 name = "ethrex-common"
 version = "9.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?branch=crypto-default-features#3a4527330ae522f9a84b4bbb0e8d2ed8c8c6ebe9"
+source = "git+https://github.com/lambdaclass/ethrex.git?branch=crypto-default-features#fb57741edd1bea8fe7151b6dbcdf740e52d4cbd3"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -963,7 +963,7 @@ dependencies = [
 [[package]]
 name = "ethrex-crypto"
 version = "9.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?branch=crypto-default-features#3a4527330ae522f9a84b4bbb0e8d2ed8c8c6ebe9"
+source = "git+https://github.com/lambdaclass/ethrex.git?branch=crypto-default-features#fb57741edd1bea8fe7151b6dbcdf740e52d4cbd3"
 dependencies = [
  "thiserror 2.0.17",
  "tiny-keccak",
@@ -972,7 +972,7 @@ dependencies = [
 [[package]]
 name = "ethrex-l2-common"
 version = "9.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?branch=crypto-default-features#3a4527330ae522f9a84b4bbb0e8d2ed8c8c6ebe9"
+source = "git+https://github.com/lambdaclass/ethrex.git?branch=crypto-default-features#fb57741edd1bea8fe7151b6dbcdf740e52d4cbd3"
 dependencies = [
  "bytes",
  "ethereum-types",
@@ -996,7 +996,7 @@ dependencies = [
 [[package]]
 name = "ethrex-levm"
 version = "9.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?branch=crypto-default-features#3a4527330ae522f9a84b4bbb0e8d2ed8c8c6ebe9"
+source = "git+https://github.com/lambdaclass/ethrex.git?branch=crypto-default-features#fb57741edd1bea8fe7151b6dbcdf740e52d4cbd3"
 dependencies = [
  "ark-bn254",
  "ark-ec",
@@ -1028,7 +1028,7 @@ dependencies = [
 [[package]]
 name = "ethrex-metrics"
 version = "9.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?branch=crypto-default-features#3a4527330ae522f9a84b4bbb0e8d2ed8c8c6ebe9"
+source = "git+https://github.com/lambdaclass/ethrex.git?branch=crypto-default-features#fb57741edd1bea8fe7151b6dbcdf740e52d4cbd3"
 dependencies = [
  "ethrex-common",
  "serde",
@@ -1040,7 +1040,7 @@ dependencies = [
 [[package]]
 name = "ethrex-rlp"
 version = "9.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?branch=crypto-default-features#3a4527330ae522f9a84b4bbb0e8d2ed8c8c6ebe9"
+source = "git+https://github.com/lambdaclass/ethrex.git?branch=crypto-default-features#fb57741edd1bea8fe7151b6dbcdf740e52d4cbd3"
 dependencies = [
  "bytes",
  "ethereum-types",
@@ -1054,7 +1054,7 @@ dependencies = [
 [[package]]
 name = "ethrex-storage"
 version = "9.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?branch=crypto-default-features#3a4527330ae522f9a84b4bbb0e8d2ed8c8c6ebe9"
+source = "git+https://github.com/lambdaclass/ethrex.git?branch=crypto-default-features#fb57741edd1bea8fe7151b6dbcdf740e52d4cbd3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1079,7 +1079,7 @@ dependencies = [
 [[package]]
 name = "ethrex-threadpool"
 version = "9.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?branch=crypto-default-features#3a4527330ae522f9a84b4bbb0e8d2ed8c8c6ebe9"
+source = "git+https://github.com/lambdaclass/ethrex.git?branch=crypto-default-features#fb57741edd1bea8fe7151b6dbcdf740e52d4cbd3"
 dependencies = [
  "crossbeam",
 ]
@@ -1087,7 +1087,7 @@ dependencies = [
 [[package]]
 name = "ethrex-trie"
 version = "9.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?branch=crypto-default-features#3a4527330ae522f9a84b4bbb0e8d2ed8c8c6ebe9"
+source = "git+https://github.com/lambdaclass/ethrex.git?branch=crypto-default-features#fb57741edd1bea8fe7151b6dbcdf740e52d4cbd3"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1111,7 +1111,7 @@ dependencies = [
 [[package]]
 name = "ethrex-vm"
 version = "9.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?branch=crypto-default-features#3a4527330ae522f9a84b4bbb0e8d2ed8c8c6ebe9"
+source = "git+https://github.com/lambdaclass/ethrex.git?branch=crypto-default-features#fb57741edd1bea8fe7151b6dbcdf740e52d4cbd3"
 dependencies = [
  "bincode",
  "bytes",
@@ -1171,9 +1171,9 @@ dependencies = [
 
 [[package]]
 name = "find-msvc-tools"
-version = "0.1.7"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f449e6c6c08c865631d4890cfacf252b3d396c9bcc83adb6623cdb02a8336c41"
+checksum = "8591b0bcc8a98a64310a2fae1bb3e9b8564dd10e381e6e28010fde8e8e8568db"
 
 [[package]]
 name = "fixed-hash"
@@ -1319,7 +1319,7 @@ dependencies = [
 [[package]]
 name = "guest_program"
 version = "9.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?branch=crypto-default-features#3a4527330ae522f9a84b4bbb0e8d2ed8c8c6ebe9"
+source = "git+https://github.com/lambdaclass/ethrex.git?branch=crypto-default-features#fb57741edd1bea8fe7151b6dbcdf740e52d4cbd3"
 dependencies = [
  "bincode",
  "bytes",
