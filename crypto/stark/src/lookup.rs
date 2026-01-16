@@ -694,6 +694,7 @@ where
 /// - `multiplicity` = number of times this row contributes to the bus
 ///
 /// This is NOT accumulated - just the individual contribution for each row.
+#[allow(clippy::needless_range_loop)]
 fn build_logup_term_column<F, E>(
     aux_column_idx: usize,
     table_interaction: &BusInteraction,
