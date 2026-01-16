@@ -26,17 +26,17 @@ type = "Bit"
 desc = "whether the result should be written to `rd` ($=0$ for memory write and when $#`rd` = #`x0`$."
 
 [[variables.output]]
-name = "mem_2b"
+name = "mem_2B"
 type = "Bit"
 desc = "whether the memory access (read or write) touches at least $2$ bytes."
 
 [[variables.output]]
-name = "mem_4b"
+name = "mem_4B"
 type = "Bit"
 desc = "whether the memory access (read or write) touches at least $4$ bytes."
 
 [[variables.output]]
-name = "mem_8b"
+name = "mem_8B"
 type = "Bit"
 desc = "whether the memory access (read or write) touches at least $8$ bytes."
 

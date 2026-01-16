@@ -16,15 +16,17 @@
 #let decode = raw(chip.name)
 
 = #decode table
-All `RV64IM` instruction are to be encoded in a format that can be interpreted by the VM.
-This section outlines the decoding table in its compressed form, as it is being used in the VM.
-Since reasoning about this compressed form is needlessly complex, the `decode (uncompressed)` section presents the same table in uncompressed form, and explains how a construct the table from `RV64IM` assembly instructions.
+All `RV64ACIM` instruction are to be decoded to a format that can be interpreted by the VM.
+This section outlines the decoding table being used in the VM.
+For reasons of efficiency, data in this table is significantly compressed.
+Since reasoning about this compressed form is needlessly complex, the `decode (uncompressed)` section presents the same table in uncompressed form, and explains how to decode `RV64IM` the assembly instructions to it.
+Instructions on how to compress the uncompressed table to form the compressed decode table, can be derived from the `packed_decode` variable provided below.
 
 == Columns
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
 
-The #decode chip is comprised of #nr_variables variables that are expressed using #nr_columns columns:
+The #decode table is comprised of #nr_variables variables that are expressed using #nr_columns columns:
 #render_chip_column_table(chip, config)
 
 == Padding
