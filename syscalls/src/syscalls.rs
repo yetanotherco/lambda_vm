@@ -1,11 +1,11 @@
-#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+#[cfg(target_arch = "riscv64")]
 use core::arch::asm;
 
-#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+#[cfg(target_arch = "riscv64")]
 // TODO: This should be properly defined
 const MAX_PRIVATE_INPUT_SIZE: usize = 6700000;
 
-#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+#[cfg(target_arch = "riscv64")]
 enum SyscallNumbers {
     Print = 1,
     Panic = 2,
@@ -14,7 +14,7 @@ enum SyscallNumbers {
     Halt = 5,
 }
 
-#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+#[cfg(target_arch = "riscv64")]
 /// This is a template for printing in the vm
 pub fn print_string(s: &str) {
     unsafe {
@@ -27,10 +27,10 @@ pub fn print_string(s: &str) {
     }
 }
 
-#[cfg(not(any(target_arch = "riscv32", target_arch = "riscv64")))]
+#[cfg(not(target_arch = "riscv64"))]
 /// This is a template for printing in the vm
 pub fn print_string(_: &str) {
-    unimplemented!("syscalls are only implemented for riscv32/riscv64 targets");
+    unimplemented!("syscalls are only implemented for riscv64 targets");
 }
 
 /// # Safety
