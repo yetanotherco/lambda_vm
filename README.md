@@ -207,17 +207,10 @@ This project is under active development. Our primary objective is to have a fir
 | Decoder Table | Implement decoder table | Done | - | v0 |
 | Link Decoder and CPU Tables | Use lookup to connect tables | In progress | 1 week | v0 |
 | PC Update Constraints | Implement constraints for updating pc | In progress | 1 week | v0 |
-| ALU - Range Checkers | Implement rangecheck for u16 and u8 | Planned | 2 weeks | v0 |
 | Trace serialization | Serialize/deserialize execution traces | Planned | 1 week | v1 |
 | Constraint debugging | Tools to identify failing constraints | Planned | 1 week | v1 |
 | Memory | Implement memory table with constraints | In progress | 2 weeks | v1 |
-| ALU - Bitwise Ops | Implement tables for u8 bitwise operations (and, xor, or) | Planned | 2 weeks | v1 |
-| ALU - Shift Operations | Implement tables for shift operations | Planned | 2 weeks | v1 |
-| ALU - Multiplication | Implement multiplication table | Done | - | v1 |
-| ALU - Division/Remainder | Implement integer division operations | Done | - | v1 |
-| ALU - Less-Than | Implement LT chip for comparisons | Planned | 1 week | v1 |
-| ALU - Load | Implement LOAD chip for memory loads | Planned | 1 week | v1 |
-| ALU - Branch | Implement BRANCH chip for conditionals | Planned | 1 week | v1 |
+| ALU  | All ALU operations | Planned | 2 weeks | v1 |
 | MEMW chip | Memory word read/write operations | Planned | 2 weeks | v1 |
 | 64-bit ALU constraints | Constraints for 64-bit arithmetic | In progress | 2 weeks | v1 |
 | Trace compression | Compress trace for storage efficiency | Planned | 1 week | v1.5 |
