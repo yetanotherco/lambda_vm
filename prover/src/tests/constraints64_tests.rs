@@ -235,7 +235,10 @@ fn test_add_operand_from_word() {
             assert_eq!(lo.len(), 1);
             assert!(hi.is_empty());
             match &lo[0] {
-                AddLinearTerm::Column { coefficient, column } => {
+                AddLinearTerm::Column {
+                    coefficient,
+                    column,
+                } => {
                     assert_eq!(*coefficient, 1);
                     assert_eq!(*column, 5);
                 }
@@ -269,14 +272,20 @@ fn test_add_operand_from_dword_hl() {
 
             // lo = h[0] + 2^16 * h[1]
             match &lo[0] {
-                AddLinearTerm::Column { coefficient, column } => {
+                AddLinearTerm::Column {
+                    coefficient,
+                    column,
+                } => {
                     assert_eq!(*coefficient, 1);
                     assert_eq!(*column, 0);
                 }
                 _ => panic!("Expected Column"),
             }
             match &lo[1] {
-                AddLinearTerm::Column { coefficient, column } => {
+                AddLinearTerm::Column {
+                    coefficient,
+                    column,
+                } => {
                     assert_eq!(*coefficient, 1 << 16);
                     assert_eq!(*column, 1);
                 }
@@ -285,14 +294,20 @@ fn test_add_operand_from_dword_hl() {
 
             // hi = h[2] + 2^16 * h[3]
             match &hi[0] {
-                AddLinearTerm::Column { coefficient, column } => {
+                AddLinearTerm::Column {
+                    coefficient,
+                    column,
+                } => {
                     assert_eq!(*coefficient, 1);
                     assert_eq!(*column, 2);
                 }
                 _ => panic!("Expected Column"),
             }
             match &hi[1] {
-                AddLinearTerm::Column { coefficient, column } => {
+                AddLinearTerm::Column {
+                    coefficient,
+                    column,
+                } => {
                     assert_eq!(*coefficient, 1 << 16);
                     assert_eq!(*column, 3);
                 }
@@ -370,7 +385,10 @@ fn test_add_operand_linear_with_negative_coefficient() {
                 _ => panic!("Expected Constant"),
             }
             match &lo[1] {
-                AddLinearTerm::Column { coefficient, column } => {
+                AddLinearTerm::Column {
+                    coefficient,
+                    column,
+                } => {
                     assert_eq!(*coefficient, -2);
                     assert_eq!(*column, 0);
                 }

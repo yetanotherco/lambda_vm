@@ -202,7 +202,10 @@ impl AddLinearTerm {
         E: IsField,
     {
         match self {
-            AddLinearTerm::Column { coefficient, column } => {
+            AddLinearTerm::Column {
+                coefficient,
+                column,
+            } => {
                 let col_val = step.get_main_evaluation_element(0, *column);
                 col_val * i64_to_fe::<F>(*coefficient)
             }
@@ -220,7 +223,10 @@ where
     if terms.is_empty() {
         FieldElement::zero()
     } else {
-        terms.iter().map(|t| t.eval(step)).fold(FieldElement::zero(), |acc, x| acc + x)
+        terms
+            .iter()
+            .map(|t| t.eval(step))
+            .fold(FieldElement::zero(), |acc, x| acc + x)
     }
 }
 
@@ -246,9 +252,9 @@ impl AddOperand {
         E: IsField,
     {
         match self {
-            AddOperand::DWordWL { start_column } => {
-                step.get_main_evaluation_element(0, *start_column + 1).clone()
-            }
+            AddOperand::DWordWL { start_column } => step
+                .get_main_evaluation_element(0, *start_column + 1)
+                .clone(),
             AddOperand::Linear { hi, .. } => eval_terms(hi, step),
         }
     }
