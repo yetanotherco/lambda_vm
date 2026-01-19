@@ -26,6 +26,19 @@ type F = Babybear31PrimeField;
 type E = Degree4BabyBearExtensionField;
 type FE = FieldElement<F>;
 
+/// Bus IDs for multi-table tests
+#[repr(u64)]
+enum BusId {
+    Add,
+    Mul,
+}
+
+impl From<BusId> for u64 {
+    fn from(id: BusId) -> u64 {
+        id as u64
+    }
+}
+
 /// Test that verifies multi-table LogUp proofs can be serialized, transmitted,
 /// and verified by a verifier who never ran the prover.
 #[test_log::test]
@@ -175,8 +188,16 @@ fn create_cpu_air(
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![
-            BusInteraction::sender(Multiplicity::Column(0), Packing::Direct.columns(&[2, 3, 4])),
-            BusInteraction::sender(Multiplicity::Column(1), Packing::Direct.columns(&[2, 3, 4])),
+            BusInteraction::sender(
+                BusId::Add,
+                Multiplicity::Column(0),
+                Packing::Direct.columns(&[2, 3, 4]),
+            ),
+            BusInteraction::sender(
+                BusId::Mul,
+                Multiplicity::Column(1),
+                Packing::Direct.columns(&[2, 3, 4]),
+            ),
         ],
     };
     AirWithBuses::new(
@@ -194,6 +215,7 @@ fn create_add_air(
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![BusInteraction::receiver(
+            BusId::Add,
             Multiplicity::Column(3),
             Packing::Direct.columns(&[0, 1, 2]),
         )],
@@ -213,6 +235,7 @@ fn create_mul_air(
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![BusInteraction::receiver(
+            BusId::Mul,
             Multiplicity::Column(3),
             Packing::Direct.columns(&[0, 1, 2]),
         )],

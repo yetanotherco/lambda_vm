@@ -1,9 +1,9 @@
-	.attribute	5, "rv32i2p1_m2p0_zmmul1p0"
+	.attribute	5, "rv64i2p1_m2p0_zmmul1p0"
 .Lfunc_end0:
 	.globl	main
 main:
-	ori	    a2, zero, 0xFFFFFFFF
-	ori	    a0, a2, 0xFFFFFFFF
+	li	a2, -1
+	ori	a0, a2, -1        # OR with -1 immediate (valid 12-bit)
 	jalr	zero, 0(ra)
 .Lfunc_end1:
 	.size	main, .Lfunc_end1-main
