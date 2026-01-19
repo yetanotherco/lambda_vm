@@ -12,7 +12,8 @@ use crate::examples::multi_table_lookup::{
     new_add_air_with_lookup, new_cpu_air_with_lookup, new_mul_air_with_lookup,
 };
 use crate::lookup::{
-    AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, NullBoundaryConstraintBuilder, Packing,
+    AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, Multiplicity,
+    NullBoundaryConstraintBuilder, Packing,
 };
 use crate::proof::options::ProofOptions;
 use crate::prover::{IsStarkProver, Prover};
@@ -414,7 +415,7 @@ fn test_bus_value_features() {
             LinearTerm::Constant(5),
         ]));
         let build_data = AuxiliaryTraceBuildData {
-            interactions: vec![BusInteraction::sender(Some(0), values)],
+            interactions: vec![BusInteraction::sender(Multiplicity::Column(0), values)],
         };
         let proof_options = ProofOptions::default_test_options();
         AirWithBuses::<F, E, NullBoundaryConstraintBuilder, ()>::new(
@@ -439,7 +440,7 @@ fn test_bus_value_features() {
             LinearTerm::Constant(5),
         ]));
         let build_data = AuxiliaryTraceBuildData {
-            interactions: vec![BusInteraction::receiver(Some(4), values)],
+            interactions: vec![BusInteraction::receiver(Multiplicity::Column(4), values)],
         };
         let proof_options = ProofOptions::default_test_options();
         AirWithBuses::<F, E, NullBoundaryConstraintBuilder, ()>::new(

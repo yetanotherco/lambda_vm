@@ -678,11 +678,12 @@ pub enum Multiplicity {
 /// 2. **Bus fingerprint** (powers of α): Combine all bus elements into one fingerprint
 #[derive(Clone)]
 pub struct BusInteraction {
-    /// How to compute the multiplicity for this interaction.
-    /// Determines how many times each row contributes to the bus.
+    /// The multiplicity determines how many times each row contributes to the bus.
+    /// Different use cases require different ways to compute this value.
     pub multiplicity: Multiplicity,
-    /// Typed values that make up this interaction
-    pub values: Vec<TypedValue>,
+    /// Bus values that make up this interaction.
+    /// Each BusValue produces one or more bus elements for the fingerprint.
+    pub values: Vec<BusValue>,
     /// Whether this side of the interaction is a sender (true) or receiver (false).
     /// Senders contribute positive values to the bus sum, receivers contribute negative.
     /// For bus balance: Σ sender_values - Σ receiver_values = 0
