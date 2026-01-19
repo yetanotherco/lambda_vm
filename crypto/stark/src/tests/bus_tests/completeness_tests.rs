@@ -11,6 +11,9 @@ use math::field::fields::fft_friendly::{
 use crate::examples::multi_table_lookup::{
     new_add_air_with_lookup, new_cpu_air_with_lookup, new_mul_air_with_lookup,
 };
+use crate::lookup::{
+    AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, NullBoundaryConstraintBuilder, Packing,
+};
 use crate::proof::options::ProofOptions;
 use crate::prover::{IsStarkProver, Prover};
 use crate::trace::TraceTable;
@@ -379,6 +382,117 @@ fn test_serialization_roundtrip() {
     assert!(Verifier::multi_verify(
         &airs,
         &deserialized,
+        &mut DefaultTranscript::<E>::new(&[]),
+    ));
+}
+
+/// Integration test for BusValue features: Packed, constant, column, and Linear.
+///
+/// Tests that the full prover/verifier pipeline works with:
+/// - `BusValue::Packed` (via `Packing::columns()`)
+/// - `BusValue::constant()` for fixed values (e.g., table IDs)
+/// - `BusValue::column()` for single column values
+/// - `BusValue::Linear()` for custom linear combinations
+///
+/// Fingerprint structure: constant(0x42) + α·Word2L(h0,h1) + α²·col[2] + α³·(3·col[3] + 5)
+#[test_log::test]
+fn test_bus_value_features() {
+    use crate::lookup::{BusValue, LinearTerm};
+
+    // Sender: [mult, h0, h1, a, b] - 5 columns
+    // Fingerprint: 0x42 + α·Word2L(h0,h1) + α²·a + α³·(3·b + 5)
+    let sender_air = {
+        let mut values = vec![BusValue::constant(0x42)]; // constant table ID
+        values.extend(Packing::Word2L.columns(&[1])); // cols 1,2 packed
+        values.push(BusValue::column(3)); // col 3 directly
+        values.push(BusValue::Linear(vec![
+            // custom: 3*col[4] + 5
+            LinearTerm::Column {
+                coefficient: 3,
+                column: 4,
+            },
+            LinearTerm::Constant(5),
+        ]));
+        let build_data = AuxiliaryTraceBuildData {
+            interactions: vec![BusInteraction::sender(Some(0), values)],
+        };
+        let proof_options = ProofOptions::default_test_options();
+        AirWithBuses::<F, E, NullBoundaryConstraintBuilder, ()>::new(
+            5,
+            build_data,
+            &proof_options,
+            1,
+            vec![],
+        )
+    };
+
+    // Receiver: [h0, h1, a, b, mult] - same fingerprint, different column layout
+    let receiver_air = {
+        let mut values = vec![BusValue::constant(0x42)];
+        values.extend(Packing::Word2L.columns(&[0])); // cols 0,1 packed
+        values.push(BusValue::column(2)); // col 2 directly
+        values.push(BusValue::Linear(vec![
+            LinearTerm::Column {
+                coefficient: 3,
+                column: 3,
+            },
+            LinearTerm::Constant(5),
+        ]));
+        let build_data = AuxiliaryTraceBuildData {
+            interactions: vec![BusInteraction::receiver(Some(4), values)],
+        };
+        let proof_options = ProofOptions::default_test_options();
+        AirWithBuses::<F, E, NullBoundaryConstraintBuilder, ()>::new(
+            5,
+            build_data,
+            &proof_options,
+            1,
+            vec![],
+        )
+    };
+
+    // Sender trace: [mult, h0, h1, a, b]
+    let mut sender_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::one(), FE::one(), FE::zero(), FE::zero()], // mult
+            vec![FE::from(0x1234u64), FE::from(0xABCDu64), FE::zero(), FE::zero()], // h0
+            vec![FE::from(0x5678u64), FE::from(0xEF01u64), FE::zero(), FE::zero()], // h1
+            vec![FE::from(100u64), FE::from(200u64), FE::zero(), FE::zero()], // a
+            vec![FE::from(10u64), FE::from(20u64), FE::zero(), FE::zero()],   // b
+        ],
+        1,
+    );
+
+    // Receiver trace: [h0, h1, a, b, mult]
+    let mut receiver_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::from(0x1234u64), FE::from(0xABCDu64), FE::zero(), FE::zero()], // h0
+            vec![FE::from(0x5678u64), FE::from(0xEF01u64), FE::zero(), FE::zero()], // h1
+            vec![FE::from(100u64), FE::from(200u64), FE::zero(), FE::zero()], // a
+            vec![FE::from(10u64), FE::from(20u64), FE::zero(), FE::zero()],   // b
+            vec![FE::one(), FE::one(), FE::zero(), FE::zero()], // mult
+        ],
+        1,
+    );
+
+    let air_trace_pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&sender_air, &mut sender_trace, &()),
+        (&receiver_air, &mut receiver_trace, &()),
+    ];
+
+    let multi_proof =
+        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        vec![&sender_air, &receiver_air];
+
+    assert!(Verifier::multi_verify(
+        &airs,
+        &multi_proof,
         &mut DefaultTranscript::<E>::new(&[]),
     ));
 }
