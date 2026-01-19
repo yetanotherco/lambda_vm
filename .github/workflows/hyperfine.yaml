@@ -37,12 +37,8 @@ jobs:
 
       - name: Build programs
         if: ${{ steps.cache.outputs.cache-hit != 'true' }}
-        # TODO: Uncomment once we build programs on the CI, for now we just commit the compiled program artifacts
-        #run: |
-        #   cd executor && make -j compile-bench
-        #   mkdir -p ${{ matrix.branch }}_programs
-        #   cp executor/program_artifacts/bench/*.elf ${{ matrix.branch }}_programs
         run: |
+          cd executor && make -j compile-bench
           mkdir -p ${{ matrix.branch }}_programs
           cp executor/program_artifacts/bench/*.elf ${{ matrix.branch }}_programs
 
