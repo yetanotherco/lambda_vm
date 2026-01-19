@@ -54,4 +54,4 @@ multiplicity = -1
 kind = "interaction"
 tag = "memory"
 input = [0, "address", "timestamp", "fini"]
-multiplity = 1
+multiplicity = 1

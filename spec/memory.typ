@@ -17,7 +17,7 @@
 = Memory argument
 
 As part of fully proving the correct execution of a RISC-V program,
-it is necessary to ensure that reads and writes to memory are consistent.
+it is necessary to ensure that memory reads and writes are consistent.
 That is, every value read from some address corresponds to the value that was last written to that address
 --- or the initial value if nothing has been written yet.
 We consider "memory" in a broad sense here:
@@ -65,7 +65,7 @@ For simplicity, we will always reserve a timestamp for every possible memory acc
 *Note on “simultaneous” memory accesses*: For reasons of completeness (since temporal integrity as discussed below is a security necessity),
 we cannot deal with multiple accesses to the same address at identical timestamps.
 However, if multiple accesses are guaranteed to be independent (that is, to different addresses), they can still share a timestamp
---- consider e.g. the case of reading a word as 4 bytes with a LOAD instruction.
+--- consider, e.g., the case of reading a word as 4 bytes with the `LW` load instruction.
 This property is already taken into account where possible in the design of the system.
 
 == Permutation argument
@@ -95,15 +95,15 @@ We choose to represent timestamps as machine words, using the existing `LT` chip
 
 == Initialization and Finalization
 
-Because the LogUp argument handling token consumption and emission needs the end-total to be fully balanced
-(that is, every token emitted should be consumed, and vice versa),
+Because the LogUp argument handling token consumption and emission needs to be fully balanced
+--- every token emitted should be consumed, and vice versa ---
 we need to have a system to emit the initial tokens and consume the final tokens.
 This needs to ensure that every address has at most a single initializing emission, and at most one finalizing consumption.
 Having at most one initialization will, through the correctness of the lookup argument,
 immediately lead to having at most one correct finalization, and vice versa.
+
 The initialization will need to correspond to a fixed initial register state for the VM,
 as well as the memory loaded from the program binary, zero-initialization of memory elsewhere, and private input provided by the prover.
-
 The contribution of initialization with static data from the ELF executable and the initial register state to the sum
 can be handled directly by the verifier, ensuring correctness corresponding to the ELF binary being proven.
 This leaves only zero-initialization and prover input as prover-side concerns for initialization,
@@ -116,7 +116,7 @@ with `page_base_address` being "page-aligned", and `page_offset` belonging to a 
 As such, initialization or finalization of a page is represented by a table with columns `page`, `offset`, `value`, and ---for finalization--- `timestamp`.
 The `page` column is a preprocessed, constant value (which can be entirely virtualized/inlined into the constraints for this table),
 and the `offset` column is a preprocessed column containing its row index.
-Depending on the type of initialization, `value` can be a prover-committed column, or a precomputed, constant column containing `0`.
+Depending on the type of initialization, `value` can be a prover-committed column (input data), or a precomputed, constant column containing `0` (free memory space).
 This table then feeds into the LogUp system in the normal way,
 emitting the initial tokens for all addresses in a page, without consuming any tokens.
 Since the `offset` column is always the same, it can be reused across all paged initialization and finalization tables.
