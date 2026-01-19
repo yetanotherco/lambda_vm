@@ -2,7 +2,7 @@
 //!
 //! Run with: `cargo bench -p stark --bench lookup_bench`
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use math::field::element::FieldElement;
 use math::field::fields::fft_friendly::{
     extensions_goldilocks::Degree2GoldilocksExtensionField, u64_goldilocks::U64GoldilocksPrimeField,
@@ -178,13 +178,7 @@ fn bench_alpha_powers(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("pow_each_time", num_elements),
             &num_elements,
-            |b, &n| {
-                b.iter(|| {
-                    (0..n)
-                        .map(|i| alpha.pow(i))
-                        .collect::<Vec<_>>()
-                })
-            },
+            |b, &n| b.iter(|| (0..n).map(|i| alpha.pow(i)).collect::<Vec<_>>()),
         );
 
         // Compute powers incrementally (more efficient)
