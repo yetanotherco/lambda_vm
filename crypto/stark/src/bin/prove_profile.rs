@@ -104,15 +104,20 @@ fn run_fibonacci_proof(trace_size: usize, do_verify: bool) {
     let trace_time = trace_start.elapsed();
 
     // Create AIR
-    let air = FibonacciAIR::<F>::new(trace.num_rows(), &pub_inputs, &proof_options);
+    let air = FibonacciAIR::<F>::new(&proof_options);
 
     let setup_time = setup_start.elapsed();
     println!("Setup time: {:?} (trace gen: {:?})", setup_time, trace_time);
 
     // Prove
     let prove_start = Instant::now();
-    let proof = Prover::prove(&air, &mut trace, &mut StoneProverTranscript::new(&[]))
-        .expect("Proving failed");
+    let proof = Prover::prove(
+        &air,
+        &mut trace,
+        &pub_inputs,
+        &mut StoneProverTranscript::new(&[]),
+    )
+    .expect("Proving failed");
     let prove_time = prove_start.elapsed();
 
     println!("Prove time: {:?}", prove_time);
