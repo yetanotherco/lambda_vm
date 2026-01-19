@@ -35,6 +35,10 @@ jobs:
           key: benchmarks-${{ matrix.branch }}-${{ hashFiles( 'executor/program_artifacts/bench/*.elf' ) }}
           restore-keys: benchmarks-${{ matrix.branch }}-
 
+      - name: Setup Rust Environment
+        if: ${{ steps.cache.outputs.cache-hit != 'true' }}
+        uses: ./.github/actions/setup-rust
+
       - name: Build programs
         if: ${{ steps.cache.outputs.cache-hit != 'true' }}
         run: |
