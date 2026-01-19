@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher};
 
-/// Fast hasher for u32 keys - uses the key directly as the hash value.
+/// Fast hasher for u64 keys - uses the key directly as the hash value.
 /// This avoids the overhead of SipHash for integer keys.
 #[derive(Default)]
 pub struct U64Hasher(u64);
