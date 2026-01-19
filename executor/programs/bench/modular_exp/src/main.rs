@@ -8,7 +8,7 @@ fn panic(_info: &PanicInfo) -> ! {
     loop {}
 }
 
-const NUM_ITERATIONS: usize = 1000;
+const NUM_ITERATIONS: usize = 150;
 
 #[inline(never)]
 fn mod_exp(base: u32, exp: u32, modulus: u32) -> u32 {

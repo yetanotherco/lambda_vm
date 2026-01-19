@@ -9,7 +9,7 @@ fn panic(_info: &PanicInfo) -> ! {
 }
 
 const ARR_SIZE: usize = 1000;
-const NUM_SEARCHES: usize = 30000;
+const NUM_SEARCHES: usize = 8000;
 
 #[inline(never)]
 fn binary_search(arr: &[u32; ARR_SIZE], target: u32) -> i32 {

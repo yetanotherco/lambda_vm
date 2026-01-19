@@ -8,7 +8,7 @@ fn panic(_info: &PanicInfo) -> ! {
     loop {}
 }
 
-const SIZE: usize = 12000;
+const SIZE: usize = 3200;
 
 #[inline(never)]
 fn partition(arr: &mut [u32], len: usize) -> usize {
