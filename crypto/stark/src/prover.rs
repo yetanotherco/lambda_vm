@@ -945,7 +945,6 @@ pub trait IsStarkProver<
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
-        FieldExtension: IsFFTField,
         PI: Send + Sync + Clone,
     {
         info!("Started proof generation...");
@@ -1036,7 +1035,6 @@ pub trait IsStarkProver<
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
-        FieldExtension: IsFFTField,
         PI: Send + Sync + Clone,
     {
         let air_trace_pairs = vec![(air, trace, pub_inputs)];
@@ -1056,7 +1054,6 @@ pub trait IsStarkProver<
     ) -> Result<StarkProof<Field, FieldExtension, PI>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
-        FieldExtension: IsFFTField,
         FieldElement<FieldExtension>: AsBytes,
         PI: Send + Sync + Clone,
     {

@@ -31,19 +31,14 @@ pub const SHIFT_32: u64 = 1u64 << 32;
 // IS_BIT Template
 // =========================================================================
 
-/// Enforces that a value is binary (0 or 1) when a condition is active.
+/// Enforces that a value is binary (0 or 1).
 ///
-/// Constraint: `cond * X * (1-X) = 0`
-///
-/// This constraint evaluates to 0 in three cases:
-/// - cond = 0 (constraint inactive)
-/// - X = 0 (valid binary value)
-/// - X = 1 (valid binary value)
-///
-/// Degree: 3 (cubic)
+/// Two modes:
+/// - Conditional: `cond * X * (1-X) = 0` (degree 3)
+/// - Unconditional: `X * (1-X) = 0` (degree 2)
 pub struct IsBitConstraint {
-    /// Column index for the condition (cond)
-    cond_col: usize,
+    /// Column index for the condition (None = unconditional)
+    cond_col: Option<usize>,
     /// Column index for the value to check (X)
     value_col: usize,
     /// Unique constraint identifier
@@ -51,29 +46,23 @@ pub struct IsBitConstraint {
 }
 
 impl IsBitConstraint {
-    /// Creates a new IS_BIT constraint.
+    /// Creates a conditional IS_BIT constraint.
     ///
-    /// # Arguments
-    /// * `cond_col` - Column index containing the condition flag
-    /// * `value_col` - Column index containing the value to check
-    /// * `constraint_idx` - Unique constraint identifier
+    /// Constraint: `cond * X * (1-X) = 0`
     pub fn new(cond_col: usize, value_col: usize, constraint_idx: usize) -> Self {
         Self {
-            cond_col,
+            cond_col: Some(cond_col),
             value_col,
             constraint_idx,
         }
     }
 
-    /// Creates an unconditional IS_BIT constraint (always active).
+    /// Creates an unconditional IS_BIT constraint.
     ///
-    /// Uses the value column itself as condition (since 0 or 1 as condition
-    /// still satisfies the constraint when the value is correct).
-    ///
-    /// For truly unconditional constraints, use a column that's always 1.
-    pub fn unconditional(value_col: usize, always_one_col: usize, constraint_idx: usize) -> Self {
+    /// Constraint: `X * (1-X) = 0`
+    pub fn unconditional(value_col: usize, constraint_idx: usize) -> Self {
         Self {
-            cond_col: always_one_col,
+            cond_col: None,
             value_col,
             constraint_idx,
         }
@@ -84,18 +73,29 @@ impl IsBitConstraint {
         F: IsSubFieldOf<E>,
         E: IsField,
     {
-        let cond = step.get_main_evaluation_element(0, self.cond_col).clone();
         let x = step.get_main_evaluation_element(0, self.value_col).clone();
         let one = FieldElement::<F>::one();
 
-        // cond * X * (1 - X)
-        &cond * &x * (one - x)
+        match self.cond_col {
+            Some(cond_col) => {
+                let cond = step.get_main_evaluation_element(0, cond_col).clone();
+                // cond * X * (1 - X)
+                &cond * &x * (one - x)
+            }
+            None => {
+                // X * (1 - X)
+                &x * (one - &x)
+            }
+        }
     }
 }
 
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for IsBitConstraint {
     fn degree(&self) -> usize {
-        3 // cubic: cond * X * (1-X)
+        match self.cond_col {
+            Some(_) => 3, // cubic: cond * X * (1-X)
+            None => 2,    // quadratic: X * (1-X)
+        }
     }
 
     fn constraint_idx(&self) -> usize {
@@ -137,6 +137,235 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for IsBitConstra
 // ADD Template (Embedded Carry Approach)
 // =========================================================================
 
+// -------------------------------------------------------------------------
+// AddOperand - Flexible operand representation for ADD constraints
+// -------------------------------------------------------------------------
+
+/// A term in a linear combination: coeff * column OR constant.
+///
+/// Uses i64 for coefficients to support negative values (e.g., `4 - 2*c`).
+/// Converted to FieldElement in eval().
+#[derive(Debug, Clone)]
+pub enum AddLinearTerm {
+    /// coefficient * column_value
+    Column {
+        /// Coefficient (can be negative, e.g., -2 for subtraction)
+        coefficient: i64,
+        /// Column index to read from
+        column: usize,
+    },
+    /// A constant value
+    Constant(i64),
+}
+
+/// An ADD operand representing a 64-bit value as [lo, hi] words.
+///
+/// Supports various representations:
+/// - DWordWL: 2 consecutive columns (most common case)
+/// - Linear: Arbitrary linear combinations for lo and hi limbs
+///
+/// The Linear variant handles:
+/// - Constants: `AddOperand::constant(42)` → lo=42, hi=0
+/// - Word → DWordWL: `AddOperand::from_word(col)` → lo=col, hi=0
+/// - DWordHL → DWordWL: `AddOperand::from_dword_hl(col)` → repack 4 halves
+/// - DWordBL → DWordWL: `AddOperand::from_dword_bl(col)` → repack 8 bytes
+/// - Expressions: `AddOperand::linear(...)` → arbitrary linear combinations
+#[derive(Debug, Clone)]
+pub enum AddOperand {
+    /// Two consecutive columns (DWordWL): evaluates to [col, col+1]
+    DWordWL { start_column: usize },
+
+    /// Linear combination for lo and hi limbs.
+    /// Handles: constants, single columns, expressions, and virtual columns.
+    Linear {
+        /// Terms for the low 32-bit word
+        lo: Vec<AddLinearTerm>,
+        /// Terms for the high 32-bit word (empty = zero)
+        hi: Vec<AddLinearTerm>,
+    },
+}
+
+/// Convert i64 to FieldElement (handles negative values via field negation).
+fn i64_to_fe<F: IsField>(val: i64) -> FieldElement<F> {
+    if val >= 0 {
+        FieldElement::from(val as u64)
+    } else {
+        -FieldElement::from((-val) as u64)
+    }
+}
+
+impl AddLinearTerm {
+    /// Evaluate this term using values from the trace.
+    fn eval<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        match self {
+            AddLinearTerm::Column { coefficient, column } => {
+                let col_val = step.get_main_evaluation_element(0, *column);
+                col_val * i64_to_fe::<F>(*coefficient)
+            }
+            AddLinearTerm::Constant(value) => i64_to_fe(*value),
+        }
+    }
+}
+
+/// Evaluate a slice of terms as a sum.
+fn eval_terms<F, E>(terms: &[AddLinearTerm], step: &TableView<F, E>) -> FieldElement<F>
+where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+{
+    if terms.is_empty() {
+        FieldElement::zero()
+    } else {
+        terms.iter().map(|t| t.eval(step)).fold(FieldElement::zero(), |acc, x| acc + x)
+    }
+}
+
+impl AddOperand {
+    /// Get the low word value from the trace.
+    pub fn eval_lo<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        match self {
+            AddOperand::DWordWL { start_column } => {
+                step.get_main_evaluation_element(0, *start_column).clone()
+            }
+            AddOperand::Linear { lo, .. } => eval_terms(lo, step),
+        }
+    }
+
+    /// Get the high word value from the trace.
+    pub fn eval_hi<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        match self {
+            AddOperand::DWordWL { start_column } => {
+                step.get_main_evaluation_element(0, *start_column + 1).clone()
+            }
+            AddOperand::Linear { hi, .. } => eval_terms(hi, step),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Convenience constructors for common cast types
+    // -------------------------------------------------------------------------
+
+    /// DWordWL: 2 consecutive columns [col, col+1].
+    pub fn dword(start_column: usize) -> Self {
+        AddOperand::DWordWL { start_column }
+    }
+
+    /// Constant: single value, zero-extended to 64 bits.
+    /// hi = 0 (since constants fit in 32 bits for VM use cases).
+    pub fn constant(value: i64) -> Self {
+        AddOperand::Linear {
+            lo: vec![AddLinearTerm::Constant(value)],
+            hi: vec![],
+        }
+    }
+
+    /// Word → DWordWL: single column, zero-extended.
+    /// hi = 0.
+    pub fn from_word(col: usize) -> Self {
+        AddOperand::Linear {
+            lo: vec![AddLinearTerm::Column {
+                coefficient: 1,
+                column: col,
+            }],
+            hi: vec![],
+        }
+    }
+
+    /// DWordHL → DWordWL: repack 4 half-words into 2 words.
+    /// lo = h[0] + 2^16 * h[1]
+    /// hi = h[2] + 2^16 * h[3]
+    pub fn from_dword_hl(start_column: usize) -> Self {
+        AddOperand::Linear {
+            lo: vec![
+                AddLinearTerm::Column {
+                    coefficient: 1,
+                    column: start_column,
+                },
+                AddLinearTerm::Column {
+                    coefficient: 1 << 16,
+                    column: start_column + 1,
+                },
+            ],
+            hi: vec![
+                AddLinearTerm::Column {
+                    coefficient: 1,
+                    column: start_column + 2,
+                },
+                AddLinearTerm::Column {
+                    coefficient: 1 << 16,
+                    column: start_column + 3,
+                },
+            ],
+        }
+    }
+
+    /// DWordBL → DWordWL: repack 8 bytes into 2 words.
+    /// lo = b[0] + 2^8*b[1] + 2^16*b[2] + 2^24*b[3]
+    /// hi = b[4] + 2^8*b[5] + 2^16*b[6] + 2^24*b[7]
+    pub fn from_dword_bl(start_column: usize) -> Self {
+        AddOperand::Linear {
+            lo: vec![
+                AddLinearTerm::Column {
+                    coefficient: 1,
+                    column: start_column,
+                },
+                AddLinearTerm::Column {
+                    coefficient: 1 << 8,
+                    column: start_column + 1,
+                },
+                AddLinearTerm::Column {
+                    coefficient: 1 << 16,
+                    column: start_column + 2,
+                },
+                AddLinearTerm::Column {
+                    coefficient: 1 << 24,
+                    column: start_column + 3,
+                },
+            ],
+            hi: vec![
+                AddLinearTerm::Column {
+                    coefficient: 1,
+                    column: start_column + 4,
+                },
+                AddLinearTerm::Column {
+                    coefficient: 1 << 8,
+                    column: start_column + 5,
+                },
+                AddLinearTerm::Column {
+                    coefficient: 1 << 16,
+                    column: start_column + 6,
+                },
+                AddLinearTerm::Column {
+                    coefficient: 1 << 24,
+                    column: start_column + 7,
+                },
+            ],
+        }
+    }
+
+    /// Creates a Linear operand from explicit lo/hi term lists.
+    /// Use this for complex expressions like `4 - 2*c` or virtual columns.
+    pub fn linear(lo: Vec<AddLinearTerm>, hi: Vec<AddLinearTerm>) -> Self {
+        AddOperand::Linear { lo, hi }
+    }
+}
+
+// -------------------------------------------------------------------------
+// AddConstraint
+// -------------------------------------------------------------------------
+
 /// 64-bit addition constraint with embedded carry.
 ///
 /// Enforces: `lhs + rhs = sum (mod 2^64)`
@@ -159,12 +388,12 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for IsBitConstra
 pub struct AddConstraint {
     /// Column index for condition flag
     cond_col: usize,
-    /// Starting column index for lhs (2 consecutive columns)
-    lhs_start_col: usize,
-    /// Starting column index for rhs (2 consecutive columns)
-    rhs_start_col: usize,
-    /// Starting column index for sum (2 consecutive columns)
-    sum_start_col: usize,
+    /// Left-hand side operand (flexible representation)
+    lhs: AddOperand,
+    /// Right-hand side operand (flexible representation)
+    rhs: AddOperand,
+    /// Sum/output operand (flexible representation)
+    sum: AddOperand,
     /// Which carry constraint this is (0 or 1)
     carry_idx: usize,
     /// Unique constraint identifier
@@ -175,27 +404,34 @@ impl AddConstraint {
     /// Creates ADD constraints for both carries.
     ///
     /// Returns two constraints: one for carry_0 and one for carry_1.
+    ///
+    /// # Arguments
+    /// * `cond_col` - Column index for the condition flag
+    /// * `lhs` - Left-hand side operand (flexible representation)
+    /// * `rhs` - Right-hand side operand (flexible representation)
+    /// * `sum` - Sum/output operand (flexible representation)
+    /// * `constraint_idx_start` - Starting constraint index (uses 2 consecutive indices)
     pub fn new_pair(
         cond_col: usize,
-        lhs_start_col: usize,
-        rhs_start_col: usize,
-        sum_start_col: usize,
+        lhs: AddOperand,
+        rhs: AddOperand,
+        sum: AddOperand,
         constraint_idx_start: usize,
     ) -> (Self, Self) {
         let carry_0 = Self {
             cond_col,
-            lhs_start_col,
-            rhs_start_col,
-            sum_start_col,
+            lhs: lhs.clone(),
+            rhs: rhs.clone(),
+            sum: sum.clone(),
             carry_idx: 0,
             constraint_idx: constraint_idx_start,
         };
 
         let carry_1 = Self {
             cond_col,
-            lhs_start_col,
-            rhs_start_col,
-            sum_start_col,
+            lhs,
+            rhs,
+            sum,
             carry_idx: 1,
             constraint_idx: constraint_idx_start + 1,
         };
@@ -209,9 +445,9 @@ impl AddConstraint {
         F: IsSubFieldOf<E>,
         E: IsField,
     {
-        let lhs_lo = step.get_main_evaluation_element(0, self.lhs_start_col);
-        let rhs_lo = step.get_main_evaluation_element(0, self.rhs_start_col);
-        let sum_lo = step.get_main_evaluation_element(0, self.sum_start_col);
+        let lhs_lo = self.lhs.eval_lo(step);
+        let rhs_lo = self.rhs.eval_lo(step);
+        let sum_lo = self.sum.eval_lo(step);
 
         // carry_0 = (lhs_lo + rhs_lo - sum_lo) * 2^(-32)
         let inv_2_32: FieldElement<F> = FieldElement::from(SHIFT_32).inv().unwrap();
@@ -224,9 +460,9 @@ impl AddConstraint {
         F: IsSubFieldOf<E>,
         E: IsField,
     {
-        let lhs_hi = step.get_main_evaluation_element(0, self.lhs_start_col + 1);
-        let rhs_hi = step.get_main_evaluation_element(0, self.rhs_start_col + 1);
-        let sum_hi = step.get_main_evaluation_element(0, self.sum_start_col + 1);
+        let lhs_hi = self.lhs.eval_hi(step);
+        let rhs_hi = self.rhs.eval_hi(step);
+        let sum_hi = self.sum.eval_hi(step);
         let carry_0 = self.compute_carry_0(step);
 
         // carry_1 = (lhs_hi + rhs_hi + carry_0 - sum_hi) * 2^(-32)
@@ -300,24 +536,22 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for AddConstrain
 // Helper Functions
 // =========================================================================
 
-/// Creates multiple IS_BIT constraints for consecutive columns.
+/// Creates multiple unconditional IS_BIT constraints for the given columns.
 ///
 /// # Arguments
-/// * `cond_col` - Column index for the condition flag
 /// * `value_cols` - Slice of column indices to constrain
 /// * `constraint_idx_start` - Starting index for constraint numbering
 ///
 /// # Returns
 /// Vector of IS_BIT constraints and the next available constraint index.
 pub fn new_is_bit_constraints(
-    cond_col: usize,
     value_cols: &[usize],
     constraint_idx_start: usize,
 ) -> (Vec<IsBitConstraint>, usize) {
     let constraints = value_cols
         .iter()
         .enumerate()
-        .map(|(i, &col)| IsBitConstraint::new(cond_col, col, constraint_idx_start + i))
+        .map(|(i, &col)| IsBitConstraint::unconditional(col, constraint_idx_start + i))
         .collect();
 
     (constraints, constraint_idx_start + value_cols.len())
