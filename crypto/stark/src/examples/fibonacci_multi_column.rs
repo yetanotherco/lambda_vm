@@ -10,30 +10,44 @@ use crate::{
     trace::TraceTable,
     traits::{AIR, TransitionEvaluationContext},
 };
-use math::field::{element::FieldElement, traits::IsFFTField};
+use math::field::{
+    element::FieldElement,
+    traits::{IsFFTField, IsField, IsSubFieldOf},
+};
 
 /// Transition constraint for a single Fibonacci column.
 /// Enforces: col[i+2] = col[i+1] + col[i]
 #[derive(Clone)]
-pub struct FibColumnConstraint<F: IsFFTField> {
+pub struct FibColumnConstraint<F, E>
+where
+    F: IsSubFieldOf<E> + IsFFTField + Send + Sync,
+    E: IsField + Send + Sync,
+{
     column_idx: usize,
     constraint_idx: usize,
-    phantom: PhantomData<F>,
+    phantom_f: PhantomData<F>,
+    phantom_e: PhantomData<E>,
 }
 
-impl<F: IsFFTField> FibColumnConstraint<F> {
+impl<F, E> FibColumnConstraint<F, E>
+where
+    F: IsSubFieldOf<E> + IsFFTField + Send + Sync,
+    E: IsField + Send + Sync,
+{
     pub fn new(column_idx: usize, constraint_idx: usize) -> Self {
         Self {
             column_idx,
             constraint_idx,
-            phantom: PhantomData,
+            phantom_f: PhantomData,
+            phantom_e: PhantomData,
         }
     }
 }
 
-impl<F> TransitionConstraint<F, F> for FibColumnConstraint<F>
+impl<F, E> TransitionConstraint<F, E> for FibColumnConstraint<F, E>
 where
-    F: IsFFTField + Send + Sync,
+    F: IsSubFieldOf<E> + IsFFTField + Send + Sync,
+    E: IsField + Send + Sync,
 {
     fn degree(&self) -> usize {
         1
@@ -49,35 +63,49 @@ where
 
     fn evaluate(
         &self,
-        evaluation_context: &TransitionEvaluationContext<F, F>,
-        transition_evaluations: &mut [FieldElement<F>],
+        evaluation_context: &TransitionEvaluationContext<F, E>,
+        transition_evaluations: &mut [FieldElement<E>],
     ) {
-        let (frame, _periodic_values, _rap_challenges) = match evaluation_context {
+        match evaluation_context {
             TransitionEvaluationContext::Prover {
                 frame,
-                periodic_values,
-                rap_challenges,
+                periodic_values: _,
+                rap_challenges: _,
+            } => {
+                let step_0 = frame.get_evaluation_step(0);
+                let step_1 = frame.get_evaluation_step(1);
+                let step_2 = frame.get_evaluation_step(2);
+
+                // Get the values from the column at each step
+                let a0 = step_0.get_main_evaluation_element(0, self.column_idx);
+                let a1 = step_1.get_main_evaluation_element(0, self.column_idx);
+                let a2 = step_2.get_main_evaluation_element(0, self.column_idx);
+
+                // Constraint: a2 = a1 + a0  =>  a2 - a1 - a0 = 0
+                let res = a2 - a1 - a0;
+
+                transition_evaluations[self.constraint_idx] = res.to_extension();
             }
-            | TransitionEvaluationContext::Verifier {
+            TransitionEvaluationContext::Verifier {
                 frame,
-                periodic_values,
-                rap_challenges,
-            } => (frame, periodic_values, rap_challenges),
-        };
+                periodic_values: _,
+                rap_challenges: _,
+            } => {
+                let step_0 = frame.get_evaluation_step(0);
+                let step_1 = frame.get_evaluation_step(1);
+                let step_2 = frame.get_evaluation_step(2);
 
-        let step_0 = frame.get_evaluation_step(0);
-        let step_1 = frame.get_evaluation_step(1);
-        let step_2 = frame.get_evaluation_step(2);
+                // Get the values from the column at each step
+                let a0 = step_0.get_main_evaluation_element(0, self.column_idx);
+                let a1 = step_1.get_main_evaluation_element(0, self.column_idx);
+                let a2 = step_2.get_main_evaluation_element(0, self.column_idx);
 
-        // Get the values from the column at each step
-        let a0 = step_0.get_main_evaluation_element(0, self.column_idx);
-        let a1 = step_1.get_main_evaluation_element(0, self.column_idx);
-        let a2 = step_2.get_main_evaluation_element(0, self.column_idx);
+                // Constraint: a2 = a1 + a0  =>  a2 - a1 - a0 = 0
+                let res = a2 - a1 - a0;
 
-        // Constraint: a2 = a1 + a0  =>  a2 - a1 - a0 = 0
-        let res = a2 - a1 - a0;
-
-        transition_evaluations[self.constraint_idx] = res;
+                transition_evaluations[self.constraint_idx] = res;
+            }
+        }
     }
 }
 
@@ -91,21 +119,23 @@ pub struct FibonacciMultiColumnPublicInputs<F: IsFFTField> {
 
 /// Multi-column Fibonacci AIR.
 /// Each column contains an independent Fibonacci sequence.
-pub struct FibonacciMultiColumnAIR<F>
+pub struct FibonacciMultiColumnAIR<F, E>
 where
-    F: IsFFTField,
+    F: IsSubFieldOf<E> + IsFFTField + Send + Sync,
+    E: IsField + Send + Sync,
 {
     context: AirContext,
-    constraints: Vec<Box<dyn TransitionConstraint<F, F>>>,
+    constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
     num_columns: usize,
 }
 
-impl<F> AIR for FibonacciMultiColumnAIR<F>
+impl<F, E> AIR for FibonacciMultiColumnAIR<F, E>
 where
-    F: IsFFTField + Send + Sync + 'static,
+    F: IsSubFieldOf<E> + IsFFTField + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
 {
     type Field = F;
-    type FieldExtension = F;
+    type FieldExtension = E;
     type PublicInputs = FibonacciMultiColumnPublicInputs<Self::Field>;
 
     fn step_size(&self) -> usize {
@@ -121,25 +151,25 @@ where
         trace_length
     }
 
-    fn transition_constraints(&self) -> &Vec<Box<dyn TransitionConstraint<F, F>>> {
+    fn transition_constraints(&self) -> &Vec<Box<dyn TransitionConstraint<F, E>>> {
         &self.constraints
     }
 
     fn boundary_constraints(
         &self,
         pub_inputs: &Self::PublicInputs,
-        _rap_challenges: &[FieldElement<Self::Field>],
+        _rap_challenges: &[FieldElement<Self::FieldExtension>],
         _bus_public_inputs: Option<&crate::lookup::BusPublicInputs<Self::FieldExtension>>,
         _trace_length: usize,
-    ) -> BoundaryConstraints<Self::Field> {
+    ) -> BoundaryConstraints<Self::FieldExtension> {
         let mut constraints = Vec::new();
 
         // For each column, add boundary constraints for the first two rows
         for (col_idx, (a0, a1)) in pub_inputs.initial_values.iter().enumerate() {
             // First value (row 0)
-            constraints.push(BoundaryConstraint::new_main(col_idx, 0, a0.clone()));
+            constraints.push(BoundaryConstraint::new_main(col_idx, 0, a0.clone().to_extension()));
             // Second value (row 1)
-            constraints.push(BoundaryConstraint::new_main(col_idx, 1, a1.clone()));
+            constraints.push(BoundaryConstraint::new_main(col_idx, 1, a1.clone().to_extension()));
         }
 
         BoundaryConstraints::from_constraints(constraints)
@@ -154,17 +184,18 @@ where
     }
 }
 
-impl<F> FibonacciMultiColumnAIR<F>
+impl<F, E> FibonacciMultiColumnAIR<F, E>
 where
-    F: IsFFTField + Send + Sync + 'static,
+    F: IsSubFieldOf<E> + IsFFTField + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
 {
     /// Creates a new multi-column Fibonacci AIR with the specified number of columns.
     pub fn with_num_columns(proof_options: &ProofOptions, num_columns: usize) -> Self {
         // Create one constraint per column
-        let constraints: Vec<Box<dyn TransitionConstraint<F, F>>> = (0..num_columns)
+        let constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = (0..num_columns)
             .map(|col_idx| {
                 Box::new(FibColumnConstraint::new(col_idx, col_idx))
-                    as Box<dyn TransitionConstraint<F, F>>
+                    as Box<dyn TransitionConstraint<F, E>>
             })
             .collect();
 
@@ -193,10 +224,14 @@ where
 ///
 /// # Returns
 /// A TraceTable with `num_columns` columns and `trace_length` rows.
-pub fn compute_trace<F: IsFFTField>(
+pub fn compute_trace<F, E>(
     initial_values: &[(FieldElement<F>, FieldElement<F>)],
     trace_length: usize,
-) -> TraceTable<F, F> {
+) -> TraceTable<F, E>
+where
+    F: IsSubFieldOf<E> + IsFFTField + Send + Sync,
+    E: IsField + Send + Sync,
+{
     let num_columns = initial_values.len();
     let mut columns: Vec<Vec<FieldElement<F>>> = Vec::with_capacity(num_columns);
 

@@ -2,8 +2,9 @@ use crate::field::{
     element::FieldElement,
     errors::FieldError,
     fields::fft_friendly::u64_goldilocks::U64GoldilocksPrimeField,
-    traits::{IsField, IsSubFieldOf},
+    traits::{HasDefaultTranscript, IsFFTField, IsField, IsSubFieldOf},
 };
+use crate::traits::{AsBytes, ByteConversion};
 
 // =====================================================
 // QUADRATIC EXTENSION (Fp2)
@@ -155,6 +156,91 @@ impl Fp2E {
     /// Returns the conjugate of self: conjugate(a0 + a1*w) = a0 - a1*w
     pub fn conjugate(&self) -> Self {
         Self::new([self.value()[0], -self.value()[1]])
+    }
+}
+
+impl ByteConversion for Fp2E {
+    #[cfg(feature = "alloc")]
+    fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
+        let mut byte_slice = ByteConversion::to_bytes_be(&self.value()[0]);
+        byte_slice.extend(ByteConversion::to_bytes_be(&self.value()[1]));
+        byte_slice
+    }
+
+    #[cfg(feature = "alloc")]
+    fn to_bytes_le(&self) -> alloc::vec::Vec<u8> {
+        let mut byte_slice = ByteConversion::to_bytes_le(&self.value()[0]);
+        byte_slice.extend(ByteConversion::to_bytes_le(&self.value()[1]));
+        byte_slice
+    }
+
+    fn from_bytes_be(bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
+    where
+        Self: Sized,
+    {
+        const BYTES_PER_FIELD: usize = 8;
+        let x0 = FieldElement::from_bytes_be(&bytes[0..BYTES_PER_FIELD])?;
+        let x1 = FieldElement::from_bytes_be(&bytes[BYTES_PER_FIELD..BYTES_PER_FIELD * 2])?;
+
+        Ok(Self::new([x0, x1]))
+    }
+
+    fn from_bytes_le(bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
+    where
+        Self: Sized,
+    {
+        const BYTES_PER_FIELD: usize = 8;
+        let x0 = FieldElement::from_bytes_le(&bytes[0..BYTES_PER_FIELD])?;
+        let x1 = FieldElement::from_bytes_le(&bytes[BYTES_PER_FIELD..BYTES_PER_FIELD * 2])?;
+
+        Ok(Self::new([x0, x1]))
+    }
+}
+
+impl AsBytes for Fp2E {
+    fn as_bytes(&self) -> alloc::vec::Vec<u8> {
+        self.to_bytes_be()
+    }
+}
+
+impl IsFFTField for Degree2GoldilocksExtensionField {
+    // Same two-adicity as the base Goldilocks field
+    const TWO_ADICITY: u64 = 32;
+
+    // 2^32-th primitive root of unity in the quadratic extension.
+    // We embed the base field's root of unity into Fp2 as (ω, 0).
+    // The base field root is 1753635133440165772.
+    const TWO_ADIC_PRIMITVE_ROOT_OF_UNITY: Self::BaseType = [
+        FpE::from_hex_unchecked("1851f41b4234c69c"),
+        FpE::from_hex_unchecked("0"),
+    ];
+
+    fn field_name() -> &'static str {
+        "Degree2GoldilocksExtension"
+    }
+}
+
+impl HasDefaultTranscript for Degree2GoldilocksExtensionField {
+    fn get_random_field_element_from_rng(rng: &mut impl rand::Rng) -> FieldElement<Self> {
+        // Goldilocks Prime p = 2^64 - 2^32 + 1
+        const MODULUS: u64 = 0xFFFFFFFF00000001;
+
+        let mut sample = [0u8; 8];
+
+        let mut coeffs = [FpE::zero(), FpE::zero()];
+
+        for coeff in &mut coeffs {
+            loop {
+                rng.fill(&mut sample);
+                let candidate = u64::from_le_bytes(sample);
+                if candidate < MODULUS {
+                    *coeff = FpE::from(candidate);
+                    break;
+                }
+            }
+        }
+
+        FieldElement::new(coeffs)
     }
 }
 

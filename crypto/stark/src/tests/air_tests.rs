@@ -6,8 +6,8 @@ use math::field::{
 };
 
 use math::field::fields::fft_friendly::{
-    babybear::Babybear31PrimeField, quartic_babybear::Degree4BabyBearExtensionField,
-    u64_goldilocks::U64GoldilocksPrimeField,
+    babybear::Babybear31PrimeField, extensions_goldilocks::Degree2GoldilocksExtensionField,
+    quartic_babybear::Degree4BabyBearExtensionField, u64_goldilocks::U64GoldilocksPrimeField,
 };
 
 use crate::traits::AIR;
@@ -553,8 +553,9 @@ fn test_multi_prove_different_airs() {
 }
 
 // Type aliases for multi-column Fibonacci tests
-type F = U64GoldilocksPrimeField;
-type FE = FieldElement<F>;
+type GoldilocksField = U64GoldilocksPrimeField;
+type GoldilocksExt = Degree2GoldilocksExtensionField;
+type GoldilocksFE = FieldElement<GoldilocksField>;
 
 #[test]
 fn test_multi_column_fibonacci_2_cols() {
@@ -563,26 +564,37 @@ fn test_multi_column_fibonacci_2_cols() {
     let trace_length = 16;
 
     // Create initial values for each column
-    let initial_values: Vec<(FE, FE)> = (0..num_columns)
-        .map(|i| (FE::from((i + 1) as u64), FE::from((i + 2) as u64)))
+    let initial_values: Vec<(GoldilocksFE, GoldilocksFE)> = (0..num_columns)
+        .map(|i| {
+            (
+                GoldilocksFE::from((i + 1) as u64),
+                GoldilocksFE::from((i + 2) as u64),
+            )
+        })
         .collect();
 
-    let mut trace = fibonacci_multi_column::compute_trace(&initial_values, trace_length);
+    let mut trace = fibonacci_multi_column::compute_trace::<GoldilocksField, GoldilocksExt>(
+        &initial_values,
+        trace_length,
+    );
     let pub_inputs = fibonacci_multi_column::create_public_inputs(initial_values);
-    let air = FibonacciMultiColumnAIR::<F>::with_num_columns(&proof_options, num_columns);
+    let air = FibonacciMultiColumnAIR::<GoldilocksField, GoldilocksExt>::with_num_columns(
+        &proof_options,
+        num_columns,
+    );
 
-    let proof = Prover::<F, F, _>::prove(
+    let proof = Prover::<GoldilocksField, GoldilocksExt, _>::prove(
         &air,
         &mut trace,
         &pub_inputs,
-        &mut DefaultTranscript::<F>::new(&[]),
+        &mut DefaultTranscript::<GoldilocksExt>::new(&[]),
     )
     .unwrap();
 
-    assert!(Verifier::<F, F, _>::verify(
+    assert!(Verifier::<GoldilocksField, GoldilocksExt, _>::verify(
         &proof,
         &air,
-        &mut DefaultTranscript::<F>::new(&[])
+        &mut DefaultTranscript::<GoldilocksExt>::new(&[])
     ));
 }
 
@@ -592,25 +604,36 @@ fn test_multi_column_fibonacci_4_cols() {
     let num_columns = 4;
     let trace_length = 16;
 
-    let initial_values: Vec<(FE, FE)> = (0..num_columns)
-        .map(|i| (FE::from((i + 1) as u64), FE::from((i + 2) as u64)))
+    let initial_values: Vec<(GoldilocksFE, GoldilocksFE)> = (0..num_columns)
+        .map(|i| {
+            (
+                GoldilocksFE::from((i + 1) as u64),
+                GoldilocksFE::from((i + 2) as u64),
+            )
+        })
         .collect();
 
-    let mut trace = fibonacci_multi_column::compute_trace(&initial_values, trace_length);
+    let mut trace = fibonacci_multi_column::compute_trace::<GoldilocksField, GoldilocksExt>(
+        &initial_values,
+        trace_length,
+    );
     let pub_inputs = fibonacci_multi_column::create_public_inputs(initial_values);
-    let air = FibonacciMultiColumnAIR::<F>::with_num_columns(&proof_options, num_columns);
+    let air = FibonacciMultiColumnAIR::<GoldilocksField, GoldilocksExt>::with_num_columns(
+        &proof_options,
+        num_columns,
+    );
 
-    let proof = Prover::<F, F, _>::prove(
+    let proof = Prover::<GoldilocksField, GoldilocksExt, _>::prove(
         &air,
         &mut trace,
         &pub_inputs,
-        &mut DefaultTranscript::<F>::new(&[]),
+        &mut DefaultTranscript::<GoldilocksExt>::new(&[]),
     )
     .unwrap();
 
-    assert!(Verifier::<F, F, _>::verify(
+    assert!(Verifier::<GoldilocksField, GoldilocksExt, _>::verify(
         &proof,
         &air,
-        &mut DefaultTranscript::<F>::new(&[])
+        &mut DefaultTranscript::<GoldilocksExt>::new(&[])
     ));
 }

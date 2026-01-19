@@ -1,6 +1,7 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
+use math::field::fields::fft_friendly::extensions_goldilocks::Degree2GoldilocksExtensionField;
 use math::field::fields::fft_friendly::u64_goldilocks::U64GoldilocksPrimeField;
 use stark::examples::fibonacci_multi_column::{
     FibonacciMultiColumnAIR, FibonacciMultiColumnPublicInputs, compute_trace, create_public_inputs,
@@ -11,6 +12,7 @@ use stark::prover::{IsStarkProver, Prover};
 use stark::verifier::{IsStarkVerifier, Verifier};
 
 type F = U64GoldilocksPrimeField;
+type E = Degree2GoldilocksExtensionField;
 type FE = FieldElement<F>;
 
 /// Configuration for a benchmark case
@@ -66,20 +68,20 @@ fn benchmark_proof_options() -> ProofOptions {
 fn generate_proof(
     config: &BenchConfig,
 ) -> (
-    StarkProof<F, F, FibonacciMultiColumnPublicInputs<F>>,
-    FibonacciMultiColumnAIR<F>,
+    StarkProof<F, E, FibonacciMultiColumnPublicInputs<F>>,
+    FibonacciMultiColumnAIR<F, E>,
 ) {
     let proof_options = benchmark_proof_options();
     let initial_values = create_initial_values(config.num_columns);
-    let mut trace = compute_trace(&initial_values, config.trace_length);
+    let mut trace = compute_trace::<F, E>(&initial_values, config.trace_length);
     let pub_inputs = create_public_inputs(initial_values);
-    let air = FibonacciMultiColumnAIR::<F>::with_num_columns(&proof_options, config.num_columns);
+    let air = FibonacciMultiColumnAIR::<F, E>::with_num_columns(&proof_options, config.num_columns);
 
-    let proof = Prover::<F, F, _>::prove(
+    let proof = Prover::<F, E, _>::prove(
         &air,
         &mut trace,
         &pub_inputs,
-        &mut DefaultTranscript::<F>::new(&[]),
+        &mut DefaultTranscript::<E>::new(&[]),
     )
     .unwrap();
 
@@ -97,20 +99,20 @@ fn bench_prove(c: &mut Criterion, group_name: &str, config: &BenchConfig) {
             b.iter_with_setup(
                 || {
                     let initial_values = create_initial_values(config.num_columns);
-                    let trace = compute_trace(&initial_values, config.trace_length);
+                    let trace = compute_trace::<F, E>(&initial_values, config.trace_length);
                     let pub_inputs = create_public_inputs(initial_values);
-                    let air = FibonacciMultiColumnAIR::<F>::with_num_columns(
+                    let air = FibonacciMultiColumnAIR::<F, E>::with_num_columns(
                         &proof_options,
                         config.num_columns,
                     );
                     (trace, pub_inputs, air)
                 },
                 |(mut trace, pub_inputs, air)| {
-                    Prover::<F, F, _>::prove(
+                    Prover::<F, E, _>::prove(
                         &air,
                         &mut trace,
                         &pub_inputs,
-                        &mut DefaultTranscript::<F>::new(&[]),
+                        &mut DefaultTranscript::<E>::new(&[]),
                     )
                     .unwrap()
                 },
@@ -129,7 +131,7 @@ fn bench_verify(c: &mut Criterion, group_name: &str, config: &BenchConfig) {
         &(proof, air),
         |b, (proof, air)| {
             b.iter(|| {
-                Verifier::<F, F, _>::verify(proof, air, &mut DefaultTranscript::<F>::new(&[]))
+                Verifier::<F, E, _>::verify(proof, air, &mut DefaultTranscript::<E>::new(&[]))
             })
         },
     );
