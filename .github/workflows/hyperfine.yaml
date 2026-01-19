@@ -44,6 +44,8 @@ jobs:
         run: |
           cd executor && make -j compile-bench
           mkdir -p ${{ matrix.branch }}_programs
+          ls
+          ls exectuor/program_artifacts/bench
           cp executor/program_artifacts/bench/*.elf ${{ matrix.branch }}_programs
 
       - name: Export benchmark hashes
