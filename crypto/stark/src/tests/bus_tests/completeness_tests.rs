@@ -415,7 +415,11 @@ fn test_bus_value_features() {
             LinearTerm::Constant(5),
         ]));
         let build_data = AuxiliaryTraceBuildData {
-            interactions: vec![BusInteraction::sender(Multiplicity::Column(0), values)],
+            interactions: vec![BusInteraction::sender(
+                0u64,
+                Multiplicity::Column(0),
+                values,
+            )],
         };
         let proof_options = ProofOptions::default_test_options();
         AirWithBuses::<F, E, NullBoundaryConstraintBuilder, ()>::new(
@@ -440,7 +444,11 @@ fn test_bus_value_features() {
             LinearTerm::Constant(5),
         ]));
         let build_data = AuxiliaryTraceBuildData {
-            interactions: vec![BusInteraction::receiver(Multiplicity::Column(4), values)],
+            interactions: vec![BusInteraction::receiver(
+                0u64,
+                Multiplicity::Column(4),
+                values,
+            )],
         };
         let proof_options = ProofOptions::default_test_options();
         AirWithBuses::<F, E, NullBoundaryConstraintBuilder, ()>::new(
