@@ -42,11 +42,9 @@ jobs:
       - name: Build programs
         if: ${{ steps.cache.outputs.cache-hit != 'true' }}
         run: |
-          cd executor && make -j compile-bench
           mkdir -p ${{ matrix.branch }}_programs
-          ls
-          ls exectuor/program_artifacts/bench
-          cp executor/program_artifacts/bench/*.elf ${{ matrix.branch }}_programs
+          cd executor && make -j compile-bench
+          cp program_artifacts/bench/*.elf ../${{ matrix.branch }}_programs
 
       - name: Export benchmark hashes
         id: export-hashes
