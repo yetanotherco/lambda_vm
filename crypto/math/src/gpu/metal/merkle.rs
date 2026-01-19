@@ -97,7 +97,11 @@ impl MetalMerkleTree {
         encoder.set_buffer(1, Some(&output_buffer), 0);
 
         let n_u32 = n as u32;
-        encoder.set_bytes(2, core::mem::size_of::<u32>() as u64, &n_u32 as *const u32 as *const _);
+        encoder.set_bytes(
+            2,
+            core::mem::size_of::<u32>() as u64,
+            &n_u32 as *const u32 as *const _,
+        );
 
         // Dispatch threads
         let threadgroup_size = self.state.recommended_threadgroup_size().min(n);
@@ -209,7 +213,11 @@ mod tests {
             let leaves: Vec<Fp> = (1..=8).map(|i| Fp::from(i as u64)).collect();
             let result = merkle.build_root_only(&leaves);
 
-            assert!(result.is_ok(), "Failed to build Merkle tree: {:?}", result.err());
+            assert!(
+                result.is_ok(),
+                "Failed to build Merkle tree: {:?}",
+                result.err()
+            );
             let root = result.unwrap();
             println!("Root: {:?}", root.value());
 

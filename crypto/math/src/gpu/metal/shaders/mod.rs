@@ -83,17 +83,21 @@ fn create_pipeline(
     library: &Library,
     kernel_name: &str,
 ) -> Result<ComputePipelineState, MetalError> {
-    let function = library
-        .get_function(kernel_name, None)
-        .map_err(|e| MetalError::ShaderCompilationFailed(
-            format!("Failed to get function '{}': {}", kernel_name, e)
-        ))?;
+    let function = library.get_function(kernel_name, None).map_err(|e| {
+        MetalError::ShaderCompilationFailed(format!(
+            "Failed to get function '{}': {}",
+            kernel_name, e
+        ))
+    })?;
 
     device
         .new_compute_pipeline_state_with_function(&function)
-        .map_err(|e| MetalError::PipelineCreationFailed(
-            format!("Failed to create pipeline for '{}': {}", kernel_name, e)
-        ))
+        .map_err(|e| {
+            MetalError::PipelineCreationFailed(format!(
+                "Failed to create pipeline for '{}': {}",
+                kernel_name, e
+            ))
+        })
 }
 
 #[cfg(test)]
@@ -105,7 +109,11 @@ mod tests {
     fn test_pipeline_creation() {
         if let Ok(state) = MetalState::new() {
             let pipelines = FFTPipelines::new(&state.device, &state.library);
-            assert!(pipelines.is_ok(), "Failed to create pipelines: {:?}", pipelines.err());
+            assert!(
+                pipelines.is_ok(),
+                "Failed to create pipelines: {:?}",
+                pipelines.err()
+            );
         }
     }
 }

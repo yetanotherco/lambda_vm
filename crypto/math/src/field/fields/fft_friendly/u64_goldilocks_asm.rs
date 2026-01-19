@@ -96,11 +96,7 @@ pub fn sub_fast(a: u64, b: u64) -> u64 {
 /// -a mod p = (0 - a) mod p
 #[inline(always)]
 pub fn neg(a: u64) -> u64 {
-    if a == 0 {
-        0
-    } else {
-        sub_fast(0, a)
-    }
+    if a == 0 { 0 } else { sub_fast(0, a) }
 }
 
 /// Double a value: 2a mod p.
@@ -175,7 +171,11 @@ mod tests {
     use super::*;
 
     fn canonicalize(x: u64) -> u64 {
-        if x >= GOLDILOCKS_PRIME { x - GOLDILOCKS_PRIME } else { x }
+        if x >= GOLDILOCKS_PRIME {
+            x - GOLDILOCKS_PRIME
+        } else {
+            x
+        }
     }
 
     fn native_mul(a: u64, b: u64) -> u64 {
@@ -189,19 +189,31 @@ mod tests {
         let t0 = if borrow { t0.wrapping_sub(EPSILON) } else { t0 };
         let t1 = x_hi_lo.wrapping_mul(EPSILON);
         let (result, carry) = t0.overflowing_add(t1);
-        if carry { result.wrapping_add(EPSILON) } else { result }
+        if carry {
+            result.wrapping_add(EPSILON)
+        } else {
+            result
+        }
     }
 
     fn native_add(a: u64, b: u64) -> u64 {
         let (sum, over) = a.overflowing_add(b);
         let (sum, over2) = sum.overflowing_add((over as u64) * EPSILON);
-        if over2 { sum.wrapping_add(EPSILON) } else { sum }
+        if over2 {
+            sum.wrapping_add(EPSILON)
+        } else {
+            sum
+        }
     }
 
     fn native_sub(a: u64, b: u64) -> u64 {
         let (diff, under) = a.overflowing_sub(b);
         let (diff, under2) = diff.overflowing_sub((under as u64) * EPSILON);
-        if under2 { diff.wrapping_sub(EPSILON) } else { diff }
+        if under2 {
+            diff.wrapping_sub(EPSILON)
+        } else {
+            diff
+        }
     }
 
     #[test]
@@ -222,8 +234,13 @@ mod tests {
             let fast = add_fast(a, b);
             let native = native_add(a, b);
             assert_eq!(
-                canonicalize(fast), canonicalize(native),
-                "add_fast mismatch for a={}, b={}: fast={}, native={}", a, b, fast, native
+                canonicalize(fast),
+                canonicalize(native),
+                "add_fast mismatch for a={}, b={}: fast={}, native={}",
+                a,
+                b,
+                fast,
+                native
             );
         }
     }
@@ -244,8 +261,13 @@ mod tests {
             let fast = sub_fast(a, b);
             let native = native_sub(a, b);
             assert_eq!(
-                canonicalize(fast), canonicalize(native),
-                "sub_fast mismatch for a={}, b={}: fast={}, native={}", a, b, fast, native
+                canonicalize(fast),
+                canonicalize(native),
+                "sub_fast mismatch for a={}, b={}: fast={}, native={}",
+                a,
+                b,
+                fast,
+                native
             );
         }
     }
@@ -265,8 +287,11 @@ mod tests {
             let result = mul(a, b);
             let native = native_mul(a, b);
             assert_eq!(
-                canonicalize(result), canonicalize(native),
-                "mul mismatch for a={}, b={}", a, b
+                canonicalize(result),
+                canonicalize(native),
+                "mul mismatch for a={}, b={}",
+                a,
+                b
             );
         }
     }
@@ -279,8 +304,12 @@ mod tests {
             let neg_a = neg(a);
             let sum = add_fast(a, neg_a);
             assert_eq!(
-                canonicalize(sum), 0,
-                "neg failed for a={}: neg={}, sum={}", a, neg_a, sum
+                canonicalize(sum),
+                0,
+                "neg failed for a={}: neg={}, sum={}",
+                a,
+                neg_a,
+                sum
             );
         }
     }
@@ -293,8 +322,10 @@ mod tests {
             let doubled = double(a);
             let added = add_fast(a, a);
             assert_eq!(
-                canonicalize(doubled), canonicalize(added),
-                "double mismatch for a={}", a
+                canonicalize(doubled),
+                canonicalize(added),
+                "double mismatch for a={}",
+                a
             );
         }
     }

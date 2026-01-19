@@ -1,4 +1,4 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use rand::Rng;
 
 // Lambda VM types
@@ -10,8 +10,8 @@ use math::polynomial::Polynomial;
 
 // Plonky3 types
 use p3_baby_bear::BabyBear;
-use p3_goldilocks::Goldilocks;
 use p3_dft::{Radix2Dit, TwoAdicSubgroupDft};
+use p3_goldilocks::Goldilocks;
 use p3_matrix::dense::RowMajorMatrix;
 
 type LambdaBabyBear = FieldElement<Babybear31PrimeField>;
@@ -105,16 +105,12 @@ fn bench_babybear_fft_evaluate(c: &mut Criterion) {
         );
 
         let dft = Radix2Dit::default();
-        group.bench_with_input(
-            BenchmarkId::new("plonky3", log_size),
-            &log_size,
-            |b, _| {
-                b.iter(|| {
-                    let mat = RowMajorMatrix::new(plonky3_coeffs.clone(), 1);
-                    black_box(dft.dft_batch(mat))
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("plonky3", log_size), &log_size, |b, _| {
+            b.iter(|| {
+                let mat = RowMajorMatrix::new(plonky3_coeffs.clone(), 1);
+                black_box(dft.dft_batch(mat))
+            })
+        });
     }
 
     group.finish();
@@ -143,16 +139,12 @@ fn bench_babybear_fft_interpolate(c: &mut Criterion) {
         );
 
         let dft = Radix2Dit::default();
-        group.bench_with_input(
-            BenchmarkId::new("plonky3", log_size),
-            &log_size,
-            |b, _| {
-                b.iter(|| {
-                    let mat = RowMajorMatrix::new(plonky3_evals.clone(), 1);
-                    black_box(dft.idft_batch(mat))
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("plonky3", log_size), &log_size, |b, _| {
+            b.iter(|| {
+                let mat = RowMajorMatrix::new(plonky3_evals.clone(), 1);
+                black_box(dft.idft_batch(mat))
+            })
+        });
     }
 
     group.finish();
@@ -190,16 +182,12 @@ fn bench_babybear_fft_coset(c: &mut Criterion) {
 
         let dft = Radix2Dit::default();
         let p3_shift = BabyBear::new(7);
-        group.bench_with_input(
-            BenchmarkId::new("plonky3", log_size),
-            &log_size,
-            |b, _| {
-                b.iter(|| {
-                    let mat = RowMajorMatrix::new(plonky3_coeffs.clone(), 1);
-                    black_box(dft.coset_lde_batch(mat, blowup.trailing_zeros() as usize, p3_shift))
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("plonky3", log_size), &log_size, |b, _| {
+            b.iter(|| {
+                let mat = RowMajorMatrix::new(plonky3_coeffs.clone(), 1);
+                black_box(dft.coset_lde_batch(mat, blowup.trailing_zeros() as usize, p3_shift))
+            })
+        });
     }
 
     group.finish();
@@ -244,16 +232,12 @@ fn bench_goldilocks_fft_evaluate(c: &mut Criterion) {
         );
 
         let dft = Radix2Dit::default();
-        group.bench_with_input(
-            BenchmarkId::new("plonky3", log_size),
-            &log_size,
-            |b, _| {
-                b.iter(|| {
-                    let mat = RowMajorMatrix::new(plonky3_coeffs.clone(), 1);
-                    black_box(dft.dft_batch(mat))
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("plonky3", log_size), &log_size, |b, _| {
+            b.iter(|| {
+                let mat = RowMajorMatrix::new(plonky3_coeffs.clone(), 1);
+                black_box(dft.dft_batch(mat))
+            })
+        });
     }
 
     group.finish();
@@ -276,7 +260,8 @@ fn bench_goldilocks_fft_interpolate(c: &mut Criterion) {
             |b, _| {
                 b.iter(|| {
                     black_box(
-                        Polynomial::interpolate_fft::<U64GoldilocksPrimeField>(&mont_evals).unwrap(),
+                        Polynomial::interpolate_fft::<U64GoldilocksPrimeField>(&mont_evals)
+                            .unwrap(),
                     )
                 })
             },
@@ -295,16 +280,12 @@ fn bench_goldilocks_fft_interpolate(c: &mut Criterion) {
         );
 
         let dft = Radix2Dit::default();
-        group.bench_with_input(
-            BenchmarkId::new("plonky3", log_size),
-            &log_size,
-            |b, _| {
-                b.iter(|| {
-                    let mat = RowMajorMatrix::new(plonky3_evals.clone(), 1);
-                    black_box(dft.idft_batch(mat))
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("plonky3", log_size), &log_size, |b, _| {
+            b.iter(|| {
+                let mat = RowMajorMatrix::new(plonky3_evals.clone(), 1);
+                black_box(dft.idft_batch(mat))
+            })
+        });
     }
 
     group.finish();
@@ -362,16 +343,12 @@ fn bench_goldilocks_fft_coset(c: &mut Criterion) {
 
         let dft = Radix2Dit::default();
         let p3_shift = Goldilocks::new(7);
-        group.bench_with_input(
-            BenchmarkId::new("plonky3", log_size),
-            &log_size,
-            |b, _| {
-                b.iter(|| {
-                    let mat = RowMajorMatrix::new(plonky3_coeffs.clone(), 1);
-                    black_box(dft.coset_lde_batch(mat, blowup.trailing_zeros() as usize, p3_shift))
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("plonky3", log_size), &log_size, |b, _| {
+            b.iter(|| {
+                let mat = RowMajorMatrix::new(plonky3_coeffs.clone(), 1);
+                black_box(dft.coset_lde_batch(mat, blowup.trailing_zeros() as usize, p3_shift))
+            })
+        });
     }
 
     group.finish();

@@ -184,11 +184,7 @@ fn reduce128(x: u128) -> u64 {
 
     // Step 1: t0 = x_lo - x_hi_hi
     let (t0, borrow) = x_lo.overflowing_sub(x_hi_hi);
-    let t0 = if borrow {
-        t0.wrapping_sub(EPSILON)
-    } else {
-        t0
-    };
+    let t0 = if borrow { t0.wrapping_sub(EPSILON) } else { t0 };
 
     // Step 2: t1 = x_hi_lo * EPSILON = (x_hi_lo << 32) - x_hi_lo
     // Using shift is ~10% faster than multiply
@@ -416,7 +412,8 @@ mod tests {
     #[test]
     fn test_primitive_root() {
         // The primitive root should have order 2^32
-        let root = GoldilocksField::get_primitive_root_of_unity(GoldilocksField::TWO_ADICITY).unwrap();
+        let root =
+            GoldilocksField::get_primitive_root_of_unity(GoldilocksField::TWO_ADICITY).unwrap();
 
         // root^(2^32) should be 1
         let mut result = *root.value();
@@ -442,7 +439,12 @@ mod tests {
         for a in [5u64, 123456789, GOLDILOCKS_PRIME - 1, 0xDEADBEEF, 1, 2] {
             let sq = GoldilocksField::square(&a);
             let mul = GoldilocksField::mul(&a, &a);
-            assert_eq!(canonicalize(sq), canonicalize(mul), "Square mismatch for a = {}", a);
+            assert_eq!(
+                canonicalize(sq),
+                canonicalize(mul),
+                "Square mismatch for a = {}",
+                a
+            );
         }
     }
 }

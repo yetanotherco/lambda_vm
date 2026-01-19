@@ -7,7 +7,9 @@
 use crate::fft::cpu::ops::fft as cpu_fft_impl;
 use crate::fft::cpu::roots_of_unity::get_twiddles;
 use crate::field::element::FieldElement;
-use crate::field::fields::fft_friendly::u64_goldilocks_native::{GoldilocksField, GOLDILOCKS_PRIME};
+use crate::field::fields::fft_friendly::u64_goldilocks_native::{
+    GOLDILOCKS_PRIME, GoldilocksField,
+};
 use crate::field::traits::RootsConfig;
 use crate::gpu::metal::{MetalError, MetalFFT};
 use alloc::format;
@@ -54,8 +56,8 @@ pub struct FuzzConfig {
 impl Default for FuzzConfig {
     fn default() -> Self {
         Self {
-            min_log_size: 2,    // 4 elements
-            max_log_size: 14,   // 16384 elements
+            min_log_size: 2,  // 4 elements
+            max_log_size: 14, // 16384 elements
             iterations_per_size: 10,
             test_edge_cases: true,
             enable_timing: true,
@@ -78,7 +80,7 @@ impl DifferentialFuzzer {
         Ok(Self {
             metal_fft,
             config,
-            rng_state: 0x123456789ABCDEF0,  // Fixed seed for reproducibility
+            rng_state: 0x123456789ABCDEF0, // Fixed seed for reproducibility
         })
     }
 
@@ -127,8 +129,14 @@ impl DifferentialFuzzer {
         // Alternating zeros and ones
         cases.push(
             (0..size)
-                .map(|i| if i % 2 == 0 { FieldElement::zero() } else { FieldElement::one() })
-                .collect()
+                .map(|i| {
+                    if i % 2 == 0 {
+                        FieldElement::zero()
+                    } else {
+                        FieldElement::one()
+                    }
+                })
+                .collect(),
         );
 
         // Powers of two (modulo p)
@@ -138,15 +146,11 @@ impl DifferentialFuzzer {
                     let val = 1u64 << (i % 63);
                     FieldElement::from(val % GOLDILOCKS_PRIME)
                 })
-                .collect()
+                .collect(),
         );
 
         // Sequential values
-        cases.push(
-            (0..size)
-                .map(|i| FieldElement::from(i as u64))
-                .collect()
-        );
+        cases.push((0..size).map(|i| FieldElement::from(i as u64)).collect());
 
         // Values near field boundaries
         cases.push(
@@ -155,19 +159,22 @@ impl DifferentialFuzzer {
                     let base = match i % 4 {
                         0 => 0u64,
                         1 => GOLDILOCKS_PRIME - 1,
-                        2 => (1u64 << 32) - 1,  // EPSILON
+                        2 => (1u64 << 32) - 1, // EPSILON
                         _ => 1u64 << 32,
                     };
                     FieldElement::from(base)
                 })
-                .collect()
+                .collect(),
         );
 
         cases
     }
 
     /// Compute CPU FFT using existing implementation
-    fn cpu_fft(&self, input: &[FieldElement<GoldilocksField>]) -> Option<Vec<FieldElement<GoldilocksField>>> {
+    fn cpu_fft(
+        &self,
+        input: &[FieldElement<GoldilocksField>],
+    ) -> Option<Vec<FieldElement<GoldilocksField>>> {
         let log_n = input.len().trailing_zeros() as u64;
         let twiddles = get_twiddles::<GoldilocksField>(log_n, RootsConfig::BitReverse).ok()?;
         cpu_fft_impl::<GoldilocksField, GoldilocksField>(input, &twiddles).ok()
@@ -248,7 +255,8 @@ impl DifferentialFuzzer {
         let metal_time = metal_start.map(|s| s.elapsed().as_micros() as u64);
 
         // Compare
-        let (passed, mismatches, first_mismatch) = Self::compare_results(&cpu_result, &metal_result);
+        let (passed, mismatches, first_mismatch) =
+            Self::compare_results(&cpu_result, &metal_result);
 
         FuzzResult {
             size,
@@ -292,7 +300,8 @@ impl DifferentialFuzzer {
         };
 
         // Compare
-        let (passed, mismatches, first_mismatch) = Self::compare_results(&cpu_result, &metal_result);
+        let (passed, mismatches, first_mismatch) =
+            Self::compare_results(&cpu_result, &metal_result);
 
         FuzzResult {
             size,
@@ -417,11 +426,13 @@ impl FuzzReport {
         summary.push_str("----\t\t-------\t\t---------\t-------\n");
 
         for size_report in &self.results_by_size {
-            let cpu_times: Vec<u64> = size_report.results
+            let cpu_times: Vec<u64> = size_report
+                .results
                 .iter()
                 .filter_map(|r| r.cpu_time_us)
                 .collect();
-            let metal_times: Vec<u64> = size_report.results
+            let metal_times: Vec<u64> = size_report
+                .results
                 .iter()
                 .filter_map(|r| r.metal_time_us)
                 .collect();
@@ -437,10 +448,7 @@ impl FuzzReport {
 
                 summary.push_str(&format!(
                     "2^{}\t\t{}\t\t{}\t\t{:.2}x\n",
-                    size_report.log_size,
-                    cpu_avg,
-                    metal_avg,
-                    speedup,
+                    size_report.log_size, cpu_avg, metal_avg, speedup,
                 ));
             }
         }
@@ -508,7 +516,7 @@ mod tests {
         let config = FuzzConfig {
             min_log_size: 4,
             max_log_size: 10,
-            iterations_per_size: 0,  // Only edge cases
+            iterations_per_size: 0, // Only edge cases
             test_edge_cases: true,
             enable_timing: false,
         };
@@ -546,7 +554,10 @@ mod tests {
                 let input1 = fuzzer1.generate_random_input(16);
                 let input2 = fuzzer2.generate_random_input(16);
 
-                assert_eq!(input1, input2, "Random inputs should be identical with same seed");
+                assert_eq!(
+                    input1, input2,
+                    "Random inputs should be identical with same seed"
+                );
             }
         }
     }

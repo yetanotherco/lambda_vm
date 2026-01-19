@@ -12,7 +12,7 @@
 
 // Re-export base field operations from the primary ASM module
 pub use super::u64_goldilocks_asm::{
-    add_fast, sub_fast, mul, reduce128, double, neg, EPSILON, GOLDILOCKS_PRIME,
+    EPSILON, GOLDILOCKS_PRIME, add_fast, double, mul, neg, reduce128, sub_fast,
 };
 
 /// Base field squaring (uses native Rust for optimal performance).

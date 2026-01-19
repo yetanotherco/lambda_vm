@@ -1,4 +1,4 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use rand::Rng;
 
 // Lambda VM types
@@ -9,9 +9,9 @@ use math::field::traits::RootsConfig;
 use math::polynomial::Polynomial;
 
 // Plonky3 types
-use p3_goldilocks::Goldilocks;
 use p3_dft::{Radix2Dit, TwoAdicSubgroupDft};
 use p3_field::{PrimeCharacteristicRing, TwoAdicField};
+use p3_goldilocks::Goldilocks;
 use p3_matrix::dense::RowMajorMatrix;
 
 type LambdaGoldilocksMont = FieldElement<U64GoldilocksPrimeField>;
@@ -134,17 +134,13 @@ fn bench_polynomial_scaling(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("lambda_montgomery", log_size),
             &log_size,
-            |b, _| {
-                b.iter(|| black_box(mont_poly.scale(&mont_offset)))
-            },
+            |b, _| b.iter(|| black_box(mont_poly.scale(&mont_offset))),
         );
 
         group.bench_with_input(
             BenchmarkId::new("lambda_native", log_size),
             &log_size,
-            |b, _| {
-                b.iter(|| black_box(native_poly.scale(&native_offset)))
-            },
+            |b, _| b.iter(|| black_box(native_poly.scale(&native_offset))),
         );
 
         // Plonky3's coset_shift applies shift to the domain, not polynomial coefficients
@@ -211,20 +207,16 @@ fn bench_bit_reversal(c: &mut Criterion) {
         );
 
         // Plonky3's bit reversal (p3_util::reverse_slice_index_bits)
-        group.bench_with_input(
-            BenchmarkId::new("plonky3", log_size),
-            &log_size,
-            |b, _| {
-                b.iter_batched(
-                    || generate_plonky3_vec(size),
-                    |mut data| {
-                        p3_util::reverse_slice_index_bits(&mut data);
-                        data
-                    },
-                    BatchSize::SmallInput,
-                )
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("plonky3", log_size), &log_size, |b, _| {
+            b.iter_batched(
+                || generate_plonky3_vec(size),
+                |mut data| {
+                    p3_util::reverse_slice_index_bits(&mut data);
+                    data
+                },
+                BatchSize::SmallInput,
+            )
+        });
     }
 
     group.finish();
@@ -240,11 +232,12 @@ fn bench_fft_butterflies(c: &mut Criterion) {
         group.throughput(Throughput::Elements(size as u64));
 
         // Pre-compute twiddles (not counted in benchmark)
-        let mont_twiddles = math::fft::cpu::roots_of_unity::get_twiddles::<U64GoldilocksPrimeField>(
-            log_size as u64,
-            RootsConfig::BitReverse,
-        )
-        .unwrap();
+        let mont_twiddles =
+            math::fft::cpu::roots_of_unity::get_twiddles::<U64GoldilocksPrimeField>(
+                log_size as u64,
+                RootsConfig::BitReverse,
+            )
+            .unwrap();
 
         let native_twiddles = math::fft::cpu::roots_of_unity::get_twiddles::<GoldilocksNative>(
             log_size as u64,
@@ -342,16 +335,12 @@ fn bench_full_fft_pipeline(c: &mut Criterion) {
         );
 
         let dft = Radix2Dit::default();
-        group.bench_with_input(
-            BenchmarkId::new("plonky3", log_size),
-            &log_size,
-            |b, _| {
-                b.iter(|| {
-                    let mat = RowMajorMatrix::new(plonky3_coeffs.clone(), 1);
-                    black_box(dft.dft_batch(mat))
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("plonky3", log_size), &log_size, |b, _| {
+            b.iter(|| {
+                let mat = RowMajorMatrix::new(plonky3_coeffs.clone(), 1);
+                black_box(dft.dft_batch(mat))
+            })
+        });
     }
 
     group.finish();
@@ -411,16 +400,12 @@ fn bench_lde_pipeline(c: &mut Criterion) {
 
         let dft = Radix2Dit::default();
         let p3_shift = Goldilocks::new(7);
-        group.bench_with_input(
-            BenchmarkId::new("plonky3", log_size),
-            &log_size,
-            |b, _| {
-                b.iter(|| {
-                    let mat = RowMajorMatrix::new(plonky3_coeffs.clone(), 1);
-                    black_box(dft.coset_lde_batch(mat, blowup.trailing_zeros() as usize, p3_shift))
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("plonky3", log_size), &log_size, |b, _| {
+            b.iter(|| {
+                let mat = RowMajorMatrix::new(plonky3_coeffs.clone(), 1);
+                black_box(dft.coset_lde_batch(mat, blowup.trailing_zeros() as usize, p3_shift))
+            })
+        });
     }
 
     group.finish();

@@ -14,7 +14,7 @@
 //! For small sizes (< 8192), a single-kernel approach using shared memory
 //! is more efficient due to reduced global memory traffic.
 
-use super::device::{MetalState, GPU_THRESHOLD, MAX_FFT_SIZE};
+use super::device::{GPU_THRESHOLD, MAX_FFT_SIZE, MetalState};
 use super::errors::MetalError;
 use super::shaders::FFTPipelines;
 use crate::field::element::FieldElement;
@@ -130,10 +130,8 @@ impl MetalFFT {
         self.state.read_buffer(&data_buffer, &mut output_raw)?;
 
         // Convert back to field elements
-        let output: Vec<FieldElement<GoldilocksField>> = output_raw
-            .into_iter()
-            .map(FieldElement::from)
-            .collect();
+        let output: Vec<FieldElement<GoldilocksField>> =
+            output_raw.into_iter().map(FieldElement::from).collect();
 
         Ok(output)
     }
@@ -179,7 +177,10 @@ impl MetalFFT {
     }
 
     /// Get cached natural-order twiddle factors or generate them.
-    fn get_or_generate_twiddles_natural_cached(&mut self, log_n: usize) -> Result<Buffer, MetalError> {
+    fn get_or_generate_twiddles_natural_cached(
+        &mut self,
+        log_n: usize,
+    ) -> Result<Buffer, MetalError> {
         // Check cache
         if let Some(ref buffer) = self.twiddle_cache_natural[log_n] {
             return Ok(buffer.clone());
@@ -397,11 +398,11 @@ impl MetalFFT {
             // Alternate buffers: even stages read from data, write to temp
             //                    odd stages read from temp, write to data
             if stage % 2 == 0 {
-                encoder.set_buffer(0, Some(data_buffer), 0);  // src
+                encoder.set_buffer(0, Some(data_buffer), 0); // src
                 encoder.set_buffer(1, Some(&temp_buffer), 0); // dst
             } else {
                 encoder.set_buffer(0, Some(&temp_buffer), 0); // src
-                encoder.set_buffer(1, Some(data_buffer), 0);  // dst
+                encoder.set_buffer(1, Some(data_buffer), 0); // dst
             }
 
             encoder.set_buffer(2, Some(twiddles_natural), 0);
@@ -533,8 +534,14 @@ mod tests {
         use metal::MTLSize;
 
         // Get pipeline
-        let function = state.library.get_function(KERNEL_TEST_MULTIPLY, None).unwrap();
-        let pipeline = state.device.new_compute_pipeline_state_with_function(&function).unwrap();
+        let function = state
+            .library
+            .get_function(KERNEL_TEST_MULTIPLY, None)
+            .unwrap();
+        let pipeline = state
+            .device
+            .new_compute_pipeline_state_with_function(&function)
+            .unwrap();
 
         // Create buffer with single value
         let data = vec![a];
@@ -565,7 +572,10 @@ mod tests {
         use metal::MTLSize;
 
         let function = state.library.get_function(KERNEL_TEST_ADD, None).unwrap();
-        let pipeline = state.device.new_compute_pipeline_state_with_function(&function).unwrap();
+        let pipeline = state
+            .device
+            .new_compute_pipeline_state_with_function(&function)
+            .unwrap();
 
         let data = vec![a];
         let buffer = state.create_buffer_with_data(&data).unwrap();
@@ -600,16 +610,23 @@ mod tests {
         };
 
         let test_cases: Vec<(u64, u64)> = vec![
-            (2, 3), (5, 7), (1, 1), (0, 12345),
-            (1u64 << 32, 2), (1u64 << 40, 1u64 << 30),
+            (2, 3),
+            (5, 7),
+            (1, 1),
+            (0, 12345),
+            (1u64 << 32, 2),
+            (1u64 << 40, 1u64 << 30),
         ];
 
         for (a, b) in test_cases {
             let metal_result = test_metal_multiplication(&state, a, b);
             let cpu_result = GoldilocksField::mul(&a, &b);
             assert_eq!(
-                canonicalize(cpu_result), canonicalize(metal_result),
-                "Mul mismatch for {} * {}", a, b
+                canonicalize(cpu_result),
+                canonicalize(metal_result),
+                "Mul mismatch for {} * {}",
+                a,
+                b
             );
         }
     }
@@ -622,7 +639,9 @@ mod tests {
         };
 
         let test_cases: Vec<(u64, u64)> = vec![
-            (2, 3), (5, 7), (0, 0),
+            (2, 3),
+            (5, 7),
+            (0, 0),
             (0xFFFFFFFF00000000, 1), // Near prime
             (0xFFFFFFFF00000000, 2), // Wraps past prime
         ];
@@ -631,9 +650,13 @@ mod tests {
             let metal_result = test_metal_addition(&state, a, b);
             let cpu_result = GoldilocksField::add(&a, &b);
             assert_eq!(
-                canonicalize(cpu_result), canonicalize(metal_result),
+                canonicalize(cpu_result),
+                canonicalize(metal_result),
                 "Add mismatch for {} + {}: CPU={}, Metal={}",
-                a, b, canonicalize(cpu_result), canonicalize(metal_result)
+                a,
+                b,
+                canonicalize(cpu_result),
+                canonicalize(metal_result)
             );
         }
     }
@@ -648,8 +671,14 @@ mod tests {
         use super::super::shaders::KERNEL_TEST_BUTTERFLY;
         use metal::MTLSize;
 
-        let function = state.library.get_function(KERNEL_TEST_BUTTERFLY, None).unwrap();
-        let pipeline = state.device.new_compute_pipeline_state_with_function(&function).unwrap();
+        let function = state
+            .library
+            .get_function(KERNEL_TEST_BUTTERFLY, None)
+            .unwrap();
+        let pipeline = state
+            .device
+            .new_compute_pipeline_state_with_function(&function)
+            .unwrap();
 
         // Test butterfly: (a, b) -> (a + w*b, a - w*b)
         let test_cases = vec![
@@ -687,14 +716,24 @@ mod tests {
             let expected_b = GoldilocksField::sub(&a, &wb);
 
             assert_eq!(
-                canonicalize(expected_a), canonicalize(a_result[0]),
+                canonicalize(expected_a),
+                canonicalize(a_result[0]),
                 "Butterfly a mismatch for ({}, {}, w={}): expected {}, got {}",
-                a, b, w, canonicalize(expected_a), canonicalize(a_result[0])
+                a,
+                b,
+                w,
+                canonicalize(expected_a),
+                canonicalize(a_result[0])
             );
             assert_eq!(
-                canonicalize(expected_b), canonicalize(b_result[0]),
+                canonicalize(expected_b),
+                canonicalize(b_result[0]),
                 "Butterfly b mismatch for ({}, {}, w={}): expected {}, got {}",
-                a, b, w, canonicalize(expected_b), canonicalize(b_result[0])
+                a,
+                b,
+                w,
+                canonicalize(expected_b),
+                canonicalize(b_result[0])
             );
         }
         println!("Butterfly tests passed!");
@@ -765,8 +804,8 @@ mod tests {
     #[test]
     #[ignore] // Run with: cargo test --features metal test_compare_radix2_vs_mixed -- --ignored --nocapture
     fn test_compare_radix2_vs_mixed() {
-        use std::time::Instant;
         use super::FFTAlgorithm;
+        use std::time::Instant;
 
         let mut metal_fft = match MetalFFT::new() {
             Ok(fft) => fft,
@@ -807,8 +846,12 @@ mod tests {
             );
 
             // Verify correctness
-            let result_r2 = metal_fft.benchmark_algorithm(&input, FFTAlgorithm::Radix2).unwrap();
-            let result_mx = metal_fft.benchmark_algorithm(&input, FFTAlgorithm::MixedRadix).unwrap();
+            let result_r2 = metal_fft
+                .benchmark_algorithm(&input, FFTAlgorithm::Radix2)
+                .unwrap();
+            let result_mx = metal_fft
+                .benchmark_algorithm(&input, FFTAlgorithm::MixedRadix)
+                .unwrap();
             assert_eq!(result_r2, result_mx, "Results differ for size 2^{}", log_n);
         }
     }
@@ -816,8 +859,8 @@ mod tests {
     #[test]
     #[ignore] // Run with: cargo test --features metal test_compare_all_algorithms -- --ignored --nocapture
     fn test_compare_all_algorithms() {
-        use std::time::Instant;
         use super::FFTAlgorithm;
+        use std::time::Instant;
 
         let mut metal_fft = match MetalFFT::new() {
             Ok(fft) => fft,
@@ -873,17 +916,26 @@ mod tests {
             );
 
             // Verify Stockham correctness against CPU reference
-            let result_stockham = metal_fft.benchmark_algorithm(&input, FFTAlgorithm::Stockham).unwrap();
-            let result_mixed = metal_fft.benchmark_algorithm(&input, FFTAlgorithm::MixedRadix).unwrap();
+            let result_stockham = metal_fft
+                .benchmark_algorithm(&input, FFTAlgorithm::Stockham)
+                .unwrap();
+            let result_mixed = metal_fft
+                .benchmark_algorithm(&input, FFTAlgorithm::MixedRadix)
+                .unwrap();
 
             // Note: Stockham may have different numerical precision due to different computation order
             // For now, just verify it completes without error
             assert_eq!(result_stockham.len(), n, "Stockham output length mismatch");
 
             // Check if results match (they should for exact arithmetic)
-            let matches = result_stockham.iter().zip(result_mixed.iter()).all(|(a, b)| a == b);
+            let matches = result_stockham
+                .iter()
+                .zip(result_mixed.iter())
+                .all(|(a, b)| a == b);
             if !matches {
-                println!("  Warning: Stockham results differ from Mixed-Radix (may need twiddle adjustment)");
+                println!(
+                    "  Warning: Stockham results differ from Mixed-Radix (may need twiddle adjustment)"
+                );
             }
         }
     }

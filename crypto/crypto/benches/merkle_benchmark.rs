@@ -5,7 +5,7 @@
 //!
 //! Run with: cargo bench -p crypto -- merkle
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use crypto::hash::poseidon2::Fp;
 use crypto::merkle_tree::{
     backends::types::{BatchPoseidon2Backend, Poseidon2Backend},

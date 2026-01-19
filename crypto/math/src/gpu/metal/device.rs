@@ -29,8 +29,7 @@ impl MetalState {
         let device = Device::system_default().ok_or(MetalError::DeviceNotFound)?;
 
         // Create command queue
-        let command_queue = device
-            .new_command_queue();
+        let command_queue = device.new_command_queue();
 
         // Compile shaders
         let library = Self::compile_shaders(&device)?;
@@ -85,11 +84,9 @@ impl MetalState {
 
         let options = MTLResourceOptions::StorageModeShared;
 
-        let buffer = self.device.new_buffer_with_data(
-            data.as_ptr() as *const _,
-            byte_size as u64,
-            options,
-        );
+        let buffer =
+            self.device
+                .new_buffer_with_data(data.as_ptr() as *const _, byte_size as u64, options);
 
         Ok(buffer)
     }
@@ -153,7 +150,10 @@ mod tests {
         if let Ok(state) = MetalState::new() {
             println!("Metal device: {}", state.device_name());
             println!("Unified memory: {}", state.is_unified_memory());
-            println!("Max threadgroup memory: {} bytes", state.max_threadgroup_memory());
+            println!(
+                "Max threadgroup memory: {} bytes",
+                state.max_threadgroup_memory()
+            );
         } else {
             println!("Metal not available on this system");
         }
@@ -171,10 +171,14 @@ mod tests {
     fn test_buffer_roundtrip() {
         if let Ok(state) = MetalState::new() {
             let input: Vec<u64> = (0..1024).collect();
-            let buffer = state.create_buffer_with_data(&input).expect("Failed to create buffer");
+            let buffer = state
+                .create_buffer_with_data(&input)
+                .expect("Failed to create buffer");
 
             let mut output = vec![0u64; 1024];
-            state.read_buffer(&buffer, &mut output).expect("Failed to read buffer");
+            state
+                .read_buffer(&buffer, &mut output)
+                .expect("Failed to read buffer");
 
             assert_eq!(input, output);
         }

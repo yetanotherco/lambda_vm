@@ -120,22 +120,14 @@ mod tests {
     #[test]
     fn test_batch_poseidon2_backend() {
         let values: Vec<Vec<Fp>> = (0..4)
-            .map(|i| {
-                (0..3)
-                    .map(|j| Fp::from((i * 3 + j) as u64))
-                    .collect()
-            })
+            .map(|i| (0..3).map(|j| Fp::from((i * 3 + j) as u64)).collect())
             .collect();
 
         let merkle_tree = MerkleTree::<BatchPoseidon2Backend>::build(&values).unwrap();
 
         // Verify proof for first element
         let proof = merkle_tree.get_proof_by_pos(0).unwrap();
-        assert!(proof.verify::<BatchPoseidon2Backend>(
-            &merkle_tree.root,
-            0,
-            &values[0]
-        ));
+        assert!(proof.verify::<BatchPoseidon2Backend>(&merkle_tree.root, 0, &values[0]));
     }
 
     #[test]

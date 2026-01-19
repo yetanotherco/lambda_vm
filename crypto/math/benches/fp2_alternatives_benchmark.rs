@@ -2,13 +2,13 @@
 //!
 //! Run with: cargo bench -p math --features asm-arm64 --bench fp2_alternatives_benchmark
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
 mod fp2_benches {
     use super::*;
     use math::field::fields::fft_friendly::goldilocks_extensions_asm::{
-        fp2_mul, fp2_square, fp3_mul, fp3_square, mul_by_7, GOLDILOCKS_PRIME,
+        GOLDILOCKS_PRIME, fp2_mul, fp2_square, fp3_mul, fp3_square, mul_by_7,
     };
 
     const BATCH_SIZE: usize = 10_000;

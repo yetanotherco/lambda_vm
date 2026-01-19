@@ -17,9 +17,8 @@ use math::field::element::FieldElement;
 use math::field::fields::fft_friendly::u64_goldilocks_native::GoldilocksField;
 
 use goldilocks::{
-    EXTERNAL_ROUNDS_BEGIN, EXTERNAL_ROUNDS_END, EXTERNAL_ROUND_CONSTANTS_INIT,
-    EXTERNAL_ROUND_CONSTANTS_TERM, INTERNAL_ROUNDS, INTERNAL_ROUND_CONSTANTS, MATRIX_DIAG_8,
-    RATE, WIDTH,
+    EXTERNAL_ROUND_CONSTANTS_INIT, EXTERNAL_ROUND_CONSTANTS_TERM, EXTERNAL_ROUNDS_BEGIN,
+    EXTERNAL_ROUNDS_END, INTERNAL_ROUND_CONSTANTS, INTERNAL_ROUNDS, MATRIX_DIAG_8, RATE, WIDTH,
 };
 
 /// Type alias for Goldilocks field element
@@ -60,7 +59,10 @@ impl Poseidon2 {
         self.external_linear_layer();
 
         // Initial external rounds (after initial linear layer)
-        for round_constants in EXTERNAL_ROUND_CONSTANTS_INIT.iter().take(EXTERNAL_ROUNDS_BEGIN) {
+        for round_constants in EXTERNAL_ROUND_CONSTANTS_INIT
+            .iter()
+            .take(EXTERNAL_ROUNDS_BEGIN)
+        {
             self.external_round(round_constants);
         }
 
@@ -70,7 +72,10 @@ impl Poseidon2 {
         }
 
         // Terminal external rounds (no initial linear layer)
-        for round_constants in EXTERNAL_ROUND_CONSTANTS_TERM.iter().take(EXTERNAL_ROUNDS_END) {
+        for round_constants in EXTERNAL_ROUND_CONSTANTS_TERM
+            .iter()
+            .take(EXTERNAL_ROUNDS_END)
+        {
             self.external_round(round_constants);
         }
     }
@@ -258,8 +263,8 @@ impl Poseidon2 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::goldilocks::MATRIX_DIAG_8;
+    use super::*;
 
     #[test]
     fn test_poseidon2_permutation_deterministic() {
@@ -363,7 +368,11 @@ mod tests {
         hasher.permute();
 
         // State should change after permutation
-        let all_same = hasher.state.iter().zip(initial_state.iter()).all(|(a, b)| a == b);
+        let all_same = hasher
+            .state
+            .iter()
+            .zip(initial_state.iter())
+            .all(|(a, b)| a == b);
         assert!(!all_same, "State should change after permutation");
     }
 
@@ -496,7 +505,12 @@ mod tests {
         // Input: [1, 2, 3, 4] should give:
         // [5*1 + 7*2 + 1*3 + 3*4, 4*1 + 6*2 + 1*3 + 1*4, 1*1 + 3*2 + 5*3 + 7*4, 1*1 + 1*2 + 4*3 + 6*4]
         // = [5+14+3+12, 4+12+3+4, 1+6+15+28, 1+2+12+24] = [34, 23, 50, 39]
-        let mut x = [Fp::from(1u64), Fp::from(2u64), Fp::from(3u64), Fp::from(4u64)];
+        let mut x = [
+            Fp::from(1u64),
+            Fp::from(2u64),
+            Fp::from(3u64),
+            Fp::from(4u64),
+        ];
         Poseidon2::apply_hl_mat4(&mut x);
         assert_eq!(*x[0].value(), 34u64, "General test [0]");
         assert_eq!(*x[1].value(), 23u64, "General test [1]");

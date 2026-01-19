@@ -8,16 +8,20 @@
 
 use crate::field::element::FieldElement;
 use crate::field::fields::fft_friendly::u64_goldilocks_asm::{
-    add_fast as add_asm, sub_fast as sub_asm, mul,
-    neg, double, mul_wide, reduce128, GOLDILOCKS_PRIME, EPSILON,
+    EPSILON, GOLDILOCKS_PRIME, add_fast as add_asm, double, mul, mul_wide, neg, reduce128,
+    sub_fast as sub_asm,
 };
 use crate::field::fields::fft_friendly::u64_goldilocks_native::GoldilocksField;
-use crate::field::traits::{IsField, IsFFTField};
+use crate::field::traits::{IsFFTField, IsField};
 
 type GoldilocksElement = FieldElement<GoldilocksField>;
 
 fn canonicalize(x: u64) -> u64 {
-    if x >= GOLDILOCKS_PRIME { x - GOLDILOCKS_PRIME } else { x }
+    if x >= GOLDILOCKS_PRIME {
+        x - GOLDILOCKS_PRIME
+    } else {
+        x
+    }
 }
 
 // ============== BASIC OPERATION TESTS ==============
@@ -91,7 +95,14 @@ fn test_square_basic() {
 #[test]
 fn test_square_equals_mul() {
     // Square uses native Rust (faster than ASM)
-    let test_values = [5, 123456789, GOLDILOCKS_PRIME - 1, EPSILON, 1u64 << 32, 0xDEADBEEF];
+    let test_values = [
+        5,
+        123456789,
+        GOLDILOCKS_PRIME - 1,
+        EPSILON,
+        1u64 << 32,
+        0xDEADBEEF,
+    ];
 
     for a in test_values {
         let sq = GoldilocksField::square(&a);
@@ -99,7 +110,8 @@ fn test_square_equals_mul() {
         assert_eq!(
             canonicalize(sq),
             canonicalize(mul_result),
-            "square mismatch for a={}", a
+            "square mismatch for a={}",
+            a
         );
     }
 }
@@ -135,27 +147,40 @@ fn test_field_axiom_add_commutativity() {
         assert_eq!(
             canonicalize(add_asm(a, b)),
             canonicalize(add_asm(b, a)),
-            "Add commutativity failed for a={}, b={}", a, b
+            "Add commutativity failed for a={}, b={}",
+            a,
+            b
         );
     }
 }
 
 #[test]
 fn test_field_axiom_mul_commutativity() {
-    let pairs = [(5, 7), (123, 456), (GOLDILOCKS_PRIME - 1, 2), (EPSILON, 100)];
+    let pairs = [
+        (5, 7),
+        (123, 456),
+        (GOLDILOCKS_PRIME - 1, 2),
+        (EPSILON, 100),
+    ];
 
     for (a, b) in pairs {
         assert_eq!(
             canonicalize(mul(a, b)),
             canonicalize(mul(b, a)),
-            "Mul commutativity failed for a={}, b={}", a, b
+            "Mul commutativity failed for a={}, b={}",
+            a,
+            b
         );
     }
 }
 
 #[test]
 fn test_field_axiom_add_associativity() {
-    let triples = [(5, 7, 11), (100, 200, 300), (EPSILON, 1, GOLDILOCKS_PRIME - 1)];
+    let triples = [
+        (5, 7, 11),
+        (100, 200, 300),
+        (EPSILON, 1, GOLDILOCKS_PRIME - 1),
+    ];
 
     for (a, b, c) in triples {
         let left = add_asm(add_asm(a, b), c);
@@ -163,7 +188,10 @@ fn test_field_axiom_add_associativity() {
         assert_eq!(
             canonicalize(left),
             canonicalize(right),
-            "Add associativity failed for a={}, b={}, c={}", a, b, c
+            "Add associativity failed for a={}, b={}, c={}",
+            a,
+            b,
+            c
         );
     }
 }
@@ -178,7 +206,10 @@ fn test_field_axiom_mul_associativity() {
         assert_eq!(
             canonicalize(left),
             canonicalize(right),
-            "Mul associativity failed for a={}, b={}, c={}", a, b, c
+            "Mul associativity failed for a={}, b={}, c={}",
+            a,
+            b,
+            c
         );
     }
 }
@@ -193,7 +224,10 @@ fn test_field_axiom_distributivity() {
         assert_eq!(
             canonicalize(left),
             canonicalize(right),
-            "Distributivity failed for a={}, b={}, c={}", a, b, c
+            "Distributivity failed for a={}, b={}, c={}",
+            a,
+            b,
+            c
         );
     }
 }
@@ -223,7 +257,10 @@ fn test_field_axiom_additive_inverse() {
         assert_eq!(
             canonicalize(sum),
             0,
-            "Additive inverse failed for a={}: neg={}, sum={}", a, neg_a, sum
+            "Additive inverse failed for a={}: neg={}, sum={}",
+            a,
+            neg_a,
+            sum
         );
     }
 }
@@ -266,7 +303,9 @@ fn test_reduce128_from_mul() {
         assert_eq!(
             canonicalize(reduced),
             expected,
-            "reduce128 mismatch for mul({}, {})", a, b
+            "reduce128 mismatch for mul({}, {})",
+            a,
+            b
         );
     }
 }
@@ -416,7 +455,9 @@ fn test_powers_of_two() {
                 assert_eq!(
                     canonicalize(result),
                     expected,
-                    "Power of 2 mul failed for 2^{} * 2^{}", exp1, exp2
+                    "Power of 2 mul failed for 2^{} * 2^{}",
+                    exp1,
+                    exp2
                 );
             }
         }
@@ -428,17 +469,18 @@ fn test_powers_of_two() {
 
 mod extension_asm_tests {
     use crate::field::fields::fft_friendly::goldilocks_extensions_asm::{
-        mul_by_6, mul_by_7, mul_by_4,
-        fp2_add, fp2_sub, fp2_mul, fp2_square, fp2_neg, fp2_double,
-        fp2_conjugate, fp2_norm, fp2_scalar_mul,
-        fp3_add, fp3_sub, fp3_mul, fp3_square, fp3_neg, fp3_double, fp3_scalar_mul,
+        fp2_add, fp2_conjugate, fp2_double, fp2_mul, fp2_neg, fp2_norm, fp2_scalar_mul, fp2_square,
+        fp2_sub, fp3_add, fp3_double, fp3_mul, fp3_neg, fp3_scalar_mul, fp3_square, fp3_sub,
+        mul_by_4, mul_by_6, mul_by_7,
     };
-    use crate::field::fields::fft_friendly::u64_goldilocks_asm::{
-        mul, sub_fast, GOLDILOCKS_PRIME,
-    };
+    use crate::field::fields::fft_friendly::u64_goldilocks_asm::{GOLDILOCKS_PRIME, mul, sub_fast};
 
     fn canonicalize(x: u64) -> u64 {
-        if x >= GOLDILOCKS_PRIME { x - GOLDILOCKS_PRIME } else { x }
+        if x >= GOLDILOCKS_PRIME {
+            x - GOLDILOCKS_PRIME
+        } else {
+            x
+        }
     }
 
     // ============== MULTIPLY BY CONSTANT TESTS ==============
@@ -450,8 +492,10 @@ mod extension_asm_tests {
             let result = mul_by_4(a);
             let expected = mul(a, 4);
             assert_eq!(
-                canonicalize(result), canonicalize(expected),
-                "mul_by_4 mismatch for a={}", a
+                canonicalize(result),
+                canonicalize(expected),
+                "mul_by_4 mismatch for a={}",
+                a
             );
         }
     }
@@ -463,8 +507,10 @@ mod extension_asm_tests {
             let result = mul_by_6(a);
             let expected = mul(a, 6);
             assert_eq!(
-                canonicalize(result), canonicalize(expected),
-                "mul_by_6 mismatch for a={}", a
+                canonicalize(result),
+                canonicalize(expected),
+                "mul_by_6 mismatch for a={}",
+                a
             );
         }
     }
@@ -476,8 +522,10 @@ mod extension_asm_tests {
             let result = mul_by_7(a);
             let expected = mul(a, 7);
             assert_eq!(
-                canonicalize(result), canonicalize(expected),
-                "mul_by_7 mismatch for a={}", a
+                canonicalize(result),
+                canonicalize(expected),
+                "mul_by_7 mismatch for a={}",
+                a
             );
         }
     }
@@ -672,5 +720,4 @@ mod extension_asm_tests {
         assert_eq!(canonicalize(result[1]), canonicalize(a[1]));
         assert_eq!(canonicalize(result[2]), canonicalize(a[2]));
     }
-
 }

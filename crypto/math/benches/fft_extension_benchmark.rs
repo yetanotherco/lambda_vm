@@ -2,12 +2,12 @@
 //!
 //! Run with: cargo bench -p math --features asm-arm64 --bench fft_extension_benchmark
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use rand::Rng;
 
 use math::field::element::FieldElement;
-use math::field::fields::fft_friendly::u64_goldilocks_native::GoldilocksField;
 use math::field::fields::fft_friendly::extensions_goldilocks_native::Fp3E;
+use math::field::fields::fft_friendly::u64_goldilocks_native::GoldilocksField;
 use math::polynomial::Polynomial;
 
 type FpE = FieldElement<GoldilocksField>;
@@ -17,9 +17,7 @@ const SIZE: usize = 1 << LOG_SIZE;
 
 fn generate_base_field_elements(size: usize) -> Vec<FpE> {
     let mut rng = rand::thread_rng();
-    (0..size)
-        .map(|_| FpE::from(rng.r#gen::<u64>()))
-        .collect()
+    (0..size).map(|_| FpE::from(rng.r#gen::<u64>())).collect()
 }
 
 fn generate_extension_field_elements(base_elements: &[FpE]) -> Vec<Fp3E> {
@@ -50,20 +48,14 @@ fn bench_fft_base_vs_extension(c: &mut Criterion) {
     // Benchmark base field FFT
     group.bench_function("goldilocks_base_field", |b| {
         b.iter(|| {
-            black_box(
-                Polynomial::evaluate_fft::<GoldilocksField>(&base_poly, 1, None)
-                    .unwrap()
-            )
+            black_box(Polynomial::evaluate_fft::<GoldilocksField>(&base_poly, 1, None).unwrap())
         })
     });
 
     // Benchmark extension field FFT
     group.bench_function("goldilocks_cubic_extension", |b| {
         b.iter(|| {
-            black_box(
-                Polynomial::evaluate_fft::<GoldilocksField>(&ext_poly, 1, None)
-                    .unwrap()
-            )
+            black_box(Polynomial::evaluate_fft::<GoldilocksField>(&ext_poly, 1, None).unwrap())
         })
     });
 
@@ -81,22 +73,12 @@ fn bench_fft_interpolate_base_vs_extension(c: &mut Criterion) {
 
     // Benchmark base field IFFT
     group.bench_function("goldilocks_base_field", |b| {
-        b.iter(|| {
-            black_box(
-                Polynomial::interpolate_fft::<GoldilocksField>(&base_evals)
-                    .unwrap()
-            )
-        })
+        b.iter(|| black_box(Polynomial::interpolate_fft::<GoldilocksField>(&base_evals).unwrap()))
     });
 
     // Benchmark extension field IFFT
     group.bench_function("goldilocks_cubic_extension", |b| {
-        b.iter(|| {
-            black_box(
-                Polynomial::interpolate_fft::<GoldilocksField>(&ext_evals)
-                    .unwrap()
-            )
-        })
+        b.iter(|| black_box(Polynomial::interpolate_fft::<GoldilocksField>(&ext_evals).unwrap()))
     });
 
     group.finish();

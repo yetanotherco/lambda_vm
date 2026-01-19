@@ -12,17 +12,16 @@
 //!   # Use samply (better for macOS)
 //!   samply record ./target/release/prove_profile --log-trace-size 14
 
+use math::field::{
+    element::FieldElement, fields::fft_friendly::stark_252_prime_field::Stark252PrimeField,
+};
 use stark::{
-    examples::simple_fibonacci::{fibonacci_trace, FibonacciAIR, FibonacciPublicInputs},
+    examples::simple_fibonacci::{FibonacciAIR, FibonacciPublicInputs, fibonacci_trace},
     proof::options::ProofOptions,
     prover::{IsStarkProver, Prover},
     traits::AIR,
     transcript::StoneProverTranscript,
     verifier::{IsStarkVerifier, Verifier},
-};
-use math::field::{
-    element::FieldElement,
-    fields::fft_friendly::stark_252_prime_field::Stark252PrimeField,
 };
 use std::{env, time::Instant};
 
@@ -112,11 +111,8 @@ fn run_fibonacci_proof(trace_size: usize, do_verify: bool) {
 
     // Prove
     let prove_start = Instant::now();
-    let proof = Prover::prove(
-        &air,
-        &mut trace,
-        &mut StoneProverTranscript::new(&[]),
-    ).expect("Proving failed");
+    let proof = Prover::prove(&air, &mut trace, &mut StoneProverTranscript::new(&[]))
+        .expect("Proving failed");
     let prove_time = prove_start.elapsed();
 
     println!("Prove time: {:?}", prove_time);
@@ -126,11 +122,7 @@ fn run_fibonacci_proof(trace_size: usize, do_verify: bool) {
     // Verify
     if do_verify {
         let verify_start = Instant::now();
-        let valid = Verifier::verify(
-            &proof,
-            &air,
-            &mut StoneProverTranscript::new(&[]),
-        );
+        let valid = Verifier::verify(&proof, &air, &mut StoneProverTranscript::new(&[]));
         let verify_time = verify_start.elapsed();
 
         println!("Verify time: {:?}", verify_time);

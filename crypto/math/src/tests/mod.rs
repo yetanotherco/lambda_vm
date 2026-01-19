@@ -13,6 +13,8 @@ pub mod fft_friendly_stark_252_tests;
 pub mod fft_friendly_u64_goldilocks_tests;
 pub mod fft_tests;
 pub mod field_element_tests;
+#[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+pub mod goldilocks_asm_tests;
 pub mod montgomery_backed_prime_fields_tests;
 pub mod msm_tests;
 pub mod polynomial_tests;
@@ -23,5 +25,3 @@ pub mod u64_prime_field_tests;
 pub mod unsigned_integer_montgomery_tests;
 pub mod unsigned_integer_u256_tests;
 pub mod unsigned_integer_u384_tests;
-#[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
-pub mod goldilocks_asm_tests;

@@ -193,10 +193,8 @@ impl IsSubFieldOf<Degree2GoldilocksNativeExtensionField> for GoldilocksField {
     ) -> <Degree2GoldilocksNativeExtensionField as IsField>::BaseType {
         #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
         {
-            let result = goldilocks_extensions_asm::fp2_scalar_mul(
-                *a,
-                [*b[0].value(), *b[1].value()],
-            );
+            let result =
+                goldilocks_extensions_asm::fp2_scalar_mul(*a, [*b[0].value(), *b[1].value()]);
             [FpE::from_raw(result[0]), FpE::from_raw(result[1])]
         }
         #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
@@ -213,10 +211,8 @@ impl IsSubFieldOf<Degree2GoldilocksNativeExtensionField> for GoldilocksField {
     ) -> <Degree2GoldilocksNativeExtensionField as IsField>::BaseType {
         #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
         {
-            let result = goldilocks_extensions_asm::fp2_add_base(
-                *a,
-                [*b[0].value(), *b[1].value()],
-            );
+            let result =
+                goldilocks_extensions_asm::fp2_add_base(*a, [*b[0].value(), *b[1].value()]);
             [FpE::from_raw(result[0]), FpE::from_raw(result[1])]
         }
         #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
@@ -231,7 +227,9 @@ impl IsSubFieldOf<Degree2GoldilocksNativeExtensionField> for GoldilocksField {
         b: &<Degree2GoldilocksNativeExtensionField as IsField>::BaseType,
     ) -> Result<<Degree2GoldilocksNativeExtensionField as IsField>::BaseType, FieldError> {
         let b_inv = Degree2GoldilocksNativeExtensionField::inv(b)?;
-        Ok(<Self as IsSubFieldOf<Degree2GoldilocksNativeExtensionField>>::mul(a, &b_inv))
+        Ok(<Self as IsSubFieldOf<
+            Degree2GoldilocksNativeExtensionField,
+        >>::mul(a, &b_inv))
     }
 
     fn sub(
@@ -240,10 +238,8 @@ impl IsSubFieldOf<Degree2GoldilocksNativeExtensionField> for GoldilocksField {
     ) -> <Degree2GoldilocksNativeExtensionField as IsField>::BaseType {
         #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
         {
-            let result = goldilocks_extensions_asm::fp2_sub_from_base(
-                *a,
-                [*b[0].value(), *b[1].value()],
-            );
+            let result =
+                goldilocks_extensions_asm::fp2_sub_from_base(*a, [*b[0].value(), *b[1].value()]);
             [FpE::from_raw(result[0]), FpE::from_raw(result[1])]
         }
         #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
@@ -300,7 +296,11 @@ impl IsField for Degree3GoldilocksNativeExtensionField {
                 [*a[0].value(), *a[1].value(), *a[2].value()],
                 [*b[0].value(), *b[1].value(), *b[2].value()],
             );
-            [FpE::from_raw(result[0]), FpE::from_raw(result[1]), FpE::from_raw(result[2])]
+            [
+                FpE::from_raw(result[0]),
+                FpE::from_raw(result[1]),
+                FpE::from_raw(result[2]),
+            ]
         }
         #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
         {
@@ -318,7 +318,11 @@ impl IsField for Degree3GoldilocksNativeExtensionField {
                 [*a[0].value(), *a[1].value(), *a[2].value()],
                 [*b[0].value(), *b[1].value(), *b[2].value()],
             );
-            [FpE::from_raw(result[0]), FpE::from_raw(result[1]), FpE::from_raw(result[2])]
+            [
+                FpE::from_raw(result[0]),
+                FpE::from_raw(result[1]),
+                FpE::from_raw(result[2]),
+            ]
         }
         #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
         {
@@ -333,11 +337,7 @@ impl IsField for Degree3GoldilocksNativeExtensionField {
             let t1 = (a[0] + a[1]) * (b[0] + b[1]) - v0 - v1;
             let t2 = (a[0] + a[2]) * (b[0] + b[2]) - v0 - v2;
 
-            [
-                v0 + t0.double(),
-                t1 + v2.double(),
-                t2 + v1,
-            ]
+            [v0 + t0.double(), t1 + v2.double(), t2 + v1]
         }
     }
 
@@ -346,10 +346,16 @@ impl IsField for Degree3GoldilocksNativeExtensionField {
     fn square(a: &Self::BaseType) -> Self::BaseType {
         #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
         {
-            let result = goldilocks_extensions_asm::fp3_square(
-                [*a[0].value(), *a[1].value(), *a[2].value()],
-            );
-            [FpE::from_raw(result[0]), FpE::from_raw(result[1]), FpE::from_raw(result[2])]
+            let result = goldilocks_extensions_asm::fp3_square([
+                *a[0].value(),
+                *a[1].value(),
+                *a[2].value(),
+            ]);
+            [
+                FpE::from_raw(result[0]),
+                FpE::from_raw(result[1]),
+                FpE::from_raw(result[2]),
+            ]
         }
         #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
         {
@@ -380,7 +386,11 @@ impl IsField for Degree3GoldilocksNativeExtensionField {
                 [*a[0].value(), *a[1].value(), *a[2].value()],
                 [*b[0].value(), *b[1].value(), *b[2].value()],
             );
-            [FpE::from_raw(result[0]), FpE::from_raw(result[1]), FpE::from_raw(result[2])]
+            [
+                FpE::from_raw(result[0]),
+                FpE::from_raw(result[1]),
+                FpE::from_raw(result[2]),
+            ]
         }
         #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
         {
@@ -393,10 +403,13 @@ impl IsField for Degree3GoldilocksNativeExtensionField {
     fn neg(a: &Self::BaseType) -> Self::BaseType {
         #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
         {
-            let result = goldilocks_extensions_asm::fp3_neg(
-                [*a[0].value(), *a[1].value(), *a[2].value()],
-            );
-            [FpE::from_raw(result[0]), FpE::from_raw(result[1]), FpE::from_raw(result[2])]
+            let result =
+                goldilocks_extensions_asm::fp3_neg([*a[0].value(), *a[1].value(), *a[2].value()]);
+            [
+                FpE::from_raw(result[0]),
+                FpE::from_raw(result[1]),
+                FpE::from_raw(result[2]),
+            ]
         }
         #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
         {
@@ -464,10 +477,16 @@ impl IsField for Degree3GoldilocksNativeExtensionField {
     fn double(a: &Self::BaseType) -> Self::BaseType {
         #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
         {
-            let result = goldilocks_extensions_asm::fp3_double(
-                [*a[0].value(), *a[1].value(), *a[2].value()],
-            );
-            [FpE::from_raw(result[0]), FpE::from_raw(result[1]), FpE::from_raw(result[2])]
+            let result = goldilocks_extensions_asm::fp3_double([
+                *a[0].value(),
+                *a[1].value(),
+                *a[2].value(),
+            ]);
+            [
+                FpE::from_raw(result[0]),
+                FpE::from_raw(result[1]),
+                FpE::from_raw(result[2]),
+            ]
         }
         #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
         {
@@ -487,7 +506,11 @@ impl IsSubFieldOf<Degree3GoldilocksNativeExtensionField> for GoldilocksField {
                 *a,
                 [*b[0].value(), *b[1].value(), *b[2].value()],
             );
-            [FpE::from_raw(result[0]), FpE::from_raw(result[1]), FpE::from_raw(result[2])]
+            [
+                FpE::from_raw(result[0]),
+                FpE::from_raw(result[1]),
+                FpE::from_raw(result[2]),
+            ]
         }
         #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
         {
@@ -508,7 +531,11 @@ impl IsSubFieldOf<Degree3GoldilocksNativeExtensionField> for GoldilocksField {
                 *a,
                 [*b[0].value(), *b[1].value(), *b[2].value()],
             );
-            [FpE::from_raw(result[0]), FpE::from_raw(result[1]), FpE::from_raw(result[2])]
+            [
+                FpE::from_raw(result[0]),
+                FpE::from_raw(result[1]),
+                FpE::from_raw(result[2]),
+            ]
         }
         #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
         {
@@ -522,7 +549,9 @@ impl IsSubFieldOf<Degree3GoldilocksNativeExtensionField> for GoldilocksField {
         b: &<Degree3GoldilocksNativeExtensionField as IsField>::BaseType,
     ) -> Result<<Degree3GoldilocksNativeExtensionField as IsField>::BaseType, FieldError> {
         let b_inv = Degree3GoldilocksNativeExtensionField::inv(b)?;
-        Ok(<Self as IsSubFieldOf<Degree3GoldilocksNativeExtensionField>>::mul(a, &b_inv))
+        Ok(<Self as IsSubFieldOf<
+            Degree3GoldilocksNativeExtensionField,
+        >>::mul(a, &b_inv))
     }
 
     fn sub(
@@ -535,7 +564,11 @@ impl IsSubFieldOf<Degree3GoldilocksNativeExtensionField> for GoldilocksField {
                 *a,
                 [*b[0].value(), *b[1].value(), *b[2].value()],
             );
-            [FpE::from_raw(result[0]), FpE::from_raw(result[1]), FpE::from_raw(result[2])]
+            [
+                FpE::from_raw(result[0]),
+                FpE::from_raw(result[1]),
+                FpE::from_raw(result[2]),
+            ]
         }
         #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
         {

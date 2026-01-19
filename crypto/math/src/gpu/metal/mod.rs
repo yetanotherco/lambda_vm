@@ -29,4 +29,4 @@ pub use errors::MetalError;
 pub use fft::MetalFFT;
 pub use fuzzing::{DifferentialFuzzer, FuzzConfig, FuzzReport, FuzzResult};
 pub use merkle::MetalMerkleTree;
-pub use merkle_fuzzing::{MerkleFuzzer, MerkleFuzzConfig, MerkleFuzzReport};
+pub use merkle_fuzzing::{MerkleFuzzConfig, MerkleFuzzReport, MerkleFuzzer};

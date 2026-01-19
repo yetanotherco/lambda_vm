@@ -6,9 +6,9 @@
 //!
 //! Run with: cargo bench --features asm-arm64 -- asm
 
-use criterion::{criterion_group, criterion_main, Criterion};
 #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
-use criterion::{black_box, BenchmarkId, Throughput};
+use criterion::{BenchmarkId, Throughput, black_box};
+use criterion::{Criterion, criterion_group, criterion_main};
 
 #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
 mod asm_benches {
@@ -40,7 +40,11 @@ mod asm_benches {
         let t1 = x_hi_lo.wrapping_mul(EPSILON);
 
         let (result, carry) = t0.overflowing_add(t1);
-        if carry { result.wrapping_add(EPSILON) } else { result }
+        if carry {
+            result.wrapping_add(EPSILON)
+        } else {
+            result
+        }
     }
 
     fn native_reduce128_shift(x: u128) -> u64 {
@@ -56,7 +60,11 @@ mod asm_benches {
         let t1 = (x_hi_lo << 32).wrapping_sub(x_hi_lo);
 
         let (result, carry) = t0.overflowing_add(t1);
-        if carry { result.wrapping_add(EPSILON) } else { result }
+        if carry {
+            result.wrapping_add(EPSILON)
+        } else {
+            result
+        }
     }
 
     fn native_mul_shift(a: u64, b: u64) -> u64 {
@@ -67,13 +75,21 @@ mod asm_benches {
     fn native_add(a: u64, b: u64) -> u64 {
         let (sum, over) = a.overflowing_add(b);
         let (sum, over2) = sum.overflowing_add((over as u64) * EPSILON);
-        if over2 { sum.wrapping_add(EPSILON) } else { sum }
+        if over2 {
+            sum.wrapping_add(EPSILON)
+        } else {
+            sum
+        }
     }
 
     fn native_sub(a: u64, b: u64) -> u64 {
         let (diff, under) = a.overflowing_sub(b);
         let (diff, under2) = diff.overflowing_sub((under as u64) * EPSILON);
-        if under2 { diff.wrapping_sub(EPSILON) } else { diff }
+        if under2 {
+            diff.wrapping_sub(EPSILON)
+        } else {
+            diff
+        }
     }
 
     fn generate_random_pairs(count: usize, seed: u64) -> Vec<(u64, u64)> {

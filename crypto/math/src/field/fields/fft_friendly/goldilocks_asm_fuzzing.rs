@@ -42,7 +42,9 @@ pub struct Xorshift64 {
 
 impl Xorshift64 {
     pub fn new(seed: u64) -> Self {
-        Self { state: if seed == 0 { 1 } else { seed } }
+        Self {
+            state: if seed == 0 { 1 } else { seed },
+        }
     }
 
     pub fn next(&mut self) -> u64 {
@@ -107,7 +109,11 @@ impl GoldilocksAsmFuzzer {
 
     /// Canonicalize a value to [0, p).
     fn canonicalize(x: u64) -> u64 {
-        if x >= GOLDILOCKS_PRIME { x - GOLDILOCKS_PRIME } else { x }
+        if x >= GOLDILOCKS_PRIME {
+            x - GOLDILOCKS_PRIME
+        } else {
+            x
+        }
     }
 
     // Reference implementations (native Rust)
@@ -128,19 +134,31 @@ impl GoldilocksAsmFuzzer {
         let t1 = x_hi_lo.wrapping_mul(EPSILON);
 
         let (result, carry) = t0.overflowing_add(t1);
-        if carry { result.wrapping_add(EPSILON) } else { result }
+        if carry {
+            result.wrapping_add(EPSILON)
+        } else {
+            result
+        }
     }
 
     fn native_add(a: u64, b: u64) -> u64 {
         let (sum, over) = a.overflowing_add(b);
         let (sum, over2) = sum.overflowing_add((over as u64) * EPSILON);
-        if over2 { sum.wrapping_add(EPSILON) } else { sum }
+        if over2 {
+            sum.wrapping_add(EPSILON)
+        } else {
+            sum
+        }
     }
 
     fn native_sub(a: u64, b: u64) -> u64 {
         let (diff, under) = a.overflowing_sub(b);
         let (diff, under2) = diff.overflowing_sub((under as u64) * EPSILON);
-        if under2 { diff.wrapping_sub(EPSILON) } else { diff }
+        if under2 {
+            diff.wrapping_sub(EPSILON)
+        } else {
+            diff
+        }
     }
 
     /// Generate edge case test pairs (all values reduced to [0, p)).
@@ -177,7 +195,10 @@ impl GoldilocksAsmFuzzer {
             (0xDEADBEEF % GOLDILOCKS_PRIME, 0x12345678 % GOLDILOCKS_PRIME),
             // Values that produce specific hi patterns in mul
             ((1u64 << 40), (1u64 << 40)),
-            ((1u64 << 48) % GOLDILOCKS_PRIME, (1u64 << 48) % GOLDILOCKS_PRIME),
+            (
+                (1u64 << 48) % GOLDILOCKS_PRIME,
+                (1u64 << 48) % GOLDILOCKS_PRIME,
+            ),
         ]
     }
 
@@ -342,13 +363,37 @@ mod tests {
         let report = fuzzer.run_differential_tests();
 
         println!("Differential Fuzzer Report:");
-        println!("  Multiplication: {}/{} passed", report.mul_tests - report.mul_failures, report.mul_tests);
-        println!("  Addition: {}/{} passed", report.add_tests - report.add_failures, report.add_tests);
-        println!("  Subtraction: {}/{} passed", report.sub_tests - report.sub_failures, report.sub_tests);
-        println!("  Reduce128: {}/{} passed", report.reduce128_tests - report.reduce128_failures, report.reduce128_tests);
-        println!("  Total: {}/{} passed", report.total_tests() - report.total_failures(), report.total_tests());
+        println!(
+            "  Multiplication: {}/{} passed",
+            report.mul_tests - report.mul_failures,
+            report.mul_tests
+        );
+        println!(
+            "  Addition: {}/{} passed",
+            report.add_tests - report.add_failures,
+            report.add_tests
+        );
+        println!(
+            "  Subtraction: {}/{} passed",
+            report.sub_tests - report.sub_failures,
+            report.sub_tests
+        );
+        println!(
+            "  Reduce128: {}/{} passed",
+            report.reduce128_tests - report.reduce128_failures,
+            report.reduce128_tests
+        );
+        println!(
+            "  Total: {}/{} passed",
+            report.total_tests() - report.total_failures(),
+            report.total_tests()
+        );
 
-        assert!(report.passed(), "Differential fuzzing found {} failures", report.total_failures());
+        assert!(
+            report.passed(),
+            "Differential fuzzing found {} failures",
+            report.total_failures()
+        );
     }
 
     #[test]
@@ -361,8 +406,12 @@ mod tests {
         let mut fuzzer = GoldilocksAsmFuzzer::new(config, 67890);
         let report = fuzzer.run_differential_tests();
 
-        assert!(report.passed(), "Differential fuzzing found {} failures out of {} tests",
-            report.total_failures(), report.total_tests());
+        assert!(
+            report.passed(),
+            "Differential fuzzing found {} failures out of {} tests",
+            report.total_failures(),
+            report.total_tests()
+        );
     }
 
     #[test]
@@ -396,6 +445,10 @@ mod tests {
         let mut fuzzer = GoldilocksAsmFuzzer::new(config, 0);
         let report = fuzzer.run_differential_tests();
 
-        assert!(report.passed(), "Edge case testing found {} failures", report.total_failures());
+        assert!(
+            report.passed(),
+            "Edge case testing found {} failures",
+            report.total_failures()
+        );
     }
 }

@@ -1,23 +1,23 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use rand::Rng;
 
 // Lambda VM field types
 use math::field::element::FieldElement;
 use math::field::fields::fft_friendly::babybear::Babybear31PrimeField;
-use math::field::fields::fft_friendly::u64_goldilocks::U64GoldilocksPrimeField;
-use math::field::fields::fft_friendly::u64_goldilocks_native::GoldilocksField as GoldilocksNative;
 use math::field::fields::fft_friendly::extensions_goldilocks_native::{
     Degree2GoldilocksNativeExtensionField, Degree3GoldilocksNativeExtensionField,
 };
+use math::field::fields::fft_friendly::u64_goldilocks::U64GoldilocksPrimeField;
+use math::field::fields::fft_friendly::u64_goldilocks_native::GoldilocksField as GoldilocksNative;
 
 // Plonky3 field types
 use p3_baby_bear::BabyBear;
-use p3_goldilocks::Goldilocks;
 use p3_field::{Field, PrimeCharacteristicRing, extension::BinomialExtensionField};
+use p3_goldilocks::Goldilocks;
 
 type LambdaBabyBear = FieldElement<Babybear31PrimeField>;
-type LambdaGoldilocksMont = FieldElement<U64GoldilocksPrimeField>;  // Montgomery form
-type LambdaGoldilocksNative = FieldElement<GoldilocksNative>;       // Native form
+type LambdaGoldilocksMont = FieldElement<U64GoldilocksPrimeField>; // Montgomery form
+type LambdaGoldilocksNative = FieldElement<GoldilocksNative>; // Native form
 type LambdaGoldilocksFp2 = FieldElement<Degree2GoldilocksNativeExtensionField>;
 type LambdaGoldilocksFp3 = FieldElement<Degree3GoldilocksNativeExtensionField>;
 
@@ -165,11 +165,23 @@ fn bench_babybear_inv(c: &mut Criterion) {
 
     let lambda_a: Vec<_> = generate_lambda_babybear(BATCH_SIZE)
         .into_iter()
-        .map(|x| if x == LambdaBabyBear::zero() { LambdaBabyBear::one() } else { x })
+        .map(|x| {
+            if x == LambdaBabyBear::zero() {
+                LambdaBabyBear::one()
+            } else {
+                x
+            }
+        })
         .collect();
     let plonky3_a: Vec<_> = generate_plonky3_babybear(BATCH_SIZE)
         .into_iter()
-        .map(|x| if x == BabyBear::ZERO { BabyBear::ONE } else { x })
+        .map(|x| {
+            if x == BabyBear::ZERO {
+                BabyBear::ONE
+            } else {
+                x
+            }
+        })
         .collect();
 
     group.bench_function("lambda_vm", |b| {
@@ -274,15 +286,33 @@ fn bench_goldilocks_inv(c: &mut Criterion) {
 
     let mont_a: Vec<_> = generate_lambda_goldilocks_mont(BATCH_SIZE)
         .into_iter()
-        .map(|x| if x == LambdaGoldilocksMont::zero() { LambdaGoldilocksMont::one() } else { x })
+        .map(|x| {
+            if x == LambdaGoldilocksMont::zero() {
+                LambdaGoldilocksMont::one()
+            } else {
+                x
+            }
+        })
         .collect();
     let native_a: Vec<_> = generate_lambda_goldilocks_native(BATCH_SIZE)
         .into_iter()
-        .map(|x| if x == LambdaGoldilocksNative::zero() { LambdaGoldilocksNative::one() } else { x })
+        .map(|x| {
+            if x == LambdaGoldilocksNative::zero() {
+                LambdaGoldilocksNative::one()
+            } else {
+                x
+            }
+        })
         .collect();
     let plonky3_a: Vec<_> = generate_plonky3_goldilocks(BATCH_SIZE)
         .into_iter()
-        .map(|x| if x == Goldilocks::ZERO { Goldilocks::ONE } else { x })
+        .map(|x| {
+            if x == Goldilocks::ZERO {
+                Goldilocks::ONE
+            } else {
+                x
+            }
+        })
         .collect();
 
     group.bench_function("lambda_vm_montgomery", |b| {
@@ -375,11 +405,23 @@ fn bench_goldilocks_fp2_inv(c: &mut Criterion) {
 
     let lambda_a: Vec<_> = generate_lambda_goldilocks_fp2(BATCH_SIZE)
         .into_iter()
-        .map(|x| if x == LambdaGoldilocksFp2::zero() { LambdaGoldilocksFp2::one() } else { x })
+        .map(|x| {
+            if x == LambdaGoldilocksFp2::zero() {
+                LambdaGoldilocksFp2::one()
+            } else {
+                x
+            }
+        })
         .collect();
     let plonky3_a: Vec<_> = generate_plonky3_goldilocks_fp2(BATCH_SIZE)
         .into_iter()
-        .map(|x| if x == P3GoldilocksFp2::ZERO { P3GoldilocksFp2::ONE } else { x })
+        .map(|x| {
+            if x == P3GoldilocksFp2::ZERO {
+                P3GoldilocksFp2::ONE
+            } else {
+                x
+            }
+        })
         .collect();
 
     group.bench_function("lambda_vm", |b| {
@@ -444,7 +486,13 @@ fn bench_goldilocks_fp3_inv(c: &mut Criterion) {
 
     let lambda_a: Vec<_> = generate_lambda_goldilocks_fp3(BATCH_SIZE)
         .into_iter()
-        .map(|x| if x == LambdaGoldilocksFp3::zero() { LambdaGoldilocksFp3::one() } else { x })
+        .map(|x| {
+            if x == LambdaGoldilocksFp3::zero() {
+                LambdaGoldilocksFp3::one()
+            } else {
+                x
+            }
+        })
         .collect();
 
     group.bench_function("lambda_vm", |b| {
