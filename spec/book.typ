@@ -28,3 +28,5 @@
 ]
 #let rj = todo.with(background: teal, name: "Robin")
 #let et = todo.with(background: rgb("d4aa3a"), name: "Erik")
+
+#let aside(body) = figure(block(fill: rgb("55aaff"), inset: 1em, stroke: black, breakable: false, align(left, body)))

@@ -1,4 +1,4 @@
-#import "/book.typ": book-page, rj
+#import "/book.typ": book-page, rj, aside
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   render_chip_assumptions,
@@ -18,11 +18,13 @@
 
 As part of fully proving the correct execution of a RISC-V program,
 it is necessary to ensure that memory reads and writes are consistent.
-That is, every value read from some address corresponds to the value that was last written to that address
+That is, every byte read from some address corresponds to the byte that was last written to that address
 --- or the initial value if nothing has been written yet.
 We consider "memory" in a broad sense here:
 both RAM and the general purpose registers can be seen as instantiations of memory
-and are therefore handled simultaneously.
+and are therefore handled simultaneously.#footnote[
+  While RAM is byte addressed, we do choose to store registers as a dword over two word addresses.
+]
 
 On a high level, we ensure memory consistency by an interacting system of
 reads and writes to a lookup argument, combined with an initialization and finalization scheme.
@@ -53,22 +55,51 @@ Every memory operation has some conceptual attributes that are relevant to menti
 - When the value was read or written, see the below paragraph
 
 Since we will have to ensure that memory accesses are temporally consistent within the execution of the VM,
-we additionally consider a _unique timestamp_ for every memory access, that should be strictly increasing.
+we additionally consider a _timestamp_ for  every memory access, that should be strictly increasing.
+As such, it should never be possible for the system to generate accesses to the same address at identical timestamps.
 Multiple memory accesses can (and indeed will, consider e.g. register reads) occur in a single execution cycle of the VM,
 so we cannot use the cycle counter directly as timestamp for register accesses.
-We can, however, statically bound the maximal number of memory accesses made during a single execution by a constant $k$
+We can, however, statically bound the maximal number of memory accesses made during a single execution by a granularity constant $k$
 and derive timestamps from the cycle counter.
 The $i$th possible memory access in cycle $c$ will obtain as timestamp the value $k dot c + i$.
 For simplicity, we will always reserve a timestamp for every possible memory access, and leave the timestamp unused if an instruction does not use it.
 
-#rj[Maybe we can find a nice way to show these notes/asides]
-*Note on “simultaneous” memory accesses*: For reasons of completeness (since temporal integrity as discussed below is a security necessity),
-we cannot deal with multiple accesses to the same address at identical timestamps.
-However, if multiple accesses are guaranteed to be independent (that is, to different addresses), they can still share a timestamp
---- consider, e.g., the case of reading a word as 4 bytes with the `LW` load instruction.
-This property is already taken into account where possible in the design of the system.
+#aside[
+  *Note on “simultaneous” memory accesses*: For reasons of completeness (since temporal integrity as discussed below is a security necessity),
+  we cannot deal with multiple accesses to the same address at identical timestamps.
+  However, if multiple accesses are guaranteed to be independent (that is, to different addresses), they can still share a timestamp
+  --- consider, e.g., the case of reading a word as 4 bytes with the `LW` load instruction.
+  This property is already taken into account where possible in the design of the system.
+  For instance, in the CPU chip, we can ensure that there are at most 3 memory accesses not guaranteed
+  to be independent, so a timestamp granularity of 4 timestamps per cycle is enough.
+]
+
 
 == Permutation argument
+
+We can conceptually organise the state of the memory as a collection of "tokens" that represent tuples
+$(serif("timestamp"), serif("address"), serif("value"))$,
+meaning the current value written to $serif("address")$ is $serif("value")$,
+last written to memory at $serif("timestamp")$.
+Having exactly one value associated with any address will be ensured (see further down in this document)
+by the interaction of memory initialization, memory finalization, and the effects of memory operations.
+
+Each memory operation will then do two things:
+
+- Consume the current token in the memory
+- Emit a new token to replace it
+
+Naturally, for a read operation, the values embedded in the consumed and emitted tokens must be identical.
+From the need to consume a token even on the first memory access,
+we can see the necessity for a memory initialization procedure
+---in addition to having to make sure the initial memory content lines up with what the binary dictates.
+
+Given that we can properly constrain temporal integrity (that is, no memory operation can consume future tokens),
+this "balancing" act of tokens can be integrated (with sufficient domain separation) into the existing LogUp argument:
+consuming a token corresponds to a "receive" and emitting a new token is a "send".
+#rj[properly link/refer to the logup spec]
+
+== Temporal integrity
 
 To ensure temporal integrity, every memory operation needs to be constrained for the newly emitted token
 to have a strictly greater timestamp than the consumed token.
@@ -78,17 +109,19 @@ as over a finite field the “less than” relation is ill-defined
 We choose to represent timestamps as machine words, using the existing `LT` chip functionality for comparisons.
 #rj[Properly link/refer to the LT chip]
 
-*Note on alternative options and trade-offs for timestamp representation*:
-#grid(columns: (1fr, 1fr), gutter: 1em)[#align(center, emph[Machine word])][#align(center, emph[Field element])][
-  - Clean definition of “less-than”, using the already existing `LT` functionality in the ALU
-  - Harder to perform increments, needing extra constraints beyond field arithmetic
-    - But this can be alleviated by providing a precomputed column that has a fixed increment per CPU row
-][
-  - Comparison is more annoying, but can work by:
-    - Decomposition into a machine word and chip interaction with the LT chip
-    - Bit decomposition and comparison constraints
-    - Range-checking the difference to be sufficiently small w.r.t. the field characteristic.
-  - Increments and basic arithmetic operations are cheap
+#aside[
+  *Note on options and trade-offs for timestamp representation*:
+  #grid(columns: (1fr, 1fr), gutter: 1em)[#align(center, emph[Machine word])][#align(center, emph[Field element])][
+    - Clean definition of “less-than”, using the already existing `LT` functionality in the ALU
+    - Harder to perform increments, needing extra constraints beyond field arithmetic
+      - But this can be alleviated by providing a precomputed column that has a fixed increment per CPU row
+  ][
+    - Comparison is more annoying, but can work by:
+      - Decomposition into a machine word and chip interaction with the LT chip
+      - Bit decomposition and comparison constraints
+      - Range-checking the difference to be sufficiently small w.r.t. the field characteristic.
+    - Increments and basic arithmetic operations are cheap
+  ]
 ]
 
 #rj[reference to CPU chip/timestamp column and MEMW chip]
@@ -127,45 +160,68 @@ For each such table, the `page` variable is instantiated as the constant base ad
 The `offset` column is preprocessed, which helps the verifier ensure that each page has a single fixed size,
 but the verifier should still check that no pages overlap and all `page` values are page-aligned.
 
+=== Page initialization
+
+#rj[check whether we need `fini` to be range-checked]
+We present here a set of constraints on the `PAGE` table that
+
++ enforces the initial and final values of each address are bytes
++ adds the initial and final interaction to the LogUp argument
+
+For zero-initialized pages, `init` can be a constant `0`,
+and hence doesn't need a column, nor a range check.
+
 #render_chip_column_table(chip, config)
 #render_constraint_table(chip, config)
 
 
-*Note on alternatives and trade-offs*:
-We identify a few alternatives that would achieve the desired initialization/finalization functionalities, and consider their respective trade-offs.
+#aside[
+  *Note on alternatives and trade-offs*:
+  We identify a few alternatives that would achieve the desired initialization/finalization functionalities, and consider their respective trade-offs.
 
-#rj[Not really content with the 1:2 split, but otherwise one column is far longer than the other, which is also pretty annoying.
-Could just do it one after the other instead, like we have it on notion]
-#grid(columns: (1fr, 2fr), gutter: 1em)[_"Free-zero" initialization_][_Sparse initialization/finalization_][
-  Zero-initialization could be achieved by allowing the `MEMW` chip to output a zero
-  without consuming a token from the lookup argument.
-  This would in turn be made secure by finalization consuming at most one token per address:
-  if an address is initialized more than once, the proof cannot be finalized.
-  - This requires fewer pages (and hence tables) for zero-initialization.
-  - But it comes at a cost of added complexity in the `MEMW `chip, and likely some extra columns to handle this.
-    Keeping track of initialized addresses, and potentially having to initialize only some of the bytes in a word-read
-    may make bookkeeping challenging.
-  - This is an alternative form of sparse initialization (see below), so it is incompatible with paged finalization.
-    Paged finalization can be made into a compatible sparse form by adding a bit-checked multiplicity column.
-][
-  One or more STARK tables (depending on the amount of memory used) consisting of `(address, value)` columns are introduced,
-  where for zero-initialization, `value` can be constant zero.
-  Transition constraints ensure that `address` is strictly increasing, enforcing the "at most once" property;
-  `value` is range-checked to consist of bytes.
-  Similar to paged finalization, an additional `timestamp` column is added, containing the final timestamp each address was accessed.
-  This table is then further used to contribute to the LogUp sum as with any other interactions.
-  - The transition constraints can be chosen to only apply on finalization, as at-most-once finalization is enough to ensure consistency.
-  - Sparse initialization is incompatible with paged finalization, see also the remark under free-zero initialization above.
-  - This would require transition constraints, which currently are not needed elsewhere in the VM design
-    - Additionally, for memory use exceeding the capacity of a single initialization/finalization table, some form of transition constraint between tables is needed
-    - Alternatively, transition constraints could potentially be avoided by more integration into the LogUp system, but this could turn out more costly in practice
-  - This is compatible with the above "free zero" initialization
-  - Since a prover-committed address column is needed (rather than a precomputed one), the number of required columns increases.
-    - As an optimization, the address column could potentially be used simultaneously for initialization and finalization
-  - Sparse initialization/finalization reduces the cost for sparse memory access patterns,
-    where only a few addresses would be accessed per page.
-    Most programs and compilers should however favor a memory locality that makes paged initialization/finalization comparable.
+  #rj[Not really content with the 1:2 split, but otherwise one column is far longer than the other, which is also pretty annoying.
+  Could just do it one after the other instead, like we have it on notion]
+  #grid(columns: (1fr, 2fr), gutter: 1em)[_"Free-zero" initialization_][_Sparse initialization/finalization_][
+    Zero-initialization could be achieved by allowing the `MEMW` chip to output a zero
+    without consuming a token from the lookup argument.
+    This would in turn be made secure by finalization consuming at most one token per address:
+    if an address is initialized more than once, the proof cannot be finalized.
+    - This requires fewer pages (and hence tables) for zero-initialization.
+    - But it comes at a cost of added complexity in the `MEMW `chip, and likely some extra columns to handle this.
+      Keeping track of initialized addresses, and potentially having to initialize only some of the bytes in a word-read
+      may make bookkeeping challenging.
+    - This is an alternative form of sparse initialization (see below), so it is incompatible with paged finalization.
+      Paged finalization can be made into a compatible sparse form by adding a bit-checked multiplicity column.
+  ][
+    One or more STARK tables (depending on the amount of memory used) consisting of `(address, value)` columns are introduced,
+    where for zero-initialization, `value` can be constant zero.
+    Transition constraints ensure that `address` is strictly increasing, enforcing the "at most once" property;
+    `value` is range-checked to consist of bytes.
+    Similar to paged finalization, an additional `timestamp` column is added, containing the final timestamp each address was accessed.
+    This table is then further used to contribute to the LogUp sum as with any other interactions.
+    - The transition constraints can be chosen to only apply on finalization, as at-most-once finalization is enough to ensure consistency.
+    - Sparse initialization is incompatible with paged finalization, see also the remark under free-zero initialization above.
+    - This would require transition constraints, which currently are not needed elsewhere in the VM design
+      - Additionally, for memory use exceeding the capacity of a single initialization/finalization table, some form of transition constraint between tables is needed
+      - Alternatively, transition constraints could potentially be avoided by more integration into the LogUp system, but this could turn out more costly in practice
+    - This is compatible with the above "free zero" initialization
+    - Since a prover-committed address column is needed (rather than a precomputed one), the number of required columns increases.
+      - As an optimization, the address column could potentially be used simultaneously for initialization and finalization
+    - Sparse initialization/finalization reduces the cost for sparse memory access patterns,
+      where only a few addresses would be accessed per page.
+      Most programs and compilers should however favor a memory locality that makes paged initialization/finalization comparable.
+  ]
 ]
+
+=== Register initialization/finalization
+
+#rj[Properly link/reference ECALL/HALT chip]
+The initial and final state of registers can be entirely known by
+the verifier, since the relevant initialization values are either zero,
+or embedded in the ELF, and the final values can be set to a known value
+by the HALT ecall.
+As additionally, the number of registers is small, the verifier can directly
+add the required balancing terms to the LogUp sum.
 
 == Notes and considerations
 
