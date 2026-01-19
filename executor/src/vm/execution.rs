@@ -12,12 +12,12 @@ use crate::vm::{
 
 pub struct ReturnValues {
     pub memory_values: Vec<u8>,
-    pub register_values: (i32, i32),
+    pub register_values: (i64, i64),
 }
 
 pub fn run_program(
-    instruction_map: BTreeMap<u32, u32>,
-    entrypoint: u32,
+    instruction_map: BTreeMap<u64, u32>,
+    entrypoint: u64,
     private_inputs: Vec<u8>,
 ) -> Result<(ReturnValues, Vec<Log>), ExecutorError> {
     let mut memory = Memory::default();
@@ -28,7 +28,7 @@ pub fn run_program(
     run_from_entrypoint(&mut memory, entrypoint, &decoded_instructions)
 }
 
-fn predecode_instructions(instruction_map: &BTreeMap<u32, u32>) -> BTreeMap<u32, Instruction> {
+fn predecode_instructions(instruction_map: &BTreeMap<u64, u32>) -> BTreeMap<u64, Instruction> {
     let mut decoded = BTreeMap::new();
     for (&addr, &raw) in instruction_map {
         // Skip addresses that don't contain valid instructions (data sections)
@@ -40,7 +40,7 @@ fn predecode_instructions(instruction_map: &BTreeMap<u32, u32>) -> BTreeMap<u32,
 }
 
 fn load_program(
-    instruction_map: BTreeMap<u32, u32>,
+    instruction_map: BTreeMap<u64, u32>,
     memory: &mut Memory,
 ) -> Result<(), MemoryError> {
     for (addr, instruction) in instruction_map {
@@ -51,8 +51,8 @@ fn load_program(
 
 fn run_from_entrypoint(
     memory: &mut Memory,
-    entrypoint: u32,
-    decoded_instructions: &BTreeMap<u32, Instruction>,
+    entrypoint: u64,
+    decoded_instructions: &BTreeMap<u64, Instruction>,
 ) -> Result<(ReturnValues, Vec<Log>), ExecutorError> {
     let mut pc = entrypoint;
     let mut registers = Registers::default();
@@ -77,8 +77,8 @@ fn run_from_entrypoint(
         ReturnValues {
             memory_values: memory_return_value,
             register_values: (
-                registers_return_values.0 as i32,
-                registers_return_values.1 as i32,
+                registers_return_values.0 as i64,
+                registers_return_values.1 as i64,
             ),
         },
         logs,
