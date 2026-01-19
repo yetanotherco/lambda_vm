@@ -11,7 +11,8 @@ use math::field::fields::fft_friendly::{
 
 use crate::constraints::transition::TransitionConstraint;
 use crate::lookup::{
-    AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, NullBoundaryConstraintBuilder, Packing,
+    AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, Multiplicity,
+    NullBoundaryConstraintBuilder, Packing,
 };
 use crate::proof::options::ProofOptions;
 use crate::proof::stark::MultiProof;
@@ -174,8 +175,8 @@ fn create_cpu_air(
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![
-            BusInteraction::sender(Some(0), Packing::Direct.columns(&[2, 3, 4])),
-            BusInteraction::sender(Some(1), Packing::Direct.columns(&[2, 3, 4])),
+            BusInteraction::sender(Multiplicity::Column(0), Packing::Direct.columns(&[2, 3, 4])),
+            BusInteraction::sender(Multiplicity::Column(1), Packing::Direct.columns(&[2, 3, 4])),
         ],
     };
     AirWithBuses::new(
@@ -193,7 +194,7 @@ fn create_add_air(
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![BusInteraction::receiver(
-            Some(3),
+            Multiplicity::Column(3),
             Packing::Direct.columns(&[0, 1, 2]),
         )],
     };
@@ -212,7 +213,7 @@ fn create_mul_air(
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![BusInteraction::receiver(
-            Some(3),
+            Multiplicity::Column(3),
             Packing::Direct.columns(&[0, 1, 2]),
         )],
     };
