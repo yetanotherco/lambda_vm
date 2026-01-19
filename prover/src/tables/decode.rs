@@ -66,9 +66,10 @@ impl DecodeTableRow {
     pub const INSTRUCTION: usize = 13;
     pub const MULTIPLICITY: usize = 14;
 
+    // TODO: Properly migrate to 64-bit when prover is updated (separate PR)
     pub fn from_log(log: &Log) -> Self {
         let mut row = Self {
-            pc: u32_to_2_limbs(log.current_pc),
+            pc: u32_to_2_limbs(log.current_pc as u32),
             ..Default::default()
         };
 
@@ -214,6 +215,15 @@ impl DecodeTableRow {
                     }
                     LoadStoreWidth::ByteUnsigned => (),
                     LoadStoreWidth::HalfUnsigned => row.memory_2bytes = FE::one(),
+                    // TODO: RV64 - properly handle DoubleWord and WordUnsigned in prover migration
+                    LoadStoreWidth::DoubleWord => {
+                        row.memory_2bytes = FE::one();
+                        row.memory_4bytes = FE::one();
+                    }
+                    LoadStoreWidth::WordUnsigned => {
+                        row.memory_2bytes = FE::one();
+                        row.memory_4bytes = FE::one();
+                    }
                 }
             }
 

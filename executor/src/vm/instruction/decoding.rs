@@ -9,6 +9,9 @@ const JUMP_AND_LINK_OPCODE: u32 = 0b1101111;
 const LOAD_UPPER_IMM_OPCODE: u32 = 0b0110111;
 const ADD_UPPER_IMM_TO_PC: u32 = 0b0010111;
 const SYSTEM_OPCODE: u32 = 0b1110011;
+// RV64 specific opcodes
+const ARITH_IMM_32_OPCODE: u32 = 0b0011011; // 0x1B - ADDIW, SLLIW, SRLIW, SRAIW
+const ARITH_32_OPCODE: u32 = 0b0111011; // 0x3B - ADDW, SUBW, SLLW, SRLW, SRAW, MULW, etc.
 
 #[derive(Debug)]
 pub enum Opcode {
@@ -22,6 +25,9 @@ pub enum Opcode {
     LoadUpperImm,
     AddUpperImmToPc,
     System,
+    // RV64 specific
+    ArithImm32, // OP-IMM-32: W-suffix immediate instructions
+    Arith32,    // OP-32: W-suffix register instructions
 }
 
 impl TryFrom<u32> for Opcode {
@@ -39,6 +45,8 @@ impl TryFrom<u32> for Opcode {
             LOAD_UPPER_IMM_OPCODE => Opcode::LoadUpperImm,
             ADD_UPPER_IMM_TO_PC => Opcode::AddUpperImmToPc,
             SYSTEM_OPCODE => Opcode::System,
+            ARITH_IMM_32_OPCODE => Opcode::ArithImm32,
+            ARITH_32_OPCODE => Opcode::Arith32,
             _ => return Err(InstructionError::UnknownOpcode(value)),
         })
     }
@@ -56,14 +64,16 @@ enum InstructionFormat {
 impl Opcode {
     fn instruction_format(&self) -> InstructionFormat {
         match self {
-            &Opcode::Arith => InstructionFormat::R,
-            &Opcode::ArithImm | &Opcode::Load | &Opcode::JumpAndLinkRegister | &Opcode::System => {
-                InstructionFormat::I
-            }
-            &Opcode::Store => InstructionFormat::S,
-            &Opcode::Branch => InstructionFormat::B,
-            &Opcode::JumpAndLink => InstructionFormat::J,
-            &Opcode::LoadUpperImm | &Opcode::AddUpperImmToPc => InstructionFormat::U,
+            Opcode::Arith | Opcode::Arith32 => InstructionFormat::R,
+            Opcode::ArithImm
+            | Opcode::ArithImm32
+            | Opcode::Load
+            | Opcode::JumpAndLinkRegister
+            | Opcode::System => InstructionFormat::I,
+            Opcode::Store => InstructionFormat::S,
+            Opcode::Branch => InstructionFormat::B,
+            Opcode::JumpAndLink => InstructionFormat::J,
+            Opcode::LoadUpperImm | Opcode::AddUpperImmToPc => InstructionFormat::U,
         }
     }
 }
@@ -93,16 +103,20 @@ pub enum ArithOp {
 const LOAD_STORE_BYTE_WIDTH: u32 = 0x0;
 const LOAD_STORE_HALF_WIDTH: u32 = 0x1;
 const LOAD_STORE_WORD_WIDTH: u32 = 0x2;
+const LOAD_STORE_DOUBLEWORD_WIDTH: u32 = 0x3; // RV64: LD/SD
 const LOAD_BYTE_UNSIGNED_FUNC: u32 = 0x4;
 const LOAD_HALF_UNSIGNED_FUNC: u32 = 0x5;
+const LOAD_WORD_UNSIGNED_FUNC: u32 = 0x6; // RV64: LWU
 
 #[derive(Debug, Clone, Copy)]
 pub enum LoadStoreWidth {
     Byte,
     Half,
     Word,
+    DoubleWord, // RV64: LD/SD
     ByteUnsigned,
     HalfUnsigned,
+    WordUnsigned, // RV64: LWU
 }
 
 impl LoadStoreWidth {
@@ -111,8 +125,20 @@ impl LoadStoreWidth {
             LOAD_STORE_BYTE_WIDTH => LoadStoreWidth::Byte,
             LOAD_STORE_HALF_WIDTH => LoadStoreWidth::Half,
             LOAD_STORE_WORD_WIDTH => LoadStoreWidth::Word,
+            LOAD_STORE_DOUBLEWORD_WIDTH => LoadStoreWidth::DoubleWord,
             LOAD_BYTE_UNSIGNED_FUNC => LoadStoreWidth::ByteUnsigned,
             LOAD_HALF_UNSIGNED_FUNC => LoadStoreWidth::HalfUnsigned,
+            LOAD_WORD_UNSIGNED_FUNC => LoadStoreWidth::WordUnsigned,
+            width => return Err(InstructionError::InvalidLoadStoreWidth(width)),
+        })
+    }
+
+    fn from_func3_store(func3: u32) -> Result<LoadStoreWidth, InstructionError> {
+        Ok(match func3 {
+            LOAD_STORE_BYTE_WIDTH => LoadStoreWidth::Byte,
+            LOAD_STORE_HALF_WIDTH => LoadStoreWidth::Half,
+            LOAD_STORE_WORD_WIDTH => LoadStoreWidth::Word,
+            LOAD_STORE_DOUBLEWORD_WIDTH => LoadStoreWidth::DoubleWord,
             width => return Err(InstructionError::InvalidLoadStoreWidth(width)),
         })
     }
@@ -140,6 +166,7 @@ pub enum CsrOp {
 
 #[derive(Debug, Clone)]
 pub enum Instruction {
+    // 64-bit arithmetic (RV64I base)
     Arith {
         dst: u32,
         src1: u32,
@@ -147,6 +174,19 @@ pub enum Instruction {
         op: ArithOp,
     },
     ArithImm {
+        dst: u32,
+        src: u32,
+        imm: i32,
+        op: ArithOp,
+    },
+    // 32-bit arithmetic with sign extension (RV64 W-suffix)
+    ArithW {
+        dst: u32,
+        src1: u32,
+        src2: u32,
+        op: ArithOp,
+    },
+    ArithImmW {
         dst: u32,
         src: u32,
         imm: i32,
@@ -254,34 +294,55 @@ fn parse_r_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, 
     let rs2 = (instruction & RS2_MASK) >> 20;
     let rs1 = (instruction & RS1_MASK) >> 15;
     let rd = (instruction & RD_MASK) >> 7;
+
+    let operation = match (func3, func7) {
+        ADD_FUNC_IDENTIFIERS => ArithOp::Add,
+        SUB_FUNC_IDENTIFIERS => ArithOp::Sub,
+        XOR_FUNC_IDENTIFIERS => ArithOp::Xor,
+        OR_FUNC_IDENTIFIERS => ArithOp::Or,
+        AND_FUNC_IDENTIFIERS => ArithOp::And,
+        SHL_FUNC_IDENTIFIERS => ArithOp::ShiftLeftLogical,
+        SRL_FUNC_IDENTIFIERS => ArithOp::ShiftRightLogical,
+        SRA_FUNC_IDENTIFIERS => ArithOp::ShiftRightArith,
+        SLT_FUNC_IDENTIFIERS => ArithOp::SetLessThan,
+        SLTU_FUNC_IDENTIFIERS => ArithOp::SetLessThanU,
+        MUL_FUNC_IDENTIFIERS => ArithOp::Mul,
+        MUL_H_FUNC_IDENTIFIERS => ArithOp::MulHigh,
+        MUL_H_S_U_FUNC_IDENTIFIERS => ArithOp::MulHighSignedUnsigned,
+        MUL_H_U_FUNC_IDENTIFIERS => ArithOp::MulHighUnsigned,
+        DIV_FUNC_IDENTIFIERS => ArithOp::Div,
+        DIV_U_FUNC_IDENTIFIERS => ArithOp::DivUnsigned,
+        REM_FUNC_IDENTIFIERS => ArithOp::Remainder,
+        REM_U_FUNC_IDENTIFIERS => ArithOp::RemainderUnsigned,
+        _ => return Err(InstructionError::UnknownOpcodeFuncIdentifier(opcode, func3)),
+    };
+
     Ok(match opcode {
-        Opcode::Arith => {
-            let operation = match (func3, func7) {
-                ADD_FUNC_IDENTIFIERS => ArithOp::Add,
-                SUB_FUNC_IDENTIFIERS => ArithOp::Sub,
-                XOR_FUNC_IDENTIFIERS => ArithOp::Xor,
-                OR_FUNC_IDENTIFIERS => ArithOp::Or,
-                AND_FUNC_IDENTIFIERS => ArithOp::And,
-                SHL_FUNC_IDENTIFIERS => ArithOp::ShiftLeftLogical,
-                SRL_FUNC_IDENTIFIERS => ArithOp::ShiftRightLogical,
-                SRA_FUNC_IDENTIFIERS => ArithOp::ShiftRightArith,
-                SLT_FUNC_IDENTIFIERS => ArithOp::SetLessThan,
-                SLTU_FUNC_IDENTIFIERS => ArithOp::SetLessThanU,
-                MUL_FUNC_IDENTIFIERS => ArithOp::Mul,
-                MUL_H_FUNC_IDENTIFIERS => ArithOp::MulHigh,
-                MUL_H_S_U_FUNC_IDENTIFIERS => ArithOp::MulHighSignedUnsigned,
-                MUL_H_U_FUNC_IDENTIFIERS => ArithOp::MulHighUnsigned,
-                DIV_FUNC_IDENTIFIERS => ArithOp::Div,
-                DIV_U_FUNC_IDENTIFIERS => ArithOp::DivUnsigned,
-                REM_FUNC_IDENTIFIERS => ArithOp::Remainder,
-                REM_U_FUNC_IDENTIFIERS => ArithOp::RemainderUnsigned,
-                _ => return Err(InstructionError::UnknownOpcodeFuncIdentifier(opcode, func3)),
-            };
-            Instruction::Arith {
-                dst: rd,
-                src1: rs1,
-                src2: rs2,
-                op: operation,
+        Opcode::Arith => Instruction::Arith {
+            dst: rd,
+            src1: rs1,
+            src2: rs2,
+            op: operation,
+        },
+        Opcode::Arith32 => {
+            // W-suffix instructions only support a subset of operations
+            match operation {
+                ArithOp::Add
+                | ArithOp::Sub
+                | ArithOp::ShiftLeftLogical
+                | ArithOp::ShiftRightLogical
+                | ArithOp::ShiftRightArith
+                | ArithOp::Mul
+                | ArithOp::Div
+                | ArithOp::DivUnsigned
+                | ArithOp::Remainder
+                | ArithOp::RemainderUnsigned => Instruction::ArithW {
+                    dst: rd,
+                    src1: rs1,
+                    src2: rs2,
+                    op: operation,
+                },
+                _ => return Err(InstructionError::InvalidW32Instruction),
             }
         }
         _ => return Err(InstructionError::InvalidInstruction),
@@ -328,19 +389,21 @@ fn parse_i_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, 
                 OR_FUNC_IDENTIFIER => ArithOp::Or,
                 AND_FUNC_IDENTIFIER => ArithOp::And,
                 SHL_FUNC_IDENTIFIER => {
-                    let func_id = imm >> 5;
+                    // RV64: shift amount is 6 bits (imm[5:0])
+                    let func_id = imm >> 6;
                     if func_id != 0 {
                         return Err(InstructionError::UnknownSLVariant(func_id));
                     }
-                    imm &= 0x1F;
+                    imm &= 0x3F; // 6-bit shift amount for RV64
                     ArithOp::ShiftLeftLogical
                 }
                 SR_FUNC_IDENTIFIER => {
-                    let func_id = imm >> 5;
-                    imm &= 0x1F;
+                    // RV64: shift amount is 6 bits, func7 is in bits [11:6]
+                    let func_id = imm >> 6;
+                    imm &= 0x3F; // 6-bit shift amount for RV64
                     match func_id {
                         0x00 => ArithOp::ShiftRightLogical,
-                        0x20 => ArithOp::ShiftRightArith,
+                        0x10 => ArithOp::ShiftRightArith, // 0x20 >> 1 = 0x10 when looking at bits [11:6]
                         _ => return Err(InstructionError::UnknownSRVariant(func_id)),
                     }
                 }
@@ -349,6 +412,38 @@ fn parse_i_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, 
                 _ => return Err(InstructionError::UnknownOpcodeFuncIdentifier(opcode, func3)),
             };
             Instruction::ArithImm {
+                dst: rd,
+                src: rs1,
+                imm,
+                op: operation,
+            }
+        }
+        Opcode::ArithImm32 => {
+            // W-suffix immediate instructions (ADDIW, SLLIW, SRLIW, SRAIW)
+            let operation = match func3 {
+                ADD_FUNC_IDENTIFIER => ArithOp::Add,
+                SHL_FUNC_IDENTIFIER => {
+                    // SLLIW: shift amount is 5 bits for 32-bit operation
+                    let func_id = imm >> 5;
+                    if func_id != 0 {
+                        return Err(InstructionError::UnknownSLVariant(func_id));
+                    }
+                    imm &= 0x1F; // 5-bit shift amount for W instructions
+                    ArithOp::ShiftLeftLogical
+                }
+                SR_FUNC_IDENTIFIER => {
+                    // SRLIW/SRAIW: shift amount is 5 bits
+                    let func_id = imm >> 5;
+                    imm &= 0x1F; // 5-bit shift amount for W instructions
+                    match func_id {
+                        0x00 => ArithOp::ShiftRightLogical,
+                        0x20 => ArithOp::ShiftRightArith,
+                        _ => return Err(InstructionError::UnknownSRVariant(func_id)),
+                    }
+                }
+                _ => return Err(InstructionError::InvalidW32Instruction),
+            };
+            Instruction::ArithImmW {
                 dst: rd,
                 src: rs1,
                 imm,
@@ -425,7 +520,7 @@ fn parse_s_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, 
             src: rs2,
             offset: imm,
             base: rs1,
-            width: LoadStoreWidth::from_func3(func3)?,
+            width: LoadStoreWidth::from_func3_store(func3)?,
         },
         _ => return Err(InstructionError::InvalidInstruction),
     })
@@ -528,4 +623,6 @@ pub enum InstructionError {
     InvalidJALR,
     #[error("Invalid system instruction encoding with func3: {0:0x}")]
     InvalidSystemInstruction(u32),
+    #[error("Invalid W32 instruction: operation not supported")]
+    InvalidW32Instruction,
 }
