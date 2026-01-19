@@ -10,10 +10,74 @@ Right now, this is a project under development and experimentation and must not 
 
 ### Dependencies
 
-- Rust 1.90.0
+- Our Rust fork with support for our riscv target
 - Risc-V toolchain (To run executor tests)
 
 ### Setup executor
+
+#### Install Our Rust Fork
+
+First remove rust if you already have it installed
+
+```sh
+rustup self uninstall
+```
+
+You can install it from source or use our pre-installed binaries
+
+##### Install from source
+
+```sh
+git clone https://github.com/yetanotherco/rust.git
+cd rust
+```
+Add `bootstrap.toml` file:
+
+```toml
+profile = "dist"
+change-id = 149355
+rust.lld = true
+```
+
+Export the directory where you want rust to be installed
+
+```sh
+export DESTDIR=<Your_rust_destiny_dir>
+```
+
+Run the rust installation
+```sh
+./x.py build && ./x.py install
+```
+
+##### Download pre-installed binaries
+
+For mac
+
+```sh
+wget lambda.alignedlayer.com/lambda_rust_mac.zip
+```
+
+For linux
+
+```sh
+wget https://lambda.alignedlayer.com/lambda_rust.tar.gz
+```
+
+Then unzip it.
+
+Note that your system may prevent execution because the binaries were compiled on another machine. You may need to grant explicit permission to run them.
+
+##### Add to path
+
+Add the rust directory to your path
+
+```sh
+export PATH="/<your_rust_path>/usr/local/bin:$PATH"
+source ~/.zshrc
+```
+
+#### Install the dependencies
 
 ```sh
 cd executor

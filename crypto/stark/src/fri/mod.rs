@@ -15,7 +15,7 @@ use crate::config::{BatchedMerkleTree, BatchedMerkleTreeBackend};
 
 use self::fri_commitment::FriLayer;
 use self::fri_decommit::FriDecommitment;
-use self::fri_functions::fold_polynomial_doubled;
+use self::fri_functions::fold_polynomial_doubled_inplace;
 
 pub fn commit_phase<F: IsFFTField + IsSubFieldOf<E>, E: IsField>(
     num_layers: usize,
@@ -41,24 +41,31 @@ where
         coset_offset = coset_offset.square();
         domain_size /= 2;
 
-        current_poly = fold_polynomial_doubled(&current_poly, &zeta);
+        // In-place folding avoids memory allocation
+        fold_polynomial_doubled_inplace(&mut current_poly, &zeta);
         let layer = new_fri_layer(&current_poly, &coset_offset, domain_size);
-
-        transcript.append_bytes(&layer.merkle_tree.root);
+        // Copy just the root (small, 32 bytes) before moving the layer
+        let new_data = layer.merkle_tree.root;
         layers.push(layer);
+
+        // >>>> Send commitment: [pₖ]
+        transcript.append_bytes(&new_data);
     }
 
     let zeta = transcript.sample_field_element();
-    let final_poly = fold_polynomial_doubled(&current_poly, &zeta);
-    let final_value = final_poly
+
+    // Final fold - still in-place
+    fold_polynomial_doubled_inplace(&mut current_poly, &zeta);
+
+    let last_value = current_poly
         .coefficients()
         .first()
         .cloned()
         .unwrap_or_else(FieldElement::zero);
 
-    transcript.append_field_element(&final_value);
+    transcript.append_field_element(&last_value);
 
-    (final_value, layers)
+    (last_value, layers)
 }
 
 pub fn query_phase<F: IsField>(

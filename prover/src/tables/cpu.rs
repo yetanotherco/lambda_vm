@@ -4,14 +4,12 @@ use executor::vm::{
     logs::Log,
 };
 use math::field::{
-    element::FieldElement,
-    fields::fft_friendly::{
-        babybear_u32::Babybear31PrimeField, quartic_babybear_u32::Degree4BabyBearU32ExtensionField,
-    },
+    element::FieldElement, fields::fft_friendly::babybear_u32::Babybear31PrimeField,
 };
-use stark::trace::TraceTable;
 
 type FE = FieldElement<Babybear31PrimeField>;
+
+pub const NUM_COLUMNS: usize = 52;
 
 #[derive(Default)]
 pub struct CpuTableRow {
@@ -113,15 +111,16 @@ impl CpuTableRow {
     pub const IS_EQUAL: usize = 50;
     pub const BRANCH_COND: usize = 51;
 
-    pub fn from_log(log: Log, timestamp: u32) -> Self {
+    // TODO: Properly migrate to 64-bit when prover is updated (separate PR)
+    pub fn from_log(log: &Log, timestamp: u32) -> Self {
         let mut row = Self {
             timestamp: u32_to_2_limbs(timestamp),
-            pc: u32_to_2_limbs(log.current_pc),
-            next_pc: u32_to_2_limbs(log.next_pc),
-            rv1: u32_to_4_limbs(log.src1_val),
-            rv2: u32_to_4_limbs(log.src2_val),
-            rvd: u32_to_2_limbs(log.dst_val),
-            res: u32_to_4_limbs(log.dst_val),
+            pc: u32_to_2_limbs(log.current_pc as u32),
+            next_pc: u32_to_2_limbs(log.next_pc as u32),
+            rv1: u32_to_4_limbs(log.src1_val as u32),
+            rv2: u32_to_4_limbs(log.src2_val as u32),
+            rvd: u32_to_2_limbs(log.dst_val as u32),
+            res: u32_to_4_limbs(log.dst_val as u32),
             ..Default::default()
         };
 
@@ -135,7 +134,7 @@ impl CpuTableRow {
                 row.rd = FE::from(&dst);
                 row.rs1 = FE::from(&src1);
                 row.rs2 = FE::from(&src2);
-                row.arg2 = u32_to_2_limbs(log.src2_val);
+                row.arg2 = u32_to_2_limbs(log.src2_val as u32);
                 if dst != 0 {
                     row.write_register = FE::one();
                 }
@@ -258,9 +257,9 @@ impl CpuTableRow {
                 row.rs1 = FE::from(&base);
                 row.rs2 = FE::from(&src);
                 // Fix this afer changing STORE instruction.
-                row.imm = i32_to_2_limbs(offset as i32);
-                row.arg2 = i32_to_2_limbs(offset as i32);
-                row.res = u32_to_4_limbs(log.src1_val + offset);
+                row.imm = i32_to_2_limbs(offset);
+                row.arg2 = i32_to_2_limbs(offset);
+                row.res = i32_to_4_limbs(log.src1_val as i32 + offset);
 
                 match width {
                     LoadStoreWidth::Half => row.memory_2bytes = FE::one(),
@@ -290,12 +289,27 @@ impl CpuTableRow {
                 }
 
                 match width {
-                    LoadStoreWidth::Half => row.memory_2bytes = FE::one(),
+                    LoadStoreWidth::Byte => row.signed = FE::one(),
+                    LoadStoreWidth::Half => {
+                        row.memory_2bytes = FE::one();
+                        row.signed = FE::one();
+                    }
                     LoadStoreWidth::Word => {
                         row.memory_2bytes = FE::one();
                         row.memory_4bytes = FE::one();
+                        row.signed = FE::one();
                     }
-                    _ => (),
+                    LoadStoreWidth::ByteUnsigned => (),
+                    LoadStoreWidth::HalfUnsigned => row.memory_2bytes = FE::one(),
+                    // TODO: RV64 - properly handle DoubleWord and WordUnsigned in prover migration
+                    LoadStoreWidth::DoubleWord => {
+                        row.memory_2bytes = FE::one();
+                        row.memory_4bytes = FE::one();
+                    }
+                    LoadStoreWidth::WordUnsigned => {
+                        row.memory_2bytes = FE::one();
+                        row.memory_4bytes = FE::one();
+                    }
                 }
             }
 
@@ -308,8 +322,8 @@ impl CpuTableRow {
                 row.rs1 = FE::from(&src1);
                 row.rs2 = FE::from(&src2);
                 row.imm = u32_to_2_limbs(offset as u32);
-                row.arg2 = u32_to_2_limbs(log.src2_val);
-                row.res = u32_to_4_limbs(log.src1_val.wrapping_sub(log.src2_val));
+                row.arg2 = u32_to_2_limbs(log.src2_val as u32);
+                row.res = u32_to_4_limbs((log.src1_val.wrapping_sub(log.src2_val)) as u32);
 
                 match cond {
                     Comparison::Equal => {
@@ -373,7 +387,7 @@ impl CpuTableRow {
                 row.rd = FE::from(&dst);
                 row.imm = u32_to_2_limbs(imm);
                 row.arg2 = u32_to_2_limbs(imm);
-                row.rv1 = u32_to_4_limbs(log.current_pc);
+                row.rv1 = u32_to_4_limbs(log.current_pc as u32);
                 if dst != 0 {
                     row.write_register = FE::one();
                 }
@@ -447,27 +461,11 @@ impl CpuTableRow {
         debug_assert_eq!(row.len(), 52, "CpuTableRow length mismatch");
         row
     }
-}
 
-pub fn cpu_trace_from_logs(
-    logs: Vec<Log>,
-) -> TraceTable<Babybear31PrimeField, Degree4BabyBearU32ExtensionField> {
-    const NUM_COLUMNS: usize = 52;
-    const MIN_ROWS: usize = 4;
-
-    let num_logs = logs.len();
-    let target_rows = num_logs.max(MIN_ROWS).next_power_of_two();
-
-    let mut main_data: Vec<FE> = logs
-        .into_iter()
-        .enumerate()
-        .flat_map(|(i, log)| {
-            let timestamp = (i * 4) as u32;
-            CpuTableRow::from_log(log, timestamp).to_vec()
-        })
-        .collect();
-
-    main_data.resize(target_rows * NUM_COLUMNS, FE::zero());
-
-    TraceTable::new_main(main_data, NUM_COLUMNS, 1)
+    pub fn pad_to_next_power_of_two(table: &mut Vec<FE>) {
+        const MIN_ROWS: usize = 4;
+        let num_rows = table.len() / NUM_COLUMNS;
+        let target_rows = num_rows.max(MIN_ROWS).next_power_of_two();
+        table.resize(target_rows * NUM_COLUMNS, FE::zero());
+    }
 }

@@ -58,6 +58,38 @@ where
     Polynomial::new(&result)
 }
 
+// In-place FRI polynomial folding with fused doubling: 2 * (P_even(x) + beta * P_odd(x))
+///
+/// This modifies the polynomial in place, avoiding memory allocation.
+/// The polynomial degree is halved after this operation.
+pub fn fold_polynomial_doubled_inplace<F>(
+    poly: &mut Polynomial<FieldElement<F>>,
+    beta: &FieldElement<F>,
+) where
+    F: IsField,
+{
+    let coefficients = &mut poly.coefficients;
+    if coefficients.is_empty() {
+        return;
+    }
+
+    let new_len = coefficients.len().div_ceil(2);
+
+    // Fold in place: process pairs and write results back to the beginning
+    for i in 0..new_len {
+        let idx = i * 2;
+        let folded = if idx + 1 < coefficients.len() {
+            (&coefficients[idx] + &(&coefficients[idx + 1] * beta)).double()
+        } else {
+            coefficients[idx].double()
+        };
+        coefficients[i] = folded;
+    }
+
+    // Truncate to the new length
+    coefficients.truncate(new_len);
+}
+
 /// Legacy implementation kept for benchmark comparison.
 #[cfg(any(test, feature = "benchmark"))]
 pub fn fold_polynomial_legacy<F>(
@@ -87,7 +119,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{fold_polynomial, fold_polynomial_legacy};
+    use super::{
+        fold_polynomial, fold_polynomial_doubled, fold_polynomial_doubled_inplace,
+        fold_polynomial_legacy,
+    };
     use math::field::element::FieldElement;
     use math::field::fields::u64_prime_field::U64PrimeField;
     use math::polynomial::Polynomial;
@@ -125,6 +160,62 @@ mod tests {
     }
 
     #[test]
+    fn test_fold_size_2() {
+        let p2 = Polynomial::new(&[FE::new(10), FE::new(20)]);
+        let beta = FE::new(3);
+        let result = fold_polynomial(&p2, &beta);
+        assert_eq!(result, Polynomial::new(&[FE::new(70)]));
+    }
+
+    #[test]
+    fn test_inplace_matches_regular() {
+        let p0 = Polynomial::new(&[
+            FE::new(3),
+            FE::new(1),
+            FE::new(2),
+            FE::new(7),
+            FE::new(3),
+            FE::new(5),
+            FE::new(4),
+            FE::new(2),
+        ]);
+        let beta = FE::new(4);
+
+        // Test that in-place matches regular folding with doubling
+        let expected = fold_polynomial_doubled(&p0, &beta);
+        let mut p_inplace = p0.clone();
+        fold_polynomial_doubled_inplace(&mut p_inplace, &beta);
+        assert_eq!(p_inplace, expected);
+
+        // Test multiple folds
+        let gamma = FE::new(3);
+        let expected2 = fold_polynomial_doubled(&expected, &gamma);
+        fold_polynomial_doubled_inplace(&mut p_inplace, &gamma);
+        assert_eq!(p_inplace, expected2);
+
+        let delta = FE::new(2);
+        let expected3 = fold_polynomial_doubled(&expected2, &delta);
+        fold_polynomial_doubled_inplace(&mut p_inplace, &delta);
+        assert_eq!(p_inplace, expected3);
+    }
+
+    #[test]
+    fn test_inplace_empty() {
+        let mut p: Polynomial<FE> = Polynomial::new(&[]);
+        let beta = FE::new(4);
+        fold_polynomial_doubled_inplace(&mut p, &beta);
+        assert!(p.coefficients.is_empty());
+    }
+
+    #[test]
+    fn test_inplace_single() {
+        let mut p = Polynomial::new(&[FE::new(5)]);
+        let beta = FE::new(4);
+        fold_polynomial_doubled_inplace(&mut p, &beta);
+        assert_eq!(p, Polynomial::new(&[FE::new(10)])); // 5 * 2 = 10
+    }
+
+    #[test]
     fn test_matches_legacy() {
         let p0 = Polynomial::new(&[
             FE::new(3),
@@ -154,13 +245,5 @@ mod tests {
             fold_polynomial_legacy(&p2, &beta),
             fold_polynomial(&p2, &beta)
         );
-    }
-
-    #[test]
-    fn test_fold_size_2() {
-        let p2 = Polynomial::new(&[FE::new(10), FE::new(20)]);
-        let beta = FE::new(3);
-        let result = fold_polynomial(&p2, &beta);
-        assert_eq!(result, Polynomial::new(&[FE::new(70)]));
     }
 }
