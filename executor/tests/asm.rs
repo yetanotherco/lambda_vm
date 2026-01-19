@@ -9,9 +9,9 @@ fn run_program_and_check_output(elf_path: &str, expected_output: i32) {
         println!("0x{:08x}: 0x{:08x}", addr, word);
     });
     let (results, _logs) =
-        run_program(program.image, program.entry_point, true).expect("Failed to run program");
+        run_program(program.image, program.entry_point, vec![]).expect("Failed to run program");
 
-    assert!(results.0 == expected_output);
+    assert!(results.register_values.0 == expected_output);
 }
 
 #[test]

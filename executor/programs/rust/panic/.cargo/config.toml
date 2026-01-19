@@ -1,5 +1,5 @@
-[target.rv32]
+[target.riscv32im-lambda-vm-elf]
 rustflags = [
-  "-C", "link-arg=-e",
-  "-C", "link-arg=main"
+  '--cfg', 'getrandom_backend="custom"',
+  "-C", "passes=lower-atomic" # TODO: check rust version to pass lower-atomic or loweratomic
 ]

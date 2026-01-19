@@ -20,6 +20,19 @@ BENCH_PROGRAM_DIRS := $(dir $(wildcard $(BENCH_PROGRAMS_DIR)/*/Cargo.toml))
 BENCH_PROGRAMS := $(notdir $(basename $(BENCH_PROGRAM_DIRS:%/=%)))
 BENCH_ARTIFACTS := $(addprefix $(BENCH_ARTIFACTS_DIR)/, $(addsuffix .elf, $(BENCH_PROGRAMS)))
 
+ETHREX_FILE := tests/ethrex_hoodi.bin
+ETHREX_URL := https://lambda.alignedlayer.com/ethrex_hoodi.bin
+
+.PHONY: test prepare-test-data
+
+prepare-test-data:
+	@if [ ! -f "$(ETHREX_FILE)" ]; then \
+		echo "Downloading ethrex_hoodi.bin..."; \
+		curl -L "$(ETHREX_URL)" -o "$(ETHREX_FILE)"; \
+	else \
+		echo "ethrex_hoodi.bin already exists"; \
+	fi
+
 compile-programs-asm: clean-asm $(ARTIFACTS_ASM)
 
 compile-programs-rust: clean-rust $(RUST_ARTIFACTS)
@@ -39,21 +52,20 @@ $(ASM_ARTIFACTS_DIR)/%.elf: $(ASM_ARTIFACTS_DIR)/%.o
 # Compile rust
 $(RUST_ARTIFACTS_DIR)/%.elf: $(RUST_PROGRAMS_DIR)/%/Cargo.toml
 	cd $(RUST_PROGRAMS_DIR)/$* && \
-		cargo +nightly build \
-			--target rv32.json \
+		cargo build --release \
+			--target riscv32im-lambda-vm-elf \
 			-Z build-std=core,alloc,std,compiler_builtins,panic_abort \
-			-Z build-std-features=compiler-builtins-mem 
-	cp $(RUST_PROGRAMS_DIR)/$*/target/rv32/debug/$* $@
+			-Z build-std-features=compiler-builtins-mem
+	cp $(RUST_PROGRAMS_DIR)/$*/target/riscv32im-lambda-vm-elf/release/$* $@
 
 # Compile rust benches
 $(BENCH_ARTIFACTS_DIR)/%.elf: $(BENCH_PROGRAMS_DIR)/%/Cargo.toml
 	cd $(BENCH_PROGRAMS_DIR)/$* && \
-		cargo +nightly build \
-			--target rv32.json \
+		cargo build \
+			--target riscv32im-lambda-vm-elf \
 			-Z build-std=core,alloc,std,compiler_builtins,panic_abort \
-			-Z build-std-features=compiler-builtins-mem 
-	cp $(BENCH_PROGRAMS_DIR)/$*/target/rv32/debug/$* $@
-	rm -rf $(BENCH_PROGRAMS_DIR)/$*/target
+			-Z build-std-features=compiler-builtins-mem
+	cp $(BENCH_PROGRAMS_DIR)/$*/target/riscv32im-lambda-vm-elf/debug/$* $@
 
 clean-asm:
 	-rm -rf $(ASM_ARTIFACTS_DIR)
@@ -76,10 +88,10 @@ test-asm: compile-programs-asm test-asm-no-compile
 test-asm-no-compile:
 	cargo test --test asm
 
-test-rust: compile-programs-rust
+test-rust: compile-programs-rust prepare-test-data
 	cargo test --test rust
 
-test-no-compile:
+test-no-compile: prepare-test-data
 	cargo test
 
 .PHONY: deps

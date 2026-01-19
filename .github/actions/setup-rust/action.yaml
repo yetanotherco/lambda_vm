@@ -1,27 +1,28 @@
 name: 'Setup Rust Environment'
 description: 'Sets up Rust and caches dependencies'
-inputs:
-  components:
-    description: "Rust components to install (e.g., rustfmt, clippy)"
-    required: false
-    default: ""
 runs:
   using: "composite"
   steps:
-    - name: Extract Rust version from rust-toolchain.toml
-      id: rustver
+
+    - name: Free Disk Space
+      uses: ./.github/actions/free-disk
+
+    - name: Cache Rust toolchain
+      id: cache-rust
+      uses: actions/cache@v4
+      with:
+        path: ~/lambda_rust
+        key: lambda-rust-toolchain-v1
+
+    - name: Download Rust
+      if: steps.cache-rust.outputs.cache-hit != 'true'
       shell: bash
       run: |
-        rust_version=$(grep -E '^[[:space:]]*channel[[:space:]]*=' rust-toolchain.toml \
-                 | sed -E 's/.*"([^"]+)".*/\1/')
-        echo "rust_version=${rust_version}" >>"$GITHUB_OUTPUT"
-        echo "Rust version: ${rust_version}"
-
-    - name: Install Rust
-      uses: dtolnay/rust-toolchain@master
-      with:
-        toolchain: ${{ steps.rustver.outputs.rust_version }}
-        components: ${{ inputs.components }}
-
-    - name: Add Rust Cache
-      uses: Swatinem/rust-cache@v2
+        cd $HOME
+        wget https://lambda.alignedlayer.com/lambda_rust.tar.gz
+        tar -xzvf lambda_rust.tar.gz
+        rm lambda_rust.tar.gz
+    
+    - name: Add Rust to PATH
+      shell: bash
+      run: echo "$HOME/lambda_rust/usr/local/bin" >> $GITHUB_PATH

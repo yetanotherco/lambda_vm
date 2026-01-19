@@ -1,5 +1,11 @@
 use std::collections::BTreeMap;
 
+// TODO: Correctly define this
+const MAX_PUBLIC_OUTPUT_COMMIT_SIZE: u32 = 1024;
+const PUBLIC_OUTPUT_START_INDEX: u32 = 0;
+const MAX_PRIVATE_INPUT_SIZE: u32 = 6700000;
+const PRIVATE_INPUT_START_INDEX: u32 = 0xFF000000;
+
 #[derive(Default, Debug)]
 pub struct Memory(BTreeMap<u32, [u8; 4]>);
 
@@ -60,6 +66,49 @@ impl Memory {
         entry[(address % 4) as usize + 1] = bytes[1];
         Ok(())
     }
+
+    pub fn commit_public_output(&mut self, address: u32, length: u32) -> Result<(), MemoryError> {
+        if length > MAX_PUBLIC_OUTPUT_COMMIT_SIZE {
+            return Err(MemoryError::CommitSizeExceeded);
+        }
+        self.store_word(PUBLIC_OUTPUT_START_INDEX, length)?;
+        for i in 0..length {
+            let byte = self.load_byte(address + i);
+            self.store_byte(PUBLIC_OUTPUT_START_INDEX + 4 + i, byte);
+        }
+        Ok(())
+    }
+
+    pub fn read_return_value(&self) -> Result<Vec<u8>, MemoryError> {
+        let size = self.load_word(PUBLIC_OUTPUT_START_INDEX)?;
+        let mut return_values = Vec::new();
+        for i in 0..size {
+            let word = self.load_byte(PUBLIC_OUTPUT_START_INDEX + 4 + i);
+            return_values.push(word);
+        }
+        Ok(return_values)
+    }
+
+    pub fn store_private_inputs(&mut self, inputs: Vec<u8>) -> Result<(), MemoryError> {
+        if inputs.len() as u32 > MAX_PRIVATE_INPUT_SIZE {
+            return Err(MemoryError::PrivateInputSizeExceeded);
+        }
+        self.store_word(PRIVATE_INPUT_START_INDEX, inputs.len() as u32)?;
+        for (i, byte) in inputs.iter().enumerate() {
+            self.store_byte(PRIVATE_INPUT_START_INDEX + 4 + i as u32, *byte);
+        }
+        Ok(())
+    }
+
+    pub fn load_private_inputs(&self) -> Result<Vec<u8>, MemoryError> {
+        let size = self.load_word(PRIVATE_INPUT_START_INDEX)?;
+        let mut inputs = size.to_le_bytes().to_vec();
+        for i in 0..size {
+            let byte = self.load_byte(PRIVATE_INPUT_START_INDEX + 4 + i);
+            inputs.push(byte);
+        }
+        Ok(inputs)
+    }
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -68,4 +117,8 @@ pub enum MemoryError {
     LoadHalf,
     #[error("Unaligned memory access")]
     UnalignedAccess,
+    #[error("Public output commit size exceeded")]
+    CommitSizeExceeded,
+    #[error("Private input size exceeded")]
+    PrivateInputSizeExceeded,
 }

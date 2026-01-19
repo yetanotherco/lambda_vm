@@ -163,7 +163,7 @@ pub enum Instruction {
     },
     Store {
         src: u32,
-        offset: u32,
+        offset: i32,
         base: u32,
         width: LoadStoreWidth,
     },
@@ -203,7 +203,7 @@ const RS1_MASK: u32 = 0x000f8000;
 const RS2_MASK: u32 = 0x01f00000;
 const RD_MASK: u32 = 0x00000f80;
 const SIGN_MASK: u32 = 0x80000000;
-const I_TYPE_IMM_MASK: u32 = 0x7ff;
+const I_TYPE_IMM_MASK: u32 = 0xfff;
 const U_TYPE_IMM_MASK: u32 = 0xfffff000;
 
 impl Instruction {
@@ -314,7 +314,7 @@ fn parse_i_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, 
     let csr = (instruction >> 20) & I_TYPE_IMM_MASK;
     let imm = csr as i32;
     let mut imm: i32 = if (instruction & SIGN_MASK) != 0 {
-        imm.wrapping_sub(1 << 11)
+        imm.wrapping_sub(1 << 12)
     } else {
         imm
     };
@@ -376,20 +376,20 @@ fn parse_i_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, 
                 ECALL_EBREAK_FUNC_IDENTIFIER => Instruction::EcallEbreak,
                 CSRRCI_FUNC_IDENTIFIER => Instruction::CSR {
                     csr,
-                    src: rd,
-                    dst: rs1,
+                    src: rs1,
+                    dst: rd,
                     op: CsrOp::CSRRCI,
                 },
                 CSRRS_FUNC_IDENTIFIER => Instruction::CSR {
                     csr,
-                    src: rd,
-                    dst: rs1,
+                    src: rs1,
+                    dst: rd,
                     op: CsrOp::CSRRS,
                 },
                 CSRRW_FUNC_IDENTIFIER => Instruction::CSR {
                     csr,
-                    src: rd,
-                    dst: rs1,
+                    src: rs1,
+                    dst: rd,
                     op: CsrOp::CSRRW,
                 },
                 CSRRC_FUNC_IDENTIFIER | CSRRWI_FUNC_IDENTIFIER | CSRRSI_FUNC_IDENTIFIER => {
@@ -413,7 +413,13 @@ fn parse_s_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, 
     let rs2 = (instruction & RS2_MASK) >> 20;
     let rs1 = (instruction & RS1_MASK) >> 15;
     let rd = (instruction & RD_MASK) >> 7;
-    let imm = func7 | rd;
+    let imm = (func7 | rd) as i32;
+    let imm: i32 = if (instruction & SIGN_MASK) != 0 {
+        imm.wrapping_sub(1 << 12)
+    } else {
+        imm
+    };
+
     Ok(match opcode {
         Opcode::Store => Instruction::Store {
             src: rs2,
