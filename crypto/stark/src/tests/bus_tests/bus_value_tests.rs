@@ -144,7 +144,10 @@ fn test_column_helper() {
         BusValue::Linear(terms) => {
             assert_eq!(terms.len(), 1);
             match &terms[0] {
-                LinearTerm::Column { coefficient, column } => {
+                LinearTerm::Column {
+                    coefficient,
+                    column,
+                } => {
                     assert_eq!(*coefficient, 1);
                     assert_eq!(*column, 3);
                 }

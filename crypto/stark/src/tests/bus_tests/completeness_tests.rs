@@ -455,10 +455,20 @@ fn test_bus_value_features() {
     let mut sender_trace = TraceTable::from_columns_main(
         vec![
             vec![FE::one(), FE::one(), FE::zero(), FE::zero()], // mult
-            vec![FE::from(0x1234u64), FE::from(0xABCDu64), FE::zero(), FE::zero()], // h0
-            vec![FE::from(0x5678u64), FE::from(0xEF01u64), FE::zero(), FE::zero()], // h1
+            vec![
+                FE::from(0x1234u64),
+                FE::from(0xABCDu64),
+                FE::zero(),
+                FE::zero(),
+            ], // h0
+            vec![
+                FE::from(0x5678u64),
+                FE::from(0xEF01u64),
+                FE::zero(),
+                FE::zero(),
+            ], // h1
             vec![FE::from(100u64), FE::from(200u64), FE::zero(), FE::zero()], // a
-            vec![FE::from(10u64), FE::from(20u64), FE::zero(), FE::zero()],   // b
+            vec![FE::from(10u64), FE::from(20u64), FE::zero(), FE::zero()], // b
         ],
         1,
     );
@@ -466,11 +476,21 @@ fn test_bus_value_features() {
     // Receiver trace: [h0, h1, a, b, mult]
     let mut receiver_trace = TraceTable::from_columns_main(
         vec![
-            vec![FE::from(0x1234u64), FE::from(0xABCDu64), FE::zero(), FE::zero()], // h0
-            vec![FE::from(0x5678u64), FE::from(0xEF01u64), FE::zero(), FE::zero()], // h1
+            vec![
+                FE::from(0x1234u64),
+                FE::from(0xABCDu64),
+                FE::zero(),
+                FE::zero(),
+            ], // h0
+            vec![
+                FE::from(0x5678u64),
+                FE::from(0xEF01u64),
+                FE::zero(),
+                FE::zero(),
+            ], // h1
             vec![FE::from(100u64), FE::from(200u64), FE::zero(), FE::zero()], // a
             vec![FE::from(10u64), FE::from(20u64), FE::zero(), FE::zero()],   // b
-            vec![FE::one(), FE::one(), FE::zero(), FE::zero()], // mult
+            vec![FE::one(), FE::one(), FE::zero(), FE::zero()],               // mult
         ],
         1,
     );

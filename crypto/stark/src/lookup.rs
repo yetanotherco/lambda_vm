@@ -404,12 +404,15 @@ impl BusValue {
                 let mut result = FieldElement::<E>::zero();
                 for term in terms {
                     match term {
-                        LinearTerm::Column { coefficient, column } => {
+                        LinearTerm::Column {
+                            coefficient,
+                            column,
+                        } => {
                             let coeff = FieldElement::<E>::from(*coefficient);
-                            result = result + get_column(*column) * coeff;
+                            result += get_column(*column) * coeff;
                         }
                         LinearTerm::Constant(value) => {
-                            result = result + FieldElement::<E>::from(*value);
+                            result += FieldElement::<E>::from(*value);
                         }
                     }
                 }
@@ -664,11 +667,7 @@ pub struct BusInteraction {
 
 impl BusInteraction {
     /// Creates a new table interaction.
-    pub fn new(
-        multiplicity_column: Option<usize>,
-        values: Vec<BusValue>,
-        is_sender: bool,
-    ) -> Self {
+    pub fn new(multiplicity_column: Option<usize>, values: Vec<BusValue>, is_sender: bool) -> Self {
         Self {
             multiplicity_column,
             values,
