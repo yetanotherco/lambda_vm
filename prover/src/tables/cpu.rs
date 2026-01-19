@@ -111,15 +111,16 @@ impl CpuTableRow {
     pub const IS_EQUAL: usize = 50;
     pub const BRANCH_COND: usize = 51;
 
+    // TODO: Properly migrate to 64-bit when prover is updated (separate PR)
     pub fn from_log(log: &Log, timestamp: u32) -> Self {
         let mut row = Self {
             timestamp: u32_to_2_limbs(timestamp),
-            pc: u32_to_2_limbs(log.current_pc),
-            next_pc: u32_to_2_limbs(log.next_pc),
-            rv1: u32_to_4_limbs(log.src1_val),
-            rv2: u32_to_4_limbs(log.src2_val),
-            rvd: u32_to_2_limbs(log.dst_val),
-            res: u32_to_4_limbs(log.dst_val),
+            pc: u32_to_2_limbs(log.current_pc as u32),
+            next_pc: u32_to_2_limbs(log.next_pc as u32),
+            rv1: u32_to_4_limbs(log.src1_val as u32),
+            rv2: u32_to_4_limbs(log.src2_val as u32),
+            rvd: u32_to_2_limbs(log.dst_val as u32),
+            res: u32_to_4_limbs(log.dst_val as u32),
             ..Default::default()
         };
 
@@ -133,7 +134,7 @@ impl CpuTableRow {
                 row.rd = FE::from(&dst);
                 row.rs1 = FE::from(&src1);
                 row.rs2 = FE::from(&src2);
-                row.arg2 = u32_to_2_limbs(log.src2_val);
+                row.arg2 = u32_to_2_limbs(log.src2_val as u32);
                 if dst != 0 {
                     row.write_register = FE::one();
                 }
@@ -300,6 +301,15 @@ impl CpuTableRow {
                     }
                     LoadStoreWidth::ByteUnsigned => (),
                     LoadStoreWidth::HalfUnsigned => row.memory_2bytes = FE::one(),
+                    // TODO: RV64 - properly handle DoubleWord and WordUnsigned in prover migration
+                    LoadStoreWidth::DoubleWord => {
+                        row.memory_2bytes = FE::one();
+                        row.memory_4bytes = FE::one();
+                    }
+                    LoadStoreWidth::WordUnsigned => {
+                        row.memory_2bytes = FE::one();
+                        row.memory_4bytes = FE::one();
+                    }
                 }
             }
 
@@ -312,8 +322,8 @@ impl CpuTableRow {
                 row.rs1 = FE::from(&src1);
                 row.rs2 = FE::from(&src2);
                 row.imm = u32_to_2_limbs(offset as u32);
-                row.arg2 = u32_to_2_limbs(log.src2_val);
-                row.res = u32_to_4_limbs(log.src1_val.wrapping_sub(log.src2_val));
+                row.arg2 = u32_to_2_limbs(log.src2_val as u32);
+                row.res = u32_to_4_limbs((log.src1_val.wrapping_sub(log.src2_val)) as u32);
 
                 match cond {
                     Comparison::Equal => {
@@ -377,7 +387,7 @@ impl CpuTableRow {
                 row.rd = FE::from(&dst);
                 row.imm = u32_to_2_limbs(imm);
                 row.arg2 = u32_to_2_limbs(imm);
-                row.rv1 = u32_to_4_limbs(log.current_pc);
+                row.rv1 = u32_to_4_limbs(log.current_pc as u32);
                 if dst != 0 {
                     row.write_register = FE::one();
                 }
