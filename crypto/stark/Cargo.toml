@@ -71,3 +71,7 @@ demangle-name-section = true
 dwarf-debug-info = false
 # Should we omit the default import path
 omit-default-module-path = false
+
+[[bench]]
+name = "lookup_bench"
+harness = false

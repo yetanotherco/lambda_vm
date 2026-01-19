@@ -30,6 +30,59 @@ pub const SHIFT_16: u64 = 65536;
 pub const SHIFT_32: u64 = 4294967296;
 
 // =============================================================================
+// Precomputed Constants for Packing
+// =============================================================================
+
+/// Precomputed shift constants for field E.
+///
+/// Creating field elements from u64 constants has some overhead.
+/// When combining many rows, precomputing these once saves time.
+#[derive(Clone)]
+pub struct PackingConstants<E: IsField> {
+    /// 2^8 as a field element
+    pub shift_8: FieldElement<E>,
+    /// 2^16 as a field element
+    pub shift_16: FieldElement<E>,
+    /// 2^24 = 2^8 * 2^16 as a field element
+    pub shift_24: FieldElement<E>,
+}
+
+impl<E: IsField> PackingConstants<E> {
+    /// Creates new precomputed shift constants.
+    pub fn new() -> Self {
+        let shift_8 = FieldElement::<E>::from(SHIFT_8);
+        let shift_16 = FieldElement::<E>::from(SHIFT_16);
+        let shift_24 = &shift_8 * &shift_16;
+        Self {
+            shift_8,
+            shift_16,
+            shift_24,
+        }
+    }
+}
+
+impl<E: IsField> Default for PackingConstants<E> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Computes powers of alpha incrementally: [1, α, α², α³, ...]
+///
+/// This is more efficient than calling `alpha.pow(i)` for each i,
+/// as it only requires one multiplication per element instead of
+/// a full exponentiation.
+fn compute_alpha_powers<E: IsField>(alpha: &FieldElement<E>, count: usize) -> Vec<FieldElement<E>> {
+    let mut powers = Vec::with_capacity(count);
+    let mut current = FieldElement::<E>::one();
+    for _ in 0..count {
+        powers.push(current.clone());
+        current = &current * alpha;
+    }
+    powers
+}
+
+// =============================================================================
 // LogUp Challenge Indices
 // =============================================================================
 // The LogUp protocol requires two random challenges sampled via Fiat-Shamir:
@@ -699,9 +752,9 @@ fn build_logup_term_column<F, E>(
     let z = &challenges[LOGUP_CHALLENGE_Z];
     let alpha = &challenges[LOGUP_CHALLENGE_ALPHA];
 
-    // Precompute powers of alpha for all bus elements
+    // Precompute powers of alpha for all bus elements (using incremental multiplication)
     let num_bus_elements = table_interaction.num_bus_elements();
-    let alpha_powers: Vec<FieldElement<E>> = (0..num_bus_elements).map(|i| alpha.pow(i)).collect();
+    let alpha_powers = compute_alpha_powers(alpha, num_bus_elements);
 
     // Sign: +1 for senders, -1 for receivers
     // This bakes the sign into the term so the accumulated column can just sum everything
@@ -711,7 +764,16 @@ fn build_logup_term_column<F, E>(
         -FieldElement::<E>::one()
     };
 
-    for (row, multiplicity) in multiplicities.iter().enumerate() {
+    // =========================================================================
+    // OPTIMIZATION: Batch inversion
+    // Instead of inverting each fingerprint individually (O(n) inversions),
+    // we collect all fingerprints first and batch invert them (O(1) inversion + O(n) multiplications).
+    // This is significantly faster for large traces.
+    // =========================================================================
+
+    // Step 1: Compute all fingerprints
+    let mut fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(trace_len);
+    for row in 0..trace_len {
         // Stage 1: Combine each typed value's columns using powers of 2 (in base field)
         // Stage 2: Convert to extension and combine with powers of α
         let bus_elements: Vec<FieldElement<E>> = table_interaction
@@ -737,14 +799,20 @@ fn build_logup_term_column<F, E>(
             .map(|(v, coeff)| v * coeff)
             .sum();
 
-        let fingerprint = z - &linear_combination;
+        fingerprints.push(z - &linear_combination);
+    }
 
-        // term = sign * multiplicity / fingerprint
-        let term = multiplicity
-            * &sign
-            * fingerprint
-                .inv()
-                .expect("fingerprint is zero - probability of sampling zero is negligible");
+    // Step 2: Batch invert all fingerprints
+    // This uses Montgomery's trick: compute product prefix, invert once, then multiply back
+    FieldElement::inplace_batch_inverse(&mut fingerprints)
+        .expect("fingerprint is zero - probability of sampling zero is negligible");
+
+    // Step 3: Compute terms using the inverted fingerprints
+    for (row, (multiplicity, fingerprint_inv)) in
+        multiplicities.iter().zip(fingerprints.iter()).enumerate()
+    {
+        // term = sign * multiplicity * fingerprint^(-1)
+        let term = multiplicity * &sign * fingerprint_inv;
         trace.set_aux(row, aux_column_idx, term);
     }
 }
@@ -862,9 +930,8 @@ where
                 })
                 .collect();
 
-            // Coefficients for each bus element
-            let coeffs: Vec<FieldElement<B>> =
-                (0..bus_elements.len()).map(|i| alpha.pow(i)).collect();
+            // Coefficients for each bus element (using incremental multiplication)
+            let coeffs = compute_alpha_powers(alpha, bus_elements.len());
 
             // fingerprint = z - (v[0] * alpha^0 + v[1] * alpha^1 + ... + v[n] * alpha^n)
             let fingerprint: FieldElement<B> = (-bus_elements
