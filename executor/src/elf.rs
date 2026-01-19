@@ -5,9 +5,9 @@ const EM_RISCV: u16 = 243;
 const ET_EXEC: u16 = 2;
 const PT_LOAD: u32 = 1;
 const MAX_PROGRAM_HEADERS: usize = 256;
-const EXECUTABLE_HEADER_SIZE: usize = 52;
-const PROGRAM_HEADER_SIZE: usize = 32;
-const ELF_32_BIT: u8 = 1;
+const EXECUTABLE_HEADER_SIZE: usize = 64; // 64-bit ELF header is 64 bytes
+const PROGRAM_HEADER_SIZE: usize = 56; // 64-bit program header is 56 bytes
+const ELF_64_BIT: u8 = 2;
 const ELF_LITTLE_ENDIAN: u8 = 1;
 const ELF_CURRENT_VERSION: u8 = 1;
 
@@ -21,12 +21,12 @@ pub struct ExecutableHeader {
     e_machine: u16,
     /// Object file version
     _e_version: u32,
-    /// Entry point virtual address
-    e_entry: u32,
-    /// Program header table file offset
-    e_phoff: u32,
-    /// Section header table file offset
-    _e_shoff: u32,
+    /// Entry point virtual address (64-bit)
+    e_entry: u64,
+    /// Program header table file offset (64-bit)
+    e_phoff: u64,
+    /// Section header table file offset (64-bit)
+    _e_shoff: u64,
     /// Processor-specific flags
     _e_flags: u32,
     /// ELF header size in bytes
@@ -47,20 +47,20 @@ pub struct ExecutableHeader {
 pub struct ProgramHeader {
     /// Segment type
     p_type: u32,
-    /// Segment file offset
-    p_offset: u32,
-    /// Segment virtual address
-    p_vaddr: u32,
-    /// Segment physical address
-    _p_paddr: u32,
-    /// Segment size in file
-    p_filesz: u32,
-    /// Segment size in memory
-    p_memsz: u32,
-    /// Segment flags
+    /// Segment flags (moved in 64-bit format)
     _p_flags: u32,
-    /// Segment alignment
-    _p_align: u32,
+    /// Segment file offset (64-bit)
+    p_offset: u64,
+    /// Segment virtual address (64-bit)
+    p_vaddr: u64,
+    /// Segment physical address (64-bit)
+    _p_paddr: u64,
+    /// Segment size in file (64-bit)
+    p_filesz: u64,
+    /// Segment size in memory (64-bit)
+    p_memsz: u64,
+    /// Segment alignment (64-bit)
+    _p_align: u64,
 }
 
 #[derive(Debug)]
@@ -108,8 +108,8 @@ impl ExecutableHeader {
         if e_ident[0] != 0x7F || e_ident[1] != b'E' || e_ident[2] != b'L' || e_ident[3] != b'F' {
             return Err(ElfError::InvalidELFMagicNumber);
         }
-        if e_ident[4] != ELF_32_BIT {
-            return Err(ElfError::Not32Bit);
+        if e_ident[4] != ELF_64_BIT {
+            return Err(ElfError::Not64Bit);
         }
         if e_ident[5] != ELF_LITTLE_ENDIAN {
             return Err(ElfError::NotLittleEndian);
@@ -117,28 +117,39 @@ impl ExecutableHeader {
         if e_ident[6] != ELF_CURRENT_VERSION {
             return Err(ElfError::InvalidElfVersion);
         }
-        let e_type = u16::from_le_bytes(
-            input[EI_NIDENT..18]
-                .try_into()
-                .map_err(|_| ElfError::Casting)?,
-        );
+        // 64-bit ELF header layout:
+        // 0-15: e_ident
+        // 16-17: e_type
+        // 18-19: e_machine
+        // 20-23: e_version
+        // 24-31: e_entry (8 bytes)
+        // 32-39: e_phoff (8 bytes)
+        // 40-47: e_shoff (8 bytes)
+        // 48-51: e_flags
+        // 52-53: e_ehsize
+        // 54-55: e_phentsize
+        // 56-57: e_phnum
+        // 58-59: e_shentsize
+        // 60-61: e_shnum
+        // 62-63: e_shstrndx
+        let e_type = u16::from_le_bytes(input[16..18].try_into().map_err(|_| ElfError::Casting)?);
         let e_machine =
             u16::from_le_bytes(input[18..20].try_into().map_err(|_| ElfError::Casting)?);
         let e_version =
             u32::from_le_bytes(input[20..24].try_into().map_err(|_| ElfError::Casting)?);
-        let e_entry = u32::from_le_bytes(input[24..28].try_into().map_err(|_| ElfError::Casting)?);
-        let e_phoff = u32::from_le_bytes(input[28..32].try_into().map_err(|_| ElfError::Casting)?);
-        let e_shoff = u32::from_le_bytes(input[32..36].try_into().map_err(|_| ElfError::Casting)?);
-        let e_flags = u32::from_le_bytes(input[36..40].try_into().map_err(|_| ElfError::Casting)?);
-        let e_ehsize = u16::from_le_bytes(input[40..42].try_into().map_err(|_| ElfError::Casting)?);
+        let e_entry = u64::from_le_bytes(input[24..32].try_into().map_err(|_| ElfError::Casting)?);
+        let e_phoff = u64::from_le_bytes(input[32..40].try_into().map_err(|_| ElfError::Casting)?);
+        let e_shoff = u64::from_le_bytes(input[40..48].try_into().map_err(|_| ElfError::Casting)?);
+        let e_flags = u32::from_le_bytes(input[48..52].try_into().map_err(|_| ElfError::Casting)?);
+        let e_ehsize = u16::from_le_bytes(input[52..54].try_into().map_err(|_| ElfError::Casting)?);
         let e_phentsize =
-            u16::from_le_bytes(input[42..44].try_into().map_err(|_| ElfError::Casting)?);
-        let e_phnum = u16::from_le_bytes(input[44..46].try_into().map_err(|_| ElfError::Casting)?);
+            u16::from_le_bytes(input[54..56].try_into().map_err(|_| ElfError::Casting)?);
+        let e_phnum = u16::from_le_bytes(input[56..58].try_into().map_err(|_| ElfError::Casting)?);
         let e_shentsize =
-            u16::from_le_bytes(input[46..48].try_into().map_err(|_| ElfError::Casting)?);
-        let e_shnum = u16::from_le_bytes(input[48..50].try_into().map_err(|_| ElfError::Casting)?);
+            u16::from_le_bytes(input[58..60].try_into().map_err(|_| ElfError::Casting)?);
+        let e_shnum = u16::from_le_bytes(input[60..62].try_into().map_err(|_| ElfError::Casting)?);
         let e_shstrndx =
-            u16::from_le_bytes(input[50..52].try_into().map_err(|_| ElfError::Casting)?);
+            u16::from_le_bytes(input[62..64].try_into().map_err(|_| ElfError::Casting)?);
         Ok(Self {
             _e_ident: e_ident,
             e_type,
@@ -163,38 +174,47 @@ impl ProgramHeader {
         if input.len() < PROGRAM_HEADER_SIZE {
             return Err(ElfError::ProgramHeaderSize);
         }
+        // 64-bit program header layout:
+        // 0-3: p_type
+        // 4-7: p_flags
+        // 8-15: p_offset (8 bytes)
+        // 16-23: p_vaddr (8 bytes)
+        // 24-31: p_paddr (8 bytes)
+        // 32-39: p_filesz (8 bytes)
+        // 40-47: p_memsz (8 bytes)
+        // 48-55: p_align (8 bytes)
         let p_type = u32::from_le_bytes(input[0..4].try_into().map_err(|_| ElfError::Casting)?);
-        let p_offset = u32::from_le_bytes(input[4..8].try_into().map_err(|_| ElfError::Casting)?);
-        let p_vaddr = u32::from_le_bytes(input[8..12].try_into().map_err(|_| ElfError::Casting)?);
-        let p_paddr = u32::from_le_bytes(input[12..16].try_into().map_err(|_| ElfError::Casting)?);
-        let p_filesz = u32::from_le_bytes(input[16..20].try_into().map_err(|_| ElfError::Casting)?);
-        let p_memsz = u32::from_le_bytes(input[20..24].try_into().map_err(|_| ElfError::Casting)?);
-        let p_flags = u32::from_le_bytes(input[24..28].try_into().map_err(|_| ElfError::Casting)?);
-        let p_align = u32::from_le_bytes(input[28..32].try_into().map_err(|_| ElfError::Casting)?);
+        let p_flags = u32::from_le_bytes(input[4..8].try_into().map_err(|_| ElfError::Casting)?);
+        let p_offset = u64::from_le_bytes(input[8..16].try_into().map_err(|_| ElfError::Casting)?);
+        let p_vaddr = u64::from_le_bytes(input[16..24].try_into().map_err(|_| ElfError::Casting)?);
+        let p_paddr = u64::from_le_bytes(input[24..32].try_into().map_err(|_| ElfError::Casting)?);
+        let p_filesz = u64::from_le_bytes(input[32..40].try_into().map_err(|_| ElfError::Casting)?);
+        let p_memsz = u64::from_le_bytes(input[40..48].try_into().map_err(|_| ElfError::Casting)?);
+        let p_align = u64::from_le_bytes(input[48..56].try_into().map_err(|_| ElfError::Casting)?);
         Ok(Self {
             p_type,
+            _p_flags: p_flags,
             p_offset,
             p_vaddr,
             _p_paddr: p_paddr,
             p_filesz,
             p_memsz,
-            _p_flags: p_flags,
             _p_align: p_align,
         })
     }
 }
-pub struct Elf {
-    pub entry_point: u32,
 
-    pub image: HashMap<u32, u32>,
+pub struct Elf {
+    pub entry_point: u64,
+    pub image: HashMap<u64, u32>,
 }
 
-pub(crate) const WORD_SIZE: u32 = 4;
+pub(crate) const WORD_SIZE: u64 = 4;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ElfError {
-    #[error("Not a 32-bit ELF")]
-    Not32Bit,
+    #[error("Not a 64-bit ELF")]
+    Not64Bit,
     #[error("Not a RISC-V ELF")]
     NotRiscV,
     #[error("ELF is not executable")]
@@ -227,7 +247,7 @@ pub enum ElfError {
 
 impl Elf {
     pub fn load(input: &[u8]) -> Result<Elf, ElfError> {
-        let mut image: HashMap<u32, u32> = HashMap::new();
+        let mut image: HashMap<u64, u32> = HashMap::new();
         let elf_program = ElfProgram::parse(input)?;
         if elf_program.ehdr.e_machine != EM_RISCV {
             return Err(ElfError::NotRiscV);
@@ -235,7 +255,7 @@ impl Elf {
         if elf_program.ehdr.e_type != ET_EXEC {
             return Err(ElfError::NotExecutable);
         }
-        let entry_point: u32 = elf_program.ehdr.e_entry;
+        let entry_point: u64 = elf_program.ehdr.e_entry;
         if !entry_point.is_multiple_of(WORD_SIZE) {
             return Err(ElfError::InvalidEntryPoint);
         }
@@ -258,7 +278,7 @@ impl Elf {
                 if i >= program_header.p_filesz {
                     image.insert(addr, 0);
                 } else {
-                    let mut word = 0;
+                    let mut word = 0u32;
                     let len = (program_header
                         .p_filesz
                         .checked_sub(i)
@@ -274,7 +294,7 @@ impl Elf {
                             as usize;
                         let byte = input.get(offset).ok_or(ElfError::InvalidOffset)?;
                         word |= (*byte as u32)
-                            .checked_shl(j.checked_mul(8).ok_or(ElfError::InvalidProgram)?)
+                            .checked_shl((j as u32).checked_mul(8).ok_or(ElfError::InvalidProgram)?)
                             .ok_or(ElfError::InvalidProgram)?;
                     }
                     image.insert(addr, word);
