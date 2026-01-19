@@ -164,20 +164,21 @@ impl Packing {
         }
     }
 
-    /// Creates TypedValues at the given start columns.
+    /// Creates BusValues at the given start columns.
     ///
-    /// Each element in `start_columns` becomes a separate TypedValue using this packing.
+    /// Each element in `start_columns` becomes a separate `BusValue::Packed` using this packing.
     ///
-    /// # Example
-    /// ```ignore
-    /// Packing::Direct.columns(&[0, 1, 2])  // 3 direct values at columns 0, 1, 2
-    /// Packing::DWordHL.columns(&[0, 4])    // 2 DWordHL values: cols 0-3 and cols 4-7
-    /// Packing::DWordHHW.columns(&[0])      // 1 DWordHHW value at cols 0, 1, 2
-    /// ```
-    pub fn columns(self, start_columns: &[usize]) -> Vec<TypedValue> {
+    /// Examples:
+    /// - `Packing::Direct.columns(&[0, 1, 2])` - 3 direct values at columns 0, 1, 2
+    /// - `Packing::DWordHL.columns(&[0, 4])` - 2 DWordHL values: cols 0-3 and cols 4-7
+    /// - `Packing::DWordHHW.columns(&[0])` - 1 DWordHHW value at cols 0, 1, 2
+    pub fn columns(self, start_columns: &[usize]) -> Vec<BusValue> {
         start_columns
             .iter()
-            .map(|&col| TypedValue::new(col, self))
+            .map(|&col| BusValue::Packed {
+                start_column: col,
+                packing: self,
+            })
             .collect()
     }
 
@@ -283,67 +284,138 @@ impl Packing {
 }
 
 // =============================================================================
-// Typed Value
+// Linear Term and Bus Value
 // =============================================================================
 
-/// A typed value for bus interactions.
+/// A term in a linear combination.
 ///
-/// Specifies which trace columns hold the limbs and how to combine them.
+/// Used to build custom linear combinations of column values and constants.
 #[derive(Debug, Clone)]
-pub struct TypedValue {
-    /// Starting column index in the trace
-    pub start_column: usize,
-    /// How to interpret and combine the columns
-    pub bus_type: Packing,
+pub enum LinearTerm {
+    /// coefficient * column_value
+    Column {
+        /// The multiplier for the column value
+        coefficient: u64,
+        /// The column index to read from
+        column: usize,
+    },
+    /// A constant value to add
+    Constant(u64),
 }
 
-impl TypedValue {
-    /// Creates a new typed value.
+/// A value that contributes to the bus fingerprint.
+///
+/// Each `BusValue` produces exactly **1 bus element** for the fingerprint.
+/// The fingerprint is computed as: `z - (v₀ + α·v₁ + α²·v₂ + ...)`
+/// where each `vᵢ` is a bus element from a `BusValue`.
+#[derive(Debug, Clone)]
+pub enum BusValue {
+    /// Columns combined with predefined packing (powers of 2).
     ///
-    /// Prefer using `Packing::columns()` instead:
-    /// ```ignore
-    /// Packing::Direct.columns(&[0])
-    /// Packing::Word2L.columns(&[1])
-    /// ```
-    pub fn new(start_column: usize, bus_type: Packing) -> Self {
-        Self {
-            start_column,
-            bus_type,
+    /// Uses the `Packing` enum's formula to combine consecutive columns.
+    /// Example: `Word2L` at column 0 reads columns 0,1 and computes `c₀ + 2¹⁶·c₁`
+    Packed {
+        /// Starting column index
+        start_column: usize,
+        /// How to combine the columns
+        packing: Packing,
+    },
+
+    /// Custom linear combination of columns and/or constants.
+    ///
+    /// Computes: `a₀·col[i₀] + a₁·col[i₁] + ... + c`
+    /// where `aᵢ` are coefficients, `col[iᵢ]` are column values, and `c` is a constant.
+    Linear(Vec<LinearTerm>),
+}
+
+impl BusValue {
+    /// Creates a constant value (no columns).
+    ///
+    /// Example: `BusValue::constant(0x42)` for a table ID or opcode.
+    pub fn constant(value: u64) -> Self {
+        BusValue::Linear(vec![LinearTerm::Constant(value)])
+    }
+
+    /// Creates a single column value with coefficient 1.
+    ///
+    /// Example: `BusValue::column(2)` reads column 2 directly.
+    pub fn column(col: usize) -> Self {
+        BusValue::Linear(vec![LinearTerm::Column {
+            coefficient: 1,
+            column: col,
+        }])
+    }
+
+    /// Creates a linear combination from terms.
+    ///
+    /// Example: `BusValue::linear(vec![...])` with `LinearTerm::Column` and `LinearTerm::Constant`
+    /// terms computes something like `3·col[0] + 7·col[1] + 42`.
+    pub fn linear(terms: Vec<LinearTerm>) -> Self {
+        BusValue::Linear(terms)
+    }
+
+    /// Returns the number of bus elements this value produces (always 1).
+    pub fn num_bus_elements(&self) -> usize {
+        match self {
+            BusValue::Packed { packing, .. } => packing.num_bus_elements(),
+            BusValue::Linear(_) => 1,
         }
     }
 
-    /// Returns the number of columns this value spans.
-    pub fn num_columns(&self) -> usize {
-        self.bus_type.num_columns()
-    }
-
-    /// Returns the number of bus elements this value produces.
-    pub fn num_bus_elements(&self) -> usize {
-        self.bus_type.num_bus_elements()
-    }
-
-    /// Returns the column indices this value uses.
+    /// Returns the column indices this value reads from.
     pub fn column_indices(&self) -> Vec<usize> {
-        (self.start_column..self.start_column + self.num_columns()).collect()
+        match self {
+            BusValue::Packed {
+                start_column,
+                packing,
+            } => (*start_column..*start_column + packing.num_columns()).collect(),
+            BusValue::Linear(terms) => terms
+                .iter()
+                .filter_map(|term| match term {
+                    LinearTerm::Column { column, .. } => Some(*column),
+                    LinearTerm::Constant(_) => None,
+                })
+                .collect(),
+        }
     }
 
-    /// Extracts column values from a row and combines them.
+    /// Computes the bus element value from column values.
     ///
     /// # Arguments
     /// * `get_column` - Function to get column value by index
     ///
     /// # Returns
-    /// Vector of combined bus elements
+    /// Vector of combined bus elements (length = num_bus_elements())
     pub fn combine_from<E: IsField, F: Fn(usize) -> FieldElement<E>>(
         &self,
         get_column: F,
     ) -> Vec<FieldElement<E>> {
-        let columns: Vec<_> = self
-            .column_indices()
-            .iter()
-            .map(|&i| get_column(i))
-            .collect();
-        self.bus_type.combine(&columns)
+        match self {
+            BusValue::Packed {
+                start_column,
+                packing,
+            } => {
+                let columns: Vec<_> = (*start_column..*start_column + packing.num_columns())
+                    .map(&get_column)
+                    .collect();
+                packing.combine(&columns)
+            }
+            BusValue::Linear(terms) => {
+                let mut result = FieldElement::<E>::zero();
+                for term in terms {
+                    match term {
+                        LinearTerm::Column { coefficient, column } => {
+                            let coeff = FieldElement::<E>::from(*coefficient);
+                            result = result + get_column(*column) * coeff;
+                        }
+                        LinearTerm::Constant(value) => {
+                            result = result + FieldElement::<E>::from(*value);
+                        }
+                    }
+                }
+                vec![result]
+            }
+        }
     }
 }
 
@@ -569,10 +641,10 @@ pub struct AuxiliaryTraceBuildData {
 }
 
 /// Struct representing a lookup interaction for a given table.
-/// Contains the multiplicity and typed values involved in said interaction.
+/// Contains the multiplicity and bus values involved in said interaction.
 ///
 /// Values are combined in two stages:
-/// 1. **Casting** (powers of 2): Combine limbs within each TypedValue
+/// 1. **Casting** (powers of 2 or custom linear combination): Combine limbs within each BusValue
 /// 2. **Bus fingerprint** (powers of α): Combine all bus elements into one fingerprint
 #[derive(Clone)]
 pub struct BusInteraction {
@@ -581,8 +653,9 @@ pub struct BusInteraction {
     /// Determines how many times each row contributes to the bus.
     /// If None, a constant multiplicity of 1 is used for all rows.
     pub multiplicity_column: Option<usize>,
-    /// Typed values that make up this interaction
-    pub values: Vec<TypedValue>,
+    /// Bus values that make up this interaction.
+    /// Each BusValue produces one or more bus elements for the fingerprint.
+    pub values: Vec<BusValue>,
     /// Whether this side of the interaction is a sender (true) or receiver (false).
     /// Senders contribute positive values to the bus sum, receivers contribute negative.
     /// For bus balance: Σ sender_values - Σ receiver_values = 0
@@ -593,7 +666,7 @@ impl BusInteraction {
     /// Creates a new table interaction.
     pub fn new(
         multiplicity_column: Option<usize>,
-        values: Vec<TypedValue>,
+        values: Vec<BusValue>,
         is_sender: bool,
     ) -> Self {
         Self {
@@ -604,12 +677,12 @@ impl BusInteraction {
     }
 
     /// Creates a sender interaction.
-    pub fn sender(multiplicity_column: Option<usize>, values: Vec<TypedValue>) -> Self {
+    pub fn sender(multiplicity_column: Option<usize>, values: Vec<BusValue>) -> Self {
         Self::new(multiplicity_column, values, true)
     }
 
     /// Creates a receiver interaction.
-    pub fn receiver(multiplicity_column: Option<usize>, values: Vec<TypedValue>) -> Self {
+    pub fn receiver(multiplicity_column: Option<usize>, values: Vec<BusValue>) -> Self {
         Self::new(multiplicity_column, values, false)
     }
 
@@ -712,19 +785,15 @@ fn build_logup_term_column<F, E>(
     };
 
     for (row, multiplicity) in multiplicities.iter().enumerate() {
-        // Stage 1: Combine each typed value's columns using powers of 2 (in base field)
+        // Stage 1: Combine each bus value's columns (powers of 2 or custom linear combination)
         // Stage 2: Convert to extension and combine with powers of α
         let bus_elements: Vec<FieldElement<E>> = table_interaction
             .values
             .iter()
-            .flat_map(|tv| {
-                // Combine in base field (cheaper)
-                let columns: Vec<FieldElement<F>> = tv
-                    .column_indices()
-                    .iter()
-                    .map(|&col| main_segment_cols[col][row].clone())
-                    .collect();
-                let combined = tv.bus_type.combine(&columns);
+            .flat_map(|bv| {
+                // Combine using the BusValue's combine_from method (in base field when possible)
+                let combined: Vec<FieldElement<F>> =
+                    bv.combine_from(|col| main_segment_cols[col][row].clone());
                 // Convert to extension only after combining
                 combined.into_iter().map(|v| v.to_extension())
             })
@@ -844,19 +913,15 @@ where
                 None => FieldElement::<A>::one(),
             };
 
-            // Stage 1: Combine each typed value's columns using powers of 2 (in base field)
+            // Stage 1: Combine each bus value's columns (powers of 2 or custom linear combination)
             // Stage 2: Convert to extension and flatten all bus elements
             let bus_elements: Vec<FieldElement<B>> = interaction
                 .values
                 .iter()
-                .flat_map(|tv| {
-                    // Combine in base field (cheaper)
-                    let columns: Vec<FieldElement<A>> = tv
-                        .column_indices()
-                        .iter()
-                        .map(|&col| step.get_main_evaluation_element(0, col).clone())
-                        .collect();
-                    let combined = tv.bus_type.combine(&columns);
+                .flat_map(|bv| {
+                    // Combine using the BusValue's combine_from method (in base field when possible)
+                    let combined: Vec<FieldElement<A>> =
+                        bv.combine_from(|col| step.get_main_evaluation_element(0, col).clone());
                     // Convert to extension only after combining
                     combined.into_iter().map(|v| v.to_extension())
                 })
