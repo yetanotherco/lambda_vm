@@ -83,6 +83,27 @@ fn compute_alpha_powers<E: IsField>(alpha: &FieldElement<E>, count: usize) -> Ve
 }
 
 // =============================================================================
+// Native u64 Combining Operations
+// =============================================================================
+// For fields with native u64 representation (like Goldilocks64Field), we can
+// combine values using direct bit shifts instead of field arithmetic. This
+// avoids the overhead of creating FieldElement from shift constants.
+
+/// Combines two 16-bit halves into a 32-bit word using native bit operations.
+/// Formula: h₀ + h₁ << 16
+#[inline]
+pub fn combine_word2l_native(h0: u64, h1: u64) -> u64 {
+    h0 + (h1 << 16)
+}
+
+/// Combines four 8-bit bytes into a 32-bit word using native bit operations.
+/// Formula: b₀ + b₁ << 8 + b₂ << 16 + b₃ << 24
+#[inline]
+pub fn combine_word4l_native(b0: u64, b1: u64, b2: u64, b3: u64) -> u64 {
+    b0 + (b1 << 8) + (b2 << 16) + (b3 << 24)
+}
+
+// =============================================================================
 // LogUp Challenge Indices
 // =============================================================================
 // The LogUp protocol requires two random challenges sampled via Fiat-Shamir:
@@ -330,6 +351,102 @@ impl Packing {
                 result.extend(Packing::Word2L.combine(&columns[4..6]));
                 result.extend(Packing::Word2L.combine(&columns[6..8]));
                 result
+            }
+        }
+    }
+
+    /// Combines column values into bus elements using native u64 bit operations.
+    ///
+    /// This is a specialized version for fields with native u64 representation
+    /// (like Goldilocks64Field) that avoids the overhead of creating FieldElement
+    /// shift constants and field arithmetic.
+    ///
+    /// # Arguments
+    /// * `columns` - Slice of raw u64 values from the trace columns
+    ///
+    /// # Returns
+    /// Vector of combined u64 values
+    ///
+    /// # Panics
+    /// If `columns.len() != self.num_columns()`
+    pub fn combine_native(&self, columns: &[u64]) -> Vec<u64> {
+        assert_eq!(
+            columns.len(),
+            self.num_columns(),
+            "Packing {:?} expects {} columns, got {}",
+            self,
+            self.num_columns(),
+            columns.len()
+        );
+
+        match self {
+            // =================================================================
+            // Primitives - use direct bit operations
+            // =================================================================
+            Packing::Direct => {
+                vec![columns[0]]
+            }
+
+            Packing::Word2L => {
+                // h₀ + h₁ << 16
+                vec![combine_word2l_native(columns[0], columns[1])]
+            }
+
+            Packing::Word4L => {
+                // b₀ + b₁ << 8 + b₂ << 16 + b₃ << 24
+                vec![combine_word4l_native(
+                    columns[0], columns[1], columns[2], columns[3],
+                )]
+            }
+
+            // =================================================================
+            // Compounds - delegate to primitives
+            // =================================================================
+            Packing::DWordWL => {
+                // 2× Direct
+                vec![columns[0], columns[1]]
+            }
+
+            Packing::DWordHHW => {
+                // Direct + Word2L
+                vec![
+                    columns[0],
+                    combine_word2l_native(columns[1], columns[2]),
+                ]
+            }
+
+            Packing::DWordWHH => {
+                // Word2L + Direct
+                vec![
+                    combine_word2l_native(columns[0], columns[1]),
+                    columns[2],
+                ]
+            }
+
+            Packing::DWordHL => {
+                // 2× Word2L
+                vec![
+                    combine_word2l_native(columns[0], columns[1]),
+                    combine_word2l_native(columns[2], columns[3]),
+                ]
+            }
+
+            Packing::DWordBL => {
+                // 2× Word4L
+                vec![
+                    combine_word4l_native(columns[0], columns[1], columns[2], columns[3]),
+                    combine_word4l_native(columns[4], columns[5], columns[6], columns[7]),
+                ]
+            }
+
+            Packing::QuadHL => {
+                // 4× Word2L
+                vec![
+                    combine_word2l_native(columns[0], columns[1]),
+                    combine_word2l_native(columns[2], columns[3]),
+                    combine_word2l_native(columns[4], columns[5]),
+                    combine_word2l_native(columns[6], columns[7]),
+                ]
             }
         }
     }

@@ -337,3 +337,133 @@ fn test_random_valid_operations_verify() {
         "Random valid operations should verify"
     );
 }
+
+// =============================================================================
+// Native u64 Combining Operations Tests
+// =============================================================================
+// These tests verify that the native u64 combining operations produce correct
+// results and match what the field operations would produce.
+
+use crate::lookup::{combine_word2l_native, combine_word4l_native};
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(1000))]
+
+    /// Native Word2L combining should produce h0 + h1 * 2^16
+    #[test]
+    fn prop_native_word2l_formula(
+        h0 in 0u64..65536u64,
+        h1 in 0u64..65536u64,
+    ) {
+        let result = combine_word2l_native(h0, h1);
+        let expected = h0 + (h1 << 16);
+        prop_assert_eq!(result, expected);
+    }
+
+    /// Native Word4L combining should produce b0 + b1*2^8 + b2*2^16 + b3*2^24
+    #[test]
+    fn prop_native_word4l_formula(
+        b0 in 0u64..256u64,
+        b1 in 0u64..256u64,
+        b2 in 0u64..256u64,
+        b3 in 0u64..256u64,
+    ) {
+        let result = combine_word4l_native(b0, b1, b2, b3);
+        let expected = b0 + (b1 << 8) + (b2 << 16) + (b3 << 24);
+        prop_assert_eq!(result, expected);
+    }
+
+    /// Native Direct packing should return input unchanged
+    #[test]
+    fn prop_native_direct_identity(value in 0u64..1000000u64) {
+        let columns = vec![value];
+        let result = Packing::Direct.combine_native(&columns);
+        prop_assert_eq!(result.len(), 1);
+        prop_assert_eq!(result[0], value);
+    }
+
+    /// Native Word2L packing should work correctly
+    #[test]
+    fn prop_native_packing_word2l(
+        h0 in 0u64..65536u64,
+        h1 in 0u64..65536u64,
+    ) {
+        let columns = vec![h0, h1];
+        let result = Packing::Word2L.combine_native(&columns);
+        prop_assert_eq!(result.len(), 1);
+        prop_assert_eq!(result[0], h0 + (h1 << 16));
+    }
+
+    /// Native Word4L packing should work correctly
+    #[test]
+    fn prop_native_packing_word4l(
+        b0 in 0u64..256u64,
+        b1 in 0u64..256u64,
+        b2 in 0u64..256u64,
+        b3 in 0u64..256u64,
+    ) {
+        let columns = vec![b0, b1, b2, b3];
+        let result = Packing::Word4L.combine_native(&columns);
+        prop_assert_eq!(result.len(), 1);
+        prop_assert_eq!(result[0], b0 + (b1 << 8) + (b2 << 16) + (b3 << 24));
+    }
+
+    /// Native DWordHL (2x Word2L) should produce two combined values
+    #[test]
+    fn prop_native_packing_dwordhl(
+        h0 in 0u64..65536u64,
+        h1 in 0u64..65536u64,
+        h2 in 0u64..65536u64,
+        h3 in 0u64..65536u64,
+    ) {
+        let columns = vec![h0, h1, h2, h3];
+        let result = Packing::DWordHL.combine_native(&columns);
+        prop_assert_eq!(result.len(), 2);
+        prop_assert_eq!(result[0], h0 + (h1 << 16));
+        prop_assert_eq!(result[1], h2 + (h3 << 16));
+    }
+
+    /// Native DWordBL (2x Word4L) should produce two combined values
+    #[test]
+    fn prop_native_packing_dwordbl(
+        bytes in prop::collection::vec(0u64..256u64, 8),
+    ) {
+        let result = Packing::DWordBL.combine_native(&bytes);
+        prop_assert_eq!(result.len(), 2);
+
+        let expected0 = bytes[0] + (bytes[1] << 8) + (bytes[2] << 16) + (bytes[3] << 24);
+        let expected1 = bytes[4] + (bytes[5] << 8) + (bytes[6] << 16) + (bytes[7] << 24);
+
+        prop_assert_eq!(result[0], expected0);
+        prop_assert_eq!(result[1], expected1);
+    }
+
+    /// Native QuadHL (4x Word2L) should produce four combined values
+    #[test]
+    fn prop_native_packing_quadhl(
+        halves in prop::collection::vec(0u64..65536u64, 8),
+    ) {
+        let result = Packing::QuadHL.combine_native(&halves);
+        prop_assert_eq!(result.len(), 4);
+        prop_assert_eq!(result[0], halves[0] + (halves[1] << 16));
+        prop_assert_eq!(result[1], halves[2] + (halves[3] << 16));
+        prop_assert_eq!(result[2], halves[4] + (halves[5] << 16));
+        prop_assert_eq!(result[3], halves[6] + (halves[7] << 16));
+    }
+
+    /// Native combining should produce values in valid Goldilocks range
+    /// Goldilocks prime: p = 2^64 - 2^32 + 1 = 18446744069414584321
+    #[test]
+    fn prop_native_word4l_in_goldilocks_range(
+        b0 in 0u64..256u64,
+        b1 in 0u64..256u64,
+        b2 in 0u64..256u64,
+        b3 in 0u64..256u64,
+    ) {
+        let result = combine_word4l_native(b0, b1, b2, b3);
+        // The max value is 255 + 255*256 + 255*65536 + 255*16777216 = 4294967295 (2^32 - 1)
+        // which is well within the Goldilocks field
+        let goldilocks_prime: u64 = 18446744069414584321;
+        prop_assert!(result < goldilocks_prime);
+    }
+}

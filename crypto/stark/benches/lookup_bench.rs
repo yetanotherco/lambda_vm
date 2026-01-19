@@ -257,6 +257,119 @@ fn bench_fingerprint_computation(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark native u64 combining vs field element combining
+fn bench_native_vs_field_combine(c: &mut Criterion) {
+    let mut group = c.benchmark_group("native_vs_field_combine");
+    let mut rng = rand::thread_rng();
+
+    // Word2L - two 16-bit halves
+    {
+        let h0 = rng.r#gen::<u64>() % 65536;
+        let h1 = rng.r#gen::<u64>() % 65536;
+        let columns_fe = vec![FE::from(h0), FE::from(h1)];
+        let columns_u64 = vec![h0, h1];
+
+        group.bench_function("Word2L_field", |b| {
+            b.iter(|| Packing::Word2L.combine(&columns_fe))
+        });
+
+        group.bench_function("Word2L_native", |b| {
+            b.iter(|| Packing::Word2L.combine_native(&columns_u64))
+        });
+    }
+
+    // Word4L - four bytes
+    {
+        let bytes: Vec<u64> = (0..4).map(|_| rng.r#gen::<u64>() % 256).collect();
+        let columns_fe: Vec<FE> = bytes.iter().map(|&b| FE::from(b)).collect();
+
+        group.bench_function("Word4L_field", |b| {
+            b.iter(|| Packing::Word4L.combine(&columns_fe))
+        });
+
+        group.bench_function("Word4L_native", |b| {
+            b.iter(|| Packing::Word4L.combine_native(&bytes))
+        });
+    }
+
+    // DWordBL - eight bytes producing two words
+    {
+        let bytes: Vec<u64> = (0..8).map(|_| rng.r#gen::<u64>() % 256).collect();
+        let columns_fe: Vec<FE> = bytes.iter().map(|&b| FE::from(b)).collect();
+
+        group.bench_function("DWordBL_field", |b| {
+            b.iter(|| Packing::DWordBL.combine(&columns_fe))
+        });
+
+        group.bench_function("DWordBL_native", |b| {
+            b.iter(|| Packing::DWordBL.combine_native(&bytes))
+        });
+    }
+
+    // QuadHL - eight halves producing four words
+    {
+        let halves: Vec<u64> = (0..8).map(|_| rng.r#gen::<u64>() % 65536).collect();
+        let columns_fe: Vec<FE> = halves.iter().map(|&h| FE::from(h)).collect();
+
+        group.bench_function("QuadHL_field", |b| {
+            b.iter(|| Packing::QuadHL.combine(&columns_fe))
+        });
+
+        group.bench_function("QuadHL_native", |b| {
+            b.iter(|| Packing::QuadHL.combine_native(&halves))
+        });
+    }
+
+    group.finish();
+}
+
+/// Benchmark bulk native combining (simulating trace row processing)
+fn bench_bulk_native_combine(c: &mut Criterion) {
+    let mut group = c.benchmark_group("bulk_native_combine");
+    let mut rng = rand::thread_rng();
+
+    for num_rows in [256, 1024, 4096] {
+        // Generate random trace data (8 bytes per row for DWordBL)
+        let trace_data: Vec<Vec<u64>> = (0..num_rows)
+            .map(|_| (0..8).map(|_| rng.r#gen::<u64>() % 256).collect())
+            .collect();
+
+        // Field element version
+        let trace_fe: Vec<Vec<FE>> = trace_data
+            .iter()
+            .map(|row| row.iter().map(|&v| FE::from(v)).collect())
+            .collect();
+
+        group.bench_with_input(
+            BenchmarkId::new("DWordBL_field", num_rows),
+            &num_rows,
+            |b, _| {
+                b.iter(|| {
+                    trace_fe
+                        .iter()
+                        .map(|row| Packing::DWordBL.combine(row))
+                        .collect::<Vec<_>>()
+                })
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("DWordBL_native", num_rows),
+            &num_rows,
+            |b, _| {
+                b.iter(|| {
+                    trace_data
+                        .iter()
+                        .map(|row| Packing::DWordBL.combine_native(row))
+                        .collect::<Vec<_>>()
+                })
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_batch_vs_individual_inverse,
@@ -265,5 +378,7 @@ criterion_group!(
     bench_shift_constant_creation,
     bench_alpha_powers,
     bench_fingerprint_computation,
+    bench_native_vs_field_combine,
+    bench_bulk_native_combine,
 );
 criterion_main!(benches);
