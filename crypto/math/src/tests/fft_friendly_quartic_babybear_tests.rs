@@ -90,12 +90,7 @@ fn test_mul_by_inv_is_identity() {
 fn test_mul_as_subfield() {
     let a = FpE::from(2);
     let b = Fp4E::new([FpE::from(2), FpE::from(4), FpE::from(6), FpE::from(8)]);
-    let expected_result = Fp4E::new([
-        FpE::from(4),
-        FpE::from(8),
-        FpE::from(12),
-        FpE::from(16),
-    ]);
+    let expected_result = Fp4E::new([FpE::from(4), FpE::from(8), FpE::from(12), FpE::from(16)]);
     assert_eq!(a * b, expected_result);
 }
 

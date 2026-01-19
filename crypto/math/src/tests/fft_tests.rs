@@ -146,10 +146,20 @@ mod fft_polynomial_tests {
         #[test]
         fn composition_fft_works() {
             let p = Polynomial::new(&[FE::from(0u64), FE::from(2u64)]);
-            let q = Polynomial::new(&[FE::from(0u64), FE::from(0u64), FE::from(0u64), FE::from(1u64)]);
+            let q = Polynomial::new(&[
+                FE::from(0u64),
+                FE::from(0u64),
+                FE::from(0u64),
+                FE::from(1u64),
+            ]);
             assert_eq!(
                 compose_fft::<F, F>(&p, &q),
-                Polynomial::new(&[FE::from(0u64), FE::from(0u64), FE::from(0u64), FE::from(2u64)])
+                Polynomial::new(&[
+                    FE::from(0u64),
+                    FE::from(0u64),
+                    FE::from(0u64),
+                    FE::from(2u64)
+                ])
             );
         }
     }
@@ -252,8 +262,18 @@ mod fft_polynomial_tests {
         type TF = Babybear31PrimeField;
         type TL = Degree4BabyBearExtensionField;
 
-        let a = FieldElement::<TL>::from(&[FieldElement::one(), FieldElement::one(), FieldElement::zero(), FieldElement::zero()]);
-        let b = FieldElement::<TL>::from(&[-FieldElement::from(2), FieldElement::from(17), FieldElement::zero(), FieldElement::zero()]);
+        let a = FieldElement::<TL>::from(&[
+            FieldElement::one(),
+            FieldElement::one(),
+            FieldElement::zero(),
+            FieldElement::zero(),
+        ]);
+        let b = FieldElement::<TL>::from(&[
+            -FieldElement::from(2),
+            FieldElement::from(17),
+            FieldElement::zero(),
+            FieldElement::zero(),
+        ]);
         let c = FieldElement::<TL>::one();
         let poly = Polynomial::new(&[a, b, c]);
 

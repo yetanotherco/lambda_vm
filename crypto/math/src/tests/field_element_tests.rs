@@ -6,8 +6,8 @@ mod tests {
     use crate::field::fields::fft_friendly::{
         babybear_u32::Babybear31PrimeField, stark_252_prime_field::Stark252PrimeField,
     };
-    use crate::field::fields::montgomery_backed_prime_fields::{IsModulus, U384PrimeField};
     use crate::field::fields::goldilocks::Goldilocks64Field;
+    use crate::field::fields::montgomery_backed_prime_fields::{IsModulus, U384PrimeField};
     use crate::field::fields::u64_prime_field::U64PrimeField;
     use crate::unsigned_integer::element::U384;
     #[cfg(feature = "alloc")]

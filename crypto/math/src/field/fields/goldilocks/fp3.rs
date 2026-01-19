@@ -163,7 +163,9 @@ impl IsSubFieldOf<Degree3ExtensionField> for Goldilocks64Field {
         b: &<Degree3ExtensionField as IsField>::BaseType,
     ) -> Result<<Degree3ExtensionField as IsField>::BaseType, FieldError> {
         let b_inv = Degree3ExtensionField::inv(b)?;
-        Ok(<Self as IsSubFieldOf<Degree3ExtensionField>>::mul(a, &b_inv))
+        Ok(<Self as IsSubFieldOf<Degree3ExtensionField>>::mul(
+            a, &b_inv,
+        ))
     }
 
     fn sub(

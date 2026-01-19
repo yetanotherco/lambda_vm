@@ -72,8 +72,7 @@ pub fn gen_fft_and_naive_interpolate<F: IsFFTField>(
     fft_evals: &[FieldElement<F>],
 ) -> (Polynomial<FieldElement<F>>, Polynomial<FieldElement<F>>) {
     let order = fft_evals.len().trailing_zeros() as u64;
-    let twiddles =
-        get_powers_of_primitive_root(order, 1 << order, RootsConfig::Natural).unwrap();
+    let twiddles = get_powers_of_primitive_root(order, 1 << order, RootsConfig::Natural).unwrap();
 
     let naive_poly = Polynomial::interpolate(&twiddles, fft_evals).unwrap();
     let fft_poly = Polynomial::interpolate_fft::<F>(fft_evals).unwrap();
