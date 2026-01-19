@@ -67,11 +67,11 @@ $(BENCH_ARTIFACTS_DIR)/%.elf: $(BENCH_PROGRAMS_DIR)/%/Cargo.toml
 	@mkdir -p $(BENCH_ARTIFACTS_DIR)
 	cd $(BENCH_PROGRAMS_DIR)/$* && \
 		CARGO_TARGET_DIR=$(abspath $(SHARED_TARGET_DIR)) \
-		rustup run nightly cargo build \
+		rustup run nightly cargo build --release \
 			--target $(RV64_TARGET_SPEC) \
 			-Z build-std=core,compiler_builtins \
 			-Z build-std-features=compiler-builtins-mem
-	cp $(SHARED_TARGET_DIR)/riscv64im-lambda-vm-elf/debug/$* $@
+	cp $(SHARED_TARGET_DIR)/riscv64im-lambda-vm-elf/release/$* $@
 
 clean-asm:
 	-rm -rf $(ASM_ARTIFACTS_DIR)
