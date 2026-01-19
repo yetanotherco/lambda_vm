@@ -20,6 +20,19 @@ BENCH_PROGRAM_DIRS := $(dir $(wildcard $(BENCH_PROGRAMS_DIR)/*/Cargo.toml))
 BENCH_PROGRAMS := $(notdir $(basename $(BENCH_PROGRAM_DIRS:%/=%)))
 BENCH_ARTIFACTS := $(addprefix $(BENCH_ARTIFACTS_DIR)/, $(addsuffix .elf, $(BENCH_PROGRAMS)))
 
+ETHREX_FILE := tests/ethrex_hoodi.bin
+ETHREX_URL := https://lambda.alignedlayer.com/ethrex_hoodi.bin
+
+.PHONY: test prepare-test-data
+
+prepare-test-data:
+	@if [ ! -f "$(ETHREX_FILE)" ]; then \
+		echo "Downloading ethrex_hoodi.bin..."; \
+		curl -L "$(ETHREX_URL)" -o "$(ETHREX_FILE)"; \
+	else \
+		echo "ethrex_hoodi.bin already exists"; \
+	fi
+
 compile-programs-asm: clean-asm $(ARTIFACTS_ASM)
 
 compile-programs-rust: clean-rust $(RUST_ARTIFACTS)
@@ -76,10 +89,10 @@ test-asm: compile-programs-asm test-asm-no-compile
 test-asm-no-compile:
 	cargo test --test asm
 
-test-rust: compile-programs-rust
+test-rust: compile-programs-rust prepare-test-data
 	cargo test --test rust
 
-test-no-compile:
+test-no-compile: prepare-test-data
 	cargo test
 
 .PHONY: deps

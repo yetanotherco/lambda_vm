@@ -864,8 +864,8 @@ fn test_wrong_table_consumes_value_rejected() {
 #[test_log::test]
 fn test_packing_mismatch_direct_vs_word2l() {
     use crate::lookup::{
-        AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, NullBoundaryConstraintBuilder,
-        Packing,
+        AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, Multiplicity,
+        NullBoundaryConstraintBuilder, Packing,
     };
 
     fn sender_air_direct(
@@ -874,7 +874,7 @@ fn test_packing_mismatch_direct_vs_word2l() {
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![
                 // Sender uses Direct: 2 separate elements
-                BusInteraction::sender(TEST_BUS, Some(0), Packing::Direct.columns(&[1, 2])),
+                BusInteraction::sender(TEST_BUS, Multiplicity::Column(0), Packing::Direct.columns(&[1, 2])),
             ],
         };
         AirWithBuses::new(3, auxiliary_trace_build_data, proof_options, 1, vec![])
@@ -887,7 +887,7 @@ fn test_packing_mismatch_direct_vs_word2l() {
             interactions: vec![
                 // Receiver uses Word2L: combines 2 columns into 1 element
                 // Formula: (v0 + 2^16 * v1) - different from v0 + α*v1
-                BusInteraction::receiver(TEST_BUS, Some(0), Packing::Word2L.columns(&[1])),
+                BusInteraction::receiver(TEST_BUS, Multiplicity::Column(0), Packing::Word2L.columns(&[1])),
             ],
         };
         AirWithBuses::new(
@@ -956,8 +956,8 @@ fn test_packing_mismatch_direct_vs_word2l() {
 #[test_log::test]
 fn test_packing_mismatch_element_count() {
     use crate::lookup::{
-        AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, NullBoundaryConstraintBuilder,
-        Packing,
+        AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, Multiplicity,
+        NullBoundaryConstraintBuilder, Packing,
     };
 
     fn sender_air_3_direct(
@@ -967,7 +967,7 @@ fn test_packing_mismatch_element_count() {
             interactions: vec![
                 // Sender uses 3 Direct elements: produces [col1, col2, col3]
                 // Fingerprint: z - (col1 + α*col2 + α²*col3)
-                BusInteraction::sender(TEST_BUS, Some(0), Packing::Direct.columns(&[1, 2, 3])),
+                BusInteraction::sender(TEST_BUS, Multiplicity::Column(0), Packing::Direct.columns(&[1, 2, 3])),
             ],
         };
         AirWithBuses::new(4, auxiliary_trace_build_data, proof_options, 1, vec![])
@@ -983,7 +983,7 @@ fn test_packing_mismatch_element_count() {
                 // Fingerprint: z - ((col1 + 2^16*col2) + α*col3)
                 BusInteraction::receiver(
                     TEST_BUS,
-                    Some(0),
+                    Multiplicity::Column(0),
                     vec![
                         Packing::Word2L.columns(&[1])[0].clone(),
                         Packing::Direct.columns(&[3])[0].clone(),
@@ -1049,8 +1049,8 @@ fn test_packing_mismatch_element_count() {
 #[test_log::test]
 fn test_packing_mismatch_shift_constant() {
     use crate::lookup::{
-        AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, NullBoundaryConstraintBuilder,
-        Packing,
+        AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, Multiplicity,
+        NullBoundaryConstraintBuilder, Packing,
     };
 
     fn sender_air_word4l(
@@ -1059,7 +1059,7 @@ fn test_packing_mismatch_shift_constant() {
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![
                 // Word4L: b0 + 2^8*b1 + 2^16*b2 + 2^24*b3
-                BusInteraction::sender(TEST_BUS, Some(0), Packing::Word4L.columns(&[1])),
+                BusInteraction::sender(TEST_BUS, Multiplicity::Column(0), Packing::Word4L.columns(&[1])),
             ],
         };
         AirWithBuses::new(5, auxiliary_trace_build_data, proof_options, 1, vec![])
@@ -1071,7 +1071,7 @@ fn test_packing_mismatch_shift_constant() {
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![
                 // DWordHL: [h0 + 2^16*h1, h2 + 2^16*h3] - different shift pattern!
-                BusInteraction::receiver(TEST_BUS, Some(0), Packing::DWordHL.columns(&[1])),
+                BusInteraction::receiver(TEST_BUS, Multiplicity::Column(0), Packing::DWordHL.columns(&[1])),
             ],
         };
         AirWithBuses::new(5, auxiliary_trace_build_data, proof_options, 1, vec![])
@@ -1137,8 +1137,8 @@ fn test_packing_mismatch_shift_constant() {
 #[test_log::test]
 fn test_compound_mismatch_dwordhhw_vs_dwordwhh() {
     use crate::lookup::{
-        AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, NullBoundaryConstraintBuilder,
-        Packing,
+        AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, Multiplicity,
+        NullBoundaryConstraintBuilder, Packing,
     };
 
     fn sender_air_dwordhhw(
@@ -1147,7 +1147,7 @@ fn test_compound_mismatch_dwordhhw_vs_dwordwhh() {
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![
                 // DWordHHW: [Word, Half, Half] at columns 1, 2, 3
-                BusInteraction::sender(TEST_BUS, Some(0), Packing::DWordHHW.columns(&[1])),
+                BusInteraction::sender(TEST_BUS, Multiplicity::Column(0), Packing::DWordHHW.columns(&[1])),
             ],
         };
         AirWithBuses::new(4, auxiliary_trace_build_data, proof_options, 1, vec![])
@@ -1159,7 +1159,7 @@ fn test_compound_mismatch_dwordhhw_vs_dwordwhh() {
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![
                 // DWordWHH: [Half, Half, Word] at columns 1, 2, 3
-                BusInteraction::receiver(TEST_BUS, Some(0), Packing::DWordWHH.columns(&[1])),
+                BusInteraction::receiver(TEST_BUS, Multiplicity::Column(0), Packing::DWordWHH.columns(&[1])),
             ],
         };
         AirWithBuses::new(4, auxiliary_trace_build_data, proof_options, 1, vec![])
@@ -1223,8 +1223,8 @@ fn test_compound_mismatch_dwordhhw_vs_dwordwhh() {
 #[test_log::test]
 fn test_compound_equals_primitive_expansion() {
     use crate::lookup::{
-        AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, NullBoundaryConstraintBuilder,
-        Packing,
+        AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, Multiplicity,
+        NullBoundaryConstraintBuilder, Packing,
     };
 
     fn sender_air_compound(
@@ -1233,7 +1233,7 @@ fn test_compound_equals_primitive_expansion() {
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![
                 // DWordHL (compound): 4 halves at columns 1-4
-                BusInteraction::sender(TEST_BUS, Some(0), Packing::DWordHL.columns(&[1])),
+                BusInteraction::sender(TEST_BUS, Multiplicity::Column(0), Packing::DWordHL.columns(&[1])),
             ],
         };
         AirWithBuses::new(5, auxiliary_trace_build_data, proof_options, 1, vec![])
@@ -1245,7 +1245,7 @@ fn test_compound_equals_primitive_expansion() {
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![
                 // Equivalent: 2× Word2L at columns 1-2 and 3-4
-                BusInteraction::receiver(TEST_BUS, Some(0), Packing::Word2L.columns(&[1, 3])),
+                BusInteraction::receiver(TEST_BUS, Multiplicity::Column(0), Packing::Word2L.columns(&[1, 3])),
             ],
         };
         AirWithBuses::new(5, auxiliary_trace_build_data, proof_options, 1, vec![])

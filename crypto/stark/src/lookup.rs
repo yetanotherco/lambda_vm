@@ -568,6 +568,33 @@ pub struct AuxiliaryTraceBuildData {
     pub interactions: Vec<BusInteraction>,
 }
 
+// =============================================================================
+// Multiplicity
+// =============================================================================
+
+/// Specifies how to compute the multiplicity for a bus interaction.
+///
+/// The multiplicity determines how many times each row contributes to the bus.
+/// Different use cases require different ways to compute this value.
+#[derive(Clone, Debug)]
+pub enum Multiplicity {
+    /// Constant multiplicity of 1 for all rows.
+    /// Use when every row participates exactly once.
+    One,
+
+    /// Read multiplicity from a single column (index).
+    Column(usize),
+
+    /// Sum of two columns: `col_a + col_b`.
+    /// Useful when multiple flags indicate participation.
+    Sum(usize, usize),
+
+    /// Negation of a bit column: `1 - col_value`.
+    /// The column must contain only 0 or 1.
+    /// Useful for "all rows except those marked by this flag".
+    Negated(usize),
+}
+
 /// Struct representing a lookup interaction for a given table.
 /// Contains the multiplicity and typed values involved in said interaction.
 ///
@@ -581,18 +608,16 @@ pub struct AuxiliaryTraceBuildData {
 /// #[repr(u64)]
 /// enum BusId { Add, Mul, Sub }  // auto-increments: 0, 1, 2
 ///
-/// BusInteraction::sender(BusId::Add, Some(0), Packing::Direct.columns(&[1, 2, 3]))
+/// BusInteraction::sender(BusId::Add, Multiplicity::Column(0), Packing::Direct.columns(&[1, 2, 3]))
 /// ```
 #[derive(Clone)]
 pub struct BusInteraction {
     /// Bus identifier. Senders and receivers on the same bus must use the same ID.
     /// Different buses can have different IDs to prevent cross-bus consumption.
     pub bus_id: u64,
-    /// Column index containing the multiplicity for this interaction.
-    /// Can be a binary flag (0 or 1) or a general multiplicity (0, 1, 2, ...).
+    /// How to compute the multiplicity for this interaction.
     /// Determines how many times each row contributes to the bus.
-    /// If None, a constant multiplicity of 1 is used for all rows.
-    pub multiplicity_column: Option<usize>,
+    pub multiplicity: Multiplicity,
     /// Typed values that make up this interaction
     pub values: Vec<TypedValue>,
     /// Whether this side of the interaction is a sender (true) or receiver (false).
@@ -606,18 +631,18 @@ impl BusInteraction {
     ///
     /// # Arguments
     /// * `bus_id` - Unique identifier for the bus. Can be a raw `u64` or an enum with `Into<u64>`
-    /// * `multiplicity_column` - Column index for multiplicity, or None for constant 1
+    /// * `multiplicity` - How to compute the multiplicity for this interaction
     /// * `values` - Typed values that make up this interaction
     /// * `is_sender` - true for sender, false for receiver
     pub fn new(
         bus_id: impl Into<u64>,
-        multiplicity_column: Option<usize>,
+        multiplicity: Multiplicity,
         values: Vec<TypedValue>,
         is_sender: bool,
     ) -> Self {
         Self {
             bus_id: bus_id.into(),
-            multiplicity_column,
+            multiplicity,
             values,
             is_sender,
         }
@@ -627,28 +652,28 @@ impl BusInteraction {
     ///
     /// # Arguments
     /// * `bus_id` - Unique identifier for the bus
-    /// * `multiplicity_column` - Column index for multiplicity, or None for constant 1
+    /// * `multiplicity` - How to compute the multiplicity for this interaction
     /// * `values` - Typed values to send
     pub fn sender(
         bus_id: impl Into<u64>,
-        multiplicity_column: Option<usize>,
+        multiplicity: Multiplicity,
         values: Vec<TypedValue>,
     ) -> Self {
-        Self::new(bus_id, multiplicity_column, values, true)
+        Self::new(bus_id, multiplicity, values, true)
     }
 
     /// Creates a receiver interaction.
     ///
     /// # Arguments
     /// * `bus_id` - Must match the sender's bus_id
-    /// * `multiplicity_column` - Column index for multiplicity, or None for constant 1
+    /// * `multiplicity` - How to compute the multiplicity for this interaction
     /// * `values` - Typed values to receive
     pub fn receiver(
         bus_id: impl Into<u64>,
-        multiplicity_column: Option<usize>,
+        multiplicity: Multiplicity,
         values: Vec<TypedValue>,
     ) -> Self {
-        Self::new(bus_id, multiplicity_column, values, false)
+        Self::new(bus_id, multiplicity, values, false)
     }
 
     /// Returns total number of bus elements (for α power computation).
@@ -716,6 +741,7 @@ where
 /// - `multiplicity` = number of times this row contributes to the bus
 ///
 /// This is NOT accumulated - just the individual contribution for each row.
+#[allow(clippy::needless_range_loop)]
 fn build_logup_term_column<F, E>(
     aux_column_idx: usize,
     table_interaction: &BusInteraction,
@@ -727,16 +753,6 @@ fn build_logup_term_column<F, E>(
 {
     let main_segment_cols = trace.columns_main();
     let trace_len = trace.num_rows();
-
-    // Handle optional multiplicity column - use constant 1 if None
-    let multiplicities_owned: Vec<FieldElement<F>>;
-    let multiplicities: &[FieldElement<F>] = match table_interaction.multiplicity_column {
-        Some(col) => &main_segment_cols[col],
-        None => {
-            multiplicities_owned = vec![FieldElement::one(); trace_len];
-            &multiplicities_owned
-        }
-    };
 
     // LogUp challenges (must be shared across all tables for bus to balance)
     let z = &challenges[LOGUP_CHALLENGE_Z];
@@ -754,7 +770,17 @@ fn build_logup_term_column<F, E>(
         -FieldElement::<E>::one()
     };
 
-    for (row, multiplicity) in multiplicities.iter().enumerate() {
+    for row in 0..trace_len {
+        // Compute multiplicity based on the Multiplicity variant
+        let multiplicity: FieldElement<F> = match &table_interaction.multiplicity {
+            Multiplicity::One => FieldElement::<F>::one(),
+            Multiplicity::Column(col) => main_segment_cols[*col][row].clone(),
+            Multiplicity::Sum(col_a, col_b) => {
+                &main_segment_cols[*col_a][row] + &main_segment_cols[*col_b][row]
+            }
+            Multiplicity::Negated(col) => FieldElement::<F>::one() - &main_segment_cols[*col][row],
+        };
+
         // Bus elements: [bus_id, ...typed_values...]
         // bus_id is first element to distinguish different buses
         let mut bus_elements: Vec<FieldElement<E>> =
@@ -882,10 +908,17 @@ where
             let z = &rap_challenges[LOGUP_CHALLENGE_Z];
             let alpha = &rap_challenges[LOGUP_CHALLENGE_ALPHA];
 
-            // Main frame elements - handle optional multiplicity
-            let multiplicity: FieldElement<A> = match interaction.multiplicity_column {
-                Some(col) => step.get_main_evaluation_element(0, col).clone(),
-                None => FieldElement::<A>::one(),
+            // Compute multiplicity based on the Multiplicity variant
+            let multiplicity: FieldElement<A> = match &interaction.multiplicity {
+                Multiplicity::One => FieldElement::<A>::one(),
+                Multiplicity::Column(col) => step.get_main_evaluation_element(0, *col).clone(),
+                Multiplicity::Sum(col_a, col_b) => {
+                    step.get_main_evaluation_element(0, *col_a)
+                        + step.get_main_evaluation_element(0, *col_b)
+                }
+                Multiplicity::Negated(col) => {
+                    FieldElement::<A>::one() - step.get_main_evaluation_element(0, *col)
+                }
             };
 
             // Bus elements: [bus_id, ...typed_values...]
