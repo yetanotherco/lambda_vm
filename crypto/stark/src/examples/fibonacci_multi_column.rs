@@ -167,9 +167,17 @@ where
         // For each column, add boundary constraints for the first two rows
         for (col_idx, (a0, a1)) in pub_inputs.initial_values.iter().enumerate() {
             // First value (row 0)
-            constraints.push(BoundaryConstraint::new_main(col_idx, 0, a0.clone().to_extension()));
+            constraints.push(BoundaryConstraint::new_main(
+                col_idx,
+                0,
+                a0.clone().to_extension(),
+            ));
             // Second value (row 1)
-            constraints.push(BoundaryConstraint::new_main(col_idx, 1, a1.clone().to_extension()));
+            constraints.push(BoundaryConstraint::new_main(
+                col_idx,
+                1,
+                a1.clone().to_extension(),
+            ));
         }
 
         BoundaryConstraints::from_constraints(constraints)
