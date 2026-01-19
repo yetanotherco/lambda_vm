@@ -8,7 +8,7 @@ fn panic(_info: &PanicInfo) -> ! {
     loop {}
 }
 
-const ITERATIONS: usize = 55000;
+const ITERATIONS: usize = 54000;
 
 #[inline(never)]
 fn bitwise_mix(a: u32, b: u32) -> u32 {

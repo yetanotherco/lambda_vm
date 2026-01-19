@@ -1,4 +1,4 @@
-[target.riscv32im-lambda-vm-elf]
+[target.riscv64im-lambda-vm-elf]
 rustflags = [
   "-C", "link-arg=-e",
   "-C", "link-arg=main"
