@@ -32,7 +32,7 @@ jobs:
         id: cache
         with:
           path: ${{ matrix.branch }}_programs/*.elf
-          key: benchmarks-${{ matrix.branch }}-${{ hashFiles( 'executor/program_artifacts/bench/*.elf' ) }}
+          key: benchmarks-${{ matrix.branch }}-${{ hashFiles( 'executor/programs/bench/*' ) }}
           restore-keys: benchmarks-${{ matrix.branch }}-
 
       - name: Setup Rust Environment
@@ -48,7 +48,7 @@ jobs:
 
       - name: Export benchmark hashes
         id: export-hashes
-        run: echo "benchmark-hashes-${{ matrix.branch }}=${{ hashFiles( 'executor/program_artifacts/bench/*.elf' ) }}" >> "$GITHUB_OUTPUT"
+        run: echo "benchmark-hashes-${{ matrix.branch }}=${{ hashFiles( 'executor/programs/bench/*' ) }}" >> "$GITHUB_OUTPUT"
 
   build-binaries:
     strategy:
