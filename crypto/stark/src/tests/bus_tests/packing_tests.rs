@@ -267,8 +267,11 @@ fn test_quad_hl_equals_four_word2l() {
 fn test_air_layout_single_interaction() {
     type E = math::field::fields::fft_friendly::quartic_babybear::Degree4BabyBearExtensionField;
 
-    let interaction =
-        BusInteraction::sender(TEST_BUS, Multiplicity::Column(0), Packing::Direct.columns(&[1, 2, 3]));
+    let interaction = BusInteraction::sender(
+        TEST_BUS,
+        Multiplicity::Column(0),
+        Packing::Direct.columns(&[1, 2, 3]),
+    );
     let build_data = AuxiliaryTraceBuildData {
         interactions: vec![interaction],
     };
@@ -290,8 +293,16 @@ fn test_air_layout_single_interaction() {
 fn test_air_layout_multiple_interactions() {
     type E = math::field::fields::fft_friendly::quartic_babybear::Degree4BabyBearExtensionField;
 
-    let interaction1 = BusInteraction::sender(TEST_BUS, Multiplicity::Column(0), Packing::Direct.columns(&[1, 2]));
-    let interaction2 = BusInteraction::sender(TEST_BUS, Multiplicity::Column(0), Packing::Direct.columns(&[3, 4]));
+    let interaction1 = BusInteraction::sender(
+        TEST_BUS,
+        Multiplicity::Column(0),
+        Packing::Direct.columns(&[1, 2]),
+    );
+    let interaction2 = BusInteraction::sender(
+        TEST_BUS,
+        Multiplicity::Column(0),
+        Packing::Direct.columns(&[3, 4]),
+    );
     let build_data = AuxiliaryTraceBuildData {
         interactions: vec![interaction1, interaction2],
     };

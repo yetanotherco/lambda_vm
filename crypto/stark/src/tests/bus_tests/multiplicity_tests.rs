@@ -42,7 +42,11 @@ fn test_multiplicity_one() {
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![
                 // Multiplicity::One means every row sends with multiplicity 1
-                BusInteraction::sender(TEST_BUS, Multiplicity::One, Packing::Direct.columns(&[0, 1])),
+                BusInteraction::sender(
+                    TEST_BUS,
+                    Multiplicity::One,
+                    Packing::Direct.columns(&[0, 1]),
+                ),
             ],
         };
         AirWithBuses::new(
@@ -61,7 +65,11 @@ fn test_multiplicity_one() {
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![
                 // Receiver also uses Multiplicity::One
-                BusInteraction::receiver(TEST_BUS, Multiplicity::One, Packing::Direct.columns(&[0, 1])),
+                BusInteraction::receiver(
+                    TEST_BUS,
+                    Multiplicity::One,
+                    Packing::Direct.columns(&[0, 1]),
+                ),
             ],
         };
         AirWithBuses::new(
@@ -131,7 +139,11 @@ fn test_multiplicity_sum() {
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![
                 // Multiplicity::Sum(0, 1) means multiplicity = col[0] + col[1]
-                BusInteraction::sender(TEST_BUS, Multiplicity::Sum(0, 1), Packing::Direct.columns(&[2, 3])),
+                BusInteraction::sender(
+                    TEST_BUS,
+                    Multiplicity::Sum(0, 1),
+                    Packing::Direct.columns(&[2, 3]),
+                ),
             ],
         };
         AirWithBuses::new(
@@ -150,7 +162,11 @@ fn test_multiplicity_sum() {
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![
                 // Receiver uses Column(2) as multiplicity
-                BusInteraction::receiver(TEST_BUS, Multiplicity::Column(2), Packing::Direct.columns(&[0, 1])),
+                BusInteraction::receiver(
+                    TEST_BUS,
+                    Multiplicity::Column(2),
+                    Packing::Direct.columns(&[0, 1]),
+                ),
             ],
         };
         AirWithBuses::new(
@@ -229,7 +245,11 @@ fn test_multiplicity_negated() {
             interactions: vec![
                 // Multiplicity::Negated(0) means multiplicity = 1 - col[0]
                 // When col[0]=0, multiplicity=1; when col[0]=1, multiplicity=0
-                BusInteraction::sender(TEST_BUS, Multiplicity::Negated(0), Packing::Direct.columns(&[1, 2])),
+                BusInteraction::sender(
+                    TEST_BUS,
+                    Multiplicity::Negated(0),
+                    Packing::Direct.columns(&[1, 2]),
+                ),
             ],
         };
         AirWithBuses::new(

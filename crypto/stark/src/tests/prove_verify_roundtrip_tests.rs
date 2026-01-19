@@ -188,8 +188,16 @@ fn create_cpu_air(
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![
-            BusInteraction::sender(BusId::Add, Multiplicity::Column(0), Packing::Direct.columns(&[2, 3, 4])),
-            BusInteraction::sender(BusId::Mul, Multiplicity::Column(1), Packing::Direct.columns(&[2, 3, 4])),
+            BusInteraction::sender(
+                BusId::Add,
+                Multiplicity::Column(0),
+                Packing::Direct.columns(&[2, 3, 4]),
+            ),
+            BusInteraction::sender(
+                BusId::Mul,
+                Multiplicity::Column(1),
+                Packing::Direct.columns(&[2, 3, 4]),
+            ),
         ],
     };
     AirWithBuses::new(
