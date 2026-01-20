@@ -27,12 +27,13 @@ impl Trace {
 
         let mut decode_map: HashMap<u32, (DecodeTableRow, usize)> = HashMap::new();
 
+        // TODO: Properly migrate to 64-bit when prover is updated (separate PR)
         for (i, log) in logs.iter().enumerate() {
             let timestamp = (i as u32) * 4;
             cpu_table.extend(CpuTableRow::from_log(log, timestamp).to_vec());
 
             decode_map
-                .entry(log.current_pc)
+                .entry(log.current_pc as u32)
                 .and_modify(|(_, multiplicity)| *multiplicity += 1)
                 .or_insert_with(|| (DecodeTableRow::from_log(log), 1));
         }

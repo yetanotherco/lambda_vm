@@ -1,9 +1,9 @@
-	.attribute	5, "rv32i2p1_m2p0_zmmul1p0"
+	.attribute	5, "rv64i2p1_m2p0_zmmul1p0"
 .Lfunc_end0:
 	.globl	main
 main:
-	xori    a2, zero, 0xFFFFFFFE
-	xori    a0, a2, 0xFFFFFFFF
+	li	a2, -2            # load -2
+	xori	a0, a2, -1        # XOR with -1 gives 1 (bit flip)
 	jalr	zero, 0(ra)
 .Lfunc_end1:
 	.size	main, .Lfunc_end1-main

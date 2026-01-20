@@ -127,6 +127,11 @@ pub enum Packing {
     /// 8 halves → 4 words. **Compound: 4× Word2L.**
     /// Columns: 8, Bus elements: 4
     QuadHL,
+
+    /// 4 words → 4 bus elements. **Compound: 4× Direct.**
+    /// Columns: 4, Bus elements: 4
+    /// Used for MUL table result (128-bit as 4 words).
+    QuadWL,
 }
 
 impl Packing {
@@ -144,6 +149,7 @@ impl Packing {
             Packing::DWordHL => 4,  // 2× Word2L
             Packing::DWordBL => 8,  // 2× Word4L
             Packing::QuadHL => 8,   // 4× Word2L
+            Packing::QuadWL => 4,   // 4× Direct
         }
     }
 
@@ -161,23 +167,25 @@ impl Packing {
             Packing::DWordHL => 2,  // 2× Word2L
             Packing::DWordBL => 2,  // 2× Word4L
             Packing::QuadHL => 4,   // 4× Word2L
+            Packing::QuadWL => 4,   // 4× Direct
         }
     }
 
-    /// Creates TypedValues at the given start columns.
+    /// Creates BusValues at the given start columns.
     ///
-    /// Each element in `start_columns` becomes a separate TypedValue using this packing.
+    /// Each element in `start_columns` becomes a separate `BusValue::Packed` using this packing.
     ///
-    /// # Example
-    /// ```ignore
-    /// Packing::Direct.columns(&[0, 1, 2])  // 3 direct values at columns 0, 1, 2
-    /// Packing::DWordHL.columns(&[0, 4])    // 2 DWordHL values: cols 0-3 and cols 4-7
-    /// Packing::DWordHHW.columns(&[0])      // 1 DWordHHW value at cols 0, 1, 2
-    /// ```
-    pub fn columns(self, start_columns: &[usize]) -> Vec<TypedValue> {
+    /// Examples:
+    /// - `Packing::Direct.columns(&[0, 1, 2])` - 3 direct values at columns 0, 1, 2
+    /// - `Packing::DWordHL.columns(&[0, 4])` - 2 DWordHL values: cols 0-3 and cols 4-7
+    /// - `Packing::DWordHHW.columns(&[0])` - 1 DWordHHW value at cols 0, 1, 2
+    pub fn columns(self, start_columns: &[usize]) -> Vec<BusValue> {
         start_columns
             .iter()
-            .map(|&col| TypedValue::new(col, self))
+            .map(|&col| BusValue::Packed {
+                start_column: col,
+                packing: self,
+            })
             .collect()
     }
 
@@ -278,72 +286,155 @@ impl Packing {
                 result.extend(Packing::Word2L.combine(&columns[6..8]));
                 result
             }
+
+            Packing::QuadWL => {
+                // 4× Direct
+                let mut result = Packing::Direct.combine(&columns[0..1]);
+                result.extend(Packing::Direct.combine(&columns[1..2]));
+                result.extend(Packing::Direct.combine(&columns[2..3]));
+                result.extend(Packing::Direct.combine(&columns[3..4]));
+                result
+            }
         }
     }
 }
 
 // =============================================================================
-// Typed Value
+// Linear Term and Bus Value
 // =============================================================================
 
-/// A typed value for bus interactions.
+/// A term in a linear combination.
 ///
-/// Specifies which trace columns hold the limbs and how to combine them.
+/// Used to build custom linear combinations of column values and constants.
 #[derive(Debug, Clone)]
-pub struct TypedValue {
-    /// Starting column index in the trace
-    pub start_column: usize,
-    /// How to interpret and combine the columns
-    pub bus_type: Packing,
+pub enum LinearTerm {
+    /// coefficient * column_value
+    Column {
+        /// The multiplier for the column value
+        coefficient: u64,
+        /// The column index to read from
+        column: usize,
+    },
+    /// A constant value to add
+    Constant(u64),
 }
 
-impl TypedValue {
-    /// Creates a new typed value.
+/// A value that contributes to the bus fingerprint.
+///
+/// Each `BusValue` produces exactly **1 bus element** for the fingerprint.
+/// The fingerprint is computed as: `z - (v₀ + α·v₁ + α²·v₂ + ...)`
+/// where each `vᵢ` is a bus element from a `BusValue`.
+#[derive(Debug, Clone)]
+pub enum BusValue {
+    /// Columns combined with predefined packing (powers of 2).
     ///
-    /// Prefer using `Packing::columns()` instead:
-    /// ```ignore
-    /// Packing::Direct.columns(&[0])
-    /// Packing::Word2L.columns(&[1])
-    /// ```
-    pub fn new(start_column: usize, bus_type: Packing) -> Self {
-        Self {
-            start_column,
-            bus_type,
+    /// Uses the `Packing` enum's formula to combine consecutive columns.
+    /// Example: `Word2L` at column 0 reads columns 0,1 and computes `c₀ + 2¹⁶·c₁`
+    Packed {
+        /// Starting column index
+        start_column: usize,
+        /// How to combine the columns
+        packing: Packing,
+    },
+
+    /// Custom linear combination of columns and/or constants.
+    ///
+    /// Computes: `a₀·col[i₀] + a₁·col[i₁] + ... + c`
+    /// where `aᵢ` are coefficients, `col[iᵢ]` are column values, and `c` is a constant.
+    Linear(Vec<LinearTerm>),
+}
+
+impl BusValue {
+    /// Creates a constant value (no columns).
+    ///
+    /// Example: `BusValue::constant(0x42)` for a table ID or opcode.
+    pub fn constant(value: u64) -> Self {
+        BusValue::Linear(vec![LinearTerm::Constant(value)])
+    }
+
+    /// Creates a single column value with coefficient 1.
+    ///
+    /// Example: `BusValue::column(2)` reads column 2 directly.
+    pub fn column(col: usize) -> Self {
+        BusValue::Linear(vec![LinearTerm::Column {
+            coefficient: 1,
+            column: col,
+        }])
+    }
+
+    /// Creates a linear combination from terms.
+    ///
+    /// Example: `BusValue::linear(vec![...])` with `LinearTerm::Column` and `LinearTerm::Constant`
+    /// terms computes something like `3·col[0] + 7·col[1] + 42`.
+    pub fn linear(terms: Vec<LinearTerm>) -> Self {
+        BusValue::Linear(terms)
+    }
+
+    /// Returns the number of bus elements this value produces (always 1).
+    pub fn num_bus_elements(&self) -> usize {
+        match self {
+            BusValue::Packed { packing, .. } => packing.num_bus_elements(),
+            BusValue::Linear(_) => 1,
         }
     }
 
-    /// Returns the number of columns this value spans.
-    pub fn num_columns(&self) -> usize {
-        self.bus_type.num_columns()
-    }
-
-    /// Returns the number of bus elements this value produces.
-    pub fn num_bus_elements(&self) -> usize {
-        self.bus_type.num_bus_elements()
-    }
-
-    /// Returns the column indices this value uses.
+    /// Returns the column indices this value reads from.
     pub fn column_indices(&self) -> Vec<usize> {
-        (self.start_column..self.start_column + self.num_columns()).collect()
+        match self {
+            BusValue::Packed {
+                start_column,
+                packing,
+            } => (*start_column..*start_column + packing.num_columns()).collect(),
+            BusValue::Linear(terms) => terms
+                .iter()
+                .filter_map(|term| match term {
+                    LinearTerm::Column { column, .. } => Some(*column),
+                    LinearTerm::Constant(_) => None,
+                })
+                .collect(),
+        }
     }
 
-    /// Extracts column values from a row and combines them.
+    /// Computes the bus element value from column values.
     ///
     /// # Arguments
     /// * `get_column` - Function to get column value by index
     ///
     /// # Returns
-    /// Vector of combined bus elements
+    /// Vector of combined bus elements (length = num_bus_elements())
     pub fn combine_from<E: IsField, F: Fn(usize) -> FieldElement<E>>(
         &self,
         get_column: F,
     ) -> Vec<FieldElement<E>> {
-        let columns: Vec<_> = self
-            .column_indices()
-            .iter()
-            .map(|&i| get_column(i))
-            .collect();
-        self.bus_type.combine(&columns)
+        match self {
+            BusValue::Packed {
+                start_column,
+                packing,
+            } => {
+                let columns: Vec<_> = (*start_column..*start_column + packing.num_columns())
+                    .map(&get_column)
+                    .collect();
+                packing.combine(&columns)
+            }
+            BusValue::Linear(terms) => {
+                let mut result = FieldElement::<E>::zero();
+                for term in terms {
+                    match term {
+                        LinearTerm::Column {
+                            coefficient,
+                            column,
+                        } => {
+                            let coeff = FieldElement::<E>::from(*coefficient);
+                            result += get_column(*column) * coeff;
+                        }
+                        LinearTerm::Constant(value) => {
+                            result += FieldElement::<E>::from(*value);
+                        }
+                    }
+                }
+                vec![result]
+            }
+        }
     }
 }
 
@@ -568,21 +659,59 @@ pub struct AuxiliaryTraceBuildData {
     pub interactions: Vec<BusInteraction>,
 }
 
+// =============================================================================
+// Multiplicity
+// =============================================================================
+
+/// Specifies how to compute the multiplicity for a bus interaction.
+///
+/// The multiplicity determines how many times each row contributes to the bus.
+/// Different use cases require different ways to compute this value.
+#[derive(Clone, Debug)]
+pub enum Multiplicity {
+    /// Constant multiplicity of 1 for all rows.
+    /// Use when every row participates exactly once.
+    One,
+
+    /// Read multiplicity from a single column (index).
+    Column(usize),
+
+    /// Sum of two columns: `col_a + col_b`.
+    /// Useful when multiple flags indicate participation.
+    Sum(usize, usize),
+
+    /// Negation of a bit column: `1 - col_value`.
+    /// The column must contain only 0 or 1.
+    /// Useful for "all rows except those marked by this flag".
+    Negated(usize),
+}
+
 /// Struct representing a lookup interaction for a given table.
-/// Contains the multiplicity and typed values involved in said interaction.
+/// Contains the multiplicity and bus values involved in said interaction.
 ///
 /// Values are combined in two stages:
-/// 1. **Casting** (powers of 2): Combine limbs within each TypedValue
+/// 1. **Casting** (powers of 2 or custom linear combination): Combine limbs within each BusValue
 /// 2. **Bus fingerprint** (powers of α): Combine all bus elements into one fingerprint
+///
+/// The `bus_id` distinguishes different buses. Senders and receivers must use
+/// the same `bus_id` for their fingerprints to match. Define bus IDs as an enum:
+/// ```ignore
+/// #[repr(u64)]
+/// enum BusId { Add, Mul, Sub }  // auto-increments: 0, 1, 2
+///
+/// BusInteraction::sender(BusId::Add, Multiplicity::Column(0), Packing::Direct.columns(&[1, 2, 3]))
+/// ```
 #[derive(Clone)]
 pub struct BusInteraction {
-    /// Column index containing the multiplicity for this interaction.
-    /// Can be a binary flag (0 or 1) or a general multiplicity (0, 1, 2, ...).
+    /// Bus identifier. Senders and receivers on the same bus must use the same ID.
+    /// Different buses can have different IDs to prevent cross-bus consumption.
+    pub bus_id: u64,
+    /// How to compute the multiplicity for this interaction.
     /// Determines how many times each row contributes to the bus.
-    /// If None, a constant multiplicity of 1 is used for all rows.
-    pub multiplicity_column: Option<usize>,
-    /// Typed values that make up this interaction
-    pub values: Vec<TypedValue>,
+    pub multiplicity: Multiplicity,
+    /// Bus values that make up this interaction.
+    /// Each BusValue produces one or more bus elements for the fingerprint.
+    pub values: Vec<BusValue>,
     /// Whether this side of the interaction is a sender (true) or receiver (false).
     /// Senders contribute positive values to the bus sum, receivers contribute negative.
     /// For bus balance: Σ sender_values - Σ receiver_values = 0
@@ -591,31 +720,62 @@ pub struct BusInteraction {
 
 impl BusInteraction {
     /// Creates a new table interaction.
+    ///
+    /// # Arguments
+    /// * `bus_id` - Unique identifier for the bus. Can be a raw `u64` or an enum with `Into<u64>`
+    /// * `multiplicity` - How to compute the multiplicity for this interaction
+    /// * `values` - Typed values that make up this interaction
+    /// * `is_sender` - true for sender, false for receiver
     pub fn new(
-        multiplicity_column: Option<usize>,
-        values: Vec<TypedValue>,
+        bus_id: impl Into<u64>,
+        multiplicity: Multiplicity,
+        values: Vec<BusValue>,
         is_sender: bool,
     ) -> Self {
         Self {
-            multiplicity_column,
+            bus_id: bus_id.into(),
+            multiplicity,
             values,
             is_sender,
         }
     }
 
     /// Creates a sender interaction.
-    pub fn sender(multiplicity_column: Option<usize>, values: Vec<TypedValue>) -> Self {
-        Self::new(multiplicity_column, values, true)
+    ///
+    /// # Arguments
+    /// * `bus_id` - Unique identifier for the bus
+    /// * `multiplicity` - How to compute the multiplicity for this interaction
+    /// * `values` - Typed values to send
+    pub fn sender(
+        bus_id: impl Into<u64>,
+        multiplicity: Multiplicity,
+        values: Vec<BusValue>,
+    ) -> Self {
+        Self::new(bus_id, multiplicity, values, true)
     }
 
     /// Creates a receiver interaction.
-    pub fn receiver(multiplicity_column: Option<usize>, values: Vec<TypedValue>) -> Self {
-        Self::new(multiplicity_column, values, false)
+    ///
+    /// # Arguments
+    /// * `bus_id` - Must match the sender's bus_id
+    /// * `multiplicity` - How to compute the multiplicity for this interaction
+    /// * `values` - Typed values to receive
+    pub fn receiver(
+        bus_id: impl Into<u64>,
+        multiplicity: Multiplicity,
+        values: Vec<BusValue>,
+    ) -> Self {
+        Self::new(bus_id, multiplicity, values, false)
     }
 
     /// Returns total number of bus elements (for α power computation).
+    /// Includes the bus_id as the first element.
     pub fn num_bus_elements(&self) -> usize {
-        self.values.iter().map(|v| v.num_bus_elements()).sum()
+        1 + self
+            .values
+            .iter()
+            .map(|v| v.num_bus_elements())
+            .sum::<usize>()
     }
 }
 
@@ -673,6 +833,7 @@ where
 /// - `multiplicity` = number of times this row contributes to the bus
 ///
 /// This is NOT accumulated - just the individual contribution for each row.
+#[allow(clippy::needless_range_loop)]
 fn build_logup_term_column<F, E>(
     aux_column_idx: usize,
     table_interaction: &BusInteraction,
@@ -684,16 +845,6 @@ fn build_logup_term_column<F, E>(
 {
     let main_segment_cols = trace.columns_main();
     let trace_len = trace.num_rows();
-
-    // Handle optional multiplicity column - use constant 1 if None
-    let multiplicities_owned: Vec<FieldElement<F>>;
-    let multiplicities: &[FieldElement<F>] = match table_interaction.multiplicity_column {
-        Some(col) => &main_segment_cols[col],
-        None => {
-            multiplicities_owned = vec![FieldElement::one(); trace_len];
-            &multiplicities_owned
-        }
-    };
 
     // LogUp challenges (must be shared across all tables for bus to balance)
     let z = &challenges[LOGUP_CHALLENGE_Z];
@@ -711,26 +862,33 @@ fn build_logup_term_column<F, E>(
         -FieldElement::<E>::one()
     };
 
-    for (row, multiplicity) in multiplicities.iter().enumerate() {
-        // Stage 1: Combine each typed value's columns using powers of 2 (in base field)
-        // Stage 2: Convert to extension and combine with powers of α
-        let bus_elements: Vec<FieldElement<E>> = table_interaction
-            .values
-            .iter()
-            .flat_map(|tv| {
-                // Combine in base field (cheaper)
-                let columns: Vec<FieldElement<F>> = tv
-                    .column_indices()
-                    .iter()
-                    .map(|&col| main_segment_cols[col][row].clone())
-                    .collect();
-                let combined = tv.bus_type.combine(&columns);
-                // Convert to extension only after combining
-                combined.into_iter().map(|v| v.to_extension())
-            })
-            .collect();
+    for row in 0..trace_len {
+        // Compute multiplicity based on the Multiplicity variant
+        let multiplicity: FieldElement<F> = match &table_interaction.multiplicity {
+            Multiplicity::One => FieldElement::<F>::one(),
+            Multiplicity::Column(col) => main_segment_cols[*col][row].clone(),
+            Multiplicity::Sum(col_a, col_b) => {
+                &main_segment_cols[*col_a][row] + &main_segment_cols[*col_b][row]
+            }
+            Multiplicity::Negated(col) => FieldElement::<F>::one() - &main_segment_cols[*col][row],
+        };
 
-        // fingerprint = z - (v[0] * alpha^0 + v[1] * alpha^1 + ... + v[n] * alpha^n)
+        // Bus elements: [bus_id, ...values...]
+        // bus_id is first element to distinguish different buses
+        let mut bus_elements: Vec<FieldElement<E>> =
+            vec![FieldElement::from(table_interaction.bus_id)];
+
+        // Stage 1: Combine each BusValue's columns using powers of 2 (or linear combination)
+        // Stage 2: Convert to extension and append to bus_elements
+        bus_elements.extend(table_interaction.values.iter().flat_map(|bv| {
+            // Combine using the BusValue's combine_from method (in base field when possible)
+            let combined: Vec<FieldElement<F>> =
+                bv.combine_from(|col| main_segment_cols[col][row].clone());
+            // Convert to extension only after combining
+            combined.into_iter().map(|v| v.to_extension())
+        }));
+
+        // fingerprint = z - (bus_id + v[0]*α + v[1]*α² + ... + v[n]*α^(n+1))
         let linear_combination: FieldElement<E> = bus_elements
             .iter()
             .zip(alpha_powers.iter())
@@ -838,35 +996,39 @@ where
             let z = &rap_challenges[LOGUP_CHALLENGE_Z];
             let alpha = &rap_challenges[LOGUP_CHALLENGE_ALPHA];
 
-            // Main frame elements - handle optional multiplicity
-            let multiplicity: FieldElement<A> = match interaction.multiplicity_column {
-                Some(col) => step.get_main_evaluation_element(0, col).clone(),
-                None => FieldElement::<A>::one(),
+            // Compute multiplicity based on the Multiplicity variant
+            let multiplicity: FieldElement<A> = match &interaction.multiplicity {
+                Multiplicity::One => FieldElement::<A>::one(),
+                Multiplicity::Column(col) => step.get_main_evaluation_element(0, *col).clone(),
+                Multiplicity::Sum(col_a, col_b) => {
+                    step.get_main_evaluation_element(0, *col_a)
+                        + step.get_main_evaluation_element(0, *col_b)
+                }
+                Multiplicity::Negated(col) => {
+                    FieldElement::<A>::one() - step.get_main_evaluation_element(0, *col)
+                }
             };
 
-            // Stage 1: Combine each typed value's columns using powers of 2 (in base field)
-            // Stage 2: Convert to extension and flatten all bus elements
-            let bus_elements: Vec<FieldElement<B>> = interaction
-                .values
-                .iter()
-                .flat_map(|tv| {
-                    // Combine in base field (cheaper)
-                    let columns: Vec<FieldElement<A>> = tv
-                        .column_indices()
-                        .iter()
-                        .map(|&col| step.get_main_evaluation_element(0, col).clone())
-                        .collect();
-                    let combined = tv.bus_type.combine(&columns);
-                    // Convert to extension only after combining
-                    combined.into_iter().map(|v| v.to_extension())
-                })
-                .collect();
+            // Bus elements: [bus_id, ...values...]
+            // bus_id is first element to distinguish different buses
+            let mut bus_elements: Vec<FieldElement<B>> =
+                vec![FieldElement::from(interaction.bus_id)];
 
-            // Coefficients for each bus element
+            // Stage 1: Combine each BusValue's columns using powers of 2 (or linear combination)
+            // Stage 2: Convert to extension and append to bus_elements
+            bus_elements.extend(interaction.values.iter().flat_map(|bv| {
+                // Combine using the BusValue's combine_from method (in base field when possible)
+                let combined: Vec<FieldElement<A>> =
+                    bv.combine_from(|col| step.get_main_evaluation_element(0, col).clone());
+                // Convert to extension only after combining
+                combined.into_iter().map(|v| v.to_extension())
+            }));
+
+            // Coefficients for each bus element (including bus_id)
             let coeffs: Vec<FieldElement<B>> =
                 (0..bus_elements.len()).map(|i| alpha.pow(i)).collect();
 
-            // fingerprint = z - (v[0] * alpha^0 + v[1] * alpha^1 + ... + v[n] * alpha^n)
+            // fingerprint = z - (bus_id + v[0]*α + v[1]*α² + ... + v[n]*α^(n+1))
             let fingerprint: FieldElement<B> = (-bus_elements
                 .iter()
                 .zip(coeffs.iter())

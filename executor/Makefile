@@ -9,6 +9,8 @@ RUST_ARTIFACTS_DIR=./program_artifacts/rust
 BENCH_PROGRAMS_DIR=./programs/bench
 BENCH_ARTIFACTS_DIR=./program_artifacts/bench
 
+SHARED_TARGET_DIR=./shared_target
+
 ASM_PROGRAMS = $(wildcard $(ASM_PROGRAMS_DIR)/*.s)
 ARTIFACTS_ASM = $(patsubst $(ASM_PROGRAMS_DIR)/%.s, $(ASM_ARTIFACTS_DIR)/%.elf, $(ASM_PROGRAMS))
 
@@ -20,54 +22,70 @@ BENCH_PROGRAM_DIRS := $(dir $(wildcard $(BENCH_PROGRAMS_DIR)/*/Cargo.toml))
 BENCH_PROGRAMS := $(notdir $(basename $(BENCH_PROGRAM_DIRS:%/=%)))
 BENCH_ARTIFACTS := $(addprefix $(BENCH_ARTIFACTS_DIR)/, $(addsuffix .elf, $(BENCH_PROGRAMS)))
 
-compile-programs-asm: clean-asm $(ARTIFACTS_ASM)
+ETHREX_FILE := tests/ethrex_hoodi.bin
+ETHREX_URL := https://lambda.alignedlayer.com/ethrex_hoodi.bin
 
-compile-programs-rust: clean-rust $(RUST_ARTIFACTS)
+# Custom RV64IM target spec location
+RV64_TARGET_SPEC=$(CURDIR)/programs/riscv64im-lambda-vm-elf.json
 
-compile-bench: clean-bench $(BENCH_ARTIFACTS)
+.PHONY: test prepare-test-data
+
+prepare-test-data:
+	@if [ ! -f "$(ETHREX_FILE)" ]; then \
+		echo "Downloading ethrex_hoodi.bin..."; \
+		curl -L "$(ETHREX_URL)" -o "$(ETHREX_FILE)"; \
+	else \
+		echo "ethrex_hoodi.bin already exists"; \
+	fi
+
+compile-programs-asm: $(ARTIFACTS_ASM)
+
+compile-programs-rust: $(RUST_ARTIFACTS)
+
+compile-bench: $(BENCH_ARTIFACTS)
 
 compile-programs: compile-programs-asm compile-programs-rust compile-bench
 
-# Compile assembly .s -> .o
-$(ASM_ARTIFACTS_DIR)/%.o: $(ASM_PROGRAMS_DIR)/%.s
-	clang --target=riscv32 -c $< -o $@
+# Compile and link assembly directly with clang (64-bit)
+$(ASM_ARTIFACTS_DIR)/%.elf: $(ASM_PROGRAMS_DIR)/%.s
+	@mkdir -p $(ASM_ARTIFACTS_DIR)
+	clang --target=riscv64 -fuse-ld=lld -nostdlib -Wl,-e,main $< -o $@
 
-# Link assembly .o -> .elf
-$(ASM_ARTIFACTS_DIR)/%.elf: $(ASM_ARTIFACTS_DIR)/%.o
-	riscv64-unknown-elf-ld -m elf32lriscv $< -o $@ -e main
-
-# Compile rust
+# Compile rust (64-bit)
 $(RUST_ARTIFACTS_DIR)/%.elf: $(RUST_PROGRAMS_DIR)/%/Cargo.toml
+	@mkdir -p $(RUST_ARTIFACTS_DIR)
 	cd $(RUST_PROGRAMS_DIR)/$* && \
-		cargo build --release \
-			--target riscv32im-lambda-vm-elf \
+		CARGO_TARGET_DIR=$(abspath $(SHARED_TARGET_DIR)) \
+		rustup run nightly cargo build --release \
+			--target $(RV64_TARGET_SPEC) \
 			-Z build-std=core,alloc,std,compiler_builtins,panic_abort \
-			-Z build-std-features=compiler-builtins-mem 
-	cp $(RUST_PROGRAMS_DIR)/$*/target/riscv32im-lambda-vm-elf/release/$* $@
+			-Z build-std-features=compiler-builtins-mem
+	cp $(SHARED_TARGET_DIR)/riscv64im-lambda-vm-elf/release/$* $@
 
-# Compile rust benches
+# Compile rust benches (64-bit)
 $(BENCH_ARTIFACTS_DIR)/%.elf: $(BENCH_PROGRAMS_DIR)/%/Cargo.toml
+	@mkdir -p $(BENCH_ARTIFACTS_DIR)
 	cd $(BENCH_PROGRAMS_DIR)/$* && \
-		cargo build \
-			--target riscv32im-lambda-vm-elf \
+		CARGO_TARGET_DIR=$(abspath $(SHARED_TARGET_DIR)) \
+		rustup run nightly cargo build --release \
+			--target $(RV64_TARGET_SPEC) \
 			-Z build-std=core,compiler_builtins \
-			-Z build-std-features=compiler-builtins-mem 
-	cp $(BENCH_PROGRAMS_DIR)/$*/target/riscv32im-lambda-vm-elf/debug/$* $@
-	rm -rf $(BENCH_PROGRAMS_DIR)/$*/target
+			-Z build-std-features=compiler-builtins-mem
+	cp $(SHARED_TARGET_DIR)/riscv64im-lambda-vm-elf/release/$* $@
 
 clean-asm:
 	-rm -rf $(ASM_ARTIFACTS_DIR)
-	mkdir -p $(ASM_ARTIFACTS_DIR)
 
 clean-rust:
 	-rm -rf $(RUST_ARTIFACTS_DIR)
-	mkdir -p $(RUST_ARTIFACTS_DIR)
 
 clean-bench:
 	-rm -rf $(BENCH_ARTIFACTS_DIR)
-	mkdir -p $(BENCH_ARTIFACTS_DIR)
 
-clean: clean-asm clean-rust clean-bench
+clean-shared:
+	-rm -rf $(SHARED_TARGET_DIR)
+
+clean: clean-asm clean-rust clean-bench clean-shared
 
 test: compile-programs test-no-compile
 
@@ -76,10 +94,10 @@ test-asm: compile-programs-asm test-asm-no-compile
 test-asm-no-compile:
 	cargo test --test asm
 
-test-rust: compile-programs-rust
+test-rust: compile-programs-rust prepare-test-data
 	cargo test --test rust
 
-test-no-compile:
+test-no-compile: prepare-test-data
 	cargo test
 
 .PHONY: deps
