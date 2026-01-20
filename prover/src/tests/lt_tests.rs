@@ -1,6 +1,6 @@
 //! Tests for the LT (Less-Than) table.
 
-use crate::tables64::lt::{bus_interactions, cols, generate_lt_trace, LtOperation};
+use crate::tables64::lt::{LtOperation, bus_interactions, cols, generate_lt_trace};
 use crate::tables64::types::FE;
 
 #[test]

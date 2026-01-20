@@ -9,4 +9,6 @@ pub mod bitwise_tests;
 #[cfg(test)]
 pub mod constraints64_tests;
 #[cfg(test)]
+pub mod lt_bus_tests;
+#[cfg(test)]
 pub mod lt_tests;
