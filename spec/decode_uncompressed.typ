@@ -102,8 +102,8 @@ To indicate an instruction is provided in compressed form, the `c_type` flag is 
   ([`DIV[U][W] rd, rs1, rs2`], [`DIVREM`], [$#`rd` eq.not 0$], [`[W]`], [#sym.not`[U]`], [], []),
   ([`REM[U][W] rd, rs1, rs2`], [`DIVREM`], [$#`rd` eq.not 0$], [`[W]`], [#sym.not`[U]`], [`muldiv_selector`], []),
   // LUI/AUIPC
-  ([`LUI       rd, imm`], [`ADDI`], [$#`rd` eq.not 0$], [], [], [], [#ref_note(<note-lui>)]),
-  ([`AUIPC     rd, imm`], [`ADDI`], [$#`rd` eq.not 0$], [], [], [`rs1 := x255`], [#ref_note(<note-auipc>)]),
+  ([`LUI       rd, imm`], [`ADD`], [$#`rd` eq.not 0$], [], [], [], [#ref_note(<note-lui>)]),
+  ([`AUIPC     rd, imm`], [`ADD`], [$#`rd` eq.not 0$], [], [], [`rs1 := x255`], [#ref_note(<note-auipc>)]),
   ([`JAL       rd, imm`], [`JALR`], [$#`rd` eq.not 0$], [], [], [`rs1 := x255`], [#ref_note(<note-jal>)]),
   // Branching
   ([`JALR      rd, rs1, imm`], [`JALR`], [$#`rd` eq.not 0$], [], [], [], []),
@@ -125,7 +125,7 @@ To indicate an instruction is provided in compressed form, the `c_type` flag is 
   ([`ECALL`], [`ECALL`], [1], [], [], [$#`rs1` := #`x17`$, $#`rs2` := #`x11`$, $#`rd` := #`x10`$], [#ref_note(<note-ecall>)]),
   ([`EBREAK`], [`EBREAK`], [], [], [], [], []),
   // FENCE
-  ([`FENCE`], [`ADDI`], [], [], [], [], [#ref_note(<note-fence>)]),
+  ([`FENCE`], [`ADD`], [], [], [], [], [#ref_note(<note-fence>)]),
 )
 
 
