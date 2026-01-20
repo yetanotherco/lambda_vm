@@ -14,7 +14,7 @@ pub use math::{
 #[cfg(feature = "parallel")]
 use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 
-use crate::config::{FriLayerMerkleTree, FriLayerMerkleTreeBackend};
+use crate::config::{BatchedMerkleTree, BatchedMerkleTreeBackend};
 
 use self::fri_commitment::FriLayer;
 use self::fri_decommit::FriDecommitment;
@@ -28,7 +28,7 @@ pub fn commit_phase<F: IsFFTField + IsSubFieldOf<E>, E: IsField>(
     domain_size: usize,
 ) -> (
     FieldElement<E>,
-    Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>>,
+    Vec<FriLayer<E, BatchedMerkleTreeBackend<E>>>,
 )
 where
     FieldElement<F>: AsBytes + Sync + Send,
@@ -37,7 +37,7 @@ where
     let mut domain_size = domain_size;
 
     let mut fri_layer_list = Vec::with_capacity(number_layers);
-    let mut current_layer: FriLayer<E, FriLayerMerkleTreeBackend<E>>;
+    let mut current_layer: FriLayer<E, BatchedMerkleTreeBackend<E>>;
     let mut current_poly = p_0;
 
     let mut coset_offset = coset_offset.clone();
@@ -123,7 +123,7 @@ pub fn new_fri_layer<F: IsFFTField + IsSubFieldOf<E>, E: IsField>(
     poly: &Polynomial<FieldElement<E>>,
     coset_offset: &FieldElement<F>,
     domain_size: usize,
-) -> FriLayer<E, FriLayerMerkleTreeBackend<E>>
+) -> FriLayer<E, BatchedMerkleTreeBackend<E>>
 where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
@@ -133,13 +133,12 @@ where
 
     in_place_bit_reverse_permute(&mut evaluation);
 
-    // Use fixed-size arrays instead of Vec for each pair (avoids allocation per pair)
-    let leaves: Vec<[FieldElement<E>; 2]> = evaluation
-        .chunks_exact(2)
-        .map(|chunk| [chunk[0].clone(), chunk[1].clone()])
-        .collect();
+    let mut to_commit = Vec::new();
+    for chunk in evaluation.chunks(2) {
+        to_commit.push(vec![chunk[0].clone(), chunk[1].clone()]);
+    }
 
-    let merkle_tree = FriLayerMerkleTree::build(&leaves).unwrap();
+    let merkle_tree = BatchedMerkleTree::build(&to_commit).unwrap();
 
     FriLayer::new(
         &evaluation,
