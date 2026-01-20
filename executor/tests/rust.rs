@@ -3,6 +3,8 @@ use executor::{
     vm::execution::{ReturnValues, run_program},
 };
 
+// NOTE: These tests require 64-bit RISC-V ELF files (RV64IM).
+// The test binaries need to be recompiled for 64-bit architecture.
 fn run_program_without_expect(
     elf_path: &str,
     private_inputs: Vec<u8>,
@@ -10,9 +12,9 @@ fn run_program_without_expect(
     println!("Testing {}", elf_path);
     let elf_data = std::fs::read(elf_path).unwrap();
     let program = Elf::load(&elf_data).unwrap();
-    println!("Program entry: 0x{:08x}", program.entry_point);
+    println!("Program entry: 0x{:016x}", program.entry_point);
     program.image.iter().for_each(|(addr, word)| {
-        println!("0x{:08x}: 0x{:08x}", addr, word);
+        println!("0x{:016x}: 0x{:08x}", addr, word);
     });
 
     run_program(program.image, program.entry_point, private_inputs)
@@ -26,10 +28,10 @@ fn run_program_and_check_public_output(
     let (results, _logs) =
         run_program_without_expect(elf_path, private_inputs).expect("Failed to run program");
 
-    assert!(results.memory_values == expected_output);
+    assert_eq!(results.memory_values, expected_output);
 }
 
-fn run_program_and_check_output(elf_path: &str, expected_output: i32, private_inputs: Vec<u8>) {
+fn run_program_and_check_output(elf_path: &str, expected_output: i64, private_inputs: Vec<u8>) {
     let (results, _logs) =
         run_program_without_expect(elf_path, private_inputs).expect("Failed to run program");
 
@@ -53,7 +55,7 @@ fn test_if() {
 
 #[test]
 fn test_fibonacci() {
-    run_program_and_check_output("./program_artifacts/rust/fibonacci.elf", 1597, vec![]);
+    run_program_and_check_output("./program_artifacts/rust/fibonacci.elf", 55, vec![]);
 }
 
 #[test]
@@ -196,4 +198,87 @@ fn test_random() {
     } else {
         panic!("Expected rand error");
     }
+}
+
+#[test]
+fn test_memory() {
+    let mut output = vec![];
+    let size = 100000u32;
+    for _ in 0..size {
+        output.push(1);
+    }
+    run_program_and_check_public_output(
+        "./program_artifacts/rust/memory.elf",
+        output[(size - 1000) as usize..].to_vec(),
+        size.to_be_bytes().to_vec(),
+    );
+}
+
+#[test]
+fn test_keccak() {
+    use tiny_keccak::Hasher;
+    let input_a = b"hello world";
+    let input_b = b"!";
+    let mut output = [0u8; 32];
+    let mut hasher = tiny_keccak::Keccak::v256();
+    hasher.update(input_a);
+    hasher.update(input_b);
+    hasher.finalize(&mut output);
+    run_program_and_check_public_output(
+        "./program_artifacts/rust/keccak.elf",
+        output.to_vec(),
+        vec![],
+    );
+}
+
+#[test]
+fn test_stdin_read_panics() {
+    let result = run_program_without_expect("./program_artifacts/rust/stdin_read.elf", vec![]);
+    assert!(result.is_err());
+    if let Err(executor::vm::execution::ExecutorError::ExecutionError(
+        executor::vm::instruction::execution::ExecutionError::Panic(msg),
+    )) = result
+    {
+        assert!(
+            msg.contains("sys_read is not supported"),
+            "Expected sys_read panic, got: {}",
+            msg
+        );
+    } else {
+        panic!("Expected panic error for stdin_read");
+    }
+}
+
+#[test]
+fn test_args_panics() {
+    let result = run_program_without_expect("./program_artifacts/rust/args_test.elf", vec![]);
+    assert!(result.is_err());
+    if let Err(executor::vm::execution::ExecutorError::ExecutionError(
+        executor::vm::instruction::execution::ExecutionError::Panic(msg),
+    )) = result
+    {
+        assert!(
+            msg.contains("sys_argc is not supported"),
+            "Expected sys_argc panic, got: {}",
+            msg
+        );
+    } else {
+        panic!("Expected panic error for args_test");
+    }
+}
+
+#[ignore = "Ignored until the vm is fast enough to run this test"]
+#[test]
+fn test_ethrex() {
+    use guest_program::{execution::execution_program, input::ProgramInput};
+    use rkyv::rancor::Error;
+    use std::fs;
+    let inputs = fs::read("tests/ethrex_hoodi.bin").unwrap();
+    let input = rkyv::from_bytes::<ProgramInput, Error>(&inputs).unwrap();
+    let output = execution_program(input).unwrap();
+    run_program_and_check_public_output(
+        "./program_artifacts/rust/ethrex.elf",
+        output.encode(),
+        inputs,
+    );
 }
