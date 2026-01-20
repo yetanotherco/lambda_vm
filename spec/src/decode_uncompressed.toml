@@ -58,10 +58,8 @@ desc = "selector used to indicate signed or unsigned input interpretation."
 [[variables.output]]
 name = "mp_selector"
 type = "Bit"
-desc = """Multi-purpose selector used by different ALU operations for different purposes. Currently, it is used
-    - by the `MUL` chip to select between `MUL`/`MULH` and `MULH[S]U`, and
-    - as flag for inverting the condition of conditional branches (see `branch_cond`)
-    - as direction (left or right) for `SHIFT`"""
+desc = """Multi-purpose selector used by the CPU to to configure several ALU operations in different ways. 
+          See the `CPU` chip for more details."""
 
 [[variables.output]]
 name = "muldiv_selector"
