@@ -27,6 +27,11 @@ use crate::tables64::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 type F = GoldilocksField;
 type E = GoldilocksExtension;
 
+/// Signed comparison flag
+const SIGNED: bool = true;
+/// Unsigned comparison flag
+const UNSIGNED: bool = false;
+
 // =============================================================================
 // Column indices for sender (CPU-like) table
 // =============================================================================
@@ -380,7 +385,7 @@ fn prove_and_verify_custom(ops: &[LtOperation], receiver_rows: &[CustomLtRow]) -
 
 #[test]
 fn test_padding_single_row() {
-    let ops = vec![LtOperation::new(1, 2, false)];
+    let ops = vec![LtOperation::new(1, 2, UNSIGNED)];
     let trace = generate_lt_trace(&ops);
     // 1 row -> pads to 2
     assert_eq!(trace.main_table.height, 2);
@@ -389,9 +394,9 @@ fn test_padding_single_row() {
 #[test]
 fn test_padding_three_rows() {
     let ops = vec![
-        LtOperation::new(1, 2, false),
-        LtOperation::new(3, 4, false),
-        LtOperation::new(5, 6, false),
+        LtOperation::new(1, 2, UNSIGNED),
+        LtOperation::new(3, 4, UNSIGNED),
+        LtOperation::new(5, 6, UNSIGNED),
     ];
     let trace = generate_lt_trace(&ops);
     // 3 rows -> pads to 4
@@ -401,11 +406,11 @@ fn test_padding_three_rows() {
 #[test]
 fn test_padding_five_rows() {
     let ops = vec![
-        LtOperation::new(1, 2, false),
-        LtOperation::new(3, 4, false),
-        LtOperation::new(5, 6, false),
-        LtOperation::new(7, 8, false),
-        LtOperation::new(9, 10, false),
+        LtOperation::new(1, 2, UNSIGNED),
+        LtOperation::new(3, 4, UNSIGNED),
+        LtOperation::new(5, 6, UNSIGNED),
+        LtOperation::new(7, 8, UNSIGNED),
+        LtOperation::new(9, 10, UNSIGNED),
     ];
     let trace = generate_lt_trace(&ops);
     // 5 rows -> pads to 8
@@ -414,7 +419,7 @@ fn test_padding_five_rows() {
 
 #[test]
 fn test_padding_rows_have_zero_multiplicity() {
-    let ops = vec![LtOperation::new(100, 200, false)];
+    let ops = vec![LtOperation::new(100, 200, UNSIGNED)];
     let trace = generate_lt_trace(&ops);
 
     // First row has MU = 1
@@ -433,9 +438,9 @@ fn test_padding_rows_have_zero_multiplicity() {
 #[test]
 fn test_border_zero_values() {
     let ops = vec![
-        LtOperation::new(0, 0, false), // 0 < 0 = false
-        LtOperation::new(0, 1, false), // 0 < 1 = true
-        LtOperation::new(1, 0, false), // 1 < 0 = false
+        LtOperation::new(0, 0, UNSIGNED), // 0 < 0 = false
+        LtOperation::new(0, 1, UNSIGNED), // 0 < 1 = true
+        LtOperation::new(1, 0, UNSIGNED), // 1 < 0 = false
     ];
 
     assert!(ops[0].compute_lt() == false);
@@ -449,11 +454,11 @@ fn test_border_zero_values() {
 fn test_border_max_unsigned() {
     let max = u64::MAX;
     let ops = vec![
-        LtOperation::new(max, max, false),     // MAX < MAX = false
-        LtOperation::new(max - 1, max, false), // MAX-1 < MAX = true
-        LtOperation::new(max, max - 1, false), // MAX < MAX-1 = false
-        LtOperation::new(max, 0, false),       // MAX < 0 = false (unsigned)
-        LtOperation::new(0, max, false),       // 0 < MAX = true (unsigned)
+        LtOperation::new(max, max, UNSIGNED),     // MAX < MAX = false
+        LtOperation::new(max - 1, max, UNSIGNED), // MAX-1 < MAX = true
+        LtOperation::new(max, max - 1, UNSIGNED), // MAX < MAX-1 = false
+        LtOperation::new(max, 0, UNSIGNED),       // MAX < 0 = false (unsigned)
+        LtOperation::new(0, max, UNSIGNED),       // 0 < MAX = true (unsigned)
     ];
 
     assert!(ops[0].compute_lt() == false);
@@ -471,12 +476,12 @@ fn test_border_signed_boundaries() {
     let max_signed = i64::MAX as u64; // 0x7FFF_FFFF_FFFF_FFFF
 
     let ops = vec![
-        LtOperation::new(min_signed, max_signed, true), // MIN < MAX = true
-        LtOperation::new(max_signed, min_signed, true), // MAX < MIN = false
-        LtOperation::new(min_signed, min_signed, true), // MIN < MIN = false
-        LtOperation::new(max_signed, max_signed, true), // MAX < MAX = false
-        LtOperation::new((-1i64) as u64, 0, true),      // -1 < 0 = true
-        LtOperation::new(0, (-1i64) as u64, true),      // 0 < -1 = false
+        LtOperation::new(min_signed, max_signed, SIGNED), // MIN < MAX = true
+        LtOperation::new(max_signed, min_signed, SIGNED), // MAX < MIN = false
+        LtOperation::new(min_signed, min_signed, SIGNED), // MIN < MIN = false
+        LtOperation::new(max_signed, max_signed, SIGNED), // MAX < MAX = false
+        LtOperation::new((-1i64) as u64, 0, SIGNED),      // -1 < 0 = true
+        LtOperation::new(0, (-1i64) as u64, SIGNED),      // 0 < -1 = false
     ];
 
     assert!(ops[0].compute_lt() == true);
@@ -494,9 +499,9 @@ fn test_border_32bit_boundary() {
     // Test around 2^32 boundary
     let boundary = 1u64 << 32;
     let ops = vec![
-        LtOperation::new(boundary - 1, boundary, false), // 2^32-1 < 2^32 = true
-        LtOperation::new(boundary, boundary - 1, false), // 2^32 < 2^32-1 = false
-        LtOperation::new(boundary, boundary, false),     // 2^32 < 2^32 = false
+        LtOperation::new(boundary - 1, boundary, UNSIGNED), // 2^32-1 < 2^32 = true
+        LtOperation::new(boundary, boundary - 1, UNSIGNED), // 2^32 < 2^32-1 = false
+        LtOperation::new(boundary, boundary, UNSIGNED),     // 2^32 < 2^32 = false
     ];
 
     assert!(ops[0].compute_lt() == true);
@@ -512,23 +517,23 @@ fn test_border_32bit_boundary() {
 
 #[test]
 fn test_completeness_simple_unsigned() {
-    let ops = vec![LtOperation::new(5, 10, false)]; // 5 < 10 = true
+    let ops = vec![LtOperation::new(5, 10, UNSIGNED)]; // 5 < 10 = true
     assert!(prove_and_verify(&ops));
 }
 
 #[test]
 fn test_completeness_simple_signed() {
-    let ops = vec![LtOperation::new((-5i64) as u64, 5, true)]; // -5 < 5 = true
+    let ops = vec![LtOperation::new((-5i64) as u64, 5, SIGNED)]; // -5 < 5 = true
     assert!(prove_and_verify(&ops));
 }
 
 #[test]
 fn test_completeness_multiple_lookups() {
     let ops = vec![
-        LtOperation::new(1, 2, false),
-        LtOperation::new(100, 50, false),
-        LtOperation::new((-10i64) as u64, (-5i64) as u64, true),
-        LtOperation::new(0, 0, false),
+        LtOperation::new(1, 2, UNSIGNED),
+        LtOperation::new(100, 50, UNSIGNED),
+        LtOperation::new((-10i64) as u64, (-5i64) as u64, SIGNED),
+        LtOperation::new(0, 0, UNSIGNED),
     ];
     assert!(prove_and_verify(&ops));
 }
@@ -536,9 +541,9 @@ fn test_completeness_multiple_lookups() {
 #[test]
 fn test_completeness_duplicate_lookups() {
     let ops = vec![
-        LtOperation::new(42, 100, false),
-        LtOperation::new(42, 100, false), // Duplicate
-        LtOperation::new(42, 100, false), // Duplicate
+        LtOperation::new(42, 100, UNSIGNED),
+        LtOperation::new(42, 100, UNSIGNED), // Duplicate
+        LtOperation::new(42, 100, UNSIGNED), // Duplicate
     ];
     assert!(prove_and_verify(&ops));
 }
@@ -550,13 +555,13 @@ fn test_completeness_duplicate_lookups() {
 #[test]
 fn test_soundness_wrong_lt_result() {
     // Sender claims 5 < 10 = false (WRONG! Should be true)
-    let ops = vec![LtOperation::new(5, 10, false)];
+    let ops = vec![LtOperation::new(5, 10, UNSIGNED)];
 
     // Custom receiver with wrong LT result
     let receiver = vec![CustomLtRow {
         lhs: 5,
         rhs: 10,
-        signed: false,
+        signed: UNSIGNED,
         lt: false, // WRONG - should be true
         multiplicity: 1,
     }];
@@ -568,13 +573,13 @@ fn test_soundness_wrong_lt_result() {
 fn test_soundness_wrong_signed_result() {
     // Sender: -5 < 5 (signed) = true
     let lhs = (-5i64) as u64;
-    let ops = vec![LtOperation::new(lhs, 5, true)];
+    let ops = vec![LtOperation::new(lhs, 5, SIGNED)];
 
     // Custom receiver claims false
     let receiver = vec![CustomLtRow {
         lhs,
         rhs: 5,
-        signed: true,
+        signed: SIGNED,
         lt: false, // WRONG - should be true
         multiplicity: 1,
     }];
@@ -586,14 +591,14 @@ fn test_soundness_wrong_signed_result() {
 fn test_soundness_multiplicity_mismatch() {
     // Sender sends 2 lookups, receiver has multiplicity 1
     let ops = vec![
-        LtOperation::new(5, 10, false),
-        LtOperation::new(5, 10, false), // Duplicate
+        LtOperation::new(5, 10, UNSIGNED),
+        LtOperation::new(5, 10, UNSIGNED), // Duplicate
     ];
 
     let receiver = vec![CustomLtRow {
         lhs: 5,
         rhs: 10,
-        signed: false,
+        signed: UNSIGNED,
         lt: true,
         multiplicity: 1, // WRONG - should be 2
     }];
@@ -604,12 +609,12 @@ fn test_soundness_multiplicity_mismatch() {
 #[test]
 fn test_soundness_missing_receiver_row() {
     // Sender looks up (100, 200), receiver only has (5, 10)
-    let ops = vec![LtOperation::new(100, 200, false)];
+    let ops = vec![LtOperation::new(100, 200, UNSIGNED)];
 
     let receiver = vec![CustomLtRow {
         lhs: 5,
         rhs: 10,
-        signed: false,
+        signed: UNSIGNED,
         lt: true,
         multiplicity: 1,
     }];
@@ -620,12 +625,12 @@ fn test_soundness_missing_receiver_row() {
 #[test]
 fn test_soundness_swapped_operands() {
     // Sender: 5 < 10, Receiver has 10 < 5
-    let ops = vec![LtOperation::new(5, 10, false)];
+    let ops = vec![LtOperation::new(5, 10, UNSIGNED)];
 
     let receiver = vec![CustomLtRow {
         lhs: 10, // Swapped!
         rhs: 5,  // Swapped!
-        signed: false,
+        signed: UNSIGNED,
         lt: false, // 10 < 5 = false (correct for swapped)
         multiplicity: 1,
     }];
@@ -636,12 +641,12 @@ fn test_soundness_swapped_operands() {
 #[test]
 fn test_soundness_wrong_signed_flag() {
     // Sender: unsigned comparison, receiver has signed
-    let ops = vec![LtOperation::new(5, 10, false)]; // unsigned
+    let ops = vec![LtOperation::new(5, 10, UNSIGNED)];
 
     let receiver = vec![CustomLtRow {
         lhs: 5,
         rhs: 10,
-        signed: true, // WRONG - should be false
+        signed: SIGNED, // WRONG - should be UNSIGNED
         lt: true,
         multiplicity: 1,
     }];

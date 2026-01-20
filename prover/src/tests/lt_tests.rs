@@ -3,14 +3,19 @@
 use crate::tables64::lt::{LtOperation, bus_interactions, cols, generate_lt_trace};
 use crate::tables64::types::FE;
 
+/// Signed comparison flag
+const SIGNED: bool = true;
+/// Unsigned comparison flag
+const UNSIGNED: bool = false;
+
 #[test]
 fn test_lt_unsigned_basic() {
     let ops = vec![
-        LtOperation::new(5, 10, false),       // 5 < 10 unsigned -> true
-        LtOperation::new(10, 5, false),       // 10 < 5 unsigned -> false
-        LtOperation::new(5, 5, false),        // 5 < 5 unsigned -> false
-        LtOperation::new(0, 1, false),        // 0 < 1 unsigned -> true
-        LtOperation::new(u64::MAX, 0, false), // MAX < 0 unsigned -> false
+        LtOperation::new(5, 10, UNSIGNED),       // 5 < 10 unsigned -> true
+        LtOperation::new(10, 5, UNSIGNED),       // 10 < 5 unsigned -> false
+        LtOperation::new(5, 5, UNSIGNED),        // 5 < 5 unsigned -> false
+        LtOperation::new(0, 1, UNSIGNED),        // 0 < 1 unsigned -> true
+        LtOperation::new(u64::MAX, 0, UNSIGNED), // MAX < 0 unsigned -> false
     ];
 
     assert!(ops[0].compute_lt());
@@ -23,11 +28,11 @@ fn test_lt_unsigned_basic() {
 #[test]
 fn test_lt_signed_basic() {
     let ops = vec![
-        LtOperation::new(5, 10, true),             // 5 < 10 signed -> true
-        LtOperation::new(10, 5, true),             // 10 < 5 signed -> false
-        LtOperation::new((-5i64) as u64, 5, true), // -5 < 5 signed -> true
-        LtOperation::new(5, (-5i64) as u64, true), // 5 < -5 signed -> false
-        LtOperation::new((-10i64) as u64, (-5i64) as u64, true), // -10 < -5 signed -> true
+        LtOperation::new(5, 10, SIGNED),             // 5 < 10 signed -> true
+        LtOperation::new(10, 5, SIGNED),             // 10 < 5 signed -> false
+        LtOperation::new((-5i64) as u64, 5, SIGNED), // -5 < 5 signed -> true
+        LtOperation::new(5, (-5i64) as u64, SIGNED), // 5 < -5 signed -> false
+        LtOperation::new((-10i64) as u64, (-5i64) as u64, SIGNED), // -10 < -5 signed -> true
     ];
 
     assert!(ops[0].compute_lt());
@@ -40,8 +45,8 @@ fn test_lt_signed_basic() {
 #[test]
 fn test_trace_generation() {
     let ops = vec![
-        LtOperation::new(100, 200, false),
-        LtOperation::new(200, 100, true),
+        LtOperation::new(100, 200, UNSIGNED),
+        LtOperation::new(200, 100, SIGNED),
     ];
 
     let trace = generate_lt_trace(&ops);
@@ -76,13 +81,13 @@ fn test_trace_generation() {
 
 #[test]
 fn test_multiplicity_aggregation() {
-    // Create 5 operations where (5, 10, false) appears 3 times
+    // Create 5 operations where (5, 10, UNSIGNED) appears 3 times
     let ops = vec![
-        LtOperation::new(5, 10, false), // appears 1st time
-        LtOperation::new(100, 200, false),
-        LtOperation::new(5, 10, false),    // appears 2nd time
-        LtOperation::new(5, 10, false),    // appears 3rd time
-        LtOperation::new(100, 200, false), // duplicate
+        LtOperation::new(5, 10, UNSIGNED),   // appears 1st time
+        LtOperation::new(100, 200, UNSIGNED),
+        LtOperation::new(5, 10, UNSIGNED),   // appears 2nd time
+        LtOperation::new(5, 10, UNSIGNED),   // appears 3rd time
+        LtOperation::new(100, 200, UNSIGNED), // duplicate
     ];
 
     let trace = generate_lt_trace(&ops);
@@ -122,9 +127,9 @@ fn test_multiplicity_aggregation() {
 fn test_multiplicity_different_signed_flags() {
     // Same lhs/rhs but different signed flag should be separate rows
     let ops = vec![
-        LtOperation::new(5, 10, false), // unsigned
-        LtOperation::new(5, 10, true),  // signed - different operation!
-        LtOperation::new(5, 10, false), // unsigned again
+        LtOperation::new(5, 10, UNSIGNED), // unsigned
+        LtOperation::new(5, 10, SIGNED),   // signed - different operation!
+        LtOperation::new(5, 10, UNSIGNED), // unsigned again
     ];
 
     let trace = generate_lt_trace(&ops);
