@@ -1,0 +1,23 @@
+[package]
+name = "math-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.math]
+path = ".."
+
+[[bin]]
+name = "diff_fft"
+path = "fuzz_targets/diff_fft.rs"
+test = false
+doc = false
+bench = false

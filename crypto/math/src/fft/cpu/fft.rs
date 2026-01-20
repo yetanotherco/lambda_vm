@@ -315,6 +315,36 @@ mod tests {
         }
     }
 
+    fn in_place_nr_2radix_fft_sequential<F, E>(input: &mut [FieldElement<E>], twiddles: &[FieldElement<F>])
+    where
+        F: IsFFTField + IsSubFieldOf<E>,
+        E: IsField,
+    {
+        let mut group_count = 1;
+        let mut group_size = input.len();
+
+        while group_count < input.len() {
+             super::fft_stage_sequential(input, twiddles, group_count, group_size);
+             group_count *= 2;
+             group_size /= 2;
+        }
+    }
+
+    fn in_place_nr_4radix_fft_sequential<F, E>(input: &mut [FieldElement<E>], twiddles: &[FieldElement<F>])
+    where
+        F: IsFFTField + IsSubFieldOf<E>,
+        E: IsField,
+    {
+        let mut group_count = 1;
+        let mut group_size = input.len();
+
+        while group_count < input.len() {
+             super::fft4_stage_sequential(input, twiddles, group_count, group_size);
+             group_count *= 4;
+             group_size /= 4;
+        }
+    }
+
     proptest! {
         // Property-based test that ensures NR Radix-2 FFT gives the same result as a naive DFT.
         #[test]
@@ -359,6 +389,36 @@ mod tests {
             in_place_bit_reverse_permute(&mut result);
 
             prop_assert_eq!(expected, result);
+        }
+
+        // Property-based test that ensures Parallel NR Radix-2 FFT gives the same result as Sequential.
+        #[test]
+        fn test_nr_2radix_parallel_matches_sequential(coeffs in field_vec(15)) {
+            let order = coeffs.len().trailing_zeros();
+            let twiddles = get_twiddles(order.into(), RootsConfig::BitReverse).unwrap();
+
+            let mut parallel_result = coeffs.clone();
+            let mut sequential_result = coeffs;
+
+            in_place_nr_2radix_fft::<F, F>(&mut parallel_result, &twiddles);
+            in_place_nr_2radix_fft_sequential::<F, F>(&mut sequential_result, &twiddles);
+
+            prop_assert_eq!(parallel_result, sequential_result);
+        }
+
+        // Property-based test that ensures Parallel NR Radix-4 FFT gives the same result as Sequential.
+        #[test]
+        fn test_nr_4radix_parallel_matches_sequential(coeffs in field_vec_r4(8)) {
+            let order = coeffs.len().trailing_zeros();
+            let twiddles = get_twiddles(order.into(), RootsConfig::BitReverse).unwrap();
+
+            let mut parallel_result = coeffs.clone();
+            let mut sequential_result = coeffs;
+
+            in_place_nr_4radix_fft::<F, F>(&mut parallel_result, &twiddles);
+            in_place_nr_4radix_fft_sequential::<F, F>(&mut sequential_result, &twiddles);
+
+            prop_assert_eq!(parallel_result, sequential_result);
         }
     }
 }
