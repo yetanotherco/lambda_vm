@@ -19,11 +19,9 @@
 
 pub mod types;
 
-// Phase 1
 pub mod bitwise;
-
-// Phase 2
 pub mod lt;
+
 // pub mod branch;
 // pub mod mul;
 // pub mod shift;
