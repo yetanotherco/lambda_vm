@@ -16,7 +16,7 @@
 #let decode = raw(chip.name)
 
 = #decode table
-All `RV64ACIM` instruction are to be decoded to a format that can be interpreted by the VM.
+All `RV64IMC` instruction are to be decoded to a format that can be interpreted by the VM.
 This section outlines the decoding table being used in the VM.
 For reasons of efficiency, data in this table is significantly compressed.
 Since reasoning about this compressed form is needlessly complex, the `decode (uncompressed)` section presents the same table in uncompressed form, and explains how to decode `RV64IM` assembly instructions to it.

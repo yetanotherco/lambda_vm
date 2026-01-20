@@ -4,7 +4,8 @@ name = "DECODE"
 name = "pc"
 type = "DWordWL"
 desc = "value of the program counter this instruction is associated with."
-pad = 0
+# TODO(#136): fix this when padding the CPU
+pad = 1
 
 [[variables.output]]
 name = "packed_decode"
