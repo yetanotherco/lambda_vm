@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 const EI_NIDENT: usize = 16;
 const EM_RISCV: u16 = 243;
@@ -206,7 +206,7 @@ impl ProgramHeader {
 
 pub struct Elf {
     pub entry_point: u64,
-    pub image: BTreeMap<u64, u32>,
+    pub image: HashMap<u64, u32>,
 }
 
 pub(crate) const WORD_SIZE: u64 = 4;
@@ -247,7 +247,7 @@ pub enum ElfError {
 
 impl Elf {
     pub fn load(input: &[u8]) -> Result<Elf, ElfError> {
-        let mut image: BTreeMap<u64, u32> = BTreeMap::new();
+        let mut image: HashMap<u64, u32> = HashMap::new();
         let elf_program = ElfProgram::parse(input)?;
         if elf_program.ehdr.e_machine != EM_RISCV {
             return Err(ElfError::NotRiscV);
