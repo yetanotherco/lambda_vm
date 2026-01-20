@@ -22,8 +22,9 @@ pub fn run_program(
 ) -> Result<(ReturnValues, Vec<Log>), ExecutorError> {
     let mut memory = Memory::default();
     memory.store_private_inputs(private_inputs)?;
+    let instruction_count = instruction_map.len();
     load_program(instruction_map, &mut memory)?;
-    run_from_entrypoint(&mut memory, entrypoint)
+    run_from_entrypoint(&mut memory, entrypoint, instruction_count)
 }
 
 fn load_program(
@@ -39,10 +40,12 @@ fn load_program(
 fn run_from_entrypoint(
     memory: &mut Memory,
     entrypoint: u64,
+    instruction_count: usize,
 ) -> Result<(ReturnValues, Vec<Log>), ExecutorError> {
     let mut pc = entrypoint;
     let mut registers = Registers::default();
-    let mut logs = Vec::new();
+    // Pre-Allocate logs with an estimated capacity
+    let mut logs = Vec::with_capacity(instruction_count * 1000);
     while pc != 0 {
         let next_instruction = memory.load_word(pc)?;
         let instruction = Instruction::parse(next_instruction)?;
