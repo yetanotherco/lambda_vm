@@ -231,6 +231,42 @@ fn test_keccak() {
     );
 }
 
+#[test]
+fn test_stdin_read_panics() {
+    let result = run_program_without_expect("./program_artifacts/rust/stdin_read.elf", vec![]);
+    assert!(result.is_err());
+    if let Err(executor::vm::execution::ExecutorError::ExecutionError(
+        executor::vm::instruction::execution::ExecutionError::Panic(msg),
+    )) = result
+    {
+        assert!(
+            msg.contains("sys_read is not supported"),
+            "Expected sys_read panic, got: {}",
+            msg
+        );
+    } else {
+        panic!("Expected panic error for stdin_read");
+    }
+}
+
+#[test]
+fn test_args_panics() {
+    let result = run_program_without_expect("./program_artifacts/rust/args_test.elf", vec![]);
+    assert!(result.is_err());
+    if let Err(executor::vm::execution::ExecutorError::ExecutionError(
+        executor::vm::instruction::execution::ExecutionError::Panic(msg),
+    )) = result
+    {
+        assert!(
+            msg.contains("sys_argc is not supported"),
+            "Expected sys_argc panic, got: {}",
+            msg
+        );
+    } else {
+        panic!("Expected panic error for args_test");
+    }
+}
+
 #[ignore = "Ignored until the vm is fast enough to run this test"]
 #[test]
 fn test_ethrex() {
