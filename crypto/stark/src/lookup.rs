@@ -1193,7 +1193,7 @@ where
                 vec![FieldElement::from(interaction.bus_id)];
 
             // Coefficients for each bus element (including bus_id) (using incremental multiplication)
-            let coeffs = compute_alpha_powers(alpha, bus_elements.len());
+            let coeffs = compute_alpha_powers(alpha, bus_elements.len() + interaction.values.len());
             // Stage 1: Combine each BusValue's columns using powers of 2 (or linear combination)
             // Stage 2: Convert to extension and append to bus_elements
             bus_elements.extend(interaction.values.iter().flat_map(|bv| {
