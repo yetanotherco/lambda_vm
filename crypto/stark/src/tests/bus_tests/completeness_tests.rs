@@ -9,7 +9,8 @@ use math::field::fields::fft_friendly::{
 };
 
 use crate::examples::multi_table_lookup::{
-    new_add_air_with_lookup, new_cpu_air_with_lookup, new_mul_air_with_lookup,
+    generate_random_traces, new_add_air_with_lookup, new_cpu_air_with_lookup,
+    new_mul_air_with_lookup,
 };
 use crate::proof::options::ProofOptions;
 use crate::prover::{IsStarkProver, Prover};
@@ -381,4 +382,72 @@ fn test_serialization_roundtrip() {
         &deserialized,
         &mut DefaultTranscript::<E>::new(&[]),
     ));
+}
+
+/// Verification of a random CPU trace table of 16 rows and its respective ADD and MUL tables.
+#[test_log::test]
+fn test_random_traces_proof_verification_short_table() {
+    // Generate random traces.
+    // CPU number of rows: 16
+    let (mut cpu_trace, mut add_trace, mut mul_trace) = generate_random_traces(16, None);
+
+    let proof_options = ProofOptions::default_test_options();
+    let cpu_air = new_cpu_air_with_lookup(&proof_options);
+    let add_air = new_add_air_with_lookup(&proof_options);
+    let mul_air = new_mul_air_with_lookup(&proof_options);
+
+    let air_trace_pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&cpu_air, &mut cpu_trace, &()),
+        (&add_air, &mut add_trace, &()),
+        (&mul_air, &mut mul_trace, &()),
+    ];
+
+    let multi_proof = Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
+        .expect("Failed to generate proof");
+
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        vec![&cpu_air, &add_air, &mul_air];
+
+    assert!(
+        Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[]),),
+        "Proof verification failed for random traces"
+    );
+}
+
+/// Verification of a random CPU trace table of 2^16 rows and its respective ADD and MUL tables.
+#[test_log::test]
+fn test_random_traces_proof_verification_long_table() {
+    // Generate random traces.
+    // CPU number of rows: 2^16
+    let (mut cpu_trace, mut add_trace, mut mul_trace) = generate_random_traces(65536, None);
+
+    let proof_options = ProofOptions::default_test_options();
+    let cpu_air = new_cpu_air_with_lookup(&proof_options);
+    let add_air = new_add_air_with_lookup(&proof_options);
+    let mul_air = new_mul_air_with_lookup(&proof_options);
+
+    let air_trace_pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&cpu_air, &mut cpu_trace, &()),
+        (&add_air, &mut add_trace, &()),
+        (&mul_air, &mut mul_trace, &()),
+    ];
+
+    let multi_proof = Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
+        .expect("Failed to generate proof");
+
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        vec![&cpu_air, &add_air, &mul_air];
+
+    assert!(
+        Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[]),),
+        "Proof verification failed for random traces"
+    );
 }

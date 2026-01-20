@@ -75,3 +75,7 @@ omit-default-module-path = false
 [[bench]]
 name = "prover_benchmark"
 harness = false
+
+[[bench]]
+name = "prover_benchmark_2"
+harness = false

@@ -10,7 +10,8 @@ use math::field::fields::fft_friendly::{
 };
 
 use crate::examples::multi_table_lookup::{
-    new_add_air_with_lookup, new_cpu_air_with_lookup, new_mul_air_with_lookup,
+    generate_random_traces, new_add_air_with_lookup, new_cpu_air_with_lookup,
+    new_mul_air_with_lookup,
 };
 use crate::proof::options::ProofOptions;
 use crate::prover::{IsStarkProver, Prover};
@@ -1330,4 +1331,45 @@ fn test_full_scenario_wrong_mul() {
         &multi_proof,
         &mut DefaultTranscript::<E>::new(&[])
     ));
+}
+
+// =============================================================================
+// Random tables generation
+// =============================================================================
+
+/// Generate random CPU trace table with a valid MUL table and an invalid ADD table.
+#[test_log::test]
+fn test_false_random_add_trace_table() {
+    // Generate random traces.
+    // CPU number of rows: 8
+    let (mut cpu_trace, _, mut mul_trace) = generate_random_traces(8, Some(1));
+
+    // Generate false random add trace.
+    let (_, mut false_add_trace, _) = generate_random_traces(8, Some(2));
+
+    let proof_options = ProofOptions::default_test_options();
+    let cpu_air = new_cpu_air_with_lookup(&proof_options);
+    let add_air = new_add_air_with_lookup(&proof_options);
+    let mul_air = new_mul_air_with_lookup(&proof_options);
+
+    let air_trace_pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&cpu_air, &mut cpu_trace, &()),
+        (&add_air, &mut false_add_trace, &()),
+        (&mul_air, &mut mul_trace, &()),
+    ];
+
+    let multi_proof = Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
+        .expect("Failed to generate proof");
+
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        vec![&cpu_air, &add_air, &mul_air];
+
+    assert!(
+        !Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[]),),
+        "Proof verification should fail for false add trace table"
+    );
 }

@@ -107,8 +107,8 @@ pub fn generate_random_traces(
     trace_length: usize,
     seed: Option<u64>,
 ) -> (TraceTable<F, E>, TraceTable<F, E>, TraceTable<F, E>) {
-    use rand::{Rng, SeedableRng};
     use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
 
     // Initialize RNG
     let mut rng = if let Some(s) = seed {
@@ -245,73 +245,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_generate_random_traces() {
-        // Generate traces with a fixed seed for reproducibility
-        let (cpu_trace, add_trace, mul_trace) = generate_random_traces(16, Some(3));
+    fn random_tables_have_correct_num_rows_and_cols() {
+        // Generate traces
+        let (cpu_trace, add_trace, mul_trace) = generate_random_traces(16, None);
 
         // Verify CPU trace has correct shape
         assert_eq!(cpu_trace.num_rows(), 16);
         assert_eq!(cpu_trace.num_cols(), 5);
 
-        // Verify ADD and MUL traces are valid (at least 4 rows, power of 2)
+        // Verify ADD and MUL traces are valid (at least 4 rows, power of two)
         assert!(add_trace.num_rows() >= 4);
         assert!(mul_trace.num_rows() >= 4);
         assert!(add_trace.num_rows().is_power_of_two());
         assert!(mul_trace.num_rows().is_power_of_two());
         assert_eq!(add_trace.num_cols(), 4);
         assert_eq!(mul_trace.num_cols(), 4);
-
-        println!("CPU trace length: {}", cpu_trace.num_rows());
-        println!("ADD trace length: {}", add_trace.num_rows());
-        println!("MUL trace length: {}", mul_trace.num_rows());
     }
 
     #[test]
-    fn test_generate_random_traces_power_of_two() {
+    fn generate_random_traces_correct_power_of_two_padding() {
         // Test that non-power-of-2 lengths are rounded up
-        let (cpu_trace, _, _) = generate_random_traces(100, Some(123));
+        let (cpu_trace, _, _) = generate_random_traces(100, None);
 
         // 100 should be rounded up to 128
         assert_eq!(cpu_trace.num_rows(), 128);
         assert!(cpu_trace.num_rows().is_power_of_two());
-    }
-
-    #[test]
-    fn test_random_traces_proof_verification() {
-        use crate::proof::options::ProofOptions;
-        use crate::prover::{IsStarkProver, Prover};
-        use crate::traits::AIR;
-        use crate::verifier::{IsStarkVerifier, Verifier};
-        use crypto::fiat_shamir::default_transcript::DefaultTranscript;
-
-        // Generate random traces
-        let (mut cpu_trace, mut add_trace, mut mul_trace) = generate_random_traces(16, Some(999));
-
-        let proof_options = ProofOptions::default_test_options();
-        let cpu_air = new_cpu_air_with_lookup(&proof_options);
-        let add_air = new_add_air_with_lookup(&proof_options);
-        let mul_air = new_mul_air_with_lookup(&proof_options);
-
-        let air_trace_pairs: Vec<(
-            &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
-            _,
-            _,
-        )> = vec![
-            (&cpu_air, &mut cpu_trace, &()),
-            (&add_air, &mut add_trace, &()),
-            (&mul_air, &mut mul_trace, &()),
-        ];
-
-        let multi_proof =
-            Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
-                .expect("Failed to generate proof");
-
-        let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
-            vec![&cpu_air, &add_air, &mul_air];
-
-        assert!(
-            Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[]),),
-            "Proof verification failed for random traces"
-        );
     }
 }
