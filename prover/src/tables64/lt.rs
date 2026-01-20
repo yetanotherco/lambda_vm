@@ -94,7 +94,9 @@ pub mod cols {
 // =========================================================================
 
 /// A single LT operation to be added to the trace.
-#[derive(Debug, Clone)]
+///
+/// Derives Hash and Eq so it can be used as a HashMap key for deduplication.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct LtOperation {
     /// Left operand (64-bit value)
     pub lhs: u64,
@@ -122,15 +124,24 @@ impl LtOperation {
 
 /// Generates the LT trace table from a list of operations.
 ///
-/// Each operation becomes one row in the table. The table is then
-/// padded to the next power of 2.
+/// Duplicate operations (same lhs, rhs, signed) are merged into a single row
+/// with their multiplicities summed. The table is then padded to the next power of 2.
 pub fn generate_lt_trace(
     operations: &[LtOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let num_rows = operations.len().next_power_of_two().max(2);
+    use std::collections::HashMap;
+
+    // Deduplicate operations: (lhs, rhs, signed) -> multiplicity
+    let mut op_map: HashMap<LtOperation, u64> = HashMap::new();
+    for op in operations {
+        *op_map.entry(op.clone()).or_insert(0) += 1;
+    }
+
+    let unique_ops: Vec<_> = op_map.into_iter().collect();
+    let num_rows = unique_ops.len().next_power_of_two().max(2);
     let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
 
-    for (row_idx, op) in operations.iter().enumerate() {
+    for (row_idx, (op, multiplicity)) in unique_ops.iter().enumerate() {
         let base = row_idx * cols::NUM_COLUMNS;
 
         // Extract lhs as DWordHHW: [Word, Half, Half]
@@ -176,8 +187,8 @@ pub fn generate_lt_trace(
         data[base + cols::LHS_MSB] = FE::from(lhs_msb);
         data[base + cols::RHS_MSB] = FE::from(rhs_msb);
 
-        // Multiplicity: 1 for actual operations
-        data[base + cols::MU] = FE::one();
+        // Multiplicity: aggregated count of this operation
+        data[base + cols::MU] = FE::from(*multiplicity);
     }
 
     // Padding rows have MU = 0, so they don't contribute to bus interactions
