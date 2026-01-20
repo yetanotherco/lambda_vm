@@ -12,7 +12,7 @@ use math::{
 
 use crate::{
     config::Commitment,
-    domain::Domain,
+    domain::VerifierDomain,
     fri::fri_decommit::FriDecommitment,
     lookup::BusPublicInputs,
     table::Table,
@@ -70,11 +70,11 @@ pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     pub deep_poly_openings: DeepPolynomialOpenings<F, E>,
     // nonce obtained from grinding
     pub nonce: Option<u64>,
-    // Bus interaction public inputs for each interaction in this table.
+    // Bus interaction public inputs for the accumulated column.
     // Contains initial and final aux column values, used for:
     // 1. Boundary constraints on aux columns (row 0 and last row)
-    // 2. Bus balance check: Σ sender_values - Σ receiver_values = 0 across all tables
-    pub bus_interactions: Vec<BusPublicInputs<E>>,
+    // 2. Bus balance check: Σ final_accumulated across all tables = 0
+    pub bus_public_inputs: Option<BusPublicInputs<E>>,
     // Public inputs used for boundary constraints
     pub public_inputs: PI,
 }
@@ -479,7 +479,7 @@ impl StoneCompatibleSerializer {
     {
         let mut transcript = StoneProverTranscript::new(&public_inputs.as_bytes());
         let air = A::new(proof_options);
-        let domain = Domain::<Stark252PrimeField>::new(&air, proof.trace_length);
+        let domain = VerifierDomain::<Stark252PrimeField>::new(&air, proof.trace_length);
         let challenges = Verifier::step_1_replay_rounds_and_recover_challenges(
             &air,
             proof,

@@ -17,8 +17,8 @@ fn use_byte(value: u32) -> [u16;2] {
 }
 
 #[unsafe(export_name = "main")]
-pub fn main() -> i16 {
+pub fn main() -> i32 {
     let value: u32 = 0xDEADBEEF;
     let bytes = use_byte(value);
-    bytes[1] as i16 - bytes[0] as i16
+    (bytes[1] as i16 - bytes[0] as i16) as i32
 }
