@@ -112,13 +112,13 @@ To indicate an instruction is provided in compressed form, the `c_type` flag is 
   ([`BLT[U]   rs1, rs2, imm`], [`BLT`], [], [], [#sym.not`[U]`], [], []),
   ([`BGE[U]   rs1, rs2, imm`], [`BLT`], [], [], [#sym.not`[U]`], [`mp_selector`], []),
   // LOAD
-  ([`LD        rd, rs1, imm`], [`LOAD`], [], [], [], [`mem_2B`, `mem_4B`, `mem_8B`], []),
-  ([`LW[U]     rd, rs1, imm`], [`LOAD`], [], [], [#sym.not`[U]`], [`mem_2B`, `mem_4B`], []),
+  ([`LD        rd, rs1, imm`], [`LOAD`], [], [], [], [`mem_8B`], []),
+  ([`LW[U]     rd, rs1, imm`], [`LOAD`], [], [], [#sym.not`[U]`], [`mem_4B`], []),
   ([`LH[U]     rd, rs1, imm`], [`LOAD`], [], [], [#sym.not`[U]`], [`mem_2B`], []),
   ([`LB[U]     rd, rs1, imm`], [`LOAD`], [], [], [#sym.not`[U]`], [], []),
   // STORE
-  ([`SD       rs1, rs2, imm`], [`STORE`], [], [], [], [`mem_2B`, `mem_4B`, `mem_8B`], []),
-  ([`SW       rs1, rs2, imm`], [`STORE`], [], [], [], [`mem_2B`, `mem_4B`], []),
+  ([`SD       rs1, rs2, imm`], [`STORE`], [], [], [], [`mem_8B`], []),
+  ([`SW       rs1, rs2, imm`], [`STORE`], [], [], [], [`mem_4B`], []),
   ([`SH       rs1, rs2, imm`], [`STORE`], [], [], [], [`mem_2B`], []),
   ([`SB       rs1, rs2, imm`], [`STORE`], [], [], [], [], []),
   // ECALL/EBREAK
