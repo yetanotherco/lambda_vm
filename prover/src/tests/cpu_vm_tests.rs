@@ -249,27 +249,27 @@ fn test_register_values_from_logs() {
     for (i, log) in logs.iter().enumerate() {
         let row = trace.main_table.get_row(i);
 
-        // rv1 should match log.src1_val (stored as Word, Half, Half)
-        let expected_rv1_0 = log.src1_val & 0xFFFF_FFFF;
-        let expected_rv1_1 = (log.src1_val >> 32) & 0xFFFF;
-        let expected_rv1_2 = (log.src1_val >> 48) & 0xFFFF;
+        // rv1 stored as DWordWHH: [Half, Half, Word] - Word is MSB
+        let expected_rv1_0 = log.src1_val & 0xFFFF;              // bits 0-15 (Half)
+        let expected_rv1_1 = (log.src1_val >> 16) & 0xFFFF;      // bits 16-31 (Half)
+        let expected_rv1_2 = log.src1_val >> 32;                 // bits 32-63 (Word)
 
         assert_eq!(
             row[cols::RV1_0],
             FE::from(expected_rv1_0),
-            "RV1_0 at row {} should match log.src1_val",
+            "RV1_0 at row {} should match log.src1_val bits 0-15",
             i
         );
         assert_eq!(
             row[cols::RV1_1],
             FE::from(expected_rv1_1),
-            "RV1_1 at row {} should match log.src1_val",
+            "RV1_1 at row {} should match log.src1_val bits 16-31",
             i
         );
         assert_eq!(
             row[cols::RV1_2],
             FE::from(expected_rv1_2),
-            "RV1_2 at row {} should match log.src1_val",
+            "RV1_2 at row {} should match log.src1_val bits 32-63",
             i
         );
     }

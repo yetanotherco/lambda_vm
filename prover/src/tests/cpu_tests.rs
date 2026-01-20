@@ -192,10 +192,10 @@ fn test_trace_generation_rv1_dwordwhh() {
     let trace = generate_cpu_trace(&ops);
     let row0 = trace.main_table.get_row(0);
 
-    // rv1 stored as DWordWHH: [Word, Half, Half]
-    assert_eq!(row0[cols::RV1_0], FE::from(0xDDDD_CCCCu64)); // bits 0-31
-    assert_eq!(row0[cols::RV1_1], FE::from(0xEEEEu64)); // bits 32-47
-    assert_eq!(row0[cols::RV1_2], FE::from(0xFFFFu64)); // bits 48-63
+    // rv1 stored as DWordWHH: [Half, Half, Word] - Word is MSB
+    assert_eq!(row0[cols::RV1_0], FE::from(0xCCCCu64)); // bits 0-15 (Half)
+    assert_eq!(row0[cols::RV1_1], FE::from(0xDDDDu64)); // bits 16-31 (Half)
+    assert_eq!(row0[cols::RV1_2], FE::from(0xFFFF_EEEEu64)); // bits 32-63 (Word)
 }
 
 #[test]
@@ -298,10 +298,12 @@ fn test_bus_interactions_count() {
     // - 8 AND_BYTE
     // - 8 OR_BYTE
     // - 8 XOR_BYTE
-    // Total: 8 + 8 + 8 = 24
-    // Note: LT interaction is TODO (needs DWordHHW packing)
-    // Note: IS_BYTE, MSB8, ZERO, BRANCH are TODO for later
-    assert_eq!(interactions.len(), 24);
+    // - 2 MSB16 (rv1_sign_bit, arg2_sign_bit)
+    // - 1 MSB8 (res_sign_bit)
+    // - 1 ZERO (is_equal for BEQ)
+    // - 1 LT (less-than comparison)
+    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 = 29
+    assert_eq!(interactions.len(), 29);
 }
 
 #[test]

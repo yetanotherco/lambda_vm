@@ -5,10 +5,13 @@
 //! - Generate traces for CPU and Bitwise tables
 //! - Use multi_prove/multi_verify with bus interactions
 //!
-//! Currently wired buses:
+//! Wired buses:
 //! - CPU sends AND_BYTE, OR_BYTE, XOR_BYTE to Bitwise (×8 each)
+//! - CPU sends MSB16 to Bitwise (for rv1_sign_bit, arg2_sign_bit when word_instr=1)
+//! - CPU sends MSB8 to Bitwise (for res_sign_bit when word_instr=1)
+//! - CPU sends ZERO to Bitwise (for is_equal when BEQ=1)
 //!
-//! TODO: LT bus (needs CPU sender with DWordHHW packing)
+//! TODO: LT bus (needs LT table integration)
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 
@@ -23,9 +26,12 @@ use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
 use crate::tables64::bitwise::{
-    bus_interactions as bitwise_bus_interactions, generate_bitwise_trace,
+    bus_interactions as bitwise_bus_interactions, generate_bitwise_trace, update_multiplicities,
 };
-use crate::tables64::cpu::{bus_interactions as cpu_bus_interactions, generate_cpu_trace_from_logs};
+use crate::tables64::cpu::{
+    bus_interactions as cpu_bus_interactions, collect_bitwise_lookups_from_logs,
+    generate_cpu_trace_from_logs,
+};
 use crate::tables64::types::{GoldilocksExtension, GoldilocksField};
 
 type F = GoldilocksField;
@@ -171,6 +177,7 @@ fn test_cpu_only_no_bus() {
 }
 
 #[test]
+#[ignore] // Slow: run with `make test_all`
 fn test_vm_prover_lui() {
     // LUI program: 2 steps (power of 2)
     // Only uses ADD (for LUI), no bitwise operations (AND=0, OR=0, XOR=0)
@@ -184,11 +191,13 @@ fn test_vm_prover_lui() {
         cpu_trace.main_table.height, cpu_trace.main_table.width
     );
 
-    // Generate Bitwise trace (the full precomputed table)
+    // Generate Bitwise trace and update multiplicities based on CPU lookups
     let mut bitwise_trace = generate_bitwise_trace();
+    let bitwise_lookups = collect_bitwise_lookups_from_logs(&logs);
+    update_multiplicities(&mut bitwise_trace, &bitwise_lookups);
     println!(
-        "Bitwise trace: {} rows x {} cols",
-        bitwise_trace.main_table.height, bitwise_trace.main_table.width
+        "Bitwise trace: {} rows x {} cols, {} lookups",
+        bitwise_trace.main_table.height, bitwise_trace.main_table.width, bitwise_lookups.len()
     );
 
     // Run prover and verifier
@@ -199,13 +208,19 @@ fn test_vm_prover_lui() {
 }
 
 #[test]
+#[ignore] // Slow: run with `make test_all`
 fn test_vm_prover_beq() {
-    // BEQ program: uses branch instruction, no bitwise ops
+    // BEQ program: uses branch instruction, sends ZERO lookups
     let logs = run_asm_elf("beq");
     println!("beq.elf has {} steps", logs.len());
 
     let mut cpu_trace = generate_cpu_trace_from_logs(&logs);
+
+    // Generate Bitwise trace and update multiplicities
     let mut bitwise_trace = generate_bitwise_trace();
+    let bitwise_lookups = collect_bitwise_lookups_from_logs(&logs);
+    update_multiplicities(&mut bitwise_trace, &bitwise_lookups);
+    println!("BEQ test: {} bitwise lookups", bitwise_lookups.len());
 
     assert!(
         prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace),
@@ -214,13 +229,18 @@ fn test_vm_prover_beq() {
 }
 
 #[test]
+#[ignore] // Slow: run with `make test_all`
 fn test_vm_prover_add_64bit() {
     // 64-bit addition: 6 steps (padded to 8)
     let logs = run_asm_elf("add_64bit");
     println!("add_64bit.elf has {} steps", logs.len());
 
     let mut cpu_trace = generate_cpu_trace_from_logs(&logs);
+
+    // Generate Bitwise trace and update multiplicities
     let mut bitwise_trace = generate_bitwise_trace();
+    let bitwise_lookups = collect_bitwise_lookups_from_logs(&logs);
+    update_multiplicities(&mut bitwise_trace, &bitwise_lookups);
 
     assert!(
         prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace),
@@ -229,13 +249,19 @@ fn test_vm_prover_add_64bit() {
 }
 
 #[test]
+#[ignore] // Slow: run with `make test_all`
 fn test_vm_prover_subw() {
-    // SUBW: 32-bit word subtraction
+    // SUBW: 32-bit word subtraction, sends MSB16/MSB8 lookups (word_instr=1)
     let logs = run_asm_elf("subw");
     println!("subw.elf has {} steps", logs.len());
 
     let mut cpu_trace = generate_cpu_trace_from_logs(&logs);
+
+    // Generate Bitwise trace and update multiplicities
     let mut bitwise_trace = generate_bitwise_trace();
+    let bitwise_lookups = collect_bitwise_lookups_from_logs(&logs);
+    update_multiplicities(&mut bitwise_trace, &bitwise_lookups);
+    println!("SUBW test: {} bitwise lookups", bitwise_lookups.len());
 
     assert!(
         prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace),

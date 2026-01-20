@@ -162,8 +162,6 @@ fn test_multiplicity_different_signed_flags() {
 #[test]
 fn test_bus_interactions_count() {
     let interactions = bus_interactions();
-    // All interactions disabled for now until:
-    // - CPU sends LT with proper DWordHHW packing
-    // - Bitwise receives MSB16 and IS_HALFWORD
-    assert_eq!(interactions.len(), 0);
+    // LT table receives LT lookups from CPU
+    assert_eq!(interactions.len(), 1);
 }

@@ -28,16 +28,12 @@
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::TransitionConstraint;
-use stark::lookup::BusInteraction;
-// TODO: Re-enable when bus interactions are wired
-// use stark::lookup::{BusValue, Multiplicity, Packing};
+use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::table::TableView;
 use stark::trace::TraceTable;
 use stark::traits::TransitionEvaluationContext;
 
-use super::types::{FE, GoldilocksExtension, GoldilocksField, SHIFT_16, SHIFT_32};
-// TODO: Re-enable when bus interactions are wired
-// use super::types::BusId;
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16, SHIFT_32};
 
 // =========================================================================
 // Column indices for LT table
@@ -222,8 +218,55 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         // TODO: Re-add when Bitwise table receives IS_HALFWORD
         // IS_HALFWORD[lhs_sub_rhs[0..3]]
 
-        // TODO: Re-add when CPU sends with proper DWordHHW packing
         // LT[lhs, rhs, signed] -> lt (receiver)
+        // Receives from CPU table (sender)
+        // Format: lhs (3 cols: Word, Half, Half), rhs (3 cols), signed, lt
+        BusInteraction::receiver(
+            BusId::Lt,
+            Multiplicity::Column(cols::MU),
+            vec![
+                // lhs[0]: Word (lower 32 bits)
+                BusValue::Packed {
+                    start_column: cols::LHS_0,
+                    packing: Packing::Direct,
+                },
+                // lhs[1]: Half (bits 32-47)
+                BusValue::Packed {
+                    start_column: cols::LHS_1,
+                    packing: Packing::Direct,
+                },
+                // lhs[2]: Half (bits 48-63)
+                BusValue::Packed {
+                    start_column: cols::LHS_2,
+                    packing: Packing::Direct,
+                },
+                // rhs[0]: Word (lower 32 bits)
+                BusValue::Packed {
+                    start_column: cols::RHS_0,
+                    packing: Packing::Direct,
+                },
+                // rhs[1]: Half (bits 32-47)
+                BusValue::Packed {
+                    start_column: cols::RHS_1,
+                    packing: Packing::Direct,
+                },
+                // rhs[2]: Half (bits 48-63)
+                BusValue::Packed {
+                    start_column: cols::RHS_2,
+                    packing: Packing::Direct,
+                },
+                // signed flag
+                BusValue::Packed {
+                    start_column: cols::SIGNED,
+                    packing: Packing::Direct,
+                },
+                // lt result
+                BusValue::Packed {
+                    start_column: cols::LT,
+                    packing: Packing::Direct,
+                },
+            ],
+        ),
     ]
 }
 

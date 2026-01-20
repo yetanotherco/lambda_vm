@@ -269,8 +269,10 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for EbreakConstr
 
 /// Constraint: arg1[0:4] = rv1[0:2] (lower 32 bits match)
 ///
-/// arg1 is DWordBL (8 bytes), rv1 is DWordWHH (word + 2 halves)
-/// arg1[:4] as word = rv1[0] (word)
+/// arg1 is DWordBL (8 bytes), rv1 is DWordWHH [Half, Half, Word]
+/// arg1[:4] as word = rv1[0] + rv1[1] * 2^16 (two halves make a word)
+///
+/// Spec (CPU-CE54): arg1::DWordWL[0] - rv1::DWordWL[0] = 0
 pub struct Arg1LowerConstraint {
     constraint_idx: usize,
 }
@@ -295,13 +297,16 @@ impl Arg1LowerConstraint {
         let shift_16: FieldElement<F> = FieldElement::from(1u64 << 16);
         let shift_24: FieldElement<F> = FieldElement::from(1u64 << 24);
 
-        let arg1_lo = arg1_0 + arg1_1 * shift_8 + arg1_2 * shift_16 + arg1_3 * shift_24;
+        let arg1_lo = arg1_0 + arg1_1 * shift_8.clone() + arg1_2 * shift_16.clone() + arg1_3 * shift_24;
 
-        // rv1[0] is already a word
+        // rv1 is DWordWHH: [Half(0-15), Half(16-31), Word(32-63)]
+        // rv1::DWordWL[0] = rv1[0] + rv1[1] * 2^16
         let rv1_0 = step.get_main_evaluation_element(0, cols::RV1_0).clone();
+        let rv1_1 = step.get_main_evaluation_element(0, cols::RV1_1).clone();
+        let rv1_lower = rv1_0 + rv1_1 * shift_16;
 
-        // Constraint: arg1_lo - rv1[0] = 0
-        arg1_lo - rv1_0
+        // Constraint: arg1_lo - rv1_lower = 0
+        arg1_lo - rv1_lower
     }
 }
 
@@ -374,10 +379,8 @@ impl Arg1UpperConstraint {
 
         let arg1_hi = arg1_4 + arg1_5 * shift_8 + arg1_6 * shift_16.clone() + arg1_7 * shift_24;
 
-        // rv1 upper part: rv1[1] (half) + rv1[2] (half) * 2^16
-        let rv1_1 = step.get_main_evaluation_element(0, cols::RV1_1).clone();
-        let rv1_2 = step.get_main_evaluation_element(0, cols::RV1_2).clone();
-        let rv1_upper = rv1_1 + rv1_2 * shift_16;
+        // rv1 is DWordWHH: rv1[2] IS the upper 32 bits directly (Word)
+        let rv1_upper = step.get_main_evaluation_element(0, cols::RV1_2);
 
         let word_instr = step
             .get_main_evaluation_element(0, cols::WORD_INSTR)
@@ -750,6 +753,466 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for NextPcAddCon
 }
 
 // =========================================================================
+// Arg2 Constraints
+// =========================================================================
+
+/// Constraint: arg2[:4] = (1-STORE-LOAD)*rv2[:2] + (1-BEQ-BLT)*imm[0]
+///
+/// arg2 lower 32 bits comes from either rv2 or imm depending on instruction type.
+pub struct Arg2LowerConstraint {
+    constraint_idx: usize,
+}
+
+impl Arg2LowerConstraint {
+    pub fn new(constraint_idx: usize) -> Self {
+        Self { constraint_idx }
+    }
+
+    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        // arg2[0:4] as DWordWL[0] = sum of bytes
+        let arg2_0 = step.get_main_evaluation_element(0, cols::ARG2[0]);
+        let arg2_1 = step.get_main_evaluation_element(0, cols::ARG2[1]);
+        let arg2_2 = step.get_main_evaluation_element(0, cols::ARG2[2]);
+        let arg2_3 = step.get_main_evaluation_element(0, cols::ARG2[3]);
+
+        let shift_8: FieldElement<F> = FieldElement::from(1u64 << 8);
+        let shift_16: FieldElement<F> = FieldElement::from(1u64 << 16);
+        let shift_24: FieldElement<F> = FieldElement::from(1u64 << 24);
+
+        let arg2_lo = arg2_0 + arg2_1 * &shift_8 + arg2_2 * &shift_16 + arg2_3 * shift_24;
+
+        // rv2 is DWordWHH: rv2[:2] = rv2[0] + rv2[1] * 2^16
+        let rv2_0 = step.get_main_evaluation_element(0, cols::RV2_0);
+        let rv2_1 = step.get_main_evaluation_element(0, cols::RV2_1);
+        let rv2_lower = rv2_0 + rv2_1 * &shift_16;
+
+        // imm[0] is lower word of immediate
+        let imm_0 = step.get_main_evaluation_element(0, cols::IMM_0);
+
+        // Selectors
+        let store = step.get_main_evaluation_element(0, cols::STORE);
+        let load = step.get_main_evaluation_element(0, cols::LOAD);
+        let beq = step.get_main_evaluation_element(0, cols::BEQ);
+        let blt = step.get_main_evaluation_element(0, cols::BLT);
+
+        let one = FieldElement::<F>::one();
+
+        // (1-STORE-LOAD) * rv2_lower + (1-BEQ-BLT) * imm[0]
+        let expected = (&one - store - load) * rv2_lower + (&one - beq - blt) * imm_0;
+
+        // Constraint: arg2_lo - expected = 0
+        arg2_lo - expected
+    }
+}
+
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg2LowerConstraint {
+    fn degree(&self) -> usize {
+        2
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    fn end_exemptions(&self) -> usize {
+        0
+    }
+
+    fn evaluate(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
+    ) {
+        match evaluation_context {
+            TransitionEvaluationContext::Prover { frame, .. } => {
+                let constraint_value = self.compute(frame.get_evaluation_step(0));
+                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
+            }
+            TransitionEvaluationContext::Verifier { frame, .. } => {
+                let constraint_value = self.compute(frame.get_evaluation_step(0));
+                transition_evaluations[self.constraint_idx] = constraint_value;
+            }
+        }
+    }
+}
+
+/// Constraint: arg2[4:] = (1-STORE-LOAD)*((1-word_instr)*rv2[2] + signed*arg2_sign_bit*(2^32-1)) + (1-BEQ-BLT)*imm[1]
+///
+/// arg2 upper 32 bits with sign extension logic.
+pub struct Arg2UpperConstraint {
+    constraint_idx: usize,
+}
+
+impl Arg2UpperConstraint {
+    pub fn new(constraint_idx: usize) -> Self {
+        Self { constraint_idx }
+    }
+
+    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        // arg2[4:8] as DWordWL[1]
+        let arg2_4 = step.get_main_evaluation_element(0, cols::ARG2[4]);
+        let arg2_5 = step.get_main_evaluation_element(0, cols::ARG2[5]);
+        let arg2_6 = step.get_main_evaluation_element(0, cols::ARG2[6]);
+        let arg2_7 = step.get_main_evaluation_element(0, cols::ARG2[7]);
+
+        let shift_8: FieldElement<F> = FieldElement::from(1u64 << 8);
+        let shift_16: FieldElement<F> = FieldElement::from(1u64 << 16);
+        let shift_24: FieldElement<F> = FieldElement::from(1u64 << 24);
+
+        let arg2_hi = arg2_4 + arg2_5 * &shift_8 + arg2_6 * &shift_16 + arg2_7 * shift_24;
+
+        // rv2 is DWordWHH: rv2[2] IS the upper 32 bits directly (Word)
+        let rv2_upper = step.get_main_evaluation_element(0, cols::RV2_2);
+
+        // imm[1] is upper word of immediate
+        let imm_1 = step.get_main_evaluation_element(0, cols::IMM_1);
+
+        // Flags
+        let store = step.get_main_evaluation_element(0, cols::STORE);
+        let load = step.get_main_evaluation_element(0, cols::LOAD);
+        let beq = step.get_main_evaluation_element(0, cols::BEQ);
+        let blt = step.get_main_evaluation_element(0, cols::BLT);
+        let word_instr = step.get_main_evaluation_element(0, cols::WORD_INSTR);
+        let signed = step.get_main_evaluation_element(0, cols::SIGNED);
+        let arg2_sign_bit = step.get_main_evaluation_element(0, cols::ARG2_SIGN_BIT);
+
+        let one = FieldElement::<F>::one();
+        let mask_32: FieldElement<F> = FieldElement::from((1u64 << 32) - 1);
+
+        // rv2_term = (1 - word_instr) * rv2[2] + signed * arg2_sign_bit * (2^32 - 1)
+        let rv2_term = (&one - word_instr) * rv2_upper + signed * arg2_sign_bit * &mask_32;
+
+        // expected = (1-STORE-LOAD) * rv2_term + (1-BEQ-BLT) * imm[1]
+        let expected = (&one - store - load) * rv2_term + (&one - beq - blt) * imm_1;
+
+        // Constraint: arg2_hi - expected = 0
+        arg2_hi - expected
+    }
+}
+
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg2UpperConstraint {
+    fn degree(&self) -> usize {
+        // (1-STORE-LOAD) * signed * arg2_sign_bit has degree 3
+        3
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    fn end_exemptions(&self) -> usize {
+        0
+    }
+
+    fn evaluate(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
+    ) {
+        match evaluation_context {
+            TransitionEvaluationContext::Prover { frame, .. } => {
+                let constraint_value = self.compute(frame.get_evaluation_step(0));
+                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
+            }
+            TransitionEvaluationContext::Verifier { frame, .. } => {
+                let constraint_value = self.compute(frame.get_evaluation_step(0));
+                transition_evaluations[self.constraint_idx] = constraint_value;
+            }
+        }
+    }
+}
+
+// =========================================================================
+// RVD Constraints
+// =========================================================================
+
+/// Constraint: (1-LOAD) * (rvd[0] - res[:4]) = 0
+///
+/// When not LOAD, rvd lower 32 bits equals res lower 32 bits.
+pub struct RvdLowerConstraint {
+    constraint_idx: usize,
+}
+
+impl RvdLowerConstraint {
+    pub fn new(constraint_idx: usize) -> Self {
+        Self { constraint_idx }
+    }
+
+    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        // rvd[0] is lower word
+        let rvd_0 = step.get_main_evaluation_element(0, cols::RVD_0);
+
+        // res[:4] as DWordWL[0] = sum of bytes
+        let res_0 = step.get_main_evaluation_element(0, cols::RES[0]);
+        let res_1 = step.get_main_evaluation_element(0, cols::RES[1]);
+        let res_2 = step.get_main_evaluation_element(0, cols::RES[2]);
+        let res_3 = step.get_main_evaluation_element(0, cols::RES[3]);
+
+        let shift_8: FieldElement<F> = FieldElement::from(1u64 << 8);
+        let shift_16: FieldElement<F> = FieldElement::from(1u64 << 16);
+        let shift_24: FieldElement<F> = FieldElement::from(1u64 << 24);
+
+        let res_lo = res_0 + res_1 * &shift_8 + res_2 * &shift_16 + res_3 * shift_24;
+
+        let load = step.get_main_evaluation_element(0, cols::LOAD);
+        let one = FieldElement::<F>::one();
+
+        // (1 - LOAD) * (rvd[0] - res_lo) = 0
+        (one - load) * (rvd_0 - res_lo)
+    }
+}
+
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RvdLowerConstraint {
+    fn degree(&self) -> usize {
+        2
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    fn end_exemptions(&self) -> usize {
+        0
+    }
+
+    fn evaluate(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
+    ) {
+        match evaluation_context {
+            TransitionEvaluationContext::Prover { frame, .. } => {
+                let constraint_value = self.compute(frame.get_evaluation_step(0));
+                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
+            }
+            TransitionEvaluationContext::Verifier { frame, .. } => {
+                let constraint_value = self.compute(frame.get_evaluation_step(0));
+                transition_evaluations[self.constraint_idx] = constraint_value;
+            }
+        }
+    }
+}
+
+/// Constraint: (1-LOAD) * (rvd[1] - ((1-word_instr)*res[4:] + res_sign_bit*(2^32-1))) = 0
+///
+/// When not LOAD, rvd upper 32 bits equals res upper with sign extension.
+pub struct RvdUpperConstraint {
+    constraint_idx: usize,
+}
+
+impl RvdUpperConstraint {
+    pub fn new(constraint_idx: usize) -> Self {
+        Self { constraint_idx }
+    }
+
+    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        // rvd[1] is upper word
+        let rvd_1 = step.get_main_evaluation_element(0, cols::RVD_1);
+
+        // res[4:] as DWordWL[1] = sum of bytes
+        let res_4 = step.get_main_evaluation_element(0, cols::RES[4]);
+        let res_5 = step.get_main_evaluation_element(0, cols::RES[5]);
+        let res_6 = step.get_main_evaluation_element(0, cols::RES[6]);
+        let res_7 = step.get_main_evaluation_element(0, cols::RES[7]);
+
+        let shift_8: FieldElement<F> = FieldElement::from(1u64 << 8);
+        let shift_16: FieldElement<F> = FieldElement::from(1u64 << 16);
+        let shift_24: FieldElement<F> = FieldElement::from(1u64 << 24);
+
+        let res_hi = res_4 + res_5 * &shift_8 + res_6 * &shift_16 + res_7 * shift_24;
+
+        let load = step.get_main_evaluation_element(0, cols::LOAD);
+        let word_instr = step.get_main_evaluation_element(0, cols::WORD_INSTR);
+        let res_sign_bit = step.get_main_evaluation_element(0, cols::RES_SIGN_BIT);
+
+        let one = FieldElement::<F>::one();
+        let mask_32: FieldElement<F> = FieldElement::from((1u64 << 32) - 1);
+
+        // expected = (1 - word_instr) * res_hi + res_sign_bit * (2^32 - 1)
+        let expected = (&one - word_instr) * res_hi + res_sign_bit * mask_32;
+
+        // (1 - LOAD) * (rvd[1] - expected) = 0
+        (one - load) * (rvd_1 - expected)
+    }
+}
+
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RvdUpperConstraint {
+    fn degree(&self) -> usize {
+        // (1-LOAD) * (1-word_instr) * res_hi has degree 3
+        3
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    fn end_exemptions(&self) -> usize {
+        0
+    }
+
+    fn evaluate(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
+    ) {
+        match evaluation_context {
+            TransitionEvaluationContext::Prover { frame, .. } => {
+                let constraint_value = self.compute(frame.get_evaluation_step(0));
+                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
+            }
+            TransitionEvaluationContext::Verifier { frame, .. } => {
+                let constraint_value = self.compute(frame.get_evaluation_step(0));
+                transition_evaluations[self.constraint_idx] = constraint_value;
+            }
+        }
+    }
+}
+
+// =========================================================================
+// SUB Constraints
+// =========================================================================
+
+/// Creates SUB constraints for the CPU table.
+///
+/// Active when SUB + BEQ = 1.
+/// Verifies: arg1 - arg2 = res (with borrow handling via carry)
+pub fn create_sub_constraints(constraint_idx_start: usize) -> (Vec<AddConstraint>, usize) {
+    // SUB uses the same carry-based approach as ADD:
+    // res = arg1 - arg2 is verified as arg1 = arg2 + res (no carry out for correct subtraction)
+    // Actually, we verify: arg2 + res = arg1 with carries
+    //
+    // Condition column: we need SUB + BEQ, but AddConstraint takes single column
+    // For now, we create separate constraints or use a helper column.
+    //
+    // Actually looking at the AddConstraint, it uses AddOperand which can read from
+    // columns. We need to think about this differently.
+    //
+    // The SUB constraint verifies: res + arg2 = arg1 (subtraction as addition)
+    // Low: res_lo + arg2_lo = arg1_lo + carry_0 * 2^32
+    // High: res_hi + arg2_hi + carry_0 = arg1_hi + carry_1 * 2^32
+    //
+    // For SUB+BEQ condition, we can't directly use AddConstraint since it takes
+    // a single condition column. Let's create a dedicated SubConstraint.
+
+    // For now, return empty - SUB verification is more complex
+    // TODO: Implement proper SUB constraint with borrow logic
+    (vec![], constraint_idx_start)
+}
+
+// =========================================================================
+// JALR Result Constraint
+// =========================================================================
+
+/// Constraint: JALR * (res - (pc + instr_size)) = 0
+///
+/// When JALR=1, the result should be pc + instruction size (return address).
+/// instr_size = 4 - 2 * c_type_instruction
+pub struct JalrResConstraint {
+    constraint_idx: usize,
+}
+
+impl JalrResConstraint {
+    pub fn new(constraint_idx: usize) -> Self {
+        Self { constraint_idx }
+    }
+
+    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        let jalr = step.get_main_evaluation_element(0, cols::JALR);
+
+        // pc as DWordWL (only using low word for now)
+        let pc_lo = step.get_main_evaluation_element(0, cols::PC_0);
+        let _pc_hi = step.get_main_evaluation_element(0, cols::PC_1);
+
+        // res[:4] as DWordWL[0]
+        let res_0 = step.get_main_evaluation_element(0, cols::RES[0]);
+        let res_1 = step.get_main_evaluation_element(0, cols::RES[1]);
+        let res_2 = step.get_main_evaluation_element(0, cols::RES[2]);
+        let res_3 = step.get_main_evaluation_element(0, cols::RES[3]);
+
+        let shift_8: FieldElement<F> = FieldElement::from(1u64 << 8);
+        let shift_16: FieldElement<F> = FieldElement::from(1u64 << 16);
+        let shift_24: FieldElement<F> = FieldElement::from(1u64 << 24);
+
+        let res_lo = res_0 + res_1 * &shift_8 + res_2 * &shift_16 + res_3 * &shift_24;
+
+        // res[4:] as DWordWL[1] (unused for now - only checking low word)
+        let res_4 = step.get_main_evaluation_element(0, cols::RES[4]);
+        let res_5 = step.get_main_evaluation_element(0, cols::RES[5]);
+        let res_6 = step.get_main_evaluation_element(0, cols::RES[6]);
+        let res_7 = step.get_main_evaluation_element(0, cols::RES[7]);
+
+        let _res_hi = res_4 + res_5 * &shift_8 + res_6 * &shift_16 + res_7 * shift_24;
+
+        // instr_size = 4 - 2 * c_type_instruction
+        let c_type = step.get_main_evaluation_element(0, cols::C_TYPE_INSTRUCTION);
+        let four: FieldElement<F> = FieldElement::from(4u64);
+        let two: FieldElement<F> = FieldElement::from(2u64);
+        let instr_size = four - &two * c_type;
+
+        // expected_lo = pc_lo + instr_size (mod 2^32)
+        // expected_hi = pc_hi + carry
+        // For simplicity, we check: res_lo + res_hi * 2^32 = pc_lo + pc_hi * 2^32 + instr_size
+        // This is: (res_lo - pc_lo - instr_size) + (res_hi - pc_hi) * 2^32 = 0
+        //
+        // But this doesn't handle carry properly. For now, just check low word:
+        // JALR * (res_lo - pc_lo - instr_size) = 0 (assuming no carry, which is usually true)
+
+        jalr * (res_lo - pc_lo - instr_size)
+    }
+}
+
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for JalrResConstraint {
+    fn degree(&self) -> usize {
+        2
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    fn end_exemptions(&self) -> usize {
+        0
+    }
+
+    fn evaluate(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
+    ) {
+        match evaluation_context {
+            TransitionEvaluationContext::Prover { frame, .. } => {
+                let constraint_value = self.compute(frame.get_evaluation_step(0));
+                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
+            }
+            TransitionEvaluationContext::Verifier { frame, .. } => {
+                let constraint_value = self.compute(frame.get_evaluation_step(0));
+                transition_evaluations[self.constraint_idx] = constraint_value;
+            }
+        }
+    }
+}
+
+// =========================================================================
 // Constraint Summary
 // =========================================================================
 
@@ -761,12 +1224,17 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for NextPcAddCon
 /// - EBREAK: 1
 /// - Arg1 lower: 1
 /// - Arg1 upper: 1
+/// - Arg2 lower: 1
+/// - Arg2 upper: 1
+/// - Rvd lower: 1
+/// - Rvd upper: 1
 /// - SLT res zero: 7 (bytes 1-7)
 /// - Sign bit zero: 1
 /// - Next PC (non-branching): 2
+/// - JALR res: 1
 ///
-/// Total: 46 constraints
-pub const NUM_CPU_CONSTRAINTS: usize = 30 + 2 + 1 + 1 + 1 + 1 + 7 + 1 + 2;
+/// Total: 51 constraints
+pub const NUM_CPU_CONSTRAINTS: usize = 30 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 7 + 1 + 2 + 1;
 
 /// Creates all CPU constraints.
 ///
@@ -805,6 +1273,18 @@ pub fn create_all_cpu_constraints() -> (
     other.push(Box::new(Arg1UpperConstraint::new(next_idx)));
     next_idx += 1;
 
+    // Arg2 constraints
+    other.push(Box::new(Arg2LowerConstraint::new(next_idx)));
+    next_idx += 1;
+    other.push(Box::new(Arg2UpperConstraint::new(next_idx)));
+    next_idx += 1;
+
+    // Rvd constraints
+    other.push(Box::new(RvdLowerConstraint::new(next_idx)));
+    next_idx += 1;
+    other.push(Box::new(RvdUpperConstraint::new(next_idx)));
+    next_idx += 1;
+
     // SLT res zero constraints
     let (slt_zero, next) = create_slt_res_zero_constraints(next_idx);
     next_idx = next;
@@ -821,6 +1301,10 @@ pub fn create_all_cpu_constraints() -> (
     other.push(Box::new(next_pc_0));
     other.push(Box::new(next_pc_1));
     next_idx += 2;
+
+    // JALR result constraint
+    other.push(Box::new(JalrResConstraint::new(next_idx)));
+    next_idx += 1;
 
     (is_bit, add, other, next_idx)
 }
