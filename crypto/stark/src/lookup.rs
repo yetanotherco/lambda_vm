@@ -1192,8 +1192,6 @@ where
             let mut bus_elements: Vec<FieldElement<B>> =
                 vec![FieldElement::from(interaction.bus_id)];
 
-            // Coefficients for each bus element (including bus_id) (using incremental multiplication)
-            let coeffs = compute_alpha_powers(alpha, bus_elements.len() + interaction.values.len());
             // Stage 1: Combine each BusValue's columns using powers of 2 (or linear combination)
             // Stage 2: Convert to extension and append to bus_elements
             bus_elements.extend(interaction.values.iter().flat_map(|bv| {
@@ -1203,6 +1201,9 @@ where
                 // Convert to extension only after combining
                 combined.into_iter().map(|v| v.to_extension())
             }));
+
+            // Coefficients for each bus element (including bus_id) (using incremental multiplication)
+            let coeffs = compute_alpha_powers(alpha, bus_elements.len());
 
             // fingerprint = z - (bus_id + v[0]*α + v[1]*α² + ... + v[n]*α^(n+1))
             let fingerprint: FieldElement<B> = (-bus_elements
