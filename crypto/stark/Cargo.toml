@@ -73,5 +73,9 @@ dwarf-debug-info = false
 omit-default-module-path = false
 
 [[bench]]
+name = "prover_benchmark"
+harness = false
+
+[[bench]]
 name = "lookup_bench"
 harness = false

@@ -6,7 +6,8 @@ use math::field::{
 };
 
 use math::field::fields::fft_friendly::{
-    babybear::Babybear31PrimeField, quartic_babybear::Degree4BabyBearExtensionField,
+    babybear::Babybear31PrimeField, extensions_goldilocks::Degree3GoldilocksExtensionField,
+    quartic_babybear::Degree4BabyBearExtensionField, u64_goldilocks::U64GoldilocksPrimeField,
 };
 
 use crate::traits::AIR;
@@ -17,6 +18,7 @@ use crate::{
         dummy_air::{self, DummyAIR},
         fibonacci_2_cols_shifted::{self, Fibonacci2ColsShifted},
         fibonacci_2_columns::{self, Fibonacci2ColsAIR},
+        fibonacci_multi_column::{self, FibonacciMultiColumnAIR},
         fibonacci_rap::{FibonacciRAP, FibonacciRAPPublicInputs, fibonacci_rap_trace},
         quadratic_air::{self, QuadraticAIR, QuadraticPublicInputs},
         read_only_memory::{ReadOnlyPublicInputs, ReadOnlyRAP, sort_rap_trace},
@@ -547,5 +549,91 @@ fn test_multi_prove_different_airs() {
         &airs,
         &multi_proof,
         &mut StoneProverTranscript::new(&[]),
+    ));
+}
+
+// Type aliases for multi-column Fibonacci tests
+type GoldilocksField = U64GoldilocksPrimeField;
+type GoldilocksExt = Degree3GoldilocksExtensionField;
+type GoldilocksFE = FieldElement<GoldilocksField>;
+
+#[test]
+fn test_multi_column_fibonacci_2_cols() {
+    let proof_options = ProofOptions::default_test_options();
+    let num_columns = 2;
+    let trace_length = 16;
+
+    // Create initial values for each column
+    let initial_values: Vec<(GoldilocksFE, GoldilocksFE)> = (0..num_columns)
+        .map(|i| {
+            (
+                GoldilocksFE::from((i + 1) as u64),
+                GoldilocksFE::from((i + 2) as u64),
+            )
+        })
+        .collect();
+
+    let mut trace = fibonacci_multi_column::compute_trace::<GoldilocksField, GoldilocksExt>(
+        &initial_values,
+        trace_length,
+    );
+    let pub_inputs = fibonacci_multi_column::create_public_inputs(initial_values);
+    let air = FibonacciMultiColumnAIR::<GoldilocksField, GoldilocksExt>::with_num_columns(
+        &proof_options,
+        num_columns,
+    );
+
+    let proof = Prover::<GoldilocksField, GoldilocksExt, _>::prove(
+        &air,
+        &mut trace,
+        &pub_inputs,
+        &mut DefaultTranscript::<GoldilocksExt>::new(&[]),
+    )
+    .unwrap();
+
+    assert!(Verifier::<GoldilocksField, GoldilocksExt, _>::verify(
+        &proof,
+        &air,
+        &mut DefaultTranscript::<GoldilocksExt>::new(&[])
+    ));
+}
+
+#[test]
+fn test_multi_column_fibonacci_4_cols() {
+    let proof_options = ProofOptions::default_test_options();
+    let num_columns = 4;
+    let trace_length = 16;
+
+    let initial_values: Vec<(GoldilocksFE, GoldilocksFE)> = (0..num_columns)
+        .map(|i| {
+            (
+                GoldilocksFE::from((i + 1) as u64),
+                GoldilocksFE::from((i + 2) as u64),
+            )
+        })
+        .collect();
+
+    let mut trace = fibonacci_multi_column::compute_trace::<GoldilocksField, GoldilocksExt>(
+        &initial_values,
+        trace_length,
+    );
+    let pub_inputs = fibonacci_multi_column::create_public_inputs(initial_values);
+    let air = FibonacciMultiColumnAIR::<GoldilocksField, GoldilocksExt>::with_num_columns(
+        &proof_options,
+        num_columns,
+    );
+
+    let proof = Prover::<GoldilocksField, GoldilocksExt, _>::prove(
+        &air,
+        &mut trace,
+        &pub_inputs,
+        &mut DefaultTranscript::<GoldilocksExt>::new(&[]),
+    )
+    .unwrap();
+
+    assert!(Verifier::<GoldilocksField, GoldilocksExt, _>::verify(
+        &proof,
+        &air,
+        &mut DefaultTranscript::<GoldilocksExt>::new(&[])
     ));
 }

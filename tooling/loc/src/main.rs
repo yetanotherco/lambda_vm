@@ -1,13 +1,13 @@
 // Acknowledgement: Lambdaclass Ethrex Team (https://github.com/lambdaclass/ethrex)
 use clap::Parser;
-use report::{LinesOfCodeReport, LinesOfCodeReporterOptions, shell_summary};
-use spinoff::{Color, Spinner, spinners::Dots};
+use report::{shell_summary, LinesOfCodeReport, LinesOfCodeReporterOptions};
+use spinoff::{spinners::Dots, Color, Spinner};
 use std::{collections::HashMap, fs::DirEntry, path::PathBuf};
 use tokei::{Config, Language, LanguageType, Languages};
 
 mod report;
 
-const EXCLUDED: &[&str] = &["tooling", "*target*", "*tests*", "*bench*"];
+const EXCLUDED: &[&str] = &["tooling", "*target*", "*tests*", "*bench*", "*benches*"];
 
 fn count_crates_loc(crates_path: &PathBuf, config: &Config) -> Vec<(String, usize)> {
     let top_level_crate_dirs = std::fs::read_dir(crates_path)
@@ -27,10 +27,7 @@ fn count_crates_loc(crates_path: &PathBuf, config: &Config) -> Vec<(String, usiz
             }
 
             if let Some(crate_loc) = count_loc(crate_path.clone(), config) {
-                Some((
-                    crate_name.to_owned(),
-                    crate_loc.code,
-                ))
+                Some((crate_name.to_owned(), crate_loc.code))
             } else {
                 None
             }

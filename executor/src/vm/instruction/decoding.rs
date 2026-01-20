@@ -164,7 +164,7 @@ pub enum CsrOp {
     CSRRCI,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum Instruction {
     // 64-bit arithmetic (RV64I base)
     Arith {
