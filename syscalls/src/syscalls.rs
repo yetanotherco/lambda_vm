@@ -119,3 +119,36 @@ pub fn sys_halt() -> ! {
 pub fn sys_halt() -> ! {
     unimplemented!("syscalls are only implemented for riscv64 targets");
 }
+
+// =============================================================================
+// Stub implementations for unsupported std functions
+// These functions are required by Rust's std zkvm module but are not supported
+// in Lambda VM. They will panic at runtime if called.
+// =============================================================================
+
+/// # Safety
+///
+/// This function is not supported in Lambda VM.
+/// It will panic if called.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sys_read(_fd: u32, _buf: *mut u8, _nbytes: usize) -> usize {
+    panic!("sys_read is not supported: io::Read for Stdin is not implemented in Lambda VM");
+}
+
+/// # Safety
+///
+/// This function is not supported in Lambda VM.
+/// It will panic if called.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sys_argc() -> usize {
+    panic!("sys_argc is not supported: command-line arguments are not available in Lambda VM");
+}
+
+/// # Safety
+///
+/// This function is not supported in Lambda VM.
+/// It will panic if called.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sys_argv(_buf: *mut u32, _buf_nwords: usize, _arg_idx: usize) -> usize {
+    panic!("sys_argv is not supported: command-line arguments are not available in Lambda VM");
+}
