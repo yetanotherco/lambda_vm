@@ -282,4 +282,3 @@ fn test_ethrex() {
         inputs,
     );
 }
-
