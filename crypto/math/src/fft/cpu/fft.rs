@@ -315,8 +315,10 @@ mod tests {
         }
     }
 
-    fn in_place_nr_2radix_fft_sequential<F, E>(input: &mut [FieldElement<E>], twiddles: &[FieldElement<F>])
-    where
+    fn in_place_nr_2radix_fft_sequential<F, E>(
+        input: &mut [FieldElement<E>],
+        twiddles: &[FieldElement<F>],
+    ) where
         F: IsFFTField + IsSubFieldOf<E>,
         E: IsField,
     {
@@ -324,14 +326,16 @@ mod tests {
         let mut group_size = input.len();
 
         while group_count < input.len() {
-             super::fft_stage_sequential(input, twiddles, group_count, group_size);
-             group_count *= 2;
-             group_size /= 2;
+            super::fft_stage_sequential(input, twiddles, group_count, group_size);
+            group_count *= 2;
+            group_size /= 2;
         }
     }
 
-    fn in_place_nr_4radix_fft_sequential<F, E>(input: &mut [FieldElement<E>], twiddles: &[FieldElement<F>])
-    where
+    fn in_place_nr_4radix_fft_sequential<F, E>(
+        input: &mut [FieldElement<E>],
+        twiddles: &[FieldElement<F>],
+    ) where
         F: IsFFTField + IsSubFieldOf<E>,
         E: IsField,
     {
@@ -339,9 +343,9 @@ mod tests {
         let mut group_size = input.len();
 
         while group_count < input.len() {
-             super::fft4_stage_sequential(input, twiddles, group_count, group_size);
-             group_count *= 4;
-             group_size /= 4;
+            super::fft4_stage_sequential(input, twiddles, group_count, group_size);
+            group_count *= 4;
+            group_size /= 4;
         }
     }
 
