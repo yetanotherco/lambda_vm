@@ -459,6 +459,10 @@ impl Packing {
                     combine_word2l_native(columns[6], columns[7]),
                 ]
             }
+            Packing::QuadWL => {
+                // 4× Direct
+                vec![columns[0], columns[1], columns[2], columns[3]]
+            }
         }
     }
 }

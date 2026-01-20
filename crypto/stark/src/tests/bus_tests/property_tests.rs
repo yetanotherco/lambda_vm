@@ -158,6 +158,7 @@ proptest! {
             Packing::DWordHL,
             Packing::DWordBL,
             Packing::QuadHL,
+            Packing::QuadWL,
         ];
 
         if packing_idx < packings.len() {
