@@ -259,6 +259,46 @@ fn test_quad_hl_equals_four_word2l() {
     assert_eq!(compound_result, manual_result);
 }
 
+#[test]
+fn test_quad_wl() {
+    // 4 words → 4 bus elements (no combining, 4× Direct)
+    // columns: [0x11111111, 0x22222222, 0x33333333, 0x44444444]
+    // Expected: [0x11111111, 0x22222222, 0x33333333, 0x44444444] (pass-through)
+    let words = vec![
+        FE::from(0x11111111u64),
+        FE::from(0x22222222u64),
+        FE::from(0x33333333u64),
+        FE::from(0x44444444u64),
+    ];
+    let combined = Packing::QuadWL.combine(&words);
+    assert_eq!(combined.len(), 4);
+    assert_eq!(combined[0], FE::from(0x11111111u64));
+    assert_eq!(combined[1], FE::from(0x22222222u64));
+    assert_eq!(combined[2], FE::from(0x33333333u64));
+    assert_eq!(combined[3], FE::from(0x44444444u64));
+}
+
+#[test]
+fn test_quad_wl_equals_four_direct() {
+    let words = vec![
+        FE::from(0xAABBCCDDu64),
+        FE::from(0x11223344u64),
+        FE::from(0x55667788u64),
+        FE::from(0x99AABBCCu64),
+    ];
+
+    // Compound
+    let compound_result = Packing::QuadWL.combine(&words);
+
+    // Manual: 4× Direct
+    let mut manual_result = Packing::Direct.combine(&words[0..1]);
+    manual_result.extend(Packing::Direct.combine(&words[1..2]));
+    manual_result.extend(Packing::Direct.combine(&words[2..3]));
+    manual_result.extend(Packing::Direct.combine(&words[3..4]));
+
+    assert_eq!(compound_result, manual_result);
+}
+
 // =============================================================================
 // AIR layout tests
 // =============================================================================
