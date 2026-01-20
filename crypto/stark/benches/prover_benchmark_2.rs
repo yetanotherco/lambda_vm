@@ -29,16 +29,10 @@ impl BenchConfig {
     }
 }
 
-/// Quick benchmark configurations
-const QUICK_CONFIGS: &[BenchConfig] = &[
-    BenchConfig::new("config_1", 8192),
-    BenchConfig::new("config_2", 16384),
-];
-
-/// Thorough benchmark configurations
-const THOROUGH_CONFIGS: &[BenchConfig] = &[
-    BenchConfig::new("config_3", 65536),      // 2^16 = 65.536
-    BenchConfig::new("config_4", 4294967296), // 2^32 = 4.294.967.296
+/// Benchmark configurations
+const CONFIGS: &[BenchConfig] = &[
+    BenchConfig::new("2^13 rows", 8192),    // 2^13 = 8,192
+    BenchConfig::new("2^20 rows", 1048576), // 2^20 = 1,048,576
 ];
 
 /// Creates proof options suitable for benchmarking
@@ -132,35 +126,19 @@ fn bench_verify(c: &mut Criterion, group_name: &str, config: &BenchConfig) {
 }
 
 /// Quick benchmarks
-fn quick_benchmarks(c: &mut Criterion) {
-    for config in QUICK_CONFIGS {
-        bench_prove(c, "quick", config);
-        bench_verify(c, "quick", config);
-    }
-}
-
-/// Thorough benchmarks
-fn thorough_benchmarks(c: &mut Criterion) {
-    for config in THOROUGH_CONFIGS {
-        bench_prove(c, "thorough", config);
-        bench_verify(c, "thorough", config);
+fn multi_air_bench(c: &mut Criterion) {
+    for config in CONFIGS {
+        bench_prove(c, "multi-air", config);
+        bench_verify(c, "multi-air", config);
     }
 }
 
 criterion_group! {
-    name = quick;
+    name = multi_air;
     config = Criterion::default()
         .sample_size(10)
         .measurement_time(std::time::Duration::from_secs(30));
-    targets = quick_benchmarks
+    targets = multi_air_bench
 }
 
-criterion_group! {
-    name = thorough;
-    config = Criterion::default()
-        .sample_size(10)
-        .measurement_time(std::time::Duration::from_secs(60));
-    targets = thorough_benchmarks
-}
-
-criterion_main!(quick);
+criterion_main!(multi_air);
