@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fmt::Debug};
+use std::{collections::HashMap, fmt::Debug};
 
 use crate::vm::{
     instruction::{
@@ -16,7 +16,7 @@ pub struct ReturnValues {
 }
 
 pub fn run_program(
-    instruction_map: BTreeMap<u64, u32>,
+    instruction_map: HashMap<u64, u32>,
     entrypoint: u64,
     private_inputs: Vec<u8>,
 ) -> Result<(ReturnValues, Vec<Log>), ExecutorError> {
@@ -24,12 +24,13 @@ pub fn run_program(
     memory.store_private_inputs(private_inputs)?;
     // Pre-decode all instructions
     let decoded_instructions = predecode_instructions(&instruction_map);
+    let instruction_count = instruction_map.len();
     load_program(instruction_map, &mut memory)?;
-    run_from_entrypoint(&mut memory, entrypoint, &decoded_instructions)
+    run_from_entrypoint(&mut memory, entrypoint, &decoded_instructions, instruction_count)
 }
 
-fn predecode_instructions(instruction_map: &BTreeMap<u64, u32>) -> BTreeMap<u64, Instruction> {
-    let mut decoded = BTreeMap::new();
+fn predecode_instructions(instruction_map: &HashMap<u64, u32>) -> HashMap<u64, Instruction> {
+    let mut decoded = HashMap::new();
     for (&addr, &raw) in instruction_map {
         // Skip addresses that don't contain valid instructions (data sections)
         if let Ok(instr) = Instruction::parse(raw) {
@@ -40,7 +41,7 @@ fn predecode_instructions(instruction_map: &BTreeMap<u64, u32>) -> BTreeMap<u64,
 }
 
 fn load_program(
-    instruction_map: BTreeMap<u64, u32>,
+    instruction_map: HashMap<u64, u32>,
     memory: &mut Memory,
 ) -> Result<(), MemoryError> {
     for (addr, instruction) in instruction_map {
@@ -52,11 +53,13 @@ fn load_program(
 fn run_from_entrypoint(
     memory: &mut Memory,
     entrypoint: u64,
-    decoded_instructions: &BTreeMap<u64, Instruction>,
+    decoded_instructions: &HashMap<u64, Instruction>,
+    instruction_count: usize,
 ) -> Result<(ReturnValues, Vec<Log>), ExecutorError> {
     let mut pc = entrypoint;
     let mut registers = Registers::default();
-    let mut logs = Vec::new();
+    // Pre-Allocate logs with an estimated capacity
+    let mut logs = Vec::with_capacity(instruction_count * 1000);
     while pc != 0 {
         // Use pre-decoded instruction if available, otherwise fall back to parsing
         let instruction = match decoded_instructions.get(&pc) {
