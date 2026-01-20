@@ -538,7 +538,7 @@ multiplicity = "SHIFT"
 kind = "template"
 tag = "ADD"
 input = ["pc", ["cast", ["+", ["*", 2, "c_type_instruction"], ["*", 4, ["not", "c_type_instruction"]]], "DWordWL"]]
-output = ["cast", "DWordWL", "res"]
+output = ["cast", "res", "DWordWL"]
 cond = "JALR"
 
 # TODO: no types available, so no casting yet
