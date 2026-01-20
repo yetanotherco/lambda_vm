@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fmt::Debug};
+use std::{collections::HashMap, fmt::Debug};
 
 use crate::vm::{
     instruction::{
@@ -16,7 +16,7 @@ pub struct ReturnValues {
 }
 
 pub fn run_program(
-    instruction_map: BTreeMap<u64, u32>,
+    instruction_map: HashMap<u64, u32>,
     entrypoint: u64,
     private_inputs: Vec<u8>,
 ) -> Result<(ReturnValues, Vec<Log>), ExecutorError> {
@@ -27,7 +27,7 @@ pub fn run_program(
 }
 
 fn load_program(
-    instruction_map: BTreeMap<u64, u32>,
+    instruction_map: HashMap<u64, u32>,
     memory: &mut Memory,
 ) -> Result<(), MemoryError> {
     for (addr, instruction) in instruction_map {
