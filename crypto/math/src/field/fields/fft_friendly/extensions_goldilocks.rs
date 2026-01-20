@@ -2,8 +2,9 @@ use crate::field::{
     element::FieldElement,
     errors::FieldError,
     fields::fft_friendly::u64_goldilocks::U64GoldilocksPrimeField,
-    traits::{IsField, IsSubFieldOf},
+    traits::{HasDefaultTranscript, IsField, IsSubFieldOf},
 };
+use crate::traits::{AsBytes, ByteConversion};
 
 // =====================================================
 // QUADRATIC EXTENSION (Fp2)
@@ -340,3 +341,78 @@ impl IsSubFieldOf<Degree3GoldilocksExtensionField> for U64GoldilocksPrimeField {
 
 /// Field element type for the cubic extension of Goldilocks
 pub type Fp3E = FieldElement<Degree3GoldilocksExtensionField>;
+
+// =====================================================
+// TRAIT IMPLEMENTATIONS FOR PROVER/VERIFIER
+// =====================================================
+
+impl ByteConversion for FieldElement<Degree3GoldilocksExtensionField> {
+    #[cfg(feature = "alloc")]
+    fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
+        let mut byte_slice = ByteConversion::to_bytes_be(&self.value()[0]);
+        byte_slice.extend(ByteConversion::to_bytes_be(&self.value()[1]));
+        byte_slice.extend(ByteConversion::to_bytes_be(&self.value()[2]));
+        byte_slice
+    }
+
+    #[cfg(feature = "alloc")]
+    fn to_bytes_le(&self) -> alloc::vec::Vec<u8> {
+        let mut byte_slice = ByteConversion::to_bytes_le(&self.value()[0]);
+        byte_slice.extend(ByteConversion::to_bytes_le(&self.value()[1]));
+        byte_slice.extend(ByteConversion::to_bytes_le(&self.value()[2]));
+        byte_slice
+    }
+
+    fn from_bytes_be(bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
+    where
+        Self: Sized,
+    {
+        const BYTES_PER_FIELD: usize = 8;
+        let x0 = FieldElement::from_bytes_be(&bytes[0..BYTES_PER_FIELD])?;
+        let x1 = FieldElement::from_bytes_be(&bytes[BYTES_PER_FIELD..BYTES_PER_FIELD * 2])?;
+        let x2 = FieldElement::from_bytes_be(&bytes[BYTES_PER_FIELD * 2..BYTES_PER_FIELD * 3])?;
+
+        Ok(Self::new([x0, x1, x2]))
+    }
+
+    fn from_bytes_le(bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
+    where
+        Self: Sized,
+    {
+        const BYTES_PER_FIELD: usize = 8;
+        let x0 = FieldElement::from_bytes_le(&bytes[0..BYTES_PER_FIELD])?;
+        let x1 = FieldElement::from_bytes_le(&bytes[BYTES_PER_FIELD..BYTES_PER_FIELD * 2])?;
+        let x2 = FieldElement::from_bytes_le(&bytes[BYTES_PER_FIELD * 2..BYTES_PER_FIELD * 3])?;
+
+        Ok(Self::new([x0, x1, x2]))
+    }
+}
+
+impl AsBytes for FieldElement<Degree3GoldilocksExtensionField> {
+    fn as_bytes(&self) -> alloc::vec::Vec<u8> {
+        self.to_bytes_be()
+    }
+}
+
+impl HasDefaultTranscript for Degree3GoldilocksExtensionField {
+    fn get_random_field_element_from_rng(rng: &mut impl rand::Rng) -> FieldElement<Self> {
+        // Goldilocks prime: p = 2^64 - 2^32 + 1 = 0xFFFFFFFF00000001
+        const MODULUS: u64 = 0xFFFFFFFF00000001;
+
+        let mut sample = [0u8; 8];
+        let mut coeffs = [FpE::zero(), FpE::zero(), FpE::zero()];
+
+        for coeff in &mut coeffs {
+            loop {
+                rng.fill(&mut sample);
+                let int_sample = u64::from_be_bytes(sample);
+                if int_sample < MODULUS {
+                    *coeff = FpE::from(int_sample);
+                    break;
+                }
+            }
+        }
+
+        FieldElement::<Self>::new(coeffs)
+    }
+}

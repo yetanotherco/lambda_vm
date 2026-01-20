@@ -201,6 +201,11 @@ pub enum Packing {
     /// 8 halves → 4 words. **Compound: 4× Word2L.**
     /// Columns: 8, Bus elements: 4
     QuadHL,
+
+    /// 4 words → 4 bus elements. **Compound: 4× Direct.**
+    /// Columns: 4, Bus elements: 4
+    /// Used for MUL table result (128-bit as 4 words).
+    QuadWL,
 }
 
 impl Packing {
@@ -218,6 +223,7 @@ impl Packing {
             Packing::DWordHL => 4,  // 2× Word2L
             Packing::DWordBL => 8,  // 2× Word4L
             Packing::QuadHL => 8,   // 4× Word2L
+            Packing::QuadWL => 4,   // 4× Direct
         }
     }
 
@@ -235,6 +241,7 @@ impl Packing {
             Packing::DWordHL => 2,  // 2× Word2L
             Packing::DWordBL => 2,  // 2× Word4L
             Packing::QuadHL => 4,   // 4× Word2L
+            Packing::QuadWL => 4,   // 4× Direct
         }
     }
 
@@ -351,6 +358,15 @@ impl Packing {
                 result.extend(Packing::Word2L.combine(&columns[2..4]));
                 result.extend(Packing::Word2L.combine(&columns[4..6]));
                 result.extend(Packing::Word2L.combine(&columns[6..8]));
+                result
+            }
+
+            Packing::QuadWL => {
+                // 4× Direct
+                let mut result = Packing::Direct.combine(&columns[0..1]);
+                result.extend(Packing::Direct.combine(&columns[1..2]));
+                result.extend(Packing::Direct.combine(&columns[2..3]));
+                result.extend(Packing::Direct.combine(&columns[3..4]));
                 result
             }
         }
