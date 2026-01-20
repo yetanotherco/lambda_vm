@@ -1,7 +1,7 @@
 [workspace]
 
 [package]
-name = "fibonacci_50"
+name = "bitwise_ops"
 version = "0.1.0"
 edition = "2024"
 
