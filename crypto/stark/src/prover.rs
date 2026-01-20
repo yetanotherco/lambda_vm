@@ -99,8 +99,8 @@ where
     pub(crate) aux: Option<Round1CommitmentData<FieldExtension>>,
     /// The challenges of the RAP round.
     pub(crate) rap_challenges: Vec<FieldElement<FieldExtension>>,
-    /// Bus interaction public inputs (initial and final aux column values for each interaction).
-    pub(crate) bus_interactions: Vec<BusPublicInputs<FieldExtension>>,
+    /// Bus interaction public inputs (initial and final aux column values).
+    pub(crate) bus_public_inputs: Option<BusPublicInputs<FieldExtension>>,
 }
 
 impl<Field, FieldExtension> Round1<Field, FieldExtension>
@@ -402,8 +402,8 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let (aux, aux_evaluations, bus_interactions) = if air.has_trace_interaction() {
-            let bus_interactions = air.build_auxiliary_trace(trace, &rap_challenges);
+        let (aux, aux_evaluations, bus_public_inputs) = if air.has_trace_interaction() {
+            let bus_public_inputs = air.build_auxiliary_trace(trace, &rap_challenges);
             let Some((
                 aux_trace_polys,
                 aux_trace_polys_evaluations,
@@ -418,9 +418,9 @@ pub trait IsStarkProver<
                 lde_trace_merkle_tree: aux_merkle_tree,
                 lde_trace_merkle_root: aux_merkle_root,
             });
-            (aux, aux_trace_polys_evaluations, bus_interactions)
+            (aux, aux_trace_polys_evaluations, bus_public_inputs)
         } else {
-            (None, Vec::new(), Vec::new())
+            (None, Vec::new(), None)
         };
 
         let lde_trace = LDETraceTable::from_columns(
@@ -435,7 +435,7 @@ pub trait IsStarkProver<
             main,
             aux,
             rap_challenges,
-            bus_interactions,
+            bus_public_inputs,
         })
     }
 
@@ -484,17 +484,12 @@ pub trait IsStarkProver<
         FieldElement<FieldExtension>: AsBytes,
     {
         // Compute the evaluations of the composition polynomial on the LDE domain.
-        let bus_interactions = if round_1_result.bus_interactions.is_empty() {
-            None
-        } else {
-            Some(&round_1_result.bus_interactions[..])
-        };
         let trace_length = domain.interpolation_domain_size;
         let evaluator = ConstraintEvaluator::new(
             air,
             pub_inputs,
             &round_1_result.rap_challenges,
-            bus_interactions,
+            round_1_result.bus_public_inputs.as_ref(),
             trace_length,
         );
         let constraint_evaluations = evaluator.evaluate(
@@ -1092,17 +1087,12 @@ pub trait IsStarkProver<
 
         // <<<< Receive challenge: 𝛽
         let beta = transcript.sample_field_element();
-        let bus_interactions = if round_1_result.bus_interactions.is_empty() {
-            None
-        } else {
-            Some(&round_1_result.bus_interactions[..])
-        };
         let trace_length = domain.interpolation_domain_size;
         let num_boundary_constraints = air
             .boundary_constraints(
                 pub_inputs,
                 &round_1_result.rap_challenges,
-                bus_interactions,
+                round_1_result.bus_public_inputs.as_ref(),
                 trace_length,
             )
             .constraints
@@ -1241,7 +1231,7 @@ pub trait IsStarkProver<
             // nonce obtained from grinding
             nonce: round_4_result.nonce,
             // Bus interaction public inputs (for boundary constraints and bus balance check)
-            bus_interactions: round_1_result.bus_interactions.clone(),
+            bus_public_inputs: round_1_result.bus_public_inputs.clone(),
             // Public inputs for boundary constraints
             public_inputs: pub_inputs.clone(),
             trace_length: domain.interpolation_domain_size,
@@ -1251,6 +1241,7 @@ pub trait IsStarkProver<
 
 #[cfg(test)]
 mod tests {
+    use crate::domain::VerifierDomain;
     use std::num::ParseIntError;
 
     fn decode_hex(s: &str) -> Result<Vec<u8>, ParseIntError> {
@@ -1430,7 +1421,7 @@ mod tests {
     fn stone_compatibility_case_1_challenges() -> Challenges<Stark252PrimeField> {
         let (proof, air, _, seed, trace_length) = proof_parts_stone_compatibility_case_1();
 
-        let domain = Domain::new(&air, trace_length);
+        let domain = VerifierDomain::new(&air, trace_length);
         Verifier::step_1_replay_rounds_and_recover_challenges(
             &air,
             &proof,
@@ -1834,7 +1825,7 @@ mod tests {
         let (proof, options, seed) = proof_parts_stone_compatibility_case_2();
 
         let air = Fibonacci2ColsShifted::new(&options);
-        let domain = Domain::new(&air, proof.trace_length);
+        let domain = VerifierDomain::new(&air, proof.trace_length);
         Verifier::step_1_replay_rounds_and_recover_challenges(
             &air,
             &proof,

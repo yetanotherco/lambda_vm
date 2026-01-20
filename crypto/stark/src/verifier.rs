@@ -1,6 +1,6 @@
 use super::{
     config::BatchedMerkleTreeBackend,
-    domain::Domain,
+    domain::VerifierDomain,
     fri::fri_decommit::FriDecommitment,
     grinding,
     proof::stark::StarkProof,
@@ -8,7 +8,7 @@ use super::{
 };
 use crate::{
     config::Commitment,
-    domain::new_domain,
+    domain::new_verifier_domain,
     lookup::LOGUP_NUM_CHALLENGES,
     proof::stark::{DeepPolynomialOpening, MultiProof},
 };
@@ -82,10 +82,10 @@ pub trait IsStarkVerifier<
 {
     fn sample_query_indexes(
         number_of_queries: usize,
-        domain: &Domain<Field>,
+        domain: &VerifierDomain<Field>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
     ) -> Vec<usize> {
-        let domain_size = domain.lde_roots_of_unity_coset.len() as u64;
+        let domain_size = domain.lde_length as u64;
         (0..number_of_queries)
             .map(|_| (transcript.sample_u64(domain_size >> 1)) as usize)
             .collect::<Vec<usize>>()
@@ -95,7 +95,7 @@ pub trait IsStarkVerifier<
     fn step_1_replay_rounds_and_recover_challenges(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         proof: &StarkProof<Field, FieldExtension, PI>,
-        domain: &Domain<Field>,
+        domain: &VerifierDomain<Field>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
     ) -> Challenges<FieldExtension>
     where
@@ -121,17 +121,12 @@ pub trait IsStarkVerifier<
 
         // <<<< Receive challenge: 𝛽
         let beta = transcript.sample_field_element();
-        let bus_interactions = if proof.bus_interactions.is_empty() {
-            None
-        } else {
-            Some(&proof.bus_interactions[..])
-        };
         let trace_length = proof.trace_length;
         let num_boundary_constraints = air
             .boundary_constraints(
                 &proof.public_inputs,
                 &rap_challenges,
-                bus_interactions,
+                proof.bus_public_inputs.as_ref(),
                 trace_length,
             )
             .constraints
@@ -154,9 +149,10 @@ pub trait IsStarkVerifier<
         // ===================================
 
         // >>>> Send challenge: z
-        let z = transcript.sample_z_ood(
-            &domain.lde_roots_of_unity_coset,
-            &domain.trace_roots_of_unity,
+        let z = transcript.sample_z_ood_with_domain_params(
+            domain.trace_length,
+            domain.lde_length,
+            &domain.coset_offset,
         );
 
         // <<<< Receive values: tⱼ(zgᵏ)
@@ -249,19 +245,14 @@ pub trait IsStarkVerifier<
     fn step_2_verify_claimed_composition_polynomial(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         proof: &StarkProof<Field, FieldExtension, PI>,
-        domain: &Domain<Field>,
+        domain: &VerifierDomain<Field>,
         challenges: &Challenges<FieldExtension>,
     ) -> bool {
-        let bus_interactions = if proof.bus_interactions.is_empty() {
-            None
-        } else {
-            Some(&proof.bus_interactions[..])
-        };
         let trace_length = proof.trace_length;
         let boundary_constraints = air.boundary_constraints(
             &proof.public_inputs,
             &challenges.rap_challenges,
-            bus_interactions,
+            proof.bus_public_inputs.as_ref(),
             trace_length,
         );
         let number_of_b_constraints = boundary_constraints.constraints.len();
@@ -360,7 +351,7 @@ pub trait IsStarkVerifier<
     /// FRI decommitments are valid and correspond to the Deep composition polynomial.
     fn step_3_verify_fri(
         proof: &StarkProof<Field, FieldExtension, PI>,
-        domain: &Domain<Field>,
+        domain: &VerifierDomain<Field>,
         challenges: &Challenges<FieldExtension>,
     ) -> bool
     where
@@ -403,21 +394,19 @@ pub trait IsStarkVerifier<
     /// Returns the field element element of the domain `domain` corresponding to the given FRI query index challenge `iota`.
     fn query_challenge_to_evaluation_point(
         iota: usize,
-        domain: &Domain<Field>,
+        domain: &VerifierDomain<Field>,
     ) -> FieldElement<Field> {
-        domain.lde_roots_of_unity_coset
-            [reverse_index(iota * 2, domain.lde_roots_of_unity_coset.len() as u64)]
-        .clone()
+        let index = reverse_index(iota * 2, domain.lde_length as u64);
+        domain.lde_coset_element(index)
     }
 
     /// Returns the symmetric field element element of the domain `domain` corresponding to the given FRI query index challenge `iota`.
     fn query_challenge_to_evaluation_point_sym(
         iota: usize,
-        domain: &Domain<Field>,
+        domain: &VerifierDomain<Field>,
     ) -> FieldElement<Field> {
-        domain.lde_roots_of_unity_coset
-            [reverse_index(iota * 2 + 1, domain.lde_roots_of_unity_coset.len() as u64)]
-        .clone()
+        let index = reverse_index(iota * 2 + 1, domain.lde_length as u64);
+        domain.lde_coset_element(index)
     }
 
     /// Verifies the validity of the opening proof.
@@ -649,7 +638,7 @@ pub trait IsStarkVerifier<
 
     fn reconstruct_deep_composition_poly_evaluations_for_all_queries(
         challenges: &Challenges<FieldExtension>,
-        domain: &Domain<Field>,
+        domain: &VerifierDomain<Field>,
         proof: &StarkProof<Field, FieldExtension, PI>,
     ) -> DeepPolynomialEvaluations<FieldExtension> {
         let mut deep_poly_evaluations = Vec::new();
@@ -828,26 +817,23 @@ pub trait IsStarkVerifier<
         }
 
         // =====================================================================
-        // Bus Balance Check: Σ sender_values - Σ receiver_values = 0
+        // Bus Balance Check: Σ accumulated_values = 0
         // =====================================================================
-        // For LogUp, the sum of sender contributions minus receiver contributions must equal zero.
-        // This ensures that every value "sent" on the bus was "received" exactly once.
+        // For LogUp, each table has one accumulated column that sums all its terms.
+        // The sign (sender vs receiver) is already baked into the accumulated values,
+        // so the bus balances when the sum of all accumulated values equals zero.
 
         if needs_logup_challenges {
             let mut total = FieldElement::<FieldExtension>::zero();
             for proof in &multi_proof.proofs {
-                for interaction in &proof.bus_interactions {
-                    if interaction.is_sender {
-                        total = total + &interaction.final_accumulated;
-                    } else {
-                        total = total - &interaction.final_accumulated;
-                    }
+                if let Some(interaction) = &proof.bus_public_inputs {
+                    total = total + &interaction.final_accumulated;
                 }
             }
 
             if total != FieldElement::zero() {
                 #[cfg(not(feature = "test_fiat_shamir"))]
-                error!("LogUp bus does not balance: sender and receiver values do not match");
+                error!("LogUp bus does not balance: sum of accumulated values is not zero");
                 return false;
             }
         }
@@ -876,7 +862,7 @@ pub trait IsStarkVerifier<
     fn replay_rounds_after_round_1(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         proof: &StarkProof<Field, FieldExtension, PI>,
-        domain: &Domain<Field>,
+        domain: &VerifierDomain<Field>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
         rap_challenges: Vec<FieldElement<FieldExtension>>,
     ) -> Challenges<FieldExtension>
@@ -890,17 +876,12 @@ pub trait IsStarkVerifier<
 
         // <<<< Receive challenge: 𝛽
         let beta = transcript.sample_field_element();
-        let bus_interactions = if proof.bus_interactions.is_empty() {
-            None
-        } else {
-            Some(&proof.bus_interactions[..])
-        };
         let trace_length = proof.trace_length;
         let num_boundary_constraints = air
             .boundary_constraints(
                 &proof.public_inputs,
                 &rap_challenges,
-                bus_interactions,
+                proof.bus_public_inputs.as_ref(),
                 trace_length,
             )
             .constraints
@@ -923,9 +904,10 @@ pub trait IsStarkVerifier<
         // ===================================
 
         // >>>> Send challenge: z
-        let z = transcript.sample_z_ood(
-            &domain.lde_roots_of_unity_coset,
-            &domain.trace_roots_of_unity,
+        let z = transcript.sample_z_ood_with_domain_params(
+            domain.trace_length,
+            domain.lde_length,
+            &domain.coset_offset,
         );
 
         // <<<< Receive values: tⱼ(zgᵏ)
@@ -1023,7 +1005,7 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        let domain = new_domain(air, proof.trace_length);
+        let domain = new_verifier_domain(air, proof.trace_length);
 
         // Verify there are enough queries
         if proof.query_list.len() < air.options().fri_number_of_queries {

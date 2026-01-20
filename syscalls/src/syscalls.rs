@@ -1,8 +1,11 @@
+#[cfg(target_arch = "riscv64")]
 use core::arch::asm;
 
+#[cfg(target_arch = "riscv64")]
 // TODO: This should be properly defined
-const MAX_PRIVATE_INPUT_SIZE: usize = 1024;
+const MAX_PRIVATE_INPUT_SIZE: usize = 6700000;
 
+#[cfg(target_arch = "riscv64")]
 enum SyscallNumbers {
     Print = 1,
     Panic = 2,
@@ -11,19 +14,23 @@ enum SyscallNumbers {
     Halt = 5,
 }
 
+#[cfg(target_arch = "riscv64")]
 /// This is a template for printing in the vm
 pub fn print_string(s: &str) {
     unsafe {
         asm!(
-            "mv a0, {ptr}",
-            "mv a1, {len}",
-            "mv a7, {syscall_number}", // syscall number for print
             "ecall",
-            ptr = in(reg) s.as_ptr(),
-            len = in(reg) s.len(),
-            syscall_number = in(reg) SyscallNumbers::Print as usize,
+            in("a0") s.as_ptr(),
+            in("a1") s.len(),
+            in("a7") SyscallNumbers::Print as usize,
         );
     }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+/// This is a template for printing in the vm
+pub fn print_string(_: &str) {
+    unimplemented!("syscalls are only implemented for riscv64 targets");
 }
 
 /// # Safety
@@ -38,6 +45,7 @@ pub unsafe extern "C" fn sys_write(_fildes: i32, buf: *const u8, size: usize) ->
     size.try_into().unwrap_or(-1)
 }
 
+#[cfg(target_arch = "riscv64")]
 /// # Safety
 ///
 /// This function should not be called by the user
@@ -47,42 +55,36 @@ pub unsafe extern "C" fn sys_panic(msg_ptr: *const u8, len: usize) {
     print_string("Sys panic called\n");
     unsafe {
         asm!(
-            "mv a0, {ptr}",
-            "mv a1, {len}",
-            "mv a7, {syscall_number}", // syscall number for panic
             "ecall",
-            ptr = in(reg) msg_ptr,
-            len = in(reg) len,
-            syscall_number = in(reg) SyscallNumbers::Panic as usize,
+            in("a0") msg_ptr,
+            in("a1") len,
+            in("a7") SyscallNumbers::Panic as usize,
         )
     }
 }
 
+#[cfg(target_arch = "riscv64")]
 pub fn commit(slice: &[u8]) {
     print_string("commit called\n");
     unsafe {
         asm!(
-            "mv a0, {ptr}",
-            "mv a1, {len}",
-            "mv a7, {syscall_number}", // syscall number for commit
             "ecall",
-            ptr = in(reg) slice.as_ptr(),
-            len = in(reg) slice.len(),
-            syscall_number = in(reg) SyscallNumbers::Commit as usize,
+            in("a0") slice.as_ptr(),
+            in("a1") slice.len(),
+            in("a7") SyscallNumbers::Commit as usize,
         )
     }
 }
 
+#[cfg(target_arch = "riscv64")]
 pub fn get_private_input() -> Result<Vec<u8>, SyscallError> {
     print_string("get_private_input called\n");
     let mut dest = vec![0u8; MAX_PRIVATE_INPUT_SIZE];
     unsafe {
         asm!(
-            "mv a0, {ptr}",
-            "mv a7, {syscall_number}", // syscall number for get_private_input
             "ecall",
-            ptr = in(reg) dest.as_mut_ptr(),
-            syscall_number = in(reg) SyscallNumbers::GetPrivateInputs as usize,
+            in("a0") dest.as_mut_ptr(),
+            in("a7") SyscallNumbers::GetPrivateInputs as usize,
         )
     }
     let len = u32::from_le_bytes(
@@ -96,20 +98,24 @@ pub fn get_private_input() -> Result<Vec<u8>, SyscallError> {
     Ok(dest)
 }
 
-#[derive(thiserror::Error, Debug)]
+#[derive(Debug)]
 pub enum SyscallError {
-    #[error("Wrong private input size")]
     WrongPrivateInputSize,
 }
 
+#[cfg(target_arch = "riscv64")]
 pub fn sys_halt() -> ! {
     print_string("sys_halt called\n");
     unsafe {
         asm!(
-            "mv a7, {syscall_number}", // syscall number for halt
             "ecall",
-            syscall_number = in(reg) SyscallNumbers::Halt as usize,
+            in("a7") SyscallNumbers::Halt as usize,
         );
     }
     unreachable!()
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+pub fn sys_halt() -> ! {
+    unimplemented!("syscalls are only implemented for riscv64 targets");
 }

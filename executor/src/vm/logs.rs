@@ -11,13 +11,13 @@ pub struct Log {
     /// Executed Instruction
     pub instruction: Instruction,
     /// PC before instruction execution
-    pub current_pc: u32,
+    pub current_pc: u64,
     /// PC after instruction execution
-    pub next_pc: u32,
+    pub next_pc: u64,
     /// Value of src1 register before execution (if used by the instruction)
-    pub src1_val: u32,
+    pub src1_val: u64,
     /// Value of src2 register before execution (if used by the instruction)
-    pub src2_val: u32,
+    pub src2_val: u64,
     /// Value of dst register after execution (if used by the instruction)
-    pub dst_val: u32,
+    pub dst_val: u64,
 }
