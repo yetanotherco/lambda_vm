@@ -53,7 +53,7 @@ desc = "the *fully extended (!)* 64-bit version of the immediate."
 [[variables.output]]
 name = "signed"
 type = "Bit"
-desc = "selector used to indicate signed or unsigned input interpretation. Currently, this is used to choose between <TODO>."
+desc = "selector used to indicate signed or unsigned input interpretation."
 
 [[variables.output]]
 name = "mp_selector"
