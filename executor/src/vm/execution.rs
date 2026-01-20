@@ -26,7 +26,12 @@ pub fn run_program(
     let decoded_instructions = predecode_instructions(&instruction_map);
     let instruction_count = instruction_map.len();
     load_program(instruction_map, &mut memory)?;
-    run_from_entrypoint(&mut memory, entrypoint, &decoded_instructions, instruction_count)
+    run_from_entrypoint(
+        &mut memory,
+        entrypoint,
+        &decoded_instructions,
+        instruction_count,
+    )
 }
 
 fn predecode_instructions(instruction_map: &HashMap<u64, u32>) -> HashMap<u64, Instruction> {
