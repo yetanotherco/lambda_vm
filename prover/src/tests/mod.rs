@@ -11,6 +11,10 @@ pub mod constraints64_tests;
 #[cfg(test)]
 pub mod cpu_tests;
 #[cfg(test)]
+pub mod cpu_vm_tests;
+#[cfg(test)]
 pub mod lt_bus_tests;
 #[cfg(test)]
 pub mod lt_tests;
+#[cfg(test)]
+pub mod vm_prover_tests;

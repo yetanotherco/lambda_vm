@@ -28,12 +28,16 @@
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::TransitionConstraint;
-use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
+use stark::lookup::BusInteraction;
+// TODO: Re-enable when bus interactions are wired
+// use stark::lookup::{BusValue, Multiplicity, Packing};
 use stark::table::TableView;
 use stark::trace::TraceTable;
 use stark::traits::TransitionEvaluationContext;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16, SHIFT_32};
+use super::types::{FE, GoldilocksExtension, GoldilocksField, SHIFT_16, SHIFT_32};
+// TODO: Re-enable when bus interactions are wired
+// use super::types::BusId;
 
 // =========================================================================
 // Column indices for LT table
@@ -203,123 +207,23 @@ pub fn generate_lt_trace(
 /// Creates all bus interactions for the LT table.
 ///
 /// The LT table:
-/// - **Sends** MSB16 lookups for lhs_msb and rhs_msb extraction
-/// - **Sends** IS_HALFWORD lookups for lhs_sub_rhs range checks
-/// - **Receives** LT lookups from other tables (CPU)
+/// - **Sends** MSB16 lookups for lhs_msb and rhs_msb extraction (TODO: needs Bitwise receiver)
+/// - **Sends** IS_HALFWORD lookups for lhs_sub_rhs range checks (TODO: needs Bitwise receiver)
+/// - **Receives** LT lookups from other tables (CPU) (TODO: needs CPU sender with DWordHHW packing)
+///
+/// For now, bus interactions are disabled until CPU sender is properly implemented
+/// and Bitwise receivers for MSB16/IS_HALFWORD are wired.
 pub fn bus_interactions() -> Vec<BusInteraction> {
     vec![
+        // TODO: Re-add when Bitwise table receives MSB16
         // MSB16[lhs[2]] -> lhs_msb
-        // Input: lhs[2] (half containing MSB)
-        // Output: lhs_msb
-        BusInteraction::sender(
-            BusId::Msb16,
-            Multiplicity::Column(cols::MU),
-            vec![
-                BusValue::Packed {
-                    start_column: cols::LHS_2,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::LHS_MSB,
-                    packing: Packing::Direct,
-                },
-            ],
-        ),
         // MSB16[rhs[2]] -> rhs_msb
-        BusInteraction::sender(
-            BusId::Msb16,
-            Multiplicity::Column(cols::MU),
-            vec![
-                BusValue::Packed {
-                    start_column: cols::RHS_2,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::RHS_MSB,
-                    packing: Packing::Direct,
-                },
-            ],
-        ),
-        // IS_HALFWORD[lhs_sub_rhs[0]]
-        BusInteraction::sender(
-            BusId::IsHalfword,
-            Multiplicity::Column(cols::MU),
-            vec![BusValue::Packed {
-                start_column: cols::LHS_SUB_RHS_0,
-                packing: Packing::Direct,
-            }],
-        ),
-        // IS_HALFWORD[lhs_sub_rhs[1]]
-        BusInteraction::sender(
-            BusId::IsHalfword,
-            Multiplicity::Column(cols::MU),
-            vec![BusValue::Packed {
-                start_column: cols::LHS_SUB_RHS_1,
-                packing: Packing::Direct,
-            }],
-        ),
-        // IS_HALFWORD[lhs_sub_rhs[2]]
-        BusInteraction::sender(
-            BusId::IsHalfword,
-            Multiplicity::Column(cols::MU),
-            vec![BusValue::Packed {
-                start_column: cols::LHS_SUB_RHS_2,
-                packing: Packing::Direct,
-            }],
-        ),
-        // IS_HALFWORD[lhs_sub_rhs[3]]
-        BusInteraction::sender(
-            BusId::IsHalfword,
-            Multiplicity::Column(cols::MU),
-            vec![BusValue::Packed {
-                start_column: cols::LHS_SUB_RHS_3,
-                packing: Packing::Direct,
-            }],
-        ),
+
+        // TODO: Re-add when Bitwise table receives IS_HALFWORD
+        // IS_HALFWORD[lhs_sub_rhs[0..3]]
+
+        // TODO: Re-add when CPU sends with proper DWordHHW packing
         // LT[lhs, rhs, signed] -> lt (receiver)
-        // lhs is DWordHHW, rhs is DWordHHW, signed is Bit, lt is Bit
-        BusInteraction::receiver(
-            BusId::Lt,
-            Multiplicity::Column(cols::MU),
-            vec![
-                // lhs as DWordHHW (3 elements: Word, Half, Half)
-                BusValue::Packed {
-                    start_column: cols::LHS_0,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::LHS_1,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::LHS_2,
-                    packing: Packing::Direct,
-                },
-                // rhs as DWordHHW (3 elements)
-                BusValue::Packed {
-                    start_column: cols::RHS_0,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::RHS_1,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::RHS_2,
-                    packing: Packing::Direct,
-                },
-                // signed
-                BusValue::Packed {
-                    start_column: cols::SIGNED,
-                    packing: Packing::Direct,
-                },
-                // lt (output)
-                BusValue::Packed {
-                    start_column: cols::LT,
-                    packing: Packing::Direct,
-                },
-            ],
-        ),
     ]
 }
 

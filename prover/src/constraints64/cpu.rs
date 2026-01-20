@@ -69,9 +69,7 @@ pub const BIT_FLAG_COLUMNS: &[usize] = &[
 /// Creates all IS_BIT constraints for CPU flag columns.
 ///
 /// Returns the constraints and the next available constraint index.
-pub fn create_is_bit_constraints(
-    constraint_idx_start: usize,
-) -> (Vec<IsBitConstraint>, usize) {
+pub fn create_is_bit_constraints(constraint_idx_start: usize) -> (Vec<IsBitConstraint>, usize) {
     super::templates::new_is_bit_constraints(BIT_FLAG_COLUMNS, constraint_idx_start)
 }
 
@@ -86,9 +84,7 @@ pub fn create_is_bit_constraints(
 /// - LOAD/STORE: base_address + offset = effective_address (in res)
 ///
 /// Returns the constraints and the next available constraint index.
-pub fn create_add_constraints(
-    constraint_idx_start: usize,
-) -> (Vec<AddConstraint>, usize) {
+pub fn create_add_constraints(constraint_idx_start: usize) -> (Vec<AddConstraint>, usize) {
     // For ADD operations, we compute: arg1 + arg2 = res
     // All operands are DWordBL (8 bytes), need to cast to DWordWL (2 words)
 
@@ -101,13 +97,7 @@ pub fn create_add_constraints(
     let rhs = AddOperand::from_dword_bl(cols::ARG2_0);
     let sum = AddOperand::from_dword_bl(cols::RES_0);
 
-    let (add_c0, add_c1) = AddConstraint::new_pair(
-        cols::ADD,
-        lhs,
-        rhs,
-        sum,
-        constraint_idx_start,
-    );
+    let (add_c0, add_c1) = AddConstraint::new_pair(cols::ADD, lhs, rhs, sum, constraint_idx_start);
 
     (vec![add_c0, add_c1], constraint_idx_start + 2)
 }
@@ -141,10 +131,14 @@ impl BranchCondConstraint {
         let jalr = step.get_main_evaluation_element(0, cols::JALR).clone();
         let blt = step.get_main_evaluation_element(0, cols::BLT).clone();
         let beq = step.get_main_evaluation_element(0, cols::BEQ).clone();
-        let mp_selector = step.get_main_evaluation_element(0, cols::MP_SELECTOR).clone();
+        let mp_selector = step
+            .get_main_evaluation_element(0, cols::MP_SELECTOR)
+            .clone();
         let res_0 = step.get_main_evaluation_element(0, cols::RES_0).clone();
         let is_equal = step.get_main_evaluation_element(0, cols::IS_EQUAL).clone();
-        let branch_cond = step.get_main_evaluation_element(0, cols::BRANCH_COND).clone();
+        let branch_cond = step
+            .get_main_evaluation_element(0, cols::BRANCH_COND)
+            .clone();
 
         let two = FieldElement::<F>::from(2u64);
 
@@ -385,9 +379,13 @@ impl Arg1UpperConstraint {
         let rv1_2 = step.get_main_evaluation_element(0, cols::RV1_2).clone();
         let rv1_upper = rv1_1 + rv1_2 * shift_16;
 
-        let word_instr = step.get_main_evaluation_element(0, cols::WORD_INSTR).clone();
+        let word_instr = step
+            .get_main_evaluation_element(0, cols::WORD_INSTR)
+            .clone();
         let signed = step.get_main_evaluation_element(0, cols::SIGNED).clone();
-        let rv1_sign_bit = step.get_main_evaluation_element(0, cols::RV1_SIGN_BIT).clone();
+        let rv1_sign_bit = step
+            .get_main_evaluation_element(0, cols::RV1_SIGN_BIT)
+            .clone();
 
         let one = FieldElement::<F>::one();
         let mask_32: FieldElement<F> = FieldElement::from((1u64 << 32) - 1); // 2^32 - 1
@@ -457,7 +455,10 @@ pub struct SltResZeroConstraint {
 impl SltResZeroConstraint {
     pub fn new(byte_idx: usize, constraint_idx: usize) -> Self {
         assert!(byte_idx >= 1 && byte_idx <= 7);
-        Self { byte_idx, constraint_idx }
+        Self {
+            byte_idx,
+            constraint_idx,
+        }
     }
 
     fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
@@ -467,7 +468,9 @@ impl SltResZeroConstraint {
     {
         let slt = step.get_main_evaluation_element(0, cols::SLT).clone();
         let blt = step.get_main_evaluation_element(0, cols::BLT).clone();
-        let res_i = step.get_main_evaluation_element(0, cols::RES[self.byte_idx]).clone();
+        let res_i = step
+            .get_main_evaluation_element(0, cols::RES[self.byte_idx])
+            .clone();
 
         // (SLT + BLT) * res[i] = 0
         (slt + blt) * res_i
@@ -547,10 +550,18 @@ impl SignBitZeroConstraint {
         F: IsSubFieldOf<E>,
         E: IsField,
     {
-        let rv1_sign_bit = step.get_main_evaluation_element(0, cols::RV1_SIGN_BIT).clone();
-        let arg2_sign_bit = step.get_main_evaluation_element(0, cols::ARG2_SIGN_BIT).clone();
-        let res_sign_bit = step.get_main_evaluation_element(0, cols::RES_SIGN_BIT).clone();
-        let word_instr = step.get_main_evaluation_element(0, cols::WORD_INSTR).clone();
+        let rv1_sign_bit = step
+            .get_main_evaluation_element(0, cols::RV1_SIGN_BIT)
+            .clone();
+        let arg2_sign_bit = step
+            .get_main_evaluation_element(0, cols::ARG2_SIGN_BIT)
+            .clone();
+        let res_sign_bit = step
+            .get_main_evaluation_element(0, cols::RES_SIGN_BIT)
+            .clone();
+        let word_instr = step
+            .get_main_evaluation_element(0, cols::WORD_INSTR)
+            .clone();
 
         let one = FieldElement::<F>::one();
 
@@ -619,7 +630,10 @@ pub struct NextPcAddConstraint {
 impl NextPcAddConstraint {
     pub fn new(carry_idx: usize, constraint_idx: usize) -> Self {
         assert!(carry_idx <= 1);
-        Self { carry_idx, constraint_idx }
+        Self {
+            carry_idx,
+            constraint_idx,
+        }
     }
 
     /// Creates constraints for both carries.
@@ -638,7 +652,9 @@ impl NextPcAddConstraint {
     {
         let pc_lo = step.get_main_evaluation_element(0, cols::PC_0).clone();
         let next_pc_lo = step.get_main_evaluation_element(0, cols::NEXT_PC_0).clone();
-        let c_type = step.get_main_evaluation_element(0, cols::C_TYPE_INSTRUCTION).clone();
+        let c_type = step
+            .get_main_evaluation_element(0, cols::C_TYPE_INSTRUCTION)
+            .clone();
 
         // instr_size = 4 - 2 * c_type_instruction
         let four: FieldElement<F> = FieldElement::from(4u64);
@@ -646,7 +662,9 @@ impl NextPcAddConstraint {
         let instr_size = four - two * c_type;
 
         // carry_0 = (pc_lo + instr_size - next_pc_lo) * 2^(-32)
-        let inv_2_32: FieldElement<F> = FieldElement::from(super::templates::SHIFT_32).inv().unwrap();
+        let inv_2_32: FieldElement<F> = FieldElement::from(super::templates::SHIFT_32)
+            .inv()
+            .unwrap();
         (pc_lo + instr_size - next_pc_lo) * inv_2_32
     }
 
@@ -662,7 +680,9 @@ impl NextPcAddConstraint {
 
         // rhs_hi = 0 (instruction size fits in low word)
         // carry_1 = (pc_hi + 0 + carry_0 - next_pc_hi) * 2^(-32)
-        let inv_2_32: FieldElement<F> = FieldElement::from(super::templates::SHIFT_32).inv().unwrap();
+        let inv_2_32: FieldElement<F> = FieldElement::from(super::templates::SHIFT_32)
+            .inv()
+            .unwrap();
         (pc_hi + carry_0 - next_pc_hi) * inv_2_32
     }
 
@@ -671,7 +691,9 @@ impl NextPcAddConstraint {
         F: IsSubFieldOf<E>,
         E: IsField,
     {
-        let branch_cond = step.get_main_evaluation_element(0, cols::BRANCH_COND).clone();
+        let branch_cond = step
+            .get_main_evaluation_element(0, cols::BRANCH_COND)
+            .clone();
         let one = FieldElement::<F>::one();
         let not_branch = one - branch_cond;
 
@@ -766,7 +788,8 @@ pub fn create_all_cpu_constraints() -> (
     next_idx = next;
 
     // Other constraints
-    let mut other: Vec<Box<dyn TransitionConstraint<GoldilocksField, GoldilocksExtension>>> = Vec::new();
+    let mut other: Vec<Box<dyn TransitionConstraint<GoldilocksField, GoldilocksExtension>>> =
+        Vec::new();
 
     // Branch condition
     other.push(Box::new(BranchCondConstraint::new(next_idx)));

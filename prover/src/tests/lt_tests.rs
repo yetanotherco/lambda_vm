@@ -162,6 +162,8 @@ fn test_multiplicity_different_signed_flags() {
 #[test]
 fn test_bus_interactions_count() {
     let interactions = bus_interactions();
-    // MSB16 x2 + IS_HALFWORD x4 + LT x1 = 7 interactions
-    assert_eq!(interactions.len(), 7);
+    // All interactions disabled for now until:
+    // - CPU sends LT with proper DWordHHW packing
+    // - Bitwise receives MSB16 and IS_HALFWORD
+    assert_eq!(interactions.len(), 0);
 }

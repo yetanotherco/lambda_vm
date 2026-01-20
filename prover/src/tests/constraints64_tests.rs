@@ -545,10 +545,10 @@ fn test_dword_bl_repack_formula() {
 // =========================================================================
 
 use crate::constraints64::cpu::{
-    BIT_FLAG_COLUMNS, NUM_CPU_CONSTRAINTS,
-    create_is_bit_constraints, create_add_constraints, create_slt_res_zero_constraints,
-    BranchCondConstraint, EbreakConstraint, Arg1LowerConstraint, Arg1UpperConstraint,
-    SignBitZeroConstraint, NextPcAddConstraint, create_all_cpu_constraints,
+    Arg1LowerConstraint, Arg1UpperConstraint, BIT_FLAG_COLUMNS, BranchCondConstraint,
+    EbreakConstraint, NUM_CPU_CONSTRAINTS, NextPcAddConstraint, SignBitZeroConstraint,
+    create_add_constraints, create_all_cpu_constraints, create_is_bit_constraints,
+    create_slt_res_zero_constraints,
 };
 use crate::tables64::cpu::cols as cpu_cols;
 
@@ -680,7 +680,12 @@ fn test_cpu_constraint_indices_are_unique() {
     // Check no duplicates
     indices.sort();
     for i in 1..indices.len() {
-        assert_ne!(indices[i], indices[i-1], "Duplicate constraint index: {}", indices[i]);
+        assert_ne!(
+            indices[i],
+            indices[i - 1],
+            "Duplicate constraint index: {}",
+            indices[i]
+        );
     }
 
     // Check sequential
