@@ -27,7 +27,7 @@ The below table illustrates how each instruction should be expressed in the deco
 The columns of the table represent the following:
 - *`operation`*: the assembly operation being encoded,
 - *`op-flag`*: which of the "`ALU` selector flags" operation flags to set. Each operation sets exactly one.
-- *`w_reg`*, *`w_inst`*, *`signed`*: whether to set the `write_register`, `word_inst` or `signed` flag, respectively,
+- *`w_reg`*, *`w_instr`*, *`signed`*: whether to set the `write_register`, `word_instr` or `signed` flag, respectively,
 - *other*: the other flags that should be set or variables that should be given specific values.
 
 For the purpose of brevity and readability, the table uses the following rules-of-thumb:
