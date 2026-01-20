@@ -83,10 +83,10 @@ fn test_trace_generation() {
 fn test_multiplicity_aggregation() {
     // Create 5 operations where (5, 10, UNSIGNED) appears 3 times
     let ops = vec![
-        LtOperation::new(5, 10, UNSIGNED),   // appears 1st time
+        LtOperation::new(5, 10, UNSIGNED), // appears 1st time
         LtOperation::new(100, 200, UNSIGNED),
-        LtOperation::new(5, 10, UNSIGNED),   // appears 2nd time
-        LtOperation::new(5, 10, UNSIGNED),   // appears 3rd time
+        LtOperation::new(5, 10, UNSIGNED),    // appears 2nd time
+        LtOperation::new(5, 10, UNSIGNED),    // appears 3rd time
         LtOperation::new(100, 200, UNSIGNED), // duplicate
     ];
 
