@@ -41,10 +41,10 @@ const QUICK_CONFIGS: &[BenchConfig] = &[
 
 /// Thorough benchmark configurations
 const THOROUGH_CONFIGS: &[BenchConfig] = &[
-    //BenchConfig::new("fib_8col_16k", 8, 16384),
+    BenchConfig::new("fib_8col_16k", 8, 16384),
     BenchConfig::new("fib_12col_16k", 12, 16384),
-    //BenchConfig::new("fib_16col_8k", 16, 8192),
-    //BenchConfig::new("fib_16col_16k", 16, 16384),
+    BenchConfig::new("fib_16col_8k", 16, 8192),
+    BenchConfig::new("fib_16col_16k", 16, 16384),
 ];
 
 /// Creates initial values for the specified number of columns
