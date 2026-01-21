@@ -23,7 +23,7 @@ use stark::traits::TransitionEvaluationContext;
 use crate::tables64::cpu::cols;
 use crate::tables64::types::{GoldilocksExtension, GoldilocksField};
 
-use super::templates::{AddConstraint, AddOperand, IsBitConstraint};
+use super::templates::{AddConstraint, AddLinearTerm, AddOperand, IsBitConstraint};
 
 // =========================================================================
 // CPU Constraint Collection
@@ -1089,126 +1089,69 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RvdUpperCons
 
 /// Creates SUB constraints for the CPU table.
 ///
-/// Active when SUB + BEQ = 1.
-/// Verifies: arg1 - arg2 = res (with borrow handling via carry)
+/// SUB template is used when: SUB + BEQ > 0
+/// - SUB: res = arg1 - arg2
+/// - BEQ: computes arg1 - arg2 to check equality (res = 0 means equal)
+///
+/// Verifies: arg2 + res = arg1 (subtraction expressed as addition)
+///
+/// Returns the constraints and the next available constraint index.
 pub fn create_sub_constraints(constraint_idx_start: usize) -> (Vec<AddConstraint>, usize) {
-    // SUB uses the same carry-based approach as ADD:
-    // res = arg1 - arg2 is verified as arg1 = arg2 + res (no carry out for correct subtraction)
-    // Actually, we verify: arg2 + res = arg1 with carries
-    //
-    // Condition column: we need SUB + BEQ, but AddConstraint takes single column
-    // For now, we create separate constraints or use a helper column.
-    //
-    // Actually looking at the AddConstraint, it uses AddOperand which can read from
-    // columns. We need to think about this differently.
-    //
-    // The SUB constraint verifies: res + arg2 = arg1 (subtraction as addition)
-    // Low: res_lo + arg2_lo = arg1_lo + carry_0 * 2^32
-    // High: res_hi + arg2_hi + carry_0 = arg1_hi + carry_1 * 2^32
-    //
-    // For SUB+BEQ condition, we can't directly use AddConstraint since it takes
-    // a single condition column. Let's create a dedicated SubConstraint.
+    // SUB is verified as: arg2 + res = arg1
+    // This is the ADD template with swapped roles:
+    // - lhs = arg2
+    // - rhs = res
+    // - sum = arg1
 
-    // For now, return empty - SUB verification is more complex
-    // TODO: Implement proper SUB constraint with borrow logic
-    (vec![], constraint_idx_start)
+    let lhs = AddOperand::from_dword_bl(cols::ARG2_0); // First addend
+    let rhs = AddOperand::from_dword_bl(cols::RES_0); // Second addend (the difference)
+    let sum = AddOperand::from_dword_bl(cols::ARG1_0); // Result of addition (original minuend)
+
+    // Condition: SUB + BEQ (active when either flag is set)
+    let cond_cols = vec![cols::SUB, cols::BEQ];
+
+    let (sub_c0, sub_c1) = AddConstraint::new_pair(cond_cols, lhs, rhs, sum, constraint_idx_start);
+
+    (vec![sub_c0, sub_c1], constraint_idx_start + 2)
 }
 
 // =========================================================================
 // JALR Result Constraint
 // =========================================================================
 
-/// Constraint: JALR * (res - (pc + instr_size)) = 0
+/// Creates JALR result constraints using the ADD template.
 ///
-/// When JALR=1, the result should be pc + instruction size (return address).
-/// instr_size = 4 - 2 * c_type_instruction
-pub struct JalrResConstraint {
-    constraint_idx: usize,
-}
+/// JALR: res = pc + instr_size (return address)
+/// where instr_size = 4 - 2 * c_type_instruction
+///
+/// This uses proper 64-bit addition with carry handling.
+pub fn create_jalr_constraints(constraint_idx_start: usize) -> (Vec<AddConstraint>, usize) {
+    // pc is stored as DWordWL (2 consecutive columns)
+    let pc = AddOperand::dword(cols::PC_0);
 
-impl JalrResConstraint {
-    pub fn new(constraint_idx: usize) -> Self {
-        Self { constraint_idx }
-    }
+    // instr_size = 4 - 2 * c_type_instruction
+    // This is a linear expression with only a low word (hi = 0)
+    let instr_size = AddOperand::linear(
+        vec![
+            AddLinearTerm::Constant(4),
+            AddLinearTerm::Column {
+                coefficient: -2,
+                column: cols::C_TYPE_INSTRUCTION,
+            },
+        ],
+        vec![], // hi = 0
+    );
 
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let jalr = step.get_main_evaluation_element(0, cols::JALR);
+    // res is stored as DWordBL (8 bytes)
+    let res = AddOperand::from_dword_bl(cols::RES_0);
 
-        // pc as DWordWL (only using low word for now)
-        let pc_lo = step.get_main_evaluation_element(0, cols::PC_0);
-        let _pc_hi = step.get_main_evaluation_element(0, cols::PC_1);
+    // Condition: JALR
+    let cond_cols = vec![cols::JALR];
 
-        // res[:4] as DWordWL[0]
-        let res_0 = step.get_main_evaluation_element(0, cols::RES[0]);
-        let res_1 = step.get_main_evaluation_element(0, cols::RES[1]);
-        let res_2 = step.get_main_evaluation_element(0, cols::RES[2]);
-        let res_3 = step.get_main_evaluation_element(0, cols::RES[3]);
+    let (jalr_c0, jalr_c1) =
+        AddConstraint::new_pair(cond_cols, pc, instr_size, res, constraint_idx_start);
 
-        let shift_8: FieldElement<F> = FieldElement::from(1u64 << 8);
-        let shift_16: FieldElement<F> = FieldElement::from(1u64 << 16);
-        let shift_24: FieldElement<F> = FieldElement::from(1u64 << 24);
-
-        let res_lo = res_0 + res_1 * &shift_8 + res_2 * &shift_16 + res_3 * &shift_24;
-
-        // res[4:] as DWordWL[1] (unused for now - only checking low word)
-        let res_4 = step.get_main_evaluation_element(0, cols::RES[4]);
-        let res_5 = step.get_main_evaluation_element(0, cols::RES[5]);
-        let res_6 = step.get_main_evaluation_element(0, cols::RES[6]);
-        let res_7 = step.get_main_evaluation_element(0, cols::RES[7]);
-
-        let _res_hi = res_4 + res_5 * &shift_8 + res_6 * &shift_16 + res_7 * shift_24;
-
-        // instr_size = 4 - 2 * c_type_instruction
-        let c_type = step.get_main_evaluation_element(0, cols::C_TYPE_INSTRUCTION);
-        let four: FieldElement<F> = FieldElement::from(4u64);
-        let two: FieldElement<F> = FieldElement::from(2u64);
-        let instr_size = four - &two * c_type;
-
-        // expected_lo = pc_lo + instr_size (mod 2^32)
-        // expected_hi = pc_hi + carry
-        // For simplicity, we check: res_lo + res_hi * 2^32 = pc_lo + pc_hi * 2^32 + instr_size
-        // This is: (res_lo - pc_lo - instr_size) + (res_hi - pc_hi) * 2^32 = 0
-        //
-        // But this doesn't handle carry properly. For now, just check low word:
-        // JALR * (res_lo - pc_lo - instr_size) = 0 (assuming no carry, which is usually true)
-
-        jalr * (res_lo - pc_lo - instr_size)
-    }
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for JalrResConstraint {
-    fn degree(&self) -> usize {
-        2
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn end_exemptions(&self) -> usize {
-        0
-    }
-
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover { frame, .. } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-            }
-            TransitionEvaluationContext::Verifier { frame, .. } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
-            }
-        }
-    }
+    (vec![jalr_c0, jalr_c1], constraint_idx_start + 2)
 }
 
 // =========================================================================
@@ -1218,7 +1161,9 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for JalrResConst
 /// Total number of CPU constraints.
 ///
 /// - IS_BIT: 30 (all bit flags)
-/// - ADD carry: 2
+/// - ADD carry: 2 (for ADD + LOAD + STORE)
+/// - SUB carry: 2 (for SUB + BEQ)
+/// - JALR carry: 2 (res = pc + instr_size)
 /// - Branch cond: 1
 /// - EBREAK: 1
 /// - Arg1 lower: 1
@@ -1230,10 +1175,9 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for JalrResConst
 /// - SLT res zero: 7 (bytes 1-7)
 /// - Sign bit zero: 1
 /// - Next PC (non-branching): 2
-/// - JALR res: 1
 ///
-/// Total: 51 constraints
-pub const NUM_CPU_CONSTRAINTS: usize = 30 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 7 + 1 + 2 + 1;
+/// Total: 54 constraints
+pub const NUM_CPU_CONSTRAINTS: usize = 30 + 2 + 2 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 7 + 1 + 2;
 
 /// Creates all CPU constraints.
 ///
@@ -1251,9 +1195,19 @@ pub fn create_all_cpu_constraints() -> (
     let (is_bit, next) = create_is_bit_constraints(next_idx);
     next_idx = next;
 
-    // ADD constraints
-    let (add, next) = create_add_constraints(next_idx);
+    // ADD constraints (for ADD + LOAD + STORE)
+    let (mut add_constraints, next) = create_add_constraints(next_idx);
     next_idx = next;
+
+    // SUB constraints (for SUB + BEQ)
+    let (sub, next) = create_sub_constraints(next_idx);
+    next_idx = next;
+    add_constraints.extend(sub);
+
+    // JALR constraints (res = pc + instr_size)
+    let (jalr, next) = create_jalr_constraints(next_idx);
+    next_idx = next;
+    add_constraints.extend(jalr);
 
     // Other constraints
     let mut other: Vec<Box<dyn TransitionConstraint<GoldilocksField, GoldilocksExtension>>> =
@@ -1302,9 +1256,5 @@ pub fn create_all_cpu_constraints() -> (
     other.push(Box::new(next_pc_1));
     next_idx += 2;
 
-    // JALR result constraint
-    other.push(Box::new(JalrResConstraint::new(next_idx)));
-    next_idx += 1;
-
-    (is_bit, add, other, next_idx)
+    (is_bit, add_constraints, other, next_idx)
 }

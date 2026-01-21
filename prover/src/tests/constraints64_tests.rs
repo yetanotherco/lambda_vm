@@ -652,12 +652,13 @@ fn test_create_all_cpu_constraints() {
     let (is_bit, add, other, total) = create_all_cpu_constraints();
 
     assert_eq!(is_bit.len(), 30);
-    assert_eq!(add.len(), 2);
-    // Other: branch_cond(1) + ebreak(1) + arg1(2) + arg2(2) + rvd(2) + slt_zero(7) + sign_bit_zero(1) + next_pc(2) + jalr_res(1) = 19
-    assert_eq!(other.len(), 19);
+    // ADD constraints: 2 (ADD+LOAD+STORE) + 2 (SUB+BEQ) + 2 (JALR) = 6
+    assert_eq!(add.len(), 6);
+    // Other: branch_cond(1) + ebreak(1) + arg1(2) + arg2(2) + rvd(2) + slt_zero(7) + sign_bit_zero(1) + next_pc(2) = 18
+    assert_eq!(other.len(), 18);
 
-    // Total should be 30 + 2 + 19 = 51
-    assert_eq!(total, 51);
+    // Total should be 30 + 6 + 18 = 54
+    assert_eq!(total, 54);
     assert_eq!(total, NUM_CPU_CONSTRAINTS);
 }
 
