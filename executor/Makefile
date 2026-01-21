@@ -34,7 +34,7 @@ RV64_TARGET_SPEC=$(CURDIR)/programs/riscv64im-lambda-vm-elf.json
 
 .PHONY: test prepare-test-data prepare-sysroot
 
-prepare-test-data: prepare-sysroot
+prepare-test-data:
 	@if [ ! -f "$(ETHREX_FILE)" ]; then \
 		echo "Downloading ethrex_hoodi.bin..."; \
 		curl -L "$(ETHREX_URL)" -o "$(ETHREX_FILE)"; \
@@ -55,7 +55,7 @@ prepare-sysroot:
 
 compile-programs-asm: $(ARTIFACTS_ASM)
 
-compile-programs-rust: $(RUST_ARTIFACTS)
+compile-programs-rust: prepare-sysroot $(RUST_ARTIFACTS)
 
 compile-bench: $(BENCH_ARTIFACTS)
 
