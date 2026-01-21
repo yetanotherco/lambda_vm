@@ -6,7 +6,6 @@ members = [
   "crypto/crypto",
   "crypto/math",
   "bin/cli",
-  "syscalls",
 ]
 
 resolver = "2"
