@@ -72,10 +72,6 @@ fn run_from_entrypoint(
         .max(MAX_INITIAL_LOG_CAPACITY);
     let mut logs = Vec::with_capacity(estimated_execution_count);
     while pc != 0 {
-        // Preventively allocate more memory for logs if current capacity is met
-        if logs.len() >= estimated_execution_count {
-            logs.reserve(estimated_execution_count);
-        }
         // Use pre-decoded instruction if available, otherwise fall back to parsing
         let instruction = match decoded_instructions.get(&pc) {
             Some(&instr) => instr,
