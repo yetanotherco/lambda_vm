@@ -735,8 +735,22 @@ impl CpuOperation {
 pub fn generate_cpu_trace(
     operations: &[CpuOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    // Minimum 4 rows required for FRI to work properly
-    let num_rows = operations.len().next_power_of_two().max(4);
+    let n = operations.len();
+
+    // Require power of 2, minimum 4 rows (FRI requirement)
+    // Padding not yet supported - constraints like NextPcAdd fail on zero-filled rows
+    assert!(
+        n >= 4,
+        "CPU trace requires at least 4 operations, got {}",
+        n
+    );
+    assert!(
+        n.is_power_of_two(),
+        "CPU trace requires power-of-2 operations (no padding support yet), got {}",
+        n
+    );
+
+    let num_rows = n;
     let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
 
     for (row_idx, op) in operations.iter().enumerate() {
@@ -825,8 +839,6 @@ pub fn generate_cpu_trace(
         data[base + cols::BRANCH_COND] = FE::from(op.branch_cond as u64);
     }
 
-    // Padding rows are already zeros (no operations, no multiplicities)
-
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
 }
 
@@ -834,6 +846,8 @@ pub fn generate_cpu_trace(
 ///
 /// This is a convenience function that converts logs to CpuOperations
 /// and then generates the trace.
+///
+/// Panics if logs.len() is not a power of 2 >= 4.
 pub fn generate_cpu_trace_from_logs(
     logs: &[Log],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
