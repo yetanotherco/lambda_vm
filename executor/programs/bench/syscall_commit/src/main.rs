@@ -2,7 +2,7 @@ use lambda_vm_syscalls as syscalls;
 use std::array;
 
 const MAX_COMMIT_SIZE: usize = 1024;
-const ITERATIONS: usize = 9000;
+const ITERATIONS: usize = 100;
 
 pub fn main() {
     for n in 0..ITERATIONS {
