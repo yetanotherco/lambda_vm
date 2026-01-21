@@ -77,6 +77,38 @@ export PATH="/<your_rust_path>/usr/local/bin:$PATH"
 source ~/.zshrc
 ```
 
+#### Compile sysroot
+
+Some of the tests require linking with C libraries.
+
+##### Download pre-installed C libraries
+
+```sh
+wget https://lambda.alignedlayer.com/lambda-vm-sysroot-rv64im.tar.gz
+sudo mkdir -p /opt && sudo tar -xzf lambda-vm-sysroot-rv64im.tar.gz -C /opt
+```
+
+##### Compile it directly             
+    
+```sh                                                
+   sudo apt-get install -y autoconf automake autotools-dev curl python3 \                                           
+   libmpc-dev libmpfr-dev libgmp-dev gawk build-essential bison flex \                                   
+   texinfo gperf libtool patchutils bc zlib1g-dev libexpat-dev             
+```    
+
+```sh                                                                      
+  git clone https://github.com/riscv/riscv-gnu-toolchain /tmp/riscv-gnu-toolchain
+  cd /tmp/riscv-gnu-toolchain                                                                      
+  ./configure --prefix=/opt/riscv64-newlib --with-arch=rv64im --with-abi=lp64 --disable-gdb 
+  make -j$(nproc)                                                                               
+```     
+
+```sh                                                                                                                  
+  mkdir -p /opt/lambda-vm-sysroot                                                     
+  cp -r /opt/riscv64-newlib/riscv64-unknown-elf/include /opt/lambda-vm-sysroot/         
+  cp -r /opt/riscv64-newlib/riscv64-unknown-elf/lib /opt/lambda-vm-sysroot/                
+```
+
 #### Install the dependencies
 
 ```sh
