@@ -13,58 +13,69 @@ desc = "A preprocessed timestamp to coordinate the memory argument. Since we hav
 name = "pc"
 type = "DWordWL"
 desc = "The program counter"
+pad = 1
 
 [[variables.input]]
 name = "rs1"
 type = "Byte"
 desc = "Source register 1 index"
+pad = 0
 
 [[variables.input]]
 name = "rs2"
 type = "Byte"
 desc = "Source register 2 index"
+pad = 0
 
 [[variables.input]]
 name = "rd"
 type = "Byte"
 desc = "Destination register index"
+pad = 0
 
 [[variables.input]]
 name = "read_register1"
 type = "Bit"
 desc = "Whether to read from `rs1` (1) or to place a 0 in `rv1` (0)"
+pad = 0
 
 [[variables.input]]
 name = "read_register2"
 type = "Bit"
 desc = "Whether to read from `rs2` (1) or to place a 0 in `rv2` (0)"
+pad = 0
 
 [[variables.input]]
 name = "write_register"
 type = "Bit"
 desc = "Whether to write back to the destination register"
+pad = 0
 
 # TODO: can we compress this to a single value? (1: is it worth it, 2: does it work)
 [[variables.input]]
 name = "memory_2bytes"
 type = "Bit"
 desc = "Whether the memory access (read or write) touches exactly 2 bytes"
+pad = 0
 
 [[variables.input]]
 name = "memory_4bytes"
 type = "Bit"
 desc = "Whether the memory access (read or write) touches exactly 4 bytes"
+pad = 0
 
 [[variables.input]]
 name = "memory_8bytes"
 type = "Bit"
 desc = "Whether the memory access (read or write) touches exactly 8 bytes"
+pad = 0
 
 # TODO: Are there usecases where it's nicer to just have this as a length constant?
 [[variables.input]]
 name = "c_type_instruction"
 type = "Bit"
 desc = "Whether the instruction is of C type, i.e., whether it is 2 bytes long instead of 4"
+pad = 0
 
 # TODO: Should this just be a word? (CHECK: effect on computation/extension of arg2)
 # TODO: make sure decode correctly extends this (may be zero for unsigned and word_instr?)
@@ -72,11 +83,13 @@ desc = "Whether the instruction is of C type, i.e., whether it is 2 bytes long i
 name = "imm"
 type = "DWordWL"
 desc = "The fully extended 64-bit version of the immediate"
+pad = 0
 
 [[variables.input]]
 name = "signed"
 type = "Bit"
 desc = "Indicates whether we're dealing with a signed or unsigned instruction"
+pad = 0
 
 [[variables.input]]
 name = "mp_selector"
@@ -85,96 +98,115 @@ desc = """Multi-purpose selector used by different ALU operations for different 
     - by the `MUL` chip to select between `MUL`/`MULH` and `MULH[S]U`, and
     - as flag for inverting the condition of conditional branches (see `branch_cond`)
     - as direction (left or right) for `SHIFT`"""
+pad = 0
 
 [[variables.input]]
 name = "muldiv_selector"
 type = "Bit"
 desc = "Selects which output of `MUL` (lo/hi) or `DIV` (quo/rem) is wanted"
+pad = 0
 
 [[variables.input]]
 name = "word_instr"
 type = "Bit"
 desc = "Whether the instruction is a \\*W instruction, requiring the inputs and outputs to be (sign) extended"
+pad = 0
 
 [[variables.input]]
 name = "ADD"
 type = "Bit"
 desc = "One-hot ALU selector flag"
+pad = 0
 
 [[variables.input]]
 name = "SUB"
 type = "Bit"
 desc = "One-hot ALU selector flag"
+pad = 0
 
 [[variables.input]]
 name = "SLT"
 type = "Bit"
 desc = "One-hot ALU selector flag"
+pad = 0
 
 [[variables.input]]
 name = "AND"
 type = "Bit"
 desc = "One-hot ALU selector flag"
+pad = 0
 
 [[variables.input]]
 name = "OR"
 type = "Bit"
 desc = "One-hot ALU selector flag"
+pad = 0
 
 [[variables.input]]
 name = "XOR"
 type = "Bit"
 desc = "One-hot ALU selector flag"
+pad = 0
 
 [[variables.input]]
 name = "SHIFT"
 type = "Bit"
 desc = "One-hot ALU selector flag"
+pad = 0
 
 [[variables.input]]
 name = "JALR"
 type = "Bit"
 desc = "One-hot ALU selector flag"
+pad = 0
 
 [[variables.input]]
 name = "BEQ"
 type = "Bit"
 desc = "One-hot ALU selector flag"
+pad = 0
 
 [[variables.input]]
 name = "BLT"
 type = "Bit"
 desc = "One-hot ALU selector flag"
+pad = 0
 
 [[variables.input]]
 name = "LOAD"
 type = "Bit"
 desc = "One-hot ALU selector flag"
+pad = 0
 
 [[variables.input]]
 name = "STORE"
 type = "Bit"
 desc = "One-hot ALU selector flag"
+pad = 0
 
 [[variables.input]]
 name = "MUL"
 type = "Bit"
 desc = "One-hot ALU selector flag"
+pad = 0
 
 [[variables.input]]
 name = "DIVREM"
 type = "Bit"
 desc = "One-hot ALU selector flag"
+pad = 0
 
 [[variables.input]]
 name = "ECALL"
 type = "Bit"
 desc = "One-hot ALU selector flag"
+pad = 0
 
 [[variables.input]]
 name = "EBREAK"
 type = "Bit"
 desc = "One-hot ALU selector flag"
+pad = 0
 
 
 # Output
@@ -182,62 +214,74 @@ desc = "One-hot ALU selector flag"
 name = "next_pc"
 type = "DWordWL"
 desc = "The program counter for the next instruction"
+pad = 5
 
 [[variables.output]]
 name = "rvd"
 type = "DWordWL"
 desc = "The value to (maybe) be written back to rvd"
+pad = 0
 
 # Auxiliary
 [[variables.auxiliary]]
 name = "rv1"
 type = "DWordWHH"
 desc = "The value of register `rs1`"
+pad = 0
 
 [[variables.auxiliary]]
 name = "rv2"
 type = "DWordWHH"
 desc = "The value of register `rs2`"
+pad = 0
 
 [[variables.auxiliary]]
 name = "rv1_sign_bit"
 type = "Bit"
 desc = "The sign bit of `rv1` if seen as a 32-bit word"
+pad = 0
 
 [[variables.auxiliary]]
 name = "arg1"
 type = "DWordBL"
-desc = "The extended version of `rv1`, depending on `c_type_instruction`"
+desc = "The extended version of `rv1`, depending on `word_instr`"
+pad = 0
 
 [[variables.auxiliary]]
 name = "arg2_sign_bit"
 type = "Bit"
 desc = "The sign bit of `arg2` if seen as a 32-bit word"
+pad = 0
 
 [[variables.auxiliary]]
 name = "arg2"
 type = "DWordBL"
 desc = "A multiplexed version of `rv2` and `imm`, to be used as second argument to ALU calls"
+pad = 0
 
 [[variables.auxiliary]]
 name = "res_sign_bit"
 type = "Bit"
 desc = "The sign bit of `res`, if seen as a 32-bit word"
+pad = 0
 
 [[variables.auxiliary]]
 name = "res"
 type = "DWordBL"
 desc = "The ALU result"
+pad = 0
 
 [[variables.auxiliary]]
 name = "is_equal"
 type = "Bit"
 desc = "Whether `rv1` and `arg2` are equal"
+pad = 0
 
 [[variables.auxiliary]]
 name = "branch_cond"
 type = "Bit"
 desc = "Whether a branch is taken, i.e., the branch condition"
+pad = 0
 
 # Virtual
 [[variables.virtual]]
