@@ -6,6 +6,8 @@ use super::{
     field_element_vector::{FieldElementPairBackend, FieldElementVectorBackend},
 };
 
+pub use super::poseidon2::{BatchPoseidon2Backend, Poseidon2Backend};
+
 // Field element backend definitions
 
 // - With 256 bit
