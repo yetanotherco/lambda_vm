@@ -581,6 +581,7 @@ output = "rv2"
 kind = "interaction"
 tag = "MEMW"
 input = [1, ["*", 2, "rd"], "rvd", ["+", "timestamp", 2], 1, 0, 0]
+multiplicity = "write_register"
 
 [[constraints.mem]]
 kind = "interaction"
