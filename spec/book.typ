@@ -5,6 +5,7 @@
 #book-meta(
   title: "Lambda VM specification",
   summary: [
+    #chapter("memory.typ")[Memory argument]
     #chapter("variables.typ")[Variables]
     #chapter("is_bit.typ")[IS_BIT template]
     #chapter("add.typ")[ADD template]
@@ -32,3 +33,17 @@
 ]
 #let rj = todo.with(background: teal, name: "Robin")
 #let et = todo.with(background: rgb("d4aa3a"), name: "Erik")
+
+#let style = state("style", (
+  foreground: white,
+))
+
+#let aside(title, body) = context figure(
+  block(inset: (left: 1em, right: 1em, bottom: 1em), stroke: style.final().foreground, breakable: false)[
+    #block(inset: (left: 1em, right: 1em, top: .75em, bottom: .75em),
+           width: 100% + 2em,
+           fill: rgb("55aaff"),
+           stroke: style.final().foreground,
+           align(center, strong(text(fill: black, title))))
+    #align(left, body)
+])
