@@ -1,6 +1,6 @@
 .PHONY: deps deps-linux deps-macos prepare-test-data compile-programs-asm compile-programs-rust compile-bench \
 compile-programs clean-asm clean-rust clean-bench clean-shared clean test test-asm test-no-compile \
-test-asm-no-compile test-rust test-rust-no-compile test-executor
+test-asm-no-compile test-rust test-rust-no-compile test-executor flamegraph-prover
 
 UNAME := $(shell uname)
 
@@ -124,3 +124,6 @@ test-no-compile: prepare-test-data
 
 test: compile-programs prepare-test-data
 	cargo test
+
+flamegraph-prover:
+	cd crypto/stark && samply record cargo bench --bench profile_prover --features parallel
