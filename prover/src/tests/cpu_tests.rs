@@ -62,8 +62,9 @@ fn test_cpu_operation_compute_arg1_word_sign_extend_negative() {
     op.word_instr = true;
     op.signed = true;
 
-    // Bit 31 is 1, so sign extension fills upper 32 bits with 1s
-    assert_eq!(op.compute_arg1(), 0xFFFF_FFFF_8000_0001);
+    // For word instructions, compute_arg1 zero-extends (not sign-extends).
+    // Sign extension happens in rvd, not in the arithmetic computation.
+    assert_eq!(op.compute_arg1(), 0x8000_0001);
 }
 
 #[test]
@@ -232,8 +233,11 @@ fn test_trace_generation_arg1_dwordbl() {
 
 #[test]
 fn test_trace_generation_res_dwordbl() {
+    // For op_add, compute_res() calculates arg1 + arg2 (not using self.res directly).
+    // Set rv1 to the desired result value since arg1 = rv1 when word_instr=false,
+    // and arg2 = 0 (imm default) when rs2=0.
     let ops = ops4(CpuOperation {
-        res: 0xFEDC_BA98_7654_3210u64,
+        rv1: 0xFEDC_BA98_7654_3210u64,
         op_add: true,
         ..Default::default()
     });
@@ -241,7 +245,8 @@ fn test_trace_generation_res_dwordbl() {
     let trace = generate_cpu_trace(&ops);
     let row0 = trace.main_table.get_row(0);
 
-    // res stored as DWordBL: 8 bytes
+    // res = arg1 + arg2 = rv1 + 0 = 0xFEDC_BA98_7654_3210
+    // Stored as DWordBL: 8 bytes (little-endian)
     assert_eq!(row0[cols::RES_0], FE::from(0x10u64));
     assert_eq!(row0[cols::RES_1], FE::from(0x32u64));
     assert_eq!(row0[cols::RES_2], FE::from(0x54u64));
