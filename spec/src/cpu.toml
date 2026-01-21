@@ -277,9 +277,15 @@ def = ["+",
     ["*", ["^", 2, 43], "rd"],
 ]
 
+[[variables.virtual]]
+name = "pad"
+type = "Bit"
+desc = "When no flags are set, we must be in a padding row."
+def = ["-", 1, "ADD", "SUB", "SLT", "AND", "OR", "XOR", "SHIFT", "JALR", "BEQ", "BLT", "LOAD", "STORE", "MUL", "DIVREM", "ECALL", "EBREAK"]
+
 
 [[assumptions]]
-desc = "The flags are a one-hot vector in the decoding"
+desc = "At most one flag is 1 by the decoding, and every other flag is 0"
 ref = "cpu:a:one-hot"
 
 [[assumptions]]
@@ -640,6 +646,7 @@ kind = "interaction"
 tag = "MEMW"
 input = [1, ["*", 2, 255], "next_pc", ["+", "timestamp", 1], 1, 0, 0]
 output = "pc"
+multiplicity = ["not", "pad"]
 
 
 [[constraint_groups]]
