@@ -512,7 +512,7 @@ fn generate_minimal_bitwise_trace(lookups: &[(BitwiseLookup, u8, u8, u8)]) -> Tr
 }
 
 #[test]
-fn test_vm_prover_sub_fast() {
+fn test_prove_elfs_sub_fast() {
     let logs = run_asm_elf("sub");
     assert_eq!(logs.len(), 4, "sub.elf should have 4 steps");
 
@@ -534,7 +534,7 @@ fn test_vm_prover_sub_fast() {
 }
 
 #[test]
-fn test_vm_prover_sub_neg_result_fast() {
+fn test_prove_elfs_sub_neg_result_fast() {
     let logs = run_asm_elf("sub_neg_result");
     assert_eq!(logs.len(), 4, "sub_neg_result.elf should have 4 steps");
 
@@ -556,7 +556,7 @@ fn test_vm_prover_sub_neg_result_fast() {
 }
 
 #[test]
-fn test_vm_prover_sub_underflow_fast() {
+fn test_prove_elfs_sub_underflow_fast() {
     let logs = run_asm_elf("sub_underflow");
     assert_eq!(logs.len(), 4, "sub_underflow.elf should have 4 steps");
 
@@ -578,7 +578,7 @@ fn test_vm_prover_sub_underflow_fast() {
 }
 
 #[test]
-fn test_vm_prover_subw_fast() {
+fn test_prove_elfs_subw_fast() {
     let logs = run_asm_elf("subw");
     assert_eq!(logs.len(), 4, "subw.elf should have 4 steps");
 
@@ -601,7 +601,7 @@ fn test_vm_prover_subw_fast() {
 
 /// 8-instruction test with LUI
 #[test]
-fn test_vm_prover_arith_lui_8() {
+fn test_prove_elfs_arith_lui_8() {
     let logs = run_asm_elf("arith_lui_8");
     assert_eq!(logs.len(), 8, "arith_lui_8.elf should have 8 steps");
 
@@ -624,7 +624,7 @@ fn test_vm_prover_arith_lui_8() {
 
 /// 8-instruction test with ADD, SUB, ADDW, SUBW
 #[test]
-fn test_vm_prover_arith_8() {
+fn test_prove_elfs_arith_8() {
     let logs = run_asm_elf("arith_8");
     assert_eq!(logs.len(), 8, "arith_8.elf should have 8 steps");
 
@@ -650,7 +650,7 @@ fn test_vm_prover_arith_8() {
 /// - 64-bit SUB with underflow, negative results
 /// - 32-bit ADDW/SUBW with sign extension
 #[test]
-fn test_vm_prover_basic_arith_32() {
+fn test_prove_elfs_basic_arith_32() {
     let logs = run_asm_elf("basic_arith_32");
     assert_eq!(logs.len(), 32, "basic_arith_32.elf should have 32 steps");
 
@@ -681,7 +681,7 @@ fn test_vm_prover_basic_arith_32() {
 /// - Comparisons: SLTI, SLTIU
 /// - Immediates: LUI, ADDI with edge cases
 #[test]
-fn test_vm_prover_comprehensive() {
+fn test_prove_elfs_comprehensive() {
     let _ = env_logger::builder().is_test(true).try_init();
 
     let logs = run_asm_elf("comprehensive_test");
@@ -722,7 +722,7 @@ fn test_vm_prover_comprehensive() {
 // =============================================================================
 
 #[test]
-fn test_vm_prover_test_add_8() {
+fn test_prove_elfs_test_add_8() {
     let logs = run_asm_elf("test_add_8");
     assert_eq!(logs.len(), 8);
     let mut cpu_trace = generate_cpu_trace_from_logs(&logs);
@@ -736,7 +736,7 @@ fn test_vm_prover_test_add_8() {
 }
 
 #[test]
-fn test_vm_prover_test_sub_8() {
+fn test_prove_elfs_test_sub_8() {
     let logs = run_asm_elf("test_sub_8");
     assert_eq!(logs.len(), 8);
     let mut cpu_trace = generate_cpu_trace_from_logs(&logs);
@@ -750,7 +750,7 @@ fn test_vm_prover_test_sub_8() {
 }
 
 #[test]
-fn test_vm_prover_test_addw_8() {
+fn test_prove_elfs_test_addw_8() {
     let logs = run_asm_elf("test_addw_8");
     assert_eq!(logs.len(), 8);
     let mut cpu_trace = generate_cpu_trace_from_logs(&logs);
@@ -764,7 +764,7 @@ fn test_vm_prover_test_addw_8() {
 }
 
 #[test]
-fn test_vm_prover_test_subw_8() {
+fn test_prove_elfs_test_subw_8() {
     let logs = run_asm_elf("test_subw_8");
     assert_eq!(logs.len(), 8);
     let mut cpu_trace = generate_cpu_trace_from_logs(&logs);
@@ -778,7 +778,7 @@ fn test_vm_prover_test_subw_8() {
 }
 
 #[test]
-fn test_vm_prover_test_addw_lui_8() {
+fn test_prove_elfs_test_addw_lui_8() {
     let logs = run_asm_elf("test_addw_lui_8");
     assert_eq!(logs.len(), 8);
     let mut cpu_trace = generate_cpu_trace_from_logs(&logs);
@@ -792,7 +792,7 @@ fn test_vm_prover_test_addw_lui_8() {
 }
 
 #[test]
-fn test_vm_prover_test_subw_lui_8() {
+fn test_prove_elfs_test_subw_lui_8() {
     let logs = run_asm_elf("test_subw_lui_8");
     assert_eq!(logs.len(), 8);
     let mut cpu_trace = generate_cpu_trace_from_logs(&logs);
@@ -806,7 +806,7 @@ fn test_vm_prover_test_subw_lui_8() {
 }
 
 #[test]
-fn test_vm_prover_test_add_neg_8() {
+fn test_prove_elfs_test_add_neg_8() {
     let logs = run_asm_elf("test_add_neg_8");
     assert_eq!(logs.len(), 8);
     let mut cpu_trace = generate_cpu_trace_from_logs(&logs);
@@ -820,7 +820,7 @@ fn test_vm_prover_test_add_neg_8() {
 }
 
 #[test]
-fn test_vm_prover_test_sub_neg_8() {
+fn test_prove_elfs_test_sub_neg_8() {
     let logs = run_asm_elf("test_sub_neg_8");
     assert_eq!(logs.len(), 8);
     let mut cpu_trace = generate_cpu_trace_from_logs(&logs);
@@ -834,7 +834,7 @@ fn test_vm_prover_test_sub_neg_8() {
 }
 
 #[test]
-fn test_vm_prover_test_mul_8() {
+fn test_prove_elfs_test_mul_8() {
     let logs = run_asm_elf("test_mul_8");
     assert_eq!(logs.len(), 8);
     let mut cpu_trace = generate_cpu_trace_from_logs(&logs);
@@ -848,7 +848,7 @@ fn test_vm_prover_test_mul_8() {
 }
 
 #[test]
-fn test_vm_prover_test_div_8() {
+fn test_prove_elfs_test_div_8() {
     let logs = run_asm_elf("test_div_8");
     assert_eq!(logs.len(), 8);
     let mut cpu_trace = generate_cpu_trace_from_logs(&logs);
@@ -862,7 +862,7 @@ fn test_vm_prover_test_div_8() {
 }
 
 #[test]
-fn test_vm_prover_test_shift_8() {
+fn test_prove_elfs_test_shift_8() {
     let logs = run_asm_elf("test_shift_8");
     assert_eq!(logs.len(), 8);
     let mut cpu_trace = generate_cpu_trace_from_logs(&logs);
@@ -876,7 +876,7 @@ fn test_vm_prover_test_shift_8() {
 }
 
 #[test]
-fn test_vm_prover_test_bitwise_8() {
+fn test_prove_elfs_test_bitwise_8() {
     let logs = run_asm_elf("test_bitwise_8");
     assert_eq!(logs.len(), 8);
     let mut cpu_trace = generate_cpu_trace_from_logs(&logs);
@@ -890,7 +890,7 @@ fn test_vm_prover_test_bitwise_8() {
 }
 
 #[test]
-fn test_vm_prover_test_slt_8() {
+fn test_prove_elfs_test_slt_8() {
     // Initialize logger to see debug constraint validation output
     let _ = env_logger::builder().is_test(true).try_init();
 
@@ -924,7 +924,7 @@ fn test_vm_prover_test_slt_8() {
 // =========================================================================
 
 #[test]
-fn test_vm_prover_test_xor_8() {
+fn test_prove_elfs_test_xor_8() {
     let logs = run_asm_elf("test_xor_8");
     assert_eq!(logs.len(), 8);
     let mut cpu_trace = generate_cpu_trace_from_logs(&logs);
@@ -938,7 +938,7 @@ fn test_vm_prover_test_xor_8() {
 }
 
 #[test]
-fn test_vm_prover_test_lb_lh_8() {
+fn test_prove_elfs_test_lb_lh_8() {
     let logs = run_asm_elf("test_lb_lh_8");
     assert_eq!(logs.len(), 8);
     let mut cpu_trace = generate_cpu_trace_from_logs(&logs);
@@ -952,7 +952,7 @@ fn test_vm_prover_test_lb_lh_8() {
 }
 
 #[test]
-fn test_vm_prover_test_sb_sh_8() {
+fn test_prove_elfs_test_sb_sh_8() {
     let logs = run_asm_elf("test_sb_sh_8");
     assert_eq!(logs.len(), 8);
     let mut cpu_trace = generate_cpu_trace_from_logs(&logs);
@@ -966,7 +966,7 @@ fn test_vm_prover_test_sb_sh_8() {
 }
 
 #[test]
-fn test_vm_prover_all_branches_16() {
+fn test_prove_elfs_all_branches_16() {
     // Initialize logger to see debug constraint validation output
     let _ = env_logger::builder().is_test(true).try_init();
 
@@ -996,7 +996,7 @@ fn test_vm_prover_all_branches_16() {
 }
 
 #[test]
-fn test_vm_prover_all_loadstore_32() {
+fn test_prove_elfs_all_loadstore_32() {
     let logs = run_asm_elf("all_loadstore_32");
     assert_eq!(logs.len(), 32);
     let mut cpu_trace = generate_cpu_trace_from_logs(&logs);
@@ -1011,7 +1011,7 @@ fn test_vm_prover_all_loadstore_32() {
 
 /// Fast version using minimal bitwise table for debugging
 #[test]
-fn test_vm_prover_all_instructions_64() {
+fn test_prove_elfs_all_instructions_64() {
     let _ = env_logger::builder().is_test(true).try_init();
 
     let logs = run_asm_elf("all_instructions_64");
@@ -1053,7 +1053,7 @@ fn test_vm_prover_all_instructions_64() {
 /// - Control: LUI, AUIPC, JALR
 #[test]
 #[ignore] // Slow: run with `cargo test --ignored` or `make test-prover-all`
-fn test_vm_prover_all_instructions_64_full() {
+fn test_prove_elfs_all_instructions_64_full() {
     let _ = env_logger::builder().is_test(true).try_init();
 
     let logs = run_asm_elf("all_instructions_64");
@@ -1099,7 +1099,7 @@ fn test_vm_prover_all_instructions_64_full() {
 /// - SRAW/SRAIW use small positive shift amounts (arg2 bit 31 = 0)
 /// - This test uses DIVW/REMW with a negative divisor (arg2 bit 31 = 1)
 #[test]
-fn test_vm_prover_sign_ext_edge_cases_8() {
+fn test_prove_elfs_sign_ext_edge_cases_8() {
     let logs = run_asm_elf("sign_ext_edge_cases_8");
     assert_eq!(
         logs.len(),
