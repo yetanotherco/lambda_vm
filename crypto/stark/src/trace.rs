@@ -163,6 +163,15 @@ where
         self.aux_table.set(row, col, value);
     }
 
+    /// Allocates the auxiliary table with zeros.
+    /// Single allocation - efficient for large tables.
+    pub fn allocate_aux_table(&mut self, num_aux_columns: usize) {
+        let num_rows = self.num_rows();
+        let aux_data = vec![FieldElement::<E>::zero(); num_rows * num_aux_columns];
+        self.aux_table = Table::new(aux_data, num_aux_columns);
+        self.num_aux_columns = num_aux_columns;
+    }
+
     pub fn allocate_with_zeros(
         num_steps: usize,
         num_main_columns: usize,

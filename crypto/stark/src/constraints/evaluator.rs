@@ -38,11 +38,11 @@ where
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         pub_inputs: &PI,
         rap_challenges: &[FieldElement<FieldExtension>],
-        bus_interactions: Option<&[BusPublicInputs<FieldExtension>]>,
+        bus_public_inputs: Option<&BusPublicInputs<FieldExtension>>,
         trace_length: usize,
     ) -> Self {
         let boundary_constraints =
-            air.boundary_constraints(pub_inputs, rap_challenges, bus_interactions, trace_length);
+            air.boundary_constraints(pub_inputs, rap_challenges, bus_public_inputs, trace_length);
 
         Self {
             boundary_constraints,
@@ -70,7 +70,7 @@ where
                     let mut evals = domain
                         .lde_roots_of_unity_coset
                         .iter()
-                        .map(|v| v.clone() - point)
+                        .map(|v| v - point)
                         .collect::<Vec<FieldElement<Field>>>();
                     FieldElement::inplace_batch_inverse(&mut evals).unwrap();
                     evals

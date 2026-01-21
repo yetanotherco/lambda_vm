@@ -1,4 +1,4 @@
-	.attribute	5, "rv32i2p1_m2p0_zmmul1p0"
+	.attribute	5, "rv64i2p1_m2p0_zmmul1p0"
 .Lfunc_end0:
 	.globl	main
 main:

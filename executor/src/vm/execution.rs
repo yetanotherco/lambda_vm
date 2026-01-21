@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fmt::Debug};
+use std::{collections::HashMap, fmt::Debug};
 
 use crate::vm::{
     instruction::{
@@ -6,28 +6,47 @@ use crate::vm::{
         execution::ExecutionError,
     },
     logs::Log,
-    memory::{Memory, MemoryError},
+    memory::{Memory, MemoryError, U64HashMap},
     registers::Registers,
 };
 
 pub struct ReturnValues {
     pub memory_values: Vec<u8>,
-    pub register_values: (i32, i32),
+    pub register_values: (i64, i64),
 }
 
 pub fn run_program(
-    instruction_map: BTreeMap<u32, u32>,
-    entrypoint: u32,
+    instruction_map: HashMap<u64, u32>,
+    entrypoint: u64,
     private_inputs: Vec<u8>,
 ) -> Result<(ReturnValues, Vec<Log>), ExecutorError> {
     let mut memory = Memory::default();
     memory.store_private_inputs(private_inputs)?;
+    // Pre-decode all instructions
+    let decoded_instructions = predecode_instructions(&instruction_map);
+    let instruction_count = instruction_map.len();
     load_program(instruction_map, &mut memory)?;
-    run_from_entrypoint(&mut memory, entrypoint)
+    run_from_entrypoint(
+        &mut memory,
+        entrypoint,
+        &decoded_instructions,
+        instruction_count,
+    )
+}
+
+fn predecode_instructions(instruction_map: &HashMap<u64, u32>) -> U64HashMap<Instruction> {
+    let mut decoded = U64HashMap::default();
+    for (&addr, &raw) in instruction_map {
+        // Skip addresses that don't contain valid instructions (data sections)
+        if let Ok(instr) = Instruction::parse(raw) {
+            decoded.insert(addr, instr);
+        }
+    }
+    decoded
 }
 
 fn load_program(
-    instruction_map: BTreeMap<u32, u32>,
+    instruction_map: HashMap<u64, u32>,
     memory: &mut Memory,
 ) -> Result<(), MemoryError> {
     for (addr, instruction) in instruction_map {
@@ -38,14 +57,23 @@ fn load_program(
 
 fn run_from_entrypoint(
     memory: &mut Memory,
-    entrypoint: u32,
+    entrypoint: u64,
+    decoded_instructions: &U64HashMap<Instruction>,
+    instruction_count: usize,
 ) -> Result<(ReturnValues, Vec<Log>), ExecutorError> {
     let mut pc = entrypoint;
     let mut registers = Registers::default();
-    let mut logs = Vec::new();
+    // Pre-Allocate logs with an estimated capacity
+    let mut logs = Vec::with_capacity(instruction_count * 1000);
     while pc != 0 {
-        let next_instruction = memory.load_word(pc)?;
-        let instruction = Instruction::parse(next_instruction)?;
+        // Use pre-decoded instruction if available, otherwise fall back to parsing
+        let instruction = match decoded_instructions.get(&pc) {
+            Some(&instr) => instr,
+            None => {
+                let next_instruction = memory.load_word(pc)?;
+                Instruction::parse(next_instruction)?
+            }
+        };
         let log = instruction.run(&mut pc, &mut registers, memory)?;
         logs.push(log);
     }
@@ -57,8 +85,8 @@ fn run_from_entrypoint(
         ReturnValues {
             memory_values: memory_return_value,
             register_values: (
-                registers_return_values.0 as i32,
-                registers_return_values.1 as i32,
+                registers_return_values.0 as i64,
+                registers_return_values.1 as i64,
             ),
         },
         logs,
