@@ -809,8 +809,9 @@ pub fn generate_cpu_trace(
         data[base + cols::RV2_1] = FE::from((op.rv2 >> 16) & 0xFFFF); // bits 16-31 (Half)
         data[base + cols::RV2_2] = FE::from(op.rv2 >> 32); // bits 32-63 (Word)
 
-        // Sign bits
-        let rv1_sign_bit = CpuOperation::sign_bit_32(op.rv1);
+        // Sign bits - only set when word_instr=1, per spec constraint ext_sign_bits
+        // The constraint enforces: (rv1_sign_bit + arg2_sign_bit + res_sign_bit) * (1 - word_instr) = 0
+        let rv1_sign_bit = op.word_instr && CpuOperation::sign_bit_32(op.rv1);
         data[base + cols::RV1_SIGN_BIT] = FE::from(rv1_sign_bit as u64);
 
         // Compute and store arg1 as DWordBL (8 bytes)
@@ -821,14 +822,14 @@ pub fn generate_cpu_trace(
 
         // Compute and store arg2
         let arg2 = op.compute_arg2();
-        let arg2_sign_bit = CpuOperation::sign_bit_32(arg2);
+        let arg2_sign_bit = op.word_instr && CpuOperation::sign_bit_32(arg2);
         data[base + cols::ARG2_SIGN_BIT] = FE::from(arg2_sign_bit as u64);
         for i in 0..8 {
             data[base + cols::ARG2[i]] = FE::from((arg2 >> (i * 8)) & 0xFF);
         }
 
         // Result
-        let res_sign_bit = CpuOperation::sign_bit_32(op.res);
+        let res_sign_bit = op.word_instr && CpuOperation::sign_bit_32(op.res);
         data[base + cols::RES_SIGN_BIT] = FE::from(res_sign_bit as u64);
         for i in 0..8 {
             data[base + cols::RES[i]] = FE::from((op.res >> (i * 8)) & 0xFF);

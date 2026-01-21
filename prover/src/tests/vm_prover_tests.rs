@@ -412,9 +412,7 @@ fn test_vm_prover_sub_fast() {
     );
 }
 
-/// TODO: Investigate constraint failure with 64-bit negative results
 #[test]
-#[ignore]
 fn test_vm_prover_sub_neg_result_fast() {
     let logs = run_asm_elf("sub_neg_result");
     assert_eq!(logs.len(), 4, "sub_neg_result.elf should have 4 steps");
@@ -436,9 +434,7 @@ fn test_vm_prover_sub_neg_result_fast() {
     );
 }
 
-/// TODO: Investigate constraint failure with 64-bit underflow results
 #[test]
-#[ignore]
 fn test_vm_prover_sub_underflow_fast() {
     let logs = run_asm_elf("sub_underflow");
     assert_eq!(logs.len(), 4, "sub_underflow.elf should have 4 steps");
@@ -518,5 +514,87 @@ fn check_elf_step_counts() {
             n,
             if is_pow2 { "YES" } else { "no" }
         );
+    }
+}
+
+/// Debug helper: dumps trace data for analysis
+#[test]
+#[ignore]
+fn test_debug_trace_dump() {
+    use crate::tables64::cpu::cols;
+
+    let logs = run_asm_elf("sub_neg_result");
+    let cpu_trace = generate_cpu_trace_from_logs(&logs);
+
+    println!("\n=== sub_neg_result trace analysis ===\n");
+
+    // Print each row's key values
+    for row_idx in 0..4 {
+        let row = cpu_trace.main_table.get_row(row_idx);
+        println!("Row {}:", row_idx);
+        println!("  PC: [{}, {}]", row[cols::PC_0], row[cols::PC_1]);
+        println!(
+            "  NEXT_PC: [{}, {}]",
+            row[cols::NEXT_PC_0], row[cols::NEXT_PC_1]
+        );
+        println!("  ADD={}, SUB={}", row[cols::ADD], row[cols::SUB]);
+        println!(
+            "  rv1: [{}, {}, {}]",
+            row[cols::RV1_0], row[cols::RV1_1], row[cols::RV1_2]
+        );
+        println!(
+            "  rv2: [{}, {}, {}]",
+            row[cols::RV2_0], row[cols::RV2_1], row[cols::RV2_2]
+        );
+        println!(
+            "  arg1[0..4]: [{}, {}, {}, {}]",
+            row[cols::ARG1_0], row[cols::ARG1_1], row[cols::ARG1_2], row[cols::ARG1_3]
+        );
+        println!(
+            "  arg1[4..8]: [{}, {}, {}, {}]",
+            row[cols::ARG1_4], row[cols::ARG1_5], row[cols::ARG1_6], row[cols::ARG1_7]
+        );
+        println!(
+            "  arg2[0..4]: [{}, {}, {}, {}]",
+            row[cols::ARG2_0], row[cols::ARG2_1], row[cols::ARG2_2], row[cols::ARG2_3]
+        );
+        println!(
+            "  arg2[4..8]: [{}, {}, {}, {}]",
+            row[cols::ARG2_4], row[cols::ARG2_5], row[cols::ARG2_6], row[cols::ARG2_7]
+        );
+        println!(
+            "  res[0..4]: [{}, {}, {}, {}]",
+            row[cols::RES_0], row[cols::RES_1], row[cols::RES_2], row[cols::RES_3]
+        );
+        println!(
+            "  res[4..8]: [{}, {}, {}, {}]",
+            row[cols::RES_4], row[cols::RES_5], row[cols::RES_6], row[cols::RES_7]
+        );
+        println!("  rvd: [{}, {}]", row[cols::RVD_0], row[cols::RVD_1]);
+        println!(
+            "  branch_cond={}, c_type={}",
+            row[cols::BRANCH_COND], row[cols::C_TYPE_INSTRUCTION]
+        );
+        println!();
+    }
+
+    // Compare with passing test
+    println!("=== sub (passing) trace for comparison ===\n");
+    let logs_pass = run_asm_elf("sub");
+    let cpu_trace_pass = generate_cpu_trace_from_logs(&logs_pass);
+
+    for row_idx in 0..4 {
+        let row = cpu_trace_pass.main_table.get_row(row_idx);
+        println!("Row {}:", row_idx);
+        println!(
+            "  res[0..4]: [{}, {}, {}, {}]",
+            row[cols::RES_0], row[cols::RES_1], row[cols::RES_2], row[cols::RES_3]
+        );
+        println!(
+            "  res[4..8]: [{}, {}, {}, {}]",
+            row[cols::RES_4], row[cols::RES_5], row[cols::RES_6], row[cols::RES_7]
+        );
+        println!("  rvd: [{}, {}]", row[cols::RVD_0], row[cols::RVD_1]);
+        println!();
     }
 }
