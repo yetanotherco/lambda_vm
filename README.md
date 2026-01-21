@@ -13,6 +13,10 @@ Right now, this is a project under development and experimentation and must not 
 - Our Rust fork with support for our riscv target
 - Risc-V toolchain (To run executor tests)
 
+### Dev dependencies
+
+- Samply (To create flamegraphs) [Installation](https://github.com/mstange/samply?tab=readme-ov-file#installation)
+
 ### Setup executor
 
 #### Install Our Rust Fork
@@ -138,6 +142,14 @@ Then add the corresponding test under `tests/rust.rs`
 You can run it with
 
 `make test-rust`
+
+## Benchmarking & Profiling
+
+You can create a flamegraph for proof generation using the following target:
+
+```
+  make flamegraph-prover
+```
 
 ## Roadmap for the virtual machine
 
