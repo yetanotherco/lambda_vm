@@ -11,7 +11,7 @@ use crate::vm::{
 };
 
 const MAX_INITIAL_LOG_CAPACITY: usize = 10000;
-const LOG_PRE_ALLOCATION_FACTOR: usize = 10;
+const LOG_PRE_ALLOCATION_FACTOR: usize = 100;
 
 pub struct ReturnValues {
     pub memory_values: Vec<u8>,
