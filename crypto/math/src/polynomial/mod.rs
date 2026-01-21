@@ -1,7 +1,6 @@
 use super::field::element::FieldElement;
-use crate::field::traits::{IsField, IsPrimeField, IsSubFieldOf};
-use alloc::string::{String, ToString};
-use alloc::{borrow::ToOwned, format, vec, vec::Vec};
+use crate::field::traits::{IsField, IsSubFieldOf};
+use alloc::{borrow::ToOwned, vec, vec::Vec};
 use core::{fmt::Display, ops, slice};
 pub mod dense_multilinear_poly;
 mod error;
@@ -113,12 +112,6 @@ impl<F: IsField> Polynomial<FieldElement<F>> {
             })
     }
 
-    /// Evaluates a polynomial P(t) at a slice of points x
-    /// Returns a vector y such that y[i] = P(input[i])
-    pub fn evaluate_slice(&self, input: &[FieldElement<F>]) -> Vec<FieldElement<F>> {
-        input.iter().map(|x| self.evaluate(x)).collect()
-    }
-
     /// Returns the degree of a polynomial, which corresponds to the highest power of x^d
     /// with non-zero coefficient
     pub fn degree(&self) -> usize {
@@ -151,19 +144,6 @@ impl<F: IsField> Polynomial<FieldElement<F>> {
         self.coefficients().len()
     }
 
-    /// Returns the derivative of the polynomial with respect to x.
-    pub fn differentiate(&self) -> Self {
-        let degree = self.degree();
-        if degree == 0 {
-            return Polynomial::zero();
-        }
-        let mut derivative = Vec::with_capacity(degree);
-        for (i, coeff) in self.coefficients().iter().enumerate().skip(1) {
-            derivative.push(FieldElement::<F>::from(i as u64) * coeff);
-        }
-        Polynomial::new(&derivative)
-    }
-
     /// Computes quotient with `x - b` in place.
     pub fn ruffini_division_inplace(&mut self, b: &FieldElement<F>) {
         let mut c = FieldElement::zero();
@@ -172,26 +152,6 @@ impl<F: IsField> Polynomial<FieldElement<F>> {
             core::mem::swap(coeff, &mut c);
         }
         self.coefficients.pop();
-    }
-
-    /// Computes the quotient of the division of P(x) with x - b using Ruffini's rule
-    pub fn ruffini_division<L>(&self, b: &FieldElement<L>) -> Polynomial<FieldElement<L>>
-    where
-        L: IsField,
-        F: IsSubFieldOf<L>,
-    {
-        if let Some(c) = self.coefficients.last() {
-            let mut c = c.clone().to_extension();
-            let mut coefficients = Vec::with_capacity(self.degree());
-            for coeff in self.coefficients.iter().rev().skip(1) {
-                coefficients.push(c.clone());
-                c = coeff + c * b;
-            }
-            coefficients = coefficients.into_iter().rev().collect();
-            Polynomial::new(&coefficients)
-        } else {
-            Polynomial::zero()
-        }
     }
 
     /// Computes quotient and remainder of polynomial division.
@@ -215,41 +175,6 @@ impl<F: IsField> Polynomial<FieldElement<F>> {
             }
             (Polynomial::new(&q), n)
         }
-    }
-
-    /// Extended Euclidean Algorithm for polynomials.
-    ///
-    /// This method computes the extended greatest common divisor (GCD) of two polynomials `self` and `y`.
-    /// It returns a tuple of three elements: `(a, b, g)` such that `a * self + b * y = g`, where `g` is the
-    /// greatest common divisor of `self` and `y`.
-    pub fn xgcd(&self, y: &Self) -> (Self, Self, Self) {
-        let one = Polynomial::new(&[FieldElement::one()]);
-        let zero = Polynomial::zero();
-        let (mut old_r, mut r) = (self.clone(), y.clone());
-        let (mut old_s, mut s) = (one.clone(), zero.clone());
-        let (mut old_t, mut t) = (zero.clone(), one.clone());
-
-        while r != Polynomial::zero() {
-            let quotient = old_r.clone().div_with_ref(&r);
-            old_r = old_r - &quotient * &r;
-            core::mem::swap(&mut old_r, &mut r);
-            old_s = old_s - &quotient * &s;
-            core::mem::swap(&mut old_s, &mut s);
-            old_t = old_t - &quotient * &t;
-            core::mem::swap(&mut old_t, &mut t);
-        }
-
-        let lcinv = old_r.leading_coefficient().inv().unwrap();
-        (
-            old_s.scale_coeffs(&lcinv),
-            old_t.scale_coeffs(&lcinv),
-            old_r.scale_coeffs(&lcinv),
-        )
-    }
-
-    pub fn div_with_ref(self, dividend: &Self) -> Self {
-        let (quotient, _remainder) = self.long_division_with_remainder(dividend);
-        quotient
     }
 
     pub fn mul_with_ref(&self, factor: &Self) -> Self {
@@ -351,44 +276,6 @@ impl<F: IsField> Polynomial<FieldElement<F>> {
     }
 }
 
-impl<F: IsPrimeField> Polynomial<FieldElement<F>> {
-    // Print the polynomial as a string ready to be used in SageMath, or just for pretty printing.
-    pub fn print_as_sage_poly(&self, var_name: Option<char>) -> String {
-        let var_name = var_name.unwrap_or('x');
-        if self.coefficients.is_empty()
-            || self.coefficients.len() == 1 && self.coefficients[0] == FieldElement::zero()
-        {
-            return String::new();
-        }
-
-        let mut string = String::new();
-        let zero = FieldElement::<F>::zero();
-
-        for (i, coeff) in self.coefficients.iter().rev().enumerate() {
-            if *coeff == zero {
-                continue;
-            }
-
-            let coeff_str = coeff.representative().to_string();
-
-            if i == self.coefficients.len() - 1 {
-                string.push_str(&coeff_str);
-            } else if i == self.coefficients.len() - 2 {
-                string.push_str(&format!("{coeff_str}*{var_name} + "));
-            } else {
-                string.push_str(&format!(
-                    "{}*{}^{} + ",
-                    coeff_str,
-                    var_name,
-                    self.coefficients.len() - 1 - i
-                ));
-            }
-        }
-
-        string
-    }
-}
-
 /// Pads a polynomial with zeros until the desired length
 /// This function can be useful when evaluating polynomials with the FFT
 pub fn pad_with_zero_coefficients_to_length<F: IsField>(
@@ -412,38 +299,6 @@ pub fn pad_with_zero_coefficients<L: IsField, F: IsSubFieldOf<L>>(
         pad_with_zero_coefficients_to_length(&mut pa, pb.coefficients.len());
     }
     (pa, pb)
-}
-
-/// Computes the composition of polynomials P1(t) and P2(t), that is P1(P2(t))
-/// It uses interpolation to determine the evaluation at points x_i and evaluates
-/// P1(P2(x[i])). The interpolation theorem ensures that we can reconstruct the polynomial
-/// uniquely by interpolation over a suitable number of points
-/// This is an inefficient version, for something more efficient, use FFT for evaluation,
-/// provided the field satisfies the necessary traits
-pub fn compose<F>(
-    poly_1: &Polynomial<FieldElement<F>>,
-    poly_2: &Polynomial<FieldElement<F>>,
-) -> Polynomial<FieldElement<F>>
-where
-    F: IsField,
-{
-    let max_degree: u64 = (poly_1.degree() * poly_2.degree()) as u64;
-
-    let mut interpolation_points = vec![];
-    for i in 0_u64..max_degree + 1 {
-        interpolation_points.push(FieldElement::<F>::from(i));
-    }
-
-    let values: Vec<_> = interpolation_points
-        .iter()
-        .map(|value| {
-            let intermediate_value = poly_2.evaluate(value);
-            poly_1.evaluate(&intermediate_value)
-        })
-        .collect();
-
-    Polynomial::interpolate(interpolation_points.as_slice(), values.as_slice())
-        .expect("xs and ys have equal length and xs are unique")
 }
 
 // impl Add
@@ -568,17 +423,6 @@ where
 
     fn sub(self, substrahend: Polynomial<FieldElement<L>>) -> Polynomial<FieldElement<L>> {
         self - &substrahend
-    }
-}
-
-impl<F> ops::Div<Polynomial<FieldElement<F>>> for Polynomial<FieldElement<F>>
-where
-    F: IsField,
-{
-    type Output = Polynomial<FieldElement<F>>;
-
-    fn div(self, dividend: Polynomial<FieldElement<F>>) -> Polynomial<FieldElement<F>> {
-        self.div_with_ref(&dividend)
     }
 }
 
