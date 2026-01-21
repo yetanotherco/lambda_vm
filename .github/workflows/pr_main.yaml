@@ -67,7 +67,7 @@ jobs:
       - name: Compile ASM programs to ELF
         if: steps.cache-asm-elfs.outputs.cache-hit != 'true'
         run: |
-          cd executor && make compile-programs-asm
+          make compile-programs-asm
 
       - name: Cache compiled Rust ELF artifacts and build cache
         id: cache-rust-elfs
@@ -83,15 +83,15 @@ jobs:
       - name: Compile Rust programs to ELF
         if: steps.cache-rust-elfs.outputs.cache-hit != 'true'
         run: |
-          cd executor && make compile-programs-rust
+          make compile-programs-rust
 
-      - name: Run asm tests
+      - name: Run asm tests (no compile)
         run: |
-          cd executor && make test-asm-no-compile
+          make test-asm-no-compile
 
       - name: Run rust tests (no compile)
         run: |
-          cd executor && cargo test --test rust
+          make test-rust-no-compile
 
       - name: Run prover and crypto tests
         run: |
