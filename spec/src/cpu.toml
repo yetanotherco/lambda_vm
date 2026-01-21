@@ -329,7 +329,7 @@ def = ["-", 1, "ADD", "SUB", "SLT", "AND", "OR", "XOR", "SHIFT", "JALR", "BEQ", 
 
 
 [[assumptions]]
-desc = "At most one flag is 1 by the decoding, and every other flag is 0"
+desc = "At most one ALU selector flag is 1 by the decoding, and every other flag is 0."
 ref = "cpu:a:one-hot"
 
 [[assumptions]]
@@ -647,7 +647,7 @@ multiplicity = "read_register1"
 [[constraints.mem]]
 kind = "arith"
 constraint = "`!read_register1` => `rv1[i]` = 0"
-poly = ["*", ["not", "register1"], ["idx", "rv1", "i"]]
+poly = ["*", ["not", "read_register1"], ["idx", "rv1", "i"]]
 iter = ["i", 0, 2]
 
 # TODO: no types available, so no casting yet
@@ -661,7 +661,7 @@ multiplicity = "read_register2"
 [[constraints.mem]]
 kind = "arith"
 constraint = "`!read_register2` => `rv2[i]` = 0"
-poly = ["*", ["not", "register2"], ["idx", "rv2", "i"]]
+poly = ["*", ["not", "read_register2"], ["idx", "rv2", "i"]]
 iter = ["i", 0, 2]
 
 # TODO: no types available, so no casting yet
