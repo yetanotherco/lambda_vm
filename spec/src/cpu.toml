@@ -388,8 +388,8 @@ ref = "cpu:c:range_memory_8bytes"
 [[constraints.range]]
 kind = "template"
 tag = "IS_BIT"
-input = ["c_kind_instruction"]
-ref = "cpu:c:range_c_kind_instruction"
+input = ["c_type_instruction"]
+ref = "cpu:c:range_c_type_instruction"
 
 [[constraints.range]]
 kind = "template"
