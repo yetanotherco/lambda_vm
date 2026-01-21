@@ -1,4 +1,5 @@
-/// Profiling binary for STARK prover - generates flamegraph data
+// Profiling binary for STARK prover to generate flamegraph data
+// It can run using `samply record cargo bench --bench profile_prover --features parallel`.
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
 use math::field::fields::fft_friendly::extensions_goldilocks::Degree3GoldilocksExtensionField;
@@ -63,5 +64,7 @@ fn main() {
 
     let elapsed = start.elapsed();
     println!("\nProof generation completed in {:?}", elapsed);
-    println!("Flamegraph data saved. Analyze with the generated SVG file.");
+    println!(
+        "Profiling complete. Run with 'samply record' or 'cargo flamegraph' to generate flamegraph."
+    );
 }
