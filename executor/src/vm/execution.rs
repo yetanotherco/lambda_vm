@@ -10,6 +10,9 @@ use crate::vm::{
     registers::Registers,
 };
 
+const MAX_INITIAL_LOG_CAPACITY: usize = 10000;
+const LOG_PRE_ALLOCATION_FACTOR: usize = 10;
+
 pub struct ReturnValues {
     pub memory_values: Vec<u8>,
     pub register_values: (i64, i64),
@@ -64,7 +67,10 @@ fn run_from_entrypoint(
     let mut pc = entrypoint;
     let mut registers = Registers::default();
     // Pre-Allocate logs with an estimated capacity
-    let mut logs = Vec::with_capacity(instruction_count * 1000);
+    let estimated_execution_count = instruction_count
+        .saturating_mul(LOG_PRE_ALLOCATION_FACTOR)
+        .max(MAX_INITIAL_LOG_CAPACITY);
+    let mut logs = Vec::with_capacity(estimated_execution_count);
     while pc != 0 {
         // Use pre-decoded instruction if available, otherwise fall back to parsing
         let instruction = match decoded_instructions.get(&pc) {
