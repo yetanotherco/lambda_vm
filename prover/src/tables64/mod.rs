@@ -26,6 +26,8 @@ pub mod lt;
 // pub mod branch;
 // pub mod mul;
 // pub mod shift;
+
+// Phase 3 (to be added)
 // pub mod decode;
 
 // Phase 5 - Deferred (to be added)

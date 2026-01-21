@@ -6,7 +6,7 @@ use crate::vm::{
         execution::ExecutionError,
     },
     logs::Log,
-    memory::{Memory, MemoryError},
+    memory::{Memory, MemoryError, U64HashMap},
     registers::Registers,
 };
 
@@ -34,8 +34,8 @@ pub fn run_program(
     )
 }
 
-fn predecode_instructions(instruction_map: &HashMap<u64, u32>) -> HashMap<u64, Instruction> {
-    let mut decoded = HashMap::new();
+fn predecode_instructions(instruction_map: &HashMap<u64, u32>) -> U64HashMap<Instruction> {
+    let mut decoded = U64HashMap::default();
     for (&addr, &raw) in instruction_map {
         // Skip addresses that don't contain valid instructions (data sections)
         if let Ok(instr) = Instruction::parse(raw) {
@@ -58,7 +58,7 @@ fn load_program(
 fn run_from_entrypoint(
     memory: &mut Memory,
     entrypoint: u64,
-    decoded_instructions: &HashMap<u64, Instruction>,
+    decoded_instructions: &U64HashMap<Instruction>,
     instruction_count: usize,
 ) -> Result<(ReturnValues, Vec<Log>), ExecutorError> {
     let mut pc = entrypoint;

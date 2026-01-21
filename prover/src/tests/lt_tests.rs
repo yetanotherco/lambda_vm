@@ -162,6 +162,6 @@ fn test_multiplicity_different_signed_flags() {
 #[test]
 fn test_bus_interactions_count() {
     let interactions = bus_interactions();
-    // LT table receives LT lookups from CPU
-    assert_eq!(interactions.len(), 1);
+    // MSB16 x2 + IS_HALFWORD x4 + LT x1 = 7 interactions
+    assert_eq!(interactions.len(), 7);
 }

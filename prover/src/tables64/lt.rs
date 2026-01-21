@@ -203,64 +203,117 @@ pub fn generate_lt_trace(
 /// Creates all bus interactions for the LT table.
 ///
 /// The LT table:
-/// - **Sends** MSB16 lookups for lhs_msb and rhs_msb extraction (TODO: needs Bitwise receiver)
-/// - **Sends** IS_HALFWORD lookups for lhs_sub_rhs range checks (TODO: needs Bitwise receiver)
-/// - **Receives** LT lookups from other tables (CPU) (TODO: needs CPU sender with DWordHHW packing)
-///
-/// For now, bus interactions are disabled until CPU sender is properly implemented
-/// and Bitwise receivers for MSB16/IS_HALFWORD are wired.
+/// - **Sends** MSB16 lookups for lhs_msb and rhs_msb extraction
+/// - **Sends** IS_HALFWORD lookups for lhs_sub_rhs range checks
+/// - **Receives** LT lookups from other tables (CPU)
 pub fn bus_interactions() -> Vec<BusInteraction> {
     vec![
-        // TODO: Re-add when Bitwise table receives MSB16
         // MSB16[lhs[2]] -> lhs_msb
-        // MSB16[rhs[2]] -> rhs_msb
-
-        // TODO: Re-add when Bitwise table receives IS_HALFWORD
-        // IS_HALFWORD[lhs_sub_rhs[0..3]]
-
-        // LT[lhs, rhs, signed] -> lt (receiver)
-        // Receives from CPU table (sender)
-        // Format: lhs (3 cols: Word, Half, Half), rhs (3 cols), signed, lt
-        BusInteraction::receiver(
-            BusId::Lt,
+        // Input: lhs[2] (half containing MSB)
+        // Output: lhs_msb
+        BusInteraction::sender(
+            BusId::Msb16,
             Multiplicity::Column(cols::MU),
             vec![
-                // lhs[0]: Word (lower 32 bits)
-                BusValue::Packed {
-                    start_column: cols::LHS_0,
-                    packing: Packing::Direct,
-                },
-                // lhs[1]: Half (bits 32-47)
-                BusValue::Packed {
-                    start_column: cols::LHS_1,
-                    packing: Packing::Direct,
-                },
-                // lhs[2]: Half (bits 48-63)
                 BusValue::Packed {
                     start_column: cols::LHS_2,
                     packing: Packing::Direct,
                 },
-                // rhs[0]: Word (lower 32 bits)
                 BusValue::Packed {
-                    start_column: cols::RHS_0,
+                    start_column: cols::LHS_MSB,
                     packing: Packing::Direct,
                 },
-                // rhs[1]: Half (bits 32-47)
-                BusValue::Packed {
-                    start_column: cols::RHS_1,
-                    packing: Packing::Direct,
-                },
-                // rhs[2]: Half (bits 48-63)
+            ],
+        ),
+        // MSB16[rhs[2]] -> rhs_msb
+        BusInteraction::sender(
+            BusId::Msb16,
+            Multiplicity::Column(cols::MU),
+            vec![
                 BusValue::Packed {
                     start_column: cols::RHS_2,
                     packing: Packing::Direct,
                 },
-                // signed flag
+                BusValue::Packed {
+                    start_column: cols::RHS_MSB,
+                    packing: Packing::Direct,
+                },
+            ],
+        ),
+        // IS_HALFWORD[lhs_sub_rhs[0]]
+        BusInteraction::sender(
+            BusId::IsHalfword,
+            Multiplicity::Column(cols::MU),
+            vec![BusValue::Packed {
+                start_column: cols::LHS_SUB_RHS_0,
+                packing: Packing::Direct,
+            }],
+        ),
+        // IS_HALFWORD[lhs_sub_rhs[1]]
+        BusInteraction::sender(
+            BusId::IsHalfword,
+            Multiplicity::Column(cols::MU),
+            vec![BusValue::Packed {
+                start_column: cols::LHS_SUB_RHS_1,
+                packing: Packing::Direct,
+            }],
+        ),
+        // IS_HALFWORD[lhs_sub_rhs[2]]
+        BusInteraction::sender(
+            BusId::IsHalfword,
+            Multiplicity::Column(cols::MU),
+            vec![BusValue::Packed {
+                start_column: cols::LHS_SUB_RHS_2,
+                packing: Packing::Direct,
+            }],
+        ),
+        // IS_HALFWORD[lhs_sub_rhs[3]]
+        BusInteraction::sender(
+            BusId::IsHalfword,
+            Multiplicity::Column(cols::MU),
+            vec![BusValue::Packed {
+                start_column: cols::LHS_SUB_RHS_3,
+                packing: Packing::Direct,
+            }],
+        ),
+        // LT[lhs, rhs, signed] -> lt (receiver)
+        // lhs is DWordHHW, rhs is DWordHHW, signed is Bit, lt is Bit
+        BusInteraction::receiver(
+            BusId::Lt,
+            Multiplicity::Column(cols::MU),
+            vec![
+                // lhs as DWordHHW (3 elements: Word, Half, Half)
+                BusValue::Packed {
+                    start_column: cols::LHS_0,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::LHS_1,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::LHS_2,
+                    packing: Packing::Direct,
+                },
+                // rhs as DWordHHW (3 elements)
+                BusValue::Packed {
+                    start_column: cols::RHS_0,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::RHS_1,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::RHS_2,
+                    packing: Packing::Direct,
+                },
+                // signed
                 BusValue::Packed {
                     start_column: cols::SIGNED,
                     packing: Packing::Direct,
                 },
-                // lt result
+                // lt (output)
                 BusValue::Packed {
                     start_column: cols::LT,
                     packing: Packing::Direct,
