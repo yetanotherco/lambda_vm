@@ -297,7 +297,8 @@ impl Arg1LowerConstraint {
         let shift_16: FieldElement<F> = FieldElement::from(1u64 << 16);
         let shift_24: FieldElement<F> = FieldElement::from(1u64 << 24);
 
-        let arg1_lo = arg1_0 + arg1_1 * shift_8.clone() + arg1_2 * shift_16.clone() + arg1_3 * shift_24;
+        let arg1_lo =
+            arg1_0 + arg1_1 * shift_8.clone() + arg1_2 * shift_16.clone() + arg1_3 * shift_24;
 
         // rv1 is DWordWHH: [Half(0-15), Half(16-31), Word(32-63)]
         // rv1::DWordWL[0] = rv1[0] + rv1[1] * 2^16
@@ -457,7 +458,7 @@ pub struct SltResZeroConstraint {
 
 impl SltResZeroConstraint {
     pub fn new(byte_idx: usize, constraint_idx: usize) -> Self {
-        assert!(byte_idx >= 1 && byte_idx <= 7);
+        assert!((1..=7).contains(&byte_idx));
         Self {
             byte_idx,
             constraint_idx,
@@ -1239,6 +1240,7 @@ pub const NUM_CPU_CONSTRAINTS: usize = 30 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 
 /// Creates all CPU constraints.
 ///
 /// Returns a tuple of (is_bit_constraints, add_constraints, other_constraints, next_idx)
+#[allow(clippy::type_complexity)]
 pub fn create_all_cpu_constraints() -> (
     Vec<IsBitConstraint>,
     Vec<AddConstraint>,

@@ -323,13 +323,10 @@ impl CpuOperation {
 
     /// Compute arg2 based on instruction type.
     ///
-    /// For STORE/LOAD: uses rv2
-    /// For BEQ/BLT: uses rv2
+    /// For STORE/LOAD/BEQ/BLT: uses rv2
     /// Otherwise: uses imm (when rs2=0) or rv2
     pub fn compute_arg2(&self) -> u64 {
-        if self.op_store || self.op_load {
-            self.rv2
-        } else if self.op_beq || self.op_blt {
+        if self.op_store || self.op_load || self.op_beq || self.op_blt {
             self.rv2
         } else {
             // For other ops, use imm (the spec assumes rs2=0 or imm=0)
@@ -789,14 +786,14 @@ pub fn generate_cpu_trace(
         data[base + cols::RVD_1] = FE::from(op.rvd >> 32);
 
         // Auxiliary: rv1 as DWordWHH [Half, Half, Word] - Word is MSB (bits 32-63)
-        data[base + cols::RV1_0] = FE::from(op.rv1 & 0xFFFF);              // bits 0-15 (Half)
-        data[base + cols::RV1_1] = FE::from((op.rv1 >> 16) & 0xFFFF);      // bits 16-31 (Half)
-        data[base + cols::RV1_2] = FE::from(op.rv1 >> 32);                 // bits 32-63 (Word)
+        data[base + cols::RV1_0] = FE::from(op.rv1 & 0xFFFF); // bits 0-15 (Half)
+        data[base + cols::RV1_1] = FE::from((op.rv1 >> 16) & 0xFFFF); // bits 16-31 (Half)
+        data[base + cols::RV1_2] = FE::from(op.rv1 >> 32); // bits 32-63 (Word)
 
         // Auxiliary: rv2 as DWordWHH [Half, Half, Word] - Word is MSB (bits 32-63)
-        data[base + cols::RV2_0] = FE::from(op.rv2 & 0xFFFF);              // bits 0-15 (Half)
-        data[base + cols::RV2_1] = FE::from((op.rv2 >> 16) & 0xFFFF);      // bits 16-31 (Half)
-        data[base + cols::RV2_2] = FE::from(op.rv2 >> 32);                 // bits 32-63 (Word)
+        data[base + cols::RV2_0] = FE::from(op.rv2 & 0xFFFF); // bits 0-15 (Half)
+        data[base + cols::RV2_1] = FE::from((op.rv2 >> 16) & 0xFFFF); // bits 16-31 (Half)
+        data[base + cols::RV2_2] = FE::from(op.rv2 >> 32); // bits 32-63 (Word)
 
         // Sign bits
         let rv1_sign_bit = CpuOperation::sign_bit_32(op.rv1);
@@ -851,7 +848,9 @@ pub fn generate_cpu_trace_from_logs(
 /// Collects all Bitwise lookups from a list of CPU operations.
 ///
 /// Returns tuples (BitwiseLookup, x, y, z) to pass to `bitwise::update_multiplicities`.
-pub fn collect_bitwise_lookups(operations: &[CpuOperation]) -> Vec<(super::bitwise::BitwiseLookup, u8, u8, u8)> {
+pub fn collect_bitwise_lookups(
+    operations: &[CpuOperation],
+) -> Vec<(super::bitwise::BitwiseLookup, u8, u8, u8)> {
     operations
         .iter()
         .flat_map(|op| op.collect_bitwise_lookups())
@@ -861,7 +860,9 @@ pub fn collect_bitwise_lookups(operations: &[CpuOperation]) -> Vec<(super::bitwi
 /// Collects all Bitwise lookups from executor logs.
 ///
 /// Convenience function that converts logs to operations and collects lookups.
-pub fn collect_bitwise_lookups_from_logs(logs: &[Log]) -> Vec<(super::bitwise::BitwiseLookup, u8, u8, u8)> {
+pub fn collect_bitwise_lookups_from_logs(
+    logs: &[Log],
+) -> Vec<(super::bitwise::BitwiseLookup, u8, u8, u8)> {
     let operations: Vec<CpuOperation> = logs
         .iter()
         .enumerate()
@@ -1036,14 +1037,38 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         vec![
             // Sum of all 8 result bytes as linear combination
             BusValue::linear(vec![
-                stark::lookup::LinearTerm::Column { coefficient: 1, column: cols::RES[0] },
-                stark::lookup::LinearTerm::Column { coefficient: 1, column: cols::RES[1] },
-                stark::lookup::LinearTerm::Column { coefficient: 1, column: cols::RES[2] },
-                stark::lookup::LinearTerm::Column { coefficient: 1, column: cols::RES[3] },
-                stark::lookup::LinearTerm::Column { coefficient: 1, column: cols::RES[4] },
-                stark::lookup::LinearTerm::Column { coefficient: 1, column: cols::RES[5] },
-                stark::lookup::LinearTerm::Column { coefficient: 1, column: cols::RES[6] },
-                stark::lookup::LinearTerm::Column { coefficient: 1, column: cols::RES[7] },
+                stark::lookup::LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::RES[0],
+                },
+                stark::lookup::LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::RES[1],
+                },
+                stark::lookup::LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::RES[2],
+                },
+                stark::lookup::LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::RES[3],
+                },
+                stark::lookup::LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::RES[4],
+                },
+                stark::lookup::LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::RES[5],
+                },
+                stark::lookup::LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::RES[6],
+                },
+                stark::lookup::LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::RES[7],
+                },
             ]),
             BusValue::Packed {
                 start_column: cols::IS_EQUAL,
@@ -1070,37 +1095,85 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         vec![
             // arg1[0]: Word (lower 32 bits)
             BusValue::linear(vec![
-                stark::lookup::LinearTerm::Column { coefficient: 1, column: cols::ARG1[0] },
-                stark::lookup::LinearTerm::Column { coefficient: 1 << 8, column: cols::ARG1[1] },
-                stark::lookup::LinearTerm::Column { coefficient: 1 << 16, column: cols::ARG1[2] },
-                stark::lookup::LinearTerm::Column { coefficient: 1 << 24, column: cols::ARG1[3] },
+                stark::lookup::LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::ARG1[0],
+                },
+                stark::lookup::LinearTerm::Column {
+                    coefficient: 1 << 8,
+                    column: cols::ARG1[1],
+                },
+                stark::lookup::LinearTerm::Column {
+                    coefficient: 1 << 16,
+                    column: cols::ARG1[2],
+                },
+                stark::lookup::LinearTerm::Column {
+                    coefficient: 1 << 24,
+                    column: cols::ARG1[3],
+                },
             ]),
             // arg1[1]: Half (bits 32-47)
             BusValue::linear(vec![
-                stark::lookup::LinearTerm::Column { coefficient: 1, column: cols::ARG1[4] },
-                stark::lookup::LinearTerm::Column { coefficient: 1 << 8, column: cols::ARG1[5] },
+                stark::lookup::LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::ARG1[4],
+                },
+                stark::lookup::LinearTerm::Column {
+                    coefficient: 1 << 8,
+                    column: cols::ARG1[5],
+                },
             ]),
             // arg1[2]: Half (bits 48-63)
             BusValue::linear(vec![
-                stark::lookup::LinearTerm::Column { coefficient: 1, column: cols::ARG1[6] },
-                stark::lookup::LinearTerm::Column { coefficient: 1 << 8, column: cols::ARG1[7] },
+                stark::lookup::LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::ARG1[6],
+                },
+                stark::lookup::LinearTerm::Column {
+                    coefficient: 1 << 8,
+                    column: cols::ARG1[7],
+                },
             ]),
             // arg2[0]: Word (lower 32 bits)
             BusValue::linear(vec![
-                stark::lookup::LinearTerm::Column { coefficient: 1, column: cols::ARG2[0] },
-                stark::lookup::LinearTerm::Column { coefficient: 1 << 8, column: cols::ARG2[1] },
-                stark::lookup::LinearTerm::Column { coefficient: 1 << 16, column: cols::ARG2[2] },
-                stark::lookup::LinearTerm::Column { coefficient: 1 << 24, column: cols::ARG2[3] },
+                stark::lookup::LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::ARG2[0],
+                },
+                stark::lookup::LinearTerm::Column {
+                    coefficient: 1 << 8,
+                    column: cols::ARG2[1],
+                },
+                stark::lookup::LinearTerm::Column {
+                    coefficient: 1 << 16,
+                    column: cols::ARG2[2],
+                },
+                stark::lookup::LinearTerm::Column {
+                    coefficient: 1 << 24,
+                    column: cols::ARG2[3],
+                },
             ]),
             // arg2[1]: Half (bits 32-47)
             BusValue::linear(vec![
-                stark::lookup::LinearTerm::Column { coefficient: 1, column: cols::ARG2[4] },
-                stark::lookup::LinearTerm::Column { coefficient: 1 << 8, column: cols::ARG2[5] },
+                stark::lookup::LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::ARG2[4],
+                },
+                stark::lookup::LinearTerm::Column {
+                    coefficient: 1 << 8,
+                    column: cols::ARG2[5],
+                },
             ]),
             // arg2[2]: Half (bits 48-63)
             BusValue::linear(vec![
-                stark::lookup::LinearTerm::Column { coefficient: 1, column: cols::ARG2[6] },
-                stark::lookup::LinearTerm::Column { coefficient: 1 << 8, column: cols::ARG2[7] },
+                stark::lookup::LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::ARG2[6],
+                },
+                stark::lookup::LinearTerm::Column {
+                    coefficient: 1 << 8,
+                    column: cols::ARG2[7],
+                },
             ]),
             // signed flag
             BusValue::Packed {

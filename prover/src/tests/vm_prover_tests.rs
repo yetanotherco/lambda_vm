@@ -26,8 +26,8 @@ use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
 use crate::tables64::bitwise::{
-    bus_interactions as bitwise_bus_interactions, cols as bitwise_cols, generate_bitwise_trace,
-    update_multiplicities, BitwiseLookup,
+    BitwiseLookup, bus_interactions as bitwise_bus_interactions, cols as bitwise_cols,
+    generate_bitwise_trace, update_multiplicities,
 };
 use crate::tables64::cpu::{
     bus_interactions as cpu_bus_interactions, collect_bitwise_lookups_from_logs,
@@ -143,7 +143,10 @@ fn test_cpu_only_no_bus() {
     assert_eq!(logs.len(), 2);
 
     let mut cpu_trace = generate_cpu_trace_from_logs(&logs);
-    println!("CPU trace: {} rows x {} cols", cpu_trace.main_table.height, cpu_trace.main_table.width);
+    println!(
+        "CPU trace: {} rows x {} cols",
+        cpu_trace.main_table.height, cpu_trace.main_table.width
+    );
 
     let proof_options = ProofOptions::default_test_options();
 
@@ -198,7 +201,9 @@ fn test_vm_prover_lui() {
     update_multiplicities(&mut bitwise_trace, &bitwise_lookups);
     println!(
         "Bitwise trace: {} rows x {} cols, {} lookups",
-        bitwise_trace.main_table.height, bitwise_trace.main_table.width, bitwise_lookups.len()
+        bitwise_trace.main_table.height,
+        bitwise_trace.main_table.width,
+        bitwise_lookups.len()
     );
 
     // Run prover and verifier
@@ -287,9 +292,7 @@ use std::collections::HashMap;
 /// Generates a minimal bitwise trace containing only the rows needed for the given lookups.
 ///
 /// **WARNING: FOR TESTING ONLY - NOT PRODUCTION SAFE!**
-fn generate_minimal_bitwise_trace(
-    lookups: &[(BitwiseLookup, u8, u8, u8)],
-) -> TraceTable<F, E> {
+fn generate_minimal_bitwise_trace(lookups: &[(BitwiseLookup, u8, u8, u8)]) -> TraceTable<F, E> {
     // Collect unique (x, y, z) tuples and count multiplicities per lookup type
     let mut row_data: HashMap<(u8, u8, u8), [u64; 11]> = HashMap::new();
 
