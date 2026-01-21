@@ -118,6 +118,22 @@ Full documentation can be found in [docs](./docs/). It is currently a work in pr
 
 ## Testing
 
+### Quick Reference
+
+| Command | Description |
+|---------|-------------|
+| `make test` | Run all tests (compiles programs first) |
+| `make test-fast` | Fast tests for prover, stark, and executor (skips slow tests) |
+| `make test-prover` | Prover tests only (fast) |
+| `make test-prover-all` | Prover tests including slow ones |
+| `make test-asm` | Compile and run ASM tests |
+| `make test-rust` | Compile and run Rust tests |
+| `make test-executor` | Compile all programs and run executor tests |
+| `make build` | Build all workspace crates |
+| `make check` | Check all crates (faster than build, no codegen) |
+
+### Full Test Suite
+
 To run all tests across the project use
 
 `make test`
