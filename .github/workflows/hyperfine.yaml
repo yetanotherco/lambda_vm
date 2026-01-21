@@ -43,8 +43,8 @@ jobs:
         if: ${{ steps.cache.outputs.cache-hit != 'true' }}
         run: |
           mkdir -p ${{ matrix.branch }}_programs
-          cd executor && make -j compile-bench
-          cp program_artifacts/bench/*.elf ../${{ matrix.branch }}_programs
+          make -j compile-bench
+          cp executor/program_artifacts/bench/*.elf ${{ matrix.branch }}_programs
 
       - name: Export benchmark hashes
         id: export-hashes

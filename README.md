@@ -80,7 +80,6 @@ source ~/.zshrc
 #### Install the dependencies
 
 ```sh
-cd executor
 make deps
 ```
 
@@ -89,7 +88,7 @@ make deps
 Then, you can check that the executor works by running:
 
 ```sh
-make test
+make test-executor
 ```
 
 ## Design choices
@@ -115,6 +114,10 @@ Full documentation can be found in [docs](./docs/). It is currently a work in pr
 
 ## Testing
 
+To run all tests across the project use
+
+`make test`
+
 ### ASM Tests
 
 In order to add a new asm test you should add the `.s` file under `programs/asm`
@@ -122,7 +125,7 @@ Then add the corresponding test under `tests/asm.rs`
 
 To run them you can use
 
-`make test`
+`make test-asm`
 
 This will compile them and run the tests
 
@@ -134,7 +137,7 @@ Then add the corresponding test under `tests/rust.rs`
 
 You can run it with
 
-`make test`
+`make test-rust`
 
 ## Roadmap for the virtual machine
 

@@ -1,15 +1,36 @@
+.PHONY: deps deps-linux deps-macos prepare-test-data compile-programs-asm compile-programs-rust compile-bench \
+compile-programs clean-asm clean-rust clean-bench clean-shared clean test test-asm test-no-compile \
+test-asm-no-compile test-rust test-rust-no-compile test-executor
+
 UNAME := $(shell uname)
 
-ASM_PROGRAMS_DIR=./programs/asm
-ASM_ARTIFACTS_DIR=./program_artifacts/asm
+deps:
+ifeq ($(UNAME), Linux)
+deps: deps-linux
+endif
+ifeq ($(UNAME), Darwin)
+deps: deps-macos
+endif
 
-RUST_PROGRAMS_DIR=./programs/rust
-RUST_ARTIFACTS_DIR=./program_artifacts/rust
+deps-linux:
+	@# TODO
+	@echo "not yet implemented"
+	@exit 1
 
-BENCH_PROGRAMS_DIR=./programs/bench
-BENCH_ARTIFACTS_DIR=./program_artifacts/bench
+deps-macos:
+	brew tap riscv-software-src/riscv
+	brew install riscv-software-src/riscv/riscv-gnu-toolchain
 
-SHARED_TARGET_DIR=./shared_target
+ASM_PROGRAMS_DIR=./executor/programs/asm
+ASM_ARTIFACTS_DIR=./executor/program_artifacts/asm
+
+RUST_PROGRAMS_DIR=./executor/programs/rust
+RUST_ARTIFACTS_DIR=./executor/program_artifacts/rust
+
+BENCH_PROGRAMS_DIR=./executor/programs/bench
+BENCH_ARTIFACTS_DIR=./executor/program_artifacts/bench
+
+SHARED_TARGET_DIR=./executor/shared_target
 
 ASM_PROGRAMS = $(wildcard $(ASM_PROGRAMS_DIR)/*.s)
 ARTIFACTS_ASM = $(patsubst $(ASM_PROGRAMS_DIR)/%.s, $(ASM_ARTIFACTS_DIR)/%.elf, $(ASM_PROGRAMS))
@@ -22,7 +43,7 @@ BENCH_PROGRAM_DIRS := $(dir $(wildcard $(BENCH_PROGRAMS_DIR)/*/Cargo.toml))
 BENCH_PROGRAMS := $(notdir $(basename $(BENCH_PROGRAM_DIRS:%/=%)))
 BENCH_ARTIFACTS := $(addprefix $(BENCH_ARTIFACTS_DIR)/, $(addsuffix .elf, $(BENCH_PROGRAMS)))
 
-ETHREX_FILE := tests/ethrex_hoodi.bin
+ETHREX_FILE := executor/tests/ethrex_hoodi.bin
 ETHREX_URL := https://lambda.alignedlayer.com/ethrex_hoodi.bin
 
 SYSROOT_DIR := /opt/lambda-vm-sysroot
@@ -30,7 +51,7 @@ SYSROOT_TARBALL := /tmp/lambda-vm-sysroot-rv64im.tar.gz
 SYSROOT_URL := https://lambda.alignedlayer.com/lambda-vm-sysroot-rv64im.tar.gz
 
 # Custom RV64IM target spec location
-RV64_TARGET_SPEC=$(CURDIR)/programs/riscv64im-lambda-vm-elf.json
+RV64_TARGET_SPEC=$(CURDIR)/executor/programs/riscv64im-lambda-vm-elf.json
 
 .PHONY: test prepare-test-data prepare-sysroot
 
@@ -102,35 +123,21 @@ clean-shared:
 
 clean: clean-asm clean-rust clean-bench clean-shared
 
-test: compile-programs test-no-compile
+test-executor: compile-programs test-no-compile
 
 test-asm: compile-programs-asm test-asm-no-compile
 
 test-asm-no-compile:
-	cargo test --test asm
+	cargo test -p executor --test asm
 
 test-rust: compile-programs-rust prepare-test-data
-	cargo test --test rust
+	cargo test -p executor --test rust
+
+test-rust-no-compile:
+	cargo test -p executor --test rust
 
 test-no-compile: prepare-test-data
+	cargo test -p executor
+
+test: compile-programs prepare-test-data
 	cargo test
-
-.PHONY: deps
-deps:
-ifeq ($(UNAME), Linux)
-deps: deps-linux
-endif
-ifeq ($(UNAME), Darwin)
-deps: deps-macos
-endif
-
-.PHONY: deps-linux
-deps-linux:
-	@# TODO
-	@echo "not yet implemented"
-	@exit 1
-
-.PHONY: deps-macos
-deps-macos:
-	brew tap riscv-software-src/riscv
-	brew install riscv-software-src/riscv/riscv-gnu-toolchain
