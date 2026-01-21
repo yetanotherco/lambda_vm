@@ -49,6 +49,46 @@ impl AsBytes for u64 {
     }
 }
 
+impl ByteConversion for u64 {
+    #[cfg(feature = "alloc")]
+    fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
+        self.to_be_bytes().to_vec()
+    }
+
+    #[cfg(feature = "alloc")]
+    fn to_bytes_le(&self) -> alloc::vec::Vec<u8> {
+        self.to_le_bytes().to_vec()
+    }
+
+    fn from_bytes_be(bytes: &[u8]) -> Result<Self, ByteConversionError>
+    where
+        Self: Sized,
+    {
+        let needed_bytes = bytes
+            .get(0..8)
+            .ok_or(ByteConversionError::FromBEBytesError)?;
+        Ok(u64::from_be_bytes(
+            needed_bytes
+                .try_into()
+                .map_err(|_| ByteConversionError::FromBEBytesError)?,
+        ))
+    }
+
+    fn from_bytes_le(bytes: &[u8]) -> Result<Self, ByteConversionError>
+    where
+        Self: Sized,
+    {
+        let needed_bytes = bytes
+            .get(0..8)
+            .ok_or(ByteConversionError::FromLEBytesError)?;
+        Ok(u64::from_le_bytes(
+            needed_bytes
+                .try_into()
+                .map_err(|_| ByteConversionError::FromLEBytesError)?,
+        ))
+    }
+}
+
 /// Deserialize function without args
 pub trait Deserializable {
     fn deserialize(bytes: &[u8]) -> Result<Self, DeserializationError>

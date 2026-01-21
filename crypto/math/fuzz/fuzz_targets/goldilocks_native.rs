@@ -1,23 +1,11 @@
-//! Differential fuzzer for Goldilocks field implementations.
-//!
-//! Compares:
-//! - Native Goldilocks (u64_goldilocks_native) operations
-//! - Montgomery Goldilocks (u64_goldilocks) operations as reference
-//!
-//! With asm-arm64 feature enabled, this also validates that ASM
-//! implementations produce identical results to native Rust.
+//! Fuzzer for native Goldilocks field operations against a reference implementation.
 
 #![no_main]
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
-use math::field::{
-    element::FieldElement,
-    fields::fft_friendly::{
-        u64_goldilocks::U64GoldilocksPrimeField, u64_goldilocks_native::GoldilocksField,
-    },
-    traits::IsField,
-};
+use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
+use math::field::traits::IsField;
 
 /// Input for fuzzing field operations
 #[derive(Debug, Arbitrary)]
@@ -39,94 +27,115 @@ fn canonicalize(x: u64) -> u64 {
     }
 }
 
+#[inline]
+fn mod_add(a: u64, b: u64) -> u64 {
+    ((a as u128 + b as u128) % GOLDILOCKS_PRIME as u128) as u64
+}
+
+#[inline]
+fn mod_sub(a: u64, b: u64) -> u64 {
+    ((a as u128 + GOLDILOCKS_PRIME as u128 - b as u128) % GOLDILOCKS_PRIME as u128) as u64
+}
+
+#[inline]
+fn mod_mul(a: u64, b: u64) -> u64 {
+    ((a as u128 * b as u128) % GOLDILOCKS_PRIME as u128) as u64
+}
+
+#[inline]
+fn mod_neg(a: u64) -> u64 {
+    if a == 0 { 0 } else { GOLDILOCKS_PRIME - a }
+}
+
+fn mod_pow(mut base: u64, mut exp: u64) -> u64 {
+    let mut result = 1u64;
+    while exp > 0 {
+        if exp & 1 == 1 {
+            result = mod_mul(result, base);
+        }
+        base = mod_mul(base, base);
+        exp >>= 1;
+    }
+    result
+}
+
+#[inline]
+fn mod_inv(a: u64) -> u64 {
+    mod_pow(a, GOLDILOCKS_PRIME - 2)
+}
+
 fuzz_target!(|input: FuzzInput| {
     // Reduce inputs to canonical range for fair comparison
     let a_native = input.a % GOLDILOCKS_PRIME;
     let b_native = input.b % GOLDILOCKS_PRIME;
 
-    // Create Montgomery field elements from canonical values
-    let a_mont = FieldElement::<U64GoldilocksPrimeField>::from(a_native);
-    let b_mont = FieldElement::<U64GoldilocksPrimeField>::from(b_native);
-
     // Test addition
     let sum_native = GoldilocksField::add(&a_native, &b_native);
-    let sum_mont = &a_mont + &b_mont;
-    let sum_mont_canonical = sum_mont.representative().limbs[0];
     assert_eq!(
         canonicalize(sum_native),
-        sum_mont_canonical,
-        "Addition mismatch: native={}, mont={}, a={}, b={}",
+        mod_add(a_native, b_native),
+        "Addition mismatch: native={}, ref={}, a={}, b={}",
         canonicalize(sum_native),
-        sum_mont_canonical,
+        mod_add(a_native, b_native),
         a_native,
         b_native
     );
 
     // Test subtraction
     let diff_native = GoldilocksField::sub(&a_native, &b_native);
-    let diff_mont = &a_mont - &b_mont;
-    let diff_mont_canonical = diff_mont.representative().limbs[0];
     assert_eq!(
         canonicalize(diff_native),
-        diff_mont_canonical,
-        "Subtraction mismatch: native={}, mont={}, a={}, b={}",
+        mod_sub(a_native, b_native),
+        "Subtraction mismatch: native={}, ref={}, a={}, b={}",
         canonicalize(diff_native),
-        diff_mont_canonical,
+        mod_sub(a_native, b_native),
         a_native,
         b_native
     );
 
     // Test multiplication
     let prod_native = GoldilocksField::mul(&a_native, &b_native);
-    let prod_mont = &a_mont * &b_mont;
-    let prod_mont_canonical = prod_mont.representative().limbs[0];
     assert_eq!(
         canonicalize(prod_native),
-        prod_mont_canonical,
-        "Multiplication mismatch: native={}, mont={}, a={}, b={}",
+        mod_mul(a_native, b_native),
+        "Multiplication mismatch: native={}, ref={}, a={}, b={}",
         canonicalize(prod_native),
-        prod_mont_canonical,
+        mod_mul(a_native, b_native),
         a_native,
         b_native
     );
 
     // Test squaring
     let sq_native = GoldilocksField::square(&a_native);
-    let sq_mont = &a_mont * &a_mont;
-    let sq_mont_canonical = sq_mont.representative().limbs[0];
     assert_eq!(
         canonicalize(sq_native),
-        sq_mont_canonical,
-        "Squaring mismatch: native={}, mont={}, a={}",
+        mod_mul(a_native, a_native),
+        "Squaring mismatch: native={}, ref={}, a={}",
         canonicalize(sq_native),
-        sq_mont_canonical,
+        mod_mul(a_native, a_native),
         a_native
     );
 
     // Test negation
     let neg_native = GoldilocksField::neg(&a_native);
-    let neg_mont = -&a_mont;
-    let neg_mont_canonical = neg_mont.representative().limbs[0];
     assert_eq!(
         canonicalize(neg_native),
-        neg_mont_canonical,
-        "Negation mismatch: native={}, mont={}, a={}",
+        mod_neg(a_native),
+        "Negation mismatch: native={}, ref={}, a={}",
         canonicalize(neg_native),
-        neg_mont_canonical,
+        mod_neg(a_native),
         a_native
     );
 
     // Test inversion (skip zero)
     if a_native != 0 {
         let inv_native = GoldilocksField::inv(&a_native).unwrap();
-        let inv_mont = a_mont.inv().unwrap();
-        let inv_mont_canonical = inv_mont.representative().limbs[0];
         assert_eq!(
             canonicalize(inv_native),
-            inv_mont_canonical,
-            "Inversion mismatch: native={}, mont={}, a={}",
+            mod_inv(a_native),
+            "Inversion mismatch: native={}, ref={}, a={}",
             canonicalize(inv_native),
-            inv_mont_canonical,
+            mod_inv(a_native),
             a_native
         );
 
@@ -144,14 +153,12 @@ fuzz_target!(|input: FuzzInput| {
     // Test division (skip if b is zero)
     if b_native != 0 {
         let div_native = GoldilocksField::div(&a_native, &b_native).unwrap();
-        let div_mont = (&a_mont / &b_mont).unwrap();
-        let div_mont_canonical = div_mont.representative().limbs[0];
         assert_eq!(
             canonicalize(div_native),
-            div_mont_canonical,
-            "Division mismatch: native={}, mont={}, a={}, b={}",
+            mod_mul(a_native, mod_inv(b_native)),
+            "Division mismatch: native={}, ref={}, a={}, b={}",
             canonicalize(div_native),
-            div_mont_canonical,
+            mod_mul(a_native, mod_inv(b_native)),
             a_native,
             b_native
         );
@@ -159,14 +166,12 @@ fuzz_target!(|input: FuzzInput| {
 
     // Test doubling
     let double_native = GoldilocksField::double(&a_native);
-    let double_mont = &a_mont + &a_mont;
-    let double_mont_canonical = double_mont.representative().limbs[0];
     assert_eq!(
         canonicalize(double_native),
-        double_mont_canonical,
-        "Doubling mismatch: native={}, mont={}, a={}",
+        mod_add(a_native, a_native),
+        "Doubling mismatch: native={}, ref={}, a={}",
         canonicalize(double_native),
-        double_mont_canonical,
+        mod_add(a_native, a_native),
         a_native
     );
 });
