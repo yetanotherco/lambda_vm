@@ -33,7 +33,8 @@ The #decode table is comprised of #nr_variables variables that are expressed usi
 The #decode table must be padded to a length that is a power of two.
 Empty rows with the following content can be added to achieve this:
 #render_chip_padding_table(chip, config)
-
+Note that this row sets the `EBREAK` flag.
+Given that `CPU` asserts that `EBREAK = 0` (see @cpu:c:ebreak_traps), using this "padding-instruction" would immediately make the CPU table unprovable.
 
 == Decoding
 For the purposes of explaining decoding, we decompress #decode's `packed_decode` variable into its constituent variables.

@@ -4,8 +4,7 @@ name = "DECODE"
 name = "pc"
 type = "DWordWL"
 desc = "value of the program counter this instruction is associated with."
-# TODO(#136): fix this when padding the CPU
-pad = 1
+pad = 0
 
 [[variables.output]]
 name = "packed_decode"
@@ -43,7 +42,7 @@ A list of each variable and the bit(-range) in which it is located:\\
 [48] `EBREAK`; \\
 the remaining bits are set to zero.
 """
-pad = 0
+pad = ["^", 2, 48]
 
 [[variables.output]]
 name = "imm"

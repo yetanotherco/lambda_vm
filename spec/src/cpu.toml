@@ -702,6 +702,7 @@ kind = "arith"
 constraint = "`!EBREAK`"
 desc = "We treat `EBREAK` as an unprovable trap"
 poly = ["not", "EBREAK"]
+ref = "cpu:c:ebreak_traps"
 
 # TODO: no types available, so no casting yet
 [[constraints.sys]]
