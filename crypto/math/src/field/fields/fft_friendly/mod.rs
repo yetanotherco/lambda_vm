@@ -19,7 +19,7 @@ pub mod babybear_u32;
 /// Implementation of the extension of degree 4 of the babybear field using u32.
 pub mod quartic_babybear_u32;
 
-///
+/// Quadratic and cubic extensions of the native Goldilocks field
 pub mod extensions_goldilocks_native;
-///
+/// Optimized native Goldilocks field p = 2^64 - 2^32 + 1 (no Montgomery form)
 pub mod u64_goldilocks_native;
