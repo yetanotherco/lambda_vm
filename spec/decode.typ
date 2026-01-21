@@ -218,3 +218,10 @@ We note the following about the above decoding table:
     )
   )
 )
+
+== One more instruction
+In addition to decoding all instructions provided in the ELF and adding a corresponding entry to the #decode table, one must include an entry that has $#`pc` = 1$ and every other variable set to $0$.
+Note that this will never conflict with any entry in the ELF, since it has an odd `pc` value.
+
+This entry is used to pad the `CPU` table.
+More details on this matter are provided in the `CPU` chip.
