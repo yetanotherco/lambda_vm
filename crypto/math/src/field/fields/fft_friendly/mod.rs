@@ -18,3 +18,8 @@ pub mod babybear_u32;
 
 /// Implementation of the extension of degree 4 of the babybear field using u32.
 pub mod quartic_babybear_u32;
+
+///
+pub mod extensions_goldilocks_native;
+///
+pub mod u64_goldilocks_native;
