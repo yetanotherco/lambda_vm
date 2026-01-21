@@ -305,15 +305,23 @@ impl CpuOperation {
         Self::default()
     }
 
-    /// Compute arg1 from rv1 based on word_instr flag.
+    /// Compute arg1 from rv1 based on word_instr and signed flags.
     ///
-    /// For word instructions, arg1 is zero-extended from the lower 32 bits.
-    /// (Sign extension happens in rvd, not in the arithmetic computation.)
+    /// Per spec constraint: arg1[4:] = rv1[2] * (1 - word_instr) + (2^32 - 1) * rv1_sign_bit * signed
+    ///
+    /// For 64-bit instructions: pass through full rv1
+    /// For unsigned word instructions: zero-extend from 32 bits
+    /// For signed word instructions: sign-extend from 32 bits
     pub fn compute_arg1(&self) -> u64 {
         if self.word_instr {
-            // Zero extend from 32 bits for word instructions
-            // The ADD constraint computes the full 64-bit sum with carry
-            self.rv1 & 0xFFFF_FFFF
+            let lower_32 = self.rv1 & 0xFFFF_FFFF;
+            if self.signed && Self::sign_bit_32(self.rv1) {
+                // Sign extend: set upper 32 bits to all 1s
+                lower_32 | (0xFFFF_FFFF_u64 << 32)
+            } else {
+                // Zero extend: upper 32 bits are 0
+                lower_32
+            }
         } else {
             self.rv1
         }
@@ -321,29 +329,70 @@ impl CpuOperation {
 
     /// Compute arg2 based on instruction type.
     ///
-    /// For STORE/LOAD/BEQ/BLT: uses rv2
-    /// Otherwise: uses imm (when rs2=0) or rv2
-    /// For word instructions, zero-extends from 32 bits.
+    /// Per spec constraint for arg2[4:]:
+    /// (1-STORE-LOAD) * ((1-word_instr)*rv2[2] + signed*arg2_sign_bit*(2^32-1)) + (1-BEQ-BLT)*imm[1]
+    ///
+    /// For LOAD/STORE: uses imm (full 64-bit, for address calculation)
+    /// For BEQ/BLT: uses rv2 (full 64-bit, comparing register values)
+    /// Otherwise: uses imm (when rs2=0) or rv2, with sign extension for signed word instructions
     pub fn compute_arg2(&self) -> u64 {
-        let base = if self.op_store || self.op_load || self.op_beq || self.op_blt {
+        if self.op_load || self.op_store {
+            // LOAD/STORE: address = rv1 + imm, use full imm
+            self.imm
+        } else if self.op_beq || self.op_blt {
+            // BEQ/BLT: compare rv1 vs rv2, use full rv2
             self.rv2
         } else {
-            // For other ops, use imm (the spec assumes rs2=0 or imm=0)
-            if self.rs2 == 0 { self.imm } else { self.rv2 }
-        };
+            // For other ops, use imm (when rs2=0) or rv2
+            let base = if self.rs2 == 0 { self.imm } else { self.rv2 };
 
-        // For word instructions, zero-extend from 32 bits
-        // (Sign extension happens in rvd, not in the arithmetic computation)
-        if self.word_instr {
-            base & 0xFFFF_FFFF
-        } else {
-            base
+            // For word instructions, apply sign/zero extension based on signed flag
+            if self.word_instr {
+                let lower_32 = base & 0xFFFF_FFFF;
+                if self.signed && Self::sign_bit_32(base) {
+                    // Sign extend: set upper 32 bits to all 1s
+                    lower_32 | (0xFFFF_FFFF_u64 << 32)
+                } else {
+                    // Zero extend: upper 32 bits are 0
+                    lower_32
+                }
+            } else {
+                base
+            }
         }
     }
 
     /// Extract sign bit of a 32-bit word (bit 31).
     pub fn sign_bit_32(val: u64) -> bool {
         (val >> 31) & 1 == 1
+    }
+
+    /// Compute rvd (destination register value) based on res and word_instr.
+    ///
+    /// According to spec constraints:
+    /// - rvd[0] = res[:4] (lower 32 bits of res)
+    /// - rvd[1] = (1 - word_instr) * res[4:] + res_sign_bit * (2^32 - 1)
+    ///
+    /// For LOAD: rvd comes from the executor (loaded value), not this method.
+    /// For all other operations: rvd is computed from res with sign extension.
+    pub fn compute_rvd(&self) -> u64 {
+        let res = self.compute_res();
+        let res_lo = res & 0xFFFF_FFFF;
+
+        if self.word_instr {
+            // Sign extend from 32 bits
+            let res_sign_bit = Self::sign_bit_32(res);
+            if res_sign_bit {
+                // Upper 32 bits = 0xFFFF_FFFF (sign extension)
+                res_lo | (0xFFFF_FFFF_u64 << 32)
+            } else {
+                // Upper 32 bits = 0 (zero extension)
+                res_lo
+            }
+        } else {
+            // rvd = res (full 64-bit value)
+            res
+        }
     }
 
     /// Compute the result based on operation type.
@@ -359,7 +408,10 @@ impl CpuOperation {
         let arg1 = self.compute_arg1();
         let arg2 = self.compute_arg2();
 
-        if self.op_add {
+        if self.op_add || self.op_load || self.op_store {
+            // ADD constraint: arg1 + arg2 = res
+            // For ADD: computes arithmetic result
+            // For LOAD/STORE: computes memory address (rv1 + imm)
             arg1.wrapping_add(arg2)
         } else if self.op_sub {
             // SUB constraint checks: res + arg2 = arg1, so res = arg1 - arg2
@@ -592,39 +644,53 @@ impl CpuOperation {
                 op.rs1 = src1 as u8;
                 op.rs2 = src2 as u8;
                 op.imm = offset as i64 as u64;
-                // res is the subtraction result for comparison
-                op.res = log.src1_val.wrapping_sub(log.src2_val);
                 op.is_equal = log.src1_val == log.src2_val;
 
                 match cond {
                     Comparison::Equal => {
                         op.op_beq = true;
+                        // BEQ uses SUB constraint: res = arg1 - arg2
+                        op.res = log.src1_val.wrapping_sub(log.src2_val);
                         op.branch_cond = log.src1_val == log.src2_val;
                     }
                     Comparison::NotEqual => {
                         op.op_beq = true;
                         op.mp_selector = true; // Inverted
+                        // BNE uses SUB constraint: res = arg1 - arg2
+                        op.res = log.src1_val.wrapping_sub(log.src2_val);
                         op.branch_cond = log.src1_val != log.src2_val;
                     }
                     Comparison::LessThan => {
                         op.op_blt = true;
                         op.signed = true;
-                        op.branch_cond = (log.src1_val as i64) < (log.src2_val as i64);
+                        // BLT uses LT table: res[0] = comparison result, res[1..7] = 0
+                        let lt_result = (log.src1_val as i64) < (log.src2_val as i64);
+                        op.res = lt_result as u64;
+                        op.branch_cond = lt_result;
                     }
                     Comparison::LessThanUnsigned => {
                         op.op_blt = true;
-                        op.branch_cond = log.src1_val < log.src2_val;
+                        // BLTU uses LT table: res[0] = comparison result, res[1..7] = 0
+                        let lt_result = log.src1_val < log.src2_val;
+                        op.res = lt_result as u64;
+                        op.branch_cond = lt_result;
                     }
                     Comparison::GreaterOrEqual => {
                         op.op_blt = true;
                         op.signed = true;
                         op.mp_selector = true; // Inverted
-                        op.branch_cond = (log.src1_val as i64) >= (log.src2_val as i64);
+                        // BGE uses LT table with inversion: res[0] = arg1 < arg2
+                        let lt_result = (log.src1_val as i64) < (log.src2_val as i64);
+                        op.res = lt_result as u64;
+                        op.branch_cond = !lt_result; // Inverted: >= means NOT <
                     }
                     Comparison::GreaterOrEqualUnsigned => {
                         op.op_blt = true;
                         op.mp_selector = true; // Inverted
-                        op.branch_cond = log.src1_val >= log.src2_val;
+                        // BGEU uses LT table with inversion: res[0] = arg1 < arg2
+                        let lt_result = log.src1_val < log.src2_val;
+                        op.res = lt_result as u64;
+                        op.branch_cond = !lt_result; // Inverted: >= means NOT <
                     }
                 }
             }
@@ -834,8 +900,17 @@ pub fn generate_cpu_trace(
         // Output columns
         data[base + cols::NEXT_PC_0] = FE::from(op.next_pc & 0xFFFF_FFFF);
         data[base + cols::NEXT_PC_1] = FE::from(op.next_pc >> 32);
-        data[base + cols::RVD_0] = FE::from(op.rvd & 0xFFFF_FFFF);
-        data[base + cols::RVD_1] = FE::from(op.rvd >> 32);
+
+        // rvd: For LOAD, use the executor's loaded value (op.rvd).
+        // For all other operations (including STORE), compute from res with sign extension.
+        // This satisfies spec constraint: (1-LOAD) * (rvd - res_extended) = 0
+        let rvd = if op.op_load {
+            op.rvd // Loaded value from executor
+        } else {
+            op.compute_rvd() // res with sign extension for word instructions
+        };
+        data[base + cols::RVD_0] = FE::from(rvd & 0xFFFF_FFFF);
+        data[base + cols::RVD_1] = FE::from(rvd >> 32);
 
         // Auxiliary: rv1 as DWordWHH [Half, Half, Word] - Word is MSB (bits 32-63)
         data[base + cols::RV1_0] = FE::from(op.rv1 & 0xFFFF); // bits 0-15 (Half)

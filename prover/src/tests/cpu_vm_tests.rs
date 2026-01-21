@@ -360,7 +360,9 @@ fn test_cpu_operation_from_log_branch() {
     assert!(op.op_blt);
     assert!(op.signed);
     assert!(op.branch_cond); // 10 < 20
-    assert_eq!(op.res, 10u64.wrapping_sub(20)); // Subtraction result
+    // For BLT, res is the comparison result (0 or 1), not subtraction
+    // res[0] = 1 if arg1 < arg2, res[1..7] = 0 (enforced by SLT res zero constraint)
+    assert_eq!(op.res, 1); // 10 < 20 = true
 }
 
 #[test]

@@ -936,6 +936,8 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg2UpperCon
 /// Constraint: (1-LOAD) * (rvd[0] - res[:4]) = 0
 ///
 /// When not LOAD, rvd lower 32 bits equals res lower 32 bits.
+/// For LOAD: rvd is the loaded value, not res (which is the address).
+/// For non-LOAD ops (including STORE): rvd must equal res in the trace.
 pub struct RvdLowerConstraint {
     constraint_idx: usize,
 }
@@ -1007,6 +1009,8 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RvdLowerCons
 /// Constraint: (1-LOAD) * (rvd[1] - ((1-word_instr)*res[4:] + res_sign_bit*(2^32-1))) = 0
 ///
 /// When not LOAD, rvd upper 32 bits equals res upper with sign extension.
+/// For LOAD: rvd is the loaded value, not res (which is the address).
+/// For non-LOAD ops (including STORE): rvd must equal res in the trace.
 pub struct RvdUpperConstraint {
     constraint_idx: usize,
 }

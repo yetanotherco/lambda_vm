@@ -1097,3 +1097,97 @@ fn test_debug_slt_trace() {
         println!();
     }
 }
+
+// =========================================================================
+// New comprehensive tests for all instructions
+// =========================================================================
+
+#[test]
+fn test_vm_prover_test_xor_8() {
+    let logs = run_asm_elf("test_xor_8");
+    assert_eq!(logs.len(), 8);
+    let mut cpu_trace = generate_cpu_trace_from_logs(&logs);
+    let bitwise_lookups = collect_bitwise_lookups_from_logs(&logs);
+    let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
+    println!("test_xor_8: {} lookups", bitwise_lookups.len());
+    assert!(prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace), "test_xor_8 failed");
+}
+
+#[test]
+fn test_vm_prover_test_lb_lh_8() {
+    let logs = run_asm_elf("test_lb_lh_8");
+    assert_eq!(logs.len(), 8);
+    let mut cpu_trace = generate_cpu_trace_from_logs(&logs);
+    let bitwise_lookups = collect_bitwise_lookups_from_logs(&logs);
+    let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
+    println!("test_lb_lh_8: {} lookups", bitwise_lookups.len());
+    assert!(prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace), "test_lb_lh_8 failed");
+}
+
+#[test]
+fn test_vm_prover_test_sb_sh_8() {
+    let logs = run_asm_elf("test_sb_sh_8");
+    assert_eq!(logs.len(), 8);
+    let mut cpu_trace = generate_cpu_trace_from_logs(&logs);
+    let bitwise_lookups = collect_bitwise_lookups_from_logs(&logs);
+    let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
+    println!("test_sb_sh_8: {} lookups", bitwise_lookups.len());
+    assert!(prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace), "test_sb_sh_8 failed");
+}
+
+#[test]
+fn test_vm_prover_all_branches_16() {
+    // Initialize logger to see debug constraint validation output
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let logs = run_asm_elf("all_branches_16");
+    assert_eq!(logs.len(), 16);
+    let mut cpu_trace = generate_cpu_trace_from_logs(&logs);
+
+    // BLT instructions need LT table (like SLT)
+    let lt_lookups = collect_lt_lookups_from_logs(&logs);
+    let mut lt_trace = generate_lt_trace(&lt_lookups);
+
+    // Collect ALL bitwise lookups: from CPU + from LT table
+    let mut bitwise_lookups = collect_bitwise_lookups_from_logs(&logs);
+    let lt_bitwise_lookups = collect_bitwise_lookups_from_lt(&lt_lookups);
+    bitwise_lookups.extend(lt_bitwise_lookups);
+    let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
+
+    println!("all_branches_16: {} bitwise lookups, {} lt lookups", bitwise_lookups.len(), lt_lookups.len());
+    assert!(prove_and_verify_vm_with_lt(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace), "all_branches_16 failed");
+}
+
+#[test]
+fn test_vm_prover_all_loadstore_32() {
+    let logs = run_asm_elf("all_loadstore_32");
+    assert_eq!(logs.len(), 32);
+    let mut cpu_trace = generate_cpu_trace_from_logs(&logs);
+    let bitwise_lookups = collect_bitwise_lookups_from_logs(&logs);
+    let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
+    println!("all_loadstore_32: {} lookups", bitwise_lookups.len());
+    assert!(prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace), "all_loadstore_32 failed");
+}
+
+#[test]
+fn test_vm_prover_all_instructions_64() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let logs = run_asm_elf("all_instructions_64");
+    assert_eq!(logs.len(), 64);
+    let mut cpu_trace = generate_cpu_trace_from_logs(&logs);
+
+    // Includes SLT/SLTU instructions - need LT table
+    let lt_lookups = collect_lt_lookups_from_logs(&logs);
+    let mut lt_trace = generate_lt_trace(&lt_lookups);
+
+    // Collect ALL bitwise lookups: from CPU + from LT table
+    // Using minimal bitwise trace for fast debugging
+    let mut bitwise_lookups = collect_bitwise_lookups_from_logs(&logs);
+    let lt_bitwise_lookups = collect_bitwise_lookups_from_lt(&lt_lookups);
+    bitwise_lookups.extend(lt_bitwise_lookups);
+    let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
+
+    println!("all_instructions_64: {} bitwise lookups, {} lt lookups", bitwise_lookups.len(), lt_lookups.len());
+    assert!(prove_and_verify_vm_with_lt(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace), "all_instructions_64 failed");
+}

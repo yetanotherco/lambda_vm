@@ -62,9 +62,9 @@ fn test_cpu_operation_compute_arg1_word_sign_extend_negative() {
     op.word_instr = true;
     op.signed = true;
 
-    // For word instructions, compute_arg1 zero-extends (not sign-extends).
-    // Sign extension happens in rvd, not in the arithmetic computation.
-    assert_eq!(op.compute_arg1(), 0x8000_0001);
+    // Per spec constraint: arg1[4:] = (2^32-1) * rv1_sign_bit * signed
+    // For signed word instructions with sign bit set, arg1 is sign-extended.
+    assert_eq!(op.compute_arg1(), 0xFFFF_FFFF_8000_0001);
 }
 
 #[test]
@@ -74,8 +74,9 @@ fn test_cpu_operation_compute_arg2_store() {
     op.imm = 0x1234;
     op.op_store = true;
 
-    // STORE uses rv2
-    assert_eq!(op.compute_arg2(), 0xDEAD_BEEF);
+    // STORE uses imm for address calculation (addr = rv1 + imm)
+    // rv2 is the value being stored, not part of address
+    assert_eq!(op.compute_arg2(), 0x1234);
 }
 
 #[test]
@@ -85,8 +86,8 @@ fn test_cpu_operation_compute_arg2_load() {
     op.imm = 0x1234;
     op.op_load = true;
 
-    // LOAD uses rv2
-    assert_eq!(op.compute_arg2(), 0xDEAD_BEEF);
+    // LOAD uses imm for address calculation (addr = rv1 + imm)
+    assert_eq!(op.compute_arg2(), 0x1234);
 }
 
 #[test]
