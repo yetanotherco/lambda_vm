@@ -79,8 +79,8 @@ pub fn create_is_bit_constraints(constraint_idx_start: usize) -> (Vec<IsBitConst
 
 /// Creates ADD constraints for the CPU table.
 ///
-/// ADD is used when: ADD + LOAD + STORE = 1
-/// - ADD: arg1 + arg2 = res
+/// ADD template is used when: ADD + LOAD + STORE > 0
+/// - ADD: arg1 + arg2 = res (arithmetic addition)
 /// - LOAD/STORE: base_address + offset = effective_address (in res)
 ///
 /// Returns the constraints and the next available constraint index.
@@ -88,16 +88,14 @@ pub fn create_add_constraints(constraint_idx_start: usize) -> (Vec<AddConstraint
     // For ADD operations, we compute: arg1 + arg2 = res
     // All operands are DWordBL (8 bytes), need to cast to DWordWL (2 words)
 
-    // Condition: ADD + LOAD + STORE
-    // We need a virtual column for this, or we handle it differently.
-    // For now, we'll create separate constraints for each.
-
-    // ADD constraint: when ADD=1, arg1 + arg2 = res
     let lhs = AddOperand::from_dword_bl(cols::ARG1_0);
     let rhs = AddOperand::from_dword_bl(cols::ARG2_0);
     let sum = AddOperand::from_dword_bl(cols::RES_0);
 
-    let (add_c0, add_c1) = AddConstraint::new_pair(cols::ADD, lhs, rhs, sum, constraint_idx_start);
+    // Condition: ADD + LOAD + STORE (active when any of these flags is set)
+    let cond_cols = vec![cols::ADD, cols::LOAD, cols::STORE];
+
+    let (add_c0, add_c1) = AddConstraint::new_pair(cond_cols, lhs, rhs, sum, constraint_idx_start);
 
     (vec![add_c0, add_c1], constraint_idx_start + 2)
 }

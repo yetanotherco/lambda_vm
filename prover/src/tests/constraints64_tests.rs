@@ -33,7 +33,7 @@ fn test_is_bit_constraint_degree() {
 #[test]
 fn test_add_constraint_degree() {
     let (c0, c1) = AddConstraint::new_pair(
-        0,
+        vec![0],
         AddOperand::dword(1),
         AddOperand::dword(3),
         AddOperand::dword(5),
@@ -46,7 +46,7 @@ fn test_add_constraint_degree() {
 #[test]
 fn test_add_constraint_indices() {
     let (c0, c1) = AddConstraint::new_pair(
-        0,
+        vec![0],
         AddOperand::dword(1),
         AddOperand::dword(3),
         AddOperand::dword(5),
