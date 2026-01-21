@@ -26,7 +26,8 @@ use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
 use crate::tables64::bitwise::{
-    bus_interactions as bitwise_bus_interactions, generate_bitwise_trace, update_multiplicities,
+    bus_interactions as bitwise_bus_interactions, cols as bitwise_cols, generate_bitwise_trace,
+    update_multiplicities, BitwiseLookup,
 };
 use crate::tables64::cpu::{
     bus_interactions as cpu_bus_interactions, collect_bitwise_lookups_from_logs,
@@ -266,5 +267,193 @@ fn test_vm_prover_subw() {
     assert!(
         prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace),
         "Proof verification failed for subw program"
+    );
+}
+
+// =============================================================================
+// Fast tests using minimal (dummy) bitwise table
+// =============================================================================
+//
+// These tests use a minimal bitwise table that only contains rows for the
+// actual lookups. This is ~1000x faster than the full 2^20 row table.
+//
+// **WARNING: The minimal table is NOT production-safe!**
+// The verifier expects the full deterministic 2^20 row public table.
+// A minimal table would require the prover to reveal all values,
+// making the proof size unacceptably large.
+
+use std::collections::HashMap;
+
+/// Generates a minimal bitwise trace containing only the rows needed for the given lookups.
+///
+/// **WARNING: FOR TESTING ONLY - NOT PRODUCTION SAFE!**
+fn generate_minimal_bitwise_trace(
+    lookups: &[(BitwiseLookup, u8, u8, u8)],
+) -> TraceTable<F, E> {
+    // Collect unique (x, y, z) tuples and count multiplicities per lookup type
+    let mut row_data: HashMap<(u8, u8, u8), [u64; 11]> = HashMap::new();
+
+    for (lookup_type, x, y, z) in lookups {
+        let key = (*x, *y, *z);
+        let mu_idx = match lookup_type {
+            BitwiseLookup::AndByte => 0,
+            BitwiseLookup::OrByte => 1,
+            BitwiseLookup::XorByte => 2,
+            BitwiseLookup::Msb8 => 3,
+            BitwiseLookup::Msb16 => 4,
+            BitwiseLookup::Zero => 5,
+            BitwiseLookup::IsByte => 6,
+            BitwiseLookup::IsHalf => 7,
+            BitwiseLookup::IsB20 => 8,
+            BitwiseLookup::Hwsl => 9,
+            BitwiseLookup::Hwslc => 10,
+        };
+        row_data.entry(key).or_insert([0; 11])[mu_idx] += 1;
+    }
+
+    // Need at least 4 rows for FRI, pad to power of 2
+    let unique_rows: Vec<_> = row_data.keys().cloned().collect();
+    let num_rows = unique_rows.len().max(4).next_power_of_two();
+
+    type FE = math::field::element::FieldElement<F>;
+    let mut data = vec![FE::zero(); num_rows * bitwise_cols::NUM_COLUMNS];
+
+    for (row_idx, (x, y, z)) in unique_rows.iter().enumerate() {
+        let base = row_idx * bitwise_cols::NUM_COLUMNS;
+        let x = *x as u32;
+        let y = *y as u32;
+        let z = *z as u32;
+
+        // Input columns
+        data[base + bitwise_cols::X] = FE::from(x as u64);
+        data[base + bitwise_cols::Y] = FE::from(y as u64);
+        data[base + bitwise_cols::Z] = FE::from(z as u64);
+
+        // Bitwise operation results
+        data[base + bitwise_cols::AND] = FE::from((x & y) as u64);
+        data[base + bitwise_cols::OR] = FE::from((x | y) as u64);
+        data[base + bitwise_cols::XOR] = FE::from((x ^ y) as u64);
+
+        // MSB extractions
+        let msb8 = (x >> 7) & 1;
+        let halfword = x + y * 256;
+        let msb16 = (halfword >> 15) & 1;
+        data[base + bitwise_cols::MSB8] = FE::from(msb8 as u64);
+        data[base + bitwise_cols::MSB16] = FE::from(msb16 as u64);
+
+        // Zero check
+        let is_zero = if x == 0 && y == 0 { 1u64 } else { 0u64 };
+        data[base + bitwise_cols::ZERO] = FE::from(is_zero);
+
+        // Shift operations
+        let sll = if z == 0 {
+            halfword
+        } else {
+            (halfword << z) & 0xFFFF
+        };
+        let sllc = if z == 0 { 0 } else { halfword >> (16 - z) };
+        data[base + bitwise_cols::SLL] = FE::from(sll as u64);
+        data[base + bitwise_cols::SLLC] = FE::from(sllc as u64);
+
+        // Multiplicity columns
+        let mus = &row_data[&(x as u8, y as u8, z as u8)];
+        data[base + bitwise_cols::MU_AND] = FE::from(mus[0]);
+        data[base + bitwise_cols::MU_OR] = FE::from(mus[1]);
+        data[base + bitwise_cols::MU_XOR] = FE::from(mus[2]);
+        data[base + bitwise_cols::MU_MSB8] = FE::from(mus[3]);
+        data[base + bitwise_cols::MU_MSB16] = FE::from(mus[4]);
+        data[base + bitwise_cols::MU_ZERO] = FE::from(mus[5]);
+        data[base + bitwise_cols::MU_IS_BYTE] = FE::from(mus[6]);
+        data[base + bitwise_cols::MU_IS_HALF] = FE::from(mus[7]);
+        data[base + bitwise_cols::MU_IS_B20] = FE::from(mus[8]);
+        data[base + bitwise_cols::MU_HWSL] = FE::from(mus[9]);
+        data[base + bitwise_cols::MU_HWSLC] = FE::from(mus[10]);
+    }
+
+    TraceTable::new_main(data, bitwise_cols::NUM_COLUMNS, 1)
+}
+
+#[test]
+fn test_vm_prover_lui_fast() {
+    let logs = run_asm_elf("lui");
+    assert_eq!(logs.len(), 2, "lui.elf should have 2 steps");
+
+    let mut cpu_trace = generate_cpu_trace_from_logs(&logs);
+    let bitwise_lookups = collect_bitwise_lookups_from_logs(&logs);
+    let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
+
+    println!(
+        "Fast LUI: CPU {} rows, Bitwise {} rows (minimal), {} lookups",
+        cpu_trace.main_table.height,
+        bitwise_trace.main_table.height,
+        bitwise_lookups.len()
+    );
+
+    assert!(
+        prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace),
+        "Proof verification failed for lui program (fast)"
+    );
+}
+
+#[test]
+fn test_vm_prover_beq_fast() {
+    let logs = run_asm_elf("beq");
+    println!("beq.elf has {} steps", logs.len());
+
+    let mut cpu_trace = generate_cpu_trace_from_logs(&logs);
+    let bitwise_lookups = collect_bitwise_lookups_from_logs(&logs);
+    let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
+
+    println!(
+        "Fast BEQ: Bitwise {} rows (minimal), {} lookups",
+        bitwise_trace.main_table.height,
+        bitwise_lookups.len()
+    );
+
+    assert!(
+        prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace),
+        "Proof verification failed for beq program (fast)"
+    );
+}
+
+#[test]
+fn test_vm_prover_add_64bit_fast() {
+    let logs = run_asm_elf("add_64bit");
+    println!("add_64bit.elf has {} steps", logs.len());
+
+    let mut cpu_trace = generate_cpu_trace_from_logs(&logs);
+    let bitwise_lookups = collect_bitwise_lookups_from_logs(&logs);
+    let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
+
+    println!(
+        "Fast ADD64: Bitwise {} rows (minimal), {} lookups",
+        bitwise_trace.main_table.height,
+        bitwise_lookups.len()
+    );
+
+    assert!(
+        prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace),
+        "Proof verification failed for add_64bit program (fast)"
+    );
+}
+
+#[test]
+fn test_vm_prover_subw_fast() {
+    let logs = run_asm_elf("subw");
+    println!("subw.elf has {} steps", logs.len());
+
+    let mut cpu_trace = generate_cpu_trace_from_logs(&logs);
+    let bitwise_lookups = collect_bitwise_lookups_from_logs(&logs);
+    let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
+
+    println!(
+        "Fast SUBW: Bitwise {} rows (minimal), {} lookups",
+        bitwise_trace.main_table.height,
+        bitwise_lookups.len()
+    );
+
+    assert!(
+        prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace),
+        "Proof verification failed for subw program (fast)"
     );
 }

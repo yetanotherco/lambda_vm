@@ -196,7 +196,7 @@ pub fn update_multiplicities(
 }
 
 /// Types of lookups the BITWISE table provides.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BitwiseLookup {
     AndByte,
     OrByte,
@@ -433,3 +433,4 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ),
     ]
 }
+
