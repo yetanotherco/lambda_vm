@@ -47,16 +47,16 @@
 
 #let PREC = (
   "MIN": -1, // <the most secret heart of any expression>
-  "pow": 0,  // ^
-  "neg": 1,  // Unary -
-  "cast": 2, // cast
-  "mul": 3,  // *
-  "div": 4,  // /
-  "sum": 5,  // Σ
-  "not": 6,  // not
-  "add": 7,  // +
-  "sub": 8,  // -
-  "idx": 9,  // []
+  "idx": 0,  // []
+  "pow": 1,  // ^
+  "neg": 2,  // Unary -
+  "cast": 3, // cast
+  "mul": 4,  // *
+  "div": 5,  // /
+  "sum": 6,  // Σ
+  "not": 7,  // not
+  "add": 8,  // +
+  "sub": 9,  // -
   "eq": 10,   // = and :=
   "MAX": 11, // <the void outside every expression>
 )
