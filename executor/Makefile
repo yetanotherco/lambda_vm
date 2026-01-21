@@ -25,17 +25,32 @@ BENCH_ARTIFACTS := $(addprefix $(BENCH_ARTIFACTS_DIR)/, $(addsuffix .elf, $(BENC
 ETHREX_FILE := tests/ethrex_hoodi.bin
 ETHREX_URL := https://lambda.alignedlayer.com/ethrex_hoodi.bin
 
+SYSROOT_DIR := /opt/lambda-vm-sysroot
+SYSROOT_TARBALL := /tmp/lambda-vm-sysroot-rv64im.tar.gz
+SYSROOT_URL := https://lambda.alignedlayer.com/lambda-vm-sysroot-rv64im.tar.gz
+
 # Custom RV64IM target spec location
 RV64_TARGET_SPEC=$(CURDIR)/programs/riscv64im-lambda-vm-elf.json
 
-.PHONY: test prepare-test-data
+.PHONY: test prepare-test-data prepare-sysroot
 
-prepare-test-data:
+prepare-test-data: prepare-sysroot
 	@if [ ! -f "$(ETHREX_FILE)" ]; then \
 		echo "Downloading ethrex_hoodi.bin..."; \
 		curl -L "$(ETHREX_URL)" -o "$(ETHREX_FILE)"; \
 	else \
 		echo "ethrex_hoodi.bin already exists"; \
+	fi
+
+prepare-sysroot:
+	@if [ ! -d "$(SYSROOT_DIR)" ]; then \
+		echo "Downloading lambda-vm-sysroot-rv64im.tar.gz..."; \
+		curl -L "$(SYSROOT_URL)" -o "$(SYSROOT_TARBALL)"; \
+		echo "Extracting sysroot to $(SYSROOT_DIR)..."; \
+		sudo mkdir -p /opt && sudo tar -xzf "$(SYSROOT_TARBALL)" -C /opt; \
+		rm "$(SYSROOT_TARBALL)"; \
+	else \
+		echo "Sysroot already exists at $(SYSROOT_DIR)"; \
 	fi
 
 compile-programs-asm: $(ARTIFACTS_ASM)
