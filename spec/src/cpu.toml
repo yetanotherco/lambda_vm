@@ -30,6 +30,16 @@ type = "Byte"
 desc = "Destination register index"
 
 [[variables.input]]
+name = "read_register1"
+type = "Bit"
+desc = "Whether to read from `rs1` (1) or to place a 0 in `rv1` (0)"
+
+[[variables.input]]
+name = "read_register2"
+type = "Bit"
+desc = "Whether to read from `rs2` (1) or to place a 0 in `rv2` (0)"
+
+[[variables.input]]
 name = "write_register"
 type = "Bit"
 desc = "Whether to write back to the destination register"
@@ -234,35 +244,37 @@ desc = "Whether a branch is taken, i.e., the branch condition"
 name = "packed_decode"
 type = "BaseField"
 desc = "A packed representation of all bit flags and register indices obtained from the decoding"
-poly = ["+",
-    ["*", ["^", 2, 0], "write_register"],
-    ["*", ["^", 2, 1], "memory_2bytes"],
-    ["*", ["^", 2, 2], "memory_4bytes"],
-    ["*", ["^", 2, 3], "memory_8bytes"],
-    ["*", ["^", 2, 4], "c_type_instruction"],
-    ["*", ["^", 2, 5], "signed"],
-    ["*", ["^", 2, 6], "mp_selector"],
-    ["*", ["^", 2, 7], "muldiv_selector"],
-    ["*", ["^", 2, 8], "word_instr"],
-    ["*", ["^", 2, 9], "ADD"],
-    ["*", ["^", 2, 10], "SUB"],
-    ["*", ["^", 2, 11], "SLT"],
-    ["*", ["^", 2, 12], "AND"],
-    ["*", ["^", 2, 13], "OR"],
-    ["*", ["^", 2, 14], "XOR"],
-    ["*", ["^", 2, 15], "SHIFT"],
-    ["*", ["^", 2, 16], "JALR"],
-    ["*", ["^", 2, 17], "BEQ"],
-    ["*", ["^", 2, 18], "BLT"],
-    ["*", ["^", 2, 19], "LOAD"],
-    ["*", ["^", 2, 20], "STORE"],
-    ["*", ["^", 2, 21], "MUL"],
-    ["*", ["^", 2, 22], "DIVREM"],
-    ["*", ["^", 2, 23], "ECALL"],
-    ["*", ["^", 2, 24], "EBREAK"],
-    ["*", ["^", 2, 25], "rs1"],
-    ["*", ["^", 2, 33], "rs2"],
-    ["*", ["^", 2, 41], "rd"],
+def = ["+",
+    ["*", ["^", 2, 0], "read_register1"],
+    ["*", ["^", 2, 1], "read_register2"],
+    ["*", ["^", 2, 2], "write_register"],
+    ["*", ["^", 2, 3], "memory_2bytes"],
+    ["*", ["^", 2, 4], "memory_4bytes"],
+    ["*", ["^", 2, 5], "memory_8bytes"],
+    ["*", ["^", 2, 6], "c_type_instruction"],
+    ["*", ["^", 2, 7], "signed"],
+    ["*", ["^", 2, 8], "mp_selector"],
+    ["*", ["^", 2, 9], "muldiv_selector"],
+    ["*", ["^", 2, 10], "word_instr"],
+    ["*", ["^", 2, 11], "ADD"],
+    ["*", ["^", 2, 12], "SUB"],
+    ["*", ["^", 2, 13], "SLT"],
+    ["*", ["^", 2, 14], "AND"],
+    ["*", ["^", 2, 15], "OR"],
+    ["*", ["^", 2, 16], "XOR"],
+    ["*", ["^", 2, 17], "SHIFT"],
+    ["*", ["^", 2, 18], "JALR"],
+    ["*", ["^", 2, 19], "BEQ"],
+    ["*", ["^", 2, 20], "BLT"],
+    ["*", ["^", 2, 21], "LOAD"],
+    ["*", ["^", 2, 22], "STORE"],
+    ["*", ["^", 2, 23], "MUL"],
+    ["*", ["^", 2, 24], "DIVREM"],
+    ["*", ["^", 2, 25], "ECALL"],
+    ["*", ["^", 2, 26], "EBREAK"],
+    ["*", ["^", 2, 27], "rs1"],
+    ["*", ["^", 2, 35], "rs2"],
+    ["*", ["^", 2, 43], "rd"],
 ]
 
 
@@ -286,6 +298,18 @@ input = ["pc", "imm", "packed_decode"]
 [[constraint_groups]]
 name = "range"
 prefix = "R"
+
+[[constraints.range]]
+kind = "template"
+tag = "IS_BIT"
+input = ["read_register1"]
+ref = "cpu:c:range_read_register1"
+
+[[constraints.range]]
+kind = "template"
+tag = "IS_BIT"
+input = ["read_register2"]
+ref = "cpu:c:range_read_register2"
 
 [[constraints.range]]
 kind = "template"
@@ -568,6 +592,13 @@ kind = "interaction"
 tag = "MEMW"
 input = [1, ["*", 2, "rs1"], "rv1", ["+", "timestamp", 0], 1, 0, 0]
 output = "rv1"
+multiplicity = "read_register1"
+
+[[constraints.mem]]
+kind = "arith"
+constraint = "`!read_register1` => `rv1[i]` = 0"
+poly = ["*", ["not", "register1"], ["idx", "rv1", "i"]]
+iter = ["i", 0, 2]
 
 # TODO: no types available, so no casting yet
 [[constraints.mem]]
@@ -575,6 +606,13 @@ kind = "interaction"
 tag = "MEMW"
 input = [1, ["*", 2, "rs2"], "rv2", ["+", "timestamp", 1], 1, 0, 0]
 output = "rv2"
+multiplicity = "read_register2"
+
+[[constraints.mem]]
+kind = "arith"
+constraint = "`!read_register2` => `rv2[i]` = 0"
+poly = ["*", ["not", "register2"], ["idx", "rv2", "i"]]
+iter = ["i", 0, 2]
 
 # TODO: no types available, so no casting yet
 [[constraints.mem]]
