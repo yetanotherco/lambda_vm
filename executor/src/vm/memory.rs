@@ -142,7 +142,7 @@ impl Memory {
         }
         self.store_word(PUBLIC_OUTPUT_START_INDEX, length as u32)?;
         let inputs = self.load_bytes(address, length);
-        self.set_bytes_aligned(&inputs, PUBLIC_OUTPUT_START_INDEX + 4)?;
+        self.set_bytes_aligned(PUBLIC_OUTPUT_START_INDEX + 4, &inputs)?;
         Ok(())
     }
 
@@ -156,7 +156,7 @@ impl Memory {
             return Err(MemoryError::PrivateInputSizeExceeded);
         }
         self.store_word(PRIVATE_INPUT_START_INDEX, inputs.len() as u32)?;
-        self.set_bytes_aligned(&inputs, PRIVATE_INPUT_START_INDEX + 4)?;
+        self.set_bytes_aligned(PRIVATE_INPUT_START_INDEX + 4, &inputs)?;
         Ok(())
     }
 
@@ -183,7 +183,7 @@ impl Memory {
 
     /// Helper method to store a given input at an aligned address. It may also overwrite existing bytes with zero if inputs is not divisible by 4
     /// Should only be used to write to public output and private input where these limitations are not a problem
-    fn set_bytes_aligned(&mut self, inputs: &[u8], mut addr: u64) -> Result<(), MemoryError> {
+    fn set_bytes_aligned(&mut self, mut addr: u64, inputs: &[u8]) -> Result<(), MemoryError> {
         if !addr.is_multiple_of(4) {
             return Err(MemoryError::UnalignedAccess);
         }
