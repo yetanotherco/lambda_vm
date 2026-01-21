@@ -126,6 +126,10 @@ range = ["i", 0, 3]
 ref = "lt:a:range_d"
 
 [[assumptions]]
+desc = "`IS_BIT<signed>`"
+ref = "lt:a:range_signed"
+
+[[assumptions]]
 desc = "`IS_HALF[q[i]]`"
 range = ["i", 0, 3]
 ref = "lt:a:range_q"
@@ -278,7 +282,7 @@ ref = "dvrm:c:abs_d_if_nonnegative"
 [[constraints.abs_diff]]
 kind = "interaction"
 tag = "LT"
-input = ["abs_r", "abs_d"]
+input = ["abs_r", "abs_d", 0]
 output = 1
 multiplicity = ["not", "div_by_zero"]
 ref ="dvrm:c:abs_r_lt_abs_d"
