@@ -17,13 +17,13 @@ fn main() {
     // Use a representative workload for profiling
     let proof_options = ProofOptions {
         blowup_factor: 4,
-        fri_number_of_queries: 30,
+        fri_number_of_queries: 100,
         coset_offset: 3,
         grinding_factor: 0,
     };
 
     let num_columns = 16;
-    let trace_length = 65536; // 2^16
+    let trace_length = 1048576; // 2^20 = 1.048.576
 
     println!("Starting STARK prover profiling...");
     println!("Configuration:");
