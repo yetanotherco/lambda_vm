@@ -142,7 +142,7 @@ impl Memory {
         }
         self.store_word(PUBLIC_OUTPUT_START_INDEX, length as u32)?;
         let inputs = self.load_bytes(address, length);
-        self.store_bytes(inputs, PUBLIC_OUTPUT_START_INDEX + 4)?;
+        self.store_bytes_aligned(inputs, PUBLIC_OUTPUT_START_INDEX + 4)?;
         Ok(())
     }
 
@@ -156,7 +156,7 @@ impl Memory {
             return Err(MemoryError::PrivateInputSizeExceeded);
         }
         self.store_word(PRIVATE_INPUT_START_INDEX, inputs.len() as u32)?;
-        self.store_bytes(inputs, PRIVATE_INPUT_START_INDEX + 4)?;
+        self.store_bytes_aligned(inputs, PRIVATE_INPUT_START_INDEX + 4)?;
         Ok(())
     }
 
@@ -181,7 +181,11 @@ impl Memory {
         result
     }
 
-    pub fn store_bytes(&mut self, inputs: Vec<u8>, mut addr: u64) -> Result<(), MemoryError> {
+    pub fn store_bytes_aligned(
+        &mut self,
+        inputs: Vec<u8>,
+        mut addr: u64,
+    ) -> Result<(), MemoryError> {
         if !addr.is_multiple_of(4) {
             return Err(MemoryError::UnalignedAccess);
         }
