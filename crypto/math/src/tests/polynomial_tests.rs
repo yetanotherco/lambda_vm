@@ -3,7 +3,7 @@ mod tests {
     use crate::field::element::FieldElement;
     use crate::field::fields::u64_prime_field::U64PrimeField;
     use crate::field::traits::{IsField, IsPrimeField, IsSubFieldOf};
-    use crate::polynomial::{pad_with_zero_coefficients, Polynomial};
+    use crate::polynomial::{Polynomial, pad_with_zero_coefficients};
     use alloc::string::{String, ToString};
     use alloc::{format, vec, vec::Vec};
 
@@ -23,7 +23,9 @@ mod tests {
     }
 
     /// Returns the derivative of the polynomial with respect to x
-    fn differentiate<F: IsField>(poly: &Polynomial<FieldElement<F>>) -> Polynomial<FieldElement<F>> {
+    fn differentiate<F: IsField>(
+        poly: &Polynomial<FieldElement<F>>,
+    ) -> Polynomial<FieldElement<F>> {
         let degree = poly.degree();
         if degree == 0 {
             return Polynomial::zero();
