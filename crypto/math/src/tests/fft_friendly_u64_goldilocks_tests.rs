@@ -1,10 +1,15 @@
 use crate::field::element::FieldElement;
-use crate::field::fields::fft_friendly::u64_goldilocks::U64GoldilocksPrimeField;
+use crate::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
 use crate::field::traits::IsFFTField;
 use crate::traits::ByteConversion;
 
-type F = U64GoldilocksPrimeField;
+type F = GoldilocksField;
 type FE = FieldElement<F>;
+
+fn fe_from_hex(hex: &str) -> FE {
+    let value = u64::from_str_radix(hex, 16).unwrap();
+    FE::from(value)
+}
 
 #[test]
 fn two_adic_primitve_root_of_unity_is_correct() {
@@ -45,11 +50,7 @@ fn primitive_root_of_unity_powers() {
 #[test]
 #[cfg(feature = "alloc")]
 fn byte_serialization_for_a_number_matches_with_byte_conversion_implementation_le() {
-    let element = FieldElement::<U64GoldilocksPrimeField>::from_hex_unchecked(
-        "\
-        0123456701234567\
-    ",
-    );
+    let element = fe_from_hex("0123456701234567");
     let bytes = element.to_bytes_le();
     let expected_bytes: [u8; 8] = ByteConversion::to_bytes_le(&element).try_into().unwrap();
     assert_eq!(bytes, expected_bytes);
@@ -58,11 +59,7 @@ fn byte_serialization_for_a_number_matches_with_byte_conversion_implementation_l
 #[test]
 #[cfg(feature = "alloc")]
 fn byte_serialization_for_a_number_matches_with_byte_conversion_implementation_be() {
-    let element = FieldElement::<U64GoldilocksPrimeField>::from_hex_unchecked(
-        "\
-        0123456701234567\
-    ",
-    );
+    let element = fe_from_hex("0123456701234567");
     let bytes = element.to_bytes_be();
     let expected_bytes: [u8; 8] = ByteConversion::to_bytes_be(&element).try_into().unwrap();
     assert_eq!(bytes, expected_bytes);
@@ -70,25 +67,17 @@ fn byte_serialization_for_a_number_matches_with_byte_conversion_implementation_b
 
 #[test]
 fn byte_serialization_and_deserialization_works_le() {
-    let element = FieldElement::<U64GoldilocksPrimeField>::from_hex_unchecked(
-        "\
-        7654321076543210\
-    ",
-    );
+    let element = fe_from_hex("7654321076543210");
     let bytes = element.to_bytes_le();
-    let from_bytes = FieldElement::<U64GoldilocksPrimeField>::from_bytes_le(&bytes).unwrap();
+    let from_bytes = FieldElement::<GoldilocksField>::from_bytes_le(&bytes).unwrap();
     assert_eq!(element, from_bytes);
 }
 
 #[test]
 fn byte_serialization_and_deserialization_works_be() {
-    let element = FieldElement::<U64GoldilocksPrimeField>::from_hex_unchecked(
-        "\
-        7654321076543210\
-    ",
-    );
+    let element = fe_from_hex("7654321076543210");
     let bytes = element.to_bytes_be();
-    let from_bytes = FieldElement::<U64GoldilocksPrimeField>::from_bytes_be(&bytes).unwrap();
+    let from_bytes = FieldElement::<GoldilocksField>::from_bytes_be(&bytes).unwrap();
     assert_eq!(element, from_bytes);
 }
 
@@ -173,30 +162,30 @@ mod fft_tests {
         fn powers_of_two(max_exp: u8)(exp in 1..max_exp) -> usize { 1 << exp }
     }
     prop_compose! {
-        fn field_element()(num in any::<u64>().prop_filter("Avoid null coefficients", |x| x != &0)) -> FieldElement<U64GoldilocksPrimeField> {
-            FieldElement::<U64GoldilocksPrimeField>::from(num)
+        fn field_element()(num in any::<u64>().prop_filter("Avoid null coefficients", |x| x != &0)) -> FieldElement<GoldilocksField> {
+            FieldElement::<GoldilocksField>::from(num)
         }
     }
     prop_compose! {
-        fn offset()(num in any::<u64>(), factor in any::<u64>()) -> FieldElement<U64GoldilocksPrimeField> { FieldElement::<U64GoldilocksPrimeField>::from(num).pow(factor) }
+        fn offset()(num in any::<u64>(), factor in any::<u64>()) -> FieldElement<GoldilocksField> { FieldElement::<GoldilocksField>::from(num).pow(factor) }
     }
     prop_compose! {
-        fn field_vec(max_exp: u8)(vec in collection::vec(field_element(), 0..1 << max_exp)) -> Vec<FieldElement<U64GoldilocksPrimeField>> {
+        fn field_vec(max_exp: u8)(vec in collection::vec(field_element(), 0..1 << max_exp)) -> Vec<FieldElement<GoldilocksField>> {
             vec
         }
     }
     prop_compose! {
-        fn non_power_of_two_sized_field_vec(max_exp: u8)(vec in collection::vec(field_element(), 2..1<<max_exp).prop_filter("Avoid polynomials of size power of two", |vec| !vec.len().is_power_of_two())) -> Vec<FieldElement<U64GoldilocksPrimeField>> {
+        fn non_power_of_two_sized_field_vec(max_exp: u8)(vec in collection::vec(field_element(), 2..1<<max_exp).prop_filter("Avoid polynomials of size power of two", |vec| !vec.len().is_power_of_two())) -> Vec<FieldElement<GoldilocksField>> {
             vec
         }
     }
     prop_compose! {
-        fn poly(max_exp: u8)(coeffs in field_vec(max_exp)) -> Polynomial<FieldElement<U64GoldilocksPrimeField>> {
+        fn poly(max_exp: u8)(coeffs in field_vec(max_exp)) -> Polynomial<FieldElement<GoldilocksField>> {
             Polynomial::new(&coeffs)
         }
     }
     prop_compose! {
-        fn poly_with_non_power_of_two_coeffs(max_exp: u8)(coeffs in non_power_of_two_sized_field_vec(max_exp)) -> Polynomial<FieldElement<U64GoldilocksPrimeField>> {
+        fn poly_with_non_power_of_two_coeffs(max_exp: u8)(coeffs in non_power_of_two_sized_field_vec(max_exp)) -> Polynomial<FieldElement<GoldilocksField>> {
             Polynomial::new(&coeffs)
         }
     }

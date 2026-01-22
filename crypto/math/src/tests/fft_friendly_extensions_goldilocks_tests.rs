@@ -2,11 +2,11 @@ use crate::field::{
     element::FieldElement,
     fields::fft_friendly::{
         extensions_goldilocks::{Fp2E, Fp3E},
-        u64_goldilocks::U64GoldilocksPrimeField,
+        u64_goldilocks::GoldilocksField,
     },
 };
 
-type FpE = FieldElement<U64GoldilocksPrimeField>;
+type FpE = FieldElement<GoldilocksField>;
 
 // =====================================================
 // QUADRATIC EXTENSION TESTS

@@ -47,9 +47,12 @@ lambdaworks-serde-string = ["dep:serde", "dep:serde_json", "alloc"]
 proptest = ["dep:proptest"]
 instruments = []
 
-
 # gpu
 cuda = ["dep:cudarc", "dep:lambdaworks-gpu"]
 
 [target.wasm32-unknown-unknown.dependencies]
 getrandom = { version = "0.2.15", features = ["js"] }
+
+[[bench]]
+name = "goldilocks_benchmark"
+harness = false

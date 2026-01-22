@@ -11,10 +11,10 @@
 
 use math::field::element::FieldElement;
 use math::field::fields::fft_friendly::extensions_goldilocks::Degree3GoldilocksExtensionField;
-use math::field::fields::fft_friendly::u64_goldilocks::U64GoldilocksPrimeField;
+use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField as GoldilocksBaseField;
 
 /// Base field type: Goldilocks prime field (p = 2^64 - 2^32 + 1)
-pub type GoldilocksField = U64GoldilocksPrimeField;
+pub type GoldilocksField = GoldilocksBaseField;
 
 /// Extension field type: Degree 3 extension of Goldilocks (w³ = 2)
 pub type GoldilocksExtension = Degree3GoldilocksExtensionField;
