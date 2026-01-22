@@ -11,7 +11,6 @@ Right now, this is a project under development and experimentation and must not 
 ### Dependencies
 
 - Rust nightly with `rust-src` component
-- Risc-V toolchain (To run executor tests)
 
 ### Dev dependencies
 
