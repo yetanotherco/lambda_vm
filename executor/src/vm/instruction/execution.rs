@@ -174,6 +174,7 @@ impl Instruction {
                     LoadStoreWidth::HalfUnsigned => memory.load_half(addr)? as u64,
                     // RV64: LWU zero-extends to 64 bits
                     LoadStoreWidth::WordUnsigned => memory.load_word(addr)? as u64,
+                    //new line for lock report
                 };
                 registers.write(dst, value)?;
                 Log {
