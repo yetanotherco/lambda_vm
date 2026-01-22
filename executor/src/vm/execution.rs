@@ -1,4 +1,4 @@
-use std::fmt::Debug;
+use std::{cmp::Ordering, fmt::Debug};
 
 use crate::vm::{
     instruction::{
@@ -114,25 +114,35 @@ impl InstructionCache {
     }
 
     pub fn get(&self, pc: u64) -> Option<&Instruction> {
-        use std::cmp::Ordering;
+        // Fast path: most programs have a single executable segment
+        let segment = if self.segments.len() == 1 {
+            let seg = &self.segments[0];
+            if pc < seg.base_addr || pc >= seg.end_addr() {
+                return None;
+            }
+            seg
+        } else {
+            // Use binary search to find the segment containing pc
+            let idx = self
+                .segments
+                .binary_search_by(|seg| {
+                    if pc < seg.base_addr {
+                        Ordering::Greater
+                    } else if pc >= seg.end_addr() {
+                        Ordering::Less
+                    } else {
+                        Ordering::Equal
+                    }
+                })
+                .ok()?;
+            &self.segments[idx]
+        };
 
-        let idx = self
-            .segments
-            .binary_search_by(|seg| {
-                if pc < seg.base_addr {
-                    Ordering::Greater
-                } else if pc >= seg.end_addr() {
-                    Ordering::Less
-                } else {
-                    Ordering::Equal
-                }
-            })
-            .ok()?;
-
-        let segment = &self.segments[idx];
         let byte_offset = pc - segment.base_addr;
-        let offset = (byte_offset.checked_div(4)?) as usize;
-        segment.instructions.get(offset)
+        if byte_offset % 4 != 0 {
+            return None;
+        }
+        segment.instructions.get((byte_offset / 4) as usize)
     }
 
     pub fn instruction_count(&self) -> usize {
