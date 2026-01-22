@@ -58,7 +58,6 @@ impl Instruction {
                 let res = op.apply(op1, imm as i64) as u64;
                 registers.write(dst, res)?;
                 Log {
-                    instruction: self,
                     current_pc: pc,
                     next_pc: pc.wrapping_add(REGULAR_PC_UPDATE),
                     src1_val: op1 as u64,
@@ -76,7 +75,6 @@ impl Instruction {
                 let res = res32 as i64 as u64; // Sign-extend to 64 bits
                 registers.write(dst, res)?;
                 Log {
-                    instruction: self,
                     current_pc: pc,
                     next_pc: pc.wrapping_add(REGULAR_PC_UPDATE),
                     src1_val: op1 as u64,
@@ -89,7 +87,6 @@ impl Instruction {
                 let new_pc = (((base_value as i64).wrapping_add(offset as i64)) & !1) as u64;
                 registers.write(dst, pc.wrapping_add(REGULAR_PC_UPDATE))?;
                 Log {
-                    instruction: self,
                     current_pc: pc,
                     next_pc: new_pc,
                     src1_val: base_value,
@@ -100,7 +97,6 @@ impl Instruction {
             Instruction::JumpAndLink { dst, offset } => {
                 registers.write(dst, pc.wrapping_add(REGULAR_PC_UPDATE))?;
                 Log {
-                    instruction: self,
                     current_pc: pc,
                     next_pc: (pc as i64).wrapping_add(offset as i64) as u64,
                     src1_val: 0,
@@ -143,7 +139,6 @@ impl Instruction {
                     }
                 };
                 Log {
-                    instruction: self,
                     current_pc: pc,
                     next_pc: pc.wrapping_add(REGULAR_PC_UPDATE),
                     src1_val: base,
@@ -177,7 +172,6 @@ impl Instruction {
                 };
                 registers.write(dst, value)?;
                 Log {
-                    instruction: self,
                     current_pc: pc,
                     next_pc: pc.wrapping_add(REGULAR_PC_UPDATE),
                     src1_val: base,
@@ -198,7 +192,6 @@ impl Instruction {
                     pc.wrapping_add(REGULAR_PC_UPDATE)
                 };
                 Log {
-                    instruction: self,
                     current_pc: pc,
                     next_pc: new_pc,
                     src1_val: a,
@@ -211,7 +204,6 @@ impl Instruction {
                 let value = (imm as i32) as i64 as u64;
                 registers.write(dst, value)?;
                 Log {
-                    instruction: self,
                     current_pc: pc,
                     next_pc: pc.wrapping_add(REGULAR_PC_UPDATE),
                     src1_val: 0,
@@ -224,7 +216,6 @@ impl Instruction {
                 let value = pc.wrapping_add((imm as i32) as i64 as u64);
                 registers.write(dst, value)?;
                 Log {
-                    instruction: self,
                     current_pc: pc,
                     next_pc: pc.wrapping_add(REGULAR_PC_UPDATE),
                     src1_val: 0,
@@ -243,7 +234,6 @@ impl Instruction {
                 let res = op.apply(a as i64, b as i64) as u64;
                 registers.write(dst, res)?;
                 Log {
-                    instruction: self,
                     current_pc: pc,
                     next_pc: pc.wrapping_add(REGULAR_PC_UPDATE),
                     src1_val: a,
@@ -264,7 +254,6 @@ impl Instruction {
                 let res = res32 as i64 as u64; // Sign-extend to 64 bits
                 registers.write(dst, res)?;
                 Log {
-                    instruction: self,
                     current_pc: pc,
                     next_pc: pc.wrapping_add(REGULAR_PC_UPDATE),
                     src1_val: a as u64,
@@ -280,7 +269,6 @@ impl Instruction {
             } => {
                 // Todo: CSR are currently no-ops
                 Log {
-                    instruction: self,
                     current_pc: pc,
                     next_pc: pc.wrapping_add(REGULAR_PC_UPDATE),
                     src1_val: 0,
@@ -336,7 +324,6 @@ impl Instruction {
                     SyscallNumbers::Halt => {
                         // halt
                         return Ok(Log {
-                            instruction: self,
                             current_pc: pc,
                             next_pc: 0, // We halt by setting pc to 0
                             src1_val: 0,
@@ -346,7 +333,6 @@ impl Instruction {
                     }
                 }
                 Log {
-                    instruction: self,
                     current_pc: pc,
                     next_pc: pc + REGULAR_PC_UPDATE,
                     src1_val: 0,

@@ -56,9 +56,27 @@ use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 use executor::vm::{
     instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth},
     logs::Log,
+    memory::U64HashMap,
 };
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::trace::TraceTable;
+
+#[derive(Debug)]
+pub enum CpuTraceError {
+    InstructionNotFound(u64),
+}
+
+impl std::fmt::Display for CpuTraceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CpuTraceError::InstructionNotFound(pc) => {
+                write!(f, "Instruction not found for pc: 0x{:x}", pc)
+            }
+        }
+    }
+}
+
+impl std::error::Error for CpuTraceError {}
 
 // =========================================================================
 // Column indices for CPU table
@@ -497,7 +515,7 @@ impl CpuOperation {
     /// Creates a CpuOperation from an executor Log.
     ///
     /// This is the main integration point between the executor and the prover.
-    pub fn from_log(log: &Log, timestamp: u64) -> Self {
+    pub fn from_log(log: &Log, instruction: Instruction, timestamp: u64) -> Self {
         let mut op = Self {
             timestamp,
             pc: log.current_pc,
@@ -509,7 +527,7 @@ impl CpuOperation {
             ..Default::default()
         };
 
-        match log.instruction {
+        match instruction {
             Instruction::Arith {
                 dst,
                 src1,
@@ -962,16 +980,20 @@ pub fn generate_cpu_trace(
 /// This is a convenience function that converts logs to CpuOperations
 /// and then generates the trace.
 ///
+/// Returns an error if an instruction is not found for a PC in the logs.
 /// Panics if logs.len() is not a power of 2 >= 4.
 pub fn generate_cpu_trace_from_logs(
     logs: &[Log],
-) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let operations: Vec<CpuOperation> = logs
-        .iter()
-        .enumerate()
-        .map(|(i, log)| CpuOperation::from_log(log, (i as u64) * 4))
-        .collect();
-    generate_cpu_trace(&operations)
+    instructions: &U64HashMap<Instruction>,
+) -> Result<TraceTable<GoldilocksField, GoldilocksExtension>, CpuTraceError> {
+    let mut operations = Vec::with_capacity(logs.len());
+    for (i, log) in logs.iter().enumerate() {
+        let instruction = *instructions
+            .get(&log.current_pc)
+            .ok_or(CpuTraceError::InstructionNotFound(log.current_pc))?;
+        operations.push(CpuOperation::from_log(log, instruction, (i as u64) * 4));
+    }
+    Ok(generate_cpu_trace(&operations))
 }
 
 /// Collects all Bitwise lookups from a list of CPU operations.
@@ -989,15 +1011,19 @@ pub fn collect_bitwise_lookups(
 /// Collects all Bitwise lookups from executor logs.
 ///
 /// Convenience function that converts logs to operations and collects lookups.
+/// Returns an error if an instruction is not found for a PC in the logs.
 pub fn collect_bitwise_lookups_from_logs(
     logs: &[Log],
-) -> Vec<(super::bitwise::BitwiseLookup, u8, u8, u8)> {
-    let operations: Vec<CpuOperation> = logs
-        .iter()
-        .enumerate()
-        .map(|(i, log)| CpuOperation::from_log(log, (i as u64) * 4))
-        .collect();
-    collect_bitwise_lookups(&operations)
+    instructions: &U64HashMap<Instruction>,
+) -> Result<Vec<(super::bitwise::BitwiseLookup, u8, u8, u8)>, CpuTraceError> {
+    let mut operations = Vec::with_capacity(logs.len());
+    for (i, log) in logs.iter().enumerate() {
+        let instruction = *instructions
+            .get(&log.current_pc)
+            .ok_or(CpuTraceError::InstructionNotFound(log.current_pc))?;
+        operations.push(CpuOperation::from_log(log, instruction, (i as u64) * 4));
+    }
+    Ok(collect_bitwise_lookups(&operations))
 }
 
 // =========================================================================

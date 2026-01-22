@@ -18,10 +18,11 @@ pub fn run_program_and_prover(elf_path: &str) {
     let elf_data = std::fs::read(elf_path).unwrap();
     let program = Elf::load(&elf_data).unwrap();
 
-    let (_results, logs) =
+    let result =
         run_program(program.image, program.entry_point, vec![]).expect("Failed to run program");
 
-    let mut trace = Trace::generate_trace_from_logs(logs);
+    let mut trace = Trace::generate_trace_from_logs(result.logs, &result.instructions)
+        .expect("Failed to generate trace");
 
     let proof_options = ProofOptions::default_test_options();
 

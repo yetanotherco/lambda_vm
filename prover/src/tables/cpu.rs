@@ -112,7 +112,7 @@ impl CpuTableRow {
     pub const BRANCH_COND: usize = 51;
 
     // TODO: Properly migrate to 64-bit when prover is updated (separate PR)
-    pub fn from_log(log: &Log, timestamp: u32) -> Self {
+    pub fn from_log(log: &Log, instruction: Instruction, timestamp: u32) -> Self {
         let mut row = Self {
             timestamp: u32_to_2_limbs(timestamp),
             pc: u32_to_2_limbs(log.current_pc as u32),
@@ -124,7 +124,7 @@ impl CpuTableRow {
             ..Default::default()
         };
 
-        match log.instruction {
+        match instruction {
             Instruction::Arith {
                 dst,
                 src1,

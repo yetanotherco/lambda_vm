@@ -1,5 +1,6 @@
 use executor::vm::instruction::decoding::{ArithOp, Instruction, LoadStoreWidth};
 use executor::vm::logs::Log;
+use executor::vm::memory::U64HashMap;
 use math::field::{
     element::FieldElement, fields::fft_friendly::babybear_u32::Babybear31PrimeField,
 };
@@ -403,15 +404,47 @@ pub fn build_cpu_columns_example() -> Vec<Vec<FE>> {
     columns
 }
 
-pub fn get_add_logs() -> Vec<Log> {
-    vec![
+pub fn get_add_logs() -> (Vec<Log>, U64HashMap<Instruction>) {
+    let mut instructions = U64HashMap::default();
+
+    instructions.insert(
+        65652,
+        Instruction::ArithImm {
+            dst: 12,
+            src: 0,
+            imm: 10,
+            op: ArithOp::Add,
+        },
+    );
+    instructions.insert(
+        65656,
+        Instruction::ArithImm {
+            dst: 13,
+            src: 0,
+            imm: 20,
+            op: ArithOp::Add,
+        },
+    );
+    instructions.insert(
+        65660,
+        Instruction::Arith {
+            dst: 10,
+            src1: 12,
+            src2: 13,
+            op: ArithOp::Add,
+        },
+    );
+    instructions.insert(
+        65664,
+        Instruction::JumpAndLinkRegister {
+            base: 1,
+            dst: 0,
+            offset: 0,
+        },
+    );
+
+    let logs = vec![
         Log {
-            instruction: Instruction::ArithImm {
-                dst: 12,
-                src: 0,
-                imm: 10,
-                op: ArithOp::Add,
-            },
             current_pc: 65652,
             next_pc: 65656,
             src1_val: 0,
@@ -419,12 +452,6 @@ pub fn get_add_logs() -> Vec<Log> {
             dst_val: 10,
         },
         Log {
-            instruction: Instruction::ArithImm {
-                dst: 13,
-                src: 0,
-                imm: 20,
-                op: ArithOp::Add,
-            },
             current_pc: 65656,
             next_pc: 65660,
             src1_val: 0,
@@ -432,12 +459,6 @@ pub fn get_add_logs() -> Vec<Log> {
             dst_val: 20,
         },
         Log {
-            instruction: Instruction::Arith {
-                dst: 10,
-                src1: 12,
-                src2: 13,
-                op: ArithOp::Add,
-            },
             current_pc: 65660,
             next_pc: 65664,
             src1_val: 10,
@@ -445,29 +466,120 @@ pub fn get_add_logs() -> Vec<Log> {
             dst_val: 30,
         },
         Log {
-            instruction: Instruction::JumpAndLinkRegister {
-                base: 1,
-                dst: 0,
-                offset: 0,
-            },
             current_pc: 65664,
             next_pc: 0,
             src1_val: 0,
             src2_val: 0,
             dst_val: 65668,
         },
-    ]
+    ];
+
+    (logs, instructions)
 }
 
-pub fn get_rust_logs() -> Vec<Log> {
-    vec![
+pub fn get_rust_logs() -> (Vec<Log>, U64HashMap<Instruction>) {
+    let mut instructions = U64HashMap::default();
+
+    instructions.insert(
+        70136,
+        Instruction::ArithImm {
+            dst: 2,
+            src: 2,
+            imm: -16,
+            op: ArithOp::Add,
+        },
+    );
+    instructions.insert(
+        70140,
+        Instruction::Store {
+            src: 1,
+            offset: 12,
+            base: 2,
+            width: LoadStoreWidth::Word,
+        },
+    );
+    instructions.insert(
+        70144,
+        Instruction::LoadUpperImm {
+            dst: 10,
+            imm: 3735928832,
+        },
+    );
+    instructions.insert(
+        70148,
+        Instruction::ArithImm {
+            dst: 10,
+            src: 10,
+            imm: -273,
+            op: ArithOp::Add,
+        },
+    );
+    instructions.insert(70152, Instruction::AddUpperImmToPc { dst: 1, imm: 0 });
+    instructions.insert(
+        70156,
+        Instruction::JumpAndLinkRegister {
+            base: 1,
+            dst: 1,
+            offset: -308,
+        },
+    );
+    instructions.insert(
+        69844,
+        Instruction::ArithImm {
+            dst: 2,
+            src: 2,
+            imm: -16,
+            op: ArithOp::Add,
+        },
+    );
+    instructions.insert(
+        69848,
+        Instruction::Store {
+            src: 1,
+            offset: 12,
+            base: 2,
+            width: LoadStoreWidth::Word,
+        },
+    );
+    instructions.insert(69852, Instruction::AddUpperImmToPc { dst: 1, imm: 0 });
+    instructions.insert(
+        69856,
+        Instruction::JumpAndLinkRegister {
+            base: 1,
+            dst: 1,
+            offset: 72,
+        },
+    );
+    instructions.insert(
+        69924,
+        Instruction::ArithImm {
+            dst: 2,
+            src: 2,
+            imm: -16,
+            op: ArithOp::Add,
+        },
+    );
+    instructions.insert(
+        69928,
+        Instruction::Store {
+            src: 1,
+            offset: 12,
+            base: 2,
+            width: LoadStoreWidth::Word,
+        },
+    );
+    instructions.insert(
+        69932,
+        Instruction::ArithImm {
+            dst: 11,
+            src: 10,
+            imm: 8,
+            op: ArithOp::ShiftRightLogical,
+        },
+    );
+
+    let logs = vec![
         Log {
-            instruction: Instruction::ArithImm {
-                dst: 2,
-                src: 2,
-                imm: -16,
-                op: ArithOp::Add,
-            },
             current_pc: 70136,
             next_pc: 70140,
             src1_val: 4294967292,
@@ -475,12 +587,6 @@ pub fn get_rust_logs() -> Vec<Log> {
             dst_val: 4294967276,
         },
         Log {
-            instruction: Instruction::Store {
-                src: 1,
-                offset: 12,
-                base: 2,
-                width: LoadStoreWidth::Word,
-            },
             current_pc: 70140,
             next_pc: 70144,
             src1_val: 4294967276,
@@ -488,10 +594,6 @@ pub fn get_rust_logs() -> Vec<Log> {
             dst_val: 0,
         },
         Log {
-            instruction: Instruction::LoadUpperImm {
-                dst: 10,
-                imm: 3735928832,
-            },
             current_pc: 70144,
             next_pc: 70148,
             src1_val: 0,
@@ -499,12 +601,6 @@ pub fn get_rust_logs() -> Vec<Log> {
             dst_val: 3735928832,
         },
         Log {
-            instruction: Instruction::ArithImm {
-                dst: 10,
-                src: 10,
-                imm: -273,
-                op: ArithOp::Add,
-            },
             current_pc: 70148,
             next_pc: 70152,
             src1_val: 3735928832,
@@ -512,7 +608,6 @@ pub fn get_rust_logs() -> Vec<Log> {
             dst_val: 3735928559,
         },
         Log {
-            instruction: Instruction::AddUpperImmToPc { dst: 1, imm: 0 },
             current_pc: 70152,
             next_pc: 70156,
             src1_val: 0,
@@ -520,11 +615,6 @@ pub fn get_rust_logs() -> Vec<Log> {
             dst_val: 70152,
         },
         Log {
-            instruction: Instruction::JumpAndLinkRegister {
-                base: 1,
-                dst: 1,
-                offset: -308,
-            },
             current_pc: 70156,
             next_pc: 69844,
             src1_val: 70152,
@@ -532,12 +622,6 @@ pub fn get_rust_logs() -> Vec<Log> {
             dst_val: 70160,
         },
         Log {
-            instruction: Instruction::ArithImm {
-                dst: 2,
-                src: 2,
-                imm: -16,
-                op: ArithOp::Add,
-            },
             current_pc: 69844,
             next_pc: 69848,
             src1_val: 4294967276,
@@ -545,12 +629,6 @@ pub fn get_rust_logs() -> Vec<Log> {
             dst_val: 4294967260,
         },
         Log {
-            instruction: Instruction::Store {
-                src: 1,
-                offset: 12,
-                base: 2,
-                width: LoadStoreWidth::Word,
-            },
             current_pc: 69848,
             next_pc: 69852,
             src1_val: 4294967260,
@@ -558,7 +636,6 @@ pub fn get_rust_logs() -> Vec<Log> {
             dst_val: 0,
         },
         Log {
-            instruction: Instruction::AddUpperImmToPc { dst: 1, imm: 0 },
             current_pc: 69852,
             next_pc: 69856,
             src1_val: 0,
@@ -566,11 +643,6 @@ pub fn get_rust_logs() -> Vec<Log> {
             dst_val: 69852,
         },
         Log {
-            instruction: Instruction::JumpAndLinkRegister {
-                base: 1,
-                dst: 1,
-                offset: 72,
-            },
             current_pc: 69856,
             next_pc: 69924,
             src1_val: 69852,
@@ -578,12 +650,6 @@ pub fn get_rust_logs() -> Vec<Log> {
             dst_val: 69860,
         },
         Log {
-            instruction: Instruction::ArithImm {
-                dst: 2,
-                src: 2,
-                imm: -16,
-                op: ArithOp::Add,
-            },
             current_pc: 69924,
             next_pc: 69928,
             src1_val: 4294967260,
@@ -591,12 +657,6 @@ pub fn get_rust_logs() -> Vec<Log> {
             dst_val: 4294967244,
         },
         Log {
-            instruction: Instruction::Store {
-                src: 1,
-                offset: 12,
-                base: 2,
-                width: LoadStoreWidth::Word,
-            },
             current_pc: 69928,
             next_pc: 69932,
             src1_val: 4294967244,
@@ -604,19 +664,15 @@ pub fn get_rust_logs() -> Vec<Log> {
             dst_val: 0,
         },
         Log {
-            instruction: Instruction::ArithImm {
-                dst: 11,
-                src: 10,
-                imm: 8,
-                op: ArithOp::ShiftRightLogical,
-            },
             current_pc: 69932,
             next_pc: 69936,
             src1_val: 3735928559,
             src2_val: 0,
             dst_val: 14593470,
         },
-    ]
+    ];
+
+    (logs, instructions)
 }
 
 #[cfg(test)]

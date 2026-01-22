@@ -67,13 +67,13 @@ impl DecodeTableRow {
     pub const MULTIPLICITY: usize = 14;
 
     // TODO: Properly migrate to 64-bit when prover is updated (separate PR)
-    pub fn from_log(log: &Log) -> Self {
+    pub fn from_log(log: &Log, instruction: Instruction) -> Self {
         let mut row = Self {
             pc: u32_to_2_limbs(log.current_pc as u32),
             ..Default::default()
         };
 
-        match log.instruction {
+        match instruction {
             Instruction::Arith {
                 dst,
                 src1,

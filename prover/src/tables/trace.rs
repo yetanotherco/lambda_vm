@@ -2,7 +2,11 @@ use crate::tables::{
     cpu::{self, CpuTableRow},
     decode::{self, DecodeTableRow},
 };
-use executor::vm::logs::Log;
+use executor::vm::{
+    instruction::decoding::Instruction,
+    logs::Log,
+    memory::U64HashMap,
+};
 use math::field::{
     element::FieldElement,
     fields::fft_friendly::{
@@ -15,13 +19,33 @@ use stark::trace::TraceTable;
 
 type FE = FieldElement<Babybear31PrimeField>;
 
+#[derive(Debug)]
+pub enum TraceError {
+    InstructionNotFound(u64),
+}
+
+impl std::fmt::Display for TraceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TraceError::InstructionNotFound(pc) => {
+                write!(f, "Instruction not found for pc: 0x{:x}", pc)
+            }
+        }
+    }
+}
+
+impl std::error::Error for TraceError {}
+
 pub struct Trace {
     pub cpu_trace_table: TraceTable<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>,
     pub decode_trace_table: TraceTable<Babybear31PrimeField, Degree4BabyBearU32ExtensionField>,
 }
 
 impl Trace {
-    pub fn generate_trace_from_logs(logs: Vec<Log>) -> Self {
+    pub fn generate_trace_from_logs(
+        logs: Vec<Log>,
+        instructions: &U64HashMap<Instruction>,
+    ) -> Result<Self, TraceError> {
         let mut cpu_table: Vec<FE> = Vec::new();
         let mut decode_table: Vec<FE> = Vec::new();
 
@@ -30,12 +54,15 @@ impl Trace {
         // TODO: Properly migrate to 64-bit when prover is updated (separate PR)
         for (i, log) in logs.iter().enumerate() {
             let timestamp = (i as u32) * 4;
-            cpu_table.extend(CpuTableRow::from_log(log, timestamp).to_vec());
+            let instruction = instructions
+                .get(&log.current_pc)
+                .ok_or(TraceError::InstructionNotFound(log.current_pc))?;
+            cpu_table.extend(CpuTableRow::from_log(log, *instruction, timestamp).to_vec());
 
             decode_map
                 .entry(log.current_pc as u32)
                 .and_modify(|(_, multiplicity)| *multiplicity += 1)
-                .or_insert_with(|| (DecodeTableRow::from_log(log), 1));
+                .or_insert_with(|| (DecodeTableRow::from_log(log, *instruction), 1));
         }
 
         for (mut row, multiplicity) in decode_map.into_values() {
@@ -49,10 +76,10 @@ impl Trace {
         let cpu_trace_table = TraceTable::new_main(cpu_table, cpu::NUM_COLUMNS, 1);
         let decode_trace_table = TraceTable::new_main(decode_table, decode::NUM_COLUMNS, 1);
 
-        Trace {
+        Ok(Trace {
             cpu_trace_table,
             decode_trace_table,
-        }
+        })
     }
 }
 
