@@ -5,9 +5,9 @@
 //! - Trace generation tests
 //! - Integration tests for CpuOperation::from_log (ELF execution)
 
-use crate::tables64::cpu::{CpuOperation, bus_interactions, cols, generate_cpu_trace};
-use crate::tables64::trace_builder::Traces;
-use crate::tables64::types::FE;
+use crate::tables::cpu::{CpuOperation, bus_interactions, cols, generate_cpu_trace};
+use crate::tables::trace_builder::Traces;
+use crate::tables::types::FE;
 
 use executor::{elf::Elf, vm::execution::run_program};
 

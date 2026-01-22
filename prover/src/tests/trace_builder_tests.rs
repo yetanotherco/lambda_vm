@@ -1,10 +1,10 @@
 //! Tests for the trace builder module.
 
-use crate::tables64::bitwise;
-use crate::tables64::cpu::cols;
-use crate::tables64::lt;
-use crate::tables64::trace_builder::Traces;
-use crate::tables64::types::FE;
+use crate::tables::bitwise;
+use crate::tables::cpu::cols;
+use crate::tables::lt;
+use crate::tables::trace_builder::Traces;
+use crate::tables::types::FE;
 use executor::vm::instruction::decoding::{ArithOp, Comparison, Instruction};
 use executor::vm::logs::Log;
 
@@ -73,20 +73,18 @@ fn make_and_log(pc: u64, rs1_val: u64, rs2_val: u64, result: u64) -> Log {
 }
 
 #[test]
+#[should_panic(expected = "CPU trace requires at least 4 operations")]
 fn test_empty_logs() {
-    let traces = Traces::from_logs(&[]);
-
-    assert!(traces.cpu.main_table.height >= 4);
-    assert_eq!(traces.bitwise.main_table.height, bitwise::NUM_ROWS);
-    assert!(traces.lt.main_table.height >= 2);
+    // CPU trace cannot be padded - caller must provide valid power-of-2 operations
+    let _traces = Traces::from_logs(&[]);
 }
 
 #[test]
+#[should_panic(expected = "CPU trace requires at least 4 operations")]
 fn test_single_log() {
+    // CPU trace cannot be padded - caller must provide valid power-of-2 operations
     let logs = vec![make_add_log(0x1000, 10, 20, 30)];
-    let traces = Traces::from_logs(&logs);
-
-    assert_eq!(traces.cpu.main_table.height, 4); // padded
+    let _traces = Traces::from_logs(&logs);
 }
 
 #[test]
@@ -100,13 +98,14 @@ fn test_power_of_two_logs() {
 }
 
 #[test]
+#[should_panic(expected = "CPU trace requires power-of-2 operations")]
 fn test_padding_to_power_of_two() {
+    // CPU trace cannot be padded - caller must provide valid power-of-2 operations
     let logs: Vec<Log> = (0..5)
         .map(|i| make_add_log(0x1000 + i * 4, i, i, i * 2))
         .collect();
 
-    let traces = Traces::from_logs(&logs);
-    assert_eq!(traces.cpu.main_table.height, 8); // 5 -> 8
+    let _traces = Traces::from_logs(&logs);
 }
 
 #[test]

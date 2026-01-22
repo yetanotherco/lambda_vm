@@ -1,0 +1,22 @@
+[package]
+name = "math-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+math = { path = ".." }
+arbitrary = { version = "1", features = ["derive"] }
+
+[[bin]]
+name = "goldilocks_native"
+path = "fuzz_targets/goldilocks_native.rs"
+test = false
+doc = false
+bench = false

@@ -6,7 +6,7 @@
 //! ## Usage
 //!
 //! ```ignore
-//! use prover::tables64::trace_builder::Traces;
+//! use prover::tables::trace_builder::Traces;
 //!
 //! let traces = Traces::from_logs(&logs);
 //! // Use traces.cpu, traces.bitwise, traces.lt

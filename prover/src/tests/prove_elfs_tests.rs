@@ -25,17 +25,17 @@ use stark::trace::TraceTable;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
-use crate::constraints64::cpu::create_all_cpu_constraints;
-use crate::tables64::bitwise::{
+use crate::constraints::cpu::create_all_cpu_constraints;
+use crate::tables::bitwise::{
     BitwiseLookup, bus_interactions as bitwise_bus_interactions, cols as bitwise_cols,
     generate_bitwise_trace, update_multiplicities,
 };
-use crate::tables64::cpu::{CpuOperation, bus_interactions as cpu_bus_interactions};
-use crate::tables64::lt::{
+use crate::tables::cpu::{CpuOperation, bus_interactions as cpu_bus_interactions};
+use crate::tables::lt::{
     LtOperation, bus_interactions as lt_bus_interactions, generate_lt_trace,
 };
-use crate::tables64::trace_builder::Traces;
-use crate::tables64::types::{GoldilocksExtension, GoldilocksField};
+use crate::tables::trace_builder::Traces;
+use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
 type F = GoldilocksField;
 type E = GoldilocksExtension;
@@ -92,7 +92,7 @@ fn create_cpu_air(
     };
 
     AirWithBuses::new(
-        crate::tables64::cpu::cols::NUM_COLUMNS,
+        crate::tables::cpu::cols::NUM_COLUMNS,
         auxiliary_trace_build_data,
         proof_options,
         1,
@@ -110,7 +110,7 @@ fn create_bitwise_air(
     };
 
     AirWithBuses::new(
-        crate::tables64::bitwise::cols::NUM_COLUMNS,
+        crate::tables::bitwise::cols::NUM_COLUMNS,
         auxiliary_trace_build_data,
         proof_options,
         1,
@@ -128,7 +128,7 @@ fn create_lt_air(
     };
 
     AirWithBuses::new(
-        crate::tables64::lt::cols::NUM_COLUMNS,
+        crate::tables::lt::cols::NUM_COLUMNS,
         auxiliary_trace_build_data,
         proof_options,
         1,
@@ -396,7 +396,7 @@ fn test_cpu_only_no_bus() {
     };
     let cpu_air: AirWithBuses<F, E, stark::lookup::NullBoundaryConstraintBuilder, ()> =
         AirWithBuses::new(
-            crate::tables64::cpu::cols::NUM_COLUMNS,
+            crate::tables::cpu::cols::NUM_COLUMNS,
             auxiliary_trace_build_data,
             &proof_options,
             1,
