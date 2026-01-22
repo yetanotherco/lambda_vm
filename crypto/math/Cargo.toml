@@ -47,6 +47,9 @@ lambdaworks-serde-string = ["dep:serde", "dep:serde_json", "alloc"]
 proptest = ["dep:proptest"]
 instruments = []
 
+# ARM64 assembly optimizations for Goldilocks field
+asm-arm64 = []
+
 # gpu
 cuda = ["dep:cudarc", "dep:lambdaworks-gpu"]
 
@@ -55,4 +58,8 @@ getrandom = { version = "0.2.15", features = ["js"] }
 
 [[bench]]
 name = "goldilocks_benchmark"
+harness = false
+
+[[bench]]
+name = "goldilocks_asm_benchmark"
 harness = false

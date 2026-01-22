@@ -19,3 +19,10 @@ pub mod quartic_babybear_u32;
 pub mod extensions_goldilocks;
 /// Optimized Goldilocks field p = 2^64 - 2^32 + 1 (no Montgomery form)
 pub mod u64_goldilocks;
+
+/// ARM64 assembly optimizations for Goldilocks field (enabled with asm-arm64 feature)
+#[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+pub mod u64_goldilocks_asm;
+/// ARM64 assembly optimizations for Goldilocks extensions (enabled with asm-arm64 feature)
+#[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+pub mod goldilocks_extensions_asm;

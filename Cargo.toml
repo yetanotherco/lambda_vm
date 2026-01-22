@@ -7,5 +7,8 @@ members = [
   "crypto/math",
   "bin/cli",
 ]
+exclude = [
+  "crypto/math/fuzz",
+]
 
 resolver = "2"

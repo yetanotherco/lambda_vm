@@ -11,6 +11,10 @@ use crate::field::{
 };
 use crate::traits::{AsBytes, ByteConversion};
 
+// Import ARM64 assembly optimizations when available
+#[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+use super::goldilocks_extensions_asm;
+
 // =====================================================
 // QUADRATIC EXTENSION (Fp2)
 // =====================================================
@@ -29,50 +33,104 @@ impl IsField for Degree2GoldilocksExtensionField {
     type BaseType = [FpE; 2];
 
     /// Returns the component-wise addition of `a` and `b`
+    /// Uses ARM64 assembly optimization when available
     #[inline(always)]
     fn add(a: &Self::BaseType, b: &Self::BaseType) -> Self::BaseType {
-        [a[0] + b[0], a[1] + b[1]]
+        #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+        {
+            let result = goldilocks_extensions_asm::fp2_add(
+                [*a[0].value(), *a[1].value()],
+                [*b[0].value(), *b[1].value()],
+            );
+            [FpE::from_raw(result[0]), FpE::from_raw(result[1])]
+        }
+        #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
+        {
+            [a[0] + b[0], a[1] + b[1]]
+        }
     }
 
     /// Returns the multiplication of `a` and `b`:
     /// (a0 + a1*w) * (b0 + b1*w) = (a0*b0 + W*a1*b1) + (a0*b1 + a1*b0)*w
     /// where w^2 = W = 7
+    /// Uses ARM64 assembly optimization when available
     #[inline(always)]
     fn mul(a: &Self::BaseType, b: &Self::BaseType) -> Self::BaseType {
-        let a0b0 = a[0] * b[0];
-        let a1b1 = a[1] * b[1];
-        let z = (a[0] + a[1]) * (b[0] + b[1]);
+        #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+        {
+            let result = goldilocks_extensions_asm::fp2_mul(
+                [*a[0].value(), *a[1].value()],
+                [*b[0].value(), *b[1].value()],
+            );
+            [FpE::from_raw(result[0]), FpE::from_raw(result[1])]
+        }
+        #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
+        {
+            let a0b0 = a[0] * b[0];
+            let a1b1 = a[1] * b[1];
+            let z = (a[0] + a[1]) * (b[0] + b[1]);
 
-        // W * a1b1 = 7 * a1b1
-        let w_a1b1 = mul_by_7(&a1b1);
+            // W * a1b1 = 7 * a1b1
+            let w_a1b1 = mul_by_7(&a1b1);
 
-        [a0b0 + w_a1b1, z - a0b0 - a1b1]
+            [a0b0 + w_a1b1, z - a0b0 - a1b1]
+        }
     }
 
     /// Returns the square of `a`:
     /// (a0 + a1*w)^2 = (a0^2 + W*a1^2) + 2*a0*a1*w
+    /// Uses ARM64 assembly optimization when available
     #[inline(always)]
     fn square(a: &Self::BaseType) -> Self::BaseType {
-        let a0_sq = a[0].square();
-        let a1_sq = a[1].square();
-        let a0a1 = a[0] * a[1];
+        #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+        {
+            let result = goldilocks_extensions_asm::fp2_square([*a[0].value(), *a[1].value()]);
+            [FpE::from_raw(result[0]), FpE::from_raw(result[1])]
+        }
+        #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
+        {
+            let a0_sq = a[0].square();
+            let a1_sq = a[1].square();
+            let a0a1 = a[0] * a[1];
 
-        // W * a1^2 = 7 * a1^2
-        let w_a1_sq = mul_by_7(&a1_sq);
+            // W * a1^2 = 7 * a1^2
+            let w_a1_sq = mul_by_7(&a1_sq);
 
-        [a0_sq + w_a1_sq, a0a1.double()]
+            [a0_sq + w_a1_sq, a0a1.double()]
+        }
     }
 
     /// Returns the component-wise subtraction of `a` and `b`
+    /// Uses ARM64 assembly optimization when available
     #[inline(always)]
     fn sub(a: &Self::BaseType, b: &Self::BaseType) -> Self::BaseType {
-        [a[0] - b[0], a[1] - b[1]]
+        #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+        {
+            let result = goldilocks_extensions_asm::fp2_sub(
+                [*a[0].value(), *a[1].value()],
+                [*b[0].value(), *b[1].value()],
+            );
+            [FpE::from_raw(result[0]), FpE::from_raw(result[1])]
+        }
+        #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
+        {
+            [a[0] - b[0], a[1] - b[1]]
+        }
     }
 
     /// Returns the component-wise negation of `a`
+    /// Uses ARM64 assembly optimization when available
     #[inline(always)]
     fn neg(a: &Self::BaseType) -> Self::BaseType {
-        [-&a[0], -&a[1]]
+        #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+        {
+            let result = goldilocks_extensions_asm::fp2_neg([*a[0].value(), *a[1].value()]);
+            [FpE::from_raw(result[0]), FpE::from_raw(result[1])]
+        }
+        #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
+        {
+            [-&a[0], -&a[1]]
+        }
     }
 
     /// Returns the multiplicative inverse of `a`:
@@ -189,59 +247,113 @@ impl IsField for Degree3GoldilocksExtensionField {
     type BaseType = [FpE; 3];
 
     /// Returns the component-wise addition of `a` and `b`
+    /// Uses ARM64 assembly optimization when available
     #[inline(always)]
     fn add(a: &Self::BaseType, b: &Self::BaseType) -> Self::BaseType {
-        [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+        #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+        {
+            let result = goldilocks_extensions_asm::fp3_add(
+                [*a[0].value(), *a[1].value(), *a[2].value()],
+                [*b[0].value(), *b[1].value(), *b[2].value()],
+            );
+            [FpE::from_raw(result[0]), FpE::from_raw(result[1]), FpE::from_raw(result[2])]
+        }
+        #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
+        {
+            [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+        }
     }
 
     /// Returns the multiplication of `a` and `b`:
     /// (a0 + a1*w + a2*w^2) * (b0 + b1*w + b2*w^2) mod (w^3 - 2)
+    /// Uses ARM64 assembly optimization when available
     #[inline(always)]
     fn mul(a: &Self::BaseType, b: &Self::BaseType) -> Self::BaseType {
-        let v0 = a[0] * b[0];
-        let v1 = a[1] * b[1];
-        let v2 = a[2] * b[2];
+        #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+        {
+            let result = goldilocks_extensions_asm::fp3_mul(
+                [*a[0].value(), *a[1].value(), *a[2].value()],
+                [*b[0].value(), *b[1].value(), *b[2].value()],
+            );
+            [FpE::from_raw(result[0]), FpE::from_raw(result[1]), FpE::from_raw(result[2])]
+        }
+        #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
+        {
+            let v0 = a[0] * b[0];
+            let v1 = a[1] * b[1];
+            let v2 = a[2] * b[2];
 
-        // c0 = v0 + 2 * ((a1 + a2)(b1 + b2) - v1 - v2)
-        // c1 = (a0 + a1)(b0 + b1) - v0 - v1 + 2 * v2
-        // c2 = (a0 + a2)(b0 + b2) - v0 + v1 - v2
-        let t0 = (a[1] + a[2]) * (b[1] + b[2]) - v1 - v2;
-        let t1 = (a[0] + a[1]) * (b[0] + b[1]) - v0 - v1;
-        let t2 = (a[0] + a[2]) * (b[0] + b[2]) - v0 - v2;
+            // c0 = v0 + 2 * ((a1 + a2)(b1 + b2) - v1 - v2)
+            // c1 = (a0 + a1)(b0 + b1) - v0 - v1 + 2 * v2
+            // c2 = (a0 + a2)(b0 + b2) - v0 + v1 - v2
+            let t0 = (a[1] + a[2]) * (b[1] + b[2]) - v1 - v2;
+            let t1 = (a[0] + a[1]) * (b[0] + b[1]) - v0 - v1;
+            let t2 = (a[0] + a[2]) * (b[0] + b[2]) - v0 - v2;
 
-        [v0 + t0.double(), t1 + v2.double(), t2 + v1]
+            [v0 + t0.double(), t1 + v2.double(), t2 + v1]
+        }
     }
 
     /// Returns the square of `a`
+    /// Uses ARM64 assembly optimization when available
     #[inline(always)]
     fn square(a: &Self::BaseType) -> Self::BaseType {
-        let s0 = a[0].square();
-        let s1 = a[1].square();
-        let s2 = a[2].square();
-        let a01 = a[0] * a[1];
-        let a02 = a[0] * a[2];
-        let a12 = a[1] * a[2];
+        #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+        {
+            let result = goldilocks_extensions_asm::fp3_square([*a[0].value(), *a[1].value(), *a[2].value()]);
+            [FpE::from_raw(result[0]), FpE::from_raw(result[1]), FpE::from_raw(result[2])]
+        }
+        #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
+        {
+            let s0 = a[0].square();
+            let s1 = a[1].square();
+            let s2 = a[2].square();
+            let a01 = a[0] * a[1];
+            let a02 = a[0] * a[2];
+            let a12 = a[1] * a[2];
 
-        // c0 = s0 + 4 * a12
-        // c1 = 2 * a01 + 2 * s2
-        // c2 = 2 * a02 + s1
-        [
-            s0 + a12.double().double(),
-            a01.double() + s2.double(),
-            a02.double() + s1,
-        ]
+            // c0 = s0 + 4 * a12
+            // c1 = 2 * a01 + 2 * s2
+            // c2 = 2 * a02 + s1
+            [
+                s0 + a12.double().double(),
+                a01.double() + s2.double(),
+                a02.double() + s1,
+            ]
+        }
     }
 
     /// Returns the component-wise subtraction of `a` and `b`
+    /// Uses ARM64 assembly optimization when available
     #[inline(always)]
     fn sub(a: &Self::BaseType, b: &Self::BaseType) -> Self::BaseType {
-        [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+        #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+        {
+            let result = goldilocks_extensions_asm::fp3_sub(
+                [*a[0].value(), *a[1].value(), *a[2].value()],
+                [*b[0].value(), *b[1].value(), *b[2].value()],
+            );
+            [FpE::from_raw(result[0]), FpE::from_raw(result[1]), FpE::from_raw(result[2])]
+        }
+        #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
+        {
+            [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+        }
     }
 
     /// Returns the component-wise negation of `a`
+    /// Uses ARM64 assembly optimization when available
     #[inline(always)]
     fn neg(a: &Self::BaseType) -> Self::BaseType {
-        [-a[0], -a[1], -a[2]]
+        #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
+        {
+            let result = goldilocks_extensions_asm::fp3_neg([*a[0].value(), *a[1].value(), *a[2].value()]);
+            [FpE::from_raw(result[0]), FpE::from_raw(result[1]), FpE::from_raw(result[2])]
+        }
+        #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
+        {
+            [-a[0], -a[1], -a[2]]
+        }
     }
 
     /// Returns the multiplicative inverse of `a`
