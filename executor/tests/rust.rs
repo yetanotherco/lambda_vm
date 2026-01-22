@@ -13,11 +13,7 @@ fn run_program_without_expect(
     let elf_data = std::fs::read(elf_path).unwrap();
     let program = Elf::load(&elf_data).unwrap();
     println!("Program entry: 0x{:016x}", program.entry_point);
-    program.image.iter().for_each(|(addr, word)| {
-        println!("0x{:016x}: 0x{:08x}", addr, word);
-    });
-
-    run_program(program.image, program.entry_point, private_inputs)
+    run_program(&program.data, program.entry_point, private_inputs)
 }
 
 fn run_program_and_check_public_output(

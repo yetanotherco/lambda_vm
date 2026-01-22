@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt::Debug};
+use std::fmt::Debug;
 
 use crate::vm::{
     instruction::{
@@ -6,7 +6,7 @@ use crate::vm::{
         execution::ExecutionError,
     },
     logs::Log,
-    memory::{Memory, MemoryError, U64HashMap},
+    memory::{Memory, MemoryError},
     registers::Registers,
 };
 
@@ -16,41 +16,29 @@ pub struct ReturnValues {
 }
 
 pub fn run_program(
-    instruction_map: HashMap<u64, u32>,
+    segments: &[crate::elf::Segment],
     entrypoint: u64,
     private_inputs: Vec<u8>,
 ) -> Result<(ReturnValues, Vec<Log>), ExecutorError> {
     let mut memory = Memory::default();
     memory.store_private_inputs(private_inputs)?;
-    // Pre-decode all instructions
-    let decoded_instructions = predecode_instructions(&instruction_map);
-    let instruction_count = instruction_map.len();
-    load_program(instruction_map, &mut memory)?;
+    // Pre-decode all instructions from executable segments
+    let instruction_cache = InstructionCache::new(segments)?;
+    load_program(segments, &mut memory)?;
     run_from_entrypoint(
         &mut memory,
         entrypoint,
-        &decoded_instructions,
-        instruction_count,
+        &instruction_cache,
+        instruction_cache.instruction_count(),
     )
 }
 
-fn predecode_instructions(instruction_map: &HashMap<u64, u32>) -> U64HashMap<Instruction> {
-    let mut decoded = U64HashMap::default();
-    for (&addr, &raw) in instruction_map {
-        // Skip addresses that don't contain valid instructions (data sections)
-        if let Ok(instr) = Instruction::parse(raw) {
-            decoded.insert(addr, instr);
+fn load_program(segments: &[crate::elf::Segment], memory: &mut Memory) -> Result<(), MemoryError> {
+    for segment in segments {
+        for (i, inst) in segment.values.iter().enumerate() {
+            let addr = segment.base_addr + (i as u64 * 4);
+            memory.store_word(addr, *inst)?;
         }
-    }
-    decoded
-}
-
-fn load_program(
-    instruction_map: HashMap<u64, u32>,
-    memory: &mut Memory,
-) -> Result<(), MemoryError> {
-    for (addr, instruction) in instruction_map {
-        memory.store_word(addr, instruction)?;
     }
     Ok(())
 }
@@ -58,7 +46,7 @@ fn load_program(
 fn run_from_entrypoint(
     memory: &mut Memory,
     entrypoint: u64,
-    decoded_instructions: &U64HashMap<Instruction>,
+    instruction_cache: &InstructionCache,
     instruction_count: usize,
 ) -> Result<(ReturnValues, Vec<Log>), ExecutorError> {
     let mut pc = entrypoint;
@@ -67,7 +55,7 @@ fn run_from_entrypoint(
     let mut logs = Vec::with_capacity(instruction_count * 1000);
     while pc != 0 {
         // Use pre-decoded instruction if available, otherwise fall back to parsing
-        let instruction = match decoded_instructions.get(&pc) {
+        let instruction = match instruction_cache.get(pc) {
             Some(&instr) => instr,
             None => {
                 let next_instruction = memory.load_word(pc)?;
@@ -91,6 +79,71 @@ fn run_from_entrypoint(
         },
         logs,
     ))
+}
+
+pub struct InstructionSegment {
+    base_addr: u64,
+    instructions: Vec<Instruction>,
+}
+
+impl InstructionSegment {
+    fn end_addr(&self) -> u64 {
+        self.base_addr + (self.instructions.len() as u64 * 4)
+    }
+}
+
+pub struct InstructionCache {
+    segments: Vec<InstructionSegment>,
+}
+
+impl InstructionCache {
+    pub fn new(segments: &[crate::elf::Segment]) -> Result<Self, InstructionError> {
+        let segments = segments
+            .iter()
+            .filter(|seg| seg.is_executable)
+            .map(|seg| {
+                let instructions: Vec<Instruction> = seg
+                    .values
+                    .iter()
+                    .map(|inst| Instruction::parse(*inst))
+                    .collect::<Result<_, _>>()?;
+                Ok(InstructionSegment {
+                    base_addr: seg.base_addr,
+                    instructions,
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self { segments })
+    }
+
+    pub fn get(&self, pc: u64) -> Option<&Instruction> {
+        use std::cmp::Ordering;
+
+        let idx = self
+            .segments
+            .binary_search_by(|seg| {
+                if pc < seg.base_addr {
+                    Ordering::Greater
+                } else if pc >= seg.end_addr() {
+                    Ordering::Less
+                } else {
+                    Ordering::Equal
+                }
+            })
+            .ok()?;
+
+        let segment = &self.segments[idx];
+        let byte_offset = pc - segment.base_addr;
+        if !byte_offset.is_multiple_of(4) {
+            return None;
+        }
+        let offset = (byte_offset / 4) as usize;
+        segment.instructions.get(offset)
+    }
+
+    pub fn instruction_count(&self) -> usize {
+        self.segments.iter().map(|s| s.instructions.len()).sum()
+    }
 }
 
 #[derive(thiserror::Error, Debug)]

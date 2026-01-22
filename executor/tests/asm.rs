@@ -7,12 +7,8 @@ fn run_program_and_check_output(elf_path: &str, expected_output: i64) {
     println!("Testing {}", elf_path);
     let elf_data = std::fs::read(elf_path).unwrap();
     let program = Elf::load(&elf_data).unwrap();
-    println!("Program entry: 0x{:016x}", program.entry_point);
-    program.image.iter().for_each(|(addr, word)| {
-        println!("0x{:016x}: 0x{:08x}", addr, word);
-    });
     let (results, _logs) =
-        run_program(program.image, program.entry_point, vec![]).expect("Failed to run program");
+        run_program(&program.data, program.entry_point, vec![]).expect("Failed to run program");
 
     assert!(results.register_values.0 == expected_output);
 }
