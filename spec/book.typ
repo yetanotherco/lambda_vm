@@ -20,6 +20,7 @@
     #chapter("load.typ")[LOAD chip]
     #chapter("ecall.typ")[ECALL chips]
     #chapter("bitwise.typ")[BITWISE]
+    #chapter("logup.typ")[LogUp argument]
   ]
 )
 
