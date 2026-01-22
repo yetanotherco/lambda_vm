@@ -8,7 +8,7 @@ fn panic(_info: &PanicInfo) -> ! {
     loop {}
 }
 
-const LIMIT: usize = 37000;
+const LIMIT: usize = 320000;
 
 #[inline(never)]
 fn sieve(is_prime: &mut [bool; LIMIT + 1]) -> u32 {

@@ -8,7 +8,7 @@ fn panic(_info: &PanicInfo) -> ! {
     loop {}
 }
 
-const SIZE: usize = 50000;
+const SIZE: usize = 420000;
 
 #[inline(never)]
 fn sum_array(arr: &[u32; SIZE]) -> u32 {

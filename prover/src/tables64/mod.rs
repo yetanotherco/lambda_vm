@@ -20,6 +20,7 @@
 pub mod types;
 
 pub mod bitwise;
+pub mod cpu;
 pub mod lt;
 
 // pub mod branch;
@@ -27,7 +28,6 @@ pub mod lt;
 // pub mod shift;
 
 // Phase 3 (to be added)
-// pub mod cpu;
 // pub mod decode;
 
 // Phase 5 - Deferred (to be added)

@@ -9,3 +9,6 @@ crypto = { path = "../crypto/crypto" }
 math = { path = "../crypto/math" }
 executor = { path = "../executor" }
 lazy_static = "1.5.0"
+
+[dev-dependencies]
+env_logger = "*"
