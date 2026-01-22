@@ -65,7 +65,6 @@ pub unsafe extern "C" fn sys_panic(msg_ptr: *const u8, len: usize) {
 
 #[cfg(target_arch = "riscv64")]
 pub fn commit(slice: &[u8]) {
-    print_string("commit called\n");
     unsafe {
         asm!(
             "ecall",

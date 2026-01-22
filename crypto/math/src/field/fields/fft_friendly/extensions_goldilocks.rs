@@ -256,7 +256,11 @@ impl IsField for Degree3GoldilocksExtensionField {
                 [*a[0].value(), *a[1].value(), *a[2].value()],
                 [*b[0].value(), *b[1].value(), *b[2].value()],
             );
-            [FpE::from_raw(result[0]), FpE::from_raw(result[1]), FpE::from_raw(result[2])]
+            [
+                FpE::from_raw(result[0]),
+                FpE::from_raw(result[1]),
+                FpE::from_raw(result[2]),
+            ]
         }
         #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
         {
@@ -275,7 +279,11 @@ impl IsField for Degree3GoldilocksExtensionField {
                 [*a[0].value(), *a[1].value(), *a[2].value()],
                 [*b[0].value(), *b[1].value(), *b[2].value()],
             );
-            [FpE::from_raw(result[0]), FpE::from_raw(result[1]), FpE::from_raw(result[2])]
+            [
+                FpE::from_raw(result[0]),
+                FpE::from_raw(result[1]),
+                FpE::from_raw(result[2]),
+            ]
         }
         #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
         {
@@ -300,8 +308,16 @@ impl IsField for Degree3GoldilocksExtensionField {
     fn square(a: &Self::BaseType) -> Self::BaseType {
         #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
         {
-            let result = goldilocks_extensions_asm::fp3_square([*a[0].value(), *a[1].value(), *a[2].value()]);
-            [FpE::from_raw(result[0]), FpE::from_raw(result[1]), FpE::from_raw(result[2])]
+            let result = goldilocks_extensions_asm::fp3_square([
+                *a[0].value(),
+                *a[1].value(),
+                *a[2].value(),
+            ]);
+            [
+                FpE::from_raw(result[0]),
+                FpE::from_raw(result[1]),
+                FpE::from_raw(result[2]),
+            ]
         }
         #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
         {
@@ -333,7 +349,11 @@ impl IsField for Degree3GoldilocksExtensionField {
                 [*a[0].value(), *a[1].value(), *a[2].value()],
                 [*b[0].value(), *b[1].value(), *b[2].value()],
             );
-            [FpE::from_raw(result[0]), FpE::from_raw(result[1]), FpE::from_raw(result[2])]
+            [
+                FpE::from_raw(result[0]),
+                FpE::from_raw(result[1]),
+                FpE::from_raw(result[2]),
+            ]
         }
         #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
         {
@@ -347,8 +367,13 @@ impl IsField for Degree3GoldilocksExtensionField {
     fn neg(a: &Self::BaseType) -> Self::BaseType {
         #[cfg(all(feature = "asm-arm64", target_arch = "aarch64"))]
         {
-            let result = goldilocks_extensions_asm::fp3_neg([*a[0].value(), *a[1].value(), *a[2].value()]);
-            [FpE::from_raw(result[0]), FpE::from_raw(result[1]), FpE::from_raw(result[2])]
+            let result =
+                goldilocks_extensions_asm::fp3_neg([*a[0].value(), *a[1].value(), *a[2].value()]);
+            [
+                FpE::from_raw(result[0]),
+                FpE::from_raw(result[1]),
+                FpE::from_raw(result[2]),
+            ]
         }
         #[cfg(not(all(feature = "asm-arm64", target_arch = "aarch64")))]
         {

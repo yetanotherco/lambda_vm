@@ -18,7 +18,7 @@ use stark::{
     traits::TransitionEvaluationContext,
 };
 
-use crate::tables64::types::{GoldilocksExtension, GoldilocksField};
+use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
 // =========================================================================
 // Constants
@@ -392,8 +392,8 @@ impl AddOperand {
 /// Assumptions (must be verified via bus lookups):
 /// - lhs_lo, lhs_hi, rhs_lo, rhs_hi, sum_lo, sum_hi are all valid 32-bit words
 pub struct AddConstraint {
-    /// Column index for condition flag
-    cond_col: usize,
+    /// Column indices for condition flags (constraint active when sum > 0)
+    cond_cols: Vec<usize>,
     /// Left-hand side operand (flexible representation)
     lhs: AddOperand,
     /// Right-hand side operand (flexible representation)
@@ -412,20 +412,20 @@ impl AddConstraint {
     /// Returns two constraints: one for carry_0 and one for carry_1.
     ///
     /// # Arguments
-    /// * `cond_col` - Column index for the condition flag
+    /// * `cond_cols` - Column indices for condition flags (constraint active when sum > 0)
     /// * `lhs` - Left-hand side operand (flexible representation)
     /// * `rhs` - Right-hand side operand (flexible representation)
     /// * `sum` - Sum/output operand (flexible representation)
     /// * `constraint_idx_start` - Starting constraint index (uses 2 consecutive indices)
     pub fn new_pair(
-        cond_col: usize,
+        cond_cols: Vec<usize>,
         lhs: AddOperand,
         rhs: AddOperand,
         sum: AddOperand,
         constraint_idx_start: usize,
     ) -> (Self, Self) {
         let carry_0 = Self {
-            cond_col,
+            cond_cols: cond_cols.clone(),
             lhs: lhs.clone(),
             rhs: rhs.clone(),
             sum: sum.clone(),
@@ -434,7 +434,7 @@ impl AddConstraint {
         };
 
         let carry_1 = Self {
-            cond_col,
+            cond_cols,
             lhs,
             rhs,
             sum,
@@ -481,7 +481,13 @@ impl AddConstraint {
         F: IsSubFieldOf<E>,
         E: IsField,
     {
-        let cond = step.get_main_evaluation_element(0, self.cond_col);
+        // Sum all condition columns: constraint active when any flag is set
+        let cond = self
+            .cond_cols
+            .iter()
+            .map(|&col| step.get_main_evaluation_element(0, col).clone())
+            .fold(FieldElement::<F>::zero(), |acc, x| acc + x);
+
         let one = FieldElement::<F>::one();
 
         let carry = match self.carry_idx {
