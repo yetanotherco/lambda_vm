@@ -834,27 +834,12 @@ impl CpuOperation {
 
 /// Generates the CPU trace table from a list of operations.
 ///
-/// Each operation becomes one row in the table. The table is then
-/// padded to the next power of 2.
+/// Each operation becomes one row in the table. The table is padded
+/// to the next power of 2 (minimum 4 rows) with zero-filled rows.
 pub fn generate_cpu_trace(
     operations: &[CpuOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let n = operations.len();
-
-    // Require power of 2, minimum 4 rows (FRI requirement)
-    // Padding not yet supported - constraints like NextPcAdd fail on zero-filled rows
-    assert!(
-        n >= 4,
-        "CPU trace requires at least 4 operations, got {}",
-        n
-    );
-    assert!(
-        n.is_power_of_two(),
-        "CPU trace requires power-of-2 operations (no padding support yet), got {}",
-        n
-    );
-
-    let num_rows = n;
+    let num_rows = operations.len().next_power_of_two().max(4);
     let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
 
     for (row_idx, op) in operations.iter().enumerate() {
@@ -955,31 +940,6 @@ pub fn generate_cpu_trace(
     }
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
-}
-
-/// Generates the CPU trace table with automatic padding to power of 2.
-///
-/// Accepts any number of operations (including zero) and pads to the next
-/// power of 2 with a minimum of 4 rows. Padding rows are all zeros.
-pub fn generate_cpu_trace_padded(operations: &[CpuOperation]) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let n = operations.len();
-    let target = n.next_power_of_two().max(4);
-
-    if n == target {
-        generate_cpu_trace(operations)
-    } else {
-        let mut padded = operations.to_vec();
-        padded.extend(create_padding_operations(target - n));
-        generate_cpu_trace(&padded)
-    }
-}
-
-/// Creates padding CPU operations (all zeros).
-///
-/// Placeholder for padding rows. Constraints are not yet designed to handle
-/// padding, so this is only used when testing with power-of-2 row counts.
-fn create_padding_operations(count: usize) -> Vec<CpuOperation> {
-    vec![CpuOperation::default(); count]
 }
 
 // =========================================================================

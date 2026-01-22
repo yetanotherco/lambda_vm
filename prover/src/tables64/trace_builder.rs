@@ -59,14 +59,14 @@ impl Traces {
         }
 
         // Generate CPU trace (handles padding internally)
-        let cpu = cpu::generate_cpu_trace_padded(&cpu_ops);
+        let cpu = cpu::generate_cpu_trace(&cpu_ops);
 
         // Generate BITWISE trace and update multiplicities
         let mut bitwise = bitwise::generate_bitwise_trace();
         bitwise::update_multiplicities(&mut bitwise, &bitwise_lookups);
 
-        // Generate LT trace (handles padding internally)
-        let lt = lt::generate_lt_trace_padded(&lt_ops);
+        // Generate LT trace (handles deduplication and padding internally)
+        let lt = lt::generate_lt_trace(&lt_ops);
 
         Traces { cpu, bitwise, lt }
     }

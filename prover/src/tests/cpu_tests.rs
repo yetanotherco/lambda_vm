@@ -284,41 +284,6 @@ fn test_trace_generation_sign_bits() {
 }
 
 #[test]
-#[should_panic(expected = "power-of-2")]
-fn test_trace_generation_rejects_non_power_of_2() {
-    // 5 operations should panic (>=4 but not power of 2)
-    let ops = vec![
-        CpuOperation {
-            pc: 0x1000,
-            op_add: true,
-            ..Default::default()
-        },
-        CpuOperation {
-            pc: 0x1004,
-            op_add: true,
-            ..Default::default()
-        },
-        CpuOperation {
-            pc: 0x1008,
-            op_add: true,
-            ..Default::default()
-        },
-        CpuOperation {
-            pc: 0x100C,
-            op_add: true,
-            ..Default::default()
-        },
-        CpuOperation {
-            pc: 0x1010,
-            op_add: true,
-            ..Default::default()
-        },
-    ];
-
-    let _trace = generate_cpu_trace(&ops);
-}
-
-#[test]
 fn test_bus_interactions_count() {
     let interactions = bus_interactions();
 
