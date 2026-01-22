@@ -96,8 +96,14 @@ impl<F: IsSubFieldOf<E>, E: IsField, PI> MultiProof<F, E, PI> {
 
 /// Serializer compatible with Stone prover
 /// (https://github.com/starkware-libs/stone-prover/)
+///
+/// NOTE: This serializer is only available with Keccak256 backend (default).
+/// It is not compatible with Poseidon2 since it requires byte-array commitments
+/// and is specific to Stark252 field.
+#[cfg(not(feature = "poseidon2"))]
 pub struct StoneCompatibleSerializer;
 
+#[cfg(not(feature = "poseidon2"))]
 impl StoneCompatibleSerializer {
     pub fn serialize_proof<A, PI>(
         proof: &StarkProof<Stark252PrimeField, Stark252PrimeField, PI>,

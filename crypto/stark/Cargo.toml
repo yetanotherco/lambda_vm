@@ -47,6 +47,7 @@ test_fiat_shamir = []
 instruments = []                                                     # This enables timing prints in prover and verifier
 parallel = ["dep:rayon", "crypto/parallel"]
 wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "dep:web-sys"]
+poseidon2 = ["crypto/poseidon2"]                                     # Use Poseidon2 hash for Merkle trees (Goldilocks only)
 
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dev-dependencies]
 proptest = "1.2.0"

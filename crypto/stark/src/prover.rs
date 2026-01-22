@@ -269,7 +269,7 @@ pub trait IsStarkProver<
             Self::batch_commit_main(&lde_trace_permuted_rows)?;
 
         // >>>> Send commitment.
-        transcript.append_bytes(&lde_trace_merkle_root);
+        transcript.append_bytes(&crate::config::commitment_to_bytes(&lde_trace_merkle_root));
 
         Some((
             trace_polys,
@@ -320,7 +320,7 @@ pub trait IsStarkProver<
             Self::batch_commit_extension(&lde_trace_permuted_rows)?;
 
         // >>>> Send commitment.
-        transcript.append_bytes(&lde_trace_merkle_root);
+        transcript.append_bytes(&crate::config::commitment_to_bytes(&lde_trace_merkle_root));
 
         Some((
             trace_polys,
@@ -1116,7 +1116,9 @@ pub trait IsStarkProver<
         )?;
 
         // >>>> Send commitments: [H₁], [H₂]
-        transcript.append_bytes(&round_2_result.composition_poly_root);
+        transcript.append_bytes(&crate::config::commitment_to_bytes(
+            &round_2_result.composition_poly_root,
+        ));
 
         #[cfg(feature = "instruments")]
         let elapsed2 = timer2.elapsed();
@@ -1406,6 +1408,16 @@ mod tests {
         )
     }
 
+    // ============================================================
+    // Stone Compatibility Tests
+    // ============================================================
+    // These tests verify compatibility with the Stone prover and are
+    // only available with Keccak256 backend (default).
+    // They are not compatible with Poseidon2 since:
+    // 1. They use Stark252 field (Poseidon2 requires Goldilocks)
+    // 2. They check specific Keccak256 commitment bytes
+
+    #[cfg(not(feature = "poseidon2"))]
     fn stone_compatibility_case_1_proof() -> StarkProof<
         Stark252PrimeField,
         Stark252PrimeField,
@@ -1415,6 +1427,7 @@ mod tests {
         proof
     }
 
+    #[cfg(not(feature = "poseidon2"))]
     fn stone_compatibility_case_1_challenges() -> Challenges<Stark252PrimeField> {
         let (proof, air, _, seed, trace_length) = proof_parts_stone_compatibility_case_1();
 
@@ -1428,6 +1441,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "poseidon2"))]
     fn stone_compatibility_case_1_proof_is_valid() {
         let (proof, air, _options, seed, _) = proof_parts_stone_compatibility_case_1();
         assert!(Verifier::verify(
@@ -1438,6 +1452,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "poseidon2"))]
     fn stone_compatibility_case_1_trace_commitment() {
         let proof = stone_compatibility_case_1_proof();
 
@@ -1448,6 +1463,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "poseidon2"))]
     fn stone_compatibility_case_1_composition_poly_challenges() {
         let challenges = stone_compatibility_case_1_challenges();
 
@@ -1465,6 +1481,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "poseidon2"))]
     fn stone_compatibility_case_1_composition_poly_commitment() {
         let proof = stone_compatibility_case_1_proof();
         // Composition polynomial commitment
@@ -1475,6 +1492,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "poseidon2"))]
     fn stone_compatibility_case_1_out_of_domain_challenge() {
         let challenges = stone_compatibility_case_1_challenges();
         assert_eq!(
@@ -1486,6 +1504,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "poseidon2"))]
     fn stone_compatibility_case_1_out_of_domain_trace_evaluation() {
         let proof = stone_compatibility_case_1_proof();
 
@@ -1516,6 +1535,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "poseidon2"))]
     fn stone_compatibility_case_1_out_of_domain_composition_poly_evaluation() {
         let proof = stone_compatibility_case_1_proof();
 
@@ -1528,6 +1548,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "poseidon2"))]
     fn stone_compatibility_case_1_deep_composition_poly_challenges() {
         let challenges = stone_compatibility_case_1_challenges();
 
@@ -1548,6 +1569,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "poseidon2"))]
     fn stone_compatibility_case_1_fri_commit_phase_challenge_0() {
         let challenges = stone_compatibility_case_1_challenges();
 
@@ -1561,6 +1583,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "poseidon2"))]
     fn stone_compatibility_case_1_fri_commit_phase_layer_1_commitment() {
         let proof = stone_compatibility_case_1_proof();
 
@@ -1572,6 +1595,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "poseidon2"))]
     fn stone_compatibility_case_1_fri_commit_phase_challenge_1() {
         let challenges = stone_compatibility_case_1_challenges();
         assert_eq!(
@@ -1583,6 +1607,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "poseidon2"))]
     fn stone_compatibility_case_1_fri_commit_phase_last_value() {
         let proof = stone_compatibility_case_1_proof();
 
@@ -1595,12 +1620,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "poseidon2"))]
     fn stone_compatibility_case_1_fri_query_iota_challenge() {
         let challenges = stone_compatibility_case_1_challenges();
         assert_eq!(challenges.iotas[0], 1);
     }
 
     #[test]
+    #[cfg(not(feature = "poseidon2"))]
     fn stone_compatibility_case_1_fri_query_phase_trace_openings() {
         let proof = stone_compatibility_case_1_proof();
 
@@ -1638,6 +1665,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "poseidon2"))]
     fn stone_compatibility_case_1_fri_query_phase_trace_terms_authentication_path() {
         let proof = stone_compatibility_case_1_proof();
 
@@ -1673,6 +1701,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "poseidon2"))]
     fn stone_compatibility_case_1_fri_query_phase_composition_poly_openings() {
         let proof = stone_compatibility_case_1_proof();
 
@@ -1693,6 +1722,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "poseidon2"))]
     fn stone_compatibility_case_1_fri_query_phase_composition_poly_authentication_path() {
         let proof = stone_compatibility_case_1_proof();
 
@@ -1728,6 +1758,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "poseidon2"))]
     fn stone_compatibility_case_1_fri_query_phase_query_lengths() {
         let proof = stone_compatibility_case_1_proof();
 
@@ -1742,6 +1773,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "poseidon2"))]
     fn stone_compatibility_case_1_fri_query_phase_layer_1_evaluation_symmetric() {
         let proof = stone_compatibility_case_1_proof();
 
@@ -1754,6 +1786,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "poseidon2"))]
     fn stone_compatibility_case_1_fri_query_phase_layer_1_authentication_path() {
         let proof = stone_compatibility_case_1_proof();
 
@@ -1770,6 +1803,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "poseidon2"))]
     fn proof_parts_stone_compatibility_case_2() -> (
         StarkProof<
             Stark252PrimeField,
@@ -1809,6 +1843,7 @@ mod tests {
         (proof, proof_options, transcript_init_seed)
     }
 
+    #[cfg(not(feature = "poseidon2"))]
     fn stone_compatibility_case_2_proof() -> StarkProof<
         Stark252PrimeField,
         Stark252PrimeField,
@@ -1818,6 +1853,7 @@ mod tests {
         proof
     }
 
+    #[cfg(not(feature = "poseidon2"))]
     fn stone_compatibility_case_2_challenges() -> Challenges<Stark252PrimeField> {
         let (proof, options, seed) = proof_parts_stone_compatibility_case_2();
 
@@ -1832,6 +1868,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "poseidon2"))]
     fn stone_compatibility_case_2_trace_commitment() {
         let proof = stone_compatibility_case_2_proof();
 
@@ -1842,12 +1879,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "poseidon2"))]
     fn stone_compatibility_case_2_fri_query_iota_challenge() {
         let challenges = stone_compatibility_case_2_challenges();
         assert_eq!(challenges.iotas[0], 4239);
     }
 
     #[test]
+    #[cfg(not(feature = "poseidon2"))]
     fn stone_compatibility_case_2_fri_query_phase_layer_7_evaluation_symmetric() {
         let proof = stone_compatibility_case_2_proof();
 
@@ -1860,6 +1899,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "poseidon2"))]
     fn stone_compatibility_case_2_fri_query_phase_layer_8_authentication_path() {
         let proof = stone_compatibility_case_2_proof();
 

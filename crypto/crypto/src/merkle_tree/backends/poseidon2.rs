@@ -36,6 +36,29 @@ impl IsMerkleTreeBackend for Poseidon2Backend {
     }
 }
 
+/// Poseidon2 Merkle tree backend for pairs of Goldilocks field elements
+///
+/// Node type: Goldilocks field element (64-bit)
+/// Data type: [Fp; 2] (fixed-size pair)
+///
+/// This is optimized for FRI layers where each leaf is exactly 2 field elements.
+/// Using a fixed-size array avoids Vec overhead.
+#[derive(Clone, Default)]
+pub struct PairPoseidon2Backend;
+
+impl IsMerkleTreeBackend for PairPoseidon2Backend {
+    type Node = Fp;
+    type Data = [Fp; 2];
+
+    fn hash_data(input: &[Fp; 2]) -> Fp {
+        Poseidon2::hash(&input[0], &input[1])
+    }
+
+    fn hash_new_parent(left: &Fp, right: &Fp) -> Fp {
+        Poseidon2::compress(left, right)
+    }
+}
+
 /// Poseidon2 Merkle tree backend for vectors of Goldilocks field elements
 ///
 /// Node type: Goldilocks field element (64-bit)
@@ -118,6 +141,38 @@ mod tests {
         // Verify proof for first element
         let proof = merkle_tree.get_proof_by_pos(0).unwrap();
         assert!(proof.verify::<BatchPoseidon2Backend>(&merkle_tree.root, 0, &values[0]));
+    }
+
+    #[test]
+    fn test_pair_poseidon2_backend() {
+        // Test FRI layer-style commitments with pairs of field elements
+        let pairs: Vec<[Fp; 2]> = (0..8)
+            .map(|i| [Fp::from(i as u64), Fp::from((i + 100) as u64)])
+            .collect();
+
+        let merkle_tree = MerkleTree::<PairPoseidon2Backend>::build(&pairs).unwrap();
+
+        // Verify proofs for all positions
+        for i in 0..8 {
+            let proof = merkle_tree.get_proof_by_pos(i).unwrap();
+            assert!(
+                proof.verify::<PairPoseidon2Backend>(&merkle_tree.root, i, &pairs[i]),
+                "Proof verification failed for position {}",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_pair_poseidon2_backend_deterministic() {
+        let pairs: Vec<[Fp; 2]> = (0..4)
+            .map(|i| [Fp::from(i as u64), Fp::from((i * 2) as u64)])
+            .collect();
+
+        let tree1 = MerkleTree::<PairPoseidon2Backend>::build(&pairs).unwrap();
+        let tree2 = MerkleTree::<PairPoseidon2Backend>::build(&pairs).unwrap();
+
+        assert_eq!(tree1.root, tree2.root);
     }
 
     #[test]

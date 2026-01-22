@@ -16,7 +16,7 @@ use super::{
 };
 
 /// Poseidon2 backends - Goldilocks field only (see module docs).
-pub use super::poseidon2::{BatchPoseidon2Backend, Poseidon2Backend};
+pub use super::poseidon2::{BatchPoseidon2Backend, PairPoseidon2Backend, Poseidon2Backend};
 
 // Field element backend definitions
 

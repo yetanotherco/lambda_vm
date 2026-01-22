@@ -107,12 +107,14 @@ pub trait IsStarkVerifier<
         // ===================================
 
         // <<<< Receive commitments:[tⱼ]
-        transcript.append_bytes(&proof.lde_trace_main_merkle_root);
+        transcript.append_bytes(&crate::config::commitment_to_bytes(
+            &proof.lde_trace_main_merkle_root,
+        ));
 
         let rap_challenges = air.build_rap_challenges(transcript);
 
         if let Some(root) = proof.lde_trace_aux_merkle_root {
-            transcript.append_bytes(&root);
+            transcript.append_bytes(&crate::config::commitment_to_bytes(&root));
         }
 
         // ===================================
@@ -142,7 +144,9 @@ pub trait IsStarkVerifier<
         let boundary_coeffs = coefficients;
 
         // <<<< Receive commitments: [H₁], [H₂]
-        transcript.append_bytes(&proof.composition_poly_root);
+        transcript.append_bytes(&crate::config::commitment_to_bytes(
+            &proof.composition_poly_root,
+        ));
 
         // ===================================
         // ==========|   Round 3   |==========
@@ -200,7 +204,7 @@ pub trait IsStarkVerifier<
                 // >>>> Send challenge 𝜁ₖ
                 let element = transcript.sample_field_element();
                 // <<<< Receive commitment: [pₖ] (the first one is [p₀])
-                transcript.append_bytes(root);
+                transcript.append_bytes(&crate::config::commitment_to_bytes(root));
                 element
             })
             .collect::<Vec<FieldElement<FieldExtension>>>();
@@ -410,6 +414,7 @@ pub trait IsStarkVerifier<
     }
 
     /// Verifies the validity of the opening proof.
+    #[cfg(not(feature = "poseidon2"))]
     fn verify_opening<E>(
         proof: &Proof<Commitment>,
         root: &Commitment,
@@ -423,6 +428,25 @@ pub trait IsStarkVerifier<
         Field: IsSubFieldOf<E>,
     {
         proof.verify::<BatchedMerkleTreeBackend<E>>(root, index, &value.to_owned())
+    }
+
+    /// Verifies the validity of the opening proof.
+    #[cfg(feature = "poseidon2")]
+    fn verify_opening<E>(
+        proof: &Proof<Commitment>,
+        root: &Commitment,
+        index: usize,
+        value: &[FieldElement<E>],
+    ) -> bool
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<E>: AsBytes + Sync + Send,
+        E: IsField,
+        Field: IsSubFieldOf<E>,
+    {
+        // For Poseidon2, convert field elements to Fp limbs and verify
+        let value_fp = crate::config::field_elements_to_fps(value);
+        proof.verify::<crate::config::BatchedMerkleTreeBackendInner>(root, index, &value_fp)
     }
 
     /// Verify opening Open(tⱼ(D_LDE), 𝜐) and Open(tⱼ(D_LDE), -𝜐) for all trace polynomials tⱼ,
@@ -481,6 +505,7 @@ pub trait IsStarkVerifier<
 
     /// Verify opening Open(Hᵢ(D_LDE), 𝜐) and Open(Hᵢ(D_LDE), -𝜐) for all parts Hᵢof the composition
     /// polynomial, where 𝜐 and -𝜐 are the elements corresponding to the index challenge `iota`.
+    #[cfg(not(feature = "poseidon2"))]
     fn verify_composition_poly_opening(
         deep_poly_openings: &DeepPolynomialOpening<Field, FieldExtension>,
         composition_poly_merkle_root: &Commitment,
@@ -500,6 +525,31 @@ pub trait IsStarkVerifier<
                 composition_poly_merkle_root,
                 *iota,
                 &value,
+            )
+    }
+
+    #[cfg(feature = "poseidon2")]
+    fn verify_composition_poly_opening(
+        deep_poly_openings: &DeepPolynomialOpening<Field, FieldExtension>,
+        composition_poly_merkle_root: &Commitment,
+        iota: &usize,
+    ) -> bool
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    {
+        let mut value = deep_poly_openings.composition_poly.evaluations.clone();
+        value.extend_from_slice(&deep_poly_openings.composition_poly.evaluations_sym);
+
+        let value_fp = crate::config::field_elements_to_fps(&value);
+
+        deep_poly_openings
+            .composition_poly
+            .proof
+            .verify::<crate::config::BatchedMerkleTreeBackendInner>(
+                composition_poly_merkle_root,
+                *iota,
+                &value_fp,
             )
     }
 
@@ -530,6 +580,7 @@ pub trait IsStarkVerifier<
     }
 
     /// Verifies the openings of a fold polynomial of an inner layer of FRI.
+    #[cfg(not(feature = "poseidon2"))]
     fn verify_fri_layer_openings(
         merkle_root: &Commitment,
         auth_path_sym: &Proof<Commitment>,
@@ -548,6 +599,38 @@ pub trait IsStarkVerifier<
         };
 
         auth_path_sym.verify::<BatchedMerkleTreeBackend<FieldExtension>>(
+            merkle_root,
+            iota >> 1,
+            &evaluations,
+        )
+    }
+
+    #[cfg(feature = "poseidon2")]
+    fn verify_fri_layer_openings(
+        merkle_root: &Commitment,
+        auth_path_sym: &Proof<Commitment>,
+        evaluation: &FieldElement<FieldExtension>,
+        evaluation_sym: &FieldElement<FieldExtension>,
+        iota: usize,
+    ) -> bool
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    {
+        // FRI layers use Poseidon2 on concatenated limbs of two evaluations.
+        let mut evaluations = if iota % 2 == 1 {
+            crate::config::field_element_to_fps(evaluation_sym)
+        } else {
+            crate::config::field_element_to_fps(evaluation)
+        };
+        let other = if iota % 2 == 1 {
+            crate::config::field_element_to_fps(evaluation)
+        } else {
+            crate::config::field_element_to_fps(evaluation_sym)
+        };
+        evaluations.extend(other);
+
+        auth_path_sym.verify::<crate::config::FriLayerMerkleTreeBackendInner>(
             merkle_root,
             iota >> 1,
             &evaluations,
@@ -780,7 +863,9 @@ pub trait IsStarkVerifier<
         // =====================================================================
 
         for proof in &multi_proof.proofs {
-            transcript.append_bytes(&proof.lde_trace_main_merkle_root);
+            transcript.append_bytes(&crate::config::commitment_to_bytes(
+                &proof.lde_trace_main_merkle_root,
+            ));
         }
 
         // =====================================================================
@@ -802,7 +887,7 @@ pub trait IsStarkVerifier<
 
         for proof in &multi_proof.proofs {
             if let Some(root) = proof.lde_trace_aux_merkle_root {
-                transcript.append_bytes(&root);
+                transcript.append_bytes(&crate::config::commitment_to_bytes(&root));
             }
         }
 
@@ -897,7 +982,9 @@ pub trait IsStarkVerifier<
         let boundary_coeffs = coefficients;
 
         // <<<< Receive commitments: [H₁], [H₂]
-        transcript.append_bytes(&proof.composition_poly_root);
+        transcript.append_bytes(&crate::config::commitment_to_bytes(
+            &proof.composition_poly_root,
+        ));
 
         // ===================================
         // ==========|   Round 3   |==========
@@ -955,7 +1042,7 @@ pub trait IsStarkVerifier<
                 // >>>> Send challenge 𝜁ₖ
                 let element = transcript.sample_field_element();
                 // <<<< Receive commitment: [pₖ] (the first one is [p₀])
-                transcript.append_bytes(root);
+                transcript.append_bytes(&crate::config::commitment_to_bytes(root));
                 element
             })
             .collect::<Vec<FieldElement<FieldExtension>>>();
