@@ -364,7 +364,7 @@ fn run_elf(path: &str) -> Vec<executor::vm::logs::Log> {
     let elf_data = std::fs::read(path).expect("Failed to read ELF");
     let program = Elf::load(&elf_data).expect("Failed to load ELF");
     let (_results, logs) =
-        run_program(program.image, program.entry_point, vec![]).expect("Failed to run program");
+        run_program(&program.data, program.entry_point, vec![]).expect("Failed to run program");
     logs
 }
 
