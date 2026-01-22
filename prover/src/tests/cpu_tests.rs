@@ -5,9 +5,8 @@
 //! - Trace generation tests
 //! - Integration tests for CpuOperation::from_log (ELF execution)
 
-use crate::tables64::cpu::{
-    CpuOperation, bus_interactions, cols, generate_cpu_trace, generate_cpu_trace_from_logs,
-};
+use crate::tables64::cpu::{CpuOperation, bus_interactions, cols, generate_cpu_trace};
+use crate::tables64::trace_builder::Traces;
 use crate::tables64::types::FE;
 
 use executor::{elf::Elf, vm::execution::run_program};
@@ -383,12 +382,13 @@ fn test_trace_from_logs_subw() {
     let logs = run_asm_elf("subw");
     assert_eq!(logs.len(), 4, "subw.elf should have 4 steps");
 
-    let trace = generate_cpu_trace_from_logs(&logs);
+    let traces = Traces::from_logs(&logs);
 
-    assert_eq!(trace.main_table.height, 4);
+    assert_eq!(traces.cpu.main_table.height, 4);
 
     // Should have SUB instruction with word_instr flag
-    let has_sub = (0..logs.len()).any(|i| trace.main_table.get_row(i)[cols::SUB] == FE::one());
+    let has_sub =
+        (0..logs.len()).any(|i| traces.cpu.main_table.get_row(i)[cols::SUB] == FE::one());
     assert!(has_sub, "subw.elf should have SUB instruction");
 }
 

@@ -957,49 +957,6 @@ pub fn generate_cpu_trace(
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
 }
 
-/// Generates the CPU trace table directly from executor logs.
-///
-/// This is a convenience function that converts logs to CpuOperations
-/// and then generates the trace.
-///
-/// Panics if logs.len() is not a power of 2 >= 4.
-pub fn generate_cpu_trace_from_logs(
-    logs: &[Log],
-) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let operations: Vec<CpuOperation> = logs
-        .iter()
-        .enumerate()
-        .map(|(i, log)| CpuOperation::from_log(log, (i as u64) * 4))
-        .collect();
-    generate_cpu_trace(&operations)
-}
-
-/// Collects all Bitwise lookups from a list of CPU operations.
-///
-/// Returns tuples (BitwiseLookup, x, y, z) to pass to `bitwise::update_multiplicities`.
-pub fn collect_bitwise_lookups(
-    operations: &[CpuOperation],
-) -> Vec<(super::bitwise::BitwiseLookup, u8, u8, u8)> {
-    operations
-        .iter()
-        .flat_map(|op| op.collect_bitwise_lookups())
-        .collect()
-}
-
-/// Collects all Bitwise lookups from executor logs.
-///
-/// Convenience function that converts logs to operations and collects lookups.
-pub fn collect_bitwise_lookups_from_logs(
-    logs: &[Log],
-) -> Vec<(super::bitwise::BitwiseLookup, u8, u8, u8)> {
-    let operations: Vec<CpuOperation> = logs
-        .iter()
-        .enumerate()
-        .map(|(i, log)| CpuOperation::from_log(log, (i as u64) * 4))
-        .collect();
-    collect_bitwise_lookups(&operations)
-}
-
 // =========================================================================
 // Bus interactions
 // =========================================================================
