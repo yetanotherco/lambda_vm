@@ -7,7 +7,8 @@ use math::field::{
 
 use math::field::fields::fft_friendly::{
     babybear::Babybear31PrimeField, extensions_goldilocks::Degree3GoldilocksExtensionField,
-    quartic_babybear::Degree4BabyBearExtensionField, u64_goldilocks::U64GoldilocksPrimeField,
+    quartic_babybear::Degree4BabyBearExtensionField,
+    u64_goldilocks::GoldilocksField as GoldilocksBaseField,
 };
 
 use crate::traits::AIR;
@@ -553,7 +554,7 @@ fn test_multi_prove_different_airs() {
 }
 
 // Type aliases for multi-column Fibonacci tests
-type GoldilocksField = U64GoldilocksPrimeField;
+type GoldilocksField = GoldilocksBaseField;
 type GoldilocksExt = Degree3GoldilocksExtensionField;
 type GoldilocksFE = FieldElement<GoldilocksField>;
 
