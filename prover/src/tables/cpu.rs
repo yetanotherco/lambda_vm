@@ -54,8 +54,9 @@
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 use executor::vm::{
-    instruction::{self, decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth}},
+    instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth},
     logs::Log,
+    memory::U64HashMap,
 };
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::trace::TraceTable;
@@ -965,11 +966,15 @@ pub fn generate_cpu_trace(
 /// Panics if logs.len() is not a power of 2 >= 4.
 pub fn generate_cpu_trace_from_logs(
     logs: &[Log],
+    instructions: &U64HashMap<Instruction>,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let operations: Vec<CpuOperation> = logs
         .iter()
         .enumerate()
-        .map(|(i, log)| CpuOperation::from_log(log, (i as u64) * 4))
+        .map(|(i, log)| {
+            let instruction = *instructions.get(&log.current_pc).expect("instruction not found for PC");
+            CpuOperation::from_log(log, (i as u64) * 4, instruction)
+        })
         .collect();
     generate_cpu_trace(&operations)
 }
@@ -991,11 +996,15 @@ pub fn collect_bitwise_lookups(
 /// Convenience function that converts logs to operations and collects lookups.
 pub fn collect_bitwise_lookups_from_logs(
     logs: &[Log],
+    instructions: &U64HashMap<Instruction>,
 ) -> Vec<(super::bitwise::BitwiseLookup, u8, u8, u8)> {
     let operations: Vec<CpuOperation> = logs
         .iter()
         .enumerate()
-        .map(|(i, log)| CpuOperation::from_log(log, (i as u64) * 4))
+        .map(|(i, log)| {
+            let instruction = *instructions.get(&log.current_pc).expect("instruction not found for PC");
+            CpuOperation::from_log(log, (i as u64) * 4, instruction)
+        })
         .collect();
     collect_bitwise_lookups(&operations)
 }
