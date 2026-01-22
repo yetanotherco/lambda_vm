@@ -1,6 +1,7 @@
 .PHONY: deps deps-linux deps-macos prepare-test-data compile-programs-asm compile-programs-rust compile-bench \
 compile-programs clean-asm clean-rust clean-bench clean-shared clean test test-asm test-no-compile \
-test-asm-no-compile test-rust test-rust-no-compile test-executor flamegraph-prover
+test-asm-no-compile test-rust test-rust-no-compile test-executor flamegraph-prover \
+test-fast test-prover test-prover-all build check
 
 UNAME := $(shell uname)
 
@@ -88,7 +89,7 @@ $(BENCH_ARTIFACTS_DIR)/%.elf: $(BENCH_PROGRAMS_DIR)/%/Cargo.toml
 		CARGO_TARGET_DIR=$(abspath $(SHARED_TARGET_DIR)) \
 		rustup run nightly cargo build --release \
 			--target $(RV64_TARGET_SPEC) \
-			-Z build-std=core,compiler_builtins \
+			-Z build-std=core,alloc,std,compiler_builtins,panic_abort \
 			-Z build-std-features=compiler-builtins-mem
 	cp $(SHARED_TARGET_DIR)/riscv64im-lambda-vm-elf/release/$* $@
 
@@ -124,6 +125,28 @@ test-no-compile: prepare-test-data
 
 test: compile-programs prepare-test-data
 	cargo test
+
+# === Quick test shortcuts ===
+
+# Fast prover tests (skips ignored slow tests)
+test-fast:
+	cargo test -p prover -p stark -p executor -F stark/parallel
+
+# Prover tests only (fast)
+test-prover:
+	cargo test -p prover -F stark/parallel
+
+# Prover tests including slow ones
+test-prover-all:
+	cargo test -p prover -F stark/parallel -- --include-ignored
+
+# Build all
+build:
+	cargo build --workspace
+
+# Check (faster than build, no codegen)
+check:
+	cargo check --workspace
 
 flamegraph-prover:
 	cd crypto/stark && samply record cargo bench --bench profile_prover --features parallel
