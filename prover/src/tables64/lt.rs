@@ -196,6 +196,17 @@ pub fn generate_lt_trace(
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
 }
 
+/// Generates the LT trace table with automatic handling of empty input.
+///
+/// If no operations are provided, creates a minimal valid trace with
+/// padding rows (all zeros, MU=0). This ensures the trace has the minimum
+/// required height for FRI while not affecting bus balancing.
+pub fn generate_lt_trace_padded(
+    operations: &[LtOperation],
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_lt_trace(operations)
+}
+
 // =========================================================================
 // Bus interactions
 // =========================================================================

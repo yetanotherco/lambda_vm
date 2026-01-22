@@ -957,6 +957,31 @@ pub fn generate_cpu_trace(
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
 }
 
+/// Generates the CPU trace table with automatic padding to power of 2.
+///
+/// Accepts any number of operations (including zero) and pads to the next
+/// power of 2 with a minimum of 4 rows. Padding rows are all zeros.
+pub fn generate_cpu_trace_padded(operations: &[CpuOperation]) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let n = operations.len();
+    let target = n.next_power_of_two().max(4);
+
+    if n == target {
+        generate_cpu_trace(operations)
+    } else {
+        let mut padded = operations.to_vec();
+        padded.extend(create_padding_operations(target - n));
+        generate_cpu_trace(&padded)
+    }
+}
+
+/// Creates padding CPU operations (all zeros).
+///
+/// Placeholder for padding rows. Constraints are not yet designed to handle
+/// padding, so this is only used when testing with power-of-2 row counts.
+fn create_padding_operations(count: usize) -> Vec<CpuOperation> {
+    vec![CpuOperation::default(); count]
+}
+
 // =========================================================================
 // Bus interactions
 // =========================================================================
