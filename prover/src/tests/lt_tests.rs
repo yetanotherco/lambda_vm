@@ -10,7 +10,7 @@ const UNSIGNED: bool = false;
 
 #[test]
 fn test_lt_unsigned_basic() {
-    let ops = vec![
+    let ops = [
         LtOperation::new(5, 10, UNSIGNED),       // 5 < 10 unsigned -> true
         LtOperation::new(10, 5, UNSIGNED),       // 10 < 5 unsigned -> false
         LtOperation::new(5, 5, UNSIGNED),        // 5 < 5 unsigned -> false
@@ -27,7 +27,7 @@ fn test_lt_unsigned_basic() {
 
 #[test]
 fn test_lt_signed_basic() {
-    let ops = vec![
+    let ops = [
         LtOperation::new(5, 10, SIGNED),             // 5 < 10 signed -> true
         LtOperation::new(10, 5, SIGNED),             // 10 < 5 signed -> false
         LtOperation::new((-5i64) as u64, 5, SIGNED), // -5 < 5 signed -> true
