@@ -2,11 +2,7 @@ use crate::tables::{
     cpu::{self, CpuTableRow},
     decode::{self, DecodeTableRow},
 };
-use executor::vm::{
-    instruction::decoding::Instruction,
-    logs::Log,
-    memory::U64HashMap,
-};
+use executor::vm::{instruction::decoding::Instruction, logs::Log, memory::U64HashMap};
 use math::field::{
     element::FieldElement,
     fields::fft_friendly::{

@@ -12,11 +12,7 @@ use crate::tables64::types::FE;
 
 use executor::{
     elf::Elf,
-    vm::{
-        execution::run_program,
-        instruction::decoding::Instruction,
-        memory::U64HashMap,
-    },
+    vm::{execution::run_program, instruction::decoding::Instruction, memory::U64HashMap},
 };
 
 /// Helper to create 4 operations from a template (required for power-of-2 trace).
@@ -390,7 +386,8 @@ fn test_trace_from_logs_subw() {
     let (logs, instructions) = run_asm_elf("subw");
     assert_eq!(logs.len(), 4, "subw.elf should have 4 steps");
 
-    let trace = generate_cpu_trace_from_logs(&logs, &instructions).expect("Failed to generate CPU trace");
+    let trace =
+        generate_cpu_trace_from_logs(&logs, &instructions).expect("Failed to generate CPU trace");
 
     assert_eq!(trace.main_table.height, 4);
 
