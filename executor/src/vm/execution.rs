@@ -139,7 +139,7 @@ impl InstructionCache {
         };
 
         let byte_offset = pc - segment.base_addr;
-        if byte_offset % 4 != 0 {
+        if !byte_offset.is_multiple_of(4) {
             return None;
         }
         segment.instructions.get((byte_offset / 4) as usize)
