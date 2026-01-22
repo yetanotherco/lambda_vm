@@ -3,7 +3,7 @@ use crate::{
     tables::trace::Trace,
 };
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
-use executor::{elf::Elf, vm::execution::run_program};
+use executor::{elf::Elf, vm::execution::Executor};
 use math::field::fields::fft_friendly::{
     babybear_u32::Babybear31PrimeField, quartic_babybear_u32::Degree4BabyBearU32ExtensionField,
 };
@@ -18,8 +18,9 @@ pub fn run_program_and_prover(elf_path: &str) {
     let elf_data = std::fs::read(elf_path).unwrap();
     let program = Elf::load(&elf_data).unwrap();
 
-    let result =
-        run_program(program.image, program.entry_point, vec![]).expect("Failed to run program");
+    let executor = Executor::new(program.image, program.entry_point, vec![])
+        .expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
 
     let mut trace = Trace::generate_trace_from_logs(result.logs, &result.instructions)
         .expect("Failed to generate trace");

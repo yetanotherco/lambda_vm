@@ -17,7 +17,7 @@ use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 
 use executor::{
     elf::Elf,
-    vm::{execution::run_program, instruction::decoding::Instruction, memory::U64HashMap},
+    vm::{execution::Executor, instruction::decoding::Instruction, memory::U64HashMap},
 };
 
 use stark::constraints::transition::TransitionConstraint;
@@ -54,8 +54,9 @@ fn run_asm_elf(name: &str) -> (Vec<executor::vm::logs::Log>, U64HashMap<Instruct
     );
     let elf_data = std::fs::read(&path).expect("Failed to read ELF");
     let program = Elf::load(&elf_data).expect("Failed to load ELF");
-    let result =
-        run_program(program.image, program.entry_point, vec![]).expect("Failed to run program");
+    let executor = Executor::new(program.image, program.entry_point, vec![])
+        .expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
     (result.logs, result.instructions)
 }
 

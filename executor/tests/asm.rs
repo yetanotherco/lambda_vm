@@ -1,4 +1,4 @@
-use executor::{elf::Elf, vm::execution::run_program};
+use executor::{elf::Elf, vm::execution::Executor};
 
 // NOTE: These tests require 64-bit RISC-V ELF files (RV64IM).
 // The test ELF files need to be recompiled with a 64-bit toolchain.
@@ -11,8 +11,9 @@ fn run_program_and_check_output(elf_path: &str, expected_output: i64) {
     program.image.iter().for_each(|(addr, word)| {
         println!("0x{:016x}: 0x{:08x}", addr, word);
     });
-    let result =
-        run_program(program.image, program.entry_point, vec![]).expect("Failed to run program");
+    let executor = Executor::new(program.image, program.entry_point, vec![])
+        .expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
 
     assert!(result.return_values.register_values.0 == expected_output);
 }

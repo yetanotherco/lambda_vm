@@ -1,6 +1,6 @@
 use executor::{
     elf::Elf,
-    vm::execution::{ExecutionResult, run_program},
+    vm::execution::{ExecutionResult, Executor},
 };
 
 // NOTE: These tests require 64-bit RISC-V ELF files (RV64IM).
@@ -17,7 +17,7 @@ fn run_program_without_expect(
         println!("0x{:016x}: 0x{:08x}", addr, word);
     });
 
-    run_program(program.image, program.entry_point, private_inputs)
+    Executor::new(program.image, program.entry_point, private_inputs)?.run()
 }
 
 fn run_program_and_check_public_output(
