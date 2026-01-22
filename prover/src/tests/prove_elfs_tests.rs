@@ -30,7 +30,7 @@ use crate::tables64::bitwise::{
     BitwiseLookup, bus_interactions as bitwise_bus_interactions, cols as bitwise_cols,
     generate_bitwise_trace, update_multiplicities,
 };
-use crate::tables64::cpu::{bus_interactions as cpu_bus_interactions, CpuOperation};
+use crate::tables64::cpu::{CpuOperation, bus_interactions as cpu_bus_interactions};
 use crate::tables64::lt::{
     LtOperation, bus_interactions as lt_bus_interactions, generate_lt_trace,
 };
