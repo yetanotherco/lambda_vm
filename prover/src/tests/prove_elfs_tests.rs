@@ -31,9 +31,7 @@ use crate::tables::bitwise::{
     generate_bitwise_trace, update_multiplicities,
 };
 use crate::tables::cpu::{CpuOperation, bus_interactions as cpu_bus_interactions};
-use crate::tables::lt::{
-    LtOperation, bus_interactions as lt_bus_interactions, generate_lt_trace,
-};
+use crate::tables::lt::{LtOperation, bus_interactions as lt_bus_interactions, generate_lt_trace};
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
