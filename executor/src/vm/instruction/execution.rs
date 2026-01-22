@@ -174,11 +174,6 @@ impl Instruction {
                     LoadStoreWidth::HalfUnsigned => memory.load_half(addr)? as u64,
                     // RV64: LWU zero-extends to 64 bits
                     LoadStoreWidth::WordUnsigned => memory.load_word(addr)? as u64,
-                    //new line for lock report
-                    // add more lines
-                    // add more lines
-                    // add more lines
-                    // add more lines
                 };
                 registers.write(dst, value)?;
                 Log {
@@ -196,6 +191,7 @@ impl Instruction {
                 cond,
                 offset,
             } => {
+                let i = 0; // just for loc report
                 let (a, b) = (registers.read(src1)?, registers.read(src2)?);
                 let new_pc = if cond.apply(a, b) {
                     (pc as i64).wrapping_add(offset as i64) as u64
