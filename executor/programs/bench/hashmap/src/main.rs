@@ -1,7 +1,7 @@
 use lambda_vm_syscalls as syscalls;
 use std::collections::HashMap;
 
-const ITERATIONS: usize = 1000;
+const ITERATIONS: usize = 100;
 const MAP_SIZE: usize = 100;
 
 pub fn main() {

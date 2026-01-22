@@ -1,7 +1,7 @@
 use lambda_vm_syscalls as syscalls;
 use tiny_keccak::Hasher;
 
-const ITERATIONS: usize = 10000;
+const ITERATIONS: usize = 1000;
 
 pub fn main() {
     let mut output = [0u8; 32];
