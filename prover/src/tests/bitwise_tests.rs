@@ -1,8 +1,6 @@
 //! Tests for the BITWISE precomputed table.
 
-use crate::tables::bitwise::{
-    NUM_ROWS, bus_interactions, cols, generate_bitwise_trace, row_index,
-};
+use crate::tables::bitwise::{NUM_ROWS, bus_interactions, cols, generate_bitwise_trace, row_index};
 use crate::tables::types::FE;
 
 #[test]

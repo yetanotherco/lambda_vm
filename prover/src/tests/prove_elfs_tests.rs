@@ -34,9 +34,7 @@ use crate::tables::cpu::{
     bus_interactions as cpu_bus_interactions, collect_bitwise_lookups_from_logs,
     generate_cpu_trace_from_logs,
 };
-use crate::tables::lt::{
-    LtOperation, bus_interactions as lt_bus_interactions, generate_lt_trace,
-};
+use crate::tables::lt::{LtOperation, bus_interactions as lt_bus_interactions, generate_lt_trace};
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
 type F = GoldilocksField;
