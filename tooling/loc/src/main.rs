@@ -7,7 +7,7 @@ use tokei::{Config, Language, LanguageType, Languages};
 
 mod report;
 
-const EXCLUDED: &[&str] = &["tooling", "*target*", "*tests*", "*bench*", "*benches*"];
+const EXCLUDED: &[&str] = &["tooling", "*target*", "*tests*", "*bench*", "*benches*", "*fuzz*"];
 
 fn count_crates_loc(crates_path: &PathBuf, config: &Config) -> Vec<(String, usize)> {
     let top_level_crate_dirs = std::fs::read_dir(crates_path)
