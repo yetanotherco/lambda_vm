@@ -1,13 +1,23 @@
-//! Poseidon2 parameters for Goldilocks field (p = 2^64 - 2^32 + 1)
+//! Poseidon2 parameters for Goldilocks field (p = 2^64 - 2^32 + 1).
 //!
-//! Parameters compatible with Plonky3/HorizenLabs implementations.
-//! Reference: https://github.com/HorizenLabs/poseidon2
+//! # Source
 //!
-//! Configuration for WIDTH=8:
-//! - S-box: x^7 (gcd(7, p-1) = 1)
-//! - External rounds: 4 + 4
+//! Constants derived from HorizenLabs/Plonky3 Poseidon2 implementation.
+//! - Repository: <https://github.com/HorizenLabs/poseidon2>
+//! - Plonky3 reference: <https://github.com/Plonky3/Plonky3>
+//!
+//! The round constants and diagonal matrix values were generated using the
+//! Poseidon2 parameter generation algorithm with Goldilocks-specific security
+//! margins.
+//!
+//! # Configuration (WIDTH=8)
+//!
+//! - S-box: x^7 (gcd(7, p-1) = 1, ensuring bijection)
+//! - External rounds: 4 (initial) + 4 (terminal)
 //! - Internal rounds: 22
-//! - Rate: 4, Capacity: 4
+//! - Rate: 4
+//! - Capacity: 4
+//! - Security: ~128-bit
 
 /// Width of the permutation state
 pub const WIDTH: usize = 8;

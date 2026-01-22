@@ -1,15 +1,39 @@
-//! Poseidon2 hash function implementation
+//! Poseidon2 hash function implementation for Goldilocks field.
 //!
 //! Poseidon2 is an optimized version of the Poseidon hash function designed for
 //! efficient implementation in both hardware and software, particularly for
 //! zero-knowledge proof systems.
 //!
-//! Key differences from Poseidon:
+//! # Configuration
+//!
+//! | Parameter | Value |
+//! |-----------|-------|
+//! | Field | Goldilocks (p = 2^64 - 2^32 + 1) |
+//! | Width | 8 |
+//! | Rate | 4 |
+//! | Capacity | 4 |
+//! | S-box | x^7 |
+//! | Rounds | 4 (external) + 22 (internal) + 4 (external) = 30 |
+//!
+//! # Key Differences from Poseidon
+//!
 //! - Different linear layers for external and internal rounds
-//! - Optimized MDS matrices
+//! - Optimized MDS matrices (Horizen Labs 4×4 matrix)
 //! - Reduced constraint complexity
 //!
-//! Reference: https://eprint.iacr.org/2023/323
+//! # Domain Separation
+//!
+//! The implementation uses domain separation via the capacity element:
+//! - `hash_single(x)`: domain tag = 1
+//! - `hash(x, y)` / `compress(x, y)`: domain tag = 2
+//! - `hash_many(inputs)`: uses 10* padding (no explicit domain tag)
+//!
+//! This ensures that `hash(a, b) ≠ hash_many([a, b])` due to different constructions.
+//!
+//! # References
+//!
+//! - Paper: <https://eprint.iacr.org/2023/323>
+//! - Constants: HorizenLabs/Plonky3 implementation
 
 pub mod goldilocks;
 
@@ -249,9 +273,32 @@ impl Poseidon2 {
         Self::hash(left, right)
     }
 
-    /// Hash a vector of field elements (for Merkle tree leaves)
+    /// Hash a vector of field elements (for Merkle tree leaves).
+    ///
+    /// # Behavior
+    ///
+    /// - **Empty**: Returns `Fp::zero()` (debug assertion guards against misuse)
+    /// - **Length 1**: Delegates to [`hash_single`](Self::hash_single) (domain tag = 1)
+    /// - **Length 2+**: Delegates to [`hash_many`](Self::hash_many) (10* padding)
+    ///
+    /// # Security Note
+    ///
+    /// Empty input returns a fixed zero value which could collide with valid hash
+    /// outputs. Callers should ensure empty inputs are invalid in their protocol,
+    /// or filter them before calling this function. A debug assertion catches this
+    /// in development builds.
+    ///
+    /// # Construction Discontinuity
+    ///
+    /// Note that length-1 inputs use `hash_single` (with domain tag), while
+    /// length-2+ inputs use `hash_many` (with padding). This is intentional for
+    /// efficiency but means the underlying construction differs by length.
     pub fn hash_vec(inputs: &[Fp]) -> Fp {
         if inputs.is_empty() {
+            debug_assert!(
+                false,
+                "hash_vec called with empty input - this may cause collision with valid hashes"
+            );
             return Fp::zero();
         }
         if inputs.len() == 1 {
@@ -551,5 +598,115 @@ mod tests {
         let expected0 = &diag0 + &Fp::from(1u64);
         assert_eq!(hasher.state[0], expected0, "ILL state[0]");
         assert_eq!(hasher.state[1], Fp::from(1u64), "ILL state[1]");
+    }
+
+    // ========================================================================
+    // Domain separation tests (HIGH PRIORITY)
+    // These verify that different hash constructions produce different outputs
+    // ========================================================================
+
+    #[test]
+    fn test_domain_separation_hash_vs_hash_many() {
+        // hash(a, b) uses domain tag = 2 in capacity
+        // hash_many([a, b]) uses 10* padding, no domain tag
+        // These MUST produce different outputs
+        let a = Fp::from(1u64);
+        let b = Fp::from(2u64);
+        assert_ne!(
+            Poseidon2::hash(&a, &b),
+            Poseidon2::hash_many(&[a, b]),
+            "hash(a,b) should differ from hash_many([a,b]) due to domain separation"
+        );
+    }
+
+    #[test]
+    fn test_domain_separation_single_vs_many() {
+        // hash_single uses domain tag = 1
+        // hash_many uses 10* padding
+        // These MUST produce different outputs for same logical input
+        let x = Fp::from(42u64);
+        assert_ne!(
+            Poseidon2::hash_single(&x),
+            Poseidon2::hash_many(&[x]),
+            "hash_single(x) should differ from hash_many([x]) due to domain separation"
+        );
+    }
+
+    #[test]
+    fn test_hash_vec_delegates_length_one() {
+        // hash_vec with length 1 should delegate to hash_single
+        let x = Fp::from(42u64);
+        assert_eq!(
+            Poseidon2::hash_vec(&[x]),
+            Poseidon2::hash_single(&x),
+            "hash_vec([x]) should equal hash_single(x)"
+        );
+    }
+
+    #[test]
+    fn test_hash_vec_delegates_length_two_plus() {
+        // hash_vec with length >= 2 should delegate to hash_many
+        let inputs = vec![Fp::from(1u64), Fp::from(2u64), Fp::from(3u64)];
+        assert_eq!(
+            Poseidon2::hash_vec(&inputs),
+            Poseidon2::hash_many(&inputs),
+            "hash_vec should equal hash_many for length >= 2"
+        );
+    }
+
+    #[test]
+    fn test_compress_non_commutative() {
+        // compress(a, b) != compress(b, a) - important for Merkle tree security
+        let a = Fp::from(100u64);
+        let b = Fp::from(200u64);
+        assert_ne!(
+            Poseidon2::compress(&a, &b),
+            Poseidon2::compress(&b, &a),
+            "compress should be non-commutative (order matters)"
+        );
+    }
+
+    // ========================================================================
+    // Empty input edge case tests
+    // ========================================================================
+
+    #[test]
+    fn test_hash_vec_empty_returns_zero() {
+        // Empty input returns Fp::zero() (but triggers debug_assert in debug builds)
+        // This test verifies the behavior in release mode
+        #[cfg(not(debug_assertions))]
+        {
+            assert_eq!(
+                Poseidon2::hash_vec(&[]),
+                Fp::zero(),
+                "hash_vec([]) should return Fp::zero()"
+            );
+        }
+    }
+
+    #[test]
+    fn test_hash_many_empty_not_zero() {
+        // hash_many([]) applies 10* padding: [1, 0, 0, 0] then permutes
+        // Result should NOT be Fp::zero()
+        let result = Poseidon2::hash_many(&[]);
+        assert_ne!(
+            result,
+            Fp::zero(),
+            "hash_many([]) should not be zero (padding is applied)"
+        );
+    }
+
+    #[test]
+    fn test_hash_single_zero_not_zero() {
+        // hash_single(0) should not return 0 (would be a weak hash)
+        let result = Poseidon2::hash_single(&Fp::zero());
+        assert_ne!(result, Fp::zero(), "hash_single(0) should not return 0");
+    }
+
+    #[test]
+    fn test_hash_zero_pair_not_zero() {
+        // hash(0, 0) should not return 0
+        let result = Poseidon2::hash(&Fp::zero(), &Fp::zero());
+        assert_ne!(result, Fp::zero(), "hash(0, 0) should not return 0");
     }
 }
