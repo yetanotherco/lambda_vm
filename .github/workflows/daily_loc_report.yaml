@@ -21,30 +21,40 @@ jobs:
       - name: Setup Rust Environment
         uses: ./.github/actions/setup-rust
 
-      - name: Restore cache
-        id: cache-loc-report
-        uses: actions/cache@v4
-        with:
-          path: tooling/loc/loc_report.json
-          key: loc-report-${{ github.ref_name }}-${{ github.run_id }}
-          restore-keys: |
-            loc-report-${{ github.ref_name }}-
-            loc-report-
+      - name: Find previous successful run
+        id: find-previous-run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RUN_ID=$(gh run list -w daily_loc_report.yaml -s success -L 1 --json databaseId -q '.[0].databaseId')
+          echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
 
-      - name: Rename cached loc_report.json to loc_report.json.old
-        if: steps.cache-loc-report.outputs.cache-hit != ''
+      - name: Download previous loc report artifact
+        id: download-artifact
+        if: steps.find-previous-run.outputs.run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: loc-report
+          path: tooling/loc
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.find-previous-run.outputs.run_id }}
+        continue-on-error: true
+
+      - name: Rename previous loc_report.json to loc_report.json.old
+        if: steps.download-artifact.outcome == 'success'
         run: mv tooling/loc/loc_report.json tooling/loc/loc_report.json.old
 
       - name: Generate the loc report
         run: |
           cd tooling/loc && make loc
 
-      - name: Save new loc_report.json to cache
+      - name: Upload loc report artifact
         if: success()
-        uses: actions/cache/save@v4
+        uses: actions/upload-artifact@v4
         with:
+          name: loc-report
           path: tooling/loc/loc_report.json
-          key: loc-report-${{ github.ref_name }}-${{ github.run_id }}
+          retention-days: 7
 
       - name: Post results in summary
         run: |
