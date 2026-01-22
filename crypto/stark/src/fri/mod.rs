@@ -82,11 +82,12 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
 {
     if !fri_layers.is_empty() {
+        let num_layers = fri_layers.len();
         iotas
             .iter()
             .map(|iota_s| {
-                let mut layers_evaluations_sym = Vec::new();
-                let mut layers_auth_paths_sym = Vec::new();
+                let mut layers_evaluations_sym = Vec::with_capacity(num_layers);
+                let mut layers_auth_paths_sym = Vec::with_capacity(num_layers);
 
                 let mut index = *iota_s;
                 for layer in fri_layers {
