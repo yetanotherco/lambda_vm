@@ -13,6 +13,10 @@ Right now, this is a project under development and experimentation and must not 
 - Our Rust fork with support for our riscv target
 - Risc-V toolchain (To run executor tests)
 
+### Dev dependencies
+
+- Samply (To create flamegraphs) [Installation](https://github.com/mstange/samply?tab=readme-ov-file#installation)
+
 ### Setup executor
 
 #### Install Our Rust Fork
@@ -114,6 +118,22 @@ Full documentation can be found in [docs](./docs/). It is currently a work in pr
 
 ## Testing
 
+### Quick Reference
+
+| Command | Description |
+|---------|-------------|
+| `make test` | Run all tests (compiles programs first) |
+| `make test-fast` | Fast tests for prover, stark, and executor (skips slow tests) |
+| `make test-prover` | Prover tests only (fast) |
+| `make test-prover-all` | Prover tests including slow ones |
+| `make test-asm` | Compile and run ASM tests |
+| `make test-rust` | Compile and run Rust tests |
+| `make test-executor` | Compile all programs and run executor tests |
+| `make build` | Build all workspace crates |
+| `make check` | Check all crates (faster than build, no codegen) |
+
+### Full Test Suite
+
 To run all tests across the project use
 
 `make test`
@@ -139,129 +159,189 @@ You can run it with
 
 `make test-rust`
 
+## Benchmarking & Profiling
+
+You can create a flamegraph for proof generation using the following target:
+
+```
+  make flamegraph-prover
+```
+
 ## Roadmap for the virtual machine
 
-This project is under active development. Our primary objective is to have a first working version for the virtual machine. The first roadmap for the project can be found [here](./docs/roadmap.md). Priorities and features might change as we continue developing.
+This project is under active development. Our primary objective is to have a first working version for the virtual machine. Priorities and features might change as we continue developing.
 
-#### Milestones
+### Version Milestones
 
-- v0: VM that can prove fibonacci with lookups
-- v1: VM that can prove any program, with public inputs, and has at least one co-processor
-- v2: VM with all co-processors, recursion and solidity verifiers
-- v3: GPU + Engineering upgrades
+| Version | Description | Key Deliverables |
+|---------|-------------|------------------|
+| **v0** | Prove fibonacci with lookups | CPU table, decoder, basic constraints |
+| **v1** | Prove any program + CLI + SDK | Full instruction set, CLI tools, native verifier, benchmarks, Phase 1 audit |
+| **v1.5** | Production hardening | Segmented execution, trace compression, debugging tools |
+| **v2** | Coprocessors + recursion + Solidity verifier | All syscall tables, recursion, on-chain verification, Phase 2 audit |
+| **v3** | GPU acceleration | CUDA/Metal support, parallel proving, full audit |
 
-Notice this roadmap doesn't fully take in account the migration to 64 bits, leaving aside the executor
+### CLI
 
-Total weeks: 80
+| Feature | Description | Status | Duration | Version |
+|---------|-------------|--------|----------|---------|
+| `run` command | Execute ELF files with verbose mode, step limits, memory limits | In progress | 1 week | v0 |
+| `prove` command | Generate proof from execution trace | Planned | 2 weeks | v1 |
+| `verify` command | Verify a proof locally | Planned | 1 week | v1 |
+| `build` command | Compile guest programs to ELF | Planned | 2 weeks | v1 |
+| `new` command | Scaffold new guest project | Planned | 1 week | v1 |
+| `inspect` command | Inspect proof contents, trace stats | Planned | 1 week | v2 |
+
+### SDK / Guest Library
+
+| Feature | Description | Status | Duration | Version |
+|---------|-------------|--------|----------|---------|
+| Basic syscalls | Print, Panic, Commit, GetPrivateInputs, Halt | Done | - | v0 |
+| Structured I/O | Typed input/output with serde support | Planned | 2 weeks | v1 |
+| Logging macros | `info!`, `debug!` macros for guest programs | Planned | 3 days | v1 |
+| Assertions | `assert_eq!` that reports to host | Planned | 3 days | v1 |
+| Environment variables | Read env vars from host | Planned | 3 days | v1 |
+| Guest library docs | Comprehensive SDK documentation | Planned | 1 week | v1 |
+| Hint/Advice mechanism | Non-deterministic hints for optimization | Planned | 1 week | v2 |
 
 ### Executor
 
-#### Engineering
-- Mauro
-- Gianluca
+| Feature | Description | Status | Duration | Version |
+|---------|-------------|--------|----------|---------|
+| Documentation | Explain how the executor works | In progress | 1 week | all |
+| 32-bit CPU | CPU with all base operations | Done | - | v0 |
+| Cycle counter | Track instruction cycles for profiling | Planned | 3 days | v1 |
+| Memory statistics | Track memory usage, peak allocation | Planned | 3 days | v1 |
+| Execution limits | Max cycles, max memory configuration | Planned | 3 days | v1 |
+| Public/Private Inputs | Support for public and private inputs in the VM | Planned | 2 weeks | v1 |
+| STD Support | Implement all STD operations | Planned | 3 weeks | v1 |
+| System Instructions | `ecall`, `ebreak` | Planned | 1 week | v1 |
+| 64-bit lookup variants | Lookup arguments for 64-bit ops | Done | - | v1 |
+| 64-bit executor | RV64IM instruction execution | In progress | 1 week | v1 |
+| 64-bit memory model | 64-bit address space | In progress | 1 week | v1 |
+| Segmented execution | Split execution into chunks for large programs | Planned | 2 weeks | v1.5 |
+| Checkpoint/Resume | Save and restore execution state | Planned | 2 weeks | v1.5 |
+| CPU with Coprocessors | Add coprocessors for cryptographic operations | Planned | 1 week | v2 |
+| Big Integer Arithmetic | Big integer arithmetic syscall | Planned | 3 days | v2 |
+| Elliptic Curve Addition | EC operations syscall | Planned | 3 days | v2 |
+| Poseidon Hash syscall | Poseidon hash syscall | Planned | 3 days | v2 |
+| Keccak Hash syscall | Keccak hash syscall | Planned | 3 days | v2 |
+| SHA256 syscall | SHA256 syscall | Planned | 3 days | v2 |
+| Pairing syscall | Table for pairings | Planned | 3 days | v2 |
 
-**Total estimated duration:** 16 weeks
+### Trace and Constraints Generator
 
-| Feature                     | Description                        | Status       | Duration | Version |
-|---------------------------- |------------------------------------|--------------| ---------| ------- |
-| Documentation               | Explain how the executor works     | In progress  |  1 weeks | all versions |
-| 32-bits CPU                 | CPU with all operations | Done | - | v0 |
-| Public Inputs / Private Inputs | Support for public and private inputs in the VM | planned | 2 weeks | v1 |
-| STD Support                 | Implement all STD operations, compile get_rand | Planned | 3 weeks | v1 |
-| System instructions | `ecall`, `ebreak` | Planned | 1 week | v1 |
-| CPU with coprocessors       | Add coprocessors for special cryptographic operations   | Planned | 1 week | v2 |
-| Big Integer arithmetic | Big integer arithmetic syscall | Planned | 3 days | v2 |
-| Elliptic curve addition | EC operations syscall | Planned | 3 days  | v2 |
-| Poseidon hash | Poseidon hash syscall | Planned | 3 days | v2 |
-| Keccak hash | Keccak hash syscall | Planned | 3 days | v2 |
-| SHA256 | SHA 256 syscall | Planned | 3 days | v2 |
-| Pairing | Table for pairings | Planned | 3 days | v2 |
-| Recursion Experiments | Try naive recursion, and explore how it behaves | Planned | 1 week | v2 |
-| Perf tools for guest programs | Flamegraphs, cycle counts, and tools to optimize guests | Planned | 2 weeks | v2 |
-| RISCV64IM CPU               | Migration to 64 bits | Planned | 1 week | ??? |
+| Feature | Description | Status | Duration | Version |
+|---------|-------------|--------|----------|---------|
+| Documentation | Document trace generation and constraints | In progress | 2 weeks | all |
+| CPU Table with Basic Constraints | Implement CPU table with constraints | In progress | 4 weeks | v0 |
+| Decoder Table | Implement decoder table | Done | - | v0 |
+| Link Decoder and CPU Tables | Use lookup to connect tables | In progress | 1 week | v0 |
+| PC Update Constraints | Implement constraints for updating pc | In progress | 1 week | v0 |
+| Trace serialization | Serialize/deserialize execution traces | Planned | 1 week | v1 |
+| Constraint debugging | Tools to identify failing constraints | Planned | 1 week | v1 |
+| Memory | Implement memory table with constraints | In progress | 2 weeks | v1 |
+| ALU  | All ALU operations | Planned | 2 weeks | v1 |
+| MEMW chip | Memory word read/write operations | Planned | 2 weeks | v1 |
+| 64-bit ALU constraints | Constraints for 64-bit arithmetic | In progress | 2 weeks | v1 |
+| Trace compression | Compress trace for storage efficiency | Planned | 1 week | v1.5 |
+| Syscall - Big Integer | Table for big integer arithmetic | Planned | 3 weeks | v2 |
+| Syscall - Elliptic Curve | Table for EC operations | Planned | 3 weeks | v2 |
+| Syscall - Poseidon Hash | Table for Poseidon hash | Planned | 3 weeks | v2 |
+| Syscall - Keccak Hash | Table for Keccak hash | Planned | 3 weeks | v2 |
+| Syscall - SHA256 | Table for SHA256 | Planned | 1 week | v2 |
+| Syscall - Pairing | Table for pairings | Planned | 3 weeks | v2 |
 
-### Trace and Constraints generator
+### Table Infrastructure
 
-#### Engineering
-- Mauro
-- Federica
-- Colo
+| Feature | Description | Status | Duration | Version |
+|---------|-------------|--------|----------|---------|
+| Preprocessed columns | Generate constant/precomputed columns | Planned | 1 week | v0 |
+| Padding utilities | Consistent power-of-two padding across tables | Planned | 1 week | v0 |
+| Column count optimization | Track and minimize total column counts | Planned | 2 weeks | v1 |
+| Range check tables | IS_B8, IS_B16, IS_B20 lookup tables | Planned | 2 weeks | v1 |
+| Bitwise lookup tables | AND, OR, XOR, MSB precomputed tables | Planned | 2 weeks | v1 |
+| Shift lookup tables | HWSL, HWSLC for half-word shifts | Planned | 2 weeks | v1 |
 
-**Total estimated duration:** 37 weeks
+### Memory Argument
 
-*This includes the linking with the executor*
+| Feature | Description | Status | Duration | Version |
+|---------|-------------|--------|----------|---------|
+| PAGE tables | Paged memory initialization/finalization | Planned | 2 weeks | v1 |
+| Timestamp ordering | Unique timestamps for memory access ordering | Planned | 1 week | v1 |
+| Token balancing | LogUp emission/consumption balance | Planned | 1 week | v1 |
+| ELF binary verification | Verifier checks initial memory from ELF | Planned | 1 week | v1 |
+| Register init state | Initial register values (x0-x31) | Planned | 3 days | v1 |
+| Private input pages | PAGE tables for prover private inputs | Planned | 1 week | v1 |
 
-| Feature                     | Description                       | Status       | Duration | Version |
-|---------------------------- |-----------------------------------|--------------| -------- | ------- |
-| Documentation               | Document trace generation and constraints | In progress | 2 weeks | all versions |
-| CPU Table with basic constraints  | Implement CPU table with constraints | In progress | 4 weeks | v0 |
-| Decoder table | Implement decoder table | Planned | 1 week | v0 |
-| Link decoder table and CPU | Use lookup to connect tables | Planned | 1 week | v0 |
-| Constraints for updating pc | Implement constraints for updating pc | In progress | 1 week | v0 |
-| ALU - Range checkers | Implement rangecheck for u16 and u8 | Planned | 2 week | v0 |
-| Memory                      | Implement memory table with constraints | Planned | 2 weeks | v0 |
-| ALU - Bitwise operations (and, xor, or) | Implement tables for u8 bitwise operations | Planned | 2 week | v1 |
-| ALU - Shift operations | Implement tables for shift operations | Planned | 2 week | v1 |
-| ALU - Multiplication table | Implement table for multiplication table | Planned | 2 week | v1 |
-| ALU - Division and remainder | Implement table for integer division operations | Planned | 2 week | v1 |
-| Syscall - Initial - Big Integer arithmetic | Table for big integer arithmetic | Planned | 3 week |v2|
-| Syscall - Elliptic curve addition | Table for EC operations | Planned | 3 weeks  | v2|
-| Syscall - Poseidon hash | Table for Poseidon hash | Planned | 3 weeks | v2 |
-| Syscall -Keccak hash | Table for Keccak hash | Planned | 3 weeks | v2 |
-| Syscall - SHA256 | Table for SHA256 | Planned | 1 weeks | v2 |
-| Syscall - Pairing / FP | Table for pairings | Planned | 3 weeks | v2 |
+### Proof System
 
-### Core Proof system
-
-#### Theory
-
-- Diego
-- Manuel
-- 3MILabs (Cyprien, Robin, and Erik)
-
-#### Implementation
-- Mauro
-- Juan
-- Nicole
-
-**Total estimated duration:** 18 weeks
-
-| Feature                     | Description                       | Status       | Duration | Version |
-|---------------------------- |-----------------------------------|--------------| -------- | ------- |
-| Documentation               | Prepare comprehensive documentation on proof system | In progress   | 4 weeks | all versions |
-| Lookup arguments            | Linking tables via lookup arguments | In progress | 2 weeks | v0 |
-| Lookup - I | Accept multitables | In progress | 1 week | v0 |
-| Lookup - II | Perform argument with constraints | In progress | 1 week | v0 |
-| Public input | Add public input using Lookup | Planned | 1 week | v0 |
-| Poseidon hash               | Adapt Poseidon for Goldilocks      | Planned      | 3 days   | v1 |
-| Multi-table Merkle trees (MTMT)   | Merkle tree that can be used to commit to polynomials of various sizes | In progress | 2 weeks | v2 |
-| Multi-FRI                   | Perform FRI using MTMT | Planned | 2 weeks | v2 |
-| Adjust parameters           | Adjust parameters for 128 bits of security | Planned | 1 week | v2 |
-| Recursion | Allow for n-1 recursion tree to compress proof size | Planned | 4 weeks | v2 |
-| More efficient lookups | Experiment with lookup arguments | Planned | 4 weeks | v3 |
+| Feature | Description | Status | Duration | Version |
+|---------|-------------|--------|----------|---------|
+| Documentation | Prepare comprehensive documentation on proof system | In progress | 4 weeks | all |
+| Lookup arguments | Linking tables via lookup arguments | Done | - | v0 |
+| Lookup - Multi-table | Accept multitables | Done | - | v0 |
+| Lookup - Constraints | Perform argument with constraints | Done | - | v0 |
+| Public Input | Add public input using Lookup | Done | - | v0 |
+| Multi-table Merkle Trees (MTMT) | Merkle tree for polynomials of various sizes | In progress | 2 weeks | v2 |
+| Multi-FRI | Perform FRI using MTMT | Planned | 2 weeks | v2 |
+| Adjust parameters | Adjust parameters for 128 bits of security | Planned | 1 week | v2 |
+| Single-layer Recursion | Verify one proof inside another | Planned | 4 weeks | v2 |
+| Proof Aggregation | Combine N proofs into one | Planned | 2 weeks | v2 |
+| Recursive Verifier Circuit | AIR constraints for in-circuit verification | Planned | 3 weeks | v2 |
+| More Efficient Lookups | Experiment with lookup arguments | Planned | 4 weeks | v3 |
 
 ### Verifier
 
-**Total estimated duration:** 7 weeks
+| Feature | Description | Status | Duration | Version |
+|---------|-------------|--------|----------|---------|
+| Native Rust verifier | Verify proofs locally | Done | - | v1 |
+| Proof serialization | Standard proof format (bincode/JSON) | Planned | 1 week | v1 |
+| CPU Table Ethereum Verifier | Solidity verifier for the vm | Planned | 2 weeks | v2 |
+| Batch verification | Verify multiple proofs efficiently | In progress | 2 weeks | v2 |
+| Browser Verifier | Verifier using wasm in javascript | Planned | 1 week | v2 |
+| Optimize Ethereum Verifier | Optimize gas cost for verifier | Planned | 2 weeks | v2 |
+| Multi Table Ethereum Verifier | Solidity verifier for multi-table vm | Planned | 2 weeks | v2 |
+
+### Testing & Quality
 
 | Feature | Description | Status | Duration | Version |
-| ------ | -------- |--------| -----------| ------- |
-| CPU Table Ethereum verifier | Solidity verifier for the vm | Planned | 2 weeks | v1 |
-| Browser Verifier | Verifier for the vm using wasm in javascript | Planned | 1 weeks | v2 |
-|Optimize Ethereum verifier | Optimize gas cost for verifier | Planned | 2 weeks | v2 |
-| Multi Table Ethereum verifier | Solidity verifier for the vm | Planned | 2 weeks | v2 |
+|---------|-------------|--------|----------|---------|
+| ASM test suite | Assembly test programs | Done | - | v0 |
+| Rust test programs | Rust guest program tests | Done | - | v0 |
+| Benchmarking suite | Systematic performance benchmarks | In progress | 2 weeks | v1 |
+| Fuzzing infrastructure | Continuous fuzzing for executor/prover | Planned | 2 weeks | v1 |
+| RISC-V compliance tests | Official RISC-V test suite | Planned | 1 week | v1 |
+| Property-based tests | Proptest for constraint correctness | Planned | 1 week | v1 |
+| Integration tests | Full pipeline tests (compile→prove→verify) | Planned | 2 weeks | v1 |
 
-### GPU and performance
+### Security & Audits
 
-**Total estimated duration:** 24 weeks
+| Feature | Description | Status | Version |
+|---------|-------------|--------|---------|
+| Constraint audit (Phase 1) | Audit core CPU/memory constraints | Planned | v1 |
+| Crypto audit | Audit field arithmetic, hash functions | Planned | v1 |
+| Prover audit (Phase 2) | Audit STARK prover, FRI, lookups | Planned | v2 |
+| Full system audit | End-to-end security audit | Planned | v3 |
 
-| Feature                     | Description                       | Status       | Version |
-|---------------------------- |-----------------------------------|--------------| ------ |
-| Fields                      | Improve field performance using assembly | Planned | v3 |
-| GPU-Fast-Fourier transform      | Implement GPU version of FFT | Planned | v3 |
-| GPU-Merkle tree                 | Implement GPU version for Merkle trees | Planned | v3 |
-| Parallel witness generation   | Use GPU for fast witness generation | Planned | v3 |
-| GPU-FRI | Perform FRI on GPU | Planned | v3 |
+### Integration & Examples
+
+| Feature | Description | Status | Duration | Version |
+|---------|-------------|--------|----------|---------|
+| End-to-end examples | Complete prove/verify workflows | Planned | 1 week | v1 |
+| Project templates | Starter templates for common use cases | Planned | 1 week | v1 |
+
+### GPU and Performance
+
+| Feature | Description | Status | Duration | Version |
+|---------|-------------|--------|----------|---------|
+| Fields (ASM/SIMD) | Improve field performance using assembly/SIMD | In progress | 4 weeks | v3 |
+| CUDA NTT/FFT | Number theoretic transform on CUDA | Planned | 4 weeks | v3 |
+| Metal NTT/FFT | NTT for Apple Silicon | Planned | 3 weeks | v3 |
+| GPU Merkle hashing | Parallel Merkle tree on GPU | Planned | 3 weeks | v3 |
+| GPU witness generation | Parallel trace generation | Planned | 4 weeks | v3 |
+| GPU FRI | FRI folding on GPU | Planned | 4 weeks | v3 |
+| Multi-GPU support | Distribute across multiple GPUs | Planned | 3 weeks | v3 |
   
 ## Acknowledgements
 

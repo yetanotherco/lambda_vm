@@ -33,7 +33,7 @@ fn test_is_bit_constraint_degree() {
 #[test]
 fn test_add_constraint_degree() {
     let (c0, c1) = AddConstraint::new_pair(
-        0,
+        vec![0],
         AddOperand::dword(1),
         AddOperand::dword(3),
         AddOperand::dword(5),
@@ -46,7 +46,7 @@ fn test_add_constraint_degree() {
 #[test]
 fn test_add_constraint_indices() {
     let (c0, c1) = AddConstraint::new_pair(
-        0,
+        vec![0],
         AddOperand::dword(1),
         AddOperand::dword(3),
         AddOperand::dword(5),
@@ -538,4 +538,159 @@ fn test_dword_bl_repack_formula() {
 
     assert_eq!(lo, FE::from(0x78563412u64));
     assert_eq!(hi, FE::from(0xF0DEBC9Au64));
+}
+
+// =========================================================================
+// CPU Constraints tests
+// =========================================================================
+
+use crate::constraints64::cpu::{
+    Arg1LowerConstraint, Arg1UpperConstraint, BIT_FLAG_COLUMNS, BranchCondConstraint,
+    EbreakConstraint, NUM_CPU_CONSTRAINTS, NextPcAddConstraint, SignBitZeroConstraint,
+    create_add_constraints, create_all_cpu_constraints, create_is_bit_constraints,
+    create_slt_res_zero_constraints,
+};
+use crate::tables64::cpu::cols as cpu_cols;
+
+#[test]
+fn test_cpu_bit_flag_columns_count() {
+    // Should have 30 bit flag columns
+    assert_eq!(BIT_FLAG_COLUMNS.len(), 30);
+}
+
+#[test]
+fn test_cpu_bit_flag_columns_valid() {
+    // All columns should be valid CPU column indices
+    for &col in BIT_FLAG_COLUMNS {
+        assert!(col < cpu_cols::NUM_COLUMNS, "Column {} out of range", col);
+    }
+}
+
+#[test]
+fn test_create_is_bit_constraints() {
+    let (constraints, next_idx) = create_is_bit_constraints(0);
+
+    assert_eq!(constraints.len(), 30);
+    assert_eq!(next_idx, 30);
+
+    // Check constraint indices are sequential
+    for (i, c) in constraints.iter().enumerate() {
+        assert_eq!(c.constraint_idx(), i);
+    }
+}
+
+#[test]
+fn test_create_add_constraints() {
+    let (constraints, next_idx) = create_add_constraints(0);
+
+    // Should create 2 constraints (carry_0 and carry_1)
+    assert_eq!(constraints.len(), 2);
+    assert_eq!(next_idx, 2);
+
+    assert_eq!(constraints[0].constraint_idx(), 0);
+    assert_eq!(constraints[1].constraint_idx(), 1);
+}
+
+#[test]
+fn test_create_slt_res_zero_constraints() {
+    let (constraints, next_idx) = create_slt_res_zero_constraints(0);
+
+    // Should create 7 constraints (for bytes 1-7)
+    assert_eq!(constraints.len(), 7);
+    assert_eq!(next_idx, 7);
+
+    for (i, c) in constraints.iter().enumerate() {
+        assert_eq!(c.constraint_idx(), i);
+    }
+}
+
+#[test]
+fn test_branch_cond_constraint_degree() {
+    let c = BranchCondConstraint::new(0);
+    assert_eq!(c.degree(), 3);
+}
+
+#[test]
+fn test_ebreak_constraint_degree() {
+    let c = EbreakConstraint::new(0);
+    assert_eq!(c.degree(), 1);
+}
+
+#[test]
+fn test_arg1_lower_constraint_degree() {
+    let c = Arg1LowerConstraint::new(0);
+    assert_eq!(c.degree(), 1);
+}
+
+#[test]
+fn test_arg1_upper_constraint_degree() {
+    let c = Arg1UpperConstraint::new(0);
+    assert_eq!(c.degree(), 3);
+}
+
+#[test]
+fn test_sign_bit_zero_constraint_degree() {
+    let c = SignBitZeroConstraint::new(0);
+    assert_eq!(c.degree(), 2);
+}
+
+#[test]
+fn test_next_pc_add_constraint_degree() {
+    let c = NextPcAddConstraint::new(0, 0);
+    assert_eq!(c.degree(), 3);
+}
+
+#[test]
+fn test_next_pc_add_constraint_new_pair() {
+    let (c0, c1) = NextPcAddConstraint::new_pair(10);
+    assert_eq!(c0.constraint_idx(), 10);
+    assert_eq!(c1.constraint_idx(), 11);
+}
+
+#[test]
+fn test_create_all_cpu_constraints() {
+    let (is_bit, add, other, total) = create_all_cpu_constraints();
+
+    assert_eq!(is_bit.len(), 30);
+    // ADD constraints: 2 (ADD+LOAD+STORE) + 2 (SUB+BEQ) + 2 (JALR) = 6
+    assert_eq!(add.len(), 6);
+    // Other: branch_cond(1) + ebreak(1) + arg1(2) + arg2(2) + rvd(2) + slt_zero(7) + sign_bit_zero(1) + next_pc(2) = 18
+    assert_eq!(other.len(), 18);
+
+    // Total should be 30 + 6 + 18 = 54
+    assert_eq!(total, 54);
+    assert_eq!(total, NUM_CPU_CONSTRAINTS);
+}
+
+#[test]
+fn test_cpu_constraint_indices_are_unique() {
+    let (is_bit, add, other, _) = create_all_cpu_constraints();
+
+    let mut indices: Vec<usize> = Vec::new();
+
+    for c in &is_bit {
+        indices.push(c.constraint_idx());
+    }
+    for c in &add {
+        indices.push(c.constraint_idx());
+    }
+    for c in &other {
+        indices.push(c.constraint_idx());
+    }
+
+    // Check no duplicates
+    indices.sort();
+    for i in 1..indices.len() {
+        assert_ne!(
+            indices[i],
+            indices[i - 1],
+            "Duplicate constraint index: {}",
+            indices[i]
+        );
+    }
+
+    // Check sequential
+    for (i, &idx) in indices.iter().enumerate() {
+        assert_eq!(idx, i, "Expected index {} but got {}", i, idx);
+    }
 }
