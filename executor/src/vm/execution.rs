@@ -98,22 +98,19 @@ pub struct InstructionCache {
 
 impl InstructionCache {
     pub fn new(segments: &[crate::elf::Segment]) -> Result<Self, InstructionError> {
-        let segments = segments
-            .iter()
-            .filter(|seg| seg.is_executable)
-            .map(|seg| {
-                let instructions: Vec<Instruction> = seg
-                    .values
-                    .iter()
-                    .map(|inst| Instruction::parse(*inst))
-                    .collect::<Result<_, _>>()?;
-                Ok(InstructionSegment {
-                    base_addr: seg.base_addr,
-                    instructions,
-                })
-            })
-            .collect::<Result<_, _>>()?;
-        Ok(Self { segments })
+        let mut result = Vec::new();
+        for seg in segments.iter().filter(|s| s.is_executable) {
+            let instructions = seg
+                .values
+                .iter()
+                .map(|v| Instruction::parse(*v))
+                .collect::<Result<Vec<_>, _>>()?;
+            result.push(InstructionSegment {
+                base_addr: seg.base_addr,
+                instructions,
+            });
+        }
+        Ok(Self { segments: result })
     }
 
     pub fn get(&self, pc: u64) -> Option<&Instruction> {
@@ -134,10 +131,7 @@ impl InstructionCache {
 
         let segment = &self.segments[idx];
         let byte_offset = pc - segment.base_addr;
-        if !byte_offset.is_multiple_of(4) {
-            return None;
-        }
-        let offset = (byte_offset / 4) as usize;
+        let offset = (byte_offset.checked_div(4)?) as usize;
         segment.instructions.get(offset)
     }
 
