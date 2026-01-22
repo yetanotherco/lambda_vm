@@ -46,10 +46,22 @@ const MAX_PRIVATE_INPUT_SIZE: u64 = 6700000;
 // Ported from main: fixed high address to avoid overlap with program memory
 const PRIVATE_INPUT_START_INDEX: u64 = 0xFF000000;
 
-#[derive(Default, Debug)]
+/// Pre-allocated capacity for the memory HashMap to avoid resizing during execution.
+/// This is sized to handle typical program memory usage without reallocation.
+const INITIAL_MEMORY_CAPACITY: usize = 64 * 1024; // 64K entries = 256KB of addressable memory
+
+#[derive(Debug)]
 pub struct Memory(U64HashMap<[u8; 4]>);
 
 impl Memory {
+    /// Create a new Memory with pre-allocated capacity
+    pub fn new() -> Self {
+        Self(U64HashMap::with_capacity_and_hasher(
+            INITIAL_MEMORY_CAPACITY,
+            U64BuildHasher,
+        ))
+    }
+
     pub fn load_byte(&self, address: u64) -> u8 {
         let aligned_address = address - address % 4;
         let value = self.0.get(&aligned_address).cloned().unwrap_or_default();

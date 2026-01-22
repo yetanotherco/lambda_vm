@@ -20,7 +20,7 @@ pub fn run_program(
     entrypoint: u64,
     private_inputs: Vec<u8>,
 ) -> Result<(ReturnValues, Vec<Log>), ExecutorError> {
-    let mut memory = Memory::default();
+    let mut memory = Memory::new();
     memory.store_private_inputs(private_inputs)?;
     // Pre-decode all instructions
     let decoded_instructions = predecode_instructions(&instruction_map);
