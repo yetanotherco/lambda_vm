@@ -287,10 +287,7 @@ impl Instruction {
                         // It is not the correct implementation of ecall/ebreak
                         let pointer = registers.read(10)?;
                         let len = registers.read(11)?;
-                        let mut bytes = vec![];
-                        for i in 0..len {
-                            bytes.push(memory.load_byte(pointer + i));
-                        }
+                        let bytes = memory.load_bytes(pointer, len);
                         let value =
                             str::from_utf8(&bytes).map_err(|_| ExecutionError::IncorrectMessage)?;
                         println!("PRINT VM: {}", value);
@@ -299,10 +296,7 @@ impl Instruction {
                         // panic
                         let pointer = registers.read(10)?;
                         let len = registers.read(11)?;
-                        let mut bytes = vec![];
-                        for i in 0..len {
-                            bytes.push(memory.load_byte(pointer + i));
-                        }
+                        let bytes = memory.load_bytes(pointer, len);
                         let value =
                             str::from_utf8(&bytes).map_err(|_| ExecutionError::IncorrectMessage)?;
                         return Err(ExecutionError::Panic(value.to_owned()));
