@@ -972,7 +972,9 @@ pub fn generate_cpu_trace_from_logs(
         .iter()
         .enumerate()
         .map(|(i, log)| {
-            let instruction = *instructions.get(&log.current_pc).expect("instruction not found for PC");
+            let instruction = *instructions
+                .get(&log.current_pc)
+                .expect("instruction not found for PC");
             CpuOperation::from_log(log, (i as u64) * 4, instruction)
         })
         .collect();
@@ -1002,7 +1004,9 @@ pub fn collect_bitwise_lookups_from_logs(
         .iter()
         .enumerate()
         .map(|(i, log)| {
-            let instruction = *instructions.get(&log.current_pc).expect("instruction not found for PC");
+            let instruction = *instructions
+                .get(&log.current_pc)
+                .expect("instruction not found for PC");
             CpuOperation::from_log(log, (i as u64) * 4, instruction)
         })
         .collect();
