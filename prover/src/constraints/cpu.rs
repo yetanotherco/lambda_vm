@@ -20,8 +20,8 @@ use stark::constraints::transition::TransitionConstraint;
 use stark::table::TableView;
 use stark::traits::TransitionEvaluationContext;
 
-use crate::tables64::cpu::cols;
-use crate::tables64::types::{GoldilocksExtension, GoldilocksField};
+use crate::tables::cpu::cols;
+use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
 use super::templates::{AddConstraint, AddLinearTerm, AddOperand, IsBitConstraint};
 

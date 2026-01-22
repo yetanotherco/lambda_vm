@@ -89,7 +89,9 @@ where
 
     /// Returns the Merkle path for the element/s for the leaf at position pos
     fn build_merkle_path(&self, pos: usize) -> Result<Vec<B::Node>, Error> {
-        let mut merkle_path = Vec::new();
+        // Pre-allocate based on tree depth (log2 of tree size)
+        let tree_depth = (self.nodes.len() + 1).ilog2() as usize;
+        let mut merkle_path = Vec::with_capacity(tree_depth);
         let mut pos = pos;
 
         while pos != ROOT {

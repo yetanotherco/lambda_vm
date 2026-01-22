@@ -1,7 +1,12 @@
+//! Quadratic and cubic extensions of the Goldilocks field.
+//!
+//! These extensions use the optimized Goldilocks implementation (no Montgomery form).
+//!
+
 use crate::field::{
     element::FieldElement,
     errors::FieldError,
-    fields::fft_friendly::u64_goldilocks::U64GoldilocksPrimeField,
+    fields::fft_friendly::u64_goldilocks::{GOLDILOCKS_PRIME, GoldilocksField},
     traits::{HasDefaultTranscript, IsField, IsSubFieldOf},
 };
 use crate::traits::{AsBytes, ByteConversion};
@@ -9,17 +14,12 @@ use crate::traits::{AsBytes, ByteConversion};
 // =====================================================
 // QUADRATIC EXTENSION (Fp2)
 // =====================================================
-// The non-residue was taken from [Plonky3](https://github.com/Plonky3/Plonky3/blob/main/goldilocks/src/extension.rs)
 // The quadratic extension is constructed using x^2 - 7,
 // where 7 is a quadratic non-residue in the Goldilocks field.
 // This means Fp2 = Fp[x] / (x^2 - 7)
 // Elements are represented as a0 + a1*w where w^2 = 7
 
-type FpE = FieldElement<U64GoldilocksPrimeField>;
-
-/// The quadratic non-residue W = 7 for the quadratic extension.
-/// Fp2 is constructed as Fp[x] / (x^2 - 7)
-pub const QUADRATIC_NON_RESIDUE: FpE = FpE::from_hex_unchecked("7");
+type FpE = FieldElement<GoldilocksField>;
 
 /// Degree 2 extension field of Goldilocks
 #[derive(Copy, Clone, Debug)]
@@ -29,6 +29,7 @@ impl IsField for Degree2GoldilocksExtensionField {
     type BaseType = [FpE; 2];
 
     /// Returns the component-wise addition of `a` and `b`
+    #[inline(always)]
     fn add(a: &Self::BaseType, b: &Self::BaseType) -> Self::BaseType {
         [a[0] + b[0], a[1] + b[1]]
     }
@@ -36,38 +37,51 @@ impl IsField for Degree2GoldilocksExtensionField {
     /// Returns the multiplication of `a` and `b`:
     /// (a0 + a1*w) * (b0 + b1*w) = (a0*b0 + W*a1*b1) + (a0*b1 + a1*b0)*w
     /// where w^2 = W = 7
+    #[inline(always)]
     fn mul(a: &Self::BaseType, b: &Self::BaseType) -> Self::BaseType {
         let a0b0 = a[0] * b[0];
         let a1b1 = a[1] * b[1];
         let z = (a[0] + a[1]) * (b[0] + b[1]);
-        [a0b0 + QUADRATIC_NON_RESIDUE * a1b1, z - a0b0 - a1b1]
+
+        // W * a1b1 = 7 * a1b1
+        let w_a1b1 = mul_by_7(&a1b1);
+
+        [a0b0 + w_a1b1, z - a0b0 - a1b1]
     }
 
     /// Returns the square of `a`:
     /// (a0 + a1*w)^2 = (a0^2 + W*a1^2) + 2*a0*a1*w
+    #[inline(always)]
     fn square(a: &Self::BaseType) -> Self::BaseType {
         let a0_sq = a[0].square();
         let a1_sq = a[1].square();
         let a0a1 = a[0] * a[1];
-        [a0_sq + QUADRATIC_NON_RESIDUE * a1_sq, a0a1.double()]
+
+        // W * a1^2 = 7 * a1^2
+        let w_a1_sq = mul_by_7(&a1_sq);
+
+        [a0_sq + w_a1_sq, a0a1.double()]
     }
 
     /// Returns the component-wise subtraction of `a` and `b`
+    #[inline(always)]
     fn sub(a: &Self::BaseType, b: &Self::BaseType) -> Self::BaseType {
         [a[0] - b[0], a[1] - b[1]]
     }
 
     /// Returns the component-wise negation of `a`
+    #[inline(always)]
     fn neg(a: &Self::BaseType) -> Self::BaseType {
-        [-a[0], -a[1]]
+        [-&a[0], -&a[1]]
     }
 
     /// Returns the multiplicative inverse of `a`:
     /// (a0 + a1*w)^-1 = (a0 - a1*w) / (a0^2 - W*a1^2)
-    /// The norm is a0^2 - W*a1^2. This is never zero for non-zero elements
-    /// because W=7 is a quadratic non-residue (no x exists where x^2 = 7).
     fn inv(a: &Self::BaseType) -> Result<Self::BaseType, FieldError> {
-        let norm = a[0].square() - QUADRATIC_NON_RESIDUE * a[1].square();
+        let a0_sq = a[0].square();
+        let a1_sq = a[1].square();
+        let w_a1_sq = mul_by_7(&a1_sq);
+        let norm = a0_sq - w_a1_sq;
         let norm_inv = norm.inv()?;
         Ok([a[0] * norm_inv, -a[1] * norm_inv])
     }
@@ -102,7 +116,7 @@ impl IsField for Degree2GoldilocksExtensionField {
     }
 }
 
-impl IsSubFieldOf<Degree2GoldilocksExtensionField> for U64GoldilocksPrimeField {
+impl IsSubFieldOf<Degree2GoldilocksExtensionField> for GoldilocksField {
     fn mul(
         a: &Self::BaseType,
         b: &<Degree2GoldilocksExtensionField as IsField>::BaseType,
@@ -149,7 +163,7 @@ impl IsSubFieldOf<Degree2GoldilocksExtensionField> for U64GoldilocksPrimeField {
     }
 }
 
-/// Field element type for the quadratic extension of Goldilocks
+/// Field element type for the quadratic extension of native Goldilocks
 pub type Fp2E = FieldElement<Degree2GoldilocksExtensionField>;
 
 impl Fp2E {
@@ -166,9 +180,6 @@ impl Fp2E {
 // where 2 is a cubic non-residue in the Goldilocks field.
 // This means Fp3 = Fp[x] / (x^3 - 2)
 // Elements are represented as a0 + a1*w + a2*w^2 where w^3 = 2
-//
-// Since the non-residue is 2, we use .double() for efficiency
-// instead of multiplying by the non-residue constant.
 
 /// Degree 3 extension field of Goldilocks
 #[derive(Copy, Clone, Debug)]
@@ -178,13 +189,14 @@ impl IsField for Degree3GoldilocksExtensionField {
     type BaseType = [FpE; 3];
 
     /// Returns the component-wise addition of `a` and `b`
+    #[inline(always)]
     fn add(a: &Self::BaseType, b: &Self::BaseType) -> Self::BaseType {
         [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
     }
 
     /// Returns the multiplication of `a` and `b`:
     /// (a0 + a1*w + a2*w^2) * (b0 + b1*w + b2*w^2) mod (w^3 - 2)
-    /// Using Karatsuba-like optimization with W=2 replaced by .double()
+    #[inline(always)]
     fn mul(a: &Self::BaseType, b: &Self::BaseType) -> Self::BaseType {
         let v0 = a[0] * b[0];
         let v1 = a[1] * b[1];
@@ -193,14 +205,15 @@ impl IsField for Degree3GoldilocksExtensionField {
         // c0 = v0 + 2 * ((a1 + a2)(b1 + b2) - v1 - v2)
         // c1 = (a0 + a1)(b0 + b1) - v0 - v1 + 2 * v2
         // c2 = (a0 + a2)(b0 + b2) - v0 + v1 - v2
-        [
-            v0 + ((a[1] + a[2]) * (b[1] + b[2]) - v1 - v2).double(),
-            (a[0] + a[1]) * (b[0] + b[1]) - v0 - v1 + v2.double(),
-            (a[0] + a[2]) * (b[0] + b[2]) - v0 + v1 - v2,
-        ]
+        let t0 = (a[1] + a[2]) * (b[1] + b[2]) - v1 - v2;
+        let t1 = (a[0] + a[1]) * (b[0] + b[1]) - v0 - v1;
+        let t2 = (a[0] + a[2]) * (b[0] + b[2]) - v0 - v2;
+
+        [v0 + t0.double(), t1 + v2.double(), t2 + v1]
     }
 
     /// Returns the square of `a`
+    #[inline(always)]
     fn square(a: &Self::BaseType) -> Self::BaseType {
         let s0 = a[0].square();
         let s1 = a[1].square();
@@ -209,7 +222,7 @@ impl IsField for Degree3GoldilocksExtensionField {
         let a02 = a[0] * a[2];
         let a12 = a[1] * a[2];
 
-        // c0 = s0 + 2 * 2 * a12 = s0 + 4 * a12
+        // c0 = s0 + 4 * a12
         // c1 = 2 * a01 + 2 * s2
         // c2 = 2 * a02 + s1
         [
@@ -220,23 +233,23 @@ impl IsField for Degree3GoldilocksExtensionField {
     }
 
     /// Returns the component-wise subtraction of `a` and `b`
+    #[inline(always)]
     fn sub(a: &Self::BaseType, b: &Self::BaseType) -> Self::BaseType {
         [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
     }
 
     /// Returns the component-wise negation of `a`
+    #[inline(always)]
     fn neg(a: &Self::BaseType) -> Self::BaseType {
         [-a[0], -a[1], -a[2]]
     }
 
     /// Returns the multiplicative inverse of `a`
-    /// Using the formula for cubic extension inverse with W=2
     fn inv(a: &Self::BaseType) -> Result<Self::BaseType, FieldError> {
         let a0_sq = a[0].square();
         let a1_sq = a[1].square();
         let a2_sq = a[2].square();
 
-        // W = 2, W^2 = 4
         // Compute the norm: N = a0^3 + 2*a1^3 + 4*a2^3 - 6*a0*a1*a2
         let a0_cubed = a0_sq * a[0];
         let a1_cubed = a1_sq * a[1];
@@ -249,14 +262,17 @@ impl IsField for Degree3GoldilocksExtensionField {
 
         let norm_inv = norm.inv()?;
 
-        // Compute inverse components:
         // inv[0] = (a0^2 - 2*a1*a2) / N
         // inv[1] = (2*a2^2 - a0*a1) / N
         // inv[2] = (a1^2 - a0*a2) / N
+        let a1a2 = a[1] * a[2];
+        let a0a1 = a[0] * a[1];
+        let a0a2 = a[0] * a[2];
+
         Ok([
-            (a0_sq - (a[1] * a[2]).double()) * norm_inv,
-            (a2_sq.double() - a[0] * a[1]) * norm_inv,
-            (a1_sq - a[0] * a[2]) * norm_inv,
+            (a0_sq - a1a2.double()) * norm_inv,
+            (a2_sq.double() - a0a1) * norm_inv,
+            (a1_sq - a0a2) * norm_inv,
         ])
     }
 
@@ -290,7 +306,7 @@ impl IsField for Degree3GoldilocksExtensionField {
     }
 }
 
-impl IsSubFieldOf<Degree3GoldilocksExtensionField> for U64GoldilocksPrimeField {
+impl IsSubFieldOf<Degree3GoldilocksExtensionField> for GoldilocksField {
     fn mul(
         a: &Self::BaseType,
         b: &<Degree3GoldilocksExtensionField as IsField>::BaseType,
@@ -339,7 +355,7 @@ impl IsSubFieldOf<Degree3GoldilocksExtensionField> for U64GoldilocksPrimeField {
     }
 }
 
-/// Field element type for the cubic extension of Goldilocks
+/// Field element type for the cubic extension of native Goldilocks
 pub type Fp3E = FieldElement<Degree3GoldilocksExtensionField>;
 
 // =====================================================
@@ -388,6 +404,7 @@ impl ByteConversion for FieldElement<Degree3GoldilocksExtensionField> {
     }
 }
 
+#[cfg(feature = "alloc")]
 impl AsBytes for FieldElement<Degree3GoldilocksExtensionField> {
     fn as_bytes(&self) -> alloc::vec::Vec<u8> {
         self.to_bytes_be()
@@ -396,9 +413,6 @@ impl AsBytes for FieldElement<Degree3GoldilocksExtensionField> {
 
 impl HasDefaultTranscript for Degree3GoldilocksExtensionField {
     fn get_random_field_element_from_rng(rng: &mut impl rand::Rng) -> FieldElement<Self> {
-        // Goldilocks prime: p = 2^64 - 2^32 + 1 = 0xFFFFFFFF00000001
-        const MODULUS: u64 = 0xFFFFFFFF00000001;
-
         let mut sample = [0u8; 8];
         let mut coeffs = [FpE::zero(), FpE::zero(), FpE::zero()];
 
@@ -406,7 +420,7 @@ impl HasDefaultTranscript for Degree3GoldilocksExtensionField {
             loop {
                 rng.fill(&mut sample);
                 let int_sample = u64::from_be_bytes(sample);
-                if int_sample < MODULUS {
+                if int_sample < GOLDILOCKS_PRIME {
                     *coeff = FpE::from(int_sample);
                     break;
                 }
@@ -414,5 +428,86 @@ impl HasDefaultTranscript for Degree3GoldilocksExtensionField {
         }
 
         FieldElement::<Self>::new(coeffs)
+    }
+}
+
+// =====================================================
+// HELPER FUNCTIONS
+// =====================================================
+
+/// Multiply a field element by 7 (the quadratic non-residue).
+/// Uses 7 = 1 + 2 + 4 for efficiency (2 doubles + 2 adds, saves one double vs 8-1).
+#[inline(always)]
+fn mul_by_7(a: &FpE) -> FpE {
+    // 7 * a = a + 2a + 4a
+    let a2 = a.double();
+    let a4 = a2.double();
+    *a + a2 + a4
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fp2_add() {
+        let a = Fp2E::new([FpE::from(3u64), FpE::from(4u64)]);
+        let b = Fp2E::new([FpE::from(1u64), FpE::from(2u64)]);
+        let c = &a + &b;
+        assert_eq!(c.value()[0], FpE::from(4u64));
+        assert_eq!(c.value()[1], FpE::from(6u64));
+    }
+
+    #[test]
+    fn test_fp2_mul() {
+        let a = Fp2E::new([FpE::from(3u64), FpE::from(4u64)]);
+        let b = Fp2E::new([FpE::from(1u64), FpE::from(2u64)]);
+        // (3 + 4w)(1 + 2w) = 3 + 6w + 4w + 8w^2 = 3 + 10w + 8*7 = 59 + 10w
+        let c = &a * &b;
+        assert_eq!(c.value()[0], FpE::from(59u64));
+        assert_eq!(c.value()[1], FpE::from(10u64));
+    }
+
+    #[test]
+    fn test_fp2_inv() {
+        let a = Fp2E::new([FpE::from(3u64), FpE::from(4u64)]);
+        let a_inv = a.inv().unwrap();
+        let product = &a * &a_inv;
+        assert_eq!(product, Fp2E::one());
+    }
+
+    #[test]
+    fn test_fp3_add() {
+        let a = Fp3E::new([FpE::from(1u64), FpE::from(2u64), FpE::from(3u64)]);
+        let b = Fp3E::new([FpE::from(4u64), FpE::from(5u64), FpE::from(6u64)]);
+        let c = &a + &b;
+        assert_eq!(c.value()[0], FpE::from(5u64));
+        assert_eq!(c.value()[1], FpE::from(7u64));
+        assert_eq!(c.value()[2], FpE::from(9u64));
+    }
+
+    #[test]
+    fn test_fp3_mul() {
+        let a = Fp3E::new([FpE::from(1u64), FpE::from(2u64), FpE::from(3u64)]);
+        let b = Fp3E::new([FpE::from(4u64), FpE::from(5u64), FpE::from(6u64)]);
+        let c = &a * &b;
+        // Verify by computing inverse
+        let c_div_a = &c * &a.inv().unwrap();
+        assert_eq!(c_div_a, b);
+    }
+
+    #[test]
+    fn test_fp3_inv() {
+        let a = Fp3E::new([FpE::from(1u64), FpE::from(2u64), FpE::from(3u64)]);
+        let a_inv = a.inv().unwrap();
+        let product = &a * &a_inv;
+        assert_eq!(product, Fp3E::one());
+    }
+
+    #[test]
+    fn test_mul_by_7() {
+        let a = FpE::from(5u64);
+        let result = mul_by_7(&a);
+        assert_eq!(result, FpE::from(35u64));
     }
 }

@@ -1,9 +1,7 @@
 //! Tests for the BITWISE precomputed table.
 
-use crate::tables64::bitwise::{
-    NUM_ROWS, bus_interactions, cols, generate_bitwise_trace, row_index,
-};
-use crate::tables64::types::FE;
+use crate::tables::bitwise::{NUM_ROWS, bus_interactions, cols, generate_bitwise_trace, row_index};
+use crate::tables::types::FE;
 
 #[test]
 fn test_row_index() {
