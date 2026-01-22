@@ -191,7 +191,6 @@ impl Instruction {
                 cond,
                 offset,
             } => {
-                let i = 0; // just for loc report
                 let (a, b) = (registers.read(src1)?, registers.read(src2)?);
                 let new_pc = if cond.apply(a, b) {
                     (pc as i64).wrapping_add(offset as i64) as u64
