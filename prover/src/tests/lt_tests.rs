@@ -1,7 +1,7 @@
 //! Tests for the LT (Less-Than) table.
 
-use crate::tables64::lt::{LtOperation, bus_interactions, cols, generate_lt_trace};
-use crate::tables64::types::FE;
+use crate::tables::lt::{LtOperation, bus_interactions, cols, generate_lt_trace};
+use crate::tables::types::FE;
 
 /// Signed comparison flag
 const SIGNED: bool = true;

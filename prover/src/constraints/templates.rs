@@ -18,7 +18,7 @@ use stark::{
     traits::TransitionEvaluationContext,
 };
 
-use crate::tables64::types::{GoldilocksExtension, GoldilocksField};
+use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
 // =========================================================================
 // Constants
