@@ -141,21 +141,14 @@ impl Memory {
             return Err(MemoryError::CommitSizeExceeded);
         }
         self.store_word(PUBLIC_OUTPUT_START_INDEX, length as u32)?;
-        for i in 0..length {
-            let byte = self.load_byte(address + i);
-            self.store_byte(PUBLIC_OUTPUT_START_INDEX + 4 + i, byte);
-        }
+        let inputs = self.load_bytes(address, length);
+        self.set_bytes_aligned(PUBLIC_OUTPUT_START_INDEX + 4, &inputs)?;
         Ok(())
     }
 
     pub fn read_return_value(&self) -> Result<Vec<u8>, MemoryError> {
         let size = self.load_word(PUBLIC_OUTPUT_START_INDEX)?;
-        let mut return_values = Vec::new();
-        for i in 0..size as u64 {
-            let word = self.load_byte(PUBLIC_OUTPUT_START_INDEX + 4 + i);
-            return_values.push(word);
-        }
-        Ok(return_values)
+        Ok(self.load_bytes(PUBLIC_OUTPUT_START_INDEX + 4, size as u64))
     }
 
     pub fn store_private_inputs(&mut self, inputs: Vec<u8>) -> Result<(), MemoryError> {
@@ -163,20 +156,44 @@ impl Memory {
             return Err(MemoryError::PrivateInputSizeExceeded);
         }
         self.store_word(PRIVATE_INPUT_START_INDEX, inputs.len() as u32)?;
-        for (i, byte) in inputs.iter().enumerate() {
-            self.store_byte(PRIVATE_INPUT_START_INDEX + 4 + i as u64, *byte);
-        }
+        self.set_bytes_aligned(PRIVATE_INPUT_START_INDEX + 4, &inputs)?;
         Ok(())
     }
 
     pub fn load_private_inputs(&self) -> Result<Vec<u8>, MemoryError> {
         let size = self.load_word(PRIVATE_INPUT_START_INDEX)?;
         let mut inputs = size.to_le_bytes().to_vec();
-        for i in 0..size as u64 {
-            let byte = self.load_byte(PRIVATE_INPUT_START_INDEX + 4 + i);
-            inputs.push(byte);
-        }
+        inputs.extend_from_slice(&self.load_bytes(PRIVATE_INPUT_START_INDEX + 4, size as u64));
         Ok(inputs)
+    }
+
+    pub fn load_bytes(&self, mut addr: u64, len: u64) -> Vec<u8> {
+        let mut result = Vec::with_capacity(len as usize);
+        let end = addr + len;
+        while addr < end {
+            let aligned = addr - (addr % 4);
+            let bytes = self.0.get(&aligned).cloned().unwrap_or_default();
+            let offset = (addr % 4) as usize;
+            let take = std::cmp::min(4 - offset, (end - addr) as usize);
+            result.extend_from_slice(&bytes[offset..offset + take]);
+            addr += take as u64;
+        }
+        result
+    }
+
+    /// Helper method to store a given input at an aligned address. It may also overwrite existing bytes with zero if inputs is not divisible by 4
+    /// Should only be used to write to public output and private input where these limitations are not a problem
+    fn set_bytes_aligned(&mut self, mut addr: u64, inputs: &[u8]) -> Result<(), MemoryError> {
+        if !addr.is_multiple_of(4) {
+            return Err(MemoryError::UnalignedAccess);
+        }
+        for chunk in inputs.chunks(4) {
+            let mut bytes = [0u8; 4];
+            bytes[..chunk.len()].copy_from_slice(chunk);
+            self.0.insert(addr, bytes);
+            addr += 4;
+        }
+        Ok(())
     }
 }
 
