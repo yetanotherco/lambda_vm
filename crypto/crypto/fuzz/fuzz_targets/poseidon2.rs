@@ -46,7 +46,11 @@ fuzz_target!(|fuzz_data: FuzzInput| {
         // In debug, hash_vec panics (assertion). In release, it returns 0.
         // We verify hash_many allows empty (padding logic) and returns non-zero.
         let many_hash = Poseidon2::hash_many(&elements);
-        assert_ne!(many_hash, Fp::zero(), "hash_many([]) should be non-zero due to padding");
+        assert_ne!(
+            many_hash,
+            Fp::zero(),
+            "hash_many([]) should be non-zero due to padding"
+        );
     }
 
     // 2. Domain separation: hash(a,b) != hash_many([a,b])
@@ -95,7 +99,11 @@ fuzz_target!(|fuzz_data: FuzzInput| {
     );
 
     // 8. Non-zero outputs
-    assert_ne!(Poseidon2::hash(&a, &b), Fp::zero(), "Hash should not be zero");
+    assert_ne!(
+        Poseidon2::hash(&a, &b),
+        Fp::zero(),
+        "Hash should not be zero"
+    );
     assert_ne!(
         Poseidon2::hash_single(&a),
         Fp::zero(),
