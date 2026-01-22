@@ -21,8 +21,8 @@ use stark::trace::TraceTable;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
-use crate::tables64::lt::{LtOperation, cols, generate_lt_trace};
-use crate::tables64::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use crate::tables::lt::{LtOperation, cols, generate_lt_trace};
+use crate::tables::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 
 type F = GoldilocksField;
 type E = GoldilocksExtension;

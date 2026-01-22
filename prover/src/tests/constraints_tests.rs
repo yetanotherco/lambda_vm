@@ -1,9 +1,9 @@
 //! Tests for the 64-bit VM constraint templates.
 
-use crate::constraints64::templates::{
+use crate::constraints::templates::{
     AddConstraint, AddLinearTerm, AddOperand, IsBitConstraint, SHIFT_32, new_is_bit_constraints,
 };
-use crate::tables64::types::FE;
+use crate::tables::types::FE;
 use stark::constraints::transition::TransitionConstraint;
 
 // =========================================================================
@@ -544,13 +544,13 @@ fn test_dword_bl_repack_formula() {
 // CPU Constraints tests
 // =========================================================================
 
-use crate::constraints64::cpu::{
+use crate::constraints::cpu::{
     Arg1LowerConstraint, Arg1UpperConstraint, BIT_FLAG_COLUMNS, BranchCondConstraint,
     EbreakConstraint, NUM_CPU_CONSTRAINTS, NextPcAddConstraint, SignBitZeroConstraint,
     create_add_constraints, create_all_cpu_constraints, create_is_bit_constraints,
     create_slt_res_zero_constraints,
 };
-use crate::tables64::cpu::cols as cpu_cols;
+use crate::tables::cpu::cols as cpu_cols;
 
 #[test]
 fn test_cpu_bit_flag_columns_count() {

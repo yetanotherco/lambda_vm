@@ -284,3 +284,9 @@ fn test_ethrex() {
         inputs,
     );
 }
+
+#[ignore = "Ignored until the vm is fast enough to run this test"]
+#[test]
+fn test_ckzg() {
+    run_program_and_check_public_output("./program_artifacts/rust/ckzg.elf", vec![1, 1], vec![]);
+}

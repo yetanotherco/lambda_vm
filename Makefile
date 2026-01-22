@@ -47,8 +47,14 @@ BENCH_ARTIFACTS := $(addprefix $(BENCH_ARTIFACTS_DIR)/, $(addsuffix .elf, $(BENC
 ETHREX_FILE := executor/tests/ethrex_hoodi.bin
 ETHREX_URL := https://lambda.alignedlayer.com/ethrex_hoodi.bin
 
+SYSROOT_DIR := /opt/lambda-vm-sysroot
+SYSROOT_TARBALL := /tmp/lambda-vm-sysroot-rv64im.tar.gz
+SYSROOT_URL := https://lambda.alignedlayer.com/lambda-vm-sysroot-rv64im.tar.gz
+
 # Custom RV64IM target spec location
 RV64_TARGET_SPEC=$(CURDIR)/executor/programs/riscv64im-lambda-vm-elf.json
+
+.PHONY: test prepare-test-data prepare-sysroot
 
 prepare-test-data:
 	@if [ ! -f "$(ETHREX_FILE)" ]; then \
@@ -58,9 +64,20 @@ prepare-test-data:
 		echo "ethrex_hoodi.bin already exists"; \
 	fi
 
+prepare-sysroot:
+	@if [ ! -d "$(SYSROOT_DIR)" ]; then \
+		echo "Downloading lambda-vm-sysroot-rv64im.tar.gz..."; \
+		curl -L "$(SYSROOT_URL)" -o "$(SYSROOT_TARBALL)"; \
+		echo "Extracting sysroot to $(SYSROOT_DIR)..."; \
+		sudo mkdir -p /opt && sudo tar -xzf "$(SYSROOT_TARBALL)" -C /opt; \
+		rm "$(SYSROOT_TARBALL)"; \
+	else \
+		echo "Sysroot already exists at $(SYSROOT_DIR)"; \
+	fi
+
 compile-programs-asm: $(ARTIFACTS_ASM)
 
-compile-programs-rust: $(RUST_ARTIFACTS)
+compile-programs-rust: prepare-sysroot $(RUST_ARTIFACTS)
 
 compile-bench: $(BENCH_ARTIFACTS)
 
@@ -89,7 +106,7 @@ $(BENCH_ARTIFACTS_DIR)/%.elf: $(BENCH_PROGRAMS_DIR)/%/Cargo.toml
 		CARGO_TARGET_DIR=$(abspath $(SHARED_TARGET_DIR)) \
 		rustup run nightly cargo build --release \
 			--target $(RV64_TARGET_SPEC) \
-			-Z build-std=core,compiler_builtins \
+			-Z build-std=core,alloc,std,compiler_builtins,panic_abort \
 			-Z build-std-features=compiler-builtins-mem
 	cp $(SHARED_TARGET_DIR)/riscv64im-lambda-vm-elf/release/$* $@
 

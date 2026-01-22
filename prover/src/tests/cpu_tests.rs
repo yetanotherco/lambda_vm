@@ -5,10 +5,10 @@
 //! - Trace generation tests
 //! - Integration tests for CpuOperation::from_log (ELF execution)
 
-use crate::tables64::cpu::{
+use crate::tables::cpu::{
     CpuOperation, bus_interactions, cols, generate_cpu_trace, generate_cpu_trace_from_logs,
 };
-use crate::tables64::types::FE;
+use crate::tables::types::FE;
 
 use executor::{
     elf::Elf,
@@ -388,7 +388,7 @@ fn test_trace_from_logs_subw() {
     assert_eq!(logs.len(), 4, "subw.elf should have 4 steps");
 
     let trace =
-        generate_cpu_trace_from_logs(&logs, &instructions).expect("Failed to generate CPU trace");
+        generate_cpu_trace_from_logs(&logs, &instructions);
 
     assert_eq!(trace.main_table.height, 4);
 
@@ -417,7 +417,7 @@ fn test_cpu_operation_from_log_arith() {
         dst_val: 300,
     };
 
-    let op = CpuOperation::from_log(&log, instruction, 0);
+    let op = CpuOperation::from_log(&log, 0, instruction);
 
     assert_eq!(op.pc, 0x1000);
     assert_eq!(op.next_pc, 0x1004);
@@ -451,7 +451,7 @@ fn test_cpu_operation_from_log_branch() {
         dst_val: 0,
     };
 
-    let op = CpuOperation::from_log(&log, instruction, 4);
+    let op = CpuOperation::from_log(&log, 4, instruction);
 
     assert_eq!(op.timestamp, 4);
     assert_eq!(op.pc, 0x2000);
@@ -483,7 +483,7 @@ fn test_cpu_operation_from_log_word_instr() {
         dst_val: 0xFFFF_FFFF_8000_0001, // Result sign-extended
     };
 
-    let op = CpuOperation::from_log(&log, instruction, 8);
+    let op = CpuOperation::from_log(&log, 8, instruction);
 
     assert!(op.word_instr);
     assert!(op.op_add);
