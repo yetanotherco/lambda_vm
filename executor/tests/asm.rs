@@ -11,11 +11,13 @@ fn run_program_and_check_output(elf_path: &str, expected_output: i64) {
     program.image.iter().for_each(|(addr, word)| {
         println!("0x{:016x}: 0x{:08x}", addr, word);
     });
-    let executor = Executor::new(program.image, program.entry_point, vec![])
+    let mut executor = Executor::new(program.image, program.entry_point, vec![])
         .expect("Failed to create executor");
-    let result = executor.run().expect("Failed to run program");
 
-    assert!(result.return_values.register_values.0 == expected_output);
+    while let Some(_logs) = executor.resume().expect("Failed to execute") {}
+
+    let result = executor.finish().expect("Failed to get return values");
+    assert!(result.register_values.0 == expected_output);
 }
 
 #[test]

@@ -1,6 +1,6 @@
 use executor::{
     elf::Elf,
-    vm::execution::{ExecutionResult, Executor},
+    vm::execution::{Executor, ReturnValues},
 };
 
 // NOTE: These tests require 64-bit RISC-V ELF files (RV64IM).
@@ -8,7 +8,7 @@ use executor::{
 fn run_program_without_expect(
     elf_path: &str,
     private_inputs: Vec<u8>,
-) -> Result<ExecutionResult, executor::vm::execution::ExecutorError> {
+) -> Result<ReturnValues, executor::vm::execution::ExecutorError> {
     println!("Testing {}", elf_path);
     let elf_data = std::fs::read(elf_path).unwrap();
     let program = Elf::load(&elf_data).unwrap();
@@ -17,7 +17,9 @@ fn run_program_without_expect(
         println!("0x{:016x}: 0x{:08x}", addr, word);
     });
 
-    Executor::new(program.image, program.entry_point, private_inputs)?.run()
+    let mut executor = Executor::new(program.image, program.entry_point, private_inputs)?;
+    while let Some(_logs) = executor.resume()? {}
+    executor.finish()
 }
 
 fn run_program_and_check_public_output(
@@ -28,14 +30,14 @@ fn run_program_and_check_public_output(
     let result =
         run_program_without_expect(elf_path, private_inputs).expect("Failed to run program");
 
-    assert_eq!(result.return_values.memory_values, expected_output);
+    assert_eq!(result.memory_values, expected_output);
 }
 
 fn run_program_and_check_output(elf_path: &str, expected_output: i64, private_inputs: Vec<u8>) {
     let result =
         run_program_without_expect(elf_path, private_inputs).expect("Failed to run program");
 
-    assert!(result.return_values.register_values.0 == expected_output);
+    assert!(result.register_values.0 == expected_output);
 }
 
 #[test]

@@ -83,6 +83,26 @@ impl Executor {
         }
     }
 
+    fn get_return_values(&self) -> Result<ReturnValues, ExecutorError> {
+        println!("Final Register Values:\n {}", &self.registers);
+        let memory_return_value = self.memory.read_return_value()?;
+        let registers_return_values = self.registers.read_return_values();
+        println!("Registers Return Values: {registers_return_values:?}");
+
+        Ok(ReturnValues {
+            memory_values: memory_return_value,
+            register_values: (
+                registers_return_values.0 as i64,
+                registers_return_values.1 as i64,
+            ),
+        })
+    }
+
+    /// Get return values after execution is complete (call after resume() returns None)
+    pub fn finish(self) -> Result<ReturnValues, ExecutorError> {
+        self.get_return_values()
+    }
+
     /// Run to completion and return all logs (consumes executor)
     pub fn run(mut self) -> Result<ExecutionResult, ExecutorError> {
         let mut logs = Vec::with_capacity(CHUNK_SIZE);
@@ -91,19 +111,8 @@ impl Executor {
             logs.extend_from_slice(chunk);
         }
 
-        println!("Final Register Values:\n {}", &self.registers);
-        let memory_return_value = self.memory.read_return_value()?;
-        let registers_return_values = self.registers.read_return_values();
-        println!("Registers Return Values: {registers_return_values:?}");
-
         Ok(ExecutionResult {
-            return_values: ReturnValues {
-                memory_values: memory_return_value,
-                register_values: (
-                    registers_return_values.0 as i64,
-                    registers_return_values.1 as i64,
-                ),
-            },
+            return_values: self.get_return_values()?,
             logs,
             instructions: self.instructions,
         })
