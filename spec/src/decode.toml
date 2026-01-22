@@ -12,37 +12,37 @@ type = "BaseField"
 desc = """Ordered concatenation of several small variables.
 The `decode (uncompressed)` section explains the purpose of each variable.\\
 A list of each variable and the bit(-range) in which it is located:\\
-[0:7] `rs1`, \\
-[8:15] `rs2`, \\
-[16:23] `rd`, \\
-[24] `write_register`, \\
-[25] `memory_2bytes`, \\
-[26] `memory_4bytes`, \\
-[27] `memory_8bytes`, \\
-[28] `c_type`, \\
-[29] `signed`, \\
-[30] `mp_selector`, \\
-[31] `muldiv_selector`, \\
-[32] `word_instr`, \\
-[33] `ADD`, \\
-[34] `SUB`, \\
-[35] `SLT`, \\
-[36] `AND`, \\
-[37] `OR`, \\
-[38] `XOR`, \\
-[39] `SHIFT`, \\
-[40] `JALR`, \\
-[41] `BEQ`, \\
-[42] `BLT`, \\
-[43] `LOAD`, \\
-[44] `STORE`, \\
-[45] `MUL`, \\
-[46] `DIVREM`, \\
-[47] `ECALL`, \\
-[48] `EBREAK`; \\
+[0] `write_register`, \\
+[1] `memory_2bytes`, \\
+[2] `memory_4bytes`, \\
+[3] `memory_8bytes`, \\
+[4] `c_type`, \\
+[5] `signed`, \\
+[6] `mp_selector`, \\
+[7] `muldiv_selector`, \\
+[8] `word_instr`, \\
+[9] `ADD`, \\
+[10] `SUB`, \\
+[11] `SLT`, \\
+[12] `AND`, \\
+[13] `OR`, \\
+[14] `XOR`, \\
+[15] `SHIFT`, \\
+[16] `JALR`, \\
+[17] `BEQ`, \\
+[18] `BLT`, \\
+[19] `LOAD`, \\
+[20] `STORE`, \\
+[21] `MUL`, \\
+[22] `DIVREM`, \\
+[23] `ECALL`, \\
+[24] `EBREAK`; \\
+[25:33] `rs1`, \\
+[33:41] `rs2`, \\
+[41:49] `rd`, \\
 the remaining bits are set to zero.
 """
-pad = ["^", 2, 48]
+pad = ["^", 2, 24]
 
 [[variables.output]]
 name = "imm"
