@@ -100,4 +100,4 @@ jobs:
       - name: Run comprehensive prover tests (merge queue only)
         if: github.event_name == 'merge_group'
         run: |
-          cargo test -p prover test_prove_elfs_all_instructions_64_full -- --ignored
+          cargo test -p prover --release test_prove_elfs_all_instructions_64_full -- --ignored
