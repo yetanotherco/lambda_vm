@@ -34,7 +34,7 @@ jobs:
         if: steps.find-previous-run.outputs.run_id != ''
         uses: actions/download-artifact@v4
         with:
-          name: loc-report
+          name: ${{ github.event_name == 'workflow_dispatch' && 'loc-report-test' || 'loc-report' }}
           path: tooling/loc
           github-token: ${{ github.token }}
           run-id: ${{ steps.find-previous-run.outputs.run_id }}
@@ -52,7 +52,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: loc-report
+          name: ${{ github.event_name == 'workflow_dispatch' && 'loc-report-test' || 'loc-report' }}
           path: tooling/loc/loc_report.json
           retention-days: 7
 
