@@ -646,7 +646,7 @@ multiplicity = "read_register1"
 
 [[constraints.mem]]
 kind = "arith"
-constraint = "`!read_register1` => `rv1[i]` = 0"
+constraint = "$#`!read_register1` => #`rv1[i]` = 0$"
 poly = ["*", ["not", "read_register1"], ["idx", "rv1", "i"]]
 iter = ["i", 0, 2]
 
@@ -660,7 +660,7 @@ multiplicity = "read_register2"
 
 [[constraints.mem]]
 kind = "arith"
-constraint = "`!read_register2` => `rv2[i]` = 0"
+constraint = "$#`!read_register2` => #`rv2[i]` = 0$"
 poly = ["*", ["not", "read_register2"], ["idx", "rv2", "i"]]
 iter = ["i", 0, 2]
 
