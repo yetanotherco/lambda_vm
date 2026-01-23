@@ -171,7 +171,14 @@ fn demangle(name: &str) -> String {
     }
 
     // Handle simple length-prefixed names like _9quicksort15quicksort_range
-    if name.starts_with('_') && name.len() > 1 && name.chars().nth(1).map(|c| c.is_ascii_digit()).unwrap_or(false) {
+    if name.starts_with('_')
+        && name.len() > 1
+        && name
+            .chars()
+            .nth(1)
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false)
+    {
         if let Some(demangled) = try_demangle_length_prefixed(&name[1..]) {
             return demangled;
         }
@@ -257,7 +264,11 @@ fn clean_length_prefixed(part: &str) -> String {
     let s = part.strip_prefix('_').unwrap_or(part);
 
     // Check if it starts with a digit (length-prefixed)
-    if s.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+    if s.chars()
+        .next()
+        .map(|c| c.is_ascii_digit())
+        .unwrap_or(false)
+    {
         if let Some(parsed) = try_demangle_length_prefixed(s) {
             return parsed;
         }
@@ -283,7 +294,11 @@ fn try_strip_hash_prefix(s: &str) -> Option<String> {
         // Prefix should be short (1-6 chars) and alphanumeric (likely a hash)
         if prefix.len() <= 6
             && prefix.chars().all(|c| c.is_alphanumeric())
-            && rest.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+            && rest
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_digit())
+                .unwrap_or(false)
         {
             // Try to parse the rest as length-prefixed
             if let Some(parsed) = try_demangle_length_prefixed(rest) {
@@ -358,8 +373,15 @@ fn should_filter_part(part: &str) -> bool {
         if let Some(pos) = part.find('_') {
             let after = &part[pos + 1..];
             // If it's hash_lengthpartial (digits followed by short text), filter it
-            if after.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
-                let digit_end = after.find(|c: char| !c.is_ascii_digit()).unwrap_or(after.len());
+            if after
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_digit())
+                .unwrap_or(false)
+            {
+                let digit_end = after
+                    .find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(after.len());
                 if let Ok(expected_len) = after[..digit_end].parse::<usize>() {
                     let actual_len = after.len() - digit_end;
                     // If actual length doesn't match expected, it's a partial/broken name
@@ -375,7 +397,11 @@ fn should_filter_part(part: &str) -> bool {
     if part.len() <= 10 && part.chars().all(|c| c.is_alphanumeric()) {
         let has_upper = part.chars().any(|c| c.is_uppercase());
         let has_digit = part.chars().any(|c| c.is_ascii_digit());
-        let starts_upper = part.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
+        let starts_upper = part
+            .chars()
+            .next()
+            .map(|c| c.is_uppercase())
+            .unwrap_or(false);
 
         if (has_upper && has_digit) || (starts_upper && has_digit) {
             return true;
@@ -436,7 +462,11 @@ fn try_demangle_v0(name: &str) -> Option<String> {
                         let ident = String::from_utf8_lossy(&bytes[i..i + len]).to_string();
                         // Accept if it starts with a letter (valid identifier)
                         if !ident.is_empty()
-                            && ident.chars().next().map(|c| c.is_alphabetic()).unwrap_or(false)
+                            && ident
+                                .chars()
+                                .next()
+                                .map(|c| c.is_alphabetic())
+                                .unwrap_or(false)
                         {
                             result.push(ident);
                             i += len;
