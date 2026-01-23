@@ -8,6 +8,3 @@ executor/program_artifacts/
 
 # Shared cargo target directory for ELF builds
 executor/shared_target/
-
-# Benchmark comparison temp directory
-scripts/.bench_tmp/
