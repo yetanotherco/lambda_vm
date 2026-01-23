@@ -146,7 +146,7 @@ To indicate an instruction is provided in compressed form, the `c_type` flag is 
   ([`SH       rs1, rs2, imm`], [`STORE`], [], [], [`mem_2B`], []),
   ([`SB       rs1, rs2, imm`], [`STORE`], [], [], [], []),
   // ECALL/EBREAK
-  ([`ECALL`], [`ECALL`], [], [], [$#`rs1` := #`x17`$, $#`rs2` := #`x11`$, $#`rd` := #`x10`$], [#ref_note(<note-ecall>)]),
+  ([`ECALL`], [`ECALL`], [], [], [$#`rs1` := #`x17`$, $#`rs2` := #`x10`$, $#`rd` := #`x10`$], [#ref_note(<note-ecall>)]),
   ([`EBREAK`], [`EBREAK`], [], [], [], []),
   // FENCE
   ([`FENCE`], [`ADD`], [], [], [], [#ref_note(<note-fence>)]),
@@ -206,7 +206,7 @@ We note the following about the above decoding table:
       "On RISC-V a system call has its own instruction: `ECALL`. A system call can have up to 7 arguments and has 1 return value. The arguments are in registers A0-A6, in that order, and the return value is written into A0 before giving back control to the guest. A7 contains the system call number." #link("https://libriscv.no/docs/concepts/syscalls/#the-risc-v-system-call-abi")[[source]]
       As such,
       - syscall number in A7 (= register `x17`)
-      - first syscall argument in A1 (= register `x11`)
+      - first syscall argument in A0 (= register `x10`)
       - syscall output in A0 (= register `x10`)]
     )
   ),
