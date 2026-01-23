@@ -234,17 +234,17 @@ pub trait IsStarkProver<
         Some((tree, commitment))
     }
 
-    /// Compute the LDE commitment for a subset of columns from a trace.
+    /// Compute the LDE commitment for a subset of columns from a trace (for testing).
     ///
-    /// This is useful for testing preprocessed tables where you need to compute
-    /// the commitment that matches what the prover would generate internally.
+    /// This helper computes the same commitment the prover generates internally,
+    /// useful for setting up soundness test scenarios.
     ///
     /// The commitment is computed by:
     /// 1. Interpolating columns to polynomials
     /// 2. Evaluating on LDE domain (size = trace_size * blowup_factor)
     /// 3. Bit-reverse permuting
     /// 4. Building Merkle tree from rows
-    fn compute_precomputed_commitment(
+    fn compute_precomputed_commitment_for_testing(
         trace: &TraceTable<Field, FieldExtension>,
         air: &impl AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         num_precomputed_cols: usize,

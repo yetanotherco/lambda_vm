@@ -521,7 +521,7 @@ mod soundness_tests {
         let dummy_air = create_receiver_air(proof_options);
 
         // Use the prover's commitment computation (3 precomputed cols: X, Y, AND)
-        Prover::compute_precomputed_commitment(trace, &dummy_air, 3)
+        Prover::compute_precomputed_commitment_for_testing(trace, &dummy_air, 3)
             .expect("Failed to compute commitment")
     }
 
