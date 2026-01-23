@@ -8,6 +8,8 @@
 #   ./bench_compare.sh <branch>           # Compare main vs <branch>
 #   ./bench_compare.sh <branch1> <branch2> # Compare <branch1> vs <branch2>
 #
+# Requires: hyperfine, jq
+#
 
 set -euo pipefail
 
@@ -70,6 +72,7 @@ for branch in "$BASE_BRANCH" "$COMPARE_BRANCH"; do
     git -C "$ROOT_DIR" checkout "$branch"
     echo -e "${GREEN}Building CLI for $branch...${NC}"
     cargo build --release -p cli --manifest-path "$ROOT_DIR/Cargo.toml"
+    mkdir -p "$TMP_DIR"
     cp "$ROOT_DIR/target/release/cli" "$TMP_DIR/cli-$bin_name"
 done
 
@@ -86,7 +89,22 @@ for elf in "$BENCH_ARTIFACTS_DIR"/*.elf; do
     echo -e "${YELLOW}--- $name ---${NC}"
     hyperfine --warmup 5 --runs 10 \
         -n "$BASE_BRANCH" "$TMP_DIR/cli-base $elf" \
-        -n "$COMPARE_BRANCH" "$TMP_DIR/cli-compare $elf"
+        -n "$COMPARE_BRANCH" "$TMP_DIR/cli-compare $elf" \
+        --export-json "$TMP_DIR/$name.json"
+done
+
+# Summary
+echo -e "${GREEN}=== Summary ===${NC}"
+printf "%-20s %10s %10s %10s\n" "Benchmark" "$BASE_BRANCH" "$COMPARE_BRANCH" "Speedup"
+echo "-------------------------------------------------------"
+for json in "$TMP_DIR"/*.json; do
+    name=$(basename "$json" .json)
+    base=$(jq -r '.results[0].mean' "$json")
+    compare=$(jq -r '.results[1].mean' "$json")
+    speedup=$(echo "scale=2; $base / $compare" | bc)
+    base_ms=$(echo "scale=1; $base * 1000" | bc)
+    compare_ms=$(echo "scale=1; $compare * 1000" | bc)
+    printf "%-20s %8s ms %8s ms %9sx\n" "$name" "$base_ms" "$compare_ms" "$speedup"
 done
 
 echo -e "${GREEN}Done!${NC}"
