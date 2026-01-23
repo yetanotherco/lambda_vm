@@ -6,7 +6,7 @@ use clap::{Parser, ValueHint};
 use executor::{
     elf::{Elf, SymbolTable},
     flamegraph::FlamegraphGenerator,
-    vm::execution::run_program,
+    vm::execution::Executor,
 };
 
 #[derive(Parser, Debug)]
@@ -25,20 +25,37 @@ fn main() {
     let elf_data = std::fs::read(&args.filename).expect("Failed to read elf file");
     let program = Elf::load(&elf_data).expect("Failed to load elf program");
 
-    // Save entry_point before moving program.image into run_program
+    // Save entry_point before moving program.image into Executor
     let entry_point = program.entry_point;
 
-    let execution_result =
-        run_program(program.image, entry_point, vec![]).expect("Failed to run program");
+    let mut executor =
+        Executor::new(program.image, entry_point, vec![]).expect("Failed to create executor");
 
-    // Generate flamegraph if requested
-    if let Some(output_path) = args.flamegraph {
+    // Set up flamegraph generator if requested
+    let mut generator = args.flamegraph.as_ref().map(|_| {
         let symbols = SymbolTable::parse(&elf_data);
-        let mut generator = FlamegraphGenerator::new(symbols, entry_point);
-        generator
-            .process_logs(&execution_result.logs, &execution_result.instructions)
-            .expect("Failed to process logs for flamegraph");
+        FlamegraphGenerator::new(symbols, entry_point)
+    });
 
+    // Execute in chunks, processing logs only if generating flamegraph
+    loop {
+        let logs = executor.resume().expect("Failed to resume execution");
+        match logs {
+            Some(logs) => {
+                if let Some(ref mut fg) = generator {
+                    // Clone logs to release the borrow on executor
+                    let logs: Vec<_> = logs.to_vec();
+                    fg.process_logs(&logs, &executor.instructions)
+                        .expect("Failed to process logs for flamegraph");
+                }
+            }
+            None => break,
+        }
+    }
+    let _return_values = executor.finish().expect("Failed to finish execution");
+
+    // Write flamegraph output if requested
+    if let (Some(output_path), Some(generator)) = (args.flamegraph, generator) {
         let file = File::create(&output_path).expect("Failed to create flamegraph output file");
         let mut writer = BufWriter::new(file);
         generator
@@ -52,5 +69,5 @@ fn main() {
         );
     }
 
-    // TODO: Prove program execution using result.logs and result.instructions
+    // TODO: Prove program execution
 }
