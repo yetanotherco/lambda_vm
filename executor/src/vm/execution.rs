@@ -99,8 +99,8 @@ fn run_from_entrypoint(
 }
 
 pub struct InstructionSegment {
-    base_addr: u64,
-    instructions: Vec<Instruction>,
+    pub base_addr: u64,
+    pub instructions: Vec<Instruction>,
 }
 
 impl InstructionSegment {
@@ -110,7 +110,7 @@ impl InstructionSegment {
 }
 
 pub struct InstructionCache {
-    segments: Vec<InstructionSegment>,
+    pub segments: Vec<InstructionSegment>,
 }
 
 impl InstructionCache {
