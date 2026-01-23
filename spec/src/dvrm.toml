@@ -15,7 +15,7 @@ desc = "The denominator"
 [[variables.input]]
 name = "signed"
 type = "Bit"
-desc = "Whether to interpret the input as signed integers"
+desc = "Whether to interpret the input as signed (1) or unsigned (0) integers."
 
 
 # Output
@@ -48,14 +48,14 @@ type = "DWordHL"
 desc = "$#`n`-#`r`$."
 
 [[variables.auxiliary]]
-name = "n_sub_r_is_negative"
+name = "sign_n_sub_r"
 type = "Bit"
-desc = "Whether `n_sub_r` is negative"
+desc = "Sign of `n_sub_r`."
 
 [[variables.auxiliary]]
-name = "signed_q"
+name = "sign_q"
 type = "Bit"
-desc = "Whether to interpret `q` as a signed integer"
+desc = "Whether to interpret `q` as a signed (1) or unsigned (0) integer."
 
 [[variables.auxiliary]]
 name = "abs_r"
@@ -68,19 +68,24 @@ type = "DWordHL"
 desc = "Absolute value of `d`."
 
 [[variables.auxiliary]]
-name = "r_is_negative"
+name = "msb_r"
 type = "Bit"
-desc = "Whether `r` is negative."
+desc = "Most significant bit of `r`."
 
 [[variables.auxiliary]]
-name = "n_is_negative"
+name = "msb_n"
 type = "Bit"
-desc = "Whether `n` is negative."
+desc = "Most significant bit of `n`."
 
 [[variables.auxiliary]]
-name = "d_is_negative"
+name = "sign_r"
 type = "Bit"
-desc = "Whether `d` is negative."
+desc = "Sign of `r`."
+
+[[variables.auxiliary]]
+name = "sign_d"
+type = "Bit"
+desc = "Sign of `d`."
 
 # Virtual
 
@@ -90,8 +95,9 @@ type = ["Half", 8]
 desc = "sign-extended value of `n_sub_r`."
 def = {idx="i", polys = [
   {range=[0, 3], poly=["idx", "n_sub_r", "i"]},
-  {range=[4, 7], poly=["*", 0xFFFF, "n_sub_r_is_negative"]}
+  {range=[4, 7], poly=["*", 0xFFFF, "sign_n_sub_r"]}
 ]}
+ref = "dvrm:v:extended_n_sub_r"
 
 [[variables.virtual]]
 name = "μ_sum"
@@ -142,141 +148,16 @@ ref = "lt:a:range_r"
 # Constraints
 
 [[constraint_groups]]
-name = "defs"
+name = "sign_equality"
 
-[[constraints.defs]]
-kind = "template"
-tag = "IsZero"
-input = ["d"]
-output = "div_by_zero"
-ref = "dvrm:c:div_by_zero"
-cond = "μ_sum"
-
-# TODO: drop `signed` from here; it is implied by `n_is_negative`
-[[constraints.defs]]
-kind = "template"
-tag = "IsEqual"
-input = [["=", "signed", 1], ["=", ["idx", "n", "0:3"], "[0, 0, 0]"], ["=", ["-", ["idx", "n", 3], ["*", 128, "n_is_negative"]], 0], ["=", "n_is_negative", 1]]
-output = "overflow"
-cond = "μ_sum"
-ref = "dvrm:c:overflow"
-
-[[constraints.defs]]
-kind = "template"
-tag = "SUB"
-input = ["n", "r"]
-output = "n_sub_r"
-ref = "dvrm:c:n_sub_r"
-
-[[constraints.defs]]
-kind = "interaction"
-tag = "IS_HALF"
-input = [["idx", "n_sub_r", "i"]]
-range = ["i", 0, 3]
-ref = "dvrm:c:n_sub_r_range"
-
-[[constraints.defs]]
-kind = "template"
-tag = "SIGN"
-input = [["idx", "n_sub_r", 3], "signed"]
-output = "n_sub_r_is_negative"
-ref = "dvrm:c:n_sub_r_is_negative"
-
-[[constraints.defs]]
-kind = "template"
-tag = "SIGN"
-input = [["idx", "n", 3], "signed"]
-output = "n_is_negative"
-ref = "dvrm:c:n_is_negative"
-
-[[constraints.defs]]
-kind = "template"
-tag = "SIGN"
-input = [["idx", "d", 3], "signed"]
-output = "d_is_negative"
-ref = "dvrm:c:d_is_negative"
-
-[[constraints.defs]]
-kind = "template"
-tag = "SIGN"
-input = [["idx", "r", 3], "signed"]
-output = "r_is_negative"
-ref = "dvrm:c:r_is_negative"
-
-[[constraint_groups]]
-name = "equality"
-
-[[constraints.equality]]
+[[constraints.sign_equality]]
 kind = "arith"
-constraint = "$#`signed_q` = #`signed` dot (1- #`overflow` )$"
-poly = ["-", ["*", "signed", ["-", 1, "overflow"]], "signed_q"]
-ref = "dvrm:c:signed_q"
-
-[[constraints.equality]]
-kind = "interaction"
-tag = "MUL"
-input = ["d", "signed", "q", "signed_q", 0]
-output = ["idx", "extended_n_sub_r", "0:4"]
-multiplicity = "μ_sum"
-ref = "dvrm:c:mul_lower"
-
-[[constraints.equality]]
-kind = "interaction"
-tag = "MUL"
-input = ["d", "signed", "q", "signed_q", 1]
-output = ["idx", "extended_n_sub_r", "4:8"]
-multiplicity = "μ_sum"
-ref = "dvrm:c:mul_upper"
-
+constraint = "$#`r` eq.not 0 and #`signed` => #`r_msb` = #`n_msb`$"
+poly = ["*", ["sum", ["=", "i", 0], 3, ["idx", "r", "i"]], "signed", ["-", "r_msb", "n_msb"]]
+ref = "dvrm:c:sign_r_equals_sign_n"
 
 [[constraint_groups]]
 name = "abs_diff"
-
-[[constraints.abs_diff]]
-kind = "interaction"
-tag = "IS_HALF"
-input = [["idx", "abs_r", "i"]]
-range = ["i", 0, 3]
-multiplicity = "μ_sum"
-ref = "dvrm:c:abs_r_range_check"
-
-[[constraints.abs_diff]]
-kind = "template"
-tag = "SUB"
-input = [0, "r"]
-output = "abs_r"
-cond = "r_is_negative"
-ref = "dvrm:c:abs_r_if_negative"
-
-[[constraints.abs_diff]]
-kind = "arith"
-constraint = "$!#`r_is_negative` => #`abs_r[i]`=#`r[i]`$"
-range = ["i", 0, 3]
-poly = ["*", ["-", 1, "r_is_negative"], ["-", ["idx", "abs_r", "i"], ["idx", "r", "i"]]]
-ref = "dvrm:c:abs_r_if_nonnegative"
-
-[[constraints.abs_diff]]
-kind = "interaction"
-tag = "IS_HALF"
-input = [["idx", "abs_d", "i"]]
-range = ["i", 0, 3]
-multiplicity = "μ_sum"
-ref = "dvrm:c:abs_d_range_check"
-
-[[constraints.abs_diff]]
-kind = "template"
-tag = "SUB"
-input = [0, "d"]
-output = "abs_d"
-cond = "d_is_negative"
-ref = "dvrm:c:abs_d_if_negative"
-
-[[constraints.abs_diff]]
-kind = "arith"
-constraint = "$!#`d_is_negative` => #`abs_d[i]`=#`d[i]`$"
-range = ["i", 0, 3]
-poly = ["*", ["-", 1, "d_is_negative"], ["-", ["idx", "abs_d", "i"], ["idx", "d", "i"]]]
-ref = "dvrm:c:abs_d_if_nonnegative"
 
 # TODO: alternatively, we could set `1-div_by_zero` as the output, and use a different multiplicity.
 [[constraints.abs_diff]]
@@ -287,26 +168,51 @@ output = 1
 multiplicity = ["not", "div_by_zero"]
 ref ="dvrm:c:abs_r_lt_abs_d"
 
-
-[[constraint_groups]]
-name = "div_by_zero"
-
-
-[[constraints.div_by_zero]]
-kind = "arith"
+[[constraints.abs_diff]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "abs_r", "i"]]
 range = ["i", 0, 3]
-constraint = "$#`div_by_zero` => #`q[i]` = 65535$"
-poly = ["*", "div_by_zero", ["-", ["idx", "q", "i"], 65535]]
-ref = "dvrm:c:q_if_div_by_zero"
+multiplicity = "sign_r"
+ref = "dvrm:c:abs_r_range_check"
 
+[[constraints.abs_diff]]
+kind = "template"
+tag = "SUB"
+input = [0, "r"]
+output = "abs_r"
+cond = "sign_r"
+ref = "dvrm:c:abs_r_if_negative"
 
-[[constraints.div_by_zero]]
+[[constraints.abs_diff]]
 kind = "arith"
+constraint = "$not#`sign_r` => #`abs_r[i]`=#`r[i]`$"
 range = ["i", 0, 3]
-constraint = "$#`div_by_zero` => #`r[i]` = #`n[i]`$"
-poly = ["*", "div_by_zero", ["-", ["idx", "r", "i"], ["idx", "n", "i"]]]
-ref = "dvrm:c:r_if_div_by_zero"
+poly = ["*", ["-", 1, "sign_r"], ["-", ["idx", "abs_r", "i"], ["idx", "r", "i"]]]
+ref = "dvrm:c:abs_r_if_nonnegative"
 
+[[constraints.abs_diff]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "abs_d", "i"]]
+range = ["i", 0, 3]
+multiplicity = "sign_d"
+ref = "dvrm:c:abs_d_range_check"
+
+[[constraints.abs_diff]]
+kind = "template"
+tag = "SUB"
+input = [0, "d"]
+output = "abs_d"
+cond = "sign_d"
+ref = "dvrm:c:abs_d_if_negative"
+
+[[constraints.abs_diff]]
+kind = "arith"
+constraint = "$not#`sign_d` => #`abs_d[i]`=#`d[i]`$"
+range = ["i", 0, 3]
+poly = ["*", ["-", 1, "sign_d"], ["-", ["idx", "abs_d", "i"], ["idx", "d", "i"]]]
+ref = "dvrm:c:abs_d_if_nonnegative"
 
 [[constraint_groups]]
 name = "overflow"
@@ -320,10 +226,131 @@ ref = "dvrm:c:q_if_overflow"
 
 [[constraints.overflow]]
 kind = "arith"
+constraint = "$#`sign_q` = #`signed` dot (1- #`overflow` )$"
+poly = ["-", ["*", "signed", ["-", 1, "overflow"]], "sign_q"]
+ref = "dvrm:c:sign_q"
+
+[[constraints.overflow]]
+kind = "template"
+tag = "IsEqual"
+input = [["=", "signed", 1], ["=", ["idx", "n", "0:3"], "[0, 0, 0]"], ["=", ["-", ["idx", "n", 3], ["*", ["^", 2, 15], "msb_n"]], 0], ["=", "msb_n", 1], ["=", "d", "[65535, 65535, 65535, 65535]"]]
+output = "overflow"
+cond = "μ_sum"
+ref = "dvrm:c:overflow"
+
+[[constraint_groups]]
+name = "n_sub_r"
+
+[[constraints.n_sub_r]]
+kind = "arith"
+constraint = "$not#`signed` and not#`msb_n` => not#`msb_r`$"
+poly = ["*", ["not", "signed"], ["not", "msb_n"], "msb_r"]
+ref = "dvrm:c:unsigned_implies_msb_r_lt_msb_n"
+
+# TODO: we're going to have to do something interesting to prevent this from
+# interfering with padding.
+[[constraints.n_sub_r]]
+kind = "interaction"
+tag = "MSB16"
+input = [["idx", "n_sub_r", 3]]
+output = "sign_n_sub_r"
+multiplicity = ["-", ["+", 1, "msb_r"], "msb_n"]
+ref = "dvrm:c:sign_n_sub_r_eq_msb"
+
+[[constraints.n_sub_r]]
+kind = "arith"
+constraint = "$1 + #`msb_r` - #`msb_n` = 0 => #`sign_n_sub_r` = #`signed`$"
+poly = ["*", ["-", "msb_n", "msb_r"], ["-", "sign_n_sub_r", "signed"]]
+tag = "SIGN"
+input = [["idx", "n_sub_r", 3], "signed"]
+output = "sign_n_sub_r"
+ref = "dvrm:c:sign_n_sub_r_eq_signed"
+
+[[constraints.n_sub_r]]
+kind = "template"
+tag = "SUB"
+input = ["n", "r"]
+output = "n_sub_r"
+ref = "dvrm:c:n_sub_r"
+
+[[constraints.n_sub_r]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "n_sub_r", "i"]]
 range = ["i", 0, 3]
-constraint = "$#`overflow` => #`r[i]` = 0$"
-poly = ["*", "overflow", ["idx", "r", "i"]]
-ref = "dvrm:c:r_if_overflow"
+multiplicity = "μ_sum"
+ref = "dvrm:c:n_sub_r_range"
+
+[[constraint_groups]]
+name = "equality"
+
+[[constraints.equality]]
+kind = "interaction"
+tag = "MUL"
+input = ["d", "signed", "q", "sign_q", 0]
+output = ["idx", "extended_n_sub_r", "0:4"]
+multiplicity = "μ_sum"
+ref = "dvrm:c:mul_lower"
+
+[[constraints.equality]]
+kind = "interaction"
+tag = "MUL"
+input = ["d", "signed", "q", "sign_q", 1]
+output = ["idx", "extended_n_sub_r", "4:8"]
+multiplicity = "μ_sum"
+ref = "dvrm:c:mul_upper"
+
+
+[[constraint_groups]]
+name = "defs"
+
+[[constraints.defs]]
+kind = "interaction"
+tag = "MSB16"
+input = [["idx", "n", 3]]
+output = "msb_n"
+multiplicity = "μ_sum"
+ref = "dvrm:c:msb_n"
+
+[[constraints.defs]]
+kind = "interaction"
+tag = "MSB16"
+input = [["idx", "r", 3]]
+output = "msb_r"
+multiplicity = "μ_sum"
+ref = "dvrm:c:msb_r"
+
+[[constraints.defs]]
+kind = "template"
+tag = "SIGN"
+input = [["idx", "r", 3], "signed"]
+output = "sign_r"
+ref = "dvrm:c:sign_r"
+
+[[constraints.defs]]
+kind = "template"
+tag = "SIGN"
+input = [["idx", "d", 3], "signed"]
+output = "sign_d"
+ref = "dvrm:c:sign_d"
+
+[[constraint_groups]]
+name = "div_by_zero"
+
+[[constraints.div_by_zero]]
+kind = "arith"
+range = ["i", 0, 3]
+constraint = "$#`div_by_zero` => #`q[i]` = 65535$"
+poly = ["*", "div_by_zero", ["-", ["idx", "q", "i"], 65535]]
+ref = "dvrm:c:q_if_div_by_zero"
+
+[[constraints.div_by_zero]]
+kind = "template"
+tag = "IsZero"
+input = ["d"]
+output = "div_by_zero"
+ref = "dvrm:c:div_by_zero"
+cond = "μ_sum"
 
 [[constraint_groups]]
 name = "output"
