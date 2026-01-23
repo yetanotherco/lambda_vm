@@ -53,6 +53,7 @@
 //! - ECALL: for system calls
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use crate::ProverError;
 use executor::vm::{
     instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth},
     logs::Log,
@@ -963,22 +964,20 @@ pub fn generate_cpu_trace(
 /// This is a convenience function that converts logs to CpuOperations
 /// and then generates the trace.
 ///
+/// Returns an error if an instruction is not found for a PC.
 /// Panics if logs.len() is not a power of 2 >= 4.
 pub fn generate_cpu_trace_from_logs(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,
-) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let operations: Vec<CpuOperation> = logs
-        .iter()
-        .enumerate()
-        .map(|(i, log)| {
-            let instruction = *instructions
-                .get(&log.current_pc)
-                .expect("instruction not found for PC");
-            CpuOperation::from_log(log, (i as u64) * 4, instruction)
-        })
-        .collect();
-    generate_cpu_trace(&operations)
+) -> Result<TraceTable<GoldilocksField, GoldilocksExtension>, ProverError> {
+    let mut operations = Vec::with_capacity(logs.len());
+    for (i, log) in logs.iter().enumerate() {
+        let instruction = *instructions
+            .get(&log.current_pc)
+            .ok_or(ProverError::MissingInstruction(log.current_pc))?;
+        operations.push(CpuOperation::from_log(log, (i as u64) * 4, instruction));
+    }
+    Ok(generate_cpu_trace(&operations))
 }
 
 /// Collects all Bitwise lookups from a list of CPU operations.
@@ -999,18 +998,15 @@ pub fn collect_bitwise_lookups(
 pub fn collect_bitwise_lookups_from_logs(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,
-) -> Vec<(super::bitwise::BitwiseLookup, u8, u8, u8)> {
-    let operations: Vec<CpuOperation> = logs
-        .iter()
-        .enumerate()
-        .map(|(i, log)| {
-            let instruction = *instructions
-                .get(&log.current_pc)
-                .expect("instruction not found for PC");
-            CpuOperation::from_log(log, (i as u64) * 4, instruction)
-        })
-        .collect();
-    collect_bitwise_lookups(&operations)
+) -> Result<Vec<(super::bitwise::BitwiseLookup, u8, u8, u8)>, ProverError> {
+    let mut operations = Vec::with_capacity(logs.len());
+    for (i, log) in logs.iter().enumerate() {
+        let instruction = *instructions
+            .get(&log.current_pc)
+            .ok_or(ProverError::MissingInstruction(log.current_pc))?;
+        operations.push(CpuOperation::from_log(log, (i as u64) * 4, instruction));
+    }
+    Ok(collect_bitwise_lookups(&operations))
 }
 
 // =========================================================================

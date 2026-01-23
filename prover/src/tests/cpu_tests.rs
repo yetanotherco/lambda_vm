@@ -350,7 +350,7 @@ fn test_trace_from_logs_subw() {
     let (logs, instructions) = run_asm_elf("subw");
     assert_eq!(logs.len(), 4, "subw.elf should have 4 steps");
 
-    let traces = Traces::from_logs(&logs, instructions);
+    let traces = Traces::from_logs(&logs, instructions).unwrap();
 
     assert_eq!(traces.cpu.main_table.height, 4);
 

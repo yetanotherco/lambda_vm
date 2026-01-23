@@ -8,11 +8,10 @@
 //! ```ignore
 //! use prover::tables::trace_builder::Traces;
 //!
-//! let traces = Traces::from_logs(&logs);
+//! let traces = Traces::from_logs(&logs)?;
 //! // Use traces.cpu, traces.bitwise, traces.lt
 //! ```
 
-use executor::vm::instruction;
 use executor::vm::instruction::decoding::Instruction;
 use executor::vm::logs::Log;
 use executor::vm::memory::U64HashMap;
@@ -22,6 +21,7 @@ use super::bitwise;
 use super::cpu::{self, CpuOperation};
 use super::lt::{self, LtOperation};
 use super::types::{GoldilocksExtension, GoldilocksField};
+use crate::ProverError;
 
 /// All generated trace tables.
 pub struct Traces {
@@ -37,7 +37,10 @@ pub struct Traces {
 
 impl Traces {
     /// Generates all traces from execution logs in a single pass.
-    pub fn from_logs(logs: &[Log], instructions: U64HashMap<Instruction>) -> Self {
+    pub fn from_logs(
+        logs: &[Log],
+        instructions: U64HashMap<Instruction>,
+    ) -> Result<Self, ProverError> {
         // Pre-allocate collectors
         let mut cpu_ops = Vec::with_capacity(logs.len());
         let mut bitwise_lookups = Vec::with_capacity(logs.len() * 4);
@@ -48,7 +51,8 @@ impl Traces {
             let timestamp = (i as u64) * 4;
             let instruction = instructions
                 .get(&log.current_pc)
-                .cloned().expect("");
+                .copied()
+                .ok_or(ProverError::MissingInstruction(log.current_pc))?;
             let op = CpuOperation::from_log(log, timestamp, instruction);
 
             // Collect bitwise lookups from this operation
@@ -74,6 +78,6 @@ impl Traces {
         // Generate LT trace (handles deduplication and padding internally)
         let lt = lt::generate_lt_trace(&lt_ops);
 
-        Traces { cpu, bitwise, lt }
+        Ok(Traces { cpu, bitwise, lt })
     }
 }
