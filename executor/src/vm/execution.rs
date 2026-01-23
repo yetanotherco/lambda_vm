@@ -22,9 +22,9 @@ pub struct ReturnValues {
 pub struct ExecutionResult {
     pub return_values: ReturnValues,
     pub logs: Vec<Log>,
-    /// Predecoded instructions map (pc -> instruction)
-    /// Use this to look up instructions by their PC from the logs
-    pub instructions: U64HashMap<Instruction>,
+    /// Predecoded instruction cache
+    /// Use the `get` method to fetch instructions by their PC from the logs
+    pub instructions: InstructionCache,
 }
 
 pub fn run_program(
@@ -42,11 +42,10 @@ pub fn run_program(
         &instruction_cache,
         instruction_cache.instruction_count(),
     )?;
-    let instructions = instruction_cache.into_instruction_map();
     Ok(ExecutionResult {
         return_values,
         logs,
-        instructions,
+        instructions: instruction_cache,
     })
 }
 

@@ -8,10 +8,12 @@
 use crate::tables::cpu::{CpuOperation, bus_interactions, cols, generate_cpu_trace};
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::FE;
-
 use executor::{
     elf::Elf,
-    vm::{execution::run_program, instruction::decoding::Instruction, memory::U64HashMap},
+    vm::{
+        execution::{InstructionCache, run_program},
+        instruction::decoding::Instruction,
+    },
 };
 
 /// Helper to create 4 operations from a template (required for power-of-2 trace).
@@ -327,7 +329,7 @@ fn test_column_arrays() {
 // =============================================================================
 
 /// Helper to run an ELF and return the logs and instructions
-fn run_elf(path: &str) -> (Vec<executor::vm::logs::Log>, U64HashMap<Instruction>) {
+fn run_elf(path: &str) -> (Vec<executor::vm::logs::Log>, InstructionCache) {
     let elf_data = std::fs::read(path).expect("Failed to read ELF");
     let program = Elf::load(&elf_data).expect("Failed to load ELF");
     let result = run_program(&program, vec![]).expect("Failed to run program");
@@ -335,7 +337,7 @@ fn run_elf(path: &str) -> (Vec<executor::vm::logs::Log>, U64HashMap<Instruction>
 }
 
 /// Helper to run an ELF from the program_artifacts directory
-fn run_asm_elf(name: &str) -> (Vec<executor::vm::logs::Log>, U64HashMap<Instruction>) {
+fn run_asm_elf(name: &str) -> (Vec<executor::vm::logs::Log>, InstructionCache) {
     run_elf(&format!(
         "{}/executor/program_artifacts/asm/{}.elf",
         env!("CARGO_MANIFEST_DIR").replace("/prover", ""),
@@ -349,7 +351,7 @@ fn test_trace_from_logs_subw() {
     let (logs, instructions) = run_asm_elf("subw");
     assert_eq!(logs.len(), 4, "subw.elf should have 4 steps");
 
-    let traces = Traces::from_logs(&logs, instructions).unwrap();
+    let traces = Traces::from_logs(&logs, &instructions).unwrap();
 
     assert_eq!(traces.cpu.main_table.height, 4);
 

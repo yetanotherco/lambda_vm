@@ -5,6 +5,7 @@ use crate::tables::cpu::cols;
 use crate::tables::lt;
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::FE;
+use executor::vm::execution::InstructionCache;
 use executor::vm::instruction::decoding::{ArithOp, Comparison, Instruction};
 use executor::vm::logs::Log;
 use executor::vm::memory::U64HashMap;
@@ -52,7 +53,7 @@ fn make_instructions(logs: &[Log], instrs: &[Instruction]) -> U64HashMap<Instruc
 #[should_panic(expected = "CPU trace requires at least 4 operations")]
 fn test_empty_logs() {
     // CPU trace cannot be padded - caller must provide valid power-of-2 operations
-    let _traces = Traces::from_logs(&[], U64HashMap::default()).unwrap();
+    let _traces = Traces::from_logs(&[], &InstructionCache::new(&[]).unwrap()).unwrap();
 }
 
 #[test]

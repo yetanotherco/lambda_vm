@@ -12,6 +12,7 @@
 //! // Use traces.cpu, traces.bitwise, traces.lt
 //! ```
 
+use executor::vm::execution::InstructionCache;
 use executor::vm::instruction::decoding::Instruction;
 use executor::vm::logs::Log;
 use executor::vm::memory::U64HashMap;
@@ -37,10 +38,7 @@ pub struct Traces {
 
 impl Traces {
     /// Generates all traces from execution logs in a single pass.
-    pub fn from_logs(
-        logs: &[Log],
-        instructions: U64HashMap<Instruction>,
-    ) -> Result<Self, ProverError> {
+    pub fn from_logs(logs: &[Log], instructions: &InstructionCache) -> Result<Self, ProverError> {
         // Pre-allocate collectors
         let mut cpu_ops = Vec::with_capacity(logs.len());
         let mut bitwise_lookups = Vec::with_capacity(logs.len() * 4);
@@ -50,7 +48,7 @@ impl Traces {
         for (i, log) in logs.iter().enumerate() {
             let timestamp = (i as u64) * 4;
             let instruction = instructions
-                .get(&log.current_pc)
+                .get(log.current_pc)
                 .copied()
                 .ok_or(ProverError::MissingInstruction(log.current_pc))?;
             let op = CpuOperation::from_log(log, timestamp, instruction);
