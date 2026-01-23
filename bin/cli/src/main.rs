@@ -32,7 +32,9 @@ fn main() {
     if let Some(output_path) = args.flamegraph {
         let symbols = SymbolTable::parse(&elf_data);
         let mut generator = FlamegraphGenerator::new(symbols, program.entry_point);
-        generator.process_logs(&execution_result.logs, execution_result.instructions);
+        generator
+            .process_logs(&execution_result.logs, &execution_result.instructions)
+            .expect("Failed to process logs for flamegraph");
 
         let file = File::create(&output_path).expect("Failed to create flamegraph output file");
         let mut writer = BufWriter::new(file);
