@@ -10,6 +10,8 @@
 | `rs1` | `Byte` | index of source register 1. |
 | `rs2` | `Byte` | index of source register 2. |
 | `rd` | `Byte` | index of destination register. |
+| `read_register1` | `Bit` | whether to load the contents of address `rs1` (1) or `0` (0) into `rv1`. |
+| `read_register2` | `Bit` | whether to load the contents of address `rs2` (1) or `0` (0) into `rv2`. |
 | `write_register` | `Bit` | whether the result should be written to `rd` ($=0$ for memory write and when $`rd` = `x0`$. |
 | `mem_2B` | `Bit` | whether the memory access (read or write) touches exactly $2$ bytes. |
 | `mem_4B` | `Bit` | whether the memory access (read or write) touches exactly $4$ bytes. |
