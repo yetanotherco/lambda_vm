@@ -10,8 +10,7 @@ Right now, this is a project under development and experimentation and must not 
 
 ### Dependencies
 
-- Our Rust fork with support for our riscv target
-- Risc-V toolchain (To run executor tests)
+- Rust nightly with `rust-src` component
 
 ### Dev dependencies
 
@@ -19,66 +18,51 @@ Right now, this is a project under development and experimentation and must not 
 
 ### Setup executor
 
-#### Install Our Rust Fork
+#### Install Rust
 
-First remove rust if you already have it installed
-
-```sh
-rustup self uninstall
-```
-
-You can install it from source or use our pre-installed binaries
-
-##### Install from source
+Install Rust using [rustup](https://rustup.rs/):
 
 ```sh
-git clone https://github.com/yetanotherco/rust.git
-cd rust
-```
-Add `bootstrap.toml` file:
-
-```toml
-profile = "dist"
-change-id = 149355
-rust.lld = true
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-Export the directory where you want rust to be installed
+Then install the nightly toolchain with the `rust-src` component (required for building `std` for the custom RISC-V target):
 
 ```sh
-export DESTDIR=<Your_rust_destiny_dir>
+rustup toolchain install nightly
+rustup component add rust-src --toolchain nightly
 ```
 
-Run the rust installation
+#### Compile sysroot
+
+Some of the tests require linking with C libraries.
+
+##### Download pre-installed C libraries
+
 ```sh
-./x.py build && ./x.py install
+wget https://lambda.alignedlayer.com/lambda-vm-sysroot-rv64im.tar.gz
+sudo mkdir -p /opt && sudo tar -xzf lambda-vm-sysroot-rv64im.tar.gz -C /opt
 ```
 
-##### Download pre-installed binaries
+##### Compile it directly             
+    
+```sh                                                
+   sudo apt-get install -y autoconf automake autotools-dev curl python3 \                                           
+   libmpc-dev libmpfr-dev libgmp-dev gawk build-essential bison flex \                                   
+   texinfo gperf libtool patchutils bc zlib1g-dev libexpat-dev             
+```    
 
-For mac
+```sh                                                                      
+  git clone https://github.com/riscv/riscv-gnu-toolchain /tmp/riscv-gnu-toolchain
+  cd /tmp/riscv-gnu-toolchain                                                                      
+  ./configure --prefix=/opt/riscv64-newlib --with-arch=rv64im --with-abi=lp64 --disable-gdb 
+  make -j$(nproc)                                                                               
+```     
 
-```sh
-wget lambda.alignedlayer.com/lambda_rust_mac.zip
-```
-
-For linux
-
-```sh
-wget https://lambda.alignedlayer.com/lambda_rust.tar.gz
-```
-
-Then unzip it.
-
-Note that your system may prevent execution because the binaries were compiled on another machine. You may need to grant explicit permission to run them.
-
-##### Add to path
-
-Add the rust directory to your path
-
-```sh
-export PATH="/<your_rust_path>/usr/local/bin:$PATH"
-source ~/.zshrc
+```sh                                                                                                                  
+  mkdir -p /opt/lambda-vm-sysroot                                                     
+  cp -r /opt/riscv64-newlib/riscv64-unknown-elf/include /opt/lambda-vm-sysroot/         
+  cp -r /opt/riscv64-newlib/riscv64-unknown-elf/lib /opt/lambda-vm-sysroot/                
 ```
 
 #### Install the dependencies
