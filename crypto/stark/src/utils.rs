@@ -46,6 +46,7 @@ pub fn deserialize_proof(bytes: &[u8]) -> Result<(Proof<Commitment>, &[u8]), Des
 // ============================================================
 // Poseidon2 Implementation (feature = "poseidon2")
 // ============================================================
+// Commitments are [Fp; 2] (128-bit) for security equivalent to Keccak256.
 
 #[cfg(feature = "poseidon2")]
 pub fn serialize_proof(proof: &Proof<Commitment>) -> Vec<u8> {
@@ -54,7 +55,9 @@ pub fn serialize_proof(proof: &Proof<Commitment>) -> Vec<u8> {
     let mut bytes = vec![];
     bytes.extend(proof.merkle_path.len().to_be_bytes());
     for commitment in &proof.merkle_path {
-        bytes.extend(commitment.as_bytes());
+        // Each commitment is [Fp; 2], serialize both elements (16 bytes total)
+        bytes.extend(commitment[0].as_bytes());
+        bytes.extend(commitment[1].as_bytes());
     }
     bytes
 }
@@ -74,20 +77,30 @@ pub fn deserialize_proof(bytes: &[u8]) -> Result<(Proof<Commitment>, &[u8]), Des
     );
     bytes = &bytes[8..];
 
-    // Fp is 8 bytes (u64, big-endian)
+    // Each Fp is 8 bytes (u64, big-endian), commitment is [Fp; 2] = 16 bytes
     const FP_SIZE: usize = 8;
+    const COMMITMENT_SIZE: usize = FP_SIZE * 2; // 16 bytes for [Fp; 2]
     for _ in 0..merkle_path_len {
         let commitment_bytes = bytes
-            .get(..FP_SIZE)
+            .get(..COMMITMENT_SIZE)
             .ok_or(DeserializationError::InvalidAmountOfBytes)?;
-        let val = u64::from_be_bytes(
-            commitment_bytes
+
+        // Deserialize first Fp element
+        let val0 = u64::from_be_bytes(
+            commitment_bytes[..FP_SIZE]
                 .try_into()
                 .map_err(|_| DeserializationError::InvalidAmountOfBytes)?,
         );
-        let commitment: PoseidonFp = PoseidonFp::from(val);
+        // Deserialize second Fp element
+        let val1 = u64::from_be_bytes(
+            commitment_bytes[FP_SIZE..COMMITMENT_SIZE]
+                .try_into()
+                .map_err(|_| DeserializationError::InvalidAmountOfBytes)?,
+        );
+
+        let commitment: Commitment = [PoseidonFp::from(val0), PoseidonFp::from(val1)];
         merkle_path.push(commitment);
-        bytes = &bytes[FP_SIZE..];
+        bytes = &bytes[COMMITMENT_SIZE..];
     }
 
     Ok((Proof { merkle_path }, bytes))

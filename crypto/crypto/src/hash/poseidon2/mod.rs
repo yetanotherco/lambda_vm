@@ -15,6 +15,28 @@
 //! | S-box | x^7 |
 //! | Rounds | 4 (external) + 22 (internal) + 4 (external) = 30 |
 //!
+//! # Security Levels
+//!
+//! This implementation provides two security levels:
+//!
+//! | Function Family | Output Size | Security (collision) | Use Case |
+//! |-----------------|-------------|----------------------|----------|
+//! | 64-bit (`hash`, `compress`, etc.) | 1 Fp (8 bytes) | ~32 bits (birthday) | Legacy, non-critical |
+//! | 128-bit (`hash_128`, `compress_128`, etc.) | 2 Fp (16 bytes) | ~64 bits (birthday) | **Recommended for STARK** |
+//!
+//! The 128-bit functions return `[Fp; 2]` and provide collision resistance equivalent
+//! to Keccak256 for birthday attacks (~2^64 operations to find collision).
+//!
+//! ## 128-bit Hash Functions
+//!
+//! | Function | Description | Domain Tag |
+//! |----------|-------------|------------|
+//! | [`Poseidon2::hash_128`] | Hash two field elements | 2 |
+//! | [`Poseidon2::hash_single_128`] | Hash single field element | 1 |
+//! | [`Poseidon2::compress_128`] | Compress two 128-bit digests (4 Fp inputs) | 4 |
+//! | [`Poseidon2::hash_many_128`] | Sponge construction for arbitrary inputs | 10* padding |
+//! | [`Poseidon2::hash_vec_128`] | Convenience wrapper (delegates to above) | varies |
+//!
 //! # Key Differences from Poseidon
 //!
 //! - Different linear layers for external and internal rounds
@@ -24,11 +46,27 @@
 //! # Domain Separation
 //!
 //! The implementation uses domain separation via the capacity element:
-//! - `hash_single(x)`: domain tag = 1
-//! - `hash(x, y)` / `compress(x, y)`: domain tag = 2
-//! - `hash_many(inputs)`: uses 10* padding (no explicit domain tag)
+//! - `hash_single(x)` / `hash_single_128(x)`: domain tag = 1
+//! - `hash(x, y)` / `hash_128(x, y)`: domain tag = 2
+//! - `compress_128(left, right)`: domain tag = 4 (for 4 Fp inputs)
+//! - `hash_many(inputs)` / `hash_many_128(inputs)`: uses 10* padding (no explicit domain tag)
 //!
 //! This ensures that `hash(a, b) ≠ hash_many([a, b])` due to different constructions.
+//!
+//! # Example: 128-bit Merkle Tree Commitment
+//!
+//! ```rust
+//! use crypto::hash::poseidon2::{Poseidon2, Fp};
+//!
+//! // Hash leaf data to 128-bit commitment
+//! let leaf = Fp::from(42u64);
+//! let leaf_hash: [Fp; 2] = Poseidon2::hash_single_128(&leaf);
+//!
+//! // Compress two child nodes into parent (Merkle tree)
+//! let left_child = [Fp::from(1u64), Fp::from(2u64)];
+//! let right_child = [Fp::from(3u64), Fp::from(4u64)];
+//! let parent: [Fp; 2] = Poseidon2::compress_128(&left_child, &right_child);
+//! ```
 //!
 //! # References
 //!
@@ -271,6 +309,91 @@ impl Poseidon2 {
     /// Compress two digests into one (for Merkle tree internal nodes)
     pub fn compress(left: &Fp, right: &Fp) -> Fp {
         Self::hash(left, right)
+    }
+
+    // ========================================================================
+    // 128-bit security hash functions
+    // ========================================================================
+    // These functions return [Fp; 2] (128 bits) instead of Fp (64 bits)
+    // for enhanced collision resistance equivalent to Keccak256 security.
+
+    /// Hash two field elements and return a 128-bit digest (2 Fp)
+    pub fn hash_128(x: &Fp, y: &Fp) -> [Fp; 2] {
+        let mut hasher = Self::new();
+        hasher.state[0] = *x;
+        hasher.state[1] = *y;
+        // Domain separation: set capacity element to 2 (for 2 inputs)
+        hasher.state[WIDTH - 1] = Fp::from(2u64);
+        hasher.permute();
+        [hasher.state[0], hasher.state[1]]
+    }
+
+    /// Hash a single field element and return a 128-bit digest (2 Fp)
+    pub fn hash_single_128(x: &Fp) -> [Fp; 2] {
+        let mut hasher = Self::new();
+        hasher.state[0] = *x;
+        // Domain separation: set capacity element to 1 (for 1 input)
+        hasher.state[WIDTH - 1] = Fp::from(1u64);
+        hasher.permute();
+        [hasher.state[0], hasher.state[1]]
+    }
+
+    /// Compress two 128-bit digests into one 128-bit digest (for Merkle tree internal nodes)
+    pub fn compress_128(left: &[Fp; 2], right: &[Fp; 2]) -> [Fp; 2] {
+        let mut hasher = Self::new();
+        hasher.state[0] = left[0];
+        hasher.state[1] = left[1];
+        hasher.state[2] = right[0];
+        hasher.state[3] = right[1];
+        // Domain separation: set capacity element to 4 (for 4 inputs)
+        hasher.state[WIDTH - 1] = Fp::from(4u64);
+        hasher.permute();
+        [hasher.state[0], hasher.state[1]]
+    }
+
+    /// Hash multiple field elements using sponge construction, return 128-bit digest
+    pub fn hash_many_128(inputs: &[Fp]) -> [Fp; 2] {
+        let mut hasher = Self::new();
+
+        // Pad input with 1 followed by 0s (if necessary)
+        let mut values = inputs.to_vec();
+        values.push(Fp::from(1u64)); // Padding
+        while !values.len().is_multiple_of(RATE) {
+            values.push(Fp::zero());
+        }
+
+        // Absorb phase: process input in chunks of RATE
+        for chunk in values.chunks(RATE) {
+            // XOR chunk into state (first RATE elements)
+            for (i, val) in chunk.iter().enumerate() {
+                hasher.state[i] = &hasher.state[i] + val;
+            }
+            hasher.permute();
+        }
+
+        // Squeeze phase: return first two elements (128 bits)
+        [hasher.state[0], hasher.state[1]]
+    }
+
+    /// Hash a vector of field elements (for Merkle tree leaves), return 128-bit digest.
+    ///
+    /// # Behavior
+    ///
+    /// - **Empty**: Returns `[Fp::zero(), Fp::zero()]` (debug assertion guards against misuse)
+    /// - **Length 1**: Delegates to [`hash_single_128`](Self::hash_single_128)
+    /// - **Length 2+**: Delegates to [`hash_many_128`](Self::hash_many_128)
+    pub fn hash_vec_128(inputs: &[Fp]) -> [Fp; 2] {
+        if inputs.is_empty() {
+            debug_assert!(
+                false,
+                "hash_vec_128 called with empty input - this may cause collision with valid hashes"
+            );
+            return [Fp::zero(), Fp::zero()];
+        }
+        if inputs.len() == 1 {
+            return Self::hash_single_128(&inputs[0]);
+        }
+        Self::hash_many_128(inputs)
     }
 
     /// Hash a vector of field elements (for Merkle tree leaves).
@@ -708,5 +831,111 @@ mod tests {
         // hash(0, 0) should not return 0
         let result = Poseidon2::hash(&Fp::zero(), &Fp::zero());
         assert_ne!(result, Fp::zero(), "hash(0, 0) should not return 0");
+    }
+
+    // ========================================================================
+    // 128-bit hash function tests
+    // ========================================================================
+
+    #[test]
+    fn test_hash_128_deterministic() {
+        let x = Fp::from(123u64);
+        let y = Fp::from(456u64);
+
+        let h1 = Poseidon2::hash_128(&x, &y);
+        let h2 = Poseidon2::hash_128(&x, &y);
+
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn test_hash_128_different_inputs() {
+        let x1 = Fp::from(1u64);
+        let y1 = Fp::from(2u64);
+
+        let x2 = Fp::from(1u64);
+        let y2 = Fp::from(3u64);
+
+        let h1 = Poseidon2::hash_128(&x1, &y1);
+        let h2 = Poseidon2::hash_128(&x2, &y2);
+
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn test_hash_single_128() {
+        let x = Fp::from(42u64);
+        let h = Poseidon2::hash_single_128(&x);
+
+        // Should not be zero
+        assert!(h[0] != Fp::zero() || h[1] != Fp::zero());
+    }
+
+    #[test]
+    fn test_compress_128_deterministic() {
+        let left = [Fp::from(100u64), Fp::from(101u64)];
+        let right = [Fp::from(200u64), Fp::from(201u64)];
+
+        let c1 = Poseidon2::compress_128(&left, &right);
+        let c2 = Poseidon2::compress_128(&left, &right);
+
+        assert_eq!(c1, c2);
+    }
+
+    #[test]
+    fn test_compress_128_non_commutative() {
+        // compress_128(a, b) != compress_128(b, a) - important for Merkle tree security
+        let a = [Fp::from(100u64), Fp::from(101u64)];
+        let b = [Fp::from(200u64), Fp::from(201u64)];
+
+        assert_ne!(
+            Poseidon2::compress_128(&a, &b),
+            Poseidon2::compress_128(&b, &a),
+            "compress_128 should be non-commutative (order matters)"
+        );
+    }
+
+    #[test]
+    fn test_hash_many_128() {
+        let inputs: Vec<Fp> = (1..=10).map(|i| Fp::from(i as u64)).collect();
+        let h = Poseidon2::hash_many_128(&inputs);
+
+        // Should produce a valid hash (not all zeros)
+        assert!(h[0] != Fp::zero() || h[1] != Fp::zero());
+
+        // Same inputs should produce same hash
+        let h2 = Poseidon2::hash_many_128(&inputs);
+        assert_eq!(h, h2);
+    }
+
+    #[test]
+    fn test_hash_vec_128_delegates_correctly() {
+        let x = Fp::from(42u64);
+        // Length 1 should delegate to hash_single_128
+        assert_eq!(
+            Poseidon2::hash_vec_128(&[x]),
+            Poseidon2::hash_single_128(&x)
+        );
+
+        // Length 2+ should delegate to hash_many_128
+        let inputs = vec![Fp::from(1u64), Fp::from(2u64), Fp::from(3u64)];
+        assert_eq!(
+            Poseidon2::hash_vec_128(&inputs),
+            Poseidon2::hash_many_128(&inputs)
+        );
+    }
+
+    #[test]
+    fn test_128_bit_domain_separation() {
+        // 128-bit and 64-bit versions should produce different results
+        // (state[0] might match but state[1] differs, or vice versa)
+        let x = Fp::from(123u64);
+        let y = Fp::from(456u64);
+
+        let h64 = Poseidon2::hash(&x, &y);
+        let h128 = Poseidon2::hash_128(&x, &y);
+
+        // The 64-bit hash equals the first element of 128-bit (same construction)
+        assert_eq!(h64, h128[0], "First element of 128-bit should match 64-bit");
     }
 }

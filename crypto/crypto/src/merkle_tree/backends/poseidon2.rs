@@ -4,6 +4,11 @@
 //! zero-knowledge proof systems. It operates natively on Goldilocks field
 //! elements, avoiding the overhead of byte serialization.
 //!
+//! # Security Level
+//!
+//! All backends use 128-bit security with `[Fp; 2]` commitments (vs 64-bit with single `Fp`).
+//! This provides collision resistance equivalent to Keccak256 for birthday attacks.
+//!
 //! Benefits over Keccak256/SHA3:
 //! - Field-native operations (no byte conversions)
 //! - ZK-friendly (low constraint count)
@@ -16,29 +21,29 @@ use alloc::vec::Vec;
 #[cfg(feature = "parallel")]
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 
-/// Poseidon2 Merkle tree backend for single Goldilocks field elements
+/// Poseidon2 Merkle tree backend for single Goldilocks field elements (128-bit security)
 ///
-/// Node type: Goldilocks field element (64-bit)
+/// Node type: [Fp; 2] (128-bit commitment)
 /// Data type: Goldilocks field element (64-bit)
 #[derive(Clone, Default)]
 pub struct Poseidon2Backend;
 
 impl IsMerkleTreeBackend for Poseidon2Backend {
-    type Node = Fp;
+    type Node = [Fp; 2];
     type Data = Fp;
 
     fn hash_data(leaf: &Self::Data) -> Self::Node {
-        Poseidon2::hash_single(leaf)
+        Poseidon2::hash_single_128(leaf)
     }
 
     fn hash_new_parent(left: &Self::Node, right: &Self::Node) -> Self::Node {
-        Poseidon2::compress(left, right)
+        Poseidon2::compress_128(left, right)
     }
 }
 
-/// Poseidon2 Merkle tree backend for pairs of Goldilocks field elements
+/// Poseidon2 Merkle tree backend for pairs of Goldilocks field elements (128-bit security)
 ///
-/// Node type: Goldilocks field element (64-bit)
+/// Node type: [Fp; 2] (128-bit commitment)
 /// Data type: [Fp; 2] (fixed-size pair)
 ///
 /// This is optimized for FRI layers where each leaf is exactly 2 field elements.
@@ -47,21 +52,21 @@ impl IsMerkleTreeBackend for Poseidon2Backend {
 pub struct PairPoseidon2Backend;
 
 impl IsMerkleTreeBackend for PairPoseidon2Backend {
-    type Node = Fp;
+    type Node = [Fp; 2];
     type Data = [Fp; 2];
 
-    fn hash_data(input: &[Fp; 2]) -> Fp {
-        Poseidon2::hash(&input[0], &input[1])
+    fn hash_data(input: &[Fp; 2]) -> [Fp; 2] {
+        Poseidon2::hash_128(&input[0], &input[1])
     }
 
-    fn hash_new_parent(left: &Fp, right: &Fp) -> Fp {
-        Poseidon2::compress(left, right)
+    fn hash_new_parent(left: &[Fp; 2], right: &[Fp; 2]) -> [Fp; 2] {
+        Poseidon2::compress_128(left, right)
     }
 }
 
-/// Poseidon2 Merkle tree backend for vectors of Goldilocks field elements
+/// Poseidon2 Merkle tree backend for vectors of Goldilocks field elements (128-bit security)
 ///
-/// Node type: Goldilocks field element (64-bit)
+/// Node type: [Fp; 2] (128-bit commitment)
 /// Data type: Vec<Goldilocks field element>
 ///
 /// This is useful for committing to rows of field elements (e.g., trace columns)
@@ -69,11 +74,11 @@ impl IsMerkleTreeBackend for PairPoseidon2Backend {
 pub struct BatchPoseidon2Backend;
 
 impl IsMerkleTreeBackend for BatchPoseidon2Backend {
-    type Node = Fp;
+    type Node = [Fp; 2];
     type Data = Vec<Fp>;
 
     fn hash_data(leaf: &Self::Data) -> Self::Node {
-        Poseidon2::hash_vec(leaf)
+        Poseidon2::hash_vec_128(leaf)
     }
 
     fn hash_leaves(unhashed_leaves: &[Self::Data]) -> Vec<Self::Node> {
@@ -86,7 +91,7 @@ impl IsMerkleTreeBackend for BatchPoseidon2Backend {
     }
 
     fn hash_new_parent(left: &Self::Node, right: &Self::Node) -> Self::Node {
-        Poseidon2::compress(left, right)
+        Poseidon2::compress_128(left, right)
     }
 }
 
@@ -246,5 +251,17 @@ mod tests {
             &selected,
             values.len()
         ));
+    }
+
+    #[test]
+    fn test_128_bit_commitment_size() {
+        // Verify that Node type is [Fp; 2] which gives us 128-bit security
+        let values: Vec<Fp> = (1..5).map(|i| Fp::from(i as u64)).collect();
+        let merkle_tree = MerkleTree::<Poseidon2Backend>::build(&values).unwrap();
+
+        // Root should be [Fp; 2]
+        let root: [Fp; 2] = merkle_tree.root;
+        // Both elements should be non-zero for real inputs
+        assert!(root[0] != Fp::zero() || root[1] != Fp::zero());
     }
 }

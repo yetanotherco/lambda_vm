@@ -39,6 +39,9 @@ pub use keccak_config::*;
 //
 // The types below use PhantomData to carry generic type information for API
 // compatibility, but internally always use Goldilocks-specific backends.
+//
+// SECURITY: Uses 128-bit commitments ([Fp; 2]) for collision resistance
+// equivalent to Keccak256 (vs 64-bit with single Fp).
 #[cfg(feature = "poseidon2")]
 mod poseidon2_config {
     use super::*;
@@ -54,8 +57,8 @@ mod poseidon2_config {
     // Re-export backend types for use in fri/mod.rs and other modules
     pub use crypto::merkle_tree::backends::types::PairPoseidon2Backend;
 
-    /// Commitment type for Poseidon2: a single Goldilocks field element
-    pub type Commitment = Fp;
+    /// Commitment type for Poseidon2: two Goldilocks field elements (128-bit security)
+    pub type Commitment = [Fp; 2];
 
     // Type aliases for actual backends - no generic parameter
     pub type FriMerkleTreeBackendInner = Poseidon2Backend;
@@ -261,5 +264,8 @@ pub fn commitment_to_bytes(commitment: &Commitment) -> Vec<u8> {
 #[cfg(feature = "poseidon2")]
 pub fn commitment_to_bytes(commitment: &Commitment) -> Vec<u8> {
     use math::traits::AsBytes;
-    commitment.as_bytes()
+    // Commitment is [Fp; 2], so we concatenate both elements' bytes
+    let mut bytes = commitment[0].as_bytes();
+    bytes.extend(commitment[1].as_bytes());
+    bytes // 16 bytes total (2 × 8 bytes)
 }

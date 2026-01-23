@@ -1,5 +1,4 @@
 use super::{
-    config::BatchedMerkleTreeBackend,
     domain::VerifierDomain,
     fri::fri_decommit::FriDecommitment,
     grinding,
@@ -136,9 +135,16 @@ pub trait IsStarkVerifier<
 
         let num_transition_constraints = air.context().num_transition_constraints;
 
-        let mut coefficients: Vec<_> = (0..num_boundary_constraints + num_transition_constraints)
-            .map(|i| beta.pow(i))
-            .collect();
+        // Generate coefficients via iterative multiplication (O(N)) instead of pow (O(N log N))
+        let num_total = num_boundary_constraints + num_transition_constraints;
+        let mut coefficients = Vec::with_capacity(num_total);
+        {
+            let mut current = FieldElement::one();
+            for _ in 0..num_total {
+                coefficients.push(current.clone());
+                current = &current * &beta;
+            }
+        }
 
         let transition_coeffs: Vec<_> = coefficients.drain(..num_transition_constraints).collect();
         let boundary_coeffs = coefficients;
@@ -974,9 +980,16 @@ pub trait IsStarkVerifier<
 
         let num_transition_constraints = air.context().num_transition_constraints;
 
-        let mut coefficients: Vec<_> = (0..num_boundary_constraints + num_transition_constraints)
-            .map(|i| beta.pow(i))
-            .collect();
+        // Generate coefficients via iterative multiplication (O(N)) instead of pow (O(N log N))
+        let num_total = num_boundary_constraints + num_transition_constraints;
+        let mut coefficients = Vec::with_capacity(num_total);
+        {
+            let mut current = FieldElement::one();
+            for _ in 0..num_total {
+                coefficients.push(current.clone());
+                current = &current * &beta;
+            }
+        }
 
         let transition_coeffs: Vec<_> = coefficients.drain(..num_transition_constraints).collect();
         let boundary_coeffs = coefficients;
