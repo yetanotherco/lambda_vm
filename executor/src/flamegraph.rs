@@ -88,13 +88,13 @@ impl FlamegraphGenerator {
         match instruction {
             // Function CALL: JAL with dst=ra (register 1)
             // Saves return address to ra and jumps to offset
-            Instruction::JumpAndLink { dst, .. } if dst == 1 => {
+            Instruction::JumpAndLink { dst: 1, .. } => {
                 self.call_stack.push(log.next_pc);
             }
 
             // Function CALL: JALR with dst=ra (register 1)
             // Indirect call through register
-            Instruction::JumpAndLinkRegister { dst, .. } if dst == 1 => {
+            Instruction::JumpAndLinkRegister { dst: 1, .. } => {
                 self.call_stack.push(log.next_pc);
             }
 
@@ -106,11 +106,11 @@ impl FlamegraphGenerator {
 
             // Tail call: JAL/JALR with dst=zero (doesn't save return address)
             // Pop current function and push the new one
-            Instruction::JumpAndLink { dst, .. } if dst == 0 => {
+            Instruction::JumpAndLink { dst: 0, .. } => {
                 self.call_stack.pop();
                 self.call_stack.push(log.next_pc);
             }
-            Instruction::JumpAndLinkRegister { dst, base, .. } if dst == 0 && base != 1 => {
+            Instruction::JumpAndLinkRegister { dst: 0, base, .. } if base != 1 => {
                 // Tail call through register (not a return)
                 self.call_stack.pop();
                 self.call_stack.push(log.next_pc);
@@ -164,10 +164,10 @@ fn demangle(name: &str) -> String {
     }
 
     // Handle legacy Rust mangling: _ZN...
-    if name.starts_with("_ZN") {
-        if let Some(demangled) = try_demangle_legacy(name) {
-            return clean_demangled(&demangled);
-        }
+    if name.starts_with("_ZN")
+        && let Some(demangled) = try_demangle_legacy(name)
+    {
+        return clean_demangled(&demangled);
     }
 
     // Handle simple length-prefixed names like _9quicksort15quicksort_range
@@ -178,10 +178,9 @@ fn demangle(name: &str) -> String {
             .nth(1)
             .map(|c| c.is_ascii_digit())
             .unwrap_or(false)
+        && let Some(demangled) = try_demangle_length_prefixed(&name[1..])
     {
-        if let Some(demangled) = try_demangle_length_prefixed(&name[1..]) {
-            return demangled;
-        }
+        return demangled;
     }
 
     // Return original if can't demangle
@@ -268,10 +267,9 @@ fn clean_length_prefixed(part: &str) -> String {
         .next()
         .map(|c| c.is_ascii_digit())
         .unwrap_or(false)
+        && let Some(parsed) = try_demangle_length_prefixed(s)
     {
-        if let Some(parsed) = try_demangle_length_prefixed(s) {
-            return parsed;
-        }
+        return parsed;
     }
 
     // Check for hash prefix pattern like "guj_14syscall_commit" -> strip "guj_" and parse
@@ -369,25 +367,25 @@ fn should_filter_part(part: &str) -> bool {
     }
 
     // Filter out parts that look like partial hash_length patterns (e.g., "H_17compi")
-    if part.contains("_") {
-        if let Some(pos) = part.find('_') {
-            let after = &part[pos + 1..];
-            // If it's hash_lengthpartial (digits followed by short text), filter it
-            if after
-                .chars()
-                .next()
-                .map(|c| c.is_ascii_digit())
-                .unwrap_or(false)
-            {
-                let digit_end = after
-                    .find(|c: char| !c.is_ascii_digit())
-                    .unwrap_or(after.len());
-                if let Ok(expected_len) = after[..digit_end].parse::<usize>() {
-                    let actual_len = after.len() - digit_end;
-                    // If actual length doesn't match expected, it's a partial/broken name
-                    if actual_len < expected_len {
-                        return true;
-                    }
+    if part.contains("_")
+        && let Some(pos) = part.find('_')
+    {
+        let after = &part[pos + 1..];
+        // If it's hash_lengthpartial (digits followed by short text), filter it
+        if after
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false)
+        {
+            let digit_end = after
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(after.len());
+            if let Ok(expected_len) = after[..digit_end].parse::<usize>() {
+                let actual_len = after.len() - digit_end;
+                // If actual length doesn't match expected, it's a partial/broken name
+                if actual_len < expected_len {
+                    return true;
                 }
             }
         }
@@ -403,7 +401,7 @@ fn should_filter_part(part: &str) -> bool {
             .map(|c| c.is_uppercase())
             .unwrap_or(false);
 
-        if (has_upper && has_digit) || (starts_upper && has_digit) {
+        if (starts_upper || has_upper) && has_digit {
             return true;
         }
     }
@@ -433,15 +431,17 @@ fn try_demangle_v0(name: &str) -> Option<String> {
                 i += 1;
             }
 
-            if let Ok(len) = len_str.parse::<usize>() {
-                if len > 0 && len < 200 && i + len <= bytes.len() {
-                    let ident = String::from_utf8_lossy(&bytes[i..i + len]).to_string();
-                    if !ident.is_empty() {
-                        result.push(ident);
-                    }
-                    i += len;
-                    continue;
+            if let Ok(len) = len_str.parse::<usize>()
+                && len > 0
+                && len < 200
+                && i + len <= bytes.len()
+            {
+                let ident = String::from_utf8_lossy(&bytes[i..i + len]).to_string();
+                if !ident.is_empty() {
+                    result.push(ident);
                 }
+                i += len;
+                continue;
             }
         }
         // Look for bare digit sequences that are length prefixes
@@ -457,21 +457,23 @@ fn try_demangle_v0(name: &str) -> Option<String> {
                     i += 1;
                 }
 
-                if let Ok(len) = len_str.parse::<usize>() {
-                    if len > 0 && len < 200 && i + len <= bytes.len() {
-                        let ident = String::from_utf8_lossy(&bytes[i..i + len]).to_string();
-                        // Accept if it starts with a letter (valid identifier)
-                        if !ident.is_empty()
-                            && ident
-                                .chars()
-                                .next()
-                                .map(|c| c.is_alphabetic())
-                                .unwrap_or(false)
-                        {
-                            result.push(ident);
-                            i += len;
-                            continue;
-                        }
+                if let Ok(len) = len_str.parse::<usize>()
+                    && len > 0
+                    && len < 200
+                    && i + len <= bytes.len()
+                {
+                    let ident = String::from_utf8_lossy(&bytes[i..i + len]).to_string();
+                    // Accept if it starts with a letter (valid identifier)
+                    if !ident.is_empty()
+                        && ident
+                            .chars()
+                            .next()
+                            .map(|c| c.is_alphabetic())
+                            .unwrap_or(false)
+                    {
+                        result.push(ident);
+                        i += len;
+                        continue;
                     }
                 }
                 // If parsing failed, just skip one digit
