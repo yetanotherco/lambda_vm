@@ -6,7 +6,7 @@ use crate::vm::{
         execution::ExecutionError,
     },
     logs::Log,
-    memory::{Memory, MemoryError},
+    memory::{Memory, MemoryError, U64HashMap},
     registers::Registers,
 };
 
@@ -15,22 +15,37 @@ pub struct ReturnValues {
     pub register_values: (i64, i64),
 }
 
+/// Result of program execution including logs and predecoded instructions
+pub struct ExecutionResult {
+    pub return_values: ReturnValues,
+    pub logs: Vec<Log>,
+    /// Predecoded instructions map (pc -> instruction)
+    /// Use this to look up instructions by their PC from the logs
+    pub instructions: U64HashMap<Instruction>,
+}
+
 pub fn run_program(
     segments: &[crate::elf::Segment],
     entrypoint: u64,
     private_inputs: Vec<u8>,
-) -> Result<(ReturnValues, Vec<Log>), ExecutorError> {
+) -> Result<ExecutionResult, ExecutorError> {
     let mut memory = Memory::default();
     memory.store_private_inputs(private_inputs)?;
     // Pre-decode all instructions from executable segments
     let instruction_cache = InstructionCache::new(segments)?;
     load_program(segments, &mut memory)?;
-    run_from_entrypoint(
+    let (return_values, logs) = run_from_entrypoint(
         &mut memory,
         entrypoint,
         &instruction_cache,
         instruction_cache.instruction_count(),
-    )
+    )?;
+    let instructions = instruction_cache.into_instruction_map();
+    Ok(ExecutionResult {
+        return_values,
+        logs,
+        instructions,
+    })
 }
 
 fn load_program(segments: &[crate::elf::Segment], memory: &mut Memory) -> Result<(), MemoryError> {
@@ -147,6 +162,10 @@ impl InstructionCache {
 
     pub fn instruction_count(&self) -> usize {
         self.segments.iter().map(|s| s.instructions.len()).sum()
+    }
+
+    pub fn into_instruction_map(self) -> U64HashMap<Instruction> {
+        todo!()
     }
 }
 

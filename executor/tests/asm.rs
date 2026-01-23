@@ -7,10 +7,10 @@ fn run_program_and_check_output(elf_path: &str, expected_output: i64) {
     println!("Testing {}", elf_path);
     let elf_data = std::fs::read(elf_path).unwrap();
     let program = Elf::load(&elf_data).unwrap();
-    let (results, _logs) =
+    let result =
         run_program(&program.data, program.entry_point, vec![]).expect("Failed to run program");
 
-    assert!(results.register_values.0 == expected_output);
+    assert!(result.return_values.register_values.0 == expected_output);
 }
 
 #[test]

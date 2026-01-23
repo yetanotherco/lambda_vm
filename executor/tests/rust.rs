@@ -1,6 +1,6 @@
 use executor::{
     elf::Elf,
-    vm::execution::{ReturnValues, run_program},
+    vm::execution::{ExecutionResult, run_program},
 };
 
 // NOTE: These tests require 64-bit RISC-V ELF files (RV64IM).
@@ -8,7 +8,7 @@ use executor::{
 fn run_program_without_expect(
     elf_path: &str,
     private_inputs: Vec<u8>,
-) -> Result<(ReturnValues, Vec<executor::vm::logs::Log>), executor::vm::execution::ExecutorError> {
+) -> Result<ExecutionResult, executor::vm::execution::ExecutorError> {
     println!("Testing {}", elf_path);
     let elf_data = std::fs::read(elf_path).unwrap();
     let program = Elf::load(&elf_data).unwrap();
@@ -21,17 +21,17 @@ fn run_program_and_check_public_output(
     expected_output: Vec<u8>,
     private_inputs: Vec<u8>,
 ) {
-    let (results, _logs) =
+    let result =
         run_program_without_expect(elf_path, private_inputs).expect("Failed to run program");
 
-    assert_eq!(results.memory_values, expected_output);
+    assert_eq!(result.return_values.memory_values, expected_output);
 }
 
 fn run_program_and_check_output(elf_path: &str, expected_output: i64, private_inputs: Vec<u8>) {
-    let (results, _logs) =
+    let result =
         run_program_without_expect(elf_path, private_inputs).expect("Failed to run program");
 
-    assert!(results.register_values.0 == expected_output);
+    assert!(result.return_values.register_values.0 == expected_output);
 }
 
 #[test]
@@ -277,4 +277,10 @@ fn test_ethrex() {
         output.encode(),
         inputs,
     );
+}
+
+#[ignore = "Ignored until the vm is fast enough to run this test"]
+#[test]
+fn test_ckzg() {
+    run_program_and_check_public_output("./program_artifacts/rust/ckzg.elf", vec![1, 1], vec![]);
 }

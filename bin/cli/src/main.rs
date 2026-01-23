@@ -14,7 +14,7 @@ fn main() {
     let args = Args::parse_from(std::env::args());
     let elf_data = std::fs::read(args.filename).expect("Failed to read elf file");
     let program = Elf::load(&elf_data).expect("Failed to load elf program");
-    let (_, _logs) =
+    let _result =
         run_program(&program.data, program.entry_point, vec![]).expect("Failed to run program");
-    // TODO: Prove program execution using logs
+    // TODO: Prove program execution using result.logs and result.instructions
 }

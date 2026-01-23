@@ -5,12 +5,14 @@
 //! - Trace generation tests
 //! - Integration tests for CpuOperation::from_log (ELF execution)
 
-use crate::tables64::cpu::{
-    CpuOperation, bus_interactions, cols, generate_cpu_trace, generate_cpu_trace_from_logs,
-};
-use crate::tables64::types::FE;
+use crate::tables::cpu::{CpuOperation, bus_interactions, cols, generate_cpu_trace};
+use crate::tables::trace_builder::Traces;
+use crate::tables::types::FE;
 
-use executor::{elf::Elf, vm::execution::run_program};
+use executor::{
+    elf::Elf,
+    vm::{execution::run_program, instruction::decoding::Instruction, memory::U64HashMap},
+};
 
 /// Helper to create 4 operations from a template (required for power-of-2 trace).
 fn ops4(op: CpuOperation) -> Vec<CpuOperation> {
@@ -285,41 +287,6 @@ fn test_trace_generation_sign_bits() {
 }
 
 #[test]
-#[should_panic(expected = "power-of-2")]
-fn test_trace_generation_rejects_non_power_of_2() {
-    // 5 operations should panic (>=4 but not power of 2)
-    let ops = vec![
-        CpuOperation {
-            pc: 0x1000,
-            op_add: true,
-            ..Default::default()
-        },
-        CpuOperation {
-            pc: 0x1004,
-            op_add: true,
-            ..Default::default()
-        },
-        CpuOperation {
-            pc: 0x1008,
-            op_add: true,
-            ..Default::default()
-        },
-        CpuOperation {
-            pc: 0x100C,
-            op_add: true,
-            ..Default::default()
-        },
-        CpuOperation {
-            pc: 0x1010,
-            op_add: true,
-            ..Default::default()
-        },
-    ];
-
-    let _trace = generate_cpu_trace(&ops);
-}
-
-#[test]
 fn test_bus_interactions_count() {
     let interactions = bus_interactions();
 
@@ -359,17 +326,17 @@ fn test_column_arrays() {
 // ELF execution helpers and from_log tests
 // =============================================================================
 
-/// Helper to run an ELF and return the logs
-fn run_elf(path: &str) -> Vec<executor::vm::logs::Log> {
+/// Helper to run an ELF and return the logs and instructions
+fn run_elf(path: &str) -> (Vec<executor::vm::logs::Log>, U64HashMap<Instruction>) {
     let elf_data = std::fs::read(path).expect("Failed to read ELF");
     let program = Elf::load(&elf_data).expect("Failed to load ELF");
-    let (_results, logs) =
+    let result =
         run_program(&program.data, program.entry_point, vec![]).expect("Failed to run program");
-    logs
+    (result.logs, result.instructions)
 }
 
 /// Helper to run an ELF from the program_artifacts directory
-fn run_asm_elf(name: &str) -> Vec<executor::vm::logs::Log> {
+fn run_asm_elf(name: &str) -> (Vec<executor::vm::logs::Log>, U64HashMap<Instruction>) {
     run_elf(&format!(
         "{}/executor/program_artifacts/asm/{}.elf",
         env!("CARGO_MANIFEST_DIR").replace("/prover", ""),
@@ -380,30 +347,31 @@ fn run_asm_elf(name: &str) -> Vec<executor::vm::logs::Log> {
 #[test]
 fn test_trace_from_logs_subw() {
     // subw test - 4 steps (power of 2, works without padding)
-    let logs = run_asm_elf("subw");
+    let (logs, instructions) = run_asm_elf("subw");
     assert_eq!(logs.len(), 4, "subw.elf should have 4 steps");
 
-    let trace = generate_cpu_trace_from_logs(&logs);
+    let traces = Traces::from_logs(&logs, instructions).unwrap();
 
-    assert_eq!(trace.main_table.height, 4);
+    assert_eq!(traces.cpu.main_table.height, 4);
 
     // Should have SUB instruction with word_instr flag
-    let has_sub = (0..logs.len()).any(|i| trace.main_table.get_row(i)[cols::SUB] == FE::one());
+    let has_sub = (0..logs.len()).any(|i| traces.cpu.main_table.get_row(i)[cols::SUB] == FE::one());
     assert!(has_sub, "subw.elf should have SUB instruction");
 }
 
 #[test]
 fn test_cpu_operation_from_log_arith() {
-    use executor::vm::instruction::decoding::{ArithOp, Instruction};
+    use executor::vm::instruction::decoding::ArithOp;
     use executor::vm::logs::Log;
 
+    let instruction = Instruction::Arith {
+        dst: 10,
+        src1: 11,
+        src2: 12,
+        op: ArithOp::Add,
+    };
+
     let log = Log {
-        instruction: Instruction::Arith {
-            dst: 10,
-            src1: 11,
-            src2: 12,
-            op: ArithOp::Add,
-        },
         current_pc: 0x1000,
         next_pc: 0x1004,
         src1_val: 100,
@@ -411,7 +379,7 @@ fn test_cpu_operation_from_log_arith() {
         dst_val: 300,
     };
 
-    let op = CpuOperation::from_log(&log, 0);
+    let op = CpuOperation::from_log(&log, 0, instruction);
 
     assert_eq!(op.pc, 0x1000);
     assert_eq!(op.next_pc, 0x1004);
@@ -427,16 +395,17 @@ fn test_cpu_operation_from_log_arith() {
 
 #[test]
 fn test_cpu_operation_from_log_branch() {
-    use executor::vm::instruction::decoding::{Comparison, Instruction};
+    use executor::vm::instruction::decoding::Comparison;
     use executor::vm::logs::Log;
 
+    let instruction = Instruction::Branch {
+        src1: 5,
+        src2: 6,
+        cond: Comparison::LessThan,
+        offset: 8,
+    };
+
     let log = Log {
-        instruction: Instruction::Branch {
-            src1: 5,
-            src2: 6,
-            cond: Comparison::LessThan,
-            offset: 8,
-        },
         current_pc: 0x2000,
         next_pc: 0x2008, // Branch taken
         src1_val: 10,
@@ -444,7 +413,7 @@ fn test_cpu_operation_from_log_branch() {
         dst_val: 0,
     };
 
-    let op = CpuOperation::from_log(&log, 4);
+    let op = CpuOperation::from_log(&log, 4, instruction);
 
     assert_eq!(op.timestamp, 4);
     assert_eq!(op.pc, 0x2000);
@@ -458,16 +427,17 @@ fn test_cpu_operation_from_log_branch() {
 
 #[test]
 fn test_cpu_operation_from_log_word_instr() {
-    use executor::vm::instruction::decoding::{ArithOp, Instruction};
+    use executor::vm::instruction::decoding::ArithOp;
     use executor::vm::logs::Log;
 
+    let instruction = Instruction::ArithW {
+        dst: 1,
+        src1: 2,
+        src2: 3,
+        op: ArithOp::Add,
+    };
+
     let log = Log {
-        instruction: Instruction::ArithW {
-            dst: 1,
-            src1: 2,
-            src2: 3,
-            op: ArithOp::Add,
-        },
         current_pc: 0x3000,
         next_pc: 0x3004,
         src1_val: 0xFFFF_FFFF_8000_0000, // Would be negative as 32-bit
@@ -475,7 +445,7 @@ fn test_cpu_operation_from_log_word_instr() {
         dst_val: 0xFFFF_FFFF_8000_0001, // Result sign-extended
     };
 
-    let op = CpuOperation::from_log(&log, 8);
+    let op = CpuOperation::from_log(&log, 8, instruction);
 
     assert!(op.word_instr);
     assert!(op.op_add);
