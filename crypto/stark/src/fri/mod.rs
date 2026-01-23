@@ -101,7 +101,8 @@ where
                 for layer in fri_layers {
                     // symmetric element
                     let evaluation_sym = layer.evaluation[index ^ 1].clone();
-                    let auth_path_sym = layer.merkle_tree
+                    let auth_path_sym = layer
+                        .merkle_tree
                         .get_proof_by_pos(index >> 1)
                         .expect("FRI query index out of bounds - invalid iota or layer size");
                     layers_evaluations_sym.push(evaluation_sym);
@@ -135,9 +136,10 @@ where
     B: crypto::merkle_tree::traits::IsMerkleTreeBackend,
     BuildLeaves: FnOnce(&[FieldElement<E>]) -> Vec<B::Data>,
 {
-    let mut evaluation =
-        Polynomial::evaluate_offset_fft(poly, 1, Some(domain_size), coset_offset)
-            .expect("FFT evaluation failed - domain size must be a power of 2 and match polynomial degree");
+    let mut evaluation = Polynomial::evaluate_offset_fft(poly, 1, Some(domain_size), coset_offset)
+        .expect(
+            "FFT evaluation failed - domain size must be a power of 2 and match polynomial degree",
+        );
 
     in_place_bit_reverse_permute(&mut evaluation);
 

@@ -16,6 +16,7 @@ use super::{
 };
 
 /// Poseidon2 backends - Goldilocks field only (see module docs).
+#[cfg(feature = "poseidon2")]
 pub use super::poseidon2::{BatchPoseidon2Backend, Poseidon2Backend};
 
 // Field element backend definitions

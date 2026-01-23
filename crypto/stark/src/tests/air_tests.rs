@@ -638,3 +638,48 @@ fn test_multi_column_fibonacci_4_cols() {
         &mut DefaultTranscript::<GoldilocksExt>::new(&[])
     ));
 }
+
+/// Test prove/verify with Poseidon2 Merkle tree backend (4 columns).
+/// This test only runs when the `poseidon2` feature is enabled.
+/// It validates that the STARK prover/verifier works correctly with
+/// Poseidon2 hash function for Merkle tree commitments.
+#[cfg(feature = "poseidon2")]
+#[test]
+fn test_multi_column_fibonacci_4_cols_poseidon2() {
+    let proof_options = ProofOptions::default_test_options();
+    let num_columns = 4;
+    let trace_length = 16;
+
+    let initial_values: Vec<(GoldilocksFE, GoldilocksFE)> = (0..num_columns)
+        .map(|i| {
+            (
+                GoldilocksFE::from((i + 1) as u64),
+                GoldilocksFE::from((i + 2) as u64),
+            )
+        })
+        .collect();
+
+    let mut trace = fibonacci_multi_column::compute_trace::<GoldilocksField, GoldilocksExt>(
+        &initial_values,
+        trace_length,
+    );
+    let pub_inputs = fibonacci_multi_column::create_public_inputs(initial_values);
+    let air = FibonacciMultiColumnAIR::<GoldilocksField, GoldilocksExt>::with_num_columns(
+        &proof_options,
+        num_columns,
+    );
+
+    let proof = Prover::<GoldilocksField, GoldilocksExt, _>::prove(
+        &air,
+        &mut trace,
+        &pub_inputs,
+        &mut DefaultTranscript::<GoldilocksExt>::new(&[]),
+    )
+    .unwrap();
+
+    assert!(Verifier::<GoldilocksField, GoldilocksExt, _>::verify(
+        &proof,
+        &air,
+        &mut DefaultTranscript::<GoldilocksExt>::new(&[])
+    ));
+}

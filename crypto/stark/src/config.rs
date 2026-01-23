@@ -167,10 +167,10 @@ mod poseidon2_config {
     {
         let bytes = elem.as_bytes();
         debug_assert!(
-            bytes.len() % 8 == 0,
+            bytes.len().is_multiple_of(8),
             "as_bytes() length must be a multiple of 8 for Poseidon2 encoding"
         );
-        let mut limbs = Vec::with_capacity((bytes.len() + 7) / 8);
+        let mut limbs = Vec::with_capacity(bytes.len().div_ceil(8));
         for chunk in bytes.chunks(8) {
             let mut buf = [0u8; 8];
             // Left-pad for big-endian chunks shorter than 8 bytes.
