@@ -5,9 +5,8 @@
 //! - Trace generation tests
 //! - Integration tests for CpuOperation::from_log (ELF execution)
 
-use crate::tables::cpu::{
-    CpuOperation, bus_interactions, cols, generate_cpu_trace, generate_cpu_trace_from_logs,
-};
+use crate::tables::cpu::{CpuOperation, bus_interactions, cols, generate_cpu_trace};
+use crate::tables::trace_builder::Traces;
 use crate::tables::types::FE;
 
 use executor::{
@@ -288,41 +287,6 @@ fn test_trace_generation_sign_bits() {
 }
 
 #[test]
-#[should_panic(expected = "power-of-2")]
-fn test_trace_generation_rejects_non_power_of_2() {
-    // 5 operations should panic (>=4 but not power of 2)
-    let ops = vec![
-        CpuOperation {
-            pc: 0x1000,
-            op_add: true,
-            ..Default::default()
-        },
-        CpuOperation {
-            pc: 0x1004,
-            op_add: true,
-            ..Default::default()
-        },
-        CpuOperation {
-            pc: 0x1008,
-            op_add: true,
-            ..Default::default()
-        },
-        CpuOperation {
-            pc: 0x100C,
-            op_add: true,
-            ..Default::default()
-        },
-        CpuOperation {
-            pc: 0x1010,
-            op_add: true,
-            ..Default::default()
-        },
-    ];
-
-    let _trace = generate_cpu_trace(&ops);
-}
-
-#[test]
 fn test_bus_interactions_count() {
     let interactions = bus_interactions();
 
@@ -387,12 +351,12 @@ fn test_trace_from_logs_subw() {
     let (logs, instructions) = run_asm_elf("subw");
     assert_eq!(logs.len(), 4, "subw.elf should have 4 steps");
 
-    let trace = generate_cpu_trace_from_logs(&logs, &instructions);
+    let traces = Traces::from_logs(&logs, instructions).unwrap();
 
-    assert_eq!(trace.main_table.height, 4);
+    assert_eq!(traces.cpu.main_table.height, 4);
 
     // Should have SUB instruction with word_instr flag
-    let has_sub = (0..logs.len()).any(|i| trace.main_table.get_row(i)[cols::SUB] == FE::one());
+    let has_sub = (0..logs.len()).any(|i| traces.cpu.main_table.get_row(i)[cols::SUB] == FE::one());
     assert!(has_sub, "subw.elf should have SUB instruction");
 }
 

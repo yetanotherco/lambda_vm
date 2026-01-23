@@ -22,6 +22,7 @@ pub mod types;
 pub mod bitwise;
 pub mod cpu;
 pub mod lt;
+pub mod trace_builder;
 
 // pub mod branch;
 // pub mod mul;
