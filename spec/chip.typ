@@ -80,6 +80,13 @@
     }
   }
 
+  // Add a label for `var`
+  let lbl(var) = {
+    if "ref" in var {
+      label(var.ref)
+    }
+  }
+
   // Group variables by category
   show figure: set block(breakable: true)
   figure(table(
@@ -93,7 +100,7 @@
       (table.header(level:2, table.cell(colspan: 4, emph(cat))), table.hline(stroke: .6pt))
       for var in vars {
         (
-          [#raw(var.name)], 
+          [#raw(var.name)#lbl(var)], 
           [#type_to_code(var.type)], 
           table.cell(colspan: 2, [#eval(var.desc, mode: "markup")])
         )
