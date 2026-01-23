@@ -53,12 +53,7 @@
 //! - ECALL: for system calls
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
-use crate::ProverError;
-use executor::vm::{
-    instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth},
-    logs::Log,
-    memory::U64HashMap,
-};
+use executor::vm::logs::Log;
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
@@ -307,6 +302,115 @@ impl CpuOperation {
         Self::default()
     }
 
+    /// Creates a CpuOperation from a DecodeEntry and runtime Log values.
+    ///
+    /// This is the preferred constructor that reuses decode-time information
+    /// from the DECODE table, avoiding duplication of decode logic.
+    pub fn from_decode_entry(
+        entry: &super::decode::DecodeEntry,
+        log: &Log,
+        timestamp: u64,
+    ) -> Self {
+        let mut op = Self {
+            timestamp,
+            pc: entry.pc,
+            next_pc: log.next_pc,
+
+            // Copy decode-time fields from DecodeEntry
+            rs1: entry.rs1,
+            rs2: entry.rs2,
+            rd: entry.rd,
+            write_register: entry.write_register,
+            memory_2bytes: entry.memory_2bytes,
+            memory_4bytes: entry.memory_4bytes,
+            memory_8bytes: entry.memory_8bytes,
+            c_type_instruction: entry.c_type,
+            imm: entry.imm,
+            signed: entry.signed,
+            mp_selector: entry.mp_selector,
+            muldiv_selector: entry.muldiv_selector,
+            word_instr: entry.word_instr,
+
+            // Copy ALU selector flags
+            op_add: entry.op_add,
+            op_sub: entry.op_sub,
+            op_slt: entry.op_slt,
+            op_and: entry.op_and,
+            op_or: entry.op_or,
+            op_xor: entry.op_xor,
+            op_shift: entry.op_shift,
+            op_jalr: entry.op_jalr,
+            op_beq: entry.op_beq,
+            op_blt: entry.op_blt,
+            op_load: entry.op_load,
+            op_store: entry.op_store,
+            op_mul: entry.op_mul,
+            op_divrem: entry.op_divrem,
+            op_ecall: entry.op_ecall,
+            op_ebreak: entry.op_ebreak,
+
+            // Runtime values from log
+            rv1: log.src1_val,
+            rv2: log.src2_val,
+            rvd: log.dst_val,
+            res: log.dst_val, // Default: result is destination value
+
+            ..Default::default()
+        };
+
+        // Handle rs1=255 (virtual PC register) for JAL/AUIPC
+        if entry.rs1 == 255 {
+            op.rv1 = log.current_pc;
+        }
+
+        // JAL/JALR: set branch_cond = true
+        if entry.op_jalr {
+            op.branch_cond = true;
+        }
+
+        // STORE: res is the memory address = base + offset
+        if entry.op_store {
+            op.res = (log.src1_val as i64 + entry.imm as i64) as u64;
+        }
+
+        // LOAD: res is the memory address = base + offset
+        if entry.op_load {
+            op.res = (log.src1_val as i64 + entry.imm as i64) as u64;
+        }
+
+        // BEQ/BNE: compute is_equal, res (subtraction), branch_cond
+        if entry.op_beq {
+            op.is_equal = log.src1_val == log.src2_val;
+            op.res = log.src1_val.wrapping_sub(log.src2_val);
+            if entry.mp_selector {
+                // BNE: branch if not equal
+                op.branch_cond = log.src1_val != log.src2_val;
+            } else {
+                // BEQ: branch if equal
+                op.branch_cond = log.src1_val == log.src2_val;
+            }
+        }
+
+        // BLT/BGE: compute res (comparison result), branch_cond
+        if entry.op_blt {
+            let lt_result = if entry.signed {
+                (log.src1_val as i64) < (log.src2_val as i64)
+            } else {
+                log.src1_val < log.src2_val
+            };
+            op.res = lt_result as u64;
+            if entry.mp_selector {
+                // BGE/BGEU: branch if NOT less than
+                op.branch_cond = !lt_result;
+            } else {
+                // BLT/BLTU: branch if less than
+                op.branch_cond = lt_result;
+            }
+        }
+
+        op
+    }
+
     /// Compute arg1 from rv1 based on word_instr and signed flags.
     ///
     /// Per spec constraint: arg1[4:] = rv1[2] * (1 - word_instr) + (2^32 - 1) * rv1_sign_bit * signed
@@ -496,338 +600,6 @@ impl CpuOperation {
         lookups
     }
 
-    /// Creates a CpuOperation from an executor Log.
-    ///
-    /// This is the main integration point between the executor and the prover.
-    pub fn from_log(log: &Log, timestamp: u64, instruction: Instruction) -> Self {
-        let mut op = Self {
-            timestamp,
-            pc: log.current_pc,
-            next_pc: log.next_pc,
-            rv1: log.src1_val,
-            rv2: log.src2_val,
-            rvd: log.dst_val,
-            res: log.dst_val, // Default: result is destination value
-            ..Default::default()
-        };
-
-        match instruction {
-            Instruction::Arith {
-                dst,
-                src1,
-                src2,
-                op: arith_op,
-            } => {
-                op.rd = dst as u8;
-                op.rs1 = src1 as u8;
-                op.rs2 = src2 as u8;
-                if dst != 0 {
-                    op.write_register = true;
-                }
-                Self::set_arith_op(&mut op, arith_op, false);
-            }
-
-            Instruction::ArithImm {
-                dst,
-                src,
-                imm,
-                op: arith_op,
-            } => {
-                op.rd = dst as u8;
-                op.rs1 = src as u8;
-                op.rs2 = 0;
-                op.imm = imm as i64 as u64; // Sign extend
-                if dst != 0 {
-                    op.write_register = true;
-                }
-                Self::set_arith_op(&mut op, arith_op, false);
-            }
-
-            Instruction::ArithW {
-                dst,
-                src1,
-                src2,
-                op: arith_op,
-            } => {
-                op.rd = dst as u8;
-                op.rs1 = src1 as u8;
-                op.rs2 = src2 as u8;
-                op.word_instr = true;
-                if dst != 0 {
-                    op.write_register = true;
-                }
-                Self::set_arith_op(&mut op, arith_op, true);
-            }
-
-            Instruction::ArithImmW {
-                dst,
-                src,
-                imm,
-                op: arith_op,
-            } => {
-                op.rd = dst as u8;
-                op.rs1 = src as u8;
-                op.rs2 = 0;
-                op.imm = imm as i64 as u64; // Sign extend
-                op.word_instr = true;
-                if dst != 0 {
-                    op.write_register = true;
-                }
-                Self::set_arith_op(&mut op, arith_op, true);
-            }
-
-            Instruction::JumpAndLink { dst, offset } => {
-                op.op_jalr = true;
-                op.rd = dst as u8;
-                op.imm = offset as i64 as u64;
-                op.branch_cond = true;
-                if dst != 0 {
-                    op.write_register = true;
-                }
-            }
-
-            Instruction::JumpAndLinkRegister { base, dst, offset } => {
-                op.op_jalr = true;
-                op.rd = dst as u8;
-                op.rs1 = base as u8;
-                op.imm = offset as i64 as u64;
-                op.branch_cond = true;
-                if dst != 0 {
-                    op.write_register = true;
-                }
-            }
-
-            Instruction::Store {
-                src,
-                offset,
-                base,
-                width,
-            } => {
-                op.op_store = true;
-                op.rs1 = base as u8;
-                op.rs2 = src as u8;
-                op.imm = offset as i64 as u64;
-                // res is the memory address = base + offset
-                op.res = (log.src1_val as i64 + offset as i64) as u64;
-                Self::set_memory_width(&mut op, width);
-            }
-
-            Instruction::Load {
-                dst,
-                offset,
-                base,
-                width,
-            } => {
-                op.op_load = true;
-                op.rd = dst as u8;
-                op.rs1 = base as u8;
-                op.imm = offset as i64 as u64;
-                // res is the memory address = base + offset
-                op.res = (log.src1_val as i64 + offset as i64) as u64;
-                if dst != 0 {
-                    op.write_register = true;
-                }
-                Self::set_memory_width(&mut op, width);
-                // Set signed flag for sign-extending loads
-                match width {
-                    LoadStoreWidth::Byte | LoadStoreWidth::Half | LoadStoreWidth::Word => {
-                        op.signed = true;
-                    }
-                    _ => {}
-                }
-            }
-
-            Instruction::Branch {
-                src1,
-                src2,
-                cond,
-                offset,
-            } => {
-                op.rs1 = src1 as u8;
-                op.rs2 = src2 as u8;
-                op.imm = offset as i64 as u64;
-                op.is_equal = log.src1_val == log.src2_val;
-
-                match cond {
-                    Comparison::Equal => {
-                        op.op_beq = true;
-                        // BEQ uses SUB constraint: res = arg1 - arg2
-                        op.res = log.src1_val.wrapping_sub(log.src2_val);
-                        op.branch_cond = log.src1_val == log.src2_val;
-                    }
-                    Comparison::NotEqual => {
-                        op.op_beq = true;
-                        op.mp_selector = true; // Inverted
-                        // BNE uses SUB constraint: res = arg1 - arg2
-                        op.res = log.src1_val.wrapping_sub(log.src2_val);
-                        op.branch_cond = log.src1_val != log.src2_val;
-                    }
-                    Comparison::LessThan => {
-                        op.op_blt = true;
-                        op.signed = true;
-                        // BLT uses LT table: res[0] = comparison result, res[1..7] = 0
-                        let lt_result = (log.src1_val as i64) < (log.src2_val as i64);
-                        op.res = lt_result as u64;
-                        op.branch_cond = lt_result;
-                    }
-                    Comparison::LessThanUnsigned => {
-                        op.op_blt = true;
-                        // BLTU uses LT table: res[0] = comparison result, res[1..7] = 0
-                        let lt_result = log.src1_val < log.src2_val;
-                        op.res = lt_result as u64;
-                        op.branch_cond = lt_result;
-                    }
-                    Comparison::GreaterOrEqual => {
-                        op.op_blt = true;
-                        op.signed = true;
-                        op.mp_selector = true; // Inverted
-                        // BGE uses LT table with inversion: res[0] = arg1 < arg2
-                        let lt_result = (log.src1_val as i64) < (log.src2_val as i64);
-                        op.res = lt_result as u64;
-                        op.branch_cond = !lt_result; // Inverted: >= means NOT <
-                    }
-                    Comparison::GreaterOrEqualUnsigned => {
-                        op.op_blt = true;
-                        op.mp_selector = true; // Inverted
-                        // BGEU uses LT table with inversion: res[0] = arg1 < arg2
-                        let lt_result = log.src1_val < log.src2_val;
-                        op.res = lt_result as u64;
-                        op.branch_cond = !lt_result; // Inverted: >= means NOT <
-                    }
-                }
-            }
-
-            Instruction::LoadUpperImm { dst, imm } => {
-                op.op_add = true;
-                op.rd = dst as u8;
-                op.rs1 = 0;
-                op.rs2 = 0;
-                // LUI immediate must be sign-extended to 64 bits (matches executor)
-                op.imm = (imm as i32) as i64 as u64;
-                if dst != 0 {
-                    op.write_register = true;
-                }
-            }
-
-            Instruction::AddUpperImmToPc { dst, imm } => {
-                op.op_add = true;
-                op.rd = dst as u8;
-                // AUIPC immediate must be sign-extended to 64 bits (matches executor)
-                op.imm = (imm as i32) as i64 as u64;
-                op.rv1 = log.current_pc;
-                if dst != 0 {
-                    op.write_register = true;
-                }
-            }
-
-            Instruction::CSR { .. } => {
-                // CSR instructions not yet supported in prover
-                // TODO: Add CSR support
-            }
-
-            Instruction::EcallEbreak => {
-                // Determine if ECALL or EBREAK based on context
-                // For now, default to ECALL
-                op.op_ecall = true;
-            }
-        }
-
-        op
-    }
-
-    /// Helper to set ALU operation flags based on ArithOp.
-    fn set_arith_op(op: &mut Self, arith_op: ArithOp, is_word: bool) {
-        match arith_op {
-            ArithOp::Add => {
-                op.op_add = true;
-            }
-            ArithOp::Sub => {
-                op.op_sub = true;
-            }
-            ArithOp::Xor => op.op_xor = true,
-            ArithOp::Or => op.op_or = true,
-            ArithOp::And => op.op_and = true,
-            ArithOp::ShiftLeftLogical => {
-                op.op_shift = true;
-                // mp_selector = 0 for left shift
-            }
-            ArithOp::ShiftRightLogical => {
-                op.op_shift = true;
-                op.mp_selector = true; // mp_selector = 1 for right shift
-            }
-            ArithOp::ShiftRightArith => {
-                op.op_shift = true;
-                op.mp_selector = true;
-                op.signed = true;
-            }
-            ArithOp::SetLessThan => {
-                op.op_slt = true;
-                op.signed = true;
-            }
-            ArithOp::SetLessThanU => {
-                op.op_slt = true;
-            }
-            ArithOp::Mul => {
-                op.op_mul = true;
-                op.mp_selector = true;
-                if !is_word {
-                    op.signed = true;
-                }
-            }
-            ArithOp::MulHigh => {
-                op.op_mul = true;
-                op.muldiv_selector = true;
-                op.signed = true;
-            }
-            ArithOp::MulHighSignedUnsigned => {
-                op.op_mul = true;
-                op.muldiv_selector = true;
-                op.mp_selector = true;
-                op.signed = true;
-            }
-            ArithOp::MulHighUnsigned => {
-                op.op_mul = true;
-                op.muldiv_selector = true;
-            }
-            ArithOp::Div => {
-                op.op_divrem = true;
-                op.signed = true;
-            }
-            ArithOp::DivUnsigned => {
-                op.op_divrem = true;
-            }
-            ArithOp::Remainder => {
-                op.op_divrem = true;
-                op.muldiv_selector = true;
-                op.signed = true;
-            }
-            ArithOp::RemainderUnsigned => {
-                op.op_divrem = true;
-                op.muldiv_selector = true;
-            }
-        }
-    }
-
-    /// Helper to set memory width flags.
-    fn set_memory_width(op: &mut Self, width: LoadStoreWidth) {
-        match width {
-            LoadStoreWidth::Byte | LoadStoreWidth::ByteUnsigned => {
-                // 1 byte - no flags set
-            }
-            LoadStoreWidth::Half | LoadStoreWidth::HalfUnsigned => {
-                op.memory_2bytes = true;
-            }
-            LoadStoreWidth::Word | LoadStoreWidth::WordUnsigned => {
-                op.memory_2bytes = true;
-                op.memory_4bytes = true;
-            }
-            LoadStoreWidth::DoubleWord => {
-                op.memory_2bytes = true;
-                op.memory_4bytes = true;
-                op.memory_8bytes = true;
-            }
-        }
-    }
 }
 
 // =========================================================================
@@ -860,7 +632,40 @@ pub fn generate_cpu_trace(
     let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
 
     for (row_idx, op) in operations.iter().enumerate() {
-        let base = row_idx * cols::NUM_COLUMNS;
+        write_cpu_row(&mut data, row_idx, op);
+    }
+
+    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+}
+
+/// Creates an empty CPU trace table with the given number of rows.
+///
+/// Use `write_cpu_row` to populate rows. The caller must ensure all rows
+/// are written before using the trace.
+pub fn create_cpu_trace(num_rows: usize) -> Vec<FE> {
+    assert!(
+        num_rows >= 4,
+        "CPU trace requires at least 4 rows, got {}",
+        num_rows
+    );
+    assert!(
+        num_rows.is_power_of_two(),
+        "CPU trace requires power-of-2 rows, got {}",
+        num_rows
+    );
+    vec![FE::zero(); num_rows * cols::NUM_COLUMNS]
+}
+
+/// Finalizes a CPU trace data vector into a TraceTable.
+pub fn finalize_cpu_trace(data: Vec<FE>) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+}
+
+/// Writes a single CPU operation to a row in the trace data.
+///
+/// This is the streaming-friendly version that writes directly to pre-allocated data.
+pub fn write_cpu_row(data: &mut [FE], row_idx: usize, op: &CpuOperation) {
+    let base = row_idx * cols::NUM_COLUMNS;
 
         // Input columns
         data[base + cols::TIMESTAMP] = FE::from(op.timestamp);
@@ -951,33 +756,9 @@ pub fn generate_cpu_trace(
             data[base + cols::RES[i]] = FE::from((res >> (i * 8)) & 0xFF);
         }
 
-        // Branch columns
-        data[base + cols::IS_EQUAL] = FE::from(op.is_equal as u64);
-        data[base + cols::BRANCH_COND] = FE::from(op.branch_cond as u64);
-    }
-
-    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
-}
-
-/// Generates the CPU trace table directly from executor logs.
-///
-/// This is a convenience function that converts logs to CpuOperations
-/// and then generates the trace.
-///
-/// Returns an error if an instruction is not found for a PC.
-/// Panics if logs.len() is not a power of 2 >= 4.
-pub fn generate_cpu_trace_from_logs(
-    logs: &[Log],
-    instructions: &U64HashMap<Instruction>,
-) -> Result<TraceTable<GoldilocksField, GoldilocksExtension>, ProverError> {
-    let mut operations = Vec::with_capacity(logs.len());
-    for (i, log) in logs.iter().enumerate() {
-        let instruction = *instructions
-            .get(&log.current_pc)
-            .ok_or(ProverError::MissingInstruction(log.current_pc))?;
-        operations.push(CpuOperation::from_log(log, (i as u64) * 4, instruction));
-    }
-    Ok(generate_cpu_trace(&operations))
+    // Branch columns
+    data[base + cols::IS_EQUAL] = FE::from(op.is_equal as u64);
+    data[base + cols::BRANCH_COND] = FE::from(op.branch_cond as u64);
 }
 
 /// Collects all Bitwise lookups from a list of CPU operations.
@@ -990,23 +771,6 @@ pub fn collect_bitwise_lookups(
         .iter()
         .flat_map(|op| op.collect_bitwise_lookups())
         .collect()
-}
-
-/// Collects all Bitwise lookups from executor logs.
-///
-/// Convenience function that converts logs to operations and collects lookups.
-pub fn collect_bitwise_lookups_from_logs(
-    logs: &[Log],
-    instructions: &U64HashMap<Instruction>,
-) -> Result<Vec<(super::bitwise::BitwiseLookup, u8, u8, u8)>, ProverError> {
-    let mut operations = Vec::with_capacity(logs.len());
-    for (i, log) in logs.iter().enumerate() {
-        let instruction = *instructions
-            .get(&log.current_pc)
-            .ok_or(ProverError::MissingInstruction(log.current_pc))?;
-        operations.push(CpuOperation::from_log(log, (i as u64) * 4, instruction));
-    }
-    Ok(collect_bitwise_lookups(&operations))
 }
 
 // =========================================================================

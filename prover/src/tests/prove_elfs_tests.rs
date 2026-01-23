@@ -33,9 +33,12 @@ use crate::tables::bitwise::{
     generate_bitwise_trace, update_multiplicities,
 };
 use crate::tables::cpu::{CpuOperation, bus_interactions as cpu_bus_interactions};
+use crate::tables::decode::DecodeEntry;
 use crate::tables::lt::{LtOperation, bus_interactions as lt_bus_interactions, generate_lt_trace};
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
+
+use std::collections::HashMap;
 
 type F = GoldilocksField;
 type E = GoldilocksExtension;
@@ -59,11 +62,17 @@ fn collect_bitwise_lookups(
     logs: &[executor::vm::logs::Log],
     instructions: &U64HashMap<Instruction>,
 ) -> Vec<(BitwiseLookup, u8, u8, u8)> {
+    // Build decode entries map
+    let decode_entries: HashMap<u64, DecodeEntry> = instructions
+        .iter()
+        .map(|(&pc, &instr)| (pc, DecodeEntry::from_instruction(pc, instr)))
+        .collect();
+
     logs.iter()
         .enumerate()
         .flat_map(|(i, log)| {
-            let instruction = *instructions.get(&log.current_pc).unwrap();
-            let op = CpuOperation::from_log(log, (i as u64) * 4, instruction);
+            let decode_entry = decode_entries.get(&log.current_pc).unwrap();
+            let op = CpuOperation::from_decode_entry(decode_entry, log, (i as u64) * 4);
             op.collect_bitwise_lookups()
         })
         .collect()
@@ -205,96 +214,22 @@ fn collect_lt_lookups_from_logs(
     logs: &[executor::vm::logs::Log],
     instructions: &U64HashMap<Instruction>,
 ) -> Vec<LtOperation> {
-    use executor::vm::instruction::decoding::{ArithOp, Comparison};
+    // Build decode entries map
+    let decode_entries: HashMap<u64, DecodeEntry> = instructions
+        .iter()
+        .map(|(&pc, &instr)| (pc, DecodeEntry::from_instruction(pc, instr)))
+        .collect();
 
     let mut lookups = Vec::new();
 
-    for log in logs {
-        let instruction = *instructions.get(&log.current_pc).unwrap();
+    for (i, log) in logs.iter().enumerate() {
+        let decode_entry = decode_entries.get(&log.current_pc).unwrap();
+        let op = CpuOperation::from_decode_entry(decode_entry, log, (i as u64) * 4);
 
-        let is_slt = matches!(
-            &instruction,
-            Instruction::Arith {
-                op: ArithOp::SetLessThan,
-                ..
-            } | Instruction::Arith {
-                op: ArithOp::SetLessThanU,
-                ..
-            } | Instruction::ArithImm {
-                op: ArithOp::SetLessThan,
-                ..
-            } | Instruction::ArithImm {
-                op: ArithOp::SetLessThanU,
-                ..
-            } | Instruction::ArithW {
-                op: ArithOp::SetLessThan,
-                ..
-            } | Instruction::ArithW {
-                op: ArithOp::SetLessThanU,
-                ..
-            } | Instruction::ArithImmW {
-                op: ArithOp::SetLessThan,
-                ..
-            } | Instruction::ArithImmW {
-                op: ArithOp::SetLessThanU,
-                ..
-            }
-        );
-
-        let is_blt = matches!(
-            &instruction,
-            Instruction::Branch {
-                cond: Comparison::LessThan,
-                ..
-            } | Instruction::Branch {
-                cond: Comparison::LessThanUnsigned,
-                ..
-            } | Instruction::Branch {
-                cond: Comparison::GreaterOrEqual,
-                ..
-            } | Instruction::Branch {
-                cond: Comparison::GreaterOrEqualUnsigned,
-                ..
-            }
-        );
-
-        if is_slt || is_blt {
-            // Determine signed flag
-            let signed = matches!(
-                &instruction,
-                Instruction::Arith {
-                    op: ArithOp::SetLessThan,
-                    ..
-                } | Instruction::ArithImm {
-                    op: ArithOp::SetLessThan,
-                    ..
-                } | Instruction::ArithW {
-                    op: ArithOp::SetLessThan,
-                    ..
-                } | Instruction::ArithImmW {
-                    op: ArithOp::SetLessThan,
-                    ..
-                } | Instruction::Branch {
-                    cond: Comparison::LessThan,
-                    ..
-                } | Instruction::Branch {
-                    cond: Comparison::GreaterOrEqual,
-                    ..
-                }
-            );
-
-            // Get arg1 and arg2 values
-            // For SLT: arg1 = rv1, arg2 = rv2 or imm
-            // For BLT: arg1 = rv1, arg2 = rv2
-            let arg1 = log.src1_val;
-            let arg2 = match &instruction {
-                Instruction::ArithImm { imm, .. } | Instruction::ArithImmW { imm, .. } => {
-                    *imm as i64 as u64
-                }
-                _ => log.src2_val,
-            };
-
-            lookups.push(LtOperation::new(arg1, arg2, signed));
+        if op.op_slt || op.op_blt {
+            let arg1 = op.compute_arg1();
+            let arg2 = op.compute_arg2();
+            lookups.push(LtOperation::new(arg1, arg2, op.signed));
         }
     }
 
@@ -439,8 +374,6 @@ fn test_cpu_only_no_bus() {
 // The verifier expects the full deterministic 2^20 row public table.
 // A minimal table would require the prover to reveal all values,
 // making the proof size unacceptably large.
-
-use std::collections::HashMap;
 
 /// Generates a minimal bitwise trace containing only the rows needed for the given lookups.
 ///

@@ -12,6 +12,8 @@
 //! // Use traces.cpu, traces.bitwise, traces.lt
 //! ```
 
+use std::collections::HashMap;
+
 use executor::vm::instruction::decoding::Instruction;
 use executor::vm::logs::Log;
 use executor::vm::memory::U64HashMap;
@@ -19,7 +21,7 @@ use stark::trace::TraceTable;
 
 use super::bitwise;
 use super::cpu::{self, CpuOperation};
-use super::decode;
+use super::decode::{self, DecodeEntry};
 use super::lt::{self, LtOperation};
 use super::types::{GoldilocksExtension, GoldilocksField};
 use crate::ProverError;
@@ -41,30 +43,47 @@ pub struct Traces {
 
 impl Traces {
     /// Generates all traces from execution logs.
+    ///
+    /// Uses streaming processing to minimize memory usage - CPU rows are written
+    /// directly during log iteration without collecting all CpuOperations first.
     pub fn from_logs(
         logs: &[Log],
         instructions: U64HashMap<Instruction>,
     ) -> Result<Self, ProverError> {
-        // Generate DECODE trace first from instructions (MU=0 initially)
+        // Build DecodeEntry map from instructions (single source of truth for decode logic)
+        let decode_entries: HashMap<u64, DecodeEntry> = instructions
+            .iter()
+            .map(|(&pc, &instr)| (pc, DecodeEntry::from_instruction(pc, instr)))
+            .collect();
+
+        // Generate DECODE trace from instructions (MU=0 initially)
         let (mut decode, pc_to_row) = decode::generate_decode_trace(&instructions);
 
         // Generate BITWISE precomputed table (MU=0 initially)
         let mut bitwise = bitwise::generate_bitwise_trace();
 
-        // Pre-allocate collectors for log processing
-        let mut cpu_ops = Vec::with_capacity(logs.len());
+        // Pre-allocate CPU trace data for streaming writes
+        let mut cpu_data = cpu::create_cpu_trace(logs.len());
+
+        // Pre-allocate collectors for lookups (smaller than storing all CpuOperations)
         let mut bitwise_lookups = Vec::with_capacity(logs.len() * 4);
         let mut lt_ops = Vec::with_capacity(logs.len() / 10 + 1);
         let mut decode_lookups = Vec::with_capacity(logs.len());
 
-        // Process logs to build CPU trace and collect lookups
+        // Process logs: stream CPU rows directly, collect only lookups
         for (i, log) in logs.iter().enumerate() {
             let timestamp = (i as u64) * 4;
-            let instruction = instructions
+
+            // Look up pre-computed DecodeEntry (reuses decode logic from DECODE table)
+            let decode_entry = decode_entries
                 .get(&log.current_pc)
-                .copied()
                 .ok_or(ProverError::MissingInstruction(log.current_pc))?;
-            let op = CpuOperation::from_log(log, timestamp, instruction);
+
+            // Create CpuOperation from DecodeEntry + runtime values
+            let op = CpuOperation::from_decode_entry(decode_entry, log, timestamp);
+
+            // Write CPU row directly (streaming - op not stored)
+            cpu::write_cpu_row(&mut cpu_data, i, &op);
 
             // Collect bitwise lookups from this operation
             bitwise_lookups.extend(op.collect_bitwise_lookups());
@@ -79,11 +98,11 @@ impl Traces {
             // Collect PC for DECODE lookups
             decode_lookups.push(log.current_pc);
 
-            cpu_ops.push(op);
+            // op is dropped here - no accumulation in memory
         }
 
-        // Generate CPU trace
-        let cpu = cpu::generate_cpu_trace(&cpu_ops);
+        // Finalize CPU trace
+        let cpu = cpu::finalize_cpu_trace(cpu_data);
 
         // Update BITWISE multiplicities
         bitwise::update_multiplicities(&mut bitwise, &bitwise_lookups);

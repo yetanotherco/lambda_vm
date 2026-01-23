@@ -49,16 +49,16 @@ fn make_instructions(logs: &[Log], instrs: &[Instruction]) -> U64HashMap<Instruc
 }
 
 #[test]
-#[should_panic(expected = "CPU trace requires at least 4 operations")]
+#[should_panic(expected = "CPU trace requires at least 4 rows")]
 fn test_empty_logs() {
-    // CPU trace cannot be padded - caller must provide valid power-of-2 operations
+    // CPU trace cannot be padded - caller must provide valid power-of-2 rows
     let _traces = Traces::from_logs(&[], U64HashMap::default()).unwrap();
 }
 
 #[test]
-#[should_panic(expected = "CPU trace requires at least 4 operations")]
+#[should_panic(expected = "CPU trace requires at least 4 rows")]
 fn test_single_log() {
-    // CPU trace cannot be padded - caller must provide valid power-of-2 operations
+    // CPU trace cannot be padded - caller must provide valid power-of-2 rows
     let logs = vec![make_add_log(0x1000, 10, 20, 30)];
     let instrs = vec![Instruction::Arith {
         dst: 1,
@@ -90,9 +90,9 @@ fn test_power_of_two_logs() {
 }
 
 #[test]
-#[should_panic(expected = "CPU trace requires power-of-2 operations")]
+#[should_panic(expected = "CPU trace requires power-of-2 rows")]
 fn test_padding_to_power_of_two() {
-    // CPU trace cannot be padded - caller must provide valid power-of-2 operations
+    // CPU trace cannot be padded - caller must provide valid power-of-2 rows
     let logs: Vec<Log> = (0..5)
         .map(|i| make_add_log(0x1000 + i * 4, i, i, i * 2))
         .collect();
