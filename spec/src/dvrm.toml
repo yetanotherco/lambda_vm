@@ -177,7 +177,6 @@ ref = "dvrm:c:sign_r_equals_sign_n"
 [[constraint_groups]]
 name = "abs_diff"
 
-# TODO: alternatively, we could set `1-div_by_zero` as the output, and use a different multiplicity.
 [[constraints.abs_diff]]
 kind = "interaction"
 tag = "LT"
@@ -265,8 +264,6 @@ constraint = "$not#`signed` and not#`msb_n` => not#`msb_r`$"
 poly = ["*", ["not", "signed"], ["not", "msb_n"], "msb_r"]
 ref = "dvrm:c:unsigned_implies_msb_r_lt_msb_n"
 
-# TODO: we're going to have to do something interesting to prevent this from
-# interfering with padding.
 [[constraints.n_sub_r]]
 kind = "interaction"
 tag = "MSB16"
