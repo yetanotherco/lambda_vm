@@ -1,13 +1,16 @@
 use std::{cmp::Ordering, fmt::Debug};
 
-use crate::vm::{
-    instruction::{
-        decoding::{Instruction, InstructionError},
-        execution::ExecutionError,
+use crate::{
+    elf::Elf,
+    vm::{
+        instruction::{
+            decoding::{Instruction, InstructionError},
+            execution::ExecutionError,
+        },
+        logs::Log,
+        memory::{Memory, MemoryError, U64HashMap},
+        registers::Registers,
     },
-    logs::Log,
-    memory::{Memory, MemoryError, U64HashMap},
-    registers::Registers,
 };
 
 pub struct ReturnValues {
@@ -25,18 +28,17 @@ pub struct ExecutionResult {
 }
 
 pub fn run_program(
-    segments: &[crate::elf::Segment],
-    entrypoint: u64,
+    program: &Elf,
     private_inputs: Vec<u8>,
 ) -> Result<ExecutionResult, ExecutorError> {
     let mut memory = Memory::default();
     memory.store_private_inputs(private_inputs)?;
     // Pre-decode all instructions from executable segments
-    let instruction_cache = InstructionCache::new(segments)?;
-    load_program(segments, &mut memory)?;
+    let instruction_cache = InstructionCache::new(&program.data)?;
+    load_program(&program.data, &mut memory)?;
     let (return_values, logs) = run_from_entrypoint(
         &mut memory,
-        entrypoint,
+        program.entry_point,
         &instruction_cache,
         instruction_cache.instruction_count(),
     )?;

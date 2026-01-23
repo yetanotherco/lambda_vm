@@ -49,8 +49,7 @@ fn run_asm_elf(name: &str) -> (Vec<executor::vm::logs::Log>, U64HashMap<Instruct
     );
     let elf_data = std::fs::read(&path).expect("Failed to read ELF");
     let program = Elf::load(&elf_data).expect("Failed to load ELF");
-    let result =
-        run_program(&program.data, program.entry_point, vec![]).expect("Failed to run program");
+    let result = run_program(&program, vec![]).expect("Failed to run program");
     (result.logs, result.instructions)
 }
 

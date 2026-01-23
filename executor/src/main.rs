@@ -9,6 +9,6 @@ fn main() -> Result<(), ExecutorError> {
     let elf_data = std::fs::read("./program_artifacts/rust/ethrex.elf").unwrap();
     let inputs = fs::read("tests/ethrex_hoodi.bin").unwrap();
     let program = Elf::load(&elf_data).unwrap();
-    run_program(&program.data, program.entry_point, inputs)?;
+    run_program(&program, inputs)?;
     Ok(())
 }
