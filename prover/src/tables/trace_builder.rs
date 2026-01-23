@@ -12,7 +12,10 @@
 //! // Use traces.cpu, traces.bitwise, traces.lt
 //! ```
 
+use executor::vm::instruction;
+use executor::vm::instruction::decoding::Instruction;
 use executor::vm::logs::Log;
+use executor::vm::memory::U64HashMap;
 use stark::trace::TraceTable;
 
 use super::bitwise;
@@ -34,7 +37,7 @@ pub struct Traces {
 
 impl Traces {
     /// Generates all traces from execution logs in a single pass.
-    pub fn from_logs(logs: &[Log]) -> Self {
+    pub fn from_logs(logs: &[Log], instructions: U64HashMap<Instruction>) -> Self {
         // Pre-allocate collectors
         let mut cpu_ops = Vec::with_capacity(logs.len());
         let mut bitwise_lookups = Vec::with_capacity(logs.len() * 4);
@@ -43,7 +46,10 @@ impl Traces {
         // Single pass over logs
         for (i, log) in logs.iter().enumerate() {
             let timestamp = (i as u64) * 4;
-            let op = CpuOperation::from_log(log, timestamp);
+            let instruction = instructions
+                .get(&log.current_pc)
+                .cloned().expect("");
+            let op = CpuOperation::from_log(log, timestamp, instruction);
 
             // Collect bitwise lookups from this operation
             bitwise_lookups.extend(op.collect_bitwise_lookups());
