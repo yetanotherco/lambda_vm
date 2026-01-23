@@ -21,7 +21,7 @@ NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-TMP_DIR="$SCRIPT_DIR/.bench_tmp"
+TMP_DIR="/tmp/bench_compare"
 BENCH_ARTIFACTS_DIR="$ROOT_DIR/executor/program_artifacts/bench"
 
 CURRENT_BRANCH=$(git -C "$ROOT_DIR" rev-parse --abbrev-ref HEAD)
@@ -72,7 +72,6 @@ for branch in "$BASE_BRANCH" "$COMPARE_BRANCH"; do
     git -C "$ROOT_DIR" checkout "$branch"
     echo -e "${GREEN}Building CLI for $branch...${NC}"
     cargo build --release -p cli --manifest-path "$ROOT_DIR/Cargo.toml"
-    mkdir -p "$TMP_DIR"
     cp "$ROOT_DIR/target/release/cli" "$TMP_DIR/cli-$bin_name"
 done
 
