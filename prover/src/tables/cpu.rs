@@ -719,16 +719,17 @@ impl CpuOperation {
                     op.write_register = true;
                 }
             }
-
             Instruction::CSR { .. } => {
                 // CSR instructions not yet supported in prover
                 // TODO: Add CSR support
             }
-
             Instruction::EcallEbreak => {
                 // Determine if ECALL or EBREAK based on context
                 // For now, default to ECALL
                 op.op_ecall = true;
+            }
+            Instruction::Fence => {
+                // Fence instruction not supported by executor
             }
         }
 

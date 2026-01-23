@@ -9,6 +9,7 @@ const JUMP_AND_LINK_OPCODE: u32 = 0b1101111;
 const LOAD_UPPER_IMM_OPCODE: u32 = 0b0110111;
 const ADD_UPPER_IMM_TO_PC: u32 = 0b0010111;
 const SYSTEM_OPCODE: u32 = 0b1110011;
+const FENCE_OPCODE: u32 = 0b0001111; // 0x0F - FENCE, FENCE.I
 // RV64 specific opcodes
 const ARITH_IMM_32_OPCODE: u32 = 0b0011011; // 0x1B - ADDIW, SLLIW, SRLIW, SRAIW
 const ARITH_32_OPCODE: u32 = 0b0111011; // 0x3B - ADDW, SUBW, SLLW, SRLW, SRAW, MULW, etc.
@@ -28,6 +29,7 @@ pub enum Opcode {
     // RV64 specific
     ArithImm32, // OP-IMM-32: W-suffix immediate instructions
     Arith32,    // OP-32: W-suffix register instructions
+    Fence,
 }
 
 impl TryFrom<u32> for Opcode {
@@ -45,6 +47,7 @@ impl TryFrom<u32> for Opcode {
             LOAD_UPPER_IMM_OPCODE => Opcode::LoadUpperImm,
             ADD_UPPER_IMM_TO_PC => Opcode::AddUpperImmToPc,
             SYSTEM_OPCODE => Opcode::System,
+            FENCE_OPCODE => Opcode::Fence,
             ARITH_IMM_32_OPCODE => Opcode::ArithImm32,
             ARITH_32_OPCODE => Opcode::Arith32,
             _ => return Err(InstructionError::UnknownOpcode(value)),
@@ -69,7 +72,8 @@ impl Opcode {
             | Opcode::ArithImm32
             | Opcode::Load
             | Opcode::JumpAndLinkRegister
-            | Opcode::System => InstructionFormat::I,
+            | Opcode::System
+            | Opcode::Fence => InstructionFormat::I,
             Opcode::Store => InstructionFormat::S,
             Opcode::Branch => InstructionFormat::B,
             Opcode::JumpAndLink => InstructionFormat::J,
@@ -234,6 +238,7 @@ pub enum Instruction {
         op: CsrOp,
     },
     EcallEbreak,
+    Fence,
 }
 
 const OPCODE_MASK: u32 = 0x0000007f;
@@ -493,6 +498,10 @@ fn parse_i_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, 
                 }
                 _ => return Err(InstructionError::UnknownOpcodeFuncIdentifier(opcode, func3)),
             }
+        }
+        Opcode::Fence => {
+            // FENCE and FENCE.I instructions - we parse them but don't support execution
+            Instruction::Fence
         }
         _ => return Err(InstructionError::InvalidInstruction),
     })

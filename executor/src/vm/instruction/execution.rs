@@ -334,6 +334,9 @@ impl Instruction {
                     dst_val: 0,
                 }
             }
+            Instruction::Fence => {
+                return Err(ExecutionError::UnsupportedInstruction("FENCE"));
+            }
         })
     }
 }
@@ -475,4 +478,6 @@ pub enum ExecutionError {
     IncorrectMessage,
     #[error("Invalid W-suffix operation: {0:?}")]
     InvalidWSuffixOperation(ArithOp),
+    #[error("Unsupported instruction: {0}")]
+    UnsupportedInstruction(&'static str),
 }
