@@ -15,7 +15,7 @@ fn test_inv_2_32() {
     // Verify that 2^32 * 2^(-32) = 1 in Goldilocks
     let two_32 = FE::from(SHIFT_32);
     let inv = two_32.inv().expect("Should be invertible");
-    let product = &two_32 * &inv;
+    let product = two_32 * inv;
     assert_eq!(product, FE::one());
 }
 
@@ -66,7 +66,7 @@ fn test_is_bit_formula_valid_zero() {
     // When X = 0: cond * 0 * 1 = 0 ✓
     let cond = FE::one();
     let x = FE::zero();
-    let result = &cond * &x * (FE::one() - &x);
+    let result = cond * x * (FE::one() - x);
     assert_eq!(result, FE::zero());
 }
 
@@ -76,7 +76,7 @@ fn test_is_bit_formula_valid_one() {
     // When X = 1: cond * 1 * 0 = 0 ✓
     let cond = FE::one();
     let x = FE::one();
-    let result = &cond * &x * (FE::one() - &x);
+    let result = cond * x * (FE::one() - x);
     assert_eq!(result, FE::zero());
 }
 
@@ -86,7 +86,7 @@ fn test_is_bit_formula_invalid_two() {
     // When X = 2: cond * 2 * (-1) = -2 ≠ 0 ✗
     let cond = FE::one();
     let x = FE::from(2u64);
-    let result = &cond * &x * (FE::one() - &x);
+    let result = cond * x * (FE::one() - x);
     assert_ne!(result, FE::zero());
 }
 
@@ -96,7 +96,7 @@ fn test_is_bit_formula_cond_zero() {
     // When cond = 0: 0 * X * (1 - X) = 0 always ✓
     let cond = FE::zero();
     let x = FE::from(42u64); // Any invalid value
-    let result = &cond * &x * (FE::one() - &x);
+    let result = cond * x * (FE::one() - x);
     assert_eq!(result, FE::zero());
 }
 
@@ -112,7 +112,7 @@ fn test_carry_computation_no_carry() {
     let sum_lo = FE::from(300u64); // 100 + 200 = 300
 
     let inv_2_32 = FE::from(SHIFT_32).inv().unwrap();
-    let carry = (&lhs_lo + &rhs_lo - &sum_lo) * &inv_2_32;
+    let carry = (lhs_lo + rhs_lo - sum_lo) * inv_2_32;
 
     // carry should be 0
     assert_eq!(carry, FE::zero());
@@ -127,7 +127,7 @@ fn test_carry_computation_with_carry() {
     let sum_lo = FE::from(1u64);
 
     let inv_2_32 = FE::from(SHIFT_32).inv().unwrap();
-    let carry = (&lhs_lo + &rhs_lo - &sum_lo) * &inv_2_32;
+    let carry = (lhs_lo + rhs_lo - sum_lo) * inv_2_32;
 
     // carry should be 1: (0xFFFFFFFF + 2 - 1) / 2^32 = 0x100000000 / 2^32 = 1
     assert_eq!(carry, FE::one());
@@ -137,12 +137,12 @@ fn test_carry_computation_with_carry() {
 fn test_carry_is_bit_valid() {
     // When carry is 0, the IS_BIT constraint is satisfied
     let carry = FE::zero();
-    let result = &carry * (FE::one() - &carry);
+    let result = carry * (FE::one() - carry);
     assert_eq!(result, FE::zero());
 
     // When carry is 1, the IS_BIT constraint is satisfied
     let carry = FE::one();
-    let result = &carry * (FE::one() - &carry);
+    let result = carry * (FE::one() - carry);
     assert_eq!(result, FE::zero());
 }
 
@@ -154,7 +154,7 @@ fn test_carry_boundary_just_below() {
     let sum_lo = FE::from(0xFFFFFFFFu64); // 2^32 - 1
 
     let inv_2_32 = FE::from(SHIFT_32).inv().unwrap();
-    let carry = (&lhs_lo + &rhs_lo - &sum_lo) * &inv_2_32;
+    let carry = (lhs_lo + rhs_lo - sum_lo) * inv_2_32;
 
     assert_eq!(carry, FE::zero());
 }
@@ -167,7 +167,7 @@ fn test_carry_boundary_exactly_2_32() {
     let sum_lo = FE::from(0u64); // (2^31 + 2^31) mod 2^32 = 0
 
     let inv_2_32 = FE::from(SHIFT_32).inv().unwrap();
-    let carry = (&lhs_lo + &rhs_lo - &sum_lo) * &inv_2_32;
+    let carry = (lhs_lo + rhs_lo - sum_lo) * inv_2_32;
 
     assert_eq!(carry, FE::one());
 }
@@ -181,7 +181,7 @@ fn test_carry_max_values() {
     let sum_lo = FE::from(0xFFFFFFFEu64);
 
     let inv_2_32 = FE::from(SHIFT_32).inv().unwrap();
-    let carry = (&lhs_lo + &rhs_lo - &sum_lo) * &inv_2_32;
+    let carry = (lhs_lo + rhs_lo - sum_lo) * inv_2_32;
 
     assert_eq!(carry, FE::one());
 }
@@ -466,7 +466,7 @@ fn test_i64_to_fe_negative() {
 
     // -2 + 2 should equal 0
     let two = FE::from(2u64);
-    assert_eq!(&fe + &two, FE::zero());
+    assert_eq!(fe + two, FE::zero());
 }
 
 #[test]
@@ -477,7 +477,7 @@ fn test_linear_term_negative_coefficient_formula() {
     let coefficient = -FE::from(2u64);
     let col_value = FE::one();
 
-    let result = &constant + &coefficient * &col_value;
+    let result = constant + coefficient * col_value;
     assert_eq!(result, FE::from(2u64));
 }
 
@@ -498,8 +498,8 @@ fn test_dword_hl_repack_formula() {
 
     let shift_16 = FE::from(1u64 << 16);
 
-    let lo = &h0 + &h1 * &shift_16;
-    let hi = &h2 + &h3 * &shift_16;
+    let lo = h0 + h1 * shift_16;
+    let hi = h2 + h3 * shift_16;
 
     assert_eq!(lo, FE::from(0x5678_1234u64));
     assert_eq!(hi, FE::from(0xEF01_ABCDu64));
@@ -533,8 +533,8 @@ fn test_dword_bl_repack_formula() {
         FE::from(1u64 << 24),
     ];
 
-    let lo = &b[0] * &coeffs[0] + &b[1] * &coeffs[1] + &b[2] * &coeffs[2] + &b[3] * &coeffs[3];
-    let hi = &b[4] * &coeffs[0] + &b[5] * &coeffs[1] + &b[6] * &coeffs[2] + &b[7] * &coeffs[3];
+    let lo = b[0] * coeffs[0] + b[1] * coeffs[1] + b[2] * coeffs[2] + b[3] * coeffs[3];
+    let hi = b[4] * coeffs[0] + b[5] * coeffs[1] + b[6] * coeffs[2] + b[7] * coeffs[3];
 
     assert_eq!(lo, FE::from(0x78563412u64));
     assert_eq!(hi, FE::from(0xF0DEBC9Au64));
