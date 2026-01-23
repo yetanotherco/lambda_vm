@@ -63,8 +63,8 @@ name = "lhs_ext"
 type = ["Half", 8]
 desc = "sign-extended value of `lhs`"
 def = {idx="i", polys=[
-    {range=[0, 3], poly=["idx", "lhs", "i"]},
-    {range=[4, 7], poly=["*", 0xFFFF, "lhs_is_negative"]},
+    {iter=[0, 3], poly=["idx", "lhs", "i"]},
+    {iter=[4, 7], poly=["*", 0xFFFF, "lhs_is_negative"]},
 ]}
 
 [[variables.virtual]]
@@ -72,8 +72,8 @@ name = "rhs_ext"
 type = ["Half", 8]
 desc = "sign-extended value of `rhs`"
 def = {idx="i", polys=[
-    {range=[0, 3], poly=["idx", "rhs", "i"]},
-    {range=[4, 7], poly=["*", 0xFFFF, "rhs_is_negative"]},
+    {iter=[0, 3], poly=["idx", "rhs", "i"]},
+    {iter=[4, 7], poly=["*", 0xFFFF, "rhs_is_negative"]},
 ]}
 
 [[variables.virtual]]
@@ -81,8 +81,8 @@ name = "carry"
 type = ["B20", 4]
 desc = "carry values"
 def = {idx="i", polys=[
-    {range=0, poly=["*", ["^", 2, -32], ["-", ["idx", "raw_product", 0], ["idx", "res", 0]]]},
-    {range=[1, 3], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", "raw_product", "i"], ["idx", "carry", ["-", "i", 1]]], ["idx", "res", "i"]]]},
+    {iter=0, poly=["*", ["^", 2, -32], ["-", ["idx", "raw_product", 0], ["idx", "res", 0]]]},
+    {iter=[1, 3], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", "raw_product", "i"], ["idx", "carry", ["-", "i", 1]]], ["idx", "res", "i"]]]},
 ]}
 
 [[variables.virtual]]
