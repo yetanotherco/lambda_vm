@@ -53,6 +53,12 @@ const INITIAL_MEMORY_CAPACITY: usize = 64 * 1024; // 64K entries = 256KB of addr
 #[derive(Debug)]
 pub struct Memory(U64HashMap<[u8; 4]>);
 
+impl Default for Memory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Memory {
     /// Create a new Memory with pre-allocated capacity
     pub fn new() -> Self {
