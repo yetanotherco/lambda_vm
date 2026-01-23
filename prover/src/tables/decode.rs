@@ -177,26 +177,26 @@ impl DecodeEntry {
     /// Packs all flags and register indices into a single 51-bit value.
     ///
     /// Bit layout:
-    /// - [0]:     read_register1
-    /// - [1]:     read_register2
-    /// - [2]:     write_register
-    /// - [3]:     memory_2bytes
-    /// - [4]:     memory_4bytes
-    /// - [5]:     memory_8bytes
-    /// - [6]:     c_type
-    /// - [7]:     signed
-    /// - [8]:     mp_selector
-    /// - [9]:     muldiv_selector
-    /// - [10]:    word_instr
-    /// - [11-26]: ALU flags (16 flags)
-    /// - [27:35]: rs1 (8 bits)
-    /// - [35:43]: rs2 (8 bits)
-    /// - [43:51]: rd (8 bits)
+    /// - bit 0:     read_register1
+    /// - bit 1:     read_register2
+    /// - bit 2:     write_register
+    /// - bit 3:     memory_2bytes
+    /// - bit 4:     memory_4bytes
+    /// - bit 5:     memory_8bytes
+    /// - bit 6:     c_type
+    /// - bit 7:     signed
+    /// - bit 8:     mp_selector
+    /// - bit 9:     muldiv_selector
+    /// - bit 10:    word_instr
+    /// - bits 11-26: ALU flags (16 flags)
+    /// - bits 27-35: rs1 (8 bits)
+    /// - bits 35-43: rs2 (8 bits)
+    /// - bits 43-51: rd (8 bits)
     pub fn packed_decode(&self) -> u64 {
         let mut packed: u64 = 0;
 
         // Control flags (bits 0-10)
-        packed |= (self.read_register1 as u64) << 0;
+        packed |= self.read_register1 as u64;
         packed |= (self.read_register2 as u64) << 1;
         packed |= (self.write_register as u64) << 2;
         packed |= (self.memory_2bytes as u64) << 3;
