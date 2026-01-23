@@ -24,22 +24,71 @@
   .sum()
 }
 
+// Return a list of iterators needed by `obj`. Taken from `iters` or `iter`.
+// Prepend `name` to every iterator, if given.
+#let iters_of(obj, name: none) = {
+  let clean_iter(it) = {
+    let arr = if type(it) == array {
+      it
+    } else {
+      (it,)
+    }
+    if name != none {
+      (name,) + arr
+    } else {
+      arr
+    }
+  }
+
+  (if "iters" in obj {
+    obj.iters
+  } else if "iter" in obj {
+    (obj.iter,)
+  } else {
+    ()
+  }).map(clean_iter)
+}
+
+#let render_chip_padding_table(chip, config) = {
+  // Whether `var` is a preprocessed variable.
+  let is_preprocessed(var) = {
+    config.variables.types
+    .filter(t => t.label == var.type)
+    .all(t => t.at("preprocessed", default: false))
+  }
+
+  let instantiated_vars = config.variables.categories.instantiated.map(c => chip.variables.at(c, default: ())).flatten()
+
+  show figure: set block(breakable: true)
+  figure(table(
+    columns: (auto, auto, auto),
+    inset: 6pt,
+    align: (right + top, center + top, left + top),
+    stroke: none,
+    table.header([*Column*], [], [*Padding value*]),
+    table.hline(stroke: stroke(thickness: 2pt)),
+    ..for var in instantiated_vars {
+      if not is_preprocessed(var) {
+        ([#raw(var.name)], [$:=$], [#expr_to_math(var.pad)],)
+      }
+    },
+  ), caption: [Overview of padding values for #chip.name chip.])
+}
+
 /// Generates a table listing `chip`'s columns.
 #let render_chip_column_table(chip, config) = {
 
-  // Render a definition's range
-  let render_def_range(idx, range) = {
-    if type(range) == array {
-      if range.len() == 1 {
-        [#raw(idx) `=` #range.at(0)]
-      } else if range.len() == 2 {
-        [#raw(idx) #sym.in `[`#range.at(0)`,`#range.at(1)`]`]
+  // Render a definition's iterators
+  let render_def_iters(iters) = {
+    (..for (name, ..args) in iters {
+      if args.len() == 1 {
+        ([#raw(name) = #expr_to_code(args.at(0))],)
+      } else if args.len() == 2 {
+        ([#raw(name) #sym.in `[`#expr_to_code(args.at(0)), #expr_to_code(args.at(1))`]`],)
       } else {
-        assert(false, message: "invalid range: " + repr(range) + repr(range.len()))
+        assert(false, message: "Invalid def range: " + repr(name, ..args))
       }
-    } else {
-      [#raw(idx) `=` #range]
-    }
+    }).join("\n")
   }
 
   // Render definition `def`
@@ -54,25 +103,39 @@
 
     assert(type(def) == dictionary, message: "invalid definition: " + repr(def))
 
+    let idx = def.at("idx", default: none)
+    let gather_indices(obj) = iters_of(obj, name: idx).map(it => it.first())
+    let index_all(expr, indices) = {
+      for index in indices {
+        expr = ("idx", expr, index)
+      }
+      expr
+    }
+
     if "poly" in def {
+      // assert(false, message: repr(index_all(var_name, gather_indices(def))))
       (
         [],
         table.cell(align: right, emph[definition]), 
-        expr_to_math((":=", ("idx", var_name, def.idx), def.poly)),
-        render_def_range(def.idx, def.range)
+        expr_to_math((":=", index_all(var_name, gather_indices(def)), def.poly)),
+        render_def_iters(iters_of(def, name: idx))
       )
     } else if "polys" in def {
+      assert(
+        def.polys.map(gather_indices).dedup().len() == 1,
+        message: "Can only do multiple polys if they're indexed identically"
+      )
       (
         [],
         table.cell(align: right, emph[definition]), 
-        table.cell(colspan: 2, expr_to_math(("idx", var_name, def.idx)))
+        table.cell(colspan: 2, expr_to_math(index_all(var_name, gather_indices(def.polys.first()))))
       )
       for (i, poly) in def.polys.enumerate() {
         (
           [],
           [],              
           table.cell(inset: (left: 1.5em), expr_to_math((":=", "", poly.poly))),
-          render_def_range(def.idx, poly.range), 
+          render_def_iters(iters_of(poly, name: idx)),
         )
       }
     } else {
@@ -121,11 +184,9 @@
   }
 }
 
-// Render a range if `obj` contains one.
-#let interval(obj) = {
-  if "range" in obj {
-    [#raw(obj.range.at(0)) #sym.in` [`#obj.range.at(1)`,`#obj.range.at(2)`]`]
-  } else { return [] }
+// Render the iterators of `obj`.
+#let iters(obj) = {
+  iters_of(obj).map(iter => [#raw(iter.at(0)) #sym.in `[`#expr_to_code(iter.at(1)), #expr_to_code(iter.at(2))`]`]).join("\n")
 }
 
 #let args_interaction_like(input, output) = {
@@ -138,12 +199,13 @@
 
 #let render_chip_assumptions(chip, config) = {
   let tag(assumption) = {
-    let index = if "range" in assumption { "." + assumption.range.at(0) } else { "" }
+    let with_index(x) = ((x,) + iters_of(assumption).map(it => it.at(0))).join(".")
     let lbl = [#chip.name\-A]
-    show figure: (it) => align(left, block[#lbl#context it.counter.display()#index])
+    show figure: (it) => align(left, block[#lbl#context with_index(it.counter.display())])
     cref(assumption)[#figure(kind: chip.name + "assumption", numbering: (i) => [#lbl#i], supplement: [], [])]
   }
 
+  show figure: set block(breakable: true)
   figure(table(
     columns: (auto, auto, 1fr),
     inset: 6pt,
@@ -152,7 +214,7 @@
     table.header([*Tag*], [*Range*], [*Description*]),
     table.hline(stroke: stroke(thickness: 2pt)),
     ..for assumption in chip.assumptions {
-      ([#tag(assumption)], [#interval(assumption)], [#eval(assumption.desc, mode: "markup")])
+      ([#tag(assumption)], [#iters(assumption)], [#eval(assumption.desc, mode: "markup")])
     },
   ), caption: [Assumption overview of #chip.name chip.])
 }
@@ -174,10 +236,10 @@
 
   /// Render the contraint's tag.
   let tag(constraint, group) = {
-    let index = if "range" in constraint { "." + constraint.range.at(0) } else { "" }
+    let with_index(x) = ((x,) + iters_of(constraint).map(it => it.at(0))).join(".")
     let prefix = if "prefix" in group { group.prefix }
     let lbl = [#chip.name\-C#prefix]
-    show figure: (it) => align(left, block[#lbl#context it.counter.display()#index])
+    show figure: (it) => align(left, block[#lbl#context with_index(it.counter.display())])
     cref(constraint)[#figure(kind: chip.name + "constraint", numbering: (i) => [#lbl#i], supplement: [], [])]
   }
 
@@ -230,7 +292,7 @@
 
   // Whether there is at least one constraint with a range
   // This can be used to see whether the "Range" label should be displayed
-  let do_display_range = selected_constraints.values().flatten().any(x => "range" in x)
+  let do_display_range = selected_constraints.values().flatten().any(x => iters_of(x).len() > 0)
 
   // Whether there is at least one constraint with a multiplicity
   // This can be used to see whether the "Multiplicity" label should be displayed
@@ -253,7 +315,7 @@
       for constraint in group_constraints {
         (
           [#tag(constraint, lookup_group(group))],
-          [#interval(constraint)],
+          [#iters(constraint)],
           [#repr_constraint(constraint)],
           [#expr_to_math(constraint.at("multiplicity", default: ""))],
         )

@@ -38,17 +38,17 @@ desc = "Whether to write back to the destination register"
 [[variables.input]]
 name = "memory_2bytes"
 type = "Bit"
-desc = "Whether the memory access (read or write) touches at least 2 bytes"
+desc = "Whether the memory access (read or write) touches exactly 2 bytes"
 
 [[variables.input]]
 name = "memory_4bytes"
 type = "Bit"
-desc = "Whether the memory access (read or write) touches at least 4 bytes"
+desc = "Whether the memory access (read or write) touches exactly 4 bytes"
 
 [[variables.input]]
 name = "memory_8bytes"
 type = "Bit"
-desc = "Whether the memory access (read or write) touches at least 8 bytes"
+desc = "Whether the memory access (read or write) touches exactly 8 bytes"
 
 # TODO: Are there usecases where it's nicer to just have this as a length constant?
 [[variables.input]]
@@ -456,19 +456,19 @@ input = ["rd"]
 kind = "interaction"
 tag = "IS_BYTE"
 input = [["idx", "arg1", "i"]]
-range = ["i", 0, 7]
+iter = ["i", 0, 7]
 
 [[constraints.range]]
 kind = "interaction"
 tag = "IS_BYTE"
 input = [["idx", "arg2", "i"]]
-range = ["i", 0, 7]
+iter = ["i", 0, 7]
 
 [[constraints.range]]
 kind = "interaction"
 tag = "IS_BYTE"
 input = [["idx", "res", "i"]]
-range = ["i", 0, 7]
+iter = ["i", 0, 7]
 
 
 [[constraint_groups]]
@@ -501,7 +501,7 @@ multiplicity = ["+", "SLT", "BLT"]
 kind = "arith"
 constraint = "$#`SLT` + #`BLT` => #`res[i]` = 0$"
 poly = ["*", ["+", "SLT", "BLT"], ["idx", "res", "i"]]
-range = ["i", 1, 7]
+iter = ["i", 1, 7]
 
 [[constraints.alu]]
 kind = "interaction"
@@ -509,7 +509,7 @@ tag = "AND_BYTE"
 input = [["idx", "arg1", "i"], ["idx", "arg2", "i"]]
 output = ["idx", "res", "i"]
 multiplicity = "AND"
-range = ["i", 0, 7]
+iter = ["i", 0, 7]
 
 [[constraints.alu]]
 kind = "interaction"
@@ -517,7 +517,7 @@ tag = "OR_BYTE"
 input = [["idx", "arg1", "i"], ["idx", "arg2", "i"]]
 output = ["idx", "res", "i"]
 multiplicity = "OR"
-range = ["i", 0, 7]
+iter = ["i", 0, 7]
 
 [[constraints.alu]]
 kind = "interaction"
@@ -525,7 +525,7 @@ tag = "XOR_BYTE"
 input = [["idx", "arg1", "i"], ["idx", "arg2", "i"]]
 output = ["idx", "res", "i"]
 multiplicity = "XOR"
-range = ["i", 0, 7]
+iter = ["i", 0, 7]
 
 [[constraints.alu]]
 kind = "interaction"
@@ -538,7 +538,7 @@ multiplicity = "SHIFT"
 kind = "template"
 tag = "ADD"
 input = ["pc", ["cast", ["+", ["*", 2, "c_type_instruction"], ["*", 4, ["not", "c_type_instruction"]]], "DWordWL"]]
-output = ["cast", "DWordWL", "res"]
+output = ["cast", "res", "DWordWL"]
 cond = "JALR"
 
 # TODO: no types available, so no casting yet
@@ -581,8 +581,8 @@ output = "rv2"
 kind = "interaction"
 tag = "MEMW"
 input = [1, ["*", 2, "rd"], "rvd", ["+", "timestamp", 2], 1, 0, 0]
+multiplicity = "write_register"
 
-# TODO: no types available, so no casting yet
 [[constraints.mem]]
 kind = "interaction"
 tag = "LOAD"

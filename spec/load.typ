@@ -3,38 +3,36 @@
 #import "/chip.typ": (
   render_chip_assumptions,
   render_chip_column_table,
-  total_nr_variables,
-  total_nr_instantiated_columns,
-  render_constraint_table,
   render_chip_padding_table,
+  render_constraint_table,
+  total_nr_instantiated_columns,
+  total_nr_variables,
 )
 
 #let config = load_config()
-#let chip = load_chip("src/branch.toml", config)
+#let chip = load_chip("src/load.toml", config)
 
-#show: book-page.with(title: "BRANCH chip")
+#show: book-page.with(title: "LOAD chip")
 
 == Columns
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
 
-The `BRANCH` chip is comprised of #nr_variables variables that are expressed using #nr_columns columns:
+The `LOAD` chip is comprised of #nr_variables variables that are expressed using #nr_columns columns:
 #render_chip_column_table(chip, config)
 
 == Assumptions
-
 #render_chip_assumptions(chip, config)
 
 == Constraints
+The chip delegates the actual memory interaction to the `MEMW` chip,
+and ensures correctness of the requested sign/zero extension.
+The output `res` is correctly range-checked as long as the memory contents are.
 
-#rj[Check correspondence with CPU for passing in `offset` as word or dword]
-We constrain `next_pc` to be $#`base_address` + #`offset`$,
-where `base_address` equals `pc` when $#`JALR` = 0$ and `register` otherwise.
-
-The range checks on `unmasked_low_byte` and `next_pc_low[0]` are performed implicitly by the `AND_BYTE` lookup.
 #render_constraint_table(chip, config, groups: "all")
 
-This chip contributes the following to the lookup argument.
+The chip contributes the following to the lookup argument.
+
 #render_constraint_table(chip, config, groups: "output")
 
 == Padding

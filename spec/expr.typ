@@ -47,16 +47,16 @@
 
 #let PREC = (
   "MIN": -1, // <the most secret heart of any expression>
-  "pow": 0,  // ^
-  "neg": 1,  // Unary -
-  "cast": 2, // cast
-  "mul": 3,  // *
-  "div": 4,  // /
-  "sum": 5,  // Σ
-  "not": 6,  // not
-  "add": 7,  // +
-  "sub": 8,  // -
-  "idx": 9,  // []
+  "idx": 0,  // []
+  "pow": 1,  // ^
+  "neg": 2,  // Unary -
+  "cast": 3, // cast
+  "mul": 4,  // *
+  "div": 5,  // /
+  "sum": 6,  // Σ
+  "not": 7,  // not
+  "add": 8,  // +
+  "sub": 9,  // -
   "eq": 10,   // = and :=
   "MAX": 11, // <the void outside every expression>
 )
@@ -95,7 +95,15 @@
     "not": (pp, rec, e) => cwrap(`1 - ` + rec(PREC.not, e.at(1)), pp < PREC.not),
     "+": (pp, rec, e) => cwrap(e.slice(1).map(rec.with(PREC.add)).join(` + `), pp < PREC.add),
     "sum": (pp, rec, e) => assert(false, message: "sum is unsupported in code."),
-    "*": (pp, rec, e) => cwrap(e.slice(1).map(rec.with(PREC.mul)).join(` ` + sym.dot + ` `), pp < PREC.mul),
+    "*": (pp, rec, e) => {
+      if e.len() == 3 and type(e.at(1)) == int and type(e.at(2)) == str and e.at(2).len() == 1 {
+        // multiplication of a constant with one-letter variable. 
+        // Dropping the "dot"
+        cwrap(e.slice(1).map(rec.with(PREC.mul)).join(``), pp < PREC.mul)
+      } else {
+        cwrap(e.slice(1).map(rec.with(PREC.mul)).join(` ` + sym.dot + ` `), pp < PREC.mul)
+      }
+    },
     "/": (pp, rec, e) => cwrap(rec(PREC.div, e.at(1)), pp < PREC.div) + ` / ` + rec(PREC.div, e.at(2)),
     "^": (pp, rec, e) => {
       assert(type(e.at(1)) == int and type(e.at(2)) == int, message: "Can only exponentiate constants")
@@ -129,10 +137,22 @@
   }
 }
 
+#let flat_idxs(expr) = {
+  if expr.at(0) != "idx" {
+    (expr, ())
+  } else {
+    let (sub, gathered) = flat_idxs(expr.at(1))
+    (sub, gathered + (expr.at(2),))
+  }
+}
+
 // Typeset an expression as math
 #let expr_to_math = make_expr_formatter(
   (
-    "idx": (pp, rec, e) => $#rec(PREC.idx, e.at(1))_(#rec(PREC.idx, e.at(2)))$,
+    "idx": (pp, rec, e) => {
+      let (val, idxs) = flat_idxs(e)
+      $#rec(PREC.idx, val)_(#idxs.map(idx => rec(PREC.idx, idx)).join($, $))$
+    },
     "not": (pp, rec, e) => mwrap($1 - #rec(PREC.not, e.at(1))$, pp < PREC.not),
     "+": (pp, rec, e) => mwrap($#e.slice(1).map(rec.with(PREC.add)).join($+$)$, pp < PREC.add),
     "sum": (pp, rec, e) => {
@@ -153,8 +173,8 @@
     },
     "/": (pp, rec, e) => $#rec(PREC.div, e.at(1)) / #rec(PREC.div, e.at(2))$,
     "^": (pp, rec, e) => {
-      assert(type(e.at(1)) == int and type(e.at(2)) == int, message: "Can only exponentiate constants")
-      $#e.at(1)^#e.at(2)$
+      assert(type(e.at(1)) == int, message: "Can only exponentiate constants")
+      $#e.at(1)^#rec(PREC.MAX, e.at(2))$
     },
     "=": (pp, rec, e) => $#rec(PREC.eq, e.at(1)) = #rec(PREC.eq, e.at(2))$,
     ":=": (pp, rec, e) => $#rec(PREC.eq, e.at(1)) := #rec(PREC.eq, e.at(2))$,
