@@ -25,10 +25,9 @@
 //!
 //! The implementation uses domain separation via the capacity element:
 //! - `hash_single(x)`: domain tag = 1
-//! - `hash(x, y)` / `compress(x, y)`: domain tag = 2
+//! - `hash(x, y)`: domain tag = 2
+//! - `compress(left, right)`: domain tag = 4 (for 4 field elements)
 //! - `hash_many(inputs)`: uses 10* padding (no explicit domain tag)
-//!
-//! This ensures that `hash(a, b) ≠ hash_many([a, b])` due to different constructions.
 //!
 //! # References
 //!
@@ -47,6 +46,9 @@ use goldilocks::{
 
 /// Type alias for Goldilocks field element
 pub type Fp = FieldElement<GoldilocksField>;
+
+/// 128-bit digest type (2 Goldilocks field elements)
+pub type Digest = [Fp; 2];
 
 /// Poseidon2 hash function for Goldilocks field with width 8
 pub struct Poseidon2 {
@@ -220,32 +222,47 @@ impl Poseidon2 {
     }
 
     // ========================================================================
-    // Sponge-based hash functions
+    // Hash functions
     // ========================================================================
 
-    /// Hash two field elements and return a single field element
-    pub fn hash(x: &Fp, y: &Fp) -> Fp {
+    /// Hash a single field element returning 128-bit digest.
+    pub fn hash_single(x: &Fp) -> Digest {
+        let mut hasher = Self::new();
+        hasher.state[0] = *x;
+        // Domain separation: capacity element = 1 (for 1 input)
+        hasher.state[WIDTH - 1] = Fp::from(1u64);
+        hasher.permute();
+        [hasher.state[0], hasher.state[1]]
+    }
+
+    /// Hash two field elements returning 128-bit digest.
+    pub fn hash(x: &Fp, y: &Fp) -> Digest {
         let mut hasher = Self::new();
         hasher.state[0] = *x;
         hasher.state[1] = *y;
-        // Domain separation: set capacity element to 2 (for 2 inputs)
+        // Domain separation: capacity element = 2 (for 2 inputs)
         hasher.state[WIDTH - 1] = Fp::from(2u64);
         hasher.permute();
-        hasher.state[0]
+        [hasher.state[0], hasher.state[1]]
     }
 
-    /// Hash a single field element
-    pub fn hash_single(x: &Fp) -> Fp {
+    /// Compress two 128-bit digests into one (for Merkle tree internal nodes).
+    ///
+    /// Takes two `[Fp; 2]` digests and produces a single `[Fp; 2]` digest.
+    pub fn compress(left: &Digest, right: &Digest) -> Digest {
         let mut hasher = Self::new();
-        hasher.state[0] = *x;
-        // Domain separation: set capacity element to 1 (for 1 input)
-        hasher.state[WIDTH - 1] = Fp::from(1u64);
+        hasher.state[0] = left[0];
+        hasher.state[1] = left[1];
+        hasher.state[2] = right[0];
+        hasher.state[3] = right[1];
+        // Domain separation: capacity element = 4 (for 4 field elements input)
+        hasher.state[WIDTH - 1] = Fp::from(4u64);
         hasher.permute();
-        hasher.state[0]
+        [hasher.state[0], hasher.state[1]]
     }
 
-    /// Hash multiple field elements using sponge construction
-    pub fn hash_many(inputs: &[Fp]) -> Fp {
+    /// Hash multiple field elements using sponge construction, returning 128-bit digest.
+    pub fn hash_many(inputs: &[Fp]) -> Digest {
         let mut hasher = Self::new();
 
         // Pad input with 1 followed by 0s (if necessary)
@@ -264,42 +281,24 @@ impl Poseidon2 {
             hasher.permute();
         }
 
-        // Squeeze phase: return first element
-        hasher.state[0]
+        // Squeeze phase: return first two elements
+        [hasher.state[0], hasher.state[1]]
     }
 
-    /// Compress two digests into one (for Merkle tree internal nodes)
-    pub fn compress(left: &Fp, right: &Fp) -> Fp {
-        Self::hash(left, right)
-    }
-
-    /// Hash a vector of field elements (for Merkle tree leaves).
+    /// Hash a vector of field elements, returning 128-bit digest (for Merkle tree leaves).
     ///
     /// # Behavior
     ///
-    /// - **Empty**: Returns `Fp::zero()` (debug assertion guards against misuse)
-    /// - **Length 1**: Delegates to [`hash_single`](Self::hash_single) (domain tag = 1)
-    /// - **Length 2+**: Delegates to [`hash_many`](Self::hash_many) (10* padding)
-    ///
-    /// # Security Note
-    ///
-    /// Empty input returns a fixed zero value which could collide with valid hash
-    /// outputs. Callers should ensure empty inputs are invalid in their protocol,
-    /// or filter them before calling this function. A debug assertion catches this
-    /// in development builds.
-    ///
-    /// # Construction Discontinuity
-    ///
-    /// Note that length-1 inputs use `hash_single` (with domain tag), while
-    /// length-2+ inputs use `hash_many` (with padding). This is intentional for
-    /// efficiency but means the underlying construction differs by length.
-    pub fn hash_vec(inputs: &[Fp]) -> Fp {
+    /// - **Empty**: Returns `[Fp::zero(); 2]` (debug assertion guards against misuse)
+    /// - **Length 1**: Delegates to [`hash_single`](Self::hash_single)
+    /// - **Length 2+**: Delegates to [`hash_many`](Self::hash_many)
+    pub fn hash_vec(inputs: &[Fp]) -> Digest {
         if inputs.is_empty() {
             debug_assert!(
                 false,
                 "hash_vec called with empty input - this may cause collision with valid hashes"
             );
-            return Fp::zero();
+            return [Fp::zero(); 2];
         }
         if inputs.len() == 1 {
             return Self::hash_single(&inputs[0]);
@@ -363,9 +362,8 @@ mod tests {
         let x = Fp::from(42u64);
         let h = Poseidon2::hash_single(&x);
 
-        // Should not be zero or equal to input
-        assert_ne!(h, Fp::zero());
-        assert_ne!(h, x);
+        // Should not be zero
+        assert_ne!(h, [Fp::zero(); 2]);
     }
 
     #[test]
@@ -374,7 +372,7 @@ mod tests {
         let h = Poseidon2::hash_many(&inputs);
 
         // Should produce a valid hash
-        assert_ne!(h, Fp::zero());
+        assert_ne!(h, [Fp::zero(); 2]);
 
         // Same inputs should produce same hash
         let h2 = Poseidon2::hash_many(&inputs);
@@ -392,14 +390,14 @@ mod tests {
 
     #[test]
     fn test_poseidon2_compress() {
-        let left = Fp::from(100u64);
-        let right = Fp::from(200u64);
+        let left = [Fp::from(100u64), Fp::from(101u64)];
+        let right = [Fp::from(200u64), Fp::from(201u64)];
 
-        let compressed = Poseidon2::compress(&left, &right);
+        let h1 = Poseidon2::compress(&left, &right);
+        let h2 = Poseidon2::compress(&left, &right);
 
-        // Same as hash(left, right)
-        let hashed = Poseidon2::hash(&left, &right);
-        assert_eq!(compressed, hashed);
+        assert_eq!(h1, h2);
+        assert_ne!(h1, [Fp::zero(); 2]);
     }
 
     #[test]
@@ -601,8 +599,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Domain separation tests (HIGH PRIORITY)
-    // These verify that different hash constructions produce different outputs
+    // Domain separation tests
     // ========================================================================
 
     #[test]
@@ -657,8 +654,8 @@ mod tests {
     #[test]
     fn test_compress_non_commutative() {
         // compress(a, b) != compress(b, a) - important for Merkle tree security
-        let a = Fp::from(100u64);
-        let b = Fp::from(200u64);
+        let a = [Fp::from(100u64), Fp::from(101u64)];
+        let b = [Fp::from(200u64), Fp::from(201u64)];
         assert_ne!(
             Poseidon2::compress(&a, &b),
             Poseidon2::compress(&b, &a),
@@ -666,20 +663,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_domain_separation_hash_vs_compress() {
+        // hash(a, b) uses domain tag = 2
+        // compress([a, b], [c, d]) uses domain tag = 4
+        let a = Fp::from(1u64);
+        let b = Fp::from(2u64);
+        let left = [a, b];
+        let right = [Fp::zero(), Fp::zero()];
+
+        assert_ne!(
+            Poseidon2::hash(&a, &b),
+            Poseidon2::compress(&left, &right),
+            "hash and compress should have domain separation"
+        );
+    }
+
     // ========================================================================
-    // Empty input edge case tests
+    // Edge case tests
     // ========================================================================
 
     #[test]
     fn test_hash_vec_empty_returns_zero() {
-        // Empty input returns Fp::zero() (but triggers debug_assert in debug builds)
-        // This test verifies the behavior in release mode
         #[cfg(not(debug_assertions))]
         {
             assert_eq!(
                 Poseidon2::hash_vec(&[]),
-                Fp::zero(),
-                "hash_vec([]) should return Fp::zero()"
+                [Fp::zero(); 2],
+                "hash_vec([]) should return [0, 0]"
             );
         }
     }
@@ -687,26 +698,61 @@ mod tests {
     #[test]
     fn test_hash_many_empty_not_zero() {
         // hash_many([]) applies 10* padding: [1, 0, 0, 0] then permutes
-        // Result should NOT be Fp::zero()
         let result = Poseidon2::hash_many(&[]);
         assert_ne!(
             result,
-            Fp::zero(),
+            [Fp::zero(); 2],
             "hash_many([]) should not be zero (padding is applied)"
         );
     }
 
     #[test]
     fn test_hash_single_zero_not_zero() {
-        // hash_single(0) should not return 0 (would be a weak hash)
         let result = Poseidon2::hash_single(&Fp::zero());
-        assert_ne!(result, Fp::zero(), "hash_single(0) should not return 0");
+        assert_ne!(
+            result,
+            [Fp::zero(); 2],
+            "hash_single(0) should not return [0, 0]"
+        );
     }
 
     #[test]
     fn test_hash_zero_pair_not_zero() {
-        // hash(0, 0) should not return 0
         let result = Poseidon2::hash(&Fp::zero(), &Fp::zero());
-        assert_ne!(result, Fp::zero(), "hash(0, 0) should not return 0");
+        assert_ne!(
+            result,
+            [Fp::zero(); 2],
+            "hash(0, 0) should not return [0, 0]"
+        );
+    }
+
+    // ========================================================================
+    // Collision resistance tests
+    // ========================================================================
+
+    #[test]
+    fn test_hash_single_collision_resistance() {
+        let h1 = Poseidon2::hash_single(&Fp::from(1u64));
+        let h2 = Poseidon2::hash_single(&Fp::from(2u64));
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn test_hash_collision_resistance() {
+        let h1 = Poseidon2::hash(&Fp::from(1u64), &Fp::from(2u64));
+        let h2 = Poseidon2::hash(&Fp::from(1u64), &Fp::from(3u64));
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn test_hash_many_length_extension_resistance() {
+        let a = Fp::from(1u64);
+        let b = Fp::from(2u64);
+        let c = Fp::from(3u64);
+        assert_ne!(
+            Poseidon2::hash_many(&[a, b]),
+            Poseidon2::hash_many(&[a, b, c]),
+            "Different length inputs should produce different hashes"
+        );
     }
 }

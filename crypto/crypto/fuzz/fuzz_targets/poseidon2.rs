@@ -15,6 +15,7 @@ struct FuzzInput {
     a: u64,
     b: u64,
     c: u64,
+    d: u64,
 }
 
 fuzz_target!(|fuzz_data: FuzzInput| {
@@ -22,6 +23,7 @@ fuzz_target!(|fuzz_data: FuzzInput| {
     let a = Fp::from(fuzz_data.a);
     let b = Fp::from(fuzz_data.b);
     let c = Fp::from(fuzz_data.c);
+    let d = Fp::from(fuzz_data.d);
 
     // 1. Variable Length & Consistency check
     // hash_vec should be consistent with hash_single (len=1) and hash_many (len!=1)
@@ -43,12 +45,12 @@ fuzz_target!(|fuzz_data: FuzzInput| {
         }
     } else {
         // Handle empty case:
-        // In debug, hash_vec panics (assertion). In release, it returns 0.
+        // In debug, hash_vec panics (assertion). In release, it returns [0, 0].
         // We verify hash_many allows empty (padding logic) and returns non-zero.
         let many_hash = Poseidon2::hash_many(&elements);
         assert_ne!(
             many_hash,
-            Fp::zero(),
+            [Fp::zero(); 2],
             "hash_many([]) should be non-zero due to padding"
         );
     }
@@ -61,11 +63,13 @@ fuzz_target!(|fuzz_data: FuzzInput| {
         "Domain separation violated: hash(a,b) == hash_many([a,b])"
     );
 
-    // 3. Non-commutativity (when a != b)
-    if a != b {
+    // 3. Non-commutativity for compress (when inputs differ)
+    let left = [a, b];
+    let right = [c, d];
+    if left != right {
         assert_ne!(
-            Poseidon2::compress(&a, &b),
-            Poseidon2::compress(&b, &a),
+            Poseidon2::compress(&left, &right),
+            Poseidon2::compress(&right, &left),
             "Compress should be non-commutative"
         );
     }
@@ -75,6 +79,16 @@ fuzz_target!(|fuzz_data: FuzzInput| {
         Poseidon2::hash(&a, &b),
         Poseidon2::hash(&a, &b),
         "Hash should be deterministic"
+    );
+    assert_eq!(
+        Poseidon2::hash_single(&a),
+        Poseidon2::hash_single(&a),
+        "hash_single should be deterministic"
+    );
+    assert_eq!(
+        Poseidon2::compress(&left, &right),
+        Poseidon2::compress(&left, &right),
+        "compress should be deterministic"
     );
 
     // 5. Domain separation: hash_single vs hash_many
@@ -101,13 +115,18 @@ fuzz_target!(|fuzz_data: FuzzInput| {
     // 8. Non-zero outputs
     assert_ne!(
         Poseidon2::hash(&a, &b),
-        Fp::zero(),
-        "Hash should not be zero"
+        [Fp::zero(); 2],
+        "Hash should not be [0, 0]"
     );
     assert_ne!(
         Poseidon2::hash_single(&a),
-        Fp::zero(),
-        "Hash single should not be zero"
+        [Fp::zero(); 2],
+        "Hash single should not be [0, 0]"
+    );
+    assert_ne!(
+        Poseidon2::compress(&left, &right),
+        [Fp::zero(); 2],
+        "Compress should not be [0, 0]"
     );
 
     // 9. Collision resistance
@@ -118,4 +137,15 @@ fuzz_target!(|fuzz_data: FuzzInput| {
             "hash_single should be collision-resistant"
         );
     }
+
+    // 10. Domain separation: hash vs compress
+    // hash(a, b) uses domain tag = 2
+    // compress([a, b], [0, 0]) uses domain tag = 4
+    let left_for_sep = [a, b];
+    let right_for_sep = [Fp::zero(), Fp::zero()];
+    assert_ne!(
+        Poseidon2::hash(&a, &b),
+        Poseidon2::compress(&left_for_sep, &right_for_sep),
+        "hash and compress should have domain separation"
+    );
 });
