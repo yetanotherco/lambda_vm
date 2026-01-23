@@ -1,0 +1,22 @@
+[package]
+name = "crypto-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+crypto = { path = ".." }
+arbitrary = { version = "1", features = ["derive"] }
+
+[[bin]]
+name = "poseidon2"
+path = "fuzz_targets/poseidon2.rs"
+test = false
+doc = false
+bench = false

@@ -1,3 +1,12 @@
+//! Type aliases for common Merkle tree backends.
+//!
+//! # Field-Specific Backends
+//!
+//! Note: `Poseidon2Backend` and `BatchPoseidon2Backend` are **Goldilocks-field specific**.
+//! They operate on `Fp = FieldElement<GoldilocksField>` and cannot be used with other fields.
+//! For generic field support, use the SHA/Keccak backends which work with any field via
+//! byte serialization.
+
 use sha2::{Sha256, Sha512};
 use sha3::{Keccak256, Keccak512, Sha3_256, Sha3_512};
 
@@ -5,6 +14,9 @@ use super::{
     field_element::FieldElementBackend,
     field_element_vector::{FieldElementPairBackend, FieldElementVectorBackend},
 };
+
+/// Poseidon2 backends - Goldilocks field only (see module docs).
+pub use super::poseidon2::{BatchPoseidon2Backend, Poseidon2Backend};
 
 // Field element backend definitions
 
