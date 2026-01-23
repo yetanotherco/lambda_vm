@@ -12,7 +12,11 @@ use executor::vm::memory::U64HashMap;
 fn make_log(pc: u64, rs1_val: u64, rs2_val: u64, dst_val: u64, taken: bool, offset: i32) -> Log {
     Log {
         current_pc: pc,
-        next_pc: if taken { (pc as i64 + offset as i64) as u64 } else { pc + 4 },
+        next_pc: if taken {
+            (pc as i64 + offset as i64) as u64
+        } else {
+            pc + 4
+        },
         src1_val: rs1_val,
         src2_val: rs2_val,
         dst_val,
@@ -114,10 +118,30 @@ fn test_lt_operations_collected() {
         make_blt_log(0x100c, 3, 7, true),
     ];
     let instrs = vec![
-        Instruction::Arith { dst: 1, src1: 2, src2: 3, op: ArithOp::SetLessThan },
-        Instruction::Arith { dst: 1, src1: 2, src2: 3, op: ArithOp::SetLessThan },
-        Instruction::Arith { dst: 1, src1: 2, src2: 3, op: ArithOp::Add },
-        Instruction::Branch { src1: 2, src2: 3, cond: Comparison::LessThan, offset: 8 },
+        Instruction::Arith {
+            dst: 1,
+            src1: 2,
+            src2: 3,
+            op: ArithOp::SetLessThan,
+        },
+        Instruction::Arith {
+            dst: 1,
+            src1: 2,
+            src2: 3,
+            op: ArithOp::SetLessThan,
+        },
+        Instruction::Arith {
+            dst: 1,
+            src1: 2,
+            src2: 3,
+            op: ArithOp::Add,
+        },
+        Instruction::Branch {
+            src1: 2,
+            src2: 3,
+            cond: Comparison::LessThan,
+            offset: 8,
+        },
     ];
     let instructions = make_instructions(&logs, &instrs);
 
@@ -136,10 +160,30 @@ fn test_lt_deduplication() {
         make_add_log(0x100c, 0, 0, 0),  // padding to 4
     ];
     let instrs = vec![
-        Instruction::Arith { dst: 1, src1: 2, src2: 3, op: ArithOp::SetLessThan },
-        Instruction::Arith { dst: 1, src1: 2, src2: 3, op: ArithOp::SetLessThan },
-        Instruction::Arith { dst: 1, src1: 2, src2: 3, op: ArithOp::SetLessThan },
-        Instruction::Arith { dst: 1, src1: 2, src2: 3, op: ArithOp::Add },
+        Instruction::Arith {
+            dst: 1,
+            src1: 2,
+            src2: 3,
+            op: ArithOp::SetLessThan,
+        },
+        Instruction::Arith {
+            dst: 1,
+            src1: 2,
+            src2: 3,
+            op: ArithOp::SetLessThan,
+        },
+        Instruction::Arith {
+            dst: 1,
+            src1: 2,
+            src2: 3,
+            op: ArithOp::SetLessThan,
+        },
+        Instruction::Arith {
+            dst: 1,
+            src1: 2,
+            src2: 3,
+            op: ArithOp::Add,
+        },
     ];
     let instructions = make_instructions(&logs, &instrs);
 
@@ -160,10 +204,30 @@ fn test_bitwise_lookups_collected() {
         make_add_log(0x100c, 0, 0, 0),
     ];
     let instrs = vec![
-        Instruction::Arith { dst: 1, src1: 2, src2: 3, op: ArithOp::And },
-        Instruction::Arith { dst: 1, src1: 2, src2: 3, op: ArithOp::Add },
-        Instruction::Arith { dst: 1, src1: 2, src2: 3, op: ArithOp::Add },
-        Instruction::Arith { dst: 1, src1: 2, src2: 3, op: ArithOp::Add },
+        Instruction::Arith {
+            dst: 1,
+            src1: 2,
+            src2: 3,
+            op: ArithOp::And,
+        },
+        Instruction::Arith {
+            dst: 1,
+            src1: 2,
+            src2: 3,
+            op: ArithOp::Add,
+        },
+        Instruction::Arith {
+            dst: 1,
+            src1: 2,
+            src2: 3,
+            op: ArithOp::Add,
+        },
+        Instruction::Arith {
+            dst: 1,
+            src1: 2,
+            src2: 3,
+            op: ArithOp::Add,
+        },
     ];
     let instructions = make_instructions(&logs, &instrs);
 
@@ -184,7 +248,12 @@ fn test_cpu_timestamps() {
         make_add_log(0x100c, 10, 11, 12),
     ];
     let instrs: Vec<Instruction> = (0..4)
-        .map(|_| Instruction::Arith { dst: 1, src1: 2, src2: 3, op: ArithOp::Add })
+        .map(|_| Instruction::Arith {
+            dst: 1,
+            src1: 2,
+            src2: 3,
+            op: ArithOp::Add,
+        })
         .collect();
     let instructions = make_instructions(&logs, &instrs);
 
@@ -206,10 +275,30 @@ fn test_mixed_instructions() {
         make_blt_log(0x100c, 1, 2, true),
     ];
     let instrs = vec![
-        Instruction::Arith { dst: 1, src1: 2, src2: 3, op: ArithOp::Add },
-        Instruction::Arith { dst: 1, src1: 2, src2: 3, op: ArithOp::SetLessThan },
-        Instruction::Arith { dst: 1, src1: 2, src2: 3, op: ArithOp::And },
-        Instruction::Branch { src1: 2, src2: 3, cond: Comparison::LessThan, offset: 8 },
+        Instruction::Arith {
+            dst: 1,
+            src1: 2,
+            src2: 3,
+            op: ArithOp::Add,
+        },
+        Instruction::Arith {
+            dst: 1,
+            src1: 2,
+            src2: 3,
+            op: ArithOp::SetLessThan,
+        },
+        Instruction::Arith {
+            dst: 1,
+            src1: 2,
+            src2: 3,
+            op: ArithOp::And,
+        },
+        Instruction::Branch {
+            src1: 2,
+            src2: 3,
+            cond: Comparison::LessThan,
+            offset: 8,
+        },
     ];
     let instructions = make_instructions(&logs, &instrs);
 
