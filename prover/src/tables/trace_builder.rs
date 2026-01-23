@@ -19,6 +19,7 @@ use stark::trace::TraceTable;
 
 use super::bitwise;
 use super::cpu::{self, CpuOperation};
+use super::decode;
 use super::lt::{self, LtOperation};
 use super::types::{GoldilocksExtension, GoldilocksField};
 use crate::ProverError;
@@ -33,20 +34,30 @@ pub struct Traces {
 
     /// LT comparison trace (deduplicated operations)
     pub lt: TraceTable<GoldilocksField, GoldilocksExtension>,
+
+    /// DECODE instruction decode trace (deduplicated by PC)
+    pub decode: TraceTable<GoldilocksField, GoldilocksExtension>,
 }
 
 impl Traces {
-    /// Generates all traces from execution logs in a single pass.
+    /// Generates all traces from execution logs.
     pub fn from_logs(
         logs: &[Log],
         instructions: U64HashMap<Instruction>,
     ) -> Result<Self, ProverError> {
-        // Pre-allocate collectors
+        // Generate DECODE trace first from instructions (MU=0 initially)
+        let (mut decode, pc_to_row) = decode::generate_decode_trace(&instructions);
+
+        // Generate BITWISE precomputed table (MU=0 initially)
+        let mut bitwise = bitwise::generate_bitwise_trace();
+
+        // Pre-allocate collectors for log processing
         let mut cpu_ops = Vec::with_capacity(logs.len());
         let mut bitwise_lookups = Vec::with_capacity(logs.len() * 4);
         let mut lt_ops = Vec::with_capacity(logs.len() / 10 + 1);
+        let mut decode_lookups = Vec::with_capacity(logs.len());
 
-        // Single pass over logs
+        // Process logs to build CPU trace and collect lookups
         for (i, log) in logs.iter().enumerate() {
             let timestamp = (i as u64) * 4;
             let instruction = instructions
@@ -65,19 +76,24 @@ impl Traces {
                 lt_ops.push(LtOperation::new(arg1, arg2, op.signed));
             }
 
+            // Collect PC for DECODE lookups
+            decode_lookups.push(log.current_pc);
+
             cpu_ops.push(op);
         }
 
-        // Generate CPU trace (handles padding internally)
+        // Generate CPU trace
         let cpu = cpu::generate_cpu_trace(&cpu_ops);
 
-        // Generate BITWISE trace and update multiplicities
-        let mut bitwise = bitwise::generate_bitwise_trace();
+        // Update BITWISE multiplicities
         bitwise::update_multiplicities(&mut bitwise, &bitwise_lookups);
 
         // Generate LT trace (handles deduplication and padding internally)
         let lt = lt::generate_lt_trace(&lt_ops);
 
-        Ok(Traces { cpu, bitwise, lt })
+        // Update DECODE multiplicities
+        decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
+
+        Ok(Traces { cpu, bitwise, lt, decode })
     }
 }

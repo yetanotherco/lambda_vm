@@ -14,3 +14,5 @@ pub mod lt_tests;
 pub mod prove_elfs_tests;
 #[cfg(test)]
 pub mod trace_builder_tests;
+#[cfg(test)]
+pub mod decode_tests;

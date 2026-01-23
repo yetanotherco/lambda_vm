@@ -28,8 +28,7 @@ pub mod trace_builder;
 // pub mod mul;
 // pub mod shift;
 
-// Phase 3 (to be added)
-// pub mod decode;
+pub mod decode;
 
 // Phase 5 - Deferred (to be added)
 // pub mod memw;
