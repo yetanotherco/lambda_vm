@@ -94,20 +94,14 @@ done
 
 # Summary
 echo -e "${GREEN}=== Summary ===${NC}"
-printf "%-20s %10s   %s\n" "Benchmark" "Speedup" "Faster branch"
-echo "-------------------------------------------------------"
+echo -e "Speedup = $BASE_BRANCH / $COMPARE_BRANCH (>1 means $COMPARE_BRANCH is faster)"
+echo ""
+printf "%-20s %10s\n" "Benchmark" "Speedup"
+echo "-------------------------------"
 for json in "$TMP_DIR"/*.json; do
     name=$(basename "$json" .json)
     base=$(jq -r '.results[0].mean' "$json")
     compare=$(jq -r '.results[1].mean' "$json")
     speedup=$(echo "scale=2; $base / $compare" | bc)
-    if (( $(echo "$speedup > 1" | bc -l) )); then
-        faster="$COMPARE_BRANCH (${speedup}x)"
-    elif (( $(echo "$speedup < 1" | bc -l) )); then
-        inverse=$(echo "scale=2; 1 / $speedup" | bc)
-        faster="$BASE_BRANCH (${inverse}x)"
-    else
-        faster="same"
-    fi
-    printf "%-20s %10sx   %s\n" "$name" "$speedup" "$faster"
+    printf "%-20s %9sx\n" "$name" "$speedup"
 done
