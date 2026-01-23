@@ -163,6 +163,7 @@ Full documentation can be found in [docs](./docs/). It is currently a work in pr
 | `make test-executor` | Compile all programs and run executor tests |
 | `make build` | Build all workspace crates |
 | `make check` | Check all crates (faster than build, no codegen) |
+| `make fuzz-poseidon2` | Run Poseidon2 fuzzer (requires nightly) |
 
 ### Full Test Suite
 

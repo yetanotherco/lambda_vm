@@ -167,3 +167,7 @@ check:
 
 flamegraph-prover:
 	cd crypto/stark && samply record cargo bench --bench profile_prover --features parallel
+
+# Fuzzing
+fuzz-poseidon2:
+	cd crypto/crypto/fuzz && cargo +nightly fuzz run poseidon2
