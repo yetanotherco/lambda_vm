@@ -8,7 +8,9 @@
 #   ./bench_compare.sh <branch>           # Compare main vs <branch>
 #   ./bench_compare.sh <branch1> <branch2> # Compare <branch1> vs <branch2>
 #
-# Requires: hyperfine, jq
+# Note: Benchmarks are compiled from the current branch, not from the branches being compared.
+#
+# Requires: hyperfine, jq, bc
 #
 
 set -euo pipefail
@@ -25,8 +27,26 @@ TMP_DIR="/tmp/bench_compare"
 BENCH_ARTIFACTS_DIR="$ROOT_DIR/executor/program_artifacts/bench"
 
 CURRENT_BRANCH=$(git -C "$ROOT_DIR" rev-parse --abbrev-ref HEAD)
-
 # Parse arguments
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+    echo "Benchmark Comparison Script"
+    echo "Compares CLI execution performance between two git branches using hyperfine."
+    echo ""
+    echo "Usage:"
+    echo "  ./bench_compare.sh                    # Compare main vs current branch"
+    echo "  ./bench_compare.sh <branch>           # Compare main vs <branch>"
+    echo "  ./bench_compare.sh <branch1> <branch2> # Compare <branch1> vs <branch2>"
+    echo ""
+    echo "Note: Benchmarks are compiled from the current branch, not from the branches being compared."
+    echo ""
+    echo "Requires: hyperfine, jq, bc"
+    exit 0
+fi
+
+# Cleanup on failure - restore original branch
+trap 'echo -e "${YELLOW}Restoring original branch...${NC}"; git -C "$ROOT_DIR" checkout "$CURRENT_BRANCH" 2>/dev/null' EXIT
+
+
 if [ $# -eq 0 ]; then
     BASE_BRANCH="main"
     COMPARE_BRANCH="$CURRENT_BRANCH"
@@ -47,7 +67,7 @@ if [ "$BASE_BRANCH" = "$COMPARE_BRANCH" ]; then
     exit 1
 fi
 
-if ! git -C "$ROOT_DIR" diff --quiet; then
+if ! git -C "$ROOT_DIR" diff-index --quiet HEAD; then
     echo -e "${RED}Error: You have uncommitted changes. Please commit or stash them first.${NC}"
     exit 1
 fi
@@ -86,7 +106,7 @@ echo -e "${GREEN}=== Running Benchmarks ===${NC}"
 for elf in "$BENCH_ARTIFACTS_DIR"/*.elf; do
     name=$(basename "$elf" .elf)
     echo -e "${YELLOW}--- $name ---${NC}"
-    hyperfine --warmup 5 --runs 10 \
+    hyperfine -N --warmup 5 --runs 10 \
         -n "$BASE_BRANCH" "$TMP_DIR/cli-base $elf" \
         -n "$COMPARE_BRANCH" "$TMP_DIR/cli-compare $elf" \
         --export-json "$TMP_DIR/$name.json"
@@ -102,6 +122,10 @@ for json in "$TMP_DIR"/*.json; do
     name=$(basename "$json" .json)
     base=$(jq -r '.results[0].mean' "$json")
     compare=$(jq -r '.results[1].mean' "$json")
-    speedup=$(echo "scale=2; $base / $compare" | bc)
+    if [ -z "$compare" ] || [ "$compare" = "0" ]; then
+        speedup="N/A"
+    else
+        speedup=$(echo "scale=2; $base / $compare" | bc)
+    fi
     printf "%-20s %9sx\n" "$name" "$speedup"
 done
