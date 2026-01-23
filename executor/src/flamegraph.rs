@@ -9,6 +9,14 @@ use std::io::{self, Write};
 use crate::elf::SymbolTable;
 use crate::vm::instruction::decoding::Instruction;
 use crate::vm::logs::Log;
+use crate::vm::memory::U64HashMap;
+
+/// Errors that can occur during flamegraph generation.
+#[derive(Debug)]
+pub enum FlamegraphError {
+    /// Instruction not found for a given program counter.
+    InstructionNotFound,
+}
 
 /// Generates flamegraph data by tracking function calls during execution.
 pub struct FlamegraphGenerator {
@@ -34,15 +42,19 @@ impl FlamegraphGenerator {
     }
 
     /// Process a batch of execution logs, updating call stack and instruction counts.
-    pub fn process_logs(&mut self, logs: &[Log]) {
+    pub fn process_logs(&mut self, logs: &[Log], instructions: U64HashMap<Instruction>) -> Result<(), FlamegraphError> {
         for log in logs {
             // Count this instruction under the current stack
             let stack_key = self.format_stack();
             *self.stack_counts.entry(stack_key).or_insert(0) += 1;
 
             // Update call stack based on instruction type
-            self.update_stack(log);
+            let instruction = instructions
+                .get(&log.current_pc)
+                .copied().unwrap_or_else(|| FlamegraphError::InstructionNotFound)?;
+            self.update_stack(log, instruction);
         }
+        Ok(())
     }
 
     /// Format the current call stack as a semicolon-separated string.
@@ -67,8 +79,8 @@ impl FlamegraphGenerator {
     }
 
     /// Update the call stack based on the instruction type.
-    fn update_stack(&mut self, log: &Log) {
-        match log.instruction {
+    fn update_stack(&mut self, log: &Log, instruction: Instruction) {
+        match instruction {
             // Function CALL: JAL with dst=ra (register 1)
             // Saves return address to ra and jumps to offset
             Instruction::JumpAndLink { dst, .. } if dst == 1 => {
