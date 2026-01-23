@@ -14,9 +14,11 @@ use crate::{
 };
 
 use super::{
+    config::Commitment,
     constraints::boundary::BoundaryConstraints, context::AirContext, frame::Frame,
     proof::options::ProofOptions, trace::TraceTable,
 };
+
 
 type ZerofierGroupKey = (usize, usize, Option<usize>, Option<usize>, usize);
 
@@ -106,6 +108,29 @@ pub trait AIR: Send + Sync {
     fn has_trace_interaction(&self) -> bool {
         let (_main_trace_columns, aux_trace_columns) = self.trace_layout();
         aux_trace_columns != 0
+    }
+
+    /// Returns true if this AIR has preprocessed (precomputed) columns.
+    ///
+    /// Preprocessed tables have columns that are fully deterministic and known
+    /// to both prover and verifier (e.g., bitwise lookup tables).
+    fn is_preprocessed(&self) -> bool {
+        false
+    }
+
+    /// Returns the number of precomputed columns (columns 0..n are precomputed).
+    ///
+    /// Only meaningful if `is_preprocessed()` returns true.
+    /// The remaining columns (n..) are multiplicities.
+    fn num_precomputed_columns(&self) -> usize {
+        0
+    }
+
+    /// Returns the hardcoded commitment to the precomputed columns.
+    ///
+    /// Only meaningful if `is_preprocessed()` returns true.
+    fn precomputed_commitment(&self) -> Commitment {
+        [0u8; 32]
     }
 
     fn num_auxiliary_rap_columns(&self) -> usize {

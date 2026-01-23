@@ -440,6 +440,7 @@ pub trait IsStarkVerifier<
         let index_sym = iota * 2 + 1;
         let mut result = true;
 
+        // Verify main trace (multiplicities for preprocessed, full trace for normal)
         result &= Self::verify_opening::<Field>(
             &deep_poly_openings.main_trace_polys.proof,
             &proof.lde_trace_main_merkle_root,
@@ -453,6 +454,31 @@ pub trait IsStarkVerifier<
             &deep_poly_openings.main_trace_polys.evaluations_sym,
         );
 
+        // Verify precomputed trace (for preprocessed tables only)
+        match (
+            &proof.lde_trace_precomputed_merkle_root,
+            &deep_poly_openings.precomputed_trace_polys,
+        ) {
+            (None, Some(_)) => result = false,
+            (Some(_), None) => result = false,
+            (Some(precomputed_root), Some(precomputed_opening)) => {
+                result &= Self::verify_opening::<Field>(
+                    &precomputed_opening.proof,
+                    precomputed_root,
+                    index,
+                    &precomputed_opening.evaluations,
+                );
+                result &= Self::verify_opening::<Field>(
+                    &precomputed_opening.proof_sym,
+                    precomputed_root,
+                    index_sym,
+                    &precomputed_opening.evaluations_sym,
+                );
+            }
+            _ => {}
+        }
+
+        // Verify auxiliary trace
         match (
             proof.lde_trace_aux_merkle_root,
             &deep_poly_openings.aux_trace_polys,
@@ -648,13 +674,25 @@ pub trait IsStarkVerifier<
             let primitive_root =
                 &Field::get_primitive_root_of_unity(domain.root_order as u64).unwrap();
 
-            let mut evaluations: Vec<FieldElement<FieldExtension>> = proof.deep_poly_openings[i]
-                .main_trace_polys
-                .evaluations
-                .clone()
-                .into_iter()
-                .map(|x| x.to_extension())
-                .collect();
+            // For preprocessed tables: precomputed columns come FIRST, then multiplicities
+            let mut evaluations: Vec<FieldElement<FieldExtension>> = Vec::new();
+            if let Some(precomputed_polys) = &proof.deep_poly_openings[i].precomputed_trace_polys {
+                evaluations.extend(
+                    precomputed_polys
+                        .evaluations
+                        .iter()
+                        .cloned()
+                        .map(|x| x.to_extension()),
+                );
+            }
+            evaluations.extend(
+                proof.deep_poly_openings[i]
+                    .main_trace_polys
+                    .evaluations
+                    .iter()
+                    .cloned()
+                    .map(|x| x.to_extension()),
+            );
             if let Some(aux_trace_polys) = &proof.deep_poly_openings[i].aux_trace_polys {
                 evaluations.extend_from_slice(&aux_trace_polys.evaluations);
             }
@@ -669,14 +707,25 @@ pub trait IsStarkVerifier<
                 &proof.deep_poly_openings[i].composition_poly.evaluations,
             ));
 
-            let mut evaluations_sym: Vec<FieldElement<FieldExtension>> = proof.deep_poly_openings
-                [i]
-                .main_trace_polys
-                .evaluations_sym
-                .clone()
-                .into_iter()
-                .map(|x| x.to_extension())
-                .collect();
+            // For preprocessed tables: precomputed columns come FIRST, then multiplicities
+            let mut evaluations_sym: Vec<FieldElement<FieldExtension>> = Vec::new();
+            if let Some(precomputed_polys) = &proof.deep_poly_openings[i].precomputed_trace_polys {
+                evaluations_sym.extend(
+                    precomputed_polys
+                        .evaluations_sym
+                        .iter()
+                        .cloned()
+                        .map(|x| x.to_extension()),
+                );
+            }
+            evaluations_sym.extend(
+                proof.deep_poly_openings[i]
+                    .main_trace_polys
+                    .evaluations_sym
+                    .iter()
+                    .cloned()
+                    .map(|x| x.to_extension()),
+            );
             if let Some(aux_trace_polys) = &proof.deep_poly_openings[i].aux_trace_polys {
                 evaluations_sym.extend_from_slice(&aux_trace_polys.evaluations_sym);
             }
@@ -779,9 +828,40 @@ pub trait IsStarkVerifier<
         // =====================================================================
         // Round 1, Phase A: Replay main trace commitments
         // =====================================================================
+        // For preprocessed tables, use the hardcoded commitment (verifier cannot
+        // trust the prover). For normal tables, use the commitment from the proof.
 
-        for proof in &multi_proof.proofs {
-            transcript.append_bytes(&proof.lde_trace_main_merkle_root);
+        for (air, proof) in airs.iter().zip(&multi_proof.proofs) {
+            if air.is_preprocessed() {
+                // Preprocessed table: VERIFY precomputed commitment matches hardcoded.
+                // This is the critical soundness check - ensures prover used correct precomputed values.
+                let expected_precomputed = air.precomputed_commitment();
+                match &proof.lde_trace_precomputed_merkle_root {
+                    Some(actual) if *actual == expected_precomputed => {
+                        // OK - commitment matches hardcoded
+                    }
+                    Some(actual) => {
+                        error!(
+                            "Preprocessed commitment mismatch: expected {:?}, got {:?}",
+                            expected_precomputed, actual
+                        );
+                        return false;
+                    }
+                    None => {
+                        error!("Preprocessed table proof missing precomputed commitment");
+                        return false;
+                    }
+                }
+
+                // Add BOTH commitments to transcript (Fiat-Shamir binding).
+                // Precomputed commitment binds challenges to correct precomputed values.
+                // Multiplicities commitment binds challenges to actual lookups made.
+                transcript.append_bytes(&expected_precomputed);
+                transcript.append_bytes(&proof.lde_trace_main_merkle_root);
+            } else {
+                // Normal table: use commitment from proof
+                transcript.append_bytes(&proof.lde_trace_main_merkle_root);
+            }
         }
 
         // =====================================================================
