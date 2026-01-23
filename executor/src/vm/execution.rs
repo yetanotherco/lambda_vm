@@ -15,6 +15,15 @@ pub struct ReturnValues {
     pub register_values: (i64, i64),
 }
 
+/// Result of program execution including logs and predecoded instructions
+pub struct ExecutionResult {
+    pub return_values: ReturnValues,
+    pub logs: Vec<Log>,
+    /// Predecoded instructions map (pc -> instruction)
+    /// Use this to look up instructions by their PC from the logs
+    pub instructions: U64HashMap<Instruction>,
+}
+
 pub fn run_program(
     instruction_map: HashMap<u64, u32>,
     entrypoint: u64,
@@ -26,12 +35,17 @@ pub fn run_program(
     let decoded_instructions = predecode_instructions(&instruction_map);
     let instruction_count = instruction_map.len();
     load_program(instruction_map, &mut memory)?;
-    run_from_entrypoint(
+    let (return_values, logs) = run_from_entrypoint(
         &mut memory,
         entrypoint,
         &decoded_instructions,
         instruction_count,
-    )
+    )?;
+    Ok(ExecutionResult {
+        return_values,
+        logs,
+        instructions: decoded_instructions,
+    })
 }
 
 fn predecode_instructions(instruction_map: &HashMap<u64, u32>) -> U64HashMap<Instruction> {

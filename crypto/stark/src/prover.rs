@@ -883,7 +883,7 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let mut openings = Vec::new();
+        let mut openings = Vec::with_capacity(indexes_to_open.len());
 
         for index in indexes_to_open.iter() {
             let main_trace_opening = Self::open_trace_polys::<Field>(
@@ -949,6 +949,8 @@ pub trait IsStarkProver<
     {
         info!("Started proof generation...");
 
+        let num_airs = air_trace_pairs.len();
+
         // Check if any AIR uses LogUp (has auxiliary trace for running sums)
         let needs_logup_challenges = air_trace_pairs
             .iter()
@@ -960,8 +962,8 @@ pub trait IsStarkProver<
         // All main trace commitments must be in the transcript before sampling
         // LogUp challenges. This ensures the challenges depend on ALL tables.
 
-        let mut domains = Vec::new();
-        let mut main_commitments: Vec<MainCommitment<Field>> = Vec::new();
+        let mut domains = Vec::with_capacity(num_airs);
+        let mut main_commitments: Vec<MainCommitment<Field>> = Vec::with_capacity(num_airs);
 
         for (air, trace, _pub_inputs) in &*air_trace_pairs {
             let trace_length = trace.num_rows();
@@ -990,7 +992,7 @@ pub trait IsStarkProver<
         // =====================================================================
         // Each AIR builds its LogUp running-sum columns using the shared challenges.
 
-        let mut round_1_results: Vec<Round1<Field, FieldExtension>> = Vec::new();
+        let mut round_1_results: Vec<Round1<Field, FieldExtension>> = Vec::with_capacity(num_airs);
         for (((air, trace, _pub_inputs), (main, main_evaluations)), domain) in air_trace_pairs
             .iter_mut()
             .zip(main_commitments)
@@ -1012,7 +1014,7 @@ pub trait IsStarkProver<
         // Rounds 2-4: Standard STARK protocol for each AIR
         // =====================================================================
 
-        let mut proofs = Vec::new();
+        let mut proofs = Vec::with_capacity(num_airs);
         for (((air, _, pub_inputs), round_1_result), domain) in
             air_trace_pairs.iter().zip(round_1_results).zip(domains)
         {
