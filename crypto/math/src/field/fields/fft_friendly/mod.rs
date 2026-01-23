@@ -19,3 +19,7 @@ pub mod quartic_babybear_u32;
 pub mod extensions_goldilocks;
 /// Optimized Goldilocks field p = 2^64 - 2^32 + 1 (no Montgomery form)
 pub mod u64_goldilocks;
+
+/// AVX2-optimized Goldilocks field operations (x86/x86_64 only)
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub mod u64_goldilocks_avx;
