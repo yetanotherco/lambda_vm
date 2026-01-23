@@ -122,8 +122,7 @@ fn build_test_data(base_pc: u64, steps: Vec<ProgramStep>) -> (Vec<Log>, Instruct
 #[should_panic(expected = "CPU trace requires at least 4 operations")]
 fn test_empty_logs() {
     // CPU trace cannot be padded - caller must provide valid power-of-2 operations
-    let (logs, cache) = build_test_data(0x1000, vec![]);
-    let _traces = Traces::from_logs(&logs, &cache).unwrap();
+    let _traces = Traces::from_logs(&[], &InstructionCache::new(&[]).unwrap()).unwrap();
 }
 
 #[test]
