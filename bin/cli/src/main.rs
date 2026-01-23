@@ -25,13 +25,16 @@ fn main() {
     let elf_data = std::fs::read(&args.filename).expect("Failed to read elf file");
     let program = Elf::load(&elf_data).expect("Failed to load elf program");
 
-    let execution_result = run_program(program.image.clone(), program.entry_point, vec![])
+    // Save entry_point before moving program.image into run_program
+    let entry_point = program.entry_point;
+
+    let execution_result = run_program(program.image, entry_point, vec![])
         .expect("Failed to run program");
 
     // Generate flamegraph if requested
     if let Some(output_path) = args.flamegraph {
         let symbols = SymbolTable::parse(&elf_data);
-        let mut generator = FlamegraphGenerator::new(symbols, program.entry_point);
+        let mut generator = FlamegraphGenerator::new(symbols, entry_point);
         generator
             .process_logs(&execution_result.logs, &execution_result.instructions)
             .expect("Failed to process logs for flamegraph");

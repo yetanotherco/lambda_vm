@@ -28,8 +28,6 @@ pub struct FlamegraphGenerator {
     call_stack: Vec<u64>,
     /// Instruction counts per stack state: "main;foo;bar" -> count
     stack_counts: HashMap<String, u64>,
-    /// Entry point address (for root frame)
-    entry_point: u64,
 }
 
 impl FlamegraphGenerator {
@@ -39,7 +37,6 @@ impl FlamegraphGenerator {
             symbols,
             call_stack: vec![entry_point], // Start with entry point on stack
             stack_counts: HashMap::new(),
-            entry_point,
         }
     }
 
@@ -102,19 +99,27 @@ impl FlamegraphGenerator {
 
             // Function RETURN: JALR with base=ra (register 1), dst=zero (register 0)
             // This is the standard "ret" instruction (jalr x0, ra, 0)
+            // Only pop if we have more than the root frame to prevent stack underflow
             Instruction::JumpAndLinkRegister { base, dst, .. } if base == 1 && dst == 0 => {
-                self.call_stack.pop();
+                if self.call_stack.len() > 1 {
+                    self.call_stack.pop();
+                }
             }
 
             // Tail call: JAL/JALR with dst=zero (doesn't save return address)
             // Pop current function and push the new one
+            // Only pop if we have more than the root frame to prevent stack underflow
             Instruction::JumpAndLink { dst: 0, .. } => {
-                self.call_stack.pop();
+                if self.call_stack.len() > 1 {
+                    self.call_stack.pop();
+                }
                 self.call_stack.push(log.next_pc);
             }
             Instruction::JumpAndLinkRegister { dst: 0, base, .. } if base != 1 => {
                 // Tail call through register (not a return)
-                self.call_stack.pop();
+                if self.call_stack.len() > 1 {
+                    self.call_stack.pop();
+                }
                 self.call_stack.push(log.next_pc);
             }
 
@@ -143,11 +148,6 @@ impl FlamegraphGenerator {
     /// Get the total number of instructions processed.
     pub fn total_instructions(&self) -> u64 {
         self.stack_counts.values().sum()
-    }
-
-    /// Get the entry point address.
-    pub fn entry_point(&self) -> u64 {
-        self.entry_point
     }
 }
 

@@ -338,6 +338,12 @@ impl SymbolTable {
         Self::try_parse(input).unwrap_or_default()
     }
 
+    /// Create a symbol table from a list of functions.
+    /// Functions should be sorted by address.
+    pub fn from_functions(functions: Vec<FunctionSymbol>) -> Self {
+        Self { functions }
+    }
+
     fn try_parse(input: &[u8]) -> Result<Self, ElfError> {
         let ehdr = ExecutableHeader::parse(input)?;
 
