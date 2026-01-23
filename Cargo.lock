@@ -1394,6 +1394,7 @@ version = "0.1.0"
 dependencies = [
  "guest_program",
  "rkyv",
+ "rustc-demangle",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
