@@ -32,9 +32,13 @@ The #decode table is comprised of #nr_variables variables that are expressed usi
 == Padding
 The #decode table must be padded to a length that is a power of two.
 Empty rows with the following content can be added to achieve this:
+
 #render_chip_padding_table(chip, config)
+
 Note that this row sets the `EBREAK` flag.
 Given that `CPU` asserts that `EBREAK = 0` (see @cpu:c:ebreak_traps), using this "padding-instruction" would immediately make the CPU table unprovable.
+Note moreover that the `pc` is set to $7$.
+This value is the _smallest odd number_ (i.e., not reachable during regular execution) that is more than _$4$_ (i.e., the max `pc`-increment) greater than _$1$_ (i.e., the `pc`-value used in the #link(<cpu-padding-decode-row>)[additional instruction] referred to by `CPU`-padding lines).
 
 == Decoding
 For the purposes of explaining decoding, we decompress #decode's `packed_decode` variable into its constituent variables.
@@ -220,7 +224,7 @@ We note the following about the above decoding table:
   )
 )
 
-== One more instruction
+== One more instruction <cpu-padding-decode-row>
 In addition to decoding all instructions provided in the ELF and adding a corresponding entry to the #decode table, one must include an entry that has $#`pc` = 1$ and every other variable set to $0$.
 Note that this will never conflict with any entry in the ELF, since it has an odd `pc` value.
 

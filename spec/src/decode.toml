@@ -4,7 +4,7 @@ name = "DECODE"
 name = "pc"
 type = "DWordWL"
 desc = "value of the program counter this instruction is associated with."
-pad = 0
+pad = 7
 
 [[variables.output]]
 name = "packed_decode"
