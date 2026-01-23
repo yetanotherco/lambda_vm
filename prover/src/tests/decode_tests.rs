@@ -4,7 +4,7 @@ use executor::vm::instruction::decoding::{ArithOp, Instruction};
 use executor::vm::memory::U64HashMap;
 
 use crate::tables::decode::{
-    bus_interactions, cols, generate_decode_trace, update_multiplicities, DecodeEntry,
+    DecodeEntry, bus_interactions, cols, generate_decode_trace, update_multiplicities,
 };
 use crate::tables::types::FE;
 
@@ -433,10 +433,7 @@ fn test_trace_padding_to_power_of_two() {
 
     let (trace, _pc_to_row) = generate_decode_trace(&instructions);
 
-    assert_eq!(
-        trace.main_table.height, 4,
-        "3 entries should pad to 4 rows"
-    );
+    assert_eq!(trace.main_table.height, 4, "3 entries should pad to 4 rows");
 
     // Verify the padding row has pc=7 and EBREAK flag
     let padding = DecodeEntry::padding_entry();
@@ -499,7 +496,11 @@ fn test_bus_interactions_count() {
     let interactions = bus_interactions();
 
     // DECODE table should have exactly 1 interaction (receiver for DECODE bus)
-    assert_eq!(interactions.len(), 1, "DECODE should have 1 bus interaction");
+    assert_eq!(
+        interactions.len(),
+        1,
+        "DECODE should have 1 bus interaction"
+    );
 }
 
 #[test]

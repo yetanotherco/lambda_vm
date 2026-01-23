@@ -599,7 +599,6 @@ impl CpuOperation {
 
         lookups
     }
-
 }
 
 // =========================================================================
@@ -667,94 +666,94 @@ pub fn finalize_cpu_trace(data: Vec<FE>) -> TraceTable<GoldilocksField, Goldiloc
 pub fn write_cpu_row(data: &mut [FE], row_idx: usize, op: &CpuOperation) {
     let base = row_idx * cols::NUM_COLUMNS;
 
-        // Input columns
-        data[base + cols::TIMESTAMP] = FE::from(op.timestamp);
-        data[base + cols::PC_0] = FE::from(op.pc & 0xFFFF_FFFF);
-        data[base + cols::PC_1] = FE::from(op.pc >> 32);
-        data[base + cols::RS1] = FE::from(op.rs1 as u64);
-        data[base + cols::RS2] = FE::from(op.rs2 as u64);
-        data[base + cols::RD] = FE::from(op.rd as u64);
-        data[base + cols::WRITE_REGISTER] = FE::from(op.write_register as u64);
-        data[base + cols::MEMORY_2BYTES] = FE::from(op.memory_2bytes as u64);
-        data[base + cols::MEMORY_4BYTES] = FE::from(op.memory_4bytes as u64);
-        data[base + cols::MEMORY_8BYTES] = FE::from(op.memory_8bytes as u64);
-        data[base + cols::C_TYPE_INSTRUCTION] = FE::from(op.c_type_instruction as u64);
-        data[base + cols::IMM_0] = FE::from(op.imm & 0xFFFF_FFFF);
-        data[base + cols::IMM_1] = FE::from(op.imm >> 32);
-        data[base + cols::SIGNED] = FE::from(op.signed as u64);
-        data[base + cols::MP_SELECTOR] = FE::from(op.mp_selector as u64);
-        data[base + cols::MULDIV_SELECTOR] = FE::from(op.muldiv_selector as u64);
-        data[base + cols::WORD_INSTR] = FE::from(op.word_instr as u64);
+    // Input columns
+    data[base + cols::TIMESTAMP] = FE::from(op.timestamp);
+    data[base + cols::PC_0] = FE::from(op.pc & 0xFFFF_FFFF);
+    data[base + cols::PC_1] = FE::from(op.pc >> 32);
+    data[base + cols::RS1] = FE::from(op.rs1 as u64);
+    data[base + cols::RS2] = FE::from(op.rs2 as u64);
+    data[base + cols::RD] = FE::from(op.rd as u64);
+    data[base + cols::WRITE_REGISTER] = FE::from(op.write_register as u64);
+    data[base + cols::MEMORY_2BYTES] = FE::from(op.memory_2bytes as u64);
+    data[base + cols::MEMORY_4BYTES] = FE::from(op.memory_4bytes as u64);
+    data[base + cols::MEMORY_8BYTES] = FE::from(op.memory_8bytes as u64);
+    data[base + cols::C_TYPE_INSTRUCTION] = FE::from(op.c_type_instruction as u64);
+    data[base + cols::IMM_0] = FE::from(op.imm & 0xFFFF_FFFF);
+    data[base + cols::IMM_1] = FE::from(op.imm >> 32);
+    data[base + cols::SIGNED] = FE::from(op.signed as u64);
+    data[base + cols::MP_SELECTOR] = FE::from(op.mp_selector as u64);
+    data[base + cols::MULDIV_SELECTOR] = FE::from(op.muldiv_selector as u64);
+    data[base + cols::WORD_INSTR] = FE::from(op.word_instr as u64);
 
-        // ALU selector flags
-        data[base + cols::ADD] = FE::from(op.op_add as u64);
-        data[base + cols::SUB] = FE::from(op.op_sub as u64);
-        data[base + cols::SLT] = FE::from(op.op_slt as u64);
-        data[base + cols::AND] = FE::from(op.op_and as u64);
-        data[base + cols::OR] = FE::from(op.op_or as u64);
-        data[base + cols::XOR] = FE::from(op.op_xor as u64);
-        data[base + cols::SHIFT] = FE::from(op.op_shift as u64);
-        data[base + cols::JALR] = FE::from(op.op_jalr as u64);
-        data[base + cols::BEQ] = FE::from(op.op_beq as u64);
-        data[base + cols::BLT] = FE::from(op.op_blt as u64);
-        data[base + cols::LOAD] = FE::from(op.op_load as u64);
-        data[base + cols::STORE] = FE::from(op.op_store as u64);
-        data[base + cols::MUL] = FE::from(op.op_mul as u64);
-        data[base + cols::DIVREM] = FE::from(op.op_divrem as u64);
-        data[base + cols::ECALL] = FE::from(op.op_ecall as u64);
-        data[base + cols::EBREAK] = FE::from(op.op_ebreak as u64);
+    // ALU selector flags
+    data[base + cols::ADD] = FE::from(op.op_add as u64);
+    data[base + cols::SUB] = FE::from(op.op_sub as u64);
+    data[base + cols::SLT] = FE::from(op.op_slt as u64);
+    data[base + cols::AND] = FE::from(op.op_and as u64);
+    data[base + cols::OR] = FE::from(op.op_or as u64);
+    data[base + cols::XOR] = FE::from(op.op_xor as u64);
+    data[base + cols::SHIFT] = FE::from(op.op_shift as u64);
+    data[base + cols::JALR] = FE::from(op.op_jalr as u64);
+    data[base + cols::BEQ] = FE::from(op.op_beq as u64);
+    data[base + cols::BLT] = FE::from(op.op_blt as u64);
+    data[base + cols::LOAD] = FE::from(op.op_load as u64);
+    data[base + cols::STORE] = FE::from(op.op_store as u64);
+    data[base + cols::MUL] = FE::from(op.op_mul as u64);
+    data[base + cols::DIVREM] = FE::from(op.op_divrem as u64);
+    data[base + cols::ECALL] = FE::from(op.op_ecall as u64);
+    data[base + cols::EBREAK] = FE::from(op.op_ebreak as u64);
 
-        // Output columns
-        data[base + cols::NEXT_PC_0] = FE::from(op.next_pc & 0xFFFF_FFFF);
-        data[base + cols::NEXT_PC_1] = FE::from(op.next_pc >> 32);
+    // Output columns
+    data[base + cols::NEXT_PC_0] = FE::from(op.next_pc & 0xFFFF_FFFF);
+    data[base + cols::NEXT_PC_1] = FE::from(op.next_pc >> 32);
 
-        // rvd: For LOAD, use the executor's loaded value (op.rvd).
-        // For all other operations (including STORE), compute from res with sign extension.
-        // This satisfies spec constraint: (1-LOAD) * (rvd - res_extended) = 0
-        let rvd = if op.op_load {
-            op.rvd // Loaded value from executor
-        } else {
-            op.compute_rvd() // res with sign extension for word instructions
-        };
-        data[base + cols::RVD_0] = FE::from(rvd & 0xFFFF_FFFF);
-        data[base + cols::RVD_1] = FE::from(rvd >> 32);
+    // rvd: For LOAD, use the executor's loaded value (op.rvd).
+    // For all other operations (including STORE), compute from res with sign extension.
+    // This satisfies spec constraint: (1-LOAD) * (rvd - res_extended) = 0
+    let rvd = if op.op_load {
+        op.rvd // Loaded value from executor
+    } else {
+        op.compute_rvd() // res with sign extension for word instructions
+    };
+    data[base + cols::RVD_0] = FE::from(rvd & 0xFFFF_FFFF);
+    data[base + cols::RVD_1] = FE::from(rvd >> 32);
 
-        // Auxiliary: rv1 as DWordWHH [Half, Half, Word] - Word is MSB (bits 32-63)
-        data[base + cols::RV1_0] = FE::from(op.rv1 & 0xFFFF); // bits 0-15 (Half)
-        data[base + cols::RV1_1] = FE::from((op.rv1 >> 16) & 0xFFFF); // bits 16-31 (Half)
-        data[base + cols::RV1_2] = FE::from(op.rv1 >> 32); // bits 32-63 (Word)
+    // Auxiliary: rv1 as DWordWHH [Half, Half, Word] - Word is MSB (bits 32-63)
+    data[base + cols::RV1_0] = FE::from(op.rv1 & 0xFFFF); // bits 0-15 (Half)
+    data[base + cols::RV1_1] = FE::from((op.rv1 >> 16) & 0xFFFF); // bits 16-31 (Half)
+    data[base + cols::RV1_2] = FE::from(op.rv1 >> 32); // bits 32-63 (Word)
 
-        // Auxiliary: rv2 as DWordWHH [Half, Half, Word] - Word is MSB (bits 32-63)
-        data[base + cols::RV2_0] = FE::from(op.rv2 & 0xFFFF); // bits 0-15 (Half)
-        data[base + cols::RV2_1] = FE::from((op.rv2 >> 16) & 0xFFFF); // bits 16-31 (Half)
-        data[base + cols::RV2_2] = FE::from(op.rv2 >> 32); // bits 32-63 (Word)
+    // Auxiliary: rv2 as DWordWHH [Half, Half, Word] - Word is MSB (bits 32-63)
+    data[base + cols::RV2_0] = FE::from(op.rv2 & 0xFFFF); // bits 0-15 (Half)
+    data[base + cols::RV2_1] = FE::from((op.rv2 >> 16) & 0xFFFF); // bits 16-31 (Half)
+    data[base + cols::RV2_2] = FE::from(op.rv2 >> 32); // bits 32-63 (Word)
 
-        // Sign bits - only set when word_instr=1, per spec constraint ext_sign_bits
-        // The constraint enforces: (rv1_sign_bit + arg2_sign_bit + res_sign_bit) * (1 - word_instr) = 0
-        let rv1_sign_bit = op.word_instr && CpuOperation::sign_bit_32(op.rv1);
-        data[base + cols::RV1_SIGN_BIT] = FE::from(rv1_sign_bit as u64);
+    // Sign bits - only set when word_instr=1, per spec constraint ext_sign_bits
+    // The constraint enforces: (rv1_sign_bit + arg2_sign_bit + res_sign_bit) * (1 - word_instr) = 0
+    let rv1_sign_bit = op.word_instr && CpuOperation::sign_bit_32(op.rv1);
+    data[base + cols::RV1_SIGN_BIT] = FE::from(rv1_sign_bit as u64);
 
-        // Compute and store arg1 as DWordBL (8 bytes)
-        let arg1 = op.compute_arg1();
-        for i in 0..8 {
-            data[base + cols::ARG1[i]] = FE::from((arg1 >> (i * 8)) & 0xFF);
-        }
+    // Compute and store arg1 as DWordBL (8 bytes)
+    let arg1 = op.compute_arg1();
+    for i in 0..8 {
+        data[base + cols::ARG1[i]] = FE::from((arg1 >> (i * 8)) & 0xFF);
+    }
 
-        // Compute and store arg2
-        let arg2 = op.compute_arg2();
-        let arg2_sign_bit = op.word_instr && CpuOperation::sign_bit_32(arg2);
-        data[base + cols::ARG2_SIGN_BIT] = FE::from(arg2_sign_bit as u64);
-        for i in 0..8 {
-            data[base + cols::ARG2[i]] = FE::from((arg2 >> (i * 8)) & 0xFF);
-        }
+    // Compute and store arg2
+    let arg2 = op.compute_arg2();
+    let arg2_sign_bit = op.word_instr && CpuOperation::sign_bit_32(arg2);
+    data[base + cols::ARG2_SIGN_BIT] = FE::from(arg2_sign_bit as u64);
+    for i in 0..8 {
+        data[base + cols::ARG2[i]] = FE::from((arg2 >> (i * 8)) & 0xFF);
+    }
 
-        // Result - computed from arg1/arg2 for ADD/SUB to satisfy constraints
-        let res = op.compute_res();
-        let res_sign_bit = op.word_instr && CpuOperation::sign_bit_32(res);
-        data[base + cols::RES_SIGN_BIT] = FE::from(res_sign_bit as u64);
-        for i in 0..8 {
-            data[base + cols::RES[i]] = FE::from((res >> (i * 8)) & 0xFF);
-        }
+    // Result - computed from arg1/arg2 for ADD/SUB to satisfy constraints
+    let res = op.compute_res();
+    let res_sign_bit = op.word_instr && CpuOperation::sign_bit_32(res);
+    data[base + cols::RES_SIGN_BIT] = FE::from(res_sign_bit as u64);
+    for i in 0..8 {
+        data[base + cols::RES[i]] = FE::from((res >> (i * 8)) & 0xFF);
+    }
 
     // Branch columns
     data[base + cols::IS_EQUAL] = FE::from(op.is_equal as u64);

@@ -244,7 +244,12 @@ impl DecodeEntry {
         };
 
         match instruction {
-            Instruction::Arith { dst, src1, src2, op } => {
+            Instruction::Arith {
+                dst,
+                src1,
+                src2,
+                op,
+            } => {
                 entry.rd = dst as u8;
                 entry.rs1 = src1 as u8;
                 entry.rs2 = src2 as u8;
@@ -268,7 +273,12 @@ impl DecodeEntry {
                 Self::set_arith_op(&mut entry, op, false);
             }
 
-            Instruction::ArithW { dst, src1, src2, op } => {
+            Instruction::ArithW {
+                dst,
+                src1,
+                src2,
+                op,
+            } => {
                 entry.rd = dst as u8;
                 entry.rs1 = src1 as u8;
                 entry.rs2 = src2 as u8;

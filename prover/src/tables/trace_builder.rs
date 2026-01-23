@@ -113,6 +113,11 @@ impl Traces {
         // Update DECODE multiplicities
         decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
 
-        Ok(Traces { cpu, bitwise, lt, decode })
+        Ok(Traces {
+            cpu,
+            bitwise,
+            lt,
+            decode,
+        })
     }
 }
