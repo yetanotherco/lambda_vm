@@ -13,9 +13,7 @@
 //! ```
 
 use executor::vm::execution::InstructionCache;
-use executor::vm::instruction::decoding::Instruction;
 use executor::vm::logs::Log;
-use executor::vm::memory::U64HashMap;
 use stark::trace::TraceTable;
 
 use super::bitwise;
