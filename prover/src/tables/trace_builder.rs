@@ -65,9 +65,9 @@ impl Traces {
         // Pre-allocate CPU trace data for streaming writes
         let mut cpu_data = cpu::create_cpu_trace(logs.len());
 
-        // Pre-allocate collectors for lookups (smaller than storing all CpuOperations)
-        let mut bitwise_lookups = Vec::with_capacity(logs.len() * 4);
-        let mut lt_ops = Vec::with_capacity(logs.len() / 10 + 1);
+        // Pre-allocate collectors for lookups
+        let mut bitwise_lookups = Vec::new();
+        let mut lt_ops = Vec::new();
         let mut decode_lookups = Vec::with_capacity(logs.len());
 
         // Process logs: stream CPU rows directly, collect only lookups
