@@ -6,6 +6,7 @@
   total_nr_variables,
   total_nr_instantiated_columns,
   render_constraint_table,
+  render_chip_padding_table,
 )
 
 #let config = load_config()
@@ -82,3 +83,12 @@ For @cpu:c:is_equal, refer to the logic of IsZero or IsEqual, in combination wit
 #render_constraint_table(chip, config, groups: "misc")
 
 #rj[Document the choice to not have a multiplicity column here for padding]
+
+== Padding
+
+The CPU can be padded with the following values, which have a corresponding row
+in the DECODE table, at the _odd_ address 1, only reachable through a HALT ecall.
+
+#render_chip_padding_table(chip, config)
+
+This approach minimizes the number of dependent lookups, increasing only multiplicities in the DECODE table and the IS_BYTE lookup.
