@@ -47,3 +47,46 @@
            align(center, strong(text(fill: black, title))))
     #align(left, body)
 ])
+
+#let is-shiroa = is-web-target()
+
+#show figure: repr
+
+#let _xref-included = state("_xref-included", (:))
+
+#let strip-all(content) = {
+  if repr(content.func()) == "sequence" {
+    for c in content.children {
+      strip-all(c)
+    }
+  } else if repr(content.func()) == "styled" {
+    strip-all(content.child)
+  } else {
+    content
+  }
+}
+
+#let xref(file, lbl, ..ref-args) = {
+  if is-shiroa {
+    // Because shiroa does weird url escaping
+    let shiroa-label = label(str(lbl).replace(":", "%3A"))
+    context if file not in _xref-included.get() {
+        // Let's blow up the compile times :)
+        hide(box(width: 0%, height: 0%, strip-all(include file)))
+        _xref-included.update(it => it + ((file): true))
+    }
+    let link-content = context {
+      let fig = query(lbl).first()
+      let counter = if fig.has("counter") {
+        fig.counter
+      } else {
+        counter(fig.func())
+      }
+
+      [#ref-args.named().at("supplement", default: [])#numbering(fig.numbering, ..counter.at(lbl))]
+    }
+    cross-link(file, reference: shiroa-label, link-content)
+  } else {
+    ref(lbl, ..ref-args)
+  }
+}

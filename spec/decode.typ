@@ -1,4 +1,4 @@
-#import "/book.typ": book-page, rj
+#import "/book.typ": book-page, rj, xref
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   render_chip_assumptions,
@@ -36,7 +36,7 @@ Empty rows with the following content can be added to achieve this:
 #render_chip_padding_table(chip, config)
 
 Note that this row sets the `EBREAK` flag.
-Given that `CPU` asserts that `EBREAK = 0` (see @cpu:c:ebreak_traps), using this "padding-instruction" would immediately make the CPU table unprovable.
+Given that `CPU` asserts that `EBREAK = 0` (see #xref("/cpu.typ", <cpu:c:ebreak_traps>)), using this "padding-instruction" would immediately make the CPU table unprovable.
 Note moreover that the `pc` is set to $7$.
 This value is the _smallest odd number_ (i.e., not reachable during regular execution) that is more than _$4$_ (i.e., the max `pc`-increment) greater than _$1$_ (i.e., the `pc`-value used in the #link(<cpu-padding-decode-row>)[additional instruction] referred to by `CPU`-padding lines).
 
