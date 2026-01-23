@@ -8,10 +8,7 @@ crate-type = ["cdylib", "rlib"]
 
 
 [dependencies]
-math = { path = "../math", features = [
-    "std",
-    "lambdaworks-serde-binary",
-] }
+math = { path = "../math", features = ["std", "lambdaworks-serde-binary"] }
 crypto = { path = "../crypto", features = ["std", "serde"] }
 rand = "0.8.5"
 thiserror = "1.0.38"
@@ -47,6 +44,7 @@ test_fiat_shamir = []
 instruments = []                                                     # This enables timing prints in prover and verifier
 parallel = ["dep:rayon", "crypto/parallel"]
 wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "dep:web-sys"]
+poseidon2 = ["crypto/poseidon2"]
 
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dev-dependencies]
 proptest = "1.2.0"
