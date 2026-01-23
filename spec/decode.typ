@@ -53,7 +53,7 @@ We will illustrate how each instruction should be expressed in this (uncompresse
 The columns of the accompanying table represent the following:
 - *`operation`*: the assembly operation being encoded,
 - *`op-flag`*: which of the "`ALU` selector flags" operation flags to set. Each operation sets exactly one.
-- *`w_reg`*, *`w_instr`*, *`signed`*: whether to set the `write_register`, `word_instr` or `signed` flag, respectively,
+- *`w_instr`* and *`signed`*: whether to set the `word_instr` respectively `signed` flag,
 - *other*: the other flags that should be set or variables that should be given specific values.
 
 For the purpose of brevity and readability, the table uses the following rules-of-thumb:
@@ -100,37 +100,37 @@ To indicate an instruction is provided in compressed form, the `c_type` flag is 
 
 #let decoding = (
     // OP-IMM
-  ([`ADDI[W]   rd, rs1, imm`], [`ADD`], [`[W]`], [], [], [#ref_note(<note_w_reg>, <note_word_instr>)]),
-  ([`SLTI[U]   rd, rs1, imm`], [`SLT`], [], [#sym.not`[U]`], [], [#ref_note(<note_w_reg>, <note_signed>)]),
-  ([`ANDI      rd, rs1, imm`], [`AND`], [], [], [], [#ref_note(<note_w_reg>)]),
-  ([`ORI       rd, rs1, imm`], [`OR`],   [], [], [], [#ref_note(<note_w_reg>)]),
-  ([`XORI      rd, rs1, imm`], [`XOR`], [], [], [], [#ref_note(<note_w_reg>)]),
-  ([`SLLI[W]   rd, rs1, imm`], [`SHIFT`], [`[W]`], [], [], [#ref_note(<note_w_reg>)]),
-  ([`SRLI[W]   rd, rs1, imm`], [`SHIFT`], [`[W]`], [], [`mp_selector`], [#ref_note(<note_w_reg>, <note_word_instr>)]),
-  ([`SRAI[W]   rd, rs1, imm`], [`SHIFT`], [`[W]`], [1], [`mp_selector`], [#ref_note(<note_w_reg>, <note_word_instr>)]),
+  ([`ADDI[W]   rd, rs1, imm`], [`ADD`], [`[W]`], [], [], [#ref_note(<note_word_instr>)]),
+  ([`SLTI[U]   rd, rs1, imm`], [`SLT`], [], [#sym.not`[U]`], [], [#ref_note(<note_signed>)]),
+  ([`ANDI      rd, rs1, imm`], [`AND`], [], [], [], []),
+  ([`ORI       rd, rs1, imm`], [`OR`],   [], [], [], []),
+  ([`XORI      rd, rs1, imm`], [`XOR`], [], [], [], []),
+  ([`SLLI[W]   rd, rs1, imm`], [`SHIFT`], [`[W]`], [], [], []),
+  ([`SRLI[W]   rd, rs1, imm`], [`SHIFT`], [`[W]`], [], [`mp_selector`], [#ref_note(<note_word_instr>)]),
+  ([`SRAI[W]   rd, rs1, imm`], [`SHIFT`], [`[W]`], [1], [`mp_selector`], [#ref_note(<note_word_instr>)]),
   // OP
-  ([`ADD[W]    rd, rs1, rs2`], [`ADD`], [`[W]`], [], [], [#ref_note(<note_w_reg>, <note_word_instr>)]),
-  ([`SUB[W]    rd, rs1, rs2`], [`SUB`], [`[W]`], [], [], [#ref_note(<note_w_reg>, <note_word_instr>)]),
-  ([`SLT[U]    rd, rs1, rs2`], [`SLT`], [], [#sym.not`[U]`], [], [#ref_note(<note_w_reg>, <note_signed>)]),
-  ([`AND       rd, rs1, rs2`], [`AND`], [], [], [], [#ref_note(<note_w_reg>)]),
-  ([`OR        rd, rs1, rs2`], [`OR`], [], [], [], [#ref_note(<note_w_reg>)]),
-  ([`XOR       rd, rs1, rs2`], [`XOR`], [], [], [], [#ref_note(<note_w_reg>)]),
-  ([`SLL[W]    rd, rs1, rs2`], [`SHIFT`], [`[W]`], [], [], [#ref_note(<note_w_reg>, <note_word_instr>)]),
-  ([`SRL[W]    rd, rs1, rs2`], [`SHIFT`], [`[W]`], [], [`mp_selector`], [#ref_note(<note_w_reg>, <note_word_instr>)]),
-  ([`SRA[W]    rd, rs1, rs2`], [`SHIFT`], [`[W]`], [1], [`mp_selector`], [#ref_note(<note_w_reg>, <note_word_instr>)]),
+  ([`ADD[W]    rd, rs1, rs2`], [`ADD`], [`[W]`], [], [], [#ref_note(<note_word_instr>)]),
+  ([`SUB[W]    rd, rs1, rs2`], [`SUB`], [`[W]`], [], [], [#ref_note(<note_word_instr>)]),
+  ([`SLT[U]    rd, rs1, rs2`], [`SLT`], [], [#sym.not`[U]`], [], [#ref_note(<note_signed>)]),
+  ([`AND       rd, rs1, rs2`], [`AND`], [], [], [], []),
+  ([`OR        rd, rs1, rs2`], [`OR`], [], [], [], []),
+  ([`XOR       rd, rs1, rs2`], [`XOR`], [], [], [], []),
+  ([`SLL[W]    rd, rs1, rs2`], [`SHIFT`], [`[W]`], [], [], [#ref_note(<note_word_instr>)]),
+  ([`SRL[W]    rd, rs1, rs2`], [`SHIFT`], [`[W]`], [], [`mp_selector`], [#ref_note(<note_word_instr>)]),
+  ([`SRA[W]    rd, rs1, rs2`], [`SHIFT`], [`[W]`], [1], [`mp_selector`], [#ref_note(<note_word_instr>)]),
   // OP - M
-  ([`MUL[W]    rd, rs1, rs2`], [`MUL`], [`[W]`], [1], [`mp_selector`], [#ref_note(<note_w_reg>, <note_word_instr>)]),
-  ([`MULH      rd, rs1, rs2`], [`MUL`], [], [1], [`mp_selector`, `muldiv_selector`], [#ref_note(<note_w_reg>)]),
-  ([`MULHU     rd, rs1, rs2`], [`MUL`], [], [], [`muldiv_selector`], [#ref_note(<note_w_reg>)]),
-  ([`MULHSU    rd, rs1, rs2`], [`MUL`], [], [1], [`muldiv_selector`], [#ref_note(<note_w_reg>)]),
-  ([`DIV[U][W] rd, rs1, rs2`], [`DIVREM`], [`[W]`], [#sym.not`[U]`], [], [#ref_note(<note_w_reg>, <note_word_instr>, <note_signed>)]),
-  ([`REM[U][W] rd, rs1, rs2`], [`DIVREM`], [`[W]`], [#sym.not`[U]`], [`muldiv_selector`], [#ref_note(<note_w_reg>, <note_word_instr>, <note_signed>)]),
+  ([`MUL[W]    rd, rs1, rs2`], [`MUL`], [`[W]`], [1], [`mp_selector`], [#ref_note(<note_word_instr>)]),
+  ([`MULH      rd, rs1, rs2`], [`MUL`], [], [1], [`mp_selector`, `muldiv_selector`], []),
+  ([`MULHU     rd, rs1, rs2`], [`MUL`], [], [], [`muldiv_selector`], []),
+  ([`MULHSU    rd, rs1, rs2`], [`MUL`], [], [1], [`muldiv_selector`], []),
+  ([`DIV[U][W] rd, rs1, rs2`], [`DIVREM`], [`[W]`], [#sym.not`[U]`], [], [#ref_note(<note_word_instr>, <note_signed>)]),
+  ([`REM[U][W] rd, rs1, rs2`], [`DIVREM`], [`[W]`], [#sym.not`[U]`], [`muldiv_selector`], [#ref_note(<note_word_instr>, <note_signed>)]),
   // LUI/AUIPC
-  ([`LUI       rd, imm`], [`ADD`], [], [], [], [#ref_note(<note_w_reg>, <note-lui>)]),
-  ([`AUIPC     rd, imm`], [`ADD`], [], [], [`rs1 := x255`], [#ref_note(<note_w_reg>, <note-auipc>)]),
-  ([`JAL       rd, imm`], [`JALR`], [], [], [`rs1 := x255`], [#ref_note(<note_w_reg>, <note-jal>)]),
+  ([`LUI       rd, imm`], [`ADD`], [], [], [], [#ref_note(<note-lui>)]),
+  ([`AUIPC     rd, imm`], [`ADD`], [], [], [`rs1 := x255`], [#ref_note(<note-auipc>)]),
+  ([`JAL       rd, imm`], [`JALR`], [], [], [`rs1 := x255`], [#ref_note(<note-jal>)]),
   // Branching
-  ([`JALR      rd, rs1, imm`], [`JALR`], [], [], [], [#ref_note(<note_w_reg>)]),
+  ([`JALR      rd, rs1, imm`], [`JALR`], [], [], [], []),
   ([`BEQ      rs1, rs2, imm`], [`BEQ`], [], [], [], []),
   ([`BNE      rs1, rs2, imm`], [`BEQ`], [], [], [`mp_selector`], []),
   ([`BLT[U]   rs1, rs2, imm`], [`BLT`], [], [#sym.not`[U]`], [], [#ref_note(<note_signed>)]),
@@ -165,14 +165,8 @@ We note the following about the above decoding table:
 #enum(numbering: "[1]",
   enum.item(
     referenceable_note(
-      "note_w_reg",
-      [`write_register`: $#`rd` eq.not 0$ indicates that $#`write_register` = 1$ when $#`rd` eq.not 0$ and $0$ otherwise.]
-    )
-  ),
-  enum.item(
-    referenceable_note(
       "note_word_instr",
-      [`word_instr`: `[W]` indicates that $#`word_instr` = 0$ for the `W`-variant of the operation, and $0$ for the non-`W`-variant.]
+      [`word_instr`: `[W]` indicates that $#`word_instr` = 1$ for the `W`-variant of the operation, and $0$ for the non-`W`-variant.]
     )
   ),
   enum.item(
@@ -200,9 +194,9 @@ We note the following about the above decoding table:
   enum.item(
     referenceable_note(
       "note-jal",
-      [`JAL`: this operation stores `pc + 4` in `rd` and adds two times the sign-extended 20-bit immediate to the `pc`.
+      [`JAL`: this operation stores $#`pc` + 4$ in `rd` and adds two times the sign-extended 20-bit immediate to the `pc`.
       Note that this can be represented using `JALR rd, x255, imm`.
-      As such, *we expect the decoding to take care of writing the immediate in bit range $[1:13]$ of `imm` and extending it to 64 bits; the least significant bit should always be 0.*]
+      As such, *we expect the decoding to take care of writing the immediate in bit range $[1:21]$ of `imm` and extending it to 64 bits; the least significant bit should always be 0.*]
     )
   ),
   enum.item(
