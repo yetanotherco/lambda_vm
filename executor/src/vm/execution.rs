@@ -165,7 +165,14 @@ impl InstructionCache {
     }
 
     pub fn into_instruction_map(self) -> U64HashMap<Instruction> {
-        todo!()
+        let mut map = U64HashMap::default();
+        for segment in self.segments {
+            for (i, instruction) in segment.instructions.into_iter().enumerate() {
+                let addr = segment.base_addr + (i as u64 * 4);
+                map.insert(addr, instruction);
+            }
+        }
+        map
     }
 }
 
