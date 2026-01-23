@@ -51,7 +51,7 @@ fn test_symbol_lookup_exact_match() {
 #[test]
 fn test_symbol_lookup_within_function() {
     let table = make_symbol_table(vec![
-        ("main", 0x1000, 100),  // covers 0x1000-0x1063
+        ("main", 0x1000, 100), // covers 0x1000-0x1063
         ("foo", 0x1100, 50),
     ]);
 
@@ -69,10 +69,7 @@ fn test_symbol_lookup_within_function() {
 
 #[test]
 fn test_symbol_lookup_outside_bounds() {
-    let table = make_symbol_table(vec![
-        ("main", 0x1000, 100),
-        ("foo", 0x1200, 50),
-    ]);
+    let table = make_symbol_table(vec![("main", 0x1000, 100), ("foo", 0x1200, 50)]);
 
     // Address before first function
     assert!(table.lookup(0x500).is_none());
@@ -87,10 +84,7 @@ fn test_symbol_lookup_outside_bounds() {
 #[test]
 fn test_symbol_lookup_zero_size() {
     // Zero-size symbols (common in ASM) should match any address >= start
-    let table = make_symbol_table(vec![
-        ("asm_func", 0x1000, 0),
-        ("next_func", 0x1100, 50),
-    ]);
+    let table = make_symbol_table(vec![("asm_func", 0x1000, 0), ("next_func", 0x1100, 50)]);
 
     // Should match asm_func since size is 0
     let sym = table.lookup(0x1000).unwrap();
@@ -136,10 +130,7 @@ fn test_symbol_lookup_overlapping_functions() {
 
 #[test]
 fn test_flamegraph_simple_call_return() {
-    let symbols = make_symbol_table(vec![
-        ("main", 0x1000, 100),
-        ("foo", 0x2000, 50),
-    ]);
+    let symbols = make_symbol_table(vec![("main", 0x1000, 100), ("foo", 0x2000, 50)]);
     let mut generator = FlamegraphGenerator::new(symbols, 0x1000);
 
     // Simulate: main calls foo, foo returns
@@ -153,19 +144,68 @@ fn test_flamegraph_simple_call_return() {
         (0x2000, nop_instruction()),
         (0x2004, nop_instruction()),
         // foo: return (JALR with base=ra, dst=zero)
-        (0x2008, Instruction::JumpAndLinkRegister { dst: 0, base: 1, offset: 0 }),
+        (
+            0x2008,
+            Instruction::JumpAndLinkRegister {
+                dst: 0,
+                base: 1,
+                offset: 0,
+            },
+        ),
         // main: after return
         (0x100c, nop_instruction()),
     ]);
 
     let logs = vec![
-        Log { current_pc: 0x1000, next_pc: 0x1004, src1_val: 0, src2_val: 0, dst_val: 0 },
-        Log { current_pc: 0x1004, next_pc: 0x1008, src1_val: 0, src2_val: 0, dst_val: 0 },
-        Log { current_pc: 0x1008, next_pc: 0x2000, src1_val: 0, src2_val: 0, dst_val: 0 }, // call
-        Log { current_pc: 0x2000, next_pc: 0x2004, src1_val: 0, src2_val: 0, dst_val: 0 },
-        Log { current_pc: 0x2004, next_pc: 0x2008, src1_val: 0, src2_val: 0, dst_val: 0 },
-        Log { current_pc: 0x2008, next_pc: 0x100c, src1_val: 0, src2_val: 0, dst_val: 0 }, // return
-        Log { current_pc: 0x100c, next_pc: 0x1010, src1_val: 0, src2_val: 0, dst_val: 0 },
+        Log {
+            current_pc: 0x1000,
+            next_pc: 0x1004,
+            src1_val: 0,
+            src2_val: 0,
+            dst_val: 0,
+        },
+        Log {
+            current_pc: 0x1004,
+            next_pc: 0x1008,
+            src1_val: 0,
+            src2_val: 0,
+            dst_val: 0,
+        },
+        Log {
+            current_pc: 0x1008,
+            next_pc: 0x2000,
+            src1_val: 0,
+            src2_val: 0,
+            dst_val: 0,
+        }, // call
+        Log {
+            current_pc: 0x2000,
+            next_pc: 0x2004,
+            src1_val: 0,
+            src2_val: 0,
+            dst_val: 0,
+        },
+        Log {
+            current_pc: 0x2004,
+            next_pc: 0x2008,
+            src1_val: 0,
+            src2_val: 0,
+            dst_val: 0,
+        },
+        Log {
+            current_pc: 0x2008,
+            next_pc: 0x100c,
+            src1_val: 0,
+            src2_val: 0,
+            dst_val: 0,
+        }, // return
+        Log {
+            current_pc: 0x100c,
+            next_pc: 0x1010,
+            src1_val: 0,
+            src2_val: 0,
+            dst_val: 0,
+        },
     ];
 
     generator.process_logs(&logs, &instructions).unwrap();
@@ -190,14 +230,39 @@ fn test_flamegraph_stack_underflow_protection() {
     let instructions = make_instructions(vec![
         (0x1000, nop_instruction()),
         // Return instruction at root level
-        (0x1004, Instruction::JumpAndLinkRegister { dst: 0, base: 1, offset: 0 }),
+        (
+            0x1004,
+            Instruction::JumpAndLinkRegister {
+                dst: 0,
+                base: 1,
+                offset: 0,
+            },
+        ),
         (0x1008, nop_instruction()),
     ]);
 
     let logs = vec![
-        Log { current_pc: 0x1000, next_pc: 0x1004, src1_val: 0, src2_val: 0, dst_val: 0 },
-        Log { current_pc: 0x1004, next_pc: 0x1008, src1_val: 0, src2_val: 0, dst_val: 0 }, // return at root
-        Log { current_pc: 0x1008, next_pc: 0x100c, src1_val: 0, src2_val: 0, dst_val: 0 },
+        Log {
+            current_pc: 0x1000,
+            next_pc: 0x1004,
+            src1_val: 0,
+            src2_val: 0,
+            dst_val: 0,
+        },
+        Log {
+            current_pc: 0x1004,
+            next_pc: 0x1008,
+            src1_val: 0,
+            src2_val: 0,
+            dst_val: 0,
+        }, // return at root
+        Log {
+            current_pc: 0x1008,
+            next_pc: 0x100c,
+            src1_val: 0,
+            src2_val: 0,
+            dst_val: 0,
+        },
     ];
 
     // Should not panic
@@ -231,18 +296,67 @@ fn test_flamegraph_tail_call() {
         (0x2004, Instruction::JumpAndLink { dst: 0, offset: 0 }),
         (0x3000, nop_instruction()),
         // bar: return
-        (0x3004, Instruction::JumpAndLinkRegister { dst: 0, base: 1, offset: 0 }),
+        (
+            0x3004,
+            Instruction::JumpAndLinkRegister {
+                dst: 0,
+                base: 1,
+                offset: 0,
+            },
+        ),
         (0x1008, nop_instruction()),
     ]);
 
     let logs = vec![
-        Log { current_pc: 0x1000, next_pc: 0x1004, src1_val: 0, src2_val: 0, dst_val: 0 },
-        Log { current_pc: 0x1004, next_pc: 0x2000, src1_val: 0, src2_val: 0, dst_val: 0 }, // call foo
-        Log { current_pc: 0x2000, next_pc: 0x2004, src1_val: 0, src2_val: 0, dst_val: 0 },
-        Log { current_pc: 0x2004, next_pc: 0x3000, src1_val: 0, src2_val: 0, dst_val: 0 }, // tail call bar
-        Log { current_pc: 0x3000, next_pc: 0x3004, src1_val: 0, src2_val: 0, dst_val: 0 },
-        Log { current_pc: 0x3004, next_pc: 0x1008, src1_val: 0, src2_val: 0, dst_val: 0 }, // return
-        Log { current_pc: 0x1008, next_pc: 0x100c, src1_val: 0, src2_val: 0, dst_val: 0 },
+        Log {
+            current_pc: 0x1000,
+            next_pc: 0x1004,
+            src1_val: 0,
+            src2_val: 0,
+            dst_val: 0,
+        },
+        Log {
+            current_pc: 0x1004,
+            next_pc: 0x2000,
+            src1_val: 0,
+            src2_val: 0,
+            dst_val: 0,
+        }, // call foo
+        Log {
+            current_pc: 0x2000,
+            next_pc: 0x2004,
+            src1_val: 0,
+            src2_val: 0,
+            dst_val: 0,
+        },
+        Log {
+            current_pc: 0x2004,
+            next_pc: 0x3000,
+            src1_val: 0,
+            src2_val: 0,
+            dst_val: 0,
+        }, // tail call bar
+        Log {
+            current_pc: 0x3000,
+            next_pc: 0x3004,
+            src1_val: 0,
+            src2_val: 0,
+            dst_val: 0,
+        },
+        Log {
+            current_pc: 0x3004,
+            next_pc: 0x1008,
+            src1_val: 0,
+            src2_val: 0,
+            dst_val: 0,
+        }, // return
+        Log {
+            current_pc: 0x1008,
+            next_pc: 0x100c,
+            src1_val: 0,
+            src2_val: 0,
+            dst_val: 0,
+        },
     ];
 
     generator.process_logs(&logs, &instructions).unwrap();
@@ -261,27 +375,68 @@ fn test_flamegraph_tail_call() {
 
 #[test]
 fn test_flamegraph_indirect_call() {
-    let symbols = make_symbol_table(vec![
-        ("main", 0x1000, 100),
-        ("callback", 0x2000, 50),
-    ]);
+    let symbols = make_symbol_table(vec![("main", 0x1000, 100), ("callback", 0x2000, 50)]);
     let mut generator = FlamegraphGenerator::new(symbols, 0x1000);
 
     let instructions = make_instructions(vec![
         (0x1000, nop_instruction()),
         // Indirect call via JALR with dst=ra (register 1)
-        (0x1004, Instruction::JumpAndLinkRegister { dst: 1, base: 5, offset: 0 }),
+        (
+            0x1004,
+            Instruction::JumpAndLinkRegister {
+                dst: 1,
+                base: 5,
+                offset: 0,
+            },
+        ),
         (0x2000, nop_instruction()),
-        (0x2004, Instruction::JumpAndLinkRegister { dst: 0, base: 1, offset: 0 }),
+        (
+            0x2004,
+            Instruction::JumpAndLinkRegister {
+                dst: 0,
+                base: 1,
+                offset: 0,
+            },
+        ),
         (0x1008, nop_instruction()),
     ]);
 
     let logs = vec![
-        Log { current_pc: 0x1000, next_pc: 0x1004, src1_val: 0, src2_val: 0, dst_val: 0 },
-        Log { current_pc: 0x1004, next_pc: 0x2000, src1_val: 0, src2_val: 0, dst_val: 0 }, // indirect call
-        Log { current_pc: 0x2000, next_pc: 0x2004, src1_val: 0, src2_val: 0, dst_val: 0 },
-        Log { current_pc: 0x2004, next_pc: 0x1008, src1_val: 0, src2_val: 0, dst_val: 0 }, // return
-        Log { current_pc: 0x1008, next_pc: 0x100c, src1_val: 0, src2_val: 0, dst_val: 0 },
+        Log {
+            current_pc: 0x1000,
+            next_pc: 0x1004,
+            src1_val: 0,
+            src2_val: 0,
+            dst_val: 0,
+        },
+        Log {
+            current_pc: 0x1004,
+            next_pc: 0x2000,
+            src1_val: 0,
+            src2_val: 0,
+            dst_val: 0,
+        }, // indirect call
+        Log {
+            current_pc: 0x2000,
+            next_pc: 0x2004,
+            src1_val: 0,
+            src2_val: 0,
+            dst_val: 0,
+        },
+        Log {
+            current_pc: 0x2004,
+            next_pc: 0x1008,
+            src1_val: 0,
+            src2_val: 0,
+            dst_val: 0,
+        }, // return
+        Log {
+            current_pc: 0x1008,
+            next_pc: 0x100c,
+            src1_val: 0,
+            src2_val: 0,
+            dst_val: 0,
+        },
     ];
 
     generator.process_logs(&logs, &instructions).unwrap();
@@ -299,13 +454,15 @@ fn test_flamegraph_unknown_symbols() {
     let symbols = SymbolTable::default();
     let mut generator = FlamegraphGenerator::new(symbols, 0x1000);
 
-    let instructions = make_instructions(vec![
-        (0x1000, nop_instruction()),
-    ]);
+    let instructions = make_instructions(vec![(0x1000, nop_instruction())]);
 
-    let logs = vec![
-        Log { current_pc: 0x1000, next_pc: 0x1004, src1_val: 0, src2_val: 0, dst_val: 0 },
-    ];
+    let logs = vec![Log {
+        current_pc: 0x1000,
+        next_pc: 0x1004,
+        src1_val: 0,
+        src2_val: 0,
+        dst_val: 0,
+    }];
 
     generator.process_logs(&logs, &instructions).unwrap();
 
@@ -325,9 +482,13 @@ fn test_flamegraph_instruction_not_found_error() {
     // Empty instruction map
     let instructions = make_instructions(vec![]);
 
-    let logs = vec![
-        Log { current_pc: 0x1000, next_pc: 0x1004, src1_val: 0, src2_val: 0, dst_val: 0 },
-    ];
+    let logs = vec![Log {
+        current_pc: 0x1000,
+        next_pc: 0x1004,
+        src1_val: 0,
+        src2_val: 0,
+        dst_val: 0,
+    }];
 
     let result = generator.process_logs(&logs, &instructions);
     assert!(result.is_err());

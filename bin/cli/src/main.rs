@@ -28,8 +28,8 @@ fn main() {
     // Save entry_point before moving program.image into run_program
     let entry_point = program.entry_point;
 
-    let execution_result = run_program(program.image, entry_point, vec![])
-        .expect("Failed to run program");
+    let execution_result =
+        run_program(program.image, entry_point, vec![]).expect("Failed to run program");
 
     // Generate flamegraph if requested
     if let Some(output_path) = args.flamegraph {
