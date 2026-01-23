@@ -21,6 +21,7 @@ use math::field::element::FieldElement;
 use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData, NullBoundaryConstraintBuilder};
 use stark::proof::options::ProofOptions;
+use stark::proof::stark::MultiProof;
 use stark::prover::{IsStarkProver, Prover};
 use stark::trace::TraceTable;
 use stark::traits::AIR;
@@ -42,6 +43,8 @@ type F = prover::tables::types::GoldilocksField;
 type E = prover::tables::types::GoldilocksExtension;
 type FE = FieldElement<F>;
 
+type CpuAir = AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()>;
+
 /// Configuration for a benchmark case
 struct BenchConfig {
     name: &'static str,
@@ -61,7 +64,7 @@ impl BenchConfig {
 
 /// Benchmark configurations
 const CONFIGS: &[BenchConfig] = &[
-    BenchConfig::new("vm_32k", "bench_32k", 32768), // 2^15 CPU rows.
+    BenchConfig::new("vm_32k", "bench_32k", 32768), // 2^15 = 32768 rows.
 ];
 
 /// Creates proof options suitable for benchmarking
@@ -323,9 +326,7 @@ fn generate_minimal_bitwise_trace(lookups: &[(BitwiseLookup, u8, u8, u8)]) -> Tr
 // AIR creation helpers
 // =============================================================================
 
-fn create_cpu_air(
-    proof_options: &ProofOptions,
-) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+fn create_cpu_air(proof_options: &ProofOptions) -> CpuAir {
     // Get all CPU constraints
     let (is_bit, add, other, _) = create_all_cpu_constraints();
 
@@ -354,9 +355,7 @@ fn create_cpu_air(
     )
 }
 
-fn create_bitwise_air(
-    proof_options: &ProofOptions,
-) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+fn create_bitwise_air(proof_options: &ProofOptions) -> CpuAir {
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
@@ -372,9 +371,7 @@ fn create_bitwise_air(
     )
 }
 
-fn create_lt_air(
-    proof_options: &ProofOptions,
-) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+fn create_lt_air(proof_options: &ProofOptions) -> CpuAir {
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
@@ -390,17 +387,23 @@ fn create_lt_air(
     )
 }
 
-/// Generate all traces from ELF execution.
-fn generate_traces_from_elf(
+fn create_airs(proof_options: &ProofOptions) -> (CpuAir, CpuAir, CpuAir) {
+    (
+        create_cpu_air(proof_options),
+        create_bitwise_air(proof_options),
+        create_lt_air(proof_options),
+    )
+}
+
+// =============================================================================
+// Helper functions for benchmarking
+// =============================================================================
+
+/// Execute ELF and generate traces (ELF execution + trace generation)
+fn execute_program(
     elf_name: &str,
     expected_steps: usize,
-) -> (
-    TraceTable<F, E>,
-    TraceTable<F, E>,
-    TraceTable<F, E>,
-    usize, // bitwise lookups count
-    usize, // lt ops count
-) {
+) -> (TraceTable<F, E>, TraceTable<F, E>, TraceTable<F, E>) {
     // Run the ELF program
     let (logs, instructions) = run_asm_elf(elf_name);
     assert_eq!(
@@ -428,99 +431,182 @@ fn generate_traces_from_elf(
     // Generate minimal bitwise trace for speed
     let bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
 
-    let bitwise_count = bitwise_lookups.len();
-    let lt_count = lt_ops.len();
-
-    (cpu_trace, bitwise_trace, lt_trace, bitwise_count, lt_count)
+    (cpu_trace, bitwise_trace, lt_trace)
 }
 
-/// Benchmark proving for a configuration
-fn bench_prove(c: &mut Criterion, group_name: &str, config: &BenchConfig) {
+/// Run multi_prove on the given traces and AIRs
+fn prove(
+    cpu_air: &CpuAir,
+    bitwise_air: &CpuAir,
+    lt_air: &CpuAir,
+    cpu_trace: &mut TraceTable<F, E>,
+    bitwise_trace: &mut TraceTable<F, E>,
+    lt_trace: &mut TraceTable<F, E>,
+) -> MultiProof<F, E, ()> {
+    let air_trace_pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (cpu_air, cpu_trace, &()),
+        (bitwise_air, bitwise_trace, &()),
+        (lt_air, lt_trace, &()),
+    ];
+
+    Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap()
+}
+
+/// Run multi_verify on the given proof and AIRs
+fn verify(
+    cpu_air: &CpuAir,
+    bitwise_air: &CpuAir,
+    lt_air: &CpuAir,
+    proof: &MultiProof<F, E, ()>,
+) -> bool {
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        vec![cpu_air, bitwise_air, lt_air];
+    Verifier::multi_verify(&airs, proof, &mut DefaultTranscript::<E>::new(&[]))
+}
+
+// =============================================================================
+// Benchmark functions
+// =============================================================================
+
+/// Benchmark execute + prove (ELF execution + trace generation + proving)
+fn bench_execute_and_prove(c: &mut Criterion, config: &BenchConfig) {
     let proof_options = benchmark_proof_options();
 
     c.bench_with_input(
-        BenchmarkId::new(format!("{}/prove", group_name), config.name),
+        BenchmarkId::new("vm_prover/execute_and_prove", config.name),
         config,
         |b, config| {
             b.iter_with_setup(
-                || {
-                    let (cpu_trace, bitwise_trace, lt_trace, _, _) =
-                        generate_traces_from_elf(config.elf_name, config.expected_steps);
-                    let cpu_air = create_cpu_air(&proof_options);
-                    let bitwise_air = create_bitwise_air(&proof_options);
-                    let lt_air = create_lt_air(&proof_options);
-                    (
-                        cpu_trace,
-                        bitwise_trace,
-                        lt_trace,
-                        cpu_air,
-                        bitwise_air,
-                        lt_air,
+                || create_airs(&proof_options),
+                |(cpu_air, bitwise_air, lt_air)| {
+                    let (mut cpu_trace, mut bitwise_trace, mut lt_trace) =
+                        execute_program(config.elf_name, config.expected_steps);
+                    prove(
+                        &cpu_air,
+                        &bitwise_air,
+                        &lt_air,
+                        &mut cpu_trace,
+                        &mut bitwise_trace,
+                        &mut lt_trace,
                     )
-                },
-                |(mut cpu_trace, mut bitwise_trace, mut lt_trace, cpu_air, bitwise_air, lt_air)| {
-                    let air_trace_pairs: Vec<(
-                        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
-                        _,
-                        _,
-                    )> = vec![
-                        (&cpu_air, &mut cpu_trace, &()),
-                        (&bitwise_air, &mut bitwise_trace, &()),
-                        (&lt_air, &mut lt_trace, &()),
-                    ];
-
-                    Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
-                        .unwrap()
                 },
             )
         },
     );
 }
 
-/// Benchmark verification for a configuration
-fn bench_verify(c: &mut Criterion, group_name: &str, config: &BenchConfig) {
+/// Benchmark prove only (just the multi_prove function, traces pre-generated)
+fn bench_prove(c: &mut Criterion, config: &BenchConfig) {
     let proof_options = benchmark_proof_options();
 
-    // Pre-generate the proof
-    let (mut cpu_trace, mut bitwise_trace, mut lt_trace, bitwise_count, lt_count) =
-        generate_traces_from_elf(config.elf_name, config.expected_steps);
+    // Pre-generate traces once
+    let (cpu_trace, bitwise_trace, lt_trace) =
+        execute_program(config.elf_name, config.expected_steps);
 
     println!(
-        "{}: CPU {} rows, Bitwise {} rows, LT {} rows, {} bitwise lookups, {} lt ops",
+        "{}: CPU {} rows, Bitwise {} rows, LT {} rows",
         config.name,
         cpu_trace.main_table.height,
         bitwise_trace.main_table.height,
         lt_trace.main_table.height,
-        bitwise_count,
-        lt_count,
     );
 
-    let cpu_air = create_cpu_air(&proof_options);
-    let bitwise_air = create_bitwise_air(&proof_options);
-    let lt_air = create_lt_air(&proof_options);
+    c.bench_with_input(
+        BenchmarkId::new("vm_prover/prove", config.name),
+        config,
+        |b, _config| {
+            b.iter_with_setup(
+                || {
+                    let airs = create_airs(&proof_options);
+                    // Clone traces for each iteration
+                    (
+                        airs,
+                        cpu_trace.clone(),
+                        bitwise_trace.clone(),
+                        lt_trace.clone(),
+                    )
+                },
+                |(
+                    (cpu_air, bitwise_air, lt_air),
+                    mut cpu_trace,
+                    mut bitwise_trace,
+                    mut lt_trace,
+                )| {
+                    prove(
+                        &cpu_air,
+                        &bitwise_air,
+                        &lt_air,
+                        &mut cpu_trace,
+                        &mut bitwise_trace,
+                        &mut lt_trace,
+                    )
+                },
+            )
+        },
+    );
+}
 
-    let air_trace_pairs: Vec<(
-        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
-        _,
-        _,
-    )> = vec![
-        (&cpu_air, &mut cpu_trace, &()),
-        (&bitwise_air, &mut bitwise_trace, &()),
-        (&lt_air, &mut lt_trace, &()),
-    ];
+/// Benchmark verify only (proof pre-generated)
+fn bench_verify(c: &mut Criterion, config: &BenchConfig) {
+    let proof_options = benchmark_proof_options();
 
-    let proof =
-        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+    // Pre-generate traces and proof
+    let (mut cpu_trace, mut bitwise_trace, mut lt_trace) =
+        execute_program(config.elf_name, config.expected_steps);
+
+    let (cpu_air, bitwise_air, lt_air) = create_airs(&proof_options);
+
+    let proof = prove(
+        &cpu_air,
+        &bitwise_air,
+        &lt_air,
+        &mut cpu_trace,
+        &mut bitwise_trace,
+        &mut lt_trace,
+    );
 
     c.bench_with_input(
-        BenchmarkId::new(format!("{}/verify", group_name), config.name),
+        BenchmarkId::new("vm_prover/verify", config.name),
         &(proof, cpu_air, bitwise_air, lt_air),
         |b, (proof, cpu_air, bitwise_air, lt_air)| {
-            b.iter(|| {
-                let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
-                    vec![cpu_air, bitwise_air, lt_air];
-                Verifier::multi_verify(&airs, proof, &mut DefaultTranscript::<E>::new(&[]))
-            })
+            b.iter(|| verify(cpu_air, bitwise_air, lt_air, proof))
+        },
+    );
+}
+
+/// Benchmark execute + prove + verify (full pipeline)
+fn bench_execute_prove_and_verify(c: &mut Criterion, config: &BenchConfig) {
+    let proof_options = benchmark_proof_options();
+
+    c.bench_with_input(
+        BenchmarkId::new("vm_prover/execute_prove_and_verify", config.name),
+        config,
+        |b, config| {
+            b.iter_with_setup(
+                || create_airs(&proof_options),
+                |(cpu_air, bitwise_air, lt_air)| {
+                    // Execute
+                    let (mut cpu_trace, mut bitwise_trace, mut lt_trace) =
+                        execute_program(config.elf_name, config.expected_steps);
+
+                    // Prove
+                    let proof = prove(
+                        &cpu_air,
+                        &bitwise_air,
+                        &lt_air,
+                        &mut cpu_trace,
+                        &mut bitwise_trace,
+                        &mut lt_trace,
+                    );
+
+                    // Verify
+                    verify(&cpu_air, &bitwise_air, &lt_air, &proof)
+                },
+            )
         },
     );
 }
@@ -528,8 +614,10 @@ fn bench_verify(c: &mut Criterion, group_name: &str, config: &BenchConfig) {
 /// VM prover benchmarks
 fn vm_prover_benchmarks(c: &mut Criterion) {
     for config in CONFIGS {
-        bench_prove(c, "vm_prover", config);
-        bench_verify(c, "vm_prover", config);
+        bench_execute_and_prove(c, config);
+        bench_prove(c, config);
+        bench_verify(c, config);
+        bench_execute_prove_and_verify(c, config);
     }
 }
 
