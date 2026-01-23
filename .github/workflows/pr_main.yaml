@@ -31,7 +31,7 @@ jobs:
       - name: Cache cargo build artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ""
+          shared-key: "lambda-vm"
 
       - name: Run cargo check
         run: cargo check
@@ -59,7 +59,7 @@ jobs:
       - name: Cache cargo build artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ""
+          shared-key: "lambda-vm"
 
       - name: Cache compiled ASM ELF artifacts
         id: cache-asm-elfs
