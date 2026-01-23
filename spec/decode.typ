@@ -51,9 +51,9 @@ Note that the below table is _not_ used in practice: it is solely used for the p
 
 We will illustrate how each instruction should be expressed in this (uncompressed) decoding table.
 The columns of the accompanying table represent the following:
-- *`operation`*: the assembly operation being encoded,
+- *`operation`*: the assembly operation being encoded.
 - *`op-flag`*: which of the "`ALU` selector flags" operation flags to set. Each operation sets exactly one.
-+ - *`w_instr`*, *`signed`*: whether to set respectively the `word_instr` and `signed` flags
+- *`w_instr`*, *`signed`*: whether to set the `word_instr` and `signed` flags, respectively.
 - *other*: the other flags that should be set or variables that should be given specific values.
 
 For the purpose of brevity and readability, the table uses the following rules-of-thumb:
