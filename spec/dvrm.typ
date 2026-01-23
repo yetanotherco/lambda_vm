@@ -5,6 +5,7 @@
   total_nr_variables,
   total_nr_instantiated_columns,
   render_constraint_table,
+  render_chip_padding_table,
   render_chip_assumptions
 )
 
@@ -156,3 +157,7 @@ Also, we ensure the multiplicities are binary.
 === Output
 Lastly, this chip contributes the following to the lookup:
 #render_constraint_table(chip, config, groups:("output", ))
+
+== Padding
+To pad the #dvrm table, we use the following data, representing the unsigned division $frac(2^63, 1, style: "horizontal")$:
+#render_chip_padding_table(chip, config)
