@@ -14,24 +14,3 @@ runs:
       uses: dtolnay/rust-toolchain@nightly
       with:
         components: rust-src
-
-    # Custom lambda toolchain - commented out, not recreated for 64-bit yet
-    # - name: Cache Rust toolchain
-    #   id: cache-rust
-    #   uses: actions/cache@v4
-    #   with:
-    #     path: ~/lambda_rust
-    #     key: lambda-rust-toolchain-v1
-    #
-    # - name: Download Rust
-    #   if: steps.cache-rust.outputs.cache-hit != 'true'
-    #   shell: bash
-    #   run: |
-    #     cd $HOME
-    #     wget https://lambda.alignedlayer.com/lambda_rust.tar.gz
-    #     tar -xzvf lambda_rust.tar.gz
-    #     rm lambda_rust.tar.gz
-    #
-    # - name: Add Rust to PATH
-    #   shell: bash
-    #   run: echo "$HOME/lambda_rust/usr/local/bin" >> $GITHUB_PATH

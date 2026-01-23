@@ -27,27 +27,95 @@ pub struct ExecutionResult {
     pub instructions: U64HashMap<Instruction>,
 }
 
-pub fn run_program(
-    program: &Elf,
-    private_inputs: Vec<u8>,
-) -> Result<ExecutionResult, ExecutorError> {
-    let mut memory = Memory::default();
-    memory.store_private_inputs(private_inputs)?;
-    // Pre-decode all instructions from executable segments
-    let instruction_cache = InstructionCache::new(&program.data)?;
-    load_program(&program.data, &mut memory)?;
-    let (return_values, logs) = run_from_entrypoint(
-        &mut memory,
-        program.entry_point,
-        &instruction_cache,
-        instruction_cache.instruction_count(),
-    )?;
-    let instructions = instruction_cache.into_instruction_map();
-    Ok(ExecutionResult {
-        return_values,
-        logs,
-        instructions,
-    })
+/// Size of each log chunk - balances memory usage vs callback overhead
+const CHUNK_SIZE: usize = 100_000;
+
+/// Executor state for chunked execution
+pub struct Executor {
+    memory: Memory,
+    registers: Registers,
+    pc: u64,
+    pub instructions: InstructionCache,
+    logs: Vec<Log>,
+}
+
+impl Executor {
+    pub fn new(program: &Elf, private_inputs: Vec<u8>) -> Result<Self, ExecutorError> {
+        let mut memory = Memory::default();
+        memory.store_private_inputs(private_inputs)?;
+        let instructions = InstructionCache::new(&program.data)?;
+        load_program(&program.data, &mut memory)?;
+
+        Ok(Self {
+            memory,
+            registers: Registers::default(),
+            pc: program.entry_point,
+            instructions,
+            logs: Vec::with_capacity(CHUNK_SIZE),
+        })
+    }
+
+    /// Resume execution and return next logs. Returns None when program is finished.
+    pub fn resume(&mut self) -> Result<Option<&[Log]>, ExecutorError> {
+        if self.pc == 0 {
+            return Ok(None);
+        }
+
+        self.logs.clear();
+
+        while self.pc != 0 && self.logs.len() < CHUNK_SIZE {
+            let instruction = match self.instructions.get(self.pc) {
+                Some(&instr) => instr,
+                None => {
+                    let next_instruction = self.memory.load_word(self.pc)?;
+                    Instruction::parse(next_instruction)?
+                }
+            };
+            let log = instruction.run(&mut self.pc, &mut self.registers, &mut self.memory)?;
+            self.logs.push(log);
+        }
+
+        if self.logs.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(&self.logs))
+        }
+    }
+
+    fn get_return_values(&self) -> Result<ReturnValues, ExecutorError> {
+        println!("Final Register Values:\n {}", &self.registers);
+        let memory_return_value = self.memory.read_return_value()?;
+        let registers_return_values = self.registers.read_return_values();
+        println!("Registers Return Values: {registers_return_values:?}");
+
+        Ok(ReturnValues {
+            memory_values: memory_return_value,
+            register_values: (
+                registers_return_values.0 as i64,
+                registers_return_values.1 as i64,
+            ),
+        })
+    }
+
+    /// Get return values after execution is complete (call after resume() returns None)
+    pub fn finish(self) -> Result<ReturnValues, ExecutorError> {
+        self.get_return_values()
+    }
+
+    /// Run to completion and return all logs (consumes executor)
+    pub fn run(mut self) -> Result<ExecutionResult, ExecutorError> {
+        let mut logs = Vec::with_capacity(CHUNK_SIZE);
+
+        while let Some(chunk) = self.resume()? {
+            logs.extend_from_slice(chunk);
+        }
+
+        Ok(ExecutionResult {
+            return_values: self.get_return_values()?,
+            logs,
+            instructions: self.instructions.into_instruction_map(),
+        })
+    }
 }
 
 fn load_program(segments: &[crate::elf::Segment], memory: &mut Memory) -> Result<(), MemoryError> {
@@ -58,44 +126,6 @@ fn load_program(segments: &[crate::elf::Segment], memory: &mut Memory) -> Result
         }
     }
     Ok(())
-}
-
-fn run_from_entrypoint(
-    memory: &mut Memory,
-    entrypoint: u64,
-    instruction_cache: &InstructionCache,
-    instruction_count: usize,
-) -> Result<(ReturnValues, Vec<Log>), ExecutorError> {
-    let mut pc = entrypoint;
-    let mut registers = Registers::default();
-    // Pre-Allocate logs with an estimated capacity
-    let mut logs = Vec::with_capacity(instruction_count * 1000);
-    while pc != 0 {
-        // Use pre-decoded instruction if available, otherwise fall back to parsing
-        let instruction = match instruction_cache.get(pc) {
-            Some(&instr) => instr,
-            None => {
-                let next_instruction = memory.load_word(pc)?;
-                Instruction::parse(next_instruction)?
-            }
-        };
-        let log = instruction.run(&mut pc, &mut registers, memory)?;
-        logs.push(log);
-    }
-    println!("Final Register Values:\n {}", &registers);
-    let memory_return_value = memory.read_return_value()?;
-    let registers_return_values = registers.read_return_values();
-    println!("Registers Return Values: {registers_return_values:?}");
-    Ok((
-        ReturnValues {
-            memory_values: memory_return_value,
-            register_values: (
-                registers_return_values.0 as i64,
-                registers_return_values.1 as i64,
-            ),
-        },
-        logs,
-    ))
 }
 
 pub struct InstructionSegment {
