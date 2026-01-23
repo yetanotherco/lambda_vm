@@ -161,6 +161,7 @@ Full documentation can be found in [docs](./docs/). It is currently a work in pr
 | `make test-asm` | Compile and run ASM tests |
 | `make test-rust` | Compile and run Rust tests |
 | `make test-executor` | Compile all programs and run executor tests |
+| `make fuzz-goldilocks` | Run fuzzing tests for Goldilocks field operations |
 | `make build` | Build all workspace crates |
 | `make check` | Check all crates (faster than build, no codegen) |
 
@@ -190,6 +191,29 @@ Then add the corresponding test under `tests/rust.rs`
 You can run it with
 
 `make test-rust`
+
+### Fuzzing Tests
+
+Fuzzing tests are available for Goldilocks field operations to ensure correctness of ARM64 assembly optimizations through differential testing.
+
+**Native Rust implementation (no ASM):**
+```bash
+cd crypto/math/fuzz
+cargo +nightly fuzz run goldilocks_native -- -runs=10000
+```
+
+**ARM64 assembly implementation (with ASM feature):**
+```bash
+cd crypto/math/fuzz
+cargo +nightly fuzz run goldilocks_asm --features asm-arm64 -- -runs=10000
+```
+
+Or use the Makefile target:
+```bash
+make fuzz-goldilocks
+```
+
+**Note:** Fuzzing requires nightly Rust compiler. Install with `rustup install nightly`.
 
 ## Benchmarking & Profiling
 

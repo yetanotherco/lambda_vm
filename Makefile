@@ -1,7 +1,7 @@
 .PHONY: deps deps-linux deps-macos prepare-test-data compile-programs-asm compile-programs-rust compile-bench \
 compile-programs clean-asm clean-rust clean-bench clean-shared clean test test-asm test-no-compile \
 test-asm-no-compile test-rust test-rust-no-compile test-executor flamegraph-prover \
-test-fast test-prover test-prover-all build check
+test-fast test-prover test-prover-all fuzz-goldilocks build check
 
 UNAME := $(shell uname)
 
@@ -156,6 +156,15 @@ test-prover:
 # Prover tests including slow ones
 test-prover-all:
 	cargo test -p prover -F stark/parallel -- --include-ignored
+
+# Fuzzing tests for Goldilocks field operations
+fuzz-goldilocks:
+	@echo "Running fuzzing tests (requires nightly Rust)..."
+	@echo "Testing native implementation..."
+	cd crypto/math/fuzz && cargo +nightly fuzz run goldilocks_native -- -runs=10000
+	@echo "Testing ARM64 assembly implementation..."
+	cd crypto/math/fuzz && cargo +nightly fuzz run goldilocks_asm --features asm-arm64 -- -runs=10000
+	@echo "Fuzzing completed successfully!"
 
 # Build all
 build:
