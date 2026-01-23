@@ -33,6 +33,7 @@
 ]
 #let rj = todo.with(background: teal, name: "Robin")
 #let et = todo.with(background: rgb("d4aa3a"), name: "Erik")
+#let cdsg = todo.with(background: olive, name: "Cyprien")
 
 #let style = state("style", (
   foreground: white,
