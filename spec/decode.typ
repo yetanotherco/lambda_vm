@@ -53,7 +53,7 @@ We will illustrate how each instruction should be expressed in this (uncompresse
 The columns of the accompanying table represent the following:
 - *`operation`*: the assembly operation being encoded,
 - *`op-flag`*: which of the "`ALU` selector flags" operation flags to set. Each operation sets exactly one.
-- *`w_instr`* and *`signed`*: whether to set the `word_instr` respectively `signed` flag,
++ - *`w_instr`*, *`signed`*: whether to set respectively the `word_instr` and `signed` flags
 - *other*: the other flags that should be set or variables that should be given specific values.
 
 For the purpose of brevity and readability, the table uses the following rules-of-thumb:
