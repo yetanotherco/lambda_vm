@@ -77,6 +77,8 @@ jobs:
       - name: Fetch Rust cache
         if: ${{ steps.cache.outputs.cache-hit != 'true' }}
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ""
 
       - name: Build binary
         if: ${{ steps.cache.outputs.cache-hit != 'true' }}
