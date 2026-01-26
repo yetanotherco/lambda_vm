@@ -7,19 +7,12 @@
 //!
 //! Uses an actual ELF program that runs through the executor, generating
 //! real execution traces with lookups.
+//!
+//! Run with `cargo bench --bench vm_prover_benchmark`.
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use std::collections::HashMap;
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
-use executor::elf::Elf;
-use executor::vm::execution::run_program;
-use executor::vm::instruction::decoding::Instruction;
-use executor::vm::logs::Log;
-use executor::vm::memory::U64HashMap;
-use math::field::element::FieldElement;
-use stark::constraints::transition::TransitionConstraint;
-use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData, NullBoundaryConstraintBuilder};
 use stark::proof::options::ProofOptions;
 use stark::proof::stark::MultiProof;
 use stark::prover::{IsStarkProver, Prover};
@@ -27,23 +20,15 @@ use stark::trace::TraceTable;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
-use prover::constraints::cpu::create_all_cpu_constraints;
-use prover::tables::bitwise::{
-    BitwiseLookup, bus_interactions as bitwise_bus_interactions, cols as bitwise_cols,
-};
-use prover::tables::cpu::{
-    CpuOperation, bus_interactions as cpu_bus_interactions, cols as cpu_cols,
-};
-use prover::tables::lt::{
-    LtOperation, bus_interactions as lt_bus_interactions, cols as lt_cols, generate_lt_trace,
-};
+use prover::tables::lt::generate_lt_trace;
 use prover::tables::trace_builder::Traces;
 
-type F = prover::tables::types::GoldilocksField;
-type E = prover::tables::types::GoldilocksExtension;
-type FE = FieldElement<F>;
-
-type CpuAir = AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()>;
+// Import shared utilities
+use prover::test_utils::{
+    E, F, VmAir, collect_bitwise_lookups_from_logs, collect_bitwise_lookups_from_lt,
+    collect_lt_lookups_from_logs, create_bitwise_air, create_cpu_air, create_lt_air,
+    generate_minimal_bitwise_trace, run_asm_elf,
+};
 
 /// Configuration for a benchmark case
 struct BenchConfig {
@@ -77,317 +62,9 @@ fn benchmark_proof_options() -> ProofOptions {
     }
 }
 
-/// Helper to run an ELF from the program_artifacts directory
-fn run_asm_elf(name: &str) -> (Vec<Log>, U64HashMap<Instruction>) {
-    let path = format!(
-        "{}/executor/program_artifacts/asm/{}.elf",
-        env!("CARGO_MANIFEST_DIR").replace("/prover", ""),
-        name
-    );
-    let elf_data = std::fs::read(&path).expect(&format!("Failed to read ELF: {}", path));
-    let program = Elf::load(&elf_data).expect("Failed to load ELF");
-    let result =
-        run_program(program.image, program.entry_point, vec![]).expect("Failed to run program");
-    (result.logs, result.instructions)
-}
+// Lookup collection and AIR creation functions moved to prover::test_utils module
 
-/// Collect bitwise lookups from logs for minimal table generation.
-fn collect_bitwise_lookups_from_logs(
-    logs: &[Log],
-    instructions: &U64HashMap<Instruction>,
-) -> Vec<(BitwiseLookup, u8, u8, u8)> {
-    logs.iter()
-        .enumerate()
-        .flat_map(|(i, log)| {
-            let instruction = *instructions.get(&log.current_pc).unwrap();
-            let op = CpuOperation::from_log(log, (i as u64) * 4, instruction);
-            op.collect_bitwise_lookups()
-        })
-        .collect()
-}
-
-/// Collect LT lookups from executor logs.
-fn collect_lt_lookups_from_logs(
-    logs: &[Log],
-    instructions: &U64HashMap<Instruction>,
-) -> Vec<LtOperation> {
-    use executor::vm::instruction::decoding::{ArithOp, Comparison};
-
-    let mut lookups = Vec::new();
-
-    for log in logs {
-        let instruction = *instructions.get(&log.current_pc).unwrap();
-
-        let is_slt = matches!(
-            &instruction,
-            Instruction::Arith {
-                op: ArithOp::SetLessThan,
-                ..
-            } | Instruction::Arith {
-                op: ArithOp::SetLessThanU,
-                ..
-            } | Instruction::ArithImm {
-                op: ArithOp::SetLessThan,
-                ..
-            } | Instruction::ArithImm {
-                op: ArithOp::SetLessThanU,
-                ..
-            } | Instruction::ArithW {
-                op: ArithOp::SetLessThan,
-                ..
-            } | Instruction::ArithW {
-                op: ArithOp::SetLessThanU,
-                ..
-            } | Instruction::ArithImmW {
-                op: ArithOp::SetLessThan,
-                ..
-            } | Instruction::ArithImmW {
-                op: ArithOp::SetLessThanU,
-                ..
-            }
-        );
-
-        let is_blt = matches!(
-            &instruction,
-            Instruction::Branch {
-                cond: Comparison::LessThan,
-                ..
-            } | Instruction::Branch {
-                cond: Comparison::LessThanUnsigned,
-                ..
-            } | Instruction::Branch {
-                cond: Comparison::GreaterOrEqual,
-                ..
-            } | Instruction::Branch {
-                cond: Comparison::GreaterOrEqualUnsigned,
-                ..
-            }
-        );
-
-        if is_slt || is_blt {
-            let signed = matches!(
-                &instruction,
-                Instruction::Arith {
-                    op: ArithOp::SetLessThan,
-                    ..
-                } | Instruction::ArithImm {
-                    op: ArithOp::SetLessThan,
-                    ..
-                } | Instruction::ArithW {
-                    op: ArithOp::SetLessThan,
-                    ..
-                } | Instruction::ArithImmW {
-                    op: ArithOp::SetLessThan,
-                    ..
-                } | Instruction::Branch {
-                    cond: Comparison::LessThan,
-                    ..
-                } | Instruction::Branch {
-                    cond: Comparison::GreaterOrEqual,
-                    ..
-                }
-            );
-
-            let arg1 = log.src1_val;
-            let arg2 = match &instruction {
-                Instruction::ArithImm { imm, .. } | Instruction::ArithImmW { imm, .. } => {
-                    *imm as i64 as u64
-                }
-                _ => log.src2_val,
-            };
-
-            lookups.push(LtOperation::new(arg1, arg2, signed));
-        }
-    }
-
-    lookups
-}
-
-/// Collect bitwise lookups from LT operations (MSB16 and IS_HALFWORD).
-fn collect_bitwise_lookups_from_lt(lt_ops: &[LtOperation]) -> Vec<(BitwiseLookup, u8, u8, u8)> {
-    let mut lookups = Vec::new();
-
-    for op in lt_ops {
-        // MSB16 for lhs_msb (bits 48-63 of lhs)
-        let lhs_2 = ((op.lhs >> 48) & 0xFFFF) as u16;
-        let x = (lhs_2 & 0xFF) as u8;
-        let y = ((lhs_2 >> 8) & 0xFF) as u8;
-        lookups.push((BitwiseLookup::Msb16, x, y, 0));
-
-        // MSB16 for rhs_msb (bits 48-63 of rhs)
-        let rhs_2 = ((op.rhs >> 48) & 0xFFFF) as u16;
-        let x = (rhs_2 & 0xFF) as u8;
-        let y = ((rhs_2 >> 8) & 0xFF) as u8;
-        lookups.push((BitwiseLookup::Msb16, x, y, 0));
-
-        // IS_HALFWORD for lhs_sub_rhs (4 halfwords)
-        let lhs_sub_rhs = op.lhs.wrapping_sub(op.rhs);
-        for shift in [0, 16, 32, 48] {
-            let half = ((lhs_sub_rhs >> shift) & 0xFFFF) as u16;
-            lookups.push((
-                BitwiseLookup::IsHalf,
-                (half & 0xFF) as u8,
-                ((half >> 8) & 0xFF) as u8,
-                0,
-            ));
-        }
-    }
-
-    lookups
-}
-
-/// Generate a minimal bitwise trace containing only the rows needed for the given lookups.
-///
-/// This is much faster than the full 2^20 row table for benchmarking.
-fn generate_minimal_bitwise_trace(lookups: &[(BitwiseLookup, u8, u8, u8)]) -> TraceTable<F, E> {
-    // Collect unique (x, y, z) tuples and count multiplicities per lookup type
-    let mut row_data: HashMap<(u8, u8, u8), [u64; 11]> = HashMap::new();
-
-    for (lookup_type, x, y, z) in lookups {
-        let key = (*x, *y, *z);
-        let mu_idx = match lookup_type {
-            BitwiseLookup::AndByte => 0,
-            BitwiseLookup::OrByte => 1,
-            BitwiseLookup::XorByte => 2,
-            BitwiseLookup::Msb8 => 3,
-            BitwiseLookup::Msb16 => 4,
-            BitwiseLookup::Zero => 5,
-            BitwiseLookup::IsByte => 6,
-            BitwiseLookup::IsHalf => 7,
-            BitwiseLookup::IsB20 => 8,
-            BitwiseLookup::Hwsl => 9,
-            BitwiseLookup::Hwslc => 10,
-        };
-        row_data.entry(key).or_insert([0; 11])[mu_idx] += 1;
-    }
-
-    // Need at least 4 rows for FRI, pad to power of 2
-    let unique_rows: Vec<_> = row_data.keys().cloned().collect();
-    let num_rows = unique_rows.len().max(4).next_power_of_two();
-
-    let mut data = vec![FE::zero(); num_rows * bitwise_cols::NUM_COLUMNS];
-
-    for (row_idx, (x, y, z)) in unique_rows.iter().enumerate() {
-        let base = row_idx * bitwise_cols::NUM_COLUMNS;
-        let x = *x as u32;
-        let y = *y as u32;
-        let z = *z as u32;
-
-        // Input columns
-        data[base + bitwise_cols::X] = FE::from(x as u64);
-        data[base + bitwise_cols::Y] = FE::from(y as u64);
-        data[base + bitwise_cols::Z] = FE::from(z as u64);
-
-        // Bitwise operation results
-        data[base + bitwise_cols::AND] = FE::from((x & y) as u64);
-        data[base + bitwise_cols::OR] = FE::from((x | y) as u64);
-        data[base + bitwise_cols::XOR] = FE::from((x ^ y) as u64);
-
-        // MSB extractions
-        let msb8 = (x >> 7) & 1;
-        let halfword = x + y * 256;
-        let msb16 = (halfword >> 15) & 1;
-        data[base + bitwise_cols::MSB8] = FE::from(msb8 as u64);
-        data[base + bitwise_cols::MSB16] = FE::from(msb16 as u64);
-
-        // Zero check
-        let is_zero = if x == 0 && y == 0 { 1u64 } else { 0u64 };
-        data[base + bitwise_cols::ZERO] = FE::from(is_zero);
-
-        // Shift operations
-        let sll = if z == 0 {
-            halfword
-        } else {
-            (halfword << z) & 0xFFFF
-        };
-        let sllc = if z == 0 { 0 } else { halfword >> (16 - z) };
-        data[base + bitwise_cols::SLL] = FE::from(sll as u64);
-        data[base + bitwise_cols::SLLC] = FE::from(sllc as u64);
-
-        // Multiplicity columns
-        let mus = &row_data[&(x as u8, y as u8, z as u8)];
-        data[base + bitwise_cols::MU_AND] = FE::from(mus[0]);
-        data[base + bitwise_cols::MU_OR] = FE::from(mus[1]);
-        data[base + bitwise_cols::MU_XOR] = FE::from(mus[2]);
-        data[base + bitwise_cols::MU_MSB8] = FE::from(mus[3]);
-        data[base + bitwise_cols::MU_MSB16] = FE::from(mus[4]);
-        data[base + bitwise_cols::MU_ZERO] = FE::from(mus[5]);
-        data[base + bitwise_cols::MU_IS_BYTE] = FE::from(mus[6]);
-        data[base + bitwise_cols::MU_IS_HALF] = FE::from(mus[7]);
-        data[base + bitwise_cols::MU_IS_B20] = FE::from(mus[8]);
-        data[base + bitwise_cols::MU_HWSL] = FE::from(mus[9]);
-        data[base + bitwise_cols::MU_HWSLC] = FE::from(mus[10]);
-    }
-
-    TraceTable::new_main(data, bitwise_cols::NUM_COLUMNS, 1)
-}
-
-// =============================================================================
-// AIR creation helpers
-// =============================================================================
-
-fn create_cpu_air(proof_options: &ProofOptions) -> CpuAir {
-    // Get all CPU constraints
-    let (is_bit, add, other, _) = create_all_cpu_constraints();
-
-    // All CPU constraints
-    let mut transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = Vec::new();
-    for c in is_bit {
-        transition_constraints.push(Box::new(c));
-    }
-    for c in add {
-        transition_constraints.push(Box::new(c));
-    }
-    for c in other {
-        transition_constraints.push(c);
-    }
-
-    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: cpu_bus_interactions(),
-    };
-
-    AirWithBuses::new(
-        cpu_cols::NUM_COLUMNS,
-        auxiliary_trace_build_data,
-        proof_options,
-        1,
-        transition_constraints,
-    )
-}
-
-fn create_bitwise_air(proof_options: &ProofOptions) -> CpuAir {
-    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
-
-    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: bitwise_bus_interactions(),
-    };
-
-    AirWithBuses::new(
-        bitwise_cols::NUM_COLUMNS,
-        auxiliary_trace_build_data,
-        proof_options,
-        1,
-        transition_constraints,
-    )
-}
-
-fn create_lt_air(proof_options: &ProofOptions) -> CpuAir {
-    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
-
-    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: lt_bus_interactions(),
-    };
-
-    AirWithBuses::new(
-        lt_cols::NUM_COLUMNS,
-        auxiliary_trace_build_data,
-        proof_options,
-        1,
-        transition_constraints,
-    )
-}
-
-fn create_airs(proof_options: &ProofOptions) -> (CpuAir, CpuAir, CpuAir) {
+fn create_airs(proof_options: &ProofOptions) -> (VmAir, VmAir, VmAir) {
     (
         create_cpu_air(proof_options),
         create_bitwise_air(proof_options),
@@ -436,9 +113,9 @@ fn execute_program(
 
 /// Run multi_prove on the given traces and AIRs
 fn prove(
-    cpu_air: &CpuAir,
-    bitwise_air: &CpuAir,
-    lt_air: &CpuAir,
+    cpu_air: &VmAir,
+    bitwise_air: &VmAir,
+    lt_air: &VmAir,
     cpu_trace: &mut TraceTable<F, E>,
     bitwise_trace: &mut TraceTable<F, E>,
     lt_trace: &mut TraceTable<F, E>,
@@ -458,9 +135,9 @@ fn prove(
 
 /// Run multi_verify on the given proof and AIRs
 fn verify(
-    cpu_air: &CpuAir,
-    bitwise_air: &CpuAir,
-    lt_air: &CpuAir,
+    cpu_air: &VmAir,
+    bitwise_air: &VmAir,
+    lt_air: &VmAir,
     proof: &MultiProof<F, E, ()>,
 ) -> bool {
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
@@ -473,6 +150,20 @@ fn verify(
 // =============================================================================
 
 /// Benchmark execute + prove (ELF execution + trace generation + proving)
+///
+/// **What's measured (timed):**
+/// - ELF execution through the executor
+/// - Trace generation for CPU, Bitwise, and LT tables
+/// - Multi-table STARK proving (commit, FRI, query phases)
+///
+/// **What's excluded from timing (setup):**
+/// - AIR (Algebraic Intermediate Representation) creation
+/// - Proof options configuration
+///
+/// **What the numbers represent:**
+/// Time to go from ELF binary to complete STARK proof, including all table
+/// generation and cryptographic operations. This represents the prover's
+/// end-to-end latency for a given program size.
 fn bench_execute_and_prove(c: &mut Criterion, config: &BenchConfig) {
     let proof_options = benchmark_proof_options();
 
@@ -500,6 +191,22 @@ fn bench_execute_and_prove(c: &mut Criterion, config: &BenchConfig) {
 }
 
 /// Benchmark prove only (just the multi_prove function, traces pre-generated)
+///
+/// **What's measured (timed):**
+/// - Multi-table STARK proving only (commit phase, FRI, query generation)
+/// - Auxiliary trace construction (bus argument columns)
+/// - Merkle tree commitments and FRI folding
+///
+/// **What's excluded from timing (setup):**
+/// - ELF execution (done once before benchmark loop)
+/// - Trace generation (done once before benchmark loop)
+/// - AIR creation
+/// - Trace cloning (to provide fresh traces for each iteration)
+///
+/// **What the numbers represent:**
+/// Pure proving time from execution traces to STARK proof. This isolates the
+/// cryptographic proving cost from program execution and trace generation.
+/// Useful for understanding prover performance scaling with table sizes.
 fn bench_prove(c: &mut Criterion, config: &BenchConfig) {
     let proof_options = benchmark_proof_options();
 
@@ -551,6 +258,24 @@ fn bench_prove(c: &mut Criterion, config: &BenchConfig) {
 }
 
 /// Benchmark verify only (proof pre-generated)
+///
+/// **What's measured (timed):**
+/// - Multi-table STARK verification
+/// - Constraint evaluation at queried positions
+/// - FRI verification (verifying low-degree property)
+/// - Merkle proof verification
+///
+/// **What's excluded from timing (setup):**
+/// - ELF execution
+/// - Trace generation
+/// - Proof generation
+/// - AIR creation
+///
+/// **What the numbers represent:**
+/// Pure verification time for a STARK proof. This is the time a verifier
+/// (who doesn't have the execution trace) needs to verify correctness.
+/// Should be much faster than proving and scale logarithmically with
+/// trace size.
 fn bench_verify(c: &mut Criterion, config: &BenchConfig) {
     let proof_options = benchmark_proof_options();
 
@@ -579,6 +304,22 @@ fn bench_verify(c: &mut Criterion, config: &BenchConfig) {
 }
 
 /// Benchmark execute + prove + verify (full pipeline)
+///
+/// **What's measured (timed):**
+/// - Complete end-to-end pipeline:
+///   1. ELF execution through the executor
+///   2. Trace generation for all tables (CPU, Bitwise, LT)
+///   3. STARK proof generation (commit, FRI, queries)
+///   4. STARK proof verification
+///
+/// **What's excluded from timing (setup):**
+/// - AIR creation
+/// - Proof options configuration
+///
+/// **What the numbers represent:**
+/// Total time from ELF binary to verified proof, representing the complete
+/// zkVM proving system latency. This is the most realistic benchmark for
+/// end-to-end performance, including both prover and verifier costs.
 fn bench_execute_prove_and_verify(c: &mut Criterion, config: &BenchConfig) {
     let proof_options = benchmark_proof_options();
 
@@ -623,6 +364,9 @@ fn vm_prover_benchmarks(c: &mut Criterion) {
 
 criterion_group! {
     name = vm_prover;
+    // Use 10 samples instead of Criterion's default 100 because each benchmark
+    // iteration takes 5+ seconds. This provides sufficient statistical confidence
+    // while keeping total benchmark time reasonable (some minutes vs hours).
     config = Criterion::default()
         .sample_size(10)
         .measurement_time(std::time::Duration::from_secs(60));
