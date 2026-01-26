@@ -278,35 +278,21 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ),
         // LT[lhs, rhs, signed] -> lt (receiver)
         // lhs is DWordHHW, rhs is DWordHHW, signed is Bit, lt is Bit
+        // Uses DWordHHW packing: reads 3 columns (Word, Half, Half), produces 2 bus elements [lo32, hi32]
+        // This allows DWordWL senders (like MEMW timestamps) to match via Packing::DWordWL
         BusInteraction::receiver(
             BusId::Lt,
             Multiplicity::Column(cols::MU),
             vec![
-                // lhs as DWordHHW (3 elements: Word, Half, Half)
+                // lhs as DWordHHW (reads 3 columns: Word, Half, Half; produces 2 elements: [lo32, hi32])
                 BusValue::Packed {
                     start_column: cols::LHS_0,
-                    packing: Packing::Direct,
+                    packing: Packing::DWordHHW,
                 },
-                BusValue::Packed {
-                    start_column: cols::LHS_1,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::LHS_2,
-                    packing: Packing::Direct,
-                },
-                // rhs as DWordHHW (3 elements)
+                // rhs as DWordHHW (reads 3 columns, produces 2 elements)
                 BusValue::Packed {
                     start_column: cols::RHS_0,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::RHS_1,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::RHS_2,
-                    packing: Packing::Direct,
+                    packing: Packing::DWordHHW,
                 },
                 // signed
                 BusValue::Packed {
