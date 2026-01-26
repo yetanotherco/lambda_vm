@@ -459,6 +459,8 @@ pub trait IsStarkVerifier<
             &proof.lde_trace_precomputed_merkle_root,
             &deep_poly_openings.precomputed_trace_polys,
         ) {
+            // Unreachable: multi_verify() already rejected proofs with None root for preprocessed AIRs,
+            // and non-preprocessed AIRs never have openings. No valid execution path reaches here.
             (None, Some(_)) => result = false,
             (Some(_), None) => result = false,
             (Some(precomputed_root), Some(precomputed_opening)) => {
