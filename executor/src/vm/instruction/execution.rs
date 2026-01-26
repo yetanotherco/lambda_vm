@@ -335,7 +335,14 @@ impl Instruction {
                 }
             }
             Instruction::Fence => {
-                return Err(ExecutionError::UnsupportedInstruction("FENCE"));
+                // FENCE is a memory barrier - in single-threaded, in-order execution it's a no-op
+                Log {
+                    current_pc: pc,
+                    next_pc: pc + REGULAR_PC_UPDATE,
+                    src1_val: 0,
+                    src2_val: 0,
+                    dst_val: 0,
+                }
             }
         })
     }
@@ -478,6 +485,4 @@ pub enum ExecutionError {
     IncorrectMessage,
     #[error("Invalid W-suffix operation: {0:?}")]
     InvalidWSuffixOperation(ArithOp),
-    #[error("Unsupported instruction: {0}")]
-    UnsupportedInstruction(&'static str),
 }
