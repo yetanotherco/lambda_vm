@@ -15,10 +15,6 @@
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 
-use executor::vm::instruction::decoding::Instruction;
-use executor::vm::memory::U64HashMap;
-use executor::{elf::Elf, vm::execution::run_program};
-
 use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData};
 use stark::proof::options::ProofOptions;
@@ -27,223 +23,42 @@ use stark::trace::TraceTable;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
-use crate::constraints::cpu::create_all_cpu_constraints;
-use crate::tables::bitwise::{
-    BitwiseLookup, bus_interactions as bitwise_bus_interactions, cols as bitwise_cols,
-    generate_bitwise_trace, update_multiplicities,
-};
-use crate::tables::cpu::{CpuOperation, bus_interactions as cpu_bus_interactions};
-use crate::tables::decode::DecodeEntry;
-use crate::tables::lt::{LtOperation, bus_interactions as lt_bus_interactions, generate_lt_trace};
+use crate::tables::bitwise::{generate_bitwise_trace, update_multiplicities};
+use crate::tables::lt::generate_lt_trace;
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
-use std::collections::HashMap;
+// Import shared utilities
+use crate::test_utils::{
+    collect_bitwise_lookups_from_logs, collect_bitwise_lookups_from_lt,
+    collect_lt_lookups_from_logs, create_bitwise_air, create_cpu_air, create_lt_air,
+    generate_minimal_bitwise_trace, run_asm_elf,
+};
 
 type F = GoldilocksField;
 type E = GoldilocksExtension;
 
-/// Helper to run an ELF from the program_artifacts directory
-fn run_asm_elf(name: &str) -> (Vec<executor::vm::logs::Log>, U64HashMap<Instruction>) {
-    let path = format!(
-        "{}/executor/program_artifacts/asm/{}.elf",
-        env!("CARGO_MANIFEST_DIR").replace("/prover", ""),
-        name
-    );
-    let elf_data = std::fs::read(&path).expect("Failed to read ELF");
-    let program = Elf::load(&elf_data).expect("Failed to load ELF");
-    let result =
-        run_program(program.image, program.entry_point, vec![]).expect("Failed to run program");
-    (result.logs, result.instructions)
-}
-
-/// Test helper: collect bitwise lookups from logs for minimal table tests.
+/// Alias for compatibility with existing test code.
 fn collect_bitwise_lookups(
     logs: &[executor::vm::logs::Log],
-    instructions: &U64HashMap<Instruction>,
-) -> Vec<(BitwiseLookup, u8, u8, u8)> {
-    // Build decode entries map
-    let decode_entries: HashMap<u64, DecodeEntry> = instructions
-        .iter()
-        .map(|(&pc, &instr)| (pc, DecodeEntry::from_instruction(pc, instr)))
-        .collect();
-
-    logs.iter()
-        .enumerate()
-        .flat_map(|(i, log)| {
-            let decode_entry = decode_entries.get(&log.current_pc).unwrap();
-            let op = CpuOperation::from_decode_entry(decode_entry, log, (i as u64) * 4);
-            op.collect_bitwise_lookups()
-        })
-        .collect()
+    instructions: &executor::vm::memory::U64HashMap<
+        executor::vm::instruction::decoding::Instruction,
+    >,
+) -> Vec<(crate::tables::bitwise::BitwiseLookup, u8, u8, u8)> {
+    collect_bitwise_lookups_from_logs(logs, instructions)
 }
 
-// =============================================================================
-// AIR creation helpers
-// =============================================================================
-
-fn create_cpu_air(
-    proof_options: &ProofOptions,
-) -> AirWithBuses<F, E, stark::lookup::NullBoundaryConstraintBuilder, ()> {
-    // Get all CPU constraints
-    let (is_bit, add, other, _) = create_all_cpu_constraints();
-
-    // All CPU constraints: IS_BIT + ADD + other (Branch, Arg1, Arg2, etc.)
-    let mut transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = Vec::new();
-    for c in is_bit {
-        transition_constraints.push(Box::new(c));
-    }
-    for c in add {
-        transition_constraints.push(Box::new(c));
-    }
-    for c in other {
-        transition_constraints.push(c);
-    }
-
-    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: cpu_bus_interactions(),
-    };
-
-    AirWithBuses::new(
-        crate::tables::cpu::cols::NUM_COLUMNS,
-        auxiliary_trace_build_data,
-        proof_options,
-        1,
-        transition_constraints,
-    )
-}
-
-fn create_bitwise_air(
-    proof_options: &ProofOptions,
-) -> AirWithBuses<F, E, stark::lookup::NullBoundaryConstraintBuilder, ()> {
-    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
-
-    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: bitwise_bus_interactions(),
-    };
-
-    AirWithBuses::new(
-        crate::tables::bitwise::cols::NUM_COLUMNS,
-        auxiliary_trace_build_data,
-        proof_options,
-        1,
-        transition_constraints,
-    )
-}
-
-fn create_lt_air(
-    proof_options: &ProofOptions,
-) -> AirWithBuses<F, E, stark::lookup::NullBoundaryConstraintBuilder, ()> {
-    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
-
-    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: lt_bus_interactions(),
-    };
-
-    AirWithBuses::new(
-        crate::tables::lt::cols::NUM_COLUMNS,
-        auxiliary_trace_build_data,
-        proof_options,
-        1,
-        transition_constraints,
-    )
-}
-
-/// Collect bitwise lookups from LT operations.
-///
-/// The LT table sends:
-/// - MSB16 lookups (×2 per row: for lhs_msb and rhs_msb)
-/// - IS_HALFWORD lookups (×4 per row: for lhs_sub_rhs range checks)
-fn collect_bitwise_lookups_from_lt(lt_ops: &[LtOperation]) -> Vec<(BitwiseLookup, u8, u8, u8)> {
-    let mut lookups = Vec::new();
-
-    for op in lt_ops {
-        // MSB16 for lhs_msb (bits 48-63 of lhs)
-        let lhs_2 = ((op.lhs >> 48) & 0xFFFF) as u16;
-        let x = (lhs_2 & 0xFF) as u8;
-        let y = ((lhs_2 >> 8) & 0xFF) as u8;
-        lookups.push((BitwiseLookup::Msb16, x, y, 0));
-
-        // MSB16 for rhs_msb (bits 48-63 of rhs)
-        let rhs_2 = ((op.rhs >> 48) & 0xFFFF) as u16;
-        let x = (rhs_2 & 0xFF) as u8;
-        let y = ((rhs_2 >> 8) & 0xFF) as u8;
-        lookups.push((BitwiseLookup::Msb16, x, y, 0));
-
-        // IS_HALFWORD for lhs_sub_rhs (4 halfwords)
-        let lhs_sub_rhs = op.lhs.wrapping_sub(op.rhs);
-        let sub_0 = (lhs_sub_rhs & 0xFFFF) as u16;
-        let sub_1 = ((lhs_sub_rhs >> 16) & 0xFFFF) as u16;
-        let sub_2 = ((lhs_sub_rhs >> 32) & 0xFFFF) as u16;
-        let sub_3 = ((lhs_sub_rhs >> 48) & 0xFFFF) as u16;
-
-        lookups.push((
-            BitwiseLookup::IsHalf,
-            (sub_0 & 0xFF) as u8,
-            ((sub_0 >> 8) & 0xFF) as u8,
-            0,
-        ));
-        lookups.push((
-            BitwiseLookup::IsHalf,
-            (sub_1 & 0xFF) as u8,
-            ((sub_1 >> 8) & 0xFF) as u8,
-            0,
-        ));
-        lookups.push((
-            BitwiseLookup::IsHalf,
-            (sub_2 & 0xFF) as u8,
-            ((sub_2 >> 8) & 0xFF) as u8,
-            0,
-        ));
-        lookups.push((
-            BitwiseLookup::IsHalf,
-            (sub_3 & 0xFF) as u8,
-            ((sub_3 >> 8) & 0xFF) as u8,
-            0,
-        ));
-    }
-
-    lookups
-}
-
-/// Collect LT lookups from executor logs.
-///
-/// For each instruction that triggers an SLT or BLT operation, creates an LtOperation
-/// with the arg1, arg2, and signed values.
-fn collect_lt_lookups_from_logs(
-    logs: &[executor::vm::logs::Log],
-    instructions: &U64HashMap<Instruction>,
-) -> Vec<LtOperation> {
-    // Build decode entries map
-    let decode_entries: HashMap<u64, DecodeEntry> = instructions
-        .iter()
-        .map(|(&pc, &instr)| (pc, DecodeEntry::from_instruction(pc, instr)))
-        .collect();
-
-    let mut lookups = Vec::new();
-
-    for (i, log) in logs.iter().enumerate() {
-        let decode_entry = decode_entries.get(&log.current_pc).unwrap();
-        let op = CpuOperation::from_decode_entry(decode_entry, log, (i as u64) * 4);
-
-        if op.op_slt || op.op_blt {
-            let arg1 = op.compute_arg1();
-            let arg2 = op.compute_arg2();
-            lookups.push(LtOperation::new(arg1, arg2, op.signed));
-        }
-    }
-
-    lookups
-}
+// AIR creation helpers and lookup collection functions are now in test_utils module
 
 // =============================================================================
 // Prover test helpers
 // =============================================================================
 
-/// Run multi_prove and multi_verify for CPU + Bitwise + LT tables.
+/// Run multi_prove and multi_verify for all VM tables (CPU + Bitwise + LT).
 ///
+/// Uses the FULL 2^20 row bitwise table with preprocessed commitment.
 /// Returns true if verification succeeds.
-fn prove_and_verify_vm_with_lt(
+fn prove_and_verify_vm(
     cpu_trace: &mut TraceTable<F, E>,
     bitwise_trace: &mut TraceTable<F, E>,
     lt_trace: &mut TraceTable<F, E>,
@@ -279,17 +94,20 @@ fn prove_and_verify_vm_with_lt(
     Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[]))
 }
 
-/// Run multi_prove and multi_verify for CPU + Bitwise tables.
+/// Run multi_prove and multi_verify for all VM tables with MINIMAL bitwise.
 ///
-/// Returns true if verification succeeds.
-fn prove_and_verify_vm(
+/// Used for fast tests where the bitwise table is a dummy that only contains
+/// the rows needed to balance the bus. NOT the full preprocessed table.
+fn prove_and_verify_vm_minimal(
     cpu_trace: &mut TraceTable<F, E>,
     bitwise_trace: &mut TraceTable<F, E>,
+    lt_trace: &mut TraceTable<F, E>,
 ) -> bool {
     let proof_options = ProofOptions::default_test_options();
 
     let cpu_air = create_cpu_air(&proof_options);
     let bitwise_air = create_bitwise_air(&proof_options);
+    let lt_air = create_lt_air(&proof_options);
 
     let air_trace_pairs: Vec<(
         &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
@@ -298,11 +116,19 @@ fn prove_and_verify_vm(
     )> = vec![
         (&cpu_air, cpu_trace, &()),
         (&bitwise_air, bitwise_trace, &()),
+        (&lt_air, lt_trace, &()),
     ];
 
+    eprintln!("DEBUG: Proving {} tables...", air_trace_pairs.len());
     let multi_proof =
         match Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])) {
-            Ok(proof) => proof,
+            Ok(proof) => {
+                eprintln!(
+                    "DEBUG: Prover succeeded, {} proofs generated",
+                    proof.proofs.len()
+                );
+                proof
+            }
             Err(e) => {
                 eprintln!("Prover error: {:?}", e);
                 return false;
@@ -310,9 +136,12 @@ fn prove_and_verify_vm(
         };
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
-        vec![&cpu_air, &bitwise_air];
+        vec![&cpu_air, &bitwise_air, &lt_air];
 
-    Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[]))
+    eprintln!("DEBUG: Verifying {} AIRs...", airs.len());
+    let result = Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[]));
+    eprintln!("DEBUG: Verification result: {}", result);
+    result
 }
 
 // =============================================================================
@@ -375,100 +204,16 @@ fn test_cpu_only_no_bus() {
 // A minimal table would require the prover to reveal all values,
 // making the proof size unacceptably large.
 
-/// Generates a minimal bitwise trace containing only the rows needed for the given lookups.
-///
-/// **WARNING: FOR TESTING ONLY - NOT PRODUCTION SAFE!**
-fn generate_minimal_bitwise_trace(lookups: &[(BitwiseLookup, u8, u8, u8)]) -> TraceTable<F, E> {
-    // Collect unique (x, y, z) tuples and count multiplicities per lookup type
-    let mut row_data: HashMap<(u8, u8, u8), [u64; 11]> = HashMap::new();
-
-    for (lookup_type, x, y, z) in lookups {
-        let key = (*x, *y, *z);
-        let mu_idx = match lookup_type {
-            BitwiseLookup::AndByte => 0,
-            BitwiseLookup::OrByte => 1,
-            BitwiseLookup::XorByte => 2,
-            BitwiseLookup::Msb8 => 3,
-            BitwiseLookup::Msb16 => 4,
-            BitwiseLookup::Zero => 5,
-            BitwiseLookup::IsByte => 6,
-            BitwiseLookup::IsHalf => 7,
-            BitwiseLookup::IsB20 => 8,
-            BitwiseLookup::Hwsl => 9,
-            BitwiseLookup::Hwslc => 10,
-        };
-        row_data.entry(key).or_insert([0; 11])[mu_idx] += 1;
-    }
-
-    // Need at least 4 rows for FRI, pad to power of 2
-    let unique_rows: Vec<_> = row_data.keys().cloned().collect();
-    let num_rows = unique_rows.len().max(4).next_power_of_two();
-
-    type FE = math::field::element::FieldElement<F>;
-    let mut data = vec![FE::zero(); num_rows * bitwise_cols::NUM_COLUMNS];
-
-    for (row_idx, (x, y, z)) in unique_rows.iter().enumerate() {
-        let base = row_idx * bitwise_cols::NUM_COLUMNS;
-        let x = *x as u32;
-        let y = *y as u32;
-        let z = *z as u32;
-
-        // Input columns
-        data[base + bitwise_cols::X] = FE::from(x as u64);
-        data[base + bitwise_cols::Y] = FE::from(y as u64);
-        data[base + bitwise_cols::Z] = FE::from(z as u64);
-
-        // Bitwise operation results
-        data[base + bitwise_cols::AND] = FE::from((x & y) as u64);
-        data[base + bitwise_cols::OR] = FE::from((x | y) as u64);
-        data[base + bitwise_cols::XOR] = FE::from((x ^ y) as u64);
-
-        // MSB extractions
-        let msb8 = (x >> 7) & 1;
-        let halfword = x + y * 256;
-        let msb16 = (halfword >> 15) & 1;
-        data[base + bitwise_cols::MSB8] = FE::from(msb8 as u64);
-        data[base + bitwise_cols::MSB16] = FE::from(msb16 as u64);
-
-        // Zero check
-        let is_zero = if x == 0 && y == 0 { 1u64 } else { 0u64 };
-        data[base + bitwise_cols::ZERO] = FE::from(is_zero);
-
-        // Shift operations
-        let sll = if z == 0 {
-            halfword
-        } else {
-            (halfword << z) & 0xFFFF
-        };
-        let sllc = if z == 0 { 0 } else { halfword >> (16 - z) };
-        data[base + bitwise_cols::SLL] = FE::from(sll as u64);
-        data[base + bitwise_cols::SLLC] = FE::from(sllc as u64);
-
-        // Multiplicity columns
-        let mus = &row_data[&(x as u8, y as u8, z as u8)];
-        data[base + bitwise_cols::MU_AND] = FE::from(mus[0]);
-        data[base + bitwise_cols::MU_OR] = FE::from(mus[1]);
-        data[base + bitwise_cols::MU_XOR] = FE::from(mus[2]);
-        data[base + bitwise_cols::MU_MSB8] = FE::from(mus[3]);
-        data[base + bitwise_cols::MU_MSB16] = FE::from(mus[4]);
-        data[base + bitwise_cols::MU_ZERO] = FE::from(mus[5]);
-        data[base + bitwise_cols::MU_IS_BYTE] = FE::from(mus[6]);
-        data[base + bitwise_cols::MU_IS_HALF] = FE::from(mus[7]);
-        data[base + bitwise_cols::MU_IS_B20] = FE::from(mus[8]);
-        data[base + bitwise_cols::MU_HWSL] = FE::from(mus[9]);
-        data[base + bitwise_cols::MU_HWSLC] = FE::from(mus[10]);
-    }
-
-    TraceTable::new_main(data, bitwise_cols::NUM_COLUMNS, 1)
-}
-
 #[test]
 fn test_prove_elfs_sub_fast() {
     let (logs, instructions) = run_asm_elf("sub");
     assert_eq!(logs.len(), 4, "sub.elf should have 4 steps");
 
     let mut cpu_trace = Traces::from_logs(&logs, instructions.clone()).unwrap().cpu;
-    let bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    let lt_lookups = collect_lt_lookups_from_logs(&logs, &instructions);
+    let mut lt_trace = generate_lt_trace(&lt_lookups);
+    let mut bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    bitwise_lookups.extend(collect_bitwise_lookups_from_lt(&lt_lookups));
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
 
     println!(
@@ -479,7 +224,7 @@ fn test_prove_elfs_sub_fast() {
     );
 
     assert!(
-        prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace),
+        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
         "Proof verification failed for sub program (fast)"
     );
 }
@@ -490,7 +235,10 @@ fn test_prove_elfs_sub_neg_result_fast() {
     assert_eq!(logs.len(), 4, "sub_neg_result.elf should have 4 steps");
 
     let mut cpu_trace = Traces::from_logs(&logs, instructions.clone()).unwrap().cpu;
-    let bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    let lt_lookups = collect_lt_lookups_from_logs(&logs, &instructions);
+    let mut lt_trace = generate_lt_trace(&lt_lookups);
+    let mut bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    bitwise_lookups.extend(collect_bitwise_lookups_from_lt(&lt_lookups));
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
 
     println!(
@@ -501,7 +249,7 @@ fn test_prove_elfs_sub_neg_result_fast() {
     );
 
     assert!(
-        prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace),
+        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
         "Proof verification failed for sub_neg_result program (fast)"
     );
 }
@@ -512,7 +260,10 @@ fn test_prove_elfs_sub_underflow_fast() {
     assert_eq!(logs.len(), 4, "sub_underflow.elf should have 4 steps");
 
     let mut cpu_trace = Traces::from_logs(&logs, instructions.clone()).unwrap().cpu;
-    let bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    let lt_lookups = collect_lt_lookups_from_logs(&logs, &instructions);
+    let mut lt_trace = generate_lt_trace(&lt_lookups);
+    let mut bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    bitwise_lookups.extend(collect_bitwise_lookups_from_lt(&lt_lookups));
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
 
     println!(
@@ -523,7 +274,7 @@ fn test_prove_elfs_sub_underflow_fast() {
     );
 
     assert!(
-        prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace),
+        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
         "Proof verification failed for sub_underflow program (fast)"
     );
 }
@@ -534,7 +285,10 @@ fn test_prove_elfs_subw_fast() {
     assert_eq!(logs.len(), 4, "subw.elf should have 4 steps");
 
     let mut cpu_trace = Traces::from_logs(&logs, instructions.clone()).unwrap().cpu;
-    let bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    let lt_lookups = collect_lt_lookups_from_logs(&logs, &instructions);
+    let mut lt_trace = generate_lt_trace(&lt_lookups);
+    let mut bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    bitwise_lookups.extend(collect_bitwise_lookups_from_lt(&lt_lookups));
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
 
     println!(
@@ -545,7 +299,7 @@ fn test_prove_elfs_subw_fast() {
     );
 
     assert!(
-        prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace),
+        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
         "Proof verification failed for subw program (fast)"
     );
 }
@@ -557,7 +311,10 @@ fn test_prove_elfs_arith_lui_8() {
     assert_eq!(logs.len(), 8, "arith_lui_8.elf should have 8 steps");
 
     let mut cpu_trace = Traces::from_logs(&logs, instructions.clone()).unwrap().cpu;
-    let bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    let lt_lookups = collect_lt_lookups_from_logs(&logs, &instructions);
+    let mut lt_trace = generate_lt_trace(&lt_lookups);
+    let mut bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    bitwise_lookups.extend(collect_bitwise_lookups_from_lt(&lt_lookups));
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
 
     println!(
@@ -568,7 +325,7 @@ fn test_prove_elfs_arith_lui_8() {
     );
 
     assert!(
-        prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace),
+        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
         "Proof verification failed for arith_lui_8 program"
     );
 }
@@ -580,7 +337,10 @@ fn test_prove_elfs_arith_8() {
     assert_eq!(logs.len(), 8, "arith_8.elf should have 8 steps");
 
     let mut cpu_trace = Traces::from_logs(&logs, instructions.clone()).unwrap().cpu;
-    let bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    let lt_lookups = collect_lt_lookups_from_logs(&logs, &instructions);
+    let mut lt_trace = generate_lt_trace(&lt_lookups);
+    let mut bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    bitwise_lookups.extend(collect_bitwise_lookups_from_lt(&lt_lookups));
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
 
     println!(
@@ -591,7 +351,7 @@ fn test_prove_elfs_arith_8() {
     );
 
     assert!(
-        prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace),
+        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
         "Proof verification failed for arith_8 program"
     );
 }
@@ -606,7 +366,10 @@ fn test_prove_elfs_basic_arith_32() {
     assert_eq!(logs.len(), 32, "basic_arith_32.elf should have 32 steps");
 
     let mut cpu_trace = Traces::from_logs(&logs, instructions.clone()).unwrap().cpu;
-    let bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    let lt_lookups = collect_lt_lookups_from_logs(&logs, &instructions);
+    let mut lt_trace = generate_lt_trace(&lt_lookups);
+    let mut bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    bitwise_lookups.extend(collect_bitwise_lookups_from_lt(&lt_lookups));
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
 
     println!(
@@ -617,7 +380,7 @@ fn test_prove_elfs_basic_arith_32() {
     );
 
     assert!(
-        prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace),
+        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
         "Proof verification failed for basic_arith_32 program"
     );
 }
@@ -663,7 +426,7 @@ fn test_prove_elfs_comprehensive() {
     );
 
     assert!(
-        prove_and_verify_vm_with_lt(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
         "Proof verification failed for comprehensive_test program"
     );
 }
@@ -677,11 +440,14 @@ fn test_prove_elfs_test_add_8() {
     let (logs, instructions) = run_asm_elf("test_add_8");
     assert_eq!(logs.len(), 8);
     let mut cpu_trace = Traces::from_logs(&logs, instructions.clone()).unwrap().cpu;
-    let bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    let lt_lookups = collect_lt_lookups_from_logs(&logs, &instructions);
+    let mut lt_trace = generate_lt_trace(&lt_lookups);
+    let mut bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    bitwise_lookups.extend(collect_bitwise_lookups_from_lt(&lt_lookups));
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
     println!("test_add_8: {} lookups", bitwise_lookups.len());
     assert!(
-        prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace),
+        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
         "test_add_8 failed"
     );
 }
@@ -691,11 +457,14 @@ fn test_prove_elfs_test_sub_8() {
     let (logs, instructions) = run_asm_elf("test_sub_8");
     assert_eq!(logs.len(), 8);
     let mut cpu_trace = Traces::from_logs(&logs, instructions.clone()).unwrap().cpu;
-    let bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    let lt_lookups = collect_lt_lookups_from_logs(&logs, &instructions);
+    let mut lt_trace = generate_lt_trace(&lt_lookups);
+    let mut bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    bitwise_lookups.extend(collect_bitwise_lookups_from_lt(&lt_lookups));
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
     println!("test_sub_8: {} lookups", bitwise_lookups.len());
     assert!(
-        prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace),
+        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
         "test_sub_8 failed"
     );
 }
@@ -705,11 +474,14 @@ fn test_prove_elfs_test_addw_8() {
     let (logs, instructions) = run_asm_elf("test_addw_8");
     assert_eq!(logs.len(), 8);
     let mut cpu_trace = Traces::from_logs(&logs, instructions.clone()).unwrap().cpu;
-    let bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    let lt_lookups = collect_lt_lookups_from_logs(&logs, &instructions);
+    let mut lt_trace = generate_lt_trace(&lt_lookups);
+    let mut bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    bitwise_lookups.extend(collect_bitwise_lookups_from_lt(&lt_lookups));
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
     println!("test_addw_8: {} lookups", bitwise_lookups.len());
     assert!(
-        prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace),
+        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
         "test_addw_8 failed"
     );
 }
@@ -719,11 +491,14 @@ fn test_prove_elfs_test_subw_8() {
     let (logs, instructions) = run_asm_elf("test_subw_8");
     assert_eq!(logs.len(), 8);
     let mut cpu_trace = Traces::from_logs(&logs, instructions.clone()).unwrap().cpu;
-    let bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    let lt_lookups = collect_lt_lookups_from_logs(&logs, &instructions);
+    let mut lt_trace = generate_lt_trace(&lt_lookups);
+    let mut bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    bitwise_lookups.extend(collect_bitwise_lookups_from_lt(&lt_lookups));
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
     println!("test_subw_8: {} lookups", bitwise_lookups.len());
     assert!(
-        prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace),
+        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
         "test_subw_8 failed"
     );
 }
@@ -733,11 +508,14 @@ fn test_prove_elfs_test_addw_lui_8() {
     let (logs, instructions) = run_asm_elf("test_addw_lui_8");
     assert_eq!(logs.len(), 8);
     let mut cpu_trace = Traces::from_logs(&logs, instructions.clone()).unwrap().cpu;
-    let bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    let lt_lookups = collect_lt_lookups_from_logs(&logs, &instructions);
+    let mut lt_trace = generate_lt_trace(&lt_lookups);
+    let mut bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    bitwise_lookups.extend(collect_bitwise_lookups_from_lt(&lt_lookups));
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
     println!("test_addw_lui_8: {} lookups", bitwise_lookups.len());
     assert!(
-        prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace),
+        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
         "test_addw_lui_8 failed"
     );
 }
@@ -747,11 +525,14 @@ fn test_prove_elfs_test_subw_lui_8() {
     let (logs, instructions) = run_asm_elf("test_subw_lui_8");
     assert_eq!(logs.len(), 8);
     let mut cpu_trace = Traces::from_logs(&logs, instructions.clone()).unwrap().cpu;
-    let bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    let lt_lookups = collect_lt_lookups_from_logs(&logs, &instructions);
+    let mut lt_trace = generate_lt_trace(&lt_lookups);
+    let mut bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    bitwise_lookups.extend(collect_bitwise_lookups_from_lt(&lt_lookups));
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
     println!("test_subw_lui_8: {} lookups", bitwise_lookups.len());
     assert!(
-        prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace),
+        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
         "test_subw_lui_8 failed"
     );
 }
@@ -761,11 +542,14 @@ fn test_prove_elfs_test_add_neg_8() {
     let (logs, instructions) = run_asm_elf("test_add_neg_8");
     assert_eq!(logs.len(), 8);
     let mut cpu_trace = Traces::from_logs(&logs, instructions.clone()).unwrap().cpu;
-    let bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    let lt_lookups = collect_lt_lookups_from_logs(&logs, &instructions);
+    let mut lt_trace = generate_lt_trace(&lt_lookups);
+    let mut bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    bitwise_lookups.extend(collect_bitwise_lookups_from_lt(&lt_lookups));
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
     println!("test_add_neg_8: {} lookups", bitwise_lookups.len());
     assert!(
-        prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace),
+        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
         "test_add_neg_8 failed"
     );
 }
@@ -775,11 +559,14 @@ fn test_prove_elfs_test_sub_neg_8() {
     let (logs, instructions) = run_asm_elf("test_sub_neg_8");
     assert_eq!(logs.len(), 8);
     let mut cpu_trace = Traces::from_logs(&logs, instructions.clone()).unwrap().cpu;
-    let bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    let lt_lookups = collect_lt_lookups_from_logs(&logs, &instructions);
+    let mut lt_trace = generate_lt_trace(&lt_lookups);
+    let mut bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    bitwise_lookups.extend(collect_bitwise_lookups_from_lt(&lt_lookups));
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
     println!("test_sub_neg_8: {} lookups", bitwise_lookups.len());
     assert!(
-        prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace),
+        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
         "test_sub_neg_8 failed"
     );
 }
@@ -789,11 +576,14 @@ fn test_prove_elfs_test_mul_8() {
     let (logs, instructions) = run_asm_elf("test_mul_8");
     assert_eq!(logs.len(), 8);
     let mut cpu_trace = Traces::from_logs(&logs, instructions.clone()).unwrap().cpu;
-    let bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    let lt_lookups = collect_lt_lookups_from_logs(&logs, &instructions);
+    let mut lt_trace = generate_lt_trace(&lt_lookups);
+    let mut bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    bitwise_lookups.extend(collect_bitwise_lookups_from_lt(&lt_lookups));
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
     println!("test_mul_8: {} lookups", bitwise_lookups.len());
     assert!(
-        prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace),
+        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
         "test_mul_8 failed"
     );
 }
@@ -803,11 +593,14 @@ fn test_prove_elfs_test_div_8() {
     let (logs, instructions) = run_asm_elf("test_div_8");
     assert_eq!(logs.len(), 8);
     let mut cpu_trace = Traces::from_logs(&logs, instructions.clone()).unwrap().cpu;
-    let bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    let lt_lookups = collect_lt_lookups_from_logs(&logs, &instructions);
+    let mut lt_trace = generate_lt_trace(&lt_lookups);
+    let mut bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    bitwise_lookups.extend(collect_bitwise_lookups_from_lt(&lt_lookups));
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
     println!("test_div_8: {} lookups", bitwise_lookups.len());
     assert!(
-        prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace),
+        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
         "test_div_8 failed"
     );
 }
@@ -817,11 +610,14 @@ fn test_prove_elfs_test_shift_8() {
     let (logs, instructions) = run_asm_elf("test_shift_8");
     assert_eq!(logs.len(), 8);
     let mut cpu_trace = Traces::from_logs(&logs, instructions.clone()).unwrap().cpu;
-    let bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    let lt_lookups = collect_lt_lookups_from_logs(&logs, &instructions);
+    let mut lt_trace = generate_lt_trace(&lt_lookups);
+    let mut bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    bitwise_lookups.extend(collect_bitwise_lookups_from_lt(&lt_lookups));
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
     println!("test_shift_8: {} lookups", bitwise_lookups.len());
     assert!(
-        prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace),
+        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
         "test_shift_8 failed"
     );
 }
@@ -831,11 +627,14 @@ fn test_prove_elfs_test_bitwise_8() {
     let (logs, instructions) = run_asm_elf("test_bitwise_8");
     assert_eq!(logs.len(), 8);
     let mut cpu_trace = Traces::from_logs(&logs, instructions.clone()).unwrap().cpu;
-    let bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    let lt_lookups = collect_lt_lookups_from_logs(&logs, &instructions);
+    let mut lt_trace = generate_lt_trace(&lt_lookups);
+    let mut bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    bitwise_lookups.extend(collect_bitwise_lookups_from_lt(&lt_lookups));
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
     println!("test_bitwise_8: {} lookups", bitwise_lookups.len());
     assert!(
-        prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace),
+        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
         "test_bitwise_8 failed"
     );
 }
@@ -865,7 +664,7 @@ fn test_prove_elfs_test_slt_8() {
         lt_lookups.len()
     );
     assert!(
-        prove_and_verify_vm_with_lt(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
         "test_slt_8 failed"
     );
 }
@@ -879,11 +678,14 @@ fn test_prove_elfs_test_xor_8() {
     let (logs, instructions) = run_asm_elf("test_xor_8");
     assert_eq!(logs.len(), 8);
     let mut cpu_trace = Traces::from_logs(&logs, instructions.clone()).unwrap().cpu;
-    let bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    let lt_lookups = collect_lt_lookups_from_logs(&logs, &instructions);
+    let mut lt_trace = generate_lt_trace(&lt_lookups);
+    let mut bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    bitwise_lookups.extend(collect_bitwise_lookups_from_lt(&lt_lookups));
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
     println!("test_xor_8: {} lookups", bitwise_lookups.len());
     assert!(
-        prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace),
+        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
         "test_xor_8 failed"
     );
 }
@@ -893,11 +695,14 @@ fn test_prove_elfs_test_lb_lh_8() {
     let (logs, instructions) = run_asm_elf("test_lb_lh_8");
     assert_eq!(logs.len(), 8);
     let mut cpu_trace = Traces::from_logs(&logs, instructions.clone()).unwrap().cpu;
-    let bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    let lt_lookups = collect_lt_lookups_from_logs(&logs, &instructions);
+    let mut lt_trace = generate_lt_trace(&lt_lookups);
+    let mut bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    bitwise_lookups.extend(collect_bitwise_lookups_from_lt(&lt_lookups));
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
     println!("test_lb_lh_8: {} lookups", bitwise_lookups.len());
     assert!(
-        prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace),
+        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
         "test_lb_lh_8 failed"
     );
 }
@@ -907,11 +712,14 @@ fn test_prove_elfs_test_sb_sh_8() {
     let (logs, instructions) = run_asm_elf("test_sb_sh_8");
     assert_eq!(logs.len(), 8);
     let mut cpu_trace = Traces::from_logs(&logs, instructions.clone()).unwrap().cpu;
-    let bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    let lt_lookups = collect_lt_lookups_from_logs(&logs, &instructions);
+    let mut lt_trace = generate_lt_trace(&lt_lookups);
+    let mut bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    bitwise_lookups.extend(collect_bitwise_lookups_from_lt(&lt_lookups));
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
     println!("test_sb_sh_8: {} lookups", bitwise_lookups.len());
     assert!(
-        prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace),
+        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
         "test_sb_sh_8 failed"
     );
 }
@@ -941,7 +749,7 @@ fn test_prove_elfs_all_branches_16() {
         lt_lookups.len()
     );
     assert!(
-        prove_and_verify_vm_with_lt(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
         "all_branches_16 failed"
     );
 }
@@ -951,11 +759,14 @@ fn test_prove_elfs_all_loadstore_32() {
     let (logs, instructions) = run_asm_elf("all_loadstore_32");
     assert_eq!(logs.len(), 32);
     let mut cpu_trace = Traces::from_logs(&logs, instructions.clone()).unwrap().cpu;
-    let bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    let lt_lookups = collect_lt_lookups_from_logs(&logs, &instructions);
+    let mut lt_trace = generate_lt_trace(&lt_lookups);
+    let mut bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    bitwise_lookups.extend(collect_bitwise_lookups_from_lt(&lt_lookups));
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
     println!("all_loadstore_32: {} lookups", bitwise_lookups.len());
     assert!(
-        prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace),
+        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
         "all_loadstore_32 failed"
     );
 }
@@ -986,7 +797,7 @@ fn test_prove_elfs_all_instructions_64() {
         lt_lookups.len()
     );
     assert!(
-        prove_and_verify_vm_with_lt(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
         "all_instructions_64 failed"
     );
 }
@@ -1033,7 +844,7 @@ fn test_prove_elfs_all_instructions_64_full() {
     );
 
     assert!(
-        prove_and_verify_vm_with_lt(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+        prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
         "all_instructions_64 (full) failed"
     );
 }
@@ -1059,7 +870,10 @@ fn test_prove_elfs_sign_ext_edge_cases_8() {
     );
 
     let mut cpu_trace = Traces::from_logs(&logs, instructions.clone()).unwrap().cpu;
-    let bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    let lt_lookups = collect_lt_lookups_from_logs(&logs, &instructions);
+    let mut lt_trace = generate_lt_trace(&lt_lookups);
+    let mut bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    bitwise_lookups.extend(collect_bitwise_lookups_from_lt(&lt_lookups));
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
 
     println!(
@@ -1069,7 +883,7 @@ fn test_prove_elfs_sign_ext_edge_cases_8() {
     );
 
     assert!(
-        prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace),
+        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
         "sign_ext_edge_cases_8 failed - arg2 sign extension may be broken"
     );
 }

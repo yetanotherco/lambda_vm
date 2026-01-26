@@ -190,7 +190,7 @@ fn test_lt_deduplication() {
     let traces = Traces::from_logs(&logs, instructions).unwrap();
 
     // Should have 1 unique LT op with multiplicity 3
-    assert_eq!(traces.lt.main_table.height, 2); // 1 op padded to 2
+    assert_eq!(traces.lt.main_table.height, 4); // 1 op padded to 4 (minimum for FRI)
     let row = traces.lt.main_table.get_row(0);
     assert_eq!(row[lt::cols::MU], FE::from(3u64));
 }

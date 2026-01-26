@@ -12,7 +12,7 @@ use crate::tables::types::FE;
 
 use executor::{
     elf::Elf,
-    vm::{execution::run_program, instruction::decoding::Instruction, memory::U64HashMap},
+    vm::{execution::Executor, instruction::decoding::Instruction, memory::U64HashMap},
 };
 
 /// Helper to create 4 operations from a template (required for power-of-2 trace).
@@ -331,8 +331,8 @@ fn test_column_arrays() {
 fn run_elf(path: &str) -> (Vec<executor::vm::logs::Log>, U64HashMap<Instruction>) {
     let elf_data = std::fs::read(path).expect("Failed to read ELF");
     let program = Elf::load(&elf_data).expect("Failed to load ELF");
-    let result =
-        run_program(program.image, program.entry_point, vec![]).expect("Failed to run program");
+    let executor = Executor::new(&program, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
     (result.logs, result.instructions)
 }
 

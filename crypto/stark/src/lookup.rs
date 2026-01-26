@@ -455,6 +455,10 @@ pub struct AirWithBuses<
     transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
     auxiliary_trace_build_data: AuxiliaryTraceBuildData,
     boundary_constraint_builder: PhantomData<(B, PI)>,
+    /// Commitment to precomputed columns (if this is a preprocessed table)
+    preprocessed_commitment: Option<crate::config::Commitment>,
+    /// Number of precomputed columns (columns 0..n are precomputed, rest are multiplicities)
+    num_precomputed_cols: Option<usize>,
 }
 
 impl<
@@ -521,7 +525,35 @@ impl<
             transition_constraints,
             auxiliary_trace_build_data,
             boundary_constraint_builder: PhantomData,
+            preprocessed_commitment: None,
+            num_precomputed_cols: None,
         }
+    }
+
+    /// Marks this AIR as a preprocessed table with a hardcoded commitment.
+    ///
+    /// Preprocessed tables have columns that are fully deterministic and known
+    /// to both prover and verifier (e.g., bitwise lookup tables). The verifier
+    /// uses the hardcoded commitment instead of trusting the prover.
+    ///
+    /// # Arguments
+    /// * `commitment` - The Merkle root commitment to the precomputed columns
+    /// * `num_precomputed_cols` - Number of precomputed columns (0..n are precomputed,
+    ///   remaining columns are multiplicities that vary per proof)
+    ///
+    /// # Example
+    /// ```ignore
+    /// let air = AirWithBuses::new(num_cols, aux_data, opts, 1, constraints)
+    ///     .with_preprocessed(bitwise::preprocessed_commitment(), bitwise::NUM_PRECOMPUTED_COLS);
+    /// ```
+    pub fn with_preprocessed(
+        mut self,
+        commitment: crate::config::Commitment,
+        num_precomputed_cols: usize,
+    ) -> Self {
+        self.preprocessed_commitment = Some(commitment);
+        self.num_precomputed_cols = Some(num_precomputed_cols);
+        self
     }
 }
 
@@ -650,6 +682,18 @@ where
         boundary_constraints.extend(B::boundary_constraints(pub_inputs, rap_challenges));
 
         BoundaryConstraints::from_constraints(boundary_constraints)
+    }
+
+    fn is_preprocessed(&self) -> bool {
+        self.preprocessed_commitment.is_some()
+    }
+
+    fn num_precomputed_columns(&self) -> usize {
+        self.num_precomputed_cols.unwrap_or(0)
+    }
+
+    fn precomputed_commitment(&self) -> crate::config::Commitment {
+        self.preprocessed_commitment.unwrap_or([0u8; 32])
     }
 }
 

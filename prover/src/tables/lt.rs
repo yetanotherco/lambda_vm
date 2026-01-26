@@ -138,7 +138,7 @@ pub fn generate_lt_trace(
     }
 
     let unique_ops: Vec<_> = op_map.into_iter().collect();
-    let num_rows = unique_ops.len().next_power_of_two().max(2);
+    let num_rows = unique_ops.len().next_power_of_two().max(4);
     let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
 
     for (row_idx, (op, multiplicity)) in unique_ops.iter().enumerate() {
