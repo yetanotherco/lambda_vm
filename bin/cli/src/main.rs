@@ -15,8 +15,7 @@ fn main() {
     let elf_data = std::fs::read(args.filename).expect("Failed to read elf file");
     let program = Elf::load(&elf_data).expect("Failed to load elf program");
 
-    let mut executor = Executor::new(program.image, program.entry_point, vec![])
-        .expect("Failed to create executor");
+    let mut executor = Executor::new(&program, vec![]).expect("Failed to create executor");
 
     while let Some(_logs) = executor.resume().expect("Failed to execute") {
         // Process logs here (e.g., generate trace rows)
