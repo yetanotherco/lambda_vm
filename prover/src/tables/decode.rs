@@ -445,6 +445,11 @@ impl DecodeEntry {
                 entry.read_register2 = true;
                 entry.write_register = true;
             }
+
+            Instruction::Fence => {
+                // FENCE is a memory barrier - in single-threaded, in-order execution it's a no-op
+                // No operation flags needed, just advance PC (handled by default)
+            }
         }
 
         entry

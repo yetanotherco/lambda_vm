@@ -30,6 +30,7 @@ use crate::tables::bitwise::{
 use crate::tables::cpu::{
     CpuOperation, bus_interactions as cpu_bus_interactions, cols as cpu_cols,
 };
+use crate::tables::decode::DecodeEntry;
 use crate::tables::lt::{LtOperation, bus_interactions as lt_bus_interactions, cols as lt_cols};
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
@@ -77,11 +78,19 @@ pub fn collect_bitwise_lookups_from_logs(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,
 ) -> Vec<(BitwiseLookup, u8, u8, u8)> {
+    use std::collections::HashMap;
+
+    // Build decode entries map
+    let decode_entries: HashMap<u64, DecodeEntry> = instructions
+        .iter()
+        .map(|(&pc, &instr)| (pc, DecodeEntry::from_instruction(pc, instr)))
+        .collect();
+
     logs.iter()
         .enumerate()
         .flat_map(|(i, log)| {
-            let instruction = *instructions.get(&log.current_pc).unwrap();
-            let op = CpuOperation::from_log(log, (i as u64) * 4, instruction);
+            let decode_entry = decode_entries.get(&log.current_pc).unwrap();
+            let op = CpuOperation::from_decode_entry(decode_entry, log, (i as u64) * 4);
             op.collect_bitwise_lookups()
         })
         .collect()
@@ -95,92 +104,24 @@ pub fn collect_lt_lookups_from_logs(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,
 ) -> Vec<LtOperation> {
-    use executor::vm::instruction::decoding::{ArithOp, Comparison};
+    use std::collections::HashMap;
+
+    // Build decode entries map
+    let decode_entries: HashMap<u64, DecodeEntry> = instructions
+        .iter()
+        .map(|(&pc, &instr)| (pc, DecodeEntry::from_instruction(pc, instr)))
+        .collect();
 
     let mut lookups = Vec::new();
 
-    for log in logs {
-        let instruction = *instructions.get(&log.current_pc).unwrap();
+    for (i, log) in logs.iter().enumerate() {
+        let decode_entry = decode_entries.get(&log.current_pc).unwrap();
+        let op = CpuOperation::from_decode_entry(decode_entry, log, (i as u64) * 4);
 
-        let is_slt = matches!(
-            &instruction,
-            Instruction::Arith {
-                op: ArithOp::SetLessThan,
-                ..
-            } | Instruction::Arith {
-                op: ArithOp::SetLessThanU,
-                ..
-            } | Instruction::ArithImm {
-                op: ArithOp::SetLessThan,
-                ..
-            } | Instruction::ArithImm {
-                op: ArithOp::SetLessThanU,
-                ..
-            } | Instruction::ArithW {
-                op: ArithOp::SetLessThan,
-                ..
-            } | Instruction::ArithW {
-                op: ArithOp::SetLessThanU,
-                ..
-            } | Instruction::ArithImmW {
-                op: ArithOp::SetLessThan,
-                ..
-            } | Instruction::ArithImmW {
-                op: ArithOp::SetLessThanU,
-                ..
-            }
-        );
-
-        let is_blt = matches!(
-            &instruction,
-            Instruction::Branch {
-                cond: Comparison::LessThan,
-                ..
-            } | Instruction::Branch {
-                cond: Comparison::LessThanUnsigned,
-                ..
-            } | Instruction::Branch {
-                cond: Comparison::GreaterOrEqual,
-                ..
-            } | Instruction::Branch {
-                cond: Comparison::GreaterOrEqualUnsigned,
-                ..
-            }
-        );
-
-        if is_slt || is_blt {
-            let signed = matches!(
-                &instruction,
-                Instruction::Arith {
-                    op: ArithOp::SetLessThan,
-                    ..
-                } | Instruction::ArithImm {
-                    op: ArithOp::SetLessThan,
-                    ..
-                } | Instruction::ArithW {
-                    op: ArithOp::SetLessThan,
-                    ..
-                } | Instruction::ArithImmW {
-                    op: ArithOp::SetLessThan,
-                    ..
-                } | Instruction::Branch {
-                    cond: Comparison::LessThan,
-                    ..
-                } | Instruction::Branch {
-                    cond: Comparison::GreaterOrEqual,
-                    ..
-                }
-            );
-
-            let arg1 = log.src1_val;
-            let arg2 = match &instruction {
-                Instruction::ArithImm { imm, .. } | Instruction::ArithImmW { imm, .. } => {
-                    *imm as i64 as u64
-                }
-                _ => log.src2_val,
-            };
-
-            lookups.push(LtOperation::new(arg1, arg2, signed));
+        if op.op_slt || op.op_blt {
+            let arg1 = op.compute_arg1();
+            let arg2 = op.compute_arg2();
+            lookups.push(LtOperation::new(arg1, arg2, op.signed));
         }
     }
 
