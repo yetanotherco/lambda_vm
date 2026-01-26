@@ -33,7 +33,7 @@ use math::polynomial::Polynomial;
 use stark::config::{BatchedMerkleTree, Commitment};
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::prover::evaluate_polynomial_on_lde_domain;
-use stark::trace::{columns2rows, TraceTable};
+use stark::trace::{TraceTable, columns2rows};
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 
@@ -204,7 +204,9 @@ const LDE_COSET_OFFSET: u64 = 3;
 fn compute_preprocessed_commitment() -> Commitment {
     // Step 1: Generate precomputed columns (not rows)
     // Each column is a vector of NUM_ROWS field elements
-    let mut columns: Vec<Vec<FE>> = vec![Vec::with_capacity(NUM_ROWS); NUM_PRECOMPUTED_COLS];
+    let mut columns: Vec<Vec<FE>> = (0..NUM_PRECOMPUTED_COLS)
+        .map(|_| Vec::with_capacity(NUM_ROWS))
+        .collect();
 
     for idx in 0..NUM_ROWS {
         let row = generate_bitwise_row(idx);

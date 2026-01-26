@@ -230,18 +230,18 @@ fn test_generate_bitwise_row_matches_trace() {
 
     // Test boundary cases and representative samples
     let test_indices = [
-        0,                              // First row: x=0, y=0, z=0
-        1,                              // x=1, y=0, z=0
-        255,                            // x=255, y=0, z=0
-        256,                            // x=0, y=1, z=0
-        256 * 256,                      // x=0, y=0, z=1
-        256 * 256 * 15,                 // x=0, y=0, z=15
-        NUM_ROWS - 1,                   // Last row: x=255, y=255, z=15
-        row_index(0xAA, 0x55, 7),       // Alternating bits
-        row_index(0x55, 0xAA, 8),       // Alternating bits reversed
-        row_index(128, 128, 4),         // MSB set
-        row_index(1, 0, 15),            // Shift boundary
-        row_index(0, 128, 1),           // Carry case
+        0,                        // First row: x=0, y=0, z=0
+        1,                        // x=1, y=0, z=0
+        255,                      // x=255, y=0, z=0
+        256,                      // x=0, y=1, z=0
+        256 * 256,                // x=0, y=0, z=1
+        256 * 256 * 15,           // x=0, y=0, z=15
+        NUM_ROWS - 1,             // Last row: x=255, y=255, z=15
+        row_index(0xAA, 0x55, 7), // Alternating bits
+        row_index(0x55, 0xAA, 8), // Alternating bits reversed
+        row_index(128, 128, 4),   // MSB set
+        row_index(1, 0, 15),      // Shift boundary
+        row_index(0, 128, 1),     // Carry case
     ];
 
     for &idx in &test_indices {
@@ -501,7 +501,9 @@ mod soundness_tests {
         );
 
         match preprocessed {
-            Some((commitment, num_precomputed)) => air.with_preprocessed(commitment, num_precomputed),
+            Some((commitment, num_precomputed)) => {
+                air.with_preprocessed(commitment, num_precomputed)
+            }
             None => air,
         }
     }
@@ -671,7 +673,8 @@ mod soundness_tests {
 
         // Compute commitment to the MALICIOUS table (what prover will use)
         let malicious_trace_for_commitment = create_malicious_receiver_trace(x, y, fake_result);
-        let malicious_commitment = compute_trace_commitment(&malicious_trace_for_commitment, &proof_options);
+        let malicious_commitment =
+            compute_trace_commitment(&malicious_trace_for_commitment, &proof_options);
 
         // Sender claims the fake result
         let mut sender_trace = create_sender_trace(x, y, fake_result);
@@ -704,8 +707,11 @@ mod soundness_tests {
         let verifier_airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
             vec![&sender_air, &verifier_receiver_air];
 
-        let result =
-            Verifier::multi_verify(&verifier_airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[]));
+        let result = Verifier::multi_verify(
+            &verifier_airs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+        );
 
         // With preprocessed support, malicious proof is REJECTED (secure!)
         assert!(
@@ -713,5 +719,4 @@ mod soundness_tests {
             "With preprocessed support, malicious bitwise table should be REJECTED"
         );
     }
-
 }

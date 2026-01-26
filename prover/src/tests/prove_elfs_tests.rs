@@ -123,7 +123,10 @@ fn prove_and_verify_vm_minimal(
     let multi_proof =
         match Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])) {
             Ok(proof) => {
-                eprintln!("DEBUG: Prover succeeded, {} proofs generated", proof.proofs.len());
+                eprintln!(
+                    "DEBUG: Prover succeeded, {} proofs generated",
+                    proof.proofs.len()
+                );
                 proof
             }
             Err(e) => {
