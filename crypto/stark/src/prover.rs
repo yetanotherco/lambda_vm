@@ -334,6 +334,7 @@ pub trait IsStarkProver<
     ///
     /// Does NOT append to transcript - the caller handles that with the hardcoded commitment.
     /// Returns the computed commitment for verification purposes.
+    #[allow(clippy::type_complexity)]
     fn interpolate_and_commit_preprocessed(
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
@@ -491,6 +492,7 @@ pub trait IsStarkProver<
     /// - Multiplicity columns (num_precomputed_cols..): separate tree, root in proof
     ///
     /// Both commitments are added to the transcript for Fiat-Shamir binding.
+    #[allow(clippy::type_complexity)]
     fn round_1_commit_preprocessed_trace(
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
