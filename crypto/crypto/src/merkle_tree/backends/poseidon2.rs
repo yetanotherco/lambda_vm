@@ -14,7 +14,7 @@ use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 
 /// Poseidon2 Merkle tree backend for single Goldilocks field elements
 ///
-/// Node type: `[Fp; 2]` (128-bit, providing 64-bit collision resistance)
+/// Node type: `[Fp; 2]` (128-bit digest, providing ~64-bit collision resistance via birthday bound)
 /// Data type: Goldilocks field element (64-bit)
 #[derive(Clone, Default)]
 pub struct Poseidon2Backend;
@@ -34,7 +34,7 @@ impl IsMerkleTreeBackend for Poseidon2Backend {
 
 /// Poseidon2 Merkle tree backend for vectors of Goldilocks field elements
 ///
-/// Node type: `[Fp; 2]` (128-bit, providing 64-bit collision resistance)
+/// Node type: `[Fp; 2]` (128-bit digest, providing ~64-bit collision resistance via birthday bound)
 /// Data type: Vec<Goldilocks field element>
 ///
 /// This is useful for committing to rows of field elements (e.g., trace columns)

@@ -162,7 +162,11 @@ pub const INTERNAL_ROUND_CONSTANTS: [u64; 22] = [
 ];
 
 /// Diagonal elements for the internal diffusion matrix (width 12)
-/// For future WIDTH=12 support (rate=8, capacity=4)
+///
+/// Reserved for potential future WIDTH=12 configuration (rate=8, capacity=4).
+/// These constants are from the Poseidon2 paper and are kept here to enable
+/// easy extension to larger state widths if higher throughput is needed.
+/// Currently unused as we use WIDTH=8 for 128-bit security with Goldilocks.
 #[allow(dead_code)]
 pub const MATRIX_DIAG_12: [u64; 12] = [
     0xc3b6c08e23ba9300,
@@ -180,7 +184,11 @@ pub const MATRIX_DIAG_12: [u64; 12] = [
 ];
 
 /// Diagonal elements for the internal diffusion matrix (width 16)
-/// For future WIDTH=16 support (rate=12, capacity=4)
+///
+/// Reserved for potential future WIDTH=16 configuration (rate=12, capacity=4).
+/// These constants are from the Poseidon2 paper and are kept here to enable
+/// easy extension to larger state widths if higher throughput is needed.
+/// Currently unused as we use WIDTH=8 for 128-bit security with Goldilocks.
 #[allow(dead_code)]
 pub const MATRIX_DIAG_16: [u64; 16] = [
     0xde9b91a467d6afc0,

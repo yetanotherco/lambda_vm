@@ -289,17 +289,18 @@ impl Poseidon2 {
     ///
     /// # Behavior
     ///
-    /// - **Empty**: Returns `[Fp::zero(); 2]` (debug assertion guards against misuse)
+    /// - **Empty**: Panics (empty input is not allowed)
     /// - **Length 1**: Delegates to [`hash_single`](Self::hash_single)
     /// - **Length 2+**: Delegates to [`hash_many`](Self::hash_many)
+    ///
+    /// # Panics
+    ///
+    /// Panics if `inputs` is empty.
     pub fn hash_vec(inputs: &[Fp]) -> Digest {
-        if inputs.is_empty() {
-            debug_assert!(
-                false,
-                "hash_vec called with empty input - this may cause collision with valid hashes"
-            );
-            return [Fp::zero(); 2];
-        }
+        assert!(
+            !inputs.is_empty(),
+            "hash_vec called with empty input - empty input is not allowed"
+        );
         if inputs.len() == 1 {
             return Self::hash_single(&inputs[0]);
         }
@@ -684,15 +685,9 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_hash_vec_empty_returns_zero() {
-        #[cfg(not(debug_assertions))]
-        {
-            assert_eq!(
-                Poseidon2::hash_vec(&[]),
-                [Fp::zero(); 2],
-                "hash_vec([]) should return [0, 0]"
-            );
-        }
+    #[should_panic(expected = "hash_vec called with empty input")]
+    fn test_hash_vec_empty_panics() {
+        let _ = Poseidon2::hash_vec(&[]);
     }
 
     #[test]
