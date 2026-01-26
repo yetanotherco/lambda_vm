@@ -13,7 +13,7 @@
 use std::path::PathBuf;
 
 use executor::elf::Elf;
-use executor::vm::execution::run_program;
+use executor::vm::execution::Executor;
 use executor::vm::instruction::decoding::Instruction;
 use executor::vm::logs::Log;
 use executor::vm::memory::U64HashMap;
@@ -63,8 +63,9 @@ pub fn run_asm_elf(name: &str) -> (Vec<Log>, U64HashMap<Instruction>) {
     let elf_data =
         std::fs::read(&path).unwrap_or_else(|_| panic!("Failed to read ELF: {}", path.display()));
     let program = Elf::load(&elf_data).expect("Failed to load ELF");
-    let result =
-        run_program(program.image, program.entry_point, vec![]).expect("Failed to run program");
+    let executor =
+        Executor::new(program.image, program.entry_point, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
     (result.logs, result.instructions)
 }
 
