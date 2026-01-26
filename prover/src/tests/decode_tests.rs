@@ -15,177 +15,173 @@ use crate::tables::types::FE;
 #[test]
 fn test_packed_decode_flags() {
     // Test each control flag individually
+    // Format matches cpu.toml spec
     let mut entry = DecodeEntry::new();
 
-    // Bit 0: read_register1
-    entry.read_register1 = true;
-    assert_eq!(entry.packed_decode() & (1 << 0), 1 << 0);
-    entry.read_register1 = false;
-
-    // Bit 1: read_register2
-    entry.read_register2 = true;
-    assert_eq!(entry.packed_decode() & (1 << 1), 1 << 1);
-    entry.read_register2 = false;
-
-    // Bit 2: write_register
+    // Bit 0: write_register
     entry.write_register = true;
-    assert_eq!(entry.packed_decode() & (1 << 2), 1 << 2);
+    assert_eq!(entry.packed_decode() & (1 << 0), 1 << 0);
     entry.write_register = false;
 
-    // Bit 3: memory_2bytes
+    // Bit 1: memory_2bytes
     entry.memory_2bytes = true;
-    assert_eq!(entry.packed_decode() & (1 << 3), 1 << 3);
+    assert_eq!(entry.packed_decode() & (1 << 1), 1 << 1);
     entry.memory_2bytes = false;
 
-    // Bit 4: memory_4bytes
+    // Bit 2: memory_4bytes
     entry.memory_4bytes = true;
-    assert_eq!(entry.packed_decode() & (1 << 4), 1 << 4);
+    assert_eq!(entry.packed_decode() & (1 << 2), 1 << 2);
     entry.memory_4bytes = false;
 
-    // Bit 5: memory_8bytes
+    // Bit 3: memory_8bytes
     entry.memory_8bytes = true;
-    assert_eq!(entry.packed_decode() & (1 << 5), 1 << 5);
+    assert_eq!(entry.packed_decode() & (1 << 3), 1 << 3);
     entry.memory_8bytes = false;
 
-    // Bit 6: c_type
+    // Bit 4: c_type
     entry.c_type = true;
-    assert_eq!(entry.packed_decode() & (1 << 6), 1 << 6);
+    assert_eq!(entry.packed_decode() & (1 << 4), 1 << 4);
     entry.c_type = false;
 
-    // Bit 7: signed
+    // Bit 5: signed
     entry.signed = true;
-    assert_eq!(entry.packed_decode() & (1 << 7), 1 << 7);
+    assert_eq!(entry.packed_decode() & (1 << 5), 1 << 5);
     entry.signed = false;
 
-    // Bit 8: mp_selector
+    // Bit 6: mp_selector
     entry.mp_selector = true;
-    assert_eq!(entry.packed_decode() & (1 << 8), 1 << 8);
+    assert_eq!(entry.packed_decode() & (1 << 6), 1 << 6);
     entry.mp_selector = false;
 
-    // Bit 9: muldiv_selector
+    // Bit 7: muldiv_selector
     entry.muldiv_selector = true;
-    assert_eq!(entry.packed_decode() & (1 << 9), 1 << 9);
+    assert_eq!(entry.packed_decode() & (1 << 7), 1 << 7);
     entry.muldiv_selector = false;
 
-    // Bit 10: word_instr
+    // Bit 8: word_instr
     entry.word_instr = true;
-    assert_eq!(entry.packed_decode() & (1 << 10), 1 << 10);
+    assert_eq!(entry.packed_decode() & (1 << 8), 1 << 8);
     entry.word_instr = false;
 }
 
 #[test]
 fn test_packed_decode_alu_flags() {
+    // ALU flags at bits 9-24 per cpu.toml spec
     let mut entry = DecodeEntry::new();
 
-    // Bit 11: ADD
+    // Bit 9: ADD
     entry.op_add = true;
-    assert_eq!(entry.packed_decode() & (1 << 11), 1 << 11);
+    assert_eq!(entry.packed_decode() & (1 << 9), 1 << 9);
     entry.op_add = false;
 
-    // Bit 12: SUB
+    // Bit 10: SUB
     entry.op_sub = true;
-    assert_eq!(entry.packed_decode() & (1 << 12), 1 << 12);
+    assert_eq!(entry.packed_decode() & (1 << 10), 1 << 10);
     entry.op_sub = false;
 
-    // Bit 13: SLT
+    // Bit 11: SLT
     entry.op_slt = true;
-    assert_eq!(entry.packed_decode() & (1 << 13), 1 << 13);
+    assert_eq!(entry.packed_decode() & (1 << 11), 1 << 11);
     entry.op_slt = false;
 
-    // Bit 14: AND
+    // Bit 12: AND
     entry.op_and = true;
-    assert_eq!(entry.packed_decode() & (1 << 14), 1 << 14);
+    assert_eq!(entry.packed_decode() & (1 << 12), 1 << 12);
     entry.op_and = false;
 
-    // Bit 15: OR
+    // Bit 13: OR
     entry.op_or = true;
-    assert_eq!(entry.packed_decode() & (1 << 15), 1 << 15);
+    assert_eq!(entry.packed_decode() & (1 << 13), 1 << 13);
     entry.op_or = false;
 
-    // Bit 16: XOR
+    // Bit 14: XOR
     entry.op_xor = true;
-    assert_eq!(entry.packed_decode() & (1 << 16), 1 << 16);
+    assert_eq!(entry.packed_decode() & (1 << 14), 1 << 14);
     entry.op_xor = false;
 
-    // Bit 17: SHIFT
+    // Bit 15: SHIFT
     entry.op_shift = true;
-    assert_eq!(entry.packed_decode() & (1 << 17), 1 << 17);
+    assert_eq!(entry.packed_decode() & (1 << 15), 1 << 15);
     entry.op_shift = false;
 
-    // Bit 18: JALR
+    // Bit 16: JALR
     entry.op_jalr = true;
-    assert_eq!(entry.packed_decode() & (1 << 18), 1 << 18);
+    assert_eq!(entry.packed_decode() & (1 << 16), 1 << 16);
     entry.op_jalr = false;
 
-    // Bit 19: BEQ
+    // Bit 17: BEQ
     entry.op_beq = true;
-    assert_eq!(entry.packed_decode() & (1 << 19), 1 << 19);
+    assert_eq!(entry.packed_decode() & (1 << 17), 1 << 17);
     entry.op_beq = false;
 
-    // Bit 20: BLT
+    // Bit 18: BLT
     entry.op_blt = true;
-    assert_eq!(entry.packed_decode() & (1 << 20), 1 << 20);
+    assert_eq!(entry.packed_decode() & (1 << 18), 1 << 18);
     entry.op_blt = false;
 
-    // Bit 21: LOAD
+    // Bit 19: LOAD
     entry.op_load = true;
-    assert_eq!(entry.packed_decode() & (1 << 21), 1 << 21);
+    assert_eq!(entry.packed_decode() & (1 << 19), 1 << 19);
     entry.op_load = false;
 
-    // Bit 22: STORE
+    // Bit 20: STORE
     entry.op_store = true;
-    assert_eq!(entry.packed_decode() & (1 << 22), 1 << 22);
+    assert_eq!(entry.packed_decode() & (1 << 20), 1 << 20);
     entry.op_store = false;
 
-    // Bit 23: MUL
+    // Bit 21: MUL
     entry.op_mul = true;
-    assert_eq!(entry.packed_decode() & (1 << 23), 1 << 23);
+    assert_eq!(entry.packed_decode() & (1 << 21), 1 << 21);
     entry.op_mul = false;
 
-    // Bit 24: DIVREM
+    // Bit 22: DIVREM
     entry.op_divrem = true;
-    assert_eq!(entry.packed_decode() & (1 << 24), 1 << 24);
+    assert_eq!(entry.packed_decode() & (1 << 22), 1 << 22);
     entry.op_divrem = false;
 
-    // Bit 25: ECALL
+    // Bit 23: ECALL
     entry.op_ecall = true;
-    assert_eq!(entry.packed_decode() & (1 << 25), 1 << 25);
+    assert_eq!(entry.packed_decode() & (1 << 23), 1 << 23);
     entry.op_ecall = false;
 
-    // Bit 26: EBREAK
+    // Bit 24: EBREAK
     entry.op_ebreak = true;
-    assert_eq!(entry.packed_decode() & (1 << 26), 1 << 26);
+    assert_eq!(entry.packed_decode() & (1 << 24), 1 << 24);
     entry.op_ebreak = false;
 }
 
 #[test]
 fn test_packed_decode_registers() {
+    // Register positions per cpu.toml spec:
+    // rs1 at bits [25:33), rs2 at bits [33:41), rd at bits [41:49)
     let mut entry = DecodeEntry::new();
 
-    // rs1 at bits [27:35)
+    // rs1 at bits [25:33)
     entry.rs1 = 0b10101010;
     let packed = entry.packed_decode();
-    let rs1_extracted = (packed >> 27) & 0xFF;
+    let rs1_extracted = (packed >> 25) & 0xFF;
     assert_eq!(rs1_extracted, 0b10101010);
     entry.rs1 = 0;
 
-    // rs2 at bits [35:43)
+    // rs2 at bits [33:41)
     entry.rs2 = 0b11001100;
     let packed = entry.packed_decode();
-    let rs2_extracted = (packed >> 35) & 0xFF;
+    let rs2_extracted = (packed >> 33) & 0xFF;
     assert_eq!(rs2_extracted, 0b11001100);
     entry.rs2 = 0;
 
-    // rd at bits [43:51)
+    // rd at bits [41:49)
     entry.rd = 0b11110000;
     let packed = entry.packed_decode();
-    let rd_extracted = (packed >> 43) & 0xFF;
+    let rd_extracted = (packed >> 41) & 0xFF;
     assert_eq!(rd_extracted, 0b11110000);
 }
 
 #[test]
 fn test_packed_decode_combined() {
-    // Test with realistic ADD instruction: rd=10, rs1=5, rs2=6, read_register1, read_register2, write_register, op_add
+    // Test with realistic ADD instruction: rd=10, rs1=5, rs2=6
+    // Per cpu.toml spec: write_register at bit 0, op_add at bit 9
+    // Note: read_register1/read_register2 are NOT in packed_decode (they're separate fields)
     let entry = DecodeEntry {
         pc: 0x1000,
         rs1: 5,
@@ -200,16 +196,14 @@ fn test_packed_decode_combined() {
 
     let packed = entry.packed_decode();
 
-    // Verify flags
-    assert_eq!(packed & (1 << 0), 1 << 0, "read_register1 should be set");
-    assert_eq!(packed & (1 << 1), 1 << 1, "read_register2 should be set");
-    assert_eq!(packed & (1 << 2), 1 << 2, "write_register should be set");
-    assert_eq!(packed & (1 << 11), 1 << 11, "op_add should be set");
+    // Verify flags per spec: write_register at bit 0, op_add at bit 9
+    assert_eq!(packed & (1 << 0), 1 << 0, "write_register should be set at bit 0");
+    assert_eq!(packed & (1 << 9), 1 << 9, "op_add should be set at bit 9");
 
-    // Verify registers
-    assert_eq!((packed >> 27) & 0xFF, 5, "rs1 should be 5");
-    assert_eq!((packed >> 35) & 0xFF, 6, "rs2 should be 6");
-    assert_eq!((packed >> 43) & 0xFF, 10, "rd should be 10");
+    // Verify registers per spec: rs1 at bits 25-32, rs2 at bits 33-40, rd at bits 41-48
+    assert_eq!((packed >> 25) & 0xFF, 5, "rs1 should be 5");
+    assert_eq!((packed >> 33) & 0xFF, 6, "rs2 should be 6");
+    assert_eq!((packed >> 41) & 0xFF, 10, "rd should be 10");
 }
 
 // =========================================================================
@@ -511,5 +505,126 @@ fn test_bus_interactions_is_receiver() {
     assert!(
         !interactions[0].is_sender,
         "DECODE should be a receiver, not sender"
+    );
+}
+
+// =========================================================================
+// Precomputed commitment tests
+// =========================================================================
+
+#[test]
+fn test_compute_precomputed_commitment_deterministic() {
+    use crate::tables::decode::compute_precomputed_commitment;
+    use stark::proof::options::ProofOptions;
+
+    // Same instructions should produce same commitment
+    let mut instructions = U64HashMap::default();
+    instructions.insert(
+        0x1000,
+        Instruction::Arith {
+            dst: 1,
+            src1: 2,
+            src2: 3,
+            op: ArithOp::Add,
+        },
+    );
+    instructions.insert(
+        0x1004,
+        Instruction::Arith {
+            dst: 4,
+            src1: 5,
+            src2: 6,
+            op: ArithOp::Sub,
+        },
+    );
+
+    let options = ProofOptions::default_test_options();
+
+    let commitment1 = compute_precomputed_commitment(&instructions, &options);
+    let commitment2 = compute_precomputed_commitment(&instructions, &options);
+
+    assert_eq!(
+        commitment1, commitment2,
+        "Same instructions should produce same commitment"
+    );
+}
+
+#[test]
+fn test_compute_precomputed_commitment_different_programs() {
+    use crate::tables::decode::compute_precomputed_commitment;
+    use stark::proof::options::ProofOptions;
+
+    let options = ProofOptions::default_test_options();
+
+    // Program A: ADD instruction
+    let mut program_a = U64HashMap::default();
+    program_a.insert(
+        0x1000,
+        Instruction::Arith {
+            dst: 1,
+            src1: 2,
+            src2: 3,
+            op: ArithOp::Add,
+        },
+    );
+
+    // Program B: SUB instruction (different from A)
+    let mut program_b = U64HashMap::default();
+    program_b.insert(
+        0x1000,
+        Instruction::Arith {
+            dst: 1,
+            src1: 2,
+            src2: 3,
+            op: ArithOp::Sub, // Different operation
+        },
+    );
+
+    let commitment_a = compute_precomputed_commitment(&program_a, &options);
+    let commitment_b = compute_precomputed_commitment(&program_b, &options);
+
+    assert_ne!(
+        commitment_a, commitment_b,
+        "Different programs should produce different commitments"
+    );
+}
+
+#[test]
+fn test_compute_precomputed_commitment_different_pc() {
+    use crate::tables::decode::compute_precomputed_commitment;
+    use stark::proof::options::ProofOptions;
+
+    let options = ProofOptions::default_test_options();
+
+    // Program A: instruction at PC 0x1000
+    let mut program_a = U64HashMap::default();
+    program_a.insert(
+        0x1000,
+        Instruction::Arith {
+            dst: 1,
+            src1: 2,
+            src2: 3,
+            op: ArithOp::Add,
+        },
+    );
+
+    // Program B: same instruction at different PC
+    let mut program_b = U64HashMap::default();
+    program_b.insert(
+        0x2000, // Different PC
+        Instruction::Arith {
+            dst: 1,
+            src1: 2,
+            src2: 3,
+            op: ArithOp::Add,
+        },
+    );
+
+    let commitment_a = compute_precomputed_commitment(&program_a, &options);
+    let commitment_b = compute_precomputed_commitment(&program_b, &options);
+
+    assert_ne!(
+        commitment_a, commitment_b,
+        "Programs with different PCs should produce different commitments"
     );
 }

@@ -36,8 +36,14 @@
 //! - **Receiver**: DECODE bus - receives lookups from CPU table
 
 use executor::vm::instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth};
+use executor::vm::memory::U64HashMap;
+use math::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
+use math::polynomial::Polynomial;
+use stark::config::{BatchedMerkleTree, Commitment};
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
-use stark::trace::TraceTable;
+use stark::proof::options::ProofOptions;
+use stark::prover::evaluate_polynomial_on_lde_domain;
+use stark::trace::{columns2rows, TraceTable};
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 
@@ -70,6 +76,10 @@ pub mod cols {
     /// Total number of columns
     pub const NUM_COLUMNS: usize = 6;
 }
+
+/// Number of precomputed columns (PC_0, PC_1, PACKED_DECODE, IMM_0, IMM_1).
+/// The remaining column (MU) is the multiplicity column that varies per execution.
+pub const NUM_PRECOMPUTED_COLS: usize = 5;
 
 // =========================================================================
 // DecodeEntry (uncompressed representation)
@@ -174,62 +184,73 @@ impl DecodeEntry {
         }
     }
 
-    /// Packs all flags and register indices into a single 51-bit value.
+    /// Packs all flags and register indices into a single 49-bit value.
     ///
-    /// Bit layout:
-    /// - bit 0:     read_register1
-    /// - bit 1:     read_register2
-    /// - bit 2:     write_register
-    /// - bit 3:     memory_2bytes
-    /// - bit 4:     memory_4bytes
-    /// - bit 5:     memory_8bytes
-    /// - bit 6:     c_type
-    /// - bit 7:     signed
-    /// - bit 8:     mp_selector
-    /// - bit 9:     muldiv_selector
-    /// - bit 10:    word_instr
-    /// - bits 11-26: ALU flags (16 flags)
-    /// - bits 27-35: rs1 (8 bits)
-    /// - bits 35-43: rs2 (8 bits)
-    /// - bits 43-51: rd (8 bits)
+    /// This matches the spec's packed_decode format (cpu.toml):
+    /// - bit 0:      write_register
+    /// - bit 1:      memory_2bytes
+    /// - bit 2:      memory_4bytes
+    /// - bit 3:      memory_8bytes
+    /// - bit 4:      c_type
+    /// - bit 5:      signed
+    /// - bit 6:      mp_selector
+    /// - bit 7:      muldiv_selector
+    /// - bit 8:      word_instr
+    /// - bit 9:      ADD
+    /// - bit 10:     SUB
+    /// - bit 11:     SLT
+    /// - bit 12:     AND
+    /// - bit 13:     OR
+    /// - bit 14:     XOR
+    /// - bit 15:     SHIFT
+    /// - bit 16:     JALR
+    /// - bit 17:     BEQ
+    /// - bit 18:     BLT
+    /// - bit 19:     LOAD
+    /// - bit 20:     STORE
+    /// - bit 21:     MUL
+    /// - bit 22:     DIVREM
+    /// - bit 23:     ECALL
+    /// - bit 24:     EBREAK
+    /// - bits 25-32: rs1 (8 bits)
+    /// - bits 33-40: rs2 (8 bits)
+    /// - bits 41-48: rd (8 bits)
     pub fn packed_decode(&self) -> u64 {
         let mut packed: u64 = 0;
 
-        // Control flags (bits 0-10)
-        packed |= self.read_register1 as u64;
-        packed |= (self.read_register2 as u64) << 1;
-        packed |= (self.write_register as u64) << 2;
-        packed |= (self.memory_2bytes as u64) << 3;
-        packed |= (self.memory_4bytes as u64) << 4;
-        packed |= (self.memory_8bytes as u64) << 5;
-        packed |= (self.c_type as u64) << 6;
-        packed |= (self.signed as u64) << 7;
-        packed |= (self.mp_selector as u64) << 8;
-        packed |= (self.muldiv_selector as u64) << 9;
-        packed |= (self.word_instr as u64) << 10;
+        // Control flags (bits 0-8)
+        packed |= self.write_register as u64;
+        packed |= (self.memory_2bytes as u64) << 1;
+        packed |= (self.memory_4bytes as u64) << 2;
+        packed |= (self.memory_8bytes as u64) << 3;
+        packed |= (self.c_type as u64) << 4;
+        packed |= (self.signed as u64) << 5;
+        packed |= (self.mp_selector as u64) << 6;
+        packed |= (self.muldiv_selector as u64) << 7;
+        packed |= (self.word_instr as u64) << 8;
 
-        // ALU flags (bits 11-26)
-        packed |= (self.op_add as u64) << 11;
-        packed |= (self.op_sub as u64) << 12;
-        packed |= (self.op_slt as u64) << 13;
-        packed |= (self.op_and as u64) << 14;
-        packed |= (self.op_or as u64) << 15;
-        packed |= (self.op_xor as u64) << 16;
-        packed |= (self.op_shift as u64) << 17;
-        packed |= (self.op_jalr as u64) << 18;
-        packed |= (self.op_beq as u64) << 19;
-        packed |= (self.op_blt as u64) << 20;
-        packed |= (self.op_load as u64) << 21;
-        packed |= (self.op_store as u64) << 22;
-        packed |= (self.op_mul as u64) << 23;
-        packed |= (self.op_divrem as u64) << 24;
-        packed |= (self.op_ecall as u64) << 25;
-        packed |= (self.op_ebreak as u64) << 26;
+        // ALU flags (bits 9-24)
+        packed |= (self.op_add as u64) << 9;
+        packed |= (self.op_sub as u64) << 10;
+        packed |= (self.op_slt as u64) << 11;
+        packed |= (self.op_and as u64) << 12;
+        packed |= (self.op_or as u64) << 13;
+        packed |= (self.op_xor as u64) << 14;
+        packed |= (self.op_shift as u64) << 15;
+        packed |= (self.op_jalr as u64) << 16;
+        packed |= (self.op_beq as u64) << 17;
+        packed |= (self.op_blt as u64) << 18;
+        packed |= (self.op_load as u64) << 19;
+        packed |= (self.op_store as u64) << 20;
+        packed |= (self.op_mul as u64) << 21;
+        packed |= (self.op_divrem as u64) << 22;
+        packed |= (self.op_ecall as u64) << 23;
+        packed |= (self.op_ebreak as u64) << 24;
 
-        // Register indices (bits 27-50)
-        packed |= (self.rs1 as u64) << 27;
-        packed |= (self.rs2 as u64) << 35;
-        packed |= (self.rd as u64) << 43;
+        // Register indices (bits 25-48)
+        packed |= (self.rs1 as u64) << 25;
+        packed |= (self.rs2 as u64) << 33;
+        packed |= (self.rd as u64) << 41;
 
         packed
     }
@@ -554,7 +575,6 @@ impl DecodeEntry {
 // Trace generation
 // =========================================================================
 
-use executor::vm::memory::U64HashMap;
 use std::collections::HashMap;
 
 /// Map from PC to row index in the DECODE trace table.
@@ -644,10 +664,10 @@ pub fn update_multiplicities(
 /// Creates all bus interactions for the DECODE table.
 ///
 /// The DECODE table is a **receiver** that accepts lookups from the CPU table.
-/// The CPU sends: DECODE[pc, packed_decode, imm]
+/// Per spec (cpu.toml): input = ["pc", "imm", "packed_decode"]
 pub fn bus_interactions() -> Vec<BusInteraction> {
     vec![
-        // DECODE[pc, packed_decode, imm] - receiver from CPU
+        // DECODE[pc, imm, packed_decode] - receiver from CPU
         BusInteraction::receiver(
             BusId::Decode,
             Multiplicity::Column(cols::MU),
@@ -657,17 +677,88 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     start_column: cols::PC_0,
                     packing: Packing::DWordWL,
                 },
-                // packed_decode as Direct (1 bus element)
-                BusValue::Packed {
-                    start_column: cols::PACKED_DECODE,
-                    packing: Packing::Direct,
-                },
                 // imm as DWordWL (2 bus elements)
                 BusValue::Packed {
                     start_column: cols::IMM_0,
                     packing: Packing::DWordWL,
                 },
+                // packed_decode as Direct (1 bus element)
+                BusValue::Packed {
+                    start_column: cols::PACKED_DECODE,
+                    packing: Packing::Direct,
+                },
             ],
         ),
     ]
+}
+
+// =========================================================================
+// Precomputed commitment
+// =========================================================================
+
+/// Computes the LDE commitment for DECODE precomputed columns.
+///
+/// This builds a Merkle tree over the LDE (Low Degree Extension) of the precomputed
+/// columns (PC_0, PC_1, PACKED_DECODE, IMM_0, IMM_1), matching exactly how the prover
+/// commits to traces.
+///
+/// Used by both prover (sanity check) and verifier (soundness check). The verifier
+/// computes this from the program and checks that the proof's commitment matches.
+///
+/// ## Arguments
+/// * `instructions` - The program's instruction map (PC → Instruction)
+/// * `options` - Proof options containing blowup factor and coset offset
+///
+/// ## Returns
+/// The Merkle root commitment over the LDE of precomputed columns.
+pub fn compute_precomputed_commitment(
+    instructions: &U64HashMap<Instruction>,
+    options: &ProofOptions,
+) -> Commitment {
+    // Step 1: Generate trace (MU=0, we only need precomputed columns)
+    let (trace, _pc_to_row) = generate_decode_trace(instructions);
+    let num_rows = trace.num_rows();
+
+    // Step 2: Extract precomputed columns (0..NUM_PRECOMPUTED_COLS)
+    let columns: Vec<Vec<FE>> = (0..NUM_PRECOMPUTED_COLS)
+        .map(|col_idx| {
+            (0..num_rows)
+                .map(|row_idx| *trace.main_table.get(row_idx, col_idx))
+                .collect()
+        })
+        .collect();
+
+    // Step 3: Interpolate each column to a polynomial
+    let polys: Vec<Polynomial<FE>> = columns
+        .iter()
+        .map(|col| {
+            Polynomial::interpolate_fft::<GoldilocksField>(col)
+                .expect("FFT interpolation failed for decode column")
+        })
+        .collect();
+
+    // Step 4: Evaluate polynomials on LDE domain (N * blowup_factor points)
+    let blowup_factor = options.blowup_factor as usize;
+    let coset_offset = FE::from(options.coset_offset);
+    let mut lde_columns: Vec<Vec<FE>> = polys
+        .iter()
+        .map(|poly| {
+            evaluate_polynomial_on_lde_domain(poly, blowup_factor, num_rows, &coset_offset)
+                .expect("LDE evaluation failed for decode polynomial")
+        })
+        .collect();
+
+    // Step 5: Bit-reverse permute (same as prover)
+    for col in lde_columns.iter_mut() {
+        in_place_bit_reverse_permute(col);
+    }
+
+    // Step 6: Convert columns to rows for Merkle tree
+    let lde_rows = columns2rows(lde_columns);
+
+    // Step 7: Build Merkle tree over LDE (N * blowup leaves)
+    let tree = BatchedMerkleTree::<GoldilocksField>::build(&lde_rows)
+        .expect("Failed to build Merkle tree for decode LDE");
+
+    tree.root
 }

@@ -30,7 +30,11 @@ use crate::tables::bitwise::{
 use crate::tables::cpu::{
     CpuOperation, bus_interactions as cpu_bus_interactions, cols as cpu_cols,
 };
-use crate::tables::decode::DecodeEntry;
+use crate::tables::decode::{
+    DecodeEntry, NUM_PRECOMPUTED_COLS as DECODE_NUM_PRECOMPUTED_COLS,
+    bus_interactions as decode_bus_interactions, cols as decode_cols,
+};
+use stark::config::Commitment;
 use crate::tables::lt::{LtOperation, bus_interactions as lt_bus_interactions, cols as lt_cols};
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
@@ -326,4 +330,32 @@ pub fn create_lt_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+}
+
+/// Create DECODE AIR with precomputed commitment.
+///
+/// The DECODE table is a program-dependent precomputed table: its content
+/// depends on the instructions being proven, but the precomputed columns
+/// (PC, PACKED_DECODE, IMM) are deterministic given the instruction map.
+///
+/// The `commitment` is the Merkle root of the LDE of precomputed columns,
+/// computed via `decode::compute_precomputed_commitment()`.
+///
+/// Bus interactions: CPU sends DECODE[pc, packed_decode, imm] with multiplicity=1
+/// per instruction. The DECODE table receives this and verifies the decoding matches.
+pub fn create_decode_air(commitment: Commitment, proof_options: &ProofOptions) -> VmAir {
+    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: decode_bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        decode_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+    .with_preprocessed(commitment, DECODE_NUM_PRECOMPUTED_COLS)
 }

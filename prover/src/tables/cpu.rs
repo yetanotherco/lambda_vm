@@ -218,8 +218,13 @@ pub mod cols {
     /// branch_cond: Whether branch is taken
     pub const BRANCH_COND: usize = 71;
 
+    /// packed_decode: Packed decode flags for DECODE bus lookup
+    /// Contains all decode-time flags packed into a single 64-bit value.
+    /// This is sent to the DECODE table to verify instruction decoding.
+    pub const PACKED_DECODE: usize = 72;
+
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 72;
+    pub const NUM_COLUMNS: usize = 73;
 
     // -------------------------------------------------------------------------
     // Helper ranges for iteration
@@ -294,6 +299,11 @@ pub struct CpuOperation {
     pub res: u64,
     pub is_equal: bool,
     pub branch_cond: bool,
+
+    // Packed decode for DECODE bus interaction
+    /// All decode-time flags packed into a single value for bus lookup.
+    /// Computed from DecodeEntry::packed_decode() to match DECODE table.
+    pub packed_decode: u64,
 }
 
 impl CpuOperation {
@@ -354,6 +364,9 @@ impl CpuOperation {
             rv2: log.src2_val,
             rvd: log.dst_val,
             res: log.dst_val, // Default: result is destination value
+
+            // Packed decode for DECODE bus interaction
+            packed_decode: entry.packed_decode(),
 
             ..Default::default()
         };
@@ -758,6 +771,9 @@ pub fn write_cpu_row(data: &mut [FE], row_idx: usize, op: &CpuOperation) {
     // Branch columns
     data[base + cols::IS_EQUAL] = FE::from(op.is_equal as u64);
     data[base + cols::BRANCH_COND] = FE::from(op.branch_cond as u64);
+
+    // DECODE bus lookup column
+    data[base + cols::PACKED_DECODE] = FE::from(op.packed_decode);
 }
 
 /// Collects all Bitwise lookups from a list of CPU operations.
@@ -1084,6 +1100,34 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             // lt result (res[0])
             BusValue::Packed {
                 start_column: cols::RES[0],
+                packing: Packing::Direct,
+            },
+        ],
+    ));
+
+    // -------------------------------------------------------------------------
+    // DECODE interaction - verify instruction decoding
+    // -------------------------------------------------------------------------
+    // Per spec (cpu.toml): input = ["pc", "imm", "packed_decode"]
+    // CPU sends: DECODE[pc, imm, packed_decode] with multiplicity = 1 per instruction
+    // The DECODE table receives this and verifies the packed_decode matches the program.
+    interactions.push(BusInteraction::sender(
+        BusId::Decode,
+        Multiplicity::One,
+        vec![
+            // pc as DWordWL (2 bus elements: PC_0, PC_1)
+            BusValue::Packed {
+                start_column: cols::PC_0,
+                packing: Packing::DWordWL,
+            },
+            // imm as DWordWL (2 bus elements: IMM_0, IMM_1)
+            BusValue::Packed {
+                start_column: cols::IMM_0,
+                packing: Packing::DWordWL,
+            },
+            // packed_decode as Direct (1 bus element)
+            BusValue::Packed {
+                start_column: cols::PACKED_DECODE,
                 packing: Packing::Direct,
             },
         ],
