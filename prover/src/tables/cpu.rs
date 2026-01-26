@@ -719,16 +719,18 @@ impl CpuOperation {
                     op.write_register = true;
                 }
             }
-
             Instruction::CSR { .. } => {
                 // CSR instructions not yet supported in prover
                 // TODO: Add CSR support
             }
-
             Instruction::EcallEbreak => {
                 // Determine if ECALL or EBREAK based on context
                 // For now, default to ECALL
                 op.op_ecall = true;
+            }
+            Instruction::Fence => {
+                // FENCE is a memory barrier - in single-threaded, in-order execution it's a no-op
+                // No operation flags needed, just advance PC (handled by default from log)
             }
         }
 

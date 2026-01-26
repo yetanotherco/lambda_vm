@@ -334,6 +334,16 @@ impl Instruction {
                     dst_val: 0,
                 }
             }
+            Instruction::Fence => {
+                // FENCE is a memory barrier - in single-threaded, in-order execution it's a no-op
+                Log {
+                    current_pc: pc,
+                    next_pc: pc + REGULAR_PC_UPDATE,
+                    src1_val: 0,
+                    src2_val: 0,
+                    dst_val: 0,
+                }
+            }
         })
     }
 }
