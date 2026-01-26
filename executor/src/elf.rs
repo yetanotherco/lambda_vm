@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 const EI_NIDENT: usize = 16;
 // Section header types
 const SHT_SYMTAB: u32 = 2;
@@ -12,6 +10,7 @@ const SYMBOL_ENTRY_SIZE: usize = 24;
 const EM_RISCV: u16 = 243;
 const ET_EXEC: u16 = 2;
 const PT_LOAD: u32 = 1;
+const PF_X: u32 = 0x1;
 const MAX_PROGRAM_HEADERS: usize = 256;
 const EXECUTABLE_HEADER_SIZE: usize = 64; // 64-bit ELF header is 64 bytes
 const PROGRAM_HEADER_SIZE: usize = 56; // 64-bit program header is 56 bytes
@@ -56,7 +55,7 @@ pub struct ProgramHeader {
     /// Segment type
     p_type: u32,
     /// Segment flags (moved in 64-bit format)
-    _p_flags: u32,
+    p_flags: u32,
     /// Segment file offset (64-bit)
     p_offset: u64,
     /// Segment virtual address (64-bit)
@@ -201,7 +200,7 @@ impl ProgramHeader {
         let p_align = u64::from_le_bytes(input[48..56].try_into().map_err(|_| ElfError::Casting)?);
         Ok(Self {
             p_type,
-            _p_flags: p_flags,
+            p_flags,
             p_offset,
             p_vaddr,
             _p_paddr: p_paddr,
@@ -212,9 +211,21 @@ impl ProgramHeader {
     }
 }
 
+/// A contiguous segment of instructions loaded from a PT_LOAD segment
+#[derive(Debug, Clone)]
+pub struct Segment {
+    /// Base virtual address for this segment
+    pub base_addr: u64,
+    /// The 32-bit instruction words in this segment
+    pub values: Vec<u32>,
+    /// Whether this segment is executable (has PF_X flag)
+    pub is_executable: bool,
+}
+
 pub struct Elf {
     pub entry_point: u64,
-    pub image: HashMap<u64, u32>,
+    /// Segments loaded from PT_LOAD headers, sorted by base_addr
+    pub data: Vec<Segment>,
 }
 
 pub(crate) const WORD_SIZE: u64 = 4;
@@ -255,7 +266,6 @@ pub enum ElfError {
 
 impl Elf {
     pub fn load(input: &[u8]) -> Result<Elf, ElfError> {
-        let mut image: HashMap<u64, u32> = HashMap::new();
         let elf_program = ElfProgram::parse(input)?;
         if elf_program.ehdr.e_machine != EM_RISCV {
             return Err(ElfError::NotRiscV);
@@ -271,6 +281,8 @@ impl Elf {
         if phdrs.len() > MAX_PROGRAM_HEADERS {
             return Err(ElfError::TooManyProgramHeaders);
         }
+        // Build segments from PT_LOAD headers
+        let mut segments: Vec<Segment> = Vec::new();
         for program_header in phdrs
             .iter()
             .filter(|program_header| program_header.p_type == PT_LOAD)
@@ -278,38 +290,41 @@ impl Elf {
             if !program_header.p_vaddr.is_multiple_of(WORD_SIZE) {
                 return Err(ElfError::UnalignedVAddr);
             }
+            let mut values = Vec::new();
             for i in (0..program_header.p_memsz).step_by(WORD_SIZE as usize) {
-                let addr = program_header
-                    .p_vaddr
-                    .checked_add(i)
-                    .ok_or(ElfError::AddrTooLarge)?;
-                if i >= program_header.p_filesz {
-                    image.insert(addr, 0);
-                } else {
+                let word = if i < program_header.p_filesz {
+                    // Read initialized data from file
+                    let remaining = program_header.p_filesz - i;
+                    let len = remaining.min(WORD_SIZE);
                     let mut word = 0u32;
-                    let len = (program_header
-                        .p_filesz
-                        .checked_sub(i)
-                        .ok_or(ElfError::InvalidProgram)?)
-                    .min(WORD_SIZE);
                     for j in 0..len {
-                        let offset = (program_header
-                            .p_offset
-                            .checked_add(i)
-                            .ok_or(ElfError::InvalidProgram)?
-                            .checked_add(j)
-                            .ok_or(ElfError::InvalidProgram)?)
-                            as usize;
+                        let offset = (program_header.p_offset + i + j) as usize;
                         let byte = input.get(offset).ok_or(ElfError::InvalidOffset)?;
                         word |= (*byte as u32)
                             .checked_shl((j as u32).checked_mul(8).ok_or(ElfError::InvalidProgram)?)
                             .ok_or(ElfError::InvalidProgram)?;
                     }
-                    image.insert(addr, word);
-                }
+                    word
+                } else {
+                    // BSS section - zero-initialized
+                    0
+                };
+                values.push(word);
+            }
+            if !values.is_empty() {
+                segments.push(Segment {
+                    base_addr: program_header.p_vaddr,
+                    values,
+                    is_executable: (program_header.p_flags & PF_X) != 0,
+                });
             }
         }
-        Ok(Self { entry_point, image })
+        // Sort segments by base address for efficient binary search
+        segments.sort_by_key(|s| s.base_addr);
+        Ok(Self {
+            entry_point,
+            data: segments,
+        })
     }
 }
 

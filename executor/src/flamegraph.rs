@@ -9,9 +9,9 @@ use std::io::{self, Write};
 use rustc_demangle::demangle as rustc_demangle;
 
 use crate::elf::SymbolTable;
+use crate::vm::execution::InstructionCache;
 use crate::vm::instruction::decoding::Instruction;
 use crate::vm::logs::Log;
-use crate::vm::memory::U64HashMap;
 
 /// Errors that can occur during flamegraph generation.
 #[derive(Debug)]
@@ -44,7 +44,7 @@ impl FlamegraphGenerator {
     pub fn process_logs(
         &mut self,
         logs: &[Log],
-        instructions: &U64HashMap<Instruction>,
+        instructions: &InstructionCache,
     ) -> Result<(), FlamegraphError> {
         for log in logs {
             // Count this instruction under the current stack
@@ -53,7 +53,7 @@ impl FlamegraphGenerator {
 
             // Update call stack based on instruction type
             let instruction = instructions
-                .get(&log.current_pc)
+                .get(log.current_pc)
                 .copied()
                 .ok_or(FlamegraphError::InstructionNotFound)?;
             self.update_stack(log, instruction);

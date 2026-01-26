@@ -101,6 +101,12 @@ jobs:
         run: |
           make test-flamegraph
 
+      - name: Run ignored executor tests (release)
+        run: |
+          make prepare-test-data
+          cargo test -p executor --release test_ethrex -- --ignored
+          cargo test -p executor --release test_ckzg -- --ignored
+
       - name: Run prover and crypto tests
         run: |
           cargo test -p prover -p stark -p crypto ${{ github.event_name == 'merge_group' && '--release' || '' }}

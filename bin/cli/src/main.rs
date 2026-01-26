@@ -25,16 +25,12 @@ fn main() {
     let elf_data = std::fs::read(&args.filename).expect("Failed to read elf file");
     let program = Elf::load(&elf_data).expect("Failed to load elf program");
 
-    // Save entry_point before moving program.image into Executor
-    let entry_point = program.entry_point;
-
-    let mut executor =
-        Executor::new(program.image, entry_point, vec![]).expect("Failed to create executor");
+    let mut executor = Executor::new(&program, vec![]).expect("Failed to create executor");
 
     // Set up flamegraph generator if requested
     let mut generator = args.flamegraph.as_ref().map(|_| {
         let symbols = SymbolTable::parse(&elf_data);
-        FlamegraphGenerator::new(symbols, entry_point)
+        FlamegraphGenerator::new(symbols, program.entry_point)
     });
 
     // Execute in chunks, processing logs only if generating flamegraph

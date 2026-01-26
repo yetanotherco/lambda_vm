@@ -1,13 +1,16 @@
-use std::{collections::HashMap, fmt::Debug};
+use std::{cmp::Ordering, fmt::Debug};
 
-use crate::vm::{
-    instruction::{
-        decoding::{Instruction, InstructionError},
-        execution::ExecutionError,
+use crate::{
+    elf::Elf,
+    vm::{
+        instruction::{
+            decoding::{Instruction, InstructionError},
+            execution::ExecutionError,
+        },
+        logs::Log,
+        memory::{Memory, MemoryError, U64HashMap},
+        registers::Registers,
     },
-    logs::Log,
-    memory::{Memory, MemoryError, U64HashMap},
-    registers::Registers,
 };
 
 pub struct ReturnValues {
@@ -32,25 +35,21 @@ pub struct Executor {
     memory: Memory,
     registers: Registers,
     pc: u64,
-    pub instructions: U64HashMap<Instruction>,
+    pub instructions: InstructionCache,
     logs: Vec<Log>,
 }
 
 impl Executor {
-    pub fn new(
-        instruction_map: HashMap<u64, u32>,
-        entrypoint: u64,
-        private_inputs: Vec<u8>,
-    ) -> Result<Self, ExecutorError> {
+    pub fn new(program: &Elf, private_inputs: Vec<u8>) -> Result<Self, ExecutorError> {
         let mut memory = Memory::default();
         memory.store_private_inputs(private_inputs)?;
-        let instructions = predecode_instructions(&instruction_map);
-        load_program(instruction_map, &mut memory)?;
+        let instructions = InstructionCache::new(&program.data)?;
+        load_program(&program.data, &mut memory)?;
 
         Ok(Self {
             memory,
             registers: Registers::default(),
-            pc: entrypoint,
+            pc: program.entry_point,
             instructions,
             logs: Vec::with_capacity(CHUNK_SIZE),
         })
@@ -65,7 +64,7 @@ impl Executor {
         self.logs.clear();
 
         while self.pc != 0 && self.logs.len() < CHUNK_SIZE {
-            let instruction = match self.instructions.get(&self.pc) {
+            let instruction = match self.instructions.get(self.pc) {
                 Some(&instr) => instr,
                 None => {
                     let next_instruction = self.memory.load_word(self.pc)?;
@@ -114,30 +113,99 @@ impl Executor {
         Ok(ExecutionResult {
             return_values: self.get_return_values()?,
             logs,
-            instructions: self.instructions,
+            instructions: self.instructions.into_instruction_map(),
         })
     }
 }
 
-fn predecode_instructions(instruction_map: &HashMap<u64, u32>) -> U64HashMap<Instruction> {
-    let mut decoded = U64HashMap::default();
-    for (&addr, &raw) in instruction_map {
-        // Skip addresses that don't contain valid instructions (data sections)
-        if let Ok(instr) = Instruction::parse(raw) {
-            decoded.insert(addr, instr);
+fn load_program(segments: &[crate::elf::Segment], memory: &mut Memory) -> Result<(), MemoryError> {
+    for segment in segments {
+        for (i, inst) in segment.values.iter().enumerate() {
+            let addr = segment.base_addr + (i as u64 * 4);
+            memory.store_word(addr, *inst)?;
         }
     }
-    decoded
+    Ok(())
 }
 
-fn load_program(
-    instruction_map: HashMap<u64, u32>,
-    memory: &mut Memory,
-) -> Result<(), MemoryError> {
-    for (addr, instruction) in instruction_map {
-        memory.store_word(addr, instruction)?;
+pub struct InstructionSegment {
+    base_addr: u64,
+    instructions: Vec<Instruction>,
+}
+
+impl InstructionSegment {
+    fn end_addr(&self) -> u64 {
+        self.base_addr + (self.instructions.len() as u64 * 4)
     }
-    Ok(())
+}
+
+pub struct InstructionCache {
+    segments: Vec<InstructionSegment>,
+}
+
+impl InstructionCache {
+    pub fn new(segments: &[crate::elf::Segment]) -> Result<Self, InstructionError> {
+        let mut result = Vec::new();
+        for seg in segments.iter().filter(|s| s.is_executable) {
+            let instructions = seg
+                .values
+                .iter()
+                .map(|v| Instruction::parse(*v))
+                .collect::<Result<Vec<_>, _>>()?;
+            result.push(InstructionSegment {
+                base_addr: seg.base_addr,
+                instructions,
+            });
+        }
+        Ok(Self { segments: result })
+    }
+
+    pub fn get(&self, pc: u64) -> Option<&Instruction> {
+        // Fast path: most programs have a single executable segment
+        let segment = if self.segments.len() == 1 {
+            let seg = &self.segments[0];
+            if pc < seg.base_addr || pc >= seg.end_addr() {
+                return None;
+            }
+            seg
+        } else {
+            // Use binary search to find the segment containing pc
+            let idx = self
+                .segments
+                .binary_search_by(|seg| {
+                    if pc < seg.base_addr {
+                        Ordering::Greater
+                    } else if pc >= seg.end_addr() {
+                        Ordering::Less
+                    } else {
+                        Ordering::Equal
+                    }
+                })
+                .ok()?;
+            &self.segments[idx]
+        };
+
+        let byte_offset = pc - segment.base_addr;
+        if !byte_offset.is_multiple_of(4) {
+            return None;
+        }
+        segment.instructions.get((byte_offset / 4) as usize)
+    }
+
+    pub fn instruction_count(&self) -> usize {
+        self.segments.iter().map(|s| s.instructions.len()).sum()
+    }
+
+    pub fn into_instruction_map(self) -> U64HashMap<Instruction> {
+        let mut map = U64HashMap::default();
+        for segment in self.segments {
+            for (i, instruction) in segment.instructions.into_iter().enumerate() {
+                let addr = segment.base_addr + (i as u64 * 4);
+                map.insert(addr, instruction);
+            }
+        }
+        map
+    }
 }
 
 #[derive(thiserror::Error, Debug)]
