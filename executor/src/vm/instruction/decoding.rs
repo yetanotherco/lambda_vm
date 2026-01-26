@@ -499,10 +499,7 @@ fn parse_i_instruction(instruction: u32, opcode: Opcode) -> Result<Instruction, 
                 _ => return Err(InstructionError::UnknownOpcodeFuncIdentifier(opcode, func3)),
             }
         }
-        Opcode::Fence => {
-            // FENCE and FENCE.I instructions - we parse them but don't support execution
-            Instruction::Fence
-        }
+        Opcode::Fence => Instruction::Fence,
         _ => return Err(InstructionError::InvalidInstruction),
     })
 }

@@ -729,7 +729,8 @@ impl CpuOperation {
                 op.op_ecall = true;
             }
             Instruction::Fence => {
-                // Fence instruction not supported by executor
+                // FENCE is a memory barrier - in single-threaded, in-order execution it's a no-op
+                // No operation flags needed, just advance PC (handled by default from log)
             }
         }
 

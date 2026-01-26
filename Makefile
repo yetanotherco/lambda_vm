@@ -140,6 +140,9 @@ test-rust-no-compile:
 test-no-compile: prepare-test-data
 	cargo test -p executor
 
+test-flamegraph: 
+	cargo test -p executor --test flamegraph
+	
 test: compile-programs prepare-test-data
 	cargo test
 
@@ -149,13 +152,13 @@ test: compile-programs prepare-test-data
 test-fast:
 	cargo test -p prover -p stark -p executor -F stark/parallel
 
-# Prover tests only (fast)
+# Prover tests only (fast, parallel enabled by default)
 test-prover:
-	cargo test -p prover -F stark/parallel
+	cargo test -p prover
 
 # Prover tests including slow ones
 test-prover-all:
-	cargo test -p prover -F stark/parallel -- --include-ignored
+	cargo test -p prover -- --include-ignored
 
 # Build all
 build:

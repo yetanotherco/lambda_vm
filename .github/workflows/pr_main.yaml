@@ -30,6 +30,8 @@ jobs:
 
       - name: Cache cargo build artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "lambda-vm"
 
       - name: Run cargo check
         run: cargo check
@@ -56,6 +58,8 @@ jobs:
 
       - name: Cache cargo build artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "lambda-vm"
 
       - name: Cache compiled ASM ELF artifacts
         id: cache-asm-elfs
@@ -92,6 +96,16 @@ jobs:
       - name: Run rust tests (no compile)
         run: |
           make test-rust-no-compile
+
+      - name: Run flamegraph tests
+        run: |
+          make test-flamegraph
+
+      - name: Run ignored executor tests (release)
+        run: |
+          make prepare-test-data
+          cargo test -p executor --release test_ethrex -- --ignored
+          cargo test -p executor --release test_ckzg -- --ignored
 
       - name: Run prover and crypto tests
         run: |

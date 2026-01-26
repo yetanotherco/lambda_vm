@@ -27,8 +27,13 @@
 //! All lookups are provided as receivers with negative multiplicity,
 //! meaning other tables send to this table.
 
+use lazy_static::lazy_static;
+use math::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
+use math::polynomial::Polynomial;
+use stark::config::{BatchedMerkleTree, Commitment};
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
-use stark::trace::TraceTable;
+use stark::prover::evaluate_polynomial_on_lde_domain;
+use stark::trace::{TraceTable, columns2rows};
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 
@@ -92,6 +97,165 @@ pub mod cols {
 
 /// Number of rows in the BITWISE table: 256 * 256 * 16 = 2^20
 pub const NUM_ROWS: usize = 256 * 256 * 16;
+
+/// Number of precomputed (non-multiplicity) columns
+pub const NUM_PRECOMPUTED_COLS: usize = 11;
+
+// =========================================================================
+// Compile-time row generation
+// =========================================================================
+
+/// Generate bitwise table row values at compile time.
+///
+/// This is a `const fn` that can be evaluated at compile time, allowing
+/// the verifier to compute table values without runtime overhead.
+///
+/// Index encoding: `index = x + y * 256 + z * 65536`
+/// where x, y ∈ [0, 255] and z ∈ [0, 15]
+///
+/// Returns the 11 precomputed columns: [X, Y, Z, AND, OR, XOR, MSB8, MSB16, ZERO, SLL, SLLC]
+#[inline]
+pub const fn generate_bitwise_row(index: usize) -> [u64; NUM_PRECOMPUTED_COLS] {
+    let x = (index & 0xFF) as u32;
+    let y = ((index >> 8) & 0xFF) as u32;
+    let z = ((index >> 16) & 0xF) as u32;
+
+    // Bitwise operations on bytes
+    let and_val = x & y;
+    let or_val = x | y;
+    let xor_val = x ^ y;
+
+    // MSB extractions
+    let msb8 = (x >> 7) & 1;
+    let halfword = x + y * 256;
+    let msb16 = (halfword >> 15) & 1;
+
+    // Zero check (both X and Y must be zero)
+    let is_zero = if x == 0 && y == 0 { 1 } else { 0 };
+
+    // Shift operations on halfword
+    let sll = if z == 0 {
+        halfword
+    } else {
+        (halfword << z) & 0xFFFF
+    };
+    let sllc = if z == 0 { 0 } else { halfword >> (16 - z) };
+
+    [
+        x as u64,       // X
+        y as u64,       // Y
+        z as u64,       // Z
+        and_val as u64, // AND
+        or_val as u64,  // OR
+        xor_val as u64, // XOR
+        msb8 as u64,    // MSB8
+        msb16 as u64,   // MSB16
+        is_zero as u64, // ZERO
+        sll as u64,     // SLL
+        sllc as u64,    // SLLC
+    ]
+}
+
+/// Whether this table is preprocessed (commitment is hardcoded).
+///
+/// Preprocessed tables have their commitment known at compile time,
+/// so it's not included in proofs - both prover and verifier use the
+/// hardcoded value in the Fiat-Shamir transcript.
+pub const fn is_preprocessed() -> bool {
+    true
+}
+
+// =========================================================================
+// Preprocessed commitment (computed once, cached)
+// =========================================================================
+
+lazy_static! {
+    /// Commitment to the LDE of the precomputed bitwise table columns.
+    ///
+    /// This is a Merkle root over 2^22 rows (2^20 * blowup_factor=4) of the
+    /// LDE-evaluated 11 precomputed columns (X, Y, Z, AND, OR, XOR, MSB8,
+    /// MSB16, ZERO, SLL, SLLC).
+    ///
+    /// The commitment is over LDE values (not raw values) because FRI queries
+    /// can target any index in the extended domain [0, N*blowup). The verifier
+    /// checks that proofs open against this exact commitment.
+    ///
+    /// Computed once on first access and cached. Both prover and verifier
+    /// use this same value in the Fiat-Shamir transcript.
+    pub static ref BITWISE_TABLE_COMMITMENT: Commitment = compute_preprocessed_commitment();
+}
+
+/// Standard blowup factor for LDE domain (matches proof options).
+const LDE_BLOWUP_FACTOR: usize = 4;
+
+/// Standard coset offset for LDE domain (matches proof options).
+const LDE_COSET_OFFSET: u64 = 3;
+
+/// Computes the Merkle commitment over the precomputed bitwise table columns.
+///
+/// This builds a Merkle tree over the LDE (Low Degree Extension) of the precomputed
+/// columns, matching exactly how the prover commits to traces. The tree has
+/// NUM_ROWS * LDE_BLOWUP_FACTOR = 2^22 leaves, enabling FRI queries at any index
+/// in the extended domain.
+///
+/// Critical for security: the commitment must be over LDE values (not raw values)
+/// because FRI queries can target any index in [0, N*blowup). A raw-value commitment
+/// would only have N leaves, unable to verify queries at indices >= N.
+fn compute_preprocessed_commitment() -> Commitment {
+    // Step 1: Generate precomputed columns (not rows)
+    // Each column is a vector of NUM_ROWS field elements
+    let mut columns: Vec<Vec<FE>> = (0..NUM_PRECOMPUTED_COLS)
+        .map(|_| Vec::with_capacity(NUM_ROWS))
+        .collect();
+
+    for idx in 0..NUM_ROWS {
+        let row = generate_bitwise_row(idx);
+        for (col_idx, &value) in row.iter().enumerate() {
+            columns[col_idx].push(FE::from(value));
+        }
+    }
+
+    // Step 2: Interpolate each column to a polynomial
+    let polys: Vec<Polynomial<FE>> = columns
+        .iter()
+        .map(|col| {
+            Polynomial::interpolate_fft::<GoldilocksField>(col)
+                .expect("FFT interpolation failed for bitwise column")
+        })
+        .collect();
+
+    // Step 3: Evaluate polynomials on LDE domain (N * blowup_factor points)
+    let coset_offset = FE::from(LDE_COSET_OFFSET);
+    let mut lde_columns: Vec<Vec<FE>> = polys
+        .iter()
+        .map(|poly| {
+            evaluate_polynomial_on_lde_domain(poly, LDE_BLOWUP_FACTOR, NUM_ROWS, &coset_offset)
+                .expect("LDE evaluation failed for bitwise polynomial")
+        })
+        .collect();
+
+    // Step 4: Bit-reverse permute (same as prover)
+    for col in lde_columns.iter_mut() {
+        in_place_bit_reverse_permute(col);
+    }
+
+    // Step 5: Convert columns to rows for Merkle tree
+    let lde_rows = columns2rows(lde_columns);
+
+    // Step 6: Build Merkle tree over LDE (N * blowup leaves)
+    let tree = BatchedMerkleTree::<GoldilocksField>::build(&lde_rows)
+        .expect("Failed to build Merkle tree for bitwise LDE");
+
+    tree.root
+}
+
+/// Returns the preprocessed commitment for the bitwise table.
+///
+/// This is a convenience function that dereferences the lazy_static.
+#[inline]
+pub fn preprocessed_commitment() -> Commitment {
+    *BITWISE_TABLE_COMMITMENT
+}
 
 // =========================================================================
 // Trace generation
