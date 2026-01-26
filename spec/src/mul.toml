@@ -116,11 +116,11 @@ pad = 0
 
 [[assumptions]]
 desc = "`IS_HALF[lhs[i]]`"
-range = ["i", 0, 3]
+iter = ["i", 0, 3]
 
 [[assumptions]]
 desc = "`IS_HALF[rhs[i]]`"
-range = ["i", 0, 3]
+iter = ["i", 0, 3]
 
 [[assumptions]]
 desc = "`IS_WORD[lo[i]]`"
@@ -156,7 +156,7 @@ ref = "mul:c:rhs_is_negative"
 kind = "interaction"
 tag = "IS_B20"
 input = [["idx", "carry", "i"]]
-range = ["i", 0, 3]
+iter = ["i", 0, 3]
 multiplicity = "μ_sum"
 ref = "mul:c:carry"
 
@@ -168,7 +168,7 @@ name = "prod"
 kind = "arith"
 constraint = "$#`raw_product[i]` = sum_(#`k`=0)^1 2^(16k) sum_(#`j`=0)^(2i+k) #`lhs_ext[j]` dot #`rhs_ext[2i+k-j]`$"
 poly = ["-", ["sum", ["=", "k", 0], "1", ["*", ["^", 2, ["*", 16, "k"]], ["sum", ["=", "j", 0], ["+", ["*", 2, "i"], "k"], ["*", ["idx", "lhs_ext", "j"], ["idx", "rhs_ext", ["-", ["+", ["*", 2, "i"], "k"], "j"]]]]]], ["idx", "raw_product", "i"]]
-range = ["i", 0, 3]
+iter = ["i", 0, 3]
 ref = "mul:c:raw_product"
 
 [[constraint_groups]]
