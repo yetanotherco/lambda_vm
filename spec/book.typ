@@ -19,6 +19,7 @@
     #chapter("dvrm.typ")[DVRM chip]
     #chapter("load.typ")[LOAD chip]
     #chapter("ecall.typ")[ECALL chips]
+    #chapter("halt.typ")[HALT chips]
     #chapter("bitwise.typ")[BITWISE]
   ]
 )

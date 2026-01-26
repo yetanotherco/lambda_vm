@@ -1,0 +1,76 @@
+name = "HALT"
+
+[[variables.input]]
+name = "pc"
+type = "DWordWL"
+desc = "program counter containing the HALT call."
+
+[[variables.input]]
+name = "timestamp"
+type = "DWordWL"
+desc = "timestamp at which to halt the program"
+
+[[variables.input]]
+name = "rv2"
+type = "DWordWL"
+desc = "value of register two at the point of calling HALT."
+
+[[constraint_groups]]
+name = "all"
+
+
+[[assumptions]]
+desc = "`IS_WORD[pc[i]]`"
+iter = ["i", 0, 1]
+
+[[assumptions]]
+desc = "`IS_WORD[timestamp[i]]`"
+iter = ["i", 0, 1]
+
+[[assumptions]]
+desc = "`IS_WORD[rv2[i]]`"
+iter = ["i", 0, 1]
+
+
+
+[[constraints.all]]
+kind = "interaction"
+tag = "MEMW"
+input = [1, 10, 0, ["-", ["^", 2, 64], 1], 1, 0, 0]
+output = 0
+multiplicity = 1
+ref = "halt:c:read_zero_exit_code"
+
+[[constraints.all]]
+kind = "interaction"
+tag = "MEMW"
+input = [1, "i", 0, ["-", ["^", 2, 64], 1], 1, 0, 0]
+iter = ["i", 1, 9]
+multiplicity = 1
+ref = "halt:c:zeroize_registers_lo"
+
+[[constraints.all]]
+kind = "interaction"
+tag = "MEMW"
+input = [1, "i", 0, ["-", ["^", 2, 64], 1], 1, 0, 0]
+iter = ["i", 11, 31]
+multiplicity = 1
+ref = "halt:c:zeroize_registers_hi"
+
+[[constraints.all]]
+kind = "interaction"
+tag = "MEMW"
+input = [1, 255, 1, ["-", ["^", 2, 64], 1], 1, 0, 0]
+multiplicity = 1
+ref = "halt:c:pc"
+
+[[constraint_groups]]
+name = "lookup"
+
+[[constraints.lookup]]
+kind = "interaction"
+tag = "ECALL"
+input = [93, "pc", "timestamp", "rv2"]
+output = 0
+multiplicity = ["-", 1]
+ref = "halt:c:lookup"
