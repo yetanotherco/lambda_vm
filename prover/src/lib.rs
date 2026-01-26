@@ -1,4 +1,5 @@
 pub mod constraints;
+pub mod segment;
 pub mod tables;
 pub mod test_utils;
 pub mod tests;
