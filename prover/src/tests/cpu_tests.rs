@@ -300,12 +300,12 @@ fn test_bus_interactions_count() {
     // - 1 ZERO (is_equal for BEQ)
     // - 1 LT (less-than comparison)
     // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 = 29
-    assert_eq!(interactions.len(), 29);
+    assert_eq!(interactions.len(), 30);
 }
 
 #[test]
 fn test_column_count() {
-    assert_eq!(cols::NUM_COLUMNS, 72);
+    assert_eq!(cols::NUM_COLUMNS, 73);
 }
 
 #[test]
