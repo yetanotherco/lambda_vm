@@ -1,4 +1,4 @@
-#import "/book.typ": book-page, rj, aside
+#import "/book.typ": book-page, rj, aside, xref
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   render_chip_assumptions,
@@ -12,9 +12,7 @@
 #let config = load_config()
 #let chip = load_chip("src/page.toml", config)
 
-#show: book-page.with(title: "Memory argument")
-
-= Memory argument
+#show: book-page("memory.typ") // TODO: can we get rid of this?
 
 As part of fully proving the correct execution of a RISC-V program,
 the VM must ensure that memory reads and writes are consistent.
@@ -108,7 +106,7 @@ to have a strictly greater timestamp than the consumed token.
 This raises the question of how to represent timestamps and cleanly perform this check,
 as over a finite field the “less than” relation is ill-defined
 (though it is common and natural to consider it as the less than relation over the natural lift of the field into the integers).
-We choose to represent timestamps as machine words, using the existing `LT` chip functionality for comparisons.
+We choose to represent timestamps as machine words, using the existing `LT` chip (#xref("/lt.typ")) functionality for comparisons.
 #rj[Properly link/refer to the LT chip]
 
 #aside[Note on options and trade-offs for timestamp representation][

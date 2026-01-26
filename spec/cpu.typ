@@ -12,7 +12,7 @@
 #let config = load_config()
 #let chip = load_chip("src/cpu.toml", config)
 
-#show: book-page.with(title: "CPU chip")
+#show: book-page("cpu.typ")
 
 == Columns
 #let nr_variables = total_nr_variables(chip)

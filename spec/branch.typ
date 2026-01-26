@@ -12,7 +12,7 @@
 #let config = load_config()
 #let chip = load_chip("src/branch.toml", config)
 
-#show: book-page.with(title: "BRANCH chip")
+#show: book-page("branch.typ")
 
 == Columns
 #let nr_variables = total_nr_variables(chip)

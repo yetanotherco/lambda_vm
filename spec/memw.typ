@@ -11,7 +11,7 @@
 #let config = load_config()
 #let chip = load_chip("src/memw.toml", config)
 
-#show: book-page.with(title: "MEMW chip")
+#show: book-page("memw.typ")
 
 == Columns
 #let nr_variables = total_nr_variables(chip)

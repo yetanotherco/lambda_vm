@@ -2,7 +2,7 @@
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": render_chip_column_table, render_chip_assumptions, render_constraint_table
 
-#show: book-page.with(title: "ADD/SUB")
+#show: book-page("add.typ")
 
 #let config = load_config()
 #let chip = load_chip("src/add.toml", config)
@@ -18,7 +18,6 @@
     raw(code))
 }
 
-= #add template
 #add is a constraint template that is used to assert that $#`sum` = #`lhs` + #`rhs` mod 2^64$, under the condition that `cond` is non-zero.
 
 == Notation
