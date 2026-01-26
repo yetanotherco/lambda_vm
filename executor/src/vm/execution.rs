@@ -130,13 +130,8 @@ fn load_program(segments: &[crate::elf::Segment], memory: &mut Memory) -> Result
 
 pub struct InstructionSegment {
     base_addr: u64,
+    end_addr: u64,
     instructions: Vec<Instruction>,
-}
-
-impl InstructionSegment {
-    fn end_addr(&self) -> u64 {
-        self.base_addr + (self.instructions.len() as u64 * 4)
-    }
 }
 
 pub struct InstructionCache {
@@ -152,8 +147,11 @@ impl InstructionCache {
                 .iter()
                 .map(|v| Instruction::parse(*v))
                 .collect::<Result<Vec<_>, _>>()?;
+            let base_addr = seg.base_addr;
+            let end_addr = base_addr + (instructions.len() as u64 * 4);
             result.push(InstructionSegment {
-                base_addr: seg.base_addr,
+                base_addr,
+                end_addr,
                 instructions,
             });
         }
@@ -164,7 +162,7 @@ impl InstructionCache {
         // Fast path: most programs have a single executable segment
         let segment = if self.segments.len() == 1 {
             let seg = &self.segments[0];
-            if pc < seg.base_addr || pc >= seg.end_addr() {
+            if pc < seg.base_addr || pc >= seg.end_addr {
                 return None;
             }
             seg
@@ -175,7 +173,7 @@ impl InstructionCache {
                 .binary_search_by(|seg| {
                     if pc < seg.base_addr {
                         Ordering::Greater
-                    } else if pc >= seg.end_addr() {
+                    } else if pc >= seg.end_addr {
                         Ordering::Less
                     } else {
                         Ordering::Equal
