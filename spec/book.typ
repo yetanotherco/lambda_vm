@@ -1,4 +1,5 @@
 #import "@preview/shiroa:0.3.1": *
+#import "/templates/page.typ": project
 
 #show: book
 
@@ -31,13 +32,6 @@
 
 #let is-shiroa = "x-target" in sys.inputs
 
-#import "/templates/page.typ": project
-#let book-page(file, ..args) = if is-shiroa {
-  (body) => project.with(..args, title: meta.summary.find(x => x.at(0) == file).at(1))(body)
-} else {
-  (body) => body
-}
-
 #let todo(background: white, foreground: black, name: none, body) = block(fill: background, outset: 0.5em, radius: 20%, stroke: black)[
   #set text(fill: foreground)
   *TODO #if name != none { [(#name)] }*: #body
@@ -59,10 +53,6 @@
     #align(left, body)
 ])
 
-#show figure: repr
-
-#let _xref-included = state("_xref-included", (:))
-
 // Strip styling to keep only "pure" content.
 // This is useful to avoid errors on the `set document(...)` in `project`
 // when invisibly including other chapters to resolve xrefs.
@@ -78,19 +68,33 @@
   }
 }
 
-#let xref(lbl, ..ref-args) = {
-  if is-shiroa {
-    let found =  meta.summary.find(x => str(lbl).starts-with(str(x.at(2))))
+#let _toplevel = state("_toplevel", none)
+#let _xref-included = state("_xref-included", (:))
+
+#let xref-include(f) = {
+  context if f not in _xref-included.get() {
+    (hide(box(width: 0%, height: 0%, strip-all(include "/" + f))))
+  }
+  context _xref-included.update(x => x + ((f): true))
+}
+
+#let xref(rf, ..ref-args) = {
+  assert(is-shiroa, message: "xref should only be used when compiling for shiroa")
+  let lbl = rf.target
+  let found =  meta.summary.find(x => str(lbl).starts-with(str(x.at(2))))
+  context if found != none and found.at(0) != _toplevel.final() {
     let (ch, title, ref) = found
     if ref == lbl {
       cross-link("/" + ch, [Chapter #(meta.summary.position(x => x == found) + 1)])
     } else {
       // Because shiroa does weird url escaping
       let shiroa-label = label(str(lbl).replace(":", "%3A"))
-      context if ch not in _xref-included.get() {
-        hide(box(width: 0%, height: 0%, strip-all(include "/" + ch)))
-        _xref-included.update(it => it + ((ch): true))
-      }
+      xref-include(ch)
+      // The ideal would be to use `rf` directly as content argument to `cross-link`,
+      // as that would inherit any/all formatting of the ref we want or need.
+      // Unfortunately the ref link seems to take precedence over the cross-link hyperlink
+      // when clicking.
+      // There may still be some way around it by messing with some html output
       let link-content = context {
         let fig = query(lbl).first()
         let counter = if fig.has("counter") {
@@ -104,6 +108,28 @@
       cross-link("/" + ch, reference: shiroa-label, link-content)
     }
   } else {
-    ref(lbl)
+    rf
   }
+}
+
+#let book-page(file, ..args) = if is-shiroa {
+  (body) => {
+    context _xref-included.update(x => x + ((file): true))
+    context _toplevel.update(s => {
+      if s == none {
+        file
+      } else {
+        s
+      }
+    })
+    let cond() = _toplevel.final() == file
+    project.with(..args, description: "aaa", title: meta.summary.find(x => x.at(0) == file).at(1), cond: cond)([
+      #show ref: it => context if _toplevel.final() == file {
+        xref(it)
+      }
+      #body
+    ])
+  }
+} else {
+  (body) => body
 }
