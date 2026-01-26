@@ -20,6 +20,31 @@ pub fn parent_index(node_index: usize) -> usize {
     }
 }
 
+/// Returns the sibling position for a given node index.
+/// Returns `None` for the root node (index 0) since it has no sibling.
+pub fn get_sibling_pos(node_index: usize) -> Option<usize> {
+    if node_index == 0 {
+        return None;
+    }
+    if node_index.is_multiple_of(2) {
+        Some(node_index - 1)
+    } else {
+        Some(node_index + 1)
+    }
+}
+
+pub fn get_parent_pos(node_index: usize) -> usize {
+    // Root node (index 0) has no parent, return itself to avoid underflow
+    if node_index == 0 {
+        return node_index;
+    }
+    if node_index.is_multiple_of(2) {
+        (node_index - 1) / 2
+    } else {
+        node_index / 2
+    }
+}
+
 // The list of values is completed repeating the last value to a power of two length
 pub fn complete_until_power_of_two<T: Clone>(mut values: Vec<T>) -> Vec<T> {
     while !is_power_of_two(values.len()) {

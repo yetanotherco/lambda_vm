@@ -1,7 +1,10 @@
 use sha2::{Sha256, Sha512};
 use sha3::{Keccak256, Keccak512, Sha3_256, Sha3_512};
 
-use super::{field_element::FieldElementBackend, field_element_vector::FieldElementVectorBackend};
+use super::{
+    field_element::FieldElementBackend,
+    field_element_vector::{FieldElementPairBackend, FieldElementVectorBackend},
+};
 
 // Field element backend definitions
 
@@ -26,3 +29,10 @@ pub type BatchSha2_256Backend<F> = FieldElementVectorBackend<F, Sha256, 32>;
 pub type BatchSha3_512Backend<F> = FieldElementVectorBackend<F, Sha3_512, 64>;
 pub type BatchKeccak512Backend<F> = FieldElementVectorBackend<F, Keccak512, 64>;
 pub type BatchSha2_512Backend<F> = FieldElementVectorBackend<F, Sha512, 64>;
+
+// Fixed-size pair backends (more efficient for FRI layers)
+
+// - With 256 bit
+pub type PairKeccak256Backend<F> = FieldElementPairBackend<F, Keccak256, 32>;
+pub type PairSha3_256Backend<F> = FieldElementPairBackend<F, Sha3_256, 32>;
+pub type PairSha2_256Backend<F> = FieldElementPairBackend<F, Sha256, 32>;
