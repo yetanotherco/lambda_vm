@@ -12,7 +12,7 @@
 #align(center, title(meta.title))
 // #outline()
 
-#meta.summary.map(((ch, title)) => [
-  #heading(supplement: [Chapter], level: 1, title)#label("/"+ch)
+#meta.summary.map(((ch, title, ref)) => [
+  #heading(supplement: [Chapter], level: 1, title)#ref
   #include ch
 ]).join()

@@ -6,34 +6,34 @@
   title: "Lambda VM specification",
   authors: ("3MI Labs", "Aligned"),
   summary: (
-    ("memory.typ", [Memory argument]),
-    ("variables.typ", [Variables]),
-    ("is_bit.typ", [IS_BIT template]),
-    ("add.typ", [ADD/SUB template]),
-    ("decode.typ", [DECODE table]),
-    ("cpu.typ", [CPU chip]),
-    ("shift.typ", [SHIFT chip]),
-    ("branch.typ", [BRANCH chip]),
-    ("memw.typ", [MEMW chip]),
-    ("lt.typ", [LT chip]),
-    ("mul.typ", [MUL chip]),
-    ("dvrm.typ", [DVRM chip]),
-    ("load.typ", [LOAD chip]),
-    ("ecall.typ", [ECALL chips]),
-    ("bitwise.typ", [BITWISE chips]),
+    ("memory.typ", [Memory argument], <memory>),
+    ("variables.typ", [Variables], <vars>),
+    ("is_bit.typ", [IS_BIT template], <isbit>),
+    ("add.typ", [ADD/SUB template], <add>),
+    ("decode.typ", [DECODE table], <decode>),
+    ("cpu.typ", [CPU chip], <cpu>),
+    ("shift.typ", [SHIFT chip], <shift>),
+    ("branch.typ", [BRANCH chip], <branch>),
+    ("memw.typ", [MEMW chip], <memw>),
+    ("lt.typ", [LT chip], <lt>),
+    ("mul.typ", [MUL chip], <mul>),
+    ("dvrm.typ", [DVRM chip], <dvrm>),
+    ("load.typ", [LOAD chip], <load>),
+    ("ecall.typ", [ECALL chips], <ecall>),
+    ("bitwise.typ", [BITWISE chips], <bitwise>),
   )
 )
 #book-meta(
   title: meta.title,
   authors: meta.authors,
-  summary: meta.summary.map(((ch, title)) => chapter(ch, title)).join()
+  summary: meta.summary.map(((ch, title, _ref)) => chapter(ch, title)).join()
 )
 
 #let is-shiroa = "x-target" in sys.inputs
 
 #import "/templates/page.typ": project
 #let book-page(file, ..args) = if is-shiroa {
-  (body) => project.with(..args, title: meta.summary.find(((ch, title)) => ch == file).at(1))(body)
+  (body) => project.with(..args, title: meta.summary.find(x => x.at(0) == file).at(1))(body)
 } else {
   (body) => body
 }
@@ -75,17 +75,18 @@
   }
 }
 
-#let xref(file, lbl: none, ..ref-args) = {
+#let xref(lbl, ..ref-args) = {
   if is-shiroa {
-    if lbl == none {
-      cross-link(file, [Chapter #(meta.summary.position(((ch, title)) => "/"+ch == file) + 1)])
+    let found =  meta.summary.find(x => str(lbl).starts-with(str(x.at(2))))
+    let (ch, title, ref) = found
+    if ref == lbl {
+      cross-link("/" + ch, [Chapter #(meta.summary.position(x => x == found) + 1)])
     } else {
       // Because shiroa does weird url escaping
       let shiroa-label = label(str(lbl).replace(":", "%3A"))
-      context if file not in _xref-included.get() {
-        // Let's blow up the compile times :)
-        hide(box(width: 0%, height: 0%, strip-all(include file)))
-        _xref-included.update(it => it + ((file): true))
+      context if ch not in _xref-included.get() {
+        hide(box(width: 0%, height: 0%, strip-all(include "/" + ch)))
+        _xref-included.update(it => it + ((ch): true))
       }
       let link-content = context {
         let fig = query(lbl).first()
@@ -97,9 +98,9 @@
 
         [#ref-args.named().at("supplement", default: [])#numbering(fig.numbering, ..counter.at(lbl))]
       }
-      cross-link(file, reference: shiroa-label, link-content)
+      cross-link("/" + ch, reference: shiroa-label, link-content)
     }
   } else {
-    ref(if lbl != none { lbl } else { label(file) }, ..ref-args)
+    ref(lbl)
   }
 }
