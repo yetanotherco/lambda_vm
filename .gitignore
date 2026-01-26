@@ -8,3 +8,6 @@ executor/program_artifacts/
 
 # Shared cargo target directory for ELF builds
 executor/shared_target/
+
+# Compiled spec artifacts
+spec/dist/
