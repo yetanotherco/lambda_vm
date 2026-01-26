@@ -336,10 +336,9 @@ multiplicity = "μ_sum"
 ref = "dvrm:c:msb_r"
 
 [[constraints.defs]]
-kind = "template"
-tag = "SIGN"
-input = [["idx", "r", 3], "signed"]
-output = "sign_r"
+kind = "arith"
+constraint = "$#`sign_r` = #`signed` dot #`msb_r`$"
+poly = ["-", ["*", "signed", "msb_r"], "sign_r"]
 ref = "dvrm:c:sign_r"
 
 [[constraints.defs]]
