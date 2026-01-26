@@ -14,11 +14,9 @@ use crate::{
 };
 
 use super::{
-    config::Commitment,
-    constraints::boundary::BoundaryConstraints, context::AirContext, frame::Frame,
-    proof::options::ProofOptions, trace::TraceTable,
+    config::Commitment, constraints::boundary::BoundaryConstraints, context::AirContext,
+    frame::Frame, proof::options::ProofOptions, trace::TraceTable,
 };
-
 
 type ZerofierGroupKey = (usize, usize, Option<usize>, Option<usize>, usize);
 

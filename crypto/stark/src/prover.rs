@@ -260,7 +260,8 @@ pub trait IsStarkProver<
         let trace_polys = trace.compute_trace_polys_main::<Field>();
 
         // Keep only precomputed columns
-        let precomputed_polys: Vec<_> = trace_polys.into_iter().take(num_precomputed_cols).collect();
+        let precomputed_polys: Vec<_> =
+            trace_polys.into_iter().take(num_precomputed_cols).collect();
 
         // Evaluate on LDE domain
         let evaluations = Self::compute_lde_trace_evaluations::<Field>(&precomputed_polys, &domain);
@@ -1069,11 +1070,11 @@ pub trait IsStarkProver<
         PolynomialOpenings {
             proof: tree.get_proof_by_pos(index).unwrap(),
             proof_sym: tree.get_proof_by_pos(index_sym).unwrap(),
-            evaluations: lde_trace
-                .get_row(reverse_index(index, domain_size as u64))[col_start..col_end]
+            evaluations: lde_trace.get_row(reverse_index(index, domain_size as u64))
+                [col_start..col_end]
                 .to_vec(),
-            evaluations_sym: lde_trace
-                .get_row(reverse_index(index_sym, domain_size as u64))[col_start..col_end]
+            evaluations_sym: lde_trace.get_row(reverse_index(index_sym, domain_size as u64))
+                [col_start..col_end]
                 .to_vec(),
         }
     }
