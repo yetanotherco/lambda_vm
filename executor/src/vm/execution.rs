@@ -158,6 +158,7 @@ impl InstructionCache {
         Ok(Self { segments: result })
     }
 
+    #[inline(always)]
     pub fn get(&self, pc: u64) -> Option<&Instruction> {
         // Fast path: most programs have a single executable segment
         let segment = if self.segments.len() == 1 {
