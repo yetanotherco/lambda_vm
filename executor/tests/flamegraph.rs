@@ -1,7 +1,10 @@
 use executor::{
     elf::{FunctionSymbol, SymbolTable},
     flamegraph::FlamegraphGenerator,
-    vm::{instruction::decoding::Instruction, logs::Log, memory::U64HashMap},
+    vm::{
+        execution::InstructionCache, instruction::decoding::Instruction, logs::Log,
+        memory::U64HashMap,
+    },
 };
 
 /// Helper to create a SymbolTable from a list of (name, address, size) tuples
@@ -18,9 +21,10 @@ fn make_symbol_table(symbols: Vec<(&str, u64, u64)>) -> SymbolTable {
     SymbolTable::from_functions(functions)
 }
 
-/// Helper to create an instruction map
-fn make_instructions(instructions: Vec<(u64, Instruction)>) -> U64HashMap<Instruction> {
-    instructions.into_iter().collect()
+/// Helper to create an instruction cache
+fn make_instructions(instructions: Vec<(u64, Instruction)>) -> InstructionCache {
+    let map: U64HashMap<Instruction> = instructions.into_iter().collect();
+    InstructionCache::from_map(&map)
 }
 
 /// Helper to create a simple non-jump instruction (LoadUpperImm is simple)

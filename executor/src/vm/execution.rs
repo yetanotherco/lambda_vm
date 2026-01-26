@@ -144,6 +144,47 @@ pub struct InstructionCache {
 }
 
 impl InstructionCache {
+    /// Creates an InstructionCache from a hashmap of address -> instruction.
+    /// Used for testing where we don't have real ELF segments.
+    pub fn from_map(map: &U64HashMap<Instruction>) -> Self {
+        if map.is_empty() {
+            return Self { segments: vec![] };
+        }
+
+        // Collect and sort addresses
+        let mut entries: Vec<_> = map.iter().collect();
+        entries.sort_by_key(|(addr, _)| *addr);
+
+        // Group into contiguous segments (addresses differ by exactly 4)
+        let mut segments = Vec::new();
+        let mut current_base = *entries[0].0;
+        let mut current_instructions = vec![*entries[0].1];
+
+        for (addr, instruction) in entries.into_iter().skip(1) {
+            let expected_addr = current_base + (current_instructions.len() as u64 * 4);
+            if *addr == expected_addr {
+                // Contiguous, add to current segment
+                current_instructions.push(*instruction);
+            } else {
+                // Gap found, start new segment
+                segments.push(InstructionSegment {
+                    base_addr: current_base,
+                    instructions: current_instructions,
+                });
+                current_base = *addr;
+                current_instructions = vec![*instruction];
+            }
+        }
+
+        // Don't forget the last segment
+        segments.push(InstructionSegment {
+            base_addr: current_base,
+            instructions: current_instructions,
+        });
+
+        Self { segments }
+    }
+
     pub fn new(segments: &[crate::elf::Segment]) -> Result<Self, InstructionError> {
         let mut result = Vec::new();
         for seg in segments.iter().filter(|s| s.is_executable) {
