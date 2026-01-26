@@ -63,6 +63,9 @@
 
 #let _xref-included = state("_xref-included", (:))
 
+// Strip styling to keep only "pure" content.
+// This is useful to avoid errors on the `set document(...)` in `project`
+// when invisibly including other chapters to resolve xrefs.
 #let strip-all(content) = {
   if repr(content.func()) == "sequence" {
     for c in content.children {
