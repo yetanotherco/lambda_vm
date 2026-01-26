@@ -53,9 +53,11 @@
 //! - ECALL: for system calls
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use crate::ProverError;
 use executor::vm::{
     instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth},
     logs::Log,
+    memory::U64HashMap,
 };
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::trace::TraceTable;
@@ -497,7 +499,7 @@ impl CpuOperation {
     /// Creates a CpuOperation from an executor Log.
     ///
     /// This is the main integration point between the executor and the prover.
-    pub fn from_log(log: &Log, timestamp: u64) -> Self {
+    pub fn from_log(log: &Log, timestamp: u64, instruction: Instruction) -> Self {
         let mut op = Self {
             timestamp,
             pc: log.current_pc,
@@ -509,7 +511,7 @@ impl CpuOperation {
             ..Default::default()
         };
 
-        match log.instruction {
+        match instruction {
             Instruction::Arith {
                 dst,
                 src1,
@@ -717,16 +719,18 @@ impl CpuOperation {
                     op.write_register = true;
                 }
             }
-
             Instruction::CSR { .. } => {
                 // CSR instructions not yet supported in prover
                 // TODO: Add CSR support
             }
-
             Instruction::EcallEbreak => {
                 // Determine if ECALL or EBREAK based on context
                 // For now, default to ECALL
                 op.op_ecall = true;
+            }
+            Instruction::Fence => {
+                // FENCE is a memory barrier - in single-threaded, in-order execution it's a no-op
+                // No operation flags needed, just advance PC (handled by default from log)
             }
         }
 
@@ -962,16 +966,20 @@ pub fn generate_cpu_trace(
 /// This is a convenience function that converts logs to CpuOperations
 /// and then generates the trace.
 ///
+/// Returns an error if an instruction is not found for a PC.
 /// Panics if logs.len() is not a power of 2 >= 4.
 pub fn generate_cpu_trace_from_logs(
     logs: &[Log],
-) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let operations: Vec<CpuOperation> = logs
-        .iter()
-        .enumerate()
-        .map(|(i, log)| CpuOperation::from_log(log, (i as u64) * 4))
-        .collect();
-    generate_cpu_trace(&operations)
+    instructions: &U64HashMap<Instruction>,
+) -> Result<TraceTable<GoldilocksField, GoldilocksExtension>, ProverError> {
+    let mut operations = Vec::with_capacity(logs.len());
+    for (i, log) in logs.iter().enumerate() {
+        let instruction = *instructions
+            .get(&log.current_pc)
+            .ok_or(ProverError::MissingInstruction(log.current_pc))?;
+        operations.push(CpuOperation::from_log(log, (i as u64) * 4, instruction));
+    }
+    Ok(generate_cpu_trace(&operations))
 }
 
 /// Collects all Bitwise lookups from a list of CPU operations.
@@ -991,13 +999,16 @@ pub fn collect_bitwise_lookups(
 /// Convenience function that converts logs to operations and collects lookups.
 pub fn collect_bitwise_lookups_from_logs(
     logs: &[Log],
-) -> Vec<(super::bitwise::BitwiseLookup, u8, u8, u8)> {
-    let operations: Vec<CpuOperation> = logs
-        .iter()
-        .enumerate()
-        .map(|(i, log)| CpuOperation::from_log(log, (i as u64) * 4))
-        .collect();
-    collect_bitwise_lookups(&operations)
+    instructions: &U64HashMap<Instruction>,
+) -> Result<Vec<(super::bitwise::BitwiseLookup, u8, u8, u8)>, ProverError> {
+    let mut operations = Vec::with_capacity(logs.len());
+    for (i, log) in logs.iter().enumerate() {
+        let instruction = *instructions
+            .get(&log.current_pc)
+            .ok_or(ProverError::MissingInstruction(log.current_pc))?;
+        operations.push(CpuOperation::from_log(log, (i as u64) * 4, instruction));
+    }
+    Ok(collect_bitwise_lookups(&operations))
 }
 
 // =========================================================================

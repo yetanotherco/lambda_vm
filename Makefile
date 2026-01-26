@@ -140,6 +140,9 @@ test-rust-no-compile:
 test-no-compile: prepare-test-data
 	cargo test -p executor
 
+test-flamegraph: 
+	cargo test -p executor --test flamegraph
+	
 test: compile-programs prepare-test-data
 	cargo test
 

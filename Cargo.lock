@@ -1394,6 +1394,7 @@ version = "0.1.0"
 dependencies = [
  "guest_program",
  "rkyv",
+ "rustc-demangle",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -2991,6 +2992,7 @@ dependencies = [
 name = "prover"
 version = "0.1.0"
 dependencies = [
+ "criterion 0.5.1",
  "crypto",
  "env_logger",
  "executor",
