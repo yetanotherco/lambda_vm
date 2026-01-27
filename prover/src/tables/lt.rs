@@ -22,7 +22,7 @@
 //!
 //! ## Bus Interactions
 //! - Sender: MSB16 (×2 for lhs_msb, rhs_msb)
-//! - Sender: IS_HALFWORD (×4 for lhs_sub_rhs range check)
+//! - Sender: IS_HALFWORD (×6: ×4 for lhs_sub_rhs, ×1 for lhs[1], ×1 for rhs[1])
 //! - Receiver: LT (provides less-than results to other tables)
 
 use math::field::element::FieldElement;
@@ -273,6 +273,24 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             Multiplicity::Column(cols::MU),
             vec![BusValue::Packed {
                 start_column: cols::LHS_SUB_RHS_3,
+                packing: Packing::Direct,
+            }],
+        ),
+        // IS_HALFWORD[lhs[1]]
+        BusInteraction::sender(
+            BusId::IsHalfword,
+            Multiplicity::Column(cols::MU),
+            vec![BusValue::Packed {
+                start_column: cols::LHS_1,
+                packing: Packing::Direct,
+            }],
+        ),
+        // IS_HALFWORD[rhs[1]]
+        BusInteraction::sender(
+            BusId::IsHalfword,
+            Multiplicity::Column(cols::MU),
+            vec![BusValue::Packed {
+                start_column: cols::RHS_1,
                 packing: Packing::Direct,
             }],
         ),

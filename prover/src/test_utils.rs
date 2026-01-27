@@ -197,7 +197,7 @@ pub fn collect_lt_lookups_from_logs(
 ///
 /// The LT table sends:
 /// - MSB16 lookups (×2 per row: for lhs_msb and rhs_msb)
-/// - IS_HALFWORD lookups (×4 per row: for lhs_sub_rhs range checks)
+/// - IS_HALFWORD lookups (×6 per row: ×4 for lhs_sub_rhs, ×1 for lhs[1], ×1 for rhs[1])
 pub fn collect_bitwise_lookups_from_lt(lt_ops: &[LtOperation]) -> Vec<(BitwiseLookup, u8, u8, u8)> {
     let mut lookups = Vec::new();
 
@@ -225,6 +225,24 @@ pub fn collect_bitwise_lookups_from_lt(lt_ops: &[LtOperation]) -> Vec<(BitwiseLo
                 0,
             ));
         }
+
+        // IS_HALFWORD for lhs[1] (bits 32-47 of lhs)
+        let lhs_1 = ((op.lhs >> 32) & 0xFFFF) as u16;
+        lookups.push((
+            BitwiseLookup::IsHalf,
+            (lhs_1 & 0xFF) as u8,
+            ((lhs_1 >> 8) & 0xFF) as u8,
+            0,
+        ));
+
+        // IS_HALFWORD for rhs[1] (bits 32-47 of rhs)
+        let rhs_1 = ((op.rhs >> 32) & 0xFFFF) as u16;
+        lookups.push((
+            BitwiseLookup::IsHalf,
+            (rhs_1 & 0xFF) as u8,
+            ((rhs_1 >> 8) & 0xFF) as u8,
+            0,
+        ));
     }
 
     lookups
