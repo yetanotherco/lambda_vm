@@ -6,16 +6,12 @@ use crate::lookup::BusPublicInputs;
 use crate::trace::LDETraceTable;
 use crate::traits::{AIR, TransitionEvaluationContext};
 use crate::{frame::Frame, prover::evaluate_polynomial_on_lde_domain};
-use itertools::Itertools;
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 #[cfg(not(feature = "parallel"))]
 use math::polynomial::Polynomial;
 use math::{fft::errors::FFTError, field::element::FieldElement};
 #[cfg(feature = "parallel")]
-use rayon::{
-    iter::IndexedParallelIterator,
-    prelude::{IntoParallelIterator, ParallelIterator},
-};
+use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 
 use std::marker::PhantomData;
 #[cfg(feature = "instruments")]
@@ -60,7 +56,6 @@ where
         rap_challenges: &[FieldElement<FieldExtension>],
     ) -> Vec<FieldElement<FieldExtension>> {
         let boundary_constraints = &self.boundary_constraints;
-        let number_of_b_constraints = boundary_constraints.constraints.len();
         let boundary_zerofiers_inverse_evaluations: Vec<Vec<FieldElement<Field>>> =
             boundary_constraints
                 .constraints
@@ -104,59 +99,10 @@ where
             timer.elapsed()
         );
 
-        #[cfg(feature = "instruments")]
-        let timer = Instant::now();
-
-        let boundary_polys_evaluations = boundary_constraints
-            .constraints
-            .iter()
-            .map(|constraint| {
-                if constraint.is_aux {
-                    (0..lde_trace.num_rows())
-                        .map(|row| {
-                            let v = lde_trace.get_aux(row, constraint.col);
-                            v - &constraint.value
-                        })
-                        .collect_vec()
-                } else {
-                    (0..lde_trace.num_rows())
-                        .map(|row| {
-                            let v = lde_trace.get_main(row, constraint.col);
-                            v - &constraint.value
-                        })
-                        .collect_vec()
-                }
-            })
-            .collect_vec();
-
-        #[cfg(feature = "instruments")]
-        println!("     Created boundary polynomials: {:#?}", timer.elapsed());
-        #[cfg(feature = "instruments")]
-        let timer = Instant::now();
-
-        #[cfg(feature = "parallel")]
-        let boundary_eval_iter = (0..domain.lde_roots_of_unity_coset.len()).into_par_iter();
-        #[cfg(not(feature = "parallel"))]
-        let boundary_eval_iter = 0..domain.lde_roots_of_unity_coset.len();
-
-        let boundary_evaluation: Vec<_> = boundary_eval_iter
-            .map(|domain_index| {
-                (0..number_of_b_constraints)
-                    .zip(boundary_coefficients)
-                    .fold(FieldElement::zero(), |acc, (constraint_index, beta)| {
-                        acc + &boundary_zerofiers_inverse_evaluations[constraint_index]
-                            [domain_index]
-                            * beta
-                            * &boundary_polys_evaluations[constraint_index][domain_index]
-                    })
-            })
-            .collect();
-
-        #[cfg(feature = "instruments")]
-        println!(
-            "     Evaluated boundary polynomials on LDE: {:#?}",
-            timer.elapsed()
-        );
+        // NOTE: We intentionally skip precomputing boundary_polys_evaluations and
+        // boundary_evaluation vectors. Instead, we compute boundary contributions
+        // on-the-fly in the main loop below. This saves ~1GB of intermediate memory
+        // for large traces.
 
         #[cfg(all(debug_assertions, not(feature = "parallel")))]
         let boundary_zerofiers = Vec::new();
@@ -176,22 +122,42 @@ where
             timer.elapsed()
         );
 
-        // Iterate over all LDE domain and compute the part of the composition polynomial
-        // related to the transition constraints and add it to the already computed part of the
-        // boundary constraints.
+        // Iterate over all LDE domain and compute both boundary and transition
+        // contributions to the composition polynomial in a single pass.
+        // This fused approach avoids allocating large intermediate vectors.
 
         #[cfg(feature = "instruments")]
         let timer = Instant::now();
         let evaluations_t_iter = 0..domain.lde_roots_of_unity_coset.len();
 
         #[cfg(feature = "parallel")]
-        let boundary_evaluation = boundary_evaluation.into_par_iter();
-        #[cfg(feature = "parallel")]
         let evaluations_t_iter = evaluations_t_iter.into_par_iter();
 
+        let boundary_constraints_vec = &boundary_constraints.constraints;
+
         let evaluations_t = evaluations_t_iter
-            .zip(boundary_evaluation)
-            .map(|(i, boundary)| {
+            .map(|i| {
+                // Compute boundary contribution on-the-fly (fused from previous separate passes)
+                let boundary = boundary_constraints_vec
+                    .iter()
+                    .zip(boundary_coefficients)
+                    .enumerate()
+                    .fold(
+                        FieldElement::zero(),
+                        |acc, (constraint_index, (constraint, beta))| {
+                            // Get trace value at this position and compute (trace - boundary_value)
+                            let poly_eval: FieldElement<FieldExtension> = if constraint.is_aux {
+                                lde_trace.get_aux(i, constraint.col) - &constraint.value
+                            } else {
+                                lde_trace.get_main(i, constraint.col) - &constraint.value
+                            };
+                            // Multiply by zerofier_inverse and beta coefficient
+                            acc + &boundary_zerofiers_inverse_evaluations[constraint_index][i]
+                                * beta
+                                * poly_eval
+                        },
+                    );
+
                 let frame = Frame::read_from_lde(lde_trace, i, &air.context().transition_offsets);
 
                 let periodic_values: Vec<_> = lde_periodic_columns
