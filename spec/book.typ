@@ -30,7 +30,6 @@
   summary: meta.summary.map(((ch, title, _ref)) => chapter(ch, title)).join()
 )
 
-#let is-shiroa = "x-target" in sys.inputs
 
 #let todo(background: white, foreground: black, name: none, body) = block(fill: background, outset: 0.5em, radius: 20%, stroke: black)[
   #set text(fill: foreground)
@@ -53,6 +52,9 @@
     #align(left, body)
 ])
 
+
+#let is-shiroa = "x-target" in sys.inputs
+
 // Strip styling to keep only "pure" content.
 // This is useful to avoid errors on the `set document(...)` in `project`
 // when invisibly including other chapters to resolve xrefs.
@@ -71,6 +73,7 @@
 #let _toplevel = state("_toplevel", none)
 #let _xref-included = state("_xref-included", (:))
 
+// Invisibly include another chapter, so that its labels can be resolved
 #let xref-include(f) = {
   context if f not in _xref-included.get() {
     hide(box(width: 0%, height: 0%, strip-all(include "/" + f)))
@@ -78,7 +81,9 @@
   context _xref-included.update(x => x + ((f): true))
 }
 
-#let xref(rf, ..ref-args) = {
+// Generate a cross-link for references to other chapters.
+// Leaves the ref untouched if it can't be resolved or points to the current chapter.
+#let xref(rf) = {
   assert(is-shiroa, message: "xref should only be used when compiling for shiroa")
   let lbl = rf.target
   let found = meta.summary.find(((_, _, tag)) => str(lbl).starts-with(str(tag)))
@@ -103,7 +108,12 @@
           counter(fig.func())
         }
 
-        [#ref-args.named().at("supplement", default: [])#numbering(fig.numbering, ..counter.at(lbl))]
+        let supplement = if rf.supplement == auto {
+          fig.fields().at("supplement", default: none)
+        } else {
+          rf.supplement
+        }
+        [#supplement#numbering(fig.numbering, ..counter.at(lbl))]
       }
       cross-link("/" + ch, reference: shiroa-label, link-content)
     }

@@ -85,6 +85,9 @@
 ///   - Hint: use `""` to generate an empty description.
 /// - authors (array | str): The author(s) of the page.
 /// - kind (str): The kind of the page.
+/// - cond (function): A predicate that can be used inside of `context`
+///                    to check whether display rules should be applied.
+///                    Useful for including other chapters invisibly to figure out information about their labels
 /// - plain-body (content): The plain body of the page.
 #let project(title: "Typst Book", description: auto, authors: (), kind: "page", cond: none, plain-body) = {
   // set basic document metadata
