@@ -73,7 +73,7 @@
 
 #let xref-include(f) = {
   context if f not in _xref-included.get() {
-    (hide(box(width: 0%, height: 0%, strip-all(include "/" + f))))
+    hide(box(width: 0%, height: 0%, strip-all(include "/" + f)))
   }
   context _xref-included.update(x => x + ((f): true))
 }
@@ -123,7 +123,7 @@
       }
     })
     let cond() = _toplevel.final() == file
-    project.with(..args, description: "aaa", title: meta.summary.find(x => x.at(0) == file).at(1), cond: cond)([
+    project.with(..args, title: context meta.summary.find(x => x.at(0) == _toplevel.final()).at(1), cond: cond)([
       #show ref: it => context if _toplevel.final() == file {
         xref(it)
       }
