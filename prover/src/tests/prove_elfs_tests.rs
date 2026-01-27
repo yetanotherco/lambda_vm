@@ -887,3 +887,36 @@ fn test_prove_elfs_sign_ext_edge_cases_8() {
         "sign_ext_edge_cases_8 failed - arg2 sign extension may be broken"
     );
 }
+
+/// Memory profiling test using dhat.
+///
+/// Run with:
+/// ```
+/// cargo test -p prover --release --features dhat-heap test_dhat_memory_profile -- --ignored --nocapture
+/// ```
+///
+/// This generates `dhat-heap.json` which can be viewed with:
+/// https://nnethercote.github.io/dh_view/dh_view.html
+#[test]
+#[ignore]
+fn test_dhat_memory_profile() {
+    #[cfg(feature = "dhat-heap")]
+    let _profiler = dhat::Profiler::new_heap();
+
+    let (logs, instructions) = run_asm_elf("loop_1024");
+    assert_eq!(logs.len(), 1024, "Expected 2^10 instructions");
+
+    let mut cpu_trace = Traces::from_logs(&logs, instructions.clone()).unwrap().cpu;
+
+    let lt_lookups = collect_lt_lookups_from_logs(&logs, &instructions);
+    let mut lt_trace = generate_lt_trace(&lt_lookups);
+
+    let mut bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
+    bitwise_lookups.extend(collect_bitwise_lookups_from_lt(&lt_lookups));
+    let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
+
+    assert!(
+        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+        "verification failed"
+    );
+}
