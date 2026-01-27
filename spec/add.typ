@@ -2,10 +2,10 @@
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": render_chip_column_table, render_chip_assumptions, render_constraint_table
 
-#show: book-page("add.typ")
-
 #let config = load_config()
 #let chip = load_chip("src/add.toml", config)
+
+#show: book-page(chip.name)
 
 #let add = raw(chip.name)
 

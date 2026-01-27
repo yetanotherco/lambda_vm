@@ -122,24 +122,32 @@
   }
 }
 
-#let book-page(file, ..args) = if is-shiroa {
-  (body) => {
-    context _xref-included.update(x => x + ((file): true))
-    context _toplevel.update(s => {
-      if s == none {
-        file
-      } else {
-        s
-      }
-    })
-    let cond() = _toplevel.final() == file
-    project.with(..args, title: context meta.summary.find(x => x.at(0) == _toplevel.final()).at(1), cond: cond)([
-      #show ref: it => context if _toplevel.final() == file {
-        xref(it)
-      }
-      #body
-    ])
+#let book-page(file, ..args) = {
+  let file = if file.ends-with(".typ") {
+    file
+  } else {
+    lower(file) + ".typ"
   }
-} else {
-  (body) => body
+  assert(meta.summary.find(((f, _, _)) => f == file) != none, message: "Couldn't resolve typst source file " + file)
+  if is-shiroa {
+    (body) => {
+      context _xref-included.update(x => x + ((file): true))
+      context _toplevel.update(s => {
+        if s == none {
+          file
+        } else {
+          s
+        }
+      })
+      let cond() = _toplevel.final() == file
+      project.with(..args, title: context meta.summary.find(x => x.at(0) == _toplevel.final()).at(1), cond: cond)([
+        #show ref: it => context if _toplevel.final() == file {
+          xref(it)
+        }
+        #body
+      ])
+    }
+  } else {
+    (body) => body
+  }
 }

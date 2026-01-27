@@ -12,7 +12,7 @@
 #let config = load_config()
 #let chip = load_chip("src/mul.toml", config)
 
-#show: book-page("mul.typ")
+#show: book-page(chip.name)
 
 #let mul = raw(chip.name)
 

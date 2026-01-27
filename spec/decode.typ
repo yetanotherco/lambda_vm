@@ -11,7 +11,7 @@
 
 #let config = load_config()
 #let chip = load_chip("src/decode.toml", config)
-#show: book-page("decode.typ")
+#show: book-page(chip.name)
 
 #let decode = raw(chip.name)
 

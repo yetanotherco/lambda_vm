@@ -2,10 +2,10 @@
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": render_chip_column_table, render_constraint_table
 
-#show: book-page("is_bit.typ")
-
 #let config = load_config()
 #let chip = load_chip("src/is_bit.toml", config)
+
+#show: book-page(chip.name)
 
 #let is_bit = raw(chip.name)
 
