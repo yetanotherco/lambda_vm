@@ -1,4 +1,4 @@
-#import "/book.typ": book-page, rj
+#import "/book.typ": book-page, rj, aside
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   render_chip_assumptions,
@@ -36,6 +36,12 @@ The #halt chip:
 Note that the writes performed by all these interactions are accompanied by the timestamp $2^64-1$; the maximum timestamp.
 This prevents any other operation involving memory from being executed hereafter.
 #render_constraint_table(chip, config, groups: "all")
+
+#aside("Note on register clean up",
+[
+  Observe that --- in its current state --- this solution puts the burden of verifying the register cleanup on the verifier inside of the lookup argument.
+  Alternatively, one could add 31 lookups to the "memory" table to remove the _known_ final tokens for the registers there.
+])
 
 === Lookup
 The HALT chip contributes the following interaction to the lookup-argument:
