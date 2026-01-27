@@ -30,7 +30,13 @@ use crate::tables::bitwise::{
 use crate::tables::cpu::{
     CpuOperation, bus_interactions as cpu_bus_interactions, cols as cpu_cols,
 };
+use crate::tables::load::{
+    bus_interactions as load_bus_interactions, cols as load_cols, constraints as load_constraints,
+};
 use crate::tables::lt::{LtOperation, bus_interactions as lt_bus_interactions, cols as lt_cols};
+use crate::tables::memw::{
+    bus_interactions as memw_bus_interactions, cols as memw_cols, constraints as memw_constraints,
+};
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
 pub type F = GoldilocksField;
@@ -380,6 +386,40 @@ pub fn create_lt_air(proof_options: &ProofOptions) -> VmAir {
 
     AirWithBuses::new(
         lt_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+}
+
+/// Create MEMW AIR with constraints and bus interactions.
+pub fn create_memw_air(proof_options: &ProofOptions) -> VmAir {
+    let transition_constraints = memw_constraints();
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: memw_bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        memw_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+}
+
+/// Create LOAD AIR with constraints and bus interactions.
+pub fn create_load_air(proof_options: &ProofOptions) -> VmAir {
+    let transition_constraints = load_constraints();
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: load_bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        load_cols::NUM_COLUMNS,
         auxiliary_trace_build_data,
         proof_options,
         1,

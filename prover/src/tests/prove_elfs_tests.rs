@@ -24,15 +24,17 @@ use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
 use crate::tables::bitwise::{generate_bitwise_trace, update_multiplicities};
+use crate::tables::load::generate_load_trace;
 use crate::tables::lt::generate_lt_trace;
+use crate::tables::memw::generate_memw_trace;
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
 // Import shared utilities
 use crate::test_utils::{
     collect_bitwise_lookups_from_logs, collect_bitwise_lookups_from_lt,
-    collect_lt_lookups_from_logs, create_bitwise_air, create_cpu_air, create_lt_air,
-    generate_minimal_bitwise_trace, run_asm_elf,
+    collect_lt_lookups_from_logs, create_bitwise_air, create_cpu_air, create_load_air,
+    create_lt_air, create_memw_air, generate_minimal_bitwise_trace, run_asm_elf,
 };
 
 type F = GoldilocksField;
@@ -54,7 +56,7 @@ fn collect_bitwise_lookups(
 // Prover test helpers
 // =============================================================================
 
-/// Run multi_prove and multi_verify for all VM tables (CPU + Bitwise + LT).
+/// Run multi_prove and multi_verify for all VM tables (CPU + Bitwise + LT + MEMW + LOAD).
 ///
 /// Uses the FULL 2^20 row bitwise table with preprocessed commitment.
 /// Returns true if verification succeeds.
@@ -62,12 +64,16 @@ fn prove_and_verify_vm(
     cpu_trace: &mut TraceTable<F, E>,
     bitwise_trace: &mut TraceTable<F, E>,
     lt_trace: &mut TraceTable<F, E>,
+    memw_trace: &mut TraceTable<F, E>,
+    load_trace: &mut TraceTable<F, E>,
 ) -> bool {
     let proof_options = ProofOptions::default_test_options();
 
     let cpu_air = create_cpu_air(&proof_options);
     let bitwise_air = create_bitwise_air(&proof_options);
     let lt_air = create_lt_air(&proof_options);
+    let memw_air = create_memw_air(&proof_options);
+    let load_air = create_load_air(&proof_options);
 
     let air_trace_pairs: Vec<(
         &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
@@ -77,6 +83,8 @@ fn prove_and_verify_vm(
         (&cpu_air, cpu_trace, &()),
         (&bitwise_air, bitwise_trace, &()),
         (&lt_air, lt_trace, &()),
+        (&memw_air, memw_trace, &()),
+        (&load_air, load_trace, &()),
     ];
 
     let multi_proof =
@@ -89,12 +97,12 @@ fn prove_and_verify_vm(
         };
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
-        vec![&cpu_air, &bitwise_air, &lt_air];
+        vec![&cpu_air, &bitwise_air, &lt_air, &memw_air, &load_air];
 
     Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[]))
 }
 
-/// Run multi_prove and multi_verify for all VM tables with MINIMAL bitwise.
+/// Run multi_prove and multi_verify for all VM tables (CPU + Bitwise + LT + MEMW + LOAD).
 ///
 /// Used for fast tests where the bitwise table is a dummy that only contains
 /// the rows needed to balance the bus. NOT the full preprocessed table.
@@ -102,12 +110,16 @@ fn prove_and_verify_vm_minimal(
     cpu_trace: &mut TraceTable<F, E>,
     bitwise_trace: &mut TraceTable<F, E>,
     lt_trace: &mut TraceTable<F, E>,
+    memw_trace: &mut TraceTable<F, E>,
+    load_trace: &mut TraceTable<F, E>,
 ) -> bool {
     let proof_options = ProofOptions::default_test_options();
 
     let cpu_air = create_cpu_air(&proof_options);
     let bitwise_air = create_bitwise_air(&proof_options);
     let lt_air = create_lt_air(&proof_options);
+    let memw_air = create_memw_air(&proof_options);
+    let load_air = create_load_air(&proof_options);
 
     let air_trace_pairs: Vec<(
         &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
@@ -117,18 +129,13 @@ fn prove_and_verify_vm_minimal(
         (&cpu_air, cpu_trace, &()),
         (&bitwise_air, bitwise_trace, &()),
         (&lt_air, lt_trace, &()),
+        (&memw_air, memw_trace, &()),
+        (&load_air, load_trace, &()),
     ];
 
-    eprintln!("DEBUG: Proving {} tables...", air_trace_pairs.len());
     let multi_proof =
         match Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])) {
-            Ok(proof) => {
-                eprintln!(
-                    "DEBUG: Prover succeeded, {} proofs generated",
-                    proof.proofs.len()
-                );
-                proof
-            }
+            Ok(proof) => proof,
             Err(e) => {
                 eprintln!("Prover error: {:?}", e);
                 return false;
@@ -136,12 +143,9 @@ fn prove_and_verify_vm_minimal(
         };
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
-        vec![&cpu_air, &bitwise_air, &lt_air];
+        vec![&cpu_air, &bitwise_air, &lt_air, &memw_air, &load_air];
 
-    eprintln!("DEBUG: Verifying {} AIRs...", airs.len());
-    let result = Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[]));
-    eprintln!("DEBUG: Verification result: {}", result);
-    result
+    Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[]))
 }
 
 // =============================================================================
@@ -224,7 +228,13 @@ fn test_prove_elfs_sub_fast() {
     );
 
     assert!(
-        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+        prove_and_verify_vm_minimal(
+            &mut cpu_trace,
+            &mut bitwise_trace,
+            &mut lt_trace,
+            &mut generate_memw_trace(&[]),
+            &mut generate_load_trace(&[])
+        ),
         "Proof verification failed for sub program (fast)"
     );
 }
@@ -249,7 +259,13 @@ fn test_prove_elfs_sub_neg_result_fast() {
     );
 
     assert!(
-        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+        prove_and_verify_vm_minimal(
+            &mut cpu_trace,
+            &mut bitwise_trace,
+            &mut lt_trace,
+            &mut generate_memw_trace(&[]),
+            &mut generate_load_trace(&[])
+        ),
         "Proof verification failed for sub_neg_result program (fast)"
     );
 }
@@ -274,7 +290,13 @@ fn test_prove_elfs_sub_underflow_fast() {
     );
 
     assert!(
-        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+        prove_and_verify_vm_minimal(
+            &mut cpu_trace,
+            &mut bitwise_trace,
+            &mut lt_trace,
+            &mut generate_memw_trace(&[]),
+            &mut generate_load_trace(&[])
+        ),
         "Proof verification failed for sub_underflow program (fast)"
     );
 }
@@ -299,7 +321,13 @@ fn test_prove_elfs_subw_fast() {
     );
 
     assert!(
-        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+        prove_and_verify_vm_minimal(
+            &mut cpu_trace,
+            &mut bitwise_trace,
+            &mut lt_trace,
+            &mut generate_memw_trace(&[]),
+            &mut generate_load_trace(&[])
+        ),
         "Proof verification failed for subw program (fast)"
     );
 }
@@ -325,7 +353,13 @@ fn test_prove_elfs_arith_lui_8() {
     );
 
     assert!(
-        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+        prove_and_verify_vm_minimal(
+            &mut cpu_trace,
+            &mut bitwise_trace,
+            &mut lt_trace,
+            &mut generate_memw_trace(&[]),
+            &mut generate_load_trace(&[])
+        ),
         "Proof verification failed for arith_lui_8 program"
     );
 }
@@ -351,7 +385,13 @@ fn test_prove_elfs_arith_8() {
     );
 
     assert!(
-        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+        prove_and_verify_vm_minimal(
+            &mut cpu_trace,
+            &mut bitwise_trace,
+            &mut lt_trace,
+            &mut generate_memw_trace(&[]),
+            &mut generate_load_trace(&[])
+        ),
         "Proof verification failed for arith_8 program"
     );
 }
@@ -380,7 +420,13 @@ fn test_prove_elfs_basic_arith_32() {
     );
 
     assert!(
-        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+        prove_and_verify_vm_minimal(
+            &mut cpu_trace,
+            &mut bitwise_trace,
+            &mut lt_trace,
+            &mut generate_memw_trace(&[]),
+            &mut generate_load_trace(&[])
+        ),
         "Proof verification failed for basic_arith_32 program"
     );
 }
@@ -426,7 +472,13 @@ fn test_prove_elfs_comprehensive() {
     );
 
     assert!(
-        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+        prove_and_verify_vm_minimal(
+            &mut cpu_trace,
+            &mut bitwise_trace,
+            &mut lt_trace,
+            &mut generate_memw_trace(&[]),
+            &mut generate_load_trace(&[])
+        ),
         "Proof verification failed for comprehensive_test program"
     );
 }
@@ -447,7 +499,13 @@ fn test_prove_elfs_test_add_8() {
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
     println!("test_add_8: {} lookups", bitwise_lookups.len());
     assert!(
-        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+        prove_and_verify_vm_minimal(
+            &mut cpu_trace,
+            &mut bitwise_trace,
+            &mut lt_trace,
+            &mut generate_memw_trace(&[]),
+            &mut generate_load_trace(&[])
+        ),
         "test_add_8 failed"
     );
 }
@@ -464,7 +522,13 @@ fn test_prove_elfs_test_sub_8() {
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
     println!("test_sub_8: {} lookups", bitwise_lookups.len());
     assert!(
-        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+        prove_and_verify_vm_minimal(
+            &mut cpu_trace,
+            &mut bitwise_trace,
+            &mut lt_trace,
+            &mut generate_memw_trace(&[]),
+            &mut generate_load_trace(&[])
+        ),
         "test_sub_8 failed"
     );
 }
@@ -481,7 +545,13 @@ fn test_prove_elfs_test_addw_8() {
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
     println!("test_addw_8: {} lookups", bitwise_lookups.len());
     assert!(
-        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+        prove_and_verify_vm_minimal(
+            &mut cpu_trace,
+            &mut bitwise_trace,
+            &mut lt_trace,
+            &mut generate_memw_trace(&[]),
+            &mut generate_load_trace(&[])
+        ),
         "test_addw_8 failed"
     );
 }
@@ -498,7 +568,13 @@ fn test_prove_elfs_test_subw_8() {
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
     println!("test_subw_8: {} lookups", bitwise_lookups.len());
     assert!(
-        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+        prove_and_verify_vm_minimal(
+            &mut cpu_trace,
+            &mut bitwise_trace,
+            &mut lt_trace,
+            &mut generate_memw_trace(&[]),
+            &mut generate_load_trace(&[])
+        ),
         "test_subw_8 failed"
     );
 }
@@ -515,7 +591,13 @@ fn test_prove_elfs_test_addw_lui_8() {
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
     println!("test_addw_lui_8: {} lookups", bitwise_lookups.len());
     assert!(
-        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+        prove_and_verify_vm_minimal(
+            &mut cpu_trace,
+            &mut bitwise_trace,
+            &mut lt_trace,
+            &mut generate_memw_trace(&[]),
+            &mut generate_load_trace(&[])
+        ),
         "test_addw_lui_8 failed"
     );
 }
@@ -532,7 +614,13 @@ fn test_prove_elfs_test_subw_lui_8() {
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
     println!("test_subw_lui_8: {} lookups", bitwise_lookups.len());
     assert!(
-        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+        prove_and_verify_vm_minimal(
+            &mut cpu_trace,
+            &mut bitwise_trace,
+            &mut lt_trace,
+            &mut generate_memw_trace(&[]),
+            &mut generate_load_trace(&[])
+        ),
         "test_subw_lui_8 failed"
     );
 }
@@ -549,7 +637,13 @@ fn test_prove_elfs_test_add_neg_8() {
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
     println!("test_add_neg_8: {} lookups", bitwise_lookups.len());
     assert!(
-        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+        prove_and_verify_vm_minimal(
+            &mut cpu_trace,
+            &mut bitwise_trace,
+            &mut lt_trace,
+            &mut generate_memw_trace(&[]),
+            &mut generate_load_trace(&[])
+        ),
         "test_add_neg_8 failed"
     );
 }
@@ -566,7 +660,13 @@ fn test_prove_elfs_test_sub_neg_8() {
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
     println!("test_sub_neg_8: {} lookups", bitwise_lookups.len());
     assert!(
-        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+        prove_and_verify_vm_minimal(
+            &mut cpu_trace,
+            &mut bitwise_trace,
+            &mut lt_trace,
+            &mut generate_memw_trace(&[]),
+            &mut generate_load_trace(&[])
+        ),
         "test_sub_neg_8 failed"
     );
 }
@@ -583,7 +683,13 @@ fn test_prove_elfs_test_mul_8() {
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
     println!("test_mul_8: {} lookups", bitwise_lookups.len());
     assert!(
-        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+        prove_and_verify_vm_minimal(
+            &mut cpu_trace,
+            &mut bitwise_trace,
+            &mut lt_trace,
+            &mut generate_memw_trace(&[]),
+            &mut generate_load_trace(&[])
+        ),
         "test_mul_8 failed"
     );
 }
@@ -600,7 +706,13 @@ fn test_prove_elfs_test_div_8() {
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
     println!("test_div_8: {} lookups", bitwise_lookups.len());
     assert!(
-        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+        prove_and_verify_vm_minimal(
+            &mut cpu_trace,
+            &mut bitwise_trace,
+            &mut lt_trace,
+            &mut generate_memw_trace(&[]),
+            &mut generate_load_trace(&[])
+        ),
         "test_div_8 failed"
     );
 }
@@ -617,7 +729,13 @@ fn test_prove_elfs_test_shift_8() {
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
     println!("test_shift_8: {} lookups", bitwise_lookups.len());
     assert!(
-        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+        prove_and_verify_vm_minimal(
+            &mut cpu_trace,
+            &mut bitwise_trace,
+            &mut lt_trace,
+            &mut generate_memw_trace(&[]),
+            &mut generate_load_trace(&[])
+        ),
         "test_shift_8 failed"
     );
 }
@@ -634,7 +752,13 @@ fn test_prove_elfs_test_bitwise_8() {
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
     println!("test_bitwise_8: {} lookups", bitwise_lookups.len());
     assert!(
-        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+        prove_and_verify_vm_minimal(
+            &mut cpu_trace,
+            &mut bitwise_trace,
+            &mut lt_trace,
+            &mut generate_memw_trace(&[]),
+            &mut generate_load_trace(&[])
+        ),
         "test_bitwise_8 failed"
     );
 }
@@ -664,7 +788,13 @@ fn test_prove_elfs_test_slt_8() {
         lt_lookups.len()
     );
     assert!(
-        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+        prove_and_verify_vm_minimal(
+            &mut cpu_trace,
+            &mut bitwise_trace,
+            &mut lt_trace,
+            &mut generate_memw_trace(&[]),
+            &mut generate_load_trace(&[])
+        ),
         "test_slt_8 failed"
     );
 }
@@ -685,7 +815,13 @@ fn test_prove_elfs_test_xor_8() {
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
     println!("test_xor_8: {} lookups", bitwise_lookups.len());
     assert!(
-        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+        prove_and_verify_vm_minimal(
+            &mut cpu_trace,
+            &mut bitwise_trace,
+            &mut lt_trace,
+            &mut generate_memw_trace(&[]),
+            &mut generate_load_trace(&[])
+        ),
         "test_xor_8 failed"
     );
 }
@@ -702,7 +838,13 @@ fn test_prove_elfs_test_lb_lh_8() {
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
     println!("test_lb_lh_8: {} lookups", bitwise_lookups.len());
     assert!(
-        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+        prove_and_verify_vm_minimal(
+            &mut cpu_trace,
+            &mut bitwise_trace,
+            &mut lt_trace,
+            &mut generate_memw_trace(&[]),
+            &mut generate_load_trace(&[])
+        ),
         "test_lb_lh_8 failed"
     );
 }
@@ -719,7 +861,13 @@ fn test_prove_elfs_test_sb_sh_8() {
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
     println!("test_sb_sh_8: {} lookups", bitwise_lookups.len());
     assert!(
-        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+        prove_and_verify_vm_minimal(
+            &mut cpu_trace,
+            &mut bitwise_trace,
+            &mut lt_trace,
+            &mut generate_memw_trace(&[]),
+            &mut generate_load_trace(&[])
+        ),
         "test_sb_sh_8 failed"
     );
 }
@@ -749,7 +897,13 @@ fn test_prove_elfs_all_branches_16() {
         lt_lookups.len()
     );
     assert!(
-        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+        prove_and_verify_vm_minimal(
+            &mut cpu_trace,
+            &mut bitwise_trace,
+            &mut lt_trace,
+            &mut generate_memw_trace(&[]),
+            &mut generate_load_trace(&[])
+        ),
         "all_branches_16 failed"
     );
 }
@@ -766,7 +920,13 @@ fn test_prove_elfs_all_loadstore_32() {
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
     println!("all_loadstore_32: {} lookups", bitwise_lookups.len());
     assert!(
-        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+        prove_and_verify_vm_minimal(
+            &mut cpu_trace,
+            &mut bitwise_trace,
+            &mut lt_trace,
+            &mut generate_memw_trace(&[]),
+            &mut generate_load_trace(&[])
+        ),
         "all_loadstore_32 failed"
     );
 }
@@ -797,7 +957,13 @@ fn test_prove_elfs_all_instructions_64() {
         lt_lookups.len()
     );
     assert!(
-        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+        prove_and_verify_vm_minimal(
+            &mut cpu_trace,
+            &mut bitwise_trace,
+            &mut lt_trace,
+            &mut generate_memw_trace(&[]),
+            &mut generate_load_trace(&[])
+        ),
         "all_instructions_64 failed"
     );
 }
@@ -844,7 +1010,13 @@ fn test_prove_elfs_all_instructions_64_full() {
     );
 
     assert!(
-        prove_and_verify_vm(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+        prove_and_verify_vm(
+            &mut cpu_trace,
+            &mut bitwise_trace,
+            &mut lt_trace,
+            &mut generate_memw_trace(&[]),
+            &mut generate_load_trace(&[])
+        ),
         "all_instructions_64 (full) failed"
     );
 }
@@ -883,7 +1055,13 @@ fn test_prove_elfs_sign_ext_edge_cases_8() {
     );
 
     assert!(
-        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+        prove_and_verify_vm_minimal(
+            &mut cpu_trace,
+            &mut bitwise_trace,
+            &mut lt_trace,
+            &mut generate_memw_trace(&[]),
+            &mut generate_load_trace(&[])
+        ),
         "sign_ext_edge_cases_8 failed - arg2 sign extension may be broken"
     );
 }

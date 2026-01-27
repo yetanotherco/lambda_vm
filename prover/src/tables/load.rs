@@ -1,0 +1,717 @@
+//! LOAD (Memory Load with Extension) table.
+//!
+//! This table handles memory load operations with sign/zero extension for
+//! RISC-V load instructions (LB, LH, LW, LD, LBU, LHU, LWU).
+//!
+//! ## Inputs
+//! - `base_address`: DWordWL (64-bit address)
+//! - `timestamp`: DWordWL (64-bit timestamp)
+//! - `read2/4/8`: Bit (access width flags)
+//! - `signed`: Bit (1 = sign-extend, 0 = zero-extend)
+//!
+//! ## Output
+//! - `res[8]`: DWordBL (8 bytes result, properly extended)
+//!
+//! ## Auxiliary
+//! - `sign_bit`: Bit (MSB of the read data, for sign extension)
+//!
+//! ## Virtual (computed inline)
+//! - `read1`: μ - read2 - read4 - read8 (reading exactly 1 byte)
+//!
+//! ## Bus Interactions
+//! - Receiver: LOAD (from CPU for load operations)
+//! - Sender: MEMW (to read from memory)
+//! - Sender: MSB8 (for sign bit extraction)
+
+use math::field::element::FieldElement;
+use math::field::traits::{IsField, IsSubFieldOf};
+use stark::constraints::transition::TransitionConstraint;
+use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
+use stark::table::TableView;
+use stark::trace::TraceTable;
+use stark::traits::TransitionEvaluationContext;
+
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+
+// =========================================================================
+// Column indices for LOAD table
+// =========================================================================
+
+/// Column definitions for the LOAD table.
+pub mod cols {
+    // Input columns
+    /// base_address: DWordWL (2 words = 2 columns)
+    pub const BASE_ADDRESS_0: usize = 0;
+    pub const BASE_ADDRESS_1: usize = 1;
+
+    /// timestamp: DWordWL (2 words = 2 columns)
+    pub const TIMESTAMP_0: usize = 2;
+    pub const TIMESTAMP_1: usize = 3;
+
+    /// read2, read4, read8: access width flags
+    /// Similar to MEMW write flags - see MEMW for encoding explanation
+    pub const READ2: usize = 4;
+    pub const READ4: usize = 5;
+    pub const READ8: usize = 6;
+
+    /// signed: Bit (1 = sign-extend, 0 = zero-extend)
+    pub const SIGNED: usize = 7;
+
+    // Output columns
+    /// res[8]: 8 bytes of result (DWordBL = 8 columns)
+    pub const RES: [usize; 8] = [8, 9, 10, 11, 12, 13, 14, 15];
+
+    // Auxiliary columns
+    /// sign_bit: Bit (MSB of the relevant byte for sign extension)
+    pub const SIGN_BIT: usize = 16;
+
+    // Multiplicity column
+    /// μ: Whether this row is active
+    pub const MU: usize = 17;
+
+    /// Total number of columns
+    pub const NUM_COLUMNS: usize = 18;
+}
+
+// =========================================================================
+// Trace generation
+// =========================================================================
+
+/// A single LOAD operation to be added to the trace.
+#[derive(Debug, Clone)]
+pub struct LoadOperation {
+    /// Base address (64-bit)
+    pub base_address: u64,
+    /// Timestamp of this access
+    pub timestamp: u64,
+    /// Access width: 1, 2, 4, or 8 bytes
+    pub width: u8,
+    /// Whether to sign-extend (true) or zero-extend (false)
+    pub signed: bool,
+    /// Result bytes (8 bytes, extended)
+    pub res: [u64; 8],
+}
+
+impl LoadOperation {
+    /// Create a new LOAD operation.
+    pub fn new(base_address: u64, timestamp: u64, width: u8, signed: bool, res: [u64; 8]) -> Self {
+        Self {
+            base_address,
+            timestamp,
+            width,
+            signed,
+            res,
+        }
+    }
+
+    /// Convert access width to the spec's flag representation (read2, read4, read8).
+    ///
+    /// The spec uses three flags to encode access width:
+    /// - `read2`: set if accessing 2+ bytes (width >= 2)
+    /// - `read4`: set if accessing 4+ bytes (width >= 4)
+    /// - `read8`: set if accessing 8 bytes (width == 8)
+    ///
+    /// | Width | read2 | read4 | read8 |
+    /// |-------|-------|-------|-------|
+    /// |   1   |   0   |   0   |   0   |
+    /// |   2   |   1   |   0   |   0   |
+    /// |   4   |   1   |   1   |   0   |
+    /// |   8   |   1   |   1   |   1   |
+    pub fn read_flags(&self) -> (bool, bool, bool) {
+        match self.width {
+            1 => (false, false, false),
+            2 => (true, false, false),
+            4 => (true, true, false),
+            8 => (true, true, true),
+            _ => (false, false, false),
+        }
+    }
+
+    /// Get the sign bit from the result based on width.
+    ///
+    /// The sign bit is the MSB of the highest byte being read:
+    /// - width 1: MSB of res[0] (bit 7)
+    /// - width 2: MSB of res[1] (bit 7 of byte 1 = bit 15 of halfword)
+    /// - width 4: MSB of res[3] (bit 7 of byte 3 = bit 31 of word)
+    /// - width 8: MSB of res[7] (bit 7 of byte 7 = bit 63 of dword)
+    pub fn compute_sign_bit(&self) -> bool {
+        let byte_idx = match self.width {
+            1 => 0,
+            2 => 1,
+            4 => 3,
+            8 => 7,
+            _ => 0,
+        };
+        (self.res[byte_idx] >> 7) & 1 == 1
+    }
+}
+
+/// Generates the LOAD trace table from a list of operations.
+pub fn generate_load_trace(
+    operations: &[LoadOperation],
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let num_rows = operations.len().next_power_of_two().max(4);
+    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+
+    for (row_idx, op) in operations.iter().enumerate() {
+        let base = row_idx * cols::NUM_COLUMNS;
+
+        // Input columns
+        // base_address as DWordWL (2 words)
+        data[base + cols::BASE_ADDRESS_0] = FE::from(op.base_address & 0xFFFF_FFFF);
+        data[base + cols::BASE_ADDRESS_1] = FE::from(op.base_address >> 32);
+
+        // timestamp as DWordWL (2 words)
+        data[base + cols::TIMESTAMP_0] = FE::from(op.timestamp & 0xFFFF_FFFF);
+        data[base + cols::TIMESTAMP_1] = FE::from(op.timestamp >> 32);
+
+        // read flags
+        let (r2, r4, r8) = op.read_flags();
+        data[base + cols::READ2] = FE::from(r2 as u64);
+        data[base + cols::READ4] = FE::from(r4 as u64);
+        data[base + cols::READ8] = FE::from(r8 as u64);
+
+        // signed
+        data[base + cols::SIGNED] = FE::from(op.signed as u64);
+
+        // Output: res[8]
+        for i in 0..8 {
+            data[base + cols::RES[i]] = FE::from(op.res[i]);
+        }
+
+        // Auxiliary: sign_bit
+        data[base + cols::SIGN_BIT] = FE::from(op.compute_sign_bit() as u64);
+
+        // Multiplicity: active row
+        data[base + cols::MU] = FE::one();
+    }
+
+    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+}
+
+// =========================================================================
+// Bus interactions
+// =========================================================================
+
+/// Creates all bus interactions for the LOAD table.
+///
+/// The LOAD table:
+/// - **Receives** LOAD lookups from CPU
+/// - **Sends** MEMW lookups to read memory
+/// - **Sends** MSB8 lookups for sign bit extraction
+pub fn bus_interactions() -> Vec<BusInteraction> {
+    let mut interactions = Vec::new();
+
+    // -------------------------------------------------------------------------
+    // MEMW sender (to read memory)
+    // -------------------------------------------------------------------------
+    // LOAD calls MEMW with is_register=0, passing res as both value and old
+    // (since we're reading, value=old=the read data)
+    interactions.push(BusInteraction::sender(
+        BusId::Memw,
+        Multiplicity::Column(cols::MU),
+        vec![
+            // old[8] = res[8] for reads
+            BusValue::Packed {
+                start_column: cols::RES[0],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[1],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[2],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[3],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[4],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[5],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[6],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[7],
+                packing: Packing::Direct,
+            },
+            // is_register = 0 (constant)
+            BusValue::constant(0),
+            // base_address (DWordWL = 2 words)
+            BusValue::Packed {
+                start_column: cols::BASE_ADDRESS_0,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::BASE_ADDRESS_1,
+                packing: Packing::Direct,
+            },
+            // value[8] = res[8] for reads
+            BusValue::Packed {
+                start_column: cols::RES[0],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[1],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[2],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[3],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[4],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[5],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[6],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[7],
+                packing: Packing::Direct,
+            },
+            // timestamp (DWordWL = 2 words)
+            BusValue::Packed {
+                start_column: cols::TIMESTAMP_0,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::TIMESTAMP_1,
+                packing: Packing::Direct,
+            },
+            // read flags (same as write flags for MEMW)
+            BusValue::Packed {
+                start_column: cols::READ2,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::READ4,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::READ8,
+                packing: Packing::Direct,
+            },
+        ],
+    ));
+
+    // -------------------------------------------------------------------------
+    // MSB8 lookups for sign bit extraction
+    // -------------------------------------------------------------------------
+    // Need to extract MSB from the relevant byte based on width
+    // For read1: MSB8[res[0]] -> sign_bit, multiplicity = read1 = μ - read2 - read4 - read8
+    // For read2: MSB8[res[1]] -> sign_bit, multiplicity = read2
+    // For read4: MSB8[res[3]] -> sign_bit, multiplicity = read4
+    // (For read8, no extension needed - all 8 bytes are used)
+
+    // MSB8[res[0]] -> sign_bit (for read1)
+    // read1 = μ - read2 - read4 - read8 (reading exactly 1 byte)
+    interactions.push(BusInteraction::sender(
+        BusId::Msb8,
+        Multiplicity::Linear(vec![
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::MU,
+            },
+            LinearTerm::Column {
+                coefficient: -1,
+                column: cols::READ2,
+            },
+            LinearTerm::Column {
+                coefficient: -1,
+                column: cols::READ4,
+            },
+            LinearTerm::Column {
+                coefficient: -1,
+                column: cols::READ8,
+            },
+        ]),
+        vec![
+            BusValue::Packed {
+                start_column: cols::RES[0],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::SIGN_BIT,
+                packing: Packing::Direct,
+            },
+        ],
+    ));
+
+    // MSB8[res[1]] -> sign_bit (for read2)
+    interactions.push(BusInteraction::sender(
+        BusId::Msb8,
+        Multiplicity::Column(cols::READ2),
+        vec![
+            BusValue::Packed {
+                start_column: cols::RES[1],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::SIGN_BIT,
+                packing: Packing::Direct,
+            },
+        ],
+    ));
+
+    // MSB8[res[3]] -> sign_bit (for read4)
+    interactions.push(BusInteraction::sender(
+        BusId::Msb8,
+        Multiplicity::Column(cols::READ4),
+        vec![
+            BusValue::Packed {
+                start_column: cols::RES[3],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::SIGN_BIT,
+                packing: Packing::Direct,
+            },
+        ],
+    ));
+
+    // -------------------------------------------------------------------------
+    // LOAD receiver (from CPU)
+    // -------------------------------------------------------------------------
+    // CPU sends: base_address, timestamp, read2, read4, read8
+    // LOAD returns: res as DWordWL (extended result)
+    interactions.push(BusInteraction::receiver(
+        BusId::Load,
+        Multiplicity::Column(cols::MU),
+        vec![
+            // res as DWordWL (2 words) - the extended result
+            // Lower 32 bits = res[0] + res[1]*256 + res[2]*256^2 + res[3]*256^3
+            // Upper 32 bits = res[4] + res[5]*256 + res[6]*256^2 + res[7]*256^3
+            // For simplicity, we pack all 8 bytes
+            BusValue::Packed {
+                start_column: cols::RES[0],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[1],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[2],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[3],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[4],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[5],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[6],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[7],
+                packing: Packing::Direct,
+            },
+            // base_address (DWordWL = 2 words)
+            BusValue::Packed {
+                start_column: cols::BASE_ADDRESS_0,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::BASE_ADDRESS_1,
+                packing: Packing::Direct,
+            },
+            // timestamp (DWordWL = 2 words)
+            BusValue::Packed {
+                start_column: cols::TIMESTAMP_0,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::TIMESTAMP_1,
+                packing: Packing::Direct,
+            },
+            // read flags
+            BusValue::Packed {
+                start_column: cols::READ2,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::READ4,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::READ8,
+                packing: Packing::Direct,
+            },
+        ],
+    ));
+
+    interactions
+}
+
+// =========================================================================
+// Virtual column computations
+// =========================================================================
+
+/// Compute virtual read1 = μ - read2 - read4 - read8
+#[allow(dead_code)]
+fn compute_read1<F, E>(step: &TableView<F, E>) -> FieldElement<F>
+where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+{
+    let mu = step.get_main_evaluation_element(0, cols::MU).clone();
+    let read2 = step.get_main_evaluation_element(0, cols::READ2).clone();
+    let read4 = step.get_main_evaluation_element(0, cols::READ4).clone();
+    let read8 = step.get_main_evaluation_element(0, cols::READ8).clone();
+    mu - read2 - read4 - read8
+}
+
+// =========================================================================
+// Constraints
+// =========================================================================
+
+/// LOAD table constraint kinds.
+#[derive(Debug, Clone, Copy)]
+pub enum LoadConstraintKind {
+    /// (read2 + read4 + read8) => μ: if reading 2+ bytes, row must be active
+    ReadImpliesMu,
+    /// Extension constraint for res[i] when not reading those bytes
+    /// !read8 => res[i] = signed * sign_bit * 255 for i in 4..8
+    ExtensionHigh(usize),
+    /// !read4 && !read8 => res[i] = signed * sign_bit * 255 for i in 2..4
+    ExtensionMid(usize),
+    /// !read2 && !read4 && !read8 => res[1] = signed * sign_bit * 255
+    ExtensionLow,
+}
+
+/// LOAD table constraint.
+pub struct LoadConstraint {
+    constraint_idx: usize,
+    kind: LoadConstraintKind,
+}
+
+impl LoadConstraint {
+    pub fn new(kind: LoadConstraintKind, constraint_idx: usize) -> Self {
+        Self {
+            constraint_idx,
+            kind,
+        }
+    }
+
+    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        let one = FieldElement::<F>::one();
+        let ff = FieldElement::<F>::from(255u64); // 0xFF for sign extension
+
+        let mu = step.get_main_evaluation_element(0, cols::MU).clone();
+        let read2 = step.get_main_evaluation_element(0, cols::READ2).clone();
+        let read4 = step.get_main_evaluation_element(0, cols::READ4).clone();
+        let read8 = step.get_main_evaluation_element(0, cols::READ8).clone();
+        let signed = step.get_main_evaluation_element(0, cols::SIGNED).clone();
+        let sign_bit = step.get_main_evaluation_element(0, cols::SIGN_BIT).clone();
+
+        match self.kind {
+            LoadConstraintKind::ReadImpliesMu => {
+                // (read2 + read4 + read8) * (1 - μ) = 0
+                let read_sum = &read2 + &read4 + &read8;
+                &read_sum * (&one - &mu)
+            }
+            LoadConstraintKind::ExtensionHigh(i) => {
+                // (1 - read8) * (res[i] - signed * sign_bit * 255) = 0
+                // i should be in 4..8
+                let res_i = step.get_main_evaluation_element(0, cols::RES[i]).clone();
+                let expected = &signed * &sign_bit * &ff;
+                (&one - &read8) * (&res_i - &expected)
+            }
+            LoadConstraintKind::ExtensionMid(i) => {
+                // (1 - read4 - read8) * (res[i] - signed * sign_bit * 255) = 0
+                // i should be in 2..4
+                let res_i = step.get_main_evaluation_element(0, cols::RES[i]).clone();
+                let expected = &signed * &sign_bit * &ff;
+                (&one - &read4 - &read8) * (&res_i - &expected)
+            }
+            LoadConstraintKind::ExtensionLow => {
+                // (1 - read2 - read4 - read8) * (res[1] - signed * sign_bit * 255) = 0
+                let res_1 = step.get_main_evaluation_element(0, cols::RES[1]).clone();
+                let expected = &signed * &sign_bit * &ff;
+                (&one - &read2 - &read4 - &read8) * (&res_1 - &expected)
+            }
+        }
+    }
+}
+
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for LoadConstraint {
+    fn degree(&self) -> usize {
+        match self.kind {
+            LoadConstraintKind::ReadImpliesMu => 2,
+            // Extension constraints: (1 - readX) * (res[i] - signed * sign_bit * 255)
+            // = degree 1 * (degree 1 - degree 2) = degree 3
+            LoadConstraintKind::ExtensionHigh(_) => 3,
+            LoadConstraintKind::ExtensionMid(_) => 3,
+            LoadConstraintKind::ExtensionLow => 3,
+        }
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    fn end_exemptions(&self) -> usize {
+        0
+    }
+
+    fn evaluate(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
+    ) {
+        match evaluation_context {
+            TransitionEvaluationContext::Prover {
+                frame,
+                periodic_values: _,
+                rap_challenges: _,
+            } => {
+                let constraint_value = self.compute(frame.get_evaluation_step(0));
+                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
+            }
+            TransitionEvaluationContext::Verifier {
+                frame,
+                periodic_values: _,
+                rap_challenges: _,
+            } => {
+                let constraint_value = self.compute(frame.get_evaluation_step(0));
+                transition_evaluations[self.constraint_idx] = constraint_value;
+            }
+        }
+    }
+}
+
+/// Creates all constraints for the LOAD table.
+pub fn constraints() -> Vec<Box<dyn TransitionConstraint<GoldilocksField, GoldilocksExtension>>> {
+    let mut constraints: Vec<Box<dyn TransitionConstraint<GoldilocksField, GoldilocksExtension>>> =
+        Vec::new();
+
+    let mut idx = 0;
+
+    // (read2 + read4 + read8) => μ
+    constraints.push(Box::new(LoadConstraint::new(
+        LoadConstraintKind::ReadImpliesMu,
+        idx,
+    )));
+    idx += 1;
+
+    // Extension constraints for high bytes (4..8): !read8 => res[i] = extended
+    for i in 4..8 {
+        constraints.push(Box::new(LoadConstraint::new(
+            LoadConstraintKind::ExtensionHigh(i),
+            idx,
+        )));
+        idx += 1;
+    }
+
+    // Extension constraints for mid bytes (2..4): !(read4 + read8) => res[i] = extended
+    for i in 2..4 {
+        constraints.push(Box::new(LoadConstraint::new(
+            LoadConstraintKind::ExtensionMid(i),
+            idx,
+        )));
+        idx += 1;
+    }
+
+    // Extension constraint for low byte (1): !(read2 + read4 + read8) => res[1] = extended
+    constraints.push(Box::new(LoadConstraint::new(
+        LoadConstraintKind::ExtensionLow,
+        idx,
+    )));
+
+    constraints
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_load_trace_generation() {
+        // Load 4 bytes, sign-extend
+        let ops = vec![
+            LoadOperation::new(
+                0x1000,
+                100,
+                4,
+                true,
+                [0x12, 0x34, 0x56, 0x78, 0xFF, 0xFF, 0xFF, 0xFF],
+            ),
+            LoadOperation::new(
+                0x2000,
+                200,
+                1,
+                false,
+                [0x42, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+            ),
+        ];
+
+        let trace = generate_load_trace(&ops);
+        assert_eq!(trace.num_cols(), cols::NUM_COLUMNS);
+        assert!(trace.num_rows() >= 2);
+    }
+
+    #[test]
+    fn test_read_flags() {
+        let op1 = LoadOperation::new(0, 0, 1, false, [0; 8]);
+        assert_eq!(op1.read_flags(), (false, false, false));
+
+        let op2 = LoadOperation::new(0, 0, 2, false, [0; 8]);
+        assert_eq!(op2.read_flags(), (true, false, false));
+
+        let op4 = LoadOperation::new(0, 0, 4, false, [0; 8]);
+        assert_eq!(op4.read_flags(), (true, true, false));
+
+        let op8 = LoadOperation::new(0, 0, 8, false, [0; 8]);
+        assert_eq!(op8.read_flags(), (true, true, true));
+    }
+
+    #[test]
+    fn test_sign_bit_extraction() {
+        // Byte with MSB set
+        let op1 = LoadOperation::new(0, 0, 1, true, [0x80, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(op1.compute_sign_bit());
+
+        // Byte without MSB set
+        let op2 = LoadOperation::new(0, 0, 1, true, [0x7F, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(!op2.compute_sign_bit());
+
+        // Halfword with MSB set
+        let op3 = LoadOperation::new(0, 0, 2, true, [0x00, 0x80, 0, 0, 0, 0, 0, 0]);
+        assert!(op3.compute_sign_bit());
+
+        // Word with MSB set
+        let op4 = LoadOperation::new(0, 0, 4, true, [0, 0, 0, 0x80, 0, 0, 0, 0]);
+        assert!(op4.compute_sign_bit());
+    }
+}

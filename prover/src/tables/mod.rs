@@ -12,7 +12,7 @@
 //! - **CPU**: Main execution table
 //! - **DECODE**: Instruction decode table (dummy - spec not available)
 //!
-//! ## Deferred (Phase 5)
+//! ## Memory Tables
 //!
 //! - **MEMW**: Memory word read/write table
 //! - **LOAD**: Memory load with extension table
@@ -21,18 +21,9 @@ pub mod types;
 
 pub mod bitwise;
 pub mod cpu;
+pub mod load;
 pub mod lt;
+pub mod memw;
 pub mod trace_builder;
-
-// pub mod branch;
-// pub mod mul;
-// pub mod shift;
-
-// Phase 3 (to be added)
-// pub mod decode;
-
-// Phase 5 - Deferred (to be added)
-// pub mod memw;
-// pub mod load;
 
 pub use types::BusId;
