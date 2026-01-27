@@ -33,6 +33,8 @@ The #halt chip:
 + makes sure register `x10` (containing the exit code) equals $0$ (@halt:c:read_zero_exit_code),
 + writes $0$ to all other registers (@halt:c:zeroize_registers_lo/@halt:c:zeroize_registers_hi), and
 + sets `pc` equal to $1$ (@halt:c:pc).
+Note that the writes performed by all these interactions are accompanied by the timestamp $2^64-1$; the maximum timestamp.
+This prevents any other operation involving memory from being executed hereafter.
 #render_constraint_table(chip, config, groups: "all")
 
 === Lookup

@@ -17,18 +17,18 @@ name = "all"
 [[constraints.all]]
 kind = "interaction"
 tag = "MEMW"
-input = [1, 10, 0, ["-", ["^", 2, 64], 1], 1, 0, 0]
-output = 0
-multiplicity = 1
-ref = "halt:c:read_zero_exit_code"
-
-[[constraints.all]]
-kind = "interaction"
-tag = "MEMW"
 input = [1, "i", 0, ["-", ["^", 2, 64], 1], 1, 0, 0]
 iter = ["i", 1, 9]
 multiplicity = 1
 ref = "halt:c:zeroize_registers_lo"
+
+[[constraints.all]]
+kind = "interaction"
+tag = "MEMW"
+input = [1, 10, 0, ["-", ["^", 2, 64], 1], 1, 0, 0]
+output = 0
+multiplicity = 1
+ref = "halt:c:read_zero_exit_code"
 
 [[constraints.all]]
 kind = "interaction"
