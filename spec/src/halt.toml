@@ -1,37 +1,18 @@
 name = "HALT"
 
 [[variables.input]]
-name = "pc"
-type = "DWordWL"
-desc = "program counter containing the HALT call."
-
-[[variables.input]]
 name = "timestamp"
 type = "DWordWL"
 desc = "timestamp at which to halt the program"
 
-[[variables.input]]
-name = "rv2"
-type = "DWordWL"
-desc = "value of register two at the point of calling HALT."
-
-[[constraint_groups]]
-name = "all"
-
-
-[[assumptions]]
-desc = "`IS_WORD[pc[i]]`"
-iter = ["i", 0, 1]
 
 [[assumptions]]
 desc = "`IS_WORD[timestamp[i]]`"
 iter = ["i", 0, 1]
 
-[[assumptions]]
-desc = "`IS_WORD[rv2[i]]`"
-iter = ["i", 0, 1]
 
-
+[[constraint_groups]]
+name = "all"
 
 [[constraints.all]]
 kind = "interaction"
@@ -70,7 +51,6 @@ name = "lookup"
 [[constraints.lookup]]
 kind = "interaction"
 tag = "ECALL"
-input = [93, "pc", "timestamp", "rv2"]
-output = 0
+input = ["timestamp", 93]
 multiplicity = ["-", 1]
 ref = "halt:c:lookup"
