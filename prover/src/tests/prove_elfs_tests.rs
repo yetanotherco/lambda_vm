@@ -828,3 +828,44 @@ fn test_prove_elfs_sign_ext_edge_cases_8() {
         "sign_ext_edge_cases_8 failed - arg2 sign extension may be broken"
     );
 }
+
+// =============================================================================
+// Segmented proving tests
+// =============================================================================
+
+/// Test segmented proving: split a long trace into smaller segments and prove each.
+///
+/// This test uses loop_128.elf (128 instructions) and splits it into 2 segments
+/// of 64 rows each. Each segment is proven independently.
+#[test]
+fn test_prove_elfs_segmented_loop_128() {
+    use crate::segment::split_into_segments;
+
+    let (logs, instructions) = run_asm_elf("loop_128");
+    assert_eq!(logs.len(), 128, "loop_128.elf should have 128 instructions");
+
+    let segments = split_into_segments(&logs, 64).expect("Failed to split into segments");
+    assert_eq!(segments.len(), 2, "Expected 2 segments of 64 each");
+
+    for (i, segment_logs) in segments.iter().enumerate() {
+        assert_eq!(segment_logs.len(), 64);
+
+        let mut cpu_trace = Traces::from_logs(segment_logs, instructions.clone())
+            .expect("Failed to generate traces")
+            .cpu;
+
+        let lt_lookups = collect_lt_lookups_from_logs(segment_logs, &instructions);
+        let mut lt_trace = generate_lt_trace(&lt_lookups);
+        let mut bitwise_lookups = collect_bitwise_lookups(segment_logs, &instructions);
+        bitwise_lookups.extend(collect_bitwise_lookups_from_lt(&lt_lookups));
+        let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
+
+        assert!(
+            prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+            "Segment {} verification failed",
+            i
+        );
+
+        println!("Segment {} verified: {} rows", i, segment_logs.len());
+    }
+}
