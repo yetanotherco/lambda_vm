@@ -43,7 +43,7 @@ use stark::config::{BatchedMerkleTree, Commitment};
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::proof::options::ProofOptions;
 use stark::prover::evaluate_polynomial_on_lde_domain;
-use stark::trace::{columns2rows, TraceTable};
+use stark::trace::{TraceTable, columns2rows};
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 

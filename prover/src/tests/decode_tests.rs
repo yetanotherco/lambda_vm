@@ -197,7 +197,11 @@ fn test_packed_decode_combined() {
     let packed = entry.packed_decode();
 
     // Verify flags per spec: write_register at bit 0, op_add at bit 9
-    assert_eq!(packed & (1 << 0), 1 << 0, "write_register should be set at bit 0");
+    assert_eq!(
+        packed & (1 << 0),
+        1 << 0,
+        "write_register should be set at bit 0"
+    );
     assert_eq!(packed & (1 << 9), 1 << 9, "op_add should be set at bit 9");
 
     // Verify registers per spec: rs1 at bits 25-32, rs2 at bits 33-40, rd at bits 41-48

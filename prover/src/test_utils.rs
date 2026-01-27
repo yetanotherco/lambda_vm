@@ -34,9 +34,9 @@ use crate::tables::decode::{
     DecodeEntry, NUM_PRECOMPUTED_COLS as DECODE_NUM_PRECOMPUTED_COLS,
     bus_interactions as decode_bus_interactions, cols as decode_cols,
 };
-use stark::config::Commitment;
 use crate::tables::lt::{LtOperation, bus_interactions as lt_bus_interactions, cols as lt_cols};
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
+use stark::config::Commitment;
 
 pub type F = GoldilocksField;
 pub type E = GoldilocksExtension;
