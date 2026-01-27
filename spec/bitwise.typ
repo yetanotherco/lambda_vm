@@ -13,9 +13,7 @@
 
 #let bitwise = raw(chip.name)
 
-#show: book-page.with(title: "BRANCH chip")
-
-= #bitwise chip
+#show: book-page(chip.name)
 
 == Columns
 #let nr_variables = total_nr_variables(chip)

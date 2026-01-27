@@ -85,8 +85,11 @@
 ///   - Hint: use `""` to generate an empty description.
 /// - authors (array | str): The author(s) of the page.
 /// - kind (str): The kind of the page.
+/// - cond (function): A predicate that can be used inside of `context`
+///                    to check whether display rules should be applied.
+///                    Useful for including other chapters invisibly to figure out information about their labels
 /// - plain-body (content): The plain body of the page.
-#let project(title: "Typst Book", description: auto, authors: (), kind: "page", plain-body) = {
+#let project(title: "Typst Book", description: auto, authors: (), kind: "page", cond: none, plain-body) = {
   // set basic document metadata
   set document(
     author: authors,
@@ -137,23 +140,28 @@
     lang: "en",
   )
 
-  // markup setting
-  show: markup-rules.with(
-    ..common,
-    themes: themes,
-    heading-sizes: heading-sizes,
-    list-indent: list-indent,
-    main-size: main-size,
-  )
-  // math setting
-  show: equation-rules.with(..common, theme-box: theme-box)
-  // code block setting
-  show: code-block-rules.with(..common, themes: themes, code-font: code-font)
+  context if cond() {
+    // markup setting
+    show: markup-rules.with(
+      ..common,
+      themes: themes,
+      heading-sizes: heading-sizes,
+      list-indent: list-indent,
+      main-size: main-size,
+    )
 
-  // Main body.
-  set par(justify: true)
+    // math setting
+    show: equation-rules.with(..common, theme-box: theme-box)
+    // code block setting
+    show: code-block-rules.with(..common, themes: themes, code-font: code-font)
 
-  plain-body
+    // Main body.
+    set par(justify: true)
+
+    plain-body
+  } else {
+    plain-body
+  }
 }
 
 #let part-style = heading

@@ -567,7 +567,7 @@ ref = "cpu:c:sub"
 [[constraints.alu]]
 kind = "interaction"
 tag = "LT"
-input = [["cast", "arg1", "DWordHHW"], ["cast", "arg2", "DWordHHW"], "signed"]
+input = [["cast", "arg1", "DWordWL"], ["cast", "arg2", "DWordWL"], "signed"]
 output = ["idx", "res", 0]
 multiplicity = ["+", "SLT", "BLT"]
 
@@ -705,12 +705,10 @@ desc = "We treat `EBREAK` as an unprovable trap"
 poly = ["not", "EBREAK"]
 ref = "cpu:c:ebreak_traps"
 
-# TODO: no types available, so no casting yet
 [[constraints.sys]]
 kind = "interaction"
 tag = "ECALL"
-input = ["rv1", "pc", "timestamp", "rv2"]
-output = "rvd"
+input = ["timestamp", ["cast", "rv1", "DWordWL"]]
 multiplicity = "ECALL"
 
 
