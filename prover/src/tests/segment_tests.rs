@@ -5,61 +5,13 @@
 //! - Splitting logs into segments
 //! - Independent proving of each segment
 
-use crypto::fiat_shamir::default_transcript::DefaultTranscript;
-
-use stark::proof::options::ProofOptions;
-use stark::prover::{IsStarkProver, Prover};
-use stark::traits::AIR;
-use stark::verifier::{IsStarkVerifier, Verifier};
-
 use crate::segment::{split_into_segments, SegmentError};
 use crate::tables::lt::generate_lt_trace;
 use crate::tables::trace_builder::Traces;
-use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 use crate::test_utils::{
     collect_bitwise_lookups_from_logs, collect_bitwise_lookups_from_lt, collect_lt_lookups_from_logs,
-    create_bitwise_air, create_cpu_air, create_lt_air, generate_minimal_bitwise_trace, run_asm_elf,
+    generate_minimal_bitwise_trace, prove_and_verify_vm_minimal, run_asm_elf,
 };
-
-type F = GoldilocksField;
-type E = GoldilocksExtension;
-
-/// Run multi_prove and multi_verify for all VM tables with MINIMAL bitwise.
-fn prove_and_verify_vm_minimal(
-    cpu_trace: &mut stark::trace::TraceTable<F, E>,
-    bitwise_trace: &mut stark::trace::TraceTable<F, E>,
-    lt_trace: &mut stark::trace::TraceTable<F, E>,
-) -> bool {
-    let proof_options = ProofOptions::default_test_options();
-
-    let cpu_air = create_cpu_air(&proof_options);
-    let bitwise_air = create_bitwise_air(&proof_options);
-    let lt_air = create_lt_air(&proof_options);
-
-    let air_trace_pairs: Vec<(
-        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
-        _,
-        _,
-    )> = vec![
-        (&cpu_air, cpu_trace, &()),
-        (&bitwise_air, bitwise_trace, &()),
-        (&lt_air, lt_trace, &()),
-    ];
-
-    let multi_proof =
-        match Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])) {
-            Ok(proof) => proof,
-            Err(e) => {
-                eprintln!("Prover error: {:?}", e);
-                return false;
-            }
-        };
-
-    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
-        vec![&cpu_air, &bitwise_air, &lt_air];
-
-    Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[]))
-}
 
 // =============================================================================
 // Validation tests

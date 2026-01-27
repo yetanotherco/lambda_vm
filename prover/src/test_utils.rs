@@ -386,3 +386,51 @@ pub fn create_lt_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
 }
+
+// =============================================================================
+// Prover Helpers
+// =============================================================================
+
+/// Run multi_prove and multi_verify for all VM tables with MINIMAL bitwise.
+///
+/// Used for fast tests where the bitwise table is a dummy that only contains
+/// the rows needed to balance the bus. NOT the full preprocessed table.
+///
+/// **WARNING: FOR TESTING ONLY - NOT PRODUCTION SAFE!**
+pub fn prove_and_verify_vm_minimal(
+    cpu_trace: &mut TraceTable<F, E>,
+    bitwise_trace: &mut TraceTable<F, E>,
+    lt_trace: &mut TraceTable<F, E>,
+) -> bool {
+    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+    use stark::prover::{IsStarkProver, Prover};
+    use stark::traits::AIR;
+    use stark::verifier::{IsStarkVerifier, Verifier};
+
+    let proof_options = ProofOptions::default_test_options();
+
+    let cpu_air = create_cpu_air(&proof_options);
+    let bitwise_air = create_bitwise_air(&proof_options);
+    let lt_air = create_lt_air(&proof_options);
+
+    let air_trace_pairs: Vec<(&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>, _, _)> =
+        vec![
+            (&cpu_air, cpu_trace, &()),
+            (&bitwise_air, bitwise_trace, &()),
+            (&lt_air, lt_trace, &()),
+        ];
+
+    let multi_proof =
+        match Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])) {
+            Ok(proof) => proof,
+            Err(e) => {
+                eprintln!("Prover error: {:?}", e);
+                return false;
+            }
+        };
+
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        vec![&cpu_air, &bitwise_air, &lt_air];
+
+    Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[]))
+}
