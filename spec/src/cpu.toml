@@ -708,7 +708,7 @@ ref = "cpu:c:ebreak_traps"
 [[constraints.sys]]
 kind = "interaction"
 tag = "ECALL"
-input = ["timestamp", "rv1"]
+input = ["timestamp", ["cast", "rv1", "DWordWL"]]
 multiplicity = "ECALL"
 
 
