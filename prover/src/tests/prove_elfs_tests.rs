@@ -19,17 +19,24 @@ use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData};
 use stark::proof::options::ProofOptions;
 use stark::prover::{IsStarkProver, Prover};
+use stark::trace::TraceTable;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
 use crate::tables::bitwise::{generate_bitwise_trace, update_multiplicities};
 use crate::tables::lt::generate_lt_trace;
 use crate::tables::trace_builder::Traces;
+use crate::tables::types::{GoldilocksExtension, GoldilocksField};
+
+// Import shared utilities
 use crate::test_utils::{
-    E, F, collect_bitwise_lookups_from_logs, collect_bitwise_lookups_from_lt,
+    collect_bitwise_lookups_from_logs, collect_bitwise_lookups_from_lt,
     collect_lt_lookups_from_logs, create_bitwise_air, create_cpu_air, create_lt_air,
     generate_minimal_bitwise_trace, run_asm_elf,
 };
+
+type F = GoldilocksField;
+type E = GoldilocksExtension;
 
 /// Alias for compatibility with existing test code.
 fn collect_bitwise_lookups(
@@ -41,6 +48,8 @@ fn collect_bitwise_lookups(
     collect_bitwise_lookups_from_logs(logs, instructions)
 }
 
+// AIR creation helpers and lookup collection functions are now in test_utils module
+
 // =============================================================================
 // Prover test helpers
 // =============================================================================
@@ -50,9 +59,9 @@ fn collect_bitwise_lookups(
 /// Uses the FULL 2^20 row bitwise table with preprocessed commitment.
 /// Returns true if verification succeeds.
 fn prove_and_verify_vm(
-    cpu_trace: &mut stark::trace::TraceTable<F, E>,
-    bitwise_trace: &mut stark::trace::TraceTable<F, E>,
-    lt_trace: &mut stark::trace::TraceTable<F, E>,
+    cpu_trace: &mut TraceTable<F, E>,
+    bitwise_trace: &mut TraceTable<F, E>,
+    lt_trace: &mut TraceTable<F, E>,
 ) -> bool {
     let proof_options = ProofOptions::default_test_options();
 
@@ -89,12 +98,10 @@ fn prove_and_verify_vm(
 ///
 /// Used for fast tests where the bitwise table is a dummy that only contains
 /// the rows needed to balance the bus. NOT the full preprocessed table.
-///
-/// **WARNING: FOR TESTING ONLY - NOT PRODUCTION SAFE!**
 fn prove_and_verify_vm_minimal(
-    cpu_trace: &mut stark::trace::TraceTable<F, E>,
-    bitwise_trace: &mut stark::trace::TraceTable<F, E>,
-    lt_trace: &mut stark::trace::TraceTable<F, E>,
+    cpu_trace: &mut TraceTable<F, E>,
+    bitwise_trace: &mut TraceTable<F, E>,
+    lt_trace: &mut TraceTable<F, E>,
 ) -> bool {
     let proof_options = ProofOptions::default_test_options();
 
@@ -112,9 +119,16 @@ fn prove_and_verify_vm_minimal(
         (&lt_air, lt_trace, &()),
     ];
 
+    eprintln!("DEBUG: Proving {} tables...", air_trace_pairs.len());
     let multi_proof =
         match Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])) {
-            Ok(proof) => proof,
+            Ok(proof) => {
+                eprintln!(
+                    "DEBUG: Prover succeeded, {} proofs generated",
+                    proof.proofs.len()
+                );
+                proof
+            }
             Err(e) => {
                 eprintln!("Prover error: {:?}", e);
                 return false;
@@ -124,7 +138,10 @@ fn prove_and_verify_vm_minimal(
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &bitwise_air, &lt_air];
 
-    Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[]))
+    eprintln!("DEBUG: Verifying {} AIRs...", airs.len());
+    let result = Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[]));
+    eprintln!("DEBUG: Verification result: {}", result);
+    result
 }
 
 // =============================================================================
