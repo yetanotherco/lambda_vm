@@ -21,7 +21,6 @@
     ("dvrm.typ", [DVRM chip], <dvrm>),
     ("load.typ", [LOAD chip], <load>),
     ("ecall.typ", [ECALL chips], <ecall>),
-    ("halt.typ", [HALT chip], <halt>),
     ("bitwise.typ", [BITWISE chips], <bitwise>),
   )
 )
