@@ -12,7 +12,7 @@ main:
 	addi	t0, zero, 40		# 1: counter = 40
 	addi	t1, zero, 0		# 2: accumulator = 0
 	addi	t2, zero, 1		# 3: increment = 1
-	addi	t3, zero, 0		# 4: temp
+	addi	zero, zero, 0		# 4: NOP (padding)
 
 loop:
 	# === Loop body: 3 instructions per iteration, 40 iterations = 120 instructions ===
