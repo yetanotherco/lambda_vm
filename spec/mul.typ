@@ -12,11 +12,9 @@
 #let config = load_config()
 #let chip = load_chip("src/mul.toml", config)
 
-#show: book-page.with(title: "MUL chip")
+#show: book-page(chip.name)
 
 #let mul = raw(chip.name)
-
-= #mul chip
 
 == Columns
 #let nr_variables = total_nr_variables(chip)

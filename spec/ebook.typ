@@ -1,12 +1,19 @@
-#import "@preview/shiroa:0.3.1": *
-#import "/book.typ": style
+#import "/book.typ": style, meta
 
-#import "/templates/ebook.typ"
+#set document(author: meta.authors, title: meta.title)
 
-#show: ebook.project.with(title: "typst-book", spec: "book.typ")
 #style.update((
   foreground: black,
 ))
 
-// set a resolver for inclusion
-#ebook.resolve-inclusion(it => include it)
+#align(center, title(meta.title))
+#pagebreak(weak: true)
+#outline()
+
+#show heading: set heading(numbering: "1.1")
+
+#meta.summary.map(((ch, title, ref)) => [
+  #pagebreak(weak: true)
+  #heading(supplement: [Chapter], level: 1, title)#ref
+  #include ch
+]).join()

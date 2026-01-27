@@ -12,6 +12,6 @@
 #let config = load_config()
 // #let chip = load_chip("src/dvrm.toml", config)
 
-#show: book-page.with(title: "DVRM chip")
+#show: book-page("dvrm.typ")
 
 *placeholder chapter: WIP*

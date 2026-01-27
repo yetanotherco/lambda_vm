@@ -11,7 +11,7 @@
 
 #let config = load_config()
 
-#show: book-page.with(title: "ECALL chips")
+#show: book-page("ecall.typ")
 
 *placeholder chapter: WIP*
 
