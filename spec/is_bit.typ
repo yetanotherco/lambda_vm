@@ -2,10 +2,10 @@
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": render_chip_column_table, render_constraint_table
 
-#show: book-page.with(title: "IS_BIT template")
-
 #let config = load_config()
 #let chip = load_chip("src/is_bit.toml", config)
+
+#show: book-page(chip.name)
 
 #let is_bit = raw(chip.name)
 
@@ -18,7 +18,6 @@
     raw(code))
 }
 
-= #is_bit template
 #is_bit is a constraint template that is used to assert that a variable lies in the range ${0, 1}$ if some second variable is non-zero.
 Barring exceptional cases, this template is used to assert that a variable of type `Bit` assumes a valid value under some condition.
 

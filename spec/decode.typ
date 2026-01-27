@@ -1,4 +1,4 @@
-#import "/book.typ": book-page, rj
+#import "/book.typ": book-page, rj, xref
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   render_chip_assumptions,
@@ -11,11 +11,10 @@
 
 #let config = load_config()
 #let chip = load_chip("src/decode.toml", config)
-#show: book-page.with(title: "DECODE chip")
+#show: book-page(chip.name)
 
 #let decode = raw(chip.name)
 
-= #decode table
 All `RV64IMC` instruction are to be decoded to a format that can be interpreted by the VM.
 This section outlines the decoding table being used in the VM.
 For reasons of efficiency, data in this table is significantly compressed.
