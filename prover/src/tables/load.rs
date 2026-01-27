@@ -199,6 +199,7 @@ pub fn generate_load_trace(
 /// - **Receives** LOAD lookups from CPU
 /// - **Sends** MEMW lookups to read memory
 /// - **Sends** MSB8 lookups for sign bit extraction
+#[allow(clippy::vec_init_then_push)]
 pub fn bus_interactions() -> Vec<BusInteraction> {
     let mut interactions = Vec::new();
 

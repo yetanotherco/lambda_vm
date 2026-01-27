@@ -153,8 +153,8 @@ impl Traces {
 
                     // Extract individual bytes from loaded value
                     let mut value_bytes = [0u64; 8];
-                    for j in 0..byte_count {
-                        value_bytes[j] = (loaded_value >> (j * 8)) & 0xFF;
+                    for (j, byte) in value_bytes.iter_mut().take(byte_count).enumerate() {
+                        *byte = (loaded_value >> (j * 8)) & 0xFF;
                     }
 
                     // Sign/zero extend the upper bytes for LOAD result
@@ -163,8 +163,8 @@ impl Traces {
                         let msb = value_bytes[byte_count - 1];
                         let sign_bit = (msb >> 7) & 1;
                         let fill = if signed && sign_bit == 1 { 0xFF } else { 0 };
-                        for j in byte_count..8 {
-                            res_bytes[j] = fill;
+                        for byte in res_bytes.iter_mut().skip(byte_count) {
+                            *byte = fill;
                         }
                     }
 
@@ -204,8 +204,8 @@ impl Traces {
 
                     // Extract individual bytes from store value
                     let mut value_bytes = [0u64; 8];
-                    for j in 0..byte_count {
-                        value_bytes[j] = (store_value >> (j * 8)) & 0xFF;
+                    for (j, byte) in value_bytes.iter_mut().take(byte_count).enumerate() {
+                        *byte = (store_value >> (j * 8)) & 0xFF;
                     }
 
                     // Create MEMW operation (write)
