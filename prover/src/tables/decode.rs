@@ -559,12 +559,9 @@ impl DecodeEntry {
                 entry.memory_2bytes = true;
             }
             LoadStoreWidth::Word | LoadStoreWidth::WordUnsigned => {
-                entry.memory_2bytes = true;
                 entry.memory_4bytes = true;
             }
             LoadStoreWidth::DoubleWord => {
-                entry.memory_2bytes = true;
-                entry.memory_4bytes = true;
                 entry.memory_8bytes = true;
             }
         }
