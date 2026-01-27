@@ -1118,36 +1118,120 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             // packed_decode as Linear (virtual column - computed from individual flags)
             BusValue::Linear(vec![
                 // Control flags (bits 0-8)
-                LinearTerm::Column { coefficient: 1 << 0, column: cols::WRITE_REGISTER },
-                LinearTerm::Column { coefficient: 1 << 1, column: cols::MEMORY_2BYTES },
-                LinearTerm::Column { coefficient: 1 << 2, column: cols::MEMORY_4BYTES },
-                LinearTerm::Column { coefficient: 1 << 3, column: cols::MEMORY_8BYTES },
-                LinearTerm::Column { coefficient: 1 << 4, column: cols::C_TYPE_INSTRUCTION },
-                LinearTerm::Column { coefficient: 1 << 5, column: cols::SIGNED },
-                LinearTerm::Column { coefficient: 1 << 6, column: cols::MP_SELECTOR },
-                LinearTerm::Column { coefficient: 1 << 7, column: cols::MULDIV_SELECTOR },
-                LinearTerm::Column { coefficient: 1 << 8, column: cols::WORD_INSTR },
+                LinearTerm::Column {
+                    coefficient: 1 << 0,
+                    column: cols::WRITE_REGISTER,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << 1,
+                    column: cols::MEMORY_2BYTES,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << 2,
+                    column: cols::MEMORY_4BYTES,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << 3,
+                    column: cols::MEMORY_8BYTES,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << 4,
+                    column: cols::C_TYPE_INSTRUCTION,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << 5,
+                    column: cols::SIGNED,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << 6,
+                    column: cols::MP_SELECTOR,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << 7,
+                    column: cols::MULDIV_SELECTOR,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << 8,
+                    column: cols::WORD_INSTR,
+                },
                 // ALU flags (bits 9-24)
-                LinearTerm::Column { coefficient: 1 << 9, column: cols::ADD },
-                LinearTerm::Column { coefficient: 1 << 10, column: cols::SUB },
-                LinearTerm::Column { coefficient: 1 << 11, column: cols::SLT },
-                LinearTerm::Column { coefficient: 1 << 12, column: cols::AND },
-                LinearTerm::Column { coefficient: 1 << 13, column: cols::OR },
-                LinearTerm::Column { coefficient: 1 << 14, column: cols::XOR },
-                LinearTerm::Column { coefficient: 1 << 15, column: cols::SHIFT },
-                LinearTerm::Column { coefficient: 1 << 16, column: cols::JALR },
-                LinearTerm::Column { coefficient: 1 << 17, column: cols::BEQ },
-                LinearTerm::Column { coefficient: 1 << 18, column: cols::BLT },
-                LinearTerm::Column { coefficient: 1 << 19, column: cols::LOAD },
-                LinearTerm::Column { coefficient: 1 << 20, column: cols::STORE },
-                LinearTerm::Column { coefficient: 1 << 21, column: cols::MUL },
-                LinearTerm::Column { coefficient: 1 << 22, column: cols::DIVREM },
-                LinearTerm::Column { coefficient: 1 << 23, column: cols::ECALL },
-                LinearTerm::Column { coefficient: 1 << 24, column: cols::EBREAK },
+                LinearTerm::Column {
+                    coefficient: 1 << 9,
+                    column: cols::ADD,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << 10,
+                    column: cols::SUB,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << 11,
+                    column: cols::SLT,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << 12,
+                    column: cols::AND,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << 13,
+                    column: cols::OR,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << 14,
+                    column: cols::XOR,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << 15,
+                    column: cols::SHIFT,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << 16,
+                    column: cols::JALR,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << 17,
+                    column: cols::BEQ,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << 18,
+                    column: cols::BLT,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << 19,
+                    column: cols::LOAD,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << 20,
+                    column: cols::STORE,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << 21,
+                    column: cols::MUL,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << 22,
+                    column: cols::DIVREM,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << 23,
+                    column: cols::ECALL,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << 24,
+                    column: cols::EBREAK,
+                },
                 // Register indices (bits 25-48)
-                LinearTerm::Column { coefficient: 1 << 25, column: cols::RS1 },
-                LinearTerm::Column { coefficient: 1 << 33, column: cols::RS2 },
-                LinearTerm::Column { coefficient: 1 << 41, column: cols::RD },
+                LinearTerm::Column {
+                    coefficient: 1 << 25,
+                    column: cols::RS1,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << 33,
+                    column: cols::RS2,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << 41,
+                    column: cols::RD,
+                },
             ]),
         ],
     ));
