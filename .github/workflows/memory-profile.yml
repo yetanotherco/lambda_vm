@@ -11,7 +11,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-action@stable
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -34,22 +34,26 @@ jobs:
         run: |
           cargo test -p prover --release --features dhat-heap \
             test_dhat_memory_profile -- --ignored --nocapture 2>&1 | tee profile-output.txt
+          # Move dhat-heap.json to root for easier access
+          mv prover/dhat-heap.json ./dhat-heap.json
 
       - name: Extract metrics
         id: metrics
         run: |
           # Extract metrics from dhat-heap.json
-          TOTAL_BYTES=$(jq '.tgmax_bytes' dhat-heap.json)
-          TOTAL_BLOCKS=$(jq '.tgmax_blocks' dhat-heap.json)
-          TOTAL_ALLOC=$(jq '.total_bytes' dhat-heap.json)
+          # dhat stores per-allocation-point data in .pps array
+          # tb = total bytes, gb = bytes at t-gmax (peak), gbk = blocks at t-gmax
+          PEAK_BYTES=$(jq '[.pps[].gb] | add' dhat-heap.json)
+          PEAK_BLOCKS=$(jq '[.pps[].gbk] | add' dhat-heap.json)
+          TOTAL_BYTES=$(jq '[.pps[].tb] | add' dhat-heap.json)
 
-          echo "peak_bytes=$TOTAL_BYTES" >> $GITHUB_OUTPUT
-          echo "peak_blocks=$TOTAL_BLOCKS" >> $GITHUB_OUTPUT
-          echo "total_alloc=$TOTAL_ALLOC" >> $GITHUB_OUTPUT
+          echo "peak_bytes=$PEAK_BYTES" >> $GITHUB_OUTPUT
+          echo "peak_blocks=$PEAK_BLOCKS" >> $GITHUB_OUTPUT
+          echo "total_alloc=$TOTAL_BYTES" >> $GITHUB_OUTPUT
 
           # Human readable
-          PEAK_MB=$(echo "scale=2; $TOTAL_BYTES / 1048576" | bc)
-          TOTAL_MB=$(echo "scale=2; $TOTAL_ALLOC / 1048576" | bc)
+          PEAK_MB=$(echo "scale=2; $PEAK_BYTES / 1048576" | bc)
+          TOTAL_MB=$(echo "scale=2; $TOTAL_BYTES / 1048576" | bc)
           echo "peak_mb=$PEAK_MB" >> $GITHUB_OUTPUT
           echo "total_mb=$TOTAL_MB" >> $GITHUB_OUTPUT
 
@@ -77,8 +81,8 @@ jobs:
         run: |
           if [ -f baseline/*/dhat-heap.json ]; then
             BASELINE_FILE=$(ls baseline/*/dhat-heap.json | head -1)
-            BASELINE_PEAK=$(jq '.tgmax_bytes' "$BASELINE_FILE")
-            BASELINE_TOTAL=$(jq '.total_bytes' "$BASELINE_FILE")
+            BASELINE_PEAK=$(jq '[.pps[].gb] | add' "$BASELINE_FILE")
+            BASELINE_TOTAL=$(jq '[.pps[].tb] | add' "$BASELINE_FILE")
 
             CURRENT_PEAK=${{ steps.metrics.outputs.peak_bytes }}
             CURRENT_TOTAL=${{ steps.metrics.outputs.total_alloc }}
