@@ -39,7 +39,7 @@ The #halt chip:
 The HALT chip contributes the following interaction to the lookup-argument:
 #render_constraint_table(chip, config, groups: "lookup")
 
-*Note*: $93$ is the system call number corresponding to `sys_exit`.
+*Note*: #link("https://github.com/riscv-collab/riscv-gnu-toolchain/blob/master/linux-headers/include/asm-generic/unistd.h#L258")[$93$ is the system call number corresponding to `sys_exit`.]
 
 == Padding
 This chip should only contain a single row.
