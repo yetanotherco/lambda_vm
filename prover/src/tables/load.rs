@@ -115,14 +115,17 @@ impl LoadOperation {
     /// |-------|-------|-------|-------|
     /// |   1   |   0   |   0   |   0   |
     /// |   2   |   1   |   0   |   0   |
-    /// |   4   |   1   |   1   |   0   |
-    /// |   8   |   1   |   1   |   1   |
+    /// |   4   |   0   |   1   |   0   |
+    /// |   8   |   0   |   0   |   1   |
+    ///
+    /// Note: These are "exactly N" semantics per spec, not cumulative.
+    /// Virtual column read1 = μ - read2 - read4 - read8 computes "exactly 1 byte".
     pub fn read_flags(&self) -> (bool, bool, bool) {
         match self.width {
             1 => (false, false, false),
             2 => (true, false, false),
-            4 => (true, true, false),
-            8 => (true, true, true),
+            4 => (false, true, false),
+            8 => (false, false, true),
             _ => (false, false, false),
         }
     }
@@ -392,65 +395,28 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // -------------------------------------------------------------------------
     // LOAD receiver (from CPU)
     // -------------------------------------------------------------------------
-    // CPU sends: base_address, timestamp, read2, read4, read8
-    // LOAD returns: res as DWordWL (extended result)
+    // Spec: LOAD[res::DWordWL; base_address, timestamp, read2, read4, read8] | -μ
+    //
+    // res is DWordBL (8 bytes) but packed as DWordWL (2 words) for the bus.
+    // DWordBL packing: 8 bytes → 2 bus elements [lo32, hi32]
     interactions.push(BusInteraction::receiver(
         BusId::Load,
         Multiplicity::Column(cols::MU),
         vec![
-            // res as DWordWL (2 words) - the extended result
-            // Lower 32 bits = res[0] + res[1]*256 + res[2]*256^2 + res[3]*256^3
-            // Upper 32 bits = res[4] + res[5]*256 + res[6]*256^2 + res[7]*256^3
-            // For simplicity, we pack all 8 bytes
+            // res::DWordWL - pack 8 bytes as 2 words
             BusValue::Packed {
                 start_column: cols::RES[0],
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::RES[1],
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::RES[2],
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::RES[3],
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::RES[4],
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::RES[5],
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::RES[6],
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::RES[7],
-                packing: Packing::Direct,
+                packing: Packing::DWordBL,
             },
             // base_address (DWordWL = 2 words)
             BusValue::Packed {
                 start_column: cols::BASE_ADDRESS_0,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::BASE_ADDRESS_1,
-                packing: Packing::Direct,
+                packing: Packing::DWordWL,
             },
             // timestamp (DWordWL = 2 words)
             BusValue::Packed {
                 start_column: cols::TIMESTAMP_0,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::TIMESTAMP_1,
-                packing: Packing::Direct,
+                packing: Packing::DWordWL,
             },
             // read flags
             BusValue::Packed {
@@ -684,17 +650,18 @@ mod tests {
 
     #[test]
     fn test_read_flags() {
+        // "Exactly N" semantics per spec
         let op1 = LoadOperation::new(0, 0, 1, false, [0; 8]);
-        assert_eq!(op1.read_flags(), (false, false, false));
+        assert_eq!(op1.read_flags(), (false, false, false)); // no flags for 1 byte
 
         let op2 = LoadOperation::new(0, 0, 2, false, [0; 8]);
-        assert_eq!(op2.read_flags(), (true, false, false));
+        assert_eq!(op2.read_flags(), (true, false, false)); // read2 only
 
         let op4 = LoadOperation::new(0, 0, 4, false, [0; 8]);
-        assert_eq!(op4.read_flags(), (true, true, false));
+        assert_eq!(op4.read_flags(), (false, true, false)); // read4 only
 
         let op8 = LoadOperation::new(0, 0, 8, false, [0; 8]);
-        assert_eq!(op8.read_flags(), (true, true, true));
+        assert_eq!(op8.read_flags(), (false, false, true)); // read8 only
     }
 
     #[test]

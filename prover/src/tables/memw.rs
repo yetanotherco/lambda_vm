@@ -172,14 +172,18 @@ impl MemwOperation {
     /// |-------|--------|--------|--------|
     /// |   1   |   0    |   0    |   0    |
     /// |   2   |   1    |   0    |   0    |
-    /// |   4   |   1    |   1    |   0    |
-    /// |   8   |   1    |   1    |   1    |
+    /// |   4   |   0    |   1    |   0    |
+    /// |   8   |   0    |   0    |   1    |
+    ///
+    /// Note: These are "exactly N" semantics per spec, not cumulative.
+    /// Virtual columns w2 = write2 + write4 + write8 and w4 = write4 + write8
+    /// compute "at least N" from these.
     pub fn write_flags(&self) -> (bool, bool, bool) {
         match self.width {
             1 => (false, false, false),
             2 => (true, false, false),
-            4 => (true, true, false),
-            8 => (true, true, true),
+            4 => (false, true, false),
+            8 => (false, false, true),
             _ => (false, false, false),
         }
     }
@@ -356,6 +360,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // M3: memory[is_register, address_add[0], old_timestamp[1], old[1]] with +w2
+    // address_add is DWordHL (4 halfwords), pack to 2 bus elements matching DWordWL format
     interactions.push(BusInteraction::sender(
         BusId::Memory,
         Multiplicity::Linear(vec![
@@ -379,11 +384,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             },
             BusValue::Packed {
                 start_column: cols::address_add(0)[0],
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::address_add(0)[1],
-                packing: Packing::Direct,
+                packing: Packing::DWordHL,
             },
             BusValue::Packed {
                 start_column: cols::old_timestamp(1)[0],
@@ -424,11 +425,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             },
             BusValue::Packed {
                 start_column: cols::address_add(0)[0],
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::address_add(0)[1],
-                packing: Packing::Direct,
+                packing: Packing::DWordHL,
             },
             BusValue::Packed {
                 start_column: cols::TIMESTAMP_0,
@@ -446,6 +443,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // M5-M6: For bytes 2-3 (w4 multiplicity)
+    // address_add is DWordHL (4 halfwords), pack to 2 bus elements matching DWordWL format
     for i in 2..4 {
         // Read old
         interactions.push(BusInteraction::sender(
@@ -458,11 +456,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 },
                 BusValue::Packed {
                     start_column: cols::address_add(i - 1)[0],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::address_add(i - 1)[1],
-                    packing: Packing::Direct,
+                    packing: Packing::DWordHL,
                 },
                 BusValue::Packed {
                     start_column: cols::old_timestamp(i)[0],
@@ -489,11 +483,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 },
                 BusValue::Packed {
                     start_column: cols::address_add(i - 1)[0],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::address_add(i - 1)[1],
-                    packing: Packing::Direct,
+                    packing: Packing::DWordHL,
                 },
                 BusValue::Packed {
                     start_column: cols::TIMESTAMP_0,
@@ -512,6 +502,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     }
 
     // M7-M8: For bytes 4-7 (write8 multiplicity)
+    // address_add is DWordHL (4 halfwords), pack to 2 bus elements matching DWordWL format
     for i in 4..8 {
         // Read old
         interactions.push(BusInteraction::sender(
@@ -524,11 +515,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 },
                 BusValue::Packed {
                     start_column: cols::address_add(i - 1)[0],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::address_add(i - 1)[1],
-                    packing: Packing::Direct,
+                    packing: Packing::DWordHL,
                 },
                 BusValue::Packed {
                     start_column: cols::old_timestamp(i)[0],
@@ -555,11 +542,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 },
                 BusValue::Packed {
                     start_column: cols::address_add(i - 1)[0],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::address_add(i - 1)[1],
-                    packing: Packing::Direct,
+                    packing: Packing::DWordHL,
                 },
                 BusValue::Packed {
                     start_column: cols::TIMESTAMP_0,
@@ -1130,16 +1113,17 @@ mod tests {
 
     #[test]
     fn test_write_flags() {
+        // "Exactly N" semantics per spec
         let op1 = MemwOperation::new(false, 0, [0; 8], 0, 1, false);
-        assert_eq!(op1.write_flags(), (false, false, false));
+        assert_eq!(op1.write_flags(), (false, false, false)); // no flags for 1 byte
 
         let op2 = MemwOperation::new(false, 0, [0; 8], 0, 2, false);
-        assert_eq!(op2.write_flags(), (true, false, false));
+        assert_eq!(op2.write_flags(), (true, false, false)); // write2 only
 
         let op4 = MemwOperation::new(false, 0, [0; 8], 0, 4, false);
-        assert_eq!(op4.write_flags(), (true, true, false));
+        assert_eq!(op4.write_flags(), (false, true, false)); // write4 only
 
         let op8 = MemwOperation::new(false, 0, [0; 8], 0, 8, false);
-        assert_eq!(op8.write_flags(), (true, true, true));
+        assert_eq!(op8.write_flags(), (false, false, true)); // write8 only
     }
 }
