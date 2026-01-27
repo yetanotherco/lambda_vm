@@ -9,6 +9,53 @@ use math::{
     traits::AsBytes,
 };
 
+/// A backend for Merkle trees that uses fixed-size pairs of field elements.
+/// This is more efficient than `FieldElementVectorBackend` when the batch size is always 2,
+/// as it avoids Vec allocation overhead.
+#[derive(Clone)]
+pub struct FieldElementPairBackend<F, D: Digest, const NUM_BYTES: usize> {
+    phantom1: PhantomData<F>,
+    phantom2: PhantomData<D>,
+}
+
+impl<F, D: Digest, const NUM_BYTES: usize> Default for FieldElementPairBackend<F, D, NUM_BYTES> {
+    fn default() -> Self {
+        Self {
+            phantom1: PhantomData,
+            phantom2: PhantomData,
+        }
+    }
+}
+
+impl<F, D: Digest, const NUM_BYTES: usize> IsMerkleTreeBackend
+    for FieldElementPairBackend<F, D, NUM_BYTES>
+where
+    F: IsField,
+    FieldElement<F>: AsBytes,
+    [u8; NUM_BYTES]: From<Output<D>>,
+{
+    type Node = [u8; NUM_BYTES];
+    type Data = [FieldElement<F>; 2];
+
+    fn hash_data(input: &[FieldElement<F>; 2]) -> [u8; NUM_BYTES] {
+        let mut hasher = D::new();
+        hasher.update(input[0].as_bytes());
+        hasher.update(input[1].as_bytes());
+        let mut result_hash = [0_u8; NUM_BYTES];
+        result_hash.copy_from_slice(&hasher.finalize());
+        result_hash
+    }
+
+    fn hash_new_parent(left: &[u8; NUM_BYTES], right: &[u8; NUM_BYTES]) -> [u8; NUM_BYTES] {
+        let mut hasher = D::new();
+        hasher.update(left);
+        hasher.update(right);
+        let mut result_hash = [0_u8; NUM_BYTES];
+        result_hash.copy_from_slice(&hasher.finalize());
+        result_hash
+    }
+}
+
 #[derive(Clone)]
 pub struct FieldElementVectorBackend<F, D: Digest, const NUM_BYTES: usize> {
     phantom1: PhantomData<F>,
