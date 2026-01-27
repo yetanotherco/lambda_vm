@@ -379,17 +379,28 @@ where
     Table::new(table_data, table_width)
 }
 
-pub fn columns2rows<F>(columns: Vec<Vec<F>>) -> Vec<Vec<F>>
+/// Transpose columns to rows while reading in bit-reversed order.
+///
+/// This combines two operations in one pass:
+/// 1. Bit-reverse permutation of row indices
+/// 2. Column-to-row transpose
+///
+/// The output row at index `i` contains values from the input row at
+/// `reverse_index(i, num_rows)`.
+pub fn columns2rows<F>(columns: &[Vec<F>]) -> Vec<Vec<F>>
 where
     F: Clone,
 {
+    use math::fft::cpu::bit_reversing::reverse_index;
+
     let num_rows = columns[0].len();
     let num_cols = columns.len();
 
     (0..num_rows)
         .map(|row_index| {
+            let src_row = reverse_index(row_index, num_rows as u64);
             (0..num_cols)
-                .map(|col_index| columns[col_index][row_index].clone())
+                .map(|col_index| columns[col_index][src_row].clone())
                 .collect()
         })
         .collect()

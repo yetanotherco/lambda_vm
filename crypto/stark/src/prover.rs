@@ -266,14 +266,8 @@ pub trait IsStarkProver<
         // Evaluate on LDE domain
         let evaluations = Self::compute_lde_trace_evaluations::<Field>(&precomputed_polys, &domain);
 
-        // Bit-reverse permute
-        let mut lde_permuted = evaluations;
-        for col in lde_permuted.iter_mut() {
-            in_place_bit_reverse_permute(col);
-        }
-
-        // Build commitment
-        let rows = columns2rows(lde_permuted);
+        // Build commitment (columns2rows does bit-reverse internally)
+        let rows = columns2rows(&evaluations);
         let (_, commitment) = Self::batch_commit_main(&rows)?;
 
         Some(commitment)
@@ -309,13 +303,8 @@ pub trait IsStarkProver<
         let lde_trace_evaluations =
             Self::compute_lde_trace_evaluations::<Field>(&trace_polys, domain);
 
-        let mut lde_trace_permuted = lde_trace_evaluations.clone();
-        for col in lde_trace_permuted.iter_mut() {
-            in_place_bit_reverse_permute(col);
-        }
-
-        // Compute commitment.
-        let lde_trace_permuted_rows = columns2rows(lde_trace_permuted);
+        // Compute commitment (columns2rows does bit-reverse internally).
+        let lde_trace_permuted_rows = columns2rows(&lde_trace_evaluations);
 
         let (lde_trace_merkle_tree, lde_trace_merkle_root) =
             Self::batch_commit_main(&lde_trace_permuted_rows)?;
@@ -357,13 +346,8 @@ pub trait IsStarkProver<
         let lde_trace_evaluations =
             Self::compute_lde_trace_evaluations::<Field>(&trace_polys, domain);
 
-        let mut lde_trace_permuted = lde_trace_evaluations.clone();
-        for col in lde_trace_permuted.iter_mut() {
-            in_place_bit_reverse_permute(col);
-        }
-
-        // Compute commitment (but don't append to transcript - caller does that).
-        let lde_trace_permuted_rows = columns2rows(lde_trace_permuted);
+        // Compute commitment (columns2rows does bit-reverse internally).
+        let lde_trace_permuted_rows = columns2rows(&lde_trace_evaluations);
 
         let (lde_trace_merkle_tree, lde_trace_merkle_root) =
             Self::batch_commit_main(&lde_trace_permuted_rows)?;
@@ -405,13 +389,8 @@ pub trait IsStarkProver<
         // Evaluate those polynomials t_j on the large domain D_LDE.
         let lde_trace_evaluations = Self::compute_lde_trace_evaluations(&trace_polys, domain);
 
-        let mut lde_trace_permuted = lde_trace_evaluations.clone();
-        for col in lde_trace_permuted.iter_mut() {
-            in_place_bit_reverse_permute(col);
-        }
-
-        // Compute commitment.
-        let lde_trace_permuted_rows = columns2rows(lde_trace_permuted);
+        // Compute commitment (columns2rows does bit-reverse internally).
+        let lde_trace_permuted_rows = columns2rows(&lde_trace_evaluations);
 
         let (lde_trace_merkle_tree, lde_trace_merkle_root) =
             Self::batch_commit_extension(&lde_trace_permuted_rows)?;
@@ -513,22 +492,14 @@ pub trait IsStarkProver<
         };
 
         // --- Build PRECOMPUTED tree (cols 0..num_precomputed) ---
-        let precomputed_evaluations: Vec<_> = evaluations[..num_precomputed_cols].to_vec();
-        let mut precomputed_lde_permuted = precomputed_evaluations.clone();
-        for col in precomputed_lde_permuted.iter_mut() {
-            in_place_bit_reverse_permute(col);
-        }
-        let precomputed_rows = columns2rows(precomputed_lde_permuted);
+        let precomputed_evaluations: &[Vec<_>] = &evaluations[..num_precomputed_cols];
+        let precomputed_rows = columns2rows(precomputed_evaluations);
         let (precomputed_tree, precomputed_root) =
             Self::batch_commit_main(&precomputed_rows).ok_or(ProvingError::EmptyCommitment)?;
 
         // --- Build MULTIPLICITIES tree (cols num_precomputed..) ---
-        let multiplicity_evaluations: Vec<_> = evaluations[num_precomputed_cols..].to_vec();
-        let mut mult_lde_permuted = multiplicity_evaluations.clone();
-        for col in mult_lde_permuted.iter_mut() {
-            in_place_bit_reverse_permute(col);
-        }
-        let mult_rows = columns2rows(mult_lde_permuted);
+        let multiplicity_evaluations: &[Vec<_>] = &evaluations[num_precomputed_cols..];
+        let mult_rows = columns2rows(multiplicity_evaluations);
         let (mult_tree, mult_root) =
             Self::batch_commit_main(&mult_rows).ok_or(ProvingError::EmptyCommitment)?;
 

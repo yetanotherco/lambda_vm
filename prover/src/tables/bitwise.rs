@@ -28,7 +28,6 @@
 //! meaning other tables send to this table.
 
 use lazy_static::lazy_static;
-use math::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
 use math::polynomial::Polynomial;
 use stark::config::{BatchedMerkleTree, Commitment};
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
@@ -226,7 +225,7 @@ fn compute_preprocessed_commitment() -> Commitment {
 
     // Step 3: Evaluate polynomials on LDE domain (N * blowup_factor points)
     let coset_offset = FE::from(LDE_COSET_OFFSET);
-    let mut lde_columns: Vec<Vec<FE>> = polys
+    let lde_columns: Vec<Vec<FE>> = polys
         .iter()
         .map(|poly| {
             evaluate_polynomial_on_lde_domain(poly, LDE_BLOWUP_FACTOR, NUM_ROWS, &coset_offset)
@@ -234,13 +233,8 @@ fn compute_preprocessed_commitment() -> Commitment {
         })
         .collect();
 
-    // Step 4: Bit-reverse permute (same as prover)
-    for col in lde_columns.iter_mut() {
-        in_place_bit_reverse_permute(col);
-    }
-
-    // Step 5: Convert columns to rows for Merkle tree
-    let lde_rows = columns2rows(lde_columns);
+    // Step 4: Convert columns to rows for Merkle tree (columns2rows does bit-reverse internally)
+    let lde_rows = columns2rows(&lde_columns);
 
     // Step 6: Build Merkle tree over LDE (N * blowup leaves)
     let tree = BatchedMerkleTree::<GoldilocksField>::build(&lde_rows)
