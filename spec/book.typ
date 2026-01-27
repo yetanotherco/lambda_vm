@@ -81,7 +81,7 @@
 #let xref(rf, ..ref-args) = {
   assert(is-shiroa, message: "xref should only be used when compiling for shiroa")
   let lbl = rf.target
-  let found =  meta.summary.find(x => str(lbl).starts-with(str(x.at(2))))
+  let found = meta.summary.find(((_, _, tag)) => str(lbl).starts-with(str(tag)))
   context if found != none and found.at(0) != _toplevel.final() {
     let (ch, title, ref) = found
     if ref == lbl {
