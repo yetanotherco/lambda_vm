@@ -22,7 +22,7 @@ The `LT` chip is comprised of #nr_variables variables that are expressed using #
 #render_chip_column_table(chip, config)
 
 == Assumptions
-We assume the inputs `lhs`, `rhs` and `signed` are appropriately range checked.
+We assume the inputs `lhs`, `rhs` and `signed` are partially range checked.
 #render_chip_assumptions(chip, config)
 
 == Constraints
@@ -71,7 +71,8 @@ Therefore, we can use $Q$ to constrain `lt` when `signed = 1`.
 
 #render_constraint_table(chip, config, groups: "defs")
 
-And then we constrain the subtraction.
+And then we constrain the subtraction,
+taking care of the remaining range checking not yet covered by the assumptions or the `MSB16` lookup.
 
 #render_constraint_table(chip, config, groups: "sub")
 

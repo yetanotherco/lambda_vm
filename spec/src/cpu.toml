@@ -567,7 +567,7 @@ ref = "cpu:c:sub"
 [[constraints.alu]]
 kind = "interaction"
 tag = "LT"
-input = [["cast", "arg1", "DWordHHW"], ["cast", "arg2", "DWordHHW"], "signed"]
+input = [["cast", "arg1", "DWordWL"], ["cast", "arg2", "DWordWL"], "signed"]
 output = ["idx", "res", 0]
 multiplicity = ["+", "SLT", "BLT"]
 
