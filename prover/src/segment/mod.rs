@@ -35,7 +35,7 @@ use executor::vm::logs::Log;
 /// Padding support will be added in a future implementation.
 pub fn split_into_segments<'a>(logs: &'a [Log], config: &SegmentConfig) -> Vec<&'a [Log]> {
     assert!(
-        logs.len() % config.segment_size == 0,
+        logs.len().is_multiple_of(config.segment_size),
         "Total logs ({}) must be divisible by segment_size ({})",
         logs.len(),
         config.segment_size
