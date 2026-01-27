@@ -981,101 +981,26 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // -------------------------------------------------------------------------
     // LT interaction (for SLT, BLT)
     // -------------------------------------------------------------------------
-    // LT[arg1::DWordHHW, arg2::DWordHHW, signed] -> res[0]
+    // LT[arg1, arg2, signed] -> res[0]
     // multiplicity = SLT + BLT
     //
-    // DWordHHW format: [Word(0-31), Half(32-47), Half(48-63)]
-    // arg1/arg2 are DWordBL (8 bytes), need to repack:
-    //   Word = byte[0] + 2^8*byte[1] + 2^16*byte[2] + 2^24*byte[3]
-    //   Half1 = byte[4] + 2^8*byte[5]
-    //   Half2 = byte[6] + 2^8*byte[7]
+    // LT bus uses 2 elements per 64-bit operand: [lo32, hi32]
+    // arg1/arg2 are DWordBL (8 bytes) - use Packing::DWordBL to produce 2 elements
     interactions.push(BusInteraction::sender(
         BusId::Lt,
         // SLT + BLT using Multiplicity::Sum
         Multiplicity::Sum(cols::SLT, cols::BLT),
         vec![
-            // arg1[0]: Word (lower 32 bits)
-            BusValue::linear(vec![
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::ARG1[0],
-                },
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1 << 8,
-                    column: cols::ARG1[1],
-                },
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1 << 16,
-                    column: cols::ARG1[2],
-                },
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1 << 24,
-                    column: cols::ARG1[3],
-                },
-            ]),
-            // arg1[1]: Half (bits 32-47)
-            BusValue::linear(vec![
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::ARG1[4],
-                },
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1 << 8,
-                    column: cols::ARG1[5],
-                },
-            ]),
-            // arg1[2]: Half (bits 48-63)
-            BusValue::linear(vec![
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::ARG1[6],
-                },
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1 << 8,
-                    column: cols::ARG1[7],
-                },
-            ]),
-            // arg2[0]: Word (lower 32 bits)
-            BusValue::linear(vec![
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::ARG2[0],
-                },
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1 << 8,
-                    column: cols::ARG2[1],
-                },
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1 << 16,
-                    column: cols::ARG2[2],
-                },
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1 << 24,
-                    column: cols::ARG2[3],
-                },
-            ]),
-            // arg2[1]: Half (bits 32-47)
-            BusValue::linear(vec![
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::ARG2[4],
-                },
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1 << 8,
-                    column: cols::ARG2[5],
-                },
-            ]),
-            // arg2[2]: Half (bits 48-63)
-            BusValue::linear(vec![
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::ARG2[6],
-                },
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1 << 8,
-                    column: cols::ARG2[7],
-                },
-            ]),
+            // arg1 as DWordBL (8 bytes → 2 elements: [lo32, hi32])
+            BusValue::Packed {
+                start_column: cols::ARG1[0],
+                packing: Packing::DWordBL,
+            },
+            // arg2 as DWordBL (8 bytes → 2 elements: [lo32, hi32])
+            BusValue::Packed {
+                start_column: cols::ARG2[0],
+                packing: Packing::DWordBL,
+            },
             // signed flag
             BusValue::Packed {
                 start_column: cols::SIGNED,
