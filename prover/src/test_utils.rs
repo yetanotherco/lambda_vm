@@ -413,12 +413,15 @@ pub fn prove_and_verify_vm_minimal(
     let bitwise_air = create_bitwise_air(&proof_options);
     let lt_air = create_lt_air(&proof_options);
 
-    let air_trace_pairs: Vec<(&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>, _, _)> =
-        vec![
-            (&cpu_air, cpu_trace, &()),
-            (&bitwise_air, bitwise_trace, &()),
-            (&lt_air, lt_trace, &()),
-        ];
+    let air_trace_pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&cpu_air, cpu_trace, &()),
+        (&bitwise_air, bitwise_trace, &()),
+        (&lt_air, lt_trace, &()),
+    ];
 
     let multi_proof =
         match Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])) {

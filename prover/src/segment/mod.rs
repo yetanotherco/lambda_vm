@@ -29,7 +29,10 @@ pub enum SegmentError {
     /// Segment size is not a power of 2
     SizeNotPowerOfTwo(usize),
     /// Log count is not divisible by segment size
-    LogCountNotDivisible { log_count: usize, segment_size: usize },
+    LogCountNotDivisible {
+        log_count: usize,
+        segment_size: usize,
+    },
 }
 
 impl fmt::Display for SegmentError {
@@ -41,8 +44,14 @@ impl fmt::Display for SegmentError {
             SegmentError::SizeNotPowerOfTwo(size) => {
                 write!(f, "segment_size must be power of 2, got {size}")
             }
-            SegmentError::LogCountNotDivisible { log_count, segment_size } => {
-                write!(f, "log count ({log_count}) must be divisible by segment_size ({segment_size})")
+            SegmentError::LogCountNotDivisible {
+                log_count,
+                segment_size,
+            } => {
+                write!(
+                    f,
+                    "log count ({log_count}) must be divisible by segment_size ({segment_size})"
+                )
             }
         }
     }

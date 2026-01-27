@@ -5,12 +5,13 @@
 //! - Splitting logs into segments
 //! - Independent proving of each segment
 
-use crate::segment::{split_into_segments, SegmentError};
+use crate::segment::{SegmentError, split_into_segments};
 use crate::tables::lt::generate_lt_trace;
 use crate::tables::trace_builder::Traces;
 use crate::test_utils::{
-    collect_bitwise_lookups_from_logs, collect_bitwise_lookups_from_lt, collect_lt_lookups_from_logs,
-    generate_minimal_bitwise_trace, prove_and_verify_vm_minimal, run_asm_elf,
+    collect_bitwise_lookups_from_logs, collect_bitwise_lookups_from_lt,
+    collect_lt_lookups_from_logs, generate_minimal_bitwise_trace, prove_and_verify_vm_minimal,
+    run_asm_elf,
 };
 
 // =============================================================================
@@ -38,7 +39,10 @@ fn test_split_not_divisible() {
     let result = split_into_segments(&logs, 64);
     assert!(matches!(
         result,
-        Err(SegmentError::LogCountNotDivisible { log_count: 8, segment_size: 64 })
+        Err(SegmentError::LogCountNotDivisible {
+            log_count: 8,
+            segment_size: 64
+        })
     ));
 }
 

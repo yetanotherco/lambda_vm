@@ -26,9 +26,9 @@ use crate::tables::bitwise::{generate_bitwise_trace, update_multiplicities};
 use crate::tables::lt::generate_lt_trace;
 use crate::tables::trace_builder::Traces;
 use crate::test_utils::{
-    collect_bitwise_lookups_from_logs, collect_bitwise_lookups_from_lt,
+    E, F, collect_bitwise_lookups_from_logs, collect_bitwise_lookups_from_lt,
     collect_lt_lookups_from_logs, create_bitwise_air, create_cpu_air, create_lt_air,
-    generate_minimal_bitwise_trace, prove_and_verify_vm_minimal, run_asm_elf, E, F,
+    generate_minimal_bitwise_trace, prove_and_verify_vm_minimal, run_asm_elf,
 };
 
 /// Alias for compatibility with existing test code.
@@ -60,12 +60,15 @@ fn prove_and_verify_vm(
     let bitwise_air = create_bitwise_air(&proof_options);
     let lt_air = create_lt_air(&proof_options);
 
-    let air_trace_pairs: Vec<(&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>, _, _)> =
-        vec![
-            (&cpu_air, cpu_trace, &()),
-            (&bitwise_air, bitwise_trace, &()),
-            (&lt_air, lt_trace, &()),
-        ];
+    let air_trace_pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&cpu_air, cpu_trace, &()),
+        (&bitwise_air, bitwise_trace, &()),
+        (&lt_air, lt_trace, &()),
+    ];
 
     let multi_proof =
         match Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])) {
