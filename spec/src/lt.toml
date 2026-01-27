@@ -83,7 +83,6 @@ ref = "lt:a:range_lhs"
 
 [[assumptions]]
 desc = "`IS_WORD[rhs[0]]`"
-iter = ["i", 1, 2]
 ref = "lt:a:range_rhs"
 
 [[assumptions]]
