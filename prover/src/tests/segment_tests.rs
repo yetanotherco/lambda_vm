@@ -12,7 +12,7 @@ use stark::prover::{IsStarkProver, Prover};
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
-use crate::segment::split_into_segments;
+use crate::segment::{split_into_segments, SegmentError};
 use crate::tables::lt::generate_lt_trace;
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
@@ -20,7 +20,6 @@ use crate::test_utils::{
     collect_bitwise_lookups_from_logs, collect_bitwise_lookups_from_lt, collect_lt_lookups_from_logs,
     create_bitwise_air, create_cpu_air, create_lt_air, generate_minimal_bitwise_trace, run_asm_elf,
 };
-use crate::ProverError;
 
 type F = GoldilocksField;
 type E = GoldilocksExtension;
@@ -70,14 +69,14 @@ fn prove_and_verify_vm_minimal(
 fn test_segment_size_min() {
     let (logs, _) = run_asm_elf("arith_8");
     let result = split_into_segments(&logs, 2);
-    assert!(matches!(result, Err(ProverError::SegmentSizeTooSmall(2))));
+    assert!(matches!(result, Err(SegmentError::SizeTooSmall(2))));
 }
 
 #[test]
 fn test_segment_size_power_of_two() {
     let (logs, _) = run_asm_elf("loop_128");
     let result = split_into_segments(&logs, 100);
-    assert!(matches!(result, Err(ProverError::SegmentSizeNotPowerOfTwo(100))));
+    assert!(matches!(result, Err(SegmentError::SizeNotPowerOfTwo(100))));
 }
 
 #[test]
@@ -87,7 +86,7 @@ fn test_split_not_divisible() {
     let result = split_into_segments(&logs, 64);
     assert!(matches!(
         result,
-        Err(ProverError::LogCountNotDivisible { log_count: 8, segment_size: 64 })
+        Err(SegmentError::LogCountNotDivisible { log_count: 8, segment_size: 64 })
     ));
 }
 
