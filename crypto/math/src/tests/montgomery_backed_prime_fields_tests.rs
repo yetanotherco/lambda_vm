@@ -964,9 +964,9 @@ mod tests_u256_prime_fields {
 
     #[test]
     fn test_cios_overflow_case() {
-        let a = GoldilocksElement::from(732582227915286439);
-        let b = GoldilocksElement::from(3906369333256140342);
-        let expected_sum = GoldilocksElement::from(4638951561171426781);
+        let a = GoldilocksElement::from(732582227915286439u64);
+        let b = GoldilocksElement::from(3906369333256140342u64);
+        let expected_sum = GoldilocksElement::from(4638951561171426781u64);
         assert_eq!(a + b, expected_sum);
     }
 }

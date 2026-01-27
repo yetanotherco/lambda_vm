@@ -107,6 +107,31 @@ where
     }
 }
 
+/// From overloading for i64.
+/// Negative values are converted to their field equivalents: -x becomes p - x.
+impl<F> From<i64> for FieldElement<F>
+where
+    F: IsField,
+{
+    fn from(value: i64) -> Self {
+        if value >= 0 {
+            Self::from(value as u64)
+        } else {
+            -Self::from(value.unsigned_abs())
+        }
+    }
+}
+
+/// From overloading for i32 (convenience for integer literals).
+impl<F> From<i32> for FieldElement<F>
+where
+    F: IsField,
+{
+    fn from(value: i32) -> Self {
+        Self::from(value as i64)
+    }
+}
+
 #[cfg(feature = "alloc")]
 /// From overloading for BigUint.
 /// Creates a field element from a BigUint that is smaller than the modulus.
