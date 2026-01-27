@@ -179,14 +179,6 @@ impl Fp2E {
     }
 }
 
-/// From overloading for i64 (Fp2 Goldilocks extension-specific).
-/// Negative values are converted to their field equivalents.
-impl From<i64> for Fp2E {
-    fn from(value: i64) -> Self {
-        Self::new([FpE::from(value), FpE::zero()])
-    }
-}
-
 // =====================================================
 // CUBIC EXTENSION (Fp3)
 // =====================================================
@@ -377,14 +369,6 @@ impl Fp3E {
     /// Negative values are converted to their field equivalents: -x becomes p - x.
     pub fn from_i64(value: i64) -> Self {
         Self::from(value)
-    }
-}
-
-/// From overloading for i64 (Fp3 Goldilocks extension-specific).
-/// Negative values are converted to their field equivalents.
-impl From<i64> for Fp3E {
-    fn from(value: i64) -> Self {
-        Self::new([FpE::from(value), FpE::zero(), FpE::zero()])
     }
 }
 
