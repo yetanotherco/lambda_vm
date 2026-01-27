@@ -13,9 +13,7 @@
 #let chip = load_chip("src/halt.toml", config)
 #let halt = raw(chip.name)
 
-#show: book-page.with(title: "Halt chip")
-
-= #halt chip
+#show: book-page(chip.name)
 
 == Columns
 #let nr_variables = total_nr_variables(chip)
