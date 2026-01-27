@@ -220,7 +220,7 @@ pub fn collect_bitwise_lookups_from_lt(lt_ops: &[LtOperation]) -> Vec<(BitwiseLo
             ));
         }
 
-        // IS_HALFWORD for lhs[1] (bits 32-47 of lhs) - soundness fix
+        // IS_HALFWORD for lhs[1] (bits 32-47 of lhs)
         let lhs_1 = ((op.lhs >> 32) & 0xFFFF) as u16;
         lookups.push((
             BitwiseLookup::IsHalf,
@@ -229,7 +229,7 @@ pub fn collect_bitwise_lookups_from_lt(lt_ops: &[LtOperation]) -> Vec<(BitwiseLo
             0,
         ));
 
-        // IS_HALFWORD for rhs[1] (bits 32-47 of rhs) - soundness fix
+        // IS_HALFWORD for rhs[1] (bits 32-47 of rhs)
         let rhs_1 = ((op.rhs >> 32) & 0xFFFF) as u16;
         lookups.push((
             BitwiseLookup::IsHalf,

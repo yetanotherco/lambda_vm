@@ -276,8 +276,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 packing: Packing::Direct,
             }],
         ),
-        // lt:c:range_lhs - IS_HALFWORD[lhs[1]] with multiplicity μ
-        // Soundness fix: Range check lhs[1] to ensure it's a valid halfword
+        // IS_HALFWORD[lhs[1]]
         BusInteraction::sender(
             BusId::IsHalfword,
             Multiplicity::Column(cols::MU),
@@ -286,8 +285,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 packing: Packing::Direct,
             }],
         ),
-        // lt:c:range_rhs - IS_HALFWORD[rhs[1]] with multiplicity μ
-        // Soundness fix: Range check rhs[1] to ensure it's a valid halfword
+        // IS_HALFWORD[rhs[1]]
         BusInteraction::sender(
             BusId::IsHalfword,
             Multiplicity::Column(cols::MU),
