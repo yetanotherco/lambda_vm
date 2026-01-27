@@ -54,7 +54,7 @@
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 use executor::vm::logs::Log;
-use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
+use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
 // =========================================================================
@@ -218,13 +218,8 @@ pub mod cols {
     /// branch_cond: Whether branch is taken
     pub const BRANCH_COND: usize = 71;
 
-    /// packed_decode: Packed decode flags for DECODE bus lookup
-    /// Contains all decode-time flags packed into a single 64-bit value.
-    /// This is sent to the DECODE table to verify instruction decoding.
-    pub const PACKED_DECODE: usize = 72;
-
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 73;
+    pub const NUM_COLUMNS: usize = 72;
 
     // -------------------------------------------------------------------------
     // Helper ranges for iteration
@@ -299,11 +294,6 @@ pub struct CpuOperation {
     pub res: u64,
     pub is_equal: bool,
     pub branch_cond: bool,
-
-    // Packed decode for DECODE bus interaction
-    /// All decode-time flags packed into a single value for bus lookup.
-    /// Computed from DecodeEntry::packed_decode() to match DECODE table.
-    pub packed_decode: u64,
 }
 
 impl CpuOperation {
@@ -364,9 +354,6 @@ impl CpuOperation {
             rv2: log.src2_val,
             rvd: log.dst_val,
             res: log.dst_val, // Default: result is destination value
-
-            // Packed decode for DECODE bus interaction
-            packed_decode: entry.packed_decode(),
 
             ..Default::default()
         };
@@ -771,9 +758,6 @@ pub fn write_cpu_row(data: &mut [FE], row_idx: usize, op: &CpuOperation) {
     // Branch columns
     data[base + cols::IS_EQUAL] = FE::from(op.is_equal as u64);
     data[base + cols::BRANCH_COND] = FE::from(op.branch_cond as u64);
-
-    // DECODE bus lookup column
-    data[base + cols::PACKED_DECODE] = FE::from(op.packed_decode);
 }
 
 /// Collects all Bitwise lookups from a list of CPU operations.
@@ -1111,6 +1095,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // Per spec (cpu.toml): input = ["pc", "imm", "packed_decode"]
     // CPU sends: DECODE[pc, imm, packed_decode] with multiplicity = 1 per instruction
     // The DECODE table receives this and verifies the packed_decode matches the program.
+    //
+    // packed_decode is a VIRTUAL column - computed via linear combination, not stored.
+    // Format (matching decode.rs packed_decode()):
+    //   bit 0: write_register, bit 1: memory_2bytes, ..., bit 8: word_instr
+    //   bits 9-24: ALU flags (ADD, SUB, ..., EBREAK)
+    //   bits 25-32: rs1, bits 33-40: rs2, bits 41-48: rd
     interactions.push(BusInteraction::sender(
         BusId::Decode,
         Multiplicity::One,
@@ -1125,11 +1115,40 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::IMM_0,
                 packing: Packing::DWordWL,
             },
-            // packed_decode as Direct (1 bus element)
-            BusValue::Packed {
-                start_column: cols::PACKED_DECODE,
-                packing: Packing::Direct,
-            },
+            // packed_decode as Linear (virtual column - computed from individual flags)
+            BusValue::Linear(vec![
+                // Control flags (bits 0-8)
+                LinearTerm::Column { coefficient: 1 << 0, column: cols::WRITE_REGISTER },
+                LinearTerm::Column { coefficient: 1 << 1, column: cols::MEMORY_2BYTES },
+                LinearTerm::Column { coefficient: 1 << 2, column: cols::MEMORY_4BYTES },
+                LinearTerm::Column { coefficient: 1 << 3, column: cols::MEMORY_8BYTES },
+                LinearTerm::Column { coefficient: 1 << 4, column: cols::C_TYPE_INSTRUCTION },
+                LinearTerm::Column { coefficient: 1 << 5, column: cols::SIGNED },
+                LinearTerm::Column { coefficient: 1 << 6, column: cols::MP_SELECTOR },
+                LinearTerm::Column { coefficient: 1 << 7, column: cols::MULDIV_SELECTOR },
+                LinearTerm::Column { coefficient: 1 << 8, column: cols::WORD_INSTR },
+                // ALU flags (bits 9-24)
+                LinearTerm::Column { coefficient: 1 << 9, column: cols::ADD },
+                LinearTerm::Column { coefficient: 1 << 10, column: cols::SUB },
+                LinearTerm::Column { coefficient: 1 << 11, column: cols::SLT },
+                LinearTerm::Column { coefficient: 1 << 12, column: cols::AND },
+                LinearTerm::Column { coefficient: 1 << 13, column: cols::OR },
+                LinearTerm::Column { coefficient: 1 << 14, column: cols::XOR },
+                LinearTerm::Column { coefficient: 1 << 15, column: cols::SHIFT },
+                LinearTerm::Column { coefficient: 1 << 16, column: cols::JALR },
+                LinearTerm::Column { coefficient: 1 << 17, column: cols::BEQ },
+                LinearTerm::Column { coefficient: 1 << 18, column: cols::BLT },
+                LinearTerm::Column { coefficient: 1 << 19, column: cols::LOAD },
+                LinearTerm::Column { coefficient: 1 << 20, column: cols::STORE },
+                LinearTerm::Column { coefficient: 1 << 21, column: cols::MUL },
+                LinearTerm::Column { coefficient: 1 << 22, column: cols::DIVREM },
+                LinearTerm::Column { coefficient: 1 << 23, column: cols::ECALL },
+                LinearTerm::Column { coefficient: 1 << 24, column: cols::EBREAK },
+                // Register indices (bits 25-48)
+                LinearTerm::Column { coefficient: 1 << 25, column: cols::RS1 },
+                LinearTerm::Column { coefficient: 1 << 33, column: cols::RS2 },
+                LinearTerm::Column { coefficient: 1 << 41, column: cols::RD },
+            ]),
         ],
     ));
 

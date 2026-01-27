@@ -305,7 +305,7 @@ fn test_bus_interactions_count() {
 
 #[test]
 fn test_column_count() {
-    assert_eq!(cols::NUM_COLUMNS, 73);
+    assert_eq!(cols::NUM_COLUMNS, 72);
 }
 
 #[test]
