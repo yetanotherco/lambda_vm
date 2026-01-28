@@ -1092,15 +1092,25 @@ pub fn constraints() -> Vec<Box<dyn TransitionConstraint<GoldilocksField, Goldil
 
     // ADD constraints for address_add[0..6]
     // Each ADD constraint verifies: address_add[i] = base_address + (i+1)
-    // Uses μ_sum as condition (active when row is used)
+    // Multiplicities per spec:
+    //   C3: address_add[0] with w2 (write2 + write4 + write8)
+    //   C4: address_add[1..2] with w4 (write4 + write8)
+    //   C5: address_add[3..6] with write8
     for i in 0..7 {
         let lhs = AddOperand::dword(cols::BASE_ADDRESS_0);
         let rhs = AddOperand::constant((i + 1) as i64);
         let sum = AddOperand::from_dword_hl(cols::address_add(i)[0]);
 
+        // Select multiplicity based on which address_add we're constraining
+        let condition = match i {
+            0 => vec![cols::WRITE2, cols::WRITE4, cols::WRITE8], // w2
+            1 | 2 => vec![cols::WRITE4, cols::WRITE8],           // w4
+            _ => vec![cols::WRITE8],                              // write8 (i = 3..6)
+        };
+
         // ADD constraint produces 2 constraints (carry_0, carry_1)
         let (c0, c1) = AddConstraint::new_pair(
-            vec![cols::MU_READ, cols::MU_WRITE], // condition: active when μ_read + μ_write > 0
+            condition,
             lhs,
             rhs,
             sum,
