@@ -69,9 +69,11 @@ jobs:
           # Extract the full stack trace for the allocation site with highest peak memory
           # DHAT JSON: pps[].fs contains frame indices, ftbl maps indices to function names
           PEAK_STACK=$(jq -r '
-            (.pps | max_by(.gb).fs) as $frames |
-            $frames | map(. as $idx | $ARGS.positional[0].ftbl[$idx]) | join("\n")
-          ' --jsonargs "$(cat dhat-heap.json)" dhat-heap.json)
+            .ftbl as $ftbl |
+            (.pps | max_by(.gb).fs) |
+            map($ftbl[.]) |
+            join("\n")
+          ' dhat-heap.json)
           # Use delimiter for multiline output
           echo "peak_stack<<EOF" >> $GITHUB_OUTPUT
           echo "$PEAK_STACK" >> $GITHUB_OUTPUT
