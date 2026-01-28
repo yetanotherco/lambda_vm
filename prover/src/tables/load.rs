@@ -392,10 +392,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             },
         ],
     ));
-    } // END TEMPORARILY DISABLED LOAD→MEMW and MSB8 interactions
+    } // END TEMPORARILY DISABLED MSB8 interactions
 
     // -------------------------------------------------------------------------
-    // LOAD receiver (from CPU) - ENABLED FOR TESTING
+    // LOAD receiver (from CPU)
     // -------------------------------------------------------------------------
     // Spec: LOAD[res::DWordWL; base_address, timestamp, read2, read4, read8] | -μ
     //

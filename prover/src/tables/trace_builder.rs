@@ -219,6 +219,7 @@ impl Traces {
 
                     // Create MEMW operation (read)
                     // Use res_bytes (sign-extended) to match what LOAD→MEMW sends
+                    // For reads: old = value = the data being read (sign-extended)
                     let memw_op = MemwOperation::new(
                         false, // is_register = false (memory access)
                         base_address,
@@ -227,7 +228,7 @@ impl Traces {
                         byte_count as u8,
                         true, // is_read = true
                     )
-                    .with_old(old_values, old_timestamps);
+                    .with_old(res_bytes, old_timestamps);
                     memw_ops.push(memw_op);
 
                     // Create LOAD operation
@@ -296,8 +297,7 @@ impl Traces {
                 let reg_value = pack_register_value(log.src1_val);
                 let reg_addr = 2 * op.rs1 as u64;
                 // Get old_timestamp from register state (when this register was last accessed)
-                let (old_val, old_ts) = register_state.read(op.rs1);
-                let old_value = pack_register_value(old_val);
+                let (_old_val, old_ts) = register_state.read(op.rs1);
                 let old_timestamps = [old_ts; 8];
                 let memw_op = MemwOperation::new(
                     true,        // is_register = true
@@ -307,7 +307,8 @@ impl Traces {
                     8,           // width = 8 (full 64-bit register)
                     true,        // is_read = true
                 )
-                .with_old(old_value, old_timestamps);
+                // For reads: old = value = the data being read
+                .with_old(reg_value, old_timestamps);
                 memw_ops.push(memw_op);
                 // Update register state: value stays same, timestamp updates to current
                 register_state.write(op.rs1, log.src1_val, timestamp);
@@ -318,8 +319,7 @@ impl Traces {
                 let reg_value = pack_register_value(log.src2_val);
                 let reg_addr = 2 * op.rs2 as u64;
                 // Get old_timestamp from register state
-                let (old_val, old_ts) = register_state.read(op.rs2);
-                let old_value = pack_register_value(old_val);
+                let (_old_val, old_ts) = register_state.read(op.rs2);
                 let old_timestamps = [old_ts; 8];
                 let memw_op = MemwOperation::new(
                     true,            // is_register = true
@@ -329,7 +329,8 @@ impl Traces {
                     8,               // width = 8
                     true,            // is_read = true
                 )
-                .with_old(old_value, old_timestamps);
+                // For reads: old = value = the data being read
+                .with_old(reg_value, old_timestamps);
                 memw_ops.push(memw_op);
                 // Update register state: value stays same, timestamp updates to current
                 register_state.write(op.rs2, log.src2_val, timestamp + 1);
