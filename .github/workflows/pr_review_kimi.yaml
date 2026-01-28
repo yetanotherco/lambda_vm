@@ -1,0 +1,128 @@
+name: Kimi Code Review
+
+on:
+  pull_request:
+    types: [opened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  kimi-review:
+    name: Kimi Code Review
+    runs-on: ubuntu-latest
+    # Only run for PRs from users with write access (not external contributors)
+    if: |
+      github.event.pull_request.author_association == 'OWNER' ||
+      github.event.pull_request.author_association == 'MEMBER' ||
+      github.event.pull_request.author_association == 'COLLABORATOR'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Get PR diff
+        id: diff
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr diff ${{ github.event.pull_request.number }} > pr_diff.txt
+
+          TOTAL_LINES=$(wc -l < pr_diff.txt)
+          MAX_LINES=10000
+
+          # Truncate if too large (Kimi has context limits)
+          # Use line-based truncation to avoid breaking UTF-8 characters
+          head -n $MAX_LINES pr_diff.txt > pr_diff_truncated.txt
+
+          # Warn if truncation occurred - reviewers should know some content was not reviewed
+          if [ "$TOTAL_LINES" -gt "$MAX_LINES" ]; then
+            echo "truncated=true" >> "$GITHUB_OUTPUT"
+            echo "total_lines=$TOTAL_LINES" >> "$GITHUB_OUTPUT"
+            echo "::warning::Diff truncated from $TOTAL_LINES to $MAX_LINES lines. Some changes were not reviewed."
+          else
+            echo "truncated=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Kimi Code Review
+        id: kimi_review
+        env:
+          KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          # Mask the API key to prevent accidental exposure in logs
+          echo "::add-mask::$KIMI_API_KEY"
+
+          if [ -z "$KIMI_API_KEY" ]; then
+            echo "KIMI_API_KEY secret is not set. Skipping Kimi review."
+            exit 1
+          fi
+
+          # Use --rawfile for diff to avoid shell interpolation
+          # Use --arg for title (safely escapes user-controlled input)
+          REQUEST_BODY=$(jq -n \
+            --rawfile diff pr_diff_truncated.txt \
+            --arg title "$PR_TITLE" \
+            '{
+              "model": "moonshot-v1-128k",
+              "messages": [
+                {
+                  "role": "system",
+                  "content": "You are a senior code reviewer for Lambda ZKVM, a minimalist, performant and auditable verifiable RISC-V vm written in Rust."
+                },
+                {
+                  "role": "user",
+                  "content": ("PR Title: " + $title + "\n\nReview this PR focusing on:\n- Code correctness and potential bugs\n- Security vulnerabilities\n- Performance implications\n- Rust best practices and idiomatic patterns\n- Memory safety and proper error handling\n- Code readability and maintainability\n\nBe concise and specific. Provide line references when suggesting changes.\nIf the code looks good, acknowledge it briefly.\n\nDiff:\n" + $diff)
+                }
+              ],
+              "temperature": 0.3,
+              "max_tokens": 4096
+            }')
+
+          HTTP_RESPONSE=$(curl -s -w "\n%{http_code}" https://api.moonshot.ai/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $KIMI_API_KEY" \
+            -d "$REQUEST_BODY")
+
+          HTTP_CODE=$(echo "$HTTP_RESPONSE" | tail -n1)
+          RESPONSE=$(echo "$HTTP_RESPONSE" | sed '$d')
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            # Only log HTTP status code - never log raw API responses which may contain sensitive data
+            echo "Kimi API request failed with HTTP status $HTTP_CODE." > kimi_review.txt
+            echo "::error::Kimi API returned HTTP $HTTP_CODE"
+          else
+            # Check for API error without logging the message (may contain sensitive data)
+            HAS_ERROR=$(echo "$RESPONSE" | jq -e '.error.message' > /dev/null 2>&1 && echo "yes" || echo "no")
+            if [ "$HAS_ERROR" = "yes" ]; then
+              echo "Kimi API returned an error response." > kimi_review.txt
+              echo "::error::Kimi API returned an error (details omitted for security)"
+            else
+              REVIEW=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // "Error: Unexpected API response"')
+              echo "$REVIEW" > kimi_review.txt
+            fi
+          fi
+
+      - name: Post review comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TRUNCATED: ${{ steps.diff.outputs.truncated }}
+          TOTAL_LINES: ${{ steps.diff.outputs.total_lines }}
+        run: |
+          REVIEW_CONTENT=$(cat kimi_review.txt)
+
+          TRUNCATION_WARNING=""
+          if [ "$TRUNCATED" = "true" ]; then
+            TRUNCATION_WARNING="
+          > ⚠️ **Warning:** Diff was truncated from $TOTAL_LINES to 10000 lines. Some changes were not reviewed.
+          "
+          fi
+
+          gh pr comment ${{ github.event.pull_request.number }} --body "## 🤖 Kimi Code Review
+          $TRUNCATION_WARNING
+          $REVIEW_CONTENT
+
+          ---
+          *Automated review by Kimi (Moonshot AI)*"
