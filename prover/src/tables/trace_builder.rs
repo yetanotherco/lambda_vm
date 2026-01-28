@@ -198,7 +198,7 @@ impl Traces {
                     let loaded_value = log.dst_val;
 
                     // Read old values and timestamps from memory state
-                    let (old_values, old_timestamps) = memory_state.read_bytes(base_address, 8);
+                    let (_old_values, old_timestamps) = memory_state.read_bytes(base_address, 8);
 
                     // Extract individual bytes from loaded value
                     let mut value_bytes = [0u64; 8];

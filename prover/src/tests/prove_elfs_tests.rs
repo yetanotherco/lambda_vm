@@ -24,9 +24,7 @@ use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
 use crate::tables::bitwise::{generate_bitwise_trace, update_multiplicities};
-use crate::tables::load::generate_load_trace;
 use crate::tables::lt::generate_lt_trace;
-use crate::tables::memw::generate_memw_trace;
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
@@ -1008,7 +1006,7 @@ fn test_prove_elfs_all_loadstore_32() {
             let m4 = traces.cpu.main_table.data[base + cpu_cols::MEMORY_4BYTES];
             let m8 = traces.cpu.main_table.data[base + cpu_cols::MEMORY_8BYTES];
             // CPU RES (base_address) as bytes
-            let mut cpu_res: Vec<_> = (0..8).map(|i| traces.cpu.main_table.data[base + cpu_cols::RES[i]]).collect();
+            let cpu_res: Vec<_> = (0..8).map(|i| traces.cpu.main_table.data[base + cpu_cols::RES[i]]).collect();
 
             // Corresponding LOAD row
             let load_base = load_idx * load_cols::NUM_COLUMNS;

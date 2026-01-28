@@ -1,7 +1,7 @@
 use super::domain::Domain;
 use super::traits::{AIR, TransitionEvaluationContext};
 use crate::{frame::Frame, trace::LDETraceTable};
-use log::{error, info};
+use log::error;
 use math::field::traits::IsSubFieldOf;
 use math::{
     field::{
