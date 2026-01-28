@@ -70,8 +70,10 @@ jobs:
         with:
           branch: main
           workflow: memory-profile.yml
+          workflow_conclusion: success
           name: dhat-heap-.*
           name_is_regexp: true
+          search_artifacts: true
           path: baseline/
           if_no_artifact_found: warn
         continue-on-error: true
@@ -80,7 +82,8 @@ jobs:
         id: compare
         run: |
           if [ -f baseline/*/dhat-heap.json ]; then
-            BASELINE_FILE=$(ls baseline/*/dhat-heap.json | head -1)
+            # Get the most recently modified baseline file (in case multiple were downloaded)
+            BASELINE_FILE=$(ls -t baseline/*/dhat-heap.json 2>/dev/null | head -1)
             BASELINE_PEAK=$(jq '[.pps[].gb] | add' "$BASELINE_FILE")
             BASELINE_TOTAL=$(jq '[.pps[].tb] | add' "$BASELINE_FILE")
 
@@ -145,6 +148,7 @@ jobs:
               fi
             fi
           else
+            echo "::notice::No baseline found on main branch, establishing initial baseline"
             echo "has_baseline=false" >> $GITHUB_OUTPUT
             echo "regression=false" >> $GITHUB_OUTPUT
           fi
