@@ -2,6 +2,9 @@ use std::marker::PhantomData;
 #[cfg(feature = "instruments")]
 use std::time::Instant;
 
+#[cfg(feature = "memory-profile")]
+use memory_stats::memory_stats;
+
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use math::fft::cpu::bit_reversing::{in_place_bit_reverse_permute, reverse_index};
 use math::fft::errors::FFTError;
@@ -15,7 +18,9 @@ use math::{
 };
 
 #[cfg(feature = "parallel")]
-use rayon::prelude::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use rayon::prelude::{
+    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
+};
 
 #[cfg(debug_assertions)]
 use crate::debug::validate_trace;
@@ -35,6 +40,26 @@ use super::lookup::BusPublicInputs;
 use super::proof::stark::{DeepPolynomialOpening, MultiProof, StarkProof};
 use super::trace::TraceTable;
 use super::traits::AIR;
+
+/// Macro for memory profiling checkpoints
+#[cfg(feature = "memory-profile")]
+macro_rules! memory_checkpoint {
+    ($label:expr) => {
+        if let Some(usage) = memory_stats() {
+            println!(
+                "[MEMORY] {}: {:.2} MB (physical), {:.2} MB (virtual)",
+                $label,
+                usage.physical_mem as f64 / (1024.0 * 1024.0),
+                usage.virtual_mem as f64 / (1024.0 * 1024.0)
+            );
+        }
+    };
+}
+
+#[cfg(not(feature = "memory-profile"))]
+macro_rules! memory_checkpoint {
+    ($label:expr) => {};
+}
 
 /// A triple of (AIR, TraceTable, PublicInputs) for proving.
 type AirTracePair<'a, Field, FieldExtension, PI> = (
@@ -617,6 +642,10 @@ pub trait IsStarkProver<
 
     /// Returns the Merkle tree and the commitment to the evaluations of the parts of the
     /// composition polynomial.
+    ///
+    /// This function transposes the column-major input to row-major format, applies bit-reversal,
+    /// and merges pairs of rows for the Merkle tree commitment - all in a single pass to minimize
+    /// memory allocations.
     fn commit_composition_polynomial(
         lde_composition_poly_parts_evaluations: &[Vec<FieldElement<FieldExtension>>],
     ) -> Option<(BatchedMerkleTree<FieldExtension>, Commitment)>
@@ -624,24 +653,39 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        // TODO: Remove clones
-        let mut lde_composition_poly_evaluations = Vec::new();
-        for i in 0..lde_composition_poly_parts_evaluations[0].len() {
-            let mut row = Vec::new();
-            for evaluation in lde_composition_poly_parts_evaluations.iter() {
-                row.push(evaluation[i].clone());
-            }
-            lde_composition_poly_evaluations.push(row);
-        }
+        let num_elements = lde_composition_poly_parts_evaluations[0].len();
+        let num_parts = lde_composition_poly_parts_evaluations.len();
+        let num_merged_rows = num_elements / 2;
 
-        in_place_bit_reverse_permute(&mut lde_composition_poly_evaluations);
+        // Build merged rows directly, applying bit-reversal during construction.
+        // This avoids creating an intermediate transposed array.
+        //
+        // After bit-reverse permutation, position i contains data from position reverse_index(i).
+        // We merge pairs of consecutive rows, so merged row i combines:
+        //   - bit-reversed row 2*i (from original index reverse_index(2*i))
+        //   - bit-reversed row 2*i+1 (from original index reverse_index(2*i+1))
+        #[cfg(feature = "parallel")]
+        let iter = (0..num_merged_rows).into_par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let iter = 0..num_merged_rows;
 
-        let mut lde_composition_poly_evaluations_merged = Vec::new();
-        for chunk in lde_composition_poly_evaluations.chunks(2) {
-            let (mut chunk0, chunk1) = (chunk[0].clone(), &chunk[1]);
-            chunk0.extend_from_slice(chunk1);
-            lde_composition_poly_evaluations_merged.push(chunk0);
-        }
+        let lde_composition_poly_evaluations_merged: Vec<Vec<FieldElement<FieldExtension>>> = iter
+            .map(|i| {
+                let src_idx_0 = reverse_index(2 * i, num_elements as u64);
+                let src_idx_1 = reverse_index(2 * i + 1, num_elements as u64);
+
+                let mut row = Vec::with_capacity(2 * num_parts);
+                // First half: elements from the row at src_idx_0
+                for part in lde_composition_poly_parts_evaluations.iter() {
+                    row.push(part[src_idx_0].clone());
+                }
+                // Second half: elements from the row at src_idx_1
+                for part in lde_composition_poly_parts_evaluations.iter() {
+                    row.push(part[src_idx_1].clone());
+                }
+                row
+            })
+            .collect();
 
         Self::batch_commit_extension(&lde_composition_poly_evaluations_merged)
     }
@@ -659,6 +703,8 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
+        memory_checkpoint!("Round 2: Start");
+
         // Compute the evaluations of the composition polynomial on the LDE domain.
         let trace_length = domain.interpolation_domain_size;
         let evaluator = ConstraintEvaluator::new(
@@ -676,11 +722,13 @@ pub trait IsStarkProver<
             boundary_coefficients,
             &round_1_result.rap_challenges,
         );
+        memory_checkpoint!("Round 2: After constraint evaluation");
 
         // Get coefficients of the composition poly H
         let composition_poly =
             Polynomial::interpolate_offset_fft(&constraint_evaluations, &domain.coset_offset)
                 .unwrap();
+        memory_checkpoint!("Round 2: After composition poly interpolation");
 
         let trace_length = domain.interpolation_domain_size;
         let number_of_parts = air.composition_poly_degree_bound(trace_length) / trace_length;
@@ -698,12 +746,14 @@ pub trait IsStarkProver<
                 .unwrap()
             })
             .collect();
+        memory_checkpoint!("Round 2: After LDE composition poly evaluation");
 
         let Some((composition_poly_merkle_tree, composition_poly_root)) =
             Self::commit_composition_polynomial(&lde_composition_poly_parts_evaluations)
         else {
             return Err(ProvingError::EmptyCommitment);
         };
+        memory_checkpoint!("Round 2: After composition poly commitment");
 
         Ok(Round2 {
             lde_composition_poly_evaluations: lde_composition_poly_parts_evaluations,
@@ -1192,6 +1242,7 @@ pub trait IsStarkProver<
         PI: Send + Sync + Clone,
     {
         info!("Started proof generation...");
+        memory_checkpoint!("Start of multi_prove");
 
         let num_airs = air_trace_pairs.len();
 
@@ -1234,6 +1285,7 @@ pub trait IsStarkProver<
             main_commitments.push((main, evaluations));
             domains.push(domain);
         }
+        memory_checkpoint!("After Round 1 Phase A (main trace commitment)");
 
         // =====================================================================
         // Round 1, Phase B: Sample shared LogUp challenges
@@ -1271,6 +1323,7 @@ pub trait IsStarkProver<
             )?;
             round_1_results.push(round_1_result);
         }
+        memory_checkpoint!("After Round 1 Phase C (auxiliary trace commitment)");
 
         // =====================================================================
         // Rounds 2-4: Standard STARK protocol for each AIR
@@ -1284,6 +1337,7 @@ pub trait IsStarkProver<
                 Self::prove_rounds_2_to_4(*air, *pub_inputs, &round_1_result, transcript, &domain)?;
             proofs.push(proof);
         }
+        memory_checkpoint!("After Rounds 2-4 (proof complete)");
 
         Ok(MultiProof::new(proofs))
     }

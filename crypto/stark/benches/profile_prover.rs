@@ -1,18 +1,31 @@
 // Profiling binary for STARK prover to generate flamegraph data
 // It can run using `samply record cargo bench --bench profile_prover --features parallel`.
+// For memory profiling, run with `cargo bench --bench profile_prover --features "parallel,memory-profile"`.
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
 use math::field::fields::fft_friendly::extensions_goldilocks::Degree3GoldilocksExtensionField;
-use math::field::fields::fft_friendly::u64_goldilocks::U64GoldilocksPrimeField;
+use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
+use memory_stats::memory_stats;
 use stark::examples::fibonacci_multi_column::{
     FibonacciMultiColumnAIR, compute_trace, create_public_inputs,
 };
 use stark::proof::options::ProofOptions;
 use stark::prover::{IsStarkProver, Prover};
 
-type F = U64GoldilocksPrimeField;
+type F = GoldilocksField;
 type E = Degree3GoldilocksExtensionField;
 type FE = FieldElement<F>;
+
+fn print_memory(label: &str) {
+    if let Some(usage) = memory_stats() {
+        println!(
+            "[MEMORY] {}: {:.2} MB (physical), {:.2} MB (virtual)",
+            label,
+            usage.physical_mem as f64 / (1024.0 * 1024.0),
+            usage.virtual_mem as f64 / (1024.0 * 1024.0)
+        );
+    }
+}
 
 fn main() {
     // Use a representative workload for profiling
@@ -25,6 +38,8 @@ fn main() {
 
     let num_columns = 16;
     let trace_length = 1048576; // 2^20 = 1.048.576
+
+    print_memory("Start");
 
     println!("Starting STARK prover profiling...");
     println!("Configuration:");
@@ -42,6 +57,12 @@ fn main() {
     #[cfg(not(feature = "parallel"))]
     println!("  - Parallel: DISABLED");
 
+    #[cfg(feature = "memory-profile")]
+    println!("  - Memory profiling: ENABLED");
+
+    #[cfg(not(feature = "memory-profile"))]
+    println!("  - Memory profiling: DISABLED (enable with --features memory-profile)");
+
     let initial_values: Vec<(FE, FE)> = (0..num_columns)
         .map(|i| (FE::from((i + 1) as u64), FE::from((i + 2) as u64)))
         .collect();
@@ -50,6 +71,7 @@ fn main() {
     let mut trace = compute_trace::<F, E>(&initial_values, trace_length);
     let pub_inputs = create_public_inputs(initial_values);
     let air = FibonacciMultiColumnAIR::<F, E>::with_num_columns(&proof_options, num_columns);
+    print_memory("After trace generation");
 
     println!("Starting proof generation (this could take a while)...");
     let start = std::time::Instant::now();
@@ -63,6 +85,8 @@ fn main() {
     .expect("Failed to generate proof");
 
     let elapsed = start.elapsed();
+    print_memory("After proof generation");
+
     println!("\nProof generation completed in {:?}", elapsed);
     println!(
         "Profiling complete. Run with 'samply record' or 'cargo flamegraph' to generate flamegraph."
