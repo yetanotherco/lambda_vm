@@ -498,6 +498,45 @@ impl Traces {
             ));
         }
 
+        // Collect IsHalfword lookups for MEMW address_add columns
+        // Each MEMW operation sends 28 IsHalfword lookups (7 address_add values × 4 halfwords each)
+        // Note: address_add[i] = base_address + i + 1 (as per memw trace generation)
+        for memw_op in &memw_ops {
+            for i in 0..7u64 {
+                let addr_add = memw_op.base_address.wrapping_add(i + 1);
+                // Extract 4 halfwords from address_add (DWordHL packing)
+                let h0 = (addr_add & 0xFFFF) as u16;
+                let h1 = ((addr_add >> 16) & 0xFFFF) as u16;
+                let h2 = ((addr_add >> 32) & 0xFFFF) as u16;
+                let h3 = ((addr_add >> 48) & 0xFFFF) as u16;
+
+                bitwise_lookups.push((
+                    bitwise::BitwiseLookup::IsHalf,
+                    (h0 & 0xFF) as u8,
+                    (h0 >> 8) as u8,
+                    0,
+                ));
+                bitwise_lookups.push((
+                    bitwise::BitwiseLookup::IsHalf,
+                    (h1 & 0xFF) as u8,
+                    (h1 >> 8) as u8,
+                    0,
+                ));
+                bitwise_lookups.push((
+                    bitwise::BitwiseLookup::IsHalf,
+                    (h2 & 0xFF) as u8,
+                    (h2 >> 8) as u8,
+                    0,
+                ));
+                bitwise_lookups.push((
+                    bitwise::BitwiseLookup::IsHalf,
+                    (h3 & 0xFF) as u8,
+                    (h3 >> 8) as u8,
+                    0,
+                ));
+            }
+        }
+
         // Update bitwise multiplicities after all lookups are collected
         bitwise::update_multiplicities(&mut bitwise, &bitwise_lookups);
 

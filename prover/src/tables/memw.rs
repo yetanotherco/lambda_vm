@@ -392,38 +392,34 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // -------------------------------------------------------------------------
     // IS_HALFWORD range checks for address_add[i][j]
     // -------------------------------------------------------------------------
-    // TEMPORARILY DISABLED: Requires bitwise table to have matching receivers
-    // with appropriate multiplicities. The current setup doesn't balance.
-    //
-    // Each address_add[i] is 4 halfwords, need to range check all of them.
+    // -------------------------------------------------------------------------
+    // IsHalfword range checks for address_add columns
+    // -------------------------------------------------------------------------
+    // Each address_add[i] is 4 halfwords (DWordHL packing), need to range check all.
     // Only check when row is active (μ_read + μ_write > 0).
-    // TODO: Refine multiplicity based on access width (only check addresses actually used)
-    #[allow(clippy::never_loop)]
-    for _ in 0..0 {
-        for i in 0..7 {
-            let cols_i = cols::address_add(i);
-            for &col in &cols_i {
-                interactions.push(BusInteraction::sender(
-                    BusId::IsHalfword,
-                    // Only range check when row is active
-                    Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE),
-                    vec![BusValue::Packed {
-                        start_column: col,
-                        packing: Packing::Direct,
-                    }],
-                ));
-            }
+    for i in 0..7 {
+        let cols_i = cols::address_add(i);
+        for &col in &cols_i {
+            interactions.push(BusInteraction::sender(
+                BusId::IsHalfword,
+                // Only range check when row is active
+                Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE),
+                vec![BusValue::Packed {
+                    start_column: col,
+                    packing: Packing::Direct,
+                }],
+            ));
         }
     }
 
     // -------------------------------------------------------------------------
     // Memory bus interactions (M1-M8 from spec)
     // -------------------------------------------------------------------------
-    // TEMPORARILY DISABLED: These require initialization rows at timestamp 0
-    // for each address to be accessed. Without initialization, the first write
-    // to any address sends a "read old" that has no matching "write".
-    //
-    // TODO: Either add initialization rows or implement a different scheme.
+    // DISABLED: Memory bus requires initialization and finalization:
+    // - Initialization: For each address accessed, an initial row at timestamp=0
+    //   with the starting value must exist so the first read has a matching write.
+    // - Finalization: Final values must be consumed to balance the bus.
+    // Without these, the bus won't balance.
     // -------------------------------------------------------------------------
     // These ensure read/write consistency:
     // - Read old value at old_timestamp (+multiplicity)
