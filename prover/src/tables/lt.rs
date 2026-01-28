@@ -141,33 +141,8 @@ pub fn generate_lt_trace(
     let num_rows = unique_ops.len().next_power_of_two().max(4);
     let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
 
-    // DEBUG: Print all unique LT operations
-    eprintln!("\n=== LT TRACE (receiver side) ===");
-    eprintln!("Total unique ops: {}, Total raw ops: {}", unique_ops.len(), operations.len());
-
     for (row_idx, (op, multiplicity)) in unique_ops.iter().enumerate() {
         let base = row_idx * cols::NUM_COLUMNS;
-
-        // DEBUG: Print each LT row
-        let lt = op.compute_lt();
-        // Compute what bus elements the receiver would produce
-        let lhs_bus_e0 = op.lhs & 0xFFFF_FFFF;
-        let lhs_bus_e1 = op.lhs >> 32;
-        let rhs_bus_e0 = op.rhs & 0xFFFF_FFFF;
-        let rhs_bus_e1 = op.rhs >> 32;
-        if row_idx == 0 {
-            eprintln!(
-                "LT row 0 bus elements: [{}, {}, {}, {}, {}, {}] x{}",
-                lhs_bus_e0, lhs_bus_e1, rhs_bus_e0, rhs_bus_e1,
-                if op.signed { 1 } else { 0 },
-                if lt { 1 } else { 0 },
-                multiplicity
-            );
-        }
-        eprintln!(
-            "LT row {}: ({:#x}, {:#x}, {}, {}) x{}",
-            row_idx, op.lhs, op.rhs, if op.signed { 1 } else { 0 }, if lt { 1 } else { 0 }, multiplicity
-        );
 
         // Extract lhs as DWordHHW: [Word, Half, Half]
         let lhs_0 = (op.lhs & 0xFFFF_FFFF) as u32; // bits 0-31
@@ -187,33 +162,6 @@ pub fn generate_lt_trace(
         data[base + cols::RHS_1] = FE::from(rhs_1 as u64);
         data[base + cols::RHS_2] = FE::from(rhs_2 as u64);
         data[base + cols::SIGNED] = FE::from(if op.signed { 1u64 } else { 0u64 });
-
-        // DEBUG: Print column layout and values for first row
-        if row_idx == 0 {
-            eprintln!("\n=== LT COLUMN LAYOUT DEBUG ===");
-            eprintln!("LHS columns: [{}, {}, {}] (DWordHHW)", cols::LHS_0, cols::LHS_1, cols::LHS_2);
-            eprintln!("RHS columns: [{}, {}, {}] (DWordHHW)", cols::RHS_0, cols::RHS_1, cols::RHS_2);
-            eprintln!("SIGNED: {}, LT: {}, MU: {}", cols::SIGNED, cols::LT, cols::MU);
-        }
-        // DWordHHW produces: [col0, col1 + 2^16 * col2]
-        let lhs_bus_e0 = lhs_0 as u64;
-        let lhs_bus_e1 = (lhs_1 as u64) + ((lhs_2 as u64) << 16);
-        let rhs_bus_e0 = rhs_0 as u64;
-        let rhs_bus_e1 = (rhs_1 as u64) + ((rhs_2 as u64) << 16);
-        let signed_val = if op.signed { 1u64 } else { 0u64 };
-        let lt_val = if op.compute_lt() { 1u64 } else { 0u64 };
-        eprintln!(
-            "LT row {}: col[{}]={}, col[{}]={}, col[{}]={}, col[{}]={}, col[{}]={}, col[{}]={} → bus: [{}, {}, {}, {}, {}, {}] x{}",
-            row_idx,
-            cols::LHS_0, lhs_0,
-            cols::LHS_1, lhs_1,
-            cols::LHS_2, lhs_2,
-            cols::RHS_0, rhs_0,
-            cols::RHS_1, rhs_1,
-            cols::RHS_2, rhs_2,
-            lhs_bus_e0, lhs_bus_e1, rhs_bus_e0, rhs_bus_e1, signed_val, lt_val,
-            multiplicity
-        );
 
         // Compute lt result
         let lt = op.compute_lt();
@@ -242,30 +190,6 @@ pub fn generate_lt_trace(
         // Multiplicity: aggregated count of this operation
         data[base + cols::MU] = FE::from(*multiplicity);
     }
-
-    // DEBUG: Summary
-    let total_mult: u64 = unique_ops.iter().map(|(_, m)| m).sum();
-    let failed_lt: Vec<_> = unique_ops.iter().filter(|(op, _)| !op.compute_lt()).collect();
-    eprintln!("LT total multiplicity: {}", total_mult);
-    if !failed_lt.is_empty() {
-        eprintln!("WARNING: {} ops where lhs >= rhs (lt=0):", failed_lt.len());
-        for (op, mult) in failed_lt {
-            eprintln!("  ({:#x}, {:#x}, {}) x{}", op.lhs, op.rhs, if op.signed { 1 } else { 0 }, mult);
-        }
-    }
-    eprintln!("=== END LT TRACE ===\n");
-
-    // DEBUG: Check padding rows
-    eprintln!("=== LT TRACE PADDING DEBUG ===");
-    eprintln!("Active rows: {}, Total rows (padded): {}", unique_ops.len(), num_rows);
-    for row_idx in unique_ops.len()..num_rows {
-        let base = row_idx * cols::NUM_COLUMNS;
-        let mu = data[base + cols::MU];
-        if mu != FE::zero() {
-            eprintln!("WARNING: LT padding row {} has non-zero MU: {:?}", row_idx, mu);
-        }
-    }
-    eprintln!("=== END LT TRACE PADDING DEBUG ===\n");
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
 }

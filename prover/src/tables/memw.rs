@@ -209,22 +209,18 @@ impl MemwOperation {
         // Constraint 8: old_timestamp[1] < timestamp (for width >= 2)
         if self.width >= 2 {
             ops.push(LtOperation::new(self.old_timestamp[1], self.timestamp, false));
-            eprintln!("  #8: ({}, {}, 0) [old_ts[1] < ts]", self.old_timestamp[1], self.timestamp);
         }
 
         // Constraint 9: old_timestamp[2,3] < timestamp (for width >= 4)
         if self.width >= 4 {
             ops.push(LtOperation::new(self.old_timestamp[2], self.timestamp, false));
-            eprintln!("  #9a: ({}, {}, 0) [old_ts[2] < ts]", self.old_timestamp[2], self.timestamp);
             ops.push(LtOperation::new(self.old_timestamp[3], self.timestamp, false));
-            eprintln!("  #9b: ({}, {}, 0) [old_ts[3] < ts]", self.old_timestamp[3], self.timestamp);
         }
 
         // Constraint 10: old_timestamp[4..7] < timestamp (for width == 8)
         if self.width == 8 {
             for i in 4..8 {
                 ops.push(LtOperation::new(self.old_timestamp[i], self.timestamp, false));
-                eprintln!("  #10: ({}, {}, 0) [old_ts[{}] < ts]", self.old_timestamp[i], self.timestamp, i);
             }
         }
 
@@ -235,9 +231,6 @@ impl MemwOperation {
             // Only add if no overflow (addr_plus_1 > base_address)
             if addr_plus_1 > self.base_address {
                 ops.push(LtOperation::new(self.base_address, addr_plus_1, false));
-                eprintln!("  R1: ({:#x}, {:#x}, 0) [base < base+1]", self.base_address, addr_plus_1);
-            } else {
-                eprintln!("  R1: SKIPPED (overflow) base={:#x}", self.base_address);
             }
         }
 
@@ -246,9 +239,6 @@ impl MemwOperation {
             let addr_plus_3 = self.base_address.wrapping_add(3);
             if addr_plus_3 > self.base_address {
                 ops.push(LtOperation::new(self.base_address, addr_plus_3, false));
-                eprintln!("  R2: ({:#x}, {:#x}, 0) [base < base+3]", self.base_address, addr_plus_3);
-            } else {
-                eprintln!("  R2: SKIPPED (overflow) base={:#x}", self.base_address);
             }
         }
 
@@ -257,9 +247,6 @@ impl MemwOperation {
             let addr_plus_7 = self.base_address.wrapping_add(7);
             if addr_plus_7 > self.base_address {
                 ops.push(LtOperation::new(self.base_address, addr_plus_7, false));
-                eprintln!("  R3: ({:#x}, {:#x}, 0) [base < base+7]", self.base_address, addr_plus_7);
-            } else {
-                eprintln!("  R3: SKIPPED (overflow) base={:#x}", self.base_address);
             }
         }
 
@@ -325,53 +312,7 @@ pub fn generate_memw_trace(
         data[base + cols::MU_READ] = FE::from(op.is_read as u64);
         data[base + cols::MU_WRITE] = FE::from(!op.is_read as u64);
         // Note: w2, w4, μ_sum are computed inline via Multiplicity::Linear/Sum
-
-        // DEBUG: Print bus elements for all rows with column details
-        if row_idx == 0 {
-            let old_ts_cols = cols::old_timestamp(0);
-            eprintln!("\n=== MEMW COLUMN LAYOUT DEBUG ===");
-            eprintln!("old_timestamp(0) columns: [{}, {}]", old_ts_cols[0], old_ts_cols[1]);
-            eprintln!("TIMESTAMP columns: [{}, {}]", cols::TIMESTAMP_0, cols::TIMESTAMP_1);
-            eprintln!("MU_READ: {}, MU_WRITE: {}", cols::MU_READ, cols::MU_WRITE);
-            eprintln!("NUM_COLUMNS: {}", cols::NUM_COLUMNS);
-        }
-        {
-            // Print exact column values for constraint #7
-            let old_ts_cols = cols::old_timestamp(0);
-            let old_ts_lo32 = op.old_timestamp[0] & 0xFFFF_FFFF;
-            let old_ts_hi32 = op.old_timestamp[0] >> 32;
-            let ts_lo32 = op.timestamp & 0xFFFF_FFFF;
-            let ts_hi32 = op.timestamp >> 32;
-            let mu_read = if op.is_read { 1u64 } else { 0u64 };
-            let mu_write = if op.is_read { 0u64 } else { 1u64 };
-            eprintln!(
-                "MEMW row {}: col[{}]={}, col[{}]={}, col[{}]={}, col[{}]={}, MU_R={}, MU_W={} → bus: [{}, {}, {}, {}, 0, 1]",
-                row_idx,
-                old_ts_cols[0], old_ts_lo32,
-                old_ts_cols[1], old_ts_hi32,
-                cols::TIMESTAMP_0, ts_lo32,
-                cols::TIMESTAMP_1, ts_hi32,
-                mu_read, mu_write,
-                old_ts_lo32, old_ts_hi32, ts_lo32, ts_hi32
-            );
-        }
     }
-
-    // DEBUG: Check trace dimensions and padding
-    eprintln!("=== MEMW TRACE DEBUG ===");
-    eprintln!("Active rows: {}, Total rows (padded): {}", operations.len(), num_rows);
-    eprintln!("Padding rows: {} (rows {} to {})", num_rows - operations.len(), operations.len(), num_rows - 1);
-
-    // Verify padding rows have MU_READ=MU_WRITE=0
-    for row_idx in operations.len()..num_rows {
-        let base = row_idx * cols::NUM_COLUMNS;
-        let mu_read = data[base + cols::MU_READ];
-        let mu_write = data[base + cols::MU_WRITE];
-        if mu_read != FE::zero() || mu_write != FE::zero() {
-            eprintln!("WARNING: Padding row {} has non-zero MU: MU_R={:?}, MU_W={:?}", row_idx, mu_read, mu_write);
-        }
-    }
-    eprintln!("=== END MEMW TRACE DEBUG ===\n");
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
 }
