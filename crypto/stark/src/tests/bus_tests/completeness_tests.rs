@@ -8,7 +8,7 @@ use math::field::fields::fft_friendly::{
     babybear::Babybear31PrimeField, quartic_babybear::Degree4BabyBearExtensionField,
 };
 
-use crate::examples::multi_table_lookup::{
+use crate::test_utils::examples::multi_table_lookup::{
     new_add_air_with_lookup, new_cpu_air_with_lookup, new_mul_air_with_lookup,
 };
 use crate::lookup::{

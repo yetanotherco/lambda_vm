@@ -47,6 +47,7 @@ test_fiat_shamir = []
 instruments = []                                                     # This enables timing prints in prover and verifier
 parallel = ["dep:rayon", "crypto/parallel"]
 wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "dep:web-sys"]
+test-utils = []  # Expose test examples and utilities for benchmarks
 
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dev-dependencies]
 proptest = "1.2.0"
@@ -75,7 +76,9 @@ omit-default-module-path = false
 [[bench]]
 name = "prover_benchmark"
 harness = false
+required-features = ["test-utils"]
 
 [[bench]]
 name = "profile_prover"
 harness = false
+required-features = ["test-utils"]

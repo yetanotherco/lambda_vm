@@ -1516,7 +1516,7 @@ mod tests {
 
     use crate::{
         Felt252,
-        examples::{
+        test_utils::examples::{
             fibonacci_2_cols_shifted::{self, Fibonacci2ColsShifted},
             simple_fibonacci::{self},
         },

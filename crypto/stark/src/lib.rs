@@ -6,7 +6,9 @@ pub mod constraints;
 pub mod context;
 pub mod debug;
 pub mod domain;
-pub mod examples;
+// Test utilities and examples - only available with test or test-utils feature
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_utils;
 pub mod frame;
 pub mod fri;
 pub mod grinding;

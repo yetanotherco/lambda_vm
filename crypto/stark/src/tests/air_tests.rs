@@ -14,7 +14,7 @@ use math::field::fields::fft_friendly::{
 use crate::traits::AIR;
 use crate::{
     Felt252,
-    examples::{
+    test_utils::examples::{
         bit_flags::{self, BitFlagsAIR},
         dummy_air::{self, DummyAIR},
         fibonacci_2_cols_shifted::{self, Fibonacci2ColsShifted},
@@ -32,7 +32,7 @@ use crate::{
     verifier::{IsStarkVerifier, Verifier},
 };
 
-use crate::examples::read_only_memory_logup::{
+use crate::test_utils::examples::read_only_memory_logup::{
     LogReadOnlyPublicInputs, LogReadOnlyRAP, read_only_logup_trace,
 };
 
