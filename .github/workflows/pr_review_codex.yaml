@@ -1,0 +1,53 @@
+# Reference: https://github.com/openai/codex-action/blob/main/README.md
+name: Codex Code Review
+
+on:
+  pull_request:
+    types: [opened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  codex-review:
+    name: Codex Code Review
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Run Codex Code Review
+        id: codex
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt: |
+            You are a senior code reviewer for Lambda ZKVM, a minimalist, performant and auditable verifiable RISC-V vm written in Rust.
+
+            Review this PR focusing on:
+            - Code correctness and potential bugs
+            - Security vulnerabilities
+            - Performance implications
+            - Rust best practices and idiomatic patterns
+            - Memory safety and proper error handling
+            - Code readability and maintainability
+
+            Be concise and specific. Provide line references when suggesting changes.
+            If the code looks good, acknowledge it briefly.
+
+      - name: Post Review Comment
+        if: steps.codex.outputs.final-message != ''
+        uses: actions/github-script@v7
+        env:
+          CODEX_REVIEW: ${{ steps.codex.outputs.final-message }}
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: `## 🤖 Codex Code Review\n\n${process.env.CODEX_REVIEW}`
+            });
