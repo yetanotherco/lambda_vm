@@ -30,9 +30,10 @@ use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
 // Import shared utilities
 use crate::test_utils::{
-    collect_bitwise_lookups_from_logs, collect_bitwise_lookups_from_lt,
-    collect_lt_lookups_from_logs, create_bitwise_air, create_cpu_air, create_load_air,
-    create_lt_air, create_memw_air, generate_minimal_bitwise_trace, run_asm_elf,
+    collect_bitwise_lookups_from_load, collect_bitwise_lookups_from_logs,
+    collect_bitwise_lookups_from_lt, collect_load_ops_from_logs, collect_lt_lookups_from_logs,
+    create_bitwise_air, create_cpu_air, create_load_air, create_lt_air, create_memw_air,
+    generate_minimal_bitwise_trace, run_asm_elf,
 };
 
 type F = GoldilocksField;
@@ -899,9 +900,11 @@ fn test_prove_elfs_test_lb_lh_8() {
     assert_eq!(logs.len(), 8);
     let mut traces = Traces::from_logs(&logs, instructions.clone()).unwrap();
     let lt_lookups = collect_lt_lookups_from_logs(&logs, &instructions);
+    let load_ops = collect_load_ops_from_logs(&logs, &instructions);
     let mut lt_trace = generate_lt_trace(&lt_lookups);
     let mut bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
     bitwise_lookups.extend(collect_bitwise_lookups_from_lt(&lt_lookups));
+    bitwise_lookups.extend(collect_bitwise_lookups_from_load(&load_ops));
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
     println!("test_lb_lh_8: {} lookups", bitwise_lookups.len());
     assert!(
@@ -922,9 +925,11 @@ fn test_prove_elfs_test_sb_sh_8() {
     assert_eq!(logs.len(), 8);
     let mut traces = Traces::from_logs(&logs, instructions.clone()).unwrap();
     let lt_lookups = collect_lt_lookups_from_logs(&logs, &instructions);
+    let load_ops = collect_load_ops_from_logs(&logs, &instructions);
     let mut lt_trace = generate_lt_trace(&lt_lookups);
     let mut bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
     bitwise_lookups.extend(collect_bitwise_lookups_from_lt(&lt_lookups));
+    bitwise_lookups.extend(collect_bitwise_lookups_from_load(&load_ops));
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
     println!("test_sb_sh_8: {} lookups", bitwise_lookups.len());
     assert!(
@@ -982,9 +987,11 @@ fn test_prove_elfs_all_loadstore_32() {
     // Use full Traces to get real MEMW and LOAD traces
     let mut traces = Traces::from_logs(&logs, instructions.clone()).unwrap();
     let lt_lookups = collect_lt_lookups_from_logs(&logs, &instructions);
+    let load_ops = collect_load_ops_from_logs(&logs, &instructions);
     let mut lt_trace = generate_lt_trace(&lt_lookups);
     let mut bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
     bitwise_lookups.extend(collect_bitwise_lookups_from_lt(&lt_lookups));
+    bitwise_lookups.extend(collect_bitwise_lookups_from_load(&load_ops));
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
     println!(
         "all_loadstore_32: {} CPU rows, {} MEMW rows, {} LOAD rows, {} bitwise lookups",

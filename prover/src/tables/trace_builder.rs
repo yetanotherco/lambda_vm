@@ -244,6 +244,8 @@ impl Traces {
                         signed,
                         res_bytes,
                     );
+                    // Collect MSB8 lookups for sign bit extraction
+                    bitwise_lookups.extend(load_op.collect_bitwise_lookups());
                     load_ops.push(load_op);
 
                     // Update memory state (reads still update timestamp for consistency)

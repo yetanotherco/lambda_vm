@@ -193,6 +193,72 @@ pub fn collect_lt_lookups_from_logs(
     lookups
 }
 
+/// Collect LOAD operations from executor logs.
+///
+/// Creates LoadOperation objects for each Load instruction in the logs.
+pub fn collect_load_ops_from_logs(
+    logs: &[Log],
+    instructions: &U64HashMap<Instruction>,
+) -> Vec<crate::tables::load::LoadOperation> {
+    use executor::vm::instruction::decoding::LoadStoreWidth;
+
+    let mut load_ops = Vec::new();
+
+    for log in logs {
+        let instruction = *instructions.get(&log.current_pc).unwrap();
+
+        if let Instruction::Load { width, .. } = instruction {
+            let base_address = log.src1_val.wrapping_add(
+                match instruction {
+                    Instruction::Load { offset, .. } => offset as i64 as u64,
+                    _ => 0,
+                }
+            );
+
+            let (byte_count, signed) = match width {
+                LoadStoreWidth::Byte => (1, true),
+                LoadStoreWidth::ByteUnsigned => (1, false),
+                LoadStoreWidth::Half => (2, true),
+                LoadStoreWidth::HalfUnsigned => (2, false),
+                LoadStoreWidth::Word => (4, true),
+                LoadStoreWidth::WordUnsigned => (4, false),
+                LoadStoreWidth::DoubleWord => (8, false),
+            };
+
+            let loaded_value = log.dst_val;
+
+            // Extract individual bytes from loaded value
+            let mut res_bytes = [0u64; 8];
+            for (j, byte) in res_bytes.iter_mut().take(byte_count).enumerate() {
+                *byte = (loaded_value >> (j * 8)) & 0xFF;
+            }
+
+            // Sign/zero extend the upper bytes
+            if byte_count < 8 {
+                let msb = res_bytes[byte_count - 1];
+                let sign_bit = (msb >> 7) & 1;
+                let fill = if signed && sign_bit == 1 { 0xFF } else { 0 };
+                for byte in res_bytes.iter_mut().skip(byte_count) {
+                    *byte = fill;
+                }
+            }
+
+            // Use a dummy timestamp (not used for bitwise lookups)
+            let timestamp = 0;
+
+            load_ops.push(crate::tables::load::LoadOperation::new(
+                base_address,
+                timestamp,
+                byte_count as u8,
+                signed,
+                res_bytes,
+            ));
+        }
+    }
+
+    load_ops
+}
+
 /// Collect bitwise lookups from LT operations (MSB16 and IS_HALFWORD).
 ///
 /// The LT table sends:
@@ -246,6 +312,22 @@ pub fn collect_bitwise_lookups_from_lt(lt_ops: &[LtOperation]) -> Vec<(BitwiseLo
     }
 
     lookups
+}
+
+/// Collect bitwise lookups from LOAD operations.
+///
+/// The LOAD table sends MSB8 lookups for sign bit extraction:
+/// - read1: MSB8[res[0]] -> sign_bit
+/// - read2: MSB8[res[1]] -> sign_bit
+/// - read4: MSB8[res[3]] -> sign_bit
+/// - read8: no MSB8 lookup (all 8 bytes are used)
+pub fn collect_bitwise_lookups_from_load(
+    load_ops: &[crate::tables::load::LoadOperation],
+) -> Vec<(BitwiseLookup, u8, u8, u8)> {
+    load_ops
+        .iter()
+        .flat_map(|op| op.collect_bitwise_lookups())
+        .collect()
 }
 
 // =============================================================================

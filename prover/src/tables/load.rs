@@ -147,6 +147,33 @@ impl LoadOperation {
         };
         (self.res[byte_idx] >> 7) & 1 == 1
     }
+
+    /// Collect MSB8 bitwise lookups for sign bit extraction.
+    ///
+    /// Per spec constraints #3-#5:
+    /// - read1: MSB8[res[0]] -> sign_bit
+    /// - read2: MSB8[res[1]] -> sign_bit
+    /// - read4: MSB8[res[3]] -> sign_bit
+    /// - read8: no MSB8 lookup needed (all 8 bytes are used)
+    pub fn collect_bitwise_lookups(&self) -> Vec<(super::bitwise::BitwiseLookup, u8, u8, u8)> {
+        use super::bitwise::BitwiseLookup;
+
+        // For width 8, no sign extension is needed
+        if self.width == 8 {
+            return Vec::new();
+        }
+
+        // Get the byte index for the MSB8 lookup based on width
+        let byte_idx = match self.width {
+            1 => 0, // res[0] for read1
+            2 => 1, // res[1] for read2
+            4 => 3, // res[3] for read4
+            _ => return Vec::new(),
+        };
+
+        let input_byte = self.res[byte_idx] as u8;
+        vec![(BitwiseLookup::Msb8, input_byte, 0, 0)]
+    }
 }
 
 /// Generates the LOAD trace table from a list of operations.
@@ -318,81 +345,79 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // MSB8 lookups for sign bit extraction - TEMPORARILY DISABLED
+    // MSB8 lookups for sign bit extraction
     // -------------------------------------------------------------------------
     // Need to extract MSB from the relevant byte based on width
     // For read1: MSB8[res[0]] -> sign_bit, multiplicity = read1 = μ - read2 - read4 - read8
     // For read2: MSB8[res[1]] -> sign_bit, multiplicity = read2
     // For read4: MSB8[res[3]] -> sign_bit, multiplicity = read4
     // (For read8, no extension needed - all 8 bytes are used)
-    #[allow(clippy::overly_complex_bool_expr)]
-    for _ in 0..0 {
-        // MSB8[res[0]] -> sign_bit (for read1)
-        // read1 = μ - read2 - read4 - read8 (reading exactly 1 byte)
-        interactions.push(BusInteraction::sender(
-            BusId::Msb8,
-            Multiplicity::Linear(vec![
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::MU,
-                },
-                LinearTerm::Column {
-                    coefficient: -1,
-                    column: cols::READ2,
-                },
-                LinearTerm::Column {
-                    coefficient: -1,
-                    column: cols::READ4,
-                },
-                LinearTerm::Column {
-                    coefficient: -1,
-                    column: cols::READ8,
-                },
-            ]),
-            vec![
-                BusValue::Packed {
-                    start_column: cols::RES[0],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::SIGN_BIT,
-                    packing: Packing::Direct,
-                },
-            ],
-        ));
 
-        // MSB8[res[1]] -> sign_bit (for read2)
-        interactions.push(BusInteraction::sender(
-            BusId::Msb8,
-            Multiplicity::Column(cols::READ2),
-            vec![
-                BusValue::Packed {
-                    start_column: cols::RES[1],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::SIGN_BIT,
-                    packing: Packing::Direct,
-                },
-            ],
-        ));
+    // MSB8[res[0]] -> sign_bit (for read1)
+    // read1 = μ - read2 - read4 - read8 (reading exactly 1 byte)
+    interactions.push(BusInteraction::sender(
+        BusId::Msb8,
+        Multiplicity::Linear(vec![
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::MU,
+            },
+            LinearTerm::Column {
+                coefficient: -1,
+                column: cols::READ2,
+            },
+            LinearTerm::Column {
+                coefficient: -1,
+                column: cols::READ4,
+            },
+            LinearTerm::Column {
+                coefficient: -1,
+                column: cols::READ8,
+            },
+        ]),
+        vec![
+            BusValue::Packed {
+                start_column: cols::RES[0],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::SIGN_BIT,
+                packing: Packing::Direct,
+            },
+        ],
+    ));
 
-        // MSB8[res[3]] -> sign_bit (for read4)
-        interactions.push(BusInteraction::sender(
-            BusId::Msb8,
-            Multiplicity::Column(cols::READ4),
-            vec![
-                BusValue::Packed {
-                    start_column: cols::RES[3],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::SIGN_BIT,
-                    packing: Packing::Direct,
-                },
-            ],
-        ));
-    } // END TEMPORARILY DISABLED MSB8 interactions
+    // MSB8[res[1]] -> sign_bit (for read2)
+    interactions.push(BusInteraction::sender(
+        BusId::Msb8,
+        Multiplicity::Column(cols::READ2),
+        vec![
+            BusValue::Packed {
+                start_column: cols::RES[1],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::SIGN_BIT,
+                packing: Packing::Direct,
+            },
+        ],
+    ));
+
+    // MSB8[res[3]] -> sign_bit (for read4)
+    interactions.push(BusInteraction::sender(
+        BusId::Msb8,
+        Multiplicity::Column(cols::READ4),
+        vec![
+            BusValue::Packed {
+                start_column: cols::RES[3],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::SIGN_BIT,
+                packing: Packing::Direct,
+            },
+        ],
+    ));
 
     // -------------------------------------------------------------------------
     // LOAD receiver (from CPU)
