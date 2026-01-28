@@ -330,6 +330,20 @@ pub fn collect_bitwise_lookups_from_load(
         .collect()
 }
 
+/// Collect LT operations from MEMW operations.
+///
+/// The MEMW table sends LT lookups for:
+/// - Timestamp ordering: old_timestamp[i] < timestamp
+/// - Overflow checking: base_address < base_address + offset
+pub fn collect_lt_lookups_from_memw(
+    memw_ops: &[crate::tables::memw::MemwOperation],
+) -> Vec<LtOperation> {
+    memw_ops
+        .iter()
+        .flat_map(|op| op.collect_lt_lookups())
+        .collect()
+}
+
 // =============================================================================
 // Minimal Trace Generation (for testing/benchmarking only)
 // =============================================================================

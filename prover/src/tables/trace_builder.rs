@@ -176,8 +176,10 @@ impl Traces {
         let mut register_state = RegisterState::new();
 
         // Single pass over logs
+        // Timestamps start at 4 (not 0) to ensure old_timestamp < timestamp holds
+        // for the first access to any register/memory location (where old_timestamp=0).
         for (i, log) in logs.iter().enumerate() {
-            let timestamp = (i as u64) * 4;
+            let timestamp = (i as u64) * 4 + 4;
             let instruction = instructions
                 .get(&log.current_pc)
                 .copied()
@@ -191,6 +193,7 @@ impl Traces {
             if op.op_slt || op.op_blt {
                 let arg1 = op.compute_arg1();
                 let arg2 = op.compute_arg2();
+                eprintln!("CPU LT op: ({:#x}, {:#x}, {}) [SLT/BLT]", arg1, arg2, if op.signed { 1 } else { 0 });
                 lt_ops.push(LtOperation::new(arg1, arg2, op.signed));
             }
 
@@ -376,8 +379,134 @@ impl Traces {
         // Generate CPU trace (handles padding internally)
         let cpu = cpu::generate_cpu_trace(&cpu_ops);
 
-        // Generate BITWISE trace and update multiplicities
+        // Generate BITWISE trace (multiplicities updated after LT ops are collected)
         let mut bitwise = bitwise::generate_bitwise_trace();
+
+        // Collect LT operations from MEMW (timestamp ordering and overflow checks)
+        // DEBUG: Match enable flags in bus_interactions
+        let enable_c7 = true;
+        let enable_c8 = true;
+        let enable_c9 = true;
+        let enable_c10 = true;
+        let enable_r1_r3 = true;
+        let lt_ops_before_memw = lt_ops.len();
+        for memw_op in &memw_ops {
+            // Only collect ops for enabled constraints
+            if enable_c7 {
+                lt_ops.push(LtOperation::new(memw_op.old_timestamp[0], memw_op.timestamp, false));
+            }
+            if enable_c8 && memw_op.width >= 2 {
+                lt_ops.push(LtOperation::new(memw_op.old_timestamp[1], memw_op.timestamp, false));
+            }
+            if enable_c9 && memw_op.width >= 4 {
+                lt_ops.push(LtOperation::new(memw_op.old_timestamp[2], memw_op.timestamp, false));
+                lt_ops.push(LtOperation::new(memw_op.old_timestamp[3], memw_op.timestamp, false));
+            }
+            if enable_c10 && memw_op.width == 8 {
+                for i in 4..8 {
+                    lt_ops.push(LtOperation::new(memw_op.old_timestamp[i], memw_op.timestamp, false));
+                }
+            }
+            if enable_r1_r3 {
+                if memw_op.width == 2 {
+                    let addr_plus_1 = memw_op.base_address.wrapping_add(1);
+                    if addr_plus_1 > memw_op.base_address {
+                        lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_1, false));
+                    }
+                }
+                if memw_op.width == 4 {
+                    let addr_plus_3 = memw_op.base_address.wrapping_add(3);
+                    if addr_plus_3 > memw_op.base_address {
+                        lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_3, false));
+                    }
+                }
+                if memw_op.width == 8 {
+                    let addr_plus_7 = memw_op.base_address.wrapping_add(7);
+                    if addr_plus_7 > memw_op.base_address {
+                        lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_7, false));
+                    }
+                }
+            }
+        }
+        eprintln!("\n=== LT OPS SUMMARY ===");
+        eprintln!("CPU LT ops (SLT/BLT): {}", lt_ops_before_memw);
+        eprintln!("MEMW LT ops: {}", lt_ops.len() - lt_ops_before_memw);
+        eprintln!("Total LT ops: {}", lt_ops.len());
+
+        // Collect bitwise lookups for ALL LT operations (CPU and MEMW)
+        // Each LT operation sends to MSB16 (2 lookups) and IsHalfword (6 lookups)
+        for op in &lt_ops {
+            // Extract halfwords for MSB16 lookups
+            let lhs_2 = ((op.lhs >> 48) & 0xFFFF) as u16;
+            let rhs_2 = ((op.rhs >> 48) & 0xFFFF) as u16;
+
+            // Extract halfwords for IsHalf lookups
+            let lhs_1 = ((op.lhs >> 32) & 0xFFFF) as u16;
+            let rhs_1 = ((op.rhs >> 32) & 0xFFFF) as u16;
+
+            // Compute lhs_sub_rhs for IsHalf lookups
+            let lhs_sub_rhs = op.lhs.wrapping_sub(op.rhs);
+            let sub_0 = (lhs_sub_rhs & 0xFFFF) as u16;
+            let sub_1 = ((lhs_sub_rhs >> 16) & 0xFFFF) as u16;
+            let sub_2 = ((lhs_sub_rhs >> 32) & 0xFFFF) as u16;
+            let sub_3 = ((lhs_sub_rhs >> 48) & 0xFFFF) as u16;
+
+            // MSB16 lookups (input is halfword, split as x=lo byte, y=hi byte, z=0)
+            bitwise_lookups.push((
+                bitwise::BitwiseLookup::Msb16,
+                (lhs_2 & 0xFF) as u8,
+                (lhs_2 >> 8) as u8,
+                0,
+            ));
+            bitwise_lookups.push((
+                bitwise::BitwiseLookup::Msb16,
+                (rhs_2 & 0xFF) as u8,
+                (rhs_2 >> 8) as u8,
+                0,
+            ));
+
+            // IsHalf lookups for lhs_sub_rhs[0..4]
+            bitwise_lookups.push((
+                bitwise::BitwiseLookup::IsHalf,
+                (sub_0 & 0xFF) as u8,
+                (sub_0 >> 8) as u8,
+                0,
+            ));
+            bitwise_lookups.push((
+                bitwise::BitwiseLookup::IsHalf,
+                (sub_1 & 0xFF) as u8,
+                (sub_1 >> 8) as u8,
+                0,
+            ));
+            bitwise_lookups.push((
+                bitwise::BitwiseLookup::IsHalf,
+                (sub_2 & 0xFF) as u8,
+                (sub_2 >> 8) as u8,
+                0,
+            ));
+            bitwise_lookups.push((
+                bitwise::BitwiseLookup::IsHalf,
+                (sub_3 & 0xFF) as u8,
+                (sub_3 >> 8) as u8,
+                0,
+            ));
+
+            // IsHalf lookups for lhs[1] and rhs[1]
+            bitwise_lookups.push((
+                bitwise::BitwiseLookup::IsHalf,
+                (lhs_1 & 0xFF) as u8,
+                (lhs_1 >> 8) as u8,
+                0,
+            ));
+            bitwise_lookups.push((
+                bitwise::BitwiseLookup::IsHalf,
+                (rhs_1 & 0xFF) as u8,
+                (rhs_1 >> 8) as u8,
+                0,
+            ));
+        }
+
+        // Update bitwise multiplicities after all lookups are collected
         bitwise::update_multiplicities(&mut bitwise, &bitwise_lookups);
 
         // Generate LT trace (handles deduplication and padding internally)
