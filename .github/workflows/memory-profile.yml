@@ -45,6 +45,12 @@ jobs:
       - name: Extract metrics
         id: metrics
         run: |
+          # Extract program metadata from test output
+          PROGRAM_NAME=$(grep "MEMORY_PROFILE_PROGRAM=" profile-output.txt | cut -d= -f2)
+          INSTRUCTION_COUNT=$(grep "MEMORY_PROFILE_INSTRUCTIONS=" profile-output.txt | cut -d= -f2)
+          echo "program_name=$PROGRAM_NAME" >> $GITHUB_OUTPUT
+          echo "instruction_count=$INSTRUCTION_COUNT" >> $GITHUB_OUTPUT
+
           # Extract metrics from dhat-heap.json
           # dhat stores per-allocation-point data in .pps array
           # tb = total bytes, gb = bytes at t-gmax (peak), gbk = blocks at t-gmax
@@ -61,6 +67,11 @@ jobs:
           TOTAL_MB=$(echo "scale=2; $TOTAL_BYTES / 1048576" | bc)
           echo "peak_mb=$PEAK_MB" >> $GITHUB_OUTPUT
           echo "total_mb=$TOTAL_MB" >> $GITHUB_OUTPUT
+
+          # Find the function with the highest peak memory (gb = bytes at t-gmax)
+          # DHAT JSON structure: pps[].gb contains peak bytes, pps[].fs[0] is frame index, ftbl maps to names
+          PEAK_FUNCTION=$(jq -r '(.pps | max_by(.gb).fs[0]) as $idx | .ftbl[$idx]' dhat-heap.json)
+          echo "peak_function=$PEAK_FUNCTION" >> $GITHUB_OUTPUT
 
       - name: Upload profile artifact
         id: upload
@@ -166,15 +177,20 @@ jobs:
             const peak_mb = '${{ steps.metrics.outputs.peak_mb }}';
             const total_mb = '${{ steps.metrics.outputs.total_mb }}';
             const peak_blocks = '${{ steps.metrics.outputs.peak_blocks }}';
+            const program_name = '${{ steps.metrics.outputs.program_name }}';
+            const instruction_count = '${{ steps.metrics.outputs.instruction_count }}';
+            const peak_function = '${{ steps.metrics.outputs.peak_function }}';
             const has_baseline = '${{ steps.compare.outputs.has_baseline }}' === 'true';
             const regression = '${{ steps.compare.outputs.regression }}' === 'true';
 
             let body = `## 📊 Memory Profile Results\n\n`;
+            body += `**Program:** \`${program_name}\` (${instruction_count} instructions)\n\n`;
             body += `| Metric | Value |\n`;
             body += `|--------|-------|\n`;
             body += `| **Peak Memory** | ${peak_mb} MB |\n`;
             body += `| **Total Allocated** | ${total_mb} MB |\n`;
-            body += `| **Peak Blocks** | ${peak_blocks} |\n\n`;
+            body += `| **Peak Blocks** | ${peak_blocks} |\n`;
+            body += `| **Peak Function** | \`${peak_function}\` |\n\n`;
 
             if (has_baseline) {
               const baseline_peak = '${{ steps.compare.outputs.baseline_peak_mb }}';

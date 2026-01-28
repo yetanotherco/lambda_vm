@@ -903,7 +903,13 @@ fn test_dhat_memory_profile() {
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
 
-    let (logs, instructions) = run_asm_elf("loop_4096");
+    let program_name = "loop_4096";
+    let (logs, instructions) = run_asm_elf(program_name);
+
+    // Output metadata for CI parsing
+    println!("MEMORY_PROFILE_PROGRAM={}", program_name);
+    println!("MEMORY_PROFILE_INSTRUCTIONS={}", logs.len());
+
     assert_eq!(logs.len(), 4096, "Expected 2^12 instructions");
 
     let mut cpu_trace = Traces::from_logs(&logs, instructions.clone()).unwrap().cpu;
