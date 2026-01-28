@@ -3,6 +3,11 @@ name: Memory Profile
 on:
   pull_request:
     branches: [main]
+    paths:
+      - 'prover/**'
+      - 'crypto/**'
+      - 'executor/**'
+      - '.github/workflows/memory-profile.yml'
 
 jobs:
   profile:
