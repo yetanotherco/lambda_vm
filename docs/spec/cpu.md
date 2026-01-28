@@ -138,7 +138,7 @@ pad := 1 - ADD - SUB - SLT - AND - OR - XOR - SHIFT - JALR - BEQ - BLT - LOAD - 
 |-----|------|-------|-------------|--------------|
 | `A1` | template |  | ADD + LOAD + STORE ⇒ `ADD<res::DWordWL; arg1::DWordWL, arg2::DWordWL>` |  |
 | `cpu:c:sub` | template |  | SUB + BEQ ⇒ `SUB<res::DWordWL; arg1::DWordWL, arg2::DWordWL>` |  |
-| `A3` | interaction |  | `LT[res[0]; arg1::DWordHHW, arg2::DWordHHW, signed]` | SLT + BLT |
+| `A3` | interaction |  | `LT[res[0]; arg1::DWordWL, arg2::DWordWL, signed]` | SLT + BLT |
 | `A4` | arith | i ∈ [1, 7] | `SLT` + `BLT` => `res[i]` = 0 |  |
 | | | _polynomial:_ `(SLT + BLT) * res[i] = 0` | |
 | `A5` | interaction | i ∈ [0, 7] | `AND_BYTE[res[i]; arg1[i], arg2[i]]` | AND |
@@ -171,7 +171,7 @@ pad := 1 - ADD - SUB - SLT - AND - OR - XOR - SHIFT - JALR - BEQ - BLT - LOAD - 
 | `cpu:c:ebreak_traps` | arith | `!EBREAK` |  |
 | | | _polynomial:_ `1 - EBREAK = 0` | |
 | | | _note:_ We treat `EBREAK` as an unprovable trap | |
-| `S2` | interaction | `ECALL[rvd; rv1, pc, timestamp, rv2]` | ECALL |
+| `S2` | interaction | `ECALL[timestamp, rv1::DWordWL]` | ECALL |
 
 ### ext
 
