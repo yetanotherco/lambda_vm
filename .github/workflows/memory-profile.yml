@@ -63,6 +63,7 @@ jobs:
           echo "total_mb=$TOTAL_MB" >> $GITHUB_OUTPUT
 
       - name: Upload profile artifact
+        id: upload
         uses: actions/upload-artifact@v4
         with:
           name: dhat-heap-${{ github.sha }}
@@ -195,8 +196,9 @@ jobs:
             }
 
             body += `<details>\n<summary>View detailed profile</summary>\n\n`;
-            body += `Download the \`dhat-heap-${{ github.sha }}\` artifact and view at:\n`;
-            body += `https://nnethercote.github.io/dh_view/dh_view.html\n`;
+            body += `1. [Download the artifact](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts/${{ steps.upload.outputs.artifact-id }})\n`;
+            body += `2. Extract \`dhat-heap.json\` from the zip\n`;
+            body += `3. Upload to [dh_view](https://nnethercote.github.io/dh_view/dh_view.html)\n`;
             body += `</details>\n`;
 
             // Find existing comment to update
