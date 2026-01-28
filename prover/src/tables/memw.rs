@@ -276,20 +276,20 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // TODO: Refine multiplicity based on access width (only check addresses actually used)
     #[allow(clippy::never_loop)]
     for _ in 0..0 {
-    for i in 0..7 {
-        let cols_i = cols::address_add(i);
-        for &col in &cols_i {
-            interactions.push(BusInteraction::sender(
-                BusId::IsHalfword,
-                // Only range check when row is active
-                Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE),
-                vec![BusValue::Packed {
-                    start_column: col,
-                    packing: Packing::Direct,
-                }],
-            ));
+        for i in 0..7 {
+            let cols_i = cols::address_add(i);
+            for &col in &cols_i {
+                interactions.push(BusInteraction::sender(
+                    BusId::IsHalfword,
+                    // Only range check when row is active
+                    Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE),
+                    vec![BusValue::Packed {
+                        start_column: col,
+                        packing: Packing::Direct,
+                    }],
+                ));
+            }
         }
-    }
     }
 
     // -------------------------------------------------------------------------
@@ -311,194 +311,136 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     #[allow(unreachable_code)]
     // Disable Memory bus interactions for now
     for _ in 0..0 {
-    // M1: memory[is_register, base_address, old_timestamp[0], old[0]] with +μ_sum
-    interactions.push(BusInteraction::sender(
-        BusId::Memory,
-        Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE),
-        vec![
-            BusValue::Packed {
-                start_column: cols::IS_REGISTER,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::BASE_ADDRESS_0,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::BASE_ADDRESS_1,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::old_timestamp(0)[0],
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::old_timestamp(0)[1],
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::OLD[0],
-                packing: Packing::Direct,
-            },
-        ],
-    ));
-
-    // M2: memory[is_register, base_address, timestamp, value[0]] with -μ_sum
-    interactions.push(BusInteraction::receiver(
-        BusId::Memory,
-        Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE),
-        vec![
-            BusValue::Packed {
-                start_column: cols::IS_REGISTER,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::BASE_ADDRESS_0,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::BASE_ADDRESS_1,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::TIMESTAMP_0,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::TIMESTAMP_1,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::VALUE[0],
-                packing: Packing::Direct,
-            },
-        ],
-    ));
-
-    // M3: memory[is_register, address_add[0], old_timestamp[1], old[1]] with +w2
-    // address_add is DWordHL (4 halfwords), pack to 2 bus elements matching DWordWL format
-    interactions.push(BusInteraction::sender(
-        BusId::Memory,
-        Multiplicity::Linear(vec![
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::WRITE2,
-            },
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::WRITE4,
-            },
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::WRITE8,
-            },
-        ]),
-        vec![
-            BusValue::Packed {
-                start_column: cols::IS_REGISTER,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::address_add(0)[0],
-                packing: Packing::DWordHL,
-            },
-            BusValue::Packed {
-                start_column: cols::old_timestamp(1)[0],
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::old_timestamp(1)[1],
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::OLD[1],
-                packing: Packing::Direct,
-            },
-        ],
-    ));
-
-    // M4: memory[is_register, address_add[0], timestamp, value[1]] with -w2
-    interactions.push(BusInteraction::receiver(
-        BusId::Memory,
-        Multiplicity::Linear(vec![
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::WRITE2,
-            },
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::WRITE4,
-            },
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::WRITE8,
-            },
-        ]),
-        vec![
-            BusValue::Packed {
-                start_column: cols::IS_REGISTER,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::address_add(0)[0],
-                packing: Packing::DWordHL,
-            },
-            BusValue::Packed {
-                start_column: cols::TIMESTAMP_0,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::TIMESTAMP_1,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::VALUE[1],
-                packing: Packing::Direct,
-            },
-        ],
-    ));
-
-    // M5-M6: For bytes 2-3 (w4 multiplicity)
-    // address_add is DWordHL (4 halfwords), pack to 2 bus elements matching DWordWL format
-    for i in 2..4 {
-        // Read old
+        // M1: memory[is_register, base_address, old_timestamp[0], old[0]] with +μ_sum
         interactions.push(BusInteraction::sender(
             BusId::Memory,
-            Multiplicity::Sum(cols::WRITE4, cols::WRITE8),
+            Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE),
             vec![
                 BusValue::Packed {
                     start_column: cols::IS_REGISTER,
                     packing: Packing::Direct,
                 },
                 BusValue::Packed {
-                    start_column: cols::address_add(i - 1)[0],
-                    packing: Packing::DWordHL,
-                },
-                BusValue::Packed {
-                    start_column: cols::old_timestamp(i)[0],
+                    start_column: cols::BASE_ADDRESS_0,
                     packing: Packing::Direct,
                 },
                 BusValue::Packed {
-                    start_column: cols::old_timestamp(i)[1],
+                    start_column: cols::BASE_ADDRESS_1,
                     packing: Packing::Direct,
                 },
                 BusValue::Packed {
-                    start_column: cols::OLD[i],
+                    start_column: cols::old_timestamp(0)[0],
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::old_timestamp(0)[1],
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::OLD[0],
                     packing: Packing::Direct,
                 },
             ],
         ));
-        // Write new
+
+        // M2: memory[is_register, base_address, timestamp, value[0]] with -μ_sum
         interactions.push(BusInteraction::receiver(
             BusId::Memory,
-            Multiplicity::Sum(cols::WRITE4, cols::WRITE8),
+            Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE),
             vec![
                 BusValue::Packed {
                     start_column: cols::IS_REGISTER,
                     packing: Packing::Direct,
                 },
                 BusValue::Packed {
-                    start_column: cols::address_add(i - 1)[0],
+                    start_column: cols::BASE_ADDRESS_0,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::BASE_ADDRESS_1,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::TIMESTAMP_0,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::TIMESTAMP_1,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::VALUE[0],
+                    packing: Packing::Direct,
+                },
+            ],
+        ));
+
+        // M3: memory[is_register, address_add[0], old_timestamp[1], old[1]] with +w2
+        // address_add is DWordHL (4 halfwords), pack to 2 bus elements matching DWordWL format
+        interactions.push(BusInteraction::sender(
+            BusId::Memory,
+            Multiplicity::Linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::WRITE2,
+                },
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::WRITE4,
+                },
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::WRITE8,
+                },
+            ]),
+            vec![
+                BusValue::Packed {
+                    start_column: cols::IS_REGISTER,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::address_add(0)[0],
+                    packing: Packing::DWordHL,
+                },
+                BusValue::Packed {
+                    start_column: cols::old_timestamp(1)[0],
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::old_timestamp(1)[1],
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::OLD[1],
+                    packing: Packing::Direct,
+                },
+            ],
+        ));
+
+        // M4: memory[is_register, address_add[0], timestamp, value[1]] with -w2
+        interactions.push(BusInteraction::receiver(
+            BusId::Memory,
+            Multiplicity::Linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::WRITE2,
+                },
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::WRITE4,
+                },
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::WRITE8,
+                },
+            ]),
+            vec![
+                BusValue::Packed {
+                    start_column: cols::IS_REGISTER,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::address_add(0)[0],
                     packing: Packing::DWordHL,
                 },
                 BusValue::Packed {
@@ -510,71 +452,129 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     packing: Packing::Direct,
                 },
                 BusValue::Packed {
-                    start_column: cols::VALUE[i],
+                    start_column: cols::VALUE[1],
                     packing: Packing::Direct,
                 },
             ],
         ));
-    }
 
-    // M7-M8: For bytes 4-7 (write8 multiplicity)
-    // address_add is DWordHL (4 halfwords), pack to 2 bus elements matching DWordWL format
-    for i in 4..8 {
-        // Read old
-        interactions.push(BusInteraction::sender(
-            BusId::Memory,
-            Multiplicity::Column(cols::WRITE8),
-            vec![
-                BusValue::Packed {
-                    start_column: cols::IS_REGISTER,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::address_add(i - 1)[0],
-                    packing: Packing::DWordHL,
-                },
-                BusValue::Packed {
-                    start_column: cols::old_timestamp(i)[0],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::old_timestamp(i)[1],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::OLD[i],
-                    packing: Packing::Direct,
-                },
-            ],
-        ));
-        // Write new
-        interactions.push(BusInteraction::receiver(
-            BusId::Memory,
-            Multiplicity::Column(cols::WRITE8),
-            vec![
-                BusValue::Packed {
-                    start_column: cols::IS_REGISTER,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::address_add(i - 1)[0],
-                    packing: Packing::DWordHL,
-                },
-                BusValue::Packed {
-                    start_column: cols::TIMESTAMP_0,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::TIMESTAMP_1,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::VALUE[i],
-                    packing: Packing::Direct,
-                },
-            ],
-        ));
-    }
+        // M5-M6: For bytes 2-3 (w4 multiplicity)
+        // address_add is DWordHL (4 halfwords), pack to 2 bus elements matching DWordWL format
+        for i in 2..4 {
+            // Read old
+            interactions.push(BusInteraction::sender(
+                BusId::Memory,
+                Multiplicity::Sum(cols::WRITE4, cols::WRITE8),
+                vec![
+                    BusValue::Packed {
+                        start_column: cols::IS_REGISTER,
+                        packing: Packing::Direct,
+                    },
+                    BusValue::Packed {
+                        start_column: cols::address_add(i - 1)[0],
+                        packing: Packing::DWordHL,
+                    },
+                    BusValue::Packed {
+                        start_column: cols::old_timestamp(i)[0],
+                        packing: Packing::Direct,
+                    },
+                    BusValue::Packed {
+                        start_column: cols::old_timestamp(i)[1],
+                        packing: Packing::Direct,
+                    },
+                    BusValue::Packed {
+                        start_column: cols::OLD[i],
+                        packing: Packing::Direct,
+                    },
+                ],
+            ));
+            // Write new
+            interactions.push(BusInteraction::receiver(
+                BusId::Memory,
+                Multiplicity::Sum(cols::WRITE4, cols::WRITE8),
+                vec![
+                    BusValue::Packed {
+                        start_column: cols::IS_REGISTER,
+                        packing: Packing::Direct,
+                    },
+                    BusValue::Packed {
+                        start_column: cols::address_add(i - 1)[0],
+                        packing: Packing::DWordHL,
+                    },
+                    BusValue::Packed {
+                        start_column: cols::TIMESTAMP_0,
+                        packing: Packing::Direct,
+                    },
+                    BusValue::Packed {
+                        start_column: cols::TIMESTAMP_1,
+                        packing: Packing::Direct,
+                    },
+                    BusValue::Packed {
+                        start_column: cols::VALUE[i],
+                        packing: Packing::Direct,
+                    },
+                ],
+            ));
+        }
+
+        // M7-M8: For bytes 4-7 (write8 multiplicity)
+        // address_add is DWordHL (4 halfwords), pack to 2 bus elements matching DWordWL format
+        for i in 4..8 {
+            // Read old
+            interactions.push(BusInteraction::sender(
+                BusId::Memory,
+                Multiplicity::Column(cols::WRITE8),
+                vec![
+                    BusValue::Packed {
+                        start_column: cols::IS_REGISTER,
+                        packing: Packing::Direct,
+                    },
+                    BusValue::Packed {
+                        start_column: cols::address_add(i - 1)[0],
+                        packing: Packing::DWordHL,
+                    },
+                    BusValue::Packed {
+                        start_column: cols::old_timestamp(i)[0],
+                        packing: Packing::Direct,
+                    },
+                    BusValue::Packed {
+                        start_column: cols::old_timestamp(i)[1],
+                        packing: Packing::Direct,
+                    },
+                    BusValue::Packed {
+                        start_column: cols::OLD[i],
+                        packing: Packing::Direct,
+                    },
+                ],
+            ));
+            // Write new
+            interactions.push(BusInteraction::receiver(
+                BusId::Memory,
+                Multiplicity::Column(cols::WRITE8),
+                vec![
+                    BusValue::Packed {
+                        start_column: cols::IS_REGISTER,
+                        packing: Packing::Direct,
+                    },
+                    BusValue::Packed {
+                        start_column: cols::address_add(i - 1)[0],
+                        packing: Packing::DWordHL,
+                    },
+                    BusValue::Packed {
+                        start_column: cols::TIMESTAMP_0,
+                        packing: Packing::Direct,
+                    },
+                    BusValue::Packed {
+                        start_column: cols::TIMESTAMP_1,
+                        packing: Packing::Direct,
+                    },
+                    BusValue::Packed {
+                        start_column: cols::VALUE[i],
+                        packing: Packing::Direct,
+                    },
+                ],
+            ));
+        }
     } // End of disabled Memory bus interactions
 
     // -------------------------------------------------------------------------
@@ -780,67 +780,48 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     #[allow(clippy::never_loop)]
     for _ in 0..0 {
-    // Constraint 7: LT[1; old_timestamp[0], timestamp] with μ_sum
-    interactions.push(BusInteraction::sender(
-        BusId::Lt,
-        Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE),
-        vec![
-            // lhs = old_timestamp[0] as DWordWL (2 elements: [lo32, hi32])
-            BusValue::Packed {
-                start_column: cols::old_timestamp(0)[0],
-                packing: Packing::DWordWL,
-            },
-            // rhs = timestamp as DWordWL (2 elements: [lo32, hi32])
-            BusValue::Packed {
-                start_column: cols::TIMESTAMP_0,
-                packing: Packing::DWordWL,
-            },
-            // signed = 0 (unsigned comparison)
-            BusValue::constant(0),
-            // lt = 1 (expected result: old_timestamp < timestamp)
-            BusValue::constant(1),
-        ],
-    ));
-
-    // Constraint 8: LT[1; old_timestamp[1], timestamp] with w2
-    interactions.push(BusInteraction::sender(
-        BusId::Lt,
-        Multiplicity::Linear(vec![
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::WRITE2,
-            },
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::WRITE4,
-            },
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::WRITE8,
-            },
-        ]),
-        vec![
-            BusValue::Packed {
-                start_column: cols::old_timestamp(1)[0],
-                packing: Packing::DWordWL,
-            },
-            BusValue::Packed {
-                start_column: cols::TIMESTAMP_0,
-                packing: Packing::DWordWL,
-            },
-            BusValue::constant(0),
-            BusValue::constant(1),
-        ],
-    ));
-
-    // Constraint 9: LT[1; old_timestamp[i], timestamp] for i ∈ [2,3] with w4
-    for i in 2..4 {
+        // Constraint 7: LT[1; old_timestamp[0], timestamp] with μ_sum
         interactions.push(BusInteraction::sender(
             BusId::Lt,
-            Multiplicity::Sum(cols::WRITE4, cols::WRITE8),
+            Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE),
+            vec![
+                // lhs = old_timestamp[0] as DWordWL (2 elements: [lo32, hi32])
+                BusValue::Packed {
+                    start_column: cols::old_timestamp(0)[0],
+                    packing: Packing::DWordWL,
+                },
+                // rhs = timestamp as DWordWL (2 elements: [lo32, hi32])
+                BusValue::Packed {
+                    start_column: cols::TIMESTAMP_0,
+                    packing: Packing::DWordWL,
+                },
+                // signed = 0 (unsigned comparison)
+                BusValue::constant(0),
+                // lt = 1 (expected result: old_timestamp < timestamp)
+                BusValue::constant(1),
+            ],
+        ));
+
+        // Constraint 8: LT[1; old_timestamp[1], timestamp] with w2
+        interactions.push(BusInteraction::sender(
+            BusId::Lt,
+            Multiplicity::Linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::WRITE2,
+                },
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::WRITE4,
+                },
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::WRITE8,
+                },
+            ]),
             vec![
                 BusValue::Packed {
-                    start_column: cols::old_timestamp(i)[0],
+                    start_column: cols::old_timestamp(1)[0],
                     packing: Packing::DWordWL,
                 },
                 BusValue::Packed {
@@ -851,88 +832,107 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 BusValue::constant(1),
             ],
         ));
-    }
 
-    // Constraint 10: LT[1; old_timestamp[i], timestamp] for i ∈ [4,7] with write8
-    for i in 4..8 {
+        // Constraint 9: LT[1; old_timestamp[i], timestamp] for i ∈ [2,3] with w4
+        for i in 2..4 {
+            interactions.push(BusInteraction::sender(
+                BusId::Lt,
+                Multiplicity::Sum(cols::WRITE4, cols::WRITE8),
+                vec![
+                    BusValue::Packed {
+                        start_column: cols::old_timestamp(i)[0],
+                        packing: Packing::DWordWL,
+                    },
+                    BusValue::Packed {
+                        start_column: cols::TIMESTAMP_0,
+                        packing: Packing::DWordWL,
+                    },
+                    BusValue::constant(0),
+                    BusValue::constant(1),
+                ],
+            ));
+        }
+
+        // Constraint 10: LT[1; old_timestamp[i], timestamp] for i ∈ [4,7] with write8
+        for i in 4..8 {
+            interactions.push(BusInteraction::sender(
+                BusId::Lt,
+                Multiplicity::Column(cols::WRITE8),
+                vec![
+                    BusValue::Packed {
+                        start_column: cols::old_timestamp(i)[0],
+                        packing: Packing::DWordWL,
+                    },
+                    BusValue::Packed {
+                        start_column: cols::TIMESTAMP_0,
+                        packing: Packing::DWordWL,
+                    },
+                    BusValue::constant(0),
+                    BusValue::constant(1),
+                ],
+            ));
+        }
+
+        // -------------------------------------------------------------------------
+        // LT interactions for overflow checking (constraints R1-R3)
+        // -------------------------------------------------------------------------
+        // Verify base_address < address_add[i] (no overflow when adding offset).
+        // base_address is DWordWL, address_add[i] is DWordHL (cast to DWordWL).
+        // Both packings produce 2 elements [lo32, hi32].
+
+        // R1: LT[1; base_address, address_add[0]] with write2
+        interactions.push(BusInteraction::sender(
+            BusId::Lt,
+            Multiplicity::Column(cols::WRITE2),
+            vec![
+                BusValue::Packed {
+                    start_column: cols::BASE_ADDRESS_0,
+                    packing: Packing::DWordWL,
+                },
+                BusValue::Packed {
+                    start_column: cols::address_add(0)[0],
+                    packing: Packing::DWordHL,
+                },
+                BusValue::constant(0), // unsigned
+                BusValue::constant(1), // lt = 1
+            ],
+        ));
+
+        // R2: LT[1; base_address, address_add[2]] with write4
+        interactions.push(BusInteraction::sender(
+            BusId::Lt,
+            Multiplicity::Column(cols::WRITE4),
+            vec![
+                BusValue::Packed {
+                    start_column: cols::BASE_ADDRESS_0,
+                    packing: Packing::DWordWL,
+                },
+                BusValue::Packed {
+                    start_column: cols::address_add(2)[0],
+                    packing: Packing::DWordHL,
+                },
+                BusValue::constant(0),
+                BusValue::constant(1),
+            ],
+        ));
+
+        // R3: LT[1; base_address, address_add[6]] with write8
         interactions.push(BusInteraction::sender(
             BusId::Lt,
             Multiplicity::Column(cols::WRITE8),
             vec![
                 BusValue::Packed {
-                    start_column: cols::old_timestamp(i)[0],
+                    start_column: cols::BASE_ADDRESS_0,
                     packing: Packing::DWordWL,
                 },
                 BusValue::Packed {
-                    start_column: cols::TIMESTAMP_0,
-                    packing: Packing::DWordWL,
+                    start_column: cols::address_add(6)[0],
+                    packing: Packing::DWordHL,
                 },
                 BusValue::constant(0),
                 BusValue::constant(1),
             ],
         ));
-    }
-
-    // -------------------------------------------------------------------------
-    // LT interactions for overflow checking (constraints R1-R3)
-    // -------------------------------------------------------------------------
-    // Verify base_address < address_add[i] (no overflow when adding offset).
-    // base_address is DWordWL, address_add[i] is DWordHL (cast to DWordWL).
-    // Both packings produce 2 elements [lo32, hi32].
-
-    // R1: LT[1; base_address, address_add[0]] with write2
-    interactions.push(BusInteraction::sender(
-        BusId::Lt,
-        Multiplicity::Column(cols::WRITE2),
-        vec![
-            BusValue::Packed {
-                start_column: cols::BASE_ADDRESS_0,
-                packing: Packing::DWordWL,
-            },
-            BusValue::Packed {
-                start_column: cols::address_add(0)[0],
-                packing: Packing::DWordHL,
-            },
-            BusValue::constant(0), // unsigned
-            BusValue::constant(1), // lt = 1
-        ],
-    ));
-
-    // R2: LT[1; base_address, address_add[2]] with write4
-    interactions.push(BusInteraction::sender(
-        BusId::Lt,
-        Multiplicity::Column(cols::WRITE4),
-        vec![
-            BusValue::Packed {
-                start_column: cols::BASE_ADDRESS_0,
-                packing: Packing::DWordWL,
-            },
-            BusValue::Packed {
-                start_column: cols::address_add(2)[0],
-                packing: Packing::DWordHL,
-            },
-            BusValue::constant(0),
-            BusValue::constant(1),
-        ],
-    ));
-
-    // R3: LT[1; base_address, address_add[6]] with write8
-    interactions.push(BusInteraction::sender(
-        BusId::Lt,
-        Multiplicity::Column(cols::WRITE8),
-        vec![
-            BusValue::Packed {
-                start_column: cols::BASE_ADDRESS_0,
-                packing: Packing::DWordWL,
-            },
-            BusValue::Packed {
-                start_column: cols::address_add(6)[0],
-                packing: Packing::DWordHL,
-            },
-            BusValue::constant(0),
-            BusValue::constant(1),
-        ],
-    ));
     } // End of disabled LT interactions
 
     interactions
@@ -1105,17 +1105,11 @@ pub fn constraints() -> Vec<Box<dyn TransitionConstraint<GoldilocksField, Goldil
         let condition = match i {
             0 => vec![cols::WRITE2, cols::WRITE4, cols::WRITE8], // w2
             1 | 2 => vec![cols::WRITE4, cols::WRITE8],           // w4
-            _ => vec![cols::WRITE8],                              // write8 (i = 3..6)
+            _ => vec![cols::WRITE8],                             // write8 (i = 3..6)
         };
 
         // ADD constraint produces 2 constraints (carry_0, carry_1)
-        let (c0, c1) = AddConstraint::new_pair(
-            condition,
-            lhs,
-            rhs,
-            sum,
-            idx,
-        );
+        let (c0, c1) = AddConstraint::new_pair(condition, lhs, rhs, sum, idx);
         constraints.push(Box::new(c0));
         constraints.push(Box::new(c1));
         idx += 2;

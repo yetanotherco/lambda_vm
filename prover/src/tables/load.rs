@@ -327,71 +327,71 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // (For read8, no extension needed - all 8 bytes are used)
     #[allow(clippy::overly_complex_bool_expr)]
     for _ in 0..0 {
-    // MSB8[res[0]] -> sign_bit (for read1)
-    // read1 = μ - read2 - read4 - read8 (reading exactly 1 byte)
-    interactions.push(BusInteraction::sender(
-        BusId::Msb8,
-        Multiplicity::Linear(vec![
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::MU,
-            },
-            LinearTerm::Column {
-                coefficient: -1,
-                column: cols::READ2,
-            },
-            LinearTerm::Column {
-                coefficient: -1,
-                column: cols::READ4,
-            },
-            LinearTerm::Column {
-                coefficient: -1,
-                column: cols::READ8,
-            },
-        ]),
-        vec![
-            BusValue::Packed {
-                start_column: cols::RES[0],
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::SIGN_BIT,
-                packing: Packing::Direct,
-            },
-        ],
-    ));
+        // MSB8[res[0]] -> sign_bit (for read1)
+        // read1 = μ - read2 - read4 - read8 (reading exactly 1 byte)
+        interactions.push(BusInteraction::sender(
+            BusId::Msb8,
+            Multiplicity::Linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::MU,
+                },
+                LinearTerm::Column {
+                    coefficient: -1,
+                    column: cols::READ2,
+                },
+                LinearTerm::Column {
+                    coefficient: -1,
+                    column: cols::READ4,
+                },
+                LinearTerm::Column {
+                    coefficient: -1,
+                    column: cols::READ8,
+                },
+            ]),
+            vec![
+                BusValue::Packed {
+                    start_column: cols::RES[0],
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::SIGN_BIT,
+                    packing: Packing::Direct,
+                },
+            ],
+        ));
 
-    // MSB8[res[1]] -> sign_bit (for read2)
-    interactions.push(BusInteraction::sender(
-        BusId::Msb8,
-        Multiplicity::Column(cols::READ2),
-        vec![
-            BusValue::Packed {
-                start_column: cols::RES[1],
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::SIGN_BIT,
-                packing: Packing::Direct,
-            },
-        ],
-    ));
+        // MSB8[res[1]] -> sign_bit (for read2)
+        interactions.push(BusInteraction::sender(
+            BusId::Msb8,
+            Multiplicity::Column(cols::READ2),
+            vec![
+                BusValue::Packed {
+                    start_column: cols::RES[1],
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::SIGN_BIT,
+                    packing: Packing::Direct,
+                },
+            ],
+        ));
 
-    // MSB8[res[3]] -> sign_bit (for read4)
-    interactions.push(BusInteraction::sender(
-        BusId::Msb8,
-        Multiplicity::Column(cols::READ4),
-        vec![
-            BusValue::Packed {
-                start_column: cols::RES[3],
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::SIGN_BIT,
-                packing: Packing::Direct,
-            },
-        ],
-    ));
+        // MSB8[res[3]] -> sign_bit (for read4)
+        interactions.push(BusInteraction::sender(
+            BusId::Msb8,
+            Multiplicity::Column(cols::READ4),
+            vec![
+                BusValue::Packed {
+                    start_column: cols::RES[3],
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::SIGN_BIT,
+                    packing: Packing::Direct,
+                },
+            ],
+        ));
     } // END TEMPORARILY DISABLED MSB8 interactions
 
     // -------------------------------------------------------------------------

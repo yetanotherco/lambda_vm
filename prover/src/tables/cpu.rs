@@ -1317,11 +1317,20 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         vec![
             // old[0] = lo32 = RV1_0 + 2^16 * RV1_1
             BusValue::linear(vec![
-                LinearTerm::Column { coefficient: 1, column: cols::RV1_0 },
-                LinearTerm::Column { coefficient: 65536, column: cols::RV1_1 },
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::RV1_0,
+                },
+                LinearTerm::Column {
+                    coefficient: 65536,
+                    column: cols::RV1_1,
+                },
             ]),
             // old[1] = hi32 = RV1_2
-            BusValue::Packed { start_column: cols::RV1_2, packing: Packing::Direct },
+            BusValue::Packed {
+                start_column: cols::RV1_2,
+                packing: Packing::Direct,
+            },
             // old[2..7] = 0 (unconstrained for registers)
             BusValue::constant(0),
             BusValue::constant(0),
@@ -1332,15 +1341,27 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             // is_register = 1
             BusValue::constant(1),
             // base_address[0] = 2 * rs1
-            BusValue::linear(vec![LinearTerm::Column { coefficient: 2, column: cols::RS1 }]),
+            BusValue::linear(vec![LinearTerm::Column {
+                coefficient: 2,
+                column: cols::RS1,
+            }]),
             // base_address[1] = 0
             BusValue::constant(0),
             // value[0..7] = same as old (rv1 as WL + 6 zeros)
             BusValue::linear(vec![
-                LinearTerm::Column { coefficient: 1, column: cols::RV1_0 },
-                LinearTerm::Column { coefficient: 65536, column: cols::RV1_1 },
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::RV1_0,
+                },
+                LinearTerm::Column {
+                    coefficient: 65536,
+                    column: cols::RV1_1,
+                },
             ]),
-            BusValue::Packed { start_column: cols::RV1_2, packing: Packing::Direct },
+            BusValue::Packed {
+                start_column: cols::RV1_2,
+                packing: Packing::Direct,
+            },
             BusValue::constant(0),
             BusValue::constant(0),
             BusValue::constant(0),
@@ -1348,7 +1369,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             BusValue::constant(0),
             BusValue::constant(0),
             // timestamp[0] = timestamp, timestamp[1] = 0
-            BusValue::Packed { start_column: cols::TIMESTAMP, packing: Packing::Direct },
+            BusValue::Packed {
+                start_column: cols::TIMESTAMP,
+                packing: Packing::Direct,
+            },
             BusValue::constant(0),
             // write2=0, write4=0, write8=1 (register access = 8 bytes / 64 bits)
             BusValue::constant(0),
@@ -1367,11 +1391,20 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         vec![
             // old[0] = lo32 = RV2_0 + 2^16 * RV2_1
             BusValue::linear(vec![
-                LinearTerm::Column { coefficient: 1, column: cols::RV2_0 },
-                LinearTerm::Column { coefficient: 65536, column: cols::RV2_1 },
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::RV2_0,
+                },
+                LinearTerm::Column {
+                    coefficient: 65536,
+                    column: cols::RV2_1,
+                },
             ]),
             // old[1] = hi32 = RV2_2
-            BusValue::Packed { start_column: cols::RV2_2, packing: Packing::Direct },
+            BusValue::Packed {
+                start_column: cols::RV2_2,
+                packing: Packing::Direct,
+            },
             // old[2..7] = 0
             BusValue::constant(0),
             BusValue::constant(0),
@@ -1382,15 +1415,27 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             // is_register = 1
             BusValue::constant(1),
             // base_address[0] = 2 * rs2
-            BusValue::linear(vec![LinearTerm::Column { coefficient: 2, column: cols::RS2 }]),
+            BusValue::linear(vec![LinearTerm::Column {
+                coefficient: 2,
+                column: cols::RS2,
+            }]),
             // base_address[1] = 0
             BusValue::constant(0),
             // value[0..7] = rv2 as WL + 6 zeros
             BusValue::linear(vec![
-                LinearTerm::Column { coefficient: 1, column: cols::RV2_0 },
-                LinearTerm::Column { coefficient: 65536, column: cols::RV2_1 },
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::RV2_0,
+                },
+                LinearTerm::Column {
+                    coefficient: 65536,
+                    column: cols::RV2_1,
+                },
             ]),
-            BusValue::Packed { start_column: cols::RV2_2, packing: Packing::Direct },
+            BusValue::Packed {
+                start_column: cols::RV2_2,
+                packing: Packing::Direct,
+            },
             BusValue::constant(0),
             BusValue::constant(0),
             BusValue::constant(0),
@@ -1399,7 +1444,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             BusValue::constant(0),
             // timestamp[0] = timestamp + 1, timestamp[1] = 0
             BusValue::linear(vec![
-                LinearTerm::Column { coefficient: 1, column: cols::TIMESTAMP },
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::TIMESTAMP,
+                },
                 LinearTerm::Constant(1),
             ]),
             BusValue::constant(0),
@@ -1426,13 +1474,22 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             // is_register = 1
             BusValue::constant(1),
             // base_address[0] = 2 * rd
-            BusValue::linear(vec![LinearTerm::Column { coefficient: 2, column: cols::RD }]),
+            BusValue::linear(vec![LinearTerm::Column {
+                coefficient: 2,
+                column: cols::RD,
+            }]),
             // base_address[1] = 0
             BusValue::constant(0),
             // value[0] = rvd_lo = RVD_0
-            BusValue::Packed { start_column: cols::RVD_0, packing: Packing::Direct },
+            BusValue::Packed {
+                start_column: cols::RVD_0,
+                packing: Packing::Direct,
+            },
             // value[1] = rvd_hi = RVD_1
-            BusValue::Packed { start_column: cols::RVD_1, packing: Packing::Direct },
+            BusValue::Packed {
+                start_column: cols::RVD_1,
+                packing: Packing::Direct,
+            },
             // value[2..7] = 0
             BusValue::constant(0),
             BusValue::constant(0),
@@ -1442,7 +1499,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             BusValue::constant(0),
             // timestamp[0] = timestamp + 2, timestamp[1] = 0
             BusValue::linear(vec![
-                LinearTerm::Column { coefficient: 1, column: cols::TIMESTAMP },
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::TIMESTAMP,
+                },
                 LinearTerm::Constant(2),
             ]),
             BusValue::constant(0),
@@ -1474,25 +1534,49 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         vec![
             // rvd as DWordWL (2 words) - this is the loaded value
             // CPU RVD is already WL format
-            BusValue::Packed { start_column: cols::RVD_0, packing: Packing::DWordWL },
+            BusValue::Packed {
+                start_column: cols::RVD_0,
+                packing: Packing::DWordWL,
+            },
             // base_address = res (computed address) as DWordBL (8 bytes → 2 elements)
-            BusValue::Packed { start_column: cols::RES[0], packing: Packing::DWordBL },
+            BusValue::Packed {
+                start_column: cols::RES[0],
+                packing: Packing::DWordBL,
+            },
             // timestamp as DWordWL: [timestamp, 0]
-            BusValue::Packed { start_column: cols::TIMESTAMP, packing: Packing::Direct },
+            BusValue::Packed {
+                start_column: cols::TIMESTAMP,
+                packing: Packing::Direct,
+            },
             BusValue::constant(0),
             // read flags: convert from cumulative to exclusive encoding
             // read2 = memory_2bytes - memory_4bytes
             BusValue::linear(vec![
-                LinearTerm::Column { coefficient: 1, column: cols::MEMORY_2BYTES },
-                LinearTerm::Column { coefficient: -1, column: cols::MEMORY_4BYTES },
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::MEMORY_2BYTES,
+                },
+                LinearTerm::Column {
+                    coefficient: -1,
+                    column: cols::MEMORY_4BYTES,
+                },
             ]),
             // read4 = memory_4bytes - memory_8bytes
             BusValue::linear(vec![
-                LinearTerm::Column { coefficient: 1, column: cols::MEMORY_4BYTES },
-                LinearTerm::Column { coefficient: -1, column: cols::MEMORY_8BYTES },
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::MEMORY_4BYTES,
+                },
+                LinearTerm::Column {
+                    coefficient: -1,
+                    column: cols::MEMORY_8BYTES,
+                },
             ]),
             // read8 = memory_8bytes
-            BusValue::Packed { start_column: cols::MEMORY_8BYTES, packing: Packing::Direct },
+            BusValue::Packed {
+                start_column: cols::MEMORY_8BYTES,
+                packing: Packing::Direct,
+            },
         ],
     ));
 
@@ -1513,14 +1597,26 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             // is_register = 0 (memory access)
             BusValue::constant(0),
             // base_address = res as DWordBL → 2 elements [lo32, hi32]
-            BusValue::Packed { start_column: cols::RES[0], packing: Packing::DWordBL },
+            BusValue::Packed {
+                start_column: cols::RES[0],
+                packing: Packing::DWordBL,
+            },
             // value[0] = rv2_lo = RV2_0 + 2^16 * RV2_1
             BusValue::linear(vec![
-                LinearTerm::Column { coefficient: 1, column: cols::RV2_0 },
-                LinearTerm::Column { coefficient: 65536, column: cols::RV2_1 },
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::RV2_0,
+                },
+                LinearTerm::Column {
+                    coefficient: 65536,
+                    column: cols::RV2_1,
+                },
             ]),
             // value[1] = rv2_hi = RV2_2
-            BusValue::Packed { start_column: cols::RV2_2, packing: Packing::Direct },
+            BusValue::Packed {
+                start_column: cols::RV2_2,
+                packing: Packing::Direct,
+            },
             // value[2..7] = 0 (unconstrained per team feedback)
             BusValue::constant(0),
             BusValue::constant(0),
@@ -1530,23 +1626,41 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             BusValue::constant(0),
             // timestamp[0] = timestamp + 1, timestamp[1] = 0
             BusValue::linear(vec![
-                LinearTerm::Column { coefficient: 1, column: cols::TIMESTAMP },
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::TIMESTAMP,
+                },
                 LinearTerm::Constant(1),
             ]),
             BusValue::constant(0),
             // write flags: convert from cumulative to exclusive encoding
             // write2 = memory_2bytes - memory_4bytes
             BusValue::linear(vec![
-                LinearTerm::Column { coefficient: 1, column: cols::MEMORY_2BYTES },
-                LinearTerm::Column { coefficient: -1, column: cols::MEMORY_4BYTES },
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::MEMORY_2BYTES,
+                },
+                LinearTerm::Column {
+                    coefficient: -1,
+                    column: cols::MEMORY_4BYTES,
+                },
             ]),
             // write4 = memory_4bytes - memory_8bytes
             BusValue::linear(vec![
-                LinearTerm::Column { coefficient: 1, column: cols::MEMORY_4BYTES },
-                LinearTerm::Column { coefficient: -1, column: cols::MEMORY_8BYTES },
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::MEMORY_4BYTES,
+                },
+                LinearTerm::Column {
+                    coefficient: -1,
+                    column: cols::MEMORY_8BYTES,
+                },
             ]),
             // write8 = memory_8bytes
-            BusValue::Packed { start_column: cols::MEMORY_8BYTES, packing: Packing::Direct },
+            BusValue::Packed {
+                start_column: cols::MEMORY_8BYTES,
+                packing: Packing::Direct,
+            },
         ],
     ));
 

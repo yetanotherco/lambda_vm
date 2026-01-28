@@ -127,9 +127,14 @@ fn width_to_bytes_and_signed(width: LoadStoreWidth) -> (usize, bool) {
 /// This matches the CPU bus interaction which sends rv1/rv2/rvd as 2 words + 6 zeros.
 fn pack_register_value(value: u64) -> [u64; 8] {
     [
-        value & 0xFFFF_FFFF,  // lo32
-        value >> 32,          // hi32
-        0, 0, 0, 0, 0, 0,     // remaining 6 elements are unconstrained (zeros)
+        value & 0xFFFF_FFFF, // lo32
+        value >> 32,         // hi32
+        0,
+        0,
+        0,
+        0,
+        0,
+        0, // remaining 6 elements are unconstrained (zeros)
     ]
 }
 
@@ -256,9 +261,14 @@ impl Traces {
                     // Pack store value as [lo32, hi32, 0, 0, 0, 0, 0, 0] to match CPU M7
                     // CPU sends rv2 as packed words (can't decompose to bytes in bus interaction)
                     let value_bytes = [
-                        store_value & 0xFFFF_FFFF,  // lo32
-                        store_value >> 32,          // hi32
-                        0, 0, 0, 0, 0, 0,
+                        store_value & 0xFFFF_FFFF, // lo32
+                        store_value >> 32,         // hi32
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
                     ];
 
                     // Create MEMW operation (write)
@@ -300,12 +310,12 @@ impl Traces {
                 let (_old_val, old_ts) = register_state.read(op.rs1);
                 let old_timestamps = [old_ts; 8];
                 let memw_op = MemwOperation::new(
-                    true,        // is_register = true
-                    reg_addr,    // base_address = 2 * rs1
-                    reg_value,   // value
-                    timestamp,   // timestamp + 0
-                    8,           // width = 8 (full 64-bit register)
-                    true,        // is_read = true
+                    true,      // is_register = true
+                    reg_addr,  // base_address = 2 * rs1
+                    reg_value, // value
+                    timestamp, // timestamp + 0
+                    8,         // width = 8 (full 64-bit register)
+                    true,      // is_read = true
                 )
                 // For reads: old = value = the data being read
                 .with_old(reg_value, old_timestamps);
@@ -322,12 +332,12 @@ impl Traces {
                 let (_old_val, old_ts) = register_state.read(op.rs2);
                 let old_timestamps = [old_ts; 8];
                 let memw_op = MemwOperation::new(
-                    true,            // is_register = true
-                    reg_addr,        // base_address = 2 * rs2
-                    reg_value,       // value
-                    timestamp + 1,   // timestamp + 1
-                    8,               // width = 8
-                    true,            // is_read = true
+                    true,          // is_register = true
+                    reg_addr,      // base_address = 2 * rs2
+                    reg_value,     // value
+                    timestamp + 1, // timestamp + 1
+                    8,             // width = 8
+                    true,          // is_read = true
                 )
                 // For reads: old = value = the data being read
                 .with_old(reg_value, old_timestamps);
@@ -345,12 +355,12 @@ impl Traces {
                 let old_value = pack_register_value(old_val);
                 let old_timestamps = [old_ts; 8];
                 let memw_op = MemwOperation::new(
-                    true,            // is_register = true
-                    reg_addr,        // base_address = 2 * rd
-                    reg_value,       // value = rvd
-                    timestamp + 2,   // timestamp + 2
-                    8,               // width = 8
-                    false,           // is_read = false (write)
+                    true,          // is_register = true
+                    reg_addr,      // base_address = 2 * rd
+                    reg_value,     // value = rvd
+                    timestamp + 2, // timestamp + 2
+                    8,             // width = 8
+                    false,         // is_read = false (write)
                 )
                 .with_old(old_value, old_timestamps);
                 memw_ops.push(memw_op);

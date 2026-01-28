@@ -269,9 +269,13 @@ fn test_prove_elfs_sub_fast() {
         let mu_r = traces.memw.main_table.data[base + memw_cols::MU_READ];
         let mu_w = traces.memw.main_table.data[base + memw_cols::MU_WRITE];
         // Get all 8 VALUE elements
-        let v: Vec<_> = (0..8).map(|i| traces.memw.main_table.data[base + memw_cols::VALUE[i]]).collect();
+        let v: Vec<_> = (0..8)
+            .map(|i| traces.memw.main_table.data[base + memw_cols::VALUE[i]])
+            .collect();
         // Get all 8 OLD elements
-        let old: Vec<_> = (0..8).map(|i| traces.memw.main_table.data[base + memw_cols::OLD[i]]).collect();
+        let old: Vec<_> = (0..8)
+            .map(|i| traces.memw.main_table.data[base + memw_cols::OLD[i]])
+            .collect();
         let w2 = traces.memw.main_table.data[base + memw_cols::WRITE2];
         let w4 = traces.memw.main_table.data[base + memw_cols::WRITE4];
         let w8 = traces.memw.main_table.data[base + memw_cols::WRITE8];
@@ -1006,11 +1010,15 @@ fn test_prove_elfs_all_loadstore_32() {
             let m4 = traces.cpu.main_table.data[base + cpu_cols::MEMORY_4BYTES];
             let m8 = traces.cpu.main_table.data[base + cpu_cols::MEMORY_8BYTES];
             // CPU RES (base_address) as bytes
-            let cpu_res: Vec<_> = (0..8).map(|i| traces.cpu.main_table.data[base + cpu_cols::RES[i]]).collect();
+            let cpu_res: Vec<_> = (0..8)
+                .map(|i| traces.cpu.main_table.data[base + cpu_cols::RES[i]])
+                .collect();
 
             // Corresponding LOAD row
             let load_base = load_idx * load_cols::NUM_COLUMNS;
-            let load_res: Vec<_> = (0..8).map(|i| traces.load.main_table.data[load_base + load_cols::RES[i]]).collect();
+            let load_res: Vec<_> = (0..8)
+                .map(|i| traces.load.main_table.data[load_base + load_cols::RES[i]])
+                .collect();
             let load_addr_0 = traces.load.main_table.data[load_base + load_cols::BASE_ADDRESS_0];
             let load_addr_1 = traces.load.main_table.data[load_base + load_cols::BASE_ADDRESS_1];
             let load_ts_0 = traces.load.main_table.data[load_base + load_cols::TIMESTAMP_0];
@@ -1020,12 +1028,16 @@ fn test_prove_elfs_all_loadstore_32() {
             let load_r8 = traces.load.main_table.data[load_base + load_cols::READ8];
             let load_mu = traces.load.main_table.data[load_base + load_cols::MU];
 
-            println!("CPU row {} (LOAD): rvd=[{:?},{:?}] ts={:?} mem=[{:?},{:?},{:?}]",
-                row, rvd_0, rvd_1, ts, m2, m4, m8);
+            println!(
+                "CPU row {} (LOAD): rvd=[{:?},{:?}] ts={:?} mem=[{:?},{:?},{:?}]",
+                row, rvd_0, rvd_1, ts, m2, m4, m8
+            );
             println!("  CPU res (addr bytes)={:?}", cpu_res);
             println!("LOAD row {}: mu={:?} res={:?}", load_idx, load_mu, load_res);
-            println!("  addr=[{:?},{:?}] ts=[{:?},{:?}] read=[{:?},{:?},{:?}]",
-                load_addr_0, load_addr_1, load_ts_0, load_ts_1, load_r2, load_r4, load_r8);
+            println!(
+                "  addr=[{:?},{:?}] ts=[{:?},{:?}] read=[{:?},{:?},{:?}]",
+                load_addr_0, load_addr_1, load_ts_0, load_ts_1, load_r2, load_r4, load_r8
+            );
             load_idx += 1;
         }
     }
@@ -1043,7 +1055,9 @@ fn test_prove_elfs_all_loadstore_32() {
         let read8 = traces.load.main_table.data[base + load_cols::READ8];
         let signed = traces.load.main_table.data[base + load_cols::SIGNED];
         let sign_bit = traces.load.main_table.data[base + load_cols::SIGN_BIT];
-        let res: Vec<_> = (0..8).map(|i| traces.load.main_table.data[base + load_cols::RES[i]]).collect();
+        let res: Vec<_> = (0..8)
+            .map(|i| traces.load.main_table.data[base + load_cols::RES[i]])
+            .collect();
 
         if mu == FE::one() {
             // Check extension constraints
@@ -1053,8 +1067,10 @@ fn test_prove_elfs_all_loadstore_32() {
             if read8 == FE::zero() {
                 for i in 4..8 {
                     if res[i] != expected_fill {
-                        println!("LOAD row {} FAIL ExtensionHigh({}): res[{}]={:?} expected {:?} (signed={:?} sign_bit={:?})",
-                            row, i, i, res[i], expected_fill, signed, sign_bit);
+                        println!(
+                            "LOAD row {} FAIL ExtensionHigh({}): res[{}]={:?} expected {:?} (signed={:?} sign_bit={:?})",
+                            row, i, i, res[i], expected_fill, signed, sign_bit
+                        );
                     }
                 }
             }
@@ -1062,16 +1078,20 @@ fn test_prove_elfs_all_loadstore_32() {
             if read4 == FE::zero() && read8 == FE::zero() {
                 for i in 2..4 {
                     if res[i] != expected_fill {
-                        println!("LOAD row {} FAIL ExtensionMid({}): res[{}]={:?} expected {:?}",
-                            row, i, i, res[i], expected_fill);
+                        println!(
+                            "LOAD row {} FAIL ExtensionMid({}): res[{}]={:?} expected {:?}",
+                            row, i, i, res[i], expected_fill
+                        );
                     }
                 }
             }
             // ExtensionLow: if !read2 && !read4 && !read8 (1-byte load), res[1] must be sign-extended
             if read2 == FE::zero() && read4 == FE::zero() && read8 == FE::zero() {
                 if res[1] != expected_fill {
-                    println!("LOAD row {} FAIL ExtensionLow: res[1]={:?} expected {:?}",
-                        row, res[1], expected_fill);
+                    println!(
+                        "LOAD row {} FAIL ExtensionLow: res[1]={:?} expected {:?}",
+                        row, res[1], expected_fill
+                    );
                 }
             }
         }

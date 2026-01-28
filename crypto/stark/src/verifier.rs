@@ -916,7 +916,9 @@ pub trait IsStarkVerifier<
             }
 
             if total != FieldElement::zero() {
-                println!("=== LogUp bus does not balance: sum of accumulated values is not zero ===");
+                println!(
+                    "=== LogUp bus does not balance: sum of accumulated values is not zero ==="
+                );
                 println!("=== total = {:?} ===", total);
                 #[cfg(not(feature = "test_fiat_shamir"))]
                 error!("LogUp bus does not balance: sum of accumulated values is not zero");
