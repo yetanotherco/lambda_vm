@@ -17,7 +17,8 @@ use math::{
 #[cfg(feature = "parallel")]
 use rayon::prelude::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
-#[cfg(debug_assertions)]
+// TEMPORARILY ENABLED FOR DEBUGGING - restore #[cfg(debug_assertions)] when done
+// #[cfg(debug_assertions)]
 use crate::debug::validate_trace;
 use crate::domain::new_domain;
 use crate::fri;
@@ -1323,7 +1324,8 @@ pub trait IsStarkProver<
     {
         info!("Started proof generation...");
 
-        #[cfg(debug_assertions)]
+        // TEMPORARILY ENABLED FOR DEBUGGING
+        // #[cfg(debug_assertions)]
         validate_trace(
             air,
             pub_inputs,

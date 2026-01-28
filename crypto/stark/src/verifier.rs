@@ -893,8 +893,9 @@ pub trait IsStarkVerifier<
         // Rounds 2-4: Verify each proof
         // =====================================================================
 
-        for (air, proof) in airs.iter().zip(&multi_proof.proofs) {
+        for (i, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
             if !Self::verify_rounds_2_to_4(*air, proof, transcript, logup_challenges.clone()) {
+                println!("=== Verifier: table {} failed verify_rounds_2_to_4 ===", i);
                 return false;
             }
         }
@@ -915,6 +916,8 @@ pub trait IsStarkVerifier<
             }
 
             if total != FieldElement::zero() {
+                println!("=== LogUp bus does not balance: sum of accumulated values is not zero ===");
+                println!("=== total = {:?} ===", total);
                 #[cfg(not(feature = "test_fiat_shamir"))]
                 error!("LogUp bus does not balance: sum of accumulated values is not zero");
                 return false;

@@ -137,15 +137,19 @@ fn prove_and_verify_vm_minimal(
         match Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])) {
             Ok(proof) => proof,
             Err(e) => {
-                eprintln!("Prover error: {:?}", e);
-                return false;
+                println!("=== PROVER ERROR: {:?} ===", e);
+                panic!("Prover failed: {:?}", e);
             }
         };
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &bitwise_air, &lt_air, &memw_air, &load_air];
 
-    Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[]))
+    let result = Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[]));
+    if !result {
+        println!("=== VERIFIER FAILED ===");
+    }
+    result
 }
 
 // =============================================================================
@@ -210,10 +214,12 @@ fn test_cpu_only_no_bus() {
 
 #[test]
 fn test_prove_elfs_sub_fast() {
+    let _ = env_logger::builder().is_test(true).try_init();
     let (logs, instructions) = run_asm_elf("sub");
     assert_eq!(logs.len(), 4, "sub.elf should have 4 steps");
 
-    let mut cpu_trace = Traces::from_logs(&logs, instructions.clone()).unwrap().cpu;
+    // Use full Traces to get real MEMW trace (includes register operations)
+    let mut traces = Traces::from_logs(&logs, instructions.clone()).unwrap();
     let lt_lookups = collect_lt_lookups_from_logs(&logs, &instructions);
     let mut lt_trace = generate_lt_trace(&lt_lookups);
     let mut bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
@@ -221,19 +227,78 @@ fn test_prove_elfs_sub_fast() {
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
 
     println!(
-        "Fast SUB: CPU {} rows, Bitwise {} rows (minimal), {} lookups",
-        cpu_trace.main_table.height,
+        "Fast SUB: CPU {} rows, Bitwise {} rows (minimal), {} lookups, MEMW {} rows",
+        traces.cpu.main_table.height,
         bitwise_trace.main_table.height,
-        bitwise_lookups.len()
+        bitwise_lookups.len(),
+        traces.memw.main_table.height
     );
+
+    // Debug: Print CPU register-related columns for each row
+    use crate::tables::cpu::cols as cpu_cols;
+    use crate::tables::memw::cols as memw_cols;
+    for row in 0..traces.cpu.main_table.height {
+        let base = row * cpu_cols::NUM_COLUMNS;
+        let ts = traces.cpu.main_table.data[base + cpu_cols::TIMESTAMP];
+        let rs1 = traces.cpu.main_table.data[base + cpu_cols::RS1];
+        let rs2 = traces.cpu.main_table.data[base + cpu_cols::RS2];
+        let rd = traces.cpu.main_table.data[base + cpu_cols::RD];
+        let rr1 = traces.cpu.main_table.data[base + cpu_cols::READ_REGISTER1];
+        let rr2 = traces.cpu.main_table.data[base + cpu_cols::READ_REGISTER2];
+        let wr = traces.cpu.main_table.data[base + cpu_cols::WRITE_REGISTER];
+        let rv1_0 = traces.cpu.main_table.data[base + cpu_cols::RV1_0];
+        let rv1_1 = traces.cpu.main_table.data[base + cpu_cols::RV1_1];
+        let rv1_2 = traces.cpu.main_table.data[base + cpu_cols::RV1_2];
+        let rvd_0 = traces.cpu.main_table.data[base + cpu_cols::RVD_0];
+        let rvd_1 = traces.cpu.main_table.data[base + cpu_cols::RVD_1];
+        let m2 = traces.cpu.main_table.data[base + cpu_cols::MEMORY_2BYTES];
+        let m4 = traces.cpu.main_table.data[base + cpu_cols::MEMORY_4BYTES];
+        let m8 = traces.cpu.main_table.data[base + cpu_cols::MEMORY_8BYTES];
+        println!(
+            "CPU row {}: ts={:?} rs1={:?} rs2={:?} rd={:?} RR1={:?} RR2={:?} WR={:?} rv1=[{:?},{:?},{:?}] rvd=[{:?},{:?}] mem=[{:?},{:?},{:?}]",
+            row, ts, rs1, rs2, rd, rr1, rr2, wr, rv1_0, rv1_1, rv1_2, rvd_0, rvd_1, m2, m4, m8
+        );
+    }
+
+    // Debug: Print MEMW rows with full VALUE and OLD arrays
+    for row in 0..traces.memw.main_table.height {
+        let base = row * memw_cols::NUM_COLUMNS;
+        let is_reg = traces.memw.main_table.data[base + memw_cols::IS_REGISTER];
+        let addr0 = traces.memw.main_table.data[base + memw_cols::BASE_ADDRESS_0];
+        let addr1 = traces.memw.main_table.data[base + memw_cols::BASE_ADDRESS_1];
+        let ts0 = traces.memw.main_table.data[base + memw_cols::TIMESTAMP_0];
+        let ts1 = traces.memw.main_table.data[base + memw_cols::TIMESTAMP_1];
+        let mu_r = traces.memw.main_table.data[base + memw_cols::MU_READ];
+        let mu_w = traces.memw.main_table.data[base + memw_cols::MU_WRITE];
+        // Get all 8 VALUE elements
+        let v: Vec<_> = (0..8).map(|i| traces.memw.main_table.data[base + memw_cols::VALUE[i]]).collect();
+        // Get all 8 OLD elements
+        let old: Vec<_> = (0..8).map(|i| traces.memw.main_table.data[base + memw_cols::OLD[i]]).collect();
+        let w2 = traces.memw.main_table.data[base + memw_cols::WRITE2];
+        let w4 = traces.memw.main_table.data[base + memw_cols::WRITE4];
+        let w8 = traces.memw.main_table.data[base + memw_cols::WRITE8];
+        // Get old_timestamp[0] (first 2 elements)
+        let old_ts_0_0 = traces.memw.main_table.data[base + memw_cols::OLD_TIMESTAMP_START];
+        let old_ts_0_1 = traces.memw.main_table.data[base + memw_cols::OLD_TIMESTAMP_START + 1];
+        println!(
+            "MEMW row {}: is_reg={:?} addr=[{:?},{:?}] ts=[{:?},{:?}] old_ts0=[{:?},{:?}] mu_r={:?} mu_w={:?}",
+            row, is_reg, addr0, addr1, ts0, ts1, old_ts_0_0, old_ts_0_1, mu_r, mu_w
+        );
+        println!("  VALUE={:?}", v);
+        println!("  OLD={:?}", old);
+        println!("  w=[{:?},{:?},{:?}]", w2, w4, w8);
+    }
+
+    // Debug: Print LOAD trace size
+    println!("LOAD trace: {} rows", traces.load.main_table.height);
 
     assert!(
         prove_and_verify_vm_minimal(
-            &mut cpu_trace,
+            &mut traces.cpu,
             &mut bitwise_trace,
             &mut lt_trace,
-            &mut generate_memw_trace(&[]),
-            &mut generate_load_trace(&[])
+            &mut traces.memw,
+            &mut traces.load
         ),
         "Proof verification failed for sub program (fast)"
     );
@@ -912,20 +977,116 @@ fn test_prove_elfs_all_branches_16() {
 fn test_prove_elfs_all_loadstore_32() {
     let (logs, instructions) = run_asm_elf("all_loadstore_32");
     assert_eq!(logs.len(), 32);
-    let mut cpu_trace = Traces::from_logs(&logs, instructions.clone()).unwrap().cpu;
+    // Use full Traces to get real MEMW and LOAD traces
+    let mut traces = Traces::from_logs(&logs, instructions.clone()).unwrap();
     let lt_lookups = collect_lt_lookups_from_logs(&logs, &instructions);
     let mut lt_trace = generate_lt_trace(&lt_lookups);
     let mut bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
     bitwise_lookups.extend(collect_bitwise_lookups_from_lt(&lt_lookups));
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
-    println!("all_loadstore_32: {} lookups", bitwise_lookups.len());
+    println!(
+        "all_loadstore_32: {} CPU rows, {} MEMW rows, {} LOAD rows, {} bitwise lookups",
+        traces.cpu.main_table.height,
+        traces.memw.main_table.height,
+        traces.load.main_table.height,
+        bitwise_lookups.len()
+    );
+
+    // Debug: Compare CPU LOAD sends vs LOAD receives
+    use crate::tables::cpu::cols as cpu_cols;
+    use crate::tables::load::cols as load_cols;
+    let mut load_idx = 0;
+    for row in 0..traces.cpu.main_table.height {
+        let base = row * cpu_cols::NUM_COLUMNS;
+        let is_load = traces.cpu.main_table.data[base + cpu_cols::LOAD];
+        if is_load == crate::tables::types::FE::one() {
+            // CPU row with LOAD=1
+            let rvd_0 = traces.cpu.main_table.data[base + cpu_cols::RVD_0];
+            let rvd_1 = traces.cpu.main_table.data[base + cpu_cols::RVD_1];
+            let ts = traces.cpu.main_table.data[base + cpu_cols::TIMESTAMP];
+            let m2 = traces.cpu.main_table.data[base + cpu_cols::MEMORY_2BYTES];
+            let m4 = traces.cpu.main_table.data[base + cpu_cols::MEMORY_4BYTES];
+            let m8 = traces.cpu.main_table.data[base + cpu_cols::MEMORY_8BYTES];
+            // CPU RES (base_address) as bytes
+            let mut cpu_res: Vec<_> = (0..8).map(|i| traces.cpu.main_table.data[base + cpu_cols::RES[i]]).collect();
+
+            // Corresponding LOAD row
+            let load_base = load_idx * load_cols::NUM_COLUMNS;
+            let load_res: Vec<_> = (0..8).map(|i| traces.load.main_table.data[load_base + load_cols::RES[i]]).collect();
+            let load_addr_0 = traces.load.main_table.data[load_base + load_cols::BASE_ADDRESS_0];
+            let load_addr_1 = traces.load.main_table.data[load_base + load_cols::BASE_ADDRESS_1];
+            let load_ts_0 = traces.load.main_table.data[load_base + load_cols::TIMESTAMP_0];
+            let load_ts_1 = traces.load.main_table.data[load_base + load_cols::TIMESTAMP_1];
+            let load_r2 = traces.load.main_table.data[load_base + load_cols::READ2];
+            let load_r4 = traces.load.main_table.data[load_base + load_cols::READ4];
+            let load_r8 = traces.load.main_table.data[load_base + load_cols::READ8];
+            let load_mu = traces.load.main_table.data[load_base + load_cols::MU];
+
+            println!("CPU row {} (LOAD): rvd=[{:?},{:?}] ts={:?} mem=[{:?},{:?},{:?}]",
+                row, rvd_0, rvd_1, ts, m2, m4, m8);
+            println!("  CPU res (addr bytes)={:?}", cpu_res);
+            println!("LOAD row {}: mu={:?} res={:?}", load_idx, load_mu, load_res);
+            println!("  addr=[{:?},{:?}] ts=[{:?},{:?}] read=[{:?},{:?},{:?}]",
+                load_addr_0, load_addr_1, load_ts_0, load_ts_1, load_r2, load_r4, load_r8);
+            load_idx += 1;
+        }
+    }
+    println!("Total LOAD operations: {}", load_idx);
+
+    // Validate LOAD extension constraints on trace data
+    println!("\n=== Validating LOAD extension constraints ===");
+    use crate::tables::types::FE;
+    let ff = FE::from(255u64);
+    for row in 0..traces.load.main_table.height {
+        let base = row * load_cols::NUM_COLUMNS;
+        let mu = traces.load.main_table.data[base + load_cols::MU];
+        let read2 = traces.load.main_table.data[base + load_cols::READ2];
+        let read4 = traces.load.main_table.data[base + load_cols::READ4];
+        let read8 = traces.load.main_table.data[base + load_cols::READ8];
+        let signed = traces.load.main_table.data[base + load_cols::SIGNED];
+        let sign_bit = traces.load.main_table.data[base + load_cols::SIGN_BIT];
+        let res: Vec<_> = (0..8).map(|i| traces.load.main_table.data[base + load_cols::RES[i]]).collect();
+
+        if mu == FE::one() {
+            // Check extension constraints
+            let expected_fill = signed * sign_bit * ff;
+
+            // ExtensionHigh: if !read8, res[4..8] must be sign-extended
+            if read8 == FE::zero() {
+                for i in 4..8 {
+                    if res[i] != expected_fill {
+                        println!("LOAD row {} FAIL ExtensionHigh({}): res[{}]={:?} expected {:?} (signed={:?} sign_bit={:?})",
+                            row, i, i, res[i], expected_fill, signed, sign_bit);
+                    }
+                }
+            }
+            // ExtensionMid: if !read4 && !read8, res[2..4] must be sign-extended
+            if read4 == FE::zero() && read8 == FE::zero() {
+                for i in 2..4 {
+                    if res[i] != expected_fill {
+                        println!("LOAD row {} FAIL ExtensionMid({}): res[{}]={:?} expected {:?}",
+                            row, i, i, res[i], expected_fill);
+                    }
+                }
+            }
+            // ExtensionLow: if !read2 && !read4 && !read8 (1-byte load), res[1] must be sign-extended
+            if read2 == FE::zero() && read4 == FE::zero() && read8 == FE::zero() {
+                if res[1] != expected_fill {
+                    println!("LOAD row {} FAIL ExtensionLow: res[1]={:?} expected {:?}",
+                        row, res[1], expected_fill);
+                }
+            }
+        }
+    }
+    println!("=== LOAD constraint validation complete ===\n");
+
     assert!(
         prove_and_verify_vm_minimal(
-            &mut cpu_trace,
+            &mut traces.cpu,
             &mut bitwise_trace,
             &mut lt_trace,
-            &mut generate_memw_trace(&[]),
-            &mut generate_load_trace(&[])
+            &mut traces.memw,
+            &mut traces.load
         ),
         "all_loadstore_32 failed"
     );
@@ -938,7 +1099,8 @@ fn test_prove_elfs_all_instructions_64() {
 
     let (logs, instructions) = run_asm_elf("all_instructions_64");
     assert_eq!(logs.len(), 64);
-    let mut cpu_trace = Traces::from_logs(&logs, instructions.clone()).unwrap().cpu;
+    // Use full Traces to get real MEMW and LOAD traces
+    let mut traces = Traces::from_logs(&logs, instructions.clone()).unwrap();
 
     // Includes SLT/SLTU instructions - need LT table
     let lt_lookups = collect_lt_lookups_from_logs(&logs, &instructions);
@@ -952,17 +1114,19 @@ fn test_prove_elfs_all_instructions_64() {
     let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
 
     println!(
-        "all_instructions_64 (fast): {} bitwise lookups, {} lt lookups",
+        "all_instructions_64 (fast): {} bitwise lookups, {} lt lookups, {} MEMW rows, {} LOAD rows",
         bitwise_lookups.len(),
-        lt_lookups.len()
+        lt_lookups.len(),
+        traces.memw.main_table.height,
+        traces.load.main_table.height
     );
     assert!(
         prove_and_verify_vm_minimal(
-            &mut cpu_trace,
+            &mut traces.cpu,
             &mut bitwise_trace,
             &mut lt_trace,
-            &mut generate_memw_trace(&[]),
-            &mut generate_load_trace(&[])
+            &mut traces.memw,
+            &mut traces.load
         ),
         "all_instructions_64 failed"
     );

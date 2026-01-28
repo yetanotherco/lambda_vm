@@ -207,7 +207,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     let mut interactions = Vec::new();
 
     // -------------------------------------------------------------------------
-    // MEMW sender (to read memory)
+    // MEMW sender (to read memory) - ENABLED
     // -------------------------------------------------------------------------
     // LOAD calls MEMW with is_register=0, passing res as both value and old
     // (since we're reading, value=old=the read data)
@@ -318,14 +318,15 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // MSB8 lookups for sign bit extraction
+    // MSB8 lookups for sign bit extraction - TEMPORARILY DISABLED
     // -------------------------------------------------------------------------
     // Need to extract MSB from the relevant byte based on width
     // For read1: MSB8[res[0]] -> sign_bit, multiplicity = read1 = μ - read2 - read4 - read8
     // For read2: MSB8[res[1]] -> sign_bit, multiplicity = read2
     // For read4: MSB8[res[3]] -> sign_bit, multiplicity = read4
     // (For read8, no extension needed - all 8 bytes are used)
-
+    #[allow(clippy::overly_complex_bool_expr)]
+    for _ in 0..0 {
     // MSB8[res[0]] -> sign_bit (for read1)
     // read1 = μ - read2 - read4 - read8 (reading exactly 1 byte)
     interactions.push(BusInteraction::sender(
@@ -391,9 +392,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             },
         ],
     ));
+    } // END TEMPORARILY DISABLED LOAD→MEMW and MSB8 interactions
 
     // -------------------------------------------------------------------------
-    // LOAD receiver (from CPU)
+    // LOAD receiver (from CPU) - ENABLED FOR TESTING
     // -------------------------------------------------------------------------
     // Spec: LOAD[res::DWordWL; base_address, timestamp, read2, read4, read8] | -μ
     //

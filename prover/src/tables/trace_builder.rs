@@ -30,10 +30,44 @@ use crate::ProverError;
 /// Memory cell state: (value_byte, last_write_timestamp)
 type MemoryCell = (u8, u64);
 
+/// Register state: (value, last_write_timestamp)
+/// Registers are 64-bit values, timestamp is for the whole register.
+type RegisterCell = (u64, u64);
+
 /// Memory state tracker for generating MEMW/LOAD traces.
 struct MemoryState {
     /// Map from byte address to (value, timestamp)
     cells: HashMap<u64, MemoryCell>,
+}
+
+/// Register state tracker for generating MEMW register traces.
+/// Tracks the last write timestamp for each register (0-31).
+struct RegisterState {
+    /// Register file: (value, last_write_timestamp)
+    /// Index by register number (0-31)
+    regs: [RegisterCell; 32],
+}
+
+impl RegisterState {
+    fn new() -> Self {
+        Self {
+            // All registers start at (0, 0) - value 0 at timestamp 0
+            regs: [(0, 0); 32],
+        }
+    }
+
+    /// Read a register. Returns (value, last_write_timestamp).
+    fn read(&self, reg: u8) -> RegisterCell {
+        self.regs[reg as usize]
+    }
+
+    /// Write a register with the given timestamp.
+    fn write(&mut self, reg: u8, value: u64, timestamp: u64) {
+        if reg != 0 {
+            // x0 is always 0 and never written
+            self.regs[reg as usize] = (value, timestamp);
+        }
+    }
 }
 
 impl MemoryState {
@@ -87,6 +121,18 @@ fn width_to_bytes_and_signed(width: LoadStoreWidth) -> (usize, bool) {
     }
 }
 
+/// Pack a 64-bit register value into the MEMW value format.
+///
+/// For register operations, values are packed as [lo32, hi32, 0, 0, 0, 0, 0, 0].
+/// This matches the CPU bus interaction which sends rv1/rv2/rvd as 2 words + 6 zeros.
+fn pack_register_value(value: u64) -> [u64; 8] {
+    [
+        value & 0xFFFF_FFFF,  // lo32
+        value >> 32,          // hi32
+        0, 0, 0, 0, 0, 0,     // remaining 6 elements are unconstrained (zeros)
+    ]
+}
+
 /// All generated trace tables.
 pub struct Traces {
     /// CPU execution trace (one row per instruction)
@@ -120,6 +166,9 @@ impl Traces {
 
         // Memory state tracker
         let mut memory_state = MemoryState::new();
+
+        // Register state tracker for old_timestamp values
+        let mut register_state = RegisterState::new();
 
         // Single pass over logs
         for (i, log) in logs.iter().enumerate() {
@@ -169,10 +218,11 @@ impl Traces {
                     }
 
                     // Create MEMW operation (read)
+                    // Use res_bytes (sign-extended) to match what LOAD→MEMW sends
                     let memw_op = MemwOperation::new(
                         false, // is_register = false (memory access)
                         base_address,
-                        value_bytes,
+                        res_bytes,
                         timestamp,
                         byte_count as u8,
                         true, // is_read = true
@@ -202,28 +252,109 @@ impl Traces {
                     // Read old values and timestamps from memory state
                     let (old_values, old_timestamps) = memory_state.read_bytes(base_address, 8);
 
-                    // Extract individual bytes from store value
-                    let mut value_bytes = [0u64; 8];
-                    for (j, byte) in value_bytes.iter_mut().take(byte_count).enumerate() {
-                        *byte = (store_value >> (j * 8)) & 0xFF;
-                    }
+                    // Pack store value as [lo32, hi32, 0, 0, 0, 0, 0, 0] to match CPU M7
+                    // CPU sends rv2 as packed words (can't decompose to bytes in bus interaction)
+                    let value_bytes = [
+                        store_value & 0xFFFF_FFFF,  // lo32
+                        store_value >> 32,          // hi32
+                        0, 0, 0, 0, 0, 0,
+                    ];
 
                     // Create MEMW operation (write)
+                    // M7 uses timestamp+1 (M1=ts+0, M3=ts+1, M5=ts+2)
                     let memw_op = MemwOperation::new(
                         false, // is_register = false (memory access)
                         base_address,
                         value_bytes,
-                        timestamp,
+                        timestamp + 1,
                         byte_count as u8,
                         false, // is_read = false (write)
                     )
                     .with_old(old_values, old_timestamps);
                     memw_ops.push(memw_op);
 
-                    // Update memory state
-                    memory_state.write_bytes(base_address, store_value, byte_count, timestamp);
+                    // Update memory state (using timestamp+1 to match M7)
+                    memory_state.write_bytes(base_address, store_value, byte_count, timestamp + 1);
                 }
                 _ => {}
+            }
+
+            // =========================================================================
+            // Register operations (M1, M3, M5)
+            // =========================================================================
+            // These MEMW operations handle register file access as part of the memory model.
+            // Register addresses are 2 * register_index (0-31 → 0-62).
+            // Values are packed as [lo32, hi32, 0, 0, 0, 0, 0, 0].
+            //
+            // The register_state tracks (value, last_timestamp) for each register.
+            // For the MEMW internal Memory bus to balance:
+            // - old_timestamp must be the timestamp of the last operation on this register
+            // - old_value must be the value at that timestamp
+
+            // M1: Read rs1 register at timestamp+0
+            if op.read_register1 && op.rs1 != 0 {
+                let reg_value = pack_register_value(log.src1_val);
+                let reg_addr = 2 * op.rs1 as u64;
+                // Get old_timestamp from register state (when this register was last accessed)
+                let (old_val, old_ts) = register_state.read(op.rs1);
+                let old_value = pack_register_value(old_val);
+                let old_timestamps = [old_ts; 8];
+                let memw_op = MemwOperation::new(
+                    true,        // is_register = true
+                    reg_addr,    // base_address = 2 * rs1
+                    reg_value,   // value
+                    timestamp,   // timestamp + 0
+                    8,           // width = 8 (full 64-bit register)
+                    true,        // is_read = true
+                )
+                .with_old(old_value, old_timestamps);
+                memw_ops.push(memw_op);
+                // Update register state: value stays same, timestamp updates to current
+                register_state.write(op.rs1, log.src1_val, timestamp);
+            }
+
+            // M3: Read rs2 register at timestamp+1
+            if op.read_register2 && op.rs2 != 0 {
+                let reg_value = pack_register_value(log.src2_val);
+                let reg_addr = 2 * op.rs2 as u64;
+                // Get old_timestamp from register state
+                let (old_val, old_ts) = register_state.read(op.rs2);
+                let old_value = pack_register_value(old_val);
+                let old_timestamps = [old_ts; 8];
+                let memw_op = MemwOperation::new(
+                    true,            // is_register = true
+                    reg_addr,        // base_address = 2 * rs2
+                    reg_value,       // value
+                    timestamp + 1,   // timestamp + 1
+                    8,               // width = 8
+                    true,            // is_read = true
+                )
+                .with_old(old_value, old_timestamps);
+                memw_ops.push(memw_op);
+                // Update register state: value stays same, timestamp updates to current
+                register_state.write(op.rs2, log.src2_val, timestamp + 1);
+            }
+
+            // M5: Write rd register at timestamp+2
+            if op.write_register && op.rd != 0 {
+                let reg_value = pack_register_value(log.dst_val);
+                let reg_addr = 2 * op.rd as u64;
+                // Get old value and timestamp from register state
+                let (old_val, old_ts) = register_state.read(op.rd);
+                let old_value = pack_register_value(old_val);
+                let old_timestamps = [old_ts; 8];
+                let memw_op = MemwOperation::new(
+                    true,            // is_register = true
+                    reg_addr,        // base_address = 2 * rd
+                    reg_value,       // value = rvd
+                    timestamp + 2,   // timestamp + 2
+                    8,               // width = 8
+                    false,           // is_read = false (write)
+                )
+                .with_old(old_value, old_timestamps);
+                memw_ops.push(memw_op);
+                // Update register state with new value and timestamp
+                register_state.write(op.rd, log.dst_val, timestamp + 2);
             }
 
             cpu_ops.push(op);
