@@ -53,13 +53,11 @@ jobs:
 
           # Extract metrics from dhat-heap.json
           # dhat stores per-allocation-point data in .pps array
-          # tb = total bytes, gb = bytes at t-gmax (peak), gbk = blocks at t-gmax
+          # tb = total bytes, gb = bytes at t-gmax (peak)
           PEAK_BYTES=$(jq '[.pps[].gb] | add' dhat-heap.json)
-          PEAK_BLOCKS=$(jq '[.pps[].gbk] | add' dhat-heap.json)
           TOTAL_BYTES=$(jq '[.pps[].tb] | add' dhat-heap.json)
 
           echo "peak_bytes=$PEAK_BYTES" >> $GITHUB_OUTPUT
-          echo "peak_blocks=$PEAK_BLOCKS" >> $GITHUB_OUTPUT
           echo "total_alloc=$TOTAL_BYTES" >> $GITHUB_OUTPUT
 
           # Human readable
@@ -68,10 +66,16 @@ jobs:
           echo "peak_mb=$PEAK_MB" >> $GITHUB_OUTPUT
           echo "total_mb=$TOTAL_MB" >> $GITHUB_OUTPUT
 
-          # Find the function with the highest peak memory (gb = bytes at t-gmax)
-          # DHAT JSON structure: pps[].gb contains peak bytes, pps[].fs[0] is frame index, ftbl maps to names
-          PEAK_FUNCTION=$(jq -r '(.pps | max_by(.gb).fs[0]) as $idx | .ftbl[$idx]' dhat-heap.json)
-          echo "peak_function=$PEAK_FUNCTION" >> $GITHUB_OUTPUT
+          # Extract the full stack trace for the allocation site with highest peak memory
+          # DHAT JSON: pps[].fs contains frame indices, ftbl maps indices to function names
+          PEAK_STACK=$(jq -r '
+            (.pps | max_by(.gb).fs) as $frames |
+            $frames | map(. as $idx | $ARGS.positional[0].ftbl[$idx]) | join("\n")
+          ' --jsonargs "$(cat dhat-heap.json)" dhat-heap.json)
+          # Use delimiter for multiline output
+          echo "peak_stack<<EOF" >> $GITHUB_OUTPUT
+          echo "$PEAK_STACK" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
 
       - name: Upload profile artifact
         id: upload
@@ -176,10 +180,9 @@ jobs:
           script: |
             const peak_mb = '${{ steps.metrics.outputs.peak_mb }}';
             const total_mb = '${{ steps.metrics.outputs.total_mb }}';
-            const peak_blocks = '${{ steps.metrics.outputs.peak_blocks }}';
             const program_name = '${{ steps.metrics.outputs.program_name }}';
             const instruction_count = '${{ steps.metrics.outputs.instruction_count }}';
-            const peak_function = '${{ steps.metrics.outputs.peak_function }}';
+            const peak_stack = `${{ steps.metrics.outputs.peak_stack }}`;
             const has_baseline = '${{ steps.compare.outputs.has_baseline }}' === 'true';
             const regression = '${{ steps.compare.outputs.regression }}' === 'true';
 
@@ -188,9 +191,8 @@ jobs:
             body += `| Metric | Value |\n`;
             body += `|--------|-------|\n`;
             body += `| **Peak Memory** | ${peak_mb} MB |\n`;
-            body += `| **Total Allocated** | ${total_mb} MB |\n`;
-            body += `| **Peak Blocks** | ${peak_blocks} |\n`;
-            body += `| **Peak Function** | \`${peak_function}\` |\n\n`;
+            body += `| **Total Allocated** | ${total_mb} MB |\n\n`;
+            body += `**Peak Allocation Stack Trace:**\n\`\`\`\n${peak_stack}\n\`\`\`\n\n`;
 
             if (has_baseline) {
               const baseline_peak = '${{ steps.compare.outputs.baseline_peak_mb }}';
