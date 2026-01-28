@@ -203,15 +203,8 @@ impl MemwOperation {
 
         let mut ops = Vec::new();
 
-        // DEBUG: Print MEMW operation info
-        eprintln!(
-            "MEMW collect_lt_lookups: width={}, base_addr={:#x}, timestamp={}, old_ts={:?}",
-            self.width, self.base_address, self.timestamp, &self.old_timestamp[..self.width as usize]
-        );
-
         // Constraint 7: old_timestamp[0] < timestamp (always, for any access)
         ops.push(LtOperation::new(self.old_timestamp[0], self.timestamp, false));
-        eprintln!("  #7: ({}, {}, 0) [old_ts[0] < ts]", self.old_timestamp[0], self.timestamp);
 
         // Constraint 8: old_timestamp[1] < timestamp (for width >= 2)
         if self.width >= 2 {
@@ -908,15 +901,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // LT bus uses 2 elements per 64-bit operand: [lo32, hi32]
     // Both old_timestamp and timestamp are DWordWL, so use Packing::DWordWL.
 
-    // DEBUG: Enable individual constraints to isolate the issue
-    let enable_c7 = true;
-    let enable_c8 = true;
-    let enable_c9 = true;
-    let enable_c10 = true;
-    let enable_r1_r3 = true;
-
-    if enable_c7 {
-        // Constraint 7: LT[1; old_timestamp[0], timestamp] with μ_sum
+    // Constraint 7: LT[1; old_timestamp[0], timestamp] with μ_sum
         interactions.push(BusInteraction::sender(
             BusId::Lt,
             Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE),
@@ -937,10 +922,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 BusValue::constant(1),
             ],
         ));
-    }
 
-    if enable_c8 {
-        // Constraint 8: LT[1; old_timestamp[1], timestamp] with w2
+    // Constraint 8: LT[1; old_timestamp[1], timestamp] with w2
         interactions.push(BusInteraction::sender(
             BusId::Lt,
             Multiplicity::Linear(vec![
@@ -970,10 +953,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 BusValue::constant(1),
             ],
         ));
-    }
 
-    if enable_c9 {
-        // Constraint 9: LT[1; old_timestamp[i], timestamp] for i ∈ [2,3] with w4
+    // Constraint 9: LT[1; old_timestamp[i], timestamp] for i ∈ [2,3] with w4
         for i in 2..4 {
             interactions.push(BusInteraction::sender(
                 BusId::Lt,
@@ -992,10 +973,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 ],
             ));
         }
-    }
 
-    if enable_c10 {
-        // Constraint 10: LT[1; old_timestamp[i], timestamp] for i ∈ [4,7] with write8
+    // Constraint 10: LT[1; old_timestamp[i], timestamp] for i ∈ [4,7] with write8
         for i in 4..8 {
             interactions.push(BusInteraction::sender(
                 BusId::Lt,
@@ -1014,10 +993,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 ],
             ));
         }
-    }
 
-    if enable_r1_r3 {
-        // -------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
         // LT interactions for overflow checking (constraints R1-R3)
         // -------------------------------------------------------------------------
         // Verify base_address < address_add[i] (no overflow when adding offset).
@@ -1079,7 +1056,6 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 BusValue::constant(1),
             ],
         ));
-    }
 
     interactions
 }
