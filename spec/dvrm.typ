@@ -65,7 +65,7 @@ Leveraging R1 #footnote([Note: we need not worry about the _overflow_ case in ap
 + $|#`r`|  < |#`d`|$ (unless $#`d` = 0$).
 
 Focusing on the first statement, we observe that this trivially holds when $#`signed` = 0$, 
-while R3 deals with the case that $#`signed` = 0$.
+while R3 deals with the case that $#`signed` = 1$.
 The second statement is enforced by @dvrm:c:abs_r_lt_abs_d.
 @dvrm:c:abs_r_if_negative and @dvrm:c:abs_r_if_nonnegative, respectively @dvrm:c:abs_d_if_negative and @dvrm:c:abs_d_if_nonnegative are included to ensure that `abs_r` and `abs_d` are the absolute values of `r` respectively `d`.
 @dvrm:c:abs_r_range_check and @dvrm:c:abs_d_range_check are required to uphold assumption @add:a:lhs required by the `SUB` chip.
@@ -75,7 +75,7 @@ The second statement is enforced by @dvrm:c:abs_r_lt_abs_d.
 === R5: overflow
 The ISA requires that $#`q` = #`n`$ and $#`r` = 0$ in the event of overflow.
 We note that, while $#`n` = #`qd` + #`r`$ (R1) does _not_ hold in the case of overflow, the relation $#`n` = |#`q`|#`d` + #`r`$ _does_.
-We moreover note that the _signed_ two's complement representation of `q` is identical to the _unsigned_ representation of $|#`q`|$.
+We moreover note that the _signed_ two's complement representation of $-2^63$ is identical to the _unsigned_ representation of $|-2^63| = 2^63$.
 As such, by interpreting `q` as an unsigned integer when $#`overflow` = 1$, it follows that R1 will enforce $#`r` = 0$.
 
 In summary, it suffices to enforce that $#`overflow` => #`q` = #`n`$ (@dvrm:c:q_if_overflow) and to interpret `q` as unsigned in the multiplication when $#`overflow` = 1$ (@dvrm:c:sign_q).
