@@ -8,6 +8,13 @@ on:
       - 'crypto/**'
       - 'executor/**'
       - '.github/workflows/memory-profile.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'prover/**'
+      - 'crypto/**'
+      - 'executor/**'
+      - '.github/workflows/memory-profile.yml'
 
 jobs:
   profile:
@@ -177,6 +184,7 @@ jobs:
           fi
 
       - name: Comment on PR
+        if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
         with:
           script: |
