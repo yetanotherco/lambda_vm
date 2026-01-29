@@ -38,6 +38,7 @@ use crate::tables::lt::{LtOperation, bus_interactions as lt_bus_interactions, co
 use crate::tables::memw::{
     bus_interactions as memw_bus_interactions, cols as memw_cols, constraints as memw_constraints,
 };
+use crate::tables::decode::{bus_interactions as decode_bus_interactions, cols as decode_cols};
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
 pub type F = GoldilocksField;
@@ -534,6 +535,26 @@ pub fn create_load_air(proof_options: &ProofOptions) -> VmAir {
 
     AirWithBuses::new(
         load_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+}
+
+/// Create DECODE AIR with bus interactions.
+///
+/// The DECODE table has no transition constraints (it's a pure lookup table).
+/// It receives lookups from the CPU table via the DECODE bus.
+pub fn create_decode_air(proof_options: &ProofOptions) -> VmAir {
+    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: decode_bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        decode_cols::NUM_COLUMNS,
         auxiliary_trace_build_data,
         proof_options,
         1,

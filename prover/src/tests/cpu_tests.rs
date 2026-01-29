@@ -322,8 +322,9 @@ fn test_bus_interactions_count() {
     // - 1 M5 (MEMW write rd register)
     // - 1 M6 (LOAD from memory)
     // - 1 M7 (STORE to memory)
-    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 5 = 34
-    assert_eq!(interactions.len(), 34);
+    // - 1 DECODE (instruction fetch)
+    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 5 + 1 = 35
+    assert_eq!(interactions.len(), 35);
 }
 
 #[test]

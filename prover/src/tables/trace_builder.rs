@@ -33,6 +33,7 @@ use stark::trace::TraceTable;
 
 use super::bitwise::{self, BitwiseOperation, BitwiseOperationType};
 use super::cpu::{self, CpuOperation};
+use super::decode;
 use super::load::{self, LoadOperation};
 use super::lt::{self, LtOperation};
 use super::memw::{self, MemwOperation};
@@ -575,6 +576,9 @@ pub struct Traces {
 
     /// LOAD memory load with extension trace
     pub load: TraceTable<GoldilocksField, GoldilocksExtension>,
+
+    /// DECODE instruction decoding table
+    pub decode: TraceTable<GoldilocksField, GoldilocksExtension>,
 }
 
 impl Traces {
@@ -626,12 +630,19 @@ impl Traces {
         let mut bitwise = bitwise::generate_bitwise_trace();
         bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
 
+        // Generate DECODE trace and update multiplicities
+        // Each CPU operation looks up the DECODE table once
+        let (mut decode, pc_to_row) = decode::generate_decode_trace(&instructions);
+        let decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
+        decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
+
         Ok(Traces {
             cpu,
             bitwise,
             lt,
             memw,
             load,
+            decode,
         })
     }
 

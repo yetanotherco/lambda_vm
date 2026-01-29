@@ -19,19 +19,28 @@ fn test_packed_decode_flags() {
     let mut entry = DecodeEntry::new();
 
     // Bit 0: read_register1
+    // Note: packed_decode excludes x0 and x255, so we need rs1 != 0 && rs1 != 255
     entry.read_register1 = true;
+    entry.rs1 = 1; // Use a valid register (not x0 or x255)
     assert_eq!(entry.packed_decode() & (1 << 0), 1 << 0);
     entry.read_register1 = false;
+    entry.rs1 = 0;
 
     // Bit 1: read_register2
+    // Note: packed_decode excludes x0, so we need rs2 != 0
     entry.read_register2 = true;
+    entry.rs2 = 1; // Use a valid register (not x0)
     assert_eq!(entry.packed_decode() & (1 << 1), 1 << 1);
     entry.read_register2 = false;
+    entry.rs2 = 0;
 
     // Bit 2: write_register
+    // Note: packed_decode excludes x0, so we need rd != 0
     entry.write_register = true;
+    entry.rd = 1; // Use a valid register (not x0)
     assert_eq!(entry.packed_decode() & (1 << 2), 1 << 2);
     entry.write_register = false;
+    entry.rd = 0;
 
     // Bit 3: memory_2bytes
     entry.memory_2bytes = true;

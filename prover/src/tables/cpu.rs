@@ -846,12 +846,78 @@ pub fn collect_bitwise_ops_from_logs(
 /// Returns the bus interactions for the CPU table.
 ///
 /// The CPU table sends to:
+/// - DECODE: instruction fetch (every row)
 /// - AND_BYTE, OR_BYTE, XOR_BYTE: for bitwise operations (×8 each)
 ///
 /// Note: LT interaction is TODO - needs proper DWordHHW packing to match LT table receiver.
 /// Note: IS_BYTE, MSB8, ZERO, BRANCH interactions are TODO for later.
 pub fn bus_interactions() -> Vec<BusInteraction> {
     let mut interactions = Vec::new();
+
+    // -------------------------------------------------------------------------
+    // DECODE interaction (instruction fetch)
+    // -------------------------------------------------------------------------
+    // Every CPU row looks up the DECODE table once to verify instruction decoding.
+    // Format: DECODE[pc::DWordWL, imm::DWordWL, packed_decode]
+    //
+    // packed_decode is computed as a linear combination of all decode columns:
+    // bits [0-10]: control flags
+    // bits [11-26]: ALU selector flags
+    // bits [27-34]: rs1
+    // bits [35-42]: rs2
+    // bits [43-50]: rd
+    interactions.push(BusInteraction::sender(
+        BusId::Decode,
+        Multiplicity::One, // Every row sends exactly once
+        vec![
+            // pc as DWordWL (2 bus elements)
+            BusValue::Packed {
+                start_column: cols::PC_0,
+                packing: Packing::DWordWL,
+            },
+            // imm as DWordWL (2 bus elements)
+            BusValue::Packed {
+                start_column: cols::IMM_0,
+                packing: Packing::DWordWL,
+            },
+            // packed_decode as linear combination of decode columns
+            BusValue::linear(vec![
+                // Control flags (bits 0-10)
+                LinearTerm::Column { coefficient: 1, column: cols::READ_REGISTER1 },           // bit 0
+                LinearTerm::Column { coefficient: 1 << 1, column: cols::READ_REGISTER2 },     // bit 1
+                LinearTerm::Column { coefficient: 1 << 2, column: cols::WRITE_REGISTER },     // bit 2
+                LinearTerm::Column { coefficient: 1 << 3, column: cols::MEMORY_2BYTES },      // bit 3
+                LinearTerm::Column { coefficient: 1 << 4, column: cols::MEMORY_4BYTES },      // bit 4
+                LinearTerm::Column { coefficient: 1 << 5, column: cols::MEMORY_8BYTES },      // bit 5
+                LinearTerm::Column { coefficient: 1 << 6, column: cols::C_TYPE_INSTRUCTION }, // bit 6
+                LinearTerm::Column { coefficient: 1 << 7, column: cols::SIGNED },             // bit 7
+                LinearTerm::Column { coefficient: 1 << 8, column: cols::MP_SELECTOR },        // bit 8
+                LinearTerm::Column { coefficient: 1 << 9, column: cols::MULDIV_SELECTOR },    // bit 9
+                LinearTerm::Column { coefficient: 1 << 10, column: cols::WORD_INSTR },        // bit 10
+                // ALU selector flags (bits 11-26)
+                LinearTerm::Column { coefficient: 1 << 11, column: cols::ADD },               // bit 11
+                LinearTerm::Column { coefficient: 1 << 12, column: cols::SUB },               // bit 12
+                LinearTerm::Column { coefficient: 1 << 13, column: cols::SLT },               // bit 13
+                LinearTerm::Column { coefficient: 1 << 14, column: cols::AND },               // bit 14
+                LinearTerm::Column { coefficient: 1 << 15, column: cols::OR },                // bit 15
+                LinearTerm::Column { coefficient: 1 << 16, column: cols::XOR },               // bit 16
+                LinearTerm::Column { coefficient: 1 << 17, column: cols::SHIFT },             // bit 17
+                LinearTerm::Column { coefficient: 1 << 18, column: cols::JALR },              // bit 18
+                LinearTerm::Column { coefficient: 1 << 19, column: cols::BEQ },               // bit 19
+                LinearTerm::Column { coefficient: 1 << 20, column: cols::BLT },               // bit 20
+                LinearTerm::Column { coefficient: 1 << 21, column: cols::LOAD },              // bit 21
+                LinearTerm::Column { coefficient: 1 << 22, column: cols::STORE },             // bit 22
+                LinearTerm::Column { coefficient: 1 << 23, column: cols::MUL },               // bit 23
+                LinearTerm::Column { coefficient: 1 << 24, column: cols::DIVREM },            // bit 24
+                LinearTerm::Column { coefficient: 1 << 25, column: cols::ECALL },             // bit 25
+                LinearTerm::Column { coefficient: 1 << 26, column: cols::EBREAK },            // bit 26
+                // Register indices (bits 27-50)
+                LinearTerm::Column { coefficient: 1 << 27, column: cols::RS1 },               // bits 27-34
+                LinearTerm::Column { coefficient: 1 << 35, column: cols::RS2 },               // bits 35-42
+                LinearTerm::Column { coefficient: 1 << 43, column: cols::RD },                // bits 43-50
+            ]),
+        ],
+    ));
 
     // -------------------------------------------------------------------------
     // LT interaction (for SLT, BLT) - TODO: Re-add when properly implemented

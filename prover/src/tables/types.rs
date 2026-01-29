@@ -294,13 +294,21 @@ impl DecodeEntry {
     /// Packs all flags and register indices into a single 51-bit value.
     ///
     /// This matches the spec's packed_decode format (decode.md).
+    ///
+    /// Note: The register flags (read_register1, read_register2, write_register)
+    /// are adjusted to exclude x0 (hardwired zero) and x255 (virtual PC for AUIPC/JAL).
+    /// This matches the CPU trace columns and ensures the DECODE bus balances.
     pub fn packed_decode(&self) -> u64 {
         let mut packed: u64 = 0;
 
         // Control flags (bits 0-10)
-        packed |= self.read_register1 as u64;
-        packed |= (self.read_register2 as u64) << 1;
-        packed |= (self.write_register as u64) << 2;
+        // Note: Register flags exclude x0 and x255 (virtual PC) to match CPU trace
+        let read_reg1_physical = self.read_register1 && self.rs1 != 0 && self.rs1 != 255;
+        let read_reg2_physical = self.read_register2 && self.rs2 != 0;
+        let write_reg_physical = self.write_register && self.rd != 0;
+        packed |= read_reg1_physical as u64;
+        packed |= (read_reg2_physical as u64) << 1;
+        packed |= (write_reg_physical as u64) << 2;
         packed |= (self.memory_2bytes as u64) << 3;
         packed |= (self.memory_4bytes as u64) << 4;
         packed |= (self.memory_8bytes as u64) << 5;
