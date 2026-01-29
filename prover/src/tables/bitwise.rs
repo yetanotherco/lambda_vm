@@ -384,7 +384,7 @@ pub fn update_multiplicities(
     ops: &[BitwiseOperation],
 ) {
     for op in ops {
-        let row = row_index(op.lo_byte, op.hi_byte, op.shift);
+        let row = row_index(op.x, op.y, op.z);
         let mu_col = match op.lookup_type {
             BitwiseOperationType::AndByte => cols::MU_AND,
             BitwiseOperationType::OrByte => cols::MU_OR,
@@ -479,59 +479,59 @@ pub enum BitwiseOperationType {
 
 /// A lookup request to the BITWISE precomputed table.
 ///
-/// The BITWISE table has 2^20 rows indexed by `(lo_byte, hi_byte, shift)`.
+/// The BITWISE table has 2^20 rows indexed by `(x, y, z)`.
 /// Each row contains precomputed results for various operations.
 ///
-/// # Fields
+/// # Fields (matching spec column names)
 /// - `lookup_type`: Which operation result to look up
-/// - `lo_byte`: Low byte input (0-255), used as X in table
-/// - `hi_byte`: High byte input (0-255), used as Y in table
-/// - `shift`: 4-bit shift amount (0-15), only used for HWSL/HWSLC operations
+/// - `x`: Byte input (0-255)
+/// - `y`: Byte input (0-255)
+/// - `z`: 4-bit value (0-15), shift amount for HWSL/HWSLC
 ///
 /// # How inputs map to operations
-/// - AND/OR/XOR: `lo_byte OP hi_byte`
-/// - MSB8: MSB of `lo_byte`
-/// - MSB16: MSB of halfword `lo_byte + hi_byte * 256`
-/// - IS_BYTE/IS_HALF: Range check on `lo_byte + hi_byte * 256`
-/// - HWSL/HWSLC: Shift `lo_byte + hi_byte * 256` by `shift` bits
+/// - AND/OR/XOR: `x OP y`
+/// - MSB8: MSB of `x`
+/// - MSB16: MSB of halfword `x + y * 256`
+/// - IS_BYTE/IS_HALF: Range check on `x + y * 256`
+/// - HWSL/HWSLC: Shift `x + y * 256` by `z` bits
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BitwiseOperation {
     pub lookup_type: BitwiseOperationType,
-    pub lo_byte: u8,
-    pub hi_byte: u8,
-    pub shift: u8,
+    pub x: u8,
+    pub y: u8,
+    pub z: u8,
 }
 
 impl BitwiseOperation {
-    /// Create a new bitwise lookup.
-    pub fn new(lookup_type: BitwiseOperationType, lo_byte: u8, hi_byte: u8, shift: u8) -> Self {
-        debug_assert!(shift < 16, "shift must be in range [0, 16)");
+    /// Create a new bitwise operation.
+    pub fn new(lookup_type: BitwiseOperationType, x: u8, y: u8, z: u8) -> Self {
+        debug_assert!(z < 16, "z must be in range [0, 16)");
         Self {
             lookup_type,
-            lo_byte,
-            hi_byte,
-            shift,
+            x,
+            y,
+            z,
         }
     }
 
-    /// Create a lookup for byte operations (AND, OR, XOR) where shift is unused.
-    pub fn byte_op(lookup_type: BitwiseOperationType, a: u8, b: u8) -> Self {
-        Self::new(lookup_type, a, b, 0)
+    /// Create an operation for byte ops (AND, OR, XOR) where z is unused.
+    pub fn byte_op(lookup_type: BitwiseOperationType, x: u8, y: u8) -> Self {
+        Self::new(lookup_type, x, y, 0)
     }
 
-    /// Create a lookup for single-byte operations (MSB8, IS_BYTE).
-    pub fn single_byte(lookup_type: BitwiseOperationType, byte: u8) -> Self {
-        Self::new(lookup_type, byte, 0, 0)
+    /// Create an operation for single-byte ops (MSB8, IS_BYTE).
+    pub fn single_byte(lookup_type: BitwiseOperationType, x: u8) -> Self {
+        Self::new(lookup_type, x, 0, 0)
     }
 
-    /// Create a lookup for halfword operations (MSB16, IS_HALF, ZERO).
-    pub fn halfword(lookup_type: BitwiseOperationType, lo: u8, hi: u8) -> Self {
-        Self::new(lookup_type, lo, hi, 0)
+    /// Create an operation for halfword ops (MSB16, IS_HALF, ZERO).
+    pub fn halfword(lookup_type: BitwiseOperationType, x: u8, y: u8) -> Self {
+        Self::new(lookup_type, x, y, 0)
     }
 
-    /// Create a lookup for shift operations (HWSL, HWSLC).
-    pub fn shift_op(lookup_type: BitwiseOperationType, lo: u8, hi: u8, shift: u8) -> Self {
-        Self::new(lookup_type, lo, hi, shift)
+    /// Create an operation for shift ops (HWSL, HWSLC).
+    pub fn shift_op(lookup_type: BitwiseOperationType, x: u8, y: u8, z: u8) -> Self {
+        Self::new(lookup_type, x, y, z)
     }
 }
 

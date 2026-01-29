@@ -361,7 +361,7 @@ pub fn generate_minimal_bitwise_trace(ops: &[BitwiseOperation]) -> TraceTable<F,
     let mut row_data: HashMap<(u8, u8, u8), [u64; 11]> = HashMap::new();
 
     for op in ops {
-        let key = (op.lo_byte, op.hi_byte, op.shift);
+        let key = (op.x, op.y, op.z);
         let mu_idx = match op.lookup_type {
             BitwiseOperationType::AndByte => 0,
             BitwiseOperationType::OrByte => 1,
