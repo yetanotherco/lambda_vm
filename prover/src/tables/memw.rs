@@ -245,29 +245,24 @@ impl MemwOperation {
         }
 
         // Overflow checks R1-R3: base_address < base_address + offset
+        // Always generate the LT operation - if overflow occurred, LT will return 0
+        // and the constraint (expecting result=1) will fail, rejecting the proof.
         // R1: for width == 2, check base_address < base_address + 1
         if self.width == 2 {
             let addr_plus_1 = self.base_address.wrapping_add(1);
-            // Only add if no overflow (addr_plus_1 > base_address)
-            if addr_plus_1 > self.base_address {
-                ops.push(LtOperation::new(self.base_address, addr_plus_1, false));
-            }
+            ops.push(LtOperation::new(self.base_address, addr_plus_1, false));
         }
 
         // R2: for width == 4, check base_address < base_address + 3
         if self.width == 4 {
             let addr_plus_3 = self.base_address.wrapping_add(3);
-            if addr_plus_3 > self.base_address {
-                ops.push(LtOperation::new(self.base_address, addr_plus_3, false));
-            }
+            ops.push(LtOperation::new(self.base_address, addr_plus_3, false));
         }
 
         // R3: for width == 8, check base_address < base_address + 7
         if self.width == 8 {
             let addr_plus_7 = self.base_address.wrapping_add(7);
-            if addr_plus_7 > self.base_address {
-                ops.push(LtOperation::new(self.base_address, addr_plus_7, false));
-            }
+            ops.push(LtOperation::new(self.base_address, addr_plus_7, false));
         }
 
         ops

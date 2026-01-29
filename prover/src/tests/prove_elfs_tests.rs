@@ -23,33 +23,17 @@ use stark::trace::TraceTable;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
-use crate::tables::bitwise::{generate_bitwise_trace, update_multiplicities};
-use crate::tables::lt::generate_lt_trace;
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
 // Import shared utilities
 use crate::test_utils::{
-    collect_bitwise_lookups_from_load, collect_bitwise_lookups_from_logs,
-    collect_bitwise_lookups_from_lt, collect_load_ops_from_logs, collect_lt_lookups_from_logs,
     create_bitwise_air, create_cpu_air, create_load_air, create_lt_air, create_memw_air,
-    generate_minimal_bitwise_trace, run_asm_elf,
+    run_asm_elf,
 };
 
 type F = GoldilocksField;
 type E = GoldilocksExtension;
-
-/// Alias for compatibility with existing test code.
-fn collect_bitwise_lookups(
-    logs: &[executor::vm::logs::Log],
-    instructions: &executor::vm::memory::U64HashMap<
-        executor::vm::instruction::decoding::Instruction,
-    >,
-) -> Vec<(crate::tables::bitwise::BitwiseLookup, u8, u8, u8)> {
-    collect_bitwise_lookups_from_logs(logs, instructions)
-}
-
-// AIR creation helpers and lookup collection functions are now in test_utils module
 
 // =============================================================================
 // Prover test helpers

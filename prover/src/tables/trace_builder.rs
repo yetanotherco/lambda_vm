@@ -425,23 +425,19 @@ impl Traces {
             }
 
             // R1-R3: Address overflow checks (base_address < base_address + offset)
+            // Always generate the LT operation - if overflow occurred, LT returns 0
+            // and the constraint (expecting result=1) will fail, rejecting the proof.
             if memw_op.width == 2 {
                 let addr_plus_1 = memw_op.base_address.wrapping_add(1);
-                if addr_plus_1 > memw_op.base_address {
-                    lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_1, false));
-                }
+                lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_1, false));
             }
             if memw_op.width == 4 {
                 let addr_plus_3 = memw_op.base_address.wrapping_add(3);
-                if addr_plus_3 > memw_op.base_address {
-                    lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_3, false));
-                }
+                lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_3, false));
             }
             if memw_op.width == 8 {
                 let addr_plus_7 = memw_op.base_address.wrapping_add(7);
-                if addr_plus_7 > memw_op.base_address {
-                    lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_7, false));
-                }
+                lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_7, false));
             }
         }
 
