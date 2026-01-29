@@ -277,10 +277,10 @@ fn test_cpu_timestamps() {
 
     let traces = Traces::from_logs(&logs, instructions).unwrap();
 
-    // Check timestamps are 0, 4, 8, 12
+    // Check timestamps are 4, 8, 12, 16 (starting from 4 to ensure old_timestamp < timestamp)
     for i in 0..4 {
         let row = traces.cpu.main_table.get_row(i);
-        assert_eq!(row[cols::TIMESTAMP], FE::from((i * 4) as u64));
+        assert_eq!(row[cols::TIMESTAMP], FE::from((i * 4 + 4) as u64));
     }
 }
 
