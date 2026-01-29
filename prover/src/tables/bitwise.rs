@@ -35,6 +35,9 @@ use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::prover::evaluate_polynomial_on_lde_domain;
 use stark::trace::{TraceTable, columns2rows};
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 
 // =========================================================================
@@ -202,20 +205,46 @@ const LDE_COSET_OFFSET: u64 = 3;
 /// because FRI queries can target any index in [0, N*blowup). A raw-value commitment
 /// would only have N leaves, unable to verify queries at indices >= N.
 fn compute_preprocessed_commitment() -> Commitment {
-    // Step 1: Generate precomputed columns (not rows)
-    // Each column is a vector of NUM_ROWS field elements
-    let mut columns: Vec<Vec<FE>> = (0..NUM_PRECOMPUTED_COLS)
-        .map(|_| Vec::with_capacity(NUM_ROWS))
+    // Step 1: Generate precomputed columns in parallel
+    // Each column is generated independently by iterating over all row indices
+    #[cfg(feature = "parallel")]
+    let columns: Vec<Vec<FE>> = (0..NUM_PRECOMPUTED_COLS)
+        .into_par_iter()
+        .map(|col_idx| {
+            (0..NUM_ROWS)
+                .map(|idx| {
+                    let row = generate_bitwise_row(idx);
+                    FE::from(row[col_idx])
+                })
+                .collect()
+        })
         .collect();
 
-    for idx in 0..NUM_ROWS {
-        let row = generate_bitwise_row(idx);
-        for (col_idx, &value) in row.iter().enumerate() {
-            columns[col_idx].push(FE::from(value));
+    #[cfg(not(feature = "parallel"))]
+    let columns: Vec<Vec<FE>> = {
+        let mut cols: Vec<Vec<FE>> = (0..NUM_PRECOMPUTED_COLS)
+            .map(|_| Vec::with_capacity(NUM_ROWS))
+            .collect();
+        for idx in 0..NUM_ROWS {
+            let row = generate_bitwise_row(idx);
+            for (col_idx, &value) in row.iter().enumerate() {
+                cols[col_idx].push(FE::from(value));
+            }
         }
-    }
+        cols
+    };
 
-    // Step 2: Interpolate each column to a polynomial
+    // Step 2: Interpolate each column to a polynomial (parallel)
+    #[cfg(feature = "parallel")]
+    let polys: Vec<Polynomial<FE>> = columns
+        .par_iter()
+        .map(|col| {
+            Polynomial::interpolate_fft::<GoldilocksField>(col)
+                .expect("FFT interpolation failed for bitwise column")
+        })
+        .collect();
+
+    #[cfg(not(feature = "parallel"))]
     let polys: Vec<Polynomial<FE>> = columns
         .iter()
         .map(|col| {
@@ -224,8 +253,19 @@ fn compute_preprocessed_commitment() -> Commitment {
         })
         .collect();
 
-    // Step 3: Evaluate polynomials on LDE domain (N * blowup_factor points)
+    // Step 3: Evaluate polynomials on LDE domain (parallel)
     let coset_offset = FE::from(LDE_COSET_OFFSET);
+
+    #[cfg(feature = "parallel")]
+    let mut lde_columns: Vec<Vec<FE>> = polys
+        .par_iter()
+        .map(|poly| {
+            evaluate_polynomial_on_lde_domain(poly, LDE_BLOWUP_FACTOR, NUM_ROWS, &coset_offset)
+                .expect("LDE evaluation failed for bitwise polynomial")
+        })
+        .collect();
+
+    #[cfg(not(feature = "parallel"))]
     let mut lde_columns: Vec<Vec<FE>> = polys
         .iter()
         .map(|poly| {
@@ -234,7 +274,13 @@ fn compute_preprocessed_commitment() -> Commitment {
         })
         .collect();
 
-    // Step 4: Bit-reverse permute (same as prover)
+    // Step 4: Bit-reverse permute (parallel)
+    #[cfg(feature = "parallel")]
+    lde_columns.par_iter_mut().for_each(|col| {
+        in_place_bit_reverse_permute(col);
+    });
+
+    #[cfg(not(feature = "parallel"))]
     for col in lde_columns.iter_mut() {
         in_place_bit_reverse_permute(col);
     }
@@ -357,6 +403,62 @@ pub fn update_multiplicities(
         let current = trace.main_table.get_row(row)[mu_col];
         trace.set_main(row, mu_col, current + FE::one());
     }
+}
+
+/// Removes rows where all multiplicity columns are zero.
+/// Returns a smaller table containing only rows with actual lookups.
+///
+/// # WARNING: UNSOUND FOR PRODUCTION
+///
+/// This function is for tests only. The reduced table is NOT a valid
+/// preprocessed table because:
+/// 1. Row indices no longer match the (x, y, z) encoding
+/// 2. The verifier cannot verify against a preprocessed commitment
+/// 3. A malicious prover could claim incorrect bitwise results
+///
+/// This is acceptable for tests because we're testing:
+/// - Bus interaction balancing (sends = receives)
+/// - Constraint satisfaction
+/// - LogUp protocol correctness
+#[cfg(test)]
+pub fn trim_zero_rows(
+    trace: TraceTable<GoldilocksField, GoldilocksExtension>,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    use super::types::FE;
+
+    let num_rows = trace.main_table.height;
+
+    // Find rows with any non-zero multiplicity
+    let kept_rows: Vec<usize> = (0..num_rows)
+        .filter(|&row| {
+            let row_data = trace.main_table.get_row(row);
+            // Check all multiplicity columns (indices 11-21)
+            (cols::MU_AND..=cols::MU_HWSLC).any(|col| row_data[col] != FE::zero())
+        })
+        .collect();
+
+    if kept_rows.is_empty() {
+        // No lookups - return minimal table with 16 rows of zeros
+        let data = vec![FE::zero(); 16 * cols::NUM_COLUMNS];
+        return TraceTable::new_main(data, cols::NUM_COLUMNS, 1);
+    }
+
+    // Determine new table size (next power of 2, minimum 16)
+    let new_size = kept_rows.len().next_power_of_two().max(16);
+
+    // Allocate new trace data
+    let mut new_data = vec![FE::zero(); new_size * cols::NUM_COLUMNS];
+
+    // Copy kept rows to new table
+    for (new_row, &old_row) in kept_rows.iter().enumerate() {
+        let old_row_data = trace.main_table.get_row(old_row);
+        let base = new_row * cols::NUM_COLUMNS;
+        for (col, &val) in old_row_data.iter().enumerate() {
+            new_data[base + col] = val;
+        }
+    }
+
+    TraceTable::new_main(new_data, cols::NUM_COLUMNS, 1)
 }
 
 /// Types of lookups the BITWISE table provides.

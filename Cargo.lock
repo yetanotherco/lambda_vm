@@ -3021,6 +3021,7 @@ dependencies = [
  "executor",
  "lazy_static",
  "math",
+ "rayon",
  "stark",
 ]
 
