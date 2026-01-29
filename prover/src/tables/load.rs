@@ -155,7 +155,7 @@ impl LoadOperation {
     /// - read2: MSB8[res[1]] -> sign_bit
     /// - read4: MSB8[res[3]] -> sign_bit
     /// - read8: no MSB8 lookup needed (all 8 bytes are used)
-    pub fn collect_bitwise_lookups(&self) -> Vec<super::bitwise::BitwiseOperation> {
+    pub fn collect_bitwise_ops(&self) -> Vec<super::bitwise::BitwiseOperation> {
         use super::bitwise::{BitwiseOperation, BitwiseOperationType};
 
         // For width 8, no sign extension is needed

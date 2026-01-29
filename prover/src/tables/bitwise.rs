@@ -378,14 +378,14 @@ pub fn row_index(x: u8, y: u8, z: u8) -> usize {
 ///
 /// # Arguments
 /// * `trace` - The BITWISE trace table to update
-/// * `lookups` - Vector of BitwiseOperation requests
+/// * `ops` - Vector of BitwiseOperation requests
 pub fn update_multiplicities(
     trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>,
-    lookups: &[BitwiseOperation],
+    ops: &[BitwiseOperation],
 ) {
-    for lookup in lookups {
-        let row = row_index(lookup.lo_byte, lookup.hi_byte, lookup.shift);
-        let mu_col = match lookup.lookup_type {
+    for op in ops {
+        let row = row_index(op.lo_byte, op.hi_byte, op.shift);
+        let mu_col = match op.lookup_type {
             BitwiseOperationType::AndByte => cols::MU_AND,
             BitwiseOperationType::OrByte => cols::MU_OR,
             BitwiseOperationType::XorByte => cols::MU_XOR,

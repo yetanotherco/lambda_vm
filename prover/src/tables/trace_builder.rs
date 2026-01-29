@@ -188,7 +188,7 @@ fn collect_cpu_ops(
 ///
 /// MEMW and LOAD collection requires sequential processing with state tracking.
 ///
-/// Returns: (memw_ops, load_ops, lt_ops, bitwise_lookups)
+/// Returns: (memw_ops, load_ops, lt_ops, bitwise_ops)
 fn collect_ops_from_cpu(
     cpu_ops: &[CpuOperation],
     memory_state: &mut MemoryState,
@@ -202,7 +202,7 @@ fn collect_ops_from_cpu(
     let mut memw_ops = Vec::with_capacity(cpu_ops.len() * 3);
     let mut load_ops = Vec::with_capacity(cpu_ops.len() / 8 + 1);
     let mut lt_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
-    let mut bitwise_lookups = Vec::with_capacity(cpu_ops.len() * 4);
+    let mut bitwise_ops = Vec::with_capacity(cpu_ops.len() * 4);
 
     for op in cpu_ops {
         // --- MEMW and LOAD (require state tracking, order matters) ---
@@ -212,7 +212,7 @@ fn collect_ops_from_cpu(
             let (memw_op, load_op, lookups) = collect_load_op_from_cpu(op, memory_state);
             memw_ops.push(memw_op);
             load_ops.push(load_op);
-            bitwise_lookups.extend(lookups);
+            bitwise_ops.extend(lookups);
         } else if op.op_store {
             let memw_op = collect_store_op_from_cpu(op, memory_state);
             memw_ops.push(memw_op);
@@ -232,15 +232,15 @@ fn collect_ops_from_cpu(
         }
 
         // Collect bitwise lookups
-        bitwise_lookups.extend(op.collect_bitwise_lookups());
+        bitwise_ops.extend(op.collect_bitwise_ops());
     }
 
-    (memw_ops, load_ops, lt_ops, bitwise_lookups)
+    (memw_ops, load_ops, lt_ops, bitwise_ops)
 }
 
 /// Collects a LOAD operation and corresponding MEMW read from CpuOperation.
 ///
-/// Returns: (memw_op, load_op, bitwise_lookups)
+/// Returns: (memw_op, load_op, bitwise_ops)
 fn collect_load_op_from_cpu(
     op: &CpuOperation,
     memory_state: &mut MemoryState,
@@ -292,12 +292,12 @@ fn collect_load_op_from_cpu(
     );
 
     // Collect MSB8 lookups for sign bit extraction
-    let bitwise_lookups = load_op.collect_bitwise_lookups();
+    let bitwise_ops = load_op.collect_bitwise_ops();
 
     // Update memory state
     memory_state.write_bytes(base_address, loaded_value, byte_count, op.timestamp);
 
-    (memw_op, load_op, bitwise_lookups)
+    (memw_op, load_op, bitwise_ops)
 }
 
 /// Collects a STORE operation as a MEMW write from CpuOperation.
@@ -482,19 +482,19 @@ fn collect_lt_from_memw(memw_ops: &[MemwOperation]) -> Vec<LtOperation> {
 ///
 /// Returns: Vec of bitwise lookups
 fn collect_bitwise_from_lt(lt_ops: &[LtOperation]) -> Vec<BitwiseOperation> {
-    let mut bitwise_lookups = Vec::with_capacity(lt_ops.len() * 8);
+    let mut bitwise_ops = Vec::with_capacity(lt_ops.len() * 8);
 
     for op in lt_ops {
         // MSB16 lookups for lhs[2] and rhs[2]
         let lhs_2 = ((op.lhs >> 48) & 0xFFFF) as u16;
         let rhs_2 = ((op.rhs >> 48) & 0xFFFF) as u16;
 
-        bitwise_lookups.push(BitwiseOperation::halfword(
+        bitwise_ops.push(BitwiseOperation::halfword(
             BitwiseOperationType::Msb16,
             (lhs_2 & 0xFF) as u8,
             (lhs_2 >> 8) as u8,
         ));
-        bitwise_lookups.push(BitwiseOperation::halfword(
+        bitwise_ops.push(BitwiseOperation::halfword(
             BitwiseOperationType::Msb16,
             (rhs_2 & 0xFF) as u8,
             (rhs_2 >> 8) as u8,
@@ -504,7 +504,7 @@ fn collect_bitwise_from_lt(lt_ops: &[LtOperation]) -> Vec<BitwiseOperation> {
         let lhs_sub_rhs = op.lhs.wrapping_sub(op.rhs);
         for shift in [0, 16, 32, 48] {
             let half = ((lhs_sub_rhs >> shift) & 0xFFFF) as u16;
-            bitwise_lookups.push(BitwiseOperation::halfword(
+            bitwise_ops.push(BitwiseOperation::halfword(
                 BitwiseOperationType::IsHalf,
                 (half & 0xFF) as u8,
                 (half >> 8) as u8,
@@ -514,26 +514,26 @@ fn collect_bitwise_from_lt(lt_ops: &[LtOperation]) -> Vec<BitwiseOperation> {
         // IS_HALFWORD lookups for lhs[1] and rhs[1]
         let lhs_1 = ((op.lhs >> 32) & 0xFFFF) as u16;
         let rhs_1 = ((op.rhs >> 32) & 0xFFFF) as u16;
-        bitwise_lookups.push(BitwiseOperation::halfword(
+        bitwise_ops.push(BitwiseOperation::halfword(
             BitwiseOperationType::IsHalf,
             (lhs_1 & 0xFF) as u8,
             (lhs_1 >> 8) as u8,
         ));
-        bitwise_lookups.push(BitwiseOperation::halfword(
+        bitwise_ops.push(BitwiseOperation::halfword(
             BitwiseOperationType::IsHalf,
             (rhs_1 & 0xFF) as u8,
             (rhs_1 >> 8) as u8,
         ));
     }
 
-    bitwise_lookups
+    bitwise_ops
 }
 
 /// Collects IS_HALFWORD lookups from MEMW address_add columns.
 ///
 /// Returns: Vec of bitwise lookups
 fn collect_bitwise_from_memw(memw_ops: &[MemwOperation]) -> Vec<BitwiseOperation> {
-    let mut bitwise_lookups = Vec::with_capacity(memw_ops.len() * 28); // 7 addresses * 4 halfwords
+    let mut bitwise_ops = Vec::with_capacity(memw_ops.len() * 28); // 7 addresses * 4 halfwords
 
     for memw_op in memw_ops {
         for i in 0..7u64 {
@@ -541,7 +541,7 @@ fn collect_bitwise_from_memw(memw_ops: &[MemwOperation]) -> Vec<BitwiseOperation
             // Extract 4 halfwords (DWordHL packing)
             for shift in [0, 16, 32, 48] {
                 let half = ((addr_add >> shift) & 0xFFFF) as u16;
-                bitwise_lookups.push(BitwiseOperation::halfword(
+                bitwise_ops.push(BitwiseOperation::halfword(
                     BitwiseOperationType::IsHalf,
                     (half & 0xFF) as u8,
                     (half >> 8) as u8,
@@ -550,7 +550,7 @@ fn collect_bitwise_from_memw(memw_ops: &[MemwOperation]) -> Vec<BitwiseOperation
         }
     }
 
-    bitwise_lookups
+    bitwise_ops
 }
 
 // =============================================================================
@@ -599,7 +599,7 @@ impl Traces {
         // Processes cpu_ops in order. MEMW/LOAD need state tracking, LT/Bitwise don't.
         let mut memory_state = MemoryState::new();
         let mut register_state = RegisterState::new();
-        let (memw_ops, load_ops, mut lt_ops, mut bitwise_lookups) =
+        let (memw_ops, load_ops, mut lt_ops, mut bitwise_ops) =
             collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
 
         // =====================================================================
@@ -610,8 +610,8 @@ impl Traces {
         // =====================================================================
         // PHASE 4: All → Bitwise lookups
         // =====================================================================
-        bitwise_lookups.extend(collect_bitwise_from_lt(&lt_ops));
-        bitwise_lookups.extend(collect_bitwise_from_memw(&memw_ops));
+        bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
+        bitwise_ops.extend(collect_bitwise_from_memw(&memw_ops));
 
         // =====================================================================
         // PHASE 5: Generate final traces
@@ -622,7 +622,7 @@ impl Traces {
         let load = load::generate_load_trace(&load_ops);
 
         let mut bitwise = bitwise::generate_bitwise_trace();
-        bitwise::update_multiplicities(&mut bitwise, &bitwise_lookups);
+        bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
 
         Ok(Traces {
             cpu,

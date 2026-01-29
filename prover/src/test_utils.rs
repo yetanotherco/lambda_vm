@@ -80,7 +80,7 @@ pub fn run_asm_elf(name: &str) -> (Vec<Log>, U64HashMap<Instruction>) {
 // =============================================================================
 
 /// Collect bitwise lookups from executor logs for minimal table generation.
-pub fn collect_bitwise_lookups_from_logs(
+pub fn collect_bitwise_ops_from_logs(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,
 ) -> Vec<BitwiseOperation> {
@@ -89,7 +89,7 @@ pub fn collect_bitwise_lookups_from_logs(
         .flat_map(|(i, log)| {
             let instruction = *instructions.get(&log.current_pc).unwrap();
             let op = CpuOperation::from_log(log, (i as u64) * 4, instruction);
-            op.collect_bitwise_lookups()
+            op.collect_bitwise_ops()
         })
         .collect()
 }
@@ -263,7 +263,7 @@ pub fn collect_load_ops_from_logs(
 /// The LT table sends:
 /// - MSB16 lookups (×2 per row: for lhs_msb and rhs_msb)
 /// - IS_HALFWORD lookups (×6 per row: ×4 for lhs_sub_rhs, ×1 for lhs[1], ×1 for rhs[1])
-pub fn collect_bitwise_lookups_from_lt(lt_ops: &[LtOperation]) -> Vec<BitwiseOperation> {
+pub fn collect_bitwise_ops_from_lt(lt_ops: &[LtOperation]) -> Vec<BitwiseOperation> {
     let mut lookups = Vec::new();
 
     for op in lt_ops {
@@ -321,12 +321,12 @@ pub fn collect_bitwise_lookups_from_lt(lt_ops: &[LtOperation]) -> Vec<BitwiseOpe
 /// - read2: MSB8[res[1]] -> sign_bit
 /// - read4: MSB8[res[3]] -> sign_bit
 /// - read8: no MSB8 lookup (all 8 bytes are used)
-pub fn collect_bitwise_lookups_from_load(
+pub fn collect_bitwise_ops_from_load(
     load_ops: &[crate::tables::load::LoadOperation],
 ) -> Vec<BitwiseOperation> {
     load_ops
         .iter()
-        .flat_map(|op| op.collect_bitwise_lookups())
+        .flat_map(|op| op.collect_bitwise_ops())
         .collect()
 }
 
@@ -354,15 +354,15 @@ pub fn collect_lt_lookups_from_memw(
 ///
 /// **WARNING: FOR TESTING/BENCHMARKING ONLY - NOT PRODUCTION SAFE!**
 /// The verifier expects the full deterministic 2^20 row public table.
-pub fn generate_minimal_bitwise_trace(lookups: &[BitwiseOperation]) -> TraceTable<F, E> {
+pub fn generate_minimal_bitwise_trace(ops: &[BitwiseOperation]) -> TraceTable<F, E> {
     use std::collections::HashMap;
 
     // Collect unique (lo_byte, hi_byte, shift) tuples and count multiplicities per lookup type
     let mut row_data: HashMap<(u8, u8, u8), [u64; 11]> = HashMap::new();
 
-    for lookup in lookups {
-        let key = (lookup.lo_byte, lookup.hi_byte, lookup.shift);
-        let mu_idx = match lookup.lookup_type {
+    for op in ops {
+        let key = (op.lo_byte, op.hi_byte, op.shift);
+        let mu_idx = match op.lookup_type {
             BitwiseOperationType::AndByte => 0,
             BitwiseOperationType::OrByte => 1,
             BitwiseOperationType::XorByte => 2,
