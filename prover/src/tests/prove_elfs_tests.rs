@@ -685,9 +685,8 @@ fn test_prove_elfs_test_lb_lh_8() {
     let (logs, instructions) = run_asm_elf("test_lb_lh_8");
     assert_eq!(logs.len(), 8);
     let mut traces = Traces::from_logs_minimal(&logs, instructions.clone()).unwrap();
-    // Use prove_and_verify_vm which uses the full bitwise table
     assert!(
-        prove_and_verify_vm(
+        prove_and_verify_vm_minimal(
             &mut traces.cpu,
             &mut traces.bitwise,
             &mut traces.lt,
