@@ -1,11 +1,10 @@
 #import "/book.typ": book-page
 #import "/src.typ": load_config
 
-#show: book-page.with(title: "Variables")
+#show: book-page("variables.typ")
 
 #let config = load_config()
 
-= Variables
 While this VM operates on 64-bit words, the proving system's base field has fewer than $2^64$ elements available and thus cannot represent all words natively.
 To this end, we introduce the concept of "variables" as an abstraction layer on top of the VM's field elements. The following table lists all variable types used in this VM.
 

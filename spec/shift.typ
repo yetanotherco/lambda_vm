@@ -14,9 +14,7 @@
 
 #let shift = raw(chip.name)
 
-#show: book-page.with(title: "SHIFT chip")
-
-= #shift chip
+#show: book-page(chip.name)
 
 == Interface
 The #shift chip has the following interface:

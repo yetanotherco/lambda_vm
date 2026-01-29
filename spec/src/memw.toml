@@ -159,21 +159,21 @@ iters = [
 [[constraints.consistency]]
 kind = "interaction"
 tag = "LT"
-input = [["idx", "old_timestamp", 0], "timestamp"]
+input = [["idx", "old_timestamp", 0], "timestamp", 0]
 output = 1
 multiplicity = "μ_sum"
 
 [[constraints.consistency]]
 kind = "interaction"
 tag = "LT"
-input = [["idx", "old_timestamp", 1], "timestamp"]
+input = [["idx", "old_timestamp", 1], "timestamp", 0]
 output = 1
 multiplicity = "w2"
 
 [[constraints.consistency]]
 kind = "interaction"
 tag = "LT"
-input = [["idx", "old_timestamp", "i"], "timestamp"]
+input = [["idx", "old_timestamp", "i"], "timestamp", 0]
 output = 1
 iter = ["i", 2, 3]
 multiplicity = "w4"
@@ -181,7 +181,7 @@ multiplicity = "w4"
 [[constraints.consistency]]
 kind = "interaction"
 tag = "LT"
-input = [["idx", "old_timestamp", "i"], "timestamp"]
+input = [["idx", "old_timestamp", "i"], "timestamp", 0]
 output = 1
 iter = ["i", 4, 7]
 multiplicity = "write8"
@@ -194,21 +194,21 @@ prefix = "R"
 [[constraints.overflow]]
 kind = "interaction"
 tag = "LT"
-input = ["base_address", ["cast", ["idx", "address_add", 0], "DWordWL"]]
+input = ["base_address", ["cast", ["idx", "address_add", 0], "DWordWL"], 0]
 output = 1
 multiplicity = "write2"
 
 [[constraints.overflow]]
 kind = "interaction"
 tag = "LT"
-input = ["base_address", ["cast", ["idx", "address_add", 2], "DWordWL"]]
+input = ["base_address", ["cast", ["idx", "address_add", 2], "DWordWL"], 0]
 output = 1
 multiplicity = "write4"
 
 [[constraints.overflow]]
 kind = "interaction"
 tag = "LT"
-input = ["base_address", ["cast", ["idx", "address_add", 6], "DWordWL"]]
+input = ["base_address", ["cast", ["idx", "address_add", 6], "DWordWL"], 0]
 output = 1
 multiplicity = "write8"
 
