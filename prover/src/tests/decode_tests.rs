@@ -15,173 +15,183 @@ use crate::tables::types::FE;
 #[test]
 fn test_packed_decode_flags() {
     // Test each control flag individually
-    // Format matches cpu.toml spec
+    // Format matches decode.md spec
     let mut entry = DecodeEntry::new();
 
-    // Bit 0: write_register
-    entry.write_register = true;
+    // Bit 0: read_register1
+    entry.read_register1 = true;
     assert_eq!(entry.packed_decode() & (1 << 0), 1 << 0);
+    entry.read_register1 = false;
+
+    // Bit 1: read_register2
+    entry.read_register2 = true;
+    assert_eq!(entry.packed_decode() & (1 << 1), 1 << 1);
+    entry.read_register2 = false;
+
+    // Bit 2: write_register
+    entry.write_register = true;
+    assert_eq!(entry.packed_decode() & (1 << 2), 1 << 2);
     entry.write_register = false;
 
-    // Bit 1: memory_2bytes
+    // Bit 3: memory_2bytes
     entry.memory_2bytes = true;
-    assert_eq!(entry.packed_decode() & (1 << 1), 1 << 1);
+    assert_eq!(entry.packed_decode() & (1 << 3), 1 << 3);
     entry.memory_2bytes = false;
 
-    // Bit 2: memory_4bytes
+    // Bit 4: memory_4bytes
     entry.memory_4bytes = true;
-    assert_eq!(entry.packed_decode() & (1 << 2), 1 << 2);
+    assert_eq!(entry.packed_decode() & (1 << 4), 1 << 4);
     entry.memory_4bytes = false;
 
-    // Bit 3: memory_8bytes
+    // Bit 5: memory_8bytes
     entry.memory_8bytes = true;
-    assert_eq!(entry.packed_decode() & (1 << 3), 1 << 3);
+    assert_eq!(entry.packed_decode() & (1 << 5), 1 << 5);
     entry.memory_8bytes = false;
 
-    // Bit 4: c_type
+    // Bit 6: c_type
     entry.c_type = true;
-    assert_eq!(entry.packed_decode() & (1 << 4), 1 << 4);
+    assert_eq!(entry.packed_decode() & (1 << 6), 1 << 6);
     entry.c_type = false;
 
-    // Bit 5: signed
+    // Bit 7: signed
     entry.signed = true;
-    assert_eq!(entry.packed_decode() & (1 << 5), 1 << 5);
+    assert_eq!(entry.packed_decode() & (1 << 7), 1 << 7);
     entry.signed = false;
 
-    // Bit 6: mp_selector
+    // Bit 8: mp_selector
     entry.mp_selector = true;
-    assert_eq!(entry.packed_decode() & (1 << 6), 1 << 6);
+    assert_eq!(entry.packed_decode() & (1 << 8), 1 << 8);
     entry.mp_selector = false;
 
-    // Bit 7: muldiv_selector
+    // Bit 9: muldiv_selector
     entry.muldiv_selector = true;
-    assert_eq!(entry.packed_decode() & (1 << 7), 1 << 7);
+    assert_eq!(entry.packed_decode() & (1 << 9), 1 << 9);
     entry.muldiv_selector = false;
 
-    // Bit 8: word_instr
+    // Bit 10: word_instr
     entry.word_instr = true;
-    assert_eq!(entry.packed_decode() & (1 << 8), 1 << 8);
+    assert_eq!(entry.packed_decode() & (1 << 10), 1 << 10);
     entry.word_instr = false;
 }
 
 #[test]
 fn test_packed_decode_alu_flags() {
-    // ALU flags at bits 9-24 per cpu.toml spec
+    // ALU flags at bits 11-26 per decode.md spec
     let mut entry = DecodeEntry::new();
 
-    // Bit 9: ADD
+    // Bit 11: ADD
     entry.op_add = true;
-    assert_eq!(entry.packed_decode() & (1 << 9), 1 << 9);
+    assert_eq!(entry.packed_decode() & (1 << 11), 1 << 11);
     entry.op_add = false;
 
-    // Bit 10: SUB
+    // Bit 12: SUB
     entry.op_sub = true;
-    assert_eq!(entry.packed_decode() & (1 << 10), 1 << 10);
+    assert_eq!(entry.packed_decode() & (1 << 12), 1 << 12);
     entry.op_sub = false;
 
-    // Bit 11: SLT
+    // Bit 13: SLT
     entry.op_slt = true;
-    assert_eq!(entry.packed_decode() & (1 << 11), 1 << 11);
+    assert_eq!(entry.packed_decode() & (1 << 13), 1 << 13);
     entry.op_slt = false;
 
-    // Bit 12: AND
+    // Bit 14: AND
     entry.op_and = true;
-    assert_eq!(entry.packed_decode() & (1 << 12), 1 << 12);
+    assert_eq!(entry.packed_decode() & (1 << 14), 1 << 14);
     entry.op_and = false;
 
-    // Bit 13: OR
+    // Bit 15: OR
     entry.op_or = true;
-    assert_eq!(entry.packed_decode() & (1 << 13), 1 << 13);
+    assert_eq!(entry.packed_decode() & (1 << 15), 1 << 15);
     entry.op_or = false;
 
-    // Bit 14: XOR
+    // Bit 16: XOR
     entry.op_xor = true;
-    assert_eq!(entry.packed_decode() & (1 << 14), 1 << 14);
+    assert_eq!(entry.packed_decode() & (1 << 16), 1 << 16);
     entry.op_xor = false;
 
-    // Bit 15: SHIFT
+    // Bit 17: SHIFT
     entry.op_shift = true;
-    assert_eq!(entry.packed_decode() & (1 << 15), 1 << 15);
+    assert_eq!(entry.packed_decode() & (1 << 17), 1 << 17);
     entry.op_shift = false;
 
-    // Bit 16: JALR
+    // Bit 18: JALR
     entry.op_jalr = true;
-    assert_eq!(entry.packed_decode() & (1 << 16), 1 << 16);
+    assert_eq!(entry.packed_decode() & (1 << 18), 1 << 18);
     entry.op_jalr = false;
 
-    // Bit 17: BEQ
+    // Bit 19: BEQ
     entry.op_beq = true;
-    assert_eq!(entry.packed_decode() & (1 << 17), 1 << 17);
+    assert_eq!(entry.packed_decode() & (1 << 19), 1 << 19);
     entry.op_beq = false;
 
-    // Bit 18: BLT
+    // Bit 20: BLT
     entry.op_blt = true;
-    assert_eq!(entry.packed_decode() & (1 << 18), 1 << 18);
+    assert_eq!(entry.packed_decode() & (1 << 20), 1 << 20);
     entry.op_blt = false;
 
-    // Bit 19: LOAD
+    // Bit 21: LOAD
     entry.op_load = true;
-    assert_eq!(entry.packed_decode() & (1 << 19), 1 << 19);
+    assert_eq!(entry.packed_decode() & (1 << 21), 1 << 21);
     entry.op_load = false;
 
-    // Bit 20: STORE
+    // Bit 22: STORE
     entry.op_store = true;
-    assert_eq!(entry.packed_decode() & (1 << 20), 1 << 20);
+    assert_eq!(entry.packed_decode() & (1 << 22), 1 << 22);
     entry.op_store = false;
 
-    // Bit 21: MUL
+    // Bit 23: MUL
     entry.op_mul = true;
-    assert_eq!(entry.packed_decode() & (1 << 21), 1 << 21);
+    assert_eq!(entry.packed_decode() & (1 << 23), 1 << 23);
     entry.op_mul = false;
 
-    // Bit 22: DIVREM
+    // Bit 24: DIVREM
     entry.op_divrem = true;
-    assert_eq!(entry.packed_decode() & (1 << 22), 1 << 22);
+    assert_eq!(entry.packed_decode() & (1 << 24), 1 << 24);
     entry.op_divrem = false;
 
-    // Bit 23: ECALL
+    // Bit 25: ECALL
     entry.op_ecall = true;
-    assert_eq!(entry.packed_decode() & (1 << 23), 1 << 23);
+    assert_eq!(entry.packed_decode() & (1 << 25), 1 << 25);
     entry.op_ecall = false;
 
-    // Bit 24: EBREAK
+    // Bit 26: EBREAK
     entry.op_ebreak = true;
-    assert_eq!(entry.packed_decode() & (1 << 24), 1 << 24);
+    assert_eq!(entry.packed_decode() & (1 << 26), 1 << 26);
     entry.op_ebreak = false;
 }
 
 #[test]
 fn test_packed_decode_registers() {
-    // Register positions per cpu.toml spec:
-    // rs1 at bits [25:33), rs2 at bits [33:41), rd at bits [41:49)
+    // Register positions per decode.md spec:
+    // rs1 at bits [27:35), rs2 at bits [35:43), rd at bits [43:51)
     let mut entry = DecodeEntry::new();
 
-    // rs1 at bits [25:33)
+    // rs1 at bits [27:35)
     entry.rs1 = 0b10101010;
     let packed = entry.packed_decode();
-    let rs1_extracted = (packed >> 25) & 0xFF;
+    let rs1_extracted = (packed >> 27) & 0xFF;
     assert_eq!(rs1_extracted, 0b10101010);
     entry.rs1 = 0;
 
-    // rs2 at bits [33:41)
+    // rs2 at bits [35:43)
     entry.rs2 = 0b11001100;
     let packed = entry.packed_decode();
-    let rs2_extracted = (packed >> 33) & 0xFF;
+    let rs2_extracted = (packed >> 35) & 0xFF;
     assert_eq!(rs2_extracted, 0b11001100);
     entry.rs2 = 0;
 
-    // rd at bits [41:49)
+    // rd at bits [43:51)
     entry.rd = 0b11110000;
     let packed = entry.packed_decode();
-    let rd_extracted = (packed >> 41) & 0xFF;
+    let rd_extracted = (packed >> 43) & 0xFF;
     assert_eq!(rd_extracted, 0b11110000);
 }
 
 #[test]
 fn test_packed_decode_combined() {
     // Test with realistic ADD instruction: rd=10, rs1=5, rs2=6
-    // Per cpu.toml spec: write_register at bit 0, op_add at bit 9
-    // Note: read_register1/read_register2 are NOT in packed_decode (they're separate fields)
+    // Per decode.md spec: read_register1 at bit 0, read_register2 at bit 1,
+    // write_register at bit 2, op_add at bit 11
     let entry = DecodeEntry {
         pc: 0x1000,
         rs1: 5,
@@ -196,18 +206,28 @@ fn test_packed_decode_combined() {
 
     let packed = entry.packed_decode();
 
-    // Verify flags per spec: write_register at bit 0, op_add at bit 9
+    // Verify flags per spec
     assert_eq!(
         packed & (1 << 0),
         1 << 0,
-        "write_register should be set at bit 0"
+        "read_register1 should be set at bit 0"
     );
-    assert_eq!(packed & (1 << 9), 1 << 9, "op_add should be set at bit 9");
+    assert_eq!(
+        packed & (1 << 1),
+        1 << 1,
+        "read_register2 should be set at bit 1"
+    );
+    assert_eq!(
+        packed & (1 << 2),
+        1 << 2,
+        "write_register should be set at bit 2"
+    );
+    assert_eq!(packed & (1 << 11), 1 << 11, "op_add should be set at bit 11");
 
-    // Verify registers per spec: rs1 at bits 25-32, rs2 at bits 33-40, rd at bits 41-48
-    assert_eq!((packed >> 25) & 0xFF, 5, "rs1 should be 5");
-    assert_eq!((packed >> 33) & 0xFF, 6, "rs2 should be 6");
-    assert_eq!((packed >> 41) & 0xFF, 10, "rd should be 10");
+    // Verify registers per spec: rs1 at bits 27-34, rs2 at bits 35-42, rd at bits 43-50
+    assert_eq!((packed >> 27) & 0xFF, 5, "rs1 should be 5");
+    assert_eq!((packed >> 35) & 0xFF, 6, "rs2 should be 6");
+    assert_eq!((packed >> 43) & 0xFF, 10, "rd should be 10");
 }
 
 // =========================================================================

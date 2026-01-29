@@ -184,73 +184,77 @@ impl DecodeEntry {
         }
     }
 
-    /// Packs all flags and register indices into a single 49-bit value.
+    /// Packs all flags and register indices into a single 51-bit value.
     ///
-    /// This matches the spec's packed_decode format (cpu.toml):
-    /// - bit 0:      write_register
-    /// - bit 1:      memory_2bytes
-    /// - bit 2:      memory_4bytes
-    /// - bit 3:      memory_8bytes
-    /// - bit 4:      c_type
-    /// - bit 5:      signed
-    /// - bit 6:      mp_selector
-    /// - bit 7:      muldiv_selector
-    /// - bit 8:      word_instr
-    /// - bit 9:      ADD
-    /// - bit 10:     SUB
-    /// - bit 11:     SLT
-    /// - bit 12:     AND
-    /// - bit 13:     OR
-    /// - bit 14:     XOR
-    /// - bit 15:     SHIFT
-    /// - bit 16:     JALR
-    /// - bit 17:     BEQ
-    /// - bit 18:     BLT
-    /// - bit 19:     LOAD
-    /// - bit 20:     STORE
-    /// - bit 21:     MUL
-    /// - bit 22:     DIVREM
-    /// - bit 23:     ECALL
-    /// - bit 24:     EBREAK
-    /// - bits 25-32: rs1 (8 bits)
-    /// - bits 33-40: rs2 (8 bits)
-    /// - bits 41-48: rd (8 bits)
+    /// This matches the spec's packed_decode format (decode.md):
+    /// - bit 0:      read_register1
+    /// - bit 1:      read_register2
+    /// - bit 2:      write_register
+    /// - bit 3:      memory_2bytes
+    /// - bit 4:      memory_4bytes
+    /// - bit 5:      memory_8bytes
+    /// - bit 6:      c_type
+    /// - bit 7:      signed
+    /// - bit 8:      mp_selector
+    /// - bit 9:      muldiv_selector
+    /// - bit 10:     word_instr
+    /// - bit 11:     ADD
+    /// - bit 12:     SUB
+    /// - bit 13:     SLT
+    /// - bit 14:     AND
+    /// - bit 15:     OR
+    /// - bit 16:     XOR
+    /// - bit 17:     SHIFT
+    /// - bit 18:     JALR
+    /// - bit 19:     BEQ
+    /// - bit 20:     BLT
+    /// - bit 21:     LOAD
+    /// - bit 22:     STORE
+    /// - bit 23:     MUL
+    /// - bit 24:     DIVREM
+    /// - bit 25:     ECALL
+    /// - bit 26:     EBREAK
+    /// - bits 27-34: rs1 (8 bits)
+    /// - bits 35-42: rs2 (8 bits)
+    /// - bits 43-50: rd (8 bits)
     pub fn packed_decode(&self) -> u64 {
         let mut packed: u64 = 0;
 
-        // Control flags (bits 0-8)
-        packed |= self.write_register as u64;
-        packed |= (self.memory_2bytes as u64) << 1;
-        packed |= (self.memory_4bytes as u64) << 2;
-        packed |= (self.memory_8bytes as u64) << 3;
-        packed |= (self.c_type as u64) << 4;
-        packed |= (self.signed as u64) << 5;
-        packed |= (self.mp_selector as u64) << 6;
-        packed |= (self.muldiv_selector as u64) << 7;
-        packed |= (self.word_instr as u64) << 8;
+        // Control flags (bits 0-10)
+        packed |= self.read_register1 as u64;
+        packed |= (self.read_register2 as u64) << 1;
+        packed |= (self.write_register as u64) << 2;
+        packed |= (self.memory_2bytes as u64) << 3;
+        packed |= (self.memory_4bytes as u64) << 4;
+        packed |= (self.memory_8bytes as u64) << 5;
+        packed |= (self.c_type as u64) << 6;
+        packed |= (self.signed as u64) << 7;
+        packed |= (self.mp_selector as u64) << 8;
+        packed |= (self.muldiv_selector as u64) << 9;
+        packed |= (self.word_instr as u64) << 10;
 
-        // ALU flags (bits 9-24)
-        packed |= (self.op_add as u64) << 9;
-        packed |= (self.op_sub as u64) << 10;
-        packed |= (self.op_slt as u64) << 11;
-        packed |= (self.op_and as u64) << 12;
-        packed |= (self.op_or as u64) << 13;
-        packed |= (self.op_xor as u64) << 14;
-        packed |= (self.op_shift as u64) << 15;
-        packed |= (self.op_jalr as u64) << 16;
-        packed |= (self.op_beq as u64) << 17;
-        packed |= (self.op_blt as u64) << 18;
-        packed |= (self.op_load as u64) << 19;
-        packed |= (self.op_store as u64) << 20;
-        packed |= (self.op_mul as u64) << 21;
-        packed |= (self.op_divrem as u64) << 22;
-        packed |= (self.op_ecall as u64) << 23;
-        packed |= (self.op_ebreak as u64) << 24;
+        // ALU flags (bits 11-26)
+        packed |= (self.op_add as u64) << 11;
+        packed |= (self.op_sub as u64) << 12;
+        packed |= (self.op_slt as u64) << 13;
+        packed |= (self.op_and as u64) << 14;
+        packed |= (self.op_or as u64) << 15;
+        packed |= (self.op_xor as u64) << 16;
+        packed |= (self.op_shift as u64) << 17;
+        packed |= (self.op_jalr as u64) << 18;
+        packed |= (self.op_beq as u64) << 19;
+        packed |= (self.op_blt as u64) << 20;
+        packed |= (self.op_load as u64) << 21;
+        packed |= (self.op_store as u64) << 22;
+        packed |= (self.op_mul as u64) << 23;
+        packed |= (self.op_divrem as u64) << 24;
+        packed |= (self.op_ecall as u64) << 25;
+        packed |= (self.op_ebreak as u64) << 26;
 
-        // Register indices (bits 25-48)
-        packed |= (self.rs1 as u64) << 25;
-        packed |= (self.rs2 as u64) << 33;
-        packed |= (self.rd as u64) << 41;
+        // Register indices (bits 27-50)
+        packed |= (self.rs1 as u64) << 27;
+        packed |= (self.rs2 as u64) << 35;
+        packed |= (self.rd as u64) << 43;
 
         packed
     }
