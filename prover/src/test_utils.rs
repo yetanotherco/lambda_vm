@@ -25,7 +25,8 @@ use stark::trace::TraceTable;
 
 use crate::constraints::cpu::create_all_cpu_constraints;
 use crate::tables::bitwise::{
-    BitwiseLookup, bus_interactions as bitwise_bus_interactions, cols as bitwise_cols,
+    BitwiseOperation, BitwiseOperationType, bus_interactions as bitwise_bus_interactions,
+    cols as bitwise_cols,
 };
 use crate::tables::cpu::{
     CpuOperation, bus_interactions as cpu_bus_interactions, cols as cpu_cols,
@@ -79,16 +80,16 @@ pub fn run_asm_elf(name: &str) -> (Vec<Log>, U64HashMap<Instruction>) {
 // =============================================================================
 
 /// Collect bitwise lookups from executor logs for minimal table generation.
-pub fn collect_bitwise_lookups_from_logs(
+pub fn collect_bitwise_ops_from_logs(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,
-) -> Vec<(BitwiseLookup, u8, u8, u8)> {
+) -> Vec<BitwiseOperation> {
     logs.iter()
         .enumerate()
         .flat_map(|(i, log)| {
             let instruction = *instructions.get(&log.current_pc).unwrap();
             let op = CpuOperation::from_log(log, (i as u64) * 4, instruction);
-            op.collect_bitwise_lookups()
+            op.collect_bitwise_ops()
         })
         .collect()
 }
@@ -262,50 +263,51 @@ pub fn collect_load_ops_from_logs(
 /// The LT table sends:
 /// - MSB16 lookups (×2 per row: for lhs_msb and rhs_msb)
 /// - IS_HALFWORD lookups (×6 per row: ×4 for lhs_sub_rhs, ×1 for lhs[1], ×1 for rhs[1])
-pub fn collect_bitwise_lookups_from_lt(lt_ops: &[LtOperation]) -> Vec<(BitwiseLookup, u8, u8, u8)> {
+pub fn collect_bitwise_ops_from_lt(lt_ops: &[LtOperation]) -> Vec<BitwiseOperation> {
     let mut lookups = Vec::new();
 
     for op in lt_ops {
         // MSB16 for lhs_msb (bits 48-63 of lhs)
         let lhs_2 = ((op.lhs >> 48) & 0xFFFF) as u16;
-        let x = (lhs_2 & 0xFF) as u8;
-        let y = ((lhs_2 >> 8) & 0xFF) as u8;
-        lookups.push((BitwiseLookup::Msb16, x, y, 0));
+        lookups.push(BitwiseOperation::halfword(
+            BitwiseOperationType::Msb16,
+            (lhs_2 & 0xFF) as u8,
+            ((lhs_2 >> 8) & 0xFF) as u8,
+        ));
 
         // MSB16 for rhs_msb (bits 48-63 of rhs)
         let rhs_2 = ((op.rhs >> 48) & 0xFFFF) as u16;
-        let x = (rhs_2 & 0xFF) as u8;
-        let y = ((rhs_2 >> 8) & 0xFF) as u8;
-        lookups.push((BitwiseLookup::Msb16, x, y, 0));
+        lookups.push(BitwiseOperation::halfword(
+            BitwiseOperationType::Msb16,
+            (rhs_2 & 0xFF) as u8,
+            ((rhs_2 >> 8) & 0xFF) as u8,
+        ));
 
         // IS_HALFWORD for lhs_sub_rhs (4 halfwords)
         let lhs_sub_rhs = op.lhs.wrapping_sub(op.rhs);
         for shift in [0, 16, 32, 48] {
             let half = ((lhs_sub_rhs >> shift) & 0xFFFF) as u16;
-            lookups.push((
-                BitwiseLookup::IsHalf,
+            lookups.push(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
                 (half & 0xFF) as u8,
                 ((half >> 8) & 0xFF) as u8,
-                0,
             ));
         }
 
         // IS_HALFWORD for lhs[1] (bits 32-47 of lhs)
         let lhs_1 = ((op.lhs >> 32) & 0xFFFF) as u16;
-        lookups.push((
-            BitwiseLookup::IsHalf,
+        lookups.push(BitwiseOperation::halfword(
+            BitwiseOperationType::IsHalf,
             (lhs_1 & 0xFF) as u8,
             ((lhs_1 >> 8) & 0xFF) as u8,
-            0,
         ));
 
         // IS_HALFWORD for rhs[1] (bits 32-47 of rhs)
         let rhs_1 = ((op.rhs >> 32) & 0xFFFF) as u16;
-        lookups.push((
-            BitwiseLookup::IsHalf,
+        lookups.push(BitwiseOperation::halfword(
+            BitwiseOperationType::IsHalf,
             (rhs_1 & 0xFF) as u8,
             ((rhs_1 >> 8) & 0xFF) as u8,
-            0,
         ));
     }
 
@@ -319,12 +321,12 @@ pub fn collect_bitwise_lookups_from_lt(lt_ops: &[LtOperation]) -> Vec<(BitwiseLo
 /// - read2: MSB8[res[1]] -> sign_bit
 /// - read4: MSB8[res[3]] -> sign_bit
 /// - read8: no MSB8 lookup (all 8 bytes are used)
-pub fn collect_bitwise_lookups_from_load(
+pub fn collect_bitwise_ops_from_load(
     load_ops: &[crate::tables::load::LoadOperation],
-) -> Vec<(BitwiseLookup, u8, u8, u8)> {
+) -> Vec<BitwiseOperation> {
     load_ops
         .iter()
-        .flat_map(|op| op.collect_bitwise_lookups())
+        .flat_map(|op| op.collect_bitwise_ops())
         .collect()
 }
 
@@ -352,26 +354,26 @@ pub fn collect_lt_lookups_from_memw(
 ///
 /// **WARNING: FOR TESTING/BENCHMARKING ONLY - NOT PRODUCTION SAFE!**
 /// The verifier expects the full deterministic 2^20 row public table.
-pub fn generate_minimal_bitwise_trace(lookups: &[(BitwiseLookup, u8, u8, u8)]) -> TraceTable<F, E> {
+pub fn generate_minimal_bitwise_trace(ops: &[BitwiseOperation]) -> TraceTable<F, E> {
     use std::collections::HashMap;
 
-    // Collect unique (x, y, z) tuples and count multiplicities per lookup type
+    // Collect unique (lo_byte, hi_byte, shift) tuples and count multiplicities per lookup type
     let mut row_data: HashMap<(u8, u8, u8), [u64; 11]> = HashMap::new();
 
-    for (lookup_type, x, y, z) in lookups {
-        let key = (*x, *y, *z);
-        let mu_idx = match lookup_type {
-            BitwiseLookup::AndByte => 0,
-            BitwiseLookup::OrByte => 1,
-            BitwiseLookup::XorByte => 2,
-            BitwiseLookup::Msb8 => 3,
-            BitwiseLookup::Msb16 => 4,
-            BitwiseLookup::Zero => 5,
-            BitwiseLookup::IsByte => 6,
-            BitwiseLookup::IsHalf => 7,
-            BitwiseLookup::IsB20 => 8,
-            BitwiseLookup::Hwsl => 9,
-            BitwiseLookup::Hwslc => 10,
+    for op in ops {
+        let key = (op.x, op.y, op.z);
+        let mu_idx = match op.lookup_type {
+            BitwiseOperationType::AndByte => 0,
+            BitwiseOperationType::OrByte => 1,
+            BitwiseOperationType::XorByte => 2,
+            BitwiseOperationType::Msb8 => 3,
+            BitwiseOperationType::Msb16 => 4,
+            BitwiseOperationType::Zero => 5,
+            BitwiseOperationType::IsByte => 6,
+            BitwiseOperationType::IsHalf => 7,
+            BitwiseOperationType::IsB20 => 8,
+            BitwiseOperationType::Hwsl => 9,
+            BitwiseOperationType::Hwslc => 10,
         };
         row_data.entry(key).or_insert([0; 11])[mu_idx] += 1;
     }
