@@ -13,19 +13,38 @@ jobs:
   codex-review:
     name: Codex Code Review
     runs-on: ubuntu-latest
+    outputs:
+      final_message: ${{ steps.codex.outputs.final-message }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v6
         with:
-          fetch-depth: 0
+          # Explicitly check out the PR's merge commit.
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+
+      - name: Pre-fetch base and head refs for the PR
+        run: |
+          git fetch --no-tags origin \
+            ${{ github.event.pull_request.base.ref }} \
+            +refs/pull/${{ github.event.pull_request.number }}/head
+
+      # If you want Codex to build and run code, install any dependencies that
+      # need to be downloaded before the "Run Codex" step because Codex's
+      # default sandbox disables network access.
 
       - name: Run Codex Code Review
         id: codex
         uses: openai/codex-action@v1
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          # Reference for safety strategy: https://github.com/openai/codex-action/blob/main/examples/test-sandbox-protections.yml
+          safety-strategy: drop-sudo
           prompt: |
-            You are a senior code reviewer for Lambda ZKVM, a minimalist, performant and auditable verifiable RISC-V vm written in Rust.
+            You are a senior code reviewer for Lambda ZKVM, a minimalist, performant and auditable verifiable RISC-V vm written in Rust. 
+            Review ONLY the changes in this pull request diff, not the entire codebase.
+
+            This is PR #${{ github.event.pull_request.number }} for ${{ github.repository }}.
+            To see only the PR changes, run:
+            git diff ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}
 
             Review this PR focusing on:
             - Code correctness and potential bugs
@@ -35,19 +54,26 @@ jobs:
             - Memory safety and proper error handling
             - Code readability and maintainability
 
-            Be concise and specific. Provide line references when suggesting changes.
-            If the code looks good, acknowledge it briefly.
+            If no issues found, say so briefly.
 
-      - name: Post Review Comment
-        if: steps.codex.outputs.final-message != ''
+  post_feedback:
+    runs-on: ubuntu-latest
+    needs: codex
+    if: needs.codex.outputs.final_message != ''
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Report Codex feedback
         uses: actions/github-script@v7
         env:
-          CODEX_REVIEW: ${{ steps.codex.outputs.final-message }}
+          CODEX_FINAL_MESSAGE: ${{ needs.codex.outputs.final_message }}
         with:
+          github-token: ${{ github.token }}
           script: |
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.payload.pull_request.number,
-              body: `## 🤖 Codex Code Review\n\n${process.env.CODEX_REVIEW}`
+              body: `## 🤖 Codex Code Review\n\n${process.env.CODEX_FINAL_MESSAGE}`,
             });

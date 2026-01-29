@@ -4,21 +4,9 @@ name: Claude Code Review
 on:
   pull_request:
     types: [opened, ready_for_review]
-    # Optional: Only run on specific file changes
-    # paths:
-    #   - "src/**/*.ts"
-    #   - "src/**/*.tsx"
-    #   - "src/**/*.js"
-    #   - "src/**/*.jsx"
 
 jobs:
   claude-review:
-    # Optional: Filter by PR author
-    # if: |
-    #   github.event.pull_request.user.login == 'external-contributor' ||
-    #   github.event.pull_request.user.login == 'new-developer' ||
-    #   github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR'
-
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -30,7 +18,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Run Claude Code Review
         id: claude-review
@@ -41,8 +29,14 @@ jobs:
           # Will use the models latest version, reference: https://code.claude.com/docs/en/cli-reference#cli-flags
           claude_args: |
             --model sonnet
-            --allowedTools "Bash(gh pr:*),Bash(gh issue:*),Bash(git diff:*),Bash(git log:*),Read,Glob,Grep"
+            --max-turns 10
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(cargo tree:*),Bash(cargo metadata:*),Bash(npm list:*),Bash(npm ls:*),Bash(forge inspect:*),Read,Glob,Grep"
           prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            Please review this pull request with a focus on:
+
             You are a senior code reviewer for Lambda ZKVM, a minimalist, performant and auditable verifiable RISC-V vm written in Rust.
 
             Review this PR focusing on:
@@ -53,5 +47,12 @@ jobs:
             - Memory safety and proper error handling
             - Code readability and maintainability
 
-            Be concise and specific. Provide line references when suggesting changes.
-            If the code looks good, acknowledge it briefly.
+            Note: The PR branch is already checked out in the current working directory.
+
+            How to comment:
+            Use `gh pr comment` for top-level feedback.
+            Use `mcp__github_inline_comment__create_inline_comment` to highlight specific code issues.
+            Only post GitHub comments - don't submit review text as messages.
+
+            If no issues found, say so briefly.
+
