@@ -3,10 +3,9 @@
 //! This module contains:
 //! - Unit tests for CpuOperation struct and its methods
 //! - Trace generation tests
-//! - Integration tests for CpuOperation::from_decode_entry (ELF execution)
+//! - Integration tests for CpuOperation::from_log (ELF execution)
 
 use crate::tables::cpu::{CpuOperation, bus_interactions, cols, generate_cpu_trace};
-use crate::tables::decode::DecodeEntry;
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::FE;
 
@@ -299,13 +298,18 @@ fn test_bus_interactions_count() {
     // - 1 MSB8 (res_sign_bit)
     // - 1 ZERO (is_equal for BEQ)
     // - 1 LT (less-than comparison)
-    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 = 29
-    assert_eq!(interactions.len(), 30);
+    // - 1 M1 (MEMW read rs1 register)
+    // - 1 M3 (MEMW read rs2 register)
+    // - 1 M5 (MEMW write rd register)
+    // - 1 M6 (LOAD from memory)
+    // - 1 M7 (STORE to memory)
+    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 5 = 34
+    assert_eq!(interactions.len(), 34);
 }
 
 #[test]
 fn test_column_count() {
-    assert_eq!(cols::NUM_COLUMNS, 72);
+    assert_eq!(cols::NUM_COLUMNS, 74);
 }
 
 #[test]
@@ -361,7 +365,7 @@ fn test_trace_from_logs_subw() {
 }
 
 #[test]
-fn test_cpu_operation_from_decode_entry_arith() {
+fn test_cpu_operation_from_log_arith() {
     use executor::vm::instruction::decoding::ArithOp;
     use executor::vm::logs::Log;
 
@@ -372,8 +376,6 @@ fn test_cpu_operation_from_decode_entry_arith() {
         op: ArithOp::Add,
     };
 
-    let decode_entry = DecodeEntry::from_instruction(0x1000, instruction);
-
     let log = Log {
         current_pc: 0x1000,
         next_pc: 0x1004,
@@ -382,7 +384,7 @@ fn test_cpu_operation_from_decode_entry_arith() {
         dst_val: 300,
     };
 
-    let op = CpuOperation::from_decode_entry(&decode_entry, &log, 0);
+    let op = CpuOperation::from_log(&log, 0, instruction);
 
     assert_eq!(op.pc, 0x1000);
     assert_eq!(op.next_pc, 0x1004);
@@ -397,7 +399,7 @@ fn test_cpu_operation_from_decode_entry_arith() {
 }
 
 #[test]
-fn test_cpu_operation_from_decode_entry_branch() {
+fn test_cpu_operation_from_log_branch() {
     use executor::vm::instruction::decoding::Comparison;
     use executor::vm::logs::Log;
 
@@ -408,8 +410,6 @@ fn test_cpu_operation_from_decode_entry_branch() {
         offset: 8,
     };
 
-    let decode_entry = DecodeEntry::from_instruction(0x2000, instruction);
-
     let log = Log {
         current_pc: 0x2000,
         next_pc: 0x2008, // Branch taken
@@ -418,7 +418,7 @@ fn test_cpu_operation_from_decode_entry_branch() {
         dst_val: 0,
     };
 
-    let op = CpuOperation::from_decode_entry(&decode_entry, &log, 4);
+    let op = CpuOperation::from_log(&log, 4, instruction);
 
     assert_eq!(op.timestamp, 4);
     assert_eq!(op.pc, 0x2000);
@@ -431,7 +431,7 @@ fn test_cpu_operation_from_decode_entry_branch() {
 }
 
 #[test]
-fn test_cpu_operation_from_decode_entry_word_instr() {
+fn test_cpu_operation_from_log_word_instr() {
     use executor::vm::instruction::decoding::ArithOp;
     use executor::vm::logs::Log;
 
@@ -442,8 +442,6 @@ fn test_cpu_operation_from_decode_entry_word_instr() {
         op: ArithOp::Add,
     };
 
-    let decode_entry = DecodeEntry::from_instruction(0x3000, instruction);
-
     let log = Log {
         current_pc: 0x3000,
         next_pc: 0x3004,
@@ -452,7 +450,7 @@ fn test_cpu_operation_from_decode_entry_word_instr() {
         dst_val: 0xFFFF_FFFF_8000_0001, // Result sign-extended
     };
 
-    let op = CpuOperation::from_decode_entry(&decode_entry, &log, 8);
+    let op = CpuOperation::from_log(&log, 8, instruction);
 
     assert!(op.word_instr);
     assert!(op.op_add);

@@ -185,15 +185,6 @@ pub enum AddOperand {
     },
 }
 
-/// Convert i64 to FieldElement (handles negative values via field negation).
-fn i64_to_fe<F: IsField>(val: i64) -> FieldElement<F> {
-    if val >= 0 {
-        FieldElement::from(val as u64)
-    } else {
-        -FieldElement::from((-val) as u64)
-    }
-}
-
 impl AddLinearTerm {
     /// Evaluate this term using values from the trace.
     fn eval<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
@@ -207,9 +198,9 @@ impl AddLinearTerm {
                 column,
             } => {
                 let col_val = step.get_main_evaluation_element(0, *column);
-                col_val * i64_to_fe::<F>(*coefficient)
+                col_val * FieldElement::<F>::from(*coefficient)
             }
-            AddLinearTerm::Constant(value) => i64_to_fe(*value),
+            AddLinearTerm::Constant(value) => FieldElement::<F>::from(*value),
         }
     }
 }

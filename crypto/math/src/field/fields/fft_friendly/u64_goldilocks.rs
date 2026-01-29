@@ -292,19 +292,6 @@ impl GoldilocksElement {
     }
 }
 
-/// From overloading for i64 (Goldilocks-specific).
-/// Negative values are converted to their field equivalents: -x becomes p - x.
-impl From<i64> for GoldilocksElement {
-    fn from(value: i64) -> Self {
-        if value >= 0 {
-            Self::from(value as u64)
-        } else {
-            // For negative values: -x ≡ p - x (mod p)
-            -Self::from(value.unsigned_abs())
-        }
-    }
-}
-
 // =====================================================
 // TRAIT IMPLEMENTATIONS FOR PROVER/VERIFIER
 // =====================================================

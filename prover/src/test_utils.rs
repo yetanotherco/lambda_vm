@@ -25,18 +25,20 @@ use stark::trace::TraceTable;
 
 use crate::constraints::cpu::create_all_cpu_constraints;
 use crate::tables::bitwise::{
-    BitwiseLookup, bus_interactions as bitwise_bus_interactions, cols as bitwise_cols,
+    BitwiseOperation, BitwiseOperationType, bus_interactions as bitwise_bus_interactions,
+    cols as bitwise_cols,
 };
 use crate::tables::cpu::{
     CpuOperation, bus_interactions as cpu_bus_interactions, cols as cpu_cols,
 };
-use crate::tables::decode::{
-    DecodeEntry, NUM_PRECOMPUTED_COLS as DECODE_NUM_PRECOMPUTED_COLS,
-    bus_interactions as decode_bus_interactions, cols as decode_cols,
+use crate::tables::load::{
+    bus_interactions as load_bus_interactions, cols as load_cols, constraints as load_constraints,
 };
 use crate::tables::lt::{LtOperation, bus_interactions as lt_bus_interactions, cols as lt_cols};
+use crate::tables::memw::{
+    bus_interactions as memw_bus_interactions, cols as memw_cols, constraints as memw_constraints,
+};
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
-use stark::config::Commitment;
 
 pub type F = GoldilocksField;
 pub type E = GoldilocksExtension;
@@ -78,24 +80,16 @@ pub fn run_asm_elf(name: &str) -> (Vec<Log>, U64HashMap<Instruction>) {
 // =============================================================================
 
 /// Collect bitwise lookups from executor logs for minimal table generation.
-pub fn collect_bitwise_lookups_from_logs(
+pub fn collect_bitwise_ops_from_logs(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,
-) -> Vec<(BitwiseLookup, u8, u8, u8)> {
-    use std::collections::HashMap;
-
-    // Build decode entries map
-    let decode_entries: HashMap<u64, DecodeEntry> = instructions
-        .iter()
-        .map(|(&pc, &instr)| (pc, DecodeEntry::from_instruction(pc, instr)))
-        .collect();
-
+) -> Vec<BitwiseOperation> {
     logs.iter()
         .enumerate()
         .flat_map(|(i, log)| {
-            let decode_entry = decode_entries.get(&log.current_pc).unwrap();
-            let op = CpuOperation::from_decode_entry(decode_entry, log, (i as u64) * 4);
-            op.collect_bitwise_lookups()
+            let instruction = *instructions.get(&log.current_pc).unwrap();
+            let op = CpuOperation::from_log(log, (i as u64) * 4, instruction);
+            op.collect_bitwise_ops()
         })
         .collect()
 }
@@ -108,28 +102,160 @@ pub fn collect_lt_lookups_from_logs(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,
 ) -> Vec<LtOperation> {
-    use std::collections::HashMap;
-
-    // Build decode entries map
-    let decode_entries: HashMap<u64, DecodeEntry> = instructions
-        .iter()
-        .map(|(&pc, &instr)| (pc, DecodeEntry::from_instruction(pc, instr)))
-        .collect();
+    use executor::vm::instruction::decoding::{ArithOp, Comparison};
 
     let mut lookups = Vec::new();
 
-    for (i, log) in logs.iter().enumerate() {
-        let decode_entry = decode_entries.get(&log.current_pc).unwrap();
-        let op = CpuOperation::from_decode_entry(decode_entry, log, (i as u64) * 4);
+    for log in logs {
+        let instruction = *instructions.get(&log.current_pc).unwrap();
 
-        if op.op_slt || op.op_blt {
-            let arg1 = op.compute_arg1();
-            let arg2 = op.compute_arg2();
-            lookups.push(LtOperation::new(arg1, arg2, op.signed));
+        let is_slt = matches!(
+            &instruction,
+            Instruction::Arith {
+                op: ArithOp::SetLessThan,
+                ..
+            } | Instruction::Arith {
+                op: ArithOp::SetLessThanU,
+                ..
+            } | Instruction::ArithImm {
+                op: ArithOp::SetLessThan,
+                ..
+            } | Instruction::ArithImm {
+                op: ArithOp::SetLessThanU,
+                ..
+            } | Instruction::ArithW {
+                op: ArithOp::SetLessThan,
+                ..
+            } | Instruction::ArithW {
+                op: ArithOp::SetLessThanU,
+                ..
+            } | Instruction::ArithImmW {
+                op: ArithOp::SetLessThan,
+                ..
+            } | Instruction::ArithImmW {
+                op: ArithOp::SetLessThanU,
+                ..
+            }
+        );
+
+        let is_blt = matches!(
+            &instruction,
+            Instruction::Branch {
+                cond: Comparison::LessThan,
+                ..
+            } | Instruction::Branch {
+                cond: Comparison::LessThanUnsigned,
+                ..
+            } | Instruction::Branch {
+                cond: Comparison::GreaterOrEqual,
+                ..
+            } | Instruction::Branch {
+                cond: Comparison::GreaterOrEqualUnsigned,
+                ..
+            }
+        );
+
+        if is_slt || is_blt {
+            let signed = matches!(
+                &instruction,
+                Instruction::Arith {
+                    op: ArithOp::SetLessThan,
+                    ..
+                } | Instruction::ArithImm {
+                    op: ArithOp::SetLessThan,
+                    ..
+                } | Instruction::ArithW {
+                    op: ArithOp::SetLessThan,
+                    ..
+                } | Instruction::ArithImmW {
+                    op: ArithOp::SetLessThan,
+                    ..
+                } | Instruction::Branch {
+                    cond: Comparison::LessThan,
+                    ..
+                } | Instruction::Branch {
+                    cond: Comparison::GreaterOrEqual,
+                    ..
+                }
+            );
+
+            let arg1 = log.src1_val;
+            let arg2 = match &instruction {
+                Instruction::ArithImm { imm, .. } | Instruction::ArithImmW { imm, .. } => {
+                    *imm as i64 as u64
+                }
+                _ => log.src2_val,
+            };
+
+            lookups.push(LtOperation::new(arg1, arg2, signed));
         }
     }
 
     lookups
+}
+
+/// Collect LOAD operations from executor logs.
+///
+/// Creates LoadOperation objects for each Load instruction in the logs.
+pub fn collect_load_ops_from_logs(
+    logs: &[Log],
+    instructions: &U64HashMap<Instruction>,
+) -> Vec<crate::tables::load::LoadOperation> {
+    use executor::vm::instruction::decoding::LoadStoreWidth;
+
+    let mut load_ops = Vec::new();
+
+    for log in logs {
+        let instruction = *instructions.get(&log.current_pc).unwrap();
+
+        if let Instruction::Load { width, .. } = instruction {
+            let base_address = log.src1_val.wrapping_add(match instruction {
+                Instruction::Load { offset, .. } => offset as i64 as u64,
+                _ => 0,
+            });
+
+            let (byte_count, signed) = match width {
+                LoadStoreWidth::Byte => (1, true),
+                LoadStoreWidth::ByteUnsigned => (1, false),
+                LoadStoreWidth::Half => (2, true),
+                LoadStoreWidth::HalfUnsigned => (2, false),
+                LoadStoreWidth::Word => (4, true),
+                LoadStoreWidth::WordUnsigned => (4, false),
+                LoadStoreWidth::DoubleWord => (8, false),
+            };
+
+            let loaded_value = log.dst_val;
+
+            // Extract individual bytes from loaded value
+            let mut res_bytes = [0u64; 8];
+            for (j, byte) in res_bytes.iter_mut().take(byte_count).enumerate() {
+                *byte = (loaded_value >> (j * 8)) & 0xFF;
+            }
+
+            // Sign/zero extend the upper bytes
+            if byte_count < 8 {
+                let msb = res_bytes[byte_count - 1];
+                let sign_bit = (msb >> 7) & 1;
+                let fill = if signed && sign_bit == 1 { 0xFF } else { 0 };
+                for byte in res_bytes.iter_mut().skip(byte_count) {
+                    *byte = fill;
+                }
+            }
+
+            // Use a dummy timestamp (not used for bitwise lookups)
+            let timestamp = 0;
+
+            load_ops.push(crate::tables::load::LoadOperation::new(
+                base_address,
+                timestamp,
+                byte_count as u8,
+                signed,
+                res_bytes,
+            ));
+        }
+    }
+
+    load_ops
 }
 
 /// Collect bitwise lookups from LT operations (MSB16 and IS_HALFWORD).
@@ -137,54 +263,85 @@ pub fn collect_lt_lookups_from_logs(
 /// The LT table sends:
 /// - MSB16 lookups (×2 per row: for lhs_msb and rhs_msb)
 /// - IS_HALFWORD lookups (×6 per row: ×4 for lhs_sub_rhs, ×1 for lhs[1], ×1 for rhs[1])
-pub fn collect_bitwise_lookups_from_lt(lt_ops: &[LtOperation]) -> Vec<(BitwiseLookup, u8, u8, u8)> {
+pub fn collect_bitwise_ops_from_lt(lt_ops: &[LtOperation]) -> Vec<BitwiseOperation> {
     let mut lookups = Vec::new();
 
     for op in lt_ops {
         // MSB16 for lhs_msb (bits 48-63 of lhs)
         let lhs_2 = ((op.lhs >> 48) & 0xFFFF) as u16;
-        let x = (lhs_2 & 0xFF) as u8;
-        let y = ((lhs_2 >> 8) & 0xFF) as u8;
-        lookups.push((BitwiseLookup::Msb16, x, y, 0));
+        lookups.push(BitwiseOperation::halfword(
+            BitwiseOperationType::Msb16,
+            (lhs_2 & 0xFF) as u8,
+            ((lhs_2 >> 8) & 0xFF) as u8,
+        ));
 
         // MSB16 for rhs_msb (bits 48-63 of rhs)
         let rhs_2 = ((op.rhs >> 48) & 0xFFFF) as u16;
-        let x = (rhs_2 & 0xFF) as u8;
-        let y = ((rhs_2 >> 8) & 0xFF) as u8;
-        lookups.push((BitwiseLookup::Msb16, x, y, 0));
+        lookups.push(BitwiseOperation::halfword(
+            BitwiseOperationType::Msb16,
+            (rhs_2 & 0xFF) as u8,
+            ((rhs_2 >> 8) & 0xFF) as u8,
+        ));
 
         // IS_HALFWORD for lhs_sub_rhs (4 halfwords)
         let lhs_sub_rhs = op.lhs.wrapping_sub(op.rhs);
         for shift in [0, 16, 32, 48] {
             let half = ((lhs_sub_rhs >> shift) & 0xFFFF) as u16;
-            lookups.push((
-                BitwiseLookup::IsHalf,
+            lookups.push(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
                 (half & 0xFF) as u8,
                 ((half >> 8) & 0xFF) as u8,
-                0,
             ));
         }
 
         // IS_HALFWORD for lhs[1] (bits 32-47 of lhs)
         let lhs_1 = ((op.lhs >> 32) & 0xFFFF) as u16;
-        lookups.push((
-            BitwiseLookup::IsHalf,
+        lookups.push(BitwiseOperation::halfword(
+            BitwiseOperationType::IsHalf,
             (lhs_1 & 0xFF) as u8,
             ((lhs_1 >> 8) & 0xFF) as u8,
-            0,
         ));
 
         // IS_HALFWORD for rhs[1] (bits 32-47 of rhs)
         let rhs_1 = ((op.rhs >> 32) & 0xFFFF) as u16;
-        lookups.push((
-            BitwiseLookup::IsHalf,
+        lookups.push(BitwiseOperation::halfword(
+            BitwiseOperationType::IsHalf,
             (rhs_1 & 0xFF) as u8,
             ((rhs_1 >> 8) & 0xFF) as u8,
-            0,
         ));
     }
 
     lookups
+}
+
+/// Collect bitwise lookups from LOAD operations.
+///
+/// The LOAD table sends MSB8 lookups for sign bit extraction:
+/// - read1: MSB8[res[0]] -> sign_bit
+/// - read2: MSB8[res[1]] -> sign_bit
+/// - read4: MSB8[res[3]] -> sign_bit
+/// - read8: no MSB8 lookup (all 8 bytes are used)
+pub fn collect_bitwise_ops_from_load(
+    load_ops: &[crate::tables::load::LoadOperation],
+) -> Vec<BitwiseOperation> {
+    load_ops
+        .iter()
+        .flat_map(|op| op.collect_bitwise_ops())
+        .collect()
+}
+
+/// Collect LT operations from MEMW operations.
+///
+/// The MEMW table sends LT lookups for:
+/// - Timestamp ordering: old_timestamp[i] < timestamp
+/// - Overflow checking: base_address < base_address + offset
+pub fn collect_lt_lookups_from_memw(
+    memw_ops: &[crate::tables::memw::MemwOperation],
+) -> Vec<LtOperation> {
+    memw_ops
+        .iter()
+        .flat_map(|op| op.collect_lt_lookups())
+        .collect()
 }
 
 // =============================================================================
@@ -197,26 +354,26 @@ pub fn collect_bitwise_lookups_from_lt(lt_ops: &[LtOperation]) -> Vec<(BitwiseLo
 ///
 /// **WARNING: FOR TESTING/BENCHMARKING ONLY - NOT PRODUCTION SAFE!**
 /// The verifier expects the full deterministic 2^20 row public table.
-pub fn generate_minimal_bitwise_trace(lookups: &[(BitwiseLookup, u8, u8, u8)]) -> TraceTable<F, E> {
+pub fn generate_minimal_bitwise_trace(ops: &[BitwiseOperation]) -> TraceTable<F, E> {
     use std::collections::HashMap;
 
-    // Collect unique (x, y, z) tuples and count multiplicities per lookup type
+    // Collect unique (lo_byte, hi_byte, shift) tuples and count multiplicities per lookup type
     let mut row_data: HashMap<(u8, u8, u8), [u64; 11]> = HashMap::new();
 
-    for (lookup_type, x, y, z) in lookups {
-        let key = (*x, *y, *z);
-        let mu_idx = match lookup_type {
-            BitwiseLookup::AndByte => 0,
-            BitwiseLookup::OrByte => 1,
-            BitwiseLookup::XorByte => 2,
-            BitwiseLookup::Msb8 => 3,
-            BitwiseLookup::Msb16 => 4,
-            BitwiseLookup::Zero => 5,
-            BitwiseLookup::IsByte => 6,
-            BitwiseLookup::IsHalf => 7,
-            BitwiseLookup::IsB20 => 8,
-            BitwiseLookup::Hwsl => 9,
-            BitwiseLookup::Hwslc => 10,
+    for op in ops {
+        let key = (op.x, op.y, op.z);
+        let mu_idx = match op.lookup_type {
+            BitwiseOperationType::AndByte => 0,
+            BitwiseOperationType::OrByte => 1,
+            BitwiseOperationType::XorByte => 2,
+            BitwiseOperationType::Msb8 => 3,
+            BitwiseOperationType::Msb16 => 4,
+            BitwiseOperationType::Zero => 5,
+            BitwiseOperationType::IsByte => 6,
+            BitwiseOperationType::IsHalf => 7,
+            BitwiseOperationType::IsB20 => 8,
+            BitwiseOperationType::Hwsl => 9,
+            BitwiseOperationType::Hwslc => 10,
         };
         row_data.entry(key).or_insert([0; 11])[mu_idx] += 1;
     }
@@ -350,30 +507,36 @@ pub fn create_lt_air(proof_options: &ProofOptions) -> VmAir {
     )
 }
 
-/// Create DECODE AIR with precomputed commitment.
-///
-/// The DECODE table is a program-dependent precomputed table: its content
-/// depends on the instructions being proven, but the precomputed columns
-/// (PC, PACKED_DECODE, IMM) are deterministic given the instruction map.
-///
-/// The `commitment` is the Merkle root of the LDE of precomputed columns,
-/// computed via `decode::compute_precomputed_commitment()`.
-///
-/// Bus interactions: CPU sends DECODE[pc, packed_decode, imm] with multiplicity=1
-/// per instruction. The DECODE table receives this and verifies the decoding matches.
-pub fn create_decode_air(commitment: Commitment, proof_options: &ProofOptions) -> VmAir {
-    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+/// Create MEMW AIR with constraints and bus interactions.
+pub fn create_memw_air(proof_options: &ProofOptions) -> VmAir {
+    let transition_constraints = memw_constraints();
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: decode_bus_interactions(),
+        interactions: memw_bus_interactions(),
     };
 
     AirWithBuses::new(
-        decode_cols::NUM_COLUMNS,
+        memw_cols::NUM_COLUMNS,
         auxiliary_trace_build_data,
         proof_options,
         1,
         transition_constraints,
     )
-    .with_preprocessed(commitment, DECODE_NUM_PRECOMPUTED_COLS)
+}
+
+/// Create LOAD AIR with constraints and bus interactions.
+pub fn create_load_air(proof_options: &ProofOptions) -> VmAir {
+    let transition_constraints = load_constraints();
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: load_bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        load_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
 }
