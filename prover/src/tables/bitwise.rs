@@ -35,6 +35,9 @@ use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::prover::evaluate_polynomial_on_lde_domain;
 use stark::trace::{TraceTable, columns2rows};
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 
 // =========================================================================
@@ -202,20 +205,46 @@ const LDE_COSET_OFFSET: u64 = 3;
 /// because FRI queries can target any index in [0, N*blowup). A raw-value commitment
 /// would only have N leaves, unable to verify queries at indices >= N.
 fn compute_preprocessed_commitment() -> Commitment {
-    // Step 1: Generate precomputed columns (not rows)
-    // Each column is a vector of NUM_ROWS field elements
-    let mut columns: Vec<Vec<FE>> = (0..NUM_PRECOMPUTED_COLS)
-        .map(|_| Vec::with_capacity(NUM_ROWS))
+    // Step 1: Generate precomputed columns in parallel
+    // Each column is generated independently by iterating over all row indices
+    #[cfg(feature = "parallel")]
+    let columns: Vec<Vec<FE>> = (0..NUM_PRECOMPUTED_COLS)
+        .into_par_iter()
+        .map(|col_idx| {
+            (0..NUM_ROWS)
+                .map(|idx| {
+                    let row = generate_bitwise_row(idx);
+                    FE::from(row[col_idx])
+                })
+                .collect()
+        })
         .collect();
 
-    for idx in 0..NUM_ROWS {
-        let row = generate_bitwise_row(idx);
-        for (col_idx, &value) in row.iter().enumerate() {
-            columns[col_idx].push(FE::from(value));
+    #[cfg(not(feature = "parallel"))]
+    let columns: Vec<Vec<FE>> = {
+        let mut cols: Vec<Vec<FE>> = (0..NUM_PRECOMPUTED_COLS)
+            .map(|_| Vec::with_capacity(NUM_ROWS))
+            .collect();
+        for idx in 0..NUM_ROWS {
+            let row = generate_bitwise_row(idx);
+            for (col_idx, &value) in row.iter().enumerate() {
+                cols[col_idx].push(FE::from(value));
+            }
         }
-    }
+        cols
+    };
 
-    // Step 2: Interpolate each column to a polynomial
+    // Step 2: Interpolate each column to a polynomial (parallel)
+    #[cfg(feature = "parallel")]
+    let polys: Vec<Polynomial<FE>> = columns
+        .par_iter()
+        .map(|col| {
+            Polynomial::interpolate_fft::<GoldilocksField>(col)
+                .expect("FFT interpolation failed for bitwise column")
+        })
+        .collect();
+
+    #[cfg(not(feature = "parallel"))]
     let polys: Vec<Polynomial<FE>> = columns
         .iter()
         .map(|col| {
@@ -224,8 +253,19 @@ fn compute_preprocessed_commitment() -> Commitment {
         })
         .collect();
 
-    // Step 3: Evaluate polynomials on LDE domain (N * blowup_factor points)
+    // Step 3: Evaluate polynomials on LDE domain (parallel)
     let coset_offset = FE::from(LDE_COSET_OFFSET);
+
+    #[cfg(feature = "parallel")]
+    let mut lde_columns: Vec<Vec<FE>> = polys
+        .par_iter()
+        .map(|poly| {
+            evaluate_polynomial_on_lde_domain(poly, LDE_BLOWUP_FACTOR, NUM_ROWS, &coset_offset)
+                .expect("LDE evaluation failed for bitwise polynomial")
+        })
+        .collect();
+
+    #[cfg(not(feature = "parallel"))]
     let mut lde_columns: Vec<Vec<FE>> = polys
         .iter()
         .map(|poly| {
@@ -234,7 +274,13 @@ fn compute_preprocessed_commitment() -> Commitment {
         })
         .collect();
 
-    // Step 4: Bit-reverse permute (same as prover)
+    // Step 4: Bit-reverse permute (parallel)
+    #[cfg(feature = "parallel")]
+    lde_columns.par_iter_mut().for_each(|col| {
+        in_place_bit_reverse_permute(col);
+    });
+
+    #[cfg(not(feature = "parallel"))]
     for col in lde_columns.iter_mut() {
         in_place_bit_reverse_permute(col);
     }
