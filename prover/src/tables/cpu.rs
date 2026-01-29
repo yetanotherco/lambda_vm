@@ -52,10 +52,10 @@
 //! - BRANCH: for branch target calculation
 //! - ECALL: for system calls
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use super::types::{BusId, DecodeEntry, FE, GoldilocksExtension, GoldilocksField};
 use crate::ProverError;
 use executor::vm::{
-    instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth},
+    instruction::decoding::Instruction,
     logs::Log,
     memory::U64HashMap,
 };
@@ -254,57 +254,52 @@ pub mod cols {
 
 /// A single CPU cycle to be added to the trace.
 ///
-/// This is a high-level representation that will be converted to
-/// the flat column format during trace generation.
-#[derive(Debug, Clone, Default)]
+/// Contains static decode information (from DecodeEntry) plus runtime values
+/// from execution (register values, computed results, etc.).
+#[derive(Debug, Clone)]
 pub struct CpuOperation {
-    // Input (from DECODE)
+    /// Static decode information (shared with DECODE table)
+    pub decode: DecodeEntry,
+
+    /// Timestamp for memory argument coordination
     pub timestamp: u64,
-    pub pc: u64,
-    pub rs1: u8,
-    pub rs2: u8,
-    pub rd: u8,
-    pub read_register1: bool,
-    pub read_register2: bool,
-    pub write_register: bool,
-    pub memory_2bytes: bool,
-    pub memory_4bytes: bool,
-    pub memory_8bytes: bool,
-    pub c_type_instruction: bool,
-    pub imm: u64,
-    pub signed: bool,
-    pub mp_selector: bool,
-    pub muldiv_selector: bool,
-    pub word_instr: bool,
 
-    // ALU selector (exactly one should be true)
-    pub op_add: bool,
-    pub op_sub: bool,
-    pub op_slt: bool,
-    pub op_and: bool,
-    pub op_or: bool,
-    pub op_xor: bool,
-    pub op_shift: bool,
-    pub op_jalr: bool,
-    pub op_beq: bool,
-    pub op_blt: bool,
-    pub op_load: bool,
-    pub op_store: bool,
-    pub op_mul: bool,
-    pub op_divrem: bool,
-    pub op_ecall: bool,
-    pub op_ebreak: bool,
-
-    // Output
+    /// Next program counter (from execution)
     pub next_pc: u64,
+
+    /// Value to write to destination register (from execution)
     pub rvd: u64,
 
-    // Auxiliary (computed from register file and ALU)
+    /// Value of register rs1 (from execution)
     pub rv1: u64,
+
+    /// Value of register rs2 (from execution)
     pub rv2: u64,
+
+    /// ALU result or memory address (computed)
     pub res: u64,
+
+    /// Whether rv1 == rv2 (for BEQ)
     pub is_equal: bool,
+
+    /// Whether branch is taken
     pub branch_cond: bool,
+}
+
+impl Default for CpuOperation {
+    fn default() -> Self {
+        Self {
+            decode: DecodeEntry::default(),
+            timestamp: 0,
+            next_pc: 0,
+            rvd: 0,
+            rv1: 0,
+            rv2: 0,
+            res: 0,
+            is_equal: false,
+            branch_cond: false,
+        }
+    }
 }
 
 impl CpuOperation {
@@ -312,6 +307,43 @@ impl CpuOperation {
     pub fn new() -> Self {
         Self::default()
     }
+
+    // =========================================================================
+    // Convenience accessors for decode fields (reduces verbosity)
+    // =========================================================================
+
+    #[inline]
+    pub fn pc(&self) -> u64 {
+        self.decode.pc
+    }
+    #[inline]
+    pub fn rs1(&self) -> u8 {
+        self.decode.rs1
+    }
+    #[inline]
+    pub fn rs2(&self) -> u8 {
+        self.decode.rs2
+    }
+    #[inline]
+    pub fn rd(&self) -> u8 {
+        self.decode.rd
+    }
+    #[inline]
+    pub fn imm(&self) -> u64 {
+        self.decode.imm
+    }
+    #[inline]
+    pub fn word_instr(&self) -> bool {
+        self.decode.word_instr
+    }
+    #[inline]
+    pub fn signed(&self) -> bool {
+        self.decode.signed
+    }
+
+    // =========================================================================
+    // Computation methods
+    // =========================================================================
 
     /// Compute arg1 from rv1 based on word_instr and signed flags.
     ///
@@ -321,9 +353,9 @@ impl CpuOperation {
     /// For unsigned word instructions: zero-extend from 32 bits
     /// For signed word instructions: sign-extend from 32 bits
     pub fn compute_arg1(&self) -> u64 {
-        if self.word_instr {
+        if self.decode.word_instr {
             let lower_32 = self.rv1 & 0xFFFF_FFFF;
-            if self.signed && Self::sign_bit_32(self.rv1) {
+            if self.decode.signed && Self::sign_bit_32(self.rv1) {
                 // Sign extend: set upper 32 bits to all 1s
                 lower_32 | (0xFFFF_FFFF_u64 << 32)
             } else {
@@ -344,20 +376,24 @@ impl CpuOperation {
     /// For BEQ/BLT: uses rv2 (full 64-bit, comparing register values)
     /// Otherwise: uses imm (when rs2=0) or rv2, with sign extension for signed word instructions
     pub fn compute_arg2(&self) -> u64 {
-        if self.op_load || self.op_store {
+        if self.decode.op_load || self.decode.op_store {
             // LOAD/STORE: address = rv1 + imm, use full imm
-            self.imm
-        } else if self.op_beq || self.op_blt {
+            self.decode.imm
+        } else if self.decode.op_beq || self.decode.op_blt {
             // BEQ/BLT: compare rv1 vs rv2, use full rv2
             self.rv2
         } else {
             // For other ops, use imm (when rs2=0) or rv2
-            let base = if self.rs2 == 0 { self.imm } else { self.rv2 };
+            let base = if self.decode.rs2 == 0 {
+                self.decode.imm
+            } else {
+                self.rv2
+            };
 
             // For word instructions, apply sign/zero extension based on signed flag
-            if self.word_instr {
+            if self.decode.word_instr {
                 let lower_32 = base & 0xFFFF_FFFF;
-                if self.signed && Self::sign_bit_32(base) {
+                if self.decode.signed && Self::sign_bit_32(base) {
                     // Sign extend: set upper 32 bits to all 1s
                     lower_32 | (0xFFFF_FFFF_u64 << 32)
                 } else {
@@ -387,7 +423,7 @@ impl CpuOperation {
         let res = self.compute_res();
         let res_lo = res & 0xFFFF_FFFF;
 
-        if self.word_instr {
+        if self.decode.word_instr {
             // Sign extend from 32 bits
             let res_sign_bit = Self::sign_bit_32(res);
             if res_sign_bit {
@@ -416,12 +452,12 @@ impl CpuOperation {
         let arg1 = self.compute_arg1();
         let arg2 = self.compute_arg2();
 
-        if self.op_add || self.op_load || self.op_store {
+        if self.decode.op_add || self.decode.op_load || self.decode.op_store {
             // ADD constraint: arg1 + arg2 = res
             // For ADD: computes arithmetic result
             // For LOAD/STORE: computes memory address (rv1 + imm)
             arg1.wrapping_add(arg2)
-        } else if self.op_sub {
+        } else if self.decode.op_sub {
             // SUB constraint checks: res + arg2 = arg1, so res = arg1 - arg2
             arg1.wrapping_sub(arg2)
         } else {
@@ -437,7 +473,7 @@ impl CpuOperation {
         let mut lookups = Vec::new();
 
         // MSB16 lookups for sign bit extraction (when word_instr=1)
-        if self.word_instr {
+        if self.decode.word_instr {
             // rv1[1] is bits 16-31, extract as halfword for MSB16 lookup
             let rv1_half = ((self.rv1 >> 16) & 0xFFFF) as u16;
             let lo = (rv1_half & 0xFF) as u8;
@@ -467,7 +503,7 @@ impl CpuOperation {
         }
 
         // ZERO lookup for is_equal (when BEQ=1)
-        if self.op_beq {
+        if self.decode.op_beq {
             // Sum of all result bytes
             let mut sum: u64 = 0;
             for i in 0..8 {
@@ -487,7 +523,7 @@ impl CpuOperation {
         let arg1 = self.compute_arg1();
         let arg2 = self.compute_arg2();
 
-        if self.op_and {
+        if self.decode.op_and {
             for i in 0..8 {
                 let a = ((arg1 >> (i * 8)) & 0xFF) as u8;
                 let b = ((arg2 >> (i * 8)) & 0xFF) as u8;
@@ -499,7 +535,7 @@ impl CpuOperation {
             }
         }
 
-        if self.op_or {
+        if self.decode.op_or {
             for i in 0..8 {
                 let a = ((arg1 >> (i * 8)) & 0xFF) as u8;
                 let b = ((arg2 >> (i * 8)) & 0xFF) as u8;
@@ -511,7 +547,7 @@ impl CpuOperation {
             }
         }
 
-        if self.op_xor {
+        if self.decode.op_xor {
             for i in 0..8 {
                 let a = ((arg1 >> (i * 8)) & 0xFF) as u8;
                 let b = ((arg2 >> (i * 8)) & 0xFF) as u8;
@@ -526,374 +562,89 @@ impl CpuOperation {
         lookups
     }
 
-    /// Creates a CpuOperation from an executor Log.
+    /// Creates a CpuOperation from an executor Log and DecodeEntry.
     ///
-    /// This is the main integration point between the executor and the prover.
-    pub fn from_log(log: &Log, timestamp: u64, instruction: Instruction) -> Self {
+    /// The DecodeEntry contains static instruction information. This method
+    /// adds runtime values from the Log (register values, branch decisions, etc.).
+    pub fn from_log(log: &Log, timestamp: u64, decode: DecodeEntry) -> Self {
+
         let mut op = Self {
+            decode,
             timestamp,
-            pc: log.current_pc,
             next_pc: log.next_pc,
             rv1: log.src1_val,
             rv2: log.src2_val,
             rvd: log.dst_val,
             res: log.dst_val, // Default: result is destination value
-            ..Default::default()
+            is_equal: false,
+            branch_cond: false,
         };
 
-        match instruction {
-            Instruction::Arith {
-                dst,
-                src1,
-                src2,
-                op: arith_op,
-            } => {
-                op.rd = dst as u8;
-                op.rs1 = src1 as u8;
-                op.rs2 = src2 as u8;
-                if src1 != 0 {
-                    op.read_register1 = true;
-                }
-                if src2 != 0 {
-                    op.read_register2 = true;
-                }
-                if dst != 0 {
-                    op.write_register = true;
-                }
-                Self::set_arith_op(&mut op, arith_op, false);
-            }
-
-            Instruction::ArithImm {
-                dst,
-                src,
-                imm,
-                op: arith_op,
-            } => {
-                op.rd = dst as u8;
-                op.rs1 = src as u8;
-                op.rs2 = 0;
-                op.imm = imm as i64 as u64; // Sign extend
-                if src != 0 {
-                    op.read_register1 = true;
-                }
-                if dst != 0 {
-                    op.write_register = true;
-                }
-                Self::set_arith_op(&mut op, arith_op, false);
-            }
-
-            Instruction::ArithW {
-                dst,
-                src1,
-                src2,
-                op: arith_op,
-            } => {
-                op.rd = dst as u8;
-                op.rs1 = src1 as u8;
-                op.rs2 = src2 as u8;
-                op.word_instr = true;
-                if src1 != 0 {
-                    op.read_register1 = true;
-                }
-                if src2 != 0 {
-                    op.read_register2 = true;
-                }
-                if dst != 0 {
-                    op.write_register = true;
-                }
-                Self::set_arith_op(&mut op, arith_op, true);
-            }
-
-            Instruction::ArithImmW {
-                dst,
-                src,
-                imm,
-                op: arith_op,
-            } => {
-                op.rd = dst as u8;
-                op.rs1 = src as u8;
-                op.rs2 = 0;
-                op.imm = imm as i64 as u64; // Sign extend
-                op.word_instr = true;
-                if src != 0 {
-                    op.read_register1 = true;
-                }
-                if dst != 0 {
-                    op.write_register = true;
-                }
-                Self::set_arith_op(&mut op, arith_op, true);
-            }
-
-            Instruction::JumpAndLink { dst, offset } => {
-                op.op_jalr = true;
-                op.rd = dst as u8;
-                op.imm = offset as i64 as u64;
-                op.branch_cond = true;
-                if dst != 0 {
-                    op.write_register = true;
-                }
-            }
-
-            Instruction::JumpAndLinkRegister { base, dst, offset } => {
-                op.op_jalr = true;
-                op.rd = dst as u8;
-                op.rs1 = base as u8;
-                op.imm = offset as i64 as u64;
-                op.branch_cond = true;
-                if base != 0 {
-                    op.read_register1 = true;
-                }
-                if dst != 0 {
-                    op.write_register = true;
-                }
-            }
-
-            Instruction::Store {
-                src,
-                offset,
-                base,
-                width,
-            } => {
-                op.op_store = true;
-                op.rs1 = base as u8;
-                op.rs2 = src as u8;
-                op.imm = offset as i64 as u64;
-                // res is the memory address = base + offset
-                op.res = (log.src1_val as i64 + offset as i64) as u64;
-                if base != 0 {
-                    op.read_register1 = true;
-                }
-                if src != 0 {
-                    op.read_register2 = true;
-                }
-                Self::set_memory_width(&mut op, width);
-            }
-
-            Instruction::Load {
-                dst,
-                offset,
-                base,
-                width,
-            } => {
-                op.op_load = true;
-                op.rd = dst as u8;
-                op.rs1 = base as u8;
-                op.imm = offset as i64 as u64;
-                // res is the memory address = base + offset
-                op.res = (log.src1_val as i64 + offset as i64) as u64;
-                if base != 0 {
-                    op.read_register1 = true;
-                }
-                if dst != 0 {
-                    op.write_register = true;
-                }
-                Self::set_memory_width(&mut op, width);
-                // Set signed flag for sign-extending loads
-                match width {
-                    LoadStoreWidth::Byte | LoadStoreWidth::Half | LoadStoreWidth::Word => {
-                        op.signed = true;
-                    }
-                    _ => {}
-                }
-            }
-
-            Instruction::Branch {
-                src1,
-                src2,
-                cond,
-                offset,
-            } => {
-                op.rs1 = src1 as u8;
-                op.rs2 = src2 as u8;
-                op.imm = offset as i64 as u64;
-                op.is_equal = log.src1_val == log.src2_val;
-                if src1 != 0 {
-                    op.read_register1 = true;
-                }
-                if src2 != 0 {
-                    op.read_register2 = true;
-                }
-
-                match cond {
-                    Comparison::Equal => {
-                        op.op_beq = true;
-                        // BEQ uses SUB constraint: res = arg1 - arg2
-                        op.res = log.src1_val.wrapping_sub(log.src2_val);
-                        op.branch_cond = log.src1_val == log.src2_val;
-                    }
-                    Comparison::NotEqual => {
-                        op.op_beq = true;
-                        op.mp_selector = true; // Inverted
-                        // BNE uses SUB constraint: res = arg1 - arg2
-                        op.res = log.src1_val.wrapping_sub(log.src2_val);
-                        op.branch_cond = log.src1_val != log.src2_val;
-                    }
-                    Comparison::LessThan => {
-                        op.op_blt = true;
-                        op.signed = true;
-                        // BLT uses LT table: res[0] = comparison result, res[1..7] = 0
-                        let lt_result = (log.src1_val as i64) < (log.src2_val as i64);
-                        op.res = lt_result as u64;
-                        op.branch_cond = lt_result;
-                    }
-                    Comparison::LessThanUnsigned => {
-                        op.op_blt = true;
-                        // BLTU uses LT table: res[0] = comparison result, res[1..7] = 0
-                        let lt_result = log.src1_val < log.src2_val;
-                        op.res = lt_result as u64;
-                        op.branch_cond = lt_result;
-                    }
-                    Comparison::GreaterOrEqual => {
-                        op.op_blt = true;
-                        op.signed = true;
-                        op.mp_selector = true; // Inverted
-                        // BGE uses LT table with inversion: res[0] = arg1 < arg2
-                        let lt_result = (log.src1_val as i64) < (log.src2_val as i64);
-                        op.res = lt_result as u64;
-                        op.branch_cond = !lt_result; // Inverted: >= means NOT <
-                    }
-                    Comparison::GreaterOrEqualUnsigned => {
-                        op.op_blt = true;
-                        op.mp_selector = true; // Inverted
-                        // BGEU uses LT table with inversion: res[0] = arg1 < arg2
-                        let lt_result = log.src1_val < log.src2_val;
-                        op.res = lt_result as u64;
-                        op.branch_cond = !lt_result; // Inverted: >= means NOT <
-                    }
-                }
-            }
-
-            Instruction::LoadUpperImm { dst, imm } => {
-                op.op_add = true;
-                op.rd = dst as u8;
-                op.rs1 = 0;
-                op.rs2 = 0;
-                // LUI immediate must be sign-extended to 64 bits (matches executor)
-                op.imm = (imm as i32) as i64 as u64;
-                if dst != 0 {
-                    op.write_register = true;
-                }
-            }
-
-            Instruction::AddUpperImmToPc { dst, imm } => {
-                op.op_add = true;
-                op.rd = dst as u8;
-                // AUIPC immediate must be sign-extended to 64 bits (matches executor)
-                op.imm = (imm as i32) as i64 as u64;
-                op.rv1 = log.current_pc;
-                if dst != 0 {
-                    op.write_register = true;
-                }
-            }
-            Instruction::CSR { .. } => {
-                // CSR instructions not yet supported in prover
-                // TODO: Add CSR support
-            }
-            Instruction::EcallEbreak => {
-                // Determine if ECALL or EBREAK based on context
-                // For now, default to ECALL
-                op.op_ecall = true;
-            }
-            Instruction::Fence => {
-                // FENCE is a memory barrier - in single-threaded, in-order execution it's a no-op
-                // No operation flags needed, just advance PC (handled by default from log)
-            }
-        }
-
+        // Compute runtime-specific values based on instruction type
+        op.compute_runtime_values(log);
         op
     }
 
-    /// Helper to set ALU operation flags based on ArithOp.
-    fn set_arith_op(op: &mut Self, arith_op: ArithOp, is_word: bool) {
-        match arith_op {
-            ArithOp::Add => {
-                op.op_add = true;
-            }
-            ArithOp::Sub => {
-                op.op_sub = true;
-            }
-            ArithOp::Xor => op.op_xor = true,
-            ArithOp::Or => op.op_or = true,
-            ArithOp::And => op.op_and = true,
-            ArithOp::ShiftLeftLogical => {
-                op.op_shift = true;
-                // mp_selector = 0 for left shift
-            }
-            ArithOp::ShiftRightLogical => {
-                op.op_shift = true;
-                op.mp_selector = true; // mp_selector = 1 for right shift
-            }
-            ArithOp::ShiftRightArith => {
-                op.op_shift = true;
-                op.mp_selector = true;
-                op.signed = true;
-            }
-            ArithOp::SetLessThan => {
-                op.op_slt = true;
-                op.signed = true;
-            }
-            ArithOp::SetLessThanU => {
-                op.op_slt = true;
-            }
-            ArithOp::Mul => {
-                op.op_mul = true;
-                op.mp_selector = true;
-                if !is_word {
-                    op.signed = true;
-                }
-            }
-            ArithOp::MulHigh => {
-                op.op_mul = true;
-                op.muldiv_selector = true;
-                op.signed = true;
-            }
-            ArithOp::MulHighSignedUnsigned => {
-                op.op_mul = true;
-                op.muldiv_selector = true;
-                op.mp_selector = true;
-                op.signed = true;
-            }
-            ArithOp::MulHighUnsigned => {
-                op.op_mul = true;
-                op.muldiv_selector = true;
-            }
-            ArithOp::Div => {
-                op.op_divrem = true;
-                op.signed = true;
-            }
-            ArithOp::DivUnsigned => {
-                op.op_divrem = true;
-            }
-            ArithOp::Remainder => {
-                op.op_divrem = true;
-                op.muldiv_selector = true;
-                op.signed = true;
-            }
-            ArithOp::RemainderUnsigned => {
-                op.op_divrem = true;
-                op.muldiv_selector = true;
-            }
-        }
+    /// Creates a CpuOperation from Log and Instruction (convenience method).
+    ///
+    /// This creates the DecodeEntry internally. Use `from_log` with a pre-built
+    /// DecodeEntry when possible to avoid redundant decoding.
+    pub fn from_log_and_instruction(log: &Log, timestamp: u64, instruction: Instruction) -> Self {
+        let decode = DecodeEntry::from_instruction(log.current_pc, instruction);
+        Self::from_log(log, timestamp, decode)
     }
 
-    /// Helper to set memory width flags.
-    fn set_memory_width(op: &mut Self, width: LoadStoreWidth) {
-        match width {
-            LoadStoreWidth::Byte | LoadStoreWidth::ByteUnsigned => {
-                // 1 byte - no flags set
-            }
-            LoadStoreWidth::Half | LoadStoreWidth::HalfUnsigned => {
-                op.memory_2bytes = true;
-            }
-            LoadStoreWidth::Word | LoadStoreWidth::WordUnsigned => {
-                op.memory_2bytes = true;
-                op.memory_4bytes = true;
-            }
-            LoadStoreWidth::DoubleWord => {
-                op.memory_2bytes = true;
-                op.memory_4bytes = true;
-                op.memory_8bytes = true;
-            }
+    /// Computes runtime-specific values based on the instruction type.
+    ///
+    /// This handles:
+    /// - Memory address computation for LOAD/STORE
+    /// - Branch condition and result computation for BEQ/BLT
+    /// - AUIPC special case (rv1 = current_pc)
+    /// - JALR branch_cond = true
+    fn compute_runtime_values(&mut self, log: &Log) {
+        // JALR: always jumps
+        if self.decode.op_jalr {
+            self.branch_cond = true;
+        }
+
+        // LOAD/STORE: res = memory address = rv1 + imm
+        if self.decode.op_load || self.decode.op_store {
+            self.res = (log.src1_val as i64 + self.decode.imm as i64) as u64;
+        }
+
+        // BEQ: res = rv1 - rv2, branch if equal (or not equal for BNE)
+        if self.decode.op_beq {
+            self.is_equal = log.src1_val == log.src2_val;
+            self.res = log.src1_val.wrapping_sub(log.src2_val);
+            // mp_selector inverts the condition (BNE vs BEQ)
+            self.branch_cond = if self.decode.mp_selector {
+                log.src1_val != log.src2_val
+            } else {
+                log.src1_val == log.src2_val
+            };
+        }
+
+        // BLT: res = comparison result (0 or 1)
+        if self.decode.op_blt {
+            self.is_equal = log.src1_val == log.src2_val;
+            let lt_result = if self.decode.signed {
+                (log.src1_val as i64) < (log.src2_val as i64)
+            } else {
+                log.src1_val < log.src2_val
+            };
+            self.res = lt_result as u64;
+            // mp_selector inverts the condition (BGE/BGEU vs BLT/BLTU)
+            self.branch_cond = if self.decode.mp_selector {
+                !lt_result
+            } else {
+                lt_result
+            };
+        }
+
+        // AUIPC/JAL: rv1 should be current_pc (special case)
+        // Per spec, these instructions use rs1=255 (virtual PC register)
+        if self.decode.rs1 == 255 {
+            self.rv1 = log.current_pc;
         }
     }
 }
@@ -929,47 +680,50 @@ pub fn generate_cpu_trace(
 
     for (row_idx, op) in operations.iter().enumerate() {
         let base = row_idx * cols::NUM_COLUMNS;
+        let d = &op.decode; // Shorthand for decode fields
 
-        // Input columns
+        // Input columns (from decode)
         data[base + cols::TIMESTAMP] = FE::from(op.timestamp);
-        data[base + cols::PC_0] = FE::from(op.pc & 0xFFFF_FFFF);
-        data[base + cols::PC_1] = FE::from(op.pc >> 32);
-        data[base + cols::RS1] = FE::from(op.rs1 as u64);
-        data[base + cols::RS2] = FE::from(op.rs2 as u64);
-        data[base + cols::RD] = FE::from(op.rd as u64);
-        // Only set read/write register flags when register is non-zero (x0 is always 0)
-        // This matches trace_builder which only generates MEMW rows when reg != 0
-        data[base + cols::READ_REGISTER1] = FE::from((op.read_register1 && op.rs1 != 0) as u64);
-        data[base + cols::READ_REGISTER2] = FE::from((op.read_register2 && op.rs2 != 0) as u64);
-        data[base + cols::WRITE_REGISTER] = FE::from((op.write_register && op.rd != 0) as u64);
-        data[base + cols::MEMORY_2BYTES] = FE::from(op.memory_2bytes as u64);
-        data[base + cols::MEMORY_4BYTES] = FE::from(op.memory_4bytes as u64);
-        data[base + cols::MEMORY_8BYTES] = FE::from(op.memory_8bytes as u64);
-        data[base + cols::C_TYPE_INSTRUCTION] = FE::from(op.c_type_instruction as u64);
-        data[base + cols::IMM_0] = FE::from(op.imm & 0xFFFF_FFFF);
-        data[base + cols::IMM_1] = FE::from(op.imm >> 32);
-        data[base + cols::SIGNED] = FE::from(op.signed as u64);
-        data[base + cols::MP_SELECTOR] = FE::from(op.mp_selector as u64);
-        data[base + cols::MULDIV_SELECTOR] = FE::from(op.muldiv_selector as u64);
-        data[base + cols::WORD_INSTR] = FE::from(op.word_instr as u64);
+        data[base + cols::PC_0] = FE::from(d.pc & 0xFFFF_FFFF);
+        data[base + cols::PC_1] = FE::from(d.pc >> 32);
+        data[base + cols::RS1] = FE::from(d.rs1 as u64);
+        data[base + cols::RS2] = FE::from(d.rs2 as u64);
+        data[base + cols::RD] = FE::from(d.rd as u64);
+        // Only set read/write register flags when register is a real register
+        // Skip x0 (hardwired zero) and x255 (virtual PC register for AUIPC/JAL)
+        // This matches trace_builder which only generates MEMW rows for real registers
+        data[base + cols::READ_REGISTER1] =
+            FE::from((d.read_register1 && d.rs1 != 0 && d.rs1 != 255) as u64);
+        data[base + cols::READ_REGISTER2] = FE::from((d.read_register2 && d.rs2 != 0) as u64);
+        data[base + cols::WRITE_REGISTER] = FE::from((d.write_register && d.rd != 0) as u64);
+        data[base + cols::MEMORY_2BYTES] = FE::from(d.memory_2bytes as u64);
+        data[base + cols::MEMORY_4BYTES] = FE::from(d.memory_4bytes as u64);
+        data[base + cols::MEMORY_8BYTES] = FE::from(d.memory_8bytes as u64);
+        data[base + cols::C_TYPE_INSTRUCTION] = FE::from(d.c_type as u64);
+        data[base + cols::IMM_0] = FE::from(d.imm & 0xFFFF_FFFF);
+        data[base + cols::IMM_1] = FE::from(d.imm >> 32);
+        data[base + cols::SIGNED] = FE::from(d.signed as u64);
+        data[base + cols::MP_SELECTOR] = FE::from(d.mp_selector as u64);
+        data[base + cols::MULDIV_SELECTOR] = FE::from(d.muldiv_selector as u64);
+        data[base + cols::WORD_INSTR] = FE::from(d.word_instr as u64);
 
         // ALU selector flags
-        data[base + cols::ADD] = FE::from(op.op_add as u64);
-        data[base + cols::SUB] = FE::from(op.op_sub as u64);
-        data[base + cols::SLT] = FE::from(op.op_slt as u64);
-        data[base + cols::AND] = FE::from(op.op_and as u64);
-        data[base + cols::OR] = FE::from(op.op_or as u64);
-        data[base + cols::XOR] = FE::from(op.op_xor as u64);
-        data[base + cols::SHIFT] = FE::from(op.op_shift as u64);
-        data[base + cols::JALR] = FE::from(op.op_jalr as u64);
-        data[base + cols::BEQ] = FE::from(op.op_beq as u64);
-        data[base + cols::BLT] = FE::from(op.op_blt as u64);
-        data[base + cols::LOAD] = FE::from(op.op_load as u64);
-        data[base + cols::STORE] = FE::from(op.op_store as u64);
-        data[base + cols::MUL] = FE::from(op.op_mul as u64);
-        data[base + cols::DIVREM] = FE::from(op.op_divrem as u64);
-        data[base + cols::ECALL] = FE::from(op.op_ecall as u64);
-        data[base + cols::EBREAK] = FE::from(op.op_ebreak as u64);
+        data[base + cols::ADD] = FE::from(d.op_add as u64);
+        data[base + cols::SUB] = FE::from(d.op_sub as u64);
+        data[base + cols::SLT] = FE::from(d.op_slt as u64);
+        data[base + cols::AND] = FE::from(d.op_and as u64);
+        data[base + cols::OR] = FE::from(d.op_or as u64);
+        data[base + cols::XOR] = FE::from(d.op_xor as u64);
+        data[base + cols::SHIFT] = FE::from(d.op_shift as u64);
+        data[base + cols::JALR] = FE::from(d.op_jalr as u64);
+        data[base + cols::BEQ] = FE::from(d.op_beq as u64);
+        data[base + cols::BLT] = FE::from(d.op_blt as u64);
+        data[base + cols::LOAD] = FE::from(d.op_load as u64);
+        data[base + cols::STORE] = FE::from(d.op_store as u64);
+        data[base + cols::MUL] = FE::from(d.op_mul as u64);
+        data[base + cols::DIVREM] = FE::from(d.op_divrem as u64);
+        data[base + cols::ECALL] = FE::from(d.op_ecall as u64);
+        data[base + cols::EBREAK] = FE::from(d.op_ebreak as u64);
 
         // Output columns
         data[base + cols::NEXT_PC_0] = FE::from(op.next_pc & 0xFFFF_FFFF);
@@ -978,7 +732,7 @@ pub fn generate_cpu_trace(
         // rvd: For LOAD, use the executor's loaded value (op.rvd).
         // For all other operations (including STORE), compute from res with sign extension.
         // This satisfies spec constraint: (1-LOAD) * (rvd - res_extended) = 0
-        let rvd = if op.op_load {
+        let rvd = if d.op_load {
             op.rvd // Loaded value from executor
         } else {
             op.compute_rvd() // res with sign extension for word instructions
@@ -998,7 +752,7 @@ pub fn generate_cpu_trace(
 
         // Sign bits - only set when word_instr=1, per spec constraint ext_sign_bits
         // The constraint enforces: (rv1_sign_bit + arg2_sign_bit + res_sign_bit) * (1 - word_instr) = 0
-        let rv1_sign_bit = op.word_instr && CpuOperation::sign_bit_32(op.rv1);
+        let rv1_sign_bit = d.word_instr && CpuOperation::sign_bit_32(op.rv1);
         data[base + cols::RV1_SIGN_BIT] = FE::from(rv1_sign_bit as u64);
 
         // Compute and store arg1 as DWordBL (8 bytes)
@@ -1009,7 +763,7 @@ pub fn generate_cpu_trace(
 
         // Compute and store arg2
         let arg2 = op.compute_arg2();
-        let arg2_sign_bit = op.word_instr && CpuOperation::sign_bit_32(arg2);
+        let arg2_sign_bit = d.word_instr && CpuOperation::sign_bit_32(arg2);
         data[base + cols::ARG2_SIGN_BIT] = FE::from(arg2_sign_bit as u64);
         for i in 0..8 {
             data[base + cols::ARG2[i]] = FE::from((arg2 >> (i * 8)) & 0xFF);
@@ -1017,7 +771,7 @@ pub fn generate_cpu_trace(
 
         // Result - computed from arg1/arg2 for ADD/SUB to satisfy constraints
         let res = op.compute_res();
-        let res_sign_bit = op.word_instr && CpuOperation::sign_bit_32(res);
+        let res_sign_bit = d.word_instr && CpuOperation::sign_bit_32(res);
         data[base + cols::RES_SIGN_BIT] = FE::from(res_sign_bit as u64);
         for i in 0..8 {
             data[base + cols::RES[i]] = FE::from((res >> (i * 8)) & 0xFF);
@@ -1047,7 +801,11 @@ pub fn generate_cpu_trace_from_logs(
         let instruction = *instructions
             .get(&log.current_pc)
             .ok_or(ProverError::MissingInstruction(log.current_pc))?;
-        operations.push(CpuOperation::from_log(log, (i as u64) * 4, instruction));
+        operations.push(CpuOperation::from_log_and_instruction(
+            log,
+            (i as u64) * 4,
+            instruction,
+        ));
     }
     Ok(generate_cpu_trace(&operations))
 }
@@ -1072,7 +830,11 @@ pub fn collect_bitwise_ops_from_logs(
         let instruction = *instructions
             .get(&log.current_pc)
             .ok_or(ProverError::MissingInstruction(log.current_pc))?;
-        operations.push(CpuOperation::from_log(log, (i as u64) * 4, instruction));
+        operations.push(CpuOperation::from_log_and_instruction(
+            log,
+            (i as u64) * 4,
+            instruction,
+        ));
     }
     Ok(collect_bitwise_ops(&operations))
 }
@@ -1541,13 +1303,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // For CPU LOAD:
     // - rvd (the loaded result) corresponds to res
     // - res (computed address = rv1 + imm) corresponds to base_address
-    // - memory_Xbytes flags use CUMULATIVE encoding (1,1,1 for 8 bytes)
-    // - LOAD readX flags use EXCLUSIVE encoding (0,0,1 for 8 bytes)
-    //
-    // Convert cumulative to exclusive:
-    // - read2 = memory_2bytes - memory_4bytes
-    // - read4 = memory_4bytes - memory_8bytes
-    // - read8 = memory_8bytes
+    // - memory_Xbytes flags use EXCLUSIVE encoding per spec ("exactly N bytes")
     interactions.push(BusInteraction::sender(
         BusId::Load,
         Multiplicity::Column(cols::LOAD),
@@ -1569,30 +1325,15 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 packing: Packing::Direct,
             },
             BusValue::constant(0),
-            // read flags: convert from cumulative to exclusive encoding
-            // read2 = memory_2bytes - memory_4bytes
-            BusValue::linear(vec![
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::MEMORY_2BYTES,
-                },
-                LinearTerm::Column {
-                    coefficient: -1,
-                    column: cols::MEMORY_4BYTES,
-                },
-            ]),
-            // read4 = memory_4bytes - memory_8bytes
-            BusValue::linear(vec![
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::MEMORY_4BYTES,
-                },
-                LinearTerm::Column {
-                    coefficient: -1,
-                    column: cols::MEMORY_8BYTES,
-                },
-            ]),
-            // read8 = memory_8bytes
+            // read flags: exclusive encoding (pass through directly)
+            BusValue::Packed {
+                start_column: cols::MEMORY_2BYTES,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::MEMORY_4BYTES,
+                packing: Packing::Direct,
+            },
             BusValue::Packed {
                 start_column: cols::MEMORY_8BYTES,
                 packing: Packing::Direct,
@@ -1653,30 +1394,15 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 LinearTerm::Constant(1),
             ]),
             BusValue::constant(0),
-            // write flags: convert from cumulative to exclusive encoding
-            // write2 = memory_2bytes - memory_4bytes
-            BusValue::linear(vec![
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::MEMORY_2BYTES,
-                },
-                LinearTerm::Column {
-                    coefficient: -1,
-                    column: cols::MEMORY_4BYTES,
-                },
-            ]),
-            // write4 = memory_4bytes - memory_8bytes
-            BusValue::linear(vec![
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::MEMORY_4BYTES,
-                },
-                LinearTerm::Column {
-                    coefficient: -1,
-                    column: cols::MEMORY_8BYTES,
-                },
-            ]),
-            // write8 = memory_8bytes
+            // write flags: exclusive encoding (pass through directly)
+            BusValue::Packed {
+                start_column: cols::MEMORY_2BYTES,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::MEMORY_4BYTES,
+                packing: Packing::Direct,
+            },
             BusValue::Packed {
                 start_column: cols::MEMORY_8BYTES,
                 packing: Packing::Direct,

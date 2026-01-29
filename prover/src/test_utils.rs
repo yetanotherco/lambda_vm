@@ -88,7 +88,7 @@ pub fn collect_bitwise_ops_from_logs(
         .enumerate()
         .flat_map(|(i, log)| {
             let instruction = *instructions.get(&log.current_pc).unwrap();
-            let op = CpuOperation::from_log(log, (i as u64) * 4, instruction);
+            let op = CpuOperation::from_log_and_instruction(log, (i as u64) * 4, instruction);
             op.collect_bitwise_ops()
         })
         .collect()
