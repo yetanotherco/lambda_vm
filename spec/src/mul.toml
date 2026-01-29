@@ -32,13 +32,13 @@ pad = 0
 
 [[variables.output]]
 name = "lo"
-type = "DWordWL"
+type = "DWordHL"
 desc = "the lower limbs of the (extended) multiplication result"
 pad = 0
 
 [[variables.output]]
 name = "hi"
-type = "DWordWL"
+type = "DWordHL"
 desc = "the upper limbs of the (extended) multiplication result"
 pad = 0
 
@@ -83,13 +83,22 @@ def = {idx="i", polys=[
 ]}
 
 [[variables.virtual]]
+name = "res"
+type = "QuadWL"
+desc = "concatenation of `lo` and `hi`."
+def = {idx="i", polys=[
+    {iter=[0, 1], poly=["idx", ["cast", "lo", "DWordWL"], "i"]},
+    {iter=[2, 3], poly=["idx", ["cast", "hi", "DWordWL"], ["-", "i", 2]]},
+]}
+
+
+[[variables.virtual]]
 name = "carry"
 type = ["B20", 4]
 desc = "carry values"
 def = {idx="i", polys=[
-    {iter=0, poly=["*", ["^", 2, -32], ["-", ["idx", "raw_product", 0], ["idx", "lo", 0]]]},    
-    {iter=1, poly=["*", ["^", 2, -32], ["-", ["+", ["idx", "raw_product", 1], ["idx", "carry", 0]], ["idx", "lo", 1]]]},
-    {iter=[2, 3], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", "raw_product", "i"], ["idx", "carry", ["-", "i", 1]]], ["idx", "hi", ["-", "i", 2]]]]},
+    {iter=0, poly=["*", ["^", 2, -32], ["-", ["idx", "raw_product", 0], ["idx", "res", 0]]]},
+    {iter=[1, 3], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", "raw_product", "i"], ["idx", "carry", ["-", "i", 1]]], ["idx", "res", "i"]]]},
 ]}
 
 [[variables.virtual]]
@@ -122,17 +131,6 @@ iter = ["i", 0, 3]
 desc = "`IS_HALF[rhs[i]]`"
 iter = ["i", 0, 3]
 
-[[assumptions]]
-desc = "`IS_WORD[lo[i]]`"
-iter = ["i", 0, 1]
-ref = "mul:a:lo"
-
-[[assumptions]]
-desc = "`IS_WORD[hi[i]]`"
-iter = ["i", 0, 1]
-ref = "mul:a:hi"
-
-
 # Constraints
 
 [[constraint_groups]]
@@ -151,6 +149,22 @@ tag = "SIGN"
 input = [["idx", "rhs", 3], "rhs_signed"]
 output = "rhs_is_negative"
 ref = "mul:c:rhs_is_negative"
+
+[[constraints.def]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "lo", "i"]]
+iter = ["i", 0, 3]
+multiplicity = "μ_sum"
+ref = "mul:c:range_lo"
+
+[[constraints.def]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "hi", "i"]]
+iter = ["i", 0, 3]
+multiplicity = "μ_sum"
+ref = "mul:c:range_hi"
 
 [[constraints.def]]
 kind = "interaction"
@@ -178,7 +192,7 @@ name = "lookup"
 kind = "interaction"
 tag = "MUL"
 input = ["lhs", "lhs_signed", "rhs", "rhs_signed", "0"]
-output = "lo"
+output = ["cast", "lo", "DWordWL"]
 multiplicity = ["-", "μ_lo"]
 ref = "mul:c:lookup_lo"
 
@@ -186,6 +200,6 @@ ref = "mul:c:lookup_lo"
 kind = "interaction"
 tag = "MUL"
 input = ["lhs", "lhs_signed", "rhs", "rhs_signed", "1"]
-output = "hi"
+output = ["cast", "hi", "DWordWL"]
 multiplicity = ["-", "μ_hi"]
 ref = "mul:c:lookup_hi"
