@@ -53,7 +53,7 @@ jobs:
             exit 0
           fi
 
-          SYSTEM_PROMPT="You are a senior code reviewer for Lambda ZKVM, a minimalist, performant and auditable verifiable RISC-V vm written in Rust.. Review ONLY the changes in the pull request diff, not the entire codebase.
+          SYSTEM_PROMPT="You are a senior code reviewer for Lambda ZKVM, a minimalist, performant and auditable verifiable RISC-V vm written in Rust. Review ONLY the changes in the pull request diff, not the entire codebase.
 
           Review this PR focusing on:
             - Code correctness and potential bugs
