@@ -12,11 +12,9 @@
 #let config = load_config()
 #let chip = load_chip("src/mul.toml", config)
 
-#show: book-page.with(title: "MUL chip")
+#show: book-page(chip.name)
 
 #let mul = raw(chip.name)
-
-= #mul chip
 
 == Columns
 #let nr_variables = total_nr_variables(chip)
@@ -34,7 +32,6 @@ The following range checks are assumed to be performed/enforced outside of this 
 #render_chip_assumptions(chip, config)
 
 == Constraints
-
 === Overview
 When `lhs` and `rhs` are _unsigned_ integers, computing their product $mod 2^128$ comes down to evaluating
 $
@@ -67,14 +64,14 @@ We let `raw_product` capture the second summation in this last formula (see @mul
 By construction, $#`raw_product`_i < 2^51$ for all $i in [0, 3]$, far exceeding the 32-bits that fit in a single `Word`-limb.
 What remains then is to reduce each limb of `raw_product` $mod 2^32$, carrying the overflow of each limb to the next, constructing the output `res` in doing so.
 
-This reduce-and-carry operation is constrained @mul:a:res and @mul:c:carry, combined with `carry`'s definition.
+This reduce-and-carry operation is constrained by @mul:c:range_lo/@mul:c:range_hi and @mul:c:carry, combined with `carry`'s definition.
 @mul:c:carry and `carry`'s definition enforce that
 $
   forall i in [0, 3]: #`raw_product`_i + #`carry`_(i-1) - #`res`_i in { k dot 2^32 | k in [0, 2^20) }
 $
 with $#`carry`_(-1) = 0$ for simplicity.
 In other words: $#`res`_i equiv #`raw_product`_i + #`carry`_(i-1) (mod 2^32)$.
-With @mul:a:res forcing $#`res`_i < 2^32$, $#`res`_i$ can only assume one value: $#`raw_product`_i + #`carry`_(i-1) mod 2^32$.
+With @mul:c:range_lo/@mul:c:range_hi forcing $#`res`_i < 2^32$, $#`res`_i$ can only assume one value: $#`raw_product`_i + #`carry`_(i-1) mod 2^32$.
 
 *Note*: one may have observed that @mul:c:carry requires $#`carry`_i in [0, 2^20)$, while no limb of a valid carry value would ever exceed $2^19$.
 This is indeed the case.
@@ -83,7 +80,7 @@ In fact, in this situation it suffices to assert that $#`carry`_i < frac(p, 2^32
 Given that other chips also use 20-bit lookups, using `IS_B20` makes for a simpler design.
 
 === Definitions
-We constrain `lhs_is_negative` and `rhs_is_negative` according to their definition; `carry` is appropriately range checked.
+We constrain `lhs_is_negative` and `rhs_is_negative` according to their definition; `lo`, `hi` and `carry` are appropriately range checked.
 #render_constraint_table(chip, config, groups: "def")
 
 === Product
@@ -99,3 +96,12 @@ The #mul chip contributes the following to the lookup:
 The table can be padded to the next power of two with the following value assignments:
 
 #render_chip_padding_table(chip, config)
+
+== Notes
+- `lo` and `hi` are stored in `DWordHL`s (rather than `DWordWL`s) because of their values being range checked.
+  Since it is not required that both `μ_lo` and `μ_hi` are non-zero at the same time, one cannot safely assume their range to be checked elsewhere.
+
+  As an optimization, one might be able to use a `DWordWL` and `DWordHL` to store `lo` and `hi`, 
+  where one would decide which to store in which based on the multiplicities `μ_lo` and `μ_hi`;
+  the value sent into the lookup could then be assumed range-checked by the other side of the relation.
+  This optimization was not included at this moment because of its negative impact on the readability and verifiability of the chip.
