@@ -853,17 +853,16 @@ fn test_dhat_memory_profile() {
 
     assert_eq!(logs.len(), 4096, "Expected 2^12 instructions");
 
-    let mut cpu_trace = Traces::from_logs(&logs, instructions.clone()).unwrap().cpu;
-
-    let lt_lookups = collect_lt_lookups_from_logs(&logs, &instructions);
-    let mut lt_trace = generate_lt_trace(&lt_lookups);
-
-    let mut bitwise_lookups = collect_bitwise_lookups(&logs, &instructions);
-    bitwise_lookups.extend(collect_bitwise_lookups_from_lt(&lt_lookups));
-    let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
+    let mut traces = Traces::from_logs_minimal(&logs, instructions).unwrap();
 
     assert!(
-        prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+        prove_and_verify_vm_minimal(
+            &mut traces.cpu,
+            &mut traces.bitwise,
+            &mut traces.lt,
+            &mut traces.memw,
+            &mut traces.load
+        ),
         "verification failed"
     );
 }
