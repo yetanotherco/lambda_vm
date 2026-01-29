@@ -98,3 +98,12 @@ The #mul chip contributes the following to the lookup:
 The table can be padded to the next power of two with the following value assignments:
 
 #render_chip_padding_table(chip, config)
+
+== Notes
+- `lo` and `hi` are stored in `DWordHL`s (rather than `DWordWL`s) because of their values being range checked.
+  Since it is not required that both `μ_lo` and `μ_hi` are non-zero at the same time, one cannot safely assume their range to be checked elsewhere.
+
+  As an optimization, one might be able to use a `DWordWL` and `DWordHL` to store `lo` and `hi`, 
+  where one would decide which to store in which based on the multiplicities `μ_lo` and `μ_hi`;
+  the value sent into the lookup could then be assumed range-checked by the other side of the relation.
+  This optimization was not included at this moment because of its negative impact on the readability and verifiability of the chip.
