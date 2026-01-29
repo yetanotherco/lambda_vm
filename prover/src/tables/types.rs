@@ -84,6 +84,9 @@ pub enum BusId {
     Memw,
     /// Memory load with sign/zero extension
     Load,
+    /// Internal memory consistency bus for read/write pairing (M1-M8 in spec)
+    /// Format: memory[is_register, address, timestamp, value]
+    Memory,
     /// Branch target computation
     Branch,
 
