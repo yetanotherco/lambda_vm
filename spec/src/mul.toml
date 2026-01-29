@@ -114,6 +114,7 @@ range = ["i", 0, 3]
 [[assumptions]]
 desc = "`IS_HALF[rhs[i]]`"
 range = ["i", 0, 3]
+ref = "mul:a:rhs"
 
 [[assumptions]]
 desc = "`IS_WORD[res[i]]`"

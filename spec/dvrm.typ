@@ -133,11 +133,12 @@ $
 Moreover note that, ignoring the two excluded cases, $1 + #`msb_r` - #`msb_n` in {0, 1}$.
 `sign_n_sub_r` is assigned its appropriate value based on these cases in @dvrm:c:sign_n_sub_r_eq_msb and @dvrm:c:sign_n_sub_r_eq_signed.
 @dvrm:c:n_sub_r now computes $#`n` - #`r`$, and is combined with `sign_n_sub_r` to form `extended_n_sub_r` (see its #link(<dvrm:v:extended_n_sub_r>)[definition]).
-Lastly, @dvrm:c:n_sub_r_range is included to uphold assumption @add:a:lhs required by the `SUB` chip.
+Lastly, @dvrm:c:r_range and @dvrm:c:n_sub_r_range are included to uphold assumption @add:a:sum respectively @add:a:lhs, which are required by the `SUB` chip.
 
 #render_constraint_table(chip, config, groups:("n_sub_r", ))
 
-With `n_sub_r` constructed, the relation $#`n` - #`r` = #`qd`$ is asserted by @dvrm:c:mul_lower and @dvrm:c:mul_upper.
+With `n_sub_r` constructed, the relation $#`n` - #`r` = #`qd`$ is asserted by @dvrm:c:mul_lower and @dvrm:c:mul_upper;
+@dvrm:c:q_range is included to uphold assumption @mul:a:rhs.
 
 #render_constraint_table(chip, config, groups:("equality", ))
 

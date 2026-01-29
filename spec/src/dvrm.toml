@@ -153,16 +153,6 @@ ref = "lt:a:range_d"
 desc = "`IS_BIT<signed>`"
 ref = "lt:a:range_signed"
 
-[[assumptions]]
-desc = "`IS_HALF[q[i]]`"
-iter = ["i", 0, 3]
-ref = "lt:a:range_q"
-
-[[assumptions]]
-desc = "`IS_HALF[r[i]]`"
-iter = ["i", 0, 3]
-ref = "lt:a:range_r"
-
 # Constraints
 
 [[constraint_groups]]
@@ -291,6 +281,14 @@ ref = "dvrm:c:n_sub_r"
 [[constraints.n_sub_r]]
 kind = "interaction"
 tag = "IS_HALF"
+input = [["idx", "r", "i"]]
+iter = ["i", 0, 3]
+multiplicity = "μ_sum"
+ref = "dvrm:c:r_range"
+
+[[constraints.n_sub_r]]
+kind = "interaction"
+tag = "IS_HALF"
 input = [["idx", "n_sub_r", "i"]]
 iter = ["i", 0, 3]
 multiplicity = "μ_sum"
@@ -314,6 +312,14 @@ input = ["d", "signed", "q", "sign_q", 1]
 output = ["idx", "extended_n_sub_r", "4:8"]
 multiplicity = "μ_sum"
 ref = "dvrm:c:mul_upper"
+
+[[constraints.equality]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "q", "i"]]
+iter = ["i", 0, 3]
+multiplicity = "μ_sum"
+ref = "dvrm:c:q_range"
 
 
 [[constraint_groups]]
