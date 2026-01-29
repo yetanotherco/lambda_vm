@@ -8,6 +8,8 @@ on:
       - 'crypto/**'
       - 'executor/**'
       - '.github/workflows/memory-profile.yml'
+
+  # Run memory profiling on main to create baselines for PR comparisons
   push:
     branches: [main]
     paths:
