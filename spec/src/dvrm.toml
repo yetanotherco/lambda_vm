@@ -110,8 +110,8 @@ name = "extended_n_sub_r"
 type = ["Half", 8]
 desc = "sign-extended value of `n_sub_r`."
 def = {idx="i", polys = [
-  {range=[0, 3], poly=["idx", "n_sub_r", "i"]},
-  {range=[4, 7], poly=["*", 0xFFFF, "sign_n_sub_r"]}
+  {iter=[0, 3], poly=["idx", "n_sub_r", "i"]},
+  {iter=[4, 7], poly=["*", 0xFFFF, "sign_n_sub_r"]}
 ]}
 ref = "dvrm:v:extended_n_sub_r"
 
@@ -141,12 +141,12 @@ pad = 0
 
 [[assumptions]]
 desc = "`IS_HALF[n[i]]`"
-range = ["i", 0, 3]
+iter = ["i", 0, 3]
 ref = "lt:a:range_n"
 
 [[assumptions]]
 desc = "`IS_HALF[d[i]]`"
-range = ["i", 0, 3]
+iter = ["i", 0, 3]
 ref = "lt:a:range_d"
 
 [[assumptions]]
@@ -155,12 +155,12 @@ ref = "lt:a:range_signed"
 
 [[assumptions]]
 desc = "`IS_HALF[q[i]]`"
-range = ["i", 0, 3]
+iter = ["i", 0, 3]
 ref = "lt:a:range_q"
 
 [[assumptions]]
 desc = "`IS_HALF[r[i]]`"
-range = ["i", 0, 3]
+iter = ["i", 0, 3]
 ref = "lt:a:range_r"
 
 # Constraints
@@ -189,7 +189,7 @@ ref ="dvrm:c:abs_r_lt_abs_d"
 kind = "interaction"
 tag = "IS_HALF"
 input = [["idx", "abs_r", "i"]]
-range = ["i", 0, 3]
+iter = ["i", 0, 3]
 multiplicity = "sign_r"
 ref = "dvrm:c:abs_r_range_check"
 
@@ -204,7 +204,7 @@ ref = "dvrm:c:abs_r_if_negative"
 [[constraints.abs_diff]]
 kind = "arith"
 constraint = "$not#`sign_r` => #`abs_r[i]`=#`r[i]`$"
-range = ["i", 0, 3]
+iter = ["i", 0, 3]
 poly = ["*", ["-", 1, "sign_r"], ["-", ["idx", "abs_r", "i"], ["idx", "r", "i"]]]
 ref = "dvrm:c:abs_r_if_nonnegative"
 
@@ -212,7 +212,7 @@ ref = "dvrm:c:abs_r_if_nonnegative"
 kind = "interaction"
 tag = "IS_HALF"
 input = [["idx", "abs_d", "i"]]
-range = ["i", 0, 3]
+iter = ["i", 0, 3]
 multiplicity = "sign_d"
 ref = "dvrm:c:abs_d_range_check"
 
@@ -227,7 +227,7 @@ ref = "dvrm:c:abs_d_if_negative"
 [[constraints.abs_diff]]
 kind = "arith"
 constraint = "$not#`sign_d` => #`abs_d[i]`=#`d[i]`$"
-range = ["i", 0, 3]
+iter = ["i", 0, 3]
 poly = ["*", ["-", 1, "sign_d"], ["-", ["idx", "abs_d", "i"], ["idx", "d", "i"]]]
 ref = "dvrm:c:abs_d_if_nonnegative"
 
@@ -236,7 +236,7 @@ name = "overflow"
 
 [[constraints.overflow]]
 kind = "arith"
-range = ["i", 0, 3]
+iter = ["i", 0, 3]
 constraint = "$#`overflow` => #`q[i]` = #`n[i]`$"
 poly = ["*", "overflow", ["-", ["idx", "q", "i"], ["idx", "n", "i"]]]
 ref = "dvrm:c:q_if_overflow"
@@ -292,7 +292,7 @@ ref = "dvrm:c:n_sub_r"
 kind = "interaction"
 tag = "IS_HALF"
 input = [["idx", "n_sub_r", "i"]]
-range = ["i", 0, 3]
+iter = ["i", 0, 3]
 multiplicity = "μ_sum"
 ref = "dvrm:c:n_sub_r_range"
 
@@ -365,7 +365,7 @@ name = "div_by_zero"
 
 [[constraints.div_by_zero]]
 kind = "arith"
-range = ["i", 0, 3]
+iter = ["i", 0, 3]
 constraint = "$#`div_by_zero` => #`q[i]` = 65535$"
 poly = ["*", "div_by_zero", ["-", ["idx", "q", "i"], 65535]]
 ref = "dvrm:c:q_if_div_by_zero"
