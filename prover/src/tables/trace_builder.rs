@@ -143,11 +143,7 @@ fn cpu_op_to_bytes_and_signed(op: &CpuOperation) -> (usize, bool) {
 ///
 /// For register operations, values are packed as [lo32, hi32, 0, 0, 0, 0, 0, 0].
 fn pack_register_value(value: u64) -> [u64; 8] {
-    [
-        value & 0xFFFF_FFFF,
-        value >> 32,
-        0, 0, 0, 0, 0, 0,
-    ]
+    [value & 0xFFFF_FFFF, value >> 32, 0, 0, 0, 0, 0, 0]
 }
 
 // =============================================================================
@@ -199,7 +195,8 @@ fn collect_cpu_ops(ctx: &mut CollectionContext) -> Result<(), ProverError> {
     // for the first access to any register/memory location (where old_timestamp=0).
     for (i, log) in ctx.logs.iter().enumerate() {
         let timestamp = (i as u64) * 4 + 4;
-        let instruction = ctx.instructions
+        let instruction = ctx
+            .instructions
             .get(&log.current_pc)
             .copied()
             .ok_or(ProverError::MissingInstruction(log.current_pc))?;
@@ -305,11 +302,13 @@ fn collect_load_op_from_cpu(ctx: &mut CollectionContext, op: &CpuOperation) {
         res_bytes,
     );
     // Collect MSB8 lookups for sign bit extraction
-    ctx.bitwise_lookups.extend(load_op.collect_bitwise_lookups());
+    ctx.bitwise_lookups
+        .extend(load_op.collect_bitwise_lookups());
     ctx.load_ops.push(load_op);
 
     // Update memory state
-    ctx.memory_state.write_bytes(base_address, loaded_value, byte_count, op.timestamp);
+    ctx.memory_state
+        .write_bytes(base_address, loaded_value, byte_count, op.timestamp);
 }
 
 /// Collects a STORE operation as a MEMW write from CpuOperation.
@@ -327,7 +326,12 @@ fn collect_store_op_from_cpu(ctx: &mut CollectionContext, op: &CpuOperation) {
     let value_bytes = [
         store_value & 0xFFFF_FFFF,
         store_value >> 32,
-        0, 0, 0, 0, 0, 0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
     ];
 
     // Create MEMW operation (write) - M7 uses timestamp+1
@@ -343,7 +347,8 @@ fn collect_store_op_from_cpu(ctx: &mut CollectionContext, op: &CpuOperation) {
     ctx.memw_ops.push(memw_op);
 
     // Update memory state (using timestamp+1 to match M7)
-    ctx.memory_state.write_bytes(base_address, store_value, byte_count, op.timestamp + 1);
+    ctx.memory_state
+        .write_bytes(base_address, store_value, byte_count, op.timestamp + 1);
 }
 
 /// Collects register read/write operations (M1, M3, M5) from CpuOperation.
@@ -355,10 +360,8 @@ fn collect_register_ops_from_cpu(ctx: &mut CollectionContext, op: &CpuOperation)
         let (_old_val, old_ts) = ctx.register_state.read(op.rs1);
         let old_timestamps = [old_ts; 8];
 
-        let memw_op = MemwOperation::new(
-            true, reg_addr, reg_value, op.timestamp, 8, true,
-        )
-        .with_old(reg_value, old_timestamps);
+        let memw_op = MemwOperation::new(true, reg_addr, reg_value, op.timestamp, 8, true)
+            .with_old(reg_value, old_timestamps);
         ctx.memw_ops.push(memw_op);
         ctx.register_state.write(op.rs1, op.rv1, op.timestamp);
     }
@@ -370,10 +373,8 @@ fn collect_register_ops_from_cpu(ctx: &mut CollectionContext, op: &CpuOperation)
         let (_old_val, old_ts) = ctx.register_state.read(op.rs2);
         let old_timestamps = [old_ts; 8];
 
-        let memw_op = MemwOperation::new(
-            true, reg_addr, reg_value, op.timestamp + 1, 8, true,
-        )
-        .with_old(reg_value, old_timestamps);
+        let memw_op = MemwOperation::new(true, reg_addr, reg_value, op.timestamp + 1, 8, true)
+            .with_old(reg_value, old_timestamps);
         ctx.memw_ops.push(memw_op);
         ctx.register_state.write(op.rs2, op.rv2, op.timestamp + 1);
     }
@@ -386,10 +387,8 @@ fn collect_register_ops_from_cpu(ctx: &mut CollectionContext, op: &CpuOperation)
         let old_value = pack_register_value(old_val);
         let old_timestamps = [old_ts; 8];
 
-        let memw_op = MemwOperation::new(
-            true, reg_addr, reg_value, op.timestamp + 2, 8, false,
-        )
-        .with_old(old_value, old_timestamps);
+        let memw_op = MemwOperation::new(true, reg_addr, reg_value, op.timestamp + 2, 8, false)
+            .with_old(old_value, old_timestamps);
         ctx.memw_ops.push(memw_op);
         ctx.register_state.write(op.rd, op.rvd, op.timestamp + 2);
     }
@@ -408,23 +407,31 @@ fn collect_lt_from_memw(ctx: &mut CollectionContext) {
     for memw_op in &ctx.memw_ops {
         // C7: old_timestamp[0] < timestamp (all accesses)
         ctx.lt_ops.push(LtOperation::new(
-            memw_op.old_timestamp[0], memw_op.timestamp, false,
+            memw_op.old_timestamp[0],
+            memw_op.timestamp,
+            false,
         ));
 
         // C8: old_timestamp[1] < timestamp (width >= 2)
         if memw_op.width >= 2 {
             ctx.lt_ops.push(LtOperation::new(
-                memw_op.old_timestamp[1], memw_op.timestamp, false,
+                memw_op.old_timestamp[1],
+                memw_op.timestamp,
+                false,
             ));
         }
 
         // C9: old_timestamp[2,3] < timestamp (width >= 4)
         if memw_op.width >= 4 {
             ctx.lt_ops.push(LtOperation::new(
-                memw_op.old_timestamp[2], memw_op.timestamp, false,
+                memw_op.old_timestamp[2],
+                memw_op.timestamp,
+                false,
             ));
             ctx.lt_ops.push(LtOperation::new(
-                memw_op.old_timestamp[3], memw_op.timestamp, false,
+                memw_op.old_timestamp[3],
+                memw_op.timestamp,
+                false,
             ));
         }
 
@@ -432,7 +439,9 @@ fn collect_lt_from_memw(ctx: &mut CollectionContext) {
         if memw_op.width == 8 {
             for i in 4..8 {
                 ctx.lt_ops.push(LtOperation::new(
-                    memw_op.old_timestamp[i], memw_op.timestamp, false,
+                    memw_op.old_timestamp[i],
+                    memw_op.timestamp,
+                    false,
                 ));
             }
         }
@@ -441,19 +450,22 @@ fn collect_lt_from_memw(ctx: &mut CollectionContext) {
         if memw_op.width == 2 {
             let addr_plus_1 = memw_op.base_address.wrapping_add(1);
             if addr_plus_1 > memw_op.base_address {
-                ctx.lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_1, false));
+                ctx.lt_ops
+                    .push(LtOperation::new(memw_op.base_address, addr_plus_1, false));
             }
         }
         if memw_op.width == 4 {
             let addr_plus_3 = memw_op.base_address.wrapping_add(3);
             if addr_plus_3 > memw_op.base_address {
-                ctx.lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_3, false));
+                ctx.lt_ops
+                    .push(LtOperation::new(memw_op.base_address, addr_plus_3, false));
             }
         }
         if memw_op.width == 8 {
             let addr_plus_7 = memw_op.base_address.wrapping_add(7);
             if addr_plus_7 > memw_op.base_address {
-                ctx.lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_7, false));
+                ctx.lt_ops
+                    .push(LtOperation::new(memw_op.base_address, addr_plus_7, false));
             }
         }
     }

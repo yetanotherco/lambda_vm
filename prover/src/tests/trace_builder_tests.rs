@@ -211,7 +211,10 @@ fn test_lt_deduplication() {
             break;
         }
     }
-    assert!(found_slt, "SLT operation (5 < 10, signed) not found in LT table");
+    assert!(
+        found_slt,
+        "SLT operation (5 < 10, signed) not found in LT table"
+    );
 }
 
 #[test]
