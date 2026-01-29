@@ -208,12 +208,10 @@ pub fn collect_load_ops_from_logs(
         let instruction = *instructions.get(&log.current_pc).unwrap();
 
         if let Instruction::Load { width, .. } = instruction {
-            let base_address = log.src1_val.wrapping_add(
-                match instruction {
-                    Instruction::Load { offset, .. } => offset as i64 as u64,
-                    _ => 0,
-                }
-            );
+            let base_address = log.src1_val.wrapping_add(match instruction {
+                Instruction::Load { offset, .. } => offset as i64 as u64,
+                _ => 0,
+            });
 
             let (byte_count, signed) = match width {
                 LoadStoreWidth::Byte => (1, true),

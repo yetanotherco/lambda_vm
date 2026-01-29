@@ -384,23 +384,43 @@ impl Traces {
         // Collect LT operations from MEMW (timestamp ordering and overflow checks)
         for memw_op in &memw_ops {
             // C7: old_timestamp[0] < timestamp (all accesses)
-            lt_ops.push(LtOperation::new(memw_op.old_timestamp[0], memw_op.timestamp, false));
+            lt_ops.push(LtOperation::new(
+                memw_op.old_timestamp[0],
+                memw_op.timestamp,
+                false,
+            ));
 
             // C8: old_timestamp[1] < timestamp (width >= 2)
             if memw_op.width >= 2 {
-                lt_ops.push(LtOperation::new(memw_op.old_timestamp[1], memw_op.timestamp, false));
+                lt_ops.push(LtOperation::new(
+                    memw_op.old_timestamp[1],
+                    memw_op.timestamp,
+                    false,
+                ));
             }
 
             // C9: old_timestamp[2,3] < timestamp (width >= 4)
             if memw_op.width >= 4 {
-                lt_ops.push(LtOperation::new(memw_op.old_timestamp[2], memw_op.timestamp, false));
-                lt_ops.push(LtOperation::new(memw_op.old_timestamp[3], memw_op.timestamp, false));
+                lt_ops.push(LtOperation::new(
+                    memw_op.old_timestamp[2],
+                    memw_op.timestamp,
+                    false,
+                ));
+                lt_ops.push(LtOperation::new(
+                    memw_op.old_timestamp[3],
+                    memw_op.timestamp,
+                    false,
+                ));
             }
 
             // C10: old_timestamp[4..7] < timestamp (width == 8)
             if memw_op.width == 8 {
                 for i in 4..8 {
-                    lt_ops.push(LtOperation::new(memw_op.old_timestamp[i], memw_op.timestamp, false));
+                    lt_ops.push(LtOperation::new(
+                        memw_op.old_timestamp[i],
+                        memw_op.timestamp,
+                        false,
+                    ));
                 }
             }
 
