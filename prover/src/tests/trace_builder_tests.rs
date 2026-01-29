@@ -259,10 +259,11 @@ fn test_cpu_timestamps() {
 
     let traces = Traces::from_logs(&logs, instructions).unwrap();
 
-    // Check timestamps are 0, 4, 8, 12
+    // Check timestamps are 4, 8, 12, 16 (starting at 4, not 0)
+    // This ensures first memory access has old_timestamp(0) < timestamp(4)
     for i in 0..4 {
         let row = traces.cpu.main_table.get_row(i);
-        assert_eq!(row[cols::TIMESTAMP], FE::from((i * 4) as u64));
+        assert_eq!(row[cols::TIMESTAMP], FE::from(((i + 1) * 4) as u64));
     }
 }
 
@@ -308,4 +309,97 @@ fn test_mixed_instructions() {
     assert_eq!(traces.bitwise.main_table.height, bitwise::NUM_ROWS);
     // 1 SLT + 1 BLT = 2 LT ops
     assert!(traces.lt.main_table.height >= 2);
+}
+
+#[test]
+fn test_lt_bitwise_lookups_collected() {
+    // Test that LtOperation::collect_bitwise_lookups() works correctly
+    // and that LT → Bitwise lookups are collected in the trace builder
+    use crate::tables::bitwise::BitwiseLookup;
+    use crate::tables::lt::LtOperation;
+
+    // Create an LT operation with known values
+    let lhs: u64 = 0x1234_5678_9ABC_DEF0;
+    let rhs: u64 = 0x0FED_CBA9_8765_4321;
+    let lt_op = LtOperation::new(lhs, rhs, false);
+
+    // Test collect_bitwise_lookups directly
+    let lookups = lt_op.collect_bitwise_lookups();
+
+    // Should have 8 lookups: 2 MSB16 + 6 IS_HALF
+    assert_eq!(lookups.len(), 8, "LtOperation should generate 8 bitwise lookups");
+
+    // Verify MSB16 lookups for lhs[2] and rhs[2] (bits 48-63)
+    let lhs_2 = ((lhs >> 48) & 0xFFFF) as u16; // 0x1234
+    let rhs_2 = ((rhs >> 48) & 0xFFFF) as u16; // 0x0FED
+
+    // First lookup: MSB16 for lhs[2]
+    assert_eq!(lookups[0].0, BitwiseLookup::Msb16);
+    assert_eq!(lookups[0].1, (lhs_2 & 0xFF) as u8); // 0x34
+    assert_eq!(lookups[0].2, ((lhs_2 >> 8) & 0xFF) as u8); // 0x12
+
+    // Second lookup: MSB16 for rhs[2]
+    assert_eq!(lookups[1].0, BitwiseLookup::Msb16);
+    assert_eq!(lookups[1].1, (rhs_2 & 0xFF) as u8); // 0xED
+    assert_eq!(lookups[1].2, ((rhs_2 >> 8) & 0xFF) as u8); // 0x0F
+
+    // Verify IS_HALF lookups (indices 2-7)
+    for i in 2..8 {
+        assert_eq!(lookups[i].0, BitwiseLookup::IsHalf);
+    }
+}
+
+#[test]
+fn test_lt_to_bitwise_integration() {
+    // Test that LT → Bitwise lookups are properly integrated in trace builder
+    // Use a simple SLT that triggers LT lookups
+    let logs = vec![
+        make_slt_log(0x1000, 5, 10, 1), // 5 < 10 = true
+        make_add_log(0x1004, 0, 0, 0),
+        make_add_log(0x1008, 0, 0, 0),
+        make_add_log(0x100c, 0, 0, 0),
+    ];
+    let instrs = vec![
+        Instruction::Arith {
+            dst: 1,
+            src1: 2,
+            src2: 3,
+            op: ArithOp::SetLessThan,
+        },
+        Instruction::Arith {
+            dst: 1,
+            src1: 2,
+            src2: 3,
+            op: ArithOp::Add,
+        },
+        Instruction::Arith {
+            dst: 1,
+            src1: 2,
+            src2: 3,
+            op: ArithOp::Add,
+        },
+        Instruction::Arith {
+            dst: 1,
+            src1: 2,
+            src2: 3,
+            op: ArithOp::Add,
+        },
+    ];
+    let instructions = make_instructions(&logs, &instrs);
+
+    let traces = Traces::from_logs(&logs, instructions).unwrap();
+
+    // LT op: lhs=5, rhs=10, signed=false
+    // lhs_sub_rhs = 5 - 10 = 0xFFFF_FFFF_FFFF_FFFB (wrapping)
+    let lhs_sub_rhs = 5u64.wrapping_sub(10);
+    let sub_0 = (lhs_sub_rhs & 0xFFFF) as u16; // 0xFFFB
+
+    // Check that IS_HALF multiplicity was incremented for lhs_sub_rhs[0]
+    let row_idx = bitwise::row_index((sub_0 & 0xFF) as u8, ((sub_0 >> 8) & 0xFF) as u8, 0);
+    let row = traces.bitwise.main_table.get_row(row_idx);
+    assert_ne!(
+        row[bitwise::cols::MU_IS_HALF],
+        FE::zero(),
+        "IS_HALF multiplicity should be non-zero for lhs_sub_rhs[0]"
+    );
 }

@@ -120,6 +120,95 @@ impl LtOperation {
             self.lhs < self.rhs
         }
     }
+
+    /// Collects bitwise lookups for this LT operation.
+    ///
+    /// From spec lt.md:
+    /// - MSB16[lhs[2]] → lhs_msb (bits 48-63)
+    /// - MSB16[rhs[2]] → rhs_msb (bits 48-63)
+    /// - IS_HALFWORD[lhs_sub_rhs[i]] × 4 (all 4 halfwords)
+    /// - IS_HALFWORD[lhs[1]] (bits 32-47)
+    /// - IS_HALFWORD[rhs[1]] (bits 32-47)
+    pub fn collect_bitwise_lookups(
+        &self,
+    ) -> Vec<(super::bitwise::BitwiseLookup, u8, u8, u8)> {
+        use super::bitwise::BitwiseLookup;
+        let mut lookups = Vec::with_capacity(8);
+
+        // Extract halfwords
+        let lhs_1 = ((self.lhs >> 32) & 0xFFFF) as u16; // bits 32-47
+        let lhs_2 = ((self.lhs >> 48) & 0xFFFF) as u16; // bits 48-63
+
+        let rhs_1 = ((self.rhs >> 32) & 0xFFFF) as u16; // bits 32-47
+        let rhs_2 = ((self.rhs >> 48) & 0xFFFF) as u16; // bits 48-63
+
+        // Compute lhs_sub_rhs = lhs - rhs (wrapping)
+        let lhs_sub_rhs = self.lhs.wrapping_sub(self.rhs);
+        let sub_0 = (lhs_sub_rhs & 0xFFFF) as u16;
+        let sub_1 = ((lhs_sub_rhs >> 16) & 0xFFFF) as u16;
+        let sub_2 = ((lhs_sub_rhs >> 32) & 0xFFFF) as u16;
+        let sub_3 = ((lhs_sub_rhs >> 48) & 0xFFFF) as u16;
+
+        // MSB16[lhs[2]] → lhs_msb
+        lookups.push((
+            BitwiseLookup::Msb16,
+            (lhs_2 & 0xFF) as u8,
+            ((lhs_2 >> 8) & 0xFF) as u8,
+            0,
+        ));
+
+        // MSB16[rhs[2]] → rhs_msb
+        lookups.push((
+            BitwiseLookup::Msb16,
+            (rhs_2 & 0xFF) as u8,
+            ((rhs_2 >> 8) & 0xFF) as u8,
+            0,
+        ));
+
+        // IS_HALFWORD[lhs_sub_rhs[0..3]] × 4
+        lookups.push((
+            BitwiseLookup::IsHalf,
+            (sub_0 & 0xFF) as u8,
+            ((sub_0 >> 8) & 0xFF) as u8,
+            0,
+        ));
+        lookups.push((
+            BitwiseLookup::IsHalf,
+            (sub_1 & 0xFF) as u8,
+            ((sub_1 >> 8) & 0xFF) as u8,
+            0,
+        ));
+        lookups.push((
+            BitwiseLookup::IsHalf,
+            (sub_2 & 0xFF) as u8,
+            ((sub_2 >> 8) & 0xFF) as u8,
+            0,
+        ));
+        lookups.push((
+            BitwiseLookup::IsHalf,
+            (sub_3 & 0xFF) as u8,
+            ((sub_3 >> 8) & 0xFF) as u8,
+            0,
+        ));
+
+        // IS_HALFWORD[lhs[1]]
+        lookups.push((
+            BitwiseLookup::IsHalf,
+            (lhs_1 & 0xFF) as u8,
+            ((lhs_1 >> 8) & 0xFF) as u8,
+            0,
+        ));
+
+        // IS_HALFWORD[rhs[1]]
+        lookups.push((
+            BitwiseLookup::IsHalf,
+            (rhs_1 & 0xFF) as u8,
+            ((rhs_1 >> 8) & 0xFF) as u8,
+            0,
+        ));
+
+        lookups
+    }
 }
 
 /// Generates the LT trace table from a list of operations.

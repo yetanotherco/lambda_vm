@@ -193,6 +193,7 @@ impl Traces {
             if op.op_slt || op.op_blt {
                 let arg1 = op.compute_arg1();
                 let arg2 = op.compute_arg2();
+                eprintln!("CPU LT op: ({:#x}, {:#x}, {}) [SLT/BLT]", arg1, arg2, if op.signed { 1 } else { 0 });
                 lt_ops.push(LtOperation::new(arg1, arg2, op.signed));
             }
 
@@ -382,48 +383,55 @@ impl Traces {
         let mut bitwise = bitwise::generate_bitwise_trace();
 
         // Collect LT operations from MEMW (timestamp ordering and overflow checks)
+        // DEBUG: Match enable flags in bus_interactions
+        let enable_c7 = true;
+        let enable_c8 = true;
+        let enable_c9 = true;
+        let enable_c10 = true;
+        let enable_r1_r3 = true;
+        let lt_ops_before_memw = lt_ops.len();
         for memw_op in &memw_ops {
-            // C7: old_timestamp[0] < timestamp (all accesses)
-            lt_ops.push(LtOperation::new(memw_op.old_timestamp[0], memw_op.timestamp, false));
-
-            // C8: old_timestamp[1] < timestamp (width >= 2)
-            if memw_op.width >= 2 {
+            // Only collect ops for enabled constraints
+            if enable_c7 {
+                lt_ops.push(LtOperation::new(memw_op.old_timestamp[0], memw_op.timestamp, false));
+            }
+            if enable_c8 && memw_op.width >= 2 {
                 lt_ops.push(LtOperation::new(memw_op.old_timestamp[1], memw_op.timestamp, false));
             }
-
-            // C9: old_timestamp[2,3] < timestamp (width >= 4)
-            if memw_op.width >= 4 {
+            if enable_c9 && memw_op.width >= 4 {
                 lt_ops.push(LtOperation::new(memw_op.old_timestamp[2], memw_op.timestamp, false));
                 lt_ops.push(LtOperation::new(memw_op.old_timestamp[3], memw_op.timestamp, false));
             }
-
-            // C10: old_timestamp[4..7] < timestamp (width == 8)
-            if memw_op.width == 8 {
+            if enable_c10 && memw_op.width == 8 {
                 for i in 4..8 {
                     lt_ops.push(LtOperation::new(memw_op.old_timestamp[i], memw_op.timestamp, false));
                 }
             }
-
-            // R1-R3: Address overflow checks (base_address < base_address + offset)
-            if memw_op.width == 2 {
-                let addr_plus_1 = memw_op.base_address.wrapping_add(1);
-                if addr_plus_1 > memw_op.base_address {
-                    lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_1, false));
+            if enable_r1_r3 {
+                if memw_op.width == 2 {
+                    let addr_plus_1 = memw_op.base_address.wrapping_add(1);
+                    if addr_plus_1 > memw_op.base_address {
+                        lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_1, false));
+                    }
                 }
-            }
-            if memw_op.width == 4 {
-                let addr_plus_3 = memw_op.base_address.wrapping_add(3);
-                if addr_plus_3 > memw_op.base_address {
-                    lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_3, false));
+                if memw_op.width == 4 {
+                    let addr_plus_3 = memw_op.base_address.wrapping_add(3);
+                    if addr_plus_3 > memw_op.base_address {
+                        lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_3, false));
+                    }
                 }
-            }
-            if memw_op.width == 8 {
-                let addr_plus_7 = memw_op.base_address.wrapping_add(7);
-                if addr_plus_7 > memw_op.base_address {
-                    lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_7, false));
+                if memw_op.width == 8 {
+                    let addr_plus_7 = memw_op.base_address.wrapping_add(7);
+                    if addr_plus_7 > memw_op.base_address {
+                        lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_7, false));
+                    }
                 }
             }
         }
+        eprintln!("\n=== LT OPS SUMMARY ===");
+        eprintln!("CPU LT ops (SLT/BLT): {}", lt_ops_before_memw);
+        eprintln!("MEMW LT ops: {}", lt_ops.len() - lt_ops_before_memw);
+        eprintln!("Total LT ops: {}", lt_ops.len());
 
         // Collect bitwise lookups for ALL LT operations (CPU and MEMW)
         // Each LT operation sends to MSB16 (2 lookups) and IsHalfword (6 lookups)
@@ -496,45 +504,6 @@ impl Traces {
                 (rhs_1 >> 8) as u8,
                 0,
             ));
-        }
-
-        // Collect IsHalfword lookups for MEMW address_add columns
-        // Each MEMW operation sends 28 IsHalfword lookups (7 address_add values × 4 halfwords each)
-        // Note: address_add[i] = base_address + i + 1 (as per memw trace generation)
-        for memw_op in &memw_ops {
-            for i in 0..7u64 {
-                let addr_add = memw_op.base_address.wrapping_add(i + 1);
-                // Extract 4 halfwords from address_add (DWordHL packing)
-                let h0 = (addr_add & 0xFFFF) as u16;
-                let h1 = ((addr_add >> 16) & 0xFFFF) as u16;
-                let h2 = ((addr_add >> 32) & 0xFFFF) as u16;
-                let h3 = ((addr_add >> 48) & 0xFFFF) as u16;
-
-                bitwise_lookups.push((
-                    bitwise::BitwiseLookup::IsHalf,
-                    (h0 & 0xFF) as u8,
-                    (h0 >> 8) as u8,
-                    0,
-                ));
-                bitwise_lookups.push((
-                    bitwise::BitwiseLookup::IsHalf,
-                    (h1 & 0xFF) as u8,
-                    (h1 >> 8) as u8,
-                    0,
-                ));
-                bitwise_lookups.push((
-                    bitwise::BitwiseLookup::IsHalf,
-                    (h2 & 0xFF) as u8,
-                    (h2 >> 8) as u8,
-                    0,
-                ));
-                bitwise_lookups.push((
-                    bitwise::BitwiseLookup::IsHalf,
-                    (h3 & 0xFF) as u8,
-                    (h3 >> 8) as u8,
-                    0,
-                ));
-            }
         }
 
         // Update bitwise multiplicities after all lookups are collected
