@@ -81,18 +81,18 @@ w4 := write4 + write8
 | `4` | template | i ∈ [1, 2] | `ADD<address_add[i]::DWordWL; base_address, i + 1>` | w4 |
 | `5` | template | i ∈ [3, 6] | `ADD<address_add[i]::DWordWL; base_address, i + 1>` | write8 |
 | `6` | interaction | i ∈ [0, 6], j ∈ [0, 3] | `IS_HALFWORD[address_add[i][j]]` |  |
-| `7` | interaction |  | `LT[1; old_timestamp[0], timestamp]` | μ_sum |
-| `8` | interaction |  | `LT[1; old_timestamp[1], timestamp]` | w2 |
-| `9` | interaction | i ∈ [2, 3] | `LT[1; old_timestamp[i], timestamp]` | w4 |
-| `10` | interaction | i ∈ [4, 7] | `LT[1; old_timestamp[i], timestamp]` | write8 |
+| `7` | interaction |  | `LT[1; old_timestamp[0], timestamp, 0]` | μ_sum |
+| `8` | interaction |  | `LT[1; old_timestamp[1], timestamp, 0]` | w2 |
+| `9` | interaction | i ∈ [2, 3] | `LT[1; old_timestamp[i], timestamp, 0]` | w4 |
+| `10` | interaction | i ∈ [4, 7] | `LT[1; old_timestamp[i], timestamp, 0]` | write8 |
 
 ### overflow
 
 | Ref | Kind | Description | Multiplicity |
 |-----|------|-------------|--------------|
-| `R1` | interaction | `LT[1; base_address, address_add[0]::DWordWL]` | write2 |
-| `R2` | interaction | `LT[1; base_address, address_add[2]::DWordWL]` | write4 |
-| `R3` | interaction | `LT[1; base_address, address_add[6]::DWordWL]` | write8 |
+| `R1` | interaction | `LT[1; base_address, address_add[0]::DWordWL, 0]` | write2 |
+| `R2` | interaction | `LT[1; base_address, address_add[2]::DWordWL, 0]` | write4 |
+| `R3` | interaction | `LT[1; base_address, address_add[6]::DWordWL, 0]` | write8 |
 
 ### memory
 

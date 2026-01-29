@@ -52,8 +52,8 @@ unsigned_lt := carry[1]
 
 | Ref | Range | Description |
 |-----|-------|-------------|
-| `lt:a:range_lhs` | i ∈ [1, 2] | `IS_HALFWORD[lhs[i]]` and `IS_WORD[lhs[0]]` |
-| `lt:a:range_rhs` | i ∈ [1, 2] | `IS_HALFWORD[rhs[i]]` and `IS_WORD[rhs[0]]` |
+| `lt:a:range_lhs` |  | `IS_WORD[lhs[0]]` |
+| `lt:a:range_rhs` |  | `IS_WORD[rhs[0]]` |
 | `lt:a:range_signed` |  | `IS_BIT<signed>` |
 
 ## Constraints
@@ -68,6 +68,8 @@ _Enforce that variables have been correctly computed_
 | `lt:c:lt` | arith | `lt` = `signed` dot (A (1 - B) + A C + (1 - B) C) + (1 - `signed`) dot `unsigned_lt` |  |
 | | | _polynomial:_ `lt - signed * (lhs_msb * (1 - rhs_msb) + lhs_msb * carry[1] + (1 - rhs_msb) * carry[1]) - (1 - signed) * unsigned_lt = 0` | |
 | | | _note:_ Where $A = #`lhs_msb`$, $B = #`rhs_msb`$ and $C = #`carry[1]`$ | |
+| `lt:c:range_lhs` | interaction | `IS_HALFWORD[lhs[1]]` | μ |
+| `lt:c:range_rhs` | interaction | `IS_HALFWORD[rhs[1]]` | μ |
 
 ### sub
 _Constrain the subtraction_
@@ -82,4 +84,4 @@ _Each row contributes the following to the LogUp sum_
 
 | Ref | Kind | Description | Multiplicity |
 |-----|------|-------------|--------------|
-| `1` | interaction | `LT[lt; lhs, rhs, signed]` | -μ |
+| `1` | interaction | `LT[lt; lhs::DWordWL, rhs::DWordWL, signed]` | -μ |
