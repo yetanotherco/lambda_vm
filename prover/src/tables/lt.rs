@@ -191,8 +191,6 @@ pub fn generate_lt_trace(
         data[base + cols::MU] = FE::from(*multiplicity);
     }
 
-    // Padding rows have MU = 0, so they don't contribute to bus interactions
-
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
 }
 

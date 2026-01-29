@@ -78,12 +78,15 @@ pub enum BusId {
     Shift,
 
     // =========================================================================
-    // Memory/Control (separate tables, Phase 5)
+    // Memory/Control
     // =========================================================================
-    /// Memory word read/write with timestamps
+    /// Memory word read/write with timestamps (lookup bus from CPU)
     Memw,
-    /// Memory load with sign/zero extension
+    /// Memory load with sign/zero extension (lookup bus from CPU)
     Load,
+    /// Internal memory consistency bus: memory[is_register, address, timestamp, value]
+    /// Used for read/write pairing in MEMW table (M1-M8 in spec)
+    Memory,
     /// Branch target computation
     Branch,
 
