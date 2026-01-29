@@ -298,13 +298,18 @@ fn test_bus_interactions_count() {
     // - 1 MSB8 (res_sign_bit)
     // - 1 ZERO (is_equal for BEQ)
     // - 1 LT (less-than comparison)
-    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 = 29
-    assert_eq!(interactions.len(), 29);
+    // - 1 M1 (MEMW read rs1 register)
+    // - 1 M3 (MEMW read rs2 register)
+    // - 1 M5 (MEMW write rd register)
+    // - 1 M6 (LOAD from memory)
+    // - 1 M7 (STORE to memory)
+    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 5 = 34
+    assert_eq!(interactions.len(), 34);
 }
 
 #[test]
 fn test_column_count() {
-    assert_eq!(cols::NUM_COLUMNS, 72);
+    assert_eq!(cols::NUM_COLUMNS, 74);
 }
 
 #[test]

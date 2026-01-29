@@ -5,7 +5,8 @@ edition = "2024"
 
 [features]
 default = ["parallel"]
-parallel = ["stark/parallel", "math/parallel", "crypto/parallel"]
+parallel = ["stark/parallel", "math/parallel", "crypto/parallel", "dep:rayon"]
+dhat-heap = ["dhat"]
 
 [dependencies]
 stark = { path = "../crypto/stark" }
@@ -13,6 +14,8 @@ crypto = { path = "../crypto/crypto" }
 math = { path = "../crypto/math" }
 executor = { path = "../executor" }
 lazy_static = "1.5.0"
+dhat = { version = "0.3", optional = true }
+rayon = { version = "1.8.0", optional = true }
 
 [dev-dependencies]
 env_logger = "*"
