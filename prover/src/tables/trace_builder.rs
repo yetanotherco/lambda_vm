@@ -31,7 +31,7 @@ use executor::vm::logs::Log;
 use executor::vm::memory::U64HashMap;
 use stark::trace::TraceTable;
 
-use super::bitwise::{self, BitwiseLookup};
+use super::bitwise::{self, BitwiseOperation, BitwiseOperationType};
 use super::cpu::{self, CpuOperation};
 use super::load::{self, LoadOperation};
 use super::lt::{self, LtOperation};
@@ -147,64 +147,31 @@ fn pack_register_value(value: u64) -> [u64; 8] {
 }
 
 // =============================================================================
-// Collection Context
-// =============================================================================
-
-/// Central context for collecting all operations during trace generation.
-struct CollectionContext<'a> {
-    // References to input data
-    logs: &'a [Log],
-    instructions: &'a U64HashMap<Instruction>,
-
-    // Collected operations
-    cpu_ops: Vec<CpuOperation>,
-    lt_ops: Vec<LtOperation>,
-    memw_ops: Vec<MemwOperation>,
-    load_ops: Vec<LoadOperation>,
-    bitwise_lookups: Vec<(BitwiseLookup, u8, u8, u8)>,
-
-    // State trackers
-    memory_state: MemoryState,
-    register_state: RegisterState,
-}
-
-impl<'a> CollectionContext<'a> {
-    /// Creates a new collection context.
-    fn new(logs: &'a [Log], instructions: &'a U64HashMap<Instruction>) -> Self {
-        Self {
-            logs,
-            instructions,
-            cpu_ops: Vec::with_capacity(logs.len()),
-            lt_ops: Vec::with_capacity(logs.len() / 10 + 1),
-            memw_ops: Vec::with_capacity(logs.len() * 3),
-            load_ops: Vec::with_capacity(logs.len() / 8 + 1),
-            bitwise_lookups: Vec::with_capacity(logs.len() * 4),
-            memory_state: MemoryState::new(),
-            register_state: RegisterState::new(),
-        }
-    }
-}
-
-// =============================================================================
 // Phase 1: Logs → CPU ops
 // =============================================================================
 
 /// Collects CPU operations from execution logs.
-fn collect_cpu_ops(ctx: &mut CollectionContext) -> Result<(), ProverError> {
+///
+/// Returns a vector of CpuOperation, one per log entry.
+fn collect_cpu_ops(
+    logs: &[Log],
+    instructions: &U64HashMap<Instruction>,
+) -> Result<Vec<CpuOperation>, ProverError> {
+    let mut cpu_ops = Vec::with_capacity(logs.len());
+
     // Timestamps start at 4 (not 0) to ensure old_timestamp < timestamp holds
     // for the first access to any register/memory location (where old_timestamp=0).
-    for (i, log) in ctx.logs.iter().enumerate() {
+    for (i, log) in logs.iter().enumerate() {
         let timestamp = (i as u64) * 4 + 4;
-        let instruction = ctx
-            .instructions
+        let instruction = instructions
             .get(&log.current_pc)
             .copied()
             .ok_or(ProverError::MissingInstruction(log.current_pc))?;
 
         let op = CpuOperation::from_log(log, timestamp, instruction);
-        ctx.cpu_ops.push(op);
+        cpu_ops.push(op);
     }
-    Ok(())
+    Ok(cpu_ops)
 }
 
 // =============================================================================
@@ -220,24 +187,40 @@ fn collect_cpu_ops(ctx: &mut CollectionContext) -> Result<(), ProverError> {
 /// - Bitwise lookups (from CPU operations)
 ///
 /// MEMW and LOAD collection requires sequential processing with state tracking.
-fn collect_ops_from_cpu(ctx: &mut CollectionContext) {
-    // Iterate by index to avoid borrow checker issues (we need mutable access to ctx
-    // while iterating over cpu_ops)
-    for i in 0..ctx.cpu_ops.len() {
-        // Clone the operation to avoid borrowing issues
-        let op = ctx.cpu_ops[i].clone();
+///
+/// Returns: (memw_ops, load_ops, lt_ops, bitwise_ops)
+fn collect_ops_from_cpu(
+    cpu_ops: &[CpuOperation],
+    memory_state: &mut MemoryState,
+    register_state: &mut RegisterState,
+) -> (
+    Vec<MemwOperation>,
+    Vec<LoadOperation>,
+    Vec<LtOperation>,
+    Vec<BitwiseOperation>,
+) {
+    let mut memw_ops = Vec::with_capacity(cpu_ops.len() * 3);
+    let mut load_ops = Vec::with_capacity(cpu_ops.len() / 8 + 1);
+    let mut lt_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
+    let mut bitwise_ops = Vec::with_capacity(cpu_ops.len() * 4);
 
+    for op in cpu_ops {
         // --- MEMW and LOAD (require state tracking, order matters) ---
 
         // Collect memory operations for Load/Store instructions
         if op.op_load {
-            collect_load_op_from_cpu(ctx, &op);
+            let (memw_op, load_op, lookups) = collect_load_op_from_cpu(op, memory_state);
+            memw_ops.push(memw_op);
+            load_ops.push(load_op);
+            bitwise_ops.extend(lookups);
         } else if op.op_store {
-            collect_store_op_from_cpu(ctx, &op);
+            let memw_op = collect_store_op_from_cpu(op, memory_state);
+            memw_ops.push(memw_op);
         }
 
         // Collect register operations (M1, M3, M5)
-        collect_register_ops_from_cpu(ctx, &op);
+        let reg_memw_ops = collect_register_ops_from_cpu(op, register_state);
+        memw_ops.extend(reg_memw_ops);
 
         // --- LT and Bitwise (no state tracking needed) ---
 
@@ -245,16 +228,23 @@ fn collect_ops_from_cpu(ctx: &mut CollectionContext) {
         if op.op_slt || op.op_blt {
             let arg1 = op.compute_arg1();
             let arg2 = op.compute_arg2();
-            ctx.lt_ops.push(LtOperation::new(arg1, arg2, op.signed));
+            lt_ops.push(LtOperation::new(arg1, arg2, op.signed));
         }
 
         // Collect bitwise lookups
-        ctx.bitwise_lookups.extend(op.collect_bitwise_lookups());
+        bitwise_ops.extend(op.collect_bitwise_ops());
     }
+
+    (memw_ops, load_ops, lt_ops, bitwise_ops)
 }
 
 /// Collects a LOAD operation and corresponding MEMW read from CpuOperation.
-fn collect_load_op_from_cpu(ctx: &mut CollectionContext, op: &CpuOperation) {
+///
+/// Returns: (memw_op, load_op, bitwise_ops)
+fn collect_load_op_from_cpu(
+    op: &CpuOperation,
+    memory_state: &mut MemoryState,
+) -> (MemwOperation, LoadOperation, Vec<BitwiseOperation>) {
     // res contains the effective address (base + offset)
     let base_address = op.res;
     let (byte_count, signed) = cpu_op_to_bytes_and_signed(op);
@@ -262,7 +252,7 @@ fn collect_load_op_from_cpu(ctx: &mut CollectionContext, op: &CpuOperation) {
     let loaded_value = op.rvd;
 
     // Read old timestamps from memory state
-    let (_old_values, old_timestamps) = ctx.memory_state.read_bytes(base_address, 8);
+    let (_old_values, old_timestamps) = memory_state.read_bytes(base_address, 8);
 
     // Extract individual bytes from loaded value
     let mut value_bytes = [0u64; 8];
@@ -291,7 +281,6 @@ fn collect_load_op_from_cpu(ctx: &mut CollectionContext, op: &CpuOperation) {
         true, // is_read = true
     )
     .with_old(res_bytes, old_timestamps);
-    ctx.memw_ops.push(memw_op);
 
     // Create LOAD operation
     let load_op = LoadOperation::new(
@@ -301,18 +290,20 @@ fn collect_load_op_from_cpu(ctx: &mut CollectionContext, op: &CpuOperation) {
         signed,
         res_bytes,
     );
+
     // Collect MSB8 lookups for sign bit extraction
-    ctx.bitwise_lookups
-        .extend(load_op.collect_bitwise_lookups());
-    ctx.load_ops.push(load_op);
+    let bitwise_ops = load_op.collect_bitwise_ops();
 
     // Update memory state
-    ctx.memory_state
-        .write_bytes(base_address, loaded_value, byte_count, op.timestamp);
+    memory_state.write_bytes(base_address, loaded_value, byte_count, op.timestamp);
+
+    (memw_op, load_op, bitwise_ops)
 }
 
 /// Collects a STORE operation as a MEMW write from CpuOperation.
-fn collect_store_op_from_cpu(ctx: &mut CollectionContext, op: &CpuOperation) {
+///
+/// Returns: memw_op
+fn collect_store_op_from_cpu(op: &CpuOperation, memory_state: &mut MemoryState) -> MemwOperation {
     // res contains the effective address (base + offset)
     let base_address = op.res;
     let (byte_count, _) = cpu_op_to_bytes_and_signed(op);
@@ -320,7 +311,7 @@ fn collect_store_op_from_cpu(ctx: &mut CollectionContext, op: &CpuOperation) {
     let store_value = op.rv2;
 
     // Read old values and timestamps
-    let (old_values, old_timestamps) = ctx.memory_state.read_bytes(base_address, 8);
+    let (old_values, old_timestamps) = memory_state.read_bytes(base_address, 8);
 
     // Pack store value as [lo32, hi32, 0, 0, 0, 0, 0, 0] to match CPU M7
     let value_bytes = [
@@ -344,54 +335,63 @@ fn collect_store_op_from_cpu(ctx: &mut CollectionContext, op: &CpuOperation) {
         false, // is_read = false (write)
     )
     .with_old(old_values, old_timestamps);
-    ctx.memw_ops.push(memw_op);
 
     // Update memory state (using timestamp+1 to match M7)
-    ctx.memory_state
-        .write_bytes(base_address, store_value, byte_count, op.timestamp + 1);
+    memory_state.write_bytes(base_address, store_value, byte_count, op.timestamp + 1);
+
+    memw_op
 }
 
 /// Collects register read/write operations (M1, M3, M5) from CpuOperation.
-fn collect_register_ops_from_cpu(ctx: &mut CollectionContext, op: &CpuOperation) {
+///
+/// Returns: Vec of MEMW operations for register accesses
+fn collect_register_ops_from_cpu(
+    op: &CpuOperation,
+    register_state: &mut RegisterState,
+) -> Vec<MemwOperation> {
+    let mut memw_ops = Vec::with_capacity(3);
+
     // M1: Read rs1 register at timestamp+0
     if op.read_register1 && op.rs1 != 0 {
         let reg_value = pack_register_value(op.rv1);
         let reg_addr = 2 * op.rs1 as u64;
-        let (_old_val, old_ts) = ctx.register_state.read(op.rs1);
+        let (_old_val, old_ts) = register_state.read(op.rs1);
         let old_timestamps = [old_ts; 8];
 
         let memw_op = MemwOperation::new(true, reg_addr, reg_value, op.timestamp, 8, true)
             .with_old(reg_value, old_timestamps);
-        ctx.memw_ops.push(memw_op);
-        ctx.register_state.write(op.rs1, op.rv1, op.timestamp);
+        memw_ops.push(memw_op);
+        register_state.write(op.rs1, op.rv1, op.timestamp);
     }
 
     // M3: Read rs2 register at timestamp+1
     if op.read_register2 && op.rs2 != 0 {
         let reg_value = pack_register_value(op.rv2);
         let reg_addr = 2 * op.rs2 as u64;
-        let (_old_val, old_ts) = ctx.register_state.read(op.rs2);
+        let (_old_val, old_ts) = register_state.read(op.rs2);
         let old_timestamps = [old_ts; 8];
 
         let memw_op = MemwOperation::new(true, reg_addr, reg_value, op.timestamp + 1, 8, true)
             .with_old(reg_value, old_timestamps);
-        ctx.memw_ops.push(memw_op);
-        ctx.register_state.write(op.rs2, op.rv2, op.timestamp + 1);
+        memw_ops.push(memw_op);
+        register_state.write(op.rs2, op.rv2, op.timestamp + 1);
     }
 
     // M5: Write rd register at timestamp+2
     if op.write_register && op.rd != 0 {
         let reg_value = pack_register_value(op.rvd);
         let reg_addr = 2 * op.rd as u64;
-        let (old_val, old_ts) = ctx.register_state.read(op.rd);
+        let (old_val, old_ts) = register_state.read(op.rd);
         let old_value = pack_register_value(old_val);
         let old_timestamps = [old_ts; 8];
 
         let memw_op = MemwOperation::new(true, reg_addr, reg_value, op.timestamp + 2, 8, false)
             .with_old(old_value, old_timestamps);
-        ctx.memw_ops.push(memw_op);
-        ctx.register_state.write(op.rd, op.rvd, op.timestamp + 2);
+        memw_ops.push(memw_op);
+        register_state.write(op.rd, op.rvd, op.timestamp + 2);
     }
+
+    memw_ops
 }
 
 // =============================================================================
@@ -403,10 +403,14 @@ fn collect_register_ops_from_cpu(ctx: &mut CollectionContext, op: &CpuOperation)
 /// From spec memw.md:
 /// - C7-C10: old_timestamp[i] < timestamp (based on width)
 /// - R1-R3: base_address < base_address + offset (overflow checks)
-fn collect_lt_from_memw(ctx: &mut CollectionContext) {
-    for memw_op in &ctx.memw_ops {
+///
+/// Returns: Vec of LT operations
+fn collect_lt_from_memw(memw_ops: &[MemwOperation]) -> Vec<LtOperation> {
+    let mut lt_ops = Vec::with_capacity(memw_ops.len() * 8);
+
+    for memw_op in memw_ops {
         // C7: old_timestamp[0] < timestamp (all accesses)
-        ctx.lt_ops.push(LtOperation::new(
+        lt_ops.push(LtOperation::new(
             memw_op.old_timestamp[0],
             memw_op.timestamp,
             false,
@@ -414,7 +418,7 @@ fn collect_lt_from_memw(ctx: &mut CollectionContext) {
 
         // C8: old_timestamp[1] < timestamp (width >= 2)
         if memw_op.width >= 2 {
-            ctx.lt_ops.push(LtOperation::new(
+            lt_ops.push(LtOperation::new(
                 memw_op.old_timestamp[1],
                 memw_op.timestamp,
                 false,
@@ -423,12 +427,12 @@ fn collect_lt_from_memw(ctx: &mut CollectionContext) {
 
         // C9: old_timestamp[2,3] < timestamp (width >= 4)
         if memw_op.width >= 4 {
-            ctx.lt_ops.push(LtOperation::new(
+            lt_ops.push(LtOperation::new(
                 memw_op.old_timestamp[2],
                 memw_op.timestamp,
                 false,
             ));
-            ctx.lt_ops.push(LtOperation::new(
+            lt_ops.push(LtOperation::new(
                 memw_op.old_timestamp[3],
                 memw_op.timestamp,
                 false,
@@ -438,7 +442,7 @@ fn collect_lt_from_memw(ctx: &mut CollectionContext) {
         // C10: old_timestamp[4..7] < timestamp (width == 8)
         if memw_op.width == 8 {
             for i in 4..8 {
-                ctx.lt_ops.push(LtOperation::new(
+                lt_ops.push(LtOperation::new(
                     memw_op.old_timestamp[i],
                     memw_op.timestamp,
                     false,
@@ -450,25 +454,24 @@ fn collect_lt_from_memw(ctx: &mut CollectionContext) {
         if memw_op.width == 2 {
             let addr_plus_1 = memw_op.base_address.wrapping_add(1);
             if addr_plus_1 > memw_op.base_address {
-                ctx.lt_ops
-                    .push(LtOperation::new(memw_op.base_address, addr_plus_1, false));
+                lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_1, false));
             }
         }
         if memw_op.width == 4 {
             let addr_plus_3 = memw_op.base_address.wrapping_add(3);
             if addr_plus_3 > memw_op.base_address {
-                ctx.lt_ops
-                    .push(LtOperation::new(memw_op.base_address, addr_plus_3, false));
+                lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_3, false));
             }
         }
         if memw_op.width == 8 {
             let addr_plus_7 = memw_op.base_address.wrapping_add(7);
             if addr_plus_7 > memw_op.base_address {
-                ctx.lt_ops
-                    .push(LtOperation::new(memw_op.base_address, addr_plus_7, false));
+                lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_7, false));
             }
         }
     }
+
+    lt_ops
 }
 
 // =============================================================================
@@ -476,72 +479,78 @@ fn collect_lt_from_memw(ctx: &mut CollectionContext) {
 // =============================================================================
 
 /// Collects bitwise lookups from LT operations (MSB16 and IS_HALFWORD).
-fn collect_bitwise_from_lt(ctx: &mut CollectionContext) {
-    for op in &ctx.lt_ops {
+///
+/// Returns: Vec of bitwise lookups
+fn collect_bitwise_from_lt(lt_ops: &[LtOperation]) -> Vec<BitwiseOperation> {
+    let mut bitwise_ops = Vec::with_capacity(lt_ops.len() * 8);
+
+    for op in lt_ops {
         // MSB16 lookups for lhs[2] and rhs[2]
         let lhs_2 = ((op.lhs >> 48) & 0xFFFF) as u16;
         let rhs_2 = ((op.rhs >> 48) & 0xFFFF) as u16;
 
-        ctx.bitwise_lookups.push((
-            BitwiseLookup::Msb16,
+        bitwise_ops.push(BitwiseOperation::halfword(
+            BitwiseOperationType::Msb16,
             (lhs_2 & 0xFF) as u8,
             (lhs_2 >> 8) as u8,
-            0,
         ));
-        ctx.bitwise_lookups.push((
-            BitwiseLookup::Msb16,
+        bitwise_ops.push(BitwiseOperation::halfword(
+            BitwiseOperationType::Msb16,
             (rhs_2 & 0xFF) as u8,
             (rhs_2 >> 8) as u8,
-            0,
         ));
 
         // IS_HALFWORD lookups for lhs_sub_rhs[0..4]
         let lhs_sub_rhs = op.lhs.wrapping_sub(op.rhs);
         for shift in [0, 16, 32, 48] {
             let half = ((lhs_sub_rhs >> shift) & 0xFFFF) as u16;
-            ctx.bitwise_lookups.push((
-                BitwiseLookup::IsHalf,
+            bitwise_ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
                 (half & 0xFF) as u8,
                 (half >> 8) as u8,
-                0,
             ));
         }
 
         // IS_HALFWORD lookups for lhs[1] and rhs[1]
         let lhs_1 = ((op.lhs >> 32) & 0xFFFF) as u16;
         let rhs_1 = ((op.rhs >> 32) & 0xFFFF) as u16;
-        ctx.bitwise_lookups.push((
-            BitwiseLookup::IsHalf,
+        bitwise_ops.push(BitwiseOperation::halfword(
+            BitwiseOperationType::IsHalf,
             (lhs_1 & 0xFF) as u8,
             (lhs_1 >> 8) as u8,
-            0,
         ));
-        ctx.bitwise_lookups.push((
-            BitwiseLookup::IsHalf,
+        bitwise_ops.push(BitwiseOperation::halfword(
+            BitwiseOperationType::IsHalf,
             (rhs_1 & 0xFF) as u8,
             (rhs_1 >> 8) as u8,
-            0,
         ));
     }
+
+    bitwise_ops
 }
 
 /// Collects IS_HALFWORD lookups from MEMW address_add columns.
-fn collect_bitwise_from_memw(ctx: &mut CollectionContext) {
-    for memw_op in &ctx.memw_ops {
+///
+/// Returns: Vec of bitwise lookups
+fn collect_bitwise_from_memw(memw_ops: &[MemwOperation]) -> Vec<BitwiseOperation> {
+    let mut bitwise_ops = Vec::with_capacity(memw_ops.len() * 28); // 7 addresses * 4 halfwords
+
+    for memw_op in memw_ops {
         for i in 0..7u64 {
             let addr_add = memw_op.base_address.wrapping_add(i + 1);
             // Extract 4 halfwords (DWordHL packing)
             for shift in [0, 16, 32, 48] {
                 let half = ((addr_add >> shift) & 0xFFFF) as u16;
-                ctx.bitwise_lookups.push((
-                    BitwiseLookup::IsHalf,
+                bitwise_ops.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::IsHalf,
                     (half & 0xFF) as u8,
                     (half >> 8) as u8,
-                    0,
                 ));
             }
         }
     }
+
+    bitwise_ops
 }
 
 // =============================================================================
@@ -579,40 +588,41 @@ impl Traces {
         logs: &[Log],
         instructions: U64HashMap<Instruction>,
     ) -> Result<Self, ProverError> {
-        let mut ctx = CollectionContext::new(logs, &instructions);
-
         // =====================================================================
         // PHASE 1: Logs → CPU operations
         // =====================================================================
-        collect_cpu_ops(&mut ctx)?;
+        let cpu_ops = collect_cpu_ops(logs, &instructions)?;
 
         // =====================================================================
         // PHASE 2: CPU ops → MEMW, LOAD, LT, Bitwise
         // =====================================================================
         // Processes cpu_ops in order. MEMW/LOAD need state tracking, LT/Bitwise don't.
-        collect_ops_from_cpu(&mut ctx);
+        let mut memory_state = MemoryState::new();
+        let mut register_state = RegisterState::new();
+        let (memw_ops, load_ops, mut lt_ops, mut bitwise_ops) =
+            collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
 
         // =====================================================================
         // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
         // =====================================================================
-        collect_lt_from_memw(&mut ctx);
+        lt_ops.extend(collect_lt_from_memw(&memw_ops));
 
         // =====================================================================
         // PHASE 4: All → Bitwise lookups
         // =====================================================================
-        collect_bitwise_from_lt(&mut ctx);
-        collect_bitwise_from_memw(&mut ctx);
+        bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
+        bitwise_ops.extend(collect_bitwise_from_memw(&memw_ops));
 
         // =====================================================================
         // PHASE 5: Generate final traces
         // =====================================================================
-        let cpu = cpu::generate_cpu_trace(&ctx.cpu_ops);
-        let lt = lt::generate_lt_trace(&ctx.lt_ops);
-        let memw = memw::generate_memw_trace(&ctx.memw_ops);
-        let load = load::generate_load_trace(&ctx.load_ops);
+        let cpu = cpu::generate_cpu_trace(&cpu_ops);
+        let lt = lt::generate_lt_trace(&lt_ops);
+        let memw = memw::generate_memw_trace(&memw_ops);
+        let load = load::generate_load_trace(&load_ops);
 
         let mut bitwise = bitwise::generate_bitwise_trace();
-        bitwise::update_multiplicities(&mut bitwise, &ctx.bitwise_lookups);
+        bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
 
         Ok(Traces {
             cpu,
