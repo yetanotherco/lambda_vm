@@ -48,8 +48,8 @@ jobs:
           echo "::add-mask::${{ secrets.KIMI_API_KEY }}"
 
           if [ -z "${{ secrets.KIMI_API_KEY }}" ]; then
-            echo "error=true" >> $GITHUB_OUTPUT
-            echo "error_message=KIMI_API_KEY secret is not set" >> $GITHUB_OUTPUT
+            echo "error=true" >> "$GITHUB_OUTPUT"
+            echo "error_message=KIMI_API_KEY secret is not set" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -93,22 +93,22 @@ jobs:
           BODY=$(echo "$RESPONSE" | sed '$d')
 
           if [ "$HTTP_CODE" != "200" ]; then
-            echo "error=true" >> $GITHUB_OUTPUT
-            echo "error_message=Kimi API request failed with status $HTTP_CODE" >> $GITHUB_OUTPUT
+            echo "error=true" >> "$GITHUB_OUTPUT"
+            echo "error_message=Kimi API request failed with status $HTTP_CODE" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           # Check for API error without logging the message (may contain sensitive data)
           HAS_ERROR=$(echo "$BODY" | jq -e '.error.message' > /dev/null 2>&1 && echo "yes" || echo "no")
           if [ "$HAS_ERROR" = "yes" ]; then
-            echo "error=true" >> $GITHUB_OUTPUT
-            echo "error_message=Kimi API returned an error response" >> $GITHUB_OUTPUT
+            echo "error=true" >> "$GITHUB_OUTPUT"
+            echo "error_message=Kimi API returned an error response" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           REVIEW=$(echo "$BODY" | jq -r '.choices[0].message.content // "Error: Unexpected API response"')
           echo "$REVIEW" > /tmp/review.txt
-          echo "success=true" >> $GITHUB_OUTPUT
+          echo "success=true" >> "$GITHUB_OUTPUT"
 
       - name: Post review comment
         if: steps.kimi_review.outputs.success == 'true'
