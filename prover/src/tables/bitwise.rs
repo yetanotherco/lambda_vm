@@ -378,25 +378,25 @@ pub fn row_index(x: u8, y: u8, z: u8) -> usize {
 ///
 /// # Arguments
 /// * `trace` - The BITWISE trace table to update
-/// * `lookups` - Vector of (lookup_type, x, y, z) tuples
+/// * `lookups` - Vector of BitwiseOperation requests
 pub fn update_multiplicities(
     trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>,
-    lookups: &[(BitwiseLookup, u8, u8, u8)],
+    lookups: &[BitwiseOperation],
 ) {
-    for (lookup_type, x, y, z) in lookups {
-        let row = row_index(*x, *y, *z);
-        let mu_col = match lookup_type {
-            BitwiseLookup::AndByte => cols::MU_AND,
-            BitwiseLookup::OrByte => cols::MU_OR,
-            BitwiseLookup::XorByte => cols::MU_XOR,
-            BitwiseLookup::Msb8 => cols::MU_MSB8,
-            BitwiseLookup::Msb16 => cols::MU_MSB16,
-            BitwiseLookup::Zero => cols::MU_ZERO,
-            BitwiseLookup::IsByte => cols::MU_IS_BYTE,
-            BitwiseLookup::IsHalf => cols::MU_IS_HALF,
-            BitwiseLookup::IsB20 => cols::MU_IS_B20,
-            BitwiseLookup::Hwsl => cols::MU_HWSL,
-            BitwiseLookup::Hwslc => cols::MU_HWSLC,
+    for lookup in lookups {
+        let row = row_index(lookup.lo_byte, lookup.hi_byte, lookup.shift);
+        let mu_col = match lookup.lookup_type {
+            BitwiseOperationType::AndByte => cols::MU_AND,
+            BitwiseOperationType::OrByte => cols::MU_OR,
+            BitwiseOperationType::XorByte => cols::MU_XOR,
+            BitwiseOperationType::Msb8 => cols::MU_MSB8,
+            BitwiseOperationType::Msb16 => cols::MU_MSB16,
+            BitwiseOperationType::Zero => cols::MU_ZERO,
+            BitwiseOperationType::IsByte => cols::MU_IS_BYTE,
+            BitwiseOperationType::IsHalf => cols::MU_IS_HALF,
+            BitwiseOperationType::IsB20 => cols::MU_IS_B20,
+            BitwiseOperationType::Hwsl => cols::MU_HWSL,
+            BitwiseOperationType::Hwslc => cols::MU_HWSLC,
         };
 
         // Increment multiplicity
@@ -463,7 +463,7 @@ pub fn trim_zero_rows(
 
 /// Types of lookups the BITWISE table provides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum BitwiseLookup {
+pub enum BitwiseOperationType {
     AndByte,
     OrByte,
     XorByte,
@@ -475,6 +475,64 @@ pub enum BitwiseLookup {
     IsB20,
     Hwsl,
     Hwslc,
+}
+
+/// A lookup request to the BITWISE precomputed table.
+///
+/// The BITWISE table has 2^20 rows indexed by `(lo_byte, hi_byte, shift)`.
+/// Each row contains precomputed results for various operations.
+///
+/// # Fields
+/// - `lookup_type`: Which operation result to look up
+/// - `lo_byte`: Low byte input (0-255), used as X in table
+/// - `hi_byte`: High byte input (0-255), used as Y in table
+/// - `shift`: 4-bit shift amount (0-15), only used for HWSL/HWSLC operations
+///
+/// # How inputs map to operations
+/// - AND/OR/XOR: `lo_byte OP hi_byte`
+/// - MSB8: MSB of `lo_byte`
+/// - MSB16: MSB of halfword `lo_byte + hi_byte * 256`
+/// - IS_BYTE/IS_HALF: Range check on `lo_byte + hi_byte * 256`
+/// - HWSL/HWSLC: Shift `lo_byte + hi_byte * 256` by `shift` bits
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BitwiseOperation {
+    pub lookup_type: BitwiseOperationType,
+    pub lo_byte: u8,
+    pub hi_byte: u8,
+    pub shift: u8,
+}
+
+impl BitwiseOperation {
+    /// Create a new bitwise lookup.
+    pub fn new(lookup_type: BitwiseOperationType, lo_byte: u8, hi_byte: u8, shift: u8) -> Self {
+        debug_assert!(shift < 16, "shift must be in range [0, 16)");
+        Self {
+            lookup_type,
+            lo_byte,
+            hi_byte,
+            shift,
+        }
+    }
+
+    /// Create a lookup for byte operations (AND, OR, XOR) where shift is unused.
+    pub fn byte_op(lookup_type: BitwiseOperationType, a: u8, b: u8) -> Self {
+        Self::new(lookup_type, a, b, 0)
+    }
+
+    /// Create a lookup for single-byte operations (MSB8, IS_BYTE).
+    pub fn single_byte(lookup_type: BitwiseOperationType, byte: u8) -> Self {
+        Self::new(lookup_type, byte, 0, 0)
+    }
+
+    /// Create a lookup for halfword operations (MSB16, IS_HALF, ZERO).
+    pub fn halfword(lookup_type: BitwiseOperationType, lo: u8, hi: u8) -> Self {
+        Self::new(lookup_type, lo, hi, 0)
+    }
+
+    /// Create a lookup for shift operations (HWSL, HWSLC).
+    pub fn shift_op(lookup_type: BitwiseOperationType, lo: u8, hi: u8, shift: u8) -> Self {
+        Self::new(lookup_type, lo, hi, shift)
+    }
 }
 
 // =========================================================================
