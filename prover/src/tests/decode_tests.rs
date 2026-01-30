@@ -6,7 +6,7 @@ use executor::vm::memory::U64HashMap;
 use crate::tables::decode::{
     DecodeEntry, bus_interactions, cols, generate_decode_trace, update_multiplicities,
 };
-use crate::tables::types::{packed_decode as bits, FE};
+use crate::tables::types::{FE, packed_decode as bits};
 
 // =========================================================================
 // Packed decode tests
@@ -21,62 +21,95 @@ fn test_packed_decode_flags() {
     // READ_REG1: excludes x0 and x255, so we need rs1 != 0 && rs1 != 255
     entry.read_register1 = true;
     entry.rs1 = 1;
-    assert_eq!(entry.packed_decode() & (1 << bits::READ_REG1), 1 << bits::READ_REG1);
+    assert_eq!(
+        entry.packed_decode() & (1 << bits::READ_REG1),
+        1 << bits::READ_REG1
+    );
     entry.read_register1 = false;
     entry.rs1 = 0;
 
     // READ_REG2: excludes x0, so we need rs2 != 0
     entry.read_register2 = true;
     entry.rs2 = 1;
-    assert_eq!(entry.packed_decode() & (1 << bits::READ_REG2), 1 << bits::READ_REG2);
+    assert_eq!(
+        entry.packed_decode() & (1 << bits::READ_REG2),
+        1 << bits::READ_REG2
+    );
     entry.read_register2 = false;
     entry.rs2 = 0;
 
     // WRITE_REG: excludes x0, so we need rd != 0
     entry.write_register = true;
     entry.rd = 1;
-    assert_eq!(entry.packed_decode() & (1 << bits::WRITE_REG), 1 << bits::WRITE_REG);
+    assert_eq!(
+        entry.packed_decode() & (1 << bits::WRITE_REG),
+        1 << bits::WRITE_REG
+    );
     entry.write_register = false;
     entry.rd = 0;
 
     // MEMORY_2BYTES
     entry.memory_2bytes = true;
-    assert_eq!(entry.packed_decode() & (1 << bits::MEMORY_2BYTES), 1 << bits::MEMORY_2BYTES);
+    assert_eq!(
+        entry.packed_decode() & (1 << bits::MEMORY_2BYTES),
+        1 << bits::MEMORY_2BYTES
+    );
     entry.memory_2bytes = false;
 
     // MEMORY_4BYTES
     entry.memory_4bytes = true;
-    assert_eq!(entry.packed_decode() & (1 << bits::MEMORY_4BYTES), 1 << bits::MEMORY_4BYTES);
+    assert_eq!(
+        entry.packed_decode() & (1 << bits::MEMORY_4BYTES),
+        1 << bits::MEMORY_4BYTES
+    );
     entry.memory_4bytes = false;
 
     // MEMORY_8BYTES
     entry.memory_8bytes = true;
-    assert_eq!(entry.packed_decode() & (1 << bits::MEMORY_8BYTES), 1 << bits::MEMORY_8BYTES);
+    assert_eq!(
+        entry.packed_decode() & (1 << bits::MEMORY_8BYTES),
+        1 << bits::MEMORY_8BYTES
+    );
     entry.memory_8bytes = false;
 
     // C_TYPE
     entry.c_type = true;
-    assert_eq!(entry.packed_decode() & (1 << bits::C_TYPE), 1 << bits::C_TYPE);
+    assert_eq!(
+        entry.packed_decode() & (1 << bits::C_TYPE),
+        1 << bits::C_TYPE
+    );
     entry.c_type = false;
 
     // SIGNED
     entry.signed = true;
-    assert_eq!(entry.packed_decode() & (1 << bits::SIGNED), 1 << bits::SIGNED);
+    assert_eq!(
+        entry.packed_decode() & (1 << bits::SIGNED),
+        1 << bits::SIGNED
+    );
     entry.signed = false;
 
     // MP_SELECTOR
     entry.mp_selector = true;
-    assert_eq!(entry.packed_decode() & (1 << bits::MP_SELECTOR), 1 << bits::MP_SELECTOR);
+    assert_eq!(
+        entry.packed_decode() & (1 << bits::MP_SELECTOR),
+        1 << bits::MP_SELECTOR
+    );
     entry.mp_selector = false;
 
     // MULDIV_SELECTOR
     entry.muldiv_selector = true;
-    assert_eq!(entry.packed_decode() & (1 << bits::MULDIV_SELECTOR), 1 << bits::MULDIV_SELECTOR);
+    assert_eq!(
+        entry.packed_decode() & (1 << bits::MULDIV_SELECTOR),
+        1 << bits::MULDIV_SELECTOR
+    );
     entry.muldiv_selector = false;
 
     // WORD_INSTR
     entry.word_instr = true;
-    assert_eq!(entry.packed_decode() & (1 << bits::WORD_INSTR), 1 << bits::WORD_INSTR);
+    assert_eq!(
+        entry.packed_decode() & (1 << bits::WORD_INSTR),
+        1 << bits::WORD_INSTR
+    );
     entry.word_instr = false;
 }
 
@@ -86,19 +119,31 @@ fn test_packed_decode_alu_flags() {
     let mut entry = DecodeEntry::new();
 
     entry.op_add = true;
-    assert_eq!(entry.packed_decode() & (1 << bits::OP_ADD), 1 << bits::OP_ADD);
+    assert_eq!(
+        entry.packed_decode() & (1 << bits::OP_ADD),
+        1 << bits::OP_ADD
+    );
     entry.op_add = false;
 
     entry.op_sub = true;
-    assert_eq!(entry.packed_decode() & (1 << bits::OP_SUB), 1 << bits::OP_SUB);
+    assert_eq!(
+        entry.packed_decode() & (1 << bits::OP_SUB),
+        1 << bits::OP_SUB
+    );
     entry.op_sub = false;
 
     entry.op_slt = true;
-    assert_eq!(entry.packed_decode() & (1 << bits::OP_SLT), 1 << bits::OP_SLT);
+    assert_eq!(
+        entry.packed_decode() & (1 << bits::OP_SLT),
+        1 << bits::OP_SLT
+    );
     entry.op_slt = false;
 
     entry.op_and = true;
-    assert_eq!(entry.packed_decode() & (1 << bits::OP_AND), 1 << bits::OP_AND);
+    assert_eq!(
+        entry.packed_decode() & (1 << bits::OP_AND),
+        1 << bits::OP_AND
+    );
     entry.op_and = false;
 
     entry.op_or = true;
@@ -106,47 +151,80 @@ fn test_packed_decode_alu_flags() {
     entry.op_or = false;
 
     entry.op_xor = true;
-    assert_eq!(entry.packed_decode() & (1 << bits::OP_XOR), 1 << bits::OP_XOR);
+    assert_eq!(
+        entry.packed_decode() & (1 << bits::OP_XOR),
+        1 << bits::OP_XOR
+    );
     entry.op_xor = false;
 
     entry.op_shift = true;
-    assert_eq!(entry.packed_decode() & (1 << bits::OP_SHIFT), 1 << bits::OP_SHIFT);
+    assert_eq!(
+        entry.packed_decode() & (1 << bits::OP_SHIFT),
+        1 << bits::OP_SHIFT
+    );
     entry.op_shift = false;
 
     entry.op_jalr = true;
-    assert_eq!(entry.packed_decode() & (1 << bits::OP_JALR), 1 << bits::OP_JALR);
+    assert_eq!(
+        entry.packed_decode() & (1 << bits::OP_JALR),
+        1 << bits::OP_JALR
+    );
     entry.op_jalr = false;
 
     entry.op_beq = true;
-    assert_eq!(entry.packed_decode() & (1 << bits::OP_BEQ), 1 << bits::OP_BEQ);
+    assert_eq!(
+        entry.packed_decode() & (1 << bits::OP_BEQ),
+        1 << bits::OP_BEQ
+    );
     entry.op_beq = false;
 
     entry.op_blt = true;
-    assert_eq!(entry.packed_decode() & (1 << bits::OP_BLT), 1 << bits::OP_BLT);
+    assert_eq!(
+        entry.packed_decode() & (1 << bits::OP_BLT),
+        1 << bits::OP_BLT
+    );
     entry.op_blt = false;
 
     entry.op_load = true;
-    assert_eq!(entry.packed_decode() & (1 << bits::OP_LOAD), 1 << bits::OP_LOAD);
+    assert_eq!(
+        entry.packed_decode() & (1 << bits::OP_LOAD),
+        1 << bits::OP_LOAD
+    );
     entry.op_load = false;
 
     entry.op_store = true;
-    assert_eq!(entry.packed_decode() & (1 << bits::OP_STORE), 1 << bits::OP_STORE);
+    assert_eq!(
+        entry.packed_decode() & (1 << bits::OP_STORE),
+        1 << bits::OP_STORE
+    );
     entry.op_store = false;
 
     entry.op_mul = true;
-    assert_eq!(entry.packed_decode() & (1 << bits::OP_MUL), 1 << bits::OP_MUL);
+    assert_eq!(
+        entry.packed_decode() & (1 << bits::OP_MUL),
+        1 << bits::OP_MUL
+    );
     entry.op_mul = false;
 
     entry.op_divrem = true;
-    assert_eq!(entry.packed_decode() & (1 << bits::OP_DIVREM), 1 << bits::OP_DIVREM);
+    assert_eq!(
+        entry.packed_decode() & (1 << bits::OP_DIVREM),
+        1 << bits::OP_DIVREM
+    );
     entry.op_divrem = false;
 
     entry.op_ecall = true;
-    assert_eq!(entry.packed_decode() & (1 << bits::OP_ECALL), 1 << bits::OP_ECALL);
+    assert_eq!(
+        entry.packed_decode() & (1 << bits::OP_ECALL),
+        1 << bits::OP_ECALL
+    );
     entry.op_ecall = false;
 
     entry.op_ebreak = true;
-    assert_eq!(entry.packed_decode() & (1 << bits::OP_EBREAK), 1 << bits::OP_EBREAK);
+    assert_eq!(
+        entry.packed_decode() & (1 << bits::OP_EBREAK),
+        1 << bits::OP_EBREAK
+    );
     entry.op_ebreak = false;
 }
 
