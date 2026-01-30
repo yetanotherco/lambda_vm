@@ -400,13 +400,14 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, security: SecurityPreset) 
     ];
 
     eprintln!("Generating proof (this may take a while)...");
-    let multi_proof = match Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])) {
-        Ok(proof) => proof,
-        Err(e) => {
-            eprintln!("Proof generation failed: {:?}", e);
-            return ExitCode::FAILURE;
-        }
-    };
+    let multi_proof =
+        match Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])) {
+            Ok(proof) => proof,
+            Err(e) => {
+                eprintln!("Proof generation failed: {:?}", e);
+                return ExitCode::FAILURE;
+            }
+        };
 
     // Create the proof bundle
     let bundle = ProofBundle::new(multi_proof, proof_options, elf_hash, num_steps);
@@ -430,11 +431,7 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, security: SecurityPreset) 
     eprintln!("Proof written to {:?}", output_path);
     eprintln!(
         "  ELF hash: {}",
-        hex::encode(elf_hash)
-            .chars()
-            .take(16)
-            .collect::<String>()
-            + "..."
+        hex::encode(elf_hash).chars().take(16).collect::<String>() + "..."
     );
     eprintln!("  Steps: {}", num_steps);
 
@@ -521,8 +518,11 @@ fn cmd_verify(proof_path: PathBuf) -> ExitCode {
         vec![&cpu_air, &bitwise_air, &lt_air, &memw_air, &load_air];
 
     eprintln!("Verifying proof...");
-    let result =
-        Verifier::multi_verify(&airs, &bundle.multi_proof, &mut DefaultTranscript::<E>::new(&[]));
+    let result = Verifier::multi_verify(
+        &airs,
+        &bundle.multi_proof,
+        &mut DefaultTranscript::<E>::new(&[]),
+    );
 
     if result {
         eprintln!("Verification succeeded!");
