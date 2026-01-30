@@ -6,13 +6,13 @@ name = "DVRM"
 name = "n"
 type = "DWordHL"
 desc = "The numerator"
-pad = ["^", 2, 63]
+pad = 0
 
 [[variables.input]]
 name = "d"
 type = "DWordHL"
 desc = "The denominator"
-pad = 1
+pad = 0
 
 [[variables.input]]
 name = "signed"
@@ -27,7 +27,7 @@ pad = 0
 name = "q"
 type = "DWordHL"
 desc = "The quotient; $#`n` / #`d`$ rounded towards zero."
-pad = ["^", 2, 63]
+pad = 0
 
 [[variables.output]]
 name = "r"
@@ -41,7 +41,7 @@ pad = 0
 name = "div_by_zero"
 type = "Bit"
 desc = "Whether $#`d`=0$."
-pad = 0
+pad = 1
 
 [[variables.auxiliary]]
 name = "overflow"
@@ -59,19 +59,19 @@ pad = 0
 name = "abs_d"
 type = "DWordHL"
 desc = "Absolute value of `d`."
-pad = 1
+pad = 0
 
 [[variables.auxiliary]]
 name = "n_sub_r"
 type = "DWordHL"
 desc = "$#`n`-#`r`$."
-pad = ["^", 2, 63]
+pad = 0
 
 [[variables.auxiliary]]
 name = "sign_n_sub_r"
 type = "Bit"
 desc = "Sign of `n_sub_r`."
-pad = 1
+pad = 0
 
 [[variables.auxiliary]]
 name = "sign_n"
