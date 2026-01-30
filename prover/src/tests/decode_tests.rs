@@ -912,7 +912,7 @@ fn test_decode_soundness_different_elf_rejected() {
         executor::vm::execution::Executor::new(&elf_a, vec![]).expect("Failed to create executor");
     let result_a = executor_a.run().expect("Failed to run program A");
 
-    let mut traces = Traces::from_logs(&result_a.logs, result_a.instructions).unwrap();
+    let mut traces = Traces::from_logs_minimal(&result_a.logs, result_a.instructions).unwrap();
 
     // Prover builds AIRs with commitment from ELF A
     let prover_cpu_air = create_cpu_air(&proof_options);
@@ -1022,7 +1022,7 @@ fn test_decode_soundness_same_elf_accepted() {
         .expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
 
-    let mut traces = Traces::from_logs(&result.logs, result.instructions).unwrap();
+    let mut traces = Traces::from_logs_minimal(&result.logs, result.instructions).unwrap();
 
     let prover_commitment =
         commitment_from_elf(&prover_elf, &proof_options).expect("prover commitment");
