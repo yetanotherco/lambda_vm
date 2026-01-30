@@ -49,7 +49,7 @@ where
         Self: Sized,
     {
         // Each field element takes 1/3 of the input bytes
-        if bytes.len() % 3 != 0 {
+        if !bytes.len().is_multiple_of(3) {
             return Err(crate::errors::ByteConversionError::InvalidValue);
         }
         let elem_size = bytes.len() / 3;
@@ -68,7 +68,7 @@ where
         Self: Sized,
     {
         // Each field element takes 1/3 of the input bytes
-        if bytes.len() % 3 != 0 {
+        if !bytes.len().is_multiple_of(3) {
             return Err(crate::errors::ByteConversionError::InvalidValue);
         }
         let elem_size = bytes.len() / 3;
