@@ -46,16 +46,11 @@ pub mod cols {
 /// Generates the HALT trace table from the halt timestamp.
 ///
 /// This produces a single-row table with the timestamp split into DWordWL format.
-pub fn generate_halt_trace(
-    timestamp: u64,
-) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+pub fn generate_halt_trace(timestamp: u64) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let timestamp_lo = timestamp & 0xFFFF_FFFF;
     let timestamp_hi = timestamp >> 32;
 
-    let data = vec![
-        FE::from(timestamp_lo),
-        FE::from(timestamp_hi),
-    ];
+    let data = vec![FE::from(timestamp_lo), FE::from(timestamp_hi)];
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
 }

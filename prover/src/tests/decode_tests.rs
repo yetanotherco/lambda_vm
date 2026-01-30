@@ -527,7 +527,10 @@ fn test_trace_padding_to_power_of_two() {
     let (trace, _pc_to_row) = generate_decode_trace(&instructions);
 
     // 3 instructions + 1 CPU padding entry = 4, already power of 2
-    assert_eq!(trace.main_table.height, 4, "3 instructions + 1 CPU padding entry = 4 rows");
+    assert_eq!(
+        trace.main_table.height, 4,
+        "3 instructions + 1 CPU padding entry = 4 rows"
+    );
 
     // Verify the CPU padding row has pc=1 and all flags=0
     let mut found_cpu_padding = false;
@@ -539,7 +542,11 @@ fn test_trace_padding_to_power_of_two() {
                 FE::zero(),
                 "CPU padding entry should have all flags=0"
             );
-            assert_eq!(row[cols::MU], FE::zero(), "CPU padding entry should have mu=0");
+            assert_eq!(
+                row[cols::MU],
+                FE::zero(),
+                "CPU padding entry should have mu=0"
+            );
             found_cpu_padding = true;
         }
     }
@@ -869,8 +876,8 @@ fn test_decode_soundness_different_elf_rejected() {
     use crate::tables::trace_builder::Traces;
     use crate::tables::types::{GoldilocksExtension, GoldilocksField};
     use crate::test_utils::{
-        create_bitwise_air, create_cpu_air, create_decode_air, create_halt_air,
-        create_load_air, create_lt_air, create_memw_air,
+        create_bitwise_air, create_cpu_air, create_decode_air, create_halt_air, create_load_air,
+        create_lt_air, create_memw_air,
     };
 
     type F = GoldilocksField;
@@ -994,8 +1001,8 @@ fn test_decode_soundness_same_elf_accepted() {
     use crate::tables::trace_builder::Traces;
     use crate::tables::types::{GoldilocksExtension, GoldilocksField};
     use crate::test_utils::{
-        create_bitwise_air, create_cpu_air, create_decode_air, create_halt_air,
-        create_load_air, create_lt_air, create_memw_air,
+        create_bitwise_air, create_cpu_air, create_decode_air, create_halt_air, create_load_air,
+        create_lt_air, create_memw_air,
     };
 
     type F = GoldilocksField;

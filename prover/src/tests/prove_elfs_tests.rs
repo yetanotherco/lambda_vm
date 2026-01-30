@@ -902,7 +902,6 @@ fn test_dhat_memory_profile() {
     println!("MEMORY_PROFILE_PROGRAM={}", program_name);
     println!("MEMORY_PROFILE_INSTRUCTIONS={}", logs.len());
 
-
     let mut traces = Traces::from_logs_minimal(&logs, instructions.clone()).unwrap();
 
     assert!(
