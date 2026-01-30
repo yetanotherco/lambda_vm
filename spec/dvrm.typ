@@ -9,6 +9,8 @@
   render_chip_assumptions
 )
 
+#set footnote(numbering: "[1]")
+
 #let config = load_config()
 #let chip = load_chip("src/dvrm.toml", config)
 #let dvrm = raw(chip.name)
@@ -48,10 +50,7 @@ where _overflow_ occurs when $#`n` = -2^(63)$ and $#`d` = -1$ (and, hence, $#`si
 In the following, we list the constraints associated with the #dvrm chip, and explain how these together enforce all five of these requirements.
 
 === R3: Sign remainder equals sign numerator
-We start with R3.
-Note that the signs of `r` and `n` are captured by their most significant bits whenever $#`signed` = 1$.
-As such, R3 is asserted by the constraint @dvrm:c:sign_r_equals_sign_n.
-
+We start with R3, which is straightforwardly asserted by constraint @dvrm:c:sign_r_equals_sign_n.
 #render_constraint_table(chip, config, groups:("sign_equality", ))
 
 === R2: rounding towards zero
@@ -67,7 +66,7 @@ Leveraging R1 #footnote([Note: we need not worry about the _overflow_ case in ap
 Focusing on the first statement, we observe that this trivially holds when $#`signed` = 0$, 
 while R3 deals with the case that $#`signed` = 1$.
 The second statement is enforced by @dvrm:c:abs_r_lt_abs_d.
-@dvrm:c:abs_r_if_negative and @dvrm:c:abs_r_if_nonnegative, respectively @dvrm:c:abs_d_if_negative and @dvrm:c:abs_d_if_nonnegative are included to ensure that `abs_r` and `abs_d` are the absolute values of `r` respectively `d`.
+@dvrm:c:abs_r_if_negative and @dvrm:c:abs_r_if_nonnegative (resp. @dvrm:c:abs_d_if_negative and @dvrm:c:abs_d_if_nonnegative) are included to ensure that `abs_r` (resp. `abs_d`) is the absolute values of `r` (resp. `d`).
 @dvrm:c:abs_r_range_check and @dvrm:c:abs_d_range_check are required to uphold assumption @add:a:lhs required by the `SUB` chip.
 
 #render_constraint_table(chip, config, groups:("abs_diff", ))
@@ -84,63 +83,38 @@ In summary, it suffices to enforce that $#`overflow` => #`q` = #`n`$ (@dvrm:c:q_
 
 We briefly highlight @dvrm:c:overflow.
 Recall that the `overflow` flag should be set if and only if (i) $#`signed` = 1$, (ii) $#`n` = #`0x80...00`$, and (iii) $#`d` = #`0xFF...FF`$.
-While the `IsEqual` template can handle the first and third equality directly, the second equality was rewritten as the set of equalities
+The `IsEqual` template can handle the third equality directly.
+The second equality was rewritten as the set of equalities
 $
-  #`n[`i#`]` &= 0 "for" i in [0, 2],\
-  #`n[`3#`]` - 2^15 dot #`msb_n` &= 0,\
-  #`msb_n` &= 1
+  #`n[`i#`]` &= 0 "for" i in {0, 1, 2},\
+  #`n[`3#`]` - 2^15 dot #`sign_n` &= 0,\
+  #`sign_n` &= 1
 $
-where we note that $#`n[3]` - 2^15 dot #`msb_n` = 0 <=> #`n[3]` equiv 0 mod 2^15$. 
+where we note that $#`n[3]` - 2^15 dot #`sign_n` = 0 <=> #`n[3]` equiv 0 mod 2^15$. 
 Hence, the last two equalities are satisfied if and only if $#`n[3]` = 2^15$.
+Lastly, $#`signed` = 1$ (the first equality) follows implicitly from $#`sign_n` = 1$ and thus does not have to be included.
 
 === R1: $#`n` = #`qd` + #`r`$
 Rewriting R1, we find the constraint $not#`overflow` => #`n` - #`r` = #`qd`$.
-Since `n`, `d`, `q` and `r` are all 64-bit (unsigned) integers, we must assert this equality $mod 2^128$.
-
-While one can construct the 128-bit extension of $#`n` - #`r`$ through subtraction-after-extension, extension-after-subtraction permits a more compact (yet complex) solution.
-In particular, determining the sign of the result is slightly more complex.
-To this end, we introduce @dvrm:sign_table.
-This table lists the sign of $#`n` - #`r`$, given `signed`, $#`msb`\(#`r`)$, and $#`msb`\(#`n`)$.
-
-#figure(table(
-  columns: (auto, auto, auto, auto),
-  stroke: none,
-  table.header([`signed`], [`msb_n`], [`msb_r`], [`sign`]),
-  table.hline(stroke: 1pt),
-  table.vline(x:3),
-  [0],[0],[0],[$#`msb`\(#`n`-#`r`)$],
-  [0],[0],[1],[`?`],
-  [0],[1],[0],[0],
-  [0],[1],[1],[$#`msb`\(#`n`-#`r`)$],
-  [1],[0],[0],[$#`msb`\(#`n`-#`r`)$],
-  [1],[0],[1],[#sym.crossmark],
-  [1],[1],[0],[1],
-  [1],[1],[1],[$#`msb`\(#`n`-#`r`)$],
-  ),
-  caption: [Sign of `n-r`, given `signed`, `msb_r` and `msb_n`]
-) <dvrm:sign_table>
-
-First, note that the case labelled '#sym.crossmark' cannot occur due to @dvrm:c:sign_r_equals_sign_n.
-Second, the case labelled '`?`' should not occur, since it implies $#`r` > #`n`$.
-To this end, we introduce @dvrm:c:unsigned_implies_msb_r_lt_msb_n to prevent it from occurring.
-Next, observe that 
-$
-  #`sign` = cases(
-    #`msb`\(#`n`-#`r`\) & "when" 1 + #`msb_r` - #`msb_n` = 1,
-    #`signed` & "when" 1 + #`msb_r` - #`msb_n` = 0,
-  )
-$
-Moreover note that, ignoring the two excluded cases, $1 + #`msb_r` - #`msb_n` in {0, 1}$.
-`sign_n_sub_r` is assigned its appropriate value based on these cases in @dvrm:c:sign_n_sub_r_eq_msb and @dvrm:c:sign_n_sub_r_eq_signed.
-@dvrm:c:n_sub_r now computes $#`n` - #`r`$, and is combined with `sign_n_sub_r` to form `extended_n_sub_r` (see its #link(<dvrm:v:extended_n_sub_r>)[definition]).
-Lastly, @dvrm:c:r_range and @dvrm:c:n_sub_r_range are included to uphold assumption @add:a:sum respectively @add:a:lhs, which are required by the `SUB` chip.
-
-#render_constraint_table(chip, config, groups:("n_sub_r", ))
-
-With `n_sub_r` constructed, the relation $#`n` - #`r` = #`qd`$ is asserted by @dvrm:c:mul_lower and @dvrm:c:mul_upper;
+#footnote([Recall that @dvrm:c:sign_q allows to assert this equality even when `overflow`.])
+Since `n`, `d`, `q` and `r` are all 64-bit integers, we must assert this equality $mod 2^128$, rather than $mod 2^64$.
+To this end, we introduce `extended_n_sub_r` and leverage the `MUL` chip to verify that is equal to $#`qd` mod 2^128$ using constraints @dvrm:c:mul_lower and @dvrm:c:mul_upper;
 @dvrm:c:q_range is included to uphold assumption @mul:a:rhs.
 
 #render_constraint_table(chip, config, groups:("equality", ))
+
+It now remains to enforce that `extended_n_sub_r` is the _signed_ 128-bit representation of $#`n`-#`r`$.
+Here, we introduce `extended_n` and `extended_r`.
+By their definition, these variables contain the signed 128-bit representations of `n` and `r`.
+With this in place, @dvrm:c:n_sub_r ensures `extended_n_sub_r` must contain the correct value.
+
+Lastly, observe that $#`n` - #`r` in (-2^64, 2^64)$, _regardless_ of the value of `signed`.
+Moreover, note that the upper limbs of all values in this range are either `0xFFFFFFFF` (negative) or `0x00000000` (non-negative).
+This means that we do not need to store all 128 bits of `extended_n_sub_r`.
+Rather, we need only store the lower 64-bits, and a separate bit (`sign_n_sub_r`) indicating whether the top limbs are all-ones or all-zeroes.
+The prover is free to select the value for `sign_n_sub_r`; only one of the two will fit the proof.
+
+#render_constraint_table(chip, config, groups:("n_sub_r", ))
 
 === R4: division-by-zero
 R4 requires that $#`q` = 2^64-1$ (unsigned) or $-1$ (signed) and $#`r` = n$ when $#`d` = 0$.
@@ -151,7 +125,7 @@ Hence, only @dvrm:c:q_if_div_by_zero is required to completely constrain R5; @dv
 #render_constraint_table(chip, config, groups:("div_by_zero", ))
 
 === Other
-The following constraints are included to enforce the values of `msb_n`, `msb_r`, `sign_r` and `sign_d` are correct.
+The following constraints are included to enforce the values of `sign_n`, `sign_r` and `sign_d` are correct.
 #render_constraint_table(chip, config, groups:("defs", ))
 
 === Output

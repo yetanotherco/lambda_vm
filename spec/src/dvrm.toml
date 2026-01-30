@@ -50,24 +50,6 @@ desc = "Whether $#`n` = -2^63$ and $#`d`=-1$."
 pad = 0
 
 [[variables.auxiliary]]
-name = "n_sub_r"
-type = "DWordHL"
-desc = "$#`n`-#`r`$."
-pad = ["^", 2, 63]
-
-[[variables.auxiliary]]
-name = "sign_n_sub_r"
-type = "Bit"
-desc = "Sign of `n_sub_r`."
-pad = 1
-
-[[variables.auxiliary]]
-name = "sign_q"
-type = "Bit"
-desc = "Whether to interpret `q` as a signed (1) or unsigned (0) integer."
-pad = 0
-
-[[variables.auxiliary]]
 name = "abs_r"
 type = "DWordHL"
 desc = "Absolute value of `r`."
@@ -80,21 +62,21 @@ desc = "Absolute value of `d`."
 pad = 1
 
 [[variables.auxiliary]]
-name = "msb_r"
-type = "Bit"
-desc = "Most significant bit of `r`."
-pad = 0
+name = "n_sub_r"
+type = "DWordHL"
+desc = "$#`n`-#`r`$."
+pad = ["^", 2, 63]
 
 [[variables.auxiliary]]
-name = "msb_n"
+name = "sign_n_sub_r"
 type = "Bit"
-desc = "Most significant bit of `n`."
+desc = "Sign of `n_sub_r`."
 pad = 1
 
 [[variables.auxiliary]]
-name = "sign_r"
+name = "sign_n"
 type = "Bit"
-desc = "Sign of `r`."
+desc = "Sign of `n`."
 pad = 0
 
 [[variables.auxiliary]]
@@ -103,7 +85,46 @@ type = "Bit"
 desc = "Sign of `d`."
 pad = 0
 
+[[variables.auxiliary]]
+name = "sign_q"
+type = "Bit"
+desc = "Sign of `q`."
+pad = 0
+
+[[variables.auxiliary]]
+name = "sign_r"
+type = "Bit"
+desc = "Sign of `r`."
+pad = 0
+
 # Virtual
+
+[[variables.virtual]]
+name = "extended_n"
+type = ["Half", 8]
+desc = "sign-extended value of `n`."
+def = {idx="i", polys = [
+  {iter=[0, 3], poly=["idx", "n", "i"]},
+  {iter=[4, 7], poly=["*", 0xFFFF, "sign_n"]}
+]}
+ref = "dvrm:v:extended_n"
+
+[[variables.virtual]]
+name = "extended_r"
+type = ["Half", 8]
+desc = "sign-extended value of `r`."
+def = {idx="i", polys = [
+  {iter=[0, 3], poly=["idx", "r", "i"]},
+  {iter=[4, 7], poly=["*", 0xFFFF, "sign_r"]}
+]}
+ref = "dvrm:v:extended_r"
+
+[[variables.virtual]]
+name = "extension_n_sub_r"
+type = ["Half", 4]
+desc = "sign-extension limbs of `n_sub_r`."
+def = {idx="i", iter=[0, 3], poly=["*", 0xFFFF, "sign_n_sub_r"]}
+ref = "dvrm:v:extension_n_sub_r"
 
 [[variables.virtual]]
 name = "extended_n_sub_r"
@@ -111,7 +132,7 @@ type = ["Half", 8]
 desc = "sign-extended value of `n_sub_r`."
 def = {idx="i", polys = [
   {iter=[0, 3], poly=["idx", "n_sub_r", "i"]},
-  {iter=[4, 7], poly=["*", 0xFFFF, "sign_n_sub_r"]}
+  {iter=[4, 7], poly=["idx", "extension_n_sub_r", ["-", "i", 4]]}
 ]}
 ref = "dvrm:v:extended_n_sub_r"
 
@@ -160,8 +181,8 @@ name = "sign_equality"
 
 [[constraints.sign_equality]]
 kind = "arith"
-constraint = "$#`r` eq.not 0 and #`signed` => #`r_msb` = #`n_msb`$"
-poly = ["*", ["sum", ["=", "i", 0], 3, ["idx", "r", "i"]], "signed", ["-", "r_msb", "n_msb"]]
+constraint = "$#`r` eq.not 0 => #`sign_r` = #`sign_n`$"
+poly = ["*", ["sum", ["=", "i", 0], 3, ["idx", "r", "i"]], ["-", "sign_r", "sign_n"]]
 ref = "dvrm:c:sign_r_equals_sign_n"
 
 [[constraint_groups]]
@@ -240,36 +261,13 @@ ref = "dvrm:c:sign_q"
 [[constraints.overflow]]
 kind = "template"
 tag = "IsEqual"
-input = [["=", "signed", 1], ["=", ["idx", "n", "0:3"], "[0, 0, 0]"], ["=", ["-", ["idx", "n", 3], ["*", ["^", 2, 15], "msb_n"]], 0], ["=", "msb_n", 1], ["=", "d", "[65535, 65535, 65535, 65535]"]]
+input = [["=", ["idx", "n", 0], 0], ["=", ["idx", "n", 1], 0], ["=", ["idx", "n", 2], 0], ["=", ["-", ["idx", "n", 3], ["*", ["^", 2, 15], "sign_n"]], 0], ["=", "sign_n", 1], ["=", ["idx", "d", 0], 65535], ["=", ["idx", "d", 1], 65535], ["=", ["idx", "d", 2], 65535], ["=", ["idx", "d", 3], 65535]]
 output = "overflow"
 cond = "μ_sum"
 ref = "dvrm:c:overflow"
 
 [[constraint_groups]]
 name = "n_sub_r"
-
-[[constraints.n_sub_r]]
-kind = "arith"
-constraint = "$not#`signed` and not#`msb_n` => not#`msb_r`$"
-poly = ["*", ["not", "signed"], ["not", "msb_n"], "msb_r"]
-ref = "dvrm:c:unsigned_implies_msb_r_lt_msb_n"
-
-[[constraints.n_sub_r]]
-kind = "interaction"
-tag = "MSB16"
-input = [["idx", "n_sub_r", 3]]
-output = "sign_n_sub_r"
-multiplicity = ["-", ["+", 1, "msb_r"], "msb_n"]
-ref = "dvrm:c:sign_n_sub_r_eq_msb"
-
-[[constraints.n_sub_r]]
-kind = "arith"
-constraint = "$1 + #`msb_r` - #`msb_n` = 0 => #`sign_n_sub_r` = #`signed`$"
-poly = ["*", ["-", "msb_n", "msb_r"], ["-", "sign_n_sub_r", "signed"]]
-tag = "SIGN"
-input = [["idx", "n_sub_r", 3], "signed"]
-output = "sign_n_sub_r"
-ref = "dvrm:c:sign_n_sub_r_eq_signed"
 
 [[constraints.n_sub_r]]
 kind = "template"
@@ -294,6 +292,12 @@ iter = ["i", 0, 3]
 multiplicity = "μ_sum"
 ref = "dvrm:c:n_sub_r_range"
 
+[[constraints.n_sub_r]]
+kind = "template"
+tag = "IS_BIT"
+input = ["sign_n_sub_r"]
+ref = "dvrm:c:sign_n_sub_r_is_bit"
+
 [[constraint_groups]]
 name = "equality"
 
@@ -301,7 +305,7 @@ name = "equality"
 kind = "interaction"
 tag = "MUL"
 input = ["d", "signed", "q", "sign_q", 0]
-output = ["idx", "extended_n_sub_r", "0:4"]
+output = "n_sub_r"
 multiplicity = "μ_sum"
 ref = "dvrm:c:mul_lower"
 
@@ -309,7 +313,7 @@ ref = "dvrm:c:mul_lower"
 kind = "interaction"
 tag = "MUL"
 input = ["d", "signed", "q", "sign_q", 1]
-output = ["idx", "extended_n_sub_r", "4:8"]
+output = "extension_n_sub_r"
 multiplicity = "μ_sum"
 ref = "dvrm:c:mul_upper"
 
@@ -326,25 +330,17 @@ ref = "dvrm:c:q_range"
 name = "defs"
 
 [[constraints.defs]]
-kind = "interaction"
-tag = "MSB16"
-input = [["idx", "n", 3]]
-output = "msb_n"
-multiplicity = "μ_sum"
-ref = "dvrm:c:msb_n"
+kind = "template"
+tag = "SIGN"
+input = [["idx", "n", 3], "signed"]
+output = "sign_n"
+ref = "dvrm:c:sign_n"
 
 [[constraints.defs]]
-kind = "interaction"
-tag = "MSB16"
-input = [["idx", "r", 3]]
-output = "msb_r"
-multiplicity = "μ_sum"
-ref = "dvrm:c:msb_r"
-
-[[constraints.defs]]
-kind = "arith"
-constraint = "$#`sign_r` = #`signed` dot #`msb_r`$"
-poly = ["-", ["*", "signed", "msb_r"], "sign_r"]
+kind = "template"
+tag = "SIGN"
+input = [["idx", "r", 3], "signed"]
+output = "sign_r"
 ref = "dvrm:c:sign_r"
 
 [[constraints.defs]]
