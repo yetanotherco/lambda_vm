@@ -256,7 +256,7 @@ pub mod cols {
 ///
 /// Contains static decode information (from DecodeEntry) plus runtime values
 /// from execution (register values, computed results, etc.).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CpuOperation {
     /// Static decode information (shared with DECODE table)
     pub decode: DecodeEntry,
@@ -284,22 +284,6 @@ pub struct CpuOperation {
 
     /// Whether branch is taken
     pub branch_cond: bool,
-}
-
-impl Default for CpuOperation {
-    fn default() -> Self {
-        Self {
-            decode: DecodeEntry::default(),
-            timestamp: 0,
-            next_pc: 0,
-            rvd: 0,
-            rv1: 0,
-            rv2: 0,
-            res: 0,
-            is_equal: false,
-            branch_cond: false,
-        }
-    }
 }
 
 impl CpuOperation {
