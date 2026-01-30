@@ -486,7 +486,10 @@ impl BranchConstraint {
         let (unmasked_0, _unmasked_1) = self.compute_next_pc_unmasked(step);
 
         // carry[0] = (base[0] + offset[0] - next_pc_unmasked[0]) / 2^32
-        let inv_2_32 = FieldElement::<F>::from(SHIFT_32).inv().unwrap();
+        // Compute carry_0 as (base + offset - result) / 2^32 in the field.
+        // This works because: base + offset = result + carry_0 * 2^32 (mod field)
+        // Rearranging: carry_0 = (base + offset - result) * (2^32)^-1 (mod field)
+        let inv_2_32 = FieldElement::<F>::from(SHIFT_32).inv().expect("2^32 must be invertible in field");
         (&base_0 + &offset_0 - &unmasked_0) * &inv_2_32
     }
 
@@ -511,7 +514,7 @@ impl BranchConstraint {
         let offset_1 = step.get_main_evaluation_element(0, cols::OFFSET_1).clone();
 
         // carry[1] = (base[1] + offset[1] + carry[0] - unmasked[1]) / 2^32
-        let inv_2_32 = FieldElement::<F>::from(SHIFT_32).inv().unwrap();
+        let inv_2_32 = FieldElement::<F>::from(SHIFT_32).inv().expect("2^32 must be invertible in field");
         (&base_1 + &offset_1 + &carry_0 - &unmasked_1) * &inv_2_32
     }
 
@@ -627,22 +630,11 @@ pub fn compute_carries(base: u64, offset: u64, next_pc_unmasked: u64) -> (u64, u
     let result_lo = next_pc_unmasked & 0xFFFF_FFFF;
     let result_hi = next_pc_unmasked >> 32;
 
-    // carry[0] = (base_lo + offset_lo - result_lo) / 2^32
-    let sum_lo = base_lo.wrapping_add(offset_lo);
-    let carry_0 = if sum_lo >= result_lo {
-        (sum_lo - result_lo) >> 32
-    } else {
-        // Underflow - shouldn't happen with correct trace
-        0
-    };
+    // carry[0] = (base_lo + offset_lo) >> 32
+    let carry_0 = (base_lo + offset_lo) >> 32;
 
-    // carry[1] = (base_hi + offset_hi + carry_0 - result_hi) / 2^32
-    let sum_hi = base_hi.wrapping_add(offset_hi).wrapping_add(carry_0);
-    let carry_1 = if sum_hi >= result_hi {
-        (sum_hi - result_hi) >> 32
-    } else {
-        0
-    };
+    // carry[1] = (base_hi + offset_hi + carry_0) >> 32
+    let carry_1 = (base_hi + offset_hi + carry_0) >> 32;
 
     (carry_0, carry_1)
 }
