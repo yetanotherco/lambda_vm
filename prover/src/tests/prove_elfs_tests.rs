@@ -27,6 +27,7 @@ use executor::vm::instruction::decoding::Instruction;
 use executor::vm::memory::U64HashMap;
 
 use crate::tables::bitwise;
+use crate::tables::decode;
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
@@ -67,7 +68,11 @@ fn prove_and_verify_vm(
     let lt_air = create_lt_air(&proof_options);
     let memw_air = create_memw_air(&proof_options);
     let load_air = create_load_air(&proof_options);
-    let decode_air = create_decode_air(&proof_options, instructions);
+    // Use preprocessed commitment for decode table verification
+    let decode_air = create_decode_air(&proof_options).with_preprocessed(
+        decode::compute_precomputed_commitment(instructions, &proof_options),
+        decode::NUM_PRECOMPUTED_COLS,
+    );
 
     let air_trace_pairs: Vec<(
         &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
@@ -118,7 +123,6 @@ fn prove_and_verify_vm_minimal(
     memw_trace: &mut TraceTable<F, E>,
     load_trace: &mut TraceTable<F, E>,
     decode_trace: &mut TraceTable<F, E>,
-    instructions: &U64HashMap<Instruction>,
 ) -> bool {
     let proof_options = ProofOptions::default_test_options();
 
@@ -127,7 +131,7 @@ fn prove_and_verify_vm_minimal(
     let lt_air = create_lt_air(&proof_options);
     let memw_air = create_memw_air(&proof_options);
     let load_air = create_load_air(&proof_options);
-    let decode_air = create_decode_air(&proof_options, instructions);
+    let decode_air = create_decode_air(&proof_options);
 
     let air_trace_pairs: Vec<(
         &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
@@ -239,8 +243,7 @@ fn test_prove_elfs_sub_fast() {
             &mut traces.lt,
             &mut traces.memw,
             &mut traces.load,
-            &mut traces.decode,
-            &instructions
+            &mut traces.decode
         ),
         "Proof verification failed for sub program (fast)"
     );
@@ -265,8 +268,7 @@ fn test_prove_elfs_sub_neg_result_fast() {
             &mut traces.lt,
             &mut traces.memw,
             &mut traces.load,
-            &mut traces.decode,
-            &instructions
+            &mut traces.decode
         ),
         "Proof verification failed for sub_neg_result program (fast)"
     );
@@ -291,8 +293,7 @@ fn test_prove_elfs_sub_underflow_fast() {
             &mut traces.lt,
             &mut traces.memw,
             &mut traces.load,
-            &mut traces.decode,
-            &instructions
+            &mut traces.decode
         ),
         "Proof verification failed for sub_underflow program (fast)"
     );
@@ -317,8 +318,7 @@ fn test_prove_elfs_subw_fast() {
             &mut traces.lt,
             &mut traces.memw,
             &mut traces.load,
-            &mut traces.decode,
-            &instructions
+            &mut traces.decode
         ),
         "Proof verification failed for subw program (fast)"
     );
@@ -344,8 +344,7 @@ fn test_prove_elfs_arith_lui_8() {
             &mut traces.lt,
             &mut traces.memw,
             &mut traces.load,
-            &mut traces.decode,
-            &instructions
+            &mut traces.decode
         ),
         "Proof verification failed for arith_lui_8 program"
     );
@@ -371,8 +370,7 @@ fn test_prove_elfs_arith_8() {
             &mut traces.lt,
             &mut traces.memw,
             &mut traces.load,
-            &mut traces.decode,
-            &instructions
+            &mut traces.decode
         ),
         "Proof verification failed for arith_8 program"
     );
@@ -401,8 +399,7 @@ fn test_prove_elfs_basic_arith_32() {
             &mut traces.lt,
             &mut traces.memw,
             &mut traces.load,
-            &mut traces.decode,
-            &instructions
+            &mut traces.decode
         ),
         "Proof verification failed for basic_arith_32 program"
     );
@@ -444,8 +441,7 @@ fn test_prove_elfs_comprehensive() {
             &mut traces.lt,
             &mut traces.memw,
             &mut traces.load,
-            &mut traces.decode,
-            &instructions
+            &mut traces.decode
         ),
         "Proof verification failed for comprehensive_test program"
     );
@@ -469,8 +465,7 @@ fn test_prove_elfs_test_add_8() {
             &mut traces.lt,
             &mut traces.memw,
             &mut traces.load,
-            &mut traces.decode,
-            &instructions
+            &mut traces.decode
         ),
         "test_add_8 failed"
     );
@@ -488,8 +483,7 @@ fn test_prove_elfs_test_sub_8() {
             &mut traces.lt,
             &mut traces.memw,
             &mut traces.load,
-            &mut traces.decode,
-            &instructions
+            &mut traces.decode
         ),
         "test_sub_8 failed"
     );
@@ -507,8 +501,7 @@ fn test_prove_elfs_test_addw_8() {
             &mut traces.lt,
             &mut traces.memw,
             &mut traces.load,
-            &mut traces.decode,
-            &instructions
+            &mut traces.decode
         ),
         "test_addw_8 failed"
     );
@@ -527,8 +520,7 @@ fn test_prove_elfs_test_subw_8() {
             &mut traces.lt,
             &mut traces.memw,
             &mut traces.load,
-            &mut traces.decode,
-            &instructions
+            &mut traces.decode
         ),
         "test_subw_8 failed"
     );
@@ -547,8 +539,7 @@ fn test_prove_elfs_test_addw_lui_8() {
             &mut traces.lt,
             &mut traces.memw,
             &mut traces.load,
-            &mut traces.decode,
-            &instructions
+            &mut traces.decode
         ),
         "test_addw_lui_8 failed"
     );
@@ -567,8 +558,7 @@ fn test_prove_elfs_test_subw_lui_8() {
             &mut traces.lt,
             &mut traces.memw,
             &mut traces.load,
-            &mut traces.decode,
-            &instructions
+            &mut traces.decode
         ),
         "test_subw_lui_8 failed"
     );
@@ -587,8 +577,7 @@ fn test_prove_elfs_test_add_neg_8() {
             &mut traces.lt,
             &mut traces.memw,
             &mut traces.load,
-            &mut traces.decode,
-            &instructions
+            &mut traces.decode
         ),
         "test_add_neg_8 failed"
     );
@@ -607,8 +596,7 @@ fn test_prove_elfs_test_sub_neg_8() {
             &mut traces.lt,
             &mut traces.memw,
             &mut traces.load,
-            &mut traces.decode,
-            &instructions
+            &mut traces.decode
         ),
         "test_sub_neg_8 failed"
     );
@@ -627,8 +615,7 @@ fn test_prove_elfs_test_mul_8() {
             &mut traces.lt,
             &mut traces.memw,
             &mut traces.load,
-            &mut traces.decode,
-            &instructions
+            &mut traces.decode
         ),
         "test_mul_8 failed"
     );
@@ -647,8 +634,7 @@ fn test_prove_elfs_test_div_8() {
             &mut traces.lt,
             &mut traces.memw,
             &mut traces.load,
-            &mut traces.decode,
-            &instructions
+            &mut traces.decode
         ),
         "test_div_8 failed"
     );
@@ -667,8 +653,7 @@ fn test_prove_elfs_test_shift_8() {
             &mut traces.lt,
             &mut traces.memw,
             &mut traces.load,
-            &mut traces.decode,
-            &instructions
+            &mut traces.decode
         ),
         "test_shift_8 failed"
     );
@@ -687,8 +672,7 @@ fn test_prove_elfs_test_bitwise_8() {
             &mut traces.lt,
             &mut traces.memw,
             &mut traces.load,
-            &mut traces.decode,
-            &instructions
+            &mut traces.decode
         ),
         "test_bitwise_8 failed"
     );
@@ -716,8 +700,7 @@ fn test_prove_elfs_test_slt_8() {
             &mut traces.lt,
             &mut traces.memw,
             &mut traces.load,
-            &mut traces.decode,
-            &instructions
+            &mut traces.decode
         ),
         "test_slt_8 failed"
     );
@@ -740,8 +723,7 @@ fn test_prove_elfs_test_xor_8() {
             &mut traces.lt,
             &mut traces.memw,
             &mut traces.load,
-            &mut traces.decode,
-            &instructions
+            &mut traces.decode
         ),
         "test_xor_8 failed"
     );
@@ -759,8 +741,7 @@ fn test_prove_elfs_test_lb_lh_8() {
             &mut traces.lt,
             &mut traces.memw,
             &mut traces.load,
-            &mut traces.decode,
-            &instructions
+            &mut traces.decode
         ),
         "test_lb_lh_8 failed"
     );
@@ -779,8 +760,7 @@ fn test_prove_elfs_test_sb_sh_8() {
             &mut traces.lt,
             &mut traces.memw,
             &mut traces.load,
-            &mut traces.decode,
-            &instructions
+            &mut traces.decode
         ),
         "test_sb_sh_8 failed"
     );
@@ -808,8 +788,7 @@ fn test_prove_elfs_all_branches_16() {
             &mut traces.lt,
             &mut traces.memw,
             &mut traces.load,
-            &mut traces.decode,
-            &instructions
+            &mut traces.decode
         ),
         "all_branches_16 failed"
     );
@@ -828,8 +807,7 @@ fn test_prove_elfs_all_loadstore_32() {
             &mut traces.lt,
             &mut traces.memw,
             &mut traces.load,
-            &mut traces.decode,
-            &instructions
+            &mut traces.decode
         ),
         "all_loadstore_32 failed"
     );
@@ -861,8 +839,7 @@ fn test_prove_elfs_all_instructions_64() {
             &mut traces.lt,
             &mut traces.memw,
             &mut traces.load,
-            &mut traces.decode,
-            &instructions
+            &mut traces.decode
         ),
         "all_instructions_64 failed"
     );
@@ -902,7 +879,7 @@ fn test_prove_elfs_all_instructions_64_full() {
             &mut traces.memw,
             &mut traces.load,
             &mut traces.decode,
-            &instructions
+            &instructions,
         ),
         "all_instructions_64_full failed - comprehensive test with full bitwise table"
     );
@@ -941,8 +918,7 @@ fn test_dhat_memory_profile() {
             &mut traces.lt,
             &mut traces.memw,
             &mut traces.load,
-            &mut traces.decode,
-            &instructions
+            &mut traces.decode
         ),
         "verification failed"
     );

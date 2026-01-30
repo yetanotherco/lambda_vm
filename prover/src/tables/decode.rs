@@ -35,7 +35,8 @@
 //!
 //! - **Receiver**: DECODE bus - receives lookups from CPU table
 
-use executor::vm::instruction::decoding::Instruction;
+use executor::elf::Elf;
+use executor::vm::instruction::decoding::{Instruction, InstructionError};
 use executor::vm::memory::U64HashMap;
 use math::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
 use math::polynomial::Polynomial;
@@ -274,4 +275,31 @@ pub fn compute_precomputed_commitment(
         .expect("Failed to build Merkle tree for decode LDE");
 
     tree.root
+}
+
+// =========================================================================
+// ELF to Instructions (for verifier)
+// =========================================================================
+
+/// Extract instructions from an ELF without running the executor.
+///
+/// This is the minimal computation needed for verifier to compute
+/// the DECODE commitment from the program.
+pub fn instructions_from_elf(elf: &Elf) -> Result<U64HashMap<Instruction>, InstructionError> {
+    let mut map = U64HashMap::default();
+    for seg in elf.data.iter().filter(|s| s.is_executable) {
+        for (i, &word) in seg.values.iter().enumerate() {
+            let pc = seg.base_addr + (i as u64 * 4);
+            map.insert(pc, Instruction::parse(word)?);
+        }
+    }
+    Ok(map)
+}
+
+/// Compute DECODE commitment directly from an ELF.
+///
+/// This is what the verifier uses - no executor needed.
+pub fn commitment_from_elf(elf: &Elf, options: &ProofOptions) -> Result<Commitment, InstructionError> {
+    let instructions = instructions_from_elf(elf)?;
+    Ok(compute_precomputed_commitment(&instructions, options))
 }

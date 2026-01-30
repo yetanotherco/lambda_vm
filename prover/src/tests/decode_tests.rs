@@ -1,11 +1,14 @@
 //! Tests for the DECODE table.
 
+use executor::elf::Elf;
 use executor::vm::instruction::decoding::{ArithOp, Instruction};
 use executor::vm::memory::U64HashMap;
 
 use crate::tables::decode::{
-    DecodeEntry, bus_interactions, cols, generate_decode_trace, update_multiplicities,
+    DecodeEntry, bus_interactions, cols, generate_decode_trace, instructions_from_elf,
+    update_multiplicities,
 };
+use crate::test_utils::run_asm_elf;
 use crate::tables::types::{FE, packed_decode as bits};
 
 // =========================================================================
@@ -722,4 +725,126 @@ fn test_compute_precomputed_commitment_different_pc() {
         commitment_a, commitment_b,
         "Programs with different PCs should produce different commitments"
     );
+}
+
+// =========================================================================
+// instructions_from_elf tests (verifier vs executor consistency)
+// =========================================================================
+
+/// Test that instructions_from_elf produces the same result as the executor.
+#[test]
+fn test_instructions_from_elf_matches_executor() {
+    // Run executor to get instructions
+    let (_logs, executor_instructions) = run_asm_elf("arith_8");
+
+    // Load the same ELF and extract instructions directly
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let elf_path = manifest_dir
+        .parent()
+        .unwrap()
+        .join("executor/program_artifacts/asm/arith_8.elf");
+    let elf_bytes = std::fs::read(&elf_path).expect("Failed to read ELF file");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+
+    let verifier_instructions = instructions_from_elf(&elf).expect("Failed to extract instructions");
+
+    // Compare via DecodeEntry (what matters for the DECODE table)
+    for (pc, executor_instr) in executor_instructions.iter() {
+        let verifier_instr = verifier_instructions
+            .get(pc)
+            .expect(&format!("Verifier missing instruction at PC {:#x}", pc));
+
+        // Compare by converting to DecodeEntry - this is what the DECODE table uses
+        let executor_entry = DecodeEntry::from_instruction(*pc, *executor_instr);
+        let verifier_entry = DecodeEntry::from_instruction(*pc, *verifier_instr);
+
+        assert_eq!(
+            executor_entry.packed_decode(),
+            verifier_entry.packed_decode(),
+            "packed_decode mismatch at PC {:#x}",
+            pc
+        );
+        assert_eq!(
+            executor_entry.imm, verifier_entry.imm,
+            "imm mismatch at PC {:#x}",
+            pc
+        );
+    }
+
+    // Verifier may have more instructions (all executable code vs only executed code)
+    // but every executed instruction must match
+    assert!(
+        verifier_instructions.len() >= executor_instructions.len(),
+        "Verifier should have at least as many instructions as executor"
+    );
+}
+
+/// Test instructions_from_elf with a more complex program.
+#[test]
+fn test_instructions_from_elf_matches_executor_complex() {
+    let (_logs, executor_instructions) = run_asm_elf("all_instructions_64");
+
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let elf_path = manifest_dir
+        .parent()
+        .unwrap()
+        .join("executor/program_artifacts/asm/all_instructions_64.elf");
+    let elf_bytes = std::fs::read(&elf_path).expect("Failed to read ELF file");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+
+    let verifier_instructions = instructions_from_elf(&elf).expect("Failed to extract instructions");
+
+    // Every executed instruction must be present and match
+    for (pc, executor_instr) in executor_instructions.iter() {
+        let verifier_instr = verifier_instructions
+            .get(pc)
+            .expect(&format!("Verifier missing instruction at PC {:#x}", pc));
+
+        // Compare via DecodeEntry
+        let executor_entry = DecodeEntry::from_instruction(*pc, *executor_instr);
+        let verifier_entry = DecodeEntry::from_instruction(*pc, *verifier_instr);
+
+        assert_eq!(
+            executor_entry.packed_decode(),
+            verifier_entry.packed_decode(),
+            "packed_decode mismatch at PC {:#x}",
+            pc
+        );
+        assert_eq!(
+            executor_entry.imm, verifier_entry.imm,
+            "imm mismatch at PC {:#x}",
+            pc
+        );
+    }
+}
+
+/// Test that instructions_from_elf includes all executable instructions,
+/// not just the ones that were executed.
+#[test]
+fn test_instructions_from_elf_includes_all_executable() {
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let elf_path = manifest_dir
+        .parent()
+        .unwrap()
+        .join("executor/program_artifacts/asm/all_branches_16.elf");
+    let elf_bytes = std::fs::read(&elf_path).expect("Failed to read ELF file");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+
+    let instructions = instructions_from_elf(&elf).expect("Failed to extract instructions");
+
+    // Should have decoded all executable code
+    assert!(
+        !instructions.is_empty(),
+        "Should have extracted some instructions"
+    );
+
+    // All PCs should be 4-byte aligned
+    for (pc, _) in instructions.iter() {
+        assert_eq!(
+            pc % 4,
+            0,
+            "PC {:#x} is not 4-byte aligned",
+            pc
+        );
+    }
 }
