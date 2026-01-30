@@ -21,7 +21,7 @@ use stark::trace::TraceTable;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
-use crate::tables::branch::{cols, generate_branch_trace, BranchOperation};
+use crate::tables::branch::{BranchOperation, cols, generate_branch_trace};
 use crate::tables::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 
 type F = GoldilocksField;
@@ -282,7 +282,11 @@ fn create_receiver_trace(ops: &[BranchOperation]) -> TraceTable<F, E> {
         let next_pc_high_2 = ((next_pc >> 48) & 0xFFFF) as u16;
 
         // Sign bit for offset
-        let sign_bit = if op.offset >= (1u32 << 31) { 1u64 } else { 0u64 };
+        let sign_bit = if op.offset >= (1u32 << 31) {
+            1u64
+        } else {
+            0u64
+        };
 
         // Store columns
         data[base + cols::PC_0] = FE::from(pc_0 as u64);
@@ -565,8 +569,8 @@ fn test_completeness_duplicate_lookups() {
 #[test]
 fn test_completeness_mixed_jalr_and_branch() {
     let ops = vec![
-        BranchOperation::new(0x1000, 16, 0, false),          // branch
-        BranchOperation::new(0x2000, 32, 0x8000, true),      // jalr
+        BranchOperation::new(0x1000, 16, 0, false),     // branch
+        BranchOperation::new(0x2000, 32, 0x8000, true), // jalr
         BranchOperation::new(0x3000, (-8i32) as u32, 0, false), // branch with negative offset
         BranchOperation::new(0x4000, (-16i32) as u32, 0xA000, true), // jalr with negative offset
     ];

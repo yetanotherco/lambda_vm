@@ -203,7 +203,11 @@ pub fn generate_branch_trace(
         let next_pc_high_2 = ((next_pc >> 48) & 0xFFFF) as u16;
 
         // Sign bit: bit 31 of offset (1 if offset is negative in signed interpretation)
-        let sign_bit = if op.offset >= (1u32 << 31) { 1u64 } else { 0u64 };
+        let sign_bit = if op.offset >= (1u32 << 31) {
+            1u64
+        } else {
+            0u64
+        };
 
         // Store columns
         data[base + cols::PC_0] = FE::from(pc_0 as u64);
@@ -408,8 +412,12 @@ impl BranchConstraint {
     {
         let pc_0 = step.get_main_evaluation_element(0, cols::PC_0).clone();
         let pc_1 = step.get_main_evaluation_element(0, cols::PC_1).clone();
-        let register_0 = step.get_main_evaluation_element(0, cols::REGISTER_0).clone();
-        let register_1 = step.get_main_evaluation_element(0, cols::REGISTER_1).clone();
+        let register_0 = step
+            .get_main_evaluation_element(0, cols::REGISTER_0)
+            .clone();
+        let register_1 = step
+            .get_main_evaluation_element(0, cols::REGISTER_1)
+            .clone();
         let jalr = step.get_main_evaluation_element(0, cols::JALR).clone();
 
         let one = FieldElement::<F>::one();
@@ -455,7 +463,8 @@ impl BranchConstraint {
         let shift_16 = FieldElement::<F>::from(SHIFT_16);
 
         // next_pc_unmasked[0] = unmasked_low_byte + 2^8 * next_pc_low[1] + 2^16 * next_pc_high[0]
-        let unmasked_0 = &unmasked_low_byte + &next_pc_low_1 * &shift_8 + &next_pc_high_0 * &shift_16;
+        let unmasked_0 =
+            &unmasked_low_byte + &next_pc_low_1 * &shift_8 + &next_pc_high_0 * &shift_16;
 
         // next_pc_unmasked[1] = next_pc_high[1] + 2^16 * next_pc_high[2]
         let unmasked_1 = &next_pc_high_1 + &next_pc_high_2 * &shift_16;
@@ -502,9 +511,7 @@ impl BranchConstraint {
         let carry_0 = self.compute_carry_0(step);
 
         // Get sign_bit from auxiliary column
-        let sign_bit = step
-            .get_main_evaluation_element(0, cols::SIGN_BIT)
-            .clone();
+        let sign_bit = step.get_main_evaluation_element(0, cols::SIGN_BIT).clone();
 
         // Compute sign extension: offset_ext[1] = sign_bit * (2^32 - 1)
         // When sign_bit = 0: offset_ext[1] = 0 (positive offset)

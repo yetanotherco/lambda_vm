@@ -1018,8 +1018,8 @@ fn test_decode_soundness_same_elf_accepted() {
     // =========================================================================
     // PROVER: Runs program, builds traces, generates proof
     // =========================================================================
-    let executor =
-        executor::vm::execution::Executor::new(&prover_elf, vec![]).expect("Failed to create executor");
+    let executor = executor::vm::execution::Executor::new(&prover_elf, vec![])
+        .expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
 
     let mut traces = Traces::from_logs(&result.logs, result.instructions).unwrap();
@@ -1032,10 +1032,8 @@ fn test_decode_soundness_same_elf_accepted() {
     let prover_lt_air = create_lt_air(&proof_options);
     let prover_memw_air = create_memw_air(&proof_options);
     let prover_load_air = create_load_air(&proof_options);
-    let prover_decode_air = create_decode_air(&proof_options).with_preprocessed(
-        prover_commitment,
-        decode::NUM_PRECOMPUTED_COLS,
-    );
+    let prover_decode_air = create_decode_air(&proof_options)
+        .with_preprocessed(prover_commitment, decode::NUM_PRECOMPUTED_COLS);
 
     let air_trace_pairs: Vec<(
         &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
@@ -1067,10 +1065,8 @@ fn test_decode_soundness_same_elf_accepted() {
     let verifier_lt_air = create_lt_air(&proof_options);
     let verifier_memw_air = create_memw_air(&proof_options);
     let verifier_load_air = create_load_air(&proof_options);
-    let verifier_decode_air = create_decode_air(&proof_options).with_preprocessed(
-        verifier_commitment,
-        decode::NUM_PRECOMPUTED_COLS,
-    );
+    let verifier_decode_air = create_decode_air(&proof_options)
+        .with_preprocessed(verifier_commitment, decode::NUM_PRECOMPUTED_COLS);
 
     let verifier_airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
         &verifier_cpu_air,
@@ -1088,8 +1084,5 @@ fn test_decode_soundness_same_elf_accepted() {
     );
 
     // With same ELF, verification should SUCCEED
-    assert!(
-        result,
-        "Verifier with same ELF should ACCEPT the proof"
-    );
+    assert!(result, "Verifier with same ELF should ACCEPT the proof");
 }
