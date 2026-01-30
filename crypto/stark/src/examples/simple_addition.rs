@@ -115,7 +115,7 @@ where
 
         let context = AirContext {
             proof_options: proof_options.clone(),
-            trace_columns: 3, // col0, col1, col2
+            trace_columns: 3,            // col0, col1, col2
             transition_offsets: vec![0], // Only need current step
             num_transition_constraints: constraints.len(),
         };

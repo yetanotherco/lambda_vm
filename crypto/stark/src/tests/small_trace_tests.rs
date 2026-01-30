@@ -6,7 +6,9 @@ use math::field::{
 };
 
 use crate::{
-    examples::simple_addition::{simple_addition_trace, SimpleAdditionAIR, SimpleAdditionPublicInputs},
+    examples::simple_addition::{
+        SimpleAdditionAIR, SimpleAdditionPublicInputs, simple_addition_trace,
+    },
     proof::options::ProofOptions,
     prover::{IsStarkProver, Prover},
     traits::AIR,
