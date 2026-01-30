@@ -6,11 +6,8 @@
 //!
 //! - **BITWISE**: Precomputed lookup table for bitwise operations (2^20 rows)
 //! - **LT**: Less-than comparison table
-//! - **BRANCH**: Branch target computation table
-//! - **MUL**: 64-bit multiplication table
-//! - **SHIFT**: Shift operations table
 //! - **CPU**: Main execution table
-//! - **DECODE**: Instruction decode table (dummy - spec not available)
+//! - **DECODE**: Instruction decode table
 //!
 //! ## Memory Tables
 //!
@@ -21,6 +18,7 @@ pub mod types;
 
 pub mod bitwise;
 pub mod cpu;
+pub mod decode;
 pub mod load;
 pub mod lt;
 pub mod memw;
