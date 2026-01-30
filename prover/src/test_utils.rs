@@ -31,6 +31,7 @@ use crate::tables::bitwise::{
 use crate::tables::cpu::{
     CpuOperation, bus_interactions as cpu_bus_interactions, cols as cpu_cols,
 };
+use crate::tables::decode;
 use crate::tables::decode::{bus_interactions as decode_bus_interactions, cols as decode_cols};
 use crate::tables::load::{
     bus_interactions as load_bus_interactions, cols as load_cols, constraints as load_constraints,
@@ -542,16 +543,25 @@ pub fn create_load_air(proof_options: &ProofOptions) -> VmAir {
     )
 }
 
-/// Create DECODE AIR with bus interactions.
+/// Create DECODE AIR with bus interactions and program-dependent precomputed commitment.
 ///
 /// The DECODE table has no transition constraints (it's a pure lookup table).
 /// It receives lookups from the CPU table via the DECODE bus.
-pub fn create_decode_air(proof_options: &ProofOptions) -> VmAir {
+///
+/// The commitment is computed from the program instructions at AIR creation time.
+/// Both prover and verifier must create the AIR with the same instructions.
+pub fn create_decode_air(
+    proof_options: &ProofOptions,
+    instructions: &U64HashMap<Instruction>,
+) -> VmAir {
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: decode_bus_interactions(),
     };
+
+    // Compute commitment from program - this makes DECODE program-dependent
+    let commitment = decode::compute_precomputed_commitment(instructions, proof_options);
 
     AirWithBuses::new(
         decode_cols::NUM_COLUMNS,
@@ -560,4 +570,5 @@ pub fn create_decode_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_preprocessed(commitment, decode::NUM_PRECOMPUTED_COLS)
 }
