@@ -44,17 +44,19 @@ mod sender_cols {
     pub const PC_0: usize = 2;
     /// pc[1]: Word (bits 32-63)
     pub const PC_1: usize = 3;
-    /// offset: Word
-    pub const OFFSET: usize = 4;
+    /// offset[0]: Word (bits 0-31)
+    pub const OFFSET_0: usize = 4;
+    /// offset[1]: Word (bits 32-63)
+    pub const OFFSET_1: usize = 5;
     /// register[0]: Word (bits 0-31)
-    pub const REGISTER_0: usize = 5;
+    pub const REGISTER_0: usize = 6;
     /// register[1]: Word (bits 32-63)
-    pub const REGISTER_1: usize = 6;
+    pub const REGISTER_1: usize = 7;
     /// JALR flag
-    pub const JALR: usize = 7;
+    pub const JALR: usize = 8;
     /// multiplicity (1 = active row)
-    pub const MU: usize = 8;
-    pub const NUM_COLUMNS: usize = 9;
+    pub const MU: usize = 9;
+    pub const NUM_COLUMNS: usize = 10;
 }
 
 // =============================================================================
@@ -89,9 +91,13 @@ fn new_sender_air(
                     start_column: sender_cols::PC_1,
                     packing: Packing::Direct,
                 },
-                // offset
+                // offset as DWordWL
                 BusValue::Packed {
-                    start_column: sender_cols::OFFSET,
+                    start_column: sender_cols::OFFSET_0,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: sender_cols::OFFSET_1,
                     packing: Packing::Direct,
                 },
                 // register as DWordWL
@@ -166,9 +172,13 @@ fn new_receiver_air(
                     start_column: cols::PC_1,
                     packing: Packing::Direct,
                 },
-                // offset
+                // offset as DWordWL
                 BusValue::Packed {
-                    start_column: cols::OFFSET,
+                    start_column: cols::OFFSET_0,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::OFFSET_1,
                     packing: Packing::Direct,
                 },
                 // register as DWordWL
@@ -219,6 +229,10 @@ fn create_sender_trace(ops: &[BranchOperation]) -> TraceTable<F, E> {
         let pc_0 = (op.pc & 0xFFFF_FFFF) as u32;
         let pc_1 = (op.pc >> 32) as u32;
 
+        // Extract offset as DWordWL
+        let offset_0 = (op.offset & 0xFFFF_FFFF) as u32;
+        let offset_1 = (op.offset >> 32) as u32;
+
         // Extract register as DWordWL
         let register_0 = (op.register & 0xFFFF_FFFF) as u32;
         let register_1 = (op.register >> 32) as u32;
@@ -227,7 +241,8 @@ fn create_sender_trace(ops: &[BranchOperation]) -> TraceTable<F, E> {
         data[base + sender_cols::NEXT_PC_1] = FE::from(next_pc_1 as u64);
         data[base + sender_cols::PC_0] = FE::from(pc_0 as u64);
         data[base + sender_cols::PC_1] = FE::from(pc_1 as u64);
-        data[base + sender_cols::OFFSET] = FE::from(op.offset as u64);
+        data[base + sender_cols::OFFSET_0] = FE::from(offset_0 as u64);
+        data[base + sender_cols::OFFSET_1] = FE::from(offset_1 as u64);
         data[base + sender_cols::REGISTER_0] = FE::from(register_0 as u64);
         data[base + sender_cols::REGISTER_1] = FE::from(register_1 as u64);
         data[base + sender_cols::JALR] = FE::from(if op.jalr { 1u64 } else { 0u64 });
@@ -240,7 +255,7 @@ fn create_sender_trace(ops: &[BranchOperation]) -> TraceTable<F, E> {
 /// Create a receiver trace that matches sender operations (for completeness tests).
 fn create_receiver_trace(ops: &[BranchOperation]) -> TraceTable<F, E> {
     // Count multiplicities for each unique operation
-    let mut multiplicities: HashMap<(u64, u32, u64, bool), u32> = HashMap::new();
+    let mut multiplicities: HashMap<(u64, u64, u64, bool), u32> = HashMap::new();
     for op in ops {
         *multiplicities
             .entry((op.pc, op.offset, op.register, op.jalr))
@@ -265,6 +280,10 @@ fn create_receiver_trace(ops: &[BranchOperation]) -> TraceTable<F, E> {
         let pc_0 = (op.pc & 0xFFFF_FFFF) as u32;
         let pc_1 = (op.pc >> 32) as u32;
 
+        // Extract offset as DWordWL
+        let offset_0 = (op.offset & 0xFFFF_FFFF) as u32;
+        let offset_1 = (op.offset >> 32) as u32;
+
         // Extract register as DWordWL
         let register_0 = (op.register & 0xFFFF_FFFF) as u32;
         let register_1 = (op.register >> 32) as u32;
@@ -281,13 +300,11 @@ fn create_receiver_trace(ops: &[BranchOperation]) -> TraceTable<F, E> {
         let next_pc_high_1 = ((next_pc >> 32) & 0xFFFF) as u16;
         let next_pc_high_2 = ((next_pc >> 48) & 0xFFFF) as u16;
 
-        // Sign bit for offset
-        let sign_bit = if op.offset >= (1u32 << 31) { 1u64 } else { 0u64 };
-
         // Store columns
         data[base + cols::PC_0] = FE::from(pc_0 as u64);
         data[base + cols::PC_1] = FE::from(pc_1 as u64);
-        data[base + cols::OFFSET] = FE::from(op.offset as u64);
+        data[base + cols::OFFSET_0] = FE::from(offset_0 as u64);
+        data[base + cols::OFFSET_1] = FE::from(offset_1 as u64);
         data[base + cols::REGISTER_0] = FE::from(register_0 as u64);
         data[base + cols::REGISTER_1] = FE::from(register_1 as u64);
         data[base + cols::JALR] = FE::from(if op.jalr { 1u64 } else { 0u64 });
@@ -297,7 +314,6 @@ fn create_receiver_trace(ops: &[BranchOperation]) -> TraceTable<F, E> {
         data[base + cols::NEXT_PC_LOW_0] = FE::from(next_pc_low_0 as u64);
         data[base + cols::NEXT_PC_LOW_1] = FE::from(next_pc_low_1 as u64);
         data[base + cols::UNMASKED_LOW_BYTE] = FE::from(unmasked_low_byte as u64);
-        data[base + cols::SIGN_BIT] = FE::from(sign_bit);
         data[base + cols::MU] = FE::from(*mult as u64);
     }
 
@@ -334,7 +350,7 @@ fn prove_and_verify(ops: &[BranchOperation]) -> bool {
 /// Create a custom receiver trace for soundness tests.
 struct CustomBranchRow {
     pc: u64,
-    offset: u32,
+    offset: u64,
     register: u64,
     jalr: bool,
     next_pc: u64, // Can be wrong for soundness tests
@@ -350,6 +366,9 @@ fn create_custom_receiver_trace(rows: &[CustomBranchRow]) -> TraceTable<F, E> {
 
         let pc_0 = (row.pc & 0xFFFF_FFFF) as u32;
         let pc_1 = (row.pc >> 32) as u32;
+
+        let offset_0 = (row.offset & 0xFFFF_FFFF) as u32;
+        let offset_1 = (row.offset >> 32) as u32;
 
         let register_0 = (row.register & 0xFFFF_FFFF) as u32;
         let register_1 = (row.register >> 32) as u32;
@@ -368,15 +387,10 @@ fn create_custom_receiver_trace(rows: &[CustomBranchRow]) -> TraceTable<F, E> {
         let next_pc_high_1 = ((next_pc >> 32) & 0xFFFF) as u16;
         let next_pc_high_2 = ((next_pc >> 48) & 0xFFFF) as u16;
 
-        let sign_bit = if row.offset >= (1u32 << 31) {
-            1u64
-        } else {
-            0u64
-        };
-
         data[base + cols::PC_0] = FE::from(pc_0 as u64);
         data[base + cols::PC_1] = FE::from(pc_1 as u64);
-        data[base + cols::OFFSET] = FE::from(row.offset as u64);
+        data[base + cols::OFFSET_0] = FE::from(offset_0 as u64);
+        data[base + cols::OFFSET_1] = FE::from(offset_1 as u64);
         data[base + cols::REGISTER_0] = FE::from(register_0 as u64);
         data[base + cols::REGISTER_1] = FE::from(register_1 as u64);
         data[base + cols::JALR] = FE::from(if row.jalr { 1u64 } else { 0u64 });
@@ -386,7 +400,6 @@ fn create_custom_receiver_trace(rows: &[CustomBranchRow]) -> TraceTable<F, E> {
         data[base + cols::NEXT_PC_LOW_0] = FE::from(next_pc_low_0 as u64);
         data[base + cols::NEXT_PC_LOW_1] = FE::from(next_pc_low_1 as u64);
         data[base + cols::UNMASKED_LOW_BYTE] = FE::from(unmasked_low_byte as u64);
-        data[base + cols::SIGN_BIT] = FE::from(sign_bit);
         data[base + cols::MU] = FE::from(row.multiplicity as u64);
     }
 
@@ -490,8 +503,8 @@ fn test_border_max_pc() {
 
 #[test]
 fn test_border_negative_offset() {
-    // PC + negative offset (offset >= 2^31 is negative in signed interpretation)
-    let negative_4: u32 = (-4i32) as u32; // 0xFFFFFFFC
+    // PC + negative offset (sign-extended to 64-bit)
+    let negative_4: u64 = (-4i64) as u64; // 0xFFFFFFFF_FFFFFFFC
     let ops = vec![BranchOperation::new(0x1000, negative_4, 0, false)];
     // Expected: next_pc = 0x1000 + (-4) = 0x0FFC, masked to even = 0x0FFC
     assert!(prove_and_verify(&ops));
@@ -507,8 +520,8 @@ fn test_border_jalr_operation() {
 
 #[test]
 fn test_border_jalr_with_negative_offset() {
-    // JALR with negative offset
-    let negative_16: u32 = (-16i32) as u32;
+    // JALR with negative offset (sign-extended to 64-bit)
+    let negative_16: u64 = (-16i64) as u64;
     let ops = vec![BranchOperation::new(0x1000, negative_16, 0x3000, true)];
     // Expected: next_pc = 0x3000 + (-16) = 0x2FF0, masked to even = 0x2FF0
     assert!(prove_and_verify(&ops));
@@ -565,10 +578,10 @@ fn test_completeness_duplicate_lookups() {
 #[test]
 fn test_completeness_mixed_jalr_and_branch() {
     let ops = vec![
-        BranchOperation::new(0x1000, 16, 0, false),          // branch
-        BranchOperation::new(0x2000, 32, 0x8000, true),      // jalr
-        BranchOperation::new(0x3000, (-8i32) as u32, 0, false), // branch with negative offset
-        BranchOperation::new(0x4000, (-16i32) as u32, 0xA000, true), // jalr with negative offset
+        BranchOperation::new(0x1000, 16, 0, false),            // branch
+        BranchOperation::new(0x2000, 32, 0x8000, true),        // jalr
+        BranchOperation::new(0x3000, (-8i64) as u64, 0, false), // branch with negative offset
+        BranchOperation::new(0x4000, (-16i64) as u64, 0xA000, true), // jalr with negative offset
     ];
     assert!(prove_and_verify(&ops));
 }
