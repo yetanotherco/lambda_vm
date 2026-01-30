@@ -152,7 +152,6 @@ Hence, only @dvrm:c:q_if_div_by_zero is required to completely constrain R5; @dv
 
 === Other
 The following constraints are included to enforce the values of `msb_n`, `msb_r`, `sign_r` and `sign_d` are correct.
-Also, we ensure the multiplicities are binary.
 #render_constraint_table(chip, config, groups:("defs", ))
 
 === Output

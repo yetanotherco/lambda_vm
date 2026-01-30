@@ -126,13 +126,13 @@ def = ["+", "μ_q", "μ_r"]
 
 [[variables.multiplicity]]
 name = "μ_q"
-type = "Bit"
+type = "BaseField"
 desc = ""
 pad = 0
 
 [[variables.multiplicity]]
 name = "μ_r"
-type = "Bit"
+type = "BaseField"
 desc = ""
 pad = 0
 
@@ -353,18 +353,6 @@ tag = "SIGN"
 input = [["idx", "d", 3], "signed"]
 output = "sign_d"
 ref = "dvrm:c:sign_d"
-
-[[constraints.defs]]
-kind = "template"
-tag = "IS_BIT"
-input = ["μ_q"]
-ref = "dvrm:c:is_bit_μ_q"
-
-[[constraints.defs]]
-kind = "template"
-tag = "IS_BIT"
-input = ["μ_r"]
-ref = "dvrm:c:is_bit_μ_r"
 
 [[constraint_groups]]
 name = "div_by_zero"
