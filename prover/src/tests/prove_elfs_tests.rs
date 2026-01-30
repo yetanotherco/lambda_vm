@@ -862,3 +862,42 @@ fn test_prove_elfs_all_instructions_64_full() {
         "all_instructions_64_full failed - comprehensive test with full bitwise table"
     );
 }
+
+/// Memory profiling test using dhat.
+///
+/// Run with:
+/// ```
+/// cargo test -p prover --release --features dhat-heap test_dhat_memory_profile -- --ignored --nocapture
+/// ```
+///
+/// This generates `dhat-heap.json` which can be viewed with:
+/// https://nnethercote.github.io/dh_view/dh_view.html
+#[test]
+#[ignore]
+fn test_dhat_memory_profile() {
+    #[cfg(feature = "dhat-heap")]
+    let _profiler = dhat::Profiler::new_heap();
+
+    let program_name = "loop_4096";
+    let (logs, instructions) = run_asm_elf(program_name);
+
+    // Output metadata for CI parsing
+    println!("MEMORY_PROFILE_PROGRAM={}", program_name);
+    println!("MEMORY_PROFILE_INSTRUCTIONS={}", logs.len());
+
+    assert_eq!(logs.len(), 4096, "Expected 2^12 instructions");
+
+    let mut traces = Traces::from_logs_minimal(&logs, instructions).unwrap();
+
+    assert!(
+        prove_and_verify_vm_minimal(
+            &mut traces.cpu,
+            &mut traces.bitwise,
+            &mut traces.lt,
+            &mut traces.memw,
+            &mut traces.load,
+            &mut traces.decode
+        ),
+        "verification failed"
+    );
+}
