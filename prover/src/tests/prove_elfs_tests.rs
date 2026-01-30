@@ -70,7 +70,8 @@ fn prove_and_verify_vm(
     let load_air = create_load_air(&proof_options);
     // Verifier computes DECODE commitment directly from ELF (no executor needed)
     let decode_air = create_decode_air(&proof_options).with_preprocessed(
-        decode::commitment_from_elf(elf, &proof_options).expect("Failed to compute decode commitment"),
+        decode::commitment_from_elf(elf, &proof_options)
+            .expect("Failed to compute decode commitment"),
         decode::NUM_PRECOMPUTED_COLS,
     );
     let branch_air = create_branch_air(&proof_options);
