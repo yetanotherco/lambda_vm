@@ -845,3 +845,251 @@ fn test_instructions_from_elf_includes_all_executable() {
         assert_eq!(pc % 4, 0, "PC {:#x} is not 4-byte aligned", pc);
     }
 }
+
+// =========================================================================
+// Soundness tests (prover/verifier decoupling)
+// =========================================================================
+
+/// SECURITY TEST: Verifier with different ELF rejects proof.
+///
+/// This test proves the security model works:
+/// - Prover runs program A, generates proof with DECODE commitment from ELF A
+/// - Verifier has ELF B, computes DECODE commitment from ELF B
+/// - Commitments differ → Fiat-Shamir challenges differ → verification FAILS
+///
+/// This demonstrates that a verifier who independently has the correct ELF
+/// will reject proofs from a prover who ran a different program.
+#[test]
+fn test_decode_soundness_different_elf_rejected() {
+    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+    use stark::proof::options::ProofOptions;
+    use stark::prover::{IsStarkProver, Prover};
+    use stark::traits::AIR;
+    use stark::verifier::{IsStarkVerifier, Verifier};
+
+    use crate::tables::decode::{self, commitment_from_elf};
+    use crate::tables::trace_builder::Traces;
+    use crate::tables::types::{GoldilocksExtension, GoldilocksField};
+    use crate::test_utils::{
+        create_bitwise_air, create_cpu_air, create_decode_air, create_load_air, create_lt_air,
+        create_memw_air,
+    };
+
+    type F = GoldilocksField;
+    type E = GoldilocksExtension;
+
+    let proof_options = ProofOptions::default_test_options();
+
+    // Load two DIFFERENT ELF files
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let elf_path_a = manifest_dir
+        .parent()
+        .unwrap()
+        .join("executor/program_artifacts/asm/arith_8.elf");
+    let elf_path_b = manifest_dir
+        .parent()
+        .unwrap()
+        .join("executor/program_artifacts/asm/test_sub_8.elf");
+
+    let elf_bytes_a = std::fs::read(&elf_path_a).expect("Failed to read ELF A");
+    let elf_bytes_b = std::fs::read(&elf_path_b).expect("Failed to read ELF B");
+
+    let elf_a = Elf::load(&elf_bytes_a).expect("Failed to load ELF A");
+    let elf_b = Elf::load(&elf_bytes_b).expect("Failed to load ELF B");
+
+    // Verify the two programs produce different commitments
+    let commitment_a = commitment_from_elf(&elf_a, &proof_options).expect("commitment A");
+    let commitment_b = commitment_from_elf(&elf_b, &proof_options).expect("commitment B");
+    assert_ne!(
+        commitment_a, commitment_b,
+        "Test requires two different programs with different commitments"
+    );
+
+    // =========================================================================
+    // PROVER: Runs program A, builds traces, generates proof
+    // =========================================================================
+    let executor_a =
+        executor::vm::execution::Executor::new(&elf_a, vec![]).expect("Failed to create executor");
+    let result_a = executor_a.run().expect("Failed to run program A");
+
+    let mut traces = Traces::from_logs(&result_a.logs, result_a.instructions).unwrap();
+
+    // Prover builds AIRs with commitment from ELF A
+    let prover_cpu_air = create_cpu_air(&proof_options);
+    let prover_bitwise_air = create_bitwise_air(&proof_options);
+    let prover_lt_air = create_lt_air(&proof_options);
+    let prover_memw_air = create_memw_air(&proof_options);
+    let prover_load_air = create_load_air(&proof_options);
+    let prover_decode_air = create_decode_air(&proof_options).with_preprocessed(
+        commitment_a, // Prover uses commitment from ELF A
+        decode::NUM_PRECOMPUTED_COLS,
+    );
+
+    let air_trace_pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&prover_cpu_air, &mut traces.cpu, &()),
+        (&prover_bitwise_air, &mut traces.bitwise, &()),
+        (&prover_lt_air, &mut traces.lt, &()),
+        (&prover_memw_air, &mut traces.memw, &()),
+        (&prover_load_air, &mut traces.load, &()),
+        (&prover_decode_air, &mut traces.decode, &()),
+    ];
+
+    let proof = Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
+        .expect("Prover failed to generate proof");
+
+    // =========================================================================
+    // VERIFIER: Has ELF B (different program!), computes commitment from it
+    // =========================================================================
+    let verifier_cpu_air = create_cpu_air(&proof_options);
+    let verifier_bitwise_air = create_bitwise_air(&proof_options);
+    let verifier_lt_air = create_lt_air(&proof_options);
+    let verifier_memw_air = create_memw_air(&proof_options);
+    let verifier_load_air = create_load_air(&proof_options);
+    let verifier_decode_air = create_decode_air(&proof_options).with_preprocessed(
+        commitment_b, // Verifier uses commitment from ELF B (DIFFERENT!)
+        decode::NUM_PRECOMPUTED_COLS,
+    );
+
+    let verifier_airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
+        &verifier_cpu_air,
+        &verifier_bitwise_air,
+        &verifier_lt_air,
+        &verifier_memw_air,
+        &verifier_load_air,
+        &verifier_decode_air,
+    ];
+
+    let result = Verifier::multi_verify(
+        &verifier_airs,
+        &proof,
+        &mut DefaultTranscript::<E>::new(&[]),
+    );
+
+    // With different ELFs, verification should FAIL (secure!)
+    assert!(
+        !result,
+        "Verifier with different ELF should REJECT the proof"
+    );
+}
+
+/// SECURITY TEST: Verifier with same ELF accepts proof.
+///
+/// Complementary test: when prover and verifier have the SAME ELF,
+/// verification should succeed.
+#[test]
+fn test_decode_soundness_same_elf_accepted() {
+    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+    use stark::proof::options::ProofOptions;
+    use stark::prover::{IsStarkProver, Prover};
+    use stark::traits::AIR;
+    use stark::verifier::{IsStarkVerifier, Verifier};
+
+    use crate::tables::decode::{self, commitment_from_elf};
+    use crate::tables::trace_builder::Traces;
+    use crate::tables::types::{GoldilocksExtension, GoldilocksField};
+    use crate::test_utils::{
+        create_bitwise_air, create_cpu_air, create_decode_air, create_load_air, create_lt_air,
+        create_memw_air,
+    };
+
+    type F = GoldilocksField;
+    type E = GoldilocksExtension;
+
+    let proof_options = ProofOptions::default_test_options();
+
+    // Load the SAME ELF for both prover and verifier
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let elf_path = manifest_dir
+        .parent()
+        .unwrap()
+        .join("executor/program_artifacts/asm/arith_8.elf");
+
+    let elf_bytes = std::fs::read(&elf_path).expect("Failed to read ELF");
+
+    // Prover loads ELF
+    let prover_elf = Elf::load(&elf_bytes).expect("Prover: failed to load ELF");
+    // Verifier loads ELF independently (same bytes)
+    let verifier_elf = Elf::load(&elf_bytes).expect("Verifier: failed to load ELF");
+
+    // =========================================================================
+    // PROVER: Runs program, builds traces, generates proof
+    // =========================================================================
+    let executor =
+        executor::vm::execution::Executor::new(&prover_elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+
+    let mut traces = Traces::from_logs(&result.logs, result.instructions).unwrap();
+
+    let prover_commitment =
+        commitment_from_elf(&prover_elf, &proof_options).expect("prover commitment");
+
+    let prover_cpu_air = create_cpu_air(&proof_options);
+    let prover_bitwise_air = create_bitwise_air(&proof_options);
+    let prover_lt_air = create_lt_air(&proof_options);
+    let prover_memw_air = create_memw_air(&proof_options);
+    let prover_load_air = create_load_air(&proof_options);
+    let prover_decode_air = create_decode_air(&proof_options).with_preprocessed(
+        prover_commitment,
+        decode::NUM_PRECOMPUTED_COLS,
+    );
+
+    let air_trace_pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&prover_cpu_air, &mut traces.cpu, &()),
+        (&prover_bitwise_air, &mut traces.bitwise, &()),
+        (&prover_lt_air, &mut traces.lt, &()),
+        (&prover_memw_air, &mut traces.memw, &()),
+        (&prover_load_air, &mut traces.load, &()),
+        (&prover_decode_air, &mut traces.decode, &()),
+    ];
+
+    let proof = Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
+        .expect("Prover failed to generate proof");
+
+    // =========================================================================
+    // VERIFIER: Loads same ELF independently, computes commitment
+    // =========================================================================
+    let verifier_commitment =
+        commitment_from_elf(&verifier_elf, &proof_options).expect("verifier commitment");
+
+    // Commitments should match (same ELF)
+    assert_eq!(prover_commitment, verifier_commitment);
+
+    let verifier_cpu_air = create_cpu_air(&proof_options);
+    let verifier_bitwise_air = create_bitwise_air(&proof_options);
+    let verifier_lt_air = create_lt_air(&proof_options);
+    let verifier_memw_air = create_memw_air(&proof_options);
+    let verifier_load_air = create_load_air(&proof_options);
+    let verifier_decode_air = create_decode_air(&proof_options).with_preprocessed(
+        verifier_commitment,
+        decode::NUM_PRECOMPUTED_COLS,
+    );
+
+    let verifier_airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
+        &verifier_cpu_air,
+        &verifier_bitwise_air,
+        &verifier_lt_air,
+        &verifier_memw_air,
+        &verifier_load_air,
+        &verifier_decode_air,
+    ];
+
+    let result = Verifier::multi_verify(
+        &verifier_airs,
+        &proof,
+        &mut DefaultTranscript::<E>::new(&[]),
+    );
+
+    // With same ELF, verification should SUCCEED
+    assert!(
+        result,
+        "Verifier with same ELF should ACCEPT the proof"
+    );
+}
