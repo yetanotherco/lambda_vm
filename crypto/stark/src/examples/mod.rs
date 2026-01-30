@@ -8,5 +8,6 @@ pub mod multi_table_lookup;
 pub mod quadratic_air;
 pub mod read_only_memory;
 pub mod read_only_memory_logup;
+pub mod simple_addition;
 pub mod simple_fibonacci;
 pub mod simple_periodic_cols;

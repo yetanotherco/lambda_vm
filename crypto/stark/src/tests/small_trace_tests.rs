@@ -1,0 +1,108 @@
+//! Tests for STARK proving/verification with small traces (1-2 rows).
+//! These tests verify that the FRI protocol handles 0 FRI layers correctly.
+
+use math::field::{
+    element::FieldElement, fields::fft_friendly::stark_252_prime_field::Stark252PrimeField,
+};
+
+use crate::{
+    examples::simple_addition::{simple_addition_trace, SimpleAdditionAIR, SimpleAdditionPublicInputs},
+    proof::options::ProofOptions,
+    prover::{IsStarkProver, Prover},
+    traits::AIR,
+    transcript::StoneProverTranscript,
+    verifier::{IsStarkVerifier, Verifier},
+};
+
+type Felt252 = FieldElement<Stark252PrimeField>;
+
+/// Test STARK prove/verify with a single-row trace.
+/// This exercises the FRI protocol with 0 FRI layers (trace_length=1, number_layers=0).
+#[test_log::test]
+fn test_prove_verify_single_row() {
+    let mut trace = simple_addition_trace::<Stark252PrimeField>(1);
+
+    let proof_options = ProofOptions::default_test_options();
+
+    // For row 0: col0=1, col1=2, col2=3 (1+2=3)
+    let pub_inputs = SimpleAdditionPublicInputs {
+        a: Felt252::from(1u64),
+        b: Felt252::from(2u64),
+    };
+
+    let air = SimpleAdditionAIR::<Stark252PrimeField>::new(&proof_options);
+
+    let proof = Prover::prove(
+        &air,
+        &mut trace,
+        &pub_inputs,
+        &mut StoneProverTranscript::new(&[]),
+    )
+    .unwrap();
+
+    assert!(
+        Verifier::verify(&proof, &air, &mut StoneProverTranscript::new(&[])),
+        "Verification failed for single-row trace"
+    );
+}
+
+/// Test STARK prove/verify with a two-row trace.
+/// This exercises the FRI protocol with 0 FRI layers (trace_length=2, number_layers=1).
+#[test_log::test]
+fn test_prove_verify_two_rows() {
+    let mut trace = simple_addition_trace::<Stark252PrimeField>(2);
+
+    let proof_options = ProofOptions::default_test_options();
+
+    // For row 0: col0=1, col1=2, col2=3 (1+2=3)
+    let pub_inputs = SimpleAdditionPublicInputs {
+        a: Felt252::from(1u64),
+        b: Felt252::from(2u64),
+    };
+
+    let air = SimpleAdditionAIR::<Stark252PrimeField>::new(&proof_options);
+
+    let proof = Prover::prove(
+        &air,
+        &mut trace,
+        &pub_inputs,
+        &mut StoneProverTranscript::new(&[]),
+    )
+    .unwrap();
+
+    assert!(
+        Verifier::verify(&proof, &air, &mut StoneProverTranscript::new(&[])),
+        "Verification failed for two-row trace"
+    );
+}
+
+/// Test that verification succeeds with correct public inputs.
+/// This ensures the small trace proof works correctly.
+#[test_log::test]
+fn test_verify_fails_with_wrong_inputs() {
+    let mut trace = simple_addition_trace::<Stark252PrimeField>(2);
+
+    let proof_options = ProofOptions::default_test_options();
+
+    // Correct public inputs
+    let pub_inputs = SimpleAdditionPublicInputs {
+        a: Felt252::from(1u64),
+        b: Felt252::from(2u64),
+    };
+
+    let air = SimpleAdditionAIR::<Stark252PrimeField>::new(&proof_options);
+
+    let proof = Prover::prove(
+        &air,
+        &mut trace,
+        &pub_inputs,
+        &mut StoneProverTranscript::new(&[]),
+    )
+    .unwrap();
+
+    // Verify the proof is correct
+    assert!(
+        Verifier::verify(&proof, &air, &mut StoneProverTranscript::new(&[])),
+        "Verification should succeed with correct inputs"
+    );
+}
