@@ -117,12 +117,13 @@ pub fn generate_decode_trace(
         })
         .collect();
 
-    // Add the CPU padding entry: pc=1, all flags=0 (per spec, decode must include this)
-    // This row is looked up by CPU padding rows. Its MU will be set by update_multiplicities.
+    // Add the CPU padding entry: pc=CPU_PADDING_PC, all flags=0 (per spec, decode must
+    // include this). This row is looked up by CPU padding rows. Its MU will be set by
+    // update_multiplicities.
     let cpu_padding_row = entries.len();
-    pc_to_row.insert(1u64, cpu_padding_row);
+    pc_to_row.insert(super::cpu::CPU_PADDING_PC, cpu_padding_row);
     let cpu_padding_entry = DecodeEntry {
-        pc: 1,
+        pc: super::cpu::CPU_PADDING_PC,
         ..Default::default()
     };
 

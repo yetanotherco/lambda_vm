@@ -58,6 +58,11 @@ use executor::vm::{instruction::decoding::Instruction, logs::Log, memory::U64Has
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
+/// PC value used for CPU padding rows. Per spec, this is an odd address (unreachable
+/// during normal execution) with all flags=0. The DECODE table must contain a
+/// corresponding entry at this PC.
+pub const CPU_PADDING_PC: u64 = 1;
+
 // =========================================================================
 // Column indices for CPU table
 // =========================================================================
@@ -626,8 +631,10 @@ impl CpuOperation {
             self.rv1 = log.current_pc;
         }
 
-        // ECALL: Per spec constraint CO69, next_pc = pc + instr_size unconditionally.
-        // The executor sets next_pc=0 for halt, but the prover trace must use pc+4.
+        // ECALL: Per spec constraint CO69, next_pc = pc + instr_size for all instructions,
+        // including ECALL. The CPU transition constraint enforces next_pc = pc + 4 on every
+        // row, so the trace must satisfy this even though the executor sets next_pc=0 to
+        // signal halt. The HALT table separately proves program termination via the ECALL bus.
         if self.decode.op_ecall {
             self.next_pc = self.decode.pc + 4;
         }
@@ -760,8 +767,8 @@ pub fn generate_cpu_trace(
     // The DECODE table must contain a corresponding entry at pc=1.
     for row_idx in n..num_rows {
         let base = row_idx * cols::NUM_COLUMNS;
-        data[base + cols::PC_0] = FE::one();
-        data[base + cols::NEXT_PC_0] = FE::from(5u64);
+        data[base + cols::PC_0] = FE::from(CPU_PADDING_PC);
+        data[base + cols::NEXT_PC_0] = FE::from(CPU_PADDING_PC + 4);
     }
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)

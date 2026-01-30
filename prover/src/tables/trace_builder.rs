@@ -632,7 +632,7 @@ impl Traces {
             .iter()
             .rev()
             .find(|op| op.decode.op_ecall)
-            .expect("Program must contain an ECALL (halt) instruction");
+            .ok_or(ProverError::MissingEcall)?;
         let halt_trace = halt::generate_halt_trace(halt_op.timestamp);
 
         let cpu = cpu::generate_cpu_trace(&cpu_ops);
@@ -649,7 +649,7 @@ impl Traces {
         let (mut decode, pc_to_row) = decode::generate_decode_trace(&instructions);
         let num_padding_rows = cpu_ops.len().next_power_of_two() - cpu_ops.len();
         let mut decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
-        decode_lookups.extend(std::iter::repeat_n(1u64, num_padding_rows));
+        decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
         decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
 
         Ok(Traces {

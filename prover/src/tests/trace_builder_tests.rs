@@ -63,9 +63,9 @@ fn append_ecall(logs: &mut Vec<Log>, instrs: &mut Vec<Instruction>) {
 }
 
 #[test]
-#[should_panic(expected = "Program must contain an ECALL")]
 fn test_empty_logs() {
-    let _traces = Traces::from_logs(&[], U64HashMap::default()).unwrap();
+    let result = Traces::from_logs(&[], U64HashMap::default());
+    assert!(result.is_err(), "Empty logs should return an error");
 }
 
 #[test]

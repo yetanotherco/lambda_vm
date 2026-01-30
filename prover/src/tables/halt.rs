@@ -46,7 +46,16 @@ pub mod cols {
 /// Generates the HALT trace table from the halt timestamp.
 ///
 /// This produces a single-row table with the timestamp split into DWordWL format.
+/// The HALT table expects exactly one ECALL per execution: the executor stops on the
+/// first ECALL, so a valid trace always contains exactly one. If a program had multiple
+/// ECALLs, the CPU would send multiple bus interactions but HALT only receives one,
+/// causing a bus imbalance and proof failure.
 pub fn generate_halt_trace(timestamp: u64) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    // CPU timestamps must fit in u32 (timestamp_hi should be 0)
+    debug_assert!(
+        timestamp <= u32::MAX as u64,
+        "HALT timestamp {timestamp} exceeds u32 range"
+    );
     let timestamp_lo = timestamp & 0xFFFF_FFFF;
     let timestamp_hi = timestamp >> 32;
 
