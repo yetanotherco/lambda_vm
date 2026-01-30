@@ -735,7 +735,7 @@ fn test_compute_precomputed_commitment_different_pc() {
 #[test]
 fn test_instructions_from_elf_matches_executor() {
     // Run executor to get instructions
-    let (_logs, executor_instructions) = run_asm_elf("arith_8");
+    let (_elf, _logs, executor_instructions) = run_asm_elf("arith_8");
 
     // Load the same ELF and extract instructions directly
     let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -783,7 +783,7 @@ fn test_instructions_from_elf_matches_executor() {
 /// Test instructions_from_elf with a more complex program.
 #[test]
 fn test_instructions_from_elf_matches_executor_complex() {
-    let (_logs, executor_instructions) = run_asm_elf("all_instructions_64");
+    let (_elf, _logs, executor_instructions) = run_asm_elf("all_instructions_64");
 
     let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let elf_path = manifest_dir

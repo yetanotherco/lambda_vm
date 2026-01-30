@@ -53,8 +53,8 @@ pub type VmAir = AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()>;
 
 /// Helper to run an ELF from the program_artifacts directory.
 ///
-/// Returns the execution logs and instruction map.
-pub fn run_asm_elf(name: &str) -> (Vec<Log>, U64HashMap<Instruction>) {
+/// Returns the ELF, execution logs, and instruction map.
+pub fn run_asm_elf(name: &str) -> (Elf, Vec<Log>, U64HashMap<Instruction>) {
     // Get workspace root by going up one level from prover directory
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest_dir
@@ -70,10 +70,10 @@ pub fn run_asm_elf(name: &str) -> (Vec<Log>, U64HashMap<Instruction>) {
 
     let elf_data =
         std::fs::read(&path).unwrap_or_else(|_| panic!("Failed to read ELF: {}", path.display()));
-    let program = Elf::load(&elf_data).expect("Failed to load ELF");
-    let executor = Executor::new(&program, vec![]).expect("Failed to create executor");
+    let elf = Elf::load(&elf_data).expect("Failed to load ELF");
+    let executor = Executor::new(&elf, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
-    (result.logs, result.instructions)
+    (elf, result.logs, result.instructions)
 }
 
 // =============================================================================
