@@ -21,14 +21,14 @@ For reasons of efficiency, data in this table is significantly compressed.
 Since reasoning about this compressed form is needlessly complex, the `decode (uncompressed)` section presents the same table in uncompressed form, and explains how to decode `RV64IM` assembly instructions to it.
 Instructions on how to compress the uncompressed table to form the compressed decode table, can be derived from the `packed_decode` variable provided below.
 
-== Columns
+= Columns
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
 
 The #decode table is comprised of #nr_variables variables that are expressed using #nr_columns columns:
 #render_chip_column_table(chip, config)
 
-== Padding
+= Padding
 The #decode table must be padded to a length that is a power of two.
 Empty rows with the following content can be added to achieve this:
 
@@ -39,7 +39,7 @@ Given that `CPU` asserts that `EBREAK = 0` (see @cpu:c:ebreak_traps), using this
 Note moreover that the `pc` is set to $7$.
 This value is the _smallest odd number_ (i.e., not reachable during regular execution) that is more than _$4$_ (i.e., the max `pc`-increment) greater than _$1$_ (i.e., the `pc`-value used in the #link(<cpu-padding-decode-row>)[additional instruction] referred to by `CPU`-padding lines).
 
-== Decoding
+= Decoding
 For the purposes of explaining decoding, we decompress #decode's `packed_decode` variable into its constituent variables.
 Note that the below table is _not_ used in practice: it is solely used for the purposes of this explanation.
 
@@ -64,7 +64,7 @@ For the purpose of brevity and readability, the table uses the following rules-o
 
 Further clarification is provided in the notes following the table.
 
-=== C-type instructions
+== C-type instructions
 The `RV64C` extension for compressed instructions specifies that \~50% of all instructions can be represented using a 16-bit instruction (rather than 32-bits), saving \~25% in code size.
 This execution of assembly code is _not_ agnostic to an instruction's compression state; after executing a compressed instruction, the `pc` should be incremented by $2$ rather than $4$.
 To indicate an instruction is provided in compressed form, the `c_type` flag is introduced.
@@ -159,7 +159,7 @@ To indicate an instruction is provided in compressed form, the `c_type` flag is 
   [#figure(kind: "note", supplement: [], [#note]) #label(lbl)]
 }
 
-==== Notes
+== Notes
 We note the following about the above decoding table:
 #enum(numbering: "[1]",
   enum.item(

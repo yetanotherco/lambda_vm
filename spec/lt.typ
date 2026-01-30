@@ -14,18 +14,18 @@
 
 #show: book-page(chip.name)
 
-== Columns
+= Columns
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
 
 The `LT` chip is comprised of #nr_variables variables that are expressed using #nr_columns columns:
 #render_chip_column_table(chip, config)
 
-== Assumptions
+= Assumptions
 We assume the inputs `lhs`, `rhs` and `signed` are partially range checked.
 #render_chip_assumptions(chip, config)
 
-== Constraints
+= Constraints
 We first constrain that all variables correspond to their definition.
 For the defining constraint of `lt`, @lt:c:lt, observe that it is a choice
 between two options, depending on the input flag `signed`.
@@ -80,7 +80,7 @@ The chip contributes the following to the lookup argument.
 
 #render_constraint_table(chip, config, groups: "output")
 
-== Padding
+= Padding
 
 The table can be padded to the next power of two with the following value assignments:
 
