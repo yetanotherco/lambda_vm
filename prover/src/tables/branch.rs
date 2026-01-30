@@ -489,7 +489,9 @@ impl BranchConstraint {
         // Compute carry_0 as (base + offset - result) / 2^32 in the field.
         // This works because: base + offset = result + carry_0 * 2^32 (mod field)
         // Rearranging: carry_0 = (base + offset - result) * (2^32)^-1 (mod field)
-        let inv_2_32 = FieldElement::<F>::from(SHIFT_32).inv().expect("2^32 must be invertible in field");
+        let inv_2_32 = FieldElement::<F>::from(SHIFT_32)
+            .inv()
+            .expect("2^32 must be invertible in field");
         (&base_0 + &offset_0 - &unmasked_0) * &inv_2_32
     }
 
@@ -514,7 +516,9 @@ impl BranchConstraint {
         let offset_1 = step.get_main_evaluation_element(0, cols::OFFSET_1).clone();
 
         // carry[1] = (base[1] + offset[1] + carry[0] - unmasked[1]) / 2^32
-        let inv_2_32 = FieldElement::<F>::from(SHIFT_32).inv().expect("2^32 must be invertible in field");
+        let inv_2_32 = FieldElement::<F>::from(SHIFT_32)
+            .inv()
+            .expect("2^32 must be invertible in field");
         (&base_1 + &offset_1 + &carry_0 - &unmasked_1) * &inv_2_32
     }
 
