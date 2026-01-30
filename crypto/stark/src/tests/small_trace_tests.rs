@@ -78,33 +78,39 @@ fn test_prove_verify_two_rows() {
     );
 }
 
-/// Test that verification succeeds with correct public inputs.
-/// This ensures the small trace proof works correctly.
+/// Test that verification fails when using wrong public inputs.
+/// This ensures the boundary constraints are actually enforced.
 #[test_log::test]
 fn test_verify_fails_with_wrong_inputs() {
     let mut trace = simple_addition_trace::<Stark252PrimeField>(2);
 
     let proof_options = ProofOptions::default_test_options();
 
-    // Correct public inputs
-    let pub_inputs = SimpleAdditionPublicInputs {
+    // Correct public inputs for proving
+    let correct_pub_inputs = SimpleAdditionPublicInputs {
         a: Felt252::from(1u64),
         b: Felt252::from(2u64),
     };
 
     let air = SimpleAdditionAIR::<Stark252PrimeField>::new(&proof_options);
 
-    let proof = Prover::prove(
+    let mut proof = Prover::prove(
         &air,
         &mut trace,
-        &pub_inputs,
+        &correct_pub_inputs,
         &mut StoneProverTranscript::new(&[]),
     )
     .unwrap();
 
-    // Verify the proof is correct
+    // Tamper with the proof's public inputs
+    proof.public_inputs = SimpleAdditionPublicInputs {
+        a: Felt252::from(99u64), // Wrong value - doesn't match trace
+        b: Felt252::from(2u64),
+    };
+
+    // Verification should fail because boundary constraint col0[0]=99 doesn't match trace
     assert!(
-        Verifier::verify(&proof, &air, &mut StoneProverTranscript::new(&[])),
-        "Verification should succeed with correct inputs"
+        !Verifier::verify(&proof, &air, &mut StoneProverTranscript::new(&[])),
+        "Verification should fail with tampered public inputs"
     );
 }
