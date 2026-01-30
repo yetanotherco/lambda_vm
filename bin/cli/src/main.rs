@@ -9,7 +9,7 @@
 //!
 //! - **execute**: Run a program without generating a proof (fast, for testing)
 //! - **prove**: Execute a program and generate a STARK proof of correct execution
-//! - **verify**: Verify a previously generated proof
+//! - **verify**: Verify a previously generated proof (requires the original ELF file)
 //!
 //! # Architecture
 //!
@@ -20,6 +20,7 @@
 //! - **LT Table**: Less-than comparison results
 //! - **MEMW Table**: Memory write operations with timestamp ordering
 //! - **LOAD Table**: Memory load operations
+//! - **DECODE Table**: Instruction decoding verification (precomputed from ELF)
 //!
 //! Tables are linked via a LogUp bus protocol for cross-table lookups.
 //!
@@ -42,8 +43,8 @@
 //! # Generate a proof
 //! lambda-vm prove program.elf -o proof.cbor --security fast
 //!
-//! # Verify the proof
-//! lambda-vm verify proof.cbor
+//! # Verify the proof (requires the original ELF file)
+//! lambda-vm verify proof.cbor program.elf
 //! ```
 
 mod proof_bundle;
@@ -61,10 +62,12 @@ use executor::{
     vm::execution::Executor,
 };
 use prover::tables::bitwise;
+use prover::tables::decode;
 use prover::tables::trace_builder::Traces;
 use prover::tables::types::{GoldilocksExtension, GoldilocksField};
 use prover::test_utils::{
-    create_bitwise_air, create_cpu_air, create_load_air, create_lt_air, create_memw_air,
+    create_bitwise_air, create_cpu_air, create_decode_air, create_load_air, create_lt_air,
+    create_memw_air,
 };
 use sha3::{Digest, Sha3_256};
 use stark::proof::options::{ProofOptions, SecurityLevel};
@@ -117,6 +120,10 @@ enum Commands {
         /// Path to the proof bundle file
         #[arg(value_parser, value_hint = ValueHint::FilePath)]
         proof: PathBuf,
+
+        /// Path to the ELF file (required for DECODE table verification)
+        #[arg(value_parser, value_hint = ValueHint::FilePath)]
+        elf: PathBuf,
     },
 }
 
@@ -192,7 +199,7 @@ fn main() -> ExitCode {
             output,
             security,
         } => cmd_prove(elf, output, security),
-        Commands::Verify { proof } => cmd_verify(proof),
+        Commands::Verify { proof, elf } => cmd_verify(proof, elf),
     }
 }
 
@@ -386,6 +393,11 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, security: SecurityPreset) 
     let lt_air = create_lt_air(&proof_options);
     let memw_air = create_memw_air(&proof_options);
     let load_air = create_load_air(&proof_options);
+    let decode_air = create_decode_air(&proof_options).with_preprocessed(
+        decode::commitment_from_elf(&program, &proof_options)
+            .expect("Failed to compute decode commitment"),
+        decode::NUM_PRECOMPUTED_COLS,
+    );
 
     let air_trace_pairs: Vec<(
         &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
@@ -397,6 +409,7 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, security: SecurityPreset) 
         (&lt_air, &mut traces.lt, &()),
         (&memw_air, &mut traces.memw, &()),
         (&load_air, &mut traces.load, &()),
+        (&decode_air, &mut traces.decode, &()),
     ];
 
     eprintln!("Generating proof (this may take a while)...");
@@ -441,20 +454,22 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, security: SecurityPreset) 
 /// Verify command: verify a STARK proof bundle.
 ///
 /// This command verifies that a proof bundle represents valid execution
-/// of some RISC-V program. Verification does NOT require:
-/// - The original ELF file
-/// - The execution trace
-/// - Knowledge of the program inputs
+/// of a RISC-V program. Verification requires the original ELF file to:
+/// - Compute the DECODE table commitment for verification
+/// - Verify the ELF hash matches the proof metadata
 ///
 /// The verification process:
-/// 1. Deserialize the proof bundle from CBOR
-/// 2. Reconstruct AIRs using the embedded proof options
-/// 3. Run the STARK verifier on all table proofs
-/// 4. Verify LogUp bus consistency across tables
+/// 1. Load the ELF file and verify its hash matches the proof
+/// 2. Deserialize the proof bundle from CBOR
+/// 3. Reconstruct AIRs using the embedded proof options
+/// 4. Compute the DECODE commitment from the ELF
+/// 5. Run the STARK verifier on all table proofs
+/// 6. Verify LogUp bus consistency across tables
 ///
 /// # Arguments
 ///
 /// * `proof_path` - Path to the proof bundle (.cbor file)
+/// * `elf_path` - Path to the RISC-V ELF binary (must match the program that was proven)
 ///
 /// # Exit Codes
 ///
@@ -464,15 +479,29 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, security: SecurityPreset) 
 /// # Security Notes
 ///
 /// A valid proof guarantees that:
-/// - Some RISC-V program was executed correctly
+/// - The specific RISC-V program (identified by ELF hash) was executed correctly
 /// - The execution followed RISC-V semantics
 /// - Memory operations were consistent
 /// - All table lookups were valid
-///
-/// The `elf_hash` in the proof metadata can be used to verify the proof
-/// corresponds to a specific program by comparing with the hash of the
-/// original ELF file.
-fn cmd_verify(proof_path: PathBuf) -> ExitCode {
+/// - Instruction decoding was correct (via DECODE table)
+fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf) -> ExitCode {
+    eprintln!("Reading ELF file...");
+    let elf_data = match std::fs::read(&elf_path) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("Failed to read ELF file: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let program = match Elf::load(&elf_data) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Failed to load ELF program: {:?}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+
     eprintln!("Reading proof bundle...");
     let file = match File::open(&proof_path) {
         Ok(f) => f,
@@ -490,6 +519,25 @@ fn cmd_verify(proof_path: PathBuf) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // Verify ELF hash matches proof metadata
+    let elf_hash: [u8; 32] = Sha3_256::digest(&elf_data).into();
+    if elf_hash != bundle.metadata.elf_hash {
+        eprintln!("ELF hash mismatch!");
+        eprintln!(
+            "  Expected: {}...",
+            hex::encode(bundle.metadata.elf_hash)
+                .chars()
+                .take(16)
+                .collect::<String>()
+        );
+        eprintln!(
+            "  Got:      {}...",
+            hex::encode(elf_hash).chars().take(16).collect::<String>()
+        );
+        eprintln!("The proof was generated for a different program.");
+        return ExitCode::FAILURE;
+    }
 
     eprintln!("Proof metadata:");
     eprintln!("  Version: {}", bundle.metadata.version);
@@ -513,9 +561,20 @@ fn cmd_verify(proof_path: PathBuf) -> ExitCode {
     let lt_air = create_lt_air(proof_options);
     let memw_air = create_memw_air(proof_options);
     let load_air = create_load_air(proof_options);
+    let decode_air = create_decode_air(proof_options).with_preprocessed(
+        decode::commitment_from_elf(&program, proof_options)
+            .expect("Failed to compute decode commitment"),
+        decode::NUM_PRECOMPUTED_COLS,
+    );
 
-    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
-        vec![&cpu_air, &bitwise_air, &lt_air, &memw_air, &load_air];
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
+        &cpu_air,
+        &bitwise_air,
+        &lt_air,
+        &memw_air,
+        &load_air,
+        &decode_air,
+    ];
 
     eprintln!("Verifying proof...");
     let result = Verifier::multi_verify(
