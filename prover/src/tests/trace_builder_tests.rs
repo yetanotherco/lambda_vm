@@ -49,34 +49,41 @@ fn make_instructions(logs: &[Log], instrs: &[Instruction]) -> U64HashMap<Instruc
     map
 }
 
+/// Append an ecall (halt) log+instruction to test data so Traces::from_logs succeeds.
+fn append_ecall(logs: &mut Vec<Log>, instrs: &mut Vec<Instruction>) {
+    let last_pc = logs.last().map(|l| l.current_pc + 4).unwrap_or(0x1000);
+    logs.push(Log {
+        current_pc: last_pc,
+        next_pc: 0, // executor sets next_pc=0 for halt; prover overrides to pc+4
+        src1_val: 0,
+        src2_val: 0,
+        dst_val: 0,
+    });
+    instrs.push(Instruction::EcallEbreak);
+}
+
 #[test]
-#[should_panic(expected = "CPU trace requires at least 4 operations")]
+#[should_panic(expected = "Program must contain an ECALL")]
 fn test_empty_logs() {
-    // CPU trace cannot be padded - caller must provide valid power-of-2 operations
     let _traces = Traces::from_logs(&[], U64HashMap::default()).unwrap();
 }
 
 #[test]
-#[should_panic(expected = "CPU trace requires at least 4 operations")]
 fn test_single_log() {
-    // CPU trace cannot be padded - caller must provide valid power-of-2 operations
-    let logs = vec![make_add_log(0x1000, 10, 20, 30)];
-    let instrs = vec![Instruction::Arith {
-        dst: 1,
-        src1: 2,
-        src2: 3,
-        op: ArithOp::Add,
-    }];
+    // Single ecall log should work (padding handles power-of-2)
+    let mut logs = vec![];
+    let mut instrs = vec![];
+    append_ecall(&mut logs, &mut instrs);
     let instructions = make_instructions(&logs, &instrs);
     let _traces = Traces::from_logs(&logs, instructions).unwrap();
 }
 
 #[test]
 fn test_power_of_two_logs() {
-    let logs: Vec<Log> = (0..4)
+    let mut logs: Vec<Log> = (0..3)
         .map(|i| make_add_log(0x1000 + i * 4, i, i, i * 2))
         .collect();
-    let instrs: Vec<Instruction> = (0..4)
+    let mut instrs: Vec<Instruction> = (0..3)
         .map(|_| Instruction::Arith {
             dst: 1,
             src1: 2,
@@ -84,6 +91,7 @@ fn test_power_of_two_logs() {
             op: ArithOp::Add,
         })
         .collect();
+    append_ecall(&mut logs, &mut instrs);
     let instructions = make_instructions(&logs, &instrs);
 
     let traces = Traces::from_logs(&logs, instructions).unwrap();
@@ -91,13 +99,12 @@ fn test_power_of_two_logs() {
 }
 
 #[test]
-#[should_panic(expected = "CPU trace requires power-of-2 operations")]
 fn test_padding_to_power_of_two() {
-    // CPU trace cannot be padded - caller must provide valid power-of-2 operations
-    let logs: Vec<Log> = (0..5)
+    // 5 ops (not power of 2) should be padded to 8
+    let mut logs: Vec<Log> = (0..4)
         .map(|i| make_add_log(0x1000 + i * 4, i, i, i * 2))
         .collect();
-    let instrs: Vec<Instruction> = (0..5)
+    let mut instrs: Vec<Instruction> = (0..4)
         .map(|_| Instruction::Arith {
             dst: 1,
             src1: 2,
@@ -105,20 +112,23 @@ fn test_padding_to_power_of_two() {
             op: ArithOp::Add,
         })
         .collect();
+    append_ecall(&mut logs, &mut instrs);
     let instructions = make_instructions(&logs, &instrs);
 
-    let _traces = Traces::from_logs(&logs, instructions).unwrap();
+    let traces = Traces::from_logs(&logs, instructions).unwrap();
+    // 5 ops padded to 8
+    assert_eq!(traces.cpu.main_table.height, 8);
 }
 
 #[test]
 fn test_lt_operations_collected() {
-    let logs = vec![
+    let mut logs = vec![
         make_slt_log(0x1000, 5, 10, 1),
         make_slt_log(0x1004, 10, 5, 0),
         make_add_log(0x1008, 1, 2, 3),
         make_blt_log(0x100c, 3, 7, true),
     ];
-    let instrs = vec![
+    let mut instrs = vec![
         Instruction::Arith {
             dst: 1,
             src1: 2,
@@ -144,6 +154,7 @@ fn test_lt_operations_collected() {
             offset: 8,
         },
     ];
+    append_ecall(&mut logs, &mut instrs);
     let instructions = make_instructions(&logs, &instrs);
 
     let traces = Traces::from_logs(&logs, instructions).unwrap();
@@ -154,13 +165,13 @@ fn test_lt_operations_collected() {
 
 #[test]
 fn test_lt_deduplication() {
-    let logs = vec![
+    let mut logs = vec![
         make_slt_log(0x1000, 5, 10, 1),
         make_slt_log(0x1004, 5, 10, 1), // duplicate
         make_slt_log(0x1008, 5, 10, 1), // duplicate
         make_add_log(0x100c, 0, 0, 0),  // padding to 4
     ];
-    let instrs = vec![
+    let mut instrs = vec![
         Instruction::Arith {
             dst: 1,
             src1: 2,
@@ -186,6 +197,7 @@ fn test_lt_deduplication() {
             op: ArithOp::Add,
         },
     ];
+    append_ecall(&mut logs, &mut instrs);
     let instructions = make_instructions(&logs, &instrs);
 
     let traces = Traces::from_logs(&logs, instructions).unwrap();
@@ -219,13 +231,13 @@ fn test_lt_deduplication() {
 
 #[test]
 fn test_bitwise_lookups_collected() {
-    let logs = vec![
+    let mut logs = vec![
         make_and_log(0x1000, 0x12, 0x34, 0x10),
         make_add_log(0x1004, 0, 0, 0),
         make_add_log(0x1008, 0, 0, 0),
         make_add_log(0x100c, 0, 0, 0),
     ];
-    let instrs = vec![
+    let mut instrs = vec![
         Instruction::Arith {
             dst: 1,
             src1: 2,
@@ -251,6 +263,7 @@ fn test_bitwise_lookups_collected() {
             op: ArithOp::Add,
         },
     ];
+    append_ecall(&mut logs, &mut instrs);
     let instructions = make_instructions(&logs, &instrs);
 
     let traces = Traces::from_logs(&logs, instructions).unwrap();
@@ -263,13 +276,13 @@ fn test_bitwise_lookups_collected() {
 
 #[test]
 fn test_cpu_timestamps() {
-    let logs = vec![
+    let mut logs = vec![
         make_add_log(0x1000, 1, 2, 3),
         make_add_log(0x1004, 4, 5, 6),
         make_add_log(0x1008, 7, 8, 9),
         make_add_log(0x100c, 10, 11, 12),
     ];
-    let instrs: Vec<Instruction> = (0..4)
+    let mut instrs: Vec<Instruction> = (0..4)
         .map(|_| Instruction::Arith {
             dst: 1,
             src1: 2,
@@ -277,6 +290,7 @@ fn test_cpu_timestamps() {
             op: ArithOp::Add,
         })
         .collect();
+    append_ecall(&mut logs, &mut instrs);
     let instructions = make_instructions(&logs, &instrs);
 
     let traces = Traces::from_logs(&logs, instructions).unwrap();
@@ -290,13 +304,13 @@ fn test_cpu_timestamps() {
 
 #[test]
 fn test_mixed_instructions() {
-    let logs = vec![
+    let mut logs = vec![
         make_add_log(0x1000, 10, 20, 30),
         make_slt_log(0x1004, 5, 10, 1),
         make_and_log(0x1008, 0xFF, 0xF0, 0xF0),
         make_blt_log(0x100c, 1, 2, true),
     ];
-    let instrs = vec![
+    let mut instrs = vec![
         Instruction::Arith {
             dst: 1,
             src1: 2,
@@ -322,11 +336,13 @@ fn test_mixed_instructions() {
             offset: 8,
         },
     ];
+    append_ecall(&mut logs, &mut instrs);
     let instructions = make_instructions(&logs, &instrs);
 
     let traces = Traces::from_logs(&logs, instructions).unwrap();
 
-    assert_eq!(traces.cpu.main_table.height, 4);
+    // 5 ops (4 + ecall) padded to 8
+    assert_eq!(traces.cpu.main_table.height, 8);
     assert_eq!(traces.bitwise.main_table.height, bitwise::NUM_ROWS);
     // 1 SLT + 1 BLT = 2 LT ops
     assert!(traces.lt.main_table.height >= 2);
@@ -340,13 +356,13 @@ fn test_mixed_instructions() {
 fn test_memw_generated_from_register_ops() {
     // Test that MEMW operations are generated for register reads/writes
     // ADD x1, x2, x3 reads x2 (M1), x3 (M3), writes x1 (M5)
-    let logs = vec![
+    let mut logs = vec![
         make_add_log(0x1000, 100, 200, 300), // x2=100, x3=200, x1=300
         make_add_log(0x1004, 0, 0, 0),
         make_add_log(0x1008, 0, 0, 0),
         make_add_log(0x100c, 0, 0, 0),
     ];
-    let instrs = vec![
+    let mut instrs = vec![
         Instruction::Arith {
             dst: 1,  // x1
             src1: 2, // x2
@@ -372,6 +388,7 @@ fn test_memw_generated_from_register_ops() {
             op: ArithOp::Add,
         },
     ];
+    append_ecall(&mut logs, &mut instrs);
     let instructions = make_instructions(&logs, &instrs);
 
     let traces = Traces::from_logs(&logs, instructions).unwrap();
@@ -409,13 +426,13 @@ fn test_memw_generated_from_register_ops() {
 fn test_memw_generates_lt_for_timestamp_ordering() {
     // Test Phase 3: MEMW operations generate LT ops for old_timestamp < timestamp
     // Each MEMW op generates at least one LT op (C7: old_timestamp[0] < timestamp)
-    let logs = vec![
+    let mut logs = vec![
         make_add_log(0x1000, 100, 200, 300),
         make_add_log(0x1004, 0, 0, 0),
         make_add_log(0x1008, 0, 0, 0),
         make_add_log(0x100c, 0, 0, 0),
     ];
-    let instrs = vec![
+    let mut instrs = vec![
         Instruction::Arith {
             dst: 1,
             src1: 2,
@@ -441,6 +458,7 @@ fn test_memw_generates_lt_for_timestamp_ordering() {
             op: ArithOp::Add,
         },
     ];
+    append_ecall(&mut logs, &mut instrs);
     let instructions = make_instructions(&logs, &instrs);
 
     let traces = Traces::from_logs(&logs, instructions).unwrap();
@@ -483,13 +501,13 @@ fn test_lt_generates_bitwise_lookups() {
     // Each LT op generates:
     // - 2 MSB16 lookups (for lhs[2] and rhs[2])
     // - 6 IS_HALF lookups (4 for lhs_sub_rhs, 2 for lhs[1] and rhs[1])
-    let logs = vec![
+    let mut logs = vec![
         make_slt_log(0x1000, 0x1234, 0x5678, 1), // SLT generates LT op
         make_add_log(0x1004, 0, 0, 0),
         make_add_log(0x1008, 0, 0, 0),
         make_add_log(0x100c, 0, 0, 0),
     ];
-    let instrs = vec![
+    let mut instrs = vec![
         Instruction::Arith {
             dst: 1,
             src1: 2,
@@ -515,6 +533,7 @@ fn test_lt_generates_bitwise_lookups() {
             op: ArithOp::Add,
         },
     ];
+    append_ecall(&mut logs, &mut instrs);
     let instructions = make_instructions(&logs, &instrs);
 
     let traces = Traces::from_logs(&logs, instructions).unwrap();

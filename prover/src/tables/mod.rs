@@ -19,6 +19,7 @@ pub mod types;
 pub mod bitwise;
 pub mod cpu;
 pub mod decode;
+pub mod halt;
 pub mod load;
 pub mod lt;
 pub mod memw;
