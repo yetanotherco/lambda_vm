@@ -299,7 +299,10 @@ pub fn instructions_from_elf(elf: &Elf) -> Result<U64HashMap<Instruction>, Instr
 /// Compute DECODE commitment directly from an ELF.
 ///
 /// This is what the verifier uses - no executor needed.
-pub fn commitment_from_elf(elf: &Elf, options: &ProofOptions) -> Result<Commitment, InstructionError> {
+pub fn commitment_from_elf(
+    elf: &Elf,
+    options: &ProofOptions,
+) -> Result<Commitment, InstructionError> {
     let instructions = instructions_from_elf(elf)?;
     Ok(compute_precomputed_commitment(&instructions, options))
 }

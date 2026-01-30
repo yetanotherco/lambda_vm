@@ -8,8 +8,8 @@ use crate::tables::decode::{
     DecodeEntry, bus_interactions, cols, generate_decode_trace, instructions_from_elf,
     update_multiplicities,
 };
-use crate::test_utils::run_asm_elf;
 use crate::tables::types::{FE, packed_decode as bits};
+use crate::test_utils::run_asm_elf;
 
 // =========================================================================
 // Packed decode tests
@@ -746,7 +746,8 @@ fn test_instructions_from_elf_matches_executor() {
     let elf_bytes = std::fs::read(&elf_path).expect("Failed to read ELF file");
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
 
-    let verifier_instructions = instructions_from_elf(&elf).expect("Failed to extract instructions");
+    let verifier_instructions =
+        instructions_from_elf(&elf).expect("Failed to extract instructions");
 
     // Compare via DecodeEntry (what matters for the DECODE table)
     for (pc, executor_instr) in executor_instructions.iter() {
@@ -792,7 +793,8 @@ fn test_instructions_from_elf_matches_executor_complex() {
     let elf_bytes = std::fs::read(&elf_path).expect("Failed to read ELF file");
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
 
-    let verifier_instructions = instructions_from_elf(&elf).expect("Failed to extract instructions");
+    let verifier_instructions =
+        instructions_from_elf(&elf).expect("Failed to extract instructions");
 
     // Every executed instruction must be present and match
     for (pc, executor_instr) in executor_instructions.iter() {
@@ -840,11 +842,6 @@ fn test_instructions_from_elf_includes_all_executable() {
 
     // All PCs should be 4-byte aligned
     for (pc, _) in instructions.iter() {
-        assert_eq!(
-            pc % 4,
-            0,
-            "PC {:#x} is not 4-byte aligned",
-            pc
-        );
+        assert_eq!(pc % 4, 0, "PC {:#x} is not 4-byte aligned", pc);
     }
 }
