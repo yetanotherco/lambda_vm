@@ -1,4 +1,4 @@
-# BITWISE Chip
+# BITWISE Chips
 
 ## Columns
 
@@ -39,20 +39,32 @@
 | `μ_HWSL` | `BaseField` |  |
 | `μ_HWSLC` | `BaseField` |  |
 
+The  chip is comprised of  variables that are expressed using  columns. Of these, the _input_ and _output_ variables ( in total) are precomputed.
+
+*Note*: This table contains one row for every possible value of `(X, Y, Z)`. As such, it has length `2^8 dot 2^8 dot 2^4 = 2^(20)`.
+
+## Lookup
+
+This chip adds the following interactions to the lookup:
+
+## Areas of Optimization
+
+The following ideas may prove to be optimizations for the  chip: + Extend `IS_BYTE[X]` to `ARE_BYTES[X, Y]`, such that two bytes are range checked at once. When only a single check is required, one can still execute `IS_BYTE[X] := ARE_BYTES[X, 0]`. + Drop `MSB8` column, and instead define the `MSB8` lookup as `MSB8<X> := MSB16[256X]`. Note: currently, `MSB8` also implicity range checks the input `X` (the lookup fails if `X` is not a `Byte`). This optimization should only be executed when all chips leveraging `MSB8` do _not_ need this implicit range check. + Place the 16-bit (`AND`, `OR`, `XOR`, `MSB16`, `ZERO`, etc.) and 20-bit (`HWSL`, `HWSLC`, `IS_B20`) lookups in separate tables. + Combine `HWSL` and `HWSLC` into a single lookup (see also \).
+
 ## Constraints
 
 ### contributions
 
-| Ref | Kind | Description | Multiplicity |
-|-----|------|-------------|--------------|
-| `1` | interaction | `AND_BYTE[AND; X, Y]` | -μ_AND |
-| `2` | interaction | `OR_BYTE[OR; X, Y]` | -μ_OR |
-| `3` | interaction | `XOR_BYTE[XOR; X, Y]` | -μ_XOR |
-| `4` | interaction | `MSB8[MSB8; X]` | -μ_MSB8 |
-| `5` | interaction | `MSB16[MSB16; X + 256 * Y]` | -μ_MSB16 |
-| `6` | interaction | `ZERO[ZERO; X + 256 * Y]` | -μ_ZERO |
-| `7` | interaction | `IS_BYTE[X]` | -μ_IS_BYTE |
-| `8` | interaction | `IS_HALF[X + 256 * Y]` | -μ_IS_HALF |
-| `9` | interaction | `IS_B20[X + 256 * Y + 65536 * Z]` | -μ_IS_B20 |
-| `10` | interaction | `HWSL[SLL; X + 256 * Y, Z]` | -μ_HWSL |
-| `11` | interaction | `HWSLC[SLLC; X + 256 * Y, Z]` | -μ_HWSLC |
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `BITWISE-C1` | `AND_BYTE[AND; X, Y]` | -μ_AND |
+| `BITWISE-C2` | `OR_BYTE[OR; X, Y]` | -μ_OR |
+| `BITWISE-C3` | `XOR_BYTE[XOR; X, Y]` | -μ_XOR |
+| `BITWISE-C4` | `MSB8[MSB8; X]` | -μ_MSB8 |
+| `BITWISE-C5` | `MSB16[MSB16; X + 256 * Y]` | -μ_MSB16 |
+| `BITWISE-C6` | `ZERO[ZERO; X + 256 * Y]` | -μ_ZERO |
+| `BITWISE-C7` | `IS_BYTE[X]` | -μ_IS_BYTE |
+| `BITWISE-C8` | `IS_HALF[X + 256 * Y]` | -μ_IS_HALF |
+| `BITWISE-C9` | `IS_B20[X + 256 * Y + 65536 * Z]` | -μ_IS_B20 |
+| `BITWISE-C10` | `HWSL[SLL; X + 256 * Y, Z]` | -μ_HWSL |
+| `BITWISE-C11` | `HWSLC[SLLC; X + 256 * Y, Z]` | -μ_HWSLC |

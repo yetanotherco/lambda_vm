@@ -633,7 +633,7 @@ def main():
 
     output_dir = args.output_dir
     if output_dir is None:
-        output_dir = spec_dir
+        output_dir = script_dir / "../docs/spec"
     output_dir = output_dir.resolve()
 
     if not spec_dir.exists():

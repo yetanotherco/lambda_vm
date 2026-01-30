@@ -17,7 +17,7 @@ Converts the Typst specification to Markdown format.
 ```bash
 cd scripts
 source .venv/bin/activate
-python typst_to_md.py                          # Output to ../spec/
+python typst_to_md.py                          # Output to ../docs/spec/
 python typst_to_md.py -o ../others/spec_md     # Output to specific directory
 ```
 
