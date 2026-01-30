@@ -1,6 +1,6 @@
 #import "/book.typ": book-page, cdsg
 
-#show: book-page.with(title: "LogUp Argument")
+#show: book-page("logup")
 
 The _LogUp_ proof system conducts a permutation check based on summing partial derivatives. This check ensures that whatever tuple is sent to be "looked-up" by a _source table_ is indeed received in the expected _destination table_.
 
@@ -20,11 +20,11 @@ The _LogUp_ proof system conducts a permutation check based on summing partial d
 
 === Arithmetisation notation
 
-#let numTables = math.sans()[t]
+#let numTables = $sans(t)$
 #let Table = $T$
 #let TableSet = ${Table_i}_(i in [t])$
-#let numColumns = math.sans()[m]
-#let numRows = math.sans()[N]
+#let numColumns = $sans(m)$
+#let numRows = $sans(N)$
 
 - $numTables in NN$: number of tables $Table_i$ in the arithmetisation of the VM.
 - $TableSet$: set of all tables $Table_i$ in the arithmetisation of the VM.
@@ -34,8 +34,8 @@ The _LogUp_ proof system conducts a permutation check based on summing partial d
 == Interaction Notation
 
 #let Interaction = $I$
-#let id = math.sans()[id]
-#let numElements = $l$
+#let id = $sans(id)$
+#let numElements = $ell$
 #let weightFunction = $w$
 #let multiplicity = $mu$
 
@@ -66,28 +66,24 @@ The $j$-th _interaction_ $Interaction_j$ of table $Table_i$ is defined by the fo
 #let logupChallenge = math.alpha
 #let fingerprintCoeff = math.beta
 
+#set enum(numbering: "1.a.i.1.a.")
+
 + Prover commits to all traces.
 
 + Verifier samples a random _(global) LogUp challenge_ $logupChallenge in ExtensionField$ and a random _fingerprint coefficient_ $fingerprintCoeff in ExtensionField$ and sends them to the Prover.
 
-+ Prover commits to interaction contribution and table running sum columns and to each table's contribution:
-
-  #set enum(numbering: "a.")
++ Prover commits to (i) interaction contribution, (ii) table running sum columns, and (iii) each table's contribution:
 
   + For each table $Table_i$, populate the interaction contribution columns and compute the _table (LogUp) contribution_:
-
-    #set enum(numbering: "i.")
 
     + For each interaction $Interaction_j$ of table $Table_i$, initialize an empty _interaction contribution column_ of length $numRows_i$.
 
     + Initialise a _table running sum column_ $S_i in ExtensionField^(numRows_i)$ with $S_i [0] = 0_ExtensionField$ in the first row.
 
     + For each $j$-th row $R_j in BaseField^(numColumns_i)$ of $Table_i$, for $j in [numRows_i]$:
-      #set enum(numbering: "1.")
       + For each $k$-th interaction $Interaction_k$ of table $Table_i$:
-        #set enum(numbering: "a.")
         + Compute the _interaction contribution numerator_ $ n_(j,k) = cases(R_j [multiplicity] quad & "if" multiplicity in [numColumns]",", multiplicity & "otherwise.") $
-        + If $n eq.not 0$, compute the _interaction contribution denominator_ $ d_(j,k) = logupChallenge + fingerprintCoeff dot Interaction_k\.id + sum_(l = 0)^(numElements - 1) fingerprintCoeff^(l + 2) dot weightFunction(R_j)[l] $.
+        + If $n eq.not 0$, compute the _interaction contribution denominator_ $ d_(j,k) = logupChallenge + fingerprintCoeff dot id_(i,k) + sum_(l = 0)^(numElements - 1) fingerprintCoeff^(l + 2) dot weightFunction_(i,k) (R_j)[l]. $
         + Save the _interaction contribution_ as $n_(j,k)/d_(j,k) in ExtensionField$ in the corresponding interaction contribution column for this interaction.
         + *Constrain* the interaction contribution column according to the definitions of $n$ and $d$.
 
