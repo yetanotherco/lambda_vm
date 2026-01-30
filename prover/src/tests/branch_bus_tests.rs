@@ -21,7 +21,7 @@ use stark::trace::TraceTable;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
-use crate::tables::branch::{cols, generate_branch_trace, BranchOperation};
+use crate::tables::branch::{BranchOperation, cols, generate_branch_trace};
 use crate::tables::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 
 type F = GoldilocksField;
