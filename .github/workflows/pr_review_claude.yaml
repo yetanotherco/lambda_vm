@@ -1,57 +1,39 @@
-# Reference https://github.com/anthropics/claude-code-action/blob/main/docs/solutions.md#automatic-pr-code-review
 name: Claude Code Review
 
 on:
   pull_request:
     types: [opened, ready_for_review]
-    # Optional: Only run on specific file changes
-    # paths:
-    #   - "src/**/*.ts"
-    #   - "src/**/*.tsx"
-    #   - "src/**/*.js"
-    #   - "src/**/*.jsx"
+  issue_comment:
+    types: [created]
 
 jobs:
   claude-review:
-    # Optional: Filter by PR author
-    # if: |
-    #   github.event.pull_request.user.login == 'external-contributor' ||
-    #   github.event.pull_request.user.login == 'new-developer' ||
-    #   github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR'
+    if: |
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request &&
+       contains(github.event.comment.body, '/claude') &&
+       contains(fromJson('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))
+    uses: yetanotherco/actions/.github/workflows/pr_review_claude.yml@main
+    with:
+      custom_prompt: |
+        1. **Security vulnerabilities** - Label by criticality (Critical/High/Medium/Low)
+           - Rust: unsafe blocks, error handling, panics, memory safety issues
+           - Cryptography: incorrect implementations, timing attacks, weak randomness
+           - VM: instruction handling, memory access, privilege escalation
 
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write
-      issues: read
-      id-token: write
+        2. **Potential bugs** - Logic errors, edge cases, incorrect behavior, race conditions
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
+        3. **Performance issues** - Only significant: e.g. O(n²) on unbounded input, unnecessary allocations, hot path inefficiencies
 
-      - name: Run Claude Code Review
-        id: claude-review
-        uses: anthropics/claude-code-action@v1
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          show_full_output: true
-          # Will use the models latest version, reference: https://code.claude.com/docs/en/cli-reference#cli-flags
-          claude_args: |
-            --model sonnet
-            --allowedTools "Bash(gh pr:*),Bash(gh issue:*),Bash(git diff:*),Bash(git log:*),Read,Glob,Grep"
-          prompt: |
-            You are a senior code reviewer for Lambda ZKVM, a minimalist, performant and auditable verifiable RISC-V vm written in Rust.
+        4. **Simplicity** - Prefer simple, readable code over clever abstractions
 
-            Review this PR focusing on:
-            - Code correctness and potential bugs
-            - Security vulnerabilities
-            - Performance implications
-            - Rust best practices and idiomatic patterns
-            - Memory safety and proper error handling
-            - Code readability and maintainability
-
-            Be concise and specific. Provide line references when suggesting changes.
-            If the code looks good, acknowledge it briefly.
+        Guidelines:
+        - Be concise and to the point
+        - Do NOT suggest micro-optimizations or premature abstractions
+        - Always prefer simplicity over complexity when performance gains are marginal
+        - Focus on real issues, not hypothetical improvements
+        - Be concise and actionable
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
