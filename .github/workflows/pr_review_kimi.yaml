@@ -15,7 +15,7 @@ jobs:
        github.event.issue.pull_request &&
        contains(github.event.comment.body, '/kimi') &&
        contains(fromJson('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))
-    uses: yetanotherco/actions/.github/workflows/pr_review_kimi.yml@main
+    uses: yetanotherco/actions/.github/workflows/pr_review_kimi.yml@v1.0.0
     with:
       custom_prompt: |
         1. **Security vulnerabilities** - Label by criticality (Critical/High/Medium/Low)
