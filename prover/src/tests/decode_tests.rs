@@ -231,7 +231,11 @@ fn test_packed_decode_combined() {
         1 << 2,
         "write_register should be set at bit 2"
     );
-    assert_eq!(packed & (1 << 11), 1 << 11, "op_add should be set at bit 11");
+    assert_eq!(
+        packed & (1 << 11),
+        1 << 11,
+        "op_add should be set at bit 11"
+    );
 
     // Verify registers per spec: rs1 at bits 27-34, rs2 at bits 35-42, rd at bits 43-50
     assert_eq!((packed >> 27) & 0xFF, 5, "rs1 should be 5");

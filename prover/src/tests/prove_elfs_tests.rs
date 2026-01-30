@@ -87,8 +87,14 @@ fn prove_and_verify_vm(
             }
         };
 
-    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
-        vec![&cpu_air, &bitwise_air, &lt_air, &memw_air, &load_air, &decode_air];
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
+        &cpu_air,
+        &bitwise_air,
+        &lt_air,
+        &memw_air,
+        &load_air,
+        &decode_air,
+    ];
 
     let result = Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[]));
     if !result {
@@ -140,8 +146,14 @@ fn prove_and_verify_vm_minimal(
             }
         };
 
-    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
-        vec![&cpu_air, &bitwise_air, &lt_air, &memw_air, &load_air, &decode_air];
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
+        &cpu_air,
+        &bitwise_air,
+        &lt_air,
+        &memw_air,
+        &load_air,
+        &decode_air,
+    ];
 
     Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[]))
 }

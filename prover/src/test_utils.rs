@@ -31,6 +31,7 @@ use crate::tables::bitwise::{
 use crate::tables::cpu::{
     CpuOperation, bus_interactions as cpu_bus_interactions, cols as cpu_cols,
 };
+use crate::tables::decode::{bus_interactions as decode_bus_interactions, cols as decode_cols};
 use crate::tables::load::{
     bus_interactions as load_bus_interactions, cols as load_cols, constraints as load_constraints,
 };
@@ -38,7 +39,6 @@ use crate::tables::lt::{LtOperation, bus_interactions as lt_bus_interactions, co
 use crate::tables::memw::{
     bus_interactions as memw_bus_interactions, cols as memw_cols, constraints as memw_constraints,
 };
-use crate::tables::decode::{bus_interactions as decode_bus_interactions, cols as decode_cols};
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
 pub type F = GoldilocksField;
