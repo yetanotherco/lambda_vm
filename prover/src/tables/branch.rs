@@ -5,7 +5,7 @@
 //!
 //! ## Inputs
 //! - `pc`: DWordWL (64-bit as [Word, Word]) - current program counter
-//! - `offset`: Word (32-bit, sign-extended for 64-bit addition)
+//! - `offset`: DWordWL (64-bit as [Word, Word]) - already sign-extended from CPU's imm
 //! - `register`: DWordWL (64-bit) - base address for JALR
 //! - `JALR`: Bit - selector between pc (0) and register (1) as base
 //!
@@ -15,7 +15,6 @@
 //!
 //! ## Auxiliary
 //! - `unmasked_low_byte`: Byte - low byte before LSB masking (for ADD constraint)
-//! - `sign_bit`: Bit - bit 31 of offset (for sign extension in ADD template)
 //!
 //! ## Virtual (embedded in constraints)
 //! - `next_pc_unmasked`: The raw addition result before masking LSB
@@ -49,40 +48,39 @@ pub mod cols {
     /// pc[1]: Word (bits 32-63)
     pub const PC_1: usize = 1;
 
-    // Input column: offset (Word, will be sign-extended)
-    /// offset: Word (32-bit signed offset)
-    pub const OFFSET: usize = 2;
+    // Input columns: offset (DWordWL = 2 Words, sign-extended from CPU's imm)
+    /// offset[0]: Word (bits 0-31)
+    pub const OFFSET_0: usize = 2;
+    /// offset[1]: Word (bits 32-63)
+    pub const OFFSET_1: usize = 3;
 
     // Input columns: register (DWordWL = 2 Words)
     /// register[0]: Word (bits 0-31)
-    pub const REGISTER_0: usize = 3;
+    pub const REGISTER_0: usize = 4;
     /// register[1]: Word (bits 32-63)
-    pub const REGISTER_1: usize = 4;
+    pub const REGISTER_1: usize = 5;
 
     // Input column: JALR flag
     /// JALR: Bit (1 = use register as base, 0 = use pc as base)
-    pub const JALR: usize = 5;
+    pub const JALR: usize = 6;
 
     // Output columns: next_pc_high (Half[3])
     /// next_pc_high[0]: Half (bits 16-31 of next_pc)
-    pub const NEXT_PC_HIGH_0: usize = 6;
+    pub const NEXT_PC_HIGH_0: usize = 7;
     /// next_pc_high[1]: Half (bits 32-47 of next_pc)
-    pub const NEXT_PC_HIGH_1: usize = 7;
+    pub const NEXT_PC_HIGH_1: usize = 8;
     /// next_pc_high[2]: Half (bits 48-63 of next_pc)
-    pub const NEXT_PC_HIGH_2: usize = 8;
+    pub const NEXT_PC_HIGH_2: usize = 9;
 
     // Output columns: next_pc_low (Byte[2])
     /// next_pc_low[0]: Byte (bits 0-7 of next_pc, with LSB masked to 0)
-    pub const NEXT_PC_LOW_0: usize = 9;
+    pub const NEXT_PC_LOW_0: usize = 10;
     /// next_pc_low[1]: Byte (bits 8-15 of next_pc)
-    pub const NEXT_PC_LOW_1: usize = 10;
+    pub const NEXT_PC_LOW_1: usize = 11;
 
     // Auxiliary columns
     /// unmasked_low_byte: Byte (bits 0-7 before LSB masking)
-    pub const UNMASKED_LOW_BYTE: usize = 11;
-    /// sign_bit: Bit (bit 31 of offset, for sign extension)
-    /// sign_bit = 1 if offset >= 2^31, else 0
-    pub const SIGN_BIT: usize = 12;
+    pub const UNMASKED_LOW_BYTE: usize = 12;
 
     // Multiplicity column
     /// μ: multiplicity for bus interactions
@@ -113,8 +111,8 @@ const MASK_254: u64 = 254;
 pub struct BranchOperation {
     /// Current program counter (64-bit)
     pub pc: u64,
-    /// Offset from base address (32-bit, treated as signed)
-    pub offset: u32,
+    /// Offset from base address (64-bit DWordWL, already sign-extended from CPU's imm)
+    pub offset: u64,
     /// Register value for JALR (64-bit)
     pub register: u64,
     /// Whether this is a JALR instruction (uses register instead of pc)
@@ -123,7 +121,7 @@ pub struct BranchOperation {
 
 impl BranchOperation {
     /// Create a new BRANCH operation.
-    pub fn new(pc: u64, offset: u32, register: u64, jalr: bool) -> Self {
+    pub fn new(pc: u64, offset: u64, register: u64, jalr: bool) -> Self {
         Self {
             pc,
             offset,
@@ -134,15 +132,14 @@ impl BranchOperation {
 
     /// Compute the next program counter.
     ///
-    /// For regular branches: next_pc = pc + sign_extend(offset)
-    /// For JALR: next_pc = (register + sign_extend(offset)) & !1
+    /// For regular branches: next_pc = pc + offset
+    /// For JALR: next_pc = (register + offset) & !1
     ///
     /// The LSB is always masked to 0 per RISC-V ISA.
+    /// Note: offset is already sign-extended to 64-bit by the CPU.
     pub fn compute_next_pc(&self) -> u64 {
         let base = if self.jalr { self.register } else { self.pc };
-        // Sign-extend offset from 32-bit to 64-bit
-        let offset_ext = self.offset as i32 as i64 as u64;
-        let unmasked = base.wrapping_add(offset_ext);
+        let unmasked = base.wrapping_add(self.offset);
         // Mask LSB to 0 (RISC-V requirement)
         unmasked & !1u64
     }
@@ -150,8 +147,7 @@ impl BranchOperation {
     /// Compute the unmasked next_pc (before LSB masking).
     pub fn compute_next_pc_unmasked(&self) -> u64 {
         let base = if self.jalr { self.register } else { self.pc };
-        let offset_ext = self.offset as i32 as i64 as u64;
-        base.wrapping_add(offset_ext)
+        base.wrapping_add(self.offset)
     }
 }
 
@@ -181,6 +177,10 @@ pub fn generate_branch_trace(
         let pc_0 = (op.pc & 0xFFFF_FFFF) as u32;
         let pc_1 = (op.pc >> 32) as u32;
 
+        // Extract offset as DWordWL: [Word, Word]
+        let offset_0 = (op.offset & 0xFFFF_FFFF) as u32;
+        let offset_1 = (op.offset >> 32) as u32;
+
         // Extract register as DWordWL: [Word, Word]
         let register_0 = (op.register & 0xFFFF_FFFF) as u32;
         let register_1 = (op.register >> 32) as u32;
@@ -202,13 +202,11 @@ pub fn generate_branch_trace(
         let next_pc_high_1 = ((next_pc >> 32) & 0xFFFF) as u16;
         let next_pc_high_2 = ((next_pc >> 48) & 0xFFFF) as u16;
 
-        // Sign bit: bit 31 of offset (1 if offset is negative in signed interpretation)
-        let sign_bit = if op.offset >= (1u32 << 31) { 1u64 } else { 0u64 };
-
         // Store columns
         data[base + cols::PC_0] = FE::from(pc_0 as u64);
         data[base + cols::PC_1] = FE::from(pc_1 as u64);
-        data[base + cols::OFFSET] = FE::from(op.offset as u64);
+        data[base + cols::OFFSET_0] = FE::from(offset_0 as u64);
+        data[base + cols::OFFSET_1] = FE::from(offset_1 as u64);
         data[base + cols::REGISTER_0] = FE::from(register_0 as u64);
         data[base + cols::REGISTER_1] = FE::from(register_1 as u64);
         data[base + cols::JALR] = FE::from(if op.jalr { 1u64 } else { 0u64 });
@@ -218,7 +216,6 @@ pub fn generate_branch_trace(
         data[base + cols::NEXT_PC_LOW_0] = FE::from(next_pc_low_0 as u64);
         data[base + cols::NEXT_PC_LOW_1] = FE::from(next_pc_low_1 as u64);
         data[base + cols::UNMASKED_LOW_BYTE] = FE::from(unmasked_low_byte as u64);
-        data[base + cols::SIGN_BIT] = FE::from(sign_bit);
         data[base + cols::MU] = FE::from(*multiplicity);
     }
 
@@ -292,7 +289,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             }],
         ),
         // BRANCH[next_pc; pc, offset, register, JALR] (receiver)
-        // Signature: [next_pc (DWordWL), pc (DWordWL), offset (Word), register (DWordWL), JALR (Bit)]
+        // Signature: [next_pc (DWordWL), pc (DWordWL), offset (DWordWL), register (DWordWL), JALR (Bit)]
         BusInteraction::receiver(
             BusId::Branch,
             Multiplicity::Column(cols::MU),
@@ -333,9 +330,13 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     start_column: cols::PC_1,
                     packing: Packing::Direct,
                 },
-                // offset
+                // offset as DWordWL
                 BusValue::Packed {
-                    start_column: cols::OFFSET,
+                    start_column: cols::OFFSET_0,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::OFFSET_1,
                     packing: Packing::Direct,
                 },
                 // register as DWordWL
@@ -466,32 +467,32 @@ impl BranchConstraint {
     /// Compute virtual carry[0] from the addition check.
     ///
     /// From ADD template iter=0:
-    /// base[0] + offset_ext[0] = next_pc_unmasked[0] + carry[0] * 2^32
+    /// base[0] + offset[0] = next_pc_unmasked[0] + carry[0] * 2^32
     ///
     /// Therefore:
-    /// carry[0] = (base[0] + offset_ext[0] - next_pc_unmasked[0]) / 2^32
+    /// carry[0] = (base[0] + offset[0] - next_pc_unmasked[0]) / 2^32
     fn compute_carry_0<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
     where
         F: IsSubFieldOf<E>,
         E: IsField,
     {
         let (base_0, _base_1) = self.compute_base(step);
-        let offset = step.get_main_evaluation_element(0, cols::OFFSET).clone();
+        let offset_0 = step.get_main_evaluation_element(0, cols::OFFSET_0).clone();
         let (unmasked_0, _unmasked_1) = self.compute_next_pc_unmasked(step);
 
-        // carry[0] = (base[0] + offset - next_pc_unmasked[0]) / 2^32
+        // carry[0] = (base[0] + offset[0] - next_pc_unmasked[0]) / 2^32
         let inv_2_32 = FieldElement::<F>::from(SHIFT_32).inv().unwrap();
-        (&base_0 + &offset - &unmasked_0) * &inv_2_32
+        (&base_0 + &offset_0 - &unmasked_0) * &inv_2_32
     }
 
     /// Compute virtual carry[1] from the addition check.
     ///
     /// From ADD template iter=1:
-    /// base[1] + offset_ext[1] + carry[0] = next_pc_unmasked[1] + carry[1] * 2^32
+    /// base[1] + offset[1] + carry[0] = next_pc_unmasked[1] + carry[1] * 2^32
     ///
-    /// where offset_ext[1] = sign_bit * (2^32 - 1) for sign extension.
+    /// With offset as DWordWL, offset[1] directly contains the sign-extended high word.
     ///
-    /// carry[1] = (base[1] + offset_ext[1] + carry[0] - next_pc_unmasked[1]) / 2^32
+    /// carry[1] = (base[1] + offset[1] + carry[0] - next_pc_unmasked[1]) / 2^32
     fn compute_carry_1<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
     where
         F: IsSubFieldOf<E>,
@@ -501,20 +502,12 @@ impl BranchConstraint {
         let (_unmasked_0, unmasked_1) = self.compute_next_pc_unmasked(step);
         let carry_0 = self.compute_carry_0(step);
 
-        // Get sign_bit from auxiliary column
-        let sign_bit = step
-            .get_main_evaluation_element(0, cols::SIGN_BIT)
-            .clone();
+        // offset[1] already contains the sign-extended high word
+        let offset_1 = step.get_main_evaluation_element(0, cols::OFFSET_1).clone();
 
-        // Compute sign extension: offset_ext[1] = sign_bit * (2^32 - 1)
-        // When sign_bit = 0: offset_ext[1] = 0 (positive offset)
-        // When sign_bit = 1: offset_ext[1] = 0xFFFFFFFF (negative offset)
-        let max_u32 = FieldElement::<F>::from(0xFFFF_FFFFu64);
-        let offset_ext_1 = &sign_bit * &max_u32;
-
-        // carry[1] = (base[1] + offset_ext[1] + carry[0] - unmasked[1]) / 2^32
+        // carry[1] = (base[1] + offset[1] + carry[0] - unmasked[1]) / 2^32
         let inv_2_32 = FieldElement::<F>::from(SHIFT_32).inv().unwrap();
-        (&base_1 + &offset_ext_1 + &carry_0 - &unmasked_1) * &inv_2_32
+        (&base_1 + &offset_1 + &carry_0 - &unmasked_1) * &inv_2_32
     }
 
     /// Compute the constraint value.
@@ -614,19 +607,17 @@ pub fn branch_constraints(constraint_idx_start: usize) -> (Vec<BranchConstraint>
 
 /// Compute virtual carry[0] and carry[1] for the branch addition.
 ///
-/// This computes the carries for: base + sign_extend(offset) = next_pc_unmasked
+/// This computes the carries for: base + offset = next_pc_unmasked
+/// where offset is already sign-extended to 64 bits as DWordWL.
 ///
 /// Returns (carry_0, carry_1) where both should be 0 or 1.
-pub fn compute_carries(base: u64, offset: u32, next_pc_unmasked: u64) -> (u64, u64) {
-    // Sign-extend offset to 64 bits
-    let offset_ext = offset as i32 as i64 as u64;
-
+pub fn compute_carries(base: u64, offset: u64, next_pc_unmasked: u64) -> (u64, u64) {
     // Split into DWordWL format
     let base_lo = base & 0xFFFF_FFFF;
     let base_hi = base >> 32;
 
-    let offset_lo = offset_ext & 0xFFFF_FFFF;
-    let offset_hi = offset_ext >> 32;
+    let offset_lo = offset & 0xFFFF_FFFF;
+    let offset_hi = offset >> 32;
 
     let result_lo = next_pc_unmasked & 0xFFFF_FFFF;
     let result_hi = next_pc_unmasked >> 32;

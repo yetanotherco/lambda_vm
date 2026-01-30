@@ -53,7 +53,7 @@ fn test_carry_computation_simple_positive() {
     // pc = 0x1000, offset = 4 (positive)
     // next_pc = 0x1004
     let base: u64 = 0x1000;
-    let offset: u32 = 4;
+    let offset: u64 = 4;
     let next_pc_unmasked: u64 = 0x1004;
 
     let (carry_0, carry_1) = compute_carries(base, offset, next_pc_unmasked);
@@ -68,7 +68,7 @@ fn test_carry_computation_with_carry_0() {
     // pc = 0xFFFF_FFFF, offset = 1 (positive)
     // next_pc = 0x1_0000_0000
     let base: u64 = 0xFFFF_FFFF;
-    let offset: u32 = 1;
+    let offset: u64 = 1;
     let next_pc_unmasked: u64 = 0x1_0000_0000;
 
     let (carry_0, carry_1) = compute_carries(base, offset, next_pc_unmasked);
@@ -80,10 +80,10 @@ fn test_carry_computation_with_carry_0() {
 
 #[test]
 fn test_carry_computation_negative_offset() {
-    // pc = 0x1000, offset = -4 (0xFFFFFFFC)
+    // pc = 0x1000, offset = -4 (sign-extended to 64-bit)
     // next_pc = 0x0FFC (no carry since subtraction)
     let base: u64 = 0x1000;
-    let offset: u32 = (-4i32) as u32; // 0xFFFFFFFC
+    let offset: u64 = (-4i64) as u64; // 0xFFFF_FFFF_FFFF_FFFC
     let op = BranchOperation::new(base, offset, 0, false);
     let next_pc_unmasked = op.compute_next_pc_unmasked();
 
@@ -96,9 +96,9 @@ fn test_carry_computation_negative_offset() {
 
 #[test]
 fn test_carry_computation_large_negative_offset() {
-    // pc = 0x1000_0000_0000, offset = -0x1000 (large negative)
+    // pc = 0x1000_0000_0000, offset = -0x1000 (large negative, sign-extended)
     let base: u64 = 0x1000_0000_0000;
-    let offset: u32 = (-0x1000i32) as u32;
+    let offset: u64 = (-0x1000i64) as u64;
     let op = BranchOperation::new(base, offset, 0, false);
     let next_pc_unmasked = op.compute_next_pc_unmasked();
 
@@ -130,8 +130,8 @@ fn test_branch_operation_lsb_masking() {
 
 #[test]
 fn test_branch_operation_negative_offset() {
-    // -4 should be sign-extended
-    let op = BranchOperation::new(0x1000, (-4i32) as u32, 0, false);
+    // -4 sign-extended to 64-bit
+    let op = BranchOperation::new(0x1000, (-4i64) as u64, 0, false);
     assert_eq!(op.compute_next_pc(), 0x0FFC);
 }
 
@@ -145,7 +145,7 @@ fn test_branch_operation_jalr() {
 
 #[test]
 fn test_branch_operation_jalr_negative_offset() {
-    let op = BranchOperation::new(0x1000, (-16i32) as u32, 0x3000, true);
+    let op = BranchOperation::new(0x1000, (-16i64) as u64, 0x3000, true);
     // register (0x3000) + (-16) = 0x2FF0
     assert_eq!(op.compute_next_pc(), 0x2FF0);
 }

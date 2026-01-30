@@ -323,8 +323,9 @@ fn test_bus_interactions_count() {
     // - 1 M6 (LOAD from memory)
     // - 1 M7 (STORE to memory)
     // - 1 DECODE (instruction fetch)
-    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 5 + 1 = 35
-    assert_eq!(interactions.len(), 35);
+    // - 1 BRANCH (branch/jump target calculation)
+    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 5 + 1 + 1 = 36
+    assert_eq!(interactions.len(), 36);
 }
 
 #[test]
