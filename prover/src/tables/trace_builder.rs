@@ -681,7 +681,7 @@ impl Traces {
             .map(|op| {
                 BranchOperation::new(
                     op.decode.pc,
-                    op.decode.imm,     // offset as full 64-bit DWordWL (already sign-extended)
+                    op.decode.imm, // offset as full 64-bit DWordWL (already sign-extended)
                     op.compute_arg1(), // register value must match CPU's arg1 for bus signature
                     op.decode.op_jalr,
                 )

@@ -21,7 +21,7 @@ use stark::trace::TraceTable;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
-use crate::tables::branch::{cols, generate_branch_trace, BranchOperation};
+use crate::tables::branch::{BranchOperation, cols, generate_branch_trace};
 use crate::tables::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 
 type F = GoldilocksField;
@@ -578,8 +578,8 @@ fn test_completeness_duplicate_lookups() {
 #[test]
 fn test_completeness_mixed_jalr_and_branch() {
     let ops = vec![
-        BranchOperation::new(0x1000, 16, 0, false),            // branch
-        BranchOperation::new(0x2000, 32, 0x8000, true),        // jalr
+        BranchOperation::new(0x1000, 16, 0, false),     // branch
+        BranchOperation::new(0x2000, 32, 0x8000, true), // jalr
         BranchOperation::new(0x3000, (-8i64) as u64, 0, false), // branch with negative offset
         BranchOperation::new(0x4000, (-16i64) as u64, 0xA000, true), // jalr with negative offset
     ];

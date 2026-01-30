@@ -409,8 +409,12 @@ impl BranchConstraint {
     {
         let pc_0 = step.get_main_evaluation_element(0, cols::PC_0).clone();
         let pc_1 = step.get_main_evaluation_element(0, cols::PC_1).clone();
-        let register_0 = step.get_main_evaluation_element(0, cols::REGISTER_0).clone();
-        let register_1 = step.get_main_evaluation_element(0, cols::REGISTER_1).clone();
+        let register_0 = step
+            .get_main_evaluation_element(0, cols::REGISTER_0)
+            .clone();
+        let register_1 = step
+            .get_main_evaluation_element(0, cols::REGISTER_1)
+            .clone();
         let jalr = step.get_main_evaluation_element(0, cols::JALR).clone();
 
         let one = FieldElement::<F>::one();
@@ -456,7 +460,8 @@ impl BranchConstraint {
         let shift_16 = FieldElement::<F>::from(SHIFT_16);
 
         // next_pc_unmasked[0] = unmasked_low_byte + 2^8 * next_pc_low[1] + 2^16 * next_pc_high[0]
-        let unmasked_0 = &unmasked_low_byte + &next_pc_low_1 * &shift_8 + &next_pc_high_0 * &shift_16;
+        let unmasked_0 =
+            &unmasked_low_byte + &next_pc_low_1 * &shift_8 + &next_pc_high_0 * &shift_16;
 
         // next_pc_unmasked[1] = next_pc_high[1] + 2^16 * next_pc_high[2]
         let unmasked_1 = &next_pc_high_1 + &next_pc_high_2 * &shift_16;

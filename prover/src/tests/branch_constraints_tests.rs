@@ -5,7 +5,7 @@
 //! - Carry computation validity
 //! - Sign extension handling
 
-use crate::tables::branch::{branch_constraints, compute_carries, BranchOperation};
+use crate::tables::branch::{BranchOperation, branch_constraints, compute_carries};
 use crate::tables::types::FE;
 use stark::constraints::transition::TransitionConstraint;
 
