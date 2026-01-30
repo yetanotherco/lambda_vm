@@ -33,6 +33,7 @@ use stark::trace::TraceTable;
 
 use super::bitwise::{self, BitwiseOperation, BitwiseOperationType};
 use super::cpu::{self, CpuOperation};
+use super::decode;
 use super::load::{self, LoadOperation};
 use super::lt::{self, LtOperation};
 use super::memw::{self, MemwOperation};
@@ -127,16 +128,16 @@ impl RegisterState {
 
 /// Get byte count and signed flag from CpuOperation memory flags.
 fn cpu_op_to_bytes_and_signed(op: &CpuOperation) -> (usize, bool) {
-    let byte_count = if op.memory_8bytes {
+    let byte_count = if op.decode.memory_8bytes {
         8
-    } else if op.memory_4bytes {
+    } else if op.decode.memory_4bytes {
         4
-    } else if op.memory_2bytes {
+    } else if op.decode.memory_2bytes {
         2
     } else {
         1
     };
-    (byte_count, op.signed)
+    (byte_count, op.decode.signed)
 }
 
 /// Pack a 64-bit register value into the MEMW value format.
@@ -168,7 +169,7 @@ fn collect_cpu_ops(
             .copied()
             .ok_or(ProverError::MissingInstruction(log.current_pc))?;
 
-        let op = CpuOperation::from_log(log, timestamp, instruction);
+        let op = CpuOperation::from_log_and_instruction(log, timestamp, instruction);
         cpu_ops.push(op);
     }
     Ok(cpu_ops)
@@ -208,12 +209,12 @@ fn collect_ops_from_cpu(
         // --- MEMW and LOAD (require state tracking, order matters) ---
 
         // Collect memory operations for Load/Store instructions
-        if op.op_load {
+        if op.decode.op_load {
             let (memw_op, load_op, lookups) = collect_load_op_from_cpu(op, memory_state);
             memw_ops.push(memw_op);
             load_ops.push(load_op);
             bitwise_ops.extend(lookups);
-        } else if op.op_store {
+        } else if op.decode.op_store {
             let memw_op = collect_store_op_from_cpu(op, memory_state);
             memw_ops.push(memw_op);
         }
@@ -225,10 +226,10 @@ fn collect_ops_from_cpu(
         // --- LT and Bitwise (no state tracking needed) ---
 
         // Collect LT operations from SLT/BLT instructions
-        if op.op_slt || op.op_blt {
+        if op.decode.op_slt || op.decode.op_blt {
             let arg1 = op.compute_arg1();
             let arg2 = op.compute_arg2();
-            lt_ops.push(LtOperation::new(arg1, arg2, op.signed));
+            lt_ops.push(LtOperation::new(arg1, arg2, op.decode.signed));
         }
 
         // Collect bitwise lookups
@@ -350,45 +351,47 @@ fn collect_register_ops_from_cpu(
     register_state: &mut RegisterState,
 ) -> Vec<MemwOperation> {
     let mut memw_ops = Vec::with_capacity(3);
+    let d = &op.decode;
 
     // M1: Read rs1 register at timestamp+0
-    if op.read_register1 && op.rs1 != 0 {
+    // Skip x0 (hardwired zero) and x255 (virtual PC register for AUIPC/JAL)
+    if d.read_register1 && d.rs1 != 0 && d.rs1 != 255 {
         let reg_value = pack_register_value(op.rv1);
-        let reg_addr = 2 * op.rs1 as u64;
-        let (_old_val, old_ts) = register_state.read(op.rs1);
+        let reg_addr = 2 * d.rs1 as u64;
+        let (_old_val, old_ts) = register_state.read(d.rs1);
         let old_timestamps = [old_ts; 8];
 
         let memw_op = MemwOperation::new(true, reg_addr, reg_value, op.timestamp, 8, true)
             .with_old(reg_value, old_timestamps);
         memw_ops.push(memw_op);
-        register_state.write(op.rs1, op.rv1, op.timestamp);
+        register_state.write(d.rs1, op.rv1, op.timestamp);
     }
 
     // M3: Read rs2 register at timestamp+1
-    if op.read_register2 && op.rs2 != 0 {
+    if d.read_register2 && d.rs2 != 0 {
         let reg_value = pack_register_value(op.rv2);
-        let reg_addr = 2 * op.rs2 as u64;
-        let (_old_val, old_ts) = register_state.read(op.rs2);
+        let reg_addr = 2 * d.rs2 as u64;
+        let (_old_val, old_ts) = register_state.read(d.rs2);
         let old_timestamps = [old_ts; 8];
 
         let memw_op = MemwOperation::new(true, reg_addr, reg_value, op.timestamp + 1, 8, true)
             .with_old(reg_value, old_timestamps);
         memw_ops.push(memw_op);
-        register_state.write(op.rs2, op.rv2, op.timestamp + 1);
+        register_state.write(d.rs2, op.rv2, op.timestamp + 1);
     }
 
     // M5: Write rd register at timestamp+2
-    if op.write_register && op.rd != 0 {
+    if d.write_register && d.rd != 0 {
         let reg_value = pack_register_value(op.rvd);
-        let reg_addr = 2 * op.rd as u64;
-        let (old_val, old_ts) = register_state.read(op.rd);
+        let reg_addr = 2 * d.rd as u64;
+        let (old_val, old_ts) = register_state.read(d.rd);
         let old_value = pack_register_value(old_val);
         let old_timestamps = [old_ts; 8];
 
         let memw_op = MemwOperation::new(true, reg_addr, reg_value, op.timestamp + 2, 8, false)
             .with_old(old_value, old_timestamps);
         memw_ops.push(memw_op);
-        register_state.write(op.rd, op.rvd, op.timestamp + 2);
+        register_state.write(d.rd, op.rvd, op.timestamp + 2);
     }
 
     memw_ops
@@ -573,6 +576,9 @@ pub struct Traces {
 
     /// LOAD memory load with extension trace
     pub load: TraceTable<GoldilocksField, GoldilocksExtension>,
+
+    /// DECODE instruction decoding table
+    pub decode: TraceTable<GoldilocksField, GoldilocksExtension>,
 }
 
 impl Traces {
@@ -624,12 +630,19 @@ impl Traces {
         let mut bitwise = bitwise::generate_bitwise_trace();
         bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
 
+        // Generate DECODE trace and update multiplicities
+        // Each CPU operation looks up the DECODE table once
+        let (mut decode, pc_to_row) = decode::generate_decode_trace(&instructions);
+        let decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
+        decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
+
         Ok(Traces {
             cpu,
             bitwise,
             lt,
             memw,
             load,
+            decode,
         })
     }
 
