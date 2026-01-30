@@ -6,7 +6,7 @@ use executor::vm::memory::U64HashMap;
 use crate::tables::decode::{
     DecodeEntry, bus_interactions, cols, generate_decode_trace, update_multiplicities,
 };
-use crate::tables::types::FE;
+use crate::tables::types::{packed_decode as bits, FE};
 
 // =========================================================================
 // Packed decode tests
@@ -14,185 +14,165 @@ use crate::tables::types::FE;
 
 #[test]
 fn test_packed_decode_flags() {
-    // Test each control flag individually
-    // Format matches decode.md spec
+    // Test each control flag individually using the constants from packed_decode module.
+    // This validates that the constants match the actual bit packing logic.
     let mut entry = DecodeEntry::new();
 
-    // Bit 0: read_register1
-    // Note: packed_decode excludes x0 and x255, so we need rs1 != 0 && rs1 != 255
+    // READ_REG1: excludes x0 and x255, so we need rs1 != 0 && rs1 != 255
     entry.read_register1 = true;
-    entry.rs1 = 1; // Use a valid register (not x0 or x255)
-    assert_eq!(entry.packed_decode() & (1 << 0), 1 << 0);
+    entry.rs1 = 1;
+    assert_eq!(entry.packed_decode() & (1 << bits::READ_REG1), 1 << bits::READ_REG1);
     entry.read_register1 = false;
     entry.rs1 = 0;
 
-    // Bit 1: read_register2
-    // Note: packed_decode excludes x0, so we need rs2 != 0
+    // READ_REG2: excludes x0, so we need rs2 != 0
     entry.read_register2 = true;
-    entry.rs2 = 1; // Use a valid register (not x0)
-    assert_eq!(entry.packed_decode() & (1 << 1), 1 << 1);
+    entry.rs2 = 1;
+    assert_eq!(entry.packed_decode() & (1 << bits::READ_REG2), 1 << bits::READ_REG2);
     entry.read_register2 = false;
     entry.rs2 = 0;
 
-    // Bit 2: write_register
-    // Note: packed_decode excludes x0, so we need rd != 0
+    // WRITE_REG: excludes x0, so we need rd != 0
     entry.write_register = true;
-    entry.rd = 1; // Use a valid register (not x0)
-    assert_eq!(entry.packed_decode() & (1 << 2), 1 << 2);
+    entry.rd = 1;
+    assert_eq!(entry.packed_decode() & (1 << bits::WRITE_REG), 1 << bits::WRITE_REG);
     entry.write_register = false;
     entry.rd = 0;
 
-    // Bit 3: memory_2bytes
+    // MEMORY_2BYTES
     entry.memory_2bytes = true;
-    assert_eq!(entry.packed_decode() & (1 << 3), 1 << 3);
+    assert_eq!(entry.packed_decode() & (1 << bits::MEMORY_2BYTES), 1 << bits::MEMORY_2BYTES);
     entry.memory_2bytes = false;
 
-    // Bit 4: memory_4bytes
+    // MEMORY_4BYTES
     entry.memory_4bytes = true;
-    assert_eq!(entry.packed_decode() & (1 << 4), 1 << 4);
+    assert_eq!(entry.packed_decode() & (1 << bits::MEMORY_4BYTES), 1 << bits::MEMORY_4BYTES);
     entry.memory_4bytes = false;
 
-    // Bit 5: memory_8bytes
+    // MEMORY_8BYTES
     entry.memory_8bytes = true;
-    assert_eq!(entry.packed_decode() & (1 << 5), 1 << 5);
+    assert_eq!(entry.packed_decode() & (1 << bits::MEMORY_8BYTES), 1 << bits::MEMORY_8BYTES);
     entry.memory_8bytes = false;
 
-    // Bit 6: c_type
+    // C_TYPE
     entry.c_type = true;
-    assert_eq!(entry.packed_decode() & (1 << 6), 1 << 6);
+    assert_eq!(entry.packed_decode() & (1 << bits::C_TYPE), 1 << bits::C_TYPE);
     entry.c_type = false;
 
-    // Bit 7: signed
+    // SIGNED
     entry.signed = true;
-    assert_eq!(entry.packed_decode() & (1 << 7), 1 << 7);
+    assert_eq!(entry.packed_decode() & (1 << bits::SIGNED), 1 << bits::SIGNED);
     entry.signed = false;
 
-    // Bit 8: mp_selector
+    // MP_SELECTOR
     entry.mp_selector = true;
-    assert_eq!(entry.packed_decode() & (1 << 8), 1 << 8);
+    assert_eq!(entry.packed_decode() & (1 << bits::MP_SELECTOR), 1 << bits::MP_SELECTOR);
     entry.mp_selector = false;
 
-    // Bit 9: muldiv_selector
+    // MULDIV_SELECTOR
     entry.muldiv_selector = true;
-    assert_eq!(entry.packed_decode() & (1 << 9), 1 << 9);
+    assert_eq!(entry.packed_decode() & (1 << bits::MULDIV_SELECTOR), 1 << bits::MULDIV_SELECTOR);
     entry.muldiv_selector = false;
 
-    // Bit 10: word_instr
+    // WORD_INSTR
     entry.word_instr = true;
-    assert_eq!(entry.packed_decode() & (1 << 10), 1 << 10);
+    assert_eq!(entry.packed_decode() & (1 << bits::WORD_INSTR), 1 << bits::WORD_INSTR);
     entry.word_instr = false;
 }
 
 #[test]
 fn test_packed_decode_alu_flags() {
-    // ALU flags at bits 11-26 per decode.md spec
+    // ALU flags - using constants to validate they match the packing logic
     let mut entry = DecodeEntry::new();
 
-    // Bit 11: ADD
     entry.op_add = true;
-    assert_eq!(entry.packed_decode() & (1 << 11), 1 << 11);
+    assert_eq!(entry.packed_decode() & (1 << bits::OP_ADD), 1 << bits::OP_ADD);
     entry.op_add = false;
 
-    // Bit 12: SUB
     entry.op_sub = true;
-    assert_eq!(entry.packed_decode() & (1 << 12), 1 << 12);
+    assert_eq!(entry.packed_decode() & (1 << bits::OP_SUB), 1 << bits::OP_SUB);
     entry.op_sub = false;
 
-    // Bit 13: SLT
     entry.op_slt = true;
-    assert_eq!(entry.packed_decode() & (1 << 13), 1 << 13);
+    assert_eq!(entry.packed_decode() & (1 << bits::OP_SLT), 1 << bits::OP_SLT);
     entry.op_slt = false;
 
-    // Bit 14: AND
     entry.op_and = true;
-    assert_eq!(entry.packed_decode() & (1 << 14), 1 << 14);
+    assert_eq!(entry.packed_decode() & (1 << bits::OP_AND), 1 << bits::OP_AND);
     entry.op_and = false;
 
-    // Bit 15: OR
     entry.op_or = true;
-    assert_eq!(entry.packed_decode() & (1 << 15), 1 << 15);
+    assert_eq!(entry.packed_decode() & (1 << bits::OP_OR), 1 << bits::OP_OR);
     entry.op_or = false;
 
-    // Bit 16: XOR
     entry.op_xor = true;
-    assert_eq!(entry.packed_decode() & (1 << 16), 1 << 16);
+    assert_eq!(entry.packed_decode() & (1 << bits::OP_XOR), 1 << bits::OP_XOR);
     entry.op_xor = false;
 
-    // Bit 17: SHIFT
     entry.op_shift = true;
-    assert_eq!(entry.packed_decode() & (1 << 17), 1 << 17);
+    assert_eq!(entry.packed_decode() & (1 << bits::OP_SHIFT), 1 << bits::OP_SHIFT);
     entry.op_shift = false;
 
-    // Bit 18: JALR
     entry.op_jalr = true;
-    assert_eq!(entry.packed_decode() & (1 << 18), 1 << 18);
+    assert_eq!(entry.packed_decode() & (1 << bits::OP_JALR), 1 << bits::OP_JALR);
     entry.op_jalr = false;
 
-    // Bit 19: BEQ
     entry.op_beq = true;
-    assert_eq!(entry.packed_decode() & (1 << 19), 1 << 19);
+    assert_eq!(entry.packed_decode() & (1 << bits::OP_BEQ), 1 << bits::OP_BEQ);
     entry.op_beq = false;
 
-    // Bit 20: BLT
     entry.op_blt = true;
-    assert_eq!(entry.packed_decode() & (1 << 20), 1 << 20);
+    assert_eq!(entry.packed_decode() & (1 << bits::OP_BLT), 1 << bits::OP_BLT);
     entry.op_blt = false;
 
-    // Bit 21: LOAD
     entry.op_load = true;
-    assert_eq!(entry.packed_decode() & (1 << 21), 1 << 21);
+    assert_eq!(entry.packed_decode() & (1 << bits::OP_LOAD), 1 << bits::OP_LOAD);
     entry.op_load = false;
 
-    // Bit 22: STORE
     entry.op_store = true;
-    assert_eq!(entry.packed_decode() & (1 << 22), 1 << 22);
+    assert_eq!(entry.packed_decode() & (1 << bits::OP_STORE), 1 << bits::OP_STORE);
     entry.op_store = false;
 
-    // Bit 23: MUL
     entry.op_mul = true;
-    assert_eq!(entry.packed_decode() & (1 << 23), 1 << 23);
+    assert_eq!(entry.packed_decode() & (1 << bits::OP_MUL), 1 << bits::OP_MUL);
     entry.op_mul = false;
 
-    // Bit 24: DIVREM
     entry.op_divrem = true;
-    assert_eq!(entry.packed_decode() & (1 << 24), 1 << 24);
+    assert_eq!(entry.packed_decode() & (1 << bits::OP_DIVREM), 1 << bits::OP_DIVREM);
     entry.op_divrem = false;
 
-    // Bit 25: ECALL
     entry.op_ecall = true;
-    assert_eq!(entry.packed_decode() & (1 << 25), 1 << 25);
+    assert_eq!(entry.packed_decode() & (1 << bits::OP_ECALL), 1 << bits::OP_ECALL);
     entry.op_ecall = false;
 
-    // Bit 26: EBREAK
     entry.op_ebreak = true;
-    assert_eq!(entry.packed_decode() & (1 << 26), 1 << 26);
+    assert_eq!(entry.packed_decode() & (1 << bits::OP_EBREAK), 1 << bits::OP_EBREAK);
     entry.op_ebreak = false;
 }
 
 #[test]
 fn test_packed_decode_registers() {
-    // Register positions per decode.md spec:
-    // rs1 at bits [27:35), rs2 at bits [35:43), rd at bits [43:51)
+    // Register positions - using constants
     let mut entry = DecodeEntry::new();
 
-    // rs1 at bits [27:35)
+    // rs1
     entry.rs1 = 0b10101010;
     let packed = entry.packed_decode();
-    let rs1_extracted = (packed >> 27) & 0xFF;
+    let rs1_extracted = (packed >> bits::RS1) & 0xFF;
     assert_eq!(rs1_extracted, 0b10101010);
     entry.rs1 = 0;
 
-    // rs2 at bits [35:43)
+    // rs2
     entry.rs2 = 0b11001100;
     let packed = entry.packed_decode();
-    let rs2_extracted = (packed >> 35) & 0xFF;
+    let rs2_extracted = (packed >> bits::RS2) & 0xFF;
     assert_eq!(rs2_extracted, 0b11001100);
     entry.rs2 = 0;
 
-    // rd at bits [43:51)
+    // rd
     entry.rd = 0b11110000;
     let packed = entry.packed_decode();
-    let rd_extracted = (packed >> 43) & 0xFF;
+    let rd_extracted = (packed >> bits::RD) & 0xFF;
     assert_eq!(rd_extracted, 0b11110000);
 }
 

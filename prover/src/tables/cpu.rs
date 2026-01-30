@@ -822,6 +822,14 @@ pub fn collect_bitwise_ops_from_logs(
 // Bus interactions
 // =========================================================================
 
+/// Helper to create a LinearTerm with coefficient 2^bit for a column.
+fn linear_term(bit: u32, column: usize) -> LinearTerm {
+    LinearTerm::Column {
+        coefficient: 1 << bit,
+        column,
+    }
+}
+
 /// Returns the bus interactions for the CPU table.
 ///
 /// The CPU table sends to:
@@ -831,6 +839,8 @@ pub fn collect_bitwise_ops_from_logs(
 /// Note: LT interaction is TODO - needs proper DWordHHW packing to match LT table receiver.
 /// Note: IS_BYTE, MSB8, ZERO, BRANCH interactions are TODO for later.
 pub fn bus_interactions() -> Vec<BusInteraction> {
+    use super::types::packed_decode as bits;
+
     let mut interactions = Vec::new();
 
     // -------------------------------------------------------------------------
@@ -839,12 +849,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // Every CPU row looks up the DECODE table once to verify instruction decoding.
     // Format: DECODE[pc::DWordWL, imm::DWordWL, packed_decode]
     //
-    // packed_decode is computed as a linear combination of all decode columns:
-    // bits [0-10]: control flags
-    // bits [11-26]: ALU selector flags
-    // bits [27-34]: rs1
-    // bits [35-42]: rs2
-    // bits [43-50]: rd
+    // packed_decode is computed as a linear combination of all decode columns.
+    // Bit positions are defined in types::packed_decode (single source of truth).
     interactions.push(BusInteraction::sender(
         BusId::Decode,
         Multiplicity::One, // Every row sends exactly once
@@ -862,128 +868,38 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             // packed_decode as linear combination of decode columns
             BusValue::linear(vec![
                 // Control flags (bits 0-10)
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::READ_REGISTER1,
-                }, // bit 0
-                LinearTerm::Column {
-                    coefficient: 1 << 1,
-                    column: cols::READ_REGISTER2,
-                }, // bit 1
-                LinearTerm::Column {
-                    coefficient: 1 << 2,
-                    column: cols::WRITE_REGISTER,
-                }, // bit 2
-                LinearTerm::Column {
-                    coefficient: 1 << 3,
-                    column: cols::MEMORY_2BYTES,
-                }, // bit 3
-                LinearTerm::Column {
-                    coefficient: 1 << 4,
-                    column: cols::MEMORY_4BYTES,
-                }, // bit 4
-                LinearTerm::Column {
-                    coefficient: 1 << 5,
-                    column: cols::MEMORY_8BYTES,
-                }, // bit 5
-                LinearTerm::Column {
-                    coefficient: 1 << 6,
-                    column: cols::C_TYPE_INSTRUCTION,
-                }, // bit 6
-                LinearTerm::Column {
-                    coefficient: 1 << 7,
-                    column: cols::SIGNED,
-                }, // bit 7
-                LinearTerm::Column {
-                    coefficient: 1 << 8,
-                    column: cols::MP_SELECTOR,
-                }, // bit 8
-                LinearTerm::Column {
-                    coefficient: 1 << 9,
-                    column: cols::MULDIV_SELECTOR,
-                }, // bit 9
-                LinearTerm::Column {
-                    coefficient: 1 << 10,
-                    column: cols::WORD_INSTR,
-                }, // bit 10
+                linear_term(bits::READ_REG1, cols::READ_REGISTER1),
+                linear_term(bits::READ_REG2, cols::READ_REGISTER2),
+                linear_term(bits::WRITE_REG, cols::WRITE_REGISTER),
+                linear_term(bits::MEMORY_2BYTES, cols::MEMORY_2BYTES),
+                linear_term(bits::MEMORY_4BYTES, cols::MEMORY_4BYTES),
+                linear_term(bits::MEMORY_8BYTES, cols::MEMORY_8BYTES),
+                linear_term(bits::C_TYPE, cols::C_TYPE_INSTRUCTION),
+                linear_term(bits::SIGNED, cols::SIGNED),
+                linear_term(bits::MP_SELECTOR, cols::MP_SELECTOR),
+                linear_term(bits::MULDIV_SELECTOR, cols::MULDIV_SELECTOR),
+                linear_term(bits::WORD_INSTR, cols::WORD_INSTR),
                 // ALU selector flags (bits 11-26)
-                LinearTerm::Column {
-                    coefficient: 1 << 11,
-                    column: cols::ADD,
-                }, // bit 11
-                LinearTerm::Column {
-                    coefficient: 1 << 12,
-                    column: cols::SUB,
-                }, // bit 12
-                LinearTerm::Column {
-                    coefficient: 1 << 13,
-                    column: cols::SLT,
-                }, // bit 13
-                LinearTerm::Column {
-                    coefficient: 1 << 14,
-                    column: cols::AND,
-                }, // bit 14
-                LinearTerm::Column {
-                    coefficient: 1 << 15,
-                    column: cols::OR,
-                }, // bit 15
-                LinearTerm::Column {
-                    coefficient: 1 << 16,
-                    column: cols::XOR,
-                }, // bit 16
-                LinearTerm::Column {
-                    coefficient: 1 << 17,
-                    column: cols::SHIFT,
-                }, // bit 17
-                LinearTerm::Column {
-                    coefficient: 1 << 18,
-                    column: cols::JALR,
-                }, // bit 18
-                LinearTerm::Column {
-                    coefficient: 1 << 19,
-                    column: cols::BEQ,
-                }, // bit 19
-                LinearTerm::Column {
-                    coefficient: 1 << 20,
-                    column: cols::BLT,
-                }, // bit 20
-                LinearTerm::Column {
-                    coefficient: 1 << 21,
-                    column: cols::LOAD,
-                }, // bit 21
-                LinearTerm::Column {
-                    coefficient: 1 << 22,
-                    column: cols::STORE,
-                }, // bit 22
-                LinearTerm::Column {
-                    coefficient: 1 << 23,
-                    column: cols::MUL,
-                }, // bit 23
-                LinearTerm::Column {
-                    coefficient: 1 << 24,
-                    column: cols::DIVREM,
-                }, // bit 24
-                LinearTerm::Column {
-                    coefficient: 1 << 25,
-                    column: cols::ECALL,
-                }, // bit 25
-                LinearTerm::Column {
-                    coefficient: 1 << 26,
-                    column: cols::EBREAK,
-                }, // bit 26
+                linear_term(bits::OP_ADD, cols::ADD),
+                linear_term(bits::OP_SUB, cols::SUB),
+                linear_term(bits::OP_SLT, cols::SLT),
+                linear_term(bits::OP_AND, cols::AND),
+                linear_term(bits::OP_OR, cols::OR),
+                linear_term(bits::OP_XOR, cols::XOR),
+                linear_term(bits::OP_SHIFT, cols::SHIFT),
+                linear_term(bits::OP_JALR, cols::JALR),
+                linear_term(bits::OP_BEQ, cols::BEQ),
+                linear_term(bits::OP_BLT, cols::BLT),
+                linear_term(bits::OP_LOAD, cols::LOAD),
+                linear_term(bits::OP_STORE, cols::STORE),
+                linear_term(bits::OP_MUL, cols::MUL),
+                linear_term(bits::OP_DIVREM, cols::DIVREM),
+                linear_term(bits::OP_ECALL, cols::ECALL),
+                linear_term(bits::OP_EBREAK, cols::EBREAK),
                 // Register indices (bits 27-50)
-                LinearTerm::Column {
-                    coefficient: 1 << 27,
-                    column: cols::RS1,
-                }, // bits 27-34
-                LinearTerm::Column {
-                    coefficient: 1 << 35,
-                    column: cols::RS2,
-                }, // bits 35-42
-                LinearTerm::Column {
-                    coefficient: 1 << 43,
-                    column: cols::RD,
-                }, // bits 43-50
+                linear_term(bits::RS1, cols::RS1),
+                linear_term(bits::RS2, cols::RS2),
+                linear_term(bits::RD, cols::RD),
             ]),
         ],
     ));

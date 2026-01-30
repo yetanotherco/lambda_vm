@@ -162,6 +162,64 @@ pub mod columns {
 }
 
 // =========================================================================
+// packed_decode bit positions (shared between CPU and DECODE tables)
+// =========================================================================
+
+/// Bit positions for the packed_decode field.
+///
+/// This is the single source of truth for how decode fields are packed into
+/// a 51-bit value. Used by:
+/// - `DecodeEntry::packed_decode()` - packs fields into a u64
+/// - CPU table bus interaction - builds LinearTerm coefficients
+///
+/// ## Format (51 bits total)
+///
+/// ```text
+/// Bits [0-10]:  Control flags (read_reg1, read_reg2, write_reg, memory_*, etc.)
+/// Bits [11-26]: ALU operation flags (ADD, SUB, SLT, AND, OR, XOR, etc.)
+/// Bits [27-34]: rs1 register index (8 bits)
+/// Bits [35-42]: rs2 register index (8 bits)
+/// Bits [43-50]: rd register index (8 bits)
+/// ```
+pub mod packed_decode {
+    // Control flags (bits 0-10)
+    pub const READ_REG1: u32 = 0;
+    pub const READ_REG2: u32 = 1;
+    pub const WRITE_REG: u32 = 2;
+    pub const MEMORY_2BYTES: u32 = 3;
+    pub const MEMORY_4BYTES: u32 = 4;
+    pub const MEMORY_8BYTES: u32 = 5;
+    pub const C_TYPE: u32 = 6;
+    pub const SIGNED: u32 = 7;
+    pub const MP_SELECTOR: u32 = 8;
+    pub const MULDIV_SELECTOR: u32 = 9;
+    pub const WORD_INSTR: u32 = 10;
+
+    // ALU operation flags (bits 11-26)
+    pub const OP_ADD: u32 = 11;
+    pub const OP_SUB: u32 = 12;
+    pub const OP_SLT: u32 = 13;
+    pub const OP_AND: u32 = 14;
+    pub const OP_OR: u32 = 15;
+    pub const OP_XOR: u32 = 16;
+    pub const OP_SHIFT: u32 = 17;
+    pub const OP_JALR: u32 = 18;
+    pub const OP_BEQ: u32 = 19;
+    pub const OP_BLT: u32 = 20;
+    pub const OP_LOAD: u32 = 21;
+    pub const OP_STORE: u32 = 22;
+    pub const OP_MUL: u32 = 23;
+    pub const OP_DIVREM: u32 = 24;
+    pub const OP_ECALL: u32 = 25;
+    pub const OP_EBREAK: u32 = 26;
+
+    // Register indices (bits 27-50)
+    pub const RS1: u32 = 27;
+    pub const RS2: u32 = 35;
+    pub const RD: u32 = 43;
+}
+
+// =========================================================================
 // DecodeEntry - Shared decode information for CPU and DECODE tables
 // =========================================================================
 
@@ -294,11 +352,14 @@ impl DecodeEntry {
     /// Packs all flags and register indices into a single 51-bit value.
     ///
     /// This matches the spec's packed_decode format (decode.md).
+    /// Bit positions are defined in the `packed_decode` module.
     ///
     /// Note: The register flags (read_register1, read_register2, write_register)
     /// are adjusted to exclude x0 (hardwired zero) and x255 (virtual PC for AUIPC/JAL).
     /// This matches the CPU trace columns and ensures the DECODE bus balances.
     pub fn packed_decode(&self) -> u64 {
+        use crate::tables::types::packed_decode as bits;
+
         let mut packed: u64 = 0;
 
         // Control flags (bits 0-10)
@@ -306,40 +367,40 @@ impl DecodeEntry {
         let read_reg1_physical = self.read_register1 && self.rs1 != 0 && self.rs1 != 255;
         let read_reg2_physical = self.read_register2 && self.rs2 != 0;
         let write_reg_physical = self.write_register && self.rd != 0;
-        packed |= read_reg1_physical as u64;
-        packed |= (read_reg2_physical as u64) << 1;
-        packed |= (write_reg_physical as u64) << 2;
-        packed |= (self.memory_2bytes as u64) << 3;
-        packed |= (self.memory_4bytes as u64) << 4;
-        packed |= (self.memory_8bytes as u64) << 5;
-        packed |= (self.c_type as u64) << 6;
-        packed |= (self.signed as u64) << 7;
-        packed |= (self.mp_selector as u64) << 8;
-        packed |= (self.muldiv_selector as u64) << 9;
-        packed |= (self.word_instr as u64) << 10;
+        packed |= (read_reg1_physical as u64) << bits::READ_REG1;
+        packed |= (read_reg2_physical as u64) << bits::READ_REG2;
+        packed |= (write_reg_physical as u64) << bits::WRITE_REG;
+        packed |= (self.memory_2bytes as u64) << bits::MEMORY_2BYTES;
+        packed |= (self.memory_4bytes as u64) << bits::MEMORY_4BYTES;
+        packed |= (self.memory_8bytes as u64) << bits::MEMORY_8BYTES;
+        packed |= (self.c_type as u64) << bits::C_TYPE;
+        packed |= (self.signed as u64) << bits::SIGNED;
+        packed |= (self.mp_selector as u64) << bits::MP_SELECTOR;
+        packed |= (self.muldiv_selector as u64) << bits::MULDIV_SELECTOR;
+        packed |= (self.word_instr as u64) << bits::WORD_INSTR;
 
         // ALU flags (bits 11-26)
-        packed |= (self.op_add as u64) << 11;
-        packed |= (self.op_sub as u64) << 12;
-        packed |= (self.op_slt as u64) << 13;
-        packed |= (self.op_and as u64) << 14;
-        packed |= (self.op_or as u64) << 15;
-        packed |= (self.op_xor as u64) << 16;
-        packed |= (self.op_shift as u64) << 17;
-        packed |= (self.op_jalr as u64) << 18;
-        packed |= (self.op_beq as u64) << 19;
-        packed |= (self.op_blt as u64) << 20;
-        packed |= (self.op_load as u64) << 21;
-        packed |= (self.op_store as u64) << 22;
-        packed |= (self.op_mul as u64) << 23;
-        packed |= (self.op_divrem as u64) << 24;
-        packed |= (self.op_ecall as u64) << 25;
-        packed |= (self.op_ebreak as u64) << 26;
+        packed |= (self.op_add as u64) << bits::OP_ADD;
+        packed |= (self.op_sub as u64) << bits::OP_SUB;
+        packed |= (self.op_slt as u64) << bits::OP_SLT;
+        packed |= (self.op_and as u64) << bits::OP_AND;
+        packed |= (self.op_or as u64) << bits::OP_OR;
+        packed |= (self.op_xor as u64) << bits::OP_XOR;
+        packed |= (self.op_shift as u64) << bits::OP_SHIFT;
+        packed |= (self.op_jalr as u64) << bits::OP_JALR;
+        packed |= (self.op_beq as u64) << bits::OP_BEQ;
+        packed |= (self.op_blt as u64) << bits::OP_BLT;
+        packed |= (self.op_load as u64) << bits::OP_LOAD;
+        packed |= (self.op_store as u64) << bits::OP_STORE;
+        packed |= (self.op_mul as u64) << bits::OP_MUL;
+        packed |= (self.op_divrem as u64) << bits::OP_DIVREM;
+        packed |= (self.op_ecall as u64) << bits::OP_ECALL;
+        packed |= (self.op_ebreak as u64) << bits::OP_EBREAK;
 
         // Register indices (bits 27-50)
-        packed |= (self.rs1 as u64) << 27;
-        packed |= (self.rs2 as u64) << 35;
-        packed |= (self.rd as u64) << 43;
+        packed |= (self.rs1 as u64) << bits::RS1;
+        packed |= (self.rs2 as u64) << bits::RS2;
+        packed |= (self.rd as u64) << bits::RD;
 
         packed
     }
