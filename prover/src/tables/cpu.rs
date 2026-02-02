@@ -58,6 +58,11 @@ use executor::vm::{instruction::decoding::Instruction, logs::Log, memory::U64Has
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
+/// PC value used for CPU padding rows. Per spec, this is an odd address (unreachable
+/// during normal execution) with all flags=0. The DECODE table must contain a
+/// corresponding entry at this PC.
+pub const CPU_PADDING_PC: u64 = 1;
+
 // =========================================================================
 // Column indices for CPU table
 // =========================================================================
@@ -625,6 +630,14 @@ impl CpuOperation {
         if self.decode.rs1 == 255 {
             self.rv1 = log.current_pc;
         }
+
+        // ECALL: Per spec constraint CO69, next_pc = pc + instr_size for all instructions,
+        // including ECALL. The CPU transition constraint enforces next_pc = pc + 4 on every
+        // row, so the trace must satisfy this even though the executor sets next_pc=0 to
+        // signal halt. The HALT table separately proves program termination via the ECALL bus.
+        if self.decode.op_ecall {
+            self.next_pc = self.decode.pc + 4;
+        }
     }
 }
 
@@ -641,20 +654,7 @@ pub fn generate_cpu_trace(
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let n = operations.len();
 
-    // Require power of 2, minimum 4 rows (FRI requirement)
-    // Padding not yet supported - constraints like NextPcAdd fail on zero-filled rows
-    assert!(
-        n >= 4,
-        "CPU trace requires at least 4 operations, got {}",
-        n
-    );
-    assert!(
-        n.is_power_of_two(),
-        "CPU trace requires power-of-2 operations (no padding support yet), got {}",
-        n
-    );
-
-    let num_rows = n;
+    let num_rows = n.next_power_of_two();
     let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
 
     for (row_idx, op) in operations.iter().enumerate() {
@@ -759,6 +759,16 @@ pub fn generate_cpu_trace(
         // Branch columns
         data[base + cols::IS_EQUAL] = FE::from(op.is_equal as u64);
         data[base + cols::BRANCH_COND] = FE::from(op.branch_cond as u64);
+    }
+
+    // Padding rows: per spec, padding uses pc=1 (odd address, unreachable during
+    // normal execution) with all flags=0, so pad=1 and no bus interactions fire.
+    // next_pc=5 satisfies the NextPcAdd constraint: carry=(1+4-5)/2^32=0.
+    // The DECODE table must contain a corresponding entry at pc=1.
+    for row_idx in n..num_rows {
+        let base = row_idx * cols::NUM_COLUMNS;
+        data[base + cols::PC_0] = FE::from(CPU_PADDING_PC);
+        data[base + cols::NEXT_PC_0] = FE::from(CPU_PADDING_PC + 4);
     }
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
@@ -1458,6 +1468,22 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::MEMORY_8BYTES,
                 packing: Packing::Direct,
             },
+        ],
+    ));
+
+    // ECALL interaction (CPU → HALT)
+    // -------------------------------------------------------------------------
+    // When ECALL flag is set, send [timestamp_lo, timestamp_hi] to the HALT table.
+    // The CPU timestamp fits in a single field element (u32), so timestamp_hi = 0.
+    interactions.push(BusInteraction::sender(
+        BusId::Ecall,
+        Multiplicity::Column(cols::ECALL),
+        vec![
+            BusValue::Packed {
+                start_column: cols::TIMESTAMP,
+                packing: Packing::Direct,
+            },
+            BusValue::constant(0), // timestamp_hi = 0 (CPU timestamps fit in u32)
         ],
     ));
 

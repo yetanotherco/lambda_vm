@@ -9,6 +9,7 @@ main:
 	divu    a4, a3, a1
 	sub     a5, a4, a0
 	mulhu    a0, a2, a5
-	jalr	zero, 0(ra)
+	li	a7, 5
+	ecall
 .Lfunc_end1:
 	.size	main, .Lfunc_end1-main

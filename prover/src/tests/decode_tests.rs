@@ -404,8 +404,8 @@ fn test_trace_generation_basic() {
 
     let (trace, _pc_to_row) = generate_decode_trace(&instructions);
 
-    // Should be padded to power of 2
-    assert_eq!(trace.main_table.height, 2);
+    // 2 instructions + 1 CPU padding entry = 3, padded to power of 2 = 4
+    assert_eq!(trace.main_table.height, 4);
     assert_eq!(trace.main_table.width, cols::NUM_COLUMNS);
 }
 
@@ -473,7 +473,8 @@ fn test_trace_multiple_instructions_different_multiplicities() {
     ];
     update_multiplicities(&mut trace, &pc_to_row, &lookups);
 
-    assert_eq!(trace.main_table.height, 2);
+    // 2 instructions + 1 CPU padding entry = 3, padded to 4
+    assert_eq!(trace.main_table.height, 4);
 
     let mut mu_1000 = None;
     let mut mu_1004 = None;
@@ -525,27 +526,31 @@ fn test_trace_padding_to_power_of_two() {
 
     let (trace, _pc_to_row) = generate_decode_trace(&instructions);
 
-    assert_eq!(trace.main_table.height, 4, "3 entries should pad to 4 rows");
+    // 3 instructions + 1 CPU padding entry = 4, already power of 2
+    assert_eq!(
+        trace.main_table.height, 4,
+        "3 instructions + 1 CPU padding entry = 4 rows"
+    );
 
-    // Verify the padding row has pc=7 and EBREAK flag
-    let padding = DecodeEntry::padding_entry();
-    let padding_packed = padding.packed_decode();
-
-    // Find a row with pc=7 (padding)
-    let mut found_padding = false;
+    // Verify the CPU padding row has pc=1 and all flags=0
+    let mut found_cpu_padding = false;
     for row_idx in 0..trace.main_table.height {
         let row = trace.main_table.get_row(row_idx);
-        if row[cols::PC_0] == FE::from(7u64) {
+        if row[cols::PC_0] == FE::from(1u64) {
             assert_eq!(
                 row[cols::PACKED_DECODE],
-                FE::from(padding_packed),
-                "Padding should have EBREAK set"
+                FE::zero(),
+                "CPU padding entry should have all flags=0"
             );
-            assert_eq!(row[cols::MU], FE::zero(), "Padding should have mu=0");
-            found_padding = true;
+            assert_eq!(
+                row[cols::MU],
+                FE::zero(),
+                "CPU padding entry should have mu=0"
+            );
+            found_cpu_padding = true;
         }
     }
-    assert!(found_padding, "Padding row with pc=7 not found");
+    assert!(found_cpu_padding, "CPU padding row with pc=1 not found");
 }
 
 #[test]
@@ -871,8 +876,8 @@ fn test_decode_soundness_different_elf_rejected() {
     use crate::tables::trace_builder::Traces;
     use crate::tables::types::{GoldilocksExtension, GoldilocksField};
     use crate::test_utils::{
-        create_bitwise_air, create_cpu_air, create_decode_air, create_load_air, create_lt_air,
-        create_memw_air,
+        create_bitwise_air, create_cpu_air, create_decode_air, create_halt_air, create_load_air,
+        create_lt_air, create_memw_air,
     };
 
     type F = GoldilocksField;
@@ -920,6 +925,7 @@ fn test_decode_soundness_different_elf_rejected() {
     let prover_lt_air = create_lt_air(&proof_options);
     let prover_memw_air = create_memw_air(&proof_options);
     let prover_load_air = create_load_air(&proof_options);
+    let prover_halt_air = create_halt_air(&proof_options);
     let prover_decode_air = create_decode_air(&proof_options).with_preprocessed(
         commitment_a, // Prover uses commitment from ELF A
         decode::NUM_PRECOMPUTED_COLS,
@@ -935,6 +941,7 @@ fn test_decode_soundness_different_elf_rejected() {
         (&prover_lt_air, &mut traces.lt, &()),
         (&prover_memw_air, &mut traces.memw, &()),
         (&prover_load_air, &mut traces.load, &()),
+        (&prover_halt_air, &mut traces.halt, &()),
         (&prover_decode_air, &mut traces.decode, &()),
     ];
 
@@ -949,6 +956,7 @@ fn test_decode_soundness_different_elf_rejected() {
     let verifier_lt_air = create_lt_air(&proof_options);
     let verifier_memw_air = create_memw_air(&proof_options);
     let verifier_load_air = create_load_air(&proof_options);
+    let verifier_halt_air = create_halt_air(&proof_options);
     let verifier_decode_air = create_decode_air(&proof_options).with_preprocessed(
         commitment_b, // Verifier uses commitment from ELF B (DIFFERENT!)
         decode::NUM_PRECOMPUTED_COLS,
@@ -960,6 +968,7 @@ fn test_decode_soundness_different_elf_rejected() {
         &verifier_lt_air,
         &verifier_memw_air,
         &verifier_load_air,
+        &verifier_halt_air,
         &verifier_decode_air,
     ];
 
@@ -992,8 +1001,8 @@ fn test_decode_soundness_same_elf_accepted() {
     use crate::tables::trace_builder::Traces;
     use crate::tables::types::{GoldilocksExtension, GoldilocksField};
     use crate::test_utils::{
-        create_bitwise_air, create_cpu_air, create_decode_air, create_load_air, create_lt_air,
-        create_memw_air,
+        create_bitwise_air, create_cpu_air, create_decode_air, create_halt_air, create_load_air,
+        create_lt_air, create_memw_air,
     };
 
     type F = GoldilocksField;
@@ -1032,6 +1041,7 @@ fn test_decode_soundness_same_elf_accepted() {
     let prover_lt_air = create_lt_air(&proof_options);
     let prover_memw_air = create_memw_air(&proof_options);
     let prover_load_air = create_load_air(&proof_options);
+    let prover_halt_air = create_halt_air(&proof_options);
     let prover_decode_air = create_decode_air(&proof_options)
         .with_preprocessed(prover_commitment, decode::NUM_PRECOMPUTED_COLS);
 
@@ -1045,6 +1055,7 @@ fn test_decode_soundness_same_elf_accepted() {
         (&prover_lt_air, &mut traces.lt, &()),
         (&prover_memw_air, &mut traces.memw, &()),
         (&prover_load_air, &mut traces.load, &()),
+        (&prover_halt_air, &mut traces.halt, &()),
         (&prover_decode_air, &mut traces.decode, &()),
     ];
 
@@ -1065,6 +1076,7 @@ fn test_decode_soundness_same_elf_accepted() {
     let verifier_lt_air = create_lt_air(&proof_options);
     let verifier_memw_air = create_memw_air(&proof_options);
     let verifier_load_air = create_load_air(&proof_options);
+    let verifier_halt_air = create_halt_air(&proof_options);
     let verifier_decode_air = create_decode_air(&proof_options)
         .with_preprocessed(verifier_commitment, decode::NUM_PRECOMPUTED_COLS);
 
@@ -1074,6 +1086,7 @@ fn test_decode_soundness_same_elf_accepted() {
         &verifier_lt_air,
         &verifier_memw_air,
         &verifier_load_air,
+        &verifier_halt_air,
         &verifier_decode_air,
     ];
 

@@ -7,4 +7,5 @@ main:
 	li	a2, 0x80000000
 	addi	a3, zero, 1
 	sraw	a0, a2, a3
-	jalr	zero, 0(ra)
+	li	a7, 5
+	ecall

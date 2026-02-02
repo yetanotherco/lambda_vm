@@ -32,6 +32,7 @@ use crate::tables::cpu::{
     CpuOperation, bus_interactions as cpu_bus_interactions, cols as cpu_cols,
 };
 use crate::tables::decode::{bus_interactions as decode_bus_interactions, cols as decode_cols};
+use crate::tables::halt::{bus_interactions as halt_bus_interactions, cols as halt_cols};
 use crate::tables::load::{
     bus_interactions as load_bus_interactions, cols as load_cols, constraints as load_constraints,
 };
@@ -564,6 +565,23 @@ pub fn create_decode_air(proof_options: &ProofOptions) -> VmAir {
 
     AirWithBuses::new(
         decode_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+}
+
+/// Create HALT AIR with bus interactions (no transition constraints).
+pub fn create_halt_air(proof_options: &ProofOptions) -> VmAir {
+    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: halt_bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        halt_cols::NUM_COLUMNS,
         auxiliary_trace_build_data,
         proof_options,
         1,

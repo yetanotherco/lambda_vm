@@ -117,8 +117,20 @@ pub fn generate_decode_trace(
         })
         .collect();
 
+    // Add the CPU padding entry: pc=CPU_PADDING_PC, all flags=0 (per spec, decode must
+    // include this). This row is looked up by CPU padding rows. Its MU will be set by
+    // update_multiplicities.
+    let cpu_padding_row = entries.len();
+    pc_to_row.insert(super::cpu::CPU_PADDING_PC, cpu_padding_row);
+    let cpu_padding_entry = DecodeEntry {
+        pc: super::cpu::CPU_PADDING_PC,
+        ..Default::default()
+    };
+
     // Pad to next power of 2, minimum 2
-    let num_rows = entries.len().next_power_of_two().max(2);
+    // +1 for the CPU padding entry
+    let num_entries = entries.len() + 1;
+    let num_rows = num_entries.next_power_of_two().max(2);
     let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
 
     // Fill actual entries (MU = 0 initially)
@@ -139,9 +151,19 @@ pub fn generate_decode_trace(
         // MU = 0 (already zero from vec initialization)
     }
 
+    // Write CPU padding entry (pc=1, all flags=0)
+    {
+        let base = cpu_padding_row * cols::NUM_COLUMNS;
+        data[base + cols::PC_0] = FE::from(cpu_padding_entry.pc & 0xFFFF_FFFF);
+        data[base + cols::PC_1] = FE::from(cpu_padding_entry.pc >> 32);
+        data[base + cols::PACKED_DECODE] = FE::from(cpu_padding_entry.packed_decode());
+        data[base + cols::IMM_0] = FE::from(cpu_padding_entry.imm & 0xFFFF_FFFF);
+        data[base + cols::IMM_1] = FE::from(cpu_padding_entry.imm >> 32);
+    }
+
     // Fill padding rows with DECODE padding pattern: pc=7, EBREAK=1
     let padding_entry = DecodeEntry::padding_entry();
-    for row_idx in entries.len()..num_rows {
+    for row_idx in num_entries..num_rows {
         let base = row_idx * cols::NUM_COLUMNS;
 
         data[base + cols::PC_0] = FE::from(padding_entry.pc & 0xFFFF_FFFF);

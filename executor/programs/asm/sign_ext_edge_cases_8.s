@@ -28,4 +28,5 @@ main:
 
 	# === 7-8: Finalize ===
 	addi	a2, a0, 0		# 7: Copy result (NOP-like)
-	jalr	zero, 0(zero)		# 8: Halt
+	li	a7, 5
+	ecall		# 8: Halt

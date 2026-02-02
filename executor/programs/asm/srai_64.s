@@ -5,4 +5,5 @@ main:
 	# 0x8000000000000000 >> 32 (arithmetic) = 0xFFFFFFFF80000000
 	li	a2, 0x8000000000000000
 	srai	a0, a2, 32
-	jalr	zero, 0(ra)
+	li	a7, 5
+	ecall

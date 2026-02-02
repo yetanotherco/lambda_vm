@@ -9,4 +9,5 @@ main:
 	subw	a2, t0, zero		# 5. 10 - 0 = 10
 	subw	a3, zero, t0		# 6. 0 - 10 = -10
 	subw	a4, t0, t0		# 7. 10 - 10 = 0
-	jalr	zero, 0(zero)		# 8. Return
+	li	a7, 5
+	ecall		# 8. Return
