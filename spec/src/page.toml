@@ -38,11 +38,13 @@ name = "all"
 kind = "interaction"
 tag = "IS_BYTE"
 input = ["init"]
+multiplicity = 1
 
 [[constraints.all]]
 kind = "interaction"
 tag = "IS_BYTE"
 input = ["fini"]
+multiplicity = 1
 
 [[constraints.all]]
 kind = "interaction"

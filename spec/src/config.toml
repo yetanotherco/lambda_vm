@@ -19,7 +19,6 @@ desc = "Variable that can only assume values in the range $[0, 2^4)$."
 [[variables.types]]
 label = "Byte"
 subtypes = ["BaseField"]
-count = 1
 desc = "Variable that can only assume values in the range $[0, 2^8)$."
 
 [[variables.types]]

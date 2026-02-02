@@ -145,4 +145,4 @@ kind = "interaction"
 tag = "BRANCH"
 input = ["pc", "offset", "register", "JALR"]
 output = "next_pc"
-multiplicity = "-μ"
+multiplicity = ["-", "μ"]
