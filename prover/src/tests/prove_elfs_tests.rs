@@ -969,7 +969,7 @@ fn test_dhat_memory_profile() {
 fn test_prove_elfs_segmented_loop_128() {
     use crate::segment::split_into_segments;
 
-    let (logs, instructions) = run_asm_elf("loop_128");
+    let (_elf, logs, instructions) = run_asm_elf("loop_128");
     assert_eq!(logs.len(), 128, "loop_128.elf should have 128 instructions");
 
     let segments = split_into_segments(&logs, 64).expect("Failed to split into segments");
@@ -978,18 +978,20 @@ fn test_prove_elfs_segmented_loop_128() {
     for (i, segment_logs) in segments.iter().enumerate() {
         assert_eq!(segment_logs.len(), 64);
 
-        let mut cpu_trace = Traces::from_logs(segment_logs, instructions.clone())
-            .expect("Failed to generate traces")
-            .cpu;
-
-        let lt_lookups = collect_lt_lookups_from_logs(segment_logs, &instructions);
-        let mut lt_trace = generate_lt_trace(&lt_lookups);
-        let mut bitwise_lookups = collect_bitwise_lookups(segment_logs, &instructions);
-        bitwise_lookups.extend(collect_bitwise_lookups_from_lt(&lt_lookups));
-        let mut bitwise_trace = generate_minimal_bitwise_trace(&bitwise_lookups);
+        let mut traces = Traces::from_logs_minimal(segment_logs, instructions.clone())
+            .expect("Failed to generate traces");
 
         assert!(
-            prove_and_verify_vm_minimal(&mut cpu_trace, &mut bitwise_trace, &mut lt_trace),
+            prove_and_verify_vm_minimal(
+                &mut traces.cpu,
+                &mut traces.bitwise,
+                &mut traces.lt,
+                &mut traces.memw,
+                &mut traces.load,
+                &mut traces.decode,
+                &mut traces.branch,
+                &mut traces.halt
+            ),
             "Segment {} verification failed",
             i
         );
