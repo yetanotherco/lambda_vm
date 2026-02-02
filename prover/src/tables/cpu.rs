@@ -54,11 +54,7 @@
 
 use super::types::{BusId, DecodeEntry, FE, GoldilocksExtension, GoldilocksField};
 use crate::Error;
-use executor::vm::{
-    instruction::decoding::Instruction,
-    logs::Log,
-    memory::U64HashMap,
-};
+use executor::vm::{instruction::decoding::Instruction, logs::Log, memory::U64HashMap};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
@@ -793,7 +789,10 @@ pub fn generate_cpu_trace_from_logs(
     for (i, log) in logs.iter().enumerate() {
         let instruction = *instructions
             .get(&log.current_pc)
-            .ok_or(Error::TraceGeneration(format!("instruction not found for PC {:#x}", log.current_pc)))?;
+            .ok_or(Error::TraceGeneration(format!(
+                "instruction not found for PC {:#x}",
+                log.current_pc
+            )))?;
         operations.push(CpuOperation::from_log_and_instruction(
             log,
             (i as u64) * 4,
@@ -822,7 +821,10 @@ pub fn collect_bitwise_ops_from_logs(
     for (i, log) in logs.iter().enumerate() {
         let instruction = *instructions
             .get(&log.current_pc)
-            .ok_or(Error::TraceGeneration(format!("instruction not found for PC {:#x}", log.current_pc)))?;
+            .ok_or(Error::TraceGeneration(format!(
+                "instruction not found for PC {:#x}",
+                log.current_pc
+            )))?;
         operations.push(CpuOperation::from_log_and_instruction(
             log,
             (i as u64) * 4,

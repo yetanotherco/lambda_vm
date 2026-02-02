@@ -32,7 +32,7 @@ use stark::verifier::{IsStarkVerifier, Verifier};
 use crate::tables::bitwise;
 use crate::tables::trace_builder::Traces;
 use crate::test_utils::{
-    create_bitwise_air, create_cpu_air, create_load_air, create_lt_air, create_memw_air, E, F,
+    E, F, create_bitwise_air, create_cpu_air, create_load_air, create_lt_air, create_memw_air,
 };
 
 use stark::proof::options::ProofOptions;
