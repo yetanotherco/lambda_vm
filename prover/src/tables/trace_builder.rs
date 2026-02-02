@@ -39,6 +39,7 @@ use super::halt;
 use super::load::{self, LoadOperation};
 use super::lt::{self, LtOperation};
 use super::memw::{self, MemwOperation};
+use super::mul::{self, MulOperation};
 use super::types::{GoldilocksExtension, GoldilocksField};
 use crate::Error;
 
@@ -534,6 +535,78 @@ fn collect_bitwise_from_lt(lt_ops: &[LtOperation]) -> Vec<BitwiseOperation> {
     bitwise_ops
 }
 
+/// Collects bitwise lookups from MUL operations (MSB16 for sign bits).
+///
+/// MUL sends MSB16 lookups when signed=1 to extract sign bits,
+/// IS_HALF lookups for lo/hi range checks, and IS_B20 lookups for carry range checks.
+///
+/// Returns: Vec of bitwise lookups
+fn collect_bitwise_from_mul(mul_ops: &[(MulOperation, bool)]) -> Vec<BitwiseOperation> {
+    // MSB16: up to 2 per op, IS_HALF: 8 per op (4 lo + 4 hi), IS_B20: 4 per op (carries)
+    let mut bitwise_ops = Vec::with_capacity(mul_ops.len() * 14);
+
+    for (op, _wants_hi) in mul_ops {
+        // MSB16[lhs[3]] when lhs_signed=1
+        if op.lhs_signed {
+            let lhs_3 = ((op.lhs >> 48) & 0xFFFF) as u16;
+            bitwise_ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::Msb16,
+                (lhs_3 & 0xFF) as u8,
+                (lhs_3 >> 8) as u8,
+            ));
+        }
+
+        // MSB16[rhs[3]] when rhs_signed=1
+        if op.rhs_signed {
+            let rhs_3 = ((op.rhs >> 48) & 0xFFFF) as u16;
+            bitwise_ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::Msb16,
+                (rhs_3 & 0xFF) as u8,
+                (rhs_3 >> 8) as u8,
+            ));
+        }
+
+        // IS_HALF for lo[0..4] and hi[0..4] with multiplicity 1 per operation
+        // MUL table sends with mu_sum = mu_lo + mu_hi; since we iterate original ops,
+        // each operation contributes 1 to the sum.
+        let (lo, hi) = op.compute_product();
+
+        // IS_HALF for lo halfwords
+        for shift in [0, 16, 32, 48] {
+            let half = ((lo >> shift) & 0xFFFF) as u16;
+            bitwise_ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
+                (half & 0xFF) as u8,
+                (half >> 8) as u8,
+            ));
+        }
+
+        // IS_HALF for hi halfwords
+        for shift in [0, 16, 32, 48] {
+            let half = ((hi >> shift) & 0xFFFF) as u16;
+            bitwise_ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
+                (half & 0xFF) as u8,
+                (half >> 8) as u8,
+            ));
+        }
+
+        // IS_B20 for carry[0..4] range checks
+        let raw_products = op.compute_raw_products();
+        let carries = mul::compute_carries(lo, hi, &raw_products);
+        for carry in carries {
+            // IS_B20 takes a 20-bit value packed as X + 256*Y + 65536*Z
+            // where X, Y are bytes and Z is a 4-bit nibble
+            let x = (carry & 0xFF) as u8;
+            let y = ((carry >> 8) & 0xFF) as u8;
+            let z = ((carry >> 16) & 0xF) as u8;
+            bitwise_ops.push(BitwiseOperation::b20(x, y, z));
+        }
+    }
+
+    bitwise_ops
+}
+
 /// Collects IS_HALFWORD lookups from MEMW address_add columns.
 ///
 /// Returns: Vec of bitwise lookups
@@ -644,6 +717,9 @@ pub struct Traces {
     /// DECODE instruction decoding table
     pub decode: TraceTable<GoldilocksField, GoldilocksExtension>,
 
+    /// MUL multiplication trace
+    pub mul: TraceTable<GoldilocksField, GoldilocksExtension>,
+
     /// BRANCH target calculation trace
     pub branch: TraceTable<GoldilocksField, GoldilocksExtension>,
 
@@ -675,6 +751,25 @@ impl Traces {
         let (memw_ops, load_ops, mut lt_ops, mut bitwise_ops) =
             collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
 
+        // Collect MUL operations from CPU ops where op_mul = true
+        let mul_ops: Vec<(MulOperation, bool)> = cpu_ops
+            .iter()
+            .filter(|op| op.decode.op_mul)
+            .map(|op| {
+                let lhs = op.compute_arg1();
+                let lhs_signed = op.decode.signed;
+                // rhs_signed = mp_selector per spec CPU-CA44:
+                // MUL/MULH have mp_selector=1 (both signed), MULHU/MULHSU have mp_selector=0 (rhs unsigned)
+                let rhs_signed = op.decode.mp_selector;
+                let rhs = op.compute_arg2();
+                let wants_hi = op.decode.muldiv_selector;
+                (
+                    MulOperation::new(lhs, lhs_signed, rhs, rhs_signed),
+                    wants_hi,
+                )
+            })
+            .collect();
+
         // Collect BRANCH operations from CPU ops where branch_cond = true
         let branch_ops: Vec<BranchOperation> = cpu_ops
             .iter()
@@ -699,6 +794,7 @@ impl Traces {
         // =====================================================================
         bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
         bitwise_ops.extend(collect_bitwise_from_memw(&memw_ops));
+        bitwise_ops.extend(collect_bitwise_from_mul(&mul_ops));
         bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
 
         // =====================================================================
@@ -717,6 +813,7 @@ impl Traces {
         let lt = lt::generate_lt_trace(&lt_ops);
         let memw = memw::generate_memw_trace(&memw_ops);
         let load = load::generate_load_trace(&load_ops);
+        let mul = mul::generate_mul_trace(&mul_ops);
         let branch = branch::generate_branch_trace(&branch_ops);
 
         let mut bitwise = bitwise::generate_bitwise_trace();
@@ -738,6 +835,7 @@ impl Traces {
             memw,
             load,
             decode,
+            mul,
             branch,
             halt: halt_trace,
         })
