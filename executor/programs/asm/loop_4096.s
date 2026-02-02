@@ -21,4 +21,5 @@ loop:
 
     addi zero, zero, 0        # cleanup NOP
     addi zero, zero, 0        # cleanup NOP
-    jalr zero, 0(zero)        # halt
+    li	a7, 5
+	ecall        # halt

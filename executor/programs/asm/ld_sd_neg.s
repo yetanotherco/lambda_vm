@@ -7,4 +7,5 @@ main:
 	lui	a3, 0x80000         # Base address
 	sd	a2, 0(a3)           # Store doubleword
 	ld	a0, 0(a3)           # Load doubleword
-	jalr	zero, 0(ra)
+	li	a7, 5
+	ecall

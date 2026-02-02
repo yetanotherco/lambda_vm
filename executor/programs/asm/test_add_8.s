@@ -9,4 +9,5 @@ main:
 	add	a2, zero, t1		# 5. 0 + 20 = 20
 	add	a3, t0, t0		# 6. 10 + 10 = 20
 	add	a4, t1, t1		# 7. 20 + 20 = 40
-	jalr	zero, 0(zero)		# 8. Return
+	li	a7, 5
+	ecall		# 8. Return

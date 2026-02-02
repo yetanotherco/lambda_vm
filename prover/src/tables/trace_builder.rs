@@ -35,6 +35,7 @@ use super::bitwise::{self, BitwiseOperation, BitwiseOperationType};
 use super::branch::{self, BranchOperation};
 use super::cpu::{self, CpuOperation};
 use super::decode;
+use super::halt;
 use super::load::{self, LoadOperation};
 use super::lt::{self, LtOperation};
 use super::memw::{self, MemwOperation};
@@ -645,6 +646,9 @@ pub struct Traces {
 
     /// BRANCH target calculation trace
     pub branch: TraceTable<GoldilocksField, GoldilocksExtension>,
+
+    /// HALT single-row table for program termination
+    pub halt: TraceTable<GoldilocksField, GoldilocksExtension>,
 }
 
 impl Traces {
@@ -703,6 +707,15 @@ impl Traces {
         // =====================================================================
         // PHASE 5: Generate final traces
         // =====================================================================
+
+        // Extract halt timestamp from the last ECALL instruction
+        let halt_op = cpu_ops
+            .iter()
+            .rev()
+            .find(|op| op.decode.op_ecall)
+            .ok_or(ProverError::MissingEcall)?;
+        let halt_trace = halt::generate_halt_trace(halt_op.timestamp);
+
         let cpu = cpu::generate_cpu_trace(&cpu_ops);
         let lt = lt::generate_lt_trace(&lt_ops);
         let memw = memw::generate_memw_trace(&memw_ops);
@@ -714,8 +727,11 @@ impl Traces {
 
         // Generate DECODE trace and update multiplicities
         // Each CPU operation looks up the DECODE table once
+        // Padding rows also look up pc=1 (the CPU padding entry)
         let (mut decode, pc_to_row) = decode::generate_decode_trace(&instructions);
-        let decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
+        let num_padding_rows = cpu_ops.len().next_power_of_two() - cpu_ops.len();
+        let mut decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
+        decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
         decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
 
         Ok(Traces {
@@ -726,6 +742,7 @@ impl Traces {
             load,
             decode,
             branch,
+            halt: halt_trace,
         })
     }
 

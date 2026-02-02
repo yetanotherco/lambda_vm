@@ -8,6 +8,7 @@ main:
 	bne     a2, a3, 8
 	jalr	zero, 0(ra)
 	addi    a0, zero, 1
-	jalr	zero, 0(ra)
+	li	a7, 5
+	ecall
 .Lfunc_end1:
 	.size	main, .Lfunc_end1-main

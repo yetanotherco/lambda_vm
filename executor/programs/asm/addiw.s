@@ -5,4 +5,5 @@ main:
 	# 0x7FFFFFFF + 1 = 0x80000000, sign-extends to 0xFFFFFFFF80000000
 	li	a2, 0x7FFFFFFF
 	addiw	a0, a2, 1
-	jalr	zero, 0(ra)
+	li	a7, 5
+	ecall
