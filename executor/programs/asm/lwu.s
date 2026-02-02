@@ -7,4 +7,5 @@ main:
 	lui	a3, 0x80000         # Base address
 	sw	a2, 0(a3)           # Store word
 	lwu	a0, 0(a3)           # Load word unsigned
-	jalr	zero, 0(ra)
+	li	a7, 5
+	ecall

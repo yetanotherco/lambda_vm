@@ -9,4 +9,5 @@ main:
 	lbu	a1, 0(sp)		# Unsigned byte load: a1 = 255
 	lh	a2, 0(sp)		# Signed half load: a2 = -1 (sign extended)
 	lhu	a3, 0(sp)		# Unsigned half load: a3 = 65535
-	jalr	zero, 0(zero)
+	li	a7, 5
+	ecall

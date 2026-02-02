@@ -152,15 +152,15 @@ test: compile-programs prepare-test-data
 
 # Fast prover tests (skips ignored slow tests)
 test-fast:
-	cargo test -p prover -p stark -p executor -F stark/parallel
+	cargo test -p lambda-vm-prover -p stark -p executor -F stark/parallel
 
 # Prover tests only (fast, parallel enabled by default)
 test-prover:
-	cargo test -p prover
+	cargo test -p lambda-vm-prover
 
 # Prover tests including slow ones
 test-prover-all:
-	cargo test -p prover -- --include-ignored
+	cargo test -p lambda-vm-prover -- --include-ignored
 
 # Build all
 build:
