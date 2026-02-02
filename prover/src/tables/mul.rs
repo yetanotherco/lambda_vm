@@ -39,7 +39,11 @@ use stark::table::TableView;
 use stark::trace::TraceTable;
 use stark::traits::TransitionEvaluationContext;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16};
+use super::types::{
+    BusId, FE, GoldilocksExtension, GoldilocksField, INV_2_32, INV_2_64, INV_2_96, INV_2_128,
+    NEG_INV_2_16, NEG_INV_2_32, NEG_INV_2_48, NEG_INV_2_64, NEG_INV_2_80, NEG_INV_2_96,
+    NEG_INV_2_112, NEG_INV_2_128, SHIFT_16,
+};
 
 // =========================================================================
 // Column indices for MUL table
@@ -426,17 +430,78 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     // -------------------------------------------------------------------------
     // IS_B20 lookups for carry range checks (multiplicity: mu_lo + mu_hi)
+    // Carries are virtual columns computed as linear combinations:
+    //   carry[0] = 2^-32 * (raw_product[0] - res[0])
+    //   carry[i] = 2^-32 * (raw_product[i] + carry[i-1] - res[i])
+    // where res = [lo_word0, lo_word1, hi_word0, hi_word1]
     // -------------------------------------------------------------------------
-    for col in [cols::CARRY_0, cols::CARRY_1, cols::CARRY_2, cols::CARRY_3] {
-        interactions.push(BusInteraction::sender(
-            BusId::IsB20,
-            Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
-            vec![BusValue::Packed {
-                start_column: col,
-                packing: Packing::Direct,
-            }],
-        ));
-    }
+
+    // carry[0] = 2^-32 * raw_product[0] - 2^-32 * lo[0] - 2^-16 * lo[1]
+    interactions.push(BusInteraction::sender(
+        BusId::IsB20,
+        Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
+        vec![BusValue::linear(vec![
+            LinearTerm::ColumnUnsigned { coefficient: INV_2_32, column: cols::RAW_PRODUCT_0 },
+            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_32, column: cols::LO_0 },
+            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_16, column: cols::LO_1 },
+        ])],
+    ));
+
+    // carry[1] = 2^-32 * raw_product[1] + 2^-64 * raw_product[0]
+    //          - 2^-64 * lo[0] - 2^-48 * lo[1] - 2^-32 * lo[2] - 2^-16 * lo[3]
+    interactions.push(BusInteraction::sender(
+        BusId::IsB20,
+        Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
+        vec![BusValue::linear(vec![
+            LinearTerm::ColumnUnsigned { coefficient: INV_2_32, column: cols::RAW_PRODUCT_1 },
+            LinearTerm::ColumnUnsigned { coefficient: INV_2_64, column: cols::RAW_PRODUCT_0 },
+            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_64, column: cols::LO_0 },
+            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_48, column: cols::LO_1 },
+            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_32, column: cols::LO_2 },
+            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_16, column: cols::LO_3 },
+        ])],
+    ));
+
+    // carry[2] = 2^-32 * raw_product[2] + 2^-64 * raw_product[1] + 2^-96 * raw_product[0]
+    //          - 2^-96 * lo[0] - 2^-80 * lo[1] - 2^-64 * lo[2] - 2^-48 * lo[3]
+    //          - 2^-32 * hi[0] - 2^-16 * hi[1]
+    interactions.push(BusInteraction::sender(
+        BusId::IsB20,
+        Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
+        vec![BusValue::linear(vec![
+            LinearTerm::ColumnUnsigned { coefficient: INV_2_32, column: cols::RAW_PRODUCT_2 },
+            LinearTerm::ColumnUnsigned { coefficient: INV_2_64, column: cols::RAW_PRODUCT_1 },
+            LinearTerm::ColumnUnsigned { coefficient: INV_2_96, column: cols::RAW_PRODUCT_0 },
+            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_96, column: cols::LO_0 },
+            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_80, column: cols::LO_1 },
+            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_64, column: cols::LO_2 },
+            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_48, column: cols::LO_3 },
+            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_32, column: cols::HI_0 },
+            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_16, column: cols::HI_1 },
+        ])],
+    ));
+
+    // carry[3] = 2^-32 * raw_product[3] + 2^-64 * raw_product[2] + 2^-96 * raw_product[1] + 2^-128 * raw_product[0]
+    //          - 2^-128 * lo[0] - 2^-112 * lo[1] - 2^-96 * lo[2] - 2^-80 * lo[3]
+    //          - 2^-64 * hi[0] - 2^-48 * hi[1] - 2^-32 * hi[2] - 2^-16 * hi[3]
+    interactions.push(BusInteraction::sender(
+        BusId::IsB20,
+        Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
+        vec![BusValue::linear(vec![
+            LinearTerm::ColumnUnsigned { coefficient: INV_2_32, column: cols::RAW_PRODUCT_3 },
+            LinearTerm::ColumnUnsigned { coefficient: INV_2_64, column: cols::RAW_PRODUCT_2 },
+            LinearTerm::ColumnUnsigned { coefficient: INV_2_96, column: cols::RAW_PRODUCT_1 },
+            LinearTerm::ColumnUnsigned { coefficient: INV_2_128, column: cols::RAW_PRODUCT_0 },
+            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_128, column: cols::LO_0 },
+            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_112, column: cols::LO_1 },
+            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_96, column: cols::LO_2 },
+            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_80, column: cols::LO_3 },
+            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_64, column: cols::HI_0 },
+            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_48, column: cols::HI_1 },
+            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_32, column: cols::HI_2 },
+            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_16, column: cols::HI_3 },
+        ])],
+    ));
 
     // -------------------------------------------------------------------------
     // MUL receiver for lo result

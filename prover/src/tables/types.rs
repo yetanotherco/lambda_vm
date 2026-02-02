@@ -122,22 +122,38 @@ pub const SHIFT_16: u64 = 1 << 16;
 /// 2^32 for word combining
 pub const SHIFT_32: u64 = 1 << 32;
 
-/// 2^(-32) mod p for carry extraction in 64-bit addition
-/// In Babybear field: p = 2^31 - 2^27 + 1
-/// We need to find x such that x * 2^32 ≡ 1 (mod p)
-pub const INV_2_32: u64 = {
-    // 2^32 mod p = 2^32 mod (2^31 - 2^27 + 1)
-    // 2^32 = 2 * 2^31 = 2 * (p + 2^27 - 1) = 2p + 2^28 - 2 ≡ 2^28 - 2 (mod p)
-    // We need the inverse of (2^28 - 2) mod p
-    // For now, this is a placeholder - compute at runtime or verify
-    1
-};
+// Field inverses for Goldilocks prime p = 2^64 - 2^32 + 1
+// Used for virtual carry computation in MUL table
+//
+// Only the constants actually used in mul.rs are defined here:
+// - Positive: INV_2_32, INV_2_64, INV_2_96, INV_2_128 (for raw_product terms)
+// - Negative: NEG_INV_2_* (for lo/hi terms which are subtracted)
 
-/// 2^(-16) mod p for halfword operations
-pub const INV_2_16: u64 = {
-    // Placeholder - compute at runtime or verify
-    1
-};
+/// 2^(-32) mod p
+pub const INV_2_32: u64 = 18446744065119617026;
+/// 2^(-64) mod p
+pub const INV_2_64: u64 = 18446744065119617025;
+/// 2^(-96) mod p
+pub const INV_2_96: u64 = 18446744069414584320;
+/// 2^(-128) mod p
+pub const INV_2_128: u64 = 4294967295;
+
+/// -(2^-16) mod p = p - 2^(-16)
+pub const NEG_INV_2_16: u64 = 281474976645120;
+/// -(2^-32) mod p = p - 2^(-32)
+pub const NEG_INV_2_32: u64 = 4294967295;
+/// -(2^-48) mod p = p - 2^(-48)
+pub const NEG_INV_2_48: u64 = 281474976710656;
+/// -(2^-64) mod p = p - 2^(-64)
+pub const NEG_INV_2_64: u64 = 4294967296;
+/// -(2^-80) mod p = p - 2^(-80)
+pub const NEG_INV_2_80: u64 = 65536;
+/// -(2^-96) mod p = p - 2^(-96)
+pub const NEG_INV_2_96: u64 = 1;
+/// -(2^-112) mod p = p - 2^(-112)
+pub const NEG_INV_2_112: u64 = 18446462594437939201;
+/// -(2^-128) mod p = p - 2^(-128)
+pub const NEG_INV_2_128: u64 = 18446744065119617026;
 
 // =========================================================================
 // Column index helpers

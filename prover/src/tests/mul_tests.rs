@@ -296,8 +296,3 @@ fn test_identity_multiplication() {
     assert_eq!(hi, 0);
 }
 
-#[test]
-fn testito() {
-    let inv = FE::inv(&FE::from(10usize.pow(19)));
-    println!("Inverse of 10^19 is {}", inv);
-}
