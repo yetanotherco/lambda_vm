@@ -3,6 +3,10 @@ pub mod bitwise_bus_tests;
 #[cfg(test)]
 pub mod bitwise_tests;
 #[cfg(test)]
+pub mod branch_bus_tests;
+#[cfg(test)]
+pub mod branch_constraints_tests;
+#[cfg(test)]
 pub mod constraints_tests;
 #[cfg(test)]
 pub mod cpu_tests;

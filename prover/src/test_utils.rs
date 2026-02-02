@@ -28,10 +28,14 @@ use crate::tables::bitwise::{
     BitwiseOperation, BitwiseOperationType, bus_interactions as bitwise_bus_interactions,
     cols as bitwise_cols,
 };
+use crate::tables::branch::{
+    branch_constraints, bus_interactions as branch_bus_interactions, cols as branch_cols,
+};
 use crate::tables::cpu::{
     CpuOperation, bus_interactions as cpu_bus_interactions, cols as cpu_cols,
 };
 use crate::tables::decode::{bus_interactions as decode_bus_interactions, cols as decode_cols};
+use crate::tables::halt::{bus_interactions as halt_bus_interactions, cols as halt_cols};
 use crate::tables::load::{
     bus_interactions as load_bus_interactions, cols as load_cols, constraints as load_constraints,
 };
@@ -582,6 +586,46 @@ pub fn create_mul_air(proof_options: &ProofOptions) -> VmAir {
 
     AirWithBuses::new(
         mul_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+}
+
+/// Create BRANCH AIR with constraints and bus interactions.
+///
+/// The BRANCH table computes next_pc for branch/jump instructions:
+/// - For branches (BEQ, BLT, JAL): next_pc = pc + sign_extend(offset)
+/// - For JALR: next_pc = (register + sign_extend(offset)) & ~1
+pub fn create_branch_air(proof_options: &ProofOptions) -> VmAir {
+    let (constraints, _) = branch_constraints(0);
+    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> =
+        constraints.into_iter().map(|c| Box::new(c) as _).collect();
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: branch_bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        branch_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+}
+
+/// Create HALT AIR with bus interactions (no transition constraints).
+pub fn create_halt_air(proof_options: &ProofOptions) -> VmAir {
+    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: halt_bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        halt_cols::NUM_COLUMNS,
         auxiliary_trace_build_data,
         proof_options,
         1,

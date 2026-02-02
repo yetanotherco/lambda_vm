@@ -15,6 +15,8 @@ use std::fmt;
 pub enum ProverError {
     /// Instruction not found for a given PC address
     MissingInstruction(u64),
+    /// Program does not contain an ECALL (halt) instruction
+    MissingEcall,
 }
 
 impl fmt::Display for ProverError {
@@ -22,6 +24,9 @@ impl fmt::Display for ProverError {
         match self {
             ProverError::MissingInstruction(pc) => {
                 write!(f, "instruction not found for PC {pc:#x}")
+            }
+            ProverError::MissingEcall => {
+                write!(f, "program does not contain an ECALL (halt) instruction")
             }
         }
     }

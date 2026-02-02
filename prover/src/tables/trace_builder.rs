@@ -32,8 +32,10 @@ use executor::vm::memory::U64HashMap;
 use stark::trace::TraceTable;
 
 use super::bitwise::{self, BitwiseOperation, BitwiseOperationType};
+use super::branch::{self, BranchOperation};
 use super::cpu::{self, CpuOperation};
 use super::decode;
+use super::halt;
 use super::load::{self, LoadOperation};
 use super::lt::{self, LtOperation};
 use super::memw::{self, MemwOperation};
@@ -629,6 +631,68 @@ fn collect_bitwise_from_memw(memw_ops: &[MemwOperation]) -> Vec<BitwiseOperation
     bitwise_ops
 }
 
+/// Collects bitwise lookups from BRANCH operations.
+///
+/// BRANCH sends:
+/// - IS_BYTE[next_pc_low[1]] - range check bits 8-15
+/// - AND_BYTE[unmasked_low_byte, 254, next_pc_low[0]] - LSB masking
+/// - IS_HALFWORD[next_pc_high[0..3]] - range checks for bits 16-63
+///
+/// Returns: Vec of bitwise lookups
+fn collect_bitwise_from_branch(branch_ops: &[BranchOperation]) -> Vec<BitwiseOperation> {
+    let mut bitwise_ops = Vec::with_capacity(branch_ops.len() * 5);
+
+    for op in branch_ops {
+        let next_pc = op.compute_next_pc();
+        let next_pc_unmasked = op.compute_next_pc_unmasked();
+
+        // Extract next_pc components
+        let _next_pc_low_0 = (next_pc & 0xFF) as u8; // Used by constraint, not lookup
+        let next_pc_low_1 = ((next_pc >> 8) & 0xFF) as u8;
+        let next_pc_high_0 = ((next_pc >> 16) & 0xFFFF) as u16;
+        let next_pc_high_1 = ((next_pc >> 32) & 0xFFFF) as u16;
+        let next_pc_high_2 = ((next_pc >> 48) & 0xFFFF) as u16;
+        let unmasked_low_byte = (next_pc_unmasked & 0xFF) as u8;
+
+        // IS_BYTE[next_pc_low[1]] - range check for byte value
+        bitwise_ops.push(BitwiseOperation::single_byte(
+            BitwiseOperationType::IsByte,
+            next_pc_low_1,
+        ));
+
+        // AND_BYTE[unmasked_low_byte, 254] → next_pc_low[0]
+        // Verifies: next_pc_low[0] = unmasked_low_byte & 0xFE
+        bitwise_ops.push(BitwiseOperation::byte_op(
+            BitwiseOperationType::AndByte,
+            unmasked_low_byte,
+            254, // 0xFE mask
+        ));
+
+        // IS_HALFWORD[next_pc_high[0]]
+        bitwise_ops.push(BitwiseOperation::halfword(
+            BitwiseOperationType::IsHalf,
+            (next_pc_high_0 & 0xFF) as u8,
+            (next_pc_high_0 >> 8) as u8,
+        ));
+
+        // IS_HALFWORD[next_pc_high[1]]
+        bitwise_ops.push(BitwiseOperation::halfword(
+            BitwiseOperationType::IsHalf,
+            (next_pc_high_1 & 0xFF) as u8,
+            (next_pc_high_1 >> 8) as u8,
+        ));
+
+        // IS_HALFWORD[next_pc_high[2]]
+        bitwise_ops.push(BitwiseOperation::halfword(
+            BitwiseOperationType::IsHalf,
+            (next_pc_high_2 & 0xFF) as u8,
+            (next_pc_high_2 >> 8) as u8,
+        ));
+    }
+
+    bitwise_ops
+}
+
 // =============================================================================
 // Trace Generation
 // =============================================================================
@@ -655,6 +719,12 @@ pub struct Traces {
 
     /// MUL multiplication trace
     pub mul: TraceTable<GoldilocksField, GoldilocksExtension>,
+
+    /// BRANCH target calculation trace
+    pub branch: TraceTable<GoldilocksField, GoldilocksExtension>,
+
+    /// HALT single-row table for program termination
+    pub halt: TraceTable<GoldilocksField, GoldilocksExtension>,
 }
 
 impl Traces {
@@ -662,9 +732,9 @@ impl Traces {
     ///
     /// The phases are:
     /// 1. Logs → CPU operations
-    /// 2. CPU ops → MEMW, LOAD, LT, Bitwise (state tracking for MEMW/LOAD)
+    /// 2. CPU ops → MEMW, LOAD, LT, Bitwise, Branch (state tracking for MEMW/LOAD)
     /// 3. MEMW → LT operations (timestamp ordering)
-    /// 4. LT, MEMW → Bitwise lookups
+    /// 4. LT, MEMW, Branch → Bitwise lookups
     /// 5. Generate all traces
     pub fn from_logs(
         logs: &[Log],
@@ -676,7 +746,7 @@ impl Traces {
         let cpu_ops = collect_cpu_ops(logs, &instructions)?;
 
         // =====================================================================
-        // PHASE 2: CPU ops → MEMW, LOAD, LT, Bitwise
+        // PHASE 2: CPU ops → MEMW, LOAD, LT, Bitwise, Branch
         // =====================================================================
         // Processes cpu_ops in order. MEMW/LOAD need state tracking, LT/Bitwise don't.
         let mut memory_state = MemoryState::new();
@@ -700,6 +770,20 @@ impl Traces {
             })
             .collect();
 
+        // Collect BRANCH operations from CPU ops where branch_cond = true
+        let branch_ops: Vec<BranchOperation> = cpu_ops
+            .iter()
+            .filter(|op| op.branch_cond)
+            .map(|op| {
+                BranchOperation::new(
+                    op.decode.pc,
+                    op.decode.imm, // offset as full 64-bit DWordWL (already sign-extended)
+                    op.compute_arg1(), // register value must match CPU's arg1 for bus signature
+                    op.decode.op_jalr,
+                )
+            })
+            .collect();
+
         // =====================================================================
         // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
         // =====================================================================
@@ -711,23 +795,37 @@ impl Traces {
         bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
         bitwise_ops.extend(collect_bitwise_from_memw(&memw_ops));
         bitwise_ops.extend(collect_bitwise_from_mul(&mul_ops));
+        bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
 
         // =====================================================================
         // PHASE 5: Generate final traces
         // =====================================================================
+
+        // Extract halt timestamp from the last ECALL instruction
+        let halt_op = cpu_ops
+            .iter()
+            .rev()
+            .find(|op| op.decode.op_ecall)
+            .ok_or(ProverError::MissingEcall)?;
+        let halt_trace = halt::generate_halt_trace(halt_op.timestamp);
+
         let cpu = cpu::generate_cpu_trace(&cpu_ops);
         let lt = lt::generate_lt_trace(&lt_ops);
         let memw = memw::generate_memw_trace(&memw_ops);
         let load = load::generate_load_trace(&load_ops);
         let mul = mul::generate_mul_trace(&mul_ops);
+        let branch = branch::generate_branch_trace(&branch_ops);
 
         let mut bitwise = bitwise::generate_bitwise_trace();
         bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
 
         // Generate DECODE trace and update multiplicities
         // Each CPU operation looks up the DECODE table once
+        // Padding rows also look up pc=1 (the CPU padding entry)
         let (mut decode, pc_to_row) = decode::generate_decode_trace(&instructions);
-        let decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
+        let num_padding_rows = cpu_ops.len().next_power_of_two() - cpu_ops.len();
+        let mut decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
+        decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
         decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
 
         Ok(Traces {
@@ -738,6 +836,8 @@ impl Traces {
             load,
             decode,
             mul,
+            branch,
+            halt: halt_trace,
         })
     }
 
