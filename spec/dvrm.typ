@@ -74,7 +74,7 @@ The second statement is enforced by @dvrm:c:abs_r_lt_abs_d.
 === R5: overflow
 The ISA requires that $#`q` = #`n`$ and $#`r` = 0$ in the event of overflow.
 We note that, while $#`n` = #`qd` + #`r`$ (R1) does _not_ hold in the case of overflow, the relation $#`n` = |#`q`|#`d` + #`r`$ _does_.
-We moreover note that the _signed_ two's complement representation of $-2^63$ is identical to the _unsigned_ representation of $|-2^63| = 2^63$.
+We moreover note that the 64-bit _signed_ two's complement representation of $-2^63$ is identical to the 64-bit _unsigned_ representation of $|-2^63| = 2^63$.
 As such, by interpreting `q` as an unsigned integer when $#`overflow` = 1$, it follows that R1 will enforce $#`r` = 0$.
 
 In summary, it suffices to enforce that $#`overflow` => #`q` = #`n`$ (@dvrm:c:q_if_overflow) and to interpret `q` as unsigned in the multiplication when $#`overflow` = 1$ (@dvrm:c:sign_q).
