@@ -28,6 +28,9 @@ use crate::tables::bitwise::{
     BitwiseOperation, BitwiseOperationType, bus_interactions as bitwise_bus_interactions,
     cols as bitwise_cols,
 };
+use crate::tables::branch::{
+    branch_constraints, bus_interactions as branch_bus_interactions, cols as branch_cols,
+};
 use crate::tables::cpu::{
     CpuOperation, bus_interactions as cpu_bus_interactions, cols as cpu_cols,
 };
@@ -565,6 +568,29 @@ pub fn create_decode_air(proof_options: &ProofOptions) -> VmAir {
 
     AirWithBuses::new(
         decode_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+}
+
+/// Create BRANCH AIR with constraints and bus interactions.
+///
+/// The BRANCH table computes next_pc for branch/jump instructions:
+/// - For branches (BEQ, BLT, JAL): next_pc = pc + sign_extend(offset)
+/// - For JALR: next_pc = (register + sign_extend(offset)) & ~1
+pub fn create_branch_air(proof_options: &ProofOptions) -> VmAir {
+    let (constraints, _) = branch_constraints(0);
+    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> =
+        constraints.into_iter().map(|c| Box::new(c) as _).collect();
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: branch_bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        branch_cols::NUM_COLUMNS,
         auxiliary_trace_build_data,
         proof_options,
         1,

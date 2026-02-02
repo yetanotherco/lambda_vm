@@ -17,6 +17,7 @@
 pub mod types;
 
 pub mod bitwise;
+pub mod branch;
 pub mod cpu;
 pub mod decode;
 pub mod halt;

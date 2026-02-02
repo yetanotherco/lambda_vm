@@ -847,7 +847,7 @@ fn linear_term(bit: u32, column: usize) -> LinearTerm {
 /// - AND_BYTE, OR_BYTE, XOR_BYTE: for bitwise operations (×8 each)
 ///
 /// Note: LT interaction is TODO - needs proper DWordHHW packing to match LT table receiver.
-/// Note: IS_BYTE, MSB8, ZERO, BRANCH interactions are TODO for later.
+/// Note: IS_BYTE, MSB8, ZERO interactions are TODO for later.
 pub fn bus_interactions() -> Vec<BusInteraction> {
     use super::types::packed_decode as bits;
 
@@ -1466,6 +1466,100 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             },
             BusValue::Packed {
                 start_column: cols::MEMORY_8BYTES,
+                packing: Packing::Direct,
+            },
+        ],
+    ));
+
+    // -------------------------------------------------------------------------
+    // BRANCH interaction (for branch/jump target calculation)
+    // -------------------------------------------------------------------------
+    // CPU-CO68: BRANCH[next_pc; pc, imm, arg1::DWordWL, JALR] | branch_cond
+    //
+    // Sends to BRANCH table when branch_cond is true.
+    // Bus signature: [next_pc[0], next_pc[1], pc[0], pc[1], offset[0], offset[1], register[0], register[1], JALR]
+    // - next_pc: DWordWL (2 words) from NEXT_PC_0, NEXT_PC_1
+    // - pc: DWordWL (2 words) from PC_0, PC_1
+    // - offset: DWordWL (2 words) from IMM_0, IMM_1 (already sign-extended)
+    // - register: DWordWL (2 words) - arg1 (DWordBL: 8 bytes) repacked as 2 words
+    // - JALR: Bit flag
+    interactions.push(BusInteraction::sender(
+        BusId::Branch,
+        Multiplicity::Column(cols::BRANCH_COND),
+        vec![
+            // next_pc[0] (Word) - low 32 bits
+            BusValue::Packed {
+                start_column: cols::NEXT_PC_0,
+                packing: Packing::Direct,
+            },
+            // next_pc[1] (Word) - high 32 bits
+            BusValue::Packed {
+                start_column: cols::NEXT_PC_1,
+                packing: Packing::Direct,
+            },
+            // pc[0] (Word)
+            BusValue::Packed {
+                start_column: cols::PC_0,
+                packing: Packing::Direct,
+            },
+            // pc[1] (Word)
+            BusValue::Packed {
+                start_column: cols::PC_1,
+                packing: Packing::Direct,
+            },
+            // offset[0] = imm[0] (Word) - low 32 bits of immediate
+            BusValue::Packed {
+                start_column: cols::IMM_0,
+                packing: Packing::Direct,
+            },
+            // offset[1] = imm[1] (Word) - high 32 bits of immediate (sign-extended)
+            BusValue::Packed {
+                start_column: cols::IMM_1,
+                packing: Packing::Direct,
+            },
+            // register[0] = arg1[0..4] repacked as Word
+            // arg1_word0 = arg1[0] + 2^8*arg1[1] + 2^16*arg1[2] + 2^24*arg1[3]
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::ARG1[0],
+                },
+                LinearTerm::Column {
+                    coefficient: 256,
+                    column: cols::ARG1[1],
+                },
+                LinearTerm::Column {
+                    coefficient: 65536,
+                    column: cols::ARG1[2],
+                },
+                LinearTerm::Column {
+                    coefficient: 16777216,
+                    column: cols::ARG1[3],
+                },
+            ]),
+            // register[1] = arg1[4..8] repacked as Word
+            // arg1_word1 = arg1[4] + 2^8*arg1[5] + 2^16*arg1[6] + 2^24*arg1[7]
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::ARG1[4],
+                },
+                LinearTerm::Column {
+                    coefficient: 256,
+                    column: cols::ARG1[5],
+                },
+                LinearTerm::Column {
+                    coefficient: 65536,
+                    column: cols::ARG1[6],
+                },
+                LinearTerm::Column {
+                    coefficient: 16777216,
+                    column: cols::ARG1[7],
+                },
+            ]),
+            // JALR flag
+            BusValue::Packed {
+                start_column: cols::JALR,
                 packing: Packing::Direct,
             },
         ],

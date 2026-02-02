@@ -876,8 +876,8 @@ fn test_decode_soundness_different_elf_rejected() {
     use crate::tables::trace_builder::Traces;
     use crate::tables::types::{GoldilocksExtension, GoldilocksField};
     use crate::test_utils::{
-        create_bitwise_air, create_cpu_air, create_decode_air, create_halt_air, create_load_air,
-        create_lt_air, create_memw_air,
+        create_bitwise_air, create_branch_air, create_cpu_air, create_decode_air, create_halt_air,
+        create_load_air, create_lt_air, create_memw_air,
     };
 
     type F = GoldilocksField;
@@ -925,6 +925,7 @@ fn test_decode_soundness_different_elf_rejected() {
     let prover_lt_air = create_lt_air(&proof_options);
     let prover_memw_air = create_memw_air(&proof_options);
     let prover_load_air = create_load_air(&proof_options);
+    let prover_branch_air = create_branch_air(&proof_options);
     let prover_halt_air = create_halt_air(&proof_options);
     let prover_decode_air = create_decode_air(&proof_options).with_preprocessed(
         commitment_a, // Prover uses commitment from ELF A
@@ -941,6 +942,7 @@ fn test_decode_soundness_different_elf_rejected() {
         (&prover_lt_air, &mut traces.lt, &()),
         (&prover_memw_air, &mut traces.memw, &()),
         (&prover_load_air, &mut traces.load, &()),
+        (&prover_branch_air, &mut traces.branch, &()),
         (&prover_halt_air, &mut traces.halt, &()),
         (&prover_decode_air, &mut traces.decode, &()),
     ];
@@ -956,6 +958,7 @@ fn test_decode_soundness_different_elf_rejected() {
     let verifier_lt_air = create_lt_air(&proof_options);
     let verifier_memw_air = create_memw_air(&proof_options);
     let verifier_load_air = create_load_air(&proof_options);
+    let verifier_branch_air = create_branch_air(&proof_options);
     let verifier_halt_air = create_halt_air(&proof_options);
     let verifier_decode_air = create_decode_air(&proof_options).with_preprocessed(
         commitment_b, // Verifier uses commitment from ELF B (DIFFERENT!)
@@ -968,6 +971,7 @@ fn test_decode_soundness_different_elf_rejected() {
         &verifier_lt_air,
         &verifier_memw_air,
         &verifier_load_air,
+        &verifier_branch_air,
         &verifier_halt_air,
         &verifier_decode_air,
     ];
@@ -1001,8 +1005,8 @@ fn test_decode_soundness_same_elf_accepted() {
     use crate::tables::trace_builder::Traces;
     use crate::tables::types::{GoldilocksExtension, GoldilocksField};
     use crate::test_utils::{
-        create_bitwise_air, create_cpu_air, create_decode_air, create_halt_air, create_load_air,
-        create_lt_air, create_memw_air,
+        create_bitwise_air, create_branch_air, create_cpu_air, create_decode_air, create_halt_air,
+        create_load_air, create_lt_air, create_memw_air,
     };
 
     type F = GoldilocksField;
@@ -1041,6 +1045,7 @@ fn test_decode_soundness_same_elf_accepted() {
     let prover_lt_air = create_lt_air(&proof_options);
     let prover_memw_air = create_memw_air(&proof_options);
     let prover_load_air = create_load_air(&proof_options);
+    let prover_branch_air = create_branch_air(&proof_options);
     let prover_halt_air = create_halt_air(&proof_options);
     let prover_decode_air = create_decode_air(&proof_options)
         .with_preprocessed(prover_commitment, decode::NUM_PRECOMPUTED_COLS);
@@ -1055,6 +1060,7 @@ fn test_decode_soundness_same_elf_accepted() {
         (&prover_lt_air, &mut traces.lt, &()),
         (&prover_memw_air, &mut traces.memw, &()),
         (&prover_load_air, &mut traces.load, &()),
+        (&prover_branch_air, &mut traces.branch, &()),
         (&prover_halt_air, &mut traces.halt, &()),
         (&prover_decode_air, &mut traces.decode, &()),
     ];
@@ -1076,6 +1082,7 @@ fn test_decode_soundness_same_elf_accepted() {
     let verifier_lt_air = create_lt_air(&proof_options);
     let verifier_memw_air = create_memw_air(&proof_options);
     let verifier_load_air = create_load_air(&proof_options);
+    let verifier_branch_air = create_branch_air(&proof_options);
     let verifier_halt_air = create_halt_air(&proof_options);
     let verifier_decode_air = create_decode_air(&proof_options)
         .with_preprocessed(verifier_commitment, decode::NUM_PRECOMPUTED_COLS);
@@ -1086,6 +1093,7 @@ fn test_decode_soundness_same_elf_accepted() {
         &verifier_lt_air,
         &verifier_memw_air,
         &verifier_load_air,
+        &verifier_branch_air,
         &verifier_halt_air,
         &verifier_decode_air,
     ];
