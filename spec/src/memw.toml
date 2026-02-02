@@ -129,7 +129,7 @@ kind = "template"
 tag = "ADD"
 input = ["base_address", 1]
 output = ["cast", ["idx", "address_add", 0], "DWordWL"]
-multiplicity = "w2"
+cond = "w2"
 
 [[constraints.consistency]]
 kind = "template"
@@ -137,7 +137,7 @@ tag = "ADD"
 input = ["base_address", ["+", "i", 1]]
 output = ["cast", ["idx", "address_add", "i"], "DWordWL"]
 iter = ["i", 1, 2]
-multiplicity = "w4"
+cond = "w4"
 
 [[constraints.consistency]]
 kind = "template"
@@ -145,16 +145,37 @@ tag = "ADD"
 input = ["base_address", ["+", "i", 1]]
 output = ["cast", ["idx", "address_add", "i"], "DWordWL"]
 iter = ["i", 3, 6]
-multiplicity = "write8"
+cond = "write8"
 
 [[constraints.consistency]]
 kind = "interaction"
 tag = "IS_HALFWORD"
 input = [["idx", ["idx", "address_add", "i"], "j"]]
 iters = [
-  ["i", 0, 6],
+  ["i", 0, 0],
   ["j", 0, 3],
 ]
+multiplicity = "w2"
+
+[[constraints.consistency]]
+kind = "interaction"
+tag = "IS_HALFWORD"
+input = [["idx", ["idx", "address_add", "i"], "j"]]
+iters = [
+  ["i", 1, 2],
+  ["j", 0, 3],
+]
+multiplicity = "w4"
+
+[[constraints.consistency]]
+kind = "interaction"
+tag = "IS_HALFWORD"
+input = [["idx", ["idx", "address_add", "i"], "j"]]
+iters = [
+  ["i", 3, 6],
+  ["j", 0, 3],
+]
+multiplicity = "write8"
 
 [[constraints.consistency]]
 kind = "interaction"

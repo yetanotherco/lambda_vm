@@ -182,7 +182,7 @@ name = "prod"
 [[constraints.prod]]
 kind = "arith"
 constraint = "$#`raw_product[i]` = sum_(#`k`=0)^1 2^(16k) sum_(#`j`=0)^(2i+k) #`lhs_ext[j]` dot #`rhs_ext[2i+k-j]`$"
-poly = ["-", ["sum", ["=", "k", 0], "1", ["*", ["^", 2, ["*", 16, "k"]], ["sum", ["=", "j", 0], ["+", ["*", 2, "i"], "k"], ["*", ["idx", "lhs_ext", "j"], ["idx", "rhs_ext", ["-", ["+", ["*", 2, "i"], "k"], "j"]]]]]], ["idx", "raw_product", "i"]]
+poly = ["-", ["sum", ["=", "k", 0], 1, ["*", ["^", 2, ["*", 16, "k"]], ["sum", ["=", "j", 0], ["+", ["*", 2, "i"], "k"], ["*", ["idx", "lhs_ext", "j"], ["idx", "rhs_ext", ["-", ["+", ["*", 2, "i"], "k"], "j"]]]]]], ["idx", "raw_product", "i"]]
 iter = ["i", 0, 3]
 ref = "mul:c:raw_product"
 
@@ -192,7 +192,7 @@ name = "lookup"
 [[constraints.lookup]]
 kind = "interaction"
 tag = "MUL"
-input = ["lhs", "lhs_signed", "rhs", "rhs_signed", "0"]
+input = ["lhs", "lhs_signed", "rhs", "rhs_signed", 0]
 output = ["cast", "lo", "DWordWL"]
 multiplicity = ["-", "μ_lo"]
 ref = "mul:c:lookup_lo"
@@ -200,7 +200,7 @@ ref = "mul:c:lookup_lo"
 [[constraints.lookup]]
 kind = "interaction"
 tag = "MUL"
-input = ["lhs", "lhs_signed", "rhs", "rhs_signed", "1"]
+input = ["lhs", "lhs_signed", "rhs", "rhs_signed", 1]
 output = ["cast", "hi", "DWordWL"]
 multiplicity = ["-", "μ_hi"]
 ref = "mul:c:lookup_hi"

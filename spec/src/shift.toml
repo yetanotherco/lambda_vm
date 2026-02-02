@@ -203,7 +203,7 @@ tag = "ZERO"
 input = ["bit_shift"]
 output = "zbs"
 ref = "shift:c:zbs"
-multiplicity = "μ"
+cond = "μ"
 
 
 [[constraint_groups]]
@@ -292,5 +292,5 @@ kind = "interaction"
 tag = "SHIFT"
 input = ["in", "shift", "direction", "signed", "word_instr"]
 output = "out"
-multiplicity = "-μ"
+multiplicity = ["-", "μ"]
 ref = "shift:c:lookup"
