@@ -166,14 +166,10 @@ fn collect_cpu_ops(
     // for the first access to any register/memory location (where old_timestamp=0).
     for (i, log) in logs.iter().enumerate() {
         let timestamp = (i as u64) * 4 + 4;
-        let instruction =
-            instructions
-                .get(&log.current_pc)
-                .copied()
-                .ok_or(Error::TraceGeneration(format!(
-                    "instruction not found for PC {:#x}",
-                    log.current_pc
-                )))?;
+        let instruction = instructions
+            .get(&log.current_pc)
+            .copied()
+            .ok_or(Error::MissingInstruction(log.current_pc))?;
 
         let op = CpuOperation::from_log_and_instruction(log, timestamp, instruction);
         cpu_ops.push(op);
@@ -710,14 +706,11 @@ impl Traces {
         // =====================================================================
 
         // Extract halt timestamp from the last ECALL instruction
-        let halt_op =
-            cpu_ops
-                .iter()
-                .rev()
-                .find(|op| op.decode.op_ecall)
-                .ok_or(Error::TraceGeneration(
-                    "program does not contain an ECALL (halt) instruction".to_string(),
-                ))?;
+        let halt_op = cpu_ops
+            .iter()
+            .rev()
+            .find(|op| op.decode.op_ecall)
+            .ok_or(Error::MissingEcall)?;
         let halt_trace = halt::generate_halt_trace(halt_op.timestamp);
 
         let cpu = cpu::generate_cpu_trace(&cpu_ops);

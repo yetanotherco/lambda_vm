@@ -420,7 +420,8 @@ pub fn update_multiplicities(
 /// - Bus interaction balancing (sends = receives)
 /// - Constraint satisfaction
 /// - LogUp protocol correctness
-pub fn trim_zero_rows(
+#[cfg(test)]
+pub(crate) fn trim_zero_rows(
     trace: TraceTable<GoldilocksField, GoldilocksExtension>,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     use super::types::FE;
