@@ -82,7 +82,7 @@ fn vm_prover_benchmarks(c: &mut Criterion) {
 criterion_group! {
     name = vm_prover;
     config = Criterion::default()
-        .sample_size(3)
+        .sample_size(10)
         .measurement_time(std::time::Duration::from_secs(60));
     targets = vm_prover_benchmarks
 }
