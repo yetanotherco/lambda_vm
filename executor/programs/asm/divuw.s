@@ -6,4 +6,5 @@ main:
 	li	a2, 0xFFFFFFFF
 	addi	a3, zero, 2
 	divuw	a0, a2, a3
-	jalr	zero, 0(ra)
+	li	a7, 5
+	ecall

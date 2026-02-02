@@ -5,6 +5,7 @@ main:
 	addi    a0, zero, 1
 	jal     a0, 8
 	addi    a0, zero, 2
-	jalr	zero, 0(ra)
+	li	a7, 5
+	ecall
 .Lfunc_end1:
 	.size	main, .Lfunc_end1-main

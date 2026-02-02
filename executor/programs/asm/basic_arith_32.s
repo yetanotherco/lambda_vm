@@ -48,4 +48,5 @@ main:
 	subw	sp, t6, t3		# 31. SUBW: 0x80000000 - 1 = 0x7FFFFFFF (pos)
 
 	# === Return ===
-	jalr	zero, 0(zero)		# 32. Return
+	li	a7, 5
+	ecall		# 32. Return

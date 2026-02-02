@@ -14,6 +14,8 @@ pub enum ProverError {
     MissingInstruction(u64),
     /// Segmentation error
     Segment(segment::SegmentError),
+    /// Program does not contain an ECALL (halt) instruction
+    MissingEcall,
 }
 
 impl fmt::Display for ProverError {
@@ -23,6 +25,9 @@ impl fmt::Display for ProverError {
                 write!(f, "instruction not found for PC {pc:#x}")
             }
             ProverError::Segment(e) => write!(f, "{e}"),
+            ProverError::MissingEcall => {
+                write!(f, "program does not contain an ECALL (halt) instruction")
+            }
         }
     }
 }
