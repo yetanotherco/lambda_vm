@@ -664,6 +664,92 @@ impl Traces {
         logs: &[Log],
         instructions: U64HashMap<Instruction>,
     ) -> Result<Self, ProverError> {
+        // Full trace generation always requires halt (ECALL instruction)
+        Self::from_logs_inner(logs, instructions, true)
+    }
+
+    /// Generates all traces with a trimmed bitwise table (TEST ONLY).
+    ///
+    /// # WARNING: UNSOUND FOR PRODUCTION
+    ///
+    /// This function generates the full 2^20 row bitwise table, updates multiplicities,
+    /// then removes rows where all multiplicity columns are zero. This is **unsound**
+    /// because:
+    ///
+    /// 1. The bitwise table is NOT preprocessed - the verifier checks the prover's
+    ///    commitment instead of a hardcoded trusted commitment
+    /// 2. A malicious prover could provide incorrect bitwise results and the
+    ///    verifier would accept them (e.g., claim 5 AND 3 = 7)
+    /// 3. The table structure differs from production (row indices don't match)
+    ///
+    /// This is acceptable for tests because we're testing:
+    /// - Bus interaction balancing (sends = receives)
+    /// - Constraint satisfaction
+    /// - LogUp protocol correctness
+    ///
+    /// The full preprocessed bitwise verification is tested separately in the
+    /// comprehensive `test_prove_elfs_all_instructions_64_full` test.
+    #[cfg(test)]
+    pub fn from_logs_trimmed(
+        logs: &[Log],
+        instructions: U64HashMap<Instruction>,
+    ) -> Result<Self, ProverError> {
+        // Use from_logs_segment with is_final_segment=true to require ECALL
+        Self::from_logs_segment(logs, instructions, true)
+    }
+
+    /// Generates all traces with a minimal bitwise table (TEST ONLY).
+    ///
+    /// Alias for `from_logs_trimmed` for backwards compatibility.
+    #[cfg(test)]
+    pub fn from_logs_minimal(
+        logs: &[Log],
+        instructions: U64HashMap<Instruction>,
+    ) -> Result<Self, ProverError> {
+        Self::from_logs_trimmed(logs, instructions)
+    }
+
+    /// Generates all traces for a segment with optional halt table (TEST ONLY).
+    ///
+    /// # Arguments
+    /// * `logs` - Execution logs for this segment
+    /// * `instructions` - Instruction lookup table
+    /// * `is_final_segment` - If true, requires ECALL and generates proper halt trace.
+    ///                        If false, skips ECALL requirement and generates placeholder halt.
+    ///
+    /// # Segmentation Support
+    ///
+    /// When splitting a program into segments for proving:
+    /// - Only the **last segment** contains the ECALL (halt) instruction
+    /// - Intermediate segments don't have ECALL, so we generate a placeholder halt trace
+    /// - The prover must exclude the halt table from bus interactions for intermediate segments
+    ///
+    /// # WARNING: UNSOUND FOR PRODUCTION
+    ///
+    /// Same caveats as `from_logs_trimmed` apply (trimmed bitwise table).
+    /// Additionally, intermediate segments without proper halt verification require
+    /// segment linking constraints to be sound (not yet implemented).
+    #[cfg(test)]
+    pub fn from_logs_segment(
+        logs: &[Log],
+        instructions: U64HashMap<Instruction>,
+        is_final_segment: bool,
+    ) -> Result<Self, ProverError> {
+        // Generate full traces (including full 2^20 bitwise table with multiplicities)
+        let mut traces = Self::from_logs_inner(logs, instructions, is_final_segment)?;
+
+        // Trim the bitwise table to only rows with non-zero multiplicities
+        traces.bitwise = bitwise::trim_zero_rows(traces.bitwise);
+
+        Ok(traces)
+    }
+
+    /// Internal trace generation with optional halt requirement.
+    fn from_logs_inner(
+        logs: &[Log],
+        instructions: U64HashMap<Instruction>,
+        require_halt: bool,
+    ) -> Result<Self, ProverError> {
         // =====================================================================
         // PHASE 1: Logs → CPU operations
         // =====================================================================
@@ -708,13 +794,20 @@ impl Traces {
         // PHASE 5: Generate final traces
         // =====================================================================
 
-        // Extract halt timestamp from the last ECALL instruction
-        let halt_op = cpu_ops
-            .iter()
-            .rev()
-            .find(|op| op.decode.op_ecall)
-            .ok_or(ProverError::MissingEcall)?;
-        let halt_trace = halt::generate_halt_trace(halt_op.timestamp);
+        // Generate halt trace based on whether this is the final segment
+        let halt_trace = if require_halt {
+            // Extract halt timestamp from the last ECALL instruction
+            let halt_op = cpu_ops
+                .iter()
+                .rev()
+                .find(|op| op.decode.op_ecall)
+                .ok_or(ProverError::MissingEcall)?;
+            halt::generate_halt_trace(halt_op.timestamp)
+        } else {
+            // Intermediate segment: generate placeholder halt trace (timestamp 0)
+            // This table should NOT be included in bus interactions during proving
+            halt::generate_halt_trace(0)
+        };
 
         let cpu = cpu::generate_cpu_trace(&cpu_ops);
         let lt = lt::generate_lt_trace(&lt_ops);
@@ -744,51 +837,5 @@ impl Traces {
             branch,
             halt: halt_trace,
         })
-    }
-
-    /// Generates all traces with a trimmed bitwise table (TEST ONLY).
-    ///
-    /// # WARNING: UNSOUND FOR PRODUCTION
-    ///
-    /// This function generates the full 2^20 row bitwise table, updates multiplicities,
-    /// then removes rows where all multiplicity columns are zero. This is **unsound**
-    /// because:
-    ///
-    /// 1. The bitwise table is NOT preprocessed - the verifier checks the prover's
-    ///    commitment instead of a hardcoded trusted commitment
-    /// 2. A malicious prover could provide incorrect bitwise results and the
-    ///    verifier would accept them (e.g., claim 5 AND 3 = 7)
-    /// 3. The table structure differs from production (row indices don't match)
-    ///
-    /// This is acceptable for tests because we're testing:
-    /// - Bus interaction balancing (sends = receives)
-    /// - Constraint satisfaction
-    /// - LogUp protocol correctness
-    ///
-    /// The full preprocessed bitwise verification is tested separately in the
-    /// comprehensive `test_prove_elfs_all_instructions_64_full` test.
-    #[cfg(test)]
-    pub fn from_logs_trimmed(
-        logs: &[Log],
-        instructions: U64HashMap<Instruction>,
-    ) -> Result<Self, ProverError> {
-        // Generate full traces (including full 2^20 bitwise table with multiplicities)
-        let mut traces = Self::from_logs(logs, instructions)?;
-
-        // Trim the bitwise table to only rows with non-zero multiplicities
-        traces.bitwise = bitwise::trim_zero_rows(traces.bitwise);
-
-        Ok(traces)
-    }
-
-    /// Generates all traces with a minimal bitwise table (TEST ONLY).
-    ///
-    /// Alias for `from_logs_trimmed` for backwards compatibility.
-    #[cfg(test)]
-    pub fn from_logs_minimal(
-        logs: &[Log],
-        instructions: U64HashMap<Instruction>,
-    ) -> Result<Self, ProverError> {
-        Self::from_logs_trimmed(logs, instructions)
     }
 }

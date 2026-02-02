@@ -185,6 +185,83 @@ fn prove_and_verify_vm_minimal(
     Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[]))
 }
 
+/// Run multi_prove and multi_verify for a segment (intermediate or final).
+///
+/// For intermediate segments (`is_final_segment = false`), the halt table is excluded
+/// from bus interactions since there's no ECALL instruction. The CPU won't send to
+/// the ECALL bus, so halt shouldn't receive either.
+///
+/// For final segments (`is_final_segment = true`), this behaves identically to
+/// `prove_and_verify_vm_minimal`.
+fn prove_and_verify_vm_segment(
+    cpu_trace: &mut TraceTable<F, E>,
+    bitwise_trace: &mut TraceTable<F, E>,
+    lt_trace: &mut TraceTable<F, E>,
+    memw_trace: &mut TraceTable<F, E>,
+    load_trace: &mut TraceTable<F, E>,
+    decode_trace: &mut TraceTable<F, E>,
+    branch_trace: &mut TraceTable<F, E>,
+    halt_trace: &mut TraceTable<F, E>,
+    is_final_segment: bool,
+) -> bool {
+    let proof_options = ProofOptions::default_test_options();
+
+    let cpu_air = create_cpu_air(&proof_options);
+    let bitwise_air = create_bitwise_air(&proof_options);
+    let lt_air = create_lt_air(&proof_options);
+    let memw_air = create_memw_air(&proof_options);
+    let load_air = create_load_air(&proof_options);
+    let decode_air = create_decode_air(&proof_options);
+    let branch_air = create_branch_air(&proof_options);
+    let halt_air = create_halt_air(&proof_options);
+
+    // Build AIR/trace pairs based on segment type
+    let mut air_trace_pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&cpu_air, cpu_trace, &()),
+        (&bitwise_air, bitwise_trace, &()),
+        (&lt_air, lt_trace, &()),
+        (&memw_air, memw_trace, &()),
+        (&load_air, load_trace, &()),
+        (&decode_air, decode_trace, &()),
+        (&branch_air, branch_trace, &()),
+    ];
+
+    // Only include halt for final segment (which has ECALL)
+    if is_final_segment {
+        air_trace_pairs.push((&halt_air, halt_trace, &()));
+    }
+
+    let multi_proof =
+        match Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])) {
+            Ok(proof) => proof,
+            Err(e) => {
+                eprintln!("Prover error: {:?}", e);
+                return false;
+            }
+        };
+
+    // Build AIR list for verification
+    let mut airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
+        &cpu_air,
+        &bitwise_air,
+        &lt_air,
+        &memw_air,
+        &load_air,
+        &decode_air,
+        &branch_air,
+    ];
+
+    if is_final_segment {
+        airs.push(&halt_air);
+    }
+
+    Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[]))
+}
+
 // =============================================================================
 // Integration tests
 // =============================================================================
@@ -966,11 +1043,9 @@ fn test_dhat_memory_profile() {
 /// This test uses loop_128.elf (128 instructions) and splits it into 2 segments
 /// of 64 rows each. Each segment is proven independently.
 ///
-/// NOTE: Currently ignored because Traces::from_logs_minimal requires an ECALL
-/// instruction which only exists in the last segment. Full segment support needs
-/// to handle halt traces properly for intermediate segments.
+/// For intermediate segments (without ECALL), the halt table is excluded from
+/// bus interactions. Only the final segment includes the halt table.
 #[test]
-#[ignore]
 fn test_prove_elfs_segmented_loop_128() {
     use crate::segment::split_into_segments;
 
@@ -980,14 +1055,16 @@ fn test_prove_elfs_segmented_loop_128() {
     let segments = split_into_segments(&logs, 64).expect("Failed to split into segments");
     assert_eq!(segments.len(), 2, "Expected 2 segments of 64 each");
 
+    let num_segments = segments.len();
     for (i, segment_logs) in segments.iter().enumerate() {
         assert_eq!(segment_logs.len(), 64);
 
-        let mut traces = Traces::from_logs_minimal(segment_logs, instructions.clone())
+        let is_final_segment = i == num_segments - 1;
+        let mut traces = Traces::from_logs_segment(segment_logs, instructions.clone(), is_final_segment)
             .expect("Failed to generate traces");
 
         assert!(
-            prove_and_verify_vm_minimal(
+            prove_and_verify_vm_segment(
                 &mut traces.cpu,
                 &mut traces.bitwise,
                 &mut traces.lt,
@@ -995,12 +1072,18 @@ fn test_prove_elfs_segmented_loop_128() {
                 &mut traces.load,
                 &mut traces.decode,
                 &mut traces.branch,
-                &mut traces.halt
+                &mut traces.halt,
+                is_final_segment,
             ),
             "Segment {} verification failed",
             i
         );
 
-        println!("Segment {} verified: {} rows", i, segment_logs.len());
+        println!(
+            "Segment {} verified: {} rows (final={})",
+            i,
+            segment_logs.len(),
+            is_final_segment
+        );
     }
 }

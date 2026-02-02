@@ -23,5 +23,5 @@ loop:
 	# === Teardown: 4 instructions ===
 	addi	a0, t1, 0          # 125: return accumulator
 	addi	zero, zero, 0      # 126: NOP
-	addi	zero, zero, 0      # 127: NOP
-	jalr	zero, 0(zero)      # 128: halt
+	addi	a7, zero, 5        # 127: syscall number for exit
+	ecall                      # 128: halt
