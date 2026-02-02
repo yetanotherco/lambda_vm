@@ -306,17 +306,29 @@ impl Packing {
 /// A term in a linear combination.
 ///
 /// Used to build custom linear combinations of column values and constants.
+/// Supports both positive and negative coefficients (i64) for use in
+/// Multiplicity::Linear (e.g., μ - read2 - read4 - read8).
 #[derive(Debug, Clone)]
 pub enum LinearTerm {
-    /// coefficient * column_value
+    /// coefficient * column_value (coefficient can be negative)
     Column {
-        /// The multiplier for the column value
+        /// The multiplier for the column value (signed to support subtraction)
+        coefficient: i64,
+        /// The column index to read from
+        column: usize,
+    },
+    /// coefficient * column_value (unsigned, for large field elements like inverses)
+    ///
+    /// Use this when the coefficient is a large field element (e.g., 2^-32 mod p)
+    /// that doesn't fit in i64.
+    ColumnUnsigned {
+        /// The multiplier as an unsigned value (for large field elements)
         coefficient: u64,
         /// The column index to read from
         column: usize,
     },
-    /// A constant value to add
-    Constant(u64),
+    /// A constant value to add (signed to support subtraction)
+    Constant(i64),
 }
 
 /// A value that contributes to the bus fingerprint.
@@ -349,7 +361,7 @@ impl BusValue {
     ///
     /// Example: `BusValue::constant(0x42)` for a table ID or opcode.
     pub fn constant(value: u64) -> Self {
-        BusValue::Linear(vec![LinearTerm::Constant(value)])
+        BusValue::Linear(vec![LinearTerm::Constant(value as i64)])
     }
 
     /// Creates a single column value with coefficient 1.
@@ -389,6 +401,7 @@ impl BusValue {
                 .iter()
                 .filter_map(|term| match term {
                     LinearTerm::Column { column, .. } => Some(*column),
+                    LinearTerm::ColumnUnsigned { column, .. } => Some(*column),
                     LinearTerm::Constant(_) => None,
                 })
                 .collect(),
@@ -424,11 +437,29 @@ impl BusValue {
                             coefficient,
                             column,
                         } => {
+                            // Handle signed coefficients
+                            let coeff = if *coefficient >= 0 {
+                                FieldElement::<E>::from(*coefficient as u64)
+                            } else {
+                                -FieldElement::<E>::from((-*coefficient) as u64)
+                            };
+                            result += get_column(*column) * coeff;
+                        }
+                        LinearTerm::ColumnUnsigned {
+                            coefficient,
+                            column,
+                        } => {
+                            // Unsigned coefficient (for large field elements)
                             let coeff = FieldElement::<E>::from(*coefficient);
                             result += get_column(*column) * coeff;
                         }
                         LinearTerm::Constant(value) => {
-                            result += FieldElement::<E>::from(*value);
+                            // Handle signed constants
+                            if *value >= 0 {
+                                result += FieldElement::<E>::from(*value as u64);
+                            } else {
+                                result = result - FieldElement::<E>::from((-*value) as u64);
+                            }
                         }
                     }
                 }
@@ -455,6 +486,10 @@ pub struct AirWithBuses<
     transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
     auxiliary_trace_build_data: AuxiliaryTraceBuildData,
     boundary_constraint_builder: PhantomData<(B, PI)>,
+    /// Commitment to precomputed columns (if this is a preprocessed table)
+    preprocessed_commitment: Option<crate::config::Commitment>,
+    /// Number of precomputed columns (columns 0..n are precomputed, rest are multiplicities)
+    num_precomputed_cols: Option<usize>,
 }
 
 impl<
@@ -521,7 +556,35 @@ impl<
             transition_constraints,
             auxiliary_trace_build_data,
             boundary_constraint_builder: PhantomData,
+            preprocessed_commitment: None,
+            num_precomputed_cols: None,
         }
+    }
+
+    /// Marks this AIR as a preprocessed table with a hardcoded commitment.
+    ///
+    /// Preprocessed tables have columns that are fully deterministic and known
+    /// to both prover and verifier (e.g., bitwise lookup tables). The verifier
+    /// uses the hardcoded commitment instead of trusting the prover.
+    ///
+    /// # Arguments
+    /// * `commitment` - The Merkle root commitment to the precomputed columns
+    /// * `num_precomputed_cols` - Number of precomputed columns (0..n are precomputed,
+    ///   remaining columns are multiplicities that vary per proof)
+    ///
+    /// # Example
+    /// ```ignore
+    /// let air = AirWithBuses::new(num_cols, aux_data, opts, 1, constraints)
+    ///     .with_preprocessed(bitwise::preprocessed_commitment(), bitwise::NUM_PRECOMPUTED_COLS);
+    /// ```
+    pub fn with_preprocessed(
+        mut self,
+        commitment: crate::config::Commitment,
+        num_precomputed_cols: usize,
+    ) -> Self {
+        self.preprocessed_commitment = Some(commitment);
+        self.num_precomputed_cols = Some(num_precomputed_cols);
+        self
     }
 }
 
@@ -651,6 +714,18 @@ where
 
         BoundaryConstraints::from_constraints(boundary_constraints)
     }
+
+    fn is_preprocessed(&self) -> bool {
+        self.preprocessed_commitment.is_some()
+    }
+
+    fn num_precomputed_columns(&self) -> usize {
+        self.num_precomputed_cols.unwrap_or(0)
+    }
+
+    fn precomputed_commitment(&self) -> crate::config::Commitment {
+        self.preprocessed_commitment.unwrap_or([0u8; 32])
+    }
 }
 
 /// Struct representing how each lookup air should build its auxiliary trace
@@ -684,6 +759,19 @@ pub enum Multiplicity {
     /// The column must contain only 0 or 1.
     /// Useful for "all rows except those marked by this flag".
     Negated(usize),
+
+    /// Arbitrary linear combination of columns and constants.
+    /// Supports signed coefficients for subtraction.
+    /// Example: `μ - read2 - read4 - read8` can be expressed as:
+    /// ```ignore
+    /// Multiplicity::Linear(vec![
+    ///     LinearTerm::Column { coefficient: 1, column: cols::MU },
+    ///     LinearTerm::Column { coefficient: -1, column: cols::READ2 },
+    ///     LinearTerm::Column { coefficient: -1, column: cols::READ4 },
+    ///     LinearTerm::Column { coefficient: -1, column: cols::READ8 },
+    /// ])
+    /// ```
+    Linear(Vec<LinearTerm>),
 }
 
 /// Struct representing a lookup interaction for a given table.
@@ -871,6 +959,39 @@ fn build_logup_term_column<F, E>(
                 &main_segment_cols[*col_a][row] + &main_segment_cols[*col_b][row]
             }
             Multiplicity::Negated(col) => FieldElement::<F>::one() - &main_segment_cols[*col][row],
+            Multiplicity::Linear(terms) => {
+                let mut result = FieldElement::<F>::zero();
+                for term in terms {
+                    match term {
+                        LinearTerm::Column {
+                            coefficient,
+                            column,
+                        } => {
+                            let coeff = if *coefficient >= 0 {
+                                FieldElement::<F>::from(*coefficient as u64)
+                            } else {
+                                -FieldElement::<F>::from((-*coefficient) as u64)
+                            };
+                            result += &main_segment_cols[*column][row] * coeff;
+                        }
+                        LinearTerm::ColumnUnsigned {
+                            coefficient,
+                            column,
+                        } => {
+                            let coeff = FieldElement::<F>::from(*coefficient);
+                            result += &main_segment_cols[*column][row] * coeff;
+                        }
+                        LinearTerm::Constant(value) => {
+                            if *value >= 0 {
+                                result += FieldElement::<F>::from(*value as u64);
+                            } else {
+                                result = result - FieldElement::<F>::from((-*value) as u64);
+                            }
+                        }
+                    }
+                }
+                result
+            }
         };
 
         // Bus elements: [bus_id, ...values...]
@@ -1006,6 +1127,39 @@ where
                 }
                 Multiplicity::Negated(col) => {
                     FieldElement::<A>::one() - step.get_main_evaluation_element(0, *col)
+                }
+                Multiplicity::Linear(terms) => {
+                    let mut result = FieldElement::<A>::zero();
+                    for term in terms {
+                        match term {
+                            LinearTerm::Column {
+                                coefficient,
+                                column,
+                            } => {
+                                let coeff = if *coefficient >= 0 {
+                                    FieldElement::<A>::from(*coefficient as u64)
+                                } else {
+                                    -FieldElement::<A>::from((-*coefficient) as u64)
+                                };
+                                result += step.get_main_evaluation_element(0, *column) * coeff;
+                            }
+                            LinearTerm::ColumnUnsigned {
+                                coefficient,
+                                column,
+                            } => {
+                                let coeff = FieldElement::<A>::from(*coefficient);
+                                result += step.get_main_evaluation_element(0, *column) * coeff;
+                            }
+                            LinearTerm::Constant(value) => {
+                                if *value >= 0 {
+                                    result += FieldElement::<A>::from(*value as u64);
+                                } else {
+                                    result = result - FieldElement::<A>::from((-*value) as u64);
+                                }
+                            }
+                        }
+                    }
+                    result
                 }
             };
 

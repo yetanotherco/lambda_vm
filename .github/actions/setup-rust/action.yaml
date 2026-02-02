@@ -13,4 +13,5 @@ runs:
     - name: Install Rust nightly for build-std
       uses: dtolnay/rust-toolchain@nightly
       with:
+        toolchain: nightly-2026-02-01
         components: rust-src

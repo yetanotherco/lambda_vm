@@ -171,6 +171,12 @@ impl Fp2E {
     pub fn conjugate(&self) -> Self {
         Self::new([self.value()[0], -self.value()[1]])
     }
+
+    /// Create a field element from an i64.
+    /// Negative values are converted to their field equivalents: -x becomes p - x.
+    pub fn from_i64(value: i64) -> Self {
+        Self::from(value)
+    }
 }
 
 // =====================================================
@@ -358,6 +364,14 @@ impl IsSubFieldOf<Degree3GoldilocksExtensionField> for GoldilocksField {
 /// Field element type for the cubic extension of native Goldilocks
 pub type Fp3E = FieldElement<Degree3GoldilocksExtensionField>;
 
+impl Fp3E {
+    /// Create a field element from an i64.
+    /// Negative values are converted to their field equivalents: -x becomes p - x.
+    pub fn from_i64(value: i64) -> Self {
+        Self::from(value)
+    }
+}
+
 // =====================================================
 // TRAIT IMPLEMENTATIONS FOR PROVER/VERIFIER
 // =====================================================
@@ -509,5 +523,64 @@ mod tests {
         let a = FpE::from(5u64);
         let result = mul_by_7(&a);
         assert_eq!(result, FpE::from(35u64));
+    }
+
+    // =========================================================================
+    // Tests for From<i64> implementations
+    // =========================================================================
+
+    #[test]
+    fn test_fp2_from_i64_positive() {
+        let fe = Fp2E::from(42i64);
+        assert_eq!(fe.value()[0], FpE::from(42u64));
+        assert_eq!(fe.value()[1], FpE::zero());
+    }
+
+    #[test]
+    fn test_fp2_from_i64_negative() {
+        // -1 in the base field embedded into Fp2
+        let fe = Fp2E::from(-1i64);
+        let expected = Fp2E::new([FpE::from(-1i64), FpE::zero()]);
+        assert_eq!(fe, expected);
+
+        // Verify: -1 + 1 = 0
+        let one = Fp2E::one();
+        assert_eq!(fe + one, Fp2E::zero());
+    }
+
+    #[test]
+    fn test_fp2_from_i64_arithmetic() {
+        let five = Fp2E::from(5i64);
+        let ten = Fp2E::from(10i64);
+        let minus_five = Fp2E::from(-5i64);
+        assert_eq!(five - ten, minus_five);
+    }
+
+    #[test]
+    fn test_fp3_from_i64_positive() {
+        let fe = Fp3E::from(42i64);
+        assert_eq!(fe.value()[0], FpE::from(42u64));
+        assert_eq!(fe.value()[1], FpE::zero());
+        assert_eq!(fe.value()[2], FpE::zero());
+    }
+
+    #[test]
+    fn test_fp3_from_i64_negative() {
+        // -1 in the base field embedded into Fp3
+        let fe = Fp3E::from(-1i64);
+        let expected = Fp3E::new([FpE::from(-1i64), FpE::zero(), FpE::zero()]);
+        assert_eq!(fe, expected);
+
+        // Verify: -1 + 1 = 0
+        let one = Fp3E::one();
+        assert_eq!(fe + one, Fp3E::zero());
+    }
+
+    #[test]
+    fn test_fp3_from_i64_arithmetic() {
+        let five = Fp3E::from(5i64);
+        let ten = Fp3E::from(10i64);
+        let minus_five = Fp3E::from(-5i64);
+        assert_eq!(five - ten, minus_five);
     }
 }

@@ -93,10 +93,11 @@ $(RUST_ARTIFACTS_DIR)/%.elf: $(RUST_PROGRAMS_DIR)/%/Cargo.toml
 	@mkdir -p $(RUST_ARTIFACTS_DIR)
 	cd $(RUST_PROGRAMS_DIR)/$* && \
 		CARGO_TARGET_DIR=$(abspath $(SHARED_TARGET_DIR)) \
-		rustup run nightly cargo build --release \
+		rustup run nightly-2026-02-01 cargo build --release \
 			--target $(RV64_TARGET_SPEC) \
 			-Z build-std=core,alloc,std,compiler_builtins,panic_abort \
-			-Z build-std-features=compiler-builtins-mem
+			-Z build-std-features=compiler-builtins-mem \
+			-Z json-target-spec
 	cp $(SHARED_TARGET_DIR)/riscv64im-lambda-vm-elf/release/$* $@
 
 # Compile rust benches (64-bit)
@@ -104,10 +105,11 @@ $(BENCH_ARTIFACTS_DIR)/%.elf: $(BENCH_PROGRAMS_DIR)/%/Cargo.toml
 	@mkdir -p $(BENCH_ARTIFACTS_DIR)
 	cd $(BENCH_PROGRAMS_DIR)/$* && \
 		CARGO_TARGET_DIR=$(abspath $(SHARED_TARGET_DIR)) \
-		rustup run nightly cargo build --release \
+		rustup run nightly-2026-02-01 cargo build --release \
 			--target $(RV64_TARGET_SPEC) \
 			-Z build-std=core,alloc,std,compiler_builtins,panic_abort \
-			-Z build-std-features=compiler-builtins-mem
+			-Z build-std-features=compiler-builtins-mem \
+			-Z json-target-spec
 	cp $(SHARED_TARGET_DIR)/riscv64im-lambda-vm-elf/release/$* $@
 
 clean-asm:
@@ -150,15 +152,15 @@ test: compile-programs prepare-test-data
 
 # Fast prover tests (skips ignored slow tests)
 test-fast:
-	cargo test -p prover -p stark -p executor -F stark/parallel
+	cargo test -p lambda-vm-prover -p stark -p executor -F stark/parallel
 
-# Prover tests only (fast)
+# Prover tests only (fast, parallel enabled by default)
 test-prover:
-	cargo test -p prover -F stark/parallel
+	cargo test -p lambda-vm-prover
 
 # Prover tests including slow ones
 test-prover-all:
-	cargo test -p prover -F stark/parallel -- --include-ignored
+	cargo test -p lambda-vm-prover -- --include-ignored
 
 # Build all
 build:

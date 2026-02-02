@@ -387,8 +387,8 @@ fn prove_and_verify_custom(ops: &[LtOperation], receiver_rows: &[CustomLtRow]) -
 fn test_padding_single_row() {
     let ops = vec![LtOperation::new(1, 2, UNSIGNED)];
     let trace = generate_lt_trace(&ops);
-    // 1 row -> pads to 2
-    assert_eq!(trace.main_table.height, 2);
+    // 1 row -> pads to 4 (minimum for FRI)
+    assert_eq!(trace.main_table.height, 4);
 }
 
 #[test]

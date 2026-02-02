@@ -78,9 +78,16 @@ where
     /// The result of the interpolation of the columns of the trace table.
     pub(crate) trace_polys: Vec<Polynomial<FieldElement<F>>>,
     /// The Merkle trees constructed to obtain the commitment of the entire trace table.
+    /// For preprocessed tables, this contains only the multiplicity columns.
     pub(crate) lde_trace_merkle_tree: BatchedMerkleTree<F>,
     /// The root of the Merkle tree in `lde_trace_merkle_tree`.
     pub(crate) lde_trace_merkle_root: Commitment,
+    /// For preprocessed tables: Merkle tree over precomputed columns only.
+    pub(crate) precomputed_merkle_tree: Option<BatchedMerkleTree<F>>,
+    /// For preprocessed tables: root of the precomputed Merkle tree.
+    pub(crate) precomputed_merkle_root: Option<Commitment>,
+    /// For preprocessed tables: number of precomputed columns (for splitting during opening).
+    pub(crate) num_precomputed_cols: usize,
 }
 
 /// A container for the results of the first round of the STARK Prove protocol.
@@ -219,6 +226,51 @@ pub trait IsStarkProver<
         Some((tree, commitment))
     }
 
+    /// Compute the LDE commitment for a subset of columns from a trace (for testing).
+    ///
+    /// This helper computes the same commitment the prover generates internally,
+    /// useful for setting up soundness test scenarios.
+    ///
+    /// The commitment is computed by:
+    /// 1. Interpolating columns to polynomials
+    /// 2. Evaluating on LDE domain (size = trace_size * blowup_factor)
+    /// 3. Bit-reverse permuting
+    /// 4. Building Merkle tree from rows
+    fn compute_precomputed_commitment_for_testing(
+        trace: &TraceTable<Field, FieldExtension>,
+        air: &impl AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        num_precomputed_cols: usize,
+    ) -> Option<Commitment>
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    {
+        // Create domain for LDE
+        let domain = Domain::new(air, trace.num_rows());
+
+        // Interpolate columns to polynomials
+        let trace_polys = trace.compute_trace_polys_main::<Field>();
+
+        // Keep only precomputed columns
+        let precomputed_polys: Vec<_> =
+            trace_polys.into_iter().take(num_precomputed_cols).collect();
+
+        // Evaluate on LDE domain
+        let evaluations = Self::compute_lde_trace_evaluations::<Field>(&precomputed_polys, &domain);
+
+        // Bit-reverse permute
+        let mut lde_permuted = evaluations;
+        for col in lde_permuted.iter_mut() {
+            in_place_bit_reverse_permute(col);
+        }
+
+        // Build commitment
+        let rows = columns2rows(lde_permuted);
+        let (_, commitment) = Self::batch_commit_main(&rows)?;
+
+        Some(commitment)
+    }
+
     /// Given a `TraceTable`, this method interpolates its columns, computes the commitment to the
     /// table and appends it to the transcript.
     /// Output: a touple of length 4 with the following:
@@ -268,6 +320,51 @@ pub trait IsStarkProver<
         for col in lde_trace_evaluations.iter_mut() {
             in_place_bit_reverse_permute(col);
         }
+
+        Some((
+            trace_polys,
+            lde_trace_evaluations,
+            lde_trace_merkle_tree,
+            lde_trace_merkle_root,
+        ))
+    }
+
+    /// Variant of `interpolate_and_commit_main` for preprocessed tables.
+    ///
+    /// Does NOT append to transcript - the caller handles that with the hardcoded commitment.
+    /// Returns the computed commitment for verification purposes.
+    #[allow(clippy::type_complexity)]
+    fn interpolate_and_commit_preprocessed(
+        trace: &TraceTable<Field, FieldExtension>,
+        domain: &Domain<Field>,
+    ) -> Option<(
+        Vec<Polynomial<FieldElement<Field>>>,
+        Vec<Vec<FieldElement<Field>>>,
+        BatchedMerkleTree<Field>,
+        Commitment,
+    )>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+        Field: IsSubFieldOf<FieldExtension>,
+    {
+        // Interpolate columns of `trace`.
+        let trace_polys = trace.compute_trace_polys_main::<Field>();
+
+        // Evaluate those polynomials t_j on the large domain D_LDE.
+        let lde_trace_evaluations =
+            Self::compute_lde_trace_evaluations::<Field>(&trace_polys, domain);
+
+        let mut lde_trace_permuted = lde_trace_evaluations.clone();
+        for col in lde_trace_permuted.iter_mut() {
+            in_place_bit_reverse_permute(col);
+        }
+
+        // Compute commitment (but don't append to transcript - caller does that).
+        let lde_trace_permuted_rows = columns2rows(lde_trace_permuted);
+
+        let (lde_trace_merkle_tree, lde_trace_merkle_root) =
+            Self::batch_commit_main(&lde_trace_permuted_rows)?;
 
         Some((
             trace_polys,
@@ -385,8 +482,84 @@ pub trait IsStarkProver<
             trace_polys,
             lde_trace_merkle_tree: main_merkle_tree,
             lde_trace_merkle_root: main_merkle_root,
+            precomputed_merkle_tree: None,
+            precomputed_merkle_root: None,
+            num_precomputed_cols: 0,
         };
 
+        Ok((main, evaluations))
+    }
+
+    /// Phase 1a variant for preprocessed tables: commits precomputed and multiplicities separately.
+    ///
+    /// For preprocessed tables (e.g., bitwise lookup):
+    /// - Precomputed columns (0..num_precomputed_cols): separate tree, root must match hardcoded
+    /// - Multiplicity columns (num_precomputed_cols..): separate tree, root in proof
+    ///
+    /// Both commitments are added to the transcript for Fiat-Shamir binding.
+    #[allow(clippy::type_complexity)]
+    fn round_1_commit_preprocessed_trace(
+        trace: &TraceTable<Field, FieldExtension>,
+        domain: &Domain<Field>,
+        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+        precomputed_commitment: Commitment,
+        num_precomputed_cols: usize,
+    ) -> Result<(Round1CommitmentData<Field>, Vec<Vec<FieldElement<Field>>>), ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        // Interpolate all columns (needed for constraint evaluation)
+        let Some((trace_polys, evaluations, _full_tree, _full_root)) =
+            Self::interpolate_and_commit_preprocessed(trace, domain)
+        else {
+            return Err(ProvingError::EmptyCommitment);
+        };
+
+        // --- Build PRECOMPUTED tree (cols 0..num_precomputed) ---
+        let precomputed_evaluations: Vec<_> = evaluations[..num_precomputed_cols].to_vec();
+        let mut precomputed_lde_permuted = precomputed_evaluations.clone();
+        for col in precomputed_lde_permuted.iter_mut() {
+            in_place_bit_reverse_permute(col);
+        }
+        let precomputed_rows = columns2rows(precomputed_lde_permuted);
+        let (precomputed_tree, precomputed_root) =
+            Self::batch_commit_main(&precomputed_rows).ok_or(ProvingError::EmptyCommitment)?;
+
+        // --- Build MULTIPLICITIES tree (cols num_precomputed..) ---
+        let multiplicity_evaluations: Vec<_> = evaluations[num_precomputed_cols..].to_vec();
+        let mut mult_lde_permuted = multiplicity_evaluations.clone();
+        for col in mult_lde_permuted.iter_mut() {
+            in_place_bit_reverse_permute(col);
+        }
+        let mult_rows = columns2rows(mult_lde_permuted);
+        let (mult_tree, mult_root) =
+            Self::batch_commit_main(&mult_rows).ok_or(ProvingError::EmptyCommitment)?;
+
+        // Verify that our computed precomputed root matches the hardcoded commitment.
+        // This is a sanity check - if they don't match, something is wrong with the trace.
+        debug_assert_eq!(
+            precomputed_root, precomputed_commitment,
+            "Prover's precomputed commitment doesn't match hardcoded AIR commitment"
+        );
+
+        // Add BOTH commitments to transcript for Fiat-Shamir binding.
+        // The precomputed commitment binds challenges to the correct precomputed values.
+        // The multiplicities commitment binds challenges to the actual lookups made.
+        transcript.append_bytes(&precomputed_commitment);
+        transcript.append_bytes(&mult_root);
+
+        // Store multiplicities tree as main (for FRI openings), precomputed tree separately
+        let main = Round1CommitmentData::<Field> {
+            trace_polys,
+            lde_trace_merkle_tree: mult_tree,
+            lde_trace_merkle_root: mult_root,
+            precomputed_merkle_tree: Some(precomputed_tree),
+            precomputed_merkle_root: Some(precomputed_root),
+            num_precomputed_cols,
+        };
+
+        // Return full evaluations (all columns) for constraint evaluation
         Ok((main, evaluations))
     }
 
@@ -421,6 +594,9 @@ pub trait IsStarkProver<
                 trace_polys: aux_trace_polys,
                 lde_trace_merkle_tree: aux_merkle_tree,
                 lde_trace_merkle_root: aux_merkle_root,
+                precomputed_merkle_tree: None,
+                precomputed_merkle_root: None,
+                num_precomputed_cols: 0,
             });
             (aux, aux_trace_polys_evaluations, bus_public_inputs)
         } else {
@@ -955,6 +1131,39 @@ pub trait IsStarkProver<
         }
     }
 
+    /// Variant of open_trace_polys that takes a column range for slicing.
+    /// Used for preprocessed tables where we need to open only a subset of columns
+    /// (either precomputed or multiplicities).
+    fn open_trace_polys_with_columns<E>(
+        domain: &Domain<Field>,
+        tree: &BatchedMerkleTree<E>,
+        lde_trace: &Table<E>,
+        challenge: usize,
+        col_start: usize,
+        col_end: usize,
+    ) -> PolynomialOpenings<E>
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<E>: AsBytes + Sync + Send,
+        Field: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        let domain_size = domain.lde_roots_of_unity_coset.len();
+
+        let index = challenge * 2;
+        let index_sym = challenge * 2 + 1;
+        PolynomialOpenings {
+            proof: tree.get_proof_by_pos(index).unwrap(),
+            proof_sym: tree.get_proof_by_pos(index_sym).unwrap(),
+            evaluations: lde_trace.get_row(reverse_index(index, domain_size as u64))
+                [col_start..col_end]
+                .to_vec(),
+            evaluations_sym: lde_trace.get_row(reverse_index(index_sym, domain_size as u64))
+                [col_start..col_end]
+                .to_vec(),
+        }
+    }
+
     /// Open the deep composition polynomial on a list of indexes and their symmetric elements.
     fn open_deep_composition_poly(
         domain: &Domain<Field>,
@@ -968,13 +1177,47 @@ pub trait IsStarkProver<
     {
         let mut openings = Vec::with_capacity(indexes_to_open.len());
 
+        // Check if this is a preprocessed table (has separate precomputed tree)
+        let is_preprocessed = round_1_result.main.precomputed_merkle_tree.is_some();
+        let num_precomputed_cols = round_1_result.main.num_precomputed_cols;
+        let total_cols = round_1_result.lde_trace.main_table.width;
+
         for index in indexes_to_open.iter() {
-            let main_trace_opening = Self::open_trace_polys::<Field>(
-                domain,
-                &round_1_result.main.lde_trace_merkle_tree,
-                &round_1_result.lde_trace.main_table,
-                *index,
-            );
+            // For preprocessed tables, open main (multiplicities) with column range
+            // For normal tables, open all columns
+            let main_trace_opening = if is_preprocessed {
+                Self::open_trace_polys_with_columns::<Field>(
+                    domain,
+                    &round_1_result.main.lde_trace_merkle_tree,
+                    &round_1_result.lde_trace.main_table,
+                    *index,
+                    num_precomputed_cols,
+                    total_cols,
+                )
+            } else {
+                Self::open_trace_polys::<Field>(
+                    domain,
+                    &round_1_result.main.lde_trace_merkle_tree,
+                    &round_1_result.lde_trace.main_table,
+                    *index,
+                )
+            };
+
+            // For preprocessed tables, also open precomputed tree
+            let precomputed_trace_opening = round_1_result
+                .main
+                .precomputed_merkle_tree
+                .as_ref()
+                .map(|tree| {
+                    Self::open_trace_polys_with_columns::<Field>(
+                        domain,
+                        tree,
+                        &round_1_result.lde_trace.main_table,
+                        *index,
+                        0,
+                        num_precomputed_cols,
+                    )
+                });
 
             let composition_openings = Self::open_composition_poly(
                 &round_2_result.composition_poly_merkle_tree,
@@ -994,6 +1237,7 @@ pub trait IsStarkProver<
             openings.push(DeepPolynomialOpening {
                 composition_poly: composition_openings,
                 main_trace_polys: main_trace_opening,
+                precomputed_trace_polys: precomputed_trace_opening,
                 aux_trace_polys,
             });
         }
@@ -1044,6 +1288,10 @@ pub trait IsStarkProver<
         // =====================================================================
         // All main trace commitments must be in the transcript before sampling
         // LogUp challenges. This ensures the challenges depend on ALL tables.
+        //
+        // For preprocessed tables (e.g., bitwise lookup), we use a hardcoded
+        // commitment instead of computing one. Both prover and verifier use the
+        // same hardcoded value in the transcript.
 
         let mut domains = Vec::with_capacity(num_airs);
         let mut main_commitments: Vec<MainCommitment<Field>> = Vec::with_capacity(num_airs);
@@ -1051,7 +1299,21 @@ pub trait IsStarkProver<
         for (air, trace, _pub_inputs) in &*air_trace_pairs {
             let trace_length = trace.num_rows();
             let domain = new_domain(*air, trace_length);
-            let (main, evaluations) = Self::round_1_commit_main_trace(*trace, &domain, transcript)?;
+
+            let (main, evaluations) = if air.is_preprocessed() {
+                // Preprocessed table: use hardcoded commitment for precomputed columns
+                Self::round_1_commit_preprocessed_trace(
+                    *trace,
+                    &domain,
+                    transcript,
+                    air.precomputed_commitment(),
+                    air.num_precomputed_columns(),
+                )?
+            } else {
+                // Normal table: compute commitment as usual
+                Self::round_1_commit_main_trace(*trace, &domain, transcript)?
+            };
+
             main_commitments.push((main, evaluations));
             domains.push(domain);
         }
@@ -1294,6 +1556,8 @@ pub trait IsStarkProver<
             lde_trace_main_merkle_root: round_1_result.main.lde_trace_merkle_root,
             // [t]
             lde_trace_aux_merkle_root: round_1_result.aux.as_ref().map(|x| x.lde_trace_merkle_root),
+            // For preprocessed tables: commitment to precomputed columns only
+            lde_trace_precomputed_merkle_root: round_1_result.main.precomputed_merkle_root,
             // tⱼ(zgᵏ)
             trace_ood_evaluations: round_3_result.trace_ood_evaluations,
             // [H₁] and [H₂]

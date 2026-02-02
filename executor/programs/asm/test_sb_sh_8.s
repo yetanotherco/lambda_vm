@@ -9,4 +9,5 @@ main:
 	sh	t1, 2(sp)		# Store half
 	lb	a0, 0(sp)		# Load byte back (a0 = 0x42)
 	lh	a1, 2(sp)		# Load half back (a1 = 0x789)
-	jalr	zero, 0(zero)
+	li	a7, 5
+	ecall

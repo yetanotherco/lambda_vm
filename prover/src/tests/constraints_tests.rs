@@ -437,38 +437,6 @@ fn test_add_operand_linear_with_nonzero_hi() {
     }
 }
 
-// =========================================================================
-// i64_to_fe formula verification tests
-// =========================================================================
-
-#[test]
-fn test_i64_to_fe_positive() {
-    // Verify positive conversion
-    let val: i64 = 42;
-    let expected = FE::from(42u64);
-    let fe = if val >= 0 {
-        FE::from(val as u64)
-    } else {
-        -FE::from((-val) as u64)
-    };
-    assert_eq!(fe, expected);
-}
-
-#[test]
-fn test_i64_to_fe_negative() {
-    // Verify negative conversion: -2 in field
-    let val: i64 = -2;
-    let fe = if val >= 0 {
-        FE::from(val as u64)
-    } else {
-        -FE::from((-val) as u64)
-    };
-
-    // -2 + 2 should equal 0
-    let two = FE::from(2u64);
-    assert_eq!(fe + two, FE::zero());
-}
-
 #[test]
 fn test_linear_term_negative_coefficient_formula() {
     // Verify that 4 - 2*1 = 2 using field arithmetic
