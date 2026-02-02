@@ -121,37 +121,33 @@ impl VmAirs {
             &self.halt,
         ]
     }
-}
 
-/// Create all VM AIR instances. `minimal_bitwise` controls whether the full
-/// 2^20 bitwise preprocessed table is included (false = full, true = minimal).
-/// DECODE is always preprocessed.
-pub(crate) fn create_vm_airs(
-    elf: &Elf,
-    proof_options: &ProofOptions,
-    minimal_bitwise: bool,
-) -> VmAirs {
-    let cpu = create_cpu_air(proof_options);
-    let bitwise = if minimal_bitwise {
-        create_bitwise_air(proof_options)
-    } else {
-        create_bitwise_air(proof_options).with_preprocessed(
-            bitwise::preprocessed_commitment(),
-            bitwise::NUM_PRECOMPUTED_COLS,
-        )
-    };
-    let lt = create_lt_air(proof_options);
-    let memw = create_memw_air(proof_options);
-    let load = create_load_air(proof_options);
-    let decode = create_decode_air(proof_options).with_preprocessed(
-        decode::commitment_from_elf(elf, proof_options)
-            .expect("Failed to compute decode commitment"),
-        decode::NUM_PRECOMPUTED_COLS,
-    );
-    let mul = create_mul_air(proof_options);
-    let branch = create_branch_air(proof_options);
-    let halt = create_halt_air(proof_options);
-    VmAirs { cpu, bitwise, lt, memw, load, decode, mul, branch, halt }
+    /// Create all VM AIR instances. `minimal_bitwise` controls whether the full
+    /// 2^20 bitwise preprocessed table is included (false = full, true = minimal).
+    /// DECODE is always preprocessed.
+    pub fn new(elf: &Elf, proof_options: &ProofOptions, minimal_bitwise: bool) -> Self {
+        let cpu = create_cpu_air(proof_options);
+        let bitwise = if minimal_bitwise {
+            create_bitwise_air(proof_options)
+        } else {
+            create_bitwise_air(proof_options).with_preprocessed(
+                bitwise::preprocessed_commitment(),
+                bitwise::NUM_PRECOMPUTED_COLS,
+            )
+        };
+        let lt = create_lt_air(proof_options);
+        let memw = create_memw_air(proof_options);
+        let load = create_load_air(proof_options);
+        let decode = create_decode_air(proof_options).with_preprocessed(
+            decode::commitment_from_elf(elf, proof_options)
+                .expect("Failed to compute decode commitment"),
+            decode::NUM_PRECOMPUTED_COLS,
+        );
+        let mul = create_mul_air(proof_options);
+        let branch = create_branch_air(proof_options);
+        let halt = create_halt_air(proof_options);
+        Self { cpu, bitwise, lt, memw, load, decode, mul, branch, halt }
+    }
 }
 
 /// Prove an ELF binary execution. Returns a serializable proof.
@@ -165,7 +161,7 @@ pub fn prove(elf_bytes: &[u8]) -> Result<MultiProof<F, E, ()>, Error> {
     let mut traces = Traces::from_logs(&result.logs, result.instructions)?;
 
     let proof_options = ProofOptions::default_test_options();
-    let airs = create_vm_airs(&program, &proof_options, false);
+    let airs = VmAirs::new(&program, &proof_options, false);
 
     Prover::multi_prove(airs.air_trace_pairs(&mut traces), &mut DefaultTranscript::<E>::new(&[]))
         .map_err(|e| Error::Prover(format!("{e:?}")))
@@ -175,7 +171,7 @@ pub fn prove(elf_bytes: &[u8]) -> Result<MultiProof<F, E, ()>, Error> {
 pub fn verify(proof: &MultiProof<F, E, ()>, elf_bytes: &[u8]) -> Result<bool, Error> {
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let proof_options = ProofOptions::default_test_options();
-    let airs = create_vm_airs(&program, &proof_options, false);
+    let airs = VmAirs::new(&program, &proof_options, false);
 
     Ok(Verifier::multi_verify(&airs.air_refs(), proof, &mut DefaultTranscript::<E>::new(&[])))
 }

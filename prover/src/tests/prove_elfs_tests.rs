@@ -28,7 +28,7 @@ use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 use executor::elf::Elf;
 
 // Import shared utilities
-use crate::create_vm_airs;
+use crate::VmAirs;
 use crate::test_utils::run_asm_elf;
 
 type F = GoldilocksField;
@@ -43,7 +43,7 @@ type E = GoldilocksExtension;
 /// Uses minimal bitwise (no full 2^20 preprocessed table) but DECODE is always preprocessed.
 fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
     let proof_options = ProofOptions::default_test_options();
-    let airs = create_vm_airs(elf, &proof_options, true);
+    let airs = VmAirs::new(elf, &proof_options, true);
 
     let multi_proof =
         match Prover::multi_prove(airs.air_trace_pairs(traces), &mut DefaultTranscript::<E>::new(&[])) {
@@ -64,7 +64,7 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
 /// Test CPU table alone (no bus interactions) to verify basic prove/verify works.
 #[test]
 fn test_cpu_only_no_bus() {
-    let (elf, logs, instructions) = run_asm_elf("sub");
+    let (_elf, logs, instructions) = run_asm_elf("sub");
 
     let mut cpu_trace = Traces::from_logs(&logs, instructions).unwrap().cpu;
     println!(
