@@ -53,7 +53,7 @@
 //! - ECALL: for system calls
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
-use crate::ProverError;
+use crate::Error;
 use executor::vm::{
     instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth},
     logs::Log,
@@ -1041,12 +1041,12 @@ pub fn generate_cpu_trace(
 pub fn generate_cpu_trace_from_logs(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,
-) -> Result<TraceTable<GoldilocksField, GoldilocksExtension>, ProverError> {
+) -> Result<TraceTable<GoldilocksField, GoldilocksExtension>, Error> {
     let mut operations = Vec::with_capacity(logs.len());
     for (i, log) in logs.iter().enumerate() {
         let instruction = *instructions
             .get(&log.current_pc)
-            .ok_or(ProverError::MissingInstruction(log.current_pc))?;
+            .ok_or(Error::TraceGeneration(format!("instruction not found for PC {:#x}", log.current_pc)))?;
         operations.push(CpuOperation::from_log(log, (i as u64) * 4, instruction));
     }
     Ok(generate_cpu_trace(&operations))
@@ -1066,12 +1066,12 @@ pub fn collect_bitwise_ops(operations: &[CpuOperation]) -> Vec<super::bitwise::B
 pub fn collect_bitwise_ops_from_logs(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,
-) -> Result<Vec<super::bitwise::BitwiseOperation>, ProverError> {
+) -> Result<Vec<super::bitwise::BitwiseOperation>, Error> {
     let mut operations = Vec::with_capacity(logs.len());
     for (i, log) in logs.iter().enumerate() {
         let instruction = *instructions
             .get(&log.current_pc)
-            .ok_or(ProverError::MissingInstruction(log.current_pc))?;
+            .ok_or(Error::TraceGeneration(format!("instruction not found for PC {:#x}", log.current_pc)))?;
         operations.push(CpuOperation::from_log(log, (i as u64) * 4, instruction));
     }
     Ok(collect_bitwise_ops(&operations))

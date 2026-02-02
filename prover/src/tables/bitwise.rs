@@ -420,7 +420,6 @@ pub fn update_multiplicities(
 /// - Bus interaction balancing (sends = receives)
 /// - Constraint satisfaction
 /// - LogUp protocol correctness
-#[cfg(test)]
 pub fn trim_zero_rows(
     trace: TraceTable<GoldilocksField, GoldilocksExtension>,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {

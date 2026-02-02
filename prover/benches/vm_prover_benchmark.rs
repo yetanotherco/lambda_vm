@@ -20,11 +20,11 @@ use stark::trace::TraceTable;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
-use prover::tables::lt::generate_lt_trace;
-use prover::tables::trace_builder::Traces;
+use lambda_vm_prover::tables::lt::generate_lt_trace;
+use lambda_vm_prover::tables::trace_builder::Traces;
 
 // Import shared utilities
-use prover::test_utils::{
+use lambda_vm_lambda_vm_prover::test_utils::{
     E, F, VmAir, collect_bitwise_lookups_from_logs, collect_bitwise_lookups_from_lt,
     collect_lt_lookups_from_logs, create_bitwise_air, create_cpu_air, create_lt_air,
     generate_minimal_bitwise_trace, run_asm_elf,
@@ -62,7 +62,7 @@ fn benchmark_proof_options() -> ProofOptions {
     }
 }
 
-// Lookup collection and AIR creation functions moved to prover::test_utils module
+// Lookup collection and AIR creation functions moved to lambda_vm_prover::test_utils module
 
 fn create_airs(proof_options: &ProofOptions) -> (VmAir, VmAir, VmAir) {
     (
