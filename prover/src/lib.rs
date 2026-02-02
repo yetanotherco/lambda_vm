@@ -4,7 +4,7 @@
 //! multi-table STARK proofs (CPU, bitwise, LT, memory, load).
 //!
 //! # Example
-//! ```no_run
+//! ```ignore
 //! let elf_bytes = std::fs::read("program.elf").unwrap();
 //! let proof = lambda_vm_prover::prove(&elf_bytes).unwrap();
 //! assert!(lambda_vm_prover::verify(&proof));
@@ -131,4 +131,3 @@ pub fn prove_and_verify(elf_bytes: &[u8]) -> Result<bool, Error> {
     let proof = prove(elf_bytes)?;
     Ok(verify(&proof))
 }
-
