@@ -257,10 +257,10 @@ fn test_bus_interactions_count() {
     // Expected interactions:
     // - 2x MSB16 senders (lhs sign, rhs sign)
     // - 8x IS_HALF senders (lo[0..4], hi[0..4])
+    // - 4x IS_B20 senders (carry[0..4] virtual range checks)
     // - 2x MUL receivers (lo, hi)
-    // Total: 2 + 8 + 2 = 12
-    // Note: Carries are virtual and checked via constraints, not bus lookups
-    assert_eq!(interactions.len(), 12, "Expected 12 bus interactions");
+    // Total: 2 + 8 + 4 + 2 = 16
+    assert_eq!(interactions.len(), 16, "Expected 16 bus interactions");
 }
 
 #[test]
