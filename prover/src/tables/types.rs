@@ -672,12 +672,13 @@ impl DecodeEntry {
             ArithOp::MulHigh => {
                 entry.op_mul = true;
                 entry.muldiv_selector = true;
+                entry.mp_selector = true; // both operands signed for MULH
                 entry.signed = true;
             }
             ArithOp::MulHighSignedUnsigned => {
                 entry.op_mul = true;
                 entry.muldiv_selector = true;
-                entry.mp_selector = true;
+                // mp_selector = false (default): rhs is unsigned for MULHSU
                 entry.signed = true;
             }
             ArithOp::MulHighUnsigned => {

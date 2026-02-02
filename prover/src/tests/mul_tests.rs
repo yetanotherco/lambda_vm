@@ -1,0 +1,303 @@
+//! Tests for the MUL (Multiplication) table.
+
+use crate::tables::mul::{MulOperation, bus_interactions, cols, generate_mul_trace};
+use crate::tables::types::FE;
+
+#[test]
+fn test_mul_unsigned_basic() {
+    // Simple unsigned multiplications
+    let op1 = MulOperation::new(5, false, 10, false);
+    let (lo, hi) = op1.compute_product();
+    assert_eq!(lo, 50);
+    assert_eq!(hi, 0);
+
+    // Larger numbers
+    let op2 = MulOperation::new(0x1_0000_0000, false, 0x1_0000_0000, false);
+    let (lo, hi) = op2.compute_product();
+    assert_eq!(lo, 0); // 2^64 mod 2^64 = 0
+    assert_eq!(hi, 1); // 2^64 / 2^64 = 1
+
+    // Max values
+    let op3 = MulOperation::new(u64::MAX, false, 2, false);
+    let (lo, hi) = op3.compute_product();
+    // u64::MAX * 2 = 2^65 - 2 = 0xFFFF_FFFF_FFFF_FFFE (lo) with hi = 1
+    assert_eq!(lo, u64::MAX - 1);
+    assert_eq!(hi, 1);
+}
+
+#[test]
+fn test_mul_signed_basic() {
+    // Positive * positive
+    let op1 = MulOperation::new(5, true, 10, true);
+    let (lo, hi) = op1.compute_product();
+    assert_eq!(lo, 50);
+    assert_eq!(hi, 0);
+
+    // Negative * positive
+    let op2 = MulOperation::new((-5i64) as u64, true, 10, true);
+    let (lo, hi) = op2.compute_product();
+    assert_eq!(lo as i64, -50);
+    assert_eq!(hi, u64::MAX); // Sign extension
+
+    // Negative * negative
+    let op3 = MulOperation::new((-5i64) as u64, true, (-10i64) as u64, true);
+    let (lo, hi) = op3.compute_product();
+    assert_eq!(lo, 50);
+    assert_eq!(hi, 0);
+
+    // Large negative
+    let op4 = MulOperation::new((-1i64) as u64, true, (-1i64) as u64, true);
+    let (lo, hi) = op4.compute_product();
+    assert_eq!(lo, 1);
+    assert_eq!(hi, 0);
+}
+
+#[test]
+fn test_mul_mulhsu() {
+    // MULHSU: signed lhs * unsigned rhs
+    // -1 (signed) * 2 (unsigned) = -2
+    let op1 = MulOperation::new((-1i64) as u64, true, 2, false);
+    let (lo, hi) = op1.compute_product();
+    assert_eq!(lo as i64, -2);
+    assert_eq!(hi, u64::MAX); // Sign extension
+
+    // Positive signed * unsigned
+    let op2 = MulOperation::new(5, true, 10, false);
+    let (lo, hi) = op2.compute_product();
+    assert_eq!(lo, 50);
+    assert_eq!(hi, 0);
+}
+
+#[test]
+fn test_sign_detection() {
+    // Unsigned: never negative
+    let op1 = MulOperation::new((-1i64) as u64, false, (-1i64) as u64, false);
+    assert!(!op1.lhs_is_negative());
+    assert!(!op1.rhs_is_negative());
+
+    // Signed: check sign bit
+    let op2 = MulOperation::new((-1i64) as u64, true, 5, true);
+    assert!(op2.lhs_is_negative());
+    assert!(!op2.rhs_is_negative());
+
+    // MULHSU: lhs signed, rhs unsigned
+    let op3 = MulOperation::new((-1i64) as u64, true, (-1i64) as u64, false);
+    assert!(op3.lhs_is_negative());
+    assert!(!op3.rhs_is_negative()); // rhs_signed=false, so never negative
+}
+
+#[test]
+fn test_sign_extension() {
+    // Positive number: no sign extension
+    let op1 = MulOperation::new(0x1234_5678_9ABC_DEF0, false, 0, false);
+    let ext = op1.lhs_extended();
+    assert_eq!(ext[0], 0xDEF0);
+    assert_eq!(ext[1], 0x9ABC);
+    assert_eq!(ext[2], 0x5678);
+    assert_eq!(ext[3], 0x1234);
+    assert_eq!(ext[4], 0); // No extension
+    assert_eq!(ext[5], 0);
+    assert_eq!(ext[6], 0);
+    assert_eq!(ext[7], 0);
+
+    // Signed positive: still no extension
+    let op2 = MulOperation::new(0x1234_5678_9ABC_DEF0, true, 0, false);
+    let ext = op2.lhs_extended();
+    assert_eq!(ext[4], 0); // MSB is 0, so positive
+    assert_eq!(ext[7], 0);
+
+    // Signed negative: full extension
+    let op3 = MulOperation::new((-1i64) as u64, true, 0, false);
+    let ext = op3.lhs_extended();
+    assert_eq!(ext[0], 0xFFFF);
+    assert_eq!(ext[3], 0xFFFF);
+    assert_eq!(ext[4], 0xFFFF); // Sign extension
+    assert_eq!(ext[7], 0xFFFF);
+}
+
+#[test]
+fn test_raw_products() {
+    // Simple case: 2 * 3 = 6
+    let op = MulOperation::new(2, false, 3, false);
+    let raw = op.compute_raw_products();
+    // raw[0] should contain the low 32-bit portion of convolution
+    // For 2 * 3, result is 6, which fits in raw[0]
+    assert!(raw[0] >= 6, "raw[0] should contain product term");
+}
+
+#[test]
+fn test_trace_generation() {
+    let ops = vec![
+        (MulOperation::new(100, false, 200, false), false), // wants_lo
+        (MulOperation::new(5, true, 10, true), true),       // wants_hi
+    ];
+
+    let trace = generate_mul_trace(&ops);
+
+    // Should be padded to power of 2 (minimum 4 for FRI)
+    assert_eq!(trace.main_table.height, 4);
+    assert_eq!(trace.main_table.width, cols::NUM_COLUMNS);
+
+    // Find the rows
+    let mut found_100_200 = false;
+    let mut found_5_10 = false;
+
+    for row_idx in 0..4 {
+        let row = trace.main_table.get_row(row_idx);
+        if row[cols::LHS_0] == FE::from(100u64) && row[cols::RHS_0] == FE::from(200u64) {
+            assert_eq!(row[cols::LHS_SIGNED], FE::zero());
+            assert_eq!(row[cols::RHS_SIGNED], FE::zero());
+            assert_eq!(row[cols::MU_LO], FE::one()); // wants_lo
+            assert_eq!(row[cols::MU_HI], FE::zero());
+            // Check product: 100 * 200 = 20000
+            assert_eq!(row[cols::LO_0], FE::from(20000u64 & 0xFFFF));
+            found_100_200 = true;
+        }
+        if row[cols::LHS_0] == FE::from(5u64) && row[cols::RHS_0] == FE::from(10u64) {
+            assert_eq!(row[cols::LHS_SIGNED], FE::one());
+            assert_eq!(row[cols::RHS_SIGNED], FE::one());
+            assert_eq!(row[cols::MU_LO], FE::zero());
+            assert_eq!(row[cols::MU_HI], FE::one()); // wants_hi
+            // Check product: 5 * 10 = 50
+            assert_eq!(row[cols::LO_0], FE::from(50u64));
+            found_5_10 = true;
+        }
+    }
+
+    assert!(found_100_200, "Row with lhs=100, rhs=200 not found");
+    assert!(found_5_10, "Row with lhs=5, rhs=10 not found");
+}
+
+#[test]
+fn test_multiplicity_aggregation() {
+    // Create operations where same (lhs, rhs, signs) appears multiple times
+    // with different wants_hi flags
+    let ops = vec![
+        (MulOperation::new(5, false, 10, false), false), // wants_lo
+        (MulOperation::new(5, false, 10, false), false), // wants_lo again
+        (MulOperation::new(5, false, 10, false), true),  // wants_hi
+        (MulOperation::new(100, false, 200, false), true), // different op
+    ];
+
+    let trace = generate_mul_trace(&ops);
+
+    // Should deduplicate to 2 unique rows, padded to 4
+    assert_eq!(trace.main_table.height, 4);
+
+    let mut found_5_10 = false;
+    let mut found_100_200 = false;
+
+    for row_idx in 0..4 {
+        let row = trace.main_table.get_row(row_idx);
+        if row[cols::LHS_0] == FE::from(5u64) && row[cols::RHS_0] == FE::from(10u64) {
+            assert_eq!(
+                row[cols::MU_LO],
+                FE::from(2u64),
+                "Expected mu_lo=2 for (5, 10)"
+            );
+            assert_eq!(
+                row[cols::MU_HI],
+                FE::from(1u64),
+                "Expected mu_hi=1 for (5, 10)"
+            );
+            found_5_10 = true;
+        }
+        if row[cols::LHS_0] == FE::from(100u64) && row[cols::RHS_0] == FE::from(200u64) {
+            assert_eq!(
+                row[cols::MU_LO],
+                FE::zero(),
+                "Expected mu_lo=0 for (100, 200)"
+            );
+            assert_eq!(
+                row[cols::MU_HI],
+                FE::one(),
+                "Expected mu_hi=1 for (100, 200)"
+            );
+            found_100_200 = true;
+        }
+    }
+
+    assert!(found_5_10, "Row with lhs=5, rhs=10 not found");
+    assert!(found_100_200, "Row with lhs=100, rhs=200 not found");
+}
+
+#[test]
+fn test_different_signed_flags_separate_rows() {
+    // Same lhs/rhs but different signed flags should be separate rows
+    let ops = vec![
+        (MulOperation::new(5, false, 10, false), false), // UNSIGNED
+        (MulOperation::new(5, true, 10, true), false),   // SIGNED
+        (MulOperation::new(5, true, 10, false), false),  // MULHSU
+    ];
+
+    let trace = generate_mul_trace(&ops);
+
+    // 3 unique operations, padded to 4
+    assert_eq!(trace.main_table.height, 4);
+
+    let mut count_5_10 = 0;
+    for row_idx in 0..4 {
+        let row = trace.main_table.get_row(row_idx);
+        if row[cols::LHS_0] == FE::from(5u64) && row[cols::RHS_0] == FE::from(10u64) {
+            // Check that multiplicity is 1 for each unique operation
+            assert_eq!(row[cols::MU_LO], FE::one());
+            count_5_10 += 1;
+        }
+    }
+
+    assert_eq!(
+        count_5_10, 3,
+        "Should have 3 separate rows for (5, 10) with different signed flags"
+    );
+}
+
+#[test]
+fn test_bus_interactions_count() {
+    let interactions = bus_interactions();
+    // Expected interactions:
+    // - 2x MSB16 senders (lhs sign, rhs sign)
+    // - 8x IS_HALF senders (lo[0..4], hi[0..4])
+    // - 2x MUL receivers (lo, hi)
+    // Total: 2 + 8 + 2 = 12
+    // Note: Carries are virtual and checked via constraints, not bus lookups
+    assert_eq!(interactions.len(), 12, "Expected 12 bus interactions");
+}
+
+#[test]
+fn test_large_multiplication() {
+    // Test with large numbers that overflow into hi
+    let op = MulOperation::new(0xFFFF_FFFF_FFFF_FFFF, false, 0xFFFF_FFFF_FFFF_FFFF, false);
+    let (lo, hi) = op.compute_product();
+
+    // (2^64 - 1)^2 = 2^128 - 2^65 + 1
+    // lo = 1, hi = 2^64 - 2
+    assert_eq!(lo, 1);
+    assert_eq!(hi, 0xFFFF_FFFF_FFFF_FFFE);
+}
+
+#[test]
+fn test_zero_multiplication() {
+    let op1 = MulOperation::new(0, false, 12345, false);
+    let (lo, hi) = op1.compute_product();
+    assert_eq!(lo, 0);
+    assert_eq!(hi, 0);
+
+    let op2 = MulOperation::new(12345, true, 0, true);
+    let (lo, hi) = op2.compute_product();
+    assert_eq!(lo, 0);
+    assert_eq!(hi, 0);
+}
+
+#[test]
+fn test_identity_multiplication() {
+    let op = MulOperation::new(12345, false, 1, false);
+    let (lo, hi) = op.compute_product();
+    assert_eq!(lo, 12345);
+    assert_eq!(hi, 0);
+}
+
+#[test]
+fn testito() {
+    let inv = FE::inv(&FE::from(10usize.pow(19)));
+    println!("Inverse of 10^19 is {}", inv);
+}

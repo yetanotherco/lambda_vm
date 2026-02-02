@@ -533,6 +533,13 @@ impl BitwiseOperation {
     pub fn shift_op(lookup_type: BitwiseOperationType, x: u8, y: u8, z: u8) -> Self {
         Self::new(lookup_type, x, y, z)
     }
+
+    /// Create an IS_B20 operation for 20-bit range checks.
+    /// Value is packed as: x + 256*y + 65536*z (where z is 4 bits).
+    pub fn b20(x: u8, y: u8, z: u8) -> Self {
+        debug_assert!(z < 16, "z must be 4-bit value for IS_B20");
+        Self::new(BitwiseOperationType::IsB20, x, y, z)
+    }
 }
 
 // =========================================================================
