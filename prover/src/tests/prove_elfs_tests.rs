@@ -33,7 +33,7 @@ use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 // Import shared utilities
 use crate::test_utils::{
     create_bitwise_air, create_branch_air, create_cpu_air, create_decode_air, create_halt_air,
-    create_load_air, create_lt_air, create_memw_air, run_asm_elf,
+    create_load_air, create_lt_air, create_memw_air, create_mul_air, run_asm_elf,
 };
 
 type F = GoldilocksField;
@@ -44,7 +44,7 @@ type E = GoldilocksExtension;
 // =============================================================================
 
 /// Run multi_prove and multi_verify for all VM tables.
-/// Run multi_prove and multi_verify for all VM tables (CPU + Bitwise + LT + MEMW + LOAD + DECODE + HALT).
+/// Run multi_prove and multi_verify for all VM tables (CPU + Bitwise + LT + MEMW + LOAD + DECODE + MUL + BRANCH + HALT).
 ///
 /// Uses the FULL 2^20 row bitwise table with preprocessed commitment.
 /// Returns true if verification succeeds.
@@ -55,6 +55,7 @@ fn prove_and_verify_vm(
     memw_trace: &mut TraceTable<F, E>,
     load_trace: &mut TraceTable<F, E>,
     decode_trace: &mut TraceTable<F, E>,
+    mul_trace: &mut TraceTable<F, E>,
     branch_trace: &mut TraceTable<F, E>,
     halt_trace: &mut TraceTable<F, E>,
     elf: &Elf,
@@ -76,6 +77,7 @@ fn prove_and_verify_vm(
             .expect("Failed to compute decode commitment"),
         decode::NUM_PRECOMPUTED_COLS,
     );
+    let mul_air = create_mul_air(&proof_options);
     let branch_air = create_branch_air(&proof_options);
     let halt_air = create_halt_air(&proof_options);
 
@@ -90,6 +92,7 @@ fn prove_and_verify_vm(
         (&memw_air, memw_trace, &()),
         (&load_air, load_trace, &()),
         (&decode_air, decode_trace, &()),
+        (&mul_air, mul_trace, &()),
         (&branch_air, branch_trace, &()),
         (&halt_air, halt_trace, &()),
     ];
@@ -110,6 +113,7 @@ fn prove_and_verify_vm(
         &memw_air,
         &load_air,
         &decode_air,
+        &mul_air,
         &branch_air,
         &halt_air,
     ];
@@ -122,7 +126,7 @@ fn prove_and_verify_vm(
 }
 
 /// Run multi_prove and multi_verify for all VM tables.
-/// Run multi_prove and multi_verify for all VM tables (CPU + Bitwise + LT + MEMW + LOAD + DECODE + HALT).
+/// Run multi_prove and multi_verify for all VM tables (CPU + Bitwise + LT + MEMW + LOAD + DECODE + MUL + BRANCH + HALT).
 ///
 /// Used for fast tests where the bitwise table is a dummy that only contains
 /// the rows needed to balance the bus. NOT the full preprocessed table.
@@ -133,6 +137,7 @@ fn prove_and_verify_vm_minimal(
     memw_trace: &mut TraceTable<F, E>,
     load_trace: &mut TraceTable<F, E>,
     decode_trace: &mut TraceTable<F, E>,
+    mul_trace: &mut TraceTable<F, E>,
     branch_trace: &mut TraceTable<F, E>,
     halt_trace: &mut TraceTable<F, E>,
 ) -> bool {
@@ -144,6 +149,7 @@ fn prove_and_verify_vm_minimal(
     let memw_air = create_memw_air(&proof_options);
     let load_air = create_load_air(&proof_options);
     let decode_air = create_decode_air(&proof_options);
+    let mul_air = create_mul_air(&proof_options);
     let branch_air = create_branch_air(&proof_options);
     let halt_air = create_halt_air(&proof_options);
 
@@ -158,6 +164,7 @@ fn prove_and_verify_vm_minimal(
         (&memw_air, memw_trace, &()),
         (&load_air, load_trace, &()),
         (&decode_air, decode_trace, &()),
+        (&mul_air, mul_trace, &()),
         (&branch_air, branch_trace, &()),
         (&halt_air, halt_trace, &()),
     ];
@@ -178,6 +185,7 @@ fn prove_and_verify_vm_minimal(
         &memw_air,
         &load_air,
         &decode_air,
+        &mul_air,
         &branch_air,
         &halt_air,
     ];
@@ -259,6 +267,7 @@ fn test_prove_elfs_sub_fast() {
             &mut traces.memw,
             &mut traces.load,
             &mut traces.decode,
+            &mut traces.mul,
             &mut traces.branch,
             &mut traces.halt
         ),
@@ -284,6 +293,7 @@ fn test_prove_elfs_sub_neg_result_fast() {
             &mut traces.memw,
             &mut traces.load,
             &mut traces.decode,
+            &mut traces.mul,
             &mut traces.branch,
             &mut traces.halt
         ),
@@ -309,6 +319,7 @@ fn test_prove_elfs_sub_underflow_fast() {
             &mut traces.memw,
             &mut traces.load,
             &mut traces.decode,
+            &mut traces.mul,
             &mut traces.branch,
             &mut traces.halt
         ),
@@ -334,6 +345,7 @@ fn test_prove_elfs_subw_fast() {
             &mut traces.memw,
             &mut traces.load,
             &mut traces.decode,
+            &mut traces.mul,
             &mut traces.branch,
             &mut traces.halt
         ),
@@ -360,6 +372,7 @@ fn test_prove_elfs_arith_lui_8() {
             &mut traces.memw,
             &mut traces.load,
             &mut traces.decode,
+            &mut traces.mul,
             &mut traces.branch,
             &mut traces.halt
         ),
@@ -386,6 +399,7 @@ fn test_prove_elfs_arith_8() {
             &mut traces.memw,
             &mut traces.load,
             &mut traces.decode,
+            &mut traces.mul,
             &mut traces.branch,
             &mut traces.halt
         ),
@@ -415,6 +429,7 @@ fn test_prove_elfs_basic_arith_32() {
             &mut traces.memw,
             &mut traces.load,
             &mut traces.decode,
+            &mut traces.mul,
             &mut traces.branch,
             &mut traces.halt
         ),
@@ -453,6 +468,7 @@ fn test_prove_elfs_comprehensive() {
             &mut traces.memw,
             &mut traces.load,
             &mut traces.decode,
+            &mut traces.mul,
             &mut traces.branch,
             &mut traces.halt
         ),
@@ -478,6 +494,7 @@ fn test_prove_elfs_test_add_8() {
             &mut traces.memw,
             &mut traces.load,
             &mut traces.decode,
+            &mut traces.mul,
             &mut traces.branch,
             &mut traces.halt
         ),
@@ -497,6 +514,7 @@ fn test_prove_elfs_test_sub_8() {
             &mut traces.memw,
             &mut traces.load,
             &mut traces.decode,
+            &mut traces.mul,
             &mut traces.branch,
             &mut traces.halt
         ),
@@ -516,6 +534,7 @@ fn test_prove_elfs_test_addw_8() {
             &mut traces.memw,
             &mut traces.load,
             &mut traces.decode,
+            &mut traces.mul,
             &mut traces.branch,
             &mut traces.halt
         ),
@@ -536,6 +555,7 @@ fn test_prove_elfs_test_subw_8() {
             &mut traces.memw,
             &mut traces.load,
             &mut traces.decode,
+            &mut traces.mul,
             &mut traces.branch,
             &mut traces.halt
         ),
@@ -556,6 +576,7 @@ fn test_prove_elfs_test_addw_lui_8() {
             &mut traces.memw,
             &mut traces.load,
             &mut traces.decode,
+            &mut traces.mul,
             &mut traces.branch,
             &mut traces.halt
         ),
@@ -576,6 +597,7 @@ fn test_prove_elfs_test_subw_lui_8() {
             &mut traces.memw,
             &mut traces.load,
             &mut traces.decode,
+            &mut traces.mul,
             &mut traces.branch,
             &mut traces.halt
         ),
@@ -596,6 +618,7 @@ fn test_prove_elfs_test_add_neg_8() {
             &mut traces.memw,
             &mut traces.load,
             &mut traces.decode,
+            &mut traces.mul,
             &mut traces.branch,
             &mut traces.halt
         ),
@@ -616,6 +639,7 @@ fn test_prove_elfs_test_sub_neg_8() {
             &mut traces.memw,
             &mut traces.load,
             &mut traces.decode,
+            &mut traces.mul,
             &mut traces.branch,
             &mut traces.halt
         ),
@@ -636,6 +660,7 @@ fn test_prove_elfs_test_mul_8() {
             &mut traces.memw,
             &mut traces.load,
             &mut traces.decode,
+            &mut traces.mul,
             &mut traces.branch,
             &mut traces.halt
         ),
@@ -656,6 +681,7 @@ fn test_prove_elfs_test_div_8() {
             &mut traces.memw,
             &mut traces.load,
             &mut traces.decode,
+            &mut traces.mul,
             &mut traces.branch,
             &mut traces.halt
         ),
@@ -676,6 +702,7 @@ fn test_prove_elfs_test_shift_8() {
             &mut traces.memw,
             &mut traces.load,
             &mut traces.decode,
+            &mut traces.mul,
             &mut traces.branch,
             &mut traces.halt
         ),
@@ -696,6 +723,7 @@ fn test_prove_elfs_test_bitwise_8() {
             &mut traces.memw,
             &mut traces.load,
             &mut traces.decode,
+            &mut traces.mul,
             &mut traces.branch,
             &mut traces.halt
         ),
@@ -725,6 +753,7 @@ fn test_prove_elfs_test_slt_8() {
             &mut traces.memw,
             &mut traces.load,
             &mut traces.decode,
+            &mut traces.mul,
             &mut traces.branch,
             &mut traces.halt
         ),
@@ -749,6 +778,7 @@ fn test_prove_elfs_test_xor_8() {
             &mut traces.memw,
             &mut traces.load,
             &mut traces.decode,
+            &mut traces.mul,
             &mut traces.branch,
             &mut traces.halt
         ),
@@ -768,6 +798,7 @@ fn test_prove_elfs_test_lb_lh_8() {
             &mut traces.memw,
             &mut traces.load,
             &mut traces.decode,
+            &mut traces.mul,
             &mut traces.branch,
             &mut traces.halt
         ),
@@ -788,6 +819,7 @@ fn test_prove_elfs_test_sb_sh_8() {
             &mut traces.memw,
             &mut traces.load,
             &mut traces.decode,
+            &mut traces.mul,
             &mut traces.branch,
             &mut traces.halt
         ),
@@ -817,6 +849,7 @@ fn test_prove_elfs_all_branches_16() {
             &mut traces.memw,
             &mut traces.load,
             &mut traces.decode,
+            &mut traces.mul,
             &mut traces.branch,
             &mut traces.halt
         ),
@@ -837,6 +870,7 @@ fn test_prove_elfs_all_loadstore_32() {
             &mut traces.memw,
             &mut traces.load,
             &mut traces.decode,
+            &mut traces.mul,
             &mut traces.branch,
             &mut traces.halt
         ),
@@ -870,6 +904,7 @@ fn test_prove_elfs_all_instructions_64() {
             &mut traces.memw,
             &mut traces.load,
             &mut traces.decode,
+            &mut traces.mul,
             &mut traces.branch,
             &mut traces.halt
         ),
@@ -910,6 +945,7 @@ fn test_prove_elfs_all_instructions_64_full() {
             &mut traces.memw,
             &mut traces.load,
             &mut traces.decode,
+            &mut traces.mul,
             &mut traces.branch,
             &mut traces.halt,
             &elf,
@@ -950,6 +986,7 @@ fn test_dhat_memory_profile() {
             &mut traces.memw,
             &mut traces.load,
             &mut traces.decode,
+            &mut traces.mul,
             &mut traces.branch,
             &mut traces.halt
         ),

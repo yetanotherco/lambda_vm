@@ -33,7 +33,7 @@ use crate::tables::bitwise;
 use crate::tables::trace_builder::Traces;
 use crate::test_utils::{
     E, F, create_bitwise_air, create_branch_air, create_cpu_air, create_decode_air,
-    create_halt_air, create_load_air, create_lt_air, create_memw_air,
+    create_halt_air, create_load_air, create_lt_air, create_memw_air, create_mul_air,
 };
 
 use stark::proof::options::ProofOptions;
@@ -90,6 +90,7 @@ pub fn prove(elf_bytes: &[u8]) -> Result<MultiProof<F, E, ()>, Error> {
     let memw_air = create_memw_air(&proof_options);
     let load_air = create_load_air(&proof_options);
     let decode_air = create_decode_air(&proof_options);
+    let mul_air = create_mul_air(&proof_options);
     let branch_air = create_branch_air(&proof_options);
     let halt_air = create_halt_air(&proof_options);
 
@@ -104,6 +105,7 @@ pub fn prove(elf_bytes: &[u8]) -> Result<MultiProof<F, E, ()>, Error> {
         (&memw_air, &mut traces.memw, &()),
         (&load_air, &mut traces.load, &()),
         (&decode_air, &mut traces.decode, &()),
+        (&mul_air, &mut traces.mul, &()),
         (&branch_air, &mut traces.branch, &()),
         (&halt_air, &mut traces.halt, &()),
     ];
@@ -124,6 +126,7 @@ pub fn verify(proof: &MultiProof<F, E, ()>) -> bool {
     let memw_air = create_memw_air(&proof_options);
     let load_air = create_load_air(&proof_options);
     let decode_air = create_decode_air(&proof_options);
+    let mul_air = create_mul_air(&proof_options);
     let branch_air = create_branch_air(&proof_options);
     let halt_air = create_halt_air(&proof_options);
 
@@ -134,6 +137,7 @@ pub fn verify(proof: &MultiProof<F, E, ()>) -> bool {
         &memw_air,
         &load_air,
         &decode_air,
+        &mul_air,
         &branch_air,
         &halt_air,
     ];
