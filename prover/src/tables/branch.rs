@@ -49,6 +49,7 @@ pub mod cols {
     pub const PC_1: usize = 1;
 
     // Input columns: offset (DWordWL = 2 Words, sign-extended from CPU's imm)
+    // NOTE: This offset representation differs from the one used in the spec.
     /// offset[0]: Word (bits 0-31)
     pub const OFFSET_0: usize = 2;
     /// offset[1]: Word (bits 32-63)
