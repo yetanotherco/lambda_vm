@@ -66,7 +66,8 @@ loop:
 	addi	zero, zero, 0		# NOP 25
 	addi	zero, zero, 0		# NOP 26
 	addi	zero, zero, 0		# NOP 27
-	jalr	zero, 0(zero)		# 28: Halt
+	li	a7, 5
+	ecall		# 28: Halt
 
 	# Verification:
 	# Setup: 4 instructions

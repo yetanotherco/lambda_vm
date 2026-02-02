@@ -421,7 +421,7 @@ pub fn update_multiplicities(
 /// - Constraint satisfaction
 /// - LogUp protocol correctness
 #[cfg(test)]
-pub fn trim_zero_rows(
+pub(crate) fn trim_zero_rows(
     trace: TraceTable<GoldilocksField, GoldilocksExtension>,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     use super::types::FE;

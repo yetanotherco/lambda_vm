@@ -37,7 +37,7 @@ jobs:
 
       - name: Run memory profile
         run: |
-          cargo test -p prover --release --features dhat-heap \
+          cargo test -p lambda-vm-prover --release --features dhat-heap \
             test_dhat_memory_profile -- --ignored --nocapture 2>&1 | tee profile-output.txt
           # Move dhat-heap.json to root for easier access
           mv prover/dhat-heap.json ./dhat-heap.json

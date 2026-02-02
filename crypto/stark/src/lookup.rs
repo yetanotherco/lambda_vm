@@ -317,6 +317,16 @@ pub enum LinearTerm {
         /// The column index to read from
         column: usize,
     },
+    /// coefficient * column_value (unsigned, for large field elements like inverses)
+    ///
+    /// Use this when the coefficient is a large field element (e.g., 2^-32 mod p)
+    /// that doesn't fit in i64.
+    ColumnUnsigned {
+        /// The multiplier as an unsigned value (for large field elements)
+        coefficient: u64,
+        /// The column index to read from
+        column: usize,
+    },
     /// A constant value to add (signed to support subtraction)
     Constant(i64),
 }
@@ -391,6 +401,7 @@ impl BusValue {
                 .iter()
                 .filter_map(|term| match term {
                     LinearTerm::Column { column, .. } => Some(*column),
+                    LinearTerm::ColumnUnsigned { column, .. } => Some(*column),
                     LinearTerm::Constant(_) => None,
                 })
                 .collect(),
@@ -432,6 +443,14 @@ impl BusValue {
                             } else {
                                 -FieldElement::<E>::from((-*coefficient) as u64)
                             };
+                            result += get_column(*column) * coeff;
+                        }
+                        LinearTerm::ColumnUnsigned {
+                            coefficient,
+                            column,
+                        } => {
+                            // Unsigned coefficient (for large field elements)
+                            let coeff = FieldElement::<E>::from(*coefficient);
                             result += get_column(*column) * coeff;
                         }
                         LinearTerm::Constant(value) => {
@@ -955,6 +974,13 @@ fn build_logup_term_column<F, E>(
                             };
                             result += &main_segment_cols[*column][row] * coeff;
                         }
+                        LinearTerm::ColumnUnsigned {
+                            coefficient,
+                            column,
+                        } => {
+                            let coeff = FieldElement::<F>::from(*coefficient);
+                            result += &main_segment_cols[*column][row] * coeff;
+                        }
                         LinearTerm::Constant(value) => {
                             if *value >= 0 {
                                 result += FieldElement::<F>::from(*value as u64);
@@ -1115,6 +1141,13 @@ where
                                 } else {
                                     -FieldElement::<A>::from((-*coefficient) as u64)
                                 };
+                                result += step.get_main_evaluation_element(0, *column) * coeff;
+                            }
+                            LinearTerm::ColumnUnsigned {
+                                coefficient,
+                                column,
+                            } => {
+                                let coeff = FieldElement::<A>::from(*coefficient);
                                 result += step.get_main_evaluation_element(0, *column) * coeff;
                             }
                             LinearTerm::Constant(value) => {

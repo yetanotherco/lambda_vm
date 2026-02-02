@@ -4,6 +4,7 @@
 main:
 	li	a2, -2            # load -2
 	xori	a0, a2, -1        # XOR with -1 gives 1 (bit flip)
-	jalr	zero, 0(ra)
+	li	a7, 5
+	ecall
 .Lfunc_end1:
 	.size	main, .Lfunc_end1-main

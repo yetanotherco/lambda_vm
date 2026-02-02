@@ -9,4 +9,5 @@ main:
 	sub	a2, t0, t0		# 5. -1 - (-1) = 0
 	sub	a3, zero, t0		# 6. 0 - (-1) = 1
 	sub	a4, t0, zero		# 7. -1 - 0 = -1
-	jalr	zero, 0(zero)		# 8. Return
+	li	a7, 5
+	ecall		# 8. Return
