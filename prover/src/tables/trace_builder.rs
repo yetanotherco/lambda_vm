@@ -766,7 +766,10 @@ impl Traces {
                 let rhs_signed = op.decode.mp_selector;
                 let rhs = op.compute_arg2();
                 let wants_hi = op.decode.muldiv_selector;
-                (MulOperation::new(lhs, lhs_signed, rhs, rhs_signed), wants_hi)
+                (
+                    MulOperation::new(lhs, lhs_signed, rhs, rhs_signed),
+                    wants_hi,
+                )
             })
             .collect();
 

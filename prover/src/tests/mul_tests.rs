@@ -295,4 +295,3 @@ fn test_identity_multiplication() {
     assert_eq!(lo, 12345);
     assert_eq!(hi, 0);
 }
-

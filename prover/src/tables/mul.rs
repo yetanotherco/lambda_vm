@@ -441,9 +441,18 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusId::IsB20,
         Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
         vec![BusValue::linear(vec![
-            LinearTerm::ColumnUnsigned { coefficient: INV_2_32, column: cols::RAW_PRODUCT_0 },
-            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_32, column: cols::LO_0 },
-            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_16, column: cols::LO_1 },
+            LinearTerm::ColumnUnsigned {
+                coefficient: INV_2_32,
+                column: cols::RAW_PRODUCT_0,
+            },
+            LinearTerm::ColumnUnsigned {
+                coefficient: NEG_INV_2_32,
+                column: cols::LO_0,
+            },
+            LinearTerm::ColumnUnsigned {
+                coefficient: NEG_INV_2_16,
+                column: cols::LO_1,
+            },
         ])],
     ));
 
@@ -453,12 +462,30 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusId::IsB20,
         Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
         vec![BusValue::linear(vec![
-            LinearTerm::ColumnUnsigned { coefficient: INV_2_32, column: cols::RAW_PRODUCT_1 },
-            LinearTerm::ColumnUnsigned { coefficient: INV_2_64, column: cols::RAW_PRODUCT_0 },
-            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_64, column: cols::LO_0 },
-            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_48, column: cols::LO_1 },
-            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_32, column: cols::LO_2 },
-            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_16, column: cols::LO_3 },
+            LinearTerm::ColumnUnsigned {
+                coefficient: INV_2_32,
+                column: cols::RAW_PRODUCT_1,
+            },
+            LinearTerm::ColumnUnsigned {
+                coefficient: INV_2_64,
+                column: cols::RAW_PRODUCT_0,
+            },
+            LinearTerm::ColumnUnsigned {
+                coefficient: NEG_INV_2_64,
+                column: cols::LO_0,
+            },
+            LinearTerm::ColumnUnsigned {
+                coefficient: NEG_INV_2_48,
+                column: cols::LO_1,
+            },
+            LinearTerm::ColumnUnsigned {
+                coefficient: NEG_INV_2_32,
+                column: cols::LO_2,
+            },
+            LinearTerm::ColumnUnsigned {
+                coefficient: NEG_INV_2_16,
+                column: cols::LO_3,
+            },
         ])],
     ));
 
@@ -469,15 +496,42 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusId::IsB20,
         Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
         vec![BusValue::linear(vec![
-            LinearTerm::ColumnUnsigned { coefficient: INV_2_32, column: cols::RAW_PRODUCT_2 },
-            LinearTerm::ColumnUnsigned { coefficient: INV_2_64, column: cols::RAW_PRODUCT_1 },
-            LinearTerm::ColumnUnsigned { coefficient: INV_2_96, column: cols::RAW_PRODUCT_0 },
-            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_96, column: cols::LO_0 },
-            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_80, column: cols::LO_1 },
-            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_64, column: cols::LO_2 },
-            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_48, column: cols::LO_3 },
-            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_32, column: cols::HI_0 },
-            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_16, column: cols::HI_1 },
+            LinearTerm::ColumnUnsigned {
+                coefficient: INV_2_32,
+                column: cols::RAW_PRODUCT_2,
+            },
+            LinearTerm::ColumnUnsigned {
+                coefficient: INV_2_64,
+                column: cols::RAW_PRODUCT_1,
+            },
+            LinearTerm::ColumnUnsigned {
+                coefficient: INV_2_96,
+                column: cols::RAW_PRODUCT_0,
+            },
+            LinearTerm::ColumnUnsigned {
+                coefficient: NEG_INV_2_96,
+                column: cols::LO_0,
+            },
+            LinearTerm::ColumnUnsigned {
+                coefficient: NEG_INV_2_80,
+                column: cols::LO_1,
+            },
+            LinearTerm::ColumnUnsigned {
+                coefficient: NEG_INV_2_64,
+                column: cols::LO_2,
+            },
+            LinearTerm::ColumnUnsigned {
+                coefficient: NEG_INV_2_48,
+                column: cols::LO_3,
+            },
+            LinearTerm::ColumnUnsigned {
+                coefficient: NEG_INV_2_32,
+                column: cols::HI_0,
+            },
+            LinearTerm::ColumnUnsigned {
+                coefficient: NEG_INV_2_16,
+                column: cols::HI_1,
+            },
         ])],
     ));
 
@@ -488,18 +542,54 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusId::IsB20,
         Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
         vec![BusValue::linear(vec![
-            LinearTerm::ColumnUnsigned { coefficient: INV_2_32, column: cols::RAW_PRODUCT_3 },
-            LinearTerm::ColumnUnsigned { coefficient: INV_2_64, column: cols::RAW_PRODUCT_2 },
-            LinearTerm::ColumnUnsigned { coefficient: INV_2_96, column: cols::RAW_PRODUCT_1 },
-            LinearTerm::ColumnUnsigned { coefficient: INV_2_128, column: cols::RAW_PRODUCT_0 },
-            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_128, column: cols::LO_0 },
-            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_112, column: cols::LO_1 },
-            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_96, column: cols::LO_2 },
-            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_80, column: cols::LO_3 },
-            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_64, column: cols::HI_0 },
-            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_48, column: cols::HI_1 },
-            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_32, column: cols::HI_2 },
-            LinearTerm::ColumnUnsigned { coefficient: NEG_INV_2_16, column: cols::HI_3 },
+            LinearTerm::ColumnUnsigned {
+                coefficient: INV_2_32,
+                column: cols::RAW_PRODUCT_3,
+            },
+            LinearTerm::ColumnUnsigned {
+                coefficient: INV_2_64,
+                column: cols::RAW_PRODUCT_2,
+            },
+            LinearTerm::ColumnUnsigned {
+                coefficient: INV_2_96,
+                column: cols::RAW_PRODUCT_1,
+            },
+            LinearTerm::ColumnUnsigned {
+                coefficient: INV_2_128,
+                column: cols::RAW_PRODUCT_0,
+            },
+            LinearTerm::ColumnUnsigned {
+                coefficient: NEG_INV_2_128,
+                column: cols::LO_0,
+            },
+            LinearTerm::ColumnUnsigned {
+                coefficient: NEG_INV_2_112,
+                column: cols::LO_1,
+            },
+            LinearTerm::ColumnUnsigned {
+                coefficient: NEG_INV_2_96,
+                column: cols::LO_2,
+            },
+            LinearTerm::ColumnUnsigned {
+                coefficient: NEG_INV_2_80,
+                column: cols::LO_3,
+            },
+            LinearTerm::ColumnUnsigned {
+                coefficient: NEG_INV_2_64,
+                column: cols::HI_0,
+            },
+            LinearTerm::ColumnUnsigned {
+                coefficient: NEG_INV_2_48,
+                column: cols::HI_1,
+            },
+            LinearTerm::ColumnUnsigned {
+                coefficient: NEG_INV_2_32,
+                column: cols::HI_2,
+            },
+            LinearTerm::ColumnUnsigned {
+                coefficient: NEG_INV_2_16,
+                column: cols::HI_3,
+            },
         ])],
     ));
 
@@ -621,7 +711,9 @@ impl MulConstraint {
         match self.kind {
             MulConstraintKind::LhsSign => {
                 // (1 - lhs_signed) * lhs_is_negative = 0
-                let lhs_signed = step.get_main_evaluation_element(0, cols::LHS_SIGNED).clone();
+                let lhs_signed = step
+                    .get_main_evaluation_element(0, cols::LHS_SIGNED)
+                    .clone();
                 let lhs_is_neg = step
                     .get_main_evaluation_element(0, cols::LHS_IS_NEGATIVE)
                     .clone();
@@ -630,7 +722,9 @@ impl MulConstraint {
             }
             MulConstraintKind::RhsSign => {
                 // (1 - rhs_signed) * rhs_is_negative = 0
-                let rhs_signed = step.get_main_evaluation_element(0, cols::RHS_SIGNED).clone();
+                let rhs_signed = step
+                    .get_main_evaluation_element(0, cols::RHS_SIGNED)
+                    .clone();
                 let rhs_is_neg = step
                     .get_main_evaluation_element(0, cols::RHS_IS_NEGATIVE)
                     .clone();
@@ -806,12 +900,7 @@ pub fn mul_constraints(constraint_idx_start: usize) -> (Vec<MulConstraint>, usiz
 /// This is used by tests to verify the reduce-and-carry logic.
 pub fn compute_carries(lo: u64, hi: u64, raw_products: &[u64; 4]) -> [u64; 4] {
     // res[0..4] = [lo_word0, lo_word1, hi_word0, hi_word1]
-    let res = [
-        lo & 0xFFFF_FFFF,
-        lo >> 32,
-        hi & 0xFFFF_FFFF,
-        hi >> 32,
-    ];
+    let res = [lo & 0xFFFF_FFFF, lo >> 32, hi & 0xFFFF_FFFF, hi >> 32];
 
     let mut carries = [0u64; 4];
 
