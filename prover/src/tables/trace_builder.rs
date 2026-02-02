@@ -18,7 +18,7 @@
 //! ## Usage
 //!
 //! ```ignore
-//! use prover::tables::trace_builder::Traces;
+//! use lambda_vm_prover::tables::trace_builder::Traces;
 //!
 //! let traces = Traces::from_logs(&logs, instructions)?;
 //! // Use traces.cpu, traces.bitwise, traces.lt, traces.memw, traces.load
@@ -39,8 +39,9 @@ use super::halt;
 use super::load::{self, LoadOperation};
 use super::lt::{self, LtOperation};
 use super::memw::{self, MemwOperation};
+use super::mul::{self, MulOperation};
 use super::types::{GoldilocksExtension, GoldilocksField};
-use crate::ProverError;
+use crate::Error;
 
 // =============================================================================
 // Memory and Register State Tracking
@@ -159,7 +160,7 @@ fn pack_register_value(value: u64) -> [u64; 8] {
 fn collect_cpu_ops(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,
-) -> Result<Vec<CpuOperation>, ProverError> {
+) -> Result<Vec<CpuOperation>, Error> {
     let mut cpu_ops = Vec::with_capacity(logs.len());
 
     // Timestamps start at 4 (not 0) to ensure old_timestamp < timestamp holds
@@ -169,7 +170,7 @@ fn collect_cpu_ops(
         let instruction = instructions
             .get(&log.current_pc)
             .copied()
-            .ok_or(ProverError::MissingInstruction(log.current_pc))?;
+            .ok_or(Error::MissingInstruction(log.current_pc))?;
 
         let op = CpuOperation::from_log_and_instruction(log, timestamp, instruction);
         cpu_ops.push(op);
@@ -534,6 +535,78 @@ fn collect_bitwise_from_lt(lt_ops: &[LtOperation]) -> Vec<BitwiseOperation> {
     bitwise_ops
 }
 
+/// Collects bitwise lookups from MUL operations (MSB16 for sign bits).
+///
+/// MUL sends MSB16 lookups when signed=1 to extract sign bits,
+/// IS_HALF lookups for lo/hi range checks, and IS_B20 lookups for carry range checks.
+///
+/// Returns: Vec of bitwise lookups
+fn collect_bitwise_from_mul(mul_ops: &[(MulOperation, bool)]) -> Vec<BitwiseOperation> {
+    // MSB16: up to 2 per op, IS_HALF: 8 per op (4 lo + 4 hi), IS_B20: 4 per op (carries)
+    let mut bitwise_ops = Vec::with_capacity(mul_ops.len() * 14);
+
+    for (op, _wants_hi) in mul_ops {
+        // MSB16[lhs[3]] when lhs_signed=1
+        if op.lhs_signed {
+            let lhs_3 = ((op.lhs >> 48) & 0xFFFF) as u16;
+            bitwise_ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::Msb16,
+                (lhs_3 & 0xFF) as u8,
+                (lhs_3 >> 8) as u8,
+            ));
+        }
+
+        // MSB16[rhs[3]] when rhs_signed=1
+        if op.rhs_signed {
+            let rhs_3 = ((op.rhs >> 48) & 0xFFFF) as u16;
+            bitwise_ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::Msb16,
+                (rhs_3 & 0xFF) as u8,
+                (rhs_3 >> 8) as u8,
+            ));
+        }
+
+        // IS_HALF for lo[0..4] and hi[0..4] with multiplicity 1 per operation
+        // MUL table sends with mu_sum = mu_lo + mu_hi; since we iterate original ops,
+        // each operation contributes 1 to the sum.
+        let (lo, hi) = op.compute_product();
+
+        // IS_HALF for lo halfwords
+        for shift in [0, 16, 32, 48] {
+            let half = ((lo >> shift) & 0xFFFF) as u16;
+            bitwise_ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
+                (half & 0xFF) as u8,
+                (half >> 8) as u8,
+            ));
+        }
+
+        // IS_HALF for hi halfwords
+        for shift in [0, 16, 32, 48] {
+            let half = ((hi >> shift) & 0xFFFF) as u16;
+            bitwise_ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
+                (half & 0xFF) as u8,
+                (half >> 8) as u8,
+            ));
+        }
+
+        // IS_B20 for carry[0..4] range checks
+        let raw_products = op.compute_raw_products();
+        let carries = mul::compute_carries(lo, hi, &raw_products);
+        for carry in carries {
+            // IS_B20 takes a 20-bit value packed as X + 256*Y + 65536*Z
+            // where X, Y are bytes and Z is a 4-bit nibble
+            let x = (carry & 0xFF) as u8;
+            let y = ((carry >> 8) & 0xFF) as u8;
+            let z = ((carry >> 16) & 0xF) as u8;
+            bitwise_ops.push(BitwiseOperation::b20(x, y, z));
+        }
+    }
+
+    bitwise_ops
+}
+
 /// Collects IS_HALFWORD lookups from MEMW address_add columns.
 ///
 /// Returns: Vec of bitwise lookups
@@ -644,6 +717,9 @@ pub struct Traces {
     /// DECODE instruction decoding table
     pub decode: TraceTable<GoldilocksField, GoldilocksExtension>,
 
+    /// MUL multiplication trace
+    pub mul: TraceTable<GoldilocksField, GoldilocksExtension>,
+
     /// BRANCH target calculation trace
     pub branch: TraceTable<GoldilocksField, GoldilocksExtension>,
 
@@ -660,53 +736,9 @@ impl Traces {
     /// 3. MEMW → LT operations (timestamp ordering)
     /// 4. LT, MEMW, Branch → Bitwise lookups
     /// 5. Generate all traces
-    pub fn from_logs(
-        logs: &[Log],
-        instructions: U64HashMap<Instruction>,
-    ) -> Result<Self, ProverError> {
+    pub fn from_logs(logs: &[Log], instructions: U64HashMap<Instruction>) -> Result<Self, Error> {
         // Full trace generation always requires halt (ECALL instruction)
         Self::from_logs_inner(logs, instructions, true)
-    }
-
-    /// Generates all traces with a trimmed bitwise table (TEST ONLY).
-    ///
-    /// # WARNING: UNSOUND FOR PRODUCTION
-    ///
-    /// This function generates the full 2^20 row bitwise table, updates multiplicities,
-    /// then removes rows where all multiplicity columns are zero. This is **unsound**
-    /// because:
-    ///
-    /// 1. The bitwise table is NOT preprocessed - the verifier checks the prover's
-    ///    commitment instead of a hardcoded trusted commitment
-    /// 2. A malicious prover could provide incorrect bitwise results and the
-    ///    verifier would accept them (e.g., claim 5 AND 3 = 7)
-    /// 3. The table structure differs from production (row indices don't match)
-    ///
-    /// This is acceptable for tests because we're testing:
-    /// - Bus interaction balancing (sends = receives)
-    /// - Constraint satisfaction
-    /// - LogUp protocol correctness
-    ///
-    /// The full preprocessed bitwise verification is tested separately in the
-    /// comprehensive `test_prove_elfs_all_instructions_64_full` test.
-    #[cfg(test)]
-    pub fn from_logs_trimmed(
-        logs: &[Log],
-        instructions: U64HashMap<Instruction>,
-    ) -> Result<Self, ProverError> {
-        // Use from_logs_segment with is_final_segment=true to require ECALL
-        Self::from_logs_segment(logs, instructions, true)
-    }
-
-    /// Generates all traces with a minimal bitwise table (TEST ONLY).
-    ///
-    /// Alias for `from_logs_trimmed` for backwards compatibility.
-    #[cfg(test)]
-    pub fn from_logs_minimal(
-        logs: &[Log],
-        instructions: U64HashMap<Instruction>,
-    ) -> Result<Self, ProverError> {
-        Self::from_logs_trimmed(logs, instructions)
     }
 
     /// Generates all traces for a segment with optional halt table (TEST ONLY).
@@ -734,7 +766,7 @@ impl Traces {
         logs: &[Log],
         instructions: U64HashMap<Instruction>,
         is_final_segment: bool,
-    ) -> Result<Self, ProverError> {
+    ) -> Result<Self, Error> {
         // Generate full traces (including full 2^20 bitwise table with multiplicities)
         let mut traces = Self::from_logs_inner(logs, instructions, is_final_segment)?;
 
@@ -749,7 +781,7 @@ impl Traces {
         logs: &[Log],
         instructions: U64HashMap<Instruction>,
         require_halt: bool,
-    ) -> Result<Self, ProverError> {
+    ) -> Result<Self, Error> {
         // =====================================================================
         // PHASE 1: Logs → CPU operations
         // =====================================================================
@@ -763,6 +795,25 @@ impl Traces {
         let mut register_state = RegisterState::new();
         let (memw_ops, load_ops, mut lt_ops, mut bitwise_ops) =
             collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
+
+        // Collect MUL operations from CPU ops where op_mul = true
+        let mul_ops: Vec<(MulOperation, bool)> = cpu_ops
+            .iter()
+            .filter(|op| op.decode.op_mul)
+            .map(|op| {
+                let lhs = op.compute_arg1();
+                let lhs_signed = op.decode.signed;
+                // rhs_signed = mp_selector per spec CPU-CA44:
+                // MUL/MULH have mp_selector=1 (both signed), MULHU/MULHSU have mp_selector=0 (rhs unsigned)
+                let rhs_signed = op.decode.mp_selector;
+                let rhs = op.compute_arg2();
+                let wants_hi = op.decode.muldiv_selector;
+                (
+                    MulOperation::new(lhs, lhs_signed, rhs, rhs_signed),
+                    wants_hi,
+                )
+            })
+            .collect();
 
         // Collect BRANCH operations from CPU ops where branch_cond = true
         let branch_ops: Vec<BranchOperation> = cpu_ops
@@ -788,6 +839,7 @@ impl Traces {
         // =====================================================================
         bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
         bitwise_ops.extend(collect_bitwise_from_memw(&memw_ops));
+        bitwise_ops.extend(collect_bitwise_from_mul(&mul_ops));
         bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
 
         // =====================================================================
@@ -801,7 +853,7 @@ impl Traces {
                 .iter()
                 .rev()
                 .find(|op| op.decode.op_ecall)
-                .ok_or(ProverError::MissingEcall)?;
+                .ok_or(Error::MissingHaltEcall)?;
             halt::generate_halt_trace(halt_op.timestamp)
         } else {
             // Intermediate segment: generate placeholder halt trace (timestamp 0)
@@ -813,6 +865,7 @@ impl Traces {
         let lt = lt::generate_lt_trace(&lt_ops);
         let memw = memw::generate_memw_trace(&memw_ops);
         let load = load::generate_load_trace(&load_ops);
+        let mul = mul::generate_mul_trace(&mul_ops);
         let branch = branch::generate_branch_trace(&branch_ops);
 
         let mut bitwise = bitwise::generate_bitwise_trace();
@@ -834,8 +887,50 @@ impl Traces {
             memw,
             load,
             decode,
+            mul,
             branch,
             halt: halt_trace,
         })
+    }
+
+    /// Generates all traces with a trimmed bitwise table (TEST ONLY).
+    ///
+    /// # WARNING: UNSOUND FOR PRODUCTION
+    ///
+    /// This function generates the full 2^20 row bitwise table, updates multiplicities,
+    /// then removes rows where all multiplicity columns are zero. This is **unsound**
+    /// because:
+    ///
+    /// 1. The bitwise table is NOT preprocessed - the verifier checks the prover's
+    ///    commitment instead of a hardcoded trusted commitment
+    /// 2. A malicious prover could provide incorrect bitwise results and the
+    ///    verifier would accept them (e.g., claim 5 AND 3 = 7)
+    /// 3. The table structure differs from production (row indices don't match)
+    ///
+    /// This is acceptable for tests because we're testing:
+    /// - Bus interaction balancing (sends = receives)
+    /// - Constraint satisfaction
+    /// - LogUp protocol correctness
+    ///
+    /// The full preprocessed bitwise verification is tested separately in the
+    /// comprehensive `test_prove_elfs_all_instructions_64_full` test.
+    #[cfg(test)]
+    pub fn from_logs_trimmed(
+        logs: &[Log],
+        instructions: U64HashMap<Instruction>,
+    ) -> Result<Self, Error> {
+        // Use from_logs_segment with is_final_segment=true to require ECALL
+        Self::from_logs_segment(logs, instructions, true)
+    }
+
+    /// Generates all traces with a minimal bitwise table (TEST ONLY).
+    ///
+    /// Alias for `from_logs_trimmed` for backwards compatibility.
+    #[cfg(test)]
+    pub fn from_logs_minimal(
+        logs: &[Log],
+        instructions: U64HashMap<Instruction>,
+    ) -> Result<Self, Error> {
+        Self::from_logs_trimmed(logs, instructions)
     }
 }
