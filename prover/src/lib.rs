@@ -7,7 +7,7 @@
 //! ```ignore
 //! let elf_bytes = std::fs::read("program.elf").unwrap();
 //! let proof = lambda_vm_prover::prove(&elf_bytes).unwrap();
-//! assert!(lambda_vm_prover::verify(&proof));
+//! assert!(lambda_vm_prover::verify(&proof, &elf_bytes).unwrap());
 //! ```
 
 #[cfg(feature = "dhat-heap")]
@@ -30,9 +30,10 @@ use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
 use crate::tables::bitwise;
+use crate::tables::decode;
 use crate::tables::trace_builder::Traces;
 use crate::test_utils::{
-    E, F, create_bitwise_air, create_branch_air, create_cpu_air, create_decode_air,
+    E, F, VmAir, create_bitwise_air, create_branch_air, create_cpu_air, create_decode_air,
     create_halt_air, create_load_air, create_lt_air, create_memw_air, create_mul_air,
 };
 
@@ -70,6 +71,37 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// Create all VM AIR instances. `minimal_bitwise` controls whether the full
+/// 2^20 bitwise preprocessed table is included (false = full, true = minimal).
+/// DECODE is always preprocessed.
+pub(crate) fn create_vm_airs(
+    elf: &Elf,
+    proof_options: &ProofOptions,
+    minimal_bitwise: bool,
+) -> (VmAir, VmAir, VmAir, VmAir, VmAir, VmAir, VmAir, VmAir, VmAir) {
+    let cpu_air = create_cpu_air(proof_options);
+    let bitwise_air = if minimal_bitwise {
+        create_bitwise_air(proof_options)
+    } else {
+        create_bitwise_air(proof_options).with_preprocessed(
+            bitwise::preprocessed_commitment(),
+            bitwise::NUM_PRECOMPUTED_COLS,
+        )
+    };
+    let lt_air = create_lt_air(proof_options);
+    let memw_air = create_memw_air(proof_options);
+    let load_air = create_load_air(proof_options);
+    let decode_air = create_decode_air(proof_options).with_preprocessed(
+        decode::commitment_from_elf(elf, proof_options)
+            .expect("Failed to compute decode commitment"),
+        decode::NUM_PRECOMPUTED_COLS,
+    );
+    let mul_air = create_mul_air(proof_options);
+    let branch_air = create_branch_air(proof_options);
+    let halt_air = create_halt_air(proof_options);
+    (cpu_air, bitwise_air, lt_air, memw_air, load_air, decode_air, mul_air, branch_air, halt_air)
+}
+
 /// Prove an ELF binary execution. Returns a serializable proof.
 pub fn prove(elf_bytes: &[u8]) -> Result<MultiProof<F, E, ()>, Error> {
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
@@ -81,18 +113,8 @@ pub fn prove(elf_bytes: &[u8]) -> Result<MultiProof<F, E, ()>, Error> {
     let mut traces = Traces::from_logs(&result.logs, result.instructions)?;
 
     let proof_options = ProofOptions::default_test_options();
-    let cpu_air = create_cpu_air(&proof_options);
-    let bitwise_air = create_bitwise_air(&proof_options).with_preprocessed(
-        bitwise::preprocessed_commitment(),
-        bitwise::NUM_PRECOMPUTED_COLS,
-    );
-    let lt_air = create_lt_air(&proof_options);
-    let memw_air = create_memw_air(&proof_options);
-    let load_air = create_load_air(&proof_options);
-    let decode_air = create_decode_air(&proof_options);
-    let mul_air = create_mul_air(&proof_options);
-    let branch_air = create_branch_air(&proof_options);
-    let halt_air = create_halt_air(&proof_options);
+    let (cpu_air, bitwise_air, lt_air, memw_air, load_air, decode_air, mul_air, branch_air, halt_air) =
+        create_vm_airs(&program, &proof_options, false);
 
     let air_trace_pairs: Vec<(
         &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
@@ -115,20 +137,11 @@ pub fn prove(elf_bytes: &[u8]) -> Result<MultiProof<F, E, ()>, Error> {
 }
 
 /// Verify a proof produced by [`prove`].
-pub fn verify(proof: &MultiProof<F, E, ()>) -> bool {
+pub fn verify(proof: &MultiProof<F, E, ()>, elf_bytes: &[u8]) -> Result<bool, Error> {
+    let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let proof_options = ProofOptions::default_test_options();
-    let cpu_air = create_cpu_air(&proof_options);
-    let bitwise_air = create_bitwise_air(&proof_options).with_preprocessed(
-        bitwise::preprocessed_commitment(),
-        bitwise::NUM_PRECOMPUTED_COLS,
-    );
-    let lt_air = create_lt_air(&proof_options);
-    let memw_air = create_memw_air(&proof_options);
-    let load_air = create_load_air(&proof_options);
-    let decode_air = create_decode_air(&proof_options);
-    let mul_air = create_mul_air(&proof_options);
-    let branch_air = create_branch_air(&proof_options);
-    let halt_air = create_halt_air(&proof_options);
+    let (cpu_air, bitwise_air, lt_air, memw_air, load_air, decode_air, mul_air, branch_air, halt_air) =
+        create_vm_airs(&program, &proof_options, false);
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
         &cpu_air,
@@ -142,11 +155,11 @@ pub fn verify(proof: &MultiProof<F, E, ()>) -> bool {
         &halt_air,
     ];
 
-    Verifier::multi_verify(&airs, proof, &mut DefaultTranscript::<E>::new(&[]))
+    Ok(Verifier::multi_verify(&airs, proof, &mut DefaultTranscript::<E>::new(&[])))
 }
 
 /// Prove and verify in one call (convenience).
 pub fn prove_and_verify(elf_bytes: &[u8]) -> Result<bool, Error> {
     let proof = prove(elf_bytes)?;
-    Ok(verify(&proof))
+    verify(&proof, elf_bytes)
 }
