@@ -2,7 +2,7 @@ name = "NEG"
 
 [[variables.input]]
 name = "x"
-type = "DWordWL"
+type = "DWordHL"
 desc = "value to compute negation of"
 
 [[variables.input]]
@@ -20,8 +20,8 @@ name = "carry"
 type = ["Bit", 2]
 desc = "carries of the addition $#`neg` + #`x`$."
 def = {idx="i", polys=[
-    {iter=0, poly=["*", ["^", 2, -32], ["+", ["idx", "x", 0], ["idx", "neg", 0]]]},
-    {iter=1, poly=["*", ["^", 2, -32], ["+", ["idx", "x", 1], ["idx", "neg", 1], ["idx", "carry", 0]]]}
+    {iter=0, poly=["*", ["^", 2, -32], ["+", ["idx", ["cast", "x", "DWordWL"], 0], ["idx", "neg", 0]]]},
+    {iter=1, poly=["*", ["^", 2, -32], ["+", ["idx", ["cast", "x", "DWordWL"], 1], ["idx", "neg", 1], ["idx", "carry", 0]]]}
 ]}
 
 
@@ -37,16 +37,17 @@ desc = "`IS_BIT<cond>`"
 name = "all"
 
 [[constraints.all]]
-kind = "arith"
-constraint = "$#`cond` => #`carry`_0 = #`carry`_1$"
-poly = ["*", "cond", ["-", ["idx", "carry", 0], ["idx", "carry", 1]]]
-ref = "neg:c:identical_carry"
-
-[[constraints.all]]
-kind = "template"
-tag = "IsZero"
+kind = "interaction"
+tag = "ZERO"
 input = [["+", ["idx", "x", 0], ["idx", "x", 1]]]
 output = ["not", ["idx", "carry", 0]]
 multiplicity = "cond"
-ref = "neg:c:carry"
+ref = "neg:c:carry_0"
 
+[[constraints.all]]
+kind = "interaction"
+tag = "ZERO"
+input = [["+", ["idx", "x", 0], ["idx", "x", 1], ["idx", "x", 2], ["idx", "x", 3]]]
+output = ["not", ["idx", "carry", 1]]
+multiplicity = "cond"
+ref = "neg:c:carry_1"

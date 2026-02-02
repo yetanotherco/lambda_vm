@@ -33,13 +33,7 @@ where `cond` is a bit value (i.e., lies in ${0, 1}$)  described by an expression
 
 == Constraints
 For `neg` to equal $-#`x`$, both values must add to $0 mod 2^64$.
-Zooming in on the addition, we find that the carry values of adding the limbs must both equal to $1$, except when $#`x` = 0$, in which case they should both be $0$.
-
-To this end, we require $#`carry`_0$ is $1$, unless $#`x` = 0$ (@neg:c:carry) and
-that both limbs of `carry` are identical (@neg:c:identical_carry ensuring).
-Of course, both constraints are conditional on $#`cond` = 1$.
-Lastly, note that this @neg:c:carry implicitly enforces that $#`carry`_0 in {0, 1}$, while @neg:c:identical_carry ensures $#`carry`_1$ must also be binary.
-
+This is constrained through the following:
 #render_constraint_table(chip, config)
 
 == Note
