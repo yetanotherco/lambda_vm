@@ -32,9 +32,8 @@ use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
 // Import shared utilities
 use crate::test_utils::{
-    create_bitwise_air, create_branch_air, create_cpu_air,
-    create_decode_air, create_halt_air, create_load_air,
-    create_lt_air, create_memw_air, run_asm_elf,
+    create_bitwise_air, create_branch_air, create_cpu_air, create_decode_air, create_halt_air,
+    create_load_air, create_lt_air, create_memw_air, run_asm_elf,
 };
 
 type F = GoldilocksField;

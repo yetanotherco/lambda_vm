@@ -876,9 +876,8 @@ fn test_decode_soundness_different_elf_rejected() {
     use crate::tables::trace_builder::Traces;
     use crate::tables::types::{GoldilocksExtension, GoldilocksField};
     use crate::test_utils::{
-        create_bitwise_air, create_branch_air, create_cpu_air,
-        create_decode_air, create_halt_air, create_load_air,
-        create_lt_air, create_memw_air,
+        create_bitwise_air, create_branch_air, create_cpu_air, create_decode_air, create_halt_air,
+        create_load_air, create_lt_air, create_memw_air,
     };
 
     type F = GoldilocksField;
@@ -1006,9 +1005,8 @@ fn test_decode_soundness_same_elf_accepted() {
     use crate::tables::trace_builder::Traces;
     use crate::tables::types::{GoldilocksExtension, GoldilocksField};
     use crate::test_utils::{
-        create_bitwise_air, create_branch_air, create_cpu_air,
-        create_decode_air, create_halt_air, create_load_air,
-        create_lt_air, create_memw_air,
+        create_bitwise_air, create_branch_air, create_cpu_air, create_decode_air, create_halt_air,
+        create_load_air, create_lt_air, create_memw_air,
     };
 
     type F = GoldilocksField;
