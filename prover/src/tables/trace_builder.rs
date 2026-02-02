@@ -18,7 +18,7 @@
 //! ## Usage
 //!
 //! ```ignore
-//! use prover::tables::trace_builder::Traces;
+//! use lambda_vm_prover::tables::trace_builder::Traces;
 //!
 //! let traces = Traces::from_logs(&logs, instructions)?;
 //! // Use traces.cpu, traces.bitwise, traces.lt, traces.memw, traces.load
@@ -41,7 +41,7 @@ use super::lt::{self, LtOperation};
 use super::memw::{self, MemwOperation};
 use super::mul::{self, MulOperation};
 use super::types::{GoldilocksExtension, GoldilocksField};
-use crate::ProverError;
+use crate::Error;
 
 // =============================================================================
 // Memory and Register State Tracking
@@ -160,7 +160,7 @@ fn pack_register_value(value: u64) -> [u64; 8] {
 fn collect_cpu_ops(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,
-) -> Result<Vec<CpuOperation>, ProverError> {
+) -> Result<Vec<CpuOperation>, Error> {
     let mut cpu_ops = Vec::with_capacity(logs.len());
 
     // Timestamps start at 4 (not 0) to ensure old_timestamp < timestamp holds
@@ -170,7 +170,7 @@ fn collect_cpu_ops(
         let instruction = instructions
             .get(&log.current_pc)
             .copied()
-            .ok_or(ProverError::MissingInstruction(log.current_pc))?;
+            .ok_or(Error::MissingInstruction(log.current_pc))?;
 
         let op = CpuOperation::from_log_and_instruction(log, timestamp, instruction);
         cpu_ops.push(op);
@@ -736,10 +736,7 @@ impl Traces {
     /// 3. MEMW → LT operations (timestamp ordering)
     /// 4. LT, MEMW, Branch → Bitwise lookups
     /// 5. Generate all traces
-    pub fn from_logs(
-        logs: &[Log],
-        instructions: U64HashMap<Instruction>,
-    ) -> Result<Self, ProverError> {
+    pub fn from_logs(logs: &[Log], instructions: U64HashMap<Instruction>) -> Result<Self, Error> {
         // =====================================================================
         // PHASE 1: Logs → CPU operations
         // =====================================================================
@@ -809,7 +806,7 @@ impl Traces {
             .iter()
             .rev()
             .find(|op| op.decode.op_ecall)
-            .ok_or(ProverError::MissingEcall)?;
+            .ok_or(Error::MissingHaltEcall)?;
         let halt_trace = halt::generate_halt_trace(halt_op.timestamp);
 
         let cpu = cpu::generate_cpu_trace(&cpu_ops);
@@ -869,7 +866,7 @@ impl Traces {
     pub fn from_logs_trimmed(
         logs: &[Log],
         instructions: U64HashMap<Instruction>,
-    ) -> Result<Self, ProverError> {
+    ) -> Result<Self, Error> {
         // Generate full traces (including full 2^20 bitwise table with multiplicities)
         let mut traces = Self::from_logs(logs, instructions)?;
 
@@ -886,7 +883,7 @@ impl Traces {
     pub fn from_logs_minimal(
         logs: &[Log],
         instructions: U64HashMap<Instruction>,
-    ) -> Result<Self, ProverError> {
+    ) -> Result<Self, Error> {
         Self::from_logs_trimmed(logs, instructions)
     }
 }
