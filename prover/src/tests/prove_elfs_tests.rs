@@ -43,27 +43,10 @@ type E = GoldilocksExtension;
 /// Uses minimal bitwise (no full 2^20 preprocessed table) but DECODE is always preprocessed.
 fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
     let proof_options = ProofOptions::default_test_options();
-    let (cpu_air, bitwise_air, lt_air, memw_air, load_air, decode_air, mul_air, branch_air, halt_air) =
-        create_vm_airs(elf, &proof_options, true);
-
-    let air_trace_pairs: Vec<(
-        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
-        _,
-        _,
-    )> = vec![
-        (&cpu_air, &mut traces.cpu, &()),
-        (&bitwise_air, &mut traces.bitwise, &()),
-        (&lt_air, &mut traces.lt, &()),
-        (&memw_air, &mut traces.memw, &()),
-        (&load_air, &mut traces.load, &()),
-        (&decode_air, &mut traces.decode, &()),
-        (&mul_air, &mut traces.mul, &()),
-        (&branch_air, &mut traces.branch, &()),
-        (&halt_air, &mut traces.halt, &()),
-    ];
+    let airs = create_vm_airs(elf, &proof_options, true);
 
     let multi_proof =
-        match Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])) {
+        match Prover::multi_prove(airs.air_trace_pairs(traces), &mut DefaultTranscript::<E>::new(&[])) {
             Ok(proof) => proof,
             Err(e) => {
                 eprintln!("Prover error: {:?}", e);
@@ -71,19 +54,7 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
             }
         };
 
-    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
-        &cpu_air,
-        &bitwise_air,
-        &lt_air,
-        &memw_air,
-        &load_air,
-        &decode_air,
-        &mul_air,
-        &branch_air,
-        &halt_air,
-    ];
-
-    Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[]))
+    Verifier::multi_verify(&airs.air_refs(), &multi_proof, &mut DefaultTranscript::<E>::new(&[]))
 }
 
 // =============================================================================
