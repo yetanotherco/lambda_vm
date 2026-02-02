@@ -247,13 +247,6 @@ name = "overflow"
 
 [[constraints.overflow]]
 kind = "arith"
-iter = ["i", 0, 3]
-constraint = "$#`overflow` => #`q[i]` = #`n[i]`$"
-poly = ["*", "overflow", ["-", ["idx", "q", "i"], ["idx", "n", "i"]]]
-ref = "dvrm:c:q_if_overflow"
-
-[[constraints.overflow]]
-kind = "arith"
 constraint = "$#`sign_q` = #`signed` dot (1- #`overflow`)$"
 poly = ["-", ["*", "signed", ["-", 1, "overflow"]], "sign_q"]
 ref = "dvrm:c:sign_q"

@@ -72,12 +72,16 @@ The second statement is enforced by @dvrm:c:abs_r_lt_abs_d.
 #render_constraint_table(chip, config, groups:("abs_diff", ))
 
 === R5: overflow
-The ISA requires that $#`q` = #`n`$ and $#`r` = 0$ in the event of overflow.
-We note that, while $#`n` = #`qd` + #`r`$ (R1) does _not_ hold in the case of overflow, the relation $#`n` = |#`q`|#`d` + #`r`$ _does_.
-We moreover note that the 64-bit _signed_ two's complement representation of $-2^63$ is identical to the 64-bit _unsigned_ representation of $|-2^63| = 2^63$.
-As such, by interpreting `q` as an unsigned integer when $#`overflow` = 1$, it follows that R1 will enforce $#`r` = 0$.
+The ISA requires that $#`q` = #`n`$ and $#`r` = 0$ in the event of overflow (i.e., when $#`n` = -2^63$ and $#`d` = -1$).
+We note that the second half of this requirement is already satisfied by R2: since $#`d` = -1 != 0$, R2 requires that $|#`r`| < |#`d`| = 1$, to which $#`r` = 0$ is the only satisfying value.
 
-In summary, it suffices to enforce that $#`overflow` => #`q` = #`n`$ (@dvrm:c:q_if_overflow) and to interpret `q` as unsigned in the multiplication when $#`overflow` = 1$ (@dvrm:c:sign_q).
+We moreover find that R1 can be leveraged to enforce the correct value of `q`.
+While $#`n` = #`qd` + #`r`$ (R1) does _not_ hold in the case of overflow, the relation $#`n` = |#`q`|#`d` + #`r`$ _does_.
+We moreover note that the 64-bit _signed_ two's complement representation of $-2^63$ is identical to the 64-bit _unsigned_ representation of $|-2^63| = 2^63$.
+As such, by interpreting `q` as an unsigned integer when $#`overflow` = 1$, it follows that R1 will enforce $#`q` = #`0x80...00`$.
+
+In summary, in case of overflow R2 enforces that $#`r` = 0$.
+Moreover it suffices to interpret `q` as unsigned integer (@dvrm:c:sign_q); R1 will ensure it contains the correct value.
 
 #render_constraint_table(chip, config, groups:"overflow")
 
