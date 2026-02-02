@@ -23,10 +23,6 @@ use stark::trace::TraceTable;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
-use executor::elf::Elf;
-
-use crate::tables::bitwise;
-use crate::tables::decode;
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
@@ -42,88 +38,6 @@ type E = GoldilocksExtension;
 // =============================================================================
 // Prover test helpers
 // =============================================================================
-
-/// Run multi_prove and multi_verify for all VM tables.
-/// Run multi_prove and multi_verify for all VM tables (CPU + Bitwise + LT + MEMW + LOAD + DECODE + MUL + BRANCH + HALT).
-///
-/// Uses the FULL 2^20 row bitwise table with preprocessed commitment.
-/// Returns true if verification succeeds.
-fn prove_and_verify_vm(
-    cpu_trace: &mut TraceTable<F, E>,
-    bitwise_trace: &mut TraceTable<F, E>,
-    lt_trace: &mut TraceTable<F, E>,
-    memw_trace: &mut TraceTable<F, E>,
-    load_trace: &mut TraceTable<F, E>,
-    decode_trace: &mut TraceTable<F, E>,
-    mul_trace: &mut TraceTable<F, E>,
-    branch_trace: &mut TraceTable<F, E>,
-    halt_trace: &mut TraceTable<F, E>,
-    elf: &Elf,
-) -> bool {
-    let proof_options = ProofOptions::default_test_options();
-
-    let cpu_air = create_cpu_air(&proof_options);
-    // Use preprocessed commitment for full bitwise table verification
-    let bitwise_air = create_bitwise_air(&proof_options).with_preprocessed(
-        bitwise::preprocessed_commitment(),
-        bitwise::NUM_PRECOMPUTED_COLS,
-    );
-    let lt_air = create_lt_air(&proof_options);
-    let memw_air = create_memw_air(&proof_options);
-    let load_air = create_load_air(&proof_options);
-    // Verifier computes DECODE commitment directly from ELF (no executor needed)
-    let decode_air = create_decode_air(&proof_options).with_preprocessed(
-        decode::commitment_from_elf(elf, &proof_options)
-            .expect("Failed to compute decode commitment"),
-        decode::NUM_PRECOMPUTED_COLS,
-    );
-    let mul_air = create_mul_air(&proof_options);
-    let branch_air = create_branch_air(&proof_options);
-    let halt_air = create_halt_air(&proof_options);
-
-    let air_trace_pairs: Vec<(
-        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
-        _,
-        _,
-    )> = vec![
-        (&cpu_air, cpu_trace, &()),
-        (&bitwise_air, bitwise_trace, &()),
-        (&lt_air, lt_trace, &()),
-        (&memw_air, memw_trace, &()),
-        (&load_air, load_trace, &()),
-        (&decode_air, decode_trace, &()),
-        (&mul_air, mul_trace, &()),
-        (&branch_air, branch_trace, &()),
-        (&halt_air, halt_trace, &()),
-    ];
-
-    let multi_proof =
-        match Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])) {
-            Ok(proof) => proof,
-            Err(e) => {
-                eprintln!("Prover error: {:?}", e);
-                return false;
-            }
-        };
-
-    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
-        &cpu_air,
-        &bitwise_air,
-        &lt_air,
-        &memw_air,
-        &load_air,
-        &decode_air,
-        &mul_air,
-        &branch_air,
-        &halt_air,
-    ];
-
-    let result = Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[]));
-    if !result {
-        eprintln!("Verifier failed!");
-    }
-    result
-}
 
 /// Run multi_prove and multi_verify for all VM tables.
 /// Run multi_prove and multi_verify for all VM tables (CPU + Bitwise + LT + MEMW + LOAD + DECODE + MUL + BRANCH + HALT).
@@ -928,28 +842,10 @@ fn test_prove_elfs_all_instructions_64() {
 fn test_prove_elfs_all_instructions_64_full() {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let (elf, logs, instructions) = run_asm_elf("all_instructions_64");
-    // Use FULL bitwise table (2^20 rows) - this is the comprehensive test
-    let mut traces = Traces::from_logs(&logs, instructions.clone()).unwrap();
-
-    println!(
-        "all_instructions_64_full: CPU {} rows, Bitwise {} rows (FULL)",
-        traces.cpu.main_table.height, traces.bitwise.main_table.height,
-    );
-
+    let elf_bytes = crate::test_utils::asm_elf_bytes("all_instructions_64");
+    let result = crate::prove_and_verify(&elf_bytes).expect("prove_and_verify failed");
     assert!(
-        prove_and_verify_vm(
-            &mut traces.cpu,
-            &mut traces.bitwise,
-            &mut traces.lt,
-            &mut traces.memw,
-            &mut traces.load,
-            &mut traces.decode,
-            &mut traces.mul,
-            &mut traces.branch,
-            &mut traces.halt,
-            &elf,
-        ),
+        result,
         "all_instructions_64_full failed - comprehensive test with full bitwise table"
     );
 }
