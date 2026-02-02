@@ -39,36 +39,17 @@ use crate::test_utils::{
 use stark::proof::options::ProofOptions;
 use stark::proof::stark::MultiProof;
 
-/// Specific reasons trace generation can fail.
+/// Error type for the prover crate.
 #[derive(Debug)]
-pub enum TraceError {
+pub enum Error {
+    /// Failed to load ELF binary
+    ElfLoad(String),
     /// Instruction not found for a given PC address
     MissingInstruction(u64),
     /// Program does not contain an ECALL (halt) instruction
     MissingHaltEcall,
     /// Executor failed (setup or runtime error)
     Execution(String),
-}
-
-impl fmt::Display for TraceError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TraceError::MissingInstruction(pc) => write!(f, "instruction not found for PC {pc:#x}"),
-            TraceError::MissingHaltEcall => {
-                write!(f, "program does not contain an ECALL (halt) instruction")
-            }
-            TraceError::Execution(msg) => write!(f, "{msg}"),
-        }
-    }
-}
-
-/// Error type for the prover crate.
-#[derive(Debug)]
-pub enum Error {
-    /// Failed to load ELF binary
-    ElfLoad(String),
-    /// Trace generation failed
-    TraceGeneration(TraceError),
     /// STARK proving failed
     Prover(String),
 }
@@ -77,7 +58,11 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::ElfLoad(msg) => write!(f, "ELF load error: {msg}"),
-            Error::TraceGeneration(err) => write!(f, "trace generation error: {err}"),
+            Error::MissingInstruction(pc) => write!(f, "instruction not found for PC {pc:#x}"),
+            Error::MissingHaltEcall => {
+                write!(f, "program does not contain an ECALL (halt) instruction")
+            }
+            Error::Execution(msg) => write!(f, "execution error: {msg}"),
             Error::Prover(msg) => write!(f, "proving error: {msg}"),
         }
     }
@@ -88,11 +73,10 @@ impl std::error::Error for Error {}
 /// Prove an ELF binary execution. Returns a serializable proof.
 pub fn prove(elf_bytes: &[u8]) -> Result<MultiProof<F, E, ()>, Error> {
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
-    let executor = Executor::new(&program, vec![])
-        .map_err(|e| Error::TraceGeneration(TraceError::Execution(format!("{e}"))))?;
+    let executor = Executor::new(&program, vec![]).map_err(|e| Error::Execution(format!("{e}")))?;
     let result = executor
         .run()
-        .map_err(|e| Error::TraceGeneration(TraceError::Execution(format!("{e}"))))?;
+        .map_err(|e| Error::Execution(format!("{e}")))?;
 
     let mut traces = Traces::from_logs(&result.logs, result.instructions)?;
 
