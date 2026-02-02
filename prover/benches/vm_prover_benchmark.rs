@@ -24,7 +24,7 @@ use lambda_vm_prover::tables::lt::generate_lt_trace;
 use lambda_vm_prover::tables::trace_builder::Traces;
 
 // Import shared utilities
-use lambda_vm_lambda_vm_prover::test_utils::{
+use lambda_vm_prover::test_utils::{
     E, F, VmAir, collect_bitwise_lookups_from_logs, collect_bitwise_lookups_from_lt,
     collect_lt_lookups_from_logs, create_bitwise_air, create_cpu_air, create_lt_air,
     generate_minimal_bitwise_trace, run_asm_elf,
