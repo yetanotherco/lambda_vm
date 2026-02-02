@@ -4,6 +4,7 @@
 main:
 	xori	a2, zero, 0x01
 	xori    a0, a2, 0x01
-	jalr	zero, 0(ra)
+	li	a7, 5
+	ecall
 .Lfunc_end1:
 	.size	main, .Lfunc_end1-main

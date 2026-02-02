@@ -28,9 +28,14 @@ use crate::tables::bitwise::{
     BitwiseOperation, BitwiseOperationType, bus_interactions as bitwise_bus_interactions,
     cols as bitwise_cols,
 };
+use crate::tables::branch::{
+    branch_constraints, bus_interactions as branch_bus_interactions, cols as branch_cols,
+};
 use crate::tables::cpu::{
     CpuOperation, bus_interactions as cpu_bus_interactions, cols as cpu_cols,
 };
+use crate::tables::decode::{bus_interactions as decode_bus_interactions, cols as decode_cols};
+use crate::tables::halt::{bus_interactions as halt_bus_interactions, cols as halt_cols};
 use crate::tables::load::{
     bus_interactions as load_bus_interactions, cols as load_cols, constraints as load_constraints,
 };
@@ -52,8 +57,8 @@ pub type VmAir = AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()>;
 
 /// Helper to run an ELF from the program_artifacts directory.
 ///
-/// Returns the execution logs and instruction map.
-pub fn run_asm_elf(name: &str) -> (Vec<Log>, U64HashMap<Instruction>) {
+/// Returns the ELF, execution logs, and instruction map.
+pub fn run_asm_elf(name: &str) -> (Elf, Vec<Log>, U64HashMap<Instruction>) {
     // Get workspace root by going up one level from prover directory
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest_dir
@@ -69,10 +74,10 @@ pub fn run_asm_elf(name: &str) -> (Vec<Log>, U64HashMap<Instruction>) {
 
     let elf_data =
         std::fs::read(&path).unwrap_or_else(|_| panic!("Failed to read ELF: {}", path.display()));
-    let program = Elf::load(&elf_data).expect("Failed to load ELF");
-    let executor = Executor::new(&program, vec![]).expect("Failed to create executor");
+    let elf = Elf::load(&elf_data).expect("Failed to load ELF");
+    let executor = Executor::new(&elf, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
-    (result.logs, result.instructions)
+    (elf, result.logs, result.instructions)
 }
 
 // =============================================================================
@@ -88,7 +93,7 @@ pub fn collect_bitwise_ops_from_logs(
         .enumerate()
         .flat_map(|(i, log)| {
             let instruction = *instructions.get(&log.current_pc).unwrap();
-            let op = CpuOperation::from_log(log, (i as u64) * 4, instruction);
+            let op = CpuOperation::from_log_and_instruction(log, (i as u64) * 4, instruction);
             op.collect_bitwise_ops()
         })
         .collect()
@@ -534,6 +539,75 @@ pub fn create_load_air(proof_options: &ProofOptions) -> VmAir {
 
     AirWithBuses::new(
         load_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+}
+
+/// Create DECODE AIR with bus interactions.
+///
+/// The DECODE table has no transition constraints (it's a pure lookup table).
+/// It receives lookups from the CPU table via the DECODE bus.
+///
+/// For production use with preprocessed verification, chain with `.with_preprocessed()`:
+/// ```ignore
+/// let decode_air = create_decode_air(&opts)
+///     .with_preprocessed(
+///         decode::compute_precomputed_commitment(&instructions, &opts),
+///         decode::NUM_PRECOMPUTED_COLS,
+///     );
+/// ```
+pub fn create_decode_air(proof_options: &ProofOptions) -> VmAir {
+    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: decode_bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        decode_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+}
+
+/// Create BRANCH AIR with constraints and bus interactions.
+///
+/// The BRANCH table computes next_pc for branch/jump instructions:
+/// - For branches (BEQ, BLT, JAL): next_pc = pc + sign_extend(offset)
+/// - For JALR: next_pc = (register + sign_extend(offset)) & ~1
+pub fn create_branch_air(proof_options: &ProofOptions) -> VmAir {
+    let (constraints, _) = branch_constraints(0);
+    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> =
+        constraints.into_iter().map(|c| Box::new(c) as _).collect();
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: branch_bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        branch_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+}
+
+/// Create HALT AIR with bus interactions (no transition constraints).
+pub fn create_halt_air(proof_options: &ProofOptions) -> VmAir {
+    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: halt_bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        halt_cols::NUM_COLUMNS,
         auxiliary_trace_build_data,
         proof_options,
         1,

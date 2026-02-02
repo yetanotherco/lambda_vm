@@ -107,7 +107,16 @@ where
             })
             .collect()
     } else {
-        vec![]
+        // For 0 FRI layers (small traces), return empty decommitments for each query.
+        // The verifier still needs one decommitment entry per query, even if the
+        // FRI layer data is empty.
+        iotas
+            .iter()
+            .map(|_| FriDecommitment {
+                layers_auth_paths: vec![],
+                layers_evaluations_sym: vec![],
+            })
+            .collect()
     }
 }
 

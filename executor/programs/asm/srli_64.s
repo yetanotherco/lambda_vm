@@ -5,4 +5,5 @@ main:
 	# 0x123456789ABCDEF0 >> 32 = 0x12345678
 	li	a2, 0x123456789ABCDEF0
 	srli	a0, a2, 32
-	jalr	zero, 0(ra)
+	li	a7, 5
+	ecall

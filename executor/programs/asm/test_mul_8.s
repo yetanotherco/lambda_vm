@@ -9,4 +9,5 @@ main:
 	mulw	a2, t0, t1		# 5. MULW: 200
 	mul	a3, t1, t1		# 6. 20 * 20 = 400
 	mul	a4, zero, t0		# 7. 0 * 10 = 0
-	jalr	zero, 0(zero)		# 8. Return
+	li	a7, 5
+	ecall		# 8. Return
