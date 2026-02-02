@@ -623,16 +623,13 @@ pub fn branch_constraints(constraint_idx_start: usize) -> (Vec<BranchConstraint>
 /// where offset is already sign-extended to 64 bits as DWordWL.
 ///
 /// Returns (carry_0, carry_1) where both should be 0 or 1.
-pub fn compute_carries(base: u64, offset: u64, next_pc_unmasked: u64) -> (u64, u64) {
+pub fn compute_carries(base: u64, offset: u64, _next_pc_unmasked: u64) -> (u64, u64) {
     // Split into DWordWL format
     let base_lo = base & 0xFFFF_FFFF;
     let base_hi = base >> 32;
 
     let offset_lo = offset & 0xFFFF_FFFF;
     let offset_hi = offset >> 32;
-
-    let result_lo = next_pc_unmasked & 0xFFFF_FFFF;
-    let result_hi = next_pc_unmasked >> 32;
 
     // carry[0] = (base_lo + offset_lo) >> 32
     let carry_0 = (base_lo + offset_lo) >> 32;
