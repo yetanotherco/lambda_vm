@@ -102,7 +102,7 @@ Lastly, $#`signed` = 1$ (the first equality) follows implicitly from $#`sign_n` 
 Rewriting R1, we find the constraint $not#`overflow` => #`n` - #`r` = #`qd`$.
 #footnote([Recall that @dvrm:c:sign_q allows to assert this equality even when `overflow`.])
 Since `n`, `d`, `q` and `r` are all 64-bit integers, we must assert this equality $mod 2^128$, rather than $mod 2^64$.
-To this end, we introduce `extended_n_sub_r` and leverage the `MUL` chip to verify that is equal to $#`qd` mod 2^128$ using constraints @dvrm:c:mul_lower and @dvrm:c:mul_upper;
+To this end, we introduce `extended_n_sub_r` and leverage the `MUL` chip to verify that it is equal to $#`qd` mod 2^128$ using constraints @dvrm:c:mul_lower and @dvrm:c:mul_upper;
 @dvrm:c:q_range is included to uphold assumption @mul:a:rhs.
 
 #render_constraint_table(chip, config, groups:("equality", ))
@@ -113,7 +113,7 @@ By their definition, these variables contain the signed 128-bit representations 
 With this in place, @dvrm:c:n_sub_r ensures `extended_n_sub_r` must contain the correct value.
 
 Lastly, observe that $#`n` - #`r` in (-2^64, 2^64)$, _regardless_ of the value of `signed`.
-Moreover, note that the upper limbs of all values in this range are either `0xFFFFFFFF` (negative) or `0x00000000` (non-negative).
+Moreover, note that the upper halves of all values in this range are either `0xFFFFFFFF` (negative) or `0x00000000` (non-negative).
 This means that we do not need to store all 128 bits of `extended_n_sub_r`.
 Rather, we need only store the lower 64-bits, and a separate bit (`sign_n_sub_r`) indicating whether the top limbs are all-ones or all-zeroes.
 The prover is free to select the value for `sign_n_sub_r`; only one of the two will fit the proof.
@@ -122,7 +122,7 @@ The prover is free to select the value for `sign_n_sub_r`; only one of the two w
 
 === R4: division-by-zero
 R4 requires that $#`q` = 2^64-1$ (unsigned) or $-1$ (signed) and $#`r` = n$ when $#`d` = 0$.
-Recalling R1, we see that $#`n` = #`q` #`d` + #`r` = #`r`$ when $#`d` = 0$, already enforcing the latter.
+Recalling R1, we see that $#`n` = #`q` #`d` + #`r` = #`r`$ when $#`d` = 0$, already enforces the latter.
 Next, we note that, in two's complement, the _unsigned_ value $2^64-1$ and _signed_ value $-1$ are both represented by the bit string `0xFFFFFFFF`.
 Hence, only @dvrm:c:q_if_div_by_zero is required to completely constrain R5; @dvrm:c:div_by_zero just ensures the `div_by_zero` flag is set when $#`d` = 0$.
 
