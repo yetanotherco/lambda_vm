@@ -11,7 +11,7 @@
     ("variables.typ", [Variables], <vars>),
     ("is_bit.typ", [IS_BIT template], <isbit>),
     ("add.typ", [ADD/SUB template], <add>),
-    ("neg.typ", [NEG template], <meg>),
+    ("neg.typ", [NEG template], <neg>),
     ("decode.typ", [DECODE table], <decode>),
     ("cpu.typ", [CPU chip], <cpu>),
     ("shift.typ", [SHIFT chip], <shift>),
