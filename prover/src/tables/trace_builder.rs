@@ -40,7 +40,7 @@ use super::load::{self, LoadOperation};
 use super::lt::{self, LtOperation};
 use super::memw::{self, MemwOperation};
 use super::types::{GoldilocksExtension, GoldilocksField};
-use crate::Error;
+use crate::{Error, TraceError};
 
 // =============================================================================
 // Memory and Register State Tracking
@@ -166,10 +166,13 @@ fn collect_cpu_ops(
     // for the first access to any register/memory location (where old_timestamp=0).
     for (i, log) in logs.iter().enumerate() {
         let timestamp = (i as u64) * 4 + 4;
-        let instruction = instructions
-            .get(&log.current_pc)
-            .copied()
-            .ok_or(Error::MissingInstruction(log.current_pc))?;
+        let instruction =
+            instructions
+                .get(&log.current_pc)
+                .copied()
+                .ok_or(Error::TraceGeneration(TraceError::MissingInstruction(
+                    log.current_pc,
+                )))?;
 
         let op = CpuOperation::from_log_and_instruction(log, timestamp, instruction);
         cpu_ops.push(op);
@@ -710,7 +713,7 @@ impl Traces {
             .iter()
             .rev()
             .find(|op| op.decode.op_ecall)
-            .ok_or(Error::MissingEcall)?;
+            .ok_or(Error::TraceGeneration(TraceError::MissingHaltEcall))?;
         let halt_trace = halt::generate_halt_trace(halt_op.timestamp);
 
         let cpu = cpu::generate_cpu_trace(&cpu_ops);
