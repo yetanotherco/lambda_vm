@@ -90,11 +90,20 @@ const MAX_PROOF_FILE_SIZE: u64 = 1024 * 1024 * 1024;
 /// Minimum acceptable blowup factor for proof verification
 const MIN_BLOWUP_FACTOR: u8 = 4;
 
+/// Maximum acceptable blowup factor (32 is very high, prevents memory exhaustion)
+const MAX_BLOWUP_FACTOR: u8 = 32;
+
 /// Minimum acceptable FRI queries for proof verification (31 = Conjecturable80Bits minimum)
 const MIN_FRI_QUERIES: usize = 31;
 
+/// Maximum acceptable FRI queries (1000 is far above any reasonable security level)
+const MAX_FRI_QUERIES: usize = 1000;
+
 /// Minimum acceptable grinding factor for proof verification
 const MIN_GRINDING_FACTOR: u8 = 1;
+
+/// Maximum acceptable grinding factor (32 bits is very high)
+const MAX_GRINDING_FACTOR: u8 = 32;
 
 /// Maximum acceptable coset offset (reasonable upper bound)
 const MAX_COSET_OFFSET: u64 = 1000;
@@ -587,11 +596,13 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // Validate proof options to prevent malicious bundles with weak parameters
-    if bundle.proof_options.blowup_factor < MIN_BLOWUP_FACTOR {
+    // Validate proof options to prevent malicious bundles with weak or DoS parameters
+    if bundle.proof_options.blowup_factor < MIN_BLOWUP_FACTOR
+        || bundle.proof_options.blowup_factor > MAX_BLOWUP_FACTOR
+    {
         eprintln!(
-            "Invalid proof options: blowup_factor {} is below minimum {}",
-            bundle.proof_options.blowup_factor, MIN_BLOWUP_FACTOR
+            "Invalid proof options: blowup_factor {} is out of valid range ({}-{})",
+            bundle.proof_options.blowup_factor, MIN_BLOWUP_FACTOR, MAX_BLOWUP_FACTOR
         );
         return ExitCode::FAILURE;
     }
@@ -599,10 +610,12 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf) -> ExitCode {
         eprintln!("Invalid proof options: blowup_factor must be a power of two");
         return ExitCode::FAILURE;
     }
-    if bundle.proof_options.fri_number_of_queries < MIN_FRI_QUERIES {
+    if bundle.proof_options.fri_number_of_queries < MIN_FRI_QUERIES
+        || bundle.proof_options.fri_number_of_queries > MAX_FRI_QUERIES
+    {
         eprintln!(
-            "Invalid proof options: fri_number_of_queries {} is below minimum {}",
-            bundle.proof_options.fri_number_of_queries, MIN_FRI_QUERIES
+            "Invalid proof options: fri_number_of_queries {} is out of valid range ({}-{})",
+            bundle.proof_options.fri_number_of_queries, MIN_FRI_QUERIES, MAX_FRI_QUERIES
         );
         return ExitCode::FAILURE;
     }
@@ -615,30 +628,22 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf) -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
-    if bundle.proof_options.grinding_factor < MIN_GRINDING_FACTOR {
+    if bundle.proof_options.grinding_factor < MIN_GRINDING_FACTOR
+        || bundle.proof_options.grinding_factor > MAX_GRINDING_FACTOR
+    {
         eprintln!(
-            "Invalid proof options: grinding_factor {} is below minimum {}",
-            bundle.proof_options.grinding_factor, MIN_GRINDING_FACTOR
+            "Invalid proof options: grinding_factor {} is out of valid range ({}-{})",
+            bundle.proof_options.grinding_factor, MIN_GRINDING_FACTOR, MAX_GRINDING_FACTOR
         );
         return ExitCode::FAILURE;
     }
 
     // Verify ELF hash matches proof metadata (constant-time comparison)
+    // Note: We intentionally don't display hash values in error messages to prevent
+    // timing attacks where an attacker could iteratively modify an ELF to match.
     let elf_hash: [u8; 32] = Sha3_256::digest(&elf_data).into();
     if elf_hash.ct_eq(&bundle.metadata.elf_hash).unwrap_u8() != 1 {
-        eprintln!("ELF hash mismatch!");
-        eprintln!(
-            "  Expected: {}...",
-            hex::encode(bundle.metadata.elf_hash)
-                .chars()
-                .take(16)
-                .collect::<String>()
-        );
-        eprintln!(
-            "  Got:      {}...",
-            hex::encode(elf_hash).chars().take(16).collect::<String>()
-        );
-        eprintln!("The proof was generated for a different program.");
+        eprintln!("ELF hash mismatch: the proof was generated for a different program.");
         return ExitCode::FAILURE;
     }
 
