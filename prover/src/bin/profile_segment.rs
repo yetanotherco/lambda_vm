@@ -10,10 +10,6 @@
 //! With dhat profiling (generates dhat-heap.json):
 //!   cargo run --bin profile_segment --release --features dhat-heap -- loop_32768 64
 
-#[cfg(feature = "dhat-heap")]
-#[global_allocator]
-static ALLOC: dhat::Alloc = dhat::Alloc;
-
 use std::env;
 use std::time::Instant;
 
