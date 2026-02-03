@@ -421,7 +421,7 @@ pub fn update_multiplicities(
 /// - Constraint satisfaction
 /// - LogUp protocol correctness
 #[cfg(test)]
-pub fn trim_zero_rows(
+pub(crate) fn trim_zero_rows(
     trace: TraceTable<GoldilocksField, GoldilocksExtension>,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     use super::types::FE;
@@ -532,6 +532,13 @@ impl BitwiseOperation {
     /// Create an operation for shift ops (HWSL, HWSLC).
     pub fn shift_op(lookup_type: BitwiseOperationType, x: u8, y: u8, z: u8) -> Self {
         Self::new(lookup_type, x, y, z)
+    }
+
+    /// Create an IS_B20 operation for 20-bit range checks.
+    /// Value is packed as: x + 256*y + 65536*z (where z is 4 bits).
+    pub fn b20(x: u8, y: u8, z: u8) -> Self {
+        debug_assert!(z < 16, "z must be 4-bit value for IS_B20");
+        Self::new(BitwiseOperationType::IsB20, x, y, z)
     }
 }
 

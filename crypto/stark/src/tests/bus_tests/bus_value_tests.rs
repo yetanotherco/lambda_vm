@@ -262,3 +262,128 @@ fn test_constant_column_indices_empty() {
     let indices = bv.column_indices();
     assert!(indices.is_empty());
 }
+
+// =============================================================================
+// LinearTerm::ColumnUnsigned tests
+// =============================================================================
+
+#[test]
+fn test_linear_column_unsigned_single() {
+    // Linear with single unsigned column: large_coeff * col[0]
+    let large_coeff: u64 = 0x8000_0000_0000_0000; // Larger than i64::MAX
+    let bv = BusValue::Linear(vec![LinearTerm::ColumnUnsigned {
+        coefficient: large_coeff,
+        column: 0,
+    }]);
+
+    let columns = vec![FE::from(2u64)];
+    let combined: Vec<FE> = bv.combine_from(|col| columns[col].clone());
+
+    assert_eq!(combined.len(), 1);
+    // Result = large_coeff * 2 in field
+    let expected = FE::from(large_coeff) * FE::from(2u64);
+    assert_eq!(combined[0], expected);
+}
+
+#[test]
+fn test_linear_column_unsigned_with_coefficient() {
+    // Linear with unsigned coefficient that fits in u64 but not i64
+    let coeff: u64 = 18446744065119617026; // Example: INV_2_32 in Goldilocks
+    let bv = BusValue::Linear(vec![LinearTerm::ColumnUnsigned {
+        coefficient: coeff,
+        column: 0,
+    }]);
+
+    let columns = vec![FE::from(100u64)];
+    let combined: Vec<FE> = bv.combine_from(|col| columns[col].clone());
+
+    assert_eq!(combined.len(), 1);
+    let expected = FE::from(coeff) * FE::from(100u64);
+    assert_eq!(combined[0], expected);
+}
+
+#[test]
+fn test_linear_mixed_column_and_column_unsigned() {
+    // Mix of Column (signed) and ColumnUnsigned: 3*col[0] + large*col[1]
+    let large_coeff: u64 = 0x8000_0000_0000_0000;
+    let bv = BusValue::Linear(vec![
+        LinearTerm::Column {
+            coefficient: 3,
+            column: 0,
+        },
+        LinearTerm::ColumnUnsigned {
+            coefficient: large_coeff,
+            column: 1,
+        },
+    ]);
+
+    let columns = vec![FE::from(10u64), FE::from(2u64)];
+    let combined: Vec<FE> = bv.combine_from(|col| columns[col].clone());
+
+    assert_eq!(combined.len(), 1);
+    // 3*10 + large_coeff*2
+    let expected = FE::from(30u64) + FE::from(large_coeff) * FE::from(2u64);
+    assert_eq!(combined[0], expected);
+}
+
+#[test]
+fn test_linear_mixed_all_term_types() {
+    // Mix of all term types: 2*col[0] + large*col[1] + 10
+    let large_coeff: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+    let bv = BusValue::Linear(vec![
+        LinearTerm::Column {
+            coefficient: 2,
+            column: 0,
+        },
+        LinearTerm::ColumnUnsigned {
+            coefficient: large_coeff,
+            column: 1,
+        },
+        LinearTerm::Constant(10),
+    ]);
+
+    let columns = vec![FE::from(5u64), FE::from(3u64)];
+    let combined: Vec<FE> = bv.combine_from(|col| columns[col].clone());
+
+    assert_eq!(combined.len(), 1);
+    // 2*5 + large*3 + 10
+    let expected = FE::from(10u64) + FE::from(large_coeff) * FE::from(3u64) + FE::from(10u64);
+    assert_eq!(combined[0], expected);
+}
+
+#[test]
+fn test_linear_column_unsigned_column_indices() {
+    // ColumnUnsigned should appear in column_indices
+    let bv = BusValue::Linear(vec![
+        LinearTerm::Column {
+            coefficient: 1,
+            column: 2,
+        },
+        LinearTerm::ColumnUnsigned {
+            coefficient: 0x8000_0000_0000_0000,
+            column: 7,
+        },
+        LinearTerm::Constant(42),
+    ]);
+
+    let indices = bv.column_indices();
+    assert_eq!(indices, vec![2, 7]);
+}
+
+#[test]
+fn test_linear_column_unsigned_only_indices() {
+    // Only ColumnUnsigned terms
+    let bv = BusValue::Linear(vec![
+        LinearTerm::ColumnUnsigned {
+            coefficient: 100,
+            column: 3,
+        },
+        LinearTerm::ColumnUnsigned {
+            coefficient: 200,
+            column: 8,
+        },
+    ]);
+
+    let indices = bv.column_indices();
+    assert_eq!(indices, vec![3, 8]);
+}

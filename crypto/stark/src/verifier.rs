@@ -619,6 +619,13 @@ pub trait IsStarkVerifier<
             (p0_eval + p0_eval_sym) + evaluation_point_inv * &zetas[0] * (p0_eval - p0_eval_sym);
         let mut index = iota;
 
+        // Handle case with 0 FRI layers (trace_length <= 2)
+        // In this case, the fold loop below doesn't iterate, so we need to verify
+        // the final value directly here.
+        if fri_layers_merkle_roots.is_empty() {
+            return v == proof.fri_last_value;
+        }
+
         // For each FRI layer, starting from the layer 1: use the proof to verify the validity of values pᵢ(−𝜐^(2ⁱ)) (given by the prover) and
         // pᵢ(𝜐^(2ⁱ)) (computed on the previous iteration by the verifier). Then use them to obtain pᵢ₊₁(𝜐^(2ⁱ⁺¹)).
         // Finally, check that the final value coincides with the given by the prover.
