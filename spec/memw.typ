@@ -11,16 +11,16 @@
 #let config = load_config()
 #let chip = load_chip("src/memw.toml", config)
 
-#show: book-page.with(title: "MEMW chip")
+#show: book-page(chip.name)
 
-== Columns
+= Columns
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
 
 The `MEMW` chip is comprised of #nr_variables variables that are expressed using #nr_columns columns:
 #render_chip_column_table(chip, config)
 
-== Assumptions
+= Assumptions
 
 #render_chip_assumptions(chip, config)
 
@@ -29,7 +29,7 @@ as these are not necessary for the correctness of this chip in isolation.
 These properties are necessary for the consistency of the system as a whole, and therefore
 we document it here, keeping the type information as a reading help.
 
-== Constraints
+= Constraints
 
 #render_constraint_table(chip, config, groups: "consistency")
 
@@ -50,7 +50,7 @@ This chip contributes the following to the lookup argument.
 #render_constraint_table(chip, config, groups: "output")
 
 
-== Future optimization ideas
+= Future optimization ideas
 
 - Fast path for aligned memory access where all bytes have the same old timestamp
 - MEMB chip that deals does a one-byte write to remove old_timestamp from here (uncertain tradeoffs)

@@ -14,11 +14,9 @@
 
 #let shift = raw(chip.name)
 
-#show: book-page.with(title: "SHIFT chip")
+#show: book-page(chip.name)
 
-= #shift chip
-
-== Interface
+= Interface
 The #shift chip has the following interface:
 #block(radius: 5pt, width: 100%, inset: 1.5em, fill: luma(240), 
 ```
@@ -48,17 +46,17 @@ $
 $
 Here, `<<` and `>>` denote the _logical_ left and right shift operations, while `>>>` denotes the _arithmetic_ right shift operation.
 
-== Columns
+= Columns
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
 
 The `SHIFT` chip is comprised of #nr_variables variables that are expressed using #nr_columns columns:
 #render_chip_column_table(chip, config)
 
-== Assumptions
+= Assumptions
 #render_chip_assumptions(chip, config)
 
-== Explanation
+= Explanation
 This chip has a rather complex design as a result of designing it to fit in as few columns possible.
 We briefly discuss the intricacies of the design, attempting to illustrate its correctness.
 
@@ -72,7 +70,7 @@ The output variable `out` is equivalent to `shifted`, but expressed using `Word`
 In the following, we cover how these two phases were designed to complement one another.
 Here, we start with discussing the _logical_ left/right shift operations only; the modifications required to compute the _arithmetic_ right shift will be discussed at the end.
 
-=== First phase
+== First phase
 We zoom in on the first step.
 Here, we make use of the two lookup operations 
 - $#`HWSL[x: Half, y: B4]` := (#`x` #`<<` #`y`) mod 2^16$ (short for "HalfWord Shift Left"), and
@@ -108,7 +106,7 @@ $
 it only takes some rearranging and combining of the values $#`X[`i#`] := HWSL[in[`i#`], bit_shift]`$ and $#`Y[`i#`] := HWSLC[in[`i#`], bit_shift]`$ to form the limbs of $#`in <</>> shift` mod 16$.
 In the remaining case that $#`right` = 1$ and $#`shift` = 0 mod 16$, the limbs of $#`in <</>> shift` mod 16$ simply match those of `in`.
 
-=== Second phase
+== Second phase
 Since we're operating on 16-bit limbs, all the limbs in $#`in <</>> shift`$ must also occur somewhere in $#`in <</>> shift` mod 16$.
 The number of full-limbs we still need to shift is determined by the fifth and sixth least significant bit of `shift`.
 With `limb_shift` containing a unary decoding of the integer represented by these two bits, we find that the intermediate value needs to be shifted over by $i$ limbs (to the `left` or `right`) when $#`limb_shift[`i#`]` = 1$.
@@ -116,13 +114,13 @@ These things combined yield `shifted`'s definition.
 
 Of course, when $#`word_instr` = 1$ and, thus, only $#`shift` mod 32$ should be considered, the bit-mask for the lookup constraining `limb_shift` is adjusted appropriately (see @shift:c:limb_shift_lookup).
 
-=== Arithmetic right shift
+== Arithmetic right shift
 Lastly, we discuss the case of performing the _arithmetic_ right shift.
 Here, `extension` is constrained to contain a repetition of `in`'s most significant bit.
 Copies of this variable are used for any full limbs shifted in when $#`right` = #`signed` = 1$.
 Moreover, `X[4]` contains a copy of `extension` shifted over by the right number of bits, to allow the construction of $#`in >>> shift` mod 16$ as the appropriate intermediate.
 
-== Constraints
+= Constraints
 First, we constrain `bit_shift` based on whether we are left or right-shifting.
 @shift:c:zbs makes sure `zbs` is set to `1` if and only if `bit_shift = 0`. 
 This flag is used to indicate the special case that $#`right` = 1$ and $#`shift` = 0 mod 16$.
@@ -136,7 +134,7 @@ The case of `left`-shifting and $#`bit_shift` = 0$ will be used for padding rows
 To prevent unnecessary lookups in padding rows, we override $#`X[i]` := #`in[i]`$ and $#`Y[i]` := 0$ here.
 #render_constraint_table(chip, config, groups: "intra_limb_shift")
 
-=== Full-limb shifting
+== Full-limb shifting
 Next, we constrain that `limb_shift` is a proper unary encoding of the fifth (and sixth if $#`word_instr` = 0$) bit of `shift`.
 For this to be the case, three requirements must be satisfied:
 + *unary(0)*: $#`limb_shift[`i#`]` in {0, 1}$ for $i in [0, 3]$,
@@ -166,16 +164,16 @@ This is the exact relation @shift:c:limb_shift_lookup enforces.
 Hereafter, one must only check that `out` is the proper cast of `shifted` into a `DWordWL`.
 #render_constraint_table(chip, config, groups: "limb_shifting")
 
-=== Miscellaneous 
+== Miscellaneous 
 #render_constraint_table(chip, config, groups: ("left_flag", "is_negative"))
 *Note*: `is_negative` is not used when `signed = 0`.
 As such, there is no problem with it being unconstrained in this case.
 
-=== Lookups
+== Lookups
 This chip adds the following interaction to the lookup.
 #render_constraint_table(chip, config, groups: "lookups")
 
-== Padding
+= Padding
 
 The table can be padded to the next power of two with the following value assignments:
 

@@ -13,21 +13,22 @@
 
 #let config = load_config()
 #let chip = load_chip("src/dvrm.toml", config)
+#show: book-page(chip.name)
+
 #let dvrm = raw(chip.name)
 
-#show: book-page.with(title: "DVRM chip")
 
-== Columns
+= Columns
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
 
 The `DVRM` chip is comprised of #nr_variables variables that are expressed using #nr_columns columns:
 #render_chip_column_table(chip, config)
 
-== Assumptions
+= Assumptions
 #render_chip_assumptions(chip, config)
 
-== Constraints
+= Constraints
 From the ISA, we gather five requirements for the `DIV[U][W]` and `REM[U][W]` instructions:
 #enum(numbering: "R1.",
   enum.item([
@@ -49,11 +50,11 @@ From the ISA, we gather five requirements for the `DIV[U][W]` and `REM[U][W]` in
 where _overflow_ occurs when $#`n` = -2^(63)$ and $#`d` = -1$ (and, hence, $#`signed` = 1$), and _division-by-zero_ indicates that $#`d` = 0$.
 In the following, we list the constraints associated with the #dvrm chip, and explain how these together enforce all five of these requirements.
 
-=== R3: Sign remainder equals sign numerator
+== R3: Sign remainder equals sign numerator
 We start with R3, which is straightforwardly asserted by constraint @dvrm:c:sign_r_equals_sign_n.
 #render_constraint_table(chip, config, groups:("sign_equality", ))
 
-=== R2: rounding towards zero
+== R2: rounding towards zero
 R2 states that "_[in] signed and unsigned integer division [the quotient is] round[ed] towards zero._"
 In other words,
 + the sign of $#`n`-#`qd`$ must match that of `n` (unless $#`qd` = #`n`$), and 
@@ -71,7 +72,7 @@ The second statement is enforced by @dvrm:c:abs_r_lt_abs_d.
 
 #render_constraint_table(chip, config, groups:("abs_diff", ))
 
-=== R5: overflow
+== R5: overflow
 The ISA requires that $#`q` = #`n`$ and $#`r` = 0$ in the event of overflow (i.e., when $#`n` = -2^63$ and $#`d` = -1$).
 We note that the second half of this requirement is already satisfied by R2: since $#`d` = -1 != 0$, R2 requires that $|#`r`| < |#`d`| = 1$, to which $#`r` = 0$ is the only satisfying value.
 
@@ -99,7 +100,7 @@ The requirement is phrased in this way, because the left-hand sides of the above
 Given that the sum of these expressions does not exceed $2^19$ (and thus never wraps in the field), we can now say that the `overflow` bit should be set to $1$ if and only if their sum evaluates to $0$.
 The `ZERO` lookup guarantees this to be the case.
 
-=== R1: $#`n` = #`qd` + #`r`$
+== R1: $#`n` = #`qd` + #`r`$
 Rewriting R1, we find the constraint $not#`overflow` => #`n` - #`r` = #`qd`$.
 #footnote([Recall that @dvrm:c:sign_q allows to assert this equality even when `overflow`.])
 Since `n`, `d`, `q` and `r` are all 64-bit integers, we must assert this equality $mod 2^128$, rather than $mod 2^64$.
@@ -121,7 +122,7 @@ The prover is free to select the value for `sign_n_sub_r`; only one of the two w
 
 #render_constraint_table(chip, config, groups:("n_sub_r", ))
 
-=== R4: division-by-zero
+== R4: division-by-zero
 R4 requires that $#`q` = 2^64-1$ (unsigned) or $-1$ (signed) and $#`r` = n$ when $#`d` = 0$.
 Recalling R1, we see that $#`n` = #`q` #`d` + #`r` = #`r`$ when $#`d` = 0$, already enforces the latter.
 Next, we note that, in two's complement, the _unsigned_ value $2^64-1$ and _signed_ value $-1$ are both represented by the bit string `0xFFFFFFFF`.
@@ -129,14 +130,14 @@ Hence, only @dvrm:c:q_if_div_by_zero is required to completely constrain R5; @dv
 
 #render_constraint_table(chip, config, groups:("div_by_zero", ))
 
-=== Other
+== Other
 The following constraints are included to enforce the values of `sign_n`, `sign_r` and `sign_d` are correct.
 #render_constraint_table(chip, config, groups:("defs", ))
 
-=== Output
+== Output
 Lastly, this chip contributes the following to the lookup:
 #render_constraint_table(chip, config, groups:("output", ))
 
-== Padding
+= Padding
 To pad the #dvrm table, we use the following data, representing the unsigned division $frac(0, 0, style: "horizontal")$:
 #render_chip_padding_table(chip, config)

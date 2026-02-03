@@ -21,6 +21,16 @@ type = "Byte"
 desc = "index of destination register."
 
 [[variables.output]]
+name = "read_register1"
+type = "Bit"
+desc = "whether to load the contents of address `rs1` (1) or `0` (0) into `rv1`."
+
+[[variables.output]]
+name = "read_register2"
+type = "Bit"
+desc = "whether to load the contents of address `rs2` (1) or `0` (0) into `rv2`."
+
+[[variables.output]]
 name = "write_register"
 type = "Bit"
 desc = "whether the result should be written to `rd` ($=0$ for memory write and when $#`rd` = #`x0`$."

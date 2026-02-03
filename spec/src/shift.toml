@@ -198,8 +198,8 @@ ref = "shift:c:bit_shift_if_right"
 multiplicity = "right"
 
 [[constraints.bit_shift]]
-kind = "template"
-tag = "IsZero"
+kind = "interaction"
+tag = "ZERO"
 input = ["bit_shift"]
 output = "zbs"
 ref = "shift:c:zbs"

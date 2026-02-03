@@ -15,11 +15,19 @@ name = "sign"
 type = "Bit"
 desc = "Sign of `X`"
 
+
+[[assumptions]]
+desc = "`IS_HALF[X]`"
+
+[[assumptions]]
+desc = "`IS_BIT<signed>`"
+
+
 [[constraint_groups]]
 name = "all"
 
 [[constraints.all]]
-kind = "template"
+kind = "interaction"
 tag = "MSB16"
 input = ["X"]
 output = "sign"

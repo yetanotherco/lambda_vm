@@ -1,4 +1,4 @@
-#import "/book.typ": book-page, rj, aside
+#import "/book.typ": book-page, rj, aside, xref
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   render_chip_assumptions,
@@ -12,9 +12,7 @@
 #let config = load_config()
 #let chip = load_chip("src/page.toml", config)
 
-#show: book-page.with(title: "Memory argument")
-
-= Memory argument
+#show: book-page("memory.typ")
 
 As part of fully proving the correct execution of a RISC-V program,
 the VM must ensure that memory reads and writes are consistent.
@@ -33,7 +31,7 @@ The initialization and finalization schemes together ensure both that (1) the ne
 for the lookup system are satisfied, and (2) the program is executed with the correct
 initial memory and register contents as specified by the ELF binary and the ISA.
 
-== Memory types
+= Memory types
 
 A commonly made distinction of memory types is that of _read-only_ and _read-write_ memory,
 with the more restrictive read-only variant often allowing for more efficient solutions
@@ -45,7 +43,7 @@ While there are some subsystems that can be modelled as read-only memory
 we opt to integrate these into the proof system via chip interactions (relying on techniques derived from table lookup arguments).
 As such, we only concern ourselves with read-write memory, moving forward.
 
-== Memory operations
+= Memory operations
 
 Every memory operation has some conceptual attributes that are relevant to mention or discuss:
 
@@ -77,7 +75,7 @@ For simplicity, we will always reserve a timestamp for every possible memory acc
 ]
 
 
-== Permutation argument
+= Permutation argument
 
 We can conceptually organise the state of the memory as a collection of "tokens" that represent tuples
 $(serif("timestamp"), serif("address"), serif("value"))$,
@@ -101,14 +99,14 @@ this "balancing" act of tokens can be integrated (with sufficient domain separat
 consuming a token corresponds to a "receive" and emitting a new token is a "send".
 #rj[properly link/refer to the logup spec]
 
-== Temporal integrity
+= Temporal integrity
 
 To ensure temporal integrity, every memory operation needs to be constrained for the newly emitted token
 to have a strictly greater timestamp than the consumed token.
 This raises the question of how to represent timestamps and cleanly perform this check,
 as over a finite field the “less than” relation is ill-defined
 (though it is common and natural to consider it as the less than relation over the natural lift of the field into the integers).
-We choose to represent timestamps as machine words, using the existing `LT` chip functionality for comparisons.
+We choose to represent timestamps as machine words, using the existing `LT` chip (@lt) functionality for comparisons.
 #rj[Properly link/refer to the LT chip]
 
 #aside[Note on options and trade-offs for timestamp representation][
@@ -127,7 +125,7 @@ We choose to represent timestamps as machine words, using the existing `LT` chip
 
 #rj[reference to CPU chip/timestamp column and MEMW chip]
 
-== Initialization and Finalization
+= Initialization and Finalization
 
 Because the LogUp argument handling token consumption and emission needs to be fully balanced
 --- every token emitted should be consumed, and vice versa ---
@@ -161,7 +159,7 @@ For each such table, the `page` variable is instantiated as the constant base ad
 The `offset` column is preprocessed, which helps the verifier ensure that each page has a single fixed size,
 but the verifier should still check that no pages overlap and all `page` values are page-aligned.
 
-=== Page initialization
+== Page initialization
 
 #rj[check whether we need `fini` to be range-checked]
 We present here a set of constraints on the `PAGE` table that
@@ -213,7 +211,7 @@ and hence doesn't need a column, nor a range check.
       Most programs and compilers should however favor a memory locality that makes paged initialization/finalization comparable.
 ]
 
-=== Register initialization/finalization
+== Register initialization/finalization
 
 #rj[Properly link/reference ECALL/HALT chip]
 The initial and final state of registers can be entirely known by
@@ -223,11 +221,11 @@ by the HALT ecall.
 As additionally, the number of registers is small, the verifier can directly
 add the required balancing terms to the LogUp sum.
 
-== Notes and considerations
+= Notes and considerations
 
 - Register reads and writes may interact within a single cycle, so a correct and fixed ordering needs to be ensured
 - Correctness of initialization and completeness of finalization need to be ensured
 
-== Future topics of interest
+= Future topics of interest
 
 - Optimize memory systems after determining factual bottlenecks (e.g. taking inspiration from Twist and Shout, or other recent research)

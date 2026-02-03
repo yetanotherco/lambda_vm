@@ -12,20 +12,20 @@
 #let config = load_config()
 #let chip = load_chip("src/branch.toml", config)
 
-#show: book-page.with(title: "BRANCH chip")
+#show: book-page(chip.name)
 
-== Columns
+= Columns
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
 
 The `BRANCH` chip is comprised of #nr_variables variables that are expressed using #nr_columns columns:
 #render_chip_column_table(chip, config)
 
-== Assumptions
+= Assumptions
 
 #render_chip_assumptions(chip, config)
 
-== Constraints
+= Constraints
 
 #rj[Check correspondence with CPU for passing in `offset` as word or dword]
 We constrain `next_pc` to be $#`base_address` + #`offset`$,
@@ -37,7 +37,7 @@ The range checks on `unmasked_low_byte` and `next_pc_low[0]` are performed impli
 This chip contributes the following to the lookup argument.
 #render_constraint_table(chip, config, groups: "output")
 
-== Padding
+= Padding
 
 The table can be padded to the next power of two with the following value assignments:
 
