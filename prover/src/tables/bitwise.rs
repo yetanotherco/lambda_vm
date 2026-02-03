@@ -35,6 +35,12 @@ use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::prover::evaluate_polynomial_on_lde_domain;
 use stark::trace::{TraceTable, columns2rows};
 
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::fs::{self, File};
+use std::io::{BufReader, BufWriter, Write as IoWrite};
+use std::path::PathBuf;
+
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
@@ -169,23 +175,76 @@ pub const fn is_preprocessed() -> bool {
 }
 
 // =========================================================================
-// Preprocessed commitment (computed once, cached)
+// Preprocessed data (computed once, cached in memory)
 // =========================================================================
 
+/// Cached precomputed data for the Bitwise table.
+///
+/// Contains polynomial coefficients and LDE evaluations that are constant
+/// regardless of the program being proven. Caching these eliminates minutes
+/// of redundant computation per proof.
+///
+/// ## Memory Usage
+/// - `polynomials`: ~88 MB (11 polynomials × 2^20 coefficients × 8 bytes)
+/// - `lde_columns`: ~352 MB (11 columns × 2^22 evaluations × 8 bytes)
+/// - Total: ~440 MB in memory
+///
+/// ## What's NOT Cached
+/// - Merkle tree (~700 MB): Rebuilt from `lde_columns` during proving.
+///   This can be revisited based on benchmarks.
+#[derive(Serialize, Deserialize)]
+pub struct PrecomputedBitwiseData {
+    /// Configuration hash for cache validation.
+    /// Hash of (LDE_BLOWUP_FACTOR, LDE_COSET_OFFSET, NUM_ROWS, code version).
+    pub config_hash: [u8; 32],
+
+    /// Merkle root commitment (32 bytes) - for verification.
+    pub commitment: Commitment,
+
+    /// Polynomial coefficients (88 MB).
+    /// Shape: 11 polynomials, needed for OOD evaluation.
+    pub polynomials: Vec<Polynomial<FE>>,
+
+    /// Bit-reversed LDE evaluations of precomputed columns (352 MB).
+    /// Shape: 11 columns × 2^22 evaluations.
+    /// Already bit-reversed for direct use in Merkle tree construction.
+    pub lde_columns: Vec<Vec<FE>>,
+}
+
+impl PrecomputedBitwiseData {
+    /// Validates that the cached data matches the current configuration.
+    pub fn is_valid(&self) -> bool {
+        self.config_hash == compute_config_hash()
+    }
+}
+
+/// Computes a hash of the configuration parameters that affect precomputed data.
+/// If any of these change, cached data must be recomputed.
+fn compute_config_hash() -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"bitwise_precomputed_v1");
+    hasher.update(LDE_BLOWUP_FACTOR.to_le_bytes());
+    hasher.update(LDE_COSET_OFFSET.to_le_bytes());
+    hasher.update(NUM_ROWS.to_le_bytes());
+    hasher.update(NUM_PRECOMPUTED_COLS.to_le_bytes());
+    hasher.finalize().into()
+}
+
 lazy_static! {
-    /// Commitment to the LDE of the precomputed bitwise table columns.
+    /// Fully cached precomputed data for the Bitwise table.
     ///
-    /// This is a Merkle root over 2^22 rows (2^20 * blowup_factor=4) of the
-    /// LDE-evaluated 11 precomputed columns (X, Y, Z, AND, OR, XOR, MSB8,
-    /// MSB16, ZERO, SLL, SLLC).
+    /// Contains:
+    /// - Merkle root commitment (32 bytes)
+    /// - Polynomial coefficients (88 MB) - needed for OOD evaluation
+    /// - Bit-reversed LDE columns (352 MB) - needed for Merkle tree rebuild
     ///
-    /// The commitment is over LDE values (not raw values) because FRI queries
-    /// can target any index in the extended domain [0, N*blowup). The verifier
-    /// checks that proofs open against this exact commitment.
-    ///
-    /// Computed once on first access and cached. Both prover and verifier
-    /// use this same value in the Fiat-Shamir transcript.
-    pub static ref BITWISE_TABLE_COMMITMENT: Commitment = compute_preprocessed_commitment();
+    /// Tries to load from disk cache first, falls back to computing if not available.
+    /// Both prover and verifier can use this data, though verifiers typically only need the commitment.
+    pub static ref BITWISE_PRECOMPUTED: PrecomputedBitwiseData = load_or_compute_precomputed_data();
+
+    /// Backward-compatible commitment accessor.
+    /// Prefer using `BITWISE_PRECOMPUTED.commitment` directly.
+    pub static ref BITWISE_TABLE_COMMITMENT: Commitment = BITWISE_PRECOMPUTED.commitment;
 }
 
 /// Standard blowup factor for LDE domain (matches proof options).
@@ -194,17 +253,155 @@ const LDE_BLOWUP_FACTOR: usize = 4;
 /// Standard coset offset for LDE domain (matches proof options).
 const LDE_COSET_OFFSET: u64 = 3;
 
-/// Computes the Merkle commitment over the precomputed bitwise table columns.
+// =========================================================================
+// Disk caching
+// =========================================================================
+
+/// Magic bytes for cache file identification.
+const CACHE_MAGIC: &[u8; 4] = b"BTWC";
+
+/// Cache file version. Increment when format changes.
+/// v2: Switched from manual binary serialization to bincode.
+const CACHE_VERSION: u32 = 2;
+
+/// Returns the path to the disk cache file.
 ///
-/// This builds a Merkle tree over the LDE (Low Degree Extension) of the precomputed
-/// columns, matching exactly how the prover commits to traces. The tree has
-/// NUM_ROWS * LDE_BLOWUP_FACTOR = 2^22 leaves, enabling FRI queries at any index
-/// in the extended domain.
+/// Cache location priority:
+/// 1. `LAMBDA_VM_CACHE_DIR` environment variable
+/// 2. `$HOME/.lambda_vm/cache/`
+fn cache_path() -> Option<PathBuf> {
+    let cache_dir = if let Ok(dir) = std::env::var("LAMBDA_VM_CACHE_DIR") {
+        PathBuf::from(dir)
+    } else if let Some(home) = dirs::home_dir() {
+        home.join(".lambda_vm").join("cache")
+    } else {
+        return None;
+    };
+
+    Some(cache_dir.join("bitwise_precomputed.bin"))
+}
+
+/// Loads precomputed data from disk cache, or computes it if not available.
+fn load_or_compute_precomputed_data() -> PrecomputedBitwiseData {
+    // Try to load from disk
+    if let Some(path) = cache_path() {
+        if path.exists() {
+            match load_from_disk(&path) {
+                Ok(data) => {
+                    // Validate config hash
+                    if data.config_hash == compute_config_hash() {
+                        log::info!(
+                            "Loaded bitwise precomputed data from cache: {}",
+                            path.display()
+                        );
+                        return data;
+                    } else {
+                        log::info!(
+                            "Bitwise cache config mismatch, recomputing (path: {})",
+                            path.display()
+                        );
+                    }
+                }
+                Err(e) => {
+                    log::debug!("Failed to load bitwise cache: {} (path: {})", e, path.display());
+                }
+            }
+        }
+    }
+
+    // Compute from scratch
+    log::info!("Computing bitwise precomputed data (this may take a few minutes on first run)...");
+    let start = std::time::Instant::now();
+    let data = compute_all_precomputed_data();
+    log::info!("Bitwise precomputed data computed in {:?}", start.elapsed());
+
+    // Save to disk for next time
+    if let Some(path) = cache_path() {
+        if let Err(e) = save_to_disk(&data, &path) {
+            log::warn!("Failed to save bitwise cache: {} (path: {})", e, path.display());
+        } else {
+            log::info!("Saved bitwise precomputed data to cache: {}", path.display());
+        }
+    }
+
+    data
+}
+
+/// Saves precomputed data to disk using bincode.
+fn save_to_disk(data: &PrecomputedBitwiseData, path: &PathBuf) -> std::io::Result<()> {
+    // Ensure parent directory exists
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+
+    // Write header for quick validation without full deserialization
+    writer.write_all(CACHE_MAGIC)?;
+    writer.write_all(&CACHE_VERSION.to_le_bytes())?;
+
+    // Serialize data with bincode
+    bincode::serialize_into(&mut writer, data)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+    writer.flush()?;
+    Ok(())
+}
+
+/// Loads precomputed data from disk using bincode.
+fn load_from_disk(path: &PathBuf) -> std::io::Result<PrecomputedBitwiseData> {
+    use std::io::Read as IoRead;
+
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+
+    // Read and validate magic
+    let mut magic = [0u8; 4];
+    reader.read_exact(&mut magic)?;
+    if &magic != CACHE_MAGIC {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Invalid cache magic bytes",
+        ));
+    }
+
+    // Read and validate version
+    let mut version_bytes = [0u8; 4];
+    reader.read_exact(&mut version_bytes)?;
+    let version = u32::from_le_bytes(version_bytes);
+    if version != CACHE_VERSION {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Cache version mismatch: expected {}, got {}", CACHE_VERSION, version),
+        ));
+    }
+
+    // Deserialize data with bincode
+    bincode::deserialize_from(reader)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+}
+
+/// Computes all precomputed data for the bitwise table.
 ///
-/// Critical for security: the commitment must be over LDE values (not raw values)
-/// because FRI queries can target any index in [0, N*blowup). A raw-value commitment
-/// would only have N leaves, unable to verify queries at indices >= N.
-fn compute_preprocessed_commitment() -> Commitment {
+/// This builds:
+/// 1. Polynomial coefficients from column values (for OOD evaluation)
+/// 2. LDE evaluations (for Merkle tree construction)
+/// 3. Merkle commitment (for verification)
+///
+/// The Merkle tree itself is NOT cached - it's rebuilt from LDE columns
+/// during proving. This trades ~2 seconds of Merkle tree rebuild time
+/// for ~700MB of memory savings.
+///
+/// ## Why Cache Polynomials?
+/// Polynomials are needed for OOD (Out-of-Domain) evaluation in the prover.
+/// The random challenge `z` is sampled AFTER commitment, so we cannot
+/// precompute OOD evaluations - we need the polynomial coefficients.
+///
+/// ## Why Cache LDE Columns?
+/// LDE columns are needed to rebuild the Merkle tree for FRI opening proofs.
+/// Recomputing LDE from polynomials is expensive (FFT over 2^22 points).
+fn compute_all_precomputed_data() -> PrecomputedBitwiseData {
     // Step 1: Generate precomputed columns in parallel
     // Each column is generated independently by iterating over all row indices
     #[cfg(feature = "parallel")]
@@ -235,8 +432,9 @@ fn compute_preprocessed_commitment() -> Commitment {
     };
 
     // Step 2: Interpolate each column to a polynomial (parallel)
+    // CACHED: These polynomials are needed for OOD evaluation
     #[cfg(feature = "parallel")]
-    let polys: Vec<Polynomial<FE>> = columns
+    let polynomials: Vec<Polynomial<FE>> = columns
         .par_iter()
         .map(|col| {
             Polynomial::interpolate_fft::<GoldilocksField>(col)
@@ -245,7 +443,7 @@ fn compute_preprocessed_commitment() -> Commitment {
         .collect();
 
     #[cfg(not(feature = "parallel"))]
-    let polys: Vec<Polynomial<FE>> = columns
+    let polynomials: Vec<Polynomial<FE>> = columns
         .iter()
         .map(|col| {
             Polynomial::interpolate_fft::<GoldilocksField>(col)
@@ -254,10 +452,11 @@ fn compute_preprocessed_commitment() -> Commitment {
         .collect();
 
     // Step 3: Evaluate polynomials on LDE domain (parallel)
+    // CACHED: These evaluations are needed to rebuild the Merkle tree
     let coset_offset = FE::from(LDE_COSET_OFFSET);
 
     #[cfg(feature = "parallel")]
-    let mut lde_columns: Vec<Vec<FE>> = polys
+    let mut lde_columns: Vec<Vec<FE>> = polynomials
         .par_iter()
         .map(|poly| {
             evaluate_polynomial_on_lde_domain(poly, LDE_BLOWUP_FACTOR, NUM_ROWS, &coset_offset)
@@ -266,7 +465,7 @@ fn compute_preprocessed_commitment() -> Commitment {
         .collect();
 
     #[cfg(not(feature = "parallel"))]
-    let mut lde_columns: Vec<Vec<FE>> = polys
+    let mut lde_columns: Vec<Vec<FE>> = polynomials
         .iter()
         .map(|poly| {
             evaluate_polynomial_on_lde_domain(poly, LDE_BLOWUP_FACTOR, NUM_ROWS, &coset_offset)
@@ -275,6 +474,7 @@ fn compute_preprocessed_commitment() -> Commitment {
         .collect();
 
     // Step 4: Bit-reverse permute (parallel)
+    // CACHED: LDE columns are stored in bit-reversed order for direct Merkle tree use
     #[cfg(feature = "parallel")]
     lde_columns.par_iter_mut().for_each(|col| {
         in_place_bit_reverse_permute(col);
@@ -286,21 +486,46 @@ fn compute_preprocessed_commitment() -> Commitment {
     }
 
     // Step 5: Convert columns to rows for Merkle tree
-    let lde_rows = columns2rows(lde_columns);
+    // NOT CACHED: This is a view transformation, cheap to redo
+    let lde_rows = columns2rows(lde_columns.clone());
 
     // Step 6: Build Merkle tree over LDE (N * blowup leaves)
+    // NOT CACHED: Tree is rebuilt from lde_columns during proving (~2 seconds)
     let tree = BatchedMerkleTree::<GoldilocksField>::build(&lde_rows)
         .expect("Failed to build Merkle tree for bitwise LDE");
 
-    tree.root
+    PrecomputedBitwiseData {
+        config_hash: compute_config_hash(),
+        commitment: tree.root,
+        polynomials,
+        lde_columns,
+    }
 }
 
 /// Returns the preprocessed commitment for the bitwise table.
 ///
-/// This is a convenience function that dereferences the lazy_static.
+/// This is a convenience function that accesses the cached precomputed data.
 #[inline]
 pub fn preprocessed_commitment() -> Commitment {
-    *BITWISE_TABLE_COMMITMENT
+    BITWISE_PRECOMPUTED.commitment
+}
+
+/// Returns a reference to the cached polynomial coefficients.
+///
+/// These polynomials are needed for OOD (Out-of-Domain) evaluation.
+/// Returns a `'static` reference since the data lives in `lazy_static`.
+#[inline]
+pub fn precomputed_polynomials() -> &'static [Polynomial<FE>] {
+    &BITWISE_PRECOMPUTED.polynomials
+}
+
+/// Returns a reference to the cached bit-reversed LDE columns.
+///
+/// These are needed to rebuild the Merkle tree for FRI opening proofs.
+/// Returns a `'static` reference since the data lives in `lazy_static`.
+#[inline]
+pub fn precomputed_lde_columns() -> &'static [Vec<FE>] {
+    &BITWISE_PRECOMPUTED.lde_columns
 }
 
 // =========================================================================

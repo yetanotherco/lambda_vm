@@ -12,3 +12,7 @@ executor/shared_target/
 # Memory profiling
 **/dhat-heap.json
 
+# Precomputed cache files (if using LAMBDA_VM_CACHE_DIR in repo)
+*.precomputed.bin
+bitwise_precomputed.bin
+

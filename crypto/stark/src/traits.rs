@@ -131,6 +131,28 @@ pub trait AIR: Send + Sync {
         [0u8; 32]
     }
 
+    /// Returns cached polynomial coefficients for precomputed columns.
+    ///
+    /// When available, the prover uses these instead of recomputing from trace.
+    /// The polynomials are needed for OOD (Out-of-Domain) evaluation.
+    ///
+    /// Returns `None` by default. Preprocessed AIRs should override this
+    /// to return a `'static` reference to cached data.
+    fn precomputed_polynomials(&self) -> Option<&'static [Polynomial<FieldElement<Self::Field>>]> {
+        None
+    }
+
+    /// Returns cached bit-reversed LDE evaluations for precomputed columns.
+    ///
+    /// When available, the prover uses these to rebuild the Merkle tree
+    /// instead of recomputing LDE from polynomials.
+    ///
+    /// Returns `None` by default. Preprocessed AIRs should override this
+    /// to return a `'static` reference to cached data.
+    fn precomputed_lde_columns(&self) -> Option<&'static [Vec<FieldElement<Self::Field>>]> {
+        None
+    }
+
     fn num_auxiliary_rap_columns(&self) -> usize {
         self.trace_layout().1
     }

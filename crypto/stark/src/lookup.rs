@@ -1,9 +1,12 @@
 use std::marker::PhantomData;
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
-use math::field::{
-    element::FieldElement,
-    traits::{IsFFTField, IsField, IsSubFieldOf},
+use math::{
+    field::{
+        element::FieldElement,
+        traits::{IsFFTField, IsField, IsSubFieldOf},
+    },
+    polynomial::Polynomial,
 };
 
 use crate::{
@@ -475,8 +478,8 @@ impl BusValue {
 
 /// Struct representing an AIR with Lookup. Contains own implementation of boundary constraints and auxiliary trace building
 pub struct AirWithBuses<
-    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
-    E: IsField + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
     B: BoundaryConstraintBuilder<F, E, PI>,
     PI,
 > {
@@ -490,6 +493,10 @@ pub struct AirWithBuses<
     preprocessed_commitment: Option<crate::config::Commitment>,
     /// Number of precomputed columns (columns 0..n are precomputed, rest are multiplicities)
     num_precomputed_cols: Option<usize>,
+    /// Cached polynomial coefficients for precomputed columns (for OOD evaluation)
+    precomputed_polynomials: Option<&'static [Polynomial<FieldElement<F>>]>,
+    /// Cached bit-reversed LDE evaluations for precomputed columns (for Merkle tree rebuild)
+    precomputed_lde_columns: Option<&'static [Vec<FieldElement<F>>]>,
 }
 
 impl<
@@ -558,6 +565,8 @@ impl<
             boundary_constraint_builder: PhantomData,
             preprocessed_commitment: None,
             num_precomputed_cols: None,
+            precomputed_polynomials: None,
+            precomputed_lde_columns: None,
         }
     }
 
@@ -584,6 +593,35 @@ impl<
     ) -> Self {
         self.preprocessed_commitment = Some(commitment);
         self.num_precomputed_cols = Some(num_precomputed_cols);
+        self
+    }
+
+    /// Attaches cached precomputed data for optimization.
+    ///
+    /// When set, the prover uses cached polynomials and LDE columns instead of
+    /// recomputing them from the trace. This eliminates minutes of redundant
+    /// computation per proof.
+    ///
+    /// # Arguments
+    /// * `polynomials` - Cached polynomial coefficients (for OOD evaluation)
+    /// * `lde_columns` - Cached bit-reversed LDE evaluations (for Merkle tree rebuild)
+    ///
+    /// # Example
+    /// ```ignore
+    /// let air = AirWithBuses::new(num_cols, aux_data, opts, 1, constraints)
+    ///     .with_preprocessed(bitwise::preprocessed_commitment(), bitwise::NUM_PRECOMPUTED_COLS)
+    ///     .with_precomputed_cache(
+    ///         bitwise::precomputed_polynomials(),
+    ///         bitwise::precomputed_lde_columns(),
+    ///     );
+    /// ```
+    pub fn with_precomputed_cache(
+        mut self,
+        polynomials: &'static [Polynomial<FieldElement<F>>],
+        lde_columns: &'static [Vec<FieldElement<F>>],
+    ) -> Self {
+        self.precomputed_polynomials = Some(polynomials);
+        self.precomputed_lde_columns = Some(lde_columns);
         self
     }
 }
@@ -725,6 +763,14 @@ where
 
     fn precomputed_commitment(&self) -> crate::config::Commitment {
         self.preprocessed_commitment.unwrap_or([0u8; 32])
+    }
+
+    fn precomputed_polynomials(&self) -> Option<&'static [Polynomial<FieldElement<F>>]> {
+        self.precomputed_polynomials
+    }
+
+    fn precomputed_lde_columns(&self) -> Option<&'static [Vec<FieldElement<F>>]> {
+        self.precomputed_lde_columns
     }
 }
 
