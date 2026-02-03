@@ -147,10 +147,7 @@
         #body
       ])
     }
-  } else { // PDF
-    (body) => {
-        set heading(offset: 1)
-        body
-    }
+  } else {
+    (body) => body
   }
 }
