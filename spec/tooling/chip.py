@@ -1,32 +1,42 @@
-from dataclasses import dataclass
+from pathlib import Path
+import copy
 import sys
 import tomllib
-from typing import Optional, Union
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
+from typing import Optional, Union, Never
+
+def Bit_type():
+    return Type(None, "Bit")
 
 class ErrorReporter:
-    def __init__(self, location):
+    reported: bool
+    location: str
+    
+    def __init__(self, location: str):
         self.reported = False
         self.location = location
 
-    def update_location(self, loc):
+    def update_location(self, loc: str):
         self.reported = False
         self.location = loc
 
-    def error(self, message):
+    def error(self, message: str):
         self.reported = True
         print(f"ERROR {self.location}: {message}", file=sys.stderr)
 
-    def asserts(self, condition, message):
+    def asserts(self, condition: bool, message: str):
         if not condition:
             self.error(message)
 
 reporter = ErrorReporter("unknown")
 
-def assert_no_unexpected(data, possible_keys):
+def assert_no_unexpected(data: dict, possible_keys: Iterable[str]):
     for key in data.keys():
         reporter.asserts(key in possible_keys, f"Unexpected key: {key!r}")
-
-type Expr = (int
+        
+    
+type Expr = (LitExpr
             | VarExpr
             | IdxExpr
             | CastExpr
@@ -39,60 +49,180 @@ type Expr = (int
             | DummyExpr
             )
 
+# We can either have an explicit int literal (or const expression) or a known type
+# Returning 0 as dummy value should work in most cases, as constants can be used for
+# almost anything. The only exception being indexing.
+type TypeCheck = Type | int
+
+@dataclass
+class Environment:
+    config: "Config"
+    valmap: dict[str, int]
+    typemap: dict[str, "Type"]
+
+    def resolve_index(self, base: "Type", idx: int) -> TypeCheck:
+        if base.dimension is not None:
+            if not (0 <= idx < base.dimension):
+                reporter.error(f"Index out of range for {base!r}: {idx!r}")
+                idx = 0
+            if isinstance(base.base, str):
+                return Type(None, base.base)
+            else:
+                return base.base
+
+        assert isinstance(base.base, str), "We somehow made a type that's not an array, but has a non-str base"
+        typeconfigs = [tc for tc in self.config.variables.types if tc.label == base.base]
+        if len(typeconfigs) != 1:
+            reporter.error(f"Unable to resolve type: {base!r}")
+            return 0
+        typeconfig = typeconfigs[0]
+        if not (0 <= idx < len(typeconfig.subtypes)):
+            reporter.error(f"Index out of range for {base!r}: {idx!r}")
+            idx = 0
+        return typeconfig.subtypes[idx]
+
+def type_match(a: TypeCheck, b: TypeCheck, context: str) -> TypeCheck:
+    """Check that `a` and `b` are "compatible" TypeCheck values.
+    That is, either one of them is a constant, or the type is the same"""
+    # TODO: improve here; e.g. by allowing thing to match if their subtype is identical?
+    # Then would have to return the subtype to be sure?
+    # Maybe break everything down to subtypes, then it's purely structural matching?
+    if isinstance(a, int):
+        return b
+    if isinstance(b, int):
+        return a
+    reporter.asserts(a == b, f"Type mismatch between {a!r} and {b!r} [{context}]")
+    return 0
+
+@dataclass
+class LitExpr:
+    lit: int
+
+    def typecheck(self, _env: Environment) -> TypeCheck:
+        return self.lit
+
 @dataclass
 class VarExpr:
     name: str
+
+    def typecheck(self, env: Environment) -> TypeCheck:
+        if self.name in env.valmap:
+            return env.valmap[self.name]
+        if self.name in env.typemap:
+            return env.typemap[self.name]
+        reporter.error(f"Unknown variable: {self.name!r}")
+        return 0
 
 @dataclass
 class IdxExpr:
     base: Expr
     idx: Expr
 
+    def typecheck(self, env: Environment) -> TypeCheck:
+        base = self.base.typecheck(env)
+        idx = self.idx.typecheck(env)
+        if isinstance(base, int):
+            reporter.error(f"Trying to index a constant value: {self.base!r}")
+            return 0
+        if not isinstance(idx, int):
+            reporter.error(f"Trying to index with a non-constant: {self.idx!r}")
+            return 0
+        return env.resolve_index(base, idx)
+
 @dataclass
 class CastExpr:
     base: Expr
     type: "Type"
 
+    def typecheck(self, env: Environment) -> TypeCheck:
+        _base = self.base.typecheck(env)
+        # TODO? encode/list valid casts
+        return self.type
+
 @dataclass
 class MulExpr:
     factors: list[Expr]
 
+    def typecheck(self, env: Environment) -> TypeCheck:
+        t: TypeCheck = 0
+        for f in self.factors:
+            t = type_match(t, f.typecheck(env), repr(self))
+        return t
+
 @dataclass
 class AddExpr:
     terms: list[Expr]
+
+    def typecheck(self, env: Environment) -> TypeCheck:
+        t: TypeCheck = 0
+        for term in self.terms:
+            t = type_match(t, term.typecheck(env), repr(self))
+        return t
 
 @dataclass
 class SubExpr:
     head: Expr
     subs: list[Expr]
 
+    def typecheck(self, env: Environment) -> TypeCheck:
+        t = self.head.typecheck(env)
+        for term in self.subs:
+            t = type_match(t, term.typecheck(env), repr(self))
+        return t
+
 @dataclass
 class PowExpr:
     base: Expr
     exp: Expr
+
+    def typecheck(self, env: Environment) -> TypeCheck:
+        base = self.base.typecheck(env)
+        exp = self.exp.typecheck(env)
+        if not isinstance(base, int):
+            reporter.error(f"Invalid exponentiation with non-const base: {self.base!r}")
+            return 0
+        if not isinstance(exp, int):
+            reporter.error(f"Invalid exponentiation with non-const exponent: {self.exp!r}")
+            return 0
+        return base**exp
+            
 
 @dataclass
 class SumExpr:
     iter: "Iter"
     terms: Expr
 
+    def typecheck(self, env: Environment) -> TypeCheck:
+        t: TypeCheck = 0
+        for tc in self.iter.typecheck(env, lambda e: [self.terms.typecheck(e)]):
+            t = type_match(t, tc, repr(self))
+        return t
+
 @dataclass
 class NotExpr:
     inner: Expr
 
+    def typecheck(self, env: Environment) -> TypeCheck:
+        inner = self.inner.typecheck(env)
+        if isinstance(inner, int):
+            reporter.asserts(inner in {0, 1}, f"Not a bool passed to `not`: {self.inner!r}")
+            return 1 - inner
+        reporter.asserts(inner == Bit_type(), f"Not a bool passed to `not`: {self.inner!r}")
+        return Bit_type()
+
 @dataclass
 class DummyExpr:
-    pass
+    def typecheck(self, _env: Environment) -> TypeCheck:
+        return 0
 
-def build_expr(config: Optional["Config"], data) -> Expr:
-    # TODO
+def build_expr(config: Optional["Config"], data: object) -> Expr:
     # Does this need config, or do we delay any config-checking to when we use the expr?
     match data:
         case int(x):
-            return x
+            return LitExpr(x)
         case str(x):
             reporter.asserts(x.isidentifier(), f"Invalid identifier name for variable {x!r}")
-            return x
+            return VarExpr(x)
         case ["idx", x, y]:
             return IdxExpr(build_expr(config, x), build_expr(config, y))
         case ["cast", x, t]:
@@ -107,6 +237,7 @@ def build_expr(config: Optional["Config"], data) -> Expr:
         case ["^", base, exp]:
             return PowExpr(build_expr(config, base), build_expr(config, exp))
         case ["sum", ["=", str(var), start], stop, terms]:
+            assert config is not None
             return SumExpr(Iter(config, var, start, stop), build_expr(config, terms))
         case ["not", e]:
             return NotExpr(build_expr(config, e))
@@ -120,14 +251,30 @@ class Iter:
     start: Expr
     stop: Expr
 
-    def __init__(self, config, name, start, stop):
+    def __init__(self, config: "Config", name: str, start: object, stop: object):
         self.name = name
         reporter.asserts(isinstance(self.name, str), f"iter name is not a string: {self.name!r}")
         reporter.asserts(self.name.isidentifier(), f"Not a valid identifier: {self.name!r}")
         self.start = build_expr(config, start)
         self.stop = build_expr(config, stop)
 
-def iters_of(obj, name = None) -> list[Iter]:
+    def typecheck[T](self, env: Environment, callback: Callable[[Environment], Iterable[T]]) -> Iterable[T]:
+        start = self.start.typecheck(env)
+        if not isinstance(start, int):
+            reporter.error(f"Starting value of summation not a const: {self!r}")
+            start = 0
+        stop = self.stop.typecheck(env)
+        if not isinstance(stop, int):
+            reporter.error(f"Ending value of summation not a const: {self!r}")
+            stop = 0
+
+        for i in range(start, stop + 1):
+            old_env = copy.deepcopy(env)
+            env.valmap[self.name] = i
+            yield from callback(env)
+            env = old_env
+
+def iters_of(obj: dict, name = None) -> list[Iter]:
     """Return a list of iterators needed by `obj`. Taken from `iters` or `iter`.
     Prepend `name` to every iterator, if given.
     Adapted from the corresponding typst implementation."""
@@ -158,7 +305,7 @@ class Type:
     base: Union["Type", str]
     dimension: Optional[int]
 
-    def __init__(self, valid_types: Optional[list["TypeConfig"]], data):
+    def __init__(self, valid_types: Optional[list["TypeConfig"]], data: object):
         match data:
             case str(x):
                 reporter.asserts(valid_types is None or x in [tc.label for tc in valid_types], f"Invalid variable type: {x!r}")
@@ -177,7 +324,7 @@ class TypeConfig:
     desc: str
     preprocessed: bool
 
-    def __init__(self, data, valid_types=None):
+    def __init__(self, data: dict, valid_types=None):
         assert_no_unexpected(data, type(self).__annotations__.keys())
         self.label = data["label"]
         self.subtypes = [Type(valid_types, tp) for tp in data["subtypes"]]
@@ -189,7 +336,7 @@ class ConfigCategories:
     all: list[str]
     instantiated: list[str]
 
-    def __init__(self, data):
+    def __init__(self, data: dict):
         assert_no_unexpected(data, type(self).__annotations__.keys())
         self.all = data["all"]
         self.instantiated = data["instantiated"]
@@ -202,7 +349,7 @@ class ConfigVariables:
     types: list[TypeConfig]
     categories: ConfigCategories
 
-    def __init__(self, data):
+    def __init__(self, data: dict):
         assert_no_unexpected(data, type(self).__annotations__.keys())
         self.types = []
         for tp in data["types"]:
@@ -216,7 +363,7 @@ class ConfigVariables:
 class ConfigMetadata:
     version: int
 
-    def __init__(self, data):
+    def __init__(self, data: dict):
         assert_no_unexpected(data, type(self).__annotations__.keys())
         self.version = data["version"]
         reporter.asserts(isinstance(self.version, int), f"version {self.version!r} is not an int")
@@ -226,19 +373,19 @@ class Config:
     metadata: ConfigMetadata
     variables: ConfigVariables
 
-    def __init__(self, data):
+    def __init__(self, data: dict):
         """Construct a Config from toml-parsed data"""
         assert_no_unexpected(data, type(self).__annotations__.keys())
         self.metadata= ConfigMetadata(data["metadata"])
         self.variables = ConfigVariables(data["variables"])
         
     @classmethod
-    def from_file(cls, filename):
-        reporter.update_location(filename)
+    def from_file(cls, filename: str | Path) -> "Config":
+        reporter.update_location(str(filename))
         return cls(tomllib.load(open(filename, "rb")))
 
     @classmethod
-    def from_string(cls, s):
+    def from_string(cls, s: str) -> "Config":
         reporter.update_location("<string>")
         return cls(tomllib.loads(s))
 
@@ -252,7 +399,7 @@ class Variable:
     pad: Expr
     precomputed: bool
     
-    def __init__(self, config: Config, category: str, data):
+    def __init__(self, config: Config, category: str, data: dict):
         self.category = category
         assert_no_unexpected(data, Variable.__annotations__.keys())
         self.name = data["name"]
@@ -265,12 +412,18 @@ class Variable:
         self.precomputed = data.get("precomputed", False)
         reporter.asserts(isinstance(self.precomputed, bool), f"precomputed is not a bool: {self.precomputed!r}")
 
+def all_iters[T](its: list[Iter], env: Environment, callback: Callable[[Environment], Iterable[T]]) -> Iterable[T]:
+    if not its:
+        yield from callback(env)
+    else:
+        yield from its[0].typecheck(env, lambda e: all_iters(its[1:], e, callback))
+
 @dataclass
 class VirtualDef:
     # A list of polynomials with each a set of iters they range over
     defs: list[tuple[list[Iter], Expr]]
 
-    def __init__(self, config: Config, name: str, tp: Type, data):
+    def __init__(self, config: Config, name: str, tp: Type, data: dict):
         # TODO? More sanity checking the format (or is that duplicating work done in typst already)
         if "poly" in data:
             idx = data.get("idx", None)
@@ -285,19 +438,23 @@ class VirtualDef:
 class VirtualVariable(Variable):
     def_: VirtualDef
     
-    def __init__(self, config: Config, category: str, data):
+    def __init__(self, config: Config, category: str, data: dict):
         assert_no_unexpected(data, set(Variable.__annotations__.keys()) | {"def"})
         reporter.asserts("def" in data, f"Missing def for virtual column: {data!r}")
         def_ = data.pop("def", {})
         super().__init__(config, category, data)
         self.def_ = VirtualDef(config, self.name, self.type, def_)
 
+    def typecheck(self, env: Environment) -> TypeCheck:
+        # TODO
+        return 0
+
 @dataclass
 class Assumption:
     desc: str
     iters: list[Iter]
 
-    def __init__(self, config: Config, data):
+    def __init__(self, config: Config, data: dict):
         assert_no_unexpected(data, set(self.__annotations__.keys()) | {"iter", "iters", "ref"})
         self.desc = data["desc"]
         self.iters = iters_of(data)
@@ -309,7 +466,7 @@ class ArithConstraint:
     poly: Expr
     iters: list[Iter]
 
-    def __init__(self, config: Config, data):
+    def __init__(self, config: Config, data: dict):
         assert_no_unexpected(data, set(self.__annotations__.keys()) | {"kind", "ref", "iter", "iters"})
         assert data["kind"] == "arith"
         self.constraint = data["constraint"]
@@ -319,6 +476,18 @@ class ArithConstraint:
         self.poly = build_expr(config, data["poly"])
         self.iters = iters_of(data)
 
+    def typecheck(self, env: Environment) -> Iterable[Never]:
+        # TODO: is there any reason to typecheck if something is equatable to 0?
+        # Iteration for the side effect of typechecking and reporting errors
+        for _ in all_iters(self.iters, env, lambda e: [self.poly.typecheck(e)]):
+            pass
+        return []
+
+@dataclass
+class TemplateSignature:
+    tag: str
+    input: list[TypeCheck]
+    output: Optional[TypeCheck]
 
 @dataclass
 class TemplateConstraint:
@@ -329,7 +498,7 @@ class TemplateConstraint:
     cond: Optional[Expr]
     iters: list[Iter]
 
-    def __init__(self, config: Config, data):
+    def __init__(self, config: Config, data: dict):
         assert_no_unexpected(data, set(self.__annotations__.keys()) | {"kind", "ref", "iter", "iters"})
         assert data["kind"] == "template"
         self.tag = data["tag"]
@@ -347,6 +516,22 @@ class TemplateConstraint:
             self.cond = None
         self.iters = iters_of(data)
 
+    def typecheck(self, env: Environment) -> Iterable[TemplateSignature]:
+        def callback(e: Environment) -> Iterable[TemplateSignature]:
+            # TODO: Should we be able to check cond somehow?
+            if self.cond is not None:
+                self.cond.typecheck(e)
+            return [TemplateSignature(self.tag,
+                                        [inp.typecheck(e) for inp in self.input],
+                                        self.output.typecheck(e) if self.output else None)]
+        return all_iters(self.iters, env, callback)
+
+@dataclass
+class InteractionSignature:
+    tag: str
+    input: list[TypeCheck]
+    output: Optional[TypeCheck]
+
 @dataclass
 class InteractionConstraint:
     tag: str
@@ -355,7 +540,7 @@ class InteractionConstraint:
     multiplicity: Expr
     iters: list[Iter]
 
-    def __init__(self, config: Config, data):
+    def __init__(self, config: Config, data: dict):
         assert data["kind"] == "interaction"
         self.tag = data["tag"]
         reporter.asserts(isinstance(self.tag, str), f"tag {self.tag!r} is not a string")
@@ -367,13 +552,23 @@ class InteractionConstraint:
         self.multiplicity = build_expr(config, data["multiplicity"])
         self.iters = iters_of(data)
 
+    def typecheck(self, env: Environment) -> Iterable[InteractionSignature]:
+        def callback(e: Environment) -> Iterable[InteractionSignature]:
+            # TODO: Should we be able to check multiplicity somehow?
+            self.multiplicity.typecheck(e)
+            return [InteractionSignature(self.tag,
+                                        [inp.typecheck(e) for inp in self.input],
+                                        self.output.typecheck(e) if self.output else None)]
+        return all_iters(self.iters, env, callback)
+
 @dataclass
 class DummyConstraint:
-    pass
+    def typecheck(self, env: Environment) -> list[Never]:
+        return []
 
 type Constraint = ArithConstraint | TemplateConstraint | InteractionConstraint | DummyConstraint
 
-def build_constraint(config, data) -> Constraint:
+def build_constraint(config, data: dict) -> Constraint:
     match data["kind"]:
         case "arith":
             return ArithConstraint(config, data)
@@ -393,7 +588,7 @@ class Chip:
     assumptions: list[Assumption]
     constraints: list[Constraint]
     
-    def __init__(self, config: Config, data):
+    def __init__(self, config: Config, data: dict):
         """Construct a chip from toml-parsed data"""
         assert_no_unexpected(data, set(type(self).__annotations__.keys()) | {"constraint_groups"})
         assert_no_unexpected(data["variables"], config.variables.categories.all)
@@ -408,28 +603,37 @@ class Chip:
         self.constraints = [build_constraint(config, con) for group in data.get("constraints", {}).values() for con in group]
         
     @classmethod
-    def from_file(cls, config, filename):
-        reporter.update_location(filename)
+    def from_file(cls, config: Config, filename: str | Path) -> "Chip":
+        reporter.update_location(str(filename))
         return cls(config, tomllib.load(open(filename, "rb")))
 
     @classmethod
-    def from_string(cls, config, s):
+    def from_string(cls, config: Config, s: str) -> "Chip":
         reporter.update_location("<string>")
         return cls(config, tomllib.loads(s))
+
+    def typecheck(self) -> Iterable[TemplateSignature | InteractionSignature]:
+        env = Environment(self.config, {}, {v.name: v.type for v in self.variables})
+        for v in self.variables:
+            if isinstance(v, VirtualVariable):
+                v.typecheck(env)
+        for c in self.constraints:
+            yield from c.typecheck(env)
        
 
 if __name__ == "__main__":
-    import pprint
     config = Config.from_file(sys.argv[1])
     if reporter.reported:
         sys.exit(1)
     reported = False
-    chips = []
+    chips: list[Chip] = []
     for file in sys.argv[2:]:
         if file == sys.argv[1]:
             continue
-        print("Processing", file)
         chips.append(Chip.from_file(config, file))
         reported = reported or reporter.reported
     if not reported:
-        pprint.pprint(chips)
+        for chip in chips:
+            reporter.update_location(f"Chip {chip.name}")
+            # TODO: do something with the signatures
+            (list(chip.typecheck()))
