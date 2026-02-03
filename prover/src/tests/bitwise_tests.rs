@@ -253,57 +253,57 @@ fn test_generate_bitwise_row_matches_trace() {
 
         assert_eq!(
             const_row[0],
-            trace_row[cols::X].representative_u64(),
+            trace_row[cols::X].canonical_u64(),
             "X mismatch at index {idx}"
         );
         assert_eq!(
             const_row[1],
-            trace_row[cols::Y].representative_u64(),
+            trace_row[cols::Y].canonical_u64(),
             "Y mismatch at index {idx}"
         );
         assert_eq!(
             const_row[2],
-            trace_row[cols::Z].representative_u64(),
+            trace_row[cols::Z].canonical_u64(),
             "Z mismatch at index {idx}"
         );
         assert_eq!(
             const_row[3],
-            trace_row[cols::AND].representative_u64(),
+            trace_row[cols::AND].canonical_u64(),
             "AND mismatch at index {idx}"
         );
         assert_eq!(
             const_row[4],
-            trace_row[cols::OR].representative_u64(),
+            trace_row[cols::OR].canonical_u64(),
             "OR mismatch at index {idx}"
         );
         assert_eq!(
             const_row[5],
-            trace_row[cols::XOR].representative_u64(),
+            trace_row[cols::XOR].canonical_u64(),
             "XOR mismatch at index {idx}"
         );
         assert_eq!(
             const_row[6],
-            trace_row[cols::MSB8].representative_u64(),
+            trace_row[cols::MSB8].canonical_u64(),
             "MSB8 mismatch at index {idx}"
         );
         assert_eq!(
             const_row[7],
-            trace_row[cols::MSB16].representative_u64(),
+            trace_row[cols::MSB16].canonical_u64(),
             "MSB16 mismatch at index {idx}"
         );
         assert_eq!(
             const_row[8],
-            trace_row[cols::ZERO].representative_u64(),
+            trace_row[cols::ZERO].canonical_u64(),
             "ZERO mismatch at index {idx}"
         );
         assert_eq!(
             const_row[9],
-            trace_row[cols::SLL].representative_u64(),
+            trace_row[cols::SLL].canonical_u64(),
             "SLL mismatch at index {idx}"
         );
         assert_eq!(
             const_row[10],
-            trace_row[cols::SLLC].representative_u64(),
+            trace_row[cols::SLLC].canonical_u64(),
             "SLLC mismatch at index {idx}"
         );
     }
@@ -321,7 +321,7 @@ fn test_generate_bitwise_row_exhaustive_sample() {
 
         for col in 0..NUM_PRECOMPUTED_COLS {
             let const_val = const_row[col];
-            let trace_val = trace_row[col].representative_u64();
+            let trace_val = trace_row[col].canonical_u64();
             assert_eq!(
                 const_val, trace_val,
                 "Mismatch at index {idx}, column {col}: const={const_val}, trace={trace_val}"
