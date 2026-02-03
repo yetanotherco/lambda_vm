@@ -174,7 +174,6 @@ fn reduce128(x: u128) -> u64 {
     }
 }
 
-
 /// Inversion using optimized addition chain for a^(p-2).
 /// Based on Plonky2's approach.
 ///
@@ -334,8 +333,8 @@ impl AsBytes for FieldElement<GoldilocksField> {
 }
 
 // Implement IsPrimeField for the native Goldilocks
-use crate::field::traits::IsPrimeField;
 use crate::errors::CreationError;
+use crate::field::traits::IsPrimeField;
 
 impl IsPrimeField for GoldilocksField {
     type RepresentativeType = u64;
@@ -352,7 +351,7 @@ impl IsPrimeField for GoldilocksField {
     fn from_hex(hex_string: &str) -> Result<Self::BaseType, CreationError> {
         let hex = hex_string.strip_prefix("0x").unwrap_or(hex_string);
         u64::from_str_radix(hex, 16)
-            .map(|v| Self::from_u64(v))
+            .map(Self::from_u64)
             .map_err(|_| CreationError::InvalidHexString)
     }
 
@@ -413,7 +412,10 @@ mod tests {
         let a = 3u64;
         let b = 10u64;
         let result = GoldilocksField::sub(&a, &b);
-        assert_eq!(GoldilocksField::representative(&result), GOLDILOCKS_PRIME - 7);
+        assert_eq!(
+            GoldilocksField::representative(&result),
+            GOLDILOCKS_PRIME - 7
+        );
     }
 
     #[test]
@@ -484,7 +486,12 @@ mod tests {
         for a in [5u64, 123456789, GOLDILOCKS_PRIME - 1, 0xDEADBEEF, 1, 2] {
             let a_inv = inv_addition_chain(a);
             let product = GoldilocksField::mul(&a, &a_inv);
-            assert_eq!(GoldilocksField::representative(&product), 1, "Failed for a = {}", a);
+            assert_eq!(
+                GoldilocksField::representative(&product),
+                1,
+                "Failed for a = {}",
+                a
+            );
         }
     }
 
