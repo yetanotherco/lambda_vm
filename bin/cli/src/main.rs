@@ -30,9 +30,9 @@
 //!
 //! | Level | Security | Blowup | Queries | Use Case |
 //! |-------|----------|--------|---------|----------|
-//! | fast | Conjecturable 100-bit | 4 | 26 | Development |
-//! | standard | Provable 100-bit | 4 | 70 | Default |
-//! | maximum | Provable 128-bit | 8 | 50 | Production |
+//! | fast | Conjecturable 100-bit | 4 | 41 | Development |
+//! | standard | Provable 100-bit | 4 | 104 | Default |
+//! | maximum | Provable 128-bit | 4 | 140 | Production |
 //!
 //! # Example Usage
 //!
