@@ -6,13 +6,15 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Optional, Union, Never
 
+
 def Bit_type():
     return Type(None, "Bit")
+
 
 class ErrorReporter:
     reported: bool
     location: str
-    
+
     def __init__(self, location: str):
         self.reported = False
         self.location = location
@@ -29,30 +31,34 @@ class ErrorReporter:
         if not condition:
             self.error(message)
 
+
 reporter = ErrorReporter("unknown")
+
 
 def assert_no_unexpected(data: dict, possible_keys: Iterable[str]):
     for key in data.keys():
         reporter.asserts(key in possible_keys, f"Unexpected key: {key!r}")
-        
-    
-type Expr = (LitExpr
-            | VarExpr
-            | IdxExpr
-            | CastExpr
-            | MulExpr
-            | AddExpr
-            | SubExpr
-            | PowExpr
-            | SumExpr
-            | NotExpr
-            | DummyExpr
-            )
+
+
+type Expr = (
+    LitExpr
+    | VarExpr
+    | IdxExpr
+    | CastExpr
+    | MulExpr
+    | AddExpr
+    | SubExpr
+    | PowExpr
+    | SumExpr
+    | NotExpr
+    | DummyExpr
+)
 
 # We can either have an explicit int literal (or const expression) or a known type
 # Returning 0 as dummy value should work in most cases, as constants can be used for
 # almost anything. The only exception being indexing.
 type TypeCheck = Type | int
+
 
 @dataclass
 class Environment:
@@ -70,8 +76,12 @@ class Environment:
             else:
                 return base.base
 
-        assert isinstance(base.base, str), "We somehow made a type that's not an array, but has a non-str base"
-        typeconfigs = [tc for tc in self.config.variables.types if tc.label == base.base]
+        assert isinstance(base.base, str), (
+            "We somehow made a type that's not an array, but has a non-str base"
+        )
+        typeconfigs = [
+            tc for tc in self.config.variables.types if tc.label == base.base
+        ]
         if len(typeconfigs) != 1:
             reporter.error(f"Unable to resolve type: {base!r}")
             return 0
@@ -80,6 +90,7 @@ class Environment:
             reporter.error(f"Index out of range for {base!r}: {idx!r}")
             idx = 0
         return typeconfig.subtypes[idx]
+
 
 def type_match(a: TypeCheck, b: TypeCheck, context: str) -> TypeCheck:
     """Check that `a` and `b` are "compatible" TypeCheck values.
@@ -94,12 +105,14 @@ def type_match(a: TypeCheck, b: TypeCheck, context: str) -> TypeCheck:
     reporter.asserts(a == b, f"Type mismatch between {a!r} and {b!r} [{context}]")
     return 0
 
+
 @dataclass
 class LitExpr:
     lit: int
 
     def typecheck(self, _env: Environment) -> TypeCheck:
         return self.lit
+
 
 @dataclass
 class VarExpr:
@@ -112,6 +125,7 @@ class VarExpr:
             return env.typemap[self.name]
         reporter.error(f"Unknown variable: {self.name!r}")
         return 0
+
 
 @dataclass
 class IdxExpr:
@@ -129,6 +143,7 @@ class IdxExpr:
             return 0
         return env.resolve_index(base, idx)
 
+
 @dataclass
 class CastExpr:
     base: Expr
@@ -138,6 +153,7 @@ class CastExpr:
         _base = self.base.typecheck(env)
         # TODO? encode/list valid casts
         return self.type
+
 
 @dataclass
 class MulExpr:
@@ -149,6 +165,7 @@ class MulExpr:
             t = type_match(t, f.typecheck(env), repr(self))
         return t
 
+
 @dataclass
 class AddExpr:
     terms: list[Expr]
@@ -158,6 +175,7 @@ class AddExpr:
         for term in self.terms:
             t = type_match(t, term.typecheck(env), repr(self))
         return t
+
 
 @dataclass
 class SubExpr:
@@ -169,6 +187,7 @@ class SubExpr:
         for term in self.subs:
             t = type_match(t, term.typecheck(env), repr(self))
         return t
+
 
 @dataclass
 class PowExpr:
@@ -182,10 +201,12 @@ class PowExpr:
             reporter.error(f"Invalid exponentiation with non-const base: {self.base!r}")
             return 0
         if not isinstance(exp, int):
-            reporter.error(f"Invalid exponentiation with non-const exponent: {self.exp!r}")
+            reporter.error(
+                f"Invalid exponentiation with non-const exponent: {self.exp!r}"
+            )
             return 0
         return base**exp
-            
+
 
 @dataclass
 class SumExpr:
@@ -198,6 +219,7 @@ class SumExpr:
             t = type_match(t, tc, repr(self))
         return t
 
+
 @dataclass
 class NotExpr:
     inner: Expr
@@ -205,15 +227,21 @@ class NotExpr:
     def typecheck(self, env: Environment) -> TypeCheck:
         inner = self.inner.typecheck(env)
         if isinstance(inner, int):
-            reporter.asserts(inner in {0, 1}, f"Not a bool passed to `not`: {self.inner!r}")
+            reporter.asserts(
+                inner in {0, 1}, f"Not a bool passed to `not`: {self.inner!r}"
+            )
             return 1 - inner
-        reporter.asserts(inner == Bit_type(), f"Not a bool passed to `not`: {self.inner!r}")
+        reporter.asserts(
+            inner == Bit_type(), f"Not a bool passed to `not`: {self.inner!r}"
+        )
         return Bit_type()
+
 
 @dataclass
 class DummyExpr:
     def typecheck(self, _env: Environment) -> TypeCheck:
         return 0
+
 
 def build_expr(config: Optional["Config"], data: object) -> Expr:
     # Does this need config, or do we delay any config-checking to when we use the expr?
@@ -221,7 +249,9 @@ def build_expr(config: Optional["Config"], data: object) -> Expr:
         case int(x):
             return LitExpr(x)
         case str(x):
-            reporter.asserts(x.isidentifier(), f"Invalid identifier name for variable {x!r}")
+            reporter.asserts(
+                x.isidentifier(), f"Invalid identifier name for variable {x!r}"
+            )
             return VarExpr(x)
         case ["idx", x, y]:
             return IdxExpr(build_expr(config, x), build_expr(config, y))
@@ -233,7 +263,9 @@ def build_expr(config: Optional["Config"], data: object) -> Expr:
         case ["+", *terms]:
             return AddExpr([build_expr(config, t) for t in terms])
         case ["-", head, *subs]:
-            return SubExpr(build_expr(config, head), [build_expr(config, s) for s in subs])
+            return SubExpr(
+                build_expr(config, head), [build_expr(config, s) for s in subs]
+            )
         case ["^", base, exp]:
             return PowExpr(build_expr(config, base), build_expr(config, exp))
         case ["sum", ["=", str(var), start], stop, terms]:
@@ -245,6 +277,7 @@ def build_expr(config: Optional["Config"], data: object) -> Expr:
             reporter.error(f"Unknown expression: {other!r}")
             return DummyExpr()
 
+
 @dataclass
 class Iter:
     name: str
@@ -253,12 +286,18 @@ class Iter:
 
     def __init__(self, config: "Config", name: str, start: object, stop: object):
         self.name = name
-        reporter.asserts(isinstance(self.name, str), f"iter name is not a string: {self.name!r}")
-        reporter.asserts(self.name.isidentifier(), f"Not a valid identifier: {self.name!r}")
+        reporter.asserts(
+            isinstance(self.name, str), f"iter name is not a string: {self.name!r}"
+        )
+        reporter.asserts(
+            self.name.isidentifier(), f"Not a valid identifier: {self.name!r}"
+        )
         self.start = build_expr(config, start)
         self.stop = build_expr(config, stop)
 
-    def typecheck[T](self, env: Environment, callback: Callable[[Environment], Iterable[T]]) -> Iterable[T]:
+    def typecheck[T](
+        self, env: Environment, callback: Callable[[Environment], Iterable[T]]
+    ) -> Iterable[T]:
         start = self.start.typecheck(env)
         if not isinstance(start, int):
             reporter.error(f"Starting value of summation not a const: {self!r}")
@@ -274,10 +313,12 @@ class Iter:
             yield from callback(env)
             env = old_env
 
-def iters_of(obj: dict, name = None) -> list[Iter]:
+
+def iters_of(obj: dict, name=None) -> list[Iter]:
     """Return a list of iterators needed by `obj`. Taken from `iters` or `iter`.
     Prepend `name` to every iterator, if given.
     Adapted from the corresponding typst implementation."""
+
     def clean_iter(it):
         arr = it if isinstance(it, list) else [it]
         if name is not None:
@@ -293,12 +334,15 @@ def iters_of(obj: dict, name = None) -> list[Iter]:
         return Iter(config, *arr)
 
     if "iters" in obj:
-        reporter.asserts("iter" not in obj, f"Object has both `iters` and `iter`: {obj!r}")
+        reporter.asserts(
+            "iter" not in obj, f"Object has both `iters` and `iter`: {obj!r}"
+        )
         return [clean_iter(it) for it in obj["iters"]]
     elif "iter" in obj:
         return [clean_iter(obj["iter"])]
     else:
         return []
+
 
 @dataclass
 class Type:
@@ -308,7 +352,10 @@ class Type:
     def __init__(self, valid_types: Optional[list["TypeConfig"]], data: object):
         match data:
             case str(x):
-                reporter.asserts(valid_types is None or x in [tc.label for tc in valid_types], f"Invalid variable type: {x!r}")
+                reporter.asserts(
+                    valid_types is None or x in [tc.label for tc in valid_types],
+                    f"Invalid variable type: {x!r}",
+                )
                 self.base = x
                 self.dimension = None
             case [base, int(dim)]:
@@ -316,6 +363,7 @@ class Type:
                 self.dimension = dim
             case other:
                 reporter.error(f"Unable to parse type: {other!r}")
+
 
 @dataclass
 class TypeConfig:
@@ -331,6 +379,7 @@ class TypeConfig:
         self.desc = data["desc"]
         self.preprocessed = data.get("preprocessed", False)
 
+
 @dataclass
 class ConfigCategories:
     all: list[str]
@@ -340,8 +389,14 @@ class ConfigCategories:
         assert_no_unexpected(data, type(self).__annotations__.keys())
         self.all = data["all"]
         self.instantiated = data["instantiated"]
-        reporter.asserts(all(isinstance(v, str) for v in self.all), f"Something's not a string: {self.all}")
-        reporter.asserts(all(isinstance(v, str) for v in self.instantiated), f"Something's not a string: {self.instantiated}")
+        reporter.asserts(
+            all(isinstance(v, str) for v in self.all),
+            f"Something's not a string: {self.all}",
+        )
+        reporter.asserts(
+            all(isinstance(v, str) for v in self.instantiated),
+            f"Something's not a string: {self.instantiated}",
+        )
 
 
 @dataclass
@@ -359,6 +414,7 @@ class ConfigVariables:
                 self.types.append(TypeConfig(tp, valid_types=self.types))
         self.categories = ConfigCategories(data["categories"])
 
+
 @dataclass
 class ConfigMetadata:
     version: int
@@ -366,7 +422,10 @@ class ConfigMetadata:
     def __init__(self, data: dict):
         assert_no_unexpected(data, type(self).__annotations__.keys())
         self.version = data["version"]
-        reporter.asserts(isinstance(self.version, int), f"version {self.version!r} is not an int")
+        reporter.asserts(
+            isinstance(self.version, int), f"version {self.version!r} is not an int"
+        )
+
 
 @dataclass
 class Config:
@@ -376,9 +435,9 @@ class Config:
     def __init__(self, data: dict):
         """Construct a Config from toml-parsed data"""
         assert_no_unexpected(data, type(self).__annotations__.keys())
-        self.metadata= ConfigMetadata(data["metadata"])
+        self.metadata = ConfigMetadata(data["metadata"])
         self.variables = ConfigVariables(data["variables"])
-        
+
     @classmethod
     def from_file(cls, filename: str | Path) -> "Config":
         reporter.update_location(str(filename))
@@ -398,7 +457,7 @@ class Variable:
     desc: str
     pad: Expr
     precomputed: bool
-    
+
     def __init__(self, config: Config, category: str, data: dict):
         self.category = category
         assert_no_unexpected(data, Variable.__annotations__.keys())
@@ -410,13 +469,20 @@ class Variable:
         reporter.asserts(isinstance(self.desc, str), f"{self.desc!r} is not a string")
         self.pad = build_expr(None, data.get("pad", 0))
         self.precomputed = data.get("precomputed", False)
-        reporter.asserts(isinstance(self.precomputed, bool), f"precomputed is not a bool: {self.precomputed!r}")
+        reporter.asserts(
+            isinstance(self.precomputed, bool),
+            f"precomputed is not a bool: {self.precomputed!r}",
+        )
 
-def all_iters[T](its: list[Iter], env: Environment, callback: Callable[[Environment], Iterable[T]]) -> Iterable[T]:
+
+def all_iters[T](
+    its: list[Iter], env: Environment, callback: Callable[[Environment], Iterable[T]]
+) -> Iterable[T]:
     if not its:
         yield from callback(env)
     else:
         yield from its[0].typecheck(env, lambda e: all_iters(its[1:], e, callback))
+
 
 @dataclass
 class VirtualDef:
@@ -427,17 +493,21 @@ class VirtualDef:
         # TODO? More sanity checking the format (or is that duplicating work done in typst already)
         if "poly" in data:
             idx = data.get("idx", None)
-            self.defs = [(iters_of(data, name = idx), build_expr(config, data["poly"]))]
+            self.defs = [(iters_of(data, name=idx), build_expr(config, data["poly"]))]
         elif "polys" in data:
             idx = data.get("idx", None)
-            self.defs = [(iters_of(poly, name = idx), build_expr(config, poly["poly"])) for poly in data["polys"]]
+            self.defs = [
+                (iters_of(poly, name=idx), build_expr(config, poly["poly"]))
+                for poly in data["polys"]
+            ]
         else:
             self.defs = [([], build_expr(config, data))]
+
 
 @dataclass
 class VirtualVariable(Variable):
     def_: VirtualDef
-    
+
     def __init__(self, config: Config, category: str, data: dict):
         assert_no_unexpected(data, set(Variable.__annotations__.keys()) | {"def"})
         reporter.asserts("def" in data, f"Missing def for virtual column: {data!r}")
@@ -449,15 +519,19 @@ class VirtualVariable(Variable):
         # TODO
         return 0
 
+
 @dataclass
 class Assumption:
     desc: str
     iters: list[Iter]
 
     def __init__(self, config: Config, data: dict):
-        assert_no_unexpected(data, set(self.__annotations__.keys()) | {"iter", "iters", "ref"})
+        assert_no_unexpected(
+            data, set(self.__annotations__.keys()) | {"iter", "iters", "ref"}
+        )
         self.desc = data["desc"]
         self.iters = iters_of(data)
+
 
 @dataclass
 class ArithConstraint:
@@ -467,12 +541,19 @@ class ArithConstraint:
     iters: list[Iter]
 
     def __init__(self, config: Config, data: dict):
-        assert_no_unexpected(data, set(self.__annotations__.keys()) | {"kind", "ref", "iter", "iters"})
+        assert_no_unexpected(
+            data, set(self.__annotations__.keys()) | {"kind", "ref", "iter", "iters"}
+        )
         assert data["kind"] == "arith"
         self.constraint = data["constraint"]
-        reporter.asserts(isinstance(self.constraint, str), f"Constraint not a string: {self.constraint!r}")
+        reporter.asserts(
+            isinstance(self.constraint, str),
+            f"Constraint not a string: {self.constraint!r}",
+        )
         self.desc = data.get("desc", "")
-        reporter.asserts(isinstance(self.desc, str), f"desc is not a string: {self.desc!r}")
+        reporter.asserts(
+            isinstance(self.desc, str), f"desc is not a string: {self.desc!r}"
+        )
         self.poly = build_expr(config, data["poly"])
         self.iters = iters_of(data)
 
@@ -483,11 +564,13 @@ class ArithConstraint:
             pass
         return []
 
+
 @dataclass
 class TemplateSignature:
     tag: str
     input: list[TypeCheck]
     output: Optional[TypeCheck]
+
 
 @dataclass
 class TemplateConstraint:
@@ -499,12 +582,18 @@ class TemplateConstraint:
     iters: list[Iter]
 
     def __init__(self, config: Config, data: dict):
-        assert_no_unexpected(data, set(self.__annotations__.keys()) | {"kind", "ref", "iter", "iters"})
+        assert_no_unexpected(
+            data, set(self.__annotations__.keys()) | {"kind", "ref", "iter", "iters"}
+        )
         assert data["kind"] == "template"
         self.tag = data["tag"]
-        reporter.asserts(isinstance(self.tag, str), f"tag is not a string: {self.tag!r}")
+        reporter.asserts(
+            isinstance(self.tag, str), f"tag is not a string: {self.tag!r}"
+        )
         self.desc = data.get("desc", "")
-        reporter.asserts(isinstance(self.desc, str), f"Description is not a string: {self.desc!r}")
+        reporter.asserts(
+            isinstance(self.desc, str), f"Description is not a string: {self.desc!r}"
+        )
         self.input = [build_expr(config, inp) for inp in data["input"]]
         if "output" in data:
             self.output = build_expr(config, data["output"])
@@ -521,16 +610,23 @@ class TemplateConstraint:
             # TODO: Should we be able to check cond somehow?
             if self.cond is not None:
                 self.cond.typecheck(e)
-            return [TemplateSignature(self.tag,
-                                        [inp.typecheck(e) for inp in self.input],
-                                        self.output.typecheck(e) if self.output else None)]
+            return [
+                TemplateSignature(
+                    self.tag,
+                    [inp.typecheck(e) for inp in self.input],
+                    self.output.typecheck(e) if self.output else None,
+                )
+            ]
+
         return all_iters(self.iters, env, callback)
+
 
 @dataclass
 class InteractionSignature:
     tag: str
     input: list[TypeCheck]
     output: Optional[TypeCheck]
+
 
 @dataclass
 class InteractionConstraint:
@@ -556,17 +652,27 @@ class InteractionConstraint:
         def callback(e: Environment) -> Iterable[InteractionSignature]:
             # TODO: Should we be able to check multiplicity somehow?
             self.multiplicity.typecheck(e)
-            return [InteractionSignature(self.tag,
-                                        [inp.typecheck(e) for inp in self.input],
-                                        self.output.typecheck(e) if self.output else None)]
+            return [
+                InteractionSignature(
+                    self.tag,
+                    [inp.typecheck(e) for inp in self.input],
+                    self.output.typecheck(e) if self.output else None,
+                )
+            ]
+
         return all_iters(self.iters, env, callback)
+
 
 @dataclass
 class DummyConstraint:
     def typecheck(self, env: Environment) -> list[Never]:
         return []
 
-type Constraint = ArithConstraint | TemplateConstraint | InteractionConstraint | DummyConstraint
+
+type Constraint = (
+    ArithConstraint | TemplateConstraint | InteractionConstraint | DummyConstraint
+)
+
 
 def build_constraint(config, data: dict) -> Constraint:
     match data["kind"]:
@@ -580,6 +686,7 @@ def build_constraint(config, data: dict) -> Constraint:
             reporter.error(f"Unknown constraint kind: {other!r}")
             return DummyConstraint()
 
+
 @dataclass
 class Chip:
     config: Config
@@ -587,21 +694,35 @@ class Chip:
     variables: list[Variable]
     assumptions: list[Assumption]
     constraints: list[Constraint]
-    
+
     def __init__(self, config: Config, data: dict):
         """Construct a chip from toml-parsed data"""
-        assert_no_unexpected(data, set(type(self).__annotations__.keys()) | {"constraint_groups"})
+        assert_no_unexpected(
+            data, set(type(self).__annotations__.keys()) | {"constraint_groups"}
+        )
         assert_no_unexpected(data["variables"], config.variables.categories.all)
         self.config = config
         self.name = data["name"]
-        reporter.asserts(isinstance(self.name, str), f"name is not a string: {self.name!r}")
+        reporter.asserts(
+            isinstance(self.name, str), f"name is not a string: {self.name!r}"
+        )
         reporter.asserts(self.name.isidentifier(), f"Invalid identifier: {self.name!r}")
-        self.variables = [(Variable if cat != "virtual" else VirtualVariable)(config, cat, var) for cat, vars in data["variables"].items() for var in vars]
-        self.assumptions = [Assumption(config, asm) for asm in data.get("assumptions", [])]
+        self.variables = [
+            (Variable if cat != "virtual" else VirtualVariable)(config, cat, var)
+            for cat, vars in data["variables"].items()
+            for var in vars
+        ]
+        self.assumptions = [
+            Assumption(config, asm) for asm in data.get("assumptions", [])
+        ]
         constraint_groups = [grp["name"] for grp in data.get("constraint_groups", [])]
         assert_no_unexpected(data.get("constraints", {}), constraint_groups)
-        self.constraints = [build_constraint(config, con) for group in data.get("constraints", {}).values() for con in group]
-        
+        self.constraints = [
+            build_constraint(config, con)
+            for group in data.get("constraints", {}).values()
+            for con in group
+        ]
+
     @classmethod
     def from_file(cls, config: Config, filename: str | Path) -> "Chip":
         reporter.update_location(str(filename))
@@ -619,7 +740,7 @@ class Chip:
                 v.typecheck(env)
         for c in self.constraints:
             yield from c.typecheck(env)
-       
+
 
 if __name__ == "__main__":
     config = Config.from_file(sys.argv[1])
