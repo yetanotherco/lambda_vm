@@ -77,7 +77,7 @@ use stark::prover::{IsStarkProver, Prover};
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
-use proof_bundle::{ProofBundle, PROOF_BUNDLE_VERSION};
+use proof_bundle::{PROOF_BUNDLE_VERSION, ProofBundle};
 
 type F = GoldilocksField;
 
