@@ -191,7 +191,7 @@ name = "abs_diff"
 [[constraints.abs_diff]]
 kind = "interaction"
 tag = "LT"
-input = ["abs_r", "abs_d", 0]
+input = [["cast", "abs_r", "DWordWL"], ["cast", "abs_d", "DWordWL"], 0]
 output = ["not", "div_by_zero"]
 multiplicity = "μ_sum"
 ref ="dvrm:c:abs_r_lt_abs_d"
@@ -207,8 +207,8 @@ ref = "dvrm:c:abs_r_range_check"
 [[constraints.abs_diff]]
 kind = "template"
 tag = "SUB"
-input = [0, "r"]
-output = "abs_r"
+input = [0, ["cast", "r", "DWordWL"]]
+output = ["cast", "abs_r", "DWordWL"]
 cond = "sign_r"
 ref = "dvrm:c:abs_r_if_negative"
 
@@ -230,8 +230,8 @@ ref = "dvrm:c:abs_d_range_check"
 [[constraints.abs_diff]]
 kind = "template"
 tag = "SUB"
-input = [0, "d"]
-output = "abs_d"
+input = [0, ["cast", "d", "DWordWL"]]
+output = ["cast", "abs_d", "DWordWL"]
 cond = "sign_d"
 ref = "dvrm:c:abs_d_if_negative"
 
@@ -265,8 +265,8 @@ name = "n_sub_r"
 [[constraints.n_sub_r]]
 kind = "template"
 tag = "SUB"
-input = ["n", "r"]
-output = "n_sub_r"
+input = [["cast", "n", "DWordWL"], ["cast", "r", "DWordWL"]]
+output = ["cast", "n_sub_r", "DWordWL"]
 ref = "dvrm:c:n_sub_r"
 
 [[constraints.n_sub_r]]
@@ -298,7 +298,7 @@ name = "equality"
 kind = "interaction"
 tag = "MUL"
 input = ["d", "signed", "q", "sign_q", 0]
-output = "n_sub_r"
+output = ["cast", "n_sub_r", "DWordWL"]
 multiplicity = "μ_sum"
 ref = "dvrm:c:mul_lower"
 
@@ -306,7 +306,7 @@ ref = "dvrm:c:mul_lower"
 kind = "interaction"
 tag = "MUL"
 input = ["d", "signed", "q", "sign_q", 1]
-output = "extension_n_sub_r"
+output = ["cast", "extension_n_sub_r", "DWordWL"]
 multiplicity = "μ_sum"
 ref = "dvrm:c:mul_upper"
 
@@ -369,12 +369,12 @@ desc = "Each row contributes the following to the LogUp sum"
 kind = "interaction"
 tag = "DVRM"
 input = ["n", "d", "signed", "0"]
-output = "q"
+output = ["cast", "q", "DWordWL"]
 multiplicity = "-μ_q"
 
 [[constraints.output]]
 kind = "interaction"
 tag = "DVRM"
 input = ["n", "d", "signed", "1"]
-output = "r"
+output = ["cast", "r", "DWordWL"]
 multiplicity = "-μ_r"
