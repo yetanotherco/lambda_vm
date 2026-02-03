@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 executor = { path = "../../executor" }
-prover = { path = "../../prover" }
+prover = { path = "../../prover", package = "lambda-vm-prover" }
 stark = { path = "../../crypto/stark" }
 math = { path = "../../crypto/math" }
 crypto = { path = "../../crypto/crypto" }
