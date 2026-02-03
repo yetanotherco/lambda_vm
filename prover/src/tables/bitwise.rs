@@ -35,9 +35,10 @@ use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::prover::evaluate_polynomial_on_lde_domain;
 use stark::trace::{TraceTable, columns2rows};
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read as IoRead, Write as IoWrite};
+use std::io::{BufReader, BufWriter, Write as IoWrite};
 use std::path::PathBuf;
 
 #[cfg(feature = "parallel")]
@@ -191,6 +192,7 @@ pub const fn is_preprocessed() -> bool {
 /// ## What's NOT Cached
 /// - Merkle tree (~700 MB): Rebuilt from `lde_columns` during proving.
 ///   This can be revisited based on benchmarks.
+#[derive(Serialize, Deserialize)]
 pub struct PrecomputedBitwiseData {
     /// Configuration hash for cache validation.
     /// Hash of (LDE_BLOWUP_FACTOR, LDE_COSET_OFFSET, NUM_ROWS, code version).
@@ -259,7 +261,8 @@ const LDE_COSET_OFFSET: u64 = 3;
 const CACHE_MAGIC: &[u8; 4] = b"BTWC";
 
 /// Cache file version. Increment when format changes.
-const CACHE_VERSION: u32 = 1;
+/// v2: Switched from manual binary serialization to bincode.
+const CACHE_VERSION: u32 = 2;
 
 /// Returns the path to the disk cache file.
 ///
@@ -324,7 +327,7 @@ fn load_or_compute_precomputed_data() -> PrecomputedBitwiseData {
     data
 }
 
-/// Saves precomputed data to disk in binary format.
+/// Saves precomputed data to disk using bincode.
 fn save_to_disk(data: &PrecomputedBitwiseData, path: &PathBuf) -> std::io::Result<()> {
     // Ensure parent directory exists
     if let Some(parent) = path.parent() {
@@ -334,49 +337,22 @@ fn save_to_disk(data: &PrecomputedBitwiseData, path: &PathBuf) -> std::io::Resul
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
 
-    // Write header
+    // Write header for quick validation without full deserialization
     writer.write_all(CACHE_MAGIC)?;
     writer.write_all(&CACHE_VERSION.to_le_bytes())?;
-    writer.write_all(&data.config_hash)?;
-    writer.write_all(&data.commitment)?;
 
-    // Write polynomial count and sizes
-    let num_polys = data.polynomials.len() as u32;
-    writer.write_all(&num_polys.to_le_bytes())?;
-
-    // Write each polynomial's coefficients
-    for poly in &data.polynomials {
-        let coeffs = poly.coefficients();
-        let num_coeffs = coeffs.len() as u32;
-        writer.write_all(&num_coeffs.to_le_bytes())?;
-
-        for coeff in coeffs {
-            let value: u64 = *coeff.value();
-            writer.write_all(&value.to_le_bytes())?;
-        }
-    }
-
-    // Write LDE column count and sizes
-    let num_lde_cols = data.lde_columns.len() as u32;
-    writer.write_all(&num_lde_cols.to_le_bytes())?;
-
-    // Write each LDE column
-    for col in &data.lde_columns {
-        let col_len = col.len() as u32;
-        writer.write_all(&col_len.to_le_bytes())?;
-
-        for elem in col {
-            let value: u64 = *elem.value();
-            writer.write_all(&value.to_le_bytes())?;
-        }
-    }
+    // Serialize data with bincode
+    bincode::serialize_into(&mut writer, data)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     writer.flush()?;
     Ok(())
 }
 
-/// Loads precomputed data from disk.
+/// Loads precomputed data from disk using bincode.
 fn load_from_disk(path: &PathBuf) -> std::io::Result<PrecomputedBitwiseData> {
+    use std::io::Read as IoRead;
+
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
 
@@ -401,63 +377,9 @@ fn load_from_disk(path: &PathBuf) -> std::io::Result<PrecomputedBitwiseData> {
         ));
     }
 
-    // Read config hash and commitment
-    let mut config_hash = [0u8; 32];
-    reader.read_exact(&mut config_hash)?;
-
-    let mut commitment = [0u8; 32];
-    reader.read_exact(&mut commitment)?;
-
-    // Read polynomials
-    let mut num_polys_bytes = [0u8; 4];
-    reader.read_exact(&mut num_polys_bytes)?;
-    let num_polys = u32::from_le_bytes(num_polys_bytes) as usize;
-
-    let mut polynomials = Vec::with_capacity(num_polys);
-    for _ in 0..num_polys {
-        let mut num_coeffs_bytes = [0u8; 4];
-        reader.read_exact(&mut num_coeffs_bytes)?;
-        let num_coeffs = u32::from_le_bytes(num_coeffs_bytes) as usize;
-
-        let mut coeffs = Vec::with_capacity(num_coeffs);
-        for _ in 0..num_coeffs {
-            let mut value_bytes = [0u8; 8];
-            reader.read_exact(&mut value_bytes)?;
-            let value = u64::from_le_bytes(value_bytes);
-            coeffs.push(FE::from(value));
-        }
-
-        polynomials.push(Polynomial::new(&coeffs));
-    }
-
-    // Read LDE columns
-    let mut num_lde_cols_bytes = [0u8; 4];
-    reader.read_exact(&mut num_lde_cols_bytes)?;
-    let num_lde_cols = u32::from_le_bytes(num_lde_cols_bytes) as usize;
-
-    let mut lde_columns = Vec::with_capacity(num_lde_cols);
-    for _ in 0..num_lde_cols {
-        let mut col_len_bytes = [0u8; 4];
-        reader.read_exact(&mut col_len_bytes)?;
-        let col_len = u32::from_le_bytes(col_len_bytes) as usize;
-
-        let mut col = Vec::with_capacity(col_len);
-        for _ in 0..col_len {
-            let mut value_bytes = [0u8; 8];
-            reader.read_exact(&mut value_bytes)?;
-            let value = u64::from_le_bytes(value_bytes);
-            col.push(FE::from(value));
-        }
-
-        lde_columns.push(col);
-    }
-
-    Ok(PrecomputedBitwiseData {
-        config_hash,
-        commitment,
-        polynomials,
-        lde_columns,
-    })
+    // Deserialize data with bincode
+    bincode::deserialize_from(reader)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
 }
 
 /// Computes all precomputed data for the bitwise table.
