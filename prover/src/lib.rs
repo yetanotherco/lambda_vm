@@ -130,10 +130,15 @@ impl VmAirs {
         let bitwise = if minimal_bitwise {
             create_bitwise_air(proof_options)
         } else {
-            create_bitwise_air(proof_options).with_preprocessed(
-                bitwise::preprocessed_commitment(),
-                bitwise::NUM_PRECOMPUTED_COLS,
-            )
+            create_bitwise_air(proof_options)
+                .with_preprocessed(
+                    bitwise::preprocessed_commitment(),
+                    bitwise::NUM_PRECOMPUTED_COLS,
+                )
+                .with_precomputed_cache(
+                    bitwise::precomputed_polynomials(),
+                    bitwise::precomputed_lde_columns(),
+                )
         };
         let lt = create_lt_air(proof_options);
         let memw = create_memw_air(proof_options);

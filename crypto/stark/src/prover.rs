@@ -47,16 +47,16 @@ type MainCommitment<Field> = (Round1CommitmentData<Field>, Vec<Vec<FieldElement<
 
 /// A default STARK prover implementing `IsStarkProver`.
 pub struct Prover<
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: Send + Sync + IsField,
+    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync + 'static,
+    FieldExtension: Send + Sync + IsField + 'static,
     PI,
 > {
     p: PhantomData<(Field, FieldExtension, PI)>,
 }
 
 impl<
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: Send + Sync + IsField,
+    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync + 'static,
+    FieldExtension: Send + Sync + IsField + 'static,
     PI,
 > IsStarkProver<Field, FieldExtension, PI> for Prover<Field, FieldExtension, PI>
 {
@@ -202,8 +202,8 @@ where
 /// The default implementation is complete and is compatible with Stone prover
 /// https://github.com/starkware-libs/stone-prover
 pub trait IsStarkProver<
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: Send + Sync + IsField,
+    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync + 'static,
+    FieldExtension: Send + Sync + IsField + 'static,
     PI,
 >
 {
@@ -493,6 +493,15 @@ pub trait IsStarkProver<
     /// - Multiplicity columns (num_precomputed_cols..): separate tree, root in proof
     ///
     /// Both commitments are added to the transcript for Fiat-Shamir binding.
+    ///
+    /// ## Optimization: Cached Precomputed Data
+    ///
+    /// When `cached_polynomials` and `cached_lde_columns` are provided, the prover
+    /// uses them instead of recomputing. This eliminates minutes of redundant computation
+    /// per proof for preprocessed tables like Bitwise.
+    ///
+    /// - `cached_polynomials`: Polynomial coefficients for precomputed columns (for OOD evaluation)
+    /// - `cached_lde_columns`: Bit-reversed LDE evaluations (for Merkle tree rebuild)
     #[allow(clippy::type_complexity)]
     fn round_1_commit_preprocessed_trace(
         trace: &TraceTable<Field, FieldExtension>,
@@ -500,24 +509,103 @@ pub trait IsStarkProver<
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
         precomputed_commitment: Commitment,
         num_precomputed_cols: usize,
+        cached_polynomials: Option<&'static [Polynomial<FieldElement<Field>>]>,
+        cached_lde_columns: Option<&'static [Vec<FieldElement<Field>>]>,
     ) -> Result<(Round1CommitmentData<Field>, Vec<Vec<FieldElement<Field>>>), ProvingError>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        // Interpolate all columns (needed for constraint evaluation)
-        let Some((trace_polys, evaluations, _full_tree, _full_root)) =
-            Self::interpolate_and_commit_preprocessed(trace, domain)
-        else {
-            return Err(ProvingError::EmptyCommitment);
-        };
+        // Check if we have cached precomputed data
+        let (trace_polys, evaluations, precomputed_lde_permuted) =
+            if let (Some(cached_polys), Some(cached_lde)) = (cached_polynomials, cached_lde_columns)
+            {
+                // === OPTIMIZED PATH: Use cached polynomials and LDE ===
+                log::debug!(
+                    "Using cached precomputed data: {} polys, {} LDE columns",
+                    cached_polys.len(),
+                    cached_lde.len()
+                );
+                // What we SKIP (the expensive parts):
+                // - Precomputed polynomial interpolation (use cached)
+                // - Precomputed LDE evaluations (use cached)
+                // - Precomputed bit-reversal (cached is already bit-reversed)
+                //
+                // What we compute (varies per proof):
+                // - Multiplicity polynomial interpolation
+                // - Multiplicity LDE evaluations
 
-        // --- Build PRECOMPUTED tree (cols 0..num_precomputed) ---
-        let precomputed_evaluations: Vec<_> = evaluations[..num_precomputed_cols].to_vec();
-        let mut precomputed_lde_permuted = precomputed_evaluations.clone();
-        for col in precomputed_lde_permuted.iter_mut() {
-            in_place_bit_reverse_permute(col);
-        }
+                // Get multiplicity columns only (skip precomputed)
+                let all_columns = trace.columns_main();
+                let mult_columns = &all_columns[num_precomputed_cols..];
+
+                // Interpolate ONLY multiplicity columns using explicit turbofish
+                // to force Rust to use E=Field (not FieldExtension)
+                #[cfg(feature = "parallel")]
+                let mult_polys: Vec<Polynomial<FieldElement<Field>>> = mult_columns
+                    .par_iter()
+                    .map(|col| {
+                        <Polynomial<FieldElement<Field>>>::interpolate_fft::<Field>(col)
+                            .expect("FFT interpolation failed")
+                    })
+                    .collect();
+                #[cfg(not(feature = "parallel"))]
+                let mult_polys: Vec<Polynomial<FieldElement<Field>>> = mult_columns
+                    .iter()
+                    .map(|col| {
+                        <Polynomial<FieldElement<Field>>>::interpolate_fft::<Field>(col)
+                            .expect("FFT interpolation failed")
+                    })
+                    .collect();
+
+                // Compute LDE only for multiplicity polynomials
+                let mult_lde = Self::compute_lde_trace_evaluations::<Field>(&mult_polys, domain);
+
+                // Combine cached precomputed + fresh multiplicity polynomials
+                let mut all_polys: Vec<Polynomial<FieldElement<Field>>> =
+                    Vec::with_capacity(cached_polys.len() + mult_polys.len());
+                all_polys.extend(cached_polys.iter().cloned());
+                all_polys.extend(mult_polys);
+
+                // Combine cached precomputed LDE + fresh multiplicity LDE for evaluations
+                // Note: cached_lde is already bit-reversed, but evaluations need non-bit-reversed
+                let mut all_evaluations: Vec<Vec<FieldElement<Field>>> =
+                    Vec::with_capacity(cached_lde.len() + mult_lde.len());
+
+                // Un-bit-reverse cached LDE for evaluations (constraint evaluation needs original order)
+                for col in cached_lde.iter() {
+                    let mut unbitreversed = col.clone();
+                    in_place_bit_reverse_permute(&mut unbitreversed); // bit-reverse is self-inverse
+                    all_evaluations.push(unbitreversed);
+                }
+                all_evaluations.extend(mult_lde);
+
+                // Use cached bit-reversed LDE directly for precomputed tree
+                let precomputed_lde_permuted: Vec<Vec<FieldElement<Field>>> =
+                    cached_lde.iter().cloned().collect();
+
+                (all_polys, all_evaluations, precomputed_lde_permuted)
+            } else {
+                // === FALLBACK PATH: Recompute everything ===
+                log::debug!(
+                    "No cached precomputed data - recomputing all {} columns",
+                    trace.columns_main().len()
+                );
+                let Some((trace_polys, evaluations, _full_tree, _full_root)) =
+                    Self::interpolate_and_commit_preprocessed(trace, domain)
+                else {
+                    return Err(ProvingError::EmptyCommitment);
+                };
+
+                // Bit-reverse precomputed evaluations for Merkle tree
+                let precomputed_evaluations: Vec<_> = evaluations[..num_precomputed_cols].to_vec();
+                let mut precomputed_lde_permuted = precomputed_evaluations.clone();
+                for col in precomputed_lde_permuted.iter_mut() {
+                    in_place_bit_reverse_permute(col);
+                }
+
+                (trace_polys, evaluations, precomputed_lde_permuted)
+            };
         let precomputed_rows = columns2rows(precomputed_lde_permuted);
         let (precomputed_tree, precomputed_root) =
             Self::batch_commit_main(&precomputed_rows).ok_or(ProvingError::EmptyCommitment)?;
@@ -1219,12 +1307,15 @@ pub trait IsStarkProver<
 
             let (main, evaluations) = if air.is_preprocessed() {
                 // Preprocessed table: use hardcoded commitment for precomputed columns
+                // Pass cached data if available (eliminates recomputation)
                 Self::round_1_commit_preprocessed_trace(
                     *trace,
                     &domain,
                     transcript,
                     air.precomputed_commitment(),
                     air.num_precomputed_columns(),
+                    air.precomputed_polynomials(),
+                    air.precomputed_lde_columns(),
                 )?
             } else {
                 // Normal table: compute commitment as usual

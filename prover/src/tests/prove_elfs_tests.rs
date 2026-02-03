@@ -536,6 +536,54 @@ fn test_prove_elfs_all_instructions_64_full() {
     );
 }
 
+/// Timing test for bitwise precomputed cache optimization.
+///
+/// Runs prove twice:
+/// - First prove: Initializes lazy_static cache (pays full computation cost)
+/// - Second prove: Uses cached polynomials and LDE (should be faster)
+///
+/// The time difference shows the savings from caching precomputed data.
+///
+/// Run with:
+/// ```
+/// cargo test -p lambda-vm-prover --release test_bitwise_cache_timing -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore] // Slow: run with --release --ignored --nocapture
+fn test_bitwise_cache_timing() {
+    use std::time::Instant;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("all_instructions_64");
+
+    // First prove - initializes the lazy_static cache
+    println!("\n=== First prove (initializes cache) ===");
+    let start1 = Instant::now();
+    let result1 = crate::prove_and_verify(&elf_bytes).expect("first prove failed");
+    let elapsed1 = start1.elapsed();
+    assert!(result1, "first prove failed verification");
+    println!("First prove: {:?}", elapsed1);
+
+    // Second prove - uses cached data
+    println!("\n=== Second prove (uses cache) ===");
+    let start2 = Instant::now();
+    let result2 = crate::prove_and_verify(&elf_bytes).expect("second prove failed");
+    let elapsed2 = start2.elapsed();
+    assert!(result2, "second prove failed verification");
+    println!("Second prove: {:?}", elapsed2);
+
+    // Report savings
+    println!("\n=== Results ===");
+    println!("First prove:  {:?}", elapsed1);
+    println!("Second prove: {:?}", elapsed2);
+    if elapsed1 > elapsed2 {
+        let saved = elapsed1 - elapsed2;
+        println!("Time saved:   {:?} ({:.1}%)", saved,
+            (saved.as_secs_f64() / elapsed1.as_secs_f64()) * 100.0);
+    }
+}
+
 /// Memory profiling test using dhat.
 ///
 /// Run with:
