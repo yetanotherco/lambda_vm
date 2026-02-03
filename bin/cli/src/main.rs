@@ -51,8 +51,10 @@ mod proof_bundle;
 
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+use subtle::ConstantTimeEq;
 
 use clap::{Parser, Subcommand, ValueEnum, ValueHint};
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
@@ -75,9 +77,38 @@ use stark::prover::{IsStarkProver, Prover};
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
-use proof_bundle::ProofBundle;
+use proof_bundle::{ProofBundle, PROOF_BUNDLE_VERSION};
 
 type F = GoldilocksField;
+
+/// Maximum ELF file size: 256 MB
+const MAX_ELF_FILE_SIZE: u64 = 256 * 1024 * 1024;
+
+/// Maximum proof bundle file size: 1 GB
+const MAX_PROOF_FILE_SIZE: u64 = 1024 * 1024 * 1024;
+
+/// Minimum acceptable blowup factor for proof verification
+const MIN_BLOWUP_FACTOR: u8 = 4;
+
+/// Minimum acceptable FRI queries for proof verification
+const MIN_FRI_QUERIES: usize = 3;
+
+/// Read a file with size validation to prevent memory exhaustion.
+fn read_file_with_limit(path: &Path, max_size: u64, file_type: &str) -> Result<Vec<u8>, String> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|e| format!("Failed to get {} file metadata: {}", file_type, e))?;
+
+    if metadata.len() > max_size {
+        return Err(format!(
+            "{} file too large: {} bytes (max: {} bytes)",
+            file_type,
+            metadata.len(),
+            max_size
+        ));
+    }
+
+    std::fs::read(path).map_err(|e| format!("Failed to read {} file: {}", file_type, e))
+}
 type E = GoldilocksExtension;
 
 #[derive(Parser)]
@@ -220,10 +251,10 @@ fn main() -> ExitCode {
 /// * `0` - Execution completed successfully
 /// * `1` - Execution failed (file not found, invalid ELF, runtime error)
 fn cmd_execute(elf_path: PathBuf, flamegraph_path: Option<PathBuf>) -> ExitCode {
-    let elf_data = match std::fs::read(&elf_path) {
+    let elf_data = match read_file_with_limit(&elf_path, MAX_ELF_FILE_SIZE, "ELF") {
         Ok(data) => data,
         Err(e) => {
-            eprintln!("Failed to read ELF file: {}", e);
+            eprintln!("{}", e);
             return ExitCode::FAILURE;
         }
     };
@@ -334,10 +365,10 @@ fn cmd_execute(elf_path: PathBuf, flamegraph_path: Option<PathBuf>) -> ExitCode 
 /// - Available CPU cores (prover uses parallel FFT)
 fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, security: SecurityPreset) -> ExitCode {
     eprintln!("Reading ELF file...");
-    let elf_data = match std::fs::read(&elf_path) {
+    let elf_data = match read_file_with_limit(&elf_path, MAX_ELF_FILE_SIZE, "ELF") {
         Ok(data) => data,
         Err(e) => {
-            eprintln!("Failed to read ELF file: {}", e);
+            eprintln!("{}", e);
             return ExitCode::FAILURE;
         }
     };
@@ -393,11 +424,15 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, security: SecurityPreset) 
     let lt_air = create_lt_air(&proof_options);
     let memw_air = create_memw_air(&proof_options);
     let load_air = create_load_air(&proof_options);
-    let decode_air = create_decode_air(&proof_options).with_preprocessed(
-        decode::commitment_from_elf(&program, &proof_options)
-            .expect("Failed to compute decode commitment"),
-        decode::NUM_PRECOMPUTED_COLS,
-    );
+    let decode_commitment = match decode::commitment_from_elf(&program, &proof_options) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to compute decode commitment: {:?}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+    let decode_air = create_decode_air(&proof_options)
+        .with_preprocessed(decode_commitment, decode::NUM_PRECOMPUTED_COLS);
 
     let air_trace_pairs: Vec<(
         &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
@@ -486,10 +521,10 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, security: SecurityPreset) 
 /// - Instruction decoding was correct (via DECODE table)
 fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf) -> ExitCode {
     eprintln!("Reading ELF file...");
-    let elf_data = match std::fs::read(&elf_path) {
+    let elf_data = match read_file_with_limit(&elf_path, MAX_ELF_FILE_SIZE, "ELF") {
         Ok(data) => data,
         Err(e) => {
-            eprintln!("Failed to read ELF file: {}", e);
+            eprintln!("{}", e);
             return ExitCode::FAILURE;
         }
     };
@@ -503,6 +538,23 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf) -> ExitCode {
     };
 
     eprintln!("Reading proof bundle...");
+    // Check proof file size before reading
+    let proof_metadata = match std::fs::metadata(&proof_path) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Failed to get proof file metadata: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+    if proof_metadata.len() > MAX_PROOF_FILE_SIZE {
+        eprintln!(
+            "Proof file too large: {} bytes (max: {} bytes)",
+            proof_metadata.len(),
+            MAX_PROOF_FILE_SIZE
+        );
+        return ExitCode::FAILURE;
+    }
+
     let file = match File::open(&proof_path) {
         Ok(f) => f,
         Err(e) => {
@@ -520,9 +572,38 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf) -> ExitCode {
         }
     };
 
-    // Verify ELF hash matches proof metadata
+    // Validate proof bundle version
+    if bundle.metadata.version != PROOF_BUNDLE_VERSION {
+        eprintln!(
+            "Unsupported proof bundle version: {} (expected {})",
+            bundle.metadata.version, PROOF_BUNDLE_VERSION
+        );
+        return ExitCode::FAILURE;
+    }
+
+    // Validate proof options to prevent malicious bundles with weak parameters
+    if bundle.proof_options.blowup_factor < MIN_BLOWUP_FACTOR {
+        eprintln!(
+            "Invalid proof options: blowup_factor {} is below minimum {}",
+            bundle.proof_options.blowup_factor, MIN_BLOWUP_FACTOR
+        );
+        return ExitCode::FAILURE;
+    }
+    if !bundle.proof_options.blowup_factor.is_power_of_two() {
+        eprintln!("Invalid proof options: blowup_factor must be a power of two");
+        return ExitCode::FAILURE;
+    }
+    if bundle.proof_options.fri_number_of_queries < MIN_FRI_QUERIES {
+        eprintln!(
+            "Invalid proof options: fri_number_of_queries {} is below minimum {}",
+            bundle.proof_options.fri_number_of_queries, MIN_FRI_QUERIES
+        );
+        return ExitCode::FAILURE;
+    }
+
+    // Verify ELF hash matches proof metadata (constant-time comparison)
     let elf_hash: [u8; 32] = Sha3_256::digest(&elf_data).into();
-    if elf_hash != bundle.metadata.elf_hash {
+    if elf_hash.ct_eq(&bundle.metadata.elf_hash).unwrap_u8() != 1 {
         eprintln!("ELF hash mismatch!");
         eprintln!(
             "  Expected: {}...",
@@ -561,11 +642,15 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf) -> ExitCode {
     let lt_air = create_lt_air(proof_options);
     let memw_air = create_memw_air(proof_options);
     let load_air = create_load_air(proof_options);
-    let decode_air = create_decode_air(proof_options).with_preprocessed(
-        decode::commitment_from_elf(&program, proof_options)
-            .expect("Failed to compute decode commitment"),
-        decode::NUM_PRECOMPUTED_COLS,
-    );
+    let decode_commitment = match decode::commitment_from_elf(&program, proof_options) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to compute decode commitment: {:?}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+    let decode_air = create_decode_air(proof_options)
+        .with_preprocessed(decode_commitment, decode::NUM_PRECOMPUTED_COLS);
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
         &cpu_air,

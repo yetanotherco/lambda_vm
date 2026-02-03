@@ -627,11 +627,12 @@ dependencies = [
  "crypto",
  "executor",
  "hex",
+ "lambda-vm-prover",
  "math",
- "prover",
  "serde",
  "sha3",
  "stark",
+ "subtle",
 ]
 
 [[package]]

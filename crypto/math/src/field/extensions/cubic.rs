@@ -49,8 +49,9 @@ where
         Self: Sized,
     {
         // Each field element takes 1/3 of the input bytes
-        if !bytes.len().is_multiple_of(3) {
-            return Err(crate::errors::ByteConversionError::InvalidValue);
+        // Reject empty arrays and arrays not divisible by 3
+        if bytes.is_empty() || !bytes.len().is_multiple_of(3) {
+            return Err(crate::errors::ByteConversionError::FromBEBytesError);
         }
         let elem_size = bytes.len() / 3;
         let v0 = F::BaseType::from_bytes_be(&bytes[0..elem_size])?;
@@ -68,8 +69,9 @@ where
         Self: Sized,
     {
         // Each field element takes 1/3 of the input bytes
-        if !bytes.len().is_multiple_of(3) {
-            return Err(crate::errors::ByteConversionError::InvalidValue);
+        // Reject empty arrays and arrays not divisible by 3
+        if bytes.is_empty() || !bytes.len().is_multiple_of(3) {
+            return Err(crate::errors::ByteConversionError::FromLEBytesError);
         }
         let elem_size = bytes.len() / 3;
         let v0 = F::BaseType::from_bytes_le(&bytes[0..elem_size])?;
