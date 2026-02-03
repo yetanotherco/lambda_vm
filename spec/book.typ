@@ -9,6 +9,7 @@
   summary: (
     ("memory.typ", [Memory argument], <memory>),
     ("variables.typ", [Variables], <vars>),
+    ("signatures.typ", [Signatures], <signatures>),
     ("is_bit.typ", [IS_BIT template], <isbit>),
     ("sign.typ", [SIGN template], <sign>),
     ("add.typ", [ADD/SUB template], <add>),
