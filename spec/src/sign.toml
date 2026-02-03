@@ -20,7 +20,7 @@ desc = "Sign of `X`"
 desc = "`IS_HALF[X]`"
 
 [[assumptions]]
-desc = "`IS_BIT<cond>`"
+desc = "`IS_BIT<signed>`"
 
 
 [[constraint_groups]]
