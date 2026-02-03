@@ -1097,8 +1097,9 @@ fn test_prove_elfs_segmented_loop_128() {
         assert_eq!(segment_logs.len(), 64);
 
         let is_final_segment = i == num_segments - 1;
-        let mut traces = Traces::from_logs_segment(segment_logs, instructions.clone(), is_final_segment)
-            .expect("Failed to generate traces");
+        let mut traces =
+            Traces::from_logs_segment(segment_logs, instructions.clone(), is_final_segment)
+                .expect("Failed to generate traces");
 
         assert!(
             prove_and_verify_vm_segment(

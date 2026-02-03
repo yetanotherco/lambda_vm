@@ -22,9 +22,8 @@ use lambda_vm_prover::segment::split_into_segments;
 use lambda_vm_prover::tables::lt::generate_lt_trace;
 use lambda_vm_prover::tables::trace_builder::Traces;
 use lambda_vm_prover::test_utils::{
-    E, F, collect_bitwise_ops_from_logs, collect_bitwise_ops_from_lt,
-    collect_lt_lookups_from_logs, create_bitwise_air, create_cpu_air, create_lt_air,
-    generate_minimal_bitwise_trace, run_asm_elf,
+    E, F, collect_bitwise_ops_from_logs, collect_bitwise_ops_from_lt, collect_lt_lookups_from_logs,
+    create_bitwise_air, create_cpu_air, create_lt_air, generate_minimal_bitwise_trace, run_asm_elf,
 };
 
 fn main() {
@@ -63,7 +62,11 @@ fn run_without_segmentation(elf_name: &str) {
     let start = Instant::now();
     let (_elf, logs, instructions) = run_asm_elf(elf_name);
     let execution_time = start.elapsed();
-    println!("\nExecution: {} instructions in {:?}", logs.len(), execution_time);
+    println!(
+        "\nExecution: {} instructions in {:?}",
+        logs.len(),
+        execution_time
+    );
 
     // Create AIRs
     let proof_options = ProofOptions::default_test_options();
@@ -87,9 +90,7 @@ fn run_without_segmentation(elf_name: &str) {
 
     println!(
         "Traces: CPU {} rows, Bitwise {} rows, LT {} rows",
-        cpu_trace.main_table.height,
-        bitwise_trace.main_table.height,
-        lt_trace.main_table.height
+        cpu_trace.main_table.height, bitwise_trace.main_table.height, lt_trace.main_table.height
     );
 
     // Prove
@@ -120,7 +121,11 @@ fn run_with_segmentation(elf_name: &str, segment_size: usize) {
     let start = Instant::now();
     let (_elf, logs, instructions) = run_asm_elf(elf_name);
     let execution_time = start.elapsed();
-    println!("\nExecution: {} instructions in {:?}", logs.len(), execution_time);
+    println!(
+        "\nExecution: {} instructions in {:?}",
+        logs.len(),
+        execution_time
+    );
 
     // Split into segments
     let segments = split_into_segments(&logs, segment_size).expect("Failed to split into segments");
