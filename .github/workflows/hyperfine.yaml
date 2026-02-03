@@ -131,14 +131,14 @@ jobs:
           sudo swapoff -a
           mkdir target_programs
 
-          # Detect if each CLI supports the execute subcommand
+          # Detect if each CLI supports the execute subcommand by checking help output
           # This ensures compatibility both before and after the CLI refactor
-          if ./bench-bin/cli-base execute --help &>/dev/null; then
+          if ./bench-bin/cli-base --help 2>&1 | grep -q "execute"; then
             BASE_CMD="./bench-bin/cli-base execute"
           else
             BASE_CMD="./bench-bin/cli-base"
           fi
-          if ./bench-bin/cli-head execute --help &>/dev/null; then
+          if ./bench-bin/cli-head --help 2>&1 | grep -q "execute"; then
             HEAD_CMD="./bench-bin/cli-head execute"
           else
             HEAD_CMD="./bench-bin/cli-head"
