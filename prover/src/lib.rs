@@ -71,6 +71,13 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// Type alias for AIR-trace-public-inputs triples used in multi-table proving.
+type AirTracePair<'a> = (
+    &'a dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+    &'a mut stark::trace::TraceTable<F, E>,
+    &'a (),
+);
+
 /// All VM AIR instances, grouped by table.
 pub(crate) struct VmAirs {
     pub cpu: VmAir,
@@ -86,14 +93,7 @@ pub(crate) struct VmAirs {
 
 impl VmAirs {
     /// Build `(air, trace, public_inputs)` triples for [`Prover::multi_prove`].
-    pub fn air_trace_pairs<'a>(
-        &'a self,
-        traces: &'a mut Traces,
-    ) -> Vec<(
-        &'a dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
-        &'a mut stark::trace::TraceTable<F, E>,
-        &'a (),
-    )> {
+    pub fn air_trace_pairs<'a>(&'a self, traces: &'a mut Traces) -> Vec<AirTracePair<'a>> {
         vec![
             (&self.cpu, &mut traces.cpu, &()),
             (&self.bitwise, &mut traces.bitwise, &()),
