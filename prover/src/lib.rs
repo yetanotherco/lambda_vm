@@ -146,7 +146,17 @@ impl VmAirs {
         let mul = create_mul_air(proof_options);
         let branch = create_branch_air(proof_options);
         let halt = create_halt_air(proof_options);
-        Self { cpu, bitwise, lt, memw, load, decode, mul, branch, halt }
+        Self {
+            cpu,
+            bitwise,
+            lt,
+            memw,
+            load,
+            decode,
+            mul,
+            branch,
+            halt,
+        }
     }
 }
 
@@ -163,8 +173,11 @@ pub fn prove(elf_bytes: &[u8]) -> Result<MultiProof<F, E, ()>, Error> {
     let proof_options = ProofOptions::default_test_options();
     let airs = VmAirs::new(&program, &proof_options, false);
 
-    Prover::multi_prove(airs.air_trace_pairs(&mut traces), &mut DefaultTranscript::<E>::new(&[]))
-        .map_err(|e| Error::Prover(format!("{e:?}")))
+    Prover::multi_prove(
+        airs.air_trace_pairs(&mut traces),
+        &mut DefaultTranscript::<E>::new(&[]),
+    )
+    .map_err(|e| Error::Prover(format!("{e:?}")))
 }
 
 /// Verify a proof produced by [`prove`].
@@ -173,7 +186,11 @@ pub fn verify(proof: &MultiProof<F, E, ()>, elf_bytes: &[u8]) -> Result<bool, Er
     let proof_options = ProofOptions::default_test_options();
     let airs = VmAirs::new(&program, &proof_options, false);
 
-    Ok(Verifier::multi_verify(&airs.air_refs(), proof, &mut DefaultTranscript::<E>::new(&[])))
+    Ok(Verifier::multi_verify(
+        &airs.air_refs(),
+        proof,
+        &mut DefaultTranscript::<E>::new(&[]),
+    ))
 }
 
 /// Prove and verify in one call (convenience).

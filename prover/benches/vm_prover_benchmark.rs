@@ -37,9 +37,7 @@ fn bench_prove(c: &mut Criterion, config: &BenchConfig) {
     c.bench_with_input(
         BenchmarkId::new("vm_prover/prove", config.name),
         config,
-        |b, _config| {
-            b.iter(|| lambda_vm_prover::prove(&elf_bytes).unwrap())
-        },
+        |b, _config| b.iter(|| lambda_vm_prover::prove(&elf_bytes).unwrap()),
     );
 }
 
@@ -51,9 +49,7 @@ fn bench_verify(c: &mut Criterion, config: &BenchConfig) {
     c.bench_with_input(
         BenchmarkId::new("vm_prover/verify", config.name),
         &proof,
-        |b, proof| {
-            b.iter(|| lambda_vm_prover::verify(proof, &elf_bytes).unwrap())
-        },
+        |b, proof| b.iter(|| lambda_vm_prover::verify(proof, &elf_bytes).unwrap()),
     );
 }
 
@@ -64,9 +60,7 @@ fn bench_prove_and_verify(c: &mut Criterion, config: &BenchConfig) {
     c.bench_with_input(
         BenchmarkId::new("vm_prover/prove_and_verify", config.name),
         config,
-        |b, _config| {
-            b.iter(|| lambda_vm_prover::prove_and_verify(&elf_bytes).unwrap())
-        },
+        |b, _config| b.iter(|| lambda_vm_prover::prove_and_verify(&elf_bytes).unwrap()),
     );
 }
 

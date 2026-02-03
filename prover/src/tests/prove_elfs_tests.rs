@@ -45,16 +45,22 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
     let proof_options = ProofOptions::default_test_options();
     let airs = VmAirs::new(elf, &proof_options, true);
 
-    let multi_proof =
-        match Prover::multi_prove(airs.air_trace_pairs(traces), &mut DefaultTranscript::<E>::new(&[])) {
-            Ok(proof) => proof,
-            Err(e) => {
-                eprintln!("Prover error: {:?}", e);
-                return false;
-            }
-        };
+    let multi_proof = match Prover::multi_prove(
+        airs.air_trace_pairs(traces),
+        &mut DefaultTranscript::<E>::new(&[]),
+    ) {
+        Ok(proof) => proof,
+        Err(e) => {
+            eprintln!("Prover error: {:?}", e);
+            return false;
+        }
+    };
 
-    Verifier::multi_verify(&airs.air_refs(), &multi_proof, &mut DefaultTranscript::<E>::new(&[]))
+    Verifier::multi_verify(
+        &airs.air_refs(),
+        &multi_proof,
+        &mut DefaultTranscript::<E>::new(&[]),
+    )
 }
 
 // =============================================================================
