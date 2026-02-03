@@ -15,7 +15,7 @@
 
 #show: book-page(chip.name)
 
-== Columns
+= Columns
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
 #let nr_precomputed = ("input", "output").map(c => chip.variables.at(c)).flatten().len()
@@ -27,11 +27,11 @@ Of these, the _input_ and _output_ variables (#nr_precomputed in total) are prec
 *Note*: This table contains one row for every possible value of `(X, Y, Z)`.
 As such, it has length $2^8 dot 2^8 dot 2^4 = 2^(20)$.
 
-== Lookup
+= Lookup
 This chip adds the following interactions to the lookup:
 #render_constraint_table(chip, config)
 
-== Areas of Optimization
+= Areas of Optimization
 The following ideas may prove to be optimizations for the #bitwise chip:
 + Extend `IS_BYTE[X]` to `ARE_BYTES[X, Y]`, such that two bytes are range checked at once. 
   When only a single check is required, one can still execute `IS_BYTE[X] := ARE_BYTES[X, 0]`.

@@ -15,5 +15,6 @@
 #meta.summary.map(((ch, title, ref)) => [
   #pagebreak(weak: true)
   #heading(supplement: [Chapter], level: 1, title)#ref
+  #set heading(offset: 1)
   #include ch
 ]).join()
