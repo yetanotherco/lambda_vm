@@ -86,5 +86,5 @@ Below, we list the signatures of the #templates.len() templates in this VM.
       ([#render_signature(sig)], )
     },
   ),
-  caption: "Signature overview of interactions",
+  caption: "Signature overview of templates",
 )
