@@ -24,6 +24,7 @@ pub mod decode;
 pub mod halt;
 pub mod load;
 pub mod lt;
+pub mod memory_final;
 pub mod memory_init;
 pub mod memw;
 pub mod trace_builder;
