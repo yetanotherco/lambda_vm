@@ -40,11 +40,11 @@ cargo run -p cli --release -- prove <PROGRAM.elf> -o proof.cbor --security maxim
 
 #### Security Levels
 
-| Level | Description | Use Case |
-|-------|-------------|----------|
-| `fast` | Conjecturable 100-bit security | Development and testing |
-| `standard` | Provable 100-bit security | Default, most use cases |
-| `maximum` | Provable 128-bit security | Production, high-value applications |
+| Level | Security | FRI Queries | Use Case |
+|-------|----------|-------------|----------|
+| `fast` | Conjecturable 100-bit | 41 | Development, testing, iteration |
+| `standard` | Provable 100-bit | 104 | Production (default) |
+| `maximum` | Provable 128-bit | 140 | High-value applications |
 
 ### Verify
 
