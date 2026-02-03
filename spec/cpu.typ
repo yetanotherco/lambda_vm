@@ -76,9 +76,8 @@ including the appropriate sign/zero extension, depending on `word_instr`.
 #render_constraint_table(chip, config, groups: "ext")
 
 == Other constraints
-
-#rj[proper ref to IsZero/IsEqual]
-For @cpu:c:is_equal, refer to the logic of IsZero or IsEqual, in combination with the subtraction of @cpu:c:sub.
+For @cpu:c:is_equal, note that @cpu:c:sub sets `res` to be the difference between `arg1` and `arg2` whenever `BEQ` is $1$.
+Given that this difference is $0$ when both are equal, @cpu:c:is_equal ensures `is_equal` is set to $1$ if and only if $#`arg1` = #`arg2`$ and `BEQ` is set.
 
 #render_constraint_table(chip, config, groups: "misc")
 

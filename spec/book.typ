@@ -10,6 +10,7 @@
     ("memory.typ", [Memory argument], <memory>),
     ("variables.typ", [Variables], <vars>),
     ("is_bit.typ", [IS_BIT template], <isbit>),
+    ("sign.typ", [SIGN template], <sign>),
     ("add.typ", [ADD/SUB template], <add>),
     ("decode.typ", [DECODE table], <decode>),
     ("cpu.typ", [CPU chip], <cpu>),
