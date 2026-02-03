@@ -3,14 +3,23 @@
 //! This table contains the final memory state after execution at byte-level.
 //! It has the same byte addresses as MEMORY_INIT but with final timestamps and values.
 //!
+//! ## Token Model (per spec)
+//!
+//! Each memory address has a "token" (address, timestamp, value):
+//! - **MEMORY_INIT**: Emits initial tokens at timestamp=0 (SENDER, +multiplicity)
+//! - **MEMW**: Consumes old token (receive), emits new token (send)
+//! - **MEMORY_FINAL**: Consumes final tokens (RECEIVER, -multiplicity)
+//!
 //! ## Purpose
 //!
-//! Sends final values to the Memory bus to balance MEMW's last access.
-//! When MEMW last accesses an address, it receives (addr, ts, val).
-//! MEMORY_FINAL sends that same tuple to balance the bus.
+//! Receives final values from the Memory bus to balance MEMW's last access.
+//! When MEMW last accesses an address, it sends (addr, ts_new, val_new).
+//! MEMORY_FINAL receives that same tuple to consume the token.
 //!
-//! For non-accessed addresses, MEMORY_FINAL's send cancels with MEMORY_INIT's
-//! receive since both have (timestamp=0, value=initial).
+//! For non-accessed addresses:
+//! - MEMORY_INIT sends (is_reg=0, addr, ts=0, value_init)
+//! - MEMORY_FINAL receives (is_reg=0, addr, ts=0, value_init)
+//! - These cancel out in the bus (same fingerprint, opposite signs).
 //!
 //! ## Regions Covered
 //!
@@ -20,6 +29,7 @@
 //!
 //! ## Columns
 //!
+//! - `is_register`: 1 col - 0 for memory (registers handled by verifier)
 //! - `address`: 2 cols (lo, hi) - byte address (same as MEMORY_INIT)
 //! - `timestamp`: 2 cols (lo, hi) - final timestamp (0 if never accessed)
 //! - `value`: 1 col - final byte value
@@ -27,8 +37,8 @@
 //!
 //! ## Bus Interactions
 //!
-//! - **Sender**: Memory bus - sends (is_reg=0, addr, ts_final, value_final)
-//!   Balances MEMW M2's receive of final state on last access.
+//! - **Receiver**: Memory bus - receives (is_reg=0, addr, ts_final, value_final)
+//!   Consumes final tokens to balance the bus.
 //!
 //! ## NOT Preprocessed
 //!
@@ -50,24 +60,27 @@ use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 
 /// Column definitions for the MEMORY_FINAL table.
 pub mod cols {
+    /// is_register: 0 for memory, 1 for registers (always 0 in this table)
+    pub const IS_REGISTER: usize = 0;
+
     /// address[0]: Address (low word, bits 0-31)
-    pub const ADDRESS_0: usize = 0;
+    pub const ADDRESS_0: usize = 1;
     /// address[1]: Address (high word, bits 32-63)
-    pub const ADDRESS_1: usize = 1;
+    pub const ADDRESS_1: usize = 2;
 
     /// timestamp[0]: Final timestamp (low word, bits 0-31)
-    pub const TIMESTAMP_0: usize = 2;
+    pub const TIMESTAMP_0: usize = 3;
     /// timestamp[1]: Final timestamp (high word, bits 32-63)
-    pub const TIMESTAMP_1: usize = 3;
+    pub const TIMESTAMP_1: usize = 4;
 
     /// value: Final byte value at this address (0-255)
-    pub const VALUE: usize = 4;
+    pub const VALUE: usize = 5;
 
     /// μ: Multiplicity for bus interactions (always 1)
-    pub const MU: usize = 5;
+    pub const MU: usize = 6;
 
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 6;
+    pub const NUM_COLUMNS: usize = 7;
 }
 
 // =========================================================================
@@ -168,6 +181,9 @@ pub fn generate_memory_final_trace(
     for (row_idx, (addr, timestamp, value)) in entries.iter().enumerate() {
         let base = row_idx * cols::NUM_COLUMNS;
 
+        // is_register = 0 (this table only handles memory)
+        data[base + cols::IS_REGISTER] = FE::zero();
+
         // Address as two 32-bit words
         data[base + cols::ADDRESS_0] = FE::from(addr & 0xFFFF_FFFF);
         data[base + cols::ADDRESS_1] = FE::from(addr >> 32);
@@ -183,7 +199,7 @@ pub fn generate_memory_final_trace(
         data[base + cols::MU] = FE::one();
     }
 
-    // Padding rows: address=0, timestamp=0, value=0, MU=0
+    // Padding rows: is_register=0, address=0, timestamp=0, value=0, MU=0
     // (all zeros, already initialized, MU=0 so they don't participate in bus)
 
     (TraceTable::new_main(data, cols::NUM_COLUMNS, 1), addr_to_row)
@@ -203,21 +219,28 @@ pub fn generate_memory_final_trace_default(
 
 /// Creates all bus interactions for the MEMORY_FINAL table.
 ///
-/// MEMORY_FINAL is a **sender** to the Memory bus.
-/// It sends (is_register=0, address, timestamp_final, value_final) to balance
-/// MEMW M2's receive of the final state on last access.
+/// MEMORY_FINAL is a **receiver** on the Memory bus.
+/// It receives (is_register=0, address, timestamp_final, value_final) to consume
+/// the final tokens emitted by MEMW on last access.
 ///
-/// Bus signature matches MEMW:
-/// `[is_register, address_lo, address_hi, timestamp_lo, timestamp_hi, value]`
+/// For addresses never accessed:
+/// - MEMORY_INIT sends (is_reg=0, addr, ts=0, value_init)
+/// - MEMORY_FINAL receives (is_reg=0, addr, ts=0, value_init)
+/// - These cancel out (same fingerprint, opposite signs).
+///
+/// Bus signature: `[is_register, address_lo, address_hi, timestamp_lo, timestamp_hi, value]`
 pub fn bus_interactions() -> Vec<BusInteraction> {
     vec![
-        // MEMORY_FINAL sends to Memory bus: (is_reg=0, addr, ts_final, val_final)
-        BusInteraction::sender(
+        // MEMORY_FINAL receives from Memory bus: (is_reg=0, addr, ts_final, val_final)
+        BusInteraction::receiver(
             BusId::Memory,
             Multiplicity::Column(cols::MU),
             vec![
-                // is_register = 0 (constant, this is memory not registers)
-                BusValue::constant(0),
+                // is_register (0 for memory)
+                BusValue::Packed {
+                    start_column: cols::IS_REGISTER,
+                    packing: Packing::Direct,
+                },
                 // address_lo
                 BusValue::Packed {
                     start_column: cols::ADDRESS_0,
@@ -274,7 +297,8 @@ mod tests {
         assert_eq!(trace.num_rows(), 4);
         assert_eq!(addr_to_row.len(), 4);
 
-        // Check byte 0: should have initial value, timestamp=0
+        // Check byte 0: should have initial value, timestamp=0, is_register=0
+        assert_eq!(*trace.main_table.get(0, cols::IS_REGISTER), FE::zero());
         assert_eq!(
             *trace.main_table.get(0, cols::ADDRESS_0),
             FE::from(0x1000u64)
@@ -309,6 +333,7 @@ mod tests {
         let (trace, _) = generate_memory_final_trace(&elf, &config, &final_state);
 
         // Byte 0: should have final values
+        assert_eq!(*trace.main_table.get(0, cols::IS_REGISTER), FE::zero());
         assert_eq!(
             *trace.main_table.get(0, cols::ADDRESS_0),
             FE::from(0x1000u64)
@@ -356,6 +381,7 @@ mod tests {
 
         // Check written stack byte has final values
         let row = *addr_to_row.get(&stack_addr).unwrap();
+        assert_eq!(*trace.main_table.get(row, cols::IS_REGISTER), FE::zero());
         assert_eq!(
             *trace.main_table.get(row, cols::TIMESTAMP_0),
             FE::from(100u64)
@@ -366,7 +392,16 @@ mod tests {
         // Check unwritten stack byte has initial values (ts=0, val=0)
         let unwritten_addr = STACK_TOP - 1;
         let row2 = *addr_to_row.get(&unwritten_addr).unwrap();
+        assert_eq!(*trace.main_table.get(row2, cols::IS_REGISTER), FE::zero());
         assert_eq!(*trace.main_table.get(row2, cols::TIMESTAMP_0), FE::zero());
         assert_eq!(*trace.main_table.get(row2, cols::VALUE), FE::zero());
+    }
+
+    #[test]
+    fn test_bus_interactions_is_receiver() {
+        let interactions = bus_interactions();
+        assert_eq!(interactions.len(), 1);
+        // Verify it's a receiver (negative multiplicity contribution)
+        // The BusInteraction::receiver creates a receiver interaction
     }
 }

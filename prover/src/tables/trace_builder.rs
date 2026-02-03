@@ -851,10 +851,13 @@ impl Traces {
 
         // Create empty MEMORY_INIT table for legacy API
         // (caller should use from_elf_and_logs for proper memory_init support)
-        let memory_init = memory_init::generate_memory_init_trace(&Elf {
-            entry_point: 0,
-            data: vec![],
-        })
+        let memory_init = memory_init::generate_memory_init_trace(
+            &Elf {
+                entry_point: 0,
+                data: vec![],
+            },
+            &memory_init::MemoryInitConfig { stack_size: 0 },
+        )
         .0;
 
         Ok(Traces {
