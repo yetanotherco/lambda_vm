@@ -297,7 +297,7 @@ where
     fn from_hex(hex_string: &str) -> Result<Self::BaseType, CreationError> {
         let integer = Self::BaseType::from_hex(hex_string)?;
         if integer > M::MODULUS {
-            return Err(CreationError::RepresentativeOutOfRange);
+            return Err(CreationError::CanonicalOutOfRange);
         }
 
         Ok(MontgomeryAlgorithms::cios(

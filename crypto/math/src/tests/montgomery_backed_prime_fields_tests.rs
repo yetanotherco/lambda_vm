@@ -872,7 +872,7 @@ mod tests_u256_prime_fields {
         assert!(a.is_err());
         assert_eq!(
             a.unwrap_err(),
-            crate::errors::CreationError::RepresentativeOutOfRange
+            crate::errors::CreationError::CanonicalOutOfRange
         )
     }
 

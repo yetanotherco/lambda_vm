@@ -598,7 +598,7 @@ where
 }
 
 impl<F: IsPrimeField> FieldElement<F> {
-    /// Returns the canonical of the value stored
+    /// Returns the canonical form of the value stored
     pub fn canonical(&self) -> F::CanonicalType {
         F::canonical(self.value())
     }
@@ -620,7 +620,7 @@ impl<F: IsPrimeField> FieldElement<F> {
     /// Returns a `CreationError::EmptyString` if the input string is empty.
     /// Returns a `CreationError::HexStringIsTooBig` if the the input hex string is bigger than the
     /// maximum amount of characters for this element.
-    /// Returns a `CreationError::RepresentativeOutOfRange` if the canonical of the value is
+    /// Returns a `CreationError::CanonicalOutOfRange` if the canonical form of the value is
     /// out of the range [0, p-1] where p is the modulus.
     pub fn from_hex(hex_string: &str) -> Result<Self, CreationError> {
         if hex_string.is_empty() {
