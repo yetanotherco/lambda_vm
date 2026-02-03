@@ -328,3 +328,238 @@ pub fn commitment_from_elf(
     let instructions = instructions_from_elf(elf)?;
     Ok(compute_precomputed_commitment(&instructions, options))
 }
+
+// =========================================================================
+// Combined ELF processing (DECODE + MEMORY_INIT)
+// =========================================================================
+
+use super::memory_init::{self, AddrToRow};
+
+/// Result of combined ELF processing.
+pub struct ElfTables {
+    /// DECODE trace table
+    pub decode: TraceTable<GoldilocksField, GoldilocksExtension>,
+    /// PC to row mapping for DECODE multiplicities
+    pub pc_to_row: PcToRow,
+    /// MEMORY_INIT trace table
+    pub memory_init: TraceTable<GoldilocksField, GoldilocksExtension>,
+    /// Address to row mapping for MEMORY_INIT multiplicities
+    pub addr_to_row: AddrToRow,
+}
+
+/// Process ELF in a single pass to generate both DECODE and MEMORY_INIT tables.
+///
+/// This is more efficient than generating tables separately since it iterates
+/// through the ELF segments only once.
+///
+/// ## Returns
+///
+/// - `decode`: DECODE trace with all instructions from executable segments
+/// - `pc_to_row`: Map from PC to row index for DECODE multiplicity updates
+/// - `memory_init`: MEMORY_INIT trace with all words from all segments
+/// - `addr_to_row`: Map from address to row index for MEMORY_INIT multiplicity updates
+///
+/// Both tables have multiplicities initialized to 0.
+pub fn tables_from_elf(elf: &Elf) -> Result<ElfTables, InstructionError> {
+    let mut decode_entries = Vec::new();
+    let mut pc_to_row = HashMap::with_capacity(elf.data.iter().map(|s| s.values.len()).sum());
+
+    let mut init_entries = Vec::new();
+    let mut addr_to_row = HashMap::new();
+
+    // Single pass through all ELF segments
+    for segment in &elf.data {
+        for (i, &word) in segment.values.iter().enumerate() {
+            let addr = segment.base_addr + (i as u64 * 4);
+
+            // MEMORY_INIT: all segments (code, data, BSS)
+            addr_to_row.insert(addr, init_entries.len());
+            init_entries.push((addr, word as u64));
+
+            // DECODE: only executable segments
+            if segment.is_executable {
+                let instruction = Instruction::parse(word)?;
+                pc_to_row.insert(addr, decode_entries.len());
+                decode_entries.push(DecodeEntry::from_instruction(addr, instruction));
+            }
+        }
+    }
+
+    // Build DECODE table
+    let decode = build_decode_table(decode_entries, &mut pc_to_row);
+
+    // Build MEMORY_INIT table
+    let memory_init = build_memory_init_table(init_entries);
+
+    Ok(ElfTables {
+        decode,
+        pc_to_row,
+        memory_init,
+        addr_to_row,
+    })
+}
+
+/// Build DECODE trace table from entries.
+fn build_decode_table(
+    entries: Vec<DecodeEntry>,
+    pc_to_row: &mut PcToRow,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    // Add CPU padding entry
+    let cpu_padding_row = entries.len();
+    pc_to_row.insert(super::cpu::CPU_PADDING_PC, cpu_padding_row);
+    let cpu_padding_entry = DecodeEntry {
+        pc: super::cpu::CPU_PADDING_PC,
+        ..Default::default()
+    };
+
+    // Pad to next power of 2, minimum 2
+    let num_entries = entries.len() + 1;
+    let num_rows = num_entries.next_power_of_two().max(2);
+    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+
+    // Fill actual entries
+    for (row_idx, entry) in entries.iter().enumerate() {
+        let base = row_idx * cols::NUM_COLUMNS;
+        data[base + cols::PC_0] = FE::from(entry.pc & 0xFFFF_FFFF);
+        data[base + cols::PC_1] = FE::from(entry.pc >> 32);
+        data[base + cols::PACKED_DECODE] = FE::from(entry.packed_decode());
+        data[base + cols::IMM_0] = FE::from(entry.imm & 0xFFFF_FFFF);
+        data[base + cols::IMM_1] = FE::from(entry.imm >> 32);
+    }
+
+    // Write CPU padding entry
+    {
+        let base = cpu_padding_row * cols::NUM_COLUMNS;
+        data[base + cols::PC_0] = FE::from(cpu_padding_entry.pc & 0xFFFF_FFFF);
+        data[base + cols::PC_1] = FE::from(cpu_padding_entry.pc >> 32);
+        data[base + cols::PACKED_DECODE] = FE::from(cpu_padding_entry.packed_decode());
+        data[base + cols::IMM_0] = FE::from(cpu_padding_entry.imm & 0xFFFF_FFFF);
+        data[base + cols::IMM_1] = FE::from(cpu_padding_entry.imm >> 32);
+    }
+
+    // Fill padding rows with DECODE padding pattern
+    let padding_entry = DecodeEntry::padding_entry();
+    for row_idx in num_entries..num_rows {
+        let base = row_idx * cols::NUM_COLUMNS;
+        data[base + cols::PC_0] = FE::from(padding_entry.pc & 0xFFFF_FFFF);
+        data[base + cols::PC_1] = FE::from(padding_entry.pc >> 32);
+        data[base + cols::PACKED_DECODE] = FE::from(padding_entry.packed_decode());
+        data[base + cols::IMM_0] = FE::from(padding_entry.imm & 0xFFFF_FFFF);
+        data[base + cols::IMM_1] = FE::from(padding_entry.imm >> 32);
+    }
+
+    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+}
+
+/// Build MEMORY_INIT trace table from entries.
+fn build_memory_init_table(
+    entries: Vec<(u64, u64)>,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    // Pad to next power of 2, minimum 2
+    let num_entries = entries.len();
+    let num_rows = num_entries.next_power_of_two().max(2);
+    let mut data = vec![FE::zero(); num_rows * memory_init::cols::NUM_COLUMNS];
+
+    // Fill actual entries
+    for (row_idx, (addr, value)) in entries.iter().enumerate() {
+        let base = row_idx * memory_init::cols::NUM_COLUMNS;
+        data[base + memory_init::cols::ADDRESS_0] = FE::from(addr & 0xFFFF_FFFF);
+        data[base + memory_init::cols::ADDRESS_1] = FE::from(addr >> 32);
+        data[base + memory_init::cols::VALUE] = FE::from(*value);
+    }
+
+    // Padding rows: address=0, value=0, MU=0 (all zeros, already initialized)
+
+    TraceTable::new_main(data, memory_init::cols::NUM_COLUMNS, 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use executor::elf::Segment;
+
+    #[test]
+    fn test_tables_from_elf_single_executable_segment() {
+        // ADDI x1, x0, 42  (opcode: 0x02a00093)
+        // ADDI x2, x1, 10  (opcode: 0x00a08113)
+        let elf = Elf {
+            entry_point: 0x1000,
+            data: vec![Segment {
+                base_addr: 0x1000,
+                values: vec![0x02a00093, 0x00a08113],
+                is_executable: true,
+            }],
+        };
+
+        let tables = tables_from_elf(&elf).unwrap();
+
+        // Check DECODE table
+        assert_eq!(tables.pc_to_row.len(), 3); // 2 instructions + CPU padding
+        assert!(tables.pc_to_row.contains_key(&0x1000));
+        assert!(tables.pc_to_row.contains_key(&0x1004));
+        assert!(tables.pc_to_row.contains_key(&super::super::cpu::CPU_PADDING_PC));
+
+        // Check MEMORY_INIT table
+        assert_eq!(tables.addr_to_row.len(), 2);
+        assert!(tables.addr_to_row.contains_key(&0x1000));
+        assert!(tables.addr_to_row.contains_key(&0x1004));
+
+        // Verify values in memory_init
+        let row0 = *tables.addr_to_row.get(&0x1000).unwrap();
+        assert_eq!(
+            *tables.memory_init.main_table.get(row0, memory_init::cols::VALUE),
+            FE::from(0x02a00093u64)
+        );
+    }
+
+    #[test]
+    fn test_tables_from_elf_mixed_segments() {
+        // Executable segment with instructions
+        // Data segment with data
+        let elf = Elf {
+            entry_point: 0x1000,
+            data: vec![
+                Segment {
+                    base_addr: 0x1000,
+                    values: vec![0x02a00093], // ADDI instruction
+                    is_executable: true,
+                },
+                Segment {
+                    base_addr: 0x2000,
+                    values: vec![0xDEADBEEF, 0xCAFEBABE], // Data
+                    is_executable: false,
+                },
+            ],
+        };
+
+        let tables = tables_from_elf(&elf).unwrap();
+
+        // DECODE: only executable segment (1 instruction + CPU padding)
+        assert_eq!(tables.pc_to_row.len(), 2);
+        assert!(tables.pc_to_row.contains_key(&0x1000));
+        assert!(!tables.pc_to_row.contains_key(&0x2000)); // Data not in decode
+
+        // MEMORY_INIT: all segments (3 words total)
+        assert_eq!(tables.addr_to_row.len(), 3);
+        assert!(tables.addr_to_row.contains_key(&0x1000)); // Code
+        assert!(tables.addr_to_row.contains_key(&0x2000)); // Data
+        assert!(tables.addr_to_row.contains_key(&0x2004)); // Data
+    }
+
+    #[test]
+    fn test_tables_from_elf_empty() {
+        let elf = Elf {
+            entry_point: 0x1000,
+            data: vec![],
+        };
+
+        let tables = tables_from_elf(&elf).unwrap();
+
+        // DECODE: only CPU padding entry
+        assert_eq!(tables.pc_to_row.len(), 1);
+        assert!(tables.pc_to_row.contains_key(&super::super::cpu::CPU_PADDING_PC));
+
+        // MEMORY_INIT: empty
+        assert!(tables.addr_to_row.is_empty());
+    }
+}

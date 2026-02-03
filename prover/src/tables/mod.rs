@@ -13,6 +13,7 @@
 //!
 //! - **MEMW**: Memory word read/write table
 //! - **LOAD**: Memory load with extension table
+//! - **MEMORY_INIT**: Initial memory state from ELF (preprocessed)
 
 pub mod types;
 
@@ -23,6 +24,7 @@ pub mod decode;
 pub mod halt;
 pub mod load;
 pub mod lt;
+pub mod memory_init;
 pub mod memw;
 pub mod trace_builder;
 

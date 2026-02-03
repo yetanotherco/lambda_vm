@@ -8,6 +8,7 @@
 //! The trace generation follows this dependency graph:
 //!
 //! ```text
+//! PHASE 0: ELF → DECODE, MEMORY_INIT (preprocessed tables)
 //! PHASE 1: Logs → CPU ops
 //! PHASE 2: CPU ops → MEMW, LOAD, LT, Bitwise (with state tracking for MEMW/LOAD)
 //! PHASE 3: MEMW → LT ops (timestamp ordering, overflow checks)
@@ -20,12 +21,13 @@
 //! ```ignore
 //! use lambda_vm_prover::tables::trace_builder::Traces;
 //!
-//! let traces = Traces::from_logs(&logs, instructions)?;
-//! // Use traces.cpu, traces.bitwise, traces.lt, traces.memw, traces.load
+//! let traces = Traces::from_elf_and_logs(&elf, &logs)?;
+//! // Use traces.cpu, traces.bitwise, traces.lt, traces.memw, traces.load, traces.memory_init
 //! ```
 
 use std::collections::HashMap;
 
+use executor::elf::Elf;
 use executor::vm::instruction::decoding::Instruction;
 use executor::vm::logs::Log;
 use executor::vm::memory::U64HashMap;
@@ -34,10 +36,11 @@ use stark::trace::TraceTable;
 use super::bitwise::{self, BitwiseOperation, BitwiseOperationType};
 use super::branch::{self, BranchOperation};
 use super::cpu::{self, CpuOperation};
-use super::decode;
+use super::decode::{self, PcToRow};
 use super::halt;
 use super::load::{self, LoadOperation};
 use super::lt::{self, LtOperation};
+use super::memory_init::{self, AddrToRow};
 use super::memw::{self, MemwOperation};
 use super::types::{GoldilocksExtension, GoldilocksField};
 use crate::Error;
@@ -641,25 +644,140 @@ pub struct Traces {
     /// LOAD memory load with extension trace
     pub load: TraceTable<GoldilocksField, GoldilocksExtension>,
 
-    /// DECODE instruction decoding table
+    /// DECODE instruction decoding table (preprocessed from ELF)
     pub decode: TraceTable<GoldilocksField, GoldilocksExtension>,
+
+    /// MEMORY_INIT initial memory state table (preprocessed from ELF)
+    pub memory_init: TraceTable<GoldilocksField, GoldilocksExtension>,
 
     /// BRANCH target calculation trace
     pub branch: TraceTable<GoldilocksField, GoldilocksExtension>,
 
     /// HALT single-row table for program termination
     pub halt: TraceTable<GoldilocksField, GoldilocksExtension>,
+
+    /// PC to row mapping for DECODE multiplicities (internal use)
+    pc_to_row: PcToRow,
+
+    /// Address to row mapping for MEMORY_INIT multiplicities (internal use)
+    addr_to_row: AddrToRow,
 }
 
 impl Traces {
-    /// Generates all traces from execution logs using phased collection.
+    /// Generates all traces from ELF and execution logs using phased collection.
     ///
     /// The phases are:
+    /// 0. ELF → DECODE, MEMORY_INIT (preprocessed tables, single pass)
     /// 1. Logs → CPU operations
     /// 2. CPU ops → MEMW, LOAD, LT, Bitwise, Branch (state tracking for MEMW/LOAD)
     /// 3. MEMW → LT operations (timestamp ordering)
     /// 4. LT, MEMW, Branch → Bitwise lookups
     /// 5. Generate all traces
+    pub fn from_elf_and_logs(elf: &Elf, logs: &[Log]) -> Result<Self, Error> {
+        // =====================================================================
+        // PHASE 0: ELF → DECODE + MEMORY_INIT (single pass)
+        // =====================================================================
+        let elf_tables = decode::tables_from_elf(elf)
+            .map_err(|e| Error::Execution(format!("Failed to process ELF: {e}")))?;
+
+        // Extract instructions map for CPU ops collection
+        let instructions = decode::instructions_from_elf(elf)
+            .map_err(|e| Error::Execution(format!("Failed to parse instructions: {e}")))?;
+
+        // =====================================================================
+        // PHASE 1: Logs → CPU operations
+        // =====================================================================
+        let cpu_ops = collect_cpu_ops(logs, &instructions)?;
+
+        // =====================================================================
+        // PHASE 2: CPU ops → MEMW, LOAD, LT, Bitwise, Branch
+        // =====================================================================
+        // Processes cpu_ops in order. MEMW/LOAD need state tracking, LT/Bitwise don't.
+        let mut memory_state = MemoryState::new();
+        let mut register_state = RegisterState::new();
+        let (memw_ops, load_ops, mut lt_ops, mut bitwise_ops) =
+            collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
+
+        // Collect BRANCH operations from CPU ops where branch_cond = true
+        let branch_ops: Vec<BranchOperation> = cpu_ops
+            .iter()
+            .filter(|op| op.branch_cond)
+            .map(|op| {
+                BranchOperation::new(
+                    op.decode.pc,
+                    op.decode.imm, // offset as full 64-bit DWordWL (already sign-extended)
+                    op.compute_arg1(), // register value must match CPU's arg1 for bus signature
+                    op.decode.op_jalr,
+                )
+            })
+            .collect();
+
+        // =====================================================================
+        // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
+        // =====================================================================
+        lt_ops.extend(collect_lt_from_memw(&memw_ops));
+
+        // =====================================================================
+        // PHASE 4: All → Bitwise lookups
+        // =====================================================================
+        bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
+        bitwise_ops.extend(collect_bitwise_from_memw(&memw_ops));
+        bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
+
+        // =====================================================================
+        // PHASE 5: Generate final traces
+        // =====================================================================
+
+        // Extract halt timestamp from the last ECALL instruction
+        let halt_op = cpu_ops
+            .iter()
+            .rev()
+            .find(|op| op.decode.op_ecall)
+            .ok_or(Error::MissingHaltEcall)?;
+        let halt_trace = halt::generate_halt_trace(halt_op.timestamp);
+
+        let cpu = cpu::generate_cpu_trace(&cpu_ops);
+        let lt = lt::generate_lt_trace(&lt_ops);
+        let memw = memw::generate_memw_trace(&memw_ops);
+        let load = load::generate_load_trace(&load_ops);
+        let branch = branch::generate_branch_trace(&branch_ops);
+
+        let mut bitwise = bitwise::generate_bitwise_trace();
+        bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
+
+        // Update DECODE multiplicities
+        // Each CPU operation looks up the DECODE table once
+        // Padding rows also look up pc=1 (the CPU padding entry)
+        let mut decode = elf_tables.decode;
+        let pc_to_row = elf_tables.pc_to_row;
+        let num_padding_rows = cpu_ops.len().next_power_of_two() - cpu_ops.len();
+        let mut decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
+        decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
+        decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
+
+        // MEMORY_INIT multiplicities will be updated when Memory bus is fully wired
+        let memory_init = elf_tables.memory_init;
+        let addr_to_row = elf_tables.addr_to_row;
+
+        Ok(Traces {
+            cpu,
+            bitwise,
+            lt,
+            memw,
+            load,
+            decode,
+            memory_init,
+            branch,
+            halt: halt_trace,
+            pc_to_row,
+            addr_to_row,
+        })
+    }
+
+    /// Generates all traces from execution logs (legacy API).
+    ///
+    /// This is a compatibility wrapper. Prefer `from_elf_and_logs` for new code
+    /// as it generates both DECODE and MEMORY_INIT in a single ELF pass.
     pub fn from_logs(logs: &[Log], instructions: U64HashMap<Instruction>) -> Result<Self, Error> {
         // =====================================================================
         // PHASE 1: Logs → CPU operations
@@ -731,6 +849,14 @@ impl Traces {
         decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
         decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
 
+        // Create empty MEMORY_INIT table for legacy API
+        // (caller should use from_elf_and_logs for proper memory_init support)
+        let memory_init = memory_init::generate_memory_init_trace(&Elf {
+            entry_point: 0,
+            data: vec![],
+        })
+        .0;
+
         Ok(Traces {
             cpu,
             bitwise,
@@ -738,8 +864,11 @@ impl Traces {
             memw,
             load,
             decode,
+            memory_init,
             branch,
             halt: halt_trace,
+            pc_to_row,
+            addr_to_row: HashMap::new(),
         })
     }
 

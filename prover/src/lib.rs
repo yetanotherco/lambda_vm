@@ -78,7 +78,9 @@ pub fn prove(elf_bytes: &[u8]) -> Result<MultiProof<F, E, ()>, Error> {
         .run()
         .map_err(|e| Error::Execution(format!("{e}")))?;
 
-    let mut traces = Traces::from_logs(&result.logs, result.instructions)?;
+    // Generate all traces from ELF and execution logs
+    // This uses the combined ELF processing to generate DECODE and MEMORY_INIT in one pass
+    let mut traces = Traces::from_elf_and_logs(&program, &result.logs)?;
 
     let proof_options = ProofOptions::default_test_options();
     let cpu_air = create_cpu_air(&proof_options);
