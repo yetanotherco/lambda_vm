@@ -252,11 +252,11 @@ poly = ["-", ["*", "signed", ["-", 1, "overflow"]], "sign_q"]
 ref = "dvrm:c:sign_q"
 
 [[constraints.overflow]]
-kind = "template"
-tag = "IsEqual"
-input = [["=", ["idx", "n", 0], 0], ["=", ["idx", "n", 1], 0], ["=", ["idx", "n", 2], 0], ["=", ["-", ["idx", "n", 3], ["*", ["^", 2, 15], "sign_n"]], 0], ["=", "sign_n", 1], ["=", ["idx", "d", 0], 65535], ["=", ["idx", "d", 1], 65535], ["=", ["idx", "d", 2], 65535], ["=", ["idx", "d", 3], 65535]]
+kind = "interaction"
+tag = "ZERO"
+input = [["+", ["idx", "n", 0], ["idx", "n", 1], ["idx", "n", 2], ["-", ["idx", "n", 3], ["*", ["^", 2, 15], "sign_n"]], ["-", 1, "sign_n"], ["-", 65535, ["idx", "d", 0]], ["-", 65535, ["idx", "d", 1]], ["-", 65535, ["idx", "d", 2]], ["-", 65535, ["idx", "d", 3]]]]
 output = "overflow"
-cond = "μ_sum"
+multiplicity = "μ_sum"
 ref = "dvrm:c:overflow"
 
 [[constraint_groups]]
@@ -354,12 +354,12 @@ poly = ["*", "div_by_zero", ["-", ["idx", "q", "i"], 65535]]
 ref = "dvrm:c:q_if_div_by_zero"
 
 [[constraints.div_by_zero]]
-kind = "template"
-tag = "IsZero"
+kind = "interaction"
+tag = "ZERO"
 input = ["d"]
 output = "div_by_zero"
 ref = "dvrm:c:div_by_zero"
-cond = "μ_sum"
+multiplicity = "μ_sum"
 
 [[constraint_groups]]
 name = "output"

@@ -85,18 +85,19 @@ Moreover it suffices to interpret `q` as unsigned integer (@dvrm:c:sign_q); R1 w
 
 #render_constraint_table(chip, config, groups:"overflow")
 
-We briefly highlight @dvrm:c:overflow.
+We highlight @dvrm:c:overflow.
 Recall that the `overflow` flag should be set if and only if (i) $#`signed` = 1$, (ii) $#`n` = #`0x80...00`$, and (iii) $#`d` = #`0xFF...FF`$.
-The `IsEqual` template can handle the third equality directly.
-The second equality was rewritten as the set of equalities
+These requirements are equivalent to the state where:
 $
-  #`n[`i#`]` &= 0 "for" i in {0, 1, 2},\
-  #`n[`3#`]` - 2^15 dot #`sign_n` &= 0,\
-  #`sign_n` &= 1
+  forall i in [0, 3]:&& 65535 - #`d`_i &= 0,\
+  forall i in [0, 2]:&& #`n`_i &= 0,\
+  && #`n`_3 - 2^15 dot #`sign_n` &= 0,\
+  && 1 - #`sign_n` &= 0,\
 $
-where we note that $#`n[3]` - 2^15 dot #`sign_n` = 0 <=> #`n[3]` equiv 0 mod 2^15$. 
-Hence, the last two equalities are satisfied if and only if $#`n[3]` = 2^15$.
-Lastly, $#`signed` = 1$ (the first equality) follows implicitly from $#`sign_n` = 1$ and thus does not have to be included.
+where $#`signed` = 1$ follows from the last equality.
+The requirement is phrased in this way, because the left-hand sides of the above expressions are $>= 0$ by construction.
+Given that the sum of these expressions does not exceed $2^19$ (and thus never wraps in the field), we can now say that the `overflow` bit should be set to $1$ if and only if their sum evaluates to $0$.
+The `ZERO` lookup guarantees this to be the case.
 
 === R1: $#`n` = #`qd` + #`r`$
 Rewriting R1, we find the constraint $not#`overflow` => #`n` - #`r` = #`qd`$.
