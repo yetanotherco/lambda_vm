@@ -276,9 +276,9 @@ impl<M, const NUM_LIMBS: usize> IsPrimeField for MontgomeryBackendPrimeField<M, 
 where
     M: IsModulus<UnsignedInteger<NUM_LIMBS>> + Clone + Debug,
 {
-    type RepresentativeType = Self::BaseType;
+    type CanonicalType = Self::BaseType;
 
-    fn representative(x: &Self::BaseType) -> Self::RepresentativeType {
+    fn canonical(x: &Self::BaseType) -> Self::CanonicalType {
         MontgomeryAlgorithms::cios(x, &UnsignedInteger::from_u64(1), &M::MODULUS, &Self::MU)
     }
 
@@ -297,7 +297,7 @@ where
     fn from_hex(hex_string: &str) -> Result<Self::BaseType, CreationError> {
         let integer = Self::BaseType::from_hex(hex_string)?;
         if integer > M::MODULUS {
-            return Err(CreationError::RepresentativeOutOfRange);
+            return Err(CreationError::CanonicalOutOfRange);
         }
 
         Ok(MontgomeryAlgorithms::cios(

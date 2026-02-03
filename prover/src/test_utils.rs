@@ -56,25 +56,27 @@ pub type VmAir = AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()>;
 // ELF Execution Helpers
 // =============================================================================
 
-/// Helper to run an ELF from the program_artifacts directory.
-///
-/// Returns the ELF, execution logs, and instruction map.
-pub fn run_asm_elf(name: &str) -> (Elf, Vec<Log>, U64HashMap<Instruction>) {
-    // Get workspace root by going up one level from prover directory
+/// Returns the raw ELF bytes for an assembly test program.
+pub fn asm_elf_bytes(name: &str) -> Vec<u8> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest_dir
         .parent()
         .expect("Failed to get workspace root from CARGO_MANIFEST_DIR");
 
-    // Build path to ELF file
     let path = workspace_root
         .join("executor")
         .join("program_artifacts")
         .join("asm")
         .join(format!("{}.elf", name));
 
-    let elf_data =
-        std::fs::read(&path).unwrap_or_else(|_| panic!("Failed to read ELF: {}", path.display()));
+    std::fs::read(&path).unwrap_or_else(|_| panic!("Failed to read ELF: {}", path.display()))
+}
+
+/// Helper to run an ELF from the program_artifacts directory.
+///
+/// Returns the ELF, execution logs, and instruction map.
+pub fn run_asm_elf(name: &str) -> (Elf, Vec<Log>, U64HashMap<Instruction>) {
+    let elf_data = asm_elf_bytes(name);
     let elf = Elf::load(&elf_data).expect("Failed to load ELF");
     let executor = Executor::new(&elf, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");

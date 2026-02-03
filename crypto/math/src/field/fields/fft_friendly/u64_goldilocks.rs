@@ -81,7 +81,7 @@ impl IsField for GoldilocksField {
     /// Negation: -a = p - a (or 0 if a = 0)
     #[inline(always)]
     fn neg(a: &u64) -> u64 {
-        let canonical = canonicalize(*a);
+        let canonical = Self::canonical(a);
         if canonical == 0 {
             0
         } else {
@@ -91,7 +91,7 @@ impl IsField for GoldilocksField {
 
     /// Multiplicative inverse using Fermat's little theorem: a^(-1) = a^(p-2)
     fn inv(a: &u64) -> Result<u64, FieldError> {
-        let canonical = canonicalize(*a);
+        let canonical = Self::canonical(a);
         if canonical == 0 {
             return Err(FieldError::InvZeroError);
         }
@@ -105,7 +105,7 @@ impl IsField for GoldilocksField {
 
     #[inline(always)]
     fn eq(a: &u64, b: &u64) -> bool {
-        canonicalize(*a) == canonicalize(*b)
+        Self::canonical(a) == Self::canonical(b)
     }
 
     #[inline(always)]
@@ -171,19 +171,6 @@ fn reduce128(x: u128) -> u64 {
         result.wrapping_add(EPSILON)
     } else {
         result
-    }
-}
-
-/// Canonicalize a field element to [0, p).
-/// This is needed for comparisons and serialization.
-#[inline(always)]
-fn canonicalize(x: u64) -> u64 {
-    // Since values can be up to 2^64 - 1, we may need multiple subtractions
-    // But in practice, after proper reduction, at most one subtraction is needed
-    if x >= GOLDILOCKS_PRIME {
-        x - GOLDILOCKS_PRIME
-    } else {
-        x
     }
 }
 
@@ -271,18 +258,18 @@ impl GoldilocksElement {
     }
 
     /// Get the canonical u64 representation in [0, p).
-    pub fn to_canonical_u64(&self) -> u64 {
-        canonicalize(*self.value())
+    pub fn canonical_u64(&self) -> u64 {
+        GoldilocksField::canonical(self.value())
     }
 
     /// Convert to little-endian bytes.
     pub fn to_bytes_le(&self) -> [u8; 8] {
-        self.to_canonical_u64().to_le_bytes()
+        self.canonical_u64().to_le_bytes()
     }
 
     /// Convert to big-endian bytes.
     pub fn to_bytes_be(&self) -> [u8; 8] {
-        self.to_canonical_u64().to_be_bytes()
+        self.canonical_u64().to_be_bytes()
     }
 
     /// Create a field element from an i64.
@@ -299,12 +286,12 @@ impl GoldilocksElement {
 impl ByteConversion for FieldElement<GoldilocksField> {
     #[cfg(feature = "alloc")]
     fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
-        self.to_canonical_u64().to_be_bytes().to_vec()
+        self.canonical_u64().to_be_bytes().to_vec()
     }
 
     #[cfg(feature = "alloc")]
     fn to_bytes_le(&self) -> alloc::vec::Vec<u8> {
-        self.to_canonical_u64().to_le_bytes().to_vec()
+        self.canonical_u64().to_le_bytes().to_vec()
     }
 
     fn from_bytes_be(bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
@@ -345,6 +332,39 @@ impl AsBytes for FieldElement<GoldilocksField> {
     }
 }
 
+// Implement IsPrimeField for the native Goldilocks
+use crate::errors::CreationError;
+use crate::field::traits::IsPrimeField;
+
+impl IsPrimeField for GoldilocksField {
+    type CanonicalType = u64;
+
+    #[inline(always)]
+    fn canonical(a: &Self::BaseType) -> Self::CanonicalType {
+        if *a >= GOLDILOCKS_PRIME {
+            *a - GOLDILOCKS_PRIME
+        } else {
+            *a
+        }
+    }
+
+    fn from_hex(hex_string: &str) -> Result<Self::BaseType, CreationError> {
+        let hex = hex_string.strip_prefix("0x").unwrap_or(hex_string);
+        u64::from_str_radix(hex, 16)
+            .map(Self::from_u64)
+            .map_err(|_| CreationError::InvalidHexString)
+    }
+
+    #[cfg(feature = "std")]
+    fn to_hex(a: &Self::BaseType) -> String {
+        format!("{:x}", Self::canonical(a))
+    }
+
+    fn field_bit_size() -> usize {
+        64 // Goldilocks uses 64-bit representation
+    }
+}
+
 // Implement IsFFTField for the native Goldilocks
 use crate::field::traits::IsFFTField;
 
@@ -377,7 +397,7 @@ mod tests {
         let a = GOLDILOCKS_PRIME - 1;
         let b = 2u64;
         let result = GoldilocksField::add(&a, &b);
-        assert_eq!(canonicalize(result), 1);
+        assert_eq!(GoldilocksField::canonical(&result), 1);
     }
 
     #[test]
@@ -392,7 +412,7 @@ mod tests {
         let a = 3u64;
         let b = 10u64;
         let result = GoldilocksField::sub(&a, &b);
-        assert_eq!(canonicalize(result), GOLDILOCKS_PRIME - 7);
+        assert_eq!(GoldilocksField::canonical(&result), GOLDILOCKS_PRIME - 7);
     }
 
     #[test]
@@ -411,7 +431,7 @@ mod tests {
         // (2^40)^2 = 2^80 mod p
         // 2^80 = 2^64 * 2^16 ≡ EPSILON * 2^16 (mod p)
         let expected = ((a as u128 * b as u128) % GOLDILOCKS_PRIME as u128) as u64;
-        assert_eq!(canonicalize(result), expected);
+        assert_eq!(GoldilocksField::canonical(&result), expected);
     }
 
     #[test]
@@ -419,7 +439,7 @@ mod tests {
         let a = 5u64;
         let a_inv = GoldilocksField::inv(&a).unwrap();
         let product = GoldilocksField::mul(&a, &a_inv);
-        assert_eq!(canonicalize(product), 1);
+        assert_eq!(GoldilocksField::canonical(&product), 1);
     }
 
     #[test]
@@ -427,7 +447,7 @@ mod tests {
         let a = 123456789u64;
         let a_inv = GoldilocksField::inv(&a).unwrap();
         let product = GoldilocksField::mul(&a, &a_inv);
-        assert_eq!(canonicalize(product), 1);
+        assert_eq!(GoldilocksField::canonical(&product), 1);
     }
 
     #[test]
@@ -440,7 +460,7 @@ mod tests {
         let a = 5u64;
         let neg_a = GoldilocksField::neg(&a);
         let sum = GoldilocksField::add(&a, &neg_a);
-        assert_eq!(canonicalize(sum), 0);
+        assert_eq!(GoldilocksField::canonical(&sum), 0);
     }
 
     #[test]
@@ -454,7 +474,7 @@ mod tests {
         for _ in 0..32 {
             result = GoldilocksField::square(&result);
         }
-        assert_eq!(canonicalize(result), 1);
+        assert_eq!(GoldilocksField::canonical(&result), 1);
     }
 
     #[test]
@@ -463,7 +483,12 @@ mod tests {
         for a in [5u64, 123456789, GOLDILOCKS_PRIME - 1, 0xDEADBEEF, 1, 2] {
             let a_inv = inv_addition_chain(a);
             let product = GoldilocksField::mul(&a, &a_inv);
-            assert_eq!(canonicalize(product), 1, "Failed for a = {}", a);
+            assert_eq!(
+                GoldilocksField::canonical(&product),
+                1,
+                "Failed for a = {}",
+                a
+            );
         }
     }
 
@@ -474,8 +499,8 @@ mod tests {
             let sq = GoldilocksField::square(&a);
             let mul = GoldilocksField::mul(&a, &a);
             assert_eq!(
-                canonicalize(sq),
-                canonicalize(mul),
+                GoldilocksField::canonical(&sq),
+                GoldilocksField::canonical(&mul),
                 "Square mismatch for a = {}",
                 a
             );
