@@ -54,9 +54,16 @@ where
             return Err(crate::errors::ByteConversionError::FromBEBytesError);
         }
         let elem_size = bytes.len() / 3;
+        // Use checked arithmetic to prevent overflow
+        let end1 = elem_size
+            .checked_mul(2)
+            .ok_or(crate::errors::ByteConversionError::FromBEBytesError)?;
+        let end2 = elem_size
+            .checked_mul(3)
+            .ok_or(crate::errors::ByteConversionError::FromBEBytesError)?;
         let v0 = F::BaseType::from_bytes_be(&bytes[0..elem_size])?;
-        let v1 = F::BaseType::from_bytes_be(&bytes[elem_size..elem_size * 2])?;
-        let v2 = F::BaseType::from_bytes_be(&bytes[elem_size * 2..elem_size * 3])?;
+        let v1 = F::BaseType::from_bytes_be(&bytes[elem_size..end1])?;
+        let v2 = F::BaseType::from_bytes_be(&bytes[end1..end2])?;
         Ok([
             FieldElement::from_raw(v0),
             FieldElement::from_raw(v1),
@@ -74,9 +81,16 @@ where
             return Err(crate::errors::ByteConversionError::FromLEBytesError);
         }
         let elem_size = bytes.len() / 3;
+        // Use checked arithmetic to prevent overflow
+        let end1 = elem_size
+            .checked_mul(2)
+            .ok_or(crate::errors::ByteConversionError::FromLEBytesError)?;
+        let end2 = elem_size
+            .checked_mul(3)
+            .ok_or(crate::errors::ByteConversionError::FromLEBytesError)?;
         let v0 = F::BaseType::from_bytes_le(&bytes[0..elem_size])?;
-        let v1 = F::BaseType::from_bytes_le(&bytes[elem_size..elem_size * 2])?;
-        let v2 = F::BaseType::from_bytes_le(&bytes[elem_size * 2..elem_size * 3])?;
+        let v1 = F::BaseType::from_bytes_le(&bytes[elem_size..end1])?;
+        let v2 = F::BaseType::from_bytes_le(&bytes[end1..end2])?;
         Ok([
             FieldElement::from_raw(v0),
             FieldElement::from_raw(v1),

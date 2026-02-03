@@ -90,8 +90,14 @@ const MAX_PROOF_FILE_SIZE: u64 = 1024 * 1024 * 1024;
 /// Minimum acceptable blowup factor for proof verification
 const MIN_BLOWUP_FACTOR: u8 = 4;
 
-/// Minimum acceptable FRI queries for proof verification
-const MIN_FRI_QUERIES: usize = 3;
+/// Minimum acceptable FRI queries for proof verification (31 = Conjecturable80Bits minimum)
+const MIN_FRI_QUERIES: usize = 31;
+
+/// Minimum acceptable grinding factor for proof verification
+const MIN_GRINDING_FACTOR: u8 = 1;
+
+/// Maximum acceptable coset offset (reasonable upper bound)
+const MAX_COSET_OFFSET: u64 = 1000;
 
 /// Read a file with size validation to prevent memory exhaustion.
 fn read_file_with_limit(path: &Path, max_size: u64, file_type: &str) -> Result<Vec<u8>, String> {
@@ -597,6 +603,22 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf) -> ExitCode {
         eprintln!(
             "Invalid proof options: fri_number_of_queries {} is below minimum {}",
             bundle.proof_options.fri_number_of_queries, MIN_FRI_QUERIES
+        );
+        return ExitCode::FAILURE;
+    }
+    if bundle.proof_options.coset_offset == 0
+        || bundle.proof_options.coset_offset > MAX_COSET_OFFSET
+    {
+        eprintln!(
+            "Invalid proof options: coset_offset {} is out of valid range (1-{})",
+            bundle.proof_options.coset_offset, MAX_COSET_OFFSET
+        );
+        return ExitCode::FAILURE;
+    }
+    if bundle.proof_options.grinding_factor < MIN_GRINDING_FACTOR {
+        eprintln!(
+            "Invalid proof options: grinding_factor {} is below minimum {}",
+            bundle.proof_options.grinding_factor, MIN_GRINDING_FACTOR
         );
         return ExitCode::FAILURE;
     }
