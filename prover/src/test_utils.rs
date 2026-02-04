@@ -36,6 +36,7 @@ use crate::tables::cpu::{
 };
 use crate::tables::decode::{bus_interactions as decode_bus_interactions, cols as decode_cols};
 use crate::tables::halt::{bus_interactions as halt_bus_interactions, cols as halt_cols};
+use crate::tables::page::{bus_interactions as page_bus_interactions, cols as page_cols};
 use crate::tables::load::{
     bus_interactions as load_bus_interactions, cols as load_cols, constraints as load_constraints,
 };
@@ -608,6 +609,32 @@ pub fn create_halt_air(proof_options: &ProofOptions) -> VmAir {
 
     AirWithBuses::new(
         halt_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+}
+
+/// Create PAGE AIR with bus interactions for a specific page.
+///
+/// Each PAGE table instance has its own AIR because the bus interactions
+/// include the page_base as a constant. The `page_base` parameter specifies
+/// the base address of this page.
+///
+/// The PAGE table has no transition constraints (it's a pure lookup table).
+/// It interacts with:
+/// - IS_BYTE bus: range checks for init/fini values
+/// - Memory bus: provides initial and final memory tokens
+pub fn create_page_air(proof_options: &ProofOptions, page_base: u64) -> VmAir {
+    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: page_bus_interactions(page_base),
+    };
+
+    AirWithBuses::new(
+        page_cols::NUM_COLUMNS,
         auxiliary_trace_build_data,
         proof_options,
         1,

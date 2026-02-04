@@ -33,7 +33,7 @@ use crate::tables::bitwise;
 use crate::tables::trace_builder::Traces;
 use crate::test_utils::{
     E, F, create_bitwise_air, create_branch_air, create_cpu_air, create_decode_air,
-    create_halt_air, create_load_air, create_lt_air, create_memw_air,
+    create_halt_air, create_load_air, create_lt_air, create_memw_air, create_page_air,
 };
 
 use stark::proof::options::ProofOptions;
@@ -79,7 +79,7 @@ pub fn prove(elf_bytes: &[u8]) -> Result<MultiProof<F, E, ()>, Error> {
         .map_err(|e| Error::Execution(format!("{e}")))?;
 
     // Generate all traces from ELF and execution logs
-    // This uses the combined ELF processing to generate DECODE and MEMORY_INIT in one pass
+    // This uses the combined ELF processing to generate DECODE and PAGE tables
     let mut traces = Traces::from_elf_and_logs(&program, &result.logs)?;
 
     let proof_options = ProofOptions::default_test_options();
@@ -95,7 +95,15 @@ pub fn prove(elf_bytes: &[u8]) -> Result<MultiProof<F, E, ()>, Error> {
     let branch_air = create_branch_air(&proof_options);
     let halt_air = create_halt_air(&proof_options);
 
-    let air_trace_pairs: Vec<(
+    // Create PAGE AIRs (one per page, each with its own page_base constant)
+    let page_airs: Vec<_> = traces
+        .page_configs
+        .iter()
+        .map(|config| create_page_air(&proof_options, config.page_base))
+        .collect();
+
+    // Build air_trace_pairs for core tables
+    let mut air_trace_pairs: Vec<(
         &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
         _,
         _,
@@ -109,6 +117,11 @@ pub fn prove(elf_bytes: &[u8]) -> Result<MultiProof<F, E, ()>, Error> {
         (&branch_air, &mut traces.branch, &()),
         (&halt_air, &mut traces.halt, &()),
     ];
+
+    // Add PAGE table pairs
+    for (i, page_trace) in traces.pages.iter_mut().enumerate() {
+        air_trace_pairs.push((&page_airs[i], page_trace, &()));
+    }
 
     Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
         .map_err(|e| Error::Prover(format!("{e:?}")))

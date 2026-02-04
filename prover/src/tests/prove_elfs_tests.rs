@@ -33,8 +33,9 @@ use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 // Import shared utilities
 use crate::test_utils::{
     create_bitwise_air, create_branch_air, create_cpu_air, create_decode_air, create_halt_air,
-    create_load_air, create_lt_air, create_memw_air, run_asm_elf,
+    create_load_air, create_lt_air, create_memw_air, create_page_air, run_asm_elf,
 };
+use crate::tables::page::PageConfig;
 
 type F = GoldilocksField;
 type E = GoldilocksExtension;
@@ -122,7 +123,7 @@ fn prove_and_verify_vm(
 }
 
 /// Run multi_prove and multi_verify for all VM tables.
-/// Run multi_prove and multi_verify for all VM tables (CPU + Bitwise + LT + MEMW + LOAD + DECODE + HALT).
+/// Run multi_prove and multi_verify for all VM tables (CPU + Bitwise + LT + MEMW + LOAD + DECODE + HALT + PAGE).
 ///
 /// Used for fast tests where the bitwise table is a dummy that only contains
 /// the rows needed to balance the bus. NOT the full preprocessed table.
@@ -136,6 +137,36 @@ fn prove_and_verify_vm_minimal(
     branch_trace: &mut TraceTable<F, E>,
     halt_trace: &mut TraceTable<F, E>,
 ) -> bool {
+    // Call the version with empty PAGE tables (for tests without Memory bus)
+    prove_and_verify_vm_with_pages(
+        cpu_trace,
+        bitwise_trace,
+        lt_trace,
+        memw_trace,
+        load_trace,
+        decode_trace,
+        branch_trace,
+        halt_trace,
+        &mut Vec::new(),
+        &[],
+    )
+}
+
+/// Run multi_prove and multi_verify including PAGE tables for Memory bus.
+///
+/// This version accepts PAGE traces and configs for full Memory bus support.
+fn prove_and_verify_vm_with_pages(
+    cpu_trace: &mut TraceTable<F, E>,
+    bitwise_trace: &mut TraceTable<F, E>,
+    lt_trace: &mut TraceTable<F, E>,
+    memw_trace: &mut TraceTable<F, E>,
+    load_trace: &mut TraceTable<F, E>,
+    decode_trace: &mut TraceTable<F, E>,
+    branch_trace: &mut TraceTable<F, E>,
+    halt_trace: &mut TraceTable<F, E>,
+    page_traces: &mut Vec<TraceTable<F, E>>,
+    page_configs: &[PageConfig],
+) -> bool {
     let proof_options = ProofOptions::default_test_options();
 
     let cpu_air = create_cpu_air(&proof_options);
@@ -147,10 +178,17 @@ fn prove_and_verify_vm_minimal(
     let branch_air = create_branch_air(&proof_options);
     let halt_air = create_halt_air(&proof_options);
 
-    let air_trace_pairs: Vec<(
+    // Create PAGE AIRs (one per page, each with its own page_base)
+    let page_airs: Vec<_> = page_configs
+        .iter()
+        .map(|config| create_page_air(&proof_options, config.page_base))
+        .collect();
+
+    // Build air_trace_pairs for core tables
+    let mut air_trace_pairs: Vec<(
         &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
-        _,
-        _,
+        &mut TraceTable<F, E>,
+        &(),
     )> = vec![
         (&cpu_air, cpu_trace, &()),
         (&bitwise_air, bitwise_trace, &()),
@@ -162,6 +200,11 @@ fn prove_and_verify_vm_minimal(
         (&halt_air, halt_trace, &()),
     ];
 
+    // Add PAGE table pairs
+    for (i, page_trace) in page_traces.iter_mut().enumerate() {
+        air_trace_pairs.push((&page_airs[i], page_trace, &()));
+    }
+
     let multi_proof =
         match Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])) {
             Ok(proof) => proof,
@@ -171,7 +214,8 @@ fn prove_and_verify_vm_minimal(
             }
         };
 
-    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
+    // Build airs list for verification
+    let mut airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
         &cpu_air,
         &bitwise_air,
         &lt_air,
@@ -181,6 +225,11 @@ fn prove_and_verify_vm_minimal(
         &branch_air,
         &halt_air,
     ];
+
+    // Add PAGE AIRs
+    for page_air in &page_airs {
+        airs.push(page_air);
+    }
 
     Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[]))
 }
@@ -247,12 +296,12 @@ fn test_cpu_only_no_bus() {
 #[test]
 fn test_prove_elfs_sub_fast() {
     let _ = env_logger::builder().is_test(true).try_init();
-    let (_elf, logs, instructions) = run_asm_elf("sub");
-    // Use full Traces to get real MEMW trace (includes register operations)
-    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone()).unwrap();
+    let (elf, logs, _instructions) = run_asm_elf("sub");
+    // Use from_elf_and_logs to get PAGE tables for Memory bus
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
 
     assert!(
-        prove_and_verify_vm_minimal(
+        prove_and_verify_vm_with_pages(
             &mut traces.cpu,
             &mut traces.bitwise,
             &mut traces.lt,
@@ -260,7 +309,9 @@ fn test_prove_elfs_sub_fast() {
             &mut traces.load,
             &mut traces.decode,
             &mut traces.branch,
-            &mut traces.halt
+            &mut traces.halt,
+            &mut traces.pages,
+            &traces.page_configs,
         ),
         "Proof verification failed for sub program (fast)"
     );
