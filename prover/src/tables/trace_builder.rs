@@ -975,7 +975,11 @@ impl Traces {
                 .ok_or(Error::MissingHaltEcall)?;
             halt::generate_halt_trace(halt_op.timestamp)
         } else {
-            // Non-final segment: generate dummy halt trace
+            // Non-final segment: verify no ECALL present (would cause bus imbalance)
+            if cpu_ops.iter().any(|op| op.decode.op_ecall) {
+                return Err(Error::UnexpectedEcallInSegment);
+            }
+            // Generate dummy halt trace
             halt::generate_dummy_halt_trace()
         };
 

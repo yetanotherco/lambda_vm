@@ -67,13 +67,20 @@ fn test_boundary_next() {
 #[test]
 fn test_from_logs_segmented_intermediate_segment() {
     // Test that from_logs_segmented works for an intermediate (non-final) segment
-    // Intermediate segments don't need an ECALL
+    // Intermediate segments must NOT contain an ECALL
     let (_elf, logs, instructions) = run_asm_elf("sub");
+
+    // Find ECALL and exclude it from intermediate segment
+    let ecall_idx = find_ecall_index(&logs, &instructions).unwrap_or(logs.len());
+    if ecall_idx == 0 {
+        return; // Can't test with only ECALL
+    }
+    let logs_without_ecall = &logs[..ecall_idx];
 
     let boundary = SegmentBoundary::initial();
     let config = SegmentConfig::intermediate();
 
-    let result = Traces::from_logs_segmented(&logs, instructions, &boundary, &config)
+    let result = Traces::from_logs_segmented(logs_without_ecall, instructions, &boundary, &config)
         .expect("Failed to generate segmented traces");
 
     assert!(!result.is_final);
@@ -223,5 +230,30 @@ fn test_multi_segment_trace_generation() {
     assert_eq!(
         boundary3.start_timestamp,
         boundary2.start_timestamp + (seg2_logs.len() as u64) * 4
+    );
+}
+
+#[test]
+fn test_ecall_in_intermediate_segment_rejected() {
+    // Verify that an ECALL in an intermediate segment is rejected
+    let (_elf, logs, instructions) = run_asm_elf("sub");
+
+    // Find ECALL position
+    let ecall_idx = match find_ecall_index(&logs, &instructions) {
+        Some(idx) => idx,
+        None => return, // No ECALL, skip test
+    };
+
+    // Include the ECALL in the segment but mark it as intermediate
+    let logs_with_ecall = &logs[..=ecall_idx];
+
+    let boundary = SegmentBoundary::initial();
+    let config = SegmentConfig::intermediate(); // Wrong! ECALL should be in final segment
+
+    let result = Traces::from_logs_segmented(logs_with_ecall, instructions, &boundary, &config);
+
+    assert!(
+        result.is_err(),
+        "Should reject ECALL in intermediate segment"
     );
 }
