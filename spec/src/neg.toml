@@ -1,14 +1,14 @@
 name = "NEG"
 
+[[variables.condition]]
+name = "cond"
+type = "Bit"
+desc = "condition on whether to negate x"
+
 [[variables.input]]
 name = "x"
 type = "DWordHL"
 desc = "value to compute negation of"
-
-[[variables.input]]
-name = "cond"
-type = "BaseField"
-desc = "condition on whether to negate x"
 
 [[variables.output]]
 name = "neg"
