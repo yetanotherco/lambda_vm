@@ -8,12 +8,14 @@
 //! - **LT**: Less-than comparison table
 //! - **CPU**: Main execution table
 //! - **DECODE**: Instruction decode table
+//! - **BRANCH**: Branch target calculation table
+//! - **HALT**: Single-row halt table
 //!
 //! ## Memory Tables
 //!
 //! - **MEMW**: Memory word read/write table
 //! - **LOAD**: Memory load with extension table
-//! - **MEMORY_INIT**: Initial memory state from ELF (preprocessed)
+//! - **PAGE**: Paged memory init/final table (one per used page, replaces MEMORY_INIT/MEMORY_FINAL)
 
 pub mod types;
 
@@ -24,9 +26,8 @@ pub mod decode;
 pub mod halt;
 pub mod load;
 pub mod lt;
-pub mod memory_final;
-pub mod memory_init;
 pub mod memw;
+pub mod page;
 pub mod trace_builder;
 
 pub use types::BusId;

@@ -40,8 +40,8 @@ use super::decode::{self, PcToRow};
 use super::halt;
 use super::load::{self, LoadOperation};
 use super::lt::{self, LtOperation};
-use super::memory_init::{self, AddrToRow};
 use super::memw::{self, MemwOperation};
+use super::page::{self, FinalByteState, FinalStateMap, PageConfig};
 use super::types::{GoldilocksExtension, GoldilocksField};
 use crate::Error;
 
@@ -624,6 +624,88 @@ fn collect_bitwise_from_branch(branch_ops: &[BranchOperation]) -> Vec<BitwiseOpe
 }
 
 // =============================================================================
+// PAGE Table Generation
+// =============================================================================
+
+/// Generates PAGE tables for memory initialization and finalization.
+///
+/// Creates one PAGE table per memory page covering:
+/// 1. ELF segments (code, data, BSS)
+/// 2. Stack region (from STACK_TOP - stack_size to STACK_TOP)
+///
+/// Each PAGE table contains initial values from ELF and final state from execution.
+fn generate_page_tables(
+    elf: &Elf,
+    memory_state: &MemoryState,
+) -> (
+    Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+    Vec<PageConfig>,
+) {
+    use std::collections::BTreeSet;
+
+    let page_size = page::DEFAULT_PAGE_SIZE;
+
+    // Collect all pages needed from ELF segments
+    let mut page_bases: BTreeSet<u64> = BTreeSet::new();
+    let mut elf_page_data: HashMap<u64, Vec<u8>> = HashMap::new();
+
+    for segment in &elf.data {
+        for (i, &word) in segment.values.iter().enumerate() {
+            let word_addr = segment.base_addr + (i as u64 * 4);
+
+            // For each byte in the 32-bit word
+            for byte_offset in 0..4u64 {
+                let byte_addr = word_addr + byte_offset;
+                let byte_value = ((word >> (byte_offset * 8)) & 0xFF) as u8;
+
+                let page_base = page::page_base_for_address(byte_addr, page_size);
+                let offset = page::offset_in_page(byte_addr, page_size);
+
+                page_bases.insert(page_base);
+
+                // Store initial values for this page
+                let page_data = elf_page_data.entry(page_base).or_insert_with(|| vec![0u8; page_size]);
+                page_data[offset] = byte_value;
+            }
+        }
+    }
+
+    // Add stack pages (use a default stack size)
+    // TODO: Make this configurable via MemoryInitConfig
+    let stack_size = 4096u64; // 1 page for now
+    let stack_bottom = page::STACK_TOP - stack_size;
+    let stack_page_base = page::page_base_for_address(stack_bottom, page_size);
+    page_bases.insert(stack_page_base);
+
+    // Build final state map from memory_state
+    let final_state: FinalStateMap = memory_state
+        .cells
+        .iter()
+        .map(|(&addr, &(value, timestamp))| {
+            (addr, FinalByteState { timestamp, value })
+        })
+        .collect();
+
+    // Generate PAGE tables and configs
+    let mut pages = Vec::new();
+    let mut page_configs = Vec::new();
+
+    for &page_base in &page_bases {
+        let config = if let Some(init_data) = elf_page_data.get(&page_base) {
+            PageConfig::with_data(page_base, page_size, init_data.clone())
+        } else {
+            PageConfig::zero_init(page_base, page_size)
+        };
+
+        let trace = page::generate_page_trace(&config, &final_state);
+        pages.push(trace);
+        page_configs.push(config);
+    }
+
+    (pages, page_configs)
+}
+
+// =============================================================================
 // Trace Generation
 // =============================================================================
 
@@ -647,8 +729,11 @@ pub struct Traces {
     /// DECODE instruction decoding table (preprocessed from ELF)
     pub decode: TraceTable<GoldilocksField, GoldilocksExtension>,
 
-    /// MEMORY_INIT initial memory state table (preprocessed from ELF)
-    pub memory_init: TraceTable<GoldilocksField, GoldilocksExtension>,
+    /// PAGE tables for memory initialization/finalization (one per page)
+    pub pages: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+
+    /// Page configurations (for bus interactions)
+    pub page_configs: Vec<PageConfig>,
 
     /// BRANCH target calculation trace
     pub branch: TraceTable<GoldilocksField, GoldilocksExtension>,
@@ -658,24 +743,21 @@ pub struct Traces {
 
     /// PC to row mapping for DECODE multiplicities (internal use)
     pc_to_row: PcToRow,
-
-    /// Address to row mapping for MEMORY_INIT multiplicities (internal use)
-    addr_to_row: AddrToRow,
 }
 
 impl Traces {
     /// Generates all traces from ELF and execution logs using phased collection.
     ///
     /// The phases are:
-    /// 0. ELF → DECODE, MEMORY_INIT (preprocessed tables, single pass)
+    /// 0. ELF → DECODE (preprocessed table)
     /// 1. Logs → CPU operations
     /// 2. CPU ops → MEMW, LOAD, LT, Bitwise, Branch (state tracking for MEMW/LOAD)
     /// 3. MEMW → LT operations (timestamp ordering)
     /// 4. LT, MEMW, Branch → Bitwise lookups
-    /// 5. Generate all traces
+    /// 5. Generate all traces including PAGE tables
     pub fn from_elf_and_logs(elf: &Elf, logs: &[Log]) -> Result<Self, Error> {
         // =====================================================================
-        // PHASE 0: ELF → DECODE + MEMORY_INIT (single pass)
+        // PHASE 0: ELF → DECODE
         // =====================================================================
         let elf_tables = decode::tables_from_elf(elf)
             .map_err(|e| Error::Execution(format!("Failed to process ELF: {e}")))?;
@@ -755,9 +837,8 @@ impl Traces {
         decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
         decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
 
-        // MEMORY_INIT multiplicities will be updated when Memory bus is fully wired
-        let memory_init = elf_tables.memory_init;
-        let addr_to_row = elf_tables.addr_to_row;
+        // Generate PAGE tables from ELF and final memory state
+        let (pages, page_configs) = generate_page_tables(elf, &memory_state);
 
         Ok(Traces {
             cpu,
@@ -766,18 +847,20 @@ impl Traces {
             memw,
             load,
             decode,
-            memory_init,
+            pages,
+            page_configs,
             branch,
             halt: halt_trace,
             pc_to_row,
-            addr_to_row,
         })
     }
 
     /// Generates all traces from execution logs (legacy API).
     ///
     /// This is a compatibility wrapper. Prefer `from_elf_and_logs` for new code
-    /// as it generates both DECODE and MEMORY_INIT in a single ELF pass.
+    /// as it generates PAGE tables from ELF data.
+    ///
+    /// Note: This creates empty PAGE tables since no ELF is provided.
     pub fn from_logs(logs: &[Log], instructions: U64HashMap<Instruction>) -> Result<Self, Error> {
         // =====================================================================
         // PHASE 1: Logs → CPU operations
@@ -849,16 +932,10 @@ impl Traces {
         decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
         decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
 
-        // Create empty MEMORY_INIT table for legacy API
-        // (caller should use from_elf_and_logs for proper memory_init support)
-        let memory_init = memory_init::generate_memory_init_trace(
-            &Elf {
-                entry_point: 0,
-                data: vec![],
-            },
-            &memory_init::MemoryInitConfig { stack_size: 0 },
-        )
-        .0;
+        // Create empty PAGE tables for legacy API
+        // (caller should use from_elf_and_logs for proper PAGE table support)
+        let pages = Vec::new();
+        let page_configs = Vec::new();
 
         Ok(Traces {
             cpu,
@@ -867,11 +944,11 @@ impl Traces {
             memw,
             load,
             decode,
-            memory_init,
+            pages,
+            page_configs,
             branch,
             halt: halt_trace,
             pc_to_row,
-            addr_to_row: HashMap::new(),
         })
     }
 

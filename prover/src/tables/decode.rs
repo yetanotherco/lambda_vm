@@ -330,54 +330,34 @@ pub fn commitment_from_elf(
 }
 
 // =========================================================================
-// Combined ELF processing (DECODE + MEMORY_INIT)
+// Combined ELF processing (DECODE only)
 // =========================================================================
 
-use super::memory_init::{self, AddrToRow};
-
-/// Result of combined ELF processing.
+/// Result of ELF processing for DECODE table.
 pub struct ElfTables {
     /// DECODE trace table
     pub decode: TraceTable<GoldilocksField, GoldilocksExtension>,
     /// PC to row mapping for DECODE multiplicities
     pub pc_to_row: PcToRow,
-    /// MEMORY_INIT trace table
-    pub memory_init: TraceTable<GoldilocksField, GoldilocksExtension>,
-    /// Address to row mapping for MEMORY_INIT multiplicities
-    pub addr_to_row: AddrToRow,
 }
 
-/// Process ELF in a single pass to generate both DECODE and MEMORY_INIT tables.
-///
-/// This is more efficient than generating tables separately since it iterates
-/// through the ELF segments only once.
+/// Process ELF to generate DECODE table from executable segments.
 ///
 /// ## Returns
 ///
 /// - `decode`: DECODE trace with all instructions from executable segments
 /// - `pc_to_row`: Map from PC to row index for DECODE multiplicity updates
-/// - `memory_init`: MEMORY_INIT trace with all words from all segments
-/// - `addr_to_row`: Map from address to row index for MEMORY_INIT multiplicity updates
 ///
-/// Both tables have multiplicities initialized to 0.
+/// Table has multiplicities initialized to 0.
 pub fn tables_from_elf(elf: &Elf) -> Result<ElfTables, InstructionError> {
     let mut decode_entries = Vec::new();
     let mut pc_to_row = HashMap::with_capacity(elf.data.iter().map(|s| s.values.len()).sum());
 
-    let mut init_entries = Vec::new();
-    let mut addr_to_row = HashMap::new();
-
-    // Single pass through all ELF segments
+    // Process all ELF segments for DECODE (only executable segments)
     for segment in &elf.data {
-        for (i, &word) in segment.values.iter().enumerate() {
-            let addr = segment.base_addr + (i as u64 * 4);
-
-            // MEMORY_INIT: all segments (code, data, BSS)
-            addr_to_row.insert(addr, init_entries.len());
-            init_entries.push((addr, word as u64));
-
-            // DECODE: only executable segments
-            if segment.is_executable {
+        if segment.is_executable {
+            for (i, &word) in segment.values.iter().enumerate() {
+                let addr = segment.base_addr + (i as u64 * 4);
                 let instruction = Instruction::parse(word)?;
                 pc_to_row.insert(addr, decode_entries.len());
                 decode_entries.push(DecodeEntry::from_instruction(addr, instruction));
@@ -388,15 +368,7 @@ pub fn tables_from_elf(elf: &Elf) -> Result<ElfTables, InstructionError> {
     // Build DECODE table
     let decode = build_decode_table(decode_entries, &mut pc_to_row);
 
-    // Build MEMORY_INIT table
-    let memory_init = build_memory_init_table(init_entries);
-
-    Ok(ElfTables {
-        decode,
-        pc_to_row,
-        memory_init,
-        addr_to_row,
-    })
+    Ok(ElfTables { decode, pc_to_row })
 }
 
 /// Build DECODE trace table from entries.
@@ -451,28 +423,6 @@ fn build_decode_table(
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
 }
 
-/// Build MEMORY_INIT trace table from entries.
-fn build_memory_init_table(
-    entries: Vec<(u64, u64)>,
-) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    // Pad to next power of 2, minimum 2
-    let num_entries = entries.len();
-    let num_rows = num_entries.next_power_of_two().max(2);
-    let mut data = vec![FE::zero(); num_rows * memory_init::cols::NUM_COLUMNS];
-
-    // Fill actual entries
-    for (row_idx, (addr, value)) in entries.iter().enumerate() {
-        let base = row_idx * memory_init::cols::NUM_COLUMNS;
-        data[base + memory_init::cols::ADDRESS_0] = FE::from(addr & 0xFFFF_FFFF);
-        data[base + memory_init::cols::ADDRESS_1] = FE::from(addr >> 32);
-        data[base + memory_init::cols::VALUE] = FE::from(*value);
-    }
-
-    // Padding rows: address=0, value=0, MU=0 (all zeros, already initialized)
-
-    TraceTable::new_main(data, memory_init::cols::NUM_COLUMNS, 1)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,24 +448,12 @@ mod tests {
         assert!(tables.pc_to_row.contains_key(&0x1000));
         assert!(tables.pc_to_row.contains_key(&0x1004));
         assert!(tables.pc_to_row.contains_key(&super::super::cpu::CPU_PADDING_PC));
-
-        // Check MEMORY_INIT table
-        assert_eq!(tables.addr_to_row.len(), 2);
-        assert!(tables.addr_to_row.contains_key(&0x1000));
-        assert!(tables.addr_to_row.contains_key(&0x1004));
-
-        // Verify values in memory_init
-        let row0 = *tables.addr_to_row.get(&0x1000).unwrap();
-        assert_eq!(
-            *tables.memory_init.main_table.get(row0, memory_init::cols::VALUE),
-            FE::from(0x02a00093u64)
-        );
     }
 
     #[test]
     fn test_tables_from_elf_mixed_segments() {
         // Executable segment with instructions
-        // Data segment with data
+        // Data segment with data (not included in DECODE)
         let elf = Elf {
             entry_point: 0x1000,
             data: vec![
@@ -538,12 +476,6 @@ mod tests {
         assert_eq!(tables.pc_to_row.len(), 2);
         assert!(tables.pc_to_row.contains_key(&0x1000));
         assert!(!tables.pc_to_row.contains_key(&0x2000)); // Data not in decode
-
-        // MEMORY_INIT: all segments (3 words total)
-        assert_eq!(tables.addr_to_row.len(), 3);
-        assert!(tables.addr_to_row.contains_key(&0x1000)); // Code
-        assert!(tables.addr_to_row.contains_key(&0x2000)); // Data
-        assert!(tables.addr_to_row.contains_key(&0x2004)); // Data
     }
 
     #[test]
@@ -558,8 +490,5 @@ mod tests {
         // DECODE: only CPU padding entry
         assert_eq!(tables.pc_to_row.len(), 1);
         assert!(tables.pc_to_row.contains_key(&super::super::cpu::CPU_PADDING_PC));
-
-        // MEMORY_INIT: empty
-        assert!(tables.addr_to_row.is_empty());
     }
 }
