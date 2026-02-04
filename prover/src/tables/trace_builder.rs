@@ -376,17 +376,11 @@ fn collect_store_op_from_cpu(op: &CpuOperation, memory_state: &mut MemoryState) 
     // Read old values and timestamps
     let (old_values, old_timestamps) = memory_state.read_bytes(base_address, 8);
 
-    // Pack store value as [lo32, hi32, 0, 0, 0, 0, 0, 0] to match CPU M7
-    let value_bytes = [
-        store_value & 0xFFFF_FFFF,
-        store_value >> 32,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-    ];
+    // Pack store value as individual bytes (per spec: memory uses 8 range-checked Bytes)
+    let mut value_bytes = [0u64; 8];
+    for (j, byte) in value_bytes.iter_mut().take(byte_count).enumerate() {
+        *byte = (store_value >> (j * 8)) & 0xFF;
+    }
 
     // Create MEMW operation (write) - M7 uses timestamp+1
     let memw_op = MemwOperation::new(
@@ -683,6 +677,79 @@ fn collect_bitwise_from_branch(branch_ops: &[BranchOperation]) -> Vec<BitwiseOpe
     bitwise_ops
 }
 
+/// Collects IS_BYTE lookups from PAGE data (init and fini values).
+///
+/// Each PAGE byte generates 2 IS_BYTE lookups:
+/// - C1: IS_BYTE[init] for initialization range check
+/// - C2: IS_BYTE[fini] for finalization range check
+///
+/// This must be called BEFORE bitwise multiplicities are updated.
+fn collect_bitwise_from_page(elf: &Elf, memory_state: &MemoryState) -> Vec<BitwiseOperation> {
+    use std::collections::BTreeSet;
+
+    let page_size = page::DEFAULT_PAGE_SIZE;
+    let mut bitwise_ops = Vec::new();
+
+    // Collect all pages needed from ELF segments and build init data
+    let mut page_bases: BTreeSet<u64> = BTreeSet::new();
+    let mut elf_page_data: HashMap<u64, Vec<u8>> = HashMap::new();
+
+    for segment in &elf.data {
+        for (i, &word) in segment.values.iter().enumerate() {
+            let word_addr = segment.base_addr + (i as u64 * 4);
+            for byte_offset in 0..4u64 {
+                let byte_addr = word_addr + byte_offset;
+                let byte_value = ((word >> (byte_offset * 8)) & 0xFF) as u8;
+
+                let page_base = page::page_base_for_address(byte_addr, page_size);
+                let offset = page::offset_in_page(byte_addr, page_size);
+
+                page_bases.insert(page_base);
+
+                let page_data =
+                    elf_page_data.entry(page_base).or_insert_with(|| vec![0u8; page_size]);
+                page_data[offset] = byte_value;
+            }
+        }
+    }
+
+    // Add stack pages (same as in generate_page_tables)
+    let stack_size = 4096u64;
+    let stack_bottom = page::STACK_TOP - stack_size;
+    let stack_page_base = page::page_base_for_address(stack_bottom, page_size);
+    page_bases.insert(stack_page_base);
+
+    // Build final state map from memory_state
+    let final_state: FinalStateMap = memory_state
+        .cells
+        .iter()
+        .map(|(&addr, &(value, timestamp))| (addr, FinalByteState { timestamp, value }))
+        .collect();
+
+    // For each page and each byte, add IS_BYTE lookups for init and fini
+    for &page_base in &page_bases {
+        let init_data = elf_page_data.get(&page_base);
+
+        for offset in 0..page_size {
+            let addr = page_base + offset as u64;
+
+            // Get init value (from ELF or 0)
+            let init = init_data.map_or(0u8, |data| data[offset]);
+
+            // Get fini value (from final_state or init if never accessed)
+            let fini = final_state.get(&addr).map_or(init, |state| state.value);
+
+            // C1: IS_BYTE[init]
+            bitwise_ops.push(BitwiseOperation::single_byte(BitwiseOperationType::IsByte, init));
+
+            // C2: IS_BYTE[fini]
+            bitwise_ops.push(BitwiseOperation::single_byte(BitwiseOperationType::IsByte, fini));
+        }
+    }
+
+    bitwise_ops
+}
+
 // =============================================================================
 // PAGE Table Generation
 // =============================================================================
@@ -869,6 +936,8 @@ impl Traces {
         bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
         bitwise_ops.extend(collect_bitwise_from_memw(&memw_ops));
         bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
+        // PAGE tables do IS_BYTE lookups for init and fini values (C1, C2)
+        bitwise_ops.extend(collect_bitwise_from_page(elf, &memory_state));
 
         // =====================================================================
         // PHASE 5: Generate final traces
