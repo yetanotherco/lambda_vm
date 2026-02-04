@@ -21,4 +21,6 @@ pub mod mul_tests;
 #[cfg(test)]
 pub mod prove_elfs_tests;
 #[cfg(test)]
+pub mod segment_tests;
+#[cfg(test)]
 pub mod trace_builder_tests;

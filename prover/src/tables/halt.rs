@@ -64,6 +64,20 @@ pub fn generate_halt_trace(timestamp: u64) -> TraceTable<GoldilocksField, Goldil
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
 }
 
+/// Generates a dummy HALT trace for non-final segments.
+///
+/// Non-final segments don't contain an ECALL instruction, so the CPU doesn't
+/// send anything to the ECALL bus. This dummy trace has zero multiplicity
+/// (the BusInteraction::receiver with Multiplicity::One will contribute 0
+/// to the LogUp accumulator when the timestamp values don't match any sender).
+///
+/// The timestamp is set to 0 which won't match any real CPU timestamp
+/// (real timestamps start at 4).
+pub fn generate_dummy_halt_trace() -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let data = vec![FE::zero(), FE::zero()];
+    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+}
+
 // =========================================================================
 // Bus interactions
 // =========================================================================

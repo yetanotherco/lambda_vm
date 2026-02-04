@@ -40,6 +40,7 @@ use super::load::{self, LoadOperation};
 use super::lt::{self, LtOperation};
 use super::memw::{self, MemwOperation};
 use super::mul::{self, MulOperation};
+use super::segment::{SegmentBoundary, SegmentConfig, SegmentResult};
 use super::types::{GoldilocksExtension, GoldilocksField};
 use crate::Error;
 
@@ -54,7 +55,7 @@ type MemoryCell = (u8, u64);
 type RegisterCell = (u64, u64);
 
 /// Memory state tracker for generating MEMW/LOAD traces.
-struct MemoryState {
+pub(crate) struct MemoryState {
     /// Map from byte address to (value, timestamp)
     cells: HashMap<u64, MemoryCell>,
 }
@@ -64,6 +65,24 @@ impl MemoryState {
         Self {
             cells: HashMap::new(),
         }
+    }
+
+    /// Create memory state from a segment boundary.
+    pub fn from_boundary(boundary: &SegmentBoundary) -> Self {
+        let mut cells = HashMap::new();
+        for &(addr, val, ts) in &boundary.memory_state {
+            cells.insert(addr, (val, ts));
+        }
+        Self { cells }
+    }
+
+    /// Export memory state for segment boundary.
+    /// Returns (address, value, timestamp) tuples for all cells.
+    pub fn to_boundary(&self) -> Vec<(u64, u8, u64)> {
+        self.cells
+            .iter()
+            .map(|(&addr, &(val, ts))| (addr, val, ts))
+            .collect()
     }
 
     /// Read a byte from memory. Returns (value, timestamp) or (0, 0) if never written.
@@ -98,7 +117,7 @@ impl MemoryState {
 }
 
 /// Register state tracker for generating MEMW register traces.
-struct RegisterState {
+pub(crate) struct RegisterState {
     /// Register file: (value, last_write_timestamp)
     regs: [RegisterCell; 32],
 }
@@ -109,6 +128,27 @@ impl RegisterState {
             // All registers start at (0, 0) - value 0 at timestamp 0
             regs: [(0, 0); 32],
         }
+    }
+
+    /// Create register state from a segment boundary.
+    pub fn from_boundary(boundary: &SegmentBoundary) -> Self {
+        let mut regs = [(0u64, 0u64); 32];
+        // x0 is always (0, 0)
+        // x1-x31 come from boundary
+        for (i, &(val, ts)) in boundary.register_state.iter().enumerate() {
+            regs[i + 1] = (val, ts);
+        }
+        Self { regs }
+    }
+
+    /// Export register state for segment boundary.
+    /// Returns [(value, timestamp); 31] for x1-x31 (x0 excluded).
+    pub fn to_boundary(&self) -> [(u64, u64); 31] {
+        let mut result = [(0u64, 0u64); 31];
+        for (i, cell) in result.iter_mut().enumerate() {
+            *cell = self.regs[i + 1];
+        }
+        result
     }
 
     /// Read a register. Returns (value, last_write_timestamp).
@@ -156,17 +196,20 @@ fn pack_register_value(value: u64) -> [u64; 8] {
 
 /// Collects CPU operations from execution logs.
 ///
+/// The `start_timestamp` parameter allows continuing timestamp sequence from
+/// a previous segment. For the first segment, use 4 (timestamps start at 4,
+/// not 0, to ensure old_timestamp < timestamp holds for the first access).
+///
 /// Returns a vector of CpuOperation, one per log entry.
 fn collect_cpu_ops(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,
+    start_timestamp: u64,
 ) -> Result<Vec<CpuOperation>, Error> {
     let mut cpu_ops = Vec::with_capacity(logs.len());
 
-    // Timestamps start at 4 (not 0) to ensure old_timestamp < timestamp holds
-    // for the first access to any register/memory location (where old_timestamp=0).
     for (i, log) in logs.iter().enumerate() {
-        let timestamp = (i as u64) * 4 + 4;
+        let timestamp = start_timestamp + (i as u64) * 4;
         let instruction = instructions
             .get(&log.current_pc)
             .copied()
@@ -740,7 +783,9 @@ impl Traces {
         // =====================================================================
         // PHASE 1: Logs → CPU operations
         // =====================================================================
-        let cpu_ops = collect_cpu_ops(logs, &instructions)?;
+        // Timestamps start at 4 (not 0) to ensure old_timestamp < timestamp holds
+        // for the first access to any register/memory location (where old_timestamp=0).
+        let cpu_ops = collect_cpu_ops(logs, &instructions, 4)?;
 
         // =====================================================================
         // PHASE 2: CPU ops → MEMW, LOAD, LT, Bitwise, Branch
@@ -838,6 +883,155 @@ impl Traces {
             mul,
             branch,
             halt: halt_trace,
+        })
+    }
+
+    /// Generates all traces from execution logs for a segment.
+    ///
+    /// This is the segmented version of `from_logs` that:
+    /// - Accepts a `SegmentBoundary` to restore state from a previous segment
+    /// - Accepts a `SegmentConfig` to control segment-specific behavior
+    /// - Returns a `SegmentResult` with traces and optional next boundary
+    ///
+    /// For the first segment, use `SegmentBoundary::initial()`.
+    /// For non-final segments, use `SegmentConfig::intermediate()`.
+    /// For the final segment (containing ECALL), use `SegmentConfig::final_segment()`.
+    pub fn from_logs_segmented(
+        logs: &[Log],
+        instructions: U64HashMap<Instruction>,
+        boundary: &SegmentBoundary,
+        config: &SegmentConfig,
+    ) -> Result<SegmentResult, Error> {
+        // =====================================================================
+        // PHASE 1: Logs → CPU operations (with timestamp offset)
+        // =====================================================================
+        let cpu_ops = collect_cpu_ops(logs, &instructions, boundary.start_timestamp)?;
+
+        // =====================================================================
+        // PHASE 2: CPU ops → MEMW, LOAD, LT, Bitwise, Branch
+        // =====================================================================
+        // Initialize state from boundary (preserves state from previous segment)
+        let mut memory_state = MemoryState::from_boundary(boundary);
+        let mut register_state = RegisterState::from_boundary(boundary);
+
+        let (memw_ops, load_ops, mut lt_ops, mut bitwise_ops) =
+            collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
+
+        // Collect MUL operations from CPU ops where op_mul = true
+        let mul_ops: Vec<(MulOperation, bool)> = cpu_ops
+            .iter()
+            .filter(|op| op.decode.op_mul)
+            .map(|op| {
+                let lhs = op.compute_arg1();
+                let lhs_signed = op.decode.signed;
+                let rhs_signed = op.decode.mp_selector;
+                let rhs = op.compute_arg2();
+                let wants_hi = op.decode.muldiv_selector;
+                (
+                    MulOperation::new(lhs, lhs_signed, rhs, rhs_signed),
+                    wants_hi,
+                )
+            })
+            .collect();
+
+        // Collect BRANCH operations from CPU ops where branch_cond = true
+        let branch_ops: Vec<BranchOperation> = cpu_ops
+            .iter()
+            .filter(|op| op.branch_cond)
+            .map(|op| {
+                BranchOperation::new(
+                    op.decode.pc,
+                    op.decode.imm,
+                    op.compute_arg1(),
+                    op.decode.op_jalr,
+                )
+            })
+            .collect();
+
+        // =====================================================================
+        // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
+        // =====================================================================
+        lt_ops.extend(collect_lt_from_memw(&memw_ops));
+
+        // =====================================================================
+        // PHASE 4: All → Bitwise lookups
+        // =====================================================================
+        bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
+        bitwise_ops.extend(collect_bitwise_from_memw(&memw_ops));
+        bitwise_ops.extend(collect_bitwise_from_mul(&mul_ops));
+        bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
+
+        // =====================================================================
+        // PHASE 5: Generate final traces
+        // =====================================================================
+
+        // Generate HALT trace based on segment type
+        let halt_trace = if config.is_final {
+            // Final segment: find ECALL and generate proper halt trace
+            let halt_op = cpu_ops
+                .iter()
+                .rev()
+                .find(|op| op.decode.op_ecall)
+                .ok_or(Error::MissingHaltEcall)?;
+            halt::generate_halt_trace(halt_op.timestamp)
+        } else {
+            // Non-final segment: generate dummy halt trace
+            halt::generate_dummy_halt_trace()
+        };
+
+        let cpu = cpu::generate_cpu_trace(&cpu_ops);
+        let lt = lt::generate_lt_trace(&lt_ops);
+        let memw = memw::generate_memw_trace(&memw_ops);
+        let load = load::generate_load_trace(&load_ops);
+        let mul = mul::generate_mul_trace(&mul_ops);
+        let branch = branch::generate_branch_trace(&branch_ops);
+
+        let mut bitwise = bitwise::generate_bitwise_trace();
+        bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
+
+        // Generate DECODE trace and update multiplicities
+        let (mut decode, pc_to_row) = decode::generate_decode_trace(&instructions);
+        let num_padding_rows = cpu_ops.len().next_power_of_two() - cpu_ops.len();
+        let mut decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
+        decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
+        decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
+
+        let traces = Traces {
+            cpu,
+            bitwise,
+            lt,
+            memw,
+            load,
+            decode,
+            mul,
+            branch,
+            halt: halt_trace,
+        };
+
+        // =====================================================================
+        // PHASE 6: Capture boundary for next segment
+        // =====================================================================
+        let next_boundary = if config.is_final {
+            None
+        } else {
+            // Calculate end timestamp: start + (num_logs * 4)
+            let end_timestamp = boundary.start_timestamp + (logs.len() as u64) * 4;
+
+            // Get next PC from last log
+            let next_pc = logs.last().map(|l| l.next_pc).unwrap_or(0);
+
+            Some(boundary.next(
+                end_timestamp,
+                memory_state.to_boundary(),
+                register_state.to_boundary(),
+                next_pc,
+            ))
+        };
+
+        Ok(SegmentResult {
+            traces,
+            next_boundary,
+            is_final: config.is_final,
         })
     }
 

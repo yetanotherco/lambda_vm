@@ -25,6 +25,8 @@ pub mod load;
 pub mod lt;
 pub mod memw;
 pub mod mul;
+pub mod segment;
 pub mod trace_builder;
 
+pub use segment::{SegmentBoundary, SegmentConfig, SegmentResult};
 pub use types::BusId;
