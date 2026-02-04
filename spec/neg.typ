@@ -47,18 +47,30 @@ $
   0 & "if" #`x` = 0
  )
 $
-Clearly, $#`neg` = 0$ when $#`x` = 0$ (and `cond` is set); for non-zero `x`, it holds that
+Clearly, $#`neg` = 0$ when $#`x` = 0$ (and `cond` is set).
+For non-zero `x`, we distinguish two cases.
+When $(#`x as DWordWL`)_0 = 0$,
 $
   #`neg` 
-  &= #`neg`_0 + 2^32 dot #`neg`_1 \
-  &= (2^32 - (#`x as DWordWL`)_0) + 2^32 dot (2^32 - (#`x as DWordWL`)_1 - 1) \
-  &= 2^32 - (#`x as DWordWL`)_0 + 2^64 - 2^32 dot (#`x as DWordWL`)_1 - 2^32\
+  &= 2^32 dot #`neg`_1 + #`neg`_0\
+  &= 2^32 dot (2^32 - (#`x as DWordWL`)_1) + 0\
+  &= 2^32 dot (2^32 - (#`x as DWordWL`)_1) + (#`x as DWordWL`)_0\
+  &= 2^64 - (2^32 dot (#`x as DWordWL`)_1 + (#`x as DWordWL`)_0)\
+  &= 2^64 - #`x`\
+  &equiv -x mod 2^64,
+$
+while when $(#`x as DWordWL`)_0 != 0$,
+$
+  #`neg` 
+  &= 2^32 dot #`neg`_1 + #`neg`_0\
+  &= 2^32 dot (2^32 - (#`x as DWordWL`)_1 - 1) + (2^32 - (#`x as DWordWL`)_0)  \
+  &= 2^64 - 2^32 dot (#`x as DWordWL`)_1 - 2^32 + 2^32 - (#`x as DWordWL`)_0  \
   &= 2^64 - ((#`x as DWordWL`)_0 + 2^32 dot (#`x as DWordWL`)_1) \
   &= 2^64 - #`x`\
   &equiv -x mod 2^64
 $
 when `cond` is set.
-When `cond` is not set, the two lookups are not executed, allowing `neg` to take any value.
+When `cond` is not set, the two lookups are not executed, allowing `neg` to take any value in either case.
 
 == Note
 It is worth noting that this construction does _not_ require the limbs of `neg` to be range checked, 
