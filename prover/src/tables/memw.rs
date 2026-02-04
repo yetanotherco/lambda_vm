@@ -369,131 +369,98 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     }
 
     // -------------------------------------------------------------------------
-    // Memory bus interactions (M1-M8 from spec MEMW-CM14 through MEMW-CM21)
+    // Memory bus interactions (M1-M8 from spec)
     // -------------------------------------------------------------------------
-    // These ensure read/write consistency via the Memory bus:
-    // - Send old value at old_timestamp (+multiplicity)
-    // - Receive new value at current timestamp (-multiplicity)
-    //
-    // Memory bus signature: [is_register, address_lo, address_hi, timestamp_lo, timestamp_hi, value]
-    //
-    // The PAGE table provides initial and final tokens to balance memory accesses.
-    // Register accesses (is_register=1) need separate handling (TODO).
+    // DISABLED: Memory bus requires initialization and finalization:
+    // - Initialization: For each address accessed, an initial row at timestamp=0
+    //   with the starting value must exist so the first read has a matching write.
+    // - Finalization: Final values must be consumed to balance the bus.
+    // Without these, the bus won't balance.
     // -------------------------------------------------------------------------
+    // These ensure read/write consistency:
+    // - Read old value at old_timestamp (+multiplicity)
+    // - Write new value at current timestamp (-multiplicity)
+    //
+    // Memory bus format: memory[is_register, address, timestamp_lo, timestamp_hi, value]
+    //
+    // Currently only register tokens participate (is_register=1).
+    // Memory tokens (is_register=0) have multiplicity 0 until PAGE tables are wired.
 
-    // CM14 (M1): memory[is_register, base_address, old_timestamp[0], old[0]] with +μ_sum
+    // M1: memory[is_register, base_address, old_timestamp[0], old[0]] with +is_register
+    // Only register rows participate (is_register=1), memory rows have mult=0
     interactions.push(BusInteraction::sender(
         BusId::Memory,
-        Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE),
+        Multiplicity::Column(cols::IS_REGISTER),
         vec![
             BusValue::Packed { start_column: cols::IS_REGISTER, packing: Packing::Direct },
-            BusValue::Packed { start_column: cols::BASE_ADDRESS_0, packing: Packing::DWordWL },
-            BusValue::Packed { start_column: cols::old_timestamp(0)[0], packing: Packing::DWordWL },
+            BusValue::Packed { start_column: cols::BASE_ADDRESS_0, packing: Packing::Direct },
+            BusValue::Packed { start_column: cols::BASE_ADDRESS_1, packing: Packing::Direct },
+            BusValue::Packed { start_column: cols::old_timestamp(0)[0], packing: Packing::Direct },
+            BusValue::Packed { start_column: cols::old_timestamp(0)[1], packing: Packing::Direct },
             BusValue::Packed { start_column: cols::OLD[0], packing: Packing::Direct },
         ],
     ));
 
-    // CM15 (M2): memory[is_register, base_address, timestamp, value[0]] with -μ_sum
+    // M2: memory[is_register, base_address, timestamp, value[0]] with -is_register
     interactions.push(BusInteraction::receiver(
         BusId::Memory,
-        Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE),
+        Multiplicity::Column(cols::IS_REGISTER),
         vec![
             BusValue::Packed { start_column: cols::IS_REGISTER, packing: Packing::Direct },
-            BusValue::Packed { start_column: cols::BASE_ADDRESS_0, packing: Packing::DWordWL },
-            BusValue::Packed { start_column: cols::TIMESTAMP_0, packing: Packing::DWordWL },
+            BusValue::Packed { start_column: cols::BASE_ADDRESS_0, packing: Packing::Direct },
+            BusValue::Packed { start_column: cols::BASE_ADDRESS_1, packing: Packing::Direct },
+            BusValue::Packed { start_column: cols::TIMESTAMP_0, packing: Packing::Direct },
+            BusValue::Packed { start_column: cols::TIMESTAMP_1, packing: Packing::Direct },
             BusValue::Packed { start_column: cols::VALUE[0], packing: Packing::Direct },
         ],
     ));
 
-    // CM16 (M3): memory[is_register, address_add[0], old_timestamp[1], old[1]] with +w2
-    // w2 = write2 + write4 + write8 (accessing at least 2 bytes)
+    // M3: memory[is_register, base_address+1, old_timestamp[1], old[1]] with +is_register
+    // For registers (is_register=1), write2=1 always, so Word 1 is accessed.
+    // For memory (is_register=0), mult=0 so no contribution.
+    // Address = base_address + 1 (using linear combination since register addresses are small)
+    let address_plus_one_lo = BusValue::linear(vec![
+        LinearTerm::Constant(1),
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::BASE_ADDRESS_0,
+        },
+    ]);
+    // High word stays the same (no overflow for register addresses 0-63)
+    let address_plus_one_hi = BusValue::Packed {
+        start_column: cols::BASE_ADDRESS_1,
+        packing: Packing::Direct,
+    };
+
     interactions.push(BusInteraction::sender(
         BusId::Memory,
-        Multiplicity::Linear(vec![
-            LinearTerm::Column { coefficient: 1, column: cols::WRITE2 },
-            LinearTerm::Column { coefficient: 1, column: cols::WRITE4 },
-            LinearTerm::Column { coefficient: 1, column: cols::WRITE8 },
-        ]),
+        Multiplicity::Column(cols::IS_REGISTER),
         vec![
             BusValue::Packed { start_column: cols::IS_REGISTER, packing: Packing::Direct },
-            BusValue::Packed { start_column: cols::address_add(0)[0], packing: Packing::DWordHL },
-            BusValue::Packed { start_column: cols::old_timestamp(1)[0], packing: Packing::DWordWL },
+            address_plus_one_lo.clone(),
+            address_plus_one_hi.clone(),
+            BusValue::Packed { start_column: cols::old_timestamp(1)[0], packing: Packing::Direct },
+            BusValue::Packed { start_column: cols::old_timestamp(1)[1], packing: Packing::Direct },
             BusValue::Packed { start_column: cols::OLD[1], packing: Packing::Direct },
         ],
     ));
 
-    // CM17 (M4): memory[is_register, address_add[0], timestamp, value[1]] with -w2
+    // M4: memory[is_register, base_address+1, timestamp, value[1]] with -is_register
     interactions.push(BusInteraction::receiver(
         BusId::Memory,
-        Multiplicity::Linear(vec![
-            LinearTerm::Column { coefficient: 1, column: cols::WRITE2 },
-            LinearTerm::Column { coefficient: 1, column: cols::WRITE4 },
-            LinearTerm::Column { coefficient: 1, column: cols::WRITE8 },
-        ]),
+        Multiplicity::Column(cols::IS_REGISTER),
         vec![
             BusValue::Packed { start_column: cols::IS_REGISTER, packing: Packing::Direct },
-            BusValue::Packed { start_column: cols::address_add(0)[0], packing: Packing::DWordHL },
-            BusValue::Packed { start_column: cols::TIMESTAMP_0, packing: Packing::DWordWL },
+            address_plus_one_lo,
+            address_plus_one_hi,
+            BusValue::Packed { start_column: cols::TIMESTAMP_0, packing: Packing::Direct },
+            BusValue::Packed { start_column: cols::TIMESTAMP_1, packing: Packing::Direct },
             BusValue::Packed { start_column: cols::VALUE[1], packing: Packing::Direct },
         ],
     ));
 
-    // CM18.i (M5): memory[is_register, address_add[i-1], old_timestamp[i], old[i]] with +w4 for i∈[2,3]
-    // w4 = write4 + write8 (accessing at least 4 bytes)
-    for i in 2..=3 {
-        interactions.push(BusInteraction::sender(
-            BusId::Memory,
-            Multiplicity::Sum(cols::WRITE4, cols::WRITE8),
-            vec![
-                BusValue::Packed { start_column: cols::IS_REGISTER, packing: Packing::Direct },
-                BusValue::Packed { start_column: cols::address_add(i - 1)[0], packing: Packing::DWordHL },
-                BusValue::Packed { start_column: cols::old_timestamp(i)[0], packing: Packing::DWordWL },
-                BusValue::Packed { start_column: cols::OLD[i], packing: Packing::Direct },
-            ],
-        ));
-    }
-
-    // CM19.i (M6): memory[is_register, address_add[i-1], timestamp, value[i]] with -w4 for i∈[2,3]
-    for i in 2..=3 {
-        interactions.push(BusInteraction::receiver(
-            BusId::Memory,
-            Multiplicity::Sum(cols::WRITE4, cols::WRITE8),
-            vec![
-                BusValue::Packed { start_column: cols::IS_REGISTER, packing: Packing::Direct },
-                BusValue::Packed { start_column: cols::address_add(i - 1)[0], packing: Packing::DWordHL },
-                BusValue::Packed { start_column: cols::TIMESTAMP_0, packing: Packing::DWordWL },
-                BusValue::Packed { start_column: cols::VALUE[i], packing: Packing::Direct },
-            ],
-        ));
-    }
-
-    // CM20.i (M7): memory[is_register, address_add[i-1], old_timestamp[i], old[i]] with +write8 for i∈[4,7]
-    for i in 4..=7 {
-        interactions.push(BusInteraction::sender(
-            BusId::Memory,
-            Multiplicity::Column(cols::WRITE8),
-            vec![
-                BusValue::Packed { start_column: cols::IS_REGISTER, packing: Packing::Direct },
-                BusValue::Packed { start_column: cols::address_add(i - 1)[0], packing: Packing::DWordHL },
-                BusValue::Packed { start_column: cols::old_timestamp(i)[0], packing: Packing::DWordWL },
-                BusValue::Packed { start_column: cols::OLD[i], packing: Packing::Direct },
-            ],
-        ));
-    }
-
-    // CM21.i (M8): memory[is_register, address_add[i-1], timestamp, value[i]] with -write8 for i∈[4,7]
-    for i in 4..=7 {
-        interactions.push(BusInteraction::receiver(
-            BusId::Memory,
-            Multiplicity::Column(cols::WRITE8),
-            vec![
-                BusValue::Packed { start_column: cols::IS_REGISTER, packing: Packing::Direct },
-                BusValue::Packed { start_column: cols::address_add(i - 1)[0], packing: Packing::DWordHL },
-                BusValue::Packed { start_column: cols::TIMESTAMP_0, packing: Packing::DWordWL },
-                BusValue::Packed { start_column: cols::VALUE[i], packing: Packing::Direct },
-            ],
-        ));
-    }
+    // M5-M8: Bytes 2-7 are not used for registers (width=2).
+    // These will be enabled when PAGE tables are wired for memory operations.
 
     // -------------------------------------------------------------------------
     // MEMW receiver (from CPU and LOAD) - ENABLED

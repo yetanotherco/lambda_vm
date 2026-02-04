@@ -1217,10 +1217,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 packing: Packing::Direct,
             },
             BusValue::constant(0),
-            // write2=0, write4=0, write8=1 (register access = 8 bytes / 64 bits)
-            BusValue::constant(0),
-            BusValue::constant(0),
+            // write2=1, write4=0, write8=0 (register access = 2 Words / 64 bits)
             BusValue::constant(1),
+            BusValue::constant(0),
+            BusValue::constant(0),
         ],
     ));
 
@@ -1294,10 +1294,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 LinearTerm::Constant(1),
             ]),
             BusValue::constant(0),
-            // write2=0, write4=0, write8=1 (register access = 8 bytes / 64 bits)
-            BusValue::constant(0),
-            BusValue::constant(0),
+            // write2=1, write4=0, write8=0 (register access = 2 Words / 64 bits)
             BusValue::constant(1),
+            BusValue::constant(0),
+            BusValue::constant(0),
         ],
     ));
 
@@ -1349,10 +1349,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 LinearTerm::Constant(2),
             ]),
             BusValue::constant(0),
-            // write2=0, write4=0, write8=1 (EXCLUSIVE encoding for 8-byte register access)
-            BusValue::constant(0),
-            BusValue::constant(0),
+            // write2=1, write4=0, write8=0 (EXCLUSIVE encoding for 2-Word register access)
             BusValue::constant(1),
+            BusValue::constant(0),
+            BusValue::constant(0),
         ],
     ));
 

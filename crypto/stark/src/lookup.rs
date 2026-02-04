@@ -659,6 +659,30 @@ where
             build_logup_term_column(i, interaction, trace, challenges);
         }
 
+        // DEBUG: Sum terms by bus_id to find which bus is imbalanced
+        // Only print non-zero bus sums with their bus_ids
+        let mut bus_sums: std::collections::HashMap<u64, FieldElement<E>> = std::collections::HashMap::new();
+        for (i, interaction) in self
+            .auxiliary_trace_build_data
+            .interactions
+            .iter()
+            .enumerate()
+        {
+            let mut col_sum = FieldElement::<E>::zero();
+            for row in 0..trace.num_rows() {
+                col_sum = col_sum + trace.get_aux(row, i);
+            }
+            *bus_sums.entry(interaction.bus_id).or_insert(FieldElement::zero()) += col_sum;
+        }
+        // Print only non-zero bus contributions
+        let non_zero: Vec<_> = bus_sums.iter()
+            .filter(|(_, v)| **v != FieldElement::<E>::zero())
+            .map(|(k, v)| format!("{}:{:?}", k, v))
+            .collect();
+        if !non_zero.is_empty() {
+            eprintln!("TABLE rows={} interactions={}: {}", trace.num_rows(), num_interactions, non_zero.join(", "));
+        }
+
         // Build accumulated column (sums all term columns across rows)
         let acc_col_idx = num_interactions;
         build_accumulated_column(acc_col_idx, num_interactions, trace);
@@ -1009,6 +1033,15 @@ fn build_logup_term_column<F, E>(
             combined.into_iter().map(|v| v.to_extension())
         }));
 
+        // DEBUG: Print Memory bus (16) interactions with multiplicity
+        if table_interaction.bus_id == 16 && row < 8 {
+            let sender_str = if table_interaction.is_sender { "SEND" } else { "RECV" };
+            eprintln!(
+                "LOGUP_DEBUG: bus=16 row={} {} mult={:?} is_reg={}",
+                row, sender_str, multiplicity, bus_elements.get(1).map(|e| format!("{:?}", e)).unwrap_or_default()
+            );
+        }
+
         // fingerprint = z - (bus_id + v[0]*α + v[1]*α² + ... + v[n]*α^(n+1))
         let linear_combination: FieldElement<E> = bus_elements
             .iter()
@@ -1024,6 +1057,7 @@ fn build_logup_term_column<F, E>(
             * fingerprint
                 .inv()
                 .expect("fingerprint is zero - probability of sampling zero is negligible");
+
         trace.set_aux(row, aux_column_idx, term);
     }
 }

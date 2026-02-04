@@ -32,12 +32,13 @@ use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 /// Number of general-purpose registers (x0-x31).
 pub const NUM_REGISTERS: usize = 32;
 
-/// Bytes per register access (registers are 64-bit = 8 bytes).
-pub const BYTES_PER_REGISTER: usize = 8;
+/// Words per register access (registers are 64-bit = 2 Words of 32 bits each).
+/// Per spec: registers use write2=1 meaning 2 addresses accessed.
+pub const WORDS_PER_REGISTER: usize = 2;
 
-/// Total number of register byte addresses.
-/// Each register uses 8 byte addresses in the Memory bus.
-pub const NUM_REGISTER_ADDRESSES: usize = NUM_REGISTERS * BYTES_PER_REGISTER;
+/// Total number of register Word addresses.
+/// Each register uses 2 Word addresses in the Memory bus.
+pub const NUM_REGISTER_ADDRESSES: usize = NUM_REGISTERS * WORDS_PER_REGISTER;
 
 // =========================================================================
 // Column indices for REGISTER table
@@ -67,17 +68,17 @@ pub mod cols {
 // Types
 // =========================================================================
 
-/// Final state for a single register byte address.
+/// Final state for a single register Word address.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct FinalRegisterByteState {
+pub struct FinalRegisterWordState {
     /// Final timestamp (0 if never accessed)
     pub timestamp: u64,
-    /// Final byte value
-    pub value: u8,
+    /// Final Word value (32-bit)
+    pub value: u32,
 }
 
-/// Map from register byte address to final state.
-pub type FinalRegisterStateMap = HashMap<u64, FinalRegisterByteState>;
+/// Map from register Word address to final state.
+pub type FinalRegisterStateMap = HashMap<u64, FinalRegisterWordState>;
 
 // =========================================================================
 // Trace generation
@@ -85,12 +86,12 @@ pub type FinalRegisterStateMap = HashMap<u64, FinalRegisterByteState>;
 
 /// Generates the REGISTER trace table.
 ///
-/// Creates a table with NUM_REGISTER_ADDRESSES rows (32 regs × 8 bytes = 256).
-/// Each row represents one byte address in register space.
+/// Creates a table with NUM_REGISTER_ADDRESSES rows (32 regs × 2 Words = 64).
+/// Each row represents one Word address in register space.
 ///
 /// ## Arguments
 ///
-/// * `final_state` - Map from register byte address to final (timestamp, value)
+/// * `final_state` - Map from register Word address to final (timestamp, value)
 ///
 /// ## Returns
 ///
@@ -102,18 +103,18 @@ pub fn generate_register_trace(
     let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
 
     for offset in 0..NUM_REGISTER_ADDRESSES {
-        let byte_addr = offset as u64;
+        let word_addr = offset as u64;
         let base = offset * cols::NUM_COLUMNS;
 
-        // Offset (row index = byte address in register space)
+        // Offset (row index = Word address in register space)
         data[base + cols::OFFSET] = FE::from(offset as u64);
 
         // Initial value: all registers start at 0
-        let init_value = 0u8;
+        let init_value = 0u32;
         data[base + cols::INIT] = FE::from(init_value as u64);
 
         // Final state: if accessed use final, otherwise use initial
-        let (timestamp, fini_value) = if let Some(state) = final_state.get(&byte_addr) {
+        let (timestamp, fini_value) = if let Some(state) = final_state.get(&word_addr) {
             (state.timestamp, state.value)
         } else {
             // Never accessed: timestamp=0, fini=init
@@ -144,7 +145,7 @@ pub fn generate_register_trace(
 ///
 /// Note: is_register=1 (constant) to distinguish from memory (is_register=0).
 pub fn bus_interactions() -> Vec<BusInteraction> {
-    // Address is just the offset (0..255 for 32 regs × 8 bytes)
+    // Address is just the offset (0..63 for 32 regs × 2 Words)
     // Stored in low word, high word is 0
     let address_lo = BusValue::Packed {
         start_column: cols::OFFSET,
@@ -154,6 +155,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     vec![
         // REG-C1: memory[1, address, 0, init] - receive initial token
+        // Balances MEMW's first send on this address
         BusInteraction::receiver(
             BusId::Memory,
             Multiplicity::One,
@@ -176,6 +178,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             ],
         ),
         // REG-C2: memory[1, address, timestamp, fini] - send final token
+        // Balances MEMW's last receive on this address
         BusInteraction::sender(
             BusId::Memory,
             Multiplicity::One,
@@ -216,20 +219,11 @@ pub fn register_base_address(reg_idx: u8) -> u64 {
     2 * reg_idx as u64
 }
 
-/// Compute the byte addresses used by a register.
-/// Returns 8 addresses: base, base+1, ..., base+7
-pub fn register_byte_addresses(reg_idx: u8) -> [u64; 8] {
+/// Compute the Word addresses used by a register.
+/// Returns 2 addresses: base (low word), base+1 (high word)
+pub fn register_word_addresses(reg_idx: u8) -> [u64; 2] {
     let base = register_base_address(reg_idx);
-    [
-        base,
-        base + 1,
-        base + 2,
-        base + 3,
-        base + 4,
-        base + 5,
-        base + 6,
-        base + 7,
-    ]
+    [base, base + 1]
 }
 
 #[cfg(test)]
@@ -249,7 +243,7 @@ mod tests {
         let final_state = FinalRegisterStateMap::new();
         let trace = generate_register_trace(&final_state);
 
-        // Should have power-of-2 rows >= 256
+        // Should have power-of-2 rows >= 64 (32 regs × 2 Words)
         assert!(trace.num_rows() >= NUM_REGISTER_ADDRESSES);
         assert!(trace.num_rows().is_power_of_two());
 
@@ -263,11 +257,11 @@ mod tests {
     #[test]
     fn test_generate_register_trace_with_access() {
         let mut final_state = FinalRegisterStateMap::new();
-        // Register x5 byte 0 was written with value 0x42 at timestamp 100
+        // Register x5 low Word was written with value 0x42 at timestamp 100
         let addr = register_base_address(5); // = 10
         final_state.insert(
             addr,
-            FinalRegisterByteState {
+            FinalRegisterWordState {
                 timestamp: 100,
                 value: 0x42,
             },

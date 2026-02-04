@@ -42,7 +42,7 @@ use super::load::{self, LoadOperation};
 use super::lt::{self, LtOperation};
 use super::memw::{self, MemwOperation};
 use super::page::{self, FinalByteState, FinalStateMap, PageConfig};
-use super::register::{self, FinalRegisterByteState, FinalRegisterStateMap};
+use super::register::{self, FinalRegisterStateMap, FinalRegisterWordState};
 use super::types::{GoldilocksExtension, GoldilocksField};
 use crate::Error;
 
@@ -151,8 +151,8 @@ impl RegisterState {
 
     /// Generate the final register state map for the REGISTER table.
     ///
-    /// Returns a map from register byte address to final (timestamp, value).
-    /// Each register uses 8 byte addresses (reg_addr = 2 * reg_idx, then +0..7).
+    /// Returns a map from register Word address to final (timestamp, value).
+    /// Each register uses 2 Word addresses (reg_addr = 2 * reg_idx, then +0, +1).
     fn to_final_state_map(&self) -> FinalRegisterStateMap {
         let mut map = FinalRegisterStateMap::new();
 
@@ -160,19 +160,24 @@ impl RegisterState {
             let (value, timestamp) = self.regs[reg_idx as usize];
             let base_addr = register::register_base_address(reg_idx);
 
-            // Each register is stored as 8 bytes in little-endian order
-            for byte_offset in 0..8u64 {
-                let byte_addr = base_addr + byte_offset;
-                let byte_value = ((value >> (byte_offset * 8)) & 0xFF) as u8;
+            // Each register is stored as 2 Words (32-bit each) in little-endian order
+            let value_lo = (value & 0xFFFF_FFFF) as u32;
+            let value_hi = (value >> 32) as u32;
 
-                map.insert(
-                    byte_addr,
-                    FinalRegisterByteState {
-                        timestamp,
-                        value: byte_value,
-                    },
-                );
-            }
+            map.insert(
+                base_addr,
+                FinalRegisterWordState {
+                    timestamp,
+                    value: value_lo,
+                },
+            );
+            map.insert(
+                base_addr + 1,
+                FinalRegisterWordState {
+                    timestamp,
+                    value: value_hi,
+                },
+            );
         }
 
         map
@@ -416,9 +421,10 @@ fn collect_register_ops_from_cpu(
         let reg_value = pack_register_value(op.rv1);
         let reg_addr = 2 * d.rs1 as u64;
         let (_old_val, old_ts) = register_state.read(d.rs1);
-        let old_timestamps = [old_ts; 8];
+        // old_timestamps array is 8 elements but only first 2 are used for registers
+        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
 
-        let memw_op = MemwOperation::new(true, reg_addr, reg_value, op.timestamp, 8, true)
+        let memw_op = MemwOperation::new(true, reg_addr, reg_value, op.timestamp, 2, true)
             .with_old(reg_value, old_timestamps);
         memw_ops.push(memw_op);
         register_state.write(d.rs1, op.rv1, op.timestamp);
@@ -429,9 +435,10 @@ fn collect_register_ops_from_cpu(
         let reg_value = pack_register_value(op.rv2);
         let reg_addr = 2 * d.rs2 as u64;
         let (_old_val, old_ts) = register_state.read(d.rs2);
-        let old_timestamps = [old_ts; 8];
+        // old_timestamps array is 8 elements but only first 2 are used for registers
+        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
 
-        let memw_op = MemwOperation::new(true, reg_addr, reg_value, op.timestamp + 1, 8, true)
+        let memw_op = MemwOperation::new(true, reg_addr, reg_value, op.timestamp + 1, 2, true)
             .with_old(reg_value, old_timestamps);
         memw_ops.push(memw_op);
         register_state.write(d.rs2, op.rv2, op.timestamp + 1);
@@ -443,9 +450,10 @@ fn collect_register_ops_from_cpu(
         let reg_addr = 2 * d.rd as u64;
         let (old_val, old_ts) = register_state.read(d.rd);
         let old_value = pack_register_value(old_val);
-        let old_timestamps = [old_ts; 8];
+        // old_timestamps array is 8 elements but only first 2 are used for registers
+        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
 
-        let memw_op = MemwOperation::new(true, reg_addr, reg_value, op.timestamp + 2, 8, false)
+        let memw_op = MemwOperation::new(true, reg_addr, reg_value, op.timestamp + 2, 2, false)
             .with_old(old_value, old_timestamps);
         memw_ops.push(memw_op);
         register_state.write(d.rd, op.rvd, op.timestamp + 2);

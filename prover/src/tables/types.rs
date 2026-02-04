@@ -609,16 +609,16 @@ impl DecodeEntry {
             }
 
             Instruction::EcallEbreak => {
-                // Determine if ECALL or EBREAK based on context
-                // For now, default to ECALL
+                // ECALL is handled specially: the executor Log returns src1_val=0, src2_val=0,
+                // dst_val=0 for Halt syscalls (regardless of actual register values).
+                // To avoid corrupting register state in the trace builder, we don't set
+                // read_register or write_register flags. The HALT table handles termination.
                 entry.op_ecall = true;
-                // ECALL uses: rs1=x17 (syscall number), rs2=x10 (arg), rd=x10 (result)
-                entry.rs1 = 17;
-                entry.rs2 = 10;
-                entry.rd = 10;
-                entry.read_register1 = true;
-                entry.read_register2 = true;
-                entry.write_register = true;
+                // Set register indices for reference, but don't mark them as read/written
+                entry.rs1 = 17; // a7 (syscall number)
+                entry.rs2 = 10; // a0 (arg)
+                entry.rd = 10;  // a0 (result)
+                // Note: read_register1, read_register2, write_register remain false
             }
 
             Instruction::Fence => {
