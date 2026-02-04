@@ -6,6 +6,8 @@
   foreground: black,
 ))
 
+#set footnote(numbering: "[1]")
+
 #align(center, title(meta.title))
 #pagebreak(weak: true)
 #outline()
