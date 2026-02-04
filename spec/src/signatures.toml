@@ -3,7 +3,7 @@
 tag = "IS_BIT"
 kind = "template"
 input = ["BaseField"]
-cond = "Bit"
+cond = "BaseField"
 
 # cond => ADD<sum; lhs, rhs>
 [[signatures]]
