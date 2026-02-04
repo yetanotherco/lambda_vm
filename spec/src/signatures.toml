@@ -93,7 +93,7 @@ output = "DWordWL"
 [[signatures]]
 tag = "ECALL"
 kind = "interaction"
-input = ["DWordWL", "Word"]
+input = ["DWordWL", "DWordWL"]
 
 # AND_BYTE[res; X, Y]
 [[signatures]]
