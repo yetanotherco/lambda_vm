@@ -82,7 +82,7 @@ kind = "interaction"
 input = ["DWordHL", "DWordHL", "Bit", "Bit"]
 output = "DWordWL"
 
-# LOAD[res; base_address, timestamp, read2, read4, read8]
+# LOAD[res; base_address, timestamp, read2, read4, read8, signed]
 [[signatures]]
 tag = "LOAD"
 kind = "interaction"
