@@ -68,6 +68,28 @@ impl MemoryState {
         }
     }
 
+    /// Initialize memory state from ELF segments.
+    ///
+    /// Pre-populates all ELF bytes with timestamp=0 so that when MEMW first
+    /// accesses an address, it gets the correct initial value for `old_value`.
+    /// This is required for the Memory bus to balance (MEMW-M1 must match PAGE-C3).
+    fn from_elf(elf: &Elf) -> Self {
+        let mut cells = HashMap::new();
+        for segment in &elf.data {
+            for (i, &word) in segment.values.iter().enumerate() {
+                let word_addr = segment.base_addr + (i as u64 * 4);
+                // Split 32-bit word into 4 bytes (little-endian)
+                for byte_offset in 0..4u64 {
+                    let byte_addr = word_addr + byte_offset;
+                    let byte_value = ((word >> (byte_offset * 8)) & 0xFF) as u8;
+                    // Initial state: value from ELF, timestamp=0
+                    cells.insert(byte_addr, (byte_value, 0));
+                }
+            }
+        }
+        Self { cells }
+    }
+
     /// Read a byte from memory. Returns (value, timestamp) or (0, 0) if never written.
     fn read_byte(&self, address: u64) -> MemoryCell {
         self.cells.get(&address).copied().unwrap_or((0, 0))
@@ -775,7 +797,8 @@ impl Traces {
         // PHASE 2: CPU ops → MEMW, LOAD, LT, Bitwise, Branch
         // =====================================================================
         // Processes cpu_ops in order. MEMW/LOAD need state tracking, LT/Bitwise don't.
-        let mut memory_state = MemoryState::new();
+        // Initialize memory state from ELF so first accesses get correct old_value.
+        let mut memory_state = MemoryState::from_elf(elf);
         let mut register_state = RegisterState::new();
         let (memw_ops, load_ops, mut lt_ops, mut bitwise_ops) =
             collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
