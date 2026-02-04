@@ -42,6 +42,7 @@ use super::load::{self, LoadOperation};
 use super::lt::{self, LtOperation};
 use super::memw::{self, MemwOperation};
 use super::page::{self, FinalByteState, FinalStateMap, PageConfig};
+use super::register::{self, FinalRegisterByteState, FinalRegisterStateMap};
 use super::types::{GoldilocksExtension, GoldilocksField};
 use crate::Error;
 
@@ -146,6 +147,35 @@ impl RegisterState {
             // x0 is always 0 and never written
             self.regs[reg as usize] = (value, timestamp);
         }
+    }
+
+    /// Generate the final register state map for the REGISTER table.
+    ///
+    /// Returns a map from register byte address to final (timestamp, value).
+    /// Each register uses 8 byte addresses (reg_addr = 2 * reg_idx, then +0..7).
+    fn to_final_state_map(&self) -> FinalRegisterStateMap {
+        let mut map = FinalRegisterStateMap::new();
+
+        for reg_idx in 0..32u8 {
+            let (value, timestamp) = self.regs[reg_idx as usize];
+            let base_addr = register::register_base_address(reg_idx);
+
+            // Each register is stored as 8 bytes in little-endian order
+            for byte_offset in 0..8u64 {
+                let byte_addr = base_addr + byte_offset;
+                let byte_value = ((value >> (byte_offset * 8)) & 0xFF) as u8;
+
+                map.insert(
+                    byte_addr,
+                    FinalRegisterByteState {
+                        timestamp,
+                        value: byte_value,
+                    },
+                );
+            }
+        }
+
+        map
     }
 }
 
@@ -757,6 +787,9 @@ pub struct Traces {
     /// Page configurations (for bus interactions)
     pub page_configs: Vec<PageConfig>,
 
+    /// REGISTER table for register initialization/finalization
+    pub register: TraceTable<GoldilocksField, GoldilocksExtension>,
+
     /// BRANCH target calculation trace
     pub branch: TraceTable<GoldilocksField, GoldilocksExtension>,
 
@@ -863,6 +896,10 @@ impl Traces {
         // Generate PAGE tables from ELF and final memory state
         let (pages, page_configs) = generate_page_tables(elf, &memory_state);
 
+        // Generate REGISTER table from final register state
+        let register_final_state = register_state.to_final_state_map();
+        let register_trace = register::generate_register_trace(&register_final_state);
+
         Ok(Traces {
             cpu,
             bitwise,
@@ -872,6 +909,7 @@ impl Traces {
             decode,
             pages,
             page_configs,
+            register: register_trace,
             branch,
             halt: halt_trace,
             pc_to_row,
@@ -960,6 +998,10 @@ impl Traces {
         let pages = Vec::new();
         let page_configs = Vec::new();
 
+        // Generate REGISTER table from final register state
+        let register_final_state = register_state.to_final_state_map();
+        let register_trace = register::generate_register_trace(&register_final_state);
+
         Ok(Traces {
             cpu,
             bitwise,
@@ -969,6 +1011,7 @@ impl Traces {
             decode,
             pages,
             page_configs,
+            register: register_trace,
             branch,
             halt: halt_trace,
             pc_to_row,

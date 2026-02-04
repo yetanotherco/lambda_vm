@@ -37,6 +37,7 @@ use crate::tables::cpu::{
 use crate::tables::decode::{bus_interactions as decode_bus_interactions, cols as decode_cols};
 use crate::tables::halt::{bus_interactions as halt_bus_interactions, cols as halt_cols};
 use crate::tables::page::{bus_interactions as page_bus_interactions, cols as page_cols};
+use crate::tables::register::{bus_interactions as register_bus_interactions, cols as register_cols};
 use crate::tables::load::{
     bus_interactions as load_bus_interactions, cols as load_cols, constraints as load_constraints,
 };
@@ -635,6 +636,26 @@ pub fn create_page_air(proof_options: &ProofOptions, page_base: u64) -> VmAir {
 
     AirWithBuses::new(
         page_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+}
+
+/// Create REGISTER AIR with bus interactions.
+///
+/// The REGISTER table provides initial and final tokens for register accesses
+/// on the Memory bus (is_register=1).
+pub fn create_register_air(proof_options: &ProofOptions) -> VmAir {
+    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: register_bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        register_cols::NUM_COLUMNS,
         auxiliary_trace_build_data,
         proof_options,
         1,

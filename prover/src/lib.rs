@@ -34,6 +34,7 @@ use crate::tables::trace_builder::Traces;
 use crate::test_utils::{
     E, F, create_bitwise_air, create_branch_air, create_cpu_air, create_decode_air,
     create_halt_air, create_load_air, create_lt_air, create_memw_air, create_page_air,
+    create_register_air,
 };
 
 use stark::proof::options::ProofOptions;
@@ -102,6 +103,9 @@ pub fn prove(elf_bytes: &[u8]) -> Result<MultiProof<F, E, ()>, Error> {
         .map(|config| create_page_air(&proof_options, config.page_base))
         .collect();
 
+    // Create REGISTER AIR
+    let register_air = create_register_air(&proof_options);
+
     // Build air_trace_pairs for core tables
     let mut air_trace_pairs: Vec<(
         &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
@@ -116,6 +120,7 @@ pub fn prove(elf_bytes: &[u8]) -> Result<MultiProof<F, E, ()>, Error> {
         (&decode_air, &mut traces.decode, &()),
         (&branch_air, &mut traces.branch, &()),
         (&halt_air, &mut traces.halt, &()),
+        (&register_air, &mut traces.register, &()),
     ];
 
     // Add PAGE table pairs

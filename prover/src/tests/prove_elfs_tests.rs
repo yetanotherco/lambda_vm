@@ -33,7 +33,8 @@ use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 // Import shared utilities
 use crate::test_utils::{
     create_bitwise_air, create_branch_air, create_cpu_air, create_decode_air, create_halt_air,
-    create_load_air, create_lt_air, create_memw_air, create_page_air, run_asm_elf,
+    create_load_air, create_lt_air, create_memw_air, create_page_air, create_register_air,
+    run_asm_elf,
 };
 use crate::tables::page::PageConfig;
 
@@ -152,9 +153,9 @@ fn prove_and_verify_vm_minimal(
     )
 }
 
-/// Run multi_prove and multi_verify including PAGE tables for Memory bus.
+/// Run multi_prove and multi_verify including PAGE and REGISTER tables for Memory bus.
 ///
-/// This version accepts PAGE traces and configs for full Memory bus support.
+/// This version accepts PAGE traces and configs, plus REGISTER trace for full Memory bus support.
 fn prove_and_verify_vm_with_pages(
     cpu_trace: &mut TraceTable<F, E>,
     bitwise_trace: &mut TraceTable<F, E>,
@@ -164,6 +165,7 @@ fn prove_and_verify_vm_with_pages(
     decode_trace: &mut TraceTable<F, E>,
     branch_trace: &mut TraceTable<F, E>,
     halt_trace: &mut TraceTable<F, E>,
+    register_trace: &mut TraceTable<F, E>,
     page_traces: &mut Vec<TraceTable<F, E>>,
     page_configs: &[PageConfig],
 ) -> bool {
@@ -177,6 +179,7 @@ fn prove_and_verify_vm_with_pages(
     let decode_air = create_decode_air(&proof_options);
     let branch_air = create_branch_air(&proof_options);
     let halt_air = create_halt_air(&proof_options);
+    let register_air = create_register_air(&proof_options);
 
     // Create PAGE AIRs (one per page, each with its own page_base)
     let page_airs: Vec<_> = page_configs
@@ -198,6 +201,7 @@ fn prove_and_verify_vm_with_pages(
         (&decode_air, decode_trace, &()),
         (&branch_air, branch_trace, &()),
         (&halt_air, halt_trace, &()),
+        (&register_air, register_trace, &()),
     ];
 
     // Add PAGE table pairs
@@ -224,6 +228,7 @@ fn prove_and_verify_vm_with_pages(
         &decode_air,
         &branch_air,
         &halt_air,
+        &register_air,
     ];
 
     // Add PAGE AIRs
@@ -297,7 +302,7 @@ fn test_cpu_only_no_bus() {
 fn test_prove_elfs_sub_fast() {
     let _ = env_logger::builder().is_test(true).try_init();
     let (elf, logs, _instructions) = run_asm_elf("sub");
-    // Use from_elf_and_logs to get PAGE tables for Memory bus
+    // Use from_elf_and_logs to get PAGE and REGISTER tables for Memory bus
     let mut traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
 
     assert!(
@@ -310,6 +315,7 @@ fn test_prove_elfs_sub_fast() {
             &mut traces.decode,
             &mut traces.branch,
             &mut traces.halt,
+            &mut traces.register,
             &mut traces.pages,
             &traces.page_configs,
         ),
