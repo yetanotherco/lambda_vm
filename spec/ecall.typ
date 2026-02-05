@@ -107,7 +107,7 @@ Since we only support writing to `stdout` (which corresponds to $#`fd` = 1$
 #footnote([The Open Group Base Specifications, `unistd.h`; The Open Group, issue 7, #link("https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/unistd.h.html")[[src]]. Accessed Feb 4, 2026.]))
 we assert that `x10` contains $1$ in @commit:c:read_fd_write_count.
 Note that this constraint _also_ writes `count` to `A0`; 
-in this VM it is impossible for multiple for a commit to be interrupted or fail.
+in this VM it is impossible for a commit to be interrupted or fail.
 Furthermore, @commit:c:read_address reads `address` from `x11` and @commit:c:read_count reads `count` from `x12`.
 Again, these memory interactions only take place when this is the `first` call in the recursion tree.
 #render_constraint_table(chip, config, groups: "read_input")
@@ -120,7 +120,7 @@ In parallel, we compute $#`address_incr` = #`address` + 1$ (@commit:c:address_in
 #render_constraint_table(chip, config, groups: "incr_decr")
 
 When `count_decr` (the number of bytes still to be committed) hits $0$, we should stop recursing.
-To this end, `last` is set this is the case (@commit:c:last).
+To this end, `last` is set when this is the case (@commit:c:last).
 To prevent undesired lookups from occurring, `last` should only be set when we're not padding (@commit:c:last_implies_mu).
 Also, we must make sure `mu` is a bit (@commit:c:range_mu).
 #render_constraint_table(chip, config, groups: "last")
