@@ -1,51 +1,4 @@
-//! Lambda VM CLI
-//!
-//! A command-line interface for executing, proving, and verifying RISC-V ELF programs
-//! using the Lambda VM zkVM (zero-knowledge virtual machine).
-//!
-//! # Commands
-//!
-//! The CLI provides three main commands:
-//!
-//! - **execute**: Run a program without generating a proof (fast, for testing)
-//! - **prove**: Execute a program and generate a STARK proof of correct execution
-//! - **verify**: Verify a previously generated proof (requires the original ELF file)
-//!
-//! # Architecture
-//!
-//! The proving system uses a multi-table STARK architecture with the following tables:
-//!
-//! - **CPU Table**: Main execution trace (registers, memory, control flow)
-//! - **Bitwise Table**: Precomputed lookup table for AND, OR, XOR operations
-//! - **LT Table**: Less-than comparison results
-//! - **MEMW Table**: Memory write operations with timestamp ordering
-//! - **LOAD Table**: Memory load operations
-//! - **DECODE Table**: Instruction decoding verification (precomputed from ELF)
-//!
-//! Tables are linked via a LogUp bus protocol for cross-table lookups.
-//!
-//! # Security Levels
-//!
-//! The prover supports three security levels:
-//!
-//! | Level | Security | Blowup | Queries | Use Case |
-//! |-------|----------|--------|---------|----------|
-//! | fast | Conjecturable 100-bit | 4 | 41 | Development |
-//! | standard | Provable 100-bit | 4 | 104 | Default |
-//! | maximum | Provable 128-bit | 4 | 140 | Production |
-//!
-//! # Example Usage
-//!
-//! ```bash
-//! # Execute without proving
-//! lambda-vm execute program.elf
-//!
-//! # Generate a proof
-//! lambda-vm prove program.elf -o proof.cbor --security fast
-//!
-//! # Verify the proof (requires the original ELF file)
-//! lambda-vm verify proof.cbor program.elf
-//! ```
+//! Lambda VM CLI - execute, prove, and verify RISC-V programs.
 
 mod proof_bundle;
 
@@ -53,8 +6,6 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-
-use subtle::ConstantTimeEq;
 
 use clap::{Parser, Subcommand, ValueEnum, ValueHint};
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
@@ -108,7 +59,10 @@ const MAX_GRINDING_FACTOR: u8 = 32;
 /// Maximum acceptable coset offset (reasonable upper bound)
 const MAX_COSET_OFFSET: u64 = 1000;
 
-/// Read a file with size validation to prevent memory exhaustion.
+fn truncated_hex(bytes: &[u8]) -> String {
+    format!("{}...", &hex::encode(bytes)[..16])
+}
+
 fn read_file_with_limit(path: &Path, max_size: u64, file_type: &str) -> Result<Vec<u8>, String> {
     let metadata = std::fs::metadata(path)
         .map_err(|e| format!("Failed to get {} file metadata: {}", file_type, e))?;
@@ -173,54 +127,19 @@ enum Commands {
     },
 }
 
-/// Security level presets for proof generation.
-///
-/// These presets configure the STARK proof parameters to achieve different
-/// security/performance tradeoffs. Higher security levels require more
-/// computation and produce larger proofs.
-///
-/// # Security Guarantees
-///
-/// - **Conjecturable**: Security relies on commonly accepted cryptographic assumptions
-/// - **Provable**: Security can be formally proven under standard assumptions
-///
-/// # Performance Impact
-///
-/// Higher security levels increase:
-/// - Proof generation time (more FRI queries, larger blowup)
-/// - Proof size (more query responses)
-/// - Verification time (more queries to check)
 #[derive(Clone, Copy, ValueEnum)]
 enum SecurityPreset {
-    /// Conjecturable 100-bit security - fast, suitable for development/testing.
-    ///
-    /// Uses minimal blowup factor and fewer FRI queries for faster proving.
-    /// Suitable for testing and development where proof soundness is less critical.
+    /// Conjecturable 100-bit security (development)
     Fast,
-
-    /// Provable 100-bit security - default, suitable for most use cases.
-    ///
-    /// Balanced security and performance. Recommended for most production uses
-    /// where 100-bit security is sufficient.
+    /// Provable 100-bit security (default)
     Standard,
-
-    /// Provable 128-bit security - maximum security for production.
-    ///
-    /// Highest security level with larger blowup factor. Use for high-value
-    /// applications where maximum security is required.
+    /// Provable 128-bit security (production)
     Maximum,
 }
 
 impl SecurityPreset {
-    /// Converts the preset to concrete proof options.
-    ///
-    /// The coset offset (3) is used to shift the evaluation domain away from
-    /// roots of unity, which is required for proper FRI operation.
     fn to_proof_options(self) -> ProofOptions {
-        // Coset offset shifts the LDE domain away from the trace domain.
-        // Value 3 is a standard choice that works well with the Goldilocks field.
         const COSET_OFFSET: u64 = 3;
-
         match self {
             SecurityPreset::Fast => {
                 ProofOptions::new_secure(SecurityLevel::Conjecturable100Bits, COSET_OFFSET)
@@ -249,22 +168,6 @@ fn main() -> ExitCode {
     }
 }
 
-/// Execute command: run an ELF program without generating a proof.
-///
-/// This command is useful for:
-/// - Testing that a program executes correctly before proving
-/// - Debugging program behavior with register dumps
-/// - Generating flamegraphs to profile execution
-///
-/// # Arguments
-///
-/// * `elf_path` - Path to the RISC-V ELF binary to execute
-/// * `flamegraph_path` - Optional path to write flamegraph folded stacks
-///
-/// # Exit Codes
-///
-/// * `0` - Execution completed successfully
-/// * `1` - Execution failed (file not found, invalid ELF, runtime error)
 fn cmd_execute(elf_path: PathBuf, flamegraph_path: Option<PathBuf>) -> ExitCode {
     let elf_data = match read_file_with_limit(&elf_path, MAX_ELF_FILE_SIZE, "ELF") {
         Ok(data) => data,
@@ -349,35 +252,6 @@ fn cmd_execute(elf_path: PathBuf, flamegraph_path: Option<PathBuf>) -> ExitCode 
     ExitCode::SUCCESS
 }
 
-/// Prove command: execute a program and generate a STARK proof.
-///
-/// This command performs the full proving pipeline:
-/// 1. Load and parse the ELF file
-/// 2. Execute the program to generate execution logs
-/// 3. Build execution traces for all VM tables
-/// 4. Generate AIRs (Algebraic Intermediate Representations)
-/// 5. Run the STARK prover to create a multi-proof
-/// 6. Bundle the proof with metadata and serialize to CBOR
-///
-/// The output proof bundle can be verified with the `verify` command.
-///
-/// # Arguments
-///
-/// * `elf_path` - Path to the RISC-V ELF binary to prove
-/// * `output_path` - Path to write the proof bundle (.cbor file)
-/// * `security` - Security level preset (fast, standard, maximum)
-///
-/// # Exit Codes
-///
-/// * `0` - Proof generated successfully
-/// * `1` - Proof generation failed
-///
-/// # Performance Notes
-///
-/// Proof generation time depends on:
-/// - Number of instructions executed (trace size)
-/// - Security level (affects blowup factor and query count)
-/// - Available CPU cores (prover uses parallel FFT)
 fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, security: SecurityPreset) -> ExitCode {
     eprintln!("Reading ELF file...");
     let elf_data = match read_file_with_limit(&elf_path, MAX_ELF_FILE_SIZE, "ELF") {
@@ -492,48 +366,12 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, security: SecurityPreset) 
     }
 
     eprintln!("Proof written to {:?}", output_path);
-    eprintln!(
-        "  ELF hash: {}",
-        hex::encode(elf_hash).chars().take(16).collect::<String>() + "..."
-    );
+    eprintln!("  ELF hash: {}", truncated_hex(&elf_hash));
     eprintln!("  Steps: {}", num_steps);
 
     ExitCode::SUCCESS
 }
 
-/// Verify command: verify a STARK proof bundle.
-///
-/// This command verifies that a proof bundle represents valid execution
-/// of a RISC-V program. Verification requires the original ELF file to:
-/// - Compute the DECODE table commitment for verification
-/// - Verify the ELF hash matches the proof metadata
-///
-/// The verification process:
-/// 1. Load the ELF file and verify its hash matches the proof
-/// 2. Deserialize the proof bundle from CBOR
-/// 3. Reconstruct AIRs using the embedded proof options
-/// 4. Compute the DECODE commitment from the ELF
-/// 5. Run the STARK verifier on all table proofs
-/// 6. Verify LogUp bus consistency across tables
-///
-/// # Arguments
-///
-/// * `proof_path` - Path to the proof bundle (.cbor file)
-/// * `elf_path` - Path to the RISC-V ELF binary (must match the program that was proven)
-///
-/// # Exit Codes
-///
-/// * `0` - Proof is valid
-/// * `1` - Proof is invalid or verification failed
-///
-/// # Security Notes
-///
-/// A valid proof guarantees that:
-/// - The specific RISC-V program (identified by ELF hash) was executed correctly
-/// - The execution followed RISC-V semantics
-/// - Memory operations were consistent
-/// - All table lookups were valid
-/// - Instruction decoding was correct (via DECODE table)
 fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf) -> ExitCode {
     eprintln!("Reading ELF file...");
     let elf_data = match read_file_with_limit(&elf_path, MAX_ELF_FILE_SIZE, "ELF") {
@@ -638,25 +476,16 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // Verify ELF hash matches proof metadata (constant-time comparison)
-    // Note: We intentionally don't display hash values in error messages to prevent
-    // timing attacks where an attacker could iteratively modify an ELF to match.
+    // Verify ELF hash matches proof metadata
     let elf_hash: [u8; 32] = Sha3_256::digest(&elf_data).into();
-    if elf_hash.ct_eq(&bundle.metadata.elf_hash).unwrap_u8() != 1 {
-        eprintln!("ELF hash mismatch: the proof was generated for a different program.");
+    if elf_hash != bundle.metadata.elf_hash {
+        eprintln!("ELF hash mismatch: the proof was generated for a different program");
         return ExitCode::FAILURE;
     }
 
     eprintln!("Proof metadata:");
     eprintln!("  Version: {}", bundle.metadata.version);
-    eprintln!(
-        "  ELF hash: {}",
-        hex::encode(bundle.metadata.elf_hash)
-            .chars()
-            .take(16)
-            .collect::<String>()
-            + "..."
-    );
+    eprintln!("  ELF hash: {}", truncated_hex(&bundle.metadata.elf_hash));
     eprintln!("  Steps: {}", bundle.metadata.num_steps);
 
     // Reconstruct AIRs with the same proof options
