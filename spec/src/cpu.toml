@@ -618,7 +618,7 @@ multiplicity = "SHIFT"
 [[constraints.alu]]
 kind = "template"
 tag = "ADD"
-input = ["pc", ["cast", ["+", ["*", 2, "c_type_instruction"], ["*", 4, ["not", "c_type_instruction"]]], "DWordWL"]]
+input = ["pc", ["*", ["+", ["*", 2, "c_type_instruction"], ["*", 4, ["not", "c_type_instruction"]]], ["cast", 1, "DWordWL"]]]
 output = ["cast", "res", "DWordWL"]
 cond = "JALR"
 
@@ -817,6 +817,6 @@ multiplicity = "branch_cond"
 [[constraints.misc]]
 kind = "template"
 tag = "ADD"
-input = ["pc", ["cast", ["+", ["*", 2, "c_type_instruction"], ["*", 4, ["not", "c_type_instruction"]]], "DWordWL"]]
+input = ["pc", ["*", ["+", ["*", 2, "c_type_instruction"], ["*", 4, ["not", "c_type_instruction"]]], ["cast", 1, "DWordWL"]]]
 output = "next_pc"
 desc = "Increment `pc` to `next_pc` if we're not branching"
