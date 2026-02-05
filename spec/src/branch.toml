@@ -11,7 +11,7 @@ pad = 0
 
 [[variables.input]]
 name = "offset"
-type = "Word"
+type = "DWordWL"
 desc = "The offset from the base address to jump to"
 pad = 0
 

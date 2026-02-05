@@ -802,7 +802,7 @@ poly = ["+",
         ["-", "branch_cond"],
         "JALR",
         ["*", ["idx", "res", 0], ["not", "mp_selector"], "BLT"],
-        ["*", ["not", ["idx", "res", 0]], "mp_selector", "BLT"],
+        ["*", ["-", 1, ["idx", "res", 0]], "mp_selector", "BLT"],
         ["*", "is_equal", ["not", "mp_selector"], "BEQ"],
         ["*", ["not", "is_equal"], "mp_selector", "BEQ"]
     ]
