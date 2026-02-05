@@ -156,7 +156,7 @@ pub fn generate_page_trace(
     assert!(page_size.is_power_of_two(), "Page size must be power of 2");
     // Page base must be page-aligned
     assert!(
-        page_base % (page_size as u64) == 0,
+        page_base.is_multiple_of(page_size as u64),
         "Page base must be page-aligned"
     );
 
@@ -215,8 +215,8 @@ pub fn generate_page_trace(
 /// * `page_base` - The base address for this page (constant per table instance)
 pub fn bus_interactions(page_base: u64) -> Vec<BusInteraction> {
     // Split page_base into lo/hi 32-bit parts
-    let page_base_lo = (page_base & 0xFFFF_FFFF) as u64;
-    let page_base_hi = (page_base >> 32) as u64;
+    let page_base_lo = page_base & 0xFFFF_FFFF;
+    let page_base_hi = page_base >> 32;
 
     // Address computation: address_lo = page_base_lo + offset (linear combination)
     // address_hi = page_base_hi (constant, since offset < page_size < 2^32)

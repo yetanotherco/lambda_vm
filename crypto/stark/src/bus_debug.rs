@@ -72,10 +72,10 @@ impl BusDebugTracker {
 
     /// Log an interaction (optionally filtered by DEBUG_BUS_ID env var)
     pub fn log(&mut self, log: BusInteractionLog) {
-        if let Some(filter) = self.bus_filter {
-            if log.bus_id != filter {
-                return;
-            }
+        if let Some(filter) = self.bus_filter
+            && log.bus_id != filter
+        {
+            return;
         }
         self.logs.push(log);
     }

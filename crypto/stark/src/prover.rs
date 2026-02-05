@@ -1,3 +1,4 @@
+#[cfg(feature = "debug-checks")]
 use std::collections::HashMap;
 use std::marker::PhantomData;
 #[cfg(feature = "instruments")]
@@ -32,7 +33,9 @@ use super::constraints::evaluator::ConstraintEvaluator;
 use super::domain::Domain;
 use super::fri::fri_decommit::FriDecommitment;
 use super::grinding;
-use super::lookup::{bus_name, BusPublicInputs};
+#[cfg(feature = "debug-checks")]
+use super::lookup::bus_name;
+use super::lookup::BusPublicInputs;
 use super::proof::stark::{DeepPolynomialOpening, MultiProof, StarkProof};
 use super::trace::TraceTable;
 use super::traits::AIR;

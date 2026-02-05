@@ -97,7 +97,7 @@ pub(crate) struct VmAirs {
 impl VmAirs {
     /// Build `(air, trace, public_inputs)` triples for [`Prover::multi_prove`].
     pub fn air_trace_pairs<'a>(&'a self, traces: &'a mut Traces) -> Vec<AirTracePair<'a>> {
-        vec![
+        let mut pairs: Vec<AirTracePair<'a>> = vec![
             (&self.cpu, &mut traces.cpu, &()),
             (&self.bitwise, &mut traces.bitwise, &()),
             (&self.lt, &mut traces.lt, &()),
@@ -107,7 +107,12 @@ impl VmAirs {
             (&self.mul, &mut traces.mul, &()),
             (&self.branch, &mut traces.branch, &()),
             (&self.halt, &mut traces.halt, &()),
-        ]
+            (&self.register, &mut traces.register, &()),
+        ];
+        for (i, page_trace) in traces.pages.iter_mut().enumerate() {
+            pairs.push((&self.pages[i], page_trace, &()));
+        }
+        pairs
     }
 
     /// Collect AIR references for [`Verifier::multi_verify`].
@@ -197,26 +202,7 @@ pub fn prove(elf_bytes: &[u8]) -> Result<MultiProof<F, E, ()>, Error> {
     let proof_options = ProofOptions::default_test_options();
     let airs = VmAirs::new(&program, &proof_options, false, &traces.page_configs);
 
-    // Build air_trace_pairs from centralized VmAirs
-    let mut air_trace_pairs: Vec<AirTracePair> = vec![
-        (&airs.cpu, &mut traces.cpu, &()),
-        (&airs.bitwise, &mut traces.bitwise, &()),
-        (&airs.lt, &mut traces.lt, &()),
-        (&airs.memw, &mut traces.memw, &()),
-        (&airs.load, &mut traces.load, &()),
-        (&airs.decode, &mut traces.decode, &()),
-        (&airs.mul, &mut traces.mul, &()),
-        (&airs.branch, &mut traces.branch, &()),
-        (&airs.halt, &mut traces.halt, &()),
-        (&airs.register, &mut traces.register, &()),
-    ];
-
-    // Add PAGE tables from VmAirs
-    for (i, page_trace) in traces.pages.iter_mut().enumerate() {
-        air_trace_pairs.push((&airs.pages[i], page_trace, &()));
-    }
-
-    Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
+    Prover::multi_prove(airs.air_trace_pairs(&mut traces), &mut DefaultTranscript::<E>::new(&[]))
         .map_err(|e| Error::Prover(format!("{e:?}")))
 }
 

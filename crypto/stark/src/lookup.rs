@@ -1027,7 +1027,8 @@ fn build_logup_term_column<F, E>(
     table_interaction: &BusInteraction,
     trace: &mut TraceTable<F, E>,
     challenges: &[FieldElement<E>],
-    table_name: &str, // For debug tracking
+    #[cfg_attr(not(feature = "debug-checks"), allow(unused))]
+    table_name: &str,
 ) where
     F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
     E: IsField + Send + Sync,

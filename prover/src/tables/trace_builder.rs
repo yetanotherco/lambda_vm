@@ -36,7 +36,7 @@ use stark::trace::TraceTable;
 use super::bitwise::{self, BitwiseOperation, BitwiseOperationType};
 use super::branch::{self, BranchOperation};
 use super::cpu::{self, CpuOperation};
-use super::decode::{self, PcToRow};
+use super::decode;
 use super::halt;
 use super::load::{self, LoadOperation};
 use super::lt::{self, LtOperation};
@@ -963,8 +963,6 @@ pub struct Traces {
     /// HALT single-row table for program termination
     pub halt: TraceTable<GoldilocksField, GoldilocksExtension>,
 
-    /// PC to row mapping for DECODE multiplicities (internal use)
-    pc_to_row: PcToRow,
 }
 
 impl Traces {
@@ -1151,7 +1149,6 @@ impl Traces {
             register: register_trace,
             branch,
             halt: halt_trace,
-            pc_to_row,
         })
     }
 
@@ -1275,7 +1272,6 @@ impl Traces {
             register: register_trace,
             branch,
             halt: halt_trace,
-            pc_to_row,
         })
     }
 
