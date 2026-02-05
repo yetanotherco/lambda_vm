@@ -208,13 +208,19 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, security: SecurityPreset) 
     let proof_options = security.to_proof_options();
 
     eprintln!("Generating proof (this may take a while)...");
-    let (multi_proof, num_steps) = match prover::prove_with_options(&elf_data, &proof_options) {
-        Ok(result) => result,
+    let multi_proof = match prover::prove_with_options(&elf_data, &proof_options) {
+        Ok(proof) => proof,
         Err(e) => {
             eprintln!("Proof generation failed: {}", e);
             return ExitCode::FAILURE;
         }
     };
+
+    // Re-execute to get step count for bundle metadata
+    let program = Elf::load(&elf_data).unwrap();
+    let executor = Executor::new(&program, vec![]).unwrap();
+    let result = executor.run().unwrap();
+    let num_steps = result.logs.len();
 
     let bundle = ProofBundle::new(multi_proof, proof_options, elf_hash, num_steps);
 
