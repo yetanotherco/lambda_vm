@@ -1,4 +1,6 @@
 pub mod bit_reversing;
+#[cfg(feature = "alloc")]
+pub mod bowers;
 pub mod fft;
 #[cfg(feature = "alloc")]
 pub mod ops;
