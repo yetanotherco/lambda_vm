@@ -162,28 +162,33 @@ impl VmAirs {
 
 /// Prove an ELF binary execution. Returns a serializable proof.
 pub fn prove(elf_bytes: &[u8]) -> Result<MultiProof<F, E, ()>, Error> {
-    prove_with_options(elf_bytes, &ProofOptions::default_test_options())
+    let (proof, _) = prove_with_options(elf_bytes, &ProofOptions::default_test_options())?;
+    Ok(proof)
 }
 
 /// Prove an ELF binary execution with custom proof options.
+/// Returns the proof and the number of execution steps.
 pub fn prove_with_options(
     elf_bytes: &[u8],
     proof_options: &ProofOptions,
-) -> Result<MultiProof<F, E, ()>, Error> {
+) -> Result<(MultiProof<F, E, ()>, usize), Error> {
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let executor = Executor::new(&program, vec![]).map_err(|e| Error::Execution(format!("{e}")))?;
     let result = executor
         .run()
         .map_err(|e| Error::Execution(format!("{e}")))?;
 
+    let num_steps = result.logs.len();
     let mut traces = Traces::from_logs(&result.logs, result.instructions)?;
     let airs = VmAirs::new(&program, proof_options, false);
 
-    Prover::multi_prove(
+    let proof = Prover::multi_prove(
         airs.air_trace_pairs(&mut traces),
         &mut DefaultTranscript::<E>::new(&[]),
     )
-    .map_err(|e| Error::Prover(format!("{e:?}")))
+    .map_err(|e| Error::Prover(format!("{e:?}")))?;
+
+    Ok((proof, num_steps))
 }
 
 /// Verify a proof produced by [`prove`].
