@@ -7,7 +7,6 @@ edition = "2024"
 executor = { path = "../../executor" }
 prover = { path = "../../prover", package = "lambda-vm-prover" }
 stark = { path = "../../crypto/stark" }
-math = { path = "../../crypto/math" }
 crypto = { path = "../../crypto/crypto" }
 clap = { version = "4.3.10", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }

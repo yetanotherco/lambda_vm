@@ -628,7 +628,6 @@ dependencies = [
  "executor",
  "hex",
  "lambda-vm-prover",
- "math",
  "serde",
  "sha3",
  "stark",
