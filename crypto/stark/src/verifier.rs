@@ -935,6 +935,7 @@ pub trait IsStarkVerifier<
                 eprintln!("[VERIFIER] Bus balance check FAILED: total={:?}", total);
                 return false;
             }
+            #[cfg(feature = "debug-checks")]
             eprintln!("[VERIFIER] Bus balance check PASSED");
         }
 
