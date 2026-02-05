@@ -4,7 +4,7 @@ mod proof_bundle;
 
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum, ValueHint};
@@ -18,52 +18,8 @@ use stark::proof::options::{ProofOptions, SecurityLevel};
 
 use proof_bundle::{PROOF_BUNDLE_VERSION, ProofBundle};
 
-/// Maximum ELF file size: 256 MB
-const MAX_ELF_FILE_SIZE: u64 = 256 * 1024 * 1024;
-
-/// Maximum proof bundle file size: 1 GB
-const MAX_PROOF_FILE_SIZE: u64 = 1024 * 1024 * 1024;
-
-/// Minimum acceptable blowup factor for proof verification
-const MIN_BLOWUP_FACTOR: u8 = 4;
-
-/// Maximum acceptable blowup factor (32 is very high, prevents memory exhaustion)
-const MAX_BLOWUP_FACTOR: u8 = 32;
-
-/// Minimum acceptable FRI queries for proof verification.
-/// 41 = [`SecurityLevel::Conjecturable100Bits`] minimum from [`ProofOptions::new_secure`].
-const MIN_FRI_QUERIES: usize = 41;
-
-/// Maximum acceptable FRI queries (1000 is far above any reasonable security level)
-const MAX_FRI_QUERIES: usize = 1000;
-
-/// Minimum acceptable grinding factor for proof verification
-const MIN_GRINDING_FACTOR: u8 = 1;
-
-/// Maximum acceptable grinding factor (32 bits is very high)
-const MAX_GRINDING_FACTOR: u8 = 32;
-
-/// Maximum acceptable coset offset (reasonable upper bound)
-const MAX_COSET_OFFSET: u64 = 1000;
-
 fn truncated_hex(bytes: &[u8]) -> String {
     format!("{}...", &hex::encode(bytes)[..16])
-}
-
-fn read_file_with_limit(path: &Path, max_size: u64, file_type: &str) -> Result<Vec<u8>, String> {
-    let metadata = std::fs::metadata(path)
-        .map_err(|e| format!("Failed to get {} file metadata: {}", file_type, e))?;
-
-    if metadata.len() > max_size {
-        return Err(format!(
-            "{} file too large: {} bytes (max: {} bytes)",
-            file_type,
-            metadata.len(),
-            max_size
-        ));
-    }
-
-    std::fs::read(path).map_err(|e| format!("Failed to read {} file: {}", file_type, e))
 }
 
 #[derive(Parser)]
@@ -155,10 +111,10 @@ fn main() -> ExitCode {
 }
 
 fn cmd_execute(elf_path: PathBuf, flamegraph_path: Option<PathBuf>) -> ExitCode {
-    let elf_data = match read_file_with_limit(&elf_path, MAX_ELF_FILE_SIZE, "ELF") {
+    let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
         Err(e) => {
-            eprintln!("{}", e);
+            eprintln!("Failed to read ELF file: {}", e);
             return ExitCode::FAILURE;
         }
     };
@@ -240,10 +196,10 @@ fn cmd_execute(elf_path: PathBuf, flamegraph_path: Option<PathBuf>) -> ExitCode 
 
 fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, security: SecurityPreset) -> ExitCode {
     eprintln!("Reading ELF file...");
-    let elf_data = match read_file_with_limit(&elf_path, MAX_ELF_FILE_SIZE, "ELF") {
+    let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
         Err(e) => {
-            eprintln!("{}", e);
+            eprintln!("Failed to read ELF file: {}", e);
             return ExitCode::FAILURE;
         }
     };
@@ -293,31 +249,15 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, security: SecurityPreset) 
 
 fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf) -> ExitCode {
     eprintln!("Reading ELF file...");
-    let elf_data = match read_file_with_limit(&elf_path, MAX_ELF_FILE_SIZE, "ELF") {
+    let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
         Err(e) => {
-            eprintln!("{}", e);
+            eprintln!("Failed to read ELF file: {}", e);
             return ExitCode::FAILURE;
         }
     };
 
     eprintln!("Reading proof bundle...");
-    let proof_metadata = match std::fs::metadata(&proof_path) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("Failed to get proof file metadata: {}", e);
-            return ExitCode::FAILURE;
-        }
-    };
-    if proof_metadata.len() > MAX_PROOF_FILE_SIZE {
-        eprintln!(
-            "Proof file too large: {} bytes (max: {} bytes)",
-            proof_metadata.len(),
-            MAX_PROOF_FILE_SIZE
-        );
-        return ExitCode::FAILURE;
-    }
-
     let file = match File::open(&proof_path) {
         Ok(f) => f,
         Err(e) => {
@@ -340,48 +280,6 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf) -> ExitCode {
         eprintln!(
             "Unsupported proof bundle version: {} (expected {})",
             bundle.metadata.version, PROOF_BUNDLE_VERSION
-        );
-        return ExitCode::FAILURE;
-    }
-
-    // Validate proof options to prevent malicious bundles with weak or DoS parameters
-    if bundle.proof_options.blowup_factor < MIN_BLOWUP_FACTOR
-        || bundle.proof_options.blowup_factor > MAX_BLOWUP_FACTOR
-    {
-        eprintln!(
-            "Invalid proof options: blowup_factor {} is out of valid range ({}-{})",
-            bundle.proof_options.blowup_factor, MIN_BLOWUP_FACTOR, MAX_BLOWUP_FACTOR
-        );
-        return ExitCode::FAILURE;
-    }
-    if !bundle.proof_options.blowup_factor.is_power_of_two() {
-        eprintln!("Invalid proof options: blowup_factor must be a power of two");
-        return ExitCode::FAILURE;
-    }
-    if bundle.proof_options.fri_number_of_queries < MIN_FRI_QUERIES
-        || bundle.proof_options.fri_number_of_queries > MAX_FRI_QUERIES
-    {
-        eprintln!(
-            "Invalid proof options: fri_number_of_queries {} is out of valid range ({}-{})",
-            bundle.proof_options.fri_number_of_queries, MIN_FRI_QUERIES, MAX_FRI_QUERIES
-        );
-        return ExitCode::FAILURE;
-    }
-    if bundle.proof_options.coset_offset == 0
-        || bundle.proof_options.coset_offset > MAX_COSET_OFFSET
-    {
-        eprintln!(
-            "Invalid proof options: coset_offset {} is out of valid range (1-{})",
-            bundle.proof_options.coset_offset, MAX_COSET_OFFSET
-        );
-        return ExitCode::FAILURE;
-    }
-    if bundle.proof_options.grinding_factor < MIN_GRINDING_FACTOR
-        || bundle.proof_options.grinding_factor > MAX_GRINDING_FACTOR
-    {
-        eprintln!(
-            "Invalid proof options: grinding_factor {} is out of valid range ({}-{})",
-            bundle.proof_options.grinding_factor, MIN_GRINDING_FACTOR, MAX_GRINDING_FACTOR
         );
         return ExitCode::FAILURE;
     }
