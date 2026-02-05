@@ -2,6 +2,7 @@ use math::field::{
     element::FieldElement, fields::fft_friendly::stark_252_prime_field::Stark252PrimeField,
 };
 
+pub mod bus_debug;
 pub mod constraints;
 pub mod context;
 pub mod debug;

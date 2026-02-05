@@ -603,7 +603,7 @@ impl<
 
 /// Map bus ID to human-readable name for debug output.
 /// Based on BusId enum from prover/src/tables/types.rs.
-fn bus_name(bus_id: u64) -> &'static str {
+pub fn bus_name(bus_id: u64) -> &'static str {
     match bus_id {
         0 => "IsByte",
         1 => "IsHalfword",
@@ -691,18 +691,22 @@ where
 
         // Build term columns (one per interaction)
         // Each term column contains: sign * m[i] / fp[i]
+        let table_name = self.name.as_deref().unwrap_or("UNKNOWN");
         for (i, interaction) in self
             .auxiliary_trace_build_data
             .interactions
             .iter()
             .enumerate()
         {
-            build_logup_term_column(i, interaction, trace, challenges);
+            build_logup_term_column(i, interaction, trace, challenges, table_name);
         }
 
         // DEBUG: Sum terms by bus_id to find which bus is imbalanced
-        // Print per-table bus sums with table name and bus name for debugging
+        // Track total sums, sender sums, and receiver sums separately
         let mut bus_sums: HashMap<u64, FieldElement<E>> = HashMap::new();
+        let mut bus_sender_sums: HashMap<u64, FieldElement<E>> = HashMap::new();
+        let mut bus_receiver_sums: HashMap<u64, FieldElement<E>> = HashMap::new();
+
         for (i, interaction) in self
             .auxiliary_trace_build_data
             .interactions
@@ -713,18 +717,39 @@ where
             for row in 0..trace.num_rows() {
                 col_sum = col_sum + trace.get_aux(row, i);
             }
-            *bus_sums.entry(interaction.bus_id).or_insert(FieldElement::zero()) += col_sum;
+            *bus_sums.entry(interaction.bus_id).or_insert(FieldElement::zero()) +=
+                col_sum.clone();
+
+            // Track sender vs receiver separately
+            // Note: col_sum already has sign baked in (+ for sender, - for receiver)
+            if interaction.is_sender {
+                *bus_sender_sums
+                    .entry(interaction.bus_id)
+                    .or_insert(FieldElement::zero()) += col_sum;
+            } else {
+                // For receivers, negate to get the positive "amount received"
+                // (col_sum is negative for receivers, so we subtract to get positive)
+                let entry = bus_receiver_sums
+                    .entry(interaction.bus_id)
+                    .or_insert(FieldElement::zero());
+                *entry = entry.clone() - col_sum;
+            }
         }
+
         // Print per-table bus sums (for debugging bus imbalances)
         let table_name = self.name.as_deref().unwrap_or("UNKNOWN");
         for (&bus_id, sum) in &bus_sums {
-            // Print ALL sums (not just non-zero) for comparison
+            let sender_sum = bus_sender_sums.get(&bus_id);
+            let receiver_sum = bus_receiver_sums.get(&bus_id);
+            let role = match (sender_sum.is_some(), receiver_sum.is_some()) {
+                (true, false) => "SEND",
+                (false, true) => "RECV",
+                (true, true) => "BOTH",
+                _ => "????",
+            };
             eprintln!(
-                "[{:12}] Bus {:2} ({:10}): sum = {:?}",
-                table_name,
-                bus_id,
-                bus_name(bus_id),
-                sum
+                "[{:12}] Bus {:2} ({:10}) [{:4}]: sum = {:?}",
+                table_name, bus_id, bus_name(bus_id), role, sum
             );
         }
 
@@ -737,6 +762,10 @@ where
         Some(BusPublicInputs {
             initial_value: trace.get_aux(0, acc_col_idx).clone(),
             final_accumulated: trace.get_aux(last_row, acc_col_idx).clone(),
+            per_bus_sums: bus_sums,
+            per_bus_sender_sums: bus_sender_sums,
+            per_bus_receiver_sums: bus_receiver_sums,
+            table_name: self.name.clone().unwrap_or_else(|| "UNKNOWN".to_string()),
         })
     }
 
@@ -953,6 +982,14 @@ where
     pub initial_value: FieldElement<E>,
     /// Accumulated column value at last row (total sum of all terms)
     pub final_accumulated: FieldElement<E>,
+    /// Per-bus sums for this table (bus_id → sum) - for debug aggregation
+    pub per_bus_sums: HashMap<u64, FieldElement<E>>,
+    /// Per-bus sender sums (bus_id → sum) - positive contributions
+    pub per_bus_sender_sums: HashMap<u64, FieldElement<E>>,
+    /// Per-bus receiver sums (bus_id → sum) - absolute value (before negation)
+    pub per_bus_receiver_sums: HashMap<u64, FieldElement<E>>,
+    /// Table name for debug output
+    pub table_name: String,
 }
 
 /// Trait representing boundary constraint building behaviour.
@@ -996,6 +1033,7 @@ fn build_logup_term_column<F, E>(
     table_interaction: &BusInteraction,
     trace: &mut TraceTable<F, E>,
     challenges: &[FieldElement<E>],
+    table_name: &str, // For debug tracking
 ) where
     F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
     E: IsField + Send + Sync,
@@ -1078,15 +1116,6 @@ fn build_logup_term_column<F, E>(
             combined.into_iter().map(|v| v.to_extension())
         }));
 
-        // DEBUG: Print Memory bus (16) interactions with multiplicity
-        if table_interaction.bus_id == 16 && row < 8 {
-            let sender_str = if table_interaction.is_sender { "SEND" } else { "RECV" };
-            eprintln!(
-                "LOGUP_DEBUG: bus=16 row={} {} mult={:?} is_reg={}",
-                row, sender_str, multiplicity, bus_elements.get(1).map(|e| format!("{:?}", e)).unwrap_or_default()
-            );
-        }
-
         // fingerprint = z - (bus_id + v[0]*α + v[1]*α² + ... + v[n]*α^(n+1))
         let linear_combination: FieldElement<E> = bus_elements
             .iter()
@@ -1095,6 +1124,44 @@ fn build_logup_term_column<F, E>(
             .sum();
 
         let fingerprint = z - &linear_combination;
+
+        // Debug: Log bus interaction for mismatch analysis (runtime-enabled via DEBUG_BUS_TRACKER=1)
+        {
+            use crate::bus_debug::{BusInteractionLog, BUS_DEBUG_TRACKER};
+
+            // Check if tracker is enabled before doing any work
+            let should_log = {
+                let tracker = BUS_DEBUG_TRACKER.lock().unwrap();
+                tracker.is_enabled() && !multiplicity.eq(&FieldElement::<F>::zero())
+            };
+
+            if should_log {
+                // Convert multiplicity to u64 for logging
+                // Debug format is "FieldElement { value: X }" - extract X
+                let mult_u64 = {
+                    let repr = format!("{:?}", multiplicity);
+                    repr.split("value: ")
+                        .nth(1)
+                        .and_then(|s| s.trim_end_matches([' ', '}'].as_ref()).parse::<u64>().ok())
+                        .unwrap_or(1)
+                };
+
+                let log = BusInteractionLog {
+                    table_name: table_name.to_string(),
+                    row_idx: row,
+                    bus_id: table_interaction.bus_id,
+                    is_sender: table_interaction.is_sender,
+                    multiplicity: mult_u64,
+                    bus_elements: bus_elements
+                        .iter()
+                        .map(|e| format!("{:?}", e))
+                        .collect(),
+                    fingerprint: format!("{:?}", fingerprint),
+                };
+
+                BUS_DEBUG_TRACKER.lock().unwrap().log(log);
+            }
+        }
 
         // term = sign * multiplicity / fingerprint
         let term = multiplicity
