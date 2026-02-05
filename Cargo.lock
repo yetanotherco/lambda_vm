@@ -2199,6 +2199,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "lambda-vm-prover"
+version = "0.1.0"
+dependencies = [
+ "criterion 0.5.1",
+ "crypto",
+ "dhat",
+ "env_logger",
+ "executor",
+ "lazy_static",
+ "math",
+ "rayon",
+ "stark",
+]
+
+[[package]]
 name = "lambdaworks-crypto"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3096,21 +3111,6 @@ dependencies = [
  "rusty-fork",
  "tempfile",
  "unarray",
-]
-
-[[package]]
-name = "prover"
-version = "0.1.0"
-dependencies = [
- "criterion 0.5.1",
- "crypto",
- "dhat",
- "env_logger",
- "executor",
- "lazy_static",
- "math",
- "rayon",
- "stark",
 ]
 
 [[package]]

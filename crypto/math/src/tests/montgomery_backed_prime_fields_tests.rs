@@ -90,11 +90,11 @@ mod tests_u384_prime_fields {
     }
 
     #[test]
-    fn montgomery_backend_primefield_representative() {
+    fn montgomery_backend_primefield_canonical() {
         let a: U384 = UnsignedInteger {
             limbs: [0, 0, 0, 0, 0, 11],
         };
-        assert_eq!(U384F23::representative(&U384F23::from_u64(770_u64)), a);
+        assert_eq!(U384F23::canonical(&U384F23::from_u64(770_u64)), a);
     }
 
     #[test]
@@ -500,12 +500,12 @@ mod tests_u256_prime_fields {
     }
 
     #[test]
-    fn montgomery_backend_primefield_representative() {
+    fn montgomery_backend_primefield_canonical() {
         // 770%29
         let a: U256 = UnsignedInteger {
             limbs: [0, 0, 0, 16],
         };
-        assert_eq!(U256F29::representative(&U256F29::from_u64(770_u64)), a);
+        assert_eq!(U256F29::canonical(&U256F29::from_u64(770_u64)), a);
     }
 
     #[test]
@@ -831,18 +831,18 @@ mod tests_u256_prime_fields {
 
     #[test]
     #[cfg(feature = "alloc")]
-    fn creating_a_field_element_from_its_representative_returns_the_same_element_1() {
+    fn creating_a_field_element_from_its_canonical_returns_the_same_element_1() {
         let change = U256::from_u64(1);
         let f1 = U256FP1Element::new(U256ModulusP1::MODULUS + change);
-        let f2 = U256FP1Element::new(f1.representative());
+        let f2 = U256FP1Element::new(f1.canonical());
         assert_eq!(f1, f2);
     }
 
     #[test]
-    fn creating_a_field_element_from_its_representative_returns_the_same_element_2() {
+    fn creating_a_field_element_from_its_canonical_returns_the_same_element_2() {
         let change = U256::from_u64(27);
         let f1 = U256F29Element::new(U256Modulus29::MODULUS + change);
-        let f2 = U256F29Element::new(f1.representative());
+        let f2 = U256F29Element::new(f1.canonical());
         assert_eq!(f1, f2);
     }
 
@@ -872,7 +872,7 @@ mod tests_u256_prime_fields {
         assert!(a.is_err());
         assert_eq!(
             a.unwrap_err(),
-            crate::errors::CreationError::RepresentativeOutOfRange
+            crate::errors::CreationError::CanonicalOutOfRange
         )
     }
 

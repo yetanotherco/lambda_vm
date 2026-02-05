@@ -37,12 +37,12 @@ impl IsFFTField for Babybear31PrimeField {
 
 impl FieldElement<Babybear31PrimeField> {
     pub fn to_bytes_le(&self) -> [u8; 8] {
-        let limbs = self.representative().limbs;
+        let limbs = self.canonical().limbs;
         limbs[0].to_le_bytes()
     }
 
     pub fn to_bytes_be(&self) -> [u8; 8] {
-        let limbs = self.representative().limbs;
+        let limbs = self.canonical().limbs;
         limbs[0].to_be_bytes()
     }
 }

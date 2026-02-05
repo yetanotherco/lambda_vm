@@ -122,7 +122,7 @@ mod tests {
                 continue;
             }
 
-            let coeff_str = coeff.representative().to_string();
+            let coeff_str = coeff.canonical().to_string();
 
             if i == poly.coefficients().len() - 1 {
                 string.push_str(&coeff_str);

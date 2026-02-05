@@ -53,7 +53,7 @@
 //! - ECALL: for system calls
 
 use super::types::{BusId, DecodeEntry, FE, GoldilocksExtension, GoldilocksField};
-use crate::ProverError;
+use crate::Error;
 use executor::vm::{instruction::decoding::Instruction, logs::Log, memory::U64HashMap};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
@@ -784,12 +784,12 @@ pub fn generate_cpu_trace(
 pub fn generate_cpu_trace_from_logs(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,
-) -> Result<TraceTable<GoldilocksField, GoldilocksExtension>, ProverError> {
+) -> Result<TraceTable<GoldilocksField, GoldilocksExtension>, Error> {
     let mut operations = Vec::with_capacity(logs.len());
     for (i, log) in logs.iter().enumerate() {
         let instruction = *instructions
             .get(&log.current_pc)
-            .ok_or(ProverError::MissingInstruction(log.current_pc))?;
+            .ok_or(Error::MissingInstruction(log.current_pc))?;
         operations.push(CpuOperation::from_log_and_instruction(
             log,
             (i as u64) * 4,
@@ -813,12 +813,12 @@ pub fn collect_bitwise_ops(operations: &[CpuOperation]) -> Vec<super::bitwise::B
 pub fn collect_bitwise_ops_from_logs(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,
-) -> Result<Vec<super::bitwise::BitwiseOperation>, ProverError> {
+) -> Result<Vec<super::bitwise::BitwiseOperation>, Error> {
     let mut operations = Vec::with_capacity(logs.len());
     for (i, log) in logs.iter().enumerate() {
         let instruction = *instructions
             .get(&log.current_pc)
-            .ok_or(ProverError::MissingInstruction(log.current_pc))?;
+            .ok_or(Error::MissingInstruction(log.current_pc))?;
         operations.push(CpuOperation::from_log_and_instruction(
             log,
             (i as u64) * 4,
@@ -1137,6 +1137,57 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             // lt result (res[0])
             BusValue::Packed {
                 start_column: cols::RES[0],
+                packing: Packing::Direct,
+            },
+        ],
+    ));
+
+    // -------------------------------------------------------------------------
+    // MUL interaction (for MUL, MULH, MULHSU, MULHU)
+    // -------------------------------------------------------------------------
+    // MUL[arg1, signed, arg2, mp_selector, rvd, muldiv_selector] per spec CPU-CA44
+    // multiplicity = MUL
+    //
+    // The MUL table expects DWordHL (4 halfwords), but CPU has DWordBL (8 bytes).
+    // Both pack to 2 words (lo32, hi32), so the signatures match for the same values.
+    //
+    // rhs_signed = mp_selector per spec:
+    // - MUL/MULH: mp_selector=1 (both operands signed)
+    // - MULHU/MULHSU: mp_selector=0 (rhs unsigned)
+    //
+    // muldiv_selector distinguishes lo (0) from hi (1) result
+    interactions.push(BusInteraction::sender(
+        BusId::Mul,
+        Multiplicity::Column(cols::MUL),
+        vec![
+            // arg1 (lhs) as DWordBL (8 bytes → 2 elements)
+            BusValue::Packed {
+                start_column: cols::ARG1[0],
+                packing: Packing::DWordBL,
+            },
+            // lhs_signed = signed
+            BusValue::Packed {
+                start_column: cols::SIGNED,
+                packing: Packing::Direct,
+            },
+            // arg2 (rhs) as DWordBL (8 bytes → 2 elements)
+            BusValue::Packed {
+                start_column: cols::ARG2[0],
+                packing: Packing::DWordBL,
+            },
+            // rhs_signed = mp_selector
+            BusValue::Packed {
+                start_column: cols::MP_SELECTOR,
+                packing: Packing::Direct,
+            },
+            // result (rvd) as DWordWL (2 words → 2 elements)
+            BusValue::Packed {
+                start_column: cols::RVD_0,
+                packing: Packing::DWordWL,
+            },
+            // muldiv_selector: 0=lo (MUL), 1=hi (MULH/MULHSU/MULHU)
+            BusValue::Packed {
+                start_column: cols::MULDIV_SELECTOR,
                 packing: Packing::Direct,
             },
         ],
