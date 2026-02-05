@@ -44,8 +44,8 @@ const MIN_BLOWUP_FACTOR: u8 = 4;
 /// Maximum acceptable blowup factor (32 is very high, prevents memory exhaustion)
 const MAX_BLOWUP_FACTOR: u8 = 32;
 
-/// Minimum acceptable FRI queries for proof verification (31 = Conjecturable80Bits minimum)
-const MIN_FRI_QUERIES: usize = 31;
+/// Minimum acceptable FRI queries for proof verification (41 = Conjecturable100Bits minimum)
+const MIN_FRI_QUERIES: usize = 41;
 
 /// Maximum acceptable FRI queries (1000 is far above any reasonable security level)
 const MAX_FRI_QUERIES: usize = 1000;
