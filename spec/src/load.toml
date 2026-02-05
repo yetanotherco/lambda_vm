@@ -155,6 +155,6 @@ name = "output"
 [[constraints.output]]
 kind = "interaction"
 tag = "LOAD"
-input = ["base_address", "timestamp", "read2", "read4", "read8"]
+input = ["base_address", "timestamp", "read2", "read4", "read8", "signed"]
 output = ["cast", "res", "DWordWL"]
 multiplicity = ["-", "μ"]
