@@ -1324,14 +1324,15 @@ impl Traces {
     /// 5. Generate all traces including PAGE tables
     pub fn from_elf_and_logs(elf: &Elf, logs: &[Log]) -> Result<Self, Error> {
         // =====================================================================
-        // PHASE 0: ELF → DECODE
+        // PHASE 0: ELF → DECODE + instructions
         // =====================================================================
-        let elf_tables = decode::tables_from_elf(elf)
-            .map_err(|e| Error::Execution(format!("Failed to process ELF: {e}")))?;
-
-        // Extract instructions map for CPU ops collection
+        // IMPORTANT: Use generate_decode_trace (same as compute_precomputed_commitment)
+        // so the DECODE trace row ordering matches the AIR's hardcoded commitment.
+        // tables_from_elf iterates ELF segments sequentially, but the commitment
+        // is computed via HashMap iteration which may have different ordering.
         let instructions = decode::instructions_from_elf(elf)
             .map_err(|e| Error::Execution(format!("Failed to parse instructions: {e}")))?;
+        let (decode_trace, decode_pc_to_row) = decode::generate_decode_trace(&instructions);
 
         // =====================================================================
         // PHASE 1: Logs → CPU operations
@@ -1425,8 +1426,8 @@ impl Traces {
         // Update DECODE multiplicities
         // Each CPU operation looks up the DECODE table once
         // Padding rows also look up pc=1 (the CPU padding entry)
-        let mut decode = elf_tables.decode;
-        let pc_to_row = elf_tables.pc_to_row;
+        let mut decode = decode_trace;
+        let pc_to_row = decode_pc_to_row;
         let num_padding_rows = cpu_ops.len().next_power_of_two() - cpu_ops.len();
         let mut decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
         decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
