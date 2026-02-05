@@ -21,6 +21,14 @@ input = ["DWordWL", "DWordWL"]
 output = "DWordWL"
 cond = "BaseField"
 
+# cond => NEG<neg; X>
+[[signatures]]
+tag = "NEG"
+kind = "template"
+input = ["DWordHL"]
+output = "DWordDL"
+cond = "Bit"
+
 # SIGN<sign; X, signed>
 [[signatures]]
 tag = "SIGN"
