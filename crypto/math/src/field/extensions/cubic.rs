@@ -48,7 +48,7 @@ where
     where
         Self: Sized,
     {
-        if bytes.is_empty() || !bytes.len().is_multiple_of(3) {
+        if bytes.len() < 3 || !bytes.len().is_multiple_of(3) {
             return Err(crate::errors::ByteConversionError::FromBEBytesError);
         }
         let elem_size = bytes.len() / 3;
@@ -66,7 +66,7 @@ where
     where
         Self: Sized,
     {
-        if bytes.is_empty() || !bytes.len().is_multiple_of(3) {
+        if bytes.len() < 3 || !bytes.len().is_multiple_of(3) {
             return Err(crate::errors::ByteConversionError::FromLEBytesError);
         }
         let elem_size = bytes.len() / 3;
