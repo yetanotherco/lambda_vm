@@ -1,5 +1,5 @@
-use std::marker::PhantomData;
 use std::collections::HashMap;
+use std::marker::PhantomData;
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use math::field::{
@@ -717,8 +717,9 @@ where
             for row in 0..trace.num_rows() {
                 col_sum = col_sum + trace.get_aux(row, i);
             }
-            *bus_sums.entry(interaction.bus_id).or_insert(FieldElement::zero()) +=
-                col_sum.clone();
+            *bus_sums
+                .entry(interaction.bus_id)
+                .or_insert(FieldElement::zero()) += col_sum.clone();
 
             // Track sender vs receiver separately
             // Note: col_sum already has sign baked in (+ for sender, - for receiver)
@@ -1027,8 +1028,7 @@ fn build_logup_term_column<F, E>(
     table_interaction: &BusInteraction,
     trace: &mut TraceTable<F, E>,
     challenges: &[FieldElement<E>],
-    #[cfg_attr(not(feature = "debug-checks"), allow(unused))]
-    table_name: &str,
+    #[cfg_attr(not(feature = "debug-checks"), allow(unused))] table_name: &str,
 ) where
     F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
     E: IsField + Send + Sync,
@@ -1131,7 +1131,7 @@ fn build_logup_term_column<F, E>(
         // Debug: Log bus interaction for mismatch analysis
         #[cfg(feature = "debug-checks")]
         {
-            use crate::bus_debug::{BusInteractionLog, BUS_DEBUG_TRACKER};
+            use crate::bus_debug::{BUS_DEBUG_TRACKER, BusInteractionLog};
 
             if !multiplicity.eq(&FieldElement::<F>::zero()) {
                 // Convert multiplicity to u64 for logging
@@ -1150,10 +1150,7 @@ fn build_logup_term_column<F, E>(
                     bus_id: table_interaction.bus_id,
                     is_sender: table_interaction.is_sender,
                     multiplicity: mult_u64,
-                    bus_elements: bus_elements
-                        .iter()
-                        .map(|e| format!("{:?}", e))
-                        .collect(),
+                    bus_elements: bus_elements.iter().map(|e| format!("{:?}", e)).collect(),
                     fingerprint: format!("{:?}", fingerprint),
                 };
 

@@ -850,12 +850,16 @@ pub trait IsStarkVerifier<
                         // OK - commitment matches hardcoded
                     }
                     Some(actual) => {
-                        eprintln!("[VERIFIER] Preprocessed commitment MISMATCH for table {idx}: expected {:?}, got {:?}",
-                            expected_precomputed, actual);
+                        eprintln!(
+                            "[VERIFIER] Preprocessed commitment MISMATCH for table {idx}: expected {:?}, got {:?}",
+                            expected_precomputed, actual
+                        );
                         return false;
                     }
                     None => {
-                        eprintln!("[VERIFIER] Preprocessed table {idx} proof missing precomputed commitment");
+                        eprintln!(
+                            "[VERIFIER] Preprocessed table {idx} proof missing precomputed commitment"
+                        );
                         return false;
                     }
                 }
@@ -900,8 +904,12 @@ pub trait IsStarkVerifier<
 
         for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
             if !Self::verify_rounds_2_to_4(*air, proof, transcript, logup_challenges.clone()) {
-                eprintln!("[VERIFIER] Table {} failed verify_rounds_2_to_4 (num_constraints={}, trace_cols={})",
-                    idx, air.context().num_transition_constraints(), air.context().trace_columns);
+                eprintln!(
+                    "[VERIFIER] Table {} failed verify_rounds_2_to_4 (num_constraints={}, trace_cols={})",
+                    idx,
+                    air.context().num_transition_constraints(),
+                    air.context().trace_columns
+                );
                 return false;
             }
         }

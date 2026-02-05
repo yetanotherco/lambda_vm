@@ -230,7 +230,11 @@ impl BusDebugTracker {
             )?;
         }
 
-        eprintln!("[BusDebugTracker] Wrote {} entries to {}", self.logs.len(), path);
+        eprintln!(
+            "[BusDebugTracker] Wrote {} entries to {}",
+            self.logs.len(),
+            path
+        );
         Ok(())
     }
 
@@ -251,7 +255,9 @@ impl BusMismatchReport {
     pub fn print_summary(&self) {
         if self.imbalanced_buses.is_empty() {
             eprintln!("\n=== BUS MISMATCH ANALYSIS ===");
-            eprintln!("All tracked buses appear balanced (no orphans or multiplicity mismatches found)");
+            eprintln!(
+                "All tracked buses appear balanced (no orphans or multiplicity mismatches found)"
+            );
             eprintln!("=== END ANALYSIS ===\n");
             return;
         }
@@ -263,20 +269,14 @@ impl BusMismatchReport {
                 + imbalance.orphan_receivers.len()
                 + imbalance.multiplicity_mismatches.len();
 
-            eprintln!(
-                "\nBus {}: {} issue(s) found",
-                imbalance.bus_id, issue_count
-            );
+            eprintln!("\nBus {}: {} issue(s) found", imbalance.bus_id, issue_count);
 
             // Orphan senders
             if !imbalance.orphan_senders.is_empty() {
                 eprintln!("\n  ORPHAN SENDERS (sent but not received):");
                 for (i, orphan) in imbalance.orphan_senders.iter().enumerate() {
                     if i >= 10 {
-                        eprintln!(
-                            "    ... and {} more",
-                            imbalance.orphan_senders.len() - 10
-                        );
+                        eprintln!("    ... and {} more", imbalance.orphan_senders.len() - 10);
                         break;
                     }
                     eprintln!(
@@ -301,10 +301,7 @@ impl BusMismatchReport {
                 eprintln!("\n  ORPHAN RECEIVERS (expected but not sent):");
                 for (i, orphan) in imbalance.orphan_receivers.iter().enumerate() {
                     if i >= 10 {
-                        eprintln!(
-                            "    ... and {} more",
-                            imbalance.orphan_receivers.len() - 10
-                        );
+                        eprintln!("    ... and {} more", imbalance.orphan_receivers.len() - 10);
                         break;
                     }
                     eprintln!(
@@ -346,7 +343,9 @@ impl BusMismatchReport {
                         let first_3: Vec<_> = mismatch.senders.iter().take(3).collect();
                         eprintln!(
                             "      Sent: {} (from {} rows: {:?}...)",
-                            mismatch.total_sent, mismatch.senders.len(), first_3
+                            mismatch.total_sent,
+                            mismatch.senders.len(),
+                            first_3
                         );
                     }
                     // Print concise receiver summary
@@ -359,14 +358,19 @@ impl BusMismatchReport {
                         let first_3: Vec<_> = mismatch.receivers.iter().take(3).collect();
                         eprintln!(
                             "      Received: {} (from {} rows: {:?}...)",
-                            mismatch.total_received, mismatch.receivers.len(), first_3
+                            mismatch.total_received,
+                            mismatch.receivers.len(),
+                            first_3
                         );
                     }
                     let diff = mismatch.total_sent as i64 - mismatch.total_received as i64;
                     if diff > 0 {
                         eprintln!("      Deficit: {} lookup(s) not received!", diff);
                     } else {
-                        eprintln!("      Excess: {} lookup(s) received without sending!", -diff);
+                        eprintln!(
+                            "      Excess: {} lookup(s) received without sending!",
+                            -diff
+                        );
                     }
                 }
             }
@@ -407,7 +411,7 @@ pub struct MultiplicityMismatch {
     pub bus_elements: Vec<String>,
     pub total_sent: u64,
     pub total_received: u64,
-    pub senders: Vec<(String, usize, u64)>,   // (table, row, mult)
+    pub senders: Vec<(String, usize, u64)>, // (table, row, mult)
     pub receivers: Vec<(String, usize, u64)>, // (table, row, mult)
 }
 

@@ -447,7 +447,11 @@ mod tests {
         assert_eq!(tables.pc_to_row.len(), 3); // 2 instructions + CPU padding
         assert!(tables.pc_to_row.contains_key(&0x1000));
         assert!(tables.pc_to_row.contains_key(&0x1004));
-        assert!(tables.pc_to_row.contains_key(&super::super::cpu::CPU_PADDING_PC));
+        assert!(
+            tables
+                .pc_to_row
+                .contains_key(&super::super::cpu::CPU_PADDING_PC)
+        );
     }
 
     #[test]
@@ -489,6 +493,10 @@ mod tests {
 
         // DECODE: only CPU padding entry
         assert_eq!(tables.pc_to_row.len(), 1);
-        assert!(tables.pc_to_row.contains_key(&super::super::cpu::CPU_PADDING_PC));
+        assert!(
+            tables
+                .pc_to_row
+                .contains_key(&super::super::cpu::CPU_PADDING_PC)
+        );
     }
 }

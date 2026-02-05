@@ -783,8 +783,9 @@ fn collect_bitwise_from_page(elf: &Elf, memory_state: &MemoryState) -> Vec<Bitwi
 
                 page_bases.insert(page_base);
 
-                let page_data =
-                    elf_page_data.entry(page_base).or_insert_with(|| vec![0u8; page_size]);
+                let page_data = elf_page_data
+                    .entry(page_base)
+                    .or_insert_with(|| vec![0u8; page_size]);
                 page_data[offset] = byte_value;
             }
         }
@@ -822,10 +823,16 @@ fn collect_bitwise_from_page(elf: &Elf, memory_state: &MemoryState) -> Vec<Bitwi
             let fini = final_state.get(&addr).map_or(init, |state| state.value);
 
             // C1: IS_BYTE[init]
-            bitwise_ops.push(BitwiseOperation::single_byte(BitwiseOperationType::IsByte, init));
+            bitwise_ops.push(BitwiseOperation::single_byte(
+                BitwiseOperationType::IsByte,
+                init,
+            ));
 
             // C2: IS_BYTE[fini]
-            bitwise_ops.push(BitwiseOperation::single_byte(BitwiseOperationType::IsByte, fini));
+            bitwise_ops.push(BitwiseOperation::single_byte(
+                BitwiseOperationType::IsByte,
+                fini,
+            ));
         }
     }
 
@@ -873,7 +880,9 @@ fn generate_page_tables(
                 page_bases.insert(page_base);
 
                 // Store initial values for this page
-                let page_data = elf_page_data.entry(page_base).or_insert_with(|| vec![0u8; page_size]);
+                let page_data = elf_page_data
+                    .entry(page_base)
+                    .or_insert_with(|| vec![0u8; page_size]);
                 page_data[offset] = byte_value;
             }
         }
@@ -897,9 +906,7 @@ fn generate_page_tables(
     let final_state: FinalStateMap = memory_state
         .cells
         .iter()
-        .map(|(&addr, &(value, timestamp))| {
-            (addr, FinalByteState { timestamp, value })
-        })
+        .map(|(&addr, &(value, timestamp))| (addr, FinalByteState { timestamp, value }))
         .collect();
 
     // Generate PAGE tables and configs
@@ -962,7 +969,6 @@ pub struct Traces {
 
     /// HALT single-row table for program termination
     pub halt: TraceTable<GoldilocksField, GoldilocksExtension>,
-
 }
 
 impl Traces {
@@ -1130,7 +1136,6 @@ impl Traces {
 
         // Generate PAGE tables from ELF and final memory state
         let (pages, page_configs) = generate_page_tables(elf, &memory_state);
-
 
         // Generate REGISTER table from final register state
         let register_final_state = register_state.to_final_state_map();

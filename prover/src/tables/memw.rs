@@ -405,12 +405,30 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusId::Memory,
         Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE),
         vec![
-            BusValue::Packed { start_column: cols::IS_REGISTER, packing: Packing::Direct },
-            BusValue::Packed { start_column: cols::BASE_ADDRESS_0, packing: Packing::Direct },
-            BusValue::Packed { start_column: cols::BASE_ADDRESS_1, packing: Packing::Direct },
-            BusValue::Packed { start_column: cols::old_timestamp(0)[0], packing: Packing::Direct },
-            BusValue::Packed { start_column: cols::old_timestamp(0)[1], packing: Packing::Direct },
-            BusValue::Packed { start_column: cols::OLD[0], packing: Packing::Direct },
+            BusValue::Packed {
+                start_column: cols::IS_REGISTER,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::BASE_ADDRESS_0,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::BASE_ADDRESS_1,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::old_timestamp(0)[0],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::old_timestamp(0)[1],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::OLD[0],
+                packing: Packing::Direct,
+            },
         ],
     ));
 
@@ -419,12 +437,30 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusId::Memory,
         Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE),
         vec![
-            BusValue::Packed { start_column: cols::IS_REGISTER, packing: Packing::Direct },
-            BusValue::Packed { start_column: cols::BASE_ADDRESS_0, packing: Packing::Direct },
-            BusValue::Packed { start_column: cols::BASE_ADDRESS_1, packing: Packing::Direct },
-            BusValue::Packed { start_column: cols::TIMESTAMP_0, packing: Packing::Direct },
-            BusValue::Packed { start_column: cols::TIMESTAMP_1, packing: Packing::Direct },
-            BusValue::Packed { start_column: cols::VALUE[0], packing: Packing::Direct },
+            BusValue::Packed {
+                start_column: cols::IS_REGISTER,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::BASE_ADDRESS_0,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::BASE_ADDRESS_1,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::TIMESTAMP_0,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::TIMESTAMP_1,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::VALUE[0],
+                packing: Packing::Direct,
+            },
         ],
     ));
 
@@ -444,17 +480,38 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions.push(BusInteraction::sender(
         BusId::Memory,
         Multiplicity::Linear(vec![
-            LinearTerm::Column { coefficient: 1, column: cols::WRITE2 },
-            LinearTerm::Column { coefficient: 1, column: cols::WRITE4 },
-            LinearTerm::Column { coefficient: 1, column: cols::WRITE8 },
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::WRITE2,
+            },
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::WRITE4,
+            },
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::WRITE8,
+            },
         ]),
         vec![
-            BusValue::Packed { start_column: cols::IS_REGISTER, packing: Packing::Direct },
+            BusValue::Packed {
+                start_column: cols::IS_REGISTER,
+                packing: Packing::Direct,
+            },
             addr_add_0_lo.clone(),
             addr_add_0_hi.clone(),
-            BusValue::Packed { start_column: cols::old_timestamp(1)[0], packing: Packing::Direct },
-            BusValue::Packed { start_column: cols::old_timestamp(1)[1], packing: Packing::Direct },
-            BusValue::Packed { start_column: cols::OLD[1], packing: Packing::Direct },
+            BusValue::Packed {
+                start_column: cols::old_timestamp(1)[0],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::old_timestamp(1)[1],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::OLD[1],
+                packing: Packing::Direct,
+            },
         ],
     ));
 
@@ -462,17 +519,38 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions.push(BusInteraction::receiver(
         BusId::Memory,
         Multiplicity::Linear(vec![
-            LinearTerm::Column { coefficient: 1, column: cols::WRITE2 },
-            LinearTerm::Column { coefficient: 1, column: cols::WRITE4 },
-            LinearTerm::Column { coefficient: 1, column: cols::WRITE8 },
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::WRITE2,
+            },
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::WRITE4,
+            },
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::WRITE8,
+            },
         ]),
         vec![
-            BusValue::Packed { start_column: cols::IS_REGISTER, packing: Packing::Direct },
+            BusValue::Packed {
+                start_column: cols::IS_REGISTER,
+                packing: Packing::Direct,
+            },
             addr_add_0_lo,
             addr_add_0_hi,
-            BusValue::Packed { start_column: cols::TIMESTAMP_0, packing: Packing::Direct },
-            BusValue::Packed { start_column: cols::TIMESTAMP_1, packing: Packing::Direct },
-            BusValue::Packed { start_column: cols::VALUE[1], packing: Packing::Direct },
+            BusValue::Packed {
+                start_column: cols::TIMESTAMP_0,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::TIMESTAMP_1,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::VALUE[1],
+                packing: Packing::Direct,
+            },
         ],
     ));
 
@@ -491,16 +569,34 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         interactions.push(BusInteraction::sender(
             BusId::Memory,
             Multiplicity::Linear(vec![
-                LinearTerm::Column { coefficient: 1, column: cols::WRITE4 },
-                LinearTerm::Column { coefficient: 1, column: cols::WRITE8 },
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::WRITE4,
+                },
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::WRITE8,
+                },
             ]),
             vec![
-                BusValue::Packed { start_column: cols::IS_REGISTER, packing: Packing::Direct },
+                BusValue::Packed {
+                    start_column: cols::IS_REGISTER,
+                    packing: Packing::Direct,
+                },
                 addr_add_lo.clone(),
                 addr_add_hi.clone(),
-                BusValue::Packed { start_column: cols::old_timestamp(i)[0], packing: Packing::Direct },
-                BusValue::Packed { start_column: cols::old_timestamp(i)[1], packing: Packing::Direct },
-                BusValue::Packed { start_column: cols::OLD[i], packing: Packing::Direct },
+                BusValue::Packed {
+                    start_column: cols::old_timestamp(i)[0],
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::old_timestamp(i)[1],
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::OLD[i],
+                    packing: Packing::Direct,
+                },
             ],
         ));
 
@@ -508,16 +604,34 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         interactions.push(BusInteraction::receiver(
             BusId::Memory,
             Multiplicity::Linear(vec![
-                LinearTerm::Column { coefficient: 1, column: cols::WRITE4 },
-                LinearTerm::Column { coefficient: 1, column: cols::WRITE8 },
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::WRITE4,
+                },
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::WRITE8,
+                },
             ]),
             vec![
-                BusValue::Packed { start_column: cols::IS_REGISTER, packing: Packing::Direct },
+                BusValue::Packed {
+                    start_column: cols::IS_REGISTER,
+                    packing: Packing::Direct,
+                },
                 addr_add_lo,
                 addr_add_hi,
-                BusValue::Packed { start_column: cols::TIMESTAMP_0, packing: Packing::Direct },
-                BusValue::Packed { start_column: cols::TIMESTAMP_1, packing: Packing::Direct },
-                BusValue::Packed { start_column: cols::VALUE[i], packing: Packing::Direct },
+                BusValue::Packed {
+                    start_column: cols::TIMESTAMP_0,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::TIMESTAMP_1,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::VALUE[i],
+                    packing: Packing::Direct,
+                },
             ],
         ));
     }
@@ -538,12 +652,24 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             BusId::Memory,
             Multiplicity::Column(cols::WRITE8),
             vec![
-                BusValue::Packed { start_column: cols::IS_REGISTER, packing: Packing::Direct },
+                BusValue::Packed {
+                    start_column: cols::IS_REGISTER,
+                    packing: Packing::Direct,
+                },
                 addr_add_lo.clone(),
                 addr_add_hi.clone(),
-                BusValue::Packed { start_column: cols::old_timestamp(i)[0], packing: Packing::Direct },
-                BusValue::Packed { start_column: cols::old_timestamp(i)[1], packing: Packing::Direct },
-                BusValue::Packed { start_column: cols::OLD[i], packing: Packing::Direct },
+                BusValue::Packed {
+                    start_column: cols::old_timestamp(i)[0],
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::old_timestamp(i)[1],
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::OLD[i],
+                    packing: Packing::Direct,
+                },
             ],
         ));
 
@@ -552,12 +678,24 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             BusId::Memory,
             Multiplicity::Column(cols::WRITE8),
             vec![
-                BusValue::Packed { start_column: cols::IS_REGISTER, packing: Packing::Direct },
+                BusValue::Packed {
+                    start_column: cols::IS_REGISTER,
+                    packing: Packing::Direct,
+                },
                 addr_add_lo,
                 addr_add_hi,
-                BusValue::Packed { start_column: cols::TIMESTAMP_0, packing: Packing::Direct },
-                BusValue::Packed { start_column: cols::TIMESTAMP_1, packing: Packing::Direct },
-                BusValue::Packed { start_column: cols::VALUE[i], packing: Packing::Direct },
+                BusValue::Packed {
+                    start_column: cols::TIMESTAMP_0,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::TIMESTAMP_1,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::VALUE[i],
+                    packing: Packing::Direct,
+                },
             ],
         ));
     }

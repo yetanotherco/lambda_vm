@@ -222,7 +222,10 @@ pub fn bus_interactions(page_base: u64) -> Vec<BusInteraction> {
     // address_hi = page_base_hi (constant, since offset < page_size < 2^32)
     let address_lo = BusValue::linear(vec![
         LinearTerm::Constant(page_base_lo as i64),
-        LinearTerm::Column { coefficient: 1, column: cols::OFFSET },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::OFFSET,
+        },
     ]);
     let address_hi = BusValue::constant(page_base_hi);
 

@@ -36,8 +36,6 @@ use crate::tables::cpu::{
 };
 use crate::tables::decode::{bus_interactions as decode_bus_interactions, cols as decode_cols};
 use crate::tables::halt::{bus_interactions as halt_bus_interactions, cols as halt_cols};
-use crate::tables::page::{bus_interactions as page_bus_interactions, cols as page_cols};
-use crate::tables::register::{bus_interactions as register_bus_interactions, cols as register_cols};
 use crate::tables::load::{
     bus_interactions as load_bus_interactions, cols as load_cols, constraints as load_constraints,
 };
@@ -46,6 +44,10 @@ use crate::tables::memw::{
     bus_interactions as memw_bus_interactions, cols as memw_cols, constraints as memw_constraints,
 };
 use crate::tables::mul::{bus_interactions as mul_bus_interactions, cols as mul_cols};
+use crate::tables::page::{bus_interactions as page_bus_interactions, cols as page_cols};
+use crate::tables::register::{
+    bus_interactions as register_bus_interactions, cols as register_cols,
+};
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
 pub type F = GoldilocksField;

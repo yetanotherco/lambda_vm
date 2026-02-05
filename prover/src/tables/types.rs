@@ -633,7 +633,7 @@ impl DecodeEntry {
                 // Set register indices for reference, but don't mark them as read/written
                 entry.rs1 = 17; // a7 (syscall number)
                 entry.rs2 = 10; // a0 (arg)
-                entry.rd = 10;  // a0 (result)
+                entry.rd = 10; // a0 (result)
                 // Note: read_register1, read_register2, write_register remain false
             }
 

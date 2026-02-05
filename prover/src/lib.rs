@@ -202,8 +202,11 @@ pub fn prove(elf_bytes: &[u8]) -> Result<MultiProof<F, E, ()>, Error> {
     let proof_options = ProofOptions::default_test_options();
     let airs = VmAirs::new(&program, &proof_options, false, &traces.page_configs);
 
-    Prover::multi_prove(airs.air_trace_pairs(&mut traces), &mut DefaultTranscript::<E>::new(&[]))
-        .map_err(|e| Error::Prover(format!("{e:?}")))
+    Prover::multi_prove(
+        airs.air_trace_pairs(&mut traces),
+        &mut DefaultTranscript::<E>::new(&[]),
+    )
+    .map_err(|e| Error::Prover(format!("{e:?}")))
 }
 
 /// Verify a proof produced by [`prove`].
