@@ -12,7 +12,6 @@ pub const PROOF_BUNDLE_VERSION: u32 = 1;
 pub struct ProofMetadata {
     pub version: u32,
     pub elf_hash: [u8; 32],
-    pub num_steps: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -28,7 +27,6 @@ impl ProofBundle {
         multi_proof: MultiProof<GoldilocksField, GoldilocksExtension, ()>,
         proof_options: ProofOptions,
         elf_hash: [u8; 32],
-        num_steps: usize,
     ) -> Self {
         Self {
             multi_proof,
@@ -36,7 +34,6 @@ impl ProofBundle {
             metadata: ProofMetadata {
                 version: PROOF_BUNDLE_VERSION,
                 elf_hash,
-                num_steps,
             },
         }
     }

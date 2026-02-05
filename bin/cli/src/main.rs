@@ -216,13 +216,7 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, security: SecurityPreset) 
         }
     };
 
-    // Re-execute to get step count for bundle metadata
-    let program = Elf::load(&elf_data).unwrap();
-    let executor = Executor::new(&program, vec![]).unwrap();
-    let result = executor.run().unwrap();
-    let num_steps = result.logs.len();
-
-    let bundle = ProofBundle::new(multi_proof, proof_options, elf_hash, num_steps);
+    let bundle = ProofBundle::new(multi_proof, proof_options, elf_hash);
 
     eprintln!("Writing proof bundle...");
     let file = match File::create(&output_path) {
@@ -241,7 +235,6 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, security: SecurityPreset) 
 
     eprintln!("Proof written to {:?}", output_path);
     eprintln!("  ELF hash: {}", truncated_hex(&elf_hash));
-    eprintln!("  Steps: {}", num_steps);
 
     ExitCode::SUCCESS
 }
@@ -294,8 +287,6 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf) -> ExitCode {
     eprintln!("Proof metadata:");
     eprintln!("  Version: {}", bundle.metadata.version);
     eprintln!("  ELF hash: {}", truncated_hex(&bundle.metadata.elf_hash));
-    eprintln!("  Steps: {}", bundle.metadata.num_steps);
-
     eprintln!("Verifying proof...");
     let result =
         match prover::verify_with_options(&bundle.multi_proof, &elf_data, &bundle.proof_options) {
