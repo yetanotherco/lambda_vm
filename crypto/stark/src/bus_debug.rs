@@ -43,12 +43,11 @@ pub struct BusInteractionLog {
     pub fingerprint: String,
 }
 
-/// Global debug tracker - enabled via DEBUG_BUS_TRACKER=1
+/// Global debug tracker - enabled via `debug-checks` feature flag
 pub static BUS_DEBUG_TRACKER: LazyLock<Mutex<BusDebugTracker>> =
     LazyLock::new(|| Mutex::new(BusDebugTracker::new()));
 
 pub struct BusDebugTracker {
-    enabled: bool,
     bus_filter: Option<u64>,
     logs: Vec<BusInteractionLog>,
 }
@@ -61,43 +60,24 @@ impl Default for BusDebugTracker {
 
 impl BusDebugTracker {
     pub fn new() -> Self {
-        let enabled = std::env::var("DEBUG_BUS_TRACKER").is_ok();
         let bus_filter = std::env::var("DEBUG_BUS_ID")
             .ok()
             .and_then(|s| s.parse().ok());
 
-        if enabled {
-            eprintln!(
-                "[BusDebugTracker] Enabled{}",
-                bus_filter
-                    .map(|id| format!(", filtering to bus_id={}", id))
-                    .unwrap_or_default()
-            );
-        }
-
         Self {
-            enabled,
             bus_filter,
             logs: Vec::new(),
         }
     }
 
-    /// Log an interaction (no-op if disabled)
+    /// Log an interaction (optionally filtered by DEBUG_BUS_ID env var)
     pub fn log(&mut self, log: BusInteractionLog) {
-        if !self.enabled {
-            return;
-        }
         if let Some(filter) = self.bus_filter {
             if log.bus_id != filter {
                 return;
             }
         }
         self.logs.push(log);
-    }
-
-    /// Check if tracking is enabled
-    pub fn is_enabled(&self) -> bool {
-        self.enabled
     }
 
     /// Get number of logged interactions
@@ -455,7 +435,6 @@ mod tests {
     #[test]
     fn test_empty_tracker() {
         let tracker = BusDebugTracker {
-            enabled: true,
             bus_filter: None,
             logs: Vec::new(),
         };
@@ -466,7 +445,6 @@ mod tests {
     #[test]
     fn test_balanced_bus() {
         let tracker = BusDebugTracker {
-            enabled: true,
             bus_filter: None,
             logs: vec![
                 BusInteractionLog {
@@ -496,7 +474,6 @@ mod tests {
     #[test]
     fn test_orphan_sender() {
         let tracker = BusDebugTracker {
-            enabled: true,
             bus_filter: None,
             logs: vec![
                 BusInteractionLog {
@@ -520,7 +497,6 @@ mod tests {
     #[test]
     fn test_multiplicity_mismatch() {
         let tracker = BusDebugTracker {
-            enabled: true,
             bus_filter: None,
             logs: vec![
                 BusInteractionLog {

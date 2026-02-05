@@ -18,6 +18,7 @@ use math::{
 #[cfg(feature = "parallel")]
 use rayon::prelude::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
+#[cfg(feature = "debug-checks")]
 use crate::debug::validate_trace;
 use crate::domain::new_domain;
 use crate::fri;
@@ -1275,6 +1276,7 @@ pub trait IsStarkProver<
         // =====================================================================
         // Global Bus Balance Report: Aggregate per-bus sums across all tables
         // =====================================================================
+        #[cfg(feature = "debug-checks")]
         if needs_logup_challenges {
             // Collect all per-bus sums across all tables
             let mut global_bus_sums: HashMap<u64, FieldElement<FieldExtension>> = HashMap::new();
@@ -1359,23 +1361,16 @@ pub trait IsStarkProver<
             }
             eprintln!("=================================\n");
 
-            // Run BusDebugTracker analysis if enabled (runtime via DEBUG_BUS_TRACKER=1)
+            // Run BusDebugTracker mismatch analysis
             {
                 use crate::bus_debug::BUS_DEBUG_TRACKER;
 
                 let tracker = BUS_DEBUG_TRACKER.lock().unwrap();
-                if tracker.is_enabled() && !tracker.is_empty() {
+                if !tracker.is_empty() {
                     eprintln!(
                         "[BusDebugTracker] Logged {} interactions, running analysis...",
                         tracker.len()
                     );
-
-                    // Export raw data
-                    if let Err(e) = tracker.to_csv("bus_interactions.csv") {
-                        eprintln!("[BusDebugTracker] Failed to write CSV: {}", e);
-                    }
-
-                    // Run mismatch analysis
                     let report = tracker.analyze_mismatches();
                     report.print_summary();
                 }
@@ -1433,7 +1428,7 @@ pub trait IsStarkProver<
     {
         info!("Started proof generation...");
 
-        // Always validate constraints (not just debug builds) to catch issues early
+        #[cfg(feature = "debug-checks")]
         validate_trace(
             air,
             pub_inputs,

@@ -736,23 +736,6 @@ where
             }
         }
 
-        // Print per-table bus sums (for debugging bus imbalances)
-        let table_name = self.name.as_deref().unwrap_or("UNKNOWN");
-        for (&bus_id, sum) in &bus_sums {
-            let sender_sum = bus_sender_sums.get(&bus_id);
-            let receiver_sum = bus_receiver_sums.get(&bus_id);
-            let role = match (sender_sum.is_some(), receiver_sum.is_some()) {
-                (true, false) => "SEND",
-                (false, true) => "RECV",
-                (true, true) => "BOTH",
-                _ => "????",
-            };
-            eprintln!(
-                "[{:12}] Bus {:2} ({:10}) [{:4}]: sum = {:?}",
-                table_name, bus_id, bus_name(bus_id), role, sum
-            );
-        }
-
         // Build accumulated column (sums all term columns across rows)
         let acc_col_idx = num_interactions;
         build_accumulated_column(acc_col_idx, num_interactions, trace);
@@ -1144,17 +1127,12 @@ fn build_logup_term_column<F, E>(
 
         let fingerprint = z - &linear_combination;
 
-        // Debug: Log bus interaction for mismatch analysis (runtime-enabled via DEBUG_BUS_TRACKER=1)
+        // Debug: Log bus interaction for mismatch analysis
+        #[cfg(feature = "debug-checks")]
         {
             use crate::bus_debug::{BusInteractionLog, BUS_DEBUG_TRACKER};
 
-            // Check if tracker is enabled before doing any work
-            let should_log = {
-                let tracker = BUS_DEBUG_TRACKER.lock().unwrap();
-                tracker.is_enabled() && !multiplicity.eq(&FieldElement::<F>::zero())
-            };
-
-            if should_log {
+            if !multiplicity.eq(&FieldElement::<F>::zero()) {
                 // Convert multiplicity to u64 for logging
                 // Debug format is "FieldElement { value: X }" - extract X
                 let mult_u64 = {

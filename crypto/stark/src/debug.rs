@@ -24,7 +24,7 @@ pub fn validate_trace<
     domain: &Domain<Field>,
     rap_challenges: &[FieldElement<FieldExtension>],
 ) -> bool {
-    eprintln!("[VALIDATE_TRACE] Starting constraints validation over trace...");
+    info!("Starting constraints validation over trace...");
     let mut ret = true;
 
     let main_trace_columns: Vec<_> = main_trace_polys
@@ -82,7 +82,7 @@ pub fn validate_trace<
 
             if boundary_value.clone().to_extension() != trace_value {
                 ret = false;
-                eprintln!("[VALIDATE_TRACE] Boundary constraint inconsistency - Expected value {boundary_value:?} in step {step} and column {col}, found: {trace_value:?}");
+                error!("Boundary constraint inconsistency - Expected value {boundary_value:?} in step {step} and column {col}, found: {trace_value:?}");
             }
         });
 
@@ -113,13 +113,13 @@ pub fn validate_trace<
             // We don't take into account the transition exemptions.
             if step < exemption_steps[i] && eval != &FieldElement::zero() {
                 ret = false;
-                eprintln!(
-                    "[VALIDATE_TRACE] Inconsistent transition {i} in step {step} - expected 0, got {eval:?}"
+                error!(
+                    "Inconsistent evaluation of transition {i} in step {step} - expected 0, got {eval:?}"
                 );
             }
         })
     }
-    eprintln!("[VALIDATE_TRACE] Constraints validation check ended. valid={ret}");
+    info!("Constraints validation check ended");
     ret
 }
 
