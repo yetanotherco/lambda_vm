@@ -644,3 +644,67 @@ proptest! {
         prop_assert_eq!(canonicalize(result[0]), expected_sum);
     }
 }
+
+// =========================================================================
+// Device and infrastructure tests
+// =========================================================================
+
+use super::device::MetalState;
+use super::fft::{compute_root_of_unity, MAX_FFT_ORDER};
+
+#[test]
+fn test_metal_state_creation() {
+    match MetalState::new() {
+        Ok(state) => {
+            println!("Metal device: {:?}", state.device.name());
+        }
+        Err(MetalError::NoDevice) => {
+            println!("No Metal device available (expected on non-macOS)");
+        }
+        Err(e) => {
+            panic!("Unexpected error: {:?}", e);
+        }
+    }
+}
+
+#[test]
+fn test_metal_fft_small() {
+    match MetalFft::new() {
+        Ok(fft) => {
+            let mut data: Vec<u64> = (0..4).collect();
+            match fft.fft_natural_order(&mut data) {
+                Ok(()) => {
+                    assert_eq!(data[0], 6, "Sum should be preserved");
+                }
+                Err(e) => panic!("FFT failed: {:?}", e),
+            }
+        }
+        Err(MetalError::NoDevice) => {
+            println!("Skipping test: no Metal device available");
+        }
+        Err(e) => panic!("Unexpected error: {:?}", e),
+    }
+}
+
+#[test]
+fn test_compute_root_of_unity() {
+    let order = 10u64;
+    let root = compute_root_of_unity(order);
+
+    let mut result = root;
+    for _ in 0..order {
+        result = goldilocks_square(result);
+    }
+
+    if result >= GOLDILOCKS_PRIME {
+        result -= GOLDILOCKS_PRIME;
+    }
+
+    assert_eq!(result, 1);
+}
+
+#[test]
+fn test_fft_order_validation() {
+    let order = 33u64;
+    assert!(order > MAX_FFT_ORDER);
+}

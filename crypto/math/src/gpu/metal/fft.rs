@@ -18,7 +18,7 @@ use metal::{Buffer, MTLCommandBufferStatus, MTLSize};
 const GOLDILOCKS_TWO_ADIC_ROOT: u64 = 1753635133440165772;
 
 /// Maximum FFT order supported by Goldilocks field (2-adic order = 32)
-const MAX_FFT_ORDER: u64 = 32;
+pub(crate) const MAX_FFT_ORDER: u64 = 32;
 
 /// Metal-accelerated Bowers FFT for Goldilocks field
 pub struct MetalFft {
@@ -583,7 +583,7 @@ impl MetalFft {
 }
 
 /// Compute primitive root of unity for order (FFT size = 2^order)
-fn compute_root_of_unity(order: u64) -> u64 {
+pub(crate) fn compute_root_of_unity(order: u64) -> u64 {
     // Start with the 2^32-th root and square down to the desired order
     let mut root = GOLDILOCKS_TWO_ADIC_ROOT;
     for _ in order..32 {
@@ -642,7 +642,7 @@ fn wait_and_check_completion(command_buffer: &metal::CommandBufferRef) -> Result
 }
 
 /// Square in Goldilocks field (CPU helper for root computation)
-fn goldilocks_square(a: u64) -> u64 {
+pub(crate) fn goldilocks_square(a: u64) -> u64 {
     let product = (a as u128) * (a as u128);
     goldilocks_reduce128(product)
 }
@@ -682,63 +682,9 @@ pub fn metal_fft(input: &mut [FieldElement<GoldilocksField>]) -> Result<(), Meta
     metal_fft.fft_natural_order(&mut data)?;
 
     // Copy back to FieldElements
-    for (i, &val) in data.iter().enumerate() {
-        input[i] = FieldElement::from(val);
+    for (dest, &val) in input.iter_mut().zip(data.iter()) {
+        *dest = FieldElement::from(val);
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_metal_fft_small() {
-        match MetalFft::new() {
-            Ok(fft) => {
-                let mut data: Vec<u64> = (0..4).collect();
-                match fft.fft_natural_order(&mut data) {
-                    Ok(()) => {
-                        println!("FFT result: {:?}", data);
-                        // Sum should be preserved (first element after FFT)
-                        // For [0, 1, 2, 3], sum = 6
-                        assert_eq!(data[0], 6);
-                    }
-                    Err(e) => panic!("FFT failed: {:?}", e),
-                }
-            }
-            Err(MetalError::NoDevice) => {
-                println!("Skipping test: no Metal device available");
-            }
-            Err(e) => panic!("Unexpected error: {:?}", e),
-        }
-    }
-
-    #[test]
-    fn test_compute_root_of_unity() {
-        // Test that root^(2^order) = 1
-        let order = 10u64;
-        let root = compute_root_of_unity(order);
-
-        let mut result = root;
-        for _ in 0..order {
-            result = goldilocks_square(result);
-        }
-
-        // Canonicalize
-        const GOLDILOCKS_PRIME: u64 = 0xFFFF_FFFF_0000_0001;
-        if result >= GOLDILOCKS_PRIME {
-            result -= GOLDILOCKS_PRIME;
-        }
-
-        assert_eq!(result, 1);
-    }
-
-    #[test]
-    fn test_fft_order_validation() {
-        // This test validates the order check without actually needing Metal
-        let order = 33u64;
-        assert!(order > MAX_FFT_ORDER);
-    }
 }

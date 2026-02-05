@@ -202,24 +202,3 @@ impl Clone for MetalContext {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_metal_state_creation() {
-        // This test will fail on non-macOS or systems without Metal
-        match MetalState::new() {
-            Ok(state) => {
-                println!("Metal device: {:?}", state.device.name());
-            }
-            Err(MetalError::NoDevice) => {
-                println!("No Metal device available (expected on non-macOS)");
-            }
-            Err(e) => {
-                panic!("Unexpected error: {:?}", e);
-            }
-        }
-    }
-}

@@ -26,6 +26,9 @@ pub mod cpu;
 #[cfg(feature = "metal")]
 pub mod metal;
 
+#[cfg(all(test, feature = "alloc"))]
+mod tests;
+
 #[cfg(feature = "alloc")]
 pub use cpu::CpuFft;
 
@@ -111,45 +114,5 @@ impl Fft<GoldilocksField> for BackendChoice {
             BackendChoice::Metal(m) => m.batch_ifft(data, poly_len),
             BackendChoice::Cpu(c) => c.batch_ifft(data, poly_len),
         }
-    }
-}
-
-#[cfg(all(test, feature = "alloc"))]
-mod tests {
-    use super::*;
-    use crate::field::element::FieldElement;
-
-    type FE = FieldElement<GoldilocksField>;
-
-    #[test]
-    fn test_goldilocks_backend_fft_roundtrip() {
-        let backend = goldilocks_backend();
-        let original: alloc::vec::Vec<FE> = (1..=8).map(|i| FE::from(i as u64)).collect();
-
-        let mut data = original.clone();
-        backend.fft(&mut data).expect("FFT failed");
-        backend.ifft(&mut data).expect("IFFT failed");
-
-        assert_eq!(data, original, "FFT/IFFT roundtrip failed");
-    }
-
-    #[test]
-    fn test_goldilocks_backend_batch_fft() {
-        let backend = goldilocks_backend();
-        let poly_len = 4;
-        let num_polys = 2;
-        let original: alloc::vec::Vec<FE> = (1..=(poly_len * num_polys) as u64)
-            .map(FE::from)
-            .collect();
-
-        let mut data = original.clone();
-        backend
-            .batch_fft(&mut data, poly_len)
-            .expect("Batch FFT failed");
-        backend
-            .batch_ifft(&mut data, poly_len)
-            .expect("Batch IFFT failed");
-
-        assert_eq!(data, original, "Batch FFT/IFFT roundtrip failed");
     }
 }
