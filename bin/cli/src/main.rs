@@ -284,7 +284,8 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // Verify ELF hash matches proof metadata
+    // Detect wrong ELF early with a clear error message.
+    // The cryptographic binding happens inside verify_with_options via the DECODE table.
     let elf_hash: [u8; 32] = Sha3_256::digest(&elf_data).into();
     if elf_hash != bundle.metadata.elf_hash {
         eprintln!("ELF hash mismatch: the proof was generated for a different program");
