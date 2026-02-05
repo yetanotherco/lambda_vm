@@ -647,7 +647,7 @@ prefix = "M"
 [[constraints.mem]]
 kind = "interaction"
 tag = "MEMW"
-input = [1, ["*", 2, "rs1"], "rv1", ["+", "timestamp", 0], 1, 0, 0]
+input = [1, ["*", 2, "rs1"], "rv1", ["+", "timestamp", ["cast", 0, "DWordWL"]], 1, 0, 0]
 output = "rv1"
 multiplicity = "read_register1"
 
@@ -661,7 +661,7 @@ iter = ["i", 0, 2]
 [[constraints.mem]]
 kind = "interaction"
 tag = "MEMW"
-input = [1, ["*", 2, "rs2"], "rv2", ["+", "timestamp", 1], 1, 0, 0]
+input = [1, ["*", 2, "rs2"], "rv2", ["+", "timestamp", ["cast", 1, "DWordWL"]], 1, 0, 0]
 output = "rv2"
 multiplicity = "read_register2"
 
@@ -675,13 +675,13 @@ iter = ["i", 0, 2]
 [[constraints.mem]]
 kind = "interaction"
 tag = "MEMW"
-input = [1, ["*", 2, "rd"], "rvd", ["+", "timestamp", 2], 1, 0, 0]
+input = [1, ["*", 2, "rd"], "rvd", ["+", "timestamp", ["cast", 2, "DWordWL"]], 1, 0, 0]
 multiplicity = "write_register"
 
 [[constraints.mem]]
 kind = "interaction"
 tag = "LOAD"
-input = [0, "res", ["+", "timestamp", 0], "memory_2bytes", "memory_4bytes", "memory_8bytes", "signed"]
+input = [0, "res", ["+", "timestamp", ["cast", 0, "DWordWL"]], "memory_2bytes", "memory_4bytes", "memory_8bytes", "signed"]
 output = "rvd"
 multiplicity = "LOAD"
 
@@ -689,14 +689,14 @@ multiplicity = "LOAD"
 [[constraints.mem]]
 kind = "interaction"
 tag = "MEMW"
-input = [0, "res", "rv2", ["+", "timestamp", 1], "memory_2bytes", "memory_4bytes", "memory_8bytes"]
+input = [0, "res", "rv2", ["+", "timestamp", ["cast", 1, "DWordWL"]], "memory_2bytes", "memory_4bytes", "memory_8bytes"]
 multiplicity = "STORE"
 
 # TODO: no types available, so no casting yet
 [[constraints.mem]]
 kind = "interaction"
 tag = "MEMW"
-input = [1, ["*", 2, 255], "next_pc", ["+", "timestamp", 1], 1, 0, 0]
+input = [1, ["*", 2, 255], "next_pc", ["+", "timestamp", ["cast", 1, "DWordWL"]], 1, 0, 0]
 output = "pc"
 multiplicity = ["not", "pad"]
 
