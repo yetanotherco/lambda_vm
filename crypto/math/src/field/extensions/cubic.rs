@@ -30,9 +30,9 @@ where
 {
     #[cfg(feature = "alloc")]
     fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
-        let mut byte_slice = ByteConversion::to_bytes_be(self[2].value());
+        let mut byte_slice = ByteConversion::to_bytes_be(self[0].value());
         byte_slice.extend(ByteConversion::to_bytes_be(self[1].value()));
-        byte_slice.extend(ByteConversion::to_bytes_be(self[0].value()));
+        byte_slice.extend(ByteConversion::to_bytes_be(self[2].value()));
         byte_slice
     }
 
@@ -48,26 +48,13 @@ where
     where
         Self: Sized,
     {
-        // Each field element takes 1/3 of the input bytes
-        // Reject empty arrays and arrays not divisible by 3
         if bytes.is_empty() || !bytes.len().is_multiple_of(3) {
             return Err(crate::errors::ByteConversionError::FromBEBytesError);
         }
         let elem_size = bytes.len() / 3;
-        // Use checked arithmetic to prevent overflow and verify exact length
-        let end1 = elem_size
-            .checked_mul(2)
-            .ok_or(crate::errors::ByteConversionError::FromBEBytesError)?;
-        let end2 = elem_size
-            .checked_mul(3)
-            .ok_or(crate::errors::ByteConversionError::FromBEBytesError)?;
-        // Verify we consume exactly all bytes (defensive check)
-        if end2 != bytes.len() {
-            return Err(crate::errors::ByteConversionError::FromBEBytesError);
-        }
-        let v2 = F::BaseType::from_bytes_be(&bytes[0..elem_size])?;
-        let v1 = F::BaseType::from_bytes_be(&bytes[elem_size..end1])?;
-        let v0 = F::BaseType::from_bytes_be(&bytes[end1..end2])?;
+        let v0 = F::BaseType::from_bytes_be(&bytes[0..elem_size])?;
+        let v1 = F::BaseType::from_bytes_be(&bytes[elem_size..elem_size * 2])?;
+        let v2 = F::BaseType::from_bytes_be(&bytes[elem_size * 2..])?;
         Ok([
             FieldElement::from_raw(v0),
             FieldElement::from_raw(v1),
@@ -79,26 +66,13 @@ where
     where
         Self: Sized,
     {
-        // Each field element takes 1/3 of the input bytes
-        // Reject empty arrays and arrays not divisible by 3
         if bytes.is_empty() || !bytes.len().is_multiple_of(3) {
             return Err(crate::errors::ByteConversionError::FromLEBytesError);
         }
         let elem_size = bytes.len() / 3;
-        // Use checked arithmetic to prevent overflow and verify exact length
-        let end1 = elem_size
-            .checked_mul(2)
-            .ok_or(crate::errors::ByteConversionError::FromLEBytesError)?;
-        let end2 = elem_size
-            .checked_mul(3)
-            .ok_or(crate::errors::ByteConversionError::FromLEBytesError)?;
-        // Verify we consume exactly all bytes (defensive check)
-        if end2 != bytes.len() {
-            return Err(crate::errors::ByteConversionError::FromLEBytesError);
-        }
         let v0 = F::BaseType::from_bytes_le(&bytes[0..elem_size])?;
-        let v1 = F::BaseType::from_bytes_le(&bytes[elem_size..end1])?;
-        let v2 = F::BaseType::from_bytes_le(&bytes[end1..end2])?;
+        let v1 = F::BaseType::from_bytes_le(&bytes[elem_size..elem_size * 2])?;
+        let v2 = F::BaseType::from_bytes_le(&bytes[elem_size * 2..])?;
         Ok([
             FieldElement::from_raw(v0),
             FieldElement::from_raw(v1),
