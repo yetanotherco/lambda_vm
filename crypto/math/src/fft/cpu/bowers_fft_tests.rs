@@ -205,6 +205,256 @@ fn test_bowers_fft_non_power_of_two() {
 }
 
 // =========================================================================
+// IFFT tests
+// =========================================================================
+
+/// Naive O(n²) inverse DFT for correctness verification
+pub fn naive_idft(input: &[FE]) -> Vec<FE> {
+    let n = input.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let root = F::get_primitive_root_of_unity(n.trailing_zeros() as u64).unwrap();
+    let inv_root = root.inv().unwrap();
+    let n_inv = FE::from(n as u64).inv().unwrap();
+    let mut result = vec![FE::zero(); n];
+
+    for (k, res) in result.iter_mut().enumerate() {
+        for (j, inp) in input.iter().enumerate() {
+            *res = &*res + &(inp * &inv_root.pow((j * k) as u64));
+        }
+        // Scale by 1/n
+        *res = &*res * &n_inv;
+    }
+
+    result
+}
+
+#[test]
+fn test_bowers_ifft_basic() {
+    // FFT of [1, 2, 3, 4] then IFFT should give back [1, 2, 3, 4]
+    let input: Vec<FE> = (1..=4).map(|i| FE::from(i as u64)).collect();
+    let order = 2u64;
+    let n = input.len();
+
+    // Forward twiddles for FFT
+    let fwd_twiddles = LayerTwiddles::<F>::new(order).unwrap();
+    // Inverse twiddles for IFFT
+    let inv_twiddles = LayerTwiddles::<F>::new_inverse(order).unwrap();
+
+    // FFT
+    let mut fft_result = input.clone();
+    bowers_fft_opt_fused(&mut fft_result, &fwd_twiddles).unwrap();
+    in_place_bit_reverse_permute(&mut fft_result);
+
+    // IFFT (bit-reverse first, then IFFT)
+    in_place_bit_reverse_permute(&mut fft_result);
+    bowers_ifft_opt(&mut fft_result, &inv_twiddles).unwrap();
+
+    // Scale by 1/n
+    let n_inv = FE::from(n as u64).inv().unwrap();
+    for val in fft_result.iter_mut() {
+        *val = &*val * &n_inv;
+    }
+
+    assert_eq!(fft_result, input);
+}
+
+#[test]
+fn test_bowers_fft_ifft_roundtrip_small() {
+    for order in 1..=4u64 {
+        let n = 1 << order;
+        let input: Vec<FE> = (0..n).map(|i| FE::from(i as u64)).collect();
+
+        let fwd_twiddles = LayerTwiddles::<F>::new(order).unwrap();
+        let inv_twiddles = LayerTwiddles::<F>::new_inverse(order).unwrap();
+
+        // FFT
+        let mut result = input.clone();
+        bowers_fft_opt_fused(&mut result, &fwd_twiddles).unwrap();
+        in_place_bit_reverse_permute(&mut result);
+
+        // IFFT
+        in_place_bit_reverse_permute(&mut result);
+        bowers_ifft_opt(&mut result, &inv_twiddles).unwrap();
+
+        // Scale by 1/n
+        let n_inv = FE::from(n as u64).inv().unwrap();
+        for val in result.iter_mut() {
+            *val = &*val * &n_inv;
+        }
+
+        assert_eq!(result, input, "Roundtrip failed for order {}", order);
+    }
+}
+
+#[test]
+fn test_bowers_fft_ifft_roundtrip_medium() {
+    for order in 5..=8u64 {
+        let n = 1 << order;
+        let input: Vec<FE> = (0..n).map(|i| FE::from(i as u64)).collect();
+
+        let fwd_twiddles = LayerTwiddles::<F>::new(order).unwrap();
+        let inv_twiddles = LayerTwiddles::<F>::new_inverse(order).unwrap();
+
+        // FFT -> IFFT roundtrip
+        let mut result = input.clone();
+        bowers_fft_opt_fused(&mut result, &fwd_twiddles).unwrap();
+        in_place_bit_reverse_permute(&mut result);
+
+        in_place_bit_reverse_permute(&mut result);
+        bowers_ifft_opt(&mut result, &inv_twiddles).unwrap();
+
+        // Scale by 1/n
+        let n_inv = FE::from(n as u64).inv().unwrap();
+        for val in result.iter_mut() {
+            *val = &*val * &n_inv;
+        }
+
+        assert_eq!(
+            result, input,
+            "FFT->IFFT roundtrip failed for order {}",
+            order
+        );
+    }
+}
+
+#[test]
+fn test_bowers_ifft_fft_roundtrip() {
+    // Test IFFT -> FFT roundtrip (reverse order)
+    // This verifies that FFT(IFFT(x)) = x (with proper scaling and permutations)
+    for order in 2..=6u64 {
+        let n = 1 << order;
+        let input: Vec<FE> = (0..n).map(|i| FE::from(i as u64)).collect();
+
+        let fwd_twiddles = LayerTwiddles::<F>::new(order).unwrap();
+        let inv_twiddles = LayerTwiddles::<F>::new_inverse(order).unwrap();
+
+        // For IFFT -> FFT roundtrip, we treat input as frequency-domain values.
+        // IFFT: bit-reverse input, apply inverse butterflies
+        let mut result = input.clone();
+        in_place_bit_reverse_permute(&mut result);
+        bowers_ifft_opt(&mut result, &inv_twiddles).unwrap();
+
+        // FFT: apply forward butterflies, bit-reverse output
+        bowers_fft_opt_fused(&mut result, &fwd_twiddles).unwrap();
+        in_place_bit_reverse_permute(&mut result);
+
+        // The FFT and IFFT should cancel out (both contribute n factor, so we need 1/n)
+        let n_inv = FE::from(n as u64).inv().unwrap();
+        for val in result.iter_mut() {
+            *val = &*val * &n_inv;
+        }
+
+        assert_eq!(
+            result, input,
+            "IFFT->FFT roundtrip failed for order {}",
+            order
+        );
+    }
+}
+
+#[test]
+fn test_bowers_ifft_matches_naive() {
+    // Compare Bowers IFFT against naive IDFT
+    for order in 2..=6u64 {
+        let n = 1 << order;
+        // Start with FFT output (evaluations)
+        let input: Vec<FE> = (0..n).map(|i| FE::from(i as u64)).collect();
+        let fwd_twiddles = LayerTwiddles::<F>::new(order).unwrap();
+
+        let mut evals = input.clone();
+        bowers_fft_opt_fused(&mut evals, &fwd_twiddles).unwrap();
+        in_place_bit_reverse_permute(&mut evals);
+
+        // Naive IDFT
+        let expected = naive_idft(&evals);
+
+        // Bowers IFFT
+        let inv_twiddles = LayerTwiddles::<F>::new_inverse(order).unwrap();
+        let mut result = evals;
+        in_place_bit_reverse_permute(&mut result);
+        bowers_ifft_opt(&mut result, &inv_twiddles).unwrap();
+
+        // Scale by 1/n
+        let n_inv = FE::from(n as u64).inv().unwrap();
+        for val in result.iter_mut() {
+            *val = &*val * &n_inv;
+        }
+
+        assert_eq!(
+            result, expected,
+            "IFFT differs from naive IDFT for order {}",
+            order
+        );
+    }
+}
+
+#[test]
+fn test_layer_twiddles_inverse_creation() {
+    let order = 4u64;
+    let inv_twiddles = LayerTwiddles::<F>::new_inverse(order).unwrap();
+
+    assert_eq!(inv_twiddles.layers.len(), 4);
+    assert_eq!(inv_twiddles.layers[0].len(), 8);
+    assert_eq!(inv_twiddles.layers[1].len(), 4);
+    assert_eq!(inv_twiddles.layers[2].len(), 2);
+    assert_eq!(inv_twiddles.layers[3].len(), 1);
+
+    // First twiddle of each layer should still be 1
+    for layer in &inv_twiddles.layers {
+        assert_eq!(layer[0], FE::one());
+    }
+}
+
+#[test]
+fn test_fft_ifft_roundtrip_edge_cases() {
+    let order = 6u64;
+    let n = 1 << order;
+
+    let fwd_twiddles = LayerTwiddles::<F>::new(order).unwrap();
+    let inv_twiddles = LayerTwiddles::<F>::new_inverse(order).unwrap();
+    let n_inv = FE::from(n as u64).inv().unwrap();
+
+    // All zeros
+    let zeros: Vec<FE> = vec![FE::zero(); n];
+    let mut result = zeros.clone();
+    bowers_fft_opt_fused(&mut result, &fwd_twiddles).unwrap();
+    in_place_bit_reverse_permute(&mut result);
+    in_place_bit_reverse_permute(&mut result);
+    bowers_ifft_opt(&mut result, &inv_twiddles).unwrap();
+    for val in result.iter_mut() {
+        *val = &*val * &n_inv;
+    }
+    assert_eq!(result, zeros, "Roundtrip failed for all zeros");
+
+    // All ones
+    let ones: Vec<FE> = vec![FE::one(); n];
+    let mut result = ones.clone();
+    bowers_fft_opt_fused(&mut result, &fwd_twiddles).unwrap();
+    in_place_bit_reverse_permute(&mut result);
+    in_place_bit_reverse_permute(&mut result);
+    bowers_ifft_opt(&mut result, &inv_twiddles).unwrap();
+    for val in result.iter_mut() {
+        *val = &*val * &n_inv;
+    }
+    assert_eq!(result, ones, "Roundtrip failed for all ones");
+
+    // Single non-zero element
+    let mut sparse = vec![FE::zero(); n];
+    sparse[0] = FE::from(42u64);
+    let mut result = sparse.clone();
+    bowers_fft_opt_fused(&mut result, &fwd_twiddles).unwrap();
+    in_place_bit_reverse_permute(&mut result);
+    in_place_bit_reverse_permute(&mut result);
+    bowers_ifft_opt(&mut result, &inv_twiddles).unwrap();
+    for val in result.iter_mut() {
+        *val = &*val * &n_inv;
+    }
+    assert_eq!(result, sparse, "Roundtrip failed for sparse input");
+}
+
+// =========================================================================
 // Bowers vs Native FFT comparison tests
 // =========================================================================
 

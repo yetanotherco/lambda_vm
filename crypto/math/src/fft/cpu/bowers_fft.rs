@@ -449,6 +449,61 @@ impl<F: IsFFTField> LayerTwiddles<F> {
         Some(Self { layers })
     }
 
+    /// Compute layer-specific twiddles from the **inverse** primitive root of unity.
+    ///
+    /// This is used for the inverse FFT (IFFT). The inverse twiddles are computed
+    /// from w^(-1) where w is the primitive root of unity.
+    ///
+    /// # Errors
+    /// Returns `None` if:
+    /// - `order` exceeds the maximum supported value (would cause integer overflow)
+    /// - The field doesn't have a primitive root of unity for the given order
+    ///
+    /// # Example
+    /// ```ignore
+    /// let inv_twiddles = LayerTwiddles::<GoldilocksField>::new_inverse(10)
+    ///     .expect("Failed to create inverse twiddles for order 10");
+    /// ```
+    pub fn new_inverse(order: u64) -> Option<Self> {
+        // Check for potential integer overflow
+        if order > MAX_FFT_ORDER {
+            return None;
+        }
+
+        let n = 1usize << order;
+        let root = F::get_primitive_root_of_unity(order).ok()?;
+        // Use the inverse root for IFFT
+        // SAFETY: Primitive roots of unity are non-zero field elements,
+        // so inversion always succeeds. Convert Result to Option for consistency
+        // with the return type.
+        let inv_root = root.inv().ok()?;
+
+        let mut layers = Vec::with_capacity(order as usize);
+
+        for layer in 0..order as usize {
+            debug_assert!(
+                layer < usize::BITS as usize,
+                "Layer index exceeds shift limit"
+            );
+
+            let stride = 1usize << layer;
+            let count = n >> (layer + 1);
+
+            let mut layer_twiddles = Vec::with_capacity(count);
+            let w_stride = inv_root.pow(stride as u64);
+            let mut current = FieldElement::<F>::one();
+
+            for _ in 0..count {
+                layer_twiddles.push(current.clone());
+                current = &current * &w_stride;
+            }
+
+            layers.push(layer_twiddles);
+        }
+
+        Some(Self { layers })
+    }
+
     /// Get the twiddles for a specific layer.
     ///
     /// # Panics
