@@ -5,18 +5,17 @@
 //!
 //! # Usage
 //!
-//! Enable tracking with environment variables:
+//! Enable via the `debug-checks` Cargo feature flag:
 //! ```bash
 //! # Track all buses
-//! DEBUG_BUS_TRACKER=1 cargo test --release test_name -- --nocapture
+//! cargo test --release --features debug-checks test_name -- --nocapture
 //!
-//! # Track specific bus only
-//! DEBUG_BUS_TRACKER=1 DEBUG_BUS_ID=14 cargo test ...
+//! # Track specific bus only (optional runtime filter)
+//! DEBUG_BUS_ID=14 cargo test --release --features debug-checks test_name -- --nocapture
 //! ```
 //!
 //! # Output
 //!
-//! - `bus_interactions.csv` - Raw data for custom analysis
 //! - stderr - Mismatch report summary
 
 use std::collections::HashMap;
