@@ -58,9 +58,9 @@ Returns exit code 0 on successful verification, 1 on failure.
 
 The proof bundle (`.cbor` file) contains:
 
-- **multi_proof**: The STARK multi-proof for all VM tables (CPU, Bitwise, LT, MEMW, LOAD)
+- **multi_proof**: The STARK multi-proof for all VM tables (CPU, Bitwise, LT, MEMW, LOAD, DECODE, MUL, BRANCH, HALT)
 - **proof_options**: The proof parameters used for generation (needed for verification)
-- **metadata**: Version, ELF hash (SHA3-256), and number of execution steps
+- **metadata**: Version and ELF hash (SHA3-256)
 
 The bundle is serialized using CBOR (Concise Binary Object Representation) for compact storage.
 

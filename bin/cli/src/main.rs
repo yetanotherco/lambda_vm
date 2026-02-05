@@ -3,7 +3,7 @@
 mod proof_bundle;
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -226,10 +226,15 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, security: SecurityPreset) 
             return ExitCode::FAILURE;
         }
     };
-    let writer = BufWriter::new(file);
+    let mut writer = BufWriter::new(file);
 
-    if let Err(e) = ciborium::into_writer(&bundle, writer) {
+    if let Err(e) = ciborium::into_writer(&bundle, &mut writer) {
         eprintln!("Failed to serialize proof bundle: {}", e);
+        return ExitCode::FAILURE;
+    }
+
+    if let Err(e) = writer.flush() {
+        eprintln!("Failed to flush proof bundle: {}", e);
         return ExitCode::FAILURE;
     }
 
