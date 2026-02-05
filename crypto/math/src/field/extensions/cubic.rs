@@ -30,9 +30,9 @@ where
 {
     #[cfg(feature = "alloc")]
     fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
-        let mut byte_slice = ByteConversion::to_bytes_be(self[0].value());
+        let mut byte_slice = ByteConversion::to_bytes_be(self[2].value());
         byte_slice.extend(ByteConversion::to_bytes_be(self[1].value()));
-        byte_slice.extend(ByteConversion::to_bytes_be(self[2].value()));
+        byte_slice.extend(ByteConversion::to_bytes_be(self[0].value()));
         byte_slice
     }
 
@@ -52,9 +52,9 @@ where
             return Err(crate::errors::ByteConversionError::FromBEBytesError);
         }
         let elem_size = bytes.len() / 3;
-        let v0 = F::BaseType::from_bytes_be(&bytes[0..elem_size])?;
+        let v2 = F::BaseType::from_bytes_be(&bytes[0..elem_size])?;
         let v1 = F::BaseType::from_bytes_be(&bytes[elem_size..elem_size * 2])?;
-        let v2 = F::BaseType::from_bytes_be(&bytes[elem_size * 2..])?;
+        let v0 = F::BaseType::from_bytes_be(&bytes[elem_size * 2..])?;
         Ok([
             FieldElement::from_raw(v0),
             FieldElement::from_raw(v1),
