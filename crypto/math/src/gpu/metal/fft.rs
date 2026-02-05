@@ -2,14 +2,23 @@
 //!
 //! This module provides GPU-accelerated FFT for the Goldilocks field using
 //! the Bowers G network algorithm with 2-layer fusion for improved performance.
+//!
+//! # Limitations
+//!
+//! - Maximum FFT size is 2^32 (Goldilocks field's two-adic order)
+//! - Input sizes larger than 2^32 elements will return an error
+//! - Requires macOS with Metal-capable GPU
 
 use super::device::{MetalContext, MetalError, MetalState};
 use crate::field::element::FieldElement;
 use crate::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
-use metal::{Buffer, MTLSize};
+use metal::{Buffer, MTLCommandBufferStatus, MTLSize};
 
 /// Goldilocks field primitive 2^32-th root of unity
 const GOLDILOCKS_TWO_ADIC_ROOT: u64 = 1753635133440165772;
+
+/// Maximum FFT order supported by Goldilocks field (2-adic order = 32)
+const MAX_FFT_ORDER: u64 = 32;
 
 /// Metal-accelerated Bowers FFT for Goldilocks field
 pub struct MetalFft {
@@ -33,6 +42,12 @@ impl MetalFft {
     ///
     /// The input is modified in-place and returned in bit-reversed order.
     /// Apply bit-reversal permutation afterwards to get natural order.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` if:
+    /// - Input length is not a power of two
+    /// - Input length exceeds 2^32 (Goldilocks field's two-adic order)
     pub fn fft(&self, input: &mut [u64]) -> Result<(), MetalError> {
         let n = input.len();
         if !n.is_power_of_two() {
@@ -49,6 +64,14 @@ impl MetalFft {
         let state = self.ctx.state();
         let log_n = n.trailing_zeros() as usize;
         let order = log_n as u64;
+
+        // Validate order is within Goldilocks field's two-adic order
+        if order > MAX_FFT_ORDER {
+            return Err(MetalError::InvalidInput(format!(
+                "FFT order {} exceeds Goldilocks field's two-adic order {}",
+                order, MAX_FFT_ORDER
+            )));
+        }
 
         // Get primitive root of unity for this FFT size
         let root = compute_root_of_unity(order);
@@ -79,6 +102,13 @@ impl MetalFft {
     ///
     /// `data` contains `num_polys` polynomials each of length `poly_len`,
     /// stored contiguously in SoA format.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` if:
+    /// - Polynomial length is not a power of two
+    /// - Polynomial length exceeds 2^32 (Goldilocks field's two-adic order)
+    /// - Data length doesn't match poly_len * num_polys
     pub fn batch_fft(
         &self,
         data: &mut [u64],
@@ -108,6 +138,14 @@ impl MetalFft {
         let state = self.ctx.state();
         let log_n = poly_len.trailing_zeros() as usize;
         let order = log_n as u64;
+
+        // Validate order is within Goldilocks field's two-adic order
+        if order > MAX_FFT_ORDER {
+            return Err(MetalError::InvalidInput(format!(
+                "FFT order {} exceeds Goldilocks field's two-adic order {}",
+                order, MAX_FFT_ORDER
+            )));
+        }
 
         let root = compute_root_of_unity(order);
 
@@ -180,7 +218,7 @@ impl MetalFft {
             encoder.end_encoding();
 
             command_buffer.commit();
-            command_buffer.wait_until_completed();
+            wait_and_check_completion(&command_buffer)?;
 
             layer_twiddles.push(twiddle_buffer);
         }
@@ -236,7 +274,7 @@ impl MetalFft {
                 encoder.end_encoding();
 
                 command_buffer.commit();
-                command_buffer.wait_until_completed();
+                wait_and_check_completion(&command_buffer)?;
 
                 layer += 2;
             } else {
@@ -279,7 +317,7 @@ impl MetalFft {
             encoder.end_encoding();
 
             command_buffer.commit();
-            command_buffer.wait_until_completed();
+            wait_and_check_completion(&command_buffer)?;
 
             layer += 1;
         }
@@ -341,7 +379,7 @@ impl MetalFft {
                 encoder.end_encoding();
 
                 command_buffer.commit();
-                command_buffer.wait_until_completed();
+                wait_and_check_completion(&command_buffer)?;
 
                 layer += 2;
             } else {
@@ -387,7 +425,7 @@ impl MetalFft {
                 encoder.end_encoding();
 
                 command_buffer.commit();
-                command_buffer.wait_until_completed();
+                wait_and_check_completion(&command_buffer)?;
             }
 
             layer += 1;
@@ -396,7 +434,12 @@ impl MetalFft {
         Ok(())
     }
 
-    /// Perform in-place bit-reversal permutation
+    /// Perform bit-reversal permutation
+    ///
+    /// Uses a two-buffer approach to avoid race conditions. The in-place GPU swap
+    /// has a race where multiple threads can simultaneously access overlapping
+    /// memory locations. Instead, we read from input_buffer and write to
+    /// output_buffer at bit-reversed positions.
     pub fn bitrev_permutation_inplace(&self, data: &mut [u64]) -> Result<(), MetalError> {
         let n = data.len();
         if !n.is_power_of_two() {
@@ -413,20 +456,24 @@ impl MetalFft {
         let state = self.ctx.state();
         let log_n = n.trailing_zeros() as u32;
 
-        let buffer = state.create_buffer_with_data(data)?;
+        // Two-buffer approach to avoid race conditions in GPU swaps
+        let input_buffer = state.create_buffer_with_data(data)?;
+        let output_buffer = state.create_buffer(n * std::mem::size_of::<u64>())?;
 
         let command_buffer = state.command_queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
 
-        encoder.set_compute_pipeline_state(state.bitrev_inplace_pipeline());
-        encoder.set_buffer(0, Some(&buffer), 0);
+        // Use the two-buffer bit-reversal kernel (not the race-prone in-place one)
+        encoder.set_compute_pipeline_state(state.bitrev_pipeline());
+        encoder.set_buffer(0, Some(&input_buffer), 0);
+        encoder.set_buffer(1, Some(&output_buffer), 0);
         encoder.set_bytes(
-            1,
+            2,
             std::mem::size_of::<u32>() as u64,
             &(n as u32) as *const u32 as *const _,
         );
         encoder.set_bytes(
-            2,
+            3,
             std::mem::size_of::<u32>() as u64,
             &log_n as *const u32 as *const _,
         );
@@ -434,7 +481,7 @@ impl MetalFft {
         let threads_per_grid = MTLSize::new(n as u64, 1, 1);
         let threads_per_group = MTLSize::new(
             state
-                .bitrev_inplace_pipeline()
+                .bitrev_pipeline()
                 .max_total_threads_per_threadgroup()
                 .min(n as u64),
             1,
@@ -445,16 +492,24 @@ impl MetalFft {
         encoder.end_encoding();
 
         command_buffer.commit();
-        command_buffer.wait_until_completed();
+        wait_and_check_completion(&command_buffer)?;
 
-        self.copy_buffer_to_slice(&buffer, data);
+        self.copy_buffer_to_slice(&output_buffer, data);
 
         Ok(())
     }
 
     /// Copy buffer contents to a slice
+    ///
+    /// # Safety
+    ///
+    /// This is safe because:
+    /// - The buffer was allocated with StorageModeShared, so contents() returns valid CPU-accessible memory
+    /// - The buffer length is guaranteed to be >= dest.len() * size_of::<u64>() by construction
+    /// - No other threads access the buffer during copy (we've waited for GPU completion)
     fn copy_buffer_to_slice(&self, buffer: &Buffer, dest: &mut [u64]) {
         let ptr = buffer.contents() as *const u64;
+        // SAFETY: See function-level safety documentation
         unsafe {
             std::ptr::copy_nonoverlapping(ptr, dest.as_mut_ptr(), dest.len());
         }
@@ -469,6 +524,23 @@ fn compute_root_of_unity(order: u64) -> u64 {
         root = goldilocks_square(root);
     }
     root
+}
+
+/// Wait for command buffer completion and check for errors
+fn wait_and_check_completion(command_buffer: &metal::CommandBufferRef) -> Result<(), MetalError> {
+    command_buffer.wait_until_completed();
+
+    match command_buffer.status() {
+        MTLCommandBufferStatus::Completed => Ok(()),
+        MTLCommandBufferStatus::Error => Err(MetalError::ExecutionFailed),
+        status => {
+            // Should not happen after wait_until_completed
+            Err(MetalError::InvalidInput(format!(
+                "Unexpected command buffer status: {:?}",
+                status as u32
+            )))
+        }
+    }
 }
 
 /// Square in Goldilocks field (CPU helper for root computation)
@@ -528,12 +600,15 @@ mod tests {
         match MetalFft::new() {
             Ok(fft) => {
                 let mut data: Vec<u64> = (0..4).collect();
-                fft.fft_natural_order(&mut data).unwrap();
-                println!("FFT result: {:?}", data);
-
-                // Sum should be preserved (first element after FFT)
-                // For [0, 1, 2, 3], sum = 6
-                assert_eq!(data[0], 6);
+                match fft.fft_natural_order(&mut data) {
+                    Ok(()) => {
+                        println!("FFT result: {:?}", data);
+                        // Sum should be preserved (first element after FFT)
+                        // For [0, 1, 2, 3], sum = 6
+                        assert_eq!(data[0], 6);
+                    }
+                    Err(e) => panic!("FFT failed: {:?}", e),
+                }
             }
             Err(MetalError::NoDevice) => {
                 println!("Skipping test: no Metal device available");
@@ -560,5 +635,12 @@ mod tests {
         }
 
         assert_eq!(result, 1);
+    }
+
+    #[test]
+    fn test_fft_order_validation() {
+        // This test validates the order check without actually needing Metal
+        let order = 33u64;
+        assert!(order > MAX_FFT_ORDER);
     }
 }

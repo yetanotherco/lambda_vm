@@ -27,6 +27,8 @@
 
 pub mod device;
 pub mod fft;
+#[cfg(all(test, feature = "alloc"))]
+mod fft_tests;
 
 pub use device::{MetalContext, MetalError, MetalState};
 pub use fft::{MetalFft, metal_fft};
