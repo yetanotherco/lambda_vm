@@ -214,21 +214,17 @@ pub fn generate_page_trace(
 ///
 /// * `page_base` - The base address for this page (constant per table instance)
 pub fn bus_interactions(page_base: u64) -> Vec<BusInteraction> {
-    // Split page_base into lo/hi words for bus signature
-    let page_lo = (page_base & 0xFFFF_FFFF) as i64;
-    let page_hi = (page_base >> 32) as u64;
+    // Split page_base into lo/hi 32-bit parts
+    let page_base_lo = (page_base & 0xFFFF_FFFF) as u64;
+    let page_base_hi = (page_base >> 32) as u64;
 
-    // Virtual address computation:
-    // address_lo = page_lo + offset (linear combination)
-    // address_hi = page_hi (constant, since offset < page_size and page is aligned)
+    // Address computation: address_lo = page_base_lo + offset (linear combination)
+    // address_hi = page_base_hi (constant, since offset < page_size < 2^32)
     let address_lo = BusValue::linear(vec![
-        LinearTerm::Constant(page_lo),
-        LinearTerm::Column {
-            coefficient: 1,
-            column: cols::OFFSET,
-        },
+        LinearTerm::Constant(page_base_lo as i64),
+        LinearTerm::Column { coefficient: 1, column: cols::OFFSET },
     ]);
-    let address_hi = BusValue::constant(page_hi);
+    let address_hi = BusValue::constant(page_base_hi);
 
     vec![
         // PAGE-C1: IS_BYTE[init] - range check initial value
@@ -256,9 +252,9 @@ pub fn bus_interactions(page_base: u64) -> Vec<BusInteraction> {
             vec![
                 // is_register = 0
                 BusValue::constant(0),
-                // address_lo = page_lo + offset
+                // address_lo = page_base_lo + offset
                 address_lo.clone(),
-                // address_hi = page_hi
+                // address_hi = page_base_hi
                 address_hi.clone(),
                 // timestamp_lo = 0 (initial)
                 BusValue::constant(0),
@@ -278,9 +274,9 @@ pub fn bus_interactions(page_base: u64) -> Vec<BusInteraction> {
             vec![
                 // is_register = 0
                 BusValue::constant(0),
-                // address_lo = page_lo + offset
+                // address_lo = page_base_lo + offset
                 address_lo,
-                // address_hi = page_hi
+                // address_hi = page_base_hi
                 address_hi,
                 // timestamp_lo (final)
                 BusValue::Packed {

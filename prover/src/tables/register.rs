@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
+use super::page::STACK_TOP;
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 
 // =========================================================================
@@ -109,8 +110,17 @@ pub fn generate_register_trace(
         // Offset (row index = Word address in register space)
         data[base + cols::OFFSET] = FE::from(offset as u64);
 
-        // Initial value: all registers start at 0
-        let init_value = 0u32;
+        // Initial value: all registers start at 0, except SP (x2) which starts at STACK_TOP
+        // Register x2 (SP) uses Word addresses 4 (lo) and 5 (hi)
+        let init_value = if offset == 4 {
+            // SP low word: STACK_TOP & 0xFFFFFFFF
+            (STACK_TOP & 0xFFFF_FFFF) as u32
+        } else if offset == 5 {
+            // SP high word: STACK_TOP >> 32
+            (STACK_TOP >> 32) as u32
+        } else {
+            0u32
+        };
         data[base + cols::INIT] = FE::from(init_value as u64);
 
         // Final state: if accessed use final, otherwise use initial

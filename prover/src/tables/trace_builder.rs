@@ -130,10 +130,10 @@ struct RegisterState {
 
 impl RegisterState {
     fn new() -> Self {
-        Self {
-            // All registers start at (0, 0) - value 0 at timestamp 0
-            regs: [(0, 0); 32],
-        }
+        let mut regs = [(0u64, 0u64); 32];
+        // SP (x2) starts at STACK_TOP
+        regs[2] = (page::STACK_TOP, 0);
+        Self { regs }
     }
 
     /// Read a register. Returns (value, last_write_timestamp).
@@ -713,11 +713,16 @@ fn collect_bitwise_from_page(elf: &Elf, memory_state: &MemoryState) -> Vec<Bitwi
         }
     }
 
-    // Add stack pages (same as in generate_page_tables)
+    // Add stack pages covering from STACK_TOP down to stack_bottom
+    // (same as in generate_page_tables)
     let stack_size = 4096u64;
     let stack_bottom = page::STACK_TOP - stack_size;
-    let stack_page_base = page::page_base_for_address(stack_bottom, page_size);
-    page_bases.insert(stack_page_base);
+    let stack_top_page = page::page_base_for_address(page::STACK_TOP, page_size);
+    page_bases.insert(stack_top_page);
+    let stack_bottom_page = page::page_base_for_address(stack_bottom, page_size);
+    if stack_bottom_page != stack_top_page {
+        page_bases.insert(stack_bottom_page);
+    }
 
     // Build final state map from memory_state
     let final_state: FinalStateMap = memory_state
@@ -748,6 +753,309 @@ fn collect_bitwise_from_page(elf: &Elf, memory_state: &MemoryState) -> Vec<Bitwi
     }
 
     bitwise_ops
+}
+
+// =============================================================================
+// Memory Coverage Debug
+// =============================================================================
+
+/// Debug function to verify memory bus token balance.
+/// Traces MEMW operations and compares with PAGE table expected values.
+fn debug_memory_coverage(
+    memw_ops: &[MemwOperation],
+    page_configs: &[PageConfig],
+    memory_state: &MemoryState,
+    elf: &Elf,
+) {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    // Build ELF init data map (address -> init_value)
+    let mut elf_init: HashMap<u64, u8> = HashMap::new();
+    for segment in &elf.data {
+        for (i, &word) in segment.values.iter().enumerate() {
+            let word_addr = segment.base_addr + (i as u64 * 4);
+            for byte_offset in 0..4u64 {
+                let byte_addr = word_addr + byte_offset;
+                let byte_value = ((word >> (byte_offset * 8)) & 0xFF) as u8;
+                elf_init.insert(byte_addr, byte_value);
+            }
+        }
+    }
+
+    // Track per-address: first access (old_ts, old_val) and last access (ts, val)
+    #[derive(Debug, Default)]
+    struct AddrInfo {
+        first_old_ts: u64,
+        first_old_val: u64,
+        last_ts: u64,
+        last_val: u64,
+        access_count: u32,
+    }
+    let mut addr_info: BTreeMap<u64, AddrInfo> = BTreeMap::new();
+
+    // Process MEMW operations to find first and last access per byte address
+    for op in memw_ops {
+        if op.is_register {
+            continue; // Skip registers
+        }
+        for i in 0..op.width as usize {
+            let addr = op.base_address + i as u64;
+            let entry = addr_info.entry(addr).or_default();
+            if entry.access_count == 0 {
+                // First access
+                entry.first_old_ts = op.old_timestamp[i];
+                entry.first_old_val = op.old[i];
+            }
+            // Always update last access
+            entry.last_ts = op.timestamp;
+            entry.last_val = op.value[i];
+            entry.access_count += 1;
+        }
+    }
+
+    eprintln!("=== Memory Token Debug ===");
+
+    // First, print the ENTIRE memory_state to see what PAGE tables will use
+    eprintln!("\n=== memory_state contents (what PAGE uses for final values) ===");
+    let mut mem_entries: Vec<_> = memory_state.cells.iter().collect();
+    mem_entries.sort_by_key(|(addr, _)| *addr);
+    for (addr, (value, timestamp)) in &mem_entries {
+        eprintln!("  addr=0x{:016x}: final_val={}, final_ts={}", addr, value, timestamp);
+    }
+    eprintln!("memory_state total entries: {}", mem_entries.len());
+    eprintln!("=== end memory_state ===\n");
+
+    eprintln!("MEMW memory addresses accessed: {}", addr_info.len());
+
+    // Count MEMW memory operations and bytes
+    let mut memw_mem_ops = 0;
+    let mut memw_mem_bytes = 0;
+    for op in memw_ops {
+        if !op.is_register {
+            memw_mem_ops += 1;
+            memw_mem_bytes += op.width as usize;
+            eprintln!("  MEMW mem op: addr=0x{:016x} width={} ts={} is_read={}",
+                op.base_address, op.width, op.timestamp, op.is_read);
+            for i in 0..op.width as usize {
+                eprintln!("    byte[{}]: old_ts={} old_val={} new_val={}",
+                    i, op.old_timestamp[i], op.old[i], op.value[i]);
+            }
+        }
+    }
+    eprintln!("MEMW memory ops: {}, total bytes: {}", memw_mem_ops, memw_mem_bytes);
+
+    // Also show MEMW register operations
+    eprintln!("\n=== MEMW Register Operations ===");
+    let mut memw_reg_ops = 0;
+    for op in memw_ops {
+        if op.is_register {
+            memw_reg_ops += 1;
+            eprintln!("  MEMW reg op: addr={} width={} ts={} is_read={}",
+                op.base_address, op.width, op.timestamp, op.is_read);
+            for i in 0..op.width as usize {
+                // For registers, old[i] and value[i] are 32-bit words
+                eprintln!("    word[{}]: old_ts={} old_val=0x{:08x} new_val=0x{:08x}",
+                    i, op.old_timestamp[i], op.old[i] as u32, op.value[i] as u32);
+            }
+        }
+    }
+    eprintln!("MEMW register ops: {}", memw_reg_ops);
+
+    // Check SP (register x2): should have init=STACK_TOP
+    eprintln!("\n=== SP Init Check ===");
+    eprintln!("Expected SP init: 0x{:016x}", page::STACK_TOP);
+    // Find first access to SP (address 4 for low word, 5 for high word)
+    let sp_lo_addr = register::register_base_address(2);  // x2 = SP
+    let sp_hi_addr = sp_lo_addr + 1;
+    for op in memw_ops {
+        if op.is_register && op.base_address == sp_lo_addr {
+            let sp_old = (op.old[0] as u64) | ((op.old[1] as u64) << 32);
+            eprintln!("First SP access: old_val=0x{:016x} (lo=0x{:08x}, hi=0x{:08x})",
+                sp_old, op.old[0] as u32, op.old[1] as u32);
+            if sp_old != page::STACK_TOP {
+                eprintln!("!!! SP INIT MISMATCH! Expected 0x{:016x}, got 0x{:016x}",
+                    page::STACK_TOP, sp_old);
+            }
+            break;
+        }
+    }
+    eprintln!("=== End SP Check ===\n");
+
+    // Check register token balance for t0 (x5, addresses 10-11)
+    eprintln!("=== Register Token Debug (t0/x5) ===");
+    let t0_addr = register::register_base_address(5);  // x5 = t0
+    eprintln!("t0 addresses: {} (lo), {} (hi)", t0_addr, t0_addr + 1);
+    eprintln!("Expected init: 0x00000000");
+
+    // Find all MEMW accesses to t0
+    let mut t0_ops: Vec<_> = memw_ops.iter()
+        .filter(|op| op.is_register && op.base_address == t0_addr)
+        .collect();
+    eprintln!("t0 MEMW ops: {}", t0_ops.len());
+    for op in &t0_ops {
+        eprintln!("  ts={} is_read={} old_ts={} old_val_lo=0x{:08x} val_lo=0x{:08x}",
+            op.timestamp, op.is_read, op.old_timestamp[0], op.old[0] as u32, op.value[0] as u32);
+    }
+
+    // What should REGISTER table have?
+    // REG-C1 receives: (1, 10, 0, 0, 0), (1, 11, 0, 0, 0)
+    // REG-C2 sends: (1, 10, final_ts, 0, final_val_lo), (1, 11, final_ts, 0, final_val_hi)
+    // First MEMW should send: (1, 10, 0, 0, 0), (1, 11, 0, 0, 0) to cancel REG-C1
+    // Last MEMW should receive: (1, 10, final_ts, 0, final_val_lo) to cancel REG-C2
+    if let Some(first) = t0_ops.first() {
+        eprintln!("First t0 access: old_ts={} old_val=0x{:08x}", first.old_timestamp[0], first.old[0] as u32);
+        if first.old_timestamp[0] != 0 || first.old[0] != 0 {
+            eprintln!("!!! FIRST ACCESS MISMATCH! Expected old_ts=0, old_val=0");
+        }
+    }
+    if let Some(last) = t0_ops.last() {
+        eprintln!("Last t0 access: ts={} val=0x{:08x}", last.timestamp, last.value[0] as u32);
+    }
+    eprintln!("=== End Register Token Debug ===\n");
+
+    // Count PAGE table bytes
+    let total_page_bytes: usize = page_configs.iter().map(|c| c.page_size).sum();
+    eprintln!("PAGE total bytes: {}", total_page_bytes);
+
+    // Check each address
+    let mut mismatches = Vec::new();
+    for (&addr, info) in &addr_info {
+        // Expected init value from ELF (or 0)
+        let expected_init = elf_init.get(&addr).copied().unwrap_or(0) as u64;
+
+        // Expected final value/timestamp from memory_state
+        let (expected_final_val, expected_final_ts) = memory_state
+            .cells
+            .get(&addr)
+            .map(|&(val, ts)| (val as u64, ts))
+            .unwrap_or((expected_init, 0));
+
+        // Check init: MEMW first old should match PAGE init (ts=0, val=init)
+        let init_ts_ok = info.first_old_ts == 0;
+        let init_val_ok = info.first_old_val == expected_init;
+
+        // Check fini: MEMW last should match PAGE fini
+        let fini_ts_ok = info.last_ts == expected_final_ts;
+        let fini_val_ok = info.last_val == expected_final_val;
+
+        if !init_ts_ok || !init_val_ok || !fini_ts_ok || !fini_val_ok {
+            mismatches.push((
+                addr,
+                info,
+                expected_init,
+                expected_final_val,
+                expected_final_ts,
+                init_ts_ok,
+                init_val_ok,
+                fini_ts_ok,
+                fini_val_ok,
+            ));
+        }
+    }
+
+    if mismatches.is_empty() {
+        eprintln!("All token values match ✓");
+    } else {
+        eprintln!("TOKEN MISMATCHES ({}):", mismatches.len());
+        for (addr, info, exp_init, exp_fini_val, exp_fini_ts, init_ts_ok, init_val_ok, fini_ts_ok, fini_val_ok) in &mismatches {
+            eprintln!("  addr=0x{:016x}:", addr);
+            eprintln!("    MEMW first: old_ts={}, old_val={}", info.first_old_ts, info.first_old_val);
+            eprintln!("    PAGE init:  ts=0, val={}", exp_init);
+            if !init_ts_ok { eprintln!("      ^ init_ts MISMATCH!"); }
+            if !init_val_ok { eprintln!("      ^ init_val MISMATCH!"); }
+            eprintln!("    MEMW last:  ts={}, val={}", info.last_ts, info.last_val);
+            eprintln!("    PAGE fini:  ts={}, val={}", exp_fini_ts, exp_fini_val);
+            if !fini_ts_ok { eprintln!("      ^ fini_ts MISMATCH!"); }
+            if !fini_val_ok { eprintln!("      ^ fini_val MISMATCH!"); }
+        }
+    }
+
+    // Also show page coverage
+    let mem_addrs: BTreeSet<u64> = addr_info.keys().copied().collect();
+    let mut uncovered = Vec::new();
+    for &addr in &mem_addrs {
+        let covered = page_configs.iter().any(|cfg| {
+            addr >= cfg.page_base && (addr - cfg.page_base) < cfg.page_size as u64
+        });
+        if !covered {
+            uncovered.push(addr);
+        }
+    }
+
+    if !uncovered.is_empty() {
+        eprintln!("UNCOVERED addresses ({}):", uncovered.len());
+        for addr in uncovered.iter().take(20) {
+            eprintln!("  0x{:016x}", addr);
+        }
+    } else {
+        eprintln!("All memory addresses covered by PAGE tables ✓");
+    }
+
+    eprintln!("PAGE tables ({}):", page_configs.len());
+    for cfg in page_configs {
+        eprintln!("  0x{:016x} - 0x{:016x} (size={})",
+            cfg.page_base, cfg.page_base.wrapping_add(cfg.page_size as u64 - 1), cfg.page_size);
+    }
+
+    // Detailed signature comparison for first accessed address
+    if let Some((&addr, info)) = addr_info.iter().next() {
+        eprintln!("\n=== Signature Comparison for addr=0x{:016x} ===", addr);
+
+        // Compute what PAGE would use
+        let page_base = page_configs.iter()
+            .find(|cfg| addr >= cfg.page_base && (addr - cfg.page_base) < cfg.page_size as u64)
+            .map(|cfg| cfg.page_base)
+            .unwrap_or(0);
+        let offset = addr - page_base;
+        let page_base_lo = (page_base & 0xFFFF_FFFF) as u64;
+        let page_base_hi = (page_base >> 32) as u64;
+
+        // Expected init from ELF
+        let expected_init = elf_init.get(&addr).copied().unwrap_or(0);
+
+        // Expected final from memory_state
+        let (expected_final_val, expected_final_ts) = memory_state
+            .cells
+            .get(&addr)
+            .map(|&(val, ts)| (val as u64, ts))
+            .unwrap_or((expected_init as u64, 0));
+
+        eprintln!("PAGE C3 (recv init):");
+        eprintln!("  is_reg=0, addr_lo={} (base_lo {} + offset {}), addr_hi={}, ts=0, val={}",
+            page_base_lo + offset, page_base_lo, offset, page_base_hi, expected_init);
+
+        eprintln!("PAGE C4 (send fini):");
+        eprintln!("  is_reg=0, addr_lo={}, addr_hi={}, ts_lo={}, ts_hi={}, val={}",
+            page_base_lo + offset, page_base_hi,
+            expected_final_ts & 0xFFFF_FFFF, expected_final_ts >> 32, expected_final_val);
+
+        eprintln!("MEMW first access (send old):");
+        eprintln!("  is_reg=0, addr_lo={}, addr_hi={}, old_ts_lo={}, old_ts_hi={}, old_val={}",
+            addr & 0xFFFF_FFFF, addr >> 32,
+            info.first_old_ts & 0xFFFF_FFFF, info.first_old_ts >> 32, info.first_old_val);
+
+        eprintln!("MEMW last access (recv new):");
+        eprintln!("  is_reg=0, addr_lo={}, addr_hi={}, ts_lo={}, ts_hi={}, val={}",
+            addr & 0xFFFF_FFFF, addr >> 32,
+            info.last_ts & 0xFFFF_FFFF, info.last_ts >> 32, info.last_val);
+
+        // Check if addr_lo matches
+        let page_addr_lo = page_base_lo + offset;
+        let memw_addr_lo = addr & 0xFFFF_FFFF;
+        if page_addr_lo != memw_addr_lo {
+            eprintln!("!!! ADDR_LO MISMATCH: PAGE={}, MEMW={}", page_addr_lo, memw_addr_lo);
+        }
+        eprintln!("=== End Signature Comparison ===");
+    }
+
+    eprintln!("=== End Memory Token Debug ===");
+
+    // Count expected IsByte operations from PAGE tables
+    eprintln!("\n=== IsByte Bus Debug ===");
+    let total_page_bytes: usize = page_configs.iter().map(|c| c.page_size).sum();
+    let expected_isbyte_sends = total_page_bytes * 2;  // C1 (init) + C2 (fini) per byte
+    eprintln!("PAGE IsByte sends expected: {} (from {} bytes × 2)", expected_isbyte_sends, total_page_bytes);
+    eprintln!("=== End IsByte Debug ===");
 }
 
 // =============================================================================
@@ -797,12 +1105,19 @@ fn generate_page_tables(
         }
     }
 
-    // Add stack pages (use a default stack size)
+    // Add stack pages covering from STACK_TOP down to stack_bottom
+    // Stack grows downward from STACK_TOP, so we need pages for both ends
     // TODO: Make this configurable via MemoryInitConfig
     let stack_size = 4096u64; // 1 page for now
     let stack_bottom = page::STACK_TOP - stack_size;
-    let stack_page_base = page::page_base_for_address(stack_bottom, page_size);
-    page_bases.insert(stack_page_base);
+    // Add page containing STACK_TOP (where SP starts and first accesses happen)
+    let stack_top_page = page::page_base_for_address(page::STACK_TOP, page_size);
+    page_bases.insert(stack_top_page);
+    // Also add page containing stack_bottom (in case stack grows that far)
+    let stack_bottom_page = page::page_base_for_address(stack_bottom, page_size);
+    if stack_bottom_page != stack_top_page {
+        page_bases.insert(stack_bottom_page);
+    }
 
     // Build final state map from memory_state
     let final_state: FinalStateMap = memory_state
@@ -937,7 +1252,11 @@ impl Traces {
         bitwise_ops.extend(collect_bitwise_from_memw(&memw_ops));
         bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
         // PAGE tables do IS_BYTE lookups for init and fini values (C1, C2)
+        let before_page = bitwise_ops.len();
         bitwise_ops.extend(collect_bitwise_from_page(elf, &memory_state));
+        let after_page = bitwise_ops.len();
+        let page_isbyte_ops = after_page - before_page;
+        eprintln!("collect_bitwise_from_page added {} IsByte operations", page_isbyte_ops);
 
         // =====================================================================
         // PHASE 5: Generate final traces
@@ -972,6 +1291,9 @@ impl Traces {
 
         // Generate PAGE tables from ELF and final memory state
         let (pages, page_configs) = generate_page_tables(elf, &memory_state);
+
+        // Debug: Check memory coverage and token values
+        debug_memory_coverage(&memw_ops, &page_configs, &memory_state, elf);
 
         // Generate REGISTER table from final register state
         let register_final_state = register_state.to_final_state_map();

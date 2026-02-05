@@ -863,10 +863,10 @@ fn test_prove_elfs_test_xor_8() {
 
 #[test]
 fn test_prove_elfs_test_lb_lh_8() {
-    let (_elf, logs, instructions) = run_asm_elf("test_lb_lh_8");
-    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone()).unwrap();
+    let (elf, logs, _instructions) = run_asm_elf("test_lb_lh_8");
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
     assert!(
-        prove_and_verify_vm_minimal(
+        prove_and_verify_vm_with_pages(
             &mut traces.cpu,
             &mut traces.bitwise,
             &mut traces.lt,
@@ -875,7 +875,9 @@ fn test_prove_elfs_test_lb_lh_8() {
             &mut traces.decode,
             &mut traces.branch,
             &mut traces.halt,
-            &mut traces.register
+            &mut traces.register,
+            &mut traces.pages,
+            &traces.page_configs,
         ),
         "test_lb_lh_8 failed"
     );
@@ -883,11 +885,81 @@ fn test_prove_elfs_test_lb_lh_8() {
 
 #[test]
 fn test_prove_elfs_test_sb_sh_8() {
-    let (_elf, logs, instructions) = run_asm_elf("test_sb_sh_8");
-    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone()).unwrap();
-    // Using traces from Traces::from_logs() which includes MEMW LT ops
+    let (elf, logs, _instructions) = run_asm_elf("test_sb_sh_8");
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
+
+    // DEBUG: Count Memw bus sender/receiver operations
+    use crate::tables::cpu::cols as cpu_cols;
+    use crate::tables::memw::cols as memw_cols;
+    use crate::tables::load::cols as load_cols;
+
+    // CPU sends to Memw bus: M1 (read_reg1), M3 (read_reg2), M5 (write_reg), M7 (store)
+    let mut cpu_memw_sends: u64 = 0;
+    for row in 0..traces.cpu.num_rows() {
+        let read_reg1 = traces.cpu.main_table.get(row, cpu_cols::READ_REGISTER1).to_raw();
+        let read_reg2 = traces.cpu.main_table.get(row, cpu_cols::READ_REGISTER2).to_raw();
+        let write_reg = traces.cpu.main_table.get(row, cpu_cols::WRITE_REGISTER).to_raw();
+        let store = traces.cpu.main_table.get(row, cpu_cols::STORE).to_raw();
+        cpu_memw_sends += read_reg1 + read_reg2 + write_reg + store;
+    }
+
+    // LOAD sends to Memw bus with multiplicity MU
+    let mut load_memw_sends: u64 = 0;
+    for row in 0..traces.load.num_rows() {
+        let mu = traces.load.main_table.get(row, load_cols::MU).to_raw();
+        load_memw_sends += mu;
+    }
+
+    // MEMW receives from Memw bus with MU_READ + MU_WRITE
+    let mut memw_receives: u64 = 0;
+    for row in 0..traces.memw.num_rows() {
+        let mu_read = traces.memw.main_table.get(row, memw_cols::MU_READ).to_raw();
+        let mu_write = traces.memw.main_table.get(row, memw_cols::MU_WRITE).to_raw();
+        memw_receives += mu_read + mu_write;
+    }
+
+    // Break down by READ vs WRITE signature
+    let mut cpu_read_sends: u64 = 0;
+    let mut cpu_write_sends: u64 = 0;
+    for row in 0..traces.cpu.num_rows() {
+        let read_reg1 = traces.cpu.main_table.get(row, cpu_cols::READ_REGISTER1).to_raw();
+        let read_reg2 = traces.cpu.main_table.get(row, cpu_cols::READ_REGISTER2).to_raw();
+        let write_reg = traces.cpu.main_table.get(row, cpu_cols::WRITE_REGISTER).to_raw();
+        let store = traces.cpu.main_table.get(row, cpu_cols::STORE).to_raw();
+        cpu_read_sends += read_reg1 + read_reg2;
+        cpu_write_sends += write_reg + store;
+    }
+
+    // MEMW read/write receives
+    let mut memw_read_receives: u64 = 0;
+    let mut memw_write_receives: u64 = 0;
+    for row in 0..traces.memw.num_rows() {
+        let mu_read = traces.memw.main_table.get(row, memw_cols::MU_READ).to_raw();
+        let mu_write = traces.memw.main_table.get(row, memw_cols::MU_WRITE).to_raw();
+        memw_read_receives += mu_read;
+        memw_write_receives += mu_write;
+    }
+
+    println!("\n=== MEMW BUS (14) BALANCE DEBUG ===");
+    println!("READ signature ([old,is_reg,addr,val,ts,flags]):");
+    println!("  CPU read sends: {} (read_reg1 + read_reg2)", cpu_read_sends);
+    println!("  LOAD sends: {} (MU)", load_memw_sends);
+    println!("  MEMW READ receives: {}", memw_read_receives);
+    println!("  READ balance: {} (should be 0)", (cpu_read_sends + load_memw_sends) as i64 - memw_read_receives as i64);
+    println!("");
+    println!("WRITE signature ([is_reg,addr,val,ts,flags]):");
+    println!("  CPU write sends: {} (write_reg + store)", cpu_write_sends);
+    println!("  MEMW WRITE receives: {}", memw_write_receives);
+    println!("  WRITE balance: {} (should be 0)", cpu_write_sends as i64 - memw_write_receives as i64);
+    println!("");
+    println!("TOTAL:");
+    println!("  All sends: {}", cpu_memw_sends + load_memw_sends);
+    println!("  All receives: {}", memw_receives);
+    println!("  Difference: {} (should be 0)", (cpu_memw_sends + load_memw_sends) as i64 - memw_receives as i64);
+    println!("=== END MEMW BUS DEBUG ===\n");
+
     assert!(
-        prove_and_verify_vm_minimal(
+        prove_and_verify_vm_with_pages(
             &mut traces.cpu,
             &mut traces.bitwise,
             &mut traces.lt,
@@ -896,7 +968,9 @@ fn test_prove_elfs_test_sb_sh_8() {
             &mut traces.decode,
             &mut traces.branch,
             &mut traces.halt,
-            &mut traces.register
+            &mut traces.register,
+            &mut traces.pages,
+            &traces.page_configs,
         ),
         "test_sb_sh_8 failed"
     );
@@ -934,11 +1008,10 @@ fn test_prove_elfs_all_branches_16() {
 
 #[test]
 fn test_prove_elfs_all_loadstore_32() {
-    let (_elf, logs, instructions) = run_asm_elf("all_loadstore_32");
-    // Use full Traces to get real MEMW and LOAD traces
-    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone()).unwrap();
+    let (elf, logs, _instructions) = run_asm_elf("all_loadstore_32");
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
     assert!(
-        prove_and_verify_vm_minimal(
+        prove_and_verify_vm_with_pages(
             &mut traces.cpu,
             &mut traces.bitwise,
             &mut traces.lt,
@@ -947,7 +1020,9 @@ fn test_prove_elfs_all_loadstore_32() {
             &mut traces.decode,
             &mut traces.branch,
             &mut traces.halt,
-            &mut traces.register
+            &mut traces.register,
+            &mut traces.pages,
+            &traces.page_configs,
         ),
         "all_loadstore_32 failed"
     );
@@ -1003,9 +1078,9 @@ fn test_prove_elfs_all_instructions_64() {
 fn test_prove_elfs_all_instructions_64_full() {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let (elf, logs, instructions) = run_asm_elf("all_instructions_64");
-    // Use FULL bitwise table (2^20 rows) - this is the comprehensive test
-    let mut traces = Traces::from_logs(&logs, instructions.clone()).unwrap();
+    let (elf, logs, _instructions) = run_asm_elf("all_instructions_64");
+    // Use from_elf_and_logs to include PAGE tables for Memory bus
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
 
     println!(
         "all_instructions_64_full: CPU {} rows, Bitwise {} rows (FULL)",
@@ -1013,7 +1088,7 @@ fn test_prove_elfs_all_instructions_64_full() {
     );
 
     assert!(
-        prove_and_verify_vm(
+        prove_and_verify_vm_with_pages(
             &mut traces.cpu,
             &mut traces.bitwise,
             &mut traces.lt,
@@ -1022,7 +1097,9 @@ fn test_prove_elfs_all_instructions_64_full() {
             &mut traces.decode,
             &mut traces.branch,
             &mut traces.halt,
-            &elf,
+            &mut traces.register,
+            &mut traces.pages,
+            &traces.page_configs,
         ),
         "all_instructions_64_full failed - comprehensive test with full bitwise table"
     );
@@ -1269,4 +1346,348 @@ fn test_debug_memory_bus_tokens() {
     }
     println!("After REGISTER: total_sum = {}", total_sum);
     println!("Bus {} (should be ~0 if balanced)", if total_sum.abs() < 1e-10 { "BALANCES" } else { "DOES NOT BALANCE" });
+}
+
+/// Debug test to trace ALL Memory bus tokens (registers + memory).
+/// This helps identify mismatches in the full Memory bus.
+#[test]
+fn test_debug_memory_tokens_sb_sh() {
+    use crate::tables::memw::cols as memw_cols;
+    use crate::tables::page::cols as page_cols;
+    use crate::tables::register::cols as reg_cols;
+    use std::collections::HashMap;
+
+    let (elf, logs, _instructions) = run_asm_elf("test_sb_sh_8");
+    let traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
+
+    println!("DEBUG: test_sb_sh_8 Memory bus tokens (FULL)");
+    println!("  MEMW rows: {}", traces.memw.num_rows());
+    println!("  REGISTER rows: {}", traces.register.num_rows());
+    println!("  PAGE tables: {}", traces.pages.len());
+
+    // Token = (is_reg, addr_lo, addr_hi, ts_lo, ts_hi, value)
+    type Token = (u64, u64, u64, u64, u64, u64);
+
+    // Track sends (+1) and receives (-1)
+    let mut token_balance: HashMap<Token, (i64, Vec<String>)> = HashMap::new();
+
+    // === REGISTER Memory tokens ===
+    println!("\n=== REGISTER Memory Bus Tokens (is_register=1) ===");
+    for row in 0..traces.register.num_rows().min(64) {
+        let offset = traces.register.main_table.get(row, reg_cols::OFFSET).to_raw();
+        let init = traces.register.main_table.get(row, reg_cols::INIT).to_raw();
+        let fini = traces.register.main_table.get(row, reg_cols::FINI).to_raw();
+        let ts_lo = traces.register.main_table.get(row, reg_cols::TIMESTAMP_LO).to_raw();
+        let ts_hi = traces.register.main_table.get(row, reg_cols::TIMESTAMP_HI).to_raw();
+
+        // REG-C1: RECV init token (1, offset, 0, 0, 0, init)
+        let c1_token: Token = (1, offset, 0, 0, 0, init);
+        let entry = token_balance.entry(c1_token).or_insert((0, vec![]));
+        entry.0 -= 1; // receiver
+        entry.1.push(format!("REG[{}] C1 RECV", row));
+
+        // REG-C2: SEND final token (1, offset, 0, ts_lo, ts_hi, fini)
+        let c2_token: Token = (1, offset, 0, ts_lo, ts_hi, fini);
+        let entry = token_balance.entry(c2_token).or_insert((0, vec![]));
+        entry.0 += 1; // sender
+        entry.1.push(format!("REG[{}] C2 SEND", row));
+
+        // Only print changed registers
+        if ts_lo != 0 || ts_hi != 0 || init != fini {
+            println!("  row {} offset={} init={} fini={} ts={}:", row, offset, init, fini, ts_lo | (ts_hi << 32));
+            println!("    C1 RECV: {:?}", c1_token);
+            println!("    C2 SEND: {:?}", c2_token);
+        }
+    }
+
+    // === MEMW Memory tokens (ALL rows, both register and memory) ===
+    println!("\n=== MEMW Memory Bus Tokens (ALL rows) ===");
+    let mut memw_register_rows = 0;
+    let mut memw_memory_rows = 0;
+    for row in 0..traces.memw.num_rows() {
+        let is_reg = traces.memw.main_table.get(row, memw_cols::IS_REGISTER).to_raw();
+
+        // Count row types
+        if is_reg == 1 {
+            memw_register_rows += 1;
+        } else {
+            memw_memory_rows += 1;
+        }
+
+        let mu_read = traces.memw.main_table.get(row, memw_cols::MU_READ).to_raw();
+        let mu_write = traces.memw.main_table.get(row, memw_cols::MU_WRITE).to_raw();
+        let mu_sum = mu_read + mu_write;
+        if mu_sum == 0 {
+            continue; // Padding row
+        }
+
+        let base_lo = traces.memw.main_table.get(row, memw_cols::BASE_ADDRESS_0).to_raw();
+        let base_hi = traces.memw.main_table.get(row, memw_cols::BASE_ADDRESS_1).to_raw();
+        let ts_lo = traces.memw.main_table.get(row, memw_cols::TIMESTAMP_0).to_raw();
+        let ts_hi = traces.memw.main_table.get(row, memw_cols::TIMESTAMP_1).to_raw();
+        let old_ts0_lo = traces.memw.main_table.get(row, memw_cols::old_timestamp(0)[0]).to_raw();
+        let old_ts0_hi = traces.memw.main_table.get(row, memw_cols::old_timestamp(0)[1]).to_raw();
+        let val0 = traces.memw.main_table.get(row, memw_cols::VALUE[0]).to_raw();
+        let old0 = traces.memw.main_table.get(row, memw_cols::OLD[0]).to_raw();
+
+        let write2 = traces.memw.main_table.get(row, memw_cols::WRITE2).to_raw();
+        let write4 = traces.memw.main_table.get(row, memw_cols::WRITE4).to_raw();
+        let write8 = traces.memw.main_table.get(row, memw_cols::WRITE8).to_raw();
+
+        println!("MEMW row {} [is_read={}, is_reg={}, w2={}, w4={}, w8={}]:",
+                 row, mu_read, is_reg, write2, write4, write8);
+        println!("  base=0x{:08x}_{:08x}, ts={}, old_ts0={}",
+                 base_hi, base_lo, ts_lo | (ts_hi << 32), old_ts0_lo | (old_ts0_hi << 32));
+
+        // CM14: SEND old token for byte 0
+        let send_token: Token = (is_reg, base_lo, base_hi, old_ts0_lo, old_ts0_hi, old0);
+        println!("  CM14 SEND: {:?}", send_token);
+        let entry = token_balance.entry(send_token).or_insert((0, vec![]));
+        entry.0 += mu_sum as i64;
+        entry.1.push(format!("MEMW[{}] CM14 SEND", row));
+
+        // CM15: RECV new token for byte 0
+        let recv_token: Token = (is_reg, base_lo, base_hi, ts_lo, ts_hi, val0);
+        println!("  CM15 RECV: {:?}", recv_token);
+        let entry = token_balance.entry(recv_token).or_insert((0, vec![]));
+        entry.0 -= mu_sum as i64;
+        entry.1.push(format!("MEMW[{}] CM15 RECV", row));
+
+        // For multi-byte accesses (w2 = write2+write4+write8 > 0)
+        let w2 = write2 + write4 + write8;
+        if w2 > 0 {
+            let old_ts1_lo = traces.memw.main_table.get(row, memw_cols::old_timestamp(1)[0]).to_raw();
+            let old_ts1_hi = traces.memw.main_table.get(row, memw_cols::old_timestamp(1)[1]).to_raw();
+            let val1 = traces.memw.main_table.get(row, memw_cols::VALUE[1]).to_raw();
+            let old1 = traces.memw.main_table.get(row, memw_cols::OLD[1]).to_raw();
+
+            // address_add(0) = base + 1, stored as DWordHL
+            let addr1_lo0 = traces.memw.main_table.get(row, memw_cols::address_add(0)[0]).to_raw();
+            let addr1_lo1 = traces.memw.main_table.get(row, memw_cols::address_add(0)[1]).to_raw();
+            let addr1_hi0 = traces.memw.main_table.get(row, memw_cols::address_add(0)[2]).to_raw();
+            let addr1_hi1 = traces.memw.main_table.get(row, memw_cols::address_add(0)[3]).to_raw();
+            let addr1_lo = addr1_lo0 + (addr1_lo1 << 16);
+            let addr1_hi = addr1_hi0 + (addr1_hi1 << 16);
+
+            // CM16: SEND old token for byte 1
+            let send_token1: Token = (is_reg, addr1_lo, addr1_hi, old_ts1_lo, old_ts1_hi, old1);
+            println!("  CM16 SEND (byte 1): {:?}", send_token1);
+            let entry = token_balance.entry(send_token1).or_insert((0, vec![]));
+            entry.0 += w2 as i64;
+            entry.1.push(format!("MEMW[{}] CM16 SEND", row));
+
+            // CM17: RECV new token for byte 1
+            let recv_token1: Token = (is_reg, addr1_lo, addr1_hi, ts_lo, ts_hi, val1);
+            println!("  CM17 RECV (byte 1): {:?}", recv_token1);
+            let entry = token_balance.entry(recv_token1).or_insert((0, vec![]));
+            entry.0 -= w2 as i64;
+            entry.1.push(format!("MEMW[{}] CM17 RECV", row));
+        }
+    }
+
+    println!("\n  MEMW summary: {} register rows, {} memory rows", memw_register_rows, memw_memory_rows);
+
+    // === PAGE Memory tokens (only for accessed addresses) ===
+    println!("\n=== PAGE Memory Bus Tokens ===");
+    for (page_idx, (page_trace, page_config)) in traces.pages.iter().zip(traces.page_configs.iter()).enumerate() {
+        let page_base = page_config.page_base;
+        let page_size = page_config.page_size;
+        let page_lo = (page_base & 0xFFFF_FFFF) as u64;
+        let page_hi = page_base >> 32;
+        let trace_rows = page_trace.num_rows();
+
+        println!("PAGE {} [base=0x{:016x}, size={}, trace_rows={}]:", page_idx, page_base, page_size, trace_rows);
+
+        // Only show rows with non-zero timestamps (accessed addresses)
+        for row in 0..page_trace.num_rows().min(page_size) {
+            let offset = page_trace.main_table.get(row, page_cols::OFFSET).to_raw();
+            let init = page_trace.main_table.get(row, page_cols::INIT).to_raw();
+            let fini = page_trace.main_table.get(row, page_cols::FINI).to_raw();
+            let ts_lo = page_trace.main_table.get(row, page_cols::TIMESTAMP_LO).to_raw();
+            let ts_hi = page_trace.main_table.get(row, page_cols::TIMESTAMP_HI).to_raw();
+
+            // Compute full address
+            let addr_lo = page_lo + offset;
+            let addr_hi = page_hi;
+
+            // C3: RECV init token (all rows)
+            let c3_token: Token = (0, addr_lo, addr_hi, 0, 0, init);
+            let entry = token_balance.entry(c3_token).or_insert((0, vec![]));
+            entry.0 -= 1; // receiver
+            entry.1.push(format!("PAGE[{}][{}] C3 RECV", page_idx, row));
+
+            // C4: SEND final token (all rows)
+            let c4_token: Token = (0, addr_lo, addr_hi, ts_lo, ts_hi, fini);
+            let entry = token_balance.entry(c4_token).or_insert((0, vec![]));
+            entry.0 += 1; // sender
+            entry.1.push(format!("PAGE[{}][{}] C4 SEND", page_idx, row));
+
+            // Only print accessed addresses (non-zero timestamp or changed value)
+            if ts_lo != 0 || ts_hi != 0 || init != fini {
+                println!("  row {} addr=0x{:08x}_{:08x} init={} fini={} ts={}:",
+                         row, addr_hi, addr_lo, init, fini, ts_lo | (ts_hi << 32));
+                println!("    C3 RECV init: {:?}", c3_token);
+                println!("    C4 SEND final: {:?}", c4_token);
+            }
+        }
+    }
+
+    // === Check for imbalanced memory tokens ===
+    println!("\n=== IMBALANCED MEMORY TOKENS (should be empty) ===");
+    let mut imbalanced = 0;
+    for (token, (balance, sources)) in &token_balance {
+        if *balance != 0 {
+            println!("IMBALANCED: {:?} balance={} sources={:?}", token, balance, sources);
+            imbalanced += 1;
+        }
+    }
+    if imbalanced == 0 {
+        println!("All Memory bus tokens balance!");
+    } else {
+        println!("Found {} imbalanced memory tokens", imbalanced);
+    }
+
+    // === Count IS_BYTE lookups from PAGE (C1 init + C2 fini) ===
+    println!("\n=== IS_BYTE Lookup Counts (from PAGE tables) ===");
+    let mut is_byte_from_page = [0u64; 256];
+    let total_page_rows: usize = traces.pages.iter().map(|p| p.num_rows()).sum();
+    for (page_idx, page_trace) in traces.pages.iter().enumerate() {
+        let page_size = traces.page_configs[page_idx].page_size;
+        for row in 0..page_trace.num_rows().min(page_size) {
+            let init = page_trace.main_table.get(row, page_cols::INIT).to_raw() as usize;
+            let fini = page_trace.main_table.get(row, page_cols::FINI).to_raw() as usize;
+            is_byte_from_page[init] += 1; // C1
+            is_byte_from_page[fini] += 1; // C2
+        }
+    }
+    println!("Total PAGE rows: {}, Expected IS_BYTE: {} (2 per row)",
+             total_page_rows, total_page_rows * 2);
+    println!("IS_BYTE[0]: {} lookups (most bytes are 0)", is_byte_from_page[0]);
+
+    // Check if bitwise table has matching multiplicities for IS_BYTE
+    // IS_BYTE uses rows 0..255 for each byte value, MU_IS_BYTE is column 17
+    use crate::tables::bitwise::cols as bitwise_cols;
+    let bitwise_is_byte_mult: u64 = (0..256usize)
+        .map(|byte_val| {
+            // IS_BYTE lookup is at row with X=byte_val, Y=0, Z=0
+            // Row index = X + Y*256 + Z*256*256 = X (for Y=0, Z=0)
+            traces.bitwise.main_table.get(byte_val, bitwise_cols::MU_IS_BYTE).to_raw()
+        })
+        .sum();
+    println!("Bitwise IS_BYTE total multiplicity: {}", bitwise_is_byte_mult);
+
+    // Also count total IS_BYTE lookups expected from collect_bitwise_from_page
+    let is_byte_total_from_page: u64 = is_byte_from_page.iter().sum();
+    println!("Total IS_BYTE lookups from PAGE (counted): {}", is_byte_total_from_page);
+    println!("Difference: {} (should be 0 if PAGE IS_BYTE matches Bitwise)",
+             bitwise_is_byte_mult as i64 - is_byte_total_from_page as i64);
+
+    // === Verify PAGE AIR uses correct page_base ===
+    println!("\n=== PAGE Configuration Check ===");
+    for (idx, config) in traces.page_configs.iter().enumerate() {
+        let page_lo = (config.page_base & 0xFFFF_FFFF) as u64;
+        let page_hi = config.page_base >> 32;
+        println!("PAGE {}: base=0x{:016x}, page_lo={}, page_hi={}",
+                 idx, config.page_base, page_lo, page_hi);
+    }
+}
+
+#[test]
+fn test_page_trace_values_debug() {
+    use crate::tables::page::cols as page_cols;
+
+    let (elf, logs, _instructions) = run_asm_elf("test_sb_sh_8");
+    let traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
+
+    println!("=== Checking PAGE trace values for stack addresses ===");
+    
+    // Find the stack page (PAGE 3)
+    for (i, (trace, config)) in traces.pages.iter().zip(traces.page_configs.iter()).enumerate() {
+        let page_base = config.page_base;
+        if page_base == 0xFFFF_FFFF_FFFF_F000 {
+            println!("Found stack page at index {} with base 0x{:016x}", i, page_base);
+            
+            // Check row 4064 (offset 0xFE0, address 0xFFFF_FFFF_FFFF_FFE0)
+            let row = 4064;
+            let offset = trace.main_table.get(row, page_cols::OFFSET).to_raw();
+            let init = trace.main_table.get(row, page_cols::INIT).to_raw();
+            let fini = trace.main_table.get(row, page_cols::FINI).to_raw();
+            let ts_lo = trace.main_table.get(row, page_cols::TIMESTAMP_LO).to_raw();
+            let ts_hi = trace.main_table.get(row, page_cols::TIMESTAMP_HI).to_raw();
+            
+            println!("Row {} (addr 0xFFFF_FFFF_FFFF_FFE0):", row);
+            println!("  offset = {} (expected 4064)", offset);
+            println!("  init = {} (expected 0)", init);
+            println!("  fini = {} (expected 66 = 0x42)", fini);
+            println!("  ts_lo = {} (expected 24)", ts_lo);
+            println!("  ts_hi = {} (expected 0)", ts_hi);
+            
+            // Check row 4066 (offset 0xFE2, address 0xFFFF_FFFF_FFFF_FFE2)
+            let row = 4066;
+            let offset = trace.main_table.get(row, page_cols::OFFSET).to_raw();
+            let init = trace.main_table.get(row, page_cols::INIT).to_raw();
+            let fini = trace.main_table.get(row, page_cols::FINI).to_raw();
+            let ts_lo = trace.main_table.get(row, page_cols::TIMESTAMP_LO).to_raw();
+            
+            println!("Row {} (addr 0xFFFF_FFFF_FFFF_FFE2):", row);
+            println!("  offset = {} (expected 4066)", offset);
+            println!("  init = {} (expected 0)", init);
+            println!("  fini = {} (expected 137 = 0x89)", fini);
+            println!("  ts_lo = {} (expected 28)", ts_lo);
+            
+            // Compute what the AIR would see for address_lo
+            let page_lo = (page_base & 0xFFFF_FFFF) as u64;
+            let page_hi = page_base >> 32;
+            println!("\nAIR would compute:");
+            println!("  page_lo = {} (0x{:08x})", page_lo, page_lo);
+            println!("  page_hi = {} (0x{:08x})", page_hi, page_hi);
+            println!("  For row 4064: addr_lo = page_lo + offset = {} + 4064 = {}", page_lo, page_lo + 4064);
+            println!("  Expected: 0xFFFF_FFE0 = {}", 0xFFFF_FFE0u64);
+        }
+    }
+}
+
+/// Test with a single PAGE table to isolate the issue
+#[test]
+fn test_single_page_table_balance() {
+
+    let (elf, logs, _instructions) = run_asm_elf("test_sb_sh_8");
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
+
+    println!("Original PAGE tables: {}", traces.pages.len());
+    println!("PAGE configs:");
+    for (i, config) in traces.page_configs.iter().enumerate() {
+        println!("  {}: base=0x{:016x}", i, config.page_base);
+    }
+
+    // Keep only the stack page (PAGE 3, which contains the accessed addresses)
+    let stack_page_idx = traces.page_configs.iter()
+        .position(|c| c.page_base == 0xFFFF_FFFF_FFFF_F000)
+        .expect("Stack page not found");
+
+    println!("Using only PAGE {} (stack page at 0xFFFF_FFFF_FFFF_F000)", stack_page_idx);
+
+    let single_page_trace = traces.pages.remove(stack_page_idx);
+    let single_page_config = traces.page_configs.remove(stack_page_idx);
+    
+    traces.pages = vec![single_page_trace];
+    traces.page_configs = vec![single_page_config];
+
+    // Run the prover
+    let result = prove_and_verify_vm_with_pages(
+        &mut traces.cpu,
+        &mut traces.bitwise,
+        &mut traces.lt,
+        &mut traces.memw,
+        &mut traces.load,
+        &mut traces.decode,
+        &mut traces.branch,
+        &mut traces.halt,
+        &mut traces.register,
+        &mut traces.pages,
+        &traces.page_configs,
+    );
+
+    println!("Single PAGE table test: {}", if result { "PASSED" } else { "FAILED" });
+    assert!(result, "Single PAGE table test failed");
 }

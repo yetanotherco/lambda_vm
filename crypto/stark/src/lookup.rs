@@ -1,4 +1,5 @@
 use std::marker::PhantomData;
+use std::collections::HashMap;
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use math::field::{
@@ -661,7 +662,7 @@ where
 
         // DEBUG: Sum terms by bus_id to find which bus is imbalanced
         // Only print non-zero bus sums with their bus_ids
-        let mut bus_sums: std::collections::HashMap<u64, FieldElement<E>> = std::collections::HashMap::new();
+        let mut bus_sums: HashMap<u64, FieldElement<E>> = HashMap::new();
         for (i, interaction) in self
             .auxiliary_trace_build_data
             .interactions
@@ -674,13 +675,11 @@ where
             }
             *bus_sums.entry(interaction.bus_id).or_insert(FieldElement::zero()) += col_sum;
         }
-        // Print only non-zero bus contributions
-        let non_zero: Vec<_> = bus_sums.iter()
-            .filter(|(_, v)| **v != FieldElement::<E>::zero())
-            .map(|(k, v)| format!("{}:{:?}", k, v))
-            .collect();
-        if !non_zero.is_empty() {
-            eprintln!("TABLE rows={} interactions={}: {}", trace.num_rows(), num_interactions, non_zero.join(", "));
+        // Print non-zero bus sums (indicates imbalance)
+        for (&bus_id, sum) in &bus_sums {
+            if *sum != FieldElement::<E>::zero() {
+                eprintln!("  Bus {}: non-zero sum = {:?}", bus_id, sum);
+            }
         }
 
         // Build accumulated column (sums all term columns across rows)
