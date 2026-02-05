@@ -26,7 +26,7 @@ cond = "BaseField"
 tag = "NEG"
 kind = "template"
 input = ["DWordHL"]
-output = "DWordDL"
+output = "DWordWL"
 cond = "Bit"
 
 # SIGN<sign; X, signed>
