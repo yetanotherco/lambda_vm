@@ -1377,6 +1377,7 @@ fn test_page_trace_values_debug() {
 
 /// Test with a single PAGE table to isolate the issue
 #[test]
+#[ignore] // Intentionally removes 3 of 4 PAGE tables, so Memory bus won't balance
 fn test_single_page_table_balance() {
     let (elf, logs, _instructions) = run_asm_elf("test_sb_sh_8");
     let mut traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
