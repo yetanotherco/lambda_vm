@@ -481,6 +481,7 @@ pub fn create_cpu_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_name("CPU")
 }
 
 /// Create Bitwise AIR with bus interactions.
@@ -498,6 +499,7 @@ pub fn create_bitwise_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_name("BITWISE")
 }
 
 /// Create LT AIR with bus interactions.
@@ -515,6 +517,7 @@ pub fn create_lt_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_name("LT")
 }
 
 /// Create MEMW AIR with constraints and bus interactions.
@@ -532,6 +535,7 @@ pub fn create_memw_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_name("MEMW")
 }
 
 /// Create LOAD AIR with constraints and bus interactions.
@@ -549,6 +553,7 @@ pub fn create_load_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_name("LOAD")
 }
 
 /// Create DECODE AIR with bus interactions.
@@ -578,6 +583,7 @@ pub fn create_decode_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_name("DECODE")
 }
 
 /// Create MUL AIR with bus interactions.
@@ -595,6 +601,7 @@ pub fn create_mul_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_name("MUL")
 }
 
 /// Create BRANCH AIR with constraints and bus interactions.
@@ -618,6 +625,7 @@ pub fn create_branch_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_name("BRANCH")
 }
 
 /// Create HALT AIR with bus interactions (no transition constraints).
@@ -635,6 +643,7 @@ pub fn create_halt_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_name("HALT")
 }
 
 /// Create PAGE AIR with bus interactions for a specific page.
@@ -661,6 +670,7 @@ pub fn create_page_air(proof_options: &ProofOptions, page_base: u64) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_name(&format!("PAGE:0x{:x}", page_base))
 }
 
 /// Create REGISTER AIR with bus interactions.
@@ -681,4 +691,5 @@ pub fn create_register_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_name("REGISTER")
 }

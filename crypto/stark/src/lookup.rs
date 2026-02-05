@@ -491,6 +491,8 @@ pub struct AirWithBuses<
     preprocessed_commitment: Option<crate::config::Commitment>,
     /// Number of precomputed columns (columns 0..n are precomputed, rest are multiplicities)
     num_precomputed_cols: Option<usize>,
+    /// Optional name for debug output (per-table bus sum tracking)
+    name: Option<String>,
 }
 
 impl<
@@ -559,6 +561,7 @@ impl<
             boundary_constraint_builder: PhantomData,
             preprocessed_commitment: None,
             num_precomputed_cols: None,
+            name: None,
         }
     }
 
@@ -586,6 +589,43 @@ impl<
         self.preprocessed_commitment = Some(commitment);
         self.num_precomputed_cols = Some(num_precomputed_cols);
         self
+    }
+
+    /// Set a debug name for this AIR (for per-table bus sum tracking).
+    ///
+    /// When set, debug output will show bus sums prefixed with this name,
+    /// making it easy to identify which table is contributing to bus imbalances.
+    pub fn with_name(mut self, name: &str) -> Self {
+        self.name = Some(name.to_string());
+        self
+    }
+}
+
+/// Map bus ID to human-readable name for debug output.
+/// Based on BusId enum from prover/src/tables/types.rs.
+fn bus_name(bus_id: u64) -> &'static str {
+    match bus_id {
+        0 => "IsByte",
+        1 => "IsHalfword",
+        2 => "IsB20",
+        3 => "AndByte",
+        4 => "OrByte",
+        5 => "XorByte",
+        6 => "Msb8",
+        7 => "Msb16",
+        8 => "Zero",
+        9 => "Hwsl",
+        10 => "Hwslc",
+        11 => "Lt",
+        12 => "Mul",
+        13 => "Shift",
+        14 => "Memw",
+        15 => "Load",
+        16 => "Memory",
+        17 => "Branch",
+        18 => "Decode",
+        19 => "Ecall",
+        _ => "Unknown",
     }
 }
 
@@ -661,7 +701,7 @@ where
         }
 
         // DEBUG: Sum terms by bus_id to find which bus is imbalanced
-        // Only print non-zero bus sums with their bus_ids
+        // Print per-table bus sums with table name and bus name for debugging
         let mut bus_sums: HashMap<u64, FieldElement<E>> = HashMap::new();
         for (i, interaction) in self
             .auxiliary_trace_build_data
@@ -675,11 +715,17 @@ where
             }
             *bus_sums.entry(interaction.bus_id).or_insert(FieldElement::zero()) += col_sum;
         }
-        // Print non-zero bus sums (indicates imbalance)
+        // Print per-table bus sums (for debugging bus imbalances)
+        let table_name = self.name.as_deref().unwrap_or("UNKNOWN");
         for (&bus_id, sum) in &bus_sums {
-            if *sum != FieldElement::<E>::zero() {
-                eprintln!("  Bus {}: non-zero sum = {:?}", bus_id, sum);
-            }
+            // Print ALL sums (not just non-zero) for comparison
+            eprintln!(
+                "[{:12}] Bus {:2} ({:10}): sum = {:?}",
+                table_name,
+                bus_id,
+                bus_name(bus_id),
+                sum
+            );
         }
 
         // Build accumulated column (sums all term columns across rows)
