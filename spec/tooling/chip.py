@@ -41,7 +41,7 @@ class Range:
     high: int
 
     def is_bool(self):
-        return self.is_lit and self.low >= 0 and self.high <= 1
+        return self.low >= 0 and self.high <= 1
 
     def is_lit(self):
         return self.low == self.high
@@ -332,11 +332,11 @@ class Iter:
     ) -> Iterable[T]:
         start = self.start.typecheck(env)
         if isinstance(start, list) or not start.is_lit():
-            reporter.error(f"Starting value of summation not a const: {self!r}")
+            reporter.error(f"Starting value of iterator not a const: {self!r}")
             start = Range(0, 0)
         stop = self.stop.typecheck(env)
         if isinstance(stop, list) or not stop.is_lit():
-            reporter.error(f"Ending value of summation not a const: {self!r}")
+            reporter.error(f"Ending value of iterator not a const: {self!r}")
             stop = Range(start.get_lit(), start.get_lit())
 
         # While it's tempting to replace this loop by an assignment of Range(start, stop + 1) to self.name
@@ -574,10 +574,112 @@ class VirtualVariable(Variable):
         self.def_ = VirtualDef(config, self.name, self.type, def_)
 
     def typecheck(self, env: Environment) -> Type:
-        # TODO
-        # - Check no indices are covered twice and everything covered
-        # - Check type fits? At least structure should match
-        return DEFAULT_TYPE
+        def structure_match(a: Type, b: Type):
+            if isinstance(a, Range) and isinstance(b, (Range, type(None))):
+                return True
+            elif isinstance(a, list) and isinstance(b, list):
+                return len(a) == len(b) and all(
+                    structure_match(x, y) for x, y in zip(a, b)
+                )
+            else:
+                return False
+
+        def handle_iters(
+            env: Environment,
+            iters: list[Iter],
+            poly: Expr,
+            expected: Type,
+            indices: list[int],
+            seen: set[tuple],
+        ):
+            if not iters:
+                asn = poly.typecheck(env)
+                # Check not doubly defined
+                for s in seen:
+                    ln = min(len(s), len(indices))
+                    if s[:ln] == tuple(indices[:ln]):
+                        reporter.error(
+                            f"Double definition for virtual column: {self!r} at index {indices}"
+                        )
+                        break
+                # check asn structure matches assigned
+                reporter.asserts(
+                    structure_match(asn, expected),
+                    f"Invalid structure for definition to virtual column: {self!r}",
+                )
+                # Check type fits?
+
+                seen.add(tuple(indices))
+            else:
+                it, *its = iters
+                # Some duplicated code/concepts from Iter.typecheck
+                start = it.start.typecheck(env)
+                if isinstance(start, list) or not start.is_lit():
+                    reporter.error(
+                        f"Starting value of virtual def iter not a const: {self!r}"
+                    )
+                    start = Range(0, 0)
+                stop = it.stop.typecheck(env)
+                if isinstance(stop, list) or not stop.is_lit():
+                    reporter.error(
+                        f"Ending value of virtual def iter not a const: {self!r}"
+                    )
+                    stop = Range(start.get_lit(), start.get_lit())
+
+                for i in range(start.get_lit(), stop.get_lit() + 1):
+                    if isinstance(expected, Range):
+                        reporter.error(
+                            f"Virtual definition has an iter for a scalar: {self!r}"
+                        )
+                        break
+                    if not 0 <= i < len(expected):
+                        reporter.error(
+                            f"Virtual definition index {i} out of range for {expected}: {self!r}"
+                        )
+                        break
+                    old_val: Optional[Range] = env.valmap.get(it.name, None)
+                    env.valmap[it.name] = Range(i, i)
+                    handle_iters(env, its, poly, expected[i], indices + [i], seen)
+                    env.valmap.pop(it.name)
+                    if old_val is not None:
+                        env.valmap[it.name] = old_val
+
+        def is_covered(seen: set[tuple], indices: list[int]) -> bool:
+            for s in seen:
+                if len(s) <= len(indices) and s == tuple(indices[:len(s)]):
+                    return True
+            return False
+
+        def check_covered(t: Type, seen: set[tuple], indices: list[int]):
+            if isinstance(t, Range):
+                reporter.asserts(is_covered(seen, indices), f"Virtual column {self.name!r} not completely defined")
+            else:
+                for i in range(len(t)):
+                    check_covered(t[i], seen, indices + [i])
+
+        # Special case for better error messages
+        if isinstance(self.type, Range):
+            reporter.asserts(
+                len(self.def_.defs) == 1 and not self.def_.defs[0][0],
+                f"Invalid def for scalar column: {self!r}",
+            )
+            assigned_type = self.def_.defs[0][1].typecheck(env)
+            if not isinstance(assigned_type, Range):
+                reporter.error(
+                    f"Assigning non-scalar type to scalar virtual column: {self!r}"
+                )
+                return self.type
+            # Check type fits?
+            # Leaving this out because it produces too much noise with one-hot assumptions
+            # reporter.asserts(self.type.low <= assigned_type.low <= assigned_type.high <= self.type.high, f"Definition may not fit in virtual column: {self!r}")
+        else:
+            # Check no indices are covered twice
+            seen: set[tuple] = set()
+            for iters, poly in self.def_.defs:
+                handle_iters(env, iters, poly, self.type, [], seen)
+            # Check everything is covered
+            check_covered(self.type, seen, [])
+        return self.type
 
 
 @dataclass
