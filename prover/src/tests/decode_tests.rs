@@ -1000,9 +1000,9 @@ fn test_decode_soundness_same_elf_accepted() {
     use stark::prover::{IsStarkProver, Prover};
     use stark::verifier::{IsStarkVerifier, Verifier};
 
+    use crate::VmAirs;
     use crate::tables::trace_builder::Traces;
     use crate::tables::types::{GoldilocksExtension, GoldilocksField};
-    use crate::VmAirs;
 
     type E = GoldilocksExtension;
 
