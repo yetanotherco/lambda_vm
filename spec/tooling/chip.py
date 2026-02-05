@@ -1,14 +1,9 @@
 from pathlib import Path
-import copy
 import sys
 import tomllib
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import Optional, Union, Never
-
-
-def Bit_type():
-    return Type(None, "Bit")
+from typing import Optional, Never
 
 
 class ErrorReporter:
@@ -40,6 +35,26 @@ def assert_no_unexpected(data: dict, possible_keys: Iterable[str]):
         reporter.asserts(key in possible_keys, f"Unexpected key: {key!r}")
 
 
+@dataclass(frozen=True)
+class Range:
+    low: int
+    high: int
+
+    def is_bool(self):
+        return self.is_lit and self.low >= 0 and self.high <= 1
+
+    def is_lit(self):
+        return self.low == self.high
+
+    def get_lit(self) -> int:
+        assert self.is_lit()
+        return self.low
+
+
+type Type = list[Type] | Range
+
+DEFAULT_TYPE: Type = Range(0, 0)
+
 type Expr = (
     LitExpr
     | VarExpr
@@ -54,77 +69,33 @@ type Expr = (
     | DummyExpr
 )
 
-# We can either have an explicit int literal (or const expression) or a known type
-# Returning 0 as dummy value should work in most cases, as constants can be used for
-# almost anything. The only exception being indexing.
-type TypeCheck = Type | int
-
 
 @dataclass
 class Environment:
     config: "Config"
-    valmap: dict[str, int]
-    typemap: dict[str, "Type"]
-
-    def resolve_index(self, base: "Type", idx: int) -> TypeCheck:
-        if base.dimension is not None:
-            if not (0 <= idx < base.dimension):
-                reporter.error(f"Index out of range for {base!r}: {idx!r}")
-                idx = 0
-            if isinstance(base.base, str):
-                return Type(None, base.base)
-            else:
-                return base.base
-
-        assert isinstance(base.base, str), (
-            "We somehow made a type that's not an array, but has a non-str base"
-        )
-        typeconfigs = [
-            tc for tc in self.config.variables.types if tc.label == base.base
-        ]
-        if len(typeconfigs) != 1:
-            reporter.error(f"Unable to resolve type: {base!r}")
-            return 0
-        typeconfig = typeconfigs[0]
-        if not (0 <= idx < len(typeconfig.subtypes)):
-            reporter.error(f"Index out of range for {base!r}: {idx!r}")
-            idx = 0
-        return typeconfig.subtypes[idx]
-
-
-def type_match(a: TypeCheck, b: TypeCheck, context: str) -> TypeCheck:
-    """Check that `a` and `b` are "compatible" TypeCheck values.
-    That is, either one of them is a constant, or the type is the same"""
-    # TODO: improve here; e.g. by allowing thing to match if their subtype is identical?
-    # Then would have to return the subtype to be sure?
-    # Maybe break everything down to subtypes, then it's purely structural matching?
-    if isinstance(a, int):
-        return b
-    if isinstance(b, int):
-        return a
-    reporter.asserts(a == b, f"Type mismatch between {a!r} and {b!r} [{context}]")
-    return 0
+    valmap: dict[str, Range]
+    typemap: dict[str, Type]
 
 
 @dataclass
 class LitExpr:
     lit: int
 
-    def typecheck(self, _env: Environment) -> TypeCheck:
-        return self.lit
+    def typecheck(self, _env: Environment) -> Type:
+        return Range(self.lit, self.lit)
 
 
 @dataclass
 class VarExpr:
     name: str
 
-    def typecheck(self, env: Environment) -> TypeCheck:
+    def typecheck(self, env: Environment) -> Type:
         if self.name in env.valmap:
             return env.valmap[self.name]
         if self.name in env.typemap:
             return env.typemap[self.name]
         reporter.error(f"Unknown variable: {self.name!r}")
-        return 0
+        return DEFAULT_TYPE
 
 
 @dataclass
@@ -132,26 +103,36 @@ class IdxExpr:
     base: Expr
     idx: Expr
 
-    def typecheck(self, env: Environment) -> TypeCheck:
+    def typecheck(self, env: Environment) -> Type:
         base = self.base.typecheck(env)
         idx = self.idx.typecheck(env)
-        if isinstance(base, int):
-            reporter.error(f"Trying to index a constant value: {self.base!r}")
-            return 0
-        if not isinstance(idx, int):
-            reporter.error(f"Trying to index with a non-constant: {self.idx!r}")
-            return 0
-        return env.resolve_index(base, idx)
+        if not isinstance(idx, Range) or not idx.is_lit():
+            reporter.error(f"Invalid index: {idx!r}")
+            return Range(-1, -1)
+        idxlit = idx.get_lit()
+        if not isinstance(base, list):
+            reporter.error(f"Indexing into non-array type: {self!r}")
+            return DEFAULT_TYPE
+        if not (0 <= idxlit < len(base)):
+            reporter.error(f"Index out of range {self!r}")
+            idxlit = 0
+        return base[idxlit]
 
 
 @dataclass
 class CastExpr:
     base: Expr
-    type: "Type"
+    type: Type
 
-    def typecheck(self, env: Environment) -> TypeCheck:
-        _base = self.base.typecheck(env)
-        # TODO? encode/list valid casts
+    def typecheck(self, env: Environment) -> Type:
+        base = self.base.typecheck(env)
+        # TODO? Detect more sorts of invalid casts
+        baselen = len(base) if isinstance(base, list) else 1
+        castlen = len(self.type) if isinstance(self.type, list) else 1
+        reporter.asserts(
+            baselen >= castlen or (isinstance(base, Range) and base.is_lit()),
+            f"Casting from fewer columns to more: {self!r} {base} {self.type}",
+        )
         return self.type
 
 
@@ -159,10 +140,22 @@ class CastExpr:
 class MulExpr:
     factors: list[Expr]
 
-    def typecheck(self, env: Environment) -> TypeCheck:
-        t: TypeCheck = 0
+    def type_match(self, a: Type, b: Type) -> Type:
+        if isinstance(a, list) and isinstance(b, list):
+            reporter.error(f"Multiplication of non-scalar types: {self!r}")
+            return DEFAULT_TYPE
+        elif isinstance(a, list):
+            return [self.type_match(x, b) for x in a]
+        elif isinstance(b, list):
+            return self.type_match(b, a)
+        else:
+            extrema = [x * y for x in [a.low, a.high] for y in [b.low, b.high]]
+            return Range(min(extrema), max(extrema))
+
+    def typecheck(self, env: Environment) -> Type:
+        t: Type = Range(1, 1)
         for f in self.factors:
-            t = type_match(t, f.typecheck(env), repr(self))
+            t = self.type_match(t, f.typecheck(env))
         return t
 
 
@@ -170,10 +163,26 @@ class MulExpr:
 class AddExpr:
     terms: list[Expr]
 
-    def typecheck(self, env: Environment) -> TypeCheck:
-        t: TypeCheck = 0
-        for term in self.terms:
-            t = type_match(t, term.typecheck(env), repr(self))
+    def type_match(self, a: Type, b: Type) -> Type:
+        if isinstance(a, list) and isinstance(b, list):
+            if len(a) != len(b):
+                assert False
+                reporter.error(f"Adding array types of different length {self!r}")
+                return [DEFAULT_TYPE for _ in range(len(b))]
+            return [self.type_match(x, y) for x, y in zip(a, b)]
+        elif isinstance(a, list) or isinstance(b, list):
+            reporter.error(f"Adding of scalar and array types {self!r}")
+            return DEFAULT_TYPE
+        else:
+            return Range(a.low + b.low, a.high + b.high)
+
+    def typecheck(self, env: Environment) -> Type:
+        if not self.terms:
+            reporter.error("Empty add")
+            return Range(0, 0)
+        t: Type = self.terms[0].typecheck(env)
+        for term in self.terms[1:]:
+            t = self.type_match(t, term.typecheck(env))
         return t
 
 
@@ -182,10 +191,22 @@ class SubExpr:
     head: Expr
     subs: list[Expr]
 
-    def typecheck(self, env: Environment) -> TypeCheck:
+    def type_match(self, a: Type, b: Type) -> Type:
+        if isinstance(a, list) and isinstance(b, list):
+            if len(a) != len(b):
+                reporter.error(f"Subtracting array types of different length {self!r}")
+                return [DEFAULT_TYPE for _ in range(len(a))]
+            return [self.type_match(x, y) for x, y in zip(a, b)]
+        elif isinstance(a, list) or isinstance(b, list):
+            reporter.error(f"Subtraction of scalar and array types {self!r}")
+            return DEFAULT_TYPE
+        else:
+            return Range(a.low - b.high, a.high - b.low)
+
+    def typecheck(self, env: Environment) -> Type:
         t = self.head.typecheck(env)
         for term in self.subs:
-            t = type_match(t, term.typecheck(env), repr(self))
+            t = self.type_match(t, term.typecheck(env))
         return t
 
 
@@ -194,18 +215,19 @@ class PowExpr:
     base: Expr
     exp: Expr
 
-    def typecheck(self, env: Environment) -> TypeCheck:
+    def typecheck(self, env: Environment) -> Type:
         base = self.base.typecheck(env)
         exp = self.exp.typecheck(env)
-        if not isinstance(base, int):
+        if isinstance(base, list) or not base.is_lit():
             reporter.error(f"Invalid exponentiation with non-const base: {self.base!r}")
-            return 0
-        if not isinstance(exp, int):
+            return DEFAULT_TYPE
+        if isinstance(exp, list) or not exp.is_lit():
             reporter.error(
                 f"Invalid exponentiation with non-const exponent: {self.exp!r}"
             )
-            return 0
-        return base**exp
+            return DEFAULT_TYPE
+        val = base.get_lit() ** exp.get_lit()
+        return Range(val, val)
 
 
 @dataclass
@@ -213,10 +235,22 @@ class SumExpr:
     iter: "Iter"
     terms: Expr
 
-    def typecheck(self, env: Environment) -> TypeCheck:
-        t: TypeCheck = 0
+    def type_match(self, a: Type, b: Type) -> Type:
+        if isinstance(a, list) and isinstance(b, list):
+            if len(a) != len(b):
+                reporter.error(f"Summing array types of different length {self!r}")
+                return [DEFAULT_TYPE for _ in range(len(b))]
+            return [self.type_match(x, y) for x, y in zip(a, b)]
+        elif isinstance(a, list) or isinstance(b, list):
+            reporter.error(f"Summing of scalar and array types {self!r}")
+            return DEFAULT_TYPE
+        else:
+            return Range(a.low + b.low, a.high + b.high)
+
+    def typecheck(self, env: Environment) -> Type:
+        t: Type = Range(0, 0)
         for tc in self.iter.typecheck(env, lambda e: [self.terms.typecheck(e)]):
-            t = type_match(t, tc, repr(self))
+            t = self.type_match(t, tc)
         return t
 
 
@@ -224,23 +258,20 @@ class SumExpr:
 class NotExpr:
     inner: Expr
 
-    def typecheck(self, env: Environment) -> TypeCheck:
+    def typecheck(self, env: Environment) -> Type:
         inner = self.inner.typecheck(env)
-        if isinstance(inner, int):
+        if isinstance(inner, list) or not inner.is_bool():
             reporter.asserts(
                 inner in {0, 1}, f"Not a bool passed to `not`: {self.inner!r}"
             )
-            return 1 - inner
-        reporter.asserts(
-            inner == Bit_type(), f"Not a bool passed to `not`: {self.inner!r}"
-        )
-        return Bit_type()
+            return Range(0, 1)
+        return Range(1 - inner.high, 1 - inner.low)
 
 
 @dataclass
 class DummyExpr:
-    def typecheck(self, _env: Environment) -> TypeCheck:
-        return 0
+    def typecheck(self, _env: Environment) -> Type:
+        return DEFAULT_TYPE
 
 
 def build_expr(config: Optional["Config"], data: object) -> Expr:
@@ -257,7 +288,8 @@ def build_expr(config: Optional["Config"], data: object) -> Expr:
             return IdxExpr(build_expr(config, x), build_expr(config, y))
         case ["cast", x, t]:
             assert config is not None
-            return CastExpr(build_expr(config, x), Type(config.variables.types, t))
+            assert isinstance(t, (list, str))
+            return CastExpr(build_expr(config, x), build_type(config, t))
         case ["*", *factors]:
             return MulExpr([build_expr(config, f) for f in factors])
         case ["+", *terms]:
@@ -299,19 +331,24 @@ class Iter:
         self, env: Environment, callback: Callable[[Environment], Iterable[T]]
     ) -> Iterable[T]:
         start = self.start.typecheck(env)
-        if not isinstance(start, int):
+        if isinstance(start, list) or not start.is_lit():
             reporter.error(f"Starting value of summation not a const: {self!r}")
-            start = 0
+            start = Range(0, 0)
         stop = self.stop.typecheck(env)
-        if not isinstance(stop, int):
+        if isinstance(stop, list) or not stop.is_lit():
             reporter.error(f"Ending value of summation not a const: {self!r}")
-            stop = 0
+            stop = Range(start.get_lit(), start.get_lit())
 
-        for i in range(start, stop + 1):
-            old_env = copy.deepcopy(env)
-            env.valmap[self.name] = i
+        # While it's tempting to replace this loop by an assignment of Range(start, stop + 1) to self.name
+        # that would break both detection of literals, and narrowing down to the correct type for indexing
+        # heterogenous array types
+        for i in range(start.get_lit(), stop.get_lit() + 1):
+            old_val: Optional[Range] = env.valmap.get(self.name, None)
+            env.valmap[self.name] = Range(i, i)
             yield from callback(env)
-            env = old_env
+            env.valmap.pop(self.name)
+            if old_val is not None:
+                env.valmap[self.name] = old_val
 
 
 def iters_of(obj: dict, name=None) -> list[Iter]:
@@ -345,39 +382,44 @@ def iters_of(obj: dict, name=None) -> list[Iter]:
 
 
 @dataclass
-class Type:
-    base: Union["Type", str]
-    dimension: Optional[int]
-
-    def __init__(self, valid_types: Optional[list["TypeConfig"]], data: object):
-        match data:
-            case str(x):
-                reporter.asserts(
-                    valid_types is None or x in [tc.label for tc in valid_types],
-                    f"Invalid variable type: {x!r}",
-                )
-                self.base = x
-                self.dimension = None
-            case [base, int(dim)]:
-                self.base = Type(valid_types, base)
-                self.dimension = dim
-            case other:
-                reporter.error(f"Unable to parse type: {other!r}")
-
-
-@dataclass
 class TypeConfig:
     label: str
     subtypes: list[Type]
+    range: Optional[Range]
     desc: str
     preprocessed: bool
 
-    def __init__(self, data: dict, valid_types=None):
+    def __init__(self, default_name: str, lookup: Callable[[str], Type], data: dict):
         assert_no_unexpected(data, type(self).__annotations__.keys())
         self.label = data["label"]
-        self.subtypes = [Type(valid_types, tp) for tp in data["subtypes"]]
+        if "range" in data:
+            reporter.asserts(
+                data["subtypes"] == [default_name],
+                f"Specified a range non a non-base composite type: {data!r}",
+            )
+            reporter.asserts(
+                isinstance(data["range"], list) and len(data["range"]) == 2,
+                f"Invalid range: {data!r}",
+            )
+            start, stop = data["range"]
+            if not isinstance(start, int):
+                reporter.error(f"Range start not an int: {data!r}")
+                start = 0
+            if not isinstance(stop, int):
+                reporter.error(f"Range end not an int: {data!r}")
+                stop = start
+            self.range = Range(start, stop)
+            self.subtypes = []
+        else:
+            self.range = None
+            self.subtypes = [lookup(tp) for tp in data["subtypes"]]
         self.desc = data["desc"]
         self.preprocessed = data.get("preprocessed", False)
+
+    def as_type(self):
+        if self.range is not None:
+            return self.range
+        return self.subtypes[:]
 
 
 @dataclass
@@ -407,12 +449,19 @@ class ConfigVariables:
     def __init__(self, data: dict):
         assert_no_unexpected(data, type(self).__annotations__.keys())
         self.types = []
+        base_type = None
         for tp in data["types"]:
-            if tp["subtypes"] == [tp["label"]]:
-                self.types.append(TypeConfig(tp, valid_types=None))
-            else:
-                self.types.append(TypeConfig(tp, valid_types=self.types))
+            if base_type is None:
+                base_type = tp["label"]
+            self.types.append(TypeConfig(base_type, self.lookup_type, tp))
         self.categories = ConfigCategories(data["categories"])
+
+    def lookup_type(self, typename: str) -> Type:
+        matches = [t for t in self.types if t.label == typename]
+        if len(matches) != 1:
+            reporter.error(f"Couldn't lookup type by name: {typename!r}")
+            return DEFAULT_TYPE
+        return matches[0].as_type()
 
 
 @dataclass
@@ -449,6 +498,16 @@ class Config:
         return cls(tomllib.loads(s))
 
 
+def build_type(config: Config, data: list | str):
+    if isinstance(data, list):
+        if len(data) != 2:
+            reporter.error(f"Invalid type: {data!r}")
+            return DEFAULT_TYPE
+        return [build_type(config, data[0]) for _ in range(data[1])]
+    else:
+        return config.variables.lookup_type(data)
+
+
 @dataclass
 class Variable:
     category: str
@@ -464,7 +523,7 @@ class Variable:
         self.name = data["name"]
         reporter.asserts(isinstance(self.name, str), f"{self.name!r} is not a string")
         reporter.asserts(self.name.isidentifier(), f"Invalid identifier: {self.name!r}")
-        self.type = Type(config.variables.types, data["type"])
+        self.type = build_type(config, data["type"])
         self.desc = data["desc"]
         reporter.asserts(isinstance(self.desc, str), f"{self.desc!r} is not a string")
         self.pad = build_expr(None, data.get("pad", 0))
@@ -490,7 +549,6 @@ class VirtualDef:
     defs: list[tuple[list[Iter], Expr]]
 
     def __init__(self, config: Config, name: str, tp: Type, data: dict):
-        # TODO? More sanity checking the format (or is that duplicating work done in typst already)
         if "poly" in data:
             idx = data.get("idx", None)
             self.defs = [(iters_of(data, name=idx), build_expr(config, data["poly"]))]
@@ -515,9 +573,11 @@ class VirtualVariable(Variable):
         super().__init__(config, category, data)
         self.def_ = VirtualDef(config, self.name, self.type, def_)
 
-    def typecheck(self, env: Environment) -> TypeCheck:
+    def typecheck(self, env: Environment) -> Type:
         # TODO
-        return 0
+        # - Check no indices are covered twice and everything covered
+        # - Check type fits? At least structure should match
+        return DEFAULT_TYPE
 
 
 @dataclass
@@ -558,18 +618,29 @@ class ArithConstraint:
         self.iters = iters_of(data)
 
     def typecheck(self, env: Environment) -> Iterable[Never]:
-        # TODO: is there any reason to typecheck if something is equatable to 0?
-        # Iteration for the side effect of typechecking and reporting errors
-        for _ in all_iters(self.iters, env, lambda e: [self.poly.typecheck(e)]):
-            pass
+        # TODO? Should we check that there's no overflow of the modulus?
+        #   This would probably struggle due to things like one-hot invariants
+
+        def check_includes_zero(t: Type):
+            if isinstance(t, Range):
+                reporter.asserts(
+                    t.low <= 0 <= t.high,
+                    f"Unsatisfiable constraint, 0 not in range: {self!r} {t}",
+                )
+            else:
+                for sub in t:
+                    check_includes_zero(sub)
+
+        for t in all_iters(self.iters, env, lambda e: [self.poly.typecheck(e)]):
+            check_includes_zero(t)
         return []
 
 
 @dataclass
 class TemplateSignature:
     tag: str
-    input: list[TypeCheck]
-    output: Optional[TypeCheck]
+    input: list[Type]
+    output: Optional[Type]
 
 
 @dataclass
@@ -624,8 +695,8 @@ class TemplateConstraint:
 @dataclass
 class InteractionSignature:
     tag: str
-    input: list[TypeCheck]
-    output: Optional[TypeCheck]
+    input: list[Type]
+    output: Optional[Type]
 
 
 @dataclass
@@ -734,7 +805,15 @@ class Chip:
         return cls(config, tomllib.loads(s))
 
     def typecheck(self) -> Iterable[TemplateSignature | InteractionSignature]:
-        env = Environment(self.config, {}, {v.name: v.type for v in self.variables})
+        typemap = {}
+        for v in self.variables:
+            if isinstance(v.type, list) and len(v.type) == 1:
+                t = v.type[0]
+            else:
+                t = v.type
+            typemap[v.name] = t
+
+        env = Environment(self.config, {}, typemap)
         for v in self.variables:
             if isinstance(v, VirtualVariable):
                 v.typecheck(env)
