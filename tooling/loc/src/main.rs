@@ -14,6 +14,7 @@ const EXCLUDED: &[&str] = &[
     "*test_utils*",
     "*bench*",
     "*benches*",
+    "*examples*",
 ];
 
 fn count_crates_loc(crates_path: &PathBuf, config: &Config) -> Vec<(String, usize)> {
