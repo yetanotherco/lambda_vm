@@ -377,9 +377,13 @@ fn collect_store_op_from_cpu(op: &CpuOperation, memory_state: &mut MemoryState) 
     // Read old values and timestamps
     let (old_values, old_timestamps) = memory_state.read_bytes(base_address, 8);
 
-    // Pack store value as individual bytes (per spec: memory uses 8 range-checked Bytes)
+    // Pack ALL 8 bytes of store_value into value_bytes.
+    // Bus 14: MEMW Memory Write receiver reconstructs lo32/hi32 via linear combination
+    //   of all 8 bytes. Must match CPU M7 which sends full rv2 as [lo32, hi32].
+    // Bus 16: only positions 0..byte_count participate (controlled by w2/w4/write8
+    //   multiplicities), so extra bytes don't affect memory consistency.
     let mut value_bytes = [0u64; 8];
-    for (j, byte) in value_bytes.iter_mut().take(byte_count).enumerate() {
+    for (j, byte) in value_bytes.iter_mut().enumerate() {
         *byte = (store_value >> (j * 8)) & 0xFF;
     }
 
