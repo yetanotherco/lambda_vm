@@ -563,17 +563,15 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     }
 
     // -------------------------------------------------------------------------
-    // MEMW receiver (from CPU and LOAD) - ENABLED
+    // Read receiver for REGISTER operations (is_register=1)
     // -------------------------------------------------------------------------
-    // The CPU sends: is_register, base_address, value, timestamp, write2, write4, write8
-    // For reads (μ_read), also expects old as output
-    //
-    // Read interaction (returns old):
+    // OLD and VALUE are already words [lo32, hi32, 0, 0, 0, 0, 0, 0]
+    // Fires when MU_READ=1 AND IS_REGISTER=1 (Product multiplicity)
     interactions.push(BusInteraction::receiver(
         BusId::Memw,
-        Multiplicity::Column(cols::MU_READ),
+        Multiplicity::Product(cols::MU_READ, cols::IS_REGISTER),
         vec![
-            // old[8] - output for reads
+            // old[8] - output for reads (words)
             BusValue::Packed {
                 start_column: cols::OLD[0],
                 packing: Packing::Direct,
@@ -620,7 +618,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::BASE_ADDRESS_1,
                 packing: Packing::Direct,
             },
-            // value[8]
+            // value[8] - direct reads (words)
             BusValue::Packed {
                 start_column: cols::VALUE[0],
                 packing: Packing::Direct,
@@ -678,10 +676,153 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // Write interaction (no output) - ENABLED FOR TESTING
+    // -------------------------------------------------------------------------
+    // Read receiver for MEMORY operations (is_register=0)
+    // -------------------------------------------------------------------------
+    // OLD and VALUE are bytes, reconstruct words via linear combination
+    // Fires when MU_READ=1 AND IS_REGISTER=0
+    // ProductNegated computes: MU_READ * (1 - IS_REGISTER)
     interactions.push(BusInteraction::receiver(
         BusId::Memw,
-        Multiplicity::Column(cols::MU_WRITE),
+        Multiplicity::ProductNegated(cols::MU_READ, cols::IS_REGISTER),
+        vec![
+            // old[0] = lo32 = byte0 + 256*byte1 + 65536*byte2 + 16777216*byte3
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::OLD[0],
+                },
+                LinearTerm::Column {
+                    coefficient: 256,
+                    column: cols::OLD[1],
+                },
+                LinearTerm::Column {
+                    coefficient: 65536,
+                    column: cols::OLD[2],
+                },
+                LinearTerm::Column {
+                    coefficient: 16777216,
+                    column: cols::OLD[3],
+                },
+            ]),
+            // old[1] = hi32 = byte4 + 256*byte5 + 65536*byte6 + 16777216*byte7
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::OLD[4],
+                },
+                LinearTerm::Column {
+                    coefficient: 256,
+                    column: cols::OLD[5],
+                },
+                LinearTerm::Column {
+                    coefficient: 65536,
+                    column: cols::OLD[6],
+                },
+                LinearTerm::Column {
+                    coefficient: 16777216,
+                    column: cols::OLD[7],
+                },
+            ]),
+            // old[2..7] = 0
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            // is_register (always 0 for this receiver)
+            BusValue::Packed {
+                start_column: cols::IS_REGISTER,
+                packing: Packing::Direct,
+            },
+            // base_address (DWordWL = 2 words)
+            BusValue::Packed {
+                start_column: cols::BASE_ADDRESS_0,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::BASE_ADDRESS_1,
+                packing: Packing::Direct,
+            },
+            // value[0] = lo32 = byte0 + 256*byte1 + 65536*byte2 + 16777216*byte3
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::VALUE[0],
+                },
+                LinearTerm::Column {
+                    coefficient: 256,
+                    column: cols::VALUE[1],
+                },
+                LinearTerm::Column {
+                    coefficient: 65536,
+                    column: cols::VALUE[2],
+                },
+                LinearTerm::Column {
+                    coefficient: 16777216,
+                    column: cols::VALUE[3],
+                },
+            ]),
+            // value[1] = hi32 = byte4 + 256*byte5 + 65536*byte6 + 16777216*byte7
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::VALUE[4],
+                },
+                LinearTerm::Column {
+                    coefficient: 256,
+                    column: cols::VALUE[5],
+                },
+                LinearTerm::Column {
+                    coefficient: 65536,
+                    column: cols::VALUE[6],
+                },
+                LinearTerm::Column {
+                    coefficient: 16777216,
+                    column: cols::VALUE[7],
+                },
+            ]),
+            // value[2..7] = 0
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            // timestamp (DWordWL = 2 words)
+            BusValue::Packed {
+                start_column: cols::TIMESTAMP_0,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::TIMESTAMP_1,
+                packing: Packing::Direct,
+            },
+            // write flags
+            BusValue::Packed {
+                start_column: cols::WRITE2,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::WRITE4,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::WRITE8,
+                packing: Packing::Direct,
+            },
+        ],
+    ));
+
+    // -------------------------------------------------------------------------
+    // Write receiver for REGISTER operations (is_register=1)
+    // -------------------------------------------------------------------------
+    // VALUE is already words [lo32, hi32, 0, 0, 0, 0, 0, 0]
+    // Fires when MU_WRITE=1 AND IS_REGISTER=1 (Product multiplicity)
+    interactions.push(BusInteraction::receiver(
+        BusId::Memw,
+        Multiplicity::Product(cols::MU_WRITE, cols::IS_REGISTER),
         vec![
             // is_register
             BusValue::Packed {
@@ -697,7 +838,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::BASE_ADDRESS_1,
                 packing: Packing::Direct,
             },
-            // value[8]
+            // value[8] - direct reads (words)
             BusValue::Packed {
                 start_column: cols::VALUE[0],
                 packing: Packing::Direct,
@@ -730,6 +871,100 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::VALUE[7],
                 packing: Packing::Direct,
             },
+            // timestamp (DWordWL = 2 words)
+            BusValue::Packed {
+                start_column: cols::TIMESTAMP_0,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::TIMESTAMP_1,
+                packing: Packing::Direct,
+            },
+            // write flags
+            BusValue::Packed {
+                start_column: cols::WRITE2,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::WRITE4,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::WRITE8,
+                packing: Packing::Direct,
+            },
+        ],
+    ));
+
+    // -------------------------------------------------------------------------
+    // Write receiver for MEMORY operations (is_register=0)
+    // -------------------------------------------------------------------------
+    // VALUE is bytes, reconstruct words via linear combination
+    // Fires when MU_WRITE=1 AND IS_REGISTER=0
+    // ProductNegated computes: MU_WRITE * (1 - IS_REGISTER)
+    interactions.push(BusInteraction::receiver(
+        BusId::Memw,
+        Multiplicity::ProductNegated(cols::MU_WRITE, cols::IS_REGISTER),
+        vec![
+            // is_register (always 0 for this receiver)
+            BusValue::Packed {
+                start_column: cols::IS_REGISTER,
+                packing: Packing::Direct,
+            },
+            // base_address (DWordWL = 2 words)
+            BusValue::Packed {
+                start_column: cols::BASE_ADDRESS_0,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::BASE_ADDRESS_1,
+                packing: Packing::Direct,
+            },
+            // value[0] = lo32 = byte0 + 256*byte1 + 65536*byte2 + 16777216*byte3
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::VALUE[0],
+                },
+                LinearTerm::Column {
+                    coefficient: 256,
+                    column: cols::VALUE[1],
+                },
+                LinearTerm::Column {
+                    coefficient: 65536,
+                    column: cols::VALUE[2],
+                },
+                LinearTerm::Column {
+                    coefficient: 16777216,
+                    column: cols::VALUE[3],
+                },
+            ]),
+            // value[1] = hi32 = byte4 + 256*byte5 + 65536*byte6 + 16777216*byte7
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::VALUE[4],
+                },
+                LinearTerm::Column {
+                    coefficient: 256,
+                    column: cols::VALUE[5],
+                },
+                LinearTerm::Column {
+                    coefficient: 65536,
+                    column: cols::VALUE[6],
+                },
+                LinearTerm::Column {
+                    coefficient: 16777216,
+                    column: cols::VALUE[7],
+                },
+            ]),
+            // value[2..7] = 0
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
             // timestamp (DWordWL = 2 words)
             BusValue::Packed {
                 start_column: cols::TIMESTAMP_0,

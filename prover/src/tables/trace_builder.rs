@@ -377,17 +377,11 @@ fn collect_store_op_from_cpu(op: &CpuOperation, memory_state: &mut MemoryState) 
     // Read old values and timestamps
     let (old_values, old_timestamps) = memory_state.read_bytes(base_address, 8);
 
-    // Pack store value as [lo32, hi32, 0, 0, 0, 0, 0, 0] to match CPU STORE bus interaction
-    let value_bytes = [
-        store_value & 0xFFFF_FFFF,
-        store_value >> 32,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-    ];
+    // Pack store value as individual bytes (per spec: memory uses 8 range-checked Bytes)
+    let mut value_bytes = [0u64; 8];
+    for (j, byte) in value_bytes.iter_mut().take(byte_count).enumerate() {
+        *byte = (store_value >> (j * 8)) & 0xFF;
+    }
 
     // Create MEMW operation (write) - M7 uses timestamp+1
     let memw_op = MemwOperation::new(
