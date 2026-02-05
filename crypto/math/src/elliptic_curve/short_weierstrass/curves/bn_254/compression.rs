@@ -66,7 +66,7 @@ impl Compress for BN254Curve {
 
     fn decompress_g1_point(input_bytes: &mut [u8]) -> Result<Self::G1Point, Self::Error> {
         // We check that input_bytes has 32 bytes.
-        if !input_bytes.len() == 32 {
+        if input_bytes.len() != 32 {
             return Err(ByteConversionError::InvalidValue);
         }
 
@@ -150,7 +150,7 @@ impl Compress for BN254Curve {
 
     #[allow(unused)]
     fn decompress_g2_point(input_bytes: &mut [u8]) -> Result<Self::G2Point, Self::Error> {
-        if !input_bytes.len() == 64 {
+        if input_bytes.len() != 64 {
             return Err(ByteConversionError::InvalidValue);
         }
 
