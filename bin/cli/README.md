@@ -17,12 +17,10 @@ The binary will be available at `target/release/cli`.
 Run a RISC-V ELF program without generating a proof. Useful for testing and debugging.
 
 ```bash
-# Basic execution
 cargo run -p cli --release -- execute <PROGRAM.elf>
-
-# With flamegraph output
-cargo run -p cli --release -- execute <PROGRAM.elf> --flamegraph folded.txt
 ```
+
+See [Guest Program Flamegraphs](#guest-program-flamegraphs) for profiling execution.
 
 ### Prove
 
