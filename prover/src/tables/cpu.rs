@@ -1142,6 +1142,57 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
+    // -------------------------------------------------------------------------
+    // MUL interaction (for MUL, MULH, MULHSU, MULHU)
+    // -------------------------------------------------------------------------
+    // MUL[arg1, signed, arg2, mp_selector, rvd, muldiv_selector] per spec CPU-CA44
+    // multiplicity = MUL
+    //
+    // The MUL table expects DWordHL (4 halfwords), but CPU has DWordBL (8 bytes).
+    // Both pack to 2 words (lo32, hi32), so the signatures match for the same values.
+    //
+    // rhs_signed = mp_selector per spec:
+    // - MUL/MULH: mp_selector=1 (both operands signed)
+    // - MULHU/MULHSU: mp_selector=0 (rhs unsigned)
+    //
+    // muldiv_selector distinguishes lo (0) from hi (1) result
+    interactions.push(BusInteraction::sender(
+        BusId::Mul,
+        Multiplicity::Column(cols::MUL),
+        vec![
+            // arg1 (lhs) as DWordBL (8 bytes → 2 elements)
+            BusValue::Packed {
+                start_column: cols::ARG1[0],
+                packing: Packing::DWordBL,
+            },
+            // lhs_signed = signed
+            BusValue::Packed {
+                start_column: cols::SIGNED,
+                packing: Packing::Direct,
+            },
+            // arg2 (rhs) as DWordBL (8 bytes → 2 elements)
+            BusValue::Packed {
+                start_column: cols::ARG2[0],
+                packing: Packing::DWordBL,
+            },
+            // rhs_signed = mp_selector
+            BusValue::Packed {
+                start_column: cols::MP_SELECTOR,
+                packing: Packing::Direct,
+            },
+            // result (rvd) as DWordWL (2 words → 2 elements)
+            BusValue::Packed {
+                start_column: cols::RVD_0,
+                packing: Packing::DWordWL,
+            },
+            // muldiv_selector: 0=lo (MUL), 1=hi (MULH/MULHSU/MULHU)
+            BusValue::Packed {
+                start_column: cols::MULDIV_SELECTOR,
+                packing: Packing::Direct,
+            },
+        ],
+    ));
+
     // =========================================================================
     // MEMW and LOAD bus interactions (M1, M3, M5, M6, M7)
     // =========================================================================

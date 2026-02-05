@@ -28,6 +28,7 @@ pub mod halt;
 pub mod load;
 pub mod lt;
 pub mod memw;
+pub mod mul;
 pub mod page;
 pub mod register;
 pub mod trace_builder;
