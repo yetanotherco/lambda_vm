@@ -646,13 +646,16 @@ class VirtualVariable(Variable):
 
         def is_covered(seen: set[tuple], indices: list[int]) -> bool:
             for s in seen:
-                if len(s) <= len(indices) and s == tuple(indices[:len(s)]):
+                if len(s) <= len(indices) and s == tuple(indices[: len(s)]):
                     return True
             return False
 
         def check_covered(t: Type, seen: set[tuple], indices: list[int]):
             if isinstance(t, Range):
-                reporter.asserts(is_covered(seen, indices), f"Virtual column {self.name!r} not completely defined")
+                reporter.asserts(
+                    is_covered(seen, indices),
+                    f"Virtual column {self.name!r} not completely defined",
+                )
             else:
                 for i in range(len(t)):
                     check_covered(t[i], seen, indices + [i])
