@@ -67,7 +67,6 @@ Focusing on the first statement, we observe that this trivially holds when $#`si
 while R3 deals with the case that $#`signed` = 1$.
 The second statement is enforced by @dvrm:c:abs_r_lt_abs_d.
 @dvrm:c:abs_r_if_negative and @dvrm:c:abs_r_if_nonnegative (resp. @dvrm:c:abs_d_if_negative and @dvrm:c:abs_d_if_nonnegative) are included to ensure that `abs_r` (resp. `abs_d`) is the absolute values of `r` (resp. `d`).
-@dvrm:c:abs_r_range_check and @dvrm:c:abs_d_range_check are required to uphold assumption @add:a:lhs required by the `SUB` chip.
 
 #render_constraint_table(chip, config, groups:("abs_diff", ))
 
