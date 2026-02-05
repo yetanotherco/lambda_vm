@@ -402,13 +402,13 @@ class TypeConfig:
                 f"Invalid range: {data!r}",
             )
             start, stop = data["range"]
-            if not isinstance(start, int):
+            if not isinstance(start, int) and not (isinstance(start, str) and start.isdigit()):
                 reporter.error(f"Range start not an int: {data!r}")
                 start = 0
-            if not isinstance(stop, int):
+            if not isinstance(stop, int) and not (isinstance(stop, str) and stop.isdigit()):
                 reporter.error(f"Range end not an int: {data!r}")
                 stop = start
-            self.range = Range(start, stop)
+            self.range = Range(int(start), int(stop))
             self.subtypes = []
         else:
             self.range = None
