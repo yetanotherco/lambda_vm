@@ -8,29 +8,15 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum, ValueHint};
-use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use executor::{
     elf::{Elf, SymbolTable},
     flamegraph::FlamegraphGenerator,
     vm::execution::Executor,
 };
-use prover::tables::bitwise;
-use prover::tables::decode;
-use prover::tables::trace_builder::Traces;
-use prover::tables::types::{GoldilocksExtension, GoldilocksField};
-use prover::test_utils::{
-    create_bitwise_air, create_cpu_air, create_decode_air, create_load_air, create_lt_air,
-    create_memw_air,
-};
 use sha3::{Digest, Sha3_256};
 use stark::proof::options::{ProofOptions, SecurityLevel};
-use stark::prover::{IsStarkProver, Prover};
-use stark::traits::AIR;
-use stark::verifier::{IsStarkVerifier, Verifier};
 
 use proof_bundle::{PROOF_BUNDLE_VERSION, ProofBundle};
-
-type F = GoldilocksField;
 
 /// Maximum ELF file size: 256 MB
 const MAX_ELF_FILE_SIZE: u64 = 256 * 1024 * 1024;
@@ -78,7 +64,6 @@ fn read_file_with_limit(path: &Path, max_size: u64, file_type: &str) -> Result<V
 
     std::fs::read(path).map_err(|e| format!("Failed to read {} file: {}", file_type, e))
 }
-type E = GoldilocksExtension;
 
 #[derive(Parser)]
 #[command(author, version, about = "Lambda VM - RISC-V zkVM", long_about = None)]
@@ -262,94 +247,27 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, security: SecurityPreset) 
         }
     };
 
-    // Hash the ELF file
     let elf_hash: [u8; 32] = Sha3_256::digest(&elf_data).into();
-
-    let program = match Elf::load(&elf_data) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("Failed to load ELF program: {:?}", e);
-            return ExitCode::FAILURE;
-        }
-    };
-
-    eprintln!("Executing program...");
-    let executor = match Executor::new(&program, vec![]) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("Failed to create executor: {:?}", e);
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let result = match executor.run() {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("Execution failed: {:?}", e);
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let num_steps = result.logs.len();
-    eprintln!("Executed {} instructions", num_steps);
-
-    eprintln!("Generating traces...");
-    let mut traces = match Traces::from_logs(&result.logs, result.instructions) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("Failed to generate traces: {}", e);
-            return ExitCode::FAILURE;
-        }
-    };
-
     let proof_options = security.to_proof_options();
 
-    eprintln!("Creating AIRs...");
-    let cpu_air = create_cpu_air(&proof_options);
-    let bitwise_air = create_bitwise_air(&proof_options).with_preprocessed(
-        bitwise::preprocessed_commitment(),
-        bitwise::NUM_PRECOMPUTED_COLS,
-    );
-    let lt_air = create_lt_air(&proof_options);
-    let memw_air = create_memw_air(&proof_options);
-    let load_air = create_load_air(&proof_options);
-    let decode_commitment = match decode::commitment_from_elf(&program, &proof_options) {
-        Ok(c) => c,
+    eprintln!("Generating proof (this may take a while)...");
+    let multi_proof = match prover::prove_with_options(&elf_data, &proof_options) {
+        Ok(proof) => proof,
         Err(e) => {
-            eprintln!("Failed to compute decode commitment: {:?}", e);
+            eprintln!("Proof generation failed: {}", e);
             return ExitCode::FAILURE;
         }
     };
-    let decode_air = create_decode_air(&proof_options)
-        .with_preprocessed(decode_commitment, decode::NUM_PRECOMPUTED_COLS);
 
-    let air_trace_pairs: Vec<(
-        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
-        _,
-        _,
-    )> = vec![
-        (&cpu_air, &mut traces.cpu, &()),
-        (&bitwise_air, &mut traces.bitwise, &()),
-        (&lt_air, &mut traces.lt, &()),
-        (&memw_air, &mut traces.memw, &()),
-        (&load_air, &mut traces.load, &()),
-        (&decode_air, &mut traces.decode, &()),
-    ];
+    // Get step count by re-executing (prove_with_options doesn't return it)
+    // TODO: Consider returning step count from prove_with_options
+    let program = Elf::load(&elf_data).unwrap();
+    let executor = Executor::new(&program, vec![]).unwrap();
+    let result = executor.run().unwrap();
+    let num_steps = result.logs.len();
 
-    eprintln!("Generating proof (this may take a while)...");
-    let multi_proof =
-        match Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])) {
-            Ok(proof) => proof,
-            Err(e) => {
-                eprintln!("Proof generation failed: {:?}", e);
-                return ExitCode::FAILURE;
-            }
-        };
-
-    // Create the proof bundle
     let bundle = ProofBundle::new(multi_proof, proof_options, elf_hash, num_steps);
 
-    // Serialize and write to file
     eprintln!("Writing proof bundle...");
     let file = match File::create(&output_path) {
         Ok(f) => f,
@@ -382,16 +300,7 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf) -> ExitCode {
         }
     };
 
-    let program = match Elf::load(&elf_data) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("Failed to load ELF program: {:?}", e);
-            return ExitCode::FAILURE;
-        }
-    };
-
     eprintln!("Reading proof bundle...");
-    // Check proof file size before reading
     let proof_metadata = match std::fs::metadata(&proof_path) {
         Ok(m) => m,
         Err(e) => {
@@ -488,41 +397,15 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf) -> ExitCode {
     eprintln!("  ELF hash: {}", truncated_hex(&bundle.metadata.elf_hash));
     eprintln!("  Steps: {}", bundle.metadata.num_steps);
 
-    // Reconstruct AIRs with the same proof options
-    let proof_options = &bundle.proof_options;
-    let cpu_air = create_cpu_air(proof_options);
-    let bitwise_air = create_bitwise_air(proof_options).with_preprocessed(
-        bitwise::preprocessed_commitment(),
-        bitwise::NUM_PRECOMPUTED_COLS,
-    );
-    let lt_air = create_lt_air(proof_options);
-    let memw_air = create_memw_air(proof_options);
-    let load_air = create_load_air(proof_options);
-    let decode_commitment = match decode::commitment_from_elf(&program, proof_options) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Failed to compute decode commitment: {:?}", e);
-            return ExitCode::FAILURE;
-        }
-    };
-    let decode_air = create_decode_air(proof_options)
-        .with_preprocessed(decode_commitment, decode::NUM_PRECOMPUTED_COLS);
-
-    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
-        &cpu_air,
-        &bitwise_air,
-        &lt_air,
-        &memw_air,
-        &load_air,
-        &decode_air,
-    ];
-
     eprintln!("Verifying proof...");
-    let result = Verifier::multi_verify(
-        &airs,
-        &bundle.multi_proof,
-        &mut DefaultTranscript::<E>::new(&[]),
-    );
+    let result =
+        match prover::verify_with_options(&bundle.multi_proof, &elf_data, &bundle.proof_options) {
+            Ok(valid) => valid,
+            Err(e) => {
+                eprintln!("Verification error: {}", e);
+                return ExitCode::FAILURE;
+            }
+        };
 
     if result {
         eprintln!("Verification succeeded!");
