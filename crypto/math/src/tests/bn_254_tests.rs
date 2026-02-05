@@ -386,11 +386,8 @@ mod compression_tests {
         let first_byte_without_control_bits = (first_byte << 2) >> 2;
         compressed_g[0] = first_byte_without_control_bits;
 
-        let [x1, x0] = FieldElement::<Degree2ExtensionField>::from_bytes_be(&compressed_g)
-            .unwrap()
-            .value()
-            .clone();
-        let compressed_g_x = FieldElement::<Degree2ExtensionField>::new([x0, x1]);
+        let compressed_g_x =
+            FieldElement::<Degree2ExtensionField>::from_bytes_be(&compressed_g).unwrap();
         let g_x = g.x();
 
         assert_eq!(*g_x, compressed_g_x);

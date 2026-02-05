@@ -5,6 +5,7 @@ use crate::field::{
         u64_goldilocks::GoldilocksField,
     },
 };
+use crate::traits::ByteConversion;
 
 type FpE = FieldElement<GoldilocksField>;
 
@@ -197,6 +198,34 @@ fn test_fp3_square_equals_mul() {
 fn test_fp3_double() {
     let a = Fp3E::new([FpE::from(7u64), FpE::from(11u64), FpE::from(13u64)]);
     assert_eq!(a.double(), a + a);
+}
+
+// =====================================================
+// BYTE SERIALIZATION TESTS
+// =====================================================
+
+#[test]
+#[cfg(feature = "alloc")]
+fn fp3_to_bytes_from_bytes_be_roundtrip() {
+    let x = Fp3E::new([FpE::from(111u64), FpE::from(222u64), FpE::from(333u64)]);
+    assert_eq!(Fp3E::from_bytes_be(&x.to_bytes_be()).unwrap(), x);
+}
+
+#[test]
+#[cfg(feature = "alloc")]
+fn fp3_to_bytes_from_bytes_le_roundtrip() {
+    let x = Fp3E::new([FpE::from(111u64), FpE::from(222u64), FpE::from(333u64)]);
+    assert_eq!(Fp3E::from_bytes_le(&x.to_bytes_le()).unwrap(), x);
+}
+
+#[test]
+#[cfg(feature = "alloc")]
+fn fp3_be_is_reverse_of_le() {
+    let x = Fp3E::new([FpE::from(111u64), FpE::from(222u64), FpE::from(333u64)]);
+    let be = x.to_bytes_be();
+    let le = x.to_bytes_le();
+    let reversed_le: Vec<u8> = le.into_iter().rev().collect();
+    assert_eq!(be, reversed_le);
 }
 
 // =====================================================

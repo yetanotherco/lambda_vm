@@ -232,10 +232,10 @@ impl IsSubFieldOf<Degree4BabyBearU32ExtensionField> for Babybear31PrimeField {
 impl ByteConversion for [FieldElement<Babybear31PrimeField>; 4] {
     #[cfg(feature = "alloc")]
     fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
-        let mut byte_slice = ByteConversion::to_bytes_be(&self[0]);
-        byte_slice.extend(ByteConversion::to_bytes_be(&self[1]));
+        let mut byte_slice = ByteConversion::to_bytes_be(&self[3]);
         byte_slice.extend(ByteConversion::to_bytes_be(&self[2]));
-        byte_slice.extend(ByteConversion::to_bytes_be(&self[3]));
+        byte_slice.extend(ByteConversion::to_bytes_be(&self[1]));
+        byte_slice.extend(ByteConversion::to_bytes_be(&self[0]));
         byte_slice
     }
 
@@ -254,10 +254,10 @@ impl ByteConversion for [FieldElement<Babybear31PrimeField>; 4] {
     {
         const BYTES_PER_FIELD: usize = 32;
 
-        let x0 = FieldElement::from_bytes_be(&bytes[0..BYTES_PER_FIELD])?;
-        let x1 = FieldElement::from_bytes_be(&bytes[BYTES_PER_FIELD..BYTES_PER_FIELD * 2])?;
-        let x2 = FieldElement::from_bytes_be(&bytes[BYTES_PER_FIELD * 2..BYTES_PER_FIELD * 3])?;
-        let x3 = FieldElement::from_bytes_be(&bytes[BYTES_PER_FIELD * 3..BYTES_PER_FIELD * 4])?;
+        let x3 = FieldElement::from_bytes_be(&bytes[0..BYTES_PER_FIELD])?;
+        let x2 = FieldElement::from_bytes_be(&bytes[BYTES_PER_FIELD..BYTES_PER_FIELD * 2])?;
+        let x1 = FieldElement::from_bytes_be(&bytes[BYTES_PER_FIELD * 2..BYTES_PER_FIELD * 3])?;
+        let x0 = FieldElement::from_bytes_be(&bytes[BYTES_PER_FIELD * 3..BYTES_PER_FIELD * 4])?;
 
         Ok([x0, x1, x2, x3])
     }
@@ -280,10 +280,10 @@ impl ByteConversion for [FieldElement<Babybear31PrimeField>; 4] {
 impl ByteConversion for FieldElement<Degree4BabyBearU32ExtensionField> {
     #[cfg(feature = "alloc")]
     fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
-        let mut byte_slice = ByteConversion::to_bytes_be(&self.value()[0]);
-        byte_slice.extend(ByteConversion::to_bytes_be(&self.value()[1]));
+        let mut byte_slice = ByteConversion::to_bytes_be(&self.value()[3]);
         byte_slice.extend(ByteConversion::to_bytes_be(&self.value()[2]));
-        byte_slice.extend(ByteConversion::to_bytes_be(&self.value()[3]));
+        byte_slice.extend(ByteConversion::to_bytes_be(&self.value()[1]));
+        byte_slice.extend(ByteConversion::to_bytes_be(&self.value()[0]));
         byte_slice
     }
     #[cfg(feature = "alloc")]
@@ -300,10 +300,10 @@ impl ByteConversion for FieldElement<Degree4BabyBearU32ExtensionField> {
         Self: Sized,
     {
         const BYTES_PER_FIELD: usize = 4;
-        let x0 = FieldElement::from_bytes_be(&bytes[0..BYTES_PER_FIELD])?;
-        let x1 = FieldElement::from_bytes_be(&bytes[BYTES_PER_FIELD..BYTES_PER_FIELD * 2])?;
-        let x2 = FieldElement::from_bytes_be(&bytes[BYTES_PER_FIELD * 2..BYTES_PER_FIELD * 3])?;
-        let x3 = FieldElement::from_bytes_be(&bytes[BYTES_PER_FIELD * 3..BYTES_PER_FIELD * 4])?;
+        let x3 = FieldElement::from_bytes_be(&bytes[0..BYTES_PER_FIELD])?;
+        let x2 = FieldElement::from_bytes_be(&bytes[BYTES_PER_FIELD..BYTES_PER_FIELD * 2])?;
+        let x1 = FieldElement::from_bytes_be(&bytes[BYTES_PER_FIELD * 2..BYTES_PER_FIELD * 3])?;
+        let x0 = FieldElement::from_bytes_be(&bytes[BYTES_PER_FIELD * 3..BYTES_PER_FIELD * 4])?;
 
         Ok(Self::new([x0, x1, x2, x3]))
     }

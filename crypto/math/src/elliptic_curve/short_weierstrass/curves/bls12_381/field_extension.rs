@@ -160,8 +160,8 @@ impl IsSubFieldOf<Degree2ExtensionField> for BLS12381PrimeField {
 impl ByteConversion for FieldElement<Degree2ExtensionField> {
     #[cfg(feature = "alloc")]
     fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
-        let mut byte_slice = ByteConversion::to_bytes_be(&self.value()[0]);
-        byte_slice.extend(ByteConversion::to_bytes_be(&self.value()[1]));
+        let mut byte_slice = ByteConversion::to_bytes_be(&self.value()[1]);
+        byte_slice.extend(ByteConversion::to_bytes_be(&self.value()[0]));
         byte_slice
     }
 
@@ -177,8 +177,8 @@ impl ByteConversion for FieldElement<Degree2ExtensionField> {
         Self: core::marker::Sized,
     {
         const BYTES_PER_FIELD: usize = 48;
-        let x0 = FieldElement::from_bytes_be(&bytes[0..BYTES_PER_FIELD])?;
-        let x1 = FieldElement::from_bytes_be(&bytes[BYTES_PER_FIELD..BYTES_PER_FIELD * 2])?;
+        let x1 = FieldElement::from_bytes_be(&bytes[0..BYTES_PER_FIELD])?;
+        let x0 = FieldElement::from_bytes_be(&bytes[BYTES_PER_FIELD..BYTES_PER_FIELD * 2])?;
         Ok(Self::new([x0, x1]))
     }
 

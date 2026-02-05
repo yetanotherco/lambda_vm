@@ -152,6 +152,16 @@ fn from_bytes_to_bytes_le_is_the_identity() {
     assert_eq!(Fp4E::from_bytes_le(&bytes).unwrap().to_bytes_le(), bytes);
 }
 
+#[test]
+#[cfg(feature = "alloc")]
+fn be_is_reverse_of_le() {
+    let x = Fp4E::new([FpE::from(2), FpE::from(4), FpE::from(6), FpE::from(8)]);
+    let be = x.to_bytes_be();
+    let le = x.to_bytes_le();
+    let reversed_le: Vec<u8> = le.into_iter().rev().collect();
+    assert_eq!(be, reversed_le);
+}
+
 #[cfg(all(feature = "std", not(feature = "instruments")))]
 mod test_babybear_31_fft {
     use super::*;

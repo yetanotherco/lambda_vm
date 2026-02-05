@@ -5,6 +5,7 @@ use crate::field::{
     },
     traits::IsFFTField,
 };
+use crate::traits::ByteConversion;
 
 type FpE = FieldElement<Babybear31PrimeField>;
 type Fp4E = FieldElement<Degree4BabyBearExtensionField>;
@@ -121,6 +122,30 @@ fn test_two_adic_primitve_root_of_unity() {
         generator.pow(2u64.pow(Degree4BabyBearExtensionField::TWO_ADICITY as u32)),
         Fp4E::one()
     );
+}
+
+#[test]
+#[cfg(feature = "alloc")]
+fn to_bytes_from_bytes_be_roundtrip() {
+    let x = Fp4E::new([FpE::from(2), FpE::from(4), FpE::from(6), FpE::from(8)]);
+    assert_eq!(Fp4E::from_bytes_be(&x.to_bytes_be()).unwrap(), x);
+}
+
+#[test]
+#[cfg(feature = "alloc")]
+fn to_bytes_from_bytes_le_roundtrip() {
+    let x = Fp4E::new([FpE::from(2), FpE::from(4), FpE::from(6), FpE::from(8)]);
+    assert_eq!(Fp4E::from_bytes_le(&x.to_bytes_le()).unwrap(), x);
+}
+
+#[test]
+#[cfg(feature = "alloc")]
+fn be_is_reverse_of_le() {
+    let x = Fp4E::new([FpE::from(2), FpE::from(4), FpE::from(6), FpE::from(8)]);
+    let be = x.to_bytes_be();
+    let le = x.to_bytes_le();
+    let reversed_le: Vec<u8> = le.into_iter().rev().collect();
+    assert_eq!(be, reversed_le);
 }
 
 #[cfg(all(feature = "std", not(feature = "instruments")))]

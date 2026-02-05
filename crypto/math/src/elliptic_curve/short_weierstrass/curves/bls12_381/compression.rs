@@ -127,10 +127,8 @@ impl Compress for BLS12381Curve {
             let x = point_affine.x();
             let y = point_affine.y();
 
-            let x_rev: FieldElement<Degree2ExtensionField> =
-                FieldElement::new([x.value()[1].clone(), x.value()[0].clone()]);
             let mut x_bytes = [0u8; 96];
-            let bytes = x_rev.to_bytes_be();
+            let bytes = x.to_bytes_be();
             x_bytes.copy_from_slice(&bytes);
 
             // Set first bit to to 1 indicate this is compressed element.
