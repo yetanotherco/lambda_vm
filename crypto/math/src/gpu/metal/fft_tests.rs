@@ -232,6 +232,322 @@ fn test_differential_fft_random_small() {
 }
 
 // =========================================================================
+// IFFT and Roundtrip tests
+// =========================================================================
+
+/// Scale all elements by 1/n (for IFFT normalization)
+fn scale_by_inverse_n(data: &mut [u64], n: usize) {
+    let n_inv = goldilocks_inverse(n as u64);
+    for val in data.iter_mut() {
+        *val = goldilocks_mul(*val, n_inv);
+    }
+}
+
+/// Goldilocks field multiplication (for scaling)
+fn goldilocks_mul(a: u64, b: u64) -> u64 {
+    let product = (a as u128) * (b as u128);
+    goldilocks_reduce128(product)
+}
+
+/// Goldilocks field inversion using Fermat's little theorem
+fn goldilocks_inverse(a: u64) -> u64 {
+    const P_MINUS_2: u64 = 0xFFFF_FFFE_FFFF_FFFF;
+    goldilocks_pow(a, P_MINUS_2)
+}
+
+/// Binary exponentiation in Goldilocks field
+fn goldilocks_pow(mut base: u64, mut exp: u64) -> u64 {
+    let mut result = 1u64;
+    while exp > 0 {
+        if exp & 1 == 1 {
+            result = goldilocks_mul(result, base);
+        }
+        base = goldilocks_square(base);
+        exp >>= 1;
+    }
+    result
+}
+
+/// Square in Goldilocks field
+fn goldilocks_square(a: u64) -> u64 {
+    goldilocks_mul(a, a)
+}
+
+/// Reduce 128-bit to Goldilocks field element
+fn goldilocks_reduce128(x: u128) -> u64 {
+    const EPSILON: u64 = 0xFFFF_FFFF;
+
+    let x_lo = x as u64;
+    let x_hi = (x >> 64) as u64;
+    let x_hi_hi = x_hi >> 32;
+    let x_hi_lo = x_hi & EPSILON;
+
+    let (t0, borrow) = x_lo.overflowing_sub(x_hi_hi);
+    let t0 = if borrow { t0.wrapping_sub(EPSILON) } else { t0 };
+
+    let t1 = (x_hi_lo << 32).wrapping_sub(x_hi_lo);
+
+    let (result, carry) = t0.overflowing_add(t1);
+    if carry {
+        result.wrapping_add(EPSILON)
+    } else {
+        result
+    }
+}
+
+#[test]
+fn test_metal_ifft_basic() {
+    match MetalFft::new() {
+        Ok(fft) => {
+            let mut data: Vec<u64> = (0..16).collect();
+            match fft.ifft_natural_order(&mut data) {
+                Ok(()) => {
+                    // IFFT should also preserve the sum in the first element
+                    // (before scaling by 1/n)
+                    assert_eq!(canonicalize(data[0]), 120);
+                }
+                Err(e) => panic!("IFFT failed: {:?}", e),
+            }
+        }
+        Err(MetalError::NoDevice) => {
+            println!("Skipping test: no Metal device available");
+        }
+        Err(e) => panic!("Unexpected error: {:?}", e),
+    }
+}
+
+#[test]
+fn test_metal_fft_ifft_roundtrip_small() {
+    let metal_fft = match MetalFft::new() {
+        Ok(fft) => fft,
+        Err(MetalError::NoDevice) => {
+            println!("Skipping test: no Metal device available");
+            return;
+        }
+        Err(e) => panic!("Metal FFT creation failed: {:?}", e),
+    };
+
+    for order in 1..=6u32 {
+        let n = 1 << order;
+        let original: Vec<u64> = (0..n).map(|i| i as u64).collect();
+
+        // FFT -> IFFT -> scale by 1/n should return original
+        let mut result = original.clone();
+        if let Err(e) = metal_fft.fft_natural_order(&mut result) {
+            panic!("FFT failed: {:?}", e);
+        }
+        if let Err(e) = metal_fft.ifft_natural_order(&mut result) {
+            panic!("IFFT failed: {:?}", e);
+        }
+        scale_by_inverse_n(&mut result, n);
+
+        // Canonicalize for comparison
+        let result_canonical: Vec<u64> = result.iter().map(|&x| canonicalize(x)).collect();
+        let original_canonical: Vec<u64> = original.iter().map(|&x| canonicalize(x)).collect();
+
+        assert_eq!(
+            result_canonical, original_canonical,
+            "FFT->IFFT roundtrip failed for order {}",
+            order
+        );
+    }
+}
+
+#[test]
+fn test_metal_fft_ifft_roundtrip_medium() {
+    let metal_fft = match MetalFft::new() {
+        Ok(fft) => fft,
+        Err(MetalError::NoDevice) => {
+            println!("Skipping test: no Metal device available");
+            return;
+        }
+        Err(e) => panic!("Metal FFT creation failed: {:?}", e),
+    };
+
+    for order in 7..=10u32 {
+        let n = 1 << order;
+        let original: Vec<u64> = (0..n).map(|i| (i as u64) % GOLDILOCKS_PRIME).collect();
+
+        // FFT -> IFFT -> scale by 1/n should return original
+        let mut result = original.clone();
+        if let Err(e) = metal_fft.fft_natural_order(&mut result) {
+            panic!("FFT failed: {:?}", e);
+        }
+        if let Err(e) = metal_fft.ifft_natural_order(&mut result) {
+            panic!("IFFT failed: {:?}", e);
+        }
+        scale_by_inverse_n(&mut result, n);
+
+        // Canonicalize for comparison
+        let result_canonical: Vec<u64> = result.iter().map(|&x| canonicalize(x)).collect();
+        let original_canonical: Vec<u64> = original.iter().map(|&x| canonicalize(x)).collect();
+
+        assert_eq!(
+            result_canonical, original_canonical,
+            "FFT->IFFT roundtrip failed for order {}",
+            order
+        );
+    }
+}
+
+#[test]
+fn test_metal_ifft_fft_roundtrip() {
+    let metal_fft = match MetalFft::new() {
+        Ok(fft) => fft,
+        Err(MetalError::NoDevice) => {
+            println!("Skipping test: no Metal device available");
+            return;
+        }
+        Err(e) => panic!("Metal FFT creation failed: {:?}", e),
+    };
+
+    for order in 1..=8u32 {
+        let n = 1 << order;
+        let original: Vec<u64> = (0..n)
+            .map(|i| (i as u64 * 7 + 3) % GOLDILOCKS_PRIME)
+            .collect();
+
+        // IFFT -> FFT -> scale by 1/n should return original
+        let mut result = original.clone();
+        if let Err(e) = metal_fft.ifft_natural_order(&mut result) {
+            panic!("IFFT failed: {:?}", e);
+        }
+        if let Err(e) = metal_fft.fft_natural_order(&mut result) {
+            panic!("FFT failed: {:?}", e);
+        }
+        scale_by_inverse_n(&mut result, n);
+
+        // Canonicalize for comparison
+        let result_canonical: Vec<u64> = result.iter().map(|&x| canonicalize(x)).collect();
+        let original_canonical: Vec<u64> = original.iter().map(|&x| canonicalize(x)).collect();
+
+        assert_eq!(
+            result_canonical, original_canonical,
+            "IFFT->FFT roundtrip failed for order {}",
+            order
+        );
+    }
+}
+
+#[test]
+fn test_metal_fft_ifft_roundtrip_edge_cases() {
+    let metal_fft = match MetalFft::new() {
+        Ok(fft) => fft,
+        Err(MetalError::NoDevice) => {
+            println!("Skipping test: no Metal device available");
+            return;
+        }
+        Err(e) => panic!("Metal FFT creation failed: {:?}", e),
+    };
+
+    // All zeros
+    let n = 64;
+    let zeros: Vec<u64> = vec![0; n];
+    let mut result = zeros.clone();
+    if let Err(e) = metal_fft.fft_natural_order(&mut result) {
+        panic!("FFT failed: {:?}", e);
+    }
+    if let Err(e) = metal_fft.ifft_natural_order(&mut result) {
+        panic!("IFFT failed: {:?}", e);
+    }
+    scale_by_inverse_n(&mut result, n);
+    let result_canonical: Vec<u64> = result.iter().map(|&x| canonicalize(x)).collect();
+    assert_eq!(result_canonical, zeros, "Roundtrip failed for all zeros");
+
+    // All ones
+    let ones: Vec<u64> = vec![1; n];
+    let mut result = ones.clone();
+    if let Err(e) = metal_fft.fft_natural_order(&mut result) {
+        panic!("FFT failed: {:?}", e);
+    }
+    if let Err(e) = metal_fft.ifft_natural_order(&mut result) {
+        panic!("IFFT failed: {:?}", e);
+    }
+    scale_by_inverse_n(&mut result, n);
+    let result_canonical: Vec<u64> = result.iter().map(|&x| canonicalize(x)).collect();
+    assert_eq!(result_canonical, ones, "Roundtrip failed for all ones");
+
+    // Alternating
+    let alternating: Vec<u64> = (0..n as u64)
+        .map(|i| if i % 2 == 0 { 0 } else { 1 })
+        .collect();
+    let mut result = alternating.clone();
+    if let Err(e) = metal_fft.fft_natural_order(&mut result) {
+        panic!("FFT failed: {:?}", e);
+    }
+    if let Err(e) = metal_fft.ifft_natural_order(&mut result) {
+        panic!("IFFT failed: {:?}", e);
+    }
+    scale_by_inverse_n(&mut result, n);
+    let result_canonical: Vec<u64> = result.iter().map(|&x| canonicalize(x)).collect();
+    assert_eq!(
+        result_canonical, alternating,
+        "Roundtrip failed for alternating"
+    );
+
+    // Large values near prime
+    let large: Vec<u64> = (0..n as u64).map(|i| GOLDILOCKS_PRIME - 1 - i).collect();
+    let mut result = large.clone();
+    if let Err(e) = metal_fft.fft_natural_order(&mut result) {
+        panic!("FFT failed: {:?}", e);
+    }
+    if let Err(e) = metal_fft.ifft_natural_order(&mut result) {
+        panic!("IFFT failed: {:?}", e);
+    }
+    scale_by_inverse_n(&mut result, n);
+    let result_canonical: Vec<u64> = result.iter().map(|&x| canonicalize(x)).collect();
+    let large_canonical: Vec<u64> = large.iter().map(|&x| canonicalize(x)).collect();
+    assert_eq!(
+        result_canonical, large_canonical,
+        "Roundtrip failed for large values"
+    );
+}
+
+#[test]
+fn test_metal_fft_ifft_roundtrip_random() {
+    let metal_fft = match MetalFft::new() {
+        Ok(fft) => fft,
+        Err(MetalError::NoDevice) => {
+            println!("Skipping test: no Metal device available");
+            return;
+        }
+        Err(e) => panic!("Metal FFT creation failed: {:?}", e),
+    };
+
+    // Simple pseudo-random sequence for reproducibility
+    let mut rng_state = 98765u64;
+    let next_rand = |state: &mut u64| -> u64 {
+        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        *state
+    };
+
+    for order in 2..=8u32 {
+        let n = 1 << order;
+        let original: Vec<u64> = (0..n)
+            .map(|_| next_rand(&mut rng_state) % GOLDILOCKS_PRIME)
+            .collect();
+
+        let mut result = original.clone();
+        if let Err(e) = metal_fft.fft_natural_order(&mut result) {
+            panic!("FFT failed: {:?}", e);
+        }
+        if let Err(e) = metal_fft.ifft_natural_order(&mut result) {
+            panic!("IFFT failed: {:?}", e);
+        }
+        scale_by_inverse_n(&mut result, n);
+
+        let result_canonical: Vec<u64> = result.iter().map(|&x| canonicalize(x)).collect();
+        let original_canonical: Vec<u64> = original.iter().map(|&x| canonicalize(x)).collect();
+
+        assert_eq!(
+            result_canonical, original_canonical,
+            "Random roundtrip failed for order {}",
+            order
+        );
+    }
+}
+
+// =========================================================================
 // Batch FFT tests
 // =========================================================================
 

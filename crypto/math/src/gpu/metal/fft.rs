@@ -98,6 +98,72 @@ impl MetalFft {
         Ok(())
     }
 
+    /// Perform inverse FFT on the input data using Bowers algorithm
+    ///
+    /// The input is modified in-place and returned in bit-reversed order.
+    /// Apply bit-reversal permutation afterwards to get natural order.
+    ///
+    /// Note: This does NOT include the 1/n scaling factor. Caller must multiply
+    /// by 1/n after calling this function to get the true inverse.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` if:
+    /// - Input length is not a power of two
+    /// - Input length exceeds 2^32 (Goldilocks field's two-adic order)
+    pub fn ifft(&self, input: &mut [u64]) -> Result<(), MetalError> {
+        let n = input.len();
+        if !n.is_power_of_two() {
+            return Err(MetalError::InvalidInput(format!(
+                "Input length {} is not a power of two",
+                n
+            )));
+        }
+
+        if n <= 1 {
+            return Ok(());
+        }
+
+        let state = self.ctx.state();
+        let log_n = n.trailing_zeros() as usize;
+        let order = log_n as u64;
+
+        // Validate order is within Goldilocks field's two-adic order
+        if order > MAX_FFT_ORDER {
+            return Err(MetalError::InvalidInput(format!(
+                "FFT order {} exceeds Goldilocks field's two-adic order {}",
+                order, MAX_FFT_ORDER
+            )));
+        }
+
+        // Get INVERSE primitive root of unity for this FFT size
+        let inv_root = compute_inverse_root_of_unity(order);
+
+        // Allocate GPU buffers
+        let input_buffer = state.create_buffer_with_data(input)?;
+
+        // Compute layer twiddles on GPU using inverse root
+        let layer_twiddles = self.compute_layer_twiddles(state, order, inv_root)?;
+
+        // Execute Bowers FFT layers (same algorithm, just with inverse twiddles)
+        self.execute_bowers_fft(state, &input_buffer, &layer_twiddles, n, log_n)?;
+
+        // Copy results back
+        self.copy_buffer_to_slice(&input_buffer, input);
+
+        Ok(())
+    }
+
+    /// Perform inverse FFT and bit-reversal in one call, returning natural-ordered output
+    ///
+    /// Note: This does NOT include the 1/n scaling factor. Caller must multiply
+    /// by 1/n after calling this function to get the true inverse.
+    pub fn ifft_natural_order(&self, input: &mut [u64]) -> Result<(), MetalError> {
+        self.ifft(input)?;
+        self.bitrev_permutation_inplace(input)?;
+        Ok(())
+    }
+
     /// Perform batch FFT on multiple polynomials (SoA layout)
     ///
     /// `data` contains `num_polys` polynomials each of length `poly_len`,
@@ -524,6 +590,38 @@ fn compute_root_of_unity(order: u64) -> u64 {
         root = goldilocks_square(root);
     }
     root
+}
+
+/// Compute inverse primitive root of unity for order (FFT size = 2^order)
+fn compute_inverse_root_of_unity(order: u64) -> u64 {
+    let root = compute_root_of_unity(order);
+    goldilocks_inverse(root)
+}
+
+/// Compute multiplicative inverse in Goldilocks field using Fermat's little theorem
+/// a^(-1) = a^(p-2) mod p
+fn goldilocks_inverse(a: u64) -> u64 {
+    const P_MINUS_2: u64 = 0xFFFF_FFFE_FFFF_FFFF; // p - 2
+    goldilocks_pow(a, P_MINUS_2)
+}
+
+/// Compute a^exp mod p using binary exponentiation
+fn goldilocks_pow(mut base: u64, mut exp: u64) -> u64 {
+    let mut result = 1u64;
+    while exp > 0 {
+        if exp & 1 == 1 {
+            result = goldilocks_mul(result, base);
+        }
+        base = goldilocks_square(base);
+        exp >>= 1;
+    }
+    result
+}
+
+/// Multiply two Goldilocks field elements
+fn goldilocks_mul(a: u64, b: u64) -> u64 {
+    let product = (a as u128) * (b as u128);
+    goldilocks_reduce128(product)
 }
 
 /// Wait for command buffer completion and check for errors
