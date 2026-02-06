@@ -29,15 +29,19 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       run: ${{ steps.check.outputs.run }}
+      is-comparison: ${{ steps.check.outputs.is-comparison }}
     steps:
       - id: check
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "is-comparison=false" >> "$GITHUB_OUTPUT"
           elif [ "${{ github.event.label.name }}" = "bench-prove" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "is-comparison=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "is-comparison=false" >> "$GITHUB_OUTPUT"
           fi
 
   build-program:
@@ -73,27 +77,24 @@ jobs:
         id: export-hash
         run: echo "bench-hash=${{ hashFiles('executor/programs/bench/*') }}" >> "$GITHUB_OUTPUT"
 
-  build-binaries:
-    strategy:
-      matrix:
-        branch: [base, head]
-    name: Build CLI for ${{ matrix.branch }}
+  build-base-binary:
+    name: Build CLI for base
     needs: should-run
-    if: needs.should-run.outputs.run == 'true' && (matrix.branch == 'head' || github.event_name != 'workflow_dispatch')
+    if: needs.should-run.outputs.run == 'true' && needs.should-run.outputs.is-comparison == 'true'
     runs-on: ubuntu-24.04
     steps:
       - name: Fetch from cache
         uses: actions/cache@v4
         id: cache
         with:
-          path: bench-bin/cli-${{ matrix.branch }}
-          key: binary-prove-${{ github.event.pull_request[matrix.branch].sha || github.sha }}
+          path: bench-bin/cli-base
+          key: binary-prove-${{ github.event.pull_request.base.sha }}
 
       - name: Checkout
         if: steps.cache.outputs.cache-hit != 'true'
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request[matrix.branch].sha || github.sha }}
+          ref: ${{ github.event.pull_request.base.sha }}
 
       - name: Setup Rust Environment
         if: steps.cache.outputs.cache-hit != 'true'
@@ -110,11 +111,48 @@ jobs:
         run: |
           cargo build --release --bin cli
           mkdir -p bench-bin
-          cp target/release/cli bench-bin/cli-${{ matrix.branch }}
+          cp target/release/cli bench-bin/cli-base
+
+  build-head-binary:
+    name: Build CLI for head
+    needs: should-run
+    if: needs.should-run.outputs.run == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Fetch from cache
+        uses: actions/cache@v4
+        id: cache
+        with:
+          path: bench-bin/cli-head
+          key: binary-prove-${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Checkout
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Setup Rust Environment
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: ./.github/actions/setup-rust
+
+      - name: Fetch Rust cache
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "lambda-vm"
+
+      - name: Build binary
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          cargo build --release --bin cli
+          mkdir -p bench-bin
+          cp target/release/cli bench-bin/cli-head
 
   run-prove-benchmark:
     name: Run prove benchmark
-    needs: [build-program, build-binaries]
+    needs: [should-run, build-program, build-base-binary, build-head-binary]
+    if: "!failure() && !cancelled()"
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -124,7 +162,7 @@ jobs:
           tool: hyperfine@1.19
 
       - name: Fetch base binary
-        if: github.event_name != 'workflow_dispatch'
+        if: needs.should-run.outputs.is-comparison == 'true'
         uses: actions/cache/restore@v4
         with:
           path: bench-bin/cli-base
@@ -148,7 +186,7 @@ jobs:
             echo "::error::Head binary not found - cache restore failed"
             exit 1
           fi
-          if [ "${{ github.event_name }}" != "workflow_dispatch" ] && [ ! -f bench-bin/cli-base ]; then
+          if [ "${{ needs.should-run.outputs.is-comparison }}" = "true" ] && [ ! -f bench-bin/cli-base ]; then
             echo "::error::Base binary not found - cache restore failed"
             exit 1
           fi
