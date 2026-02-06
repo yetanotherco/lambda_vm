@@ -1263,7 +1263,7 @@ pub trait IsStarkProver<
                 main_evaluations,
                 logup_challenges.clone(),
             )?;
-            
+
             #[cfg(feature = "debug-checks")]
             print_bus_balance_report(&round_1_results);
 

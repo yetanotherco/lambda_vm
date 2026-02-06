@@ -892,12 +892,12 @@ pub trait IsStarkVerifier<
         // Phase C + Rounds 2-4: Interleaved per table (matches prover ordering)
         // =====================================================================
 
-        for (air, proof) in airs.iter().zip(&multi_proof.proofs) {
+        for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
             // Phase C: replay this table's auxiliary commitment
             if let Some(root) = proof.lde_trace_aux_merkle_root {
                 transcript.append_bytes(&root);
             }
-            
+
             // =====================================================================
             // Rounds 2-4: Verify each proof
             // =====================================================================
