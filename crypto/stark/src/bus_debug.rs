@@ -19,6 +19,7 @@
 //! - stderr - Mismatch report summary
 
 use std::collections::HashMap;
+use std::fmt::{Debug, Display};
 use std::sync::{LazyLock, Mutex};
 
 /// Single bus interaction log entry
@@ -213,6 +214,47 @@ impl BusDebugTracker {
         }
         grouped
     }
+}
+
+/// Log a bus interaction to the global tracker.
+///
+/// Converts field elements to strings and pushes a [`BusInteractionLog`] entry.
+/// Skips zero-multiplicity rows (padding) since they don't contribute to the bus.
+pub fn log_interaction<M: Display, F: Debug, E: Debug>(
+    table_name: &str,
+    row_idx: usize,
+    bus_id: u64,
+    is_sender: bool,
+    multiplicity: &M,
+    bus_elements: &[E],
+    fingerprint: &F,
+) {
+    let mult_str = format!("{}", multiplicity);
+    if mult_str == "0" {
+        return;
+    }
+    let mult_u64: u64 = mult_str.parse().unwrap_or_else(|_| {
+        eprintln!("[BusDebugTracker] WARNING: multiplicity parse failed, using u64::MAX");
+        u64::MAX
+    });
+
+    let log = BusInteractionLog {
+        table_name: table_name.to_string(),
+        row_idx,
+        bus_id,
+        is_sender,
+        multiplicity: mult_u64,
+        bus_elements: bus_elements.iter().map(|e| format!("{:?}", e)).collect(),
+        fingerprint: format!("{:?}", fingerprint),
+    };
+
+    BUS_DEBUG_TRACKER
+        .lock()
+        .unwrap_or_else(|e| {
+            eprintln!("[BusDebugTracker] WARNING: mutex was poisoned, recovering data");
+            e.into_inner()
+        })
+        .log(log);
 }
 
 /// Analysis result showing where mismatches occur

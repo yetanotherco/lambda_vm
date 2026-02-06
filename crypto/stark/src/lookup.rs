@@ -1119,37 +1119,15 @@ fn build_logup_term_column<F, E>(
 
         // Debug: Log bus interaction for mismatch analysis
         #[cfg(feature = "debug-checks")]
-        {
-            use crate::bus_debug::{BUS_DEBUG_TRACKER, BusInteractionLog};
-
-            if !multiplicity.eq(&FieldElement::<F>::zero()) {
-                // Convert multiplicity to u64 for logging via canonical representation
-                let mult_u64: u64 = format!("{}", multiplicity.canonical())
-                    .parse()
-                    .unwrap_or_else(|_| {
-                        eprintln!("[BusDebugTracker] WARNING: multiplicity parse failed, using u64::MAX");
-                        u64::MAX
-                    });
-
-                let log = BusInteractionLog {
-                    table_name: table_name.to_string(),
-                    row_idx: row,
-                    bus_id: table_interaction.bus_id,
-                    is_sender: table_interaction.is_sender,
-                    multiplicity: mult_u64,
-                    bus_elements: bus_elements.iter().map(|e| format!("{:?}", e)).collect(),
-                    fingerprint: format!("{:?}", fingerprint),
-                };
-
-                BUS_DEBUG_TRACKER
-                    .lock()
-                    .unwrap_or_else(|e| {
-                        eprintln!("[BusDebugTracker] WARNING: mutex was poisoned, recovering data");
-                        e.into_inner()
-                    })
-                    .log(log);
-            }
-        }
+        crate::bus_debug::log_interaction(
+            table_name,
+            row,
+            table_interaction.bus_id,
+            table_interaction.is_sender,
+            &multiplicity.canonical(),
+            &bus_elements,
+            &fingerprint,
+        );
 
         // term = sign * multiplicity / fingerprint
         let term = multiplicity
