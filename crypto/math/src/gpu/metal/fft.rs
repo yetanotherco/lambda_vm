@@ -246,8 +246,7 @@ impl MetalFft {
 
         for layer in 0..order as usize {
             let count = n >> (layer + 1);
-            let twiddle_buffer =
-                state.create_buffer(count * std::mem::size_of::<u64>())?;
+            let twiddle_buffer = state.create_buffer(count * std::mem::size_of::<u64>())?;
 
             let command_buffer = state.command_queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
