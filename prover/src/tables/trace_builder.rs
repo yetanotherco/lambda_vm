@@ -40,7 +40,7 @@ use super::load::{self, LoadOperation};
 use super::lt::{self, LtOperation};
 use super::memw::{self, MemwOperation};
 use super::mul::{self, MulOperation};
-use super::segment::{SegmentBoundary, SegmentConfig, SegmentResult};
+use super::segment::{OpBoundaries, SegmentResult, get_max_trace_size};
 use super::types::{GoldilocksExtension, GoldilocksField};
 use crate::Error;
 
@@ -65,24 +65,6 @@ impl MemoryState {
         Self {
             cells: HashMap::new(),
         }
-    }
-
-    /// Create memory state from a segment boundary.
-    pub fn from_boundary(boundary: &SegmentBoundary) -> Self {
-        let mut cells = HashMap::new();
-        for &(addr, val, ts) in &boundary.memory_state {
-            cells.insert(addr, (val, ts));
-        }
-        Self { cells }
-    }
-
-    /// Export memory state for segment boundary.
-    /// Returns (address, value, timestamp) tuples for all cells.
-    pub fn to_boundary(&self) -> Vec<(u64, u8, u64)> {
-        self.cells
-            .iter()
-            .map(|(&addr, &(val, ts))| (addr, val, ts))
-            .collect()
     }
 
     /// Read a byte from memory. Returns (value, timestamp) or (0, 0) if never written.
@@ -128,27 +110,6 @@ impl RegisterState {
             // All registers start at (0, 0) - value 0 at timestamp 0
             regs: [(0, 0); 32],
         }
-    }
-
-    /// Create register state from a segment boundary.
-    pub fn from_boundary(boundary: &SegmentBoundary) -> Self {
-        let mut regs = [(0u64, 0u64); 32];
-        // x0 is always (0, 0)
-        // x1-x31 come from boundary
-        for (i, &(val, ts)) in boundary.register_state.iter().enumerate() {
-            regs[i + 1] = (val, ts);
-        }
-        Self { regs }
-    }
-
-    /// Export register state for segment boundary.
-    /// Returns [(value, timestamp); 31] for x1-x31 (x0 excluded).
-    pub fn to_boundary(&self) -> [(u64, u64); 31] {
-        let mut result = [(0u64, 0u64); 31];
-        for (i, cell) in result.iter_mut().enumerate() {
-            *cell = self.regs[i + 1];
-        }
-        result
     }
 
     /// Read a register. Returns (value, last_write_timestamp).
@@ -225,6 +186,20 @@ fn collect_cpu_ops(
 // Phase 2: CPU ops → MEMW, LOAD, LT, Bitwise
 // =============================================================================
 
+/// Collected operations from phase 2.
+struct Phase2Result {
+    memw_ops: Vec<MemwOperation>,
+    load_ops: Vec<LoadOperation>,
+    lt_ops: Vec<LtOperation>,
+    bitwise_ops: Vec<BitwiseOperation>,
+    mul_ops: Vec<(MulOperation, bool)>,
+    branch_ops: Vec<BranchOperation>,
+    /// boundaries[i] = cumulative counts after processing cpu_ops[0..i].
+    /// boundaries[0] is always Default (all zeros).
+    /// Length = cpu_ops.len() + 1.
+    boundaries: Vec<OpBoundaries>,
+}
+
 /// Collects all derived operations from CPU operations in a single pass.
 ///
 /// This includes:
@@ -232,24 +207,27 @@ fn collect_cpu_ops(
 /// - LOAD ops (memory loads with sign/zero extension)
 /// - LT ops (from SLT/BLT instructions)
 /// - Bitwise lookups (from CPU operations)
+/// - MUL ops (from multiply instructions)
+/// - BRANCH ops (from taken branches)
+///
+/// Also tracks OpBoundaries for segmentation: cumulative derived op counts
+/// after each CPU op, allowing per-segment slicing without re-processing.
 ///
 /// MEMW and LOAD collection requires sequential processing with state tracking.
-///
-/// Returns: (memw_ops, load_ops, lt_ops, bitwise_ops)
 fn collect_ops_from_cpu(
     cpu_ops: &[CpuOperation],
     memory_state: &mut MemoryState,
     register_state: &mut RegisterState,
-) -> (
-    Vec<MemwOperation>,
-    Vec<LoadOperation>,
-    Vec<LtOperation>,
-    Vec<BitwiseOperation>,
-) {
+) -> Phase2Result {
     let mut memw_ops = Vec::with_capacity(cpu_ops.len() * 3);
     let mut load_ops = Vec::with_capacity(cpu_ops.len() / 8 + 1);
     let mut lt_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
     let mut bitwise_ops = Vec::with_capacity(cpu_ops.len() * 4);
+    let mut mul_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
+    let mut branch_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
+
+    let mut boundaries = Vec::with_capacity(cpu_ops.len() + 1);
+    boundaries.push(OpBoundaries::default());
 
     for op in cpu_ops {
         // --- MEMW and LOAD (require state tracking, order matters) ---
@@ -280,9 +258,49 @@ fn collect_ops_from_cpu(
 
         // Collect bitwise lookups
         bitwise_ops.extend(op.collect_bitwise_ops());
+
+        // Collect MUL operations
+        if op.decode.op_mul {
+            let lhs = op.compute_arg1();
+            let lhs_signed = op.decode.signed;
+            let rhs_signed = op.decode.mp_selector;
+            let rhs = op.compute_arg2();
+            let wants_hi = op.decode.muldiv_selector;
+            mul_ops.push((
+                MulOperation::new(lhs, lhs_signed, rhs, rhs_signed),
+                wants_hi,
+            ));
+        }
+
+        // Collect BRANCH operations
+        if op.branch_cond {
+            branch_ops.push(BranchOperation::new(
+                op.decode.pc,
+                op.decode.imm,
+                op.compute_arg1(),
+                op.decode.op_jalr,
+            ));
+        }
+
+        boundaries.push(OpBoundaries {
+            memw: memw_ops.len(),
+            load: load_ops.len(),
+            lt: lt_ops.len(),
+            mul: mul_ops.len(),
+            branch: branch_ops.len(),
+            bitwise: bitwise_ops.len(),
+        });
     }
 
-    (memw_ops, load_ops, lt_ops, bitwise_ops)
+    Phase2Result {
+        memw_ops,
+        load_ops,
+        lt_ops,
+        bitwise_ops,
+        mul_ops,
+        branch_ops,
+        boundaries,
+    }
 }
 
 /// Collects a LOAD operation and corresponding MEMW read from CpuOperation.
@@ -788,46 +806,20 @@ impl Traces {
         let cpu_ops = collect_cpu_ops(logs, &instructions, 4)?;
 
         // =====================================================================
-        // PHASE 2: CPU ops → MEMW, LOAD, LT, Bitwise, Branch
+        // PHASE 2: CPU ops → MEMW, LOAD, LT, Bitwise, MUL, Branch
         // =====================================================================
         // Processes cpu_ops in order. MEMW/LOAD need state tracking, LT/Bitwise don't.
         let mut memory_state = MemoryState::new();
         let mut register_state = RegisterState::new();
-        let (memw_ops, load_ops, mut lt_ops, mut bitwise_ops) =
-            collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
-
-        // Collect MUL operations from CPU ops where op_mul = true
-        let mul_ops: Vec<(MulOperation, bool)> = cpu_ops
-            .iter()
-            .filter(|op| op.decode.op_mul)
-            .map(|op| {
-                let lhs = op.compute_arg1();
-                let lhs_signed = op.decode.signed;
-                // rhs_signed = mp_selector per spec CPU-CA44:
-                // MUL/MULH have mp_selector=1 (both signed), MULHU/MULHSU have mp_selector=0 (rhs unsigned)
-                let rhs_signed = op.decode.mp_selector;
-                let rhs = op.compute_arg2();
-                let wants_hi = op.decode.muldiv_selector;
-                (
-                    MulOperation::new(lhs, lhs_signed, rhs, rhs_signed),
-                    wants_hi,
-                )
-            })
-            .collect();
-
-        // Collect BRANCH operations from CPU ops where branch_cond = true
-        let branch_ops: Vec<BranchOperation> = cpu_ops
-            .iter()
-            .filter(|op| op.branch_cond)
-            .map(|op| {
-                BranchOperation::new(
-                    op.decode.pc,
-                    op.decode.imm, // offset as full 64-bit DWordWL (already sign-extended)
-                    op.compute_arg1(), // register value must match CPU's arg1 for bus signature
-                    op.decode.op_jalr,
-                )
-            })
-            .collect();
+        let Phase2Result {
+            memw_ops,
+            load_ops,
+            mut lt_ops,
+            mut bitwise_ops,
+            mul_ops,
+            branch_ops,
+            ..
+        } = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
 
         // =====================================================================
         // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
@@ -886,157 +878,141 @@ impl Traces {
         })
     }
 
-    /// Generates all traces from execution logs for a segment.
+    /// Generates traces for all segments from execution logs.
     ///
     /// This is the segmented version of `from_logs` that:
-    /// - Accepts a `SegmentBoundary` to restore state from a previous segment
-    /// - Accepts a `SegmentConfig` to control segment-specific behavior
-    /// - Returns a `SegmentResult` with traces and optional next boundary
+    /// 1. Runs phases 1-2 on ALL logs (collecting ops + tracking OpBoundaries)
+    /// 2. Generates the full CPU trace, then chunks it by max_trace_size
+    /// 3. Slices derived ops per segment using OpBoundaries
+    /// 4. Runs phases 3-4 per segment (pure functions, no shared state)
+    /// 5. Generates per-segment traces
     ///
-    /// For the first segment, use `SegmentBoundary::initial()`.
-    /// For non-final segments, use `SegmentConfig::intermediate()`.
-    /// For the final segment (containing ECALL), use `SegmentConfig::final_segment()`.
+    /// Segmentation is determined internally based on CPU trace size.
+    /// ECALL always lands in the final segment (executor guarantees it's the last instruction).
     pub fn from_logs_segmented(
         logs: &[Log],
         instructions: U64HashMap<Instruction>,
-        boundary: &SegmentBoundary,
-        config: &SegmentConfig,
-    ) -> Result<SegmentResult, Error> {
-        // =====================================================================
-        // PHASE 1: Logs → CPU operations (with timestamp offset)
-        // =====================================================================
-        let cpu_ops = collect_cpu_ops(logs, &instructions, boundary.start_timestamp)?;
+    ) -> Result<Vec<SegmentResult>, Error> {
+        Self::from_logs_segmented_with_max_size(logs, instructions, get_max_trace_size())
+    }
 
+    /// Generates traces for all segments with a custom max trace size.
+    ///
+    /// Same as [`from_logs_segmented`] but allows specifying the segment size
+    /// directly, useful for testing.
+    pub fn from_logs_segmented_with_max_size(
+        logs: &[Log],
+        instructions: U64HashMap<Instruction>,
+        max_size: usize,
+    ) -> Result<Vec<SegmentResult>, Error> {
         // =====================================================================
-        // PHASE 2: CPU ops → MEMW, LOAD, LT, Bitwise, Branch
+        // PHASE 1: Logs → CPU operations
         // =====================================================================
-        // Initialize state from boundary (preserves state from previous segment)
-        let mut memory_state = MemoryState::from_boundary(boundary);
-        let mut register_state = RegisterState::from_boundary(boundary);
-
-        let (memw_ops, load_ops, mut lt_ops, mut bitwise_ops) =
-            collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
-
-        // Collect MUL operations from CPU ops where op_mul = true
-        let mul_ops: Vec<(MulOperation, bool)> = cpu_ops
-            .iter()
-            .filter(|op| op.decode.op_mul)
-            .map(|op| {
-                let lhs = op.compute_arg1();
-                let lhs_signed = op.decode.signed;
-                let rhs_signed = op.decode.mp_selector;
-                let rhs = op.compute_arg2();
-                let wants_hi = op.decode.muldiv_selector;
-                (
-                    MulOperation::new(lhs, lhs_signed, rhs, rhs_signed),
-                    wants_hi,
-                )
-            })
-            .collect();
-
-        // Collect BRANCH operations from CPU ops where branch_cond = true
-        let branch_ops: Vec<BranchOperation> = cpu_ops
-            .iter()
-            .filter(|op| op.branch_cond)
-            .map(|op| {
-                BranchOperation::new(
-                    op.decode.pc,
-                    op.decode.imm,
-                    op.compute_arg1(),
-                    op.decode.op_jalr,
-                )
-            })
-            .collect();
+        let cpu_ops = collect_cpu_ops(logs, &instructions, 4)?;
 
         // =====================================================================
-        // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
+        // PHASE 2: CPU ops → all derived ops (with OpBoundaries tracking)
         // =====================================================================
-        lt_ops.extend(collect_lt_from_memw(&memw_ops));
-
-        // =====================================================================
-        // PHASE 4: All → Bitwise lookups
-        // =====================================================================
-        bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
-        bitwise_ops.extend(collect_bitwise_from_memw(&memw_ops));
-        bitwise_ops.extend(collect_bitwise_from_mul(&mul_ops));
-        bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
+        let mut memory_state = MemoryState::new();
+        let mut register_state = RegisterState::new();
+        let phase2 = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
 
         // =====================================================================
-        // PHASE 5: Generate final traces
+        // Segment based on CPU op count
         // =====================================================================
+        let num_cpu_ops = cpu_ops.len();
+        let num_segments = num_cpu_ops.div_ceil(max_size);
+        let num_segments = num_segments.max(1); // At least one segment
 
-        // Generate HALT trace based on segment type
-        let halt_trace = if config.is_final {
-            // Final segment: find ECALL and generate proper halt trace
-            let halt_op = cpu_ops
-                .iter()
-                .rev()
-                .find(|op| op.decode.op_ecall)
-                .ok_or(Error::MissingHaltEcall)?;
-            halt::generate_halt_trace(halt_op.timestamp)
-        } else {
-            // Non-final segment: verify no ECALL present (would cause bus imbalance)
-            if cpu_ops.iter().any(|op| op.decode.op_ecall) {
-                return Err(Error::UnexpectedEcallInSegment);
-            }
-            // Generate dummy halt trace
-            halt::generate_dummy_halt_trace()
-        };
+        let mut results = Vec::with_capacity(num_segments);
 
-        let cpu = cpu::generate_cpu_trace(&cpu_ops);
-        let lt = lt::generate_lt_trace(&lt_ops);
-        let memw = memw::generate_memw_trace(&memw_ops);
-        let load = load::generate_load_trace(&load_ops);
-        let mul = mul::generate_mul_trace(&mul_ops);
-        let branch = branch::generate_branch_trace(&branch_ops);
+        for seg_idx in 0..num_segments {
+            let cpu_start = seg_idx * max_size;
+            let cpu_end = ((seg_idx + 1) * max_size).min(num_cpu_ops);
+            let is_final = seg_idx == num_segments - 1;
 
-        let mut bitwise = bitwise::generate_bitwise_trace();
-        bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
+            let seg_cpu_ops = &cpu_ops[cpu_start..cpu_end];
 
-        // Generate DECODE trace and update multiplicities
-        let (mut decode, pc_to_row) = decode::generate_decode_trace(&instructions);
-        let num_padding_rows = cpu_ops.len().next_power_of_two() - cpu_ops.len();
-        let mut decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
-        decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
-        decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
+            // Slice derived ops using OpBoundaries
+            let b_start = &phase2.boundaries[cpu_start];
+            let b_end = &phase2.boundaries[cpu_end];
 
-        let traces = Traces {
-            cpu,
-            bitwise,
-            lt,
-            memw,
-            load,
-            decode,
-            mul,
-            branch,
-            halt: halt_trace,
-        };
+            let seg_memw_ops = &phase2.memw_ops[b_start.memw..b_end.memw];
+            let seg_load_ops = &phase2.load_ops[b_start.load..b_end.load];
+            let seg_mul_ops = &phase2.mul_ops[b_start.mul..b_end.mul];
+            let seg_branch_ops = &phase2.branch_ops[b_start.branch..b_end.branch];
 
-        // =====================================================================
-        // PHASE 6: Capture boundary for next segment
-        // =====================================================================
-        let next_boundary = if config.is_final {
-            None
-        } else {
-            // Calculate end timestamp: start + (num_logs * 4)
-            let end_timestamp = boundary.start_timestamp + (logs.len() as u64) * 4;
+            // Phase 2 LT ops (from SLT/BLT instructions only)
+            let mut seg_lt_ops: Vec<LtOperation> = phase2.lt_ops[b_start.lt..b_end.lt].to_vec();
 
-            // Get next PC from last log
-            let next_pc = logs.last().map(|l| l.next_pc).unwrap_or(0);
+            // =================================================================
+            // PHASE 3 (per-segment): MEMW → LT
+            // =================================================================
+            seg_lt_ops.extend(collect_lt_from_memw(seg_memw_ops));
 
-            Some(boundary.next(
-                end_timestamp,
-                memory_state.to_boundary(),
-                register_state.to_boundary(),
-                next_pc,
-            ))
-        };
+            // =================================================================
+            // PHASE 4 (per-segment): All → Bitwise lookups
+            // =================================================================
+            // Start with phase-2 bitwise ops (from CPU ops + load ops), sliced
+            let mut seg_bitwise_ops: Vec<BitwiseOperation> =
+                phase2.bitwise_ops[b_start.bitwise..b_end.bitwise].to_vec();
+            // Add phase-4 bitwise ops (from LT, MEMW, MUL, BRANCH)
+            seg_bitwise_ops.extend(collect_bitwise_from_lt(&seg_lt_ops));
+            seg_bitwise_ops.extend(collect_bitwise_from_memw(seg_memw_ops));
+            seg_bitwise_ops.extend(collect_bitwise_from_mul(seg_mul_ops));
+            seg_bitwise_ops.extend(collect_bitwise_from_branch(seg_branch_ops));
 
-        Ok(SegmentResult {
-            traces,
-            next_boundary,
-            is_final: config.is_final,
-        })
+            // =================================================================
+            // PHASE 5 (per-segment): Generate traces
+            // =================================================================
+
+            // HALT trace
+            let halt_trace = if is_final {
+                let halt_op = cpu_ops
+                    .iter()
+                    .rev()
+                    .find(|op| op.decode.op_ecall)
+                    .ok_or(Error::MissingHaltEcall)?;
+                halt::generate_halt_trace(halt_op.timestamp)
+            } else {
+                halt::generate_dummy_halt_trace()
+            };
+
+            let cpu = cpu::generate_cpu_trace(seg_cpu_ops);
+            let lt = lt::generate_lt_trace(&seg_lt_ops);
+            let memw = memw::generate_memw_trace(seg_memw_ops);
+            let load = load::generate_load_trace(seg_load_ops);
+            let mul = mul::generate_mul_trace(seg_mul_ops);
+            let branch = branch::generate_branch_trace(seg_branch_ops);
+
+            let mut bitwise_table = bitwise::generate_bitwise_trace();
+            bitwise::update_multiplicities(&mut bitwise_table, &seg_bitwise_ops);
+
+            let (mut decode, pc_to_row) = decode::generate_decode_trace(&instructions);
+            let seg_num_ops = seg_cpu_ops.len();
+            let num_padding_rows = seg_num_ops.next_power_of_two() - seg_num_ops;
+            let mut decode_lookups: Vec<u64> = seg_cpu_ops.iter().map(|op| op.decode.pc).collect();
+            decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
+            decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
+
+            results.push(SegmentResult {
+                traces: Traces {
+                    cpu,
+                    bitwise: bitwise_table,
+                    lt,
+                    memw,
+                    load,
+                    decode,
+                    mul,
+                    branch,
+                    halt: halt_trace,
+                },
+                is_final,
+                segment_index: seg_idx,
+            });
+        }
+
+        Ok(results)
     }
 
     /// Generates all traces with a trimmed bitwise table (TEST ONLY).

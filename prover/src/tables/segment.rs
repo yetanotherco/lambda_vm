@@ -1,8 +1,7 @@
 //! Trace segmentation support for large executions.
 //!
 //! When trace length exceeds the FFT domain limit, execution must be divided
-//! into segments. This module provides the data structures for segment boundaries
-//! and configuration.
+//! into segments. This module provides the data structures for segmentation.
 //!
 //! ## FFT Constraint
 //!
@@ -50,91 +49,28 @@ pub fn get_max_trace_size() -> usize {
         .unwrap_or(MAX_TRACE_SIZE)
 }
 
-/// State captured at segment boundaries for continuity.
+/// Cumulative derived op counts after processing each CPU operation.
 ///
-/// This struct captures all state needed to resume trace generation
-/// from a previous segment, ensuring continuity of timestamps, memory,
-/// and register values across segment boundaries.
-#[derive(Debug, Clone, Default)]
-pub struct SegmentBoundary {
-    /// Segment index (0-based)
-    pub segment_index: u32,
-
-    /// Starting timestamp for this segment.
-    /// Each instruction consumes 4 timestamps, so this should be
-    /// the end timestamp of the previous segment.
-    pub start_timestamp: u64,
-
-    /// Memory state: (address, value, timestamp) tuples.
-    /// Contains all memory cells that were written during previous segments.
-    pub memory_state: Vec<(u64, u8, u64)>,
-
-    /// Register state: [(value, timestamp); 31] for registers x1-x31.
-    /// x0 is excluded as it's always zero.
-    pub register_state: [(u64, u64); 31],
-
-    /// PC at segment start (for validation/debugging).
-    pub start_pc: u64,
-}
-
-impl SegmentBoundary {
-    /// Create the initial boundary for the first segment.
-    pub fn initial() -> Self {
-        Self {
-            segment_index: 0,
-            start_timestamp: 4, // Timestamps start at 4 (not 0)
-            memory_state: Vec::new(),
-            register_state: [(0, 0); 31],
-            start_pc: 0,
-        }
-    }
-
-    /// Create a boundary for the next segment.
-    pub fn next(
-        &self,
-        end_timestamp: u64,
-        memory_state: Vec<(u64, u8, u64)>,
-        register_state: [(u64, u64); 31],
-        next_pc: u64,
-    ) -> Self {
-        Self {
-            segment_index: self.segment_index + 1,
-            start_timestamp: end_timestamp,
-            memory_state,
-            register_state,
-            start_pc: next_pc,
-        }
-    }
-}
-
-/// Configuration for segment-based trace generation.
-#[derive(Debug, Clone)]
-pub struct SegmentConfig {
-    /// Whether this is the final segment (has ECALL).
-    /// Non-final segments use a dummy HALT trace with zero multiplicity.
-    pub is_final: bool,
-}
-
-impl SegmentConfig {
-    /// Create config for a non-final segment.
-    pub fn intermediate() -> Self {
-        Self { is_final: false }
-    }
-
-    /// Create config for the final segment.
-    pub fn final_segment() -> Self {
-        Self { is_final: true }
-    }
+/// During phase 2, we track how many derived ops have been generated after
+/// each CPU operation. This allows slicing derived ops per segment without
+/// re-processing: `segment_ops = all_ops[boundaries[start]..boundaries[end]]`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OpBoundaries {
+    pub memw: usize,
+    pub load: usize,
+    pub lt: usize,
+    pub mul: usize,
+    pub branch: usize,
+    /// Bitwise ops from phase 2 (CPU ops + load ops). Phase 4 adds more per-segment.
+    pub bitwise: usize,
 }
 
 /// Result of generating traces for a single segment.
 pub struct SegmentResult {
     /// Generated traces for this segment.
     pub traces: Traces,
-
-    /// Boundary state for the next segment (None if this is the final segment).
-    pub next_boundary: Option<SegmentBoundary>,
-
     /// Whether this was the final segment.
     pub is_final: bool,
+    /// Segment index (0-based).
+    pub segment_index: usize,
 }

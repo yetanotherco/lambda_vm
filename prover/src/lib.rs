@@ -49,8 +49,6 @@ pub enum Error {
     MissingInstruction(u64),
     /// Program does not contain an ECALL (halt) instruction
     MissingHaltEcall,
-    /// ECALL found in intermediate segment (should only be in final segment)
-    UnexpectedEcallInSegment,
     /// Executor failed (setup or runtime error)
     Execution(String),
     /// STARK proving failed
@@ -64,12 +62,6 @@ impl fmt::Display for Error {
             Error::MissingInstruction(pc) => write!(f, "instruction not found for PC {pc:#x}"),
             Error::MissingHaltEcall => {
                 write!(f, "program does not contain an ECALL (halt) instruction")
-            }
-            Error::UnexpectedEcallInSegment => {
-                write!(
-                    f,
-                    "ECALL found in intermediate segment (must be in final segment only)"
-                )
             }
             Error::Execution(msg) => write!(f, "execution error: {msg}"),
             Error::Prover(msg) => write!(f, "proving error: {msg}"),
