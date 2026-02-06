@@ -41,10 +41,13 @@ pub struct BusInteractionLog {
     pub fingerprint: String,
 }
 
-/// Global debug tracker - enabled via `debug-checks` feature flag
-/// Global debug tracker - recover data on mutex poison instead of panicking
+/// Global debug tracker - enabled via `debug-checks` feature flag.
+/// Recovers data on mutex poison instead of panicking.
 pub static BUS_DEBUG_TRACKER: LazyLock<Mutex<BusDebugTracker>> =
     LazyLock::new(|| Mutex::new(BusDebugTracker::new()));
+
+/// Cap at ~1.5 GiB of log data (~400 bytes per entry including heap allocations).
+const MAX_DEBUG_LOGS: usize = 4_000_000;
 
 pub struct BusDebugTracker {
     bus_filter: Option<u64>,
@@ -69,14 +72,22 @@ impl BusDebugTracker {
         }
     }
 
-    /// Log an interaction (optionally filtered by DEBUG_BUS_ID env var)
+    /// Log an interaction (optionally filtered by DEBUG_BUS_ID env var).
+    /// Stops collecting after [`MAX_DEBUG_LOGS`] entries to bound memory usage.
     pub fn log(&mut self, log: BusInteractionLog) {
         if let Some(filter) = self.bus_filter
             && log.bus_id != filter
         {
             return;
         }
-        self.logs.push(log);
+        if self.logs.len() < MAX_DEBUG_LOGS {
+            self.logs.push(log);
+        }
+    }
+
+    /// Returns `true` if the log was truncated due to the capacity limit.
+    pub fn is_truncated(&self) -> bool {
+        self.logs.len() >= MAX_DEBUG_LOGS
     }
 
     /// Get number of logged interactions

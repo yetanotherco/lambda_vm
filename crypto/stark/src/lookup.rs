@@ -1140,7 +1140,10 @@ fn build_logup_term_column<F, E>(
 
                 BUS_DEBUG_TRACKER
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(|e| {
+                        eprintln!("[BusDebugTracker] WARNING: mutex was poisoned, recovering data");
+                        e.into_inner()
+                    })
                     .log(log);
             }
         }
