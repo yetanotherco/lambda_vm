@@ -399,3 +399,42 @@ kernel void batch_bowers_fft_fused_layer(
     data[i2] = final_2;
     data[i3] = final_3;
 }
+
+/// Batch Bowers FFT single layer for multiple polynomials (SoA layout)
+kernel void batch_bowers_fft_single_layer(
+    device ulong* data [[buffer(0)]],
+    device const ulong* twiddles [[buffer(1)]],
+    constant uint& poly_len [[buffer(2)]],
+    constant uint& num_polys [[buffer(3)]],
+    constant uint& block_size [[buffer(4)]],
+    uint2 thread_pos [[thread_position_in_grid]]
+) {
+    uint poly_idx = thread_pos.y;
+    uint within_poly = thread_pos.x;
+
+    if (poly_idx >= num_polys) return;
+
+    uint half_block = block_size >> 1;
+    uint elements_per_poly = poly_len / 2;
+    if (within_poly >= elements_per_poly) return;
+
+    uint block_idx = within_poly / half_block;
+    uint j = within_poly % half_block;
+    uint block_start = block_idx * block_size;
+
+    uint base_offset = poly_idx * poly_len;
+
+    uint i0 = base_offset + block_start + j;
+    uint i1 = i0 + half_block;
+
+    ulong w = twiddles[j];
+    ulong a = data[i0];
+    ulong b = data[i1];
+
+    ulong sum = goldilocks_add(a, b);
+    ulong diff = goldilocks_sub(a, b);
+    ulong diff_w = goldilocks_mul(w, diff);
+
+    data[i0] = sum;
+    data[i1] = diff_w;
+}

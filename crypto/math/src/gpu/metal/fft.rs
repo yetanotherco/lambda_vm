@@ -453,46 +453,47 @@ impl MetalFft {
             }
         }
 
-        // Process remaining single layers for each polynomial
+        // Process remaining single layers using batched 2D dispatch
         while layer < log_n {
             let block_size = poly_len >> layer;
 
-            for poly_idx in 0..num_polys {
-                let offset = poly_idx * poly_len * std::mem::size_of::<u64>();
+            let command_buffer = state.command_queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
 
-                let command_buffer = state.command_queue.new_command_buffer();
-                let encoder = command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(state.batch_bowers_single_pipeline());
+            encoder.set_buffer(0, Some(data_buffer), 0);
+            encoder.set_buffer(1, Some(&layer_twiddles[layer]), 0);
+            encoder.set_bytes(
+                2,
+                std::mem::size_of::<u32>() as u64,
+                &(poly_len as u32) as *const u32 as *const _,
+            );
+            encoder.set_bytes(
+                3,
+                std::mem::size_of::<u32>() as u64,
+                &(num_polys as u32) as *const u32 as *const _,
+            );
+            encoder.set_bytes(
+                4,
+                std::mem::size_of::<u32>() as u64,
+                &(block_size as u32) as *const u32 as *const _,
+            );
 
-                encoder.set_compute_pipeline_state(state.bowers_single_pipeline());
-                encoder.set_buffer(0, Some(data_buffer), offset as u64);
-                encoder.set_buffer(1, Some(&layer_twiddles[layer]), 0);
-                encoder.set_bytes(
-                    2,
-                    std::mem::size_of::<u32>() as u64,
-                    &(block_size as u32) as *const u32 as *const _,
-                );
-                encoder.set_bytes(
-                    3,
-                    std::mem::size_of::<u32>() as u64,
-                    &(poly_len as u32) as *const u32 as *const _,
-                );
+            let threads_per_grid = MTLSize::new((poly_len / 2) as u64, num_polys as u64, 1);
+            let threads_per_group = MTLSize::new(
+                state
+                    .batch_bowers_single_pipeline()
+                    .max_total_threads_per_threadgroup()
+                    .min((poly_len / 2) as u64),
+                1,
+                1,
+            );
 
-                let threads_per_grid = MTLSize::new((poly_len / 2) as u64, 1, 1);
-                let threads_per_group = MTLSize::new(
-                    state
-                        .bowers_single_pipeline()
-                        .max_total_threads_per_threadgroup()
-                        .min((poly_len / 2) as u64),
-                    1,
-                    1,
-                );
+            encoder.dispatch_threads(threads_per_grid, threads_per_group);
+            encoder.end_encoding();
 
-                encoder.dispatch_threads(threads_per_grid, threads_per_group);
-                encoder.end_encoding();
-
-                command_buffer.commit();
-                wait_and_check_completion(&command_buffer)?;
-            }
+            command_buffer.commit();
+            wait_and_check_completion(&command_buffer)?;
 
             layer += 1;
         }

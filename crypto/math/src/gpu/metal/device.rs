@@ -61,6 +61,7 @@ struct MetalPipelines {
     calc_twiddles: ComputePipelineState,
     calc_layer_twiddles: ComputePipelineState,
     batch_bowers_fft_fused_layer: ComputePipelineState,
+    batch_bowers_fft_single_layer: ComputePipelineState,
 }
 
 impl MetalState {
@@ -101,6 +102,11 @@ impl MetalState {
                 &device,
                 &library,
                 "batch_bowers_fft_fused_layer",
+            )?,
+            batch_bowers_fft_single_layer: Self::create_pipeline(
+                &device,
+                &library,
+                "batch_bowers_fft_single_layer",
             )?,
         };
 
@@ -174,6 +180,10 @@ impl MetalState {
 
     pub fn batch_bowers_fused_pipeline(&self) -> &ComputePipelineState {
         &self.pipelines.batch_bowers_fft_fused_layer
+    }
+
+    pub fn batch_bowers_single_pipeline(&self) -> &ComputePipelineState {
+        &self.pipelines.batch_bowers_fft_single_layer
     }
 }
 
