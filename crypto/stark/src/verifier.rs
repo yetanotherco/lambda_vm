@@ -840,7 +840,7 @@ pub trait IsStarkVerifier<
         // For preprocessed tables, use the hardcoded commitment (verifier cannot
         // trust the prover). For normal tables, use the commitment from the proof.
 
-        for (air, proof) in airs.iter().zip(&multi_proof.proofs) {
+        for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
             if air.is_preprocessed() {
                 // Preprocessed table: VERIFY precomputed commitment matches hardcoded.
                 // This is the critical soundness check - ensures prover used correct precomputed values.
@@ -850,14 +850,16 @@ pub trait IsStarkVerifier<
                         // OK - commitment matches hardcoded
                     }
                     Some(actual) => {
-                        error!(
-                            "Preprocessed commitment mismatch: expected {:?}, got {:?}",
+                        eprintln!(
+                            "[VERIFIER] Preprocessed commitment MISMATCH for table {idx}: expected {:?}, got {:?}",
                             expected_precomputed, actual
                         );
                         return false;
                     }
                     None => {
-                        error!("Preprocessed table proof missing precomputed commitment");
+                        eprintln!(
+                            "[VERIFIER] Preprocessed table {idx} proof missing precomputed commitment"
+                        );
                         return false;
                     }
                 }
@@ -900,8 +902,14 @@ pub trait IsStarkVerifier<
         // Rounds 2-4: Verify each proof
         // =====================================================================
 
-        for (air, proof) in airs.iter().zip(&multi_proof.proofs) {
+        for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
             if !Self::verify_rounds_2_to_4(*air, proof, transcript, logup_challenges.clone()) {
+                eprintln!(
+                    "[VERIFIER] Table {} failed verify_rounds_2_to_4 (num_constraints={}, trace_cols={})",
+                    idx,
+                    air.context().num_transition_constraints(),
+                    air.context().trace_columns
+                );
                 return false;
             }
         }
@@ -924,8 +932,11 @@ pub trait IsStarkVerifier<
             if total != FieldElement::zero() {
                 #[cfg(not(feature = "test_fiat_shamir"))]
                 error!("LogUp bus does not balance: sum of accumulated values is not zero");
+                eprintln!("[VERIFIER] Bus balance check FAILED: total={:?}", total);
                 return false;
             }
+            #[cfg(feature = "debug-checks")]
+            eprintln!("[VERIFIER] Bus balance check PASSED");
         }
 
         true

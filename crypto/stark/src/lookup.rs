@@ -1,9 +1,11 @@
+#[cfg(feature = "debug-checks")]
+use std::collections::HashMap;
 use std::marker::PhantomData;
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use math::field::{
     element::FieldElement,
-    traits::{IsFFTField, IsField, IsSubFieldOf},
+    traits::{IsFFTField, IsField, IsPrimeField, IsSubFieldOf},
 };
 
 use crate::{
@@ -475,7 +477,7 @@ impl BusValue {
 
 /// Struct representing an AIR with Lookup. Contains own implementation of boundary constraints and auxiliary trace building
 pub struct AirWithBuses<
-    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
     E: IsField + Send + Sync,
     B: BoundaryConstraintBuilder<F, E, PI>,
     PI,
@@ -490,10 +492,12 @@ pub struct AirWithBuses<
     preprocessed_commitment: Option<crate::config::Commitment>,
     /// Number of precomputed columns (columns 0..n are precomputed, rest are multiplicities)
     num_precomputed_cols: Option<usize>,
+    /// Optional name for debug output (per-table bus sum tracking)
+    name: Option<String>,
 }
 
 impl<
-    F: IsFFTField + IsSubFieldOf<E> + Send + Sync + 'static,
+    F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync + 'static,
     E: IsField + Send + Sync + 'static,
     B: BoundaryConstraintBuilder<F, E, PI>,
     PI,
@@ -558,6 +562,7 @@ impl<
             boundary_constraint_builder: PhantomData,
             preprocessed_commitment: None,
             num_precomputed_cols: None,
+            name: None,
         }
     }
 
@@ -586,11 +591,48 @@ impl<
         self.num_precomputed_cols = Some(num_precomputed_cols);
         self
     }
+
+    /// Set a debug name for this AIR (for per-table bus sum tracking).
+    ///
+    /// When set, debug output will show bus sums prefixed with this name,
+    /// making it easy to identify which table is contributing to bus imbalances.
+    pub fn with_name(mut self, name: &str) -> Self {
+        self.name = Some(name.to_string());
+        self
+    }
+}
+
+/// Map bus ID to human-readable name for debug output.
+/// Based on BusId enum from prover/src/tables/types.rs.
+pub fn bus_name(bus_id: u64) -> &'static str {
+    match bus_id {
+        0 => "IsByte",
+        1 => "IsHalfword",
+        2 => "IsB20",
+        3 => "AndByte",
+        4 => "OrByte",
+        5 => "XorByte",
+        6 => "Msb8",
+        7 => "Msb16",
+        8 => "Zero",
+        9 => "Hwsl",
+        10 => "Hwslc",
+        11 => "Lt",
+        12 => "Mul",
+        13 => "Shift",
+        14 => "Memw",
+        15 => "Load",
+        16 => "Memory",
+        17 => "Branch",
+        18 => "Decode",
+        19 => "Ecall",
+        _ => "Unknown",
+    }
 }
 
 impl<F, E, B, PI> crate::traits::AIR for AirWithBuses<F, E, B, PI>
 where
-    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
     E: IsField + Send + Sync,
     B: BoundaryConstraintBuilder<F, E, PI>,
     PI: Send + Sync,
@@ -650,14 +692,50 @@ where
 
         // Build term columns (one per interaction)
         // Each term column contains: sign * m[i] / fp[i]
+        let table_name = self.name.as_deref().unwrap_or("UNKNOWN");
         for (i, interaction) in self
             .auxiliary_trace_build_data
             .interactions
             .iter()
             .enumerate()
         {
-            build_logup_term_column(i, interaction, trace, challenges);
+            build_logup_term_column(i, interaction, trace, challenges, table_name);
         }
+
+        // DEBUG: Sum terms by bus_id to find which bus is imbalanced
+        #[cfg(feature = "debug-checks")]
+        let (bus_sums, bus_sender_sums, bus_receiver_sums) = {
+            let mut bus_sums: HashMap<u64, FieldElement<E>> = HashMap::new();
+            let mut bus_sender_sums: HashMap<u64, FieldElement<E>> = HashMap::new();
+            let mut bus_receiver_sums: HashMap<u64, FieldElement<E>> = HashMap::new();
+
+            for (i, interaction) in self
+                .auxiliary_trace_build_data
+                .interactions
+                .iter()
+                .enumerate()
+            {
+                let mut col_sum = FieldElement::<E>::zero();
+                for row in 0..trace.num_rows() {
+                    col_sum = col_sum + trace.get_aux(row, i);
+                }
+                *bus_sums
+                    .entry(interaction.bus_id)
+                    .or_insert(FieldElement::zero()) += col_sum.clone();
+
+                if interaction.is_sender {
+                    *bus_sender_sums
+                        .entry(interaction.bus_id)
+                        .or_insert(FieldElement::zero()) += col_sum;
+                } else {
+                    let entry = bus_receiver_sums
+                        .entry(interaction.bus_id)
+                        .or_insert(FieldElement::zero());
+                    *entry = entry.clone() - col_sum;
+                }
+            }
+            (bus_sums, bus_sender_sums, bus_receiver_sums)
+        };
 
         // Build accumulated column (sums all term columns across rows)
         let acc_col_idx = num_interactions;
@@ -668,6 +746,14 @@ where
         Some(BusPublicInputs {
             initial_value: trace.get_aux(0, acc_col_idx).clone(),
             final_accumulated: trace.get_aux(last_row, acc_col_idx).clone(),
+            #[cfg(feature = "debug-checks")]
+            per_bus_sums: bus_sums,
+            #[cfg(feature = "debug-checks")]
+            per_bus_sender_sums: bus_sender_sums,
+            #[cfg(feature = "debug-checks")]
+            per_bus_receiver_sums: bus_receiver_sums,
+            #[cfg(feature = "debug-checks")]
+            table_name: self.name.clone().unwrap_or_else(|| "UNKNOWN".to_string()),
         })
     }
 
@@ -884,6 +970,18 @@ where
     pub initial_value: FieldElement<E>,
     /// Accumulated column value at last row (total sum of all terms)
     pub final_accumulated: FieldElement<E>,
+    /// Per-bus sums for this table (bus_id → sum) - for debug aggregation
+    #[cfg(feature = "debug-checks")]
+    pub per_bus_sums: HashMap<u64, FieldElement<E>>,
+    /// Per-bus sender sums (bus_id → sum) - positive contributions
+    #[cfg(feature = "debug-checks")]
+    pub per_bus_sender_sums: HashMap<u64, FieldElement<E>>,
+    /// Per-bus receiver sums (bus_id → sum) - absolute value (before negation)
+    #[cfg(feature = "debug-checks")]
+    pub per_bus_receiver_sums: HashMap<u64, FieldElement<E>>,
+    /// Table name for debug output
+    #[cfg(feature = "debug-checks")]
+    pub table_name: String,
 }
 
 /// Trait representing boundary constraint building behaviour.
@@ -927,8 +1025,9 @@ fn build_logup_term_column<F, E>(
     table_interaction: &BusInteraction,
     trace: &mut TraceTable<F, E>,
     challenges: &[FieldElement<E>],
+    #[cfg_attr(not(feature = "debug-checks"), allow(unused))] table_name: &str,
 ) where
-    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
     E: IsField + Send + Sync,
 {
     let main_segment_cols = trace.columns_main();
@@ -1018,12 +1117,41 @@ fn build_logup_term_column<F, E>(
 
         let fingerprint = z - &linear_combination;
 
+        // Debug: Log bus interaction for mismatch analysis
+        #[cfg(feature = "debug-checks")]
+        {
+            use crate::bus_debug::{BUS_DEBUG_TRACKER, BusInteractionLog};
+
+            if !multiplicity.eq(&FieldElement::<F>::zero()) {
+                // Convert multiplicity to u64 for logging via canonical representation
+                let mult_u64: u64 = format!("{}", multiplicity.canonical())
+                    .parse()
+                    .unwrap_or(u64::MAX);
+
+                let log = BusInteractionLog {
+                    table_name: table_name.to_string(),
+                    row_idx: row,
+                    bus_id: table_interaction.bus_id,
+                    is_sender: table_interaction.is_sender,
+                    multiplicity: mult_u64,
+                    bus_elements: bus_elements.iter().map(|e| format!("{:?}", e)).collect(),
+                    fingerprint: format!("{:?}", fingerprint),
+                };
+
+                BUS_DEBUG_TRACKER
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .log(log);
+            }
+        }
+
         // term = sign * multiplicity / fingerprint
         let term = multiplicity
             * &sign
             * fingerprint
                 .inv()
                 .expect("fingerprint is zero - probability of sampling zero is negligible");
+
         trace.set_aux(row, aux_column_idx, term);
     }
 }
