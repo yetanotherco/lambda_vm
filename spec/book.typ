@@ -157,6 +157,6 @@
       ])
     }
   } else {
-    common-formatting
+    body => body
   }
 }
