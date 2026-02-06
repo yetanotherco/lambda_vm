@@ -533,6 +533,13 @@ multiplicity = 1
 [[constraints.range]]
 kind = "interaction"
 tag = "IS_BYTE"
+input = [["idx", "rv2", "i"]]
+iter = ["i", 0, 7]
+multiplicity = 1
+
+[[constraints.range]]
+kind = "interaction"
+tag = "IS_BYTE"
 input = [["idx", "arg1", "i"]]
 iter = ["i", 0, 7]
 multiplicity = 1
