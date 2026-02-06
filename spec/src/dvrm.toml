@@ -230,8 +230,8 @@ ref = "dvrm:c:abs_r_if_negative"
 
 [[constraints.abs_diff]]
 kind = "arith"
-constraint = "$not#`sign_r` => #`abs_r[i]`=#`(r as DWordWL)[i]`$"
-poly = ["*", ["-", 1, "sign_r"], ["-", ["idx", "abs_r", "i"], ["idx", ["cast", "r", "DWordWL"], "i"]]]
+constraint = "$not#`sign_r` => #`abs_r` = #`r`$"
+poly = ["*", ["not", "sign_r"], ["-", ["idx", "abs_r", "i"], ["idx", ["cast", "r", "DWordWL"], "i"]]]
 iter = ["i", 0, 1]
 ref = "dvrm:c:abs_r_if_nonnegative"
 
@@ -245,9 +245,9 @@ ref = "dvrm:c:abs_d_if_negative"
 
 [[constraints.abs_diff]]
 kind = "arith"
-constraint = "$not#`sign_d` => #`abs_d[i]`=#`(d as DWordWL)[i]`$"
+constraint = "$not#`sign_d` => #`abs_d` = #`d`$"
 iter = ["i", 0, 1]
-poly = ["*", ["-", 1, "sign_d"], ["-", ["idx", "abs_d", "i"], ["idx", ["cast", "d", "DWordWL"], "i"]]]
+poly = ["*", ["not", "sign_d"], ["-", ["idx", "abs_d", "i"], ["idx", ["cast", "d", "DWordWL"], "i"]]]
 ref = "dvrm:c:abs_d_if_nonnegative"
 
 [[constraint_groups]]
