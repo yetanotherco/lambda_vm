@@ -228,6 +228,12 @@ where
     }
 
     let log_n = n.trailing_zeros() as usize;
+
+    // Validate twiddle table matches input size
+    if layer_twiddles.num_layers() != log_n {
+        return Err(FFTError::InputError(n));
+    }
+
     let mut layer = 0;
 
     // Process pairs of layers with 2-layer fusion.
@@ -602,6 +608,11 @@ where
 
     let log_n = n.trailing_zeros() as usize;
 
+    // Validate twiddle table matches input size
+    if layer_twiddles.num_layers() != log_n {
+        return Err(FFTError::InputError(n));
+    }
+
     for layer in (0..log_n).rev() {
         let block_size = n >> layer;
         let half_block = block_size >> 1;
@@ -624,6 +635,114 @@ where
     }
 
     Ok(())
+}
+
+/// Parallel Bowers IFFT with adaptive parallelization.
+///
+/// This is the parallel counterpart to `bowers_ifft_opt`. Like the forward parallel
+/// variant, it uses `par_chunks_mut` to process independent blocks in parallel when
+/// there are enough blocks to amortize threading overhead.
+///
+/// **Note**: This performs the inverse butterfly structure but does NOT apply
+/// the 1/n scaling factor. The caller must scale results by n^(-1) after the transform.
+///
+/// # Errors
+/// Returns `FFTError::InputError` if input length is not a power of two or if
+/// twiddle table size doesn't match input size.
+#[cfg(all(feature = "alloc", feature = "parallel"))]
+#[allow(clippy::needless_range_loop)]
+pub fn bowers_ifft_opt_parallel<F, E>(
+    input: &mut [FieldElement<E>],
+    layer_twiddles: &LayerTwiddles<F>,
+) -> Result<(), FFTError>
+where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField + Send + Sync,
+    FieldElement<F>: Send + Sync,
+    FieldElement<E>: Send + Sync,
+{
+    let parallel_threshold = adaptive_parallel_threshold();
+
+    let n = input.len();
+    if !n.is_power_of_two() {
+        return Err(FFTError::InputError(n));
+    }
+
+    if n <= 1 {
+        return Ok(());
+    }
+
+    if n <= 4 {
+        return bowers_ifft_opt(input, layer_twiddles);
+    }
+
+    let log_n = n.trailing_zeros() as usize;
+
+    // Validate twiddle table matches input size
+    if layer_twiddles.num_layers() != log_n {
+        return Err(FFTError::InputError(n));
+    }
+
+    // DIT: iterate layers from bottom (log_n - 1) to top (0)
+    for layer in (0..log_n).rev() {
+        let block_size = n >> layer;
+        let half_block = block_size >> 1;
+        let num_blocks = n / block_size;
+        let twiddles = layer_twiddles.get_layer(layer);
+
+        if num_blocks >= parallel_threshold {
+            input.par_chunks_mut(block_size).for_each(|block| {
+                process_ifft_single_layer_block(block, twiddles, half_block);
+            });
+        } else {
+            for block_start in (0..n).step_by(block_size) {
+                for j in 0..half_block {
+                    let i0 = block_start + j;
+                    let i1 = i0 + half_block;
+                    let w = &twiddles[j];
+
+                    let bw = w * &input[i1];
+                    let sum = &input[i0] + &bw;
+                    let diff = &input[i0] - &bw;
+
+                    input[i0] = sum;
+                    input[i1] = diff;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Process a single IFFT layer block (DIT butterfly: multiply then add/subtract).
+#[cfg(all(feature = "alloc", feature = "parallel"))]
+#[inline]
+fn process_ifft_single_layer_block<F, E>(
+    block: &mut [FieldElement<E>],
+    twiddles: &[FieldElement<F>],
+    half_block: usize,
+) where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField,
+{
+    debug_assert!(
+        twiddles.len() >= half_block,
+        "twiddles too short: {} < {}",
+        twiddles.len(),
+        half_block
+    );
+
+    for j in 0..half_block {
+        let w = &twiddles[j];
+
+        let bw = w * &block[j + half_block];
+        let sum = &block[j] + &bw;
+        let diff = &block[j] - &bw;
+
+        block[j] = sum;
+        block[j + half_block] = diff;
+    }
 }
 
 /// Optimized Bowers FFT with 2-layer fusion and sequential twiddle access.
@@ -659,6 +778,11 @@ where
     }
 
     let log_n = n.trailing_zeros() as usize;
+
+    // Validate twiddle table matches input size
+    if layer_twiddles.num_layers() != log_n {
+        return Err(FFTError::InputError(n));
+    }
 
     // Handle small sizes with simple sequential processing
     if n <= 4 {

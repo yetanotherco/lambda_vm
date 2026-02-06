@@ -204,6 +204,26 @@ fn test_bowers_fft_non_power_of_two() {
     assert!(matches!(err, Err(FFTError::InputError(7))));
 }
 
+#[test]
+fn test_bowers_fft_twiddle_size_mismatch() {
+    use crate::fft::errors::FFTError;
+    // Input of size 16 (order 4) with twiddles for order 3
+    let mut input: Vec<FE> = (0..16).map(|i| FE::from(i as u64)).collect();
+    let wrong_twiddles = LayerTwiddles::<F>::new(3).unwrap();
+    let err = bowers_fft_opt_fused(&mut input, &wrong_twiddles);
+    assert!(matches!(err, Err(FFTError::InputError(16))));
+}
+
+#[test]
+fn test_bowers_ifft_twiddle_size_mismatch() {
+    use crate::fft::errors::FFTError;
+    // Input of size 16 (order 4) with inverse twiddles for order 3
+    let mut input: Vec<FE> = (0..16).map(|i| FE::from(i as u64)).collect();
+    let wrong_twiddles = LayerTwiddles::<F>::new_inverse(3).unwrap();
+    let err = bowers_ifft_opt(&mut input, &wrong_twiddles);
+    assert!(matches!(err, Err(FFTError::InputError(16))));
+}
+
 // =========================================================================
 // IFFT tests
 // =========================================================================
@@ -554,6 +574,30 @@ proptest! {
 
         prop_assert_eq!(bowers_result, native_result);
     }
+
+    #[test]
+    fn proptest_bowers_fft_ifft_roundtrip(coeffs in field_vec(8)) {
+        let n = coeffs.len();
+        let order = n.trailing_zeros() as u64;
+
+        let fwd_twiddles = LayerTwiddles::<F>::new(order).unwrap();
+        let inv_twiddles = LayerTwiddles::<F>::new_inverse(order).unwrap();
+
+        // FFT -> bit-reverse -> bit-reverse -> IFFT -> scale
+        let mut result = coeffs.clone();
+        bowers_fft_opt_fused(&mut result, &fwd_twiddles).unwrap();
+        in_place_bit_reverse_permute(&mut result);
+
+        in_place_bit_reverse_permute(&mut result);
+        bowers_ifft_opt(&mut result, &inv_twiddles).unwrap();
+
+        let n_inv = FE::from(n as u64).inv().unwrap();
+        for val in result.iter_mut() {
+            *val = &*val * &n_inv;
+        }
+
+        prop_assert_eq!(result, coeffs);
+    }
 }
 
 // =========================================================================
@@ -563,6 +607,63 @@ proptest! {
 #[cfg(feature = "parallel")]
 mod parallel_tests {
     use super::*;
+
+    // ---- Parallel IFFT tests ----
+
+    #[test]
+    fn test_bowers_ifft_opt_parallel_roundtrip() {
+        for order in 2..=10u64 {
+            let n = 1 << order;
+            let input: Vec<FE> = (0..n).map(|i| FE::from(i as u64)).collect();
+
+            let fwd_twiddles = LayerTwiddles::<F>::new(order).unwrap();
+            let inv_twiddles = LayerTwiddles::<F>::new_inverse(order).unwrap();
+
+            // FFT
+            let mut result = input.clone();
+            bowers_fft_opt_fused_parallel(&mut result, &fwd_twiddles).unwrap();
+            in_place_bit_reverse_permute(&mut result);
+
+            // Parallel IFFT
+            in_place_bit_reverse_permute(&mut result);
+            bowers_ifft_opt_parallel(&mut result, &inv_twiddles).unwrap();
+
+            // Scale by 1/n
+            let n_inv = FE::from(n as u64).inv().unwrap();
+            for val in result.iter_mut() {
+                *val = &*val * &n_inv;
+            }
+
+            assert_eq!(
+                result, input,
+                "Parallel FFT->IFFT roundtrip failed for order {}",
+                order
+            );
+        }
+    }
+
+    #[test]
+    fn test_parallel_ifft_matches_sequential() {
+        for order in 2..=10u64 {
+            let n = 1 << order;
+            let input: Vec<FE> = (0..n).map(|i| FE::from(i as u64)).collect();
+            let inv_twiddles = LayerTwiddles::<F>::new_inverse(order).unwrap();
+
+            let mut result_seq = input.clone();
+            bowers_ifft_opt(&mut result_seq, &inv_twiddles).unwrap();
+
+            let mut result_par = input.clone();
+            bowers_ifft_opt_parallel(&mut result_par, &inv_twiddles).unwrap();
+
+            assert_eq!(
+                result_seq, result_par,
+                "Parallel IFFT differs from sequential for order {}",
+                order
+            );
+        }
+    }
+
+    // ---- Parallel FFT tests ----
 
     #[test]
     fn test_bowers_fft_opt_fused_parallel_small() {
