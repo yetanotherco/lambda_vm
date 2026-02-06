@@ -1,6 +1,7 @@
 use crate::field::element::FieldElement;
 use crate::field::extensions::cubic::{CubicExtensionField, HasCubicNonResidue};
 use crate::field::fields::u64_prime_field::{U64FieldElement, U64PrimeField};
+use crate::traits::ByteConversion;
 
 const ORDER_P: u64 = 13;
 
@@ -173,4 +174,40 @@ fn test_div_as_subfield_2() {
     let b = FEE::new([-FE::new(4), FE::new(2), FE::new(2)]);
     let expected_result = FEE::new([FE::new(3), FE::new(6), FE::new(11)]);
     assert_eq!((a / b).unwrap(), expected_result);
+}
+
+#[test]
+fn test_byte_conversion_be_roundtrip() {
+    let original = [FE::new(1), FE::new(7), FE::new(11)];
+    let bytes = original.to_bytes_be();
+    let recovered = <[FieldElement<U64PrimeField<ORDER_P>>; 3]>::from_bytes_be(&bytes).unwrap();
+    assert_eq!(original, recovered);
+}
+
+#[test]
+fn test_byte_conversion_le_roundtrip() {
+    let original = [FE::new(1), FE::new(7), FE::new(11)];
+    let bytes = original.to_bytes_le();
+    let recovered = <[FieldElement<U64PrimeField<ORDER_P>>; 3]>::from_bytes_le(&bytes).unwrap();
+    assert_eq!(original, recovered);
+}
+
+#[test]
+fn test_byte_conversion_be_le_differ() {
+    let original = [FE::new(1), FE::new(0), FE::new(0)];
+    let bytes_be = original.to_bytes_be();
+    let bytes_le = original.to_bytes_le();
+    assert_ne!(bytes_be, bytes_le);
+}
+
+#[test]
+fn test_byte_conversion_rejects_empty() {
+    assert!(<[FieldElement<U64PrimeField<ORDER_P>>; 3]>::from_bytes_be(&[]).is_err());
+    assert!(<[FieldElement<U64PrimeField<ORDER_P>>; 3]>::from_bytes_le(&[]).is_err());
+}
+
+#[test]
+fn test_byte_conversion_rejects_wrong_length() {
+    assert!(<[FieldElement<U64PrimeField<ORDER_P>>; 3]>::from_bytes_be(&[0; 7]).is_err());
+    assert!(<[FieldElement<U64PrimeField<ORDER_P>>; 3]>::from_bytes_le(&[0; 7]).is_err());
 }
