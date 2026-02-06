@@ -1,7 +1,7 @@
 .PHONY: deps deps-linux deps-macos prepare-test-data compile-programs-asm compile-programs-rust compile-bench \
 compile-programs clean-asm clean-rust clean-bench clean-shared clean test test-asm test-no-compile \
 test-asm-no-compile test-rust test-rust-no-compile test-executor flamegraph-prover \
-test-fast test-prover test-prover-all build check
+test-fast test-prover test-prover-all build check bench-prove
 
 UNAME := $(shell uname)
 
@@ -169,6 +169,10 @@ build:
 # Check (faster than build, no codegen)
 check:
 	cargo check --workspace
+
+bench-prove: compile-bench
+	cargo build --release -p cli
+	./scripts/bench_prove.sh $(BENCH_PROVE_PROGRAM)
 
 flamegraph-prover:
 	cd crypto/stark && samply record cargo bench --bench profile_prover --features parallel

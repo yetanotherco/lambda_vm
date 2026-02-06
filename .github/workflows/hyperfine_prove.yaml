@@ -1,0 +1,206 @@
+name: Hyperfine Prove Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      program:
+        description: 'Bench program to prove (e.g. keccak)'
+        required: false
+        default: 'keccak'
+      runs:
+        description: 'Number of hyperfine runs'
+        required: false
+        default: '3'
+  pull_request:
+    types: [labeled]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  BENCH_PROGRAM: ${{ github.event.inputs.program || 'keccak' }}
+  BENCH_RUNS: ${{ github.event.inputs.runs || '3' }}
+
+jobs:
+  should-run:
+    name: Check trigger
+    runs-on: ubuntu-24.04
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - id: check
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.label.name }}" = "bench-prove" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-program:
+    name: Build bench program
+    needs: should-run
+    if: needs.should-run.outputs.run == 'true'
+    runs-on: ubuntu-24.04
+    outputs:
+      bench-hash: ${{ steps.export-hash.outputs.bench-hash }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch from cache
+        uses: actions/cache@v4
+        id: cache
+        with:
+          path: bench_programs/*.elf
+          key: bench-prove-${{ hashFiles('executor/programs/bench/*') }}
+
+      - name: Setup Rust Environment
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: ./.github/actions/setup-rust
+
+      - name: Build programs
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p bench_programs
+          make -j compile-bench
+          cp executor/program_artifacts/bench/*.elf bench_programs/
+
+      - name: Export bench hash
+        id: export-hash
+        run: echo "bench-hash=${{ hashFiles('executor/programs/bench/*') }}" >> "$GITHUB_OUTPUT"
+
+  build-binaries:
+    strategy:
+      matrix:
+        branch: [base, head]
+    name: Build CLI for ${{ matrix.branch }}
+    needs: should-run
+    if: needs.should-run.outputs.run == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Fetch from cache
+        uses: actions/cache@v4
+        id: cache
+        with:
+          path: bench-bin/cli-${{ matrix.branch }}
+          key: binary-prove-${{ github.event.pull_request[matrix.branch].sha || github.sha }}
+
+      - name: Checkout
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request[matrix.branch].sha || github.sha }}
+
+      - name: Setup Rust Environment
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: ./.github/actions/setup-rust
+
+      - name: Fetch Rust cache
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "lambda-vm"
+
+      - name: Build binary
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          cargo build --release --bin cli
+          mkdir -p bench-bin
+          cp target/release/cli bench-bin/cli-${{ matrix.branch }}
+
+  run-prove-benchmark:
+    name: Run prove benchmark
+    needs: [build-program, build-binaries]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Install Hyperfine
+        uses: taiki-e/install-action@v2
+        with:
+          tool: hyperfine@1.19
+
+      - name: Fetch base binary
+        uses: actions/cache/restore@v4
+        with:
+          path: bench-bin/cli-base
+          key: binary-prove-${{ github.event.pull_request.base.sha || github.sha }}
+
+      - name: Fetch head binary
+        uses: actions/cache/restore@v4
+        with:
+          path: bench-bin/cli-head
+          key: binary-prove-${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Fetch bench programs
+        uses: actions/cache/restore@v4
+        with:
+          path: bench_programs/*.elf
+          key: bench-prove-${{ needs.build-program.outputs.bench-hash }}
+
+      - name: Benchmark prove
+        id: run-benchmark
+        run: |
+          sudo swapoff -a
+          chmod +x bench-bin/cli-base bench-bin/cli-head
+
+          PROGRAM="${{ env.BENCH_PROGRAM }}"
+          ELF="bench_programs/${PROGRAM}.elf"
+
+          if [ ! -f "$ELF" ]; then
+            echo "::error::Program $PROGRAM not found"
+            exit 1
+          fi
+
+          PROOF_BASE="/tmp/proof_base.cbor"
+          PROOF_HEAD="/tmp/proof_head.cbor"
+
+          hyperfine \
+            --warmup 0 \
+            --runs "${{ env.BENCH_RUNS }}" \
+            --prepare "rm -f $PROOF_BASE $PROOF_HEAD" \
+            -n "base prove $PROGRAM" \
+            "./bench-bin/cli-base prove $ELF --output $PROOF_BASE --security fast" \
+            -n "head prove $PROGRAM" \
+            "./bench-bin/cli-head prove $ELF --output $PROOF_HEAD --security fast" \
+            --export-markdown results.md
+
+          echo "has_results=true" >> "$GITHUB_OUTPUT"
+
+      - name: Build comment body
+        if: steps.run-benchmark.outputs.has_results == 'true'
+        run: |
+          {
+            echo "Prove Benchmark Results :lock:"
+            echo ""
+            echo "Program: \`${{ env.BENCH_PROGRAM }}\` | Security: \`fast\` | Runs: \`${{ env.BENCH_RUNS }}\`"
+            echo ""
+            cat results.md
+          } > comment_body.md
+
+      - name: Find comment
+        if: steps.run-benchmark.outputs.has_results == 'true' && github.event.pull_request.number
+        uses: peter-evans/find-comment@v3
+        id: fc
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-author: "github-actions[bot]"
+          body-includes: Prove Benchmark Results
+
+      - name: Create comment
+        if: steps.fc.outputs.comment-id == '' && steps.run-benchmark.outputs.has_results == 'true' && github.event.pull_request.number
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          body-path: comment_body.md
+
+      - name: Update comment
+        if: steps.fc.outputs.comment-id != '' && steps.run-benchmark.outputs.has_results == 'true' && github.event.pull_request.number
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          comment-id: ${{ steps.fc.outputs.comment-id }}
+          body-path: comment_body.md
+          edit-mode: replace
