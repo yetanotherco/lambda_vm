@@ -143,7 +143,7 @@ impl MetalState {
     pub fn create_buffer_with_data(&self, data: &[u64]) -> Result<Buffer, MetalError> {
         let buffer = self.device.new_buffer_with_data(
             data.as_ptr() as *const _,
-            (data.len() * std::mem::size_of::<u64>()) as u64,
+            std::mem::size_of_val(data) as u64,
             MTLResourceOptions::StorageModeShared,
         );
         Ok(buffer)

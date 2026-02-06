@@ -247,7 +247,7 @@ impl MetalFft {
         for layer in 0..order as usize {
             let count = n >> (layer + 1);
             let twiddle_buffer =
-                state.create_buffer((count * std::mem::size_of::<u64>()) as usize)?;
+                state.create_buffer(count * std::mem::size_of::<u64>())?;
 
             let command_buffer = state.command_queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
@@ -284,7 +284,7 @@ impl MetalFft {
             encoder.end_encoding();
 
             command_buffer.commit();
-            wait_and_check_completion(&command_buffer)?;
+            wait_and_check_completion(command_buffer)?;
 
             layer_twiddles.push(twiddle_buffer);
         }
@@ -340,7 +340,7 @@ impl MetalFft {
                 encoder.end_encoding();
 
                 command_buffer.commit();
-                wait_and_check_completion(&command_buffer)?;
+                wait_and_check_completion(command_buffer)?;
 
                 layer += 2;
             } else {
@@ -383,7 +383,7 @@ impl MetalFft {
             encoder.end_encoding();
 
             command_buffer.commit();
-            wait_and_check_completion(&command_buffer)?;
+            wait_and_check_completion(command_buffer)?;
 
             layer += 1;
         }
@@ -445,7 +445,7 @@ impl MetalFft {
                 encoder.end_encoding();
 
                 command_buffer.commit();
-                wait_and_check_completion(&command_buffer)?;
+                wait_and_check_completion(command_buffer)?;
 
                 layer += 2;
             } else {
@@ -493,7 +493,7 @@ impl MetalFft {
             encoder.end_encoding();
 
             command_buffer.commit();
-            wait_and_check_completion(&command_buffer)?;
+            wait_and_check_completion(command_buffer)?;
 
             layer += 1;
         }
@@ -521,11 +521,11 @@ impl MetalFft {
         }
 
         let state = self.ctx.state();
-        let log_n = n.trailing_zeros() as u32;
+        let log_n = n.trailing_zeros();
 
         // Two-buffer approach to avoid race conditions in GPU swaps
         let input_buffer = state.create_buffer_with_data(data)?;
-        let output_buffer = state.create_buffer(n * std::mem::size_of::<u64>())?;
+        let output_buffer = state.create_buffer(std::mem::size_of_val(data))?;
 
         let command_buffer = state.command_queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
@@ -559,7 +559,7 @@ impl MetalFft {
         encoder.end_encoding();
 
         command_buffer.commit();
-        wait_and_check_completion(&command_buffer)?;
+        wait_and_check_completion(command_buffer)?;
 
         self.copy_buffer_to_slice(&output_buffer, data);
 
@@ -632,12 +632,9 @@ fn wait_and_check_completion(command_buffer: &metal::CommandBufferRef) -> Result
     match command_buffer.status() {
         MTLCommandBufferStatus::Completed => Ok(()),
         MTLCommandBufferStatus::Error => Err(MetalError::ExecutionFailed),
-        status => {
+        _status => {
             // Should not happen after wait_until_completed
-            Err(MetalError::InvalidInput(format!(
-                "Unexpected command buffer status: {:?}",
-                status as u32
-            )))
+            Err(MetalError::ExecutionFailed)
         }
     }
 }
