@@ -56,20 +56,15 @@ jobs:
           name: bench-programs
           path: bench_programs/*.elf
 
-  build-binary:
-    strategy:
-      matrix:
-        branch: [base, head]
-    name: Build CLI for ${{ matrix.branch }}
-    if: >-
-      (github.event_name == 'workflow_dispatch' || github.event.label.name == 'bench-prove') &&
-      (matrix.branch == 'head' || github.event.label.name == 'bench-prove')
+  build-base-binary:
+    name: Build CLI for base
+    if: github.event.label.name == 'bench-prove'
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ matrix.branch == 'base' && github.event.pull_request.base.sha || github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.event.pull_request.base.sha }}
 
       - name: Setup Rust Environment
         uses: ./.github/actions/setup-rust
@@ -83,17 +78,47 @@ jobs:
         run: |
           cargo build --release --bin cli
           mkdir -p bench-bin
-          cp target/release/cli bench-bin/cli-${{ matrix.branch }}
+          cp target/release/cli bench-bin/cli-base
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
-          name: cli-${{ matrix.branch }}
-          path: bench-bin/cli-${{ matrix.branch }}
+          name: cli-base
+          path: bench-bin/cli-base
+
+  build-head-binary:
+    name: Build CLI for head
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'bench-prove'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Setup Rust Environment
+        uses: ./.github/actions/setup-rust
+
+      - name: Fetch Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "lambda-vm"
+
+      - name: Build binary
+        run: |
+          cargo build --release --bin cli
+          mkdir -p bench-bin
+          cp target/release/cli bench-bin/cli-head
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-head
+          path: bench-bin/cli-head
 
   run-prove-benchmark:
     name: Run prove benchmark
-    needs: [build-program, build-binary]
+    needs: [build-program, build-base-binary, build-head-binary]
     if: "!failure() && !cancelled()"
     runs-on: ubuntu-24.04
     timeout-minutes: 120
