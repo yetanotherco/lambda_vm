@@ -19,3 +19,5 @@ pub use backend::goldilocks_backend;
 pub use backend::CpuFft;
 #[cfg(feature = "metal")]
 pub use backend::MetalFftBackend;
+#[cfg(feature = "cuda")]
+pub use backend::CudaFft;

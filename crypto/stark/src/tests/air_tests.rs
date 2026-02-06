@@ -638,3 +638,50 @@ fn test_multi_column_fibonacci_4_cols() {
         &mut DefaultTranscript::<GoldilocksExt>::new(&[])
     ));
 }
+
+/// Prove/verify roundtrip using the unified FFT backend.
+///
+/// When compiled with `--features metal`, this exercises Metal GPU acceleration.
+/// Otherwise, it falls back to the CPU Bowers backend. Either way, it validates
+/// that the backend-aware proving pipeline produces valid proofs.
+#[test]
+fn test_multi_column_fibonacci_with_backend() {
+    let proof_options = ProofOptions::default_test_options();
+    let num_columns = 4;
+    let trace_length = 16;
+
+    let initial_values: Vec<(GoldilocksFE, GoldilocksFE)> = (0..num_columns)
+        .map(|i| {
+            (
+                GoldilocksFE::from((i + 1) as u64),
+                GoldilocksFE::from((i + 2) as u64),
+            )
+        })
+        .collect();
+
+    let mut trace = fibonacci_multi_column::compute_trace::<GoldilocksField, GoldilocksExt>(
+        &initial_values,
+        trace_length,
+    );
+    let pub_inputs = fibonacci_multi_column::create_public_inputs(initial_values);
+    let air = FibonacciMultiColumnAIR::<GoldilocksField, GoldilocksExt>::with_num_columns(
+        &proof_options,
+        num_columns,
+    );
+
+    let backend = math::fft::goldilocks_backend();
+    let proof = Prover::<GoldilocksField, GoldilocksExt, _>::prove_with_backend(
+        &air,
+        &mut trace,
+        &pub_inputs,
+        &mut DefaultTranscript::<GoldilocksExt>::new(&[]),
+        &backend,
+    )
+    .unwrap();
+
+    assert!(Verifier::<GoldilocksField, GoldilocksExt, _>::verify(
+        &proof,
+        &air,
+        &mut DefaultTranscript::<GoldilocksExt>::new(&[])
+    ));
+}

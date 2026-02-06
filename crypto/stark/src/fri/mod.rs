@@ -130,10 +130,45 @@ where
     FieldElement<E>: AsBytes + Sync + Send,
 {
     let mut evaluation =
-        Polynomial::evaluate_offset_fft(poly, 1, Some(domain_size), coset_offset).unwrap(); // TODO: return error
+        Polynomial::evaluate_offset_fft(poly, 1, Some(domain_size), coset_offset).unwrap();
 
     in_place_bit_reverse_permute(&mut evaluation);
 
+    build_fri_layer_from_evaluation(evaluation, coset_offset, domain_size)
+}
+
+/// Backend-accelerated variant of `new_fri_layer` for base field polynomials.
+///
+/// When FRI operates on base field polynomials (no extension), this uses the
+/// unified FFT backend for GPU acceleration.
+pub fn new_fri_layer_with_backend<F: IsFFTField>(
+    poly: &Polynomial<FieldElement<F>>,
+    coset_offset: &FieldElement<F>,
+    domain_size: usize,
+    backend: &(dyn math::fft::Fft<F> + Sync),
+) -> FriLayer<F, FriLayerMerkleTreeBackend<F>>
+where
+    FieldElement<F>: AsBytes + Sync + Send,
+{
+    let mut evaluation =
+        Polynomial::evaluate_offset_fft_with_backend(poly, 1, Some(domain_size), coset_offset, backend)
+            .expect("Backend FFT failed in FRI layer evaluation");
+
+    in_place_bit_reverse_permute(&mut evaluation);
+
+    build_fri_layer_from_evaluation(evaluation, coset_offset, domain_size)
+}
+
+fn build_fri_layer_from_evaluation<F: IsFFTField, E: IsField>(
+    evaluation: Vec<FieldElement<E>>,
+    coset_offset: &FieldElement<F>,
+    domain_size: usize,
+) -> FriLayer<E, FriLayerMerkleTreeBackend<E>>
+where
+    F: IsSubFieldOf<E>,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
     // Use fixed-size arrays instead of Vec for each pair (avoids allocation per pair)
     let leaves: Vec<[FieldElement<E>; 2]> = evaluation
         .chunks_exact(2)

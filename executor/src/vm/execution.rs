@@ -106,6 +106,22 @@ impl Executor {
     pub fn run(mut self) -> Result<ExecutionResult, ExecutorError> {
         let mut logs = Vec::with_capacity(CHUNK_SIZE);
 
+        // First chunk: if it fills completely, the program is non-trivial.
+        // Pre-allocate based on instruction count to avoid repeated doublings.
+        if let Some(chunk) = self.resume()? {
+            let first_full = chunk.len() == CHUNK_SIZE;
+            logs.extend_from_slice(chunk);
+
+            if first_full {
+                // Estimate: typical programs execute ~32x their instruction count.
+                // Cap at 16M to avoid over-allocating for very large programs.
+                let estimated = (self.instructions.instruction_count() * 32)
+                    .max(CHUNK_SIZE * 8)
+                    .min(16_000_000);
+                logs.reserve(estimated.saturating_sub(logs.len()));
+            }
+        }
+
         while let Some(chunk) = self.resume()? {
             logs.extend_from_slice(chunk);
         }

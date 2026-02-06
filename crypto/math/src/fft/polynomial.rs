@@ -1,4 +1,5 @@
 use crate::fft::errors::FFTError;
+use crate::fft::traits::Fft;
 
 use crate::field::errors::FieldError;
 use crate::field::traits::{IsField, IsSubFieldOf};
@@ -10,9 +11,6 @@ use crate::{
     polynomial::Polynomial,
 };
 use alloc::{vec, vec::Vec};
-
-#[cfg(feature = "cuda")]
-use crate::fft::gpu::cuda::polynomial::{evaluate_fft_cuda, interpolate_fft_cuda};
 
 use super::cpu::{ops, roots_of_unity};
 
@@ -37,22 +35,8 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
 
         let mut coeffs = poly.coefficients().to_vec();
         coeffs.resize(len, FieldElement::zero());
-        // padding with zeros will make FFT return more evaluations of the same polynomial.
 
-        #[cfg(feature = "cuda")]
-        {
-            // TODO: support multiple fields with CUDA
-            if F::field_name() == "stark256" {
-                Ok(evaluate_fft_cuda(&coeffs)?)
-            } else {
-                evaluate_fft_cpu::<F, E>(&coeffs)
-            }
-        }
-
-        #[cfg(not(feature = "cuda"))]
-        {
-            evaluate_fft_cpu::<F, E>(&coeffs)
-        }
+        evaluate_fft_cpu::<F, E>(&coeffs)
     }
 
     /// Returns `N` evaluations with an offset of this polynomial using FFT over a domain in a subfield F of E
@@ -75,19 +59,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     pub fn interpolate_fft<F: IsFFTField + IsSubFieldOf<E>>(
         fft_evals: &[FieldElement<E>],
     ) -> Result<Self, FFTError> {
-        #[cfg(feature = "cuda")]
-        {
-            if !F::field_name().is_empty() {
-                Ok(interpolate_fft_cuda(fft_evals)?)
-            } else {
-                interpolate_fft_cpu::<F, E>(fft_evals)
-            }
-        }
-
-        #[cfg(not(feature = "cuda"))]
-        {
-            interpolate_fft_cpu::<F, E>(fft_evals)
-        }
+        interpolate_fft_cpu::<F, E>(fft_evals)
     }
 
     /// Returns a new polynomial that interpolates offset `(w^i, fft_evals[i])`, with `w` being a
@@ -98,6 +70,78 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         offset: &FieldElement<F>,
     ) -> Result<Polynomial<FieldElement<E>>, FFTError> {
         let scaled = Polynomial::interpolate_fft::<F>(fft_evals)?;
+        Ok(scaled.scale(&offset.inv().unwrap()))
+    }
+
+    /// Interpolate evaluations to a polynomial using a unified FFT backend.
+    ///
+    /// This is the backend-aware version of `interpolate_fft`. It uses the
+    /// provided `Fft` backend (CPU or GPU) instead of the hardcoded CPU path.
+    /// The field type `F` must match the backend's field (e.g. GoldilocksField).
+    pub fn interpolate_fft_with_backend(
+        fft_evals: &[FieldElement<E>],
+        backend: &dyn Fft<E>,
+    ) -> Result<Self, FFTError>
+    where
+        E: IsFFTField,
+    {
+        let mut data = fft_evals.to_vec();
+        backend.ifft(&mut data)?;
+        Ok(Polynomial::new(&data))
+    }
+
+    /// Evaluate a polynomial on an FFT domain using a unified FFT backend.
+    ///
+    /// Returns `N` evaluations where `N = max(coeff_len, domain_size).next_power_of_two() * blowup_factor`.
+    pub fn evaluate_fft_with_backend(
+        poly: &Polynomial<FieldElement<E>>,
+        blowup_factor: usize,
+        domain_size: Option<usize>,
+        backend: &dyn Fft<E>,
+    ) -> Result<Vec<FieldElement<E>>, FFTError>
+    where
+        E: IsFFTField,
+    {
+        let domain_size = domain_size.unwrap_or(0);
+        let len = core::cmp::max(poly.coeff_len(), domain_size).next_power_of_two() * blowup_factor;
+        if len.trailing_zeros() as u64 > E::TWO_ADICITY {
+            return Err(FFTError::DomainSizeError(len.trailing_zeros() as usize));
+        }
+        if poly.coefficients().is_empty() {
+            return Ok(vec![FieldElement::zero(); len]);
+        }
+
+        let mut coeffs = poly.coefficients().to_vec();
+        coeffs.resize(len, FieldElement::zero());
+        backend.fft(&mut coeffs)?;
+        Ok(coeffs)
+    }
+
+    /// Evaluate a polynomial on an offset FFT domain using a unified FFT backend.
+    pub fn evaluate_offset_fft_with_backend(
+        poly: &Polynomial<FieldElement<E>>,
+        blowup_factor: usize,
+        domain_size: Option<usize>,
+        offset: &FieldElement<E>,
+        backend: &dyn Fft<E>,
+    ) -> Result<Vec<FieldElement<E>>, FFTError>
+    where
+        E: IsFFTField,
+    {
+        let scaled = poly.scale(offset);
+        Self::evaluate_fft_with_backend(&scaled, blowup_factor, domain_size, backend)
+    }
+
+    /// Interpolate offset evaluations using a unified FFT backend.
+    pub fn interpolate_offset_fft_with_backend(
+        fft_evals: &[FieldElement<E>],
+        offset: &FieldElement<E>,
+        backend: &dyn Fft<E>,
+    ) -> Result<Polynomial<FieldElement<E>>, FFTError>
+    where
+        E: IsFFTField,
+    {
+        let scaled = Self::interpolate_fft_with_backend(fft_evals, backend)?;
         Ok(scaled.scale(&offset.inv().unwrap()))
     }
 

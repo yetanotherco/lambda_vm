@@ -24,7 +24,7 @@ use crate::fri;
 use crate::lookup::LOGUP_NUM_CHALLENGES;
 use crate::proof::stark::{DeepPolynomialOpenings, PolynomialOpenings};
 use crate::table::Table;
-use crate::trace::{LDETraceTable, columns2rows};
+use crate::trace::LDETraceTable;
 
 use super::config::{BatchedMerkleTree, Commitment};
 use super::constraints::evaluator::ConstraintEvaluator;
@@ -197,6 +197,34 @@ where
     }
 }
 
+/// Backend-aware variant of `evaluate_polynomial_on_lde_domain`.
+///
+/// Uses the unified `Fft` trait backend for acceleration (CPU or GPU).
+/// The field `F` must match the backend — typically `GoldilocksField`.
+pub fn evaluate_polynomial_on_lde_domain_with_backend<F>(
+    p: &Polynomial<FieldElement<F>>,
+    blowup_factor: usize,
+    domain_size: usize,
+    offset: &FieldElement<F>,
+    backend: &(dyn math::fft::Fft<F> + Sync),
+) -> Result<Vec<FieldElement<F>>, FFTError>
+where
+    F: IsFFTField,
+{
+    let evaluations = Polynomial::evaluate_offset_fft_with_backend(
+        p,
+        blowup_factor,
+        Some(domain_size),
+        offset,
+        backend,
+    )?;
+    let step = evaluations.len() / (domain_size * blowup_factor);
+    match step {
+        1 => Ok(evaluations),
+        _ => Ok(evaluations.into_iter().step_by(step).collect()),
+    }
+}
+
 /// The functionality of a STARK prover providing methods to run the STARK Prove protocol
 /// https://lambdaclass.github.io/lambdaworks/starks/protocol.html
 /// The default implementation is complete and is compatible with Stone prover
@@ -230,6 +258,32 @@ pub trait IsStarkProver<
     {
         let tree = BatchedMerkleTree::build(vectors)?;
 
+        let commitment = tree.root;
+        Some((tree, commitment))
+    }
+
+    /// Build Merkle tree from column-major data without the columns2rows transpose.
+    /// Each leaf is the hash of one row, gathered on-the-fly from the columns.
+    fn commit_columns_main(
+        columns: &[Vec<FieldElement<Field>>],
+    ) -> Option<(BatchedMerkleTree<Field>, Commitment)>
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+    {
+        let tree = BatchedMerkleTree::build_from_columns(columns)?;
+        let commitment = tree.root;
+        Some((tree, commitment))
+    }
+
+    /// Build Merkle tree from column-major data (extension field) without transpose.
+    fn commit_columns_extension(
+        columns: &[Vec<FieldElement<FieldExtension>>],
+    ) -> Option<(BatchedMerkleTree<FieldExtension>, Commitment)>
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    {
+        let tree = BatchedMerkleTree::build_from_columns(columns)?;
         let commitment = tree.root;
         Some((tree, commitment))
     }
@@ -272,9 +326,8 @@ pub trait IsStarkProver<
             in_place_bit_reverse_permute(col);
         }
 
-        // Build commitment
-        let rows = columns2rows(lde_permuted);
-        let (_, commitment) = Self::batch_commit_main(&rows)?;
+        // Build commitment directly from columns (avoids transpose allocation)
+        let (_, commitment) = Self::commit_columns_main(&lde_permuted)?;
 
         Some(commitment)
     }
@@ -314,11 +367,9 @@ pub trait IsStarkProver<
             in_place_bit_reverse_permute(col);
         }
 
-        // Compute commitment.
-        let lde_trace_permuted_rows = columns2rows(lde_trace_permuted);
-
+        // Compute commitment directly from columns (avoids transpose allocation).
         let (lde_trace_merkle_tree, lde_trace_merkle_root) =
-            Self::batch_commit_main(&lde_trace_permuted_rows)?;
+            Self::commit_columns_main(&lde_trace_permuted)?;
 
         // >>>> Send commitment.
         transcript.append_bytes(&lde_trace_merkle_root);
@@ -362,11 +413,9 @@ pub trait IsStarkProver<
             in_place_bit_reverse_permute(col);
         }
 
-        // Compute commitment (but don't append to transcript - caller does that).
-        let lde_trace_permuted_rows = columns2rows(lde_trace_permuted);
-
+        // Compute commitment directly from columns (avoids transpose allocation).
         let (lde_trace_merkle_tree, lde_trace_merkle_root) =
-            Self::batch_commit_main(&lde_trace_permuted_rows)?;
+            Self::commit_columns_main(&lde_trace_permuted)?;
 
         Some((
             trace_polys,
@@ -410,11 +459,9 @@ pub trait IsStarkProver<
             in_place_bit_reverse_permute(col);
         }
 
-        // Compute commitment.
-        let lde_trace_permuted_rows = columns2rows(lde_trace_permuted);
-
+        // Compute commitment directly from columns (avoids transpose allocation).
         let (lde_trace_merkle_tree, lde_trace_merkle_root) =
-            Self::batch_commit_extension(&lde_trace_permuted_rows)?;
+            Self::commit_columns_extension(&lde_trace_permuted)?;
 
         // >>>> Send commitment.
         transcript.append_bytes(&lde_trace_merkle_root);
@@ -453,6 +500,80 @@ pub trait IsStarkProver<
             })
             .collect::<Result<Vec<Vec<FieldElement<E>>>, FFTError>>()
             .unwrap()
+    }
+
+    /// Backend-aware variant of `compute_lde_trace_evaluations` for base field.
+    /// Uses the unified `Fft` backend for GPU acceleration when available.
+    fn compute_lde_trace_evaluations_with_backend(
+        trace_polys: &[Polynomial<FieldElement<Field>>],
+        domain: &Domain<Field>,
+        backend: &(dyn math::fft::Fft<Field> + Sync),
+    ) -> Vec<Vec<FieldElement<Field>>>
+    where
+        FieldElement<Field>: Send + Sync,
+    {
+        #[cfg(not(feature = "parallel"))]
+        let trace_polys_iter = trace_polys.iter();
+        #[cfg(feature = "parallel")]
+        let trace_polys_iter = trace_polys.par_iter();
+
+        trace_polys_iter
+            .map(|poly| {
+                evaluate_polynomial_on_lde_domain_with_backend(
+                    poly,
+                    domain.blowup_factor,
+                    domain.interpolation_domain_size,
+                    &domain.coset_offset,
+                    backend,
+                )
+            })
+            .collect::<Result<Vec<Vec<FieldElement<Field>>>, FFTError>>()
+            .expect("Backend FFT failed during LDE evaluation")
+    }
+
+    /// Backend-aware variant: interpolate main trace, compute LDE, and commit.
+    #[allow(clippy::type_complexity)]
+    fn interpolate_and_commit_main_with_backend(
+        trace: &TraceTable<Field, FieldExtension>,
+        domain: &Domain<Field>,
+        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+        backend: &(dyn math::fft::Fft<Field> + Sync),
+    ) -> Option<(
+        Vec<Polynomial<FieldElement<Field>>>,
+        Vec<Vec<FieldElement<Field>>>,
+        BatchedMerkleTree<Field>,
+        Commitment,
+    )>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+        Field: IsSubFieldOf<FieldExtension>,
+    {
+        // Interpolate using the backend (GPU-accelerated IFFT)
+        let trace_polys = trace.compute_trace_polys_main_with_backend(backend);
+
+        // Evaluate on LDE domain using the backend (GPU-accelerated FFT)
+        let lde_trace_evaluations =
+            Self::compute_lde_trace_evaluations_with_backend(&trace_polys, domain, backend);
+
+        let mut lde_trace_permuted = lde_trace_evaluations.clone();
+        for col in lde_trace_permuted.iter_mut() {
+            in_place_bit_reverse_permute(col);
+        }
+
+        // Commit directly from columns (avoids transpose allocation)
+        let (lde_trace_merkle_tree, lde_trace_merkle_root) =
+            Self::commit_columns_main(&lde_trace_permuted)?;
+
+        // >>>> Send commitment.
+        transcript.append_bytes(&lde_trace_merkle_root);
+
+        Some((
+            trace_polys,
+            lde_trace_evaluations,
+            lde_trace_merkle_tree,
+            lde_trace_merkle_root,
+        ))
     }
 
     /// Phase 1a of Round 1: Commit only the main trace to the transcript.
@@ -518,9 +639,9 @@ pub trait IsStarkProver<
         for col in precomputed_lde_permuted.iter_mut() {
             in_place_bit_reverse_permute(col);
         }
-        let precomputed_rows = columns2rows(precomputed_lde_permuted);
         let (precomputed_tree, precomputed_root) =
-            Self::batch_commit_main(&precomputed_rows).ok_or(ProvingError::EmptyCommitment)?;
+            Self::commit_columns_main(&precomputed_lde_permuted)
+                .ok_or(ProvingError::EmptyCommitment)?;
 
         // --- Build MULTIPLICITIES tree (cols num_precomputed..) ---
         let multiplicity_evaluations: Vec<_> = evaluations[num_precomputed_cols..].to_vec();
@@ -528,9 +649,9 @@ pub trait IsStarkProver<
         for col in mult_lde_permuted.iter_mut() {
             in_place_bit_reverse_permute(col);
         }
-        let mult_rows = columns2rows(mult_lde_permuted);
         let (mult_tree, mult_root) =
-            Self::batch_commit_main(&mult_rows).ok_or(ProvingError::EmptyCommitment)?;
+            Self::commit_columns_main(&mult_lde_permuted)
+                .ok_or(ProvingError::EmptyCommitment)?;
 
         // Verify that our computed precomputed root matches the hardcoded commitment.
         // This is a sanity check - if they don't match, something is wrong with the trace.
@@ -686,8 +807,13 @@ pub trait IsStarkProver<
         let number_of_parts = air.composition_poly_degree_bound(trace_length) / trace_length;
         let composition_poly_parts = composition_poly.break_in_parts(number_of_parts);
 
-        let lde_composition_poly_parts_evaluations: Vec<_> = composition_poly_parts
-            .iter()
+        // Evaluate composition poly parts on LDE domain in parallel
+        #[cfg(feature = "parallel")]
+        let parts_iter = composition_poly_parts.par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let parts_iter = composition_poly_parts.iter();
+
+        let lde_composition_poly_parts_evaluations: Vec<_> = parts_iter
             .map(|part| {
                 evaluate_polynomial_on_lde_domain(
                     part,
@@ -1270,12 +1396,127 @@ pub trait IsStarkProver<
                 logup_challenges.clone(),
             )?;
             round_1_results.push(round_1_result);
+
+            // Release trace data after interpolation — the polynomials and LDE
+            // evaluations are stored in round_1_result, so the original trace
+            // rows are no longer needed. Frees ~2.5 GB at 2^22 instructions.
+            trace.release_main_data();
+            trace.release_aux_data();
         }
 
         // =====================================================================
         // Rounds 2-4: Standard STARK protocol for each AIR
         // =====================================================================
 
+        let mut proofs = Vec::with_capacity(num_airs);
+        for (((air, _, pub_inputs), round_1_result), domain) in
+            air_trace_pairs.iter().zip(round_1_results).zip(domains)
+        {
+            let proof =
+                Self::prove_rounds_2_to_4(*air, *pub_inputs, &round_1_result, transcript, &domain)?;
+            proofs.push(proof);
+        }
+
+        Ok(MultiProof::new(proofs))
+    }
+
+    /// Backend-accelerated variant of `multi_prove`.
+    ///
+    /// Uses the provided `Fft` backend for main trace interpolation and LDE
+    /// evaluation (the two hottest FFT paths). Auxiliary traces and composition
+    /// polynomial still use the CPU path (extension field operations).
+    fn multi_prove_with_backend(
+        mut air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
+        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+        backend: &(dyn math::fft::Fft<Field> + Sync),
+    ) -> Result<MultiProof<Field, FieldExtension, PI>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+        PI: Send + Sync + Clone,
+    {
+        info!("Started proof generation (with FFT backend)...");
+
+        let num_airs = air_trace_pairs.len();
+
+        let needs_logup_challenges = air_trace_pairs
+            .iter()
+            .any(|(air, _, _)| air.has_trace_interaction());
+
+        // Round 1, Phase A: Commit main traces using accelerated backend
+        let mut domains = Vec::with_capacity(num_airs);
+        let mut main_commitments: Vec<MainCommitment<Field>> = Vec::with_capacity(num_airs);
+
+        for (air, trace, _pub_inputs) in &*air_trace_pairs {
+            let trace_length = trace.num_rows();
+            let domain = new_domain(*air, trace_length);
+
+            let (main, evaluations) = if air.is_preprocessed() {
+                // Preprocessed tables use the standard path (they have specific commit logic)
+                Self::round_1_commit_preprocessed_trace(
+                    *trace,
+                    &domain,
+                    transcript,
+                    air.precomputed_commitment(),
+                    air.num_precomputed_columns(),
+                )?
+            } else {
+                // Use the backend-accelerated path for normal tables
+                let Some((trace_polys, evaluations, main_merkle_tree, main_merkle_root)) =
+                    Self::interpolate_and_commit_main_with_backend(
+                        *trace, &domain, transcript, backend,
+                    )
+                else {
+                    return Err(ProvingError::EmptyCommitment);
+                };
+
+                let main = Round1CommitmentData::<Field> {
+                    trace_polys,
+                    lde_trace_merkle_tree: main_merkle_tree,
+                    lde_trace_merkle_root: main_merkle_root,
+                    precomputed_merkle_tree: None,
+                    precomputed_merkle_root: None,
+                    num_precomputed_cols: 0,
+                };
+                (main, evaluations)
+            };
+
+            main_commitments.push((main, evaluations));
+            domains.push(domain);
+        }
+
+        // Round 1, Phase B: Sample shared LogUp challenges
+        let logup_challenges: Vec<FieldElement<FieldExtension>> = if needs_logup_challenges {
+            (0..LOGUP_NUM_CHALLENGES)
+                .map(|_| transcript.sample_field_element())
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // Round 1, Phase C: Build and commit auxiliary traces
+        let mut round_1_results: Vec<Round1<Field, FieldExtension>> = Vec::with_capacity(num_airs);
+        for (((air, trace, _pub_inputs), (main, main_evaluations)), domain) in air_trace_pairs
+            .iter_mut()
+            .zip(main_commitments)
+            .zip(domains.iter())
+        {
+            let round_1_result = Self::round_1_build_auxiliary_trace(
+                *air,
+                *trace,
+                domain,
+                transcript,
+                main,
+                main_evaluations,
+                logup_challenges.clone(),
+            )?;
+            round_1_results.push(round_1_result);
+
+            trace.release_main_data();
+            trace.release_aux_data();
+        }
+
+        // Rounds 2-4: Standard STARK protocol
         let mut proofs = Vec::with_capacity(num_airs);
         for (((air, _, pub_inputs), round_1_result), domain) in
             air_trace_pairs.iter().zip(round_1_results).zip(domains)
@@ -1303,6 +1544,24 @@ pub trait IsStarkProver<
     {
         let air_trace_pairs = vec![(air, trace, pub_inputs)];
         Self::multi_prove(air_trace_pairs, transcript)
+            .map(|mut multi_proof| multi_proof.proofs.remove(0))
+    }
+
+    /// Backend-accelerated variant of `prove` for a single AIR/trace.
+    fn prove_with_backend(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        trace: &mut TraceTable<Field, FieldExtension>,
+        pub_inputs: &PI,
+        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+        backend: &(dyn math::fft::Fft<Field> + Sync),
+    ) -> Result<StarkProof<Field, FieldExtension, PI>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+        PI: Send + Sync + Clone,
+    {
+        let air_trace_pairs = vec![(air, trace, pub_inputs)];
+        Self::multi_prove_with_backend(air_trace_pairs, transcript, backend)
             .map(|mut multi_proof| multi_proof.proofs.remove(0))
     }
 

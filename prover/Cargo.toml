@@ -6,6 +6,7 @@ edition = "2024"
 [features]
 default = ["parallel"]
 parallel = ["stark/parallel", "math/parallel", "crypto/parallel", "dep:rayon"]
+metal = ["stark/metal", "math/metal"]
 dhat-heap = ["dhat"]
 
 [dependencies]

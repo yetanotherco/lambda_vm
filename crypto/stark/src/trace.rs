@@ -1,6 +1,7 @@
 use crate::table::Table;
 use itertools::Itertools;
 use math::fft::errors::FFTError;
+use math::fft::traits::Fft;
 use math::field::traits::{IsField, IsSubFieldOf};
 use math::{
     field::{element::FieldElement, traits::IsFFTField},
@@ -227,6 +228,61 @@ where
 
     pub fn get_column_aux(&self, col_idx: usize) -> Vec<FieldElement<E>> {
         self.aux_table.get_column(col_idx)
+    }
+
+    /// Interpolate main trace columns using a unified FFT backend with batch IFFT.
+    ///
+    /// Packs all columns into a single contiguous buffer and calls `batch_ifft`
+    /// once, so twiddle factors are computed only once and GPU throughput is
+    /// maximized. Falls back to per-column IFFT if the trace is empty.
+    pub fn compute_trace_polys_main_with_backend(
+        &self,
+        backend: &(dyn Fft<F> + Sync),
+    ) -> Vec<Polynomial<FieldElement<F>>>
+    where
+        F: IsFFTField,
+        FieldElement<F>: Send + Sync,
+    {
+        let num_cols = self.num_main_columns;
+        let num_rows = self.num_rows();
+        if num_cols == 0 || num_rows == 0 {
+            return Vec::new();
+        }
+
+        // Pack columns into contiguous buffer: [col0[0..n], col1[0..n], ...]
+        // The table stores data in row-major order, so we transpose.
+        let mut packed = Vec::with_capacity(num_cols * num_rows);
+        for col_idx in 0..num_cols {
+            for row_idx in 0..num_rows {
+                packed.push(self.main_table.data[row_idx * num_cols + col_idx].clone());
+            }
+        }
+
+        // Single batch IFFT call — twiddles computed once for all columns
+        backend
+            .batch_ifft(&mut packed, num_rows)
+            .expect("Backend batch IFFT failed during trace interpolation");
+
+        // Split results into individual polynomials
+        packed
+            .chunks_exact(num_rows)
+            .map(|chunk| Polynomial::new(chunk))
+            .collect()
+    }
+
+    /// Release the main table data to free memory after interpolation.
+    /// The trace polynomials have been computed and the original data is no longer needed.
+    pub fn release_main_data(&mut self) {
+        self.main_table.data = Vec::new();
+        self.main_table.width = 0;
+        self.main_table.height = 0;
+    }
+
+    /// Release the auxiliary table data to free memory after interpolation.
+    pub fn release_aux_data(&mut self) {
+        self.aux_table.data = Vec::new();
+        self.aux_table.width = 0;
+        self.aux_table.height = 0;
     }
 }
 pub struct LDETraceTable<F, E>

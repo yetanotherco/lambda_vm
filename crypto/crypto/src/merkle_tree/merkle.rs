@@ -70,6 +70,51 @@ where
         })
     }
 
+    /// Build a Merkle tree from column-major data without materializing the full
+    /// transposed matrix. Each leaf is the hash of one row, gathered on-the-fly
+    /// from the columns.
+    ///
+    /// This eliminates the ~1 GB intermediate allocation of `columns2rows()` by
+    /// reusing a single row buffer during hashing.
+    pub fn build_from_columns<I>(columns: &[Vec<I>]) -> Option<Self>
+    where
+        I: Clone,
+        Vec<I>: Sync + Send,
+        // The leaf data type must be Vec<I> for the backend
+        B: IsMerkleTreeBackend<Data = Vec<I>>,
+    {
+        if columns.is_empty() || columns[0].is_empty() {
+            return None;
+        }
+
+        let num_rows = columns[0].len();
+        let num_cols = columns.len();
+
+        // Hash each row directly from columns, reusing a single buffer
+        let mut row_buf = Vec::with_capacity(num_cols);
+        let mut hashed_leaves = Vec::with_capacity(num_rows);
+        for row_idx in 0..num_rows {
+            row_buf.clear();
+            for col in columns {
+                row_buf.push(col[row_idx].clone());
+            }
+            hashed_leaves.push(B::hash_data(&row_buf));
+        }
+
+        let hashed_leaves = complete_until_power_of_two(hashed_leaves);
+        let leaves_len = hashed_leaves.len();
+
+        let mut nodes = vec![hashed_leaves[0].clone(); leaves_len - 1];
+        nodes.extend(hashed_leaves);
+
+        build::<B>(&mut nodes, leaves_len);
+
+        Some(MerkleTree {
+            root: nodes[ROOT].clone(),
+            nodes,
+        })
+    }
+
     /// Returns a Merkle proof for the element/s at position pos
     /// For example, give me an inclusion proof for the 3rd element in the
     /// Merkle tree

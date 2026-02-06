@@ -47,6 +47,15 @@ const THOROUGH_CONFIGS: &[BenchConfig] = &[
     BenchConfig::new("fib_16col_16k", 16, 16384),
 ];
 
+/// Stress benchmark configurations (large traces for FFT/LDE/memory optimization measurement)
+const STRESS_CONFIGS: &[BenchConfig] = &[
+    BenchConfig::new("fib_4col_64k", 4, 65536),
+    BenchConfig::new("fib_8col_64k", 8, 65536),
+    BenchConfig::new("fib_16col_64k", 16, 65536),
+    BenchConfig::new("fib_4col_128k", 4, 131072),
+    BenchConfig::new("fib_16col_128k", 16, 131072),
+];
+
 /// Creates initial values for the specified number of columns
 fn create_initial_values(num_columns: usize) -> Vec<(FE, FE)> {
     (0..num_columns)
@@ -153,6 +162,13 @@ fn thorough_benchmarks(c: &mut Criterion) {
     }
 }
 
+/// Stress benchmarks (large traces — prove only, verification is fast)
+fn stress_benchmarks(c: &mut Criterion) {
+    for config in STRESS_CONFIGS {
+        bench_prove(c, "stress", config);
+    }
+}
+
 criterion_group! {
     name = quick;
     config = Criterion::default()
@@ -169,4 +185,69 @@ criterion_group! {
     targets = thorough_benchmarks
 }
 
-criterion_main!(quick, thorough);
+criterion_group! {
+    name = stress;
+    config = Criterion::default()
+        .sample_size(10)
+        .measurement_time(std::time::Duration::from_secs(120));
+    targets = stress_benchmarks
+}
+
+/// Backend-accelerated benchmark configurations (same as QUICK_CONFIGS for comparison)
+const BACKEND_CONFIGS: &[BenchConfig] = &[
+    BenchConfig::new("fib_4col_16k", 4, 16384),
+    BenchConfig::new("fib_16col_16k", 16, 16384),
+    BenchConfig::new("fib_4col_64k", 4, 65536),
+];
+
+/// Benchmark proving with unified FFT backend (auto-selects Metal on macOS)
+fn bench_prove_with_backend(c: &mut Criterion, group_name: &str, config: &BenchConfig) {
+    let proof_options = benchmark_proof_options();
+    let backend = math::fft::goldilocks_backend();
+
+    c.bench_with_input(
+        BenchmarkId::new(format!("{}/prove", group_name), config.name),
+        config,
+        |b, config| {
+            b.iter_with_setup(
+                || {
+                    let initial_values = create_initial_values(config.num_columns);
+                    let trace = compute_trace::<F, E>(&initial_values, config.trace_length);
+                    let pub_inputs = create_public_inputs(initial_values);
+                    let air = FibonacciMultiColumnAIR::<F, E>::with_num_columns(
+                        &proof_options,
+                        config.num_columns,
+                    );
+                    (trace, pub_inputs, air)
+                },
+                |(mut trace, pub_inputs, air)| {
+                    Prover::<F, E, _>::prove_with_backend(
+                        &air,
+                        &mut trace,
+                        &pub_inputs,
+                        &mut DefaultTranscript::<E>::new(&[]),
+                        &backend,
+                    )
+                    .unwrap()
+                },
+            )
+        },
+    );
+}
+
+/// Backend-accelerated benchmarks (compare against quick group for CPU vs GPU)
+fn backend_benchmarks(c: &mut Criterion) {
+    for config in BACKEND_CONFIGS {
+        bench_prove_with_backend(c, "backend", config);
+    }
+}
+
+criterion_group! {
+    name = backend;
+    config = Criterion::default()
+        .sample_size(10)
+        .measurement_time(std::time::Duration::from_secs(60));
+    targets = backend_benchmarks
+}
+
+criterion_main!(quick, thorough, stress, backend);

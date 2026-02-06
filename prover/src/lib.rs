@@ -173,9 +173,11 @@ pub fn prove(elf_bytes: &[u8]) -> Result<MultiProof<F, E, ()>, Error> {
     let proof_options = ProofOptions::default_test_options();
     let airs = VmAirs::new(&program, &proof_options, false);
 
-    Prover::multi_prove(
+    let backend = math::fft::goldilocks_backend();
+    Prover::multi_prove_with_backend(
         airs.air_trace_pairs(&mut traces),
         &mut DefaultTranscript::<E>::new(&[]),
+        &backend,
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))
 }

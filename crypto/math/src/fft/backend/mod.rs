@@ -7,7 +7,8 @@
 //! # Backend Priority
 //!
 //! 1. Metal GPU (if `metal` feature enabled and Metal device available)
-//! 2. CPU Bowers FFT (always available)
+//! 2. CUDA GPU (if `cuda` feature enabled and CUDA device available)
+//! 3. CPU Bowers FFT (always available)
 //!
 //! # Example
 //!
@@ -26,6 +27,9 @@ pub mod cpu;
 #[cfg(feature = "metal")]
 pub mod metal;
 
+#[cfg(feature = "cuda")]
+pub mod cuda;
+
 #[cfg(all(test, feature = "alloc"))]
 mod tests;
 
@@ -35,6 +39,9 @@ pub use cpu::CpuFft;
 #[cfg(feature = "metal")]
 pub use metal::MetalFftBackend;
 
+#[cfg(feature = "cuda")]
+pub use cuda::CudaFft;
+
 use crate::fft::traits::Fft;
 use crate::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
 
@@ -42,7 +49,8 @@ use crate::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
 ///
 /// Backend selection priority:
 /// 1. Metal GPU (on macOS with Metal support)
-/// 2. CPU Bowers FFT (fallback)
+/// 2. CUDA GPU (on Linux/Windows with NVIDIA GPU)
+/// 3. CPU Bowers FFT (fallback)
 ///
 /// # Example
 ///
@@ -59,8 +67,17 @@ pub fn goldilocks_backend() -> impl Fft<GoldilocksField> {
     }
 }
 
-/// Returns the CPU FFT backend for Goldilocks field (when Metal not enabled).
-#[cfg(all(feature = "alloc", not(feature = "metal")))]
+/// Returns the best available FFT backend (CUDA path, no Metal).
+#[cfg(all(feature = "alloc", feature = "cuda", not(feature = "metal")))]
+pub fn goldilocks_backend() -> impl Fft<GoldilocksField> {
+    match CudaFft::try_new() {
+        Ok(cuda) => BackendChoice::Cuda(cuda),
+        Err(_) => BackendChoice::Cpu(CpuFft::new()),
+    }
+}
+
+/// Returns the CPU FFT backend for Goldilocks field (no GPU features enabled).
+#[cfg(all(feature = "alloc", not(feature = "metal"), not(feature = "cuda")))]
 pub fn goldilocks_backend() -> impl Fft<GoldilocksField> {
     CpuFft::new()
 }
@@ -112,6 +129,58 @@ impl Fft<GoldilocksField> for BackendChoice {
     ) -> Result<(), crate::fft::errors::FFTError> {
         match self {
             BackendChoice::Metal(m) => m.batch_ifft(data, poly_len),
+            BackendChoice::Cpu(c) => c.batch_ifft(data, poly_len),
+        }
+    }
+}
+
+/// Internal enum for backend selection (CUDA path, no Metal)
+#[cfg(all(feature = "alloc", feature = "cuda", not(feature = "metal")))]
+enum BackendChoice {
+    Cuda(CudaFft),
+    Cpu(CpuFft),
+}
+
+#[cfg(all(feature = "alloc", feature = "cuda", not(feature = "metal")))]
+impl Fft<GoldilocksField> for BackendChoice {
+    fn fft(
+        &self,
+        input: &mut [crate::field::element::FieldElement<GoldilocksField>],
+    ) -> Result<(), crate::fft::errors::FFTError> {
+        match self {
+            BackendChoice::Cuda(g) => g.fft(input),
+            BackendChoice::Cpu(c) => c.fft(input),
+        }
+    }
+
+    fn ifft(
+        &self,
+        input: &mut [crate::field::element::FieldElement<GoldilocksField>],
+    ) -> Result<(), crate::fft::errors::FFTError> {
+        match self {
+            BackendChoice::Cuda(g) => g.ifft(input),
+            BackendChoice::Cpu(c) => c.ifft(input),
+        }
+    }
+
+    fn batch_fft(
+        &self,
+        data: &mut [crate::field::element::FieldElement<GoldilocksField>],
+        poly_len: usize,
+    ) -> Result<(), crate::fft::errors::FFTError> {
+        match self {
+            BackendChoice::Cuda(g) => g.batch_fft(data, poly_len),
+            BackendChoice::Cpu(c) => c.batch_fft(data, poly_len),
+        }
+    }
+
+    fn batch_ifft(
+        &self,
+        data: &mut [crate::field::element::FieldElement<GoldilocksField>],
+        poly_len: usize,
+    ) -> Result<(), crate::fft::errors::FFTError> {
+        match self {
+            BackendChoice::Cuda(g) => g.batch_ifft(data, poly_len),
             BackendChoice::Cpu(c) => c.batch_ifft(data, poly_len),
         }
     }
