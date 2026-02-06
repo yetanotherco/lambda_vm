@@ -18,7 +18,7 @@ use metal::{Buffer, MTLCommandBufferStatus, MTLSize};
 const GOLDILOCKS_TWO_ADIC_ROOT: u64 = 1753635133440165772;
 
 /// Maximum FFT order supported by Goldilocks field (2-adic order = 32)
-const MAX_FFT_ORDER: u64 = 32;
+const MAX_FFT_ORDER: u64 = 31;
 
 /// Metal-accelerated Bowers FFT for Goldilocks field
 pub struct MetalFft {
@@ -737,8 +737,15 @@ mod tests {
 
     #[test]
     fn test_fft_order_validation() {
-        // This test validates the order check without actually needing Metal
-        let order = 33u64;
-        assert!(order > MAX_FFT_ORDER);
+        // Order 32 would make n = 2^32, which truncates to 0 when cast to u32
+        // for Metal shader parameters. Verify the truncation is real:
+        let n: usize = 1 << 32u64;
+        assert_eq!(
+            n as u32, 0,
+            "2^32 as u32 must be 0 — this is the bug we're preventing"
+        );
+
+        // And verify MAX_FFT_ORDER rejects it
+        assert!(32 > MAX_FFT_ORDER);
     }
 }
