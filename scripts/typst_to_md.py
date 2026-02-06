@@ -161,8 +161,11 @@ def iters_to_text(obj: dict) -> str:
 CHAPTERS = [
     ("memory", "Memory Argument"),
     ("variables", "Variables"),
+    ("signatures", "Signatures"),
     ("is_bit", "IS_BIT Template"),
+    ("sign", "SIGN Template"),
     ("add", "ADD/SUB Template"),
+    ("neg", "NEG Template"),
     ("decode", "DECODE Table"),
     ("cpu", "CPU Chip"),
     ("shift", "SHIFT Chip"),

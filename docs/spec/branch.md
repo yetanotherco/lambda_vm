@@ -1,5 +1,37 @@
 # BRANCH Chip
 
+= Columns
+
+The `BRANCH` chip is comprised of  variables that are expressed using  columns:
+
+= Assumptions
+
+= Constraints
+
+> **Note:** Check correspondence with CPU for passing in `offset` as word or dword
+
+We constrain `next_pc` to be ``base_address` + `offset``, where `base_address` equals `pc` when ``JALR` = 0` and `register` otherwise.
+
+The range checks on `unmasked_low_byte` and `next_pc_low[0]` are performed implicitly by the `AND_BYTE` lookup.
+
+| Tag | Range | Description | Multiplicity |
+|-----|-------|-------------|--------------|
+| `BRANCH-C1` |  | 1 - JALR ⇒ `ADD<next_pc_unmasked; pc, offset::DWordWL>` |  |
+| `BRANCH-C2` |  | JALR ⇒ `ADD<next_pc_unmasked; register, offset::DWordWL>` |  |
+| `BRANCH-C3` |  | `IS_BYTE[next_pc_low[1]]` | μ |
+| `BRANCH-C4` |  | `AND_BYTE[next_pc_low[0]; unmasked_low_byte[0], 254]` | μ |
+| `BRANCH-C5.i` | i ∈ [0, 2] | `IS_HALFWORD[next_pc_high[i]]` | μ |
+
+This chip contributes the following to the lookup argument.
+
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `BRANCH-C6` | `BRANCH[next_pc; pc, offset, register, JALR]` | -μ |
+
+= Padding
+
+The table can be padded to the next power of two with the following value assignments:
+
 ## Columns
 
 ### Input
@@ -49,8 +81,6 @@ next_pc (when iter=1) := 2^16 * next_pc_high[2] + next_pc_high[1]
 |------|------|-------------|
 | `μ` | `Bit` |  |
 
-The `BRANCH` chip is comprised of  variables that are expressed using  columns:
-
 ## Assumptions
 
 | Tag | Range | Description |
@@ -59,29 +89,3 @@ The `BRANCH` chip is comprised of  variables that are expressed using  columns:
 | `BRANCH-A2` |  | `offset` is range checked, `IS_WORD[offset]` |
 | `BRANCH-A3.i` | i ∈ [0, 1] | `register` is range checked, `IS_WORD[register[i]]` |
 | `BRANCH-A4` |  | `IS_BIT<JALR>` |
-
-## Constraints
-
-> **Note:** Check correspondence with CPU for passing in `offset` as word or dword
-
-We constrain `next_pc` to be ``base_address` + `offset``, where `base_address` equals `pc` when ``JALR` = 0` and `register` otherwise.
-
-The range checks on `unmasked_low_byte` and `next_pc_low[0]` are performed implicitly by the `AND_BYTE` lookup.
-
-| Tag | Range | Description | Multiplicity |
-|-----|-------|-------------|--------------|
-| `BRANCH-C1` |  | 1 - JALR ⇒ `ADD<next_pc_unmasked; pc, offset::DWordWL>` |  |
-| `BRANCH-C2` |  | JALR ⇒ `ADD<next_pc_unmasked; register, offset::DWordWL>` |  |
-| `BRANCH-C3` |  | `IS_BYTE[next_pc_low[1]]` | μ |
-| `BRANCH-C4` |  | `AND_BYTE[next_pc_low[0]; unmasked_low_byte[0], 254]` | μ |
-| `BRANCH-C5.i` | i ∈ [0, 2] | `IS_HALFWORD[next_pc_high[i]]` | μ |
-
-This chip contributes the following to the lookup argument.
-
-| Tag | Description | Multiplicity |
-|-----|-------------|--------------|
-| `BRANCH-C6` | `BRANCH[next_pc; pc, offset, register, JALR]` | -μ |
-
-## Padding
-
-The table can be padded to the next power of two with the following value assignments:

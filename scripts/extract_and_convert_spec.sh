@@ -32,9 +32,18 @@ for file in $(git ls-tree -r origin/spec/main --name-only | grep '^spec/src/.*\.
     git show "origin/spec/main:$file" > "$TEMP_DIR/src/$filename" 2>/dev/null || true
 done
 
+# Extract all Typst (.typ) files
+for file in $(git ls-tree -r origin/spec/main --name-only | grep '^spec/.*\.typ$'); do
+    filename=$(basename "$file")
+    git show "origin/spec/main:$file" > "$TEMP_DIR/$filename" 2>/dev/null || true
+done
+
 # List extracted files
 echo "Extracted files:"
 ls -la "$TEMP_DIR/src/"
+echo ""
+echo "Extracted .typ files:"
+ls -la "$TEMP_DIR/"*.typ 2>/dev/null || echo "(none)"
 
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
@@ -42,9 +51,8 @@ mkdir -p "$OUTPUT_DIR"
 # Run the Python converter
 echo ""
 echo "Converting to Markdown..."
-python3 "$SCRIPT_DIR/spec_to_md.py" \
-    "$TEMP_DIR/src/config.toml" \
-    "$TEMP_DIR/src/"*.toml \
+python3 "$SCRIPT_DIR/typst_to_md.py" \
+    --spec-dir "$TEMP_DIR" \
     --output-dir "$OUTPUT_DIR"
 
 # Cleanup
