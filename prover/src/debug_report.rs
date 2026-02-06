@@ -103,10 +103,9 @@ where
     eprintln!("=================================\n");
 
     // Run BusDebugTracker analysis if any interactions were logged
-    let tracker = BUS_DEBUG_TRACKER.lock().unwrap_or_else(|e| {
-        eprintln!("[BusDebugTracker] WARNING: mutex was poisoned, recovering data");
-        e.into_inner()
-    });
+    let tracker = BUS_DEBUG_TRACKER
+        .lock()
+        .expect("[BusDebugTracker] mutex poisoned — debug data may be inconsistent");
     if !tracker.is_empty() {
         if tracker.is_truncated() {
             eprintln!(

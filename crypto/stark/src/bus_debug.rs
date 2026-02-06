@@ -233,10 +233,9 @@ pub fn log_interaction<M: Display, F: Debug, E: Debug>(
     if mult_str == "0" {
         return;
     }
-    let mult_u64: u64 = mult_str.parse().unwrap_or_else(|_| {
-        eprintln!("[BusDebugTracker] WARNING: multiplicity parse failed, using u64::MAX");
-        u64::MAX
-    });
+    let mult_u64: u64 = mult_str
+        .parse()
+        .expect("[BusDebugTracker] multiplicity must be a valid u64");
 
     let log = BusInteractionLog {
         table_name: table_name.to_string(),
@@ -250,10 +249,7 @@ pub fn log_interaction<M: Display, F: Debug, E: Debug>(
 
     BUS_DEBUG_TRACKER
         .lock()
-        .unwrap_or_else(|e| {
-            eprintln!("[BusDebugTracker] WARNING: mutex was poisoned, recovering data");
-            e.into_inner()
-        })
+        .expect("[BusDebugTracker] mutex poisoned — debug data may be inconsistent")
         .log(log);
 }
 
@@ -384,13 +380,15 @@ impl BusMismatchReport {
                             first_3
                         );
                     }
-                    let diff = mismatch.total_sent as i64 - mismatch.total_received as i64;
-                    if diff > 0 {
-                        eprintln!("      Deficit: {} lookup(s) not received!", diff);
+                    if mismatch.total_sent > mismatch.total_received {
+                        eprintln!(
+                            "      Deficit: {} lookup(s) not received!",
+                            mismatch.total_sent - mismatch.total_received
+                        );
                     } else {
                         eprintln!(
                             "      Excess: {} lookup(s) received without sending!",
-                            -diff
+                            mismatch.total_received - mismatch.total_sent
                         );
                     }
                 }
