@@ -9,6 +9,15 @@ on:
       - 'executor/**'
       - '.github/workflows/memory-profile.yml'
 
+  # Run memory profiling on main to create baselines for PR comparisons
+  push:
+    branches: [main]
+    paths:
+      - 'prover/**'
+      - 'crypto/**'
+      - 'executor/**'
+      - '.github/workflows/memory-profile.yml'
+
 jobs:
   profile:
     runs-on: ubuntu-latest
@@ -177,6 +186,7 @@ jobs:
           fi
 
       - name: Comment on PR
+        if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
         with:
           script: |
