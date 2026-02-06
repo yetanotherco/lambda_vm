@@ -205,10 +205,6 @@ jobs:
 
           PROOF_HEAD="/tmp/proof_head.cbor"
 
-          # Dry run to catch errors before hyperfine
-          ./bench-bin/cli-head prove "$ELF" --output /tmp/proof_dryrun.cbor --security fast
-          rm -f /tmp/proof_dryrun.cbor
-
           if [ -f bench-bin/cli-base ]; then
             PROOF_BASE="/tmp/proof_base.cbor"
             hyperfine \
