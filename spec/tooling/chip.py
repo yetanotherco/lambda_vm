@@ -62,6 +62,7 @@ DEFAULT_TYPE: Type = Range.lit(0)
 type Expr = (
     LitExpr
     | VarExpr
+    | ArrExpr
     | IdxExpr
     | CastExpr
     | MulExpr
@@ -303,6 +304,8 @@ def build_expr(config: Optional["Config"], data: object) -> Expr:
                 x.isidentifier(), f"Invalid identifier name for variable {x!r}"
             )
             return VarExpr(x)
+        case ["arr", *elems]:
+            return ArrExpr([build_expr(config, e) for e in elems])
         case ["idx", x, y]:
             return IdxExpr(build_expr(config, x), build_expr(config, y))
         case ["cast", x, t]:
