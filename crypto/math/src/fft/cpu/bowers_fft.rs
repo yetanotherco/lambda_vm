@@ -529,9 +529,30 @@ impl<F: IsFFTField> LayerTwiddles<F> {
 /// Optimized Bowers IFFT with sequential twiddle access.
 ///
 /// **Note**: This performs the inverse butterfly structure but does NOT apply
-/// the 1/n scaling factor. The caller must scale results by n^(-1) for a
-/// complete inverse FFT. Additionally, this uses forward twiddles; for a true
-/// inverse, pass twiddles computed from the inverse root of unity.
+/// the 1/n scaling factor. The caller must:
+/// 1. Pass inverse twiddles from `LayerTwiddles::new_inverse(order)`
+/// 2. Scale results by n^(-1) after the transform
+///
+/// Using forward twiddles (from `LayerTwiddles::new()`) will produce incorrect results.
+///
+/// # Example
+/// ```ignore
+/// let order = 10u64;
+/// let n = 1 << order;
+///
+/// // Create inverse twiddles for IFFT
+/// let inv_twiddles = LayerTwiddles::<F>::new_inverse(order).unwrap();
+///
+/// // Apply inverse FFT (after bit-reversing FFT output)
+/// in_place_bit_reverse_permute(&mut data);
+/// bowers_ifft_opt(&mut data, &inv_twiddles)?;
+///
+/// // Scale by 1/n to complete the inverse transform
+/// let n_inv = FieldElement::<F>::from(n as u64).inv().unwrap();
+/// for val in data.iter_mut() {
+///     *val = &*val * &n_inv;
+/// }
+/// ```
 ///
 /// # Errors
 /// Returns `FFTError::InputError` if input length is not a power of two.
