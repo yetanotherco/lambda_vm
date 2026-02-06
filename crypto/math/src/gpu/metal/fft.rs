@@ -5,8 +5,8 @@
 //!
 //! # Limitations
 //!
-//! - Maximum FFT size is 2^32 (Goldilocks field's two-adic order)
-//! - Input sizes larger than 2^32 elements will return an error
+//! - Maximum FFT size is 2^31 elements (MAX_FFT_ORDER = 31)
+//! - Input sizes larger than 2^31 elements will return an error
 //! - Requires macOS with Metal-capable GPU
 
 use super::device::{MetalContext, MetalError, MetalState};
@@ -17,7 +17,7 @@ use metal::{Buffer, MTLCommandBufferStatus, MTLSize};
 /// Goldilocks field primitive 2^32-th root of unity
 const GOLDILOCKS_TWO_ADIC_ROOT: u64 = 1753635133440165772;
 
-/// Maximum FFT order supported by Goldilocks field (2-adic order = 32)
+/// Maximum FFT order (31, not 32, because 2^32 overflows u32 in shader parameters)
 const MAX_FFT_ORDER: u64 = 31;
 
 /// Metal-accelerated Bowers FFT for Goldilocks field
@@ -47,7 +47,7 @@ impl MetalFft {
     ///
     /// Returns `InvalidInput` if:
     /// - Input length is not a power of two
-    /// - Input length exceeds 2^32 (Goldilocks field's two-adic order)
+    /// - Input length exceeds 2^31 elements
     pub fn fft(&self, input: &mut [u64]) -> Result<(), MetalError> {
         let n = input.len();
         if !n.is_power_of_two() {
@@ -110,7 +110,7 @@ impl MetalFft {
     ///
     /// Returns `InvalidInput` if:
     /// - Input length is not a power of two
-    /// - Input length exceeds 2^32 (Goldilocks field's two-adic order)
+    /// - Input length exceeds 2^31 elements
     pub fn ifft(&self, input: &mut [u64]) -> Result<(), MetalError> {
         let n = input.len();
         if !n.is_power_of_two() {
@@ -173,7 +173,7 @@ impl MetalFft {
     ///
     /// Returns `InvalidInput` if:
     /// - Polynomial length is not a power of two
-    /// - Polynomial length exceeds 2^32 (Goldilocks field's two-adic order)
+    /// - Polynomial length exceeds 2^31 elements
     /// - Data length doesn't match poly_len * num_polys
     pub fn batch_fft(
         &self,
