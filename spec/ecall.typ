@@ -16,20 +16,20 @@
 #let config = load_config()
 #let chip = load_chip("src/halt.toml", config)
 #let halt = raw(chip.name)
-== #halt chip
+= #halt chip
 
-=== Columns
+== Columns
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
 
 The #halt chip leverages #nr_variables variable, spanning #nr_columns columns:
 #render_chip_column_table(chip, config)
 
-=== Assumptions
+== Assumptions
 It is assumed the input is range checked:
 #render_chip_assumptions(chip, config)
 
-=== Constraints
+== Constraints
 The #halt chip:
 + makes sure register `x10` (containing the exit code) equals $0$ (@halt:c:read_zero_exit_code),
 + writes $0$ to all other registers (@halt:c:zeroize_registers_lo/@halt:c:zeroize_registers_hi), and
@@ -44,13 +44,13 @@ This prevents any other operation involving memory from being executed hereafter
   Alternatively, one could add 31 lookups to the "memory" table to remove the _known_ final tokens for the registers there.
 ])
 
-==== Lookup
+=== Lookup
 The HALT chip contributes the following interaction to the lookup-argument:
 #render_constraint_table(chip, config, groups: "lookup")
 
 *Note*: #link("https://github.com/riscv-collab/riscv-gnu-toolchain/blob/master/linux-headers/include/asm-generic/unistd.h#L258")[$93$ is the system call number corresponding to `sys_exit`.]
 
-=== Padding
+== Padding
 This chip should only contain a single row.
 Given that $2^0 = 1$, this chip does not need to be padded.
 As such, no padding is defined.

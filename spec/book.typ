@@ -9,8 +9,11 @@
   summary: (
     ("memory.typ", [Memory argument], <memory>),
     ("variables.typ", [Variables], <vars>),
+    ("signatures.typ", [Signatures], <signatures>),
     ("is_bit.typ", [IS_BIT template], <isbit>),
+    ("sign.typ", [SIGN template], <sign>),
     ("add.typ", [ADD/SUB template], <add>),
+    ("neg.typ", [NEG template], <neg>),
     ("decode.typ", [DECODE table], <decode>),
     ("cpu.typ", [CPU chip], <cpu>),
     ("shift.typ", [SHIFT chip], <shift>),
