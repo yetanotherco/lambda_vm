@@ -887,20 +887,15 @@ pub trait IsStarkVerifier<
         };
 
         // =====================================================================
-        // Round 1, Phase C: Replay auxiliary trace commitments
-        // =====================================================================
-
-        for proof in &multi_proof.proofs {
-            if let Some(root) = proof.lde_trace_aux_merkle_root {
-                transcript.append_bytes(&root);
-            }
-        }
-
-        // =====================================================================
-        // Rounds 2-4: Verify each proof
+        // Phase C + Rounds 2-4: Interleaved per table (matches prover ordering)
         // =====================================================================
 
         for (air, proof) in airs.iter().zip(&multi_proof.proofs) {
+            // Phase C: replay this table's auxiliary commitment
+            if let Some(root) = proof.lde_trace_aux_merkle_root {
+                transcript.append_bytes(&root);
+            }
+            // Rounds 2-4: verify this table's proof
             if !Self::verify_rounds_2_to_4(*air, proof, transcript, logup_challenges.clone()) {
                 return false;
             }

@@ -43,8 +43,6 @@ type AirTracePair<'a, Field, FieldExtension, PI> = (
     &'a PI,
 );
 
-type MainCommitment<Field> = (Round1CommitmentData<Field>, Vec<Vec<FieldElement<Field>>>);
-
 /// A default STARK prover implementing `IsStarkProver`.
 pub struct Prover<
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
@@ -458,32 +456,30 @@ pub trait IsStarkProver<
     /// Phase 1a of Round 1: Commit only the main trace to the transcript.
     /// Returns the main trace commitment data and LDE evaluations.
     /// Does NOT sample RAP challenges or build auxiliary trace.
-    #[allow(clippy::type_complexity)]
     fn round_1_commit_main_trace(
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
-    ) -> Result<(Round1CommitmentData<Field>, Vec<Vec<FieldElement<Field>>>), ProvingError>
+    ) -> Result<Round1CommitmentData<Field>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let Some((trace_polys, evaluations, main_merkle_tree, main_merkle_root)) =
+        let Some((trace_polys, _evaluations, main_merkle_tree, main_merkle_root)) =
             Self::interpolate_and_commit_main(trace, domain, transcript)
         else {
             return Err(ProvingError::EmptyCommitment);
         };
+        // _evaluations dropped here — will be recomputed from trace_polys later
 
-        let main = Round1CommitmentData::<Field> {
+        Ok(Round1CommitmentData::<Field> {
             trace_polys,
             lde_trace_merkle_tree: main_merkle_tree,
             lde_trace_merkle_root: main_merkle_root,
             precomputed_merkle_tree: None,
             precomputed_merkle_root: None,
             num_precomputed_cols: 0,
-        };
-
-        Ok((main, evaluations))
+        })
     }
 
     /// Phase 1a variant for preprocessed tables: commits precomputed and multiplicities separately.
@@ -493,14 +489,13 @@ pub trait IsStarkProver<
     /// - Multiplicity columns (num_precomputed_cols..): separate tree, root in proof
     ///
     /// Both commitments are added to the transcript for Fiat-Shamir binding.
-    #[allow(clippy::type_complexity)]
     fn round_1_commit_preprocessed_trace(
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
         precomputed_commitment: Commitment,
         num_precomputed_cols: usize,
-    ) -> Result<(Round1CommitmentData<Field>, Vec<Vec<FieldElement<Field>>>), ProvingError>
+    ) -> Result<Round1CommitmentData<Field>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
@@ -533,30 +528,25 @@ pub trait IsStarkProver<
             Self::batch_commit_main(&mult_rows).ok_or(ProvingError::EmptyCommitment)?;
 
         // Verify that our computed precomputed root matches the hardcoded commitment.
-        // This is a sanity check - if they don't match, something is wrong with the trace.
         debug_assert_eq!(
             precomputed_root, precomputed_commitment,
             "Prover's precomputed commitment doesn't match hardcoded AIR commitment"
         );
 
         // Add BOTH commitments to transcript for Fiat-Shamir binding.
-        // The precomputed commitment binds challenges to the correct precomputed values.
-        // The multiplicities commitment binds challenges to the actual lookups made.
         transcript.append_bytes(&precomputed_commitment);
         transcript.append_bytes(&mult_root);
 
-        // Store multiplicities tree as main (for FRI openings), precomputed tree separately
-        let main = Round1CommitmentData::<Field> {
+        // evaluations dropped here — will be recomputed from trace_polys later
+
+        Ok(Round1CommitmentData::<Field> {
             trace_polys,
             lde_trace_merkle_tree: mult_tree,
             lde_trace_merkle_root: mult_root,
             precomputed_merkle_tree: Some(precomputed_tree),
             precomputed_merkle_root: Some(precomputed_root),
             num_precomputed_cols,
-        };
-
-        // Return full evaluations (all columns) for constraint evaluation
-        Ok((main, evaluations))
+        })
     }
 
     /// Phase 1c of Round 1: Build and commit auxiliary trace using pre-sampled challenges.
@@ -1211,14 +1201,13 @@ pub trait IsStarkProver<
         // same hardcoded value in the transcript.
 
         let mut domains = Vec::with_capacity(num_airs);
-        let mut main_commitments: Vec<MainCommitment<Field>> = Vec::with_capacity(num_airs);
+        let mut main_commitments: Vec<Round1CommitmentData<Field>> = Vec::with_capacity(num_airs);
 
         for (air, trace, _pub_inputs) in &*air_trace_pairs {
             let trace_length = trace.num_rows();
             let domain = new_domain(*air, trace_length);
 
-            let (main, evaluations) = if air.is_preprocessed() {
-                // Preprocessed table: use hardcoded commitment for precomputed columns
+            let main = if air.is_preprocessed() {
                 Self::round_1_commit_preprocessed_trace(
                     *trace,
                     &domain,
@@ -1227,11 +1216,10 @@ pub trait IsStarkProver<
                     air.num_precomputed_columns(),
                 )?
             } else {
-                // Normal table: compute commitment as usual
                 Self::round_1_commit_main_trace(*trace, &domain, transcript)?
             };
 
-            main_commitments.push((main, evaluations));
+            main_commitments.push(main);
             domains.push(domain);
         }
 
@@ -1250,16 +1238,22 @@ pub trait IsStarkProver<
         };
 
         // =====================================================================
-        // Round 1, Phase C: Build and commit auxiliary traces
+        // Phase C + Rounds 2-4: Process each table sequentially
         // =====================================================================
-        // Each AIR builds its LogUp running-sum columns using the shared challenges.
+        // Only one table's full Round1 data exists at a time.
+        // LDE evaluations are recomputed from polynomials per table.
 
-        let mut round_1_results: Vec<Round1<Field, FieldExtension>> = Vec::with_capacity(num_airs);
-        for (((air, trace, _pub_inputs), (main, main_evaluations)), domain) in air_trace_pairs
+        let mut proofs = Vec::with_capacity(num_airs);
+        for (((air, trace, pub_inputs), main), domain) in air_trace_pairs
             .iter_mut()
             .zip(main_commitments)
             .zip(domains.iter())
         {
+            // Recompute main LDE evaluations from polynomials
+            let main_evaluations =
+                Self::compute_lde_trace_evaluations::<Field>(&main.trace_polys, domain);
+
+            // Phase C: Build and commit auxiliary trace
             let round_1_result = Self::round_1_build_auxiliary_trace(
                 *air,
                 *trace,
@@ -1269,20 +1263,12 @@ pub trait IsStarkProver<
                 main_evaluations,
                 logup_challenges.clone(),
             )?;
-            round_1_results.push(round_1_result);
-        }
 
-        // =====================================================================
-        // Rounds 2-4: Standard STARK protocol for each AIR
-        // =====================================================================
-
-        let mut proofs = Vec::with_capacity(num_airs);
-        for (((air, _, pub_inputs), round_1_result), domain) in
-            air_trace_pairs.iter().zip(round_1_results).zip(domains)
-        {
+            // Rounds 2-4
             let proof =
-                Self::prove_rounds_2_to_4(*air, *pub_inputs, &round_1_result, transcript, &domain)?;
+                Self::prove_rounds_2_to_4(*air, *pub_inputs, &round_1_result, transcript, domain)?;
             proofs.push(proof);
+            // round_1_result dropped here — frees this table's LDE + trees
         }
 
         Ok(MultiProof::new(proofs))
