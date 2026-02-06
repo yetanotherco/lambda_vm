@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       program:
-        description: 'Bench program to prove (e.g. bench_32k)'
+        description: 'Bench program to prove (e.g. all_instructions_64, bench_32k)'
         required: false
-        default: 'bench_32k'
+        default: 'all_instructions_64'
       runs:
         description: 'Number of hyperfine runs'
         required: false
@@ -20,7 +20,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  BENCH_PROGRAM: ${{ github.event.inputs.program || 'bench_32k' }}
+  BENCH_PROGRAM: ${{ github.event.inputs.program || 'all_instructions_64' }}
   BENCH_RUNS: ${{ github.event.inputs.runs || '3' }}
 
 jobs:
