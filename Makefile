@@ -1,7 +1,7 @@
 .PHONY: deps deps-linux deps-macos prepare-test-data compile-programs-asm compile-programs-rust compile-bench \
 compile-programs clean-asm clean-rust clean-bench clean-shared clean test test-asm test-no-compile \
 test-asm-no-compile test-rust test-rust-no-compile test-executor flamegraph-prover \
-test-fast test-prover test-prover-all build check bench-prove
+test-fast test-prover test-prover-all build check bench-prove clippy fmt lint
 
 UNAME := $(shell uname)
 
@@ -142,9 +142,9 @@ test-rust-no-compile:
 test-no-compile: prepare-test-data
 	cargo test -p executor
 
-test-flamegraph: 
+test-flamegraph:
 	cargo test -p executor --test flamegraph
-	
+
 test: compile-programs prepare-test-data
 	cargo test
 
@@ -154,13 +154,17 @@ test: compile-programs prepare-test-data
 test-fast:
 	cargo test -p lambda-vm-prover -p stark -p executor -F stark/parallel
 
-# Prover tests only (fast, parallel enabled by default)
+# Prover tests only
 test-prover:
 	cargo test -p lambda-vm-prover
 
 # Prover tests including slow ones
 test-prover-all:
 	cargo test -p lambda-vm-prover -- --include-ignored
+
+# Prover tests with debug-checks (shows bus balance report)
+test-prover-debug:
+	cargo test -p lambda-vm-prover --features debug-checks -- --nocapture
 
 # Build all
 build:
@@ -173,6 +177,19 @@ check:
 bench-prove: compile-programs-asm
 	cargo build --release -p cli
 	./scripts/bench_prove.sh $(BENCH_PROVE_PROGRAM)
+
+# === Linting ===
+
+clippy:
+	cargo clippy --workspace --all-targets
+
+fmt:
+	cargo fmt --all
+
+# Run clippy + fmt check
+lint:
+	cargo fmt --check --all
+	cargo clippy --workspace --all-targets
 
 flamegraph-prover:
 	cd crypto/stark && samply record cargo bench --bench profile_prover --features parallel

@@ -15,6 +15,8 @@ use crate::{
 use crypto::{fiat_shamir::is_transcript::IsStarkTranscript, merkle_tree::proof::Proof};
 #[cfg(not(feature = "test_fiat_shamir"))]
 use log::error;
+#[cfg(feature = "debug-checks")]
+use log::info;
 use math::{
     fft::cpu::bit_reversing::reverse_index,
     field::{
@@ -840,7 +842,7 @@ pub trait IsStarkVerifier<
         // For preprocessed tables, use the hardcoded commitment (verifier cannot
         // trust the prover). For normal tables, use the commitment from the proof.
 
-        for (air, proof) in airs.iter().zip(&multi_proof.proofs) {
+        for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
             if air.is_preprocessed() {
                 // Preprocessed table: VERIFY precomputed commitment matches hardcoded.
                 // This is the critical soundness check - ensures prover used correct precomputed values.
@@ -851,13 +853,13 @@ pub trait IsStarkVerifier<
                     }
                     Some(actual) => {
                         error!(
-                            "Preprocessed commitment mismatch: expected {:?}, got {:?}",
+                            "Preprocessed commitment MISMATCH for table {idx}: expected {:?}, got {:?}",
                             expected_precomputed, actual
                         );
                         return false;
                     }
                     None => {
-                        error!("Preprocessed table proof missing precomputed commitment");
+                        error!("Preprocessed table {idx} proof missing precomputed commitment");
                         return false;
                     }
                 }
@@ -900,8 +902,14 @@ pub trait IsStarkVerifier<
         // Rounds 2-4: Verify each proof
         // =====================================================================
 
-        for (air, proof) in airs.iter().zip(&multi_proof.proofs) {
+        for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
             if !Self::verify_rounds_2_to_4(*air, proof, transcript, logup_challenges.clone()) {
+                error!(
+                    "Table {} failed verify_rounds_2_to_4 (num_constraints={}, trace_cols={})",
+                    idx,
+                    air.context().num_transition_constraints(),
+                    air.context().trace_columns
+                );
                 return false;
             }
         }
@@ -923,9 +931,14 @@ pub trait IsStarkVerifier<
 
             if total != FieldElement::zero() {
                 #[cfg(not(feature = "test_fiat_shamir"))]
-                error!("LogUp bus does not balance: sum of accumulated values is not zero");
+                error!(
+                    "LogUp bus does not balance: sum of accumulated values is not zero. total={:?}",
+                    total
+                );
                 return false;
             }
+            #[cfg(feature = "debug-checks")]
+            info!("Bus balance check PASSED");
         }
 
         true
