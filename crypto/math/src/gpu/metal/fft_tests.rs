@@ -34,7 +34,10 @@ fn canonicalize(x: u64) -> u64 {
 
 /// CPU reference FFT using existing Cooley-Tukey implementation
 fn cpu_fft(input: &[u64]) -> Vec<u64> {
-    assert!(input.len().is_power_of_two(), "cpu_fft requires power-of-two input");
+    assert!(
+        input.len().is_power_of_two(),
+        "cpu_fft requires power-of-two input"
+    );
     let order = input.len().trailing_zeros() as u64;
 
     // Convert to FieldElements
