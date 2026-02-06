@@ -122,7 +122,7 @@ where
         trace_length
     }
 
-    fn transition_constraints(&self) -> &Vec<Box<dyn TransitionConstraint<F, F>>> {
+    fn transition_constraints(&self) -> &[Box<dyn TransitionConstraint<F, F>>] {
         &self.constraints
     }
 

@@ -145,7 +145,7 @@ where
                     // The denominator is guaranteed to be non-zero because the sets of powers of `offset_times_x`
                     // and `trace_primitive_root` are disjoint, provided that the offset is neither an element of the
                     // interpolation domain nor part of a subgroup with order less than n.
-                    unsafe { numerator.div(denominator).unwrap_unchecked() }
+                    numerator.div(denominator).expect("denominator is non-zero: coset offset not in interpolation domain")
                 })
                 .collect();
 
@@ -232,7 +232,7 @@ where
                 .pow(self.offset() * trace_length / self.period())
                 + z.pow(trace_length / self.period());
             // The denominator isn't zero because z is sampled outside the set of primitive roots.
-            return unsafe { numerator.div(denominator).unwrap_unchecked() }
+            return numerator.div(denominator).expect("denominator is non-zero: z is outside primitive roots")
                 * end_exemptions_poly.evaluate(z);
         }
 

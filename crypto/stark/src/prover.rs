@@ -19,7 +19,6 @@ use rayon::prelude::{IndexedParallelIterator, IntoParallelRefIterator, ParallelI
 
 #[cfg(debug_assertions)]
 use crate::debug::validate_trace;
-use crate::domain::new_domain;
 use crate::fri;
 use crate::lookup::LOGUP_NUM_CHALLENGES;
 use crate::proof::stark::{DeepPolynomialOpenings, PolynomialOpenings};
@@ -1341,7 +1340,7 @@ pub trait IsStarkProver<
 
         for (air, trace, _pub_inputs) in &*air_trace_pairs {
             let trace_length = trace.num_rows();
-            let domain = new_domain(*air, trace_length);
+            let domain = Domain::new(*air, trace_length);
 
             let (main, evaluations) = if air.is_preprocessed() {
                 // Preprocessed table: use hardcoded commitment for precomputed columns
@@ -1449,7 +1448,7 @@ pub trait IsStarkProver<
 
         for (air, trace, _pub_inputs) in &*air_trace_pairs {
             let trace_length = trace.num_rows();
-            let domain = new_domain(*air, trace_length);
+            let domain = Domain::new(*air, trace_length);
 
             let (main, evaluations) = if air.is_preprocessed() {
                 // Preprocessed tables use the standard path (they have specific commit logic)

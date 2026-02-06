@@ -39,14 +39,11 @@ impl StoneProverTranscript {
     }
 
     pub fn sample_block(&mut self, used_bytes: usize) -> Vec<u8> {
-        let mut first_part: Vec<u8> = self.state.to_vec();
-        let mut counter_bytes: Vec<u8> = vec![0; 28]
-            .into_iter()
-            .chain(self.counter.to_be_bytes().to_vec())
-            .collect();
+        let mut buf = [0u8; 64];
+        buf[..32].copy_from_slice(&self.state);
+        buf[60..64].copy_from_slice(&self.counter.to_be_bytes());
         self.counter += 1;
-        first_part.append(&mut counter_bytes);
-        let block = Self::keccak_hash(&first_part);
+        let block = Self::keccak_hash(&buf);
         self.spare_bytes.extend(&block[used_bytes..]);
         block[..used_bytes].to_vec()
     }
@@ -99,10 +96,6 @@ impl IsTranscript<Stark252PrimeField> for StoneProverTranscript {
     }
 
     fn append_bytes(&mut self, new_bytes: &[u8]) {
-        let mut result_hash = [0_u8; 32];
-        result_hash.copy_from_slice(&self.state);
-        result_hash.reverse();
-
         let digest = U256::from_bytes_be(&self.state).unwrap();
         let new_seed = (digest + self.seed_increment).to_bytes_be();
         self.state = Self::keccak_hash(&[&new_seed, new_bytes].concat());

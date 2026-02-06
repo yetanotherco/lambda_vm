@@ -189,7 +189,7 @@ where
         BoundaryConstraints::from_constraints(vec![a0, a1])
     }
 
-    fn transition_constraints(&self) -> &Vec<Box<dyn TransitionConstraint<F, F>>> {
+    fn transition_constraints(&self) -> &[Box<dyn TransitionConstraint<F, F>>] {
         &self.constraints
     }
 

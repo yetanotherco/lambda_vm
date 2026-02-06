@@ -8,7 +8,6 @@ use super::{
 };
 use crate::{
     config::Commitment,
-    domain::new_verifier_domain,
     lookup::LOGUP_NUM_CHALLENGES,
     proof::stark::{DeepPolynomialOpening, MultiProof},
 };
@@ -377,8 +376,8 @@ pub trait IsStarkVerifier<
             .zip(&challenges.iotas)
             .zip(evaluation_point_inverse)
             .enumerate()
-            .fold(true, |mut result, (i, ((proof_s, iota_s), eval))| {
-                result &= Self::verify_query_and_sym_openings(
+            .all(|(i, ((proof_s, iota_s), eval))| {
+                Self::verify_query_and_sym_openings(
                     proof,
                     &challenges.zetas,
                     *iota_s,
@@ -386,8 +385,7 @@ pub trait IsStarkVerifier<
                     eval,
                     &deep_poly_evaluations[i],
                     &deep_poly_evaluations_sym[i],
-                );
-                result
+                )
             })
     }
 
@@ -542,19 +540,17 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        challenges.iotas.iter().zip(&proof.deep_poly_openings).fold(
-            true,
-            |mut result, (iota_n, deep_poly_opening)| {
-                result &= Self::verify_composition_poly_opening(
+        challenges
+            .iotas
+            .iter()
+            .zip(&proof.deep_poly_openings)
+            .all(|(iota_n, deep_poly_opening)| {
+                Self::verify_composition_poly_opening(
                     deep_poly_opening,
                     &proof.composition_poly_root,
                     iota_n,
-                );
-
-                result &= Self::verify_trace_openings(proof, deep_poly_opening, *iota_n);
-                result
-            },
-        )
+                ) && Self::verify_trace_openings(proof, deep_poly_opening, *iota_n)
+            })
     }
 
     /// Verifies the openings of a fold polynomial of an inner layer of FRI.
@@ -679,9 +675,9 @@ pub trait IsStarkVerifier<
         let num_queries = challenges.iotas.len();
         let mut deep_poly_evaluations = Vec::with_capacity(num_queries);
         let mut deep_poly_evaluations_sym = Vec::with_capacity(num_queries);
+        let primitive_root =
+            Field::get_primitive_root_of_unity(domain.root_order as u64).unwrap();
         for (i, iota) in challenges.iotas.iter().enumerate() {
-            let primitive_root =
-                &Field::get_primitive_root_of_unity(domain.root_order as u64).unwrap();
 
             // For preprocessed tables: precomputed columns come FIRST, then multiplicities
             let mut evaluations: Vec<FieldElement<FieldExtension>> = Vec::new();
@@ -710,7 +706,7 @@ pub trait IsStarkVerifier<
             deep_poly_evaluations.push(Self::reconstruct_deep_composition_poly_evaluation(
                 proof,
                 &evaluation_point,
-                primitive_root,
+                &primitive_root,
                 challenges,
                 &evaluations,
                 &proof.deep_poly_openings[i].composition_poly.evaluations,
@@ -743,7 +739,7 @@ pub trait IsStarkVerifier<
             deep_poly_evaluations_sym.push(Self::reconstruct_deep_composition_poly_evaluation(
                 proof,
                 &evaluation_point,
-                primitive_root,
+                &primitive_root,
                 challenges,
                 &evaluations_sym,
                 &proof.deep_poly_openings[i].composition_poly.evaluations_sym,
@@ -1095,7 +1091,7 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        let domain = new_verifier_domain(air, proof.trace_length);
+        let domain = VerifierDomain::new(air, proof.trace_length);
 
         // Verify there are enough queries
         if proof.query_list.len() < air.options().fri_number_of_queries {

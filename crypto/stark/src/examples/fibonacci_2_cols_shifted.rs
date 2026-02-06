@@ -218,7 +218,7 @@ where
 
     fn transition_constraints(
         &self,
-    ) -> &Vec<Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>> {
+    ) -> &[Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>] {
         &self.transition_constraints
     }
 

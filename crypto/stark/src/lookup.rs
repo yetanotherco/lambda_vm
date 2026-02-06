@@ -627,7 +627,7 @@ where
 
     fn transition_constraints(
         &self,
-    ) -> &Vec<Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>> {
+    ) -> &[Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>] {
         &self.transition_constraints
     }
 
@@ -772,6 +772,58 @@ pub enum Multiplicity {
     /// ])
     /// ```
     Linear(Vec<LinearTerm>),
+}
+
+impl Multiplicity {
+    /// Evaluates the multiplicity for a given row using the provided column accessor.
+    ///
+    /// This is generic over the field and the column access pattern, allowing it to be
+    /// used both by the trace builder (indexing into column vectors) and by the constraint
+    /// evaluator (accessing frame evaluation elements).
+    pub fn evaluate<F: IsField>(
+        &self,
+        get_column: impl Fn(usize) -> FieldElement<F>,
+    ) -> FieldElement<F> {
+        match self {
+            Multiplicity::One => FieldElement::<F>::one(),
+            Multiplicity::Column(col) => get_column(*col),
+            Multiplicity::Sum(col_a, col_b) => get_column(*col_a) + get_column(*col_b),
+            Multiplicity::Negated(col) => FieldElement::<F>::one() - get_column(*col),
+            Multiplicity::Linear(terms) => {
+                let mut result = FieldElement::<F>::zero();
+                for term in terms {
+                    match term {
+                        LinearTerm::Column {
+                            coefficient,
+                            column,
+                        } => {
+                            let coeff = if *coefficient >= 0 {
+                                FieldElement::<F>::from(*coefficient as u64)
+                            } else {
+                                -FieldElement::<F>::from((-*coefficient) as u64)
+                            };
+                            result += get_column(*column) * coeff;
+                        }
+                        LinearTerm::ColumnUnsigned {
+                            coefficient,
+                            column,
+                        } => {
+                            let coeff = FieldElement::<F>::from(*coefficient);
+                            result += get_column(*column) * coeff;
+                        }
+                        LinearTerm::Constant(value) => {
+                            if *value >= 0 {
+                                result += FieldElement::<F>::from(*value as u64);
+                            } else {
+                                result = result - FieldElement::<F>::from((-*value) as u64);
+                            }
+                        }
+                    }
+                }
+                result
+            }
+        }
+    }
 }
 
 /// Struct representing a lookup interaction for a given table.
@@ -940,7 +992,10 @@ fn build_logup_term_column<F, E>(
 
     // Precompute powers of alpha for all bus elements
     let num_bus_elements = table_interaction.num_bus_elements();
-    let alpha_powers: Vec<FieldElement<E>> = (0..num_bus_elements).map(|i| alpha.pow(i)).collect();
+    let alpha_powers: Vec<FieldElement<E>> =
+        core::iter::successors(Some(FieldElement::<E>::one()), |prev| Some(prev * alpha))
+            .take(num_bus_elements)
+            .collect();
 
     // Sign: +1 for senders, -1 for receivers
     // This bakes the sign into the term so the accumulated column can just sum everything
@@ -951,48 +1006,9 @@ fn build_logup_term_column<F, E>(
     };
 
     for row in 0..trace_len {
-        // Compute multiplicity based on the Multiplicity variant
-        let multiplicity: FieldElement<F> = match &table_interaction.multiplicity {
-            Multiplicity::One => FieldElement::<F>::one(),
-            Multiplicity::Column(col) => main_segment_cols[*col][row].clone(),
-            Multiplicity::Sum(col_a, col_b) => {
-                &main_segment_cols[*col_a][row] + &main_segment_cols[*col_b][row]
-            }
-            Multiplicity::Negated(col) => FieldElement::<F>::one() - &main_segment_cols[*col][row],
-            Multiplicity::Linear(terms) => {
-                let mut result = FieldElement::<F>::zero();
-                for term in terms {
-                    match term {
-                        LinearTerm::Column {
-                            coefficient,
-                            column,
-                        } => {
-                            let coeff = if *coefficient >= 0 {
-                                FieldElement::<F>::from(*coefficient as u64)
-                            } else {
-                                -FieldElement::<F>::from((-*coefficient) as u64)
-                            };
-                            result += &main_segment_cols[*column][row] * coeff;
-                        }
-                        LinearTerm::ColumnUnsigned {
-                            coefficient,
-                            column,
-                        } => {
-                            let coeff = FieldElement::<F>::from(*coefficient);
-                            result += &main_segment_cols[*column][row] * coeff;
-                        }
-                        LinearTerm::Constant(value) => {
-                            if *value >= 0 {
-                                result += FieldElement::<F>::from(*value as u64);
-                            } else {
-                                result = result - FieldElement::<F>::from((-*value) as u64);
-                            }
-                        }
-                    }
-                }
-                result
-            }
-        };
+        let multiplicity: FieldElement<F> = table_interaction
+            .multiplicity
+            .evaluate(|col| main_segment_cols[col][row].clone());
 
         // Bus elements: [bus_id, ...values...]
         // bus_id is first element to distinguish different buses
@@ -1117,51 +1133,9 @@ where
             let z = &rap_challenges[LOGUP_CHALLENGE_Z];
             let alpha = &rap_challenges[LOGUP_CHALLENGE_ALPHA];
 
-            // Compute multiplicity based on the Multiplicity variant
-            let multiplicity: FieldElement<A> = match &interaction.multiplicity {
-                Multiplicity::One => FieldElement::<A>::one(),
-                Multiplicity::Column(col) => step.get_main_evaluation_element(0, *col).clone(),
-                Multiplicity::Sum(col_a, col_b) => {
-                    step.get_main_evaluation_element(0, *col_a)
-                        + step.get_main_evaluation_element(0, *col_b)
-                }
-                Multiplicity::Negated(col) => {
-                    FieldElement::<A>::one() - step.get_main_evaluation_element(0, *col)
-                }
-                Multiplicity::Linear(terms) => {
-                    let mut result = FieldElement::<A>::zero();
-                    for term in terms {
-                        match term {
-                            LinearTerm::Column {
-                                coefficient,
-                                column,
-                            } => {
-                                let coeff = if *coefficient >= 0 {
-                                    FieldElement::<A>::from(*coefficient as u64)
-                                } else {
-                                    -FieldElement::<A>::from((-*coefficient) as u64)
-                                };
-                                result += step.get_main_evaluation_element(0, *column) * coeff;
-                            }
-                            LinearTerm::ColumnUnsigned {
-                                coefficient,
-                                column,
-                            } => {
-                                let coeff = FieldElement::<A>::from(*coefficient);
-                                result += step.get_main_evaluation_element(0, *column) * coeff;
-                            }
-                            LinearTerm::Constant(value) => {
-                                if *value >= 0 {
-                                    result += FieldElement::<A>::from(*value as u64);
-                                } else {
-                                    result = result - FieldElement::<A>::from((-*value) as u64);
-                                }
-                            }
-                        }
-                    }
-                    result
-                }
-            };
+            let multiplicity: FieldElement<A> = interaction
+                .multiplicity
+                .evaluate(|col| step.get_main_evaluation_element(0, col).clone());
 
             // Bus elements: [bus_id, ...values...]
             // bus_id is first element to distinguish different buses
@@ -1180,7 +1154,9 @@ where
 
             // Coefficients for each bus element (including bus_id)
             let coeffs: Vec<FieldElement<B>> =
-                (0..bus_elements.len()).map(|i| alpha.pow(i)).collect();
+                core::iter::successors(Some(FieldElement::<B>::one()), |prev| Some(prev * alpha))
+                    .take(bus_elements.len())
+                    .collect();
 
             // fingerprint = z - (bus_id + v[0]*α + v[1]*α² + ... + v[n]*α^(n+1))
             let fingerprint: FieldElement<B> = (-bus_elements
