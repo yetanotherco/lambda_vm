@@ -1126,7 +1126,10 @@ fn build_logup_term_column<F, E>(
                 // Convert multiplicity to u64 for logging via canonical representation
                 let mult_u64: u64 = format!("{}", multiplicity.canonical())
                     .parse()
-                    .unwrap_or(u64::MAX);
+                    .unwrap_or_else(|_| {
+                        eprintln!("[BusDebugTracker] WARNING: multiplicity parse failed, using u64::MAX");
+                        u64::MAX
+                    });
 
                 let log = BusInteractionLog {
                     table_name: table_name.to_string(),
