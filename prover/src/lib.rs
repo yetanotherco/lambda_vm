@@ -14,9 +14,9 @@
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
+pub mod constraints;
 #[cfg(feature = "debug-checks")]
 mod debug_report;
-pub mod constraints;
 pub mod tables;
 pub mod test_utils;
 pub mod tests;

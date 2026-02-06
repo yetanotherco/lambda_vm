@@ -859,9 +859,7 @@ pub trait IsStarkVerifier<
                         return false;
                     }
                     None => {
-                        error!(
-                            "Preprocessed table {idx} proof missing precomputed commitment"
-                        );
+                        error!("Preprocessed table {idx} proof missing precomputed commitment");
                         return false;
                     }
                 }
@@ -933,7 +931,10 @@ pub trait IsStarkVerifier<
 
             if total != FieldElement::zero() {
                 #[cfg(not(feature = "test_fiat_shamir"))]
-                error!("LogUp bus does not balance: sum of accumulated values is not zero. total={:?}", total);
+                error!(
+                    "LogUp bus does not balance: sum of accumulated values is not zero. total={:?}",
+                    total
+                );
                 return false;
             }
             #[cfg(feature = "debug-checks")]
