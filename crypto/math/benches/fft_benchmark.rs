@@ -13,13 +13,14 @@ use math::field::element::FieldElement;
 use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
 use math::field::traits::RootsConfig;
 use rand::{RngCore, SeedableRng};
+use rand_chacha::ChaCha20Rng;
 
 type F = GoldilocksField;
 type FE = FieldElement<F>;
 
 /// Generate random field elements for testing
 fn random_field_elements(n: usize) -> Vec<FE> {
-    let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(42);
+    let mut rng = ChaCha20Rng::seed_from_u64(42);
     (0..n).map(|_| FE::from(rng.next_u64())).collect()
 }
 
