@@ -82,11 +82,12 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
 {
     if !fri_layers.is_empty() {
+        let num_layers = fri_layers.len();
         iotas
             .iter()
             .map(|iota_s| {
-                let mut layers_evaluations_sym = Vec::new();
-                let mut layers_auth_paths_sym = Vec::new();
+                let mut layers_evaluations_sym = Vec::with_capacity(num_layers);
+                let mut layers_auth_paths_sym = Vec::with_capacity(num_layers);
 
                 let mut index = *iota_s;
                 for layer in fri_layers {
@@ -106,7 +107,16 @@ where
             })
             .collect()
     } else {
-        vec![]
+        // For 0 FRI layers (small traces), return empty decommitments for each query.
+        // The verifier still needs one decommitment entry per query, even if the
+        // FRI layer data is empty.
+        iotas
+            .iter()
+            .map(|_| FriDecommitment {
+                layers_auth_paths: vec![],
+                layers_evaluations_sym: vec![],
+            })
+            .collect()
     }
 }
 

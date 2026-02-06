@@ -30,6 +30,8 @@ jobs:
 
       - name: Cache cargo build artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "lambda-vm"
 
       - name: Run cargo check
         run: cargo check
@@ -56,6 +58,8 @@ jobs:
 
       - name: Cache cargo build artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "lambda-vm"
 
       - name: Cache compiled ASM ELF artifacts
         id: cache-asm-elfs
@@ -67,7 +71,7 @@ jobs:
       - name: Compile ASM programs to ELF
         if: steps.cache-asm-elfs.outputs.cache-hit != 'true'
         run: |
-          cd executor && make compile-programs-asm
+          make compile-programs-asm
 
       - name: Cache compiled Rust ELF artifacts and build cache
         id: cache-rust-elfs
@@ -83,16 +87,31 @@ jobs:
       - name: Compile Rust programs to ELF
         if: steps.cache-rust-elfs.outputs.cache-hit != 'true'
         run: |
-          cd executor && make compile-programs-rust
+          make compile-programs-rust
 
-      - name: Run asm tests
+      - name: Run asm tests (no compile)
         run: |
-          cd executor && make test-asm-no-compile
+          make test-asm-no-compile
 
       - name: Run rust tests (no compile)
         run: |
-          cd executor && cargo test --test rust
+          make test-rust-no-compile
+
+      - name: Run flamegraph tests
+        run: |
+          make test-flamegraph
+
+      - name: Run ignored executor tests (release)
+        run: |
+          make prepare-test-data
+          cargo test -p executor --release test_ethrex -- --ignored
+          cargo test -p executor --release test_ckzg -- --ignored
 
       - name: Run prover and crypto tests
         run: |
-          cargo test -p prover -p stark -p crypto
+          cargo test -p lambda-vm-prover -p stark -p crypto --release
+
+      - name: Run comprehensive prover tests (merge queue only)
+        if: github.event_name == 'merge_group'
+        run: |
+          cargo test -p lambda-vm-prover --release test_prove_elfs_all_instructions_64_full -- --ignored

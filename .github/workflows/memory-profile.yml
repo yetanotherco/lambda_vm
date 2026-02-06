@@ -1,0 +1,250 @@
+name: Memory Profile
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'prover/**'
+      - 'crypto/**'
+      - 'executor/**'
+      - '.github/workflows/memory-profile.yml'
+
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-profile-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install RISC-V toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld
+
+      - name: Compile test programs
+        run: make compile-programs-asm
+
+      - name: Run memory profile
+        run: |
+          cargo test -p lambda-vm-prover --release --features dhat-heap \
+            test_dhat_memory_profile -- --ignored --nocapture 2>&1 | tee profile-output.txt
+          # Move dhat-heap.json to root for easier access
+          mv prover/dhat-heap.json ./dhat-heap.json
+
+      - name: Extract metrics
+        id: metrics
+        run: |
+          # Extract program metadata from test output
+          PROGRAM_NAME=$(grep "MEMORY_PROFILE_PROGRAM=" profile-output.txt | cut -d= -f2)
+          INSTRUCTION_COUNT=$(grep "MEMORY_PROFILE_INSTRUCTIONS=" profile-output.txt | cut -d= -f2)
+          echo "program_name=$PROGRAM_NAME" >> $GITHUB_OUTPUT
+          echo "instruction_count=$INSTRUCTION_COUNT" >> $GITHUB_OUTPUT
+
+          # Extract metrics from dhat-heap.json
+          # dhat stores per-allocation-point data in .pps array
+          # tb = total bytes, gb = bytes at t-gmax (peak)
+          PEAK_BYTES=$(jq '[.pps[].gb] | add' dhat-heap.json)
+          TOTAL_BYTES=$(jq '[.pps[].tb] | add' dhat-heap.json)
+
+          echo "peak_bytes=$PEAK_BYTES" >> $GITHUB_OUTPUT
+          echo "total_alloc=$TOTAL_BYTES" >> $GITHUB_OUTPUT
+
+          # Human readable
+          PEAK_MB=$(echo "scale=2; $PEAK_BYTES / 1048576" | bc)
+          TOTAL_MB=$(echo "scale=2; $TOTAL_BYTES / 1048576" | bc)
+          echo "peak_mb=$PEAK_MB" >> $GITHUB_OUTPUT
+          echo "total_mb=$TOTAL_MB" >> $GITHUB_OUTPUT
+
+          # Extract the full stack trace for the allocation site with highest peak memory
+          # DHAT JSON: pps[].fs contains frame indices, ftbl maps indices to function names
+          PEAK_STACK=$(jq -r '
+            .ftbl as $ftbl |
+            (.pps | max_by(.gb).fs) |
+            map($ftbl[.]) |
+            join("\n")
+          ' dhat-heap.json)
+          # Use delimiter for multiline output
+          echo "peak_stack<<EOF" >> $GITHUB_OUTPUT
+          echo "$PEAK_STACK" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Upload profile artifact
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: dhat-heap-${{ github.sha }}
+          path: dhat-heap.json
+          retention-days: 90
+
+      - name: Download baseline from main
+        id: baseline
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          branch: main
+          workflow: memory-profile.yml
+          workflow_conclusion: success
+          name: dhat-heap-.*
+          name_is_regexp: true
+          search_artifacts: true
+          path: baseline/
+          if_no_artifact_found: warn
+        continue-on-error: true
+
+      - name: Compare with baseline
+        id: compare
+        run: |
+          if [ -f baseline/*/dhat-heap.json ]; then
+            # Get the most recently modified baseline file (in case multiple were downloaded)
+            BASELINE_FILE=$(ls -t baseline/*/dhat-heap.json 2>/dev/null | head -1)
+            BASELINE_PEAK=$(jq '[.pps[].gb] | add' "$BASELINE_FILE")
+            BASELINE_TOTAL=$(jq '[.pps[].tb] | add' "$BASELINE_FILE")
+
+            CURRENT_PEAK=${{ steps.metrics.outputs.peak_bytes }}
+            CURRENT_TOTAL=${{ steps.metrics.outputs.total_alloc }}
+
+            # Calculate differences
+            PEAK_DIFF=$((CURRENT_PEAK - BASELINE_PEAK))
+            TOTAL_DIFF=$((CURRENT_TOTAL - BASELINE_TOTAL))
+
+            # Calculate percentages
+            if [ "$BASELINE_PEAK" -ne 0 ]; then
+              PEAK_PCT=$(echo "scale=2; ($PEAK_DIFF * 100) / $BASELINE_PEAK" | bc)
+            else
+              PEAK_PCT="N/A"
+            fi
+
+            if [ "$BASELINE_TOTAL" -ne 0 ]; then
+              TOTAL_PCT=$(echo "scale=2; ($TOTAL_DIFF * 100) / $BASELINE_TOTAL" | bc)
+            else
+              TOTAL_PCT="N/A"
+            fi
+
+            # Human readable baseline
+            BASELINE_PEAK_MB=$(echo "scale=2; $BASELINE_PEAK / 1048576" | bc)
+            BASELINE_TOTAL_MB=$(echo "scale=2; $BASELINE_TOTAL / 1048576" | bc)
+            PEAK_DIFF_MB=$(echo "scale=2; $PEAK_DIFF / 1048576" | bc)
+            TOTAL_DIFF_MB=$(echo "scale=2; $TOTAL_DIFF / 1048576" | bc)
+
+            # Determine status emoji
+            if [ "$PEAK_DIFF" -gt 0 ]; then
+              PEAK_STATUS="⚠️ +${PEAK_DIFF_MB} MB (+${PEAK_PCT}%)"
+            elif [ "$PEAK_DIFF" -lt 0 ]; then
+              PEAK_STATUS="✅ ${PEAK_DIFF_MB} MB (${PEAK_PCT}%)"
+            else
+              PEAK_STATUS="✅ No change"
+            fi
+
+            if [ "$TOTAL_DIFF" -gt 0 ]; then
+              TOTAL_STATUS="⚠️ +${TOTAL_DIFF_MB} MB (+${TOTAL_PCT}%)"
+            elif [ "$TOTAL_DIFF" -lt 0 ]; then
+              TOTAL_STATUS="✅ ${TOTAL_DIFF_MB} MB (${TOTAL_PCT}%)"
+            else
+              TOTAL_STATUS="✅ No change"
+            fi
+
+            echo "has_baseline=true" >> $GITHUB_OUTPUT
+            echo "baseline_peak_mb=$BASELINE_PEAK_MB" >> $GITHUB_OUTPUT
+            echo "baseline_total_mb=$BASELINE_TOTAL_MB" >> $GITHUB_OUTPUT
+            echo "peak_status=$PEAK_STATUS" >> $GITHUB_OUTPUT
+            echo "total_status=$TOTAL_STATUS" >> $GITHUB_OUTPUT
+
+            # Check for significant regression (>10%)
+            REGRESSION_THRESHOLD=10
+            if [ "$PEAK_PCT" != "N/A" ]; then
+              IS_REGRESSION=$(echo "$PEAK_PCT > $REGRESSION_THRESHOLD" | bc)
+              if [ "$IS_REGRESSION" -eq 1 ]; then
+                echo "regression=true" >> $GITHUB_OUTPUT
+                echo "::warning::Memory regression detected: peak memory increased by ${PEAK_PCT}%"
+              else
+                echo "regression=false" >> $GITHUB_OUTPUT
+              fi
+            fi
+          else
+            echo "::notice::No baseline found on main branch, establishing initial baseline"
+            echo "has_baseline=false" >> $GITHUB_OUTPUT
+            echo "regression=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const peak_mb = '${{ steps.metrics.outputs.peak_mb }}';
+            const total_mb = '${{ steps.metrics.outputs.total_mb }}';
+            const program_name = '${{ steps.metrics.outputs.program_name }}';
+            const instruction_count = '${{ steps.metrics.outputs.instruction_count }}';
+            const peak_stack = `${{ steps.metrics.outputs.peak_stack }}`;
+            const has_baseline = '${{ steps.compare.outputs.has_baseline }}' === 'true';
+            const regression = '${{ steps.compare.outputs.regression }}' === 'true';
+
+            let body = `## 📊 Memory Profile Results\n\n`;
+            body += `**Program:** \`${program_name}\` (${instruction_count} instructions)\n\n`;
+            body += `| Metric | Value |\n`;
+            body += `|--------|-------|\n`;
+            body += `| **Peak Memory** | ${peak_mb} MB |\n`;
+            body += `| **Total Allocated** | ${total_mb} MB |\n\n`;
+            body += `**Peak Allocation Stack Trace:**\n\`\`\`\n${peak_stack}\n\`\`\`\n\n`;
+
+            if (has_baseline) {
+              const baseline_peak = '${{ steps.compare.outputs.baseline_peak_mb }}';
+              const baseline_total = '${{ steps.compare.outputs.baseline_total_mb }}';
+              const peak_status = '${{ steps.compare.outputs.peak_status }}';
+              const total_status = '${{ steps.compare.outputs.total_status }}';
+
+              body += `### Comparison with \`main\`\n\n`;
+              body += `| Metric | main | This PR | Change |\n`;
+              body += `|--------|------|---------|--------|\n`;
+              body += `| **Peak Memory** | ${baseline_peak} MB | ${peak_mb} MB | ${peak_status} |\n`;
+              body += `| **Total Allocated** | ${baseline_total} MB | ${total_mb} MB | ${total_status} |\n\n`;
+
+              if (regression) {
+                body += `> ⚠️ **Warning:** Significant memory regression detected (>10% increase in peak memory)\n\n`;
+              }
+            } else {
+              body += `> ℹ️ No baseline found on \`main\` branch for comparison.\n\n`;
+            }
+
+            body += `<details>\n<summary>View detailed profile</summary>\n\n`;
+            body += `1. [Download the artifact](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts/${{ steps.upload.outputs.artifact-id }})\n`;
+            body += `2. Extract \`dhat-heap.json\` from the zip\n`;
+            body += `3. Upload to [dh_view](https://nnethercote.github.io/dh_view/dh_view.html)\n`;
+            body += `</details>\n`;
+
+            // Find existing comment to update
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const botComment = comments.find(comment =>
+              comment.user.type === 'Bot' &&
+              comment.body.includes('📊 Memory Profile Results')
+            );
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: body
+              });
+            }

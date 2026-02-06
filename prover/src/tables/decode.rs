@@ -1,337 +1,330 @@
-use crate::utils::{i32_to_2_limbs, u32_to_2_limbs};
-use executor::vm::{
-    instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth},
-    logs::Log,
-};
-use math::field::{
-    element::FieldElement, fields::fft_friendly::babybear_u32::Babybear31PrimeField,
-};
+//! DECODE table for instruction decoding.
+//!
+//! The DECODE table contains all decoded instructions from the program.
+//! It receives lookups from the CPU table to verify instruction decoding.
+//!
+//! ## Columns (Compressed Form)
+//!
+//! - `pc`: DWordWL (2 cols) - program counter
+//! - `packed_decode`: BaseField (1 col) - packed flags and register indices
+//! - `imm`: DWordWL (2 cols) - fully extended 64-bit immediate
+//! - `μ`: BaseField (1 col) - multiplicity
+//!
+//! ## packed_decode Format (51 bits)
+//!
+//! ```text
+//! Bits [0]:     read_register1
+//! Bits [1]:     read_register2
+//! Bits [2]:     write_register
+//! Bits [3]:     memory_2bytes
+//! Bits [4]:     memory_4bytes
+//! Bits [5]:     memory_8bytes
+//! Bits [6]:     c_type
+//! Bits [7]:     signed
+//! Bits [8]:     mp_selector
+//! Bits [9]:     muldiv_selector
+//! Bits [10]:    word_instr
+//! Bits [11-26]: ALU flags (ADD, SUB, SLT, AND, OR, XOR, SHIFT, JALR,
+//!               BEQ, BLT, LOAD, STORE, MUL, DIVREM, ECALL, EBREAK)
+//! Bits [27:35]: rs1 (8 bits)
+//! Bits [35:43]: rs2 (8 bits)
+//! Bits [43:51]: rd (8 bits)
+//! ```
+//!
+//! ## Bus Interactions
+//!
+//! - **Receiver**: DECODE bus - receives lookups from CPU table
 
-type FE = FieldElement<Babybear31PrimeField>;
+use executor::elf::Elf;
+use executor::vm::instruction::decoding::{Instruction, InstructionError};
+use executor::vm::memory::U64HashMap;
+use math::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
+use math::polynomial::Polynomial;
+use stark::config::{BatchedMerkleTree, Commitment};
+use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
+use stark::proof::options::ProofOptions;
+use stark::prover::evaluate_polynomial_on_lde_domain;
+use stark::trace::{TraceTable, columns2rows};
 
-pub const NUM_COLUMNS: usize = 15;
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 
-pub mod instruction {
-    pub const ADD: u32 = 1;
-    pub const SUB: u32 = 1 << 1;
-    pub const SLT: u32 = 1 << 2;
-    pub const AND: u32 = 1 << 3;
-    pub const OR: u32 = 1 << 4;
-    pub const XOR: u32 = 1 << 5;
-    pub const SL: u32 = 1 << 6;
-    pub const SR: u32 = 1 << 7;
-    pub const JALR: u32 = 1 << 8;
-    pub const BEQ: u32 = 1 << 9;
-    pub const BLT: u32 = 1 << 10;
-    pub const LOAD: u32 = 1 << 11;
-    pub const STORE: u32 = 1 << 12;
-    pub const MUL: u32 = 1 << 13;
-    pub const DIVREM: u32 = 1 << 14;
-    pub const ECALL: u32 = 1 << 15;
-    pub const EBREAK: u32 = 1 << 16;
-}
+// Re-export DecodeEntry from types for backwards compatibility
+pub use super::types::DecodeEntry;
 
-#[derive(Default)]
-pub struct DecodeTableRow {
-    pub pc: [FE; 2],
-    pub rs1: FE,
-    pub rs2: FE,
-    pub rd: FE,
-    pub write_register: FE,
-    pub memory_2bytes: FE,
-    pub memory_4bytes: FE,
-    pub imm: [FE; 2],
-    pub signed: FE,
-    pub mp_selector: FE,
-    pub muldiv_selector: FE,
-    pub instruction: FE,
-    pub multiplicity: FE,
-}
+// =========================================================================
+// Column indices for DECODE table
+// =========================================================================
 
-impl DecodeTableRow {
-    pub const NUM_COLUMNS: usize = 15;
+/// Column definitions for the DECODE table.
+pub mod cols {
+    // PC as DWordWL (2 columns)
+    /// pc[0]: Program counter (low word, bits 0-31)
     pub const PC_0: usize = 0;
+    /// pc[1]: Program counter (high word, bits 32-63)
     pub const PC_1: usize = 1;
-    pub const RS1: usize = 2;
-    pub const RS2: usize = 3;
-    pub const RD: usize = 4;
-    pub const WRITE_REGISTER: usize = 5;
-    pub const MEMORY_2BYTES: usize = 6;
-    pub const MEMORY_4BYTES: usize = 7;
-    pub const IMM_0: usize = 8;
-    pub const IMM_1: usize = 9;
-    pub const SIGNED: usize = 10;
-    pub const MP_SELECTOR: usize = 11;
-    pub const MULDIV_SELECTOR: usize = 12;
-    pub const INSTRUCTION: usize = 13;
-    pub const MULTIPLICITY: usize = 14;
 
-    // TODO: Properly migrate to 64-bit when prover is updated (separate PR)
-    pub fn from_log(log: &Log) -> Self {
-        let mut row = Self {
-            pc: u32_to_2_limbs(log.current_pc as u32),
-            ..Default::default()
-        };
+    // packed_decode (1 column)
+    /// packed_decode: All flags and register indices packed into single field element
+    pub const PACKED_DECODE: usize = 2;
 
-        match log.instruction {
-            Instruction::Arith {
-                dst,
-                src1,
-                src2,
-                op,
-            } => {
-                row.rd = FE::from(&dst);
-                row.rs1 = FE::from(&src1);
-                row.rs2 = FE::from(&src2);
-                if dst != 0 {
-                    row.write_register = FE::one();
-                }
-                match op {
-                    ArithOp::Add => row.instruction = FE::from(&instruction::ADD),
-                    ArithOp::Sub => row.instruction = FE::from(&instruction::SUB),
-                    ArithOp::Xor => row.instruction = FE::from(&instruction::XOR),
-                    ArithOp::Or => row.instruction = FE::from(&instruction::OR),
-                    ArithOp::And => row.instruction = FE::from(&instruction::AND),
-                    ArithOp::ShiftLeftLogical => row.instruction = FE::from(&instruction::SL),
-                    ArithOp::ShiftRightLogical => row.instruction = FE::from(&instruction::SR),
-                    ArithOp::ShiftRightArith => {
-                        row.instruction = FE::from(&instruction::SR);
-                        row.signed = FE::one();
-                    }
-                    ArithOp::SetLessThan => {
-                        row.instruction = FE::from(&instruction::SLT);
-                        row.signed = FE::one();
-                    }
-                    ArithOp::SetLessThanU => row.instruction = FE::from(&instruction::SLT),
-                    ArithOp::Mul => {
-                        row.instruction = FE::from(&instruction::MUL);
-                        row.mp_selector = FE::one();
-                        row.signed = FE::one();
-                    }
-                    ArithOp::MulHigh => {
-                        row.instruction = FE::from(&instruction::MUL);
-                        row.muldiv_selector = FE::one();
-                        row.signed = FE::one();
-                    }
-                    ArithOp::MulHighSignedUnsigned => {
-                        row.instruction = FE::from(&instruction::MUL);
-                        row.muldiv_selector = FE::one();
-                        row.mp_selector = FE::one();
-                        row.signed = FE::one();
-                    }
-                    ArithOp::MulHighUnsigned => {
-                        row.instruction = FE::from(&instruction::MUL);
-                        row.muldiv_selector = FE::one();
-                    }
-                    ArithOp::Div => {
-                        row.instruction = FE::from(&instruction::DIVREM);
-                        row.signed = FE::one();
-                    }
-                    ArithOp::DivUnsigned => {
-                        row.instruction = FE::from(&instruction::DIVREM);
-                    }
-                    ArithOp::Remainder => {
-                        row.instruction = FE::from(&instruction::DIVREM);
-                        row.muldiv_selector = FE::one();
-                        row.signed = FE::one();
-                    }
-                    ArithOp::RemainderUnsigned => {
-                        row.instruction = FE::from(&instruction::DIVREM);
-                        row.muldiv_selector = FE::one();
-                    }
-                }
-            }
+    // imm as DWordWL (2 columns)
+    /// imm[0]: Immediate value (low word, bits 0-31)
+    pub const IMM_0: usize = 3;
+    /// imm[1]: Immediate value (high word, bits 32-63)
+    pub const IMM_1: usize = 4;
 
-            Instruction::ArithImm { dst, src, imm, op } => {
-                row.rd = FE::from(&dst);
-                row.rs1 = FE::from(&src);
-                row.rs2 = FE::zero();
-                row.imm = i32_to_2_limbs(imm);
-                if dst != 0 {
-                    row.write_register = FE::one();
-                }
-                match op {
-                    ArithOp::Add => row.instruction = FE::from(&instruction::ADD),
-                    ArithOp::Sub => row.instruction = FE::from(&instruction::SUB),
-                    ArithOp::Xor => row.instruction = FE::from(&instruction::XOR),
-                    ArithOp::Or => row.instruction = FE::from(&instruction::OR),
-                    ArithOp::And => row.instruction = FE::from(&instruction::AND),
-                    ArithOp::ShiftLeftLogical => row.instruction = FE::from(&instruction::SL),
-                    ArithOp::ShiftRightLogical => row.instruction = FE::from(&instruction::SR),
-                    ArithOp::ShiftRightArith => {
-                        row.instruction = FE::from(&instruction::SR);
-                        row.signed = FE::one();
-                    }
-                    ArithOp::SetLessThan => {
-                        row.instruction = FE::from(&instruction::SLT);
-                        row.signed = FE::one();
-                    }
-                    ArithOp::SetLessThanU => row.instruction = FE::from(&instruction::SLT),
-                    _ => todo!(),
-                }
-            }
+    // Multiplicity column
+    /// μ: Multiplicity for bus interactions
+    pub const MU: usize = 5;
 
-            Instruction::JumpAndLink { dst, offset } => {
-                row.instruction = FE::from(&instruction::JALR);
-                row.rd = FE::from(&dst);
-                row.imm = i32_to_2_limbs(offset);
-                if dst != 0 {
-                    row.write_register = FE::one();
-                }
-            }
+    /// Total number of columns
+    pub const NUM_COLUMNS: usize = 6;
+}
 
-            Instruction::JumpAndLinkRegister { base, dst, offset } => {
-                row.instruction = FE::from(&instruction::JALR);
-                row.rd = FE::from(&dst);
-                row.rs1 = FE::from(&base);
-                row.imm = i32_to_2_limbs(offset);
-                if dst != 0 {
-                    row.write_register = FE::one();
-                }
-            }
+/// Number of precomputed columns (PC_0, PC_1, PACKED_DECODE, IMM_0, IMM_1).
+/// The remaining column (MU) is the multiplicity column that varies per execution.
+pub const NUM_PRECOMPUTED_COLS: usize = 5;
 
-            Instruction::Store {
-                src,
-                offset,
-                base,
-                width,
-            } => {
-                row.instruction = FE::from(&instruction::STORE);
-                row.rs1 = FE::from(&base);
-                row.rs2 = FE::from(&src);
-                // Fix this afer changing STORE instruction.
-                row.imm = i32_to_2_limbs(offset);
+// =========================================================================
+// Trace generation
+// =========================================================================
 
-                match width {
-                    LoadStoreWidth::Byte => row.signed = FE::one(),
-                    LoadStoreWidth::Half => {
-                        row.memory_2bytes = FE::one();
-                        row.signed = FE::one();
-                    }
-                    LoadStoreWidth::Word => {
-                        row.memory_2bytes = FE::one();
-                        row.memory_4bytes = FE::one();
-                        row.signed = FE::one();
-                    }
-                    LoadStoreWidth::ByteUnsigned => (),
-                    LoadStoreWidth::HalfUnsigned => row.memory_2bytes = FE::one(),
-                    // TODO: RV64 - properly handle DoubleWord and WordUnsigned in prover migration
-                    LoadStoreWidth::DoubleWord => {
-                        row.memory_2bytes = FE::one();
-                        row.memory_4bytes = FE::one();
-                    }
-                    LoadStoreWidth::WordUnsigned => {
-                        row.memory_2bytes = FE::one();
-                        row.memory_4bytes = FE::one();
-                    }
-                }
-            }
+use std::collections::HashMap;
 
-            Instruction::Load {
-                dst,
-                offset,
-                base,
-                width,
-            } => {
-                row.instruction = FE::from(&instruction::LOAD);
-                row.rd = FE::from(&dst);
-                row.rs1 = FE::from(&base);
-                row.imm = i32_to_2_limbs(offset);
+/// Map from PC to row index in the DECODE trace table.
+pub type PcToRow = HashMap<u64, usize>;
 
-                if dst != 0 {
-                    row.write_register = FE::one();
-                }
+/// Generates the DECODE trace table from the instructions map.
+///
+/// Returns the trace table and a map from PC to row index for use with
+/// `update_multiplicities`. All multiplicities are initialized to 0.
+///
+/// ## Padding
+///
+/// Empty rows use pc=7 with EBREAK=1, which makes them unprovable
+/// since CPU asserts EBREAK=0.
+pub fn generate_decode_trace(
+    instructions: &U64HashMap<Instruction>,
+) -> (TraceTable<GoldilocksField, GoldilocksExtension>, PcToRow) {
+    // Build entries and PC-to-row mapping
+    let mut pc_to_row = HashMap::with_capacity(instructions.len());
+    let entries: Vec<_> = instructions
+        .iter()
+        .enumerate()
+        .map(|(row_idx, (&pc, &instr))| {
+            pc_to_row.insert(pc, row_idx);
+            DecodeEntry::from_instruction(pc, instr)
+        })
+        .collect();
 
-                match width {
-                    LoadStoreWidth::Half => row.memory_2bytes = FE::one(),
-                    LoadStoreWidth::Word => {
-                        row.memory_2bytes = FE::one();
-                        row.memory_4bytes = FE::one();
-                    }
-                    _ => (),
-                }
-            }
+    // Add the CPU padding entry: pc=CPU_PADDING_PC, all flags=0 (per spec, decode must
+    // include this). This row is looked up by CPU padding rows. Its MU will be set by
+    // update_multiplicities.
+    let cpu_padding_row = entries.len();
+    pc_to_row.insert(super::cpu::CPU_PADDING_PC, cpu_padding_row);
+    let cpu_padding_entry = DecodeEntry {
+        pc: super::cpu::CPU_PADDING_PC,
+        ..Default::default()
+    };
 
-            Instruction::Branch {
-                src1,
-                src2,
-                cond,
-                offset,
-            } => {
-                row.rs1 = FE::from(&src1);
-                row.rs2 = FE::from(&src2);
-                row.imm = u32_to_2_limbs(offset as u32);
-                match cond {
-                    Comparison::Equal => row.instruction = FE::from(&instruction::BEQ),
-                    Comparison::NotEqual => {
-                        row.instruction = FE::from(&instruction::BEQ);
-                        row.mp_selector = FE::one()
-                    }
-                    Comparison::LessThan => {
-                        row.instruction = FE::from(&instruction::BLT);
-                        row.signed = FE::one();
-                    }
-                    Comparison::LessThanUnsigned => row.instruction = FE::from(&instruction::BLT),
-                    Comparison::GreaterOrEqual => {
-                        row.instruction = FE::from(&instruction::BLT);
-                        row.signed = FE::one();
-                        row.mp_selector = FE::one()
-                    }
-                    Comparison::GreaterOrEqualUnsigned => {
-                        row.instruction = FE::from(&instruction::BLT);
-                        row.mp_selector = FE::one()
-                    }
-                }
-            }
+    // Pad to next power of 2, minimum 2
+    // +1 for the CPU padding entry
+    let num_entries = entries.len() + 1;
+    let num_rows = num_entries.next_power_of_two().max(2);
+    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
 
-            Instruction::LoadUpperImm { dst, imm } => {
-                row.instruction = FE::from(&instruction::ADD);
-                row.rd = FE::from(&dst);
-                row.rs1 = FE::zero();
-                row.rs2 = FE::zero();
-                row.imm = u32_to_2_limbs(imm);
-                if dst != 0 {
-                    row.write_register = FE::one();
-                }
-            }
+    // Fill actual entries (MU = 0 initially)
+    for (row_idx, entry) in entries.iter().enumerate() {
+        let base = row_idx * cols::NUM_COLUMNS;
 
-            Instruction::AddUpperImmToPc { dst, imm } => {
-                row.instruction = FE::from(&instruction::ADD);
-                row.rd = FE::from(&dst);
-                row.imm = u32_to_2_limbs(imm);
-                if dst != 0 {
-                    row.write_register = FE::one();
-                }
-            }
+        // PC as DWordWL
+        data[base + cols::PC_0] = FE::from(entry.pc & 0xFFFF_FFFF);
+        data[base + cols::PC_1] = FE::from(entry.pc >> 32);
 
-            _ => {}
+        // packed_decode
+        data[base + cols::PACKED_DECODE] = FE::from(entry.packed_decode());
+
+        // imm as DWordWL
+        data[base + cols::IMM_0] = FE::from(entry.imm & 0xFFFF_FFFF);
+        data[base + cols::IMM_1] = FE::from(entry.imm >> 32);
+
+        // MU = 0 (already zero from vec initialization)
+    }
+
+    // Write CPU padding entry (pc=1, all flags=0)
+    {
+        let base = cpu_padding_row * cols::NUM_COLUMNS;
+        data[base + cols::PC_0] = FE::from(cpu_padding_entry.pc & 0xFFFF_FFFF);
+        data[base + cols::PC_1] = FE::from(cpu_padding_entry.pc >> 32);
+        data[base + cols::PACKED_DECODE] = FE::from(cpu_padding_entry.packed_decode());
+        data[base + cols::IMM_0] = FE::from(cpu_padding_entry.imm & 0xFFFF_FFFF);
+        data[base + cols::IMM_1] = FE::from(cpu_padding_entry.imm >> 32);
+    }
+
+    // Fill padding rows with DECODE padding pattern: pc=7, EBREAK=1
+    let padding_entry = DecodeEntry::padding_entry();
+    for row_idx in num_entries..num_rows {
+        let base = row_idx * cols::NUM_COLUMNS;
+
+        data[base + cols::PC_0] = FE::from(padding_entry.pc & 0xFFFF_FFFF);
+        data[base + cols::PC_1] = FE::from(padding_entry.pc >> 32);
+        data[base + cols::PACKED_DECODE] = FE::from(padding_entry.packed_decode());
+        data[base + cols::IMM_0] = FE::from(padding_entry.imm & 0xFFFF_FFFF);
+        data[base + cols::IMM_1] = FE::from(padding_entry.imm >> 32);
+        // MU = 0 for padding rows (already zero from vec initialization)
+    }
+
+    (TraceTable::new_main(data, cols::NUM_COLUMNS, 1), pc_to_row)
+}
+
+/// Updates multiplicities in the DECODE trace table.
+///
+/// For each PC in `lookups`, increments the MU column in the corresponding row.
+pub fn update_multiplicities(
+    trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>,
+    pc_to_row: &PcToRow,
+    lookups: &[u64],
+) {
+    for &pc in lookups {
+        if let Some(&row_idx) = pc_to_row.get(&pc) {
+            let current = trace.main_table.get(row_idx, cols::MU);
+            trace.main_table.set(row_idx, cols::MU, current + FE::one());
         }
-        row
+    }
+}
+
+// =========================================================================
+// Bus interactions
+// =========================================================================
+
+/// Creates all bus interactions for the DECODE table.
+///
+/// The DECODE table is a **receiver** that accepts lookups from the CPU table.
+/// Per spec (cpu.toml): input = ["pc", "imm", "packed_decode"]
+pub fn bus_interactions() -> Vec<BusInteraction> {
+    vec![
+        // DECODE[pc, imm, packed_decode] - receiver from CPU
+        BusInteraction::receiver(
+            BusId::Decode,
+            Multiplicity::Column(cols::MU),
+            vec![
+                // pc as DWordWL (2 bus elements)
+                BusValue::Packed {
+                    start_column: cols::PC_0,
+                    packing: Packing::DWordWL,
+                },
+                // imm as DWordWL (2 bus elements)
+                BusValue::Packed {
+                    start_column: cols::IMM_0,
+                    packing: Packing::DWordWL,
+                },
+                // packed_decode as Direct (1 bus element)
+                BusValue::Packed {
+                    start_column: cols::PACKED_DECODE,
+                    packing: Packing::Direct,
+                },
+            ],
+        ),
+    ]
+}
+
+// =========================================================================
+// Precomputed commitment
+// =========================================================================
+
+/// Computes the LDE commitment for DECODE precomputed columns.
+///
+/// This builds a Merkle tree over the LDE (Low Degree Extension) of the precomputed
+/// columns (PC_0, PC_1, PACKED_DECODE, IMM_0, IMM_1), matching exactly how the prover
+/// commits to traces.
+///
+/// Used by both prover (sanity check) and verifier (soundness check). The verifier
+/// computes this from the program and checks that the proof's commitment matches.
+///
+/// ## Arguments
+/// * `instructions` - The program's instruction map (PC → Instruction)
+/// * `options` - Proof options containing blowup factor and coset offset
+///
+/// ## Returns
+/// The Merkle root commitment over the LDE of precomputed columns.
+pub fn compute_precomputed_commitment(
+    instructions: &U64HashMap<Instruction>,
+    options: &ProofOptions,
+) -> Commitment {
+    // Step 1: Generate trace (MU=0, we only need precomputed columns)
+    let (trace, _pc_to_row) = generate_decode_trace(instructions);
+    let num_rows = trace.num_rows();
+
+    // Step 2: Extract precomputed columns (0..NUM_PRECOMPUTED_COLS)
+    let columns: Vec<Vec<FE>> = (0..NUM_PRECOMPUTED_COLS)
+        .map(|col_idx| {
+            (0..num_rows)
+                .map(|row_idx| *trace.main_table.get(row_idx, col_idx))
+                .collect()
+        })
+        .collect();
+
+    // Step 3: Interpolate each column to a polynomial
+    let polys: Vec<Polynomial<FE>> = columns
+        .iter()
+        .map(|col| {
+            Polynomial::interpolate_fft::<GoldilocksField>(col)
+                .expect("FFT interpolation failed for decode column")
+        })
+        .collect();
+
+    // Step 4: Evaluate polynomials on LDE domain (N * blowup_factor points)
+    let blowup_factor = options.blowup_factor as usize;
+    let coset_offset = FE::from(options.coset_offset);
+    let mut lde_columns: Vec<Vec<FE>> = polys
+        .iter()
+        .map(|poly| {
+            evaluate_polynomial_on_lde_domain(poly, blowup_factor, num_rows, &coset_offset)
+                .expect("LDE evaluation failed for decode polynomial")
+        })
+        .collect();
+
+    // Step 5: Bit-reverse permute (same as prover)
+    for col in lde_columns.iter_mut() {
+        in_place_bit_reverse_permute(col);
     }
 
-    pub fn set_multiplicity(&mut self, multiplicity: usize) {
-        self.multiplicity = FE::from(multiplicity as u64);
+    // Step 6: Convert columns to rows for Merkle tree
+    let lde_rows = columns2rows(lde_columns);
+
+    // Step 7: Build Merkle tree over LDE (N * blowup leaves)
+    let tree = BatchedMerkleTree::<GoldilocksField>::build(&lde_rows)
+        .expect("Failed to build Merkle tree for decode LDE");
+
+    tree.root
+}
+
+// =========================================================================
+// ELF to Instructions (for verifier)
+// =========================================================================
+
+/// Extract instructions from an ELF without running the executor.
+///
+/// This is the minimal computation needed for verifier to compute
+/// the DECODE commitment from the program.
+pub fn instructions_from_elf(elf: &Elf) -> Result<U64HashMap<Instruction>, InstructionError> {
+    let mut map = U64HashMap::default();
+    for seg in elf.data.iter().filter(|s| s.is_executable) {
+        for (i, &word) in seg.values.iter().enumerate() {
+            let pc = seg.base_addr + (i as u64 * 4);
+            map.insert(pc, Instruction::parse(word)?);
+        }
     }
+    Ok(map)
+}
 
-    pub fn to_vec(self) -> Vec<FE> {
-        let mut row = Vec::with_capacity(NUM_COLUMNS);
-
-        // pc[2]
-        row.extend_from_slice(&self.pc);
-        row.push(self.rs1);
-        row.push(self.rs2);
-        row.push(self.rd);
-        row.push(self.write_register);
-        row.push(self.memory_2bytes);
-        row.push(self.memory_4bytes);
-        // imm[2]
-        row.extend_from_slice(&self.imm);
-        row.push(self.signed);
-        row.push(self.mp_selector);
-        row.push(self.muldiv_selector);
-        row.push(self.instruction);
-        row.push(self.multiplicity);
-
-        row
-    }
+/// Compute DECODE commitment directly from an ELF.
+///
+/// This is what the verifier uses - no executor needed.
+pub fn commitment_from_elf(
+    elf: &Elf,
+    options: &ProofOptions,
+) -> Result<Commitment, InstructionError> {
+    let instructions = instructions_from_elf(elf)?;
+    Ok(compute_precomputed_commitment(&instructions, options))
 }
