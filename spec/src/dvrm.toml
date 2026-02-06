@@ -51,13 +51,13 @@ pad = 0
 
 [[variables.auxiliary]]
 name = "abs_r"
-type = "DWordHL"
+type = "DWordWL"
 desc = "Absolute value of `r`."
 pad = 0
 
 [[variables.auxiliary]]
 name = "abs_d"
-type = "DWordHL"
+type = "DWordWL"
 desc = "Absolute value of `d`."
 pad = 0
 
@@ -215,55 +215,39 @@ name = "abs_diff"
 [[constraints.abs_diff]]
 kind = "interaction"
 tag = "LT"
-input = [["cast", "abs_r", "DWordWL"], ["cast", "abs_d", "DWordWL"], 0]
+input = ["abs_r", "abs_d", 0]
 output = ["not", "div_by_zero"]
 multiplicity = "μ_sum"
 ref ="dvrm:c:abs_r_lt_abs_d"
 
 [[constraints.abs_diff]]
-kind = "interaction"
-tag = "IS_HALF"
-input = [["idx", "abs_r", "i"]]
-iter = ["i", 0, 3]
-multiplicity = "sign_r"
-ref = "dvrm:c:abs_r_range_check"
-
-[[constraints.abs_diff]]
 kind = "template"
-tag = "SUB"
-input = [0, ["cast", "r", "DWordWL"]]
-output = ["cast", "abs_r", "DWordWL"]
+tag = "NEG"
+input = ["r"]
+output = "abs_r"
 cond = "sign_r"
 ref = "dvrm:c:abs_r_if_negative"
 
 [[constraints.abs_diff]]
 kind = "arith"
-constraint = "$not#`sign_r` => #`abs_r[i]`=#`r[i]`$"
-iter = ["i", 0, 3]
-poly = ["*", ["-", 1, "sign_r"], ["-", ["idx", "abs_r", "i"], ["idx", "r", "i"]]]
+constraint = "$not#`sign_r` => #`abs_r` = #`r`$"
+poly = ["*", ["not", "sign_r"], ["-", ["idx", "abs_r", "i"], ["idx", ["cast", "r", "DWordWL"], "i"]]]
+iter = ["i", 0, 1]
 ref = "dvrm:c:abs_r_if_nonnegative"
 
 [[constraints.abs_diff]]
-kind = "interaction"
-tag = "IS_HALF"
-input = [["idx", "abs_d", "i"]]
-iter = ["i", 0, 3]
-multiplicity = "sign_d"
-ref = "dvrm:c:abs_d_range_check"
-
-[[constraints.abs_diff]]
 kind = "template"
-tag = "SUB"
-input = [0, ["cast", "d", "DWordWL"]]
-output = ["cast", "abs_d", "DWordWL"]
+tag = "NEG"
+input = ["d"]
+output = "abs_d"
 cond = "sign_d"
 ref = "dvrm:c:abs_d_if_negative"
 
 [[constraints.abs_diff]]
 kind = "arith"
-constraint = "$not#`sign_d` => #`abs_d[i]`=#`d[i]`$"
-iter = ["i", 0, 3]
-poly = ["*", ["-", 1, "sign_d"], ["-", ["idx", "abs_d", "i"], ["idx", "d", "i"]]]
+constraint = "$not#`sign_d` => #`abs_d` = #`d`$"
+iter = ["i", 0, 1]
+poly = ["*", ["not", "sign_d"], ["-", ["idx", "abs_d", "i"], ["idx", ["cast", "d", "DWordWL"], "i"]]]
 ref = "dvrm:c:abs_d_if_nonnegative"
 
 [[constraint_groups]]
