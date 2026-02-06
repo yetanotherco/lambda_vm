@@ -34,7 +34,7 @@ pad = 0
 name = "next_pc_high"
 type = ["Half", 3]
 desc = "The upper part of the next pc"
-pad = 0 # TODO(#128): improve handling for arrays
+pad = ["arr", 0, 0, 0]
 
 [[variables.output]]
 name = "next_pc_low"
