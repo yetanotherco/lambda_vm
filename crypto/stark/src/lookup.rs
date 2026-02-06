@@ -674,40 +674,9 @@ where
             build_logup_term_column(i, interaction, trace, challenges, table_name);
         }
 
-        // DEBUG: Sum terms by bus_id to find which bus is imbalanced
         #[cfg(feature = "debug-checks")]
-        let (bus_sums, bus_sender_sums, bus_receiver_sums) = {
-            let mut bus_sums: HashMap<u64, FieldElement<E>> = HashMap::new();
-            let mut bus_sender_sums: HashMap<u64, FieldElement<E>> = HashMap::new();
-            let mut bus_receiver_sums: HashMap<u64, FieldElement<E>> = HashMap::new();
-
-            for (i, interaction) in self
-                .auxiliary_trace_build_data
-                .interactions
-                .iter()
-                .enumerate()
-            {
-                let mut col_sum = FieldElement::<E>::zero();
-                for row in 0..trace.num_rows() {
-                    col_sum = col_sum + trace.get_aux(row, i);
-                }
-                *bus_sums
-                    .entry(interaction.bus_id)
-                    .or_insert(FieldElement::zero()) += col_sum.clone();
-
-                if interaction.is_sender {
-                    *bus_sender_sums
-                        .entry(interaction.bus_id)
-                        .or_insert(FieldElement::zero()) += col_sum;
-                } else {
-                    let entry = bus_receiver_sums
-                        .entry(interaction.bus_id)
-                        .or_insert(FieldElement::zero());
-                    *entry = entry.clone() - col_sum;
-                }
-            }
-            (bus_sums, bus_sender_sums, bus_receiver_sums)
-        };
+        let (per_bus_sums, per_bus_sender_sums, per_bus_receiver_sums) =
+            compute_debug_bus_sums(&self.auxiliary_trace_build_data.interactions, trace);
 
         // Build accumulated column (sums all term columns across rows)
         let acc_col_idx = num_interactions;
@@ -719,11 +688,11 @@ where
             initial_value: trace.get_aux(0, acc_col_idx).clone(),
             final_accumulated: trace.get_aux(last_row, acc_col_idx).clone(),
             #[cfg(feature = "debug-checks")]
-            per_bus_sums: bus_sums,
+            per_bus_sums,
             #[cfg(feature = "debug-checks")]
-            per_bus_sender_sums: bus_sender_sums,
+            per_bus_sender_sums,
             #[cfg(feature = "debug-checks")]
-            per_bus_receiver_sums: bus_receiver_sums,
+            per_bus_receiver_sums,
             #[cfg(feature = "debug-checks")]
             table_name: self.name.clone().unwrap_or_else(|| "UNKNOWN".to_string()),
         })
@@ -1137,6 +1106,48 @@ fn build_accumulated_column<F, E>(
         accumulated += row_sum;
         trace.set_aux(row, acc_column_idx, accumulated.clone());
     }
+}
+
+/// Sum aux term columns by bus_id to produce per-bus totals for the debug report.
+#[cfg(feature = "debug-checks")]
+#[allow(clippy::type_complexity)]
+fn compute_debug_bus_sums<F, E>(
+    interactions: &[BusInteraction],
+    trace: &TraceTable<F, E>,
+) -> (
+    HashMap<u64, FieldElement<E>>,
+    HashMap<u64, FieldElement<E>>,
+    HashMap<u64, FieldElement<E>>,
+)
+where
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
+    E: IsField + Send + Sync,
+{
+    let mut bus_sums: HashMap<u64, FieldElement<E>> = HashMap::new();
+    let mut sender_sums: HashMap<u64, FieldElement<E>> = HashMap::new();
+    let mut receiver_sums: HashMap<u64, FieldElement<E>> = HashMap::new();
+
+    for (i, interaction) in interactions.iter().enumerate() {
+        let mut col_sum = FieldElement::<E>::zero();
+        for row in 0..trace.num_rows() {
+            col_sum = col_sum + trace.get_aux(row, i);
+        }
+        *bus_sums
+            .entry(interaction.bus_id)
+            .or_insert(FieldElement::zero()) += col_sum.clone();
+
+        if interaction.is_sender {
+            *sender_sums
+                .entry(interaction.bus_id)
+                .or_insert(FieldElement::zero()) += col_sum;
+        } else {
+            let entry = receiver_sums
+                .entry(interaction.bus_id)
+                .or_insert(FieldElement::zero());
+            *entry = entry.clone() - col_sum;
+        }
+    }
+    (bus_sums, sender_sums, receiver_sums)
 }
 
 /// Constraint for each term column.
