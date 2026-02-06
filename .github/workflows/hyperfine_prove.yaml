@@ -195,8 +195,6 @@ jobs:
       - name: Benchmark prove
         id: run-benchmark
         run: |
-          sudo swapoff -a
-
           PROGRAM="${{ env.BENCH_PROGRAM }}"
           ELF="bench_programs/${PROGRAM}.elf"
 
