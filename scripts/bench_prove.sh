@@ -5,7 +5,7 @@
 #
 # Usage:
 #   ./bench_prove.sh              # Benchmark all bench programs
-#   ./bench_prove.sh <program>    # Benchmark a specific program (e.g. vector)
+#   ./bench_prove.sh <program>    # Benchmark a specific program (e.g. bench_32k)
 #
 # Environment variables:
 #   BENCH_PROVE_RUNS      Number of hyperfine runs (default: 3)
@@ -33,7 +33,7 @@ NC='\033[0m'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TMP_DIR="/tmp/bench_prove"
-BENCH_ARTIFACTS_DIR="$ROOT_DIR/executor/program_artifacts/bench"
+BENCH_ARTIFACTS_DIR="$ROOT_DIR/executor/program_artifacts/asm"
 
 RUNS="${BENCH_PROVE_RUNS:-3}"
 WARMUP="${BENCH_PROVE_WARMUP:-0}"
@@ -45,7 +45,7 @@ if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
     echo ""
     echo "Usage:"
     echo "  ./bench_prove.sh              # Benchmark all bench programs"
-    echo "  ./bench_prove.sh <program>    # Benchmark a specific program (e.g. keccak)"
+    echo "  ./bench_prove.sh <program>    # Benchmark a specific program (e.g. bench_32k)"
     echo ""
     echo "Environment variables:"
     echo "  BENCH_PROVE_RUNS      Number of runs (default: 3)"
@@ -88,7 +88,7 @@ else
     ELFS=("$BENCH_ARTIFACTS_DIR"/*.elf)
     shopt -u nullglob
     if [ ${#ELFS[@]} -eq 0 ]; then
-        echo -e "${RED}Error: No ELF files found in $BENCH_ARTIFACTS_DIR. Run: make compile-bench${NC}"
+        echo -e "${RED}Error: No ELF files found in $BENCH_ARTIFACTS_DIR. Run: make compile-programs-asm${NC}"
         exit 1
     fi
 fi

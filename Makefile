@@ -170,7 +170,7 @@ build:
 check:
 	cargo check --workspace
 
-bench-prove: compile-bench
+bench-prove: compile-programs-asm
 	cargo build --release -p cli
 	./scripts/bench_prove.sh $(BENCH_PROVE_PROGRAM)
 

@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       program:
-        description: 'Bench program to prove (e.g. keccak)'
+        description: 'Bench program to prove (e.g. bench_32k)'
         required: false
-        default: 'vector'
+        default: 'bench_32k'
       runs:
         description: 'Number of hyperfine runs'
         required: false
@@ -20,7 +20,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  BENCH_PROGRAM: ${{ github.event.inputs.program || 'vector' }}
+  BENCH_PROGRAM: ${{ github.event.inputs.program || 'bench_32k' }}
   BENCH_RUNS: ${{ github.event.inputs.runs || '3' }}
 
 jobs:
@@ -60,7 +60,7 @@ jobs:
         id: cache
         with:
           path: bench_programs/*.elf
-          key: prove-programs-${{ hashFiles('executor/programs/rust/*') }}
+          key: prove-programs-${{ hashFiles('executor/programs/asm/*') }}
 
       - name: Setup Rust Environment
         if: steps.cache.outputs.cache-hit != 'true'
@@ -70,13 +70,12 @@ jobs:
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p bench_programs
-          make prepare-sysroot
-          make -j compile-programs-rust
-          cp executor/program_artifacts/rust/*.elf bench_programs/
+          make -j compile-programs-asm
+          cp executor/program_artifacts/asm/*.elf bench_programs/
 
       - name: Export bench hash
         id: export-hash
-        run: echo "bench-hash=${{ hashFiles('executor/programs/rust/*') }}" >> "$GITHUB_OUTPUT"
+        run: echo "bench-hash=${{ hashFiles('executor/programs/asm/*') }}" >> "$GITHUB_OUTPUT"
 
   build-base-binary:
     name: Build CLI for base
@@ -179,7 +178,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: bench_programs/*.elf
-          key: bench-prove-${{ needs.build-program.outputs.bench-hash }}
+          key: prove-programs-${{ needs.build-program.outputs.bench-hash }}
 
       - name: Verify binaries
         run: |
