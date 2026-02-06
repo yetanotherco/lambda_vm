@@ -34,7 +34,6 @@ BENCH_ARTIFACTS_DIR=./executor/program_artifacts/bench
 SHARED_TARGET_DIR=./executor/shared_target
 
 ASM_PROGRAMS = $(wildcard $(ASM_PROGRAMS_DIR)/*.s)
-ARTIFACTS_ASM = $(patsubst $(ASM_PROGRAMS_DIR)/%.s, $(ASM_ARTIFACTS_DIR)/%.elf, $(ASM_PROGRAMS))
 
 RUST_PROGRAM_DIRS := $(dir $(wildcard $(RUST_PROGRAMS_DIR)/*/Cargo.toml))
 RUST_PROGRAMS := $(notdir $(basename $(RUST_PROGRAM_DIRS:%/=%)))
@@ -75,7 +74,12 @@ prepare-sysroot:
 		echo "Sysroot already exists at $(SYSROOT_DIR)"; \
 	fi
 
-compile-programs-asm: $(ARTIFACTS_ASM)
+compile-programs-asm:
+	@mkdir -p $(ASM_ARTIFACTS_DIR)
+	@for src in $(ASM_PROGRAMS); do \
+		echo "clang --target=riscv64 -fuse-ld=lld -nostdlib -Wl,-e,main $$src -o $(ASM_ARTIFACTS_DIR)/$$(basename $$src .s).elf"; \
+		clang --target=riscv64 -fuse-ld=lld -nostdlib -Wl,-e,main $$src -o $(ASM_ARTIFACTS_DIR)/$$(basename $$src .s).elf; \
+	done
 
 compile-programs-rust: prepare-sysroot $(RUST_ARTIFACTS)
 
@@ -83,10 +87,6 @@ compile-bench: $(BENCH_ARTIFACTS)
 
 compile-programs: compile-programs-asm compile-programs-rust compile-bench
 
-# Compile and link assembly directly with clang (64-bit)
-$(ASM_ARTIFACTS_DIR)/%.elf: $(ASM_PROGRAMS_DIR)/%.s
-	@mkdir -p $(ASM_ARTIFACTS_DIR)
-	clang --target=riscv64 -fuse-ld=lld -nostdlib -Wl,-e,main $< -o $@
 
 # Compile rust (64-bit)
 $(RUST_ARTIFACTS_DIR)/%.elf: $(RUST_PROGRAMS_DIR)/%/Cargo.toml
