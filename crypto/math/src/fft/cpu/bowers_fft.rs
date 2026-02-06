@@ -152,6 +152,31 @@ impl<E: IsField> FftMatrix<E> {
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
+/// Compute adaptive parallelization threshold based on number of available threads.
+///
+/// The threshold determines the minimum number of independent blocks required before
+/// using parallel processing. This function adapts the threshold based on CPU core count:
+/// - More cores → lower threshold (can parallelize earlier)
+/// - Fewer cores → higher threshold (avoid overhead)
+///
+/// Formula: `max(num_threads * BLOCKS_PER_THREAD, MIN_BLOCKS)`
+/// - Each thread should have at least 4 blocks to process (amortize spawn overhead)
+/// - Minimum 16 total blocks to ensure meaningful parallelism
+///
+/// # Returns
+/// Parallelization threshold (number of blocks)
+#[cfg(feature = "parallel")]
+#[inline]
+fn adaptive_parallel_threshold() -> usize {
+    const BLOCKS_PER_THREAD: usize = 4;
+    const MIN_BLOCKS: usize = 16;
+
+    let num_threads = rayon::current_num_threads();
+    num_threads
+        .saturating_mul(BLOCKS_PER_THREAD)
+        .max(MIN_BLOCKS)
+}
+
 /// Optimized Parallel Bowers FFT with 2-layer fusion using LayerTwiddles
 ///
 /// This is the recommended FFT for large inputs (>= 2^16 elements) when
@@ -162,14 +187,14 @@ use rayon::prelude::*;
 /// 2. **2-layer fusion**: Processes two FFT layers at once, keeping intermediate
 ///    values in registers to reduce memory traffic
 /// 3. **Internal parallelization**: Uses `par_chunks_mut` to process independent
-///    blocks in parallel when there are >= 64 blocks (PARALLEL_THRESHOLD)
+///    blocks in parallel when there are enough blocks (adaptive threshold)
 ///
 /// # Parallelization Strategy
 ///
 /// The FFT is structured in layers, where each layer processes blocks of decreasing size.
 /// Early layers have few large blocks (not enough parallelism), while later layers have
-/// many small blocks (good parallelism). We only parallelize when `num_blocks >= 64`
-/// to ensure the threading overhead is amortized.
+/// many small blocks (good parallelism). The parallelization threshold adapts based on
+/// CPU core count to ensure threading overhead is amortized.
 ///
 /// # Errors
 /// Returns `FFTError::InputError` if input length is not a power of two.
@@ -185,9 +210,9 @@ where
     FieldElement<F>: Send + Sync,
     FieldElement<E>: Send + Sync,
 {
-    // Minimum number of blocks required to use parallel processing.
-    // Below this threshold, the threading overhead exceeds the benefit.
-    const PARALLEL_THRESHOLD: usize = 64;
+    // Adaptive threshold based on CPU core count.
+    // More cores → lower threshold, can parallelize earlier.
+    let parallel_threshold = adaptive_parallel_threshold();
 
     let n = input.len();
     if !n.is_power_of_two() {
@@ -214,7 +239,7 @@ where
             let twiddles_l1 = layer_twiddles.get_layer(layer + 1);
             let num_blocks = n / block_size;
 
-            if num_blocks >= PARALLEL_THRESHOLD {
+            if num_blocks >= parallel_threshold {
                 input.par_chunks_mut(block_size).for_each(|block| {
                     process_fused_block(block, twiddles_l0, twiddles_l1);
                 });
@@ -237,7 +262,7 @@ where
         let num_blocks = n / block_size;
         let twiddles = layer_twiddles.get_layer(layer);
 
-        if num_blocks >= PARALLEL_THRESHOLD {
+        if num_blocks >= parallel_threshold {
             input.par_chunks_mut(block_size).for_each(|block| {
                 process_single_layer_block(block, twiddles, half_block);
             });

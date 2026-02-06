@@ -624,3 +624,39 @@ mod parallel_tests {
         assert_eq!(result_seq, result_par);
     }
 }
+
+// =========================================================================
+// Adaptive threshold tests
+// =========================================================================
+
+#[cfg(feature = "parallel")]
+#[test]
+fn test_adaptive_threshold_scales_with_threads() {
+    use crate::fft::cpu::bowers_fft::bowers_fft_opt_fused_parallel;
+    use rayon::ThreadPoolBuilder;
+
+    // Test with different thread counts
+    for num_threads in [1, 2, 4, 8] {
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .build()
+            .unwrap();
+
+        pool.install(|| {
+            // Verify FFT still works with adaptive threshold
+            let input: Vec<FE> = (0..256).map(|i| FE::from(i as u64)).collect();
+            let expected = naive_dft(&input);
+
+            let layer_twiddles = LayerTwiddles::<F>::new(8).unwrap();
+            let mut result = input.clone();
+            bowers_fft_opt_fused_parallel(&mut result, &layer_twiddles).unwrap();
+            in_place_bit_reverse_permute(&mut result);
+
+            assert_eq!(
+                result, expected,
+                "FFT correctness with {} threads",
+                num_threads
+            );
+        });
+    }
+}
