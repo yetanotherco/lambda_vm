@@ -15,6 +15,8 @@
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
 pub mod constraints;
+#[cfg(feature = "debug-checks")]
+mod debug_report;
 pub mod tables;
 pub mod test_utils;
 pub mod tests;
@@ -146,6 +148,9 @@ impl VmAirs {
         let mul = create_mul_air(proof_options);
         let branch = create_branch_air(proof_options);
         let halt = create_halt_air(proof_options);
+        #[cfg(feature = "debug-checks")]
+        debug_report::print_bus_legend();
+
         Self {
             cpu,
             bitwise,
