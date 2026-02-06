@@ -5,7 +5,7 @@
 #
 # Usage:
 #   ./bench_prove.sh              # Benchmark all bench programs
-#   ./bench_prove.sh <program>    # Benchmark a specific program (e.g. keccak)
+#   ./bench_prove.sh <program>    # Benchmark a specific program (e.g. vector)
 #
 # Environment variables:
 #   BENCH_PROVE_RUNS      Number of hyperfine runs (default: 3)

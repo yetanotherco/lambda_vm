@@ -6,7 +6,7 @@ on:
       program:
         description: 'Bench program to prove (e.g. keccak)'
         required: false
-        default: 'keccak'
+        default: 'vector'
       runs:
         description: 'Number of hyperfine runs'
         required: false
@@ -20,7 +20,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  BENCH_PROGRAM: ${{ github.event.inputs.program || 'keccak' }}
+  BENCH_PROGRAM: ${{ github.event.inputs.program || 'vector' }}
   BENCH_RUNS: ${{ github.event.inputs.runs || '3' }}
 
 jobs:
@@ -60,7 +60,7 @@ jobs:
         id: cache
         with:
           path: bench_programs/*.elf
-          key: bench-prove-${{ hashFiles('executor/programs/bench/*') }}
+          key: prove-programs-${{ hashFiles('executor/programs/rust/*') }}
 
       - name: Setup Rust Environment
         if: steps.cache.outputs.cache-hit != 'true'
@@ -70,12 +70,13 @@ jobs:
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p bench_programs
-          make -j compile-bench
-          cp executor/program_artifacts/bench/*.elf bench_programs/
+          make prepare-sysroot
+          make -j compile-programs-rust
+          cp executor/program_artifacts/rust/*.elf bench_programs/
 
       - name: Export bench hash
         id: export-hash
-        run: echo "bench-hash=${{ hashFiles('executor/programs/bench/*') }}" >> "$GITHUB_OUTPUT"
+        run: echo "bench-hash=${{ hashFiles('executor/programs/rust/*') }}" >> "$GITHUB_OUTPUT"
 
   build-base-binary:
     name: Build CLI for base
