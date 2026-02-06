@@ -12,10 +12,17 @@
 #   BENCH_PROVE_WARMUP    Number of warmup runs (default: 0)
 #   BENCH_PROVE_SECURITY  Security preset: fast|standard|maximum (default: fast)
 #
-# Requires: hyperfine
+# Requires: hyperfine, jq
 #
 
 set -euo pipefail
+
+for cmd in hyperfine jq; do
+    if ! command -v "$cmd" &>/dev/null; then
+        echo "Error: $cmd is required but not installed."
+        exit 1
+    fi
+done
 
 # Colors
 RED='\033[0;31m'
@@ -77,7 +84,9 @@ if [ -n "$PROGRAM" ]; then
     fi
     ELFS=("$ELF")
 else
+    shopt -s nullglob
     ELFS=("$BENCH_ARTIFACTS_DIR"/*.elf)
+    shopt -u nullglob
     if [ ${#ELFS[@]} -eq 0 ]; then
         echo -e "${RED}Error: No ELF files found in $BENCH_ARTIFACTS_DIR. Run: make compile-bench${NC}"
         exit 1

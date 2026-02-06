@@ -79,7 +79,7 @@ jobs:
         branch: [base, head]
     name: Build CLI for ${{ matrix.branch }}
     needs: should-run
-    if: needs.should-run.outputs.run == 'true'
+    if: needs.should-run.outputs.run == 'true' && (matrix.branch == 'head' || github.event_name != 'workflow_dispatch')
     runs-on: ubuntu-24.04
     steps:
       - name: Fetch from cache
@@ -124,10 +124,11 @@ jobs:
           tool: hyperfine@1.19
 
       - name: Fetch base binary
+        if: github.event_name != 'workflow_dispatch'
         uses: actions/cache/restore@v4
         with:
           path: bench-bin/cli-base
-          key: binary-prove-${{ github.event.pull_request.base.sha || github.sha }}
+          key: binary-prove-${{ github.event.pull_request.base.sha }}
 
       - name: Fetch head binary
         uses: actions/cache/restore@v4
@@ -141,11 +142,22 @@ jobs:
           path: bench_programs/*.elf
           key: bench-prove-${{ needs.build-program.outputs.bench-hash }}
 
+      - name: Verify binaries
+        run: |
+          if [ ! -f bench-bin/cli-head ]; then
+            echo "::error::Head binary not found - cache restore failed"
+            exit 1
+          fi
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ] && [ ! -f bench-bin/cli-base ]; then
+            echo "::error::Base binary not found - cache restore failed"
+            exit 1
+          fi
+          chmod +x bench-bin/cli-*
+
       - name: Benchmark prove
         id: run-benchmark
         run: |
           sudo swapoff -a
-          chmod +x bench-bin/cli-base bench-bin/cli-head
 
           PROGRAM="${{ env.BENCH_PROGRAM }}"
           ELF="bench_programs/${PROGRAM}.elf"
@@ -155,18 +167,28 @@ jobs:
             exit 1
           fi
 
-          PROOF_BASE="/tmp/proof_base.cbor"
           PROOF_HEAD="/tmp/proof_head.cbor"
 
-          hyperfine \
-            --warmup 0 \
-            --runs "${{ env.BENCH_RUNS }}" \
-            --prepare "rm -f $PROOF_BASE $PROOF_HEAD" \
-            -n "base prove $PROGRAM" \
-            "./bench-bin/cli-base prove $ELF --output $PROOF_BASE --security fast" \
-            -n "head prove $PROGRAM" \
-            "./bench-bin/cli-head prove $ELF --output $PROOF_HEAD --security fast" \
-            --export-markdown results.md
+          if [ -f bench-bin/cli-base ]; then
+            PROOF_BASE="/tmp/proof_base.cbor"
+            hyperfine \
+              --warmup 0 \
+              --runs "${{ env.BENCH_RUNS }}" \
+              --prepare "rm -f $PROOF_BASE $PROOF_HEAD" \
+              -n "base prove $PROGRAM" \
+              "./bench-bin/cli-base prove $ELF --output $PROOF_BASE --security fast" \
+              -n "head prove $PROGRAM" \
+              "./bench-bin/cli-head prove $ELF --output $PROOF_HEAD --security fast" \
+              --export-markdown results.md
+          else
+            hyperfine \
+              --warmup 0 \
+              --runs "${{ env.BENCH_RUNS }}" \
+              --prepare "rm -f $PROOF_HEAD" \
+              -n "prove $PROGRAM" \
+              "./bench-bin/cli-head prove $ELF --output $PROOF_HEAD --security fast" \
+              --export-markdown results.md
+          fi
 
           echo "has_results=true" >> "$GITHUB_OUTPUT"
 
