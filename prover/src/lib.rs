@@ -148,6 +148,9 @@ impl VmAirs {
         let mul = create_mul_air(proof_options);
         let branch = create_branch_air(proof_options);
         let halt = create_halt_air(proof_options);
+        #[cfg(feature = "debug-checks")]
+        debug_report::print_bus_legend();
+
         Self {
             cpu,
             bitwise,
@@ -181,16 +184,11 @@ pub fn prove_with_options(
     let mut traces = Traces::from_logs(&result.logs, result.instructions)?;
     let airs = VmAirs::new(&program, proof_options, false);
 
-    let proof = Prover::multi_prove(
+    Prover::multi_prove(
         airs.air_trace_pairs(&mut traces),
         &mut DefaultTranscript::<E>::new(&[]),
     )
-    .map_err(|e| Error::Prover(format!("{e:?}")))?;
-
-    #[cfg(feature = "debug-checks")]
-    debug_report::print_bus_balance_report(&proof);
-
-    Ok(proof)
+    .map_err(|e| Error::Prover(format!("{e:?}")))
 }
 
 /// Verify a proof produced by [`prove`].

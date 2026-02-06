@@ -861,7 +861,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     //
     // packed_decode is computed as a linear combination of all decode columns.
     // Bit positions are defined in types::packed_decode (single source of truth).
-    interactions.push(BusInteraction::sender(
+    interactions.push(BusInteraction::receiver(
+        // TEMPORARY: flipped to test debug report
         BusId::Decode,
         Multiplicity::One, // Every row sends exactly once
         vec![
