@@ -58,6 +58,7 @@ DEFAULT_TYPE: Type = Range(0, 0)
 type Expr = (
     LitExpr
     | VarExpr
+    | ArrExpr
     | IdxExpr
     | CastExpr
     | MulExpr
@@ -96,6 +97,14 @@ class VarExpr:
             return env.typemap[self.name]
         reporter.error(f"Unknown variable: {self.name!r}")
         return DEFAULT_TYPE
+
+
+@dataclass
+class ArrExpr:
+    elems: list[Expr]
+
+    def typecheck(self, env: Environment) -> Type:
+        return [e.typecheck(env) for e in self.elems]
 
 
 @dataclass
@@ -284,6 +293,8 @@ def build_expr(config: Optional["Config"], data: object) -> Expr:
                 x.isidentifier(), f"Invalid identifier name for variable {x!r}"
             )
             return VarExpr(x)
+        case ["arr", *elems]:
+            return ArrExpr([build_expr(config, e) for e in elems])
         case ["idx", x, y]:
             return IdxExpr(build_expr(config, x), build_expr(config, y))
         case ["cast", x, t]:
@@ -402,10 +413,14 @@ class TypeConfig:
                 f"Invalid range: {data!r}",
             )
             start, stop = data["range"]
-            if not isinstance(start, int) and not (isinstance(start, str) and start.isdigit()):
+            if not isinstance(start, int) and not (
+                isinstance(start, str) and start.isdigit()
+            ):
                 reporter.error(f"Range start not an int: {data!r}")
                 start = 0
-            if not isinstance(stop, int) and not (isinstance(stop, str) and stop.isdigit()):
+            if not isinstance(stop, int) and not (
+                isinstance(stop, str) and stop.isdigit()
+            ):
                 reporter.error(f"Range end not an int: {data!r}")
                 stop = start
             self.range = Range(int(start), int(stop))
