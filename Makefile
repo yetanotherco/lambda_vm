@@ -76,7 +76,7 @@ prepare-sysroot:
 
 compile-programs-asm:
 	@mkdir -p $(ASM_ARTIFACTS_DIR)
-	@for src in $(ASM_PROGRAMS); do \
+	@set -e; for src in $(ASM_PROGRAMS); do \
 		echo "clang --target=riscv64 -fuse-ld=lld -nostdlib -Wl,-e,main $$src -o $(ASM_ARTIFACTS_DIR)/$$(basename $$src .s).elf"; \
 		clang --target=riscv64 -fuse-ld=lld -nostdlib -Wl,-e,main $$src -o $(ASM_ARTIFACTS_DIR)/$$(basename $$src .s).elf; \
 	done
