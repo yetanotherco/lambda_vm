@@ -602,34 +602,6 @@ impl<
     }
 }
 
-/// Map bus ID to human-readable name for debug output.
-/// Based on BusId enum from prover/src/tables/types.rs.
-pub fn bus_name(bus_id: u64) -> &'static str {
-    match bus_id {
-        0 => "IsByte",
-        1 => "IsHalfword",
-        2 => "IsB20",
-        3 => "AndByte",
-        4 => "OrByte",
-        5 => "XorByte",
-        6 => "Msb8",
-        7 => "Msb16",
-        8 => "Zero",
-        9 => "Hwsl",
-        10 => "Hwslc",
-        11 => "Lt",
-        12 => "Mul",
-        13 => "Shift",
-        14 => "Memw",
-        15 => "Load",
-        16 => "Memory",
-        17 => "Branch",
-        18 => "Decode",
-        19 => "Ecall",
-        _ => "Unknown",
-    }
-}
-
 impl<F, E, B, PI> crate::traits::AIR for AirWithBuses<F, E, B, PI>
 where
     F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,

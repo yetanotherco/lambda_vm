@@ -14,6 +14,8 @@
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
+#[cfg(feature = "debug-checks")]
+mod debug_report;
 pub mod constraints;
 pub mod tables;
 pub mod test_utils;
@@ -179,11 +181,16 @@ pub fn prove_with_options(
     let mut traces = Traces::from_logs(&result.logs, result.instructions)?;
     let airs = VmAirs::new(&program, proof_options, false);
 
-    Prover::multi_prove(
+    let proof = Prover::multi_prove(
         airs.air_trace_pairs(&mut traces),
         &mut DefaultTranscript::<E>::new(&[]),
     )
-    .map_err(|e| Error::Prover(format!("{e:?}")))
+    .map_err(|e| Error::Prover(format!("{e:?}")))?;
+
+    #[cfg(feature = "debug-checks")]
+    debug_report::print_bus_balance_report(&proof);
+
+    Ok(proof)
 }
 
 /// Verify a proof produced by [`prove`].
