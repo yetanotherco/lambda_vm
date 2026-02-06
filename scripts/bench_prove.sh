@@ -104,9 +104,9 @@ for elf in "${ELFS[@]}"; do
     hyperfine \
         --warmup "$WARMUP" \
         --runs "$RUNS" \
-        --prepare "rm -f $proof_file" \
+        --prepare "rm -f '$proof_file'" \
         -n "prove $name ($SECURITY)" \
-        "$CLI prove $elf --output $proof_file --security $SECURITY" \
+        "'$CLI' prove '$elf' --output '$proof_file' --security $SECURITY" \
         --export-markdown "$TMP_DIR/$name.md" \
         --export-json "$TMP_DIR/$name.json"
 done
