@@ -252,7 +252,8 @@ impl ByteConversion for [FieldElement<Babybear31PrimeField>; 4] {
     where
         Self: Sized,
     {
-        const BYTES_PER_FIELD: usize = 32;
+        // Babybear31PrimeField uses U32MontgomeryBackendPrimeField = 4 bytes per element
+        const BYTES_PER_FIELD: usize = 4;
 
         let x0 = FieldElement::from_bytes_be(&bytes[0..BYTES_PER_FIELD])?;
         let x1 = FieldElement::from_bytes_be(&bytes[BYTES_PER_FIELD..BYTES_PER_FIELD * 2])?;
@@ -266,7 +267,8 @@ impl ByteConversion for [FieldElement<Babybear31PrimeField>; 4] {
     where
         Self: Sized,
     {
-        const BYTES_PER_FIELD: usize = 32;
+        // Babybear31PrimeField uses U32MontgomeryBackendPrimeField = 4 bytes per element
+        const BYTES_PER_FIELD: usize = 4;
 
         let x0 = FieldElement::from_bytes_le(&bytes[0..BYTES_PER_FIELD])?;
         let x1 = FieldElement::from_bytes_le(&bytes[BYTES_PER_FIELD..BYTES_PER_FIELD * 2])?;

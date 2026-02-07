@@ -92,7 +92,7 @@ impl<E: IsShortWeierstrass> ShortWeierstrassProjectivePoint<E> {
         let [px, py, pz] = self.coordinates();
 
         let px_square = px * px;
-        let three_px_square = &px_square + &px_square + &px_square;
+        let three_px_square = px_square.double() + &px_square;
         let w = E::a() * pz * pz + three_px_square;
         let w_square = &w * &w;
 
@@ -293,45 +293,34 @@ where
     /// Serialize the points in the given format
     #[cfg(feature = "alloc")]
     pub fn serialize(&self, point_format: PointFormat, endianness: Endianness) -> Vec<u8> {
-        // TODO: Add more compact serialization formats
-        // Uncompressed affine / Compressed
-
-        let mut bytes: Vec<u8> = Vec::new();
-        let x_bytes: Vec<u8>;
-        let y_bytes: Vec<u8>;
-        let z_bytes: Vec<u8>;
-
         match point_format {
             PointFormat::Projective => {
                 let [x, y, z] = self.coordinates();
-                if endianness == Endianness::BigEndian {
-                    x_bytes = x.to_bytes_be();
-                    y_bytes = y.to_bytes_be();
-                    z_bytes = z.to_bytes_be();
+                let (x_bytes, y_bytes, z_bytes) = if endianness == Endianness::BigEndian {
+                    (x.to_bytes_be(), y.to_bytes_be(), z.to_bytes_be())
                 } else {
-                    x_bytes = x.to_bytes_le();
-                    y_bytes = y.to_bytes_le();
-                    z_bytes = z.to_bytes_le();
-                }
+                    (x.to_bytes_le(), y.to_bytes_le(), z.to_bytes_le())
+                };
+                let mut bytes = Vec::with_capacity(x_bytes.len() * 3);
                 bytes.extend(&x_bytes);
                 bytes.extend(&y_bytes);
                 bytes.extend(&z_bytes);
+                bytes
             }
             PointFormat::Uncompressed => {
                 let affine_representation = self.to_affine();
                 let [x, y, _z] = affine_representation.coordinates();
-                if endianness == Endianness::BigEndian {
-                    x_bytes = x.to_bytes_be();
-                    y_bytes = y.to_bytes_be();
+                let (x_bytes, y_bytes) = if endianness == Endianness::BigEndian {
+                    (x.to_bytes_be(), y.to_bytes_be())
                 } else {
-                    x_bytes = x.to_bytes_le();
-                    y_bytes = y.to_bytes_le();
-                }
+                    (x.to_bytes_le(), y.to_bytes_le())
+                };
+                let mut bytes = Vec::with_capacity(x_bytes.len() * 2);
                 bytes.extend(&x_bytes);
                 bytes.extend(&y_bytes);
+                bytes
             }
         }
-        bytes
     }
 
     pub fn deserialize(

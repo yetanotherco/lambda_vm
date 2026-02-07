@@ -32,7 +32,6 @@ where
     /// Chi is the Lagrange basis polynomial evaluated at r
     /// a indicates the binary decomposition of the index of the Lagrange basis polynomial
     fn compute_chi(a: &[bool], r: &[FieldElement<F>]) -> Result<FieldElement<F>, MultilinearError> {
-        assert_eq!(a.len(), r.len());
         if a.len() != r.len() {
             return Err(MultilinearError::ChisAndEvalsLengthMismatch(
                 a.len(),
@@ -40,11 +39,11 @@ where
             ));
         }
         let mut chi_i = FieldElement::one();
-        for j in 0..r.len() {
-            if a[j] {
-                chi_i *= &r[j];
+        for (aj, rj) in a.iter().zip(r.iter()) {
+            if *aj {
+                chi_i *= rj;
             } else {
-                chi_i *= FieldElement::<F>::one() - &r[j];
+                chi_i *= FieldElement::<F>::one() - rj;
             }
         }
         Ok(chi_i)
@@ -89,7 +88,6 @@ where
         evals: &[(usize, FieldElement<F>)],
         r: &[FieldElement<F>],
     ) -> Result<FieldElement<F>, MultilinearError> {
-        assert_eq!(num_vars, r.len());
         if r.len() != num_vars {
             return Err(MultilinearError::IncorrectNumberofEvaluationPoints(
                 r.len(),

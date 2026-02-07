@@ -17,15 +17,12 @@ impl<F: IsField> Polynomial<FieldElement<F>> {
     /// Creates a new polynomial with the given coefficients
     pub fn new(coefficients: &[FieldElement<F>]) -> Self {
         // Removes trailing zero coefficients at the end
-        let mut unpadded_coefficients = coefficients
+        let end = coefficients
             .iter()
-            .rev()
-            .skip_while(|x| **x == FieldElement::zero())
-            .cloned()
-            .collect::<Vec<FieldElement<F>>>();
-        unpadded_coefficients.reverse();
+            .rposition(|x| *x != FieldElement::zero())
+            .map_or(0, |i| i + 1);
         Polynomial {
-            coefficients: unpadded_coefficients,
+            coefficients: coefficients[..end].to_vec(),
         }
     }
 
@@ -124,11 +121,10 @@ impl<F: IsField> Polynomial<FieldElement<F>> {
 
     /// Returns the coefficient accompanying x^degree
     pub fn leading_coefficient(&self) -> FieldElement<F> {
-        if let Some(coefficient) = self.coefficients.last() {
-            coefficient.clone()
-        } else {
-            FieldElement::zero()
-        }
+        self.coefficients
+            .last()
+            .cloned()
+            .unwrap_or_else(FieldElement::zero)
     }
 
     /// Returns coefficients of the polynomial as an array

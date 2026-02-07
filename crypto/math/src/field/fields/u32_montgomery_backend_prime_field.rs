@@ -215,8 +215,6 @@ impl<const MODULUS: u32> IsPrimeField for U32MontgomeryBackendPrimeField<MODULUS
     }
 }
 
-impl<const MODULUS: u32> FieldElement<U32MontgomeryBackendPrimeField<MODULUS>> {}
-
 impl<const MODULUS: u32> ByteConversion for FieldElement<U32MontgomeryBackendPrimeField<MODULUS>> {
     #[cfg(feature = "alloc")]
     fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {

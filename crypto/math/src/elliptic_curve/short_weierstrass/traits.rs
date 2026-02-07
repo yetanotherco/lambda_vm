@@ -40,9 +40,10 @@ pub trait IsShortWeierstrass: IsEllipticCurve + Clone + Debug {
         y: &FieldElement<Self::BaseField>,
         z: &FieldElement<Self::BaseField>,
     ) -> FieldElement<Self::BaseField> {
-        y.square()
-            - ((x.square() + Self::a() * z.square().square()) * x
-                + Self::b() * z.square().square() * z.square())
+        let z2 = z.square();
+        let z4 = z2.square();
+        let z6 = &z4 * &z2;
+        y.square() - ((x.square() + Self::a() * &z4) * x + Self::b() * z6)
     }
 }
 

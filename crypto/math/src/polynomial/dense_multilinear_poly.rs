@@ -42,7 +42,7 @@ where
     }
 
     /// Returns a reference to the evaluations vector.
-    pub fn evals(&self) -> &Vec<FieldElement<F>> {
+    pub fn evals(&self) -> &[FieldElement<F>] {
         &self.evals
     }
 
@@ -172,12 +172,13 @@ where
     /// Merges a series of DenseMultilinearPolynomials into one polynomial.
     /// Zero-pads the final merged polynomial to the next power-of-two length if necessary.
     pub fn merge(polys: &[DenseMultilinearPolynomial<F>]) -> DenseMultilinearPolynomial<F> {
-        // TODO (performance): pre-allocate vector to avoid repeated resizing.
-        let mut z: Vec<FieldElement<F>> = Vec::new();
+        let total: usize = polys.iter().map(|p| p.len()).sum();
+        let capacity = total.next_power_of_two();
+        let mut z: Vec<FieldElement<F>> = Vec::with_capacity(capacity);
         for poly in polys {
             z.extend(poly.evals.iter().cloned());
         }
-        z.resize(z.len().next_power_of_two(), FieldElement::zero());
+        z.resize(capacity, FieldElement::zero());
         DenseMultilinearPolynomial::new(z)
     }
 

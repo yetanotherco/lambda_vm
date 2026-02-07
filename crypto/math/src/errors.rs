@@ -34,8 +34,8 @@ pub enum PairingError {
 impl From<ByteConversionError> for DeserializationError {
     fn from(error: ByteConversionError) -> Self {
         match error {
-            ByteConversionError::FromBEBytesError => DeserializationError::FieldFromBytesError,
-            ByteConversionError::FromLEBytesError => DeserializationError::FieldFromBytesError,
+            ByteConversionError::FromBEBytesError
+            | ByteConversionError::FromLEBytesError => DeserializationError::FieldFromBytesError,
             _ => DeserializationError::InvalidValue,
         }
     }
