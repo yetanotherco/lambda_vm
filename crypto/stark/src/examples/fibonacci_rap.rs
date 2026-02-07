@@ -306,7 +306,7 @@ pub fn fibonacci_rap_trace<F: IsFFTField>(
 #[cfg(test)]
 mod test {
     use super::*;
-    use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
+    use math::field::goldilocks::GoldilocksField;
 
     type GoldilocksFE = FieldElement<GoldilocksField>;
 

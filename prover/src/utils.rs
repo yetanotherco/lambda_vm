@@ -1,4 +1,6 @@
-use math::field::{element::FieldElement, fields::fft_friendly::u64_goldilocks::GoldilocksField};
+use math::field::{
+    element::FieldElement, goldilocks::GoldilocksField,
+};
 
 type FE = FieldElement<GoldilocksField>;
 
@@ -18,11 +20,7 @@ pub fn u32_to_4_limbs(x: u32) -> [FE; 4] {
 
 pub fn i32_to_2_limbs(x: i32) -> [FE; 2] {
     let unsigned = x as u32;
-    [
-        (unsigned & 0xFFFF) as u64,
-        ((unsigned >> 16) & 0xFFFF) as u64,
-    ]
-    .map(FE::new)
+    [(unsigned & 0xFFFF) as u64, ((unsigned >> 16) & 0xFFFF) as u64].map(FE::new)
 }
 
 pub fn i32_to_4_limbs(x: i32) -> [FE; 4] {

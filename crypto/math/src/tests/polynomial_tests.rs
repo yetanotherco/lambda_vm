@@ -1,15 +1,12 @@
 #[cfg(test)]
 mod tests {
     use crate::field::element::FieldElement;
-    use crate::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
+    use crate::field::goldilocks::GoldilocksField;
     use crate::field::traits::{IsField, IsPrimeField, IsSubFieldOf};
     use crate::polynomial::{Polynomial, pad_with_zero_coefficients};
     use alloc::string::{String, ToString};
     use alloc::{format, vec, vec::Vec};
 
-    // Goldilocks prime: p = 2^64 - 2^32 + 1
-    #[allow(dead_code)]
-    const ORDER: u64 = 18446744069414584321;
     type F = GoldilocksField;
     type FE = FieldElement<F>;
 
@@ -540,7 +537,7 @@ mod tests {
 #[cfg(test)]
 mod dense_multilinear_poly_tests {
     use crate::field::element::FieldElement;
-    use crate::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
+    use crate::field::goldilocks::GoldilocksField;
     use crate::polynomial::dense_multilinear_poly::DenseMultilinearPolynomial;
 
     type F = GoldilocksField;
@@ -671,7 +668,7 @@ mod dense_multilinear_poly_tests {
 #[cfg(test)]
 mod sparse_multilinear_poly_tests {
     use crate::field::element::FieldElement;
-    use crate::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
+    use crate::field::goldilocks::GoldilocksField;
     use crate::polynomial::sparse_multilinear_poly::SparseMultilinearPolynomial;
     use alloc::vec;
 

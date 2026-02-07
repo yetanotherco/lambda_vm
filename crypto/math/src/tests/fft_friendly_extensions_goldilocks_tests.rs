@@ -1,9 +1,7 @@
 use crate::field::{
     element::FieldElement,
-    fields::fft_friendly::{
-        extensions_goldilocks::{Fp2E, Fp3E},
-        u64_goldilocks::GoldilocksField,
-    },
+    extensions_goldilocks::{Fp2E, Fp3E},
+    goldilocks::GoldilocksField,
 };
 
 type FpE = FieldElement<GoldilocksField>;
@@ -422,4 +420,71 @@ fn test_fp3_batch_inverse_large() {
     for (inv, orig) in to_invert.iter().zip(original.iter()) {
         assert_eq!(*inv * *orig, Fp3E::one());
     }
+}
+
+// =====================================================
+// TESTS MIGRATED FROM INLINE extensions_goldilocks.rs
+// =====================================================
+
+#[test]
+fn test_mul_by_7() {
+    use crate::field::extensions_goldilocks::mul_by_7;
+    let a = FpE::from(5u64);
+    let expected = FpE::from(35u64);
+    assert_eq!(mul_by_7(&a), expected);
+
+    let b = FpE::from(1u64);
+    assert_eq!(mul_by_7(&b), FpE::from(7u64));
+
+    let c = FpE::from(0u64);
+    assert_eq!(mul_by_7(&c), FpE::from(0u64));
+}
+
+#[test]
+fn test_fp2_from_i64_positive() {
+    let a = Fp2E::from_i64(42);
+    assert_eq!(a, Fp2E::new([FpE::from(42u64), FpE::zero()]));
+}
+
+#[test]
+fn test_fp2_from_i64_negative() {
+    use crate::field::goldilocks::GOLDILOCKS_PRIME;
+    let a = Fp2E::from_i64(-1);
+    assert_eq!(
+        a,
+        Fp2E::new([FpE::from(GOLDILOCKS_PRIME - 1), FpE::zero()])
+    );
+}
+
+#[test]
+fn test_fp2_from_i64_arithmetic() {
+    let a = Fp2E::from_i64(10);
+    let b = Fp2E::from_i64(-3);
+    assert_eq!(a + b, Fp2E::from_i64(7));
+}
+
+#[test]
+fn test_fp3_from_i64_positive() {
+    let a = Fp3E::from_i64(42);
+    assert_eq!(
+        a,
+        Fp3E::new([FpE::from(42u64), FpE::zero(), FpE::zero()])
+    );
+}
+
+#[test]
+fn test_fp3_from_i64_negative() {
+    use crate::field::goldilocks::GOLDILOCKS_PRIME;
+    let a = Fp3E::from_i64(-1);
+    assert_eq!(
+        a,
+        Fp3E::new([FpE::from(GOLDILOCKS_PRIME - 1), FpE::zero(), FpE::zero()])
+    );
+}
+
+#[test]
+fn test_fp3_from_i64_arithmetic() {
+    let a = Fp3E::from_i64(10);
+    let b = Fp3E::from_i64(-3);
+    assert_eq!(a + b, Fp3E::from_i64(7));
 }

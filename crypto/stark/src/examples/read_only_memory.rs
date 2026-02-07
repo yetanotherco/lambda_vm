@@ -395,7 +395,7 @@ pub fn sort_rap_trace<F: IsFFTField + IsPrimeField>(
 #[cfg(test)]
 mod test {
     use super::*;
-    use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
+    use math::field::goldilocks::GoldilocksField;
 
     type GoldilocksFE = FieldElement<GoldilocksField>;
 

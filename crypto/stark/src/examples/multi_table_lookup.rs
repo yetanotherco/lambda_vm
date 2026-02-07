@@ -6,8 +6,8 @@ use crate::{
     },
     proof::options::ProofOptions,
 };
-use math::field::fields::fft_friendly::{
-    extensions_goldilocks::Degree3GoldilocksExtensionField, u64_goldilocks::GoldilocksField,
+use math::field::{
+    extensions_goldilocks::Degree3GoldilocksExtensionField, goldilocks::GoldilocksField,
 };
 type F = GoldilocksField;
 type E = Degree3GoldilocksExtensionField;

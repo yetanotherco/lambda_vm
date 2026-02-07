@@ -1,7 +1,10 @@
 //! Tests for STARK proving/verification with small traces (1-2 rows).
 //! These tests verify that the FRI protocol handles 0 FRI layers correctly.
 
-use math::field::{element::FieldElement, fields::fft_friendly::u64_goldilocks::GoldilocksField};
+use math::field::{
+    element::FieldElement,
+    goldilocks::GoldilocksField,
+};
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 
@@ -42,11 +45,7 @@ fn test_prove_verify_single_row() {
     .unwrap();
 
     assert!(
-        Verifier::verify(
-            &proof,
-            &air,
-            &mut DefaultTranscript::<GoldilocksField>::new(&[])
-        ),
+        Verifier::verify(&proof, &air, &mut DefaultTranscript::<GoldilocksField>::new(&[])),
         "Verification failed for single-row trace"
     );
 }
@@ -76,11 +75,7 @@ fn test_prove_verify_two_rows() {
     .unwrap();
 
     assert!(
-        Verifier::verify(
-            &proof,
-            &air,
-            &mut DefaultTranscript::<GoldilocksField>::new(&[])
-        ),
+        Verifier::verify(&proof, &air, &mut DefaultTranscript::<GoldilocksField>::new(&[])),
         "Verification failed for two-row trace"
     );
 }
@@ -117,11 +112,7 @@ fn test_verify_fails_with_wrong_inputs() {
 
     // Verification should fail because boundary constraint col0[0]=99 doesn't match trace
     assert!(
-        !Verifier::verify(
-            &proof,
-            &air,
-            &mut DefaultTranscript::<GoldilocksField>::new(&[])
-        ),
+        !Verifier::verify(&proof, &air, &mut DefaultTranscript::<GoldilocksField>::new(&[])),
         "Verification should fail with tampered public inputs"
     );
 }

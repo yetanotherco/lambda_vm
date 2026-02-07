@@ -96,7 +96,7 @@ pub fn fold_polynomial_doubled_inplace<F>(
 mod tests {
     use super::{fold_polynomial, fold_polynomial_doubled, fold_polynomial_doubled_inplace};
     use math::field::element::FieldElement;
-    use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
+    use math::field::goldilocks::GoldilocksField;
     use math::polynomial::Polynomial;
 
     type FE = FieldElement<GoldilocksField>;

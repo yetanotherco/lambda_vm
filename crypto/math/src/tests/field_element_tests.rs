@@ -2,7 +2,7 @@
 mod tests {
     use crate::errors::ByteConversionError;
     use crate::field::element::FieldElement;
-    use crate::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
+    use crate::field::goldilocks::GoldilocksField;
     use crate::field::test_fields::u64_test_field::U64TestField;
     #[cfg(feature = "alloc")]
     use alloc::vec::Vec;
