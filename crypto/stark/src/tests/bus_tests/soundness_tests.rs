@@ -6,7 +6,7 @@
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
 use math::field::fields::fft_friendly::{
-    babybear::Babybear31PrimeField, quartic_babybear::Degree4BabyBearExtensionField,
+    extensions_goldilocks::Degree3GoldilocksExtensionField, u64_goldilocks::GoldilocksField,
 };
 
 use crate::examples::multi_table_lookup::{
@@ -18,8 +18,8 @@ use crate::trace::TraceTable;
 use crate::traits::AIR;
 use crate::verifier::{IsStarkVerifier, Verifier};
 
-type F = Babybear31PrimeField;
-type E = Degree4BabyBearExtensionField;
+type F = GoldilocksField;
+type E = Degree3GoldilocksExtensionField;
 type FE = FieldElement<F>;
 
 /// Bus ID for packing mismatch tests (single bus)

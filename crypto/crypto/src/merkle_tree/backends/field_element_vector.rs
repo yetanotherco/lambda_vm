@@ -131,7 +131,8 @@ where
 #[cfg(test)]
 mod tests {
     use math::field::{
-        element::FieldElement, fields::fft_friendly::stark_252_prime_field::Stark252PrimeField,
+        element::FieldElement,
+        fields::fft_friendly::u64_goldilocks::GoldilocksField,
     };
     use sha2::Sha512;
     use sha3::{Keccak256, Keccak512, Sha3_256, Sha3_512};
@@ -140,7 +141,7 @@ mod tests {
         backends::field_element_vector::FieldElementVectorBackend, merkle::MerkleTree,
     };
 
-    type F = Stark252PrimeField;
+    type F = GoldilocksField;
     type FE = FieldElement<F>;
 
     #[test]

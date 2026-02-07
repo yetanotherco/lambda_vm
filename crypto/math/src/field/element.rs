@@ -2,11 +2,13 @@ use crate::errors::{ByteConversionError, CreationError};
 use crate::field::errors::FieldError;
 use crate::field::traits::IsField;
 use crate::traits::ByteConversion;
-use crate::unsigned_integer::element::UnsignedInteger;
-use crate::unsigned_integer::montgomery::MontgomeryAlgorithms;
 use crate::unsigned_integer::traits::IsUnsignedInteger;
 #[cfg(feature = "alloc")]
 use alloc::{format, string::String};
+#[cfg(any(
+    feature = "lambdaworks-serde-binary",
+    feature = "lambdaworks-serde-string"
+))]
 use core::fmt;
 use core::fmt::Debug;
 use core::iter::Sum;
@@ -34,7 +36,6 @@ use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 ))]
 use serde::ser::{Serialize, SerializeStruct, Serializer};
 
-use super::fields::montgomery_backed_prime_fields::{IsModulus, MontgomeryBackendPrimeField};
 use super::traits::{IsPrimeField, IsSubFieldOf, LegendreSymbol};
 
 /// A field element with operations algorithms defined in `F`
@@ -801,33 +802,3 @@ impl<'de, F: IsPrimeField> Deserialize<'de> for FieldElement<F> {
     }
 }
 
-impl<M, const NUM_LIMBS: usize> fmt::Display
-    for FieldElement<MontgomeryBackendPrimeField<M, NUM_LIMBS>>
-where
-    M: IsModulus<UnsignedInteger<NUM_LIMBS>> + Clone + Debug,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let value: UnsignedInteger<NUM_LIMBS> = self.canonical();
-        write!(f, "{value}")
-    }
-}
-
-impl<M, const NUM_LIMBS: usize> FieldElement<MontgomeryBackendPrimeField<M, NUM_LIMBS>>
-where
-    M: IsModulus<UnsignedInteger<NUM_LIMBS>> + Clone + Debug,
-{
-    /// Creates a `FieldElement` from a hexstring. It can contain `0x` or not.
-    /// # Panics
-    /// Panics if value is not a hexstring
-    pub const fn from_hex_unchecked(hex: &str) -> Self {
-        let integer = UnsignedInteger::<NUM_LIMBS>::from_hex_unchecked(hex);
-        Self {
-            value: MontgomeryAlgorithms::cios(
-                &integer,
-                &MontgomeryBackendPrimeField::<M, NUM_LIMBS>::R2,
-                &M::MODULUS,
-                &MontgomeryBackendPrimeField::<M, NUM_LIMBS>::MU,
-            ),
-        }
-    }
-}

@@ -96,11 +96,10 @@ pub fn fold_polynomial_doubled_inplace<F>(
 mod tests {
     use super::{fold_polynomial, fold_polynomial_doubled, fold_polynomial_doubled_inplace};
     use math::field::element::FieldElement;
-    use math::field::fields::u64_prime_field::U64PrimeField;
+    use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
     use math::polynomial::Polynomial;
 
-    const MODULUS: u64 = 293;
-    type FE = FieldElement<U64PrimeField<MODULUS>>;
+    type FE = FieldElement<GoldilocksField>;
 
     #[test]
     fn test_fold_power_of_2() {
