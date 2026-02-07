@@ -306,7 +306,9 @@ pub fn fibonacci_rap_trace<F: IsFFTField>(
 #[cfg(test)]
 mod test {
     use super::*;
-    use math::field::fields::u64_prime_field::FE17;
+    use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
+
+    type GoldilocksFE = FieldElement<GoldilocksField>;
 
     #[test]
     fn test_build_fibonacci_rap_trace() {
@@ -316,29 +318,29 @@ mod test {
         // Also, a 0 is appended at the end of both columns. The reason for this can be read in
         // https://hackmd.io/@aztec-network/plonk-arithmetiization-air#RAPs---PAIRs-with-interjected-verifier-randomness
 
-        let trace = fibonacci_rap_trace([FE17::from(1), FE17::from(1)], 8);
+        let trace = fibonacci_rap_trace([GoldilocksFE::from(1u64), GoldilocksFE::from(1u64)], 8);
         let mut expected_trace = vec![
             vec![
-                FE17::one(),
-                FE17::one(),
-                FE17::from(2),
-                FE17::from(3),
-                FE17::from(5),
-                FE17::from(8),
-                FE17::from(13),
-                FE17::from(21),
-                FE17::zero(),
+                GoldilocksFE::one(),
+                GoldilocksFE::one(),
+                GoldilocksFE::from(2u64),
+                GoldilocksFE::from(3u64),
+                GoldilocksFE::from(5u64),
+                GoldilocksFE::from(8u64),
+                GoldilocksFE::from(13u64),
+                GoldilocksFE::from(21u64),
+                GoldilocksFE::zero(),
             ],
             vec![
-                FE17::from(21),
-                FE17::one(),
-                FE17::from(2),
-                FE17::from(3),
-                FE17::from(5),
-                FE17::from(8),
-                FE17::from(13),
-                FE17::one(),
-                FE17::zero(),
+                GoldilocksFE::from(21u64),
+                GoldilocksFE::one(),
+                GoldilocksFE::from(2u64),
+                GoldilocksFE::from(3u64),
+                GoldilocksFE::from(5u64),
+                GoldilocksFE::from(8u64),
+                GoldilocksFE::from(13u64),
+                GoldilocksFE::one(),
+                GoldilocksFE::zero(),
             ],
         ];
         resize_to_next_power_of_two(&mut expected_trace);
@@ -348,12 +350,12 @@ mod test {
 
     #[test]
     fn aux_col() {
-        let trace = fibonacci_rap_trace([FE17::from(1), FE17::from(1)], 64);
+        let trace = fibonacci_rap_trace([GoldilocksFE::from(1u64), GoldilocksFE::from(1u64)], 64);
         let trace_cols = trace.columns_main();
 
         let not_perm = trace_cols[0].clone();
         let perm = trace_cols[1].clone();
-        let gamma = FE17::from(10);
+        let gamma = GoldilocksFE::from(10u64);
 
         assert_eq!(perm.len(), not_perm.len());
         let trace_len = not_perm.len();
@@ -361,16 +363,16 @@ mod test {
         let mut aux_col = Vec::new();
         for i in 0..trace_len {
             if i == 0 {
-                aux_col.push(FE17::one());
+                aux_col.push(GoldilocksFE::one());
             } else {
-                let z_i = aux_col[i - 1];
-                let n_p_term = not_perm[i - 1] + gamma;
-                let p_term = perm[i - 1] + gamma;
+                let z_i = aux_col[i - 1].clone();
+                let n_p_term = not_perm[i - 1].clone() + gamma.clone();
+                let p_term = perm[i - 1].clone() + gamma.clone();
 
                 aux_col.push(z_i * n_p_term.div(p_term).unwrap());
             }
         }
 
-        assert_eq!(aux_col.last().unwrap(), &FE17::one());
+        assert_eq!(aux_col.last().unwrap(), &GoldilocksFE::one());
     }
 }

@@ -256,17 +256,18 @@ pub fn compute_trace<F: IsFFTField>(
 #[cfg(test)]
 mod tests {
     use math::field::{
-        element::FieldElement, fields::fft_friendly::stark_252_prime_field::Stark252PrimeField,
+        element::FieldElement,
+        fields::fft_friendly::u64_goldilocks::GoldilocksField,
     };
 
     use super::compute_trace;
 
     #[test]
     fn trace_has_expected_rows() {
-        let trace = compute_trace(FieldElement::<Stark252PrimeField>::one(), 8);
+        let trace = compute_trace(FieldElement::<GoldilocksField>::one(), 8);
         assert_eq!(trace.num_rows(), 8);
 
-        let trace = compute_trace(FieldElement::<Stark252PrimeField>::one(), 64);
+        let trace = compute_trace(FieldElement::<GoldilocksField>::one(), 64);
         assert_eq!(trace.num_rows(), 64);
     }
 }

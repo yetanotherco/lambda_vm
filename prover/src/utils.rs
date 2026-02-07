@@ -1,35 +1,35 @@
 use math::field::{
-    element::FieldElement, fields::fft_friendly::babybear_u32::Babybear31PrimeField,
+    element::FieldElement, fields::fft_friendly::u64_goldilocks::GoldilocksField,
 };
 
-type FE = FieldElement<Babybear31PrimeField>;
+type FE = FieldElement<GoldilocksField>;
 
 pub fn u32_to_2_limbs(x: u32) -> [FE; 2] {
-    [x & 0xFFFF, (x >> 16) & 0xFFFF].map(FE::new)
+    [(x & 0xFFFF) as u64, ((x >> 16) & 0xFFFF) as u64].map(FE::new)
 }
 
 pub fn u32_to_4_limbs(x: u32) -> [FE; 4] {
     [
-        x & 0xFF,
-        (x >> 8) & 0xFF,
-        (x >> 16) & 0xFF,
-        (x >> 24) & 0xFF,
+        (x & 0xFF) as u64,
+        ((x >> 8) & 0xFF) as u64,
+        ((x >> 16) & 0xFF) as u64,
+        ((x >> 24) & 0xFF) as u64,
     ]
     .map(FE::new)
 }
 
 pub fn i32_to_2_limbs(x: i32) -> [FE; 2] {
     let unsigned = x as u32;
-    [unsigned & 0xFFFF, (unsigned >> 16) & 0xFFFF].map(FE::new)
+    [(unsigned & 0xFFFF) as u64, ((unsigned >> 16) & 0xFFFF) as u64].map(FE::new)
 }
 
 pub fn i32_to_4_limbs(x: i32) -> [FE; 4] {
     let unsigned = x as u32;
     [
-        unsigned & 0xFF,
-        (unsigned >> 8) & 0xFF,
-        (unsigned >> 16) & 0xFF,
-        (unsigned >> 24) & 0xFF,
+        (unsigned & 0xFF) as u64,
+        ((unsigned >> 8) & 0xFF) as u64,
+        ((unsigned >> 16) & 0xFF) as u64,
+        ((unsigned >> 24) & 0xFF) as u64,
     ]
     .map(FE::new)
 }

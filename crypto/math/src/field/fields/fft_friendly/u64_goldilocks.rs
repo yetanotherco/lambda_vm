@@ -15,6 +15,7 @@
 //! - Remco Bloemen: <https://xn--2-umb.com/23/gold-reduce/>
 
 use crate::field::{element::FieldElement, errors::FieldError, traits::IsField};
+use crate::field::traits::HasDefaultTranscript;
 use crate::traits::{AsBytes, ByteConversion};
 
 /// The Goldilocks prime: p = 2^64 - 2^32 + 1
@@ -378,6 +379,19 @@ impl IsFFTField for GoldilocksField {
 
     fn field_name() -> &'static str {
         "Goldilocks"
+    }
+}
+
+impl HasDefaultTranscript for GoldilocksField {
+    fn get_random_field_element_from_rng(rng: &mut impl rand::Rng) -> FieldElement<Self> {
+        let mut sample = [0u8; 8];
+        loop {
+            rng.fill(&mut sample);
+            let int_sample = u64::from_be_bytes(sample);
+            if int_sample < GOLDILOCKS_PRIME {
+                return FieldElement::from(int_sample);
+            }
+        }
     }
 }
 

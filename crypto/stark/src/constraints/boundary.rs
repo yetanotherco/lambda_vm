@@ -162,9 +162,9 @@ impl<F: IsField> BoundaryConstraints<F> {
 #[cfg(test)]
 mod test {
     use math::field::{
-        fields::fft_friendly::stark_252_prime_field::Stark252PrimeField, traits::IsFFTField,
+        fields::fft_friendly::u64_goldilocks::GoldilocksField, traits::IsFFTField,
     };
-    type PrimeField = Stark252PrimeField;
+    type PrimeField = GoldilocksField;
 
     use super::*;
 

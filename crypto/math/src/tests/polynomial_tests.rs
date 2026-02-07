@@ -1,15 +1,15 @@
 #[cfg(test)]
 mod tests {
     use crate::field::element::FieldElement;
-    use crate::field::fields::u64_prime_field::U64PrimeField;
+    use crate::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
     use crate::field::traits::{IsField, IsPrimeField, IsSubFieldOf};
     use crate::polynomial::{Polynomial, pad_with_zero_coefficients};
     use alloc::string::{String, ToString};
     use alloc::{format, vec, vec::Vec};
 
-    // Some of these tests work when the finite field has order greater than 2.
-    const ORDER: u64 = 23;
-    type F = U64PrimeField<ORDER>;
+    // Goldilocks prime: p = 2^64 - 2^32 + 1
+    const ORDER: u64 = 18446744069414584321;
+    type F = GoldilocksField;
     type FE = FieldElement<F>;
 
     // ==================== Test helper functions (moved from polynomial/mod.rs) ====================
@@ -172,7 +172,7 @@ mod tests {
     }
 
     fn polynomial_minus_a() -> Polynomial<FE> {
-        Polynomial::new(&[FE::new(ORDER - 1), FE::new(ORDER - 2), FE::new(ORDER - 3)])
+        Polynomial::new(&[-FE::new(1), -FE::new(2), -FE::new(3)])
     }
 
     fn polynomial_b() -> Polynomial<FE> {
@@ -482,15 +482,13 @@ mod tests {
         let (a, b, g) = xgcd(&p1, &p2);
         // Check that a * p1 + b * p2 = g
         let lhs = a.mul_with_ref(&p1) + b.mul_with_ref(&p2);
-        assert_eq!(a, Polynomial::new(&[FE::new(12)]));
-        assert_eq!(b, Polynomial::new(&[FE::new(12), FE::new(11)]));
         assert_eq!(lhs, g);
         assert_eq!(g, Polynomial::new(&[FE::new(1)]));
 
         // x^2-1 :
-        let p3 = Polynomial::new(&[FE::new(ORDER - 1), FE::new(0), FE::new(1)]);
+        let p3 = Polynomial::new(&[-FE::new(1), FE::new(0), FE::new(1)]);
         // x^3-x = x(x^2-1)
-        let p4 = Polynomial::new(&[FE::new(0), FE::new(ORDER - 1), FE::new(0), FE::new(1)]);
+        let p4 = Polynomial::new(&[FE::new(0), -FE::new(1), FE::new(0), FE::new(1)]);
         let (a, b, g) = xgcd(&p3, &p4);
 
         let lhs = a.mul_with_ref(&p3) + b.mul_with_ref(&p4);
@@ -540,11 +538,10 @@ mod tests {
 #[cfg(test)]
 mod dense_multilinear_poly_tests {
     use crate::field::element::FieldElement;
-    use crate::field::fields::u64_prime_field::U64PrimeField;
+    use crate::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
     use crate::polynomial::dense_multilinear_poly::DenseMultilinearPolynomial;
 
-    const ORDER: u64 = 101;
-    type F = U64PrimeField<ORDER>;
+    type F = GoldilocksField;
     type FE = FieldElement<F>;
 
     pub fn evals(r: Vec<FE>) -> Vec<FE> {
@@ -672,12 +669,11 @@ mod dense_multilinear_poly_tests {
 #[cfg(test)]
 mod sparse_multilinear_poly_tests {
     use crate::field::element::FieldElement;
-    use crate::field::fields::u64_prime_field::U64PrimeField;
+    use crate::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
     use crate::polynomial::sparse_multilinear_poly::SparseMultilinearPolynomial;
     use alloc::vec;
 
-    const ORDER: u64 = 101;
-    type F = U64PrimeField<ORDER>;
+    type F = GoldilocksField;
     type FE = FieldElement<F>;
 
     #[test]

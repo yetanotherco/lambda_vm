@@ -2,7 +2,6 @@ use alloc::{borrow::ToOwned, vec::Vec};
 use math::field::element::FieldElement as FE;
 
 pub mod parameters;
-pub mod starknet;
 
 use parameters::PermutationParameters;
 

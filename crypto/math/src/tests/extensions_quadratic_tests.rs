@@ -1,20 +1,20 @@
 use crate::field::element::FieldElement;
 use crate::field::extensions::quadratic::{HasQuadraticNonResidue, QuadraticExtensionField};
-use crate::field::fields::u64_prime_field::{U64FieldElement, U64PrimeField};
+use crate::field::test_fields::u64_test_field::U64Field;
 
 const ORDER_P: u64 = 59;
 
 #[derive(Debug, Clone)]
 struct MyQuadraticNonResidue;
-impl HasQuadraticNonResidue<U64PrimeField<ORDER_P>> for MyQuadraticNonResidue {
-    fn residue() -> FieldElement<U64PrimeField<ORDER_P>> {
+impl HasQuadraticNonResidue<U64Field<ORDER_P>> for MyQuadraticNonResidue {
+    fn residue() -> FieldElement<U64Field<ORDER_P>> {
         -FieldElement::one()
     }
 }
 
-type FE = U64FieldElement<ORDER_P>;
+type FE = FieldElement<U64Field<ORDER_P>>;
 type MyFieldExtensionBackend =
-    QuadraticExtensionField<U64PrimeField<ORDER_P>, MyQuadraticNonResidue>;
+    QuadraticExtensionField<U64Field<ORDER_P>, MyQuadraticNonResidue>;
 #[allow(clippy::upper_case_acronyms)]
 type FEE = FieldElement<MyFieldExtensionBackend>;
 

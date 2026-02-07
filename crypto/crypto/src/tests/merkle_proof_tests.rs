@@ -1,5 +1,5 @@
 use alloc::vec::Vec;
-use math::field::{element::FieldElement, fields::u64_prime_field::U64PrimeField};
+use math::field::{element::FieldElement, test_fields::u64_test_field::U64Field};
 
 use crate::merkle_tree::merkle::MerkleTree;
 use crate::merkle_tree::proof::BatchProof;
@@ -7,12 +7,12 @@ use crate::tests::merkle_tests::TestBackend;
 
 /// Small field useful for starks, sometimes called min i goldilocks
 /// Used in miden and winterfell
-pub type Ecgfp5 = U64PrimeField<0xFFFF_FFFF_0000_0001_u64>;
+pub type Ecgfp5 = U64Field<0xFFFF_FFFF_0000_0001_u64>;
 pub type Ecgfp5FE = FieldElement<Ecgfp5>;
 pub type TestMerkleTreeEcgfp = MerkleTree<TestBackend<Ecgfp5>>;
 
 const MODULUS: u64 = 13;
-type U64PF = U64PrimeField<MODULUS>;
+type U64PF = U64Field<MODULUS>;
 type FE = FieldElement<U64PF>;
 
 #[test]
@@ -42,7 +42,7 @@ fn assert_merkle_path(values: &[FE], expected_values: &[FE]) {
 #[test]
 fn verify_merkle_proof_for_single_value() {
     const MODULUS: u64 = 13;
-    type U64PF = U64PrimeField<MODULUS>;
+    type U64PF = U64Field<MODULUS>;
     type FE = FieldElement<U64PF>;
 
     let values: Vec<FE> = vec![FE::new(1)]; // Single element
@@ -67,7 +67,7 @@ fn verify_merkle_proof_for_single_value() {
 #[test]
 fn batch_proof_verify_adjacent_leaves() {
     const MODULUS: u64 = 70;
-    type U64PF = U64PrimeField<MODULUS>;
+    type U64PF = U64Field<MODULUS>;
     type FE = FieldElement<U64PF>;
 
     let values: Vec<FE> = (1..=8).map(FE::new).collect();
@@ -89,7 +89,7 @@ fn batch_proof_verify_adjacent_leaves() {
 #[test]
 fn batch_proof_verify_non_adjacent_leaves() {
     const MODULUS: u64 = 70;
-    type U64PF = U64PrimeField<MODULUS>;
+    type U64PF = U64Field<MODULUS>;
     type FE = FieldElement<U64PF>;
 
     let values: Vec<FE> = (1..=8).map(FE::new).collect();
@@ -111,7 +111,7 @@ fn batch_proof_verify_non_adjacent_leaves() {
 #[test]
 fn batch_proof_verify_single_leaf() {
     const MODULUS: u64 = 70;
-    type U64PF = U64PrimeField<MODULUS>;
+    type U64PF = U64Field<MODULUS>;
     type FE = FieldElement<U64PF>;
 
     let values: Vec<FE> = (1..=8).map(FE::new).collect();
@@ -133,7 +133,7 @@ fn batch_proof_verify_single_leaf() {
 #[test]
 fn batch_proof_verify_many_leaves() {
     const MODULUS: u64 = 70;
-    type U64PF = U64PrimeField<MODULUS>;
+    type U64PF = U64Field<MODULUS>;
     type FE = FieldElement<U64PF>;
 
     let values: Vec<FE> = (1..=16).map(FE::new).collect();
@@ -155,7 +155,7 @@ fn batch_proof_verify_many_leaves() {
 #[test]
 fn batch_proof_verify_fails_with_wrong_root() {
     const MODULUS: u64 = 70;
-    type U64PF = U64PrimeField<MODULUS>;
+    type U64PF = U64Field<MODULUS>;
     type FE = FieldElement<U64PF>;
 
     let values: Vec<FE> = (1..=8).map(FE::new).collect();
@@ -177,7 +177,7 @@ fn batch_proof_verify_fails_with_wrong_root() {
 #[test]
 fn batch_proof_verify_fails_with_wrong_leaves_values() {
     const MODULUS: u64 = 70;
-    type U64PF = U64PrimeField<MODULUS>;
+    type U64PF = U64Field<MODULUS>;
     type FE = FieldElement<U64PF>;
 
     let values: Vec<FE> = (1..=8).map(FE::new).collect();
@@ -199,7 +199,7 @@ fn batch_proof_verify_fails_with_wrong_leaves_values() {
 #[test]
 fn batch_proof_duplicate_positions_are_deduplicated() {
     const MODULUS: u64 = 70;
-    type U64PF = U64PrimeField<MODULUS>;
+    type U64PF = U64Field<MODULUS>;
     type FE = FieldElement<U64PF>;
 
     let values: Vec<FE> = (1..=8).map(FE::new).collect();
@@ -222,7 +222,7 @@ fn batch_proof_duplicate_positions_are_deduplicated() {
 #[test]
 fn batch_proof_duplicate_positions_with_conflicting_values_fails() {
     const MODULUS: u64 = 70;
-    type U64PF = U64PrimeField<MODULUS>;
+    type U64PF = U64Field<MODULUS>;
     type FE = FieldElement<U64PF>;
 
     let values: Vec<FE> = (1..=8).map(FE::new).collect();
@@ -247,7 +247,7 @@ fn batch_proof_duplicate_positions_with_conflicting_values_fails() {
 #[test]
 fn batch_proof_duplicate_positions_with_same_values_passes() {
     const MODULUS: u64 = 70;
-    type U64PF = U64PrimeField<MODULUS>;
+    type U64PF = U64Field<MODULUS>;
     type FE = FieldElement<U64PF>;
 
     let values: Vec<FE> = (1..=8).map(FE::new).collect();
@@ -272,7 +272,7 @@ fn batch_proof_duplicate_positions_with_same_values_passes() {
 #[test]
 fn batch_proof_all_leaves_has_empty_path() {
     const MODULUS: u64 = 512;
-    type U64PF = U64PrimeField<MODULUS>;
+    type U64PF = U64Field<MODULUS>;
     type FE = FieldElement<U64PF>;
 
     let values: Vec<FE> = (1..=16).map(FE::new).collect();
@@ -303,7 +303,7 @@ fn batch_proof_all_leaves_has_empty_path() {
 #[test]
 fn batch_proof_verify_sparse_leaves_across_tree() {
     const MODULUS: u64 = 70;
-    type U64PF = U64PrimeField<MODULUS>;
+    type U64PF = U64Field<MODULUS>;
     type FE = FieldElement<U64PF>;
 
     let values: Vec<FE> = (1..=16).map(FE::new).collect();

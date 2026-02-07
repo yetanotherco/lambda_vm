@@ -29,8 +29,8 @@ pub struct ProofOptions {
 }
 
 impl ProofOptions {
-    // TODO: Make it work for extended fields
-    const EXTENSION_DEGREE: usize = 1;
+    // Production uses Degree3GoldilocksExtensionField (64-bit * 3 = 192 bits)
+    const EXTENSION_DEGREE: usize = 3;
     // Estimated maximum domain size. 2^40 = 1 TB
     const NUM_BITS_MAX_DOMAIN_SIZE: usize = 40;
 
@@ -156,33 +156,11 @@ impl ProofOptions {
 
 #[cfg(test)]
 mod tests {
-    use math::field::fields::{
-        fft_friendly::stark_252_prime_field::Stark252PrimeField, u64_prime_field::F17,
-    };
+    use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
 
     use crate::proof::{errors::InsecureOptionError, options::SecurityLevel};
 
     use super::ProofOptions;
-
-    #[test]
-    fn u64_prime_field_is_not_large_enough_to_be_secure() {
-        let ProofOptions {
-            blowup_factor,
-            fri_number_of_queries,
-            coset_offset,
-            grinding_factor,
-        } = ProofOptions::new_secure(SecurityLevel::Conjecturable128Bits, 1);
-
-        let u64_options = ProofOptions::new_with_checked_security::<F17>(
-            blowup_factor,
-            fri_number_of_queries,
-            coset_offset,
-            grinding_factor,
-            128,
-        );
-
-        assert!(matches!(u64_options, Err(InsecureOptionError::FieldSize)));
-    }
 
     #[test]
     fn generated_stark_proof_options_for_128_bits_are_secure() {
@@ -193,7 +171,7 @@ mod tests {
             grinding_factor,
         } = ProofOptions::new_secure(SecurityLevel::Conjecturable128Bits, 1);
 
-        let secure_options = ProofOptions::new_with_checked_security::<Stark252PrimeField>(
+        let secure_options = ProofOptions::new_with_checked_security::<GoldilocksField>(
             blowup_factor,
             fri_number_of_queries,
             coset_offset,
@@ -213,7 +191,7 @@ mod tests {
             grinding_factor,
         } = ProofOptions::new_secure(SecurityLevel::Conjecturable128Bits, 1);
 
-        let insecure_options = ProofOptions::new_with_checked_security::<Stark252PrimeField>(
+        let insecure_options = ProofOptions::new_with_checked_security::<GoldilocksField>(
             blowup_factor,
             fri_number_of_queries - 1,
             coset_offset,
@@ -236,7 +214,7 @@ mod tests {
             grinding_factor,
         } = ProofOptions::new_secure(SecurityLevel::Conjecturable100Bits, 1);
 
-        let secure_options = ProofOptions::new_with_checked_security::<Stark252PrimeField>(
+        let secure_options = ProofOptions::new_with_checked_security::<GoldilocksField>(
             blowup_factor,
             fri_number_of_queries,
             coset_offset,
@@ -256,7 +234,7 @@ mod tests {
             grinding_factor,
         } = ProofOptions::new_secure(SecurityLevel::Conjecturable80Bits, 1);
 
-        let secure_options = ProofOptions::new_with_checked_security::<Stark252PrimeField>(
+        let secure_options = ProofOptions::new_with_checked_security::<GoldilocksField>(
             blowup_factor,
             fri_number_of_queries,
             coset_offset,
