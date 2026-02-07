@@ -6,10 +6,90 @@
 use crate::field::{
     element::FieldElement,
     errors::FieldError,
-    fields::fft_friendly::u64_goldilocks::{GOLDILOCKS_PRIME, GoldilocksField},
+    goldilocks::{GOLDILOCKS_PRIME, GoldilocksField},
     traits::{HasDefaultTranscript, IsField, IsSubFieldOf},
 };
 use crate::traits::{AsBytes, ByteConversion};
+
+// =====================================================
+// ByteConversion for extension base types
+// =====================================================
+
+impl ByteConversion for [FpE; 2] {
+    #[cfg(feature = "alloc")]
+    fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
+        let mut byte_slice = ByteConversion::to_bytes_be(&self[0]);
+        byte_slice.extend(ByteConversion::to_bytes_be(&self[1]));
+        byte_slice
+    }
+
+    #[cfg(feature = "alloc")]
+    fn to_bytes_le(&self) -> alloc::vec::Vec<u8> {
+        let mut byte_slice = ByteConversion::to_bytes_le(&self[0]);
+        byte_slice.extend(ByteConversion::to_bytes_le(&self[1]));
+        byte_slice
+    }
+
+    fn from_bytes_be(bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
+    where
+        Self: Sized,
+    {
+        const BYTES_PER_FIELD: usize = 8;
+        let x0 = FieldElement::from_bytes_be(&bytes[0..BYTES_PER_FIELD])?;
+        let x1 = FieldElement::from_bytes_be(&bytes[BYTES_PER_FIELD..BYTES_PER_FIELD * 2])?;
+        Ok([x0, x1])
+    }
+
+    fn from_bytes_le(bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
+    where
+        Self: Sized,
+    {
+        const BYTES_PER_FIELD: usize = 8;
+        let x0 = FieldElement::from_bytes_le(&bytes[0..BYTES_PER_FIELD])?;
+        let x1 = FieldElement::from_bytes_le(&bytes[BYTES_PER_FIELD..BYTES_PER_FIELD * 2])?;
+        Ok([x0, x1])
+    }
+}
+
+impl ByteConversion for [FpE; 3] {
+    #[cfg(feature = "alloc")]
+    fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
+        let mut byte_slice = ByteConversion::to_bytes_be(&self[0]);
+        byte_slice.extend(ByteConversion::to_bytes_be(&self[1]));
+        byte_slice.extend(ByteConversion::to_bytes_be(&self[2]));
+        byte_slice
+    }
+
+    #[cfg(feature = "alloc")]
+    fn to_bytes_le(&self) -> alloc::vec::Vec<u8> {
+        let mut byte_slice = ByteConversion::to_bytes_le(&self[0]);
+        byte_slice.extend(ByteConversion::to_bytes_le(&self[1]));
+        byte_slice.extend(ByteConversion::to_bytes_le(&self[2]));
+        byte_slice
+    }
+
+    fn from_bytes_be(bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
+    where
+        Self: Sized,
+    {
+        const BYTES_PER_FIELD: usize = 8;
+        let x0 = FieldElement::from_bytes_be(&bytes[0..BYTES_PER_FIELD])?;
+        let x1 = FieldElement::from_bytes_be(&bytes[BYTES_PER_FIELD..BYTES_PER_FIELD * 2])?;
+        let x2 = FieldElement::from_bytes_be(&bytes[BYTES_PER_FIELD * 2..BYTES_PER_FIELD * 3])?;
+        Ok([x0, x1, x2])
+    }
+
+    fn from_bytes_le(bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
+    where
+        Self: Sized,
+    {
+        const BYTES_PER_FIELD: usize = 8;
+        let x0 = FieldElement::from_bytes_le(&bytes[0..BYTES_PER_FIELD])?;
+        let x1 = FieldElement::from_bytes_le(&bytes[BYTES_PER_FIELD..BYTES_PER_FIELD * 2])?;
+        let x2 = FieldElement::from_bytes_le(&bytes[BYTES_PER_FIELD * 2..BYTES_PER_FIELD * 3])?;
+        Ok([x0, x1, x2])
+    }
+}
 
 // =====================================================
 // QUADRATIC EXTENSION (Fp2)
@@ -452,135 +532,9 @@ impl HasDefaultTranscript for Degree3GoldilocksExtensionField {
 /// Multiply a field element by 7 (the quadratic non-residue).
 /// Uses 7 = 1 + 2 + 4 for efficiency (2 doubles + 2 adds, saves one double vs 8-1).
 #[inline(always)]
-fn mul_by_7(a: &FpE) -> FpE {
+pub(crate) fn mul_by_7(a: &FpE) -> FpE {
     // 7 * a = a + 2a + 4a
     let a2 = a.double();
     let a4 = a2.double();
     *a + a2 + a4
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_fp2_add() {
-        let a = Fp2E::new([FpE::from(3u64), FpE::from(4u64)]);
-        let b = Fp2E::new([FpE::from(1u64), FpE::from(2u64)]);
-        let c = &a + &b;
-        assert_eq!(c.value()[0], FpE::from(4u64));
-        assert_eq!(c.value()[1], FpE::from(6u64));
-    }
-
-    #[test]
-    fn test_fp2_mul() {
-        let a = Fp2E::new([FpE::from(3u64), FpE::from(4u64)]);
-        let b = Fp2E::new([FpE::from(1u64), FpE::from(2u64)]);
-        // (3 + 4w)(1 + 2w) = 3 + 6w + 4w + 8w^2 = 3 + 10w + 8*7 = 59 + 10w
-        let c = &a * &b;
-        assert_eq!(c.value()[0], FpE::from(59u64));
-        assert_eq!(c.value()[1], FpE::from(10u64));
-    }
-
-    #[test]
-    fn test_fp2_inv() {
-        let a = Fp2E::new([FpE::from(3u64), FpE::from(4u64)]);
-        let a_inv = a.inv().unwrap();
-        let product = &a * &a_inv;
-        assert_eq!(product, Fp2E::one());
-    }
-
-    #[test]
-    fn test_fp3_add() {
-        let a = Fp3E::new([FpE::from(1u64), FpE::from(2u64), FpE::from(3u64)]);
-        let b = Fp3E::new([FpE::from(4u64), FpE::from(5u64), FpE::from(6u64)]);
-        let c = &a + &b;
-        assert_eq!(c.value()[0], FpE::from(5u64));
-        assert_eq!(c.value()[1], FpE::from(7u64));
-        assert_eq!(c.value()[2], FpE::from(9u64));
-    }
-
-    #[test]
-    fn test_fp3_mul() {
-        let a = Fp3E::new([FpE::from(1u64), FpE::from(2u64), FpE::from(3u64)]);
-        let b = Fp3E::new([FpE::from(4u64), FpE::from(5u64), FpE::from(6u64)]);
-        let c = &a * &b;
-        // Verify by computing inverse
-        let c_div_a = &c * &a.inv().unwrap();
-        assert_eq!(c_div_a, b);
-    }
-
-    #[test]
-    fn test_fp3_inv() {
-        let a = Fp3E::new([FpE::from(1u64), FpE::from(2u64), FpE::from(3u64)]);
-        let a_inv = a.inv().unwrap();
-        let product = &a * &a_inv;
-        assert_eq!(product, Fp3E::one());
-    }
-
-    #[test]
-    fn test_mul_by_7() {
-        let a = FpE::from(5u64);
-        let result = mul_by_7(&a);
-        assert_eq!(result, FpE::from(35u64));
-    }
-
-    // =========================================================================
-    // Tests for From<i64> implementations
-    // =========================================================================
-
-    #[test]
-    fn test_fp2_from_i64_positive() {
-        let fe = Fp2E::from(42i64);
-        assert_eq!(fe.value()[0], FpE::from(42u64));
-        assert_eq!(fe.value()[1], FpE::zero());
-    }
-
-    #[test]
-    fn test_fp2_from_i64_negative() {
-        // -1 in the base field embedded into Fp2
-        let fe = Fp2E::from(-1i64);
-        let expected = Fp2E::new([FpE::from(-1i64), FpE::zero()]);
-        assert_eq!(fe, expected);
-
-        // Verify: -1 + 1 = 0
-        let one = Fp2E::one();
-        assert_eq!(fe + one, Fp2E::zero());
-    }
-
-    #[test]
-    fn test_fp2_from_i64_arithmetic() {
-        let five = Fp2E::from(5i64);
-        let ten = Fp2E::from(10i64);
-        let minus_five = Fp2E::from(-5i64);
-        assert_eq!(five - ten, minus_five);
-    }
-
-    #[test]
-    fn test_fp3_from_i64_positive() {
-        let fe = Fp3E::from(42i64);
-        assert_eq!(fe.value()[0], FpE::from(42u64));
-        assert_eq!(fe.value()[1], FpE::zero());
-        assert_eq!(fe.value()[2], FpE::zero());
-    }
-
-    #[test]
-    fn test_fp3_from_i64_negative() {
-        // -1 in the base field embedded into Fp3
-        let fe = Fp3E::from(-1i64);
-        let expected = Fp3E::new([FpE::from(-1i64), FpE::zero(), FpE::zero()]);
-        assert_eq!(fe, expected);
-
-        // Verify: -1 + 1 = 0
-        let one = Fp3E::one();
-        assert_eq!(fe + one, Fp3E::zero());
-    }
-
-    #[test]
-    fn test_fp3_from_i64_arithmetic() {
-        let five = Fp3E::from(5i64);
-        let ten = Fp3E::from(10i64);
-        let minus_five = Fp3E::from(-5i64);
-        assert_eq!(five - ten, minus_five);
-    }
 }

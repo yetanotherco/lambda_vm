@@ -257,7 +257,7 @@ pub fn compute_trace<F: IsFFTField>(
 mod tests {
     use math::field::{
         element::FieldElement,
-        fields::fft_friendly::u64_goldilocks::GoldilocksField,
+        goldilocks::GoldilocksField,
     };
 
     use super::compute_trace;

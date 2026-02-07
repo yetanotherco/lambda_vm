@@ -1632,7 +1632,7 @@ mod tests {
     use math::{
         field::{
             element::FieldElement,
-            fields::fft_friendly::u64_goldilocks::GoldilocksField,
+            goldilocks::GoldilocksField,
             traits::IsFFTField,
         },
         polynomial::Polynomial,

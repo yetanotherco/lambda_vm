@@ -156,7 +156,7 @@ impl ProofOptions {
 
 #[cfg(test)]
 mod tests {
-    use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
+    use math::field::goldilocks::GoldilocksField;
 
     use crate::proof::{errors::InsecureOptionError, options::SecurityLevel};
 

@@ -77,7 +77,7 @@ mod tests {
     use alloc::vec::Vec;
     use math::field::{
         element::FieldElement,
-        fields::fft_friendly::u64_goldilocks::GoldilocksField,
+        goldilocks::GoldilocksField,
     };
     use sha3::{Keccak256, Keccak512, Sha3_256, Sha3_512};
 

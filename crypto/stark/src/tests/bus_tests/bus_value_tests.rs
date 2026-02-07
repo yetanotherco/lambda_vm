@@ -1,7 +1,7 @@
 //! Unit tests for BusValue and LinearTerm combine logic.
 
 use math::field::element::FieldElement;
-use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
+use math::field::goldilocks::GoldilocksField;
 
 use crate::lookup::{BusValue, LinearTerm, Packing};
 
