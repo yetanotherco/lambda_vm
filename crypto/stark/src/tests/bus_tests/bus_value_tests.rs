@@ -1,11 +1,11 @@
 //! Unit tests for BusValue and LinearTerm combine logic.
 
 use math::field::element::FieldElement;
-use math::field::fields::fft_friendly::babybear::Babybear31PrimeField;
+use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
 
 use crate::lookup::{BusValue, LinearTerm, Packing};
 
-type F = Babybear31PrimeField;
+type F = GoldilocksField;
 type FE = FieldElement<F>;
 
 // =============================================================================

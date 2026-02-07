@@ -2,8 +2,11 @@
 //! These tests verify that the FRI protocol handles 0 FRI layers correctly.
 
 use math::field::{
-    element::FieldElement, fields::fft_friendly::stark_252_prime_field::Stark252PrimeField,
+    element::FieldElement,
+    fields::fft_friendly::u64_goldilocks::GoldilocksField,
 };
+
+use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 
 use crate::{
     examples::simple_addition::{
@@ -12,17 +15,16 @@ use crate::{
     proof::options::ProofOptions,
     prover::{IsStarkProver, Prover},
     traits::AIR,
-    transcript::StoneProverTranscript,
     verifier::{IsStarkVerifier, Verifier},
 };
 
-type Felt252 = FieldElement<Stark252PrimeField>;
+type Felt252 = FieldElement<GoldilocksField>;
 
 /// Test STARK prove/verify with a single-row trace.
 /// This exercises the FRI protocol with 0 FRI layers (trace_length=1, number_layers=0).
 #[test_log::test]
 fn test_prove_verify_single_row() {
-    let mut trace = simple_addition_trace::<Stark252PrimeField>(1);
+    let mut trace = simple_addition_trace::<GoldilocksField>(1);
 
     let proof_options = ProofOptions::default_test_options();
 
@@ -32,18 +34,18 @@ fn test_prove_verify_single_row() {
         b: Felt252::from(2u64),
     };
 
-    let air = SimpleAdditionAIR::<Stark252PrimeField>::new(&proof_options);
+    let air = SimpleAdditionAIR::<GoldilocksField>::new(&proof_options);
 
     let proof = Prover::prove(
         &air,
         &mut trace,
         &pub_inputs,
-        &mut StoneProverTranscript::new(&[]),
+        &mut DefaultTranscript::<GoldilocksField>::new(&[]),
     )
     .unwrap();
 
     assert!(
-        Verifier::verify(&proof, &air, &mut StoneProverTranscript::new(&[])),
+        Verifier::verify(&proof, &air, &mut DefaultTranscript::<GoldilocksField>::new(&[])),
         "Verification failed for single-row trace"
     );
 }
@@ -52,7 +54,7 @@ fn test_prove_verify_single_row() {
 /// This exercises the FRI protocol with 0 FRI layers (trace_length=2, number_layers=1).
 #[test_log::test]
 fn test_prove_verify_two_rows() {
-    let mut trace = simple_addition_trace::<Stark252PrimeField>(2);
+    let mut trace = simple_addition_trace::<GoldilocksField>(2);
 
     let proof_options = ProofOptions::default_test_options();
 
@@ -62,18 +64,18 @@ fn test_prove_verify_two_rows() {
         b: Felt252::from(2u64),
     };
 
-    let air = SimpleAdditionAIR::<Stark252PrimeField>::new(&proof_options);
+    let air = SimpleAdditionAIR::<GoldilocksField>::new(&proof_options);
 
     let proof = Prover::prove(
         &air,
         &mut trace,
         &pub_inputs,
-        &mut StoneProverTranscript::new(&[]),
+        &mut DefaultTranscript::<GoldilocksField>::new(&[]),
     )
     .unwrap();
 
     assert!(
-        Verifier::verify(&proof, &air, &mut StoneProverTranscript::new(&[])),
+        Verifier::verify(&proof, &air, &mut DefaultTranscript::<GoldilocksField>::new(&[])),
         "Verification failed for two-row trace"
     );
 }
@@ -82,7 +84,7 @@ fn test_prove_verify_two_rows() {
 /// This ensures the boundary constraints are actually enforced.
 #[test_log::test]
 fn test_verify_fails_with_wrong_inputs() {
-    let mut trace = simple_addition_trace::<Stark252PrimeField>(2);
+    let mut trace = simple_addition_trace::<GoldilocksField>(2);
 
     let proof_options = ProofOptions::default_test_options();
 
@@ -92,13 +94,13 @@ fn test_verify_fails_with_wrong_inputs() {
         b: Felt252::from(2u64),
     };
 
-    let air = SimpleAdditionAIR::<Stark252PrimeField>::new(&proof_options);
+    let air = SimpleAdditionAIR::<GoldilocksField>::new(&proof_options);
 
     let mut proof = Prover::prove(
         &air,
         &mut trace,
         &correct_pub_inputs,
-        &mut StoneProverTranscript::new(&[]),
+        &mut DefaultTranscript::<GoldilocksField>::new(&[]),
     )
     .unwrap();
 
@@ -110,7 +112,7 @@ fn test_verify_fails_with_wrong_inputs() {
 
     // Verification should fail because boundary constraint col0[0]=99 doesn't match trace
     assert!(
-        !Verifier::verify(&proof, &air, &mut StoneProverTranscript::new(&[])),
+        !Verifier::verify(&proof, &air, &mut DefaultTranscript::<GoldilocksField>::new(&[])),
         "Verification should fail with tampered public inputs"
     );
 }

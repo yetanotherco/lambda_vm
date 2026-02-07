@@ -1,20 +1,20 @@
 use crate::field::element::FieldElement;
 use crate::field::extensions::cubic::{CubicExtensionField, HasCubicNonResidue};
-use crate::field::fields::u64_prime_field::{U64FieldElement, U64PrimeField};
+use crate::field::test_fields::u64_test_field::U64Field;
 use crate::traits::ByteConversion;
 
 const ORDER_P: u64 = 13;
 
 #[derive(Debug, Clone)]
 struct MyCubicNonResidue;
-impl HasCubicNonResidue<U64PrimeField<ORDER_P>> for MyCubicNonResidue {
-    fn residue() -> FieldElement<U64PrimeField<ORDER_P>> {
+impl HasCubicNonResidue<U64Field<ORDER_P>> for MyCubicNonResidue {
+    fn residue() -> FieldElement<U64Field<ORDER_P>> {
         -FieldElement::from(11)
     }
 }
 
-type FE = U64FieldElement<ORDER_P>;
-type MyFieldExtensionBackend = CubicExtensionField<U64PrimeField<ORDER_P>, MyCubicNonResidue>;
+type FE = FieldElement<U64Field<ORDER_P>>;
+type MyFieldExtensionBackend = CubicExtensionField<U64Field<ORDER_P>, MyCubicNonResidue>;
 #[allow(clippy::upper_case_acronyms)]
 type FEE = FieldElement<MyFieldExtensionBackend>;
 
@@ -180,7 +180,7 @@ fn test_div_as_subfield_2() {
 fn test_byte_conversion_be_roundtrip() {
     let original = [FE::new(1), FE::new(7), FE::new(11)];
     let bytes = original.to_bytes_be();
-    let recovered = <[FieldElement<U64PrimeField<ORDER_P>>; 3]>::from_bytes_be(&bytes).unwrap();
+    let recovered = <[FieldElement<U64Field<ORDER_P>>; 3]>::from_bytes_be(&bytes).unwrap();
     assert_eq!(original, recovered);
 }
 
@@ -188,7 +188,7 @@ fn test_byte_conversion_be_roundtrip() {
 fn test_byte_conversion_le_roundtrip() {
     let original = [FE::new(1), FE::new(7), FE::new(11)];
     let bytes = original.to_bytes_le();
-    let recovered = <[FieldElement<U64PrimeField<ORDER_P>>; 3]>::from_bytes_le(&bytes).unwrap();
+    let recovered = <[FieldElement<U64Field<ORDER_P>>; 3]>::from_bytes_le(&bytes).unwrap();
     assert_eq!(original, recovered);
 }
 
@@ -202,12 +202,12 @@ fn test_byte_conversion_be_le_differ() {
 
 #[test]
 fn test_byte_conversion_rejects_empty() {
-    assert!(<[FieldElement<U64PrimeField<ORDER_P>>; 3]>::from_bytes_be(&[]).is_err());
-    assert!(<[FieldElement<U64PrimeField<ORDER_P>>; 3]>::from_bytes_le(&[]).is_err());
+    assert!(<[FieldElement<U64Field<ORDER_P>>; 3]>::from_bytes_be(&[]).is_err());
+    assert!(<[FieldElement<U64Field<ORDER_P>>; 3]>::from_bytes_le(&[]).is_err());
 }
 
 #[test]
 fn test_byte_conversion_rejects_wrong_length() {
-    assert!(<[FieldElement<U64PrimeField<ORDER_P>>; 3]>::from_bytes_be(&[0; 7]).is_err());
-    assert!(<[FieldElement<U64PrimeField<ORDER_P>>; 3]>::from_bytes_le(&[0; 7]).is_err());
+    assert!(<[FieldElement<U64Field<ORDER_P>>; 3]>::from_bytes_be(&[0; 7]).is_err());
+    assert!(<[FieldElement<U64Field<ORDER_P>>; 3]>::from_bytes_le(&[0; 7]).is_err());
 }

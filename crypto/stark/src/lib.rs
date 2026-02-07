@@ -1,7 +1,3 @@
-use math::field::{
-    element::FieldElement, fields::fft_friendly::stark_252_prime_field::Stark252PrimeField,
-};
-
 #[cfg(feature = "debug-checks")]
 pub mod bus_debug;
 pub mod constraints;
@@ -27,6 +23,3 @@ pub mod tests;
 
 /// Configurations of the Prover available in compile time
 pub mod config;
-
-pub type PrimeField = Stark252PrimeField;
-pub type Felt252 = FieldElement<PrimeField>;

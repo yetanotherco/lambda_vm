@@ -7,7 +7,7 @@ use math::field::traits::{IsFFTField, IsField};
 use math::traits::AsBytes;
 use math::{fft::cpu::bit_reversing::in_place_bit_reverse_permute, field::traits::IsSubFieldOf};
 pub use math::{
-    field::{element::FieldElement, fields::u64_prime_field::U64PrimeField},
+    field::element::FieldElement,
     polynomial::Polynomial,
 };
 
