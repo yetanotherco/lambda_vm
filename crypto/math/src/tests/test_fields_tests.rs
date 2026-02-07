@@ -2,7 +2,7 @@
 mod tests_u64_test_field {
     use crate::field::{
         element::FieldElement,
-        test_fields::u64_test_field::{U64TestField, U64TestFieldExtension},
+        test_fields::u64_test_field::U64TestField,
         traits::IsPrimeField,
     };
 
@@ -22,11 +22,16 @@ mod tests_u64_test_field {
     #[cfg(feature = "alloc")]
     #[test]
     fn test_to_subfield_vec() {
-        let a = FieldElement::<U64TestFieldExtension>::from(&[
+        use crate::field::{
+            extensions_goldilocks::Degree2GoldilocksExtensionField,
+            goldilocks::GoldilocksField,
+        };
+
+        let a = FieldElement::<Degree2GoldilocksExtensionField>::from(&[
             FieldElement::from(1),
             FieldElement::from(3),
         ]);
-        let b = a.to_subfield_vec::<U64TestField>();
+        let b = a.to_subfield_vec::<GoldilocksField>();
         assert_eq!(b, alloc::vec![FieldElement::from(1), FieldElement::from(3)]);
     }
 

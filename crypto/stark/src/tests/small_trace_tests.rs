@@ -3,7 +3,7 @@
 
 use math::field::{
     element::FieldElement,
-    fields::fft_friendly::u64_goldilocks::GoldilocksField,
+    goldilocks::GoldilocksField,
 };
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
