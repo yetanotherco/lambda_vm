@@ -10,7 +10,6 @@
 # Environment variables:
 #   BENCH_PROVE_RUNS      Number of hyperfine runs (default: 3)
 #   BENCH_PROVE_WARMUP    Number of warmup runs (default: 0)
-#   BENCH_PROVE_SECURITY  Security preset: fast|standard|maximum (default: fast)
 #
 # Requires: hyperfine, jq
 #
@@ -37,7 +36,6 @@ BENCH_ARTIFACTS_DIR="$ROOT_DIR/executor/program_artifacts/asm"
 
 RUNS="${BENCH_PROVE_RUNS:-3}"
 WARMUP="${BENCH_PROVE_WARMUP:-0}"
-SECURITY="${BENCH_PROVE_SECURITY:-fast}"
 
 if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
     echo "Prove Benchmark Script"
@@ -50,23 +48,13 @@ if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
     echo "Environment variables:"
     echo "  BENCH_PROVE_RUNS      Number of runs (default: 3)"
     echo "  BENCH_PROVE_WARMUP    Number of warmup runs (default: 0)"
-    echo "  BENCH_PROVE_SECURITY  Security preset (default: fast)"
     exit 0
 fi
 
 PROGRAM="${1:-}"
 
-# Validate security preset
-case "$SECURITY" in
-    fast|standard|maximum) ;;
-    *)
-        echo -e "${RED}Error: Invalid security preset '$SECURITY'. Use fast, standard, or maximum.${NC}"
-        exit 1
-        ;;
-esac
-
 echo -e "${GREEN}=== Prove Benchmark ===${NC}"
-echo -e "${YELLOW}Runs: $RUNS | Warmup: $WARMUP | Security: $SECURITY${NC}"
+echo -e "${YELLOW}Runs: $RUNS | Warmup: $WARMUP${NC}"
 
 # Find CLI binary
 CLI="$ROOT_DIR/target/release/cli"
@@ -105,8 +93,8 @@ for elf in "${ELFS[@]}"; do
         --warmup "$WARMUP" \
         --runs "$RUNS" \
         --prepare "rm -f '$proof_file'" \
-        -n "prove $name ($SECURITY)" \
-        "'$CLI' prove '$elf' --output '$proof_file' --security $SECURITY" \
+        -n "prove $name" \
+        "'$CLI' prove '$elf' --output '$proof_file'" \
         --export-markdown "$TMP_DIR/$name.md" \
         --export-json "$TMP_DIR/$name.json"
 done

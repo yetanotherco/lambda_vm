@@ -172,9 +172,9 @@ jobs:
               --runs "${{ env.BENCH_RUNS }}" \
               --prepare "rm -f $PROOF_BASE $PROOF_HEAD" \
               -n "base prove $PROGRAM" \
-              "./bench-bin/cli-base prove $ELF --output $PROOF_BASE --security fast" \
+              "./bench-bin/cli-base prove $ELF --output $PROOF_BASE" \
               -n "head prove $PROGRAM" \
-              "./bench-bin/cli-head prove $ELF --output $PROOF_HEAD --security fast" \
+              "./bench-bin/cli-head prove $ELF --output $PROOF_HEAD" \
               --export-markdown results.md \
               --export-json results.json
           else
@@ -183,7 +183,7 @@ jobs:
               --runs "${{ env.BENCH_RUNS }}" \
               --prepare "rm -f $PROOF_HEAD" \
               -n "prove $PROGRAM" \
-              "./bench-bin/cli-head prove $ELF --output $PROOF_HEAD --security fast" \
+              "./bench-bin/cli-head prove $ELF --output $PROOF_HEAD" \
               --export-markdown results.md
           fi
 
@@ -217,7 +217,7 @@ jobs:
           {
             echo "Prove Benchmark Results :lock:"
             echo ""
-            echo "Program: \`${{ env.BENCH_PROGRAM }}\` | Security: \`fast\` | Runs: \`${{ env.BENCH_RUNS }}\`"
+            echo "Program: \`${{ env.BENCH_PROGRAM }}\` | Runs: \`${{ env.BENCH_RUNS }}\`"
             echo ""
             cat results.md
           } > comment_body.md
