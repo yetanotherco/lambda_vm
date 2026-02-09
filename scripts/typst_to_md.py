@@ -85,7 +85,10 @@ def expr_to_text(expr, parent_prec: int = 100) -> str:
     if isinstance(expr, list) and len(expr) > 0:
         op = expr[0]
 
-        if op == "idx":
+        if op == "arr":
+            elems = [expr_to_text(e, 100) for e in expr[1:]]
+            return "[" + ", ".join(elems) + "]"
+        elif op == "idx":
             base = expr_to_text(expr[1], PREC["idx"])
             idx = expr_to_text(expr[2], 100)
             return f"{base}[{idx}]"

@@ -16,5 +16,5 @@ name = "all"
 [[constraints.all]]
 kind = "arith"
 constraint = "$#`cond` => #`X` (1-#`X`) = 0$"
-poly = ["*", "cond", "X", ["not", "X"]]
+poly = ["*", "cond", "X", ["-", 1, "X"]]
 ref = "isbit:c:isbit"

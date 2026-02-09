@@ -160,4 +160,4 @@ kind = "interaction"
 tag = "LT"
 input = [["cast", "lhs", "DWordWL"], ["cast", "rhs", "DWordWL"], "signed"]
 output = "lt"
-multiplicity = "-μ"
+multiplicity = ["-", "μ"]
