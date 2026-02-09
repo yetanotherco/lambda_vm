@@ -36,7 +36,8 @@ use crate::tables::decode;
 use crate::tables::trace_builder::Traces;
 use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_cpu_air, create_decode_air,
-    create_halt_air, create_load_air, create_lt_air, create_memw_air, create_mul_air,
+    create_dvrm_air, create_halt_air, create_load_air, create_lt_air, create_memw_air,
+    create_mul_air,
 };
 
 use stark::proof::options::ProofOptions;
@@ -89,6 +90,7 @@ pub(crate) struct VmAirs {
     pub load: VmAir,
     pub decode: VmAir,
     pub mul: VmAir,
+    pub dvrm: VmAir,
     pub branch: VmAir,
     pub halt: VmAir,
 }
@@ -104,6 +106,7 @@ impl VmAirs {
             (&self.load, &mut traces.load, &()),
             (&self.decode, &mut traces.decode, &()),
             (&self.mul, &mut traces.mul, &()),
+            (&self.dvrm, &mut traces.dvrm, &()),
             (&self.branch, &mut traces.branch, &()),
             (&self.halt, &mut traces.halt, &()),
         ]
@@ -119,6 +122,7 @@ impl VmAirs {
             &self.load,
             &self.decode,
             &self.mul,
+            &self.dvrm,
             &self.branch,
             &self.halt,
         ]
@@ -146,6 +150,7 @@ impl VmAirs {
             decode::NUM_PRECOMPUTED_COLS,
         );
         let mul = create_mul_air(proof_options);
+        let dvrm = create_dvrm_air(proof_options);
         let branch = create_branch_air(proof_options);
         let halt = create_halt_air(proof_options);
         #[cfg(feature = "debug-checks")]
@@ -159,6 +164,7 @@ impl VmAirs {
             load,
             decode,
             mul,
+            dvrm,
             branch,
             halt,
         }

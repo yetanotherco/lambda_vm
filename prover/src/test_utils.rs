@@ -43,6 +43,9 @@ use crate::tables::lt::{LtOperation, bus_interactions as lt_bus_interactions, co
 use crate::tables::memw::{
     bus_interactions as memw_bus_interactions, cols as memw_cols, constraints as memw_constraints,
 };
+use crate::tables::dvrm::{
+    bus_interactions as dvrm_bus_interactions, cols as dvrm_cols, dvrm_constraints,
+};
 use crate::tables::mul::{bus_interactions as mul_bus_interactions, cols as mul_cols};
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
@@ -600,6 +603,25 @@ pub fn create_mul_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("MUL")
+}
+
+/// Create DVRM AIR with constraints and bus interactions.
+pub fn create_dvrm_air(proof_options: &ProofOptions) -> VmAir {
+    let (constraints, _) = dvrm_constraints(0);
+    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> =
+        constraints.into_iter().map(|c| Box::new(c) as _).collect();
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: dvrm_bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        dvrm_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
 }
 
 /// Create BRANCH AIR with constraints and bus interactions.

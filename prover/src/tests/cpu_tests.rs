@@ -324,10 +324,11 @@ fn test_bus_interactions_count() {
     // - 1 M7 (STORE to memory)
     // - 1 DECODE (instruction fetch)
     // - 1 MUL (multiplication)
+    // - 1 DVRM (division/remainder)
     // - 1 BRANCH (branch/jump target calculation)
     // - 1 ECALL (send to HALT table)
-    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 5 + 1 + 1 + 1 + 1 = 38
-    assert_eq!(interactions.len(), 38);
+    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 5 + 1 + 1 + 1 + 1 + 1 = 39
+    assert_eq!(interactions.len(), 39);
 }
 
 #[test]

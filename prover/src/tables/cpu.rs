@@ -495,13 +495,7 @@ impl CpuOperation {
                 sum += (self.res >> (i * 8)) & 0xFF;
             }
             // Sum fits in 16 bits (max 8 * 255 = 2040)
-            let lo = (sum & 0xFF) as u8;
-            let hi = ((sum >> 8) & 0xFF) as u8;
-            lookups.push(BitwiseOperation::halfword(
-                BitwiseOperationType::Zero,
-                lo,
-                hi,
-            ));
+            lookups.push(BitwiseOperation::zero(sum as u32));
         }
 
         // AND/OR/XOR lookups (×8 each for each byte)
@@ -1186,6 +1180,43 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 packing: Packing::DWordWL,
             },
             // muldiv_selector: 0=lo (MUL), 1=hi (MULH/MULHSU/MULHU)
+            BusValue::Packed {
+                start_column: cols::MULDIV_SELECTOR,
+                packing: Packing::Direct,
+            },
+        ],
+    ));
+
+    // -------------------------------------------------------------------------
+    // DVRM interaction (for DIV, DIVU, REM, REMU) — CPU-CA45
+    // -------------------------------------------------------------------------
+    // DVRM[rvd; arg1, arg2, signed, muldiv_selector]
+    // multiplicity = DIVREM
+    interactions.push(BusInteraction::sender(
+        BusId::Dvrm,
+        Multiplicity::Column(cols::DIVREM),
+        vec![
+            // arg1 (numerator n) as DWordBL (8 bytes → 2 elements)
+            BusValue::Packed {
+                start_column: cols::ARG1[0],
+                packing: Packing::DWordBL,
+            },
+            // arg2 (denominator d) as DWordBL (8 bytes → 2 elements)
+            BusValue::Packed {
+                start_column: cols::ARG2[0],
+                packing: Packing::DWordBL,
+            },
+            // signed
+            BusValue::Packed {
+                start_column: cols::SIGNED,
+                packing: Packing::Direct,
+            },
+            // result (rvd) as DWordWL (2 words → 2 elements)
+            BusValue::Packed {
+                start_column: cols::RVD_0,
+                packing: Packing::DWordWL,
+            },
+            // muldiv_selector: 0=quotient (DIV), 1=remainder (REM)
             BusValue::Packed {
                 start_column: cols::MULDIV_SELECTOR,
                 packing: Packing::Direct,

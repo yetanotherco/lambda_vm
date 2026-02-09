@@ -81,6 +81,8 @@ pub enum BusId {
     Lt,
     /// Multiplication: MUL[lhs, lhs_signed, rhs, rhs_signed, hi] -> product
     Mul,
+    /// Division/Remainder: DVRM[result; n, d, signed, muldiv_selector]
+    Dvrm,
     /// Shift operation: SHIFT[in, shift, dir, signed, word] -> out
     Shift,
 
@@ -130,6 +132,7 @@ impl BusId {
             BusId::Branch => "Branch",
             BusId::Decode => "Decode",
             BusId::Ecall => "Ecall",
+            BusId::Dvrm => "Dvrm",
         }
     }
 }
