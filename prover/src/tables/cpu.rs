@@ -494,7 +494,7 @@ impl CpuOperation {
             for i in 0..8 {
                 sum += (self.res >> (i * 8)) & 0xFF;
             }
-            // Sum fits in 16 bits (max 8 * 255 = 2040)
+            // Sum fits in 11 bits (max 8 * 255 = 2040), well within ZERO's 20-bit range
             lookups.push(BitwiseOperation::zero(sum as u32));
         }
 

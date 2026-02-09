@@ -536,7 +536,7 @@ impl BitwiseOperation {
     /// Create a ZERO lookup for a value up to 20 bits.
     /// Value is decomposed as: x + 256*y + 65536*z.
     pub fn zero(value: u32) -> Self {
-        debug_assert!(value < (1 << 20), "ZERO value must fit in 20 bits");
+        assert!(value < (1 << 20), "ZERO value must fit in 20 bits");
         let x = (value & 0xFF) as u8;
         let y = ((value >> 8) & 0xFF) as u8;
         let z = ((value >> 16) & 0xF) as u8;
