@@ -55,6 +55,7 @@ jobs:
         with:
           name: bench-programs
           path: bench_programs/*.elf
+          retention-days: 1
 
   build-base-binary:
     name: Build CLI for base
@@ -85,6 +86,7 @@ jobs:
         with:
           name: cli-base
           path: bench-bin/cli-base
+          retention-days: 1
 
   build-head-binary:
     name: Build CLI for head
@@ -115,6 +117,7 @@ jobs:
         with:
           name: cli-head
           path: bench-bin/cli-head
+          retention-days: 1
 
   run-prove-benchmark:
     name: Run prove benchmark
