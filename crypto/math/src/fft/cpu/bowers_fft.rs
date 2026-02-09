@@ -197,7 +197,9 @@ fn adaptive_parallel_threshold() -> usize {
 /// CPU core count to ensure threading overhead is amortized.
 ///
 /// # Errors
-/// Returns `FFTError::InputError` if input length is not a power of two.
+/// Returns `FFTError::InputError` if:
+/// - Input length is not a power of two
+/// - Twiddle table size doesn't match input size
 #[cfg(all(feature = "alloc", feature = "parallel"))]
 #[allow(clippy::needless_range_loop)]
 pub fn bowers_fft_opt_fused_parallel<F, E>(
@@ -223,11 +225,16 @@ where
         return Ok(());
     }
 
+    let log_n = n.trailing_zeros() as usize;
+
+    // Validate that twiddle table size matches input size
+    if layer_twiddles.num_layers() != log_n {
+        return Err(FFTError::InputError(n));
+    }
+
     if n <= 4 {
         return bowers_fft_opt_fused(input, layer_twiddles);
     }
-
-    let log_n = n.trailing_zeros() as usize;
     let mut layer = 0;
 
     // Process pairs of layers with 2-layer fusion.
@@ -580,7 +587,9 @@ impl<F: IsFFTField> LayerTwiddles<F> {
 /// ```
 ///
 /// # Errors
-/// Returns `FFTError::InputError` if input length is not a power of two.
+/// Returns `FFTError::InputError` if:
+/// - Input length is not a power of two
+/// - Twiddle table size doesn't match input size
 #[cfg(feature = "alloc")]
 #[allow(clippy::needless_range_loop)]
 pub fn bowers_ifft_opt<F, E>(
@@ -601,6 +610,11 @@ where
     }
 
     let log_n = n.trailing_zeros() as usize;
+
+    // Validate that twiddle table size matches input size
+    if layer_twiddles.num_layers() != log_n {
+        return Err(FFTError::InputError(n));
+    }
 
     for layer in (0..log_n).rev() {
         let block_size = n >> layer;
@@ -638,7 +652,9 @@ where
 /// For multi-threaded execution, use `bowers_fft_opt_fused_parallel` instead.
 ///
 /// # Errors
-/// Returns `FFTError::InputError` if input length is not a power of two.
+/// Returns `FFTError::InputError` if:
+/// - Input length is not a power of two
+/// - Twiddle table size doesn't match input size
 #[cfg(feature = "alloc")]
 #[allow(clippy::needless_range_loop)]
 pub fn bowers_fft_opt_fused<F, E>(
@@ -659,6 +675,11 @@ where
     }
 
     let log_n = n.trailing_zeros() as usize;
+
+    // Validate that twiddle table size matches input size
+    if layer_twiddles.num_layers() != log_n {
+        return Err(FFTError::InputError(n));
+    }
 
     // Handle small sizes with simple sequential processing
     if n <= 4 {

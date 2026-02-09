@@ -660,3 +660,52 @@ fn test_adaptive_threshold_scales_with_threads() {
         });
     }
 }
+
+#[test]
+fn test_mismatched_twiddle_table_error() {
+    // Test that FFT returns error instead of panicking when twiddle table size doesn't match input
+    let order_input = 8u64; // Input size: 256 elements
+    let order_twiddles = 6u64; // Twiddle table for 64 elements (WRONG!)
+
+    let n = 1 << order_input;
+    let input: Vec<FE> = (0..n).map(|i| FE::from(i as u64)).collect();
+
+    // Create mismatched twiddle table (order 6 instead of 8)
+    let wrong_twiddles = LayerTwiddles::<F>::new(order_twiddles).unwrap();
+
+    // Forward FFT should return error
+    let mut data = input.clone();
+    let result = bowers_fft_opt_fused(&mut data, &wrong_twiddles);
+    assert!(
+        result.is_err(),
+        "FFT should return error with mismatched twiddle table"
+    );
+
+    // Inverse FFT should also return error
+    let wrong_inv_twiddles = LayerTwiddles::<F>::new_inverse(order_twiddles).unwrap();
+    let mut data = input.clone();
+    let result = bowers_ifft_opt(&mut data, &wrong_inv_twiddles);
+    assert!(
+        result.is_err(),
+        "IFFT should return error with mismatched twiddle table"
+    );
+}
+
+#[cfg(feature = "parallel")]
+#[test]
+fn test_mismatched_twiddle_table_error_parallel() {
+    // Test parallel FFT with mismatched twiddle table
+    let order_input = 10u64; // Input size: 1024 elements
+    let order_twiddles = 8u64; // Twiddle table for 256 elements (WRONG!)
+
+    let n = 1 << order_input;
+    let input: Vec<FE> = (0..n).map(|i| FE::from(i as u64)).collect();
+    let wrong_twiddles = LayerTwiddles::<F>::new(order_twiddles).unwrap();
+
+    let mut data = input;
+    let result = bowers_fft_opt_fused_parallel(&mut data, &wrong_twiddles);
+    assert!(
+        result.is_err(),
+        "Parallel FFT should return error with mismatched twiddle table"
+    );
+}
