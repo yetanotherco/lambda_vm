@@ -194,6 +194,11 @@ jobs:
             PROGRAM=$(basename "$json" .json)
 
             RESULT=$(awk -v bm="$BASE_MEAN" -v hm="$HEAD_MEAN" -v prog="$PROGRAM" 'BEGIN {
+              if (bm <= 0) {
+                printf "%s: base=%.2fs (invalid baseline, skipping)\n", prog, bm > "/dev/stderr"
+                print "false"
+                exit
+              }
               pct = ((hm - bm) / bm) * 100
               printf "%s: base=%.2fs  head=%.2fs  change=%+.1f%%\n", prog, bm, hm, pct > "/dev/stderr"
               print (pct > 5 ? "true" : "false")
