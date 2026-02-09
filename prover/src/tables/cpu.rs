@@ -1408,9 +1408,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // M6: LOAD[rvd; base_address, timestamp, read2, read4, read8] | LOAD
+    // M6: LOAD[rvd; base_address, timestamp, read2, read4, read8, signed] | LOAD
     // -------------------------------------------------------------------------
-    // LOAD receiver expects: [res::DWordBL(2), base_address::DWordWL(2), timestamp::DWordWL(2), flags(3)] = 9 elements
+    // LOAD receiver expects: [res::DWordBL(2), base_address::DWordWL(2), timestamp::DWordWL(2), flags(3), signed(1)] = 10 elements
     //
     // For CPU LOAD:
     // - rvd (the loaded result) corresponds to res
@@ -1448,6 +1448,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             },
             BusValue::Packed {
                 start_column: cols::MEMORY_8BYTES,
+                packing: Packing::Direct,
+            },
+            // signed flag
+            BusValue::Packed {
+                start_column: cols::SIGNED,
                 packing: Packing::Direct,
             },
         ],

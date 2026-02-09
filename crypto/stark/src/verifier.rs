@@ -15,6 +15,8 @@ use crate::{
 use crypto::{fiat_shamir::is_transcript::IsStarkTranscript, merkle_tree::proof::Proof};
 #[cfg(not(feature = "test_fiat_shamir"))]
 use log::error;
+#[cfg(feature = "debug-checks")]
+use log::info;
 use math::{
     fft::cpu::bit_reversing::reverse_index,
     field::{
@@ -850,16 +852,14 @@ pub trait IsStarkVerifier<
                         // OK - commitment matches hardcoded
                     }
                     Some(actual) => {
-                        eprintln!(
-                            "[VERIFIER] Preprocessed commitment MISMATCH for table {idx}: expected {:?}, got {:?}",
+                        error!(
+                            "Preprocessed commitment MISMATCH for table {idx}: expected {:?}, got {:?}",
                             expected_precomputed, actual
                         );
                         return false;
                     }
                     None => {
-                        eprintln!(
-                            "[VERIFIER] Preprocessed table {idx} proof missing precomputed commitment"
-                        );
+                        error!("Preprocessed table {idx} proof missing precomputed commitment");
                         return false;
                     }
                 }
@@ -904,8 +904,8 @@ pub trait IsStarkVerifier<
 
         for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
             if !Self::verify_rounds_2_to_4(*air, proof, transcript, logup_challenges.clone()) {
-                eprintln!(
-                    "[VERIFIER] Table {} failed verify_rounds_2_to_4 (num_constraints={}, trace_cols={})",
+                error!(
+                    "Table {} failed verify_rounds_2_to_4 (num_constraints={}, trace_cols={})",
                     idx,
                     air.context().num_transition_constraints(),
                     air.context().trace_columns
@@ -931,12 +931,14 @@ pub trait IsStarkVerifier<
 
             if total != FieldElement::zero() {
                 #[cfg(not(feature = "test_fiat_shamir"))]
-                error!("LogUp bus does not balance: sum of accumulated values is not zero");
-                eprintln!("[VERIFIER] Bus balance check FAILED: total={:?}", total);
+                error!(
+                    "LogUp bus does not balance: sum of accumulated values is not zero. total={:?}",
+                    total
+                );
                 return false;
             }
             #[cfg(feature = "debug-checks")]
-            eprintln!("[VERIFIER] Bus balance check PASSED");
+            info!("Bus balance check PASSED");
         }
 
         true

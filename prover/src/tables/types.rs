@@ -106,6 +106,64 @@ pub enum BusId {
     Ecall,
 }
 
+impl BusId {
+    /// Human-readable name for debug output.
+    pub fn name(&self) -> &'static str {
+        match self {
+            BusId::IsByte => "IsByte",
+            BusId::IsHalfword => "IsHalfword",
+            BusId::IsB20 => "IsB20",
+            BusId::AndByte => "AndByte",
+            BusId::OrByte => "OrByte",
+            BusId::XorByte => "XorByte",
+            BusId::Msb8 => "Msb8",
+            BusId::Msb16 => "Msb16",
+            BusId::Zero => "Zero",
+            BusId::Hwsl => "Hwsl",
+            BusId::Hwslc => "Hwslc",
+            BusId::Lt => "Lt",
+            BusId::Mul => "Mul",
+            BusId::Shift => "Shift",
+            BusId::Memw => "Memw",
+            BusId::Load => "Load",
+            BusId::Memory => "Memory",
+            BusId::Branch => "Branch",
+            BusId::Decode => "Decode",
+            BusId::Ecall => "Ecall",
+        }
+    }
+}
+
+impl TryFrom<u64> for BusId {
+    type Error = u64;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(BusId::IsByte),
+            1 => Ok(BusId::IsHalfword),
+            2 => Ok(BusId::IsB20),
+            3 => Ok(BusId::AndByte),
+            4 => Ok(BusId::OrByte),
+            5 => Ok(BusId::XorByte),
+            6 => Ok(BusId::Msb8),
+            7 => Ok(BusId::Msb16),
+            8 => Ok(BusId::Zero),
+            9 => Ok(BusId::Hwsl),
+            10 => Ok(BusId::Hwslc),
+            11 => Ok(BusId::Lt),
+            12 => Ok(BusId::Mul),
+            13 => Ok(BusId::Shift),
+            14 => Ok(BusId::Memw),
+            15 => Ok(BusId::Load),
+            16 => Ok(BusId::Memory),
+            17 => Ok(BusId::Branch),
+            18 => Ok(BusId::Decode),
+            19 => Ok(BusId::Ecall),
+            other => Err(other),
+        }
+    }
+}
+
 impl From<BusId> for u64 {
     fn from(id: BusId) -> u64 {
         id as u64

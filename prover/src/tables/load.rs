@@ -451,7 +451,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // -------------------------------------------------------------------------
     // LOAD receiver (from CPU)
     // -------------------------------------------------------------------------
-    // Spec: LOAD[res::DWordWL; base_address, timestamp, read2, read4, read8] | -μ
+    // Spec: LOAD[res::DWordWL; base_address, timestamp, read2, read4, read8, signed] | -μ
     //
     // res is DWordBL (8 bytes) but packed as DWordWL (2 words) for the bus.
     // DWordBL packing: 8 bytes → 2 bus elements [lo32, hi32]
@@ -485,6 +485,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             },
             BusValue::Packed {
                 start_column: cols::READ8,
+                packing: Packing::Direct,
+            },
+            // signed flag
+            BusValue::Packed {
+                start_column: cols::SIGNED,
                 packing: Packing::Direct,
             },
         ],
