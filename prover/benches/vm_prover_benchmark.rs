@@ -52,9 +52,7 @@ fn bench_verify(c: &mut Criterion, config: &BenchConfig) {
     c.bench_with_input(
         BenchmarkId::new("vm_prover/verify", config.name),
         &proof,
-        |b, proof| {
-            b.iter(|| lambda_vm_prover::verify(proof, &elf_bytes, &proof_options).unwrap())
-        },
+        |b, proof| b.iter(|| lambda_vm_prover::verify(proof, &elf_bytes, &proof_options).unwrap()),
     );
 }
 

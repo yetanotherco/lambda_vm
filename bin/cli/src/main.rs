@@ -264,14 +264,13 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf) -> ExitCode {
     eprintln!("  Version: {}", bundle.metadata.version);
     eprintln!("  ELF hash: {}", truncated_hex(&bundle.metadata.elf_hash));
     eprintln!("Verifying proof...");
-    let result =
-        match prover::verify(&bundle.multi_proof, &elf_data, &bundle.proof_options) {
-            Ok(valid) => valid,
-            Err(e) => {
-                eprintln!("Verification error: {}", e);
-                return ExitCode::FAILURE;
-            }
-        };
+    let result = match prover::verify(&bundle.multi_proof, &elf_data, &bundle.proof_options) {
+        Ok(valid) => valid,
+        Err(e) => {
+            eprintln!("Verification error: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
 
     if result {
         eprintln!("Verification succeeded!");
