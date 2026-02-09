@@ -383,8 +383,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     //
     // Memory bus format: memory[is_register, address, timestamp_lo, timestamp_hi, value]
     //
-    // Currently only register tokens participate (is_register=1).
-    // Memory tokens (is_register=0) have multiplicity 0 until PAGE tables are wired.
+    // Register tokens (is_register=1) are balanced by the REGISTER table.
+    // Memory tokens (is_register=0) are balanced by PAGE tables.
 
     // -------------------------------------------------------------------------
     // Memory bus interactions per spec CM14-CM21
