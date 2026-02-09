@@ -799,7 +799,6 @@ pub enum Multiplicity {
     /// ])
     /// ```
     Linear(Vec<LinearTerm>),
-
 }
 
 /// Struct representing a lookup interaction for a given table.
