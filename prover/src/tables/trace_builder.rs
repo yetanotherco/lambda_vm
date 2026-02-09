@@ -581,9 +581,12 @@ fn collect_bitwise_from_mul(mul_ops: &[(MulOperation, bool)]) -> Vec<BitwiseOper
     }
 
     // MSB16: one per unique signed op (multiplicity Column(LHS_SIGNED) / Column(RHS_SIGNED))
+    // The MUL table sends MSB16 with multiplicity = value of the SIGNED column (0 or 1)
+    // per unique row, so we must generate exactly one MSB16 per unique MUL operation,
+    // not per raw op.
     let mut msb16_seen = std::collections::HashSet::new();
     for (op, _wants_hi) in mul_ops {
-        if msb16_seen.insert(op.clone()) {
+        if msb16_seen.insert((op.lhs, op.lhs_signed, op.rhs, op.rhs_signed)) {
             if op.lhs_signed {
                 let lhs_3 = ((op.lhs >> 48) & 0xFFFF) as u16;
                 bitwise_ops.push(BitwiseOperation::halfword(
