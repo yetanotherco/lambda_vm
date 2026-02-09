@@ -269,7 +269,6 @@ impl DvrmOperation {
     pub fn sign_n_sub_r(&self) -> bool {
         self.signed && (self.n_sub_r() >> 63) == 1
     }
-
 }
 
 // =========================================================================
@@ -428,7 +427,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // -------------------------------------------------------------------------
     // DVRM-C11.i: IS_HALF[n_sub_r[i]] (×4), multiplicity: μ_q + μ_r
     // -------------------------------------------------------------------------
-    for col in [cols::N_SUB_R_0, cols::N_SUB_R_1, cols::N_SUB_R_2, cols::N_SUB_R_3] {
+    for col in [
+        cols::N_SUB_R_0,
+        cols::N_SUB_R_1,
+        cols::N_SUB_R_2,
+        cols::N_SUB_R_3,
+    ] {
         interactions.push(BusInteraction::sender(
             BusId::IsHalfword,
             Multiplicity::Sum(cols::MU_Q, cols::MU_R),
@@ -613,18 +617,14 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             // Each halfword = sign_n_sub_r * 65535
             // lo32 = sign_n_sub_r * (65535 + 65535 * 2^16) = sign_n_sub_r * 0xFFFFFFFF
             // hi32 = same
-            BusValue::linear(vec![
-                LinearTerm::Column {
-                    coefficient: (SIGN_FILL + SIGN_FILL * SHIFT_16) as i64,
-                    column: cols::SIGN_N_SUB_R,
-                },
-            ]),
-            BusValue::linear(vec![
-                LinearTerm::Column {
-                    coefficient: (SIGN_FILL + SIGN_FILL * SHIFT_16) as i64,
-                    column: cols::SIGN_N_SUB_R,
-                },
-            ]),
+            BusValue::linear(vec![LinearTerm::Column {
+                coefficient: (SIGN_FILL + SIGN_FILL * SHIFT_16) as i64,
+                column: cols::SIGN_N_SUB_R,
+            }]),
+            BusValue::linear(vec![LinearTerm::Column {
+                coefficient: (SIGN_FILL + SIGN_FILL * SHIFT_16) as i64,
+                column: cols::SIGN_N_SUB_R,
+            }]),
             // muldiv_selector = 1 (hi)
             BusValue::constant(1),
         ],
@@ -968,7 +968,6 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     interactions
 }
-
 
 // =========================================================================
 // Constraints

@@ -343,7 +343,11 @@ pub fn generate_bitwise_trace() -> TraceTable<GoldilocksField, GoldilocksExtensi
                 data[base + cols::MSB16] = FE::from(msb16 as u64);
 
                 // Zero check (X + 256*Y + 65536*Z must be zero)
-                let is_zero = if x == 0 && y == 0 && z == 0 { 1u64 } else { 0u64 };
+                let is_zero = if x == 0 && y == 0 && z == 0 {
+                    1u64
+                } else {
+                    0u64
+                };
                 data[base + cols::ZERO] = FE::from(is_zero);
 
                 // Shift operations on halfword

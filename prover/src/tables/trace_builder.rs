@@ -688,8 +688,7 @@ fn collect_bitwise_from_dvrm(dvrm_ops: &[(DvrmOperation, bool)]) -> Vec<BitwiseO
             ((op.d >> 48) & 0xFFFF) as u32,
         ];
         let sign_n: u32 = if op.sign_n() { 1 } else { 0 };
-        let overflow_sum = n_halves[0] + n_halves[1] + n_halves[2] + n_halves[3]
-            + 262141
+        let overflow_sum = n_halves[0] + n_halves[1] + n_halves[2] + n_halves[3] + 262141
             - 32769 * sign_n
             - d_halves[0]
             - d_halves[1]

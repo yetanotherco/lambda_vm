@@ -226,7 +226,7 @@ fn test_multiplicity_aggregation() {
         (DvrmOperation::new(20, 3, UNSIGNED), false), // wants_q
         (DvrmOperation::new(20, 3, UNSIGNED), false), // wants_q again
         (DvrmOperation::new(20, 3, UNSIGNED), true),  // wants_r
-        (DvrmOperation::new(100, 7, UNSIGNED), true),  // different op
+        (DvrmOperation::new(100, 7, UNSIGNED), true), // different op
     ];
 
     let trace = generate_dvrm_trace(&ops);
@@ -253,16 +253,8 @@ fn test_multiplicity_aggregation() {
             found_20_3 = true;
         }
         if row[cols::N_0] == FE::from(100u64) && row[cols::D_0] == FE::from(7u64) {
-            assert_eq!(
-                row[cols::MU_Q],
-                FE::zero(),
-                "Expected mu_q=0 for (100, 7)"
-            );
-            assert_eq!(
-                row[cols::MU_R],
-                FE::one(),
-                "Expected mu_r=1 for (100, 7)"
-            );
+            assert_eq!(row[cols::MU_Q], FE::zero(), "Expected mu_q=0 for (100, 7)");
+            assert_eq!(row[cols::MU_R], FE::one(), "Expected mu_r=1 for (100, 7)");
             found_100_7 = true;
         }
     }

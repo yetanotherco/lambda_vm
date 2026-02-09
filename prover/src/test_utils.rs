@@ -35,6 +35,9 @@ use crate::tables::cpu::{
     CpuOperation, bus_interactions as cpu_bus_interactions, cols as cpu_cols,
 };
 use crate::tables::decode::{bus_interactions as decode_bus_interactions, cols as decode_cols};
+use crate::tables::dvrm::{
+    bus_interactions as dvrm_bus_interactions, cols as dvrm_cols, dvrm_constraints,
+};
 use crate::tables::halt::{bus_interactions as halt_bus_interactions, cols as halt_cols};
 use crate::tables::load::{
     bus_interactions as load_bus_interactions, cols as load_cols, constraints as load_constraints,
@@ -42,9 +45,6 @@ use crate::tables::load::{
 use crate::tables::lt::{LtOperation, bus_interactions as lt_bus_interactions, cols as lt_cols};
 use crate::tables::memw::{
     bus_interactions as memw_bus_interactions, cols as memw_cols, constraints as memw_constraints,
-};
-use crate::tables::dvrm::{
-    bus_interactions as dvrm_bus_interactions, cols as dvrm_cols, dvrm_constraints,
 };
 use crate::tables::mul::{bus_interactions as mul_bus_interactions, cols as mul_cols};
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
