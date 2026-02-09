@@ -353,7 +353,7 @@ impl CpuOperation {
         }
     }
 
-    /// Compute arg2 based on instruction type.
+    /// Compute arg2 based on instruction type (returns imm or rv2 depending on opcode).
     ///
     /// Per spec constraint for arg2[4:]:
     /// (1-LOAD) * ((1-word_instr)*rv2[2] + signed*arg2_sign_bit*(2^32-1)) + (1-BEQ-BLT-STORE)*imm[1]
