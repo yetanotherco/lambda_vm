@@ -172,7 +172,8 @@ jobs:
               "./bench-bin/cli-base prove $ELF --output $PROOF_BASE --security fast" \
               -n "head prove $PROGRAM" \
               "./bench-bin/cli-head prove $ELF --output $PROOF_HEAD --security fast" \
-              --export-markdown results.md
+              --export-markdown results.md \
+              --export-json results.json
           else
             hyperfine \
               --warmup 0 \
@@ -185,8 +186,29 @@ jobs:
 
           echo "has_results=true" >> "$GITHUB_OUTPUT"
 
-      - name: Build comment body
+      - name: Detect regression
+        id: detect-regression
         if: steps.run-benchmark.outputs.has_results == 'true'
+        run: |
+          if [ ! -f results.json ]; then
+            echo "No base vs head comparison (dispatch-only run), skipping regression check"
+            exit 0
+          fi
+
+          BASE_MEAN=$(jq '.results[0].mean' results.json)
+          HEAD_MEAN=$(jq '.results[1].mean' results.json)
+
+          # Flag regression if head is >5% slower than base
+          REGRESSED=$(awk -v bm="$BASE_MEAN" -v hm="$HEAD_MEAN" 'BEGIN {
+            pct = ((hm - bm) / bm) * 100
+            printf "base=%.2fs  head=%.2fs  change=%+.1f%%\n", bm, hm, pct > "/dev/stderr"
+            print (pct > 5 ? "true" : "false")
+          }')
+
+          echo "regressed=$REGRESSED" >> "$GITHUB_OUTPUT"
+
+      - name: Build comment body
+        if: steps.detect-regression.outputs.regressed == 'true'
         run: |
           {
             echo "Prove Benchmark Results :lock:"
@@ -197,7 +219,7 @@ jobs:
           } > comment_body.md
 
       - name: Find comment
-        if: steps.run-benchmark.outputs.has_results == 'true' && github.event.pull_request.number
+        if: steps.detect-regression.outputs.regressed == 'true' && github.event.pull_request.number
         uses: peter-evans/find-comment@v3
         id: fc
         with:
@@ -206,14 +228,14 @@ jobs:
           body-includes: Prove Benchmark Results
 
       - name: Create comment
-        if: steps.fc.outputs.comment-id == '' && steps.run-benchmark.outputs.has_results == 'true' && github.event.pull_request.number
+        if: steps.fc.outputs.comment-id == '' && steps.detect-regression.outputs.regressed == 'true' && github.event.pull_request.number
         uses: peter-evans/create-or-update-comment@v4
         with:
           issue-number: ${{ github.event.pull_request.number }}
           body-path: comment_body.md
 
       - name: Update comment
-        if: steps.fc.outputs.comment-id != '' && steps.run-benchmark.outputs.has_results == 'true' && github.event.pull_request.number
+        if: steps.fc.outputs.comment-id != '' && steps.detect-regression.outputs.regressed == 'true' && github.event.pull_request.number
         uses: peter-evans/create-or-update-comment@v4
         with:
           comment-id: ${{ steps.fc.outputs.comment-id }}
