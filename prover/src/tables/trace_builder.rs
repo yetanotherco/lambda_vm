@@ -79,10 +79,10 @@ impl MemoryState {
         let mut cells = HashMap::new();
         for segment in &elf.data {
             for (i, &word) in segment.values.iter().enumerate() {
-                let word_addr = segment.base_addr + (i as u64 * 4);
+                let word_addr = segment.base_addr.wrapping_add(i as u64 * 4);
                 // Split 32-bit word into 4 bytes (little-endian)
                 for byte_offset in 0..4u64 {
-                    let byte_addr = word_addr + byte_offset;
+                    let byte_addr = word_addr.wrapping_add(byte_offset);
                     let byte_value = ((word >> (byte_offset * 8)) & 0xFF) as u8;
                     // Initial state: value from ELF, timestamp=0
                     cells.insert(byte_addr, (byte_value, 0));
@@ -517,24 +517,20 @@ fn collect_lt_from_memw(memw_ops: &[MemwOperation]) -> Vec<LtOperation> {
             }
         }
 
-        // R1-R3: Address overflow checks
+        // R1-R3: Address overflow checks (unconditional per MEMW-CR13/14/15)
+        // If overflow occurs, LT returns lt=0 and the constraint (expecting lt=1)
+        // rejects the proof via value mismatch.
         if memw_op.width == 2 {
             let addr_plus_1 = memw_op.base_address.wrapping_add(1);
-            if addr_plus_1 > memw_op.base_address {
-                lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_1, false));
-            }
+            lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_1, false));
         }
         if memw_op.width == 4 {
             let addr_plus_3 = memw_op.base_address.wrapping_add(3);
-            if addr_plus_3 > memw_op.base_address {
-                lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_3, false));
-            }
+            lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_3, false));
         }
         if memw_op.width == 8 {
             let addr_plus_7 = memw_op.base_address.wrapping_add(7);
-            if addr_plus_7 > memw_op.base_address {
-                lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_7, false));
-            }
+            lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_7, false));
         }
     }
 
