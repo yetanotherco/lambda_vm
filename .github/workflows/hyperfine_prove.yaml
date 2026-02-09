@@ -119,7 +119,7 @@ jobs:
   run-prove-benchmark:
     name: Run prove benchmark
     needs: [build-program, build-base-binary, build-head-binary]
-    if: "!failure() && !cancelled()"
+    if: always() && needs.build-program.result == 'success' && needs.build-head-binary.result == 'success' && needs.build-base-binary.result != 'failure'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -200,6 +200,7 @@ jobs:
 
           # Flag regression if head is >5% slower than base
           REGRESSED=$(awk -v bm="$BASE_MEAN" -v hm="$HEAD_MEAN" 'BEGIN {
+            if (bm <= 0) { print "false"; exit }
             pct = ((hm - bm) / bm) * 100
             printf "base=%.2fs  head=%.2fs  change=%+.1f%%\n", bm, hm, pct > "/dev/stderr"
             print (pct > 5 ? "true" : "false")
