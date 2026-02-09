@@ -15,6 +15,8 @@
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
 pub mod constraints;
+#[cfg(feature = "debug-checks")]
+mod debug_report;
 pub mod tables;
 pub mod test_utils;
 pub mod tests;
@@ -146,6 +148,9 @@ impl VmAirs {
         let mul = create_mul_air(proof_options);
         let branch = create_branch_air(proof_options);
         let halt = create_halt_air(proof_options);
+        #[cfg(feature = "debug-checks")]
+        debug_report::print_bus_legend();
+
         Self {
             cpu,
             bitwise,
@@ -162,6 +167,14 @@ impl VmAirs {
 
 /// Prove an ELF binary execution. Returns a serializable proof.
 pub fn prove(elf_bytes: &[u8]) -> Result<MultiProof<F, E, ()>, Error> {
+    prove_with_options(elf_bytes, &ProofOptions::default_test_options())
+}
+
+/// Prove an ELF binary execution with custom proof options.
+pub fn prove_with_options(
+    elf_bytes: &[u8],
+    proof_options: &ProofOptions,
+) -> Result<MultiProof<F, E, ()>, Error> {
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let executor = Executor::new(&program, vec![]).map_err(|e| Error::Execution(format!("{e}")))?;
     let result = executor
@@ -169,9 +182,7 @@ pub fn prove(elf_bytes: &[u8]) -> Result<MultiProof<F, E, ()>, Error> {
         .map_err(|e| Error::Execution(format!("{e}")))?;
 
     let mut traces = Traces::from_logs(&result.logs, result.instructions)?;
-
-    let proof_options = ProofOptions::default_test_options();
-    let airs = VmAirs::new(&program, &proof_options, false);
+    let airs = VmAirs::new(&program, proof_options, false);
 
     Prover::multi_prove(
         airs.air_trace_pairs(&mut traces),
@@ -182,9 +193,17 @@ pub fn prove(elf_bytes: &[u8]) -> Result<MultiProof<F, E, ()>, Error> {
 
 /// Verify a proof produced by [`prove`].
 pub fn verify(proof: &MultiProof<F, E, ()>, elf_bytes: &[u8]) -> Result<bool, Error> {
+    verify_with_options(proof, elf_bytes, &ProofOptions::default_test_options())
+}
+
+/// Verify a proof with custom proof options.
+pub fn verify_with_options(
+    proof: &MultiProof<F, E, ()>,
+    elf_bytes: &[u8],
+    proof_options: &ProofOptions,
+) -> Result<bool, Error> {
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
-    let proof_options = ProofOptions::default_test_options();
-    let airs = VmAirs::new(&program, &proof_options, false);
+    let airs = VmAirs::new(&program, proof_options, false);
 
     Ok(Verifier::multi_verify(
         &airs.air_refs(),
