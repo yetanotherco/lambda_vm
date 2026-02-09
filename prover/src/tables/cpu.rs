@@ -38,7 +38,8 @@
 //! - DECODE: instruction fetch
 //! - IS_BYTE: range checks for rs1, rs2, rd, arg1[i], arg2[i], res[i]
 //! - IS_BIT: range checks for flags (via templates)
-//! - ADD: for ADD, LOAD, STORE, JALR operations
+//! - ADD: for ADD, LOAD, JALR operations
+//! - STORE ADD: for STORE (res = arg1 + imm, separate from main ADD)
 //! - SUB: for SUB, BEQ operations
 //! - LT: for SLT, BLT operations
 //! - AND_BYTE, OR_BYTE, XOR_BYTE: for bitwise operations (×8 each)
@@ -355,15 +356,20 @@ impl CpuOperation {
     /// Compute arg2 based on instruction type.
     ///
     /// Per spec constraint for arg2[4:]:
-    /// (1-STORE-LOAD) * ((1-word_instr)*rv2[2] + signed*arg2_sign_bit*(2^32-1)) + (1-BEQ-BLT)*imm[1]
+    /// (1-LOAD) * ((1-word_instr)*rv2[2] + signed*arg2_sign_bit*(2^32-1)) + (1-BEQ-BLT-STORE)*imm[1]
     ///
-    /// For LOAD/STORE: uses imm (full 64-bit, for address calculation)
+    /// For LOAD: uses imm (full 64-bit, for address calculation)
+    /// For STORE: uses rv2 (byte-decomposed data to store; address via separate ADD)
     /// For BEQ/BLT: uses rv2 (full 64-bit, comparing register values)
     /// Otherwise: uses imm (when rs2=0) or rv2, with sign extension for signed word instructions
     pub fn compute_arg2(&self) -> u64 {
-        if self.decode.op_load || self.decode.op_store {
-            // LOAD/STORE: address = rv1 + imm, use full imm
+        if self.decode.op_load {
+            // LOAD: address = rv1 + imm, use full imm
             self.decode.imm
+        } else if self.decode.op_store {
+            // STORE: arg2 = rv2 (byte-decomposed data to store)
+            // Address computed separately as res = arg1 + imm
+            self.rv2
         } else if self.decode.op_beq || self.decode.op_blt {
             // BEQ/BLT: compare rv1 vs rv2, use full rv2
             self.rv2
@@ -437,11 +443,14 @@ impl CpuOperation {
         let arg1 = self.compute_arg1();
         let arg2 = self.compute_arg2();
 
-        if self.decode.op_add || self.decode.op_load || self.decode.op_store {
+        if self.decode.op_add || self.decode.op_load {
             // ADD constraint: arg1 + arg2 = res
             // For ADD: computes arithmetic result
-            // For LOAD/STORE: computes memory address (rv1 + imm)
+            // For LOAD: computes memory address (rv1 + imm)
             arg1.wrapping_add(arg2)
+        } else if self.decode.op_store {
+            // STORE: res = arg1 + imm (address), not arg1 + arg2 (which is now rv2)
+            arg1.wrapping_add(self.decode.imm)
         } else if self.decode.op_sub {
             // SUB constraint checks: res + arg2 = arg1, so res = arg1 - arg2
             arg1.wrapping_sub(arg2)
@@ -1479,21 +1488,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::RES[0],
                 packing: Packing::DWordBL,
             },
-            // value[0] = rv2_lo = RV2_0 + 2^16 * RV2_1
-            BusValue::linear(vec![
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::RV2_0,
-                },
-                LinearTerm::Column {
-                    coefficient: 65536,
-                    column: cols::RV2_1,
-                },
-            ]),
-            // value[1] = rv2_hi = RV2_2
+            // value[0..1] = arg2 packed as DWordBL → 2 elements [lo32, hi32]
             BusValue::Packed {
-                start_column: cols::RV2_2,
-                packing: Packing::Direct,
+                start_column: cols::ARG2[0],
+                packing: Packing::DWordBL,
             },
             // value[2..7] = 0 (unconstrained per team feedback)
             BusValue::constant(0),
