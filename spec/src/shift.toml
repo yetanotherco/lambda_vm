@@ -203,7 +203,7 @@ tag = "ZERO"
 input = ["bit_shift"]
 output = "zbs"
 ref = "shift:c:zbs"
-cond = "μ"
+multiplicity = "μ"
 
 
 [[constraint_groups]]

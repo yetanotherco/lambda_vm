@@ -821,6 +821,7 @@ class InteractionConstraint:
             self.output = build_expr(config, data["output"])
         else:
             self.output = None
+        assert "multiplicity" in data, data
         self.multiplicity = build_expr(config, data["multiplicity"])
         self.iters = iters_of(data)
 
@@ -928,12 +929,13 @@ class Chip:
 
 if __name__ == "__main__":
     config = Config.from_file(sys.argv[1])
+    signatures = sys.argv[2] # Later
     if reporter.reported:
         sys.exit(1)
     reported = False
     chips: list[Chip] = []
-    for file in sys.argv[2:]:
-        if file == sys.argv[1]:
+    for file in sys.argv[3:]:
+        if file in sys.argv[1:3]:
             continue
         chips.append(Chip.from_file(config, file))
         reported = reported or reporter.reported
