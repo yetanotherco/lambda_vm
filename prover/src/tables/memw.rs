@@ -432,7 +432,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // CM15: memory[is_register, base_address, timestamp, value[0]] with -μ_sum
+    // CM17: memory[is_register, base_address, timestamp, value[0]] with -μ_sum
     interactions.push(BusInteraction::receiver(
         BusId::Memory,
         Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE),
@@ -475,7 +475,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         packing: Packing::Word2L,
     };
 
-    // CM16: memory[is_register, address_add[0], old_timestamp[1], old[1]] with +w2
+    // CM18: memory[is_register, address_add[0], old_timestamp[1], old[1]] with +w2
     // w2 = write2 + write4 + write8
     interactions.push(BusInteraction::sender(
         BusId::Memory,
@@ -515,7 +515,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // CM17: memory[is_register, address_add[0], timestamp, value[1]] with -w2
+    // CM19: memory[is_register, address_add[0], timestamp, value[1]] with -w2
     interactions.push(BusInteraction::receiver(
         BusId::Memory,
         Multiplicity::Linear(vec![
@@ -554,7 +554,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // CM18/19: indices 2-3 with multiplicity w4 = write4 + write8
+    // CM20/21: indices 2-3 with multiplicity w4 = write4 + write8
     for i in 2..=3 {
         let addr_add_lo = BusValue::Packed {
             start_column: cols::address_add(i - 1)[0],
@@ -565,7 +565,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             packing: Packing::Word2L,
         };
 
-        // CM18.i: send old token
+        // CM22.i: send old token
         interactions.push(BusInteraction::sender(
             BusId::Memory,
             Multiplicity::Linear(vec![
@@ -600,7 +600,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             ],
         ));
 
-        // CM19.i: receive new token
+        // CM23.i: receive new token
         interactions.push(BusInteraction::receiver(
             BusId::Memory,
             Multiplicity::Linear(vec![
@@ -636,7 +636,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
-    // CM20/21: indices 4-7 with multiplicity write8
+    // CM22/23: indices 4-7 with multiplicity write8
     for i in 4..=7 {
         let addr_add_lo = BusValue::Packed {
             start_column: cols::address_add(i - 1)[0],
@@ -647,7 +647,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             packing: Packing::Word2L,
         };
 
-        // CM20.i: send old token
+        // CM22.i: send old token
         interactions.push(BusInteraction::sender(
             BusId::Memory,
             Multiplicity::Column(cols::WRITE8),
@@ -673,7 +673,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             ],
         ));
 
-        // CM21.i: receive new token
+        // CM23.i: receive new token
         interactions.push(BusInteraction::receiver(
             BusId::Memory,
             Multiplicity::Column(cols::WRITE8),
@@ -701,7 +701,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     }
 
     // -------------------------------------------------------------------------
-    // Read receiver (unified for register and memory operations)
+    // CO24: Read receiver (unified for register and memory operations)
     // -------------------------------------------------------------------------
     // OLD and VALUE are 8 individual BaseField elements (Direct packing).
     // For registers: [lo32_word, hi32_word, 0, 0, 0, 0, 0, 0]
@@ -817,7 +817,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // Write receiver (unified for register and memory operations)
+    // CO25: Write receiver (unified for register and memory operations)
     // -------------------------------------------------------------------------
     // VALUE is 8 individual BaseField elements (Direct packing).
     // For registers: [lo32_word, hi32_word, 0, 0, 0, 0, 0, 0]
