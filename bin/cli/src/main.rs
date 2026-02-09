@@ -179,7 +179,7 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf) -> ExitCode {
     };
 
     eprintln!("Generating proof (this may take a while)...");
-    let multi_proof = match prover::prove_with_options(&elf_data, &proof_options) {
+    let multi_proof = match prover::prove(&elf_data, &proof_options) {
         Ok(proof) => proof,
         Err(e) => {
             eprintln!("Proof generation failed: {}", e);
@@ -253,7 +253,7 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf) -> ExitCode {
     }
 
     // Detect wrong ELF early with a clear error message.
-    // The cryptographic binding happens inside verify_with_options via the DECODE table.
+    // The cryptographic binding happens inside verify via the DECODE table.
     let elf_hash: [u8; 32] = Sha3_256::digest(&elf_data).into();
     if elf_hash != bundle.metadata.elf_hash {
         eprintln!("ELF hash mismatch: the proof was generated for a different program");
@@ -265,7 +265,7 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf) -> ExitCode {
     eprintln!("  ELF hash: {}", truncated_hex(&bundle.metadata.elf_hash));
     eprintln!("Verifying proof...");
     let result =
-        match prover::verify_with_options(&bundle.multi_proof, &elf_data, &bundle.proof_options) {
+        match prover::verify(&bundle.multi_proof, &elf_data, &bundle.proof_options) {
             Ok(valid) => valid,
             Err(e) => {
                 eprintln!("Verification error: {}", e);
