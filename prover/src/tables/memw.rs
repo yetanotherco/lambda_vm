@@ -387,7 +387,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // Memory tokens (is_register=0) are balanced by PAGE tables.
 
     // -------------------------------------------------------------------------
-    // Memory bus interactions per spec CM14-CM21
+    // Memory bus interactions per spec CM16-CM23
     // -------------------------------------------------------------------------
     // Token format: memory[is_register, address_lo, address_hi, ts_lo, ts_hi, value]
     //
@@ -395,12 +395,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // For memory (is_register=0): value is a Byte (8-bit), address is byte-indexed
     //
     // Multiplicities per spec:
-    // - CM14/15 (index 0): μ_sum
-    // - CM16/17 (index 1): w2 = write2 + write4 + write8
-    // - CM18/19 (indices 2-3): w4 = write4 + write8
-    // - CM20/21 (indices 4-7): write8
+    // - CM16/17 (index 0): μ_sum
+    // - CM18/19 (index 1): w2 = write2 + write4 + write8
+    // - CM20/21 (indices 2-3): w4 = write4 + write8
+    // - CM22/23 (indices 4-7): write8
 
-    // CM14: memory[is_register, base_address, old_timestamp[0], old[0]] with +μ_sum
+    // CM16: memory[is_register, base_address, old_timestamp[0], old[0]] with +μ_sum
     interactions.push(BusInteraction::sender(
         BusId::Memory,
         Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE),
