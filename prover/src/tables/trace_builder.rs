@@ -603,33 +603,10 @@ fn collect_bitwise_from_lt(lt_ops: &[LtOperation]) -> Vec<BitwiseOperation> {
 ///
 /// Returns: Vec of bitwise lookups
 fn collect_bitwise_from_mul(mul_ops: &[(MulOperation, bool)]) -> Vec<BitwiseOperation> {
-    // MSB16: up to 2 per op, IS_HALF: 8 per op (4 lo + 4 hi), IS_B20: 4 per op (carries)
     let mut bitwise_ops = Vec::with_capacity(mul_ops.len() * 14);
 
+    // IS_HALF and IS_B20: one set per raw op (multiplicity Sum(MU_LO, MU_HI))
     for (op, _wants_hi) in mul_ops {
-        // MSB16[lhs[3]] when lhs_signed=1
-        if op.lhs_signed {
-            let lhs_3 = ((op.lhs >> 48) & 0xFFFF) as u16;
-            bitwise_ops.push(BitwiseOperation::halfword(
-                BitwiseOperationType::Msb16,
-                (lhs_3 & 0xFF) as u8,
-                (lhs_3 >> 8) as u8,
-            ));
-        }
-
-        // MSB16[rhs[3]] when rhs_signed=1
-        if op.rhs_signed {
-            let rhs_3 = ((op.rhs >> 48) & 0xFFFF) as u16;
-            bitwise_ops.push(BitwiseOperation::halfword(
-                BitwiseOperationType::Msb16,
-                (rhs_3 & 0xFF) as u8,
-                (rhs_3 >> 8) as u8,
-            ));
-        }
-
-        // IS_HALF for lo[0..4] and hi[0..4] with multiplicity 1 per operation
-        // MUL table sends with mu_sum = mu_lo + mu_hi; since we iterate original ops,
-        // each operation contributes 1 to the sum.
         let (lo, hi) = op.compute_product();
 
         // IS_HALF for lo halfwords
@@ -656,12 +633,36 @@ fn collect_bitwise_from_mul(mul_ops: &[(MulOperation, bool)]) -> Vec<BitwiseOper
         let raw_products = op.compute_raw_products();
         let carries = mul::compute_carries(lo, hi, &raw_products);
         for carry in carries {
-            // IS_B20 takes a 20-bit value packed as X + 256*Y + 65536*Z
-            // where X, Y are bytes and Z is a 4-bit nibble
             let x = (carry & 0xFF) as u8;
             let y = ((carry >> 8) & 0xFF) as u8;
             let z = ((carry >> 16) & 0xF) as u8;
             bitwise_ops.push(BitwiseOperation::b20(x, y, z));
+        }
+    }
+
+    // MSB16: one per unique signed op (multiplicity Column(LHS_SIGNED) / Column(RHS_SIGNED))
+    // The MUL table sends MSB16 with multiplicity = value of the SIGNED column (0 or 1)
+    // per unique row, so we must generate exactly one MSB16 per unique MUL operation,
+    // not per raw op.
+    let mut msb16_seen = std::collections::HashSet::new();
+    for (op, _wants_hi) in mul_ops {
+        if msb16_seen.insert((op.lhs, op.lhs_signed, op.rhs, op.rhs_signed)) {
+            if op.lhs_signed {
+                let lhs_3 = ((op.lhs >> 48) & 0xFFFF) as u16;
+                bitwise_ops.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::Msb16,
+                    (lhs_3 & 0xFF) as u8,
+                    (lhs_3 >> 8) as u8,
+                ));
+            }
+            if op.rhs_signed {
+                let rhs_3 = ((op.rhs >> 48) & 0xFFFF) as u16;
+                bitwise_ops.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::Msb16,
+                    (rhs_3 & 0xFF) as u8,
+                    (rhs_3 >> 8) as u8,
+                ));
+            }
         }
     }
 
