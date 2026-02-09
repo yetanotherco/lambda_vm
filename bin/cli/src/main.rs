@@ -170,7 +170,13 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf) -> ExitCode {
     };
 
     let elf_hash: [u8; 32] = Sha3_256::digest(&elf_data).into();
-    let proof_options = ProofOptions::default_test_options();
+    // Provable 100-bit security.
+    let proof_options = ProofOptions {
+        blowup_factor: 4,
+        fri_number_of_queries: 104,
+        coset_offset: 3,
+        grinding_factor: 20,
+    };
 
     eprintln!("Generating proof (this may take a while)...");
     let multi_proof = match prover::prove_with_options(&elf_data, &proof_options) {
