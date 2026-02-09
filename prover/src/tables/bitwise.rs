@@ -133,8 +133,8 @@ pub const fn generate_bitwise_row(index: usize) -> [u64; NUM_PRECOMPUTED_COLS] {
     let halfword = x + y * 256;
     let msb16 = (halfword >> 15) & 1;
 
-    // Zero check (both X and Y must be zero)
-    let is_zero = if x == 0 && y == 0 { 1 } else { 0 };
+    // Zero check (X + 256*Y + 65536*Z must be zero)
+    let is_zero = if x == 0 && y == 0 && z == 0 { 1 } else { 0 };
 
     // Shift operations on halfword
     let sll = if z == 0 {
@@ -342,8 +342,8 @@ pub fn generate_bitwise_trace() -> TraceTable<GoldilocksField, GoldilocksExtensi
                 data[base + cols::MSB8] = FE::from(msb8 as u64);
                 data[base + cols::MSB16] = FE::from(msb16 as u64);
 
-                // Zero check (both X and Y must be zero)
-                let is_zero = if x == 0 && y == 0 { 1u64 } else { 0u64 };
+                // Zero check (X + 256*Y + 65536*Z must be zero)
+                let is_zero = if x == 0 && y == 0 && z == 0 { 1u64 } else { 0u64 };
                 data[base + cols::ZERO] = FE::from(is_zero);
 
                 // Shift operations on halfword
@@ -524,9 +524,19 @@ impl BitwiseOperation {
         Self::new(lookup_type, x, 0, 0)
     }
 
-    /// Create an operation for halfword ops (MSB16, IS_HALF, ZERO).
+    /// Create an operation for halfword ops (MSB16, IS_HALF).
     pub fn halfword(lookup_type: BitwiseOperationType, x: u8, y: u8) -> Self {
         Self::new(lookup_type, x, y, 0)
+    }
+
+    /// Create a ZERO lookup for a value up to 20 bits.
+    /// Value is decomposed as: x + 256*y + 65536*z.
+    pub fn zero(value: u32) -> Self {
+        debug_assert!(value < (1 << 20), "ZERO value must fit in 20 bits");
+        let x = (value & 0xFF) as u8;
+        let y = ((value >> 8) & 0xFF) as u8;
+        let z = ((value >> 16) & 0xF) as u8;
+        Self::new(BitwiseOperationType::Zero, x, y, z)
     }
 
     /// Create an operation for shift ops (HWSL, HWSLC).
@@ -648,7 +658,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 },
             ],
         ),
-        // ZERO[X + 256*Y] -> ZERO
+        // ZERO[X + 256*Y + 65536*Z] -> ZERO
         BusInteraction::receiver(
             BusId::Zero,
             Multiplicity::Column(cols::MU_ZERO),
@@ -661,6 +671,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     stark::lookup::LinearTerm::Column {
                         coefficient: 256,
                         column: cols::Y,
+                    },
+                    stark::lookup::LinearTerm::Column {
+                        coefficient: 65536,
+                        column: cols::Z,
                     },
                 ]),
                 BusValue::Packed {

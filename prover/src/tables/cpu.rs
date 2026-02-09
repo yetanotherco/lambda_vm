@@ -495,13 +495,7 @@ impl CpuOperation {
                 sum += (self.res >> (i * 8)) & 0xFF;
             }
             // Sum fits in 16 bits (max 8 * 255 = 2040)
-            let lo = (sum & 0xFF) as u8;
-            let hi = ((sum >> 8) & 0xFF) as u8;
-            lookups.push(BitwiseOperation::halfword(
-                BitwiseOperationType::Zero,
-                lo,
-                hi,
-            ));
+            lookups.push(BitwiseOperation::zero(sum as u32));
         }
 
         // AND/OR/XOR lookups (×8 each for each byte)
