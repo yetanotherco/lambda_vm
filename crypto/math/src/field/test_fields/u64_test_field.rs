@@ -1,8 +1,8 @@
 use crate::{
     errors::CreationError,
     field::{
-        traits::{IsFFTField, IsField, IsPrimeField},
         errors::FieldError,
+        traits::{IsFFTField, IsField, IsPrimeField},
     },
 };
 

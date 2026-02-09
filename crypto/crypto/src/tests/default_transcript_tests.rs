@@ -1,7 +1,6 @@
 use alloc::vec::Vec;
 use math::field::{
-    element::FieldElement,
-    extensions_goldilocks::Degree3GoldilocksExtensionField,
+    element::FieldElement, extensions_goldilocks::Degree3GoldilocksExtensionField,
     goldilocks::GoldilocksField,
 };
 
@@ -10,8 +9,7 @@ use crate::fiat_shamir::is_transcript::IsTranscript;
 
 #[test]
 fn basic_challenge() {
-    let mut transcript =
-        DefaultTranscript::<Degree3GoldilocksExtensionField>::default();
+    let mut transcript = DefaultTranscript::<Degree3GoldilocksExtensionField>::default();
 
     let point_a: Vec<u8> = vec![0xFF, 0xAB];
     let point_b: Vec<u8> = vec![0xDD, 0x8C, 0x9D];
@@ -53,18 +51,27 @@ type Ext3FE = FieldElement<Degree3GoldilocksExtensionField>;
 #[test]
 fn degree3_goldilocks_transcript_distinguish_different_fe() {
     let mut transcript_1 = DefaultTranscript::<Degree3GoldilocksExtensionField>::default();
-    transcript_1
-        .append_field_element(&Ext3FE::new([GoldFE::one(), GoldFE::zero(), GoldFE::zero()]));
+    transcript_1.append_field_element(&Ext3FE::new([
+        GoldFE::one(),
+        GoldFE::zero(),
+        GoldFE::zero(),
+    ]));
     let sample_1 = transcript_1.sample_field_element();
 
     let mut transcript_2 = DefaultTranscript::<Degree3GoldilocksExtensionField>::default();
-    transcript_2
-        .append_field_element(&Ext3FE::new([GoldFE::zero(), GoldFE::zero(), GoldFE::one()]));
+    transcript_2.append_field_element(&Ext3FE::new([
+        GoldFE::zero(),
+        GoldFE::zero(),
+        GoldFE::one(),
+    ]));
     let sample_2 = transcript_2.sample_field_element();
 
     let mut transcript_3 = DefaultTranscript::<Degree3GoldilocksExtensionField>::default();
-    transcript_3
-        .append_field_element(&Ext3FE::new([GoldFE::one(), GoldFE::zero(), GoldFE::zero()]));
+    transcript_3.append_field_element(&Ext3FE::new([
+        GoldFE::one(),
+        GoldFE::zero(),
+        GoldFE::zero(),
+    ]));
     let sample_3 = transcript_3.sample_field_element();
 
     assert!(sample_1 != sample_2);
