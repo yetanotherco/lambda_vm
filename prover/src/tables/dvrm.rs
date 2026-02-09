@@ -20,8 +20,6 @@
 //! - `n_sub_r`: DWordHL (4 halfwords) - numerator minus remainder
 //! - `sign_n_sub_r`: Bit - sign of (n - r)
 //! - `sign_n`, `sign_d`, `sign_q`, `sign_r`: Bit - sign bits
-//! - `neg_r`: DWordWL (2 words) - NEG template aux for abs_r
-//! - `neg_d`: DWordWL (2 words) - NEG template aux for abs_d
 //!
 //! ## Bus Interactions
 //! - Sender: IS_HALF (×16: n, d, r, n_sub_r, q)
@@ -132,26 +130,14 @@ pub mod cols {
     /// sign_r: Bit (sign of remainder)
     pub const SIGN_R: usize = 31;
 
-    // NEG template auxiliary for abs_r
-    /// neg_r[0]: Word (lower 32 bits of -r)
-    pub const NEG_R_0: usize = 32;
-    /// neg_r[1]: Word (upper 32 bits of -r)
-    pub const NEG_R_1: usize = 33;
-
-    // NEG template auxiliary for abs_d
-    /// neg_d[0]: Word (lower 32 bits of -d)
-    pub const NEG_D_0: usize = 34;
-    /// neg_d[1]: Word (upper 32 bits of -d)
-    pub const NEG_D_1: usize = 35;
-
     // Multiplicity columns
     /// μ_q: multiplicity for quotient result lookups
-    pub const MU_Q: usize = 36;
+    pub const MU_Q: usize = 32;
     /// μ_r: multiplicity for remainder result lookups
-    pub const MU_R: usize = 37;
+    pub const MU_R: usize = 33;
 
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 38;
+    pub const NUM_COLUMNS: usize = 34;
 }
 
 // =========================================================================
@@ -284,22 +270,6 @@ impl DvrmOperation {
         self.signed && (self.n_sub_r() >> 63) == 1
     }
 
-    /// Compute the NEG (two's complement negation) of a value, returning as DWordWL.
-    /// Returns (lo32, hi32) of the negated value.
-    fn neg_value(val: u64) -> (u64, u64) {
-        let neg = val.wrapping_neg();
-        (neg & 0xFFFF_FFFF, neg >> 32)
-    }
-
-    /// NEG of remainder.
-    pub fn neg_r(&self) -> (u64, u64) {
-        Self::neg_value(self.compute_remainder())
-    }
-
-    /// NEG of denominator.
-    pub fn neg_d(&self) -> (u64, u64) {
-        Self::neg_value(self.d)
-    }
 }
 
 // =========================================================================
@@ -340,8 +310,6 @@ pub fn generate_dvrm_trace(
         let n_sub_r = op.n_sub_r();
         let abs_r = op.abs_r();
         let abs_d = op.abs_d();
-        let (neg_r_0, neg_r_1) = op.neg_r();
-        let (neg_d_0, neg_d_1) = op.neg_d();
 
         // Fill n as DWordHL (4 halfwords)
         data[base + cols::N_0] = FE::from(op.n & 0xFFFF);
@@ -390,12 +358,6 @@ pub fn generate_dvrm_trace(
         data[base + cols::SIGN_D] = FE::from(op.sign_d() as u64);
         data[base + cols::SIGN_Q] = FE::from(op.sign_q() as u64);
         data[base + cols::SIGN_R] = FE::from(op.sign_r() as u64);
-
-        // NEG template auxiliary
-        data[base + cols::NEG_R_0] = FE::from(neg_r_0);
-        data[base + cols::NEG_R_1] = FE::from(neg_r_1);
-        data[base + cols::NEG_D_0] = FE::from(neg_d_0);
-        data[base + cols::NEG_D_1] = FE::from(neg_d_1);
 
         // Multiplicities
         data[base + cols::MU_Q] = FE::from(multiplicities.mu_q);
@@ -673,7 +635,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // =========================================================================
 
     // -------------------------------------------------------------------------
-    // DVRM-C3: NEG template for r → abs_r (when sign_r = 1)
+    // DVRM-C3: sign_r ⇒ NEG<abs_r; r>
+    // carry uses abs_r as the NEG output (abs_r = -r when sign_r = 1)
     // ZERO[1-carry_r[0]; r[0]+r[1]] with multiplicity sign_r
     // ZERO[1-carry_r[1]; r[0]+r[1]+r[2]+r[3]] with multiplicity sign_r
     // -------------------------------------------------------------------------
@@ -695,7 +658,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 LinearTerm::Constant(1),
                 LinearTerm::ColumnUnsigned {
                     coefficient: super::types::INV_2_32,
-                    column: cols::NEG_R_0,
+                    column: cols::ABS_R_0,
                 },
                 LinearTerm::ColumnUnsigned {
                     coefficient: super::types::INV_2_32,
@@ -735,7 +698,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 LinearTerm::Constant(1),
                 LinearTerm::ColumnUnsigned {
                     coefficient: super::types::INV_2_32,
-                    column: cols::NEG_R_1,
+                    column: cols::ABS_R_1,
                 },
                 LinearTerm::ColumnUnsigned {
                     coefficient: super::types::INV_2_32,
@@ -747,7 +710,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 },
                 LinearTerm::ColumnUnsigned {
                     coefficient: super::types::INV_2_32,
-                    column: cols::NEG_R_0,
+                    column: cols::ABS_R_0,
                 },
                 LinearTerm::ColumnUnsigned {
                     coefficient: super::types::INV_2_32,
@@ -762,8 +725,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // DVRM-C5: NEG template for d → abs_d (when sign_d = 1)
-    // Same pattern as C3 but for denominator
+    // DVRM-C5: sign_d ⇒ NEG<abs_d; d>
+    // carry uses abs_d as the NEG output (abs_d = -d when sign_d = 1)
     // -------------------------------------------------------------------------
     interactions.push(BusInteraction::sender(
         BusId::Zero,
@@ -783,7 +746,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 LinearTerm::Constant(1),
                 LinearTerm::ColumnUnsigned {
                     coefficient: super::types::INV_2_32,
-                    column: cols::NEG_D_0,
+                    column: cols::ABS_D_0,
                 },
                 LinearTerm::ColumnUnsigned {
                     coefficient: super::types::INV_2_32,
@@ -823,7 +786,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 LinearTerm::Constant(1),
                 LinearTerm::ColumnUnsigned {
                     coefficient: super::types::INV_2_32,
-                    column: cols::NEG_D_1,
+                    column: cols::ABS_D_1,
                 },
                 LinearTerm::ColumnUnsigned {
                     coefficient: super::types::INV_2_32,
@@ -835,7 +798,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 },
                 LinearTerm::ColumnUnsigned {
                     coefficient: super::types::INV_2_32,
-                    column: cols::NEG_D_0,
+                    column: cols::ABS_D_0,
                 },
                 LinearTerm::ColumnUnsigned {
                     coefficient: super::types::INV_2_32,

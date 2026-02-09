@@ -154,21 +154,6 @@ fn test_n_sub_r() {
 }
 
 #[test]
-fn test_neg_values() {
-    // neg(0) = 0
-    let op1 = DvrmOperation::new(100, 10, UNSIGNED); // r = 0
-    let (neg_r_0, neg_r_1) = op1.neg_r();
-    assert_eq!(neg_r_0, 0);
-    assert_eq!(neg_r_1, 0);
-
-    // neg(1) = 0xFFFFFFFF_FFFFFFFF (wrapping)
-    let op2 = DvrmOperation::new(7, 3, UNSIGNED); // r = 1
-    let (neg_r_0, neg_r_1) = op2.neg_r();
-    assert_eq!(neg_r_0, 0xFFFF_FFFF);
-    assert_eq!(neg_r_1, 0xFFFF_FFFF);
-}
-
-#[test]
 fn test_trace_generation() {
     let ops = vec![
         (DvrmOperation::new(100, 7, UNSIGNED), false), // wants_quotient (q=14, r=2)
