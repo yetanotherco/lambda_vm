@@ -5,10 +5,7 @@ use crate::{
     trace::TraceTable,
     traits::{AIR, TransitionEvaluationContext},
 };
-use math::field::{
-    element::FieldElement,
-    goldilocks::GoldilocksField,
-};
+use math::field::{element::FieldElement, goldilocks::GoldilocksField};
 
 type StarkField = GoldilocksField;
 type Felt252 = FieldElement<GoldilocksField>;

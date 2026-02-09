@@ -2,8 +2,8 @@
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::{
-    element::FieldElement,
-    extensions_goldilocks::Degree3GoldilocksExtensionField, goldilocks::GoldilocksField,
+    element::FieldElement, extensions_goldilocks::Degree3GoldilocksExtensionField,
+    goldilocks::GoldilocksField,
 };
 
 use crate::traits::AIR;

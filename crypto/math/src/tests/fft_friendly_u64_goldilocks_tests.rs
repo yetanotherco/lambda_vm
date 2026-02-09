@@ -1,6 +1,6 @@
 use crate::field::element::FieldElement;
 use crate::field::goldilocks::{
-    inv_addition_chain, GoldilocksElement, GoldilocksField, GOLDILOCKS_PRIME,
+    GOLDILOCKS_PRIME, GoldilocksElement, GoldilocksField, inv_addition_chain,
 };
 use crate::field::traits::{IsFFTField, IsField, IsPrimeField};
 use crate::traits::ByteConversion;
@@ -164,8 +164,7 @@ fn test_neg() {
 
 #[test]
 fn test_primitive_root() {
-    let root =
-        GoldilocksField::get_primitive_root_of_unity(GoldilocksField::TWO_ADICITY).unwrap();
+    let root = GoldilocksField::get_primitive_root_of_unity(GoldilocksField::TWO_ADICITY).unwrap();
     let mut result = *root.value();
     for _ in 0..32 {
         result = GoldilocksField::square(&result);

@@ -1,9 +1,7 @@
 #[cfg(test)]
 mod tests_u64_test_field {
     use crate::field::{
-        element::FieldElement,
-        test_fields::u64_test_field::U64TestField,
-        traits::IsPrimeField,
+        element::FieldElement, test_fields::u64_test_field::U64TestField, traits::IsPrimeField,
     };
 
     #[test]
@@ -23,8 +21,7 @@ mod tests_u64_test_field {
     #[test]
     fn test_to_subfield_vec() {
         use crate::field::{
-            extensions_goldilocks::Degree2GoldilocksExtensionField,
-            goldilocks::GoldilocksField,
+            extensions_goldilocks::Degree2GoldilocksExtensionField, goldilocks::GoldilocksField,
         };
 
         let a = FieldElement::<Degree2GoldilocksExtensionField>::from(&[

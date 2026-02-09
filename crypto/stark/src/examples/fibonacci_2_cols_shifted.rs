@@ -255,10 +255,7 @@ pub fn compute_trace<F: IsFFTField>(
 
 #[cfg(test)]
 mod tests {
-    use math::field::{
-        element::FieldElement,
-        goldilocks::GoldilocksField,
-    };
+    use math::field::{element::FieldElement, goldilocks::GoldilocksField};
 
     use super::compute_trace;
 
