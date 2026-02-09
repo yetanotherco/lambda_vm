@@ -110,7 +110,7 @@ class IdxExpr:
             reporter.error(f"Invalid index: {idx!r}")
             return Range(-1, -1)
         idxlit = idx.get_lit()
-        if not isinstance(base, list):
+        if isinstance(base, Range):
             reporter.error(f"Indexing into non-array type: {self!r}")
             return DEFAULT_TYPE
         if not (0 <= idxlit < len(base)):
@@ -144,7 +144,7 @@ class MulExpr:
         if isinstance(a, list) and isinstance(b, list):
             reporter.error(f"Multiplication of non-scalar types: {self!r}")
             return DEFAULT_TYPE
-        elif isinstance(a, list):
+        elif not isinstance(a, Range):
             return [self.type_match(x, b) for x in a]
         elif isinstance(b, list):
             return self.type_match(b, a)
