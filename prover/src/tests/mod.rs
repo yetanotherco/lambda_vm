@@ -11,6 +11,8 @@ pub mod constraints_tests;
 #[cfg(test)]
 pub mod cpu_tests;
 #[cfg(test)]
+pub mod dvrm_tests;
+#[cfg(test)]
 pub mod decode_tests;
 #[cfg(test)]
 pub mod lt_bus_tests;
