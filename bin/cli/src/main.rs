@@ -7,14 +7,14 @@ use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand, ValueEnum, ValueHint};
+use clap::{Parser, Subcommand, ValueHint};
 use executor::{
     elf::{Elf, SymbolTable},
     flamegraph::FlamegraphGenerator,
     vm::execution::Executor,
 };
 use sha3::{Digest, Sha3_256};
-use stark::proof::options::{ProofOptions, SecurityLevel};
+use stark::proof::options::ProofOptions;
 
 use proof_bundle::{PROOF_BUNDLE_VERSION, ProofBundle};
 
@@ -51,10 +51,6 @@ enum Commands {
         /// Output path for the proof bundle
         #[arg(short, long, value_hint = ValueHint::FilePath)]
         output: PathBuf,
-
-        /// Security level preset
-        #[arg(long, value_enum, default_value = "standard")]
-        security: SecurityPreset,
     },
 
     /// Verify a proof bundle
@@ -69,43 +65,12 @@ enum Commands {
     },
 }
 
-#[derive(Clone, Copy, ValueEnum)]
-enum SecurityPreset {
-    /// Conjecturable 100-bit security (development)
-    Fast,
-    /// Provable 100-bit security (default)
-    Standard,
-    /// Provable 128-bit security (production)
-    Maximum,
-}
-
-impl SecurityPreset {
-    fn to_proof_options(self) -> ProofOptions {
-        const COSET_OFFSET: u64 = 3;
-        match self {
-            SecurityPreset::Fast => {
-                ProofOptions::new_secure(SecurityLevel::Conjecturable100Bits, COSET_OFFSET)
-            }
-            SecurityPreset::Standard => {
-                ProofOptions::new_secure(SecurityLevel::Provable100Bits, COSET_OFFSET)
-            }
-            SecurityPreset::Maximum => {
-                ProofOptions::new_secure(SecurityLevel::Provable128Bits, COSET_OFFSET)
-            }
-        }
-    }
-}
-
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
     match cli.command {
         Commands::Execute { elf, flamegraph } => cmd_execute(elf, flamegraph),
-        Commands::Prove {
-            elf,
-            output,
-            security,
-        } => cmd_prove(elf, output, security),
+        Commands::Prove { elf, output } => cmd_prove(elf, output),
         Commands::Verify { proof, elf } => cmd_verify(proof, elf),
     }
 }
@@ -194,7 +159,7 @@ fn cmd_execute(elf_path: PathBuf, flamegraph_path: Option<PathBuf>) -> ExitCode 
     ExitCode::SUCCESS
 }
 
-fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, security: SecurityPreset) -> ExitCode {
+fn cmd_prove(elf_path: PathBuf, output_path: PathBuf) -> ExitCode {
     eprintln!("Reading ELF file...");
     let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
@@ -205,7 +170,7 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, security: SecurityPreset) 
     };
 
     let elf_hash: [u8; 32] = Sha3_256::digest(&elf_data).into();
-    let proof_options = security.to_proof_options();
+    let proof_options = ProofOptions::default_test_options();
 
     eprintln!("Generating proof (this may take a while)...");
     let multi_proof = match prover::prove_with_options(&elf_data, &proof_options) {
