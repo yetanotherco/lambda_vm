@@ -1624,11 +1624,7 @@ mod tests {
 
     use super::*;
     use math::{
-        field::{
-            element::FieldElement,
-            goldilocks::GoldilocksField,
-            traits::IsFFTField,
-        },
+        field::{element::FieldElement, goldilocks::GoldilocksField, traits::IsFFTField},
         polynomial::Polynomial,
     };
 
@@ -1723,5 +1719,4 @@ mod tests {
             assert_eq!(*eval, poly.evaluate(&(offset * primitive_root.pow(i))));
         }
     }
-
 }

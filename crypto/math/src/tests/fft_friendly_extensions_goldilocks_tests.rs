@@ -450,10 +450,7 @@ fn test_fp2_from_i64_positive() {
 fn test_fp2_from_i64_negative() {
     use crate::field::goldilocks::GOLDILOCKS_PRIME;
     let a = Fp2E::from_i64(-1);
-    assert_eq!(
-        a,
-        Fp2E::new([FpE::from(GOLDILOCKS_PRIME - 1), FpE::zero()])
-    );
+    assert_eq!(a, Fp2E::new([FpE::from(GOLDILOCKS_PRIME - 1), FpE::zero()]));
 }
 
 #[test]
@@ -466,10 +463,7 @@ fn test_fp2_from_i64_arithmetic() {
 #[test]
 fn test_fp3_from_i64_positive() {
     let a = Fp3E::from_i64(42);
-    assert_eq!(
-        a,
-        Fp3E::new([FpE::from(42u64), FpE::zero(), FpE::zero()])
-    );
+    assert_eq!(a, Fp3E::new([FpE::from(42u64), FpE::zero(), FpE::zero()]));
 }
 
 #[test]

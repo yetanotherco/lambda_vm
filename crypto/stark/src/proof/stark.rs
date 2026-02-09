@@ -5,10 +5,7 @@ use math::field::{
 };
 
 use crate::{
-    config::Commitment,
-    fri::fri_decommit::FriDecommitment,
-    lookup::BusPublicInputs,
-    table::Table,
+    config::Commitment, fri::fri_decommit::FriDecommitment, lookup::BusPublicInputs, table::Table,
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

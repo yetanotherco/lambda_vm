@@ -2,8 +2,8 @@
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::{
-    element::FieldElement,
-    extensions_goldilocks::Degree3GoldilocksExtensionField, goldilocks::GoldilocksField,
+    element::FieldElement, extensions_goldilocks::Degree3GoldilocksExtensionField,
+    goldilocks::GoldilocksField,
 };
 
 use crate::traits::AIR;
@@ -237,7 +237,8 @@ fn test_prove_dummy() {
 
     let air = DummyAIR::new(&proof_options);
 
-    let proof = Prover::prove(&air, &mut trace, &(), &mut DefaultTranscript::<F>::new(&[])).unwrap();
+    let proof =
+        Prover::prove(&air, &mut trace, &(), &mut DefaultTranscript::<F>::new(&[])).unwrap();
 
     assert!(Verifier::verify(
         &proof,
@@ -253,7 +254,8 @@ fn test_prove_bit_flags() {
 
     let air = BitFlagsAIR::new(&proof_options);
 
-    let proof = Prover::prove(&air, &mut trace, &(), &mut DefaultTranscript::<F>::new(&[])).unwrap();
+    let proof =
+        Prover::prove(&air, &mut trace, &(), &mut DefaultTranscript::<F>::new(&[])).unwrap();
 
     assert!(Verifier::verify(
         &proof,

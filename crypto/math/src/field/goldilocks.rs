@@ -14,8 +14,8 @@
 //! - Plonky2: <https://github.com/0xPolygonZero/plonky2>
 //! - Remco Bloemen: <https://xn--2-umb.com/23/gold-reduce/>
 
-use crate::field::{element::FieldElement, errors::FieldError, traits::IsField};
 use crate::field::traits::HasDefaultTranscript;
+use crate::field::{element::FieldElement, errors::FieldError, traits::IsField};
 use crate::traits::{AsBytes, ByteConversion};
 
 /// The Goldilocks prime: p = 2^64 - 2^32 + 1
