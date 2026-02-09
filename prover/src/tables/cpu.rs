@@ -1488,18 +1488,39 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::RES[0],
                 packing: Packing::DWordBL,
             },
-            // value[0..1] = arg2 packed as DWordBL → 2 elements [lo32, hi32]
+            // value[0..7] = arg2 bytes (8 individual Direct elements)
             BusValue::Packed {
                 start_column: cols::ARG2[0],
-                packing: Packing::DWordBL,
+                packing: Packing::Direct,
             },
-            // value[2..7] = 0 (unconstrained per team feedback)
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
+            BusValue::Packed {
+                start_column: cols::ARG2[1],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::ARG2[2],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::ARG2[3],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::ARG2[4],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::ARG2[5],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::ARG2[6],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::ARG2[7],
+                packing: Packing::Direct,
+            },
             // timestamp[0] = timestamp + 1, timestamp[1] = 0
             BusValue::linear(vec![
                 LinearTerm::Column {

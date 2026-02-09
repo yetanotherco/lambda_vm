@@ -241,57 +241,46 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // -------------------------------------------------------------------------
     // LOAD calls MEMW with is_register=0, passing res as both value and old
     // (since we're reading, value=old=the read data)
-    // RES columns contain bytes, reconstruct words via linear combination
-    // to match the MEMW Memory Read receiver format.
+    // RES columns contain individual bytes, sent as Direct elements
+    // to match the unified MEMW Read receiver format.
     interactions.push(BusInteraction::sender(
         BusId::Memw,
         Multiplicity::Column(cols::MU),
         vec![
-            // old[0] = lo32 = byte0 + 256*byte1 + 65536*byte2 + 16777216*byte3
-            BusValue::linear(vec![
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::RES[0],
-                },
-                LinearTerm::Column {
-                    coefficient: 256,
-                    column: cols::RES[1],
-                },
-                LinearTerm::Column {
-                    coefficient: 65536,
-                    column: cols::RES[2],
-                },
-                LinearTerm::Column {
-                    coefficient: 16777216,
-                    column: cols::RES[3],
-                },
-            ]),
-            // old[1] = hi32 = byte4 + 256*byte5 + 65536*byte6 + 16777216*byte7
-            BusValue::linear(vec![
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::RES[4],
-                },
-                LinearTerm::Column {
-                    coefficient: 256,
-                    column: cols::RES[5],
-                },
-                LinearTerm::Column {
-                    coefficient: 65536,
-                    column: cols::RES[6],
-                },
-                LinearTerm::Column {
-                    coefficient: 16777216,
-                    column: cols::RES[7],
-                },
-            ]),
-            // old[2..7] = 0
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
+            // old[0..7] = 8 individual bytes (Direct elements)
+            // For reads, old == value (same data read back)
+            BusValue::Packed {
+                start_column: cols::RES[0],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[1],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[2],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[3],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[4],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[5],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[6],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[7],
+                packing: Packing::Direct,
+            },
             // is_register = 0 (constant)
             BusValue::constant(0),
             // base_address (DWordWL = 2 words)
@@ -303,51 +292,39 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::BASE_ADDRESS_1,
                 packing: Packing::Direct,
             },
-            // value[0] = lo32 = byte0 + 256*byte1 + 65536*byte2 + 16777216*byte3
-            BusValue::linear(vec![
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::RES[0],
-                },
-                LinearTerm::Column {
-                    coefficient: 256,
-                    column: cols::RES[1],
-                },
-                LinearTerm::Column {
-                    coefficient: 65536,
-                    column: cols::RES[2],
-                },
-                LinearTerm::Column {
-                    coefficient: 16777216,
-                    column: cols::RES[3],
-                },
-            ]),
-            // value[1] = hi32 = byte4 + 256*byte5 + 65536*byte6 + 16777216*byte7
-            BusValue::linear(vec![
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::RES[4],
-                },
-                LinearTerm::Column {
-                    coefficient: 256,
-                    column: cols::RES[5],
-                },
-                LinearTerm::Column {
-                    coefficient: 65536,
-                    column: cols::RES[6],
-                },
-                LinearTerm::Column {
-                    coefficient: 16777216,
-                    column: cols::RES[7],
-                },
-            ]),
-            // value[2..7] = 0
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
-            BusValue::constant(0),
+            // value[0..7] = 8 individual bytes (Direct elements)
+            BusValue::Packed {
+                start_column: cols::RES[0],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[1],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[2],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[3],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[4],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[5],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[6],
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::RES[7],
+                packing: Packing::Direct,
+            },
             // timestamp (DWordWL = 2 words)
             BusValue::Packed {
                 start_column: cols::TIMESTAMP_0,

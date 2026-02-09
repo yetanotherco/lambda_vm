@@ -800,16 +800,6 @@ pub enum Multiplicity {
     /// ```
     Linear(Vec<LinearTerm>),
 
-    /// Product of two bit columns: `col_a * col_b`.
-    /// Both columns must contain only 0 or 1.
-    /// Useful for conditional interactions: fires only when both flags are set.
-    Product(usize, usize),
-
-    /// Product with negated second column: `col_a * (1 - col_b)`.
-    /// Both columns must contain only 0 or 1.
-    /// Useful when first flag is set but second flag is NOT set.
-    /// Example: `MU_READ * (1 - IS_REGISTER)` for memory read operations.
-    ProductNegated(usize, usize),
 }
 
 /// Struct representing a lookup interaction for a given table.
@@ -1043,14 +1033,6 @@ fn build_logup_term_column<F, E>(
                 }
                 result
             }
-            Multiplicity::Product(col_a, col_b) => {
-                &main_segment_cols[*col_a][row] * &main_segment_cols[*col_b][row]
-            }
-            Multiplicity::ProductNegated(col_a, col_b) => {
-                // col_a * (1 - col_b)
-                &main_segment_cols[*col_a][row]
-                    * (FieldElement::<F>::one() - &main_segment_cols[*col_b][row])
-            }
         };
 
         // Bus elements: [bus_id, ...values...]
@@ -1274,15 +1256,6 @@ where
                         }
                     }
                     result
-                }
-                Multiplicity::Product(col_a, col_b) => {
-                    step.get_main_evaluation_element(0, *col_a)
-                        * step.get_main_evaluation_element(0, *col_b)
-                }
-                Multiplicity::ProductNegated(col_a, col_b) => {
-                    // col_a * (1 - col_b)
-                    step.get_main_evaluation_element(0, *col_a)
-                        * (FieldElement::<A>::one() - step.get_main_evaluation_element(0, *col_b))
                 }
             };
 
