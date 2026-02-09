@@ -585,7 +585,7 @@ fn collect_bitwise_from_mul(mul_ops: &[(MulOperation, bool)]) -> Vec<BitwiseOper
     // not per raw op.
     let mut msb16_seen = std::collections::HashSet::new();
     for (op, _wants_hi) in mul_ops {
-        if msb16_seen.insert(op.clone()) {
+        if msb16_seen.insert((op.lhs, op.lhs_signed, op.rhs, op.rhs_signed)) {
             if op.lhs_signed {
                 let lhs_3 = ((op.lhs >> 48) & 0xFFFF) as u16;
                 bitwise_ops.push(BitwiseOperation::halfword(
