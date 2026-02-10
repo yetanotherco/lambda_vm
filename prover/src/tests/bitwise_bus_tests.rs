@@ -182,7 +182,7 @@ fn prove_and_verify(sender_lookups: &[(u8, u8, u8)]) -> bool {
     let mut sender_trace = create_sender_trace(sender_lookups);
     let mut receiver_trace = create_receiver_trace(sender_lookups);
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
     let sender_air = new_sender_air(&proof_options);
     let receiver_air = new_receiver_air(&proof_options);
 
@@ -287,7 +287,7 @@ fn prove_and_verify_custom(
     let mut sender_trace = create_sender_trace(sender_lookups);
     let mut receiver_trace = create_custom_receiver_trace(receiver_rows);
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
     let sender_air = new_sender_air(&proof_options);
     let receiver_air = new_receiver_air(&proof_options);
 

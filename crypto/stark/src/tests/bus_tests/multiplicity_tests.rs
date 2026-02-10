@@ -99,7 +99,7 @@ fn test_multiplicity_one() {
         1,
     );
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
     let sender = sender_air(&proof_options);
     let receiver = receiver_air(&proof_options);
 
@@ -204,7 +204,7 @@ fn test_multiplicity_sum() {
         1,
     );
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
     let sender = sender_air(&proof_options);
     let receiver = receiver_air(&proof_options);
 
@@ -307,7 +307,7 @@ fn test_multiplicity_negated() {
         1,
     );
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
     let sender = sender_air(&proof_options);
     let receiver = receiver_air(&proof_options);
 

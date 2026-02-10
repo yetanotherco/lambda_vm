@@ -118,7 +118,7 @@ fn test_verify_serialized_multi_table_proofs() {
         let mut mul_trace =
             crate::trace::TraceTable::from_columns_main(vec![mul_a, mul_b, mul_c, mul_m], 1);
 
-        let proof_options = ProofOptions::default_test_options();
+        let proof_options = ProofOptions::default();
 
         // Create AIRs - prover passes num_main_columns from trace
         let cpu_air = create_cpu_air(&proof_options);
@@ -157,7 +157,7 @@ fn test_verify_serialized_multi_table_proofs() {
     // The verifier knows the AIR structure (columns, interactions) as part of
     // the protocol definition.
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
 
     // Reconstruct AIRs - verifier knows the structure
     let cpu_air = create_cpu_air(&proof_options);

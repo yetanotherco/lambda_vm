@@ -641,7 +641,7 @@ fn test_compute_precomputed_commitment_deterministic() {
         },
     );
 
-    let options = ProofOptions::default_test_options();
+    let options = ProofOptions::default();
 
     let commitment1 = compute_precomputed_commitment(&instructions, &options);
     let commitment2 = compute_precomputed_commitment(&instructions, &options);
@@ -657,7 +657,7 @@ fn test_compute_precomputed_commitment_different_programs() {
     use crate::tables::decode::compute_precomputed_commitment;
     use stark::proof::options::ProofOptions;
 
-    let options = ProofOptions::default_test_options();
+    let options = ProofOptions::default();
 
     // Program A: ADD instruction
     let mut program_a = U64HashMap::default();
@@ -697,7 +697,7 @@ fn test_compute_precomputed_commitment_different_pc() {
     use crate::tables::decode::compute_precomputed_commitment;
     use stark::proof::options::ProofOptions;
 
-    let options = ProofOptions::default_test_options();
+    let options = ProofOptions::default();
 
     // Program A: instruction at PC 0x1000
     let mut program_a = U64HashMap::default();
@@ -883,7 +883,7 @@ fn test_decode_soundness_different_elf_rejected() {
     type F = GoldilocksField;
     type E = GoldilocksExtension;
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
 
     // Load two DIFFERENT ELF files
     let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -1012,7 +1012,7 @@ fn test_decode_soundness_same_elf_accepted() {
     type F = GoldilocksField;
     type E = GoldilocksExtension;
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
 
     // Load the SAME ELF for both prover and verifier
     let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));

@@ -577,7 +577,7 @@ mod soundness_tests {
         let mut sender_trace = create_sender_trace(x, y, correct_result);
         let mut receiver_trace = create_honest_receiver_trace(x, y);
 
-        let proof_options = ProofOptions::default_test_options();
+        let proof_options = ProofOptions::default();
         let sender_air = create_sender_air(&proof_options);
         let receiver_air = create_receiver_air(&proof_options);
 
@@ -620,7 +620,7 @@ mod soundness_tests {
         let mut sender_trace = create_sender_trace(x, y, fake_result);
         let mut receiver_trace = create_malicious_receiver_trace(x, y, fake_result);
 
-        let proof_options = ProofOptions::default_test_options();
+        let proof_options = ProofOptions::default();
         let sender_air = create_sender_air(&proof_options);
         // NOT using preprocessed - verifier trusts proof's commitment
         let receiver_air = create_receiver_air(&proof_options);
@@ -665,7 +665,7 @@ mod soundness_tests {
         let y = 3u8;
         let fake_result = 99u8; // WRONG! Real answer is 5 & 3 = 1
 
-        let proof_options = ProofOptions::default_test_options();
+        let proof_options = ProofOptions::default();
 
         // Compute commitment to the HONEST table (what verifier expects)
         let honest_trace = create_honest_receiver_trace(x, y);

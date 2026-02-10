@@ -316,7 +316,7 @@ fn test_air_layout_single_interaction() {
         interactions: vec![interaction],
     };
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
     let air = AirWithBuses::<F, E, NullBoundaryConstraintBuilder, ()>::new(
         4,
         build_data,
@@ -347,7 +347,7 @@ fn test_air_layout_multiple_interactions() {
         interactions: vec![interaction1, interaction2],
     };
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
     let air = AirWithBuses::<F, E, NullBoundaryConstraintBuilder, ()>::new(
         5,
         build_data,

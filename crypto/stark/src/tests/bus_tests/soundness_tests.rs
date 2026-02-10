@@ -63,7 +63,7 @@ fn test_wrong_result_value() {
         1,
     );
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
     let cpu_air = new_cpu_air_with_lookup(&proof_options);
     let add_air = new_add_air_with_lookup(&proof_options);
     let mul_air = new_mul_air_with_lookup(&proof_options);
@@ -125,7 +125,7 @@ fn test_off_by_one() {
         1,
     );
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
     let cpu_air = new_cpu_air_with_lookup(&proof_options);
     let add_air = new_add_air_with_lookup(&proof_options);
     let mul_air = new_mul_air_with_lookup(&proof_options);
@@ -187,7 +187,7 @@ fn test_swapped_operands() {
         1,
     );
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
     let cpu_air = new_cpu_air_with_lookup(&proof_options);
     let add_air = new_add_air_with_lookup(&proof_options);
     let mul_air = new_mul_air_with_lookup(&proof_options);
@@ -249,7 +249,7 @@ fn test_single_column_wrong() {
         1,
     );
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
     let cpu_air = new_cpu_air_with_lookup(&proof_options);
     let add_air = new_add_air_with_lookup(&proof_options);
     let mul_air = new_mul_air_with_lookup(&proof_options);
@@ -315,7 +315,7 @@ fn test_over_report_multiplicity() {
         1,
     );
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
     let cpu_air = new_cpu_air_with_lookup(&proof_options);
     let add_air = new_add_air_with_lookup(&proof_options);
     let mul_air = new_mul_air_with_lookup(&proof_options);
@@ -377,7 +377,7 @@ fn test_under_report_multiplicity() {
         1,
     );
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
     let cpu_air = new_cpu_air_with_lookup(&proof_options);
     let add_air = new_add_air_with_lookup(&proof_options);
     let mul_air = new_mul_air_with_lookup(&proof_options);
@@ -439,7 +439,7 @@ fn test_zero_multiplicity_skip() {
         1,
     );
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
     let cpu_air = new_cpu_air_with_lookup(&proof_options);
     let add_air = new_add_air_with_lookup(&proof_options);
     let mul_air = new_mul_air_with_lookup(&proof_options);
@@ -505,7 +505,7 @@ fn test_phantom_receive() {
         1,
     );
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
     let cpu_air = new_cpu_air_with_lookup(&proof_options);
     let add_air = new_add_air_with_lookup(&proof_options);
     let mul_air = new_mul_air_with_lookup(&proof_options);
@@ -567,7 +567,7 @@ fn test_missing_receiver() {
         1,
     );
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
     let cpu_air = new_cpu_air_with_lookup(&proof_options);
     let add_air = new_add_air_with_lookup(&proof_options);
     let mul_air = new_mul_air_with_lookup(&proof_options);
@@ -633,7 +633,7 @@ fn test_one_of_many_wrong() {
         1,
     );
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
     let cpu_air = new_cpu_air_with_lookup(&proof_options);
     let add_air = new_add_air_with_lookup(&proof_options);
     let mul_air = new_mul_air_with_lookup(&proof_options);
@@ -740,7 +740,7 @@ fn test_full_scenario_wrong_add() {
         1,
     );
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
     let cpu_air = new_cpu_air_with_lookup(&proof_options);
     let add_air = new_add_air_with_lookup(&proof_options);
     let mul_air = new_mul_air_with_lookup(&proof_options);
@@ -813,7 +813,7 @@ fn test_wrong_table_consumes_value_rejected() {
         1,
     );
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
     let cpu_air = new_cpu_air_with_lookup(&proof_options);
     let add_air = new_add_air_with_lookup(&proof_options);
     let mul_air = new_mul_air_with_lookup(&proof_options);
@@ -926,7 +926,7 @@ fn test_packing_mismatch_direct_vs_word2l() {
         1,
     );
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
     let sender = sender_air_direct(&proof_options);
     let receiver = receiver_air_word2l(&proof_options);
 
@@ -1026,7 +1026,7 @@ fn test_packing_mismatch_element_count() {
         1,
     );
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
     let sender = sender_air_3_direct(&proof_options);
     let receiver = receiver_air_word2l_direct(&proof_options);
 
@@ -1123,7 +1123,7 @@ fn test_packing_mismatch_shift_constant() {
         1,
     );
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
     let sender = sender_air_word4l(&proof_options);
     let receiver = receiver_air_dwordhl(&proof_options);
 
@@ -1221,7 +1221,7 @@ fn test_compound_mismatch_dwordhhw_vs_dwordwhh() {
     // Receiver DWordWHH: [0x1000 + 0x2000*2^16, 0x3000] = [0x20001000, 0x3000]
     // Completely different bus elements!
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
     let sender = sender_air_dwordhhw(&proof_options);
     let receiver = receiver_air_dwordwhh(&proof_options);
 
@@ -1309,7 +1309,7 @@ fn test_compound_equals_primitive_expansion() {
         1,
     );
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
     let sender = sender_air_compound(&proof_options);
     let receiver = receiver_air_primitives(&proof_options);
 
@@ -1418,7 +1418,7 @@ fn test_full_scenario_wrong_mul() {
         1,
     );
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
     let cpu_air = new_cpu_air_with_lookup(&proof_options);
     let add_air = new_add_air_with_lookup(&proof_options);
     let mul_air = new_mul_air_with_lookup(&proof_options);

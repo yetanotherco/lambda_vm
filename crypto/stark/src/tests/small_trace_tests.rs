@@ -24,7 +24,7 @@ type Felt252 = FieldElement<Stark252PrimeField>;
 fn test_prove_verify_single_row() {
     let mut trace = simple_addition_trace::<Stark252PrimeField>(1);
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
 
     // For row 0: col0=1, col1=2, col2=3 (1+2=3)
     let pub_inputs = SimpleAdditionPublicInputs {
@@ -54,7 +54,7 @@ fn test_prove_verify_single_row() {
 fn test_prove_verify_two_rows() {
     let mut trace = simple_addition_trace::<Stark252PrimeField>(2);
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
 
     // For row 0: col0=1, col1=2, col2=3 (1+2=3)
     let pub_inputs = SimpleAdditionPublicInputs {
@@ -84,7 +84,7 @@ fn test_prove_verify_two_rows() {
 fn test_verify_fails_with_wrong_inputs() {
     let mut trace = simple_addition_trace::<Stark252PrimeField>(2);
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
 
     // Correct public inputs for proving
     let correct_pub_inputs = SimpleAdditionPublicInputs {

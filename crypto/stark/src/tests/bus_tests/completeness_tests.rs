@@ -106,7 +106,7 @@ fn test_multi_table_proof() {
         1,
     );
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
     let cpu_air = new_cpu_air_with_lookup(&proof_options);
     let add_air = new_add_air_with_lookup(&proof_options);
     let mul_air = new_mul_air_with_lookup(&proof_options);
@@ -168,7 +168,7 @@ fn test_all_padding() {
         1,
     );
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
     let cpu_air = new_cpu_air_with_lookup(&proof_options);
     let add_air = new_add_air_with_lookup(&proof_options);
     let mul_air = new_mul_air_with_lookup(&proof_options);
@@ -230,7 +230,7 @@ fn test_single_operation() {
         1,
     );
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
     let cpu_air = new_cpu_air_with_lookup(&proof_options);
     let add_air = new_add_air_with_lookup(&proof_options);
     let mul_air = new_mul_air_with_lookup(&proof_options);
@@ -292,7 +292,7 @@ fn test_duplicate_operations() {
         1,
     );
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
     let cpu_air = new_cpu_air_with_lookup(&proof_options);
     let add_air = new_add_air_with_lookup(&proof_options);
     let mul_air = new_mul_air_with_lookup(&proof_options);
@@ -354,7 +354,7 @@ fn test_serialization_roundtrip() {
         1,
     );
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
     let cpu_air = new_cpu_air_with_lookup(&proof_options);
     let add_air = new_add_air_with_lookup(&proof_options);
     let mul_air = new_mul_air_with_lookup(&proof_options);
@@ -421,7 +421,7 @@ fn test_bus_value_features() {
                 values,
             )],
         };
-        let proof_options = ProofOptions::default_test_options();
+        let proof_options = ProofOptions::default();
         AirWithBuses::<F, E, NullBoundaryConstraintBuilder, ()>::new(
             5,
             build_data,
@@ -450,7 +450,7 @@ fn test_bus_value_features() {
                 values,
             )],
         };
-        let proof_options = ProofOptions::default_test_options();
+        let proof_options = ProofOptions::default();
         AirWithBuses::<F, E, NullBoundaryConstraintBuilder, ()>::new(
             5,
             build_data,

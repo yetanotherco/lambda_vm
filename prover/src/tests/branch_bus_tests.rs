@@ -325,7 +325,7 @@ fn prove_and_verify(ops: &[BranchOperation]) -> bool {
     let mut sender_trace = create_sender_trace(ops);
     let mut receiver_trace = create_receiver_trace(ops);
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
     let sender_air = new_sender_air(&proof_options);
     let receiver_air = new_receiver_air(&proof_options);
 
@@ -410,7 +410,7 @@ fn prove_and_verify_custom(ops: &[BranchOperation], receiver_rows: &[CustomBranc
     let mut sender_trace = create_sender_trace(ops);
     let mut receiver_trace = create_custom_receiver_trace(receiver_rows);
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
     let sender_air = new_sender_air(&proof_options);
     let receiver_air = new_receiver_air(&proof_options);
 

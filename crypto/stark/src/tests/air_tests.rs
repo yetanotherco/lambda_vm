@@ -40,7 +40,7 @@ use crate::examples::read_only_memory_logup::{
 fn test_prove_fib() {
     let mut trace = simple_fibonacci::fibonacci_trace([Felt252::from(1), Felt252::from(1)], 8);
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
 
     let pub_inputs = FibonacciPublicInputs {
         a0: Felt252::one(),
@@ -67,7 +67,7 @@ fn test_prove_fib() {
 fn test_prove_simple_periodic_8() {
     let mut trace = simple_periodic_cols::simple_periodic_trace::<Stark252PrimeField>(8);
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
 
     let pub_inputs = SimplePeriodicPublicInputs {
         a0: Felt252::one(),
@@ -94,7 +94,7 @@ fn test_prove_simple_periodic_8() {
 fn test_prove_simple_periodic_32() {
     let mut trace = simple_periodic_cols::simple_periodic_trace::<Stark252PrimeField>(32);
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
 
     let pub_inputs = SimplePeriodicPublicInputs {
         a0: Felt252::one(),
@@ -122,7 +122,7 @@ fn test_prove_simple_periodic_32() {
 fn test_prove_fib_2_cols() {
     let mut trace = fibonacci_2_columns::compute_trace([Felt252::from(1), Felt252::from(1)], 16);
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
     let pub_inputs = FibonacciPublicInputs {
         a0: Felt252::one(),
         a1: Felt252::one(),
@@ -151,7 +151,7 @@ fn test_prove_fib_2_cols_shifted() {
 
     let claimed_index = 14;
     let claimed_value = trace.main_table.get_row(claimed_index)[0];
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
 
     let pub_inputs = fibonacci_2_cols_shifted::PublicInputs {
         claimed_value,
@@ -179,7 +179,7 @@ fn test_prove_fib_2_cols_shifted() {
 fn test_prove_quadratic() {
     let mut trace = quadratic_air::quadratic_trace(Felt252::from(3), 32);
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
 
     let pub_inputs = QuadraticPublicInputs {
         a0: Felt252::from(3),
@@ -207,7 +207,7 @@ fn test_prove_rap_fib() {
     let steps = 16;
     let mut trace = fibonacci_rap_trace([Felt252::from(1), Felt252::from(1)], steps);
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
 
     let pub_inputs = FibonacciRAPPublicInputs {
         steps,
@@ -237,7 +237,7 @@ fn test_prove_dummy() {
     let trace_length = 16;
     let mut trace = dummy_air::dummy_trace(trace_length);
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
 
     let air = DummyAIR::new(&proof_options);
 
@@ -253,7 +253,7 @@ fn test_prove_dummy() {
 #[test_log::test]
 fn test_prove_bit_flags() {
     let mut trace = bit_flags::bit_prefix_flag_trace(32);
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
 
     let air = BitFlagsAIR::new(&proof_options);
 
@@ -296,7 +296,7 @@ fn test_prove_read_only_memory() {
         v_sorted0: FieldElement::<Stark252PrimeField>::from(7), // v6
     };
     let mut trace = sort_rap_trace(address_col, value_col);
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
 
     let air = ReadOnlyRAP::<Stark252PrimeField>::new(&proof_options);
 
@@ -346,7 +346,7 @@ fn test_prove_log_read_only_memory() {
         m0: FieldElement::<Babybear31PrimeField>::from(1),
     };
     let mut trace = read_only_logup_trace(address_col, value_col);
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
 
     let air =
         LogReadOnlyRAP::<Babybear31PrimeField, Degree4BabyBearExtensionField>::new(&proof_options);
@@ -371,7 +371,7 @@ fn test_multi_prove_fib_3_tables() {
     let mut trace_1 = simple_fibonacci::fibonacci_trace([Felt252::from(1), Felt252::from(1)], 8);
     let mut trace_2 = simple_fibonacci::fibonacci_trace([Felt252::from(1), Felt252::from(1)], 16);
     let mut trace_3 = simple_fibonacci::fibonacci_trace([Felt252::from(1), Felt252::from(1)], 32);
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
 
     let pub_inputs_1 = FibonacciPublicInputs {
         a0: Felt252::one(),
@@ -483,7 +483,7 @@ fn test_multi_prove_2_tables_small_field() {
 
     let mut trace_1 = read_only_logup_trace(address_col_1, value_col_1);
     let mut trace_2 = read_only_logup_trace(address_col_2, value_col_2);
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
 
     let air_1 =
         LogReadOnlyRAP::<Babybear31PrimeField, Degree4BabyBearExtensionField>::new(&proof_options);
@@ -528,7 +528,7 @@ fn test_multi_prove_2_tables_small_field() {
 fn test_multi_prove_different_airs() {
     let mut trace_1 = dummy_air::dummy_trace(16);
     let mut trace_2 = bit_flags::bit_prefix_flag_trace(32);
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
 
     let air_1 = DummyAIR::new(&proof_options);
     let air_2 = BitFlagsAIR::new(&proof_options);
@@ -560,7 +560,7 @@ type GoldilocksFE = FieldElement<GoldilocksField>;
 
 #[test]
 fn test_multi_column_fibonacci_2_cols() {
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
     let num_columns = 2;
     let trace_length = 16;
 
@@ -601,7 +601,7 @@ fn test_multi_column_fibonacci_2_cols() {
 
 #[test]
 fn test_multi_column_fibonacci_4_cols() {
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
     let num_columns = 4;
     let trace_length = 16;
 
