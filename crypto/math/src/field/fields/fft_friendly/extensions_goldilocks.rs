@@ -467,7 +467,7 @@ mod tests {
     fn test_fp2_add() {
         let a = Fp2E::new([FpE::from(3u64), FpE::from(4u64)]);
         let b = Fp2E::new([FpE::from(1u64), FpE::from(2u64)]);
-        let c = a + b;
+        let c = &a + &b;
         assert_eq!(c.value()[0], FpE::from(4u64));
         assert_eq!(c.value()[1], FpE::from(6u64));
     }
@@ -477,7 +477,7 @@ mod tests {
         let a = Fp2E::new([FpE::from(3u64), FpE::from(4u64)]);
         let b = Fp2E::new([FpE::from(1u64), FpE::from(2u64)]);
         // (3 + 4w)(1 + 2w) = 3 + 6w + 4w + 8w^2 = 3 + 10w + 8*7 = 59 + 10w
-        let c = a * b;
+        let c = &a * &b;
         assert_eq!(c.value()[0], FpE::from(59u64));
         assert_eq!(c.value()[1], FpE::from(10u64));
     }
@@ -486,7 +486,7 @@ mod tests {
     fn test_fp2_inv() {
         let a = Fp2E::new([FpE::from(3u64), FpE::from(4u64)]);
         let a_inv = a.inv().unwrap();
-        let product = a * a_inv;
+        let product = &a * &a_inv;
         assert_eq!(product, Fp2E::one());
     }
 
@@ -494,7 +494,7 @@ mod tests {
     fn test_fp3_add() {
         let a = Fp3E::new([FpE::from(1u64), FpE::from(2u64), FpE::from(3u64)]);
         let b = Fp3E::new([FpE::from(4u64), FpE::from(5u64), FpE::from(6u64)]);
-        let c = a + b;
+        let c = &a + &b;
         assert_eq!(c.value()[0], FpE::from(5u64));
         assert_eq!(c.value()[1], FpE::from(7u64));
         assert_eq!(c.value()[2], FpE::from(9u64));
@@ -504,9 +504,9 @@ mod tests {
     fn test_fp3_mul() {
         let a = Fp3E::new([FpE::from(1u64), FpE::from(2u64), FpE::from(3u64)]);
         let b = Fp3E::new([FpE::from(4u64), FpE::from(5u64), FpE::from(6u64)]);
-        let c = a * b;
+        let c = &a * &b;
         // Verify by computing inverse
-        let c_div_a = c * a.inv().unwrap();
+        let c_div_a = &c * &a.inv().unwrap();
         assert_eq!(c_div_a, b);
     }
 
@@ -514,7 +514,7 @@ mod tests {
     fn test_fp3_inv() {
         let a = Fp3E::new([FpE::from(1u64), FpE::from(2u64), FpE::from(3u64)]);
         let a_inv = a.inv().unwrap();
-        let product = a * a_inv;
+        let product = &a * &a_inv;
         assert_eq!(product, Fp3E::one());
     }
 
