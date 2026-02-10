@@ -83,12 +83,10 @@ In this VM, committing is considered equivalent to writing a value to `stdout`.
 Hence, this chip responds to `ECALL`s with system call number 64.
 #footnote([RISC-V GNU-toolchain, `unistd.h`; version 2026-01-23, #link("https://github.com/riscv-collab/riscv-gnu-toolchain/blob/2026.01.23/linux-headers/include/asm-generic/unistd.h#L174")[[src]]])
 Since we do not know how many bytes are to be committed, this chip employs a recursive design:
-each iteration commits one byte, and recursively "call" itself to commit the remaining bytes.
+each iteration commits one byte, and recursively "calls" itself to commit the remaining bytes.
 As such, only the call from the CPU to this chip (i.e., the `first` in the recursion tree) should accept the `ECALL`; later recursive calls should not.
 This is why @commit:c:receive_ecall has multiplicity $-#`first`$.
 #render_constraint_table(chip, config, groups: "incoming")
-*Note*: the prover is free to specify the value of `first` as they see fit; @commit:c:range_first only makes sure it must be a `Bit`.
-Also, `first` being set must imply that that this is not a padding row (@commit:c:first_implies_mu).
 
 The `write` operation --- writing to a file descriptor --- has the following signature:
 #footnote([Linux man-page on `write`; man7.org, version 6.16, 2025-10-29. #link("https://man7.org/linux/man-pages/man2/write.2.html")[[src]]])
@@ -104,33 +102,53 @@ That is to say,
 - `A2` contains `count`, and
 - the written count should be written to `A0`.
 
+@commit:c:read_address reads `address` from `x11` (=`A1`) and @commit:c:read_count reads `count` from `x12` (=`A2`).
 Since we only support writing to `stdout` (which corresponds to $#`fd` = 1$
 #footnote([The Open Group Standard for Information Technology --- Portable Operating System Interface (POSIX) Base Specifications, `unistd.h`; The Open Group, issue 8, #link("https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/unistd.h.html")[[src]]]))
 we assert that `x10` contains $1$ in @commit:c:read_fd_write_count.
 Note that this constraint _also_ writes `count` to `A0`; 
 in this VM it is impossible for a commit to be interrupted or fail.
-Furthermore, @commit:c:read_address reads `address` from `x11` and @commit:c:read_count reads `count` from `x12`.
-Again, these memory interactions only take place when this is the `first` call in the recursion tree.
+Lastly, the `index` is read from `x254`#footnote([In this VM, register 254 is reserved for containing the commitment index.]); in the same operation, $#`index` + #`count`$ is written back to this location by @commit:c:read_index.
+This, too, leverages the fact that a commit will not be interrupted or fail to update the `index` for the next commit sequence.
+Again, each of these memory interactions only take place when this is the `first` call in the recursion tree.
+
 #render_constraint_table(chip, config, groups: "read_input")
 
-Next, we read the `value` located at buffer address `address` and commit to it:
+*Note*: the observant reader will notice that @commit:c:read_index casts `count` to a `BaseField`, potentiallly losing information.
+This is indeed correct.
+However, since it is practically impossible to commit more than $2^64-2^32$ bytes in a single VM execution, it was decided to permit this.
+
+Next, we read the `value` located at buffer address `address` and commit to it under the given `index`.
+This is only performed when we have not yet reached the `end` of the commit sequence.
 #render_constraint_table(chip, config, groups: "commit")
 
-In parallel, we compute $#`address_incr` = #`address` + 1$ (@commit:c:address_incr) as address of the next byte to commit, and $#`count_decr` = #`count` - 1$ (@commit:c:count_decr) as the number of bytes that still has to be committed.
+In parallel, we compute $#`address_incr` = #`address` + 1$ (@commit:c:address_incr) as address of the next byte to commit, and $#`count_decr` = #`count` - 1$ (@commit:c:count_decr) as the number of bytes that still has to be committed after committing this byte.
+Both of these constraints are only required when $#`μ` = 1$, to permit a simpler padding configuration.
 @commit:c:range_address_incr and @commit:c:range_count_decr are included to satisfy @add:a:sum respectively @add:a:rhs.
 #render_constraint_table(chip, config, groups: "incr_decr")
 
-When `count_decr` (the number of bytes still to be committed) hits $0$, we should stop recursing.
-To this end, `last` is set when this is the case (@commit:c:last).
-To prevent undesired lookups from occurring, `last` should only be set when we're not padding (@commit:c:last_implies_mu).
-Also, we must make sure `mu` is a bit (@commit:c:range_mu).
-#render_constraint_table(chip, config, groups: "last")
+When `count` hits $0$, we should performing further recursive calls.
+We use the `end` bit to indicate these circumstances.
 
-Lastly, when this was not the `last` byte to commit in this recursion sequence, we recursively _Commit the Next Byte_ (`CNB`), specifying the timestamp, address to continue reading and the number of bytes that should still be committed (@commit:c:send_commit_next_byte).
+#render_constraint_table(chip, config, groups: "end")
+
+*Note*: 
++ Rather than setting $#`end` = 1$ when $#`count` = 0$, we do so $#`count_decr` = -1$.
+  This technique allows `count` to be stored in a `DWordWL` rather than a `DWordHL`, saving two columns.
++ $forall i in [0, 3]: 65535 - #`count_decr`_i >= 0$ as a result of @commit:c:range_count_decr.
+ Hence, 
+  $
+  sum_(i=0)^3 65535 - #`count_decr`_i = 0 arrow.l.r.double.long forall i in [0, 3]: #`count_decr`_i = 65535
+  $
+
+When this was not the `end` byte to commit in this recursion sequence, we recursively _Commit the Next Byte_ (`CNB`), specifying the timestamp, address to continue reading and the number of bytes that should still be committed (@commit:c:send_commit_next_byte).
 Since that certainly won't be the `first` call in the sequence, we read `address_incr` and `count_decr` from the previous recursion level into `address` and `count` and continue executing the commit.
 #render_constraint_table(chip, config, groups: "lookups")
 
+Lastly, we must make sure `first`, `end` and `μ` are bits (@commit:c:range_first, @commit:c:range_end, @commit:c:range_mu), and that when either $#`first` = 1$ or $#`end` = 1$ imply that $#`μ` = 1$ (@commit:c:first_or_end_implies_mu).
+These are required to ensure the multiplicities $#`first` - #`μ`$ and $#`μ` - #`end`$ are binary.
+#render_constraint_table(chip, config, groups: "bits")
+
 == Padding
 To pad this chip, use the below data.
-This corresponds to committing a $0$ from address $0$.
 #render_chip_padding_table(chip, config)
