@@ -33,7 +33,7 @@ ref = "halt:c:read_zero_exit_code"
 [[constraints.all]]
 kind = "interaction"
 tag = "MEMW"
-input = [1, ["cast", ["*", 2, "i"], "DWordWL"], ["cast", 0, ["Byte", 8]], ["cast", ["-", ["^", 2, 64], 1], "DWordWL"], 1, 0, 0]
+input = [1, ["cast", ["*", 2, "i"], "DWordWL"], ["cast", 0, ["BaseField", 8]], ["cast", ["-", ["^", 2, 64], 1], "DWordWL"], 1, 0, 0]
 iter = ["i", 11, 31]
 multiplicity = 1
 ref = "halt:c:zeroize_registers_hi"
