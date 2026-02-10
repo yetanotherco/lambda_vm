@@ -24,7 +24,7 @@ use crate::fri;
 use crate::lookup::LOGUP_NUM_CHALLENGES;
 use crate::proof::stark::{DeepPolynomialOpenings, PolynomialOpenings};
 use crate::table::Table;
-use crate::trace::{LDETraceTable, columns2rows};
+use crate::trace::{LDETraceTable, columns2rows, columns2rows_ref};
 
 use super::config::{BatchedMerkleTree, Commitment};
 use super::constraints::evaluator::ConstraintEvaluator;
@@ -306,19 +306,19 @@ pub trait IsStarkProver<
         let trace_polys = trace.compute_trace_polys_main::<Field>();
 
         // Evaluate those polynomials t_j on the large domain D_LDE.
-        let lde_trace_evaluations =
+        let mut lde_trace_evaluations =
             Self::compute_lde_trace_evaluations::<Field>(&trace_polys, domain);
 
-        let mut lde_trace_permuted = lde_trace_evaluations.clone();
-        for col in lde_trace_permuted.iter_mut() {
+        // Permute in-place, commit, then restore natural order.
+        for col in lde_trace_evaluations.iter_mut() {
             in_place_bit_reverse_permute(col);
         }
-
-        // Compute commitment.
-        let lde_trace_permuted_rows = columns2rows(lde_trace_permuted);
-
+        let lde_trace_permuted_rows = columns2rows_ref(&lde_trace_evaluations);
         let (lde_trace_merkle_tree, lde_trace_merkle_root) =
             Self::batch_commit_main(&lde_trace_permuted_rows)?;
+        for col in lde_trace_evaluations.iter_mut() {
+            in_place_bit_reverse_permute(col);
+        }
 
         // >>>> Send commitment.
         transcript.append_bytes(&lde_trace_merkle_root);
@@ -354,19 +354,19 @@ pub trait IsStarkProver<
         let trace_polys = trace.compute_trace_polys_main::<Field>();
 
         // Evaluate those polynomials t_j on the large domain D_LDE.
-        let lde_trace_evaluations =
+        let mut lde_trace_evaluations =
             Self::compute_lde_trace_evaluations::<Field>(&trace_polys, domain);
 
-        let mut lde_trace_permuted = lde_trace_evaluations.clone();
-        for col in lde_trace_permuted.iter_mut() {
+        // Permute in-place, commit, then restore natural order.
+        for col in lde_trace_evaluations.iter_mut() {
             in_place_bit_reverse_permute(col);
         }
-
-        // Compute commitment (but don't append to transcript - caller does that).
-        let lde_trace_permuted_rows = columns2rows(lde_trace_permuted);
-
+        let lde_trace_permuted_rows = columns2rows_ref(&lde_trace_evaluations);
         let (lde_trace_merkle_tree, lde_trace_merkle_root) =
             Self::batch_commit_main(&lde_trace_permuted_rows)?;
+        for col in lde_trace_evaluations.iter_mut() {
+            in_place_bit_reverse_permute(col);
+        }
 
         Some((
             trace_polys,
@@ -403,18 +403,18 @@ pub trait IsStarkProver<
         let trace_polys = trace.compute_trace_polys_aux::<Field>();
 
         // Evaluate those polynomials t_j on the large domain D_LDE.
-        let lde_trace_evaluations = Self::compute_lde_trace_evaluations(&trace_polys, domain);
+        let mut lde_trace_evaluations = Self::compute_lde_trace_evaluations(&trace_polys, domain);
 
-        let mut lde_trace_permuted = lde_trace_evaluations.clone();
-        for col in lde_trace_permuted.iter_mut() {
+        // Permute in-place, commit, then restore natural order.
+        for col in lde_trace_evaluations.iter_mut() {
             in_place_bit_reverse_permute(col);
         }
-
-        // Compute commitment.
-        let lde_trace_permuted_rows = columns2rows(lde_trace_permuted);
-
+        let lde_trace_permuted_rows = columns2rows_ref(&lde_trace_evaluations);
         let (lde_trace_merkle_tree, lde_trace_merkle_root) =
             Self::batch_commit_extension(&lde_trace_permuted_rows)?;
+        for col in lde_trace_evaluations.iter_mut() {
+            in_place_bit_reverse_permute(col);
+        }
 
         // >>>> Send commitment.
         transcript.append_bytes(&lde_trace_merkle_root);
@@ -506,31 +506,33 @@ pub trait IsStarkProver<
         FieldElement<FieldExtension>: AsBytes,
     {
         // Interpolate all columns (needed for constraint evaluation)
-        let Some((trace_polys, evaluations, _full_tree, _full_root)) =
+        let Some((trace_polys, mut evaluations, _full_tree, _full_root)) =
             Self::interpolate_and_commit_preprocessed(trace, domain)
         else {
             return Err(ProvingError::EmptyCommitment);
         };
 
         // --- Build PRECOMPUTED tree (cols 0..num_precomputed) ---
-        let precomputed_evaluations: Vec<_> = evaluations[..num_precomputed_cols].to_vec();
-        let mut precomputed_lde_permuted = precomputed_evaluations.clone();
-        for col in precomputed_lde_permuted.iter_mut() {
+        for col in evaluations[..num_precomputed_cols].iter_mut() {
             in_place_bit_reverse_permute(col);
         }
-        let precomputed_rows = columns2rows(precomputed_lde_permuted);
+        let precomputed_rows = columns2rows_ref(&evaluations[..num_precomputed_cols]);
         let (precomputed_tree, precomputed_root) =
             Self::batch_commit_main(&precomputed_rows).ok_or(ProvingError::EmptyCommitment)?;
-
-        // --- Build MULTIPLICITIES tree (cols num_precomputed..) ---
-        let multiplicity_evaluations: Vec<_> = evaluations[num_precomputed_cols..].to_vec();
-        let mut mult_lde_permuted = multiplicity_evaluations.clone();
-        for col in mult_lde_permuted.iter_mut() {
+        for col in evaluations[..num_precomputed_cols].iter_mut() {
             in_place_bit_reverse_permute(col);
         }
-        let mult_rows = columns2rows(mult_lde_permuted);
+
+        // --- Build MULTIPLICITIES tree (cols num_precomputed..) ---
+        for col in evaluations[num_precomputed_cols..].iter_mut() {
+            in_place_bit_reverse_permute(col);
+        }
+        let mult_rows = columns2rows_ref(&evaluations[num_precomputed_cols..]);
         let (mult_tree, mult_root) =
             Self::batch_commit_main(&mult_rows).ok_or(ProvingError::EmptyCommitment)?;
+        for col in evaluations[num_precomputed_cols..].iter_mut() {
+            in_place_bit_reverse_permute(col);
+        }
 
         // Verify that our computed precomputed root matches the hardcoded commitment.
         // This is a sanity check - if they don't match, something is wrong with the trace.

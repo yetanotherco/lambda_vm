@@ -383,6 +383,13 @@ pub fn columns2rows<F>(columns: Vec<Vec<F>>) -> Vec<Vec<F>>
 where
     F: Clone,
 {
+    columns2rows_ref(&columns)
+}
+
+pub fn columns2rows_ref<F>(columns: &[Vec<F>]) -> Vec<Vec<F>>
+where
+    F: Clone,
+{
     let num_rows = columns[0].len();
     let num_cols = columns.len();
 
