@@ -41,23 +41,23 @@ class Range:
     high: int
 
     @classmethod
-    def lit(cls, x: int) -> Self:
+    def const(cls, x: int) -> Self:
         return cls(x, x)
 
     def is_bool(self):
         return self.low >= 0 and self.high <= 1
 
-    def is_lit(self):
+    def is_const(self):
         return self.low == self.high
 
-    def get_lit(self) -> int:
-        assert self.is_lit()
+    def get_const(self) -> int:
+        assert self.is_const()
         return self.low
 
 
 type Type = list[Type] | Range
 
-DEFAULT_TYPE: Type = Range.lit(0)
+DEFAULT_TYPE: Type = Range.const(0)
 
 type Expr = (
     LitExpr
@@ -89,7 +89,7 @@ class LitExpr:
     lit: int
 
     def typecheck(self, _env: Environment) -> Type:
-        return Range.lit(self.lit)
+        return Range.const(self.lit)
 
 
 @dataclass
@@ -122,17 +122,17 @@ class IdxExpr:
     def typecheck(self, env: Environment) -> Type:
         base = self.base.typecheck(env)
         idx = self.idx.typecheck(env)
-        if not isinstance(idx, Range) or not idx.is_lit():
+        if not isinstance(idx, Range) or not idx.is_const():
             reporter.error(f"Invalid index: {idx!r}")
-            return Range.lit(-1)
-        idxlit = idx.get_lit()
+            return Range.const(-1)
+        idxconst = idx.get_const()
         if isinstance(base, Range):
             reporter.error(f"Indexing into non-array type: {self!r}")
             return DEFAULT_TYPE
-        if not (0 <= idxlit < len(base)):
+        if not (0 <= idxconst < len(base)):
             reporter.error(f"Index out of range {self!r}")
-            idxlit = 0
-        return base[idxlit]
+            idxconst = 0
+        return base[idxconst]
 
 
 @dataclass
@@ -146,7 +146,7 @@ class CastExpr:
         baselen = len(base) if isinstance(base, list) else 1
         castlen = len(self.type) if isinstance(self.type, list) else 1
         reporter.asserts(
-            baselen >= castlen or (isinstance(base, Range) and base.is_lit()),
+            baselen >= castlen or (isinstance(base, Range) and base.is_const()),
             f"Casting from fewer columns to more: {self!r} {base} {self.type}",
         )
         return self.type
@@ -170,7 +170,7 @@ class MulExpr:
 
     def typecheck(self, env: Environment) -> Type:
         reporter.asserts(self.factors != [], f"Empty product: {self!r}")
-        t: Type = Range.lit(1)
+        t: Type = Range.const(1)
         for f in self.factors:
             t = self.type_match(t, f.typecheck(env))
         return t
@@ -195,7 +195,7 @@ class AddExpr:
     def typecheck(self, env: Environment) -> Type:
         if not self.terms:
             reporter.error("Empty add")
-            return Range.lit(0)
+            return Range.const(0)
         t: Type = self.terms[0].typecheck(env)
         for term in self.terms[1:]:
             t = self.type_match(t, term.typecheck(env))
@@ -239,16 +239,16 @@ class PowExpr:
     def typecheck(self, env: Environment) -> Type:
         base = self.base.typecheck(env)
         exp = self.exp.typecheck(env)
-        if isinstance(base, list) or not base.is_lit():
+        if isinstance(base, list) or not base.is_const():
             reporter.error(f"Invalid exponentiation with non-const base: {self.base!r}")
             return DEFAULT_TYPE
-        if isinstance(exp, list) or not exp.is_lit():
+        if isinstance(exp, list) or not exp.is_const():
             reporter.error(
                 f"Invalid exponentiation with non-const exponent: {self.exp!r}"
             )
             return DEFAULT_TYPE
-        val = pow(base.get_lit(), exp.get_lit(), env.config.variables.prime)
-        return Range.lit(val)
+        val = pow(base.get_const(), exp.get_const(), env.config.variables.prime)
+        return Range.const(val)
 
 
 @dataclass
@@ -269,7 +269,7 @@ class SumExpr:
             return Range(a.low + b.low, a.high + b.high)
 
     def typecheck(self, env: Environment) -> Type:
-        t: Type = Range.lit(0)
+        t: Type = Range.const(0)
         for tc in self.iter.typecheck(env, lambda e: [self.terms.typecheck(e)]):
             t = self.type_match(t, tc)
         return t
@@ -350,19 +350,19 @@ class Iter:
         self, env: Environment, callback: Callable[[Environment], Iterable[T]]
     ) -> Iterable[T]:
         start = self.start.typecheck(env)
-        if isinstance(start, list) or not start.is_lit():
+        if isinstance(start, list) or not start.is_const():
             reporter.error(f"Starting value of iterator not a const: {self!r}")
-            start = Range.lit(0)
+            start = Range.const(0)
         stop = self.stop.typecheck(env)
-        if isinstance(stop, list) or not stop.is_lit():
+        if isinstance(stop, list) or not stop.is_const():
             reporter.error(f"Ending value of iterator not a const: {self!r}")
-            stop = Range.lit(start.get_lit())
+            stop = Range.const(start.get_const())
 
         # While it's tempting to replace this loop by an assignment of Range(start, stop + 1) to self.name
-        # that would break both detection of literals, and narrowing down to the correct type for indexing
+        # that would break both detection of consts, and narrowing down to the correct type for indexing
         # heterogenous array types
-        for i in range(start.get_lit(), stop.get_lit() + 1):
-            yield from callback(env.with_val(self.name, Range.lit(i)))
+        for i in range(start.get_const(), stop.get_const() + 1):
+            yield from callback(env.with_val(self.name, Range.const(i)))
 
 
 def iters_of(obj: dict, name=None) -> list[Iter]:
@@ -651,17 +651,17 @@ class VirtualVariable(Variable):
                 # Some duplicated code/concepts from Iter.typecheck
                 # But threading the extra needed state through overly complicates everything
                 start = it.start.typecheck(env)
-                if isinstance(start, list) or not start.is_lit():
+                if isinstance(start, list) or not start.is_const():
                     reporter.error(
                         f"Starting value of virtual def iter not a const: {self!r}"
                     )
-                    start = Range.lit(0)
+                    start = Range.const(0)
                 stop = it.stop.typecheck(env)
-                if isinstance(stop, list) or not stop.is_lit():
+                if isinstance(stop, list) or not stop.is_const():
                     reporter.error(
                         f"Ending value of virtual def iter not a const: {self!r}"
                     )
-                    stop = Range.lit(start.get_lit())
+                    stop = Range.const(start.get_const())
 
                 if isinstance(expected, Range):
                     reporter.error(
@@ -669,15 +669,15 @@ class VirtualVariable(Variable):
                     )
                     return
 
-                if not 0 <= start.get_lit() <= stop.get_lit() < len(expected):
+                if not 0 <= start.get_const() <= stop.get_const() < len(expected):
                     reporter.error(
-                        f"Virtual definition index [{start.get_lit()}, {stop.get_lit()}] out of range for {expected}: {self!r}"
+                        f"Virtual definition index [{start.get_const()}, {stop.get_const()}] out of range for {expected}: {self!r}"
                     )
                     return
 
-                for i in range(start.get_lit(), stop.get_lit() + 1):
+                for i in range(start.get_const(), stop.get_const() + 1):
                     handle_iters(
-                        env.with_val(it.name, Range.lit(i)),
+                        env.with_val(it.name, Range.const(i)),
                         its,
                         poly,
                         expected[i],
