@@ -565,9 +565,10 @@ output = ["cast", "res", "DWordWL"]
 
 [[constraints.alu]]
 kind = "template"
-tag = "add"
+tag = "ADD"
 cond = "STORE"
 input = [["cast", "arg1", "DWordWL"], "imm"]
+output = ["cast", "res", "DWordWL"]
 
 [[constraints.alu]]
 kind = "template"
