@@ -127,14 +127,14 @@ poly = ["*", "w2", ["not", "μ_sum"]]
 [[constraints.consistency]]
 kind = "template"
 tag = "ADD"
-input = ["base_address", 1]
+input = ["base_address", ["cast", 1, "DWordWL"]]
 output = ["cast", ["idx", "address_add", 0], "DWordWL"]
 cond = "w2"
 
 [[constraints.consistency]]
 kind = "template"
 tag = "ADD"
-input = ["base_address", ["+", "i", 1]]
+input = ["base_address", ["cast", ["+", "i", 1], "DWordWL"]]
 output = ["cast", ["idx", "address_add", "i"], "DWordWL"]
 iter = ["i", 1, 2]
 cond = "w4"
@@ -142,14 +142,14 @@ cond = "w4"
 [[constraints.consistency]]
 kind = "template"
 tag = "ADD"
-input = ["base_address", ["+", "i", 1]]
+input = ["base_address", ["cast", ["+", "i", 1], "DWordWL"]]
 output = ["cast", ["idx", "address_add", "i"], "DWordWL"]
 iter = ["i", 3, 6]
 cond = "write8"
 
 [[constraints.consistency]]
 kind = "interaction"
-tag = "IS_HALFWORD"
+tag = "IS_HALF"
 input = [["idx", ["idx", "address_add", "i"], "j"]]
 iters = [
   ["i", 0, 0],
@@ -159,7 +159,7 @@ multiplicity = "w2"
 
 [[constraints.consistency]]
 kind = "interaction"
-tag = "IS_HALFWORD"
+tag = "IS_HALF"
 input = [["idx", ["idx", "address_add", "i"], "j"]]
 iters = [
   ["i", 1, 2],
@@ -169,7 +169,7 @@ multiplicity = "w4"
 
 [[constraints.consistency]]
 kind = "interaction"
-tag = "IS_HALFWORD"
+tag = "IS_HALF"
 input = [["idx", ["idx", "address_add", "i"], "j"]]
 iters = [
   ["i", 3, 6],
@@ -253,40 +253,40 @@ multiplicity = ["-", "μ_sum"]
 [[constraints.memory]]
 kind = "interaction"
 tag = "memory"
-input = ["is_register", ["idx", "address_add", 0], ["idx", "old_timestamp", 1], ["idx", "old", 1]]
+input = ["is_register", ["cast", ["idx", "address_add", 0], "DWordWL"], ["idx", "old_timestamp", 1], ["idx", "old", 1]]
 multiplicity = "w2"
 
 [[constraints.memory]]
 kind = "interaction"
 tag = "memory"
-input = ["is_register", ["idx", "address_add", 0], "timestamp", ["idx", "value", 1]]
+input = ["is_register", ["cast", ["idx", "address_add", 0], "DWordWL"], "timestamp", ["idx", "value", 1]]
 multiplicity = ["-", "w2"]
 
 [[constraints.memory]]
 kind = "interaction"
 tag = "memory"
-input = ["is_register", ["idx", "address_add", ["-", "i", 1]], ["idx", "old_timestamp", "i"], ["idx", "old", "i"]]
+input = ["is_register", ["cast", ["idx", "address_add", ["-", "i", 1]], "DWordWL"], ["idx", "old_timestamp", "i"], ["idx", "old", "i"]]
 multiplicity = "w4"
 iter = ["i", 2, 3]
 
 [[constraints.memory]]
 kind = "interaction"
 tag = "memory"
-input = ["is_register", ["idx", "address_add", ["-", "i", 1]], "timestamp", ["idx", "value", "i"]]
+input = ["is_register", ["cast", ["idx", "address_add", ["-", "i", 1]], "DWordWL"], "timestamp", ["idx", "value", "i"]]
 multiplicity = ["-", "w4"]
 iter = ["i", 2, 3]
 
 [[constraints.memory]]
 kind = "interaction"
 tag = "memory"
-input = ["is_register", ["idx", "address_add", ["-", "i", 1]], ["idx", "old_timestamp", "i"], ["idx", "old", "i"]]
+input = ["is_register", ["cast", ["idx", "address_add", ["-", "i", 1]], "DWordWL"], ["idx", "old_timestamp", "i"], ["idx", "old", "i"]]
 multiplicity = "write8"
 iter = ["i", 4, 7]
 
 [[constraints.memory]]
 kind = "interaction"
 tag = "memory"
-input = ["is_register", ["idx", "address_add", ["-", "i", 1]], "timestamp", ["idx", "value", "i"]]
+input = ["is_register", ["cast", ["idx", "address_add", ["-", "i", 1]], "DWordWL"], "timestamp", ["idx", "value", "i"]]
 multiplicity = ["-", "write8"]
 iter = ["i", 4, 7]
 

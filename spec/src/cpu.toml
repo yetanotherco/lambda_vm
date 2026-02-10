@@ -77,8 +77,6 @@ type = "Bit"
 desc = "Whether the instruction is of C type, i.e., whether it is 2 bytes long instead of 4"
 pad = 0
 
-# TODO: Should this just be a word? (CHECK: effect on computation/extension of arg2)
-# TODO: make sure decode correctly extends this (may be zero for unsigned and word_instr?)
 [[variables.input]]
 name = "imm"
 type = "DWordWL"
@@ -619,7 +617,7 @@ iter = ["i", 0, 7]
 kind = "interaction"
 tag = "SHIFT"
 input = [["cast", "arg1", "DWordHL"], ["idx", "arg2", 0], "mp_selector", "signed", "word_instr"]
-output = ["cast", "res", "DWordHL"]
+output = ["cast", "res", "DWordWL"]
 multiplicity = "SHIFT"
 
 [[constraints.alu]]
@@ -629,20 +627,18 @@ input = ["pc", ["*", ["+", ["*", 2, "c_type_instruction"], ["*", 4, ["not", "c_t
 output = ["cast", "res", "DWordWL"]
 cond = "JALR"
 
-# TODO: no types available, so no casting yet
 [[constraints.alu]]
 kind = "interaction"
 tag = "MUL"
-input = ["arg1", "signed", "arg2", "mp_selector", "muldiv_selector"]
-output = "res"
+input = [["cast", "arg1", "DWordHL"], "signed", ["cast", "arg2", "DWordHL"], "mp_selector", "muldiv_selector"]
+output = ["cast", "res", "DWordWL"]
 multiplicity = "MUL"
 
-# TODO: no types available, so no casting yet
 [[constraints.alu]]
 kind = "interaction"
 tag = "DVRM"
-input = ["arg1", "arg2", "signed", "muldiv_selector"]
-output = "res"
+input = [["cast", "arg1", "DWordHL"], ["cast", "arg2", "DWordHL"], "signed", "muldiv_selector"]
+output = ["cast", "res", "DWordWL"]
 multiplicity = "DIVREM"
 
 
@@ -650,12 +646,11 @@ multiplicity = "DIVREM"
 name = "mem"
 prefix = "M"
 
-# TODO: no types available, so no casting yet
 [[constraints.mem]]
 kind = "interaction"
 tag = "MEMW"
-input = [1, ["*", 2, "rs1"], "rv1", ["+", "timestamp", ["cast", 0, "DWordWL"]], 1, 0, 0]
-output = "rv1"
+input = [1, ["*", ["cast", 2, "DWordWL"], "rs1"], ["arr", ["idx", ["cast", "rv1", "DWordWL"], 0], ["idx", ["cast", "rv1", "DWordWL"], 1], 0, 0, 0, 0, 0, 0], ["+", "timestamp", ["cast", 0, "DWordWL"]], 1, 0, 0]
+output = ["arr", ["idx", ["cast", "rv1", "DWordWL"], 0], ["idx", ["cast", "rv1", "DWordWL"], 1], 0, 0, 0, 0, 0, 0]
 multiplicity = "read_register1"
 
 [[constraints.mem]]
@@ -664,12 +659,11 @@ constraint = "$#`!read_register1` => #`rv1[i]` = 0$"
 poly = ["*", ["not", "read_register1"], ["idx", "rv1", "i"]]
 iter = ["i", 0, 2]
 
-# TODO: no types available, so no casting yet
 [[constraints.mem]]
 kind = "interaction"
 tag = "MEMW"
-input = [1, ["*", 2, "rs2"], "rv2", ["+", "timestamp", ["cast", 1, "DWordWL"]], 1, 0, 0]
-output = "rv2"
+input = [1, ["*", ["cast", 2, "DWordWL"], "rs2"], ["arr", ["idx", ["cast", "rv2", "DWordWL"], 0], ["idx", ["cast", "rv2", "DWordWL"], 1], 0, 0, 0, 0, 0, 0], ["+", "timestamp", ["cast", 1, "DWordWL"]], 1, 0, 0]
+output = ["arr", ["idx", ["cast", "rv2", "DWordWL"], 0], ["idx", ["cast", "rv2", "DWordWL"], 1], 0, 0, 0, 0, 0, 0]
 multiplicity = "read_register2"
 
 [[constraints.mem]]
@@ -678,33 +672,30 @@ constraint = "$#`!read_register2` => #`rv2[i]` = 0$"
 poly = ["*", ["not", "read_register2"], ["idx", "rv2", "i"]]
 iter = ["i", 0, 2]
 
-# TODO: no types available, so no casting yet
 [[constraints.mem]]
 kind = "interaction"
 tag = "MEMW"
-input = [1, ["*", 2, "rd"], "rvd", ["+", "timestamp", ["cast", 2, "DWordWL"]], 1, 0, 0]
+input = [1, ["*", ["cast", 2, "DWordWL"], "rd"], ["arr", ["idx", "rvd", 0], ["idx", "rvd", 1], 0, 0, 0, 0, 0, 0], ["+", "timestamp", ["cast", 2, "DWordWL"]], 1, 0, 0]
 multiplicity = "write_register"
 
 [[constraints.mem]]
 kind = "interaction"
 tag = "LOAD"
-input = [0, "res", ["+", "timestamp", ["cast", 0, "DWordWL"]], "memory_2bytes", "memory_4bytes", "memory_8bytes", "signed"]
+input = [["cast", "res", "DWordWL"], ["+", "timestamp", ["cast", 0, "DWordWL"]], "memory_2bytes", "memory_4bytes", "memory_8bytes", "signed"]
 output = "rvd"
 multiplicity = "LOAD"
 
-# TODO: no types available, so no casting yet
 [[constraints.mem]]
 kind = "interaction"
 tag = "MEMW"
-input = [0, "res", ["cast", "arg2", ["Byte", 8]], ["+", "timestamp", ["cast", 1, "DWordWL"]], "memory_2bytes", "memory_4bytes", "memory_8bytes"]
+input = [0, ["cast", "res", "DWordWL"], ["cast", "arg2", ["Byte", 8]], ["+", "timestamp", ["cast", 1, "DWordWL"]], "memory_2bytes", "memory_4bytes", "memory_8bytes"]
 multiplicity = "STORE"
 
-# TODO: no types available, so no casting yet
 [[constraints.mem]]
 kind = "interaction"
 tag = "MEMW"
-input = [1, ["*", 2, 255], "next_pc", ["+", "timestamp", ["cast", 1, "DWordWL"]], 1, 0, 0]
-output = "pc"
+input = [1, ["cast", ["*", 2, 255], "DWordWL"], ["arr", ["idx", "next_pc", 0], ["idx", "next_pc", 1], 0, 0, 0, 0, 0, 0], ["+", "timestamp", ["cast", 1, "DWordWL"]], 1, 0, 0]
+output = ["arr", ["idx", "pc", 0], ["idx", "pc", 1], 0, 0, 0, 0, 0, 0]
 multiplicity = ["not", "pad"]
 
 
@@ -817,7 +808,7 @@ poly = ["+",
 [[constraints.misc]]
 kind = "interaction"
 tag = "BRANCH"
-input = ["pc", ["idx", "imm", 0], ["cast", "arg1", "DWordWL"], "JALR"]
+input = ["pc", "imm", ["cast", "arg1", "DWordWL"], "JALR"]
 output = "next_pc"
 multiplicity = "branch_cond"
 

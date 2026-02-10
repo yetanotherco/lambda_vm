@@ -59,6 +59,16 @@ type Type = list[Type] | Range
 
 DEFAULT_TYPE: Type = Range.const(0)
 
+
+def structure_matches(a: Type, b: Type) -> bool:
+    if isinstance(a, Range) and isinstance(b, (Range, type(None))):
+        return True
+    elif isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(structure_matches(x, y) for x, y in zip(a, b))
+    else:
+        return False
+
+
 type Expr = (
     LitExpr
     | VarExpr
@@ -612,16 +622,6 @@ class VirtualVariable(Variable):
         self.def_ = VirtualDef(config, self.name, self.type, def_)
 
     def typecheck(self, env: Environment) -> Type:
-        def structure_matches(a: Type, b: Type) -> bool:
-            if isinstance(a, Range) and isinstance(b, (Range, type(None))):
-                return True
-            elif isinstance(a, list) and isinstance(b, list):
-                return len(a) == len(b) and all(
-                    structure_matches(x, y) for x, y in zip(a, b)
-                )
-            else:
-                return False
-
         def handle_iters(
             env: Environment,
             iters: list[Iter],
@@ -793,6 +793,21 @@ class Signature:
     tag: str
     input: list[Type]
     output: Optional[Type]
+
+    def matches(self, other: Self) -> bool:
+        if not isinstance(other, type(self)):
+            return False
+        if self.tag != other.tag:
+            return False
+        if (self.output is None) != (other.output is None):
+            return False
+        if (
+            self.output is not None
+            and other.output is not None
+            and not structure_matches(self.output, other.output)
+        ):
+            return False
+        return structure_matches(self.input, other.input)
 
 
 @dataclass
@@ -971,9 +986,49 @@ class Chip:
             yield from c.typecheck(env)
 
 
+def build_signature(config: Config, data: dict) -> Signature:
+    assert_no_unexpected(
+        data, {"tag", "kind", "input", "output", "cond", "multiplicity"}
+    )
+    Sig: type[Signature]
+    match data["kind"]:
+        case "template":
+            reporter.asserts(
+                "multiplicity" not in data,
+                f"Template signature with multiplicity: {data!r}",
+            )
+            Sig = TemplateSignature
+        case "interaction":
+            reporter.asserts(
+                "cond" not in data, f"Template signature with cond: {data!r}"
+            )
+            Sig = InteractionSignature
+    tag = data["tag"]
+    reporter.asserts(isinstance(tag, str), f"Signature tag not a string: {tag!r}")
+    input = [build_type(config, inp) for inp in data["input"]]
+    if "output" in data:
+        output = build_type(config, data["output"])
+    else:
+        output = None
+    return Sig(tag, input, output)
+
+
+def read_signatures(config, filename) -> list[Signature]:
+    data = tomllib.load(open(filename, "rb"))
+    assert_no_unexpected(data, {"signatures"})
+    return [build_signature(config, sig) for sig in data["signatures"]]
+
+
+def check_signatures(found: Iterable[Signature], expected: list[Signature]):
+    for sig in found:
+        reporter.asserts(
+            any(sig.matches(exp) for exp in expected), f"Unexpected signature: {sig}"
+        )
+
+
 if __name__ == "__main__":
     config = Config.from_file(sys.argv[1])
-    signatures = sys.argv[2]  # Later
+    signatures = read_signatures(config, sys.argv[2])
     if reporter.reported:
         sys.exit(1)
     reported = False
@@ -986,6 +1041,4 @@ if __name__ == "__main__":
     if not reported:
         for chip in chips:
             reporter.update_location(f"Chip {chip.name}")
-            # TODO: do something with the signatures
-            # Use list for the sideeffect of forcing the generator until we use the content
-            list(chip.typecheck())
+            check_signatures(chip.typecheck(), signatures)

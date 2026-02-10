@@ -130,7 +130,7 @@ multiplicity = "μ"
 
 [[constraints.all]]
 kind = "interaction"
-tag = "IS_HALFWORD"
+tag = "IS_HALF"
 input = [["idx", "next_pc_high", "i"]]
 iter = ["i", 0, 2]
 multiplicity = "μ"

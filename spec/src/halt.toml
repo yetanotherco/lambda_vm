@@ -17,7 +17,7 @@ name = "all"
 [[constraints.all]]
 kind = "interaction"
 tag = "MEMW"
-input = [1, ["*", 2, "i"], 0, ["-", ["^", 2, 64], 1], 1, 0, 0]
+input = [1, ["cast", ["*", 2, "i"], "DWordWL"], ["cast", 0, ["Byte", 8]], ["cast", ["-", ["^", 2, 64], 1], "DWordWL"], 1, 0, 0]
 iter = ["i", 1, 9]
 multiplicity = 1
 ref = "halt:c:zeroize_registers_lo"
@@ -25,15 +25,15 @@ ref = "halt:c:zeroize_registers_lo"
 [[constraints.all]]
 kind = "interaction"
 tag = "MEMW"
-input = [1, ["*", 2, 10], 0, ["-", ["^", 2, 64], 1], 1, 0, 0]
-output = 0
+input = [1, ["cast", ["*", 2, 10], "DWordWL"], ["cast", 0, ["Byte", 8]], ["cast", ["-", ["^", 2, 64], 1], "DWordWL"], 1, 0, 0]
+output = ["cast", 0, ["Byte", 8]]
 multiplicity = 1
 ref = "halt:c:read_zero_exit_code"
 
 [[constraints.all]]
 kind = "interaction"
 tag = "MEMW"
-input = [1, ["*", 2, "i"], 0, ["-", ["^", 2, 64], 1], 1, 0, 0]
+input = [1, ["cast", ["*", 2, "i"], "DWordWL"], ["cast", 0, ["Byte", 8]], ["cast", ["-", ["^", 2, 64], 1], "DWordWL"], 1, 0, 0]
 iter = ["i", 11, 31]
 multiplicity = 1
 ref = "halt:c:zeroize_registers_hi"
@@ -41,7 +41,7 @@ ref = "halt:c:zeroize_registers_hi"
 [[constraints.all]]
 kind = "interaction"
 tag = "MEMW"
-input = [1, ["*", 2, 255], 1, ["-", ["^", 2, 64], 1], 1, 0, 0]
+input = [1, ["cast", ["*", 2, 255], "DWordWL"], ["arr", 1, 0, 0, 0, 0, 0, 0, 0], ["cast", ["-", ["^", 2, 64], 1], "DWordWL"], 1, 0, 0]
 multiplicity = 1
 ref = "halt:c:pc"
 
@@ -51,6 +51,6 @@ name = "lookup"
 [[constraints.lookup]]
 kind = "interaction"
 tag = "ECALL"
-input = ["timestamp", 93]
+input = ["timestamp", ["cast", 93, "DWordWL"]]
 multiplicity = ["-", 1]
 ref = "halt:c:lookup"
