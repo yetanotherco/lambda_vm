@@ -152,3 +152,7 @@ These are required to ensure the multiplicities $#`first` - #`μ`$ and $#`μ` - 
 == Padding
 To pad this chip, use the below data.
 #render_chip_padding_table(chip, config)
+
+== Notes
+- The current version only supports writing to `stdout`.
+  This chip could potentially be extended to support writing to arbitrary `fd`s
