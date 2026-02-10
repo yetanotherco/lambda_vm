@@ -292,5 +292,5 @@ kind = "interaction"
 tag = "SHIFT"
 input = ["in", "shift", "direction", "signed", "word_instr"]
 output = "out"
-multiplicity = "-μ"
+multiplicity = ["-", "μ"]
 ref = "shift:c:lookup"

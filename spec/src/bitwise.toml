@@ -4,67 +4,67 @@ name = "BITWISE"
 name = "X"
 type = "Byte"
 desc = ""
-precomputed = "true"
+precomputed = true
 
 [[variables.input]]
 name = "Y"
 type = "Byte"
 desc = ""
-precomputed = "true"
+precomputed = true
 
 [[variables.input]]
 name = "Z"
 type = "B4"
 desc = ""
-precomputed = "true"
+precomputed = true
 
 [[variables.output]]
 name = "AND"
 type = "Byte"
 desc = "the binary AND of `X` and `Y`"
-precomputed = "true"
+precomputed = true
 
 [[variables.output]]
 name = "OR"
 type = "Byte"
 desc = "the binary OR of `X` and `Y`"
-precomputed = "true"
+precomputed = true
 
 [[variables.output]]
 name = "XOR"
 type = "Byte"
 desc = "the binary XOR of `X` and `Y`"
-precomputed = "true"
+precomputed = true
 
 [[variables.output]]
 name = "MSB8"
 type = "Bit"
 desc = "the most significant bit of `X`"
-precomputed = "true"
+precomputed = true
 
 [[variables.output]]
 name = "MSB16"
 type = "Bit"
 desc = "the most significant bit of `Y`"
-precomputed = "true"
+precomputed = true
 
 [[variables.output]]
 name = "ZERO"
 type = "Bit"
 desc = "whether $#`X` = 0$, $#`Y` = 0$ and $#`Z` = 0$."
-precomputed = "true"
+precomputed = true
 
 [[variables.output]]
 name = "SLL"
 type = "Half"
 desc = "`X||Y` logically left-shifted by `Z`: $((#`X` + 256#`Y`) #`<<` #`Z`) mod 2^16$"
-precomputed = "true"
+precomputed = true
 
 [[variables.output]]
 name = "SLLC"
 type = "Half"
 desc = "`X||Y` logically right-shifted by `Z`: $(#`X` + 256#`Y`) #`>>` (16 - #`Z`)$"
-precomputed = "true"
+precomputed = true
 
 [[variables.multiplicity]]
 name = "μ_AND"

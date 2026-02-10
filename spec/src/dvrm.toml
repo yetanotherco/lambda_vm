@@ -376,13 +376,13 @@ desc = "Each row contributes the following to the LogUp sum"
 [[constraints.output]]
 kind = "interaction"
 tag = "DVRM"
-input = ["n", "d", "signed", "0"]
+input = ["n", "d", "signed", 0]
 output = ["cast", "q", "DWordWL"]
-multiplicity = "-μ_q"
+multiplicity = ["-", "μ_q"]
 
 [[constraints.output]]
 kind = "interaction"
 tag = "DVRM"
-input = ["n", "d", "signed", "1"]
+input = ["n", "d", "signed", 1]
 output = ["cast", "r", "DWordWL"]
-multiplicity = "-μ_r"
+multiplicity = ["-", "μ_r"]

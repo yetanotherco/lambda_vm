@@ -4,63 +4,49 @@ version = 1
 [[variables.types]]
 label = "BaseField"
 subtypes = ["BaseField"]
+range = [0, "18446744069414584320"]
 desc = "Variable that can assume any value in the base field."
 
 [[variables.types]]
 label = "Bit"
 subtypes = ["BaseField"]
+range = [0, 1]
 desc = "Variable that can only assume values in the set ${0,1}$."
 
 [[variables.types]]
 label = "B4"
 subtypes = ["BaseField"]
+range = [0, 15]
 desc = "Variable that can only assume values in the range $[0, 2^4)$."
 
 [[variables.types]]
 label = "Byte"
 subtypes = ["BaseField"]
-count = 1
+range = [0, 255]
 desc = "Variable that can only assume values in the range $[0, 2^8)$."
 
 [[variables.types]]
 label = "Half"
 subtypes = ["BaseField"]
+range = [0, 65535]
 desc = "Variable that can only assume values in the range $[0, 2^16)$."
 
 [[variables.types]]
 label = "B20"
 subtypes = ["BaseField"]
+range = [0, 1048575]
 desc = "Variable that can only assume values in the range $[0, 2^20)$."
 
 [[variables.types]]
 label = "Word"
 subtypes = ["BaseField"]
+range = [0, 4294967295]
 desc = "Variable that can only assume values in the range $[0, 2^32)$."
-
-[[variables.types]]
-label = "WordHL"
-subtypes = ["Half", "Half"]
-desc = """\
-       Variable that can only assume values in the range $[0, 2^32)$. \\
-       Represented as an array of two `Half` variables.\
-       """
-
-[[variables.types]]
-label = "WordBL"
-subtypes = ["Byte", "Byte", "Byte", "Byte"]
-desc = """\
-       Variable that can only assume values in the range $[0, 2^32)$. \\
-       Represented as an array of four `Byte` variables.\
-       """
-
-[[variables.types]]
-label = "B35"
-subtypes = ["BaseField"]
-desc = "Variable that can only assume values in the range $[0, 2^35)$."
 
 [[variables.types]]
 label = "B51"
 subtypes = ["BaseField"]
+range = [0, 2251799813685247]
 desc = "Variable that can only assume values in the range $[0, 2^51)$."
 
 [[variables.types]]
@@ -97,6 +83,15 @@ desc = """\
        """
 
 [[variables.types]]
+label = "DWordWHH"
+subtypes = ["Half", "Half", "Word"]
+desc = """\
+       Variable that can only assume values in the range $[0, 2^64)$. \\
+       Represented as a `Word` and two `Half` variables.\
+       The `Word` is the *most* significant digit.
+       """
+
+[[variables.types]]
 label = "QuadHL"
 subtypes = ["Half", "Half", "Half", "Half", "Half", "Half", "Half", "Half"]
 desc = """\
@@ -110,15 +105,6 @@ subtypes = ["Word", "Word", "Word", "Word"]
 desc = """\
        Variable that can only assume values in the range $[0, 2^128)$. \\
        Represented as an array of four `Word` variables.\
-       """
-
-[[variables.types]]
-label = "DWordWHH"
-subtypes = ["Half", "Half", "Word"]
-desc = """\
-       Variable that can only assume values in the range $[0, 2^64)$. \\
-       Represented as a `Word` and two `Half` variables.\
-       The `Word` is the *most* significant digit.
        """
 
 [[variables.types]]
