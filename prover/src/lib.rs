@@ -38,6 +38,7 @@ use crate::tables::trace_builder::Traces;
 use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_cpu_air, create_decode_air,
     create_halt_air, create_load_air, create_lt_air, create_memw_air, create_mul_air,
+    create_page_air, create_register_air,
 };
 
 use stark::proof::options::ProofOptions;
@@ -92,12 +93,14 @@ pub(crate) struct VmAirs {
     pub mul: VmAir,
     pub branch: VmAir,
     pub halt: VmAir,
+    pub register: VmAir,
+    pub pages: Vec<VmAir>,
 }
 
 impl VmAirs {
     /// Build `(air, trace, public_inputs)` triples for [`Prover::multi_prove`].
     pub fn air_trace_pairs<'a>(&'a self, traces: &'a mut Traces) -> Vec<AirTracePair<'a>> {
-        vec![
+        let mut pairs: Vec<AirTracePair<'a>> = vec![
             (&self.cpu, &mut traces.cpu, &()),
             (&self.bitwise, &mut traces.bitwise, &()),
             (&self.lt, &mut traces.lt, &()),
@@ -107,12 +110,17 @@ impl VmAirs {
             (&self.mul, &mut traces.mul, &()),
             (&self.branch, &mut traces.branch, &()),
             (&self.halt, &mut traces.halt, &()),
-        ]
+            (&self.register, &mut traces.register, &()),
+        ];
+        for (i, page_trace) in traces.pages.iter_mut().enumerate() {
+            pairs.push((&self.pages[i], page_trace, &()));
+        }
+        pairs
     }
 
     /// Collect AIR references for [`Verifier::multi_verify`].
     pub fn air_refs(&self) -> Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> {
-        vec![
+        let mut refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
             &self.cpu,
             &self.bitwise,
             &self.lt,
@@ -122,13 +130,25 @@ impl VmAirs {
             &self.mul,
             &self.branch,
             &self.halt,
-        ]
+            &self.register,
+        ];
+        for page in &self.pages {
+            refs.push(page);
+        }
+        refs
     }
 
     /// Create all VM AIR instances. `minimal_bitwise` controls whether the full
     /// 2^20 bitwise preprocessed table is included (false = full, true = minimal).
     /// DECODE is always preprocessed.
-    pub fn new(elf: &Elf, proof_options: &ProofOptions, minimal_bitwise: bool) -> Self {
+    ///
+    /// `page_configs` provides the page base addresses for creating PAGE AIRs.
+    pub fn new(
+        elf: &Elf,
+        proof_options: &ProofOptions,
+        minimal_bitwise: bool,
+        page_configs: &[crate::tables::page::PageConfig],
+    ) -> Self {
         let cpu = create_cpu_air(proof_options);
         let bitwise = if minimal_bitwise {
             create_bitwise_air(proof_options)
@@ -149,6 +169,12 @@ impl VmAirs {
         let mul = create_mul_air(proof_options);
         let branch = create_branch_air(proof_options);
         let halt = create_halt_air(proof_options);
+        let register = create_register_air(proof_options);
+        let pages: Vec<_> = page_configs
+            .iter()
+            .map(|config| create_page_air(proof_options, config.page_base))
+            .collect();
+
         #[cfg(feature = "debug-checks")]
         debug_report::print_bus_legend();
 
@@ -162,6 +188,8 @@ impl VmAirs {
             mul,
             branch,
             halt,
+            register,
+            pages,
         }
     }
 }
@@ -177,8 +205,10 @@ pub fn prove(
         .run()
         .map_err(|e| Error::Execution(format!("{e}")))?;
 
-    let mut traces = Traces::from_logs(&result.logs, result.instructions)?;
-    let airs = VmAirs::new(&program, proof_options, false);
+    // Generate all traces from ELF and execution logs
+    // This uses the combined ELF processing to generate DECODE and PAGE tables
+    let mut traces = Traces::from_elf_and_logs(&program, &result.logs)?;
+    let airs = VmAirs::new(&program, proof_options, false, &traces.page_configs);
 
     Prover::multi_prove(
         airs.air_trace_pairs(&mut traces),
@@ -188,13 +218,23 @@ pub fn prove(
 }
 
 /// Verify a proof produced by [`prove`].
+///
+/// Derives page layout from ELF to reconstruct PAGE AIRs for verification.
+/// This works for programs that only use ELF segments and stack (no dynamic heap).
+///
+/// # Note
+/// For full production use with dynamic heap allocation, page_configs should be
+/// embedded in proof public inputs. This implementation assumes deterministic
+/// page layout derivable from ELF.
 pub fn verify(
     proof: &MultiProof<F, E, ()>,
     elf_bytes: &[u8],
     proof_options: &ProofOptions,
 ) -> Result<bool, Error> {
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
-    let airs = VmAirs::new(&program, proof_options, false);
+    // Derive page layout from ELF (works for programs without dynamic heap)
+    let page_configs = Traces::page_configs_from_elf(&program);
+    let airs = VmAirs::new(&program, proof_options, false, &page_configs);
 
     Ok(Verifier::multi_verify(
         &airs.air_refs(),
