@@ -390,6 +390,9 @@ pub fn columns2rows_ref<F>(columns: &[Vec<F>]) -> Vec<Vec<F>>
 where
     F: Clone,
 {
+    if columns.is_empty() {
+        return Vec::new();
+    }
     let num_rows = columns[0].len();
     let num_cols = columns.len();
 
