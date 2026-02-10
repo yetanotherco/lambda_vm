@@ -1,7 +1,7 @@
 //! Lambda VM CLI - execute, prove, and verify RISC-V programs.
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -180,13 +180,16 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf) -> ExitCode {
     };
     let mut writer = BufWriter::new(file);
 
-    if let Err(e) = ciborium::into_writer(&proof, &mut writer) {
-        eprintln!("Failed to serialize proof: {}", e);
-        return ExitCode::FAILURE;
-    }
+    let bytes = match bincode::serialize(&proof) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Failed to serialize proof: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
 
-    if let Err(e) = writer.flush() {
-        eprintln!("Failed to flush output: {}", e);
+    if let Err(e) = writer.write_all(&bytes) {
+        eprintln!("Failed to write proof: {}", e);
         return ExitCode::FAILURE;
     }
 
@@ -205,17 +208,16 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf) -> ExitCode {
     };
 
     eprintln!("Reading proof...");
-    let file = match File::open(&proof_path) {
-        Ok(f) => f,
+    let proof_bytes = match std::fs::read(&proof_path) {
+        Ok(b) => b,
         Err(e) => {
-            eprintln!("Failed to open proof file: {}", e);
+            eprintln!("Failed to read proof file: {}", e);
             return ExitCode::FAILURE;
         }
     };
-    let reader = BufReader::new(file);
 
     let proof: MultiProof<GoldilocksField, GoldilocksExtension, ()> =
-        match ciborium::from_reader(reader) {
+        match bincode::deserialize(&proof_bytes) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("Failed to deserialize proof: {}", e);
