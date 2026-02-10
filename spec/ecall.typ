@@ -15,11 +15,11 @@
 = About `ECALL`
 When `ECALL` is executed, it is assumed that:
 - register `A7` contains the system call number
-  #footnote(link("https://libriscv.no/docs/concepts/syscalls/#the-risc-v-system-call-abi")[The RISC-V system call ABI; libriscv.no. Accessed Feb 4, 2026.]),
+  #footnote([The RISC-V system call ABI; libriscv.no, #link("https://web.archive.org/web/20260128152107/https://libriscv.no/docs/concepts/syscalls/#the-risc-v-system-call-abi")[[src]]]),
 - the arguments are located in registers `A0`-`A6`, and
 - the return value is written to `A0`,
 where `A0`-`A7` are symbolic names for the registers `x10`-`x17`
-#footnote(link("https://en.wikipedia.org/wiki/RISC-V#Register_sets")[RISC-V - Register sets; en.wikipedia.org. Accessed on Feb 4, 2026.]).
+#footnote([RISC-V - Register sets; en.wikipedia.org, #link("https://web.archive.org/web/20260209053447/https://en.wikipedia.org/wiki/RISC-V#Register_sets")[[src]]]).
 
 
 #let config = load_config()
@@ -54,10 +54,11 @@ This prevents any other operation involving memory from being executed hereafter
 ])
 
 === Lookup
-The HALT chip contributes the following interaction to the lookup-argument:
+In this VM, halting is considered equivalent to executing a `sys_exit`.
+Hence, this chip responds to `ECALL`s with system call number 93.
+#footnote([RISC-V GNU-toolchain, `unistd.h`; version 2026-01-23, #link("https://github.com/riscv-collab/riscv-gnu-toolchain/blob/2026.01.23/linux-headers/include/asm-generic/unistd.h#L258")[[src]]])
+The HALT chip therefore contributes the following interaction to the lookup-argument:
 #render_constraint_table(chip, config, groups: "lookup")
-
-*Note*: #link("https://github.com/riscv-collab/riscv-gnu-toolchain/blob/master/linux-headers/include/asm-generic/unistd.h#L258")[$93$ is the system call number corresponding to `sys_exit`.]
 
 == Padding
 This chip should only contain a single row.
@@ -80,7 +81,7 @@ The #commit chip leverages #nr_variables variables, spanning #nr_columns columns
 == Constraints
 In this VM, committing is considered equivalent to writing a value to `stdout`.
 Hence, this chip responds to `ECALL`s with system call number 64.
-#footnote([$64$ is the system call number corresponding to `sys_write`. #link("https://github.com/riscv-collab/riscv-gnu-toolchain/blob/master/linux-headers/include/asm-generic/unistd.h#L174")[[src]]])
+#footnote([RISC-V GNU-toolchain, `unistd.h`; version 2026-01-23, #link("https://github.com/riscv-collab/riscv-gnu-toolchain/blob/2026.01.23/linux-headers/include/asm-generic/unistd.h#L174")[[src]]])
 Since we do not know how many bytes are to be committed, this chip employs a recursive design:
 each iteration commits one byte, and recursively "call" itself to commit the remaining bytes.
 As such, only the call from the CPU to this chip (i.e., the `first` in the recursion tree) should accept the `ECALL`; later recursive calls should not.
@@ -90,7 +91,7 @@ This is why @commit:c:receive_ecall has multiplicity $-#`first`$.
 Also, `first` being set must imply that that this is not a padding row (@commit:c:first_implies_mu).
 
 The `write` operation --- writing to a file descriptor --- has the following signature:
-#footnote([Linux man-page on `write`; man7.org, #link("https://man7.org/linux/man-pages/man2/write.2.html")[[src]]. Accessed Feb 4, 2026.])
+#footnote([Linux man-page on `write`; man7.org, version 6.16, 2025-10-29. #link("https://man7.org/linux/man-pages/man2/write.2.html")[[src]]])
 #[
 #show raw.where(block: true): it => block(it, fill: luma(230), inset: 1em, width: 100%, radius: 5pt)
 ```c
@@ -104,7 +105,7 @@ That is to say,
 - the written count should be written to `A0`.
 
 Since we only support writing to `stdout` (which corresponds to $#`fd` = 1$
-#footnote([The Open Group Base Specifications, `unistd.h`; The Open Group, issue 7, #link("https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/unistd.h.html")[[src]]. Accessed Feb 4, 2026.]))
+#footnote([The Open Group Standard for Information Technology --- Portable Operating System Interface (POSIX) Base Specifications, `unistd.h`; The Open Group, issue 8, #link("https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/unistd.h.html")[[src]]]))
 we assert that `x10` contains $1$ in @commit:c:read_fd_write_count.
 Note that this constraint _also_ writes `count` to `A0`; 
 in this VM it is impossible for a commit to be interrupted or fail.
