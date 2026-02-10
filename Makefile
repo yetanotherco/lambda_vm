@@ -175,6 +175,8 @@ check:
 	cargo check --workspace
 
 # === Linting ===
+# op_ref: We pass big integers (U256/U384) and field elements by reference since operator
+# impls delegate to &self internally, avoiding unnecessary 32-48 byte copies.
 
 clippy:
 	cargo clippy --workspace --all-targets -- -D warnings -A clippy::op_ref
