@@ -457,7 +457,7 @@ class ConfigCategories:
             f"Something's not a string: {self.instantiated}",
         )
         reporter.asserts(
-            set(self.instantiated) < set(self.all),
+            set(self.instantiated) <= set(self.all),
             f"Instantiated not a subset of all: {self!r}",
         )
 
@@ -777,7 +777,7 @@ class ArithConstraint:
                 )
             else:
                 reporter.error(
-                    f"Non-scalar value for polynomial constraing: {self!r} {t}"
+                    f"Non-scalar value for polynomial constraint: {self!r} {t}"
                 )
 
         for t in all_iters(self.iters, env, lambda e: [self.poly.typecheck(e)]):
