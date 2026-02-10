@@ -168,14 +168,51 @@ jobs:
             # Unmodified programs - test both base and head
             find target_programs -name '*.elf' -exec basename -s .elf '{}' '+' | \
             sort | xargs -I '{program}' \
-            hyperfine -N -w 5 -r 10 --export-markdown "target_programs/{program}.md" \
+            hyperfine -N -w 5 -r 10 \
+            --export-markdown "target_programs/{program}.md" \
+            --export-json "target_programs/{program}.json" \
             -n "base {program}" "$BASE_CMD target_programs/{program}.elf" \
             -n "head {program}" "$HEAD_CMD target_programs/{program}.elf"
           fi
           echo "benchmark_count=$(find target_programs/*.md | wc -l)" >> $GITHUB_OUTPUT
 
-      - name: Print tables
+      - name: Detect regression
+        id: detect-regression
         if: steps.run-benchmarks.outputs.benchmark_count != 0
+        run: |
+          if [ 'modified' = '${{ matrix.program_state }}' ]; then
+            echo "Modified programs have no baseline, always report"
+            echo "regressed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          REGRESSED=false
+          for json in target_programs/*.json; do
+            [ -f "$json" ] || continue
+            BASE_MEAN=$(jq '.results[0].mean' "$json")
+            HEAD_MEAN=$(jq '.results[1].mean' "$json")
+            PROGRAM=$(basename "$json" .json)
+
+            RESULT=$(awk -v bm="$BASE_MEAN" -v hm="$HEAD_MEAN" -v prog="$PROGRAM" 'BEGIN {
+              if (bm <= 0) {
+                printf "%s: base=%.2fs (invalid baseline, skipping)\n", prog, bm > "/dev/stderr"
+                print "false"
+                exit
+              }
+              pct = ((hm - bm) / bm) * 100
+              printf "%s: base=%.2fs  head=%.2fs  change=%+.1f%%\n", prog, bm, hm, pct > "/dev/stderr"
+              print (pct > 5 ? "true" : "false")
+            }')
+
+            if [ "$RESULT" = "true" ]; then
+              REGRESSED=true
+            fi
+          done
+
+          echo "regressed=$REGRESSED" >> "$GITHUB_OUTPUT"
+
+      - name: Print tables
+        if: steps.detect-regression.outputs.regressed == 'true'
         run: |
           {
             echo "Benchmark Results for ${{ matrix.program_state }} programs :rocket:"
@@ -186,7 +223,7 @@ jobs:
           } | tee -a comment_body.md
 
       - name: Find comment
-        if: ${{ steps.run-benchmarks.outputs.benchmark_count != 0 }}
+        if: steps.detect-regression.outputs.regressed == 'true'
         uses: peter-evans/find-comment@v3
         id: fc
         with:
@@ -195,14 +232,14 @@ jobs:
           body-includes: Benchmark Results for ${{ matrix.program_state }} programs
 
       - name: Create comment
-        if: steps.fc.outputs.comment-id == '' && steps.run-benchmarks.outputs.benchmark_count != 0
+        if: steps.fc.outputs.comment-id == '' && steps.detect-regression.outputs.regressed == 'true'
         uses: peter-evans/create-or-update-comment@v4
         with:
           issue-number: ${{ github.event.pull_request.number }}
           body-path: comment_body.md
 
       - name: Update comment
-        if: steps.fc.outputs.comment-id != '' && steps.run-benchmarks.outputs.benchmark_count != 0
+        if: steps.fc.outputs.comment-id != '' && steps.detect-regression.outputs.regressed == 'true'
         uses: peter-evans/create-or-update-comment@v4
         with:
           comment-id: ${{ steps.fc.outputs.comment-id }}

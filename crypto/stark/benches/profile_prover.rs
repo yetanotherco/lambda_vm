@@ -3,14 +3,14 @@
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
 use math::field::fields::fft_friendly::extensions_goldilocks::Degree3GoldilocksExtensionField;
-use math::field::fields::fft_friendly::u64_goldilocks::U64GoldilocksPrimeField;
+use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
 use stark::examples::fibonacci_multi_column::{
     FibonacciMultiColumnAIR, compute_trace, create_public_inputs,
 };
 use stark::proof::options::ProofOptions;
 use stark::prover::{IsStarkProver, Prover};
 
-type F = U64GoldilocksPrimeField;
+type F = GoldilocksField;
 type E = Degree3GoldilocksExtensionField;
 type FE = FieldElement<F>;
 

@@ -86,9 +86,9 @@ fn test_cpu_operation_compute_arg2_store() {
     op.decode.imm = 0x1234;
     op.decode.op_store = true;
 
-    // STORE uses imm for address calculation (addr = rv1 + imm)
-    // rv2 is the value being stored, not part of address
-    assert_eq!(op.compute_arg2(), 0x1234);
+    // STORE: arg2 = rv2 (the data being stored)
+    // Address is computed separately as res = arg1 + imm
+    assert_eq!(op.compute_arg2(), 0xDEAD_BEEF);
 }
 
 #[test]

@@ -551,12 +551,14 @@ fn test_create_is_bit_constraints() {
 fn test_create_add_constraints() {
     let (constraints, next_idx) = create_add_constraints(0);
 
-    // Should create 2 constraints (carry_0 and carry_1)
-    assert_eq!(constraints.len(), 2);
-    assert_eq!(next_idx, 2);
+    // Should create 4 constraints: 2 for ADD+LOAD, 2 for STORE (res = arg1 + imm)
+    assert_eq!(constraints.len(), 4);
+    assert_eq!(next_idx, 4);
 
     assert_eq!(constraints[0].constraint_idx(), 0);
     assert_eq!(constraints[1].constraint_idx(), 1);
+    assert_eq!(constraints[2].constraint_idx(), 2);
+    assert_eq!(constraints[3].constraint_idx(), 3);
 }
 
 #[test]
@@ -620,13 +622,13 @@ fn test_create_all_cpu_constraints() {
     let (is_bit, add, other, total) = create_all_cpu_constraints();
 
     assert_eq!(is_bit.len(), 30);
-    // ADD constraints: 2 (ADD+LOAD+STORE) + 2 (SUB+BEQ) + 2 (JALR) = 6
-    assert_eq!(add.len(), 6);
+    // ADD constraints: 2 (ADD+LOAD) + 2 (STORE: arg1+imm) + 2 (SUB+BEQ) + 2 (JALR) = 8
+    assert_eq!(add.len(), 8);
     // Other: branch_cond(1) + ebreak(1) + arg1(2) + arg2(2) + rvd(2) + slt_zero(7) + sign_bit_zero(1) + next_pc(2) = 18
     assert_eq!(other.len(), 18);
 
-    // Total should be 30 + 6 + 18 = 54
-    assert_eq!(total, 54);
+    // Total should be 30 + 8 + 18 = 56
+    assert_eq!(total, 56);
     assert_eq!(total, NUM_CPU_CONSTRAINTS);
 }
 

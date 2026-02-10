@@ -27,22 +27,8 @@ See [Guest Program Flamegraphs](#guest-program-flamegraphs) for profiling execut
 Generate a STARK proof for a RISC-V ELF program execution.
 
 ```bash
-# Generate proof with default security (standard)
 cargo run -p cli --release -- prove <PROGRAM.elf> -o proof.cbor
-
-# Generate proof with specific security level
-cargo run -p cli --release -- prove <PROGRAM.elf> -o proof.cbor --security fast
-cargo run -p cli --release -- prove <PROGRAM.elf> -o proof.cbor --security standard
-cargo run -p cli --release -- prove <PROGRAM.elf> -o proof.cbor --security maximum
 ```
-
-#### Security Levels
-
-| Level | Security | FRI Queries | Use Case |
-|-------|----------|-------------|----------|
-| `fast` | Conjecturable 100-bit | 41 | Development, testing, iteration |
-| `standard` | Provable 100-bit | 104 | Production (default) |
-| `maximum` | Provable 128-bit | 140 | High-value applications |
 
 ### Verify
 
@@ -74,7 +60,7 @@ make compile-programs-asm
 cargo run -p cli --release -- execute executor/program_artifacts/asm/add.elf
 
 # Generate and verify a proof
-cargo run -p cli --release -- prove executor/program_artifacts/asm/add.elf -o /tmp/proof.cbor --security fast
+cargo run -p cli --release -- prove executor/program_artifacts/asm/add.elf -o /tmp/proof.cbor
 cargo run -p cli --release -- verify /tmp/proof.cbor executor/program_artifacts/asm/add.elf
 ```
 

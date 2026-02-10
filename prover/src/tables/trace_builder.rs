@@ -8,6 +8,7 @@
 //! The trace generation follows this dependency graph:
 //!
 //! ```text
+//! PHASE 0: ELF → DECODE, MEMORY_INIT (preprocessed tables)
 //! PHASE 1: Logs → CPU ops
 //! PHASE 2: CPU ops → MEMW, LOAD, LT, Bitwise (with state tracking for MEMW/LOAD)
 //! PHASE 3: MEMW → LT ops (timestamp ordering, overflow checks)
@@ -20,12 +21,13 @@
 //! ```ignore
 //! use lambda_vm_prover::tables::trace_builder::Traces;
 //!
-//! let traces = Traces::from_logs(&logs, instructions)?;
-//! // Use traces.cpu, traces.bitwise, traces.lt, traces.memw, traces.load
+//! let traces = Traces::from_elf_and_logs(&elf, &logs)?;
+//! // Use traces.cpu, traces.bitwise, traces.lt, traces.memw, traces.load, traces.memory_init
 //! ```
 
 use std::collections::HashMap;
 
+use executor::elf::Elf;
 use executor::vm::instruction::decoding::Instruction;
 use executor::vm::logs::Log;
 use executor::vm::memory::U64HashMap;
@@ -41,6 +43,8 @@ use super::load::{self, LoadOperation};
 use super::lt::{self, LtOperation};
 use super::memw::{self, MemwOperation};
 use super::mul::{self, MulOperation};
+use super::page::{self, FinalByteState, FinalStateMap, PageConfig};
+use super::register::{self, FinalRegisterStateMap, FinalRegisterWordState};
 use super::types::{GoldilocksExtension, GoldilocksField};
 use crate::Error;
 
@@ -65,6 +69,28 @@ impl MemoryState {
         Self {
             cells: HashMap::new(),
         }
+    }
+
+    /// Initialize memory state from ELF segments.
+    ///
+    /// Pre-populates all ELF bytes with timestamp=0 so that when MEMW first
+    /// accesses an address, it gets the correct initial value for `old_value`.
+    /// This is required for the Memory bus to balance (MEMW-M1 must match PAGE-C3).
+    fn from_elf(elf: &Elf) -> Self {
+        let mut cells = HashMap::new();
+        for segment in &elf.data {
+            for (i, &word) in segment.values.iter().enumerate() {
+                let word_addr = segment.base_addr.wrapping_add(i as u64 * 4);
+                // Split 32-bit word into 4 bytes (little-endian)
+                for byte_offset in 0..4u64 {
+                    let byte_addr = word_addr.wrapping_add(byte_offset);
+                    let byte_value = ((word >> (byte_offset * 8)) & 0xFF) as u8;
+                    // Initial state: value from ELF, timestamp=0
+                    cells.insert(byte_addr, (byte_value, 0));
+                }
+            }
+        }
+        Self { cells }
     }
 
     /// Read a byte from memory. Returns (value, timestamp) or (0, 0) if never written.
@@ -106,10 +132,10 @@ struct RegisterState {
 
 impl RegisterState {
     fn new() -> Self {
-        Self {
-            // All registers start at (0, 0) - value 0 at timestamp 0
-            regs: [(0, 0); 32],
-        }
+        let mut regs = [(0u64, 0u64); 32];
+        // SP (x2) starts at STACK_TOP
+        regs[2] = (page::STACK_TOP, 0);
+        Self { regs }
     }
 
     /// Read a register. Returns (value, last_write_timestamp).
@@ -123,6 +149,40 @@ impl RegisterState {
             // x0 is always 0 and never written
             self.regs[reg as usize] = (value, timestamp);
         }
+    }
+
+    /// Generate the final register state map for the REGISTER table.
+    ///
+    /// Returns a map from register Word address to final (timestamp, value).
+    /// Each register uses 2 Word addresses (reg_addr = 2 * reg_idx, then +0, +1).
+    fn to_final_state_map(&self) -> FinalRegisterStateMap {
+        let mut map = FinalRegisterStateMap::new();
+
+        for reg_idx in 0..32u8 {
+            let (value, timestamp) = self.regs[reg_idx as usize];
+            let base_addr = register::register_base_address(reg_idx);
+
+            // Each register is stored as 2 Words (32-bit each) in little-endian order
+            let value_lo = (value & 0xFFFF_FFFF) as u32;
+            let value_hi = (value >> 32) as u32;
+
+            map.insert(
+                base_addr,
+                FinalRegisterWordState {
+                    timestamp,
+                    value: value_lo,
+                },
+            );
+            map.insert(
+                base_addr + 1,
+                FinalRegisterWordState {
+                    timestamp,
+                    value: value_hi,
+                },
+            );
+        }
+
+        map
     }
 }
 
@@ -318,17 +378,15 @@ fn collect_store_op_from_cpu(op: &CpuOperation, memory_state: &mut MemoryState) 
     // Read old values and timestamps
     let (old_values, old_timestamps) = memory_state.read_bytes(base_address, 8);
 
-    // Pack store value as [lo32, hi32, 0, 0, 0, 0, 0, 0] to match CPU M7
-    let value_bytes = [
-        store_value & 0xFFFF_FFFF,
-        store_value >> 32,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-    ];
+    // Pack ALL 8 bytes of store_value into value_bytes.
+    // Bus 14: MEMW Memory Write receiver reconstructs lo32/hi32 via linear combination
+    //   of all 8 bytes. Must match CPU M7 which sends full rv2 as [lo32, hi32].
+    // Bus 16: only positions 0..byte_count participate (controlled by w2/w4/write8
+    //   multiplicities), so extra bytes don't affect memory consistency.
+    let mut value_bytes = [0u64; 8];
+    for (j, byte) in value_bytes.iter_mut().enumerate() {
+        *byte = (store_value >> (j * 8)) & 0xFF;
+    }
 
     // Create MEMW operation (write) - M7 uses timestamp+1
     let memw_op = MemwOperation::new(
@@ -363,9 +421,10 @@ fn collect_register_ops_from_cpu(
         let reg_value = pack_register_value(op.rv1);
         let reg_addr = 2 * d.rs1 as u64;
         let (_old_val, old_ts) = register_state.read(d.rs1);
-        let old_timestamps = [old_ts; 8];
+        // old_timestamps array is 8 elements but only first 2 are used for registers
+        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
 
-        let memw_op = MemwOperation::new(true, reg_addr, reg_value, op.timestamp, 8, true)
+        let memw_op = MemwOperation::new(true, reg_addr, reg_value, op.timestamp, 2, true)
             .with_old(reg_value, old_timestamps);
         memw_ops.push(memw_op);
         register_state.write(d.rs1, op.rv1, op.timestamp);
@@ -376,9 +435,10 @@ fn collect_register_ops_from_cpu(
         let reg_value = pack_register_value(op.rv2);
         let reg_addr = 2 * d.rs2 as u64;
         let (_old_val, old_ts) = register_state.read(d.rs2);
-        let old_timestamps = [old_ts; 8];
+        // old_timestamps array is 8 elements but only first 2 are used for registers
+        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
 
-        let memw_op = MemwOperation::new(true, reg_addr, reg_value, op.timestamp + 1, 8, true)
+        let memw_op = MemwOperation::new(true, reg_addr, reg_value, op.timestamp + 1, 2, true)
             .with_old(reg_value, old_timestamps);
         memw_ops.push(memw_op);
         register_state.write(d.rs2, op.rv2, op.timestamp + 1);
@@ -390,9 +450,10 @@ fn collect_register_ops_from_cpu(
         let reg_addr = 2 * d.rd as u64;
         let (old_val, old_ts) = register_state.read(d.rd);
         let old_value = pack_register_value(old_val);
-        let old_timestamps = [old_ts; 8];
+        // old_timestamps array is 8 elements but only first 2 are used for registers
+        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
 
-        let memw_op = MemwOperation::new(true, reg_addr, reg_value, op.timestamp + 2, 8, false)
+        let memw_op = MemwOperation::new(true, reg_addr, reg_value, op.timestamp + 2, 2, false)
             .with_old(old_value, old_timestamps);
         memw_ops.push(memw_op);
         register_state.write(d.rd, op.rvd, op.timestamp + 2);
@@ -457,24 +518,20 @@ fn collect_lt_from_memw(memw_ops: &[MemwOperation]) -> Vec<LtOperation> {
             }
         }
 
-        // R1-R3: Address overflow checks
+        // R1-R3: Address overflow checks (unconditional per MEMW-CR13/14/15)
+        // If overflow occurs, LT returns lt=0 and the constraint (expecting lt=1)
+        // rejects the proof via value mismatch.
         if memw_op.width == 2 {
             let addr_plus_1 = memw_op.base_address.wrapping_add(1);
-            if addr_plus_1 > memw_op.base_address {
-                lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_1, false));
-            }
+            lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_1, false));
         }
         if memw_op.width == 4 {
             let addr_plus_3 = memw_op.base_address.wrapping_add(3);
-            if addr_plus_3 > memw_op.base_address {
-                lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_3, false));
-            }
+            lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_3, false));
         }
         if memw_op.width == 8 {
             let addr_plus_7 = memw_op.base_address.wrapping_add(7);
-            if addr_plus_7 > memw_op.base_address {
-                lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_7, false));
-            }
+            lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_7, false));
         }
     }
 
@@ -865,6 +922,180 @@ fn collect_bitwise_from_branch(branch_ops: &[BranchOperation]) -> Vec<BitwiseOpe
     bitwise_ops
 }
 
+/// Collects IS_BYTE lookups from PAGE data (init and fini values).
+///
+/// Each PAGE byte generates 2 IS_BYTE lookups:
+/// - C1: IS_BYTE[init] for initialization range check
+/// - C2: IS_BYTE[fini] for finalization range check
+///
+/// This must be called BEFORE bitwise multiplicities are updated.
+fn collect_bitwise_from_page(elf: &Elf, memory_state: &MemoryState) -> Vec<BitwiseOperation> {
+    use std::collections::BTreeSet;
+
+    let page_size = page::DEFAULT_PAGE_SIZE;
+    let mut bitwise_ops = Vec::new();
+
+    // Collect all pages needed from ELF segments and build init data
+    let mut page_bases: BTreeSet<u64> = BTreeSet::new();
+    let mut elf_page_data: HashMap<u64, Vec<u8>> = HashMap::new();
+
+    for segment in &elf.data {
+        for (i, &word) in segment.values.iter().enumerate() {
+            let word_addr = segment.base_addr + (i as u64 * 4);
+            for byte_offset in 0..4u64 {
+                let byte_addr = word_addr + byte_offset;
+                let byte_value = ((word >> (byte_offset * 8)) & 0xFF) as u8;
+
+                let page_base = page::page_base_for_address(byte_addr, page_size);
+                let offset = page::offset_in_page(byte_addr, page_size);
+
+                page_bases.insert(page_base);
+
+                let page_data = elf_page_data
+                    .entry(page_base)
+                    .or_insert_with(|| vec![0u8; page_size]);
+                page_data[offset] = byte_value;
+            }
+        }
+    }
+
+    // Add stack pages covering from STACK_TOP down to stack_bottom
+    // (same as in generate_page_tables)
+    let stack_size = 4096u64;
+    let stack_bottom = page::STACK_TOP - stack_size;
+    let stack_top_page = page::page_base_for_address(page::STACK_TOP, page_size);
+    page_bases.insert(stack_top_page);
+    let stack_bottom_page = page::page_base_for_address(stack_bottom, page_size);
+    if stack_bottom_page != stack_top_page {
+        page_bases.insert(stack_bottom_page);
+    }
+
+    // Build final state map from memory_state
+    let final_state: FinalStateMap = memory_state
+        .cells
+        .iter()
+        .map(|(&addr, &(value, timestamp))| (addr, FinalByteState { timestamp, value }))
+        .collect();
+
+    // For each page and each byte, add IS_BYTE lookups for init and fini
+    for &page_base in &page_bases {
+        let init_data = elf_page_data.get(&page_base);
+
+        for offset in 0..page_size {
+            let addr = page_base + offset as u64;
+
+            // Get init value (from ELF or 0)
+            let init = init_data.map_or(0u8, |data| data[offset]);
+
+            // Get fini value (from final_state or init if never accessed)
+            let fini = final_state.get(&addr).map_or(init, |state| state.value);
+
+            // C1: IS_BYTE[init]
+            bitwise_ops.push(BitwiseOperation::single_byte(
+                BitwiseOperationType::IsByte,
+                init,
+            ));
+
+            // C2: IS_BYTE[fini]
+            bitwise_ops.push(BitwiseOperation::single_byte(
+                BitwiseOperationType::IsByte,
+                fini,
+            ));
+        }
+    }
+
+    bitwise_ops
+}
+
+// =============================================================================
+// PAGE Table Generation
+// =============================================================================
+
+/// Generates PAGE tables for memory initialization and finalization.
+///
+/// Creates one PAGE table per memory page covering:
+/// 1. ELF segments (code, data, BSS)
+/// 2. Stack region (from STACK_TOP - stack_size to STACK_TOP)
+///
+/// Each PAGE table contains initial values from ELF and final state from execution.
+fn generate_page_tables(
+    elf: &Elf,
+    memory_state: &MemoryState,
+) -> (
+    Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+    Vec<PageConfig>,
+) {
+    use std::collections::BTreeSet;
+
+    let page_size = page::DEFAULT_PAGE_SIZE;
+
+    // Collect all pages needed from ELF segments
+    let mut page_bases: BTreeSet<u64> = BTreeSet::new();
+    let mut elf_page_data: HashMap<u64, Vec<u8>> = HashMap::new();
+
+    for segment in &elf.data {
+        for (i, &word) in segment.values.iter().enumerate() {
+            let word_addr = segment.base_addr + (i as u64 * 4);
+
+            // For each byte in the 32-bit word
+            for byte_offset in 0..4u64 {
+                let byte_addr = word_addr + byte_offset;
+                let byte_value = ((word >> (byte_offset * 8)) & 0xFF) as u8;
+
+                let page_base = page::page_base_for_address(byte_addr, page_size);
+                let offset = page::offset_in_page(byte_addr, page_size);
+
+                page_bases.insert(page_base);
+
+                // Store initial values for this page
+                let page_data = elf_page_data
+                    .entry(page_base)
+                    .or_insert_with(|| vec![0u8; page_size]);
+                page_data[offset] = byte_value;
+            }
+        }
+    }
+
+    // Add stack pages covering from STACK_TOP down to stack_bottom
+    // Stack grows downward from STACK_TOP, so we need pages for both ends
+    // TODO: Make this configurable via MemoryInitConfig
+    let stack_size = 4096u64; // 1 page for now
+    let stack_bottom = page::STACK_TOP - stack_size;
+    // Add page containing STACK_TOP (where SP starts and first accesses happen)
+    let stack_top_page = page::page_base_for_address(page::STACK_TOP, page_size);
+    page_bases.insert(stack_top_page);
+    // Also add page containing stack_bottom (in case stack grows that far)
+    let stack_bottom_page = page::page_base_for_address(stack_bottom, page_size);
+    if stack_bottom_page != stack_top_page {
+        page_bases.insert(stack_bottom_page);
+    }
+
+    // Build final state map from memory_state
+    let final_state: FinalStateMap = memory_state
+        .cells
+        .iter()
+        .map(|(&addr, &(value, timestamp))| (addr, FinalByteState { timestamp, value }))
+        .collect();
+
+    // Generate PAGE tables and configs
+    let mut pages = Vec::new();
+    let mut page_configs = Vec::new();
+
+    for &page_base in &page_bases {
+        let config = if let Some(init_data) = elf_page_data.get(&page_base) {
+            PageConfig::with_data(page_base, page_size, init_data.clone())
+        } else {
+            PageConfig::zero_init(page_base, page_size)
+        };
+
+        let trace = page::generate_page_trace(&config, &final_state);
+        pages.push(trace);
+        page_configs.push(config);
+    }
+
+    (pages, page_configs)
+}
+
 // =============================================================================
 // Trace Generation
 // =============================================================================
@@ -886,7 +1117,7 @@ pub struct Traces {
     /// LOAD memory load with extension trace
     pub load: TraceTable<GoldilocksField, GoldilocksExtension>,
 
-    /// DECODE instruction decoding table
+    /// DECODE instruction decoding table (preprocessed from ELF)
     pub decode: TraceTable<GoldilocksField, GoldilocksExtension>,
 
     /// MUL multiplication trace
@@ -894,6 +1125,15 @@ pub struct Traces {
 
     /// DVRM division/remainder trace
     pub dvrm: TraceTable<GoldilocksField, GoldilocksExtension>,
+
+    /// PAGE tables for memory initialization/finalization (one per page)
+    pub pages: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+
+    /// Page configurations (for bus interactions)
+    pub page_configs: Vec<PageConfig>,
+
+    /// REGISTER table for register initialization/finalization
+    pub register: TraceTable<GoldilocksField, GoldilocksExtension>,
 
     /// BRANCH target calculation trace
     pub branch: TraceTable<GoldilocksField, GoldilocksExtension>,
@@ -903,14 +1143,229 @@ pub struct Traces {
 }
 
 impl Traces {
-    /// Generates all traces from execution logs using phased collection.
+    /// Extract page configurations from ELF without execution.
+    ///
+    /// Used by verifier to reconstruct PAGE AIRs when page layout is deterministic
+    /// (i.e., no dynamic heap allocation). This extracts just the page layout
+    /// (page_base addresses) from ELF, without generating trace data.
+    ///
+    /// Same logic as `generate_page_tables()` but only returns configs, not traces.
+    ///
+    /// # Note
+    /// For full production use, page_configs should be embedded in proof public inputs
+    /// to handle dynamic heap allocation. This function works for programs that only
+    /// use ELF segments and stack.
+    pub fn page_configs_from_elf(elf: &Elf) -> Vec<PageConfig> {
+        use std::collections::BTreeSet;
+
+        let page_size = page::DEFAULT_PAGE_SIZE;
+        let mut page_bases: BTreeSet<u64> = BTreeSet::new();
+
+        // Collect pages from ELF data segments
+        for segment in &elf.data {
+            for (i, _) in segment.values.iter().enumerate() {
+                let word_addr = segment.base_addr + (i as u64 * 4);
+                for byte_offset in 0..4u64 {
+                    let byte_addr = word_addr + byte_offset;
+                    let page_base = page::page_base_for_address(byte_addr, page_size);
+                    page_bases.insert(page_base);
+                }
+            }
+        }
+
+        // Add stack pages (same logic as generate_page_tables)
+        let stack_size = 4096u64;
+        let stack_bottom = page::STACK_TOP - stack_size;
+        let stack_top_page = page::page_base_for_address(page::STACK_TOP, page_size);
+        page_bases.insert(stack_top_page);
+        let stack_bottom_page = page::page_base_for_address(stack_bottom, page_size);
+        if stack_bottom_page != stack_top_page {
+            page_bases.insert(stack_bottom_page);
+        }
+
+        page_bases
+            .into_iter()
+            .map(|base| PageConfig::zero_init(base, page_size))
+            .collect()
+    }
+
+    /// Generates all traces from ELF and execution logs using phased collection.
     ///
     /// The phases are:
+    /// 0. ELF → DECODE (preprocessed table)
     /// 1. Logs → CPU operations
     /// 2. CPU ops → MEMW, LOAD, LT, Bitwise, Branch (state tracking for MEMW/LOAD)
     /// 3. MEMW → LT operations (timestamp ordering)
     /// 4. LT, MEMW, Branch → Bitwise lookups
-    /// 5. Generate all traces
+    /// 5. Generate all traces including PAGE tables
+    pub fn from_elf_and_logs(elf: &Elf, logs: &[Log]) -> Result<Self, Error> {
+        // =====================================================================
+        // PHASE 0: ELF → DECODE + instructions
+        // =====================================================================
+        // IMPORTANT: Use generate_decode_trace (same as compute_precomputed_commitment)
+        // so the DECODE trace row ordering matches the AIR's hardcoded commitment.
+        // tables_from_elf iterates ELF segments sequentially, but the commitment
+        // is computed via HashMap iteration which may have different ordering.
+        let instructions = decode::instructions_from_elf(elf)
+            .map_err(|e| Error::Execution(format!("Failed to parse instructions: {e}")))?;
+        let (decode_trace, decode_pc_to_row) = decode::generate_decode_trace(&instructions);
+
+        // =====================================================================
+        // PHASE 1: Logs → CPU operations
+        // =====================================================================
+        let cpu_ops = collect_cpu_ops(logs, &instructions)?;
+
+        // =====================================================================
+        // PHASE 2: CPU ops → MEMW, LOAD, LT, Bitwise, Branch
+        // =====================================================================
+        // Processes cpu_ops in order. MEMW/LOAD need state tracking, LT/Bitwise don't.
+        // Initialize memory state from ELF so first accesses get correct old_value.
+        let mut memory_state = MemoryState::from_elf(elf);
+        let mut register_state = RegisterState::new();
+        let (memw_ops, load_ops, mut lt_ops, mut bitwise_ops) =
+            collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
+
+        // Collect BRANCH operations from CPU ops where branch_cond = true
+        let branch_ops: Vec<BranchOperation> = cpu_ops
+            .iter()
+            .filter(|op| op.branch_cond)
+            .map(|op| {
+                BranchOperation::new(
+                    op.decode.pc,
+                    op.decode.imm, // offset as full 64-bit DWordWL (already sign-extended)
+                    op.compute_arg1(), // register value must match CPU's arg1 for bus signature
+                    op.decode.op_jalr,
+                )
+            })
+            .collect();
+
+        // Collect MUL operations from CPU ops where op_mul = true
+        let mut mul_ops: Vec<(MulOperation, bool)> = cpu_ops
+            .iter()
+            .filter(|op| op.decode.op_mul)
+            .map(|op| {
+                let lhs = op.compute_arg1();
+                let lhs_signed = op.decode.signed;
+                // rhs_signed = mp_selector per spec CPU-CA44:
+                // MUL/MULH have mp_selector=1 (both signed), MULHU/MULHSU have mp_selector=0 (rhs unsigned)
+                let rhs_signed = op.decode.mp_selector;
+                let rhs = op.compute_arg2();
+                let wants_hi = op.decode.muldiv_selector;
+                (
+                    MulOperation::new(lhs, lhs_signed, rhs, rhs_signed),
+                    wants_hi,
+                )
+            })
+            .collect();
+
+        // Collect DVRM operations from CPU ops where op_divrem = true
+        let dvrm_ops: Vec<(DvrmOperation, bool)> = cpu_ops
+            .iter()
+            .filter(|op| op.decode.op_divrem)
+            .map(|op| {
+                let n = op.compute_arg1();
+                let d = op.compute_arg2();
+                let signed = op.decode.signed;
+                let wants_remainder = op.decode.muldiv_selector;
+                (DvrmOperation::new(n, d, signed), wants_remainder)
+            })
+            .collect();
+
+        // Collect LT operations from DVRM: |r| < |d| (unsigned comparison)
+        for (op, _wants_remainder) in &dvrm_ops {
+            lt_ops.push(LtOperation::new(op.abs_r(), op.abs_d(), false));
+        }
+
+        // Collect MUL operations from DVRM: d * q = n_sub_r (C13 lo, C14 hi)
+        for (op, _wants_remainder) in &dvrm_ops {
+            let d = op.d;
+            let d_signed = op.signed;
+            let q = op.compute_quotient();
+            let q_signed = op.sign_q();
+            let mul_op = MulOperation::new(d, d_signed, q, q_signed);
+            mul_ops.push((mul_op.clone(), false)); // C13: lo (muldiv_selector=0)
+            mul_ops.push((mul_op, true)); // C14: hi (muldiv_selector=1)
+        }
+
+        // =====================================================================
+        // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
+        // =====================================================================
+        lt_ops.extend(collect_lt_from_memw(&memw_ops));
+
+        // =====================================================================
+        // PHASE 4: All → Bitwise lookups
+        // =====================================================================
+        bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
+        bitwise_ops.extend(collect_bitwise_from_memw(&memw_ops));
+        bitwise_ops.extend(collect_bitwise_from_mul(&mul_ops));
+        bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops));
+        bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
+        // PAGE tables do IS_BYTE lookups for init and fini values (C1, C2)
+        bitwise_ops.extend(collect_bitwise_from_page(elf, &memory_state));
+
+        // =====================================================================
+        // PHASE 5: Generate final traces
+        // =====================================================================
+
+        // Extract halt timestamp from the last ECALL instruction
+        let halt_op = cpu_ops
+            .iter()
+            .rev()
+            .find(|op| op.decode.op_ecall)
+            .ok_or(Error::MissingHaltEcall)?;
+        let halt_trace = halt::generate_halt_trace(halt_op.timestamp);
+
+        let cpu = cpu::generate_cpu_trace(&cpu_ops);
+        let lt = lt::generate_lt_trace(&lt_ops);
+        let memw = memw::generate_memw_trace(&memw_ops);
+        let load = load::generate_load_trace(&load_ops);
+        let mul = mul::generate_mul_trace(&mul_ops);
+        let dvrm = dvrm::generate_dvrm_trace(&dvrm_ops);
+        let branch = branch::generate_branch_trace(&branch_ops);
+
+        let mut bitwise = bitwise::generate_bitwise_trace();
+        bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
+
+        // Update DECODE multiplicities
+        // Each CPU operation looks up the DECODE table once
+        // Padding rows also look up pc=1 (the CPU padding entry)
+        let mut decode = decode_trace;
+        let pc_to_row = decode_pc_to_row;
+        let num_padding_rows = cpu_ops.len().next_power_of_two() - cpu_ops.len();
+        let mut decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
+        decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
+        decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
+
+        // Generate PAGE tables from ELF and final memory state
+        let (pages, page_configs) = generate_page_tables(elf, &memory_state);
+
+        // Generate REGISTER table from final register state
+        let register_final_state = register_state.to_final_state_map();
+        let register_trace = register::generate_register_trace(&register_final_state);
+
+        Ok(Traces {
+            cpu,
+            bitwise,
+            lt,
+            memw,
+            load,
+            decode,
+            mul,
+            dvrm,
+            pages,
+            page_configs,
+            register: register_trace,
+            branch,
+            halt: halt_trace,
+        })
+    }
+
+    /// Generates all traces from execution logs (legacy API).
+    ///
+    /// This is a compatibility wrapper. Prefer `from_elf_and_logs` for new code
+    /// as it generates PAGE tables from ELF data.
+    ///
+    /// Note: This creates empty PAGE tables since no ELF is provided.
     pub fn from_logs(logs: &[Log], instructions: U64HashMap<Instruction>) -> Result<Self, Error> {
         // =====================================================================
         // PHASE 1: Logs → CPU operations
@@ -1034,6 +1489,15 @@ impl Traces {
         decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
         decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
 
+        // Create empty PAGE tables for legacy API
+        // (caller should use from_elf_and_logs for proper PAGE table support)
+        let pages = Vec::new();
+        let page_configs = Vec::new();
+
+        // Generate REGISTER table from final register state
+        let register_final_state = register_state.to_final_state_map();
+        let register_trace = register::generate_register_trace(&register_final_state);
+
         Ok(Traces {
             cpu,
             bitwise,
@@ -1043,6 +1507,9 @@ impl Traces {
             decode,
             mul,
             dvrm,
+            pages,
+            page_configs,
+            register: register_trace,
             branch,
             halt: halt_trace,
         })

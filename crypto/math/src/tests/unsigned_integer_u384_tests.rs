@@ -748,22 +748,22 @@ fn partial_order_works() {
         "d99244c0f4a20348f44b33b288fe57bb99323f09e135c631a80e01b452e68dd6ad3315e5776b713af4a2d7f5f9a2a75",
     );
 
-    assert!(&a <= &a);
-    assert!(&a >= &a);
-    assert!(&a >= &a);
-    assert!(&a <= &a);
-    assert!(&a < &(&a + U384::from_u64(1)));
-    assert!(&a <= &(&a + U384::from_u64(1)));
-    assert!(&a + U384::from_u64(1) > a);
-    assert!((&a + U384::from_u64(1) >= a));
-    assert!(&a <= &c);
-    assert!(&a < &c);
-    assert!(&a < &c);
-    assert!(&a <= &c);
-    assert!(&c > &a);
-    assert!(&c >= &a);
-    assert!(&c >= &a);
-    assert!(&c > &a);
+    assert!(a <= a);
+    assert!(a >= a);
+    assert!(a >= a);
+    assert!(a <= a);
+    assert!(a < (a + U384::from_u64(1)));
+    assert!(a <= (a + U384::from_u64(1)));
+    assert!(a + U384::from_u64(1) > a);
+    assert!((a + U384::from_u64(1) >= a));
+    assert!(a <= c);
+    assert!(a < c);
+    assert!(a < c);
+    assert!(a <= c);
+    assert!(c > a);
+    assert!(c >= a);
+    assert!(c >= a);
+    assert!(c > a);
     assert!(a < c);
 }
 
@@ -886,7 +886,7 @@ fn shift_left_on_384_bit_integer_works_2() {
 fn shift_left_on_384_bit_integer_works_3() {
     let a = U384::from_hex_unchecked("10");
     let b = U384::from_hex_unchecked("1000");
-    assert_eq!(&a << 8, b);
+    assert_eq!(a << 8, b);
 }
 
 #[test]
@@ -904,7 +904,7 @@ fn shift_left_on_384_bit_integer_works_5() {
     let b = U384::from_hex_unchecked(
         "6607e9ad85a395e18494d604736cf35072155337d5aed7801276378350203eb9c0000000000000000000000000000000",
     );
-    assert_eq!(&a << 125, b);
+    assert_eq!(a << 125, b);
 }
 
 #[test]
@@ -913,7 +913,7 @@ fn shift_left_on_384_bit_integer_works_6() {
     let b = U384::from_hex_unchecked(
         "762e8968bc392ed786ab132f0b5b0cacd385dd51de3a00000000000000000000000000000000",
     );
-    assert_eq!(&a << (64 * 2), b);
+    assert_eq!(a << (64 * 2), b);
 }
 
 #[test]
@@ -921,7 +921,7 @@ fn shift_left_on_384_bit_integer_works_7() {
     let a = U384::from_hex_unchecked("90823e0bd707f");
     let b =
         U384::from_hex_unchecked("90823e0bd707f000000000000000000000000000000000000000000000000");
-    assert_eq!(&a << (64 * 3), b);
+    assert_eq!(a << (64 * 3), b);
 }
 
 #[test]
@@ -935,7 +935,7 @@ fn shift_right_on_384_bit_integer_works_1() {
 fn shift_right_on_384_bit_integer_works_2() {
     let a = U384::from_hex_unchecked("10");
     let b = U384::from_hex_unchecked("1000");
-    assert_eq!(&b >> 8, a);
+    assert_eq!(b >> 8, a);
 }
 
 #[test]
@@ -953,7 +953,7 @@ fn shift_right_on_384_bit_integer_works_4() {
     let b = U384::from_hex_unchecked(
         "6607e9ad85a395e18494d604736cf35072155337d5aed7801276378350203eb9c0000000000000000000000000000000",
     );
-    assert_eq!(&b >> 125, a);
+    assert_eq!(b >> 125, a);
 }
 
 #[test]
@@ -971,7 +971,7 @@ fn shift_right_on_384_bit_integer_works_6() {
         "076c075d2f65e39b9ecdde8bf6f8c94241962ce0f557b7739673200c777152eb7e772ad35",
     );
     let b = U384::from_hex_unchecked("ed80eba5ecbc7373d9bbd17edf19284832c59c1eaaf6ee7");
-    assert_eq!(&a >> 99, b);
+    assert_eq!(a >> 99, b);
 }
 
 #[test]
@@ -980,7 +980,7 @@ fn shift_right_on_384_bit_integer_works_7() {
         "6a9ce35d8940a5ebd29604ce9a182ade76f03f7e9965760b84a8cfd1d3dd2e612669fe000e58b2af688fd90",
     );
     let b = U384::from_hex_unchecked("6a9ce35d8940a5ebd29604ce9a182ade76f03f7");
-    assert_eq!(&a >> (64 * 3), b);
+    assert_eq!(a >> (64 * 3), b);
 }
 
 #[test]
@@ -989,7 +989,7 @@ fn shift_right_on_384_bit_integer_works_8() {
         "5322c128ec84081b6c376c108ebd7fd36bbd44f71ee5e6ad6bcb3dd1c5265bd7db75c90b2665a0826d17600f0e9",
     );
     let b = U384::from_hex_unchecked("5322c128ec84081b6c376c108ebd7fd36bbd44f71ee5e6ad6bcb3dd1c52");
-    assert_eq!(&a >> (64 * 2), b);
+    assert_eq!(a >> (64 * 2), b);
 }
 
 #[test]
