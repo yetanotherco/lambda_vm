@@ -175,10 +175,12 @@ check:
 	cargo check --workspace
 
 # === Linting ===
+# op_ref: We pass big integers (U256/U384) and field elements by reference since operator
+# impls delegate to &self internally, avoiding unnecessary 32-48 byte copies.
 
 clippy:
-	cargo clippy --workspace --all-targets -- -D warnings
-	cargo clippy --workspace --all-targets --no-default-features --features lambda-vm-prover/debug-checks -- -D warnings
+	cargo clippy --workspace --all-targets -- -D warnings -A clippy::op_ref
+	cargo clippy --workspace --all-targets --no-default-features --features lambda-vm-prover/debug-checks -- -D warnings -A clippy::op_ref
 
 fmt:
 	cargo fmt --all
@@ -186,8 +188,8 @@ fmt:
 # Run clippy + fmt check (used by CI)
 lint:
 	cargo fmt --check --all
-	cargo clippy --workspace --all-targets -- -D warnings
-	cargo clippy --workspace --all-targets --no-default-features --features lambda-vm-prover/debug-checks -- -D warnings
+	cargo clippy --workspace --all-targets -- -D warnings -A clippy::op_ref
+	cargo clippy --workspace --all-targets --no-default-features --features lambda-vm-prover/debug-checks -- -D warnings -A clippy::op_ref
 
 flamegraph-prover:
 	cd crypto/stark && samply record cargo bench --bench profile_prover --features parallel
