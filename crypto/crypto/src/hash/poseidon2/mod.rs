@@ -262,24 +262,34 @@ impl Poseidon2 {
     }
 
     /// Hash multiple field elements using sponge construction, returning 128-bit digest.
+    ///
+    /// Uses 10* padding: inputs || 1 || 0* to align to RATE boundary.
+    /// This implementation processes chunks in-place without allocating.
     pub fn hash_many(inputs: &[Fp]) -> Digest {
         let mut hasher = Self::new();
 
-        // Pad input with 1 followed by 0s (if necessary)
-        let mut values = inputs.to_vec();
-        values.push(Fp::from(1u64)); // Padding
-        while !values.len().is_multiple_of(RATE) {
-            values.push(Fp::zero());
-        }
-
-        // Absorb phase: process input in chunks of RATE
-        for chunk in values.chunks(RATE) {
-            // XOR chunk into state (first RATE elements)
+        // Process complete chunks directly from input (no allocation)
+        let complete_chunks = inputs.len() / RATE;
+        for chunk in inputs.chunks_exact(RATE).take(complete_chunks) {
             for (i, val) in chunk.iter().enumerate() {
                 hasher.state[i] = &hasher.state[i] + val;
             }
             hasher.permute();
         }
+
+        // Handle final partial chunk + 10* padding
+        let remainder = &inputs[complete_chunks * RATE..];
+
+        // Absorb remaining elements
+        for (i, val) in remainder.iter().enumerate() {
+            hasher.state[i] = &hasher.state[i] + val;
+        }
+
+        // Add 10* padding: 1 followed by zeros (zeros already in state)
+        hasher.state[remainder.len()] = &hasher.state[remainder.len()] + &Fp::from(1u64);
+
+        // Final permutation
+        hasher.permute();
 
         // Squeeze phase: return first two elements
         [hasher.state[0], hasher.state[1]]
