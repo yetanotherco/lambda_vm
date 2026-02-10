@@ -766,7 +766,7 @@ poly = ["-", ["idx", ["cast", "arg2", "DWordWL"], 0], ["*", ["not", "LOAD"], ["i
 
 [[constraints.ext]]
 kind = "arith"
-constraint = "$#`arg2[4:]` = (1 - #`LOAD`) dot ((1 - #`word_instr`) dot #`rv2[2]` + #`signed` dot #`arg2_sign_bit` dot (2^(32) - 1)) + (1 - #`BEQ` - #`BLT`) dot #`imm[1]`$"
+constraint = "$#`arg2[4:]` = (1 - #`LOAD`) dot ((1 - #`word_instr`) dot #`rv2[2]` + #`signed` dot #`arg2_sign_bit` dot (2^(32) - 1)) + (1 - #`BEQ` - #`BLT` - `#STORE`) dot #`imm[1]`$"
 poly = ["-", ["idx", ["cast", "arg2", "DWordWL"], 1], ["*", ["not", "LOAD"], ["not", "word_instr"], ["idx", "rv2", 2]], ["*", ["not", "LOAD"], "signed", "arg2_sign_bit", ["-", ["^", 2, 32], 1]], ["*", ["-", 1, "BEQ", "BLT", "STORE"], ["idx", "imm", 1]]]
 
 [[constraints.ext]]
