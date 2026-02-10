@@ -1,5 +1,3 @@
-#[cfg(feature = "debug-checks")]
-use std::collections::HashMap;
 use std::marker::PhantomData;
 #[cfg(feature = "instruments")]
 use std::time::Instant;
@@ -34,8 +32,6 @@ use super::domain::Domain;
 use super::fri::fri_decommit::FriDecommitment;
 use super::grinding;
 use super::lookup::BusPublicInputs;
-#[cfg(feature = "debug-checks")]
-use super::lookup::bus_name;
 use super::proof::stark::{DeepPolynomialOpening, MultiProof, StarkProof};
 use super::trace::TraceTable;
 use super::traits::AIR;
@@ -1276,109 +1272,8 @@ pub trait IsStarkProver<
             round_1_results.push(round_1_result);
         }
 
-        // =====================================================================
-        // Global Bus Balance Report: Aggregate per-bus sums across all tables
-        // =====================================================================
         #[cfg(feature = "debug-checks")]
-        if needs_logup_challenges {
-            // Collect all per-bus sums across all tables
-            let mut global_bus_sums: HashMap<u64, FieldElement<FieldExtension>> = HashMap::new();
-            // Track senders: (table_name, sum sent)
-            let mut bus_senders: HashMap<u64, Vec<(String, FieldElement<FieldExtension>)>> =
-                HashMap::new();
-            // Track receivers: (table_name, sum received - positive value)
-            let mut bus_receivers: HashMap<u64, Vec<(String, FieldElement<FieldExtension>)>> =
-                HashMap::new();
-            // Global totals for senders and receivers
-            let mut global_sender_sums: HashMap<u64, FieldElement<FieldExtension>> = HashMap::new();
-            let mut global_receiver_sums: HashMap<u64, FieldElement<FieldExtension>> =
-                HashMap::new();
-
-            for round_1_result in &round_1_results {
-                if let Some(bus_inputs) = &round_1_result.bus_public_inputs {
-                    // Aggregate total sums
-                    for (&bus_id, sum) in &bus_inputs.per_bus_sums {
-                        *global_bus_sums
-                            .entry(bus_id)
-                            .or_insert(FieldElement::zero()) += sum.clone();
-                    }
-                    // Aggregate sender sums
-                    for (&bus_id, sum) in &bus_inputs.per_bus_sender_sums {
-                        *global_sender_sums
-                            .entry(bus_id)
-                            .or_insert(FieldElement::zero()) += sum.clone();
-                        bus_senders
-                            .entry(bus_id)
-                            .or_default()
-                            .push((bus_inputs.table_name.clone(), sum.clone()));
-                    }
-                    // Aggregate receiver sums (already positive)
-                    for (&bus_id, sum) in &bus_inputs.per_bus_receiver_sums {
-                        *global_receiver_sums
-                            .entry(bus_id)
-                            .or_insert(FieldElement::zero()) += sum.clone();
-                        bus_receivers
-                            .entry(bus_id)
-                            .or_default()
-                            .push((bus_inputs.table_name.clone(), sum.clone()));
-                    }
-                }
-            }
-
-            // Report results
-            eprintln!("\n=== GLOBAL BUS BALANCE REPORT ===");
-            let zero = FieldElement::<FieldExtension>::zero();
-            let mut bus_ids: Vec<_> = global_bus_sums.keys().copied().collect();
-            bus_ids.sort();
-            for bus_id in bus_ids {
-                let total = &global_bus_sums[&bus_id];
-                if *total != zero {
-                    eprintln!("Bus {:2} ({:10}): IMBALANCED", bus_id, bus_name(bus_id));
-
-                    // Show senders
-                    if let Some(senders) = bus_senders.get(&bus_id) {
-                        eprintln!("  SENDERS:");
-                        for (table_name, sum) in senders {
-                            eprintln!("    [{:12}]: {:?}", table_name, sum);
-                        }
-                        if let Some(total_sent) = global_sender_sums.get(&bus_id) {
-                            eprintln!("    → Total sent: {:?}", total_sent);
-                        }
-                    }
-
-                    // Show receivers
-                    if let Some(receivers) = bus_receivers.get(&bus_id) {
-                        eprintln!("  RECEIVERS:");
-                        for (table_name, sum) in receivers {
-                            eprintln!("    [{:12}]: {:?}", table_name, sum);
-                        }
-                        if let Some(total_recv) = global_receiver_sums.get(&bus_id) {
-                            eprintln!("    → Total received: {:?}", total_recv);
-                        }
-                    }
-
-                    eprintln!("  IMBALANCE: {:?}\n", total);
-                } else {
-                    eprintln!("Bus {:2} ({:10}): BALANCED ✓", bus_id, bus_name(bus_id));
-                }
-            }
-            eprintln!("=================================\n");
-
-            // Run BusDebugTracker mismatch analysis
-            {
-                use crate::bus_debug::BUS_DEBUG_TRACKER;
-
-                let tracker = BUS_DEBUG_TRACKER.lock().unwrap();
-                if !tracker.is_empty() {
-                    eprintln!(
-                        "[BusDebugTracker] Logged {} interactions, running analysis...",
-                        tracker.len()
-                    );
-                    let report = tracker.analyze_mismatches();
-                    report.print_summary();
-                }
-            }
-        }
+        print_bus_balance_report(&round_1_results);
 
         // =====================================================================
         // Rounds 2-4: Standard STARK protocol for each AIR
@@ -1607,6 +1502,122 @@ pub trait IsStarkProver<
             public_inputs: pub_inputs.clone(),
             trace_length: domain.interpolation_domain_size,
         })
+    }
+}
+
+/// Print a global bus balance report aggregating per-bus sums across all tables.
+///
+/// Uses numeric bus IDs only (no VM-specific names) to keep the stark crate generic.
+/// For bus ID → name mapping, see `BusId` in the prover crate.
+#[cfg(feature = "debug-checks")]
+fn print_bus_balance_report<Field, FieldExtension>(
+    round_1_results: &[Round1<Field, FieldExtension>],
+) where
+    Field: IsSubFieldOf<FieldExtension> + IsFFTField,
+    FieldExtension: IsField,
+    FieldElement<Field>: AsBytes,
+    FieldElement<FieldExtension>: AsBytes,
+{
+    use std::collections::HashMap;
+
+    let has_logup = round_1_results
+        .iter()
+        .any(|r| r.bus_public_inputs.is_some());
+    if !has_logup {
+        return;
+    }
+
+    let mut global_bus_sums: HashMap<u64, FieldElement<FieldExtension>> = HashMap::new();
+    let mut bus_senders: HashMap<u64, Vec<(String, FieldElement<FieldExtension>)>> = HashMap::new();
+    let mut bus_receivers: HashMap<u64, Vec<(String, FieldElement<FieldExtension>)>> =
+        HashMap::new();
+    let mut global_sender_sums: HashMap<u64, FieldElement<FieldExtension>> = HashMap::new();
+    let mut global_receiver_sums: HashMap<u64, FieldElement<FieldExtension>> = HashMap::new();
+
+    for round_1_result in round_1_results {
+        if let Some(bus_inputs) = &round_1_result.bus_public_inputs {
+            for (&bus_id, sum) in &bus_inputs.per_bus_sums {
+                *global_bus_sums
+                    .entry(bus_id)
+                    .or_insert(FieldElement::zero()) += sum.clone();
+            }
+            for (&bus_id, sum) in &bus_inputs.per_bus_sender_sums {
+                *global_sender_sums
+                    .entry(bus_id)
+                    .or_insert(FieldElement::zero()) += sum.clone();
+                bus_senders
+                    .entry(bus_id)
+                    .or_default()
+                    .push((bus_inputs.table_name.clone(), sum.clone()));
+            }
+            for (&bus_id, sum) in &bus_inputs.per_bus_receiver_sums {
+                *global_receiver_sums
+                    .entry(bus_id)
+                    .or_insert(FieldElement::zero()) += sum.clone();
+                bus_receivers
+                    .entry(bus_id)
+                    .or_default()
+                    .push((bus_inputs.table_name.clone(), sum.clone()));
+            }
+        }
+    }
+
+    eprintln!("\n=== GLOBAL BUS BALANCE REPORT ===");
+    let zero = FieldElement::<FieldExtension>::zero();
+    let mut bus_ids: Vec<_> = global_bus_sums.keys().copied().collect();
+    bus_ids.sort();
+    for bus_id in bus_ids {
+        let total = &global_bus_sums[&bus_id];
+        if *total != zero {
+            eprintln!("Bus {:2}: IMBALANCED", bus_id);
+
+            if let Some(senders) = bus_senders.get(&bus_id) {
+                eprintln!("  SENDERS:");
+                for (table_name, sum) in senders {
+                    eprintln!("    [{:12}]: {:?}", table_name, sum);
+                }
+                if let Some(total_sent) = global_sender_sums.get(&bus_id) {
+                    eprintln!("    → Total sent: {:?}", total_sent);
+                }
+            }
+
+            if let Some(receivers) = bus_receivers.get(&bus_id) {
+                eprintln!("  RECEIVERS:");
+                for (table_name, sum) in receivers {
+                    eprintln!("    [{:12}]: {:?}", table_name, sum);
+                }
+                if let Some(total_recv) = global_receiver_sums.get(&bus_id) {
+                    eprintln!("    → Total received: {:?}", total_recv);
+                }
+            }
+
+            eprintln!("  IMBALANCE: {:?}\n", total);
+        } else {
+            eprintln!("Bus {:2}: BALANCED ✓", bus_id);
+        }
+    }
+    eprintln!("=================================\n");
+
+    {
+        use crate::bus_debug::BUS_DEBUG_TRACKER;
+
+        let tracker = BUS_DEBUG_TRACKER
+            .lock()
+            .expect("[BusDebugTracker] mutex poisoned — debug data may be inconsistent");
+        if !tracker.is_empty() {
+            if tracker.is_truncated() {
+                eprintln!(
+                    "[BusDebugTracker] WARNING: Log truncated at {} entries — results may be incomplete",
+                    tracker.len()
+                );
+            }
+            eprintln!(
+                "[BusDebugTracker] Logged {} interactions, running analysis...",
+                tracker.len()
+            );
+            let report = tracker.analyze_mismatches();
+            report.print_summary();
+        }
     }
 }
 

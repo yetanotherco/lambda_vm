@@ -6,8 +6,9 @@
 //! # Example
 //! ```ignore
 //! let elf_bytes = std::fs::read("program.elf").unwrap();
-//! let proof = lambda_vm_prover::prove(&elf_bytes).unwrap();
-//! assert!(lambda_vm_prover::verify(&proof, &elf_bytes).unwrap());
+//! let options = stark::proof::options::ProofOptions::default_test_options();
+//! let proof = lambda_vm_prover::prove(&elf_bytes, &options).unwrap();
+//! assert!(lambda_vm_prover::verify(&proof, &elf_bytes, &options).unwrap());
 //! ```
 
 #[cfg(feature = "dhat-heap")]
@@ -15,6 +16,8 @@
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
 pub mod constraints;
+#[cfg(feature = "debug-checks")]
+mod debug_report;
 pub mod tables;
 pub mod test_utils;
 pub mod tests;
@@ -171,6 +174,10 @@ impl VmAirs {
             .iter()
             .map(|config| create_page_air(proof_options, config.page_base))
             .collect();
+
+        #[cfg(feature = "debug-checks")]
+        debug_report::print_bus_legend();
+
         Self {
             cpu,
             bitwise,
@@ -188,7 +195,10 @@ impl VmAirs {
 }
 
 /// Prove an ELF binary execution. Returns a serializable proof.
-pub fn prove(elf_bytes: &[u8]) -> Result<MultiProof<F, E, ()>, Error> {
+pub fn prove(
+    elf_bytes: &[u8],
+    proof_options: &ProofOptions,
+) -> Result<MultiProof<F, E, ()>, Error> {
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let executor = Executor::new(&program, vec![]).map_err(|e| Error::Execution(format!("{e}")))?;
     let result = executor
@@ -198,9 +208,7 @@ pub fn prove(elf_bytes: &[u8]) -> Result<MultiProof<F, E, ()>, Error> {
     // Generate all traces from ELF and execution logs
     // This uses the combined ELF processing to generate DECODE and PAGE tables
     let mut traces = Traces::from_elf_and_logs(&program, &result.logs)?;
-
-    let proof_options = ProofOptions::default_test_options();
-    let airs = VmAirs::new(&program, &proof_options, false, &traces.page_configs);
+    let airs = VmAirs::new(&program, proof_options, false, &traces.page_configs);
 
     Prover::multi_prove(
         airs.air_trace_pairs(&mut traces),
@@ -218,13 +226,15 @@ pub fn prove(elf_bytes: &[u8]) -> Result<MultiProof<F, E, ()>, Error> {
 /// For full production use with dynamic heap allocation, page_configs should be
 /// embedded in proof public inputs. This implementation assumes deterministic
 /// page layout derivable from ELF.
-pub fn verify(proof: &MultiProof<F, E, ()>, elf_bytes: &[u8]) -> Result<bool, Error> {
+pub fn verify(
+    proof: &MultiProof<F, E, ()>,
+    elf_bytes: &[u8],
+    proof_options: &ProofOptions,
+) -> Result<bool, Error> {
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
-    let proof_options = ProofOptions::default_test_options();
-
     // Derive page layout from ELF (works for programs without dynamic heap)
     let page_configs = Traces::page_configs_from_elf(&program);
-    let airs = VmAirs::new(&program, &proof_options, false, &page_configs);
+    let airs = VmAirs::new(&program, proof_options, false, &page_configs);
 
     Ok(Verifier::multi_verify(
         &airs.air_refs(),
@@ -234,7 +244,7 @@ pub fn verify(proof: &MultiProof<F, E, ()>, elf_bytes: &[u8]) -> Result<bool, Er
 }
 
 /// Prove and verify in one call (convenience).
-pub fn prove_and_verify(elf_bytes: &[u8]) -> Result<bool, Error> {
-    let proof = prove(elf_bytes)?;
-    verify(&proof, elf_bytes)
+pub fn prove_and_verify(elf_bytes: &[u8], proof_options: &ProofOptions) -> Result<bool, Error> {
+    let proof = prove(elf_bytes, proof_options)?;
+    verify(&proof, elf_bytes, proof_options)
 }

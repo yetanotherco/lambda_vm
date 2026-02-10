@@ -14,8 +14,8 @@
 //! | Column | Type | Description |
 //! |--------|------|-------------|
 //! | offset | RowIndex | Byte offset within register space |
-//! | init | Byte | Initial value (0 for all registers at start) |
-//! | fini | Byte | Final value after execution |
+//! | init | Word | Initial value (0 for all registers at start) |
+//! | fini | Word | Final value after execution |
 //! | timestamp | DWordWL | Final timestamp (0 if never accessed) |
 
 use std::collections::HashMap;

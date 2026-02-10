@@ -171,6 +171,7 @@ pub fn generate_page_trace(
         data[base + cols::OFFSET] = FE::from(offset as u64);
 
         // Initial value
+        // Safety: init_vals.len() == page_size (guaranteed by with_data resize)
         let init_value = if let Some(ref init_vals) = config.init_values {
             init_vals[offset]
         } else {
@@ -307,11 +308,19 @@ pub fn bus_interactions(page_base: u64) -> Vec<BusInteraction> {
 
 /// Compute the page base address for a given byte address.
 pub fn page_base_for_address(addr: u64, page_size: usize) -> u64 {
+    debug_assert!(
+        page_size.is_power_of_two(),
+        "page_size must be a power of 2"
+    );
     addr & !(page_size as u64 - 1)
 }
 
 /// Compute the offset within a page for a given byte address.
 pub fn offset_in_page(addr: u64, page_size: usize) -> usize {
+    debug_assert!(
+        page_size.is_power_of_two(),
+        "page_size must be a power of 2"
+    );
     (addr & (page_size as u64 - 1)) as usize
 }
 

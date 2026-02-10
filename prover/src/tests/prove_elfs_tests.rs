@@ -556,17 +556,12 @@ fn test_prove_elfs_all_instructions_64() {
 fn test_prove_elfs_all_instructions_64_full() {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let (elf, logs, _instructions) = run_asm_elf("all_instructions_64");
-    // Use from_elf_and_logs to include PAGE tables for Memory bus
-    let mut traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
-
-    println!(
-        "all_instructions_64_full: CPU {} rows, Bitwise {} rows (FULL)",
-        traces.cpu.main_table.height, traces.bitwise.main_table.height,
-    );
-
+    let elf_bytes = crate::test_utils::asm_elf_bytes("all_instructions_64");
+    let proof_options = ProofOptions::default_test_options();
+    let result =
+        crate::prove_and_verify(&elf_bytes, &proof_options).expect("prove_and_verify failed");
     assert!(
-        prove_and_verify_vm_minimal(&elf, &mut traces),
+        result,
         "all_instructions_64_full failed - comprehensive test with full bitwise table"
     );
 }

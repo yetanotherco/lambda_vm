@@ -19,7 +19,7 @@
 //! - stderr - Mismatch report summary
 
 use std::collections::HashMap;
-use std::io::Write;
+use std::fmt::{Debug, Display};
 use std::sync::{LazyLock, Mutex};
 
 /// Single bus interaction log entry
@@ -42,9 +42,13 @@ pub struct BusInteractionLog {
     pub fingerprint: String,
 }
 
-/// Global debug tracker - enabled via `debug-checks` feature flag
+/// Global debug tracker - enabled via `debug-checks` feature flag.
+/// Recovers data on mutex poison instead of panicking.
 pub static BUS_DEBUG_TRACKER: LazyLock<Mutex<BusDebugTracker>> =
     LazyLock::new(|| Mutex::new(BusDebugTracker::new()));
+
+/// Cap at ~1.5 GiB of log data (~400 bytes per entry including heap allocations).
+const MAX_DEBUG_LOGS: usize = 4_000_000;
 
 pub struct BusDebugTracker {
     bus_filter: Option<u64>,
@@ -69,14 +73,22 @@ impl BusDebugTracker {
         }
     }
 
-    /// Log an interaction (optionally filtered by DEBUG_BUS_ID env var)
+    /// Log an interaction (optionally filtered by DEBUG_BUS_ID env var).
+    /// Stops collecting after [`MAX_DEBUG_LOGS`] entries to bound memory usage.
     pub fn log(&mut self, log: BusInteractionLog) {
         if let Some(filter) = self.bus_filter
             && log.bus_id != filter
         {
             return;
         }
-        self.logs.push(log);
+        if self.logs.len() < MAX_DEBUG_LOGS {
+            self.logs.push(log);
+        }
+    }
+
+    /// Returns `true` if the log was truncated due to the capacity limit.
+    pub fn is_truncated(&self) -> bool {
+        self.logs.len() >= MAX_DEBUG_LOGS
     }
 
     /// Get number of logged interactions
@@ -202,45 +214,43 @@ impl BusDebugTracker {
         }
         grouped
     }
+}
 
-    /// Export to CSV
-    pub fn to_csv(&self, path: &str) -> std::io::Result<()> {
-        let mut file = std::fs::File::create(path)?;
-
-        // Header
-        writeln!(
-            file,
-            "table_name,row_idx,bus_id,is_sender,multiplicity,fingerprint,bus_elements"
-        )?;
-
-        // Data
-        for log in &self.logs {
-            let bus_elements_str = format!("{:?}", log.bus_elements);
-            writeln!(
-                file,
-                "{},{},{},{},{},{},\"{}\"",
-                log.table_name,
-                log.row_idx,
-                log.bus_id,
-                log.is_sender,
-                log.multiplicity,
-                log.fingerprint,
-                bus_elements_str.replace('"', "'")
-            )?;
-        }
-
-        eprintln!(
-            "[BusDebugTracker] Wrote {} entries to {}",
-            self.logs.len(),
-            path
-        );
-        Ok(())
+/// Log a bus interaction to the global tracker.
+///
+/// Converts field elements to strings and pushes a [`BusInteractionLog`] entry.
+/// Skips zero-multiplicity rows (padding) since they don't contribute to the bus.
+pub fn log_interaction<M: Display, F: Debug, E: Debug>(
+    table_name: &str,
+    row_idx: usize,
+    bus_id: u64,
+    is_sender: bool,
+    multiplicity: &M,
+    bus_elements: &[E],
+    fingerprint: &F,
+) {
+    let mult_str = format!("{}", multiplicity);
+    if mult_str == "0" {
+        return;
     }
+    let mult_u64: u64 = mult_str
+        .parse()
+        .expect("[BusDebugTracker] multiplicity must be a valid u64");
 
-    /// Clear all logs (useful for multiple test runs)
-    pub fn clear(&mut self) {
-        self.logs.clear();
-    }
+    let log = BusInteractionLog {
+        table_name: table_name.to_string(),
+        row_idx,
+        bus_id,
+        is_sender,
+        multiplicity: mult_u64,
+        bus_elements: bus_elements.iter().map(|e| format!("{:?}", e)).collect(),
+        fingerprint: format!("{:?}", fingerprint),
+    };
+
+    BUS_DEBUG_TRACKER
+        .lock()
+        .expect("[BusDebugTracker] mutex poisoned — debug data may be inconsistent")
+        .log(log);
 }
 
 /// Analysis result showing where mismatches occur
@@ -285,10 +295,14 @@ impl BusMismatchReport {
                     if orphan.bus_elements.len() <= 10 {
                         eprintln!("      bus_elements: {:?}", orphan.bus_elements);
                     } else {
+                        let preview: Vec<_> = orphan.bus_elements.iter().take(2).collect();
                         eprintln!(
-                            "      bus_elements: [{}, {}, ... ({} total)]",
-                            orphan.bus_elements[0],
-                            orphan.bus_elements[1],
+                            "      bus_elements: [{} ... ({} total)]",
+                            preview
+                                .iter()
+                                .map(|s| s.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", "),
                             orphan.bus_elements.len()
                         );
                     }
@@ -310,10 +324,14 @@ impl BusMismatchReport {
                     if orphan.bus_elements.len() <= 10 {
                         eprintln!("      bus_elements: {:?}", orphan.bus_elements);
                     } else {
+                        let preview: Vec<_> = orphan.bus_elements.iter().take(2).collect();
                         eprintln!(
-                            "      bus_elements: [{}, {}, ... ({} total)]",
-                            orphan.bus_elements[0],
-                            orphan.bus_elements[1],
+                            "      bus_elements: [{} ... ({} total)]",
+                            preview
+                                .iter()
+                                .map(|s| s.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", "),
                             orphan.bus_elements.len()
                         );
                     }
@@ -362,13 +380,15 @@ impl BusMismatchReport {
                             first_3
                         );
                     }
-                    let diff = mismatch.total_sent as i64 - mismatch.total_received as i64;
-                    if diff > 0 {
-                        eprintln!("      Deficit: {} lookup(s) not received!", diff);
+                    if mismatch.total_sent > mismatch.total_received {
+                        eprintln!(
+                            "      Deficit: {} lookup(s) not received!",
+                            mismatch.total_sent - mismatch.total_received
+                        );
                     } else {
                         eprintln!(
                             "      Excess: {} lookup(s) received without sending!",
-                            -diff
+                            mismatch.total_received - mismatch.total_sent
                         );
                     }
                 }
@@ -412,23 +432,6 @@ pub struct MultiplicityMismatch {
     pub total_received: u64,
     pub senders: Vec<(String, usize, u64)>, // (table, row, mult)
     pub receivers: Vec<(String, usize, u64)>, // (table, row, mult)
-}
-
-/// Helper to convert a field element's representative to u64 (if small enough)
-/// Used for logging multiplicity values
-pub fn field_to_u64_saturating<F>(val: &math::field::element::FieldElement<F>) -> u64
-where
-    F: math::field::traits::IsField,
-{
-    // Get the representative as a string and parse
-    let repr = format!("{:?}", val);
-    // Try to parse directly - if it fails or overflows, return u64::MAX
-    repr.trim_start_matches("0x")
-        .parse::<u64>()
-        .unwrap_or_else(|_| {
-            // Try hex parsing
-            u64::from_str_radix(repr.trim_start_matches("0x"), 16).unwrap_or(u64::MAX)
-        })
 }
 
 #[cfg(test)]
