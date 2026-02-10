@@ -37,6 +37,7 @@ use super::bitwise::{self, BitwiseOperation, BitwiseOperationType};
 use super::branch::{self, BranchOperation};
 use super::cpu::{self, CpuOperation};
 use super::decode;
+use super::dvrm::{self, DvrmOperation};
 use super::halt;
 use super::load::{self, LoadOperation};
 use super::lt::{self, LtOperation};
@@ -665,6 +666,176 @@ fn collect_bitwise_from_mul(mul_ops: &[(MulOperation, bool)]) -> Vec<BitwiseOper
     bitwise_ops
 }
 
+/// Collects bitwise lookups from DVRM operations.
+///
+/// Generates: IS_HALF (×20), MSB16 (×3), ZERO (×2 per raw op + up to ×4 per unique signed op).
+///
+/// Returns: Vec of bitwise lookups
+fn collect_bitwise_from_dvrm(dvrm_ops: &[(DvrmOperation, bool)]) -> Vec<BitwiseOperation> {
+    let mut bitwise_ops = Vec::with_capacity(dvrm_ops.len() * 24);
+
+    for (op, _wants_remainder) in dvrm_ops {
+        // IS_HALF for n[0..4] (DVRM-A1)
+        for shift in [0, 16, 32, 48] {
+            let half = ((op.n >> shift) & 0xFFFF) as u16;
+            bitwise_ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
+                (half & 0xFF) as u8,
+                (half >> 8) as u8,
+            ));
+        }
+
+        // IS_HALF for d[0..4] (DVRM-A2)
+        for shift in [0, 16, 32, 48] {
+            let half = ((op.d >> shift) & 0xFFFF) as u16;
+            bitwise_ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
+                (half & 0xFF) as u8,
+                (half >> 8) as u8,
+            ));
+        }
+
+        // IS_HALF for r[0..4] (DVRM-C10)
+        let r = op.compute_remainder();
+        for shift in [0, 16, 32, 48] {
+            let half = ((r >> shift) & 0xFFFF) as u16;
+            bitwise_ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
+                (half & 0xFF) as u8,
+                (half >> 8) as u8,
+            ));
+        }
+
+        // IS_HALF for n_sub_r[0..4] (DVRM-C11)
+        let n_sub_r = op.n.wrapping_sub(r);
+        for shift in [0, 16, 32, 48] {
+            let half = ((n_sub_r >> shift) & 0xFFFF) as u16;
+            bitwise_ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
+                (half & 0xFF) as u8,
+                (half >> 8) as u8,
+            ));
+        }
+
+        // IS_HALF for q[0..4] (DVRM-C15)
+        let q = op.compute_quotient();
+        for shift in [0, 16, 32, 48] {
+            let half = ((q >> shift) & 0xFFFF) as u16;
+            bitwise_ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
+                (half & 0xFF) as u8,
+                (half >> 8) as u8,
+            ));
+        }
+
+        // ZERO lookups per raw op (multiplicity = μ_sum = μ_q + μ_r)
+
+        // C8: ZERO[overflow; overflow_sum]
+        // overflow_sum = n[0]+n[1]+n[2]+n[3] - 32769*sign_n + 262141 - d[0]-d[1]-d[2]-d[3]
+        let n_halves: [u32; 4] = [
+            (op.n & 0xFFFF) as u32,
+            ((op.n >> 16) & 0xFFFF) as u32,
+            ((op.n >> 32) & 0xFFFF) as u32,
+            ((op.n >> 48) & 0xFFFF) as u32,
+        ];
+        let d_halves: [u32; 4] = [
+            (op.d & 0xFFFF) as u32,
+            ((op.d >> 16) & 0xFFFF) as u32,
+            ((op.d >> 32) & 0xFFFF) as u32,
+            ((op.d >> 48) & 0xFFFF) as u32,
+        ];
+        let sign_n: u32 = if op.sign_n() { 1 } else { 0 };
+        let overflow_sum = n_halves[0] + n_halves[1] + n_halves[2] + n_halves[3] + 262141
+            - 32769 * sign_n
+            - d_halves[0]
+            - d_halves[1]
+            - d_halves[2]
+            - d_halves[3];
+        bitwise_ops.push(BitwiseOperation::zero(overflow_sum));
+
+        // C20: ZERO[div_by_zero; d[0]+d[1]+d[2]+d[3]]
+        let d_sum = d_halves[0] + d_halves[1] + d_halves[2] + d_halves[3];
+        bitwise_ops.push(BitwiseOperation::zero(d_sum));
+    }
+
+    // MSB16 lookups: one per unique signed op (not per raw op).
+    // The DVRM bus interaction uses Multiplicity::Column(SIGNED)=1, so we
+    // must emit exactly one MSB16 per unique signed (n, d) combo.
+    let mut msb16_seen = std::collections::HashSet::new();
+    for (op, _wants_remainder) in dvrm_ops {
+        if op.signed && msb16_seen.insert(op.clone()) {
+            let r = op.compute_remainder();
+
+            // MSB16[n[3]]
+            let n_3 = ((op.n >> 48) & 0xFFFF) as u16;
+            bitwise_ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::Msb16,
+                (n_3 & 0xFF) as u8,
+                (n_3 >> 8) as u8,
+            ));
+
+            // MSB16[r[3]]
+            let r_3 = ((r >> 48) & 0xFFFF) as u16;
+            bitwise_ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::Msb16,
+                (r_3 & 0xFF) as u8,
+                (r_3 >> 8) as u8,
+            ));
+
+            // MSB16[d[3]]
+            let d_3 = ((op.d >> 48) & 0xFFFF) as u16;
+            bitwise_ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::Msb16,
+                (d_3 & 0xFF) as u8,
+                (d_3 >> 8) as u8,
+            ));
+        }
+    }
+
+    // ZERO lookups for NEG template: one per unique op where sign is set.
+    // C3 uses Multiplicity::Column(SIGN_R) = 1 per unique row where sign_r = 1.
+    // C5 uses Multiplicity::Column(SIGN_D) = 1 per unique row where sign_d = 1.
+    let mut zero_seen = std::collections::HashSet::new();
+    for (op, _wants_remainder) in dvrm_ops {
+        if zero_seen.insert(op.clone()) {
+            // C3: NEG for r (when sign_r = 1)
+            if op.sign_r() {
+                let r = op.compute_remainder();
+                let r_halves: [u32; 4] = [
+                    (r & 0xFFFF) as u32,
+                    ((r >> 16) & 0xFFFF) as u32,
+                    ((r >> 32) & 0xFFFF) as u32,
+                    ((r >> 48) & 0xFFFF) as u32,
+                ];
+                // C3a: ZERO[1-carry_r[0]; r[0]+r[1]]
+                bitwise_ops.push(BitwiseOperation::zero(r_halves[0] + r_halves[1]));
+                // C3b: ZERO[1-carry_r[1]; r[0]+r[1]+r[2]+r[3]]
+                bitwise_ops.push(BitwiseOperation::zero(
+                    r_halves[0] + r_halves[1] + r_halves[2] + r_halves[3],
+                ));
+            }
+
+            // C5: NEG for d (when sign_d = 1)
+            if op.sign_d() {
+                let d_halves: [u32; 4] = [
+                    (op.d & 0xFFFF) as u32,
+                    ((op.d >> 16) & 0xFFFF) as u32,
+                    ((op.d >> 32) & 0xFFFF) as u32,
+                    ((op.d >> 48) & 0xFFFF) as u32,
+                ];
+                // C5a: ZERO[1-carry_d[0]; d[0]+d[1]]
+                bitwise_ops.push(BitwiseOperation::zero(d_halves[0] + d_halves[1]));
+                // C5b: ZERO[1-carry_d[1]; d[0]+d[1]+d[2]+d[3]]
+                bitwise_ops.push(BitwiseOperation::zero(
+                    d_halves[0] + d_halves[1] + d_halves[2] + d_halves[3],
+                ));
+            }
+        }
+    }
+
+    bitwise_ops
+}
+
 /// Collects IS_HALFWORD lookups from MEMW address_add columns.
 ///
 /// Returns: Vec of bitwise lookups
@@ -952,6 +1123,9 @@ pub struct Traces {
     /// MUL multiplication trace
     pub mul: TraceTable<GoldilocksField, GoldilocksExtension>,
 
+    /// DVRM division/remainder trace
+    pub dvrm: TraceTable<GoldilocksField, GoldilocksExtension>,
+
     /// PAGE tables for memory initialization/finalization (one per page)
     pub pages: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 
@@ -1066,7 +1240,7 @@ impl Traces {
             .collect();
 
         // Collect MUL operations from CPU ops where op_mul = true
-        let mul_ops: Vec<(MulOperation, bool)> = cpu_ops
+        let mut mul_ops: Vec<(MulOperation, bool)> = cpu_ops
             .iter()
             .filter(|op| op.decode.op_mul)
             .map(|op| {
@@ -1084,6 +1258,35 @@ impl Traces {
             })
             .collect();
 
+        // Collect DVRM operations from CPU ops where op_divrem = true
+        let dvrm_ops: Vec<(DvrmOperation, bool)> = cpu_ops
+            .iter()
+            .filter(|op| op.decode.op_divrem)
+            .map(|op| {
+                let n = op.compute_arg1();
+                let d = op.compute_arg2();
+                let signed = op.decode.signed;
+                let wants_remainder = op.decode.muldiv_selector;
+                (DvrmOperation::new(n, d, signed), wants_remainder)
+            })
+            .collect();
+
+        // Collect LT operations from DVRM: |r| < |d| (unsigned comparison)
+        for (op, _wants_remainder) in &dvrm_ops {
+            lt_ops.push(LtOperation::new(op.abs_r(), op.abs_d(), false));
+        }
+
+        // Collect MUL operations from DVRM: d * q = n_sub_r (C13 lo, C14 hi)
+        for (op, _wants_remainder) in &dvrm_ops {
+            let d = op.d;
+            let d_signed = op.signed;
+            let q = op.compute_quotient();
+            let q_signed = op.sign_q();
+            let mul_op = MulOperation::new(d, d_signed, q, q_signed);
+            mul_ops.push((mul_op.clone(), false)); // C13: lo (muldiv_selector=0)
+            mul_ops.push((mul_op, true)); // C14: hi (muldiv_selector=1)
+        }
+
         // =====================================================================
         // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
         // =====================================================================
@@ -1095,6 +1298,7 @@ impl Traces {
         bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
         bitwise_ops.extend(collect_bitwise_from_memw(&memw_ops));
         bitwise_ops.extend(collect_bitwise_from_mul(&mul_ops));
+        bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops));
         bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
         // PAGE tables do IS_BYTE lookups for init and fini values (C1, C2)
         bitwise_ops.extend(collect_bitwise_from_page(elf, &memory_state));
@@ -1116,6 +1320,7 @@ impl Traces {
         let memw = memw::generate_memw_trace(&memw_ops);
         let load = load::generate_load_trace(&load_ops);
         let mul = mul::generate_mul_trace(&mul_ops);
+        let dvrm = dvrm::generate_dvrm_trace(&dvrm_ops);
         let branch = branch::generate_branch_trace(&branch_ops);
 
         let mut bitwise = bitwise::generate_bitwise_trace();
@@ -1146,6 +1351,7 @@ impl Traces {
             load,
             decode,
             mul,
+            dvrm,
             pages,
             page_configs,
             register: register_trace,
@@ -1176,7 +1382,7 @@ impl Traces {
             collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
 
         // Collect MUL operations from CPU ops where op_mul = true
-        let mul_ops: Vec<(MulOperation, bool)> = cpu_ops
+        let mut mul_ops: Vec<(MulOperation, bool)> = cpu_ops
             .iter()
             .filter(|op| op.decode.op_mul)
             .map(|op| {
@@ -1194,6 +1400,19 @@ impl Traces {
             })
             .collect();
 
+        // Collect DVRM operations from CPU ops where op_divrem = true
+        let dvrm_ops: Vec<(DvrmOperation, bool)> = cpu_ops
+            .iter()
+            .filter(|op| op.decode.op_divrem)
+            .map(|op| {
+                let n = op.compute_arg1();
+                let d = op.compute_arg2();
+                let signed = op.decode.signed;
+                let wants_remainder = op.decode.muldiv_selector;
+                (DvrmOperation::new(n, d, signed), wants_remainder)
+            })
+            .collect();
+
         // Collect BRANCH operations from CPU ops where branch_cond = true
         let branch_ops: Vec<BranchOperation> = cpu_ops
             .iter()
@@ -1208,6 +1427,22 @@ impl Traces {
             })
             .collect();
 
+        // Collect LT operations from DVRM: |r| < |d| (unsigned comparison)
+        for (op, _wants_remainder) in &dvrm_ops {
+            lt_ops.push(LtOperation::new(op.abs_r(), op.abs_d(), false));
+        }
+
+        // Collect MUL operations from DVRM: d * q = n_sub_r (C13 lo, C14 hi)
+        for (op, _wants_remainder) in &dvrm_ops {
+            let d = op.d;
+            let d_signed = op.signed;
+            let q = op.compute_quotient();
+            let q_signed = op.sign_q();
+            let mul_op = MulOperation::new(d, d_signed, q, q_signed);
+            mul_ops.push((mul_op.clone(), false)); // C13: lo (muldiv_selector=0)
+            mul_ops.push((mul_op, true)); // C14: hi (muldiv_selector=1)
+        }
+
         // =====================================================================
         // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
         // =====================================================================
@@ -1219,6 +1454,7 @@ impl Traces {
         bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
         bitwise_ops.extend(collect_bitwise_from_memw(&memw_ops));
         bitwise_ops.extend(collect_bitwise_from_mul(&mul_ops));
+        bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops));
         bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
 
         // =====================================================================
@@ -1238,6 +1474,7 @@ impl Traces {
         let memw = memw::generate_memw_trace(&memw_ops);
         let load = load::generate_load_trace(&load_ops);
         let mul = mul::generate_mul_trace(&mul_ops);
+        let dvrm = dvrm::generate_dvrm_trace(&dvrm_ops);
         let branch = branch::generate_branch_trace(&branch_ops);
 
         let mut bitwise = bitwise::generate_bitwise_trace();
@@ -1269,6 +1506,7 @@ impl Traces {
             load,
             decode,
             mul,
+            dvrm,
             pages,
             page_configs,
             register: register_trace,

@@ -49,29 +49,8 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
     // Create all AIRs including PAGE and REGISTER tables
     let airs = VmAirs::new(elf, &proof_options, true, &traces.page_configs);
 
-    // Build air_trace_pairs for all tables (core + REGISTER + PAGEs)
-    #[allow(clippy::type_complexity)]
-    let mut air_trace_pairs: Vec<(
-        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
-        &mut stark::trace::TraceTable<F, E>,
-        &(),
-    )> = vec![
-        (&airs.cpu, &mut traces.cpu, &()),
-        (&airs.bitwise, &mut traces.bitwise, &()),
-        (&airs.lt, &mut traces.lt, &()),
-        (&airs.memw, &mut traces.memw, &()),
-        (&airs.load, &mut traces.load, &()),
-        (&airs.decode, &mut traces.decode, &()),
-        (&airs.mul, &mut traces.mul, &()),
-        (&airs.branch, &mut traces.branch, &()),
-        (&airs.halt, &mut traces.halt, &()),
-        (&airs.register, &mut traces.register, &()),
-    ];
-
-    // Add PAGE tables
-    for (i, page_trace) in traces.pages.iter_mut().enumerate() {
-        air_trace_pairs.push((&airs.pages[i], page_trace, &()));
-    }
+    // Build air_trace_pairs for all tables
+    let air_trace_pairs = airs.air_trace_pairs(traces);
 
     let multi_proof =
         match Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])) {

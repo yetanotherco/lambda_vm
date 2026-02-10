@@ -1196,6 +1196,43 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
+    // -------------------------------------------------------------------------
+    // DVRM interaction (for DIV, DIVU, REM, REMU) — CPU-CA45
+    // -------------------------------------------------------------------------
+    // DVRM[rvd; arg1, arg2, signed, muldiv_selector]
+    // multiplicity = DIVREM
+    interactions.push(BusInteraction::sender(
+        BusId::Dvrm,
+        Multiplicity::Column(cols::DIVREM),
+        vec![
+            // arg1 (numerator n) as DWordBL (8 bytes → 2 elements)
+            BusValue::Packed {
+                start_column: cols::ARG1[0],
+                packing: Packing::DWordBL,
+            },
+            // arg2 (denominator d) as DWordBL (8 bytes → 2 elements)
+            BusValue::Packed {
+                start_column: cols::ARG2[0],
+                packing: Packing::DWordBL,
+            },
+            // signed
+            BusValue::Packed {
+                start_column: cols::SIGNED,
+                packing: Packing::Direct,
+            },
+            // result (rvd) as DWordWL (2 words → 2 elements)
+            BusValue::Packed {
+                start_column: cols::RVD_0,
+                packing: Packing::DWordWL,
+            },
+            // muldiv_selector: 0=quotient (DIV), 1=remainder (REM)
+            BusValue::Packed {
+                start_column: cols::MULDIV_SELECTOR,
+                packing: Packing::Direct,
+            },
+        ],
+    ));
+
     // =========================================================================
     // MEMW and LOAD bus interactions (M1, M3, M5, M6, M7)
     // =========================================================================
