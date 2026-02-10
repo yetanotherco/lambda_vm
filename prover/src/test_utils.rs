@@ -35,6 +35,9 @@ use crate::tables::cpu::{
     CpuOperation, bus_interactions as cpu_bus_interactions, cols as cpu_cols,
 };
 use crate::tables::decode::{bus_interactions as decode_bus_interactions, cols as decode_cols};
+use crate::tables::dvrm::{
+    bus_interactions as dvrm_bus_interactions, cols as dvrm_cols, dvrm_constraints,
+};
 use crate::tables::halt::{bus_interactions as halt_bus_interactions, cols as halt_cols};
 use crate::tables::load::{
     bus_interactions as load_bus_interactions, cols as load_cols, constraints as load_constraints,
@@ -604,6 +607,25 @@ pub fn create_mul_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("MUL")
+}
+
+/// Create DVRM AIR with constraints and bus interactions.
+pub fn create_dvrm_air(proof_options: &ProofOptions) -> VmAir {
+    let (constraints, _) = dvrm_constraints(0);
+    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> =
+        constraints.into_iter().map(|c| Box::new(c) as _).collect();
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: dvrm_bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        dvrm_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
 }
 
 /// Create BRANCH AIR with constraints and bus interactions.

@@ -33,16 +33,8 @@ jobs:
         with:
           shared-key: "lambda-vm"
 
-      - name: Run cargo check
-        run: cargo check
-
-      - name: Run cargo clippy
-        run: |
-          cargo clippy -- -D warnings
-
-      - name: Run cargo fmt
-        run: |
-          cargo fmt --all -- --check
+      - name: Run lint checks
+        run: make lint
 
   test:
     # "Test" is a required check, don't change the name

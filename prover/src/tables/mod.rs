@@ -24,6 +24,7 @@ pub mod bitwise;
 pub mod branch;
 pub mod cpu;
 pub mod decode;
+pub mod dvrm;
 pub mod halt;
 pub mod load;
 pub mod lt;

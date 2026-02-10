@@ -758,7 +758,7 @@ fn test_instructions_from_elf_matches_executor() {
     for (pc, executor_instr) in executor_instructions.iter() {
         let verifier_instr = verifier_instructions
             .get(pc)
-            .expect(&format!("Verifier missing instruction at PC {:#x}", pc));
+            .unwrap_or_else(|| panic!("Verifier missing instruction at PC {:#x}", pc));
 
         // Compare by converting to DecodeEntry - this is what the DECODE table uses
         let executor_entry = DecodeEntry::from_instruction(*pc, *executor_instr);
@@ -805,7 +805,7 @@ fn test_instructions_from_elf_matches_executor_complex() {
     for (pc, executor_instr) in executor_instructions.iter() {
         let verifier_instr = verifier_instructions
             .get(pc)
-            .expect(&format!("Verifier missing instruction at PC {:#x}", pc));
+            .unwrap_or_else(|| panic!("Verifier missing instruction at PC {:#x}", pc));
 
         // Compare via DecodeEntry
         let executor_entry = DecodeEntry::from_instruction(*pc, *executor_instr);
@@ -1002,7 +1002,7 @@ fn test_decode_soundness_same_elf_accepted() {
 
     use crate::VmAirs;
     use crate::tables::trace_builder::Traces;
-    use crate::tables::types::{GoldilocksExtension, GoldilocksField};
+    use crate::tables::types::GoldilocksExtension;
 
     type E = GoldilocksExtension;
 
