@@ -23,11 +23,18 @@
 //!
 //! # Domain Separation
 //!
-//! The implementation uses domain separation via the capacity element:
-//! - `hash_single(x)`: domain tag = 1
-//! - `hash(x, y)`: domain tag = 2
-//! - `compress(left, right)`: domain tag = 4 (for 4 field elements)
+//! The implementation uses domain separation via the capacity element (last element
+//! of the state vector). These values follow the Plonky3 convention and are validated
+//! by reference test vectors:
+//!
+//! - `hash_single(x)`: domain tag = 1 (single field element)
+//! - `hash(x, y)`: domain tag = 2 (two field elements)
+//! - `compress(left, right)`: domain tag = 4 (four field elements: two 128-bit digests)
 //! - `hash_many(inputs)`: uses 10* padding (no explicit domain tag)
+//!
+//! **Note:** These small values (1, 2, 4) are part of the Plonky3 specification and
+//! ensure compatibility with the Plonky3 ecosystem. The implementation is validated
+//! against Plonky3 test vectors.
 //!
 //! # References
 //!
@@ -81,12 +88,38 @@ impl Poseidon2 {
 
     /// Apply the full Poseidon2 permutation to the state
     ///
+    /// # Permutation Structure (Plonky3 Variant)
+    ///
+    /// This implementation follows the **Plonky3/HorizenLabs variant** which includes
+    /// an initial external linear layer before the first round of external transformations.
+    /// This structure is validated by test vectors from the reference implementation.
+    ///
+    /// ```text
+    /// external_linear_layer()                    <- Initial layer (Plonky3-specific)
+    /// for i in 0..4 (EXTERNAL_ROUNDS_BEGIN):
+    ///     add_constants -> sbox -> external_linear_layer()
+    /// for i in 0..22 (INTERNAL_ROUNDS):
+    ///     add_constant -> sbox -> internal_linear_layer()
+    /// for i in 0..4 (EXTERNAL_ROUNDS_END):
+    ///     add_constants -> sbox -> external_linear_layer()
+    /// ```
+    ///
+    /// **Note:** The initial `external_linear_layer()` call before the first external
+    /// round means that layer is applied twice at the start (once explicitly, once in
+    /// the first round). This matches the Plonky3 reference and is validated by test
+    /// vectors in `test_poseidon2_plonky3_vector_*`.
+    ///
     /// # Complexity
     ///
     /// - **Time:** O(1) - Fixed 30 rounds (4 external + 22 internal + 4 external)
     /// - **Space:** O(1) - In-place state transformation
+    ///
+    /// # References
+    ///
+    /// - Test vectors: See `test_poseidon2_plonky3_vector_zeros`, `test_poseidon2_plonky3_vector_random`
+    /// - Constants: HorizenLabs/Plonky3 implementation
     pub fn permute(&mut self) {
-        // Initial linear layer (only for initial external rounds)
+        // Initial linear layer (Plonky3 variant - applied before first external round)
         self.external_linear_layer();
 
         // Initial external rounds (after initial linear layer)
@@ -314,6 +347,14 @@ impl Poseidon2 {
 
         // Handle final partial chunk + 10* padding
         let remainder = &inputs[complete_chunks * RATE..];
+
+        // Safety invariant: remainder.len() < RATE by definition of chunks_exact
+        debug_assert!(
+            remainder.len() < RATE,
+            "remainder length {} must be < RATE ({})",
+            remainder.len(),
+            RATE
+        );
 
         // Absorb remaining elements
         for (i, val) in remainder.iter().enumerate() {

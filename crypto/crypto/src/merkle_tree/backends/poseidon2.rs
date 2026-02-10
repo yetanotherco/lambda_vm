@@ -14,8 +14,30 @@ use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 
 /// Poseidon2 Merkle tree backend for single Goldilocks field elements
 ///
-/// Node type: `[Fp; 2]` (128-bit digest, providing ~64-bit collision resistance via birthday bound)
+/// Node type: `[Fp; 2]` (128-bit digest)
 /// Data type: Goldilocks field element (64-bit)
+///
+/// # Security Level
+///
+/// This backend provides approximately **64-bit collision resistance** due to the
+/// birthday bound on 128-bit digests. The security level is calculated as:
+/// - Digest size: 128 bits (2 × 64-bit Goldilocks field elements)
+/// - Collision resistance: ~2^64 operations (birthday paradox)
+/// - Preimage resistance: ~2^128 operations
+///
+/// **Suitable for:**
+/// - Most proof systems and ZK applications
+/// - Short to medium-term security requirements (< 10 years)
+/// - Applications with moderate security requirements
+///
+/// **Not recommended for:**
+/// - Long-term archival (> 10 years) without re-hashing
+/// - High-value asset tracking (> $1M) without additional layers
+/// - Post-quantum security requirements
+/// - Applications requiring 128-bit collision resistance
+///
+/// **For higher security:** Consider using a 256-bit digest backend (e.g., `[Fp; 4]`)
+/// or a standard cryptographic hash like SHA3-256.
 #[derive(Clone, Default)]
 pub struct Poseidon2Backend;
 
@@ -34,10 +56,15 @@ impl IsMerkleTreeBackend for Poseidon2Backend {
 
 /// Poseidon2 Merkle tree backend for vectors of Goldilocks field elements
 ///
-/// Node type: `[Fp; 2]` (128-bit digest, providing ~64-bit collision resistance via birthday bound)
+/// Node type: `[Fp; 2]` (128-bit digest, ~64-bit collision resistance)
 /// Data type: Vec<Goldilocks field element>
 ///
-/// This is useful for committing to rows of field elements (e.g., trace columns)
+/// This is useful for committing to rows of field elements (e.g., trace columns).
+///
+/// # Security Level
+///
+/// See [`Poseidon2Backend`] for detailed security analysis. This backend provides
+/// the same ~64-bit collision resistance.
 #[derive(Clone, Default)]
 pub struct BatchPoseidon2Backend;
 
@@ -45,6 +72,13 @@ impl IsMerkleTreeBackend for BatchPoseidon2Backend {
     type Node = [Fp; 2];
     type Data = Vec<Fp>;
 
+    /// Hash a vector of field elements into a Merkle tree leaf node.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `leaf` is an empty vector. Callers must ensure all data vectors
+    /// contain at least one field element. This is a documented precondition to
+    /// maintain API simplicity while preventing misuse.
     fn hash_data(leaf: &Self::Data) -> Self::Node {
         Poseidon2::hash_vec(leaf)
     }
