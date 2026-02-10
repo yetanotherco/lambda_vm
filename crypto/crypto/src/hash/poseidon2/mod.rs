@@ -80,6 +80,11 @@ impl Poseidon2 {
     }
 
     /// Apply the full Poseidon2 permutation to the state
+    ///
+    /// # Complexity
+    ///
+    /// - **Time:** O(1) - Fixed 30 rounds (4 external + 22 internal + 4 external)
+    /// - **Space:** O(1) - In-place state transformation
     pub fn permute(&mut self) {
         // Initial linear layer (only for initial external rounds)
         self.external_linear_layer();
@@ -226,6 +231,12 @@ impl Poseidon2 {
     // ========================================================================
 
     /// Hash a single field element returning 128-bit digest.
+    ///
+    /// # Complexity
+    ///
+    /// - **Time:** O(1) - Single permutation (30 rounds)
+    /// - **Space:** O(1) - Constant working memory
+    /// - **Permutations:** 1
     pub fn hash_single(x: &Fp) -> Digest {
         let mut hasher = Self::new();
         hasher.state[0] = *x;
@@ -236,6 +247,12 @@ impl Poseidon2 {
     }
 
     /// Hash two field elements returning 128-bit digest.
+    ///
+    /// # Complexity
+    ///
+    /// - **Time:** O(1) - Single permutation (30 rounds)
+    /// - **Space:** O(1) - Constant working memory
+    /// - **Permutations:** 1
     pub fn hash(x: &Fp, y: &Fp) -> Digest {
         let mut hasher = Self::new();
         hasher.state[0] = *x;
@@ -249,6 +266,12 @@ impl Poseidon2 {
     /// Compress two 128-bit digests into one (for Merkle tree internal nodes).
     ///
     /// Takes two `[Fp; 2]` digests and produces a single `[Fp; 2]` digest.
+    ///
+    /// # Complexity
+    ///
+    /// - **Time:** O(1) - Single permutation (30 rounds)
+    /// - **Space:** O(1) - Constant working memory
+    /// - **Permutations:** 1
     pub fn compress(left: &Digest, right: &Digest) -> Digest {
         let mut hasher = Self::new();
         hasher.state[0] = left[0];
@@ -265,6 +288,18 @@ impl Poseidon2 {
     ///
     /// Uses 10* padding: inputs || 1 || 0* to align to RATE boundary.
     /// This implementation processes chunks in-place without allocating.
+    ///
+    /// # Complexity
+    ///
+    /// - **Time:** O(n) where n is the number of input elements
+    /// - **Space:** O(1) - No heap allocation, processes in-place
+    /// - **Permutations:** ⌈(n + 1) / RATE⌉ where RATE = 4
+    ///   - Example: 10 elements → ⌈11/4⌉ = 3 permutations
+    ///
+    /// # Performance Note
+    ///
+    /// This is optimized to avoid allocations. For very large inputs (n > 1000),
+    /// the dominant cost is the permutation operations, not memory management.
     pub fn hash_many(inputs: &[Fp]) -> Digest {
         let mut hasher = Self::new();
 
@@ -302,6 +337,12 @@ impl Poseidon2 {
     /// - **Empty**: Panics (empty input is not allowed)
     /// - **Length 1**: Delegates to [`hash_single`](Self::hash_single)
     /// - **Length 2+**: Delegates to [`hash_many`](Self::hash_many)
+    ///
+    /// # Complexity
+    ///
+    /// - **Length 1:** O(1) - Single permutation
+    /// - **Length n ≥ 2:** O(n) - ⌈(n + 1) / 4⌉ permutations
+    /// - **Space:** O(1) - No heap allocation
     ///
     /// # Panics
     ///
