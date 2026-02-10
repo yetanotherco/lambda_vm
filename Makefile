@@ -177,15 +177,17 @@ check:
 # === Linting ===
 
 clippy:
-	cargo clippy --workspace --all-targets
+	cargo clippy --workspace --all-targets -- -D warnings
+	cargo clippy --workspace --all-targets --no-default-features --features lambda-vm-prover/debug-checks -- -D warnings
 
 fmt:
 	cargo fmt --all
 
-# Run clippy + fmt check
+# Run clippy + fmt check (used by CI)
 lint:
 	cargo fmt --check --all
-	cargo clippy --workspace --all-targets
+	cargo clippy --workspace --all-targets -- -D warnings
+	cargo clippy --workspace --all-targets --no-default-features --features lambda-vm-prover/debug-checks -- -D warnings
 
 flamegraph-prover:
 	cd crypto/stark && samply record cargo bench --bench profile_prover --features parallel
