@@ -6,9 +6,8 @@
 //! # Example
 //! ```ignore
 //! let elf_bytes = std::fs::read("program.elf").unwrap();
-//! let options = stark::proof::options::ProofOptions::default_test_options();
-//! let proof = lambda_vm_prover::prove(&elf_bytes, &options).unwrap();
-//! assert!(lambda_vm_prover::verify(&proof, &elf_bytes, &options).unwrap());
+//! let proof = lambda_vm_prover::prove(&elf_bytes).unwrap();
+//! assert!(lambda_vm_prover::verify(&proof, &elf_bytes).unwrap());
 //! ```
 
 #[cfg(feature = "dhat-heap")]
@@ -167,7 +166,12 @@ impl VmAirs {
 }
 
 /// Prove an ELF binary execution. Returns a serializable proof.
-pub fn prove(
+pub fn prove(elf_bytes: &[u8]) -> Result<MultiProof<F, E, ()>, Error> {
+    prove_with_options(elf_bytes, &ProofOptions::default_proving_options())
+}
+
+/// Prove an ELF binary execution with custom proof options.
+pub fn prove_with_options(
     elf_bytes: &[u8],
     proof_options: &ProofOptions,
 ) -> Result<MultiProof<F, E, ()>, Error> {
@@ -188,7 +192,12 @@ pub fn prove(
 }
 
 /// Verify a proof produced by [`prove`].
-pub fn verify(
+pub fn verify(proof: &MultiProof<F, E, ()>, elf_bytes: &[u8]) -> Result<bool, Error> {
+    verify_with_options(proof, elf_bytes, &ProofOptions::default_proving_options())
+}
+
+/// Verify a proof with custom proof options.
+pub fn verify_with_options(
     proof: &MultiProof<F, E, ()>,
     elf_bytes: &[u8],
     proof_options: &ProofOptions,
@@ -204,7 +213,7 @@ pub fn verify(
 }
 
 /// Prove and verify in one call (convenience).
-pub fn prove_and_verify(elf_bytes: &[u8], proof_options: &ProofOptions) -> Result<bool, Error> {
-    let proof = prove(elf_bytes, proof_options)?;
-    verify(&proof, elf_bytes, proof_options)
+pub fn prove_and_verify(elf_bytes: &[u8]) -> Result<bool, Error> {
+    let proof = prove(elf_bytes)?;
+    verify(&proof, elf_bytes)
 }
