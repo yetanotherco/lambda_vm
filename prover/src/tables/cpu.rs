@@ -52,15 +52,16 @@
 //! - BRANCH: for branch target calculation
 //! - ECALL: for system calls
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
-use crate::ProverError;
-use executor::vm::{
-    instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth},
-    logs::Log,
-    memory::U64HashMap,
-};
-use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
+use super::types::{BusId, DecodeEntry, FE, GoldilocksExtension, GoldilocksField};
+use crate::Error;
+use executor::vm::{instruction::decoding::Instruction, logs::Log, memory::U64HashMap};
+use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
+
+/// PC value used for CPU padding rows. Per spec, this is an odd address (unreachable
+/// during normal execution) with all flags=0. The DECODE table must contain a
+/// corresponding entry at this PC.
+pub const CPU_PADDING_PC: u64 = 1;
 
 // =========================================================================
 // Column indices for CPU table
@@ -87,144 +88,148 @@ pub mod cols {
     /// rd: Destination register index (Byte)
     pub const RD: usize = 5;
 
+    /// read_register1: Whether to read from rs1 (Bit)
+    pub const READ_REGISTER1: usize = 6;
+    /// read_register2: Whether to read from rs2 (Bit)
+    pub const READ_REGISTER2: usize = 7;
     /// write_register: Whether to write back to rd (Bit)
-    pub const WRITE_REGISTER: usize = 6;
+    pub const WRITE_REGISTER: usize = 8;
     /// memory_2bytes: Memory access is 2 bytes (Bit)
-    pub const MEMORY_2BYTES: usize = 7;
+    pub const MEMORY_2BYTES: usize = 9;
     /// memory_4bytes: Memory access is 4 bytes (Bit)
-    pub const MEMORY_4BYTES: usize = 8;
+    pub const MEMORY_4BYTES: usize = 10;
     /// memory_8bytes: Memory access is 8 bytes (Bit)
-    pub const MEMORY_8BYTES: usize = 9;
+    pub const MEMORY_8BYTES: usize = 11;
     /// c_type_instruction: Instruction is 2 bytes (compressed) instead of 4 (Bit)
-    pub const C_TYPE_INSTRUCTION: usize = 10;
+    pub const C_TYPE_INSTRUCTION: usize = 12;
 
     /// imm[0]: Immediate value (low word)
-    pub const IMM_0: usize = 11;
+    pub const IMM_0: usize = 13;
     /// imm[1]: Immediate value (high word)
-    pub const IMM_1: usize = 12;
+    pub const IMM_1: usize = 14;
 
     /// signed: Signed operation flag (Bit)
-    pub const SIGNED: usize = 13;
+    pub const SIGNED: usize = 15;
     /// mp_selector: Multi-purpose selector (branch invert, shift direction, MUL variant)
-    pub const MP_SELECTOR: usize = 14;
+    pub const MP_SELECTOR: usize = 16;
     /// muldiv_selector: Select MUL/DIV output variant
-    pub const MULDIV_SELECTOR: usize = 15;
+    pub const MULDIV_SELECTOR: usize = 17;
     /// word_instr: 32-bit word instruction (requires sign extension)
-    pub const WORD_INSTR: usize = 16;
+    pub const WORD_INSTR: usize = 18;
 
     // ALU selector flags (one-hot encoded)
     /// ADD operation
-    pub const ADD: usize = 17;
+    pub const ADD: usize = 19;
     /// SUB operation
-    pub const SUB: usize = 18;
+    pub const SUB: usize = 20;
     /// SLT (Set Less Than) operation
-    pub const SLT: usize = 19;
+    pub const SLT: usize = 21;
     /// AND operation
-    pub const AND: usize = 20;
+    pub const AND: usize = 22;
     /// OR operation
-    pub const OR: usize = 21;
+    pub const OR: usize = 23;
     /// XOR operation
-    pub const XOR: usize = 22;
+    pub const XOR: usize = 24;
     /// SHIFT operation
-    pub const SHIFT: usize = 23;
+    pub const SHIFT: usize = 25;
     /// JALR (Jump And Link Register)
-    pub const JALR: usize = 24;
+    pub const JALR: usize = 26;
     /// BEQ (Branch if Equal)
-    pub const BEQ: usize = 25;
+    pub const BEQ: usize = 27;
     /// BLT (Branch if Less Than)
-    pub const BLT: usize = 26;
+    pub const BLT: usize = 28;
     /// LOAD operation
-    pub const LOAD: usize = 27;
+    pub const LOAD: usize = 29;
     /// STORE operation
-    pub const STORE: usize = 28;
+    pub const STORE: usize = 30;
     /// MUL operation
-    pub const MUL: usize = 29;
+    pub const MUL: usize = 31;
     /// DIVREM (Division/Remainder) operation
-    pub const DIVREM: usize = 30;
+    pub const DIVREM: usize = 32;
     /// ECALL (Environment Call)
-    pub const ECALL: usize = 31;
+    pub const ECALL: usize = 33;
     /// EBREAK (Environment Break)
-    pub const EBREAK: usize = 32;
+    pub const EBREAK: usize = 34;
 
     // -------------------------------------------------------------------------
     // Output columns
     // -------------------------------------------------------------------------
 
     /// next_pc[0]: Next program counter (low word)
-    pub const NEXT_PC_0: usize = 33;
+    pub const NEXT_PC_0: usize = 35;
     /// next_pc[1]: Next program counter (high word)
-    pub const NEXT_PC_1: usize = 34;
+    pub const NEXT_PC_1: usize = 36;
 
     /// rvd[0]: Value to write to destination register (low word)
-    pub const RVD_0: usize = 35;
+    pub const RVD_0: usize = 37;
     /// rvd[1]: Value to write to destination register (high word)
-    pub const RVD_1: usize = 36;
+    pub const RVD_1: usize = 38;
 
     // -------------------------------------------------------------------------
     // Auxiliary columns
     // -------------------------------------------------------------------------
 
     /// rv1[0]: Register rs1 value (Half - bits 0-15) [DWordWHH]
-    pub const RV1_0: usize = 37;
+    pub const RV1_0: usize = 39;
     /// rv1[1]: Register rs1 value (Half - bits 16-31) [DWordWHH]
-    pub const RV1_1: usize = 38;
+    pub const RV1_1: usize = 40;
     /// rv1[2]: Register rs1 value (Word - bits 32-63) [DWordWHH]
-    pub const RV1_2: usize = 39;
+    pub const RV1_2: usize = 41;
 
     /// rv2[0]: Register rs2 value (Half - bits 0-15) [DWordWHH]
-    pub const RV2_0: usize = 40;
+    pub const RV2_0: usize = 42;
     /// rv2[1]: Register rs2 value (Half - bits 16-31) [DWordWHH]
-    pub const RV2_1: usize = 41;
+    pub const RV2_1: usize = 43;
     /// rv2[2]: Register rs2 value (Word - bits 32-63) [DWordWHH]
-    pub const RV2_2: usize = 42;
+    pub const RV2_2: usize = 44;
 
     /// rv1_sign_bit: Sign bit of rv1 as 32-bit word (for word_instr extension)
-    pub const RV1_SIGN_BIT: usize = 43;
+    pub const RV1_SIGN_BIT: usize = 45;
 
     /// arg1[0..8]: Extended rv1 as DWordBL (8 bytes)
-    pub const ARG1_0: usize = 44;
-    pub const ARG1_1: usize = 45;
-    pub const ARG1_2: usize = 46;
-    pub const ARG1_3: usize = 47;
-    pub const ARG1_4: usize = 48;
-    pub const ARG1_5: usize = 49;
-    pub const ARG1_6: usize = 50;
-    pub const ARG1_7: usize = 51;
+    pub const ARG1_0: usize = 46;
+    pub const ARG1_1: usize = 47;
+    pub const ARG1_2: usize = 48;
+    pub const ARG1_3: usize = 49;
+    pub const ARG1_4: usize = 50;
+    pub const ARG1_5: usize = 51;
+    pub const ARG1_6: usize = 52;
+    pub const ARG1_7: usize = 53;
 
     /// arg2_sign_bit: Sign bit of arg2 as 32-bit word
-    pub const ARG2_SIGN_BIT: usize = 52;
+    pub const ARG2_SIGN_BIT: usize = 54;
 
     /// arg2[0..8]: Extended rv2/imm as DWordBL (8 bytes)
-    pub const ARG2_0: usize = 53;
-    pub const ARG2_1: usize = 54;
-    pub const ARG2_2: usize = 55;
-    pub const ARG2_3: usize = 56;
-    pub const ARG2_4: usize = 57;
-    pub const ARG2_5: usize = 58;
-    pub const ARG2_6: usize = 59;
-    pub const ARG2_7: usize = 60;
+    pub const ARG2_0: usize = 55;
+    pub const ARG2_1: usize = 56;
+    pub const ARG2_2: usize = 57;
+    pub const ARG2_3: usize = 58;
+    pub const ARG2_4: usize = 59;
+    pub const ARG2_5: usize = 60;
+    pub const ARG2_6: usize = 61;
+    pub const ARG2_7: usize = 62;
 
     /// res_sign_bit: Sign bit of res as 32-bit word
-    pub const RES_SIGN_BIT: usize = 61;
+    pub const RES_SIGN_BIT: usize = 63;
 
     /// res[0..8]: ALU result as DWordBL (8 bytes)
-    pub const RES_0: usize = 62;
-    pub const RES_1: usize = 63;
-    pub const RES_2: usize = 64;
-    pub const RES_3: usize = 65;
-    pub const RES_4: usize = 66;
-    pub const RES_5: usize = 67;
-    pub const RES_6: usize = 68;
-    pub const RES_7: usize = 69;
+    pub const RES_0: usize = 64;
+    pub const RES_1: usize = 65;
+    pub const RES_2: usize = 66;
+    pub const RES_3: usize = 67;
+    pub const RES_4: usize = 68;
+    pub const RES_5: usize = 69;
+    pub const RES_6: usize = 70;
+    pub const RES_7: usize = 71;
 
     /// is_equal: Whether rv1 == arg2 (for BEQ)
-    pub const IS_EQUAL: usize = 70;
+    pub const IS_EQUAL: usize = 72;
 
     /// branch_cond: Whether branch is taken
-    pub const BRANCH_COND: usize = 71;
+    pub const BRANCH_COND: usize = 73;
 
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 72;
+    pub const NUM_COLUMNS: usize = 74;
 
     // -------------------------------------------------------------------------
     // Helper ranges for iteration
@@ -250,54 +255,35 @@ pub mod cols {
 
 /// A single CPU cycle to be added to the trace.
 ///
-/// This is a high-level representation that will be converted to
-/// the flat column format during trace generation.
+/// Contains static decode information (from DecodeEntry) plus runtime values
+/// from execution (register values, computed results, etc.).
 #[derive(Debug, Clone, Default)]
 pub struct CpuOperation {
-    // Input (from DECODE)
+    /// Static decode information (shared with DECODE table)
+    pub decode: DecodeEntry,
+
+    /// Timestamp for memory argument coordination
     pub timestamp: u64,
-    pub pc: u64,
-    pub rs1: u8,
-    pub rs2: u8,
-    pub rd: u8,
-    pub write_register: bool,
-    pub memory_2bytes: bool,
-    pub memory_4bytes: bool,
-    pub memory_8bytes: bool,
-    pub c_type_instruction: bool,
-    pub imm: u64,
-    pub signed: bool,
-    pub mp_selector: bool,
-    pub muldiv_selector: bool,
-    pub word_instr: bool,
 
-    // ALU selector (exactly one should be true)
-    pub op_add: bool,
-    pub op_sub: bool,
-    pub op_slt: bool,
-    pub op_and: bool,
-    pub op_or: bool,
-    pub op_xor: bool,
-    pub op_shift: bool,
-    pub op_jalr: bool,
-    pub op_beq: bool,
-    pub op_blt: bool,
-    pub op_load: bool,
-    pub op_store: bool,
-    pub op_mul: bool,
-    pub op_divrem: bool,
-    pub op_ecall: bool,
-    pub op_ebreak: bool,
-
-    // Output
+    /// Next program counter (from execution)
     pub next_pc: u64,
+
+    /// Value to write to destination register (from execution)
     pub rvd: u64,
 
-    // Auxiliary (computed from register file and ALU)
+    /// Value of register rs1 (from execution)
     pub rv1: u64,
+
+    /// Value of register rs2 (from execution)
     pub rv2: u64,
+
+    /// ALU result or memory address (computed)
     pub res: u64,
+
+    /// Whether rv1 == rv2 (for BEQ)
     pub is_equal: bool,
+
+    /// Whether branch is taken
     pub branch_cond: bool,
 }
 
@@ -307,6 +293,43 @@ impl CpuOperation {
         Self::default()
     }
 
+    // =========================================================================
+    // Convenience accessors for decode fields (reduces verbosity)
+    // =========================================================================
+
+    #[inline]
+    pub fn pc(&self) -> u64 {
+        self.decode.pc
+    }
+    #[inline]
+    pub fn rs1(&self) -> u8 {
+        self.decode.rs1
+    }
+    #[inline]
+    pub fn rs2(&self) -> u8 {
+        self.decode.rs2
+    }
+    #[inline]
+    pub fn rd(&self) -> u8 {
+        self.decode.rd
+    }
+    #[inline]
+    pub fn imm(&self) -> u64 {
+        self.decode.imm
+    }
+    #[inline]
+    pub fn word_instr(&self) -> bool {
+        self.decode.word_instr
+    }
+    #[inline]
+    pub fn signed(&self) -> bool {
+        self.decode.signed
+    }
+
+    // =========================================================================
+    // Computation methods
+    // =========================================================================
+
     /// Compute arg1 from rv1 based on word_instr and signed flags.
     ///
     /// Per spec constraint: arg1[4:] = rv1[2] * (1 - word_instr) + (2^32 - 1) * rv1_sign_bit * signed
@@ -315,9 +338,9 @@ impl CpuOperation {
     /// For unsigned word instructions: zero-extend from 32 bits
     /// For signed word instructions: sign-extend from 32 bits
     pub fn compute_arg1(&self) -> u64 {
-        if self.word_instr {
+        if self.decode.word_instr {
             let lower_32 = self.rv1 & 0xFFFF_FFFF;
-            if self.signed && Self::sign_bit_32(self.rv1) {
+            if self.decode.signed && Self::sign_bit_32(self.rv1) {
                 // Sign extend: set upper 32 bits to all 1s
                 lower_32 | (0xFFFF_FFFF_u64 << 32)
             } else {
@@ -338,20 +361,24 @@ impl CpuOperation {
     /// For BEQ/BLT: uses rv2 (full 64-bit, comparing register values)
     /// Otherwise: uses imm (when rs2=0) or rv2, with sign extension for signed word instructions
     pub fn compute_arg2(&self) -> u64 {
-        if self.op_load || self.op_store {
+        if self.decode.op_load || self.decode.op_store {
             // LOAD/STORE: address = rv1 + imm, use full imm
-            self.imm
-        } else if self.op_beq || self.op_blt {
+            self.decode.imm
+        } else if self.decode.op_beq || self.decode.op_blt {
             // BEQ/BLT: compare rv1 vs rv2, use full rv2
             self.rv2
         } else {
             // For other ops, use imm (when rs2=0) or rv2
-            let base = if self.rs2 == 0 { self.imm } else { self.rv2 };
+            let base = if self.decode.rs2 == 0 {
+                self.decode.imm
+            } else {
+                self.rv2
+            };
 
             // For word instructions, apply sign/zero extension based on signed flag
-            if self.word_instr {
+            if self.decode.word_instr {
                 let lower_32 = base & 0xFFFF_FFFF;
-                if self.signed && Self::sign_bit_32(base) {
+                if self.decode.signed && Self::sign_bit_32(base) {
                     // Sign extend: set upper 32 bits to all 1s
                     lower_32 | (0xFFFF_FFFF_u64 << 32)
                 } else {
@@ -381,7 +408,7 @@ impl CpuOperation {
         let res = self.compute_res();
         let res_lo = res & 0xFFFF_FFFF;
 
-        if self.word_instr {
+        if self.decode.word_instr {
             // Sign extend from 32 bits
             let res_sign_bit = Self::sign_bit_32(res);
             if res_sign_bit {
@@ -410,12 +437,12 @@ impl CpuOperation {
         let arg1 = self.compute_arg1();
         let arg2 = self.compute_arg2();
 
-        if self.op_add || self.op_load || self.op_store {
+        if self.decode.op_add || self.decode.op_load || self.decode.op_store {
             // ADD constraint: arg1 + arg2 = res
             // For ADD: computes arithmetic result
             // For LOAD/STORE: computes memory address (rv1 + imm)
             arg1.wrapping_add(arg2)
-        } else if self.op_sub {
+        } else if self.decode.op_sub {
             // SUB constraint checks: res + arg2 = arg1, so res = arg1 - arg2
             arg1.wrapping_sub(arg2)
         } else {
@@ -426,408 +453,190 @@ impl CpuOperation {
     }
 
     /// Collects Bitwise table lookups generated by this CPU operation.
-    ///
-    /// Returns a vector of (BitwiseLookup, x, y, z) tuples to pass to
-    /// `bitwise::update_multiplicities`.
-    pub fn collect_bitwise_lookups(&self) -> Vec<(super::bitwise::BitwiseLookup, u8, u8, u8)> {
-        use super::bitwise::BitwiseLookup;
+    pub fn collect_bitwise_ops(&self) -> Vec<super::bitwise::BitwiseOperation> {
+        use super::bitwise::{BitwiseOperation, BitwiseOperationType};
         let mut lookups = Vec::new();
 
         // MSB16 lookups for sign bit extraction (when word_instr=1)
-        if self.word_instr {
+        if self.decode.word_instr {
             // rv1[1] is bits 16-31, extract as halfword for MSB16 lookup
             let rv1_half = ((self.rv1 >> 16) & 0xFFFF) as u16;
-            let x = (rv1_half & 0xFF) as u8;
-            let y = ((rv1_half >> 8) & 0xFF) as u8;
-            lookups.push((BitwiseLookup::Msb16, x, y, 0));
+            let lo = (rv1_half & 0xFF) as u8;
+            let hi = ((rv1_half >> 8) & 0xFF) as u8;
+            lookups.push(BitwiseOperation::halfword(
+                BitwiseOperationType::Msb16,
+                lo,
+                hi,
+            ));
 
             // rv2[1] for arg2_sign_bit
             let rv2_half = ((self.rv2 >> 16) & 0xFFFF) as u16;
-            let x = (rv2_half & 0xFF) as u8;
-            let y = ((rv2_half >> 8) & 0xFF) as u8;
-            lookups.push((BitwiseLookup::Msb16, x, y, 0));
+            let lo = (rv2_half & 0xFF) as u8;
+            let hi = ((rv2_half >> 8) & 0xFF) as u8;
+            lookups.push(BitwiseOperation::halfword(
+                BitwiseOperationType::Msb16,
+                lo,
+                hi,
+            ));
 
             // res[3] for res_sign_bit (MSB8 on byte at bits 24-31)
             let res_byte = ((self.res >> 24) & 0xFF) as u8;
-            lookups.push((BitwiseLookup::Msb8, res_byte, 0, 0));
+            lookups.push(BitwiseOperation::single_byte(
+                BitwiseOperationType::Msb8,
+                res_byte,
+            ));
         }
 
         // ZERO lookup for is_equal (when BEQ=1)
-        if self.op_beq {
+        if self.decode.op_beq {
             // Sum of all result bytes
             let mut sum: u64 = 0;
             for i in 0..8 {
                 sum += (self.res >> (i * 8)) & 0xFF;
             }
             // Sum fits in 16 bits (max 8 * 255 = 2040)
-            let x = (sum & 0xFF) as u8;
-            let y = ((sum >> 8) & 0xFF) as u8;
-            lookups.push((BitwiseLookup::Zero, x, y, 0));
+            let lo = (sum & 0xFF) as u8;
+            let hi = ((sum >> 8) & 0xFF) as u8;
+            lookups.push(BitwiseOperation::halfword(
+                BitwiseOperationType::Zero,
+                lo,
+                hi,
+            ));
         }
 
         // AND/OR/XOR lookups (×8 each for each byte)
         let arg1 = self.compute_arg1();
         let arg2 = self.compute_arg2();
 
-        if self.op_and {
+        if self.decode.op_and {
             for i in 0..8 {
                 let a = ((arg1 >> (i * 8)) & 0xFF) as u8;
                 let b = ((arg2 >> (i * 8)) & 0xFF) as u8;
-                lookups.push((BitwiseLookup::AndByte, a, b, 0));
+                lookups.push(BitwiseOperation::byte_op(
+                    BitwiseOperationType::AndByte,
+                    a,
+                    b,
+                ));
             }
         }
 
-        if self.op_or {
+        if self.decode.op_or {
             for i in 0..8 {
                 let a = ((arg1 >> (i * 8)) & 0xFF) as u8;
                 let b = ((arg2 >> (i * 8)) & 0xFF) as u8;
-                lookups.push((BitwiseLookup::OrByte, a, b, 0));
+                lookups.push(BitwiseOperation::byte_op(
+                    BitwiseOperationType::OrByte,
+                    a,
+                    b,
+                ));
             }
         }
 
-        if self.op_xor {
+        if self.decode.op_xor {
             for i in 0..8 {
                 let a = ((arg1 >> (i * 8)) & 0xFF) as u8;
                 let b = ((arg2 >> (i * 8)) & 0xFF) as u8;
-                lookups.push((BitwiseLookup::XorByte, a, b, 0));
+                lookups.push(BitwiseOperation::byte_op(
+                    BitwiseOperationType::XorByte,
+                    a,
+                    b,
+                ));
             }
         }
 
         lookups
     }
 
-    /// Creates a CpuOperation from an executor Log.
+    /// Creates a CpuOperation from an executor Log and DecodeEntry.
     ///
-    /// This is the main integration point between the executor and the prover.
-    pub fn from_log(log: &Log, timestamp: u64, instruction: Instruction) -> Self {
+    /// The DecodeEntry contains static instruction information. This method
+    /// adds runtime values from the Log (register values, branch decisions, etc.).
+    pub fn from_log(log: &Log, timestamp: u64, decode: DecodeEntry) -> Self {
         let mut op = Self {
+            decode,
             timestamp,
-            pc: log.current_pc,
             next_pc: log.next_pc,
             rv1: log.src1_val,
             rv2: log.src2_val,
             rvd: log.dst_val,
             res: log.dst_val, // Default: result is destination value
-            ..Default::default()
+            is_equal: false,
+            branch_cond: false,
         };
 
-        match instruction {
-            Instruction::Arith {
-                dst,
-                src1,
-                src2,
-                op: arith_op,
-            } => {
-                op.rd = dst as u8;
-                op.rs1 = src1 as u8;
-                op.rs2 = src2 as u8;
-                if dst != 0 {
-                    op.write_register = true;
-                }
-                Self::set_arith_op(&mut op, arith_op, false);
-            }
-
-            Instruction::ArithImm {
-                dst,
-                src,
-                imm,
-                op: arith_op,
-            } => {
-                op.rd = dst as u8;
-                op.rs1 = src as u8;
-                op.rs2 = 0;
-                op.imm = imm as i64 as u64; // Sign extend
-                if dst != 0 {
-                    op.write_register = true;
-                }
-                Self::set_arith_op(&mut op, arith_op, false);
-            }
-
-            Instruction::ArithW {
-                dst,
-                src1,
-                src2,
-                op: arith_op,
-            } => {
-                op.rd = dst as u8;
-                op.rs1 = src1 as u8;
-                op.rs2 = src2 as u8;
-                op.word_instr = true;
-                if dst != 0 {
-                    op.write_register = true;
-                }
-                Self::set_arith_op(&mut op, arith_op, true);
-            }
-
-            Instruction::ArithImmW {
-                dst,
-                src,
-                imm,
-                op: arith_op,
-            } => {
-                op.rd = dst as u8;
-                op.rs1 = src as u8;
-                op.rs2 = 0;
-                op.imm = imm as i64 as u64; // Sign extend
-                op.word_instr = true;
-                if dst != 0 {
-                    op.write_register = true;
-                }
-                Self::set_arith_op(&mut op, arith_op, true);
-            }
-
-            Instruction::JumpAndLink { dst, offset } => {
-                op.op_jalr = true;
-                op.rd = dst as u8;
-                op.imm = offset as i64 as u64;
-                op.branch_cond = true;
-                if dst != 0 {
-                    op.write_register = true;
-                }
-            }
-
-            Instruction::JumpAndLinkRegister { base, dst, offset } => {
-                op.op_jalr = true;
-                op.rd = dst as u8;
-                op.rs1 = base as u8;
-                op.imm = offset as i64 as u64;
-                op.branch_cond = true;
-                if dst != 0 {
-                    op.write_register = true;
-                }
-            }
-
-            Instruction::Store {
-                src,
-                offset,
-                base,
-                width,
-            } => {
-                op.op_store = true;
-                op.rs1 = base as u8;
-                op.rs2 = src as u8;
-                op.imm = offset as i64 as u64;
-                // res is the memory address = base + offset
-                op.res = (log.src1_val as i64 + offset as i64) as u64;
-                Self::set_memory_width(&mut op, width);
-            }
-
-            Instruction::Load {
-                dst,
-                offset,
-                base,
-                width,
-            } => {
-                op.op_load = true;
-                op.rd = dst as u8;
-                op.rs1 = base as u8;
-                op.imm = offset as i64 as u64;
-                // res is the memory address = base + offset
-                op.res = (log.src1_val as i64 + offset as i64) as u64;
-                if dst != 0 {
-                    op.write_register = true;
-                }
-                Self::set_memory_width(&mut op, width);
-                // Set signed flag for sign-extending loads
-                match width {
-                    LoadStoreWidth::Byte | LoadStoreWidth::Half | LoadStoreWidth::Word => {
-                        op.signed = true;
-                    }
-                    _ => {}
-                }
-            }
-
-            Instruction::Branch {
-                src1,
-                src2,
-                cond,
-                offset,
-            } => {
-                op.rs1 = src1 as u8;
-                op.rs2 = src2 as u8;
-                op.imm = offset as i64 as u64;
-                op.is_equal = log.src1_val == log.src2_val;
-
-                match cond {
-                    Comparison::Equal => {
-                        op.op_beq = true;
-                        // BEQ uses SUB constraint: res = arg1 - arg2
-                        op.res = log.src1_val.wrapping_sub(log.src2_val);
-                        op.branch_cond = log.src1_val == log.src2_val;
-                    }
-                    Comparison::NotEqual => {
-                        op.op_beq = true;
-                        op.mp_selector = true; // Inverted
-                        // BNE uses SUB constraint: res = arg1 - arg2
-                        op.res = log.src1_val.wrapping_sub(log.src2_val);
-                        op.branch_cond = log.src1_val != log.src2_val;
-                    }
-                    Comparison::LessThan => {
-                        op.op_blt = true;
-                        op.signed = true;
-                        // BLT uses LT table: res[0] = comparison result, res[1..7] = 0
-                        let lt_result = (log.src1_val as i64) < (log.src2_val as i64);
-                        op.res = lt_result as u64;
-                        op.branch_cond = lt_result;
-                    }
-                    Comparison::LessThanUnsigned => {
-                        op.op_blt = true;
-                        // BLTU uses LT table: res[0] = comparison result, res[1..7] = 0
-                        let lt_result = log.src1_val < log.src2_val;
-                        op.res = lt_result as u64;
-                        op.branch_cond = lt_result;
-                    }
-                    Comparison::GreaterOrEqual => {
-                        op.op_blt = true;
-                        op.signed = true;
-                        op.mp_selector = true; // Inverted
-                        // BGE uses LT table with inversion: res[0] = arg1 < arg2
-                        let lt_result = (log.src1_val as i64) < (log.src2_val as i64);
-                        op.res = lt_result as u64;
-                        op.branch_cond = !lt_result; // Inverted: >= means NOT <
-                    }
-                    Comparison::GreaterOrEqualUnsigned => {
-                        op.op_blt = true;
-                        op.mp_selector = true; // Inverted
-                        // BGEU uses LT table with inversion: res[0] = arg1 < arg2
-                        let lt_result = log.src1_val < log.src2_val;
-                        op.res = lt_result as u64;
-                        op.branch_cond = !lt_result; // Inverted: >= means NOT <
-                    }
-                }
-            }
-
-            Instruction::LoadUpperImm { dst, imm } => {
-                op.op_add = true;
-                op.rd = dst as u8;
-                op.rs1 = 0;
-                op.rs2 = 0;
-                // LUI immediate must be sign-extended to 64 bits (matches executor)
-                op.imm = (imm as i32) as i64 as u64;
-                if dst != 0 {
-                    op.write_register = true;
-                }
-            }
-
-            Instruction::AddUpperImmToPc { dst, imm } => {
-                op.op_add = true;
-                op.rd = dst as u8;
-                // AUIPC immediate must be sign-extended to 64 bits (matches executor)
-                op.imm = (imm as i32) as i64 as u64;
-                op.rv1 = log.current_pc;
-                if dst != 0 {
-                    op.write_register = true;
-                }
-            }
-            Instruction::CSR { .. } => {
-                // CSR instructions not yet supported in prover
-                // TODO: Add CSR support
-            }
-            Instruction::EcallEbreak => {
-                // Determine if ECALL or EBREAK based on context
-                // For now, default to ECALL
-                op.op_ecall = true;
-            }
-            Instruction::Fence => {
-                // FENCE is a memory barrier - in single-threaded, in-order execution it's a no-op
-                // No operation flags needed, just advance PC (handled by default from log)
-            }
-        }
-
+        // Compute runtime-specific values based on instruction type
+        op.compute_runtime_values(log);
         op
     }
 
-    /// Helper to set ALU operation flags based on ArithOp.
-    fn set_arith_op(op: &mut Self, arith_op: ArithOp, is_word: bool) {
-        match arith_op {
-            ArithOp::Add => {
-                op.op_add = true;
-            }
-            ArithOp::Sub => {
-                op.op_sub = true;
-            }
-            ArithOp::Xor => op.op_xor = true,
-            ArithOp::Or => op.op_or = true,
-            ArithOp::And => op.op_and = true,
-            ArithOp::ShiftLeftLogical => {
-                op.op_shift = true;
-                // mp_selector = 0 for left shift
-            }
-            ArithOp::ShiftRightLogical => {
-                op.op_shift = true;
-                op.mp_selector = true; // mp_selector = 1 for right shift
-            }
-            ArithOp::ShiftRightArith => {
-                op.op_shift = true;
-                op.mp_selector = true;
-                op.signed = true;
-            }
-            ArithOp::SetLessThan => {
-                op.op_slt = true;
-                op.signed = true;
-            }
-            ArithOp::SetLessThanU => {
-                op.op_slt = true;
-            }
-            ArithOp::Mul => {
-                op.op_mul = true;
-                op.mp_selector = true;
-                if !is_word {
-                    op.signed = true;
-                }
-            }
-            ArithOp::MulHigh => {
-                op.op_mul = true;
-                op.muldiv_selector = true;
-                op.signed = true;
-            }
-            ArithOp::MulHighSignedUnsigned => {
-                op.op_mul = true;
-                op.muldiv_selector = true;
-                op.mp_selector = true;
-                op.signed = true;
-            }
-            ArithOp::MulHighUnsigned => {
-                op.op_mul = true;
-                op.muldiv_selector = true;
-            }
-            ArithOp::Div => {
-                op.op_divrem = true;
-                op.signed = true;
-            }
-            ArithOp::DivUnsigned => {
-                op.op_divrem = true;
-            }
-            ArithOp::Remainder => {
-                op.op_divrem = true;
-                op.muldiv_selector = true;
-                op.signed = true;
-            }
-            ArithOp::RemainderUnsigned => {
-                op.op_divrem = true;
-                op.muldiv_selector = true;
-            }
-        }
+    /// Creates a CpuOperation from Log and Instruction (convenience method).
+    ///
+    /// This creates the DecodeEntry internally. Use `from_log` with a pre-built
+    /// DecodeEntry when possible to avoid redundant decoding.
+    pub fn from_log_and_instruction(log: &Log, timestamp: u64, instruction: Instruction) -> Self {
+        let decode = DecodeEntry::from_instruction(log.current_pc, instruction);
+        Self::from_log(log, timestamp, decode)
     }
 
-    /// Helper to set memory width flags.
-    fn set_memory_width(op: &mut Self, width: LoadStoreWidth) {
-        match width {
-            LoadStoreWidth::Byte | LoadStoreWidth::ByteUnsigned => {
-                // 1 byte - no flags set
-            }
-            LoadStoreWidth::Half | LoadStoreWidth::HalfUnsigned => {
-                op.memory_2bytes = true;
-            }
-            LoadStoreWidth::Word | LoadStoreWidth::WordUnsigned => {
-                op.memory_2bytes = true;
-                op.memory_4bytes = true;
-            }
-            LoadStoreWidth::DoubleWord => {
-                op.memory_2bytes = true;
-                op.memory_4bytes = true;
-                op.memory_8bytes = true;
-            }
+    /// Computes runtime-specific values based on the instruction type.
+    ///
+    /// This handles:
+    /// - Memory address computation for LOAD/STORE
+    /// - Branch condition and result computation for BEQ/BLT
+    /// - AUIPC special case (rv1 = current_pc)
+    /// - JALR branch_cond = true
+    fn compute_runtime_values(&mut self, log: &Log) {
+        // JALR: always jumps
+        if self.decode.op_jalr {
+            self.branch_cond = true;
+        }
+
+        // LOAD/STORE: res = memory address = rv1 + imm
+        if self.decode.op_load || self.decode.op_store {
+            self.res = (log.src1_val as i64 + self.decode.imm as i64) as u64;
+        }
+
+        // BEQ: res = rv1 - rv2, branch if equal (or not equal for BNE)
+        if self.decode.op_beq {
+            self.is_equal = log.src1_val == log.src2_val;
+            self.res = log.src1_val.wrapping_sub(log.src2_val);
+            // mp_selector inverts the condition (BNE vs BEQ)
+            self.branch_cond = if self.decode.mp_selector {
+                log.src1_val != log.src2_val
+            } else {
+                log.src1_val == log.src2_val
+            };
+        }
+
+        // BLT: res = comparison result (0 or 1)
+        if self.decode.op_blt {
+            self.is_equal = log.src1_val == log.src2_val;
+            let lt_result = if self.decode.signed {
+                (log.src1_val as i64) < (log.src2_val as i64)
+            } else {
+                log.src1_val < log.src2_val
+            };
+            self.res = lt_result as u64;
+            // mp_selector inverts the condition (BGE/BGEU vs BLT/BLTU)
+            self.branch_cond = if self.decode.mp_selector {
+                !lt_result
+            } else {
+                lt_result
+            };
+        }
+
+        // AUIPC/JAL: rv1 should be current_pc (special case)
+        // Per spec, these instructions use rs1=255 (virtual PC register)
+        if self.decode.rs1 == 255 {
+            self.rv1 = log.current_pc;
+        }
+
+        // ECALL: Per spec constraint CO69, next_pc = pc + instr_size for all instructions,
+        // including ECALL. The CPU transition constraint enforces next_pc = pc + 4 on every
+        // row, so the trace must satisfy this even though the executor sets next_pc=0 to
+        // signal halt. The HALT table separately proves program termination via the ECALL bus.
+        if self.decode.op_ecall {
+            self.next_pc = self.decode.pc + 4;
         }
     }
 }
@@ -845,61 +654,55 @@ pub fn generate_cpu_trace(
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let n = operations.len();
 
-    // Require power of 2, minimum 4 rows (FRI requirement)
-    // Padding not yet supported - constraints like NextPcAdd fail on zero-filled rows
-    assert!(
-        n >= 4,
-        "CPU trace requires at least 4 operations, got {}",
-        n
-    );
-    assert!(
-        n.is_power_of_two(),
-        "CPU trace requires power-of-2 operations (no padding support yet), got {}",
-        n
-    );
-
-    let num_rows = n;
+    let num_rows = n.next_power_of_two();
     let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
 
     for (row_idx, op) in operations.iter().enumerate() {
         let base = row_idx * cols::NUM_COLUMNS;
+        let d = &op.decode; // Shorthand for decode fields
 
-        // Input columns
+        // Input columns (from decode)
         data[base + cols::TIMESTAMP] = FE::from(op.timestamp);
-        data[base + cols::PC_0] = FE::from(op.pc & 0xFFFF_FFFF);
-        data[base + cols::PC_1] = FE::from(op.pc >> 32);
-        data[base + cols::RS1] = FE::from(op.rs1 as u64);
-        data[base + cols::RS2] = FE::from(op.rs2 as u64);
-        data[base + cols::RD] = FE::from(op.rd as u64);
-        data[base + cols::WRITE_REGISTER] = FE::from(op.write_register as u64);
-        data[base + cols::MEMORY_2BYTES] = FE::from(op.memory_2bytes as u64);
-        data[base + cols::MEMORY_4BYTES] = FE::from(op.memory_4bytes as u64);
-        data[base + cols::MEMORY_8BYTES] = FE::from(op.memory_8bytes as u64);
-        data[base + cols::C_TYPE_INSTRUCTION] = FE::from(op.c_type_instruction as u64);
-        data[base + cols::IMM_0] = FE::from(op.imm & 0xFFFF_FFFF);
-        data[base + cols::IMM_1] = FE::from(op.imm >> 32);
-        data[base + cols::SIGNED] = FE::from(op.signed as u64);
-        data[base + cols::MP_SELECTOR] = FE::from(op.mp_selector as u64);
-        data[base + cols::MULDIV_SELECTOR] = FE::from(op.muldiv_selector as u64);
-        data[base + cols::WORD_INSTR] = FE::from(op.word_instr as u64);
+        data[base + cols::PC_0] = FE::from(d.pc & 0xFFFF_FFFF);
+        data[base + cols::PC_1] = FE::from(d.pc >> 32);
+        data[base + cols::RS1] = FE::from(d.rs1 as u64);
+        data[base + cols::RS2] = FE::from(d.rs2 as u64);
+        data[base + cols::RD] = FE::from(d.rd as u64);
+        // Only set read/write register flags when register is a real register
+        // Skip x0 (hardwired zero) and x255 (virtual PC register for AUIPC/JAL)
+        // This matches trace_builder which only generates MEMW rows for real registers
+        data[base + cols::READ_REGISTER1] =
+            FE::from((d.read_register1 && d.rs1 != 0 && d.rs1 != 255) as u64);
+        data[base + cols::READ_REGISTER2] = FE::from((d.read_register2 && d.rs2 != 0) as u64);
+        data[base + cols::WRITE_REGISTER] = FE::from((d.write_register && d.rd != 0) as u64);
+        data[base + cols::MEMORY_2BYTES] = FE::from(d.memory_2bytes as u64);
+        data[base + cols::MEMORY_4BYTES] = FE::from(d.memory_4bytes as u64);
+        data[base + cols::MEMORY_8BYTES] = FE::from(d.memory_8bytes as u64);
+        data[base + cols::C_TYPE_INSTRUCTION] = FE::from(d.c_type as u64);
+        data[base + cols::IMM_0] = FE::from(d.imm & 0xFFFF_FFFF);
+        data[base + cols::IMM_1] = FE::from(d.imm >> 32);
+        data[base + cols::SIGNED] = FE::from(d.signed as u64);
+        data[base + cols::MP_SELECTOR] = FE::from(d.mp_selector as u64);
+        data[base + cols::MULDIV_SELECTOR] = FE::from(d.muldiv_selector as u64);
+        data[base + cols::WORD_INSTR] = FE::from(d.word_instr as u64);
 
         // ALU selector flags
-        data[base + cols::ADD] = FE::from(op.op_add as u64);
-        data[base + cols::SUB] = FE::from(op.op_sub as u64);
-        data[base + cols::SLT] = FE::from(op.op_slt as u64);
-        data[base + cols::AND] = FE::from(op.op_and as u64);
-        data[base + cols::OR] = FE::from(op.op_or as u64);
-        data[base + cols::XOR] = FE::from(op.op_xor as u64);
-        data[base + cols::SHIFT] = FE::from(op.op_shift as u64);
-        data[base + cols::JALR] = FE::from(op.op_jalr as u64);
-        data[base + cols::BEQ] = FE::from(op.op_beq as u64);
-        data[base + cols::BLT] = FE::from(op.op_blt as u64);
-        data[base + cols::LOAD] = FE::from(op.op_load as u64);
-        data[base + cols::STORE] = FE::from(op.op_store as u64);
-        data[base + cols::MUL] = FE::from(op.op_mul as u64);
-        data[base + cols::DIVREM] = FE::from(op.op_divrem as u64);
-        data[base + cols::ECALL] = FE::from(op.op_ecall as u64);
-        data[base + cols::EBREAK] = FE::from(op.op_ebreak as u64);
+        data[base + cols::ADD] = FE::from(d.op_add as u64);
+        data[base + cols::SUB] = FE::from(d.op_sub as u64);
+        data[base + cols::SLT] = FE::from(d.op_slt as u64);
+        data[base + cols::AND] = FE::from(d.op_and as u64);
+        data[base + cols::OR] = FE::from(d.op_or as u64);
+        data[base + cols::XOR] = FE::from(d.op_xor as u64);
+        data[base + cols::SHIFT] = FE::from(d.op_shift as u64);
+        data[base + cols::JALR] = FE::from(d.op_jalr as u64);
+        data[base + cols::BEQ] = FE::from(d.op_beq as u64);
+        data[base + cols::BLT] = FE::from(d.op_blt as u64);
+        data[base + cols::LOAD] = FE::from(d.op_load as u64);
+        data[base + cols::STORE] = FE::from(d.op_store as u64);
+        data[base + cols::MUL] = FE::from(d.op_mul as u64);
+        data[base + cols::DIVREM] = FE::from(d.op_divrem as u64);
+        data[base + cols::ECALL] = FE::from(d.op_ecall as u64);
+        data[base + cols::EBREAK] = FE::from(d.op_ebreak as u64);
 
         // Output columns
         data[base + cols::NEXT_PC_0] = FE::from(op.next_pc & 0xFFFF_FFFF);
@@ -908,7 +711,7 @@ pub fn generate_cpu_trace(
         // rvd: For LOAD, use the executor's loaded value (op.rvd).
         // For all other operations (including STORE), compute from res with sign extension.
         // This satisfies spec constraint: (1-LOAD) * (rvd - res_extended) = 0
-        let rvd = if op.op_load {
+        let rvd = if d.op_load {
             op.rvd // Loaded value from executor
         } else {
             op.compute_rvd() // res with sign extension for word instructions
@@ -928,7 +731,7 @@ pub fn generate_cpu_trace(
 
         // Sign bits - only set when word_instr=1, per spec constraint ext_sign_bits
         // The constraint enforces: (rv1_sign_bit + arg2_sign_bit + res_sign_bit) * (1 - word_instr) = 0
-        let rv1_sign_bit = op.word_instr && CpuOperation::sign_bit_32(op.rv1);
+        let rv1_sign_bit = d.word_instr && CpuOperation::sign_bit_32(op.rv1);
         data[base + cols::RV1_SIGN_BIT] = FE::from(rv1_sign_bit as u64);
 
         // Compute and store arg1 as DWordBL (8 bytes)
@@ -939,7 +742,7 @@ pub fn generate_cpu_trace(
 
         // Compute and store arg2
         let arg2 = op.compute_arg2();
-        let arg2_sign_bit = op.word_instr && CpuOperation::sign_bit_32(arg2);
+        let arg2_sign_bit = d.word_instr && CpuOperation::sign_bit_32(arg2);
         data[base + cols::ARG2_SIGN_BIT] = FE::from(arg2_sign_bit as u64);
         for i in 0..8 {
             data[base + cols::ARG2[i]] = FE::from((arg2 >> (i * 8)) & 0xFF);
@@ -947,7 +750,7 @@ pub fn generate_cpu_trace(
 
         // Result - computed from arg1/arg2 for ADD/SUB to satisfy constraints
         let res = op.compute_res();
-        let res_sign_bit = op.word_instr && CpuOperation::sign_bit_32(res);
+        let res_sign_bit = d.word_instr && CpuOperation::sign_bit_32(res);
         data[base + cols::RES_SIGN_BIT] = FE::from(res_sign_bit as u64);
         for i in 0..8 {
             data[base + cols::RES[i]] = FE::from((res >> (i * 8)) & 0xFF);
@@ -956,6 +759,16 @@ pub fn generate_cpu_trace(
         // Branch columns
         data[base + cols::IS_EQUAL] = FE::from(op.is_equal as u64);
         data[base + cols::BRANCH_COND] = FE::from(op.branch_cond as u64);
+    }
+
+    // Padding rows: per spec, padding uses pc=1 (odd address, unreachable during
+    // normal execution) with all flags=0, so pad=1 and no bus interactions fire.
+    // next_pc=5 satisfies the NextPcAdd constraint: carry=(1+4-5)/2^32=0.
+    // The DECODE table must contain a corresponding entry at pc=1.
+    for row_idx in n..num_rows {
+        let base = row_idx * cols::NUM_COLUMNS;
+        data[base + cols::PC_0] = FE::from(CPU_PADDING_PC);
+        data[base + cols::NEXT_PC_0] = FE::from(CPU_PADDING_PC + 4);
     }
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
@@ -971,59 +784,135 @@ pub fn generate_cpu_trace(
 pub fn generate_cpu_trace_from_logs(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,
-) -> Result<TraceTable<GoldilocksField, GoldilocksExtension>, ProverError> {
+) -> Result<TraceTable<GoldilocksField, GoldilocksExtension>, Error> {
     let mut operations = Vec::with_capacity(logs.len());
     for (i, log) in logs.iter().enumerate() {
         let instruction = *instructions
             .get(&log.current_pc)
-            .ok_or(ProverError::MissingInstruction(log.current_pc))?;
-        operations.push(CpuOperation::from_log(log, (i as u64) * 4, instruction));
+            .ok_or(Error::MissingInstruction(log.current_pc))?;
+        operations.push(CpuOperation::from_log_and_instruction(
+            log,
+            (i as u64) * 4,
+            instruction,
+        ));
     }
     Ok(generate_cpu_trace(&operations))
 }
 
 /// Collects all Bitwise lookups from a list of CPU operations.
-///
-/// Returns tuples (BitwiseLookup, x, y, z) to pass to `bitwise::update_multiplicities`.
-pub fn collect_bitwise_lookups(
-    operations: &[CpuOperation],
-) -> Vec<(super::bitwise::BitwiseLookup, u8, u8, u8)> {
+pub fn collect_bitwise_ops(operations: &[CpuOperation]) -> Vec<super::bitwise::BitwiseOperation> {
     operations
         .iter()
-        .flat_map(|op| op.collect_bitwise_lookups())
+        .flat_map(|op| op.collect_bitwise_ops())
         .collect()
 }
 
 /// Collects all Bitwise lookups from executor logs.
 ///
 /// Convenience function that converts logs to operations and collects lookups.
-pub fn collect_bitwise_lookups_from_logs(
+pub fn collect_bitwise_ops_from_logs(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,
-) -> Result<Vec<(super::bitwise::BitwiseLookup, u8, u8, u8)>, ProverError> {
+) -> Result<Vec<super::bitwise::BitwiseOperation>, Error> {
     let mut operations = Vec::with_capacity(logs.len());
     for (i, log) in logs.iter().enumerate() {
         let instruction = *instructions
             .get(&log.current_pc)
-            .ok_or(ProverError::MissingInstruction(log.current_pc))?;
-        operations.push(CpuOperation::from_log(log, (i as u64) * 4, instruction));
+            .ok_or(Error::MissingInstruction(log.current_pc))?;
+        operations.push(CpuOperation::from_log_and_instruction(
+            log,
+            (i as u64) * 4,
+            instruction,
+        ));
     }
-    Ok(collect_bitwise_lookups(&operations))
+    Ok(collect_bitwise_ops(&operations))
 }
 
 // =========================================================================
 // Bus interactions
 // =========================================================================
 
+/// Helper to create a LinearTerm with coefficient 2^bit for a column.
+fn linear_term(bit: u32, column: usize) -> LinearTerm {
+    LinearTerm::Column {
+        coefficient: 1 << bit,
+        column,
+    }
+}
+
 /// Returns the bus interactions for the CPU table.
 ///
 /// The CPU table sends to:
+/// - DECODE: instruction fetch (every row)
 /// - AND_BYTE, OR_BYTE, XOR_BYTE: for bitwise operations (×8 each)
 ///
 /// Note: LT interaction is TODO - needs proper DWordHHW packing to match LT table receiver.
-/// Note: IS_BYTE, MSB8, ZERO, BRANCH interactions are TODO for later.
+/// Note: IS_BYTE, MSB8, ZERO interactions are TODO for later.
 pub fn bus_interactions() -> Vec<BusInteraction> {
+    use super::types::packed_decode as bits;
+
     let mut interactions = Vec::new();
+
+    // -------------------------------------------------------------------------
+    // DECODE interaction (instruction fetch)
+    // -------------------------------------------------------------------------
+    // Every CPU row looks up the DECODE table once to verify instruction decoding.
+    // Format: DECODE[pc::DWordWL, imm::DWordWL, packed_decode]
+    //
+    // packed_decode is computed as a linear combination of all decode columns.
+    // Bit positions are defined in types::packed_decode (single source of truth).
+    interactions.push(BusInteraction::sender(
+        BusId::Decode,
+        Multiplicity::One, // Every row sends exactly once
+        vec![
+            // pc as DWordWL (2 bus elements)
+            BusValue::Packed {
+                start_column: cols::PC_0,
+                packing: Packing::DWordWL,
+            },
+            // imm as DWordWL (2 bus elements)
+            BusValue::Packed {
+                start_column: cols::IMM_0,
+                packing: Packing::DWordWL,
+            },
+            // packed_decode as linear combination of decode columns
+            BusValue::linear(vec![
+                // Control flags (bits 0-10)
+                linear_term(bits::READ_REG1, cols::READ_REGISTER1),
+                linear_term(bits::READ_REG2, cols::READ_REGISTER2),
+                linear_term(bits::WRITE_REG, cols::WRITE_REGISTER),
+                linear_term(bits::MEMORY_2BYTES, cols::MEMORY_2BYTES),
+                linear_term(bits::MEMORY_4BYTES, cols::MEMORY_4BYTES),
+                linear_term(bits::MEMORY_8BYTES, cols::MEMORY_8BYTES),
+                linear_term(bits::C_TYPE, cols::C_TYPE_INSTRUCTION),
+                linear_term(bits::SIGNED, cols::SIGNED),
+                linear_term(bits::MP_SELECTOR, cols::MP_SELECTOR),
+                linear_term(bits::MULDIV_SELECTOR, cols::MULDIV_SELECTOR),
+                linear_term(bits::WORD_INSTR, cols::WORD_INSTR),
+                // ALU selector flags (bits 11-26)
+                linear_term(bits::OP_ADD, cols::ADD),
+                linear_term(bits::OP_SUB, cols::SUB),
+                linear_term(bits::OP_SLT, cols::SLT),
+                linear_term(bits::OP_AND, cols::AND),
+                linear_term(bits::OP_OR, cols::OR),
+                linear_term(bits::OP_XOR, cols::XOR),
+                linear_term(bits::OP_SHIFT, cols::SHIFT),
+                linear_term(bits::OP_JALR, cols::JALR),
+                linear_term(bits::OP_BEQ, cols::BEQ),
+                linear_term(bits::OP_BLT, cols::BLT),
+                linear_term(bits::OP_LOAD, cols::LOAD),
+                linear_term(bits::OP_STORE, cols::STORE),
+                linear_term(bits::OP_MUL, cols::MUL),
+                linear_term(bits::OP_DIVREM, cols::DIVREM),
+                linear_term(bits::OP_ECALL, cols::ECALL),
+                linear_term(bits::OP_EBREAK, cols::EBREAK),
+                // Register indices (bits 27-50)
+                linear_term(bits::RS1, cols::RS1),
+                linear_term(bits::RS2, cols::RS2),
+                linear_term(bits::RD, cols::RD),
+            ]),
+        ],
+    ));
 
     // -------------------------------------------------------------------------
     // LT interaction (for SLT, BLT) - TODO: Re-add when properly implemented
@@ -1220,101 +1109,26 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // -------------------------------------------------------------------------
     // LT interaction (for SLT, BLT)
     // -------------------------------------------------------------------------
-    // LT[arg1::DWordHHW, arg2::DWordHHW, signed] -> res[0]
+    // LT[arg1, arg2, signed] -> res[0]
     // multiplicity = SLT + BLT
     //
-    // DWordHHW format: [Word(0-31), Half(32-47), Half(48-63)]
-    // arg1/arg2 are DWordBL (8 bytes), need to repack:
-    //   Word = byte[0] + 2^8*byte[1] + 2^16*byte[2] + 2^24*byte[3]
-    //   Half1 = byte[4] + 2^8*byte[5]
-    //   Half2 = byte[6] + 2^8*byte[7]
+    // LT bus uses 2 elements per 64-bit operand: [lo32, hi32]
+    // arg1/arg2 are DWordBL (8 bytes) - use Packing::DWordBL to produce 2 elements
     interactions.push(BusInteraction::sender(
         BusId::Lt,
         // SLT + BLT using Multiplicity::Sum
         Multiplicity::Sum(cols::SLT, cols::BLT),
         vec![
-            // arg1[0]: Word (lower 32 bits)
-            BusValue::linear(vec![
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::ARG1[0],
-                },
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1 << 8,
-                    column: cols::ARG1[1],
-                },
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1 << 16,
-                    column: cols::ARG1[2],
-                },
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1 << 24,
-                    column: cols::ARG1[3],
-                },
-            ]),
-            // arg1[1]: Half (bits 32-47)
-            BusValue::linear(vec![
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::ARG1[4],
-                },
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1 << 8,
-                    column: cols::ARG1[5],
-                },
-            ]),
-            // arg1[2]: Half (bits 48-63)
-            BusValue::linear(vec![
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::ARG1[6],
-                },
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1 << 8,
-                    column: cols::ARG1[7],
-                },
-            ]),
-            // arg2[0]: Word (lower 32 bits)
-            BusValue::linear(vec![
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::ARG2[0],
-                },
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1 << 8,
-                    column: cols::ARG2[1],
-                },
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1 << 16,
-                    column: cols::ARG2[2],
-                },
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1 << 24,
-                    column: cols::ARG2[3],
-                },
-            ]),
-            // arg2[1]: Half (bits 32-47)
-            BusValue::linear(vec![
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::ARG2[4],
-                },
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1 << 8,
-                    column: cols::ARG2[5],
-                },
-            ]),
-            // arg2[2]: Half (bits 48-63)
-            BusValue::linear(vec![
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::ARG2[6],
-                },
-                stark::lookup::LinearTerm::Column {
-                    coefficient: 1 << 8,
-                    column: cols::ARG2[7],
-                },
-            ]),
+            // arg1 as DWordBL (8 bytes → 2 elements: [lo32, hi32])
+            BusValue::Packed {
+                start_column: cols::ARG1[0],
+                packing: Packing::DWordBL,
+            },
+            // arg2 as DWordBL (8 bytes → 2 elements: [lo32, hi32])
+            BusValue::Packed {
+                start_column: cols::ARG2[0],
+                packing: Packing::DWordBL,
+            },
             // signed flag
             BusValue::Packed {
                 start_column: cols::SIGNED,
@@ -1325,6 +1139,501 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::RES[0],
                 packing: Packing::Direct,
             },
+        ],
+    ));
+
+    // -------------------------------------------------------------------------
+    // MUL interaction (for MUL, MULH, MULHSU, MULHU)
+    // -------------------------------------------------------------------------
+    // MUL[arg1, signed, arg2, mp_selector, rvd, muldiv_selector] per spec CPU-CA44
+    // multiplicity = MUL
+    //
+    // The MUL table expects DWordHL (4 halfwords), but CPU has DWordBL (8 bytes).
+    // Both pack to 2 words (lo32, hi32), so the signatures match for the same values.
+    //
+    // rhs_signed = mp_selector per spec:
+    // - MUL/MULH: mp_selector=1 (both operands signed)
+    // - MULHU/MULHSU: mp_selector=0 (rhs unsigned)
+    //
+    // muldiv_selector distinguishes lo (0) from hi (1) result
+    interactions.push(BusInteraction::sender(
+        BusId::Mul,
+        Multiplicity::Column(cols::MUL),
+        vec![
+            // arg1 (lhs) as DWordBL (8 bytes → 2 elements)
+            BusValue::Packed {
+                start_column: cols::ARG1[0],
+                packing: Packing::DWordBL,
+            },
+            // lhs_signed = signed
+            BusValue::Packed {
+                start_column: cols::SIGNED,
+                packing: Packing::Direct,
+            },
+            // arg2 (rhs) as DWordBL (8 bytes → 2 elements)
+            BusValue::Packed {
+                start_column: cols::ARG2[0],
+                packing: Packing::DWordBL,
+            },
+            // rhs_signed = mp_selector
+            BusValue::Packed {
+                start_column: cols::MP_SELECTOR,
+                packing: Packing::Direct,
+            },
+            // result (rvd) as DWordWL (2 words → 2 elements)
+            BusValue::Packed {
+                start_column: cols::RVD_0,
+                packing: Packing::DWordWL,
+            },
+            // muldiv_selector: 0=lo (MUL), 1=hi (MULH/MULHSU/MULHU)
+            BusValue::Packed {
+                start_column: cols::MULDIV_SELECTOR,
+                packing: Packing::Direct,
+            },
+        ],
+    ));
+
+    // =========================================================================
+    // MEMW and LOAD bus interactions (M1, M3, M5, M6, M7)
+    // =========================================================================
+    // M1 and M3: Register read interactions (CPU → MEMW μ_read)
+    // -------------------------------------------------------------------------
+    // M1: MEMW[rv1; 1, 2*rs1, rv1, timestamp+0, 1, 0, 0] | read_register1
+    // -------------------------------------------------------------------------
+    // Read from rs1 register via MEMW. Format: 24 elements
+    // [old[8], is_register, base_addr[2], value[8], timestamp[2], write2, write4, write8]
+    //
+    // Registers are stored as WL (2 words), remaining 6 values are unconstrained (zeros).
+    // rv1 is DWordWHH (3 cols: Half, Half, Word) -> pack as WL: lo32 = rv1[0] + 2^16*rv1[1], hi32 = rv1[2]
+    interactions.push(BusInteraction::sender(
+        BusId::Memw,
+        Multiplicity::Column(cols::READ_REGISTER1),
+        vec![
+            // old[0] = lo32 = RV1_0 + 2^16 * RV1_1
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::RV1_0,
+                },
+                LinearTerm::Column {
+                    coefficient: 65536,
+                    column: cols::RV1_1,
+                },
+            ]),
+            // old[1] = hi32 = RV1_2
+            BusValue::Packed {
+                start_column: cols::RV1_2,
+                packing: Packing::Direct,
+            },
+            // old[2..7] = 0 (unconstrained for registers)
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            // is_register = 1
+            BusValue::constant(1),
+            // base_address[0] = 2 * rs1
+            BusValue::linear(vec![LinearTerm::Column {
+                coefficient: 2,
+                column: cols::RS1,
+            }]),
+            // base_address[1] = 0
+            BusValue::constant(0),
+            // value[0..7] = same as old (rv1 as WL + 6 zeros)
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::RV1_0,
+                },
+                LinearTerm::Column {
+                    coefficient: 65536,
+                    column: cols::RV1_1,
+                },
+            ]),
+            BusValue::Packed {
+                start_column: cols::RV1_2,
+                packing: Packing::Direct,
+            },
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            // timestamp[0] = timestamp, timestamp[1] = 0
+            BusValue::Packed {
+                start_column: cols::TIMESTAMP,
+                packing: Packing::Direct,
+            },
+            BusValue::constant(0),
+            // write2=0, write4=0, write8=1 (register access = 8 bytes / 64 bits)
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(1),
+        ],
+    ));
+
+    // -------------------------------------------------------------------------
+    // M3: MEMW[rv2; 1, 2*rs2, rv2, timestamp+1, 0, 0, 1] | read_register2
+    // -------------------------------------------------------------------------
+    // Same pattern as M1 but with RV2 and timestamp+1
+    interactions.push(BusInteraction::sender(
+        BusId::Memw,
+        Multiplicity::Column(cols::READ_REGISTER2),
+        vec![
+            // old[0] = lo32 = RV2_0 + 2^16 * RV2_1
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::RV2_0,
+                },
+                LinearTerm::Column {
+                    coefficient: 65536,
+                    column: cols::RV2_1,
+                },
+            ]),
+            // old[1] = hi32 = RV2_2
+            BusValue::Packed {
+                start_column: cols::RV2_2,
+                packing: Packing::Direct,
+            },
+            // old[2..7] = 0
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            // is_register = 1
+            BusValue::constant(1),
+            // base_address[0] = 2 * rs2
+            BusValue::linear(vec![LinearTerm::Column {
+                coefficient: 2,
+                column: cols::RS2,
+            }]),
+            // base_address[1] = 0
+            BusValue::constant(0),
+            // value[0..7] = rv2 as WL + 6 zeros
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::RV2_0,
+                },
+                LinearTerm::Column {
+                    coefficient: 65536,
+                    column: cols::RV2_1,
+                },
+            ]),
+            BusValue::Packed {
+                start_column: cols::RV2_2,
+                packing: Packing::Direct,
+            },
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            // timestamp[0] = timestamp + 1, timestamp[1] = 0
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::TIMESTAMP,
+                },
+                LinearTerm::Constant(1),
+            ]),
+            BusValue::constant(0),
+            // write2=0, write4=0, write8=1 (register access = 8 bytes / 64 bits)
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(1),
+        ],
+    ));
+
+    // -------------------------------------------------------------------------
+    // M5: MEMW[1, 2*rd, rvd, timestamp+2, 0, 0, 1] | write_register
+    // -------------------------------------------------------------------------
+    // Write to rd register via MEMW. Format: 16 elements (write, no old)
+    // [is_register, base_addr[2], value[8], timestamp[2], write2, write4, write8]
+    //
+    // rvd is DWordWL (2 cols: Word, Word)
+    // MEMW uses EXCLUSIVE encoding for write flags: (0, 0, 1) for 8-byte access
+    // ("exactly N bytes" semantics, not "at least N bytes")
+    interactions.push(BusInteraction::sender(
+        BusId::Memw,
+        Multiplicity::Column(cols::WRITE_REGISTER),
+        vec![
+            // is_register = 1
+            BusValue::constant(1),
+            // base_address[0] = 2 * rd
+            BusValue::linear(vec![LinearTerm::Column {
+                coefficient: 2,
+                column: cols::RD,
+            }]),
+            // base_address[1] = 0
+            BusValue::constant(0),
+            // value[0] = rvd_lo = RVD_0
+            BusValue::Packed {
+                start_column: cols::RVD_0,
+                packing: Packing::Direct,
+            },
+            // value[1] = rvd_hi = RVD_1
+            BusValue::Packed {
+                start_column: cols::RVD_1,
+                packing: Packing::Direct,
+            },
+            // value[2..7] = 0
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            // timestamp[0] = timestamp + 2, timestamp[1] = 0
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::TIMESTAMP,
+                },
+                LinearTerm::Constant(2),
+            ]),
+            BusValue::constant(0),
+            // write2=0, write4=0, write8=1 (EXCLUSIVE encoding for 8-byte register access)
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(1),
+        ],
+    ));
+
+    // -------------------------------------------------------------------------
+    // M6: LOAD[rvd; base_address, timestamp, read2, read4, read8, signed] | LOAD
+    // -------------------------------------------------------------------------
+    // LOAD receiver expects: [res::DWordBL(2), base_address::DWordWL(2), timestamp::DWordWL(2), flags(3), signed(1)] = 10 elements
+    //
+    // For CPU LOAD:
+    // - rvd (the loaded result) corresponds to res
+    // - res (computed address = rv1 + imm) corresponds to base_address
+    // - memory_Xbytes flags use EXCLUSIVE encoding per spec ("exactly N bytes")
+    interactions.push(BusInteraction::sender(
+        BusId::Load,
+        Multiplicity::Column(cols::LOAD),
+        vec![
+            // rvd as DWordWL (2 words) - this is the loaded value
+            // CPU RVD is already WL format
+            BusValue::Packed {
+                start_column: cols::RVD_0,
+                packing: Packing::DWordWL,
+            },
+            // base_address = res (computed address) as DWordBL (8 bytes → 2 elements)
+            BusValue::Packed {
+                start_column: cols::RES[0],
+                packing: Packing::DWordBL,
+            },
+            // timestamp as DWordWL: [timestamp, 0]
+            BusValue::Packed {
+                start_column: cols::TIMESTAMP,
+                packing: Packing::Direct,
+            },
+            BusValue::constant(0),
+            // read flags: exclusive encoding (pass through directly)
+            BusValue::Packed {
+                start_column: cols::MEMORY_2BYTES,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::MEMORY_4BYTES,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::MEMORY_8BYTES,
+                packing: Packing::Direct,
+            },
+            // signed flag
+            BusValue::Packed {
+                start_column: cols::SIGNED,
+                packing: Packing::Direct,
+            },
+        ],
+    ));
+
+    // -------------------------------------------------------------------------
+    // M7: MEMW[0, res, rv2, timestamp+1, memory_2bytes, memory_4bytes, memory_8bytes] | STORE
+    // -------------------------------------------------------------------------
+    // Write to memory via MEMW. Format: 16 elements
+    // [is_register, base_addr[2], value[8], timestamp[2], write2, write4, write8]
+    //
+    // For STORE:
+    // - is_register = 0 (memory access)
+    // - base_address = res (computed address = rv1 + imm)
+    // - value = rv2 (the value being stored)
+    interactions.push(BusInteraction::sender(
+        BusId::Memw,
+        Multiplicity::Column(cols::STORE),
+        vec![
+            // is_register = 0 (memory access)
+            BusValue::constant(0),
+            // base_address = res as DWordBL → 2 elements [lo32, hi32]
+            BusValue::Packed {
+                start_column: cols::RES[0],
+                packing: Packing::DWordBL,
+            },
+            // value[0] = rv2_lo = RV2_0 + 2^16 * RV2_1
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::RV2_0,
+                },
+                LinearTerm::Column {
+                    coefficient: 65536,
+                    column: cols::RV2_1,
+                },
+            ]),
+            // value[1] = rv2_hi = RV2_2
+            BusValue::Packed {
+                start_column: cols::RV2_2,
+                packing: Packing::Direct,
+            },
+            // value[2..7] = 0 (unconstrained per team feedback)
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            // timestamp[0] = timestamp + 1, timestamp[1] = 0
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::TIMESTAMP,
+                },
+                LinearTerm::Constant(1),
+            ]),
+            BusValue::constant(0),
+            // write flags: exclusive encoding (pass through directly)
+            BusValue::Packed {
+                start_column: cols::MEMORY_2BYTES,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::MEMORY_4BYTES,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::MEMORY_8BYTES,
+                packing: Packing::Direct,
+            },
+        ],
+    ));
+
+    // -------------------------------------------------------------------------
+    // BRANCH interaction (for branch/jump target calculation)
+    // -------------------------------------------------------------------------
+    // CPU-CO68: BRANCH[next_pc; pc, imm, arg1::DWordWL, JALR] | branch_cond
+    //
+    // Sends to BRANCH table when branch_cond is true.
+    // Bus signature: [next_pc[0], next_pc[1], pc[0], pc[1], offset[0], offset[1], register[0], register[1], JALR]
+    // - next_pc: DWordWL (2 words) from NEXT_PC_0, NEXT_PC_1
+    // - pc: DWordWL (2 words) from PC_0, PC_1
+    // - offset: DWordWL (2 words) from IMM_0, IMM_1 (already sign-extended)
+    // - register: DWordWL (2 words) - arg1 (DWordBL: 8 bytes) repacked as 2 words
+    // - JALR: Bit flag
+    interactions.push(BusInteraction::sender(
+        BusId::Branch,
+        Multiplicity::Column(cols::BRANCH_COND),
+        vec![
+            // next_pc[0] (Word) - low 32 bits
+            BusValue::Packed {
+                start_column: cols::NEXT_PC_0,
+                packing: Packing::Direct,
+            },
+            // next_pc[1] (Word) - high 32 bits
+            BusValue::Packed {
+                start_column: cols::NEXT_PC_1,
+                packing: Packing::Direct,
+            },
+            // pc[0] (Word)
+            BusValue::Packed {
+                start_column: cols::PC_0,
+                packing: Packing::Direct,
+            },
+            // pc[1] (Word)
+            BusValue::Packed {
+                start_column: cols::PC_1,
+                packing: Packing::Direct,
+            },
+            // offset[0] = imm[0] (Word) - low 32 bits of immediate
+            BusValue::Packed {
+                start_column: cols::IMM_0,
+                packing: Packing::Direct,
+            },
+            // offset[1] = imm[1] (Word) - high 32 bits of immediate (sign-extended)
+            BusValue::Packed {
+                start_column: cols::IMM_1,
+                packing: Packing::Direct,
+            },
+            // register[0] = arg1[0..4] repacked as Word
+            // arg1_word0 = arg1[0] + 2^8*arg1[1] + 2^16*arg1[2] + 2^24*arg1[3]
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::ARG1[0],
+                },
+                LinearTerm::Column {
+                    coefficient: 256,
+                    column: cols::ARG1[1],
+                },
+                LinearTerm::Column {
+                    coefficient: 65536,
+                    column: cols::ARG1[2],
+                },
+                LinearTerm::Column {
+                    coefficient: 16777216,
+                    column: cols::ARG1[3],
+                },
+            ]),
+            // register[1] = arg1[4..8] repacked as Word
+            // arg1_word1 = arg1[4] + 2^8*arg1[5] + 2^16*arg1[6] + 2^24*arg1[7]
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::ARG1[4],
+                },
+                LinearTerm::Column {
+                    coefficient: 256,
+                    column: cols::ARG1[5],
+                },
+                LinearTerm::Column {
+                    coefficient: 65536,
+                    column: cols::ARG1[6],
+                },
+                LinearTerm::Column {
+                    coefficient: 16777216,
+                    column: cols::ARG1[7],
+                },
+            ]),
+            // JALR flag
+            BusValue::Packed {
+                start_column: cols::JALR,
+                packing: Packing::Direct,
+            },
+        ],
+    ));
+
+    // ECALL interaction (CPU → HALT)
+    // -------------------------------------------------------------------------
+    // When ECALL flag is set, send [timestamp_lo, timestamp_hi] to the HALT table.
+    // The CPU timestamp fits in a single field element (u32), so timestamp_hi = 0.
+    interactions.push(BusInteraction::sender(
+        BusId::Ecall,
+        Multiplicity::Column(cols::ECALL),
+        vec![
+            BusValue::Packed {
+                start_column: cols::TIMESTAMP,
+                packing: Packing::Direct,
+            },
+            BusValue::constant(0), // timestamp_hi = 0 (CPU timestamps fit in u32)
         ],
     ));
 

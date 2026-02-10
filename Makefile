@@ -1,7 +1,7 @@
 .PHONY: deps deps-linux deps-macos prepare-test-data compile-programs-asm compile-programs-rust compile-bench \
 compile-programs clean-asm clean-rust clean-bench clean-shared clean test test-asm test-no-compile \
 test-asm-no-compile test-rust test-rust-no-compile test-executor flamegraph-prover \
-test-fast test-prover test-prover-all build check
+test-fast test-prover test-prover-all build check clippy fmt lint
 
 UNAME := $(shell uname)
 
@@ -93,10 +93,11 @@ $(RUST_ARTIFACTS_DIR)/%.elf: $(RUST_PROGRAMS_DIR)/%/Cargo.toml
 	@mkdir -p $(RUST_ARTIFACTS_DIR)
 	cd $(RUST_PROGRAMS_DIR)/$* && \
 		CARGO_TARGET_DIR=$(abspath $(SHARED_TARGET_DIR)) \
-		rustup run nightly cargo build --release \
+		rustup run nightly-2026-02-01 cargo build --release \
 			--target $(RV64_TARGET_SPEC) \
 			-Z build-std=core,alloc,std,compiler_builtins,panic_abort \
-			-Z build-std-features=compiler-builtins-mem
+			-Z build-std-features=compiler-builtins-mem \
+			-Z json-target-spec
 	cp $(SHARED_TARGET_DIR)/riscv64im-lambda-vm-elf/release/$* $@
 
 # Compile rust benches (64-bit)
@@ -104,10 +105,11 @@ $(BENCH_ARTIFACTS_DIR)/%.elf: $(BENCH_PROGRAMS_DIR)/%/Cargo.toml
 	@mkdir -p $(BENCH_ARTIFACTS_DIR)
 	cd $(BENCH_PROGRAMS_DIR)/$* && \
 		CARGO_TARGET_DIR=$(abspath $(SHARED_TARGET_DIR)) \
-		rustup run nightly cargo build --release \
+		rustup run nightly-2026-02-01 cargo build --release \
 			--target $(RV64_TARGET_SPEC) \
 			-Z build-std=core,alloc,std,compiler_builtins,panic_abort \
-			-Z build-std-features=compiler-builtins-mem
+			-Z build-std-features=compiler-builtins-mem \
+			-Z json-target-spec
 	cp $(SHARED_TARGET_DIR)/riscv64im-lambda-vm-elf/release/$* $@
 
 clean-asm:
@@ -140,9 +142,9 @@ test-rust-no-compile:
 test-no-compile: prepare-test-data
 	cargo test -p executor
 
-test-flamegraph: 
+test-flamegraph:
 	cargo test -p executor --test flamegraph
-	
+
 test: compile-programs prepare-test-data
 	cargo test
 
@@ -150,15 +152,19 @@ test: compile-programs prepare-test-data
 
 # Fast prover tests (skips ignored slow tests)
 test-fast:
-	cargo test -p prover -p stark -p executor -F stark/parallel
+	cargo test -p lambda-vm-prover -p stark -p executor -F stark/parallel
 
-# Prover tests only (fast)
+# Prover tests only
 test-prover:
-	cargo test -p prover -F stark/parallel
+	cargo test -p lambda-vm-prover
 
 # Prover tests including slow ones
 test-prover-all:
-	cargo test -p prover -F stark/parallel -- --include-ignored
+	cargo test -p lambda-vm-prover -- --include-ignored
+
+# Prover tests with debug-checks (shows bus balance report)
+test-prover-debug:
+	cargo test -p lambda-vm-prover --features debug-checks -- --nocapture
 
 # Build all
 build:
@@ -167,6 +173,19 @@ build:
 # Check (faster than build, no codegen)
 check:
 	cargo check --workspace
+
+# === Linting ===
+
+clippy:
+	cargo clippy --workspace --all-targets
+
+fmt:
+	cargo fmt --all
+
+# Run clippy + fmt check
+lint:
+	cargo fmt --check --all
+	cargo clippy --workspace --all-targets
 
 flamegraph-prover:
 	cd crypto/stark && samply record cargo bench --bench profile_prover --features parallel

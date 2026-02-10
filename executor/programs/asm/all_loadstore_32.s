@@ -46,4 +46,5 @@ main:
 
 	# === 31-32: Finalize ===
 	addi	sp, sp, 64		# 31: Deallocate stack
-	jalr	zero, 0(zero)		# 32: Halt
+	li	a7, 5
+	ecall		# 32: Halt

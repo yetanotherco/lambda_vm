@@ -15,6 +15,8 @@ use crate::{
 use crypto::{fiat_shamir::is_transcript::IsStarkTranscript, merkle_tree::proof::Proof};
 #[cfg(not(feature = "test_fiat_shamir"))]
 use log::error;
+#[cfg(feature = "debug-checks")]
+use log::info;
 use math::{
     fft::cpu::bit_reversing::reverse_index,
     field::{
@@ -440,6 +442,7 @@ pub trait IsStarkVerifier<
         let index_sym = iota * 2 + 1;
         let mut result = true;
 
+        // Verify main trace (multiplicities for preprocessed, full trace for normal)
         result &= Self::verify_opening::<Field>(
             &deep_poly_openings.main_trace_polys.proof,
             &proof.lde_trace_main_merkle_root,
@@ -453,6 +456,33 @@ pub trait IsStarkVerifier<
             &deep_poly_openings.main_trace_polys.evaluations_sym,
         );
 
+        // Verify precomputed trace (for preprocessed tables only)
+        match (
+            &proof.lde_trace_precomputed_merkle_root,
+            &deep_poly_openings.precomputed_trace_polys,
+        ) {
+            // Unreachable: multi_verify() already rejected proofs with None root for preprocessed AIRs,
+            // and non-preprocessed AIRs never have openings. No valid execution path reaches here.
+            (None, Some(_)) => result = false,
+            (Some(_), None) => result = false,
+            (Some(precomputed_root), Some(precomputed_opening)) => {
+                result &= Self::verify_opening::<Field>(
+                    &precomputed_opening.proof,
+                    precomputed_root,
+                    index,
+                    &precomputed_opening.evaluations,
+                );
+                result &= Self::verify_opening::<Field>(
+                    &precomputed_opening.proof_sym,
+                    precomputed_root,
+                    index_sym,
+                    &precomputed_opening.evaluations_sym,
+                );
+            }
+            _ => {}
+        }
+
+        // Verify auxiliary trace
         match (
             proof.lde_trace_aux_merkle_root,
             &deep_poly_openings.aux_trace_polys,
@@ -591,6 +621,13 @@ pub trait IsStarkVerifier<
             (p0_eval + p0_eval_sym) + evaluation_point_inv * &zetas[0] * (p0_eval - p0_eval_sym);
         let mut index = iota;
 
+        // Handle case with 0 FRI layers (trace_length <= 2)
+        // In this case, the fold loop below doesn't iterate, so we need to verify
+        // the final value directly here.
+        if fri_layers_merkle_roots.is_empty() {
+            return v == proof.fri_last_value;
+        }
+
         // For each FRI layer, starting from the layer 1: use the proof to verify the validity of values pᵢ(−𝜐^(2ⁱ)) (given by the prover) and
         // pᵢ(𝜐^(2ⁱ)) (computed on the previous iteration by the verifier). Then use them to obtain pᵢ₊₁(𝜐^(2ⁱ⁺¹)).
         // Finally, check that the final value coincides with the given by the prover.
@@ -648,13 +685,25 @@ pub trait IsStarkVerifier<
             let primitive_root =
                 &Field::get_primitive_root_of_unity(domain.root_order as u64).unwrap();
 
-            let mut evaluations: Vec<FieldElement<FieldExtension>> = proof.deep_poly_openings[i]
-                .main_trace_polys
-                .evaluations
-                .clone()
-                .into_iter()
-                .map(|x| x.to_extension())
-                .collect();
+            // For preprocessed tables: precomputed columns come FIRST, then multiplicities
+            let mut evaluations: Vec<FieldElement<FieldExtension>> = Vec::new();
+            if let Some(precomputed_polys) = &proof.deep_poly_openings[i].precomputed_trace_polys {
+                evaluations.extend(
+                    precomputed_polys
+                        .evaluations
+                        .iter()
+                        .cloned()
+                        .map(|x| x.to_extension()),
+                );
+            }
+            evaluations.extend(
+                proof.deep_poly_openings[i]
+                    .main_trace_polys
+                    .evaluations
+                    .iter()
+                    .cloned()
+                    .map(|x| x.to_extension()),
+            );
             if let Some(aux_trace_polys) = &proof.deep_poly_openings[i].aux_trace_polys {
                 evaluations.extend_from_slice(&aux_trace_polys.evaluations);
             }
@@ -669,14 +718,25 @@ pub trait IsStarkVerifier<
                 &proof.deep_poly_openings[i].composition_poly.evaluations,
             ));
 
-            let mut evaluations_sym: Vec<FieldElement<FieldExtension>> = proof.deep_poly_openings
-                [i]
-                .main_trace_polys
-                .evaluations_sym
-                .clone()
-                .into_iter()
-                .map(|x| x.to_extension())
-                .collect();
+            // For preprocessed tables: precomputed columns come FIRST, then multiplicities
+            let mut evaluations_sym: Vec<FieldElement<FieldExtension>> = Vec::new();
+            if let Some(precomputed_polys) = &proof.deep_poly_openings[i].precomputed_trace_polys {
+                evaluations_sym.extend(
+                    precomputed_polys
+                        .evaluations_sym
+                        .iter()
+                        .cloned()
+                        .map(|x| x.to_extension()),
+                );
+            }
+            evaluations_sym.extend(
+                proof.deep_poly_openings[i]
+                    .main_trace_polys
+                    .evaluations_sym
+                    .iter()
+                    .cloned()
+                    .map(|x| x.to_extension()),
+            );
             if let Some(aux_trace_polys) = &proof.deep_poly_openings[i].aux_trace_polys {
                 evaluations_sym.extend_from_slice(&aux_trace_polys.evaluations_sym);
             }
@@ -779,9 +839,40 @@ pub trait IsStarkVerifier<
         // =====================================================================
         // Round 1, Phase A: Replay main trace commitments
         // =====================================================================
+        // For preprocessed tables, use the hardcoded commitment (verifier cannot
+        // trust the prover). For normal tables, use the commitment from the proof.
 
-        for proof in &multi_proof.proofs {
-            transcript.append_bytes(&proof.lde_trace_main_merkle_root);
+        for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
+            if air.is_preprocessed() {
+                // Preprocessed table: VERIFY precomputed commitment matches hardcoded.
+                // This is the critical soundness check - ensures prover used correct precomputed values.
+                let expected_precomputed = air.precomputed_commitment();
+                match &proof.lde_trace_precomputed_merkle_root {
+                    Some(actual) if *actual == expected_precomputed => {
+                        // OK - commitment matches hardcoded
+                    }
+                    Some(actual) => {
+                        error!(
+                            "Preprocessed commitment MISMATCH for table {idx}: expected {:?}, got {:?}",
+                            expected_precomputed, actual
+                        );
+                        return false;
+                    }
+                    None => {
+                        error!("Preprocessed table {idx} proof missing precomputed commitment");
+                        return false;
+                    }
+                }
+
+                // Add BOTH commitments to transcript (Fiat-Shamir binding).
+                // Precomputed commitment binds challenges to correct precomputed values.
+                // Multiplicities commitment binds challenges to actual lookups made.
+                transcript.append_bytes(&expected_precomputed);
+                transcript.append_bytes(&proof.lde_trace_main_merkle_root);
+            } else {
+                // Normal table: use commitment from proof
+                transcript.append_bytes(&proof.lde_trace_main_merkle_root);
+            }
         }
 
         // =====================================================================
@@ -811,8 +902,14 @@ pub trait IsStarkVerifier<
         // Rounds 2-4: Verify each proof
         // =====================================================================
 
-        for (air, proof) in airs.iter().zip(&multi_proof.proofs) {
+        for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
             if !Self::verify_rounds_2_to_4(*air, proof, transcript, logup_challenges.clone()) {
+                error!(
+                    "Table {} failed verify_rounds_2_to_4 (num_constraints={}, trace_cols={})",
+                    idx,
+                    air.context().num_transition_constraints(),
+                    air.context().trace_columns
+                );
                 return false;
             }
         }
@@ -834,9 +931,14 @@ pub trait IsStarkVerifier<
 
             if total != FieldElement::zero() {
                 #[cfg(not(feature = "test_fiat_shamir"))]
-                error!("LogUp bus does not balance: sum of accumulated values is not zero");
+                error!(
+                    "LogUp bus does not balance: sum of accumulated values is not zero. total={:?}",
+                    total
+                );
                 return false;
             }
+            #[cfg(feature = "debug-checks")]
+            info!("Bus balance check PASSED");
         }
 
         true

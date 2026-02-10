@@ -622,8 +622,15 @@ checksum = "a1d728cc89cf3aee9ff92b05e62b19ee65a02b5702cff7d5a377e32c6ae29d8d"
 name = "cli"
 version = "0.1.0"
 dependencies = [
+ "ciborium",
  "clap 4.5.53",
+ "crypto",
  "executor",
+ "hex",
+ "lambda-vm-prover",
+ "serde",
+ "sha3",
+ "stark",
 ]
 
 [[package]]
@@ -994,6 +1001,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "dhat"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98cd11d84628e233de0ce467de10b8633f4ddaecafadefc86e13b84b8739b827"
+dependencies = [
+ "backtrace",
+ "lazy_static",
+ "mintex",
+ "parking_lot",
+ "rustc-hash 1.1.0",
+ "serde",
+ "serde_json",
+ "thousands",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1180,7 +1203,7 @@ dependencies = [
  "ethrex-trie",
  "ethrex-vm",
  "hex",
- "rustc-hash",
+ "rustc-hash 2.1.1",
  "thiserror 2.0.17",
  "tokio",
  "tokio-util",
@@ -1207,7 +1230,7 @@ dependencies = [
  "once_cell",
  "rayon",
  "rkyv",
- "rustc-hash",
+ "rustc-hash 2.1.1",
  "serde",
  "serde_json",
  "sha2",
@@ -1273,7 +1296,7 @@ dependencies = [
  "malachite",
  "p256",
  "ripemd",
- "rustc-hash",
+ "rustc-hash 2.1.1",
  "serde",
  "serde_json",
  "sha2",
@@ -1326,7 +1349,7 @@ dependencies = [
  "lru",
  "qfilter",
  "rayon",
- "rustc-hash",
+ "rustc-hash 2.1.1",
  "serde",
  "serde_json",
  "thiserror 2.0.17",
@@ -1358,7 +1381,7 @@ dependencies = [
  "hex",
  "lazy_static",
  "rkyv",
- "rustc-hash",
+ "rustc-hash 2.1.1",
  "serde",
  "serde_json",
  "smallvec",
@@ -2129,6 +2152,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "lambda-vm-prover"
+version = "0.1.0"
+dependencies = [
+ "criterion 0.5.1",
+ "crypto",
+ "dhat",
+ "env_logger",
+ "executor",
+ "lazy_static",
+ "math",
+ "rayon",
+ "stark",
+]
+
+[[package]]
 name = "lambdaworks-crypto"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2342,6 +2380,12 @@ checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
 dependencies = [
  "adler2",
 ]
+
+[[package]]
+name = "mintex"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c505b3e17ed6b70a7ed2e67fbb2c560ee327353556120d6e72f5232b6880d536"
 
 [[package]]
 name = "munge"
@@ -2989,19 +3033,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "prover"
-version = "0.1.0"
-dependencies = [
- "criterion 0.5.1",
- "crypto",
- "env_logger",
- "executor",
- "lazy_static",
- "math",
- "stark",
-]
-
-[[package]]
 name = "ptr_meta"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3329,6 +3360,12 @@ name = "rustc-demangle"
 version = "0.1.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "56f7d92ca342cea22a06f2121d944b4fd82af56988c270852495420f961d4ace"
+
+[[package]]
+name = "rustc-hash"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
 
 [[package]]
 name = "rustc-hash"
@@ -3930,6 +3967,12 @@ dependencies = [
  "quote",
  "syn 2.0.111",
 ]
+
+[[package]]
+name = "thousands"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3bf63baf9f5039dadc247375c29eb13706706cfde997d0330d05aa63a77d8820"
 
 [[package]]
 name = "thread_local"

@@ -22,7 +22,7 @@
 //!
 //! ## Bus Interactions
 //! - Sender: MSB16 (×2 for lhs_msb, rhs_msb)
-//! - Sender: IS_HALFWORD (×4 for lhs_sub_rhs range check)
+//! - Sender: IS_HALFWORD (×6: ×4 for lhs_sub_rhs, ×1 for lhs[1], ×1 for rhs[1])
 //! - Receiver: LT (provides less-than results to other tables)
 
 use math::field::element::FieldElement;
@@ -138,7 +138,7 @@ pub fn generate_lt_trace(
     }
 
     let unique_ops: Vec<_> = op_map.into_iter().collect();
-    let num_rows = unique_ops.len().next_power_of_two().max(2);
+    let num_rows = unique_ops.len().next_power_of_two().max(4);
     let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
 
     for (row_idx, (op, multiplicity)) in unique_ops.iter().enumerate() {
@@ -190,8 +190,6 @@ pub fn generate_lt_trace(
         // Multiplicity: aggregated count of this operation
         data[base + cols::MU] = FE::from(*multiplicity);
     }
-
-    // Padding rows have MU = 0, so they don't contribute to bus interactions
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
 }
@@ -276,37 +274,41 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 packing: Packing::Direct,
             }],
         ),
+        // IS_HALFWORD[lhs[1]]
+        BusInteraction::sender(
+            BusId::IsHalfword,
+            Multiplicity::Column(cols::MU),
+            vec![BusValue::Packed {
+                start_column: cols::LHS_1,
+                packing: Packing::Direct,
+            }],
+        ),
+        // IS_HALFWORD[rhs[1]]
+        BusInteraction::sender(
+            BusId::IsHalfword,
+            Multiplicity::Column(cols::MU),
+            vec![BusValue::Packed {
+                start_column: cols::RHS_1,
+                packing: Packing::Direct,
+            }],
+        ),
         // LT[lhs, rhs, signed] -> lt (receiver)
         // lhs is DWordHHW, rhs is DWordHHW, signed is Bit, lt is Bit
+        // Uses DWordHHW packing: reads 3 columns (Word, Half, Half), produces 2 bus elements [lo32, hi32]
+        // This allows DWordWL senders (like MEMW timestamps) to match via Packing::DWordWL
         BusInteraction::receiver(
             BusId::Lt,
             Multiplicity::Column(cols::MU),
             vec![
-                // lhs as DWordHHW (3 elements: Word, Half, Half)
+                // lhs as DWordHHW (reads 3 columns: Word, Half, Half; produces 2 elements: [lo32, hi32])
                 BusValue::Packed {
                     start_column: cols::LHS_0,
-                    packing: Packing::Direct,
+                    packing: Packing::DWordHHW,
                 },
-                BusValue::Packed {
-                    start_column: cols::LHS_1,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::LHS_2,
-                    packing: Packing::Direct,
-                },
-                // rhs as DWordHHW (3 elements)
+                // rhs as DWordHHW (reads 3 columns, produces 2 elements)
                 BusValue::Packed {
                     start_column: cols::RHS_0,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::RHS_1,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::RHS_2,
-                    packing: Packing::Direct,
+                    packing: Packing::DWordHHW,
                 },
                 // signed
                 BusValue::Packed {
