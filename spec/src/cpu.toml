@@ -559,8 +559,15 @@ prefix = "A"
 [[constraints.alu]]
 kind = "template"
 tag = "ADD"
-cond = ["+", "ADD", "LOAD", "STORE"]
+cond = ["+", "ADD", "LOAD"]
 input = [["cast", "arg1", "DWordWL"], ["cast", "arg2", "DWordWL"]]
+output = ["cast", "res", "DWordWL"]
+
+[[constraints.alu]]
+kind = "template"
+tag = "ADD"
+cond = "STORE"
+input = [["cast", "arg1", "DWordWL"], "imm"]
 output = ["cast", "res", "DWordWL"]
 
 [[constraints.alu]]
@@ -689,7 +696,7 @@ multiplicity = "LOAD"
 [[constraints.mem]]
 kind = "interaction"
 tag = "MEMW"
-input = [0, "res", "rv2", ["+", "timestamp", ["cast", 1, "DWordWL"]], "memory_2bytes", "memory_4bytes", "memory_8bytes"]
+input = [0, "res", ["cast", "arg2", ["Byte", 8]], ["+", "timestamp", ["cast", 1, "DWordWL"]], "memory_2bytes", "memory_4bytes", "memory_8bytes"]
 multiplicity = "STORE"
 
 # TODO: no types available, so no casting yet
@@ -754,13 +761,13 @@ multiplicity = "word_instr"
 
 [[constraints.ext]]
 kind = "arith"
-constraint = "$#`arg2[:4]` = (1 - #`STORE` - #`LOAD`) dot #`rv2[:2]` + (1 - #`BEQ` - #`BLT`) dot #`imm[0]`$"
-poly = ["-", ["idx", ["cast", "arg2", "DWordWL"], 0], ["*", ["-", 1, "STORE", "LOAD"], ["idx", ["cast", "rv2", "DWordWL"], 0]], ["*", ["-", 1, "BEQ", "BLT"], ["idx", "imm", 0]]]
+constraint = "$#`arg2[:4]` = (1 - #`LOAD`) dot #`rv2[:2]` + (1 - #`BEQ` - #`BLT` - #`STORE`) dot #`imm[0]`$"
+poly = ["-", ["idx", ["cast", "arg2", "DWordWL"], 0], ["*", ["not", "LOAD"], ["idx", ["cast", "rv2", "DWordWL"], 0]], ["*", ["-", 1, "BEQ", "BLT", "STORE"], ["idx", "imm", 0]]]
 
 [[constraints.ext]]
 kind = "arith"
-constraint = "$#`arg2[4:]` = (1 - #`STORE` - #`LOAD`) dot ((1 - #`word_instr`) dot #`rv2[2]` + #`signed` dot #`arg2_sign_bit` dot (2^(32) - 1)) + (1 - #`BEQ` - #`BLT`) dot #`imm[1]`$"
-poly = ["-", ["idx", ["cast", "arg2", "DWordWL"], 1], ["*", ["-", 1, "STORE", "LOAD"], ["not", "word_instr"], ["idx", "rv2", 2]], ["*", ["-", 1, "STORE", "LOAD"], "signed", "arg2_sign_bit", ["-", ["^", 2, 32], 1]], ["*", ["-", 1, "BEQ", "BLT"], ["idx", "imm", 1]]]
+constraint = "$#`arg2[4:]` = (1 - #`LOAD`) dot ((1 - #`word_instr`) dot #`rv2[2]` + #`signed` dot #`arg2_sign_bit` dot (2^(32) - 1)) + (1 - #`BEQ` - #`BLT` - #`STORE`) dot #`imm[1]`$"
+poly = ["-", ["idx", ["cast", "arg2", "DWordWL"], 1], ["*", ["not", "LOAD"], ["not", "word_instr"], ["idx", "rv2", 2]], ["*", ["not", "LOAD"], "signed", "arg2_sign_bit", ["-", ["^", 2, 32], 1]], ["*", ["-", 1, "BEQ", "BLT", "STORE"], ["idx", "imm", 1]]]
 
 [[constraints.ext]]
 kind = "interaction"
