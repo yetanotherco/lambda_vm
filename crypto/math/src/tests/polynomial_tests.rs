@@ -70,6 +70,7 @@ mod tests {
     }
 
     /// Extended Euclidean Algorithm for polynomials
+    #[allow(clippy::type_complexity)]
     fn xgcd<F: IsField>(
         poly: &Polynomial<FieldElement<F>>,
         y: &Polynomial<FieldElement<F>>,

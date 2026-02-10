@@ -1743,6 +1743,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     fn proof_parts_stone_compatibility_case_1() -> (
         StarkProof<
             Stark252PrimeField,

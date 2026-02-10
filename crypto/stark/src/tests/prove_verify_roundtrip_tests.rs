@@ -126,6 +126,7 @@ fn test_verify_serialized_multi_table_proofs() {
         let mul_air = create_mul_air(&proof_options);
 
         // Generate proofs
+        #[allow(clippy::type_complexity)]
         let air_trace_pairs: Vec<(
             &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
             &mut crate::trace::TraceTable<F, E>,
