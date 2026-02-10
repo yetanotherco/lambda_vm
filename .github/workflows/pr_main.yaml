@@ -109,7 +109,7 @@ jobs:
 
       - name: Run prover and crypto tests
         run: |
-          cargo test -p lambda-vm-prover -p stark -p crypto --release
+          cargo test -p lambda-vm-prover -p stark -p crypto --release -- --test-threads=2
 
       - name: Run comprehensive prover tests (merge queue only)
         if: github.event_name == 'merge_group'
