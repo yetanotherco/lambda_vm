@@ -558,9 +558,7 @@ fn test_prove_elfs_all_instructions_64_full() {
     let _ = env_logger::builder().is_test(true).try_init();
 
     let elf_bytes = crate::test_utils::asm_elf_bytes("all_instructions_64");
-    let proof_options = ProofOptions::default_test_options();
-    let result =
-        crate::prove_and_verify(&elf_bytes, &proof_options).expect("prove_and_verify failed");
+    let result = crate::prove_and_verify(&elf_bytes).expect("prove_and_verify failed");
     assert!(
         result,
         "all_instructions_64_full failed - comprehensive test with full bitwise table"
