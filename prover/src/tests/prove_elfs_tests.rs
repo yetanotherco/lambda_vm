@@ -50,6 +50,7 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
     let airs = VmAirs::new(elf, &proof_options, true, &traces.page_configs);
 
     // Build air_trace_pairs for all tables (core + REGISTER + PAGEs)
+    #[allow(clippy::type_complexity)]
     let mut air_trace_pairs: Vec<(
         &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
         &mut stark::trace::TraceTable<F, E>,
@@ -1162,7 +1163,7 @@ fn test_debug_memory_tokens_sb_sh() {
     {
         let page_base = page_config.page_base;
         let page_size = page_config.page_size;
-        let page_lo = (page_base & 0xFFFF_FFFF) as u64;
+        let page_lo = page_base & 0xFFFF_FFFF;
         let page_hi = page_base >> 32;
         let trace_rows = page_trace.num_rows();
 
@@ -1292,7 +1293,7 @@ fn test_debug_memory_tokens_sb_sh() {
     // === Verify PAGE AIR uses correct page_base ===
     println!("\n=== PAGE Configuration Check ===");
     for (idx, config) in traces.page_configs.iter().enumerate() {
-        let page_lo = (config.page_base & 0xFFFF_FFFF) as u64;
+        let page_lo = config.page_base & 0xFFFF_FFFF;
         let page_hi = config.page_base >> 32;
         println!(
             "PAGE {}: base=0x{:016x}, page_lo={}, page_hi={}",
@@ -1353,7 +1354,7 @@ fn test_page_trace_values_debug() {
             println!("  ts_lo = {} (expected 28)", ts_lo);
 
             // Compute what the AIR would see for address_lo
-            let page_lo = (page_base & 0xFFFF_FFFF) as u64;
+            let page_lo = page_base & 0xFFFF_FFFF;
             let page_hi = page_base >> 32;
             println!("\nAIR would compute:");
             println!("  page_lo = {} (0x{:08x})", page_lo, page_lo);

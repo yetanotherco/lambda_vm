@@ -1002,7 +1002,7 @@ fn test_decode_soundness_same_elf_accepted() {
 
     use crate::VmAirs;
     use crate::tables::trace_builder::Traces;
-    use crate::tables::types::{GoldilocksExtension, GoldilocksField};
+    use crate::tables::types::GoldilocksExtension;
 
     type E = GoldilocksExtension;
 
