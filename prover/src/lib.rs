@@ -6,9 +6,8 @@
 //! # Example
 //! ```ignore
 //! let elf_bytes = std::fs::read("program.elf").unwrap();
-//! let options = stark::proof::options::ProofOptions::default_test_options();
-//! let proof = lambda_vm_prover::prove(&elf_bytes, &options).unwrap();
-//! assert!(lambda_vm_prover::verify(&proof, &elf_bytes, &options).unwrap());
+//! let proof = lambda_vm_prover::prove(&elf_bytes).unwrap();
+//! assert!(lambda_vm_prover::verify(&proof, &elf_bytes).unwrap());
 //! ```
 
 #[cfg(feature = "dhat-heap")]
@@ -167,10 +166,8 @@ impl VmAirs {
 }
 
 /// Prove an ELF binary execution. Returns a serializable proof.
-pub fn prove(
-    elf_bytes: &[u8],
-    proof_options: &ProofOptions,
-) -> Result<MultiProof<F, E, ()>, Error> {
+pub fn prove(elf_bytes: &[u8]) -> Result<MultiProof<F, E, ()>, Error> {
+    let proof_options = ProofOptions::default();
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let executor = Executor::new(&program, vec![]).map_err(|e| Error::Execution(format!("{e}")))?;
     let result = executor
@@ -178,7 +175,7 @@ pub fn prove(
         .map_err(|e| Error::Execution(format!("{e}")))?;
 
     let mut traces = Traces::from_logs(&result.logs, result.instructions)?;
-    let airs = VmAirs::new(&program, proof_options, false);
+    let airs = VmAirs::new(&program, &proof_options, false);
 
     Prover::multi_prove(
         airs.air_trace_pairs(&mut traces),
@@ -188,13 +185,10 @@ pub fn prove(
 }
 
 /// Verify a proof produced by [`prove`].
-pub fn verify(
-    proof: &MultiProof<F, E, ()>,
-    elf_bytes: &[u8],
-    proof_options: &ProofOptions,
-) -> Result<bool, Error> {
+pub fn verify(proof: &MultiProof<F, E, ()>, elf_bytes: &[u8]) -> Result<bool, Error> {
+    let proof_options = ProofOptions::default();
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
-    let airs = VmAirs::new(&program, proof_options, false);
+    let airs = VmAirs::new(&program, &proof_options, false);
 
     Ok(Verifier::multi_verify(
         &airs.air_refs(),
@@ -204,7 +198,7 @@ pub fn verify(
 }
 
 /// Prove and verify in one call (convenience).
-pub fn prove_and_verify(elf_bytes: &[u8], proof_options: &ProofOptions) -> Result<bool, Error> {
-    let proof = prove(elf_bytes, proof_options)?;
-    verify(&proof, elf_bytes, proof_options)
+pub fn prove_and_verify(elf_bytes: &[u8]) -> Result<bool, Error> {
+    let proof = prove(elf_bytes)?;
+    verify(&proof, elf_bytes)
 }

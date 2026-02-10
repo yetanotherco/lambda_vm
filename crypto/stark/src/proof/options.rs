@@ -91,14 +91,25 @@ impl ProofOptions {
         Ok(())
     }
 
-    /// Default proof options used for testing purposes.
-    /// These options should never be used in production.
+    /// Insecure proof options for fast tests only. Never use in production.
     pub fn default_test_options() -> Self {
         Self {
             blowup_factor: 4,
             fri_number_of_queries: 3,
             coset_offset: 3,
             grinding_factor: 1,
+        }
+    }
+}
+
+/// Production-secure defaults (100-bit provable security).
+impl Default for ProofOptions {
+    fn default() -> Self {
+        Self {
+            blowup_factor: 4,
+            fri_number_of_queries: 104,
+            coset_offset: 3,
+            grinding_factor: 20,
         }
     }
 }

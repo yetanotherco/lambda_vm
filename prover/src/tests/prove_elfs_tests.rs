@@ -42,7 +42,7 @@ type E = GoldilocksExtension;
 ///
 /// Uses minimal bitwise (no full 2^20 preprocessed table) but DECODE is always preprocessed.
 fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
     let airs = VmAirs::new(elf, &proof_options, true);
 
     let multi_proof = match Prover::multi_prove(
@@ -78,7 +78,7 @@ fn test_cpu_only_no_bus() {
         cpu_trace.main_table.height, cpu_trace.main_table.width
     );
 
-    let proof_options = ProofOptions::default_test_options();
+    let proof_options = ProofOptions::default();
 
     // Create AIR with NO bus interactions
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
@@ -529,9 +529,7 @@ fn test_prove_elfs_all_instructions_64_full() {
     let _ = env_logger::builder().is_test(true).try_init();
 
     let elf_bytes = crate::test_utils::asm_elf_bytes("all_instructions_64");
-    let proof_options = ProofOptions::default_test_options();
-    let result =
-        crate::prove_and_verify(&elf_bytes, &proof_options).expect("prove_and_verify failed");
+    let result = crate::prove_and_verify(&elf_bytes).expect("prove_and_verify failed");
     assert!(
         result,
         "all_instructions_64_full failed - comprehensive test with full bitwise table"

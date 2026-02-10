@@ -14,7 +14,6 @@ use executor::{
     vm::execution::Executor,
 };
 use sha3::{Digest, Sha3_256};
-use stark::proof::options::ProofOptions;
 
 use proof_bundle::{PROOF_BUNDLE_VERSION, ProofBundle};
 
@@ -170,16 +169,9 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf) -> ExitCode {
     };
 
     let elf_hash: [u8; 32] = Sha3_256::digest(&elf_data).into();
-    // Provable 100-bit security.
-    let proof_options = ProofOptions {
-        blowup_factor: 4,
-        fri_number_of_queries: 104,
-        coset_offset: 3,
-        grinding_factor: 20,
-    };
 
     eprintln!("Generating proof (this may take a while)...");
-    let multi_proof = match prover::prove(&elf_data, &proof_options) {
+    let multi_proof = match prover::prove(&elf_data) {
         Ok(proof) => proof,
         Err(e) => {
             eprintln!("Proof generation failed: {}", e);
@@ -187,7 +179,7 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf) -> ExitCode {
         }
     };
 
-    let bundle = ProofBundle::new(multi_proof, proof_options, elf_hash);
+    let bundle = ProofBundle::new(multi_proof, elf_hash);
 
     eprintln!("Writing proof bundle...");
     let file = match File::create(&output_path) {
@@ -264,7 +256,7 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf) -> ExitCode {
     eprintln!("  Version: {}", bundle.metadata.version);
     eprintln!("  ELF hash: {}", truncated_hex(&bundle.metadata.elf_hash));
     eprintln!("Verifying proof...");
-    let result = match prover::verify(&bundle.multi_proof, &elf_data, &bundle.proof_options) {
+    let result = match prover::verify(&bundle.multi_proof, &elf_data) {
         Ok(valid) => valid,
         Err(e) => {
             eprintln!("Verification error: {}", e);
