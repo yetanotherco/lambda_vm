@@ -55,9 +55,6 @@ pub struct VmProof {
     /// Stack size used during proving (bytes). The verifier uses this to
     /// reconstruct the PAGE table layout.
     pub stack_size: u64,
-    /// Proof options used during proving (metadata only).
-    /// The verifier enforces its own options — these are NOT trusted.
-    pub proof_options: ProofOptions,
 }
 
 /// Error type for the prover crate.
@@ -225,18 +222,13 @@ impl VmAirs {
 
 /// Prove an ELF binary execution. Returns a serializable proof bundle.
 pub fn prove(elf_bytes: &[u8]) -> Result<VmProof, Error> {
-    prove_with_options(
-        elf_bytes,
-        &ProofOptions::default_proving_options(),
-        DEFAULT_STACK_SIZE,
-    )
+    prove_with_options(elf_bytes, &ProofOptions::default_proving_options())
 }
 
 /// Prove an ELF binary execution with custom proof options and stack size.
 pub fn prove_with_options(
     elf_bytes: &[u8],
     proof_options: &ProofOptions,
-    stack_size: u64,
 ) -> Result<VmProof, Error> {
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let executor = Executor::new(&program, vec![]).map_err(|e| Error::Execution(format!("{e}")))?;
@@ -246,7 +238,7 @@ pub fn prove_with_options(
 
     // Generate all traces from ELF and execution logs
     // This uses the combined ELF processing to generate DECODE and PAGE tables
-    let mut traces = Traces::from_elf_and_logs(&program, &result.logs, stack_size)?;
+    let mut traces = Traces::from_elf_and_logs(&program, &result.logs, DEFAULT_STACK_SIZE)?;
     let airs = VmAirs::new(&program, proof_options, false, &traces.page_configs);
 
     let proof = Prover::multi_prove(
@@ -257,8 +249,7 @@ pub fn prove_with_options(
 
     Ok(VmProof {
         proof,
-        stack_size,
-        proof_options: proof_options.clone(),
+        stack_size: DEFAULT_STACK_SIZE,
     })
 }
 
