@@ -51,8 +51,8 @@ use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 /// Default page size in bytes (4KB).
 pub const DEFAULT_PAGE_SIZE: usize = 4096;
 
-/// Stack top address (where SP starts). Must match executor.
-pub const STACK_TOP: u64 = 0xFFFF_FFFF_FFFF_FFF0;
+/// Stack top address (where SP starts). Re-exported from executor.
+pub use executor::vm::registers::STACK_TOP;
 
 /// Default stack size in bytes.
 pub const DEFAULT_STACK_SIZE: u64 = 4096;
