@@ -237,7 +237,7 @@ pub fn compute_precomputed_commitment(config: &PageConfig, options: &ProofOption
         };
     }
 
-    let columns = vec![offset_col, init_col];
+    let columns = [offset_col, init_col];
 
     let polys: Vec<Polynomial<FE>> = columns
         .iter()
