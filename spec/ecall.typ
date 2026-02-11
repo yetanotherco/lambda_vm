@@ -127,13 +127,13 @@ Both of these constraints are only required when $#`μ` = 1$, to permit a simple
 @commit:c:range_address_incr and @commit:c:range_count_decr are included to satisfy @add:a:sum respectively @add:a:rhs.
 #render_constraint_table(chip, config, groups: "incr_decr")
 
-When `count` hits $0$, we should performing further recursive calls.
+When `count` hits $0$, we should stop performing further recursive calls.
 We use the `end` bit to indicate these circumstances.
 
 #render_constraint_table(chip, config, groups: "end")
 
 *Note*: 
-+ Rather than setting $#`end` = 1$ when $#`count` = 0$, we do so $#`count_decr` = -1$.
++ Rather than setting $#`end` = 1$ when $#`count` = 0$, we do so when $#`count_decr` = -1$.
   This technique allows `count` to be stored in a `DWordWL` rather than a `DWordHL`, saving two columns.
 + $forall i in [0, 3]: 65535 - #`count_decr`_i >= 0$ as a result of @commit:c:range_count_decr.
  Hence, 
