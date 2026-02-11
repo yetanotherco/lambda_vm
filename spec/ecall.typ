@@ -146,7 +146,7 @@ Since that certainly won't be the `first` call in the sequence, we read `address
 #render_constraint_table(chip, config, groups: "lookups")
 
 Lastly, we must make sure `first`, `end` and `μ` are bits (@commit:c:range_first, @commit:c:range_end, @commit:c:range_mu), and that when either $#`first` = 1$ or $#`end` = 1$ imply that $#`μ` = 1$ (@commit:c:first_or_end_implies_mu).
-These are required to ensure the multiplicities $#`first` - #`μ`$ and $#`μ` - #`end`$ are binary.
+These are required to ensure the multiplicities $-(#`μ` - #`first`)$ and $#`μ` - #`end`$ are binary.
 #render_constraint_table(chip, config, groups: "bits")
 
 == Padding

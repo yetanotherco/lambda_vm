@@ -219,5 +219,5 @@ ref = "commit:c:send_commit_next_byte"
 kind = "interaction"
 tag = "CNB"
 input = ["timestamp", "index", "address", "count"]
-multiplicity = ["-", "first", "μ"]
+multiplicity = ["-", ["-", "μ", "first"]]
 ref = "commit:c:receive_commit_next_byte"
