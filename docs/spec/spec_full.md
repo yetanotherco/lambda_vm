@@ -88,7 +88,7 @@ The initial and final state of registers can be entirely known by the verifier, 
 
 = Future topics of interest
 
-- Optimize memory systems after determining factual bottlenecks (e.g. taking inspiration from Twist and Shout, or other recent research)
+- Optimize memory systems after determining factual bottlenecks (e.g. taking inspiration from Twist and Shout, or other recent research) - Double check whether IS_BYTE constraints are needed for fini
 
 ---
 
@@ -440,9 +440,9 @@ The `CPU` chip is comprised of  variables that are expressed using  columns:
 
 = Constraints First, we perform a decoding lookup for the current PC.
 
-| Tag | Description |
-|-----|-------------|
-| `CPU-C1` | `DECODE[pc, imm, packed_decode]` |
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `CPU-C1` | `DECODE[pc, imm, packed_decode]` | 1 |
 
 > **Note:** All casts for interactions will have to be reviewed once other chip interfaces stabilise
 
@@ -454,41 +454,41 @@ The `CPU` chip is comprised of  variables that are expressed using  columns:
 
 We constrain all columns to have the appropriate ranges. The flags and register indices looked up from the decoding need to be checked, as they are communicated through the interaction in a packed form. In contrast, we know ahead of time that decoding will ensure proper range checks for `pc` and `imm`. Similarly, since `next_pc` will propagate through the memory argument and be looked up in the instruction decoding on the next cycle, it is forced to be in the correct range. For the auxiliary columns, we need to check the limbs of `arg1`, `arg2`, and `res`. The ranges of the other auxiliary columns are enforced through later constraints.
 
-| Tag | Range | Description |
-|-----|-------|-------------|
-| `CPU-CR2` |  | `IS_BIT<read_register1>` |
-| `CPU-CR3` |  | `IS_BIT<read_register2>` |
-| `CPU-CR4` |  | `IS_BIT<write_register>` |
-| `CPU-CR5` |  | `IS_BIT<memory_2bytes>` |
-| `CPU-CR6` |  | `IS_BIT<memory_4bytes>` |
-| `CPU-CR7` |  | `IS_BIT<memory_8bytes>` |
-| `CPU-CR8` |  | `IS_BIT<c_type_instruction>` |
-| `CPU-CR9` |  | `IS_BIT<signed>` |
-| `CPU-CR10` |  | `IS_BIT<mp_selector>` |
-| `CPU-CR11` |  | `IS_BIT<muldiv_selector>` |
-| `CPU-CR12` |  | `IS_BIT<word_instr>` |
-| `CPU-CR13` |  | `IS_BIT<ADD>` |
-| `CPU-CR14` |  | `IS_BIT<SUB>` |
-| `CPU-CR15` |  | `IS_BIT<SLT>` |
-| `CPU-CR16` |  | `IS_BIT<AND>` |
-| `CPU-CR17` |  | `IS_BIT<OR>` |
-| `CPU-CR18` |  | `IS_BIT<XOR>` |
-| `CPU-CR19` |  | `IS_BIT<SHIFT>` |
-| `CPU-CR20` |  | `IS_BIT<JALR>` |
-| `CPU-CR21` |  | `IS_BIT<BEQ>` |
-| `CPU-CR22` |  | `IS_BIT<BLT>` |
-| `CPU-CR23` |  | `IS_BIT<LOAD>` |
-| `CPU-CR24` |  | `IS_BIT<STORE>` |
-| `CPU-CR25` |  | `IS_BIT<MUL>` |
-| `CPU-CR26` |  | `IS_BIT<DIVREM>` |
-| `CPU-CR27` |  | `IS_BIT<ECALL>` |
-| `CPU-CR28` |  | `IS_BIT<EBREAK>` |
-| `CPU-CR29` |  | `IS_BYTE[rs1]` |
-| `CPU-CR30` |  | `IS_BYTE[rs2]` |
-| `CPU-CR31` |  | `IS_BYTE[rd]` |
-| `CPU-CR32.i` | i ∈ [0, 7] | `IS_BYTE[arg1[i]]` |
-| `CPU-CR33.i` | i ∈ [0, 7] | `IS_BYTE[arg2[i]]` |
-| `CPU-CR34.i` | i ∈ [0, 7] | `IS_BYTE[res[i]]` |
+| Tag | Range | Description | Multiplicity |
+|-----|-------|-------------|--------------|
+| `CPU-CR2` |  | `IS_BIT<read_register1>` |  |
+| `CPU-CR3` |  | `IS_BIT<read_register2>` |  |
+| `CPU-CR4` |  | `IS_BIT<write_register>` |  |
+| `CPU-CR5` |  | `IS_BIT<memory_2bytes>` |  |
+| `CPU-CR6` |  | `IS_BIT<memory_4bytes>` |  |
+| `CPU-CR7` |  | `IS_BIT<memory_8bytes>` |  |
+| `CPU-CR8` |  | `IS_BIT<c_type_instruction>` |  |
+| `CPU-CR9` |  | `IS_BIT<signed>` |  |
+| `CPU-CR10` |  | `IS_BIT<mp_selector>` |  |
+| `CPU-CR11` |  | `IS_BIT<muldiv_selector>` |  |
+| `CPU-CR12` |  | `IS_BIT<word_instr>` |  |
+| `CPU-CR13` |  | `IS_BIT<ADD>` |  |
+| `CPU-CR14` |  | `IS_BIT<SUB>` |  |
+| `CPU-CR15` |  | `IS_BIT<SLT>` |  |
+| `CPU-CR16` |  | `IS_BIT<AND>` |  |
+| `CPU-CR17` |  | `IS_BIT<OR>` |  |
+| `CPU-CR18` |  | `IS_BIT<XOR>` |  |
+| `CPU-CR19` |  | `IS_BIT<SHIFT>` |  |
+| `CPU-CR20` |  | `IS_BIT<JALR>` |  |
+| `CPU-CR21` |  | `IS_BIT<BEQ>` |  |
+| `CPU-CR22` |  | `IS_BIT<BLT>` |  |
+| `CPU-CR23` |  | `IS_BIT<LOAD>` |  |
+| `CPU-CR24` |  | `IS_BIT<STORE>` |  |
+| `CPU-CR25` |  | `IS_BIT<MUL>` |  |
+| `CPU-CR26` |  | `IS_BIT<DIVREM>` |  |
+| `CPU-CR27` |  | `IS_BIT<ECALL>` |  |
+| `CPU-CR28` |  | `IS_BIT<EBREAK>` |  |
+| `CPU-CR29` |  | `IS_BYTE[rs1]` | 1 |
+| `CPU-CR30` |  | `IS_BYTE[rs2]` | 1 |
+| `CPU-CR31` |  | `IS_BYTE[rd]` | 1 |
+| `CPU-CR32.i` | i ∈ [0, 7] | `IS_BYTE[arg1[i]]` | 1 |
+| `CPU-CR33.i` | i ∈ [0, 7] | `IS_BYTE[arg2[i]]` | 1 |
+| `CPU-CR34.i` | i ∈ [0, 7] | `IS_BYTE[res[i]]` | 1 |
 
 ## ALU
 
@@ -496,18 +496,19 @@ The ALU functionality is then obtained through judicious dispatching to the corr
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `CPU-CA35` |  | ADD + LOAD + STORE ⇒ `ADD<res::DWordWL; arg1::DWordWL, arg2::DWordWL>` |  |
-| `CPU-CA36` |  | SUB + BEQ ⇒ `SUB<res::DWordWL; arg1::DWordWL, arg2::DWordWL>` |  |
-| `CPU-CA37` |  | `LT[res[0]; arg1::DWordWL, arg2::DWordWL, signed]` | SLT + BLT |
-| `CPU-CA38.i` | i ∈ [1, 7] | `SLT` + `BLT` => `res[i]` = 0 |  |
+| `CPU-CA35` |  | ADD + LOAD ⇒ `ADD<res::DWordWL; arg1::DWordWL, arg2::DWordWL>` |  |
+| `CPU-CA36` |  | STORE ⇒ `ADD<res::DWordWL; arg1::DWordWL, imm>` |  |
+| `CPU-CA37` |  | SUB + BEQ ⇒ `SUB<res::DWordWL; arg1::DWordWL, arg2::DWordWL>` |  |
+| `CPU-CA38` |  | `LT[res[0]; arg1::DWordWL, arg2::DWordWL, signed]` | SLT + BLT |
+| `CPU-CA39.i` | i ∈ [1, 7] | `SLT` + `BLT` => `res[i]` = 0 |  |
 | | | _polynomial:_ `(SLT + BLT) * res[i] = 0` | |
-| `CPU-CA39.i` | i ∈ [0, 7] | `AND_BYTE[res[i]; arg1[i], arg2[i]]` | AND |
-| `CPU-CA40.i` | i ∈ [0, 7] | `OR_BYTE[res[i]; arg1[i], arg2[i]]` | OR |
-| `CPU-CA41.i` | i ∈ [0, 7] | `XOR_BYTE[res[i]; arg1[i], arg2[i]]` | XOR |
-| `CPU-CA42` |  | `SHIFT[res::DWordHL; arg1::DWordHL, arg2[0], mp_selector, signed, word_instr]` | SHIFT |
-| `CPU-CA43` |  | JALR ⇒ `ADD<res::DWordWL; pc, (2 * c_type_instruction + 4 * (1 - c_type_instruction))::DWordWL>` |  |
-| `CPU-CA44` |  | `MUL[res; arg1, signed, arg2, mp_selector, muldiv_selector]` | MUL |
-| `CPU-CA45` |  | `DVRM[res; arg1, arg2, signed, muldiv_selector]` | DIVREM |
+| `CPU-CA40.i` | i ∈ [0, 7] | `AND_BYTE[res[i]; arg1[i], arg2[i]]` | AND |
+| `CPU-CA41.i` | i ∈ [0, 7] | `OR_BYTE[res[i]; arg1[i], arg2[i]]` | OR |
+| `CPU-CA42.i` | i ∈ [0, 7] | `XOR_BYTE[res[i]; arg1[i], arg2[i]]` | XOR |
+| `CPU-CA43` |  | `SHIFT[res::DWordHL; arg1::DWordHL, arg2[0], mp_selector, signed, word_instr]` | SHIFT |
+| `CPU-CA44` |  | JALR ⇒ `ADD<res::DWordWL; pc, (2 * c_type_instruction + 4 * (1 - c_type_instruction)) * 1::DWordWL>` |  |
+| `CPU-CA45` |  | `MUL[res; arg1, signed, arg2, mp_selector, muldiv_selector]` | MUL |
+| `CPU-CA46` |  | `DVRM[res; arg1, arg2, signed, muldiv_selector]` | DIVREM |
 
 ## Memory
 
@@ -515,16 +516,16 @@ The interactions with the memory, both for register loading and storing, as for 
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `CPU-CM46` |  | `MEMW[rv1; 1, 2 * rs1, rv1, timestamp + 0, 1, 0, 0]` | read_register1 |
-| `CPU-CM47.i` | i ∈ [0, 2] | `!read_register1` => `rv1[i]` = 0 |  |
+| `CPU-CM47` |  | `MEMW[rv1; 1, 2 * rs1, rv1, timestamp + 0::DWordWL, 1, 0, 0]` | read_register1 |
+| `CPU-CM48.i` | i ∈ [0, 2] | `!read_register1` => `rv1[i]` = 0 |  |
 | | | _polynomial:_ `(1 - read_register1) * rv1[i] = 0` | |
-| `CPU-CM48` |  | `MEMW[rv2; 1, 2 * rs2, rv2, timestamp + 1, 1, 0, 0]` | read_register2 |
-| `CPU-CM49.i` | i ∈ [0, 2] | `!read_register2` => `rv2[i]` = 0 |  |
+| `CPU-CM49` |  | `MEMW[rv2; 1, 2 * rs2, rv2, timestamp + 1::DWordWL, 1, 0, 0]` | read_register2 |
+| `CPU-CM50.i` | i ∈ [0, 2] | `!read_register2` => `rv2[i]` = 0 |  |
 | | | _polynomial:_ `(1 - read_register2) * rv2[i] = 0` | |
-| `CPU-CM50` |  | `MEMW[1, 2 * rd, rvd, timestamp + 2, 1, 0, 0]` | write_register |
-| `CPU-CM51` |  | `LOAD[rvd; 0, res, timestamp + 0, memory_2bytes, memory_4bytes, memory_8bytes, signed]` | LOAD |
-| `CPU-CM52` |  | `MEMW[0, res, rv2, timestamp + 1, memory_2bytes, memory_4bytes, memory_8bytes]` | STORE |
-| `CPU-CM53` |  | `MEMW[pc; 1, 2 * 255, next_pc, timestamp + 1, 1, 0, 0]` | 1 - pad |
+| `CPU-CM51` |  | `MEMW[1, 2 * rd, rvd, timestamp + 2::DWordWL, 1, 0, 0]` | write_register |
+| `CPU-CM52` |  | `LOAD[rvd; 0, res, timestamp + 0::DWordWL, memory_2bytes, memory_4bytes, memory_8bytes, signed]` | LOAD |
+| `CPU-CM53` |  | `MEMW[0, res, arg2::Byte[8], timestamp + 1::DWordWL, memory_2bytes, memory_4bytes, memory_8bytes]` | STORE |
+| `CPU-CM54` |  | `MEMW[pc; 1, 2 * 255, next_pc, timestamp + 1::DWordWL, 1, 0, 0]` | 1 - pad |
 
 ## System
 
@@ -532,9 +533,9 @@ The interactions with the wider system.
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `CPU-CS54` | `!EBREAK` |  |
+| `CPU-CS55` | `!EBREAK` |  |
 | | _polynomial:_ `1 - EBREAK = 0` | |
-| `CPU-CS55` | `ECALL[timestamp, rv1::DWordWL]` | ECALL |
+| `CPU-CS56` | `ECALL[timestamp, rv1::DWordWL]` | ECALL |
 
 ## Input and output to the ALU
 
@@ -542,22 +543,22 @@ We constrain `arg1`, `arg2` and `rvd` to correspond to the wanted values, includ
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `CPU-CE56` | (`rv1_sign_bit` or `arg2_sign_bit` or `res_sign_bit`) => `word_instr` |  |
+| `CPU-CE57` | (`rv1_sign_bit` or `arg2_sign_bit` or `res_sign_bit`) => `word_instr` |  |
 | | _polynomial:_ `(rv1_sign_bit + arg2_sign_bit + res_sign_bit) * (1 - word_instr) = 0` | |
-| `CPU-CE57` | `MSB16[rv1_sign_bit; rv1[1]]` | word_instr |
-| `CPU-CE58` | `arg1[:4]` = `rv1[:2]` |  |
+| `CPU-CE58` | `MSB16[rv1_sign_bit; rv1[1]]` | word_instr |
+| `CPU-CE59` | `arg1[:4]` = `rv1[:2]` |  |
 | | _polynomial:_ `(arg1::DWordWL)[0] - (rv1::DWordWL)[0] = 0` | |
-| `CPU-CE59` | `arg1[4:]` = `rv1[2]` dot (1 - `word_instr`) + (2^(32) - 1) dot `rv1_sign_bit` dot `signed` |  |
+| `CPU-CE60` | `arg1[4:]` = `rv1[2]` dot (1 - `word_instr`) + (2^(32) - 1) dot `rv1_sign_bit` dot `signed` |  |
 | | _polynomial:_ `(arg1::DWordWL)[1] - (1 - word_instr) * rv1[2] - signed * rv1_sign_bit * (2^32 - 1) = 0` | |
-| `CPU-CE60` | `MSB16[arg2_sign_bit; rv2[1]]` | word_instr |
-| `CPU-CE61` | `arg2[:4]` = (1 - `STORE` - `LOAD`) dot `rv2[:2]` + (1 - `BEQ` - `BLT`) dot `imm[0]` |  |
-| | _polynomial:_ `(arg2::DWordWL)[0] - (1 - STORE - LOAD) * (rv2::DWordWL)[0] - (1 - BEQ - BLT) * imm[0] = 0` | |
-| `CPU-CE62` | `arg2[4:]` = (1 - `STORE` - `LOAD`) dot ((1 - `word_instr`) dot `rv2[2]` + `signed` dot `arg2_sign_bit` dot (2^(32) - 1)) + (1 - `BEQ` - `BLT`) dot `imm[1]` |  |
-| | _polynomial:_ `(arg2::DWordWL)[1] - (1 - STORE - LOAD) * (1 - word_instr) * rv2[2] - (1 - STORE - LOAD) * signed * arg2_sign_bit * (2^32 - 1) - (1 - BEQ - BLT) * imm[1] = 0` | |
-| `CPU-CE63` | `MSB8[res_sign_bit; res[3]]` | word_instr |
-| `CPU-CE64` | `!LOAD` => `rvd[0]` = `res[:4]` |  |
+| `CPU-CE61` | `MSB16[arg2_sign_bit; rv2[1]]` | word_instr |
+| `CPU-CE62` | `arg2[:4]` = (1 - `LOAD`) dot `rv2[:2]` + (1 - `BEQ` - `BLT` - `STORE`) dot `imm[0]` |  |
+| | _polynomial:_ `(arg2::DWordWL)[0] - (1 - LOAD) * (rv2::DWordWL)[0] - (1 - BEQ - BLT - STORE) * imm[0] = 0` | |
+| `CPU-CE63` | `arg2[4:]` = (1 - `LOAD`) dot ((1 - `word_instr`) dot `rv2[2]` + `signed` dot `arg2_sign_bit` dot (2^(32) - 1)) + (1 - `BEQ` - `BLT` - `STORE`) dot `imm[1]` |  |
+| | _polynomial:_ `(arg2::DWordWL)[1] - (1 - LOAD) * (1 - word_instr) * rv2[2] - (1 - LOAD) * signed * arg2_sign_bit * (2^32 - 1) - (1 - BEQ - BLT - STORE) * imm[1] = 0` | |
+| `CPU-CE64` | `MSB8[res_sign_bit; res[3]]` | word_instr |
+| `CPU-CE65` | `!LOAD` => `rvd[0]` = `res[:4]` |  |
 | | _polynomial:_ `(1 - LOAD) * (rvd[0] - (res::DWordWL)[0]) = 0` | |
-| `CPU-CE65` | `!LOAD` => `rvd[1]` = (1 - `word_instr`) dot `res[4:]` + `res_sign_bit` dot (2^(32) - 1) |  |
+| `CPU-CE66` | `!LOAD` => `rvd[1]` = (1 - `word_instr`) dot `res[4:]` + `res_sign_bit` dot (2^(32) - 1) |  |
 | | _polynomial:_ `(1 - LOAD) * (rvd[1] - (1 - word_instr) * (res::DWordWL)[1] - res_sign_bit * (2^32 - 1)) = 0` | |
 
 ## Other constraints
@@ -566,11 +567,11 @@ For [cpu:c:is_equal], note that [cpu:c:sub] sets `res` to be the difference betw
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `CPU-CO66` | `ZERO[is_equal; res[0] + res[1] + res[2] + res[3] + res[4] + res[5] + res[6] + res[7]]` | BEQ |
-| `CPU-CO67` | `branch_cond` = `JALR` or (`BLT` and (`res` xor `invert`)) or (`BEQ` and (`is_equal` xor `invert`)) |  |
+| `CPU-CO67` | `ZERO[is_equal; res[0] + res[1] + res[2] + res[3] + res[4] + res[5] + res[6] + res[7]]` | BEQ |
+| `CPU-CO68` | `branch_cond` = `JALR` or (`BLT` and (`res` xor `invert`)) or (`BEQ` and (`is_equal` xor `invert`)) |  |
 | | _polynomial:_ `-branch_cond + JALR + res[0] * (1 - mp_selector) * BLT + (1 - res[0]) * mp_selector * BLT + is_equal * (1 - mp_selector) * BEQ + (1 - is_equal) * mp_selector * BEQ = 0` | |
-| `CPU-CO68` | `BRANCH[next_pc; pc, imm[0], arg1::DWordWL, JALR]` | branch_cond |
-| `CPU-CO69` | `ADD<next_pc; pc, (2 * c_type_instruction + 4 * (1 - c_type_instruction))::DWordWL>` |  |
+| `CPU-CO69` | `BRANCH[next_pc; pc, imm[0], arg1::DWordWL, JALR]` | branch_cond |
+| `CPU-CO70` | `ADD<next_pc; pc, (2 * c_type_instruction + 4 * (1 - c_type_instruction)) * 1::DWordWL>` |  |
 
 > **Note:** Document the choice to not have a multiplicity column here for padding
 
@@ -890,7 +891,7 @@ The range checks on `unmasked_low_byte` and `next_pc_low[0]` are performed impli
 | `BRANCH-C1` |  | 1 - JALR ⇒ `ADD<next_pc_unmasked; pc, offset::DWordWL>` |  |
 | `BRANCH-C2` |  | JALR ⇒ `ADD<next_pc_unmasked; register, offset::DWordWL>` |  |
 | `BRANCH-C3` |  | `IS_BYTE[next_pc_low[1]]` | μ |
-| `BRANCH-C4` |  | `AND_BYTE[next_pc_low[0]; unmasked_low_byte[0], 254]` | μ |
+| `BRANCH-C4` |  | `AND_BYTE[next_pc_low[0]; unmasked_low_byte, 254]` | μ |
 | `BRANCH-C5.i` | i ∈ [0, 2] | `IS_HALFWORD[next_pc_high[i]]` | μ |
 
 This chip contributes the following to the lookup argument.
@@ -910,7 +911,7 @@ The table can be padded to the next power of two with the following value assign
 | Name | Type | Description |
 |------|------|-------------|
 | `pc` | `DWordWL` | The current pc, used as base address when `!JALR` |
-| `offset` | `Word` | The offset from the base address to jump to |
+| `offset` | `DWordWL` | The offset from the base address to jump to |
 | `register` | `DWordWL` | The base address to use when `JALR` |
 | `JALR` | `Bit` | Selects between `pc` and `register` as base address, needed for the `JALR` instruction |
 
@@ -936,7 +937,7 @@ The table can be padded to the next power of two with the following value assign
 
 **Definition of `next_pc_unmasked`:**
 ```
-next_pc_unmasked (when iter=0) := 2^16 * next_pc_high[0] + 2^8 * next_pc_low[1] + unmasked_low_byte[0]
+next_pc_unmasked (when iter=0) := 2^16 * next_pc_high[0] + 2^8 * next_pc_low[1] + unmasked_low_byte
 next_pc_unmasked (when iter=1) := 2^16 * next_pc_high[2] + next_pc_high[1]
 ```
 
@@ -980,14 +981,16 @@ Our assumptions do not explicitly cover any range checks for the `is_register` a
 | `MEMW-C1` |  | `IS_BIT<μ_sum>` |  |
 | `MEMW-C2` |  | `w2` => `μ_sum` |  |
 | | | _polynomial:_ `w2 * (1 - μ_sum) = 0` | |
-| `MEMW-C3` |  | `ADD<address_add[0]::DWordWL; base_address, 1>` | w2 |
-| `MEMW-C4.i` | i ∈ [1, 2] | `ADD<address_add[i]::DWordWL; base_address, i + 1>` | w4 |
-| `MEMW-C5.i` | i ∈ [3, 6] | `ADD<address_add[i]::DWordWL; base_address, i + 1>` | write8 |
-| `MEMW-C6.i` | i ∈ [0, 6], j ∈ [0, 3] | `IS_HALFWORD[address_add[i][j]]` |  |
-| `MEMW-C7` |  | `LT[1; old_timestamp[0], timestamp, 0]` | μ_sum |
-| `MEMW-C8` |  | `LT[1; old_timestamp[1], timestamp, 0]` | w2 |
-| `MEMW-C9.i` | i ∈ [2, 3] | `LT[1; old_timestamp[i], timestamp, 0]` | w4 |
-| `MEMW-C10.i` | i ∈ [4, 7] | `LT[1; old_timestamp[i], timestamp, 0]` | write8 |
+| `MEMW-C3` |  | w2 ⇒ `ADD<address_add[0]::DWordWL; base_address, 1>` |  |
+| `MEMW-C4.i` | i ∈ [1, 2] | w4 ⇒ `ADD<address_add[i]::DWordWL; base_address, i + 1>` |  |
+| `MEMW-C5.i` | i ∈ [3, 6] | write8 ⇒ `ADD<address_add[i]::DWordWL; base_address, i + 1>` |  |
+| `MEMW-C6.i` | i ∈ [0, 0], j ∈ [0, 3] | `IS_HALFWORD[address_add[i][j]]` | w2 |
+| `MEMW-C7.i` | i ∈ [1, 2], j ∈ [0, 3] | `IS_HALFWORD[address_add[i][j]]` | w4 |
+| `MEMW-C8.i` | i ∈ [3, 6], j ∈ [0, 3] | `IS_HALFWORD[address_add[i][j]]` | write8 |
+| `MEMW-C9` |  | `LT[1; old_timestamp[0], timestamp, 0]` | μ_sum |
+| `MEMW-C10` |  | `LT[1; old_timestamp[1], timestamp, 0]` | w2 |
+| `MEMW-C11.i` | i ∈ [2, 3] | `LT[1; old_timestamp[i], timestamp, 0]` | w4 |
+| `MEMW-C12.i` | i ∈ [4, 7] | `LT[1; old_timestamp[i], timestamp, 0]` | write8 |
 
 As long as `timestamp` is properly range-checked, the presence of `old_timestamp` in the memory argument automatically ensures appropriate range checking (as long as no external entities provide negative multiplicities without range checking the timestamp). This ensures the assumptions for `LT` are satisfied.
 
@@ -995,29 +998,29 @@ We additionally check that the address does not overflow for more significant by
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `MEMW-CR11` | `LT[1; base_address, address_add[0]::DWordWL, 0]` | write2 |
-| `MEMW-CR12` | `LT[1; base_address, address_add[2]::DWordWL, 0]` | write4 |
-| `MEMW-CR13` | `LT[1; base_address, address_add[6]::DWordWL, 0]` | write8 |
+| `MEMW-CR13` | `LT[1; base_address, address_add[0]::DWordWL, 0]` | write2 |
+| `MEMW-CR14` | `LT[1; base_address, address_add[2]::DWordWL, 0]` | write4 |
+| `MEMW-CR15` | `LT[1; base_address, address_add[6]::DWordWL, 0]` | write8 |
 
 The chip adds the following tuples to the lookup argument, to effectuate that part of the memory argument.
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `MEMW-CM14` |  | `memory[is_register, base_address, old_timestamp[0], old[0]]` | μ_sum |
-| `MEMW-CM15` |  | `memory[is_register, base_address, timestamp, value[0]]` | -μ_sum |
-| `MEMW-CM16` |  | `memory[is_register, address_add[0], old_timestamp[1], old[1]]` | w2 |
-| `MEMW-CM17` |  | `memory[is_register, address_add[0], timestamp, value[1]]` | -w2 |
-| `MEMW-CM18.i` | i ∈ [2, 3] | `memory[is_register, address_add[i - 1], old_timestamp[i], old[i]]` | w4 |
-| `MEMW-CM19.i` | i ∈ [2, 3] | `memory[is_register, address_add[i - 1], timestamp, value[i]]` | -w4 |
-| `MEMW-CM20.i` | i ∈ [4, 7] | `memory[is_register, address_add[i - 1], old_timestamp[i], old[i]]` | write8 |
-| `MEMW-CM21.i` | i ∈ [4, 7] | `memory[is_register, address_add[i - 1], timestamp, value[i]]` | -write8 |
+| `MEMW-CM16` |  | `memory[is_register, base_address, old_timestamp[0], old[0]]` | μ_sum |
+| `MEMW-CM17` |  | `memory[is_register, base_address, timestamp, value[0]]` | -μ_sum |
+| `MEMW-CM18` |  | `memory[is_register, address_add[0], old_timestamp[1], old[1]]` | w2 |
+| `MEMW-CM19` |  | `memory[is_register, address_add[0], timestamp, value[1]]` | -w2 |
+| `MEMW-CM20.i` | i ∈ [2, 3] | `memory[is_register, address_add[i - 1], old_timestamp[i], old[i]]` | w4 |
+| `MEMW-CM21.i` | i ∈ [2, 3] | `memory[is_register, address_add[i - 1], timestamp, value[i]]` | -w4 |
+| `MEMW-CM22.i` | i ∈ [4, 7] | `memory[is_register, address_add[i - 1], old_timestamp[i], old[i]]` | write8 |
+| `MEMW-CM23.i` | i ∈ [4, 7] | `memory[is_register, address_add[i - 1], timestamp, value[i]]` | -write8 |
 
 This chip contributes the following to the lookup argument.
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `MEMW-CO22` | `MEMW[old; is_register, base_address, value, timestamp, write2, write4, write8]` | μ_read |
-| `MEMW-CO23` | `MEMW[is_register, base_address, value, timestamp, write2, write4, write8]` | μ_write |
+| `MEMW-CO24` | `MEMW[old; is_register, base_address, value, timestamp, write2, write4, write8]` | μ_read |
+| `MEMW-CO25` | `MEMW[is_register, base_address, value, timestamp, write2, write4, write8]` | μ_write |
 
 = Future optimization ideas
 
@@ -1505,20 +1508,13 @@ carry (when iter=[1, 3]) := 2^-32 * ((extended_n_sub_r::QuadWL)[i] + (extended_r
 | `DVRM-C21` | `DVRM[q::DWordWL; n, d, signed, 0]` | -μ_q |
 | `DVRM-C22` | `DVRM[r::DWordWL; n, d, signed, 1]` | -μ_r |
 
-### equality
-
-| Tag | Range | Description | Multiplicity |
-|-----|-------|-------------|--------------|
-| `DVRM-C13` |  | `MUL[n_sub_r::DWordWL; d, signed, q, sign_q, 0]` | μ_sum |
-| `DVRM-C14` |  | `MUL[extension_n_sub_r::DWordWL; d, signed, q, sign_q, 1]` | μ_sum |
-| `DVRM-C15.i` | i ∈ [0, 3] | `IS_HALF[q[i]]` | μ_sum |
-
-### sign_equality
+### defs
 
 | Tag | Description |
 |-----|-------------|
-| `DVRM-C1` | `r` eq.not 0 => `sign_r` = `sign_n` |
-| | _polynomial:_ `Σ_i = 0^3 r[i] * (sign_r - sign_n) = 0` |
+| `DVRM-C16` | `SIGN<sign_n; n[3], signed>` |
+| `DVRM-C17` | `SIGN<sign_r; r[3], signed>` |
+| `DVRM-C18` | `SIGN<sign_d; d[3], signed>` |
 
 ### n_sub_r
 
@@ -1529,6 +1525,13 @@ carry (when iter=[1, 3]) := 2^-32 * ((extended_n_sub_r::QuadWL)[i] + (extended_r
 | `DVRM-C11.i` | i ∈ [0, 3] | `IS_HALF[n_sub_r[i]]` | μ_sum |
 | `DVRM-C12` |  | `IS_BIT<sign_n_sub_r>` |  |
 
+### sign_equality
+
+| Tag | Description |
+|-----|-------------|
+| `DVRM-C1` | `r` eq.not 0 => `sign_r` = `sign_n` |
+| | _polynomial:_ `Σ_i = 0^3 r[i] * (sign_r - sign_n) = 0` |
+
 ### div_by_zero
 
 | Tag | Range | Description | Multiplicity |
@@ -1536,6 +1539,14 @@ carry (when iter=[1, 3]) := 2^-32 * ((extended_n_sub_r::QuadWL)[i] + (extended_r
 | `DVRM-C19.i` | i ∈ [0, 3] | `div_by_zero` => `q[i]` = 65535 |  |
 | | | _polynomial:_ `div_by_zero * (q[i] - 65535) = 0` | |
 | `DVRM-C20` |  | `ZERO[div_by_zero; d[0] + d[1] + d[2] + d[3]]` | μ_sum |
+
+### equality
+
+| Tag | Range | Description | Multiplicity |
+|-----|-------|-------------|--------------|
+| `DVRM-C13` |  | `MUL[n_sub_r::DWordWL; d, signed, q, sign_q, 0]` | μ_sum |
+| `DVRM-C14` |  | `MUL[extension_n_sub_r::DWordWL; d, signed, q, sign_q, 1]` | μ_sum |
+| `DVRM-C15.i` | i ∈ [0, 3] | `IS_HALF[q[i]]` | μ_sum |
 
 ### abs_diff
 
@@ -1548,14 +1559,6 @@ carry (when iter=[1, 3]) := 2^-32 * ((extended_n_sub_r::QuadWL)[i] + (extended_r
 | `DVRM-C5` |  | sign_d ⇒ `NEG<abs_d; d>` |  |
 | `DVRM-C6.i` | i ∈ [0, 1] | not`sign_d` => `abs_d` = `d` |  |
 | | | _polynomial:_ `(1 - sign_d) * (abs_d[i] - (d::DWordWL)[i]) = 0` | |
-
-### defs
-
-| Tag | Description |
-|-----|-------------|
-| `DVRM-C16` | `SIGN<sign_n; n[3], signed>` |
-| `DVRM-C17` | `SIGN<sign_r; r[3], signed>` |
-| `DVRM-C18` | `SIGN<sign_d; d[3], signed>` |
 
 ---
 

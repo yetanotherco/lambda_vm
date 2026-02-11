@@ -15,14 +15,16 @@ Our assumptions do not explicitly cover any range checks for the `is_register` a
 | `MEMW-C1` |  | `IS_BIT<μ_sum>` |  |
 | `MEMW-C2` |  | `w2` => `μ_sum` |  |
 | | | _polynomial:_ `w2 * (1 - μ_sum) = 0` | |
-| `MEMW-C3` |  | `ADD<address_add[0]::DWordWL; base_address, 1>` | w2 |
-| `MEMW-C4.i` | i ∈ [1, 2] | `ADD<address_add[i]::DWordWL; base_address, i + 1>` | w4 |
-| `MEMW-C5.i` | i ∈ [3, 6] | `ADD<address_add[i]::DWordWL; base_address, i + 1>` | write8 |
-| `MEMW-C6.i` | i ∈ [0, 6], j ∈ [0, 3] | `IS_HALFWORD[address_add[i][j]]` |  |
-| `MEMW-C7` |  | `LT[1; old_timestamp[0], timestamp, 0]` | μ_sum |
-| `MEMW-C8` |  | `LT[1; old_timestamp[1], timestamp, 0]` | w2 |
-| `MEMW-C9.i` | i ∈ [2, 3] | `LT[1; old_timestamp[i], timestamp, 0]` | w4 |
-| `MEMW-C10.i` | i ∈ [4, 7] | `LT[1; old_timestamp[i], timestamp, 0]` | write8 |
+| `MEMW-C3` |  | w2 ⇒ `ADD<address_add[0]::DWordWL; base_address, 1>` |  |
+| `MEMW-C4.i` | i ∈ [1, 2] | w4 ⇒ `ADD<address_add[i]::DWordWL; base_address, i + 1>` |  |
+| `MEMW-C5.i` | i ∈ [3, 6] | write8 ⇒ `ADD<address_add[i]::DWordWL; base_address, i + 1>` |  |
+| `MEMW-C6.i` | i ∈ [0, 0], j ∈ [0, 3] | `IS_HALFWORD[address_add[i][j]]` | w2 |
+| `MEMW-C7.i` | i ∈ [1, 2], j ∈ [0, 3] | `IS_HALFWORD[address_add[i][j]]` | w4 |
+| `MEMW-C8.i` | i ∈ [3, 6], j ∈ [0, 3] | `IS_HALFWORD[address_add[i][j]]` | write8 |
+| `MEMW-C9` |  | `LT[1; old_timestamp[0], timestamp, 0]` | μ_sum |
+| `MEMW-C10` |  | `LT[1; old_timestamp[1], timestamp, 0]` | w2 |
+| `MEMW-C11.i` | i ∈ [2, 3] | `LT[1; old_timestamp[i], timestamp, 0]` | w4 |
+| `MEMW-C12.i` | i ∈ [4, 7] | `LT[1; old_timestamp[i], timestamp, 0]` | write8 |
 
 As long as `timestamp` is properly range-checked, the presence of `old_timestamp` in the memory argument automatically ensures appropriate range checking (as long as no external entities provide negative multiplicities without range checking the timestamp). This ensures the assumptions for `LT` are satisfied.
 
@@ -30,29 +32,29 @@ We additionally check that the address does not overflow for more significant by
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `MEMW-CR11` | `LT[1; base_address, address_add[0]::DWordWL, 0]` | write2 |
-| `MEMW-CR12` | `LT[1; base_address, address_add[2]::DWordWL, 0]` | write4 |
-| `MEMW-CR13` | `LT[1; base_address, address_add[6]::DWordWL, 0]` | write8 |
+| `MEMW-CR13` | `LT[1; base_address, address_add[0]::DWordWL, 0]` | write2 |
+| `MEMW-CR14` | `LT[1; base_address, address_add[2]::DWordWL, 0]` | write4 |
+| `MEMW-CR15` | `LT[1; base_address, address_add[6]::DWordWL, 0]` | write8 |
 
 The chip adds the following tuples to the lookup argument, to effectuate that part of the memory argument.
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `MEMW-CM14` |  | `memory[is_register, base_address, old_timestamp[0], old[0]]` | μ_sum |
-| `MEMW-CM15` |  | `memory[is_register, base_address, timestamp, value[0]]` | -μ_sum |
-| `MEMW-CM16` |  | `memory[is_register, address_add[0], old_timestamp[1], old[1]]` | w2 |
-| `MEMW-CM17` |  | `memory[is_register, address_add[0], timestamp, value[1]]` | -w2 |
-| `MEMW-CM18.i` | i ∈ [2, 3] | `memory[is_register, address_add[i - 1], old_timestamp[i], old[i]]` | w4 |
-| `MEMW-CM19.i` | i ∈ [2, 3] | `memory[is_register, address_add[i - 1], timestamp, value[i]]` | -w4 |
-| `MEMW-CM20.i` | i ∈ [4, 7] | `memory[is_register, address_add[i - 1], old_timestamp[i], old[i]]` | write8 |
-| `MEMW-CM21.i` | i ∈ [4, 7] | `memory[is_register, address_add[i - 1], timestamp, value[i]]` | -write8 |
+| `MEMW-CM16` |  | `memory[is_register, base_address, old_timestamp[0], old[0]]` | μ_sum |
+| `MEMW-CM17` |  | `memory[is_register, base_address, timestamp, value[0]]` | -μ_sum |
+| `MEMW-CM18` |  | `memory[is_register, address_add[0], old_timestamp[1], old[1]]` | w2 |
+| `MEMW-CM19` |  | `memory[is_register, address_add[0], timestamp, value[1]]` | -w2 |
+| `MEMW-CM20.i` | i ∈ [2, 3] | `memory[is_register, address_add[i - 1], old_timestamp[i], old[i]]` | w4 |
+| `MEMW-CM21.i` | i ∈ [2, 3] | `memory[is_register, address_add[i - 1], timestamp, value[i]]` | -w4 |
+| `MEMW-CM22.i` | i ∈ [4, 7] | `memory[is_register, address_add[i - 1], old_timestamp[i], old[i]]` | write8 |
+| `MEMW-CM23.i` | i ∈ [4, 7] | `memory[is_register, address_add[i - 1], timestamp, value[i]]` | -write8 |
 
 This chip contributes the following to the lookup argument.
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `MEMW-CO22` | `MEMW[old; is_register, base_address, value, timestamp, write2, write4, write8]` | μ_read |
-| `MEMW-CO23` | `MEMW[is_register, base_address, value, timestamp, write2, write4, write8]` | μ_write |
+| `MEMW-CO24` | `MEMW[old; is_register, base_address, value, timestamp, write2, write4, write8]` | μ_read |
+| `MEMW-CO25` | `MEMW[is_register, base_address, value, timestamp, write2, write4, write8]` | μ_write |
 
 = Future optimization ideas
 

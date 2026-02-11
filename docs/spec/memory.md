@@ -86,4 +86,4 @@ The initial and final state of registers can be entirely known by the verifier, 
 
 = Future topics of interest
 
-- Optimize memory systems after determining factual bottlenecks (e.g. taking inspiration from Twist and Shout, or other recent research)
+- Optimize memory systems after determining factual bottlenecks (e.g. taking inspiration from Twist and Shout, or other recent research) - Double check whether IS_BYTE constraints are needed for fini

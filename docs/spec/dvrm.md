@@ -163,20 +163,13 @@ carry (when iter=[1, 3]) := 2^-32 * ((extended_n_sub_r::QuadWL)[i] + (extended_r
 | `DVRM-C21` | `DVRM[q::DWordWL; n, d, signed, 0]` | -μ_q |
 | `DVRM-C22` | `DVRM[r::DWordWL; n, d, signed, 1]` | -μ_r |
 
-### equality
-
-| Tag | Range | Description | Multiplicity |
-|-----|-------|-------------|--------------|
-| `DVRM-C13` |  | `MUL[n_sub_r::DWordWL; d, signed, q, sign_q, 0]` | μ_sum |
-| `DVRM-C14` |  | `MUL[extension_n_sub_r::DWordWL; d, signed, q, sign_q, 1]` | μ_sum |
-| `DVRM-C15.i` | i ∈ [0, 3] | `IS_HALF[q[i]]` | μ_sum |
-
-### sign_equality
+### defs
 
 | Tag | Description |
 |-----|-------------|
-| `DVRM-C1` | `r` eq.not 0 => `sign_r` = `sign_n` |
-| | _polynomial:_ `Σ_i = 0^3 r[i] * (sign_r - sign_n) = 0` |
+| `DVRM-C16` | `SIGN<sign_n; n[3], signed>` |
+| `DVRM-C17` | `SIGN<sign_r; r[3], signed>` |
+| `DVRM-C18` | `SIGN<sign_d; d[3], signed>` |
 
 ### n_sub_r
 
@@ -187,6 +180,13 @@ carry (when iter=[1, 3]) := 2^-32 * ((extended_n_sub_r::QuadWL)[i] + (extended_r
 | `DVRM-C11.i` | i ∈ [0, 3] | `IS_HALF[n_sub_r[i]]` | μ_sum |
 | `DVRM-C12` |  | `IS_BIT<sign_n_sub_r>` |  |
 
+### sign_equality
+
+| Tag | Description |
+|-----|-------------|
+| `DVRM-C1` | `r` eq.not 0 => `sign_r` = `sign_n` |
+| | _polynomial:_ `Σ_i = 0^3 r[i] * (sign_r - sign_n) = 0` |
+
 ### div_by_zero
 
 | Tag | Range | Description | Multiplicity |
@@ -194,6 +194,14 @@ carry (when iter=[1, 3]) := 2^-32 * ((extended_n_sub_r::QuadWL)[i] + (extended_r
 | `DVRM-C19.i` | i ∈ [0, 3] | `div_by_zero` => `q[i]` = 65535 |  |
 | | | _polynomial:_ `div_by_zero * (q[i] - 65535) = 0` | |
 | `DVRM-C20` |  | `ZERO[div_by_zero; d[0] + d[1] + d[2] + d[3]]` | μ_sum |
+
+### equality
+
+| Tag | Range | Description | Multiplicity |
+|-----|-------|-------------|--------------|
+| `DVRM-C13` |  | `MUL[n_sub_r::DWordWL; d, signed, q, sign_q, 0]` | μ_sum |
+| `DVRM-C14` |  | `MUL[extension_n_sub_r::DWordWL; d, signed, q, sign_q, 1]` | μ_sum |
+| `DVRM-C15.i` | i ∈ [0, 3] | `IS_HALF[q[i]]` | μ_sum |
 
 ### abs_diff
 
@@ -206,11 +214,3 @@ carry (when iter=[1, 3]) := 2^-32 * ((extended_n_sub_r::QuadWL)[i] + (extended_r
 | `DVRM-C5` |  | sign_d ⇒ `NEG<abs_d; d>` |  |
 | `DVRM-C6.i` | i ∈ [0, 1] | not`sign_d` => `abs_d` = `d` |  |
 | | | _polynomial:_ `(1 - sign_d) * (abs_d[i] - (d::DWordWL)[i]) = 0` | |
-
-### defs
-
-| Tag | Description |
-|-----|-------------|
-| `DVRM-C16` | `SIGN<sign_n; n[3], signed>` |
-| `DVRM-C17` | `SIGN<sign_r; r[3], signed>` |
-| `DVRM-C18` | `SIGN<sign_d; d[3], signed>` |

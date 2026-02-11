@@ -19,7 +19,7 @@ The range checks on `unmasked_low_byte` and `next_pc_low[0]` are performed impli
 | `BRANCH-C1` |  | 1 - JALR ⇒ `ADD<next_pc_unmasked; pc, offset::DWordWL>` |  |
 | `BRANCH-C2` |  | JALR ⇒ `ADD<next_pc_unmasked; register, offset::DWordWL>` |  |
 | `BRANCH-C3` |  | `IS_BYTE[next_pc_low[1]]` | μ |
-| `BRANCH-C4` |  | `AND_BYTE[next_pc_low[0]; unmasked_low_byte[0], 254]` | μ |
+| `BRANCH-C4` |  | `AND_BYTE[next_pc_low[0]; unmasked_low_byte, 254]` | μ |
 | `BRANCH-C5.i` | i ∈ [0, 2] | `IS_HALFWORD[next_pc_high[i]]` | μ |
 
 This chip contributes the following to the lookup argument.
@@ -39,7 +39,7 @@ The table can be padded to the next power of two with the following value assign
 | Name | Type | Description |
 |------|------|-------------|
 | `pc` | `DWordWL` | The current pc, used as base address when `!JALR` |
-| `offset` | `Word` | The offset from the base address to jump to |
+| `offset` | `DWordWL` | The offset from the base address to jump to |
 | `register` | `DWordWL` | The base address to use when `JALR` |
 | `JALR` | `Bit` | Selects between `pc` and `register` as base address, needed for the `JALR` instruction |
 
@@ -65,7 +65,7 @@ The table can be padded to the next power of two with the following value assign
 
 **Definition of `next_pc_unmasked`:**
 ```
-next_pc_unmasked (when iter=0) := 2^16 * next_pc_high[0] + 2^8 * next_pc_low[1] + unmasked_low_byte[0]
+next_pc_unmasked (when iter=0) := 2^16 * next_pc_high[0] + 2^8 * next_pc_low[1] + unmasked_low_byte
 next_pc_unmasked (when iter=1) := 2^16 * next_pc_high[2] + next_pc_high[1]
 ```
 
