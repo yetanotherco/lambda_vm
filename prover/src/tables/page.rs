@@ -216,10 +216,7 @@ static ZERO_PAGE_4K_COMMITMENT: OnceLock<Commitment> = OnceLock::new();
 ///
 /// The commitment covers OFFSET (0..page_size-1) and INIT (from config).
 /// Each page may have different INIT data, producing a different commitment.
-pub fn compute_precomputed_commitment(
-    config: &PageConfig,
-    options: &ProofOptions,
-) -> Commitment {
+pub fn compute_precomputed_commitment(config: &PageConfig, options: &ProofOptions) -> Commitment {
     let page_size = config.page_size;
     assert!(page_size.is_power_of_two(), "Page size must be power of 2");
 
@@ -271,13 +268,9 @@ pub fn compute_precomputed_commitment(
 ///
 /// Zero-init pages of DEFAULT_PAGE_SIZE share a cached commitment.
 /// ELF data pages compute their commitment fresh.
-pub fn precomputed_commitment_cached(
-    config: &PageConfig,
-    options: &ProofOptions,
-) -> Commitment {
+pub fn precomputed_commitment_cached(config: &PageConfig, options: &ProofOptions) -> Commitment {
     if config.init_values.is_none() && config.page_size == DEFAULT_PAGE_SIZE {
-        *ZERO_PAGE_4K_COMMITMENT
-            .get_or_init(|| compute_precomputed_commitment(config, options))
+        *ZERO_PAGE_4K_COMMITMENT.get_or_init(|| compute_precomputed_commitment(config, options))
     } else {
         compute_precomputed_commitment(config, options)
     }
