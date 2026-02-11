@@ -273,7 +273,11 @@ pub fn prove_with_stack(
 /// `stack_size` is extracted from the proof; it is safe to trust because
 /// preprocessed commitments bind the verifier to the correct page layout.
 pub fn verify(vm_proof: &VmProof, elf_bytes: &[u8]) -> Result<bool, Error> {
-    verify_with_options(vm_proof, elf_bytes, &ProofOptions::default_proving_options())
+    verify_with_options(
+        vm_proof,
+        elf_bytes,
+        &ProofOptions::default_proving_options(),
+    )
 }
 
 /// Verify a proof with caller-specified proof options.
