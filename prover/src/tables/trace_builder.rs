@@ -21,7 +21,7 @@
 //! ```ignore
 //! use lambda_vm_prover::tables::trace_builder::Traces;
 //!
-//! let traces = Traces::from_elf_and_logs(&elf, &logs)?;
+//! let traces = Traces::from_elf_and_logs(&elf, &logs, 4096)?;
 //! // Use traces.cpu, traces.bitwise, traces.lt, traces.memw, traces.load, traces.memory_init
 //! ```
 
@@ -929,7 +929,11 @@ fn collect_bitwise_from_branch(branch_ops: &[BranchOperation]) -> Vec<BitwiseOpe
 /// - C2: IS_BYTE[fini] for finalization range check
 ///
 /// This must be called BEFORE bitwise multiplicities are updated.
-fn collect_bitwise_from_page(elf: &Elf, memory_state: &MemoryState) -> Vec<BitwiseOperation> {
+fn collect_bitwise_from_page(
+    elf: &Elf,
+    memory_state: &MemoryState,
+    stack_size: u64,
+) -> Vec<BitwiseOperation> {
     use std::collections::BTreeSet;
 
     let page_size = page::DEFAULT_PAGE_SIZE;
@@ -961,7 +965,6 @@ fn collect_bitwise_from_page(elf: &Elf, memory_state: &MemoryState) -> Vec<Bitwi
 
     // Add stack pages covering from STACK_TOP down to stack_bottom
     // (same as in generate_page_tables)
-    let stack_size = 4096u64;
     let stack_bottom = page::STACK_TOP - stack_size;
     let stack_top_page = page::page_base_for_address(page::STACK_TOP, page_size);
     page_bases.insert(stack_top_page);
@@ -1021,6 +1024,7 @@ fn collect_bitwise_from_page(elf: &Elf, memory_state: &MemoryState) -> Vec<Bitwi
 fn generate_page_tables(
     elf: &Elf,
     memory_state: &MemoryState,
+    stack_size: u64,
 ) -> (
     Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
     Vec<PageConfig>,
@@ -1058,8 +1062,6 @@ fn generate_page_tables(
 
     // Add stack pages covering from STACK_TOP down to stack_bottom
     // Stack grows downward from STACK_TOP, so we need pages for both ends
-    // TODO: Make this configurable via MemoryInitConfig
-    let stack_size = 4096u64; // 1 page for now
     let stack_bottom = page::STACK_TOP - stack_size;
     // Add page containing STACK_TOP (where SP starts and first accesses happen)
     let stack_top_page = page::page_base_for_address(page::STACK_TOP, page_size);
@@ -1155,7 +1157,7 @@ impl Traces {
     /// For full production use, page_configs should be embedded in proof public inputs
     /// to handle dynamic heap allocation. This function works for programs that only
     /// use ELF segments and stack.
-    pub fn page_configs_from_elf(elf: &Elf) -> Vec<PageConfig> {
+    pub fn page_configs_from_elf(elf: &Elf, stack_size: u64) -> Vec<PageConfig> {
         use std::collections::BTreeSet;
 
         let page_size = page::DEFAULT_PAGE_SIZE;
@@ -1182,7 +1184,6 @@ impl Traces {
         }
 
         // Add stack pages (same logic as generate_page_tables)
-        let stack_size = 4096u64;
         let stack_bottom = page::STACK_TOP - stack_size;
         let stack_top_page = page::page_base_for_address(page::STACK_TOP, page_size);
         page_bases.insert(stack_top_page);
@@ -1212,7 +1213,7 @@ impl Traces {
     /// 3. MEMW → LT operations (timestamp ordering)
     /// 4. LT, MEMW, Branch → Bitwise lookups
     /// 5. Generate all traces including PAGE tables
-    pub fn from_elf_and_logs(elf: &Elf, logs: &[Log]) -> Result<Self, Error> {
+    pub fn from_elf_and_logs(elf: &Elf, logs: &[Log], stack_size: u64) -> Result<Self, Error> {
         // =====================================================================
         // PHASE 0: ELF → DECODE + instructions
         // =====================================================================
@@ -1315,7 +1316,7 @@ impl Traces {
         bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops));
         bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
         // PAGE tables do IS_BYTE lookups for init and fini values (C1, C2)
-        bitwise_ops.extend(collect_bitwise_from_page(elf, &memory_state));
+        bitwise_ops.extend(collect_bitwise_from_page(elf, &memory_state, stack_size));
 
         // =====================================================================
         // PHASE 5: Generate final traces
@@ -1351,7 +1352,7 @@ impl Traces {
         decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
 
         // Generate PAGE tables from ELF and final memory state
-        let (pages, page_configs) = generate_page_tables(elf, &memory_state);
+        let (pages, page_configs) = generate_page_tables(elf, &memory_state, stack_size);
 
         // Generate REGISTER table from final register state
         let register_final_state = register_state.to_final_state_map();

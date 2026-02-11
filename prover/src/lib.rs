@@ -6,8 +6,8 @@
 //! # Example
 //! ```ignore
 //! let elf_bytes = std::fs::read("program.elf").unwrap();
-//! let proof = lambda_vm_prover::prove(&elf_bytes).unwrap();
-//! assert!(lambda_vm_prover::verify(&proof, &elf_bytes).unwrap());
+//! let vm_proof = lambda_vm_prover::prove(&elf_bytes).unwrap();
+//! assert!(lambda_vm_prover::verify(&vm_proof, &elf_bytes).unwrap());
 //! ```
 
 #[cfg(feature = "dhat-heap")]
@@ -42,8 +42,23 @@ use crate::test_utils::{
     create_mul_air, create_page_air, create_register_air,
 };
 
+use crate::tables::page::DEFAULT_STACK_SIZE;
 use stark::proof::options::ProofOptions;
 use stark::proof::stark::MultiProof;
+
+/// A complete VM proof bundle containing the STARK proof and metadata
+/// needed by the verifier to reconstruct the AIR configuration.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct VmProof {
+    /// The multi-table STARK proof.
+    pub proof: MultiProof<F, E, ()>,
+    /// Stack size used during proving (bytes). The verifier uses this to
+    /// reconstruct the PAGE table layout.
+    pub stack_size: u64,
+    /// Proof options used during proving. The verifier needs these to
+    /// reconstruct commitments with matching LDE parameters.
+    pub proof_options: ProofOptions,
+}
 
 /// Error type for the prover crate.
 #[derive(Debug)]
@@ -208,8 +223,8 @@ impl VmAirs {
     }
 }
 
-/// Prove an ELF binary execution. Returns a serializable proof.
-pub fn prove(elf_bytes: &[u8]) -> Result<MultiProof<F, E, ()>, Error> {
+/// Prove an ELF binary execution. Returns a serializable proof bundle.
+pub fn prove(elf_bytes: &[u8]) -> Result<VmProof, Error> {
     prove_with_options(elf_bytes, &ProofOptions::default_proving_options())
 }
 
@@ -217,7 +232,16 @@ pub fn prove(elf_bytes: &[u8]) -> Result<MultiProof<F, E, ()>, Error> {
 pub fn prove_with_options(
     elf_bytes: &[u8],
     proof_options: &ProofOptions,
-) -> Result<MultiProof<F, E, ()>, Error> {
+) -> Result<VmProof, Error> {
+    prove_with_stack(elf_bytes, proof_options, DEFAULT_STACK_SIZE)
+}
+
+/// Prove an ELF binary execution with custom proof options and stack size.
+pub fn prove_with_stack(
+    elf_bytes: &[u8],
+    proof_options: &ProofOptions,
+    stack_size: u64,
+) -> Result<VmProof, Error> {
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let executor = Executor::new(&program, vec![]).map_err(|e| Error::Execution(format!("{e}")))?;
     let result = executor
@@ -226,49 +250,40 @@ pub fn prove_with_options(
 
     // Generate all traces from ELF and execution logs
     // This uses the combined ELF processing to generate DECODE and PAGE tables
-    let mut traces = Traces::from_elf_and_logs(&program, &result.logs)?;
+    let mut traces = Traces::from_elf_and_logs(&program, &result.logs, stack_size)?;
     let airs = VmAirs::new(&program, proof_options, false, &traces.page_configs);
 
-    Prover::multi_prove(
+    let proof = Prover::multi_prove(
         airs.air_trace_pairs(&mut traces),
         &mut DefaultTranscript::<E>::new(&[]),
     )
-    .map_err(|e| Error::Prover(format!("{e:?}")))
+    .map_err(|e| Error::Prover(format!("{e:?}")))?;
+
+    Ok(VmProof {
+        proof,
+        stack_size,
+        proof_options: proof_options.clone(),
+    })
 }
 
 /// Verify a proof produced by [`prove`].
-pub fn verify(proof: &MultiProof<F, E, ()>, elf_bytes: &[u8]) -> Result<bool, Error> {
-    verify_with_options(proof, elf_bytes, &ProofOptions::default_proving_options())
-}
-
-/// Verify a proof with custom proof options.
 ///
-/// Derives page layout from ELF to reconstruct PAGE AIRs for verification.
-/// This works for programs that only use ELF segments and stack (no dynamic heap).
-///
-/// # Note
-/// For full production use with dynamic heap allocation, page_configs should be
-/// embedded in proof public inputs. This implementation assumes deterministic
-/// page layout derivable from ELF.
-pub fn verify_with_options(
-    proof: &MultiProof<F, E, ()>,
-    elf_bytes: &[u8],
-    proof_options: &ProofOptions,
-) -> Result<bool, Error> {
+/// Extracts `stack_size` and `proof_options` from the [`VmProof`] bundle.
+/// Derives page layout from ELF + stack_size to reconstruct PAGE AIRs.
+pub fn verify(vm_proof: &VmProof, elf_bytes: &[u8]) -> Result<bool, Error> {
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
-    // Derive page layout from ELF (works for programs without dynamic heap)
-    let page_configs = Traces::page_configs_from_elf(&program);
-    let airs = VmAirs::new(&program, proof_options, false, &page_configs);
+    let page_configs = Traces::page_configs_from_elf(&program, vm_proof.stack_size);
+    let airs = VmAirs::new(&program, &vm_proof.proof_options, false, &page_configs);
 
     Ok(Verifier::multi_verify(
         &airs.air_refs(),
-        proof,
+        &vm_proof.proof,
         &mut DefaultTranscript::<E>::new(&[]),
     ))
 }
 
 /// Prove and verify in one call (convenience).
 pub fn prove_and_verify(elf_bytes: &[u8]) -> Result<bool, Error> {
-    let proof = prove(elf_bytes)?;
-    verify(&proof, elf_bytes)
+    let vm_proof = prove(elf_bytes)?;
+    verify(&vm_proof, elf_bytes)
 }

@@ -11,8 +11,7 @@ use executor::{
     flamegraph::FlamegraphGenerator,
     vm::execution::Executor,
 };
-use prover::tables::types::{GoldilocksExtension, GoldilocksField};
-use stark::proof::stark::MultiProof;
+use prover::VmProof;
 
 #[derive(Parser)]
 #[command(author, version, about = "Lambda VM - RISC-V zkVM", long_about = None)]
@@ -216,14 +215,13 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf) -> ExitCode {
         }
     };
 
-    let proof: MultiProof<GoldilocksField, GoldilocksExtension, ()> =
-        match bincode::deserialize(&proof_bytes) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("Failed to deserialize proof: {}", e);
-                return ExitCode::FAILURE;
-            }
-        };
+    let proof: VmProof = match bincode::deserialize(&proof_bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Failed to deserialize proof: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
 
     eprintln!("Verifying proof...");
     let result = match prover::verify(&proof, &elf_data) {
