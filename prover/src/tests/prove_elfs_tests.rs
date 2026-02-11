@@ -1406,12 +1406,8 @@ fn test_single_page_table_balance() {
 #[test]
 fn test_deep_stack_default_stack_size_fails() {
     let (elf, logs, _instructions) = run_asm_elf("deep_stack");
-    let mut traces = Traces::from_elf_and_logs(
-        &elf,
-        &logs,
-        crate::tables::page::DEFAULT_STACK_SIZE,
-    )
-    .unwrap();
+    let mut traces =
+        Traces::from_elf_and_logs(&elf, &logs, crate::tables::page::DEFAULT_STACK_SIZE).unwrap();
 
     assert!(
         !prove_and_verify_vm_minimal(&elf, &mut traces),
