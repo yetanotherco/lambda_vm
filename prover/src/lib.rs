@@ -156,7 +156,7 @@ impl VmAirs {
             create_bitwise_air(proof_options)
         } else {
             create_bitwise_air(proof_options).with_preprocessed(
-                bitwise::preprocessed_commitment(),
+                bitwise::preprocessed_commitment(proof_options),
                 bitwise::NUM_PRECOMPUTED_COLS,
             )
         };
