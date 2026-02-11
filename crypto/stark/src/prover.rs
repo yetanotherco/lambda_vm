@@ -1265,7 +1265,7 @@ pub trait IsStarkProver<
             )?;
 
             #[cfg(feature = "debug-checks")]
-            print_bus_balance_report(&round_1_results);
+            print_bus_balance_report(std::slice::from_ref(&round_1_result));
 
             // =====================================================================
             // Rounds 2-4: Standard STARK protocol for each AIR
