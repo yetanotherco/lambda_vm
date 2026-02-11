@@ -2,6 +2,12 @@ name = "PAGE"
 
 # Input
 
+# TODO: add `page` as "constant" column or smth
+[[variables.input]]
+name = "page"
+type = "DWordWL"
+desc = "Constant column containing the page base address; should be integrated into the constraints directly"
+
 [[variables.input]]
 name = "offset"
 type = "RowIndex"
@@ -28,7 +34,7 @@ desc = "The timestamp at which this address was last accessed"
 name = "address"
 type = "DWordWL"
 desc = "Adding `offset` to the page base address `page`. `page` is a constant with respect to a single instance of this table."
-def = ["+", "page", ["cast", "offset", "DWordWL"]]
+def = ["+", "page", ["*", "offset", ["cast", 1, "DWordWL"]]]
 
 
 [[constraint_groups]]
@@ -38,11 +44,13 @@ name = "all"
 kind = "interaction"
 tag = "IS_BYTE"
 input = ["init"]
+multiplicity = 1
 
 [[constraints.all]]
 kind = "interaction"
 tag = "IS_BYTE"
 input = ["fini"]
+multiplicity = 1
 
 [[constraints.all]]
 kind = "interaction"

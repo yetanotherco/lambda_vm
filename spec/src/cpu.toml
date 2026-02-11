@@ -343,6 +343,7 @@ name = "decode"
 kind = "interaction"
 tag = "DECODE"
 input = ["pc", "imm", "packed_decode"]
+multiplicity = 1
 
 
 [[constraint_groups]]
@@ -515,34 +516,40 @@ ref = "cpu:c:range_EBREAK"
 kind = "interaction"
 tag = "IS_BYTE"
 input = ["rs1"]
+multiplicity = 1
 
 [[constraints.range]]
 kind = "interaction"
 tag = "IS_BYTE"
 input = ["rs2"]
+multiplicity = 1
 
 [[constraints.range]]
 kind = "interaction"
 tag = "IS_BYTE"
 input = ["rd"]
+multiplicity = 1
 
 [[constraints.range]]
 kind = "interaction"
 tag = "IS_BYTE"
 input = [["idx", "arg1", "i"]]
 iter = ["i", 0, 7]
+multiplicity = 1
 
 [[constraints.range]]
 kind = "interaction"
 tag = "IS_BYTE"
 input = [["idx", "arg2", "i"]]
 iter = ["i", 0, 7]
+multiplicity = 1
 
 [[constraints.range]]
 kind = "interaction"
 tag = "IS_BYTE"
 input = [["idx", "res", "i"]]
 iter = ["i", 0, 7]
+multiplicity = 1
 
 
 [[constraint_groups]]
@@ -552,8 +559,15 @@ prefix = "A"
 [[constraints.alu]]
 kind = "template"
 tag = "ADD"
-cond = ["+", "ADD", "LOAD", "STORE"]
+cond = ["+", "ADD", "LOAD"]
 input = [["cast", "arg1", "DWordWL"], ["cast", "arg2", "DWordWL"]]
+output = ["cast", "res", "DWordWL"]
+
+[[constraints.alu]]
+kind = "template"
+tag = "ADD"
+cond = "STORE"
+input = [["cast", "arg1", "DWordWL"], "imm"]
 output = ["cast", "res", "DWordWL"]
 
 [[constraints.alu]]
@@ -611,7 +625,7 @@ multiplicity = "SHIFT"
 [[constraints.alu]]
 kind = "template"
 tag = "ADD"
-input = ["pc", ["cast", ["+", ["*", 2, "c_type_instruction"], ["*", 4, ["not", "c_type_instruction"]]], "DWordWL"]]
+input = ["pc", ["*", ["+", ["*", 2, "c_type_instruction"], ["*", 4, ["not", "c_type_instruction"]]], ["cast", 1, "DWordWL"]]]
 output = ["cast", "res", "DWordWL"]
 cond = "JALR"
 
@@ -640,7 +654,7 @@ prefix = "M"
 [[constraints.mem]]
 kind = "interaction"
 tag = "MEMW"
-input = [1, ["*", 2, "rs1"], "rv1", ["+", "timestamp", 0], 1, 0, 0]
+input = [1, ["*", 2, "rs1"], "rv1", ["+", "timestamp", ["cast", 0, "DWordWL"]], 1, 0, 0]
 output = "rv1"
 multiplicity = "read_register1"
 
@@ -654,7 +668,7 @@ iter = ["i", 0, 2]
 [[constraints.mem]]
 kind = "interaction"
 tag = "MEMW"
-input = [1, ["*", 2, "rs2"], "rv2", ["+", "timestamp", 1], 1, 0, 0]
+input = [1, ["*", 2, "rs2"], "rv2", ["+", "timestamp", ["cast", 1, "DWordWL"]], 1, 0, 0]
 output = "rv2"
 multiplicity = "read_register2"
 
@@ -668,13 +682,13 @@ iter = ["i", 0, 2]
 [[constraints.mem]]
 kind = "interaction"
 tag = "MEMW"
-input = [1, ["*", 2, "rd"], "rvd", ["+", "timestamp", 2], 1, 0, 0]
+input = [1, ["*", 2, "rd"], "rvd", ["+", "timestamp", ["cast", 2, "DWordWL"]], 1, 0, 0]
 multiplicity = "write_register"
 
 [[constraints.mem]]
 kind = "interaction"
 tag = "LOAD"
-input = [0, "res", ["+", "timestamp", 0], "memory_2bytes", "memory_4bytes", "memory_8bytes", "signed"]
+input = [0, "res", ["+", "timestamp", ["cast", 0, "DWordWL"]], "memory_2bytes", "memory_4bytes", "memory_8bytes", "signed"]
 output = "rvd"
 multiplicity = "LOAD"
 
@@ -682,14 +696,14 @@ multiplicity = "LOAD"
 [[constraints.mem]]
 kind = "interaction"
 tag = "MEMW"
-input = [0, "res", "rv2", ["+", "timestamp", 1], "memory_2bytes", "memory_4bytes", "memory_8bytes"]
+input = [0, "res", ["cast", "arg2", ["Byte", 8]], ["+", "timestamp", ["cast", 1, "DWordWL"]], "memory_2bytes", "memory_4bytes", "memory_8bytes"]
 multiplicity = "STORE"
 
 # TODO: no types available, so no casting yet
 [[constraints.mem]]
 kind = "interaction"
 tag = "MEMW"
-input = [1, ["*", 2, 255], "next_pc", ["+", "timestamp", 1], 1, 0, 0]
+input = [1, ["*", 2, 255], "next_pc", ["+", "timestamp", ["cast", 1, "DWordWL"]], 1, 0, 0]
 output = "pc"
 multiplicity = ["not", "pad"]
 
@@ -747,13 +761,13 @@ multiplicity = "word_instr"
 
 [[constraints.ext]]
 kind = "arith"
-constraint = "$#`arg2[:4]` = (1 - #`STORE` - #`LOAD`) dot #`rv2[:2]` + (1 - #`BEQ` - #`BLT`) dot #`imm[0]`$"
-poly = ["-", ["idx", ["cast", "arg2", "DWordWL"], 0], ["*", ["-", 1, "STORE", "LOAD"], ["idx", ["cast", "rv2", "DWordWL"], 0]], ["*", ["-", 1, "BEQ", "BLT"], ["idx", "imm", 0]]]
+constraint = "$#`arg2[:4]` = (1 - #`LOAD`) dot #`rv2[:2]` + (1 - #`BEQ` - #`BLT` - #`STORE`) dot #`imm[0]`$"
+poly = ["-", ["idx", ["cast", "arg2", "DWordWL"], 0], ["*", ["not", "LOAD"], ["idx", ["cast", "rv2", "DWordWL"], 0]], ["*", ["-", 1, "BEQ", "BLT", "STORE"], ["idx", "imm", 0]]]
 
 [[constraints.ext]]
 kind = "arith"
-constraint = "$#`arg2[4:]` = (1 - #`STORE` - #`LOAD`) dot ((1 - #`word_instr`) dot #`rv2[2]` + #`signed` dot #`arg2_sign_bit` dot (2^(32) - 1)) + (1 - #`BEQ` - #`BLT`) dot #`imm[1]`$"
-poly = ["-", ["idx", ["cast", "arg2", "DWordWL"], 1], ["*", ["-", 1, "STORE", "LOAD"], ["not", "word_instr"], ["idx", "rv2", 2]], ["*", ["-", 1, "STORE", "LOAD"], "signed", "arg2_sign_bit", ["-", ["^", 2, 32], 1]], ["*", ["-", 1, "BEQ", "BLT"], ["idx", "imm", 1]]]
+constraint = "$#`arg2[4:]` = (1 - #`LOAD`) dot ((1 - #`word_instr`) dot #`rv2[2]` + #`signed` dot #`arg2_sign_bit` dot (2^(32) - 1)) + (1 - #`BEQ` - #`BLT` - #`STORE`) dot #`imm[1]`$"
+poly = ["-", ["idx", ["cast", "arg2", "DWordWL"], 1], ["*", ["not", "LOAD"], ["not", "word_instr"], ["idx", "rv2", 2]], ["*", ["not", "LOAD"], "signed", "arg2_sign_bit", ["-", ["^", 2, 32], 1]], ["*", ["-", 1, "BEQ", "BLT", "STORE"], ["idx", "imm", 1]]]
 
 [[constraints.ext]]
 kind = "interaction"
@@ -795,7 +809,7 @@ poly = ["+",
         ["-", "branch_cond"],
         "JALR",
         ["*", ["idx", "res", 0], ["not", "mp_selector"], "BLT"],
-        ["*", ["not", ["idx", "res", 0]], "mp_selector", "BLT"],
+        ["*", ["-", 1, ["idx", "res", 0]], "mp_selector", "BLT"],
         ["*", "is_equal", ["not", "mp_selector"], "BEQ"],
         ["*", ["not", "is_equal"], "mp_selector", "BEQ"]
     ]
@@ -810,6 +824,6 @@ multiplicity = "branch_cond"
 [[constraints.misc]]
 kind = "template"
 tag = "ADD"
-input = ["pc", ["cast", ["+", ["*", 2, "c_type_instruction"], ["*", 4, ["not", "c_type_instruction"]]], "DWordWL"]]
+input = ["pc", ["*", ["+", ["*", 2, "c_type_instruction"], ["*", 4, ["not", "c_type_instruction"]]], ["cast", 1, "DWordWL"]]]
 output = "next_pc"
 desc = "Increment `pc` to `next_pc` if we're not branching"
