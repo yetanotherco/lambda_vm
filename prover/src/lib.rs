@@ -225,19 +225,11 @@ impl VmAirs {
 
 /// Prove an ELF binary execution. Returns a serializable proof bundle.
 pub fn prove(elf_bytes: &[u8]) -> Result<VmProof, Error> {
-    prove_with_options(elf_bytes, &ProofOptions::default_proving_options())
-}
-
-/// Prove an ELF binary execution with custom proof options.
-pub fn prove_with_options(
-    elf_bytes: &[u8],
-    proof_options: &ProofOptions,
-) -> Result<VmProof, Error> {
-    prove_with_stack(elf_bytes, proof_options, DEFAULT_STACK_SIZE)
+    prove_with_options(elf_bytes, &ProofOptions::default_proving_options(), DEFAULT_STACK_SIZE)
 }
 
 /// Prove an ELF binary execution with custom proof options and stack size.
-pub fn prove_with_stack(
+pub fn prove_with_options(
     elf_bytes: &[u8],
     proof_options: &ProofOptions,
     stack_size: u64,
