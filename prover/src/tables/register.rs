@@ -169,6 +169,17 @@ static REGISTER_COMMITMENT: OnceLock<Commitment> = OnceLock::new();
 pub fn compute_precomputed_commitment(options: &ProofOptions) -> Commitment {
     let num_rows = NUM_REGISTER_ADDRESSES.next_power_of_two();
 
+    // Precomputed columns: OFFSET and INIT.
+    //
+    // OFFSET (col 0): deterministic row index 0..63 (32 registers × 2 words each).
+    //   Identical for every program.
+    //
+    // INIT (col 1): initial word value for each register address. All zeros except
+    //   for the stack pointer (x2), whose two 32-bit words hold STACK_TOP:
+    //     - offset 4 (SP low word):  STACK_TOP & 0xFFFF_FFFF
+    //     - offset 5 (SP high word): STACK_TOP >> 32
+    //   This is program-independent (STACK_TOP is a fixed constant), so the entire
+    //   REGISTER preprocessed commitment can be computed once and cached globally.
     let mut offset_col = vec![FE::zero(); num_rows];
     let mut init_col = vec![FE::zero(); num_rows];
 

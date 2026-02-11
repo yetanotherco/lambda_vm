@@ -225,6 +225,16 @@ pub fn compute_precomputed_commitment(config: &PageConfig, options: &ProofOption
 
     let num_rows = page_size;
 
+    // Precomputed columns: OFFSET and INIT.
+    //
+    // OFFSET (col 0): deterministic row index 0..page_size-1, the same for every
+    //   page of a given size regardless of the program being proven.
+    //
+    // INIT (col 1): the initial byte value at each offset. For zero-init pages
+    //   (stack, heap, BSS) this is all zeros. For ELF data pages it holds the
+    //   bytes loaded from the binary. Either way the column is fully determined
+    //   before execution, so the verifier can check it against a preprocessed
+    //   commitment instead of including it in the main trace.
     let mut offset_col = vec![FE::zero(); num_rows];
     let mut init_col = vec![FE::zero(); num_rows];
 
