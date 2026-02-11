@@ -1,6 +1,7 @@
 use core::marker::PhantomData;
 
 use crate::hash::poseidon::Poseidon;
+use crate::merkle_tree::merkle::MerkleTree;
 use crate::merkle_tree::traits::IsMerkleTreeBackend;
 use alloc::vec::Vec;
 use digest::{Digest, Output};
@@ -8,6 +9,8 @@ use math::{
     field::{element::FieldElement, traits::IsField},
     traits::AsBytes,
 };
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
 /// A backend for Merkle trees that uses fixed-size pairs of field elements.
 /// This is more efficient than `FieldElementVectorBackend` when the batch size is always 2,
@@ -99,6 +102,44 @@ where
         let mut result_hash = [0_u8; NUM_BYTES];
         result_hash.copy_from_slice(&hasher.finalize());
         result_hash
+    }
+}
+
+impl<F, D, const N: usize> MerkleTree<FieldElementVectorBackend<F, D, N>>
+where
+    F: IsField,
+    FieldElement<F>: AsBytes + Sync + Send,
+    D: Digest,
+    [u8; N]: From<Output<D>>,
+    Vec<FieldElement<F>>: Sync + Send,
+{
+    /// Build a Merkle tree by hashing "virtual rows" from column-major data,
+    /// avoiding the allocation of a transposed row-major copy.
+    pub fn build_from_columns(columns: &[Vec<FieldElement<F>>]) -> Option<Self> {
+        if columns.is_empty() {
+            return None;
+        }
+        let num_rows = columns[0].len();
+        if num_rows == 0 {
+            return None;
+        }
+
+        #[cfg(feature = "parallel")]
+        let iter = (0..num_rows).into_par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let iter = 0..num_rows;
+
+        let hashed_leaves: Vec<[u8; N]> = iter
+            .map(|row| {
+                let mut hasher = D::new();
+                for col in columns {
+                    hasher.update(col[row].as_bytes());
+                }
+                hasher.finalize().into()
+            })
+            .collect();
+
+        Self::build_from_hashed_leaves(hashed_leaves)
     }
 }
 

@@ -24,7 +24,7 @@ use crate::fri;
 use crate::lookup::LOGUP_NUM_CHALLENGES;
 use crate::proof::stark::{DeepPolynomialOpenings, PolynomialOpenings};
 use crate::table::Table;
-use crate::trace::{LDETraceTable, columns2rows};
+use crate::trace::LDETraceTable;
 
 use super::config::{BatchedMerkleTree, Commitment};
 use super::constraints::evaluator::ConstraintEvaluator;
@@ -273,8 +273,8 @@ pub trait IsStarkProver<
         }
 
         // Build commitment
-        let rows = columns2rows(lde_permuted);
-        let (_, commitment) = Self::batch_commit_main(&rows)?;
+        let tree = BatchedMerkleTree::build_from_columns(&lde_permuted)?;
+        let commitment = tree.root;
 
         Some(commitment)
     }
@@ -315,10 +315,8 @@ pub trait IsStarkProver<
         }
 
         // Compute commitment.
-        let lde_trace_permuted_rows = columns2rows(lde_trace_permuted);
-
-        let (lde_trace_merkle_tree, lde_trace_merkle_root) =
-            Self::batch_commit_main(&lde_trace_permuted_rows)?;
+        let lde_trace_merkle_tree = BatchedMerkleTree::build_from_columns(&lde_trace_permuted)?;
+        let lde_trace_merkle_root = lde_trace_merkle_tree.root;
 
         // >>>> Send commitment.
         transcript.append_bytes(&lde_trace_merkle_root);
@@ -363,10 +361,8 @@ pub trait IsStarkProver<
         }
 
         // Compute commitment (but don't append to transcript - caller does that).
-        let lde_trace_permuted_rows = columns2rows(lde_trace_permuted);
-
-        let (lde_trace_merkle_tree, lde_trace_merkle_root) =
-            Self::batch_commit_main(&lde_trace_permuted_rows)?;
+        let lde_trace_merkle_tree = BatchedMerkleTree::build_from_columns(&lde_trace_permuted)?;
+        let lde_trace_merkle_root = lde_trace_merkle_tree.root;
 
         Some((
             trace_polys,
@@ -411,10 +407,8 @@ pub trait IsStarkProver<
         }
 
         // Compute commitment.
-        let lde_trace_permuted_rows = columns2rows(lde_trace_permuted);
-
-        let (lde_trace_merkle_tree, lde_trace_merkle_root) =
-            Self::batch_commit_extension(&lde_trace_permuted_rows)?;
+        let lde_trace_merkle_tree = BatchedMerkleTree::build_from_columns(&lde_trace_permuted)?;
+        let lde_trace_merkle_root = lde_trace_merkle_tree.root;
 
         // >>>> Send commitment.
         transcript.append_bytes(&lde_trace_merkle_root);
@@ -518,9 +512,9 @@ pub trait IsStarkProver<
         for col in precomputed_lde_permuted.iter_mut() {
             in_place_bit_reverse_permute(col);
         }
-        let precomputed_rows = columns2rows(precomputed_lde_permuted);
-        let (precomputed_tree, precomputed_root) =
-            Self::batch_commit_main(&precomputed_rows).ok_or(ProvingError::EmptyCommitment)?;
+        let precomputed_tree = BatchedMerkleTree::build_from_columns(&precomputed_lde_permuted)
+            .ok_or(ProvingError::EmptyCommitment)?;
+        let precomputed_root = precomputed_tree.root;
 
         // --- Build MULTIPLICITIES tree (cols num_precomputed..) ---
         let multiplicity_evaluations: Vec<_> = evaluations[num_precomputed_cols..].to_vec();
@@ -528,9 +522,9 @@ pub trait IsStarkProver<
         for col in mult_lde_permuted.iter_mut() {
             in_place_bit_reverse_permute(col);
         }
-        let mult_rows = columns2rows(mult_lde_permuted);
-        let (mult_tree, mult_root) =
-            Self::batch_commit_main(&mult_rows).ok_or(ProvingError::EmptyCommitment)?;
+        let mult_tree = BatchedMerkleTree::build_from_columns(&mult_lde_permuted)
+            .ok_or(ProvingError::EmptyCommitment)?;
+        let mult_root = mult_tree.root;
 
         // Verify that our computed precomputed root matches the hardcoded commitment.
         // This is a sanity check - if they don't match, something is wrong with the trace.

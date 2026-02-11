@@ -44,7 +44,7 @@ use stark::config::{BatchedMerkleTree, Commitment};
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::proof::options::ProofOptions;
 use stark::prover::evaluate_polynomial_on_lde_domain;
-use stark::trace::{TraceTable, columns2rows};
+use stark::trace::TraceTable;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 
@@ -289,11 +289,8 @@ pub fn compute_precomputed_commitment(
         in_place_bit_reverse_permute(col);
     }
 
-    // Step 6: Convert columns to rows for Merkle tree
-    let lde_rows = columns2rows(lde_columns);
-
-    // Step 7: Build Merkle tree over LDE (N * blowup leaves)
-    let tree = BatchedMerkleTree::<GoldilocksField>::build(&lde_rows)
+    // Step 6: Build Merkle tree over LDE (N * blowup leaves)
+    let tree = BatchedMerkleTree::<GoldilocksField>::build_from_columns(&lde_columns)
         .expect("Failed to build Merkle tree for decode LDE");
 
     tree.root

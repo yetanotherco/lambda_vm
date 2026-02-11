@@ -51,6 +51,14 @@ where
         }
 
         let hashed_leaves: Vec<B::Node> = B::hash_leaves(unhashed_leaves);
+        Self::build_from_hashed_leaves(hashed_leaves)
+    }
+
+    /// Create a Merkle tree from pre-hashed leaves.
+    pub(crate) fn build_from_hashed_leaves(hashed_leaves: Vec<B::Node>) -> Option<Self> {
+        if hashed_leaves.is_empty() {
+            return None;
+        }
 
         //The leaf must be a power of 2 set
         let hashed_leaves = complete_until_power_of_two(hashed_leaves);
