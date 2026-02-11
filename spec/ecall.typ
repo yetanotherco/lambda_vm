@@ -123,7 +123,6 @@ This is only performed when we have not yet reached the `end` of the commit sequ
 #render_constraint_table(chip, config, groups: "commit")
 
 In parallel, we compute $#`address_incr` = #`address` + 1$ (@commit:c:address_incr) as address of the next byte to commit, and $#`count_decr` = #`count` - 1$ (@commit:c:count_decr) as the number of bytes that still has to be committed after committing this byte.
-Both of these constraints are only required when $#`μ` = 1$, to permit a simpler padding configuration.
 @commit:c:range_address_incr and @commit:c:range_count_decr are included to satisfy @add:a:sum respectively @add:a:rhs.
 #render_constraint_table(chip, config, groups: "incr_decr")
 

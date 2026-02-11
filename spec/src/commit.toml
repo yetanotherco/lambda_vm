@@ -18,25 +18,25 @@ pad = 0
 name = "address"
 type = "DWordWL"
 desc = "Address of first byte to commit."
-pad = 0
+pad = ["arr", 0, 0, 0, 0]
 
 [[variables.auxiliary]]
 name = "address_incr"
 type = "DWordHL"
 desc = "$#`address` + 1$"
-pad = 0
+pad = ["arr", 1, 0, 0, 0]
 
 [[variables.auxiliary]]
 name = "count"
 type = "DWordWL"
 desc = "number of bytes to commit"
-pad = 0
+pad = ["arr", 1, 0, 0, 0]
 
 [[variables.auxiliary]]
 name = "count_decr"
 type = "DWordHL"
 desc = "$#`count` - 1$"
-pad = 0
+pad = ["arr", 0, 0, 0, 0]
 
 [[variables.auxiliary]]
 name = "first"
@@ -121,7 +121,6 @@ kind = "template"
 tag = "ADD"
 input = ["address", ["cast", 1, "DWordWL"]]
 output = ["cast", "address_incr", "DWordWL"]
-cond = "μ"
 ref = "commit:c:address_incr"
 
 [[constraints.incr_decr]]
@@ -137,7 +136,6 @@ kind = "template"
 tag = "SUB"
 input = ["count", ["cast", 1, "DWordWL"]]
 output = ["cast", "count_decr", "DWordWL"]
-cond = "μ"
 ref = "commit:c:count_decr"
 
 [[constraints.incr_decr]]
