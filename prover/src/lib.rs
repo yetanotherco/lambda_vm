@@ -55,8 +55,8 @@ pub struct VmProof {
     /// Stack size used during proving (bytes). The verifier uses this to
     /// reconstruct the PAGE table layout.
     pub stack_size: u64,
-    /// Proof options used during proving. The verifier needs these to
-    /// reconstruct commitments with matching LDE parameters.
+    /// Proof options used during proving (metadata only).
+    /// The verifier enforces its own options — these are NOT trusted.
     pub proof_options: ProofOptions,
 }
 
@@ -266,14 +266,29 @@ pub fn prove_with_stack(
     })
 }
 
-/// Verify a proof produced by [`prove`].
+/// Verify a proof produced by [`prove`] using default proof options.
 ///
-/// Extracts `stack_size` and `proof_options` from the [`VmProof`] bundle.
-/// Derives page layout from ELF + stack_size to reconstruct PAGE AIRs.
+/// Uses [`ProofOptions::default_proving_options`] for verification — the
+/// `proof_options` stored in [`VmProof`] are metadata only and NOT trusted.
+/// `stack_size` is extracted from the proof; it is safe to trust because
+/// preprocessed commitments bind the verifier to the correct page layout.
 pub fn verify(vm_proof: &VmProof, elf_bytes: &[u8]) -> Result<bool, Error> {
+    verify_with_options(vm_proof, elf_bytes, &ProofOptions::default_proving_options())
+}
+
+/// Verify a proof with caller-specified proof options.
+///
+/// The verifier enforces its own `proof_options` (security parameters),
+/// ignoring the options embedded in the proof bundle. This prevents a
+/// malicious prover from weakening the security level.
+pub fn verify_with_options(
+    vm_proof: &VmProof,
+    elf_bytes: &[u8],
+    proof_options: &ProofOptions,
+) -> Result<bool, Error> {
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let page_configs = Traces::page_configs_from_elf(&program, vm_proof.stack_size);
-    let airs = VmAirs::new(&program, &vm_proof.proof_options, false, &page_configs);
+    let airs = VmAirs::new(&program, proof_options, false, &page_configs);
 
     Ok(Verifier::multi_verify(
         &airs.air_refs(),

@@ -210,6 +210,9 @@ pub fn generate_page_trace(
 
 /// Cached commitment for zero-initialized 4KB pages.
 /// All zero-init pages of the same size have identical OFFSET and INIT columns.
+///
+/// INVARIANT: All callers within a process must use identical `ProofOptions`.
+/// The cache is keyed only by page content, not by options.
 static ZERO_PAGE_4K_COMMITMENT: OnceLock<Commitment> = OnceLock::new();
 
 /// Computes the Merkle root commitment over the LDE of PAGE precomputed columns.

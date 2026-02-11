@@ -157,6 +157,9 @@ pub fn generate_register_trace(
 // =========================================================================
 
 /// Cached commitment for the REGISTER preprocessed columns.
+///
+/// INVARIANT: All callers within a process must use identical `ProofOptions`.
+/// The cache is keyed only by table content, not by options.
 static REGISTER_COMMITMENT: OnceLock<Commitment> = OnceLock::new();
 
 /// Computes the Merkle root commitment over the LDE of REGISTER precomputed columns.
