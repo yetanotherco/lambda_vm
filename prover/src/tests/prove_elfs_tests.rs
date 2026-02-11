@@ -1395,3 +1395,39 @@ fn test_single_page_table_balance() {
     );
     assert!(result, "Single PAGE table test failed");
 }
+
+// =============================================================================
+// Deep stack tests (page coverage)
+// =============================================================================
+
+/// deep_stack allocates 8192 bytes, writing at SP = 0x...DFF0 (page D000).
+/// Default stack_size=4096 only creates pages E000+F000, so page D000 is
+/// missing and the memory bus cannot balance → verification must fail.
+#[test]
+fn test_deep_stack_default_stack_size_fails() {
+    let (elf, logs, _instructions) = run_asm_elf("deep_stack");
+    let mut traces = Traces::from_elf_and_logs(
+        &elf,
+        &logs,
+        crate::tables::page::DEFAULT_STACK_SIZE,
+    )
+    .unwrap();
+
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "deep_stack should FAIL with default stack_size (page D000 not initialized)"
+    );
+}
+
+/// Same program but with stack_size=8192, which adds page D000.
+/// All accessed addresses are now covered → verification must succeed.
+#[test]
+fn test_deep_stack_large_stack_size_passes() {
+    let (elf, logs, _instructions) = run_asm_elf("deep_stack");
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs, 8192).unwrap();
+
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "deep_stack should PASS with stack_size=8192 (page D000 initialized)"
+    );
+}
