@@ -35,6 +35,9 @@ use crate::tables::cpu::{
     CpuOperation, bus_interactions as cpu_bus_interactions, cols as cpu_cols,
 };
 use crate::tables::decode::{bus_interactions as decode_bus_interactions, cols as decode_cols};
+use crate::tables::dvrm::{
+    bus_interactions as dvrm_bus_interactions, cols as dvrm_cols, dvrm_constraints,
+};
 use crate::tables::halt::{bus_interactions as halt_bus_interactions, cols as halt_cols};
 use crate::tables::load::{
     bus_interactions as load_bus_interactions, cols as load_cols, constraints as load_constraints,
@@ -44,6 +47,10 @@ use crate::tables::memw::{
     bus_interactions as memw_bus_interactions, cols as memw_cols, constraints as memw_constraints,
 };
 use crate::tables::mul::{bus_interactions as mul_bus_interactions, cols as mul_cols};
+use crate::tables::page::{bus_interactions as page_bus_interactions, cols as page_cols};
+use crate::tables::register::{
+    bus_interactions as register_bus_interactions, cols as register_cols,
+};
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
 pub type F = GoldilocksField;
@@ -602,6 +609,25 @@ pub fn create_mul_air(proof_options: &ProofOptions) -> VmAir {
     .with_name("MUL")
 }
 
+/// Create DVRM AIR with constraints and bus interactions.
+pub fn create_dvrm_air(proof_options: &ProofOptions) -> VmAir {
+    let (constraints, _) = dvrm_constraints(0);
+    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> =
+        constraints.into_iter().map(|c| Box::new(c) as _).collect();
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: dvrm_bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        dvrm_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+}
+
 /// Create BRANCH AIR with constraints and bus interactions.
 ///
 /// The BRANCH table computes next_pc for branch/jump instructions:
@@ -642,4 +668,52 @@ pub fn create_halt_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("HALT")
+}
+
+/// Create PAGE AIR with bus interactions for a specific page.
+///
+/// Each PAGE table instance has its own AIR because the bus interactions
+/// include the page_base as a constant. The `page_base` parameter specifies
+/// the base address of this page.
+///
+/// The PAGE table has no transition constraints (it's a pure lookup table).
+/// It interacts with:
+/// - IS_BYTE bus: range checks for init/fini values
+/// - Memory bus: provides initial and final memory tokens
+pub fn create_page_air(proof_options: &ProofOptions, page_base: u64) -> VmAir {
+    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: page_bus_interactions(page_base),
+    };
+
+    AirWithBuses::new(
+        page_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+    .with_name(&format!("PAGE:0x{:x}", page_base))
+}
+
+/// Create REGISTER AIR with bus interactions.
+///
+/// The REGISTER table provides initial and final tokens for register accesses
+/// on the Memory bus (is_register=1).
+pub fn create_register_air(proof_options: &ProofOptions) -> VmAir {
+    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: register_bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        register_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+    .with_name("REGISTER")
 }

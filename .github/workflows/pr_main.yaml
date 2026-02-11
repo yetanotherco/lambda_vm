@@ -33,16 +33,8 @@ jobs:
         with:
           shared-key: "lambda-vm"
 
-      - name: Run cargo check
-        run: cargo check
-
-      - name: Run cargo clippy
-        run: |
-          cargo clippy -- -D warnings
-
-      - name: Run cargo fmt
-        run: |
-          cargo fmt --all -- --check
+      - name: Run lint checks
+        run: make lint
 
   test:
     # "Test" is a required check, don't change the name
@@ -91,27 +83,27 @@ jobs:
 
       - name: Run asm tests (no compile)
         run: |
-          make test-asm-no-compile
+          cargo test --release -p executor --test asm
 
       - name: Run rust tests (no compile)
         run: |
-          make test-rust-no-compile
+          cargo test --release -p executor --test rust
 
       - name: Run flamegraph tests
         run: |
-          make test-flamegraph
+          cargo test --release -p executor --test flamegraph
 
-      - name: Run ignored executor tests (release)
+      - name: Run ignored executor tests
         run: |
           make prepare-test-data
-          cargo test -p executor --release test_ethrex -- --ignored
-          cargo test -p executor --release test_ckzg -- --ignored
+          cargo test --release -p executor test_ethrex -- --ignored
+          cargo test --release -p executor test_ckzg -- --ignored
 
       - name: Run prover and crypto tests
         run: |
-          cargo test -p lambda-vm-prover -p stark -p crypto --release
+          cargo test --release -p lambda-vm-prover -p stark -p crypto -- --test-threads=1
 
       - name: Run comprehensive prover tests (merge queue only)
         if: github.event_name == 'merge_group'
         run: |
-          cargo test -p lambda-vm-prover --release test_prove_elfs_all_instructions_64_full -- --ignored
+          cargo test --release -p lambda-vm-prover test_prove_elfs_all_instructions_64_full -- --ignored
