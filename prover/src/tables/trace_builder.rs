@@ -1160,15 +1160,23 @@ impl Traces {
 
         let page_size = page::DEFAULT_PAGE_SIZE;
         let mut page_bases: BTreeSet<u64> = BTreeSet::new();
+        let mut elf_page_data: HashMap<u64, Vec<u8>> = HashMap::new();
 
-        // Collect pages from ELF data segments
+        // Collect pages from ELF data segments with init data
         for segment in &elf.data {
-            for (i, _) in segment.values.iter().enumerate() {
+            for (i, &word) in segment.values.iter().enumerate() {
                 let word_addr = segment.base_addr + (i as u64 * 4);
                 for byte_offset in 0..4u64 {
                     let byte_addr = word_addr + byte_offset;
+                    let byte_value = ((word >> (byte_offset * 8)) & 0xFF) as u8;
                     let page_base = page::page_base_for_address(byte_addr, page_size);
+                    let offset = page::offset_in_page(byte_addr, page_size);
                     page_bases.insert(page_base);
+
+                    let page_data = elf_page_data
+                        .entry(page_base)
+                        .or_insert_with(|| vec![0u8; page_size]);
+                    page_data[offset] = byte_value;
                 }
             }
         }
@@ -1185,7 +1193,13 @@ impl Traces {
 
         page_bases
             .into_iter()
-            .map(|base| PageConfig::zero_init(base, page_size))
+            .map(|base| {
+                if let Some(init_data) = elf_page_data.get(&base) {
+                    PageConfig::with_data(base, page_size, init_data.clone())
+                } else {
+                    PageConfig::zero_init(base, page_size)
+                }
+            })
             .collect()
     }
 

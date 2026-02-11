@@ -33,6 +33,8 @@ use stark::verifier::{IsStarkVerifier, Verifier};
 
 use crate::tables::bitwise;
 use crate::tables::decode;
+use crate::tables::page;
+use crate::tables::register;
 use crate::tables::trace_builder::Traces;
 use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_cpu_air, create_decode_air,
@@ -172,10 +174,18 @@ impl VmAirs {
         let dvrm = create_dvrm_air(proof_options);
         let branch = create_branch_air(proof_options);
         let halt = create_halt_air(proof_options);
-        let register = create_register_air(proof_options);
+        let register = create_register_air(proof_options).with_preprocessed(
+            register::preprocessed_commitment(proof_options),
+            register::NUM_PREPROCESSED_COLS,
+        );
         let pages: Vec<_> = page_configs
             .iter()
-            .map(|config| create_page_air(proof_options, config.page_base))
+            .map(|config| {
+                create_page_air(proof_options, config.page_base).with_preprocessed(
+                    page::precomputed_commitment_cached(config, proof_options),
+                    page::NUM_PREPROCESSED_COLS,
+                )
+            })
             .collect();
 
         #[cfg(feature = "debug-checks")]

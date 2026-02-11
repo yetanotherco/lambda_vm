@@ -32,9 +32,15 @@
 //! | PAGE-C4 | Memory | `[0, address, timestamp, fini]` | 1 (sender) |
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
+use math::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
+use math::polynomial::Polynomial;
+use stark::config::{BatchedMerkleTree, Commitment};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
-use stark::trace::TraceTable;
+use stark::proof::options::ProofOptions;
+use stark::prover::evaluate_polynomial_on_lde_domain;
+use stark::trace::{TraceTable, columns2rows};
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 
@@ -193,6 +199,85 @@ pub fn generate_page_trace(
     }
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+}
+
+// =========================================================================
+// Preprocessed commitment
+// =========================================================================
+
+/// Cached commitment for zero-initialized 4KB pages.
+/// All zero-init pages of the same size have identical OFFSET and INIT columns.
+static ZERO_PAGE_4K_COMMITMENT: OnceLock<Commitment> = OnceLock::new();
+
+/// Computes the Merkle root commitment over the LDE of PAGE precomputed columns.
+///
+/// The commitment covers OFFSET (0..page_size-1) and INIT (from config).
+/// Each page may have different INIT data, producing a different commitment.
+pub fn compute_precomputed_commitment(
+    config: &PageConfig,
+    options: &ProofOptions,
+) -> Commitment {
+    let page_size = config.page_size;
+    assert!(page_size.is_power_of_two(), "Page size must be power of 2");
+
+    let num_rows = page_size;
+
+    let mut offset_col = vec![FE::zero(); num_rows];
+    let mut init_col = vec![FE::zero(); num_rows];
+
+    for i in 0..page_size {
+        offset_col[i] = FE::from(i as u64);
+        init_col[i] = if let Some(ref init_vals) = config.init_values {
+            FE::from(init_vals[i] as u64)
+        } else {
+            FE::zero()
+        };
+    }
+
+    let columns = vec![offset_col, init_col];
+
+    let polys: Vec<Polynomial<FE>> = columns
+        .iter()
+        .map(|col| {
+            Polynomial::interpolate_fft::<GoldilocksField>(col)
+                .expect("FFT interpolation failed for page column")
+        })
+        .collect();
+
+    let blowup_factor = options.blowup_factor as usize;
+    let coset_offset = FE::from(options.coset_offset);
+    let mut lde_columns: Vec<Vec<FE>> = polys
+        .iter()
+        .map(|poly| {
+            evaluate_polynomial_on_lde_domain(poly, blowup_factor, num_rows, &coset_offset)
+                .expect("LDE evaluation failed for page polynomial")
+        })
+        .collect();
+
+    for col in lde_columns.iter_mut() {
+        in_place_bit_reverse_permute(col);
+    }
+
+    let lde_rows = columns2rows(lde_columns);
+    let tree = BatchedMerkleTree::<GoldilocksField>::build(&lde_rows)
+        .expect("Failed to build Merkle tree for page LDE");
+    tree.root
+}
+
+/// Returns the preprocessed commitment for a PAGE table, with caching for zero-init pages.
+///
+/// Zero-init pages of DEFAULT_PAGE_SIZE share a cached commitment.
+/// ELF data pages compute their commitment fresh.
+pub fn precomputed_commitment_cached(
+    config: &PageConfig,
+    options: &ProofOptions,
+) -> Commitment {
+    if config.init_values.is_none() && config.page_size == DEFAULT_PAGE_SIZE {
+        *ZERO_PAGE_4K_COMMITMENT
+            .get_or_init(|| compute_precomputed_commitment(config, options))
+    } else {
+        compute_precomputed_commitment(config, options)
+    }
 }
 
 // =========================================================================
