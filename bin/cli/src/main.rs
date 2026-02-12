@@ -8,7 +8,6 @@ use std::time::Instant;
 
 use clap::{Parser, Subcommand, ValueHint};
 
-#[cfg(feature = "jemalloc-stats")]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use executor::{

@@ -1,10 +1,10 @@
 #!/bin/bash
 # Benchmark the prover: wall-clock time + peak heap (jemalloc).
 #
-# Usage: bench_prove.sh <elf_path> [runs=1]
+# Usage: bench_prove.sh <elf_path> [runs=1] [base_branch=main | --single]
 #
-# If on a feature branch, automatically benchmarks main too and prints a comparison.
-# If on main, benchmarks main only.
+# If on a feature branch, automatically benchmarks base_branch too and prints a comparison.
+# Pass --single to skip comparison and only benchmark the current branch.
 #
 # Peak heap is deterministic (jemalloc stats.allocated high-water mark, 10ms polling).
 # Peak RSS is collected in raw data for reference but not shown in summary (it's noisy).
@@ -21,8 +21,9 @@ YELLOW='\033[1;33m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-ELF=${1:?Usage: bench_prove.sh <elf_path> [runs=1]}
+ELF=${1:?Usage: bench_prove.sh <elf_path> [runs=1] [base_branch | --single]}
 RUNS=${2:-1}
+BASE_BRANCH=${3:-main}
 OUTPUT="$TMP_DIR/proof.bin"
 
 CURRENT_BRANCH=$(git -C "$ROOT_DIR" rev-parse --abbrev-ref HEAD)
@@ -54,13 +55,13 @@ build_branch() {
 }
 
 COMPARE=false
-if [ "$CURRENT_BRANCH" != "main" ]; then
+if [ "$BASE_BRANCH" = "--single" ] || [ "$CURRENT_BRANCH" = "$BASE_BRANCH" ]; then
+    build_branch "$CURRENT_BRANCH" "current"
+else
     COMPARE=true
     build_branch "$CURRENT_BRANCH" "feature"
-    build_branch "main" "main"
+    build_branch "$BASE_BRANCH" "base"
     git -C "$ROOT_DIR" checkout "$CURRENT_BRANCH"
-else
-    build_branch "main" "main"
 fi
 
 # --- Benchmark function ----------------------------------------------------
@@ -129,10 +130,10 @@ bench_one() {
 # --- Run benchmarks --------------------------------------------------------
 
 if $COMPARE; then
-    bench_one "$TMP_DIR/cli-main"    "main"
+    bench_one "$TMP_DIR/cli-base"    "base"
     bench_one "$TMP_DIR/cli-feature" "feature"
 else
-    bench_one "$TMP_DIR/cli-main" "main"
+    bench_one "$TMP_DIR/cli-current" "current"
 fi
 
 # --- Statistics helpers ----------------------------------------------------
@@ -187,24 +188,26 @@ print_stats() {
         "$label" "$mean_s" "$median_s" "$heap_str"
 }
 
-print_stats "main"
 if $COMPARE; then
+    print_stats "base"
     print_stats "feature"
 
     echo ""
-    echo -e "${BOLD}  Comparison:${NC}"
+    echo -e "${BOLD}  Comparison (feature vs $BASE_BRANCH):${NC}"
 
-    MAIN_MEAN=$(mean "$TMP_DIR/main_times.txt")
+    BASE_MEAN=$(mean "$TMP_DIR/base_times.txt")
     FEAT_MEAN=$(mean "$TMP_DIR/feature_times.txt")
-    TIME_DIFF=$((FEAT_MEAN - MAIN_MEAN))
-    echo -e "    Time: $(signed_pct "$TIME_DIFF" "$MAIN_MEAN")"
+    TIME_DIFF=$((FEAT_MEAN - BASE_MEAN))
+    echo -e "    Time: $(signed_pct "$TIME_DIFF" "$BASE_MEAN")"
 
-    if [ -f "$TMP_DIR/main_heap.txt" ] && [ -f "$TMP_DIR/feature_heap.txt" ]; then
-        MAIN_HEAP=$(median "$TMP_DIR/main_heap.txt")
+    if [ -f "$TMP_DIR/base_heap.txt" ] && [ -f "$TMP_DIR/feature_heap.txt" ]; then
+        BASE_HEAP=$(median "$TMP_DIR/base_heap.txt")
         FEAT_HEAP=$(median "$TMP_DIR/feature_heap.txt")
-        HEAP_DIFF=$((FEAT_HEAP - MAIN_HEAP))
-        echo -e "    Heap: ${HEAP_DIFF} MB ($(signed_pct "$HEAP_DIFF" "$MAIN_HEAP")) ← DETERMINISTIC"
+        HEAP_DIFF=$((FEAT_HEAP - BASE_HEAP))
+        echo -e "    Heap: ${HEAP_DIFF} MB ($(signed_pct "$HEAP_DIFF" "$BASE_HEAP")) ← DETERMINISTIC"
     fi
+else
+    print_stats "current"
 fi
 
 echo ""

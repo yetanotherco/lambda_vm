@@ -44,14 +44,8 @@ Runs: 3
 
 ## How it works
 
-Builds the CLI with `--features jemalloc-stats`, which:
+The CLI always uses jemalloc as the global allocator (faster than the system allocator). Building with `--features jemalloc-stats` additionally enables a background thread that polls `stats.allocated` every 10ms and reports the peak heap after proving completes.
 
-1. Uses jemalloc as the global allocator (`tikv-jemallocator`)
-2. Spawns a background thread that polls `stats.allocated` every 10ms
-3. Reports the peak after proving completes
-
-Normal builds (without the feature) use the system allocator and don't include any tracking overhead.
-
-## Other scripts
-
-- `bench_compare.sh` — hyperfine-based time comparison across branches (no memory tracking). Useful for quick A/B timing with statistical rigor.
+In short:
+- `cargo build -p cli` → jemalloc (no tracking overhead)
+- `cargo build -p cli --features jemalloc-stats` → jemalloc + peak heap reporting
