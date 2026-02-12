@@ -152,6 +152,15 @@ These are required to ensure the multiplicities $-(#`μ` - #`first`)$ and $#`μ`
 To pad this chip, use the below data.
 #render_chip_padding_table(chip, config)
 
-== Notes
+== Notes/optimizations
 - The current version only supports writing to `stdout`.
   This chip could potentially be extended to support writing to arbitrary `fd`s
+- One might be able to replace @commit:c:end by `end => count = 0`.
+  While loosening the constraint (`count = 0 => end` is no longer enforced), this should not cause any problems:
+  if the prover does not set `end` when `count=0`, they simply cannot complete the proof.
+  First of all, one would have to recursively work through all $2^64$ values of `count`, something that is practically infeasible.
+  Moreover, if this is done with a sequence that originally has $#`count` > 0$, one will inevitably have to read a memory address twice at the same timestamp, which is impossible to prove.
+  In addition to dropping the `ZERO` lookup, this optimization might also permit moving `count_decr` from a `DWordHL` to a `DWordWL`, saving two columns.
+- Given that it is practically infeasible to commit more than $#`p`-1 = 2^64-2^32$ bytes in a program, it might suffice to store `count_decr` in a `BaseField`.
+  Note that this would probably involve having an extra (virtual) column storing `count` in `BaseField` form as well.
+  Moreover, one might need to add a lookup to `LT` to ensure $#`count` <= #`p`-1$ when being read from memory at the beginning of each commitment sequence.
