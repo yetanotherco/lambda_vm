@@ -56,4 +56,4 @@ This chip contributes the following to the lookup argument.
 - MEMB chip that deals does a one-byte write to remove old_timestamp from here (uncertain tradeoffs)
 - Compute `base_address[1] + 1` once and have high words of `address_add` as Words
 - Improve overflow trapping somehow so we don't need `LT` (could tie into previous one by checking carry bit of the +1)
-- Adding `μ_sum`/`w2`/`w4`/`write8` multiplicities to the `IS_HALFWORD` lookups may make some GKR things faster if there are known zeroes.
+- Adding `μ_sum`/`w2`/`w4`/`write8` multiplicities to the `IS_HALF` lookups may make some GKR things faster if there are known zeroes.
