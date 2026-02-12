@@ -23,8 +23,8 @@ use stark::proof::options::GoldilocksCubicProofOptions;
 /// thread-local caches — `epoch::advance()` just merges cached counters.
 #[cfg(feature = "jemalloc-stats")]
 mod heap_tracker {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread;
     use std::time::Duration;
 
@@ -67,11 +67,21 @@ mod heap_tracker {
         }
 
         pub fn stop(mut self) -> usize {
+            self.shutdown();
+            self.peak.load(Ordering::Relaxed)
+        }
+
+        fn shutdown(&mut self) {
             self.stop.store(true, Ordering::Relaxed);
             if let Some(h) = self.handle.take() {
                 h.join().ok();
             }
-            self.peak.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Drop for HeapTracker {
+        fn drop(&mut self) {
+            self.shutdown();
         }
     }
 }
