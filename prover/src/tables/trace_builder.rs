@@ -1182,6 +1182,7 @@ impl Traces {
                 ));
             }
         }
+        configs.sort_by_key(|c| c.page_base);
         configs
     }
 
