@@ -27,11 +27,13 @@
 //! All lookups are provided as receivers with negative multiplicity,
 //! meaning other tables send to this table.
 
-use lazy_static::lazy_static;
+use std::sync::OnceLock;
+
 use math::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
 use math::polynomial::Polynomial;
 use stark::config::{BatchedMerkleTree, Commitment};
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
+use stark::proof::options::ProofOptions;
 use stark::prover::evaluate_polynomial_on_lde_domain;
 use stark::trace::{TraceTable, columns2rows};
 
@@ -172,39 +174,23 @@ pub const fn is_preprocessed() -> bool {
 // Preprocessed commitment (computed once, cached)
 // =========================================================================
 
-lazy_static! {
-    /// Commitment to the LDE of the precomputed bitwise table columns.
-    ///
-    /// This is a Merkle root over 2^22 rows (2^20 * blowup_factor=4) of the
-    /// LDE-evaluated 11 precomputed columns (X, Y, Z, AND, OR, XOR, MSB8,
-    /// MSB16, ZERO, SLL, SLLC).
-    ///
-    /// The commitment is over LDE values (not raw values) because FRI queries
-    /// can target any index in the extended domain [0, N*blowup). The verifier
-    /// checks that proofs open against this exact commitment.
-    ///
-    /// Computed once on first access and cached. Both prover and verifier
-    /// use this same value in the Fiat-Shamir transcript.
-    pub static ref BITWISE_TABLE_COMMITMENT: Commitment = compute_preprocessed_commitment();
-}
-
-/// Standard blowup factor for LDE domain (matches proof options).
-const LDE_BLOWUP_FACTOR: usize = 4;
-
-/// Standard coset offset for LDE domain (matches proof options).
-const LDE_COSET_OFFSET: u64 = 3;
+/// Cached commitment for the BITWISE preprocessed columns.
+///
+/// INVARIANT: All callers within a process must use identical `ProofOptions`.
+/// The cache is keyed only by table content, not by options.
+static BITWISE_COMMITMENT: OnceLock<Commitment> = OnceLock::new();
 
 /// Computes the Merkle commitment over the precomputed bitwise table columns.
 ///
 /// This builds a Merkle tree over the LDE (Low Degree Extension) of the precomputed
 /// columns, matching exactly how the prover commits to traces. The tree has
-/// NUM_ROWS * LDE_BLOWUP_FACTOR = 2^22 leaves, enabling FRI queries at any index
+/// NUM_ROWS * blowup_factor leaves, enabling FRI queries at any index
 /// in the extended domain.
 ///
 /// Critical for security: the commitment must be over LDE values (not raw values)
 /// because FRI queries can target any index in [0, N*blowup). A raw-value commitment
 /// would only have N leaves, unable to verify queries at indices >= N.
-fn compute_preprocessed_commitment() -> Commitment {
+fn compute_preprocessed_commitment(options: &ProofOptions) -> Commitment {
     // Step 1: Generate precomputed columns in parallel
     // Each column is generated independently by iterating over all row indices
     #[cfg(feature = "parallel")]
@@ -254,13 +240,14 @@ fn compute_preprocessed_commitment() -> Commitment {
         .collect();
 
     // Step 3: Evaluate polynomials on LDE domain (parallel)
-    let coset_offset = FE::from(LDE_COSET_OFFSET);
+    let blowup_factor = options.blowup_factor as usize;
+    let coset_offset = FE::from(options.coset_offset);
 
     #[cfg(feature = "parallel")]
     let mut lde_columns: Vec<Vec<FE>> = polys
         .par_iter()
         .map(|poly| {
-            evaluate_polynomial_on_lde_domain(poly, LDE_BLOWUP_FACTOR, NUM_ROWS, &coset_offset)
+            evaluate_polynomial_on_lde_domain(poly, blowup_factor, NUM_ROWS, &coset_offset)
                 .expect("LDE evaluation failed for bitwise polynomial")
         })
         .collect();
@@ -269,7 +256,7 @@ fn compute_preprocessed_commitment() -> Commitment {
     let mut lde_columns: Vec<Vec<FE>> = polys
         .iter()
         .map(|poly| {
-            evaluate_polynomial_on_lde_domain(poly, LDE_BLOWUP_FACTOR, NUM_ROWS, &coset_offset)
+            evaluate_polynomial_on_lde_domain(poly, blowup_factor, NUM_ROWS, &coset_offset)
                 .expect("LDE evaluation failed for bitwise polynomial")
         })
         .collect();
@@ -295,12 +282,10 @@ fn compute_preprocessed_commitment() -> Commitment {
     tree.root
 }
 
-/// Returns the preprocessed commitment for the bitwise table.
-///
-/// This is a convenience function that dereferences the lazy_static.
+/// Returns the preprocessed commitment for the bitwise table, with caching.
 #[inline]
-pub fn preprocessed_commitment() -> Commitment {
-    *BITWISE_TABLE_COMMITMENT
+pub fn preprocessed_commitment(options: &ProofOptions) -> Commitment {
+    *BITWISE_COMMITMENT.get_or_init(|| compute_preprocessed_commitment(options))
 }
 
 // =========================================================================

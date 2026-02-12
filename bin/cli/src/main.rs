@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Instant;
 
 use clap::{Parser, Subcommand, ValueHint};
 use executor::{
@@ -11,8 +12,8 @@ use executor::{
     flamegraph::FlamegraphGenerator,
     vm::execution::Executor,
 };
-use prover::tables::types::{GoldilocksExtension, GoldilocksField};
-use stark::proof::stark::MultiProof;
+use prover::VmProof;
+use stark::proof::options::GoldilocksCubicProofOptions;
 
 #[derive(Parser)]
 #[command(author, version, about = "Lambda VM - RISC-V zkVM", long_about = None)]
@@ -43,6 +44,14 @@ enum Commands {
         /// Output path for the proof bundle
         #[arg(short, long, value_hint = ValueHint::FilePath)]
         output: PathBuf,
+
+        /// Blowup factor (power of 2). Higher = fewer queries, smaller proof, slower proving.
+        #[arg(long)]
+        blowup: Option<u8>,
+
+        /// Print timing breakdown
+        #[arg(long)]
+        time: bool,
     },
 
     /// Verify a proof bundle
@@ -54,6 +63,14 @@ enum Commands {
         /// Path to the ELF file (required for DECODE table verification)
         #[arg(value_parser, value_hint = ValueHint::FilePath)]
         elf: PathBuf,
+
+        /// Blowup factor used during proving (must match)
+        #[arg(long)]
+        blowup: Option<u8>,
+
+        /// Print timing breakdown
+        #[arg(long)]
+        time: bool,
     },
 }
 
@@ -62,8 +79,18 @@ fn main() -> ExitCode {
 
     match cli.command {
         Commands::Execute { elf, flamegraph } => cmd_execute(elf, flamegraph),
-        Commands::Prove { elf, output } => cmd_prove(elf, output),
-        Commands::Verify { proof, elf } => cmd_verify(proof, elf),
+        Commands::Prove {
+            elf,
+            output,
+            blowup,
+            time,
+        } => cmd_prove(elf, output, blowup, time),
+        Commands::Verify {
+            proof,
+            elf,
+            blowup,
+            time,
+        } => cmd_verify(proof, elf, blowup, time),
     }
 }
 
@@ -151,7 +178,7 @@ fn cmd_execute(elf_path: PathBuf, flamegraph_path: Option<PathBuf>) -> ExitCode 
     ExitCode::SUCCESS
 }
 
-fn cmd_prove(elf_path: PathBuf, output_path: PathBuf) -> ExitCode {
+fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, blowup: Option<u8>, time: bool) -> ExitCode {
     eprintln!("Reading ELF file...");
     let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
@@ -161,8 +188,29 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf) -> ExitCode {
         }
     };
 
-    eprintln!("Generating proof (this may take a while)...");
-    let proof = match prover::prove(&elf_data) {
+    let start = Instant::now();
+    let proof = match blowup {
+        Some(b) => {
+            let opts = match GoldilocksCubicProofOptions::with_blowup(b) {
+                Ok(opts) => opts,
+                Err(e) => {
+                    eprintln!("Invalid proof options: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            eprintln!(
+                "Generating proof (blowup={b}, queries={})...",
+                opts.fri_number_of_queries
+            );
+            prover::prove_with_options(&elf_data, &opts)
+        }
+        None => {
+            eprintln!("Generating proof...");
+            prover::prove(&elf_data)
+        }
+    };
+    let prove_elapsed = start.elapsed();
+    let proof = match proof {
         Ok(proof) => proof,
         Err(e) => {
             eprintln!("Proof generation failed: {}", e);
@@ -194,10 +242,13 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf) -> ExitCode {
     }
 
     eprintln!("Proof written to {:?}", output_path);
+    if time {
+        println!("Proving time: {:.3}s", prove_elapsed.as_secs_f64());
+    }
     ExitCode::SUCCESS
 }
 
-fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf) -> ExitCode {
+fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf, blowup: Option<u8>, time: bool) -> ExitCode {
     eprintln!("Reading ELF file...");
     let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
@@ -216,17 +267,31 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf) -> ExitCode {
         }
     };
 
-    let proof: MultiProof<GoldilocksField, GoldilocksExtension, ()> =
-        match bincode::deserialize(&proof_bytes) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("Failed to deserialize proof: {}", e);
-                return ExitCode::FAILURE;
-            }
-        };
+    let proof: VmProof = match bincode::deserialize(&proof_bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Failed to deserialize proof: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
 
     eprintln!("Verifying proof...");
-    let result = match prover::verify(&proof, &elf_data) {
+    let start = Instant::now();
+    let result = match blowup {
+        Some(b) => {
+            let opts = match GoldilocksCubicProofOptions::with_blowup(b) {
+                Ok(opts) => opts,
+                Err(e) => {
+                    eprintln!("Invalid proof options: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            prover::verify_with_options(&proof, &elf_data, &opts)
+        }
+        None => prover::verify(&proof, &elf_data),
+    };
+    let verify_elapsed = start.elapsed();
+    let result = match result {
         Ok(valid) => valid,
         Err(e) => {
             eprintln!("Verification error: {}", e);
@@ -236,6 +301,9 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf) -> ExitCode {
 
     if result {
         eprintln!("Verification succeeded!");
+        if time {
+            println!("Verification time: {:.3}s", verify_elapsed.as_secs_f64());
+        }
         ExitCode::SUCCESS
     } else {
         eprintln!("Verification failed!");
