@@ -11,9 +11,6 @@ use crate::{
 };
 use alloc::{vec, vec::Vec};
 
-#[cfg(feature = "cuda")]
-use crate::fft::gpu::cuda::polynomial::{evaluate_fft_cuda, interpolate_fft_cuda};
-
 use super::cpu::{ops, roots_of_unity};
 
 impl<E: IsField> Polynomial<FieldElement<E>> {
@@ -39,20 +36,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         coeffs.resize(len, FieldElement::zero());
         // padding with zeros will make FFT return more evaluations of the same polynomial.
 
-        #[cfg(feature = "cuda")]
-        {
-            // TODO: support multiple fields with CUDA
-            if F::field_name() == "stark256" {
-                Ok(evaluate_fft_cuda(&coeffs)?)
-            } else {
-                evaluate_fft_cpu::<F, E>(&coeffs)
-            }
-        }
-
-        #[cfg(not(feature = "cuda"))]
-        {
-            evaluate_fft_cpu::<F, E>(&coeffs)
-        }
+        evaluate_fft_cpu::<F, E>(&coeffs)
     }
 
     /// Returns `N` evaluations with an offset of this polynomial using FFT over a domain in a subfield F of E
@@ -75,19 +59,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     pub fn interpolate_fft<F: IsFFTField + IsSubFieldOf<E>>(
         fft_evals: &[FieldElement<E>],
     ) -> Result<Self, FFTError> {
-        #[cfg(feature = "cuda")]
-        {
-            if !F::field_name().is_empty() {
-                Ok(interpolate_fft_cuda(fft_evals)?)
-            } else {
-                interpolate_fft_cpu::<F, E>(fft_evals)
-            }
-        }
-
-        #[cfg(not(feature = "cuda"))]
-        {
-            interpolate_fft_cpu::<F, E>(fft_evals)
-        }
+        interpolate_fft_cpu::<F, E>(fft_evals)
     }
 
     /// Returns a new polynomial that interpolates offset `(w^i, fft_evals[i])`, with `w` being a
