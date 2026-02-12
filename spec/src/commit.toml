@@ -73,7 +73,7 @@ name = "incoming"
 [[constraints.incoming]]
 kind = "interaction"
 tag = "ECALL"
-input = ["timestamp",64]
+input = ["timestamp", ["cast", 64, "DWordWL"]]
 multiplicity = ["-", "first"]
 ref = "commit:c:receive_ecall"
 
@@ -83,32 +83,32 @@ name = "read_input"
 [[constraints.read_input]]
 kind = "interaction"
 tag = "MEMW"
-input = [1, ["*", 2, 11], "address", "timestamp", 1, 0, 0]
-output = "address"
+input = [1, ["cast", ["*", 2, 11], "DWordWL"], ["arr", ["idx", "address", 0], ["idx", "address", 1], 0, 0, 0, 0, 0, 0], "timestamp", 1, 0, 0]
+output = ["arr", ["idx", "address", 0], ["idx", "address", 1], 0, 0, 0, 0, 0, 0]
 multiplicity = "first"
 ref = "commit:c:read_address"
 
 [[constraints.read_input]]
 kind = "interaction"
 tag = "MEMW"
-input = [1, ["*", 2, 12], "count", "timestamp", 1, 0, 0]
-output = "count"
+input = [1, ["cast", ["*", 2, 12], "DWordWL"], ["arr", ["idx", "count", 0], ["idx", "count", 1], 0, 0, 0, 0, 0, 0], "timestamp", 1, 0, 0]
+output = ["arr", ["idx", "count", 0], ["idx", "count", 1], 0, 0, 0, 0, 0, 0]
 multiplicity = "first"
 ref = "commit:c:read_count"
 
 [[constraints.read_input]]
 kind = "interaction"
 tag = "MEMW"
-input = [1, ["*", 2, 10], "count", "timestamp", 1, 0, 0]
-output = 1
+input = [1, ["cast", ["*", 2, 10], "DWordWL"], ["arr", ["idx", "count", 0], ["idx", "count", 1], 0, 0, 0, 0, 0, 0], "timestamp", 1, 0, 0]
+output = ["arr", 1, 0, 0, 0, 0, 0, 0, 0]
 multiplicity = "first"
 ref = "commit:c:read_fd_write_count"
 
 [[constraints.read_input]]
 kind = "interaction"
 tag = "MEMW"
-input = [1, ["*", 2, 254], ["+", "index", ["cast", "count", "BaseField"]], "timestamp", 0, 0, 0]
-output = "index"
+input = [1, ["cast", ["*", 2, 254], "DWordWL"], ["arr", ["+", "index", ["cast", "count", "BaseField"]], 0, 0, 0, 0, 0, 0, 0], "timestamp", 0, 0, 0]
+output = ["arr", "index", 0, 0, 0, 0, 0, 0, 0]
 multiplicity = "first"
 ref = "commit:c:read_index"
 
@@ -152,9 +152,9 @@ name = "commit"
 
 [[constraints.commit]]
 kind = "interaction"
-tag = "MEWM"
-input = [0, "address", "value", "timestamp", 0, 0, 0]
-output = "value"
+tag = "MEMW"
+input = [0, "address", ["arr", "value", 0, 0, 0, 0, 0, 0, 0], "timestamp", 0, 0, 0]
+output = ["arr", "value", 0, 0, 0, 0, 0, 0, 0]
 multiplicity = ["-", "μ", "end"]
 ref = "commit:c:read_value"
 
@@ -209,7 +209,7 @@ name = "lookups"
 [[constraints.lookups]]
 kind = "interaction"
 tag = "CNB"
-input = ["timestamp", ["+", "index", 1], ["cast", "address_incr", "DWordWL"], "count_decr"]
+input = ["timestamp", ["+", "index", 1], ["cast", "address_incr", "DWordWL"], ["cast", "count_decr", "DWordWL"]]
 multiplicity = ["-", "μ", "end"]
 ref = "commit:c:send_commit_next_byte"
 

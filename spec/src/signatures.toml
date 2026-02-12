@@ -103,6 +103,18 @@ tag = "ECALL"
 kind = "interaction"
 input = ["DWordWL", "DWordWL"]
 
+# CNB[timestamp, index, address, count]
+[[signatures]]
+tag = "CNB"
+kind = "interaction"
+input = ["DWordWL", "BaseField", "DWordWL", "DWordWL"]
+
+# COMMIT[index, value]
+[[signatures]]
+tag = "COMMIT"
+kind = "interaction"
+input = ["BaseField", "Byte"]
+
 # AND_BYTE[res; X, Y]
 [[signatures]]
 tag = "AND_BYTE"
