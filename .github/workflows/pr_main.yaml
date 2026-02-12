@@ -110,10 +110,17 @@ jobs:
     steps:
       - name: Check results
         run: |
-          if [ "${{ needs.test-executor.result }}" != "success" ] || \
-             [ "${{ needs.test-prover.result }}" != "success" ]; then
-            echo "test-executor: ${{ needs.test-executor.result }}"
-            echo "test-prover: ${{ needs.test-prover.result }}"
+          executor="${{ needs.test-executor.result }}"
+          prover="${{ needs.test-prover.result }}"
+
+          echo "test-executor: $executor"
+          echo "test-prover: $prover"
+
+          # Allow "success" or "skipped" (skipped on merge queue pushes)
+          if [[ "$executor" != "success" && "$executor" != "skipped" ]]; then
+            exit 1
+          fi
+          if [[ "$prover" != "success" && "$prover" != "skipped" ]]; then
             exit 1
           fi
 
