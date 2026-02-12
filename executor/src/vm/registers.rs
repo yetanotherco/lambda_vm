@@ -1,6 +1,6 @@
 use std::fmt::Display;
 
-const STACK_MEMORY_SIZE: u64 = 0xFFFFFFFFFFFFFFF0; // 64-bit max (Multiple of 16 for RV64 ABI)
+pub const STACK_TOP: u64 = 0xFFFFFFFFFFFFFFF0; // 64-bit max (Multiple of 16 for RV64 ABI)
 
 #[derive(Debug)]
 /// Holds the current value of all 32 registers
@@ -11,7 +11,7 @@ impl Default for Registers {
     fn default() -> Self {
         let mut registers = Registers(Default::default());
         // Initialize stack pointer according to available memory size
-        registers.0[1] = STACK_MEMORY_SIZE;
+        registers.0[1] = STACK_TOP;
         registers
     }
 }
