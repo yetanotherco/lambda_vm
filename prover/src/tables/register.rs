@@ -19,9 +19,15 @@
 //! | timestamp | DWordWL | Final timestamp (0 if never accessed) |
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
+use math::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
+use math::polynomial::Polynomial;
+use stark::config::{BatchedMerkleTree, Commitment};
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
-use stark::trace::TraceTable;
+use stark::proof::options::ProofOptions;
+use stark::prover::evaluate_polynomial_on_lde_domain;
+use stark::trace::{TraceTable, columns2rows};
 
 use super::page::STACK_TOP;
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
@@ -40,6 +46,10 @@ pub const WORDS_PER_REGISTER: usize = 2;
 /// Total number of register Word addresses.
 /// Each register uses 2 Word addresses in the Memory bus.
 pub const NUM_REGISTER_ADDRESSES: usize = NUM_REGISTERS * WORDS_PER_REGISTER;
+
+/// Number of preprocessed columns (OFFSET, INIT).
+/// OFFSET is 0..63 and INIT is 0 except SP (x2) words which hold STACK_TOP.
+pub const NUM_PREPROCESSED_COLS: usize = 2;
 
 // =========================================================================
 // Column indices for REGISTER table
@@ -140,6 +150,83 @@ pub fn generate_register_trace(
     // Already zero-initialized, which is correct (init=fini=0, ts=0)
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+}
+
+// =========================================================================
+// Preprocessed commitment
+// =========================================================================
+
+/// Cached commitment for the REGISTER preprocessed columns.
+///
+/// INVARIANT: All callers within a process must use identical `ProofOptions`.
+/// The cache is keyed only by table content, not by options.
+static REGISTER_COMMITMENT: OnceLock<Commitment> = OnceLock::new();
+
+/// Computes the Merkle root commitment over the LDE of REGISTER precomputed columns.
+///
+/// The REGISTER table is program-independent: OFFSET=0..63, INIT=0 except
+/// SP (x2) words at offset 4 and 5 which hold STACK_TOP.
+pub fn compute_precomputed_commitment(options: &ProofOptions) -> Commitment {
+    let num_rows = NUM_REGISTER_ADDRESSES.next_power_of_two();
+
+    // Precomputed columns: OFFSET and INIT.
+    //
+    // OFFSET (col 0): deterministic row index 0..63 (32 registers × 2 words each).
+    //   Identical for every program.
+    //
+    // INIT (col 1): initial word value for each register address. All zeros except
+    //   for the stack pointer (x2), whose two 32-bit words hold STACK_TOP:
+    //     - offset 4 (SP low word):  STACK_TOP & 0xFFFF_FFFF
+    //     - offset 5 (SP high word): STACK_TOP >> 32
+    //   This is program-independent (STACK_TOP is a fixed constant), so the entire
+    //   REGISTER preprocessed commitment can be computed once and cached globally.
+    let mut offset_col = vec![FE::zero(); num_rows];
+    let mut init_col = vec![FE::zero(); num_rows];
+
+    for i in 0..NUM_REGISTER_ADDRESSES {
+        offset_col[i] = FE::from(i as u64);
+        init_col[i] = if i == 4 {
+            FE::from(STACK_TOP & 0xFFFF_FFFF)
+        } else if i == 5 {
+            FE::from(STACK_TOP >> 32)
+        } else {
+            FE::zero()
+        };
+    }
+
+    let columns = [offset_col, init_col];
+
+    let polys: Vec<Polynomial<FE>> = columns
+        .iter()
+        .map(|col| {
+            Polynomial::interpolate_fft::<GoldilocksField>(col)
+                .expect("FFT interpolation failed for register column")
+        })
+        .collect();
+
+    let blowup_factor = options.blowup_factor as usize;
+    let coset_offset = FE::from(options.coset_offset);
+    let mut lde_columns: Vec<Vec<FE>> = polys
+        .iter()
+        .map(|poly| {
+            evaluate_polynomial_on_lde_domain(poly, blowup_factor, num_rows, &coset_offset)
+                .expect("LDE evaluation failed for register polynomial")
+        })
+        .collect();
+
+    for col in lde_columns.iter_mut() {
+        in_place_bit_reverse_permute(col);
+    }
+
+    let lde_rows = columns2rows(lde_columns);
+    let tree = BatchedMerkleTree::<GoldilocksField>::build(&lde_rows)
+        .expect("Failed to build Merkle tree for register LDE");
+    tree.root
+}
+
+/// Returns the preprocessed commitment for the REGISTER table, with caching.
+pub fn preprocessed_commitment(options: &ProofOptions) -> Commitment {
+    *REGISTER_COMMITMENT.get_or_init(|| compute_precomputed_commitment(options))
 }
 
 // =========================================================================

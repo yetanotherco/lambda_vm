@@ -2159,6 +2159,7 @@ dependencies = [
  "executor",
  "math",
  "rayon",
+ "serde",
  "stark",
 ]
 
