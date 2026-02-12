@@ -1305,27 +1305,25 @@ fn test_deep_stack_passes() {
 
 /// Tests the full prove → VmProof → verify roundtrip for deep_stack.
 ///
-/// Verifies that `runtime_page_bases` is correctly extracted by the prover
+/// Verifies that `runtime_page_ranges` is correctly extracted by the prover
 /// and used by the verifier to reconstruct page configs for non-ELF pages.
 #[test]
-fn test_deep_stack_runtime_page_bases_roundtrip() {
+fn test_deep_stack_runtime_pages_roundtrip() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("deep_stack");
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
 
-    // Prove: generates traces, extracts runtime_page_bases into VmProof
     let proof_options = ProofOptions::default_test_options();
     let executor = executor::vm::execution::Executor::new(&elf, vec![])
         .expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
     let mut traces = Traces::from_elf_and_logs(&elf, &result.logs).unwrap();
 
-    let runtime_page_bases = traces.runtime_page_bases(&elf);
+    let runtime_page_ranges = traces.runtime_page_ranges(&elf);
     assert!(
-        !runtime_page_bases.is_empty(),
-        "deep_stack should have runtime pages beyond ELF (stack pages)"
+        !runtime_page_ranges.is_empty(),
+        "deep_stack should have runtime page ranges beyond ELF (stack pages)"
     );
 
-    // Verify: reconstruct page configs from ELF + runtime_page_bases hint
     let prover_airs = crate::VmAirs::new(&elf, &proof_options, true, &traces.page_configs);
     let proof = Prover::multi_prove(
         prover_airs.air_trace_pairs(&mut traces),
@@ -1333,7 +1331,8 @@ fn test_deep_stack_runtime_page_bases_roundtrip() {
     )
     .expect("Prover failed");
 
-    let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_bases);
+    // Verifier reconstructs from ELF + runtime_page_ranges hint
+    let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges);
     let verifier_airs = crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs);
 
     let verified = Verifier::multi_verify(
@@ -1343,11 +1342,11 @@ fn test_deep_stack_runtime_page_bases_roundtrip() {
     );
     assert!(
         verified,
-        "Verifier should accept proof when using runtime_page_bases hint"
+        "Verifier should accept proof when using runtime_page_ranges hint"
     );
 }
 
-/// Tests that the verifier REJECTS when runtime_page_bases hint is incomplete.
+/// Tests that the verifier REJECTS when runtime_page_ranges hint is incomplete.
 ///
 /// The prover generates a proof for deep_stack (which needs page D000).
 /// The verifier is given an empty hint (no runtime pages) → commitment
@@ -1371,7 +1370,7 @@ fn test_deep_stack_missing_pages_rejected() {
     )
     .expect("Prover failed");
 
-    // Verifier uses EMPTY runtime_page_bases → missing stack/heap pages
+    // Verifier uses EMPTY runtime_page_ranges → missing stack/heap pages
     let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[]);
     let verifier_airs = crate::VmAirs::new(&elf, &proof_options, true, &wrong_configs);
 
@@ -1382,7 +1381,7 @@ fn test_deep_stack_missing_pages_rejected() {
     );
     assert!(
         !verified,
-        "Verifier should REJECT when runtime_page_bases is incomplete (missing pages)"
+        "Verifier should REJECT when runtime_page_ranges is incomplete (missing pages)"
     );
 }
 
@@ -1392,18 +1391,19 @@ fn test_deep_stack_missing_pages_rejected() {
 
 /// heap_alloc writes to 4 pages (0x80000..0x83000) far from ELF segments and
 /// stack, plus a stack write. Tests that MemoryState-based page detection
-/// discovers all heap and stack pages.
+/// discovers all heap and stack pages, and run-length encodes them.
 #[test]
 fn test_heap_alloc_passes() {
     let (elf, logs, _instructions) = run_asm_elf("heap_alloc");
     let mut traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
 
-    // Verify runtime_page_bases includes both heap and stack pages
-    let runtime_pages = traces.runtime_page_bases(&elf);
+    // Verify runtime_page_ranges encodes the heap pages as a contiguous range
+    let ranges = traces.runtime_page_ranges(&elf);
+    // 4 contiguous heap pages (0x80000..0x83000) should be one range
     assert!(
-        runtime_pages.len() >= 5,
-        "Expected at least 5 runtime pages (4 heap + 1 stack), got {}",
-        runtime_pages.len()
+        ranges.iter().any(|&(base, count)| base == 0x80000 && count == 4),
+        "Expected contiguous heap range (0x80000, 4), got {:?}",
+        ranges
     );
 
     assert!(
@@ -1413,9 +1413,9 @@ fn test_heap_alloc_passes() {
 }
 
 /// Full prove → VmProof → verify roundtrip for heap_alloc.
-/// Verifies the hint correctly conveys heap page bases to the verifier.
+/// Verifies the hint correctly conveys heap page ranges to the verifier.
 #[test]
-fn test_heap_alloc_runtime_page_bases_roundtrip() {
+fn test_heap_alloc_runtime_pages_roundtrip() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("heap_alloc");
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
 
@@ -1425,16 +1425,14 @@ fn test_heap_alloc_runtime_page_bases_roundtrip() {
     let result = executor.run().expect("Failed to run program");
     let mut traces = Traces::from_elf_and_logs(&elf, &result.logs).unwrap();
 
-    let runtime_page_bases = traces.runtime_page_bases(&elf);
+    let runtime_page_ranges = traces.runtime_page_ranges(&elf);
 
-    // Should have heap pages (0x80000..0x83000) + stack page(s)
+    // Should have a range covering heap pages 0x80000..0x83000
+    let total_pages: u64 = runtime_page_ranges.iter().map(|(_, count)| count).sum();
     assert!(
-        runtime_page_bases.iter().any(|&b| b == 0x80000),
-        "runtime_page_bases should contain heap page 0x80000"
-    );
-    assert!(
-        runtime_page_bases.iter().any(|&b| b == 0x83000),
-        "runtime_page_bases should contain heap page 0x83000"
+        total_pages >= 5,
+        "Expected at least 5 runtime pages (4 heap + 1 stack), got {}",
+        total_pages
     );
 
     let prover_airs = crate::VmAirs::new(&elf, &proof_options, true, &traces.page_configs);
@@ -1444,8 +1442,9 @@ fn test_heap_alloc_runtime_page_bases_roundtrip() {
     )
     .expect("Prover failed");
 
-    // Verifier reconstructs from ELF + runtime hint
-    let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_bases);
+    // Verifier reconstructs from ELF + runtime hint (ranges decoded to pages)
+    let verifier_configs =
+        Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges);
     let verifier_airs = crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs);
 
     let verified = Verifier::multi_verify(
@@ -1455,6 +1454,6 @@ fn test_heap_alloc_runtime_page_bases_roundtrip() {
     );
     assert!(
         verified,
-        "Verifier should accept heap_alloc proof with correct runtime_page_bases"
+        "Verifier should accept heap_alloc proof with correct runtime_page_ranges"
     );
 }

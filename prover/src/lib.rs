@@ -51,10 +51,11 @@ use stark::proof::stark::MultiProof;
 pub struct VmProof {
     /// The multi-table STARK proof.
     pub proof: MultiProof<F, E, ()>,
-    /// Sorted list of runtime page base addresses (zero-initialized pages
-    /// accessed during execution but not covered by ELF segments).
-    /// Includes stack, heap, and any other dynamically accessed pages.
-    pub runtime_page_bases: Vec<u64>,
+    /// Run-length encoded runtime page ranges: `(base, count)` pairs.
+    /// Each pair represents `count` contiguous 4KB pages starting at `base`.
+    /// These are zero-initialized pages accessed during execution but not
+    /// covered by ELF segments (stack, heap, etc.).
+    pub runtime_page_ranges: Vec<(u64, u64)>,
 }
 
 /// Error type for the prover crate.
@@ -244,7 +245,7 @@ pub fn prove_with_options(
     let mut traces = Traces::from_elf_and_logs(&program, &result.logs)?;
     let airs = VmAirs::new(&program, proof_options, false, &traces.page_configs);
 
-    let runtime_page_bases = traces.runtime_page_bases(&program);
+    let runtime_page_ranges = traces.runtime_page_ranges(&program);
 
     let proof = Prover::multi_prove(
         airs.air_trace_pairs(&mut traces),
@@ -254,14 +255,14 @@ pub fn prove_with_options(
 
     Ok(VmProof {
         proof,
-        runtime_page_bases,
+        runtime_page_ranges,
     })
 }
 
 /// Verify a proof produced by [`prove`] using default proof options.
 ///
 /// Uses [`GoldilocksCubicProofOptions::with_blowup(2)`] for verification.
-/// `runtime_page_bases` from the proof are hints — preprocessed commitments
+/// `runtime_page_ranges` from the proof are hints — preprocessed commitments
 /// bind the verifier to the correct page layout.
 pub fn verify(vm_proof: &VmProof, elf_bytes: &[u8]) -> Result<bool, Error> {
     verify_with_options(
@@ -283,7 +284,7 @@ pub fn verify_with_options(
 ) -> Result<bool, Error> {
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let page_configs =
-        Traces::page_configs_from_elf_and_runtime(&program, &vm_proof.runtime_page_bases);
+        Traces::page_configs_from_elf_and_runtime(&program, &vm_proof.runtime_page_ranges);
     let airs = VmAirs::new(&program, proof_options, false, &page_configs);
 
     Ok(Verifier::multi_verify(

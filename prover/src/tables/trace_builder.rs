@@ -1165,31 +1165,35 @@ impl Traces {
             .collect()
     }
 
-    /// Reconstruct page configs from ELF and runtime page bases.
+    /// Reconstruct page configs from ELF and runtime page ranges.
     ///
     /// Used by the verifier to reconstruct the full PAGE table layout.
     /// Combines deterministic ELF pages with prover-provided runtime
-    /// page bases (zero-initialized: stack, heap, etc.).
+    /// page ranges (zero-initialized: stack, heap, etc.).
+    /// Each range is `(base, count)` — `count` contiguous 4KB pages from `base`.
     pub fn page_configs_from_elf_and_runtime(
         elf: &Elf,
-        runtime_page_bases: &[u64],
+        runtime_page_ranges: &[(u64, u64)],
     ) -> Vec<PageConfig> {
         let mut configs = Self::page_configs_from_elf(elf);
-        for &base in runtime_page_bases {
-            configs.push(PageConfig::zero_init(base, page::DEFAULT_PAGE_SIZE));
+        let page_size = page::DEFAULT_PAGE_SIZE;
+        for &(base, count) in runtime_page_ranges {
+            for i in 0..count {
+                configs.push(PageConfig::zero_init(base + i * page_size as u64, page_size));
+            }
         }
         configs
     }
 
-    /// Extracts runtime page bases from the generated page configs.
+    /// Extracts runtime page ranges from the generated page configs.
     ///
-    /// Returns the sorted list of page base addresses that are not covered
-    /// by ELF segments (i.e., stack, heap, and other runtime pages).
-    pub fn runtime_page_bases(&self, elf: &Elf) -> Vec<u64> {
+    /// Returns run-length encoded `(base, count)` pairs for page bases not
+    /// covered by ELF segments. Contiguous pages are merged into a single range.
+    pub fn runtime_page_ranges(&self, elf: &Elf) -> Vec<(u64, u64)> {
         use std::collections::BTreeSet;
 
         // Build set of ELF page bases (deterministic from binary)
-        let page_size = page::DEFAULT_PAGE_SIZE;
+        let page_size = page::DEFAULT_PAGE_SIZE as u64;
         let mut elf_bases: BTreeSet<u64> = BTreeSet::new();
 
         for segment in &elf.data {
@@ -1197,18 +1201,41 @@ impl Traces {
                 let word_addr = segment.base_addr + (i as u64 * 4);
                 for byte_offset in 0..4u64 {
                     let byte_addr = word_addr + byte_offset;
-                    let page_base = page::page_base_for_address(byte_addr, page_size);
+                    let page_base = page::page_base_for_address(byte_addr, page::DEFAULT_PAGE_SIZE);
                     elf_bases.insert(page_base);
                 }
             }
         }
 
-        // Filter page_configs for bases not in the ELF set
-        self.page_configs
+        // Collect sorted non-ELF page bases
+        let runtime_bases: Vec<u64> = self
+            .page_configs
             .iter()
             .filter(|config| !elf_bases.contains(&config.page_base))
             .map(|config| config.page_base)
-            .collect()
+            .collect();
+
+        // Run-length encode contiguous pages into (base, count) ranges
+        let mut ranges = Vec::new();
+        if runtime_bases.is_empty() {
+            return ranges;
+        }
+
+        let mut start = runtime_bases[0];
+        let mut count = 1u64;
+
+        for &base in &runtime_bases[1..] {
+            if base == start + count * page_size {
+                count += 1;
+            } else {
+                ranges.push((start, count));
+                start = base;
+                count = 1;
+            }
+        }
+        ranges.push((start, count));
+
+        ranges
     }
 
     /// Generates all traces from ELF and execution logs using phased collection.
