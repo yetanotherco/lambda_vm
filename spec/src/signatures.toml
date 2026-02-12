@@ -53,7 +53,7 @@ output = "DWordWL"
 [[signatures]]
 tag = "BRANCH"
 kind = "interaction"
-input = ["DWordWL", "Word", "DWordWL", "Bit"]
+input = ["DWordWL", "DWordWL", "DWordWL", "Bit"]
 output = "DWordWL"
 
 # MEMW[old; is_register, base_address, value, timestamp, write2, write4, write8]
@@ -176,3 +176,9 @@ tag = "HWSLC"
 kind = "interaction"
 input = ["Half", "B4"]
 output = "Half"
+
+# The actual memory tokens, see MEMW and PAGE
+[[signatures]]
+tag = "memory"
+kind = "interaction"
+input = ["Bit", "DWordWL", "DWordWL", "BaseField"]

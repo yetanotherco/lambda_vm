@@ -55,7 +55,7 @@ multiplicity = 1
 [[constraints.all]]
 kind = "interaction"
 tag = "memory"
-input = [0, "address", 0, "init"]
+input = [0, "address", ["cast", 0, "DWordWL"], "init"]
 multiplicity = -1
 
 [[constraints.all]]
