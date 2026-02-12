@@ -1,11 +1,11 @@
 //! Tests for the BITWISE precomputed table.
 
 use crate::tables::bitwise::{
-    BITWISE_TABLE_COMMITMENT, NUM_PRECOMPUTED_COLS, NUM_ROWS, bus_interactions, cols,
-    generate_bitwise_row, generate_bitwise_trace, is_preprocessed, preprocessed_commitment,
-    row_index,
+    NUM_PRECOMPUTED_COLS, NUM_ROWS, bus_interactions, cols, generate_bitwise_row,
+    generate_bitwise_trace, is_preprocessed, preprocessed_commitment, row_index,
 };
 use crate::tables::types::FE;
+use stark::proof::options::ProofOptions;
 
 #[test]
 fn test_row_index() {
@@ -332,20 +332,18 @@ fn test_generate_bitwise_row_exhaustive_sample() {
 
 #[test]
 fn test_preprocessed_commitment_is_deterministic() {
+    let options = ProofOptions::default_test_options();
     // The commitment should be the same every time we access it
-    let c1 = preprocessed_commitment();
-    let c2 = preprocessed_commitment();
+    let c1 = preprocessed_commitment(&options);
+    let c2 = preprocessed_commitment(&options);
     assert_eq!(c1, c2, "Preprocessed commitment must be deterministic");
-
-    // Also verify via the lazy_static directly
-    let c3 = *BITWISE_TABLE_COMMITMENT;
-    assert_eq!(c1, c3);
 }
 
 #[test]
 fn test_preprocessed_commitment_is_nonzero() {
+    let options = ProofOptions::default_test_options();
     // The commitment should not be all zeros
-    let commitment = preprocessed_commitment();
+    let commitment = preprocessed_commitment(&options);
     assert!(
         commitment.iter().any(|&b| b != 0),
         "Preprocessed commitment should not be all zeros"

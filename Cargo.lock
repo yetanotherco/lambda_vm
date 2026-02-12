@@ -2157,7 +2157,6 @@ dependencies = [
  "dhat",
  "env_logger",
  "executor",
- "lazy_static",
  "math",
  "rayon",
  "serde",
