@@ -33,6 +33,11 @@
   summary: meta.summary.map(((ch, title, _ref)) => chapter(ch, title)).join()
 )
 
+#let common-formatting(body) = {
+  set footnote(numbering: "[1]")
+  body
+}
+
 
 #let todo(background: white, foreground: black, name: none, body) = block(fill: background, outset: 0.5em, radius: 20%, stroke: black)[
   #set text(fill: foreground)
@@ -134,6 +139,7 @@
   assert(meta.summary.find(((f, _, _)) => f == file) != none, message: "Couldn't resolve typst source file " + file)
   if is-shiroa {
     (body) => {
+      show: common-formatting
       context _xref-included.update(x => x + ((file): true))
       context _toplevel.update(s => {
         if s == none {
@@ -151,6 +157,6 @@
       ])
     }
   } else {
-    (body) => body
+    body => body
   }
 }

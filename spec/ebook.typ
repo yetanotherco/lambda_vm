@@ -1,4 +1,4 @@
-#import "/book.typ": style, meta
+#import "/book.typ": style, meta, common-formatting
 
 #set document(author: meta.authors, title: meta.title)
 
@@ -10,6 +10,7 @@
 #pagebreak(weak: true)
 #outline()
 
+#show: common-formatting
 #show heading: set heading(numbering: "1.1")
 
 #meta.summary.map(((ch, title, ref)) => [

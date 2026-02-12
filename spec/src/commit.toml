@@ -1,0 +1,221 @@
+name = "COMMIT"
+
+# Variables
+
+[[variables.input]]
+name = "timestamp"
+type = "DWordWL"
+desc = "timestamp at which to commit"
+pad = 0
+
+[[variables.auxiliary]]
+name = "index"
+type = "BaseField"
+desc = "Index of value being committed."
+pad = 0
+
+[[variables.auxiliary]]
+name = "address"
+type = "DWordWL"
+desc = "Address of first byte to commit."
+pad = ["arr", 0, 0, 0, 0]
+
+[[variables.auxiliary]]
+name = "address_incr"
+type = "DWordHL"
+desc = "$#`address` + 1$"
+pad = ["arr", 1, 0, 0, 0]
+
+[[variables.auxiliary]]
+name = "count"
+type = "DWordWL"
+desc = "number of bytes to commit"
+pad = ["arr", 1, 0, 0, 0]
+
+[[variables.auxiliary]]
+name = "count_decr"
+type = "DWordHL"
+desc = "$#`count` - 1$"
+pad = ["arr", 0, 0, 0, 0]
+
+[[variables.auxiliary]]
+name = "first"
+type = "Bit"
+desc = "Whether this is the first commitment in this sequence."
+pad = 0
+
+[[variables.auxiliary]]
+name = "end"
+type = "Bit"
+desc = "Whether this is the end of the commitment sequence."
+pad = 0
+
+[[variables.auxiliary]]
+name = "value"
+type = "Byte"
+desc = "Byte stored at `address`."
+pad = 0
+
+[[variables.multiplicity]]
+name = "μ"
+type = "Bit"
+desc = ""
+pad = 0
+
+# Assumptions
+
+
+# Constraints
+
+[[constraint_groups]]
+name = "incoming"
+
+[[constraints.incoming]]
+kind = "interaction"
+tag = "ECALL"
+input = ["timestamp",64]
+multiplicity = ["-", "first"]
+ref = "commit:c:receive_ecall"
+
+[[constraint_groups]]
+name = "read_input"
+
+[[constraints.read_input]]
+kind = "interaction"
+tag = "MEMW"
+input = [1, ["*", 2, 11], "address", "timestamp", 1, 0, 0]
+output = "address"
+multiplicity = "first"
+ref = "commit:c:read_address"
+
+[[constraints.read_input]]
+kind = "interaction"
+tag = "MEMW"
+input = [1, ["*", 2, 12], "count", "timestamp", 1, 0, 0]
+output = "count"
+multiplicity = "first"
+ref = "commit:c:read_count"
+
+[[constraints.read_input]]
+kind = "interaction"
+tag = "MEMW"
+input = [1, ["*", 2, 10], "count", "timestamp", 1, 0, 0]
+output = 1
+multiplicity = "first"
+ref = "commit:c:read_fd_write_count"
+
+[[constraints.read_input]]
+kind = "interaction"
+tag = "MEMW"
+input = [1, ["*", 2, 254], ["+", "index", ["cast", "count", "BaseField"]], "timestamp", 0, 0, 0]
+output = "index"
+multiplicity = "first"
+ref = "commit:c:read_index"
+
+
+[[constraint_groups]]
+name = "incr_decr"
+
+[[constraints.incr_decr]]
+kind = "template"
+tag = "ADD"
+input = ["address", ["cast", 1, "DWordWL"]]
+output = ["cast", "address_incr", "DWordWL"]
+ref = "commit:c:address_incr"
+
+[[constraints.incr_decr]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "address_incr", "i"]]
+iter = ["i", 0, 3]
+multiplicity = "μ"
+ref = "commit:c:range_address_incr"
+
+[[constraints.incr_decr]]
+kind = "template"
+tag = "SUB"
+input = ["count", ["cast", 1, "DWordWL"]]
+output = ["cast", "count_decr", "DWordWL"]
+ref = "commit:c:count_decr"
+
+[[constraints.incr_decr]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "count_decr", "i"]]
+iter = ["i", 0, 3]
+multiplicity = "μ"
+ref = "commit:c:range_count_decr"
+
+
+[[constraint_groups]]
+name = "commit"
+
+[[constraints.commit]]
+kind = "interaction"
+tag = "MEWM"
+input = [0, "address", "value", "timestamp", 0, 0, 0]
+output = "value"
+multiplicity = ["-", "μ", "end"]
+ref = "commit:c:read_value"
+
+[[constraints.commit]]
+kind = "interaction"
+tag = "COMMIT"
+input = ["index", "value"]
+multiplicity = ["-", "μ", "end"]
+ref = "commit:c:commit_value"
+
+[[constraint_groups]]
+name = "end"
+
+[[constraints.end]]
+kind = "interaction"
+tag = "ZERO"
+input = [["+", ["-", 0xFFFF, ["idx", "count_decr", 0]], ["-", 0xFFFF, ["idx", "count_decr", 1]], ["-", 0xFFFF, ["idx", "count_decr", 2]], ["-", 0xFFFF, ["idx", "count_decr", 3]]]]
+output = "end"
+multiplicity = "μ"
+ref = "commit:c:end"
+
+[[constraint_groups]]
+name = "bits"
+
+[[constraints.bits]]
+kind = "template"
+tag = "IS_BIT"
+input = ["first"]
+ref = "commit:c:range_first"
+
+[[constraints.bits]]
+kind = "template"
+tag = "IS_BIT"
+input = ["end"]
+ref = "commit:c:range_end"
+
+[[constraints.bits]]
+kind = "template"
+tag = "IS_BIT"
+input = ["μ"]
+ref = "commit:c:range_mu"
+
+[[constraints.bits]]
+kind = "arith"
+constraint = "$#`first` + #`end` => #`μ` = 1$"
+poly = ["*", ["+", "first", "end"], ["not", "μ"]]
+ref = "commit:c:first_or_end_implies_mu"
+
+[[constraint_groups]]
+name = "lookups"
+
+[[constraints.lookups]]
+kind = "interaction"
+tag = "CNB"
+input = ["timestamp", ["+", "index", 1], ["cast", "address_incr", "DWordWL"], "count_decr"]
+multiplicity = ["-", "μ", "end"]
+ref = "commit:c:send_commit_next_byte"
+
+[[constraints.lookups]]
+kind = "interaction"
+tag = "CNB"
+input = ["timestamp", "index", "address", "count"]
+multiplicity = ["-", ["-", "μ", "first"]]
+ref = "commit:c:receive_commit_next_byte"
