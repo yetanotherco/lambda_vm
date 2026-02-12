@@ -43,7 +43,7 @@ use crate::test_utils::{
 };
 
 use crate::tables::page::DEFAULT_STACK_SIZE;
-use stark::proof::options::ProofOptions;
+use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
 use stark::proof::stark::MultiProof;
 
 /// A complete VM proof bundle containing the STARK proof and metadata
@@ -222,7 +222,7 @@ impl VmAirs {
 
 /// Prove an ELF binary execution. Returns a serializable proof bundle.
 pub fn prove(elf_bytes: &[u8]) -> Result<VmProof, Error> {
-    prove_with_options(elf_bytes, &ProofOptions::default_proving_options())
+    prove_with_options(elf_bytes, &GoldilocksCubicProofOptions::new(2))
 }
 
 /// Prove an ELF binary execution with custom proof options and stack size.
@@ -255,7 +255,7 @@ pub fn prove_with_options(
 
 /// Verify a proof produced by [`prove`] using default proof options.
 ///
-/// Uses [`ProofOptions::default_proving_options`] for verification — the
+/// Uses [`GoldilocksCubicProofOptions::new(4)`] for verification — the
 /// `proof_options` stored in [`VmProof`] are metadata only and NOT trusted.
 /// `stack_size` is extracted from the proof; it is safe to trust because
 /// preprocessed commitments bind the verifier to the correct page layout.
@@ -263,7 +263,7 @@ pub fn verify(vm_proof: &VmProof, elf_bytes: &[u8]) -> Result<bool, Error> {
     verify_with_options(
         vm_proof,
         elf_bytes,
-        &ProofOptions::default_proving_options(),
+        &GoldilocksCubicProofOptions::new(2),
     )
 }
 
