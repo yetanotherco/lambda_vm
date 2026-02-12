@@ -69,6 +69,13 @@ def structure_matches(a: Type, b: Type) -> bool:
         return False
 
 
+def constant_fits(cst: int, target: Type) -> bool:
+    if isinstance(target, Range):
+        return target.low <= cst <= target.high
+    else:
+        return constant_fits(cst, target[0])
+
+
 type Expr = (
     LitExpr
     | VarExpr
@@ -160,6 +167,11 @@ class CastExpr:
             baselen >= castlen or (isinstance(base, Range) and base.is_const()),
             f"Casting from fewer columns to more: {self!r} {base} {self.type}",
         )
+        if isinstance(base, Range) and base.is_const():
+            reporter.asserts(
+                constant_fits(base.get_const(), self.type),
+                f"Casting const to type it doesn't fit: {self!r}",
+            )
         return self.type
 
 
