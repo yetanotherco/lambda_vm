@@ -98,7 +98,6 @@ pub trait IsFFTField: IsField {
 /// Trait to add field behaviour to a struct.
 pub trait IsField: Debug + Clone {
     /// The underlying base type for representing elements from the field.
-    // TODO: Relax Unpin for non cuda usage
     type BaseType: Clone + Debug + Unpin + ByteConversion + Default + Send + Sync;
 
     /// Returns the sum of `a` and `b`.
