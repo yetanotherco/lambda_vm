@@ -2,8 +2,7 @@ name = "PAGE"
 
 # Input
 
-# TODO: add `page` as "constant" column or smth
-[[variables.input]]
+[[variables.constant]]
 name = "page"
 type = "DWordWL"
 desc = "Constant column containing the page base address; should be integrated into the constraints directly"
