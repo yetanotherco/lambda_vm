@@ -120,5 +120,5 @@ desc = "A preprocessed column holding the row index (zero-indexed)."
 preprocessed = true
 
 [variables.categories]
-all = ["input", "output", "auxiliary", "virtual", "multiplicity", "condition"]
+all = ["constant", "input", "output", "auxiliary", "virtual", "multiplicity", "condition"]
 instantiated = ["input", "output", "auxiliary", "multiplicity"]
