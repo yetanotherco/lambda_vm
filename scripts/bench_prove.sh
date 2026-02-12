@@ -1,7 +1,7 @@
 #!/bin/bash
 # Benchmark the prover: wall-clock time + peak heap (jemalloc).
 #
-# Usage: bench_prove.sh <elf_path> [runs=1] [base_branch=main | --single]
+# Usage: bench_prove.sh [elf_path] [runs=1] [base_branch=main | --single]
 #
 # If on a feature branch, automatically benchmarks base_branch too and prints a comparison.
 # Pass --single to skip comparison and only benchmark the current branch.
@@ -21,7 +21,8 @@ YELLOW='\033[1;33m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-ELF=${1:?Usage: bench_prove.sh <elf_path> [runs=1] [base_branch | --single]}
+DEFAULT_ELF="$ROOT_DIR/executor/program_artifacts/asm/fib_iterative_372k.elf"
+ELF=${1:-$DEFAULT_ELF}
 RUNS=${2:-1}
 BASE_BRANCH=${3:-main}
 OUTPUT="$TMP_DIR/proof.bin"
