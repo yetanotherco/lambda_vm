@@ -222,7 +222,7 @@ impl VmAirs {
 
 /// Prove an ELF binary execution. Returns a serializable proof bundle.
 pub fn prove(elf_bytes: &[u8]) -> Result<VmProof, Error> {
-    prove_with_options(elf_bytes, &GoldilocksCubicProofOptions::new(2))
+    prove_with_options(elf_bytes, &GoldilocksCubicProofOptions::with_blowup(2))
 }
 
 /// Prove an ELF binary execution with custom proof options and stack size.
@@ -263,7 +263,7 @@ pub fn verify(vm_proof: &VmProof, elf_bytes: &[u8]) -> Result<bool, Error> {
     verify_with_options(
         vm_proof,
         elf_bytes,
-        &GoldilocksCubicProofOptions::new(2),
+        &GoldilocksCubicProofOptions::with_blowup(2),
     )
 }
 

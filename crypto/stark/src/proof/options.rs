@@ -21,7 +21,7 @@ impl ProofOptions {
     /// These options should never be used in production.
     pub fn default_test_options() -> Self {
         Self {
-            blowup_factor: 4,
+            blowup_factor: 2,
             fri_number_of_queries: 3,
             coset_offset: 3,
             grinding_factor: 1,
@@ -44,14 +44,13 @@ impl ProofOptions {
 /// security bottleneck — field size is not.
 pub struct GoldilocksCubicProofOptions;
 
-#[allow(clippy::new_ret_no_self)]
 impl GoldilocksCubicProofOptions {
     const DEFAULT_GRINDING: u8 = 20;
 
     /// Create proof options targeting 128-bit security with default grinding (20 bits).
     ///
     /// `blowup_factor` must be a power of 2 >= 2 (e.g., 2, 4, 8, 16, 32, 64).
-    pub fn new(blowup_factor: u8) -> ProofOptions {
+    pub fn with_blowup(blowup_factor: u8) -> ProofOptions {
         Self::with_params(blowup_factor, 128, Self::DEFAULT_GRINDING)
     }
 
