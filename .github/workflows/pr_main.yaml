@@ -204,7 +204,7 @@ jobs:
         run: |
           cargo nextest run \
             --archive-file prover-tests.tar.zst \
-            --partition count:${{ matrix.partition }}/3 \
+            --partition hash:${{ matrix.partition }}/3 \
             --test-threads=1
 
   test-prover-comprehensive:
