@@ -88,7 +88,7 @@ jobs:
             echo "::notice::No successful run found on main"
             exit 0
           fi
-          gh run download "$RUN_ID" -D baseline/ -p "memory-metrics-*"
+          gh run download "$RUN_ID" -D baseline/ -p "memory-metrics-*" || echo "::warning::Failed to download baseline artifact"
 
       - name: Compare with baseline
         id: compare
