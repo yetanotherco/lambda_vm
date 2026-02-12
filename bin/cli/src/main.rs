@@ -79,8 +79,18 @@ fn main() -> ExitCode {
 
     match cli.command {
         Commands::Execute { elf, flamegraph } => cmd_execute(elf, flamegraph),
-        Commands::Prove { elf, output, blowup, time } => cmd_prove(elf, output, blowup, time),
-        Commands::Verify { proof, elf, blowup, time } => cmd_verify(proof, elf, blowup, time),
+        Commands::Prove {
+            elf,
+            output,
+            blowup,
+            time,
+        } => cmd_prove(elf, output, blowup, time),
+        Commands::Verify {
+            proof,
+            elf,
+            blowup,
+            time,
+        } => cmd_verify(proof, elf, blowup, time),
     }
 }
 
@@ -181,8 +191,17 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, blowup: Option<u8>, time: 
     let start = Instant::now();
     let proof = match blowup {
         Some(b) => {
-            let opts = GoldilocksCubicProofOptions::with_blowup(b);
-            eprintln!("Generating proof (blowup={b}, queries={})...", opts.fri_number_of_queries);
+            let opts = match GoldilocksCubicProofOptions::with_blowup(b) {
+                Ok(opts) => opts,
+                Err(e) => {
+                    eprintln!("Invalid proof options: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            eprintln!(
+                "Generating proof (blowup={b}, queries={})...",
+                opts.fri_number_of_queries
+            );
             prover::prove_with_options(&elf_data, &opts)
         }
         None => {
@@ -260,7 +279,13 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf, blowup: Option<u8>, time: 
     let start = Instant::now();
     let result = match blowup {
         Some(b) => {
-            let opts = GoldilocksCubicProofOptions::with_blowup(b);
+            let opts = match GoldilocksCubicProofOptions::with_blowup(b) {
+                Ok(opts) => opts,
+                Err(e) => {
+                    eprintln!("Invalid proof options: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
             prover::verify_with_options(&proof, &elf_data, &opts)
         }
         None => prover::verify(&proof, &elf_data),

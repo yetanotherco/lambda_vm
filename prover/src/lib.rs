@@ -222,7 +222,10 @@ impl VmAirs {
 
 /// Prove an ELF binary execution. Returns a serializable proof bundle.
 pub fn prove(elf_bytes: &[u8]) -> Result<VmProof, Error> {
-    prove_with_options(elf_bytes, &GoldilocksCubicProofOptions::with_blowup(2))
+    prove_with_options(
+        elf_bytes,
+        &GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid"),
+    )
 }
 
 /// Prove an ELF binary execution with custom proof options and stack size.
@@ -255,7 +258,7 @@ pub fn prove_with_options(
 
 /// Verify a proof produced by [`prove`] using default proof options.
 ///
-/// Uses [`GoldilocksCubicProofOptions::new(4)`] for verification — the
+/// Uses [`GoldilocksCubicProofOptions::with_blowup(2)`] for verification — the
 /// `proof_options` stored in [`VmProof`] are metadata only and NOT trusted.
 /// `stack_size` is extracted from the proof; it is safe to trust because
 /// preprocessed commitments bind the verifier to the correct page layout.
@@ -263,7 +266,7 @@ pub fn verify(vm_proof: &VmProof, elf_bytes: &[u8]) -> Result<bool, Error> {
     verify_with_options(
         vm_proof,
         elf_bytes,
-        &GoldilocksCubicProofOptions::with_blowup(2),
+        &GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid"),
     )
 }
 

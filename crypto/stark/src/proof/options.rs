@@ -1,5 +1,36 @@
+use core::fmt;
+
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::wasm_bindgen;
+
+/// Error returned when proof options are invalid.
+#[derive(Debug, Clone)]
+pub enum ProofOptionsError {
+    /// blowup_factor must be a power of 2 >= 2
+    InvalidBlowup(u8),
+    /// security_bits must exceed grinding_factor
+    SecurityTooLow {
+        security_bits: u8,
+        grinding_factor: u8,
+    },
+}
+
+impl fmt::Display for ProofOptionsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidBlowup(b) => {
+                write!(f, "blowup_factor must be a power of 2 >= 2, got {b}")
+            }
+            Self::SecurityTooLow {
+                security_bits,
+                grinding_factor,
+            } => write!(
+                f,
+                "security_bits ({security_bits}) must exceed grinding_factor ({grinding_factor})"
+            ),
+        }
+    }
+}
 
 /// The options for the proof
 ///
@@ -50,7 +81,7 @@ impl GoldilocksCubicProofOptions {
     /// Create proof options targeting 128-bit security with default grinding (20 bits).
     ///
     /// `blowup_factor` must be a power of 2 >= 2 (e.g., 2, 4, 8, 16, 32, 64).
-    pub fn with_blowup(blowup_factor: u8) -> ProofOptions {
+    pub fn with_blowup(blowup_factor: u8) -> Result<ProofOptions, ProofOptionsError> {
         Self::with_params(blowup_factor, 128, Self::DEFAULT_GRINDING)
     }
 
@@ -59,11 +90,16 @@ impl GoldilocksCubicProofOptions {
         blowup_factor: u8,
         security_bits: u8,
         grinding_factor: u8,
-    ) -> ProofOptions {
-        assert!(
-            blowup_factor.is_power_of_two() && blowup_factor >= 2,
-            "blowup_factor must be a power of 2 >= 2, got {blowup_factor}"
-        );
+    ) -> Result<ProofOptions, ProofOptionsError> {
+        if !blowup_factor.is_power_of_two() || blowup_factor < 2 {
+            return Err(ProofOptionsError::InvalidBlowup(blowup_factor));
+        }
+        if security_bits <= grinding_factor {
+            return Err(ProofOptionsError::SecurityTooLow {
+                security_bits,
+                grinding_factor,
+            });
+        }
 
         let rate = 1.0 / blowup_factor as f64;
         let proximity = 1.0 - rate.sqrt() - 1.0 / 300.0;
@@ -71,11 +107,11 @@ impl GoldilocksCubicProofOptions {
         let fri_number_of_queries =
             ((security_bits as f64 - grinding_factor as f64) / bits_per_query).ceil() as usize;
 
-        ProofOptions {
+        Ok(ProofOptions {
             blowup_factor,
             fri_number_of_queries,
             coset_offset: 3,
             grinding_factor,
-        }
+        })
     }
 }
