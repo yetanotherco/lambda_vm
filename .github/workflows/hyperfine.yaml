@@ -78,7 +78,8 @@ jobs:
         if: ${{ steps.cache.outputs.cache-hit != 'true' }}
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "lambda-vm"
+          shared-key: "lambda-vm-bench"
+          cache-all-crates: "true"
 
       - name: Build binary
         if: ${{ steps.cache.outputs.cache-hit != 'true' }}
