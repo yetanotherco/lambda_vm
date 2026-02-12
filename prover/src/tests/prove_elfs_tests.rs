@@ -134,8 +134,7 @@ fn test_prove_elfs_sub_fast() {
     let _ = env_logger::builder().is_test(true).try_init();
     let (elf, logs, _instructions) = run_asm_elf("sub");
     // Use from_elf_and_logs to get PAGE and REGISTER tables for Memory bus
-    let mut traces =
-        Traces::from_elf_and_logs(&elf, &logs).unwrap();
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
 
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
@@ -450,8 +449,7 @@ fn test_prove_elfs_test_xor_8() {
 #[test]
 fn test_prove_elfs_test_lb_lh_8() {
     let (elf, logs, _instructions) = run_asm_elf("test_lb_lh_8");
-    let mut traces =
-        Traces::from_elf_and_logs(&elf, &logs).unwrap();
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "test_lb_lh_8 failed"
@@ -461,8 +459,7 @@ fn test_prove_elfs_test_lb_lh_8() {
 #[test]
 fn test_prove_elfs_test_sb_sh_8() {
     let (elf, logs, _instructions) = run_asm_elf("test_sb_sh_8");
-    let mut traces =
-        Traces::from_elf_and_logs(&elf, &logs).unwrap();
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "test_sb_sh_8 failed"
@@ -492,8 +489,7 @@ fn test_prove_elfs_all_branches_16() {
 #[test]
 fn test_prove_elfs_all_loadstore_32() {
     let (elf, logs, _instructions) = run_asm_elf("all_loadstore_32");
-    let mut traces =
-        Traces::from_elf_and_logs(&elf, &logs).unwrap();
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "all_loadstore_32 failed"
@@ -914,8 +910,7 @@ fn test_debug_memory_tokens_sb_sh() {
     use std::collections::HashMap;
 
     let (elf, logs, _instructions) = run_asm_elf("test_sb_sh_8");
-    let traces =
-        Traces::from_elf_and_logs(&elf, &logs).unwrap();
+    let traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
 
     println!("DEBUG: test_sb_sh_8 Memory bus tokens (FULL)");
     println!("  MEMW rows: {}", traces.memw.num_rows());
@@ -1313,8 +1308,8 @@ fn test_deep_stack_runtime_pages_roundtrip() {
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
 
     let proof_options = ProofOptions::default_test_options();
-    let executor = executor::vm::execution::Executor::new(&elf, vec![])
-        .expect("Failed to create executor");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
     let mut traces = Traces::from_elf_and_logs(&elf, &result.logs).unwrap();
 
@@ -1357,8 +1352,8 @@ fn test_deep_stack_missing_pages_rejected() {
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
 
     let proof_options = ProofOptions::default_test_options();
-    let executor = executor::vm::execution::Executor::new(&elf, vec![])
-        .expect("Failed to create executor");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
     let mut traces = Traces::from_elf_and_logs(&elf, &result.logs).unwrap();
 
@@ -1401,7 +1396,9 @@ fn test_heap_alloc_passes() {
     let ranges = traces.runtime_page_ranges(&elf);
     // 4 contiguous heap pages (0x80000..0x83000) should be one range
     assert!(
-        ranges.iter().any(|&(base, count)| base == 0x80000 && count == 4),
+        ranges
+            .iter()
+            .any(|&(base, count)| base == 0x80000 && count == 4),
         "Expected contiguous heap range (0x80000, 4), got {:?}",
         ranges
     );
@@ -1420,8 +1417,8 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
     let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
 
     let proof_options = ProofOptions::default_test_options();
-    let executor = executor::vm::execution::Executor::new(&elf, vec![])
-        .expect("Failed to create executor");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
     let mut traces = Traces::from_elf_and_logs(&elf, &result.logs).unwrap();
 
@@ -1443,8 +1440,7 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
     .expect("Prover failed");
 
     // Verifier reconstructs from ELF + runtime hint (ranges decoded to pages)
-    let verifier_configs =
-        Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges);
+    let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges);
     let verifier_airs = crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs);
 
     let verified = Verifier::multi_verify(

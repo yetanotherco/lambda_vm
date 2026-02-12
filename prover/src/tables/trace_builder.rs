@@ -929,10 +929,7 @@ fn collect_bitwise_from_branch(branch_ops: &[BranchOperation]) -> Vec<BitwiseOpe
 /// - C2: IS_BYTE[fini] for finalization range check
 ///
 /// This must be called BEFORE bitwise multiplicities are updated.
-fn collect_bitwise_from_page(
-    elf: &Elf,
-    memory_state: &MemoryState,
-) -> Vec<BitwiseOperation> {
+fn collect_bitwise_from_page(elf: &Elf, memory_state: &MemoryState) -> Vec<BitwiseOperation> {
     use std::collections::BTreeSet;
 
     let page_size = page::DEFAULT_PAGE_SIZE;
@@ -1179,7 +1176,10 @@ impl Traces {
         let page_size = page::DEFAULT_PAGE_SIZE;
         for &(base, count) in runtime_page_ranges {
             for i in 0..count {
-                configs.push(PageConfig::zero_init(base + i * page_size as u64, page_size));
+                configs.push(PageConfig::zero_init(
+                    base + i * page_size as u64,
+                    page_size,
+                ));
             }
         }
         configs
@@ -1247,10 +1247,7 @@ impl Traces {
     /// 3. MEMW → LT operations (timestamp ordering)
     /// 4. LT, MEMW, Branch → Bitwise lookups
     /// 5. Generate all traces including PAGE tables
-    pub fn from_elf_and_logs(
-        elf: &Elf,
-        logs: &[Log],
-    ) -> Result<Self, Error> {
+    pub fn from_elf_and_logs(elf: &Elf, logs: &[Log]) -> Result<Self, Error> {
         // =====================================================================
         // PHASE 0: ELF → DECODE + instructions
         // =====================================================================
