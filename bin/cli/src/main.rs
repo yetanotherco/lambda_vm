@@ -7,6 +7,9 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use clap::{Parser, Subcommand, ValueHint};
+
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use executor::{
     elf::{Elf, SymbolTable},
     flamegraph::FlamegraphGenerator,
@@ -14,6 +17,74 @@ use executor::{
 };
 use prover::VmProof;
 use stark::proof::options::GoldilocksCubicProofOptions;
+
+/// Polls jemalloc `stats.allocated` every 10ms from a background thread,
+/// tracking the high-water mark. Near-zero overhead because jemalloc uses
+/// thread-local caches — `epoch::advance()` just merges cached counters.
+#[cfg(feature = "jemalloc-stats")]
+mod heap_tracker {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::thread;
+    use std::time::Duration;
+
+    use tikv_jemalloc_ctl::{epoch, stats};
+
+    pub struct HeapTracker {
+        stop: Arc<AtomicBool>,
+        peak: Arc<AtomicUsize>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl HeapTracker {
+        pub fn start() -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let stop_clone = stop.clone();
+            let peak_clone = peak.clone();
+
+            let handle = thread::spawn(move || {
+                while !stop_clone.load(Ordering::Relaxed) {
+                    // Refresh jemalloc's cached stats
+                    epoch::advance().ok();
+                    if let Ok(allocated) = stats::allocated::read() {
+                        peak_clone.fetch_max(allocated, Ordering::Relaxed);
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                // One final sample after stop signal
+                epoch::advance().ok();
+                if let Ok(allocated) = stats::allocated::read() {
+                    peak_clone.fetch_max(allocated, Ordering::Relaxed);
+                }
+            });
+
+            Self {
+                stop,
+                peak,
+                handle: Some(handle),
+            }
+        }
+
+        pub fn stop(mut self) -> usize {
+            self.shutdown();
+            self.peak.load(Ordering::Relaxed)
+        }
+
+        fn shutdown(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(h) = self.handle.take() {
+                h.join().ok();
+            }
+        }
+    }
+
+    impl Drop for HeapTracker {
+        fn drop(&mut self) {
+            self.shutdown();
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(author, version, about = "Lambda VM - RISC-V zkVM", long_about = None)]
@@ -188,6 +259,9 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, blowup: Option<u8>, time: 
         }
     };
 
+    #[cfg(feature = "jemalloc-stats")]
+    let tracker = heap_tracker::HeapTracker::start();
+
     let start = Instant::now();
     let proof = match blowup {
         Some(b) => {
@@ -244,6 +318,11 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, blowup: Option<u8>, time: 
     eprintln!("Proof written to {:?}", output_path);
     if time {
         println!("Proving time: {:.3}s", prove_elapsed.as_secs_f64());
+    }
+    #[cfg(feature = "jemalloc-stats")]
+    {
+        let peak_bytes = tracker.stop();
+        println!("Peak heap: {} MB", peak_bytes / (1024 * 1024));
     }
     ExitCode::SUCCESS
 }
