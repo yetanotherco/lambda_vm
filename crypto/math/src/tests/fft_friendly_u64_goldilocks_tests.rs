@@ -271,7 +271,7 @@ fn test_from_i64_max_value() {
     assert_eq!(max_val, expected);
 }
 
-#[cfg(all(feature = "std", not(feature = "instruments"), not(feature = "cuda")))]
+#[cfg(all(feature = "std", not(feature = "instruments")))]
 mod fft_tests {
     use super::*;
     use crate::fft::cpu::roots_of_unity::{
