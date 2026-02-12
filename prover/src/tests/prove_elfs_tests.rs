@@ -134,7 +134,8 @@ fn test_prove_elfs_sub_fast() {
     let _ = env_logger::builder().is_test(true).try_init();
     let (elf, logs, _instructions) = run_asm_elf("sub");
     // Use from_elf_and_logs to get PAGE and REGISTER tables for Memory bus
-    let mut traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
+    let mut traces =
+        Traces::from_elf_and_logs(&elf, &logs, crate::tables::page::DEFAULT_STACK_SIZE).unwrap();
 
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
@@ -449,7 +450,8 @@ fn test_prove_elfs_test_xor_8() {
 #[test]
 fn test_prove_elfs_test_lb_lh_8() {
     let (elf, logs, _instructions) = run_asm_elf("test_lb_lh_8");
-    let mut traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
+    let mut traces =
+        Traces::from_elf_and_logs(&elf, &logs, crate::tables::page::DEFAULT_STACK_SIZE).unwrap();
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "test_lb_lh_8 failed"
@@ -459,7 +461,8 @@ fn test_prove_elfs_test_lb_lh_8() {
 #[test]
 fn test_prove_elfs_test_sb_sh_8() {
     let (elf, logs, _instructions) = run_asm_elf("test_sb_sh_8");
-    let mut traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
+    let mut traces =
+        Traces::from_elf_and_logs(&elf, &logs, crate::tables::page::DEFAULT_STACK_SIZE).unwrap();
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "test_sb_sh_8 failed"
@@ -489,7 +492,8 @@ fn test_prove_elfs_all_branches_16() {
 #[test]
 fn test_prove_elfs_all_loadstore_32() {
     let (elf, logs, _instructions) = run_asm_elf("all_loadstore_32");
-    let mut traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
+    let mut traces =
+        Traces::from_elf_and_logs(&elf, &logs, crate::tables::page::DEFAULT_STACK_SIZE).unwrap();
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "all_loadstore_32 failed"
@@ -541,36 +545,6 @@ fn test_prove_elfs_all_instructions_64_full() {
     assert!(
         result,
         "all_instructions_64_full failed - comprehensive test with full bitwise table"
-    );
-}
-
-/// Memory profiling test using dhat.
-///
-/// Run with:
-/// ```
-/// cargo test -p prover --release --features dhat-heap test_dhat_memory_profile -- --ignored --nocapture
-/// ```
-///
-/// This generates `dhat-heap.json` which can be viewed with:
-/// https://nnethercote.github.io/dh_view/dh_view.html
-#[test]
-#[ignore]
-fn test_dhat_memory_profile() {
-    #[cfg(feature = "dhat-heap")]
-    let _profiler = dhat::Profiler::new_heap();
-
-    let program_name = "loop_4096";
-    let (elf, logs, instructions) = run_asm_elf(program_name);
-
-    // Output metadata for CI parsing
-    println!("MEMORY_PROFILE_PROGRAM={}", program_name);
-    println!("MEMORY_PROFILE_INSTRUCTIONS={}", logs.len());
-
-    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone()).unwrap();
-
-    assert!(
-        prove_and_verify_vm_minimal(&elf, &mut traces),
-        "verification failed"
     );
 }
 
@@ -910,7 +884,8 @@ fn test_debug_memory_tokens_sb_sh() {
     use std::collections::HashMap;
 
     let (elf, logs, _instructions) = run_asm_elf("test_sb_sh_8");
-    let traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
+    let traces =
+        Traces::from_elf_and_logs(&elf, &logs, crate::tables::page::DEFAULT_STACK_SIZE).unwrap();
 
     println!("DEBUG: test_sb_sh_8 Memory bus tokens (FULL)");
     println!("  MEMW rows: {}", traces.memw.num_rows());
@@ -1286,7 +1261,8 @@ fn test_page_trace_values_debug() {
     use crate::tables::page::cols as page_cols;
 
     let (elf, logs, _instructions) = run_asm_elf("test_sb_sh_8");
-    let traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
+    let traces =
+        Traces::from_elf_and_logs(&elf, &logs, crate::tables::page::DEFAULT_STACK_SIZE).unwrap();
 
     println!("=== Checking PAGE trace values for stack addresses ===");
 
@@ -1353,7 +1329,8 @@ fn test_page_trace_values_debug() {
 #[ignore] // Intentionally removes 3 of 4 PAGE tables, so Memory bus won't balance
 fn test_single_page_table_balance() {
     let (elf, logs, _instructions) = run_asm_elf("test_sb_sh_8");
-    let mut traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
+    let mut traces =
+        Traces::from_elf_and_logs(&elf, &logs, crate::tables::page::DEFAULT_STACK_SIZE).unwrap();
 
     println!("Original PAGE tables: {}", traces.pages.len());
     println!("PAGE configs:");
@@ -1387,4 +1364,36 @@ fn test_single_page_table_balance() {
         if result { "PASSED" } else { "FAILED" }
     );
     assert!(result, "Single PAGE table test failed");
+}
+
+// =============================================================================
+// Deep stack tests (page coverage)
+// =============================================================================
+
+/// deep_stack allocates 8192 bytes, writing at SP = 0x...DFF0 (page D000).
+/// Default stack_size=4096 only creates pages E000+F000, so page D000 is
+/// missing and the memory bus cannot balance → verification must fail.
+#[test]
+fn test_deep_stack_default_stack_size_fails() {
+    let (elf, logs, _instructions) = run_asm_elf("deep_stack");
+    let mut traces =
+        Traces::from_elf_and_logs(&elf, &logs, crate::tables::page::DEFAULT_STACK_SIZE).unwrap();
+
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "deep_stack should FAIL with default stack_size (page D000 not initialized)"
+    );
+}
+
+/// Same program but with stack_size=8192, which adds page D000.
+/// All accessed addresses are now covered → verification must succeed.
+#[test]
+fn test_deep_stack_large_stack_size_passes() {
+    let (elf, logs, _instructions) = run_asm_elf("deep_stack");
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs, 8192).unwrap();
+
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "deep_stack should PASS with stack_size=8192 (page D000 initialized)"
+    );
 }
