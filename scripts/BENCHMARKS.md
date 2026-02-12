@@ -1,12 +1,12 @@
 # Benchmarking
 
-## Quick benchmark (default: 1 run)
+## Quick benchmark (default: fib_iterative_372k, 1 run)
 
 ```bash
-scripts/bench_prove.sh executor/program_artifacts/asm/fib_iterative_372k.elf
+scripts/bench_prove.sh
 ```
 
-## More samples if needed
+## More samples
 
 ```bash
 scripts/bench_prove.sh executor/program_artifacts/asm/fib_iterative_372k.elf 3
@@ -14,11 +14,17 @@ scripts/bench_prove.sh executor/program_artifacts/asm/fib_iterative_372k.elf 3
 
 ## Branch comparison
 
-Run from a feature branch to automatically build both branches and compare:
+Run from a feature branch to automatically compare against main:
 
 ```bash
 git checkout feat/my-feature
 scripts/bench_prove.sh executor/program_artifacts/asm/fib_iterative_372k.elf 3
+```
+
+## Single branch (no comparison)
+
+```bash
+scripts/bench_prove.sh executor/program_artifacts/asm/fib_iterative_372k.elf 3 --no-compare
 ```
 
 Output:
@@ -40,7 +46,6 @@ Runs: 3
 
 - **Peak heap** (deterministic): jemalloc `stats.allocated` high-water mark, polled every 10ms from a background thread. Same value every run for the same code.
 - **Time**: wall-clock proving time from the CLI `--time` flag.
-- Peak RSS is collected in raw data (`/tmp/bench_prove/`) but not shown in the summary — it's noisy and varies across runs.
 
 ## How it works
 

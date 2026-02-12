@@ -1,10 +1,10 @@
 #!/bin/bash
 # Benchmark the prover: wall-clock time + peak heap (jemalloc).
 #
-# Usage: bench_prove.sh [elf_path] [runs=1] [base_branch=main | --single]
+# Usage: bench_prove.sh [elf_path] [runs=1] [base_branch=main | --no-compare]
 #
 # If on a feature branch, automatically benchmarks base_branch too and prints a comparison.
-# Pass --single to skip comparison and only benchmark the current branch.
+# Pass --no-compare to skip comparison and only benchmark the current branch.
 #
 # Peak heap is deterministic (jemalloc stats.allocated high-water mark, 10ms polling).
 # Peak RSS is collected in raw data for reference but not shown in summary (it's noisy).
@@ -56,7 +56,7 @@ build_branch() {
 }
 
 COMPARE=false
-if [ "$BASE_BRANCH" = "--single" ] || [ "$CURRENT_BRANCH" = "$BASE_BRANCH" ]; then
+if [ "$BASE_BRANCH" = "--no-compare" ] || [ "$CURRENT_BRANCH" = "$BASE_BRANCH" ]; then
     build_branch "$CURRENT_BRANCH" "current"
 else
     COMPARE=true
