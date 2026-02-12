@@ -42,7 +42,6 @@ use crate::test_utils::{
     create_mul_air, create_page_air, create_register_air,
 };
 
-use crate::tables::page::DEFAULT_STACK_SIZE;
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
 use stark::proof::stark::MultiProof;
 
@@ -52,9 +51,10 @@ use stark::proof::stark::MultiProof;
 pub struct VmProof {
     /// The multi-table STARK proof.
     pub proof: MultiProof<F, E, ()>,
-    /// Stack size used during proving (bytes). The verifier uses this to
-    /// reconstruct the PAGE table layout.
-    pub stack_size: u64,
+    /// Sorted list of runtime page base addresses (zero-initialized pages
+    /// accessed during execution but not covered by ELF segments).
+    /// Includes stack, heap, and any other dynamically accessed pages.
+    pub runtime_page_bases: Vec<u64>,
 }
 
 /// Error type for the prover crate.
@@ -239,10 +239,12 @@ pub fn prove_with_options(
         .run()
         .map_err(|e| Error::Execution(format!("{e}")))?;
 
-    // Generate all traces from ELF and execution logs
-    // This uses the combined ELF processing to generate DECODE and PAGE tables
-    let mut traces = Traces::from_elf_and_logs(&program, &result.logs, DEFAULT_STACK_SIZE)?;
+    // Generate all traces from ELF and execution logs.
+    // Page tables are derived from the prover's MemoryState (all accessed pages).
+    let mut traces = Traces::from_elf_and_logs(&program, &result.logs)?;
     let airs = VmAirs::new(&program, proof_options, false, &traces.page_configs);
+
+    let runtime_page_bases = traces.runtime_page_bases(&program);
 
     let proof = Prover::multi_prove(
         airs.air_trace_pairs(&mut traces),
@@ -252,16 +254,15 @@ pub fn prove_with_options(
 
     Ok(VmProof {
         proof,
-        stack_size: DEFAULT_STACK_SIZE,
+        runtime_page_bases,
     })
 }
 
 /// Verify a proof produced by [`prove`] using default proof options.
 ///
-/// Uses [`GoldilocksCubicProofOptions::with_blowup(2)`] for verification — the
-/// `proof_options` stored in [`VmProof`] are metadata only and NOT trusted.
-/// `stack_size` is extracted from the proof; it is safe to trust because
-/// preprocessed commitments bind the verifier to the correct page layout.
+/// Uses [`GoldilocksCubicProofOptions::with_blowup(2)`] for verification.
+/// `runtime_page_bases` from the proof are hints — preprocessed commitments
+/// bind the verifier to the correct page layout.
 pub fn verify(vm_proof: &VmProof, elf_bytes: &[u8]) -> Result<bool, Error> {
     verify_with_options(
         vm_proof,
@@ -281,7 +282,8 @@ pub fn verify_with_options(
     proof_options: &ProofOptions,
 ) -> Result<bool, Error> {
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
-    let page_configs = Traces::page_configs_from_elf(&program, vm_proof.stack_size);
+    let page_configs =
+        Traces::page_configs_from_elf_and_runtime(&program, &vm_proof.runtime_page_bases);
     let airs = VmAirs::new(&program, proof_options, false, &page_configs);
 
     Ok(Verifier::multi_verify(

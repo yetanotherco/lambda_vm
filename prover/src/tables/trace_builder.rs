@@ -21,7 +21,7 @@
 //! ```ignore
 //! use lambda_vm_prover::tables::trace_builder::Traces;
 //!
-//! let traces = Traces::from_elf_and_logs(&elf, &logs, 4096)?;
+//! let traces = Traces::from_elf_and_logs(&elf, &logs)?;
 //! // Use traces.cpu, traces.bitwise, traces.lt, traces.memw, traces.load, traces.memory_init
 //! ```
 
@@ -932,15 +932,13 @@ fn collect_bitwise_from_branch(branch_ops: &[BranchOperation]) -> Vec<BitwiseOpe
 fn collect_bitwise_from_page(
     elf: &Elf,
     memory_state: &MemoryState,
-    stack_size: u64,
 ) -> Vec<BitwiseOperation> {
     use std::collections::BTreeSet;
 
     let page_size = page::DEFAULT_PAGE_SIZE;
     let mut bitwise_ops = Vec::new();
 
-    // Collect all pages needed from ELF segments and build init data
-    let mut page_bases: BTreeSet<u64> = BTreeSet::new();
+    // Collect ELF page init data
     let mut elf_page_data: HashMap<u64, Vec<u8>> = HashMap::new();
 
     for segment in &elf.data {
@@ -953,8 +951,6 @@ fn collect_bitwise_from_page(
                 let page_base = page::page_base_for_address(byte_addr, page_size);
                 let offset = page::offset_in_page(byte_addr, page_size);
 
-                page_bases.insert(page_base);
-
                 let page_data = elf_page_data
                     .entry(page_base)
                     .or_insert_with(|| vec![0u8; page_size]);
@@ -963,14 +959,10 @@ fn collect_bitwise_from_page(
         }
     }
 
-    // Add stack pages covering from STACK_TOP down to stack_bottom
-    // (same as in generate_page_tables)
-    let stack_bottom = page::STACK_TOP - stack_size;
-    let stack_top_page = page::page_base_for_address(page::STACK_TOP, page_size);
-    page_bases.insert(stack_top_page);
-    let stack_bottom_page = page::page_base_for_address(stack_bottom, page_size);
-    if stack_bottom_page != stack_top_page {
-        page_bases.insert(stack_bottom_page);
+    // Derive ALL page bases from memory_state (includes ELF + runtime pages)
+    let mut page_bases: BTreeSet<u64> = BTreeSet::new();
+    for &addr in memory_state.cells.keys() {
+        page_bases.insert(page::page_base_for_address(addr, page_size));
     }
 
     // Build final state map from memory_state
@@ -1016,15 +1008,12 @@ fn collect_bitwise_from_page(
 
 /// Generates PAGE tables for memory initialization and finalization.
 ///
-/// Creates one PAGE table per memory page covering:
-/// 1. ELF segments (code, data, BSS)
-/// 2. Stack region (from STACK_TOP - stack_size to STACK_TOP)
-///
-/// Each PAGE table contains initial values from ELF and final state from execution.
+/// Derives all page bases from `memory_state.cells.keys()` — this includes
+/// every address accessed during execution (ELF init + runtime stores/loads).
+/// ELF pages get their init data from the binary; all others are zero-init.
 fn generate_page_tables(
     elf: &Elf,
     memory_state: &MemoryState,
-    stack_size: u64,
 ) -> (
     Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
     Vec<PageConfig>,
@@ -1033,15 +1022,13 @@ fn generate_page_tables(
 
     let page_size = page::DEFAULT_PAGE_SIZE;
 
-    // Collect all pages needed from ELF segments
-    let mut page_bases: BTreeSet<u64> = BTreeSet::new();
+    // Collect ELF page init data (needed for PageConfig::with_data)
     let mut elf_page_data: HashMap<u64, Vec<u8>> = HashMap::new();
 
     for segment in &elf.data {
         for (i, &word) in segment.values.iter().enumerate() {
             let word_addr = segment.base_addr + (i as u64 * 4);
 
-            // For each byte in the 32-bit word
             for byte_offset in 0..4u64 {
                 let byte_addr = word_addr + byte_offset;
                 let byte_value = ((word >> (byte_offset * 8)) & 0xFF) as u8;
@@ -1049,9 +1036,6 @@ fn generate_page_tables(
                 let page_base = page::page_base_for_address(byte_addr, page_size);
                 let offset = page::offset_in_page(byte_addr, page_size);
 
-                page_bases.insert(page_base);
-
-                // Store initial values for this page
                 let page_data = elf_page_data
                     .entry(page_base)
                     .or_insert_with(|| vec![0u8; page_size]);
@@ -1060,16 +1044,10 @@ fn generate_page_tables(
         }
     }
 
-    // Add stack pages covering from STACK_TOP down to stack_bottom
-    // Stack grows downward from STACK_TOP, so we need pages for both ends
-    let stack_bottom = page::STACK_TOP - stack_size;
-    // Add page containing STACK_TOP (where SP starts and first accesses happen)
-    let stack_top_page = page::page_base_for_address(page::STACK_TOP, page_size);
-    page_bases.insert(stack_top_page);
-    // Also add page containing stack_bottom (in case stack grows that far)
-    let stack_bottom_page = page::page_base_for_address(stack_bottom, page_size);
-    if stack_bottom_page != stack_top_page {
-        page_bases.insert(stack_bottom_page);
+    // Derive ALL page bases from memory_state (includes ELF + runtime pages)
+    let mut page_bases: BTreeSet<u64> = BTreeSet::new();
+    for &addr in memory_state.cells.keys() {
+        page_bases.insert(page::page_base_for_address(addr, page_size));
     }
 
     // Build final state map from memory_state
@@ -1145,26 +1123,18 @@ pub struct Traces {
 }
 
 impl Traces {
-    /// Extract page configurations from ELF without execution.
+    /// Extract page configurations from ELF only (deterministic from binary).
     ///
-    /// Used by verifier to reconstruct PAGE AIRs when page layout is deterministic
-    /// (i.e., no dynamic heap allocation). This extracts just the page layout
-    /// (page_base addresses) from ELF, without generating trace data.
-    ///
-    /// Same logic as `generate_page_tables()` but only returns configs, not traces.
-    ///
-    /// # Note
-    /// For full production use, page_configs should be embedded in proof public inputs
-    /// to handle dynamic heap allocation. This function works for programs that only
-    /// use ELF segments and stack.
-    pub fn page_configs_from_elf(elf: &Elf, stack_size: u64) -> Vec<PageConfig> {
+    /// Returns PageConfigs for pages covered by ELF segments, with their
+    /// init data populated. Used by the verifier to reconstruct the ELF
+    /// portion of the PAGE table layout.
+    pub fn page_configs_from_elf(elf: &Elf) -> Vec<PageConfig> {
         use std::collections::BTreeSet;
 
         let page_size = page::DEFAULT_PAGE_SIZE;
         let mut page_bases: BTreeSet<u64> = BTreeSet::new();
         let mut elf_page_data: HashMap<u64, Vec<u8>> = HashMap::new();
 
-        // Collect pages from ELF data segments with init data
         for segment in &elf.data {
             for (i, &word) in segment.values.iter().enumerate() {
                 let word_addr = segment.base_addr + (i as u64 * 4);
@@ -1183,15 +1153,6 @@ impl Traces {
             }
         }
 
-        // Add stack pages (same logic as generate_page_tables)
-        let stack_bottom = page::STACK_TOP - stack_size;
-        let stack_top_page = page::page_base_for_address(page::STACK_TOP, page_size);
-        page_bases.insert(stack_top_page);
-        let stack_bottom_page = page::page_base_for_address(stack_bottom, page_size);
-        if stack_bottom_page != stack_top_page {
-            page_bases.insert(stack_bottom_page);
-        }
-
         page_bases
             .into_iter()
             .map(|base| {
@@ -1204,6 +1165,52 @@ impl Traces {
             .collect()
     }
 
+    /// Reconstruct page configs from ELF and runtime page bases.
+    ///
+    /// Used by the verifier to reconstruct the full PAGE table layout.
+    /// Combines deterministic ELF pages with prover-provided runtime
+    /// page bases (zero-initialized: stack, heap, etc.).
+    pub fn page_configs_from_elf_and_runtime(
+        elf: &Elf,
+        runtime_page_bases: &[u64],
+    ) -> Vec<PageConfig> {
+        let mut configs = Self::page_configs_from_elf(elf);
+        for &base in runtime_page_bases {
+            configs.push(PageConfig::zero_init(base, page::DEFAULT_PAGE_SIZE));
+        }
+        configs
+    }
+
+    /// Extracts runtime page bases from the generated page configs.
+    ///
+    /// Returns the sorted list of page base addresses that are not covered
+    /// by ELF segments (i.e., stack, heap, and other runtime pages).
+    pub fn runtime_page_bases(&self, elf: &Elf) -> Vec<u64> {
+        use std::collections::BTreeSet;
+
+        // Build set of ELF page bases (deterministic from binary)
+        let page_size = page::DEFAULT_PAGE_SIZE;
+        let mut elf_bases: BTreeSet<u64> = BTreeSet::new();
+
+        for segment in &elf.data {
+            for (i, _) in segment.values.iter().enumerate() {
+                let word_addr = segment.base_addr + (i as u64 * 4);
+                for byte_offset in 0..4u64 {
+                    let byte_addr = word_addr + byte_offset;
+                    let page_base = page::page_base_for_address(byte_addr, page_size);
+                    elf_bases.insert(page_base);
+                }
+            }
+        }
+
+        // Filter page_configs for bases not in the ELF set
+        self.page_configs
+            .iter()
+            .filter(|config| !elf_bases.contains(&config.page_base))
+            .map(|config| config.page_base)
+            .collect()
+    }
+
     /// Generates all traces from ELF and execution logs using phased collection.
     ///
     /// The phases are:
@@ -1213,7 +1220,10 @@ impl Traces {
     /// 3. MEMW → LT operations (timestamp ordering)
     /// 4. LT, MEMW, Branch → Bitwise lookups
     /// 5. Generate all traces including PAGE tables
-    pub fn from_elf_and_logs(elf: &Elf, logs: &[Log], stack_size: u64) -> Result<Self, Error> {
+    pub fn from_elf_and_logs(
+        elf: &Elf,
+        logs: &[Log],
+    ) -> Result<Self, Error> {
         // =====================================================================
         // PHASE 0: ELF → DECODE + instructions
         // =====================================================================
@@ -1316,7 +1326,7 @@ impl Traces {
         bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops));
         bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
         // PAGE tables do IS_BYTE lookups for init and fini values (C1, C2)
-        bitwise_ops.extend(collect_bitwise_from_page(elf, &memory_state, stack_size));
+        bitwise_ops.extend(collect_bitwise_from_page(elf, &memory_state));
 
         // =====================================================================
         // PHASE 5: Generate final traces
@@ -1352,7 +1362,7 @@ impl Traces {
         decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
 
         // Generate PAGE tables from ELF and final memory state
-        let (pages, page_configs) = generate_page_tables(elf, &memory_state, stack_size);
+        let (pages, page_configs) = generate_page_tables(elf, &memory_state);
 
         // Generate REGISTER table from final register state
         let register_final_state = register_state.to_final_state_map();
