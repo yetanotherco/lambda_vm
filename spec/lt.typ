@@ -14,6 +14,8 @@
 
 #show: book-page(chip.name)
 
+The LT chip constrains an indicator bit for the less-than relation, signed or unsigned.
+
 = Columns
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)

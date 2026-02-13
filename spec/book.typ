@@ -35,6 +35,7 @@
 
 #let common-formatting(body) = {
   set footnote(numbering: "[1]")
+  show raw.where(block: true): it => block(it, inset: 1em, width: 100%, radius: 5pt)
   body
 }
 

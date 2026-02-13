@@ -14,6 +14,9 @@
 
 #show: book-page(chip.name)
 
+The CPU chip is coordinates memory accesses and dispatches to other chips for arithmetic and logical operations.
+It bases its decisions on the entry of the DECODE table (@decode) corresponding the the current program counter (PC).
+
 = Columns
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
@@ -28,8 +31,6 @@ The `CPU` chip is comprised of #nr_variables variables that are expressed using 
 First, we perform a decoding lookup for the current PC.
 
 #render_constraint_table(chip, config, groups: "decode")
-
-#rj[All casts for interactions will have to be reviewed once other chip interfaces stabilise]
 
 == Range checks
 

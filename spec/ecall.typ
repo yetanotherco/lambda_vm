@@ -12,7 +12,9 @@
 #let config = load_config()
 
 #show: book-page("ecall.typ")
-= About `ECALL`
+
+ECALLs provide system-level functionalities to the guest program.
+
 When `ECALL` is executed, it is assumed that:
 - register `A7` contains the system call number
   #footnote([The RISC-V system call ABI; libriscv.no, #link("https://web.archive.org/web/20260128152107/https://libriscv.no/docs/concepts/syscalls/#the-risc-v-system-call-abi")[[src]]]),
@@ -90,12 +92,11 @@ This is why @commit:c:receive_ecall has multiplicity $-#`first`$.
 
 The `write` operation --- writing to a file descriptor --- has the following signature:
 #footnote([Linux man-page on `write`; man7.org, version 6.16, 2025-10-29. #link("https://man7.org/linux/man-pages/man2/write.2.html")[[src]]])
-#[
-#show raw.where(block: true): it => block(it, fill: luma(230), inset: 1em, width: 100%, radius: 5pt)
+
 ```c
 ssize_t write(size_t count; int fd, const void buf[count], size_t count);
 ```
-]
+
 That is to say,
 - `A0` contains the file descriptor,
 - `A1` contains the address of `buf`'s first byte, 

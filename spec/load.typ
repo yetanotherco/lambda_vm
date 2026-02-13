@@ -14,6 +14,9 @@
 
 #show: book-page(chip.name)
 
+The LOAD chip provides functionality to read values from memory and sign-extend them where appropriate.
+It delegates to the MEMW chip (@memw) for lower level memory handling.
+
 = Columns
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)

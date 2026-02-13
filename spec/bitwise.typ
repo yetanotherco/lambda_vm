@@ -15,6 +15,9 @@
 
 #show: book-page(chip.name)
 
+The bitwise chips deal with precomputed lookup tables for bitwise boolean operations
+and convenience functionalities over small domains.
+
 = Columns
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)

@@ -12,6 +12,7 @@
 
 #show: common-formatting
 #show heading: set heading(numbering: "1.1")
+#show raw.where(block: true): set block(fill: luma(230))
 
 #meta.summary.map(((ch, title, ref)) => [
   #pagebreak(weak: true)

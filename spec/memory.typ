@@ -107,7 +107,8 @@ This raises the question of how to represent timestamps and cleanly perform this
 as over a finite field the “less than” relation is ill-defined
 (though it is common and natural to consider it as the less than relation over the natural lift of the field into the integers).
 We choose to represent timestamps as machine words, using the existing `LT` chip (@lt) functionality for comparisons.
-#rj[Properly link/refer to the LT chip]
+The full implementation of the timestamp system can be seen in the `timestamp` column of the CPU (@cpu) and MEMW chips (@memw).
+The CPU merely passes in the current timestamp, while MEMW can recall the previously written timestamp and constrain the correct sequencing.
 
 #aside[Note on options and trade-offs for timestamp representation][
  #grid(columns: (1fr, 1fr), gutter: 1em)[#align(center, emph[Machine word])][#align(center, emph[Field element])][
@@ -122,8 +123,6 @@ We choose to represent timestamps as machine words, using the existing `LT` chip
     - Increments and basic arithmetic operations are cheap
   ]
 ]
-
-#rj[reference to CPU chip/timestamp column and MEMW chip]
 
 = Initialization and Finalization
 
@@ -213,11 +212,10 @@ and hence doesn't need a column, nor a range check.
 
 == Register initialization/finalization
 
-#rj[Properly link/reference ECALL/HALT chip]
 The initial and final state of registers can be entirely known by
 the verifier, since the relevant initialization values are either zero,
 or embedded in the ELF, and the final values can be set to a known value
-by the HALT ecall.
+by the HALT ecall (@ecall).
 As additionally, the number of registers is small, the verifier can directly
 add the required balancing terms to the LogUp sum.
 

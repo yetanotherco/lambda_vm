@@ -14,6 +14,8 @@
 
 #show: book-page(chip.name)
 
+The BRANCH chip computes the target address of a branching instruction.
+
 = Columns
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
@@ -27,7 +29,6 @@ The `BRANCH` chip is comprised of #nr_variables variables that are expressed usi
 
 = Constraints
 
-#rj[Check correspondence with CPU for passing in `offset` as word or dword]
 We constrain `next_pc` to be $#`base_address` + #`offset`$,
 where `base_address` equals `pc` when $#`JALR` = 0$ and `register` otherwise.
 

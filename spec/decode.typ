@@ -84,8 +84,9 @@ To indicate an instruction is provided in compressed form, the `c_type` flag is 
     inset: (right: .5em),
     align: (left, right, center, center, left, right),
     fill: (_, y) =>
-      if calc.odd(y) and y <= lines.len() { luma(245) }
-      else { white },
+      // Overlay a low-opacity fill color to distinguish the different rows better
+      if calc.odd(y) and y <= lines.len() { color.rgb(0, 0, 100, 20) }
+      else { color.rgb(0, 0, 0, 0) },
     table.header([*Operation*], [*op-flag*], [*`w_instr`*], [*`signed`*], [*other*], []),
     table.hline(stroke: 1.5pt),
     table.vline(x: 1, start: 1, end: lines.len() + 1, stroke: .5pt),

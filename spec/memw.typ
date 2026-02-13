@@ -13,6 +13,11 @@
 
 #show: book-page(chip.name)
 
+The MEMW chip is used to read and write memory locations (both RAM and registers)
+in chunks of 1, 2, 4 or 8 values.
+It introduces the old value and last-accessed timestamps of memory addresses internally,
+in order to satisfy the design of the memory argument (@memory).
+
 = Columns
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
