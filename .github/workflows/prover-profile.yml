@@ -1,0 +1,181 @@
+name: Prover Profile
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'prover/**'
+      - 'crypto/**'
+      - 'executor/**'
+      - 'bin/cli/**'
+      - '.github/workflows/prover-profile.yml'
+
+  push:
+    branches: [main]
+    paths:
+      - 'prover/**'
+      - 'crypto/**'
+      - 'executor/**'
+      - 'bin/cli/**'
+      - '.github/workflows/prover-profile.yml'
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: write
+
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust Environment
+        uses: ./.github/actions/setup-rust
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "lambda-vm-profile"
+          cache-all-crates: "true"
+
+      - name: Cache compiled ASM ELF artifacts
+        id: cache-asm-elfs
+        uses: actions/cache@v4
+        with:
+          path: executor/program_artifacts/asm
+          key: asm-elf-artifacts-${{ hashFiles('executor/programs/asm/**') }}
+
+      - name: Compile ASM programs to ELF
+        if: steps.cache-asm-elfs.outputs.cache-hit != 'true'
+        run: make compile-programs-asm
+
+      - name: Build CLI with jemalloc-stats
+        run: cargo build --release -p cli --features jemalloc-stats
+
+      - name: Run prove and capture metrics
+        id: metrics
+        run: |
+          ./target/release/cli prove executor/program_artifacts/asm/arith_8.elf \
+            -o /tmp/proof.bin --time | tee /tmp/cli_output.txt
+
+          PEAK_MB=$(grep -o 'Peak heap: [0-9]*' /tmp/cli_output.txt | awk '{print $3}')
+          TIME_S=$(grep -o 'Proving time: [0-9.]*' /tmp/cli_output.txt | awk '{print $3}')
+
+          echo "peak_mb=$PEAK_MB" >> $GITHUB_OUTPUT
+          echo "time_s=$TIME_S" >> $GITHUB_OUTPUT
+
+          # Save for artifact
+          echo "peak_mb=$PEAK_MB" > /tmp/metrics.txt
+          echo "time_s=$TIME_S" >> /tmp/metrics.txt
+
+      - name: Upload metrics artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: memory-metrics-${{ github.sha }}
+          path: /tmp/metrics.txt
+          retention-days: 90
+
+      - name: Download baseline from main
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RUN_ID=$(gh run list -w prover-profile.yml -b main -s completed \
+            --json databaseId,conclusion \
+            -q '[.[] | select(.conclusion=="success")][0].databaseId')
+          if [ -z "$RUN_ID" ]; then
+            echo "::notice::No successful run found on main"
+            exit 0
+          fi
+          gh run download "$RUN_ID" -D baseline/ -p "memory-metrics-*" || echo "::warning::Failed to download baseline artifact"
+
+      - name: Compare with baseline
+        id: compare
+        if: github.event_name == 'pull_request'
+        run: |
+          BASELINE_FILE=$(ls -t baseline/*/metrics.txt 2>/dev/null | head -1)
+          if [ -z "$BASELINE_FILE" ]; then
+            echo "::notice::No baseline found on main — establishing initial baseline"
+            echo "has_baseline=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          BASELINE_PEAK=$(grep 'peak_mb=' "$BASELINE_FILE" | cut -d= -f2)
+          BASELINE_TIME=$(grep 'time_s=' "$BASELINE_FILE" | cut -d= -f2)
+          CURRENT_PEAK=${{ steps.metrics.outputs.peak_mb }}
+          CURRENT_TIME=${{ steps.metrics.outputs.time_s }}
+
+          PEAK_DIFF=$((CURRENT_PEAK - BASELINE_PEAK))
+          PEAK_PCT=$(awk "BEGIN { printf \"%.1f\", ($PEAK_DIFF * 100) / $BASELINE_PEAK }")
+          TIME_PCT=$(awk "BEGIN { printf \"%.1f\", (($CURRENT_TIME - $BASELINE_TIME) * 100) / $BASELINE_TIME }")
+
+          echo "has_baseline=true" >> $GITHUB_OUTPUT
+          echo "baseline_peak=$BASELINE_PEAK" >> $GITHUB_OUTPUT
+          echo "baseline_time=$BASELINE_TIME" >> $GITHUB_OUTPUT
+          echo "peak_diff=$PEAK_DIFF" >> $GITHUB_OUTPUT
+          echo "peak_pct=$PEAK_PCT" >> $GITHUB_OUTPUT
+          echo "time_pct=$TIME_PCT" >> $GITHUB_OUTPUT
+
+          # Comment on PR if either metric regresses by >5%
+          REGRESSION=$(awk "BEGIN { print ($PEAK_PCT > 5 || $TIME_PCT > 5) }")
+          if [ "$REGRESSION" -eq 1 ]; then
+            echo "regression=true" >> $GITHUB_OUTPUT
+            echo "::warning::Prover regression: heap ${PEAK_PCT}%, time ${TIME_PCT}%"
+          else
+            echo "regression=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request' && steps.compare.outputs.has_baseline == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const peak = '${{ steps.metrics.outputs.peak_mb }}';
+            const time = '${{ steps.metrics.outputs.time_s }}';
+            const basePeak = '${{ steps.compare.outputs.baseline_peak }}';
+            const baseTime = '${{ steps.compare.outputs.baseline_time }}';
+            const peakPct = '${{ steps.compare.outputs.peak_pct }}';
+            const timePct = '${{ steps.compare.outputs.time_pct }}';
+            const diff = '${{ steps.compare.outputs.peak_diff }}';
+            const regression = '${{ steps.compare.outputs.regression }}' === 'true';
+
+            const fmt = (v) => parseFloat(v) >= 0 ? `+${v}` : v;
+
+            let body = `## Prover Profile (arith_8.elf)\n\n`;
+            body += `| Metric | main | This PR | Change |\n`;
+            body += `|--------|------|---------|--------|\n`;
+            body += `| **Peak heap** | ${basePeak} MB | ${peak} MB | ${fmt(diff)} MB (${fmt(peakPct)}%) |\n`;
+            body += `| **Prove time** | ${baseTime}s | ${time}s | ${fmt(timePct)}% |\n\n`;
+
+            if (regression) {
+              body += `> :warning: **Regression detected:** heap or time increased by more than 5%.\n`;
+            } else {
+              body += `> :white_check_mark: No significant regression detected.\n`;
+            }
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c =>
+              c.user.type === 'Bot' && c.body.includes('Prover Profile (arith_8.elf)')
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body
+              });
+            }

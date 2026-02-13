@@ -10,10 +10,6 @@
 //! assert!(lambda_vm_prover::verify(&vm_proof, &elf_bytes).unwrap());
 //! ```
 
-#[cfg(feature = "dhat-heap")]
-#[global_allocator]
-static ALLOC: dhat::Alloc = dhat::Alloc;
-
 pub mod constraints;
 #[cfg(feature = "debug-checks")]
 mod debug_report;
