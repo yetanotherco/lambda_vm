@@ -626,6 +626,7 @@ pub fn create_dvrm_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_name("DVRM")
 }
 
 /// Create BRANCH AIR with constraints and bus interactions.

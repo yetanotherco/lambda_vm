@@ -30,3 +30,17 @@ pub mod config;
 
 pub type PrimeField = Stark252PrimeField;
 pub type Felt252 = FieldElement<PrimeField>;
+
+/// Prints current jemalloc `stats.allocated` to stderr.
+/// No-op when compiled without `jemalloc-stats`.
+#[cfg(feature = "jemalloc-stats")]
+pub(crate) fn heap_snapshot(label: &str) {
+    use tikv_jemalloc_ctl::{epoch, stats};
+    epoch::advance().ok();
+    if let Ok(allocated) = stats::allocated::read() {
+        eprintln!("[HEAP] {}: {} MB", label, allocated / (1024 * 1024));
+    }
+}
+
+#[cfg(not(feature = "jemalloc-stats"))]
+pub(crate) fn heap_snapshot(_label: &str) {}

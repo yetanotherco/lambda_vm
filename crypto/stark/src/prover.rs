@@ -3,6 +3,7 @@ use std::marker::PhantomData;
 use std::time::Instant;
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
+use crypto::merkle_tree::traits::IsMerkleTreeBackend;
 use math::fft::cpu::bit_reversing::{in_place_bit_reverse_permute, reverse_index};
 use math::fft::errors::FFTError;
 
@@ -15,7 +16,9 @@ use math::{
 };
 
 #[cfg(feature = "parallel")]
-use rayon::prelude::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use rayon::prelude::{
+    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
+};
 
 #[cfg(feature = "debug-checks")]
 use crate::debug::validate_trace;
@@ -24,9 +27,9 @@ use crate::fri;
 use crate::lookup::LOGUP_NUM_CHALLENGES;
 use crate::proof::stark::{DeepPolynomialOpenings, PolynomialOpenings};
 use crate::table::Table;
-use crate::trace::{LDETraceTable, columns2rows};
+use crate::trace::LDETraceTable;
 
-use super::config::{BatchedMerkleTree, Commitment};
+use super::config::{BatchedMerkleTree, BatchedMerkleTreeBackend, Commitment};
 use super::constraints::evaluator::ConstraintEvaluator;
 use super::domain::Domain;
 use super::fri::fri_decommit::FriDecommitment;
@@ -234,16 +237,51 @@ pub trait IsStarkProver<
         Some((tree, commitment))
     }
 
+    /// Builds a Merkle tree commitment from column-major LDE evaluations with
+    /// bit-reverse permutation, without cloning the full evaluation matrix.
+    ///
+    /// For each row index `i`, we hash `col_0[br(i)] || col_1[br(i)] || ...`
+    /// where `br(i)` is the bit-reversal of `i`. This produces the same Merkle
+    /// tree as the old clone + bit-reverse + columns2rows + batch_commit flow,
+    /// but avoids allocating the cloned and transposed matrices entirely.
+    fn commit_columns_bit_reversed<E>(
+        columns: &[Vec<FieldElement<E>>],
+    ) -> Option<(BatchedMerkleTree<E>, Commitment)>
+    where
+        FieldElement<E>: AsBytes + Sync + Send,
+        E: IsField,
+    {
+        if columns.is_empty() || columns[0].is_empty() {
+            return None;
+        }
+
+        let num_rows = columns[0].len();
+        let num_cols = columns.len();
+
+        #[cfg(feature = "parallel")]
+        let iter = (0..num_rows).into_par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let iter = 0..num_rows;
+
+        let hashed_leaves: Vec<Commitment> = iter
+            .map(|row_idx| {
+                let br_idx = reverse_index(row_idx, num_rows as u64);
+                let row: Vec<FieldElement<E>> = (0..num_cols)
+                    .map(|col_idx| columns[col_idx][br_idx].clone())
+                    .collect();
+                BatchedMerkleTreeBackend::<E>::hash_data(&row)
+            })
+            .collect();
+
+        let tree = BatchedMerkleTree::<E>::build_from_hashed_leaves(hashed_leaves)?;
+        let root = tree.root;
+        Some((tree, root))
+    }
+
     /// Compute the LDE commitment for a subset of columns from a trace (for testing).
     ///
     /// This helper computes the same commitment the prover generates internally,
     /// useful for setting up soundness test scenarios.
-    ///
-    /// The commitment is computed by:
-    /// 1. Interpolating columns to polynomials
-    /// 2. Evaluating on LDE domain (size = trace_size * blowup_factor)
-    /// 3. Bit-reverse permuting
-    /// 4. Building Merkle tree from rows
     fn compute_precomputed_commitment_for_testing(
         trace: &TraceTable<Field, FieldExtension>,
         air: &impl AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
@@ -266,22 +304,14 @@ pub trait IsStarkProver<
         // Evaluate on LDE domain
         let evaluations = Self::compute_lde_trace_evaluations::<Field>(&precomputed_polys, &domain);
 
-        // Bit-reverse permute
-        let mut lde_permuted = evaluations;
-        for col in lde_permuted.iter_mut() {
-            in_place_bit_reverse_permute(col);
-        }
-
-        // Build commitment
-        let rows = columns2rows(lde_permuted);
-        let (_, commitment) = Self::batch_commit_main(&rows)?;
+        let (_, commitment) = Self::commit_columns_bit_reversed(&evaluations)?;
 
         Some(commitment)
     }
 
     /// Given a `TraceTable`, this method interpolates its columns, computes the commitment to the
     /// table and appends it to the transcript.
-    /// Output: a touple of length 4 with the following:
+    /// Output: a tuple of length 4 with the following:
     /// • The polynomials interpolating the columns of `trace`.
     /// • The evaluations of the above polynomials over the domain `domain`.
     /// • The Merkle tree of evaluations of the above polynomials over the domain `domain`.
@@ -304,21 +334,18 @@ pub trait IsStarkProver<
     {
         // Interpolate columns of `trace`.
         let trace_polys = trace.compute_trace_polys_main::<Field>();
+        crate::heap_snapshot("    commit_main: after interpolation");
 
         // Evaluate those polynomials t_j on the large domain D_LDE.
         let lde_trace_evaluations =
             Self::compute_lde_trace_evaluations::<Field>(&trace_polys, domain);
+        crate::heap_snapshot("    commit_main: after LDE eval");
 
-        let mut lde_trace_permuted = lde_trace_evaluations.clone();
-        for col in lde_trace_permuted.iter_mut() {
-            in_place_bit_reverse_permute(col);
-        }
-
-        // Compute commitment.
-        let lde_trace_permuted_rows = columns2rows(lde_trace_permuted);
-
+        // Hash rows on-the-fly from column-major data with bit-reversal,
+        // avoiding the full clone + transpose that the old code did.
         let (lde_trace_merkle_tree, lde_trace_merkle_root) =
-            Self::batch_commit_main(&lde_trace_permuted_rows)?;
+            Self::commit_columns_bit_reversed(&lde_trace_evaluations)?;
+        crate::heap_snapshot("    commit_main: after Merkle build");
 
         // >>>> Send commitment.
         transcript.append_bytes(&lde_trace_merkle_root);
@@ -331,19 +358,17 @@ pub trait IsStarkProver<
         ))
     }
 
-    /// Variant of `interpolate_and_commit_main` for preprocessed tables.
+    /// Interpolates columns of a preprocessed trace table and computes LDE evaluations.
     ///
-    /// Does NOT append to transcript - the caller handles that with the hardcoded commitment.
-    /// Returns the computed commitment for verification purposes.
+    /// Does NOT build a Merkle tree (the caller builds separate trees for
+    /// precomputed and multiplicity columns).
     #[allow(clippy::type_complexity)]
-    fn interpolate_and_commit_preprocessed(
+    fn interpolate_and_compute_lde(
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
     ) -> Option<(
         Vec<Polynomial<FieldElement<Field>>>,
         Vec<Vec<FieldElement<Field>>>,
-        BatchedMerkleTree<Field>,
-        Commitment,
     )>
     where
         FieldElement<Field>: AsBytes,
@@ -352,37 +377,18 @@ pub trait IsStarkProver<
     {
         // Interpolate columns of `trace`.
         let trace_polys = trace.compute_trace_polys_main::<Field>();
+        crate::heap_snapshot("    commit_preproc: after interpolation");
 
         // Evaluate those polynomials t_j on the large domain D_LDE.
         let lde_trace_evaluations =
             Self::compute_lde_trace_evaluations::<Field>(&trace_polys, domain);
+        crate::heap_snapshot("    commit_preproc: after LDE eval");
 
-        let mut lde_trace_permuted = lde_trace_evaluations.clone();
-        for col in lde_trace_permuted.iter_mut() {
-            in_place_bit_reverse_permute(col);
-        }
-
-        // Compute commitment (but don't append to transcript - caller does that).
-        let lde_trace_permuted_rows = columns2rows(lde_trace_permuted);
-
-        let (lde_trace_merkle_tree, lde_trace_merkle_root) =
-            Self::batch_commit_main(&lde_trace_permuted_rows)?;
-
-        Some((
-            trace_polys,
-            lde_trace_evaluations,
-            lde_trace_merkle_tree,
-            lde_trace_merkle_root,
-        ))
+        Some((trace_polys, lde_trace_evaluations))
     }
 
-    /// Given a `TraceTable`, this method interpolates its columns, computes the commitment to the
-    /// table and appends it to the transcript.
-    /// Output: a touple of length 4 with the following:
-    /// • The polynomials interpolating the columns of `trace`.
-    /// • The evaluations of the above polynomials over the domain `domain`.
-    /// • The Merkle tree of evaluations of the above polynomials over the domain `domain`.
-    /// • The roots of the above Merkle trees.
+    /// Given a `TraceTable`, this method interpolates its auxiliary columns, computes the
+    /// commitment to the table and appends it to the transcript.
     #[allow(clippy::type_complexity)]
     fn interpolate_and_commit_aux(
         trace: &TraceTable<Field, FieldExtension>,
@@ -401,20 +407,16 @@ pub trait IsStarkProver<
     {
         // Interpolate columns of `trace`.
         let trace_polys = trace.compute_trace_polys_aux::<Field>();
+        crate::heap_snapshot("    commit_aux: after interpolation");
 
         // Evaluate those polynomials t_j on the large domain D_LDE.
         let lde_trace_evaluations = Self::compute_lde_trace_evaluations(&trace_polys, domain);
+        crate::heap_snapshot("    commit_aux: after LDE eval");
 
-        let mut lde_trace_permuted = lde_trace_evaluations.clone();
-        for col in lde_trace_permuted.iter_mut() {
-            in_place_bit_reverse_permute(col);
-        }
-
-        // Compute commitment.
-        let lde_trace_permuted_rows = columns2rows(lde_trace_permuted);
-
+        // Hash rows on-the-fly from column-major data with bit-reversal.
         let (lde_trace_merkle_tree, lde_trace_merkle_root) =
-            Self::batch_commit_extension(&lde_trace_permuted_rows)?;
+            Self::commit_columns_bit_reversed(&lde_trace_evaluations)?;
+        crate::heap_snapshot("    commit_aux: after Merkle build");
 
         // >>>> Send commitment.
         transcript.append_bytes(&lde_trace_merkle_root);
@@ -505,32 +507,22 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        // Interpolate all columns (needed for constraint evaluation)
-        let Some((trace_polys, evaluations, _full_tree, _full_root)) =
-            Self::interpolate_and_commit_preprocessed(trace, domain)
+        // Interpolate all columns and compute LDE evaluations (no tree building here).
+        let Some((trace_polys, evaluations)) =
+            Self::interpolate_and_compute_lde(trace, domain)
         else {
             return Err(ProvingError::EmptyCommitment);
         };
 
         // --- Build PRECOMPUTED tree (cols 0..num_precomputed) ---
-        let precomputed_evaluations: Vec<_> = evaluations[..num_precomputed_cols].to_vec();
-        let mut precomputed_lde_permuted = precomputed_evaluations.clone();
-        for col in precomputed_lde_permuted.iter_mut() {
-            in_place_bit_reverse_permute(col);
-        }
-        let precomputed_rows = columns2rows(precomputed_lde_permuted);
         let (precomputed_tree, precomputed_root) =
-            Self::batch_commit_main(&precomputed_rows).ok_or(ProvingError::EmptyCommitment)?;
+            Self::commit_columns_bit_reversed(&evaluations[..num_precomputed_cols])
+                .ok_or(ProvingError::EmptyCommitment)?;
 
         // --- Build MULTIPLICITIES tree (cols num_precomputed..) ---
-        let multiplicity_evaluations: Vec<_> = evaluations[num_precomputed_cols..].to_vec();
-        let mut mult_lde_permuted = multiplicity_evaluations.clone();
-        for col in mult_lde_permuted.iter_mut() {
-            in_place_bit_reverse_permute(col);
-        }
-        let mult_rows = columns2rows(mult_lde_permuted);
         let (mult_tree, mult_root) =
-            Self::batch_commit_main(&mult_rows).ok_or(ProvingError::EmptyCommitment)?;
+            Self::commit_columns_bit_reversed(&evaluations[num_precomputed_cols..])
+                .ok_or(ProvingError::EmptyCommitment)?;
 
         // Verify that our computed precomputed root matches the hardcoded commitment.
         // This is a sanity check - if they don't match, something is wrong with the trace.
@@ -1192,6 +1184,7 @@ pub trait IsStarkProver<
         PI: Send + Sync + Clone,
     {
         info!("Started proof generation...");
+        crate::heap_snapshot("multi_prove: start");
 
         let num_airs = air_trace_pairs.len();
 
@@ -1231,9 +1224,16 @@ pub trait IsStarkProver<
                 Self::round_1_commit_main_trace(*trace, &domain, transcript)?
             };
 
+            crate::heap_snapshot(&format!(
+                "R1A: committed {} (rows={}, cols={})",
+                air.name(),
+                trace_length,
+                trace.num_cols(),
+            ));
             main_commitments.push((main, evaluations));
             domains.push(domain);
         }
+        crate::heap_snapshot("R1A: all main commitments done");
 
         // =====================================================================
         // Round 1, Phase B: Sample shared LogUp challenges
@@ -1269,8 +1269,10 @@ pub trait IsStarkProver<
                 main_evaluations,
                 logup_challenges.clone(),
             )?;
+            crate::heap_snapshot(&format!("R1C: built aux for {}", air.name()));
             round_1_results.push(round_1_result);
         }
+        crate::heap_snapshot("R1C: all aux commitments done");
 
         #[cfg(feature = "debug-checks")]
         print_bus_balance_report(&round_1_results);
@@ -1283,11 +1285,14 @@ pub trait IsStarkProver<
         for (((air, _, pub_inputs), round_1_result), domain) in
             air_trace_pairs.iter().zip(round_1_results).zip(domains)
         {
+            crate::heap_snapshot(&format!("R2-4: start {}", air.name()));
             let proof =
                 Self::prove_rounds_2_to_4(*air, *pub_inputs, &round_1_result, transcript, &domain)?;
             proofs.push(proof);
+            crate::heap_snapshot(&format!("R2-4: done {}", air.name()));
         }
 
+        crate::heap_snapshot("multi_prove: all proofs generated");
         Ok(MultiProof::new(proofs))
     }
 
@@ -1381,6 +1386,7 @@ pub trait IsStarkProver<
             &transition_coefficients,
             &boundary_coefficients,
         )?;
+        crate::heap_snapshot(&format!("  R2 done for {}", air.name()));
 
         // >>>> Send commitments: [H₁], [H₂]
         transcript.append_bytes(&round_2_result.composition_poly_root);
@@ -1452,6 +1458,7 @@ pub trait IsStarkProver<
             &z,
             transcript,
         );
+        crate::heap_snapshot(&format!("  R4 done for {}", air.name()));
 
         #[cfg(feature = "instruments")]
         let elapsed4 = timer4.elapsed();

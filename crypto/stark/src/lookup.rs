@@ -619,6 +619,10 @@ where
         self.step_size
     }
 
+    fn name(&self) -> &str {
+        self.name.as_deref().unwrap_or("unknown")
+    }
+
     fn new(_proof_options: &crate::proof::options::ProofOptions) -> Self
     where
         Self: Sized,
