@@ -1518,31 +1518,29 @@ fn print_bus_balance_report<FieldExtension>(
     let mut global_sender_sums: HashMap<u64, FieldElement<FieldExtension>> = HashMap::new();
     let mut global_receiver_sums: HashMap<u64, FieldElement<FieldExtension>> = HashMap::new();
 
-    for bus_public_input in all_bus_public_inputs {
-        if let Some(bus_inputs) = bus_public_input {
-            for (&bus_id, sum) in &bus_inputs.per_bus_sums {
-                *global_bus_sums
-                    .entry(bus_id)
-                    .or_insert(FieldElement::zero()) += sum.clone();
-            }
-            for (&bus_id, sum) in &bus_inputs.per_bus_sender_sums {
-                *global_sender_sums
-                    .entry(bus_id)
-                    .or_insert(FieldElement::zero()) += sum.clone();
-                bus_senders
-                    .entry(bus_id)
-                    .or_default()
-                    .push((bus_inputs.table_name.clone(), sum.clone()));
-            }
-            for (&bus_id, sum) in &bus_inputs.per_bus_receiver_sums {
-                *global_receiver_sums
-                    .entry(bus_id)
-                    .or_insert(FieldElement::zero()) += sum.clone();
-                bus_receivers
-                    .entry(bus_id)
-                    .or_default()
-                    .push((bus_inputs.table_name.clone(), sum.clone()));
-            }
+    for bus_inputs in all_bus_public_inputs.iter().flatten() {
+        for (&bus_id, sum) in &bus_inputs.per_bus_sums {
+            *global_bus_sums
+                .entry(bus_id)
+                .or_insert(FieldElement::zero()) += sum.clone();
+        }
+        for (&bus_id, sum) in &bus_inputs.per_bus_sender_sums {
+            *global_sender_sums
+                .entry(bus_id)
+                .or_insert(FieldElement::zero()) += sum.clone();
+            bus_senders
+                .entry(bus_id)
+                .or_default()
+                .push((bus_inputs.table_name.clone(), sum.clone()));
+        }
+        for (&bus_id, sum) in &bus_inputs.per_bus_receiver_sums {
+            *global_receiver_sums
+                .entry(bus_id)
+                .or_insert(FieldElement::zero()) += sum.clone();
+            bus_receivers
+                .entry(bus_id)
+                .or_default()
+                .push((bus_inputs.table_name.clone(), sum.clone()));
         }
     }
 
