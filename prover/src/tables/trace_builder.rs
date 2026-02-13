@@ -1190,29 +1190,17 @@ impl Traces {
     ///
     /// Returns run-length encoded `(base, count)` pairs for page bases not
     /// covered by ELF segments. Contiguous pages are merged into a single range.
-    pub fn runtime_page_ranges(&self, elf: &Elf) -> Vec<(u64, u64)> {
-        use std::collections::BTreeSet;
-
-        // Build set of ELF page bases (deterministic from binary)
+    ///
+    /// Runtime (non-ELF) pages are identified by `init_values == None`
+    /// (zero-init), avoiding a redundant ELF segment scan.
+    pub fn runtime_page_ranges(&self) -> Vec<(u64, u64)> {
         let page_size = page::DEFAULT_PAGE_SIZE as u64;
-        let mut elf_bases: BTreeSet<u64> = BTreeSet::new();
 
-        for segment in &elf.data {
-            for (i, _) in segment.values.iter().enumerate() {
-                let word_addr = segment.base_addr + (i as u64 * 4);
-                for byte_offset in 0..4u64 {
-                    let byte_addr = word_addr + byte_offset;
-                    let page_base = page::page_base_for_address(byte_addr, page::DEFAULT_PAGE_SIZE);
-                    elf_bases.insert(page_base);
-                }
-            }
-        }
-
-        // Collect sorted non-ELF page bases
+        // Collect sorted non-ELF page bases (zero-init pages are runtime pages)
         let runtime_bases: Vec<u64> = self
             .page_configs
             .iter()
-            .filter(|config| !elf_bases.contains(&config.page_base))
+            .filter(|config| config.init_values.is_none())
             .map(|config| config.page_base)
             .collect();
 

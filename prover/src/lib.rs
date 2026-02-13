@@ -245,7 +245,7 @@ pub fn prove_with_options(
     let mut traces = Traces::from_elf_and_logs(&program, &result.logs)?;
     let airs = VmAirs::new(&program, proof_options, false, &traces.page_configs);
 
-    let runtime_page_ranges = traces.runtime_page_ranges(&program);
+    let runtime_page_ranges = traces.runtime_page_ranges();
 
     let proof = Prover::multi_prove(
         airs.air_trace_pairs(&mut traces),

@@ -1313,7 +1313,7 @@ fn test_deep_stack_runtime_pages_roundtrip() {
     let result = executor.run().expect("Failed to run program");
     let mut traces = Traces::from_elf_and_logs(&elf, &result.logs).unwrap();
 
-    let runtime_page_ranges = traces.runtime_page_ranges(&elf);
+    let runtime_page_ranges = traces.runtime_page_ranges();
     assert!(
         !runtime_page_ranges.is_empty(),
         "deep_stack should have runtime page ranges beyond ELF (stack pages)"
@@ -1393,7 +1393,7 @@ fn test_heap_alloc_passes() {
     let mut traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
 
     // Verify runtime_page_ranges encodes the heap pages as a contiguous range
-    let ranges = traces.runtime_page_ranges(&elf);
+    let ranges = traces.runtime_page_ranges();
     // 4 contiguous heap pages (0x80000..0x83000) should be one range
     assert!(
         ranges
@@ -1422,7 +1422,7 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
     let result = executor.run().expect("Failed to run program");
     let mut traces = Traces::from_elf_and_logs(&elf, &result.logs).unwrap();
 
-    let runtime_page_ranges = traces.runtime_page_ranges(&elf);
+    let runtime_page_ranges = traces.runtime_page_ranges();
 
     // Should have a range covering heap pages 0x80000..0x83000
     let total_pages: u64 = runtime_page_ranges.iter().map(|(_, count)| count).sum();
