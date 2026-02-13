@@ -84,10 +84,9 @@
 
 // Invisibly include another chapter, so that its labels can be resolved
 #let xref-include(f) = {
-  context if f not in _xref-included.get() {
-    hide(box(width: 0%, height: 0%, strip-all(include "/" + f)))
+  context {
+    place(hide(box(width: auto, height: 0%, strip-all(include "/" + f))))
   }
-  context _xref-included.update(x => x + ((f): true))
 }
 
 // Generate a cross-link for references to other chapters.
@@ -103,7 +102,7 @@
     } else {
       // Because shiroa does weird url escaping
       let shiroa-label = label(str(lbl).replace(":", "%3A"))
-      xref-include(ch)
+      context _xref-included.update(x => x + ((ch): true))
       // The ideal would be to use `rf` directly as content argument to `cross-link`,
       // as that would inherit any/all formatting of the ref we want or need.
       // Unfortunately the ref link seems to take precedence over the cross-link hyperlink
@@ -141,7 +140,6 @@
   if is-shiroa {
     (body) => {
       show: common-formatting
-      context _xref-included.update(x => x + ((file): true))
       context _toplevel.update(s => {
         if s == none {
           file
@@ -154,6 +152,9 @@
         #show ref: it => context if _toplevel.final() == file {
           xref(it)
         }
+        #context _xref-included.final().pairs().map(((key, value)) => context if value and cond() {
+          xref-include(key)
+        }).join()
         #body
       ])
     }
