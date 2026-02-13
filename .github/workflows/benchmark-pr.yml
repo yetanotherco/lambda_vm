@@ -218,10 +218,13 @@ jobs:
             body += `| **Prove time** | ${baseTime}s | ${time}s | ${fmt(timeDiff)}s (${fmt(timePct)}%) ${icon(timePct)} |\n\n`;
 
             const regression = parseFloat(peakPct) > 5 || parseFloat(timePct) > 5;
+            const improvement = parseFloat(peakPct) < -5 || parseFloat(timePct) < -5;
             if (regression) {
               body += `> ⚠️ **Regression detected** — heap or time increased by more than 5%.\n`;
+            } else if (improvement) {
+              body += `> 🎉 **Improvement detected** — heap or time decreased by more than 5%.\n`;
             } else {
-              body += `> ✅ No significant regression.\n`;
+              body += `> ✅ No significant change.\n`;
             }
 
             const sha = '${{ steps.pr-ref.outputs.sha || github.sha }}'.substring(0, 8);
