@@ -122,8 +122,8 @@ jobs:
         run: |
           RUN_ID=$(gh run list \
             -w benchmark-pr.yml -b main -s completed \
-            --json databaseId,conclusion \
-            -q '[.[] | select(.conclusion=="success")][0].databaseId')
+            --json databaseId,conclusion,event \
+            -q '[.[] | select(.conclusion=="success" and (.event=="push" or .event=="workflow_dispatch"))][0].databaseId')
 
           if [ -n "$RUN_ID" ]; then
             if gh run download "$RUN_ID" -D baseline/ -p "benchmark-metrics-*"; then
