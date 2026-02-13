@@ -1,7 +1,7 @@
 // Acknowledgement: Lambdaclass Ethrex Team (https://github.com/lambdaclass/ethrex)
 use clap::Parser;
-use report::{shell_summary, LinesOfCodeReport, LinesOfCodeReporterOptions};
-use spinoff::{spinners::Dots, Color, Spinner};
+use report::{LinesOfCodeReport, LinesOfCodeReporterOptions, shell_summary};
+use spinoff::{Color, Spinner, spinners::Dots};
 use std::{collections::HashMap, fs::DirEntry, path::PathBuf};
 use tokei::{Config, Language, LanguageType, Languages};
 
@@ -9,7 +9,6 @@ mod report;
 
 const EXCLUDED: &[&str] = &[
     "tooling",
-    "bin",
     "*target*",
     "*tests*",
     "*test_utils*",
@@ -17,6 +16,9 @@ const EXCLUDED: &[&str] = &[
     "*benches*",
     "*examples*",
 ];
+
+/// Directories counted separately (not as crates).
+const CRATE_SKIPPED: &[&str] = &["tooling", "bin"];
 
 fn count_crates_loc(crates_path: &PathBuf, config: &Config) -> Vec<(String, usize)> {
     let top_level_crate_dirs = std::fs::read_dir(crates_path)
@@ -30,8 +32,8 @@ fn count_crates_loc(crates_path: &PathBuf, config: &Config) -> Vec<(String, usiz
             let crate_path = crate_dir_entry.path();
             let crate_name = crate_path.file_name().unwrap().to_str().unwrap();
 
-            // Skip excluded directories
-            if EXCLUDED.contains(&crate_name) {
+            // Skip excluded and separately-counted directories
+            if EXCLUDED.contains(&crate_name) || CRATE_SKIPPED.contains(&crate_name) {
                 return None;
             }
 
@@ -68,12 +70,7 @@ fn count_tools_loc(bin_path: &PathBuf, config: &Config) -> Vec<(String, usize)> 
         .into_iter()
         .filter_map(|tool_dir_entry| {
             let tool_path = tool_dir_entry.path();
-            let tool_name = tool_path
-                .file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .to_owned();
+            let tool_name = tool_path.file_name().unwrap().to_str().unwrap().to_owned();
 
             // Only count directories (crates)
             if !tool_path.is_dir() {
@@ -84,11 +81,9 @@ fn count_tools_loc(bin_path: &PathBuf, config: &Config) -> Vec<(String, usize)> 
             // Use a subset of exclusions for tools
             let tool_excluded: &[&str] = &["*target*", "*tests*", "*bench*", "*benches*"];
             languages.get_statistics(&[tool_path], tool_excluded, config);
-            if let Some(rust_loc) = languages.get(&LanguageType::Rust) {
-                Some((tool_name, rust_loc.code))
-            } else {
-                None
-            }
+            languages
+                .get(&LanguageType::Rust)
+                .map(|rust_loc| (tool_name, rust_loc.code))
         })
         .collect();
 
