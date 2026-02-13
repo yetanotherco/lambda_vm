@@ -26,9 +26,6 @@ itertools = "0.11.0"
 # Parallelization crates
 rayon = { version = "1.8.0", optional = true }
 
-# Memory profiling
-tikv-jemalloc-ctl = { version = "0.6", features = ["stats"], optional = true }
-
 # wasm
 wasm-bindgen = { version = "0.2", optional = true }
 serde-wasm-bindgen = { version = "0.5", optional = true }
@@ -50,7 +47,6 @@ test_fiat_shamir = []
 instruments = []                                                     # This enables timing prints in prover and verifier
 debug-checks = []                                                    # Enables validate_trace + bus balance report in prover
 parallel = ["dep:rayon", "crypto/parallel"]
-jemalloc-stats = ["dep:tikv-jemalloc-ctl"]
 wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "dep:web-sys"]
 
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dev-dependencies]

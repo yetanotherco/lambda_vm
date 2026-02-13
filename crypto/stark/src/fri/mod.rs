@@ -39,12 +39,7 @@ where
 
     let mut coset_offset = coset_offset.clone();
 
-    crate::heap_snapshot(&format!(
-        "    FRI: start commit_phase (layers={}, domain={})",
-        number_layers, domain_size
-    ));
-
-    for layer_idx in 1..number_layers {
+    for _ in 1..number_layers {
         // <<<< Receive challenge 𝜁ₖ₋₁
         let zeta = transcript.sample_field_element();
         coset_offset = coset_offset.square();
@@ -59,13 +54,6 @@ where
 
         // >>>> Send commitment: [pₖ]
         transcript.append_bytes(&new_data);
-
-        if layer_idx <= 3 || layer_idx == number_layers - 1 {
-            crate::heap_snapshot(&format!(
-                "    FRI: after layer {} (domain={})",
-                layer_idx, domain_size
-            ));
-        }
     }
 
     // <<<< Receive challenge: 𝜁ₙ₋₁
@@ -82,8 +70,6 @@ where
 
     // >>>> Send value: pₙ
     transcript.append_field_element(&last_value);
-
-    crate::heap_snapshot("    FRI: commit_phase done");
 
     (last_value, fri_layer_list)
 }

@@ -334,18 +334,15 @@ pub trait IsStarkProver<
     {
         // Interpolate columns of `trace`.
         let trace_polys = trace.compute_trace_polys_main::<Field>();
-        crate::heap_snapshot("    commit_main: after interpolation");
 
         // Evaluate those polynomials t_j on the large domain D_LDE.
         let lde_trace_evaluations =
             Self::compute_lde_trace_evaluations::<Field>(&trace_polys, domain);
-        crate::heap_snapshot("    commit_main: after LDE eval");
 
         // Hash rows on-the-fly from column-major data with bit-reversal,
         // avoiding the full clone + transpose that the old code did.
         let (lde_trace_merkle_tree, lde_trace_merkle_root) =
             Self::commit_columns_bit_reversed(&lde_trace_evaluations)?;
-        crate::heap_snapshot("    commit_main: after Merkle build");
 
         // >>>> Send commitment.
         transcript.append_bytes(&lde_trace_merkle_root);
@@ -377,12 +374,10 @@ pub trait IsStarkProver<
     {
         // Interpolate columns of `trace`.
         let trace_polys = trace.compute_trace_polys_main::<Field>();
-        crate::heap_snapshot("    commit_preproc: after interpolation");
 
         // Evaluate those polynomials t_j on the large domain D_LDE.
         let lde_trace_evaluations =
             Self::compute_lde_trace_evaluations::<Field>(&trace_polys, domain);
-        crate::heap_snapshot("    commit_preproc: after LDE eval");
 
         Some((trace_polys, lde_trace_evaluations))
     }
@@ -407,16 +402,13 @@ pub trait IsStarkProver<
     {
         // Interpolate columns of `trace`.
         let trace_polys = trace.compute_trace_polys_aux::<Field>();
-        crate::heap_snapshot("    commit_aux: after interpolation");
 
         // Evaluate those polynomials t_j on the large domain D_LDE.
         let lde_trace_evaluations = Self::compute_lde_trace_evaluations(&trace_polys, domain);
-        crate::heap_snapshot("    commit_aux: after LDE eval");
 
         // Hash rows on-the-fly from column-major data with bit-reversal.
         let (lde_trace_merkle_tree, lde_trace_merkle_root) =
             Self::commit_columns_bit_reversed(&lde_trace_evaluations)?;
-        crate::heap_snapshot("    commit_aux: after Merkle build");
 
         // >>>> Send commitment.
         transcript.append_bytes(&lde_trace_merkle_root);
@@ -508,8 +500,7 @@ pub trait IsStarkProver<
         FieldElement<FieldExtension>: AsBytes,
     {
         // Interpolate all columns and compute LDE evaluations (no tree building here).
-        let Some((trace_polys, evaluations)) =
-            Self::interpolate_and_compute_lde(trace, domain)
+        let Some((trace_polys, evaluations)) = Self::interpolate_and_compute_lde(trace, domain)
         else {
             return Err(ProvingError::EmptyCommitment);
         };
@@ -1184,7 +1175,6 @@ pub trait IsStarkProver<
         PI: Send + Sync + Clone,
     {
         info!("Started proof generation...");
-        crate::heap_snapshot("multi_prove: start");
 
         let num_airs = air_trace_pairs.len();
 
@@ -1224,16 +1214,9 @@ pub trait IsStarkProver<
                 Self::round_1_commit_main_trace(*trace, &domain, transcript)?
             };
 
-            crate::heap_snapshot(&format!(
-                "R1A: committed {} (rows={}, cols={})",
-                air.name(),
-                trace_length,
-                trace.num_cols(),
-            ));
             main_commitments.push((main, evaluations));
             domains.push(domain);
         }
-        crate::heap_snapshot("R1A: all main commitments done");
 
         // =====================================================================
         // Round 1, Phase B: Sample shared LogUp challenges
@@ -1281,23 +1264,19 @@ pub trait IsStarkProver<
                 main_evaluations,
                 logup_challenges.clone(),
             )?;
-            crate::heap_snapshot(&format!("R1C: built aux for {}", air.name()));
 
             #[cfg(feature = "debug-checks")]
             all_bus_public_inputs.push(round_1_result.bus_public_inputs.clone());
 
             // Rounds 2-4 for this table (immediately, then Round1 is dropped)
-            crate::heap_snapshot(&format!("R2-4: start {}", air.name()));
             let proof =
                 Self::prove_rounds_2_to_4(*air, *pub_inputs, &round_1_result, transcript, domain)?;
             proofs.push(proof);
-            crate::heap_snapshot(&format!("R2-4: done {} (Round1 dropped)", air.name()));
         }
 
         #[cfg(feature = "debug-checks")]
         print_bus_balance_report(&all_bus_public_inputs);
 
-        crate::heap_snapshot("multi_prove: all proofs generated");
         Ok(MultiProof::new(proofs))
     }
 
@@ -1391,7 +1370,6 @@ pub trait IsStarkProver<
             &transition_coefficients,
             &boundary_coefficients,
         )?;
-        crate::heap_snapshot(&format!("  R2 done for {}", air.name()));
 
         // >>>> Send commitments: [H₁], [H₂]
         transcript.append_bytes(&round_2_result.composition_poly_root);
@@ -1463,7 +1441,6 @@ pub trait IsStarkProver<
             &z,
             transcript,
         );
-        crate::heap_snapshot(&format!("  R4 done for {}", air.name()));
 
         #[cfg(feature = "instruments")]
         let elapsed4 = timer4.elapsed();
