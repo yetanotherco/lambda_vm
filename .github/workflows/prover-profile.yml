@@ -21,6 +21,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
   pull-requests: write
 
 jobs:
@@ -76,19 +77,18 @@ jobs:
           retention-days: 90
 
       - name: Download baseline from main
-        id: baseline
         if: github.event_name == 'pull_request'
-        uses: dawidd6/action-download-artifact@v6
-        with:
-          branch: main
-          workflow: prover-profile.yml
-          workflow_conclusion: success
-          name: memory-metrics-.*
-          name_is_regexp: true
-          search_artifacts: true
-          path: baseline/
-          if_no_artifact_found: warn
-        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RUN_ID=$(gh run list -w prover-profile.yml -b main -s completed \
+            --json databaseId,conclusion \
+            -q '[.[] | select(.conclusion=="success")][0].databaseId')
+          if [ -z "$RUN_ID" ]; then
+            echo "::notice::No successful run found on main"
+            exit 0
+          fi
+          gh run download "$RUN_ID" -D baseline/ -p "memory-metrics-*" || echo "::warning::Failed to download baseline artifact"
 
       - name: Compare with baseline
         id: compare
