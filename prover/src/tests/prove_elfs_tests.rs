@@ -1366,9 +1366,7 @@ fn test_heap_alloc_passes() {
     let ranges = traces.runtime_page_ranges();
     // 4 contiguous heap pages (0x80000..0x83000) should be one range
     assert!(
-        ranges
-            .iter()
-            .any(|&(base, count)| base == 0x80000 && count == 4),
+        ranges.iter().any(|r| r.base == 0x80000 && r.count == 4),
         "Expected contiguous heap range (0x80000, 4), got {:?}",
         ranges
     );
@@ -1395,7 +1393,7 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
     let runtime_page_ranges = traces.runtime_page_ranges();
 
     // Should have a range covering heap pages 0x80000..0x83000
-    let total_pages: u64 = runtime_page_ranges.iter().map(|(_, count)| count).sum();
+    let total_pages: u64 = runtime_page_ranges.iter().map(|r| r.count).sum();
     assert!(
         total_pages >= 5,
         "Expected at least 5 runtime pages (4 heap + 1 stack), got {}",

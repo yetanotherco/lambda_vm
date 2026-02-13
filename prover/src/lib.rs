@@ -41,17 +41,28 @@ use crate::test_utils::{
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
 use stark::proof::stark::MultiProof;
 
+/// A run-length encoded range of contiguous zero-initialized 4KB pages.
+///
+/// Represents `count` contiguous pages starting at `base`, used for
+/// runtime-allocated memory (stack, heap) not covered by ELF segments.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RuntimePageRange {
+    /// Base address of the first page (4KB-aligned).
+    pub base: u64,
+    /// Number of contiguous 4KB pages starting at `base`.
+    pub count: u64,
+}
+
 /// A complete VM proof bundle containing the STARK proof and metadata
 /// needed by the verifier to reconstruct the AIR configuration.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct VmProof {
     /// The multi-table STARK proof.
     pub proof: MultiProof<F, E, ()>,
-    /// Run-length encoded runtime page ranges: `(base, count)` pairs.
-    /// Each pair represents `count` contiguous 4KB pages starting at `base`.
+    /// Run-length encoded runtime page ranges.
     /// These are zero-initialized pages accessed during execution but not
     /// covered by ELF segments (stack, heap, etc.).
-    pub runtime_page_ranges: Vec<(u64, u64)>,
+    pub runtime_page_ranges: Vec<RuntimePageRange>,
 }
 
 /// Error type for the prover crate.

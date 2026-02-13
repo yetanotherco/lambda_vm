@@ -1170,11 +1170,12 @@ impl Traces {
     /// Each range is `(base, count)` — `count` contiguous 4KB pages from `base`.
     pub fn page_configs_from_elf_and_runtime(
         elf: &Elf,
-        runtime_page_ranges: &[(u64, u64)],
+        runtime_page_ranges: &[crate::RuntimePageRange],
     ) -> Vec<PageConfig> {
         let mut configs = Self::page_configs_from_elf(elf);
         let page_size = page::DEFAULT_PAGE_SIZE;
-        for &(base, count) in runtime_page_ranges {
+        for r in runtime_page_ranges {
+            let (base, count) = (r.base, r.count);
             for i in 0..count {
                 configs.push(PageConfig::zero_init(
                     base + i * page_size as u64,
@@ -1193,7 +1194,7 @@ impl Traces {
     ///
     /// Runtime (non-ELF) pages are identified by `init_values == None`
     /// (zero-init), avoiding a redundant ELF segment scan.
-    pub fn runtime_page_ranges(&self) -> Vec<(u64, u64)> {
+    pub fn runtime_page_ranges(&self) -> Vec<crate::RuntimePageRange> {
         let page_size = page::DEFAULT_PAGE_SIZE as u64;
 
         // Collect sorted non-ELF page bases (zero-init pages are runtime pages)
@@ -1217,12 +1218,12 @@ impl Traces {
             if base == start + count * page_size {
                 count += 1;
             } else {
-                ranges.push((start, count));
+                ranges.push(crate::RuntimePageRange { base: start, count });
                 start = base;
                 count = 1;
             }
         }
-        ranges.push((start, count));
+        ranges.push(crate::RuntimePageRange { base: start, count });
 
         ranges
     }
