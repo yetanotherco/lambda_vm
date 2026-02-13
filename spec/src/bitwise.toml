@@ -1,0 +1,200 @@
+name = "BITWISE"
+
+[[variables.input]]
+name = "X"
+type = "Byte"
+desc = ""
+precomputed = true
+
+[[variables.input]]
+name = "Y"
+type = "Byte"
+desc = ""
+precomputed = true
+
+[[variables.input]]
+name = "Z"
+type = "B4"
+desc = ""
+precomputed = true
+
+[[variables.output]]
+name = "AND"
+type = "Byte"
+desc = "the binary AND of `X` and `Y`"
+precomputed = true
+
+[[variables.output]]
+name = "OR"
+type = "Byte"
+desc = "the binary OR of `X` and `Y`"
+precomputed = true
+
+[[variables.output]]
+name = "XOR"
+type = "Byte"
+desc = "the binary XOR of `X` and `Y`"
+precomputed = true
+
+[[variables.output]]
+name = "MSB8"
+type = "Bit"
+desc = "the most significant bit of `X`"
+precomputed = true
+
+[[variables.output]]
+name = "MSB16"
+type = "Bit"
+desc = "the most significant bit of `Y`"
+precomputed = true
+
+[[variables.output]]
+name = "ZERO"
+type = "Bit"
+desc = "whether $#`X` = 0$, $#`Y` = 0$ and $#`Z` = 0$."
+precomputed = true
+
+[[variables.output]]
+name = "SLL"
+type = "Half"
+desc = "`X||Y` logically left-shifted by `Z`: $((#`X` + 256#`Y`) #`<<` #`Z`) mod 2^16$"
+precomputed = true
+
+[[variables.output]]
+name = "SLLC"
+type = "Half"
+desc = "`X||Y` logically right-shifted by `Z`: $(#`X` + 256#`Y`) #`>>` (16 - #`Z`)$"
+precomputed = true
+
+[[variables.multiplicity]]
+name = "μ_AND"
+type = "BaseField"
+desc = ""
+
+[[variables.multiplicity]]
+name = "μ_OR"
+type = "BaseField"
+desc = ""
+
+[[variables.multiplicity]]
+name = "μ_XOR"
+type = "BaseField"
+desc = ""
+
+[[variables.multiplicity]]
+name = "μ_MSB8"
+type = "BaseField"
+desc = ""
+
+[[variables.multiplicity]]
+name = "μ_MSB16"
+type = "BaseField"
+desc = ""
+
+[[variables.multiplicity]]
+name = "μ_ZERO"
+type = "BaseField"
+desc = ""
+
+[[variables.multiplicity]]
+name = "μ_IS_BYTE"
+type = "BaseField"
+desc = ""
+
+[[variables.multiplicity]]
+name = "μ_IS_HALF"
+type = "BaseField"
+desc = ""
+
+[[variables.multiplicity]]
+name = "μ_IS_B20"
+type = "BaseField"
+desc = ""
+
+[[variables.multiplicity]]
+name = "μ_HWSL"
+type = "BaseField"
+desc = ""
+
+[[variables.multiplicity]]
+name = "μ_HWSLC"
+type = "BaseField"
+desc = ""
+
+
+[[constraint_groups]]
+name = "contributions"
+
+[[constraints.contributions]]
+kind = "interaction"
+tag = "AND_BYTE"
+input = ["X", "Y"]
+output = "AND"
+multiplicity = ["-", "μ_AND"]
+
+[[constraints.contributions]]
+kind = "interaction"
+tag = "OR_BYTE"
+input = ["X", "Y"]
+output = "OR"
+multiplicity = ["-", "μ_OR"]
+
+[[constraints.contributions]]
+kind = "interaction"
+tag = "XOR_BYTE"
+input = ["X", "Y"]
+output = "XOR"
+multiplicity = ["-", "μ_XOR"]
+
+[[constraints.contributions]]
+kind = "interaction"
+tag = "MSB8"
+input = ["X"]
+output = "MSB8"
+multiplicity = ["-", "μ_MSB8"]
+
+[[constraints.contributions]]
+kind = "interaction"
+tag = "MSB16"
+input = [["+", "X", ["*", 256, "Y"]]]
+output = "MSB16"
+multiplicity = ["-", "μ_MSB16"]
+
+[[constraints.contributions]]
+kind = "interaction"
+tag = "ZERO"
+input = [["+", "X", ["*", 256, "Y"], ["*", 65536, "Z"]]]
+output = "ZERO"
+multiplicity = ["-", "μ_ZERO"]
+
+[[constraints.contributions]]
+kind = "interaction"
+tag = "IS_BYTE"
+input = ["X"]
+multiplicity = ["-", "μ_IS_BYTE"]
+
+[[constraints.contributions]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["+", "X", ["*", 256, "Y"]]]
+multiplicity = ["-", "μ_IS_HALF"]
+
+[[constraints.contributions]]
+kind = "interaction"
+tag = "IS_B20"
+input = [["+", "X", ["*", 256, "Y"], ["*", 65536, "Z"]]]
+multiplicity = ["-", "μ_IS_B20"]
+
+[[constraints.contributions]]
+kind = "interaction"
+tag = "HWSL"
+input = [["+", "X", ["*", 256, "Y"]], "Z"]
+output = "SLL"
+multiplicity = ["-", "μ_HWSL"]
+
+[[constraints.contributions]]
+kind = "interaction"
+tag = "HWSLC"
+input = [["+", "X", ["*", 256, "Y"]], "Z"]
+output = "SLLC"
+multiplicity = ["-", "μ_HWSLC"]

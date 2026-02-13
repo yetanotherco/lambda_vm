@@ -1,0 +1,178 @@
+# cond => IS_BIT<X>
+[[signatures]]
+tag = "IS_BIT"
+kind = "template"
+input = ["BaseField"]
+cond = "BaseField"
+
+# cond => ADD<sum; lhs, rhs>
+[[signatures]]
+tag = "ADD"
+kind = "template"
+input = ["DWordWL", "DWordWL"]
+output = "DWordWL"
+cond = "BaseField"
+
+# cond => SUB<diff; lhs, rhs>
+[[signatures]]
+tag = "SUB"
+kind = "template"
+input = ["DWordWL", "DWordWL"]
+output = "DWordWL"
+cond = "BaseField"
+
+# cond => NEG<neg; X>
+[[signatures]]
+tag = "NEG"
+kind = "template"
+input = ["DWordHL"]
+output = "DWordWL"
+cond = "Bit"
+
+# SIGN<sign; X, signed>
+[[signatures]]
+tag = "SIGN"
+kind = "template"
+input = ["Half", "Bit"]
+output = "Bit"
+
+# DECODE[pc, imm, packed_decode]
+[[signatures]]
+tag = "DECODE"
+kind = "interaction"
+input = ["DWordWL", "DWordWL", "BaseField"]
+
+# SHIFT[out; in, shift, direction, signed, word_instr]
+[[signatures]]
+tag = "SHIFT"
+kind = "interaction"
+input = ["DWordHL", "Byte", "Bit", "Bit", "Bit"]
+output = "DWordWL"
+
+# BRANCH[next_pc; pc, offset, register, JALR]
+[[signatures]]
+tag = "BRANCH"
+kind = "interaction"
+input = ["DWordWL", "Word", "DWordWL", "Bit"]
+output = "DWordWL"
+
+# MEMW[old; is_register, base_address, value, timestamp, write2, write4, write8]
+[[signatures]]
+tag = "MEMW"
+kind = "interaction"
+input = ["Bit", "DWordWL", ["BaseField", 8], "DWordWL", "Bit", "Bit", "Bit"]
+output = ["BaseField", 8]
+
+# MEMW[is_register, base_address, value, timestamp, write2, write4, write8]
+[[signatures]]
+tag = "MEMW"
+kind = "interaction"
+input = ["Bit", "DWordWL", ["BaseField", 8], "DWordWL", "Bit", "Bit", "Bit"]
+
+# LT[lt; lhs, rhs, signed]
+[[signatures]]
+tag = "LT"
+kind = "interaction"
+input = ["DWordWL", "DWordWL", "Bit"]
+output = "Bit"
+
+# MUL[lo/hi; lhs, lhs_signed, rhs, rhs_signed, 0/1]
+[[signatures]]
+tag = "MUL"
+kind = "interaction"
+input = ["DWordHL", "Bit", "DWordHL", "Bit", "Bit"]
+output = "DWordWL"
+
+# DVRM[q/r; n, d, signed, 0/1]
+[[signatures]]
+tag = "DVRM"
+kind = "interaction"
+input = ["DWordHL", "DWordHL", "Bit", "Bit"]
+output = "DWordWL"
+
+# LOAD[res; base_address, timestamp, read2, read4, read8, signed]
+[[signatures]]
+tag = "LOAD"
+kind = "interaction"
+input = ["DWordWL", "DWordWL", "Bit", "Bit", "Bit", "Bit"]
+output = "DWordWL"
+
+# ECALL[timestamp, syscallnr]
+[[signatures]]
+tag = "ECALL"
+kind = "interaction"
+input = ["DWordWL", "DWordWL"]
+
+# AND_BYTE[res; X, Y]
+[[signatures]]
+tag = "AND_BYTE"
+kind = "interaction"
+input = ["Byte", "Byte"]
+output = "Byte"
+
+# OR_BYTE[res; X, Y]
+[[signatures]]
+tag = "OR_BYTE"
+kind = "interaction"
+input = ["Byte", "Byte"]
+output = "Byte"
+
+# XOR_BYTE[res; X, Y]
+[[signatures]]
+tag = "XOR_BYTE"
+kind = "interaction"
+input = ["Byte", "Byte"]
+output = "Byte"
+
+# MSB8[msb; X]
+[[signatures]]
+tag = "MSB8"
+kind = "interaction"
+input = ["Byte"]
+output = "Bit"
+
+# MSB16[msb; X]
+[[signatures]]
+tag = "MSB16"
+kind = "interaction"
+input = ["Half"]
+output = "Bit"
+
+# ZERO[is_zero; X]
+[[signatures]]
+tag = "ZERO"
+kind = "interaction"
+input = ["B20"]
+output = "Bit"
+
+# IS_BYTE[X]
+[[signatures]]
+tag = "IS_BYTE"
+kind = "interaction"
+input = ["Byte"]
+
+# IS_HALF[X]
+[[signatures]]
+tag = "IS_HALF"
+kind = "interaction"
+input = ["Half"]
+
+# IS_B20[X]
+[[signatures]]
+tag = "IS_B20"
+kind = "interaction"
+input = ["B20"]
+
+# HWSL[res; X, shift]
+[[signatures]]
+tag = "HWSL"
+kind = "interaction"
+input = ["Half", "B4"]
+output = "Half"
+
+# HWSLC[res; X, shift]
+[[signatures]]
+tag = "HWSLC"
+kind = "interaction"
+input = ["Half", "B4"]
+output = "Half"
