@@ -42,7 +42,8 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request &&
-       contains(github.event.comment.body, '/bench'))
+       contains(github.event.comment.body, '/bench') &&
+       contains(fromJSON('["MEMBER","OWNER","COLLABORATOR"]'), github.event.comment.author_association))
     steps:
       - name: React to comment
         if: github.event_name == 'issue_comment'
@@ -91,6 +92,12 @@ jobs:
 
           PEAK_MB=$(grep -o 'Peak heap: [0-9]*' /tmp/cli_output.txt | awk '{print $3}')
           TIME_S=$(grep -o 'Proving time: [0-9.]*' /tmp/cli_output.txt | awk '{print $3}')
+
+          if [ -z "$PEAK_MB" ] || [ -z "$TIME_S" ]; then
+            echo "::error::Failed to parse metrics from CLI output"
+            cat /tmp/cli_output.txt
+            exit 1
+          fi
 
           echo "peak_mb=$PEAK_MB" >> "$GITHUB_OUTPUT"
           echo "time_s=$TIME_S" >> "$GITHUB_OUTPUT"
@@ -154,6 +161,12 @@ jobs:
           PEAK_MB=$(grep -o 'Peak heap: [0-9]*' /tmp/baseline_output.txt | awk '{print $3}')
           TIME_S=$(grep -o 'Proving time: [0-9.]*' /tmp/baseline_output.txt | awk '{print $3}')
 
+          if [ -z "$PEAK_MB" ] || [ -z "$TIME_S" ]; then
+            echo "::error::Failed to parse baseline metrics from CLI output"
+            cat /tmp/baseline_output.txt
+            exit 1
+          fi
+
           echo "peak_mb=$PEAK_MB" >> "$GITHUB_OUTPUT"
           echo "time_s=$TIME_S" >> "$GITHUB_OUTPUT"
 
@@ -179,6 +192,12 @@ jobs:
 
           CURRENT_PEAK=${{ steps.pr.outputs.peak_mb }}
           CURRENT_TIME=${{ steps.pr.outputs.time_s }}
+
+          if [ -z "$BASELINE_PEAK" ] || [ "$BASELINE_PEAK" -eq 0 ] 2>/dev/null ||
+             [ -z "$BASELINE_TIME" ]; then
+            echo "::error::Invalid baseline values: peak=$BASELINE_PEAK time=$BASELINE_TIME"
+            exit 1
+          fi
 
           PEAK_DIFF=$((CURRENT_PEAK - BASELINE_PEAK))
           PEAK_PCT=$(awk "BEGIN { printf \"%.1f\", ($PEAK_DIFF * 100) / $BASELINE_PEAK }")
