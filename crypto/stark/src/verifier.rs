@@ -889,20 +889,18 @@ pub trait IsStarkVerifier<
         };
 
         // =====================================================================
-        // Round 1, Phase C: Replay auxiliary trace commitments
+        // Phase C + Rounds 2-4 (interleaved per table)
         // =====================================================================
+        // For each table: replay aux commitment, then verify rounds 2-4.
+        // This matches the prover's interleaved transcript ordering.
 
-        for proof in &multi_proof.proofs {
+        for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
+            // Phase C for this table: replay aux commitment
             if let Some(root) = proof.lde_trace_aux_merkle_root {
                 transcript.append_bytes(&root);
             }
-        }
 
-        // =====================================================================
-        // Rounds 2-4: Verify each proof
-        // =====================================================================
-
-        for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
+            // Rounds 2-4 for this table
             if !Self::verify_rounds_2_to_4(*air, proof, transcript, logup_challenges.clone()) {
                 error!(
                     "Table {} failed verify_rounds_2_to_4 (num_constraints={}, trace_cols={})",
