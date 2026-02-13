@@ -1254,12 +1254,24 @@ pub trait IsStarkProver<
         // =====================================================================
         // Each AIR builds its LogUp running-sum columns using the shared challenges.
 
-        let mut round_1_results: Vec<Round1<Field, FieldExtension>> = Vec::with_capacity(num_airs);
-        for (((air, trace, _pub_inputs), (main, main_evaluations)), domain) in air_trace_pairs
+        // =====================================================================
+        // Phase C + Rounds 2-4 (interleaved per table)
+        // =====================================================================
+        // For each table: build aux trace, commit it, then immediately run
+        // rounds 2-4 and drop the Round1 result. This avoids keeping all
+        // tables' LDE evaluations + Merkle trees alive simultaneously.
+
+        let mut proofs = Vec::with_capacity(num_airs);
+        #[cfg(feature = "debug-checks")]
+        let mut all_bus_public_inputs: Vec<Option<BusPublicInputs<FieldExtension>>> =
+            Vec::with_capacity(num_airs);
+
+        for (((air, trace, pub_inputs), (main, main_evaluations)), domain) in air_trace_pairs
             .iter_mut()
             .zip(main_commitments)
             .zip(domains.iter())
         {
+            // Phase C for this table
             let round_1_result = Self::round_1_build_auxiliary_trace(
                 *air,
                 *trace,
@@ -1270,27 +1282,20 @@ pub trait IsStarkProver<
                 logup_challenges.clone(),
             )?;
             crate::heap_snapshot(&format!("R1C: built aux for {}", air.name()));
-            round_1_results.push(round_1_result);
-        }
-        crate::heap_snapshot("R1C: all aux commitments done");
 
-        #[cfg(feature = "debug-checks")]
-        print_bus_balance_report(&round_1_results);
+            #[cfg(feature = "debug-checks")]
+            all_bus_public_inputs.push(round_1_result.bus_public_inputs.clone());
 
-        // =====================================================================
-        // Rounds 2-4: Standard STARK protocol for each AIR
-        // =====================================================================
-
-        let mut proofs = Vec::with_capacity(num_airs);
-        for (((air, _, pub_inputs), round_1_result), domain) in
-            air_trace_pairs.iter().zip(round_1_results).zip(domains)
-        {
+            // Rounds 2-4 for this table (immediately, then Round1 is dropped)
             crate::heap_snapshot(&format!("R2-4: start {}", air.name()));
             let proof =
-                Self::prove_rounds_2_to_4(*air, *pub_inputs, &round_1_result, transcript, &domain)?;
+                Self::prove_rounds_2_to_4(*air, *pub_inputs, &round_1_result, transcript, domain)?;
             proofs.push(proof);
-            crate::heap_snapshot(&format!("R2-4: done {}", air.name()));
+            crate::heap_snapshot(&format!("R2-4: done {} (Round1 dropped)", air.name()));
         }
+
+        #[cfg(feature = "debug-checks")]
+        print_bus_balance_report(&all_bus_public_inputs);
 
         crate::heap_snapshot("multi_prove: all proofs generated");
         Ok(MultiProof::new(proofs))
@@ -1517,19 +1522,14 @@ pub trait IsStarkProver<
 /// Uses numeric bus IDs only (no VM-specific names) to keep the stark crate generic.
 /// For bus ID → name mapping, see `BusId` in the prover crate.
 #[cfg(feature = "debug-checks")]
-fn print_bus_balance_report<Field, FieldExtension>(
-    round_1_results: &[Round1<Field, FieldExtension>],
+fn print_bus_balance_report<FieldExtension>(
+    all_bus_public_inputs: &[Option<BusPublicInputs<FieldExtension>>],
 ) where
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField,
     FieldExtension: IsField,
-    FieldElement<Field>: AsBytes,
-    FieldElement<FieldExtension>: AsBytes,
 {
     use std::collections::HashMap;
 
-    let has_logup = round_1_results
-        .iter()
-        .any(|r| r.bus_public_inputs.is_some());
+    let has_logup = all_bus_public_inputs.iter().any(|r| r.is_some());
     if !has_logup {
         return;
     }
@@ -1541,8 +1541,8 @@ fn print_bus_balance_report<Field, FieldExtension>(
     let mut global_sender_sums: HashMap<u64, FieldElement<FieldExtension>> = HashMap::new();
     let mut global_receiver_sums: HashMap<u64, FieldElement<FieldExtension>> = HashMap::new();
 
-    for round_1_result in round_1_results {
-        if let Some(bus_inputs) = &round_1_result.bus_public_inputs {
+    for bus_public_input in all_bus_public_inputs {
+        if let Some(bus_inputs) = bus_public_input {
             for (&bus_id, sum) in &bus_inputs.per_bus_sums {
                 *global_bus_sums
                     .entry(bus_id)
