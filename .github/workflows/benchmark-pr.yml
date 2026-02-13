@@ -1,0 +1,277 @@
+name: Benchmark (PR)
+
+on:
+  workflow_dispatch:
+  issue_comment:
+    types: [created]
+  push:
+    branches: [main]
+    paths:
+      - 'prover/**'
+      - 'crypto/**'
+      - 'executor/**'
+      - 'bin/cli/**'
+  # Uncomment to auto-run on PRs:
+  # pull_request:
+  #   branches: [main]
+  #   paths:
+  #     - 'prover/**'
+  #     - 'crypto/**'
+  #     - 'executor/**'
+  #     - 'bin/cli/**'
+
+permissions:
+  contents: read
+  pull-requests: write
+  actions: read
+
+concurrency:
+  group: benchmark-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  PROGRAM: executor/programs/asm/fib_iterative_372k.s
+  ELF: executor/program_artifacts/asm/fib_iterative_372k.elf
+
+jobs:
+  benchmark:
+    runs-on: [self-hosted, bench]
+    # Skip unless: push to main, workflow_dispatch, or "/bench" comment on a PR
+    if: >-
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request &&
+       startsWith(github.event.comment.body, '/bench') &&
+       contains(fromJSON('["MEMBER","OWNER","COLLABORATOR"]'), github.event.comment.author_association))
+    steps:
+      - name: React to comment
+        if: github.event_name == 'issue_comment'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'eyes'
+            });
+
+      - name: Get PR head ref
+        id: pr-ref
+        if: github.event_name == 'issue_comment'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR_NUM=${{ github.event.issue.number }}
+          SHA=$(gh pr view "$PR_NUM" --json headRefOid -q .headRefOid)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr-ref.outputs.sha || github.sha }}
+
+      - name: Compile benchmark ELF
+        run: |
+          mkdir -p executor/program_artifacts/asm
+          if [ ! -f "$ELF" ]; then
+            clang --target=riscv64 -march=rv64im -fuse-ld=lld -nostdlib -Wl,-e,main \
+              "$PROGRAM" -o "$ELF"
+          fi
+
+      - name: Build CLI (PR)
+        run: cargo build --release -p cli --features jemalloc-stats
+
+      - name: Benchmark PR
+        id: pr
+        run: |
+          ./target/release/cli prove "$ELF" -o /tmp/proof.bin --time \
+            | tee /tmp/cli_output.txt
+          rm -f /tmp/proof.bin
+
+          PEAK_MB=$(grep -o 'Peak heap: [0-9]*' /tmp/cli_output.txt | awk '{print $3}')
+          TIME_S=$(grep -o 'Proving time: [0-9.]*' /tmp/cli_output.txt | awk '{print $3}')
+
+          if [ -z "$PEAK_MB" ] || [ -z "$TIME_S" ]; then
+            echo "::error::Failed to parse metrics from CLI output"
+            cat /tmp/cli_output.txt
+            exit 1
+          fi
+
+          echo "peak_mb=$PEAK_MB" >> "$GITHUB_OUTPUT"
+          echo "time_s=$TIME_S" >> "$GITHUB_OUTPUT"
+
+          echo "peak_mb=$PEAK_MB" > /tmp/metrics.txt
+          echo "time_s=$TIME_S" >> /tmp/metrics.txt
+
+      - name: Upload metrics artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-metrics-${{ steps.pr-ref.outputs.sha || github.sha }}
+          path: /tmp/metrics.txt
+          retention-days: 90
+
+      # --- Baseline: try artifact first, fall back to building main ---
+
+      - name: Download baseline artifact
+        id: baseline-artifact
+        if: github.event_name != 'push' && github.event_name != 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RUN_ID=$(gh run list \
+            -w benchmark-pr.yml -b main -s completed \
+            --json databaseId,conclusion \
+            -q '[.[] | select(.conclusion=="success")][0].databaseId')
+
+          if [ -n "$RUN_ID" ]; then
+            if gh run download "$RUN_ID" -D baseline/ -p "benchmark-metrics-*"; then
+              BASELINE_FILE=$(ls -t baseline/*/metrics.txt 2>/dev/null | head -1)
+              if [ -n "$BASELINE_FILE" ]; then
+                echo "found=true" >> "$GITHUB_OUTPUT"
+                echo "peak_mb=$(grep 'peak_mb=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+                echo "time_s=$(grep 'time_s=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            fi
+          fi
+
+          echo "found=false" >> "$GITHUB_OUTPUT"
+
+      - name: Build and benchmark main (no cached baseline)
+        id: baseline-run
+        if: github.event_name != 'push' && github.event_name != 'workflow_dispatch' && steps.baseline-artifact.outputs.found != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Save current HEAD
+          PR_SHA=$(git rev-parse HEAD)
+
+          # Checkout main and build
+          git fetch origin main
+          git checkout origin/main
+
+          cargo build --release -p cli --features jemalloc-stats
+
+          ./target/release/cli prove "$ELF" -o /tmp/proof.bin --time \
+            | tee /tmp/baseline_output.txt
+          rm -f /tmp/proof.bin
+
+          PEAK_MB=$(grep -o 'Peak heap: [0-9]*' /tmp/baseline_output.txt | awk '{print $3}')
+          TIME_S=$(grep -o 'Proving time: [0-9.]*' /tmp/baseline_output.txt | awk '{print $3}')
+
+          if [ -z "$PEAK_MB" ] || [ -z "$TIME_S" ]; then
+            echo "::error::Failed to parse baseline metrics from CLI output"
+            cat /tmp/baseline_output.txt
+            exit 1
+          fi
+
+          echo "peak_mb=$PEAK_MB" >> "$GITHUB_OUTPUT"
+          echo "time_s=$TIME_S" >> "$GITHUB_OUTPUT"
+
+          # Restore PR checkout
+          git checkout "$PR_SHA"
+
+      # --- Compare ---
+
+      - name: Compare
+        id: compare
+        if: github.event_name != 'push' && github.event_name != 'workflow_dispatch'
+        run: |
+          # Pick baseline source
+          if [ "${{ steps.baseline-artifact.outputs.found }}" = "true" ]; then
+            BASELINE_PEAK=${{ steps.baseline-artifact.outputs.peak_mb }}
+            BASELINE_TIME=${{ steps.baseline-artifact.outputs.time_s }}
+            BASELINE_SRC="cached"
+          else
+            BASELINE_PEAK=${{ steps.baseline-run.outputs.peak_mb }}
+            BASELINE_TIME=${{ steps.baseline-run.outputs.time_s }}
+            BASELINE_SRC="built from main"
+          fi
+
+          CURRENT_PEAK=${{ steps.pr.outputs.peak_mb }}
+          CURRENT_TIME=${{ steps.pr.outputs.time_s }}
+
+          if [ -z "$BASELINE_PEAK" ] || [ "$BASELINE_PEAK" -eq 0 ] 2>/dev/null ||
+             [ -z "$BASELINE_TIME" ]; then
+            echo "::error::Invalid baseline values: peak=$BASELINE_PEAK time=$BASELINE_TIME"
+            exit 1
+          fi
+
+          PEAK_DIFF=$((CURRENT_PEAK - BASELINE_PEAK))
+          PEAK_PCT=$(awk "BEGIN { printf \"%.1f\", ($PEAK_DIFF * 100) / $BASELINE_PEAK }")
+          TIME_DIFF=$(awk "BEGIN { printf \"%.3f\", $CURRENT_TIME - $BASELINE_TIME }")
+          TIME_PCT=$(awk "BEGIN { printf \"%.1f\", (($CURRENT_TIME - $BASELINE_TIME) * 100) / $BASELINE_TIME }")
+
+          echo "baseline_peak=$BASELINE_PEAK" >> "$GITHUB_OUTPUT"
+          echo "baseline_time=$BASELINE_TIME" >> "$GITHUB_OUTPUT"
+          echo "baseline_src=$BASELINE_SRC" >> "$GITHUB_OUTPUT"
+          echo "peak_diff=$PEAK_DIFF" >> "$GITHUB_OUTPUT"
+          echo "peak_pct=$PEAK_PCT" >> "$GITHUB_OUTPUT"
+          echo "time_diff=$TIME_DIFF" >> "$GITHUB_OUTPUT"
+          echo "time_pct=$TIME_PCT" >> "$GITHUB_OUTPUT"
+
+      - name: Comment on PR
+        if: github.event_name != 'push' && github.event_name != 'workflow_dispatch'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const peak = '${{ steps.pr.outputs.peak_mb }}';
+            const time = '${{ steps.pr.outputs.time_s }}';
+            const basePeak = '${{ steps.compare.outputs.baseline_peak }}';
+            const baseTime = '${{ steps.compare.outputs.baseline_time }}';
+            const baseSrc = '${{ steps.compare.outputs.baseline_src }}';
+            const peakPct = '${{ steps.compare.outputs.peak_pct }}';
+            const timePct = '${{ steps.compare.outputs.time_pct }}';
+            const peakDiff = '${{ steps.compare.outputs.peak_diff }}';
+            const timeDiff = '${{ steps.compare.outputs.time_diff }}';
+
+            const fmt = (v) => parseFloat(v) >= 0 ? `+${v}` : v;
+            const icon = (pct) => parseFloat(pct) > 5 ? '🔴' : parseFloat(pct) < -5 ? '🟢' : '⚪';
+
+            let body = `## Benchmark — fib_iterative_372k\n\n`;
+            body += `| Metric | main | PR | Δ |\n`;
+            body += `|--------|------|----|---|\n`;
+            body += `| **Peak heap** | ${basePeak} MB | ${peak} MB | ${fmt(peakDiff)} MB (${fmt(peakPct)}%) ${icon(peakPct)} |\n`;
+            body += `| **Prove time** | ${baseTime}s | ${time}s | ${fmt(timeDiff)}s (${fmt(timePct)}%) ${icon(timePct)} |\n\n`;
+
+            const regression = parseFloat(peakPct) > 5 || parseFloat(timePct) > 5;
+            const improvement = parseFloat(peakPct) < -5 || parseFloat(timePct) < -5;
+            if (regression) {
+              body += `> ⚠️ **Regression detected** — heap or time increased by more than 5%.\n`;
+            } else if (improvement) {
+              body += `> 🎉 **Improvement detected** — heap or time decreased by more than 5%.\n`;
+            } else {
+              body += `> ✅ No significant change.\n`;
+            }
+
+            const sha = '${{ steps.pr-ref.outputs.sha || github.sha }}'.substring(0, 8);
+            body += `\n<sub>Commit: ${sha} · Baseline: ${baseSrc} · Runner: self-hosted bench</sub>\n`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const marker = 'Benchmark — fib_iterative_372k';
+            const existing = comments.find(c =>
+              c.user.type === 'Bot' && c.body.includes(marker)
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body
+              });
+            }
