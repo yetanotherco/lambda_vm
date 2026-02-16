@@ -1,10 +1,6 @@
-#import "/book.typ": style, meta, common-formatting
+#import "/book.typ": meta, common-formatting
 
 #set document(author: meta.authors, title: meta.title)
-
-#style.update((
-  foreground: black,
-))
 
 #align(center, title(meta.title))
 #pagebreak(weak: true)
