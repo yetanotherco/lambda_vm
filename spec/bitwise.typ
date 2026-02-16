@@ -14,8 +14,9 @@
 #let bitwise = raw(chip.name)
 
 #show: book-page(chip.name)
+#let bitwise = raw(chip.name)
 
-The bitwise chips deal with precomputed lookup tables for bitwise boolean operations
+The #bitwise chips deal with precomputed lookup tables for bitwise boolean operations
 and convenience functionalities over small domains.
 
 = Columns

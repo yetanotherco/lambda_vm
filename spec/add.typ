@@ -10,13 +10,13 @@
 #let add = raw(chip.name)
 #let sub = raw("SUB")
 
-#add is a constraint template that is used to assert that $#`sum` = #`lhs` + #`rhs` mod 2^64$, under the condition that `cond` is non-zero.
+#add is a constraint template that is used to assert that $#`sum` equiv #`lhs` + #`rhs` (mod 2^64)$, under the condition that `cond` is non-zero.
 For ease of notation, we moreover introduce the #sub constraint template
 $
-#`SUB<diff; lhs, rhs>` colon.eq #`ADD<lhs; rhs, diff>`,
+#`SUB<diff; lhs, rhs>` := #`ADD<lhs; rhs, diff>`,
 $
 in both conditional and unconditional versions.
-It constrains that $#`diff` = #`lhs` - #`rhs` mod 2^64$ when the expression `cond` is non-zero.
+It constrains that $#`diff` equiv #`lhs` - #`rhs` (mod 2^64)$ when the expression `cond` is non-zero.
 
 = Variables
 #render_chip_column_table(chip, config)

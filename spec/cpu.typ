@@ -13,8 +13,9 @@
 #let chip = load_chip("src/cpu.toml", config)
 
 #show: book-page(chip.name)
+#let cpu = raw(chip.name)
 
-The CPU chip is coordinates memory accesses and dispatches to other chips for arithmetic and logical operations.
+The #cpu chip coordinates memory accesses and dispatches to other chips for arithmetic and logical operations.
 It bases its decisions on the entry of the DECODE table (@decode) corresponding the the current program counter (PC).
 
 = Columns

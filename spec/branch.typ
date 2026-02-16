@@ -13,8 +13,9 @@
 #let chip = load_chip("src/branch.toml", config)
 
 #show: book-page(chip.name)
+#let branch = raw(chip.name)
 
-The BRANCH chip computes the target address of a branching instruction.
+The #branch chip computes the target address of a branching instruction.
 
 = Columns
 #let nr_variables = total_nr_variables(chip)
