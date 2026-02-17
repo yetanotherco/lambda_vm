@@ -13,6 +13,9 @@
 #let chip = load_chip("src/lt.toml", config)
 
 #show: book-page(chip.name)
+#let lt = raw(chip.name)
+
+The #lt chip constrains an indicator bit for the less-than relation, signed or unsigned.
 
 = Columns
 #let nr_variables = total_nr_variables(chip)

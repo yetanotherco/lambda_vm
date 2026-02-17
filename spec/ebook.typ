@@ -1,10 +1,6 @@
-#import "/book.typ": style, meta, common-formatting
+#import "/book.typ": meta, common-formatting
 
 #set document(author: meta.authors, title: meta.title)
-
-#style.update((
-  foreground: black,
-))
 
 #align(center, title(meta.title))
 #pagebreak(weak: true)
@@ -12,6 +8,7 @@
 
 #show: common-formatting
 #show heading: set heading(numbering: "1.1")
+#show raw.where(block: true): set block(fill: luma(230))
 
 #meta.summary.map(((ch, title, ref)) => [
   #pagebreak(weak: true)

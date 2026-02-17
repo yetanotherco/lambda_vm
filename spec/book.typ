@@ -35,6 +35,7 @@
 
 #let common-formatting(body) = {
   set footnote(numbering: "[1]")
+  show raw.where(block: true): it => block(it, inset: 1em, width: 100%, radius: 5pt)
   body
 }
 
@@ -46,16 +47,12 @@
 #let rj = todo.with(background: teal, name: "Robin")
 #let et = todo.with(background: rgb("d4aa3a"), name: "Erik")
 
-#let style = state("style", (
-  foreground: white,
-))
-
 #let aside(title, body) = context figure(
-  block(inset: (left: 1em, right: 1em, bottom: 1em), stroke: style.final().foreground, breakable: false)[
+  block(inset: (left: 1em, right: 1em, bottom: 1em), stroke: luma(50%), breakable: false)[
     #block(inset: (left: 1em, right: 1em, top: .75em, bottom: .75em),
            width: 100% + 2em,
            fill: rgb("55aaff"),
-           stroke: style.final().foreground,
+           stroke: luma(50%),
            align(center, strong(text(fill: black, title))))
     #align(left, body)
 ])
@@ -83,10 +80,9 @@
 
 // Invisibly include another chapter, so that its labels can be resolved
 #let xref-include(f) = {
-  context if f not in _xref-included.get() {
-    hide(box(width: 0%, height: 0%, strip-all(include "/" + f)))
+  context {
+    place(hide(box(width: auto, height: 0%, strip-all(include "/" + f))))
   }
-  context _xref-included.update(x => x + ((f): true))
 }
 
 // Generate a cross-link for references to other chapters.
@@ -102,7 +98,7 @@
     } else {
       // Because shiroa does weird url escaping
       let shiroa-label = label(str(lbl).replace(":", "%3A"))
-      xref-include(ch)
+      context _xref-included.update(x => x + ((ch): true))
       // The ideal would be to use `rf` directly as content argument to `cross-link`,
       // as that would inherit any/all formatting of the ref we want or need.
       // Unfortunately the ref link seems to take precedence over the cross-link hyperlink
@@ -140,7 +136,6 @@
   if is-shiroa {
     (body) => {
       show: common-formatting
-      context _xref-included.update(x => x + ((file): true))
       context _toplevel.update(s => {
         if s == none {
           file
@@ -153,6 +148,9 @@
         #show ref: it => context if _toplevel.final() == file {
           xref(it)
         }
+        #context _xref-included.final().pairs().map(((key, value)) => context if value and cond() {
+          xref-include(key)
+        }).join()
         #body
       ])
     }

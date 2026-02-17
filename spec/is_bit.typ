@@ -9,23 +9,8 @@
 
 #let is_bit = raw(chip.name)
 
-#let highlighted_code(code) = {
-  box(
-    inset: (left: 4pt, right: 4pt), 
-    outset: (top: 4pt, bottom: 4pt), 
-    radius: 2pt,
-    fill: luma(230), 
-    raw(code))
-}
-
 #is_bit is a constraint template that is used to assert that a variable lies in the range ${0, 1}$ if some second variable is non-zero.
 Barring exceptional cases, this template is used to assert that a variable of type `Bit` assumes a valid value under some condition.
-
-= Interface
-The #is_bit constraint template has the following interface:
-#block(radius: 5pt, width: 100%, inset: 1.5em, fill: luma(230), raw("cond => IS_BIT<X>"))
-where `cond` is any value described by an expression _of degree at most $1$_.
-Note that #highlighted_code("IS_BIT<X>") can be used to denote the _unconditional_ application of the #is_bit template to `X`.
 
 = Variables
 The #is_bit template operates on two variables: `cond` and `X`:

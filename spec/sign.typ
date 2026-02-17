@@ -9,20 +9,7 @@
 
 #let sign = raw(chip.name)
 
-#let highlighted_code(code) = {
-  box(
-    inset: (left: 4pt, right: 4pt), 
-    outset: (top: 4pt, bottom: 4pt), 
-    radius: 2pt,
-    fill: luma(230), 
-    raw(code))
-}
-
 #sign is a constraint template that is used to extract a `Half`word's sign.
-
-= Interface
-The #sign constraint template has the following interface:
-#block(radius: 5pt, width: 100%, inset: 1.5em, fill: luma(230), raw("SIGN<sign; X, signed>"))
 It constrains that `sign` is set to `1` when both `X`'s most significant bit and `signed` are $1$, and $0$ otherwise.
 
 = Variables

@@ -16,20 +16,7 @@
 
 #show: book-page(chip.name)
 
-= Interface
-The #shift chip has the following interface:
-#block(radius: 5pt, width: 100%, inset: 1.5em, fill: luma(240), 
-```
-// param in: the value being shifted
-// param shift: the number of bits to shift `in` by
-// param direction: whether to shift left (0) or right (1) 
-// param signed: whether to interpret `in` as a signed (1) or unsigned (0) integer
-// param word_instr: whether to execute the SLL/SR* (0) or SLLW/SR*W (1) instruction
-// out shifted: the resulting value
-SHIFT[shifted: DWord; in: DWord, shift: Byte, direction: Bit, signed: Bit, word_instr: Bit]
-```
-)
-In other words, the #shift chip is designed to constrain that 
+The #shift chip is designed to constrain that 
 $ 
 #`shifted` := cases(
   #`in` #`<<` #`s` " if" #`direction` = 0,
