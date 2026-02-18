@@ -896,9 +896,13 @@ pub trait IsStarkVerifier<
         // the prover's forking and makes per-table verification independent.
 
         for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
-            // Fork transcript with domain separator (must match prover)
+            // Must match prover: fork with domain separator for multi-table,
+            // use original transcript directly for single-table.
+            let num_tables = airs.len();
             let mut table_transcript = transcript.clone();
-            table_transcript.append_bytes(&(idx as u64).to_le_bytes());
+            if num_tables > 1 {
+                table_transcript.append_bytes(&(idx as u64).to_le_bytes());
+            }
 
             // Phase C: replay aux commitment
             if let Some(root) = proof.lde_trace_aux_merkle_root {

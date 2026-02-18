@@ -1253,9 +1253,13 @@ pub trait IsStarkProver<
             .zip(domains.iter())
             .enumerate()
         {
-            // Fork transcript with domain separator
+            // For multi-table proofs, fork the transcript with a domain separator
+            // so each table derives independent challenges. Single-table proofs
+            // use the original transcript directly (no fork, no separator).
             let mut table_transcript = transcript.clone();
-            table_transcript.append_bytes(&(idx as u64).to_le_bytes());
+            if num_airs > 1 {
+                table_transcript.append_bytes(&(idx as u64).to_le_bytes());
+            }
 
             // Phase C: build and commit aux trace
             let round_1_result = Self::round_1_build_auxiliary_trace(
