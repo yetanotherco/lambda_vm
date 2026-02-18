@@ -17,6 +17,17 @@ pub struct StoneProverTranscript {
     spare_bytes: Vec<u8>,
 }
 
+impl Clone for StoneProverTranscript {
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state,
+            seed_increment: self.seed_increment,
+            counter: self.counter,
+            spare_bytes: self.spare_bytes.clone(),
+        }
+    }
+}
+
 impl StoneProverTranscript {
     /// The maximum multiple of the modulus of `p` that fits in 256 bits, where
     /// `p = 0x800000000000011000000000000000000000000000000000000000000000001`
