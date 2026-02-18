@@ -10,10 +10,6 @@
 //! assert!(lambda_vm_prover::verify(&vm_proof, &elf_bytes).unwrap());
 //! ```
 
-#[cfg(feature = "dhat-heap")]
-#[global_allocator]
-static ALLOC: dhat::Alloc = dhat::Alloc;
-
 pub mod constraints;
 #[cfg(feature = "debug-checks")]
 mod debug_report;
@@ -42,9 +38,20 @@ use crate::test_utils::{
     create_mul_air, create_page_air, create_register_air,
 };
 
-use crate::tables::page::DEFAULT_STACK_SIZE;
-use stark::proof::options::ProofOptions;
+use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
 use stark::proof::stark::MultiProof;
+
+/// A run-length encoded range of contiguous zero-initialized 4KB pages.
+///
+/// Represents `count` contiguous pages starting at `base`, used for
+/// runtime-allocated memory (stack, heap) not covered by ELF segments.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RuntimePageRange {
+    /// Base address of the first page (4KB-aligned).
+    pub base: u64,
+    /// Number of contiguous 4KB pages starting at `base`.
+    pub count: u64,
+}
 
 /// A complete VM proof bundle containing the STARK proof and metadata
 /// needed by the verifier to reconstruct the AIR configuration.
@@ -52,9 +59,10 @@ use stark::proof::stark::MultiProof;
 pub struct VmProof {
     /// The multi-table STARK proof.
     pub proof: MultiProof<F, E, ()>,
-    /// Stack size used during proving (bytes). The verifier uses this to
-    /// reconstruct the PAGE table layout.
-    pub stack_size: u64,
+    /// Run-length encoded runtime page ranges.
+    /// These are zero-initialized pages accessed during execution but not
+    /// covered by ELF segments (stack, heap, etc.).
+    pub runtime_page_ranges: Vec<RuntimePageRange>,
 }
 
 /// Error type for the prover crate.
@@ -222,7 +230,10 @@ impl VmAirs {
 
 /// Prove an ELF binary execution. Returns a serializable proof bundle.
 pub fn prove(elf_bytes: &[u8]) -> Result<VmProof, Error> {
-    prove_with_options(elf_bytes, &ProofOptions::default_proving_options())
+    prove_with_options(
+        elf_bytes,
+        &GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid"),
+    )
 }
 
 /// Prove an ELF binary execution with custom proof options and stack size.
@@ -236,10 +247,12 @@ pub fn prove_with_options(
         .run()
         .map_err(|e| Error::Execution(format!("{e}")))?;
 
-    // Generate all traces from ELF and execution logs
-    // This uses the combined ELF processing to generate DECODE and PAGE tables
-    let mut traces = Traces::from_elf_and_logs(&program, &result.logs, DEFAULT_STACK_SIZE)?;
+    // Generate all traces from ELF and execution logs.
+    // Page tables are derived from the prover's MemoryState (all accessed pages).
+    let mut traces = Traces::from_elf_and_logs(&program, &result.logs)?;
     let airs = VmAirs::new(&program, proof_options, false, &traces.page_configs);
+
+    let runtime_page_ranges = traces.runtime_page_ranges();
 
     let proof = Prover::multi_prove(
         airs.air_trace_pairs(&mut traces),
@@ -249,21 +262,20 @@ pub fn prove_with_options(
 
     Ok(VmProof {
         proof,
-        stack_size: DEFAULT_STACK_SIZE,
+        runtime_page_ranges,
     })
 }
 
 /// Verify a proof produced by [`prove`] using default proof options.
 ///
-/// Uses [`ProofOptions::default_proving_options`] for verification — the
-/// `proof_options` stored in [`VmProof`] are metadata only and NOT trusted.
-/// `stack_size` is extracted from the proof; it is safe to trust because
-/// preprocessed commitments bind the verifier to the correct page layout.
+/// Uses [`GoldilocksCubicProofOptions::with_blowup(2)`] for verification.
+/// `runtime_page_ranges` from the proof are hints — preprocessed commitments
+/// bind the verifier to the correct page layout.
 pub fn verify(vm_proof: &VmProof, elf_bytes: &[u8]) -> Result<bool, Error> {
     verify_with_options(
         vm_proof,
         elf_bytes,
-        &ProofOptions::default_proving_options(),
+        &GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid"),
     )
 }
 
@@ -278,7 +290,8 @@ pub fn verify_with_options(
     proof_options: &ProofOptions,
 ) -> Result<bool, Error> {
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
-    let page_configs = Traces::page_configs_from_elf(&program, vm_proof.stack_size);
+    let page_configs =
+        Traces::page_configs_from_elf_and_runtime(&program, &vm_proof.runtime_page_ranges);
     let airs = VmAirs::new(&program, proof_options, false, &page_configs);
 
     Ok(Verifier::multi_verify(

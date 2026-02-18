@@ -145,57 +145,55 @@ fn pr_message_summary(
 pub fn slack_message(old_report: LinesOfCodeReport, new_report: LinesOfCodeReport) -> String {
     let diff_total = new_report.lambda_vm.abs_diff(old_report.lambda_vm);
 
-    let crates_mrkdwn =
-        new_report
-            .crates
-            .iter()
-            .fold(String::new(), |acc, (crate_name, loc)| {
-                let old_loc = old_report
-                    .crates
-                    .iter()
-                    .find(|(old_crate_name, _)| old_crate_name == crate_name)
-                    .map(|(_, old_loc)| old_loc)
-                    .unwrap_or(&0);
+    let crates_mrkdwn = new_report
+        .crates
+        .iter()
+        .fold(String::new(), |acc, (crate_name, loc)| {
+            let old_loc = old_report
+                .crates
+                .iter()
+                .find(|(old_crate_name, _)| old_crate_name == crate_name)
+                .map(|(_, old_loc)| old_loc)
+                .unwrap_or(&0);
 
-                let loc_diff = loc.abs_diff(*old_loc);
-                format!(
-                    "{}*{}*: {} {}\\n",
-                    acc,
-                    crate_name,
-                    loc,
-                    match loc.cmp(old_loc) {
-                        std::cmp::Ordering::Greater => format!("(+{loc_diff})"),
-                        std::cmp::Ordering::Less => format!("(-{loc_diff})"),
-                        std::cmp::Ordering::Equal => "".to_string(),
-                    }
-                )
-            });
+            let loc_diff = loc.abs_diff(*old_loc);
+            format!(
+                "{}*{}*: {} {}\\n",
+                acc,
+                crate_name,
+                loc,
+                match loc.cmp(old_loc) {
+                    std::cmp::Ordering::Greater => format!("(+{loc_diff})"),
+                    std::cmp::Ordering::Less => format!("(-{loc_diff})"),
+                    std::cmp::Ordering::Equal => "".to_string(),
+                }
+            )
+        });
 
-    let tools_mrkdwn =
-        new_report
-            .tools
-            .iter()
-            .fold(String::new(), |acc, (tool_name, loc)| {
-                let old_loc = old_report
-                    .tools
-                    .iter()
-                    .find(|(old_tool_name, _)| old_tool_name == tool_name)
-                    .map(|(_, old_loc)| old_loc)
-                    .unwrap_or(&0);
+    let tools_mrkdwn = new_report
+        .tools
+        .iter()
+        .fold(String::new(), |acc, (tool_name, loc)| {
+            let old_loc = old_report
+                .tools
+                .iter()
+                .find(|(old_tool_name, _)| old_tool_name == tool_name)
+                .map(|(_, old_loc)| old_loc)
+                .unwrap_or(&0);
 
-                let loc_diff = loc.abs_diff(*old_loc);
-                format!(
-                    "{}*{}*: {} {}\\n",
-                    acc,
-                    tool_name,
-                    loc,
-                    match loc.cmp(old_loc) {
-                        std::cmp::Ordering::Greater => format!("(+{loc_diff})"),
-                        std::cmp::Ordering::Less => format!("(-{loc_diff})"),
-                        std::cmp::Ordering::Equal => "".to_string(),
-                    }
-                )
-            });
+            let loc_diff = loc.abs_diff(*old_loc);
+            format!(
+                "{}*{}*: {} {}\\n",
+                acc,
+                tool_name,
+                loc,
+                match loc.cmp(old_loc) {
+                    std::cmp::Ordering::Greater => format!("(+{loc_diff})"),
+                    std::cmp::Ordering::Less => format!("(-{loc_diff})"),
+                    std::cmp::Ordering::Equal => "".to_string(),
+                }
+            )
+        });
 
     let tools_block = if !new_report.tools.is_empty() {
         format!(
@@ -277,31 +275,30 @@ pub fn slack_message(old_report: LinesOfCodeReport, new_report: LinesOfCodeRepor
 pub fn github_step_summary(old_report: LinesOfCodeReport, new_report: LinesOfCodeReport) -> String {
     let diff_total = new_report.lambda_vm.abs_diff(old_report.lambda_vm);
 
-    let crates_github =
-        new_report
-            .crates
-            .iter()
-            .fold(String::new(), |acc, (crate_name, loc)| {
-                let old_loc = old_report
-                    .crates
-                    .iter()
-                    .find(|(old_crate_name, _)| old_crate_name == crate_name)
-                    .map(|(_, old_loc)| old_loc)
-                    .unwrap_or(&0);
+    let crates_github = new_report
+        .crates
+        .iter()
+        .fold(String::new(), |acc, (crate_name, loc)| {
+            let old_loc = old_report
+                .crates
+                .iter()
+                .find(|(old_crate_name, _)| old_crate_name == crate_name)
+                .map(|(_, old_loc)| old_loc)
+                .unwrap_or(&0);
 
-                let loc_diff = loc.abs_diff(*old_loc);
-                format!(
-                    "{}{}: {} {}\n",
-                    acc,
-                    crate_name,
-                    loc,
-                    match loc.cmp(old_loc) {
-                        std::cmp::Ordering::Greater => format!("(+{loc_diff})"),
-                        std::cmp::Ordering::Less => format!("(-{loc_diff})"),
-                        std::cmp::Ordering::Equal => "".to_string(),
-                    }
-                )
-            });
+            let loc_diff = loc.abs_diff(*old_loc);
+            format!(
+                "{}{}: {} {}\n",
+                acc,
+                crate_name,
+                loc,
+                match loc.cmp(old_loc) {
+                    std::cmp::Ordering::Greater => format!("(+{loc_diff})"),
+                    std::cmp::Ordering::Less => format!("(-{loc_diff})"),
+                    std::cmp::Ordering::Equal => "".to_string(),
+                }
+            )
+        });
 
     let tools_github = if !new_report.tools.is_empty() {
         let tools_list = new_report
@@ -328,10 +325,7 @@ pub fn github_step_summary(old_report: LinesOfCodeReport, new_report: LinesOfCod
                     }
                 )
             });
-        format!(
-            "\nlambda_vm tools loc\n=================\n{}",
-            tools_list
-        )
+        format!("\nlambda_vm tools loc\n=================\n{}", tools_list)
     } else {
         String::new()
     };

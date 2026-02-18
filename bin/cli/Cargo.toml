@@ -10,3 +10,8 @@ stark = { path = "../../crypto/stark" }
 crypto = { path = "../../crypto/crypto" }
 clap = { version = "4.3.10", features = ["derive"] }
 bincode = "1"
+tikv-jemallocator = "0.6"
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"], optional = true }
+
+[features]
+jemalloc-stats = ["dep:tikv-jemalloc-ctl"]

@@ -134,8 +134,7 @@ fn test_prove_elfs_sub_fast() {
     let _ = env_logger::builder().is_test(true).try_init();
     let (elf, logs, _instructions) = run_asm_elf("sub");
     // Use from_elf_and_logs to get PAGE and REGISTER tables for Memory bus
-    let mut traces =
-        Traces::from_elf_and_logs(&elf, &logs, crate::tables::page::DEFAULT_STACK_SIZE).unwrap();
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
 
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
@@ -450,8 +449,7 @@ fn test_prove_elfs_test_xor_8() {
 #[test]
 fn test_prove_elfs_test_lb_lh_8() {
     let (elf, logs, _instructions) = run_asm_elf("test_lb_lh_8");
-    let mut traces =
-        Traces::from_elf_and_logs(&elf, &logs, crate::tables::page::DEFAULT_STACK_SIZE).unwrap();
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "test_lb_lh_8 failed"
@@ -461,8 +459,7 @@ fn test_prove_elfs_test_lb_lh_8() {
 #[test]
 fn test_prove_elfs_test_sb_sh_8() {
     let (elf, logs, _instructions) = run_asm_elf("test_sb_sh_8");
-    let mut traces =
-        Traces::from_elf_and_logs(&elf, &logs, crate::tables::page::DEFAULT_STACK_SIZE).unwrap();
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "test_sb_sh_8 failed"
@@ -492,8 +489,7 @@ fn test_prove_elfs_all_branches_16() {
 #[test]
 fn test_prove_elfs_all_loadstore_32() {
     let (elf, logs, _instructions) = run_asm_elf("all_loadstore_32");
-    let mut traces =
-        Traces::from_elf_and_logs(&elf, &logs, crate::tables::page::DEFAULT_STACK_SIZE).unwrap();
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "all_loadstore_32 failed"
@@ -545,36 +541,6 @@ fn test_prove_elfs_all_instructions_64_full() {
     assert!(
         result,
         "all_instructions_64_full failed - comprehensive test with full bitwise table"
-    );
-}
-
-/// Memory profiling test using dhat.
-///
-/// Run with:
-/// ```
-/// cargo test -p prover --release --features dhat-heap test_dhat_memory_profile -- --ignored --nocapture
-/// ```
-///
-/// This generates `dhat-heap.json` which can be viewed with:
-/// https://nnethercote.github.io/dh_view/dh_view.html
-#[test]
-#[ignore]
-fn test_dhat_memory_profile() {
-    #[cfg(feature = "dhat-heap")]
-    let _profiler = dhat::Profiler::new_heap();
-
-    let program_name = "loop_4096";
-    let (elf, logs, instructions) = run_asm_elf(program_name);
-
-    // Output metadata for CI parsing
-    println!("MEMORY_PROFILE_PROGRAM={}", program_name);
-    println!("MEMORY_PROFILE_INSTRUCTIONS={}", logs.len());
-
-    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone()).unwrap();
-
-    assert!(
-        prove_and_verify_vm_minimal(&elf, &mut traces),
-        "verification failed"
     );
 }
 
@@ -914,8 +880,7 @@ fn test_debug_memory_tokens_sb_sh() {
     use std::collections::HashMap;
 
     let (elf, logs, _instructions) = run_asm_elf("test_sb_sh_8");
-    let traces =
-        Traces::from_elf_and_logs(&elf, &logs, crate::tables::page::DEFAULT_STACK_SIZE).unwrap();
+    let traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
 
     println!("DEBUG: test_sb_sh_8 Memory bus tokens (FULL)");
     println!("  MEMW rows: {}", traces.memw.num_rows());
@@ -1286,144 +1251,173 @@ fn test_debug_memory_tokens_sb_sh() {
     }
 }
 
-#[test]
-fn test_page_trace_values_debug() {
-    use crate::tables::page::cols as page_cols;
-
-    let (elf, logs, _instructions) = run_asm_elf("test_sb_sh_8");
-    let traces =
-        Traces::from_elf_and_logs(&elf, &logs, crate::tables::page::DEFAULT_STACK_SIZE).unwrap();
-
-    println!("=== Checking PAGE trace values for stack addresses ===");
-
-    // Find the stack page (PAGE 3)
-    for (i, (trace, config)) in traces
-        .pages
-        .iter()
-        .zip(traces.page_configs.iter())
-        .enumerate()
-    {
-        let page_base = config.page_base;
-        if page_base == 0xFFFF_FFFF_FFFF_F000 {
-            println!(
-                "Found stack page at index {} with base 0x{:016x}",
-                i, page_base
-            );
-
-            // Check row 4064 (offset 0xFE0, address 0xFFFF_FFFF_FFFF_FFE0)
-            let row = 4064;
-            let offset = trace.main_table.get(row, page_cols::OFFSET).to_raw();
-            let init = trace.main_table.get(row, page_cols::INIT).to_raw();
-            let fini = trace.main_table.get(row, page_cols::FINI).to_raw();
-            let ts_lo = trace.main_table.get(row, page_cols::TIMESTAMP_LO).to_raw();
-            let ts_hi = trace.main_table.get(row, page_cols::TIMESTAMP_HI).to_raw();
-
-            println!("Row {} (addr 0xFFFF_FFFF_FFFF_FFE0):", row);
-            println!("  offset = {} (expected 4064)", offset);
-            println!("  init = {} (expected 0)", init);
-            println!("  fini = {} (expected 66 = 0x42)", fini);
-            println!("  ts_lo = {} (expected 24)", ts_lo);
-            println!("  ts_hi = {} (expected 0)", ts_hi);
-
-            // Check row 4066 (offset 0xFE2, address 0xFFFF_FFFF_FFFF_FFE2)
-            let row = 4066;
-            let offset = trace.main_table.get(row, page_cols::OFFSET).to_raw();
-            let init = trace.main_table.get(row, page_cols::INIT).to_raw();
-            let fini = trace.main_table.get(row, page_cols::FINI).to_raw();
-            let ts_lo = trace.main_table.get(row, page_cols::TIMESTAMP_LO).to_raw();
-
-            println!("Row {} (addr 0xFFFF_FFFF_FFFF_FFE2):", row);
-            println!("  offset = {} (expected 4066)", offset);
-            println!("  init = {} (expected 0)", init);
-            println!("  fini = {} (expected 137 = 0x89)", fini);
-            println!("  ts_lo = {} (expected 28)", ts_lo);
-
-            // Compute what the AIR would see for address_lo
-            let page_lo = page_base & 0xFFFF_FFFF;
-            let page_hi = page_base >> 32;
-            println!("\nAIR would compute:");
-            println!("  page_lo = {} (0x{:08x})", page_lo, page_lo);
-            println!("  page_hi = {} (0x{:08x})", page_hi, page_hi);
-            println!(
-                "  For row 4064: addr_lo = page_lo + offset = {} + 4064 = {}",
-                page_lo,
-                page_lo + 4064
-            );
-            println!("  Expected: 0xFFFF_FFE0 = {}", 0xFFFF_FFE0u64);
-        }
-    }
-}
-
-/// Test with a single PAGE table to isolate the issue
-#[test]
-#[ignore] // Intentionally removes 3 of 4 PAGE tables, so Memory bus won't balance
-fn test_single_page_table_balance() {
-    let (elf, logs, _instructions) = run_asm_elf("test_sb_sh_8");
-    let mut traces =
-        Traces::from_elf_and_logs(&elf, &logs, crate::tables::page::DEFAULT_STACK_SIZE).unwrap();
-
-    println!("Original PAGE tables: {}", traces.pages.len());
-    println!("PAGE configs:");
-    for (i, config) in traces.page_configs.iter().enumerate() {
-        println!("  {}: base=0x{:016x}", i, config.page_base);
-    }
-
-    // Keep only the stack page (PAGE 3, which contains the accessed addresses)
-    let stack_page_idx = traces
-        .page_configs
-        .iter()
-        .position(|c| c.page_base == 0xFFFF_FFFF_FFFF_F000)
-        .expect("Stack page not found");
-
-    println!(
-        "Using only PAGE {} (stack page at 0xFFFF_FFFF_FFFF_F000)",
-        stack_page_idx
-    );
-
-    let single_page_trace = traces.pages.remove(stack_page_idx);
-    let single_page_config = traces.page_configs.remove(stack_page_idx);
-
-    traces.pages = vec![single_page_trace];
-    traces.page_configs = vec![single_page_config];
-
-    // Run the prover
-    let result = prove_and_verify_vm_minimal(&elf, &mut traces);
-
-    println!(
-        "Single PAGE table test: {}",
-        if result { "PASSED" } else { "FAILED" }
-    );
-    assert!(result, "Single PAGE table test failed");
-}
-
 // =============================================================================
 // Deep stack tests (page coverage)
 // =============================================================================
 
 /// deep_stack allocates 8192 bytes, writing at SP = 0x...DFF0 (page D000).
-/// Default stack_size=4096 only creates pages E000+F000, so page D000 is
-/// missing and the memory bus cannot balance → verification must fail.
+/// MemoryState-based page detection auto-discovers all accessed pages.
 #[test]
-fn test_deep_stack_default_stack_size_fails() {
+fn test_deep_stack_passes() {
     let (elf, logs, _instructions) = run_asm_elf("deep_stack");
-    let mut traces =
-        Traces::from_elf_and_logs(&elf, &logs, crate::tables::page::DEFAULT_STACK_SIZE).unwrap();
-
-    assert!(
-        !prove_and_verify_vm_minimal(&elf, &mut traces),
-        "deep_stack should FAIL with default stack_size (page D000 not initialized)"
-    );
-}
-
-/// Same program but with stack_size=8192, which adds page D000.
-/// All accessed addresses are now covered → verification must succeed.
-#[test]
-fn test_deep_stack_large_stack_size_passes() {
-    let (elf, logs, _instructions) = run_asm_elf("deep_stack");
-    let mut traces = Traces::from_elf_and_logs(&elf, &logs, 8192).unwrap();
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
 
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
-        "deep_stack should PASS with stack_size=8192 (page D000 initialized)"
+        "deep_stack should PASS (MemoryState auto-discovers all accessed pages)"
+    );
+}
+
+/// Tests the full prove → VmProof → verify roundtrip for deep_stack.
+///
+/// Verifies that `runtime_page_ranges` is correctly extracted by the prover
+/// and used by the verifier to reconstruct page configs for non-ELF pages.
+#[test]
+fn test_deep_stack_runtime_pages_roundtrip() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("deep_stack");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+
+    let proof_options = ProofOptions::default_test_options();
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+    let mut traces = Traces::from_elf_and_logs(&elf, &result.logs).unwrap();
+
+    let runtime_page_ranges = traces.runtime_page_ranges();
+    assert!(
+        !runtime_page_ranges.is_empty(),
+        "deep_stack should have runtime page ranges beyond ELF (stack pages)"
+    );
+
+    let prover_airs = crate::VmAirs::new(&elf, &proof_options, true, &traces.page_configs);
+    let proof = Prover::multi_prove(
+        prover_airs.air_trace_pairs(&mut traces),
+        &mut DefaultTranscript::<E>::new(&[]),
+    )
+    .expect("Prover failed");
+
+    // Verifier reconstructs from ELF + runtime_page_ranges hint
+    let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges);
+    let verifier_airs = crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs);
+
+    let verified = Verifier::multi_verify(
+        &verifier_airs.air_refs(),
+        &proof,
+        &mut DefaultTranscript::<E>::new(&[]),
+    );
+    assert!(
+        verified,
+        "Verifier should accept proof when using runtime_page_ranges hint"
+    );
+}
+
+/// Tests that the verifier REJECTS when runtime_page_ranges hint is incomplete.
+///
+/// The prover generates a proof for deep_stack (which needs page D000).
+/// The verifier is given an empty hint (no runtime pages) → commitment
+/// mismatch → verification must fail.
+#[test]
+fn test_deep_stack_missing_pages_rejected() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("deep_stack");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+
+    let proof_options = ProofOptions::default_test_options();
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+    let mut traces = Traces::from_elf_and_logs(&elf, &result.logs).unwrap();
+
+    // Prover uses correct page configs (auto-detected from MemoryState)
+    let prover_airs = crate::VmAirs::new(&elf, &proof_options, true, &traces.page_configs);
+    let proof = Prover::multi_prove(
+        prover_airs.air_trace_pairs(&mut traces),
+        &mut DefaultTranscript::<E>::new(&[]),
+    )
+    .expect("Prover failed");
+
+    // Verifier uses EMPTY runtime_page_ranges → missing stack/heap pages
+    let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[]);
+    let verifier_airs = crate::VmAirs::new(&elf, &proof_options, true, &wrong_configs);
+
+    let verified = Verifier::multi_verify(
+        &verifier_airs.air_refs(),
+        &proof,
+        &mut DefaultTranscript::<E>::new(&[]),
+    );
+    assert!(
+        !verified,
+        "Verifier should REJECT when runtime_page_ranges is incomplete (missing pages)"
+    );
+}
+
+// =============================================================================
+// Heap allocation tests (runtime page detection)
+// =============================================================================
+
+/// heap_alloc writes to 4 pages (0x80000..0x83000) far from ELF segments and
+/// stack, plus a stack write. Tests that MemoryState-based page detection
+/// discovers all heap and stack pages, and run-length encodes them.
+#[test]
+fn test_heap_alloc_passes() {
+    let (elf, logs, _instructions) = run_asm_elf("heap_alloc");
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
+
+    // Verify runtime_page_ranges encodes the heap pages as a contiguous range
+    let ranges = traces.runtime_page_ranges();
+    // 4 contiguous heap pages (0x80000..0x83000) should be one range
+    assert!(
+        ranges.iter().any(|r| r.base == 0x80000 && r.count == 4),
+        "Expected contiguous heap range (0x80000, 4), got {:?}",
+        ranges
+    );
+
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "heap_alloc should PASS (MemoryState detects heap + stack pages)"
+    );
+}
+
+/// Full prove → VmProof → verify roundtrip for heap_alloc.
+/// Verifies the hint correctly conveys heap page ranges to the verifier.
+#[test]
+fn test_heap_alloc_runtime_pages_roundtrip() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("heap_alloc");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+
+    let proof_options = ProofOptions::default_test_options();
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+    let mut traces = Traces::from_elf_and_logs(&elf, &result.logs).unwrap();
+
+    let runtime_page_ranges = traces.runtime_page_ranges();
+
+    // Should have a range covering heap pages 0x80000..0x83000
+    let total_pages: u64 = runtime_page_ranges.iter().map(|r| r.count).sum();
+    assert!(
+        total_pages >= 5,
+        "Expected at least 5 runtime pages (4 heap + 1 stack), got {}",
+        total_pages
+    );
+
+    let prover_airs = crate::VmAirs::new(&elf, &proof_options, true, &traces.page_configs);
+    let proof = Prover::multi_prove(
+        prover_airs.air_trace_pairs(&mut traces),
+        &mut DefaultTranscript::<E>::new(&[]),
+    )
+    .expect("Prover failed");
+
+    // Verifier reconstructs from ELF + runtime hint (ranges decoded to pages)
+    let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges);
+    let verifier_airs = crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs);
+
+    let verified = Verifier::multi_verify(
+        &verifier_airs.air_refs(),
+        &proof,
+        &mut DefaultTranscript::<E>::new(&[]),
+    );
+    assert!(
+        verified,
+        "Verifier should accept heap_alloc proof with correct runtime_page_ranges"
     );
 }
