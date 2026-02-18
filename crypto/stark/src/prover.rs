@@ -1247,12 +1247,11 @@ pub trait IsStarkProver<
         let mut all_bus_public_inputs: Vec<Option<BusPublicInputs<FieldExtension>>> =
             Vec::with_capacity(num_airs);
 
-        for (idx, (((air, trace, pub_inputs), (main, main_evaluations)), domain)) in
-            air_trace_pairs
-                .iter_mut()
-                .zip(main_commitments)
-                .zip(domains.iter())
-                .enumerate()
+        for (idx, (((air, trace, pub_inputs), (main, main_evaluations)), domain)) in air_trace_pairs
+            .iter_mut()
+            .zip(main_commitments)
+            .zip(domains.iter())
+            .enumerate()
         {
             // Fork transcript with domain separator
             let mut table_transcript = transcript.clone();
