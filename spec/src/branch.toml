@@ -11,7 +11,7 @@ pad = 0
 
 [[variables.input]]
 name = "offset"
-type = "Word"
+type = "DWordWL"
 desc = "The offset from the base address to jump to"
 pad = 0
 
@@ -34,7 +34,7 @@ pad = 0
 name = "next_pc_high"
 type = ["Half", 3]
 desc = "The upper part of the next pc"
-pad = 0 # TODO(#128): improve handling for arrays
+pad = ["arr", 0, 0, 0]
 
 [[variables.output]]
 name = "next_pc_low"
@@ -59,7 +59,7 @@ name = "next_pc_unmasked"
 type = "DWordWL"
 desc = "The combination of `next_pc_high`, `next_pc_low[1]` and `unmasked_low_byte` to constrain the addition. This is the computed value for the next pc, before masking off the LSB as required by the ISA."
 def = {idx = "i", polys = [
-  {iter = 0, poly = ["+", ["*", ["^", 2, 16], ["idx", "next_pc_high", 0]], ["*", ["^", 2, 8], ["idx", "next_pc_low", 1]], ["idx", "unmasked_low_byte", 0]]},
+  {iter = 0, poly = ["+", ["*", ["^", 2, 16], ["idx", "next_pc_high", 0]], ["*", ["^", 2, 8], ["idx", "next_pc_low", 1]], "unmasked_low_byte"]},
   {iter = 1, poly = ["+", ["*", ["^", 2, 16], ["idx", "next_pc_high", 2]], ["idx", "next_pc_high", 1]]},
 ]}
 
@@ -124,13 +124,13 @@ multiplicity = "μ"
 [[constraints.all]]
 kind = "interaction"
 tag = "AND_BYTE"
-input = [["idx", "unmasked_low_byte", 0], 254]
+input = ["unmasked_low_byte", 254]
 output = ["idx", "next_pc_low", 0]
 multiplicity = "μ"
 
 [[constraints.all]]
 kind = "interaction"
-tag = "IS_HALFWORD"
+tag = "IS_HALF"
 input = [["idx", "next_pc_high", "i"]]
 iter = ["i", 0, 2]
 multiplicity = "μ"
@@ -145,4 +145,4 @@ kind = "interaction"
 tag = "BRANCH"
 input = ["pc", "offset", "register", "JALR"]
 output = "next_pc"
-multiplicity = "-μ"
+multiplicity = ["-", "μ"]

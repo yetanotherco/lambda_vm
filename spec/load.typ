@@ -13,18 +13,22 @@
 #let chip = load_chip("src/load.toml", config)
 
 #show: book-page(chip.name)
+#let load = raw(chip.name)
 
-== Columns
+The #load chip provides functionality to read values from memory and sign-extend them where appropriate.
+It delegates low-level memory handling to the `MEMW` chip (@memw).
+
+= Columns
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
 
 The `LOAD` chip is comprised of #nr_variables variables that are expressed using #nr_columns columns:
 #render_chip_column_table(chip, config)
 
-== Assumptions
+= Assumptions
 #render_chip_assumptions(chip, config)
 
-== Constraints
+= Constraints
 The chip delegates the actual memory interaction to the `MEMW` chip,
 and ensures correctness of the requested sign/zero extension.
 The output `res` is correctly range-checked as long as the memory contents are.
@@ -35,7 +39,7 @@ The chip contributes the following to the lookup argument.
 
 #render_constraint_table(chip, config, groups: "output")
 
-== Padding
+= Padding
 
 The table can be padded to the next power of two with the following value assignments:
 

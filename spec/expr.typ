@@ -28,6 +28,7 @@
 // <expr> ::= ()                           ; ""
 //          | var                          ; str(var)
 //          | int                          ; int
+//          | ["arr", expr, ...]           ; [expr, ...]
 //          | ["idx", expr1, expr2]        ; expr1[expr2]
 //          | ["not", expr]                ; !expr
 //          | ["+", expr1, expr2, ...]     ; expr1 + expr2 + ...
@@ -91,8 +92,9 @@
 // Typeset an expression as code
 #let expr_to_code = make_expr_formatter(
   (
+    "arr": (pp, rec, e) => `[` + e.slice(1).map(rec.with(PREC.MAX)).join(`, `) + `]`,
     "idx": (pp, rec, e) => rec(PREC.MIN, e.at(1)) + `[` + rec(PREC.MAX, e.at(2)) + `]`,
-    "not": (pp, rec, e) => cwrap(`1 - ` + rec(PREC.not, e.at(1)), pp < PREC.not),
+    "not": (pp, rec, e) => cwrap(rec(PREC.not, 1) + ` - ` + rec(PREC.not, e.at(1)), pp < PREC.not),
     "+": (pp, rec, e) => cwrap(e.slice(1).map(rec.with(PREC.add)).join(` + `), pp < PREC.add),
     "sum": (pp, rec, e) => assert(false, message: "sum is unsupported in code."),
     "*": (pp, rec, e) => {
@@ -149,11 +151,12 @@
 // Typeset an expression as math
 #let expr_to_math = make_expr_formatter(
   (
+    "arr": (pp, rec, e) => $[#e.slice(1).map(rec.with(PREC.MAX)).join($, $)]$,
     "idx": (pp, rec, e) => {
       let (val, idxs) = flat_idxs(e)
       $#rec(PREC.idx, val)_(#idxs.map(idx => rec(PREC.idx, idx)).join($, $))$
     },
-    "not": (pp, rec, e) => mwrap($1 - #rec(PREC.not, e.at(1))$, pp < PREC.not),
+    "not": (pp, rec, e) => mwrap(rec(PREC.not, 1) + $ - #rec(PREC.not, e.at(1))$, pp < PREC.not),
     "+": (pp, rec, e) => mwrap($#e.slice(1).map(rec.with(PREC.add)).join($+$)$, pp < PREC.add),
     "sum": (pp, rec, e) => {
       assert(e.len() == 4, message: "invalid sum:" + repr(e))

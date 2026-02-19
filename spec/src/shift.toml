@@ -65,19 +65,19 @@ pad = 1
 name = "X"
 type = ["Half", 5]
 desc = "scratch variable."
-pad = 0 # TODO: array
+pad = ["arr", 0, 0, 0, 0, 0]
 
 [[variables.auxiliary]]
 name = "Y"
 type = ["Half", 4]
 desc = "scratch variable."
-pad = 0 # TODO: array
+pad = ["arr", 0, 0, 0, 0]
 
 [[variables.auxiliary]]
 name = "limb_shift"
 type = ["Bit", 4]
 desc = "One-hot vector indicating whether $floor.l #`shift` / 16 floor.r equiv i mod s$, where $s = 2$ when $#`word_instr` = 1$ and $4$ otherwise."
-pad = 0 # TODO: array
+pad = ["arr", 0, 0, 0, 0]
 
 # Virtual
 
@@ -133,7 +133,7 @@ pad = 0
 # Assumptions
 
 [[assumptions]]
-desc = "`IS_HALFWORD[in[i]]`"
+desc = "`IS_HALF[in[i]]`"
 iter = ["i", 0, 3]
 ref = "shift:a:range_in"
 
@@ -198,8 +198,8 @@ ref = "shift:c:bit_shift_if_right"
 multiplicity = "right"
 
 [[constraints.bit_shift]]
-kind = "template"
-tag = "IsZero"
+kind = "interaction"
+tag = "ZERO"
 input = ["bit_shift"]
 output = "zbs"
 ref = "shift:c:zbs"
@@ -292,5 +292,5 @@ kind = "interaction"
 tag = "SHIFT"
 input = ["in", "shift", "direction", "signed", "word_instr"]
 output = "out"
-multiplicity = "-μ"
+multiplicity = ["-", "μ"]
 ref = "shift:c:lookup"

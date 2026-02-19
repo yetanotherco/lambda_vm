@@ -52,9 +52,9 @@
 #let render_chip_padding_table(chip, config) = {
   // Whether `var` is a preprocessed variable.
   let is_preprocessed(var) = {
-    config.variables.types
+    let type = config.variables.types
     .filter(t => t.label == var.type)
-    .all(t => t.at("preprocessed", default: false))
+    type.len() > 0 and type.all(t => t.at("preprocessed", default: false))
   }
 
   let instantiated_vars = config.variables.categories.instantiated.map(c => chip.variables.at(c, default: ())).flatten()
@@ -113,7 +113,6 @@
     }
 
     if "poly" in def {
-      // assert(false, message: repr(index_all(var_name, gather_indices(def))))
       (
         [],
         table.cell(align: right, emph[definition]), 
@@ -156,7 +155,7 @@
       (table.header(level:2, table.cell(colspan: 4, emph(cat))), table.hline(stroke: .6pt))
       for var in vars {
         (
-          [#raw(var.name)], 
+          [#raw(var.name)],
           [#type_to_code(var.type)], 
           table.cell(colspan: 2, [#eval(var.desc, mode: "markup")])
         )

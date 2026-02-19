@@ -13,25 +13,27 @@
 #let chip = load_chip("src/cpu.toml", config)
 
 #show: book-page(chip.name)
+#let cpu = raw(chip.name)
 
-== Columns
+The #cpu chip coordinates memory accesses and dispatches to other chips for arithmetic and logical operations.
+It bases its decisions on the entry of the `DECODE` table (@decode) corresponding the the current program counter (PC).
+
+= Columns
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
 
 The `CPU` chip is comprised of #nr_variables variables that are expressed using #nr_columns columns:
 #render_chip_column_table(chip, config)
 
-== Assumptions
+= Assumptions
 #render_chip_assumptions(chip, config)
 
-== Constraints
+= Constraints
 First, we perform a decoding lookup for the current PC.
 
 #render_constraint_table(chip, config, groups: "decode")
 
-#rj[All casts for interactions will have to be reviewed once other chip interfaces stabilise]
-
-=== Range checks
+== Range checks
 
 We constrain all columns to have the appropriate ranges.
 The flags and register indices looked up from the decoding need to be checked,
@@ -46,13 +48,13 @@ The ranges of the other auxiliary columns are enforced through later constraints
 
 #render_constraint_table(chip, config, groups: "range")
 
-=== ALU
+== ALU
 
 The ALU functionality is then obtained through judicious dispatching to the corresponding chips.
 
 #render_constraint_table(chip, config, groups: "alu")
 
-=== Memory
+== Memory
 
 The interactions with the memory, both for register loading and storing, as for `LOAD` and `STORE` instructions are handled.
 Note that since registers need no byte-addressing, we store them in the memory argument with `Word` limbs.
@@ -62,29 +64,28 @@ to ensure the access is disjoint with the `pc` read into `rv1` as part of the `A
 
 #render_constraint_table(chip, config, groups: "mem")
 
-=== System
+== System
 
 The interactions with the wider system.
 
 #render_constraint_table(chip, config, groups: "sys")
 
-=== Input and output to the ALU
+== Input and output to the ALU
 
 We constrain `arg1`, `arg2` and `rvd` to correspond to the wanted values,
 including the appropriate sign/zero extension, depending on `word_instr`.
 
 #render_constraint_table(chip, config, groups: "ext")
 
-=== Other constraints
-
-#rj[proper ref to IsZero/IsEqual]
-For @cpu:c:is_equal, refer to the logic of IsZero or IsEqual, in combination with the subtraction of @cpu:c:sub.
+== Other constraints
+For @cpu:c:is_equal, note that @cpu:c:sub sets `res` to be the difference between `arg1` and `arg2` whenever `BEQ` is $1$.
+Given that this difference is $0$ when both are equal, @cpu:c:is_equal ensures `is_equal` is set to $1$ if and only if $#`arg1` = #`arg2`$ and `BEQ` is set.
 
 #render_constraint_table(chip, config, groups: "misc")
 
 #rj[Document the choice to not have a multiplicity column here for padding]
 
-== Padding
+= Padding
 
 The CPU can be padded with the following values, which have a corresponding row
 in the DECODE table, at the _odd_ address 1, only reachable through a HALT ecall.
