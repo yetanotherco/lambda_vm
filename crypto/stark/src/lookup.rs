@@ -691,7 +691,6 @@ where
         let last_row = trace.num_rows() - 1;
         Some(BusPublicInputs {
             initial_terms,
-            initial_value: trace.get_aux(0, acc_col_idx).clone(),
             final_accumulated: trace.get_aux(last_row, acc_col_idx).clone(),
             #[cfg(feature = "debug-checks")]
             per_bus_sums,
@@ -917,8 +916,6 @@ where
     /// Term column values at row 0 (one per interaction).
     /// Used for boundary constraints that enforce term_i(0) = initial_terms[i].
     pub initial_terms: Vec<FieldElement<E>>,
-    /// Accumulated column value at row 0
-    pub initial_value: FieldElement<E>,
     /// Accumulated column value at last row (total sum of all terms)
     pub final_accumulated: FieldElement<E>,
     /// Per-bus sums for this table (bus_id → sum) - for debug aggregation
