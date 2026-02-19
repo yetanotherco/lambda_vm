@@ -54,10 +54,11 @@ The $j$-th _interaction_ $Interaction_j$ of table $Table_i$ is defined by the fo
   [the _type identifier_ of the interaction, usually the identifier of the chip that is constraining the relation expected to hold within the looked-up tuple.],
   [$numElements_(i,j) in NN$], 
   [the _length_ of the tuple of elements being looked-up.],
-  [$weightFunction_(i,j) : FF^(numColumns_i) arrow FF^(numElements_j)$],
-  [the _weight function_ that maps row elements of table $Table_i$ to the looked-up tuple.],
-  [$multiplicity_(i,j) in [numColumns] union {1_BaseField, dots}$],
-  [the _multiplicity_ of the interaction, as either a column index in table $Table_i$ or a constant value.]
+  [
+    $weightFunction_(i,j) : FF^(numColumns_i) & arrow FF^(numElements_(i,j) + 1) \
+    R & mapsto arrow(t)_(i,j) || mu_(i,j)$
+  ],
+  [the _weight function_ that maps a row $R$ of table $Table_i$ to the looked-up tuple $arrow(t)_(i,j)$ and its multiplicity $mu_(i,j) in BaseField$.],
 )
 
 
@@ -80,17 +81,19 @@ The $j$-th _interaction_ $Interaction_j$ of table $Table_i$ is defined by the fo
 
     + Initialise a _table running sum column_ $S_i in ExtensionField^(numRows_i)$ with $S_i [0] = 0_ExtensionField$ in the first row.
 
-    + For each $j$-th row $R_j in BaseField^(numColumns_i)$ of $Table_i$, for $j in [numRows_i]$:
+    + *Constrain* the table running sum column to begin at $0_ExtensionField$.
+
+    + For each $j$-th row $R_j in BaseField^(numColumns_i)$ of $Table_i$, for $j in [numRows_i - 1]$:
       + For each $k$-th interaction $Interaction_k$ of table $Table_i$:
-        + Compute the _interaction contribution numerator_ $ n_(j,k) = cases(R_j [multiplicity] quad & "if" multiplicity in [numColumns]",", multiplicity & "otherwise.") $
-        + If $n eq.not 0$, compute the _interaction contribution denominator_ $ d_(j,k) = logupChallenge + fingerprintCoeff dot id_(i,k) + sum_(l = 0)^(numElements - 1) fingerprintCoeff^(l + 2) dot weightFunction_(i,k) (R_j)[l]. $
+        + Compute the _interaction contribution numerator_ $ n_(j,k) = mu_(i,k) = w_(i,k)(R_j)[numElements_(i,k)] $
+        + If $n eq.not 0$, compute the _interaction contribution denominator_ $ d_(j,k) = logupChallenge + fingerprintCoeff dot id_(i,k) + sum_(l = 0)^(numElements_(i,k) - 1) fingerprintCoeff^(l + 2) dot weightFunction_(i,k) (R_j)[l]. $
         + Save the _interaction contribution_ as $n_(j,k)/d_(j,k) in ExtensionField$ in the corresponding interaction contribution column for this interaction.
-        + *Constrain* the interaction contribution column according to the definitions of $n$ and $d$.
+        + *Constrain* the interaction contribution column according to the definitions of $n$ and~$d$.
 
       + Compute the _row contribution_ as the sum $s_(j) = sum_k n_(j,k) / d_(j,k)$ and compute the next row's table running sum value $S_i [j+1] = S_i [j] + s_(j)$.
 
       + *Constrain* the update of the next row's running sum value.
 
-  + Batch-commit to every table's interaction contribution columns and running sum columns with the column commitment scheme and commit to the table's overall contribution $S_i [N_i]$ by sending it in the clear to the verifier.
+  + Batch-commit to every table's interaction contribution columns and running sum columns with the column commitment scheme and commit to the table's overall contribution $S_i [N_i - 1]$ by sending it in the clear to the verifier.
 
-+ Verifier checks that the sum of every table's overall contribution is equal to zero: $sum_i S_i [N_i] = 0_ExtensionField$, and delegates the checks of the constraints to the STARK.
++ Verifier checks that the sum of every table's overall contribution is equal to zero: $sum_i S_i [N_i - 1] = 0_ExtensionField$, and delegates the checks of the constraints to the STARK.
