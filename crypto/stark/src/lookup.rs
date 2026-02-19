@@ -682,9 +682,15 @@ where
         let acc_col_idx = num_interactions;
         build_accumulated_column(acc_col_idx, num_interactions, trace);
 
-        // Return single BusPublicInputs for the accumulated column
+        // Collect term column values at row 0 (public inputs for row-0 boundary constraints)
+        let initial_terms: Vec<FieldElement<E>> = (0..num_interactions)
+            .map(|i| trace.get_aux(0, i).clone())
+            .collect();
+
+        // Return BusPublicInputs with initial terms and accumulated column endpoints
         let last_row = trace.num_rows() - 1;
         Some(BusPublicInputs {
+            initial_terms,
             initial_value: trace.get_aux(0, acc_col_idx).clone(),
             final_accumulated: trace.get_aux(last_row, acc_col_idx).clone(),
             #[cfg(feature = "debug-checks")]
@@ -716,23 +722,24 @@ where
     ) -> BoundaryConstraints<E> {
         let mut boundary_constraints = vec![];
 
-        // Boundary constraints for the accumulated column only
-        // (term columns are fully determined by main trace and don't need boundary constraints)
-        if let Some(acc_interaction) = bus_public_inputs {
-            // The accumulated column is at index = num_interactions
+        if let Some(bus_inputs) = bus_public_inputs {
             let acc_col_idx = self.auxiliary_trace_build_data.interactions.len();
 
-            // Constraint for row 0: accumulated column must start with initial_value
-            boundary_constraints.push(BoundaryConstraint::new_aux(
-                acc_col_idx,
-                0,
-                acc_interaction.initial_value.clone(),
-            ));
-            // Constraint for last row: accumulated column must end with final_accumulated
+            // One boundary constraint per term column at row 0: term_i(0) = initial_terms[i].
+            // This makes each term's initial value a verifier-enforced public input.
+            for (i, term_value) in bus_inputs.initial_terms.iter().enumerate() {
+                boundary_constraints.push(BoundaryConstraint::new_aux(i, 0, term_value.clone()));
+            }
+
+            // Boundary constraint for the accumulated column at row 0: acc(0) = Σ initial_terms.
+            let initial_acc: FieldElement<E> = bus_inputs.initial_terms.iter().cloned().sum();
+            boundary_constraints.push(BoundaryConstraint::new_aux(acc_col_idx, 0, initial_acc));
+
+            // Boundary constraint for the accumulated column at last row.
             boundary_constraints.push(BoundaryConstraint::new_aux(
                 acc_col_idx,
                 trace_length - 1,
-                acc_interaction.final_accumulated.clone(),
+                bus_inputs.final_accumulated.clone(),
             ));
         }
 
@@ -907,6 +914,9 @@ pub struct BusPublicInputs<E>
 where
     E: IsField,
 {
+    /// Term column values at row 0 (one per interaction).
+    /// Used for boundary constraints that enforce term_i(0) = initial_terms[i].
+    pub initial_terms: Vec<FieldElement<E>>,
     /// Accumulated column value at row 0
     pub initial_value: FieldElement<E>,
     /// Accumulated column value at last row (total sum of all terms)
