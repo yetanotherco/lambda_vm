@@ -27,6 +27,7 @@
     ("load.typ", [LOAD chip], <load>),
     ("ecall.typ", [ECALL chips], <ecall>),
     ("bitwise.typ", [BITWISE chips], <bitwise>),
+    ("stark.typ", [STARK protocol], <stark>),
   )
 )
 #book-meta(
