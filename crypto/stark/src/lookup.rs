@@ -726,8 +726,18 @@ where
 
             // One boundary constraint per term column at row 0: term_i(0) = initial_terms[i].
             // This makes each term's initial value a verifier-enforced public input.
-            for (i, term_value) in bus_inputs.initial_terms.iter().enumerate() {
-                boundary_constraints.push(BoundaryConstraint::new_aux(i, 0, term_value.clone()));
+            // We iterate over acc_col_idx (= num_interactions) rather than initial_terms.len()
+            // so that a proof with a shorter initial_terms vector — which would otherwise omit
+            // constraints and allow acc[0] to be offset — still produces the full expected set.
+            // Missing entries default to zero; since logup terms equal sign*m/fp with fp ≠ 0
+            // (by Fiat-Shamir), any honest term is non-zero and the mismatch fails verification.
+            for i in 0..acc_col_idx {
+                let expected = bus_inputs
+                    .initial_terms
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(FieldElement::zero);
+                boundary_constraints.push(BoundaryConstraint::new_aux(i, 0, expected));
             }
 
             // Boundary constraint for the accumulated column at row 0: acc(0) = Σ initial_terms.

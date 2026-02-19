@@ -662,9 +662,11 @@ fn test_tampered_accumulator_first_row() {
     // the verifier will enforce term_col_0(ω^0) = corrupted value, but the
     // committed trace has the honest value, causing the composition poly check to fail.
     let add_proof = &mut multi_proof.proofs[1]; // proofs: [cpu=0, add=1, mul=2]
-    if let Some(bus_inputs) = add_proof.bus_public_inputs.as_mut() {
-        bus_inputs.initial_terms[0] = bus_inputs.initial_terms[0].clone() + FieldElement::one();
-    }
+    let bus_inputs = add_proof
+        .bus_public_inputs
+        .as_mut()
+        .expect("ADD table must have bus public inputs");
+    bus_inputs.initial_terms[0] = bus_inputs.initial_terms[0].clone() + FieldElement::one();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
@@ -732,11 +734,13 @@ fn test_tampered_acc_ood_first_row() {
         Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     // Corrupt the acc column OOD evaluation in the ADD table proof.
-    // ADD has 4 main columns and 1 interaction, so the aux layout is:
+    // ADD has 4 main columns + 1 interaction column + 1 acc column, so the aux layout is:
     //   column 4 (OOD) = term column,  column 5 (OOD) = acc column
     // initial_terms is kept honest, so the verifier's expected value Σ initial_terms
     // is correct. But acc(z) no longer matches it → composition poly check fails.
-    let acc_col_ood_idx = 5; // 4 main + 1 term
+    let num_main = 4usize;
+    let num_interactions = 1usize;
+    let acc_col_ood_idx = num_main + num_interactions;
     let add_proof = &mut multi_proof.proofs[1]; // proofs: [cpu=0, add=1, mul=2]
     let corrupted = add_proof
         .trace_ood_evaluations
