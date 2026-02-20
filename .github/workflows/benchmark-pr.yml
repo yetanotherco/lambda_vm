@@ -152,8 +152,8 @@ jobs:
           HEAP_MAX=$(echo $HEAPS | tr ' ' '\n' | sort -n | tail -1)
           HEAP_SPREAD=$(awk "BEGIN { if ($HEAP_MEDIAN > 0) printf \"%.1f\", (($HEAP_MAX - $HEAP_MIN) / $HEAP_MEDIAN) * 100; else print \"0.0\" }")
 
-          ALL_TIMES=$(echo $TIMES | tr ' ' '\n' | sort -n | paste -sd '/' -)
-          ALL_HEAPS=$(echo $HEAPS | tr ' ' '\n' | sort -n | paste -sd '/' -)
+          ALL_TIMES=$(echo $TIMES | tr ' ' '\n' | paste -sd '/' -)
+          ALL_HEAPS=$(echo $HEAPS | tr ' ' '\n' | paste -sd '/' -)
 
           echo "peak_mb=$HEAP_MEDIAN" >> "$GITHUB_OUTPUT"
           echo "time_s=$TIME_MEDIAN" >> "$GITHUB_OUTPUT"
@@ -264,8 +264,8 @@ jobs:
           HEAP_MAX=$(echo $HEAPS | tr ' ' '\n' | sort -n | tail -1)
           HEAP_SPREAD=$(awk "BEGIN { if ($HEAP_MEDIAN > 0) printf \"%.1f\", (($HEAP_MAX - $HEAP_MIN) / $HEAP_MEDIAN) * 100; else print \"0.0\" }")
 
-          ALL_TIMES=$(echo $TIMES | tr ' ' '\n' | sort -n | paste -sd '/' -)
-          ALL_HEAPS=$(echo $HEAPS | tr ' ' '\n' | sort -n | paste -sd '/' -)
+          ALL_TIMES=$(echo $TIMES | tr ' ' '\n' | paste -sd '/' -)
+          ALL_HEAPS=$(echo $HEAPS | tr ' ' '\n' | paste -sd '/' -)
 
           echo "peak_mb=$HEAP_MEDIAN" >> "$GITHUB_OUTPUT"
           echo "time_s=$TIME_MEDIAN" >> "$GITHUB_OUTPUT"
