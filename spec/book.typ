@@ -28,6 +28,7 @@
     ("ecall.typ", [ECALL chips], <ecall>),
     ("bitwise.typ", [BITWISE chips], <bitwise>),
     ("stark.typ", [STARK protocol], <stark>),
+    ("verifier.typ", [Verifier specification], <verifier>),
   )
 )
 #book-meta(
