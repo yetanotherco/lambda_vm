@@ -833,8 +833,8 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        // Check if any AIR uses LogUp (has auxiliary trace for running sums)
-        let needs_logup_challenges = airs.iter().any(|air| air.has_trace_interaction());
+        // Check if any AIR has an auxiliary trace
+        let needs_lookup_challenges = airs.iter().any(|air| air.has_aux_trace());
 
         // =====================================================================
         // Round 1, Phase A: Replay main trace commitments
@@ -880,7 +880,7 @@ pub trait IsStarkVerifier<
         // =====================================================================
         // Must match exactly what the prover sampled.
 
-        let logup_challenges: Vec<FieldElement<FieldExtension>> = if needs_logup_challenges {
+        let lookup_challenges: Vec<FieldElement<FieldExtension>> = if needs_lookup_challenges {
             (0..LOGUP_NUM_CHALLENGES)
                 .map(|_| transcript.sample_field_element())
                 .collect()
@@ -899,11 +899,45 @@ pub trait IsStarkVerifier<
         }
 
         // =====================================================================
+        // Validate bus_public_inputs presence and length against AIR layout
+        // =====================================================================
+        // A dishonest prover could omit bus_public_inputs entirely (None) to
+        // bypass the bus balance check and boundary constraints, or submit fewer
+        // initial_terms than expected to skip term boundary constraints.
+
+        for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
+            if air.has_trace_interaction() && proof.bus_public_inputs.is_none() {
+                error!(
+                    "Table {idx}: AIR has LogUp interactions but proof is missing bus_public_inputs"
+                );
+                return false;
+            }
+            if let Some(bus_inputs) = &proof.bus_public_inputs {
+                let num_aux = air.num_auxiliary_rap_columns();
+                if num_aux == 0 {
+                    error!(
+                        "Table {idx}: proof has bus_public_inputs but AIR has no auxiliary columns"
+                    );
+                    return false;
+                }
+                let expected_interactions = num_aux - 1;
+                if bus_inputs.initial_terms.len() != expected_interactions {
+                    error!(
+                        "Table {idx}: initial_terms length mismatch: got {}, expected {}",
+                        bus_inputs.initial_terms.len(),
+                        expected_interactions
+                    );
+                    return false;
+                }
+            }
+        }
+
+        // =====================================================================
         // Rounds 2-4: Verify each proof
         // =====================================================================
 
         for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
-            if !Self::verify_rounds_2_to_4(*air, proof, transcript, logup_challenges.clone()) {
+            if !Self::verify_rounds_2_to_4(*air, proof, transcript, lookup_challenges.clone()) {
                 error!(
                     "Table {} failed verify_rounds_2_to_4 (num_constraints={}, trace_cols={})",
                     idx,
@@ -921,7 +955,7 @@ pub trait IsStarkVerifier<
         // The sign (sender vs receiver) is already baked into the accumulated values,
         // so the bus balances when the sum of all accumulated values equals zero.
 
-        if needs_logup_challenges {
+        if needs_lookup_challenges {
             let mut total = FieldElement::<FieldExtension>::zero();
             for proof in &multi_proof.proofs {
                 if let Some(interaction) = &proof.bus_public_inputs {

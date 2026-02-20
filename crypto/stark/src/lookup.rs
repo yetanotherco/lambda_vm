@@ -631,6 +631,10 @@ where
         self.trace_layout
     }
 
+    fn has_trace_interaction(&self) -> bool {
+        !self.auxiliary_trace_build_data.interactions.is_empty()
+    }
+
     fn composition_poly_degree_bound(&self, trace_length: usize) -> usize {
         trace_length * 2
     }
@@ -726,18 +730,10 @@ where
 
             // One boundary constraint per term column at row 0: term_i(0) = initial_terms[i].
             // This makes each term's initial value a verifier-enforced public input.
-            // We iterate over acc_col_idx (= num_interactions) rather than initial_terms.len()
-            // so that a proof with a shorter initial_terms vector — which would otherwise omit
-            // constraints and allow acc[0] to be offset — still produces the full expected set.
-            // Missing entries default to zero; since logup terms equal sign*m/fp with fp ≠ 0
-            // (by Fiat-Shamir), any honest term is non-zero and the mismatch fails verification.
-            for i in 0..acc_col_idx {
-                let expected = bus_inputs
-                    .initial_terms
-                    .get(i)
-                    .cloned()
-                    .unwrap_or_else(FieldElement::zero);
-                boundary_constraints.push(BoundaryConstraint::new_aux(i, 0, expected));
+            // The verifier rejects proofs where initial_terms.len() != num_interactions
+            // before reaching constraint evaluation, so the length of initia_term is guaranteed to be correct.
+            for (i, expected) in bus_inputs.initial_terms.iter().enumerate() {
+                boundary_constraints.push(BoundaryConstraint::new_aux(i, 0, expected.clone()));
             }
 
             // Boundary constraint for the accumulated column at row 0: acc(0) = Σ initial_terms.

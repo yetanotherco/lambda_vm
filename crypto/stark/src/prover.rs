@@ -575,7 +575,7 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let (aux, aux_evaluations, bus_public_inputs) = if air.has_trace_interaction() {
+        let (aux, aux_evaluations, bus_public_inputs) = if air.has_aux_trace() {
             let bus_public_inputs = air.build_auxiliary_trace(trace, &rap_challenges);
             let Some((
                 aux_trace_polys,
@@ -1195,10 +1195,10 @@ pub trait IsStarkProver<
 
         let num_airs = air_trace_pairs.len();
 
-        // Check if any AIR uses LogUp (has auxiliary trace for running sums)
-        let needs_logup_challenges = air_trace_pairs
+        // Check if any AIR has an auxiliary trace
+        let needs_lookup_challenges = air_trace_pairs
             .iter()
-            .any(|(air, _, _)| air.has_trace_interaction());
+            .any(|(air, _, _)| air.has_aux_trace());
 
         // =====================================================================
         // Round 1, Phase A: Commit all main traces
@@ -1241,7 +1241,7 @@ pub trait IsStarkProver<
         // For the LogUp bus to balance (sum of fingerprints = 0), all tables
         // must use identical (z, α) challenges. We sample them ONCE here.
 
-        let logup_challenges: Vec<FieldElement<FieldExtension>> = if needs_logup_challenges {
+        let lookup_challenges: Vec<FieldElement<FieldExtension>> = if needs_lookup_challenges {
             (0..LOGUP_NUM_CHALLENGES)
                 .map(|_| transcript.sample_field_element())
                 .collect()
@@ -1267,7 +1267,7 @@ pub trait IsStarkProver<
                 transcript,
                 main,
                 main_evaluations,
-                logup_challenges.clone(),
+                lookup_challenges.clone(),
             )?;
             round_1_results.push(round_1_result);
         }
