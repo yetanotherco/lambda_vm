@@ -3,18 +3,13 @@ use crate::fft::errors::FFTError;
 use crate::field::errors::FieldError;
 use crate::field::traits::{IsField, IsSubFieldOf};
 use crate::{
-    field::{
-        element::FieldElement,
-        traits::{IsFFTField, RootsConfig},
-    },
+    field::{element::FieldElement, traits::IsFFTField},
     polynomial::Polynomial,
 };
 use alloc::{vec, vec::Vec};
 
 #[cfg(feature = "cuda")]
 use crate::fft::gpu::cuda::polynomial::{evaluate_fft_cuda, interpolate_fft_cuda};
-
-use super::cpu::{ops, roots_of_unity};
 
 impl<E: IsField> Polynomial<FieldElement<E>> {
     /// Returns `N` evaluations of this polynomial using FFT over a domain in a subfield F of E (so the results
