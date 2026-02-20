@@ -111,7 +111,7 @@ jobs:
       - name: Benchmark PR
         id: pr
         run: |
-          RUNS=${{ steps.config.outputs.runs }}
+          RUNS="${{ steps.config.outputs.runs }}"
           TIMES=""
           HEAPS=""
           for i in $(seq 1 $RUNS); do
@@ -225,7 +225,7 @@ jobs:
 
           cargo build --release -p cli --features jemalloc-stats
 
-          RUNS=${{ steps.config.outputs.runs }}
+          RUNS="${{ steps.config.outputs.runs }}"
           TIMES=""
           HEAPS=""
           for i in $(seq 1 $RUNS); do
