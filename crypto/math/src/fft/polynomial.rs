@@ -208,10 +208,13 @@ where
     F: IsFFTField + IsSubFieldOf<E>,
     E: IsField,
 {
-    let order = coeffs.len().trailing_zeros();
-    let twiddles = roots_of_unity::get_twiddles::<F>(order.into(), RootsConfig::BitReverse)?;
-    // Bit reverse order is needed for NR DIT FFT.
-    ops::fft(coeffs, &twiddles)
+    let order = coeffs.len().trailing_zeros() as u64;
+    let layer_twiddles = super::cpu::bowers_fft::LayerTwiddles::<F>::new(order)
+        .ok_or(FFTError::DomainSizeError(order as usize))?;
+    let mut results = coeffs.to_vec();
+    super::cpu::bowers_fft::bowers_fft_opt_fused(&mut results, &layer_twiddles)?;
+    super::cpu::bit_reversing::in_place_bit_reverse_permute(&mut results);
+    Ok(results)
 }
 
 pub fn interpolate_fft_cpu<F, E>(
@@ -221,12 +224,13 @@ where
     F: IsFFTField + IsSubFieldOf<E>,
     E: IsField,
 {
-    let order = fft_evals.len().trailing_zeros();
-    let twiddles =
-        roots_of_unity::get_twiddles::<F>(order.into(), RootsConfig::BitReverseInversed)?;
-
-    let coeffs = ops::fft(fft_evals, &twiddles)?;
+    let order = fft_evals.len().trailing_zeros() as u64;
+    let inv_twiddles = super::cpu::bowers_fft::LayerTwiddles::<F>::new_inverse(order)
+        .ok_or(FFTError::DomainSizeError(order as usize))?;
+    let mut results = fft_evals.to_vec();
+    super::cpu::bit_reversing::in_place_bit_reverse_permute(&mut results);
+    super::cpu::bowers_fft::bowers_ifft_opt(&mut results, &inv_twiddles)?;
 
     let scale_factor = FieldElement::from(fft_evals.len() as u64).inv().unwrap();
-    Ok(Polynomial::new(&coeffs).scale_coeffs(&scale_factor))
+    Ok(Polynomial::new(&results).scale_coeffs(&scale_factor))
 }
