@@ -731,7 +731,7 @@ where
             // One boundary constraint per term column at row 0: term_i(0) = initial_terms[i].
             // This makes each term's initial value a verifier-enforced public input.
             // The verifier rejects proofs where initial_terms.len() != num_interactions
-            // before reaching constraint evaluation, so the length of initia_term is guaranteed to be correct.
+            // before reaching constraint evaluation, so the length of initial_terms is guaranteed to be correct.
             for (i, expected) in bus_inputs.initial_terms.iter().enumerate() {
                 boundary_constraints.push(BoundaryConstraint::new_aux(i, 0, expected.clone()));
             }

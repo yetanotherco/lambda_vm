@@ -761,6 +761,148 @@ fn test_tampered_acc_ood_first_row() {
 }
 
 // =============================================================================
+// Invalid bus public inputs
+// =============================================================================
+
+/// A proof where bus_public_inputs is None for a LogUp AIR is rejected.
+///
+/// The verifier must reject proofs where an AIR declares bus interactions
+/// (has_trace_interaction() = true) but the proof omits bus_public_inputs.
+/// Without this check, a dishonest prover could bypass both the boundary
+/// constraints and the bus balance check.
+#[test_log::test]
+fn test_missing_bus_public_inputs_rejected() {
+    let mut cpu_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::zero(); 4],
+            vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
+        ],
+        1,
+    );
+    let mut add_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()],
+        ],
+        1,
+    );
+    let mut mul_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::zero(); 4],
+            vec![FE::zero(); 4],
+            vec![FE::zero(); 4],
+            vec![FE::zero(); 4],
+        ],
+        1,
+    );
+
+    let proof_options = ProofOptions::default_test_options();
+    let cpu_air = new_cpu_air_with_lookup(&proof_options);
+    let add_air = new_add_air_with_lookup(&proof_options);
+    let mul_air = new_mul_air_with_lookup(&proof_options);
+
+    let air_trace_pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&cpu_air, &mut cpu_trace, &()),
+        (&add_air, &mut add_trace, &()),
+        (&mul_air, &mut mul_trace, &()),
+    ];
+
+    let mut multi_proof =
+        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+
+    // Remove bus_public_inputs from the ADD table proof entirely.
+    multi_proof.proofs[1].bus_public_inputs = None;
+
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        vec![&cpu_air, &add_air, &mul_air];
+
+    assert!(
+        !Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
+        "Proof with missing bus_public_inputs must be rejected"
+    );
+}
+
+/// A proof where initial_terms has fewer elements than expected is rejected.
+///
+/// The verifier checks that initial_terms.len() == num_interactions before
+/// evaluating boundary constraints. A shorter vector would otherwise cause
+/// some term boundary constraints to be silently skipped.
+#[test_log::test]
+fn test_initial_terms_length_mismatch_rejected() {
+    let mut cpu_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::zero(); 4],
+            vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
+        ],
+        1,
+    );
+    let mut add_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()],
+        ],
+        1,
+    );
+    let mut mul_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::zero(); 4],
+            vec![FE::zero(); 4],
+            vec![FE::zero(); 4],
+            vec![FE::zero(); 4],
+        ],
+        1,
+    );
+
+    let proof_options = ProofOptions::default_test_options();
+    let cpu_air = new_cpu_air_with_lookup(&proof_options);
+    let add_air = new_add_air_with_lookup(&proof_options);
+    let mul_air = new_mul_air_with_lookup(&proof_options);
+
+    let air_trace_pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&cpu_air, &mut cpu_trace, &()),
+        (&add_air, &mut add_trace, &()),
+        (&mul_air, &mut mul_trace, &()),
+    ];
+
+    let mut multi_proof =
+        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+
+    // Truncate initial_terms to empty — ADD has 1 interaction so expected length is 1.
+    let add_proof = &mut multi_proof.proofs[1];
+    let bus_inputs = add_proof
+        .bus_public_inputs
+        .as_mut()
+        .expect("ADD table must have bus public inputs");
+    bus_inputs.initial_terms.clear();
+
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        vec![&cpu_air, &add_air, &mul_air];
+
+    assert!(
+        !Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
+        "Proof with initial_terms length mismatch must be rejected"
+    );
+}
+
+// =============================================================================
 // Complex scenarios
 // =============================================================================
 
