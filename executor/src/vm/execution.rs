@@ -83,10 +83,8 @@ impl Executor {
     }
 
     fn get_return_values(&self) -> Result<ReturnValues, ExecutorError> {
-        println!("Final Register Values:\n {}", &self.registers);
         let memory_return_value = self.memory.read_return_value()?;
         let registers_return_values = self.registers.read_return_values();
-        println!("Registers Return Values: {registers_return_values:?}");
 
         Ok(ReturnValues {
             memory_values: memory_return_value,
