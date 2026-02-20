@@ -1258,6 +1258,17 @@ fn build_logup_term_column<F, E>(
             .sum();
 
         fingerprints.push(z - &linear_combination);
+
+        #[cfg(feature = "debug-checks")]
+        crate::bus_debug::log_interaction(
+            table_name,
+            row,
+            table_interaction.bus_id,
+            table_interaction.is_sender,
+            &multiplicities[row].canonical(),
+            &bus_elements,
+            fingerprints.last().unwrap(),
+        );
     }
 
     // Step 2: Batch invert all fingerprints
