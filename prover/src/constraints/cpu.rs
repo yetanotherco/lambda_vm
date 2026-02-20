@@ -85,19 +85,36 @@ pub fn create_is_bit_constraints(constraint_idx_start: usize) -> (Vec<IsBitConst
 ///
 /// Returns the constraints and the next available constraint index.
 pub fn create_add_constraints(constraint_idx_start: usize) -> (Vec<AddConstraint>, usize) {
-    // For ADD operations, we compute: arg1 + arg2 = res
+    // For ADD/LOAD operations, we compute: arg1 + arg2 = res
     // All operands are DWordBL (8 bytes), need to cast to DWordWL (2 words)
 
     let lhs = AddOperand::from_dword_bl(cols::ARG1_0);
     let rhs = AddOperand::from_dword_bl(cols::ARG2_0);
     let sum = AddOperand::from_dword_bl(cols::RES_0);
 
-    // Condition: ADD + LOAD + STORE (active when any of these flags is set)
-    let cond_cols = vec![cols::ADD, cols::LOAD, cols::STORE];
+    // Condition: ADD + LOAD (active when any of these flags is set)
+    let cond_cols = vec![cols::ADD, cols::LOAD];
 
     let (add_c0, add_c1) = AddConstraint::new_pair(cond_cols, lhs, rhs, sum, constraint_idx_start);
 
-    (vec![add_c0, add_c1], constraint_idx_start + 2)
+    // STORE: res = arg1 + imm (separate ADD, because arg2 now holds rv2)
+    // arg1 is DWordBL, imm is DWordWL, res is DWordBL
+    let store_lhs = AddOperand::from_dword_bl(cols::ARG1_0);
+    let store_rhs = AddOperand::dword(cols::IMM_0);
+    let store_sum = AddOperand::from_dword_bl(cols::RES_0);
+    let store_cond = vec![cols::STORE];
+    let (store_c0, store_c1) = AddConstraint::new_pair(
+        store_cond,
+        store_lhs,
+        store_rhs,
+        store_sum,
+        constraint_idx_start + 2,
+    );
+
+    (
+        vec![add_c0, add_c1, store_c0, store_c1],
+        constraint_idx_start + 4,
+    )
 }
 
 // =========================================================================
@@ -755,7 +772,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for NextPcAddCon
 // Arg2 Constraints
 // =========================================================================
 
-/// Constraint: arg2[:4] = (1-STORE-LOAD)*rv2[:2] + (1-BEQ-BLT)*imm[0]
+/// Constraint: arg2[:4] = (1-LOAD)*rv2[:2] + (1-BEQ-BLT-STORE)*imm[0]
 ///
 /// arg2 lower 32 bits comes from either rv2 or imm depending on instruction type.
 pub struct Arg2LowerConstraint {
@@ -800,8 +817,9 @@ impl Arg2LowerConstraint {
 
         let one = FieldElement::<F>::one();
 
-        // (1-STORE-LOAD) * rv2_lower + (1-BEQ-BLT) * imm[0]
-        let expected = (&one - store - load) * rv2_lower + (&one - beq - blt) * imm_0;
+        // (1-LOAD) * rv2_lower + (1-BEQ-BLT-STORE) * imm[0]
+        // STORE now gets rv2 (via rv2_lower), not imm
+        let expected = (&one - load) * rv2_lower + (&one - beq - blt - store) * imm_0;
 
         // Constraint: arg2_lo - expected = 0
         arg2_lo - expected
@@ -839,7 +857,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg2LowerCon
     }
 }
 
-/// Constraint: arg2[4:] = (1-STORE-LOAD)*((1-word_instr)*rv2[2] + signed*arg2_sign_bit*(2^32-1)) + (1-BEQ-BLT)*imm[1]
+/// Constraint: arg2[4:] = (1-LOAD)*((1-word_instr)*rv2[2] + signed*arg2_sign_bit*(2^32-1)) + (1-BEQ-BLT-STORE)*imm[1]
 ///
 /// arg2 upper 32 bits with sign extension logic.
 pub struct Arg2UpperConstraint {
@@ -889,8 +907,9 @@ impl Arg2UpperConstraint {
         // rv2_term = (1 - word_instr) * rv2[2] + signed * arg2_sign_bit * (2^32 - 1)
         let rv2_term = (&one - word_instr) * rv2_upper + signed * arg2_sign_bit * &mask_32;
 
-        // expected = (1-STORE-LOAD) * rv2_term + (1-BEQ-BLT) * imm[1]
-        let expected = (&one - store - load) * rv2_term + (&one - beq - blt) * imm_1;
+        // expected = (1-LOAD) * rv2_term + (1-BEQ-BLT-STORE) * imm[1]
+        // STORE now gets rv2_term (with sign extension), not imm
+        let expected = (&one - load) * rv2_term + (&one - beq - blt - store) * imm_1;
 
         // Constraint: arg2_hi - expected = 0
         arg2_hi - expected
@@ -899,7 +918,7 @@ impl Arg2UpperConstraint {
 
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg2UpperConstraint {
     fn degree(&self) -> usize {
-        // (1-STORE-LOAD) * signed * arg2_sign_bit has degree 3
+        // (1-LOAD) * signed * arg2_sign_bit has degree 3
         3
     }
 
@@ -1165,7 +1184,8 @@ pub fn create_jalr_constraints(constraint_idx_start: usize) -> (Vec<AddConstrain
 /// Total number of CPU constraints.
 ///
 /// - IS_BIT: 30 (all bit flags)
-/// - ADD carry: 2 (for ADD + LOAD + STORE)
+/// - ADD carry: 2 (for ADD + LOAD)
+/// - STORE ADD carry: 2 (for STORE: res = arg1 + imm)
 /// - SUB carry: 2 (for SUB + BEQ)
 /// - JALR carry: 2 (res = pc + instr_size)
 /// - Branch cond: 1
@@ -1180,8 +1200,9 @@ pub fn create_jalr_constraints(constraint_idx_start: usize) -> (Vec<AddConstrain
 /// - Sign bit zero: 1
 /// - Next PC (non-branching): 2
 ///
-/// Total: 54 constraints
-pub const NUM_CPU_CONSTRAINTS: usize = 30 + 2 + 2 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 7 + 1 + 2;
+/// Total: 56 constraints
+pub const NUM_CPU_CONSTRAINTS: usize =
+    30 + 2 + 2 + 2 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 7 + 1 + 2;
 
 /// Creates all CPU constraints.
 ///

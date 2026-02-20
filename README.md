@@ -108,13 +108,17 @@ Full documentation can be found in [docs](./docs/). It is currently a work in pr
 |---------|-------------|
 | `make test` | Run all tests (compiles programs first) |
 | `make test-fast` | Fast tests for prover, stark, and executor (skips slow tests) |
-| `make test-prover` | Prover tests only (fast) |
+| `make test-prover` | Prover tests only |
 | `make test-prover-all` | Prover tests including slow ones |
+| `make test-prover-debug` | Prover tests with bus balance report (`debug-checks` feature) |
 | `make test-asm` | Compile and run ASM tests |
 | `make test-rust` | Compile and run Rust tests |
 | `make test-executor` | Compile all programs and run executor tests |
 | `make build` | Build all workspace crates |
 | `make check` | Check all crates (faster than build, no codegen) |
+| `make clippy` | Run clippy on all crates |
+| `make fmt` | Format all code |
+| `make lint` | Run fmt check + clippy |
 
 ### Full Test Suite
 
@@ -150,6 +154,28 @@ You can create a flamegraph for proof generation using the following target:
 ```
   make flamegraph-prover
 ```
+
+## Debug Checks
+
+The `debug-checks` cargo feature enables extra runtime diagnostics for the proof system:
+
+- **Bus balance report**: After proving, prints whether each LogUp bus is balanced (sum of all interactions equals zero).
+- **Bus mismatch analysis**: When a bus is imbalanced, identifies which rows/tables have orphan or mismatched interactions.
+- **Constraint validation**: Runs `validate_trace` to check that all AIR constraints evaluate to zero on the trace.
+
+To run prover tests with debug output:
+
+```sh
+make test-prover-debug
+```
+
+Or enable it directly:
+
+```sh
+cargo test --release -p lambda-vm-prover --features debug-checks -- --nocapture
+```
+
+The feature is defined in `crypto/stark/Cargo.toml` and forwarded through `prover/Cargo.toml`. It has zero overhead when disabled.
 
 ## Roadmap for the virtual machine
 

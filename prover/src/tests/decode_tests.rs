@@ -758,7 +758,7 @@ fn test_instructions_from_elf_matches_executor() {
     for (pc, executor_instr) in executor_instructions.iter() {
         let verifier_instr = verifier_instructions
             .get(pc)
-            .expect(&format!("Verifier missing instruction at PC {:#x}", pc));
+            .unwrap_or_else(|| panic!("Verifier missing instruction at PC {:#x}", pc));
 
         // Compare by converting to DecodeEntry - this is what the DECODE table uses
         let executor_entry = DecodeEntry::from_instruction(*pc, *executor_instr);
@@ -805,7 +805,7 @@ fn test_instructions_from_elf_matches_executor_complex() {
     for (pc, executor_instr) in executor_instructions.iter() {
         let verifier_instr = verifier_instructions
             .get(pc)
-            .expect(&format!("Verifier missing instruction at PC {:#x}", pc));
+            .unwrap_or_else(|| panic!("Verifier missing instruction at PC {:#x}", pc));
 
         // Compare via DecodeEntry
         let executor_entry = DecodeEntry::from_instruction(*pc, *executor_instr);
@@ -998,18 +998,12 @@ fn test_decode_soundness_same_elf_accepted() {
     use crypto::fiat_shamir::default_transcript::DefaultTranscript;
     use stark::proof::options::ProofOptions;
     use stark::prover::{IsStarkProver, Prover};
-    use stark::traits::AIR;
     use stark::verifier::{IsStarkVerifier, Verifier};
 
-    use crate::tables::decode::{self, commitment_from_elf};
+    use crate::VmAirs;
     use crate::tables::trace_builder::Traces;
-    use crate::tables::types::{GoldilocksExtension, GoldilocksField};
-    use crate::test_utils::{
-        create_bitwise_air, create_branch_air, create_cpu_air, create_decode_air, create_halt_air,
-        create_load_air, create_lt_air, create_memw_air,
-    };
+    use crate::tables::types::GoldilocksExtension;
 
-    type F = GoldilocksField;
     type E = GoldilocksExtension;
 
     let proof_options = ProofOptions::default_test_options();
@@ -1035,71 +1029,22 @@ fn test_decode_soundness_same_elf_accepted() {
         .expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
 
-    let mut traces = Traces::from_logs_minimal(&result.logs, result.instructions).unwrap();
+    let mut traces = Traces::from_elf_and_logs(&prover_elf, &result.logs).unwrap();
+    let prover_airs = VmAirs::new(&prover_elf, &proof_options, false, &traces.page_configs);
 
-    let prover_commitment =
-        commitment_from_elf(&prover_elf, &proof_options).expect("prover commitment");
-
-    let prover_cpu_air = create_cpu_air(&proof_options);
-    let prover_bitwise_air = create_bitwise_air(&proof_options);
-    let prover_lt_air = create_lt_air(&proof_options);
-    let prover_memw_air = create_memw_air(&proof_options);
-    let prover_load_air = create_load_air(&proof_options);
-    let prover_branch_air = create_branch_air(&proof_options);
-    let prover_halt_air = create_halt_air(&proof_options);
-    let prover_decode_air = create_decode_air(&proof_options)
-        .with_preprocessed(prover_commitment, decode::NUM_PRECOMPUTED_COLS);
-
-    let air_trace_pairs: Vec<(
-        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
-        _,
-        _,
-    )> = vec![
-        (&prover_cpu_air, &mut traces.cpu, &()),
-        (&prover_bitwise_air, &mut traces.bitwise, &()),
-        (&prover_lt_air, &mut traces.lt, &()),
-        (&prover_memw_air, &mut traces.memw, &()),
-        (&prover_load_air, &mut traces.load, &()),
-        (&prover_branch_air, &mut traces.branch, &()),
-        (&prover_halt_air, &mut traces.halt, &()),
-        (&prover_decode_air, &mut traces.decode, &()),
-    ];
-
-    let proof = Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
-        .expect("Prover failed to generate proof");
+    let proof = Prover::multi_prove(
+        prover_airs.air_trace_pairs(&mut traces),
+        &mut DefaultTranscript::<E>::new(&[]),
+    )
+    .expect("Prover failed to generate proof");
 
     // =========================================================================
-    // VERIFIER: Loads same ELF independently, computes commitment
+    // VERIFIER: Loads same ELF independently, verifies proof
     // =========================================================================
-    let verifier_commitment =
-        commitment_from_elf(&verifier_elf, &proof_options).expect("verifier commitment");
-
-    // Commitments should match (same ELF)
-    assert_eq!(prover_commitment, verifier_commitment);
-
-    let verifier_cpu_air = create_cpu_air(&proof_options);
-    let verifier_bitwise_air = create_bitwise_air(&proof_options);
-    let verifier_lt_air = create_lt_air(&proof_options);
-    let verifier_memw_air = create_memw_air(&proof_options);
-    let verifier_load_air = create_load_air(&proof_options);
-    let verifier_branch_air = create_branch_air(&proof_options);
-    let verifier_halt_air = create_halt_air(&proof_options);
-    let verifier_decode_air = create_decode_air(&proof_options)
-        .with_preprocessed(verifier_commitment, decode::NUM_PRECOMPUTED_COLS);
-
-    let verifier_airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
-        &verifier_cpu_air,
-        &verifier_bitwise_air,
-        &verifier_lt_air,
-        &verifier_memw_air,
-        &verifier_load_air,
-        &verifier_branch_air,
-        &verifier_halt_air,
-        &verifier_decode_air,
-    ];
+    let verifier_airs = VmAirs::new(&verifier_elf, &proof_options, false, &traces.page_configs);
 
     let result = Verifier::multi_verify(
-        &verifier_airs,
+        &verifier_airs.air_refs(),
         &proof,
         &mut DefaultTranscript::<E>::new(&[]),
     );

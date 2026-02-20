@@ -86,9 +86,9 @@ fn test_cpu_operation_compute_arg2_store() {
     op.decode.imm = 0x1234;
     op.decode.op_store = true;
 
-    // STORE uses imm for address calculation (addr = rv1 + imm)
-    // rv2 is the value being stored, not part of address
-    assert_eq!(op.compute_arg2(), 0x1234);
+    // STORE: arg2 = rv2 (the data being stored)
+    // Address is computed separately as res = arg1 + imm
+    assert_eq!(op.compute_arg2(), 0xDEAD_BEEF);
 }
 
 #[test]
@@ -324,10 +324,11 @@ fn test_bus_interactions_count() {
     // - 1 M7 (STORE to memory)
     // - 1 DECODE (instruction fetch)
     // - 1 MUL (multiplication)
+    // - 1 DVRM (division/remainder)
     // - 1 BRANCH (branch/jump target calculation)
     // - 1 ECALL (send to HALT table)
-    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 5 + 1 + 1 + 1 + 1 = 38
-    assert_eq!(interactions.len(), 38);
+    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 5 + 1 + 1 + 1 + 1 + 1 = 39
+    assert_eq!(interactions.len(), 39);
 }
 
 #[test]

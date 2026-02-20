@@ -81,6 +81,8 @@ pub enum BusId {
     Lt,
     /// Multiplication: MUL[lhs, lhs_signed, rhs, rhs_signed, hi] -> product
     Mul,
+    /// Division/Remainder: DVRM[result; n, d, signed, muldiv_selector]
+    Dvrm,
     /// Shift operation: SHIFT[in, shift, dir, signed, word] -> out
     Shift,
 
@@ -104,6 +106,65 @@ pub enum BusId {
     Decode,
     /// System call handling
     Ecall,
+}
+
+impl BusId {
+    /// Human-readable name for debug output.
+    pub fn name(&self) -> &'static str {
+        match self {
+            BusId::IsByte => "IsByte",
+            BusId::IsHalfword => "IsHalfword",
+            BusId::IsB20 => "IsB20",
+            BusId::AndByte => "AndByte",
+            BusId::OrByte => "OrByte",
+            BusId::XorByte => "XorByte",
+            BusId::Msb8 => "Msb8",
+            BusId::Msb16 => "Msb16",
+            BusId::Zero => "Zero",
+            BusId::Hwsl => "Hwsl",
+            BusId::Hwslc => "Hwslc",
+            BusId::Lt => "Lt",
+            BusId::Mul => "Mul",
+            BusId::Shift => "Shift",
+            BusId::Memw => "Memw",
+            BusId::Load => "Load",
+            BusId::Memory => "Memory",
+            BusId::Branch => "Branch",
+            BusId::Decode => "Decode",
+            BusId::Ecall => "Ecall",
+            BusId::Dvrm => "Dvrm",
+        }
+    }
+}
+
+impl TryFrom<u64> for BusId {
+    type Error = u64;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(BusId::IsByte),
+            1 => Ok(BusId::IsHalfword),
+            2 => Ok(BusId::IsB20),
+            3 => Ok(BusId::AndByte),
+            4 => Ok(BusId::OrByte),
+            5 => Ok(BusId::XorByte),
+            6 => Ok(BusId::Msb8),
+            7 => Ok(BusId::Msb16),
+            8 => Ok(BusId::Zero),
+            9 => Ok(BusId::Hwsl),
+            10 => Ok(BusId::Hwslc),
+            11 => Ok(BusId::Lt),
+            12 => Ok(BusId::Mul),
+            13 => Ok(BusId::Shift),
+            14 => Ok(BusId::Memw),
+            15 => Ok(BusId::Load),
+            16 => Ok(BusId::Memory),
+            17 => Ok(BusId::Branch),
+            18 => Ok(BusId::Decode),
+            19 => Ok(BusId::Ecall),
+            other => Err(other),
+        }
+    }
 }
 
 impl From<BusId> for u64 {
@@ -625,16 +686,16 @@ impl DecodeEntry {
             }
 
             Instruction::EcallEbreak => {
-                // Determine if ECALL or EBREAK based on context
-                // For now, default to ECALL
+                // ECALL is handled specially: the executor Log returns src1_val=0, src2_val=0,
+                // dst_val=0 for Halt syscalls (regardless of actual register values).
+                // To avoid corrupting register state in the trace builder, we don't set
+                // read_register or write_register flags. The HALT table handles termination.
                 entry.op_ecall = true;
-                // ECALL uses: rs1=x17 (syscall number), rs2=x10 (arg), rd=x10 (result)
-                entry.rs1 = 17;
-                entry.rs2 = 10;
-                entry.rd = 10;
-                entry.read_register1 = true;
-                entry.read_register2 = true;
-                entry.write_register = true;
+                // Set register indices for reference, but don't mark them as read/written
+                entry.rs1 = 17; // a7 (syscall number)
+                entry.rs2 = 10; // a0 (arg)
+                entry.rd = 10; // a0 (result)
+                // Note: read_register1, read_register2, write_register remain false
             }
 
             Instruction::Fence => {
