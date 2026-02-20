@@ -1,25 +1,89 @@
 //! Lambda VM CLI - execute, prove, and verify RISC-V programs.
 
-mod proof_bundle;
-
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Instant;
 
-use clap::{Parser, Subcommand, ValueEnum, ValueHint};
+use clap::{Parser, Subcommand, ValueHint};
+
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use executor::{
     elf::{Elf, SymbolTable},
     flamegraph::FlamegraphGenerator,
     vm::execution::Executor,
 };
-use sha3::{Digest, Sha3_256};
-use stark::proof::options::{ProofOptions, SecurityLevel};
+use prover::VmProof;
+use stark::proof::options::GoldilocksCubicProofOptions;
 
-use proof_bundle::{PROOF_BUNDLE_VERSION, ProofBundle};
+/// Polls jemalloc `stats.allocated` every 10ms from a background thread,
+/// tracking the high-water mark. Near-zero overhead because jemalloc uses
+/// thread-local caches — `epoch::advance()` just merges cached counters.
+#[cfg(feature = "jemalloc-stats")]
+mod heap_tracker {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::thread;
+    use std::time::Duration;
 
-fn truncated_hex(bytes: &[u8]) -> String {
-    format!("{}...", &hex::encode(bytes)[..16])
+    use tikv_jemalloc_ctl::{epoch, stats};
+
+    pub struct HeapTracker {
+        stop: Arc<AtomicBool>,
+        peak: Arc<AtomicUsize>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl HeapTracker {
+        pub fn start() -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let stop_clone = stop.clone();
+            let peak_clone = peak.clone();
+
+            let handle = thread::spawn(move || {
+                while !stop_clone.load(Ordering::Relaxed) {
+                    // Refresh jemalloc's cached stats
+                    epoch::advance().ok();
+                    if let Ok(allocated) = stats::allocated::read() {
+                        peak_clone.fetch_max(allocated, Ordering::Relaxed);
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                // One final sample after stop signal
+                epoch::advance().ok();
+                if let Ok(allocated) = stats::allocated::read() {
+                    peak_clone.fetch_max(allocated, Ordering::Relaxed);
+                }
+            });
+
+            Self {
+                stop,
+                peak,
+                handle: Some(handle),
+            }
+        }
+
+        pub fn stop(mut self) -> usize {
+            self.shutdown();
+            self.peak.load(Ordering::Relaxed)
+        }
+
+        fn shutdown(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(h) = self.handle.take() {
+                h.join().ok();
+            }
+        }
+    }
+
+    impl Drop for HeapTracker {
+        fn drop(&mut self) {
+            self.shutdown();
+        }
+    }
 }
 
 #[derive(Parser)]
@@ -52,9 +116,13 @@ enum Commands {
         #[arg(short, long, value_hint = ValueHint::FilePath)]
         output: PathBuf,
 
-        /// Security level preset
-        #[arg(long, value_enum, default_value = "standard")]
-        security: SecurityPreset,
+        /// Blowup factor (power of 2). Higher = fewer queries, smaller proof, slower proving.
+        #[arg(long)]
+        blowup: Option<u8>,
+
+        /// Print timing breakdown
+        #[arg(long)]
+        time: bool,
     },
 
     /// Verify a proof bundle
@@ -66,34 +134,15 @@ enum Commands {
         /// Path to the ELF file (required for DECODE table verification)
         #[arg(value_parser, value_hint = ValueHint::FilePath)]
         elf: PathBuf,
+
+        /// Blowup factor used during proving (must match)
+        #[arg(long)]
+        blowup: Option<u8>,
+
+        /// Print timing breakdown
+        #[arg(long)]
+        time: bool,
     },
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum SecurityPreset {
-    /// Conjecturable 100-bit security (development)
-    Fast,
-    /// Provable 100-bit security (default)
-    Standard,
-    /// Provable 128-bit security (production)
-    Maximum,
-}
-
-impl SecurityPreset {
-    fn to_proof_options(self) -> ProofOptions {
-        const COSET_OFFSET: u64 = 3;
-        match self {
-            SecurityPreset::Fast => {
-                ProofOptions::new_secure(SecurityLevel::Conjecturable100Bits, COSET_OFFSET)
-            }
-            SecurityPreset::Standard => {
-                ProofOptions::new_secure(SecurityLevel::Provable100Bits, COSET_OFFSET)
-            }
-            SecurityPreset::Maximum => {
-                ProofOptions::new_secure(SecurityLevel::Provable128Bits, COSET_OFFSET)
-            }
-        }
-    }
 }
 
 fn main() -> ExitCode {
@@ -104,9 +153,15 @@ fn main() -> ExitCode {
         Commands::Prove {
             elf,
             output,
-            security,
-        } => cmd_prove(elf, output, security),
-        Commands::Verify { proof, elf } => cmd_verify(proof, elf),
+            blowup,
+            time,
+        } => cmd_prove(elf, output, blowup, time),
+        Commands::Verify {
+            proof,
+            elf,
+            blowup,
+            time,
+        } => cmd_verify(proof, elf, blowup, time),
     }
 }
 
@@ -194,7 +249,7 @@ fn cmd_execute(elf_path: PathBuf, flamegraph_path: Option<PathBuf>) -> ExitCode 
     ExitCode::SUCCESS
 }
 
-fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, security: SecurityPreset) -> ExitCode {
+fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, blowup: Option<u8>, time: bool) -> ExitCode {
     eprintln!("Reading ELF file...");
     let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
@@ -204,11 +259,32 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, security: SecurityPreset) 
         }
     };
 
-    let elf_hash: [u8; 32] = Sha3_256::digest(&elf_data).into();
-    let proof_options = security.to_proof_options();
+    #[cfg(feature = "jemalloc-stats")]
+    let tracker = heap_tracker::HeapTracker::start();
 
-    eprintln!("Generating proof (this may take a while)...");
-    let multi_proof = match prover::prove_with_options(&elf_data, &proof_options) {
+    let start = Instant::now();
+    let proof = match blowup {
+        Some(b) => {
+            let opts = match GoldilocksCubicProofOptions::with_blowup(b) {
+                Ok(opts) => opts,
+                Err(e) => {
+                    eprintln!("Invalid proof options: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            eprintln!(
+                "Generating proof (blowup={b}, queries={})...",
+                opts.fri_number_of_queries
+            );
+            prover::prove_with_options(&elf_data, &opts)
+        }
+        None => {
+            eprintln!("Generating proof...");
+            prover::prove(&elf_data)
+        }
+    };
+    let prove_elapsed = start.elapsed();
+    let proof = match proof {
         Ok(proof) => proof,
         Err(e) => {
             eprintln!("Proof generation failed: {}", e);
@@ -216,9 +292,7 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, security: SecurityPreset) 
         }
     };
 
-    let bundle = ProofBundle::new(multi_proof, proof_options, elf_hash);
-
-    eprintln!("Writing proof bundle...");
+    eprintln!("Writing proof...");
     let file = match File::create(&output_path) {
         Ok(f) => f,
         Err(e) => {
@@ -228,23 +302,32 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, security: SecurityPreset) 
     };
     let mut writer = BufWriter::new(file);
 
-    if let Err(e) = ciborium::into_writer(&bundle, &mut writer) {
-        eprintln!("Failed to serialize proof bundle: {}", e);
-        return ExitCode::FAILURE;
-    }
+    let bytes = match bincode::serialize(&proof) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Failed to serialize proof: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
 
-    if let Err(e) = writer.flush() {
-        eprintln!("Failed to flush proof bundle: {}", e);
+    if let Err(e) = writer.write_all(&bytes) {
+        eprintln!("Failed to write proof: {}", e);
         return ExitCode::FAILURE;
     }
 
     eprintln!("Proof written to {:?}", output_path);
-    eprintln!("  ELF hash: {}", truncated_hex(&elf_hash));
-
+    if time {
+        println!("Proving time: {:.3}s", prove_elapsed.as_secs_f64());
+    }
+    #[cfg(feature = "jemalloc-stats")]
+    {
+        let peak_bytes = tracker.stop();
+        println!("Peak heap: {} MB", peak_bytes / (1024 * 1024));
+    }
     ExitCode::SUCCESS
 }
 
-fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf) -> ExitCode {
+fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf, blowup: Option<u8>, time: bool) -> ExitCode {
     eprintln!("Reading ELF file...");
     let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
@@ -254,56 +337,52 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf) -> ExitCode {
         }
     };
 
-    eprintln!("Reading proof bundle...");
-    let file = match File::open(&proof_path) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("Failed to open proof file: {}", e);
-            return ExitCode::FAILURE;
-        }
-    };
-    let reader = BufReader::new(file);
-
-    let bundle: ProofBundle = match ciborium::from_reader(reader) {
+    eprintln!("Reading proof...");
+    let proof_bytes = match std::fs::read(&proof_path) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("Failed to deserialize proof bundle: {}", e);
+            eprintln!("Failed to read proof file: {}", e);
             return ExitCode::FAILURE;
         }
     };
 
-    // Validate proof bundle version
-    if bundle.metadata.version != PROOF_BUNDLE_VERSION {
-        eprintln!(
-            "Unsupported proof bundle version: {} (expected {})",
-            bundle.metadata.version, PROOF_BUNDLE_VERSION
-        );
-        return ExitCode::FAILURE;
-    }
+    let proof: VmProof = match bincode::deserialize(&proof_bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Failed to deserialize proof: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
 
-    // Detect wrong ELF early with a clear error message.
-    // The cryptographic binding happens inside verify_with_options via the DECODE table.
-    let elf_hash: [u8; 32] = Sha3_256::digest(&elf_data).into();
-    if elf_hash != bundle.metadata.elf_hash {
-        eprintln!("ELF hash mismatch: the proof was generated for a different program");
-        return ExitCode::FAILURE;
-    }
-
-    eprintln!("Proof metadata:");
-    eprintln!("  Version: {}", bundle.metadata.version);
-    eprintln!("  ELF hash: {}", truncated_hex(&bundle.metadata.elf_hash));
     eprintln!("Verifying proof...");
-    let result =
-        match prover::verify_with_options(&bundle.multi_proof, &elf_data, &bundle.proof_options) {
-            Ok(valid) => valid,
-            Err(e) => {
-                eprintln!("Verification error: {}", e);
-                return ExitCode::FAILURE;
-            }
-        };
+    let start = Instant::now();
+    let result = match blowup {
+        Some(b) => {
+            let opts = match GoldilocksCubicProofOptions::with_blowup(b) {
+                Ok(opts) => opts,
+                Err(e) => {
+                    eprintln!("Invalid proof options: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            prover::verify_with_options(&proof, &elf_data, &opts)
+        }
+        None => prover::verify(&proof, &elf_data),
+    };
+    let verify_elapsed = start.elapsed();
+    let result = match result {
+        Ok(valid) => valid,
+        Err(e) => {
+            eprintln!("Verification error: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
 
     if result {
         eprintln!("Verification succeeded!");
+        if time {
+            println!("Verification time: {:.3}s", verify_elapsed.as_secs_f64());
+        }
         ExitCode::SUCCESS
     } else {
         eprintln!("Verification failed!");

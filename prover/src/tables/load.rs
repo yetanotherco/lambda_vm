@@ -241,11 +241,14 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // -------------------------------------------------------------------------
     // LOAD calls MEMW with is_register=0, passing res as both value and old
     // (since we're reading, value=old=the read data)
+    // RES columns contain individual bytes, sent as Direct elements
+    // to match the unified MEMW Read receiver format.
     interactions.push(BusInteraction::sender(
         BusId::Memw,
         Multiplicity::Column(cols::MU),
         vec![
-            // old[8] = res[8] for reads
+            // old[0..7] = 8 individual bytes (Direct elements)
+            // For reads, old == value (same data read back)
             BusValue::Packed {
                 start_column: cols::RES[0],
                 packing: Packing::Direct,
@@ -289,7 +292,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::BASE_ADDRESS_1,
                 packing: Packing::Direct,
             },
-            // value[8] = res[8] for reads
+            // value[0..7] = 8 individual bytes (Direct elements)
             BusValue::Packed {
                 start_column: cols::RES[0],
                 packing: Packing::Direct,

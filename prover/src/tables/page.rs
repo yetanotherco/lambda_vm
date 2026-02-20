@@ -1,0 +1,524 @@
+//! PAGE table for memory initialization and finalization.
+//!
+//! Each PAGE table instance covers one memory page. Multiple PAGE tables
+//! are created for all pages used during execution (ELF + stack + heap).
+//!
+//! ## Token Model (per spec)
+//!
+//! - **PAGE-C3**: Receives initial token `(address, ts=0, init)` - balances MEMW's send on first access
+//! - **PAGE-C4**: Sends final token `(address, timestamp, fini)` - balances MEMW's receive on last access
+//!
+//! For non-accessed addresses: PAGE-C3 receives and PAGE-C4 sends the same tuple
+//! (ts=0, init=fini), which cancel out.
+//!
+//! ## Columns (per spec)
+//!
+//! | Column | Type | Description |
+//! |--------|------|-------------|
+//! | offset | RowIndex | 0, 1, ..., page_size-1 (preprocessed) |
+//! | init | Byte | Initial value (from ELF or 0) |
+//! | fini | Byte | Final value after execution |
+//! | timestamp | DWordWL | Final timestamp (0 if never accessed) |
+//!
+//! Virtual: `address = page + offset` where `page` is constant per table instance.
+//!
+//! ## Bus Interactions
+//!
+//! | Tag | Bus | Signature | Multiplicity |
+//! |-----|-----|-----------|--------------|
+//! | PAGE-C1 | IS_BYTE | `[init]` | 1 (sender) |
+//! | PAGE-C2 | IS_BYTE | `[fini]` | 1 (sender) |
+//! | PAGE-C3 | Memory | `[0, address, 0, init]` | -1 (receiver) |
+//! | PAGE-C4 | Memory | `[0, address, timestamp, fini]` | 1 (sender) |
+
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+use math::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
+use math::polynomial::Polynomial;
+use stark::config::{BatchedMerkleTree, Commitment};
+use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
+use stark::proof::options::ProofOptions;
+use stark::prover::evaluate_polynomial_on_lde_domain;
+use stark::trace::{TraceTable, columns2rows};
+
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+
+// =========================================================================
+// Constants
+// =========================================================================
+
+/// Default page size in bytes (4KB).
+pub const DEFAULT_PAGE_SIZE: usize = 4096;
+
+/// Stack top address (where SP starts). Re-exported from executor.
+pub use executor::vm::registers::STACK_TOP;
+
+// =========================================================================
+// Column indices for PAGE table
+// =========================================================================
+
+/// Column definitions for the PAGE table.
+///
+/// Note: `address` is virtual, computed as `page_base + offset` where `page_base`
+/// is a constant per table instance. It is NOT stored as a column.
+pub mod cols {
+    /// offset: Row index (0, 1, ..., page_size-1) - preprocessed
+    pub const OFFSET: usize = 0;
+
+    /// init: Initial byte value (from ELF or 0)
+    pub const INIT: usize = 1;
+
+    /// fini: Final byte value after execution
+    pub const FINI: usize = 2;
+
+    /// timestamp[0]: Final timestamp low word (0 if never accessed)
+    pub const TIMESTAMP_LO: usize = 3;
+
+    /// timestamp[1]: Final timestamp high word
+    pub const TIMESTAMP_HI: usize = 4;
+
+    /// Total number of columns
+    pub const NUM_COLUMNS: usize = 5;
+}
+
+/// Number of preprocessed columns (OFFSET, INIT for ELF pages).
+/// For zero-init pages, INIT is also preprocessed (constant 0).
+pub const NUM_PREPROCESSED_COLS: usize = 2;
+
+// =========================================================================
+// Types
+// =========================================================================
+
+/// Final state for a single byte address.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FinalByteState {
+    /// Final timestamp (0 if never accessed)
+    pub timestamp: u64,
+    /// Final byte value
+    pub value: u8,
+}
+
+/// Map from byte address to final state.
+pub type FinalStateMap = HashMap<u64, FinalByteState>;
+
+/// Configuration for a single PAGE table instance.
+#[derive(Debug, Clone)]
+pub struct PageConfig {
+    /// Base address of this page (must be page-aligned).
+    pub page_base: u64,
+    /// Size of the page in bytes (must be power of 2).
+    pub page_size: usize,
+    /// Initial values for each byte in the page.
+    /// If None, all bytes are zero-initialized.
+    pub init_values: Option<Vec<u8>>,
+}
+
+impl PageConfig {
+    /// Create a zero-initialized page.
+    pub fn zero_init(page_base: u64, page_size: usize) -> Self {
+        Self {
+            page_base,
+            page_size,
+            init_values: None,
+        }
+    }
+
+    /// Create a page with initial values from data.
+    pub fn with_data(page_base: u64, page_size: usize, data: Vec<u8>) -> Self {
+        assert!(data.len() <= page_size, "Data exceeds page size");
+        let mut init_values = data;
+        init_values.resize(page_size, 0); // Pad with zeros
+        Self {
+            page_base,
+            page_size,
+            init_values: Some(init_values),
+        }
+    }
+}
+
+// =========================================================================
+// Trace generation
+// =========================================================================
+
+/// Generates a PAGE trace table for a single page.
+///
+/// ## Arguments
+///
+/// * `config` - Page configuration (base address, size, initial values)
+/// * `final_state` - Map from byte address to final (timestamp, value) for accessed bytes
+///
+/// ## Returns
+///
+/// The trace table for this page.
+pub fn generate_page_trace(
+    config: &PageConfig,
+    final_state: &FinalStateMap,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let page_size = config.page_size;
+    let page_base = config.page_base;
+
+    // Page size must be power of 2
+    assert!(page_size.is_power_of_two(), "Page size must be power of 2");
+    // Page base must be page-aligned
+    assert!(
+        page_base.is_multiple_of(page_size as u64),
+        "Page base must be page-aligned"
+    );
+
+    let num_rows = page_size; // One row per byte in the page
+    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+
+    for offset in 0..page_size {
+        let byte_addr = page_base + (offset as u64);
+        let base = offset * cols::NUM_COLUMNS;
+
+        // Offset (preprocessed) - address is virtual: page_base + offset
+        data[base + cols::OFFSET] = FE::from(offset as u64);
+
+        // Initial value
+        // Safety: init_vals.len() == page_size (guaranteed by with_data resize)
+        let init_value = if let Some(ref init_vals) = config.init_values {
+            init_vals[offset]
+        } else {
+            0 // Zero-initialized
+        };
+        data[base + cols::INIT] = FE::from(init_value as u64);
+
+        // Final state: if accessed use final, otherwise use initial
+        let (timestamp, fini_value) = if let Some(state) = final_state.get(&byte_addr) {
+            (state.timestamp, state.value)
+        } else {
+            // Never accessed: timestamp=0, fini=init
+            (0, init_value)
+        };
+
+        data[base + cols::FINI] = FE::from(fini_value as u64);
+        data[base + cols::TIMESTAMP_LO] = FE::from(timestamp & 0xFFFF_FFFF);
+        data[base + cols::TIMESTAMP_HI] = FE::from(timestamp >> 32);
+    }
+
+    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+}
+
+// =========================================================================
+// Preprocessed commitment
+// =========================================================================
+
+/// Cached commitment for zero-initialized 4KB pages.
+/// All zero-init pages of the same size have identical OFFSET and INIT columns.
+///
+/// INVARIANT: All callers within a process must use identical `ProofOptions`.
+/// The cache is keyed only by page content, not by options.
+static ZERO_PAGE_4K_COMMITMENT: OnceLock<Commitment> = OnceLock::new();
+
+/// Computes the Merkle root commitment over the LDE of PAGE precomputed columns.
+///
+/// The commitment covers OFFSET (0..page_size-1) and INIT (from config).
+/// Each page may have different INIT data, producing a different commitment.
+pub fn compute_precomputed_commitment(config: &PageConfig, options: &ProofOptions) -> Commitment {
+    let page_size = config.page_size;
+    assert!(page_size.is_power_of_two(), "Page size must be power of 2");
+
+    let num_rows = page_size;
+
+    // Precomputed columns: OFFSET and INIT.
+    //
+    // OFFSET (col 0): deterministic row index 0..page_size-1, the same for every
+    //   page of a given size regardless of the program being proven.
+    //
+    // INIT (col 1): the initial byte value at each offset. For zero-init pages
+    //   (stack, heap, BSS) this is all zeros. For ELF data pages it holds the
+    //   bytes loaded from the binary. Either way the column is fully determined
+    //   before execution, so the verifier can check it against a preprocessed
+    //   commitment instead of including it in the main trace.
+    let mut offset_col = vec![FE::zero(); num_rows];
+    let mut init_col = vec![FE::zero(); num_rows];
+
+    for i in 0..page_size {
+        offset_col[i] = FE::from(i as u64);
+        init_col[i] = if let Some(ref init_vals) = config.init_values {
+            FE::from(init_vals[i] as u64)
+        } else {
+            FE::zero()
+        };
+    }
+
+    let columns = [offset_col, init_col];
+
+    let polys: Vec<Polynomial<FE>> = columns
+        .iter()
+        .map(|col| {
+            Polynomial::interpolate_fft::<GoldilocksField>(col)
+                .expect("FFT interpolation failed for page column")
+        })
+        .collect();
+
+    let blowup_factor = options.blowup_factor as usize;
+    let coset_offset = FE::from(options.coset_offset);
+    let mut lde_columns: Vec<Vec<FE>> = polys
+        .iter()
+        .map(|poly| {
+            evaluate_polynomial_on_lde_domain(poly, blowup_factor, num_rows, &coset_offset)
+                .expect("LDE evaluation failed for page polynomial")
+        })
+        .collect();
+
+    for col in lde_columns.iter_mut() {
+        in_place_bit_reverse_permute(col);
+    }
+
+    let lde_rows = columns2rows(lde_columns);
+    let tree = BatchedMerkleTree::<GoldilocksField>::build(&lde_rows)
+        .expect("Failed to build Merkle tree for page LDE");
+    tree.root
+}
+
+/// Returns the preprocessed commitment for a PAGE table, with caching for zero-init pages.
+///
+/// Zero-init pages of DEFAULT_PAGE_SIZE share a cached commitment.
+/// ELF data pages compute their commitment fresh.
+pub fn precomputed_commitment_cached(config: &PageConfig, options: &ProofOptions) -> Commitment {
+    if config.init_values.is_none() && config.page_size == DEFAULT_PAGE_SIZE {
+        *ZERO_PAGE_4K_COMMITMENT.get_or_init(|| compute_precomputed_commitment(config, options))
+    } else {
+        compute_precomputed_commitment(config, options)
+    }
+}
+
+// =========================================================================
+// Bus interactions
+// =========================================================================
+
+/// Creates all bus interactions for a PAGE table.
+///
+/// The `page_base` is the constant base address for this page instance.
+/// The virtual address is computed as `page_base + offset` using linear combination.
+///
+/// ## Bus Interactions
+///
+/// - PAGE-C1: IS_BYTE[init] - sender, multiplicity 1 (range check)
+/// - PAGE-C2: IS_BYTE[fini] - sender, multiplicity 1 (range check)
+/// - PAGE-C3: memory[0, address, 0, init] - receiver, multiplicity -1
+/// - PAGE-C4: memory[0, address, timestamp, fini] - sender, multiplicity 1
+///
+/// ## Arguments
+///
+/// * `page_base` - The base address for this page (constant per table instance)
+pub fn bus_interactions(page_base: u64) -> Vec<BusInteraction> {
+    // Split page_base into lo/hi 32-bit parts
+    let page_base_lo = page_base & 0xFFFF_FFFF;
+    let page_base_hi = page_base >> 32;
+
+    // Address computation: address_lo = page_base_lo + offset (linear combination)
+    // address_hi = page_base_hi (constant, since offset < page_size < 2^32)
+    let address_lo = BusValue::linear(vec![
+        LinearTerm::Constant(page_base_lo as i64),
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::OFFSET,
+        },
+    ]);
+    let address_hi = BusValue::constant(page_base_hi);
+
+    vec![
+        // PAGE-C1: IS_BYTE[init] - range check initial value
+        BusInteraction::sender(
+            BusId::IsByte,
+            Multiplicity::One,
+            vec![BusValue::Packed {
+                start_column: cols::INIT,
+                packing: Packing::Direct,
+            }],
+        ),
+        // PAGE-C2: IS_BYTE[fini] - range check final value
+        BusInteraction::sender(
+            BusId::IsByte,
+            Multiplicity::One,
+            vec![BusValue::Packed {
+                start_column: cols::FINI,
+                packing: Packing::Direct,
+            }],
+        ),
+        // PAGE-C3: memory[0, address, 0, init] - receive initial token
+        BusInteraction::receiver(
+            BusId::Memory,
+            Multiplicity::One,
+            vec![
+                // is_register = 0
+                BusValue::constant(0),
+                // address_lo = page_base_lo + offset
+                address_lo.clone(),
+                // address_hi = page_base_hi
+                address_hi.clone(),
+                // timestamp_lo = 0 (initial)
+                BusValue::constant(0),
+                // timestamp_hi = 0
+                BusValue::constant(0),
+                // value = init
+                BusValue::Packed {
+                    start_column: cols::INIT,
+                    packing: Packing::Direct,
+                },
+            ],
+        ),
+        // PAGE-C4: memory[0, address, timestamp, fini] - send final token
+        BusInteraction::sender(
+            BusId::Memory,
+            Multiplicity::One,
+            vec![
+                // is_register = 0
+                BusValue::constant(0),
+                // address_lo = page_base_lo + offset
+                address_lo,
+                // address_hi = page_base_hi
+                address_hi,
+                // timestamp_lo (final)
+                BusValue::Packed {
+                    start_column: cols::TIMESTAMP_LO,
+                    packing: Packing::Direct,
+                },
+                // timestamp_hi (final)
+                BusValue::Packed {
+                    start_column: cols::TIMESTAMP_HI,
+                    packing: Packing::Direct,
+                },
+                // value = fini
+                BusValue::Packed {
+                    start_column: cols::FINI,
+                    packing: Packing::Direct,
+                },
+            ],
+        ),
+    ]
+}
+
+// =========================================================================
+// Helper functions for page management
+// =========================================================================
+
+/// Compute the page base address for a given byte address.
+pub fn page_base_for_address(addr: u64, page_size: usize) -> u64 {
+    debug_assert!(
+        page_size.is_power_of_two(),
+        "page_size must be a power of 2"
+    );
+    addr & !(page_size as u64 - 1)
+}
+
+/// Compute the offset within a page for a given byte address.
+pub fn offset_in_page(addr: u64, page_size: usize) -> usize {
+    debug_assert!(
+        page_size.is_power_of_two(),
+        "page_size must be a power of 2"
+    );
+    (addr & (page_size as u64 - 1)) as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_page_base_for_address() {
+        let page_size = 4096;
+        assert_eq!(page_base_for_address(0x1000, page_size), 0x1000);
+        assert_eq!(page_base_for_address(0x1001, page_size), 0x1000);
+        assert_eq!(page_base_for_address(0x1FFF, page_size), 0x1000);
+        assert_eq!(page_base_for_address(0x2000, page_size), 0x2000);
+    }
+
+    #[test]
+    fn test_offset_in_page() {
+        let page_size = 4096;
+        assert_eq!(offset_in_page(0x1000, page_size), 0);
+        assert_eq!(offset_in_page(0x1001, page_size), 1);
+        assert_eq!(offset_in_page(0x1FFF, page_size), 4095);
+        assert_eq!(offset_in_page(0x2000, page_size), 0);
+    }
+
+    #[test]
+    fn test_generate_page_trace_zero_init() {
+        let config = PageConfig::zero_init(0x1000, 16); // Small page for testing
+        let final_state = FinalStateMap::new();
+
+        let trace = generate_page_trace(&config, &final_state);
+
+        assert_eq!(trace.num_rows(), 16);
+
+        // Check first row (address is virtual: 0x1000 + offset)
+        assert_eq!(*trace.main_table.get(0, cols::OFFSET), FE::zero());
+        assert_eq!(*trace.main_table.get(0, cols::INIT), FE::zero());
+        assert_eq!(*trace.main_table.get(0, cols::FINI), FE::zero());
+        assert_eq!(*trace.main_table.get(0, cols::TIMESTAMP_LO), FE::zero());
+
+        // Check last row (address is virtual: 0x1000 + 15 = 0x100F)
+        assert_eq!(*trace.main_table.get(15, cols::OFFSET), FE::from(15u64));
+        assert_eq!(*trace.main_table.get(15, cols::INIT), FE::zero());
+    }
+
+    #[test]
+    fn test_generate_page_trace_with_data() {
+        let data = vec![0x01, 0x02, 0x03, 0x04];
+        let config = PageConfig::with_data(0x2000, 16, data);
+        let final_state = FinalStateMap::new();
+
+        let trace = generate_page_trace(&config, &final_state);
+
+        // Check initial values from data
+        assert_eq!(*trace.main_table.get(0, cols::INIT), FE::from(0x01u64));
+        assert_eq!(*trace.main_table.get(1, cols::INIT), FE::from(0x02u64));
+        assert_eq!(*trace.main_table.get(2, cols::INIT), FE::from(0x03u64));
+        assert_eq!(*trace.main_table.get(3, cols::INIT), FE::from(0x04u64));
+        // Rest should be zero (padding)
+        assert_eq!(*trace.main_table.get(4, cols::INIT), FE::zero());
+
+        // Without accesses, fini should equal init
+        assert_eq!(*trace.main_table.get(0, cols::FINI), FE::from(0x01u64));
+    }
+
+    #[test]
+    fn test_generate_page_trace_with_accesses() {
+        let data = vec![0xAA, 0xBB];
+        let config = PageConfig::with_data(0x3000, 16, data);
+
+        let mut final_state = FinalStateMap::new();
+        // Address 0x3000 was written with value 0xFF at timestamp 100
+        final_state.insert(
+            0x3000,
+            FinalByteState {
+                timestamp: 100,
+                value: 0xFF,
+            },
+        );
+
+        let trace = generate_page_trace(&config, &final_state);
+
+        // Row 0: address 0x3000 - was accessed
+        assert_eq!(*trace.main_table.get(0, cols::INIT), FE::from(0xAAu64));
+        assert_eq!(*trace.main_table.get(0, cols::FINI), FE::from(0xFFu64));
+        assert_eq!(
+            *trace.main_table.get(0, cols::TIMESTAMP_LO),
+            FE::from(100u64)
+        );
+
+        // Row 1: address 0x3001 - not accessed, fini = init
+        assert_eq!(*trace.main_table.get(1, cols::INIT), FE::from(0xBBu64));
+        assert_eq!(*trace.main_table.get(1, cols::FINI), FE::from(0xBBu64));
+        assert_eq!(*trace.main_table.get(1, cols::TIMESTAMP_LO), FE::zero());
+    }
+
+    #[test]
+    fn test_bus_interactions() {
+        let interactions = bus_interactions(0x1000); // page_base
+        assert_eq!(interactions.len(), 4); // C1, C2, C3, C4
+    }
+
+    #[test]
+    fn test_bus_interactions_high_address() {
+        // Test with high address like stack region
+        let stack_page = STACK_TOP & !(DEFAULT_PAGE_SIZE as u64 - 1);
+        let interactions = bus_interactions(stack_page);
+        assert_eq!(interactions.len(), 4);
+    }
+}

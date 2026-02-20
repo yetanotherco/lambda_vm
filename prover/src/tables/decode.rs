@@ -328,3 +328,175 @@ pub fn commitment_from_elf(
     let instructions = instructions_from_elf(elf)?;
     Ok(compute_precomputed_commitment(&instructions, options))
 }
+
+// =========================================================================
+// Combined ELF processing (DECODE only)
+// =========================================================================
+
+/// Result of ELF processing for DECODE table.
+pub struct ElfTables {
+    /// DECODE trace table
+    pub decode: TraceTable<GoldilocksField, GoldilocksExtension>,
+    /// PC to row mapping for DECODE multiplicities
+    pub pc_to_row: PcToRow,
+}
+
+/// Process ELF to generate DECODE table from executable segments.
+///
+/// ## Returns
+///
+/// - `decode`: DECODE trace with all instructions from executable segments
+/// - `pc_to_row`: Map from PC to row index for DECODE multiplicity updates
+///
+/// Table has multiplicities initialized to 0.
+pub fn tables_from_elf(elf: &Elf) -> Result<ElfTables, InstructionError> {
+    let mut decode_entries = Vec::new();
+    let mut pc_to_row = HashMap::with_capacity(elf.data.iter().map(|s| s.values.len()).sum());
+
+    // Process all ELF segments for DECODE (only executable segments)
+    for segment in &elf.data {
+        if segment.is_executable {
+            for (i, &word) in segment.values.iter().enumerate() {
+                let addr = segment.base_addr + (i as u64 * 4);
+                let instruction = Instruction::parse(word)?;
+                pc_to_row.insert(addr, decode_entries.len());
+                decode_entries.push(DecodeEntry::from_instruction(addr, instruction));
+            }
+        }
+    }
+
+    // Build DECODE table
+    let decode = build_decode_table(decode_entries, &mut pc_to_row);
+
+    Ok(ElfTables { decode, pc_to_row })
+}
+
+/// Build DECODE trace table from entries.
+fn build_decode_table(
+    entries: Vec<DecodeEntry>,
+    pc_to_row: &mut PcToRow,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    // Add CPU padding entry
+    let cpu_padding_row = entries.len();
+    pc_to_row.insert(super::cpu::CPU_PADDING_PC, cpu_padding_row);
+    let cpu_padding_entry = DecodeEntry {
+        pc: super::cpu::CPU_PADDING_PC,
+        ..Default::default()
+    };
+
+    // Pad to next power of 2, minimum 2
+    let num_entries = entries.len() + 1;
+    let num_rows = num_entries.next_power_of_two().max(2);
+    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+
+    // Fill actual entries
+    for (row_idx, entry) in entries.iter().enumerate() {
+        let base = row_idx * cols::NUM_COLUMNS;
+        data[base + cols::PC_0] = FE::from(entry.pc & 0xFFFF_FFFF);
+        data[base + cols::PC_1] = FE::from(entry.pc >> 32);
+        data[base + cols::PACKED_DECODE] = FE::from(entry.packed_decode());
+        data[base + cols::IMM_0] = FE::from(entry.imm & 0xFFFF_FFFF);
+        data[base + cols::IMM_1] = FE::from(entry.imm >> 32);
+    }
+
+    // Write CPU padding entry
+    {
+        let base = cpu_padding_row * cols::NUM_COLUMNS;
+        data[base + cols::PC_0] = FE::from(cpu_padding_entry.pc & 0xFFFF_FFFF);
+        data[base + cols::PC_1] = FE::from(cpu_padding_entry.pc >> 32);
+        data[base + cols::PACKED_DECODE] = FE::from(cpu_padding_entry.packed_decode());
+        data[base + cols::IMM_0] = FE::from(cpu_padding_entry.imm & 0xFFFF_FFFF);
+        data[base + cols::IMM_1] = FE::from(cpu_padding_entry.imm >> 32);
+    }
+
+    // Fill padding rows with DECODE padding pattern
+    let padding_entry = DecodeEntry::padding_entry();
+    for row_idx in num_entries..num_rows {
+        let base = row_idx * cols::NUM_COLUMNS;
+        data[base + cols::PC_0] = FE::from(padding_entry.pc & 0xFFFF_FFFF);
+        data[base + cols::PC_1] = FE::from(padding_entry.pc >> 32);
+        data[base + cols::PACKED_DECODE] = FE::from(padding_entry.packed_decode());
+        data[base + cols::IMM_0] = FE::from(padding_entry.imm & 0xFFFF_FFFF);
+        data[base + cols::IMM_1] = FE::from(padding_entry.imm >> 32);
+    }
+
+    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use executor::elf::Segment;
+
+    #[test]
+    fn test_tables_from_elf_single_executable_segment() {
+        // ADDI x1, x0, 42  (opcode: 0x02a00093)
+        // ADDI x2, x1, 10  (opcode: 0x00a08113)
+        let elf = Elf {
+            entry_point: 0x1000,
+            data: vec![Segment {
+                base_addr: 0x1000,
+                values: vec![0x02a00093, 0x00a08113],
+                is_executable: true,
+            }],
+        };
+
+        let tables = tables_from_elf(&elf).unwrap();
+
+        // Check DECODE table
+        assert_eq!(tables.pc_to_row.len(), 3); // 2 instructions + CPU padding
+        assert!(tables.pc_to_row.contains_key(&0x1000));
+        assert!(tables.pc_to_row.contains_key(&0x1004));
+        assert!(
+            tables
+                .pc_to_row
+                .contains_key(&super::super::cpu::CPU_PADDING_PC)
+        );
+    }
+
+    #[test]
+    fn test_tables_from_elf_mixed_segments() {
+        // Executable segment with instructions
+        // Data segment with data (not included in DECODE)
+        let elf = Elf {
+            entry_point: 0x1000,
+            data: vec![
+                Segment {
+                    base_addr: 0x1000,
+                    values: vec![0x02a00093], // ADDI instruction
+                    is_executable: true,
+                },
+                Segment {
+                    base_addr: 0x2000,
+                    values: vec![0xDEADBEEF, 0xCAFEBABE], // Data
+                    is_executable: false,
+                },
+            ],
+        };
+
+        let tables = tables_from_elf(&elf).unwrap();
+
+        // DECODE: only executable segment (1 instruction + CPU padding)
+        assert_eq!(tables.pc_to_row.len(), 2);
+        assert!(tables.pc_to_row.contains_key(&0x1000));
+        assert!(!tables.pc_to_row.contains_key(&0x2000)); // Data not in decode
+    }
+
+    #[test]
+    fn test_tables_from_elf_empty() {
+        let elf = Elf {
+            entry_point: 0x1000,
+            data: vec![],
+        };
+
+        let tables = tables_from_elf(&elf).unwrap();
+
+        // DECODE: only CPU padding entry
+        assert_eq!(tables.pc_to_row.len(), 1);
+        assert!(
+            tables
+                .pc_to_row
+                .contains_key(&super::super::cpu::CPU_PADDING_PC)
+        );
+    }
+}
