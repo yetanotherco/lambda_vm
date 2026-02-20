@@ -32,6 +32,8 @@ concurrency:
 env:
   PROGRAM: executor/programs/asm/fib_iterative_372k.s
   ELF: executor/program_artifacts/asm/fib_iterative_372k.elf
+  BENCH_RUNS_PR: 3
+  BENCH_RUNS_BASELINE: 5
 
 jobs:
   benchmark:
@@ -83,27 +85,91 @@ jobs:
       - name: Build CLI (PR)
         run: cargo build --release -p cli --features jemalloc-stats
 
+      - name: Determine run count
+        id: config
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          if [ "${{ github.event_name }}" = "issue_comment" ]; then
+            CUSTOM_N=$(echo "$COMMENT_BODY" | sed -n 's|^/bench[[:space:]]*\([0-9]\+\).*|\1|p')
+            RUNS=${CUSTOM_N:-$BENCH_RUNS_PR}
+          elif [ "${{ github.event_name }}" = "push" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RUNS=$BENCH_RUNS_BASELINE
+          else
+            RUNS=$BENCH_RUNS_PR
+          fi
+
+          # Clamp to 1-10
+          if [ "$RUNS" -lt 1 ] 2>/dev/null || [ "$RUNS" -gt 10 ] 2>/dev/null; then
+            echo "::warning::Run count $RUNS out of range [1,10], defaulting to $BENCH_RUNS_PR"
+            RUNS=$BENCH_RUNS_PR
+          fi
+
+          echo "runs=$RUNS" >> "$GITHUB_OUTPUT"
+          echo "Using $RUNS benchmark iterations"
+
       - name: Benchmark PR
         id: pr
         run: |
-          ./target/release/cli prove "$ELF" -o /tmp/proof.bin --time \
-            | tee /tmp/cli_output.txt
-          rm -f /tmp/proof.bin
+          RUNS="${{ steps.config.outputs.runs }}"
+          TIMES=""
+          HEAPS=""
+          for i in $(seq 1 $RUNS); do
+            echo "--- Run $i/$RUNS ---"
+            ./target/release/cli prove "$ELF" -o /tmp/proof.bin --time \
+              | tee /tmp/cli_output_$i.txt
+            rm -f /tmp/proof.bin
 
-          PEAK_MB=$(grep -o 'Peak heap: [0-9]*' /tmp/cli_output.txt | awk '{print $3}')
-          TIME_S=$(grep -o 'Proving time: [0-9.]*' /tmp/cli_output.txt | awk '{print $3}')
+            T=$(grep -o 'Proving time: [0-9.]*' /tmp/cli_output_$i.txt | awk '{print $3}')
+            H=$(grep -o 'Peak heap: [0-9]*' /tmp/cli_output_$i.txt | awk '{print $3}')
 
-          if [ -z "$PEAK_MB" ] || [ -z "$TIME_S" ]; then
-            echo "::error::Failed to parse metrics from CLI output"
-            cat /tmp/cli_output.txt
+            if [ -z "$T" ] || [ -z "$H" ]; then
+              echo "::error::Failed to parse metrics from run $i"
+              cat /tmp/cli_output_$i.txt
+              exit 1
+            fi
+
+            TIMES="$TIMES $T"
+            HEAPS="$HEAPS $H"
+          done
+
+          # Median position (works for odd N; for even N picks lower-middle)
+          MEDIAN_POS=$(( (RUNS + 1) / 2 ))
+          TIME_MEDIAN=$(echo $TIMES | tr ' ' '\n' | sort -n | awk "NR==$MEDIAN_POS")
+          HEAP_MEDIAN=$(echo $HEAPS | tr ' ' '\n' | sort -n | awk "NR==$MEDIAN_POS")
+
+          if [ -z "$HEAP_MEDIAN" ] || [ -z "$TIME_MEDIAN" ]; then
+            echo "::error::Failed to compute median metrics"
             exit 1
           fi
 
-          echo "peak_mb=$PEAK_MB" >> "$GITHUB_OUTPUT"
-          echo "time_s=$TIME_S" >> "$GITHUB_OUTPUT"
+          # Spread: (max - min) / median * 100
+          TIME_MIN=$(echo $TIMES | tr ' ' '\n' | sort -n | head -1)
+          TIME_MAX=$(echo $TIMES | tr ' ' '\n' | sort -n | tail -1)
+          TIME_SPREAD=$(awk "BEGIN { if ($TIME_MEDIAN > 0) printf \"%.1f\", (($TIME_MAX - $TIME_MIN) / $TIME_MEDIAN) * 100; else print \"0.0\" }")
 
-          echo "peak_mb=$PEAK_MB" > /tmp/metrics.txt
-          echo "time_s=$TIME_S" >> /tmp/metrics.txt
+          HEAP_MIN=$(echo $HEAPS | tr ' ' '\n' | sort -n | head -1)
+          HEAP_MAX=$(echo $HEAPS | tr ' ' '\n' | sort -n | tail -1)
+          HEAP_SPREAD=$(awk "BEGIN { if ($HEAP_MEDIAN > 0) printf \"%.1f\", (($HEAP_MAX - $HEAP_MIN) / $HEAP_MEDIAN) * 100; else print \"0.0\" }")
+
+          ALL_TIMES=$(echo $TIMES | tr ' ' '\n' | paste -sd '/' -)
+          ALL_HEAPS=$(echo $HEAPS | tr ' ' '\n' | paste -sd '/' -)
+
+          echo "peak_mb=$HEAP_MEDIAN" >> "$GITHUB_OUTPUT"
+          echo "time_s=$TIME_MEDIAN" >> "$GITHUB_OUTPUT"
+          echo "time_spread=$TIME_SPREAD" >> "$GITHUB_OUTPUT"
+          echo "heap_spread=$HEAP_SPREAD" >> "$GITHUB_OUTPUT"
+          echo "all_times=$ALL_TIMES" >> "$GITHUB_OUTPUT"
+          echo "all_heaps=$ALL_HEAPS" >> "$GITHUB_OUTPUT"
+          echo "runs=$RUNS" >> "$GITHUB_OUTPUT"
+
+          echo "peak_mb=$HEAP_MEDIAN" > /tmp/metrics.txt
+          echo "time_s=$TIME_MEDIAN" >> /tmp/metrics.txt
+          echo "time_spread=$TIME_SPREAD" >> /tmp/metrics.txt
+          echo "heap_spread=$HEAP_SPREAD" >> /tmp/metrics.txt
+          echo "all_times=$ALL_TIMES" >> /tmp/metrics.txt
+          echo "all_heaps=$ALL_HEAPS" >> /tmp/metrics.txt
+          echo "runs=$RUNS" >> /tmp/metrics.txt
 
       - name: Upload metrics artifact
         uses: actions/upload-artifact@v4
@@ -132,6 +198,11 @@ jobs:
                 echo "found=true" >> "$GITHUB_OUTPUT"
                 echo "peak_mb=$(grep 'peak_mb=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
                 echo "time_s=$(grep 'time_s=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+                echo "time_spread=$(grep 'time_spread=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+                echo "heap_spread=$(grep 'heap_spread=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+                echo "all_times=$(grep 'all_times=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+                echo "all_heaps=$(grep 'all_heaps=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+                echo "runs=$(grep 'runs=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
                 exit 0
               fi
             fi
@@ -154,21 +225,55 @@ jobs:
 
           cargo build --release -p cli --features jemalloc-stats
 
-          ./target/release/cli prove "$ELF" -o /tmp/proof.bin --time \
-            | tee /tmp/baseline_output.txt
-          rm -f /tmp/proof.bin
+          RUNS="${{ steps.config.outputs.runs }}"
+          TIMES=""
+          HEAPS=""
+          for i in $(seq 1 $RUNS); do
+            echo "--- Baseline run $i/$RUNS ---"
+            ./target/release/cli prove "$ELF" -o /tmp/proof.bin --time \
+              | tee /tmp/baseline_output_$i.txt
+            rm -f /tmp/proof.bin
 
-          PEAK_MB=$(grep -o 'Peak heap: [0-9]*' /tmp/baseline_output.txt | awk '{print $3}')
-          TIME_S=$(grep -o 'Proving time: [0-9.]*' /tmp/baseline_output.txt | awk '{print $3}')
+            T=$(grep -o 'Proving time: [0-9.]*' /tmp/baseline_output_$i.txt | awk '{print $3}')
+            H=$(grep -o 'Peak heap: [0-9]*' /tmp/baseline_output_$i.txt | awk '{print $3}')
 
-          if [ -z "$PEAK_MB" ] || [ -z "$TIME_S" ]; then
-            echo "::error::Failed to parse baseline metrics from CLI output"
-            cat /tmp/baseline_output.txt
+            if [ -z "$T" ] || [ -z "$H" ]; then
+              echo "::error::Failed to parse baseline metrics from run $i"
+              cat /tmp/baseline_output_$i.txt
+              exit 1
+            fi
+
+            TIMES="$TIMES $T"
+            HEAPS="$HEAPS $H"
+          done
+
+          MEDIAN_POS=$(( (RUNS + 1) / 2 ))
+          TIME_MEDIAN=$(echo $TIMES | tr ' ' '\n' | sort -n | awk "NR==$MEDIAN_POS")
+          HEAP_MEDIAN=$(echo $HEAPS | tr ' ' '\n' | sort -n | awk "NR==$MEDIAN_POS")
+
+          if [ -z "$HEAP_MEDIAN" ] || [ -z "$TIME_MEDIAN" ]; then
+            echo "::error::Failed to compute baseline median metrics"
             exit 1
           fi
 
-          echo "peak_mb=$PEAK_MB" >> "$GITHUB_OUTPUT"
-          echo "time_s=$TIME_S" >> "$GITHUB_OUTPUT"
+          TIME_MIN=$(echo $TIMES | tr ' ' '\n' | sort -n | head -1)
+          TIME_MAX=$(echo $TIMES | tr ' ' '\n' | sort -n | tail -1)
+          TIME_SPREAD=$(awk "BEGIN { if ($TIME_MEDIAN > 0) printf \"%.1f\", (($TIME_MAX - $TIME_MIN) / $TIME_MEDIAN) * 100; else print \"0.0\" }")
+
+          HEAP_MIN=$(echo $HEAPS | tr ' ' '\n' | sort -n | head -1)
+          HEAP_MAX=$(echo $HEAPS | tr ' ' '\n' | sort -n | tail -1)
+          HEAP_SPREAD=$(awk "BEGIN { if ($HEAP_MEDIAN > 0) printf \"%.1f\", (($HEAP_MAX - $HEAP_MIN) / $HEAP_MEDIAN) * 100; else print \"0.0\" }")
+
+          ALL_TIMES=$(echo $TIMES | tr ' ' '\n' | paste -sd '/' -)
+          ALL_HEAPS=$(echo $HEAPS | tr ' ' '\n' | paste -sd '/' -)
+
+          echo "peak_mb=$HEAP_MEDIAN" >> "$GITHUB_OUTPUT"
+          echo "time_s=$TIME_MEDIAN" >> "$GITHUB_OUTPUT"
+          echo "time_spread=$TIME_SPREAD" >> "$GITHUB_OUTPUT"
+          echo "heap_spread=$HEAP_SPREAD" >> "$GITHUB_OUTPUT"
+          echo "all_times=$ALL_TIMES" >> "$GITHUB_OUTPUT"
+          echo "all_heaps=$ALL_HEAPS" >> "$GITHUB_OUTPUT"
+          echo "runs=$RUNS" >> "$GITHUB_OUTPUT"
 
           # Restore PR checkout
           git checkout "$PR_SHA"
@@ -184,10 +289,20 @@ jobs:
             BASELINE_PEAK=${{ steps.baseline-artifact.outputs.peak_mb }}
             BASELINE_TIME=${{ steps.baseline-artifact.outputs.time_s }}
             BASELINE_SRC="cached"
+            BASELINE_TIME_SPREAD="${{ steps.baseline-artifact.outputs.time_spread }}"
+            BASELINE_HEAP_SPREAD="${{ steps.baseline-artifact.outputs.heap_spread }}"
+            BASELINE_ALL_TIMES="${{ steps.baseline-artifact.outputs.all_times }}"
+            BASELINE_ALL_HEAPS="${{ steps.baseline-artifact.outputs.all_heaps }}"
+            BASELINE_RUNS="${{ steps.baseline-artifact.outputs.runs }}"
           else
             BASELINE_PEAK=${{ steps.baseline-run.outputs.peak_mb }}
             BASELINE_TIME=${{ steps.baseline-run.outputs.time_s }}
             BASELINE_SRC="built from main"
+            BASELINE_TIME_SPREAD="${{ steps.baseline-run.outputs.time_spread }}"
+            BASELINE_HEAP_SPREAD="${{ steps.baseline-run.outputs.heap_spread }}"
+            BASELINE_ALL_TIMES="${{ steps.baseline-run.outputs.all_times }}"
+            BASELINE_ALL_HEAPS="${{ steps.baseline-run.outputs.all_heaps }}"
+            BASELINE_RUNS="${{ steps.baseline-run.outputs.runs }}"
           fi
 
           CURRENT_PEAK=${{ steps.pr.outputs.peak_mb }}
@@ -211,6 +326,16 @@ jobs:
           echo "peak_pct=$PEAK_PCT" >> "$GITHUB_OUTPUT"
           echo "time_diff=$TIME_DIFF" >> "$GITHUB_OUTPUT"
           echo "time_pct=$TIME_PCT" >> "$GITHUB_OUTPUT"
+          echo "pr_time_spread=${{ steps.pr.outputs.time_spread }}" >> "$GITHUB_OUTPUT"
+          echo "pr_heap_spread=${{ steps.pr.outputs.heap_spread }}" >> "$GITHUB_OUTPUT"
+          echo "pr_all_times=${{ steps.pr.outputs.all_times }}" >> "$GITHUB_OUTPUT"
+          echo "pr_all_heaps=${{ steps.pr.outputs.all_heaps }}" >> "$GITHUB_OUTPUT"
+          echo "pr_runs=${{ steps.pr.outputs.runs }}" >> "$GITHUB_OUTPUT"
+          echo "baseline_time_spread=$BASELINE_TIME_SPREAD" >> "$GITHUB_OUTPUT"
+          echo "baseline_heap_spread=$BASELINE_HEAP_SPREAD" >> "$GITHUB_OUTPUT"
+          echo "baseline_all_times=$BASELINE_ALL_TIMES" >> "$GITHUB_OUTPUT"
+          echo "baseline_all_heaps=$BASELINE_ALL_HEAPS" >> "$GITHUB_OUTPUT"
+          echo "baseline_runs=$BASELINE_RUNS" >> "$GITHUB_OUTPUT"
 
       - name: Comment on PR
         if: github.event_name != 'push' && github.event_name != 'workflow_dispatch'
@@ -226,11 +351,22 @@ jobs:
             const timePct = '${{ steps.compare.outputs.time_pct }}';
             const peakDiff = '${{ steps.compare.outputs.peak_diff }}';
             const timeDiff = '${{ steps.compare.outputs.time_diff }}';
+            const runs = '${{ steps.compare.outputs.pr_runs }}' || '1';
+            const prTimeSpread = '${{ steps.compare.outputs.pr_time_spread }}';
+            const prHeapSpread = '${{ steps.compare.outputs.pr_heap_spread }}';
+            const prAllTimes = '${{ steps.compare.outputs.pr_all_times }}';
+            const prAllHeaps = '${{ steps.compare.outputs.pr_all_heaps }}';
+            const baseTimeSpread = '${{ steps.compare.outputs.baseline_time_spread }}';
+            const baseHeapSpread = '${{ steps.compare.outputs.baseline_heap_spread }}';
+            const baseAllTimes = '${{ steps.compare.outputs.baseline_all_times }}';
+            const baseAllHeaps = '${{ steps.compare.outputs.baseline_all_heaps }}';
 
             const fmt = (v) => parseFloat(v) >= 0 ? `+${v}` : v;
             const icon = (pct) => parseFloat(pct) > 5 ? '🔴' : parseFloat(pct) < -5 ? '🟢' : '⚪';
+            const SPREAD_THRESHOLD = 5.0;
 
-            let body = `## Benchmark — fib_iterative_372k\n\n`;
+            const nLabel = parseInt(runs) > 1 ? ` (median of ${runs})` : '';
+            let body = `## Benchmark — fib_iterative_372k${nLabel}\n\n`;
             body += `| Metric | main | PR | Δ |\n`;
             body += `|--------|------|----|---|\n`;
             body += `| **Peak heap** | ${basePeak} MB | ${peak} MB | ${fmt(peakDiff)} MB (${fmt(peakPct)}%) ${icon(peakPct)} |\n`;
@@ -244,6 +380,40 @@ jobs:
               body += `> 🎉 **Improvement detected** — heap or time decreased by more than 5%.\n`;
             } else {
               body += `> ✅ No significant change.\n`;
+            }
+
+            // Spread warnings
+            const prWarnings = [];
+            const baseWarnings = [];
+
+            if (prTimeSpread && parseFloat(prTimeSpread) > SPREAD_THRESHOLD) {
+              const vals = prAllTimes ? prAllTimes.split('/').map(t => `${t}s`).join(' / ') : '';
+              prWarnings.push(`Prove time spread: ${prTimeSpread}% (${vals})`);
+            }
+            if (prHeapSpread && parseFloat(prHeapSpread) > SPREAD_THRESHOLD) {
+              const vals = prAllHeaps ? prAllHeaps.split('/').map(h => `${h} MB`).join(' / ') : '';
+              prWarnings.push(`Heap spread: ${prHeapSpread}% (${vals})`);
+            }
+            if (baseTimeSpread && parseFloat(baseTimeSpread) > SPREAD_THRESHOLD) {
+              const vals = baseAllTimes ? baseAllTimes.split('/').map(t => `${t}s`).join(' / ') : '';
+              baseWarnings.push(`Baseline time spread: ${baseTimeSpread}% (${vals}) — comparison may be less reliable`);
+            }
+            if (baseHeapSpread && parseFloat(baseHeapSpread) > SPREAD_THRESHOLD) {
+              const vals = baseAllHeaps ? baseAllHeaps.split('/').map(h => `${h} MB`).join(' / ') : '';
+              baseWarnings.push(`Baseline heap spread: ${baseHeapSpread}% (${vals}) — comparison may be less reliable`);
+            }
+
+            const allWarnings = [...prWarnings, ...baseWarnings];
+            if (allWarnings.length > 0) {
+              body += `\n`;
+              for (const w of allWarnings) {
+                body += `> ⚠️ ${w}\n`;
+              }
+              if (prWarnings.length > 0) {
+                body += `> Consider re-running \`/bench\`\n`;
+              }
+            } else if (parseInt(runs) > 1) {
+              body += `\n> ✅ Low variance (time: ${prTimeSpread || '0.0'}%, heap: ${prHeapSpread || '0.0'}%)\n`;
             }
 
             const sha = '${{ steps.pr-ref.outputs.sha || github.sha }}'.substring(0, 8);
