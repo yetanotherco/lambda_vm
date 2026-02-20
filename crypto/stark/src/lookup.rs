@@ -454,12 +454,7 @@ impl BusValue {
                             coefficient,
                             column,
                         } => {
-                            // Handle signed coefficients
-                            let coeff = if *coefficient >= 0 {
-                                FieldElement::<E>::from(*coefficient as u64)
-                            } else {
-                                -FieldElement::<E>::from((-*coefficient) as u64)
-                            };
+                            let coeff = FieldElement::<E>::from(*coefficient);
                             result += get_column(*column) * coeff;
                         }
                         LinearTerm::ColumnUnsigned {
@@ -471,12 +466,7 @@ impl BusValue {
                             result += get_column(*column) * coeff;
                         }
                         LinearTerm::Constant(value) => {
-                            // Handle signed constants
-                            if *value >= 0 {
-                                result += FieldElement::<E>::from(*value as u64);
-                            } else {
-                                result = result - FieldElement::<E>::from((-*value) as u64);
-                            }
+                            result += FieldElement::<E>::from(*value);
                         }
                     }
                 }
@@ -1026,11 +1016,7 @@ fn build_logup_term_column<F, E>(
                                 coefficient,
                                 column,
                             } => {
-                                let coeff = if coefficient >= 0 {
-                                    FieldElement::<F>::from(coefficient as u64)
-                                } else {
-                                    -FieldElement::<F>::from((-coefficient) as u64)
-                                };
+                                let coeff = FieldElement::<F>::from(coefficient);
                                 result += &main_segment_cols[column][row] * coeff;
                             }
                             LinearTerm::ColumnUnsigned {
@@ -1041,11 +1027,7 @@ fn build_logup_term_column<F, E>(
                                 result += &main_segment_cols[column][row] * coeff;
                             }
                             LinearTerm::Constant(value) => {
-                                if value >= 0 {
-                                    result += FieldElement::<F>::from(value as u64);
-                                } else {
-                                    result = result - FieldElement::<F>::from((-value) as u64);
-                                }
+                                result += FieldElement::<F>::from(value);
                             }
                         }
                     }
@@ -1283,11 +1265,7 @@ where
                                 coefficient,
                                 column,
                             } => {
-                                let coeff = if *coefficient >= 0 {
-                                    FieldElement::<A>::from(*coefficient as u64)
-                                } else {
-                                    -FieldElement::<A>::from((-*coefficient) as u64)
-                                };
+                                let coeff = FieldElement::<A>::from(*coefficient);
                                 result += step.get_main_evaluation_element(0, *column) * coeff;
                             }
                             LinearTerm::ColumnUnsigned {
@@ -1298,11 +1276,7 @@ where
                                 result += step.get_main_evaluation_element(0, *column) * coeff;
                             }
                             LinearTerm::Constant(value) => {
-                                if *value >= 0 {
-                                    result += FieldElement::<A>::from(*value as u64);
-                                } else {
-                                    result = result - FieldElement::<A>::from((-*value) as u64);
-                                }
+                                result += FieldElement::<A>::from(*value);
                             }
                         }
                     }
