@@ -31,44 +31,6 @@ pub const SHIFT_16: u64 = 65536;
 /// 2^32 - shift for combining words
 pub const SHIFT_32: u64 = 4294967296;
 
-// =============================================================================
-// Precomputed Constants for Packing
-// =============================================================================
-
-/// Precomputed shift constants for field E.
-///
-/// Creating field elements from u64 constants has some overhead.
-/// When combining many rows, precomputing these once saves time.
-#[derive(Clone)]
-pub struct PackingConstants<E: IsField> {
-    /// 2^8 as a field element
-    pub shift_8: FieldElement<E>,
-    /// 2^16 as a field element
-    pub shift_16: FieldElement<E>,
-    /// 2^24 = 2^8 * 2^16 as a field element
-    pub shift_24: FieldElement<E>,
-}
-
-impl<E: IsField> PackingConstants<E> {
-    /// Creates new precomputed shift constants.
-    pub fn new() -> Self {
-        let shift_8 = FieldElement::<E>::from(SHIFT_8);
-        let shift_16 = FieldElement::<E>::from(SHIFT_16);
-        let shift_24 = &shift_8 * &shift_16;
-        Self {
-            shift_8,
-            shift_16,
-            shift_24,
-        }
-    }
-}
-
-impl<E: IsField> Default for PackingConstants<E> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Computes powers of alpha incrementally: [1, α, α², α³, ...]
 ///
 /// This is more efficient than calling `alpha.pow(i)` for each i,
