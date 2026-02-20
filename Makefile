@@ -1,7 +1,7 @@
 .PHONY: deps deps-linux deps-macos prepare-test-data compile-programs-asm compile-programs-rust compile-bench \
 compile-programs clean-asm clean-rust clean-bench clean-shared clean test test-asm test-no-compile \
 test-asm-no-compile test-rust test-rust-no-compile test-executor flamegraph-prover \
-test-fast test-prover test-prover-all build check
+test-fast test-prover test-prover-all build check clippy fmt lint
 
 UNAME := $(shell uname)
 
@@ -34,7 +34,6 @@ BENCH_ARTIFACTS_DIR=./executor/program_artifacts/bench
 SHARED_TARGET_DIR=./executor/shared_target
 
 ASM_PROGRAMS = $(wildcard $(ASM_PROGRAMS_DIR)/*.s)
-ARTIFACTS_ASM = $(patsubst $(ASM_PROGRAMS_DIR)/%.s, $(ASM_ARTIFACTS_DIR)/%.elf, $(ASM_PROGRAMS))
 
 RUST_PROGRAM_DIRS := $(dir $(wildcard $(RUST_PROGRAMS_DIR)/*/Cargo.toml))
 RUST_PROGRAMS := $(notdir $(basename $(RUST_PROGRAM_DIRS:%/=%)))
@@ -75,7 +74,12 @@ prepare-sysroot:
 		echo "Sysroot already exists at $(SYSROOT_DIR)"; \
 	fi
 
-compile-programs-asm: $(ARTIFACTS_ASM)
+compile-programs-asm:
+	@mkdir -p $(ASM_ARTIFACTS_DIR)
+	@set -e; for src in $(ASM_PROGRAMS); do \
+		echo "clang --target=riscv64 -fuse-ld=lld -nostdlib -Wl,-e,main $$src -o $(ASM_ARTIFACTS_DIR)/$$(basename $$src .s).elf"; \
+		clang --target=riscv64 -fuse-ld=lld -nostdlib -Wl,-e,main $$src -o $(ASM_ARTIFACTS_DIR)/$$(basename $$src .s).elf; \
+	done
 
 compile-programs-rust: prepare-sysroot $(RUST_ARTIFACTS)
 
@@ -83,10 +87,6 @@ compile-bench: $(BENCH_ARTIFACTS)
 
 compile-programs: compile-programs-asm compile-programs-rust compile-bench
 
-# Compile and link assembly directly with clang (64-bit)
-$(ASM_ARTIFACTS_DIR)/%.elf: $(ASM_PROGRAMS_DIR)/%.s
-	@mkdir -p $(ASM_ARTIFACTS_DIR)
-	clang --target=riscv64 -fuse-ld=lld -nostdlib -Wl,-e,main $< -o $@
 
 # Compile rust (64-bit)
 $(RUST_ARTIFACTS_DIR)/%.elf: $(RUST_PROGRAMS_DIR)/%/Cargo.toml
@@ -142,9 +142,9 @@ test-rust-no-compile:
 test-no-compile: prepare-test-data
 	cargo test -p executor
 
-test-flamegraph: 
+test-flamegraph:
 	cargo test -p executor --test flamegraph
-	
+
 test: compile-programs prepare-test-data
 	cargo test
 
@@ -154,13 +154,17 @@ test: compile-programs prepare-test-data
 test-fast:
 	cargo test -p lambda-vm-prover -p stark -p executor -F stark/parallel
 
-# Prover tests only (fast, parallel enabled by default)
+# Prover tests only
 test-prover:
 	cargo test -p lambda-vm-prover
 
 # Prover tests including slow ones
 test-prover-all:
 	cargo test -p lambda-vm-prover -- --include-ignored
+
+# Prover tests with debug-checks (shows bus balance report)
+test-prover-debug:
+	cargo test -p lambda-vm-prover --features debug-checks -- --nocapture
 
 # Build all
 build:
@@ -169,6 +173,23 @@ build:
 # Check (faster than build, no codegen)
 check:
 	cargo check --workspace
+
+# === Linting ===
+# op_ref: We pass big integers (U256/U384) and field elements by reference since operator
+# impls delegate to &self internally, avoiding unnecessary 32-48 byte copies.
+
+clippy:
+	cargo clippy --workspace --all-targets -- -D warnings -A clippy::op_ref
+	cargo clippy --workspace --all-targets --no-default-features --features lambda-vm-prover/debug-checks -- -D warnings -A clippy::op_ref
+
+fmt:
+	cargo fmt --all
+
+# Run clippy + fmt check (used by CI)
+lint:
+	cargo fmt --check --all
+	cargo clippy --workspace --all-targets -- -D warnings -A clippy::op_ref
+	cargo clippy --workspace --all-targets --no-default-features --features lambda-vm-prover/debug-checks -- -D warnings -A clippy::op_ref
 
 flamegraph-prover:
 	cd crypto/stark && samply record cargo bench --bench profile_prover --features parallel

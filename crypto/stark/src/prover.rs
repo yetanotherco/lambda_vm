@@ -3,6 +3,7 @@ use std::marker::PhantomData;
 use std::time::Instant;
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
+use crypto::merkle_tree::traits::IsMerkleTreeBackend;
 use math::fft::cpu::bit_reversing::{in_place_bit_reverse_permute, reverse_index};
 use math::fft::errors::FFTError;
 
@@ -15,18 +16,20 @@ use math::{
 };
 
 #[cfg(feature = "parallel")]
-use rayon::prelude::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use rayon::prelude::{
+    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
+};
 
-#[cfg(debug_assertions)]
+#[cfg(feature = "debug-checks")]
 use crate::debug::validate_trace;
 use crate::domain::new_domain;
 use crate::fri;
 use crate::lookup::LOGUP_NUM_CHALLENGES;
 use crate::proof::stark::{DeepPolynomialOpenings, PolynomialOpenings};
 use crate::table::Table;
-use crate::trace::{LDETraceTable, columns2rows};
+use crate::trace::LDETraceTable;
 
-use super::config::{BatchedMerkleTree, Commitment};
+use super::config::{BatchedMerkleTree, BatchedMerkleTreeBackend, Commitment};
 use super::constraints::evaluator::ConstraintEvaluator;
 use super::domain::Domain;
 use super::fri::fri_decommit::FriDecommitment;
@@ -234,16 +237,51 @@ pub trait IsStarkProver<
         Some((tree, commitment))
     }
 
+    /// Builds a Merkle tree commitment from column-major LDE evaluations with
+    /// bit-reverse permutation, without cloning the full evaluation matrix.
+    ///
+    /// For each row index `i`, we hash `col_0[br(i)] || col_1[br(i)] || ...`
+    /// where `br(i)` is the bit-reversal of `i`. This produces the same Merkle
+    /// tree as the old clone + bit-reverse + columns2rows + batch_commit flow,
+    /// but avoids allocating the cloned and transposed matrices entirely.
+    fn commit_columns_bit_reversed<E>(
+        columns: &[Vec<FieldElement<E>>],
+    ) -> Option<(BatchedMerkleTree<E>, Commitment)>
+    where
+        FieldElement<E>: AsBytes + Sync + Send,
+        E: IsField,
+    {
+        if columns.is_empty() || columns[0].is_empty() {
+            return None;
+        }
+
+        let num_rows = columns[0].len();
+        let num_cols = columns.len();
+
+        #[cfg(feature = "parallel")]
+        let iter = (0..num_rows).into_par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let iter = 0..num_rows;
+
+        let hashed_leaves: Vec<Commitment> = iter
+            .map(|row_idx| {
+                let br_idx = reverse_index(row_idx, num_rows as u64);
+                let row: Vec<FieldElement<E>> = (0..num_cols)
+                    .map(|col_idx| columns[col_idx][br_idx].clone())
+                    .collect();
+                BatchedMerkleTreeBackend::<E>::hash_data(&row)
+            })
+            .collect();
+
+        let tree = BatchedMerkleTree::<E>::build_from_hashed_leaves(hashed_leaves)?;
+        let root = tree.root;
+        Some((tree, root))
+    }
+
     /// Compute the LDE commitment for a subset of columns from a trace (for testing).
     ///
     /// This helper computes the same commitment the prover generates internally,
     /// useful for setting up soundness test scenarios.
-    ///
-    /// The commitment is computed by:
-    /// 1. Interpolating columns to polynomials
-    /// 2. Evaluating on LDE domain (size = trace_size * blowup_factor)
-    /// 3. Bit-reverse permuting
-    /// 4. Building Merkle tree from rows
     fn compute_precomputed_commitment_for_testing(
         trace: &TraceTable<Field, FieldExtension>,
         air: &impl AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
@@ -266,22 +304,14 @@ pub trait IsStarkProver<
         // Evaluate on LDE domain
         let evaluations = Self::compute_lde_trace_evaluations::<Field>(&precomputed_polys, &domain);
 
-        // Bit-reverse permute
-        let mut lde_permuted = evaluations;
-        for col in lde_permuted.iter_mut() {
-            in_place_bit_reverse_permute(col);
-        }
-
-        // Build commitment
-        let rows = columns2rows(lde_permuted);
-        let (_, commitment) = Self::batch_commit_main(&rows)?;
+        let (_, commitment) = Self::commit_columns_bit_reversed(&evaluations)?;
 
         Some(commitment)
     }
 
     /// Given a `TraceTable`, this method interpolates its columns, computes the commitment to the
     /// table and appends it to the transcript.
-    /// Output: a touple of length 4 with the following:
+    /// Output: a tuple of length 4 with the following:
     /// • The polynomials interpolating the columns of `trace`.
     /// • The evaluations of the above polynomials over the domain `domain`.
     /// • The Merkle tree of evaluations of the above polynomials over the domain `domain`.
@@ -309,16 +339,10 @@ pub trait IsStarkProver<
         let lde_trace_evaluations =
             Self::compute_lde_trace_evaluations::<Field>(&trace_polys, domain);
 
-        let mut lde_trace_permuted = lde_trace_evaluations.clone();
-        for col in lde_trace_permuted.iter_mut() {
-            in_place_bit_reverse_permute(col);
-        }
-
-        // Compute commitment.
-        let lde_trace_permuted_rows = columns2rows(lde_trace_permuted);
-
+        // Hash rows on-the-fly from column-major data with bit-reversal,
+        // avoiding the full clone + transpose that the old code did.
         let (lde_trace_merkle_tree, lde_trace_merkle_root) =
-            Self::batch_commit_main(&lde_trace_permuted_rows)?;
+            Self::commit_columns_bit_reversed(&lde_trace_evaluations)?;
 
         // >>>> Send commitment.
         transcript.append_bytes(&lde_trace_merkle_root);
@@ -331,19 +355,17 @@ pub trait IsStarkProver<
         ))
     }
 
-    /// Variant of `interpolate_and_commit_main` for preprocessed tables.
+    /// Interpolates columns of a preprocessed trace table and computes LDE evaluations.
     ///
-    /// Does NOT append to transcript - the caller handles that with the hardcoded commitment.
-    /// Returns the computed commitment for verification purposes.
+    /// Does NOT build a Merkle tree (the caller builds separate trees for
+    /// precomputed and multiplicity columns).
     #[allow(clippy::type_complexity)]
-    fn interpolate_and_commit_preprocessed(
+    fn interpolate_and_compute_lde(
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
     ) -> Option<(
         Vec<Polynomial<FieldElement<Field>>>,
         Vec<Vec<FieldElement<Field>>>,
-        BatchedMerkleTree<Field>,
-        Commitment,
     )>
     where
         FieldElement<Field>: AsBytes,
@@ -357,32 +379,11 @@ pub trait IsStarkProver<
         let lde_trace_evaluations =
             Self::compute_lde_trace_evaluations::<Field>(&trace_polys, domain);
 
-        let mut lde_trace_permuted = lde_trace_evaluations.clone();
-        for col in lde_trace_permuted.iter_mut() {
-            in_place_bit_reverse_permute(col);
-        }
-
-        // Compute commitment (but don't append to transcript - caller does that).
-        let lde_trace_permuted_rows = columns2rows(lde_trace_permuted);
-
-        let (lde_trace_merkle_tree, lde_trace_merkle_root) =
-            Self::batch_commit_main(&lde_trace_permuted_rows)?;
-
-        Some((
-            trace_polys,
-            lde_trace_evaluations,
-            lde_trace_merkle_tree,
-            lde_trace_merkle_root,
-        ))
+        Some((trace_polys, lde_trace_evaluations))
     }
 
-    /// Given a `TraceTable`, this method interpolates its columns, computes the commitment to the
-    /// table and appends it to the transcript.
-    /// Output: a touple of length 4 with the following:
-    /// • The polynomials interpolating the columns of `trace`.
-    /// • The evaluations of the above polynomials over the domain `domain`.
-    /// • The Merkle tree of evaluations of the above polynomials over the domain `domain`.
-    /// • The roots of the above Merkle trees.
+    /// Given a `TraceTable`, this method interpolates its auxiliary columns, computes the
+    /// commitment to the table and appends it to the transcript.
     #[allow(clippy::type_complexity)]
     fn interpolate_and_commit_aux(
         trace: &TraceTable<Field, FieldExtension>,
@@ -405,16 +406,9 @@ pub trait IsStarkProver<
         // Evaluate those polynomials t_j on the large domain D_LDE.
         let lde_trace_evaluations = Self::compute_lde_trace_evaluations(&trace_polys, domain);
 
-        let mut lde_trace_permuted = lde_trace_evaluations.clone();
-        for col in lde_trace_permuted.iter_mut() {
-            in_place_bit_reverse_permute(col);
-        }
-
-        // Compute commitment.
-        let lde_trace_permuted_rows = columns2rows(lde_trace_permuted);
-
+        // Hash rows on-the-fly from column-major data with bit-reversal.
         let (lde_trace_merkle_tree, lde_trace_merkle_root) =
-            Self::batch_commit_extension(&lde_trace_permuted_rows)?;
+            Self::commit_columns_bit_reversed(&lde_trace_evaluations)?;
 
         // >>>> Send commitment.
         transcript.append_bytes(&lde_trace_merkle_root);
@@ -505,32 +499,21 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        // Interpolate all columns (needed for constraint evaluation)
-        let Some((trace_polys, evaluations, _full_tree, _full_root)) =
-            Self::interpolate_and_commit_preprocessed(trace, domain)
+        // Interpolate all columns and compute LDE evaluations (no tree building here).
+        let Some((trace_polys, evaluations)) = Self::interpolate_and_compute_lde(trace, domain)
         else {
             return Err(ProvingError::EmptyCommitment);
         };
 
         // --- Build PRECOMPUTED tree (cols 0..num_precomputed) ---
-        let precomputed_evaluations: Vec<_> = evaluations[..num_precomputed_cols].to_vec();
-        let mut precomputed_lde_permuted = precomputed_evaluations.clone();
-        for col in precomputed_lde_permuted.iter_mut() {
-            in_place_bit_reverse_permute(col);
-        }
-        let precomputed_rows = columns2rows(precomputed_lde_permuted);
         let (precomputed_tree, precomputed_root) =
-            Self::batch_commit_main(&precomputed_rows).ok_or(ProvingError::EmptyCommitment)?;
+            Self::commit_columns_bit_reversed(&evaluations[..num_precomputed_cols])
+                .ok_or(ProvingError::EmptyCommitment)?;
 
         // --- Build MULTIPLICITIES tree (cols num_precomputed..) ---
-        let multiplicity_evaluations: Vec<_> = evaluations[num_precomputed_cols..].to_vec();
-        let mut mult_lde_permuted = multiplicity_evaluations.clone();
-        for col in mult_lde_permuted.iter_mut() {
-            in_place_bit_reverse_permute(col);
-        }
-        let mult_rows = columns2rows(mult_lde_permuted);
         let (mult_tree, mult_root) =
-            Self::batch_commit_main(&mult_rows).ok_or(ProvingError::EmptyCommitment)?;
+            Self::commit_columns_bit_reversed(&evaluations[num_precomputed_cols..])
+                .ok_or(ProvingError::EmptyCommitment)?;
 
         // Verify that our computed precomputed root matches the hardcoded commitment.
         // This is a sanity check - if they don't match, something is wrong with the trace.
@@ -1272,6 +1255,9 @@ pub trait IsStarkProver<
             round_1_results.push(round_1_result);
         }
 
+        #[cfg(feature = "debug-checks")]
+        print_bus_balance_report(&round_1_results);
+
         // =====================================================================
         // Rounds 2-4: Standard STARK protocol for each AIR
         // =====================================================================
@@ -1323,7 +1309,7 @@ pub trait IsStarkProver<
     {
         info!("Started proof generation...");
 
-        #[cfg(debug_assertions)]
+        #[cfg(feature = "debug-checks")]
         validate_trace(
             air,
             pub_inputs,
@@ -1502,6 +1488,122 @@ pub trait IsStarkProver<
     }
 }
 
+/// Print a global bus balance report aggregating per-bus sums across all tables.
+///
+/// Uses numeric bus IDs only (no VM-specific names) to keep the stark crate generic.
+/// For bus ID → name mapping, see `BusId` in the prover crate.
+#[cfg(feature = "debug-checks")]
+fn print_bus_balance_report<Field, FieldExtension>(
+    round_1_results: &[Round1<Field, FieldExtension>],
+) where
+    Field: IsSubFieldOf<FieldExtension> + IsFFTField,
+    FieldExtension: IsField,
+    FieldElement<Field>: AsBytes,
+    FieldElement<FieldExtension>: AsBytes,
+{
+    use std::collections::HashMap;
+
+    let has_logup = round_1_results
+        .iter()
+        .any(|r| r.bus_public_inputs.is_some());
+    if !has_logup {
+        return;
+    }
+
+    let mut global_bus_sums: HashMap<u64, FieldElement<FieldExtension>> = HashMap::new();
+    let mut bus_senders: HashMap<u64, Vec<(String, FieldElement<FieldExtension>)>> = HashMap::new();
+    let mut bus_receivers: HashMap<u64, Vec<(String, FieldElement<FieldExtension>)>> =
+        HashMap::new();
+    let mut global_sender_sums: HashMap<u64, FieldElement<FieldExtension>> = HashMap::new();
+    let mut global_receiver_sums: HashMap<u64, FieldElement<FieldExtension>> = HashMap::new();
+
+    for round_1_result in round_1_results {
+        if let Some(bus_inputs) = &round_1_result.bus_public_inputs {
+            for (&bus_id, sum) in &bus_inputs.per_bus_sums {
+                *global_bus_sums
+                    .entry(bus_id)
+                    .or_insert(FieldElement::zero()) += sum.clone();
+            }
+            for (&bus_id, sum) in &bus_inputs.per_bus_sender_sums {
+                *global_sender_sums
+                    .entry(bus_id)
+                    .or_insert(FieldElement::zero()) += sum.clone();
+                bus_senders
+                    .entry(bus_id)
+                    .or_default()
+                    .push((bus_inputs.table_name.clone(), sum.clone()));
+            }
+            for (&bus_id, sum) in &bus_inputs.per_bus_receiver_sums {
+                *global_receiver_sums
+                    .entry(bus_id)
+                    .or_insert(FieldElement::zero()) += sum.clone();
+                bus_receivers
+                    .entry(bus_id)
+                    .or_default()
+                    .push((bus_inputs.table_name.clone(), sum.clone()));
+            }
+        }
+    }
+
+    eprintln!("\n=== GLOBAL BUS BALANCE REPORT ===");
+    let zero = FieldElement::<FieldExtension>::zero();
+    let mut bus_ids: Vec<_> = global_bus_sums.keys().copied().collect();
+    bus_ids.sort();
+    for bus_id in bus_ids {
+        let total = &global_bus_sums[&bus_id];
+        if *total != zero {
+            eprintln!("Bus {:2}: IMBALANCED", bus_id);
+
+            if let Some(senders) = bus_senders.get(&bus_id) {
+                eprintln!("  SENDERS:");
+                for (table_name, sum) in senders {
+                    eprintln!("    [{:12}]: {:?}", table_name, sum);
+                }
+                if let Some(total_sent) = global_sender_sums.get(&bus_id) {
+                    eprintln!("    → Total sent: {:?}", total_sent);
+                }
+            }
+
+            if let Some(receivers) = bus_receivers.get(&bus_id) {
+                eprintln!("  RECEIVERS:");
+                for (table_name, sum) in receivers {
+                    eprintln!("    [{:12}]: {:?}", table_name, sum);
+                }
+                if let Some(total_recv) = global_receiver_sums.get(&bus_id) {
+                    eprintln!("    → Total received: {:?}", total_recv);
+                }
+            }
+
+            eprintln!("  IMBALANCE: {:?}\n", total);
+        } else {
+            eprintln!("Bus {:2}: BALANCED ✓", bus_id);
+        }
+    }
+    eprintln!("=================================\n");
+
+    {
+        use crate::bus_debug::BUS_DEBUG_TRACKER;
+
+        let tracker = BUS_DEBUG_TRACKER
+            .lock()
+            .expect("[BusDebugTracker] mutex poisoned — debug data may be inconsistent");
+        if !tracker.is_empty() {
+            if tracker.is_truncated() {
+                eprintln!(
+                    "[BusDebugTracker] WARNING: Log truncated at {} entries — results may be incomplete",
+                    tracker.len()
+                );
+            }
+            eprintln!(
+                "[BusDebugTracker] Logged {} interactions, running analysis...",
+                tracker.len()
+            );
+            let report = tracker.analyze_mismatches();
+            report.print_summary();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::domain::VerifierDomain;
@@ -1624,6 +1726,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     fn proof_parts_stone_compatibility_case_1() -> (
         StarkProof<
             Stark252PrimeField,

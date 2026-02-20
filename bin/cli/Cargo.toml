@@ -9,7 +9,9 @@ prover = { path = "../../prover", package = "lambda-vm-prover" }
 stark = { path = "../../crypto/stark" }
 crypto = { path = "../../crypto/crypto" }
 clap = { version = "4.3.10", features = ["derive"] }
-serde = { version = "1.0", features = ["derive"] }
-ciborium = "0.2"
-sha3 = "0.10"
-hex = "0.4"
+bincode = "1"
+tikv-jemallocator = "0.6"
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"], optional = true }
+
+[features]
+jemalloc-stats = ["dep:tikv-jemalloc-ctl"]

@@ -21,7 +21,7 @@ fn test_packed_delegates_to_packing() {
     };
 
     // Simulate columns: [0x1234, 0x5678]
-    let columns = vec![FE::from(0x1234u64), FE::from(0x5678u64)];
+    let columns = [FE::from(0x1234u64), FE::from(0x5678u64)];
     let combined: Vec<FE> = bv.combine_from(|col| columns[col].clone());
 
     // Expected: 0x56781234 (same as Packing::Word2L)
@@ -37,7 +37,7 @@ fn test_linear_single_column() {
         column: 0,
     }]);
 
-    let columns = vec![FE::from(42u64)];
+    let columns = [FE::from(42u64)];
     let combined: Vec<FE> = bv.combine_from(|col| columns[col].clone());
 
     assert_eq!(combined.len(), 1);
@@ -52,7 +52,7 @@ fn test_linear_column_with_coefficient() {
         column: 0,
     }]);
 
-    let columns = vec![FE::from(10u64)];
+    let columns = [FE::from(10u64)];
     let combined: Vec<FE> = bv.combine_from(|col| columns[col].clone());
 
     assert_eq!(combined.len(), 1);
@@ -73,7 +73,7 @@ fn test_linear_multiple_columns() {
         },
     ]);
 
-    let columns = vec![FE::from(10u64), FE::from(20u64)];
+    let columns = [FE::from(10u64), FE::from(20u64)];
     let combined: Vec<FE> = bv.combine_from(|col| columns[col].clone());
 
     assert_eq!(combined.len(), 1);
@@ -107,7 +107,7 @@ fn test_linear_mixed_columns_and_constant() {
         LinearTerm::Constant(10),
     ]);
 
-    let columns = vec![FE::from(5u64), FE::from(7u64)];
+    let columns = [FE::from(5u64), FE::from(7u64)];
     let combined: Vec<FE> = bv.combine_from(|col| columns[col].clone());
 
     assert_eq!(combined.len(), 1);
@@ -276,7 +276,7 @@ fn test_linear_column_unsigned_single() {
         column: 0,
     }]);
 
-    let columns = vec![FE::from(2u64)];
+    let columns = [FE::from(2u64)];
     let combined: Vec<FE> = bv.combine_from(|col| columns[col].clone());
 
     assert_eq!(combined.len(), 1);
@@ -294,7 +294,7 @@ fn test_linear_column_unsigned_with_coefficient() {
         column: 0,
     }]);
 
-    let columns = vec![FE::from(100u64)];
+    let columns = [FE::from(100u64)];
     let combined: Vec<FE> = bv.combine_from(|col| columns[col].clone());
 
     assert_eq!(combined.len(), 1);
@@ -317,7 +317,7 @@ fn test_linear_mixed_column_and_column_unsigned() {
         },
     ]);
 
-    let columns = vec![FE::from(10u64), FE::from(2u64)];
+    let columns = [FE::from(10u64), FE::from(2u64)];
     let combined: Vec<FE> = bv.combine_from(|col| columns[col].clone());
 
     assert_eq!(combined.len(), 1);
@@ -342,7 +342,7 @@ fn test_linear_mixed_all_term_types() {
         LinearTerm::Constant(10),
     ]);
 
-    let columns = vec![FE::from(5u64), FE::from(3u64)];
+    let columns = [FE::from(5u64), FE::from(3u64)];
     let combined: Vec<FE> = bv.combine_from(|col| columns[col].clone());
 
     assert_eq!(combined.len(), 1);

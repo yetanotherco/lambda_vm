@@ -241,11 +241,14 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // -------------------------------------------------------------------------
     // LOAD calls MEMW with is_register=0, passing res as both value and old
     // (since we're reading, value=old=the read data)
+    // RES columns contain individual bytes, sent as Direct elements
+    // to match the unified MEMW Read receiver format.
     interactions.push(BusInteraction::sender(
         BusId::Memw,
         Multiplicity::Column(cols::MU),
         vec![
-            // old[8] = res[8] for reads
+            // old[0..7] = 8 individual bytes (Direct elements)
+            // For reads, old == value (same data read back)
             BusValue::Packed {
                 start_column: cols::RES[0],
                 packing: Packing::Direct,
@@ -289,7 +292,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::BASE_ADDRESS_1,
                 packing: Packing::Direct,
             },
-            // value[8] = res[8] for reads
+            // value[0..7] = 8 individual bytes (Direct elements)
             BusValue::Packed {
                 start_column: cols::RES[0],
                 packing: Packing::Direct,
@@ -425,7 +428,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // -------------------------------------------------------------------------
     // LOAD receiver (from CPU)
     // -------------------------------------------------------------------------
-    // Spec: LOAD[res::DWordWL; base_address, timestamp, read2, read4, read8] | -μ
+    // Spec: LOAD[res::DWordWL; base_address, timestamp, read2, read4, read8, signed] | -μ
     //
     // res is DWordBL (8 bytes) but packed as DWordWL (2 words) for the bus.
     // DWordBL packing: 8 bytes → 2 bus elements [lo32, hi32]
@@ -459,6 +462,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             },
             BusValue::Packed {
                 start_column: cols::READ8,
+                packing: Packing::Direct,
+            },
+            // signed flag
+            BusValue::Packed {
+                start_column: cols::SIGNED,
                 packing: Packing::Direct,
             },
         ],
