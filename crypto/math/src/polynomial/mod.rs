@@ -775,3 +775,258 @@ impl Display for InterpolateError {
 
 #[cfg(feature = "std")]
 impl std::error::Error for InterpolateError {}
+
+/// Precompute `1/(z - point_i)` for each coset point, using batch inversion.
+///
+/// Given an evaluation point `z` (in extension field E) and coset points in base field F,
+/// returns the vector of inverse denominators needed for barycentric interpolation.
+/// Uses Montgomery's trick: 1 field inversion + O(N) multiplications.
+#[cfg(feature = "alloc")]
+pub fn barycentric_inv_denoms<F, E>(
+    z: &FieldElement<E>,
+    coset_points: &[FieldElement<F>],
+) -> Vec<FieldElement<E>>
+where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+{
+    // z - p where z is in E and p is in F. Since Sub<E> is defined for F: IsSubFieldOf<E>,
+    // we compute -(p - z) which equals z - p.
+    let mut denoms: Vec<FieldElement<E>> = coset_points
+        .iter()
+        .map(|p| -(p - z))
+        .collect();
+    FieldElement::inplace_batch_inverse(&mut denoms)
+        .expect("z is sampled to avoid coset points, so z - g*w^i is never zero");
+    denoms
+}
+
+/// Evaluate a polynomial at point `z` given its evaluations on a coset `{g * w^i}`,
+/// using the barycentric interpolation formula.
+///
+/// Formula: f(z) = (z^N - g^N) / N * sum_{i=0}^{N-1} [ (g*w^i) * f(g*w^i) / (z - g*w^i) ] / g^N
+///
+/// This variant takes base-field evaluations (main trace columns) and returns an
+/// extension-field result.
+///
+/// # Arguments
+/// * `z_pow_n` - z^N where N = coset_points.len()
+/// * `coset_offset_pow_n` - g^N where g = coset_offset
+/// * `n_inv` - 1/N in the extension field
+/// * `coset_points` - the coset {g*w^0, g*w^1, ..., g*w^{N-1}}
+/// * `evaluations` - f(g*w^i) for each coset point (base field)
+/// * `inv_denoms` - precomputed 1/(z - g*w^i)
+#[cfg(feature = "alloc")]
+pub fn interpolate_coset_eval<F, E>(
+    z_pow_n: &FieldElement<E>,
+    coset_offset_pow_n: &FieldElement<E>,
+    n_inv: &FieldElement<E>,
+    coset_points: &[FieldElement<F>],
+    evaluations: &[FieldElement<F>],
+    inv_denoms: &[FieldElement<E>],
+) -> FieldElement<E>
+where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+{
+    debug_assert_eq!(coset_points.len(), evaluations.len());
+    debug_assert_eq!(coset_points.len(), inv_denoms.len());
+
+    // sum = sum_{i} (g*w^i) * f(g*w^i) / (z - g*w^i)
+    // point * eval is in base field F; multiply by inv_d lifts to E
+    let sum: FieldElement<E> = coset_points
+        .iter()
+        .zip(evaluations.iter())
+        .zip(inv_denoms.iter())
+        .fold(FieldElement::<E>::zero(), |acc, ((point, eval), inv_d)| {
+            acc + (point * eval) * inv_d
+        });
+
+    // f(z) = (z^N - g^N) / (N * g^N) * sum
+    let vanishing = z_pow_n - coset_offset_pow_n;
+    // coset_offset_pow_n is g^N where g is the non-zero coset offset
+    let g_n_inv = coset_offset_pow_n
+        .inv()
+        .expect("coset_offset_pow_n is non-zero: g is the coset offset which is always non-zero");
+    vanishing * n_inv * &sum * g_n_inv
+}
+
+/// Evaluate a polynomial at point `z` given its evaluations on a coset `{g * w^i}`,
+/// using the barycentric interpolation formula.
+///
+/// This variant takes extension-field evaluations (aux trace / composition poly columns).
+#[cfg(feature = "alloc")]
+pub fn interpolate_coset_eval_ext<E>(
+    z_pow_n: &FieldElement<E>,
+    coset_offset_pow_n: &FieldElement<E>,
+    n_inv: &FieldElement<E>,
+    coset_points_ext: &[FieldElement<E>],
+    evaluations: &[FieldElement<E>],
+    inv_denoms: &[FieldElement<E>],
+) -> FieldElement<E>
+where
+    E: IsField,
+{
+    debug_assert_eq!(coset_points_ext.len(), evaluations.len());
+    debug_assert_eq!(coset_points_ext.len(), inv_denoms.len());
+
+    let sum: FieldElement<E> = coset_points_ext
+        .iter()
+        .zip(evaluations.iter())
+        .zip(inv_denoms.iter())
+        .fold(FieldElement::<E>::zero(), |acc, ((point, eval), inv_d)| {
+            let numerator = point * eval;
+            acc + numerator * inv_d
+        });
+
+    let vanishing = z_pow_n - coset_offset_pow_n;
+    // coset_offset_pow_n is g^N where g is the non-zero coset offset
+    let g_n_inv = coset_offset_pow_n
+        .inv()
+        .expect("coset_offset_pow_n is non-zero: g is the coset offset which is always non-zero");
+    vanishing * n_inv * &sum * g_n_inv
+}
+
+#[cfg(test)]
+mod barycentric_tests {
+    use super::*;
+    use crate::fft::cpu::roots_of_unity::get_powers_of_primitive_root_coset;
+    use crate::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
+
+    type FE = FieldElement<GoldilocksField>;
+
+    /// Build a polynomial of degree < n with deterministic coefficients.
+    fn test_poly(n: usize) -> Polynomial<FE> {
+        let coeffs: Vec<FE> = (0..n).map(|i| FE::from((i * 7 + 3) as u64)).collect();
+        Polynomial::new(&coeffs)
+    }
+
+    #[test]
+    fn barycentric_matches_horner_simple() {
+        let n = 8usize;
+        let coset_offset = FE::from(3u64);
+        let poly = test_poly(n);
+
+        let root_order = n.trailing_zeros() as u64;
+        let coset_points =
+            get_powers_of_primitive_root_coset(root_order, n, &coset_offset).unwrap();
+        let evaluations: Vec<FE> = coset_points.iter().map(|p| poly.evaluate(p)).collect();
+
+        let z = FE::from(42u64);
+        let expected = poly.evaluate(&z);
+
+        let z_pow_n = z.pow(n);
+        let g_pow_n = coset_offset.pow(n);
+        let n_inv = FE::from(n as u64).inv().unwrap();
+        let inv_denoms = barycentric_inv_denoms(&z, &coset_points);
+        let result = interpolate_coset_eval(
+            &z_pow_n,
+            &g_pow_n,
+            &n_inv,
+            &coset_points,
+            &evaluations,
+            &inv_denoms,
+        );
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn barycentric_matches_horner_various_sizes() {
+        for log_n in 2..=8 {
+            let n = 1 << log_n;
+            let coset_offset = FE::from(7u64);
+            let poly = test_poly(n);
+
+            let root_order = n.trailing_zeros() as u64;
+            let coset_points =
+                get_powers_of_primitive_root_coset(root_order, n, &coset_offset).unwrap();
+            let evaluations: Vec<FE> = coset_points.iter().map(|p| poly.evaluate(p)).collect();
+
+            let z = FE::from(123u64);
+            let expected = poly.evaluate(&z);
+
+            let z_pow_n = z.pow(n);
+            let g_pow_n = coset_offset.pow(n);
+            let n_inv = FE::from(n as u64).inv().unwrap();
+            let inv_denoms = barycentric_inv_denoms(&z, &coset_points);
+            let result = interpolate_coset_eval(
+                &z_pow_n,
+                &g_pow_n,
+                &n_inv,
+                &coset_points,
+                &evaluations,
+                &inv_denoms,
+            );
+
+            assert_eq!(result, expected, "failed for n={n}");
+        }
+    }
+
+    #[test]
+    fn barycentric_ext_matches_horner() {
+        let n = 16usize;
+        let coset_offset = FE::from(5u64);
+        let poly = test_poly(n);
+
+        let root_order = n.trailing_zeros() as u64;
+        let coset_points =
+            get_powers_of_primitive_root_coset(root_order, n, &coset_offset).unwrap();
+        let evaluations: Vec<FE> = coset_points.iter().map(|p| poly.evaluate(p)).collect();
+
+        let z = FE::from(999u64);
+        let expected = poly.evaluate(&z);
+
+        let z_pow_n = z.pow(n);
+        let g_pow_n = coset_offset.pow(n);
+        let n_inv = FE::from(n as u64).inv().unwrap();
+        let inv_denoms = barycentric_inv_denoms(&z, &coset_points);
+        let result = interpolate_coset_eval_ext(
+            &z_pow_n,
+            &g_pow_n,
+            &n_inv,
+            &coset_points,
+            &evaluations,
+            &inv_denoms,
+        );
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn barycentric_from_lde_stride() {
+        // Simulate what the prover does: given an LDE of size n*bf, extract stride-bf
+        // evaluations and use barycentric to evaluate at an OOD point
+        let n = 8usize;
+        let bf = 4usize;
+        let coset_offset = FE::from(3u64);
+        let poly = test_poly(n);
+
+        let lde_root_order = (n * bf).trailing_zeros() as u64;
+        let lde_coset =
+            get_powers_of_primitive_root_coset(lde_root_order, n * bf, &coset_offset).unwrap();
+        let lde_evals: Vec<FE> = lde_coset.iter().map(|p| poly.evaluate(p)).collect();
+
+        // Extract trace-size coset (stride = bf)
+        let trace_coset: Vec<FE> = (0..n).map(|i| lde_coset[i * bf].clone()).collect();
+        let trace_evals: Vec<FE> = (0..n).map(|i| lde_evals[i * bf].clone()).collect();
+
+        let z = FE::from(42u64);
+        let expected = poly.evaluate(&z);
+
+        let z_pow_n = z.pow(n);
+        let g_pow_n = coset_offset.pow(n);
+        let n_inv = FE::from(n as u64).inv().unwrap();
+        let inv_denoms = barycentric_inv_denoms(&z, &trace_coset);
+        let result = interpolate_coset_eval(
+            &z_pow_n,
+            &g_pow_n,
+            &n_inv,
+            &trace_coset,
+            &trace_evals,
+            &inv_denoms,
+        );
+
+        assert_eq!(result, expected);
+    }
+}

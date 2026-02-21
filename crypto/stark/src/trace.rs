@@ -1,7 +1,9 @@
+use crate::domain::Domain;
 use crate::table::Table;
 use itertools::Itertools;
 use math::fft::errors::FFTError;
 use math::field::traits::{IsField, IsSubFieldOf};
+use math::polynomial::{barycentric_inv_denoms, interpolate_coset_eval, interpolate_coset_eval_ext};
 use math::{
     field::{element::FieldElement, traits::IsFFTField},
     polynomial::Polynomial,
@@ -375,6 +377,125 @@ where
     let main_trace_width = main_trace_polys.len();
     let aux_trace_width = aux_trace_polys.len();
     let table_width = main_trace_width + aux_trace_width;
+
+    Table::new(table_data, table_width)
+}
+
+/// Evaluates trace polynomials at OOD points using barycentric interpolation
+/// on the LDE evaluations, without needing coefficient-form polynomials.
+///
+/// This replaces `get_trace_evaluations` for use in Round 3 of the STARK prover.
+/// Instead of evaluating coefficient-form polynomials via Horner's method, it uses
+/// the LDE evaluations (already computed in Round 1) and performs barycentric
+/// interpolation. This decouples Round 3 from `trace_polys`.
+///
+/// The key insight: the LDE contains evaluations on a coset of size N*blowup_factor.
+/// Taking every blowup_factor-th point gives N evaluations on the trace-size coset
+/// {g * w_trace^i}, which is sufficient to interpolate a degree < N polynomial.
+pub fn get_trace_evaluations_from_lde<F, E>(
+    lde_trace: &LDETraceTable<F, E>,
+    domain: &Domain<F>,
+    z: &FieldElement<E>,
+    frame_offsets: &[usize],
+    step_size: usize,
+) -> Table<E>
+where
+    F: IsSubFieldOf<E> + IsFFTField,
+    E: IsField,
+{
+    let n = domain.interpolation_domain_size;
+    let bf = domain.blowup_factor;
+    let num_main_cols = lde_trace.main_table.width;
+    let num_aux_cols = lde_trace.aux_table.width;
+    let table_width = num_main_cols + num_aux_cols;
+
+    // Extract trace-size coset points: {g * w_trace^i} = lde_coset[i * blowup_factor]
+    let coset_points: Vec<FieldElement<F>> = (0..n)
+        .map(|i| domain.lde_roots_of_unity_coset[i * bf].clone())
+        .collect();
+
+    // Precompute constants for barycentric formula
+    let coset_offset_pow_n = domain.coset_offset.pow(n);
+    // Lift coset_offset_pow_n to extension field
+    let coset_offset_pow_n_ext: FieldElement<E> = coset_offset_pow_n.clone().to_extension();
+    let n_inv: FieldElement<E> = FieldElement::<E>::from(n as u64)
+        .inv()
+        .expect("n is a power of two, hence non-zero in the field");
+
+    // Build evaluation points: for each frame offset and step within, z * w_trace^exponent
+    let evaluation_points: Vec<FieldElement<E>> = frame_offsets
+        .iter()
+        .flat_map(|offset| {
+            let start = offset * step_size;
+            let end = (offset + 1) * step_size;
+            (start..end).collect_vec()
+        })
+        .map(|exponent| &domain.trace_primitive_root.pow(exponent) * z)
+        .collect_vec();
+
+    // For aux columns, we need the coset points lifted to extension field
+    let coset_points_ext: Vec<FieldElement<E>> = if num_aux_cols > 0 {
+        coset_points
+            .iter()
+            .map(|p| p.clone().to_extension())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // Extract trace-size evaluations from LDE for each column (stride = blowup_factor)
+    // Main columns: Vec of N base-field evaluations per column
+    let main_col_evals: Vec<Vec<FieldElement<F>>> = (0..num_main_cols)
+        .map(|col| {
+            (0..n)
+                .map(|i| lde_trace.get_main(i * bf, col).clone())
+                .collect()
+        })
+        .collect();
+
+    // Aux columns: Vec of N extension-field evaluations per column
+    let aux_col_evals: Vec<Vec<FieldElement<E>>> = (0..num_aux_cols)
+        .map(|col| {
+            (0..n)
+                .map(|i| lde_trace.get_aux(i * bf, col).clone())
+                .collect()
+        })
+        .collect();
+
+    let mut table_data =
+        Vec::with_capacity(evaluation_points.len() * table_width);
+
+    for eval_point in &evaluation_points {
+        // z_pow_n for this evaluation point
+        let z_pow_n = eval_point.pow(n);
+
+        // Precompute inv_denoms = 1/(eval_point - coset_point_i) — shared across all columns
+        let inv_denoms = barycentric_inv_denoms(eval_point, &coset_points);
+
+        // Evaluate each main column
+        for col_evals in &main_col_evals {
+            table_data.push(interpolate_coset_eval(
+                &z_pow_n,
+                &coset_offset_pow_n_ext,
+                &n_inv,
+                &coset_points,
+                col_evals,
+                &inv_denoms,
+            ));
+        }
+
+        // Evaluate each aux column
+        for col_evals in &aux_col_evals {
+            table_data.push(interpolate_coset_eval_ext(
+                &z_pow_n,
+                &coset_offset_pow_n_ext,
+                &n_inv,
+                &coset_points_ext,
+                col_evals,
+                &inv_denoms,
+            ));
+        }
+    }
 
     Table::new(table_data, table_width)
 }

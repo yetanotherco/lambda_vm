@@ -708,33 +708,58 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let z_power = z.pow(round_2_result.composition_poly_parts.len());
+        let num_parts = round_2_result.composition_poly_parts.len();
+        let z_power = z.pow(num_parts);
+        let n = domain.interpolation_domain_size;
+        let bf = domain.blowup_factor;
 
-        // Evaluate H_i in z^N for all i, where N is the number of parts the composition poly was
-        // broken into.
-        let composition_poly_parts_ood_evaluation: Vec<_> = round_2_result
-            .composition_poly_parts
+        // === Composition poly parts: barycentric evaluation at z^num_parts ===
+        // Extract trace-size coset points from the LDE coset (stride = blowup_factor)
+        let coset_points: Vec<FieldElement<Field>> = (0..n)
+            .map(|i| domain.lde_roots_of_unity_coset[i * bf].clone())
+            .collect();
+        let coset_points_ext: Vec<FieldElement<FieldExtension>> = coset_points
             .iter()
-            .map(|part| part.evaluate(&z_power))
+            .map(|p| p.clone().to_extension())
+            .collect();
+        let coset_offset_pow_n: FieldElement<FieldExtension> =
+            domain.coset_offset.pow(n).to_extension();
+        let n_inv: FieldElement<FieldExtension> = FieldElement::<FieldExtension>::from(n as u64)
+            .inv()
+            .expect("n is a power of two, hence non-zero in the field");
+
+        // Precompute inv_denoms for z^num_parts (shared across all composition poly parts)
+        let comp_z_pow_n = z_power.pow(n);
+        let comp_inv_denoms =
+            math::polynomial::barycentric_inv_denoms(&z_power, &coset_points);
+
+        let composition_poly_parts_ood_evaluation: Vec<_> = round_2_result
+            .lde_composition_poly_evaluations
+            .iter()
+            .map(|lde_evals| {
+                // Extract trace-size evaluations (stride = blowup_factor)
+                let evals: Vec<FieldElement<FieldExtension>> = (0..n)
+                    .map(|i| lde_evals[i * bf].clone())
+                    .collect();
+                math::polynomial::interpolate_coset_eval_ext(
+                    &comp_z_pow_n,
+                    &coset_offset_pow_n,
+                    &n_inv,
+                    &coset_points_ext,
+                    &evals,
+                    &comp_inv_denoms,
+                )
+            })
             .collect();
 
-        // Returns the Out of Domain Frame for the given trace polynomials, out of domain evaluation point (called `z` in the literature),
-        // frame offsets given by the AIR and primitive root used for interpolating the trace polynomials.
-        // An out of domain frame is nothing more than the evaluation of the trace polynomials in the points required by the
-        // verifier to check the consistency between the trace and the composition polynomial.
-        //
-        // In the fibonacci example, the ood frame is simply the evaluations `[t(z), t(z * g), t(z * g^2)]`, where `t` is the trace
-        // polynomial and `g` is the primitive root of unity used when interpolating `t`.
-        let trace_ood_evaluations = crate::trace::get_trace_evaluations::<Field, FieldExtension>(
-            &round_1_result.main.trace_polys,
-            round_1_result
-                .aux
-                .as_ref()
-                .map(|aux| &aux.trace_polys)
-                .unwrap_or(&vec![]),
+        // === Trace polynomials: barycentric evaluation via LDE ===
+        // Uses get_trace_evaluations_from_lde which performs barycentric interpolation
+        // on the LDE trace data, avoiding the need for coefficient-form trace_polys.
+        let trace_ood_evaluations = crate::trace::get_trace_evaluations_from_lde(
+            &round_1_result.lde_trace,
+            domain,
             z,
             &air.context().transition_offsets,
-            &domain.trace_primitive_root,
             air.step_size(),
         );
 
@@ -2237,5 +2262,81 @@ mod tests {
             proof.query_list[0].layers_auth_paths[7].merkle_path[5].to_vec(),
             decode_hex("f12f159b548ca2c571a270870d43e7ec2ead78b3e93b635738c31eb9bcda3dda").unwrap()
         );
+    }
+
+    /// Tests that `get_trace_evaluations_from_lde` (barycentric) produces identical
+    /// results to `get_trace_evaluations` (Horner) for the Fibonacci trace.
+    #[test]
+    fn barycentric_trace_eval_matches_horner_trace_eval() {
+        use crate::trace::{get_trace_evaluations, get_trace_evaluations_from_lde, LDETraceTable};
+
+        let trace = simple_fibonacci::fibonacci_trace([Felt252::from(1), Felt252::from(1)], 8);
+        let trace_length = trace.num_rows();
+        let blowup_factor: usize = 4;
+        let coset_offset = 3u64;
+
+        let proof_options = ProofOptions {
+            blowup_factor: blowup_factor as u8,
+            fri_number_of_queries: 1,
+            coset_offset,
+            grinding_factor: 0,
+        };
+
+        let air = simple_fibonacci::FibonacciAIR::<Stark252PrimeField>::new(&proof_options);
+        let domain = Domain::new(&air, trace_length);
+
+        // Compute trace polys (Horner path)
+        let trace_polys = trace.compute_trace_polys_main::<Stark252PrimeField>();
+
+        // Compute LDE evaluations for each column
+        let lde_evaluations: Vec<Vec<Felt252>> = trace_polys
+            .iter()
+            .map(|poly| {
+                evaluate_polynomial_on_lde_domain(
+                    poly,
+                    domain.blowup_factor,
+                    domain.interpolation_domain_size,
+                    &domain.coset_offset,
+                )
+                .unwrap()
+            })
+            .collect();
+
+        // Build LDE trace table
+        let lde_trace = LDETraceTable::from_columns(
+            lde_evaluations,
+            Vec::<Vec<Felt252>>::new(),
+            air.step_size(),
+            domain.blowup_factor,
+        );
+
+        // Pick OOD point (just a deterministic value)
+        let z = Felt252::from(12345u64);
+
+        let frame_offsets = air.context().transition_offsets.clone();
+        let step_size = air.step_size();
+
+        // Horner-based evaluation (ground truth)
+        let expected = get_trace_evaluations::<Stark252PrimeField, Stark252PrimeField>(
+            &trace_polys,
+            &[],
+            &z,
+            &frame_offsets,
+            &domain.trace_primitive_root,
+            step_size,
+        );
+
+        // Barycentric evaluation (new path)
+        let result = get_trace_evaluations_from_lde(
+            &lde_trace,
+            &domain,
+            &z,
+            &frame_offsets,
+            step_size,
+        );
+
+        assert_eq!(result.width, expected.width);
+        assert_eq!(result.height, expected.height);
+        assert_eq!(result.data, expected.data);
     }
 }
