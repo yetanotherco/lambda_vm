@@ -120,23 +120,6 @@ where
     FieldElement<Field>: AsBytes,
     FieldElement<FieldExtension>: AsBytes,
 {
-    /// Returns the full list of the polynomials interpolating the trace. It includes both
-    /// main and auxiliary trace polynomials. The main trace polynomials are casted to
-    /// polynomials with coefficients over `Self::FieldExtension`.
-    fn all_trace_polys(&self) -> Vec<Polynomial<FieldElement<FieldExtension>>> {
-        let mut trace_polys: Vec<_> = self
-            .main
-            .trace_polys
-            .clone()
-            .into_iter()
-            .map(|poly| poly.to_extension())
-            .collect();
-
-        if let Some(aux) = &self.aux {
-            trace_polys.extend_from_slice(&aux.trace_polys.to_owned())
-        }
-        trace_polys
-    }
 }
 
 /// A container for the results of the second round of the STARK Prove protocol.
@@ -145,8 +128,6 @@ where
     F: IsField,
     FieldElement<F>: AsBytes,
 {
-    /// The list of polynomials `H₀, ..., Hₙ` such that `H = ∑ᵢXⁱH(Xⁿ)`, where H is the composition polynomial.
-    pub(crate) composition_poly_parts: Vec<Polynomial<FieldElement<F>>>,
     /// Evaluations of the composition polynomial parts over the LDE domain.
     pub(crate) lde_composition_poly_evaluations: Vec<Vec<FieldElement<F>>>,
     /// The Merkle tree built to compute the commitment to the composition polynomial parts.
@@ -690,7 +671,6 @@ pub trait IsStarkProver<
 
         Ok(Round2 {
             lde_composition_poly_evaluations: lde_composition_poly_parts_evaluations,
-            composition_poly_parts,
             composition_poly_merkle_tree,
             composition_poly_root,
         })
@@ -708,7 +688,7 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let num_parts = round_2_result.composition_poly_parts.len();
+        let num_parts = round_2_result.lde_composition_poly_evaluations.len();
         let z_power = z.pow(num_parts);
         let n = domain.interpolation_domain_size;
         let bf = domain.blowup_factor;
@@ -808,16 +788,24 @@ pub trait IsStarkProver<
         // <<<< Receive challenges: 𝛾ⱼ, 𝛾ⱼ'
         let gammas = deep_composition_coefficients;
 
-        // Compute p₀ (deep composition polynomial)
-        let deep_composition_poly = Self::compute_deep_composition_poly(
-            &round_1_result.all_trace_polys(),
+        // Compute p₀ (deep composition polynomial) as evaluations on trace-size coset
+        let deep_evals = Self::compute_deep_composition_poly_evaluations(
+            &round_1_result.lde_trace,
             round_2_result,
             round_3_result,
             z,
+            domain,
             &domain.trace_primitive_root,
             &gammas,
             &trace_term_coeffs,
         );
+
+        // Convert evaluations to coefficient-form via iFFT for FRI
+        let deep_composition_poly = Polynomial::interpolate_offset_fft::<Field>(
+            &deep_evals,
+            &domain.coset_offset,
+        )
+        .expect("iFFT should succeed: domain size is a power of 2");
 
         let domain_size = domain.lde_roots_of_unity_coset.len();
 
@@ -873,114 +861,127 @@ pub trait IsStarkProver<
             .collect::<Vec<usize>>()
     }
 
-    /// Returns the DEEP composition polynomial that the prover then commits to using
-    /// FRI. This polynomial is a linear combination of the trace polynomial and the
-    /// composition polynomial, with coefficients sampled by the verifier (i.e. using Fiat-Shamir).
+    /// Computes the DEEP composition polynomial as evaluations on the trace-size coset.
+    ///
+    /// This replaces the old `compute_deep_composition_poly` which operated on coefficient-form
+    /// polynomials (requiring an expensive `all_trace_polys()` clone and Ruffini divisions).
+    /// Instead, we compute `deep(x_i)` point-by-point using LDE evaluations already available
+    /// from Round 1 and Round 2, then batch-invert all denominators.
+    ///
+    /// The DEEP polynomial is:
+    ///   deep(X) = Σ_j γ_j * (H_j(X) - H_j(z^K)) / (X - z^K)
+    ///           + Σ_{j,k} γ'_{j,k} * (t_j(X) - t_j(z·w^k)) / (X - z·w^k)
     #[allow(clippy::too_many_arguments)]
-    fn compute_deep_composition_poly(
-        trace_polys: &[Polynomial<FieldElement<FieldExtension>>],
+    fn compute_deep_composition_poly_evaluations(
+        lde_trace: &LDETraceTable<Field, FieldExtension>,
         round_2_result: &Round2<FieldExtension>,
         round_3_result: &Round3<FieldExtension>,
         z: &FieldElement<FieldExtension>,
+        domain: &Domain<Field>,
         primitive_root: &FieldElement<Field>,
         composition_poly_gammas: &[FieldElement<FieldExtension>],
         trace_terms_gammas: &[Vec<FieldElement<FieldExtension>>],
-    ) -> Polynomial<FieldElement<FieldExtension>>
+    ) -> Vec<FieldElement<FieldExtension>>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let z_power = z.pow(round_2_result.composition_poly_parts.len());
+        let n = domain.interpolation_domain_size;
+        let bf = domain.blowup_factor;
+        let num_parts = round_2_result.lde_composition_poly_evaluations.len();
+        let z_power = z.pow(num_parts); // pole for H terms
 
-        // ∑ᵢ 𝛾ᵢ ( Hᵢ − Hᵢ(z^N) ) / ( X − z^N )
-        let mut h_terms = Polynomial::zero();
-        for (i, part) in round_2_result.composition_poly_parts.iter().enumerate() {
-            // h_i_eval is the evaluation of the i-th part of the composition polynomial at z^N,
-            // where N is the number of parts of the composition polynomial.
-            let h_i_eval = &round_3_result.composition_poly_parts_ood_evaluation[i];
-            let h_i_term = &composition_poly_gammas[i] * (part - h_i_eval);
-            h_terms = h_terms + h_i_term;
+        // Number of evaluation points per trace column (= transition_offsets.len() * step_size)
+        let num_eval_points = if trace_terms_gammas.is_empty() {
+            0
+        } else {
+            trace_terms_gammas[0].len()
+        };
+
+        // Trace poles: z_shifted[k] = primitive_root^k * z for k = 0..num_eval_points
+        let z_shifted: Vec<FieldElement<FieldExtension>> = (0..num_eval_points)
+            .map(|k| primitive_root.pow(k) * z)
+            .collect();
+
+        // Number of main and aux columns in the LDE trace
+        let num_main_cols = lde_trace.main_table.width;
+        let num_aux_cols = lde_trace.aux_table.width;
+
+        // Precompute all inverse denominators via batch inversion.
+        // Layout: [inv_h_0, ..., inv_h_{N-1}, inv_t0_0, ..., inv_t0_{N-1}, inv_t1_0, ..., ...]
+        let num_denoms = n * (1 + num_eval_points);
+        let mut denoms: Vec<FieldElement<FieldExtension>> = Vec::with_capacity(num_denoms);
+
+        // H-term denominators: x_i - z^K
+        for i in 0..n {
+            let x_i: FieldElement<FieldExtension> =
+                domain.lde_roots_of_unity_coset[i * bf].clone().to_extension();
+            denoms.push(x_i - &z_power);
         }
-        assert_eq!(h_terms.evaluate(&z_power), FieldElement::zero());
-        h_terms.ruffini_division_inplace(&z_power);
 
-        // Get trace evaluations needed for the trace terms of the deep composition polynomial
-        let trace_frame_evaluations = &round_3_result.trace_ood_evaluations;
+        // Trace-term denominators: x_i - z_shifted[k]
+        for k in 0..num_eval_points {
+            for i in 0..n {
+                let x_i: FieldElement<FieldExtension> =
+                    domain.lde_roots_of_unity_coset[i * bf].clone().to_extension();
+                denoms.push(x_i - &z_shifted[k]);
+            }
+        }
 
-        // Compute the sum of all the trace terms of the deep composition polynomial.
-        // There is one term for every trace polynomial and for every row in the frame.
-        // ∑ ⱼₖ [ 𝛾ₖ ( tⱼ − tⱼ(z) ) / ( X − zgᵏ )]
+        FieldElement::inplace_batch_inverse(&mut denoms)
+            .expect("Denominators should be non-zero: coset points are base field, poles are extension field");
 
-        let trace_evaluations_columns = &trace_frame_evaluations.columns();
+        // Split inverse denominators
+        let inv_h = &denoms[0..n];
+        // inv_t[k] = &denoms[(1+k)*n .. (2+k)*n]
 
+        // OOD evaluations
+        let h_ood = &round_3_result.composition_poly_parts_ood_evaluation;
+        let trace_ood_columns = round_3_result.trace_ood_evaluations.columns();
+
+        // Compute deep(x_i) for each coset point i
         #[cfg(feature = "parallel")]
-        let trace_terms = trace_polys
-            .par_iter()
-            .enumerate()
-            .fold(Polynomial::zero, |trace_terms, (i, t_j)| {
-                let gammas_i = &trace_terms_gammas[i];
-                let trace_evaluations_i = &trace_evaluations_columns[i];
-                Self::compute_trace_term(
-                    &trace_terms,
-                    t_j,
-                    gammas_i,
-                    trace_evaluations_i,
-                    (z, primitive_root),
-                )
-            })
-            .reduce(Polynomial::zero, |a, b| a + b);
-
+        let iter = (0..n).into_par_iter();
         #[cfg(not(feature = "parallel"))]
-        let trace_terms =
-            trace_polys
-                .iter()
-                .enumerate()
-                .fold(Polynomial::zero(), |trace_terms, (i, t_j)| {
-                    let gammas_i = &trace_terms_gammas[i];
-                    let trace_evaluations_i = &trace_evaluations_columns[i];
-                    Self::compute_trace_term(
-                        &trace_terms,
-                        t_j,
-                        gammas_i,
-                        trace_evaluations_i,
-                        (z, primitive_root),
-                    )
-                });
+        let iter = 0..n;
 
-        h_terms + trace_terms
-    }
+        iter.map(|i| {
+            let row_idx = i * bf; // LDE row index
 
-    // FIXME: FIX THIS DOCS!
-    /// Adds to `accumulator` the term corresponding to the trace polynomial `t_j` of the Deep
-    /// composition polynomial. That is, returns `accumulator + \sum_i \gamma_i \frac{ t_j - t_j(zg^i) }{ X - zg^i }`,
-    /// where `i` ranges from `T * j` to `T * j + T - 1`, where `T` is the number of offsets in every frame.
-    fn compute_trace_term(
-        accumulator: &Polynomial<FieldElement<FieldExtension>>,
-        trace_term_poly: &Polynomial<FieldElement<FieldExtension>>,
-        trace_terms_gammas: &[FieldElement<FieldExtension>],
-        trace_frame_evaluations: &[FieldElement<FieldExtension>],
-        (z, primitive_root): (&FieldElement<FieldExtension>, &FieldElement<Field>),
-    ) -> Polynomial<FieldElement<FieldExtension>>
-    where
-        FieldElement<Field>: AsBytes,
-        FieldElement<FieldExtension>: AsBytes,
-    {
-        let trace_int = trace_frame_evaluations
-            .iter()
-            .enumerate()
-            .zip(trace_terms_gammas)
-            .fold(
-                Polynomial::zero(),
-                |trace_agg, ((offset, trace_term_poly_evaluation), trace_gamma)| {
-                    // @@@ this can be pre-computed
-                    let z_shifted = primitive_root.pow(offset) * z;
-                    let mut poly = trace_term_poly - trace_term_poly_evaluation;
-                    poly.ruffini_division_inplace(&z_shifted);
-                    trace_agg + poly * trace_gamma
-                },
-            );
+            // H terms: Σ_j γ_j * (H_j(row_idx) - H_j(z^K)) * inv_h[i]
+            let mut result = FieldElement::<FieldExtension>::zero();
+            for j in 0..num_parts {
+                let h_j_val = &round_2_result.lde_composition_poly_evaluations[j][row_idx];
+                let h_j_ood = &h_ood[j];
+                let numerator = h_j_val - h_j_ood;
+                result = result + &composition_poly_gammas[j] * numerator * &inv_h[i];
+            }
 
-        accumulator + trace_int
+            // Trace terms: Σ_{j,k} γ'_{j,k} * (t_j(row_idx) - t_j(z·w^k)) * inv_t_k[i]
+            let num_total_cols = num_main_cols + num_aux_cols;
+            for j in 0..num_total_cols {
+                let gammas_j = &trace_terms_gammas[j];
+                let ood_evals_j = &trace_ood_columns[j];
+
+                for k in 0..num_eval_points {
+                    let inv_t_k_i = &denoms[(1 + k) * n + i];
+
+                    // Get trace value: main columns are base field, aux are extension field
+                    let t_j_val: FieldElement<FieldExtension> = if j < num_main_cols {
+                        lde_trace.get_main(row_idx, j).clone().to_extension()
+                    } else {
+                        lde_trace.get_aux(row_idx, j - num_main_cols).clone()
+                    };
+
+                    let t_j_ood = &ood_evals_j[k];
+                    let numerator = t_j_val - t_j_ood;
+                    result = result + &gammas_j[k] * numerator * inv_t_k_i;
+                }
+            }
+
+            result
+        })
+        .collect()
     }
 
     /// Computes values and validity proofs of the evaluations of the composition polynomial parts
