@@ -17,7 +17,7 @@ use math::{
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::{
-    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
+    IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
 };
 
 #[cfg(feature = "debug-checks")]
@@ -45,8 +45,6 @@ type AirTracePair<'a, Field, FieldExtension, PI> = (
     &'a mut TraceTable<Field, FieldExtension>,
     &'a PI,
 );
-
-type MainCommitment<Field> = (Round1CommitmentData<Field>, Vec<Vec<FieldElement<Field>>>);
 
 /// A default STARK prover implementing `IsStarkProver`.
 pub struct Prover<
@@ -118,6 +116,26 @@ where
     FieldElement<Field>: AsBytes,
     FieldElement<FieldExtension>: AsBytes,
 {
+}
+
+/// Lightweight metadata from Round 1 commitments — stores only Merkle roots and metadata,
+/// not the full Merkle trees or LDE evaluations. Used for memory-efficient sequential proving.
+pub struct Round1Metadata<FieldExtension>
+where
+    FieldExtension: IsField,
+{
+    /// Root of the main trace (multiplicities for preprocessed tables).
+    main_merkle_root: Commitment,
+    /// For preprocessed tables: root of the precomputed Merkle tree.
+    precomputed_merkle_root: Option<Commitment>,
+    /// For preprocessed tables: number of precomputed columns.
+    num_precomputed_cols: usize,
+    /// Root of the auxiliary trace Merkle tree (None if no aux trace).
+    aux_merkle_root: Option<Commitment>,
+    /// The RAP challenges used for auxiliary trace construction.
+    rap_challenges: Vec<FieldElement<FieldExtension>>,
+    /// Bus interaction public inputs (initial and final aux column values).
+    bus_public_inputs: Option<BusPublicInputs<FieldExtension>>,
 }
 
 /// A container for the results of the second round of the STARK Prove protocol.
@@ -312,12 +330,10 @@ pub trait IsStarkProver<
         FieldElement<FieldExtension>: AsBytes,
         Field: IsSubFieldOf<FieldExtension>,
     {
-        // Interpolate columns of `trace` and evaluate on the LDE domain.
-        // The intermediate coefficient-form polynomials are transient.
-        let trace_polys = trace.compute_trace_polys_main::<Field>();
-        let lde_trace_evaluations =
-            Self::compute_lde_trace_evaluations::<Field>(&trace_polys, domain);
-        drop(trace_polys);
+        // Compute LDE evaluations directly from columns using fused coset LDE
+        // (no intermediate coefficient-form polynomials).
+        let columns = trace.columns_main();
+        let lde_trace_evaluations = Self::compute_lde_from_columns::<Field>(&columns, domain);
 
         // Hash rows on-the-fly from column-major data with bit-reversal,
         // avoiding the full clone + transpose that the old code did.
@@ -349,11 +365,9 @@ pub trait IsStarkProver<
         FieldElement<FieldExtension>: AsBytes,
         Field: IsSubFieldOf<FieldExtension>,
     {
-        // Interpolate columns of `trace` (transient) and evaluate on the LDE domain.
-        let trace_polys = trace.compute_trace_polys_main::<Field>();
-        let lde_trace_evaluations =
-            Self::compute_lde_trace_evaluations::<Field>(&trace_polys, domain);
-        drop(trace_polys);
+        // Compute LDE evaluations directly from columns using fused coset LDE.
+        let columns = trace.columns_main();
+        let lde_trace_evaluations = Self::compute_lde_from_columns::<Field>(&columns, domain);
 
         Some(lde_trace_evaluations)
     }
@@ -375,10 +389,10 @@ pub trait IsStarkProver<
         FieldElement<FieldExtension>: AsBytes,
         Field: IsSubFieldOf<FieldExtension> + IsFFTField,
     {
-        // Interpolate columns of `trace` (transient) and evaluate on the LDE domain.
-        let trace_polys = trace.compute_trace_polys_aux::<Field>();
-        let lde_trace_evaluations = Self::compute_lde_trace_evaluations(&trace_polys, domain);
-        drop(trace_polys);
+        // Compute LDE evaluations directly from aux columns using fused coset LDE.
+        let columns = trace.columns_aux();
+        let lde_trace_evaluations =
+            Self::compute_lde_from_columns::<FieldExtension>(&columns, domain);
 
         // Hash rows on-the-fly from column-major data with bit-reversal.
         let (lde_trace_merkle_tree, lde_trace_merkle_root) =
@@ -419,6 +433,32 @@ pub trait IsStarkProver<
                 )
             })
             .collect::<Result<Vec<Vec<FieldElement<E>>>, FFTError>>()
+            .unwrap()
+    }
+
+    /// Compute LDE evaluations directly from column data using the fused coset LDE.
+    ///
+    /// This replaces the `compute_trace_polys_*` + `compute_lde_trace_evaluations` pipeline
+    /// with a single `coset_lde` call per column, saving 2 intermediate allocations per column.
+    fn compute_lde_from_columns<E>(
+        columns: &[Vec<FieldElement<E>>],
+        domain: &Domain<Field>,
+    ) -> Vec<Vec<FieldElement<E>>>
+    where
+        E: IsSubFieldOf<FieldExtension>,
+        Field: IsSubFieldOf<E>,
+        FieldElement<E>: Send + Sync,
+    {
+        #[cfg(not(feature = "parallel"))]
+        let columns_iter = columns.iter();
+        #[cfg(feature = "parallel")]
+        let columns_iter = columns.par_iter();
+
+        columns_iter
+            .map(|col| {
+                Polynomial::coset_lde::<Field>(col, domain.blowup_factor, &domain.coset_offset)
+            })
+            .collect::<Result<Vec<Vec<FieldElement<E>>>, _>>()
             .unwrap()
     }
 
@@ -563,6 +603,203 @@ pub trait IsStarkProver<
         })
     }
 
+    /// Phase A helper for sequential proving: compute main LDE, commit, return only the root.
+    /// Drops the LDE evaluations and Merkle tree to save memory.
+    fn commit_main_trace_lightweight(
+        trace: &TraceTable<Field, FieldExtension>,
+        domain: &Domain<Field>,
+        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+    ) -> Result<(Commitment, Option<Commitment>, usize), ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        let columns = trace.columns_main();
+        let lde_trace_evaluations = Self::compute_lde_from_columns::<Field>(&columns, domain);
+
+        let (_, lde_trace_merkle_root) =
+            Self::commit_columns_bit_reversed(&lde_trace_evaluations)
+                .ok_or(ProvingError::EmptyCommitment)?;
+
+        transcript.append_bytes(&lde_trace_merkle_root);
+
+        // LDE evaluations and Merkle tree are dropped here
+        Ok((lde_trace_merkle_root, None, 0))
+    }
+
+    /// Phase A helper for sequential proving with preprocessed tables: commit separately,
+    /// return only roots. Drops LDE evaluations and Merkle trees.
+    fn commit_preprocessed_trace_lightweight(
+        trace: &TraceTable<Field, FieldExtension>,
+        domain: &Domain<Field>,
+        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+        precomputed_commitment: Commitment,
+        num_precomputed_cols: usize,
+    ) -> Result<(Commitment, Option<Commitment>, usize), ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        let columns = trace.columns_main();
+        let lde_trace_evaluations = Self::compute_lde_from_columns::<Field>(&columns, domain);
+
+        let (_, precomputed_root) =
+            Self::commit_columns_bit_reversed(&lde_trace_evaluations[..num_precomputed_cols])
+                .ok_or(ProvingError::EmptyCommitment)?;
+
+        let (_, mult_root) =
+            Self::commit_columns_bit_reversed(&lde_trace_evaluations[num_precomputed_cols..])
+                .ok_or(ProvingError::EmptyCommitment)?;
+
+        debug_assert_eq!(
+            precomputed_root, precomputed_commitment,
+            "Prover's precomputed commitment doesn't match hardcoded AIR commitment"
+        );
+
+        transcript.append_bytes(&precomputed_commitment);
+        transcript.append_bytes(&mult_root);
+
+        // LDE evaluations and Merkle trees are dropped here
+        Ok((mult_root, Some(precomputed_root), num_precomputed_cols))
+    }
+
+    /// Phase C helper for sequential proving: build aux trace, commit, return only root
+    /// and bus_public_inputs. Drops LDE evaluations and Merkle tree.
+    fn commit_aux_trace_lightweight(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        trace: &mut TraceTable<Field, FieldExtension>,
+        domain: &Domain<Field>,
+        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+        rap_challenges: &[FieldElement<FieldExtension>],
+    ) -> Result<
+        (
+            Option<Commitment>,
+            Option<BusPublicInputs<FieldExtension>>,
+        ),
+        ProvingError,
+    >
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        if !air.has_trace_interaction() {
+            return Ok((None, None));
+        }
+
+        let bus_public_inputs = air.build_auxiliary_trace(trace, rap_challenges);
+
+        let columns = trace.columns_aux();
+        let lde_trace_evaluations =
+            Self::compute_lde_from_columns::<FieldExtension>(&columns, domain);
+
+        let (_, aux_merkle_root) =
+            Self::commit_columns_bit_reversed(&lde_trace_evaluations)
+                .ok_or(ProvingError::EmptyCommitment)?;
+
+        transcript.append_bytes(&aux_merkle_root);
+
+        // LDE evaluations and Merkle tree are dropped here
+        Ok((Some(aux_merkle_root), bus_public_inputs))
+    }
+
+    /// Reconstruct a full Round1 struct by recomputing LDE evaluations and rebuilding
+    /// Merkle trees from the trace. Used for sequential per-table proving.
+    fn reconstruct_round1(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        trace: &TraceTable<Field, FieldExtension>,
+        domain: &Domain<Field>,
+        metadata: &Round1Metadata<FieldExtension>,
+    ) -> Result<Round1<Field, FieldExtension>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        // Recompute main LDE
+        let main_columns = trace.columns_main();
+        let main_lde = Self::compute_lde_from_columns::<Field>(&main_columns, domain);
+
+        // Rebuild main Merkle tree(s)
+        let is_preprocessed = metadata.precomputed_merkle_root.is_some();
+        let num_precomputed_cols = metadata.num_precomputed_cols;
+
+        let main = if is_preprocessed {
+            let (precomputed_tree, precomputed_root) =
+                Self::commit_columns_bit_reversed(&main_lde[..num_precomputed_cols])
+                    .ok_or(ProvingError::EmptyCommitment)?;
+            let (mult_tree, mult_root) =
+                Self::commit_columns_bit_reversed(&main_lde[num_precomputed_cols..])
+                    .ok_or(ProvingError::EmptyCommitment)?;
+            debug_assert_eq!(
+                mult_root, metadata.main_merkle_root,
+                "Recomputed main root doesn't match metadata"
+            );
+            debug_assert_eq!(
+                Some(precomputed_root),
+                metadata.precomputed_merkle_root,
+                "Recomputed precomputed root doesn't match metadata"
+            );
+            Round1CommitmentData::<Field> {
+                lde_trace_merkle_tree: mult_tree,
+                lde_trace_merkle_root: metadata.main_merkle_root,
+                precomputed_merkle_tree: Some(precomputed_tree),
+                precomputed_merkle_root: metadata.precomputed_merkle_root,
+                num_precomputed_cols,
+            }
+        } else {
+            let (main_tree, main_root) = Self::commit_columns_bit_reversed(&main_lde)
+                .ok_or(ProvingError::EmptyCommitment)?;
+            debug_assert_eq!(
+                main_root, metadata.main_merkle_root,
+                "Recomputed main root doesn't match metadata"
+            );
+            Round1CommitmentData::<Field> {
+                lde_trace_merkle_tree: main_tree,
+                lde_trace_merkle_root: metadata.main_merkle_root,
+                precomputed_merkle_tree: None,
+                precomputed_merkle_root: None,
+                num_precomputed_cols: 0,
+            }
+        };
+
+        // Recompute aux LDE and rebuild aux Merkle tree
+        let (aux, aux_evaluations) = if air.has_trace_interaction() {
+            let aux_columns = trace.columns_aux();
+            let aux_lde = Self::compute_lde_from_columns::<FieldExtension>(&aux_columns, domain);
+            let (aux_tree, aux_root) = Self::commit_columns_bit_reversed(&aux_lde)
+                .ok_or(ProvingError::EmptyCommitment)?;
+            debug_assert_eq!(
+                Some(aux_root),
+                metadata.aux_merkle_root,
+                "Recomputed aux root doesn't match metadata"
+            );
+            let aux_commitment = Round1CommitmentData::<FieldExtension> {
+                lde_trace_merkle_tree: aux_tree,
+                lde_trace_merkle_root: metadata.aux_merkle_root.unwrap(),
+                precomputed_merkle_tree: None,
+                precomputed_merkle_root: None,
+                num_precomputed_cols: 0,
+            };
+            (Some(aux_commitment), aux_lde)
+        } else {
+            (None, Vec::new())
+        };
+
+        let lde_trace = LDETraceTable::from_columns(
+            main_lde,
+            aux_evaluations,
+            air.step_size(),
+            domain.blowup_factor,
+        );
+
+        Ok(Round1 {
+            lde_trace,
+            main,
+            aux,
+            rap_challenges: metadata.rap_challenges.clone(),
+            bus_public_inputs: metadata.bus_public_inputs.clone(),
+        })
+    }
+
     /// Returns the Merkle tree and the commitment to the evaluations of the parts of the
     /// composition polynomial.
     fn commit_composition_polynomial(
@@ -592,6 +829,135 @@ pub trait IsStarkProver<
         }
 
         Self::batch_commit_extension(&lde_composition_poly_evaluations_merged)
+    }
+
+    /// Algebraically decompose H(x) = H₀(x²) + x·H₁(x²) on the LDE coset, then
+    /// extend each half to the full LDE domain. This replaces the expensive
+    /// iFFT(2N) + break_in_parts + FFT(2N)×2 pipeline with:
+    ///   O(N) pointwise ops + iFFT(N)×2 + FFT(2N)×2
+    ///
+    /// The identity used:
+    ///   H₀(x²) = (H(x) + H(-x)) / 2
+    ///   H₁(x²) = (H(x) - H(-x)) / (2x)
+    ///
+    /// On the LDE coset {g·ω^i | i=0..2N-1}, we have -g·ω^i = g·ω^{i+N}
+    /// since ω^N = -1 for a 2N-th root of unity ω.
+    fn decompose_and_extend_d2<E>(
+        constraint_evaluations: &[FieldElement<FieldExtension>],
+        domain: &Domain<Field>,
+    ) -> Vec<Vec<FieldElement<FieldExtension>>>
+    where
+        E: IsField,
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    {
+        let two_n = constraint_evaluations.len();
+        let n = two_n / 2;
+        debug_assert_eq!(two_n, n * 2);
+
+        // Step 1: Compute 1/(2·g·ω^i) for i=0..N-1 via batch inversion.
+        // The LDE coset points are g·ω^i = domain.lde_roots_of_unity_coset[i].
+        let two = FieldElement::<FieldExtension>::from(2u64);
+        let mut inv_2x: Vec<FieldElement<FieldExtension>> = (0..n)
+            .map(|i| &two * domain.lde_roots_of_unity_coset[i].clone().to_extension())
+            .collect();
+        FieldElement::inplace_batch_inverse(&mut inv_2x)
+            .expect("Coset points are non-zero");
+
+        // Step 2: Pointwise decomposition.
+        // H₀((g·ω^i)²) = (evals[i] + evals[i+N]) / 2
+        // H₁((g·ω^i)²) = (evals[i] - evals[i+N]) / (2·g·ω^i)
+        let two_inv = two.inv().expect("2 is non-zero in the field");
+        let (h0_evals, h1_evals) = {
+            #[cfg(feature = "parallel")]
+            {
+                let (h0, h1): (Vec<_>, Vec<_>) = (0..n)
+                    .into_par_iter()
+                    .map(|i| {
+                        let sum = &constraint_evaluations[i] + &constraint_evaluations[i + n];
+                        let diff = &constraint_evaluations[i] - &constraint_evaluations[i + n];
+                        (&sum * &two_inv, &diff * &inv_2x[i])
+                    })
+                    .unzip();
+                (h0, h1)
+            }
+            #[cfg(not(feature = "parallel"))]
+            {
+                let mut h0 = Vec::with_capacity(n);
+                let mut h1 = Vec::with_capacity(n);
+                for i in 0..n {
+                    let sum = &constraint_evaluations[i] + &constraint_evaluations[i + n];
+                    let diff = &constraint_evaluations[i] - &constraint_evaluations[i + n];
+                    h0.push(&sum * &two_inv);
+                    h1.push(&diff * &inv_2x[i]);
+                }
+                (h0, h1)
+            }
+        };
+
+        // Step 3: Extend each part from N evals on g²-coset to 2N evals on g-coset.
+        // The squared coset offset is g² (= coset_offset²).
+        let coset_offset_squared = &domain.coset_offset * &domain.coset_offset;
+
+        #[cfg(feature = "parallel")]
+        let (lde_h0, lde_h1) = rayon::join(
+            || {
+                Self::extend_half_to_lde::<FieldExtension>(
+                    &h0_evals,
+                    &coset_offset_squared,
+                    domain,
+                )
+            },
+            || {
+                Self::extend_half_to_lde::<FieldExtension>(
+                    &h1_evals,
+                    &coset_offset_squared,
+                    domain,
+                )
+            },
+        );
+
+        #[cfg(not(feature = "parallel"))]
+        let (lde_h0, lde_h1) = (
+            Self::extend_half_to_lde::<FieldExtension>(
+                &h0_evals,
+                &coset_offset_squared,
+                domain,
+            ),
+            Self::extend_half_to_lde::<FieldExtension>(
+                &h1_evals,
+                &coset_offset_squared,
+                domain,
+            ),
+        );
+
+        vec![lde_h0, lde_h1]
+    }
+
+    /// Given N evaluations of a degree-<N polynomial on the g²-coset,
+    /// extend to 2N evaluations on the g-coset (the full LDE domain).
+    /// This is: iFFT(N, offset=g²) → coefficients → FFT(2N, offset=g).
+    fn extend_half_to_lde<E>(
+        half_evals: &[FieldElement<FieldExtension>],
+        squared_offset: &FieldElement<Field>,
+        domain: &Domain<Field>,
+    ) -> Vec<FieldElement<FieldExtension>>
+    where
+        E: IsField,
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        // iFFT on the N-point squared coset to get coefficients
+        let poly = Polynomial::interpolate_offset_fft(half_evals, squared_offset)
+            .expect("iFFT should succeed");
+        // Evaluate on the full LDE domain (2N points on the g-coset)
+        evaluate_polynomial_on_lde_domain(
+            &poly,
+            domain.blowup_factor,
+            domain.interpolation_domain_size,
+            &domain.coset_offset,
+        )
+        .expect("LDE evaluation should succeed")
     }
 
     /// Returns the result of the second round of the STARK Prove protocol.
@@ -625,27 +991,40 @@ pub trait IsStarkProver<
             &round_1_result.rap_challenges,
         );
 
-        // Get coefficients of the composition poly H
-        let composition_poly =
-            Polynomial::interpolate_offset_fft(&constraint_evaluations, &domain.coset_offset)
-                .unwrap();
-
-        let trace_length = domain.interpolation_domain_size;
         let number_of_parts = air.composition_poly_degree_bound(trace_length) / trace_length;
-        let composition_poly_parts = composition_poly.break_in_parts(number_of_parts);
 
-        let lde_composition_poly_parts_evaluations: Vec<_> = composition_poly_parts
-            .iter()
-            .map(|part| {
-                evaluate_polynomial_on_lde_domain(
-                    part,
-                    domain.blowup_factor,
-                    domain.interpolation_domain_size,
-                    &domain.coset_offset,
-                )
-                .unwrap()
-            })
-            .collect();
+        let lde_composition_poly_parts_evaluations = if number_of_parts == 2 {
+            // Direct quotient decomposition: avoid full-size iFFT by algebraically
+            // splitting H(x) = H₀(x²) + x·H₁(x²) using:
+            //   H₀(x²) = (H(x) + H(-x)) / 2
+            //   H₁(x²) = (H(x) - H(-x)) / (2x)
+            // On the LDE coset {g·ω^i}, we have -g·ω^i = g·ω^{i+N} since ω^N = -1.
+            Self::decompose_and_extend_d2::<FieldExtension>(
+                &constraint_evaluations,
+                domain,
+            )
+        } else if number_of_parts == 1 {
+            // Degree bound equals trace length: constraint evals are the LDE directly.
+            vec![constraint_evaluations]
+        } else {
+            // Fallback for any future AIR with d > 2.
+            let composition_poly =
+                Polynomial::interpolate_offset_fft(&constraint_evaluations, &domain.coset_offset)
+                    .unwrap();
+            let composition_poly_parts = composition_poly.break_in_parts(number_of_parts);
+            composition_poly_parts
+                .iter()
+                .map(|part| {
+                    evaluate_polynomial_on_lde_domain(
+                        part,
+                        domain.blowup_factor,
+                        domain.interpolation_domain_size,
+                        &domain.coset_offset,
+                    )
+                    .unwrap()
+                })
+                .collect()
+        };
 
         let Some((composition_poly_merkle_tree, composition_poly_root)) =
             Self::commit_composition_polynomial(&lde_composition_poly_parts_evaluations)
@@ -1194,25 +1573,22 @@ pub trait IsStarkProver<
             .any(|(air, _, _)| air.has_trace_interaction());
 
         // =====================================================================
-        // Round 1, Phase A: Commit all main traces
+        // Round 1, Phase A: Commit all main traces (lightweight)
         // =====================================================================
         // All main trace commitments must be in the transcript before sampling
-        // LogUp challenges. This ensures the challenges depend on ALL tables.
-        //
-        // For preprocessed tables (e.g., bitwise lookup), we use a hardcoded
-        // commitment instead of computing one. Both prover and verifier use the
-        // same hardcoded value in the transcript.
+        // LogUp challenges. LDE evaluations and Merkle trees are dropped after
+        // committing — only roots are kept.
 
         let mut domains = Vec::with_capacity(num_airs);
-        let mut main_commitments: Vec<MainCommitment<Field>> = Vec::with_capacity(num_airs);
+        let mut main_roots: Vec<(Commitment, Option<Commitment>, usize)> =
+            Vec::with_capacity(num_airs);
 
         for (air, trace, _pub_inputs) in &*air_trace_pairs {
             let trace_length = trace.num_rows();
             let domain = new_domain(*air, trace_length);
 
-            let (main, evaluations) = if air.is_preprocessed() {
-                // Preprocessed table: use hardcoded commitment for precomputed columns
-                Self::round_1_commit_preprocessed_trace(
+            let roots = if air.is_preprocessed() {
+                Self::commit_preprocessed_trace_lightweight(
                     *trace,
                     &domain,
                     transcript,
@@ -1220,19 +1596,16 @@ pub trait IsStarkProver<
                     air.num_precomputed_columns(),
                 )?
             } else {
-                // Normal table: compute commitment as usual
-                Self::round_1_commit_main_trace(*trace, &domain, transcript)?
+                Self::commit_main_trace_lightweight(*trace, &domain, transcript)?
             };
 
-            main_commitments.push((main, evaluations));
+            main_roots.push(roots);
             domains.push(domain);
         }
 
         // =====================================================================
         // Round 1, Phase B: Sample shared LogUp challenges
         // =====================================================================
-        // For the LogUp bus to balance (sum of fingerprints = 0), all tables
-        // must use identical (z, α) challenges. We sample them ONCE here.
 
         let logup_challenges: Vec<FieldElement<FieldExtension>> = if needs_logup_challenges {
             (0..LOGUP_NUM_CHALLENGES)
@@ -1243,57 +1616,84 @@ pub trait IsStarkProver<
         };
 
         // =====================================================================
-        // Round 1, Phase C: Build and commit auxiliary traces
+        // Round 1, Phase C: Build and commit auxiliary traces (lightweight)
         // =====================================================================
         // Each AIR builds its LogUp running-sum columns using the shared challenges.
+        // LDE evaluations and Merkle trees are dropped after committing.
 
-        let mut round_1_results: Vec<Round1<Field, FieldExtension>> = Vec::with_capacity(num_airs);
-        for (((air, trace, _pub_inputs), (main, main_evaluations)), domain) in air_trace_pairs
-            .iter_mut()
-            .zip(main_commitments)
-            .zip(domains.iter())
+        let mut metadatas: Vec<Round1Metadata<FieldExtension>> = Vec::with_capacity(num_airs);
+        for (((air, trace, _pub_inputs), &(main_root, precomputed_root, num_precomputed)), domain)
+            in air_trace_pairs
+                .iter_mut()
+                .zip(main_roots.iter())
+                .zip(domains.iter())
         {
-            let round_1_result = Self::round_1_build_auxiliary_trace(
+            let (aux_root, bus_public_inputs) = Self::commit_aux_trace_lightweight(
                 *air,
                 *trace,
                 domain,
                 transcript,
-                main,
-                main_evaluations,
-                logup_challenges.clone(),
+                &logup_challenges,
             )?;
-            round_1_results.push(round_1_result);
+
+            metadatas.push(Round1Metadata {
+                main_merkle_root: main_root,
+                precomputed_merkle_root: precomputed_root,
+                num_precomputed_cols: num_precomputed,
+                aux_merkle_root: aux_root,
+                rap_challenges: logup_challenges.clone(),
+                bus_public_inputs,
+            });
         }
 
         #[cfg(feature = "debug-checks")]
-        print_bus_balance_report(&round_1_results);
-
-        #[cfg(feature = "debug-checks")]
-        for (((air, trace, pub_inputs), round_1_result), domain) in air_trace_pairs
-            .iter()
-            .zip(round_1_results.iter())
-            .zip(domains.iter())
         {
-            validate_trace(
-                *air,
-                *pub_inputs,
-                *trace,
-                domain,
-                &round_1_result.rap_challenges,
-            );
+            // For debug checks, we need to reconstruct Round1 temporarily.
+            let temp_results: Vec<Round1<Field, FieldExtension>> = air_trace_pairs
+                .iter()
+                .zip(metadatas.iter())
+                .zip(domains.iter())
+                .map(|(((air, trace, _), metadata), domain)| {
+                    Self::reconstruct_round1(*air, *trace, domain, metadata).unwrap()
+                })
+                .collect();
+
+            print_bus_balance_report(&temp_results);
+
+            for (((air, trace, pub_inputs), round_1_result), domain) in air_trace_pairs
+                .iter()
+                .zip(temp_results.iter())
+                .zip(domains.iter())
+            {
+                validate_trace(
+                    *air,
+                    *pub_inputs,
+                    *trace,
+                    domain,
+                    &round_1_result.rap_challenges,
+                );
+            }
         }
 
         // =====================================================================
-        // Rounds 2-4: Standard STARK protocol for each AIR
+        // Rounds 2-4: Sequential per-table proving
         // =====================================================================
+        // For each table, recompute LDE + rebuild Merkle trees, run rounds 2-4,
+        // then drop all table data before processing the next table.
 
         let mut proofs = Vec::with_capacity(num_airs);
-        for (((air, _, pub_inputs), round_1_result), domain) in
-            air_trace_pairs.iter().zip(round_1_results).zip(domains)
+        for (((air, trace, pub_inputs), metadata), domain) in air_trace_pairs
+            .iter()
+            .zip(metadatas.iter())
+            .zip(domains.iter())
         {
+            // Recompute LDE evaluations and Merkle trees for this table
+            let round_1_result = Self::reconstruct_round1(*air, *trace, domain, metadata)?;
+
             let proof =
-                Self::prove_rounds_2_to_4(*air, *pub_inputs, &round_1_result, transcript, &domain)?;
+                Self::prove_rounds_2_to_4(*air, *pub_inputs, &round_1_result, transcript, domain)?;
             proofs.push(proof);
+            // round_1_result is dropped here — frees LDE + Merkle trees
         }
 
         Ok(MultiProof::new(proofs))
@@ -2324,5 +2724,75 @@ mod tests {
         assert_eq!(result.width, expected.width);
         assert_eq!(result.height, expected.height);
         assert_eq!(result.data, expected.data);
+    }
+
+    /// Test that direct quotient decomposition produces identical results to
+    /// the original iFFT + break_in_parts + FFT pipeline.
+    #[test]
+    fn test_decompose_and_extend_d2_matches_original() {
+        // Build a known polynomial H of degree < 2N, evaluate on LDE coset.
+        let n = 16usize; // trace length
+        let blowup_factor = 2usize;
+        let two_n = n * blowup_factor;
+
+        let proof_options = ProofOptions {
+            blowup_factor: blowup_factor as u8,
+            fri_number_of_queries: 1,
+            coset_offset: 3,
+            grinding_factor: 0,
+        };
+
+        // We need an AIR with composition_poly_degree_bound = 2 * trace_length.
+        // Use QuadraticAIR for this.
+        use crate::examples::quadratic_air::QuadraticAIR;
+        let air = QuadraticAIR::<Stark252PrimeField>::new(&proof_options);
+        let domain = Domain::new(&air, n);
+
+        // Create a random-ish polynomial H(x) of degree < 2N (= 32 coefficients).
+        let coeffs: Vec<Felt252> = (0..two_n)
+            .map(|i| FieldElement::from((i * 37 + 13) as u64))
+            .collect();
+        let h_poly = Polynomial::new(&coeffs);
+
+        // Evaluate H on the LDE coset (2N points: g·ω^i for i=0..2N-1)
+        let constraint_evaluations: Vec<Felt252> = domain
+            .lde_roots_of_unity_coset
+            .iter()
+            .map(|x| h_poly.evaluate(x))
+            .collect();
+        assert_eq!(constraint_evaluations.len(), two_n);
+
+        // --- Original path: iFFT(2N) + break_in_parts(2) + FFT(2N) each ---
+        let composition_poly =
+            Polynomial::interpolate_offset_fft(&constraint_evaluations, &domain.coset_offset)
+                .unwrap();
+        let parts = composition_poly.break_in_parts(2);
+        let original: Vec<Vec<Felt252>> = parts
+            .iter()
+            .map(|part| {
+                evaluate_polynomial_on_lde_domain(part, blowup_factor, n, &domain.coset_offset)
+                    .unwrap()
+            })
+            .collect();
+
+        // --- New path: algebraic decomposition ---
+        let new_result =
+            Prover::<Stark252PrimeField, Stark252PrimeField, ()>::decompose_and_extend_d2::<
+                Stark252PrimeField,
+            >(&constraint_evaluations, &domain);
+
+        assert_eq!(new_result.len(), 2);
+        assert_eq!(new_result[0].len(), original[0].len());
+        assert_eq!(new_result[1].len(), original[1].len());
+        for i in 0..new_result[0].len() {
+            assert_eq!(
+                new_result[0][i], original[0][i],
+                "H₀ mismatch at index {i}"
+            );
+            assert_eq!(
+                new_result[1][i], original[1][i],
+                "H₁ mismatch at index {i}"
+            );
+        }
     }
 }
