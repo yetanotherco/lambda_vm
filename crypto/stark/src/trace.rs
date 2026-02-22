@@ -284,6 +284,27 @@ where
         }
     }
 
+    /// Creates an LDETraceTable by borrowing column data without consuming the column Vecs.
+    ///
+    /// Used for LDE buffer reuse: the pool retains the column buffers for the next table.
+    pub fn from_columns_borrowed(
+        main_columns: &[Vec<FieldElement<F>>],
+        aux_columns: &[Vec<FieldElement<E>>],
+        trace_step_size: usize,
+        blowup_factor: usize,
+    ) -> Self {
+        let main_table = Table::from_columns_borrowed(main_columns);
+        let aux_table = Table::from_columns_borrowed(aux_columns);
+        let lde_step_size = trace_step_size * blowup_factor;
+
+        Self {
+            main_table,
+            aux_table,
+            lde_step_size,
+            blowup_factor,
+        }
+    }
+
     pub fn num_cols(&self) -> usize {
         self.main_table.width + self.aux_table.width
     }

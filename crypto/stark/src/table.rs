@@ -63,6 +63,31 @@ impl<'t, F: IsField> Table<F> {
         Self::new(data, width)
     }
 
+    /// Creates a Table instance by borrowing column data without consuming it.
+    ///
+    /// Same transpose logic as [`from_columns`], but the column Vecs are NOT consumed —
+    /// the caller retains them. This is used for LDE buffer reuse where the pool
+    /// retains the column buffers for the next table.
+    pub fn from_columns_borrowed(columns: &[Vec<FieldElement<F>>]) -> Self {
+        if columns.is_empty() {
+            return Self::new(Vec::new(), 0);
+        }
+        let height = columns[0].len();
+
+        debug_assert!(columns.iter().all(|c| c.len() == height));
+
+        let width = columns.len();
+        let mut data = Vec::with_capacity(width * height);
+
+        for row_idx in 0..height {
+            for column in columns.iter() {
+                data.push(column[row_idx].clone());
+            }
+        }
+
+        Self::new(data, width)
+    }
+
     /// Returns a vector of vectors of field elements representing the table rows
     pub fn rows(&self) -> Vec<Vec<FieldElement<F>>> {
         self.data.chunks(self.width).map(|r| r.to_vec()).collect()

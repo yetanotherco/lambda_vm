@@ -196,6 +196,31 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         if n == 0 {
             return Ok(Vec::new());
         }
+        let lde_size = n * blowup_factor;
+        let mut buffer = Vec::with_capacity(lde_size);
+        Self::coset_lde_full_into(evals, blowup_factor, weights, inv_twiddles, fwd_twiddles, &mut buffer)?;
+        Ok(buffer)
+    }
+
+    /// Compute the coset LDE into a caller-provided buffer, avoiding allocation when
+    /// `buffer.capacity() >= n * blowup_factor`.
+    ///
+    /// Same as [`coset_lde_full`], but writes into `buffer` instead of allocating a new Vec.
+    /// The buffer is cleared and reused: `buffer.clear(); buffer.extend_from_slice(evals);
+    /// buffer.resize(lde_size, zero)`. When the capacity is sufficient, no heap allocation occurs.
+    pub fn coset_lde_full_into<F: IsFFTField + IsSubFieldOf<E>>(
+        evals: &[FieldElement<E>],
+        blowup_factor: usize,
+        weights: &[FieldElement<E>],
+        inv_twiddles: &LayerTwiddles<F>,
+        fwd_twiddles: &LayerTwiddles<F>,
+        buffer: &mut Vec<FieldElement<E>>,
+    ) -> Result<(), FFTError> {
+        let n = evals.len();
+        if n == 0 {
+            buffer.clear();
+            return Ok(());
+        }
         debug_assert!(n.is_power_of_two());
         let lde_size = n * blowup_factor;
 
@@ -203,7 +228,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
             return Err(FFTError::DomainSizeError(lde_size.trailing_zeros() as usize));
         }
 
-        let mut buffer = Vec::with_capacity(lde_size);
+        buffer.clear();
         buffer.extend_from_slice(evals);
         buffer.resize(lde_size, FieldElement::zero());
 
@@ -215,10 +240,10 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
             *coeff = w * &*coeff;
         }
 
-        bowers_fft_opt_fused(&mut buffer, fwd_twiddles)?;
-        in_place_bit_reverse_permute(&mut buffer);
+        bowers_fft_opt_fused(buffer, fwd_twiddles)?;
+        in_place_bit_reverse_permute(buffer);
 
-        Ok(buffer)
+        Ok(())
     }
 
     /// Multiplies two polynomials using FFT.
@@ -433,5 +458,82 @@ mod tests {
         let offset = FE::from(3u64);
         let result = Polynomial::<FE>::coset_lde::<F>(&[], 2, &offset).unwrap();
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn coset_lde_full_into_matches_coset_lde_full() {
+        use crate::fft::cpu::bowers_fft::LayerTwiddles;
+
+        let offset = FE::from(3u64);
+        let blowup_factor = 2;
+
+        for order in 1..=10 {
+            let n = 1usize << order;
+            let evals: Vec<FE> = (0..n).map(|i| FE::from((i * 7 + 13) as u64)).collect();
+
+            let lde_size = n * blowup_factor;
+            let inv_tw = LayerTwiddles::<F>::new_inverse(n.trailing_zeros() as u64).unwrap();
+            let fwd_tw = LayerTwiddles::<F>::new(lde_size.trailing_zeros() as u64).unwrap();
+
+            let n_inv = FE::from(n as u64).inv().unwrap();
+            let mut weights = Vec::with_capacity(n);
+            let mut offset_power = n_inv.clone();
+            for _ in 0..n {
+                weights.push(offset_power.clone());
+                offset_power = &offset_power * &offset;
+            }
+
+            let reference =
+                Polynomial::<FE>::coset_lde_full::<F>(&evals, blowup_factor, &weights, &inv_tw, &fwd_tw)
+                    .unwrap();
+
+            // Test with pre-allocated buffer
+            let mut buffer = Vec::with_capacity(lde_size);
+            Polynomial::<FE>::coset_lde_full_into::<F>(
+                &evals, blowup_factor, &weights, &inv_tw, &fwd_tw, &mut buffer,
+            )
+            .unwrap();
+
+            assert_eq!(reference, buffer, "Mismatch at order {}", order);
+        }
+    }
+
+    #[test]
+    fn coset_lde_full_into_reuses_buffer() {
+        use crate::fft::cpu::bowers_fft::LayerTwiddles;
+
+        let offset = FE::from(5u64);
+        let blowup_factor = 2usize;
+        let n = 16usize;
+        let lde_size = n * blowup_factor;
+
+        let inv_tw = LayerTwiddles::<F>::new_inverse(n.trailing_zeros() as u64).unwrap();
+        let fwd_tw = LayerTwiddles::<F>::new(lde_size.trailing_zeros() as u64).unwrap();
+
+        let n_inv = FE::from(n as u64).inv().unwrap();
+        let mut weights = Vec::with_capacity(n);
+        let mut offset_power = n_inv.clone();
+        for _ in 0..n {
+            weights.push(offset_power.clone());
+            offset_power = &offset_power * &offset;
+        }
+
+        // Pre-allocate buffer once, reuse for two different inputs
+        let mut buffer = Vec::with_capacity(lde_size);
+
+        for seed in [13u64, 42u64] {
+            let evals: Vec<FE> = (0..n).map(|i| FE::from(i as u64 * seed + 1)).collect();
+
+            let reference =
+                Polynomial::<FE>::coset_lde_full::<F>(&evals, blowup_factor, &weights, &inv_tw, &fwd_tw)
+                    .unwrap();
+
+            Polynomial::<FE>::coset_lde_full_into::<F>(
+                &evals, blowup_factor, &weights, &inv_tw, &fwd_tw, &mut buffer,
+            )
+            .unwrap();
+
+            assert_eq!(reference, buffer, "Mismatch for seed {}", seed);
+        }
     }
 }

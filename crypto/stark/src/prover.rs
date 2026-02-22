@@ -18,7 +18,8 @@ use math::{
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::{
-    IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
+    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
+    IntoParallelRefMutIterator, ParallelIterator,
 };
 
 #[cfg(feature = "debug-checks")]
@@ -532,6 +533,80 @@ pub trait IsStarkProver<
             .unwrap()
     }
 
+    /// Compute LDE evaluations into pre-allocated column buffers.
+    ///
+    /// Same as [`compute_lde_from_columns_cached`] but writes into `output` buffers instead of
+    /// allocating new Vecs. When `output[i].capacity() >= lde_size`, no heap allocation occurs.
+    /// Used for LDE buffer reuse across tables in sequential proving.
+    fn compute_lde_from_columns_into<E>(
+        columns: &[Vec<FieldElement<E>>],
+        domain: &Domain<Field>,
+        twiddles: &LdeTwiddles<Field>,
+        output: &mut [Vec<FieldElement<E>>],
+    ) where
+        E: IsSubFieldOf<FieldExtension>,
+        Field: IsSubFieldOf<E>,
+        FieldElement<E>: Send + Sync,
+    {
+        if columns.is_empty() {
+            return;
+        }
+
+        debug_assert!(
+            output.len() >= columns.len(),
+            "output pool has {} buffers but need {}",
+            output.len(),
+            columns.len()
+        );
+
+        let n = columns[0].len();
+
+        // Precompute coset weights: weights[i] = offset^i / n (identical for all columns).
+        let n_inv = FieldElement::<Field>::from(n as u64).inv().unwrap();
+        let offset = &domain.coset_offset;
+        let weights: Vec<FieldElement<E>> = {
+            let mut w = Vec::with_capacity(n);
+            let mut offset_power: FieldElement<E> = n_inv.clone().to_extension();
+            for _ in 0..n {
+                w.push(offset_power.clone());
+                offset_power = offset * &offset_power;
+            }
+            w
+        };
+
+        #[cfg(not(feature = "parallel"))]
+        {
+            for (col, buf) in columns.iter().zip(output.iter_mut()) {
+                Polynomial::coset_lde_full_into::<Field>(
+                    col,
+                    domain.blowup_factor,
+                    &weights,
+                    &twiddles.inv,
+                    &twiddles.fwd,
+                    buf,
+                )
+                .unwrap();
+            }
+        }
+        #[cfg(feature = "parallel")]
+        {
+            columns
+                .par_iter()
+                .zip(output.par_iter_mut())
+                .for_each(|(col, buf)| {
+                    Polynomial::coset_lde_full_into::<Field>(
+                        col,
+                        domain.blowup_factor,
+                        &weights,
+                        &twiddles.inv,
+                        &twiddles.fwd,
+                        buf,
+                    )
+                    .unwrap();
+                });
+        }
+    }
+
     /// Phase 1a of Round 1: Commit only the main trace to the transcript.
     /// Returns the main trace commitment data and LDE evaluations.
     /// Does NOT sample RAP challenges or build auxiliary trace.
@@ -674,33 +749,33 @@ pub trait IsStarkProver<
     }
 
     /// Phase A helper for sequential proving: compute main LDE, commit, return only the root.
-    /// Drops the LDE evaluations and Merkle tree to save memory.
+    /// Uses the provided pool buffers to avoid allocation; the pool retains capacity for reuse.
     fn commit_main_trace_lightweight(
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
         twiddles: &LdeTwiddles<Field>,
+        main_pool: &mut [Vec<FieldElement<Field>>],
     ) -> Result<(Commitment, Option<Commitment>, usize), ProvingError>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
         let columns = trace.columns_main();
-        let lde_trace_evaluations =
-            Self::compute_lde_from_columns_cached::<Field>(&columns, domain, twiddles);
+        Self::compute_lde_from_columns_into::<Field>(&columns, domain, twiddles, main_pool);
 
         let (_, lde_trace_merkle_root) =
-            Self::commit_columns_bit_reversed(&lde_trace_evaluations)
+            Self::commit_columns_bit_reversed(&main_pool[..columns.len()])
                 .ok_or(ProvingError::EmptyCommitment)?;
 
         transcript.append_bytes(&lde_trace_merkle_root);
 
-        // LDE evaluations and Merkle tree are dropped here
+        // Merkle tree is dropped here; pool buffers retain capacity
         Ok((lde_trace_merkle_root, None, 0))
     }
 
     /// Phase A helper for sequential proving with preprocessed tables: commit separately,
-    /// return only roots. Drops LDE evaluations and Merkle trees.
+    /// return only roots. Uses pool buffers to avoid allocation.
     fn commit_preprocessed_trace_lightweight(
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
@@ -708,21 +783,21 @@ pub trait IsStarkProver<
         precomputed_commitment: Commitment,
         num_precomputed_cols: usize,
         twiddles: &LdeTwiddles<Field>,
+        main_pool: &mut [Vec<FieldElement<Field>>],
     ) -> Result<(Commitment, Option<Commitment>, usize), ProvingError>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
         let columns = trace.columns_main();
-        let lde_trace_evaluations =
-            Self::compute_lde_from_columns_cached::<Field>(&columns, domain, twiddles);
+        Self::compute_lde_from_columns_into::<Field>(&columns, domain, twiddles, main_pool);
 
         let (_, precomputed_root) =
-            Self::commit_columns_bit_reversed(&lde_trace_evaluations[..num_precomputed_cols])
+            Self::commit_columns_bit_reversed(&main_pool[..num_precomputed_cols])
                 .ok_or(ProvingError::EmptyCommitment)?;
 
         let (_, mult_root) =
-            Self::commit_columns_bit_reversed(&lde_trace_evaluations[num_precomputed_cols..])
+            Self::commit_columns_bit_reversed(&main_pool[num_precomputed_cols..columns.len()])
                 .ok_or(ProvingError::EmptyCommitment)?;
 
         debug_assert_eq!(
@@ -733,12 +808,12 @@ pub trait IsStarkProver<
         transcript.append_bytes(&precomputed_commitment);
         transcript.append_bytes(&mult_root);
 
-        // LDE evaluations and Merkle trees are dropped here
+        // Merkle trees are dropped here; pool buffers retain capacity
         Ok((mult_root, Some(precomputed_root), num_precomputed_cols))
     }
 
     /// Phase C helper for sequential proving: build aux trace, commit, return only root
-    /// and bus_public_inputs. Drops LDE evaluations and Merkle tree.
+    /// and bus_public_inputs. Uses pool buffers to avoid allocation.
     fn commit_aux_trace_lightweight(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         trace: &mut TraceTable<Field, FieldExtension>,
@@ -746,6 +821,7 @@ pub trait IsStarkProver<
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
         rap_challenges: &[FieldElement<FieldExtension>],
         twiddles: &LdeTwiddles<Field>,
+        aux_pool: &mut [Vec<FieldElement<FieldExtension>>],
     ) -> Result<
         (
             Option<Commitment>,
@@ -764,36 +840,37 @@ pub trait IsStarkProver<
         let bus_public_inputs = air.build_auxiliary_trace(trace, rap_challenges);
 
         let columns = trace.columns_aux();
-        let lde_trace_evaluations =
-            Self::compute_lde_from_columns_cached::<FieldExtension>(&columns, domain, twiddles);
+        Self::compute_lde_from_columns_into::<FieldExtension>(&columns, domain, twiddles, aux_pool);
 
         let (_, aux_merkle_root) =
-            Self::commit_columns_bit_reversed(&lde_trace_evaluations)
+            Self::commit_columns_bit_reversed(&aux_pool[..columns.len()])
                 .ok_or(ProvingError::EmptyCommitment)?;
 
         transcript.append_bytes(&aux_merkle_root);
 
-        // LDE evaluations and Merkle tree are dropped here
+        // Merkle tree is dropped here; pool buffers retain capacity
         Ok((Some(aux_merkle_root), bus_public_inputs))
     }
 
     /// Reconstruct a full Round1 struct by recomputing LDE evaluations and rebuilding
-    /// Merkle trees from the trace. Used for sequential per-table proving.
+    /// Merkle trees from the trace. Uses pool buffers to avoid allocation.
     fn reconstruct_round1(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
         metadata: &Round1Metadata<FieldExtension>,
         twiddles: &LdeTwiddles<Field>,
+        main_pool: &mut [Vec<FieldElement<Field>>],
+        aux_pool: &mut [Vec<FieldElement<FieldExtension>>],
     ) -> Result<Round1<Field, FieldExtension>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        // Recompute main LDE
+        // Recompute main LDE into pool buffers
         let main_columns = trace.columns_main();
-        let main_lde =
-            Self::compute_lde_from_columns_cached::<Field>(&main_columns, domain, twiddles);
+        let num_main_cols = main_columns.len();
+        Self::compute_lde_from_columns_into::<Field>(&main_columns, domain, twiddles, main_pool);
 
         // Rebuild main Merkle tree(s)
         let is_preprocessed = metadata.precomputed_merkle_root.is_some();
@@ -801,10 +878,10 @@ pub trait IsStarkProver<
 
         let main = if is_preprocessed {
             let (precomputed_tree, precomputed_root) =
-                Self::commit_columns_bit_reversed(&main_lde[..num_precomputed_cols])
+                Self::commit_columns_bit_reversed(&main_pool[..num_precomputed_cols])
                     .ok_or(ProvingError::EmptyCommitment)?;
             let (mult_tree, mult_root) =
-                Self::commit_columns_bit_reversed(&main_lde[num_precomputed_cols..])
+                Self::commit_columns_bit_reversed(&main_pool[num_precomputed_cols..num_main_cols])
                     .ok_or(ProvingError::EmptyCommitment)?;
             debug_assert_eq!(
                 mult_root, metadata.main_merkle_root,
@@ -823,8 +900,9 @@ pub trait IsStarkProver<
                 num_precomputed_cols,
             }
         } else {
-            let (main_tree, main_root) = Self::commit_columns_bit_reversed(&main_lde)
-                .ok_or(ProvingError::EmptyCommitment)?;
+            let (main_tree, main_root) =
+                Self::commit_columns_bit_reversed(&main_pool[..num_main_cols])
+                    .ok_or(ProvingError::EmptyCommitment)?;
             debug_assert_eq!(
                 main_root, metadata.main_merkle_root,
                 "Recomputed main root doesn't match metadata"
@@ -838,13 +916,19 @@ pub trait IsStarkProver<
             }
         };
 
-        // Recompute aux LDE and rebuild aux Merkle tree
-        let (aux, aux_evaluations) = if air.has_trace_interaction() {
+        // Recompute aux LDE into pool buffers and rebuild aux Merkle tree
+        let (aux, num_aux_cols) = if air.has_trace_interaction() {
             let aux_columns = trace.columns_aux();
-            let aux_lde =
-                Self::compute_lde_from_columns_cached::<FieldExtension>(&aux_columns, domain, twiddles);
-            let (aux_tree, aux_root) = Self::commit_columns_bit_reversed(&aux_lde)
-                .ok_or(ProvingError::EmptyCommitment)?;
+            let n_aux = aux_columns.len();
+            Self::compute_lde_from_columns_into::<FieldExtension>(
+                &aux_columns,
+                domain,
+                twiddles,
+                aux_pool,
+            );
+            let (aux_tree, aux_root) =
+                Self::commit_columns_bit_reversed(&aux_pool[..n_aux])
+                    .ok_or(ProvingError::EmptyCommitment)?;
             debug_assert_eq!(
                 Some(aux_root),
                 metadata.aux_merkle_root,
@@ -857,14 +941,15 @@ pub trait IsStarkProver<
                 precomputed_merkle_root: None,
                 num_precomputed_cols: 0,
             };
-            (Some(aux_commitment), aux_lde)
+            (Some(aux_commitment), n_aux)
         } else {
-            (None, Vec::new())
+            (None, 0)
         };
 
-        let lde_trace = LDETraceTable::from_columns(
-            main_lde,
-            aux_evaluations,
+        // Build row-major LDETraceTable by borrowing from pool (pool retains buffers)
+        let lde_trace = LDETraceTable::from_columns_borrowed(
+            &main_pool[..num_main_cols],
+            &aux_pool[..num_aux_cols],
             air.step_size(),
             domain.blowup_factor,
         );
@@ -1651,22 +1736,19 @@ pub trait IsStarkProver<
             .any(|(air, _, _)| air.has_trace_interaction());
 
         // =====================================================================
-        // Round 1, Phase A: Commit all main traces (lightweight)
+        // Pre-pass: compute domains, twiddles, and max dimensions for pool allocation
         // =====================================================================
-        // All main trace commitments must be in the transcript before sampling
-        // LogUp challenges. LDE evaluations and Merkle trees are dropped after
-        // committing — only roots are kept.
 
         let mut domains = Vec::with_capacity(num_airs);
         let mut twiddle_caches: Vec<LdeTwiddles<Field>> = Vec::with_capacity(num_airs);
-        let mut main_roots: Vec<(Commitment, Option<Commitment>, usize)> =
-            Vec::with_capacity(num_airs);
+        let mut max_main_cols = 0usize;
+        let mut max_aux_cols = 0usize;
+        let mut max_lde_size = 0usize;
 
         for (air, trace, _pub_inputs) in &*air_trace_pairs {
             let trace_length = trace.num_rows();
             let domain = new_domain(*air, trace_length);
 
-            // Precompute twiddles once per domain — reused across Phase A, C, and Rounds 2-4.
             let n = domain.interpolation_domain_size;
             let lde_size = n * domain.blowup_factor;
             let twiddles = LdeTwiddles {
@@ -1674,22 +1756,57 @@ pub trait IsStarkProver<
                 fwd: LayerTwiddles::<Field>::new(lde_size.trailing_zeros() as u64).unwrap(),
             };
 
+            max_main_cols = max_main_cols.max(trace.num_main_columns);
+            max_aux_cols = max_aux_cols.max(air.num_auxiliary_rap_columns());
+            max_lde_size = max_lde_size.max(lde_size);
+
+            domains.push(domain);
+            twiddle_caches.push(twiddles);
+        }
+
+        // Allocate LDE column buffer pools — reused across all tables and phases.
+        let mut main_pool: Vec<Vec<FieldElement<Field>>> = (0..max_main_cols)
+            .map(|_| Vec::with_capacity(max_lde_size))
+            .collect();
+        let mut aux_pool: Vec<Vec<FieldElement<FieldExtension>>> = (0..max_aux_cols)
+            .map(|_| Vec::with_capacity(max_lde_size))
+            .collect();
+
+        // =====================================================================
+        // Round 1, Phase A: Commit all main traces (lightweight)
+        // =====================================================================
+        // All main trace commitments must be in the transcript before sampling
+        // LogUp challenges. Pool buffers are reused across tables.
+
+        let mut main_roots: Vec<(Commitment, Option<Commitment>, usize)> =
+            Vec::with_capacity(num_airs);
+
+        for ((air, trace, _pub_inputs), twiddles) in
+            air_trace_pairs.iter().zip(twiddle_caches.iter())
+        {
+            let domain = &domains[main_roots.len()];
+
             let roots = if air.is_preprocessed() {
                 Self::commit_preprocessed_trace_lightweight(
                     *trace,
-                    &domain,
+                    domain,
                     transcript,
                     air.precomputed_commitment(),
                     air.num_precomputed_columns(),
-                    &twiddles,
+                    twiddles,
+                    &mut main_pool,
                 )?
             } else {
-                Self::commit_main_trace_lightweight(*trace, &domain, transcript, &twiddles)?
+                Self::commit_main_trace_lightweight(
+                    *trace,
+                    domain,
+                    transcript,
+                    twiddles,
+                    &mut main_pool,
+                )?
             };
 
             main_roots.push(roots);
-            domains.push(domain);
-            twiddle_caches.push(twiddles);
         }
 
         // =====================================================================
@@ -1708,7 +1825,7 @@ pub trait IsStarkProver<
         // Round 1, Phase C: Build and commit auxiliary traces (lightweight)
         // =====================================================================
         // Each AIR builds its LogUp running-sum columns using the shared challenges.
-        // LDE evaluations and Merkle trees are dropped after committing.
+        // Pool buffers are reused across tables.
 
         let mut metadatas: Vec<Round1Metadata<FieldExtension>> = Vec::with_capacity(num_airs);
         for ((((air, trace, _pub_inputs), &(main_root, precomputed_root, num_precomputed)), domain), twiddles)
@@ -1725,6 +1842,7 @@ pub trait IsStarkProver<
                 transcript,
                 &logup_challenges,
                 twiddles,
+                &mut aux_pool,
             )?;
 
             metadatas.push(Round1Metadata {
@@ -1740,15 +1858,19 @@ pub trait IsStarkProver<
         #[cfg(feature = "debug-checks")]
         {
             // For debug checks, we need to reconstruct Round1 temporarily.
-            let temp_results: Vec<Round1<Field, FieldExtension>> = air_trace_pairs
+            let mut temp_results: Vec<Round1<Field, FieldExtension>> = Vec::with_capacity(num_airs);
+            for (((air, trace, _), metadata), (domain, twiddles)) in air_trace_pairs
                 .iter()
                 .zip(metadatas.iter())
-                .zip(domains.iter())
-                .zip(twiddle_caches.iter())
-                .map(|((((air, trace, _), metadata), domain), twiddles)| {
-                    Self::reconstruct_round1(*air, *trace, domain, metadata, twiddles).unwrap()
-                })
-                .collect();
+                .zip(domains.iter().zip(twiddle_caches.iter()))
+            {
+                temp_results.push(
+                    Self::reconstruct_round1(
+                        *air, *trace, domain, metadata, twiddles,
+                        &mut main_pool, &mut aux_pool,
+                    ).unwrap()
+                );
+            }
 
             print_bus_balance_report(&temp_results);
 
@@ -1770,8 +1892,8 @@ pub trait IsStarkProver<
         // =====================================================================
         // Rounds 2-4: Sequential per-table proving
         // =====================================================================
-        // For each table, recompute LDE + rebuild Merkle trees, run rounds 2-4,
-        // then drop all table data before processing the next table.
+        // For each table, recompute LDE into pool buffers, rebuild Merkle trees,
+        // run rounds 2-4, then drop table data. Pool buffers retain capacity.
 
         let mut proofs = Vec::with_capacity(num_airs);
         for ((((air, trace, pub_inputs), metadata), domain), twiddles) in air_trace_pairs
@@ -1780,14 +1902,17 @@ pub trait IsStarkProver<
             .zip(domains.iter())
             .zip(twiddle_caches.iter())
         {
-            // Recompute LDE evaluations and Merkle trees for this table
-            let round_1_result =
-                Self::reconstruct_round1(*air, *trace, domain, metadata, twiddles)?;
+            // Recompute LDE evaluations into pool and rebuild Merkle trees
+            let round_1_result = Self::reconstruct_round1(
+                *air, *trace, domain, metadata, twiddles,
+                &mut main_pool, &mut aux_pool,
+            )?;
 
             let proof =
                 Self::prove_rounds_2_to_4(*air, *pub_inputs, &round_1_result, transcript, domain)?;
             proofs.push(proof);
-            // round_1_result is dropped here — frees LDE + Merkle trees
+            // round_1_result is dropped here — frees row-major Tables + Merkle trees
+            // Pool buffers (column-oriented) retain capacity for next table
         }
 
         Ok(MultiProof::new(proofs))
