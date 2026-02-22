@@ -71,6 +71,10 @@ where
 ///
 /// This modifies the polynomial in place, avoiding memory allocation.
 /// The polynomial degree is halved after this operation.
+///
+/// Note: This is the coefficient-form fold, retained for tests and reference.
+/// Production FRI now uses `fold_evaluations_in_place` (evaluation-form).
+#[allow(unused)]
 pub fn fold_polynomial_doubled_inplace<F>(
     poly: &mut Polynomial<FieldElement<F>>,
     beta: &FieldElement<F>,

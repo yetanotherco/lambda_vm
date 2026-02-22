@@ -1,4 +1,5 @@
 use super::domain::Domain;
+use super::trace::TraceTable;
 use super::traits::{AIR, TransitionEvaluationContext};
 use crate::{frame::Frame, trace::LDETraceTable};
 use log::{error, info};
@@ -11,7 +12,10 @@ use math::{
     polynomial::Polynomial,
 };
 
-/// Validates that the trace is valid with respect to the supplied AIR constraints
+/// Validates that the trace is valid with respect to the supplied AIR constraints.
+///
+/// Accepts a `TraceTable` directly (no coefficient-form polynomials needed).
+/// The trace table contains the original trace values on the interpolation domain.
 pub fn validate_trace<
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
     FieldExtension: Send + Sync + IsField,
@@ -19,31 +23,27 @@ pub fn validate_trace<
 >(
     air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
     pub_inputs: &PI,
-    main_trace_polys: &[Polynomial<FieldElement<Field>>],
-    aux_trace_polys: &[Polynomial<FieldElement<FieldExtension>>],
+    trace: &TraceTable<Field, FieldExtension>,
     domain: &Domain<Field>,
     rap_challenges: &[FieldElement<FieldExtension>],
 ) -> bool {
     info!("Starting constraints validation over trace...");
     let mut ret = true;
 
-    let main_trace_columns: Vec<_> = main_trace_polys
-        .iter()
-        .map(|poly| {
-            Polynomial::<FieldElement<Field>>::evaluate_fft::<Field>(
-                poly,
-                1,
-                Some(domain.interpolation_domain_size),
-            )
-            .unwrap()
+    // Build an LDE trace with blowup=1 from the trace table columns.
+    let main_trace_columns: Vec<Vec<FieldElement<Field>>> = (0..trace.num_main_columns)
+        .map(|col| {
+            (0..trace.num_rows())
+                .map(|row| trace.main_table.get(row, col).clone())
+                .collect()
         })
         .collect();
 
-    let aux_trace_columns: Vec<_> = aux_trace_polys
-        .iter()
-        .map(|poly| {
-            Polynomial::evaluate_fft::<Field>(poly, 1, Some(domain.interpolation_domain_size))
-                .unwrap()
+    let aux_trace_columns: Vec<Vec<FieldElement<FieldExtension>>> = (0..trace.num_aux_columns)
+        .map(|col| {
+            (0..trace.num_rows())
+                .map(|row| trace.aux_table.get(row, col).clone())
+                .collect()
         })
         .collect();
 

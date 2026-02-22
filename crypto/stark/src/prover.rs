@@ -78,8 +78,6 @@ where
     F: IsField,
     FieldElement<F>: AsBytes,
 {
-    /// The result of the interpolation of the columns of the trace table.
-    pub(crate) trace_polys: Vec<Polynomial<FieldElement<F>>>,
     /// The Merkle trees constructed to obtain the commitment of the entire trace table.
     /// For preprocessed tables, this contains only the multiplicity columns.
     pub(crate) lde_trace_merkle_tree: BatchedMerkleTree<F>,
@@ -292,18 +290,19 @@ pub trait IsStarkProver<
 
     /// Given a `TraceTable`, this method interpolates its columns, computes the commitment to the
     /// table and appends it to the transcript.
-    /// Output: a tuple of length 4 with the following:
-    /// • The polynomials interpolating the columns of `trace`.
-    /// • The evaluations of the above polynomials over the domain `domain`.
-    /// • The Merkle tree of evaluations of the above polynomials over the domain `domain`.
-    /// • The roots of the above Merkle trees.
+    /// Output: a tuple of length 3 with the following:
+    /// • The evaluations of the trace polynomials over the LDE domain.
+    /// • The Merkle tree of evaluations over the LDE domain.
+    /// • The root of the above Merkle tree.
+    ///
+    /// Note: trace polynomials (coefficients) are computed transiently for the LDE
+    /// but are NOT stored. All downstream operations use evaluation-form data.
     #[allow(clippy::type_complexity)]
     fn interpolate_and_commit_main(
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
     ) -> Option<(
-        Vec<Polynomial<FieldElement<Field>>>,
         Vec<Vec<FieldElement<Field>>>,
         BatchedMerkleTree<Field>,
         Commitment,
@@ -313,12 +312,12 @@ pub trait IsStarkProver<
         FieldElement<FieldExtension>: AsBytes,
         Field: IsSubFieldOf<FieldExtension>,
     {
-        // Interpolate columns of `trace`.
+        // Interpolate columns of `trace` and evaluate on the LDE domain.
+        // The intermediate coefficient-form polynomials are transient.
         let trace_polys = trace.compute_trace_polys_main::<Field>();
-
-        // Evaluate those polynomials t_j on the large domain D_LDE.
         let lde_trace_evaluations =
             Self::compute_lde_trace_evaluations::<Field>(&trace_polys, domain);
+        drop(trace_polys);
 
         // Hash rows on-the-fly from column-major data with bit-reversal,
         // avoiding the full clone + transpose that the old code did.
@@ -329,7 +328,6 @@ pub trait IsStarkProver<
         transcript.append_bytes(&lde_trace_merkle_root);
 
         Some((
-            trace_polys,
             lde_trace_evaluations,
             lde_trace_merkle_tree,
             lde_trace_merkle_root,
@@ -340,27 +338,24 @@ pub trait IsStarkProver<
     ///
     /// Does NOT build a Merkle tree (the caller builds separate trees for
     /// precomputed and multiplicity columns).
-    #[allow(clippy::type_complexity)]
+    ///
+    /// Trace polynomials (coefficients) are transient and not stored.
     fn interpolate_and_compute_lde(
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
-    ) -> Option<(
-        Vec<Polynomial<FieldElement<Field>>>,
-        Vec<Vec<FieldElement<Field>>>,
-    )>
+    ) -> Option<Vec<Vec<FieldElement<Field>>>>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
         Field: IsSubFieldOf<FieldExtension>,
     {
-        // Interpolate columns of `trace`.
+        // Interpolate columns of `trace` (transient) and evaluate on the LDE domain.
         let trace_polys = trace.compute_trace_polys_main::<Field>();
-
-        // Evaluate those polynomials t_j on the large domain D_LDE.
         let lde_trace_evaluations =
             Self::compute_lde_trace_evaluations::<Field>(&trace_polys, domain);
+        drop(trace_polys);
 
-        Some((trace_polys, lde_trace_evaluations))
+        Some(lde_trace_evaluations)
     }
 
     /// Given a `TraceTable`, this method interpolates its auxiliary columns, computes the
@@ -371,7 +366,6 @@ pub trait IsStarkProver<
         domain: &Domain<Field>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
     ) -> Option<(
-        Vec<Polynomial<FieldElement<FieldExtension>>>,
         Vec<Vec<FieldElement<FieldExtension>>>,
         BatchedMerkleTree<FieldExtension>,
         Commitment,
@@ -381,11 +375,10 @@ pub trait IsStarkProver<
         FieldElement<FieldExtension>: AsBytes,
         Field: IsSubFieldOf<FieldExtension> + IsFFTField,
     {
-        // Interpolate columns of `trace`.
+        // Interpolate columns of `trace` (transient) and evaluate on the LDE domain.
         let trace_polys = trace.compute_trace_polys_aux::<Field>();
-
-        // Evaluate those polynomials t_j on the large domain D_LDE.
         let lde_trace_evaluations = Self::compute_lde_trace_evaluations(&trace_polys, domain);
+        drop(trace_polys);
 
         // Hash rows on-the-fly from column-major data with bit-reversal.
         let (lde_trace_merkle_tree, lde_trace_merkle_root) =
@@ -395,7 +388,6 @@ pub trait IsStarkProver<
         transcript.append_bytes(&lde_trace_merkle_root);
 
         Some((
-            trace_polys,
             lde_trace_evaluations,
             lde_trace_merkle_tree,
             lde_trace_merkle_root,
@@ -443,14 +435,13 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let Some((trace_polys, evaluations, main_merkle_tree, main_merkle_root)) =
+        let Some((evaluations, main_merkle_tree, main_merkle_root)) =
             Self::interpolate_and_commit_main(trace, domain, transcript)
         else {
             return Err(ProvingError::EmptyCommitment);
         };
 
         let main = Round1CommitmentData::<Field> {
-            trace_polys,
             lde_trace_merkle_tree: main_merkle_tree,
             lde_trace_merkle_root: main_merkle_root,
             precomputed_merkle_tree: None,
@@ -481,8 +472,7 @@ pub trait IsStarkProver<
         FieldElement<FieldExtension>: AsBytes,
     {
         // Interpolate all columns and compute LDE evaluations (no tree building here).
-        let Some((trace_polys, evaluations)) = Self::interpolate_and_compute_lde(trace, domain)
-        else {
+        let Some(evaluations) = Self::interpolate_and_compute_lde(trace, domain) else {
             return Err(ProvingError::EmptyCommitment);
         };
 
@@ -511,7 +501,6 @@ pub trait IsStarkProver<
 
         // Store multiplicities tree as main (for FRI openings), precomputed tree separately
         let main = Round1CommitmentData::<Field> {
-            trace_polys,
             lde_trace_merkle_tree: mult_tree,
             lde_trace_merkle_root: mult_root,
             precomputed_merkle_tree: Some(precomputed_tree),
@@ -541,17 +530,12 @@ pub trait IsStarkProver<
     {
         let (aux, aux_evaluations, bus_public_inputs) = if air.has_trace_interaction() {
             let bus_public_inputs = air.build_auxiliary_trace(trace, &rap_challenges);
-            let Some((
-                aux_trace_polys,
-                aux_trace_polys_evaluations,
-                aux_merkle_tree,
-                aux_merkle_root,
-            )) = Self::interpolate_and_commit_aux(trace, domain, transcript)
+            let Some((aux_trace_polys_evaluations, aux_merkle_tree, aux_merkle_root)) =
+                Self::interpolate_and_commit_aux(trace, domain, transcript)
             else {
                 return Err(ProvingError::EmptyCommitment);
             };
             let aux = Some(Round1CommitmentData::<FieldExtension> {
-                trace_polys: aux_trace_polys,
                 lde_trace_merkle_tree: aux_merkle_tree,
                 lde_trace_merkle_root: aux_merkle_root,
                 precomputed_merkle_tree: None,
@@ -1284,6 +1268,21 @@ pub trait IsStarkProver<
         #[cfg(feature = "debug-checks")]
         print_bus_balance_report(&round_1_results);
 
+        #[cfg(feature = "debug-checks")]
+        for (((air, trace, pub_inputs), round_1_result), domain) in air_trace_pairs
+            .iter()
+            .zip(round_1_results.iter())
+            .zip(domains.iter())
+        {
+            validate_trace(
+                *air,
+                *pub_inputs,
+                *trace,
+                domain,
+                &round_1_result.rap_challenges,
+            );
+        }
+
         // =====================================================================
         // Rounds 2-4: Standard STARK protocol for each AIR
         // =====================================================================
@@ -1334,20 +1333,6 @@ pub trait IsStarkProver<
         PI: Send + Sync + Clone,
     {
         info!("Started proof generation...");
-
-        #[cfg(feature = "debug-checks")]
-        validate_trace(
-            air,
-            pub_inputs,
-            &round_1_result.main.trace_polys,
-            round_1_result
-                .aux
-                .as_ref()
-                .map(|a| &a.trace_polys)
-                .unwrap_or(&vec![]),
-            domain,
-            &round_1_result.rap_challenges,
-        );
 
         // ===================================
         // ==========|   Round 2   |==========
