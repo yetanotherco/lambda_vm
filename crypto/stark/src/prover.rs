@@ -1263,11 +1263,15 @@ pub trait IsStarkProver<
         let coset_points: Vec<FieldElement<Field>> = (0..n)
             .map(|i| domain.lde_roots_of_unity_coset[i * bf].clone())
             .collect();
-        let coset_offset_pow_n: FieldElement<FieldExtension> =
-            domain.coset_offset.pow(n).to_extension();
-        let n_inv: FieldElement<FieldExtension> = FieldElement::<FieldExtension>::from(n as u64)
+        // Keep coset_offset_pow_n and g_n_inv in base field F — the barycentric
+        // functions use F×E→E mixed arithmetic, avoiding field conversions.
+        let coset_offset_pow_n: FieldElement<Field> = domain.coset_offset.pow(n);
+        let n_inv: FieldElement<Field> = FieldElement::<Field>::from(n as u64)
             .inv()
             .expect("n is a power of two, hence non-zero in the field");
+        let g_n_inv: FieldElement<Field> = coset_offset_pow_n
+            .inv()
+            .expect("coset_offset_pow_n is non-zero");
 
         // Precompute inv_denoms for z^num_parts (shared across all composition poly parts)
         let comp_z_pow_n = z_power.pow(n);
@@ -1282,10 +1286,11 @@ pub trait IsStarkProver<
                 let evals: Vec<FieldElement<FieldExtension>> = (0..n)
                     .map(|i| lde_evals[i * bf].clone())
                     .collect();
-                math::polynomial::interpolate_coset_eval_ext(
+                math::polynomial::interpolate_coset_eval_ext_with_g_n_inv(
                     &comp_z_pow_n,
                     &coset_offset_pow_n,
                     &n_inv,
+                    &g_n_inv,
                     &coset_points,
                     &evals,
                     &comp_inv_denoms,

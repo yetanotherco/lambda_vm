@@ -535,6 +535,19 @@ where
         }
     }
 
+    /// Compute `self - rhs` where `rhs` is in a subfield `S` of `F`.
+    ///
+    /// Uses mixed F-S arithmetic: computes `self - embed(rhs)` without
+    /// explicitly converting rhs to the extension field.
+    #[inline(always)]
+    pub fn sub_subfield<S: IsSubFieldOf<F>>(&self, rhs: &FieldElement<S>) -> Self {
+        // embed(rhs) - self gives the negation of what we want, in F.
+        // Then negate to get self - embed(rhs).
+        Self {
+            value: F::neg(&<S as IsSubFieldOf<F>>::sub(&rhs.value, &self.value)),
+        }
+    }
+
     #[cfg(feature = "alloc")]
     /// Creates a field element from a BigUint that is smaller than the modulus.
     /// Returns error if the value is bigger than the modulus.

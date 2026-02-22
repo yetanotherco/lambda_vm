@@ -832,6 +832,45 @@ where
     debug_assert_eq!(coset_points.len(), evaluations.len());
     debug_assert_eq!(coset_points.len(), inv_denoms.len());
 
+    let sum: FieldElement<E> = coset_points
+        .iter()
+        .zip(evaluations.iter())
+        .zip(inv_denoms.iter())
+        .fold(FieldElement::<E>::zero(), |acc, ((point, eval), inv_d)| {
+            acc + (point * eval) * inv_d
+        });
+
+    let vanishing = z_pow_n - coset_offset_pow_n;
+    let g_n_inv = coset_offset_pow_n
+        .inv()
+        .expect("coset_offset_pow_n is non-zero");
+    vanishing * n_inv * &sum * &g_n_inv
+}
+
+/// Like `interpolate_coset_eval` but takes a precomputed `g_n_inv = (g^N)^{-1}`.
+///
+/// Use this when evaluating multiple columns at the same coset — the inverse is
+/// constant across all columns and should be computed once.
+///
+/// Both `coset_offset_pow_n` and `g_n_inv` stay in the base field F. The function
+/// uses F×E→E mixed arithmetic for the final multiplication, avoiding any field
+/// embedding/conversion overhead.
+pub fn interpolate_coset_eval_with_g_n_inv<F, E>(
+    z_pow_n: &FieldElement<E>,
+    coset_offset_pow_n: &FieldElement<F>,
+    n_inv: &FieldElement<F>,
+    g_n_inv: &FieldElement<F>,
+    coset_points: &[FieldElement<F>],
+    evaluations: &[FieldElement<F>],
+    inv_denoms: &[FieldElement<E>],
+) -> FieldElement<E>
+where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+{
+    debug_assert_eq!(coset_points.len(), evaluations.len());
+    debug_assert_eq!(coset_points.len(), inv_denoms.len());
+
     // sum = sum_{i} (g*w^i) * f(g*w^i) / (z - g*w^i)
     // point * eval is in base field F; multiply by inv_d lifts to E
     let sum: FieldElement<E> = coset_points
@@ -843,12 +882,10 @@ where
         });
 
     // f(z) = (z^N - g^N) / (N * g^N) * sum
-    let vanishing = z_pow_n - coset_offset_pow_n;
-    // coset_offset_pow_n is g^N where g is the non-zero coset offset
-    let g_n_inv = coset_offset_pow_n
-        .inv()
-        .expect("coset_offset_pow_n is non-zero: g is the coset offset which is always non-zero");
-    vanishing * n_inv * &sum * g_n_inv
+    // All scalar factors in base field F; vanishing via sub_subfield.
+    let vanishing = z_pow_n.sub_subfield(coset_offset_pow_n); // E - F → E
+    let scalar = n_inv * g_n_inv; // F * F → F
+    &scalar * &(vanishing * &sum) // F × E → E
 }
 
 /// Evaluate a polynomial at point `z` given its evaluations on a coset `{g * w^i}`,
@@ -873,7 +910,6 @@ where
     debug_assert_eq!(coset_points.len(), evaluations.len());
     debug_assert_eq!(coset_points.len(), inv_denoms.len());
 
-    // point * eval: F × E → E (mixed multiplication, cheaper than E × E)
     let sum: FieldElement<E> = coset_points
         .iter()
         .zip(evaluations.iter())
@@ -884,11 +920,46 @@ where
         });
 
     let vanishing = z_pow_n - coset_offset_pow_n;
-    // coset_offset_pow_n is g^N where g is the non-zero coset offset
     let g_n_inv = coset_offset_pow_n
         .inv()
-        .expect("coset_offset_pow_n is non-zero: g is the coset offset which is always non-zero");
-    vanishing * n_inv * &sum * g_n_inv
+        .expect("coset_offset_pow_n is non-zero");
+    vanishing * n_inv * &sum * &g_n_inv
+}
+
+/// Like `interpolate_coset_eval_ext` but takes a precomputed `g_n_inv = (g^N)^{-1}`.
+///
+/// Both `coset_offset_pow_n` and `g_n_inv` stay in the base field F.
+#[cfg(feature = "alloc")]
+pub fn interpolate_coset_eval_ext_with_g_n_inv<F, E>(
+    z_pow_n: &FieldElement<E>,
+    coset_offset_pow_n: &FieldElement<F>,
+    n_inv: &FieldElement<F>,
+    g_n_inv: &FieldElement<F>,
+    coset_points: &[FieldElement<F>],
+    evaluations: &[FieldElement<E>],
+    inv_denoms: &[FieldElement<E>],
+) -> FieldElement<E>
+where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+{
+    debug_assert_eq!(coset_points.len(), evaluations.len());
+    debug_assert_eq!(coset_points.len(), inv_denoms.len());
+
+    // point * eval: F × E → E (mixed multiplication, cheaper than E × E)
+    let sum: FieldElement<E> = coset_points
+        .iter()
+        .zip(evaluations.iter())
+        .zip(inv_denoms.iter())
+        .fold(FieldElement::<E>::zero(), |acc, ((point, eval), inv_d)| {
+            let numerator = point * eval;
+            acc + numerator * inv_d
+        });
+
+    // All scalar factors in base field F; vanishing via sub_subfield.
+    let vanishing = z_pow_n.sub_subfield(coset_offset_pow_n); // E - F → E
+    let scalar = n_inv * g_n_inv; // F * F → F
+    &scalar * &(vanishing * &sum) // F × E → E
 }
 
 #[cfg(test)]

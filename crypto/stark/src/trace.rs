@@ -3,7 +3,10 @@ use crate::table::Table;
 use itertools::Itertools;
 use math::fft::errors::FFTError;
 use math::field::traits::{IsField, IsSubFieldOf};
-use math::polynomial::{barycentric_inv_denoms, interpolate_coset_eval, interpolate_coset_eval_ext};
+use math::polynomial::{
+    barycentric_inv_denoms,
+    interpolate_coset_eval_ext_with_g_n_inv, interpolate_coset_eval_with_g_n_inv,
+};
 use math::{
     field::{element::FieldElement, traits::IsFFTField},
     polynomial::Polynomial,
@@ -483,13 +486,17 @@ where
         .map(|i| domain.lde_roots_of_unity_coset[i * bf].clone())
         .collect();
 
-    // Precompute constants for barycentric formula
-    let coset_offset_pow_n = domain.coset_offset.pow(n);
-    // Lift coset_offset_pow_n to extension field
-    let coset_offset_pow_n_ext: FieldElement<E> = coset_offset_pow_n.clone().to_extension();
-    let n_inv: FieldElement<E> = FieldElement::<E>::from(n as u64)
+    // Precompute constants for barycentric formula.
+    // Keep coset_offset_pow_n and g_n_inv in base field F — the barycentric
+    // functions use F×E→E mixed arithmetic, avoiding field conversions.
+    let coset_offset_pow_n: FieldElement<F> = domain.coset_offset.pow(n);
+    let n_inv: FieldElement<F> = FieldElement::<F>::from(n as u64)
         .inv()
         .expect("n is a power of two, hence non-zero in the field");
+    // Precompute (g^N)^{-1} once in base field — shared across all columns and eval points.
+    let g_n_inv: FieldElement<F> = coset_offset_pow_n
+        .inv()
+        .expect("coset_offset_pow_n is non-zero");
 
     // Build evaluation points: for each frame offset and step within, z * w_trace^exponent
     let evaluation_points: Vec<FieldElement<E>> = frame_offsets
@@ -558,10 +565,11 @@ where
         let main_evals: Vec<FieldElement<E>> = main_col_evals
             .par_iter()
             .map(|col_evals| {
-                interpolate_coset_eval(
+                interpolate_coset_eval_with_g_n_inv(
                     &z_pow_n,
-                    &coset_offset_pow_n_ext,
+                    &coset_offset_pow_n,
                     &n_inv,
+                    &g_n_inv,
                     &coset_points,
                     col_evals,
                     &inv_denoms,
@@ -572,10 +580,11 @@ where
         let main_evals: Vec<FieldElement<E>> = main_col_evals
             .iter()
             .map(|col_evals| {
-                interpolate_coset_eval(
+                interpolate_coset_eval_with_g_n_inv(
                     &z_pow_n,
-                    &coset_offset_pow_n_ext,
+                    &coset_offset_pow_n,
                     &n_inv,
+                    &g_n_inv,
                     &coset_points,
                     col_evals,
                     &inv_denoms,
@@ -589,10 +598,11 @@ where
         let aux_evals: Vec<FieldElement<E>> = aux_col_evals
             .par_iter()
             .map(|col_evals| {
-                interpolate_coset_eval_ext(
+                interpolate_coset_eval_ext_with_g_n_inv(
                     &z_pow_n,
-                    &coset_offset_pow_n_ext,
+                    &coset_offset_pow_n,
                     &n_inv,
+                    &g_n_inv,
                     &coset_points,
                     col_evals,
                     &inv_denoms,
@@ -603,10 +613,11 @@ where
         let aux_evals: Vec<FieldElement<E>> = aux_col_evals
             .iter()
             .map(|col_evals| {
-                interpolate_coset_eval_ext(
+                interpolate_coset_eval_ext_with_g_n_inv(
                     &z_pow_n,
-                    &coset_offset_pow_n_ext,
+                    &coset_offset_pow_n,
                     &n_inv,
+                    &g_n_inv,
                     &coset_points,
                     col_evals,
                     &inv_denoms,
