@@ -155,9 +155,14 @@ where
 /// Shared across all columns of the same table, and across all phases (A, C, Rounds 2-4)
 /// in sequential proving. This eliminates redundant root-of-unity generation:
 /// ~700 `get_twiddles` calls per proof reduced to one pair per distinct domain.
+///
+/// The `coset_weights` vector stores `[n_inv, n_inv*g, n_inv*g², ..., n_inv*g^{n-1}]`
+/// where `g` is the coset offset and `n_inv = 1/n`. These are used in the iFFT+coset-shift
+/// step of `expand_pool_to_lde`.
 pub struct LdeTwiddles<F: IsFFTField> {
     inv: LayerTwiddles<F>,
     fwd: LayerTwiddles<F>,
+    coset_weights: Vec<FieldElement<F>>,
 }
 
 /// A container for the results of the second round of the STARK Prove protocol.
@@ -483,18 +488,33 @@ pub trait IsStarkProver<
         let inv_order = n.trailing_zeros() as u64;
         let fwd_order = lde_size.trailing_zeros() as u64;
 
+        let n_inv = FieldElement::<Field>::from(n as u64)
+            .inv()
+            .expect("n is power of two");
+        let offset = &domain.coset_offset;
+        let coset_weights = {
+            let mut w = Vec::with_capacity(n);
+            let mut offset_power = n_inv.clone();
+            for _ in 0..n {
+                w.push(offset_power.clone());
+                offset_power = offset * &offset_power;
+            }
+            w
+        };
+
         let twiddles = LdeTwiddles {
-            inv: LayerTwiddles::<Field>::new_inverse(inv_order).unwrap(),
-            fwd: LayerTwiddles::<Field>::new(fwd_order).unwrap(),
+            inv: LayerTwiddles::<Field>::new_inverse(inv_order).expect("valid inverse twiddles"),
+            fwd: LayerTwiddles::<Field>::new(fwd_order).expect("valid forward twiddles"),
+            coset_weights,
         };
 
         Self::compute_lde_from_columns_cached(columns, domain, &twiddles)
     }
 
-    /// Compute LDE evaluations with pre-computed twiddle factors.
+    /// Compute LDE evaluations with pre-computed twiddle factors and coset weights.
     ///
     /// Same as [`compute_lde_from_columns`] but accepts shared [`LdeTwiddles`] to avoid
-    /// redundant twiddle generation across phases (A, C, Rounds 2-4).
+    /// redundant twiddle generation and weight computation across phases (A, C, Rounds 2-4).
     fn compute_lde_from_columns_cached<E>(
         columns: &[Vec<FieldElement<E>>],
         domain: &Domain<Field>,
@@ -509,22 +529,6 @@ pub trait IsStarkProver<
             return Vec::new();
         }
 
-        let n = columns[0].len();
-
-        // Precompute coset weights in base field: weights[i] = offset^i / n.
-        // Weights stay in F — coset_lde_full uses mixed F×E multiplication for scaling.
-        let n_inv = FieldElement::<Field>::from(n as u64).inv().expect("n is power of two");
-        let offset = &domain.coset_offset;
-        let weights: Vec<FieldElement<Field>> = {
-            let mut w = Vec::with_capacity(n);
-            let mut offset_power = n_inv.clone();
-            for _ in 0..n {
-                w.push(offset_power.clone());
-                offset_power = offset * &offset_power;
-            }
-            w
-        };
-
         #[cfg(not(feature = "parallel"))]
         let columns_iter = columns.iter();
         #[cfg(feature = "parallel")]
@@ -535,13 +539,13 @@ pub trait IsStarkProver<
                 Polynomial::coset_lde_full::<Field>(
                     col,
                     domain.blowup_factor,
-                    &weights,
+                    &twiddles.coset_weights,
                     &twiddles.inv,
                     &twiddles.fwd,
                 )
             })
             .collect::<Result<Vec<Vec<FieldElement<E>>>, _>>()
-            .unwrap()
+            .expect("coset LDE computation")
     }
 
     /// Compute LDE evaluations into pre-allocated column buffers.
@@ -570,34 +574,18 @@ pub trait IsStarkProver<
             columns.len()
         );
 
-        let n = columns[0].len();
-
-        // Precompute coset weights in base field: weights[i] = offset^i / n.
-        // Weights stay in F — coset_lde_full uses mixed F×E multiplication for scaling.
-        let n_inv = FieldElement::<Field>::from(n as u64).inv().expect("n is power of two");
-        let offset = &domain.coset_offset;
-        let weights: Vec<FieldElement<Field>> = {
-            let mut w = Vec::with_capacity(n);
-            let mut offset_power = n_inv.clone();
-            for _ in 0..n {
-                w.push(offset_power.clone());
-                offset_power = offset * &offset_power;
-            }
-            w
-        };
-
         #[cfg(not(feature = "parallel"))]
         {
             for (col, buf) in columns.iter().zip(output.iter_mut()) {
                 Polynomial::coset_lde_full_into::<Field>(
                     col,
                     domain.blowup_factor,
-                    &weights,
+                    &twiddles.coset_weights,
                     &twiddles.inv,
                     &twiddles.fwd,
                     buf,
                 )
-                .unwrap();
+                .expect("coset LDE into");
             }
         }
         #[cfg(feature = "parallel")]
@@ -609,12 +597,12 @@ pub trait IsStarkProver<
                     Polynomial::coset_lde_full_into::<Field>(
                         col,
                         domain.blowup_factor,
-                        &weights,
+                        &twiddles.coset_weights,
                         &twiddles.inv,
                         &twiddles.fwd,
                         buf,
                     )
-                    .unwrap();
+                    .expect("coset LDE into");
                 });
         }
     }
@@ -623,6 +611,7 @@ pub trait IsStarkProver<
     ///
     /// The pool buffers already contain column data extracted via `extract_columns_*_into`.
     /// This performs iFFT + coset shift + FFT in-place, eliminating the T1 transpose copy.
+    /// Coset weights are pre-cached in `LdeTwiddles` to avoid recomputation across phases.
     fn expand_pool_to_lde<E>(
         pool: &mut [Vec<FieldElement<E>>],
         num_cols: usize,
@@ -637,40 +626,27 @@ pub trait IsStarkProver<
             return;
         }
 
-        let n = pool[0].len();
-        let n_inv = FieldElement::<Field>::from(n as u64).inv().expect("n is power of two");
-        let offset = &domain.coset_offset;
-        let weights: Vec<FieldElement<Field>> = {
-            let mut w = Vec::with_capacity(n);
-            let mut offset_power = n_inv.clone();
-            for _ in 0..n {
-                w.push(offset_power.clone());
-                offset_power = offset * &offset_power;
-            }
-            w
-        };
-
         #[cfg(feature = "parallel")]
         pool[..num_cols].par_iter_mut().for_each(|buf| {
             Polynomial::coset_lde_full_expand::<Field>(
                 buf,
                 domain.blowup_factor,
-                &weights,
+                &twiddles.coset_weights,
                 &twiddles.inv,
                 &twiddles.fwd,
             )
-            .unwrap();
+            .expect("coset LDE expansion");
         });
         #[cfg(not(feature = "parallel"))]
         for buf in pool[..num_cols].iter_mut() {
             Polynomial::coset_lde_full_expand::<Field>(
                 buf,
                 domain.blowup_factor,
-                &weights,
+                &twiddles.coset_weights,
                 &twiddles.inv,
                 &twiddles.fwd,
             )
-            .unwrap();
+            .expect("coset LDE expansion");
         }
     }
 
@@ -1827,9 +1803,23 @@ pub trait IsStarkProver<
 
             let n = domain.interpolation_domain_size;
             let lde_size = n * domain.blowup_factor;
+            let n_inv = FieldElement::<Field>::from(n as u64)
+                .inv()
+                .expect("n is power of two");
+            let offset = &domain.coset_offset;
+            let coset_weights = {
+                let mut w = Vec::with_capacity(n);
+                let mut offset_power = n_inv.clone();
+                for _ in 0..n {
+                    w.push(offset_power.clone());
+                    offset_power = offset * &offset_power;
+                }
+                w
+            };
             let twiddles = LdeTwiddles {
-                inv: LayerTwiddles::<Field>::new_inverse(n.trailing_zeros() as u64).unwrap(),
-                fwd: LayerTwiddles::<Field>::new(lde_size.trailing_zeros() as u64).unwrap(),
+                inv: LayerTwiddles::<Field>::new_inverse(n.trailing_zeros() as u64).expect("valid inverse twiddles"),
+                fwd: LayerTwiddles::<Field>::new(lde_size.trailing_zeros() as u64).expect("valid forward twiddles"),
+                coset_weights,
             };
 
             max_main_cols = max_main_cols.max(trace.num_main_columns);
