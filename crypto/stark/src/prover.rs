@@ -1893,28 +1893,69 @@ pub trait IsStarkProver<
         };
 
         // =====================================================================
-        // Round 1, Phase C: Build and commit auxiliary traces (lightweight)
+        // Round 1, Phase C: Build and commit auxiliary traces
         // =====================================================================
-        // Each AIR builds its LogUp running-sum columns using the shared challenges.
-        // Pool buffers are reused across tables.
+        // Split into two passes for parallelism:
+        //   Pass 1 (parallel): Build all auxiliary traces (fingerprint + batch inversion)
+        //   Pass 2 (sequential): Extract → LDE → commit → transcript append (shared pool)
 
+        // Pass 1: Build aux traces in parallel.
+        // Each build_auxiliary_trace only reads from its own main trace and writes
+        // to its own aux table. No cross-table dependencies.
+        #[cfg(feature = "parallel")]
+        let bus_inputs_vec: Vec<Option<BusPublicInputs<FieldExtension>>> = air_trace_pairs
+            .par_iter_mut()
+            .map(|(air, trace, _)| {
+                if air.has_trace_interaction() {
+                    air.build_auxiliary_trace(*trace, &logup_challenges)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        #[cfg(not(feature = "parallel"))]
+        let bus_inputs_vec: Vec<Option<BusPublicInputs<FieldExtension>>> = air_trace_pairs
+            .iter_mut()
+            .map(|(air, trace, _)| {
+                if air.has_trace_interaction() {
+                    air.build_auxiliary_trace(*trace, &logup_challenges)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Pass 2: Sequential extract → LDE → commit → transcript append.
+        // Uses shared aux_pool. Transcript ordering is preserved.
         let mut metadatas: Vec<Round1Metadata<Field, FieldExtension>> = Vec::with_capacity(num_airs);
-        for ((((air, trace, _pub_inputs), (main_tree, main_root, precomputed_tree, precomputed_root, num_precomputed)), domain), twiddles)
+        for (((((air, trace, _pub_inputs), bus_public_inputs), (main_tree, main_root, precomputed_tree, precomputed_root, num_precomputed)), domain), twiddles)
             in air_trace_pairs
-                .iter_mut()
+                .iter()
+                .zip(bus_inputs_vec.into_iter())
                 .zip(main_commits.into_iter())
                 .zip(domains.iter())
                 .zip(twiddle_caches.iter())
         {
-            let (aux_tree, aux_root, bus_public_inputs) = Self::commit_aux_trace_lightweight(
-                *air,
-                *trace,
-                domain,
-                transcript,
-                &logup_challenges,
-                twiddles,
-                &mut aux_pool,
-            )?;
+            let (aux_tree, aux_root) = if air.has_trace_interaction() {
+                let num_aux_cols = trace.num_aux_columns;
+                trace.extract_columns_aux_into(&mut aux_pool);
+                Self::expand_pool_to_lde::<FieldExtension>(
+                    &mut aux_pool,
+                    num_aux_cols,
+                    domain,
+                    twiddles,
+                );
+
+                let (tree, root) =
+                    Self::commit_columns_bit_reversed(&aux_pool[..num_aux_cols])
+                        .ok_or(ProvingError::EmptyCommitment)?;
+
+                transcript.append_bytes(&root);
+                (Some(tree), Some(root))
+            } else {
+                (None, None)
+            };
 
             metadatas.push(Round1Metadata {
                 main_merkle_tree: main_tree,
