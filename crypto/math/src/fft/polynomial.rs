@@ -3,10 +3,7 @@ use crate::fft::errors::FFTError;
 use crate::field::errors::FieldError;
 use crate::field::traits::{IsField, IsSubFieldOf};
 use crate::{
-    field::{
-        element::FieldElement,
-        traits::{IsFFTField, RootsConfig},
-    },
+    field::{element::FieldElement, traits::IsFFTField},
     polynomial::Polynomial,
 };
 use alloc::{vec, vec::Vec};
@@ -15,8 +12,8 @@ use alloc::{vec, vec::Vec};
 use crate::fft::gpu::cuda::polynomial::{evaluate_fft_cuda, interpolate_fft_cuda};
 
 use super::cpu::{
-    bit_reversing::in_place_bit_reverse_permute, fft::in_place_nr_2radix_fft, ops,
-    roots_of_unity,
+    bit_reversing::in_place_bit_reverse_permute,
+    bowers_fft::{bowers_fft_opt_fused, bowers_ifft_opt, LayerTwiddles},
 };
 
 impl<E: IsField> Polynomial<FieldElement<E>> {
@@ -112,10 +109,40 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     ///
     /// This fuses the `interpolate_fft` → `scale(offset)` → `evaluate_fft(blowup)` pipeline
     /// into one pass, avoiding 2 intermediate allocations per column.
+    ///
+    /// Uses Bowers FFT internally. To share pre-computed twiddles across multiple
+    /// columns, use [`coset_lde_with_twiddles`] instead.
     pub fn coset_lde<F: IsFFTField + IsSubFieldOf<E>>(
         evals: &[FieldElement<E>],
         blowup_factor: usize,
         offset: &FieldElement<F>,
+    ) -> Result<Vec<FieldElement<E>>, FFTError> {
+        let n = evals.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let inv_order = n.trailing_zeros() as u64;
+        let fwd_order = (n * blowup_factor).trailing_zeros() as u64;
+        let inv_tw = LayerTwiddles::<F>::new_inverse(inv_order)
+            .ok_or(FFTError::DomainSizeError(inv_order as usize))?;
+        let fwd_tw = LayerTwiddles::<F>::new(fwd_order)
+            .ok_or(FFTError::DomainSizeError(fwd_order as usize))?;
+        Self::coset_lde_with_twiddles(evals, blowup_factor, offset, &inv_tw, &fwd_tw)
+    }
+
+    /// Compute the coset LDE with pre-computed twiddle factors.
+    ///
+    /// Same as [`coset_lde`], but accepts pre-computed [`LayerTwiddles`] so that
+    /// multiple columns sharing the same domain can avoid redundant twiddle generation.
+    ///
+    /// - `inv_twiddles`: inverse twiddles for iFFT on the trace-size domain (order = log2(n))
+    /// - `fwd_twiddles`: forward twiddles for FFT on the LDE-size domain (order = log2(n * blowup_factor))
+    pub fn coset_lde_with_twiddles<F: IsFFTField + IsSubFieldOf<E>>(
+        evals: &[FieldElement<E>],
+        blowup_factor: usize,
+        offset: &FieldElement<F>,
+        inv_twiddles: &LayerTwiddles<F>,
+        fwd_twiddles: &LayerTwiddles<F>,
     ) -> Result<Vec<FieldElement<E>>, FFTError> {
         let n = evals.len();
         if n == 0 {
@@ -133,30 +160,62 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         buffer.extend_from_slice(evals);
         buffer.resize(lde_size, FieldElement::zero());
 
-        // 2. iFFT in-place on buffer[..n]: NR-DIT with inverse twiddles, then bit-reverse.
-        let inv_order = n.trailing_zeros() as u64;
-        let inv_twiddles =
-            roots_of_unity::get_twiddles::<F>(inv_order, RootsConfig::BitReverseInversed)?;
-        in_place_nr_2radix_fft(&mut buffer[..n], &inv_twiddles);
+        // 2. iFFT on buffer[..n] using Bowers:
+        //    bit-reverse permute (natural → bit-reversed), then DIT inverse butterflies.
         in_place_bit_reverse_permute(&mut buffer[..n]);
+        bowers_ifft_opt(&mut buffer[..n], inv_twiddles)?;
 
         // 3. Scale by offset^i / n simultaneously (fused inverse-scaling + coset shift).
-        //    After iFFT, buffer[i] = (1/n) * Σ_k evals[k] · ω^{-ik} for i=0..n-1.
-        //    The scaling transforms coefficients c[i] into c[i] · offset^i,
-        //    and the 1/n normalization from iFFT is applied at the same time.
         let n_inv = FieldElement::<F>::from(n as u64).inv().unwrap();
-        let mut offset_power = n_inv.clone(); // offset^0 * n_inv = n_inv
+        let mut offset_power = n_inv.clone();
         for coeff in buffer[..n].iter_mut() {
             *coeff = &offset_power * &*coeff;
             offset_power = &offset_power * offset;
         }
-        // buffer[n..] is already zero from the resize — no scaling needed.
 
-        // 4. Forward FFT in-place on the full buffer: NR-DIT with forward twiddles, then bit-reverse.
-        let fwd_order = lde_size.trailing_zeros() as u64;
-        let fwd_twiddles =
-            roots_of_unity::get_twiddles::<F>(fwd_order, RootsConfig::BitReverse)?;
-        in_place_nr_2radix_fft(&mut buffer, &fwd_twiddles);
+        // 4. Forward FFT on the full buffer using Bowers:
+        //    DIF forward butterflies (natural → bit-reversed), then bit-reverse permute.
+        bowers_fft_opt_fused(&mut buffer, fwd_twiddles)?;
+        in_place_bit_reverse_permute(&mut buffer);
+
+        Ok(buffer)
+    }
+
+    /// Compute the coset LDE with pre-computed twiddle factors and pre-computed weights.
+    ///
+    /// Same as [`coset_lde_with_twiddles`], but also accepts pre-computed `weights[i] = offset^i / n`
+    /// so that the scaling step avoids the running product across columns.
+    pub fn coset_lde_full<F: IsFFTField + IsSubFieldOf<E>>(
+        evals: &[FieldElement<E>],
+        blowup_factor: usize,
+        weights: &[FieldElement<E>],
+        inv_twiddles: &LayerTwiddles<F>,
+        fwd_twiddles: &LayerTwiddles<F>,
+    ) -> Result<Vec<FieldElement<E>>, FFTError> {
+        let n = evals.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        debug_assert!(n.is_power_of_two());
+        let lde_size = n * blowup_factor;
+
+        if (lde_size.trailing_zeros() as u64) > F::TWO_ADICITY {
+            return Err(FFTError::DomainSizeError(lde_size.trailing_zeros() as usize));
+        }
+
+        let mut buffer = Vec::with_capacity(lde_size);
+        buffer.extend_from_slice(evals);
+        buffer.resize(lde_size, FieldElement::zero());
+
+        in_place_bit_reverse_permute(&mut buffer[..n]);
+        bowers_ifft_opt(&mut buffer[..n], inv_twiddles)?;
+
+        // Scale using pre-computed weights instead of running product.
+        for (coeff, w) in buffer[..n].iter_mut().zip(weights.iter()) {
+            *coeff = w * &*coeff;
+        }
+
+        bowers_fft_opt_fused(&mut buffer, fwd_twiddles)?;
         in_place_bit_reverse_permute(&mut buffer);
 
         Ok(buffer)
@@ -269,10 +328,18 @@ where
     F: IsFFTField + IsSubFieldOf<E>,
     E: IsField,
 {
-    let order = coeffs.len().trailing_zeros();
-    let twiddles = roots_of_unity::get_twiddles::<F>(order.into(), RootsConfig::BitReverse)?;
-    // Bit reverse order is needed for NR DIT FFT.
-    ops::fft(coeffs, &twiddles)
+    let n = coeffs.len();
+    if !n.is_power_of_two() {
+        return Err(FFTError::InputError(n));
+    }
+    let order = n.trailing_zeros() as u64;
+    let layer_twiddles =
+        LayerTwiddles::<F>::new(order).ok_or(FFTError::DomainSizeError(order as usize))?;
+
+    let mut result = coeffs.to_vec();
+    bowers_fft_opt_fused(&mut result, &layer_twiddles)?;
+    in_place_bit_reverse_permute(&mut result);
+    Ok(result)
 }
 
 pub fn interpolate_fft_cpu<F, E>(
@@ -282,13 +349,21 @@ where
     F: IsFFTField + IsSubFieldOf<E>,
     E: IsField,
 {
-    let order = fft_evals.len().trailing_zeros();
-    let twiddles =
-        roots_of_unity::get_twiddles::<F>(order.into(), RootsConfig::BitReverseInversed)?;
+    let n = fft_evals.len();
+    if !n.is_power_of_two() {
+        return Err(FFTError::InputError(n));
+    }
+    let order = n.trailing_zeros() as u64;
+    let inv_twiddles =
+        LayerTwiddles::<F>::new_inverse(order).ok_or(FFTError::DomainSizeError(order as usize))?;
 
-    let coeffs = ops::fft(fft_evals, &twiddles)?;
+    let mut coeffs = fft_evals.to_vec();
+    // Bowers iFFT: bit-reverse first (natural → bit-reversed), then DIT inverse butterflies
+    in_place_bit_reverse_permute(&mut coeffs);
+    bowers_ifft_opt(&mut coeffs, &inv_twiddles)?;
 
-    let scale_factor = FieldElement::from(fft_evals.len() as u64).inv().unwrap();
+    // Scale by 1/n
+    let scale_factor = FieldElement::from(n as u64).inv().unwrap();
     Ok(Polynomial::new(&coeffs).scale_coeffs(&scale_factor))
 }
 

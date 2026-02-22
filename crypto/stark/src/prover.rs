@@ -5,6 +5,7 @@ use std::time::Instant;
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use crypto::merkle_tree::traits::IsMerkleTreeBackend;
 use math::fft::cpu::bit_reversing::{in_place_bit_reverse_permute, reverse_index};
+use math::fft::cpu::bowers_fft::LayerTwiddles;
 use math::fft::errors::FFTError;
 
 use log::info;
@@ -136,6 +137,16 @@ where
     rap_challenges: Vec<FieldElement<FieldExtension>>,
     /// Bus interaction public inputs (initial and final aux column values).
     bus_public_inputs: Option<BusPublicInputs<FieldExtension>>,
+}
+
+/// Pre-computed twiddle factors and coset weights for a given domain size.
+///
+/// Shared across all columns of the same table, and across all phases (A, C, Rounds 2-4)
+/// in sequential proving. This eliminates redundant root-of-unity generation:
+/// ~700 `get_twiddles` calls per proof reduced to one pair per distinct domain.
+pub struct LdeTwiddles<F: IsFFTField> {
+    inv: LayerTwiddles<F>,
+    fwd: LayerTwiddles<F>,
 }
 
 /// A container for the results of the second round of the STARK Prove protocol.
@@ -440,6 +451,9 @@ pub trait IsStarkProver<
     ///
     /// This replaces the `compute_trace_polys_*` + `compute_lde_trace_evaluations` pipeline
     /// with a single `coset_lde` call per column, saving 2 intermediate allocations per column.
+    ///
+    /// Twiddle factors and coset weights are precomputed once and shared across all columns,
+    /// eliminating redundant root-of-unity generation.
     fn compute_lde_from_columns<E>(
         columns: &[Vec<FieldElement<E>>],
         domain: &Domain<Field>,
@@ -449,6 +463,56 @@ pub trait IsStarkProver<
         Field: IsSubFieldOf<E>,
         FieldElement<E>: Send + Sync,
     {
+        if columns.is_empty() {
+            return Vec::new();
+        }
+
+        let n = columns[0].len();
+        let lde_size = n * domain.blowup_factor;
+        let inv_order = n.trailing_zeros() as u64;
+        let fwd_order = lde_size.trailing_zeros() as u64;
+
+        let twiddles = LdeTwiddles {
+            inv: LayerTwiddles::<Field>::new_inverse(inv_order).unwrap(),
+            fwd: LayerTwiddles::<Field>::new(fwd_order).unwrap(),
+        };
+
+        Self::compute_lde_from_columns_cached(columns, domain, &twiddles)
+    }
+
+    /// Compute LDE evaluations with pre-computed twiddle factors.
+    ///
+    /// Same as [`compute_lde_from_columns`] but accepts shared [`LdeTwiddles`] to avoid
+    /// redundant twiddle generation across phases (A, C, Rounds 2-4).
+    fn compute_lde_from_columns_cached<E>(
+        columns: &[Vec<FieldElement<E>>],
+        domain: &Domain<Field>,
+        twiddles: &LdeTwiddles<Field>,
+    ) -> Vec<Vec<FieldElement<E>>>
+    where
+        E: IsSubFieldOf<FieldExtension>,
+        Field: IsSubFieldOf<E>,
+        FieldElement<E>: Send + Sync,
+    {
+        if columns.is_empty() {
+            return Vec::new();
+        }
+
+        let n = columns[0].len();
+
+        // Precompute coset weights: weights[i] = offset^i / n (identical for all columns).
+        let n_inv = FieldElement::<Field>::from(n as u64).inv().unwrap();
+        let offset = &domain.coset_offset;
+        let weights: Vec<FieldElement<E>> = {
+            let mut w = Vec::with_capacity(n);
+            let mut offset_power: FieldElement<E> = n_inv.clone().to_extension();
+            for _ in 0..n {
+                w.push(offset_power.clone());
+                offset_power = offset * &offset_power;
+            }
+            w
+        };
+
         #[cfg(not(feature = "parallel"))]
         let columns_iter = columns.iter();
         #[cfg(feature = "parallel")]
@@ -456,7 +520,13 @@ pub trait IsStarkProver<
 
         columns_iter
             .map(|col| {
-                Polynomial::coset_lde::<Field>(col, domain.blowup_factor, &domain.coset_offset)
+                Polynomial::coset_lde_full::<Field>(
+                    col,
+                    domain.blowup_factor,
+                    &weights,
+                    &twiddles.inv,
+                    &twiddles.fwd,
+                )
             })
             .collect::<Result<Vec<Vec<FieldElement<E>>>, _>>()
             .unwrap()
@@ -609,13 +679,15 @@ pub trait IsStarkProver<
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+        twiddles: &LdeTwiddles<Field>,
     ) -> Result<(Commitment, Option<Commitment>, usize), ProvingError>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
         let columns = trace.columns_main();
-        let lde_trace_evaluations = Self::compute_lde_from_columns::<Field>(&columns, domain);
+        let lde_trace_evaluations =
+            Self::compute_lde_from_columns_cached::<Field>(&columns, domain, twiddles);
 
         let (_, lde_trace_merkle_root) =
             Self::commit_columns_bit_reversed(&lde_trace_evaluations)
@@ -635,13 +707,15 @@ pub trait IsStarkProver<
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
         precomputed_commitment: Commitment,
         num_precomputed_cols: usize,
+        twiddles: &LdeTwiddles<Field>,
     ) -> Result<(Commitment, Option<Commitment>, usize), ProvingError>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
         let columns = trace.columns_main();
-        let lde_trace_evaluations = Self::compute_lde_from_columns::<Field>(&columns, domain);
+        let lde_trace_evaluations =
+            Self::compute_lde_from_columns_cached::<Field>(&columns, domain, twiddles);
 
         let (_, precomputed_root) =
             Self::commit_columns_bit_reversed(&lde_trace_evaluations[..num_precomputed_cols])
@@ -671,6 +745,7 @@ pub trait IsStarkProver<
         domain: &Domain<Field>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
         rap_challenges: &[FieldElement<FieldExtension>],
+        twiddles: &LdeTwiddles<Field>,
     ) -> Result<
         (
             Option<Commitment>,
@@ -690,7 +765,7 @@ pub trait IsStarkProver<
 
         let columns = trace.columns_aux();
         let lde_trace_evaluations =
-            Self::compute_lde_from_columns::<FieldExtension>(&columns, domain);
+            Self::compute_lde_from_columns_cached::<FieldExtension>(&columns, domain, twiddles);
 
         let (_, aux_merkle_root) =
             Self::commit_columns_bit_reversed(&lde_trace_evaluations)
@@ -709,6 +784,7 @@ pub trait IsStarkProver<
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
         metadata: &Round1Metadata<FieldExtension>,
+        twiddles: &LdeTwiddles<Field>,
     ) -> Result<Round1<Field, FieldExtension>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
@@ -716,7 +792,8 @@ pub trait IsStarkProver<
     {
         // Recompute main LDE
         let main_columns = trace.columns_main();
-        let main_lde = Self::compute_lde_from_columns::<Field>(&main_columns, domain);
+        let main_lde =
+            Self::compute_lde_from_columns_cached::<Field>(&main_columns, domain, twiddles);
 
         // Rebuild main Merkle tree(s)
         let is_preprocessed = metadata.precomputed_merkle_root.is_some();
@@ -764,7 +841,8 @@ pub trait IsStarkProver<
         // Recompute aux LDE and rebuild aux Merkle tree
         let (aux, aux_evaluations) = if air.has_trace_interaction() {
             let aux_columns = trace.columns_aux();
-            let aux_lde = Self::compute_lde_from_columns::<FieldExtension>(&aux_columns, domain);
+            let aux_lde =
+                Self::compute_lde_from_columns_cached::<FieldExtension>(&aux_columns, domain, twiddles);
             let (aux_tree, aux_root) = Self::commit_columns_bit_reversed(&aux_lde)
                 .ok_or(ProvingError::EmptyCommitment)?;
             debug_assert_eq!(
@@ -1580,12 +1658,21 @@ pub trait IsStarkProver<
         // committing — only roots are kept.
 
         let mut domains = Vec::with_capacity(num_airs);
+        let mut twiddle_caches: Vec<LdeTwiddles<Field>> = Vec::with_capacity(num_airs);
         let mut main_roots: Vec<(Commitment, Option<Commitment>, usize)> =
             Vec::with_capacity(num_airs);
 
         for (air, trace, _pub_inputs) in &*air_trace_pairs {
             let trace_length = trace.num_rows();
             let domain = new_domain(*air, trace_length);
+
+            // Precompute twiddles once per domain — reused across Phase A, C, and Rounds 2-4.
+            let n = domain.interpolation_domain_size;
+            let lde_size = n * domain.blowup_factor;
+            let twiddles = LdeTwiddles {
+                inv: LayerTwiddles::<Field>::new_inverse(n.trailing_zeros() as u64).unwrap(),
+                fwd: LayerTwiddles::<Field>::new(lde_size.trailing_zeros() as u64).unwrap(),
+            };
 
             let roots = if air.is_preprocessed() {
                 Self::commit_preprocessed_trace_lightweight(
@@ -1594,13 +1681,15 @@ pub trait IsStarkProver<
                     transcript,
                     air.precomputed_commitment(),
                     air.num_precomputed_columns(),
+                    &twiddles,
                 )?
             } else {
-                Self::commit_main_trace_lightweight(*trace, &domain, transcript)?
+                Self::commit_main_trace_lightweight(*trace, &domain, transcript, &twiddles)?
             };
 
             main_roots.push(roots);
             domains.push(domain);
+            twiddle_caches.push(twiddles);
         }
 
         // =====================================================================
@@ -1622,11 +1711,12 @@ pub trait IsStarkProver<
         // LDE evaluations and Merkle trees are dropped after committing.
 
         let mut metadatas: Vec<Round1Metadata<FieldExtension>> = Vec::with_capacity(num_airs);
-        for (((air, trace, _pub_inputs), &(main_root, precomputed_root, num_precomputed)), domain)
+        for ((((air, trace, _pub_inputs), &(main_root, precomputed_root, num_precomputed)), domain), twiddles)
             in air_trace_pairs
                 .iter_mut()
                 .zip(main_roots.iter())
                 .zip(domains.iter())
+                .zip(twiddle_caches.iter())
         {
             let (aux_root, bus_public_inputs) = Self::commit_aux_trace_lightweight(
                 *air,
@@ -1634,6 +1724,7 @@ pub trait IsStarkProver<
                 domain,
                 transcript,
                 &logup_challenges,
+                twiddles,
             )?;
 
             metadatas.push(Round1Metadata {
@@ -1653,8 +1744,9 @@ pub trait IsStarkProver<
                 .iter()
                 .zip(metadatas.iter())
                 .zip(domains.iter())
-                .map(|(((air, trace, _), metadata), domain)| {
-                    Self::reconstruct_round1(*air, *trace, domain, metadata).unwrap()
+                .zip(twiddle_caches.iter())
+                .map(|((((air, trace, _), metadata), domain), twiddles)| {
+                    Self::reconstruct_round1(*air, *trace, domain, metadata, twiddles).unwrap()
                 })
                 .collect();
 
@@ -1682,13 +1774,15 @@ pub trait IsStarkProver<
         // then drop all table data before processing the next table.
 
         let mut proofs = Vec::with_capacity(num_airs);
-        for (((air, trace, pub_inputs), metadata), domain) in air_trace_pairs
+        for ((((air, trace, pub_inputs), metadata), domain), twiddles) in air_trace_pairs
             .iter()
             .zip(metadatas.iter())
             .zip(domains.iter())
+            .zip(twiddle_caches.iter())
         {
             // Recompute LDE evaluations and Merkle trees for this table
-            let round_1_result = Self::reconstruct_round1(*air, *trace, domain, metadata)?;
+            let round_1_result =
+                Self::reconstruct_round1(*air, *trace, domain, metadata, twiddles)?;
 
             let proof =
                 Self::prove_rounds_2_to_4(*air, *pub_inputs, &round_1_result, transcript, domain)?;
