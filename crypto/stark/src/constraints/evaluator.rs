@@ -293,7 +293,7 @@ where
         check_boundary_polys_divisibility(boundary_polys, boundary_zerofiers);
 
         #[cfg(all(debug_assertions, not(feature = "parallel")))]
-        let mut transition_evaluations = Vec::new();
+        let mut transition_evaluations: Vec<FieldElement<FieldExtension>> = Vec::new();
 
         #[cfg(feature = "instruments")]
         let timer = Instant::now();

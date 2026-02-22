@@ -120,18 +120,28 @@ where
 {
 }
 
-/// Lightweight metadata from Round 1 commitments — stores only Merkle roots and metadata,
-/// not the full Merkle trees or LDE evaluations. Used for memory-efficient sequential proving.
-pub struct Round1Metadata<FieldExtension>
+/// Metadata from Round 1 commitments — stores Merkle trees and roots, but not LDE evaluations.
+/// LDE evaluations are recomputed from the trace in Rounds 2-4; Merkle trees are retained
+/// to avoid expensive re-hashing (~500ms Keccak per proof).
+pub struct Round1Metadata<Field, FieldExtension>
 where
+    Field: IsFFTField + IsSubFieldOf<FieldExtension>,
     FieldExtension: IsField,
+    FieldElement<Field>: AsBytes,
+    FieldElement<FieldExtension>: AsBytes,
 {
-    /// Root of the main trace (multiplicities for preprocessed tables).
+    /// Merkle tree of the main trace (multiplicities for preprocessed tables).
+    main_merkle_tree: BatchedMerkleTree<Field>,
+    /// Root of the main trace Merkle tree.
     main_merkle_root: Commitment,
+    /// For preprocessed tables: Merkle tree over precomputed columns.
+    precomputed_merkle_tree: Option<BatchedMerkleTree<Field>>,
     /// For preprocessed tables: root of the precomputed Merkle tree.
     precomputed_merkle_root: Option<Commitment>,
     /// For preprocessed tables: number of precomputed columns.
     num_precomputed_cols: usize,
+    /// Merkle tree of the auxiliary trace (None if no aux trace).
+    aux_merkle_tree: Option<BatchedMerkleTree<FieldExtension>>,
     /// Root of the auxiliary trace Merkle tree (None if no aux trace).
     aux_merkle_root: Option<Commitment>,
     /// The RAP challenges used for auxiliary trace construction.
@@ -805,7 +815,7 @@ pub trait IsStarkProver<
         })
     }
 
-    /// Phase A helper for sequential proving: compute main LDE, commit, return only the root.
+    /// Phase A helper for sequential proving: compute main LDE, commit, return tree and root.
     /// Uses the provided pool buffers to avoid allocation; the pool retains capacity for reuse.
     fn commit_main_trace_lightweight(
         trace: &TraceTable<Field, FieldExtension>,
@@ -813,7 +823,16 @@ pub trait IsStarkProver<
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
         twiddles: &LdeTwiddles<Field>,
         main_pool: &mut [Vec<FieldElement<Field>>],
-    ) -> Result<(Commitment, Option<Commitment>, usize), ProvingError>
+    ) -> Result<
+        (
+            BatchedMerkleTree<Field>,
+            Commitment,
+            Option<BatchedMerkleTree<Field>>,
+            Option<Commitment>,
+            usize,
+        ),
+        ProvingError,
+    >
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
@@ -822,18 +841,17 @@ pub trait IsStarkProver<
         trace.extract_columns_main_into(main_pool);
         Self::expand_pool_to_lde::<Field>(main_pool, num_cols, domain, twiddles);
 
-        let (_, lde_trace_merkle_root) =
-            Self::commit_columns_bit_reversed(&main_pool[..num_cols])
-                .ok_or(ProvingError::EmptyCommitment)?;
+        let (tree, root) = Self::commit_columns_bit_reversed(&main_pool[..num_cols])
+            .ok_or(ProvingError::EmptyCommitment)?;
 
-        transcript.append_bytes(&lde_trace_merkle_root);
+        transcript.append_bytes(&root);
 
-        // Merkle tree is dropped here; pool buffers retain capacity
-        Ok((lde_trace_merkle_root, None, 0))
+        // Pool buffers retain capacity; tree is returned to caller
+        Ok((tree, root, None, None, 0))
     }
 
     /// Phase A helper for sequential proving with preprocessed tables: commit separately,
-    /// return only roots. Uses pool buffers to avoid allocation.
+    /// return trees and roots. Uses pool buffers to avoid allocation.
     fn commit_preprocessed_trace_lightweight(
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
@@ -842,7 +860,16 @@ pub trait IsStarkProver<
         num_precomputed_cols: usize,
         twiddles: &LdeTwiddles<Field>,
         main_pool: &mut [Vec<FieldElement<Field>>],
-    ) -> Result<(Commitment, Option<Commitment>, usize), ProvingError>
+    ) -> Result<
+        (
+            BatchedMerkleTree<Field>,
+            Commitment,
+            Option<BatchedMerkleTree<Field>>,
+            Option<Commitment>,
+            usize,
+        ),
+        ProvingError,
+    >
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
@@ -851,11 +878,11 @@ pub trait IsStarkProver<
         trace.extract_columns_main_into(main_pool);
         Self::expand_pool_to_lde::<Field>(main_pool, num_cols, domain, twiddles);
 
-        let (_, precomputed_root) =
+        let (precomputed_tree, precomputed_root) =
             Self::commit_columns_bit_reversed(&main_pool[..num_precomputed_cols])
                 .ok_or(ProvingError::EmptyCommitment)?;
 
-        let (_, mult_root) =
+        let (mult_tree, mult_root) =
             Self::commit_columns_bit_reversed(&main_pool[num_precomputed_cols..num_cols])
                 .ok_or(ProvingError::EmptyCommitment)?;
 
@@ -867,11 +894,17 @@ pub trait IsStarkProver<
         transcript.append_bytes(&precomputed_commitment);
         transcript.append_bytes(&mult_root);
 
-        // Merkle trees are dropped here; pool buffers retain capacity
-        Ok((mult_root, Some(precomputed_root), num_precomputed_cols))
+        // Pool buffers retain capacity; trees are returned to caller
+        Ok((
+            mult_tree,
+            mult_root,
+            Some(precomputed_tree),
+            Some(precomputed_root),
+            num_precomputed_cols,
+        ))
     }
 
-    /// Phase C helper for sequential proving: build aux trace, commit, return only root
+    /// Phase C helper for sequential proving: build aux trace, commit, return tree, root,
     /// and bus_public_inputs. Uses pool buffers to avoid allocation.
     fn commit_aux_trace_lightweight(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
@@ -883,6 +916,7 @@ pub trait IsStarkProver<
         aux_pool: &mut [Vec<FieldElement<FieldExtension>>],
     ) -> Result<
         (
+            Option<BatchedMerkleTree<FieldExtension>>,
             Option<Commitment>,
             Option<BusPublicInputs<FieldExtension>>,
         ),
@@ -893,7 +927,7 @@ pub trait IsStarkProver<
         FieldElement<FieldExtension>: AsBytes,
     {
         if !air.has_trace_interaction() {
-            return Ok((None, None));
+            return Ok((None, None, None));
         }
 
         let bus_public_inputs = air.build_auxiliary_trace(trace, rap_challenges);
@@ -902,23 +936,26 @@ pub trait IsStarkProver<
         trace.extract_columns_aux_into(aux_pool);
         Self::expand_pool_to_lde::<FieldExtension>(aux_pool, num_aux_cols, domain, twiddles);
 
-        let (_, aux_merkle_root) =
+        let (aux_tree, aux_merkle_root) =
             Self::commit_columns_bit_reversed(&aux_pool[..num_aux_cols])
                 .ok_or(ProvingError::EmptyCommitment)?;
 
         transcript.append_bytes(&aux_merkle_root);
 
-        // Merkle tree is dropped here; pool buffers retain capacity
-        Ok((Some(aux_merkle_root), bus_public_inputs))
+        // Pool buffers retain capacity; tree is returned to caller
+        Ok((Some(aux_tree), Some(aux_merkle_root), bus_public_inputs))
     }
 
-    /// Reconstruct a full Round1 struct by recomputing LDE evaluations and rebuilding
-    /// Merkle trees from the trace. Uses pool buffers to avoid allocation.
+    /// Reconstruct a full Round1 struct by recomputing LDE evaluations and using
+    /// the stored Merkle trees from metadata. Uses pool buffers to avoid allocation.
+    ///
+    /// The Merkle trees were already built during Phase A/C and are reused here,
+    /// eliminating ~500ms of Keccak hashing per proof.
     fn reconstruct_round1(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
-        metadata: &Round1Metadata<FieldExtension>,
+        metadata: &Round1Metadata<Field, FieldExtension>,
         twiddles: &LdeTwiddles<Field>,
         main_pool: &mut [Vec<FieldElement<Field>>],
         aux_pool: &mut [Vec<FieldElement<FieldExtension>>],
@@ -932,66 +969,29 @@ pub trait IsStarkProver<
         trace.extract_columns_main_into(main_pool);
         Self::expand_pool_to_lde::<Field>(main_pool, num_main_cols, domain, twiddles);
 
-        // Rebuild main Merkle tree(s)
-        let is_preprocessed = metadata.precomputed_merkle_root.is_some();
-        let num_precomputed_cols = metadata.num_precomputed_cols;
-
-        let main = if is_preprocessed {
-            let (precomputed_tree, precomputed_root) =
-                Self::commit_columns_bit_reversed(&main_pool[..num_precomputed_cols])
-                    .ok_or(ProvingError::EmptyCommitment)?;
-            let (mult_tree, mult_root) =
-                Self::commit_columns_bit_reversed(&main_pool[num_precomputed_cols..num_main_cols])
-                    .ok_or(ProvingError::EmptyCommitment)?;
-            debug_assert_eq!(
-                mult_root, metadata.main_merkle_root,
-                "Recomputed main root doesn't match metadata"
-            );
-            debug_assert_eq!(
-                Some(precomputed_root),
-                metadata.precomputed_merkle_root,
-                "Recomputed precomputed root doesn't match metadata"
-            );
-            Round1CommitmentData::<Field> {
-                lde_trace_merkle_tree: mult_tree,
-                lde_trace_merkle_root: metadata.main_merkle_root,
-                precomputed_merkle_tree: Some(precomputed_tree),
-                precomputed_merkle_root: metadata.precomputed_merkle_root,
-                num_precomputed_cols,
-            }
-        } else {
-            let (main_tree, main_root) =
-                Self::commit_columns_bit_reversed(&main_pool[..num_main_cols])
-                    .ok_or(ProvingError::EmptyCommitment)?;
-            debug_assert_eq!(
-                main_root, metadata.main_merkle_root,
-                "Recomputed main root doesn't match metadata"
-            );
-            Round1CommitmentData::<Field> {
-                lde_trace_merkle_tree: main_tree,
-                lde_trace_merkle_root: metadata.main_merkle_root,
-                precomputed_merkle_tree: None,
-                precomputed_merkle_root: None,
-                num_precomputed_cols: 0,
-            }
+        // Use stored Merkle trees from Phase A/C (no re-hashing needed)
+        let main = Round1CommitmentData::<Field> {
+            lde_trace_merkle_tree: metadata.main_merkle_tree.clone(),
+            lde_trace_merkle_root: metadata.main_merkle_root,
+            precomputed_merkle_tree: metadata.precomputed_merkle_tree.clone(),
+            precomputed_merkle_root: metadata.precomputed_merkle_root,
+            num_precomputed_cols: metadata.num_precomputed_cols,
         };
 
-        // Recompute aux LDE into pool buffers and rebuild aux Merkle tree
+        // Recompute aux LDE into pool buffers, use stored aux Merkle tree
         let (aux, num_aux_cols) = if air.has_trace_interaction() {
             let n_aux = trace.num_aux_columns;
             trace.extract_columns_aux_into(aux_pool);
             Self::expand_pool_to_lde::<FieldExtension>(aux_pool, n_aux, domain, twiddles);
-            let (aux_tree, aux_root) =
-                Self::commit_columns_bit_reversed(&aux_pool[..n_aux])
-                    .ok_or(ProvingError::EmptyCommitment)?;
-            debug_assert_eq!(
-                Some(aux_root),
-                metadata.aux_merkle_root,
-                "Recomputed aux root doesn't match metadata"
-            );
+            // Safe: has_trace_interaction() is true only when Phase C stored aux tree/root
             let aux_commitment = Round1CommitmentData::<FieldExtension> {
-                lde_trace_merkle_tree: aux_tree,
-                lde_trace_merkle_root: metadata.aux_merkle_root.unwrap(),
+                lde_trace_merkle_tree: metadata
+                    .aux_merkle_tree
+                    .clone()
+                    .expect("aux tree must exist when has_trace_interaction"),
+                lde_trace_merkle_root: metadata
+                    .aux_merkle_root
+                    .expect("aux root must exist when has_trace_interaction"),
                 precomputed_merkle_tree: None,
                 precomputed_merkle_root: None,
                 num_precomputed_cols: 0,
@@ -1001,7 +1001,7 @@ pub trait IsStarkProver<
             (None, 0)
         };
 
-        // Build row-major LDETraceTable by borrowing from pool (pool retains buffers)
+        // Build column-major LDETraceTable by borrowing from pool (pool retains buffers)
         let lde_trace = LDETraceTable::from_columns_borrowed(
             &main_pool[..num_main_cols],
             &aux_pool[..num_aux_cols],
@@ -1854,15 +1854,20 @@ pub trait IsStarkProver<
         // All main trace commitments must be in the transcript before sampling
         // LogUp challenges. Pool buffers are reused across tables.
 
-        let mut main_roots: Vec<(Commitment, Option<Commitment>, usize)> =
-            Vec::with_capacity(num_airs);
+        let mut main_commits: Vec<(
+            BatchedMerkleTree<Field>,
+            Commitment,
+            Option<BatchedMerkleTree<Field>>,
+            Option<Commitment>,
+            usize,
+        )> = Vec::with_capacity(num_airs);
 
         for ((air, trace, _pub_inputs), twiddles) in
             air_trace_pairs.iter().zip(twiddle_caches.iter())
         {
-            let domain = &domains[main_roots.len()];
+            let domain = &domains[main_commits.len()];
 
-            let roots = if air.is_preprocessed() {
+            let commit = if air.is_preprocessed() {
                 Self::commit_preprocessed_trace_lightweight(
                     *trace,
                     domain,
@@ -1882,7 +1887,7 @@ pub trait IsStarkProver<
                 )?
             };
 
-            main_roots.push(roots);
+            main_commits.push(commit);
         }
 
         // =====================================================================
@@ -1903,15 +1908,15 @@ pub trait IsStarkProver<
         // Each AIR builds its LogUp running-sum columns using the shared challenges.
         // Pool buffers are reused across tables.
 
-        let mut metadatas: Vec<Round1Metadata<FieldExtension>> = Vec::with_capacity(num_airs);
-        for ((((air, trace, _pub_inputs), &(main_root, precomputed_root, num_precomputed)), domain), twiddles)
+        let mut metadatas: Vec<Round1Metadata<Field, FieldExtension>> = Vec::with_capacity(num_airs);
+        for ((((air, trace, _pub_inputs), (main_tree, main_root, precomputed_tree, precomputed_root, num_precomputed)), domain), twiddles)
             in air_trace_pairs
                 .iter_mut()
-                .zip(main_roots.iter())
+                .zip(main_commits.into_iter())
                 .zip(domains.iter())
                 .zip(twiddle_caches.iter())
         {
-            let (aux_root, bus_public_inputs) = Self::commit_aux_trace_lightweight(
+            let (aux_tree, aux_root, bus_public_inputs) = Self::commit_aux_trace_lightweight(
                 *air,
                 *trace,
                 domain,
@@ -1922,9 +1927,12 @@ pub trait IsStarkProver<
             )?;
 
             metadatas.push(Round1Metadata {
+                main_merkle_tree: main_tree,
                 main_merkle_root: main_root,
+                precomputed_merkle_tree: precomputed_tree,
                 precomputed_merkle_root: precomputed_root,
                 num_precomputed_cols: num_precomputed,
+                aux_merkle_tree: aux_tree,
                 aux_merkle_root: aux_root,
                 rap_challenges: logup_challenges.clone(),
                 bus_public_inputs,
@@ -1968,7 +1976,7 @@ pub trait IsStarkProver<
         // =====================================================================
         // Rounds 2-4: Sequential per-table proving
         // =====================================================================
-        // For each table, recompute LDE into pool buffers, rebuild Merkle trees,
+        // For each table, recompute LDE into pool buffers, reuse stored Merkle trees,
         // run rounds 2-4, then drop table data. Pool buffers retain capacity.
 
         let mut proofs = Vec::with_capacity(num_airs);
@@ -1978,7 +1986,7 @@ pub trait IsStarkProver<
             .zip(domains.iter())
             .zip(twiddle_caches.iter())
         {
-            // Recompute LDE evaluations into pool and rebuild Merkle trees
+            // Recompute LDE evaluations into pool, reuse stored Merkle trees
             let round_1_result = Self::reconstruct_round1(
                 *air, *trace, domain, metadata, twiddles,
                 &mut main_pool, &mut aux_pool,
@@ -1987,8 +1995,8 @@ pub trait IsStarkProver<
             let proof =
                 Self::prove_rounds_2_to_4(*air, *pub_inputs, &round_1_result, transcript, domain)?;
             proofs.push(proof);
-            // round_1_result is dropped here — frees row-major Tables + Merkle trees
-            // Pool buffers (column-oriented) retain capacity for next table
+            // round_1_result is dropped here — frees LDE trace clones (Merkle trees
+            // are clones from metadata). Pool buffers retain capacity for next table
         }
 
         Ok(MultiProof::new(proofs))
