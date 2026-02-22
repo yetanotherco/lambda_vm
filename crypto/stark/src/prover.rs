@@ -609,6 +609,61 @@ pub trait IsStarkProver<
         }
     }
 
+    /// Expand pool buffers in-place from N column evaluations to N×blowup LDE evaluations.
+    ///
+    /// The pool buffers already contain column data extracted via `extract_columns_*_into`.
+    /// This performs iFFT + coset shift + FFT in-place, eliminating the T1 transpose copy.
+    fn expand_pool_to_lde<E>(
+        pool: &mut [Vec<FieldElement<E>>],
+        num_cols: usize,
+        domain: &Domain<Field>,
+        twiddles: &LdeTwiddles<Field>,
+    ) where
+        Field: IsSubFieldOf<E>,
+        E: IsSubFieldOf<FieldExtension> + IsField,
+        FieldElement<E>: Send + Sync,
+    {
+        if num_cols == 0 {
+            return;
+        }
+
+        let n = pool[0].len();
+        let n_inv = FieldElement::<Field>::from(n as u64).inv().expect("n is power of two");
+        let offset = &domain.coset_offset;
+        let weights: Vec<FieldElement<Field>> = {
+            let mut w = Vec::with_capacity(n);
+            let mut offset_power = n_inv.clone();
+            for _ in 0..n {
+                w.push(offset_power.clone());
+                offset_power = offset * &offset_power;
+            }
+            w
+        };
+
+        #[cfg(feature = "parallel")]
+        pool[..num_cols].par_iter_mut().for_each(|buf| {
+            Polynomial::coset_lde_full_expand::<Field>(
+                buf,
+                domain.blowup_factor,
+                &weights,
+                &twiddles.inv,
+                &twiddles.fwd,
+            )
+            .unwrap();
+        });
+        #[cfg(not(feature = "parallel"))]
+        for buf in pool[..num_cols].iter_mut() {
+            Polynomial::coset_lde_full_expand::<Field>(
+                buf,
+                domain.blowup_factor,
+                &weights,
+                &twiddles.inv,
+                &twiddles.fwd,
+            )
+            .unwrap();
+        }
+    }
+
     /// Phase 1a of Round 1: Commit only the main trace to the transcript.
     /// Returns the main trace commitment data and LDE evaluations.
     /// Does NOT sample RAP challenges or build auxiliary trace.
@@ -763,11 +818,12 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let columns = trace.columns_main();
-        Self::compute_lde_from_columns_into::<Field>(&columns, domain, twiddles, main_pool);
+        let num_cols = trace.num_main_columns;
+        trace.extract_columns_main_into(main_pool);
+        Self::expand_pool_to_lde::<Field>(main_pool, num_cols, domain, twiddles);
 
         let (_, lde_trace_merkle_root) =
-            Self::commit_columns_bit_reversed(&main_pool[..columns.len()])
+            Self::commit_columns_bit_reversed(&main_pool[..num_cols])
                 .ok_or(ProvingError::EmptyCommitment)?;
 
         transcript.append_bytes(&lde_trace_merkle_root);
@@ -791,15 +847,16 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let columns = trace.columns_main();
-        Self::compute_lde_from_columns_into::<Field>(&columns, domain, twiddles, main_pool);
+        let num_cols = trace.num_main_columns;
+        trace.extract_columns_main_into(main_pool);
+        Self::expand_pool_to_lde::<Field>(main_pool, num_cols, domain, twiddles);
 
         let (_, precomputed_root) =
             Self::commit_columns_bit_reversed(&main_pool[..num_precomputed_cols])
                 .ok_or(ProvingError::EmptyCommitment)?;
 
         let (_, mult_root) =
-            Self::commit_columns_bit_reversed(&main_pool[num_precomputed_cols..columns.len()])
+            Self::commit_columns_bit_reversed(&main_pool[num_precomputed_cols..num_cols])
                 .ok_or(ProvingError::EmptyCommitment)?;
 
         debug_assert_eq!(
@@ -841,11 +898,12 @@ pub trait IsStarkProver<
 
         let bus_public_inputs = air.build_auxiliary_trace(trace, rap_challenges);
 
-        let columns = trace.columns_aux();
-        Self::compute_lde_from_columns_into::<FieldExtension>(&columns, domain, twiddles, aux_pool);
+        let num_aux_cols = trace.num_aux_columns;
+        trace.extract_columns_aux_into(aux_pool);
+        Self::expand_pool_to_lde::<FieldExtension>(aux_pool, num_aux_cols, domain, twiddles);
 
         let (_, aux_merkle_root) =
-            Self::commit_columns_bit_reversed(&aux_pool[..columns.len()])
+            Self::commit_columns_bit_reversed(&aux_pool[..num_aux_cols])
                 .ok_or(ProvingError::EmptyCommitment)?;
 
         transcript.append_bytes(&aux_merkle_root);
@@ -869,10 +927,10 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        // Recompute main LDE into pool buffers
-        let main_columns = trace.columns_main();
-        let num_main_cols = main_columns.len();
-        Self::compute_lde_from_columns_into::<Field>(&main_columns, domain, twiddles, main_pool);
+        // Recompute main LDE into pool buffers (extract columns directly, no T1 transpose)
+        let num_main_cols = trace.num_main_columns;
+        trace.extract_columns_main_into(main_pool);
+        Self::expand_pool_to_lde::<Field>(main_pool, num_main_cols, domain, twiddles);
 
         // Rebuild main Merkle tree(s)
         let is_preprocessed = metadata.precomputed_merkle_root.is_some();
@@ -920,14 +978,9 @@ pub trait IsStarkProver<
 
         // Recompute aux LDE into pool buffers and rebuild aux Merkle tree
         let (aux, num_aux_cols) = if air.has_trace_interaction() {
-            let aux_columns = trace.columns_aux();
-            let n_aux = aux_columns.len();
-            Self::compute_lde_from_columns_into::<FieldExtension>(
-                &aux_columns,
-                domain,
-                twiddles,
-                aux_pool,
-            );
+            let n_aux = trace.num_aux_columns;
+            trace.extract_columns_aux_into(aux_pool);
+            Self::expand_pool_to_lde::<FieldExtension>(aux_pool, n_aux, domain, twiddles);
             let (aux_tree, aux_root) =
                 Self::commit_columns_bit_reversed(&aux_pool[..n_aux])
                     .ok_or(ProvingError::EmptyCommitment)?;

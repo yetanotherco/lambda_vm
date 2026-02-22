@@ -4,7 +4,7 @@ use crate::debug::check_boundary_polys_divisibility;
 use crate::domain::Domain;
 use crate::lookup::BusPublicInputs;
 use crate::trace::LDETraceTable;
-use crate::traits::{AIR, TransitionEvaluationContext};
+use crate::traits::{AIR, TransitionEvaluationContext, ZerofierEvaluations};
 use crate::{frame::Frame, prover::evaluate_polynomial_on_lde_domain};
 use itertools::Itertools;
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
@@ -34,6 +34,134 @@ where
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
     FieldExtension: Send + Sync + IsField,
 {
+    /// Evaluate transition + boundary constraints across the entire LDE domain.
+    ///
+    /// Uses `map_init` for per-thread buffer reuse (transition evaluations + periodic values)
+    /// and `ZerofierEvaluations` for deduplicated zerofier access.
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_transitions(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        lde_trace: &LDETraceTable<Field, FieldExtension>,
+        lde_periodic_columns: &[Vec<FieldElement<Field>>],
+        rap_challenges: &[FieldElement<FieldExtension>],
+        zerofier_data: &ZerofierEvaluations<Field>,
+        transition_coefficients: &[FieldElement<FieldExtension>],
+        boundary_evaluation: Vec<FieldElement<FieldExtension>>,
+        num_transition: usize,
+        num_periodic: usize,
+        offsets: &[usize],
+    ) -> Vec<FieldElement<FieldExtension>> {
+        let is_uniform = zerofier_data.is_uniform();
+
+        // Per-thread buffers via map_init: each Rayon worker allocates once,
+        // then reuses for all iterations assigned to that thread.
+        #[cfg(feature = "parallel")]
+        {
+            let evaluations_t: Vec<_> = boundary_evaluation
+                .into_par_iter()
+                .enumerate()
+                .map_init(
+                    || {
+                        (
+                            vec![FieldElement::<FieldExtension>::zero(); num_transition],
+                            vec![FieldElement::<Field>::zero(); num_periodic],
+                        )
+                    },
+                    |(transition_buf, periodic_buf), (i, boundary)| {
+                        let frame = Frame::read_from_lde(lde_trace, i, offsets);
+
+                        for (j, col) in lde_periodic_columns.iter().enumerate() {
+                            periodic_buf[j] = col[i].clone();
+                        }
+
+                        let ctx = TransitionEvaluationContext::new_prover(
+                            &frame,
+                            periodic_buf,
+                            rap_challenges,
+                        );
+                        air.compute_transition_into(&ctx, transition_buf);
+
+                        let acc_transition = if is_uniform {
+                            // All constraints share one zerofier: factor it out of the sum.
+                            let z = zerofier_data.get_uniform(i);
+                            let sum = transition_buf
+                                .iter()
+                                .zip(transition_coefficients)
+                                .fold(FieldElement::zero(), |acc, (eval, beta)| {
+                                    acc + eval * beta
+                                });
+                            z * &sum
+                        } else {
+                            transition_buf
+                                .iter()
+                                .enumerate()
+                                .zip(transition_coefficients)
+                                .fold(
+                                    FieldElement::zero(),
+                                    |acc, ((c_idx, eval), beta)| {
+                                        acc + zerofier_data.get(c_idx, i) * eval * beta
+                                    },
+                                )
+                        };
+
+                        acc_transition + boundary
+                    },
+                )
+                .collect();
+            evaluations_t
+        }
+
+        #[cfg(not(feature = "parallel"))]
+        {
+            let mut transition_buf =
+                vec![FieldElement::<FieldExtension>::zero(); num_transition];
+            let mut periodic_buf = vec![FieldElement::<Field>::zero(); num_periodic];
+
+            boundary_evaluation
+                .into_iter()
+                .enumerate()
+                .map(|(i, boundary)| {
+                    let frame = Frame::read_from_lde(lde_trace, i, offsets);
+
+                    for (j, col) in lde_periodic_columns.iter().enumerate() {
+                        periodic_buf[j] = col[i].clone();
+                    }
+
+                    let ctx = TransitionEvaluationContext::new_prover(
+                        &frame,
+                        &periodic_buf,
+                        rap_challenges,
+                    );
+                    air.compute_transition_into(&ctx, &mut transition_buf);
+
+                    let acc_transition = if is_uniform {
+                        let z = zerofier_data.get_uniform(i);
+                        let sum = transition_buf
+                            .iter()
+                            .zip(transition_coefficients)
+                            .fold(FieldElement::zero(), |acc, (eval, beta)| {
+                                acc + eval * beta
+                            });
+                        z * &sum
+                    } else {
+                        transition_buf
+                            .iter()
+                            .enumerate()
+                            .zip(transition_coefficients)
+                            .fold(
+                                FieldElement::zero(),
+                                |acc, ((c_idx, eval), beta)| {
+                                    acc + zerofier_data.get(c_idx, i) * eval * beta
+                                },
+                            )
+                    };
+
+                    acc_transition + boundary
+                })
+                .collect()
+        }
+    }
+
     pub fn new(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         pub_inputs: &PI,
@@ -169,7 +297,7 @@ where
 
         #[cfg(feature = "instruments")]
         let timer = Instant::now();
-        let zerofiers_evals = air.transition_zerofier_evaluations(domain);
+        let zerofier_data = air.transition_zerofier_evaluations_grouped(domain);
         #[cfg(feature = "instruments")]
         println!(
             "     Evaluated transition zerofiers: {:#?}",
@@ -182,54 +310,23 @@ where
 
         #[cfg(feature = "instruments")]
         let timer = Instant::now();
-        let evaluations_t_iter = 0..domain.lde_roots_of_unity_coset.len();
 
-        #[cfg(feature = "parallel")]
-        let boundary_evaluation = boundary_evaluation.into_par_iter();
-        #[cfg(feature = "parallel")]
-        let evaluations_t_iter = evaluations_t_iter.into_par_iter();
+        let num_transition = air.num_transition_constraints();
+        let num_periodic = lde_periodic_columns.len();
+        let offsets = &air.context().transition_offsets;
 
-        let evaluations_t = evaluations_t_iter
-            .zip(boundary_evaluation)
-            .map(|(i, boundary)| {
-                let frame = Frame::read_from_lde(lde_trace, i, &air.context().transition_offsets);
-
-                let periodic_values: Vec<_> = lde_periodic_columns
-                    .iter()
-                    .map(|col| col[i].clone())
-                    .collect();
-
-                // Compute all the transition constraints at this point of the LDE domain.
-                let transition_evaluation_context = TransitionEvaluationContext::new_prover(
-                    &frame,
-                    &periodic_values,
-                    rap_challenges,
-                );
-                let evaluations_transition = air.compute_transition(&transition_evaluation_context);
-
-                #[cfg(all(debug_assertions, not(feature = "parallel")))]
-                transition_evaluations.push(evaluations_transition.clone());
-
-                // Add each term of the transition constraints to the composition polynomial, including the zerofier,
-                // the challenge and the exemption polynomial if it is necessary.
-                let acc_transition = itertools::izip!(
-                    evaluations_transition,
-                    &zerofiers_evals,
-                    transition_coefficients
-                )
-                .fold(FieldElement::zero(), |acc, (eval, zerof_eval, beta)| {
-                    // Zerofier evaluations are cyclical, so we only calculate one cycle.
-                    // This means that here we have to wrap around
-                    // Ex: Suppose the full zerofier vector is Z = [1,2,3,1,2,3]
-                    // we will instead have calculated Z' = [1,2,3]
-                    // Now if you need Z[4] this is equal to Z'[1]
-                    let wrapped_idx = i % zerof_eval.len();
-                    acc + &zerof_eval[wrapped_idx] * eval * beta
-                });
-
-                acc_transition + boundary
-            })
-            .collect();
+        let evaluations_t = Self::evaluate_transitions(
+            air,
+            lde_trace,
+            &lde_periodic_columns,
+            rap_challenges,
+            &zerofier_data,
+            transition_coefficients,
+            boundary_evaluation,
+            num_transition,
+            num_periodic,
+            offsets,
+        );
 
         #[cfg(feature = "instruments")]
         println!(

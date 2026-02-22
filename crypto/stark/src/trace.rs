@@ -230,6 +230,22 @@ where
     pub fn get_column_aux(&self, col_idx: usize) -> Vec<FieldElement<E>> {
         self.aux_table.get_column(col_idx)
     }
+
+    /// Extract main columns directly into pre-allocated output buffers.
+    ///
+    /// Eliminates the T1 transpose allocation that `columns_main()` performs.
+    /// When `output` buffers have sufficient capacity, no heap allocation occurs.
+    pub fn extract_columns_main_into(&self, output: &mut [Vec<FieldElement<F>>]) {
+        self.main_table.extract_columns_into(output);
+    }
+
+    /// Extract auxiliary columns directly into pre-allocated output buffers.
+    ///
+    /// Eliminates the T1 transpose allocation that `columns_aux()` performs.
+    /// When `output` buffers have sufficient capacity, no heap allocation occurs.
+    pub fn extract_columns_aux_into(&self, output: &mut [Vec<FieldElement<E>>]) {
+        self.aux_table.extract_columns_into(output);
+    }
 }
 pub struct LDETraceTable<F, E>
 where

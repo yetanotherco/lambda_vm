@@ -18,6 +18,38 @@ use super::{
     frame::Frame, proof::options::ProofOptions, trace::TraceTable,
 };
 
+/// Deduplicated zerofier evaluations: unique zerofier vectors indexed by constraint.
+///
+/// Multiple constraints often share the same zerofier (same period, offset, and exemptions).
+/// Instead of cloning a `Vec<FieldElement<F>>` per constraint, this struct stores each unique
+/// zerofier vector once and maps each constraint index to its group.
+pub struct ZerofierEvaluations<F: IsField> {
+    /// Unique zerofier evaluation vectors (deduplicated).
+    pub groups: Vec<Vec<FieldElement<F>>>,
+    /// constraint_idx → group index.
+    pub constraint_to_group: Vec<usize>,
+}
+
+impl<F: IsField> ZerofierEvaluations<F> {
+    #[inline]
+    pub fn get(&self, constraint_idx: usize, lde_idx: usize) -> &FieldElement<F> {
+        let group = &self.groups[self.constraint_to_group[constraint_idx]];
+        &group[lde_idx % group.len()]
+    }
+
+    /// Returns true if all constraints share the same zerofier group.
+    pub fn is_uniform(&self) -> bool {
+        self.groups.len() == 1
+    }
+
+    /// Fast path for uniform case: all constraints share one zerofier.
+    #[inline]
+    pub fn get_uniform(&self, lde_idx: usize) -> &FieldElement<F> {
+        let group = &self.groups[0];
+        &group[lde_idx % group.len()]
+    }
+}
+
 type ZerofierGroupKey = (usize, usize, Option<usize>, Option<usize>, usize);
 
 /// This enum is necessary because, while both the prover and verifier perform the same operations
@@ -159,6 +191,23 @@ pub trait AIR: Send + Sync {
         evaluations
     }
 
+    /// Evaluate all transition constraints into a caller-provided buffer.
+    ///
+    /// Same as `compute_transition` but reuses a pre-allocated buffer, avoiding
+    /// a `Vec` allocation per LDE domain point in the prover's hot loop.
+    fn compute_transition_into(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
+        evaluations: &mut [FieldElement<Self::FieldExtension>],
+    ) {
+        for e in evaluations.iter_mut() {
+            *e = FieldElement::zero();
+        }
+        self.transition_constraints()
+            .iter()
+            .for_each(|c| c.evaluate(evaluation_context, evaluations));
+    }
+
     fn boundary_constraints(
         &self,
         pub_inputs: &Self::PublicInputs,
@@ -255,5 +304,41 @@ pub trait AIR: Send + Sync {
         });
 
         evals
+    }
+
+    /// Compute zerofier evaluations as deduplicated groups with index mapping.
+    ///
+    /// This replaces `transition_zerofier_evaluations` for the prover's constraint
+    /// evaluation loop. Instead of cloning `Vec<FieldElement<F>>` per constraint,
+    /// each unique zerofier is computed once and constraints map to group indices.
+    fn transition_zerofier_evaluations_grouped(
+        &self,
+        domain: &Domain<Self::Field>,
+    ) -> ZerofierEvaluations<Self::Field> {
+        let num_constraints = self.num_transition_constraints();
+        let mut constraint_to_group = vec![0usize; num_constraints];
+        let mut zerofier_groups_map: HashMap<ZerofierGroupKey, usize> = HashMap::new();
+        let mut groups: Vec<Vec<FieldElement<Self::Field>>> = Vec::new();
+
+        self.transition_constraints().iter().for_each(|c| {
+            let key = (
+                c.period(),
+                c.offset(),
+                c.exemptions_period(),
+                c.periodic_exemptions_offset(),
+                c.end_exemptions(),
+            );
+            let group_idx = *zerofier_groups_map.entry(key).or_insert_with(|| {
+                let idx = groups.len();
+                groups.push(c.zerofier_evaluations_on_extended_domain(domain));
+                idx
+            });
+            constraint_to_group[c.constraint_idx()] = group_idx;
+        });
+
+        ZerofierEvaluations {
+            groups,
+            constraint_to_group,
+        }
     }
 }

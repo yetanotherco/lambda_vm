@@ -248,6 +248,54 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         Ok(())
     }
 
+    /// In-place coset LDE: the buffer already contains N evaluation points at `[0..N]`.
+    ///
+    /// This expands the buffer from N elements to `N * blowup_factor` by performing:
+    /// 1. iFFT on buffer[..N]
+    /// 2. Scale by pre-computed weights
+    /// 3. Zero-pad to N * blowup_factor
+    /// 4. Forward FFT on the full buffer
+    ///
+    /// Unlike [`coset_lde_full_into`], this skips the `clear + extend_from_slice` step
+    /// since data is already in the buffer. Used for transpose elimination: columns are
+    /// extracted directly into pool buffers, then expanded in-place.
+    pub fn coset_lde_full_expand<F: IsFFTField + IsSubFieldOf<E>>(
+        buffer: &mut Vec<FieldElement<E>>,
+        blowup_factor: usize,
+        weights: &[FieldElement<F>],
+        inv_twiddles: &LayerTwiddles<F>,
+        fwd_twiddles: &LayerTwiddles<F>,
+    ) -> Result<(), FFTError> {
+        let n = buffer.len();
+        if n == 0 {
+            return Ok(());
+        }
+        debug_assert!(n.is_power_of_two());
+        let lde_size = n * blowup_factor;
+
+        if (lde_size.trailing_zeros() as u64) > F::TWO_ADICITY {
+            return Err(FFTError::DomainSizeError(lde_size.trailing_zeros() as usize));
+        }
+
+        // 1. iFFT on buffer[..n]
+        in_place_bit_reverse_permute(&mut buffer[..n]);
+        bowers_ifft_opt(&mut buffer[..n], inv_twiddles)?;
+
+        // 2. Scale using pre-computed weights (base field) — F × E → E mixed multiplication.
+        for (coeff, w) in buffer[..n].iter_mut().zip(weights.iter()) {
+            *coeff = w * &*coeff;
+        }
+
+        // 3. Zero-pad to lde_size
+        buffer.resize(lde_size, FieldElement::zero());
+
+        // 4. Forward FFT on the full buffer
+        bowers_fft_opt_fused(buffer, fwd_twiddles)?;
+        in_place_bit_reverse_permute(buffer);
+
+        Ok(())
+    }
+
     /// Multiplies two polynomials using FFT.
     /// It's faster than naive multiplication when the degree of the polynomials is large enough (>=2**6).
     /// This works best with polynomials whose highest degree is equal to a power of 2 - 1.
