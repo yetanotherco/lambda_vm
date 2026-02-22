@@ -1343,7 +1343,7 @@ impl Traces {
         bitwise_ops.extend(collect_bitwise_from_page(elf, &memory_state));
 
         // =====================================================================
-        // PHASE 5: Generate final traces
+        // PHASE 5: Generate final traces (parallelized)
         // =====================================================================
 
         // Extract halt timestamp from the last ECALL instruction
@@ -1352,35 +1352,93 @@ impl Traces {
             .rev()
             .find(|op| op.decode.op_ecall)
             .ok_or(Error::MissingHaltEcall)?;
-        let halt_trace = halt::generate_halt_trace(halt_op.timestamp);
+        let halt_timestamp = halt_op.timestamp;
 
-        let cpu = cpu::generate_cpu_trace(&cpu_ops);
-        let lt = lt::generate_lt_trace(&lt_ops);
-        let memw = memw::generate_memw_trace(&memw_ops);
-        let load = load::generate_load_trace(&load_ops);
-        let mul = mul::generate_mul_trace(&mul_ops);
-        let dvrm = dvrm::generate_dvrm_trace(&dvrm_ops);
-        let branch = branch::generate_branch_trace(&branch_ops);
-
-        let mut bitwise = bitwise::generate_bitwise_trace();
-        bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
-
-        // Update DECODE multiplicities
-        // Each CPU operation looks up the DECODE table once
-        // Padding rows also look up pc=1 (the CPU padding entry)
-        let mut decode = decode_trace;
-        let pc_to_row = decode_pc_to_row;
+        // Prepare decode multiplicity data before scope (needs cpu_ops borrow)
         let num_padding_rows = cpu_ops.len().next_power_of_two() - cpu_ops.len();
         let mut decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
         decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
-        decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
 
-        // Generate PAGE tables from ELF and final memory state
-        let (pages, page_configs) = generate_page_tables(elf, &memory_state);
-
-        // Generate REGISTER table from final register state
+        // Prepare register final state before scope (needs register_state ownership)
         let register_final_state = register_state.to_final_state_map();
-        let register_trace = register::generate_register_trace(&register_final_state);
+
+        // Generate independent traces in parallel.
+        // Each generate_*_trace takes &[Ops] and returns a TraceTable — fully independent.
+        let (cpu, lt, memw, load, mul, dvrm, branch, mut bitwise, pages, page_configs, register_trace, halt_trace);
+        #[cfg(feature = "parallel")]
+        {
+            let (
+                ((cpu_val, lt_val), (memw_val, load_val)),
+                (((mul_val, dvrm_val), (branch_val, bitwise_val)), ((pages_val, register_val), halt_val)),
+            ) = rayon::join(
+                || rayon::join(
+                    || rayon::join(
+                        || cpu::generate_cpu_trace(&cpu_ops),
+                        || lt::generate_lt_trace(&lt_ops),
+                    ),
+                    || rayon::join(
+                        || memw::generate_memw_trace(&memw_ops),
+                        || load::generate_load_trace(&load_ops),
+                    ),
+                ),
+                || rayon::join(
+                    || rayon::join(
+                        || rayon::join(
+                            || mul::generate_mul_trace(&mul_ops),
+                            || dvrm::generate_dvrm_trace(&dvrm_ops),
+                        ),
+                        || rayon::join(
+                            || branch::generate_branch_trace(&branch_ops),
+                            || bitwise::generate_bitwise_trace(),
+                        ),
+                    ),
+                    || rayon::join(
+                        || rayon::join(
+                            || generate_page_tables(elf, &memory_state),
+                            || register::generate_register_trace(&register_final_state),
+                        ),
+                        || halt::generate_halt_trace(halt_timestamp),
+                    ),
+                ),
+            );
+            cpu = cpu_val;
+            lt = lt_val;
+            memw = memw_val;
+            load = load_val;
+            mul = mul_val;
+            dvrm = dvrm_val;
+            branch = branch_val;
+            bitwise = bitwise_val;
+            let (pages_val, page_configs_val) = pages_val;
+            pages = pages_val;
+            page_configs = page_configs_val;
+            register_trace = register_val;
+            halt_trace = halt_val;
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            cpu = cpu::generate_cpu_trace(&cpu_ops);
+            lt = lt::generate_lt_trace(&lt_ops);
+            memw = memw::generate_memw_trace(&memw_ops);
+            load = load::generate_load_trace(&load_ops);
+            mul = mul::generate_mul_trace(&mul_ops);
+            dvrm = dvrm::generate_dvrm_trace(&dvrm_ops);
+            branch = branch::generate_branch_trace(&branch_ops);
+            bitwise = bitwise::generate_bitwise_trace();
+            let (pages_val, page_configs_val) = generate_page_tables(elf, &memory_state);
+            pages = pages_val;
+            page_configs = page_configs_val;
+            register_trace = register::generate_register_trace(&register_final_state);
+            halt_trace = halt::generate_halt_trace(halt_timestamp);
+        }
+
+        // Sequential: update multiplicities (requires &mut to the trace)
+        bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
+
+        // Update DECODE multiplicities
+        let mut decode = decode_trace;
+        let pc_to_row = decode_pc_to_row;
+        decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
 
         Ok(Traces {
             cpu,
@@ -1497,7 +1555,7 @@ impl Traces {
         bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
 
         // =====================================================================
-        // PHASE 5: Generate final traces
+        // PHASE 5: Generate final traces (parallelized)
         // =====================================================================
 
         // Extract halt timestamp from the last ECALL instruction
@@ -1506,36 +1564,87 @@ impl Traces {
             .rev()
             .find(|op| op.decode.op_ecall)
             .ok_or(Error::MissingHaltEcall)?;
-        let halt_trace = halt::generate_halt_trace(halt_op.timestamp);
+        let halt_timestamp = halt_op.timestamp;
 
-        let cpu = cpu::generate_cpu_trace(&cpu_ops);
-        let lt = lt::generate_lt_trace(&lt_ops);
-        let memw = memw::generate_memw_trace(&memw_ops);
-        let load = load::generate_load_trace(&load_ops);
-        let mul = mul::generate_mul_trace(&mul_ops);
-        let dvrm = dvrm::generate_dvrm_trace(&dvrm_ops);
-        let branch = branch::generate_branch_trace(&branch_ops);
-
-        let mut bitwise = bitwise::generate_bitwise_trace();
-        bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
-
-        // Generate DECODE trace and update multiplicities
-        // Each CPU operation looks up the DECODE table once
-        // Padding rows also look up pc=1 (the CPU padding entry)
-        let (mut decode, pc_to_row) = decode::generate_decode_trace(&instructions);
+        // Prepare decode and register data before parallel section
         let num_padding_rows = cpu_ops.len().next_power_of_two() - cpu_ops.len();
         let mut decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
         decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
-        decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
+        let register_final_state = register_state.to_final_state_map();
+
+        let (cpu, lt, memw, load, mul, dvrm, branch, mut bitwise, register_trace, mut decode, halt_trace);
+        #[cfg(feature = "parallel")]
+        {
+            let (((cpu_val, lt_val), (memw_val, load_val)), (((mul_val, dvrm_val), (branch_val, bitwise_val)), (register_val, (decode_val, halt_val)))) =
+                rayon::join(
+                    || rayon::join(
+                        || rayon::join(
+                            || cpu::generate_cpu_trace(&cpu_ops),
+                            || lt::generate_lt_trace(&lt_ops),
+                        ),
+                        || rayon::join(
+                            || memw::generate_memw_trace(&memw_ops),
+                            || load::generate_load_trace(&load_ops),
+                        ),
+                    ),
+                    || rayon::join(
+                        || rayon::join(
+                            || rayon::join(
+                                || mul::generate_mul_trace(&mul_ops),
+                                || dvrm::generate_dvrm_trace(&dvrm_ops),
+                            ),
+                            || rayon::join(
+                                || branch::generate_branch_trace(&branch_ops),
+                                || bitwise::generate_bitwise_trace(),
+                            ),
+                        ),
+                        || rayon::join(
+                            || register::generate_register_trace(&register_final_state),
+                            || rayon::join(
+                                || decode::generate_decode_trace(&instructions),
+                                || halt::generate_halt_trace(halt_timestamp),
+                            ),
+                        ),
+                    ),
+                );
+            cpu = cpu_val;
+            lt = lt_val;
+            memw = memw_val;
+            load = load_val;
+            mul = mul_val;
+            dvrm = dvrm_val;
+            branch = branch_val;
+            bitwise = bitwise_val;
+            register_trace = register_val;
+            let (decode_trace_val, pc_to_row_val) = decode_val;
+            decode = decode_trace_val;
+            decode::update_multiplicities(&mut decode, &pc_to_row_val, &decode_lookups);
+            halt_trace = halt_val;
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            cpu = cpu::generate_cpu_trace(&cpu_ops);
+            lt = lt::generate_lt_trace(&lt_ops);
+            memw = memw::generate_memw_trace(&memw_ops);
+            load = load::generate_load_trace(&load_ops);
+            mul = mul::generate_mul_trace(&mul_ops);
+            dvrm = dvrm::generate_dvrm_trace(&dvrm_ops);
+            branch = branch::generate_branch_trace(&branch_ops);
+            bitwise = bitwise::generate_bitwise_trace();
+            register_trace = register::generate_register_trace(&register_final_state);
+            let (decode_trace_val, pc_to_row_val) = decode::generate_decode_trace(&instructions);
+            decode = decode_trace_val;
+            decode::update_multiplicities(&mut decode, &pc_to_row_val, &decode_lookups);
+            halt_trace = halt::generate_halt_trace(halt_timestamp);
+        }
+
+        // Sequential: update multiplicities (requires &mut to the trace)
+        bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
 
         // Create empty PAGE tables for legacy API
         // (caller should use from_elf_and_logs for proper PAGE table support)
         let pages = Vec::new();
         let page_configs = Vec::new();
-
-        // Generate REGISTER table from final register state
-        let register_final_state = register_state.to_final_state_map();
-        let register_trace = register::generate_register_trace(&register_final_state);
 
         Ok(Traces {
             cpu,

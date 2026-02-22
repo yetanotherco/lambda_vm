@@ -972,26 +972,31 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        // TODO: Remove clones
-        let mut lde_composition_poly_evaluations = Vec::new();
-        for i in 0..lde_composition_poly_parts_evaluations[0].len() {
-            let mut row = Vec::new();
-            for evaluation in lde_composition_poly_parts_evaluations.iter() {
-                row.push(evaluation[i].clone());
+        let num_parts = lde_composition_poly_parts_evaluations.len();
+        let num_rows = lde_composition_poly_parts_evaluations[0].len();
+
+        // Transpose columns → rows with pre-allocated capacity.
+        let mut rows: Vec<Vec<FieldElement<FieldExtension>>> = Vec::with_capacity(num_rows);
+        for i in 0..num_rows {
+            let mut row = Vec::with_capacity(num_parts);
+            for part in lde_composition_poly_parts_evaluations.iter() {
+                row.push(part[i].clone());
             }
-            lde_composition_poly_evaluations.push(row);
+            rows.push(row);
         }
 
-        in_place_bit_reverse_permute(&mut lde_composition_poly_evaluations);
+        in_place_bit_reverse_permute(&mut rows);
 
-        let mut lde_composition_poly_evaluations_merged = Vec::new();
-        for chunk in lde_composition_poly_evaluations.chunks(2) {
-            let (mut chunk0, chunk1) = (chunk[0].clone(), &chunk[1]);
-            chunk0.extend_from_slice(chunk1);
-            lde_composition_poly_evaluations_merged.push(chunk0);
+        // Merge consecutive pairs: [row0, row1] → row0 ++ row1.
+        // Drain pairs from the original vec to avoid cloning.
+        let mut merged: Vec<Vec<FieldElement<FieldExtension>>> = Vec::with_capacity(num_rows / 2);
+        let mut iter = rows.into_iter();
+        while let (Some(mut first), Some(second)) = (iter.next(), iter.next()) {
+            first.extend(second);
+            merged.push(first);
         }
 
-        Self::batch_commit_extension(&lde_composition_poly_evaluations_merged)
+        Self::batch_commit_extension(&merged)
     }
 
     /// Algebraically decompose H(x) = H₀(x²) + x·H₁(x²) on the LDE coset, then
