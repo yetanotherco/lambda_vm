@@ -9,7 +9,7 @@ use math::{
     polynomial::Polynomial,
 };
 #[cfg(feature = "parallel")]
-use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
+use rayon::prelude::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
 /// A two-dimensional representation of an execution trace of the STARK
 /// protocol.
@@ -506,6 +506,16 @@ where
 
     // Extract trace-size evaluations from LDE for each column (stride = blowup_factor)
     // Main columns: Vec of N base-field evaluations per column
+    #[cfg(feature = "parallel")]
+    let main_col_evals: Vec<Vec<FieldElement<F>>> = (0..num_main_cols)
+        .into_par_iter()
+        .map(|col| {
+            (0..n)
+                .map(|i| lde_trace.get_main(i * bf, col).clone())
+                .collect()
+        })
+        .collect();
+    #[cfg(not(feature = "parallel"))]
     let main_col_evals: Vec<Vec<FieldElement<F>>> = (0..num_main_cols)
         .map(|col| {
             (0..n)
@@ -515,6 +525,16 @@ where
         .collect();
 
     // Aux columns: Vec of N extension-field evaluations per column
+    #[cfg(feature = "parallel")]
+    let aux_col_evals: Vec<Vec<FieldElement<E>>> = (0..num_aux_cols)
+        .into_par_iter()
+        .map(|col| {
+            (0..n)
+                .map(|i| lde_trace.get_aux(i * bf, col).clone())
+                .collect()
+        })
+        .collect();
+    #[cfg(not(feature = "parallel"))]
     let aux_col_evals: Vec<Vec<FieldElement<E>>> = (0..num_aux_cols)
         .map(|col| {
             (0..n)
@@ -533,29 +553,67 @@ where
         // Precompute inv_denoms = 1/(eval_point - coset_point_i) — shared across all columns
         let inv_denoms = barycentric_inv_denoms(eval_point, &coset_points);
 
-        // Evaluate each main column
-        for col_evals in &main_col_evals {
-            table_data.push(interpolate_coset_eval(
-                &z_pow_n,
-                &coset_offset_pow_n_ext,
-                &n_inv,
-                &coset_points,
-                col_evals,
-                &inv_denoms,
-            ));
-        }
+        // Evaluate all main columns in parallel (each barycentric eval is O(N) work)
+        #[cfg(feature = "parallel")]
+        let main_evals: Vec<FieldElement<E>> = main_col_evals
+            .par_iter()
+            .map(|col_evals| {
+                interpolate_coset_eval(
+                    &z_pow_n,
+                    &coset_offset_pow_n_ext,
+                    &n_inv,
+                    &coset_points,
+                    col_evals,
+                    &inv_denoms,
+                )
+            })
+            .collect();
+        #[cfg(not(feature = "parallel"))]
+        let main_evals: Vec<FieldElement<E>> = main_col_evals
+            .iter()
+            .map(|col_evals| {
+                interpolate_coset_eval(
+                    &z_pow_n,
+                    &coset_offset_pow_n_ext,
+                    &n_inv,
+                    &coset_points,
+                    col_evals,
+                    &inv_denoms,
+                )
+            })
+            .collect();
+        table_data.extend(main_evals);
 
-        // Evaluate each aux column (coset_points in base field, evals in extension)
-        for col_evals in &aux_col_evals {
-            table_data.push(interpolate_coset_eval_ext(
-                &z_pow_n,
-                &coset_offset_pow_n_ext,
-                &n_inv,
-                &coset_points,
-                col_evals,
-                &inv_denoms,
-            ));
-        }
+        // Evaluate all aux columns in parallel
+        #[cfg(feature = "parallel")]
+        let aux_evals: Vec<FieldElement<E>> = aux_col_evals
+            .par_iter()
+            .map(|col_evals| {
+                interpolate_coset_eval_ext(
+                    &z_pow_n,
+                    &coset_offset_pow_n_ext,
+                    &n_inv,
+                    &coset_points,
+                    col_evals,
+                    &inv_denoms,
+                )
+            })
+            .collect();
+        #[cfg(not(feature = "parallel"))]
+        let aux_evals: Vec<FieldElement<E>> = aux_col_evals
+            .iter()
+            .map(|col_evals| {
+                interpolate_coset_eval_ext(
+                    &z_pow_n,
+                    &coset_offset_pow_n_ext,
+                    &n_inv,
+                    &coset_points,
+                    col_evals,
+                    &inv_denoms,
+                )
+            })
+            .collect();
+        table_data.extend(aux_evals);
     }
 
     Table::new(table_data, table_width)
