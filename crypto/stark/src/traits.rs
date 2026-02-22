@@ -208,6 +208,49 @@ pub trait AIR: Send + Sync {
             .for_each(|c| c.evaluate(evaluation_context, evaluations));
     }
 
+    /// Evaluate transition constraints into split base-field and extension-field buffers.
+    ///
+    /// Constraints that return `computes_in_base_field() == true` write to `base_evaluations`,
+    /// enabling F×E mixed arithmetic in the accumulation step (3 base muls vs 9 for E×E).
+    fn compute_transition_split(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
+        base_evaluations: &mut [FieldElement<Self::Field>],
+        ext_evaluations: &mut [FieldElement<Self::FieldExtension>],
+    ) {
+        for e in base_evaluations.iter_mut() {
+            *e = FieldElement::zero();
+        }
+        for e in ext_evaluations.iter_mut() {
+            *e = FieldElement::zero();
+        }
+        self.transition_constraints()
+            .iter()
+            .for_each(|c| {
+                if c.computes_in_base_field() {
+                    c.evaluate_base(evaluation_context, base_evaluations);
+                } else {
+                    c.evaluate(evaluation_context, ext_evaluations);
+                }
+            });
+    }
+
+    /// Returns pre-computed partition of constraint indices into base-field and extension-field groups.
+    ///
+    /// This is called once and cached, enabling branchless accumulation loops.
+    fn constraint_field_partition(&self) -> (Vec<usize>, Vec<usize>) {
+        let mut base_indices = Vec::new();
+        let mut ext_indices = Vec::new();
+        for c in self.transition_constraints().iter() {
+            if c.computes_in_base_field() {
+                base_indices.push(c.constraint_idx());
+            } else {
+                ext_indices.push(c.constraint_idx());
+            }
+        }
+        (base_indices, ext_indices)
+    }
+
     fn boundary_constraints(
         &self,
         pub_inputs: &Self::PublicInputs,

@@ -36,8 +36,9 @@ where
 {
     /// Evaluate transition + boundary constraints across the entire LDE domain.
     ///
-    /// Uses `map_init` for per-thread buffer reuse (transition evaluations + periodic values)
-    /// and `ZerofierEvaluations` for deduplicated zerofier access.
+    /// Uses split base/extension buffers: base-field constraints use F×E mixed arithmetic
+    /// (3 base muls per term) vs E×E (9 base muls) for extension-field constraints.
+    /// Per-thread buffer reuse via `map_init` and `ZerofierEvaluations` for dedup.
     #[allow(clippy::too_many_arguments)]
     fn evaluate_transitions(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
@@ -50,6 +51,8 @@ where
         num_transition: usize,
         num_periodic: usize,
         offsets: &[usize],
+        base_constraint_indices: &[usize],
+        ext_constraint_indices: &[usize],
     ) -> Vec<FieldElement<FieldExtension>> {
         let is_uniform = zerofier_data.is_uniform();
 
@@ -63,11 +66,12 @@ where
                 .map_init(
                     || {
                         (
+                            vec![FieldElement::<Field>::zero(); num_transition],
                             vec![FieldElement::<FieldExtension>::zero(); num_transition],
                             vec![FieldElement::<Field>::zero(); num_periodic],
                         )
                     },
-                    |(transition_buf, periodic_buf), (i, boundary)| {
+                    |(base_buf, ext_buf, periodic_buf), (i, boundary)| {
                         let frame = Frame::read_from_lde(lde_trace, i, offsets);
 
                         for (j, col) in lde_periodic_columns.iter().enumerate() {
@@ -79,29 +83,34 @@ where
                             periodic_buf,
                             rap_challenges,
                         );
-                        air.compute_transition_into(&ctx, transition_buf);
+                        air.compute_transition_split(&ctx, base_buf, ext_buf);
 
                         let acc_transition = if is_uniform {
-                            // All constraints share one zerofier: factor it out of the sum.
                             let z = zerofier_data.get_uniform(i);
-                            let sum = transition_buf
-                                .iter()
-                                .zip(transition_coefficients)
-                                .fold(FieldElement::zero(), |acc, (eval, beta)| {
-                                    acc + eval * beta
-                                });
+                            // F×E accumulation for base-field constraints (3 base muls each)
+                            let mut sum = FieldElement::<FieldExtension>::zero();
+                            for &idx in base_constraint_indices {
+                                sum = sum + &base_buf[idx] * &transition_coefficients[idx];
+                            }
+                            // E×E accumulation for extension-field constraints (9 base muls each)
+                            for &idx in ext_constraint_indices {
+                                sum = sum + &ext_buf[idx] * &transition_coefficients[idx];
+                            }
                             z * &sum
                         } else {
-                            transition_buf
-                                .iter()
-                                .enumerate()
-                                .zip(transition_coefficients)
-                                .fold(
-                                    FieldElement::zero(),
-                                    |acc, ((c_idx, eval), beta)| {
-                                        acc + zerofier_data.get(c_idx, i) * eval * beta
-                                    },
-                                )
+                            let mut acc = FieldElement::<FieldExtension>::zero();
+                            for &idx in base_constraint_indices {
+                                acc = acc
+                                    + zerofier_data.get(idx, i)
+                                        * &(&base_buf[idx] * &transition_coefficients[idx]);
+                            }
+                            for &idx in ext_constraint_indices {
+                                acc = acc
+                                    + zerofier_data.get(idx, i)
+                                        * &ext_buf[idx]
+                                        * &transition_coefficients[idx];
+                            }
+                            acc
                         };
 
                         acc_transition + boundary
@@ -113,7 +122,8 @@ where
 
         #[cfg(not(feature = "parallel"))]
         {
-            let mut transition_buf =
+            let mut base_buf = vec![FieldElement::<Field>::zero(); num_transition];
+            let mut ext_buf =
                 vec![FieldElement::<FieldExtension>::zero(); num_transition];
             let mut periodic_buf = vec![FieldElement::<Field>::zero(); num_periodic];
 
@@ -132,28 +142,32 @@ where
                         &periodic_buf,
                         rap_challenges,
                     );
-                    air.compute_transition_into(&ctx, &mut transition_buf);
+                    air.compute_transition_split(&ctx, &mut base_buf, &mut ext_buf);
 
                     let acc_transition = if is_uniform {
                         let z = zerofier_data.get_uniform(i);
-                        let sum = transition_buf
-                            .iter()
-                            .zip(transition_coefficients)
-                            .fold(FieldElement::zero(), |acc, (eval, beta)| {
-                                acc + eval * beta
-                            });
+                        let mut sum = FieldElement::<FieldExtension>::zero();
+                        for &idx in base_constraint_indices {
+                            sum = sum + &base_buf[idx] * &transition_coefficients[idx];
+                        }
+                        for &idx in ext_constraint_indices {
+                            sum = sum + &ext_buf[idx] * &transition_coefficients[idx];
+                        }
                         z * &sum
                     } else {
-                        transition_buf
-                            .iter()
-                            .enumerate()
-                            .zip(transition_coefficients)
-                            .fold(
-                                FieldElement::zero(),
-                                |acc, ((c_idx, eval), beta)| {
-                                    acc + zerofier_data.get(c_idx, i) * eval * beta
-                                },
-                            )
+                        let mut acc = FieldElement::<FieldExtension>::zero();
+                        for &idx in base_constraint_indices {
+                            acc = acc
+                                + zerofier_data.get(idx, i)
+                                    * &(&base_buf[idx] * &transition_coefficients[idx]);
+                        }
+                        for &idx in ext_constraint_indices {
+                            acc = acc
+                                + zerofier_data.get(idx, i)
+                                    * &ext_buf[idx]
+                                    * &transition_coefficients[idx];
+                        }
+                        acc
                     };
 
                     acc_transition + boundary
@@ -315,6 +329,11 @@ where
         let num_periodic = lde_periodic_columns.len();
         let offsets = &air.context().transition_offsets;
 
+        // Pre-compute partition: base-field vs extension-field constraints.
+        // This avoids per-iteration branches in the hot accumulation loops.
+        let (base_constraint_indices, ext_constraint_indices) =
+            air.constraint_field_partition();
+
         let evaluations_t = Self::evaluate_transitions(
             air,
             lde_trace,
@@ -326,6 +345,8 @@ where
             num_transition,
             num_periodic,
             offsets,
+            &base_constraint_indices,
+            &ext_constraint_indices,
         );
 
         #[cfg(feature = "instruments")]

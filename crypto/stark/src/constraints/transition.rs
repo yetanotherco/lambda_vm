@@ -37,6 +37,27 @@ where
         transition_evaluations: &mut [FieldElement<E>],
     );
 
+    /// Whether this constraint computes purely in the base field F.
+    ///
+    /// When true, the evaluator uses F×E mixed arithmetic for accumulation
+    /// (3 base muls per term vs 9 for E×E), giving ~3× speedup on the
+    /// constraint combination step.
+    fn computes_in_base_field(&self) -> bool {
+        false
+    }
+
+    /// Evaluate the constraint in the base field (prover path only).
+    ///
+    /// Only called when `computes_in_base_field()` returns true.
+    /// Writes the result to `transition_evaluations[constraint_idx()]`.
+    fn evaluate_base(
+        &self,
+        _evaluation_context: &TransitionEvaluationContext<F, E>,
+        _transition_evaluations: &mut [FieldElement<F>],
+    ) {
+        // Default no-op; override for base-field constraints.
+    }
+
     /// The periodicity the constraint is applied over the trace.
     ///
     /// Default value is 1, meaning that the constraint is applied to every

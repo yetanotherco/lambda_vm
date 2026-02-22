@@ -185,29 +185,29 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for BranchCondCo
         0
     }
 
+    fn computes_in_base_field(&self) -> bool {
+        true
+    }
+
+    fn evaluate_base(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        transition_evaluations: &mut [FieldElement<GoldilocksField>],
+    ) {
+        if let TransitionEvaluationContext::Prover { frame, .. } = evaluation_context {
+            transition_evaluations[self.constraint_idx] =
+                self.compute(frame.get_evaluation_step(0));
+        }
+    }
+
     fn evaluate(
         &self,
         evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
         transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
     ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-            }
-
-            TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
-            }
+        if let TransitionEvaluationContext::Verifier { frame, .. } = evaluation_context {
+            let constraint_value = self.compute(frame.get_evaluation_step(0));
+            transition_evaluations[self.constraint_idx] = constraint_value;
         }
     }
 }
@@ -251,29 +251,29 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for EbreakConstr
         0
     }
 
+    fn computes_in_base_field(&self) -> bool {
+        true
+    }
+
+    fn evaluate_base(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        transition_evaluations: &mut [FieldElement<GoldilocksField>],
+    ) {
+        if let TransitionEvaluationContext::Prover { frame, .. } = evaluation_context {
+            transition_evaluations[self.constraint_idx] =
+                self.compute(frame.get_evaluation_step(0));
+        }
+    }
+
     fn evaluate(
         &self,
         evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
         transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
     ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-            }
-
-            TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
-            }
+        if let TransitionEvaluationContext::Verifier { frame, .. } = evaluation_context {
+            let constraint_value = self.compute(frame.get_evaluation_step(0));
+            transition_evaluations[self.constraint_idx] = constraint_value;
         }
     }
 }
@@ -339,29 +339,29 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg1LowerCon
         0
     }
 
+    fn computes_in_base_field(&self) -> bool {
+        true
+    }
+
+    fn evaluate_base(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        transition_evaluations: &mut [FieldElement<GoldilocksField>],
+    ) {
+        if let TransitionEvaluationContext::Prover { frame, .. } = evaluation_context {
+            transition_evaluations[self.constraint_idx] =
+                self.compute(frame.get_evaluation_step(0));
+        }
+    }
+
     fn evaluate(
         &self,
         evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
         transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
     ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-            }
-
-            TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
-            }
+        if let TransitionEvaluationContext::Verifier { frame, .. } = evaluation_context {
+            let constraint_value = self.compute(frame.get_evaluation_step(0));
+            transition_evaluations[self.constraint_idx] = constraint_value;
         }
     }
 }
@@ -431,29 +431,29 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg1UpperCon
         0
     }
 
+    fn computes_in_base_field(&self) -> bool {
+        true
+    }
+
+    fn evaluate_base(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        transition_evaluations: &mut [FieldElement<GoldilocksField>],
+    ) {
+        if let TransitionEvaluationContext::Prover { frame, .. } = evaluation_context {
+            transition_evaluations[self.constraint_idx] =
+                self.compute(frame.get_evaluation_step(0));
+        }
+    }
+
     fn evaluate(
         &self,
         evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
         transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
     ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-            }
-
-            TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
-            }
+        if let TransitionEvaluationContext::Verifier { frame, .. } = evaluation_context {
+            let constraint_value = self.compute(frame.get_evaluation_step(0));
+            transition_evaluations[self.constraint_idx] = constraint_value;
         }
     }
 }
@@ -509,29 +509,29 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for SltResZeroCo
         0
     }
 
+    fn computes_in_base_field(&self) -> bool {
+        true
+    }
+
+    fn evaluate_base(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        transition_evaluations: &mut [FieldElement<GoldilocksField>],
+    ) {
+        if let TransitionEvaluationContext::Prover { frame, .. } = evaluation_context {
+            transition_evaluations[self.constraint_idx] =
+                self.compute(frame.get_evaluation_step(0));
+        }
+    }
+
     fn evaluate(
         &self,
         evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
         transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
     ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-            }
-
-            TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
-            }
+        if let TransitionEvaluationContext::Verifier { frame, .. } = evaluation_context {
+            let constraint_value = self.compute(frame.get_evaluation_step(0));
+            transition_evaluations[self.constraint_idx] = constraint_value;
         }
     }
 }
@@ -602,29 +602,29 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for SignBitZeroC
         0
     }
 
+    fn computes_in_base_field(&self) -> bool {
+        true
+    }
+
+    fn evaluate_base(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        transition_evaluations: &mut [FieldElement<GoldilocksField>],
+    ) {
+        if let TransitionEvaluationContext::Prover { frame, .. } = evaluation_context {
+            transition_evaluations[self.constraint_idx] =
+                self.compute(frame.get_evaluation_step(0));
+        }
+    }
+
     fn evaluate(
         &self,
         evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
         transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
     ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-            }
-
-            TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
-            }
+        if let TransitionEvaluationContext::Verifier { frame, .. } = evaluation_context {
+            let constraint_value = self.compute(frame.get_evaluation_step(0));
+            transition_evaluations[self.constraint_idx] = constraint_value;
         }
     }
 }
@@ -741,29 +741,29 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for NextPcAddCon
         0
     }
 
+    fn computes_in_base_field(&self) -> bool {
+        true
+    }
+
+    fn evaluate_base(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        transition_evaluations: &mut [FieldElement<GoldilocksField>],
+    ) {
+        if let TransitionEvaluationContext::Prover { frame, .. } = evaluation_context {
+            transition_evaluations[self.constraint_idx] =
+                self.compute(frame.get_evaluation_step(0));
+        }
+    }
+
     fn evaluate(
         &self,
         evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
         transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
     ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-            }
-
-            TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
-            }
+        if let TransitionEvaluationContext::Verifier { frame, .. } = evaluation_context {
+            let constraint_value = self.compute(frame.get_evaluation_step(0));
+            transition_evaluations[self.constraint_idx] = constraint_value;
         }
     }
 }
@@ -839,20 +839,29 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg2LowerCon
         0
     }
 
+    fn computes_in_base_field(&self) -> bool {
+        true
+    }
+
+    fn evaluate_base(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        transition_evaluations: &mut [FieldElement<GoldilocksField>],
+    ) {
+        if let TransitionEvaluationContext::Prover { frame, .. } = evaluation_context {
+            transition_evaluations[self.constraint_idx] =
+                self.compute(frame.get_evaluation_step(0));
+        }
+    }
+
     fn evaluate(
         &self,
         evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
         transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
     ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover { frame, .. } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-            }
-            TransitionEvaluationContext::Verifier { frame, .. } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
-            }
+        if let TransitionEvaluationContext::Verifier { frame, .. } = evaluation_context {
+            let constraint_value = self.compute(frame.get_evaluation_step(0));
+            transition_evaluations[self.constraint_idx] = constraint_value;
         }
     }
 }
@@ -930,20 +939,29 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg2UpperCon
         0
     }
 
+    fn computes_in_base_field(&self) -> bool {
+        true
+    }
+
+    fn evaluate_base(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        transition_evaluations: &mut [FieldElement<GoldilocksField>],
+    ) {
+        if let TransitionEvaluationContext::Prover { frame, .. } = evaluation_context {
+            transition_evaluations[self.constraint_idx] =
+                self.compute(frame.get_evaluation_step(0));
+        }
+    }
+
     fn evaluate(
         &self,
         evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
         transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
     ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover { frame, .. } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-            }
-            TransitionEvaluationContext::Verifier { frame, .. } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
-            }
+        if let TransitionEvaluationContext::Verifier { frame, .. } = evaluation_context {
+            let constraint_value = self.compute(frame.get_evaluation_step(0));
+            transition_evaluations[self.constraint_idx] = constraint_value;
         }
     }
 }
@@ -1007,20 +1025,29 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RvdLowerCons
         0
     }
 
+    fn computes_in_base_field(&self) -> bool {
+        true
+    }
+
+    fn evaluate_base(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        transition_evaluations: &mut [FieldElement<GoldilocksField>],
+    ) {
+        if let TransitionEvaluationContext::Prover { frame, .. } = evaluation_context {
+            transition_evaluations[self.constraint_idx] =
+                self.compute(frame.get_evaluation_step(0));
+        }
+    }
+
     fn evaluate(
         &self,
         evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
         transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
     ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover { frame, .. } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-            }
-            TransitionEvaluationContext::Verifier { frame, .. } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
-            }
+        if let TransitionEvaluationContext::Verifier { frame, .. } = evaluation_context {
+            let constraint_value = self.compute(frame.get_evaluation_step(0));
+            transition_evaluations[self.constraint_idx] = constraint_value;
         }
     }
 }
@@ -1088,20 +1115,29 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RvdUpperCons
         0
     }
 
+    fn computes_in_base_field(&self) -> bool {
+        true
+    }
+
+    fn evaluate_base(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        transition_evaluations: &mut [FieldElement<GoldilocksField>],
+    ) {
+        if let TransitionEvaluationContext::Prover { frame, .. } = evaluation_context {
+            transition_evaluations[self.constraint_idx] =
+                self.compute(frame.get_evaluation_step(0));
+        }
+    }
+
     fn evaluate(
         &self,
         evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
         transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
     ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover { frame, .. } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-            }
-            TransitionEvaluationContext::Verifier { frame, .. } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
-            }
+        if let TransitionEvaluationContext::Verifier { frame, .. } = evaluation_context {
+            let constraint_value = self.compute(frame.get_evaluation_step(0));
+            transition_evaluations[self.constraint_idx] = constraint_value;
         }
     }
 }
