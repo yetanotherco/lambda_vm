@@ -1,5 +1,12 @@
 use super::Polynomial;
-use math::field::{element::FieldElement, traits::IsField};
+use math::fft::cpu::{
+    bit_reversing::in_place_bit_reverse_permute,
+    roots_of_unity::get_powers_of_primitive_root_coset,
+};
+use math::field::{
+    element::FieldElement,
+    traits::{IsFFTField, IsField, IsSubFieldOf},
+};
 
 /// FRI polynomial folding: computes P_even(x) + beta * P_odd(x)
 /// where P(x) = P_even(x^2) + x * P_odd(x^2)
@@ -90,6 +97,59 @@ pub fn fold_polynomial_doubled_inplace<F>(
 
     // Truncate to the new length
     coefficients.truncate(new_len);
+}
+
+/// Evaluation-form FRI fold: given evaluations in bit-reversed order where
+/// consecutive pairs (2j, 2j+1) are conjugates (p(x_j), p(-x_j)), compute
+/// the folded evaluations: (lo + hi) + inv_twiddle[j] * zeta * (lo - hi)
+/// = 2 * (p_even(x_j²) + zeta * p_odd(x_j²))
+///
+/// After folding, the N/2 results are evaluations on the squared coset
+/// in bit-reversed order, preserving conjugate pairing for the next fold.
+pub fn fold_evaluations_in_place<F: IsSubFieldOf<E>, E: IsField>(
+    evals: &mut Vec<FieldElement<E>>,
+    zeta: &FieldElement<E>,
+    inv_twiddles: &[FieldElement<F>],
+) {
+    let half = evals.len() / 2;
+    for j in 0..half {
+        let lo = &evals[2 * j];
+        let hi = &evals[2 * j + 1];
+        let sum = lo + hi;
+        let diff = lo - hi;
+        evals[j] = &sum + &(&inv_twiddles[j] * &(zeta * &diff));
+    }
+    evals.truncate(half);
+}
+
+/// Compute inverse twiddle factors for evaluation-form FRI folding.
+///
+/// For a coset of size N with offset g, the twiddle factors are 1/x_j where
+/// x_j are the coset points at even bit-reversed positions. Specifically:
+/// generate g·w^i for i=0..N/2 (half the coset points), bit-reverse with
+/// (logN-1) bits, then batch-invert.
+pub fn compute_coset_twiddles_inv<F: IsFFTField>(
+    coset_offset: &FieldElement<F>,
+    domain_size: usize,
+) -> Vec<FieldElement<F>> {
+    let half = domain_size / 2;
+    let order = domain_size.trailing_zeros() as u64;
+    let mut points = get_powers_of_primitive_root_coset(order, half, coset_offset).unwrap();
+    in_place_bit_reverse_permute(&mut points);
+    FieldElement::inplace_batch_inverse(&mut points).unwrap();
+    points
+}
+
+/// Update inverse twiddle factors for the next FRI layer.
+///
+/// Between levels: new_tw[j'] = tw[2j']² (take even-indexed, square).
+/// This corresponds to the squared coset offset and halved domain.
+pub fn update_twiddles_in_place<F: IsField>(twiddles: &mut Vec<FieldElement<F>>) {
+    let new_len = twiddles.len() / 2;
+    for j in 0..new_len {
+        twiddles[j] = twiddles[2 * j].square();
+    }
+    twiddles.truncate(new_len);
 }
 
 #[cfg(test)]
@@ -185,5 +245,58 @@ mod tests {
         let beta = FE::new(4);
         fold_polynomial_doubled_inplace(&mut p, &beta);
         assert_eq!(p, Polynomial::new(&[FE::new(10)])); // 5 * 2 = 10
+    }
+
+    /// Verifies that evaluation-form folding produces the same result as
+    /// coefficient-form fold + FFT. This is the key correctness invariant:
+    /// both paths must produce identical FRI layer evaluations.
+    #[test]
+    fn test_eval_fold_matches_coeff_fold() {
+        use super::{compute_coset_twiddles_inv, fold_evaluations_in_place};
+        use math::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
+        use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
+
+        type GFE = FieldElement<GoldilocksField>;
+
+        // A degree-7 polynomial (8 coefficients)
+        let poly = Polynomial::new(&[
+            GFE::from(3u64),
+            GFE::from(1u64),
+            GFE::from(2u64),
+            GFE::from(7u64),
+            GFE::from(3u64),
+            GFE::from(5u64),
+            GFE::from(4u64),
+            GFE::from(2u64),
+        ]);
+        let domain_size = 8usize;
+        let coset_offset = GFE::from(7u64); // arbitrary nonzero offset
+        let zeta = GFE::from(13u64);
+
+        // Path A: coefficient fold + FFT + bit-reverse (old approach)
+        let mut poly_coeff = poly.clone();
+        fold_polynomial_doubled_inplace(&mut poly_coeff, &zeta);
+        let coset_offset_squared = coset_offset.square();
+        let mut coeff_evals = Polynomial::evaluate_offset_fft(
+            &poly_coeff,
+            1,
+            Some(domain_size / 2),
+            &coset_offset_squared,
+        )
+        .unwrap();
+        in_place_bit_reverse_permute(&mut coeff_evals);
+
+        // Path B: FFT + bit-reverse + eval fold (new approach)
+        let mut eval_evals =
+            Polynomial::evaluate_offset_fft(&poly, 1, Some(domain_size), &coset_offset).unwrap();
+        in_place_bit_reverse_permute(&mut eval_evals);
+        let inv_twiddles = compute_coset_twiddles_inv(&coset_offset, domain_size);
+        fold_evaluations_in_place(&mut eval_evals, &zeta, &inv_twiddles);
+
+        // Both paths must produce identical results
+        assert_eq!(coeff_evals.len(), eval_evals.len());
+        for (i, (a, b)) in coeff_evals.iter().zip(eval_evals.iter()).enumerate() {
+            assert_eq!(a, b, "Mismatch at index {i}: coeff={a:?}, eval={b:?}");
+        }
     }
 }
