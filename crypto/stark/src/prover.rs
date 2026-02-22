@@ -1489,8 +1489,8 @@ pub trait IsStarkProver<
             .collect();
 
         // Number of main and aux columns in the LDE trace
-        let num_main_cols = lde_trace.main_table.width;
-        let num_aux_cols = lde_trace.aux_table.width;
+        let num_main_cols = lde_trace.num_main_cols();
+        let num_aux_cols = lde_trace.num_aux_cols();
 
         // Precompute all inverse denominators via batch inversion.
         // Layout: [inv_h_0, ..., inv_h_{N-1}, inv_t0_0, ..., inv_t0_{N-1}, inv_t1_0, ..., ...]
@@ -1611,18 +1611,16 @@ pub trait IsStarkProver<
 
     /// Computes values and validity proofs of the evaluations of the trace polynomials
     /// at the domain value corresponding to the FRI query challenge `index` and its symmetric
-    /// element.
-    fn open_trace_polys<E>(
+    /// element. Gathers row data from column-major LDE storage.
+    fn open_trace_polys_main(
         domain: &Domain<Field>,
-        tree: &BatchedMerkleTree<E>,
-        lde_trace: &Table<E>,
+        tree: &BatchedMerkleTree<Field>,
+        lde_trace: &LDETraceTable<Field, FieldExtension>,
         challenge: usize,
-    ) -> PolynomialOpenings<E>
+    ) -> PolynomialOpenings<Field>
     where
         FieldElement<Field>: AsBytes + Sync + Send,
-        FieldElement<E>: AsBytes + Sync + Send,
-        Field: IsSubFieldOf<E>,
-        E: IsField,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
         let domain_size = domain.lde_roots_of_unity_coset.len();
 
@@ -1631,31 +1629,24 @@ pub trait IsStarkProver<
         PolynomialOpenings {
             proof: tree.get_proof_by_pos(index).unwrap(),
             proof_sym: tree.get_proof_by_pos(index_sym).unwrap(),
-            evaluations: lde_trace
-                .get_row(reverse_index(index, domain_size as u64))
-                .to_vec(),
+            evaluations: lde_trace.gather_main_row(reverse_index(index, domain_size as u64)),
             evaluations_sym: lde_trace
-                .get_row(reverse_index(index_sym, domain_size as u64))
-                .to_vec(),
+                .gather_main_row(reverse_index(index_sym, domain_size as u64)),
         }
     }
 
-    /// Variant of open_trace_polys that takes a column range for slicing.
-    /// Used for preprocessed tables where we need to open only a subset of columns
-    /// (either precomputed or multiplicities).
-    fn open_trace_polys_with_columns<E>(
+    /// Variant that opens only a range of main columns (for preprocessed tables).
+    fn open_trace_polys_main_range(
         domain: &Domain<Field>,
-        tree: &BatchedMerkleTree<E>,
-        lde_trace: &Table<E>,
+        tree: &BatchedMerkleTree<Field>,
+        lde_trace: &LDETraceTable<Field, FieldExtension>,
         challenge: usize,
         col_start: usize,
         col_end: usize,
-    ) -> PolynomialOpenings<E>
+    ) -> PolynomialOpenings<Field>
     where
         FieldElement<Field>: AsBytes + Sync + Send,
-        FieldElement<E>: AsBytes + Sync + Send,
-        Field: IsSubFieldOf<E>,
-        E: IsField,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
         let domain_size = domain.lde_roots_of_unity_coset.len();
 
@@ -1664,12 +1655,40 @@ pub trait IsStarkProver<
         PolynomialOpenings {
             proof: tree.get_proof_by_pos(index).unwrap(),
             proof_sym: tree.get_proof_by_pos(index_sym).unwrap(),
-            evaluations: lde_trace.get_row(reverse_index(index, domain_size as u64))
-                [col_start..col_end]
-                .to_vec(),
-            evaluations_sym: lde_trace.get_row(reverse_index(index_sym, domain_size as u64))
-                [col_start..col_end]
-                .to_vec(),
+            evaluations: lde_trace.gather_main_row_range(
+                reverse_index(index, domain_size as u64),
+                col_start,
+                col_end,
+            ),
+            evaluations_sym: lde_trace.gather_main_row_range(
+                reverse_index(index_sym, domain_size as u64),
+                col_start,
+                col_end,
+            ),
+        }
+    }
+
+    /// Opens auxiliary trace polynomials at the given challenge index.
+    fn open_trace_polys_aux(
+        domain: &Domain<Field>,
+        tree: &BatchedMerkleTree<FieldExtension>,
+        lde_trace: &LDETraceTable<Field, FieldExtension>,
+        challenge: usize,
+    ) -> PolynomialOpenings<FieldExtension>
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    {
+        let domain_size = domain.lde_roots_of_unity_coset.len();
+
+        let index = challenge * 2;
+        let index_sym = challenge * 2 + 1;
+        PolynomialOpenings {
+            proof: tree.get_proof_by_pos(index).unwrap(),
+            proof_sym: tree.get_proof_by_pos(index_sym).unwrap(),
+            evaluations: lde_trace.gather_aux_row(reverse_index(index, domain_size as u64)),
+            evaluations_sym: lde_trace
+                .gather_aux_row(reverse_index(index_sym, domain_size as u64)),
         }
     }
 
@@ -1689,25 +1708,25 @@ pub trait IsStarkProver<
         // Check if this is a preprocessed table (has separate precomputed tree)
         let is_preprocessed = round_1_result.main.precomputed_merkle_tree.is_some();
         let num_precomputed_cols = round_1_result.main.num_precomputed_cols;
-        let total_cols = round_1_result.lde_trace.main_table.width;
+        let total_cols = round_1_result.lde_trace.num_main_cols();
 
         for index in indexes_to_open.iter() {
             // For preprocessed tables, open main (multiplicities) with column range
             // For normal tables, open all columns
             let main_trace_opening = if is_preprocessed {
-                Self::open_trace_polys_with_columns::<Field>(
+                Self::open_trace_polys_main_range(
                     domain,
                     &round_1_result.main.lde_trace_merkle_tree,
-                    &round_1_result.lde_trace.main_table,
+                    &round_1_result.lde_trace,
                     *index,
                     num_precomputed_cols,
                     total_cols,
                 )
             } else {
-                Self::open_trace_polys::<Field>(
+                Self::open_trace_polys_main(
                     domain,
                     &round_1_result.main.lde_trace_merkle_tree,
-                    &round_1_result.lde_trace.main_table,
+                    &round_1_result.lde_trace,
                     *index,
                 )
             };
@@ -1718,10 +1737,10 @@ pub trait IsStarkProver<
                 .precomputed_merkle_tree
                 .as_ref()
                 .map(|tree| {
-                    Self::open_trace_polys_with_columns::<Field>(
+                    Self::open_trace_polys_main_range(
                         domain,
                         tree,
-                        &round_1_result.lde_trace.main_table,
+                        &round_1_result.lde_trace,
                         *index,
                         0,
                         num_precomputed_cols,
@@ -1735,10 +1754,10 @@ pub trait IsStarkProver<
             );
 
             let aux_trace_polys = round_1_result.aux.as_ref().map(|aux| {
-                Self::open_trace_polys::<FieldExtension>(
+                Self::open_trace_polys_aux(
                     domain,
                     &aux.lde_trace_merkle_tree,
-                    &round_1_result.lde_trace.aux_table,
+                    &round_1_result.lde_trace,
                     *index,
                 )
             });

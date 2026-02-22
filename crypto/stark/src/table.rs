@@ -164,20 +164,21 @@ impl<'t, F: IsField> Table<F> {
     }
 
     /// Given a step size, converts the given table into a `Frame`.
-    pub fn into_frame(&'t self, main_trace_columns: usize, step_size: usize) -> Frame<'t, F, F> {
+    /// Clones row data into owned Vecs (only used by verifier on small OOD tables).
+    pub fn into_frame(&self, main_trace_columns: usize, step_size: usize) -> Frame<F, F> {
         debug_assert!(self.height.is_multiple_of(step_size));
         let steps = (0..self.height)
             .step_by(step_size)
             .map(|initial_row_idx| {
                 let end_row_idx = initial_row_idx + step_size;
 
-                let mut step_main_data: Vec<&'t [FieldElement<F>]> = Vec::new();
-                let mut step_aux_data: Vec<&'t [FieldElement<F>]> = Vec::new();
+                let mut step_main_data: Vec<Vec<FieldElement<F>>> = Vec::new();
+                let mut step_aux_data: Vec<Vec<FieldElement<F>>> = Vec::new();
 
                 (initial_row_idx..end_row_idx).for_each(|row_idx| {
                     let row = self.get_row(row_idx);
-                    step_main_data.push(&row[..main_trace_columns]);
-                    step_aux_data.push(&row[main_trace_columns..]);
+                    step_main_data.push(row[..main_trace_columns].to_vec());
+                    step_aux_data.push(row[main_trace_columns..].to_vec());
                 });
 
                 TableView::new(step_main_data, step_aux_data)
@@ -188,23 +189,26 @@ impl<'t, F: IsField> Table<F> {
     }
 }
 
-/// A view of a contiguos subset of rows of a table.
+/// A view of a contiguous subset of rows of a table.
+///
+/// Owns its row data (Vec per row) so it can be built from either row-major Tables
+/// (verifier path) or column-major LDE data (prover path) without lifetime issues.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TableView<'t, F, E>
+pub struct TableView<F, E>
 where
     E: IsField,
     F: IsSubFieldOf<F>,
 {
-    pub data: Vec<&'t [FieldElement<F>]>,
-    pub aux_data: Vec<&'t [FieldElement<E>]>,
+    pub data: Vec<Vec<FieldElement<F>>>,
+    pub aux_data: Vec<Vec<FieldElement<E>>>,
 }
 
-impl<'t, F, E> TableView<'t, F, E>
+impl<F, E> TableView<F, E>
 where
     E: IsField,
     F: IsSubFieldOf<F>,
 {
-    pub fn new(data: Vec<&'t [FieldElement<F>]>, aux_data: Vec<&'t [FieldElement<E>]>) -> Self {
+    pub fn new(data: Vec<Vec<FieldElement<F>>>, aux_data: Vec<Vec<FieldElement<E>>>) -> Self {
         Self { data, aux_data }
     }
 

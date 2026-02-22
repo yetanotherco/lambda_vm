@@ -247,13 +247,23 @@ where
         self.aux_table.extract_columns_into(output);
     }
 }
+/// Column-major LDE trace table.
+///
+/// Stores LDE evaluations as separate column vectors rather than a row-major Table.
+/// This eliminates the expensive T2 transpose (col→row) that `Table::from_columns`
+/// performs: for the CPU table with 74 cols × 524K LDE rows, this saves ~310MB of
+/// allocation and ~39M element clones.
+///
+/// Trade-off: row access requires gathering from columns (74 random reads per row),
+/// but this is negligible vs constraint evaluation cost. Column access (used by
+/// `get_main`/`get_aux`, barycentric eval, DEEP poly) is sequential and cache-friendly.
 pub struct LDETraceTable<F, E>
 where
     E: IsField,
     F: IsSubFieldOf<E> + IsField,
 {
-    pub(crate) main_table: Table<F>,
-    pub(crate) aux_table: Table<E>,
+    pub(crate) main_columns: Vec<Vec<FieldElement<F>>>,
+    pub(crate) aux_columns: Vec<Vec<FieldElement<E>>>,
     pub(crate) lde_step_size: usize,
     pub(crate) blowup_factor: usize,
 }
@@ -263,91 +273,113 @@ where
     E: IsField,
     F: IsSubFieldOf<E>,
 {
-    pub fn new(
-        main_data: Vec<FieldElement<F>>,
-        aux_data: Vec<FieldElement<E>>,
-        n_columns: usize,
-        trace_step_size: usize,
-        blowup_factor: usize,
-    ) -> Self {
-        let main_table = Table::new(main_data, n_columns);
-        let aux_table = Table::new(aux_data, n_columns);
-        let lde_step_size = trace_step_size * blowup_factor;
-
-        Self {
-            main_table,
-            aux_table,
-            lde_step_size,
-            blowup_factor,
-        }
-    }
-
+    /// Creates a column-major LDETraceTable by consuming column vectors directly.
+    /// No transpose is performed — columns are stored as-is.
     pub fn from_columns(
         main_columns: Vec<Vec<FieldElement<F>>>,
         aux_columns: Vec<Vec<FieldElement<E>>>,
         trace_step_size: usize,
         blowup_factor: usize,
     ) -> Self {
-        let main_table = Table::from_columns(main_columns);
-        let aux_table = Table::from_columns(aux_columns);
         let lde_step_size = trace_step_size * blowup_factor;
 
         Self {
-            main_table,
-            aux_table,
+            main_columns,
+            aux_columns,
             lde_step_size,
             blowup_factor,
         }
     }
 
-    /// Creates an LDETraceTable by borrowing column data without consuming the column Vecs.
+    /// Creates a column-major LDETraceTable by cloning column data from borrowed slices.
     ///
-    /// Used for LDE buffer reuse: the pool retains the column buffers for the next table.
+    /// Each column Vec is cloned sequentially (cache-friendly), avoiding the O(N×W)
+    /// row-major transpose that `Table::from_columns_borrowed` performs.
     pub fn from_columns_borrowed(
         main_columns: &[Vec<FieldElement<F>>],
         aux_columns: &[Vec<FieldElement<E>>],
         trace_step_size: usize,
         blowup_factor: usize,
     ) -> Self {
-        let main_table = Table::from_columns_borrowed(main_columns);
-        let aux_table = Table::from_columns_borrowed(aux_columns);
+        let main_cols: Vec<Vec<FieldElement<F>>> = main_columns.iter().map(|c| c.clone()).collect();
+        let aux_cols: Vec<Vec<FieldElement<E>>> = aux_columns.iter().map(|c| c.clone()).collect();
         let lde_step_size = trace_step_size * blowup_factor;
 
         Self {
-            main_table,
-            aux_table,
+            main_columns: main_cols,
+            aux_columns: aux_cols,
             lde_step_size,
             blowup_factor,
         }
     }
 
     pub fn num_cols(&self) -> usize {
-        self.main_table.width + self.aux_table.width
+        self.main_columns.len() + self.aux_columns.len()
+    }
+
+    pub fn num_main_cols(&self) -> usize {
+        self.main_columns.len()
+    }
+
+    pub fn num_aux_cols(&self) -> usize {
+        self.aux_columns.len()
     }
 
     pub fn num_rows(&self) -> usize {
-        self.main_table.height
+        if self.main_columns.is_empty() {
+            0
+        } else {
+            self.main_columns[0].len()
+        }
     }
 
-    pub fn get_main_row(&self, row_idx: usize) -> &[FieldElement<F>] {
-        self.main_table.get_row(row_idx)
-    }
-
-    pub fn get_aux_row(&self, row_idx: usize) -> &[FieldElement<E>] {
-        self.aux_table.get_row(row_idx)
-    }
-
+    /// Get a single main-trace element by (row, col).
+    #[inline]
     pub fn get_main(&self, row: usize, col: usize) -> &FieldElement<F> {
-        self.main_table.get(row, col)
+        &self.main_columns[col][row]
     }
 
+    /// Get a single aux-trace element by (row, col).
+    #[inline]
     pub fn get_aux(&self, row: usize, col: usize) -> &FieldElement<E> {
-        self.aux_table.get(row, col)
+        &self.aux_columns[col][row]
+    }
+
+    /// Gather a full main-trace row into an owned Vec.
+    /// Used by `open_trace_polys` (called ~30 times per table, allocation is negligible).
+    pub fn gather_main_row(&self, row_idx: usize) -> Vec<FieldElement<F>> {
+        self.main_columns
+            .iter()
+            .map(|col| col[row_idx].clone())
+            .collect()
+    }
+
+    /// Gather a range of main-trace columns for a given row.
+    /// Used by `open_trace_polys_with_columns` for preprocessed table openings.
+    pub fn gather_main_row_range(
+        &self,
+        row_idx: usize,
+        col_start: usize,
+        col_end: usize,
+    ) -> Vec<FieldElement<F>> {
+        self.main_columns[col_start..col_end]
+            .iter()
+            .map(|col| col[row_idx].clone())
+            .collect()
+    }
+
+    /// Gather a full aux-trace row into an owned Vec.
+    pub fn gather_aux_row(&self, row_idx: usize) -> Vec<FieldElement<E>> {
+        self.aux_columns
+            .iter()
+            .map(|col| col[row_idx].clone())
+            .collect()
     }
 
     pub fn num_steps(&self) -> usize {
-        debug_assert!(self.main_table.height.is_multiple_of(self.lde_step_size));
-        self.main_table.height / self.lde_step_size
+        let height = self.num_rows();
+        debug_assert!(height.is_multiple_of(self.lde_step_size));
+        height / self.lde_step_size
     }
 
     pub fn step_to_row(&self, step: usize) -> usize {
@@ -442,8 +474,8 @@ where
 {
     let n = domain.interpolation_domain_size;
     let bf = domain.blowup_factor;
-    let num_main_cols = lde_trace.main_table.width;
-    let num_aux_cols = lde_trace.aux_table.width;
+    let num_main_cols = lde_trace.num_main_cols();
+    let num_aux_cols = lde_trace.num_aux_cols();
     let table_width = num_main_cols + num_aux_cols;
 
     // Extract trace-size coset points: {g * w_trace^i} = lde_coset[i * blowup_factor]

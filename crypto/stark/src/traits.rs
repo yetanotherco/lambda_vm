@@ -64,12 +64,12 @@ where
     E: IsField,
 {
     Prover {
-        frame: &'a Frame<'a, F, E>,
+        frame: &'a Frame<F, E>,
         periodic_values: &'a [FieldElement<F>],
         rap_challenges: &'a [FieldElement<E>],
     },
     Verifier {
-        frame: &'a Frame<'a, E, E>,
+        frame: &'a Frame<E, E>,
         periodic_values: &'a [FieldElement<E>],
         rap_challenges: &'a [FieldElement<E>],
     },
@@ -81,7 +81,7 @@ where
     E: IsField,
 {
     pub fn new_prover(
-        frame: &'a Frame<'a, F, E>,
+        frame: &'a Frame<F, E>,
         periodic_values: &'a [FieldElement<F>],
         rap_challenges: &'a [FieldElement<E>],
     ) -> Self {
@@ -93,7 +93,7 @@ where
     }
 
     pub fn new_verifier(
-        frame: &'a Frame<'a, E, E>,
+        frame: &'a Frame<E, E>,
         periodic_values: &'a [FieldElement<E>],
         rap_challenges: &'a [FieldElement<E>],
     ) -> Self {
