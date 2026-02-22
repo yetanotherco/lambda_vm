@@ -454,15 +454,7 @@ where
         .map(|exponent| &domain.trace_primitive_root.pow(exponent) * z)
         .collect_vec();
 
-    // For aux columns, we need the coset points lifted to extension field
-    let coset_points_ext: Vec<FieldElement<E>> = if num_aux_cols > 0 {
-        coset_points
-            .iter()
-            .map(|p| p.clone().to_extension())
-            .collect()
-    } else {
-        Vec::new()
-    };
+    // Coset points stay in base field — mixed F×E arithmetic is cheaper than E×E.
 
     // Extract trace-size evaluations from LDE for each column (stride = blowup_factor)
     // Main columns: Vec of N base-field evaluations per column
@@ -505,13 +497,13 @@ where
             ));
         }
 
-        // Evaluate each aux column
+        // Evaluate each aux column (coset_points in base field, evals in extension)
         for col_evals in &aux_col_evals {
             table_data.push(interpolate_coset_eval_ext(
                 &z_pow_n,
                 &coset_offset_pow_n_ext,
                 &n_inv,
-                &coset_points_ext,
+                &coset_points,
                 col_evals,
                 &inv_denoms,
             ));

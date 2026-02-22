@@ -185,10 +185,11 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     ///
     /// Same as [`coset_lde_with_twiddles`], but also accepts pre-computed `weights[i] = offset^i / n`
     /// so that the scaling step avoids the running product across columns.
+    /// Weights are in the base field F — the scaling `w * coeff` uses mixed F×E multiplication.
     pub fn coset_lde_full<F: IsFFTField + IsSubFieldOf<E>>(
         evals: &[FieldElement<E>],
         blowup_factor: usize,
-        weights: &[FieldElement<E>],
+        weights: &[FieldElement<F>],
         inv_twiddles: &LayerTwiddles<F>,
         fwd_twiddles: &LayerTwiddles<F>,
     ) -> Result<Vec<FieldElement<E>>, FFTError> {
@@ -208,10 +209,11 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     /// Same as [`coset_lde_full`], but writes into `buffer` instead of allocating a new Vec.
     /// The buffer is cleared and reused: `buffer.clear(); buffer.extend_from_slice(evals);
     /// buffer.resize(lde_size, zero)`. When the capacity is sufficient, no heap allocation occurs.
+    /// Weights are in the base field F — the scaling `w * coeff` uses mixed F×E multiplication.
     pub fn coset_lde_full_into<F: IsFFTField + IsSubFieldOf<E>>(
         evals: &[FieldElement<E>],
         blowup_factor: usize,
-        weights: &[FieldElement<E>],
+        weights: &[FieldElement<F>],
         inv_twiddles: &LayerTwiddles<F>,
         fwd_twiddles: &LayerTwiddles<F>,
         buffer: &mut Vec<FieldElement<E>>,
@@ -235,7 +237,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         in_place_bit_reverse_permute(&mut buffer[..n]);
         bowers_ifft_opt(&mut buffer[..n], inv_twiddles)?;
 
-        // Scale using pre-computed weights instead of running product.
+        // Scale using pre-computed weights (base field) — F × E → E mixed multiplication.
         for (coeff, w) in buffer[..n].iter_mut().zip(weights.iter()) {
             *coeff = w * &*coeff;
         }

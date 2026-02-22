@@ -854,23 +854,27 @@ where
 /// Evaluate a polynomial at point `z` given its evaluations on a coset `{g * w^i}`,
 /// using the barycentric interpolation formula.
 ///
-/// This variant takes extension-field evaluations (aux trace / composition poly columns).
+/// This variant takes extension-field evaluations (aux trace / composition poly columns)
+/// but keeps coset points in the base field to avoid unnecessary extension-field arithmetic.
+/// The `point * eval` computation uses mixed F×E multiplication (cheaper than E×E).
 #[cfg(feature = "alloc")]
-pub fn interpolate_coset_eval_ext<E>(
+pub fn interpolate_coset_eval_ext<F, E>(
     z_pow_n: &FieldElement<E>,
     coset_offset_pow_n: &FieldElement<E>,
     n_inv: &FieldElement<E>,
-    coset_points_ext: &[FieldElement<E>],
+    coset_points: &[FieldElement<F>],
     evaluations: &[FieldElement<E>],
     inv_denoms: &[FieldElement<E>],
 ) -> FieldElement<E>
 where
+    F: IsSubFieldOf<E>,
     E: IsField,
 {
-    debug_assert_eq!(coset_points_ext.len(), evaluations.len());
-    debug_assert_eq!(coset_points_ext.len(), inv_denoms.len());
+    debug_assert_eq!(coset_points.len(), evaluations.len());
+    debug_assert_eq!(coset_points.len(), inv_denoms.len());
 
-    let sum: FieldElement<E> = coset_points_ext
+    // point * eval: F × E → E (mixed multiplication, cheaper than E × E)
+    let sum: FieldElement<E> = coset_points
         .iter()
         .zip(evaluations.iter())
         .zip(inv_denoms.iter())

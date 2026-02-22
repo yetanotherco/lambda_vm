@@ -501,12 +501,13 @@ pub trait IsStarkProver<
 
         let n = columns[0].len();
 
-        // Precompute coset weights: weights[i] = offset^i / n (identical for all columns).
-        let n_inv = FieldElement::<Field>::from(n as u64).inv().unwrap();
+        // Precompute coset weights in base field: weights[i] = offset^i / n.
+        // Weights stay in F — coset_lde_full uses mixed F×E multiplication for scaling.
+        let n_inv = FieldElement::<Field>::from(n as u64).inv().expect("n is power of two");
         let offset = &domain.coset_offset;
-        let weights: Vec<FieldElement<E>> = {
+        let weights: Vec<FieldElement<Field>> = {
             let mut w = Vec::with_capacity(n);
-            let mut offset_power: FieldElement<E> = n_inv.clone().to_extension();
+            let mut offset_power = n_inv.clone();
             for _ in 0..n {
                 w.push(offset_power.clone());
                 offset_power = offset * &offset_power;
@@ -561,12 +562,13 @@ pub trait IsStarkProver<
 
         let n = columns[0].len();
 
-        // Precompute coset weights: weights[i] = offset^i / n (identical for all columns).
-        let n_inv = FieldElement::<Field>::from(n as u64).inv().unwrap();
+        // Precompute coset weights in base field: weights[i] = offset^i / n.
+        // Weights stay in F — coset_lde_full uses mixed F×E multiplication for scaling.
+        let n_inv = FieldElement::<Field>::from(n as u64).inv().expect("n is power of two");
         let offset = &domain.coset_offset;
-        let weights: Vec<FieldElement<E>> = {
+        let weights: Vec<FieldElement<Field>> = {
             let mut w = Vec::with_capacity(n);
-            let mut offset_power: FieldElement<E> = n_inv.clone().to_extension();
+            let mut offset_power = n_inv.clone();
             for _ in 0..n {
                 w.push(offset_power.clone());
                 offset_power = offset * &offset_power;
@@ -1025,9 +1027,10 @@ pub trait IsStarkProver<
 
         // Step 1: Compute 1/(2·g·ω^i) for i=0..N-1 via batch inversion.
         // The LDE coset points are g·ω^i = domain.lde_roots_of_unity_coset[i].
-        let two = FieldElement::<FieldExtension>::from(2u64);
-        let mut inv_2x: Vec<FieldElement<FieldExtension>> = (0..n)
-            .map(|i| &two * domain.lde_roots_of_unity_coset[i].clone().to_extension())
+        // Compute entirely in base field — mixed F×E multiplication when used with extension values.
+        let two_base = FieldElement::<Field>::from(2u64);
+        let mut inv_2x: Vec<FieldElement<Field>> = (0..n)
+            .map(|i| &two_base * &domain.lde_roots_of_unity_coset[i])
             .collect();
         FieldElement::inplace_batch_inverse(&mut inv_2x)
             .expect("Coset points are non-zero");
@@ -1035,7 +1038,7 @@ pub trait IsStarkProver<
         // Step 2: Pointwise decomposition.
         // H₀((g·ω^i)²) = (evals[i] + evals[i+N]) / 2
         // H₁((g·ω^i)²) = (evals[i] - evals[i+N]) / (2·g·ω^i)
-        let two_inv = two.inv().expect("2 is non-zero in the field");
+        let two_inv = two_base.inv().expect("2 is non-zero in the field");
         let (h0_evals, h1_evals) = {
             #[cfg(feature = "parallel")]
             {
@@ -1044,7 +1047,8 @@ pub trait IsStarkProver<
                     .map(|i| {
                         let sum = &constraint_evaluations[i] + &constraint_evaluations[i + n];
                         let diff = &constraint_evaluations[i] - &constraint_evaluations[i + n];
-                        (&sum * &two_inv, &diff * &inv_2x[i])
+                        // F × E → E (base field scalar on left for mixed multiplication)
+                        (&two_inv * &sum, &inv_2x[i] * &diff)
                     })
                     .unzip();
                 (h0, h1)
@@ -1056,8 +1060,8 @@ pub trait IsStarkProver<
                 for i in 0..n {
                     let sum = &constraint_evaluations[i] + &constraint_evaluations[i + n];
                     let diff = &constraint_evaluations[i] - &constraint_evaluations[i + n];
-                    h0.push(&sum * &two_inv);
-                    h1.push(&diff * &inv_2x[i]);
+                    h0.push(&two_inv * &sum);
+                    h1.push(&inv_2x[i] * &diff);
                 }
                 (h0, h1)
             }
@@ -1226,12 +1230,9 @@ pub trait IsStarkProver<
 
         // === Composition poly parts: barycentric evaluation at z^num_parts ===
         // Extract trace-size coset points from the LDE coset (stride = blowup_factor)
+        // Keep coset points in base field — mixed F×E arithmetic is cheaper than E×E.
         let coset_points: Vec<FieldElement<Field>> = (0..n)
             .map(|i| domain.lde_roots_of_unity_coset[i * bf].clone())
-            .collect();
-        let coset_points_ext: Vec<FieldElement<FieldExtension>> = coset_points
-            .iter()
-            .map(|p| p.clone().to_extension())
             .collect();
         let coset_offset_pow_n: FieldElement<FieldExtension> =
             domain.coset_offset.pow(n).to_extension();
@@ -1256,7 +1257,7 @@ pub trait IsStarkProver<
                     &comp_z_pow_n,
                     &coset_offset_pow_n,
                     &n_inv,
-                    &coset_points_ext,
+                    &coset_points,
                     &evals,
                     &comp_inv_denoms,
                 )
@@ -1443,18 +1444,16 @@ pub trait IsStarkProver<
         let num_denoms = n * (1 + num_eval_points);
         let mut denoms: Vec<FieldElement<FieldExtension>> = Vec::with_capacity(num_denoms);
 
-        // H-term denominators: x_i - z^K
+        // H-term denominators: x_i - z^K (base field - extension field → extension field)
         for i in 0..n {
-            let x_i: FieldElement<FieldExtension> =
-                domain.lde_roots_of_unity_coset[i * bf].clone().to_extension();
+            let x_i = &domain.lde_roots_of_unity_coset[i * bf];
             denoms.push(x_i - &z_power);
         }
 
-        // Trace-term denominators: x_i - z_shifted[k]
+        // Trace-term denominators: x_i - z_shifted[k] (base - extension → extension)
         for k in 0..num_eval_points {
             for i in 0..n {
-                let x_i: FieldElement<FieldExtension> =
-                    domain.lde_roots_of_unity_coset[i * bf].clone().to_extension();
+                let x_i = &domain.lde_roots_of_unity_coset[i * bf];
                 denoms.push(x_i - &z_shifted[k]);
             }
         }
@@ -1497,15 +1496,15 @@ pub trait IsStarkProver<
                 for k in 0..num_eval_points {
                     let inv_t_k_i = &denoms[(1 + k) * n + i];
 
-                    // Get trace value: main columns are base field, aux are extension field
-                    let t_j_val: FieldElement<FieldExtension> = if j < num_main_cols {
-                        lde_trace.get_main(row_idx, j).clone().to_extension()
-                    } else {
-                        lde_trace.get_aux(row_idx, j - num_main_cols).clone()
-                    };
-
+                    // Get trace value and compute numerator using mixed arithmetic.
+                    // Main columns: base field value, sub from extension → extension.
+                    // Aux columns: extension field value directly.
                     let t_j_ood = &ood_evals_j[k];
-                    let numerator = t_j_val - t_j_ood;
+                    let numerator: FieldElement<FieldExtension> = if j < num_main_cols {
+                        lde_trace.get_main(row_idx, j) - t_j_ood
+                    } else {
+                        lde_trace.get_aux(row_idx, j - num_main_cols) - t_j_ood
+                    };
                     result = result + &gammas_j[k] * numerator * inv_t_k_i;
                 }
             }
