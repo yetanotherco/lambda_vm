@@ -316,6 +316,13 @@ where
         }
     }
 
+    /// Consume self and return the owned column vectors.
+    pub fn into_columns(
+        self,
+    ) -> (Vec<Vec<FieldElement<F>>>, Vec<Vec<FieldElement<E>>>) {
+        (self.main_columns, self.aux_columns)
+    }
+
     pub fn num_cols(&self) -> usize {
         self.main_columns.len() + self.aux_columns.len()
     }

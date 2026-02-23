@@ -980,10 +980,19 @@ pub trait IsStarkProver<
             (None, 0)
         };
 
-        // Build column-major LDETraceTable by borrowing from pool (pool retains buffers)
-        let lde_trace = LDETraceTable::from_columns_borrowed(
-            &main_pool[..num_main_cols],
-            &aux_pool[..num_aux_cols],
+        // Take column Vecs from pool (zero-copy move) instead of cloning.
+        // After prove_rounds_2_to_4, columns are returned to the pool via into_columns.
+        let main_cols: Vec<_> = main_pool[..num_main_cols]
+            .iter_mut()
+            .map(std::mem::take)
+            .collect();
+        let aux_cols: Vec<_> = aux_pool[..num_aux_cols]
+            .iter_mut()
+            .map(std::mem::take)
+            .collect();
+        let lde_trace = LDETraceTable::from_columns(
+            main_cols,
+            aux_cols,
             air.step_size(),
             domain.blowup_factor,
         );
@@ -2027,8 +2036,16 @@ pub trait IsStarkProver<
             let proof =
                 Self::prove_rounds_2_to_4(*air, *pub_inputs, &round_1_result, transcript, domain)?;
             proofs.push(proof);
-            // round_1_result is dropped here — frees LDE trace clones (Merkle trees
-            // are clones from metadata). Pool buffers retain capacity for next table
+
+            // Return column Vecs to pool (zero-copy move back). Pool slots that were
+            // `take`n in reconstruct_round1 get their buffers back with capacity intact.
+            let (main_cols, aux_cols) = round_1_result.lde_trace.into_columns();
+            for (slot, col) in main_pool.iter_mut().zip(main_cols) {
+                *slot = col;
+            }
+            for (slot, col) in aux_pool.iter_mut().zip(aux_cols) {
+                *slot = col;
+            }
         }
 
         Ok(MultiProof::new(proofs))
