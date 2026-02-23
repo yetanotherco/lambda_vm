@@ -1,4 +1,5 @@
 use std::marker::PhantomData;
+use std::rc::Rc;
 #[cfg(feature = "instruments")]
 use std::time::Instant;
 
@@ -80,11 +81,12 @@ where
 {
     /// The Merkle trees constructed to obtain the commitment of the entire trace table.
     /// For preprocessed tables, this contains only the multiplicity columns.
-    pub(crate) lde_trace_merkle_tree: BatchedMerkleTree<F>,
+    /// Wrapped in Rc to share with Round1Metadata without deep-cloning (~64MB per table).
+    pub(crate) lde_trace_merkle_tree: Rc<BatchedMerkleTree<F>>,
     /// The root of the Merkle tree in `lde_trace_merkle_tree`.
     pub(crate) lde_trace_merkle_root: Commitment,
     /// For preprocessed tables: Merkle tree over precomputed columns only.
-    pub(crate) precomputed_merkle_tree: Option<BatchedMerkleTree<F>>,
+    pub(crate) precomputed_merkle_tree: Option<Rc<BatchedMerkleTree<F>>>,
     /// For preprocessed tables: root of the precomputed Merkle tree.
     pub(crate) precomputed_merkle_root: Option<Commitment>,
     /// For preprocessed tables: number of precomputed columns (for splitting during opening).
@@ -131,17 +133,18 @@ where
     FieldElement<FieldExtension>: AsBytes,
 {
     /// Merkle tree of the main trace (multiplicities for preprocessed tables).
-    main_merkle_tree: BatchedMerkleTree<Field>,
+    /// Wrapped in Rc to share with Round1CommitmentData without deep-cloning.
+    main_merkle_tree: Rc<BatchedMerkleTree<Field>>,
     /// Root of the main trace Merkle tree.
     main_merkle_root: Commitment,
     /// For preprocessed tables: Merkle tree over precomputed columns.
-    precomputed_merkle_tree: Option<BatchedMerkleTree<Field>>,
+    precomputed_merkle_tree: Option<Rc<BatchedMerkleTree<Field>>>,
     /// For preprocessed tables: root of the precomputed Merkle tree.
     precomputed_merkle_root: Option<Commitment>,
     /// For preprocessed tables: number of precomputed columns.
     num_precomputed_cols: usize,
     /// Merkle tree of the auxiliary trace (None if no aux trace).
-    aux_merkle_tree: Option<BatchedMerkleTree<FieldExtension>>,
+    aux_merkle_tree: Option<Rc<BatchedMerkleTree<FieldExtension>>>,
     /// Root of the auxiliary trace Merkle tree (None if no aux trace).
     aux_merkle_root: Option<Commitment>,
     /// The RAP challenges used for auxiliary trace construction.
@@ -670,7 +673,7 @@ pub trait IsStarkProver<
         };
 
         let main = Round1CommitmentData::<Field> {
-            lde_trace_merkle_tree: main_merkle_tree,
+            lde_trace_merkle_tree: Rc::new(main_merkle_tree),
             lde_trace_merkle_root: main_merkle_root,
             precomputed_merkle_tree: None,
             precomputed_merkle_root: None,
@@ -729,9 +732,9 @@ pub trait IsStarkProver<
 
         // Store multiplicities tree as main (for FRI openings), precomputed tree separately
         let main = Round1CommitmentData::<Field> {
-            lde_trace_merkle_tree: mult_tree,
+            lde_trace_merkle_tree: Rc::new(mult_tree),
             lde_trace_merkle_root: mult_root,
-            precomputed_merkle_tree: Some(precomputed_tree),
+            precomputed_merkle_tree: Some(Rc::new(precomputed_tree)),
             precomputed_merkle_root: Some(precomputed_root),
             num_precomputed_cols,
         };
@@ -764,7 +767,7 @@ pub trait IsStarkProver<
                 return Err(ProvingError::EmptyCommitment);
             };
             let aux = Some(Round1CommitmentData::<FieldExtension> {
-                lde_trace_merkle_tree: aux_merkle_tree,
+                lde_trace_merkle_tree: Rc::new(aux_merkle_tree),
                 lde_trace_merkle_root: aux_merkle_root,
                 precomputed_merkle_tree: None,
                 precomputed_merkle_root: None,
@@ -945,11 +948,11 @@ pub trait IsStarkProver<
         trace.extract_columns_main_into(main_pool);
         Self::expand_pool_to_lde::<Field>(main_pool, num_main_cols, domain, twiddles);
 
-        // Use stored Merkle trees from Phase A/C (no re-hashing needed)
+        // Use stored Merkle trees from Phase A/C via Rc (pointer copy, no deep clone)
         let main = Round1CommitmentData::<Field> {
-            lde_trace_merkle_tree: metadata.main_merkle_tree.clone(),
+            lde_trace_merkle_tree: Rc::clone(&metadata.main_merkle_tree),
             lde_trace_merkle_root: metadata.main_merkle_root,
-            precomputed_merkle_tree: metadata.precomputed_merkle_tree.clone(),
+            precomputed_merkle_tree: metadata.precomputed_merkle_tree.as_ref().map(Rc::clone),
             precomputed_merkle_root: metadata.precomputed_merkle_root,
             num_precomputed_cols: metadata.num_precomputed_cols,
         };
@@ -961,10 +964,10 @@ pub trait IsStarkProver<
             Self::expand_pool_to_lde::<FieldExtension>(aux_pool, n_aux, domain, twiddles);
             // Safe: has_trace_interaction() is true only when Phase C stored aux tree/root
             let aux_commitment = Round1CommitmentData::<FieldExtension> {
-                lde_trace_merkle_tree: metadata
-                    .aux_merkle_tree
-                    .clone()
-                    .expect("aux tree must exist when has_trace_interaction"),
+                lde_trace_merkle_tree: Rc::clone(
+                    metadata.aux_merkle_tree.as_ref()
+                        .expect("aux tree must exist when has_trace_interaction"),
+                ),
                 lde_trace_merkle_root: metadata
                     .aux_merkle_root
                     .expect("aux root must exist when has_trace_interaction"),
@@ -1844,9 +1847,9 @@ pub trait IsStarkProver<
         // LogUp challenges. Pool buffers are reused across tables.
 
         let mut main_commits: Vec<(
-            BatchedMerkleTree<Field>,
+            Rc<BatchedMerkleTree<Field>>,
             Commitment,
-            Option<BatchedMerkleTree<Field>>,
+            Option<Rc<BatchedMerkleTree<Field>>>,
             Option<Commitment>,
             usize,
         )> = Vec::with_capacity(num_airs);
@@ -1856,7 +1859,7 @@ pub trait IsStarkProver<
         {
             let domain = &domains[main_commits.len()];
 
-            let commit = if air.is_preprocessed() {
+            let (tree, root, pre_tree, pre_root, n_pre) = if air.is_preprocessed() {
                 Self::commit_preprocessed_trace_lightweight(
                     *trace,
                     domain,
@@ -1876,7 +1879,7 @@ pub trait IsStarkProver<
                 )?
             };
 
-            main_commits.push(commit);
+            main_commits.push((Rc::new(tree), root, pre_tree.map(Rc::new), pre_root, n_pre));
         }
 
         // =====================================================================
@@ -1950,15 +1953,15 @@ pub trait IsStarkProver<
                         .ok_or(ProvingError::EmptyCommitment)?;
 
                 transcript.append_bytes(&root);
-                (Some(tree), Some(root))
+                (Some(Rc::new(tree)), Some(root))
             } else {
                 (None, None)
             };
 
             metadatas.push(Round1Metadata {
-                main_merkle_tree: main_tree,
+                main_merkle_tree: Rc::clone(&main_tree),
                 main_merkle_root: main_root,
-                precomputed_merkle_tree: precomputed_tree,
+                precomputed_merkle_tree: precomputed_tree.as_ref().map(Rc::clone),
                 precomputed_merkle_root: precomputed_root,
                 num_precomputed_cols: num_precomputed,
                 aux_merkle_tree: aux_tree,
