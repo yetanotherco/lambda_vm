@@ -9,15 +9,17 @@ ssh admin@<server-ip>
 Install dependencies:
 
 ```bash
-sudo apt-get install -y time
 sudo apt update
+sudo apt-get install -y time
 sudo apt install lsb-release wget software-properties-common gnupg tmux
 ```
 
 Install and set up LLVM 18 toolchain:
 
 ```bash
-wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 18
+wget -qO llvm.sh https://apt.llvm.org/llvm.sh
+# review llvm.sh before running
+sudo bash llvm.sh 18
 sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-18 100
 sudo update-alternatives --install /usr/bin/lld lld /usr/bin/lld-18 100
 clang --version # must be clang 18
