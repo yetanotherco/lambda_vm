@@ -85,7 +85,12 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
 fn test_cpu_only_no_bus() {
     let (_elf, logs, instructions) = run_asm_elf("sub");
 
-    let mut cpu_trace = Traces::from_logs(&logs, instructions).unwrap().cpus.into_iter().next().unwrap();
+    let mut cpu_trace = Traces::from_logs(&logs, instructions)
+        .unwrap()
+        .cpus
+        .into_iter()
+        .next()
+        .unwrap();
     println!(
         "CPU trace: {} rows x {} cols",
         cpu_trace.main_table.height, cpu_trace.main_table.width
@@ -570,7 +575,11 @@ fn test_debug_memory_bus_tokens() {
 
     let memw = &traces.memws[0]; // Small test: single MEMW chunk
     println!("DEBUG TABLE SIZES:");
-    println!("  MEMW: {} rows ({} tables)", memw.num_rows(), traces.memws.len());
+    println!(
+        "  MEMW: {} rows ({} tables)",
+        memw.num_rows(),
+        traces.memws.len()
+    );
     println!("  REGISTER: {} rows", traces.register.num_rows());
 
     // Collect all Memory bus tokens
@@ -583,30 +592,15 @@ fn test_debug_memory_bus_tokens() {
     // === MEMW tokens (for register rows only) ===
     println!("\n=== MEMW Memory Bus Tokens (register rows) ===");
     for row in 0..memw.num_rows() {
-        let is_reg = memw
-            .main_table
-            .get(row, memw_cols::IS_REGISTER)
-            .to_raw();
+        let is_reg = memw.main_table.get(row, memw_cols::IS_REGISTER).to_raw();
         if is_reg == 0 {
             continue; // Skip memory rows (multiplicity = 0)
         }
 
-        let base_lo = memw
-            .main_table
-            .get(row, memw_cols::BASE_ADDRESS_0)
-            .to_raw();
-        let base_hi = memw
-            .main_table
-            .get(row, memw_cols::BASE_ADDRESS_1)
-            .to_raw();
-        let ts_lo = memw
-            .main_table
-            .get(row, memw_cols::TIMESTAMP_0)
-            .to_raw();
-        let ts_hi = memw
-            .main_table
-            .get(row, memw_cols::TIMESTAMP_1)
-            .to_raw();
+        let base_lo = memw.main_table.get(row, memw_cols::BASE_ADDRESS_0).to_raw();
+        let base_hi = memw.main_table.get(row, memw_cols::BASE_ADDRESS_1).to_raw();
+        let ts_lo = memw.main_table.get(row, memw_cols::TIMESTAMP_0).to_raw();
+        let ts_hi = memw.main_table.get(row, memw_cols::TIMESTAMP_1).to_raw();
         let old_ts0_lo = memw
             .main_table
             .get(row, memw_cols::old_timestamp(0)[0])
@@ -623,14 +617,8 @@ fn test_debug_memory_bus_tokens() {
             .main_table
             .get(row, memw_cols::old_timestamp(1)[1])
             .to_raw();
-        let val0 = memw
-            .main_table
-            .get(row, memw_cols::VALUE[0])
-            .to_raw();
-        let val1 = memw
-            .main_table
-            .get(row, memw_cols::VALUE[1])
-            .to_raw();
+        let val0 = memw.main_table.get(row, memw_cols::VALUE[0]).to_raw();
+        let val1 = memw.main_table.get(row, memw_cols::VALUE[1]).to_raw();
         let old0 = memw.main_table.get(row, memw_cols::OLD[0]).to_raw();
         let old1 = memw.main_table.get(row, memw_cols::OLD[1]).to_raw();
 
@@ -744,30 +732,15 @@ fn test_debug_memory_bus_tokens() {
 
     // MEMW tokens
     for row in 0..memw.num_rows() {
-        let is_reg = memw
-            .main_table
-            .get(row, memw_cols::IS_REGISTER)
-            .to_raw();
+        let is_reg = memw.main_table.get(row, memw_cols::IS_REGISTER).to_raw();
         if is_reg == 0 {
             continue;
         }
 
-        let base_lo = memw
-            .main_table
-            .get(row, memw_cols::BASE_ADDRESS_0)
-            .to_raw();
-        let base_hi = memw
-            .main_table
-            .get(row, memw_cols::BASE_ADDRESS_1)
-            .to_raw();
-        let ts_lo = memw
-            .main_table
-            .get(row, memw_cols::TIMESTAMP_0)
-            .to_raw();
-        let ts_hi = memw
-            .main_table
-            .get(row, memw_cols::TIMESTAMP_1)
-            .to_raw();
+        let base_lo = memw.main_table.get(row, memw_cols::BASE_ADDRESS_0).to_raw();
+        let base_hi = memw.main_table.get(row, memw_cols::BASE_ADDRESS_1).to_raw();
+        let ts_lo = memw.main_table.get(row, memw_cols::TIMESTAMP_0).to_raw();
+        let ts_hi = memw.main_table.get(row, memw_cols::TIMESTAMP_1).to_raw();
         let old_ts0_lo = memw
             .main_table
             .get(row, memw_cols::old_timestamp(0)[0])
@@ -784,14 +757,8 @@ fn test_debug_memory_bus_tokens() {
             .main_table
             .get(row, memw_cols::old_timestamp(1)[1])
             .to_raw();
-        let val0 = memw
-            .main_table
-            .get(row, memw_cols::VALUE[0])
-            .to_raw();
-        let val1 = memw
-            .main_table
-            .get(row, memw_cols::VALUE[1])
-            .to_raw();
+        let val0 = memw.main_table.get(row, memw_cols::VALUE[0]).to_raw();
+        let val1 = memw.main_table.get(row, memw_cols::VALUE[1]).to_raw();
         let old0 = memw.main_table.get(row, memw_cols::OLD[0]).to_raw();
         let old1 = memw.main_table.get(row, memw_cols::OLD[1]).to_raw();
 
@@ -872,7 +839,11 @@ fn test_debug_memory_tokens_sb_sh() {
 
     let memw = &traces.memws[0]; // Small test: single MEMW chunk
     println!("DEBUG: test_sb_sh_8 Memory bus tokens (FULL)");
-    println!("  MEMW rows: {} ({} tables)", memw.num_rows(), traces.memws.len());
+    println!(
+        "  MEMW rows: {} ({} tables)",
+        memw.num_rows(),
+        traces.memws.len()
+    );
     println!("  REGISTER rows: {}", traces.register.num_rows());
     println!("  PAGE tables: {}", traces.pages.len());
 
@@ -935,10 +906,7 @@ fn test_debug_memory_tokens_sb_sh() {
     let mut memw_register_rows = 0;
     let mut memw_memory_rows = 0;
     for row in 0..memw.num_rows() {
-        let is_reg = memw
-            .main_table
-            .get(row, memw_cols::IS_REGISTER)
-            .to_raw();
+        let is_reg = memw.main_table.get(row, memw_cols::IS_REGISTER).to_raw();
 
         // Count row types
         if is_reg == 1 {
@@ -948,31 +916,16 @@ fn test_debug_memory_tokens_sb_sh() {
         }
 
         let mu_read = memw.main_table.get(row, memw_cols::MU_READ).to_raw();
-        let mu_write = memw
-            .main_table
-            .get(row, memw_cols::MU_WRITE)
-            .to_raw();
+        let mu_write = memw.main_table.get(row, memw_cols::MU_WRITE).to_raw();
         let mu_sum = mu_read + mu_write;
         if mu_sum == 0 {
             continue; // Padding row
         }
 
-        let base_lo = memw
-            .main_table
-            .get(row, memw_cols::BASE_ADDRESS_0)
-            .to_raw();
-        let base_hi = memw
-            .main_table
-            .get(row, memw_cols::BASE_ADDRESS_1)
-            .to_raw();
-        let ts_lo = memw
-            .main_table
-            .get(row, memw_cols::TIMESTAMP_0)
-            .to_raw();
-        let ts_hi = memw
-            .main_table
-            .get(row, memw_cols::TIMESTAMP_1)
-            .to_raw();
+        let base_lo = memw.main_table.get(row, memw_cols::BASE_ADDRESS_0).to_raw();
+        let base_hi = memw.main_table.get(row, memw_cols::BASE_ADDRESS_1).to_raw();
+        let ts_lo = memw.main_table.get(row, memw_cols::TIMESTAMP_0).to_raw();
+        let ts_hi = memw.main_table.get(row, memw_cols::TIMESTAMP_1).to_raw();
         let old_ts0_lo = memw
             .main_table
             .get(row, memw_cols::old_timestamp(0)[0])
@@ -981,10 +934,7 @@ fn test_debug_memory_tokens_sb_sh() {
             .main_table
             .get(row, memw_cols::old_timestamp(0)[1])
             .to_raw();
-        let val0 = memw
-            .main_table
-            .get(row, memw_cols::VALUE[0])
-            .to_raw();
+        let val0 = memw.main_table.get(row, memw_cols::VALUE[0]).to_raw();
         let old0 = memw.main_table.get(row, memw_cols::OLD[0]).to_raw();
 
         let write2 = memw.main_table.get(row, memw_cols::WRITE2).to_raw();
@@ -1028,10 +978,7 @@ fn test_debug_memory_tokens_sb_sh() {
                 .main_table
                 .get(row, memw_cols::old_timestamp(1)[1])
                 .to_raw();
-            let val1 = memw
-                .main_table
-                .get(row, memw_cols::VALUE[1])
-                .to_raw();
+            let val1 = memw.main_table.get(row, memw_cols::VALUE[1]).to_raw();
             let old1 = memw.main_table.get(row, memw_cols::OLD[1]).to_raw();
 
             // address_add(0) = base + 1, stored as DWordHL
@@ -1263,7 +1210,13 @@ fn test_deep_stack_runtime_pages_roundtrip() {
         "deep_stack should have runtime page ranges beyond ELF (stack pages)"
     );
 
-    let prover_airs = crate::VmAirs::new(&elf, &proof_options, true, &traces.page_configs, &table_counts);
+    let prover_airs = crate::VmAirs::new(
+        &elf,
+        &proof_options,
+        true,
+        &traces.page_configs,
+        &table_counts,
+    );
     let proof = Prover::multi_prove(
         prover_airs.air_trace_pairs(&mut traces),
         &mut DefaultTranscript::<E>::new(&[]),
@@ -1272,7 +1225,8 @@ fn test_deep_stack_runtime_pages_roundtrip() {
 
     // Verifier reconstructs from ELF + runtime_page_ranges hint
     let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges);
-    let verifier_airs = crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs, &table_counts);
+    let verifier_airs =
+        crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs, &table_counts);
 
     let verified = Verifier::multi_verify(
         &verifier_airs.air_refs(),
@@ -1303,7 +1257,13 @@ fn test_deep_stack_missing_pages_rejected() {
 
     // Prover uses correct page configs (auto-detected from MemoryState)
     let table_counts = traces.table_counts();
-    let prover_airs = crate::VmAirs::new(&elf, &proof_options, true, &traces.page_configs, &table_counts);
+    let prover_airs = crate::VmAirs::new(
+        &elf,
+        &proof_options,
+        true,
+        &traces.page_configs,
+        &table_counts,
+    );
     let proof = Prover::multi_prove(
         prover_airs.air_trace_pairs(&mut traces),
         &mut DefaultTranscript::<E>::new(&[]),
@@ -1312,7 +1272,8 @@ fn test_deep_stack_missing_pages_rejected() {
 
     // Verifier uses EMPTY runtime_page_ranges → missing stack/heap pages
     let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[]);
-    let verifier_airs = crate::VmAirs::new(&elf, &proof_options, true, &wrong_configs, &table_counts);
+    let verifier_airs =
+        crate::VmAirs::new(&elf, &proof_options, true, &wrong_configs, &table_counts);
 
     let verified = Verifier::multi_verify(
         &verifier_airs.air_refs(),
@@ -1376,7 +1337,13 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
         total_pages
     );
 
-    let prover_airs = crate::VmAirs::new(&elf, &proof_options, true, &traces.page_configs, &table_counts);
+    let prover_airs = crate::VmAirs::new(
+        &elf,
+        &proof_options,
+        true,
+        &traces.page_configs,
+        &table_counts,
+    );
     let proof = Prover::multi_prove(
         prover_airs.air_trace_pairs(&mut traces),
         &mut DefaultTranscript::<E>::new(&[]),
@@ -1385,7 +1352,8 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
 
     // Verifier reconstructs from ELF + runtime hint (ranges decoded to pages)
     let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges);
-    let verifier_airs = crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs, &table_counts);
+    let verifier_airs =
+        crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs, &table_counts);
 
     let verified = Verifier::multi_verify(
         &verifier_airs.air_refs(),

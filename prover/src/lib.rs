@@ -166,12 +166,8 @@ impl VmAirs {
 
     /// Collect AIR references for [`Verifier::multi_verify`].
     pub fn air_refs(&self) -> Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> {
-        let mut refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
-            &self.bitwise,
-            &self.decode,
-            &self.halt,
-            &self.register,
-        ];
+        let mut refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+            vec![&self.bitwise, &self.decode, &self.halt, &self.register];
 
         macro_rules! extend_vec_refs {
             ($airs:expr) => {

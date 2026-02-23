@@ -1031,7 +1031,13 @@ fn test_decode_soundness_same_elf_accepted() {
 
     let mut traces = Traces::from_elf_and_logs(&prover_elf, &result.logs).unwrap();
     let table_counts = traces.table_counts();
-    let prover_airs = VmAirs::new(&prover_elf, &proof_options, false, &traces.page_configs, &table_counts);
+    let prover_airs = VmAirs::new(
+        &prover_elf,
+        &proof_options,
+        false,
+        &traces.page_configs,
+        &table_counts,
+    );
 
     let proof = Prover::multi_prove(
         prover_airs.air_trace_pairs(&mut traces),
@@ -1042,7 +1048,13 @@ fn test_decode_soundness_same_elf_accepted() {
     // =========================================================================
     // VERIFIER: Loads same ELF independently, verifies proof
     // =========================================================================
-    let verifier_airs = VmAirs::new(&verifier_elf, &proof_options, false, &traces.page_configs, &table_counts);
+    let verifier_airs = VmAirs::new(
+        &verifier_elf,
+        &proof_options,
+        false,
+        &traces.page_configs,
+        &table_counts,
+    );
 
     let result = Verifier::multi_verify(
         &verifier_airs.air_refs(),
