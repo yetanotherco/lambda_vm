@@ -1354,7 +1354,7 @@ pub trait IsStarkProver<
         // <<<< Receive challenges: 𝛾ⱼ, 𝛾ⱼ'
         let gammas = deep_composition_coefficients;
 
-        // Compute p₀ (deep composition polynomial) as evaluations on trace-size coset
+        // Compute p₀ (deep composition polynomial) as N evaluations on trace-size coset
         let deep_evals = Self::compute_deep_composition_poly_evaluations(
             &round_1_result.lde_trace,
             round_2_result,
@@ -1366,19 +1366,21 @@ pub trait IsStarkProver<
             &trace_term_coeffs,
         );
 
-        // Convert evaluations to coefficient-form via iFFT for FRI
-        let deep_composition_poly = Polynomial::interpolate_offset_fft::<Field>(
-            &deep_evals,
-            &domain.coset_offset,
-        )
-        .expect("iFFT should succeed: domain size is a power of 2");
-
+        // Extend N trace-coset evaluations to 2N LDE-coset evaluations via standard LDE.
+        // deep_evals[i] = h(offset·ω_N^i) = f(ω_N^i) where f(x) = h(offset·x).
+        // Standard iFFT+FFT recovers f and evaluates on the 2N-th roots: f(Ω^j) = h(offset·Ω^j).
         let domain_size = domain.lde_roots_of_unity_coset.len();
+        let deep_poly = Polynomial::interpolate_fft::<Field>(&deep_evals)
+            .expect("iFFT should succeed");
+        let mut lde_evals = Polynomial::evaluate_fft::<Field>(
+            &deep_poly, 1, Some(domain_size),
+        ).expect("FFT should succeed");
+        in_place_bit_reverse_permute(&mut lde_evals);
 
-        // FRI commit and query phases
-        let (fri_last_value, fri_layers) = fri::commit_phase::<Field, FieldExtension>(
+        // FRI commit phase from pre-computed evaluations (no initial FFT)
+        let (fri_last_value, fri_layers) = fri::commit_phase_from_evaluations::<Field, FieldExtension>(
             domain.root_order as usize,
-            deep_composition_poly,
+            lde_evals,
             transcript,
             &coset_offset,
             domain_size,
@@ -1429,10 +1431,8 @@ pub trait IsStarkProver<
 
     /// Computes the DEEP composition polynomial as evaluations on the trace-size coset.
     ///
-    /// This replaces the old `compute_deep_composition_poly` which operated on coefficient-form
-    /// polynomials (requiring an expensive `all_trace_polys()` clone and Ruffini divisions).
-    /// Instead, we compute `deep(x_i)` point-by-point using LDE evaluations already available
-    /// from Round 1 and Round 2, then batch-invert all denominators.
+    /// Evaluates `deep(x_i)` at N points (every bf-th point of the LDE coset).
+    /// The caller extends to the full 2N-point LDE domain before feeding to FRI.
     ///
     /// The DEEP polynomial is:
     ///   deep(X) = Σ_j γ_j * (H_j(X) - H_j(z^K)) / (X - z^K)
@@ -1474,17 +1474,16 @@ pub trait IsStarkProver<
         let num_aux_cols = lde_trace.num_aux_cols();
 
         // Precompute all inverse denominators via batch inversion.
-        // Layout: [inv_h_0, ..., inv_h_{N-1}, inv_t0_0, ..., inv_t0_{N-1}, inv_t1_0, ..., ...]
         let num_denoms = n * (1 + num_eval_points);
         let mut denoms: Vec<FieldElement<FieldExtension>> = Vec::with_capacity(num_denoms);
 
-        // H-term denominators: x_i - z^K (base field - extension field → extension field)
+        // H-term denominators: x_i - z^K
         for i in 0..n {
             let x_i = &domain.lde_roots_of_unity_coset[i * bf];
             denoms.push(x_i - &z_power);
         }
 
-        // Trace-term denominators: x_i - z_shifted[k] (base - extension → extension)
+        // Trace-term denominators: x_i - z_shifted[k]
         for k in 0..num_eval_points {
             for i in 0..n {
                 let x_i = &domain.lde_roots_of_unity_coset[i * bf];
@@ -1495,15 +1494,13 @@ pub trait IsStarkProver<
         FieldElement::inplace_batch_inverse(&mut denoms)
             .expect("Denominators should be non-zero: coset points are base field, poles are extension field");
 
-        // Split inverse denominators
         let inv_h = &denoms[0..n];
-        // inv_t[k] = &denoms[(1+k)*n .. (2+k)*n]
 
         // OOD evaluations
         let h_ood = &round_3_result.composition_poly_parts_ood_evaluation;
         let trace_ood_columns = round_3_result.trace_ood_evaluations.columns();
 
-        // Compute deep(x_i) for each coset point i
+        // Compute deep(x_i) for each trace-size coset point
         #[cfg(feature = "parallel")]
         let iter = (0..n).into_par_iter();
         #[cfg(not(feature = "parallel"))]
@@ -1512,7 +1509,7 @@ pub trait IsStarkProver<
         iter.map(|i| {
             let row_idx = i * bf; // LDE row index
 
-            // H terms: Σ_j γ_j * (H_j(row_idx) - H_j(z^K)) * inv_h[i]
+            // H terms: Σ_j γ_j * (H_j(x_i) - H_j(z^K)) * inv_h[i]
             let mut result = FieldElement::<FieldExtension>::zero();
             for j in 0..num_parts {
                 let h_j_val = &round_2_result.lde_composition_poly_evaluations[j][row_idx];
@@ -1521,7 +1518,7 @@ pub trait IsStarkProver<
                 result = result + &composition_poly_gammas[j] * numerator * &inv_h[i];
             }
 
-            // Trace terms: Σ_{j,k} γ'_{j,k} * (t_j(row_idx) - t_j(z·w^k)) * inv_t_k[i]
+            // Trace terms: Σ_{j,k} γ'_{j,k} * (t_j(x_i) - t_j(z·w^k)) * inv_t_k[i]
             let num_total_cols = num_main_cols + num_aux_cols;
             for j in 0..num_total_cols {
                 let gammas_j = &trace_terms_gammas[j];
@@ -1530,9 +1527,6 @@ pub trait IsStarkProver<
                 for k in 0..num_eval_points {
                     let inv_t_k_i = &denoms[(1 + k) * n + i];
 
-                    // Get trace value and compute numerator using mixed arithmetic.
-                    // Main columns: base field value, sub from extension → extension.
-                    // Aux columns: extension field value directly.
                     let t_j_ood = &ood_evals_j[k];
                     let numerator: FieldElement<FieldExtension> = if j < num_main_cols {
                         lde_trace.get_main(row_idx, j) - t_j_ood
