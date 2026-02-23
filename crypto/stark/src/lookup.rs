@@ -31,6 +31,21 @@ pub const SHIFT_16: u64 = 65536;
 /// 2^32 - shift for combining words
 pub const SHIFT_32: u64 = 4294967296;
 
+/// Computes powers of alpha incrementally: [1, α, α², α³, ...]
+///
+/// This is more efficient than calling `alpha.pow(i)` for each i,
+/// as it only requires one multiplication per element instead of
+/// a full exponentiation.
+fn compute_alpha_powers<E: IsField>(alpha: &FieldElement<E>, count: usize) -> Vec<FieldElement<E>> {
+    let mut powers = Vec::with_capacity(count);
+    let mut current = FieldElement::<E>::one();
+    for _ in 0..count {
+        powers.push(current.clone());
+        current = &current * alpha;
+    }
+    powers
+}
+
 // =============================================================================
 // LogUp Challenge Indices
 // =============================================================================
@@ -439,12 +454,7 @@ impl BusValue {
                             coefficient,
                             column,
                         } => {
-                            // Handle signed coefficients
-                            let coeff = if *coefficient >= 0 {
-                                FieldElement::<E>::from(*coefficient as u64)
-                            } else {
-                                -FieldElement::<E>::from((-*coefficient) as u64)
-                            };
+                            let coeff = FieldElement::<E>::from(*coefficient);
                             result += get_column(*column) * coeff;
                         }
                         LinearTerm::ColumnUnsigned {
@@ -456,12 +466,7 @@ impl BusValue {
                             result += get_column(*column) * coeff;
                         }
                         LinearTerm::Constant(value) => {
-                            // Handle signed constants
-                            if *value >= 0 {
-                                result += FieldElement::<E>::from(*value as u64);
-                            } else {
-                                result = result - FieldElement::<E>::from((-*value) as u64);
-                            }
+                            result += FieldElement::<E>::from(*value);
                         }
                     }
                 }
@@ -617,6 +622,10 @@ where
 
     fn step_size(&self) -> usize {
         self.step_size
+    }
+
+    fn name(&self) -> &str {
+        self.name.as_deref().unwrap_or("unknown")
     }
 
     fn new(_proof_options: &crate::proof::options::ProofOptions) -> Self
@@ -987,13 +996,68 @@ fn build_logup_term_column<F, E>(
     let main_segment_cols = trace.columns_main();
     let trace_len = trace.num_rows();
 
+    // Handle multiplicity column(s)
+    let multiplicities_owned: Vec<FieldElement<F>>;
+    let multiplicities: &[FieldElement<F>] = match table_interaction.multiplicity {
+        Multiplicity::One => {
+            multiplicities_owned = vec![FieldElement::one(); trace_len];
+            &multiplicities_owned
+        }
+        Multiplicity::Column(col) => &main_segment_cols[col],
+        Multiplicity::Sum(col_a, col_b) => {
+            multiplicities_owned = main_segment_cols[col_a]
+                .iter()
+                .zip(main_segment_cols[col_b].iter())
+                .map(|(a, b)| a + b)
+                .collect();
+            &multiplicities_owned
+        }
+        Multiplicity::Negated(col) => {
+            multiplicities_owned = main_segment_cols[col]
+                .iter()
+                .map(|elem| FieldElement::<F>::one() - elem)
+                .collect();
+            &multiplicities_owned
+        }
+        Multiplicity::Linear(ref terms) => {
+            multiplicities_owned = (0..trace_len)
+                .map(|row| {
+                    let mut result = FieldElement::<F>::zero();
+                    for term in terms {
+                        match *term {
+                            LinearTerm::Column {
+                                coefficient,
+                                column,
+                            } => {
+                                let coeff = FieldElement::<F>::from(coefficient);
+                                result += &main_segment_cols[column][row] * coeff;
+                            }
+                            LinearTerm::ColumnUnsigned {
+                                coefficient,
+                                column,
+                            } => {
+                                let coeff = FieldElement::<F>::from(coefficient);
+                                result += &main_segment_cols[column][row] * coeff;
+                            }
+                            LinearTerm::Constant(value) => {
+                                result += FieldElement::<F>::from(value);
+                            }
+                        }
+                    }
+                    result
+                })
+                .collect();
+            &multiplicities_owned
+        }
+    };
+
     // LogUp challenges (must be shared across all tables for bus to balance)
     let z = &challenges[LOGUP_CHALLENGE_Z];
     let alpha = &challenges[LOGUP_CHALLENGE_ALPHA];
 
-    // Precompute powers of alpha for all bus elements
+    // Precompute powers of alpha for all bus elements (using incremental multiplication)
     let num_bus_elements = table_interaction.num_bus_elements();
-    let alpha_powers: Vec<FieldElement<E>> = (0..num_bus_elements).map(|i| alpha.pow(i)).collect();
+    let alpha_powers = compute_alpha_powers(alpha, num_bus_elements);
 
     // Sign: +1 for senders, -1 for receivers
     // This bakes the sign into the term so the accumulated column can just sum everything
@@ -1003,50 +1067,16 @@ fn build_logup_term_column<F, E>(
         -FieldElement::<E>::one()
     };
 
-    for row in 0..trace_len {
-        // Compute multiplicity based on the Multiplicity variant
-        let multiplicity: FieldElement<F> = match &table_interaction.multiplicity {
-            Multiplicity::One => FieldElement::<F>::one(),
-            Multiplicity::Column(col) => main_segment_cols[*col][row].clone(),
-            Multiplicity::Sum(col_a, col_b) => {
-                &main_segment_cols[*col_a][row] + &main_segment_cols[*col_b][row]
-            }
-            Multiplicity::Negated(col) => FieldElement::<F>::one() - &main_segment_cols[*col][row],
-            Multiplicity::Linear(terms) => {
-                let mut result = FieldElement::<F>::zero();
-                for term in terms {
-                    match term {
-                        LinearTerm::Column {
-                            coefficient,
-                            column,
-                        } => {
-                            let coeff = if *coefficient >= 0 {
-                                FieldElement::<F>::from(*coefficient as u64)
-                            } else {
-                                -FieldElement::<F>::from((-*coefficient) as u64)
-                            };
-                            result += &main_segment_cols[*column][row] * coeff;
-                        }
-                        LinearTerm::ColumnUnsigned {
-                            coefficient,
-                            column,
-                        } => {
-                            let coeff = FieldElement::<F>::from(*coefficient);
-                            result += &main_segment_cols[*column][row] * coeff;
-                        }
-                        LinearTerm::Constant(value) => {
-                            if *value >= 0 {
-                                result += FieldElement::<F>::from(*value as u64);
-                            } else {
-                                result = result - FieldElement::<F>::from((-*value) as u64);
-                            }
-                        }
-                    }
-                }
-                result
-            }
-        };
+    // =========================================================================
+    // OPTIMIZATION: Batch inversion
+    // Instead of inverting each fingerprint individually (O(n) inversions),
+    // we collect all fingerprints first and batch invert them (O(1) inversion + O(n) multiplications).
+    // This is significantly faster for large traces.
+    // =========================================================================
 
+    // Step 1: Compute all fingerprints
+    let mut fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(trace_len);
+    for row in 0..trace_len {
         // Bus elements: [bus_id, ...values...]
         // bus_id is first element to distinguish different buses
         let mut bus_elements: Vec<FieldElement<E>> =
@@ -1069,27 +1099,31 @@ fn build_logup_term_column<F, E>(
             .map(|(v, coeff)| v * coeff)
             .sum();
 
-        let fingerprint = z - &linear_combination;
+        fingerprints.push(z - &linear_combination);
 
-        // Debug: Log bus interaction for mismatch analysis
         #[cfg(feature = "debug-checks")]
         crate::bus_debug::log_interaction(
             table_name,
             row,
             table_interaction.bus_id,
             table_interaction.is_sender,
-            &multiplicity.canonical(),
+            &multiplicities[row].canonical(),
             &bus_elements,
-            &fingerprint,
+            fingerprints.last().unwrap(),
         );
+    }
 
-        // term = sign * multiplicity / fingerprint
-        let term = multiplicity
-            * &sign
-            * fingerprint
-                .inv()
-                .expect("fingerprint is zero - probability of sampling zero is negligible");
+    // Step 2: Batch invert all fingerprints
+    // This uses Montgomery's trick: compute product prefix, invert once, then multiply back
+    FieldElement::inplace_batch_inverse(&mut fingerprints)
+        .expect("fingerprint is zero - probability of sampling zero is negligible");
 
+    // Step 3: Compute terms using the inverted fingerprints
+    for (row, (multiplicity, fingerprint_inv)) in
+        multiplicities.iter().zip(fingerprints.iter()).enumerate()
+    {
+        // term = sign * multiplicity * fingerprint^(-1)
+        let term = multiplicity * &sign * fingerprint_inv;
         trace.set_aux(row, aux_column_idx, term);
     }
 }
@@ -1244,11 +1278,7 @@ where
                                 coefficient,
                                 column,
                             } => {
-                                let coeff = if *coefficient >= 0 {
-                                    FieldElement::<A>::from(*coefficient as u64)
-                                } else {
-                                    -FieldElement::<A>::from((-*coefficient) as u64)
-                                };
+                                let coeff = FieldElement::<A>::from(*coefficient);
                                 result += step.get_main_evaluation_element(0, *column) * coeff;
                             }
                             LinearTerm::ColumnUnsigned {
@@ -1259,11 +1289,7 @@ where
                                 result += step.get_main_evaluation_element(0, *column) * coeff;
                             }
                             LinearTerm::Constant(value) => {
-                                if *value >= 0 {
-                                    result += FieldElement::<A>::from(*value as u64);
-                                } else {
-                                    result = result - FieldElement::<A>::from((-*value) as u64);
-                                }
+                                result += FieldElement::<A>::from(*value);
                             }
                         }
                     }
@@ -1286,9 +1312,8 @@ where
                 combined.into_iter().map(|v| v.to_extension())
             }));
 
-            // Coefficients for each bus element (including bus_id)
-            let coeffs: Vec<FieldElement<B>> =
-                (0..bus_elements.len()).map(|i| alpha.pow(i)).collect();
+            // Coefficients for each bus element (including bus_id) (using incremental multiplication)
+            let coeffs = compute_alpha_powers(alpha, bus_elements.len());
 
             // fingerprint = z - (bus_id + v[0]*α + v[1]*α² + ... + v[n]*α^(n+1))
             let fingerprint: FieldElement<B> = (-bus_elements

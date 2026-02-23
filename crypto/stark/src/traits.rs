@@ -81,6 +81,11 @@ pub trait AIR: Send + Sync {
 
     fn step_size(&self) -> usize;
 
+    /// Human-readable name for this AIR (used in profiling output).
+    fn name(&self) -> &str {
+        "unknown"
+    }
+
     fn new(proof_options: &ProofOptions) -> Self
     where
         Self: Sized;
