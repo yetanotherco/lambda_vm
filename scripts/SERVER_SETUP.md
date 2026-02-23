@@ -11,7 +11,7 @@ Install dependencies:
 ```bash
 sudo apt-get install -y time
 sudo apt update
-sudo apt install lsb-release wget software-properties-common gnupg
+sudo apt install lsb-release wget software-properties-common gnupg tmux
 ```
 
 Install and set up LLVM 18 toolchain:
@@ -61,5 +61,21 @@ rustup toolchain install nightly-2026-02-01-x86_64-unknown-linux-gnu
 ```bash
 make compile-programs-asm
 ```
+
+### 5. Install GitHub Actions runner
+
+Go to **GitHub repo > Settings > Actions > Runners > New self-hosted runner**, select Linux, and follow the download and configuration steps. When prompted for labels, add `bench`.
+
+Start the runner inside a tmux session so it persists after disconnecting:
+
+```bash
+tmux
+cd ~/actions-runner
+./run.sh
+```
+
+Detach from the session with `Ctrl+b` then `d`.
+
+You should see the new runner as idle/active in **GitHub repo > Settings > Actions > Runners**.
 
 The server is now ready to run benchmarks. See [BENCHMARKS.md](BENCHMARKS.md) for usage.
