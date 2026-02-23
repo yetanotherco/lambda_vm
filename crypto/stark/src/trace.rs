@@ -1,5 +1,6 @@
 use crate::table::Table;
 use itertools::Itertools;
+use math::fft::cpu::bowers_fft::LayerTwiddles;
 use math::fft::errors::FFTError;
 use math::field::traits::{IsField, IsSubFieldOf};
 use math::{
@@ -192,15 +193,20 @@ where
     pub fn compute_trace_polys_main<S>(&self) -> Vec<Polynomial<FieldElement<F>>>
     where
         S: IsFFTField + IsSubFieldOf<F>,
+        F: Send + Sync,
+        FieldElement<S>: Send + Sync,
         FieldElement<F>: Send + Sync,
     {
         let columns = self.columns_main();
+        let order = self.num_rows().trailing_zeros() as u64;
+        let inv_twiddles = LayerTwiddles::<S>::new_inverse(order).unwrap();
+
         #[cfg(feature = "parallel")]
         let iter = columns.par_iter();
         #[cfg(not(feature = "parallel"))]
         let iter = columns.iter();
 
-        iter.map(|col| Polynomial::interpolate_fft::<S>(col))
+        iter.map(|col| Polynomial::interpolate_fft_with_twiddles::<S>(col, &inv_twiddles))
             .collect::<Result<Vec<Polynomial<FieldElement<F>>>, FFTError>>()
             .unwrap()
     }
@@ -208,15 +214,20 @@ where
     pub fn compute_trace_polys_aux<S>(&self) -> Vec<Polynomial<FieldElement<E>>>
     where
         S: IsFFTField + IsSubFieldOf<F>,
+        E: Send + Sync,
+        FieldElement<F>: Send + Sync,
         FieldElement<E>: Send + Sync,
     {
         let columns = self.columns_aux();
+        let order = self.num_rows().trailing_zeros() as u64;
+        let inv_twiddles = LayerTwiddles::<F>::new_inverse(order).unwrap();
+
         #[cfg(feature = "parallel")]
         let iter = columns.par_iter();
         #[cfg(not(feature = "parallel"))]
         let iter = columns.iter();
 
-        iter.map(|col| Polynomial::interpolate_fft::<F>(col))
+        iter.map(|col| Polynomial::interpolate_fft_with_twiddles::<F>(col, &inv_twiddles))
             .collect::<Result<Vec<Polynomial<FieldElement<E>>>, FFTError>>()
             .unwrap()
     }

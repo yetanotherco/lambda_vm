@@ -96,6 +96,62 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         Ok(scaled.scale(&offset.inv().unwrap()))
     }
 
+    /// Like `interpolate_fft` but accepts pre-computed inverse twiddles.
+    pub fn interpolate_fft_with_twiddles<F: IsFFTField + IsSubFieldOf<E>>(
+        fft_evals: &[FieldElement<E>],
+        inv_twiddles: &super::cpu::bowers_fft::LayerTwiddles<F>,
+    ) -> Result<Self, FFTError>
+    where
+        E: Send + Sync,
+        FieldElement<F>: Send + Sync,
+        FieldElement<E>: Send + Sync,
+    {
+        interpolate_fft_cpu_with_twiddles::<F, E>(fft_evals, inv_twiddles)
+    }
+
+    /// Like `evaluate_fft` but accepts pre-computed twiddles.
+    pub fn evaluate_fft_with_twiddles<F: IsFFTField + IsSubFieldOf<E>>(
+        poly: &Polynomial<FieldElement<E>>,
+        blowup_factor: usize,
+        domain_size: Option<usize>,
+        twiddles: &super::cpu::bowers_fft::LayerTwiddles<F>,
+    ) -> Result<Vec<FieldElement<E>>, FFTError>
+    where
+        E: Send + Sync,
+        FieldElement<F>: Send + Sync,
+        FieldElement<E>: Send + Sync,
+    {
+        let domain_size = domain_size.unwrap_or(0);
+        let len = core::cmp::max(poly.coeff_len(), domain_size).next_power_of_two() * blowup_factor;
+        if len.trailing_zeros() as u64 > F::TWO_ADICITY {
+            return Err(FFTError::DomainSizeError(len.trailing_zeros() as usize));
+        }
+        if poly.coefficients().is_empty() {
+            return Ok(vec![FieldElement::zero(); len]);
+        }
+
+        let mut coeffs = poly.coefficients().to_vec();
+        coeffs.resize(len, FieldElement::zero());
+        evaluate_fft_cpu_with_twiddles::<F, E>(&coeffs, twiddles)
+    }
+
+    /// Like `evaluate_offset_fft` but accepts pre-computed twiddles.
+    pub fn evaluate_offset_fft_with_twiddles<F: IsFFTField + IsSubFieldOf<E>>(
+        poly: &Polynomial<FieldElement<E>>,
+        blowup_factor: usize,
+        domain_size: Option<usize>,
+        offset: &FieldElement<F>,
+        twiddles: &super::cpu::bowers_fft::LayerTwiddles<F>,
+    ) -> Result<Vec<FieldElement<E>>, FFTError>
+    where
+        E: Send + Sync,
+        FieldElement<F>: Send + Sync,
+        FieldElement<E>: Send + Sync,
+    {
+        let scaled = poly.scale(offset);
+        Polynomial::evaluate_fft_with_twiddles::<F>(&scaled, blowup_factor, domain_size, twiddles)
+    }
+
     /// Multiplies two polynomials using FFT.
     /// It's faster than naive multiplication when the degree of the polynomials is large enough (>=2**6).
     /// This works best with polynomials whose highest degree is equal to a power of 2 - 1.
@@ -212,6 +268,29 @@ where
     Ok(results)
 }
 
+/// Like `evaluate_fft_cpu` but accepts pre-computed twiddles to avoid redundant computation.
+pub fn evaluate_fft_cpu_with_twiddles<F, E>(
+    coeffs: &[FieldElement<E>],
+    layer_twiddles: &super::cpu::bowers_fft::LayerTwiddles<F>,
+) -> Result<Vec<FieldElement<E>>, FFTError>
+where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField + Send + Sync,
+    FieldElement<F>: Send + Sync,
+    FieldElement<E>: Send + Sync,
+{
+    let mut results = coeffs.to_vec();
+
+    #[cfg(feature = "parallel")]
+    super::cpu::bowers_fft::bowers_fft_opt_fused_parallel(&mut results, layer_twiddles)?;
+
+    #[cfg(not(feature = "parallel"))]
+    super::cpu::bowers_fft::bowers_fft_opt_fused(&mut results, layer_twiddles)?;
+
+    super::cpu::bit_reversing::in_place_bit_reverse_permute(&mut results);
+    Ok(results)
+}
+
 pub fn interpolate_fft_cpu<F, E>(
     fft_evals: &[FieldElement<E>],
 ) -> Result<Polynomial<FieldElement<E>>, FFTError>
@@ -225,6 +304,30 @@ where
     let mut results = fft_evals.to_vec();
     super::cpu::bit_reversing::in_place_bit_reverse_permute(&mut results);
     super::cpu::bowers_fft::bowers_ifft_opt(&mut results, &inv_twiddles)?;
+
+    let scale_factor = FieldElement::from(fft_evals.len() as u64).inv().unwrap();
+    Ok(Polynomial::new(&results).scale_coeffs(&scale_factor))
+}
+
+/// Like `interpolate_fft_cpu` but accepts pre-computed inverse twiddles.
+pub fn interpolate_fft_cpu_with_twiddles<F, E>(
+    fft_evals: &[FieldElement<E>],
+    inv_twiddles: &super::cpu::bowers_fft::LayerTwiddles<F>,
+) -> Result<Polynomial<FieldElement<E>>, FFTError>
+where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField + Send + Sync,
+    FieldElement<F>: Send + Sync,
+    FieldElement<E>: Send + Sync,
+{
+    let mut results = fft_evals.to_vec();
+    super::cpu::bit_reversing::in_place_bit_reverse_permute(&mut results);
+
+    #[cfg(feature = "parallel")]
+    super::cpu::bowers_fft::bowers_ifft_opt_parallel(&mut results, inv_twiddles)?;
+
+    #[cfg(not(feature = "parallel"))]
+    super::cpu::bowers_fft::bowers_ifft_opt(&mut results, inv_twiddles)?;
 
     let scale_factor = FieldElement::from(fft_evals.len() as u64).inv().unwrap();
     Ok(Polynomial::new(&results).scale_coeffs(&scale_factor))

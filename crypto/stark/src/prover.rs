@@ -5,6 +5,7 @@ use std::time::Instant;
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use crypto::merkle_tree::traits::IsMerkleTreeBackend;
 use math::fft::cpu::bit_reversing::{in_place_bit_reverse_permute, reverse_index};
+use math::fft::cpu::bowers_fft::LayerTwiddles;
 use math::fft::errors::FFTError;
 
 use log::info;
@@ -193,6 +194,33 @@ where
     E: IsField,
 {
     let evaluations = Polynomial::evaluate_offset_fft(p, blowup_factor, Some(domain_size), offset)?;
+    let step = evaluations.len() / (domain_size * blowup_factor);
+    match step {
+        1 => Ok(evaluations),
+        _ => Ok(evaluations.into_iter().step_by(step).collect()),
+    }
+}
+
+pub fn evaluate_polynomial_on_lde_domain_with_twiddles<F, E>(
+    p: &Polynomial<FieldElement<E>>,
+    blowup_factor: usize,
+    domain_size: usize,
+    offset: &FieldElement<F>,
+    twiddles: &LayerTwiddles<F>,
+) -> Result<Vec<FieldElement<E>>, FFTError>
+where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField + Send + Sync,
+    FieldElement<F>: Send + Sync,
+    FieldElement<E>: Send + Sync,
+{
+    let evaluations = Polynomial::evaluate_offset_fft_with_twiddles(
+        p,
+        blowup_factor,
+        Some(domain_size),
+        offset,
+        twiddles,
+    )?;
     let step = evaluations.len() / (domain_size * blowup_factor);
     match step {
         1 => Ok(evaluations),
@@ -428,9 +456,14 @@ pub trait IsStarkProver<
         domain: &Domain<Field>,
     ) -> Vec<Vec<FieldElement<E>>>
     where
-        E: IsSubFieldOf<FieldExtension>,
+        E: IsSubFieldOf<FieldExtension> + Send + Sync,
         Field: IsSubFieldOf<E>,
+        FieldElement<E>: Send + Sync,
     {
+        let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
+        let lde_order = lde_size.trailing_zeros() as u64;
+        let twiddles = LayerTwiddles::<Field>::new(lde_order).unwrap();
+
         #[cfg(not(feature = "parallel"))]
         let trace_polys_iter = trace_polys.iter();
         #[cfg(feature = "parallel")]
@@ -438,11 +471,12 @@ pub trait IsStarkProver<
 
         trace_polys_iter
             .map(|poly| {
-                evaluate_polynomial_on_lde_domain(
+                evaluate_polynomial_on_lde_domain_with_twiddles::<Field, E>(
                     poly,
                     domain.blowup_factor,
                     domain.interpolation_domain_size,
                     &domain.coset_offset,
+                    &twiddles,
                 )
             })
             .collect::<Result<Vec<Vec<FieldElement<E>>>, FFTError>>()
@@ -669,14 +703,19 @@ pub trait IsStarkProver<
         let number_of_parts = air.composition_poly_degree_bound(trace_length) / trace_length;
         let composition_poly_parts = composition_poly.break_in_parts(number_of_parts);
 
+        let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
+        let lde_order = lde_size.trailing_zeros() as u64;
+        let twiddles = LayerTwiddles::<Field>::new(lde_order).unwrap();
+
         let lde_composition_poly_parts_evaluations: Vec<_> = composition_poly_parts
             .iter()
             .map(|part| {
-                evaluate_polynomial_on_lde_domain(
+                evaluate_polynomial_on_lde_domain_with_twiddles(
                     part,
                     domain.blowup_factor,
                     domain.interpolation_domain_size,
                     &domain.coset_offset,
+                    &twiddles,
                 )
                 .unwrap()
             })
