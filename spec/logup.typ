@@ -1,4 +1,4 @@
-#import "/book.typ": book-page, cdsg
+#import "/book.typ": book-page, aside, cdsg
 
 #show: book-page("logup")
 #set heading(numbering: "1.")
@@ -16,7 +16,7 @@ The _LogUp_ proof system conducts a permutation check based on summing partial d
 == VM Notation
 
 === Preliminary notation
-- $NN$: the set of non-zero natural integers.
+- $NN$: the set of non-negative natural integers.
 - $BaseField$: the base finite field used by the arithmetisation.
 - $ExtensionField$: a finite extension of $BaseField$ of cryptographic size.
 - $[n]$ for $n in NN$: the set of integers ${0, dots, n - 1}$.
@@ -53,7 +53,6 @@ The $j$-th _interaction_ $Interaction_j$ of table $Table_i$ is defined by the fo
   table.header([*Symbol*], [*Description*]),
   table.hline(stroke: 1pt),
   table.vline(stroke: 1pt, x: 1),
-  table.header([Symbol], [Description]),
   [$id_(i,j) in FF$], 
   [the _type identifier_ of the interaction, usually the identifier of the chip that is constraining the relation expected to hold within the looked-up tuple.],
   [$numElements_(i,j) in NN$], 
@@ -85,7 +84,7 @@ The $j$-th _interaction_ $Interaction_j$ of table $Table_i$ is defined by the fo
 
     + For each interaction $Interaction_j$ of table $Table_i$, initialize an empty _interaction contribution column_ of length $numRows_i$.
 
-    + Initialise a _table running sum column_ $S_i in ExtensionField^(numRows_i)$ with $S_i [0] = 0_ExtensionField$ in the first row.
+    + Initialise a _table running sum column_ $S_i in ExtensionField^(numRows_i)$ with the first value $S_i [0]$ populated according to the constraint choice.
 
     + *Constrain* the first row if required by selected constraint choice.
 
@@ -107,6 +106,8 @@ The $j$-th _interaction_ $Interaction_j$ of table $Table_i$ is defined by the fo
 + Verifier checks that the sum of every table's overall contribution is equal to zero: $sum_i S_i [N_i - 1] = 0_ExtensionField$, and delegates the checks of the constraints to the STARK.
 
 == Running Sum Constraint Choices <constraint_choices>
+
+#cdsg[Write the constraints in this section more formally after STARK description has been written.]
 
 === Choice 1: transitions looking back
 
@@ -130,6 +131,16 @@ Total constraints: 2 boundary + 1 transition over $numRows_i - 1$ rows.
 
 === Choice 3: circular transitions looking back/forward
 
-+ For each row, constrain the _current/next_ (wrapping to first on last if next) running sum value to equal the sum of every current interaction contribution value added to the _previous/current_ (wrapping to last on first if previous) running sum value added to claimed table contribution divided by $numRows_i$.
++ For each row, constrain the _current/next_ (wrapping to first on last if "next") running sum value to equal the sum of every current interaction contribution value added to the _previous/current_ (wrapping to last on first if "previous") running sum value added to claimed table contribution divided by $numRows_i$.
 
 Total constraints: 1 _circular_ transition over $numRows_i$ rows.
+
+#aside("Justification")[
+  This single circular constraint checks that each row's contribution $s_(i,j)$ is added to the running sum column, either in the current row's cell or in the next row's.
+  In order to avoid boundary constraints, the look-back or peek-forward into the running sum column wraps around the beginning or end of the table.
+
+  This alone implies that difference between first and last row's values will be the table's overall real contribution $sum_j s_(i,j)$, which will be incompatible with the circularity of the constraint.
+  Since boundary constraints are avoided, the way to check that $sum_j s_(i,j)$ equals the claimed contribution $L_i$ is to remove a fraction of $L_i$ at each row in such a way that $L_i$ is removed completely after summing all $numRows_i$ rows; i.e., the constraint subtracts the public term $L_i / numRows_i$ from the running sum at every row.
+
+  If the expected equality $sum_j s_(i,j) = L_i$ holds, then the circularity of the constraint will also hold.
+]

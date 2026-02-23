@@ -7,6 +7,7 @@
   title: "Lambda VM specification",
   authors: ("3MI Labs", "Aligned"),
   summary: (
+    ("logup.typ", [LogUp argument], <logup>),
     ("memory.typ", [Memory argument], <memory>),
     ("variables.typ", [Variables], <vars>),
     ("signatures.typ", [Signatures], <signatures>),
@@ -25,7 +26,6 @@
     ("load.typ", [LOAD chip], <load>),
     ("ecall.typ", [ECALL chips], <ecall>),
     ("bitwise.typ", [BITWISE chips], <bitwise>),
-    ("logup.typ", [LogUp argument], <logup>)
   )
 )
 #book-meta(
