@@ -95,9 +95,8 @@ we can see the necessity for a memory initialization procedure
 ---in addition to having to make sure the initial memory content lines up with what the binary dictates.
 
 So long as we can properly constrain temporal integrity (that is, no memory operation can consume future tokens),
-this "balancing" act of tokens can be integrated (with sufficient domain separation) into the existing LogUp argument:
+this "balancing" act of tokens can be integrated (with sufficient domain separation) into the existing LogUp argument (@logup):
 consuming a token corresponds to a "receive" and emitting a new token is a "send".
-#rj[properly link/refer to the logup spec]
 
 = Temporal integrity
 

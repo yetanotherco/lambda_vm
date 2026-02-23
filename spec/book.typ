@@ -7,6 +7,7 @@
   title: "Lambda VM specification",
   authors: ("3MI Labs", "Aligned"),
   summary: (
+    ("logup.typ", [LogUp argument], <logup>),
     ("memory.typ", [Memory argument], <memory>),
     ("variables.typ", [Variables], <vars>),
     ("signatures.typ", [Signatures], <signatures>),
@@ -40,12 +41,13 @@
 }
 
 
-#let todo(background: white, foreground: black, name: none, body) = block(fill: background, outset: 0.5em, radius: 20%, stroke: black)[
+#let todo(background: white, foreground: black, name: none, body) = block(fill: background, outset: 0.4em, radius: 20%, stroke: black)[
   #set text(fill: foreground)
   *TODO #if name != none { [(#name)] }*: #body
 ]
 #let rj = todo.with(background: teal, name: "Robin")
 #let et = todo.with(background: rgb("d4aa3a"), name: "Erik")
+#let cdsg = todo.with(background: olive, name: "Cyprien")
 
 #let aside(title, body) = context figure(
   block(inset: (left: 1em, right: 1em, bottom: 1em), stroke: luma(50%), breakable: false)[
