@@ -208,6 +208,125 @@ impl Packing {
             .collect()
     }
 
+    /// Accumulates the fingerprint contribution of this packing into `acc`.
+    ///
+    /// Computes: `acc += Σ combined_element_i * alpha_powers[alpha_offset + i]`
+    /// where `combined_element_i` are the bus elements produced by this packing.
+    ///
+    /// Returns the number of alpha powers consumed (= num_bus_elements()).
+    ///
+    /// This avoids allocating intermediate Vecs for the combined elements.
+    /// `main_cols` are column-major: `main_cols[col][row]`.
+    pub fn accumulate_fingerprint<F, E>(
+        &self,
+        main_cols: &[Vec<FieldElement<F>>],
+        row: usize,
+        start_col: usize,
+        alpha_powers: &[FieldElement<E>],
+        alpha_offset: usize,
+        acc: &mut FieldElement<E>,
+    ) -> usize
+    where
+        F: IsField + IsSubFieldOf<E>,
+        E: IsField,
+    {
+        match self {
+            Packing::Direct => {
+                *acc += &main_cols[start_col][row] * &alpha_powers[alpha_offset];
+                1
+            }
+            Packing::Word2L => {
+                let shift_16 = FieldElement::<F>::from(SHIFT_16);
+                let combined =
+                    &main_cols[start_col][row] + &main_cols[start_col + 1][row] * &shift_16;
+                *acc += &combined * &alpha_powers[alpha_offset];
+                1
+            }
+            Packing::Word4L => {
+                let shift_8 = FieldElement::<F>::from(SHIFT_8);
+                let shift_16 = FieldElement::<F>::from(SHIFT_16);
+                let shift_24 = &shift_8 * &shift_16;
+                let combined = &main_cols[start_col][row]
+                    + &main_cols[start_col + 1][row] * &shift_8
+                    + &main_cols[start_col + 2][row] * &shift_16
+                    + &main_cols[start_col + 3][row] * &shift_24;
+                *acc += &combined * &alpha_powers[alpha_offset];
+                1
+            }
+            // Compound packings: decompose into primitives.
+            // No recursion through generic closures — all reference main_cols directly.
+            Packing::DWordWL => {
+                // 2× Direct
+                *acc += &main_cols[start_col][row] * &alpha_powers[alpha_offset];
+                *acc += &main_cols[start_col + 1][row] * &alpha_powers[alpha_offset + 1];
+                2
+            }
+            Packing::DWordHHW => {
+                // Direct + Word2L
+                *acc += &main_cols[start_col][row] * &alpha_powers[alpha_offset];
+                let shift_16 = FieldElement::<F>::from(SHIFT_16);
+                let w = &main_cols[start_col + 1][row]
+                    + &main_cols[start_col + 2][row] * &shift_16;
+                *acc += &w * &alpha_powers[alpha_offset + 1];
+                2
+            }
+            Packing::DWordWHH => {
+                // Word2L + Direct
+                let shift_16 = FieldElement::<F>::from(SHIFT_16);
+                let w = &main_cols[start_col][row]
+                    + &main_cols[start_col + 1][row] * &shift_16;
+                *acc += &w * &alpha_powers[alpha_offset];
+                *acc += &main_cols[start_col + 2][row] * &alpha_powers[alpha_offset + 1];
+                2
+            }
+            Packing::DWordHL => {
+                // 2× Word2L
+                let shift_16 = FieldElement::<F>::from(SHIFT_16);
+                let w0 = &main_cols[start_col][row]
+                    + &main_cols[start_col + 1][row] * &shift_16;
+                *acc += &w0 * &alpha_powers[alpha_offset];
+                let w1 = &main_cols[start_col + 2][row]
+                    + &main_cols[start_col + 3][row] * &shift_16;
+                *acc += &w1 * &alpha_powers[alpha_offset + 1];
+                2
+            }
+            Packing::DWordBL => {
+                // 2× Word4L
+                let shift_8 = FieldElement::<F>::from(SHIFT_8);
+                let shift_16 = FieldElement::<F>::from(SHIFT_16);
+                let shift_24 = &shift_8 * &shift_16;
+                let w0 = &main_cols[start_col][row]
+                    + &main_cols[start_col + 1][row] * &shift_8
+                    + &main_cols[start_col + 2][row] * &shift_16
+                    + &main_cols[start_col + 3][row] * &shift_24;
+                *acc += &w0 * &alpha_powers[alpha_offset];
+                let w1 = &main_cols[start_col + 4][row]
+                    + &main_cols[start_col + 5][row] * &shift_8
+                    + &main_cols[start_col + 6][row] * &shift_16
+                    + &main_cols[start_col + 7][row] * &shift_24;
+                *acc += &w1 * &alpha_powers[alpha_offset + 1];
+                2
+            }
+            Packing::QuadHL => {
+                // 4× Word2L
+                let shift_16 = FieldElement::<F>::from(SHIFT_16);
+                for i in 0..4 {
+                    let c = start_col + i * 2;
+                    let w = &main_cols[c][row] + &main_cols[c + 1][row] * &shift_16;
+                    *acc += &w * &alpha_powers[alpha_offset + i];
+                }
+                4
+            }
+            Packing::QuadWL => {
+                // 4× Direct
+                for i in 0..4 {
+                    *acc += &main_cols[start_col + i][row] * &alpha_powers[alpha_offset + i];
+                }
+                4
+            }
+        }
+    }
+
     /// Combines column values into bus elements using powers of 2.
     ///
     /// Primitive packings define the combining formulas.
@@ -424,6 +543,63 @@ impl BusValue {
                     LinearTerm::Constant(_) => None,
                 })
                 .collect(),
+        }
+    }
+
+    /// Accumulates the fingerprint contribution of this bus value into `acc`.
+    ///
+    /// Computes: `acc += Σ element_i * alpha_powers[alpha_offset + i]`
+    /// Returns the number of alpha powers consumed.
+    pub fn accumulate_fingerprint<F, E>(
+        &self,
+        main_cols: &[Vec<FieldElement<F>>],
+        row: usize,
+        alpha_powers: &[FieldElement<E>],
+        alpha_offset: usize,
+        acc: &mut FieldElement<E>,
+    ) -> usize
+    where
+        F: IsField + IsSubFieldOf<E>,
+        E: IsField,
+    {
+        match self {
+            BusValue::Packed {
+                start_column,
+                packing,
+            } => packing.accumulate_fingerprint(
+                main_cols,
+                row,
+                *start_column,
+                alpha_powers,
+                alpha_offset,
+                acc,
+            ),
+            BusValue::Linear(terms) => {
+                let mut result = FieldElement::<F>::zero();
+                for term in terms {
+                    match term {
+                        LinearTerm::Column {
+                            coefficient,
+                            column,
+                        } => {
+                            let coeff = FieldElement::<F>::from(*coefficient);
+                            result += &main_cols[*column][row] * coeff;
+                        }
+                        LinearTerm::ColumnUnsigned {
+                            coefficient,
+                            column,
+                        } => {
+                            let coeff = FieldElement::<F>::from(*coefficient);
+                            result += &main_cols[*column][row] * coeff;
+                        }
+                        LinearTerm::Constant(value) => {
+                            result += FieldElement::<F>::from(*value);
+                        }
+                    }
+                }
+                *acc += &result * &alpha_powers[alpha_offset];
+                1
+            }
         }
     }
 
@@ -1086,34 +1262,45 @@ where
     // Batch inversion: collect all fingerprints, invert once, then multiply back.
     // Compute fingerprint = z - (bus_id*α^0 + v0*α^1 + v1*α^2 + ...) using
     // base-field × extension-field multiplication (F×E→E) to avoid to_extension().
+    //
+    // Zero-allocation inner loop: accumulate the linear combination directly
+    // into the fingerprint without collecting bus elements into intermediate Vecs.
     let bus_id_f = FieldElement::<F>::from(table_interaction.bus_id);
     let mut fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(trace_len);
     for row in 0..trace_len {
-        // Collect bus elements in base field
-        let mut base_elements: Vec<FieldElement<F>> = vec![bus_id_f.clone()];
-        base_elements.extend(table_interaction.values.iter().flat_map(|bv| {
-            bv.combine_from(|col| main_segment_cols[col][row].clone())
-        }));
-
-        // Linear combination using F×E→E multiplication (no to_extension needed)
-        let linear_combination: FieldElement<E> = base_elements
-            .iter()
-            .zip(alpha_powers.iter())
-            .map(|(v, coeff)| v * coeff)
-            .sum();
+        // Accumulate fingerprint directly: bus_id * α^0 + Σ element_i * α^(1+i)
+        let mut linear_combination = &bus_id_f * &alpha_powers[0];
+        let mut alpha_offset = 1;
+        for bv in &table_interaction.values {
+            let consumed = bv.accumulate_fingerprint(
+                main_segment_cols,
+                row,
+                &alpha_powers,
+                alpha_offset,
+                &mut linear_combination,
+            );
+            alpha_offset += consumed;
+        }
 
         fingerprints.push(z - &linear_combination);
 
         #[cfg(feature = "debug-checks")]
-        crate::bus_debug::log_interaction(
-            _table_name,
-            row,
-            table_interaction.bus_id,
-            table_interaction.is_sender,
-            &multiplicities[row].canonical(),
-            &base_elements,
-            fingerprints.last().unwrap(),
-        );
+        {
+            // Reconstruct base_elements for debug logging
+            let mut base_elements: Vec<FieldElement<F>> = vec![bus_id_f.clone()];
+            base_elements.extend(table_interaction.values.iter().flat_map(|bv| {
+                bv.combine_from(|col| main_segment_cols[col][row].clone())
+            }));
+            crate::bus_debug::log_interaction(
+                _table_name,
+                row,
+                table_interaction.bus_id,
+                table_interaction.is_sender,
+                &multiplicities[row].canonical(),
+                &base_elements,
+                fingerprints.last().unwrap(),
+            );
+        }
     }
 
     FieldElement::inplace_batch_inverse(&mut fingerprints)
@@ -1299,26 +1486,138 @@ where
                 }
             };
 
-            // Bus elements in base field: [bus_id, ...values...]
-            let mut base_elements: Vec<FieldElement<A>> =
-                vec![FieldElement::<A>::from(interaction.bus_id)];
+            // Compute fingerprint inline without allocating intermediate Vecs.
+            // fingerprint = z - (bus_id*α^0 + v[0]*α^1 + v[1]*α^2 + ...)
+            let bus_id_f = FieldElement::<A>::from(interaction.bus_id);
+            let mut linear_combination = &bus_id_f * &FieldElement::<B>::one();
+            let mut alpha_power = FieldElement::<B>::one();
+            for bv in &interaction.values {
+                match bv {
+                    BusValue::Packed { start_column, packing } => {
+                        match packing {
+                            Packing::Direct => {
+                                alpha_power = &alpha_power * alpha;
+                                linear_combination += step.get_main_evaluation_element(0, *start_column) * &alpha_power;
+                            }
+                            Packing::Word2L => {
+                                alpha_power = &alpha_power * alpha;
+                                let shift_16 = FieldElement::<A>::from(SHIFT_16);
+                                let combined = step.get_main_evaluation_element(0, *start_column)
+                                    + step.get_main_evaluation_element(0, *start_column + 1) * &shift_16;
+                                linear_combination += &combined * &alpha_power;
+                            }
+                            Packing::Word4L => {
+                                alpha_power = &alpha_power * alpha;
+                                let shift_8 = FieldElement::<A>::from(SHIFT_8);
+                                let shift_16 = FieldElement::<A>::from(SHIFT_16);
+                                let shift_24 = &shift_8 * &shift_16;
+                                let combined = step.get_main_evaluation_element(0, *start_column)
+                                    + step.get_main_evaluation_element(0, *start_column + 1) * &shift_8
+                                    + step.get_main_evaluation_element(0, *start_column + 2) * &shift_16
+                                    + step.get_main_evaluation_element(0, *start_column + 3) * &shift_24;
+                                linear_combination += &combined * &alpha_power;
+                            }
+                            Packing::DWordWL => {
+                                // 2× Direct
+                                alpha_power = &alpha_power * alpha;
+                                linear_combination += step.get_main_evaluation_element(0, *start_column) * &alpha_power;
+                                alpha_power = &alpha_power * alpha;
+                                linear_combination += step.get_main_evaluation_element(0, *start_column + 1) * &alpha_power;
+                            }
+                            Packing::DWordHL => {
+                                // 2× Word2L
+                                let shift_16 = FieldElement::<A>::from(SHIFT_16);
+                                alpha_power = &alpha_power * alpha;
+                                let w0 = step.get_main_evaluation_element(0, *start_column)
+                                    + step.get_main_evaluation_element(0, *start_column + 1) * &shift_16;
+                                linear_combination += &w0 * &alpha_power;
+                                alpha_power = &alpha_power * alpha;
+                                let w1 = step.get_main_evaluation_element(0, *start_column + 2)
+                                    + step.get_main_evaluation_element(0, *start_column + 3) * &shift_16;
+                                linear_combination += &w1 * &alpha_power;
+                            }
+                            Packing::DWordBL => {
+                                // 2× Word4L
+                                let shift_8 = FieldElement::<A>::from(SHIFT_8);
+                                let shift_16 = FieldElement::<A>::from(SHIFT_16);
+                                let shift_24 = &shift_8 * &shift_16;
+                                alpha_power = &alpha_power * alpha;
+                                let w0 = step.get_main_evaluation_element(0, *start_column)
+                                    + step.get_main_evaluation_element(0, *start_column + 1) * &shift_8
+                                    + step.get_main_evaluation_element(0, *start_column + 2) * &shift_16
+                                    + step.get_main_evaluation_element(0, *start_column + 3) * &shift_24;
+                                linear_combination += &w0 * &alpha_power;
+                                alpha_power = &alpha_power * alpha;
+                                let w1 = step.get_main_evaluation_element(0, *start_column + 4)
+                                    + step.get_main_evaluation_element(0, *start_column + 5) * &shift_8
+                                    + step.get_main_evaluation_element(0, *start_column + 6) * &shift_16
+                                    + step.get_main_evaluation_element(0, *start_column + 7) * &shift_24;
+                                linear_combination += &w1 * &alpha_power;
+                            }
+                            Packing::DWordHHW => {
+                                // Direct + Word2L
+                                alpha_power = &alpha_power * alpha;
+                                linear_combination += step.get_main_evaluation_element(0, *start_column) * &alpha_power;
+                                alpha_power = &alpha_power * alpha;
+                                let shift_16 = FieldElement::<A>::from(SHIFT_16);
+                                let w = step.get_main_evaluation_element(0, *start_column + 1)
+                                    + step.get_main_evaluation_element(0, *start_column + 2) * &shift_16;
+                                linear_combination += &w * &alpha_power;
+                            }
+                            Packing::DWordWHH => {
+                                // Word2L + Direct
+                                let shift_16 = FieldElement::<A>::from(SHIFT_16);
+                                alpha_power = &alpha_power * alpha;
+                                let w = step.get_main_evaluation_element(0, *start_column)
+                                    + step.get_main_evaluation_element(0, *start_column + 1) * &shift_16;
+                                linear_combination += &w * &alpha_power;
+                                alpha_power = &alpha_power * alpha;
+                                linear_combination += step.get_main_evaluation_element(0, *start_column + 2) * &alpha_power;
+                            }
+                            Packing::QuadHL => {
+                                // 4× Word2L
+                                let shift_16 = FieldElement::<A>::from(SHIFT_16);
+                                for i in 0..4 {
+                                    alpha_power = &alpha_power * alpha;
+                                    let c = *start_column + i * 2;
+                                    let w = step.get_main_evaluation_element(0, c)
+                                        + step.get_main_evaluation_element(0, c + 1) * &shift_16;
+                                    linear_combination += &w * &alpha_power;
+                                }
+                            }
+                            Packing::QuadWL => {
+                                // 4× Direct
+                                for i in 0..4 {
+                                    alpha_power = &alpha_power * alpha;
+                                    linear_combination += step.get_main_evaluation_element(0, *start_column + i) * &alpha_power;
+                                }
+                            }
+                        }
+                    }
+                    BusValue::Linear(terms) => {
+                        alpha_power = &alpha_power * alpha;
+                        let mut result = FieldElement::<A>::zero();
+                        for term in terms {
+                            match term {
+                                LinearTerm::Column { coefficient, column } => {
+                                    let coeff = FieldElement::<A>::from(*coefficient);
+                                    result += step.get_main_evaluation_element(0, *column) * coeff;
+                                }
+                                LinearTerm::ColumnUnsigned { coefficient, column } => {
+                                    let coeff = FieldElement::<A>::from(*coefficient);
+                                    result += step.get_main_evaluation_element(0, *column) * coeff;
+                                }
+                                LinearTerm::Constant(value) => {
+                                    result += FieldElement::<A>::from(*value);
+                                }
+                            }
+                        }
+                        linear_combination += &result * &alpha_power;
+                    }
+                }
+            }
 
-            // Combine each BusValue's columns in base field
-            base_elements.extend(interaction.values.iter().flat_map(|bv| {
-                bv.combine_from(|col| step.get_main_evaluation_element(0, col).clone())
-            }));
-
-            // Coefficients for each bus element (using incremental multiplication)
-            let coeffs = compute_alpha_powers(alpha, base_elements.len());
-
-            // fingerprint = z - (bus_id*α^0 + v[0]*α^1 + ... + v[n]*α^(n+1))
-            // Uses A×B→B multiplication directly (no to_extension needed)
-            let fingerprint: FieldElement<B> = (-base_elements
-                .iter()
-                .zip(coeffs.iter())
-                .map(|(v, coeff)| v * coeff)
-                .sum::<FieldElement<B>>())
-                + z;
+            let fingerprint = z - &linear_combination;
 
             // Sign: +1 for senders, -1 for receivers
             let sign = if interaction.is_sender {
