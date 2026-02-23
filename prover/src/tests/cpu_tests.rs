@@ -380,7 +380,7 @@ fn test_trace_from_logs_subw() {
     let traces = Traces::from_logs(&logs, instructions).unwrap();
 
     // Should have SUB instruction with word_instr flag
-    let has_sub = (0..logs.len()).any(|i| traces.cpu.main_table.get_row(i)[cols::SUB] == FE::one());
+    let has_sub = (0..logs.len()).any(|i| traces.cpus[0].main_table.get_row(i)[cols::SUB] == FE::one());
     assert!(has_sub, "subw.elf should have SUB instruction");
 }
 

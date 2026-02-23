@@ -95,7 +95,7 @@ fn test_power_of_two_logs() {
     let instructions = make_instructions(&logs, &instrs);
 
     let traces = Traces::from_logs(&logs, instructions).unwrap();
-    assert_eq!(traces.cpu.main_table.height, 4);
+    assert_eq!(traces.cpus[0].main_table.height, 4);
 }
 
 #[test]
@@ -117,7 +117,7 @@ fn test_padding_to_power_of_two() {
 
     let traces = Traces::from_logs(&logs, instructions).unwrap();
     // 5 ops padded to 8
-    assert_eq!(traces.cpu.main_table.height, 8);
+    assert_eq!(traces.cpus[0].main_table.height, 8);
 }
 
 #[test]
@@ -160,7 +160,7 @@ fn test_lt_operations_collected() {
     let traces = Traces::from_logs(&logs, instructions).unwrap();
 
     // LT trace should have rows (2 SLT + 1 BLT = 3 ops, deduplicated)
-    assert!(traces.lt.main_table.height >= 2);
+    assert!(traces.lts[0].main_table.height >= 2);
 }
 
 #[test]
@@ -206,8 +206,8 @@ fn test_lt_deduplication() {
     // With MEMW timestamp ordering LT ops also added, the table is larger,
     // but we can verify the SLT deduplication by finding the row with lhs=5, rhs=10.
     let mut found_slt = false;
-    for row_idx in 0..traces.lt.main_table.height {
-        let row = traces.lt.main_table.get_row(row_idx);
+    for row_idx in 0..traces.lts[0].main_table.height {
+        let row = traces.lts[0].main_table.get_row(row_idx);
         // Check for our SLT: lhs=5, rhs=10, signed=1
         // lhs is stored as DWordHHW: [half0, half1, word2]
         // For value 5: half0=5, half1=0, word2=0
@@ -297,7 +297,7 @@ fn test_cpu_timestamps() {
 
     // Check timestamps are 4, 8, 12, 16 (starting from 4 to ensure old_timestamp < timestamp)
     for i in 0..4 {
-        let row = traces.cpu.main_table.get_row(i);
+        let row = traces.cpus[0].main_table.get_row(i);
         assert_eq!(row[cols::TIMESTAMP], FE::from((i * 4 + 4) as u64));
     }
 }
@@ -342,10 +342,10 @@ fn test_mixed_instructions() {
     let traces = Traces::from_logs(&logs, instructions).unwrap();
 
     // 5 ops (4 + ecall) padded to 8
-    assert_eq!(traces.cpu.main_table.height, 8);
+    assert_eq!(traces.cpus[0].main_table.height, 8);
     assert_eq!(traces.bitwise.main_table.height, bitwise::NUM_ROWS);
     // 1 SLT + 1 BLT = 2 LT ops
-    assert!(traces.lt.main_table.height >= 2);
+    assert!(traces.lts[0].main_table.height >= 2);
 }
 
 // =============================================================================
@@ -396,14 +396,14 @@ fn test_memw_generated_from_register_ops() {
     // MEMW table should have register operations
     // First instruction generates: M1 (read x2), M3 (read x3), M5 (write x1)
     assert!(
-        traces.memw.main_table.height >= 3,
+        traces.memws[0].main_table.height >= 3,
         "MEMW should have at least 3 rows for register ops"
     );
 
     // Find the register write to x1 (address = 2 * 1 = 2, is_register = 1)
     let mut found_write = false;
-    for row_idx in 0..traces.memw.main_table.height {
-        let row = traces.memw.main_table.get_row(row_idx);
+    for row_idx in 0..traces.memws[0].main_table.height {
+        let row = traces.memws[0].main_table.get_row(row_idx);
         // Check for register write: is_register=1, address=2 (x1), mu_write=1
         if row[memw::cols::IS_REGISTER] == FE::one()
             && row[memw::cols::BASE_ADDRESS_0] == FE::from(2u64)
@@ -470,8 +470,8 @@ fn test_memw_generates_lt_for_timestamp_ordering() {
 
     // Find LT op with lhs=0, rhs=4 (first register read's timestamp check)
     let mut found_timestamp_lt = false;
-    for row_idx in 0..traces.lt.main_table.height {
-        let row = traces.lt.main_table.get_row(row_idx);
+    for row_idx in 0..traces.lts[0].main_table.height {
+        let row = traces.lts[0].main_table.get_row(row_idx);
         // Check for LT(0, 4): lhs=0, rhs=4, signed=0
         if row[lt::cols::LHS_0] == FE::zero()
             && row[lt::cols::LHS_1] == FE::zero()

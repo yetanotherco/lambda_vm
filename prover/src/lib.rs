@@ -53,6 +53,19 @@ pub struct RuntimePageRange {
     pub count: u64,
 }
 
+/// Number of chunks for each split table.
+/// The verifier needs this to reconstruct matching AIRs.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TableCounts {
+    pub cpu: usize,
+    pub lt: usize,
+    pub memw: usize,
+    pub load: usize,
+    pub mul: usize,
+    pub dvrm: usize,
+    pub branch: usize,
+}
+
 /// A complete VM proof bundle containing the STARK proof and metadata
 /// needed by the verifier to reconstruct the AIR configuration.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -63,6 +76,9 @@ pub struct VmProof {
     /// These are zero-initialized pages accessed during execution but not
     /// covered by ELF segments (stack, heap, etc.).
     pub runtime_page_ranges: Vec<RuntimePageRange>,
+    /// Number of chunks for each split table.
+    /// The verifier needs this to reconstruct matching AIRs.
+    pub table_counts: TableCounts,
 }
 
 /// Error type for the prover crate.
@@ -105,15 +121,15 @@ type AirTracePair<'a> = (
 
 /// All VM AIR instances, grouped by table.
 pub(crate) struct VmAirs {
-    pub cpu: VmAir,
+    pub cpus: Vec<VmAir>,
     pub bitwise: VmAir,
-    pub lt: VmAir,
-    pub memw: VmAir,
-    pub load: VmAir,
+    pub lts: Vec<VmAir>,
+    pub memws: Vec<VmAir>,
+    pub loads: Vec<VmAir>,
     pub decode: VmAir,
-    pub mul: VmAir,
-    pub dvrm: VmAir,
-    pub branch: VmAir,
+    pub muls: Vec<VmAir>,
+    pub dvrms: Vec<VmAir>,
+    pub branches: Vec<VmAir>,
     pub halt: VmAir,
     pub register: VmAir,
     pub pages: Vec<VmAir>,
@@ -123,42 +139,56 @@ impl VmAirs {
     /// Build `(air, trace, public_inputs)` triples for [`Prover::multi_prove`].
     pub fn air_trace_pairs<'a>(&'a self, traces: &'a mut Traces) -> Vec<AirTracePair<'a>> {
         let mut pairs: Vec<AirTracePair<'a>> = vec![
-            (&self.cpu, &mut traces.cpu, &()),
             (&self.bitwise, &mut traces.bitwise, &()),
-            (&self.lt, &mut traces.lt, &()),
-            (&self.memw, &mut traces.memw, &()),
-            (&self.load, &mut traces.load, &()),
             (&self.decode, &mut traces.decode, &()),
-            (&self.mul, &mut traces.mul, &()),
-            (&self.dvrm, &mut traces.dvrm, &()),
-            (&self.branch, &mut traces.branch, &()),
             (&self.halt, &mut traces.halt, &()),
             (&self.register, &mut traces.register, &()),
         ];
-        for (i, page_trace) in traces.pages.iter_mut().enumerate() {
-            pairs.push((&self.pages[i], page_trace, &()));
+
+        macro_rules! extend_vec_pairs {
+            ($airs:expr, $traces:expr) => {
+                for (i, trace) in $traces.iter_mut().enumerate() {
+                    pairs.push((&$airs[i], trace, &()));
+                }
+            };
         }
+
+        extend_vec_pairs!(self.cpus, traces.cpus);
+        extend_vec_pairs!(self.lts, traces.lts);
+        extend_vec_pairs!(self.memws, traces.memws);
+        extend_vec_pairs!(self.loads, traces.loads);
+        extend_vec_pairs!(self.muls, traces.muls);
+        extend_vec_pairs!(self.dvrms, traces.dvrms);
+        extend_vec_pairs!(self.branches, traces.branches);
+        extend_vec_pairs!(self.pages, traces.pages);
         pairs
     }
 
     /// Collect AIR references for [`Verifier::multi_verify`].
     pub fn air_refs(&self) -> Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> {
         let mut refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
-            &self.cpu,
             &self.bitwise,
-            &self.lt,
-            &self.memw,
-            &self.load,
             &self.decode,
-            &self.mul,
-            &self.dvrm,
-            &self.branch,
             &self.halt,
             &self.register,
         ];
-        for page in &self.pages {
-            refs.push(page);
+
+        macro_rules! extend_vec_refs {
+            ($airs:expr) => {
+                for air in &$airs {
+                    refs.push(air);
+                }
+            };
         }
+
+        extend_vec_refs!(self.cpus);
+        extend_vec_refs!(self.lts);
+        extend_vec_refs!(self.memws);
+        extend_vec_refs!(self.loads);
+        extend_vec_refs!(self.muls);
+        extend_vec_refs!(self.dvrms);
+        extend_vec_refs!(self.branches);
+        extend_vec_refs!(self.pages);
         refs
     }
 
@@ -167,13 +197,17 @@ impl VmAirs {
     /// DECODE is always preprocessed.
     ///
     /// `page_configs` provides the page base addresses for creating PAGE AIRs.
+    /// `table_counts` specifies how many chunks for each split table.
     pub fn new(
         elf: &Elf,
         proof_options: &ProofOptions,
         minimal_bitwise: bool,
         page_configs: &[crate::tables::page::PageConfig],
+        table_counts: &TableCounts,
     ) -> Self {
-        let cpu = create_cpu_air(proof_options);
+        let cpus: Vec<_> = (0..table_counts.cpu)
+            .map(|i| create_cpu_air(proof_options).with_name(&format!("CPU[{}]", i)))
+            .collect();
         let bitwise = if minimal_bitwise {
             create_bitwise_air(proof_options)
         } else {
@@ -182,17 +216,29 @@ impl VmAirs {
                 bitwise::NUM_PRECOMPUTED_COLS,
             )
         };
-        let lt = create_lt_air(proof_options);
-        let memw = create_memw_air(proof_options);
-        let load = create_load_air(proof_options);
+        let lts: Vec<_> = (0..table_counts.lt)
+            .map(|i| create_lt_air(proof_options).with_name(&format!("LT[{}]", i)))
+            .collect();
+        let memws: Vec<_> = (0..table_counts.memw)
+            .map(|i| create_memw_air(proof_options).with_name(&format!("MEMW[{}]", i)))
+            .collect();
+        let loads: Vec<_> = (0..table_counts.load)
+            .map(|i| create_load_air(proof_options).with_name(&format!("LOAD[{}]", i)))
+            .collect();
         let decode = create_decode_air(proof_options).with_preprocessed(
             decode::commitment_from_elf(elf, proof_options)
                 .expect("Failed to compute decode commitment"),
             decode::NUM_PRECOMPUTED_COLS,
         );
-        let mul = create_mul_air(proof_options);
-        let dvrm = create_dvrm_air(proof_options);
-        let branch = create_branch_air(proof_options);
+        let muls: Vec<_> = (0..table_counts.mul)
+            .map(|i| create_mul_air(proof_options).with_name(&format!("MUL[{}]", i)))
+            .collect();
+        let dvrms: Vec<_> = (0..table_counts.dvrm)
+            .map(|i| create_dvrm_air(proof_options).with_name(&format!("DVRM[{}]", i)))
+            .collect();
+        let branches: Vec<_> = (0..table_counts.branch)
+            .map(|i| create_branch_air(proof_options).with_name(&format!("BRANCH[{}]", i)))
+            .collect();
         let halt = create_halt_air(proof_options);
         let register = create_register_air(proof_options).with_preprocessed(
             register::preprocessed_commitment(proof_options),
@@ -212,15 +258,15 @@ impl VmAirs {
         debug_report::print_bus_legend();
 
         Self {
-            cpu,
+            cpus,
             bitwise,
-            lt,
-            memw,
-            load,
+            lts,
+            memws,
+            loads,
             decode,
-            mul,
-            dvrm,
-            branch,
+            muls,
+            dvrms,
+            branches,
             halt,
             register,
             pages,
@@ -250,7 +296,14 @@ pub fn prove_with_options(
     // Generate all traces from ELF and execution logs.
     // Page tables are derived from the prover's MemoryState (all accessed pages).
     let mut traces = Traces::from_elf_and_logs(&program, &result.logs)?;
-    let airs = VmAirs::new(&program, proof_options, false, &traces.page_configs);
+    let table_counts = traces.table_counts();
+    let airs = VmAirs::new(
+        &program,
+        proof_options,
+        false,
+        &traces.page_configs,
+        &table_counts,
+    );
 
     let runtime_page_ranges = traces.runtime_page_ranges();
 
@@ -263,6 +316,7 @@ pub fn prove_with_options(
     Ok(VmProof {
         proof,
         runtime_page_ranges,
+        table_counts,
     })
 }
 
@@ -292,7 +346,13 @@ pub fn verify_with_options(
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let page_configs =
         Traces::page_configs_from_elf_and_runtime(&program, &vm_proof.runtime_page_ranges);
-    let airs = VmAirs::new(&program, proof_options, false, &page_configs);
+    let airs = VmAirs::new(
+        &program,
+        proof_options,
+        false,
+        &page_configs,
+        &vm_proof.table_counts,
+    );
 
     Ok(Verifier::multi_verify(
         &airs.air_refs(),
