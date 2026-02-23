@@ -1,6 +1,10 @@
 # Benchmark Server Setup
 
-## As admin
+## As admin user (or user with sudo permissions)
+
+```bash
+ssh admin@<server-ip>
+```
 
 Install dependencies:
 
@@ -19,7 +23,11 @@ sudo update-alternatives --install /usr/bin/lld lld /usr/bin/lld-18 100
 clang --version # must be clang 18
 ```
 
-## As app
+## As app user
+
+```bash
+ssh app@<server-ip>
+```
 
 ### 1. Generate an SSH key
 
