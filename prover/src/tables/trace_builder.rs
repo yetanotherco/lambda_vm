@@ -1128,7 +1128,7 @@ fn chunk_and_generate<T>(
     if ops.is_empty() {
         vec![generate(&[])]
     } else {
-        ops.chunks(max_rows).map(|chunk| generate(chunk)).collect()
+        ops.chunks(max_rows).map(generate).collect()
     }
 }
 
@@ -1385,14 +1385,11 @@ impl Traces {
         let cpus = chunk_and_generate(&cpu_ops, max_rows::CPU, cpu::generate_cpu_trace);
         let memws = chunk_and_generate(&memw_ops, max_rows::MEMW, memw::generate_memw_trace);
         let loads = chunk_and_generate(&load_ops, max_rows::LOAD, load::generate_load_trace);
-        let lts = chunk_and_generate(&lt_ops, max_rows::LT, |ops| lt::generate_lt_trace(ops));
-        let muls = chunk_and_generate(&mul_ops, max_rows::MUL, |ops| mul::generate_mul_trace(ops));
-        let dvrms = chunk_and_generate(&dvrm_ops, max_rows::DVRM, |ops| {
-            dvrm::generate_dvrm_trace(ops)
-        });
-        let branches = chunk_and_generate(&branch_ops, max_rows::BRANCH, |ops| {
-            branch::generate_branch_trace(ops)
-        });
+        let lts = chunk_and_generate(&lt_ops, max_rows::LT, lt::generate_lt_trace);
+        let muls = chunk_and_generate(&mul_ops, max_rows::MUL, mul::generate_mul_trace);
+        let dvrms = chunk_and_generate(&dvrm_ops, max_rows::DVRM, dvrm::generate_dvrm_trace);
+        let branches =
+            chunk_and_generate(&branch_ops, max_rows::BRANCH, branch::generate_branch_trace);
 
         let mut bitwise = bitwise::generate_bitwise_trace();
         bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
@@ -1553,14 +1550,11 @@ impl Traces {
         let cpus = chunk_and_generate(&cpu_ops, max_rows::CPU, cpu::generate_cpu_trace);
         let memws = chunk_and_generate(&memw_ops, max_rows::MEMW, memw::generate_memw_trace);
         let loads = chunk_and_generate(&load_ops, max_rows::LOAD, load::generate_load_trace);
-        let lts = chunk_and_generate(&lt_ops, max_rows::LT, |ops| lt::generate_lt_trace(ops));
-        let muls = chunk_and_generate(&mul_ops, max_rows::MUL, |ops| mul::generate_mul_trace(ops));
-        let dvrms = chunk_and_generate(&dvrm_ops, max_rows::DVRM, |ops| {
-            dvrm::generate_dvrm_trace(ops)
-        });
-        let branches = chunk_and_generate(&branch_ops, max_rows::BRANCH, |ops| {
-            branch::generate_branch_trace(ops)
-        });
+        let lts = chunk_and_generate(&lt_ops, max_rows::LT, lt::generate_lt_trace);
+        let muls = chunk_and_generate(&mul_ops, max_rows::MUL, mul::generate_mul_trace);
+        let dvrms = chunk_and_generate(&dvrm_ops, max_rows::DVRM, dvrm::generate_dvrm_trace);
+        let branches =
+            chunk_and_generate(&branch_ops, max_rows::BRANCH, branch::generate_branch_trace);
 
         let mut bitwise = bitwise::generate_bitwise_trace();
         bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
