@@ -7,7 +7,6 @@ use crate::trace::LDETraceTable;
 use crate::lookup::{compute_alpha_powers, LOGUP_CHALLENGE_ALPHA};
 use crate::traits::{AIR, TransitionEvaluationContext, ZerofierEvaluations};
 use crate::{frame::Frame, prover::evaluate_polynomial_on_lde_domain};
-use itertools::Itertools;
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 #[cfg(not(feature = "parallel"))]
 use math::polynomial::Polynomial;
@@ -213,7 +212,6 @@ where
         rap_challenges: &[FieldElement<FieldExtension>],
     ) -> Vec<FieldElement<FieldExtension>> {
         let boundary_constraints = &self.boundary_constraints;
-        let number_of_b_constraints = boundary_constraints.constraints.len();
         let boundary_zerofiers_inverse_evaluations: Vec<Vec<FieldElement<Field>>> =
             boundary_constraints
                 .constraints
@@ -260,48 +258,34 @@ where
         #[cfg(feature = "instruments")]
         let timer = Instant::now();
 
-        let boundary_polys_evaluations = boundary_constraints
-            .constraints
-            .iter()
-            .map(|constraint| {
-                if constraint.is_aux {
-                    (0..lde_trace.num_rows())
-                        .map(|row| {
-                            let v = lde_trace.get_aux(row, constraint.col);
-                            v - &constraint.value
-                        })
-                        .collect_vec()
-                } else {
-                    (0..lde_trace.num_rows())
-                        .map(|row| {
-                            let v = lde_trace.get_main(row, constraint.col);
-                            v - &constraint.value
-                        })
-                        .collect_vec()
-                }
-            })
-            .collect_vec();
-
-        #[cfg(feature = "instruments")]
-        println!("     Created boundary polynomials: {:#?}", timer.elapsed());
-        #[cfg(feature = "instruments")]
-        let timer = Instant::now();
-
+        // Fused boundary evaluation: compute (trace[col] - value) on-the-fly
+        // instead of pre-computing all boundary_polys_evaluations.
+        // This eliminates N_constraints × LDE_size intermediate allocations.
         #[cfg(feature = "parallel")]
         let boundary_eval_iter = (0..domain.lde_roots_of_unity_coset.len()).into_par_iter();
         #[cfg(not(feature = "parallel"))]
         let boundary_eval_iter = 0..domain.lde_roots_of_unity_coset.len();
 
+        let b_constraints = &boundary_constraints.constraints;
         let boundary_evaluation: Vec<_> = boundary_eval_iter
             .map(|domain_index| {
-                (0..number_of_b_constraints)
+                b_constraints
+                    .iter()
                     .zip(boundary_coefficients)
-                    .fold(FieldElement::zero(), |acc, (constraint_index, beta)| {
-                        acc + &boundary_zerofiers_inverse_evaluations[constraint_index]
-                            [domain_index]
-                            * beta
-                            * &boundary_polys_evaluations[constraint_index][domain_index]
-                    })
+                    .zip(boundary_zerofiers_inverse_evaluations.iter())
+                    .fold(
+                        FieldElement::zero(),
+                        |acc, ((constraint, beta), zerofier_inv)| {
+                            let bp = if constraint.is_aux {
+                                lde_trace.get_aux(domain_index, constraint.col)
+                                    - &constraint.value
+                            } else {
+                                lde_trace.get_main(domain_index, constraint.col)
+                                    - &constraint.value
+                            };
+                            acc + &zerofier_inv[domain_index] * beta * bp
+                        },
+                    )
             })
             .collect();
 
