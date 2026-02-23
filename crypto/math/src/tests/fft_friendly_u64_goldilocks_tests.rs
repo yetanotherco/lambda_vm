@@ -93,14 +93,14 @@ mod fft_tests {
     use proptest::{collection, prelude::*};
 
     /// Evaluates a polynomial at a slice of points
-    fn evaluate_slice<F: IsFFTField>(
+    fn evaluate_slice<F: IsFFTField + Send + Sync>(
         poly: &Polynomial<FieldElement<F>>,
         input: &[FieldElement<F>],
     ) -> Vec<FieldElement<F>> {
         input.iter().map(|x| poly.evaluate(x)).collect()
     }
 
-    fn gen_fft_and_naive_evaluation<F: IsFFTField>(
+    fn gen_fft_and_naive_evaluation<F: IsFFTField + Send + Sync>(
         poly: Polynomial<FieldElement<F>>,
     ) -> (Vec<FieldElement<F>>, Vec<FieldElement<F>>) {
         let len = poly.coeff_len().next_power_of_two();
@@ -114,7 +114,7 @@ mod fft_tests {
         (fft_eval, naive_eval)
     }
 
-    fn gen_fft_coset_and_naive_evaluation<F: IsFFTField>(
+    fn gen_fft_coset_and_naive_evaluation<F: IsFFTField + Send + Sync>(
         poly: Polynomial<FieldElement<F>>,
         offset: FieldElement<F>,
         blowup_factor: usize,
@@ -131,7 +131,7 @@ mod fft_tests {
         (fft_eval, naive_eval)
     }
 
-    fn gen_fft_and_naive_interpolate<F: IsFFTField>(
+    fn gen_fft_and_naive_interpolate<F: IsFFTField + Send + Sync>(
         fft_evals: &[FieldElement<F>],
     ) -> (Polynomial<FieldElement<F>>, Polynomial<FieldElement<F>>) {
         let order = fft_evals.len().trailing_zeros() as u64;
@@ -144,7 +144,7 @@ mod fft_tests {
         (fft_poly, naive_poly)
     }
 
-    fn gen_fft_and_naive_coset_interpolate<F: IsFFTField>(
+    fn gen_fft_and_naive_coset_interpolate<F: IsFFTField + Send + Sync>(
         fft_evals: &[FieldElement<F>],
         offset: &FieldElement<F>,
     ) -> (Polynomial<FieldElement<F>>, Polynomial<FieldElement<F>>) {
@@ -157,7 +157,7 @@ mod fft_tests {
         (fft_poly, naive_poly)
     }
 
-    fn gen_fft_interpolate_and_evaluate<F: IsFFTField>(
+    fn gen_fft_interpolate_and_evaluate<F: IsFFTField + Send + Sync>(
         poly: Polynomial<FieldElement<F>>,
     ) -> (Polynomial<FieldElement<F>>, Polynomial<FieldElement<F>>) {
         let eval = Polynomial::evaluate_fft::<F>(&poly, 1, None).unwrap();

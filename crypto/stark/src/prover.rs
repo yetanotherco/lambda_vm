@@ -217,7 +217,7 @@ pub fn evaluate_polynomial_on_lde_domain<F, E>(
 ) -> Result<Vec<FieldElement<E>>, FFTError>
 where
     F: IsFFTField + IsSubFieldOf<E>,
-    E: IsField,
+    E: IsField + Send + Sync,
 {
     let evaluations = Polynomial::evaluate_offset_fft(p, blowup_factor, Some(domain_size), offset)?;
     let step = evaluations.len() / (domain_size * blowup_factor);
@@ -445,7 +445,7 @@ pub trait IsStarkProver<
         domain: &Domain<Field>,
     ) -> Vec<Vec<FieldElement<E>>>
     where
-        E: IsSubFieldOf<FieldExtension>,
+        E: IsSubFieldOf<FieldExtension> + Send + Sync,
         Field: IsSubFieldOf<E>,
     {
         #[cfg(not(feature = "parallel"))]

@@ -35,7 +35,10 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         poly: &Polynomial<FieldElement<E>>,
         blowup_factor: usize,
         domain_size: Option<usize>,
-    ) -> Result<Vec<FieldElement<E>>, FFTError> {
+    ) -> Result<Vec<FieldElement<E>>, FFTError>
+    where
+        E: Send + Sync,
+    {
         let domain_size = domain_size.unwrap_or(0);
         let len = core::cmp::max(poly.coeff_len(), domain_size).next_power_of_two() * blowup_factor;
         if len.trailing_zeros() as u64 > F::TWO_ADICITY {
@@ -74,7 +77,10 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         blowup_factor: usize,
         domain_size: Option<usize>,
         offset: &FieldElement<F>,
-    ) -> Result<Vec<FieldElement<E>>, FFTError> {
+    ) -> Result<Vec<FieldElement<E>>, FFTError>
+    where
+        E: Send + Sync,
+    {
         let scaled = poly.scale(offset);
         Polynomial::evaluate_fft::<F>(&scaled, blowup_factor, domain_size)
     }
@@ -84,7 +90,10 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     /// This is considered to be the inverse operation of [Self::evaluate_fft()].
     pub fn interpolate_fft<F: IsFFTField + IsSubFieldOf<E>>(
         fft_evals: &[FieldElement<E>],
-    ) -> Result<Self, FFTError> {
+    ) -> Result<Self, FFTError>
+    where
+        E: Send + Sync,
+    {
         #[cfg(feature = "cuda")]
         {
             if !F::field_name().is_empty() {
@@ -106,7 +115,10 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     pub fn interpolate_offset_fft<F: IsFFTField + IsSubFieldOf<E>>(
         fft_evals: &[FieldElement<E>],
         offset: &FieldElement<F>,
-    ) -> Result<Polynomial<FieldElement<E>>, FFTError> {
+    ) -> Result<Polynomial<FieldElement<E>>, FFTError>
+    where
+        E: Send + Sync,
+    {
         let scaled = Polynomial::interpolate_fft::<F>(fft_evals)?;
         Ok(scaled.scale(&offset.inv().unwrap()))
     }
@@ -126,7 +138,10 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         evals: &[FieldElement<E>],
         blowup_factor: usize,
         offset: &FieldElement<F>,
-    ) -> Result<Vec<FieldElement<E>>, FFTError> {
+    ) -> Result<Vec<FieldElement<E>>, FFTError>
+    where
+        E: Send + Sync,
+    {
         let n = evals.len();
         if n == 0 {
             return Ok(Vec::new());
@@ -153,7 +168,10 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         offset: &FieldElement<F>,
         inv_twiddles: &LayerTwiddles<F>,
         fwd_twiddles: &LayerTwiddles<F>,
-    ) -> Result<Vec<FieldElement<E>>, FFTError> {
+    ) -> Result<Vec<FieldElement<E>>, FFTError>
+    where
+        E: Send + Sync,
+    {
         let n = evals.len();
         if n == 0 {
             return Ok(Vec::new());
@@ -173,6 +191,16 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         // 2. iFFT on buffer[..n] using Bowers:
         //    bit-reverse permute (natural → bit-reversed), then DIT inverse butterflies.
         in_place_bit_reverse_permute(&mut buffer[..n]);
+
+        #[cfg(feature = "parallel")]
+        {
+            if n >= PARALLEL_FFT_THRESHOLD {
+                bowers_ifft_opt_parallel(&mut buffer[..n], inv_twiddles)?;
+            } else {
+                bowers_ifft_opt(&mut buffer[..n], inv_twiddles)?;
+            }
+        }
+        #[cfg(not(feature = "parallel"))]
         bowers_ifft_opt(&mut buffer[..n], inv_twiddles)?;
 
         // 3. Scale by offset^i / n simultaneously (fused inverse-scaling + coset shift).
@@ -185,7 +213,17 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
 
         // 4. Forward FFT on the full buffer using Bowers:
         //    DIF forward butterflies (natural → bit-reversed), then bit-reverse permute.
+        #[cfg(feature = "parallel")]
+        {
+            if buffer.len() >= PARALLEL_FFT_THRESHOLD {
+                bowers_fft_opt_fused_parallel(&mut buffer, fwd_twiddles)?;
+            } else {
+                bowers_fft_opt_fused(&mut buffer, fwd_twiddles)?;
+            }
+        }
+        #[cfg(not(feature = "parallel"))]
         bowers_fft_opt_fused(&mut buffer, fwd_twiddles)?;
+
         in_place_bit_reverse_permute(&mut buffer);
 
         Ok(buffer)
@@ -366,7 +404,10 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     pub fn fast_fft_multiplication<F: IsFFTField + IsSubFieldOf<E>>(
         &self,
         other: &Self,
-    ) -> Result<Self, FFTError> {
+    ) -> Result<Self, FFTError>
+    where
+        E: Send + Sync,
+    {
         let domain_size = self.degree() + other.degree() + 1;
         let p = Polynomial::evaluate_fft::<F>(self, 1, Some(domain_size))?;
         let q = Polynomial::evaluate_fft::<F>(other, 1, Some(domain_size))?;
@@ -381,7 +422,10 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     pub fn fast_division<F: IsSubFieldOf<E> + IsFFTField>(
         &self,
         divisor: &Self,
-    ) -> Result<(Self, Self), FFTError> {
+    ) -> Result<(Self, Self), FFTError>
+    where
+        E: Send + Sync,
+    {
         let n = self.degree();
         let m = divisor.degree();
         if divisor.coefficients.is_empty()
@@ -413,7 +457,10 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     pub fn invert_polynomial_mod<F: IsSubFieldOf<E> + IsFFTField>(
         &self,
         k: usize,
-    ) -> Result<Self, FFTError> {
+    ) -> Result<Self, FFTError>
+    where
+        E: Send + Sync,
+    {
         if self.coefficients.is_empty()
             || self.coefficients.iter().all(|c| c == &FieldElement::zero())
         {
@@ -445,7 +492,7 @@ pub fn compose_fft<F, E>(
 ) -> Polynomial<FieldElement<E>>
 where
     F: IsFFTField + IsSubFieldOf<E>,
-    E: IsField,
+    E: IsField + Send + Sync,
 {
     let poly_2_evaluations = Polynomial::evaluate_fft::<F>(poly_2, 1, None).unwrap();
 
@@ -460,7 +507,7 @@ where
 pub fn evaluate_fft_cpu<F, E>(coeffs: &[FieldElement<E>]) -> Result<Vec<FieldElement<E>>, FFTError>
 where
     F: IsFFTField + IsSubFieldOf<E>,
-    E: IsField,
+    E: IsField + Send + Sync,
 {
     let n = coeffs.len();
     if !n.is_power_of_two() {
@@ -471,7 +518,18 @@ where
         LayerTwiddles::<F>::new(order).ok_or(FFTError::DomainSizeError(order as usize))?;
 
     let mut result = coeffs.to_vec();
+
+    #[cfg(feature = "parallel")]
+    {
+        if n >= PARALLEL_FFT_THRESHOLD {
+            bowers_fft_opt_fused_parallel(&mut result, &layer_twiddles)?;
+        } else {
+            bowers_fft_opt_fused(&mut result, &layer_twiddles)?;
+        }
+    }
+    #[cfg(not(feature = "parallel"))]
     bowers_fft_opt_fused(&mut result, &layer_twiddles)?;
+
     in_place_bit_reverse_permute(&mut result);
     Ok(result)
 }
@@ -481,7 +539,7 @@ pub fn interpolate_fft_cpu<F, E>(
 ) -> Result<Polynomial<FieldElement<E>>, FFTError>
 where
     F: IsFFTField + IsSubFieldOf<E>,
-    E: IsField,
+    E: IsField + Send + Sync,
 {
     let n = fft_evals.len();
     if !n.is_power_of_two() {
@@ -494,6 +552,16 @@ where
     let mut coeffs = fft_evals.to_vec();
     // Bowers iFFT: bit-reverse first (natural → bit-reversed), then DIT inverse butterflies
     in_place_bit_reverse_permute(&mut coeffs);
+
+    #[cfg(feature = "parallel")]
+    {
+        if n >= PARALLEL_FFT_THRESHOLD {
+            bowers_ifft_opt_parallel(&mut coeffs, &inv_twiddles)?;
+        } else {
+            bowers_ifft_opt(&mut coeffs, &inv_twiddles)?;
+        }
+    }
+    #[cfg(not(feature = "parallel"))]
     bowers_ifft_opt(&mut coeffs, &inv_twiddles)?;
 
     // Scale by 1/n

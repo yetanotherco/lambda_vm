@@ -139,7 +139,7 @@ mod test_babybear_31_fft {
 
     /// Evaluates a polynomial at a slice of points
     #[cfg(not(feature = "cuda"))]
-    fn evaluate_slice<F: IsFFTField>(
+    fn evaluate_slice<F: IsFFTField + Send + Sync>(
         poly: &Polynomial<FieldElement<F>>,
         input: &[FieldElement<F>],
     ) -> Vec<FieldElement<F>> {
@@ -147,7 +147,7 @@ mod test_babybear_31_fft {
     }
 
     #[cfg(not(feature = "cuda"))]
-    fn gen_fft_and_naive_evaluation<F: IsFFTField>(
+    fn gen_fft_and_naive_evaluation<F: IsFFTField + Send + Sync>(
         poly: Polynomial<FieldElement<F>>,
     ) -> (Vec<FieldElement<F>>, Vec<FieldElement<F>>) {
         let len = poly.coeff_len().next_power_of_two();
@@ -162,7 +162,7 @@ mod test_babybear_31_fft {
     }
 
     #[cfg(not(feature = "cuda"))]
-    fn gen_fft_coset_and_naive_evaluation<F: IsFFTField>(
+    fn gen_fft_coset_and_naive_evaluation<F: IsFFTField + Send + Sync>(
         poly: Polynomial<FieldElement<F>>,
         offset: FieldElement<F>,
         blowup_factor: usize,
@@ -180,7 +180,7 @@ mod test_babybear_31_fft {
     }
 
     #[cfg(not(feature = "cuda"))]
-    fn gen_fft_and_naive_interpolate<F: IsFFTField>(
+    fn gen_fft_and_naive_interpolate<F: IsFFTField + Send + Sync>(
         fft_evals: &[FieldElement<F>],
     ) -> (Polynomial<FieldElement<F>>, Polynomial<FieldElement<F>>) {
         let order = fft_evals.len().trailing_zeros() as u64;
@@ -194,7 +194,7 @@ mod test_babybear_31_fft {
     }
 
     #[cfg(not(feature = "cuda"))]
-    fn gen_fft_and_naive_coset_interpolate<F: IsFFTField>(
+    fn gen_fft_and_naive_coset_interpolate<F: IsFFTField + Send + Sync>(
         fft_evals: &[FieldElement<F>],
         offset: &FieldElement<F>,
     ) -> (Polynomial<FieldElement<F>>, Polynomial<FieldElement<F>>) {
@@ -208,7 +208,7 @@ mod test_babybear_31_fft {
     }
 
     #[cfg(not(feature = "cuda"))]
-    fn gen_fft_interpolate_and_evaluate<F: IsFFTField>(
+    fn gen_fft_interpolate_and_evaluate<F: IsFFTField + Send + Sync>(
         poly: Polynomial<FieldElement<F>>,
     ) -> (Polynomial<FieldElement<F>>, Polynomial<FieldElement<F>>) {
         let eval = Polynomial::evaluate_fft::<F>(&poly, 1, None).unwrap();

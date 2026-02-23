@@ -17,7 +17,7 @@ use self::fri_commitment::FriLayer;
 use self::fri_decommit::FriDecommitment;
 use self::fri_functions::{compute_coset_twiddles_inv, fold_evaluations_in_place, update_twiddles_in_place};
 
-pub fn commit_phase<F: IsFFTField + IsSubFieldOf<E>, E: IsField>(
+pub fn commit_phase<F: IsFFTField + IsSubFieldOf<E>, E: IsField + Send + Sync>(
     number_layers: usize,
     p_0: Polynomial<FieldElement<E>>,
     transcript: &mut impl IsStarkTranscript<E, F>,
