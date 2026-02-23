@@ -1264,6 +1264,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for DvrmConstrai
                 frame,
                 periodic_values: _,
                 rap_challenges: _,
+                ..
             } => {
                 let constraint_value = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
@@ -1272,6 +1273,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for DvrmConstrai
                 frame,
                 periodic_values: _,
                 rap_challenges: _,
+                ..
             } => {
                 let constraint_value = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = constraint_value;

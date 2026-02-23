@@ -7,9 +7,6 @@ use math::field::{
     element::FieldElement,
     traits::{IsFFTField, IsField, IsPrimeField, IsSubFieldOf},
 };
-#[cfg(feature = "parallel")]
-use rayon::prelude::{IntoParallelIterator, ParallelIterator};
-
 use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
@@ -38,7 +35,7 @@ pub const SHIFT_32: u64 = 4294967296;
 /// This is more efficient than calling `alpha.pow(i)` for each i,
 /// as it only requires one multiplication per element instead of
 /// a full exponentiation.
-fn compute_alpha_powers<E: IsField>(alpha: &FieldElement<E>, count: usize) -> Vec<FieldElement<E>> {
+pub(crate) fn compute_alpha_powers<E: IsField>(alpha: &FieldElement<E>, count: usize) -> Vec<FieldElement<E>> {
     let mut powers = Vec::with_capacity(count);
     let mut current = FieldElement::<E>::one();
     for _ in 0..count {
@@ -854,25 +851,8 @@ where
         let trace_len = trace.num_rows();
         let table_name = self.name.as_deref().unwrap_or("UNKNOWN");
 
-        // Compute all term columns in parallel (each interaction is independent)
-        #[cfg(feature = "parallel")]
-        let term_columns: Vec<Vec<FieldElement<E>>> = self
-            .auxiliary_trace_build_data
-            .interactions
-            .as_slice()
-            .into_par_iter()
-            .map(|interaction| {
-                compute_logup_term_column(
-                    interaction,
-                    &main_segment_cols,
-                    trace_len,
-                    challenges,
-                    table_name,
-                )
-            })
-            .collect();
-
-        #[cfg(not(feature = "parallel"))]
+        // Compute term columns sequentially (1-3 interactions per table is too few
+        // for Rayon parallelism — each column computation already has internal parallelism).
         let term_columns: Vec<Vec<FieldElement<E>>> = self
             .auxiliary_trace_build_data
             .interactions
@@ -1441,12 +1421,12 @@ where
             term_column_idx: usize,
             interaction: &BusInteraction,
             rap_challenges: &&[FieldElement<B>],
+            alpha_powers: &[FieldElement<B>],
         ) -> FieldElement<B> {
             // Term column value
             let term = step.get_aux_evaluation_element(0, term_column_idx);
 
             let z = &rap_challenges[LOGUP_CHALLENGE_Z];
-            let alpha = &rap_challenges[LOGUP_CHALLENGE_ALPHA];
 
             // Compute multiplicity based on the Multiplicity variant
             let multiplicity: FieldElement<A> = match &interaction.multiplicity {
@@ -1486,28 +1466,28 @@ where
                 }
             };
 
-            // Compute fingerprint inline without allocating intermediate Vecs.
+            // Compute fingerprint using pre-computed alpha powers (indexed access).
             // fingerprint = z - (bus_id*α^0 + v[0]*α^1 + v[1]*α^2 + ...)
+            // alpha_powers[0] = 1, alpha_powers[1] = α, alpha_powers[2] = α², ...
             let bus_id_f = FieldElement::<A>::from(interaction.bus_id);
-            let mut linear_combination = &bus_id_f * &FieldElement::<B>::one();
-            let mut alpha_power = FieldElement::<B>::one();
+            let mut linear_combination = &bus_id_f * &alpha_powers[0];
+            let mut alpha_idx: usize = 1;
             for bv in &interaction.values {
                 match bv {
                     BusValue::Packed { start_column, packing } => {
                         match packing {
                             Packing::Direct => {
-                                alpha_power = &alpha_power * alpha;
-                                linear_combination += step.get_main_evaluation_element(0, *start_column) * &alpha_power;
+                                linear_combination += step.get_main_evaluation_element(0, *start_column) * &alpha_powers[alpha_idx];
+                                alpha_idx += 1;
                             }
                             Packing::Word2L => {
-                                alpha_power = &alpha_power * alpha;
                                 let shift_16 = FieldElement::<A>::from(SHIFT_16);
                                 let combined = step.get_main_evaluation_element(0, *start_column)
                                     + step.get_main_evaluation_element(0, *start_column + 1) * &shift_16;
-                                linear_combination += &combined * &alpha_power;
+                                linear_combination += &combined * &alpha_powers[alpha_idx];
+                                alpha_idx += 1;
                             }
                             Packing::Word4L => {
-                                alpha_power = &alpha_power * alpha;
                                 let shift_8 = FieldElement::<A>::from(SHIFT_8);
                                 let shift_16 = FieldElement::<A>::from(SHIFT_16);
                                 let shift_24 = &shift_8 * &shift_16;
@@ -1515,87 +1495,82 @@ where
                                     + step.get_main_evaluation_element(0, *start_column + 1) * &shift_8
                                     + step.get_main_evaluation_element(0, *start_column + 2) * &shift_16
                                     + step.get_main_evaluation_element(0, *start_column + 3) * &shift_24;
-                                linear_combination += &combined * &alpha_power;
+                                linear_combination += &combined * &alpha_powers[alpha_idx];
+                                alpha_idx += 1;
                             }
                             Packing::DWordWL => {
                                 // 2× Direct
-                                alpha_power = &alpha_power * alpha;
-                                linear_combination += step.get_main_evaluation_element(0, *start_column) * &alpha_power;
-                                alpha_power = &alpha_power * alpha;
-                                linear_combination += step.get_main_evaluation_element(0, *start_column + 1) * &alpha_power;
+                                linear_combination += step.get_main_evaluation_element(0, *start_column) * &alpha_powers[alpha_idx];
+                                linear_combination += step.get_main_evaluation_element(0, *start_column + 1) * &alpha_powers[alpha_idx + 1];
+                                alpha_idx += 2;
                             }
                             Packing::DWordHL => {
                                 // 2× Word2L
                                 let shift_16 = FieldElement::<A>::from(SHIFT_16);
-                                alpha_power = &alpha_power * alpha;
                                 let w0 = step.get_main_evaluation_element(0, *start_column)
                                     + step.get_main_evaluation_element(0, *start_column + 1) * &shift_16;
-                                linear_combination += &w0 * &alpha_power;
-                                alpha_power = &alpha_power * alpha;
+                                linear_combination += &w0 * &alpha_powers[alpha_idx];
                                 let w1 = step.get_main_evaluation_element(0, *start_column + 2)
                                     + step.get_main_evaluation_element(0, *start_column + 3) * &shift_16;
-                                linear_combination += &w1 * &alpha_power;
+                                linear_combination += &w1 * &alpha_powers[alpha_idx + 1];
+                                alpha_idx += 2;
                             }
                             Packing::DWordBL => {
                                 // 2× Word4L
                                 let shift_8 = FieldElement::<A>::from(SHIFT_8);
                                 let shift_16 = FieldElement::<A>::from(SHIFT_16);
                                 let shift_24 = &shift_8 * &shift_16;
-                                alpha_power = &alpha_power * alpha;
                                 let w0 = step.get_main_evaluation_element(0, *start_column)
                                     + step.get_main_evaluation_element(0, *start_column + 1) * &shift_8
                                     + step.get_main_evaluation_element(0, *start_column + 2) * &shift_16
                                     + step.get_main_evaluation_element(0, *start_column + 3) * &shift_24;
-                                linear_combination += &w0 * &alpha_power;
-                                alpha_power = &alpha_power * alpha;
+                                linear_combination += &w0 * &alpha_powers[alpha_idx];
                                 let w1 = step.get_main_evaluation_element(0, *start_column + 4)
                                     + step.get_main_evaluation_element(0, *start_column + 5) * &shift_8
                                     + step.get_main_evaluation_element(0, *start_column + 6) * &shift_16
                                     + step.get_main_evaluation_element(0, *start_column + 7) * &shift_24;
-                                linear_combination += &w1 * &alpha_power;
+                                linear_combination += &w1 * &alpha_powers[alpha_idx + 1];
+                                alpha_idx += 2;
                             }
                             Packing::DWordHHW => {
                                 // Direct + Word2L
-                                alpha_power = &alpha_power * alpha;
-                                linear_combination += step.get_main_evaluation_element(0, *start_column) * &alpha_power;
-                                alpha_power = &alpha_power * alpha;
+                                linear_combination += step.get_main_evaluation_element(0, *start_column) * &alpha_powers[alpha_idx];
                                 let shift_16 = FieldElement::<A>::from(SHIFT_16);
                                 let w = step.get_main_evaluation_element(0, *start_column + 1)
                                     + step.get_main_evaluation_element(0, *start_column + 2) * &shift_16;
-                                linear_combination += &w * &alpha_power;
+                                linear_combination += &w * &alpha_powers[alpha_idx + 1];
+                                alpha_idx += 2;
                             }
                             Packing::DWordWHH => {
                                 // Word2L + Direct
                                 let shift_16 = FieldElement::<A>::from(SHIFT_16);
-                                alpha_power = &alpha_power * alpha;
                                 let w = step.get_main_evaluation_element(0, *start_column)
                                     + step.get_main_evaluation_element(0, *start_column + 1) * &shift_16;
-                                linear_combination += &w * &alpha_power;
-                                alpha_power = &alpha_power * alpha;
-                                linear_combination += step.get_main_evaluation_element(0, *start_column + 2) * &alpha_power;
+                                linear_combination += &w * &alpha_powers[alpha_idx];
+                                linear_combination += step.get_main_evaluation_element(0, *start_column + 2) * &alpha_powers[alpha_idx + 1];
+                                alpha_idx += 2;
                             }
                             Packing::QuadHL => {
                                 // 4× Word2L
                                 let shift_16 = FieldElement::<A>::from(SHIFT_16);
                                 for i in 0..4 {
-                                    alpha_power = &alpha_power * alpha;
                                     let c = *start_column + i * 2;
                                     let w = step.get_main_evaluation_element(0, c)
                                         + step.get_main_evaluation_element(0, c + 1) * &shift_16;
-                                    linear_combination += &w * &alpha_power;
+                                    linear_combination += &w * &alpha_powers[alpha_idx + i];
                                 }
+                                alpha_idx += 4;
                             }
                             Packing::QuadWL => {
                                 // 4× Direct
                                 for i in 0..4 {
-                                    alpha_power = &alpha_power * alpha;
-                                    linear_combination += step.get_main_evaluation_element(0, *start_column + i) * &alpha_power;
+                                    linear_combination += step.get_main_evaluation_element(0, *start_column + i) * &alpha_powers[alpha_idx + i];
                                 }
+                                alpha_idx += 4;
                             }
                         }
                     }
                     BusValue::Linear(terms) => {
-                        alpha_power = &alpha_power * alpha;
                         let mut result = FieldElement::<A>::zero();
                         for term in terms {
                             match term {
@@ -1612,10 +1587,12 @@ where
                                 }
                             }
                         }
-                        linear_combination += &result * &alpha_power;
+                        linear_combination += &result * &alpha_powers[alpha_idx];
+                        alpha_idx += 1;
                     }
                 }
             }
+            let _ = alpha_idx; // suppress unused warning
 
             let fingerprint = z - &linear_combination;
 
@@ -1635,22 +1612,26 @@ where
             TransitionEvaluationContext::Prover {
                 frame,
                 rap_challenges,
+                logup_alpha_powers,
                 ..
             } => evaluate_term_constraint(
                 frame.get_evaluation_step(0),
                 self.term_column_idx,
                 &self.interaction,
                 rap_challenges,
+                logup_alpha_powers,
             ),
             TransitionEvaluationContext::Verifier {
                 frame,
                 rap_challenges,
+                logup_alpha_powers,
                 ..
             } => evaluate_term_constraint(
                 frame.get_evaluation_step(0),
                 self.term_column_idx,
                 &self.interaction,
                 rap_challenges,
+                logup_alpha_powers,
             ),
         };
 

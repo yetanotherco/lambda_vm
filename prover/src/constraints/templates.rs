@@ -116,6 +116,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for IsBitConstra
                 frame,
                 periodic_values: _,
                 rap_challenges: _,
+                ..
             } => {
                 let constraint_value = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
@@ -125,6 +126,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for IsBitConstra
                 frame,
                 periodic_values: _,
                 rap_challenges: _,
+                ..
             } => {
                 let constraint_value = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = constraint_value;
@@ -518,6 +520,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for AddConstrain
                 frame,
                 periodic_values: _,
                 rap_challenges: _,
+                ..
             } => {
                 let constraint_value = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
@@ -527,6 +530,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for AddConstrain
                 frame,
                 periodic_values: _,
                 rap_challenges: _,
+                ..
             } => {
                 let constraint_value = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = constraint_value;

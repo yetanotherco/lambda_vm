@@ -195,6 +195,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for BranchCondCo
                 frame,
                 periodic_values: _,
                 rap_challenges: _,
+                ..
             } => {
                 let constraint_value = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
@@ -204,6 +205,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for BranchCondCo
                 frame,
                 periodic_values: _,
                 rap_challenges: _,
+                ..
             } => {
                 let constraint_value = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = constraint_value;
@@ -261,6 +263,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for EbreakConstr
                 frame,
                 periodic_values: _,
                 rap_challenges: _,
+                ..
             } => {
                 let constraint_value = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
@@ -270,6 +273,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for EbreakConstr
                 frame,
                 periodic_values: _,
                 rap_challenges: _,
+                ..
             } => {
                 let constraint_value = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = constraint_value;
@@ -349,6 +353,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg1LowerCon
                 frame,
                 periodic_values: _,
                 rap_challenges: _,
+                ..
             } => {
                 let constraint_value = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
@@ -358,6 +363,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg1LowerCon
                 frame,
                 periodic_values: _,
                 rap_challenges: _,
+                ..
             } => {
                 let constraint_value = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = constraint_value;
@@ -441,6 +447,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg1UpperCon
                 frame,
                 periodic_values: _,
                 rap_challenges: _,
+                ..
             } => {
                 let constraint_value = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
@@ -450,6 +457,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg1UpperCon
                 frame,
                 periodic_values: _,
                 rap_challenges: _,
+                ..
             } => {
                 let constraint_value = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = constraint_value;
@@ -519,6 +527,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for SltResZeroCo
                 frame,
                 periodic_values: _,
                 rap_challenges: _,
+                ..
             } => {
                 let constraint_value = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
@@ -528,6 +537,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for SltResZeroCo
                 frame,
                 periodic_values: _,
                 rap_challenges: _,
+                ..
             } => {
                 let constraint_value = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = constraint_value;
@@ -612,6 +622,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for SignBitZeroC
                 frame,
                 periodic_values: _,
                 rap_challenges: _,
+                ..
             } => {
                 let constraint_value = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
@@ -621,6 +632,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for SignBitZeroC
                 frame,
                 periodic_values: _,
                 rap_challenges: _,
+                ..
             } => {
                 let constraint_value = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = constraint_value;
@@ -751,6 +763,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for NextPcAddCon
                 frame,
                 periodic_values: _,
                 rap_challenges: _,
+                ..
             } => {
                 let constraint_value = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
@@ -760,6 +773,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for NextPcAddCon
                 frame,
                 periodic_values: _,
                 rap_challenges: _,
+                ..
             } => {
                 let constraint_value = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = constraint_value;

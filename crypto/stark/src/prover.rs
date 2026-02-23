@@ -475,7 +475,7 @@ pub trait IsStarkProver<
         domain: &Domain<Field>,
     ) -> Vec<Vec<FieldElement<E>>>
     where
-        E: IsSubFieldOf<FieldExtension>,
+        E: IsSubFieldOf<FieldExtension> + Send + Sync,
         Field: IsSubFieldOf<E>,
         FieldElement<E>: Send + Sync,
     {
@@ -521,7 +521,7 @@ pub trait IsStarkProver<
         twiddles: &LdeTwiddles<Field>,
     ) -> Vec<Vec<FieldElement<E>>>
     where
-        E: IsSubFieldOf<FieldExtension>,
+        E: IsSubFieldOf<FieldExtension> + Send + Sync,
         Field: IsSubFieldOf<E>,
         FieldElement<E>: Send + Sync,
     {
@@ -559,7 +559,7 @@ pub trait IsStarkProver<
         twiddles: &LdeTwiddles<Field>,
         output: &mut [Vec<FieldElement<E>>],
     ) where
-        E: IsSubFieldOf<FieldExtension>,
+        E: IsSubFieldOf<FieldExtension> + Send + Sync,
         Field: IsSubFieldOf<E>,
         FieldElement<E>: Send + Sync,
     {
@@ -619,7 +619,7 @@ pub trait IsStarkProver<
         twiddles: &LdeTwiddles<Field>,
     ) where
         Field: IsSubFieldOf<E>,
-        E: IsSubFieldOf<FieldExtension> + IsField,
+        E: IsSubFieldOf<FieldExtension> + IsField + Send + Sync,
         FieldElement<E>: Send + Sync,
     {
         if num_cols == 0 {
@@ -1904,22 +1904,9 @@ pub trait IsStarkProver<
         //   Pass 1 (parallel): Build all auxiliary traces (fingerprint + batch inversion)
         //   Pass 2 (sequential): Extract → LDE → commit → transcript append (shared pool)
 
-        // Pass 1: Build aux traces in parallel.
-        // Each build_auxiliary_trace only reads from its own main trace and writes
-        // to its own aux table. No cross-table dependencies.
-        #[cfg(feature = "parallel")]
-        let bus_inputs_vec: Vec<Option<BusPublicInputs<FieldExtension>>> = air_trace_pairs
-            .par_iter_mut()
-            .map(|(air, trace, _)| {
-                if air.has_trace_interaction() {
-                    air.build_auxiliary_trace(*trace, &logup_challenges)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        #[cfg(not(feature = "parallel"))]
+        // Pass 1: Build aux traces sequentially.
+        // Each build_auxiliary_trace has internal parallelism (batch_inverse, par_chunks),
+        // so outer parallelism over 12 tables adds Rayon overhead without benefit.
         let bus_inputs_vec: Vec<Option<BusPublicInputs<FieldExtension>>> = air_trace_pairs
             .iter_mut()
             .map(|(air, trace, _)| {

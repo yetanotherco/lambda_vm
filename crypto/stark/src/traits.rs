@@ -67,11 +67,13 @@ where
         frame: &'a Frame<F, E>,
         periodic_values: &'a [FieldElement<F>],
         rap_challenges: &'a [FieldElement<E>],
+        logup_alpha_powers: &'a [FieldElement<E>],
     },
     Verifier {
         frame: &'a Frame<E, E>,
         periodic_values: &'a [FieldElement<E>],
         rap_challenges: &'a [FieldElement<E>],
+        logup_alpha_powers: &'a [FieldElement<E>],
     },
 }
 
@@ -84,11 +86,13 @@ where
         frame: &'a Frame<F, E>,
         periodic_values: &'a [FieldElement<F>],
         rap_challenges: &'a [FieldElement<E>],
+        logup_alpha_powers: &'a [FieldElement<E>],
     ) -> Self {
         Self::Prover {
             frame,
             periodic_values,
             rap_challenges,
+            logup_alpha_powers,
         }
     }
 
@@ -96,11 +100,13 @@ where
         frame: &'a Frame<E, E>,
         periodic_values: &'a [FieldElement<E>],
         rap_challenges: &'a [FieldElement<E>],
+        logup_alpha_powers: &'a [FieldElement<E>],
     ) -> Self {
         Self::Verifier {
             frame,
             periodic_values,
             rap_challenges,
+            logup_alpha_powers,
         }
     }
 }

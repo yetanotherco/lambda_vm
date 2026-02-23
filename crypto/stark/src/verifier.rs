@@ -9,7 +9,7 @@ use super::{
 use crate::{
     config::Commitment,
     domain::new_verifier_domain,
-    lookup::LOGUP_NUM_CHALLENGES,
+    lookup::{compute_alpha_powers, LOGUP_CHALLENGE_ALPHA, LOGUP_NUM_CHALLENGES},
     proof::stark::{DeepPolynomialOpening, MultiProof},
 };
 use crypto::{fiat_shamir::is_transcript::IsStarkTranscript, merkle_tree::proof::Proof};
@@ -308,12 +308,19 @@ pub trait IsStarkVerifier<
         let num_main_trace_columns =
             proof.trace_ood_evaluations.width - air.num_auxiliary_rap_columns();
 
+        let logup_alpha_powers: Vec<FieldElement<FieldExtension>> =
+            if challenges.rap_challenges.len() > LOGUP_CHALLENGE_ALPHA {
+                compute_alpha_powers(&challenges.rap_challenges[LOGUP_CHALLENGE_ALPHA], 32)
+            } else {
+                Vec::new()
+            };
         let ood_frame =
             (proof.trace_ood_evaluations).into_frame(num_main_trace_columns, air.step_size());
         let transition_evaluation_context = TransitionEvaluationContext::new_verifier(
             &ood_frame,
             &periodic_values,
             &challenges.rap_challenges,
+            &logup_alpha_powers,
         );
         let transition_ood_frame_evaluations =
             air.compute_transition(&transition_evaluation_context);

@@ -4,6 +4,7 @@ use crate::debug::check_boundary_polys_divisibility;
 use crate::domain::Domain;
 use crate::lookup::BusPublicInputs;
 use crate::trace::LDETraceTable;
+use crate::lookup::{compute_alpha_powers, LOGUP_CHALLENGE_ALPHA};
 use crate::traits::{AIR, TransitionEvaluationContext, ZerofierEvaluations};
 use crate::{frame::Frame, prover::evaluate_polynomial_on_lde_domain};
 use itertools::Itertools;
@@ -53,6 +54,17 @@ where
     ) -> Vec<FieldElement<FieldExtension>> {
         let is_uniform = zerofier_data.is_uniform();
 
+        // Pre-compute LogUp alpha powers once for all LDE domain points.
+        // Each LookupTermConstraint::evaluate reuses these instead of computing
+        // incremental alpha_power = alpha_power * alpha per call.
+        // 32 powers is generous (max bus elements per interaction is ~15).
+        let logup_alpha_powers: Vec<FieldElement<FieldExtension>> =
+            if rap_challenges.len() > LOGUP_CHALLENGE_ALPHA {
+                compute_alpha_powers(&rap_challenges[LOGUP_CHALLENGE_ALPHA], 32)
+            } else {
+                Vec::new()
+            };
+
         // Per-thread buffers via map_init: each Rayon worker allocates once,
         // then reuses for all iterations assigned to that thread.
         // The Frame is pre-allocated and filled in-place to avoid Vec allocations
@@ -88,6 +100,7 @@ where
                             frame,
                             periodic_buf,
                             rap_challenges,
+                            &logup_alpha_powers,
                         );
                         air.compute_transition_into(&ctx, transition_buf);
 
@@ -142,6 +155,7 @@ where
                         &frame,
                         &periodic_buf,
                         rap_challenges,
+                        &logup_alpha_powers,
                     );
                     air.compute_transition_into(&ctx, &mut transition_buf);
 

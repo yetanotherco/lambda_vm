@@ -16,6 +16,16 @@ use super::cpu::{
     bowers_fft::{bowers_fft_opt_fused, bowers_ifft_opt, LayerTwiddles},
 };
 
+#[cfg(feature = "parallel")]
+use super::cpu::bowers_fft::{bowers_fft_opt_fused_parallel, bowers_ifft_opt_parallel};
+
+/// Threshold for dispatching to parallel FFT.
+/// Below this size, sequential FFT is faster (avoids Rayon overhead).
+/// At 2^14 = 16384 elements, the parallel version starts to win
+/// because later butterfly layers have enough blocks for effective parallelism.
+#[cfg(feature = "parallel")]
+const PARALLEL_FFT_THRESHOLD: usize = 1 << 14;
+
 impl<E: IsField> Polynomial<FieldElement<E>> {
     /// Returns `N` evaluations of this polynomial using FFT over a domain in a subfield F of E (so the results
     /// are P(w^i), with w being a primitive root of unity).
@@ -186,13 +196,16 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     /// Same as [`coset_lde_with_twiddles`], but also accepts pre-computed `weights[i] = offset^i / n`
     /// so that the scaling step avoids the running product across columns.
     /// Weights are in the base field F — the scaling `w * coeff` uses mixed F×E multiplication.
-    pub fn coset_lde_full<F: IsFFTField + IsSubFieldOf<E>>(
+    pub fn coset_lde_full<F: IsFFTField + IsSubFieldOf<E> + Send + Sync>(
         evals: &[FieldElement<E>],
         blowup_factor: usize,
         weights: &[FieldElement<F>],
         inv_twiddles: &LayerTwiddles<F>,
         fwd_twiddles: &LayerTwiddles<F>,
-    ) -> Result<Vec<FieldElement<E>>, FFTError> {
+    ) -> Result<Vec<FieldElement<E>>, FFTError>
+    where
+        E: Send + Sync,
+    {
         let n = evals.len();
         if n == 0 {
             return Ok(Vec::new());
@@ -210,14 +223,17 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     /// The buffer is cleared and reused: `buffer.clear(); buffer.extend_from_slice(evals);
     /// buffer.resize(lde_size, zero)`. When the capacity is sufficient, no heap allocation occurs.
     /// Weights are in the base field F — the scaling `w * coeff` uses mixed F×E multiplication.
-    pub fn coset_lde_full_into<F: IsFFTField + IsSubFieldOf<E>>(
+    pub fn coset_lde_full_into<F: IsFFTField + IsSubFieldOf<E> + Send + Sync>(
         evals: &[FieldElement<E>],
         blowup_factor: usize,
         weights: &[FieldElement<F>],
         inv_twiddles: &LayerTwiddles<F>,
         fwd_twiddles: &LayerTwiddles<F>,
         buffer: &mut Vec<FieldElement<E>>,
-    ) -> Result<(), FFTError> {
+    ) -> Result<(), FFTError>
+    where
+        E: Send + Sync,
+    {
         let n = evals.len();
         if n == 0 {
             buffer.clear();
@@ -235,6 +251,16 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         buffer.resize(lde_size, FieldElement::zero());
 
         in_place_bit_reverse_permute(&mut buffer[..n]);
+
+        #[cfg(feature = "parallel")]
+        {
+            if n >= PARALLEL_FFT_THRESHOLD {
+                bowers_ifft_opt_parallel(&mut buffer[..n], inv_twiddles)?;
+            } else {
+                bowers_ifft_opt(&mut buffer[..n], inv_twiddles)?;
+            }
+        }
+        #[cfg(not(feature = "parallel"))]
         bowers_ifft_opt(&mut buffer[..n], inv_twiddles)?;
 
         // Scale using pre-computed weights (base field) — F × E → E mixed multiplication.
@@ -242,7 +268,17 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
             *coeff = w * &*coeff;
         }
 
+        #[cfg(feature = "parallel")]
+        {
+            if buffer.len() >= PARALLEL_FFT_THRESHOLD {
+                bowers_fft_opt_fused_parallel(buffer, fwd_twiddles)?;
+            } else {
+                bowers_fft_opt_fused(buffer, fwd_twiddles)?;
+            }
+        }
+        #[cfg(not(feature = "parallel"))]
         bowers_fft_opt_fused(buffer, fwd_twiddles)?;
+
         in_place_bit_reverse_permute(buffer);
 
         Ok(())
@@ -259,13 +295,16 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     /// Unlike [`coset_lde_full_into`], this skips the `clear + extend_from_slice` step
     /// since data is already in the buffer. Used for transpose elimination: columns are
     /// extracted directly into pool buffers, then expanded in-place.
-    pub fn coset_lde_full_expand<F: IsFFTField + IsSubFieldOf<E>>(
+    pub fn coset_lde_full_expand<F: IsFFTField + IsSubFieldOf<E> + Send + Sync>(
         buffer: &mut Vec<FieldElement<E>>,
         blowup_factor: usize,
         weights: &[FieldElement<F>],
         inv_twiddles: &LayerTwiddles<F>,
         fwd_twiddles: &LayerTwiddles<F>,
-    ) -> Result<(), FFTError> {
+    ) -> Result<(), FFTError>
+    where
+        E: Send + Sync,
+    {
         let n = buffer.len();
         if n == 0 {
             return Ok(());
@@ -279,6 +318,16 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
 
         // 1. iFFT on buffer[..n]
         in_place_bit_reverse_permute(&mut buffer[..n]);
+
+        #[cfg(feature = "parallel")]
+        {
+            if n >= PARALLEL_FFT_THRESHOLD {
+                bowers_ifft_opt_parallel(&mut buffer[..n], inv_twiddles)?;
+            } else {
+                bowers_ifft_opt(&mut buffer[..n], inv_twiddles)?;
+            }
+        }
+        #[cfg(not(feature = "parallel"))]
         bowers_ifft_opt(&mut buffer[..n], inv_twiddles)?;
 
         // 2. Scale using pre-computed weights (base field) — F × E → E mixed multiplication.
@@ -290,7 +339,17 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         buffer.resize(lde_size, FieldElement::zero());
 
         // 4. Forward FFT on the full buffer
+        #[cfg(feature = "parallel")]
+        {
+            if buffer.len() >= PARALLEL_FFT_THRESHOLD {
+                bowers_fft_opt_fused_parallel(buffer, fwd_twiddles)?;
+            } else {
+                bowers_fft_opt_fused(buffer, fwd_twiddles)?;
+            }
+        }
+        #[cfg(not(feature = "parallel"))]
         bowers_fft_opt_fused(buffer, fwd_twiddles)?;
+
         in_place_bit_reverse_permute(buffer);
 
         Ok(())
