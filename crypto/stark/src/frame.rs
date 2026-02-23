@@ -1,5 +1,6 @@
 use crate::{table::TableView, trace::LDETraceTable};
 use itertools::Itertools;
+use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 
 /// A frame represents a collection of trace steps.
@@ -80,5 +81,71 @@ impl<F: IsSubFieldOf<E>, E: IsField> Frame<F, E> {
     ) -> Self {
         let row = lde_trace.step_to_row(step);
         Self::read_from_lde(lde_trace, row, offsets)
+    }
+
+    /// Pre-allocate a Frame with the right dimensions for reuse in hot loops.
+    ///
+    /// The frame will have `offsets.len()` steps, each containing
+    /// `step_size / blowup_factor` rows (typically 1) of main and aux columns.
+    pub fn preallocate(
+        num_offsets: usize,
+        rows_per_step: usize,
+        num_main_cols: usize,
+        num_aux_cols: usize,
+    ) -> Self {
+        let steps = (0..num_offsets)
+            .map(|_| {
+                let main_data: Vec<Vec<FieldElement<F>>> = (0..rows_per_step)
+                    .map(|_| vec![FieldElement::zero(); num_main_cols])
+                    .collect();
+                let aux_data: Vec<Vec<FieldElement<E>>> = (0..rows_per_step)
+                    .map(|_| vec![FieldElement::zero(); num_aux_cols])
+                    .collect();
+                TableView::new(main_data, aux_data)
+            })
+            .collect();
+        Frame { steps }
+    }
+
+    /// Fill a pre-allocated frame from LDE data, without allocating.
+    ///
+    /// The frame must have been created with `preallocate` with matching dimensions.
+    pub fn fill_from_lde(
+        &mut self,
+        lde_trace: &LDETraceTable<F, E>,
+        row: usize,
+        offsets: &[usize],
+    ) {
+        let blowup_factor = lde_trace.blowup_factor;
+        let num_rows = lde_trace.num_rows();
+        let step_size = lde_trace.lde_step_size;
+        let num_main_cols = lde_trace.num_main_cols();
+        let num_aux_cols = lde_trace.num_aux_cols();
+
+        for (step_idx, &offset) in offsets.iter().enumerate() {
+            let initial_step_row = row + offset * step_size;
+            let end_step_row = initial_step_row + step_size;
+            let step = &mut self.steps[step_idx];
+
+            let mut sub_row_idx = 0;
+            let mut step_row = initial_step_row;
+            while step_row < end_step_row {
+                let step_row_idx = step_row % num_rows;
+
+                // Overwrite main row elements
+                for col in 0..num_main_cols {
+                    step.data[sub_row_idx][col] = lde_trace.get_main(step_row_idx, col).clone();
+                }
+
+                // Overwrite aux row elements
+                for col in 0..num_aux_cols {
+                    step.aux_data[sub_row_idx][col] =
+                        lde_trace.get_aux(step_row_idx, col).clone();
+                }
+
+                sub_row_idx += 1;
+                step_row += blowup_factor;
+            }
+        }
     }
 }

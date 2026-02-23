@@ -55,6 +55,15 @@ where
 
         // Per-thread buffers via map_init: each Rayon worker allocates once,
         // then reuses for all iterations assigned to that thread.
+        // The Frame is pre-allocated and filled in-place to avoid Vec allocations
+        // on every LDE point (which was ~8% of total CPU time).
+        let blowup_factor = lde_trace.blowup_factor;
+        let lde_step_size = lde_trace.lde_step_size;
+        let rows_per_step = lde_step_size / blowup_factor;
+        let num_main_cols = lde_trace.num_main_cols();
+        let num_aux_cols = lde_trace.num_aux_cols();
+        let num_offsets = offsets.len();
+
         #[cfg(feature = "parallel")]
         {
             let evaluations_t: Vec<_> = boundary_evaluation
@@ -65,17 +74,18 @@ where
                         (
                             vec![FieldElement::<FieldExtension>::zero(); num_transition],
                             vec![FieldElement::<Field>::zero(); num_periodic],
+                            Frame::preallocate(num_offsets, rows_per_step, num_main_cols, num_aux_cols),
                         )
                     },
-                    |(transition_buf, periodic_buf), (i, boundary)| {
-                        let frame = Frame::read_from_lde(lde_trace, i, offsets);
+                    |(transition_buf, periodic_buf, frame), (i, boundary)| {
+                        frame.fill_from_lde(lde_trace, i, offsets);
 
                         for (j, col) in lde_periodic_columns.iter().enumerate() {
                             periodic_buf[j] = col[i].clone();
                         }
 
                         let ctx = TransitionEvaluationContext::new_prover(
-                            &frame,
+                            frame,
                             periodic_buf,
                             rap_challenges,
                         );
@@ -116,12 +126,13 @@ where
             let mut transition_buf =
                 vec![FieldElement::<FieldExtension>::zero(); num_transition];
             let mut periodic_buf = vec![FieldElement::<Field>::zero(); num_periodic];
+            let mut frame = Frame::preallocate(num_offsets, rows_per_step, num_main_cols, num_aux_cols);
 
             boundary_evaluation
                 .into_iter()
                 .enumerate()
                 .map(|(i, boundary)| {
-                    let frame = Frame::read_from_lde(lde_trace, i, offsets);
+                    frame.fill_from_lde(lde_trace, i, offsets);
 
                     for (j, col) in lde_periodic_columns.iter().enumerate() {
                         periodic_buf[j] = col[i].clone();
