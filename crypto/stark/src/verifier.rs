@@ -827,7 +827,7 @@ pub trait IsStarkVerifier<
     fn multi_verify(
         airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
         multi_proof: &MultiProof<Field, FieldExtension, PI>,
-        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
@@ -889,16 +889,6 @@ pub trait IsStarkVerifier<
         };
 
         // =====================================================================
-        // Round 1, Phase C: Replay auxiliary trace commitments
-        // =====================================================================
-
-        for proof in &multi_proof.proofs {
-            if let Some(root) = proof.lde_trace_aux_merkle_root {
-                transcript.append_bytes(&root);
-            }
-        }
-
-        // =====================================================================
         // Validate bus_public_inputs presence and length against AIR layout
         // =====================================================================
         // A dishonest prover could omit bus_public_inputs entirely (None) to
@@ -933,11 +923,33 @@ pub trait IsStarkVerifier<
         }
 
         // =====================================================================
-        // Rounds 2-4: Verify each proof
+        // Phase C + Rounds 2-4: Forked per table
         // =====================================================================
+        // Each table gets an independent transcript fork (cloned from the shared
+        // state after Phase B, domain-separated by table index). This matches
+        // the prover's forking and makes per-table verification independent.
 
         for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
-            if !Self::verify_rounds_2_to_4(*air, proof, transcript, lookup_challenges.clone()) {
+            // Must match prover: fork with domain separator for multi-table,
+            // use original transcript directly for single-table.
+            let num_tables = airs.len();
+            let mut table_transcript = transcript.clone();
+            if num_tables > 1 {
+                table_transcript.append_bytes(&(idx as u64).to_le_bytes());
+            }
+
+            // Phase C: replay aux commitment
+            if let Some(root) = proof.lde_trace_aux_merkle_root {
+                table_transcript.append_bytes(&root);
+            }
+
+            // Rounds 2-4: verify
+            if !Self::verify_rounds_2_to_4(
+                *air,
+                proof,
+                &mut table_transcript,
+                lookup_challenges.clone(),
+            ) {
                 error!(
                     "Table {} failed verify_rounds_2_to_4 (num_constraints={}, trace_cols={})",
                     idx,
@@ -983,7 +995,7 @@ pub trait IsStarkVerifier<
     fn verify(
         proof: &StarkProof<Field, FieldExtension, PI>,
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
-        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
