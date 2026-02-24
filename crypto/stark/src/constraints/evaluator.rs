@@ -56,7 +56,7 @@ where
         let is_uniform = zerofier_data.is_uniform();
 
         // Pre-compute LogUp alpha powers once for all LDE domain points.
-        // Each LookupTermConstraint::evaluate reuses these instead of computing
+        // Each LogUp constraint's evaluate reuses these instead of computing
         // incremental alpha_power = alpha_power * alpha per call.
         // 32 powers is generous (max bus elements per interaction is ~15).
         let logup_alpha_powers: Vec<FieldElement<FieldExtension>> =

@@ -688,13 +688,14 @@ impl<
     /// Creates an AirWithBuses with LogUp-specific transition constraints.
     /// If no boundary constraints are needed, use `NullBoundaryConstraintBuilder` as B and () as PI.
     ///
-    /// Auxiliary column layout (with interaction batching):
-    /// - Columns 0..⌈N/2⌉-1: Term columns (one per pair of interactions), each containing
-    ///   `sign_a * m_a/fp_a + sign_b * m_b/fp_b`
-    /// - If N is odd, column ⌈N/2⌉-1 is an unbatched single interaction
-    /// - Last column: Accumulated column, containing the running sum of all terms
+    /// Auxiliary column layout (with interaction batching + absorption):
+    /// - Columns 0..num_committed_pairs-1: Committed term columns (batched pairs)
+    /// - Last column: Accumulated column (running sum + 1-2 absorbed interactions)
     ///
-    /// Total aux columns = ⌈N/2⌉ + 1 where N is the number of interactions.
+    /// The last 1-2 interactions are "absorbed" into the accumulated constraint
+    /// by clearing denominators, eliminating one committed term column per table.
+    ///
+    /// Total aux columns = ⌈N/2⌉ where N is the number of interactions.
     pub fn new(
         num_main_columns: usize,
         auxiliary_trace_build_data: AuxiliaryTraceBuildData,
@@ -704,12 +705,25 @@ impl<
     ) -> Self {
         let num_interactions = auxiliary_trace_build_data.interactions.len();
 
-        // Pair interactions for batching: 2 interactions per term column (degree-3 constraint)
-        // Odd remainder uses a single unbatched interaction (degree-2 constraint)
-        let num_pairs = num_interactions / 2;
-        let has_remainder = num_interactions % 2 == 1;
+        // Split interactions: committed pairs get term columns, last 1-2 are absorbed
+        let (num_committed_pairs, absorbed) = if num_interactions == 0 {
+            (0, vec![])
+        } else if num_interactions <= 2 {
+            // All interactions absorbed, no committed term columns
+            (0, auxiliary_trace_build_data.interactions[..num_interactions].to_vec())
+        } else if num_interactions % 2 == 1 {
+            // Odd: pairs from [0..N-1), absorb last 1
+            ((num_interactions - 1) / 2, vec![auxiliary_trace_build_data.interactions[num_interactions - 1].clone()])
+        } else {
+            // Even: pairs from [0..N-2), absorb last 2
+            ((num_interactions - 2) / 2, vec![
+                auxiliary_trace_build_data.interactions[num_interactions - 2].clone(),
+                auxiliary_trace_build_data.interactions[num_interactions - 1].clone(),
+            ])
+        };
 
-        for pair_idx in 0..num_pairs {
+        // Create batched term constraints for committed pairs only
+        for pair_idx in 0..num_committed_pairs {
             let constraint = LookupBatchedTermConstraint::new(
                 auxiliary_trace_build_data.interactions[pair_idx * 2].clone(),
                 auxiliary_trace_build_data.interactions[pair_idx * 2 + 1].clone(),
@@ -718,25 +732,17 @@ impl<
             );
             transition_constraints.push(Box::new(constraint));
         }
-        if has_remainder {
-            let constraint = LookupTermConstraint::new(
-                auxiliary_trace_build_data.interactions[num_interactions - 1].clone(),
-                num_pairs,
-                transition_constraints.len(),
-            );
-            transition_constraints.push(Box::new(constraint));
-        }
 
-        let num_term_columns = num_pairs + if has_remainder { 1 } else { 0 };
+        let num_term_columns = num_committed_pairs;
 
-        // Add the accumulated constraint
+        // Add the accumulated constraint with absorbed interactions
         if num_interactions > 0 {
             let accumulated_constraint =
-                LookupAccumulatedConstraint::new(transition_constraints.len(), num_term_columns);
+                LookupAccumulatedConstraint::new(transition_constraints.len(), num_term_columns, absorbed);
             transition_constraints.push(Box::new(accumulated_constraint));
         }
 
-        // Create Layout: ⌈N/2⌉ term columns + 1 accumulated column
+        // Layout: num_committed_pairs term columns + 1 accumulated = ⌈N/2⌉
         let num_aux_columns = if num_interactions > 0 {
             num_term_columns + 1
         } else {
@@ -870,56 +876,62 @@ where
         let trace_len = trace.num_rows();
         let table_name = self.name.as_deref().unwrap_or("UNKNOWN");
 
-        // Pair interactions for batched term columns
-        let num_pairs = num_interactions / 2;
-        let has_remainder = num_interactions % 2 == 1;
+        // Split interactions: committed pairs get term columns, last 1-2 are absorbed (virtual)
+        let (num_committed_pairs, absorbed_count) = if num_interactions <= 2 {
+            (0, num_interactions)
+        } else if num_interactions % 2 == 1 {
+            ((num_interactions - 1) / 2, 1usize)
+        } else {
+            ((num_interactions - 2) / 2, 2usize)
+        };
 
-        // Build work items: pairs + optional remainder
-        enum TermWork<'a> {
-            Batched(&'a BusInteraction, &'a BusInteraction),
-            Single(&'a BusInteraction),
-        }
-        let mut work_items: Vec<TermWork> = Vec::with_capacity(num_pairs + if has_remainder { 1 } else { 0 });
-        for pair_idx in 0..num_pairs {
-            work_items.push(TermWork::Batched(
-                &self.auxiliary_trace_build_data.interactions[pair_idx * 2],
-                &self.auxiliary_trace_build_data.interactions[pair_idx * 2 + 1],
-            ));
-        }
-        if has_remainder {
-            work_items.push(TermWork::Single(
-                &self.auxiliary_trace_build_data.interactions[num_interactions - 1],
-            ));
-        }
-
-        // Compute term columns in parallel
+        // Compute committed term columns in parallel (batched pairs only)
         #[cfg(feature = "parallel")]
-        let work_iter = work_items.as_slice().into_par_iter();
+        let committed_columns: Vec<Vec<FieldElement<E>>> = (0..num_committed_pairs)
+            .into_par_iter()
+            .map(|i| compute_logup_batched_term_column(
+                &self.auxiliary_trace_build_data.interactions[i * 2],
+                &self.auxiliary_trace_build_data.interactions[i * 2 + 1],
+                &main_segment_cols,
+                trace_len,
+                challenges,
+                table_name,
+            ))
+            .collect();
         #[cfg(not(feature = "parallel"))]
-        let work_iter = work_items.iter();
-
-        let term_columns: Vec<Vec<FieldElement<E>>> = work_iter
-            .map(|work| match work {
-                TermWork::Batched(ia, ib) => compute_logup_batched_term_column(
-                    ia,
-                    ib,
-                    &main_segment_cols,
-                    trace_len,
-                    challenges,
-                    table_name,
-                ),
-                TermWork::Single(interaction) => compute_logup_term_column(
-                    interaction,
-                    &main_segment_cols,
-                    trace_len,
-                    challenges,
-                    table_name,
-                ),
-            })
+        let committed_columns: Vec<Vec<FieldElement<E>>> = (0..num_committed_pairs)
+            .map(|i| compute_logup_batched_term_column(
+                &self.auxiliary_trace_build_data.interactions[i * 2],
+                &self.auxiliary_trace_build_data.interactions[i * 2 + 1],
+                &main_segment_cols,
+                trace_len,
+                challenges,
+                table_name,
+            ))
             .collect();
 
-        // Write term columns to trace
-        for (col_idx, col_data) in term_columns.iter().enumerate() {
+        // Compute virtual column for absorbed interactions (NOT written to trace)
+        let virtual_column = if absorbed_count == 2 {
+            compute_logup_batched_term_column(
+                &self.auxiliary_trace_build_data.interactions[num_interactions - 2],
+                &self.auxiliary_trace_build_data.interactions[num_interactions - 1],
+                &main_segment_cols,
+                trace_len,
+                challenges,
+                table_name,
+            )
+        } else {
+            compute_logup_term_column(
+                &self.auxiliary_trace_build_data.interactions[num_interactions - 1],
+                &main_segment_cols,
+                trace_len,
+                challenges,
+                table_name,
+            )
+        };
+
+        // Write only committed columns to trace
+        for (col_idx, col_data) in committed_columns.iter().enumerate() {
             for (row, value) in col_data.iter().enumerate() {
                 trace.set_aux(row, col_idx, value.clone());
             }
@@ -927,12 +939,13 @@ where
 
         #[cfg(feature = "debug-checks")]
         let (per_bus_sums, per_bus_sender_sums, per_bus_receiver_sums) =
-            compute_debug_bus_sums_batched(&self.auxiliary_trace_build_data.interactions, &term_columns, &main_segment_cols, trace_len, challenges, table_name);
+            compute_debug_bus_sums_batched(&self.auxiliary_trace_build_data.interactions, &committed_columns, &main_segment_cols, trace_len, challenges, table_name);
 
-        // Build circular accumulated column from pre-computed term columns
-        let num_term_columns = term_columns.len();
-        let acc_col_idx = num_term_columns;
-        let table_contribution = build_accumulated_column_from_terms(acc_col_idx, &term_columns, trace);
+        // Build accumulated from all columns (committed + virtual)
+        let mut all_columns = committed_columns;
+        all_columns.push(virtual_column);
+        let acc_col_idx = num_committed_pairs; // accumulated column in trace follows committed columns
+        let table_contribution = build_accumulated_column_from_terms(acc_col_idx, &all_columns, trace);
 
         Some(BusPublicInputs {
             table_contribution,
@@ -1552,283 +1565,7 @@ where
     (bus_sums, sender_sums, receiver_sums)
 }
 
-/// Constraint for each term column.
-///
-/// Verifies: `term[i] = sign * multiplicity[i] / fingerprint[i]`
-///
-/// Rearranged to avoid division: `term[i] * fingerprint[i] - sign * multiplicity[i] = 0`
-///
-/// where:
-/// - `fingerprint[i] = z - (v0 + v1*α + v2*α² + ...)` (bus elements after type combining)
-/// - `sign = +1` for senders, `-1` for receivers
-struct LookupTermConstraint {
-    // Indicates columns with multiplicity and values used to compute the term
-    interaction: BusInteraction,
-    // Index of the term column (aux column)
-    term_column_idx: usize,
-    // Index of the constraint
-    constraint_idx: usize,
-}
-
-impl LookupTermConstraint {
-    pub fn new(interaction: BusInteraction, term_column_idx: usize, constraint_idx: usize) -> Self {
-        Self {
-            interaction,
-            term_column_idx,
-            constraint_idx,
-        }
-    }
-}
-
-impl<F, E> TransitionConstraint<F, E> for LookupTermConstraint
-where
-    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
-    E: IsField + Send + Sync,
-{
-    fn degree(&self) -> usize {
-        2 // aux * fingerprint (fingerprint is linear in main trace values)
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn end_exemptions(&self) -> usize {
-        0 // Check all rows including the last
-    }
-
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<F, E>,
-        transition_evaluations: &mut [FieldElement<E>],
-    ) {
-        fn evaluate_term_constraint<'a, A: IsSubFieldOf<B>, B: IsField>(
-            step: &TableView<A, B>,
-            term_column_idx: usize,
-            interaction: &BusInteraction,
-            rap_challenges: &&[FieldElement<B>],
-            alpha_powers: &[FieldElement<B>],
-        ) -> FieldElement<B> {
-            // Term column value
-            let term = step.get_aux_evaluation_element(0, term_column_idx);
-
-            let z = &rap_challenges[LOGUP_CHALLENGE_Z];
-
-            // Compute multiplicity based on the Multiplicity variant
-            let multiplicity: FieldElement<A> = match &interaction.multiplicity {
-                Multiplicity::One => FieldElement::<A>::one(),
-                Multiplicity::Column(col) => step.get_main_evaluation_element(0, *col).clone(),
-                Multiplicity::Sum(col_a, col_b) => {
-                    step.get_main_evaluation_element(0, *col_a)
-                        + step.get_main_evaluation_element(0, *col_b)
-                }
-                Multiplicity::Negated(col) => {
-                    FieldElement::<A>::one() - step.get_main_evaluation_element(0, *col)
-                }
-                Multiplicity::Linear(terms) => {
-                    let mut result = FieldElement::<A>::zero();
-                    for term in terms {
-                        match term {
-                            LinearTerm::Column {
-                                coefficient,
-                                column,
-                            } => {
-                                let coeff = FieldElement::<A>::from(*coefficient);
-                                result += step.get_main_evaluation_element(0, *column) * coeff;
-                            }
-                            LinearTerm::ColumnUnsigned {
-                                coefficient,
-                                column,
-                            } => {
-                                let coeff = FieldElement::<A>::from(*coefficient);
-                                result += step.get_main_evaluation_element(0, *column) * coeff;
-                            }
-                            LinearTerm::Constant(value) => {
-                                result += FieldElement::<A>::from(*value);
-                            }
-                        }
-                    }
-                    result
-                }
-            };
-
-            // Compute fingerprint using pre-computed alpha powers (indexed access).
-            // fingerprint = z - (bus_id*α^0 + v[0]*α^1 + v[1]*α^2 + ...)
-            // alpha_powers[0] = 1, alpha_powers[1] = α, alpha_powers[2] = α², ...
-            let bus_id_f = FieldElement::<A>::from(interaction.bus_id);
-            let mut linear_combination = &bus_id_f * &alpha_powers[0];
-            #[allow(unused_assignments)]
-            let mut alpha_idx: usize = 1;
-            for bv in &interaction.values {
-                match bv {
-                    BusValue::Packed { start_column, packing } => {
-                        match packing {
-                            Packing::Direct => {
-                                linear_combination += step.get_main_evaluation_element(0, *start_column) * &alpha_powers[alpha_idx];
-                                alpha_idx += 1;
-                            }
-                            Packing::Word2L => {
-                                let shift_16 = FieldElement::<A>::from(SHIFT_16);
-                                let combined = step.get_main_evaluation_element(0, *start_column)
-                                    + step.get_main_evaluation_element(0, *start_column + 1) * &shift_16;
-                                linear_combination += &combined * &alpha_powers[alpha_idx];
-                                alpha_idx += 1;
-                            }
-                            Packing::Word4L => {
-                                let shift_8 = FieldElement::<A>::from(SHIFT_8);
-                                let shift_16 = FieldElement::<A>::from(SHIFT_16);
-                                let shift_24 = &shift_8 * &shift_16;
-                                let combined = step.get_main_evaluation_element(0, *start_column)
-                                    + step.get_main_evaluation_element(0, *start_column + 1) * &shift_8
-                                    + step.get_main_evaluation_element(0, *start_column + 2) * &shift_16
-                                    + step.get_main_evaluation_element(0, *start_column + 3) * &shift_24;
-                                linear_combination += &combined * &alpha_powers[alpha_idx];
-                                alpha_idx += 1;
-                            }
-                            Packing::DWordWL => {
-                                // 2× Direct
-                                linear_combination += step.get_main_evaluation_element(0, *start_column) * &alpha_powers[alpha_idx];
-                                linear_combination += step.get_main_evaluation_element(0, *start_column + 1) * &alpha_powers[alpha_idx + 1];
-                                alpha_idx += 2;
-                            }
-                            Packing::DWordHL => {
-                                // 2× Word2L
-                                let shift_16 = FieldElement::<A>::from(SHIFT_16);
-                                let w0 = step.get_main_evaluation_element(0, *start_column)
-                                    + step.get_main_evaluation_element(0, *start_column + 1) * &shift_16;
-                                linear_combination += &w0 * &alpha_powers[alpha_idx];
-                                let w1 = step.get_main_evaluation_element(0, *start_column + 2)
-                                    + step.get_main_evaluation_element(0, *start_column + 3) * &shift_16;
-                                linear_combination += &w1 * &alpha_powers[alpha_idx + 1];
-                                alpha_idx += 2;
-                            }
-                            Packing::DWordBL => {
-                                // 2× Word4L
-                                let shift_8 = FieldElement::<A>::from(SHIFT_8);
-                                let shift_16 = FieldElement::<A>::from(SHIFT_16);
-                                let shift_24 = &shift_8 * &shift_16;
-                                let w0 = step.get_main_evaluation_element(0, *start_column)
-                                    + step.get_main_evaluation_element(0, *start_column + 1) * &shift_8
-                                    + step.get_main_evaluation_element(0, *start_column + 2) * &shift_16
-                                    + step.get_main_evaluation_element(0, *start_column + 3) * &shift_24;
-                                linear_combination += &w0 * &alpha_powers[alpha_idx];
-                                let w1 = step.get_main_evaluation_element(0, *start_column + 4)
-                                    + step.get_main_evaluation_element(0, *start_column + 5) * &shift_8
-                                    + step.get_main_evaluation_element(0, *start_column + 6) * &shift_16
-                                    + step.get_main_evaluation_element(0, *start_column + 7) * &shift_24;
-                                linear_combination += &w1 * &alpha_powers[alpha_idx + 1];
-                                alpha_idx += 2;
-                            }
-                            Packing::DWordHHW => {
-                                // Direct + Word2L
-                                linear_combination += step.get_main_evaluation_element(0, *start_column) * &alpha_powers[alpha_idx];
-                                let shift_16 = FieldElement::<A>::from(SHIFT_16);
-                                let w = step.get_main_evaluation_element(0, *start_column + 1)
-                                    + step.get_main_evaluation_element(0, *start_column + 2) * &shift_16;
-                                linear_combination += &w * &alpha_powers[alpha_idx + 1];
-                                alpha_idx += 2;
-                            }
-                            Packing::DWordWHH => {
-                                // Word2L + Direct
-                                let shift_16 = FieldElement::<A>::from(SHIFT_16);
-                                let w = step.get_main_evaluation_element(0, *start_column)
-                                    + step.get_main_evaluation_element(0, *start_column + 1) * &shift_16;
-                                linear_combination += &w * &alpha_powers[alpha_idx];
-                                linear_combination += step.get_main_evaluation_element(0, *start_column + 2) * &alpha_powers[alpha_idx + 1];
-                                alpha_idx += 2;
-                            }
-                            Packing::QuadHL => {
-                                // 4× Word2L
-                                let shift_16 = FieldElement::<A>::from(SHIFT_16);
-                                for i in 0..4 {
-                                    let c = *start_column + i * 2;
-                                    let w = step.get_main_evaluation_element(0, c)
-                                        + step.get_main_evaluation_element(0, c + 1) * &shift_16;
-                                    linear_combination += &w * &alpha_powers[alpha_idx + i];
-                                }
-                                alpha_idx += 4;
-                            }
-                            Packing::QuadWL => {
-                                // 4× Direct
-                                for i in 0..4 {
-                                    linear_combination += step.get_main_evaluation_element(0, *start_column + i) * &alpha_powers[alpha_idx + i];
-                                }
-                                alpha_idx += 4;
-                            }
-                        }
-                    }
-                    BusValue::Linear(terms) => {
-                        let mut result = FieldElement::<A>::zero();
-                        for term in terms {
-                            match term {
-                                LinearTerm::Column { coefficient, column } => {
-                                    let coeff = FieldElement::<A>::from(*coefficient);
-                                    result += step.get_main_evaluation_element(0, *column) * coeff;
-                                }
-                                LinearTerm::ColumnUnsigned { coefficient, column } => {
-                                    let coeff = FieldElement::<A>::from(*coefficient);
-                                    result += step.get_main_evaluation_element(0, *column) * coeff;
-                                }
-                                LinearTerm::Constant(value) => {
-                                    result += FieldElement::<A>::from(*value);
-                                }
-                            }
-                        }
-                        linear_combination += &result * &alpha_powers[alpha_idx];
-                        alpha_idx += 1;
-                    }
-                }
-            }
-            let fingerprint = z - &linear_combination;
-
-            // Sign: +1 for senders, -1 for receivers
-            let sign = if interaction.is_sender {
-                FieldElement::<B>::one()
-            } else {
-                -FieldElement::<B>::one()
-            };
-
-            // Constraint: term * fingerprint = sign * multiplicity
-            // Rearranged: term * fingerprint - sign * multiplicity = 0
-            term * &fingerprint - multiplicity * sign
-        }
-
-        let res = match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                rap_challenges,
-                logup_alpha_powers,
-                ..
-            } => evaluate_term_constraint(
-                frame.get_evaluation_step(0),
-                self.term_column_idx,
-                &self.interaction,
-                rap_challenges,
-                logup_alpha_powers,
-            ),
-            TransitionEvaluationContext::Verifier {
-                frame,
-                rap_challenges,
-                logup_alpha_powers,
-                ..
-            } => evaluate_term_constraint(
-                frame.get_evaluation_step(0),
-                self.term_column_idx,
-                &self.interaction,
-                rap_challenges,
-                logup_alpha_powers,
-            ),
-        };
-
-        if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx) {
-            *eval = res;
-        }
-    }
-}
-
 /// Computes multiplicity for an interaction from a `TableView`.
-///
-/// Factored out to share between `LookupTermConstraint` and `LookupBatchedTermConstraint`.
 fn compute_multiplicity_from_step<A: IsSubFieldOf<B>, B: IsField>(
     step: &TableView<A, B>,
     multiplicity: &Multiplicity,
@@ -2113,28 +1850,33 @@ where
     }
 }
 
-/// Constraint for the accumulated column.
+/// Constraint for the accumulated column with absorbed interactions.
 ///
-/// Verifies: `acc[i+1] = acc[i] + sum_k(term_k[i+1])`
+/// The accumulated column tracks the running sum of all committed term columns
+/// plus 1-2 "absorbed" interactions whose terms are verified inline (not committed).
 ///
-/// Rearranged: `acc[i+1] - acc[i] - sum_k(term_k[i+1]) = 0`
+/// For 1 absorbed interaction:
+///   `(acc_next - acc_curr - Σ terms + L/N) · f - sign · m = 0` (degree 2)
 ///
-/// where `term_k[i] = sign * multiplicity[i] / fingerprint[i]` for the k-th interaction.
+/// For 2 absorbed interactions:
+///   `(acc_next - acc_curr - Σ terms + L/N) · f₁·f₂ - sign₁·m₁·f₂ - sign₂·m₂·f₁ = 0` (degree 3)
 struct LookupAccumulatedConstraint {
-    // Index of the constraint
     constraint_idx: usize,
-    // Number of term columns (one per interaction)
+    /// Number of committed term columns (excludes absorbed interactions)
     num_term_columns: usize,
-    // Index of the accumulated column (= num_term_columns)
+    /// Index of the accumulated column (= num_term_columns)
     acc_column_idx: usize,
+    /// 1 or 2 interactions absorbed into this constraint (not committed as columns)
+    absorbed: Vec<BusInteraction>,
 }
 
 impl LookupAccumulatedConstraint {
-    pub fn new(constraint_idx: usize, num_term_columns: usize) -> Self {
+    pub fn new(constraint_idx: usize, num_term_columns: usize, absorbed: Vec<BusInteraction>) -> Self {
         Self {
             constraint_idx,
             num_term_columns,
             acc_column_idx: num_term_columns,
+            absorbed,
         }
     }
 }
@@ -2145,7 +1887,7 @@ where
     E: IsField + Send + Sync,
 {
     fn degree(&self) -> usize {
-        1 // Just additions, no multiplications with main trace
+        1 + self.absorbed.len() // 2 for 1 absorbed, 3 for 2 absorbed
     }
 
     fn constraint_idx(&self) -> usize {
@@ -2161,40 +1903,85 @@ where
         evaluation_context: &TransitionEvaluationContext<F, E>,
         transition_evaluations: &mut [FieldElement<E>],
     ) {
-        fn evaluate_accumulated_constraint<'a, A: IsSubFieldOf<B>, B: IsField>(
+        fn evaluate_accumulated_constraint<A: IsSubFieldOf<B>, B: IsField>(
             first_step: &TableView<A, B>,
             second_step: &TableView<A, B>,
             acc_column_idx: usize,
             num_term_columns: usize,
             logup_table_offset: &FieldElement<B>,
+            absorbed: &[BusInteraction],
+            rap_challenges: &&[FieldElement<B>],
+            alpha_powers: &[FieldElement<B>],
         ) -> FieldElement<B> {
             // Accumulated column values
             let acc_curr = first_step.get_aux_evaluation_element(0, acc_column_idx);
             let acc_next = second_step.get_aux_evaluation_element(0, acc_column_idx);
 
-            // Sum of all term columns at the next step
+            // Sum of all committed term columns at the next step
             let terms_sum: FieldElement<B> = (0..num_term_columns)
                 .map(|i| second_step.get_aux_evaluation_element(0, i).clone())
                 .sum();
 
-            // Circular constraint: acc[(i+1) mod N] - acc[i] - terms_sum[(i+1) mod N] + L/N = 0
-            acc_next - acc_curr - terms_sum + logup_table_offset
+            // delta = acc_next - acc_curr - terms_sum + L/N
+            let delta = acc_next - acc_curr - terms_sum + logup_table_offset;
+
+            let z = &rap_challenges[LOGUP_CHALLENGE_Z];
+
+            // Clear denominators of absorbed interactions
+            match absorbed.len() {
+                1 => {
+                    // (delta) · f - sign · m = 0
+                    let m = compute_multiplicity_from_step(second_step, &absorbed[0].multiplicity);
+                    let f = compute_fingerprint_from_step(second_step, &absorbed[0], z, alpha_powers);
+                    let sign: FieldElement<B> = if absorbed[0].is_sender {
+                        FieldElement::one()
+                    } else {
+                        -FieldElement::one()
+                    };
+                    delta * &f - m * sign
+                }
+                2 => {
+                    // (delta) · f₁ · f₂ - sign₁·m₁·f₂ - sign₂·m₂·f₁ = 0
+                    let m1 = compute_multiplicity_from_step(second_step, &absorbed[0].multiplicity);
+                    let m2 = compute_multiplicity_from_step(second_step, &absorbed[1].multiplicity);
+                    let f1 = compute_fingerprint_from_step(second_step, &absorbed[0], z, alpha_powers);
+                    let f2 = compute_fingerprint_from_step(second_step, &absorbed[1], z, alpha_powers);
+                    let sign1: FieldElement<B> = if absorbed[0].is_sender {
+                        FieldElement::one()
+                    } else {
+                        -FieldElement::one()
+                    };
+                    let sign2: FieldElement<B> = if absorbed[1].is_sender {
+                        FieldElement::one()
+                    } else {
+                        -FieldElement::one()
+                    };
+                    delta * &f1 * &f2 - m1 * sign1 * &f2 - m2 * sign2 * &f1
+                }
+                _ => unreachable!("absorbed must contain 1 or 2 interactions"),
+            }
         }
 
         let res = match evaluation_context {
-            TransitionEvaluationContext::Prover { frame, logup_table_offset, .. } => evaluate_accumulated_constraint(
+            TransitionEvaluationContext::Prover { frame, logup_table_offset, rap_challenges, logup_alpha_powers, .. } => evaluate_accumulated_constraint(
                 frame.get_evaluation_step(0),
                 frame.get_evaluation_step(1),
                 self.acc_column_idx,
                 self.num_term_columns,
                 logup_table_offset,
+                &self.absorbed,
+                rap_challenges,
+                logup_alpha_powers,
             ),
-            TransitionEvaluationContext::Verifier { frame, logup_table_offset, .. } => evaluate_accumulated_constraint(
+            TransitionEvaluationContext::Verifier { frame, logup_table_offset, rap_challenges, logup_alpha_powers, .. } => evaluate_accumulated_constraint(
                 frame.get_evaluation_step(0),
                 frame.get_evaluation_step(1),
                 self.acc_column_idx,
                 self.num_term_columns,
                 logup_table_offset,
+                &self.absorbed,
+                rap_challenges,
+                logup_alpha_powers,
             ),
         };
 
