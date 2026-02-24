@@ -1991,10 +1991,11 @@ pub trait IsStarkProver<
 
             print_bus_balance_report(&temp_results);
 
-            for (((air, trace, pub_inputs), round_1_result), domain) in air_trace_pairs
+            for ((((air, trace, pub_inputs), round_1_result), domain), metadata) in air_trace_pairs
                 .iter()
                 .zip(temp_results.iter())
                 .zip(domains.iter())
+                .zip(metadatas.iter())
             {
                 validate_trace(
                     *air,
@@ -2002,6 +2003,7 @@ pub trait IsStarkProver<
                     *trace,
                     domain,
                     &round_1_result.rap_challenges,
+                    metadata.bus_public_inputs.as_ref(),
                 );
             }
         }

@@ -27,6 +27,7 @@ pub struct ConstraintEvaluator<
     PI,
 > {
     boundary_constraints: BoundaryConstraints<FieldExtension>,
+    logup_table_offset: FieldElement<FieldExtension>,
     phantom: PhantomData<(Field, PI)>,
 }
 impl<Field, FieldExtension, PI> ConstraintEvaluator<Field, FieldExtension, PI>
@@ -50,6 +51,7 @@ where
         num_transition: usize,
         num_periodic: usize,
         offsets: &[usize],
+        logup_table_offset: &FieldElement<FieldExtension>,
     ) -> Vec<FieldElement<FieldExtension>> {
         let is_uniform = zerofier_data.is_uniform();
 
@@ -100,6 +102,7 @@ where
                             periodic_buf,
                             rap_challenges,
                             &logup_alpha_powers,
+                            logup_table_offset,
                         );
                         air.compute_transition_into(&ctx, transition_buf);
 
@@ -155,6 +158,7 @@ where
                         &periodic_buf,
                         rap_challenges,
                         &logup_alpha_powers,
+                        logup_table_offset,
                     );
                     air.compute_transition_into(&ctx, &mut transition_buf);
 
@@ -196,8 +200,18 @@ where
         let boundary_constraints =
             air.boundary_constraints(pub_inputs, rap_challenges, bus_public_inputs, trace_length);
 
+        // Compute logup_table_offset = table_contribution / trace_length
+        let logup_table_offset = match bus_public_inputs {
+            Some(bpi) => {
+                let n = FieldElement::<FieldExtension>::from(trace_length as u64);
+                &bpi.table_contribution * n.inv().unwrap()
+            }
+            None => FieldElement::zero(),
+        };
+
         Self {
             boundary_constraints,
+            logup_table_offset,
             phantom: PhantomData::<(Field, PI)> {},
         }
     }
@@ -335,6 +349,7 @@ where
             num_transition,
             num_periodic,
             offsets,
+            &self.logup_table_offset,
         );
 
         #[cfg(feature = "instruments")]

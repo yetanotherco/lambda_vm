@@ -1,4 +1,5 @@
 use super::domain::Domain;
+use super::lookup::BusPublicInputs;
 use super::trace::TraceTable;
 use super::traits::{AIR, TransitionEvaluationContext};
 use crate::lookup::{compute_alpha_powers, LOGUP_CHALLENGE_ALPHA};
@@ -27,6 +28,7 @@ pub fn validate_trace<
     trace: &TraceTable<Field, FieldExtension>,
     domain: &Domain<Field>,
     rap_challenges: &[FieldElement<FieldExtension>],
+    bus_public_inputs: Option<&BusPublicInputs<FieldExtension>>,
 ) -> bool {
     info!("Starting constraints validation over trace...");
     let mut ret = true;
@@ -102,6 +104,14 @@ pub fn validate_trace<
             Vec::new()
         };
 
+    let logup_table_offset = match bus_public_inputs {
+        Some(bpi) => {
+            let n = FieldElement::<FieldExtension>::from(trace_length as u64);
+            &bpi.table_contribution * n.inv().unwrap()
+        }
+        None => FieldElement::zero(),
+    };
+
     // Iterate over trace and compute transitions
     for step in 0..lde_trace.num_steps() {
         let frame = Frame::read_step_from_lde(&lde_trace, step, &air.context().transition_offsets);
@@ -110,7 +120,7 @@ pub fn validate_trace<
             .map(|col| col[step].clone())
             .collect();
         let transition_evaluation_context =
-            TransitionEvaluationContext::new_prover(&frame, &periodic_values, rap_challenges, &logup_alpha_powers);
+            TransitionEvaluationContext::new_prover(&frame, &periodic_values, rap_challenges, &logup_alpha_powers, &logup_table_offset);
         let evaluations = air.compute_transition(&transition_evaluation_context);
 
         // Iterate over each transition evaluation. When the evaluated step is not from

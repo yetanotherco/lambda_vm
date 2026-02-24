@@ -314,6 +314,14 @@ pub trait IsStarkVerifier<
             } else {
                 Vec::new()
             };
+        // Compute logup_table_offset = table_contribution / trace_length for circular constraint
+        let logup_table_offset = match &proof.bus_public_inputs {
+            Some(bpi) => {
+                let n = FieldElement::<FieldExtension>::from(trace_length as u64);
+                &bpi.table_contribution * n.inv().unwrap()
+            }
+            None => FieldElement::zero(),
+        };
         let ood_frame =
             (proof.trace_ood_evaluations).into_frame(num_main_trace_columns, air.step_size());
         let transition_evaluation_context = TransitionEvaluationContext::new_verifier(
@@ -321,6 +329,7 @@ pub trait IsStarkVerifier<
             &periodic_values,
             &challenges.rap_challenges,
             &logup_alpha_powers,
+            &logup_table_offset,
         );
         let transition_ood_frame_evaluations =
             air.compute_transition(&transition_evaluation_context);
@@ -932,14 +941,14 @@ pub trait IsStarkVerifier<
             let mut total = FieldElement::<FieldExtension>::zero();
             for proof in &multi_proof.proofs {
                 if let Some(interaction) = &proof.bus_public_inputs {
-                    total = total + &interaction.final_accumulated;
+                    total = total + &interaction.table_contribution;
                 }
             }
 
             if total != FieldElement::zero() {
                 #[cfg(not(feature = "test_fiat_shamir"))]
                 error!(
-                    "LogUp bus does not balance: sum of accumulated values is not zero. total={:?}",
+                    "LogUp bus does not balance: sum of table_contribution is not zero. total={:?}",
                     total
                 );
                 return false;

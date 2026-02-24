@@ -356,6 +356,6 @@ fn test_air_layout_multiple_interactions() {
         vec![],
     );
 
-    // 5 main, 3 aux (2 term + 1 accumulated)
-    assert_eq!(air.trace_layout(), (5, 3));
+    // 5 main, 2 aux (1 batched term + 1 accumulated) — 2 interactions batched into 1 column
+    assert_eq!(air.trace_layout(), (5, 2));
 }
