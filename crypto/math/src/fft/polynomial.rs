@@ -18,6 +18,9 @@ use super::cpu::{
 #[cfg(feature = "parallel")]
 use super::cpu::bowers_fft::{bowers_fft_opt_fused_parallel, bowers_ifft_opt_parallel};
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 /// Threshold for dispatching to parallel FFT.
 /// Below this size, sequential FFT is faster (avoids Rayon overhead).
 /// At 2^14 = 16384 elements, the parallel version starts to win
@@ -53,6 +56,32 @@ fn dispatch_ifft<F: IsFFTField + IsSubFieldOf<E>, E: IsField + Send + Sync>(
         }
     }
     bowers_ifft_opt(buffer, twiddles)
+}
+
+/// Scale buffer elements by pre-computed weights: buffer[i] *= weights[i].
+/// Uses parallel iteration for large buffers (>= PARALLEL_FFT_THRESHOLD).
+#[inline]
+fn scale_by_weights<F: IsField + Send + Sync, E: IsField + Send + Sync>(
+    buffer: &mut [FieldElement<E>],
+    weights: &[FieldElement<F>],
+) where
+    F: IsSubFieldOf<E>,
+{
+    #[cfg(feature = "parallel")]
+    {
+        if buffer.len() >= PARALLEL_FFT_THRESHOLD {
+            buffer
+                .par_iter_mut()
+                .zip(weights.par_iter())
+                .for_each(|(coeff, w)| {
+                    *coeff = w * &*coeff;
+                });
+            return;
+        }
+    }
+    for (coeff, w) in buffer.iter_mut().zip(weights.iter()) {
+        *coeff = w * &*coeff;
+    }
 }
 
 impl<E: IsField> Polynomial<FieldElement<E>> {
@@ -301,9 +330,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         dispatch_ifft(&mut buffer[..n], inv_twiddles)?;
 
         // Scale using pre-computed weights (base field) — F × E → E mixed multiplication.
-        for (coeff, w) in buffer[..n].iter_mut().zip(weights.iter()) {
-            *coeff = w * &*coeff;
-        }
+        scale_by_weights(&mut buffer[..n], weights);
 
         dispatch_fft(buffer, fwd_twiddles)?;
         in_place_bit_reverse_permute(buffer);
