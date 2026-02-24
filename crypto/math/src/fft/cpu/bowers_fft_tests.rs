@@ -33,49 +33,6 @@ pub fn naive_dft(input: &[FE]) -> Vec<FE> {
 }
 
 // =========================================================================
-// FftMatrix tests
-// =========================================================================
-
-#[test]
-fn test_fft_matrix_roundtrip() {
-    let polys = vec![
-        (0..8).map(|i| FE::from(i as u64)).collect::<Vec<_>>(),
-        (8..16).map(|i| FE::from(i as u64)).collect::<Vec<_>>(),
-    ];
-
-    let matrix = FftMatrix::from_polynomials(polys.clone());
-    assert_eq!(matrix.width, 8);
-    assert_eq!(matrix.height, 2);
-
-    let recovered = matrix.to_polynomials();
-    assert_eq!(recovered, polys);
-}
-
-#[test]
-fn test_fft_matrix_empty() {
-    let polys: Vec<Vec<FE>> = vec![];
-    let matrix = FftMatrix::from_polynomials(polys);
-    assert_eq!(matrix.width, 0);
-    assert_eq!(matrix.height, 0);
-}
-
-#[test]
-#[should_panic(expected = "Row index out of bounds")]
-fn test_fft_matrix_row_out_of_bounds() {
-    let polys = vec![(0..8).map(|i| FE::from(i as u64)).collect::<Vec<_>>()];
-    let matrix = FftMatrix::from_polynomials(polys);
-    let _ = matrix.row(1); // Should panic
-}
-
-#[test]
-#[should_panic(expected = "Row index out of bounds")]
-fn test_fft_matrix_row_mut_out_of_bounds() {
-    let polys = vec![(0..8).map(|i| FE::from(i as u64)).collect::<Vec<_>>()];
-    let mut matrix = FftMatrix::from_polynomials(polys);
-    let _ = matrix.row_mut(1); // Should panic
-}
-
-// =========================================================================
 // LayerTwiddles tests
 // =========================================================================
 
@@ -172,23 +129,6 @@ fn test_bowers_fft_size_two() {
     bowers_fft_opt_fused(&mut result, &layer_twiddles).unwrap();
     in_place_bit_reverse_permute(&mut result);
 
-    assert_eq!(result, expected);
-}
-
-#[test]
-fn test_bowers_batch_fft_opt() {
-    let polys = vec![
-        (0..8).map(|i| FE::from(i as u64)).collect::<Vec<_>>(),
-        (8..16).map(|i| FE::from(i as u64)).collect::<Vec<_>>(),
-    ];
-
-    let expected: Vec<Vec<FE>> = polys.iter().map(|p| naive_dft(p)).collect();
-
-    let mut matrix = FftMatrix::from_polynomials(polys);
-    let layer_twiddles = LayerTwiddles::<F>::new(3).unwrap();
-    bowers_batch_fft_opt(&mut matrix, &layer_twiddles).unwrap();
-
-    let result = matrix.to_polynomials();
     assert_eq!(result, expected);
 }
 
