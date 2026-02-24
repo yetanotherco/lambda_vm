@@ -1489,3 +1489,25 @@ fn test_crafted_zero_count_proof_must_not_verify() {
 
     assert!(!verified);
 }
+
+/// Prove and verify with small max_rows to exercise table splitting.
+#[test]
+fn test_small_max_rows_splits_tables() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("all_instructions_64");
+    let proof_options = ProofOptions::default_test_options();
+    let max_rows = crate::tables::MaxRowsConfig::small();
+
+    let vm_proof = crate::prove_with_options(&elf_bytes, &proof_options, &max_rows)
+        .expect("Prover should succeed with small max_rows");
+
+    // With 2^5 max rows and 64+ instructions, tables should have multiple chunks.
+    assert!(
+        vm_proof.table_counts.cpu > 1,
+        "CPU should have multiple chunks, got {}",
+        vm_proof.table_counts.cpu
+    );
+
+    let verified = crate::verify_with_options(&vm_proof, &elf_bytes, &proof_options)
+        .expect("Verifier should not error");
+    assert!(verified, "Proof with small max_rows should verify");
+}
