@@ -155,13 +155,11 @@ impl BranchCondConstraint {
             .get_main_evaluation_element(0, cols::BRANCH_COND)
             .clone();
 
-        let two = FieldElement::<F>::from(2u64);
-
         // XOR computation: a XOR b = a + b - 2*a*b
         // res[0] XOR mp_selector
-        let res_xor_mp = &res_0 + &mp_selector - &two * &res_0 * &mp_selector;
+        let res_xor_mp = &res_0 + &mp_selector - (&res_0 * &mp_selector).double();
         // is_equal XOR mp_selector
-        let eq_xor_mp = &is_equal + &mp_selector - &two * &is_equal * &mp_selector;
+        let eq_xor_mp = &is_equal + &mp_selector - (&is_equal * &mp_selector).double();
 
         // branch_cond = JALR + BLT * res_xor_mp + BEQ * eq_xor_mp
         let expected = jalr + &blt * res_xor_mp + &beq * eq_xor_mp;
@@ -755,8 +753,7 @@ impl NextPcAddConstraint {
 
         // instr_size = 4 - 2 * c_type_instruction
         let four: FieldElement<F> = FieldElement::from(4u64);
-        let two: FieldElement<F> = FieldElement::from(2u64);
-        let instr_size = four - two * c_type;
+        let instr_size = four - c_type.double();
 
         // carry_0 = (pc_lo + instr_size - next_pc_lo) * 2^(-32)
         let inv_2_32 = FieldElement::<F>::from(super::templates::INV_SHIFT_32);

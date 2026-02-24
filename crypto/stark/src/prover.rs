@@ -1079,9 +1079,8 @@ pub trait IsStarkProver<
         // Step 1: Compute 1/(2·g·ω^i) for i=0..N-1 via batch inversion.
         // The LDE coset points are g·ω^i = domain.lde_roots_of_unity_coset[i].
         // Compute entirely in base field — mixed F×E multiplication when used with extension values.
-        let two_base = FieldElement::<Field>::from(2u64);
         let mut inv_2x: Vec<FieldElement<Field>> = (0..n)
-            .map(|i| &two_base * &domain.lde_roots_of_unity_coset[i])
+            .map(|i| domain.lde_roots_of_unity_coset[i].double())
             .collect();
         FieldElement::inplace_batch_inverse(&mut inv_2x)
             .expect("Coset points are non-zero");
@@ -1089,7 +1088,9 @@ pub trait IsStarkProver<
         // Step 2: Pointwise decomposition.
         // H₀((g·ω^i)²) = (evals[i] + evals[i+N]) / 2
         // H₁((g·ω^i)²) = (evals[i] - evals[i+N]) / (2·g·ω^i)
-        let two_inv = two_base.inv().expect("2 is non-zero in the field");
+        let two_inv = FieldElement::<Field>::from(2u64)
+            .inv()
+            .expect("2 is non-zero in the field");
         let (h0_evals, h1_evals) = {
             #[cfg(feature = "parallel")]
             {
