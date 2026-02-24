@@ -1483,6 +1483,7 @@ where
             // alpha_powers[0] = 1, alpha_powers[1] = α, alpha_powers[2] = α², ...
             let bus_id_f = FieldElement::<A>::from(interaction.bus_id);
             let mut linear_combination = &bus_id_f * &alpha_powers[0];
+            #[allow(unused_assignments)]
             let mut alpha_idx: usize = 1;
             for bv in &interaction.values {
                 match bv {
@@ -1604,8 +1605,6 @@ where
                     }
                 }
             }
-            let _ = alpha_idx; // suppress unused warning
-
             let fingerprint = z - &linear_combination;
 
             // Sign: +1 for senders, -1 for receivers

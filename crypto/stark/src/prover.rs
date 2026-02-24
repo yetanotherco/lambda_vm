@@ -113,13 +113,17 @@ where
     pub(crate) bus_public_inputs: Option<BusPublicInputs<FieldExtension>>,
 }
 
-impl<Field, FieldExtension> Round1<Field, FieldExtension>
+/// Intermediate results from committing a main trace in Phase A of sequential proving.
+/// Holds the Merkle tree/root for the main trace and optionally for precomputed columns.
+struct MainCommitData<Field: IsFFTField>
 where
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField,
-    FieldExtension: IsField,
     FieldElement<Field>: AsBytes,
-    FieldElement<FieldExtension>: AsBytes,
 {
+    main_tree: Rc<BatchedMerkleTree<Field>>,
+    main_root: Commitment,
+    precomputed_tree: Option<Rc<BatchedMerkleTree<Field>>>,
+    precomputed_root: Option<Commitment>,
+    num_precomputed_cols: usize,
 }
 
 /// Metadata from Round 1 commitments — stores Merkle trees and roots, but not LDE evaluations.
@@ -166,6 +170,36 @@ pub struct LdeTwiddles<F: IsFFTField> {
     inv: LayerTwiddles<F>,
     fwd: LayerTwiddles<F>,
     coset_weights: Vec<FieldElement<F>>,
+}
+
+impl<F: IsFFTField> LdeTwiddles<F> {
+    /// Construct twiddles and coset weights for a domain of the given size and blowup factor.
+    fn new(domain: &Domain<F>) -> Self {
+        let domain_size = domain.interpolation_domain_size;
+        let lde_size = domain_size * domain.blowup_factor;
+
+        let domain_size_inv = FieldElement::<F>::from(domain_size as u64)
+            .inv()
+            .expect("domain_size is power of two");
+        let offset = &domain.coset_offset;
+        let coset_weights = {
+            let mut w = Vec::with_capacity(domain_size);
+            let mut offset_power = domain_size_inv;
+            for _ in 0..domain_size {
+                w.push(offset_power.clone());
+                offset_power = offset * &offset_power;
+            }
+            w
+        };
+
+        Self {
+            inv: LayerTwiddles::<F>::new_inverse(domain_size.trailing_zeros() as u64)
+                .expect("valid inverse twiddles"),
+            fwd: LayerTwiddles::<F>::new(lde_size.trailing_zeros() as u64)
+                .expect("valid forward twiddles"),
+            coset_weights,
+        }
+    }
 }
 
 /// A container for the results of the second round of the STARK Prove protocol.
@@ -486,31 +520,7 @@ pub trait IsStarkProver<
             return Vec::new();
         }
 
-        let n = columns[0].len();
-        let lde_size = n * domain.blowup_factor;
-        let inv_order = n.trailing_zeros() as u64;
-        let fwd_order = lde_size.trailing_zeros() as u64;
-
-        let n_inv = FieldElement::<Field>::from(n as u64)
-            .inv()
-            .expect("n is power of two");
-        let offset = &domain.coset_offset;
-        let coset_weights = {
-            let mut w = Vec::with_capacity(n);
-            let mut offset_power = n_inv.clone();
-            for _ in 0..n {
-                w.push(offset_power.clone());
-                offset_power = offset * &offset_power;
-            }
-            w
-        };
-
-        let twiddles = LdeTwiddles {
-            inv: LayerTwiddles::<Field>::new_inverse(inv_order).expect("valid inverse twiddles"),
-            fwd: LayerTwiddles::<Field>::new(fwd_order).expect("valid forward twiddles"),
-            coset_weights,
-        };
-
+        let twiddles = LdeTwiddles::new(domain);
         Self::compute_lde_from_columns_cached(columns, domain, &twiddles)
     }
 
@@ -1266,27 +1276,27 @@ pub trait IsStarkProver<
     {
         let num_parts = round_2_result.lde_composition_poly_evaluations.len();
         let z_power = z.pow(num_parts);
-        let n = domain.interpolation_domain_size;
-        let bf = domain.blowup_factor;
+        let domain_size = domain.interpolation_domain_size;
+        let blowup_factor = domain.blowup_factor;
 
         // === Composition poly parts: barycentric evaluation at z^num_parts ===
         // Extract trace-size coset points from the LDE coset (stride = blowup_factor)
         // Keep coset points in base field — mixed F×E arithmetic is cheaper than E×E.
-        let coset_points: Vec<FieldElement<Field>> = (0..n)
-            .map(|i| domain.lde_roots_of_unity_coset[i * bf].clone())
+        let coset_points: Vec<FieldElement<Field>> = (0..domain_size)
+            .map(|i| domain.lde_roots_of_unity_coset[i * blowup_factor].clone())
             .collect();
         // Keep coset_offset_pow_n and g_n_inv in base field F — the barycentric
         // functions use F×E→E mixed arithmetic, avoiding field conversions.
-        let coset_offset_pow_n: FieldElement<Field> = domain.coset_offset.pow(n);
-        let n_inv: FieldElement<Field> = FieldElement::<Field>::from(n as u64)
+        let coset_offset_pow_n: FieldElement<Field> = domain.coset_offset.pow(domain_size);
+        let domain_size_inv: FieldElement<Field> = FieldElement::<Field>::from(domain_size as u64)
             .inv()
-            .expect("n is a power of two, hence non-zero in the field");
+            .expect("domain_size is a power of two, hence non-zero in the field");
         let g_n_inv: FieldElement<Field> = coset_offset_pow_n
             .inv()
             .expect("coset_offset_pow_n is non-zero");
 
         // Precompute inv_denoms for z^num_parts (shared across all composition poly parts)
-        let comp_z_pow_n = z_power.pow(n);
+        let comp_z_pow_n = z_power.pow(domain_size);
         let comp_inv_denoms =
             math::polynomial::barycentric_inv_denoms(&z_power, &coset_points);
 
@@ -1295,13 +1305,13 @@ pub trait IsStarkProver<
             .iter()
             .map(|lde_evals| {
                 // Extract trace-size evaluations (stride = blowup_factor)
-                let evals: Vec<FieldElement<FieldExtension>> = (0..n)
-                    .map(|i| lde_evals[i * bf].clone())
+                let evals: Vec<FieldElement<FieldExtension>> = (0..domain_size)
+                    .map(|i| lde_evals[i * blowup_factor].clone())
                     .collect();
                 math::polynomial::interpolate_coset_eval_ext_with_g_n_inv(
                     &comp_z_pow_n,
                     &coset_offset_pow_n,
-                    &n_inv,
+                    &domain_size_inv,
                     &g_n_inv,
                     &coset_points,
                     &evals,
@@ -1464,8 +1474,8 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let n = domain.interpolation_domain_size;
-        let bf = domain.blowup_factor;
+        let domain_size = domain.interpolation_domain_size;
+        let blowup_factor = domain.blowup_factor;
         let num_parts = round_2_result.lde_composition_poly_evaluations.len();
         let z_power = z.pow(num_parts); // pole for H terms
 
@@ -1486,19 +1496,19 @@ pub trait IsStarkProver<
         let num_aux_cols = lde_trace.num_aux_cols();
 
         // Precompute all inverse denominators via batch inversion.
-        let num_denoms = n * (1 + num_eval_points);
+        let num_denoms = domain_size * (1 + num_eval_points);
         let mut denoms: Vec<FieldElement<FieldExtension>> = Vec::with_capacity(num_denoms);
 
         // H-term denominators: x_i - z^K
-        for i in 0..n {
-            let x_i = &domain.lde_roots_of_unity_coset[i * bf];
+        for i in 0..domain_size {
+            let x_i = &domain.lde_roots_of_unity_coset[i * blowup_factor];
             denoms.push(x_i - &z_power);
         }
 
         // Trace-term denominators: x_i - z_shifted[k]
         for k in 0..num_eval_points {
-            for i in 0..n {
-                let x_i = &domain.lde_roots_of_unity_coset[i * bf];
+            for i in 0..domain_size {
+                let x_i = &domain.lde_roots_of_unity_coset[i * blowup_factor];
                 denoms.push(x_i - &z_shifted[k]);
             }
         }
@@ -1506,7 +1516,7 @@ pub trait IsStarkProver<
         FieldElement::inplace_batch_inverse(&mut denoms)
             .expect("Denominators should be non-zero: coset points are base field, poles are extension field");
 
-        let inv_h = &denoms[0..n];
+        let inv_h = &denoms[0..domain_size];
 
         // OOD evaluations
         let h_ood = &round_3_result.composition_poly_parts_ood_evaluation;
@@ -1514,12 +1524,12 @@ pub trait IsStarkProver<
 
         // Compute deep(x_i) for each trace-size coset point
         #[cfg(feature = "parallel")]
-        let iter = (0..n).into_par_iter();
+        let iter = (0..domain_size).into_par_iter();
         #[cfg(not(feature = "parallel"))]
-        let iter = 0..n;
+        let iter = 0..domain_size;
 
         iter.map(|i| {
-            let row_idx = i * bf; // LDE row index
+            let row_idx = i * blowup_factor; // LDE row index
 
             // H terms: Σ_j γ_j * (H_j(x_i) - H_j(z^K)) * inv_h[i]
             let mut result = FieldElement::<FieldExtension>::zero();
@@ -1537,7 +1547,7 @@ pub trait IsStarkProver<
                 let ood_evals_j = &trace_ood_columns[j];
 
                 for k in 0..num_eval_points {
-                    let inv_t_k_i = &denoms[(1 + k) * n + i];
+                    let inv_t_k_i = &denoms[(1 + k) * domain_size + i];
 
                     let t_j_ood = &ood_evals_j[k];
                     let numerator: FieldElement<FieldExtension> = if j < num_main_cols {
@@ -1760,7 +1770,7 @@ pub trait IsStarkProver<
         openings
     }
 
-    // FIXME remove unwrap() calls and return errors
+    // TODO: propagate errors instead of unwrap() in commit_columns, reconstruct_round1, and expand_pool_to_lde
     /// Generates STARK proofs for one or more AIRs with a shared transcript.
     ///
     /// # Multi-Table Proving with LogUp
@@ -1812,26 +1822,8 @@ pub trait IsStarkProver<
             let trace_length = trace.num_rows();
             let domain = new_domain(*air, trace_length);
 
-            let n = domain.interpolation_domain_size;
-            let lde_size = n * domain.blowup_factor;
-            let n_inv = FieldElement::<Field>::from(n as u64)
-                .inv()
-                .expect("n is power of two");
-            let offset = &domain.coset_offset;
-            let coset_weights = {
-                let mut w = Vec::with_capacity(n);
-                let mut offset_power = n_inv.clone();
-                for _ in 0..n {
-                    w.push(offset_power.clone());
-                    offset_power = offset * &offset_power;
-                }
-                w
-            };
-            let twiddles = LdeTwiddles {
-                inv: LayerTwiddles::<Field>::new_inverse(n.trailing_zeros() as u64).expect("valid inverse twiddles"),
-                fwd: LayerTwiddles::<Field>::new(lde_size.trailing_zeros() as u64).expect("valid forward twiddles"),
-                coset_weights,
-            };
+            let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
+            let twiddles = LdeTwiddles::new(&domain);
 
             max_main_cols = max_main_cols.max(trace.num_main_columns);
             max_aux_cols = max_aux_cols.max(air.num_auxiliary_rap_columns());
@@ -1855,13 +1847,7 @@ pub trait IsStarkProver<
         // All main trace commitments must be in the transcript before sampling
         // LogUp challenges. Pool buffers are reused across tables.
 
-        let mut main_commits: Vec<(
-            Rc<BatchedMerkleTree<Field>>,
-            Commitment,
-            Option<Rc<BatchedMerkleTree<Field>>>,
-            Option<Commitment>,
-            usize,
-        )> = Vec::with_capacity(num_airs);
+        let mut main_commits: Vec<MainCommitData<Field>> = Vec::with_capacity(num_airs);
 
         for ((air, trace, _pub_inputs), twiddles) in
             air_trace_pairs.iter().zip(twiddle_caches.iter())
@@ -1888,7 +1874,13 @@ pub trait IsStarkProver<
                 )?
             };
 
-            main_commits.push((Rc::new(tree), root, pre_tree.map(Rc::new), pre_root, n_pre));
+            main_commits.push(MainCommitData {
+                main_tree: Rc::new(tree),
+                main_root: root,
+                precomputed_tree: pre_tree.map(Rc::new),
+                precomputed_root: pre_root,
+                num_precomputed_cols: n_pre,
+            });
         }
 
         // =====================================================================
@@ -1939,13 +1931,12 @@ pub trait IsStarkProver<
         // Pass 2: Sequential extract → LDE → commit → transcript append.
         // Uses shared aux_pool. Transcript ordering is preserved.
         let mut metadatas: Vec<Round1Metadata<Field, FieldExtension>> = Vec::with_capacity(num_airs);
-        for (((((air, trace, _pub_inputs), bus_public_inputs), (main_tree, main_root, precomputed_tree, precomputed_root, num_precomputed)), domain), twiddles)
+        for ((((air, trace, _pub_inputs), bus_public_inputs), main_commit), (domain, twiddles))
             in air_trace_pairs
                 .iter()
                 .zip(bus_inputs_vec.into_iter())
                 .zip(main_commits.into_iter())
-                .zip(domains.iter())
-                .zip(twiddle_caches.iter())
+                .zip(domains.iter().zip(twiddle_caches.iter()))
         {
             let (aux_tree, aux_root) = if air.has_trace_interaction() {
                 let num_aux_cols = trace.num_aux_columns;
@@ -1968,11 +1959,11 @@ pub trait IsStarkProver<
             };
 
             metadatas.push(Round1Metadata {
-                main_merkle_tree: Rc::clone(&main_tree),
-                main_merkle_root: main_root,
-                precomputed_merkle_tree: precomputed_tree.as_ref().map(Rc::clone),
-                precomputed_merkle_root: precomputed_root,
-                num_precomputed_cols: num_precomputed,
+                main_merkle_tree: Rc::clone(&main_commit.main_tree),
+                main_merkle_root: main_commit.main_root,
+                precomputed_merkle_tree: main_commit.precomputed_tree.as_ref().map(Rc::clone),
+                precomputed_merkle_root: main_commit.precomputed_root,
+                num_precomputed_cols: main_commit.num_precomputed_cols,
                 aux_merkle_tree: aux_tree,
                 aux_merkle_root: aux_root,
                 rap_challenges: logup_challenges.clone(),
@@ -2069,7 +2060,7 @@ pub trait IsStarkProver<
             .map(|mut multi_proof| multi_proof.proofs.remove(0))
     }
 
-    // FIXME remove unwrap() calls and return errors
+    // TODO: propagate errors instead of unwrap() in open_deep_composition_poly and FRI operations
     /// Executes rounds 2-4 and generates a STARK proof for the trace `main_trace` with public inputs `pub_inputs`.
     /// Warning: the transcript must be safely initializated before passing it to this method.
     fn prove_rounds_2_to_4(

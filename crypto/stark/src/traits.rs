@@ -50,7 +50,16 @@ impl<F: IsField> ZerofierEvaluations<F> {
     }
 }
 
-type ZerofierGroupKey = (usize, usize, Option<usize>, Option<usize>, usize);
+/// Key identifying a unique zerofier shape — constraints with the same key share
+/// the same zerofier evaluations on the extended domain.
+#[derive(Clone, Copy, Hash, Eq, PartialEq)]
+struct ZerofierGroupKey {
+    period: usize,
+    offset: usize,
+    exemptions_period: Option<usize>,
+    periodic_exemptions_offset: Option<usize>,
+    end_exemptions: usize,
+}
 
 /// This enum is necessary because, while both the prover and verifier perform the same operations
 ///  to compute transition constraints, their frames differ.
@@ -294,13 +303,13 @@ pub trait AIR: Send + Sync {
             // If there are multiple domain and subdomains it can be further optimized
             // as to share computation between them
 
-            let zerofier_group_key = (
+            let zerofier_group_key = ZerofierGroupKey {
                 period,
                 offset,
                 exemptions_period,
                 periodic_exemptions_offset,
                 end_exemptions,
-            );
+            };
             zerofier_groups
                 .entry(zerofier_group_key)
                 .or_insert_with(|| c.zerofier_evaluations_on_extended_domain(domain));
@@ -327,13 +336,13 @@ pub trait AIR: Send + Sync {
         let mut groups: Vec<Vec<FieldElement<Self::Field>>> = Vec::new();
 
         self.transition_constraints().iter().for_each(|c| {
-            let key = (
-                c.period(),
-                c.offset(),
-                c.exemptions_period(),
-                c.periodic_exemptions_offset(),
-                c.end_exemptions(),
-            );
+            let key = ZerofierGroupKey {
+                period: c.period(),
+                offset: c.offset(),
+                exemptions_period: c.exemptions_period(),
+                periodic_exemptions_offset: c.periodic_exemptions_offset(),
+                end_exemptions: c.end_exemptions(),
+            };
             let group_idx = *zerofier_groups_map.entry(key).or_insert_with(|| {
                 let idx = groups.len();
                 groups.push(c.zerofier_evaluations_on_extended_domain(domain));

@@ -447,39 +447,8 @@ impl<F: IsFFTField> LayerTwiddles<F> {
     ///     .expect("Failed to create twiddles for order 10");
     /// ```
     pub fn new(order: u64) -> Option<Self> {
-        // Check for potential integer overflow
-        if order > MAX_FFT_ORDER {
-            return None;
-        }
-
-        let n = 1usize << order;
         let root = F::get_primitive_root_of_unity(order).ok()?;
-
-        let mut layers = Vec::with_capacity(order as usize);
-
-        for layer in 0..order as usize {
-            // Guard against shift overflow in debug builds
-            debug_assert!(
-                layer < usize::BITS as usize,
-                "Layer index exceeds shift limit"
-            );
-
-            let stride = 1usize << layer;
-            let count = n >> (layer + 1);
-
-            let mut layer_twiddles = Vec::with_capacity(count);
-            let w_stride = root.pow(stride as u64);
-            let mut current = FieldElement::<F>::one();
-
-            for _ in 0..count {
-                layer_twiddles.push(current.clone());
-                current = &current * &w_stride;
-            }
-
-            layers.push(layer_twiddles);
-        }
-
-        Some(Self { layers })
+        Self::build(order, &root)
     }
 
     /// Compute layer-specific twiddles from the **inverse** primitive root of unity.
@@ -498,19 +467,19 @@ impl<F: IsFFTField> LayerTwiddles<F> {
     ///     .expect("Failed to create inverse twiddles for order 10");
     /// ```
     pub fn new_inverse(order: u64) -> Option<Self> {
-        // Check for potential integer overflow
+        let root = F::get_primitive_root_of_unity(order).ok()?;
+        // Primitive roots of unity are always non-zero, so inversion succeeds.
+        let inv_root = root.inv().ok()?;
+        Self::build(order, &inv_root)
+    }
+
+    /// Shared implementation for `new` and `new_inverse`.
+    fn build(order: u64, root: &FieldElement<F>) -> Option<Self> {
         if order > MAX_FFT_ORDER {
             return None;
         }
 
         let n = 1usize << order;
-        let root = F::get_primitive_root_of_unity(order).ok()?;
-        // Use the inverse root for IFFT
-        // SAFETY: Primitive roots of unity are non-zero field elements,
-        // so inversion always succeeds. Convert Result to Option for consistency
-        // with the return type.
-        let inv_root = root.inv().ok()?;
-
         let mut layers = Vec::with_capacity(order as usize);
 
         for layer in 0..order as usize {
@@ -523,7 +492,7 @@ impl<F: IsFFTField> LayerTwiddles<F> {
             let count = n >> (layer + 1);
 
             let mut layer_twiddles = Vec::with_capacity(count);
-            let w_stride = inv_root.pow(stride as u64);
+            let w_stride = root.pow(stride as u64);
             let mut current = FieldElement::<F>::one();
 
             for _ in 0..count {

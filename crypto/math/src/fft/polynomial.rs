@@ -26,6 +26,36 @@ use super::cpu::bowers_fft::{bowers_fft_opt_fused_parallel, bowers_ifft_opt_para
 #[cfg(feature = "parallel")]
 const PARALLEL_FFT_THRESHOLD: usize = 1 << 14;
 
+/// Dispatch forward FFT (DIF) to parallel or sequential implementation based on buffer size.
+#[inline]
+fn dispatch_fft<F: IsFFTField + IsSubFieldOf<E>, E: IsField + Send + Sync>(
+    buffer: &mut [FieldElement<E>],
+    twiddles: &LayerTwiddles<F>,
+) -> Result<(), FFTError> {
+    #[cfg(feature = "parallel")]
+    {
+        if buffer.len() >= PARALLEL_FFT_THRESHOLD {
+            return bowers_fft_opt_fused_parallel(buffer, twiddles);
+        }
+    }
+    bowers_fft_opt_fused(buffer, twiddles)
+}
+
+/// Dispatch inverse FFT (DIT) to parallel or sequential implementation based on buffer size.
+#[inline]
+fn dispatch_ifft<F: IsFFTField + IsSubFieldOf<E>, E: IsField + Send + Sync>(
+    buffer: &mut [FieldElement<E>],
+    twiddles: &LayerTwiddles<F>,
+) -> Result<(), FFTError> {
+    #[cfg(feature = "parallel")]
+    {
+        if buffer.len() >= PARALLEL_FFT_THRESHOLD {
+            return bowers_ifft_opt_parallel(buffer, twiddles);
+        }
+    }
+    bowers_ifft_opt(buffer, twiddles)
+}
+
 impl<E: IsField> Polynomial<FieldElement<E>> {
     /// Returns `N` evaluations of this polynomial using FFT over a domain in a subfield F of E (so the results
     /// are P(w^i), with w being a primitive root of unity).
@@ -191,17 +221,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         // 2. iFFT on buffer[..n] using Bowers:
         //    bit-reverse permute (natural → bit-reversed), then DIT inverse butterflies.
         in_place_bit_reverse_permute(&mut buffer[..n]);
-
-        #[cfg(feature = "parallel")]
-        {
-            if n >= PARALLEL_FFT_THRESHOLD {
-                bowers_ifft_opt_parallel(&mut buffer[..n], inv_twiddles)?;
-            } else {
-                bowers_ifft_opt(&mut buffer[..n], inv_twiddles)?;
-            }
-        }
-        #[cfg(not(feature = "parallel"))]
-        bowers_ifft_opt(&mut buffer[..n], inv_twiddles)?;
+        dispatch_ifft(&mut buffer[..n], inv_twiddles)?;
 
         // 3. Scale by offset^i / n simultaneously (fused inverse-scaling + coset shift).
         let n_inv = FieldElement::<F>::from(n as u64).inv().unwrap();
@@ -213,17 +233,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
 
         // 4. Forward FFT on the full buffer using Bowers:
         //    DIF forward butterflies (natural → bit-reversed), then bit-reverse permute.
-        #[cfg(feature = "parallel")]
-        {
-            if buffer.len() >= PARALLEL_FFT_THRESHOLD {
-                bowers_fft_opt_fused_parallel(&mut buffer, fwd_twiddles)?;
-            } else {
-                bowers_fft_opt_fused(&mut buffer, fwd_twiddles)?;
-            }
-        }
-        #[cfg(not(feature = "parallel"))]
-        bowers_fft_opt_fused(&mut buffer, fwd_twiddles)?;
-
+        dispatch_fft(&mut buffer, fwd_twiddles)?;
         in_place_bit_reverse_permute(&mut buffer);
 
         Ok(buffer)
@@ -289,34 +299,14 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         buffer.resize(lde_size, FieldElement::zero());
 
         in_place_bit_reverse_permute(&mut buffer[..n]);
-
-        #[cfg(feature = "parallel")]
-        {
-            if n >= PARALLEL_FFT_THRESHOLD {
-                bowers_ifft_opt_parallel(&mut buffer[..n], inv_twiddles)?;
-            } else {
-                bowers_ifft_opt(&mut buffer[..n], inv_twiddles)?;
-            }
-        }
-        #[cfg(not(feature = "parallel"))]
-        bowers_ifft_opt(&mut buffer[..n], inv_twiddles)?;
+        dispatch_ifft(&mut buffer[..n], inv_twiddles)?;
 
         // Scale using pre-computed weights (base field) — F × E → E mixed multiplication.
         for (coeff, w) in buffer[..n].iter_mut().zip(weights.iter()) {
             *coeff = w * &*coeff;
         }
 
-        #[cfg(feature = "parallel")]
-        {
-            if buffer.len() >= PARALLEL_FFT_THRESHOLD {
-                bowers_fft_opt_fused_parallel(buffer, fwd_twiddles)?;
-            } else {
-                bowers_fft_opt_fused(buffer, fwd_twiddles)?;
-            }
-        }
-        #[cfg(not(feature = "parallel"))]
-        bowers_fft_opt_fused(buffer, fwd_twiddles)?;
-
+        dispatch_fft(buffer, fwd_twiddles)?;
         in_place_bit_reverse_permute(buffer);
 
         Ok(())
@@ -356,17 +346,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
 
         // 1. iFFT on buffer[..n]
         in_place_bit_reverse_permute(&mut buffer[..n]);
-
-        #[cfg(feature = "parallel")]
-        {
-            if n >= PARALLEL_FFT_THRESHOLD {
-                bowers_ifft_opt_parallel(&mut buffer[..n], inv_twiddles)?;
-            } else {
-                bowers_ifft_opt(&mut buffer[..n], inv_twiddles)?;
-            }
-        }
-        #[cfg(not(feature = "parallel"))]
-        bowers_ifft_opt(&mut buffer[..n], inv_twiddles)?;
+        dispatch_ifft(&mut buffer[..n], inv_twiddles)?;
 
         // 2. Scale using pre-computed weights (base field) — F × E → E mixed multiplication.
         for (coeff, w) in buffer[..n].iter_mut().zip(weights.iter()) {
@@ -377,17 +357,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         buffer.resize(lde_size, FieldElement::zero());
 
         // 4. Forward FFT on the full buffer
-        #[cfg(feature = "parallel")]
-        {
-            if buffer.len() >= PARALLEL_FFT_THRESHOLD {
-                bowers_fft_opt_fused_parallel(buffer, fwd_twiddles)?;
-            } else {
-                bowers_fft_opt_fused(buffer, fwd_twiddles)?;
-            }
-        }
-        #[cfg(not(feature = "parallel"))]
-        bowers_fft_opt_fused(buffer, fwd_twiddles)?;
-
+        dispatch_fft(buffer, fwd_twiddles)?;
         in_place_bit_reverse_permute(buffer);
 
         Ok(())
@@ -518,18 +488,7 @@ where
         LayerTwiddles::<F>::new(order).ok_or(FFTError::DomainSizeError(order as usize))?;
 
     let mut result = coeffs.to_vec();
-
-    #[cfg(feature = "parallel")]
-    {
-        if n >= PARALLEL_FFT_THRESHOLD {
-            bowers_fft_opt_fused_parallel(&mut result, &layer_twiddles)?;
-        } else {
-            bowers_fft_opt_fused(&mut result, &layer_twiddles)?;
-        }
-    }
-    #[cfg(not(feature = "parallel"))]
-    bowers_fft_opt_fused(&mut result, &layer_twiddles)?;
-
+    dispatch_fft(&mut result, &layer_twiddles)?;
     in_place_bit_reverse_permute(&mut result);
     Ok(result)
 }
@@ -552,17 +511,7 @@ where
     let mut coeffs = fft_evals.to_vec();
     // Bowers iFFT: bit-reverse first (natural → bit-reversed), then DIT inverse butterflies
     in_place_bit_reverse_permute(&mut coeffs);
-
-    #[cfg(feature = "parallel")]
-    {
-        if n >= PARALLEL_FFT_THRESHOLD {
-            bowers_ifft_opt_parallel(&mut coeffs, &inv_twiddles)?;
-        } else {
-            bowers_ifft_opt(&mut coeffs, &inv_twiddles)?;
-        }
-    }
-    #[cfg(not(feature = "parallel"))]
-    bowers_ifft_opt(&mut coeffs, &inv_twiddles)?;
+    dispatch_ifft(&mut coeffs, &inv_twiddles)?;
 
     // Scale by 1/n
     let scale_factor = FieldElement::from(n as u64).inv().unwrap();
