@@ -35,6 +35,9 @@ impl ByteConversion for [FpE; 2] {
         Self: Sized,
     {
         const BYTES_PER_FIELD: usize = 8;
+        if bytes.len() < BYTES_PER_FIELD * 2 {
+            return Err(crate::errors::ByteConversionError::FromBEBytesError);
+        }
         let x0 = FieldElement::from_bytes_be(&bytes[0..BYTES_PER_FIELD])?;
         let x1 = FieldElement::from_bytes_be(&bytes[BYTES_PER_FIELD..BYTES_PER_FIELD * 2])?;
         Ok([x0, x1])
@@ -45,6 +48,9 @@ impl ByteConversion for [FpE; 2] {
         Self: Sized,
     {
         const BYTES_PER_FIELD: usize = 8;
+        if bytes.len() < BYTES_PER_FIELD * 2 {
+            return Err(crate::errors::ByteConversionError::FromLEBytesError);
+        }
         let x0 = FieldElement::from_bytes_le(&bytes[0..BYTES_PER_FIELD])?;
         let x1 = FieldElement::from_bytes_le(&bytes[BYTES_PER_FIELD..BYTES_PER_FIELD * 2])?;
         Ok([x0, x1])
@@ -73,6 +79,9 @@ impl ByteConversion for [FpE; 3] {
         Self: Sized,
     {
         const BYTES_PER_FIELD: usize = 8;
+        if bytes.len() < BYTES_PER_FIELD * 3 {
+            return Err(crate::errors::ByteConversionError::FromBEBytesError);
+        }
         let x0 = FieldElement::from_bytes_be(&bytes[0..BYTES_PER_FIELD])?;
         let x1 = FieldElement::from_bytes_be(&bytes[BYTES_PER_FIELD..BYTES_PER_FIELD * 2])?;
         let x2 = FieldElement::from_bytes_be(&bytes[BYTES_PER_FIELD * 2..BYTES_PER_FIELD * 3])?;
@@ -84,6 +93,9 @@ impl ByteConversion for [FpE; 3] {
         Self: Sized,
     {
         const BYTES_PER_FIELD: usize = 8;
+        if bytes.len() < BYTES_PER_FIELD * 3 {
+            return Err(crate::errors::ByteConversionError::FromLEBytesError);
+        }
         let x0 = FieldElement::from_bytes_le(&bytes[0..BYTES_PER_FIELD])?;
         let x1 = FieldElement::from_bytes_le(&bytes[BYTES_PER_FIELD..BYTES_PER_FIELD * 2])?;
         let x2 = FieldElement::from_bytes_le(&bytes[BYTES_PER_FIELD * 2..BYTES_PER_FIELD * 3])?;
@@ -478,6 +490,9 @@ impl ByteConversion for FieldElement<Degree3GoldilocksExtensionField> {
         Self: Sized,
     {
         const BYTES_PER_FIELD: usize = 8;
+        if bytes.len() < BYTES_PER_FIELD * 3 {
+            return Err(crate::errors::ByteConversionError::FromBEBytesError);
+        }
         let x0 = FieldElement::from_bytes_be(&bytes[0..BYTES_PER_FIELD])?;
         let x1 = FieldElement::from_bytes_be(&bytes[BYTES_PER_FIELD..BYTES_PER_FIELD * 2])?;
         let x2 = FieldElement::from_bytes_be(&bytes[BYTES_PER_FIELD * 2..BYTES_PER_FIELD * 3])?;
@@ -490,6 +505,9 @@ impl ByteConversion for FieldElement<Degree3GoldilocksExtensionField> {
         Self: Sized,
     {
         const BYTES_PER_FIELD: usize = 8;
+        if bytes.len() < BYTES_PER_FIELD * 3 {
+            return Err(crate::errors::ByteConversionError::FromLEBytesError);
+        }
         let x0 = FieldElement::from_bytes_le(&bytes[0..BYTES_PER_FIELD])?;
         let x1 = FieldElement::from_bytes_le(&bytes[BYTES_PER_FIELD..BYTES_PER_FIELD * 2])?;
         let x2 = FieldElement::from_bytes_le(&bytes[BYTES_PER_FIELD * 2..BYTES_PER_FIELD * 3])?;
