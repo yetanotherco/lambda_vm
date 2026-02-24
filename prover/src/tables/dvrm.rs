@@ -41,7 +41,7 @@ use stark::traits::TransitionEvaluationContext;
 
 use super::types::{
     BusId, FE, GoldilocksExtension, GoldilocksField, NEG_INV_2_16, NEG_INV_2_32, NEG_INV_2_48,
-    NEG_INV_2_64, SHIFT_16, SHIFT_32,
+    NEG_INV_2_64, SHIFT_16,
 };
 
 // =========================================================================
@@ -1163,7 +1163,7 @@ impl DvrmConstraint {
         E: IsField,
     {
         let shift_16 = FieldElement::<F>::from(SHIFT_16);
-        let inv_2_32 = FieldElement::<F>::from(SHIFT_32).inv().unwrap();
+        let inv_2_32 = FieldElement::<F>::from(crate::constraints::templates::INV_SHIFT_32);
         let sign_fill = FieldElement::<F>::from(SIGN_FILL);
 
         // Get n, n_sub_r, r halfwords

@@ -27,6 +27,11 @@ use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 /// 2^32 for word combining and carry extraction
 pub const SHIFT_32: u64 = 1u64 << 32;
 
+/// Precomputed: (2^32)^(-1) mod p where p = 2^64 - 2^32 + 1.
+/// Avoids ~72 multiplications per inv() call in constraint hot loops.
+/// Verify: INV_SHIFT_32 * SHIFT_32 ≡ 1 (mod p)
+pub const INV_SHIFT_32: u64 = 18446744065119617026;
+
 // =========================================================================
 // IS_BIT Template
 // =========================================================================
@@ -460,7 +465,7 @@ impl AddConstraint {
         let sum_lo = self.sum.eval_lo(step);
 
         // carry_0 = (lhs_lo + rhs_lo - sum_lo) * 2^(-32)
-        let inv_2_32: FieldElement<F> = FieldElement::from(SHIFT_32).inv().unwrap();
+        let inv_2_32 = FieldElement::<F>::from(INV_SHIFT_32);
         (lhs_lo + rhs_lo - sum_lo) * inv_2_32
     }
 
@@ -476,7 +481,7 @@ impl AddConstraint {
         let carry_0 = self.compute_carry_0(step);
 
         // carry_1 = (lhs_hi + rhs_hi + carry_0 - sum_hi) * 2^(-32)
-        let inv_2_32: FieldElement<F> = FieldElement::from(SHIFT_32).inv().unwrap();
+        let inv_2_32 = FieldElement::<F>::from(INV_SHIFT_32);
         (lhs_hi + rhs_hi + carry_0 - sum_hi) * inv_2_32
     }
 
@@ -584,4 +589,17 @@ pub fn new_is_bit_constraints(
         .collect();
 
     (constraints, constraint_idx_start + value_cols.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tables::types::GoldilocksField;
+
+    #[test]
+    fn test_inv_shift_32_is_correct() {
+        let inv = FieldElement::<GoldilocksField>::from(INV_SHIFT_32);
+        let shift = FieldElement::<GoldilocksField>::from(SHIFT_32);
+        assert_eq!(inv * shift, FieldElement::one());
+    }
 }
