@@ -144,16 +144,6 @@ impl<F: IsField> Polynomial<FieldElement<F>> {
         self.coefficients().len()
     }
 
-    /// Computes quotient with `x - b` in place.
-    pub fn ruffini_division_inplace(&mut self, b: &FieldElement<F>) {
-        let mut c = FieldElement::zero();
-        for coeff in self.coefficients.iter_mut().rev() {
-            *coeff = &*coeff + b * &c;
-            core::mem::swap(coeff, &mut c);
-        }
-        self.coefficients.pop();
-    }
-
     /// Computes quotient and remainder of polynomial division.
     ///
     /// Output: (quotient, remainder)

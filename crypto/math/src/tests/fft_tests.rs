@@ -52,7 +52,6 @@ mod fft_polynomial_tests {
     use crate::fft::cpu::roots_of_unity::{
         get_powers_of_primitive_root, get_powers_of_primitive_root_coset,
     };
-    use crate::fft::polynomial::compose_fft;
     use crate::field::element::FieldElement;
     use crate::field::test_fields::u64_test_field::{U64TestField, U64TestFieldExtension};
     use crate::field::traits::{IsFFTField, RootsConfig};
@@ -228,32 +227,6 @@ mod fft_polynomial_tests {
 
                 prop_assert_eq!(poly, new_poly);
             }
-
-            #[test]
-            fn test_fft_multiplication_works(poly in poly(7), other in poly(7)) {
-                prop_assert_eq!(poly.fast_fft_multiplication::<F>(&other).unwrap(), poly * other);
-            }
-
-            #[test]
-            fn test_fft_division_works(poly in non_zero_poly(7), other in non_zero_poly(7)) {
-                prop_assert_eq!(poly.fast_division::<F>(&other).unwrap(), poly.long_division_with_remainder(&other));
-            }
-
-            #[test]
-            fn test_invert_polynomial_mod_works(poly in non_zero_poly(7), k in powers_of_two(4)) {
-                let inverted_poly = poly.invert_polynomial_mod::<F>(k).unwrap();
-                prop_assert_eq!((poly * inverted_poly).truncate(k), Polynomial::new(&[FE::one()]));
-            }
-        }
-
-        #[test]
-        fn composition_fft_works() {
-            let p = Polynomial::new(&[FE::new(0), FE::new(2)]);
-            let q = Polynomial::new(&[FE::new(0), FE::new(0), FE::new(0), FE::new(1)]);
-            assert_eq!(
-                compose_fft::<F, F>(&p, &q),
-                Polynomial::new(&[FE::new(0), FE::new(0), FE::new(0), FE::new(2)])
-            );
         }
     }
 
@@ -348,22 +321,6 @@ mod fft_polynomial_tests {
                 poly in poly(4).prop_filter("Avoid non pows of two", |poly| poly.coeff_len().is_power_of_two())) {
                 let (poly, new_poly) = gen_fft_interpolate_and_evaluate(poly);
                 prop_assert_eq!(poly, new_poly);
-            }
-
-            #[test]
-            fn test_fft_multiplication_works(poly in poly(7), other in poly(7)) {
-                prop_assert_eq!(poly.fast_fft_multiplication::<F>(&other).unwrap(), poly * other);
-            }
-
-            #[test]
-            fn test_fft_division_works(poly in poly(7), other in non_zero_poly(7)) {
-                prop_assert_eq!(poly.fast_division::<F>(&other).unwrap(), poly.long_division_with_remainder(&other));
-            }
-
-            #[test]
-            fn test_invert_polynomial_mod_works(poly in non_zero_poly(7), k in powers_of_two(4)) {
-                let inverted_poly = poly.invert_polynomial_mod::<F>(k).unwrap();
-                prop_assert_eq!((poly * inverted_poly).truncate(k), Polynomial::new(&[FE::one()]));
             }
         }
     }

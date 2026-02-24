@@ -448,33 +448,6 @@ mod tests {
         assert_eq!(p1, &p1_expected);
     }
 
-    use proptest::prelude::*;
-    proptest! {
-        #[test]
-        fn ruffini_inplace_equals_division(p in any::<Vec<u64>>(), b in any::<u64>()) {
-            let p: Vec<_> = p.into_iter().map(FE::from).collect();
-            let mut p = Polynomial::new(&p);
-            let b = FE::from(b);
-
-            let p_ref = p.clone();
-            let m = Polynomial::new_monomial(FE::one(), 1) - b;
-
-            p.ruffini_division_inplace(&b);
-            prop_assert_eq!(p, div_with_ref(p_ref, &m));
-        }
-    }
-
-    proptest! {
-        #[test]
-        fn ruffini_inplace_equals_ruffini(p in any::<Vec<u64>>(), b in any::<u64>()) {
-            let p: Vec<_> = p.into_iter().map(FE::from).collect();
-            let mut p = Polynomial::new(&p);
-            let b = FE::from(b);
-            let q = ruffini_division(&p, &b);
-            p.ruffini_division_inplace(&b);
-            prop_assert_eq!(q, p);
-        }
-    }
     #[test]
     fn test_xgcd() {
         // Case 1: Simple polynomials

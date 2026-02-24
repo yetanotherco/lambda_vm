@@ -1,6 +1,5 @@
 use crate::fft::errors::FFTError;
 
-use crate::field::errors::FieldError;
 use crate::field::traits::{IsField, IsSubFieldOf};
 use crate::{
     field::{element::FieldElement, traits::IsFFTField},
@@ -363,115 +362,6 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         Ok(())
     }
 
-    /// Multiplies two polynomials using FFT.
-    /// It's faster than naive multiplication when the degree of the polynomials is large enough (>=2**6).
-    /// This works best with polynomials whose highest degree is equal to a power of 2 - 1.
-    /// Will return an error if the degree of the resulting polynomial is greater than 2**63.
-    ///
-    /// This is an implementation of the fast division algorithm from
-    /// [Gathen's book](https://www.cambridge.org/core/books/modern-computer-algebra/DB3563D4013401734851CF683D2F03F0)
-    /// chapter 9
-    pub fn fast_fft_multiplication<F: IsFFTField + IsSubFieldOf<E>>(
-        &self,
-        other: &Self,
-    ) -> Result<Self, FFTError>
-    where
-        E: Send + Sync,
-    {
-        let domain_size = self.degree() + other.degree() + 1;
-        let p = Polynomial::evaluate_fft::<F>(self, 1, Some(domain_size))?;
-        let q = Polynomial::evaluate_fft::<F>(other, 1, Some(domain_size))?;
-        let r = p.into_iter().zip(q).map(|(a, b)| a * b).collect::<Vec<_>>();
-
-        Polynomial::interpolate_fft::<F>(&r)
-    }
-
-    /// Divides two polynomials with remainder.
-    /// This is faster than the naive division if the degree of the divisor
-    /// is greater than the degree of the dividend and both degrees are large enough.
-    pub fn fast_division<F: IsSubFieldOf<E> + IsFFTField>(
-        &self,
-        divisor: &Self,
-    ) -> Result<(Self, Self), FFTError>
-    where
-        E: Send + Sync,
-    {
-        let n = self.degree();
-        let m = divisor.degree();
-        if divisor.coefficients.is_empty()
-            || divisor
-                .coefficients
-                .iter()
-                .all(|c| c == &FieldElement::zero())
-        {
-            return Err(FieldError::DivisionByZero.into());
-        }
-        if n < m {
-            return Ok((Self::zero(), self.clone()));
-        }
-        let d = n - m; // Degree of the quotient
-        let a_rev = self.reverse(n);
-        let b_rev = divisor.reverse(m);
-        let inv_b_rev = b_rev.invert_polynomial_mod::<F>(d + 1)?;
-        let q = a_rev
-            .fast_fft_multiplication::<F>(&inv_b_rev)?
-            .truncate(d + 1)
-            .reverse(d);
-
-        let r = self - q.fast_fft_multiplication::<F>(divisor)?;
-        Ok((q, r))
-    }
-
-    /// Computes the inverse of polynomial P modulo x^k using Newton iteration.
-    /// P must have an invertible constant term.
-    pub fn invert_polynomial_mod<F: IsSubFieldOf<E> + IsFFTField>(
-        &self,
-        k: usize,
-    ) -> Result<Self, FFTError>
-    where
-        E: Send + Sync,
-    {
-        if self.coefficients.is_empty()
-            || self.coefficients.iter().all(|c| c == &FieldElement::zero())
-        {
-            return Err(FieldError::DivisionByZero.into());
-        }
-        let mut q = Self::new(&[self.coefficients[0].inv()?]);
-        let mut current_precision = 1;
-
-        let two = Self::new(&[FieldElement::<F>::one() + FieldElement::one()]);
-        while current_precision < k {
-            current_precision *= 2;
-            let temp = self
-                .fast_fft_multiplication::<F>(&q)?
-                .truncate(current_precision);
-            let correction = &two - temp;
-            q = q
-                .fast_fft_multiplication::<F>(&correction)?
-                .truncate(current_precision);
-        }
-
-        // Final truncation to desired degree k
-        Ok(q.truncate(k))
-    }
-}
-
-pub fn compose_fft<F, E>(
-    poly_1: &Polynomial<FieldElement<E>>,
-    poly_2: &Polynomial<FieldElement<E>>,
-) -> Polynomial<FieldElement<E>>
-where
-    F: IsFFTField + IsSubFieldOf<E>,
-    E: IsField + Send + Sync,
-{
-    let poly_2_evaluations = Polynomial::evaluate_fft::<F>(poly_2, 1, None).unwrap();
-
-    let values: Vec<_> = poly_2_evaluations
-        .iter()
-        .map(|value| poly_1.evaluate(value))
-        .collect();
-
-    Polynomial::interpolate_fft::<F>(values.as_slice()).unwrap()
 }
 
 pub fn evaluate_fft_cpu<F, E>(coeffs: &[FieldElement<E>]) -> Result<Vec<FieldElement<E>>, FFTError>
