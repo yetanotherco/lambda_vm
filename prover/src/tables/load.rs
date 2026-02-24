@@ -476,24 +476,6 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 }
 
 // =========================================================================
-// Virtual column computations
-// =========================================================================
-
-/// Compute virtual read1 = μ - read2 - read4 - read8
-#[allow(dead_code)]
-fn compute_read1<F, E>(step: &TableView<F, E>) -> FieldElement<F>
-where
-    F: IsSubFieldOf<E>,
-    E: IsField,
-{
-    let mu = step.get_main_evaluation_element(0, cols::MU).clone();
-    let read2 = step.get_main_evaluation_element(0, cols::READ2).clone();
-    let read4 = step.get_main_evaluation_element(0, cols::READ4).clone();
-    let read8 = step.get_main_evaluation_element(0, cols::READ8).clone();
-    mu - read2 - read4 - read8
-}
-
-// =========================================================================
 // Constraints
 // =========================================================================
 
