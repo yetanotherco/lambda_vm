@@ -126,6 +126,34 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         }
     }
 
+    /// Same as [`evaluate_fft`] but returns evaluations in **bit-reversed order**.
+    ///
+    /// Skips the final bit-reverse permutation, saving an O(N) pass.
+    /// Use when the consumer needs bit-reversed order (e.g. FRI commit phase).
+    pub fn evaluate_fft_bitrev<F: IsFFTField + IsSubFieldOf<E>>(
+        poly: &Polynomial<FieldElement<E>>,
+        blowup_factor: usize,
+        domain_size: Option<usize>,
+    ) -> Result<Vec<FieldElement<E>>, FFTError>
+    where
+        E: Send + Sync,
+    {
+        let domain_size = domain_size.unwrap_or(0);
+        let len = core::cmp::max(poly.coeff_len(), domain_size).next_power_of_two() * blowup_factor;
+        if len.trailing_zeros() as u64 > F::TWO_ADICITY {
+            return Err(FFTError::DomainSizeError(len.trailing_zeros() as usize));
+        }
+        if poly.coefficients().is_empty() {
+            return Ok(vec![FieldElement::zero(); len]);
+        }
+
+        let mut coeffs = poly.coefficients().to_vec();
+        coeffs.resize(len, FieldElement::zero());
+
+        evaluate_fft_cpu_bitrev::<F, E>(&mut coeffs)?;
+        Ok(coeffs)
+    }
+
     /// Returns `N` evaluations with an offset of this polynomial using FFT over a domain in a subfield F of E
     /// (so the results are P(w^i), with w being a primitive root of unity).
     /// `N = max(self.coeff_len(), domain_size).next_power_of_two() * blowup_factor`.
@@ -141,6 +169,23 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     {
         let scaled = poly.scale(offset);
         Polynomial::evaluate_fft::<F>(&scaled, blowup_factor, domain_size)
+    }
+
+    /// Same as [`evaluate_offset_fft`] but returns evaluations in **bit-reversed order**.
+    ///
+    /// Skips the final bit-reverse permutation, saving an O(N) pass.
+    /// Use when the consumer needs bit-reversed order (e.g. FRI commit phase).
+    pub fn evaluate_offset_fft_bitrev<F: IsFFTField + IsSubFieldOf<E>>(
+        poly: &Polynomial<FieldElement<E>>,
+        blowup_factor: usize,
+        domain_size: Option<usize>,
+        offset: &FieldElement<F>,
+    ) -> Result<Vec<FieldElement<E>>, FFTError>
+    where
+        E: Send + Sync,
+    {
+        let scaled = poly.scale(offset);
+        Polynomial::evaluate_fft_bitrev::<F>(&scaled, blowup_factor, domain_size)
     }
 
     /// Returns a new polynomial that interpolates `(w^i, fft_evals[i])`, with `w` being a
@@ -438,6 +483,27 @@ where
     dispatch_fft(&mut result, layer_twiddles)?;
     in_place_bit_reverse_permute(&mut result);
     Ok(result)
+}
+
+/// In-place forward FFT that leaves the result in bit-reversed order.
+/// Skips the final bit-reverse permutation, saving an O(N) pass.
+/// The input buffer is modified in-place.
+pub fn evaluate_fft_cpu_bitrev<F, E>(
+    buffer: &mut [FieldElement<E>],
+) -> Result<(), FFTError>
+where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField + Send + Sync,
+{
+    let n = buffer.len();
+    if !n.is_power_of_two() {
+        return Err(FFTError::InputError(n));
+    }
+    let order = n.trailing_zeros() as u64;
+    let layer_twiddles =
+        LayerTwiddles::<F>::new(order).ok_or(FFTError::DomainSizeError(order as usize))?;
+
+    dispatch_fft(buffer, &layer_twiddles)
 }
 
 pub fn interpolate_fft_cpu<F, E>(

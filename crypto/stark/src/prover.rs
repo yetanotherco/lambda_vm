@@ -1391,13 +1391,14 @@ pub trait IsStarkProver<
         // Extend N trace-coset evaluations to 2N LDE-coset evaluations via standard LDE.
         // deep_evals[i] = h(offset·ω_N^i) = f(ω_N^i) where f(x) = h(offset·x).
         // Standard iFFT+FFT recovers f and evaluates on the 2N-th roots: f(Ω^j) = h(offset·Ω^j).
+        // Use bitrev variant: FRI needs bit-reversed order, and FFT naturally produces it.
+        // This skips two redundant bit-reverse permutations (FFT→BRP→natural→BRP→bitrev).
         let domain_size = domain.lde_roots_of_unity_coset.len();
         let deep_poly = Polynomial::interpolate_fft::<Field>(&deep_evals)
             .expect("iFFT should succeed");
-        let mut lde_evals = Polynomial::evaluate_fft::<Field>(
+        let lde_evals = Polynomial::evaluate_fft_bitrev::<Field>(
             &deep_poly, 1, Some(domain_size),
         ).expect("FFT should succeed");
-        in_place_bit_reverse_permute(&mut lde_evals);
 
         // FRI commit phase from pre-computed evaluations (no initial FFT)
         let (fri_last_value, fri_layers) = fri::commit_phase_from_evaluations::<Field, FieldExtension>(

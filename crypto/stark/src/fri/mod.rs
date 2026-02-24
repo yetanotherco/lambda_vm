@@ -5,7 +5,7 @@ mod fri_functions;
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use math::field::traits::{IsFFTField, IsField};
 use math::traits::AsBytes;
-use math::{fft::cpu::bit_reversing::in_place_bit_reverse_permute, field::traits::IsSubFieldOf};
+use math::field::traits::IsSubFieldOf;
 pub use math::{
     field::{element::FieldElement, fields::u64_prime_field::U64PrimeField},
     polynomial::Polynomial,
@@ -31,10 +31,9 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
-    // One initial FFT: evaluate p₀ on the full domain, then bit-reverse
-    let mut evals = Polynomial::evaluate_offset_fft(&p_0, 1, Some(domain_size), coset_offset)
+    // FFT evaluation produces bit-reversed output; use bitrev variant to skip redundant BRP.
+    let mut evals = Polynomial::evaluate_offset_fft_bitrev(&p_0, 1, Some(domain_size), coset_offset)
         .expect("FRI commit: FFT evaluation of p₀ on coset domain must succeed");
-    in_place_bit_reverse_permute(&mut evals);
     drop(p_0);
 
     // Inverse twiddle factors for evaluation-form folding
