@@ -327,8 +327,14 @@ fn process_single_layer_block<F, E>(
 #[cfg(feature = "alloc")]
 #[derive(Clone)]
 pub struct LayerTwiddles<F: IsField> {
-    /// Twiddles organized by layer, stored contiguously for sequential access.
-    pub layers: Vec<Vec<FieldElement<F>>>,
+    /// All twiddles stored contiguously: [layer_0 | layer_1 | ... | layer_{order-1}].
+    /// Layer k has n/2^(k+1) twiddles starting at offset n - (n >> k).
+    /// Total storage: n - 1 elements (same as Vec<Vec<>> but in one allocation).
+    data: Vec<FieldElement<F>>,
+    /// FFT size = 2^order. Used to compute layer offsets arithmetically.
+    fft_size: usize,
+    /// Number of layers (= order).
+    order: usize,
 }
 
 #[cfg(feature = "alloc")]
@@ -342,12 +348,6 @@ impl<F: IsFFTField> LayerTwiddles<F> {
     /// Returns `None` if:
     /// - `order` exceeds the maximum supported value (would cause integer overflow)
     /// - The field doesn't have a primitive root of unity for the given order
-    ///
-    /// # Example
-    /// ```ignore
-    /// let layer_twiddles = LayerTwiddles::<GoldilocksField>::new(10)
-    ///     .expect("Failed to create twiddles for order 10");
-    /// ```
     pub fn new(order: u64) -> Option<Self> {
         let root = F::get_primitive_root_of_unity(order).ok()?;
         Self::build(order, &root)
@@ -362,12 +362,6 @@ impl<F: IsFFTField> LayerTwiddles<F> {
     /// Returns `None` if:
     /// - `order` exceeds the maximum supported value (would cause integer overflow)
     /// - The field doesn't have a primitive root of unity for the given order
-    ///
-    /// # Example
-    /// ```ignore
-    /// let inv_twiddles = LayerTwiddles::<GoldilocksField>::new_inverse(10)
-    ///     .expect("Failed to create inverse twiddles for order 10");
-    /// ```
     pub fn new_inverse(order: u64) -> Option<Self> {
         let root = F::get_primitive_root_of_unity(order).ok()?;
         // Primitive roots of unity are always non-zero, so inversion succeeds.
@@ -382,7 +376,9 @@ impl<F: IsFFTField> LayerTwiddles<F> {
         }
 
         let n = 1usize << order;
-        let mut layers = Vec::with_capacity(order as usize);
+        // Total twiddles: n/2 + n/4 + ... + 1 = n - 1
+        let total = if n > 0 { n - 1 } else { 0 };
+        let mut data = Vec::with_capacity(total);
 
         for layer in 0..order as usize {
             debug_assert!(
@@ -393,40 +389,49 @@ impl<F: IsFFTField> LayerTwiddles<F> {
             let stride = 1usize << layer;
             let count = n >> (layer + 1);
 
-            let mut layer_twiddles = Vec::with_capacity(count);
             let w_stride = root.pow(stride as u64);
             let mut current = FieldElement::<F>::one();
 
             for _ in 0..count {
-                layer_twiddles.push(current.clone());
+                data.push(current.clone());
                 current = &current * &w_stride;
             }
-
-            layers.push(layer_twiddles);
         }
 
-        Some(Self { layers })
+        Some(Self {
+            data,
+            fft_size: n,
+            order: order as usize,
+        })
     }
 
     /// Get the twiddles for a specific layer.
     ///
+    /// Layer offsets are computed arithmetically from fft_size:
+    /// offset(k) = n - (n >> k), count(k) = n >> (k+1).
+    /// Since layer < order and order = log2(fft_size), these indices are
+    /// always within bounds of the data vector (total = n - 1 elements).
+    ///
     /// # Panics
-    /// Panics if `layer >= self.layers.len()`.
+    /// Panics if `layer >= self.num_layers()`.
     #[inline(always)]
     pub fn get_layer(&self, layer: usize) -> &[FieldElement<F>] {
         assert!(
-            layer < self.layers.len(),
+            layer < self.order,
             "Layer index out of bounds: {} >= {}",
             layer,
-            self.layers.len()
+            self.order
         );
-        &self.layers[layer]
+        let n = self.fft_size;
+        let start = n - (n >> layer);
+        let count = n >> (layer + 1);
+        &self.data[start..start + count]
     }
 
     /// Returns the number of layers (equal to the FFT order).
     #[inline(always)]
     pub fn num_layers(&self) -> usize {
-        self.layers.len()
+        self.order
     }
 }
 

@@ -41,15 +41,15 @@ fn test_layer_twiddles_creation() {
     let order = 4u64;
     let layer_twiddles = LayerTwiddles::<F>::new(order).unwrap();
 
-    assert_eq!(layer_twiddles.layers.len(), 4);
-    assert_eq!(layer_twiddles.layers[0].len(), 8);
-    assert_eq!(layer_twiddles.layers[1].len(), 4);
-    assert_eq!(layer_twiddles.layers[2].len(), 2);
-    assert_eq!(layer_twiddles.layers[3].len(), 1);
+    assert_eq!(layer_twiddles.num_layers(), 4);
+    assert_eq!(layer_twiddles.get_layer(0).len(), 8);
+    assert_eq!(layer_twiddles.get_layer(1).len(), 4);
+    assert_eq!(layer_twiddles.get_layer(2).len(), 2);
+    assert_eq!(layer_twiddles.get_layer(3).len(), 1);
 
     // First twiddle of each layer should be 1
-    for layer in &layer_twiddles.layers {
-        assert_eq!(layer[0], FE::one());
+    for k in 0..layer_twiddles.num_layers() {
+        assert_eq!(layer_twiddles.get_layer(k)[0], FE::one());
     }
 }
 
@@ -353,15 +353,15 @@ fn test_layer_twiddles_inverse_creation() {
     let order = 4u64;
     let inv_twiddles = LayerTwiddles::<F>::new_inverse(order).unwrap();
 
-    assert_eq!(inv_twiddles.layers.len(), 4);
-    assert_eq!(inv_twiddles.layers[0].len(), 8);
-    assert_eq!(inv_twiddles.layers[1].len(), 4);
-    assert_eq!(inv_twiddles.layers[2].len(), 2);
-    assert_eq!(inv_twiddles.layers[3].len(), 1);
+    assert_eq!(inv_twiddles.num_layers(), 4);
+    assert_eq!(inv_twiddles.get_layer(0).len(), 8);
+    assert_eq!(inv_twiddles.get_layer(1).len(), 4);
+    assert_eq!(inv_twiddles.get_layer(2).len(), 2);
+    assert_eq!(inv_twiddles.get_layer(3).len(), 1);
 
     // First twiddle of each layer should still be 1
-    for layer in &inv_twiddles.layers {
-        assert_eq!(layer[0], FE::one());
+    for k in 0..inv_twiddles.num_layers() {
+        assert_eq!(inv_twiddles.get_layer(k)[0], FE::one());
     }
 }
 
