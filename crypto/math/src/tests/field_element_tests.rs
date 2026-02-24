@@ -57,14 +57,12 @@ mod tests {
 
     #[test]
     fn sqrt_works_for_prime_minus_one() {
+        // Goldilocks has p ≡ 1 mod 4, so -1 is a quadratic residue
         let input = -Gfe::from(1u64);
-        let sqrt = input.sqrt();
-        // -1 may or may not be a QR in Goldilocks; verify consistency
-        if let Some(sqrt) = sqrt {
-            assert_eq!(sqrt.0.square(), input);
-            assert_eq!(sqrt.1.square(), input);
-            assert_ne!(sqrt.0, sqrt.1);
-        }
+        let sqrt = input.sqrt().unwrap();
+        assert_eq!(sqrt.0.square(), input);
+        assert_eq!(sqrt.1.square(), input);
+        assert_ne!(sqrt.0, sqrt.1);
     }
 
     #[test]
