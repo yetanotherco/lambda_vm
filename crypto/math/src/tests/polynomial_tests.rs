@@ -2,7 +2,7 @@
 mod tests {
     use crate::field::element::FieldElement;
     use crate::field::fields::u64_prime_field::U64PrimeField;
-    use crate::field::traits::{IsField, IsPrimeField, IsSubFieldOf};
+    use crate::field::traits::{IsField, IsPrimeField};
     use crate::polynomial::{Polynomial, pad_with_zero_coefficients};
     use alloc::string::{String, ToString};
     use alloc::{format, vec, vec::Vec};
@@ -35,29 +35,6 @@ mod tests {
             derivative.push(FieldElement::<F>::from(i as u64) * coeff);
         }
         Polynomial::new(&derivative)
-    }
-
-    /// Computes the quotient of the division of P(x) with x - b using Ruffini's rule
-    fn ruffini_division<F, L>(
-        poly: &Polynomial<FieldElement<F>>,
-        b: &FieldElement<L>,
-    ) -> Polynomial<FieldElement<L>>
-    where
-        L: IsField,
-        F: IsSubFieldOf<L>,
-    {
-        if let Some(c) = poly.coefficients().last() {
-            let mut c = c.clone().to_extension();
-            let mut coefficients = Vec::with_capacity(poly.degree());
-            for coeff in poly.coefficients().iter().rev().skip(1) {
-                coefficients.push(c.clone());
-                c = coeff + c * b;
-            }
-            coefficients = coefficients.into_iter().rev().collect();
-            Polynomial::new(&coefficients)
-        } else {
-            Polynomial::zero()
-        }
     }
 
     /// Computes quotient only (discards remainder)

@@ -160,27 +160,7 @@ mod fft_polynomial_tests {
             }
         }
         prop_compose! {
-            fn non_empty_field_vec(max_exp: u8)(vec in collection::vec(field_element(), 1 << max_exp)) -> Vec<FE> {
-                vec
-            }
-        }
-        prop_compose! {
-            fn non_power_of_two_sized_field_vec(max_exp: u8)(vec in collection::vec(field_element(), 2..1<<max_exp).prop_filter("Avoid polynomials of size power of two", |vec| !vec.len().is_power_of_two())) -> Vec<FE> {
-                vec
-            }
-        }
-        prop_compose! {
             fn poly(max_exp: u8)(coeffs in field_vec(max_exp)) -> Polynomial<FE> {
-                Polynomial::new(&coeffs)
-            }
-        }
-        prop_compose! {
-            fn non_zero_poly(max_exp: u8)(coeffs in non_empty_field_vec(max_exp)) -> Polynomial<FE> {
-                Polynomial::new(&coeffs)
-            }
-        }
-        prop_compose! {
-            fn poly_with_non_power_of_two_coeffs(max_exp: u8)(coeffs in non_power_of_two_sized_field_vec(max_exp)) -> Polynomial<FE> {
                 Polynomial::new(&coeffs)
             }
         }
@@ -253,27 +233,7 @@ mod fft_polynomial_tests {
             }
         }
         prop_compose! {
-            fn non_empty_field_vec(max_exp: u8)(vec in collection::vec(field_element(), 1 << max_exp)) -> Vec<FE> {
-                vec
-            }
-        }
-        prop_compose! {
-            fn non_power_of_two_sized_field_vec(max_exp: u8)(vec in collection::vec(field_element(), 2..1<<max_exp).prop_filter("Avoid polynomials of size power of two", |vec| !vec.len().is_power_of_two())) -> Vec<FE> {
-                vec
-            }
-        }
-        prop_compose! {
             fn poly(max_exp: u8)(coeffs in field_vec(max_exp)) -> Polynomial<FE> {
-                Polynomial::new(&coeffs)
-            }
-        }
-        prop_compose! {
-            fn non_zero_poly(max_exp: u8)(coeffs in non_empty_field_vec(max_exp)) -> Polynomial<FE> {
-                Polynomial::new(&coeffs)
-            }
-        }
-        prop_compose! {
-            fn poly_with_non_power_of_two_coeffs(max_exp: u8)(coeffs in non_power_of_two_sized_field_vec(max_exp)) -> Polynomial<FE> {
                 Polynomial::new(&coeffs)
             }
         }
