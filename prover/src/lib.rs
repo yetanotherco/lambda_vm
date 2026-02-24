@@ -27,12 +27,12 @@ use stark::prover::{IsStarkProver, Prover};
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
+pub use crate::tables::MaxRowsConfig;
 use crate::tables::bitwise;
 use crate::tables::decode;
 use crate::tables::page;
 use crate::tables::register;
 use crate::tables::trace_builder::Traces;
-pub use crate::tables::MaxRowsConfig;
 use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_cpu_air, create_decode_air,
     create_dvrm_air, create_halt_air, create_load_air, create_lt_air, create_memw_air,
@@ -175,14 +175,30 @@ impl VmAirs {
             (&self.register, &mut traces.register, &()),
         ];
 
-        for (air, trace) in self.cpus.iter().zip(traces.cpus.iter_mut()) { pairs.push((air, trace, &())); }
-        for (air, trace) in self.lts.iter().zip(traces.lts.iter_mut()) { pairs.push((air, trace, &())); }
-        for (air, trace) in self.memws.iter().zip(traces.memws.iter_mut()) { pairs.push((air, trace, &())); }
-        for (air, trace) in self.loads.iter().zip(traces.loads.iter_mut()) { pairs.push((air, trace, &())); }
-        for (air, trace) in self.muls.iter().zip(traces.muls.iter_mut()) { pairs.push((air, trace, &())); }
-        for (air, trace) in self.dvrms.iter().zip(traces.dvrms.iter_mut()) { pairs.push((air, trace, &())); }
-        for (air, trace) in self.branches.iter().zip(traces.branches.iter_mut()) { pairs.push((air, trace, &())); }
-        for (air, trace) in self.pages.iter().zip(traces.pages.iter_mut()) { pairs.push((air, trace, &())); }
+        for (air, trace) in self.cpus.iter().zip(traces.cpus.iter_mut()) {
+            pairs.push((air, trace, &()));
+        }
+        for (air, trace) in self.lts.iter().zip(traces.lts.iter_mut()) {
+            pairs.push((air, trace, &()));
+        }
+        for (air, trace) in self.memws.iter().zip(traces.memws.iter_mut()) {
+            pairs.push((air, trace, &()));
+        }
+        for (air, trace) in self.loads.iter().zip(traces.loads.iter_mut()) {
+            pairs.push((air, trace, &()));
+        }
+        for (air, trace) in self.muls.iter().zip(traces.muls.iter_mut()) {
+            pairs.push((air, trace, &()));
+        }
+        for (air, trace) in self.dvrms.iter().zip(traces.dvrms.iter_mut()) {
+            pairs.push((air, trace, &()));
+        }
+        for (air, trace) in self.branches.iter().zip(traces.branches.iter_mut()) {
+            pairs.push((air, trace, &()));
+        }
+        for (air, trace) in self.pages.iter().zip(traces.pages.iter_mut()) {
+            pairs.push((air, trace, &()));
+        }
 
         pairs
     }
@@ -192,14 +208,30 @@ impl VmAirs {
         let mut refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
             vec![&self.bitwise, &self.decode, &self.halt, &self.register];
 
-        for air in &self.cpus { refs.push(air); }
-        for air in &self.lts { refs.push(air); }
-        for air in &self.memws { refs.push(air); }
-        for air in &self.loads { refs.push(air); }
-        for air in &self.muls { refs.push(air); }
-        for air in &self.dvrms { refs.push(air); }
-        for air in &self.branches { refs.push(air); }
-        for air in &self.pages { refs.push(air); }
+        for air in &self.cpus {
+            refs.push(air);
+        }
+        for air in &self.lts {
+            refs.push(air);
+        }
+        for air in &self.memws {
+            refs.push(air);
+        }
+        for air in &self.loads {
+            refs.push(air);
+        }
+        for air in &self.muls {
+            refs.push(air);
+        }
+        for air in &self.dvrms {
+            refs.push(air);
+        }
+        for air in &self.branches {
+            refs.push(air);
+        }
+        for air in &self.pages {
+            refs.push(air);
+        }
 
         refs
     }
