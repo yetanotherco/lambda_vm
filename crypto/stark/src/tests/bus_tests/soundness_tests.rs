@@ -666,10 +666,7 @@ fn test_tampered_accumulator_first_row() {
         .bus_public_inputs
         .as_mut()
         .expect("ADD table must have bus public inputs");
-    #[allow(clippy::assign_op_pattern)] // += causes type inference ambiguity with IsSubFieldOf
-    {
-        bus_inputs.initial_terms[0] = bus_inputs.initial_terms[0] + FieldElement::one();
-    }
+    bus_inputs.initial_terms[0] += FieldElement::<E>::one();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
