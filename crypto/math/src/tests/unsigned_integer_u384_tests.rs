@@ -748,22 +748,22 @@ fn partial_order_works() {
         "d99244c0f4a20348f44b33b288fe57bb99323f09e135c631a80e01b452e68dd6ad3315e5776b713af4a2d7f5f9a2a75",
     );
 
-    assert!(&a <= &a);
-    assert!(&a >= &a);
-    assert!(&a >= &a);
-    assert!(&a <= &a);
-    assert!(&a < &(&a + U384::from_u64(1)));
-    assert!(&a <= &(&a + U384::from_u64(1)));
-    assert!(&a + U384::from_u64(1) > a);
-    assert!((&a + U384::from_u64(1) >= a));
-    assert!(&a <= &c);
-    assert!(&a < &c);
-    assert!(&a < &c);
-    assert!(&a <= &c);
-    assert!(&c > &a);
-    assert!(&c >= &a);
-    assert!(&c >= &a);
-    assert!(&c > &a);
+    assert!(a <= a);
+    assert!(a >= a);
+    assert!(a >= a);
+    assert!(a <= a);
+    assert!(a < (a + U384::from_u64(1)));
+    assert!(a <= (a + U384::from_u64(1)));
+    assert!(a + U384::from_u64(1) > a);
+    assert!((a + U384::from_u64(1) >= a));
+    assert!(a <= c);
+    assert!(a < c);
+    assert!(a < c);
+    assert!(a <= c);
+    assert!(c > a);
+    assert!(c >= a);
+    assert!(c >= a);
+    assert!(c > a);
     assert!(a < c);
 }
 
@@ -913,7 +913,7 @@ fn shift_left_on_384_bit_integer_works_6() {
     let b = U384::from_hex_unchecked(
         "762e8968bc392ed786ab132f0b5b0cacd385dd51de3a00000000000000000000000000000000",
     );
-    assert_eq!(&a << (64 * 2), b);
+    assert_eq!(a << (64 * 2), b);
 }
 
 #[test]
@@ -921,7 +921,7 @@ fn shift_left_on_384_bit_integer_works_7() {
     let a = U384::from_hex_unchecked("90823e0bd707f");
     let b =
         U384::from_hex_unchecked("90823e0bd707f000000000000000000000000000000000000000000000000");
-    assert_eq!(&a << (64 * 3), b);
+    assert_eq!(a << (64 * 3), b);
 }
 
 #[test]
@@ -980,7 +980,7 @@ fn shift_right_on_384_bit_integer_works_7() {
         "6a9ce35d8940a5ebd29604ce9a182ade76f03f7e9965760b84a8cfd1d3dd2e612669fe000e58b2af688fd90",
     );
     let b = U384::from_hex_unchecked("6a9ce35d8940a5ebd29604ce9a182ade76f03f7");
-    assert_eq!(&a >> (64 * 3), b);
+    assert_eq!(a >> (64 * 3), b);
 }
 
 #[test]
@@ -989,7 +989,7 @@ fn shift_right_on_384_bit_integer_works_8() {
         "5322c128ec84081b6c376c108ebd7fd36bbd44f71ee5e6ad6bcb3dd1c5265bd7db75c90b2665a0826d17600f0e9",
     );
     let b = U384::from_hex_unchecked("5322c128ec84081b6c376c108ebd7fd36bbd44f71ee5e6ad6bcb3dd1c52");
-    assert_eq!(&a >> (64 * 2), b);
+    assert_eq!(a >> (64 * 2), b);
 }
 
 #[test]

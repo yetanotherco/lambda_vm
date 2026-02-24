@@ -11,8 +11,7 @@ use crate::{
     traits::{AIR, TransitionEvaluationContext},
 };
 use math::field::{
-    element::FieldElement,
-    fields::fft_friendly::u64_goldilocks::GoldilocksField,
+    element::FieldElement, fields::fft_friendly::u64_goldilocks::GoldilocksField,
     traits::IsFFTField,
 };
 

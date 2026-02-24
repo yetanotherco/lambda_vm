@@ -365,9 +365,9 @@ mod test {
             if i == 0 {
                 aux_col.push(GoldilocksFE::one());
             } else {
-                let z_i = aux_col[i - 1].clone();
-                let n_p_term = not_perm[i - 1].clone() + gamma.clone();
-                let p_term = perm[i - 1].clone() + gamma.clone();
+                let z_i = aux_col[i - 1];
+                let n_p_term = not_perm[i - 1] + gamma;
+                let p_term = perm[i - 1] + gamma;
 
                 aux_col.push(z_i * n_p_term.div(p_term).unwrap());
             }

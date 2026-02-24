@@ -305,7 +305,8 @@ fn test_quad_wl_equals_four_direct() {
 
 #[test]
 fn test_air_layout_single_interaction() {
-    type E = math::field::fields::fft_friendly::extensions_goldilocks::Degree3GoldilocksExtensionField;
+    type E =
+        math::field::fields::fft_friendly::extensions_goldilocks::Degree3GoldilocksExtensionField;
 
     let interaction = BusInteraction::sender(
         TEST_BUS,
@@ -331,7 +332,8 @@ fn test_air_layout_single_interaction() {
 
 #[test]
 fn test_air_layout_multiple_interactions() {
-    type E = math::field::fields::fft_friendly::extensions_goldilocks::Degree3GoldilocksExtensionField;
+    type E =
+        math::field::fields::fft_friendly::extensions_goldilocks::Degree3GoldilocksExtensionField;
 
     let interaction1 = BusInteraction::sender(
         TEST_BUS,

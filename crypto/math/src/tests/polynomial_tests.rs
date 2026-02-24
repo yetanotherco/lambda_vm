@@ -8,6 +8,7 @@ mod tests {
     use alloc::{format, vec, vec::Vec};
 
     // Goldilocks prime: p = 2^64 - 2^32 + 1
+    #[allow(dead_code)]
     const ORDER: u64 = 18446744069414584321;
     type F = GoldilocksField;
     type FE = FieldElement<F>;

@@ -28,7 +28,6 @@ use crate::{
 };
 
 type F = GoldilocksField;
-type E = Degree3GoldilocksExtensionField;
 type Felt252 = FieldElement<GoldilocksField>;
 
 use crate::examples::read_only_memory_logup::{
@@ -240,7 +239,8 @@ fn test_prove_dummy() {
 
     let air = DummyAIR::new(&proof_options);
 
-    let proof = Prover::prove(&air, &mut trace, &(), &mut DefaultTranscript::<F>::new(&[])).unwrap();
+    let proof =
+        Prover::prove(&air, &mut trace, &(), &mut DefaultTranscript::<F>::new(&[])).unwrap();
 
     assert!(Verifier::verify(
         &proof,
@@ -256,7 +256,8 @@ fn test_prove_bit_flags() {
 
     let air = BitFlagsAIR::new(&proof_options);
 
-    let proof = Prover::prove(&air, &mut trace, &(), &mut DefaultTranscript::<F>::new(&[])).unwrap();
+    let proof =
+        Prover::prove(&air, &mut trace, &(), &mut DefaultTranscript::<F>::new(&[])).unwrap();
 
     assert!(Verifier::verify(
         &proof,

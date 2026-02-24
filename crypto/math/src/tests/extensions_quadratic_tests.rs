@@ -13,8 +13,7 @@ impl HasQuadraticNonResidue<U64Field<ORDER_P>> for MyQuadraticNonResidue {
 }
 
 type FE = FieldElement<U64Field<ORDER_P>>;
-type MyFieldExtensionBackend =
-    QuadraticExtensionField<U64Field<ORDER_P>, MyQuadraticNonResidue>;
+type MyFieldExtensionBackend = QuadraticExtensionField<U64Field<ORDER_P>, MyQuadraticNonResidue>;
 #[allow(clippy::upper_case_acronyms)]
 type FEE = FieldElement<MyFieldExtensionBackend>;
 

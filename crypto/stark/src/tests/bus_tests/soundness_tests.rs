@@ -666,7 +666,10 @@ fn test_tampered_accumulator_first_row() {
         .bus_public_inputs
         .as_mut()
         .expect("ADD table must have bus public inputs");
-    bus_inputs.initial_terms[0] = bus_inputs.initial_terms[0].clone() + FieldElement::one();
+    #[allow(clippy::assign_op_pattern)] // += causes type inference ambiguity with IsSubFieldOf
+    {
+        bus_inputs.initial_terms[0] = bus_inputs.initial_terms[0] + FieldElement::one();
+    }
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
@@ -742,11 +745,7 @@ fn test_tampered_acc_ood_first_row() {
     let num_interactions = 1usize;
     let acc_col_ood_idx = num_main + num_interactions;
     let add_proof = &mut multi_proof.proofs[1]; // proofs: [cpu=0, add=1, mul=2]
-    let corrupted = add_proof
-        .trace_ood_evaluations
-        .get(0, acc_col_ood_idx)
-        .clone()
-        + FieldElement::one();
+    let corrupted = *add_proof.trace_ood_evaluations.get(0, acc_col_ood_idx) + FieldElement::one();
     add_proof
         .trace_ood_evaluations
         .set(0, acc_col_ood_idx, corrupted);

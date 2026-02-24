@@ -801,4 +801,3 @@ impl<'de, F: IsPrimeField> Deserialize<'de> for FieldElement<F> {
         deserializer.deserialize_struct("FieldElement", FIELDS, FieldElementVisitor(PhantomData))
     }
 }
-
