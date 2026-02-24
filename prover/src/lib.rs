@@ -174,22 +174,15 @@ impl VmAirs {
             (&self.register, &mut traces.register, &()),
         ];
 
-        macro_rules! extend_vec_pairs {
-            ($airs:expr, $traces:expr) => {
-                for (i, trace) in $traces.iter_mut().enumerate() {
-                    pairs.push((&$airs[i], trace, &()));
-                }
-            };
-        }
+        for (air, trace) in self.cpus.iter().zip(traces.cpus.iter_mut()) { pairs.push((air, trace, &())); }
+        for (air, trace) in self.lts.iter().zip(traces.lts.iter_mut()) { pairs.push((air, trace, &())); }
+        for (air, trace) in self.memws.iter().zip(traces.memws.iter_mut()) { pairs.push((air, trace, &())); }
+        for (air, trace) in self.loads.iter().zip(traces.loads.iter_mut()) { pairs.push((air, trace, &())); }
+        for (air, trace) in self.muls.iter().zip(traces.muls.iter_mut()) { pairs.push((air, trace, &())); }
+        for (air, trace) in self.dvrms.iter().zip(traces.dvrms.iter_mut()) { pairs.push((air, trace, &())); }
+        for (air, trace) in self.branches.iter().zip(traces.branches.iter_mut()) { pairs.push((air, trace, &())); }
+        for (air, trace) in self.pages.iter().zip(traces.pages.iter_mut()) { pairs.push((air, trace, &())); }
 
-        extend_vec_pairs!(self.cpus, traces.cpus);
-        extend_vec_pairs!(self.lts, traces.lts);
-        extend_vec_pairs!(self.memws, traces.memws);
-        extend_vec_pairs!(self.loads, traces.loads);
-        extend_vec_pairs!(self.muls, traces.muls);
-        extend_vec_pairs!(self.dvrms, traces.dvrms);
-        extend_vec_pairs!(self.branches, traces.branches);
-        extend_vec_pairs!(self.pages, traces.pages);
         pairs
     }
 
@@ -198,22 +191,15 @@ impl VmAirs {
         let mut refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
             vec![&self.bitwise, &self.decode, &self.halt, &self.register];
 
-        macro_rules! extend_vec_refs {
-            ($airs:expr) => {
-                for air in &$airs {
-                    refs.push(air);
-                }
-            };
-        }
+        for air in &self.cpus { refs.push(air); }
+        for air in &self.lts { refs.push(air); }
+        for air in &self.memws { refs.push(air); }
+        for air in &self.loads { refs.push(air); }
+        for air in &self.muls { refs.push(air); }
+        for air in &self.dvrms { refs.push(air); }
+        for air in &self.branches { refs.push(air); }
+        for air in &self.pages { refs.push(air); }
 
-        extend_vec_refs!(self.cpus);
-        extend_vec_refs!(self.lts);
-        extend_vec_refs!(self.memws);
-        extend_vec_refs!(self.loads);
-        extend_vec_refs!(self.muls);
-        extend_vec_refs!(self.dvrms);
-        extend_vec_refs!(self.branches);
-        extend_vec_refs!(self.pages);
         refs
     }
 
