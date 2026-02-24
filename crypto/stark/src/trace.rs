@@ -1,6 +1,7 @@
 use crate::domain::Domain;
 use crate::table::Table;
 use itertools::Itertools;
+use math::fft::cpu::bowers_fft::LayerTwiddles;
 use math::fft::errors::FFTError;
 use math::field::traits::{IsField, IsSubFieldOf};
 use math::polynomial::{
@@ -201,12 +202,22 @@ where
         FieldElement<F>: Send + Sync,
     {
         let columns = self.columns_main();
+        if columns.is_empty() {
+            return Vec::new();
+        }
+
+        // Pre-compute inverse twiddles once, shared across all columns.
+        let n = columns[0].len();
+        let order = n.trailing_zeros() as u64;
+        let inv_twiddles = LayerTwiddles::<S>::new_inverse(order)
+            .expect("inverse twiddles for trace column size");
+
         #[cfg(feature = "parallel")]
         let iter = columns.par_iter();
         #[cfg(not(feature = "parallel"))]
         let iter = columns.iter();
 
-        iter.map(|col| Polynomial::interpolate_fft::<S>(col))
+        iter.map(|col| Polynomial::interpolate_fft_with_twiddles::<S>(col, &inv_twiddles))
             .collect::<Result<Vec<Polynomial<FieldElement<F>>>, FFTError>>()
             .unwrap()
     }
@@ -218,12 +229,22 @@ where
         FieldElement<E>: Send + Sync,
     {
         let columns = self.columns_aux();
+        if columns.is_empty() {
+            return Vec::new();
+        }
+
+        // Pre-compute inverse twiddles once, shared across all columns.
+        let n = columns[0].len();
+        let order = n.trailing_zeros() as u64;
+        let inv_twiddles = LayerTwiddles::<F>::new_inverse(order)
+            .expect("inverse twiddles for trace column size");
+
         #[cfg(feature = "parallel")]
         let iter = columns.par_iter();
         #[cfg(not(feature = "parallel"))]
         let iter = columns.iter();
 
-        iter.map(|col| Polynomial::interpolate_fft::<F>(col))
+        iter.map(|col| Polynomial::interpolate_fft_with_twiddles::<F>(col, &inv_twiddles))
             .collect::<Result<Vec<Polynomial<FieldElement<E>>>, FFTError>>()
             .unwrap()
     }

@@ -167,6 +167,18 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         }
     }
 
+    /// Same as [`interpolate_fft`] but accepts pre-computed inverse twiddles.
+    /// Use when multiple columns of the same size share twiddles.
+    pub fn interpolate_fft_with_twiddles<F: IsFFTField + IsSubFieldOf<E>>(
+        fft_evals: &[FieldElement<E>],
+        inv_twiddles: &LayerTwiddles<F>,
+    ) -> Result<Self, FFTError>
+    where
+        E: Send + Sync,
+    {
+        interpolate_fft_cpu_with_twiddles::<F, E>(fft_evals, inv_twiddles)
+    }
+
     /// Returns a new polynomial that interpolates offset `(w^i, fft_evals[i])`, with `w` being a
     /// Nth primitive root of unity in a subfield F of E, and `i in 0..N`, with `N = fft_evals.len()`.
     /// This is considered to be the inverse operation of [Self::evaluate_offset_fft()].
@@ -404,8 +416,26 @@ where
     let layer_twiddles =
         LayerTwiddles::<F>::new(order).ok_or(FFTError::DomainSizeError(order as usize))?;
 
+    evaluate_fft_cpu_with_twiddles::<F, E>(coeffs, &layer_twiddles)
+}
+
+/// Same as [`evaluate_fft_cpu`] but accepts pre-computed forward twiddles.
+/// Use when multiple columns of the same size share twiddles.
+pub fn evaluate_fft_cpu_with_twiddles<F, E>(
+    coeffs: &[FieldElement<E>],
+    layer_twiddles: &LayerTwiddles<F>,
+) -> Result<Vec<FieldElement<E>>, FFTError>
+where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField + Send + Sync,
+{
+    let n = coeffs.len();
+    if !n.is_power_of_two() {
+        return Err(FFTError::InputError(n));
+    }
+
     let mut result = coeffs.to_vec();
-    dispatch_fft(&mut result, &layer_twiddles)?;
+    dispatch_fft(&mut result, layer_twiddles)?;
     in_place_bit_reverse_permute(&mut result);
     Ok(result)
 }
@@ -425,10 +455,28 @@ where
     let inv_twiddles =
         LayerTwiddles::<F>::new_inverse(order).ok_or(FFTError::DomainSizeError(order as usize))?;
 
+    interpolate_fft_cpu_with_twiddles::<F, E>(fft_evals, &inv_twiddles)
+}
+
+/// Same as [`interpolate_fft_cpu`] but accepts pre-computed inverse twiddles.
+/// Use when multiple columns of the same size share twiddles.
+pub fn interpolate_fft_cpu_with_twiddles<F, E>(
+    fft_evals: &[FieldElement<E>],
+    inv_twiddles: &LayerTwiddles<F>,
+) -> Result<Polynomial<FieldElement<E>>, FFTError>
+where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField + Send + Sync,
+{
+    let n = fft_evals.len();
+    if !n.is_power_of_two() {
+        return Err(FFTError::InputError(n));
+    }
+
     let mut coeffs = fft_evals.to_vec();
     // Bowers iFFT: bit-reverse first (natural → bit-reversed), then DIT inverse butterflies
     in_place_bit_reverse_permute(&mut coeffs);
-    dispatch_ifft(&mut coeffs, &inv_twiddles)?;
+    dispatch_ifft(&mut coeffs, inv_twiddles)?;
 
     // Scale by 1/n
     let scale_factor = FieldElement::from(n as u64).inv().unwrap();
