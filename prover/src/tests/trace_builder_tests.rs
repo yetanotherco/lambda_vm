@@ -64,7 +64,7 @@ fn append_ecall(logs: &mut Vec<Log>, instrs: &mut Vec<Instruction>) {
 
 #[test]
 fn test_empty_logs() {
-    let result = Traces::from_logs(&[], U64HashMap::default());
+    let result = Traces::from_logs(&[], U64HashMap::default(), &Default::default());
     assert!(result.is_err(), "Empty logs should return an error");
 }
 
@@ -75,7 +75,7 @@ fn test_single_log() {
     let mut instrs = vec![];
     append_ecall(&mut logs, &mut instrs);
     let instructions = make_instructions(&logs, &instrs);
-    let _traces = Traces::from_logs(&logs, instructions).unwrap();
+    let _traces = Traces::from_logs(&logs, instructions, &Default::default()).unwrap();
 }
 
 #[test]
@@ -94,7 +94,7 @@ fn test_power_of_two_logs() {
     append_ecall(&mut logs, &mut instrs);
     let instructions = make_instructions(&logs, &instrs);
 
-    let traces = Traces::from_logs(&logs, instructions).unwrap();
+    let traces = Traces::from_logs(&logs, instructions, &Default::default()).unwrap();
     assert_eq!(traces.cpus[0].main_table.height, 4);
 }
 
@@ -115,7 +115,7 @@ fn test_padding_to_power_of_two() {
     append_ecall(&mut logs, &mut instrs);
     let instructions = make_instructions(&logs, &instrs);
 
-    let traces = Traces::from_logs(&logs, instructions).unwrap();
+    let traces = Traces::from_logs(&logs, instructions, &Default::default()).unwrap();
     // 5 ops padded to 8
     assert_eq!(traces.cpus[0].main_table.height, 8);
 }
@@ -157,7 +157,7 @@ fn test_lt_operations_collected() {
     append_ecall(&mut logs, &mut instrs);
     let instructions = make_instructions(&logs, &instrs);
 
-    let traces = Traces::from_logs(&logs, instructions).unwrap();
+    let traces = Traces::from_logs(&logs, instructions, &Default::default()).unwrap();
 
     // LT trace should have rows (2 SLT + 1 BLT = 3 ops, deduplicated)
     assert!(traces.lts[0].main_table.height >= 2);
@@ -200,7 +200,7 @@ fn test_lt_deduplication() {
     append_ecall(&mut logs, &mut instrs);
     let instructions = make_instructions(&logs, &instrs);
 
-    let traces = Traces::from_logs(&logs, instructions).unwrap();
+    let traces = Traces::from_logs(&logs, instructions, &Default::default()).unwrap();
 
     // The 3 identical SLT operations (5 < 10, signed) should be deduplicated.
     // With MEMW timestamp ordering LT ops also added, the table is larger,
@@ -266,7 +266,7 @@ fn test_bitwise_lookups_collected() {
     append_ecall(&mut logs, &mut instrs);
     let instructions = make_instructions(&logs, &instrs);
 
-    let traces = Traces::from_logs(&logs, instructions).unwrap();
+    let traces = Traces::from_logs(&logs, instructions, &Default::default()).unwrap();
 
     // Check AND multiplicity was updated for (0x12, 0x34, 0)
     let row_idx = bitwise::row_index(0x12, 0x34, 0);
@@ -293,7 +293,7 @@ fn test_cpu_timestamps() {
     append_ecall(&mut logs, &mut instrs);
     let instructions = make_instructions(&logs, &instrs);
 
-    let traces = Traces::from_logs(&logs, instructions).unwrap();
+    let traces = Traces::from_logs(&logs, instructions, &Default::default()).unwrap();
 
     // Check timestamps are 4, 8, 12, 16 (starting from 4 to ensure old_timestamp < timestamp)
     for i in 0..4 {
@@ -339,7 +339,7 @@ fn test_mixed_instructions() {
     append_ecall(&mut logs, &mut instrs);
     let instructions = make_instructions(&logs, &instrs);
 
-    let traces = Traces::from_logs(&logs, instructions).unwrap();
+    let traces = Traces::from_logs(&logs, instructions, &Default::default()).unwrap();
 
     // 5 ops (4 + ecall) padded to 8
     assert_eq!(traces.cpus[0].main_table.height, 8);
@@ -391,7 +391,7 @@ fn test_memw_generated_from_register_ops() {
     append_ecall(&mut logs, &mut instrs);
     let instructions = make_instructions(&logs, &instrs);
 
-    let traces = Traces::from_logs(&logs, instructions).unwrap();
+    let traces = Traces::from_logs(&logs, instructions, &Default::default()).unwrap();
 
     // MEMW table should have register operations
     // First instruction generates: M1 (read x2), M3 (read x3), M5 (write x1)
@@ -461,7 +461,7 @@ fn test_memw_generates_lt_for_timestamp_ordering() {
     append_ecall(&mut logs, &mut instrs);
     let instructions = make_instructions(&logs, &instrs);
 
-    let traces = Traces::from_logs(&logs, instructions).unwrap();
+    let traces = Traces::from_logs(&logs, instructions, &Default::default()).unwrap();
 
     // LT table should have ops from MEMW timestamp ordering
     // First instruction: 3 register ops (M1, M3, M5) → at least 3 LT ops for C7
@@ -536,7 +536,7 @@ fn test_lt_generates_bitwise_lookups() {
     append_ecall(&mut logs, &mut instrs);
     let instructions = make_instructions(&logs, &instrs);
 
-    let traces = Traces::from_logs(&logs, instructions).unwrap();
+    let traces = Traces::from_logs(&logs, instructions, &Default::default()).unwrap();
 
     // For SLT(0x1234, 0x5678):
     // lhs_sub_rhs = 0x1234 - 0x5678 = 0xFFFF_FFFF_FFFF_BBBC (wrapping)

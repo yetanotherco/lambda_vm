@@ -85,7 +85,7 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
 fn test_cpu_only_no_bus() {
     let (_elf, logs, instructions) = run_asm_elf("sub");
 
-    let mut cpu_trace = Traces::from_logs(&logs, instructions)
+    let mut cpu_trace = Traces::from_logs(&logs, instructions, &Default::default())
         .unwrap()
         .cpus
         .into_iter()
@@ -146,7 +146,7 @@ fn test_prove_elfs_sub_fast() {
     let _ = env_logger::builder().is_test(true).try_init();
     let (elf, logs, _instructions) = run_asm_elf("sub");
     // Use from_elf_and_logs to get PAGE and REGISTER tables for Memory bus
-    let mut traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default()).unwrap();
 
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
@@ -157,7 +157,7 @@ fn test_prove_elfs_sub_fast() {
 #[test]
 fn test_prove_elfs_sub_neg_result_fast() {
     let (elf, logs, instructions) = run_asm_elf("sub_neg_result");
-    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone()).unwrap();
+    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
 
     println!(
         "Fast SUB_NEG: CPU {} rows, Bitwise {} rows, MEMW {} tables ({} rows in first), REGISTER {} rows",
@@ -177,7 +177,7 @@ fn test_prove_elfs_sub_neg_result_fast() {
 #[test]
 fn test_prove_elfs_sub_underflow_fast() {
     let (elf, logs, instructions) = run_asm_elf("sub_underflow");
-    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone()).unwrap();
+    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
 
     println!(
         "Fast SUB_UNDERFLOW: CPU {} rows, Bitwise {} rows (minimal)",
@@ -193,7 +193,7 @@ fn test_prove_elfs_sub_underflow_fast() {
 #[test]
 fn test_prove_elfs_subw_fast() {
     let (elf, logs, instructions) = run_asm_elf("subw");
-    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone()).unwrap();
+    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
 
     println!(
         "Fast SUBW: CPU {} rows, Bitwise {} rows (minimal)",
@@ -210,7 +210,7 @@ fn test_prove_elfs_subw_fast() {
 #[test]
 fn test_prove_elfs_arith_lui_8() {
     let (elf, logs, instructions) = run_asm_elf("arith_lui_8");
-    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone()).unwrap();
+    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
 
     println!(
         "ArithLUI8: CPU {} rows, Bitwise {} rows (minimal)",
@@ -227,7 +227,7 @@ fn test_prove_elfs_arith_lui_8() {
 #[test]
 fn test_prove_elfs_arith_8() {
     let (elf, logs, instructions) = run_asm_elf("arith_8");
-    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone()).unwrap();
+    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
 
     println!(
         "Arith8: CPU {} rows, Bitwise {} rows (minimal)",
@@ -247,7 +247,7 @@ fn test_prove_elfs_arith_8() {
 #[test]
 fn test_prove_elfs_basic_arith_32() {
     let (elf, logs, instructions) = run_asm_elf("basic_arith_32");
-    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone()).unwrap();
+    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
 
     println!(
         "BasicArith32: CPU {} rows, Bitwise {} rows (minimal)",
@@ -274,7 +274,7 @@ fn test_prove_elfs_comprehensive() {
     let _ = env_logger::builder().is_test(true).try_init();
 
     let (elf, logs, instructions) = run_asm_elf("comprehensive_test");
-    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone()).unwrap();
+    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
 
     // Collect LT lookups first (needed for both LT trace and bitwise lookups)
 
@@ -296,7 +296,7 @@ fn test_prove_elfs_comprehensive() {
 #[test]
 fn test_prove_elfs_test_add_8() {
     let (elf, logs, instructions) = run_asm_elf("test_add_8");
-    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone()).unwrap();
+    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
     // Use traces.lt and traces.bitwise directly instead of generating separate ones
     // This includes MEMW timestamp ordering LT ops and their bitwise lookups
     assert!(
@@ -308,7 +308,7 @@ fn test_prove_elfs_test_add_8() {
 #[test]
 fn test_prove_elfs_test_sub_8() {
     let (elf, logs, instructions) = run_asm_elf("test_sub_8");
-    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone()).unwrap();
+    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "test_sub_8 failed"
@@ -318,7 +318,7 @@ fn test_prove_elfs_test_sub_8() {
 #[test]
 fn test_prove_elfs_test_addw_8() {
     let (elf, logs, instructions) = run_asm_elf("test_addw_8");
-    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone()).unwrap();
+    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "test_addw_8 failed"
@@ -328,7 +328,7 @@ fn test_prove_elfs_test_addw_8() {
 #[test]
 fn test_prove_elfs_test_subw_8() {
     let (elf, logs, instructions) = run_asm_elf("test_subw_8");
-    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone()).unwrap();
+    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
     // Using traces from Traces::from_logs() which includes MEMW LT ops
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
@@ -339,7 +339,7 @@ fn test_prove_elfs_test_subw_8() {
 #[test]
 fn test_prove_elfs_test_addw_lui_8() {
     let (elf, logs, instructions) = run_asm_elf("test_addw_lui_8");
-    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone()).unwrap();
+    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
     // Using traces from Traces::from_logs() which includes MEMW LT ops
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
@@ -350,7 +350,7 @@ fn test_prove_elfs_test_addw_lui_8() {
 #[test]
 fn test_prove_elfs_test_subw_lui_8() {
     let (elf, logs, instructions) = run_asm_elf("test_subw_lui_8");
-    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone()).unwrap();
+    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
     // Using traces from Traces::from_logs() which includes MEMW LT ops
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
@@ -361,7 +361,7 @@ fn test_prove_elfs_test_subw_lui_8() {
 #[test]
 fn test_prove_elfs_test_add_neg_8() {
     let (elf, logs, instructions) = run_asm_elf("test_add_neg_8");
-    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone()).unwrap();
+    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
     // Using traces from Traces::from_logs() which includes MEMW LT ops
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
@@ -372,7 +372,7 @@ fn test_prove_elfs_test_add_neg_8() {
 #[test]
 fn test_prove_elfs_test_sub_neg_8() {
     let (elf, logs, instructions) = run_asm_elf("test_sub_neg_8");
-    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone()).unwrap();
+    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
     // Using traces from Traces::from_logs() which includes MEMW LT ops
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
@@ -383,7 +383,7 @@ fn test_prove_elfs_test_sub_neg_8() {
 #[test]
 fn test_prove_elfs_test_mul_8() {
     let (elf, logs, instructions) = run_asm_elf("test_mul_8");
-    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone()).unwrap();
+    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
     // Using traces from Traces::from_logs() which includes MEMW LT ops
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
@@ -394,7 +394,7 @@ fn test_prove_elfs_test_mul_8() {
 #[test]
 fn test_prove_elfs_test_div_8() {
     let (elf, logs, instructions) = run_asm_elf("test_div_8");
-    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone()).unwrap();
+    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
     // Using traces from Traces::from_logs() which includes MEMW LT ops
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
@@ -405,7 +405,7 @@ fn test_prove_elfs_test_div_8() {
 #[test]
 fn test_prove_elfs_test_shift_8() {
     let (elf, logs, instructions) = run_asm_elf("test_shift_8");
-    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone()).unwrap();
+    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
     // Using traces from Traces::from_logs() which includes MEMW LT ops
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
@@ -416,7 +416,7 @@ fn test_prove_elfs_test_shift_8() {
 #[test]
 fn test_prove_elfs_test_bitwise_8() {
     let (elf, logs, instructions) = run_asm_elf("test_bitwise_8");
-    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone()).unwrap();
+    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
     // Using traces from Traces::from_logs() which includes MEMW LT ops
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
@@ -430,7 +430,7 @@ fn test_prove_elfs_test_slt_8() {
     let _ = env_logger::builder().is_test(true).try_init();
 
     let (elf, logs, instructions) = run_asm_elf("test_slt_8");
-    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone()).unwrap();
+    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
 
     // Collect LT lookups first (needed for both LT trace and bitwise lookups)
 
@@ -451,7 +451,7 @@ fn test_prove_elfs_test_slt_8() {
 #[test]
 fn test_prove_elfs_test_xor_8() {
     let (elf, logs, instructions) = run_asm_elf("test_xor_8");
-    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone()).unwrap();
+    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
     // Using traces from Traces::from_logs() which includes MEMW LT ops
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
@@ -462,7 +462,7 @@ fn test_prove_elfs_test_xor_8() {
 #[test]
 fn test_prove_elfs_test_lb_lh_8() {
     let (elf, logs, _instructions) = run_asm_elf("test_lb_lh_8");
-    let mut traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default()).unwrap();
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "test_lb_lh_8 failed"
@@ -472,7 +472,7 @@ fn test_prove_elfs_test_lb_lh_8() {
 #[test]
 fn test_prove_elfs_test_sb_sh_8() {
     let (elf, logs, _instructions) = run_asm_elf("test_sb_sh_8");
-    let mut traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default()).unwrap();
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "test_sb_sh_8 failed"
@@ -485,7 +485,7 @@ fn test_prove_elfs_all_branches_16() {
     let _ = env_logger::builder().is_test(true).try_init();
 
     let (elf, logs, instructions) = run_asm_elf("all_branches_16");
-    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone()).unwrap();
+    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
 
     // BLT instructions need LT table (like SLT)
 
@@ -502,7 +502,7 @@ fn test_prove_elfs_all_branches_16() {
 #[test]
 fn test_prove_elfs_all_loadstore_32() {
     let (elf, logs, _instructions) = run_asm_elf("all_loadstore_32");
-    let mut traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default()).unwrap();
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "all_loadstore_32 failed"
@@ -516,7 +516,7 @@ fn test_prove_elfs_all_instructions_64() {
 
     let (elf, logs, instructions) = run_asm_elf("all_instructions_64");
     // Use full Traces to get real MEMW and LOAD traces
-    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone()).unwrap();
+    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
 
     // Includes SLT/SLTU instructions - need LT table
 
@@ -571,7 +571,7 @@ fn test_debug_memory_bus_tokens() {
     use std::collections::HashMap;
 
     let (_elf, logs, instructions) = run_asm_elf("sub_neg_result");
-    let traces = Traces::from_logs_minimal(&logs, instructions.clone()).unwrap();
+    let traces = Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
 
     let memw = &traces.memws[0]; // Small test: single MEMW chunk
     println!("DEBUG TABLE SIZES:");
@@ -835,7 +835,7 @@ fn test_debug_memory_tokens_sb_sh() {
     use std::collections::HashMap;
 
     let (elf, logs, _instructions) = run_asm_elf("test_sb_sh_8");
-    let traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
+    let traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default()).unwrap();
 
     let memw = &traces.memws[0]; // Small test: single MEMW chunk
     println!("DEBUG: test_sb_sh_8 Memory bus tokens (FULL)");
@@ -1180,7 +1180,7 @@ fn test_debug_memory_tokens_sb_sh() {
 #[test]
 fn test_deep_stack_passes() {
     let (elf, logs, _instructions) = run_asm_elf("deep_stack");
-    let mut traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default()).unwrap();
 
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
@@ -1201,7 +1201,7 @@ fn test_deep_stack_runtime_pages_roundtrip() {
     let executor =
         executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
-    let mut traces = Traces::from_elf_and_logs(&elf, &result.logs).unwrap();
+    let mut traces = Traces::from_elf_and_logs(&elf, &result.logs, &Default::default()).unwrap();
 
     let runtime_page_ranges = traces.runtime_page_ranges();
     let table_counts = traces.table_counts();
@@ -1253,7 +1253,7 @@ fn test_deep_stack_missing_pages_rejected() {
     let executor =
         executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
-    let mut traces = Traces::from_elf_and_logs(&elf, &result.logs).unwrap();
+    let mut traces = Traces::from_elf_and_logs(&elf, &result.logs, &Default::default()).unwrap();
 
     // Prover uses correct page configs (auto-detected from MemoryState)
     let table_counts = traces.table_counts();
@@ -1296,7 +1296,7 @@ fn test_deep_stack_missing_pages_rejected() {
 #[test]
 fn test_heap_alloc_passes() {
     let (elf, logs, _instructions) = run_asm_elf("heap_alloc");
-    let mut traces = Traces::from_elf_and_logs(&elf, &logs).unwrap();
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default()).unwrap();
 
     // Verify runtime_page_ranges encodes the heap pages as a contiguous range
     let ranges = traces.runtime_page_ranges();
@@ -1324,7 +1324,7 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
     let executor =
         executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
-    let mut traces = Traces::from_elf_and_logs(&elf, &result.logs).unwrap();
+    let mut traces = Traces::from_elf_and_logs(&elf, &result.logs, &Default::default()).unwrap();
 
     let runtime_page_ranges = traces.runtime_page_ranges();
     let table_counts = traces.table_counts();
@@ -1372,7 +1372,7 @@ fn test_verify_rejects_zero_table_counts() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("sub");
     let proof_options = ProofOptions::default_test_options();
 
-    let vm_proof = crate::prove_with_options(&elf_bytes, &proof_options)
+    let vm_proof = crate::prove_with_options(&elf_bytes, &proof_options, &Default::default())
         .expect("Prover should succeed on valid program");
 
     assert!(
@@ -1404,7 +1404,7 @@ fn test_verify_rejects_zero_cpu_count() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("sub");
     let proof_options = ProofOptions::default_test_options();
 
-    let vm_proof = crate::prove_with_options(&elf_bytes, &proof_options)
+    let vm_proof = crate::prove_with_options(&elf_bytes, &proof_options, &Default::default())
         .expect("Prover should succeed on valid program");
 
     let tampered_proof = crate::VmProof {
@@ -1425,7 +1425,7 @@ fn test_verify_rejects_zero_memw_count() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("sub");
     let proof_options = ProofOptions::default_test_options();
 
-    let vm_proof = crate::prove_with_options(&elf_bytes, &proof_options)
+    let vm_proof = crate::prove_with_options(&elf_bytes, &proof_options, &Default::default())
         .expect("Prover should succeed on valid program");
 
     let tampered_proof = crate::VmProof {

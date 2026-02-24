@@ -1263,7 +1263,11 @@ impl Traces {
     /// 3. MEMW → LT operations (timestamp ordering)
     /// 4. LT, MEMW, Branch → Bitwise lookups
     /// 5. Generate all traces including PAGE tables
-    pub fn from_elf_and_logs(elf: &Elf, logs: &[Log]) -> Result<Self, Error> {
+    pub fn from_elf_and_logs(
+        elf: &Elf,
+        logs: &[Log],
+        max_rows: &super::MaxRowsConfig,
+    ) -> Result<Self, Error> {
         // =====================================================================
         // PHASE 0: ELF → DECODE + instructions
         // =====================================================================
@@ -1380,16 +1384,14 @@ impl Traces {
             .ok_or(Error::MissingHaltEcall)?;
         let halt_trace = halt::generate_halt_trace(halt_op.timestamp);
 
-        use super::max_rows;
-
-        let cpus = chunk_and_generate(&cpu_ops, max_rows::CPU, cpu::generate_cpu_trace);
-        let memws = chunk_and_generate(&memw_ops, max_rows::MEMW, memw::generate_memw_trace);
-        let loads = chunk_and_generate(&load_ops, max_rows::LOAD, load::generate_load_trace);
-        let lts = chunk_and_generate(&lt_ops, max_rows::LT, lt::generate_lt_trace);
-        let muls = chunk_and_generate(&mul_ops, max_rows::MUL, mul::generate_mul_trace);
-        let dvrms = chunk_and_generate(&dvrm_ops, max_rows::DVRM, dvrm::generate_dvrm_trace);
+        let cpus = chunk_and_generate(&cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
+        let memws = chunk_and_generate(&memw_ops, max_rows.memw, memw::generate_memw_trace);
+        let loads = chunk_and_generate(&load_ops, max_rows.load, load::generate_load_trace);
+        let lts = chunk_and_generate(&lt_ops, max_rows.lt, lt::generate_lt_trace);
+        let muls = chunk_and_generate(&mul_ops, max_rows.mul, mul::generate_mul_trace);
+        let dvrms = chunk_and_generate(&dvrm_ops, max_rows.dvrm, dvrm::generate_dvrm_trace);
         let branches =
-            chunk_and_generate(&branch_ops, max_rows::BRANCH, branch::generate_branch_trace);
+            chunk_and_generate(&branch_ops, max_rows.branch, branch::generate_branch_trace);
 
         let mut bitwise = bitwise::generate_bitwise_trace();
         bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
@@ -1404,7 +1406,7 @@ impl Traces {
             0
         } else {
             cpu_ops
-                .chunks(max_rows::CPU)
+                .chunks(max_rows.cpu)
                 .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
                 .sum()
         };
@@ -1442,7 +1444,11 @@ impl Traces {
     /// as it generates PAGE tables from ELF data.
     ///
     /// Note: This creates empty PAGE tables since no ELF is provided.
-    pub fn from_logs(logs: &[Log], instructions: U64HashMap<Instruction>) -> Result<Self, Error> {
+    pub fn from_logs(
+        logs: &[Log],
+        instructions: U64HashMap<Instruction>,
+        max_rows: &super::MaxRowsConfig,
+    ) -> Result<Self, Error> {
         // =====================================================================
         // PHASE 1: Logs → CPU operations
         // =====================================================================
@@ -1545,16 +1551,14 @@ impl Traces {
             .ok_or(Error::MissingHaltEcall)?;
         let halt_trace = halt::generate_halt_trace(halt_op.timestamp);
 
-        use super::max_rows;
-
-        let cpus = chunk_and_generate(&cpu_ops, max_rows::CPU, cpu::generate_cpu_trace);
-        let memws = chunk_and_generate(&memw_ops, max_rows::MEMW, memw::generate_memw_trace);
-        let loads = chunk_and_generate(&load_ops, max_rows::LOAD, load::generate_load_trace);
-        let lts = chunk_and_generate(&lt_ops, max_rows::LT, lt::generate_lt_trace);
-        let muls = chunk_and_generate(&mul_ops, max_rows::MUL, mul::generate_mul_trace);
-        let dvrms = chunk_and_generate(&dvrm_ops, max_rows::DVRM, dvrm::generate_dvrm_trace);
+        let cpus = chunk_and_generate(&cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
+        let memws = chunk_and_generate(&memw_ops, max_rows.memw, memw::generate_memw_trace);
+        let loads = chunk_and_generate(&load_ops, max_rows.load, load::generate_load_trace);
+        let lts = chunk_and_generate(&lt_ops, max_rows.lt, lt::generate_lt_trace);
+        let muls = chunk_and_generate(&mul_ops, max_rows.mul, mul::generate_mul_trace);
+        let dvrms = chunk_and_generate(&dvrm_ops, max_rows.dvrm, dvrm::generate_dvrm_trace);
         let branches =
-            chunk_and_generate(&branch_ops, max_rows::BRANCH, branch::generate_branch_trace);
+            chunk_and_generate(&branch_ops, max_rows.branch, branch::generate_branch_trace);
 
         let mut bitwise = bitwise::generate_bitwise_trace();
         bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
@@ -1568,7 +1572,7 @@ impl Traces {
             0
         } else {
             cpu_ops
-                .chunks(max_rows::CPU)
+                .chunks(max_rows.cpu)
                 .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
                 .sum()
         };
@@ -1627,9 +1631,10 @@ impl Traces {
     pub fn from_logs_trimmed(
         logs: &[Log],
         instructions: U64HashMap<Instruction>,
+        max_rows: &super::MaxRowsConfig,
     ) -> Result<Self, Error> {
         // Generate full traces (including full 2^20 bitwise table with multiplicities)
-        let mut traces = Self::from_logs(logs, instructions)?;
+        let mut traces = Self::from_logs(logs, instructions, max_rows)?;
 
         // Trim the bitwise table to only rows with non-zero multiplicities
         traces.bitwise = bitwise::trim_zero_rows(traces.bitwise);
@@ -1644,7 +1649,8 @@ impl Traces {
     pub fn from_logs_minimal(
         logs: &[Log],
         instructions: U64HashMap<Instruction>,
+        max_rows: &super::MaxRowsConfig,
     ) -> Result<Self, Error> {
-        Self::from_logs_trimmed(logs, instructions)
+        Self::from_logs_trimmed(logs, instructions, max_rows)
     }
 }

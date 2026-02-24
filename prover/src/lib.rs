@@ -32,6 +32,7 @@ use crate::tables::decode;
 use crate::tables::page;
 use crate::tables::register;
 use crate::tables::trace_builder::Traces;
+pub use crate::tables::MaxRowsConfig;
 use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_cpu_air, create_decode_air,
     create_dvrm_air, create_halt_air, create_load_air, create_lt_air, create_memw_air,
@@ -290,13 +291,15 @@ pub fn prove(elf_bytes: &[u8]) -> Result<VmProof, Error> {
     prove_with_options(
         elf_bytes,
         &GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid"),
+        &MaxRowsConfig::default(),
     )
 }
 
-/// Prove an ELF binary execution with custom proof options and stack size.
+/// Prove an ELF binary execution with custom proof options and max rows config.
 pub fn prove_with_options(
     elf_bytes: &[u8],
     proof_options: &ProofOptions,
+    max_rows: &MaxRowsConfig,
 ) -> Result<VmProof, Error> {
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let executor = Executor::new(&program, vec![]).map_err(|e| Error::Execution(format!("{e}")))?;
@@ -306,7 +309,7 @@ pub fn prove_with_options(
 
     // Generate all traces from ELF and execution logs.
     // Page tables are derived from the prover's MemoryState (all accessed pages).
-    let mut traces = Traces::from_elf_and_logs(&program, &result.logs)?;
+    let mut traces = Traces::from_elf_and_logs(&program, &result.logs, max_rows)?;
     let table_counts = traces.table_counts();
     let airs = VmAirs::new(
         &program,

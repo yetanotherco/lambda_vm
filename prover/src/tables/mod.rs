@@ -60,3 +60,48 @@ pub mod max_rows {
     pub const LOAD: usize = 1 << 21; // 2,097,152 — eff. width 33
     pub const BRANCH: usize = 1 << 21; // 2,097,152 — eff. width 32
 }
+
+/// Per-table maximum row limits, configurable for different environments.
+///
+/// `Default` uses the production values from [`max_rows`].
+/// [`MaxRowsConfig::small`] uses 2^5 for low-memory testing.
+#[derive(Debug, Clone)]
+pub struct MaxRowsConfig {
+    pub cpu: usize,
+    pub memw: usize,
+    pub dvrm: usize,
+    pub mul: usize,
+    pub lt: usize,
+    pub load: usize,
+    pub branch: usize,
+}
+
+impl Default for MaxRowsConfig {
+    fn default() -> Self {
+        Self {
+            cpu: max_rows::CPU,
+            memw: max_rows::MEMW,
+            dvrm: max_rows::DVRM,
+            mul: max_rows::MUL,
+            lt: max_rows::LT,
+            load: max_rows::LOAD,
+            branch: max_rows::BRANCH,
+        }
+    }
+}
+
+impl MaxRowsConfig {
+    /// Small limits for low-memory testing. Generates multiple chunks
+    /// per table even for tiny programs (~32 rows per chunk).
+    pub fn small() -> Self {
+        Self {
+            cpu: 1 << 5,
+            memw: 1 << 5,
+            dvrm: 1 << 5,
+            mul: 1 << 5,
+            lt: 1 << 5,
+            load: 1 << 5,
+            branch: 1 << 5,
+        }
+    }
+}
