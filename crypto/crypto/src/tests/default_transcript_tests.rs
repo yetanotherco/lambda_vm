@@ -81,7 +81,7 @@ fn degree3_goldilocks_transcript_distinguish_different_fe() {
 #[test]
 fn fork_determinism() {
     // Cloning a transcript twice and running the same operations must produce identical challenges.
-    let mut base = DefaultTranscript::<FrField>::default();
+    let mut base = DefaultTranscript::<GoldilocksField>::default();
     base.append_bytes(&[0x01, 0x02, 0x03]);
     let _ = base.sample();
     base.append_bytes(&[0xAA, 0xBB]);
@@ -99,7 +99,7 @@ fn fork_determinism() {
 #[test]
 fn fork_domain_separator_differentiates() {
     // Two forks from the same base with different domain separators must produce different challenges.
-    let mut base = DefaultTranscript::<FrField>::default();
+    let mut base = DefaultTranscript::<GoldilocksField>::default();
     base.append_bytes(&[0x01, 0x02, 0x03]);
     let _ = base.sample();
     base.append_bytes(&[0xAA, 0xBB]);
@@ -116,7 +116,7 @@ fn fork_domain_separator_differentiates() {
 #[test]
 fn fork_isolation() {
     // Appending data to one fork must not affect challenges sampled from another.
-    let mut base = DefaultTranscript::<FrField>::default();
+    let mut base = DefaultTranscript::<GoldilocksField>::default();
     base.append_bytes(&[0x01, 0x02, 0x03]);
     let _ = base.sample();
 
