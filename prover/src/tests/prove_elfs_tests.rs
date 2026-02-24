@@ -1365,3 +1365,127 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
         "Verifier should accept heap_alloc proof with correct runtime_page_ranges"
     );
 }
+
+/// Verify rejects table_counts with all zeros.
+#[test]
+fn test_verify_rejects_zero_table_counts() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("sub");
+    let proof_options = ProofOptions::default_test_options();
+
+    let vm_proof = crate::prove_with_options(&elf_bytes, &proof_options)
+        .expect("Prover should succeed on valid program");
+
+    assert!(
+        crate::verify_with_options(&vm_proof, &elf_bytes, &proof_options)
+            .expect("Verification should not error on valid proof"),
+        "Valid proof should verify"
+    );
+
+    let tampered_proof = crate::VmProof {
+        table_counts: crate::TableCounts {
+            cpu: 0,
+            lt: 0,
+            memw: 0,
+            load: 0,
+            mul: 0,
+            dvrm: 0,
+            branch: 0,
+        },
+        ..vm_proof
+    };
+
+    let result = crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options);
+    assert!(result.is_err(), "Got {:?}", result);
+}
+
+/// Verify rejects table_counts with cpu=0.
+#[test]
+fn test_verify_rejects_zero_cpu_count() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("sub");
+    let proof_options = ProofOptions::default_test_options();
+
+    let vm_proof = crate::prove_with_options(&elf_bytes, &proof_options)
+        .expect("Prover should succeed on valid program");
+
+    let tampered_proof = crate::VmProof {
+        table_counts: crate::TableCounts {
+            cpu: 0,
+            ..vm_proof.table_counts.clone()
+        },
+        ..vm_proof
+    };
+
+    let result = crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options);
+    assert!(result.is_err(), "Got {:?}", result);
+}
+
+/// Verify rejects table_counts with memw=0.
+#[test]
+fn test_verify_rejects_zero_memw_count() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("sub");
+    let proof_options = ProofOptions::default_test_options();
+
+    let vm_proof = crate::prove_with_options(&elf_bytes, &proof_options)
+        .expect("Prover should succeed on valid program");
+
+    let tampered_proof = crate::VmProof {
+        table_counts: crate::TableCounts {
+            memw: 0,
+            ..vm_proof.table_counts.clone()
+        },
+        ..vm_proof
+    };
+
+    let result = crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options);
+    assert!(result.is_err(), "Got {:?}", result);
+}
+
+/// Verify rejects a proof with fewer proofs than AIRs.
+#[test]
+fn test_crafted_zero_count_proof_must_not_verify() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("sub");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let proof_options = ProofOptions::default_test_options();
+
+    let zero_counts = crate::TableCounts {
+        cpu: 0,
+        lt: 0,
+        memw: 0,
+        load: 0,
+        mul: 0,
+        dvrm: 0,
+        branch: 0,
+    };
+    let airs = VmAirs::new(&elf, &proof_options, true, &[], &zero_counts);
+
+    let verifier_air_refs = airs.air_refs();
+    assert_eq!(verifier_air_refs.len(), 4);
+
+    let mut bitwise_trace = crate::tables::bitwise::generate_bitwise_trace();
+
+    let instructions = crate::tables::decode::instructions_from_elf(&elf)
+        .expect("Failed to parse instructions from ELF");
+    let (mut decode_trace, _) = crate::tables::decode::generate_decode_trace(&instructions);
+
+    let pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&airs.bitwise, &mut bitwise_trace, &()),
+        (&airs.decode, &mut decode_trace, &()),
+    ];
+
+    let proof = Prover::multi_prove(pairs, &mut DefaultTranscript::<E>::new(&[]))
+        .expect("Proof generation should succeed");
+
+    assert_eq!(proof.proofs.len(), 2);
+
+    let verified = Verifier::multi_verify(
+        &verifier_air_refs,
+        &proof,
+        &mut DefaultTranscript::<E>::new(&[]),
+    );
+
+    assert!(!verified);
+}

@@ -66,6 +66,32 @@ pub struct TableCounts {
     pub branch: usize,
 }
 
+impl TableCounts {
+    /// Validate that all required tables have at least one chunk.
+    ///
+    /// A zero count for any table would remove its constraints from verification,
+    /// allowing a malicious prover to bypass soundness checks.
+    pub fn validate(&self) -> Result<(), Error> {
+        let checks = [
+            ("cpu", self.cpu),
+            ("lt", self.lt),
+            ("memw", self.memw),
+            ("load", self.load),
+            ("mul", self.mul),
+            ("dvrm", self.dvrm),
+            ("branch", self.branch),
+        ];
+        for (name, count) in checks {
+            if count == 0 {
+                return Err(Error::InvalidTableCounts(format!(
+                    "{name} count is 0 — every table must have at least 1 chunk"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A complete VM proof bundle containing the STARK proof and metadata
 /// needed by the verifier to reconstruct the AIR configuration.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -94,6 +120,8 @@ pub enum Error {
     Execution(String),
     /// STARK proving failed
     Prover(String),
+    /// Proof contains invalid table_counts (e.g. zero for a required table)
+    InvalidTableCounts(String),
 }
 
 impl fmt::Display for Error {
@@ -106,6 +134,7 @@ impl fmt::Display for Error {
             }
             Error::Execution(msg) => write!(f, "execution error: {msg}"),
             Error::Prover(msg) => write!(f, "proving error: {msg}"),
+            Error::InvalidTableCounts(msg) => write!(f, "invalid table_counts: {msg}"),
         }
     }
 }
@@ -339,6 +368,10 @@ pub fn verify_with_options(
     elf_bytes: &[u8],
     proof_options: &ProofOptions,
 ) -> Result<bool, Error> {
+    // Validate table_counts before constructing AIRs.
+    // A malicious prover could set counts to 0, removing entire constraint sets.
+    vm_proof.table_counts.validate()?;
+
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let page_configs =
         Traces::page_configs_from_elf_and_runtime(&program, &vm_proof.runtime_page_ranges);

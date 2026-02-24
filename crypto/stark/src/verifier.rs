@@ -833,6 +833,17 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
+        // Reject mismatched AIR/proof counts. Without this check, `zip` silently
+        // drops unmatched entries, allowing an attacker to omit table proofs.
+        if airs.len() != multi_proof.proofs.len() {
+            error!(
+                "AIR count ({}) does not match proof count ({})",
+                airs.len(),
+                multi_proof.proofs.len()
+            );
+            return false;
+        }
+
         // Check if any AIR uses LogUp (has auxiliary trace for running sums)
         let needs_logup_challenges = airs.iter().any(|air| air.has_trace_interaction());
 
