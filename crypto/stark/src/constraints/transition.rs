@@ -37,6 +37,22 @@ where
         transition_evaluations: &mut [FieldElement<E>],
     );
 
+    /// Prover-only: evaluate into split base/extension buffers.
+    ///
+    /// Base-field constraints override this to write directly to `base_evaluations`,
+    /// producing `FieldElement<F>` without the F→E round-trip through `to_extension()`.
+    /// Extension-field constraints (e.g. LogUp) use the default which delegates to `evaluate`.
+    fn evaluate_prover(
+        &self,
+        ctx: &TransitionEvaluationContext<F, E>,
+        base_evaluations: &mut [FieldElement<F>],
+        ext_evaluations: &mut [FieldElement<E>],
+    ) {
+        // Default: backward-compatible, writes to extension buffer
+        self.evaluate(ctx, ext_evaluations);
+        let _ = base_evaluations;
+    }
+
     /// The periodicity the constraint is applied over the trace.
     ///
     /// Default value is 1, meaning that the constraint is applied to every

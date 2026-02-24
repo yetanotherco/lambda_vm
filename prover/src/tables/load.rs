@@ -616,6 +616,17 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for LoadConstrai
             }
         }
     }
+
+    fn evaluate_prover(
+        &self,
+        ctx: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        base_evaluations: &mut [FieldElement<GoldilocksField>],
+        _ext_evaluations: &mut [FieldElement<GoldilocksExtension>],
+    ) {
+        if let TransitionEvaluationContext::Prover { frame, .. } = ctx {
+            base_evaluations[self.constraint_idx] = self.compute(frame.get_evaluation_step(0));
+        }
+    }
 }
 
 /// Creates all constraints for the LOAD table.

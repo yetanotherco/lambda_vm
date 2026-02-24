@@ -676,6 +676,8 @@ pub struct AirWithBuses<
     num_precomputed_cols: Option<usize>,
     /// Optional name for debug output (per-table bus sum tracking)
     name: Option<String>,
+    /// Number of inner (base-field) transition constraints, before LogUp constraints are appended.
+    num_inner_constraints: usize,
 }
 
 impl<
@@ -704,6 +706,7 @@ impl<
         mut transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
     ) -> Self {
         let num_interactions = auxiliary_trace_build_data.interactions.len();
+        let num_inner_constraints = transition_constraints.len();
 
         // Split interactions: committed pairs get term columns, last 1-2 are absorbed
         let (num_committed_pairs, absorbed) = if num_interactions == 0 {
@@ -768,6 +771,7 @@ impl<
             preprocessed_commitment: None,
             num_precomputed_cols: None,
             name: None,
+            num_inner_constraints,
         }
     }
 
@@ -846,6 +850,10 @@ where
 
     fn context(&self) -> &AirContext {
         &self.context
+    }
+
+    fn num_base_transition_constraints(&self) -> usize {
+        self.num_inner_constraints
     }
 
     fn transition_constraints(

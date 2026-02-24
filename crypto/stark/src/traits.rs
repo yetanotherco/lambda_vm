@@ -229,6 +229,38 @@ pub trait AIR: Send + Sync {
             .for_each(|c| c.evaluate(evaluation_context, evaluations));
     }
 
+    /// Number of base-field transition constraints (indices 0..N).
+    ///
+    /// Used by the prover to split F×E vs E×E accumulation.
+    /// Default: 0 (all constraints use E×E path via default `evaluate_prover`).
+    /// Override in AIRs whose constraints implement `evaluate_prover` to write
+    /// base-field results directly.
+    fn num_base_transition_constraints(&self) -> usize {
+        0
+    }
+
+    /// Prover-only: evaluate all transitions into split base/extension buffers.
+    ///
+    /// Base-field constraints write to `base_evals`, extension-field constraints
+    /// write to `ext_evals`. The evaluator then uses F×E multiplication for
+    /// base constraints (3 base muls) instead of E×E (9 base muls).
+    fn compute_transition_prover(
+        &self,
+        ctx: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
+        base_evals: &mut [FieldElement<Self::Field>],
+        ext_evals: &mut [FieldElement<Self::FieldExtension>],
+    ) {
+        for e in base_evals.iter_mut() {
+            *e = FieldElement::zero();
+        }
+        for e in ext_evals.iter_mut() {
+            *e = FieldElement::zero();
+        }
+        self.transition_constraints()
+            .iter()
+            .for_each(|c| c.evaluate_prover(ctx, base_evals, ext_evals));
+    }
+
     fn boundary_constraints(
         &self,
         pub_inputs: &Self::PublicInputs,
