@@ -36,7 +36,7 @@ fn byte_serialization_and_deserialization_works_be() {
     assert_eq!(element, from_bytes);
 }
 
-#[cfg(all(feature = "std", not(feature = "instruments"), not(feature = "cuda")))]
+#[cfg(all(feature = "std", not(feature = "instruments")))]
 mod fft_tests {
     use super::*;
     use crate::fft::cpu::roots_of_unity::{
