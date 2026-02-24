@@ -1167,7 +1167,7 @@ pub trait IsStarkProver<
     /// The transcript must be safely initialized before passing it to this method.
     fn multi_prove(
         mut air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
-        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
     ) -> Result<MultiProof<Field, FieldExtension, PI>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
@@ -1233,43 +1233,61 @@ pub trait IsStarkProver<
         };
 
         // =====================================================================
-        // Round 1, Phase C: Build and commit auxiliary traces
+        // Phase C + Rounds 2-4: Forked per table
         // =====================================================================
-        // Each AIR builds its LogUp running-sum columns using the shared challenges.
+        // Each table gets an independent transcript fork (cloned from the shared
+        // state after Phase B, domain-separated by table index). This makes
+        // per-table proving independent — each table's challenges only depend
+        // on the shared Phase A+B prefix and that table's own commitments.
+        //
+        // As a side effect, each Round1 is consumed immediately (memory win).
 
-        let mut round_1_results: Vec<Round1<Field, FieldExtension>> = Vec::with_capacity(num_airs);
-        for (((air, trace, _pub_inputs), (main, main_evaluations)), domain) in air_trace_pairs
+        let mut proofs = Vec::with_capacity(num_airs);
+        #[cfg(feature = "debug-checks")]
+        let mut all_bus_public_inputs: Vec<Option<BusPublicInputs<FieldExtension>>> =
+            Vec::with_capacity(num_airs);
+
+        for (idx, (((air, trace, pub_inputs), (main, main_evaluations)), domain)) in air_trace_pairs
             .iter_mut()
             .zip(main_commitments)
             .zip(domains.iter())
+            .enumerate()
         {
+            // For multi-table proofs, fork the transcript with a domain separator
+            // so each table derives independent challenges. Single-table proofs
+            // use the original transcript directly (no fork, no separator).
+            let mut table_transcript = transcript.clone();
+            if num_airs > 1 {
+                table_transcript.append_bytes(&(idx as u64).to_le_bytes());
+            }
+
+            // Phase C: build and commit aux trace
             let round_1_result = Self::round_1_build_auxiliary_trace(
                 *air,
                 *trace,
                 domain,
-                transcript,
+                &mut table_transcript,
                 main,
                 main_evaluations,
                 logup_challenges.clone(),
             )?;
-            round_1_results.push(round_1_result);
+
+            #[cfg(feature = "debug-checks")]
+            all_bus_public_inputs.push(round_1_result.bus_public_inputs.clone());
+
+            // Rounds 2-4 for this table (immediately, then Round1 is dropped)
+            let proof = Self::prove_rounds_2_to_4(
+                *air,
+                *pub_inputs,
+                &round_1_result,
+                &mut table_transcript,
+                domain,
+            )?;
+            proofs.push(proof);
         }
 
         #[cfg(feature = "debug-checks")]
-        print_bus_balance_report(&round_1_results);
-
-        // =====================================================================
-        // Rounds 2-4: Standard STARK protocol for each AIR
-        // =====================================================================
-
-        let mut proofs = Vec::with_capacity(num_airs);
-        for (((air, _, pub_inputs), round_1_result), domain) in
-            air_trace_pairs.iter().zip(round_1_results).zip(domains)
-        {
-            let proof =
-                Self::prove_rounds_2_to_4(*air, *pub_inputs, &round_1_result, transcript, &domain)?;
-            proofs.push(proof);
-        }
+        print_bus_balance_report(&all_bus_public_inputs);
 
         Ok(MultiProof::new(proofs))
     }
@@ -1280,7 +1298,7 @@ pub trait IsStarkProver<
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         trace: &mut TraceTable<Field, FieldExtension>,
         pub_inputs: &PI,
-        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
     ) -> Result<StarkProof<Field, FieldExtension, PI>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
@@ -1493,19 +1511,14 @@ pub trait IsStarkProver<
 /// Uses numeric bus IDs only (no VM-specific names) to keep the stark crate generic.
 /// For bus ID → name mapping, see `BusId` in the prover crate.
 #[cfg(feature = "debug-checks")]
-fn print_bus_balance_report<Field, FieldExtension>(
-    round_1_results: &[Round1<Field, FieldExtension>],
+fn print_bus_balance_report<FieldExtension>(
+    all_bus_public_inputs: &[Option<BusPublicInputs<FieldExtension>>],
 ) where
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField,
     FieldExtension: IsField,
-    FieldElement<Field>: AsBytes,
-    FieldElement<FieldExtension>: AsBytes,
 {
     use std::collections::HashMap;
 
-    let has_logup = round_1_results
-        .iter()
-        .any(|r| r.bus_public_inputs.is_some());
+    let has_logup = all_bus_public_inputs.iter().any(|r| r.is_some());
     if !has_logup {
         return;
     }
@@ -1517,31 +1530,29 @@ fn print_bus_balance_report<Field, FieldExtension>(
     let mut global_sender_sums: HashMap<u64, FieldElement<FieldExtension>> = HashMap::new();
     let mut global_receiver_sums: HashMap<u64, FieldElement<FieldExtension>> = HashMap::new();
 
-    for round_1_result in round_1_results {
-        if let Some(bus_inputs) = &round_1_result.bus_public_inputs {
-            for (&bus_id, sum) in &bus_inputs.per_bus_sums {
-                *global_bus_sums
-                    .entry(bus_id)
-                    .or_insert(FieldElement::zero()) += sum.clone();
-            }
-            for (&bus_id, sum) in &bus_inputs.per_bus_sender_sums {
-                *global_sender_sums
-                    .entry(bus_id)
-                    .or_insert(FieldElement::zero()) += sum.clone();
-                bus_senders
-                    .entry(bus_id)
-                    .or_default()
-                    .push((bus_inputs.table_name.clone(), sum.clone()));
-            }
-            for (&bus_id, sum) in &bus_inputs.per_bus_receiver_sums {
-                *global_receiver_sums
-                    .entry(bus_id)
-                    .or_insert(FieldElement::zero()) += sum.clone();
-                bus_receivers
-                    .entry(bus_id)
-                    .or_default()
-                    .push((bus_inputs.table_name.clone(), sum.clone()));
-            }
+    for bus_inputs in all_bus_public_inputs.iter().flatten() {
+        for (&bus_id, sum) in &bus_inputs.per_bus_sums {
+            *global_bus_sums
+                .entry(bus_id)
+                .or_insert(FieldElement::zero()) += sum.clone();
+        }
+        for (&bus_id, sum) in &bus_inputs.per_bus_sender_sums {
+            *global_sender_sums
+                .entry(bus_id)
+                .or_insert(FieldElement::zero()) += sum.clone();
+            bus_senders
+                .entry(bus_id)
+                .or_default()
+                .push((bus_inputs.table_name.clone(), sum.clone()));
+        }
+        for (&bus_id, sum) in &bus_inputs.per_bus_receiver_sums {
+            *global_receiver_sums
+                .entry(bus_id)
+                .or_insert(FieldElement::zero()) += sum.clone();
+            bus_receivers
+                .entry(bus_id)
+                .or_default()
+                .push((bus_inputs.table_name.clone(), sum.clone()));
         }
     }
 
