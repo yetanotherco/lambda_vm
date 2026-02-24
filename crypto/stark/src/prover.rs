@@ -339,6 +339,45 @@ pub trait IsStarkProver<
         Some((tree, root))
     }
 
+    /// Commit columns that are already in **bit-reversed order** (as produced by
+    /// `coset_lde_full_expand_bitrev` / `coset_lde_full_into_bitrev`).
+    ///
+    /// Since the columns are already bit-reversed, we iterate rows sequentially
+    /// instead of using `reverse_index`. Produces the same Merkle tree as
+    /// `commit_columns_bit_reversed` when given the corresponding natural-order data.
+    fn commit_columns<E>(
+        columns: &[Vec<FieldElement<E>>],
+    ) -> Option<(BatchedMerkleTree<E>, Commitment)>
+    where
+        FieldElement<E>: AsBytes + Sync + Send,
+        E: IsField,
+    {
+        if columns.is_empty() || columns[0].is_empty() {
+            return None;
+        }
+
+        let num_rows = columns[0].len();
+        let num_cols = columns.len();
+
+        #[cfg(feature = "parallel")]
+        let iter = (0..num_rows).into_par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let iter = 0..num_rows;
+
+        let hashed_leaves: Vec<Commitment> = iter
+            .map(|row_idx| {
+                let row: Vec<FieldElement<E>> = (0..num_cols)
+                    .map(|col_idx| columns[col_idx][row_idx].clone())
+                    .collect();
+                BatchedMerkleTreeBackend::<E>::hash_data(&row)
+            })
+            .collect();
+
+        let tree = BatchedMerkleTree::<E>::build_from_hashed_leaves(hashed_leaves)?;
+        let root = tree.root;
+        Some((tree, root))
+    }
+
     /// Compute the LDE commitment for a subset of columns from a trace (for testing).
     ///
     /// This helper computes the same commitment the prover generates internally,
@@ -663,6 +702,46 @@ pub trait IsStarkProver<
         }
     }
 
+    /// Same as [`expand_pool_to_lde`], but returns evaluations in **bit-reversed order**.
+    /// Use for commit-only paths where data won't be used for constraint evaluation.
+    fn expand_pool_to_lde_bitrev<E>(
+        pool: &mut [Vec<FieldElement<E>>],
+        num_cols: usize,
+        domain: &Domain<Field>,
+        twiddles: &LdeTwiddles<Field>,
+    ) where
+        Field: IsSubFieldOf<E>,
+        E: IsSubFieldOf<FieldExtension> + IsField + Send + Sync,
+        FieldElement<E>: Send + Sync,
+    {
+        if num_cols == 0 {
+            return;
+        }
+
+        #[cfg(feature = "parallel")]
+        pool[..num_cols].par_iter_mut().for_each(|buf| {
+            Polynomial::coset_lde_full_expand_bitrev::<Field>(
+                buf,
+                domain.blowup_factor,
+                &twiddles.coset_weights,
+                &twiddles.inv,
+                &twiddles.fwd,
+            )
+            .expect("coset LDE expansion");
+        });
+        #[cfg(not(feature = "parallel"))]
+        for buf in pool[..num_cols].iter_mut() {
+            Polynomial::coset_lde_full_expand_bitrev::<Field>(
+                buf,
+                domain.blowup_factor,
+                &twiddles.coset_weights,
+                &twiddles.inv,
+                &twiddles.fwd,
+            )
+            .expect("coset LDE expansion");
+        }
+    }
+
     /// Phase 1a of Round 1: Commit only the main trace to the transcript.
     /// Returns the main trace commitment data and LDE evaluations.
     /// Does NOT sample RAP challenges or build auxiliary trace.
@@ -828,9 +907,9 @@ pub trait IsStarkProver<
     {
         let num_cols = trace.num_main_columns;
         trace.extract_columns_main_into(main_pool);
-        Self::expand_pool_to_lde::<Field>(main_pool, num_cols, domain, twiddles);
+        Self::expand_pool_to_lde_bitrev::<Field>(main_pool, num_cols, domain, twiddles);
 
-        let (tree, root) = Self::commit_columns_bit_reversed(&main_pool[..num_cols])
+        let (tree, root) = Self::commit_columns(&main_pool[..num_cols])
             .ok_or(ProvingError::EmptyCommitment)?;
 
         transcript.append_bytes(&root);
@@ -865,14 +944,14 @@ pub trait IsStarkProver<
     {
         let num_cols = trace.num_main_columns;
         trace.extract_columns_main_into(main_pool);
-        Self::expand_pool_to_lde::<Field>(main_pool, num_cols, domain, twiddles);
+        Self::expand_pool_to_lde_bitrev::<Field>(main_pool, num_cols, domain, twiddles);
 
         let (precomputed_tree, precomputed_root) =
-            Self::commit_columns_bit_reversed(&main_pool[..num_precomputed_cols])
+            Self::commit_columns(&main_pool[..num_precomputed_cols])
                 .ok_or(ProvingError::EmptyCommitment)?;
 
         let (mult_tree, mult_root) =
-            Self::commit_columns_bit_reversed(&main_pool[num_precomputed_cols..num_cols])
+            Self::commit_columns(&main_pool[num_precomputed_cols..num_cols])
                 .ok_or(ProvingError::EmptyCommitment)?;
 
         debug_assert_eq!(
@@ -923,10 +1002,10 @@ pub trait IsStarkProver<
 
         let num_aux_cols = trace.num_aux_columns;
         trace.extract_columns_aux_into(aux_pool);
-        Self::expand_pool_to_lde::<FieldExtension>(aux_pool, num_aux_cols, domain, twiddles);
+        Self::expand_pool_to_lde_bitrev::<FieldExtension>(aux_pool, num_aux_cols, domain, twiddles);
 
         let (aux_tree, aux_merkle_root) =
-            Self::commit_columns_bit_reversed(&aux_pool[..num_aux_cols])
+            Self::commit_columns(&aux_pool[..num_aux_cols])
                 .ok_or(ProvingError::EmptyCommitment)?;
 
         transcript.append_bytes(&aux_merkle_root);
@@ -1126,14 +1205,14 @@ pub trait IsStarkProver<
         #[cfg(feature = "parallel")]
         let (lde_h0, lde_h1) = rayon::join(
             || {
-                Self::extend_half_to_lde::<FieldExtension>(
+                Self::extend_half_to_lde(
                     &h0_evals,
                     &coset_offset_squared,
                     domain,
                 )
             },
             || {
-                Self::extend_half_to_lde::<FieldExtension>(
+                Self::extend_half_to_lde(
                     &h1_evals,
                     &coset_offset_squared,
                     domain,
@@ -1143,12 +1222,12 @@ pub trait IsStarkProver<
 
         #[cfg(not(feature = "parallel"))]
         let (lde_h0, lde_h1) = (
-            Self::extend_half_to_lde::<FieldExtension>(
+            Self::extend_half_to_lde(
                 &h0_evals,
                 &coset_offset_squared,
                 domain,
             ),
-            Self::extend_half_to_lde::<FieldExtension>(
+            Self::extend_half_to_lde(
                 &h1_evals,
                 &coset_offset_squared,
                 domain,
@@ -1161,13 +1240,12 @@ pub trait IsStarkProver<
     /// Given N evaluations of a degree-<N polynomial on the g²-coset,
     /// extend to 2N evaluations on the g-coset (the full LDE domain).
     /// This is: iFFT(N, offset=g²) → coefficients → FFT(2N, offset=g).
-    fn extend_half_to_lde<E>(
+    fn extend_half_to_lde(
         half_evals: &[FieldElement<FieldExtension>],
         squared_offset: &FieldElement<Field>,
         domain: &Domain<Field>,
     ) -> Vec<FieldElement<FieldExtension>>
     where
-        E: IsField,
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
@@ -1943,7 +2021,7 @@ pub trait IsStarkProver<
             let (aux_tree, aux_root) = if air.has_trace_interaction() {
                 let num_aux_cols = trace.num_aux_columns;
                 trace.extract_columns_aux_into(&mut aux_pool);
-                Self::expand_pool_to_lde::<FieldExtension>(
+                Self::expand_pool_to_lde_bitrev::<FieldExtension>(
                     &mut aux_pool,
                     num_aux_cols,
                     domain,
@@ -1951,7 +2029,7 @@ pub trait IsStarkProver<
                 );
 
                 let (tree, root) =
-                    Self::commit_columns_bit_reversed(&aux_pool[..num_aux_cols])
+                    Self::commit_columns(&aux_pool[..num_aux_cols])
                         .ok_or(ProvingError::EmptyCommitment)?;
 
                 transcript.append_bytes(&root);
