@@ -1983,8 +1983,10 @@ pub trait IsStarkProver<
                 temp_results.push(result);
             }
 
-            let all_bus_public_inputs: Vec<Option<BusPublicInputs<FieldExtension>>> =
-                temp_results.iter().map(|r| r.bus_public_inputs.clone()).collect();
+            let all_bus_public_inputs: Vec<Option<BusPublicInputs<FieldExtension>>> = temp_results
+                .iter()
+                .map(|r| r.bus_public_inputs.clone())
+                .collect();
             print_bus_balance_report(&all_bus_public_inputs);
 
             for (((air, trace, pub_inputs), round_1_result), domain) in air_trace_pairs
