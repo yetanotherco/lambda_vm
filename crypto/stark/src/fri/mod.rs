@@ -40,13 +40,14 @@ where
     let mut inv_twiddles = compute_coset_twiddles_inv(coset_offset, domain_size);
 
     let mut fri_layer_list = Vec::with_capacity(number_layers);
-    let mut current_coset_offset = coset_offset.clone();
+    // Track coset offset in extension field to avoid per-layer to_extension() conversion
+    let mut current_coset_offset_ext: FieldElement<E> = coset_offset.clone().to_extension();
     let mut current_domain_size = domain_size;
 
     for _ in 1..number_layers {
         // <<<< Receive challenge 𝜁ₖ₋₁
         let zeta = transcript.sample_field_element();
-        current_coset_offset = current_coset_offset.square();
+        current_coset_offset_ext = current_coset_offset_ext.square();
         current_domain_size /= 2;
 
         // Fold evaluations in-place (no FFT needed)
@@ -60,7 +61,7 @@ where
         fri_layer_list.push(FriLayer::new(
             evals.clone(),
             merkle_tree,
-            current_coset_offset.clone().to_extension(),
+            current_coset_offset_ext.clone(),
             current_domain_size,
         ));
 
@@ -106,13 +107,14 @@ where
     let mut inv_twiddles = compute_coset_twiddles_inv(coset_offset, domain_size);
 
     let mut fri_layer_list = Vec::with_capacity(number_layers);
-    let mut current_coset_offset = coset_offset.clone();
+    // Track coset offset in extension field to avoid per-layer to_extension() conversion
+    let mut current_coset_offset_ext: FieldElement<E> = coset_offset.clone().to_extension();
     let mut current_domain_size = domain_size;
 
     for _ in 1..number_layers {
         // <<<< Receive challenge 𝜁ₖ₋₁
         let zeta = transcript.sample_field_element();
-        current_coset_offset = current_coset_offset.square();
+        current_coset_offset_ext = current_coset_offset_ext.square();
         current_domain_size /= 2;
 
         // Fold evaluations in-place (no FFT needed)
@@ -126,7 +128,7 @@ where
         fri_layer_list.push(FriLayer::new(
             evals.clone(),
             merkle_tree,
-            current_coset_offset.clone().to_extension(),
+            current_coset_offset_ext.clone(),
             current_domain_size,
         ));
 
