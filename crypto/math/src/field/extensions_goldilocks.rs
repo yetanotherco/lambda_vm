@@ -11,95 +11,55 @@ use crate::field::{
 };
 use crate::traits::{AsBytes, ByteConversion};
 
-// =====================================================
-// ByteConversion for extension base types
-// =====================================================
-
 impl ByteConversion for [FpE; 2] {
     #[cfg(feature = "alloc")]
     fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
-        let mut byte_slice = ByteConversion::to_bytes_be(&self[0]);
-        byte_slice.extend(ByteConversion::to_bytes_be(&self[1]));
-        byte_slice
+        unimplemented!()
     }
 
     #[cfg(feature = "alloc")]
     fn to_bytes_le(&self) -> alloc::vec::Vec<u8> {
-        let mut byte_slice = ByteConversion::to_bytes_le(&self[0]);
-        byte_slice.extend(ByteConversion::to_bytes_le(&self[1]));
-        byte_slice
+        unimplemented!()
     }
 
-    fn from_bytes_be(bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
+    fn from_bytes_be(_bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
     where
         Self: Sized,
     {
-        const BYTES_PER_FIELD: usize = 8;
-        if bytes.len() < BYTES_PER_FIELD * 2 {
-            return Err(crate::errors::ByteConversionError::FromBEBytesError);
-        }
-        let x0 = FieldElement::from_bytes_be(&bytes[0..BYTES_PER_FIELD])?;
-        let x1 = FieldElement::from_bytes_be(&bytes[BYTES_PER_FIELD..BYTES_PER_FIELD * 2])?;
-        Ok([x0, x1])
+        unimplemented!()
     }
 
-    fn from_bytes_le(bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
+    fn from_bytes_le(_bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
     where
         Self: Sized,
     {
-        const BYTES_PER_FIELD: usize = 8;
-        if bytes.len() < BYTES_PER_FIELD * 2 {
-            return Err(crate::errors::ByteConversionError::FromLEBytesError);
-        }
-        let x0 = FieldElement::from_bytes_le(&bytes[0..BYTES_PER_FIELD])?;
-        let x1 = FieldElement::from_bytes_le(&bytes[BYTES_PER_FIELD..BYTES_PER_FIELD * 2])?;
-        Ok([x0, x1])
+        unimplemented!()
     }
 }
 
 impl ByteConversion for [FpE; 3] {
     #[cfg(feature = "alloc")]
     fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
-        let mut byte_slice = ByteConversion::to_bytes_be(&self[0]);
-        byte_slice.extend(ByteConversion::to_bytes_be(&self[1]));
-        byte_slice.extend(ByteConversion::to_bytes_be(&self[2]));
-        byte_slice
+        unimplemented!()
     }
 
     #[cfg(feature = "alloc")]
     fn to_bytes_le(&self) -> alloc::vec::Vec<u8> {
-        let mut byte_slice = ByteConversion::to_bytes_le(&self[0]);
-        byte_slice.extend(ByteConversion::to_bytes_le(&self[1]));
-        byte_slice.extend(ByteConversion::to_bytes_le(&self[2]));
-        byte_slice
+        unimplemented!()
     }
 
-    fn from_bytes_be(bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
+    fn from_bytes_be(_bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
     where
         Self: Sized,
     {
-        const BYTES_PER_FIELD: usize = 8;
-        if bytes.len() < BYTES_PER_FIELD * 3 {
-            return Err(crate::errors::ByteConversionError::FromBEBytesError);
-        }
-        let x0 = FieldElement::from_bytes_be(&bytes[0..BYTES_PER_FIELD])?;
-        let x1 = FieldElement::from_bytes_be(&bytes[BYTES_PER_FIELD..BYTES_PER_FIELD * 2])?;
-        let x2 = FieldElement::from_bytes_be(&bytes[BYTES_PER_FIELD * 2..BYTES_PER_FIELD * 3])?;
-        Ok([x0, x1, x2])
+        unimplemented!()
     }
 
-    fn from_bytes_le(bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
+    fn from_bytes_le(_bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
     where
         Self: Sized,
     {
-        const BYTES_PER_FIELD: usize = 8;
-        if bytes.len() < BYTES_PER_FIELD * 3 {
-            return Err(crate::errors::ByteConversionError::FromLEBytesError);
-        }
-        let x0 = FieldElement::from_bytes_le(&bytes[0..BYTES_PER_FIELD])?;
-        let x1 = FieldElement::from_bytes_le(&bytes[BYTES_PER_FIELD..BYTES_PER_FIELD * 2])?;
-        let x2 = FieldElement::from_bytes_le(&bytes[BYTES_PER_FIELD * 2..BYTES_PER_FIELD * 3])?;
-        Ok([x0, x1, x2])
+        unimplemented!()
     }
 }
 
