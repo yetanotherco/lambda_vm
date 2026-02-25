@@ -1684,6 +1684,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 packing: Packing::Direct,
             },
             BusValue::constant(0), // timestamp_hi = 0 (CPU timestamps fit in u32)
+            BusValue::constant(93), // syscall number (sys_exit) — DWordWL[0]
+            BusValue::constant(0),  // syscall number hi — DWordWL[1]
         ],
     ));
 

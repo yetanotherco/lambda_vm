@@ -126,27 +126,42 @@ impl MemoryState {
 
 /// Register state tracker for generating MEMW register traces.
 struct RegisterState {
-    /// Register file: (value, last_write_timestamp)
+    /// Register file x0-x31: (value, last_write_timestamp)
     regs: [RegisterCell; 32],
+    /// PC register x255: (value, last_write_timestamp)
+    pc_reg: RegisterCell,
 }
 
 impl RegisterState {
-    fn new() -> Self {
+    fn new(entry_point: u64) -> Self {
         let mut regs = [(0u64, 0u64); 32];
         // SP (x2) starts at STACK_TOP
         regs[2] = (page::STACK_TOP, 0);
-        Self { regs }
+        Self {
+            regs,
+            // PC register starts at the ELF entry point with timestamp 0
+            pc_reg: (entry_point, 0),
+        }
     }
 
     /// Read a register. Returns (value, last_write_timestamp).
     fn read(&self, reg: u8) -> RegisterCell {
-        self.regs[reg as usize]
+        if reg == 255 {
+            self.pc_reg
+        } else {
+            self.regs[reg as usize]
+        }
     }
 
     /// Write a register with the given timestamp.
+    ///
+    /// Note: x0 is hardwired to zero in the ISA, but the memory argument chain
+    /// still needs timestamp tracking. CPU callers guard against rd=0 writes;
+    /// HALT needs to finalize x0 at timestamp 2^64-1.
     fn write(&mut self, reg: u8, value: u64, timestamp: u64) {
-        if reg != 0 {
-            // x0 is always 0 and never written
+        if reg == 255 {
+            self.pc_reg = (value, timestamp);
+        } else {
             self.regs[reg as usize] = (value, timestamp);
         }
     }
@@ -155,6 +170,7 @@ impl RegisterState {
     ///
     /// Returns a map from register Word address to final (timestamp, value).
     /// Each register uses 2 Word addresses (reg_addr = 2 * reg_idx, then +0, +1).
+    /// Includes x255 (PC) at addresses 510, 511.
     fn to_final_state_map(&self) -> FinalRegisterStateMap {
         let mut map = FinalRegisterStateMap::new();
 
@@ -181,6 +197,25 @@ impl RegisterState {
                 },
             );
         }
+
+        // x255 (PC) at addresses 510, 511
+        let (pc_value, pc_timestamp) = self.pc_reg;
+        let pc_lo = (pc_value & 0xFFFF_FFFF) as u32;
+        let pc_hi = (pc_value >> 32) as u32;
+        map.insert(
+            510,
+            FinalRegisterWordState {
+                timestamp: pc_timestamp,
+                value: pc_lo,
+            },
+        );
+        map.insert(
+            511,
+            FinalRegisterWordState {
+                timestamp: pc_timestamp,
+                value: pc_hi,
+            },
+        );
 
         map
     }
@@ -457,6 +492,52 @@ fn collect_register_ops_from_cpu(
             .with_old(old_value, old_timestamps);
         memw_ops.push(memw_op);
         register_state.write(d.rd, op.rvd, op.timestamp + 2);
+    }
+
+    memw_ops
+}
+
+/// Collects MEMW operations for HALT register finalization.
+///
+/// HALT finalizes all registers at timestamp 2^64-1:
+/// - x0-x9, x11-x31: write value=0 (31 writes)
+/// - x10: read (asserts exit code = 0)
+/// - x255 (PC): write value=1
+///
+/// Each operation reads old_value/old_timestamp from register_state, then updates it.
+fn collect_halt_memw_ops(register_state: &mut RegisterState) -> Vec<MemwOperation> {
+    const TS_MAX: u64 = u64::MAX;
+    let mut memw_ops = Vec::with_capacity(32);
+
+    // Finalize registers x1-x31 at ts=2^64-1
+    // (x0 excluded per spec — hardwired to zero, never written by CPU)
+    for reg in 1u8..32 {
+        let reg_addr = 2 * reg as u64;
+        let (old_val, old_ts) = register_state.read(reg);
+        let old_value = pack_register_value(old_val);
+        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
+        let value = pack_register_value(0);
+
+        // x10 (a0) is a READ per spec (halt:c:read_zero_exit_code) — asserts exit code = 0.
+        // All other registers are WRITEs.
+        let is_read = reg == 10;
+        let memw_op = MemwOperation::new(true, reg_addr, value, TS_MAX, 2, is_read)
+            .with_old(old_value, old_timestamps);
+        memw_ops.push(memw_op);
+        register_state.write(reg, 0, TS_MAX);
+    }
+
+    // x255 (PC): write value=1
+    {
+        let reg_addr = 510u64; // 2 * 255
+        let (old_val, old_ts) = register_state.read(255);
+        let old_value = pack_register_value(old_val);
+        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
+        let value = pack_register_value(1); // PC final value = 1
+        let memw_op = MemwOperation::new(true, reg_addr, value, TS_MAX, 2, false)
+            .with_old(old_value, old_timestamps);
+        memw_ops.push(memw_op);
+        register_state.write(255, 1, TS_MAX);
     }
 
     memw_ops
@@ -1290,9 +1371,12 @@ impl Traces {
         // Processes cpu_ops in order. MEMW/LOAD need state tracking, LT/Bitwise don't.
         // Initialize memory state from ELF so first accesses get correct old_value.
         let mut memory_state = MemoryState::from_elf(elf);
-        let mut register_state = RegisterState::new();
-        let (memw_ops, load_ops, mut lt_ops, mut bitwise_ops) =
+        let mut register_state = RegisterState::new(elf.entry_point);
+        let (mut memw_ops, load_ops, mut lt_ops, mut bitwise_ops) =
             collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
+
+        // Collect HALT register finalization MEMW ops (must come after CPU ops)
+        memw_ops.extend(collect_halt_memw_ops(&mut register_state));
 
         // Collect BRANCH operations from CPU ops where branch_cond = true
         let branch_ops: Vec<BranchOperation> = cpu_ops
@@ -1419,7 +1503,8 @@ impl Traces {
 
         // Generate REGISTER table from final register state
         let register_final_state = register_state.to_final_state_map();
-        let register_trace = register::generate_register_trace(&register_final_state);
+        let register_trace =
+            register::generate_register_trace(&register_final_state, elf.entry_point);
 
         Ok(Traces {
             cpus,
@@ -1447,6 +1532,7 @@ impl Traces {
     pub fn from_logs(
         logs: &[Log],
         instructions: U64HashMap<Instruction>,
+        entry_point: u64,
         max_rows: &super::MaxRowsConfig,
     ) -> Result<Self, Error> {
         // =====================================================================
@@ -1459,9 +1545,12 @@ impl Traces {
         // =====================================================================
         // Processes cpu_ops in order. MEMW/LOAD need state tracking, LT/Bitwise don't.
         let mut memory_state = MemoryState::new();
-        let mut register_state = RegisterState::new();
-        let (memw_ops, load_ops, mut lt_ops, mut bitwise_ops) =
+        let mut register_state = RegisterState::new(entry_point);
+        let (mut memw_ops, load_ops, mut lt_ops, mut bitwise_ops) =
             collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
+
+        // Collect HALT register finalization MEMW ops (must come after CPU ops)
+        memw_ops.extend(collect_halt_memw_ops(&mut register_state));
 
         // Collect MUL operations from CPU ops where op_mul = true
         let mut mul_ops: Vec<(MulOperation, bool)> = cpu_ops
@@ -1587,7 +1676,8 @@ impl Traces {
 
         // Generate REGISTER table from final register state
         let register_final_state = register_state.to_final_state_map();
-        let register_trace = register::generate_register_trace(&register_final_state);
+        let register_trace =
+            register::generate_register_trace(&register_final_state, entry_point);
 
         Ok(Traces {
             cpus,
@@ -1631,10 +1721,11 @@ impl Traces {
     pub fn from_logs_trimmed(
         logs: &[Log],
         instructions: U64HashMap<Instruction>,
+        entry_point: u64,
         max_rows: &super::MaxRowsConfig,
     ) -> Result<Self, Error> {
         // Generate full traces (including full 2^20 bitwise table with multiplicities)
-        let mut traces = Self::from_logs(logs, instructions, max_rows)?;
+        let mut traces = Self::from_logs(logs, instructions, entry_point, max_rows)?;
 
         // Trim the bitwise table to only rows with non-zero multiplicities
         traces.bitwise = bitwise::trim_zero_rows(traces.bitwise);
@@ -1649,8 +1740,9 @@ impl Traces {
     pub fn from_logs_minimal(
         logs: &[Log],
         instructions: U64HashMap<Instruction>,
+        entry_point: u64,
         max_rows: &super::MaxRowsConfig,
     ) -> Result<Self, Error> {
-        Self::from_logs_trimmed(logs, instructions, max_rows)
+        Self::from_logs_trimmed(logs, instructions, entry_point, max_rows)
     }
 }

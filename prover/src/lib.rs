@@ -248,6 +248,7 @@ impl VmAirs {
         minimal_bitwise: bool,
         page_configs: &[crate::tables::page::PageConfig],
         table_counts: &TableCounts,
+        entry_point: u64,
     ) -> Self {
         let cpus: Vec<_> = (0..table_counts.cpu)
             .map(|i| create_cpu_air(proof_options).with_name(&format!("CPU[{}]", i)))
@@ -285,7 +286,7 @@ impl VmAirs {
             .collect();
         let halt = create_halt_air(proof_options);
         let register = create_register_air(proof_options).with_preprocessed(
-            register::preprocessed_commitment(proof_options),
+            register::preprocessed_commitment(proof_options, entry_point),
             register::NUM_PREPROCESSED_COLS,
         );
         let pages: Vec<_> = page_configs
@@ -349,6 +350,7 @@ pub fn prove_with_options(
         false,
         &traces.page_configs,
         &table_counts,
+        program.entry_point,
     );
 
     let runtime_page_ranges = traces.runtime_page_ranges();
@@ -402,6 +404,7 @@ pub fn verify_with_options(
         false,
         &page_configs,
         &vm_proof.table_counts,
+        program.entry_point,
     );
 
     Ok(Verifier::multi_verify(

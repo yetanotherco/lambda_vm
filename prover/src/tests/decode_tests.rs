@@ -918,7 +918,7 @@ fn test_decode_soundness_different_elf_rejected() {
     let result_a = executor_a.run().expect("Failed to run program A");
 
     let mut traces =
-        Traces::from_logs_minimal(&result_a.logs, result_a.instructions, &Default::default())
+        Traces::from_logs_minimal(&result_a.logs, result_a.instructions, elf_a.entry_point, &Default::default())
             .unwrap();
 
     // Prover builds AIRs with commitment from ELF A
@@ -1040,6 +1040,7 @@ fn test_decode_soundness_same_elf_accepted() {
         false,
         &traces.page_configs,
         &table_counts,
+        prover_elf.entry_point,
     );
 
     let proof = Prover::multi_prove(
@@ -1057,6 +1058,7 @@ fn test_decode_soundness_same_elf_accepted() {
         false,
         &traces.page_configs,
         &table_counts,
+        verifier_elf.entry_point,
     );
 
     let result = Verifier::multi_verify(

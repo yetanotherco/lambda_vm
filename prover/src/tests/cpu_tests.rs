@@ -355,17 +355,18 @@ fn test_column_arrays() {
 // ELF execution helpers and from_log tests
 // =============================================================================
 
-/// Helper to run an ELF and return the logs and instructions
-fn run_elf(path: &str) -> (Vec<executor::vm::logs::Log>, U64HashMap<Instruction>) {
+/// Helper to run an ELF and return the logs, instructions, and entry point
+fn run_elf(path: &str) -> (Vec<executor::vm::logs::Log>, U64HashMap<Instruction>, u64) {
     let elf_data = std::fs::read(path).expect("Failed to read ELF");
     let program = Elf::load(&elf_data).expect("Failed to load ELF");
+    let entry_point = program.entry_point;
     let executor = Executor::new(&program, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
-    (result.logs, result.instructions)
+    (result.logs, result.instructions, entry_point)
 }
 
 /// Helper to run an ELF from the program_artifacts directory
-fn run_asm_elf(name: &str) -> (Vec<executor::vm::logs::Log>, U64HashMap<Instruction>) {
+fn run_asm_elf(name: &str) -> (Vec<executor::vm::logs::Log>, U64HashMap<Instruction>, u64) {
     run_elf(&format!(
         "{}/executor/program_artifacts/asm/{}.elf",
         env!("CARGO_MANIFEST_DIR").replace("/prover", ""),
@@ -376,8 +377,8 @@ fn run_asm_elf(name: &str) -> (Vec<executor::vm::logs::Log>, U64HashMap<Instruct
 #[test]
 fn test_trace_from_logs_subw() {
     // subw test - 4 steps (power of 2, works without padding)
-    let (logs, instructions) = run_asm_elf("subw");
-    let traces = Traces::from_logs(&logs, instructions, &Default::default()).unwrap();
+    let (logs, instructions, entry_point) = run_asm_elf("subw");
+    let traces = Traces::from_logs(&logs, instructions, entry_point, &Default::default()).unwrap();
 
     // Should have SUB instruction with word_instr flag
     let has_sub =
