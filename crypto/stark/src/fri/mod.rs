@@ -153,7 +153,7 @@ where
     }
 
     // Extract final polynomial coefficients
-    let final_poly = extract_final_poly::<F, E>(&evals, log_final_poly_len, &current_coset_offset);
+    let final_poly = extract_final_poly::<F, E>(&evals, &current_coset_offset);
 
     // >>>> Send value: pₙ
     for coeff in &final_poly {
@@ -165,23 +165,20 @@ where
 
 /// Extract final polynomial from evaluation-form FRI residual.
 ///
-/// When `log_final_poly_len == 0`, the evaluations have been folded to a single constant.
-/// When `log_final_poly_len > 0`, there are `2^log_final_poly_len` evaluations remaining
-/// on a coset with offset `coset_offset`; recover coefficients via bit-reverse + iFFT
-/// + coset correction (divide coefficient j by offset^j).
+/// Uses all remaining evaluations to recover polynomial coefficients via
+/// bit-reverse + iFFT + coset correction (divide coefficient j by offset^j).
+/// When only 1 evaluation remains, returns it directly as a constant.
 fn extract_final_poly<F: IsFFTField + IsSubFieldOf<E>, E: IsField>(
     evals: &[FieldElement<E>],
-    log_final_poly_len: usize,
     coset_offset: &FieldElement<F>,
 ) -> Vec<FieldElement<E>>
 where
     E: Send + Sync,
 {
-    if log_final_poly_len == 0 {
+    if evals.len() <= 1 {
         vec![evals.first().unwrap_or(&FieldElement::zero()).clone()]
     } else {
-        let final_poly_len = 1usize << log_final_poly_len;
-        let mut sub_evals: Vec<_> = evals[..final_poly_len].to_vec();
+        let mut sub_evals: Vec<_> = evals.to_vec();
         in_place_bit_reverse_permute(&mut sub_evals);
         // Standard iFFT treats evaluations as being at roots of unity.
         // Since they're actually at coset points (offset * w^i), the iFFT
