@@ -1180,6 +1180,14 @@ pub trait IsStarkProver<
     {
         info!("Started proof generation...");
 
+        // Validate FRI options early to prevent panics from invalid parameters
+        for (air, _, _) in &air_trace_pairs {
+            air.context()
+                .proof_options
+                .validate()
+                .map_err(|e| ProvingError::WrongParameter(e.to_string()))?;
+        }
+
         let num_airs = air_trace_pairs.len();
 
         // Check if any AIR has an auxiliary trace

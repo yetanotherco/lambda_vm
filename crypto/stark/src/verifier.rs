@@ -400,11 +400,31 @@ pub trait IsStarkVerifier<
         domain: &VerifierDomain<Field>,
         challenges: &Challenges<FieldExtension>,
         folding_factor: usize,
+        last_layer_degree_bound: usize,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
+        // Reject proofs where the last polynomial has more coefficients than expected.
+        // The prover performs 1 + num_committed_layers * log_f total folds; any remainder
+        // folds are absorbed into the last polynomial, making it slightly larger than
+        // last_layer_degree_bound.
+        let log_f = folding_factor.trailing_zeros() as usize;
+        let number_layers = domain.root_order as usize;
+        let last_poly_log = if last_layer_degree_bound == 0 {
+            0
+        } else {
+            (last_layer_degree_bound + 1).trailing_zeros() as usize
+        };
+        let folds_to_perform = number_layers.saturating_sub(last_poly_log);
+        let non_initial_folds = folds_to_perform.saturating_sub(1);
+        let remainder = non_initial_folds % log_f;
+        let max_coeffs = 1usize << (last_poly_log + remainder);
+        if proof.fri_last_value.len() > max_coeffs {
+            return false;
+        }
+
         let (deep_poly_evaluations, deep_poly_evaluations_sym) =
             Self::reconstruct_deep_composition_poly_evaluations_for_all_queries(
                 challenges, domain, proof,
@@ -672,8 +692,10 @@ pub trait IsStarkVerifier<
             if proof.fri_last_value.len() == 1 {
                 return *p0_eval == proof.fri_last_value[0];
             }
-            let eval_point: FieldElement<FieldExtension> =
-                evaluation_point_inv.inv().unwrap().to_extension();
+            let eval_point: FieldElement<FieldExtension> = match evaluation_point_inv.inv() {
+                Ok(ep) => ep.to_extension(),
+                Err(_) => return false,
+            };
             let last_poly_eval = proof
                 .fri_last_value
                 .iter()
@@ -696,8 +718,10 @@ pub trait IsStarkVerifier<
             if proof.fri_last_value.len() == 1 {
                 return v == proof.fri_last_value[0];
             }
-            let eval_point: FieldElement<FieldExtension> =
-                eval_point_inv.inv().unwrap().to_extension();
+            let eval_point: FieldElement<FieldExtension> = match eval_point_inv.inv() {
+                Ok(ep) => ep.to_extension(),
+                Err(_) => return false,
+            };
             let last_poly_eval = proof
                 .fri_last_value
                 .iter()
@@ -706,10 +730,23 @@ pub trait IsStarkVerifier<
             return v == last_poly_eval;
         }
 
+        // Reject malformed proofs with mismatched layer counts
+        let num_roots = fri_layers_merkle_roots.len();
+        if fri_decommitment.layers_auth_paths.len() < num_roots
+            || fri_decommitment.layers_evaluations_sym.len() < num_roots
+        {
+            return false;
+        }
+
         // For each committed FRI layer
         for (layer_idx, merkle_root) in fri_layers_merkle_roots.iter().enumerate() {
             let auth_path = &fri_decommitment.layers_auth_paths[layer_idx];
             let sym_evals = &fri_decommitment.layers_evaluations_sym[layer_idx];
+
+            // Each layer should have exactly folding_factor - 1 sibling evaluations
+            if sym_evals.len() != folding_factor - 1 {
+                return false;
+            }
 
             // Verify Merkle opening for this layer
             let openings_ok = Self::verify_fri_layer_openings(
@@ -808,8 +845,10 @@ pub trait IsStarkVerifier<
         if proof.fri_last_value.len() == 1 {
             result &= v == proof.fri_last_value[0];
         } else {
-            let eval_point: FieldElement<FieldExtension> =
-                eval_point_inv.inv().unwrap().to_extension();
+            let eval_point: FieldElement<FieldExtension> = match eval_point_inv.inv() {
+                Ok(ep) => ep.to_extension(),
+                Err(_) => return false,
+            };
             let last_poly_eval = proof
                 .fri_last_value
                 .iter()
@@ -1354,7 +1393,14 @@ pub trait IsStarkVerifier<
         let timer3 = Instant::now();
 
         let folding_factor = air.context().proof_options.fri_folding_factor;
-        if !Self::step_3_verify_fri(proof, &domain, &challenges, folding_factor) {
+        let last_layer_degree_bound = air.context().proof_options.fri_last_layer_degree_bound;
+        if !Self::step_3_verify_fri(
+            proof,
+            &domain,
+            &challenges,
+            folding_factor,
+            last_layer_degree_bound,
+        ) {
             #[cfg(not(feature = "test_fiat_shamir"))]
             error!("FRI verification failed");
             return false;

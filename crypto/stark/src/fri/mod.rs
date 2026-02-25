@@ -182,6 +182,11 @@ where
 
     in_place_bit_reverse_permute(&mut evaluation);
 
+    debug_assert_eq!(
+        evaluation.len() % folding_factor,
+        0,
+        "domain_size must be divisible by folding_factor"
+    );
     let leaves: Vec<Vec<FieldElement<E>>> = evaluation
         .chunks_exact(folding_factor)
         .map(|chunk| chunk.to_vec())

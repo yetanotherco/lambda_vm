@@ -156,8 +156,8 @@ impl GoldilocksCubicProofOptions {
             fri_number_of_queries,
             coset_offset: 3,
             grinding_factor,
-            fri_last_layer_degree_bound: 0,
-            fri_folding_factor: 2,
+            fri_last_layer_degree_bound: 7,
+            fri_folding_factor: 4,
         };
         opts.validate()?;
         Ok(opts)

@@ -4,39 +4,45 @@
 //! These tests verify that non-default FRI parameters produce valid proofs
 //! that pass verification.
 
-use math::field::fields::fft_friendly::stark_252_prime_field::Stark252PrimeField;
+use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+use math::field::{
+    element::FieldElement,
+    fields::fft_friendly::{
+        extensions_goldilocks::Degree3GoldilocksExtensionField, u64_goldilocks::GoldilocksField,
+    },
+};
 
 use crate::{
-    Felt252,
     examples::simple_fibonacci::{self, FibonacciAIR, FibonacciPublicInputs},
     proof::options::ProofOptions,
     prover::{IsStarkProver, Prover},
     traits::AIR,
-    transcript::StoneProverTranscript,
     verifier::{IsStarkVerifier, Verifier},
 };
 
+type F = GoldilocksField;
+type Felt = FieldElement<GoldilocksField>;
+
 fn prove_and_verify_fib(trace_length: usize, proof_options: ProofOptions) {
-    let mut trace =
-        simple_fibonacci::fibonacci_trace([Felt252::from(1), Felt252::from(1)], trace_length);
+    let mut trace = simple_fibonacci::fibonacci_trace([Felt::from(1), Felt::from(1)], trace_length);
 
     let pub_inputs = FibonacciPublicInputs {
-        a0: Felt252::one(),
-        a1: Felt252::one(),
+        a0: Felt::one(),
+        a1: Felt::one(),
     };
 
-    let air = FibonacciAIR::<Stark252PrimeField>::new(&proof_options);
+    let air = FibonacciAIR::<F>::new(&proof_options);
 
     let proof = Prover::prove(
         &air,
         &mut trace,
         &pub_inputs,
-        &mut StoneProverTranscript::new(&[]),
+        &mut DefaultTranscript::<F>::new(&[]),
     )
     .unwrap();
 
     assert!(
-        Verifier::verify(&proof, &air, &mut StoneProverTranscript::new(&[])),
+        Verifier::verify(&proof, &air, &mut DefaultTranscript::<F>::new(&[])),
         "Verification failed with options: blowup={}, folding_factor={}, degree_bound={}, trace_len={}",
         proof_options.blowup_factor,
         proof_options.fri_folding_factor,
@@ -123,18 +129,8 @@ fn test_fri_default_options_256() {
 
 #[test_log::test]
 fn test_fri_extension_field_folding_4_degree_bound_3() {
-    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
-    use math::field::{
-        element::FieldElement,
-        fields::fft_friendly::{
-            extensions_goldilocks::Degree3GoldilocksExtensionField,
-            u64_goldilocks::GoldilocksField as GoldilocksBaseField,
-        },
-    };
-
     use crate::examples::fibonacci_multi_column::{self, FibonacciMultiColumnAIR};
 
-    type GoldilocksField = GoldilocksBaseField;
     type GoldilocksExt = Degree3GoldilocksExtensionField;
     type GoldilocksFE = FieldElement<GoldilocksField>;
 
