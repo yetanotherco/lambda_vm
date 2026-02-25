@@ -1480,12 +1480,16 @@ pub trait IsStarkProver<
         ).expect("FFT should succeed");
 
         // FRI commit phase from pre-computed evaluations (no initial FFT)
+        let log_arity = air.options().fri_log_arity as usize;
+        let log_final_poly_len = air.options().fri_log_final_poly_len as usize;
         let (fri_final_poly, fri_layers) = fri::commit_phase_from_evaluations::<Field, FieldExtension>(
             domain.root_order as usize,
             lde_evals,
             transcript,
             &coset_offset,
             domain_size,
+            log_arity,
+            log_final_poly_len,
         );
 
         // grinding: generate nonce and append it to the transcript
@@ -1501,7 +1505,7 @@ pub trait IsStarkProver<
         let number_of_queries = air.options().fri_number_of_queries;
         let iotas = Self::sample_query_indexes(number_of_queries, domain, transcript);
 
-        let query_list = fri::query_phase(&fri_layers, &iotas);
+        let query_list = fri::query_phase(&fri_layers, &iotas, log_arity);
 
         let fri_layers_merkle_roots: Vec<_> = fri_layers
             .iter()
