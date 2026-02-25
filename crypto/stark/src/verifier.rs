@@ -833,6 +833,15 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
+        if airs.len() != multi_proof.proofs.len() {
+            error!(
+                "AIR count ({}) does not match proof count ({})",
+                airs.len(),
+                multi_proof.proofs.len()
+            );
+            return false;
+        }
+
         // Check if any AIR has an auxiliary trace
         let needs_lookup_challenges = airs.iter().any(|air| air.has_aux_trace());
 

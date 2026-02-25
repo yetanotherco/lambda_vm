@@ -39,6 +39,10 @@ use stark::traits::TransitionEvaluationContext;
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 use crate::constraints::templates::{AddConstraint, AddOperand};
 
+/// Maximum number of rows per MEMW table chunk.
+/// If operations exceed this, the trace is split into multiple tables.
+pub const MAX_ROWS: usize = super::max_rows::MEMW;
+
 // =========================================================================
 // Column indices for MEMW table
 // =========================================================================
