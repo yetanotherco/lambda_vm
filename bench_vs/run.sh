@@ -156,7 +156,7 @@ for i in "${!RESULT_N[@]}"; do
 
     if $RUN_LAMBDA && $RUN_SP1; then
         if [ "$lt" != "n/a" ] && [ "$st" != "n/a" ]; then
-            RATIO=$(LC_NUMERIC=C awk "BEGIN {printf \"%.1fx\", $st / $lt}")
+            RATIO=$(LC_NUMERIC=C awk "BEGIN {printf \"%.2fx\", $st / $lt}")
             if (( $(LC_NUMERIC=C awk "BEGIN {print ($st > $lt)}") )); then
                 RATIO="${GREEN}${RATIO}${NC}"
             else
