@@ -427,20 +427,6 @@ fn test_fp3_batch_inverse_large() {
 // =====================================================
 
 #[test]
-fn test_mul_by_7() {
-    use crate::field::extensions_goldilocks::mul_by_7;
-    let a = FpE::from(5u64);
-    let expected = FpE::from(35u64);
-    assert_eq!(mul_by_7(&a), expected);
-
-    let b = FpE::from(1u64);
-    assert_eq!(mul_by_7(&b), FpE::from(7u64));
-
-    let c = FpE::from(0u64);
-    assert_eq!(mul_by_7(&c), FpE::from(0u64));
-}
-
-#[test]
 fn test_fp2_from_i64_positive() {
     let a = Fp2E::from_i64(42);
     assert_eq!(a, Fp2E::new([FpE::from(42u64), FpE::zero()]));

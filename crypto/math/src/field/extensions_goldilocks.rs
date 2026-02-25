@@ -510,7 +510,7 @@ impl HasDefaultTranscript for Degree3GoldilocksExtensionField {
 /// Multiply a field element by 7 (the quadratic non-residue).
 /// Uses 7 = 1 + 2 + 4 for efficiency (2 doubles + 2 adds, saves one double vs 8-1).
 #[inline(always)]
-pub(crate) fn mul_by_7(a: &FpE) -> FpE {
+fn mul_by_7(a: &FpE) -> FpE {
     // 7 * a = a + 2a + 4a
     let a2 = a.double();
     let a4 = a2.double();
