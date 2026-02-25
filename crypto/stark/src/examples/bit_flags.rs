@@ -8,7 +8,7 @@ use crate::{
 use math::field::{element::FieldElement, goldilocks::GoldilocksField};
 
 type StarkField = GoldilocksField;
-type Felt252 = FieldElement<GoldilocksField>;
+type Felt = FieldElement<GoldilocksField>;
 
 #[derive(Clone)]
 pub struct BitConstraint;
@@ -62,8 +62,8 @@ impl TransitionConstraint<StarkField, StarkField> for BitConstraint {
         let prefix_flag = step.get_main_evaluation_element(0, 0);
         let next_prefix_flag = step.get_main_evaluation_element(1, 0);
 
-        let two = Felt252::from(2);
-        let one = Felt252::one();
+        let two = Felt::from(2);
+        let one = Felt::one();
         let bit_flag = prefix_flag - two * next_prefix_flag;
 
         let bit_constraint = bit_flag * (bit_flag - one);
@@ -188,17 +188,17 @@ impl AIR for BitFlagsAIR {
 
 pub fn bit_prefix_flag_trace(num_steps: usize) -> TraceTable<StarkField, StarkField> {
     debug_assert!(num_steps.is_power_of_two());
-    let step: Vec<Felt252> = [
+    let step: Vec<Felt> = [
         1031u64, 515, 257, 128, 64, 32, 16, 8, 4, 2, 1, 0, 0, 0, 0, 0,
     ]
     .iter()
-    .map(|t| Felt252::from(*t))
+    .map(|t| Felt::from(*t))
     .collect();
 
-    let mut data: Vec<Felt252> = std::iter::repeat_n(step, num_steps).flatten().collect();
-    data[0] = Felt252::from(1030);
+    let mut data: Vec<Felt> = std::iter::repeat_n(step, num_steps).flatten().collect();
+    data[0] = Felt::from(1030);
 
-    let mut dummy_column = (0..16).map(Felt252::from).collect();
+    let mut dummy_column = (0..16).map(Felt::from).collect();
     dummy_column = std::iter::repeat_n(dummy_column, num_steps)
         .flatten()
         .collect();

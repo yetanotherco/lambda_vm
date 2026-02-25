@@ -422,10 +422,6 @@ fn test_fp3_batch_inverse_large() {
     }
 }
 
-// =====================================================
-// TESTS MIGRATED FROM INLINE extensions_goldilocks.rs
-// =====================================================
-
 #[test]
 fn test_fp2_from_i64_positive() {
     let a = Fp2E::from_i64(42);

@@ -15,7 +15,7 @@ use crate::{
     verifier::{IsStarkVerifier, Verifier},
 };
 
-type Felt252 = FieldElement<GoldilocksField>;
+type Felt = FieldElement<GoldilocksField>;
 
 /// Test STARK prove/verify with a single-row trace.
 /// This exercises the FRI protocol with 0 FRI layers (trace_length=1, number_layers=0).
@@ -27,8 +27,8 @@ fn test_prove_verify_single_row() {
 
     // For row 0: col0=1, col1=2, col2=3 (1+2=3)
     let pub_inputs = SimpleAdditionPublicInputs {
-        a: Felt252::from(1u64),
-        b: Felt252::from(2u64),
+        a: Felt::from(1u64),
+        b: Felt::from(2u64),
     };
 
     let air = SimpleAdditionAIR::<GoldilocksField>::new(&proof_options);
@@ -61,8 +61,8 @@ fn test_prove_verify_two_rows() {
 
     // For row 0: col0=1, col1=2, col2=3 (1+2=3)
     let pub_inputs = SimpleAdditionPublicInputs {
-        a: Felt252::from(1u64),
-        b: Felt252::from(2u64),
+        a: Felt::from(1u64),
+        b: Felt::from(2u64),
     };
 
     let air = SimpleAdditionAIR::<GoldilocksField>::new(&proof_options);
@@ -95,8 +95,8 @@ fn test_verify_fails_with_wrong_inputs() {
 
     // Correct public inputs for proving
     let correct_pub_inputs = SimpleAdditionPublicInputs {
-        a: Felt252::from(1u64),
-        b: Felt252::from(2u64),
+        a: Felt::from(1u64),
+        b: Felt::from(2u64),
     };
 
     let air = SimpleAdditionAIR::<GoldilocksField>::new(&proof_options);
@@ -111,8 +111,8 @@ fn test_verify_fails_with_wrong_inputs() {
 
     // Tamper with the proof's public inputs
     proof.public_inputs = SimpleAdditionPublicInputs {
-        a: Felt252::from(99u64), // Wrong value - doesn't match trace
-        b: Felt252::from(2u64),
+        a: Felt::from(99u64), // Wrong value - doesn't match trace
+        b: Felt::from(2u64),
     };
 
     // Verification should fail because boundary constraint col0[0]=99 doesn't match trace

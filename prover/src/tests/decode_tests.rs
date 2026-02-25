@@ -917,7 +917,9 @@ fn test_decode_soundness_different_elf_rejected() {
         executor::vm::execution::Executor::new(&elf_a, vec![]).expect("Failed to create executor");
     let result_a = executor_a.run().expect("Failed to run program A");
 
-    let mut traces = Traces::from_logs_minimal(&result_a.logs, result_a.instructions).unwrap();
+    let mut traces =
+        Traces::from_logs_minimal(&result_a.logs, result_a.instructions, &Default::default())
+            .unwrap();
 
     // Prover builds AIRs with commitment from ELF A
     let prover_cpu_air = create_cpu_air(&proof_options);
@@ -937,12 +939,12 @@ fn test_decode_soundness_different_elf_rejected() {
         _,
         _,
     )> = vec![
-        (&prover_cpu_air, &mut traces.cpu, &()),
+        (&prover_cpu_air, &mut traces.cpus[0], &()),
         (&prover_bitwise_air, &mut traces.bitwise, &()),
-        (&prover_lt_air, &mut traces.lt, &()),
-        (&prover_memw_air, &mut traces.memw, &()),
-        (&prover_load_air, &mut traces.load, &()),
-        (&prover_branch_air, &mut traces.branch, &()),
+        (&prover_lt_air, &mut traces.lts[0], &()),
+        (&prover_memw_air, &mut traces.memws[0], &()),
+        (&prover_load_air, &mut traces.loads[0], &()),
+        (&prover_branch_air, &mut traces.branches[0], &()),
         (&prover_halt_air, &mut traces.halt, &()),
         (&prover_decode_air, &mut traces.decode, &()),
     ];
@@ -1029,8 +1031,16 @@ fn test_decode_soundness_same_elf_accepted() {
         .expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
 
-    let mut traces = Traces::from_elf_and_logs(&prover_elf, &result.logs).unwrap();
-    let prover_airs = VmAirs::new(&prover_elf, &proof_options, false, &traces.page_configs);
+    let mut traces =
+        Traces::from_elf_and_logs(&prover_elf, &result.logs, &Default::default()).unwrap();
+    let table_counts = traces.table_counts();
+    let prover_airs = VmAirs::new(
+        &prover_elf,
+        &proof_options,
+        false,
+        &traces.page_configs,
+        &table_counts,
+    );
 
     let proof = Prover::multi_prove(
         prover_airs.air_trace_pairs(&mut traces),
@@ -1041,7 +1051,13 @@ fn test_decode_soundness_same_elf_accepted() {
     // =========================================================================
     // VERIFIER: Loads same ELF independently, verifies proof
     // =========================================================================
-    let verifier_airs = VmAirs::new(&verifier_elf, &proof_options, false, &traces.page_configs);
+    let verifier_airs = VmAirs::new(
+        &verifier_elf,
+        &proof_options,
+        false,
+        &traces.page_configs,
+        &table_counts,
+    );
 
     let result = Verifier::multi_verify(
         &verifier_airs.air_refs(),
