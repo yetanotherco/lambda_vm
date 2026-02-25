@@ -8,7 +8,7 @@ fn panic(_info: &PanicInfo) -> ! {
     loop {}
 }
 
-const SIZE: usize = 38;
+const SIZE: usize = 81;
 
 #[inline(never)]
 fn matrix_multiply(a: &[[u32; SIZE]; SIZE], b: &[[u32; SIZE]; SIZE], result: &mut [[u32; SIZE]; SIZE]) {

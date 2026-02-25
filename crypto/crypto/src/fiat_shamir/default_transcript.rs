@@ -16,6 +16,15 @@ pub struct DefaultTranscript<F: HasDefaultTranscript> {
     phantom: PhantomData<F>,
 }
 
+impl<F: HasDefaultTranscript> Clone for DefaultTranscript<F> {
+    fn clone(&self) -> Self {
+        Self {
+            hasher: self.hasher.clone(),
+            phantom: PhantomData,
+        }
+    }
+}
+
 impl<F> DefaultTranscript<F>
 where
     F: HasDefaultTranscript,

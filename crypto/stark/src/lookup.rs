@@ -1,9 +1,11 @@
+#[cfg(feature = "debug-checks")]
+use std::collections::HashMap;
 use std::marker::PhantomData;
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use math::field::{
     element::FieldElement,
-    traits::{IsFFTField, IsField, IsSubFieldOf},
+    traits::{IsFFTField, IsField, IsPrimeField, IsSubFieldOf},
 };
 
 use crate::{
@@ -28,6 +30,21 @@ pub const SHIFT_8: u64 = 256;
 pub const SHIFT_16: u64 = 65536;
 /// 2^32 - shift for combining words
 pub const SHIFT_32: u64 = 4294967296;
+
+/// Computes powers of alpha incrementally: [1, α, α², α³, ...]
+///
+/// This is more efficient than calling `alpha.pow(i)` for each i,
+/// as it only requires one multiplication per element instead of
+/// a full exponentiation.
+fn compute_alpha_powers<E: IsField>(alpha: &FieldElement<E>, count: usize) -> Vec<FieldElement<E>> {
+    let mut powers = Vec::with_capacity(count);
+    let mut current = FieldElement::<E>::one();
+    for _ in 0..count {
+        powers.push(current.clone());
+        current = &current * alpha;
+    }
+    powers
+}
 
 // =============================================================================
 // LogUp Challenge Indices
@@ -306,17 +323,29 @@ impl Packing {
 /// A term in a linear combination.
 ///
 /// Used to build custom linear combinations of column values and constants.
+/// Supports both positive and negative coefficients (i64) for use in
+/// Multiplicity::Linear (e.g., μ - read2 - read4 - read8).
 #[derive(Debug, Clone)]
 pub enum LinearTerm {
-    /// coefficient * column_value
+    /// coefficient * column_value (coefficient can be negative)
     Column {
-        /// The multiplier for the column value
+        /// The multiplier for the column value (signed to support subtraction)
+        coefficient: i64,
+        /// The column index to read from
+        column: usize,
+    },
+    /// coefficient * column_value (unsigned, for large field elements like inverses)
+    ///
+    /// Use this when the coefficient is a large field element (e.g., 2^-32 mod p)
+    /// that doesn't fit in i64.
+    ColumnUnsigned {
+        /// The multiplier as an unsigned value (for large field elements)
         coefficient: u64,
         /// The column index to read from
         column: usize,
     },
-    /// A constant value to add
-    Constant(u64),
+    /// A constant value to add (signed to support subtraction)
+    Constant(i64),
 }
 
 /// A value that contributes to the bus fingerprint.
@@ -349,7 +378,7 @@ impl BusValue {
     ///
     /// Example: `BusValue::constant(0x42)` for a table ID or opcode.
     pub fn constant(value: u64) -> Self {
-        BusValue::Linear(vec![LinearTerm::Constant(value)])
+        BusValue::Linear(vec![LinearTerm::Constant(value as i64)])
     }
 
     /// Creates a single column value with coefficient 1.
@@ -389,6 +418,7 @@ impl BusValue {
                 .iter()
                 .filter_map(|term| match term {
                     LinearTerm::Column { column, .. } => Some(*column),
+                    LinearTerm::ColumnUnsigned { column, .. } => Some(*column),
                     LinearTerm::Constant(_) => None,
                 })
                 .collect(),
@@ -427,6 +457,14 @@ impl BusValue {
                             let coeff = FieldElement::<E>::from(*coefficient);
                             result += get_column(*column) * coeff;
                         }
+                        LinearTerm::ColumnUnsigned {
+                            coefficient,
+                            column,
+                        } => {
+                            // Unsigned coefficient (for large field elements)
+                            let coeff = FieldElement::<E>::from(*coefficient);
+                            result += get_column(*column) * coeff;
+                        }
                         LinearTerm::Constant(value) => {
                             result += FieldElement::<E>::from(*value);
                         }
@@ -444,7 +482,7 @@ impl BusValue {
 
 /// Struct representing an AIR with Lookup. Contains own implementation of boundary constraints and auxiliary trace building
 pub struct AirWithBuses<
-    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
     E: IsField + Send + Sync,
     B: BoundaryConstraintBuilder<F, E, PI>,
     PI,
@@ -455,10 +493,16 @@ pub struct AirWithBuses<
     transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
     auxiliary_trace_build_data: AuxiliaryTraceBuildData,
     boundary_constraint_builder: PhantomData<(B, PI)>,
+    /// Commitment to precomputed columns (if this is a preprocessed table)
+    preprocessed_commitment: Option<crate::config::Commitment>,
+    /// Number of precomputed columns (columns 0..n are precomputed, rest are multiplicities)
+    num_precomputed_cols: Option<usize>,
+    /// Optional name for debug output (per-table bus sum tracking)
+    name: Option<String>,
 }
 
 impl<
-    F: IsFFTField + IsSubFieldOf<E> + Send + Sync + 'static,
+    F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync + 'static,
     E: IsField + Send + Sync + 'static,
     B: BoundaryConstraintBuilder<F, E, PI>,
     PI,
@@ -521,13 +565,51 @@ impl<
             transition_constraints,
             auxiliary_trace_build_data,
             boundary_constraint_builder: PhantomData,
+            preprocessed_commitment: None,
+            num_precomputed_cols: None,
+            name: None,
         }
+    }
+
+    /// Marks this AIR as a preprocessed table with a hardcoded commitment.
+    ///
+    /// Preprocessed tables have columns that are fully deterministic and known
+    /// to both prover and verifier (e.g., bitwise lookup tables). The verifier
+    /// uses the hardcoded commitment instead of trusting the prover.
+    ///
+    /// # Arguments
+    /// * `commitment` - The Merkle root commitment to the precomputed columns
+    /// * `num_precomputed_cols` - Number of precomputed columns (0..n are precomputed,
+    ///   remaining columns are multiplicities that vary per proof)
+    ///
+    /// # Example
+    /// ```ignore
+    /// let air = AirWithBuses::new(num_cols, aux_data, opts, 1, constraints)
+    ///     .with_preprocessed(bitwise::preprocessed_commitment(), bitwise::NUM_PRECOMPUTED_COLS);
+    /// ```
+    pub fn with_preprocessed(
+        mut self,
+        commitment: crate::config::Commitment,
+        num_precomputed_cols: usize,
+    ) -> Self {
+        self.preprocessed_commitment = Some(commitment);
+        self.num_precomputed_cols = Some(num_precomputed_cols);
+        self
+    }
+
+    /// Set a debug name for this AIR (for per-table bus sum tracking).
+    ///
+    /// When set, debug output will show bus sums prefixed with this name,
+    /// making it easy to identify which table is contributing to bus imbalances.
+    pub fn with_name(mut self, name: &str) -> Self {
+        self.name = Some(name.to_string());
+        self
     }
 }
 
 impl<F, E, B, PI> crate::traits::AIR for AirWithBuses<F, E, B, PI>
 where
-    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
     E: IsField + Send + Sync,
     B: BoundaryConstraintBuilder<F, E, PI>,
     PI: Send + Sync,
@@ -542,6 +624,10 @@ where
         self.step_size
     }
 
+    fn name(&self) -> &str {
+        self.name.as_deref().unwrap_or("unknown")
+    }
+
     fn new(_proof_options: &crate::proof::options::ProofOptions) -> Self
     where
         Self: Sized,
@@ -552,6 +638,10 @@ where
 
     fn trace_layout(&self) -> (usize, usize) {
         self.trace_layout
+    }
+
+    fn has_trace_interaction(&self) -> bool {
+        !self.auxiliary_trace_build_data.interactions.is_empty()
     }
 
     fn composition_poly_degree_bound(&self, trace_length: usize) -> usize {
@@ -587,24 +677,42 @@ where
 
         // Build term columns (one per interaction)
         // Each term column contains: sign * m[i] / fp[i]
+        let table_name = self.name.as_deref().unwrap_or("UNKNOWN");
         for (i, interaction) in self
             .auxiliary_trace_build_data
             .interactions
             .iter()
             .enumerate()
         {
-            build_logup_term_column(i, interaction, trace, challenges);
+            build_logup_term_column(i, interaction, trace, challenges, table_name);
         }
+
+        #[cfg(feature = "debug-checks")]
+        let (per_bus_sums, per_bus_sender_sums, per_bus_receiver_sums) =
+            compute_debug_bus_sums(&self.auxiliary_trace_build_data.interactions, trace);
 
         // Build accumulated column (sums all term columns across rows)
         let acc_col_idx = num_interactions;
         build_accumulated_column(acc_col_idx, num_interactions, trace);
 
-        // Return single BusPublicInputs for the accumulated column
+        // Collect term column values at row 0 (public inputs for row-0 boundary constraints)
+        let initial_terms: Vec<FieldElement<E>> = (0..num_interactions)
+            .map(|i| trace.get_aux(0, i).clone())
+            .collect();
+
+        // Return BusPublicInputs with initial terms and accumulated column endpoints
         let last_row = trace.num_rows() - 1;
         Some(BusPublicInputs {
-            initial_value: trace.get_aux(0, acc_col_idx).clone(),
+            initial_terms,
             final_accumulated: trace.get_aux(last_row, acc_col_idx).clone(),
+            #[cfg(feature = "debug-checks")]
+            per_bus_sums,
+            #[cfg(feature = "debug-checks")]
+            per_bus_sender_sums,
+            #[cfg(feature = "debug-checks")]
+            per_bus_receiver_sums,
+            #[cfg(feature = "debug-checks")]
+            table_name: self.name.clone().unwrap_or_else(|| "UNKNOWN".to_string()),
         })
     }
 
@@ -626,23 +734,26 @@ where
     ) -> BoundaryConstraints<E> {
         let mut boundary_constraints = vec![];
 
-        // Boundary constraints for the accumulated column only
-        // (term columns are fully determined by main trace and don't need boundary constraints)
-        if let Some(acc_interaction) = bus_public_inputs {
-            // The accumulated column is at index = num_interactions
+        if let Some(bus_inputs) = bus_public_inputs {
             let acc_col_idx = self.auxiliary_trace_build_data.interactions.len();
 
-            // Constraint for row 0: accumulated column must start with initial_value
-            boundary_constraints.push(BoundaryConstraint::new_aux(
-                acc_col_idx,
-                0,
-                acc_interaction.initial_value.clone(),
-            ));
-            // Constraint for last row: accumulated column must end with final_accumulated
+            // One boundary constraint per term column at row 0: term_i(0) = initial_terms[i].
+            // This makes each term's initial value a verifier-enforced public input.
+            // The verifier rejects proofs where initial_terms.len() != num_interactions
+            // before reaching constraint evaluation, so the length of initial_terms is guaranteed to be correct.
+            for (i, expected) in bus_inputs.initial_terms.iter().enumerate() {
+                boundary_constraints.push(BoundaryConstraint::new_aux(i, 0, expected.clone()));
+            }
+
+            // Boundary constraint for the accumulated column at row 0: acc(0) = Σ initial_terms.
+            let initial_acc: FieldElement<E> = bus_inputs.initial_terms.iter().cloned().sum();
+            boundary_constraints.push(BoundaryConstraint::new_aux(acc_col_idx, 0, initial_acc));
+
+            // Boundary constraint for the accumulated column at last row.
             boundary_constraints.push(BoundaryConstraint::new_aux(
                 acc_col_idx,
                 trace_length - 1,
-                acc_interaction.final_accumulated.clone(),
+                bus_inputs.final_accumulated.clone(),
             ));
         }
 
@@ -650,6 +761,18 @@ where
         boundary_constraints.extend(B::boundary_constraints(pub_inputs, rap_challenges));
 
         BoundaryConstraints::from_constraints(boundary_constraints)
+    }
+
+    fn is_preprocessed(&self) -> bool {
+        self.preprocessed_commitment.is_some()
+    }
+
+    fn num_precomputed_columns(&self) -> usize {
+        self.num_precomputed_cols.unwrap_or(0)
+    }
+
+    fn precomputed_commitment(&self) -> crate::config::Commitment {
+        self.preprocessed_commitment.unwrap_or([0u8; 32])
     }
 }
 
@@ -684,6 +807,19 @@ pub enum Multiplicity {
     /// The column must contain only 0 or 1.
     /// Useful for "all rows except those marked by this flag".
     Negated(usize),
+
+    /// Arbitrary linear combination of columns and constants.
+    /// Supports signed coefficients for subtraction.
+    /// Example: `μ - read2 - read4 - read8` can be expressed as:
+    /// ```ignore
+    /// Multiplicity::Linear(vec![
+    ///     LinearTerm::Column { coefficient: 1, column: cols::MU },
+    ///     LinearTerm::Column { coefficient: -1, column: cols::READ2 },
+    ///     LinearTerm::Column { coefficient: -1, column: cols::READ4 },
+    ///     LinearTerm::Column { coefficient: -1, column: cols::READ8 },
+    /// ])
+    /// ```
+    Linear(Vec<LinearTerm>),
 }
 
 /// Struct representing a lookup interaction for a given table.
@@ -792,10 +928,23 @@ pub struct BusPublicInputs<E>
 where
     E: IsField,
 {
-    /// Accumulated column value at row 0
-    pub initial_value: FieldElement<E>,
+    /// Term column values at row 0 (one per interaction).
+    /// Used for boundary constraints that enforce term_i(0) = initial_terms[i].
+    pub initial_terms: Vec<FieldElement<E>>,
     /// Accumulated column value at last row (total sum of all terms)
     pub final_accumulated: FieldElement<E>,
+    /// Per-bus sums for this table (bus_id → sum) - for debug aggregation
+    #[cfg(feature = "debug-checks")]
+    pub per_bus_sums: HashMap<u64, FieldElement<E>>,
+    /// Per-bus sender sums (bus_id → sum) - positive contributions
+    #[cfg(feature = "debug-checks")]
+    pub per_bus_sender_sums: HashMap<u64, FieldElement<E>>,
+    /// Per-bus receiver sums (bus_id → sum) - absolute value (before negation)
+    #[cfg(feature = "debug-checks")]
+    pub per_bus_receiver_sums: HashMap<u64, FieldElement<E>>,
+    /// Table name for debug output
+    #[cfg(feature = "debug-checks")]
+    pub table_name: String,
 }
 
 /// Trait representing boundary constraint building behaviour.
@@ -839,20 +988,76 @@ fn build_logup_term_column<F, E>(
     table_interaction: &BusInteraction,
     trace: &mut TraceTable<F, E>,
     challenges: &[FieldElement<E>],
+    #[cfg_attr(not(feature = "debug-checks"), allow(unused))] table_name: &str,
 ) where
-    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
     E: IsField + Send + Sync,
 {
     let main_segment_cols = trace.columns_main();
     let trace_len = trace.num_rows();
 
+    // Handle multiplicity column(s)
+    let multiplicities_owned: Vec<FieldElement<F>>;
+    let multiplicities: &[FieldElement<F>] = match table_interaction.multiplicity {
+        Multiplicity::One => {
+            multiplicities_owned = vec![FieldElement::one(); trace_len];
+            &multiplicities_owned
+        }
+        Multiplicity::Column(col) => &main_segment_cols[col],
+        Multiplicity::Sum(col_a, col_b) => {
+            multiplicities_owned = main_segment_cols[col_a]
+                .iter()
+                .zip(main_segment_cols[col_b].iter())
+                .map(|(a, b)| a + b)
+                .collect();
+            &multiplicities_owned
+        }
+        Multiplicity::Negated(col) => {
+            multiplicities_owned = main_segment_cols[col]
+                .iter()
+                .map(|elem| FieldElement::<F>::one() - elem)
+                .collect();
+            &multiplicities_owned
+        }
+        Multiplicity::Linear(ref terms) => {
+            multiplicities_owned = (0..trace_len)
+                .map(|row| {
+                    let mut result = FieldElement::<F>::zero();
+                    for term in terms {
+                        match *term {
+                            LinearTerm::Column {
+                                coefficient,
+                                column,
+                            } => {
+                                let coeff = FieldElement::<F>::from(coefficient);
+                                result += &main_segment_cols[column][row] * coeff;
+                            }
+                            LinearTerm::ColumnUnsigned {
+                                coefficient,
+                                column,
+                            } => {
+                                let coeff = FieldElement::<F>::from(coefficient);
+                                result += &main_segment_cols[column][row] * coeff;
+                            }
+                            LinearTerm::Constant(value) => {
+                                result += FieldElement::<F>::from(value);
+                            }
+                        }
+                    }
+                    result
+                })
+                .collect();
+            &multiplicities_owned
+        }
+    };
+
     // LogUp challenges (must be shared across all tables for bus to balance)
     let z = &challenges[LOGUP_CHALLENGE_Z];
     let alpha = &challenges[LOGUP_CHALLENGE_ALPHA];
 
-    // Precompute powers of alpha for all bus elements
+    // Precompute powers of alpha for all bus elements (using incremental multiplication)
     let num_bus_elements = table_interaction.num_bus_elements();
-    let alpha_powers: Vec<FieldElement<E>> = (0..num_bus_elements).map(|i| alpha.pow(i)).collect();
+    let alpha_powers = compute_alpha_powers(alpha, num_bus_elements);
 
     // Sign: +1 for senders, -1 for receivers
     // This bakes the sign into the term so the accumulated column can just sum everything
@@ -862,17 +1067,16 @@ fn build_logup_term_column<F, E>(
         -FieldElement::<E>::one()
     };
 
-    for row in 0..trace_len {
-        // Compute multiplicity based on the Multiplicity variant
-        let multiplicity: FieldElement<F> = match &table_interaction.multiplicity {
-            Multiplicity::One => FieldElement::<F>::one(),
-            Multiplicity::Column(col) => main_segment_cols[*col][row].clone(),
-            Multiplicity::Sum(col_a, col_b) => {
-                &main_segment_cols[*col_a][row] + &main_segment_cols[*col_b][row]
-            }
-            Multiplicity::Negated(col) => FieldElement::<F>::one() - &main_segment_cols[*col][row],
-        };
+    // =========================================================================
+    // OPTIMIZATION: Batch inversion
+    // Instead of inverting each fingerprint individually (O(n) inversions),
+    // we collect all fingerprints first and batch invert them (O(1) inversion + O(n) multiplications).
+    // This is significantly faster for large traces.
+    // =========================================================================
 
+    // Step 1: Compute all fingerprints
+    let mut fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(trace_len);
+    for row in 0..trace_len {
         // Bus elements: [bus_id, ...values...]
         // bus_id is first element to distinguish different buses
         let mut bus_elements: Vec<FieldElement<E>> =
@@ -895,14 +1099,31 @@ fn build_logup_term_column<F, E>(
             .map(|(v, coeff)| v * coeff)
             .sum();
 
-        let fingerprint = z - &linear_combination;
+        fingerprints.push(z - &linear_combination);
 
-        // term = sign * multiplicity / fingerprint
-        let term = multiplicity
-            * &sign
-            * fingerprint
-                .inv()
-                .expect("fingerprint is zero - probability of sampling zero is negligible");
+        #[cfg(feature = "debug-checks")]
+        crate::bus_debug::log_interaction(
+            table_name,
+            row,
+            table_interaction.bus_id,
+            table_interaction.is_sender,
+            &multiplicities[row].canonical(),
+            &bus_elements,
+            fingerprints.last().unwrap(),
+        );
+    }
+
+    // Step 2: Batch invert all fingerprints
+    // This uses Montgomery's trick: compute product prefix, invert once, then multiply back
+    FieldElement::inplace_batch_inverse(&mut fingerprints)
+        .expect("fingerprint is zero - probability of sampling zero is negligible");
+
+    // Step 3: Compute terms using the inverted fingerprints
+    for (row, (multiplicity, fingerprint_inv)) in
+        multiplicities.iter().zip(fingerprints.iter()).enumerate()
+    {
+        // term = sign * multiplicity * fingerprint^(-1)
+        let term = multiplicity * &sign * fingerprint_inv;
         trace.set_aux(row, aux_column_idx, term);
     }
 }
@@ -932,6 +1153,48 @@ fn build_accumulated_column<F, E>(
         accumulated += row_sum;
         trace.set_aux(row, acc_column_idx, accumulated.clone());
     }
+}
+
+/// Sum aux term columns by bus_id to produce per-bus totals for the debug report.
+#[cfg(feature = "debug-checks")]
+#[allow(clippy::type_complexity)]
+fn compute_debug_bus_sums<F, E>(
+    interactions: &[BusInteraction],
+    trace: &TraceTable<F, E>,
+) -> (
+    HashMap<u64, FieldElement<E>>,
+    HashMap<u64, FieldElement<E>>,
+    HashMap<u64, FieldElement<E>>,
+)
+where
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
+    E: IsField + Send + Sync,
+{
+    let mut bus_sums: HashMap<u64, FieldElement<E>> = HashMap::new();
+    let mut sender_sums: HashMap<u64, FieldElement<E>> = HashMap::new();
+    let mut receiver_sums: HashMap<u64, FieldElement<E>> = HashMap::new();
+
+    for (i, interaction) in interactions.iter().enumerate() {
+        let mut col_sum = FieldElement::<E>::zero();
+        for row in 0..trace.num_rows() {
+            col_sum = col_sum + trace.get_aux(row, i);
+        }
+        *bus_sums
+            .entry(interaction.bus_id)
+            .or_insert(FieldElement::zero()) += col_sum.clone();
+
+        if interaction.is_sender {
+            *sender_sums
+                .entry(interaction.bus_id)
+                .or_insert(FieldElement::zero()) += col_sum;
+        } else {
+            let entry = receiver_sums
+                .entry(interaction.bus_id)
+                .or_insert(FieldElement::zero());
+            *entry = entry.clone() - col_sum;
+        }
+    }
+    (bus_sums, sender_sums, receiver_sums)
 }
 
 /// Constraint for each term column.
@@ -1007,6 +1270,31 @@ where
                 Multiplicity::Negated(col) => {
                     FieldElement::<A>::one() - step.get_main_evaluation_element(0, *col)
                 }
+                Multiplicity::Linear(terms) => {
+                    let mut result = FieldElement::<A>::zero();
+                    for term in terms {
+                        match term {
+                            LinearTerm::Column {
+                                coefficient,
+                                column,
+                            } => {
+                                let coeff = FieldElement::<A>::from(*coefficient);
+                                result += step.get_main_evaluation_element(0, *column) * coeff;
+                            }
+                            LinearTerm::ColumnUnsigned {
+                                coefficient,
+                                column,
+                            } => {
+                                let coeff = FieldElement::<A>::from(*coefficient);
+                                result += step.get_main_evaluation_element(0, *column) * coeff;
+                            }
+                            LinearTerm::Constant(value) => {
+                                result += FieldElement::<A>::from(*value);
+                            }
+                        }
+                    }
+                    result
+                }
             };
 
             // Bus elements: [bus_id, ...values...]
@@ -1024,9 +1312,8 @@ where
                 combined.into_iter().map(|v| v.to_extension())
             }));
 
-            // Coefficients for each bus element (including bus_id)
-            let coeffs: Vec<FieldElement<B>> =
-                (0..bus_elements.len()).map(|i| alpha.pow(i)).collect();
+            // Coefficients for each bus element (including bus_id) (using incremental multiplication)
+            let coeffs = compute_alpha_powers(alpha, bus_elements.len());
 
             // fingerprint = z - (bus_id + v[0]*α + v[1]*α² + ... + v[n]*α^(n+1))
             let fingerprint: FieldElement<B> = (-bus_elements

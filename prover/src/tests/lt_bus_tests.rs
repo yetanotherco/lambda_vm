@@ -21,8 +21,8 @@ use stark::trace::TraceTable;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
-use crate::tables64::lt::{LtOperation, cols, generate_lt_trace};
-use crate::tables64::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use crate::tables::lt::{LtOperation, cols, generate_lt_trace};
+use crate::tables::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 
 type F = GoldilocksField;
 type E = GoldilocksExtension;
@@ -387,8 +387,8 @@ fn prove_and_verify_custom(ops: &[LtOperation], receiver_rows: &[CustomLtRow]) -
 fn test_padding_single_row() {
     let ops = vec![LtOperation::new(1, 2, UNSIGNED)];
     let trace = generate_lt_trace(&ops);
-    // 1 row -> pads to 2
-    assert_eq!(trace.main_table.height, 2);
+    // 1 row -> pads to 4 (minimum for FRI)
+    assert_eq!(trace.main_table.height, 4);
 }
 
 #[test]
@@ -443,9 +443,9 @@ fn test_border_zero_values() {
         LtOperation::new(1, 0, UNSIGNED), // 1 < 0 = false
     ];
 
-    assert!(ops[0].compute_lt() == false);
-    assert!(ops[1].compute_lt() == true);
-    assert!(ops[2].compute_lt() == false);
+    assert!(!ops[0].compute_lt());
+    assert!(ops[1].compute_lt());
+    assert!(!ops[2].compute_lt());
 
     assert!(prove_and_verify(&ops));
 }
@@ -461,11 +461,11 @@ fn test_border_max_unsigned() {
         LtOperation::new(0, max, UNSIGNED),       // 0 < MAX = true (unsigned)
     ];
 
-    assert!(ops[0].compute_lt() == false);
-    assert!(ops[1].compute_lt() == true);
-    assert!(ops[2].compute_lt() == false);
-    assert!(ops[3].compute_lt() == false);
-    assert!(ops[4].compute_lt() == true);
+    assert!(!ops[0].compute_lt());
+    assert!(ops[1].compute_lt());
+    assert!(!ops[2].compute_lt());
+    assert!(!ops[3].compute_lt());
+    assert!(ops[4].compute_lt());
 
     assert!(prove_and_verify(&ops));
 }
@@ -484,12 +484,12 @@ fn test_border_signed_boundaries() {
         LtOperation::new(0, (-1i64) as u64, SIGNED),      // 0 < -1 = false
     ];
 
-    assert!(ops[0].compute_lt() == true);
-    assert!(ops[1].compute_lt() == false);
-    assert!(ops[2].compute_lt() == false);
-    assert!(ops[3].compute_lt() == false);
-    assert!(ops[4].compute_lt() == true);
-    assert!(ops[5].compute_lt() == false);
+    assert!(ops[0].compute_lt());
+    assert!(!ops[1].compute_lt());
+    assert!(!ops[2].compute_lt());
+    assert!(!ops[3].compute_lt());
+    assert!(ops[4].compute_lt());
+    assert!(!ops[5].compute_lt());
 
     assert!(prove_and_verify(&ops));
 }
@@ -504,9 +504,9 @@ fn test_border_32bit_boundary() {
         LtOperation::new(boundary, boundary, UNSIGNED),     // 2^32 < 2^32 = false
     ];
 
-    assert!(ops[0].compute_lt() == true);
-    assert!(ops[1].compute_lt() == false);
-    assert!(ops[2].compute_lt() == false);
+    assert!(ops[0].compute_lt());
+    assert!(!ops[1].compute_lt());
+    assert!(!ops[2].compute_lt());
 
     assert!(prove_and_verify(&ops));
 }

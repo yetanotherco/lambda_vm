@@ -51,6 +51,17 @@ where
         }
 
         let hashed_leaves: Vec<B::Node> = B::hash_leaves(unhashed_leaves);
+        Self::build_from_hashed_leaves(hashed_leaves)
+    }
+
+    /// Create a Merkle tree from pre-hashed leaf nodes.
+    ///
+    /// This skips the `hash_leaves` step, useful when leaves have already been
+    /// hashed externally (e.g., to avoid materializing large intermediate data).
+    pub fn build_from_hashed_leaves(hashed_leaves: Vec<B::Node>) -> Option<Self> {
+        if hashed_leaves.is_empty() {
+            return None;
+        }
 
         //The leaf must be a power of 2 set
         let hashed_leaves = complete_until_power_of_two(hashed_leaves);
@@ -89,7 +100,9 @@ where
 
     /// Returns the Merkle path for the element/s for the leaf at position pos
     fn build_merkle_path(&self, pos: usize) -> Result<Vec<B::Node>, Error> {
-        let mut merkle_path = Vec::new();
+        // Pre-allocate based on tree depth (log2 of tree size)
+        let tree_depth = (self.nodes.len() + 1).ilog2() as usize;
+        let mut merkle_path = Vec::with_capacity(tree_depth);
         let mut pos = pos;
 
         while pos != ROOT {
