@@ -769,7 +769,7 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let (aux, aux_evaluations, bus_public_inputs) = if air.has_trace_interaction() {
+        let (aux, aux_evaluations, bus_public_inputs) = if air.has_aux_trace() {
             let bus_public_inputs = air.build_auxiliary_trace(trace, &rap_challenges);
             let Some((aux_trace_polys_evaluations, aux_merkle_tree, aux_merkle_root)) =
                 Self::interpolate_and_commit_aux(trace, domain, transcript)
@@ -968,11 +968,11 @@ pub trait IsStarkProver<
         };
 
         // Recompute aux LDE into pool buffers, use stored aux Merkle tree
-        let (aux, num_aux_cols) = if air.has_trace_interaction() {
+        let (aux, num_aux_cols) = if air.has_aux_trace() {
             let n_aux = trace.num_aux_columns;
             trace.extract_columns_aux_into(aux_pool);
             Self::expand_pool_to_lde::<FieldExtension>(aux_pool, n_aux, domain, twiddles);
-            // Safe: has_trace_interaction() is true only when Phase C stored aux tree/root
+            // Safe: has_aux_trace() is true only when Phase C stored aux tree/root
             let aux_commitment = Round1CommitmentData::<FieldExtension> {
                 lde_trace_merkle_tree: Rc::clone(
                     metadata.aux_merkle_tree.as_ref()
@@ -1792,7 +1792,7 @@ pub trait IsStarkProver<
     /// The transcript must be safely initialized before passing it to this method.
     fn multi_prove(
         mut air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
-        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
     ) -> Result<MultiProof<Field, FieldExtension, PI>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
@@ -1803,10 +1803,10 @@ pub trait IsStarkProver<
 
         let num_airs = air_trace_pairs.len();
 
-        // Check if any AIR uses LogUp (has auxiliary trace for running sums)
-        let needs_logup_challenges = air_trace_pairs
+        // Check if any AIR has an auxiliary trace
+        let needs_lookup_challenges = air_trace_pairs
             .iter()
-            .any(|(air, _, _)| air.has_trace_interaction());
+            .any(|(air, _, _)| air.has_aux_trace());
 
         // =====================================================================
         // Pre-pass: compute domains, twiddles, and max dimensions for pool allocation
@@ -1887,7 +1887,7 @@ pub trait IsStarkProver<
         // Round 1, Phase B: Sample shared LogUp challenges
         // =====================================================================
 
-        let logup_challenges: Vec<FieldElement<FieldExtension>> = if needs_logup_challenges {
+        let lookup_challenges: Vec<FieldElement<FieldExtension>> = if needs_lookup_challenges {
             (0..LOGUP_NUM_CHALLENGES)
                 .map(|_| transcript.sample_field_element())
                 .collect()
@@ -1896,11 +1896,15 @@ pub trait IsStarkProver<
         };
 
         // =====================================================================
-        // Round 1, Phase C: Build and commit auxiliary traces
+        // Phase C + Rounds 2-4: Forked per table
         // =====================================================================
+        // Each table gets an independent transcript fork (cloned from the shared
+        // state after Phase B, domain-separated by table index). This matches
+        // the verifier's forking and makes per-table proving independent.
+        //
         // Split into two passes for parallelism:
         //   Pass 1 (parallel): Build all auxiliary traces (fingerprint + batch inversion)
-        //   Pass 2 (sequential): Extract → LDE → commit → transcript append (shared pool)
+        //   Pass 2 (sequential): Fork transcript → extract → LDE → commit (shared pool)
 
         // Pass 1: Build aux traces in parallel.
         // Each build_auxiliary_trace has internal parallelism (batch_inverse, par_chunks),
@@ -1909,8 +1913,8 @@ pub trait IsStarkProver<
         let bus_inputs_vec: Vec<Option<BusPublicInputs<FieldExtension>>> = air_trace_pairs
             .par_iter_mut()
             .map(|(air, trace, _)| {
-                if air.has_trace_interaction() {
-                    air.build_auxiliary_trace(*trace, &logup_challenges)
+                if air.has_aux_trace() {
+                    air.build_auxiliary_trace(*trace, &lookup_challenges)
                 } else {
                     None
                 }
@@ -1920,25 +1924,33 @@ pub trait IsStarkProver<
         let bus_inputs_vec: Vec<Option<BusPublicInputs<FieldExtension>>> = air_trace_pairs
             .iter_mut()
             .map(|(air, trace, _)| {
-                if air.has_trace_interaction() {
-                    air.build_auxiliary_trace(*trace, &logup_challenges)
+                if air.has_aux_trace() {
+                    air.build_auxiliary_trace(*trace, &lookup_challenges)
                 } else {
                     None
                 }
             })
             .collect();
 
-        // Pass 2: Sequential extract → LDE → commit → transcript append.
-        // Uses shared aux_pool. Transcript ordering is preserved.
+        // Pass 2: Sequential fork transcript → extract → LDE → commit.
+        // Uses shared aux_pool. Each table gets its own transcript fork.
         let mut metadatas: Vec<Round1Metadata<Field, FieldExtension>> = Vec::with_capacity(num_airs);
-        for ((((air, trace, _pub_inputs), bus_public_inputs), main_commit), (domain, twiddles))
+        let mut table_transcripts = Vec::with_capacity(num_airs);
+        for (idx, ((((air, trace, _pub_inputs), bus_public_inputs), main_commit), (domain, twiddles)))
             in air_trace_pairs
                 .iter()
                 .zip(bus_inputs_vec.into_iter())
                 .zip(main_commits.into_iter())
                 .zip(domains.iter().zip(twiddle_caches.iter()))
+                .enumerate()
         {
-            let (aux_tree, aux_root) = if air.has_trace_interaction() {
+            // Fork transcript with domain separator (must match verifier)
+            let mut table_transcript = transcript.clone();
+            if num_airs > 1 {
+                table_transcript.append_bytes(&(idx as u64).to_le_bytes());
+            }
+
+            let (aux_tree, aux_root) = if air.has_aux_trace() {
                 let num_aux_cols = trace.num_aux_columns;
                 trace.extract_columns_aux_into(&mut aux_pool);
                 Self::expand_pool_to_lde::<FieldExtension>(
@@ -1952,7 +1964,7 @@ pub trait IsStarkProver<
                     Self::commit_columns_bit_reversed(&aux_pool[..num_aux_cols])
                         .ok_or(ProvingError::EmptyCommitment)?;
 
-                transcript.append_bytes(&root);
+                table_transcript.append_bytes(&root);
                 (Some(Rc::new(tree)), Some(root))
             } else {
                 (None, None)
@@ -1966,9 +1978,10 @@ pub trait IsStarkProver<
                 num_precomputed_cols: main_commit.num_precomputed_cols,
                 aux_merkle_tree: aux_tree,
                 aux_merkle_root: aux_root,
-                rap_challenges: logup_challenges.clone(),
+                rap_challenges: lookup_challenges.clone(),
                 bus_public_inputs,
             });
+            table_transcripts.push(table_transcript);
         }
 
         #[cfg(feature = "debug-checks")]
@@ -1980,12 +1993,11 @@ pub trait IsStarkProver<
                 .zip(metadatas.iter())
                 .zip(domains.iter().zip(twiddle_caches.iter()))
             {
-                temp_results.push(
-                    Self::reconstruct_round1(
-                        *air, *trace, domain, metadata, twiddles,
-                        &mut main_pool, &mut aux_pool,
-                    ).unwrap()
-                );
+                let result = Self::reconstruct_round1(
+                    *air, *trace, domain, metadata, twiddles,
+                    &mut main_pool, &mut aux_pool,
+                ).expect("reconstruct_round1 failed in debug-checks");
+                temp_results.push(result);
             }
 
             print_bus_balance_report(&temp_results);
@@ -2006,17 +2018,18 @@ pub trait IsStarkProver<
         }
 
         // =====================================================================
-        // Rounds 2-4: Sequential per-table proving
+        // Rounds 2-4: Sequential per-table proving with forked transcripts
         // =====================================================================
         // For each table, recompute LDE into pool buffers, reuse stored Merkle trees,
-        // run rounds 2-4, then drop table data. Pool buffers retain capacity.
+        // run rounds 2-4 with the table's forked transcript, then drop table data.
 
         let mut proofs = Vec::with_capacity(num_airs);
-        for ((((air, trace, pub_inputs), metadata), domain), twiddles) in air_trace_pairs
+        for (((((air, trace, pub_inputs), metadata), domain), twiddles), table_transcript) in air_trace_pairs
             .iter()
             .zip(metadatas.iter())
             .zip(domains.iter())
             .zip(twiddle_caches.iter())
+            .zip(table_transcripts.iter_mut())
         {
             // Recompute LDE evaluations into pool, reuse stored Merkle trees
             let round_1_result = Self::reconstruct_round1(
@@ -2025,7 +2038,7 @@ pub trait IsStarkProver<
             )?;
 
             let proof =
-                Self::prove_rounds_2_to_4(*air, *pub_inputs, &round_1_result, transcript, domain)?;
+                Self::prove_rounds_2_to_4(*air, *pub_inputs, &round_1_result, table_transcript, domain)?;
             proofs.push(proof);
 
             // Return column Vecs to pool (zero-copy move back). Pool slots that were
@@ -2048,7 +2061,7 @@ pub trait IsStarkProver<
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         trace: &mut TraceTable<Field, FieldExtension>,
         pub_inputs: &PI,
-        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
     ) -> Result<StarkProof<Field, FieldExtension, PI>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
@@ -2247,19 +2260,14 @@ pub trait IsStarkProver<
 /// Uses numeric bus IDs only (no VM-specific names) to keep the stark crate generic.
 /// For bus ID → name mapping, see `BusId` in the prover crate.
 #[cfg(feature = "debug-checks")]
-fn print_bus_balance_report<Field, FieldExtension>(
-    round_1_results: &[Round1<Field, FieldExtension>],
+fn print_bus_balance_report<FieldExtension>(
+    all_bus_public_inputs: &[Option<BusPublicInputs<FieldExtension>>],
 ) where
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField,
     FieldExtension: IsField,
-    FieldElement<Field>: AsBytes,
-    FieldElement<FieldExtension>: AsBytes,
 {
     use std::collections::HashMap;
 
-    let has_logup = round_1_results
-        .iter()
-        .any(|r| r.bus_public_inputs.is_some());
+    let has_logup = all_bus_public_inputs.iter().any(|r| r.is_some());
     if !has_logup {
         return;
     }
@@ -2271,31 +2279,29 @@ fn print_bus_balance_report<Field, FieldExtension>(
     let mut global_sender_sums: HashMap<u64, FieldElement<FieldExtension>> = HashMap::new();
     let mut global_receiver_sums: HashMap<u64, FieldElement<FieldExtension>> = HashMap::new();
 
-    for round_1_result in round_1_results {
-        if let Some(bus_inputs) = &round_1_result.bus_public_inputs {
-            for (&bus_id, sum) in &bus_inputs.per_bus_sums {
-                *global_bus_sums
-                    .entry(bus_id)
-                    .or_insert(FieldElement::zero()) += sum.clone();
-            }
-            for (&bus_id, sum) in &bus_inputs.per_bus_sender_sums {
-                *global_sender_sums
-                    .entry(bus_id)
-                    .or_insert(FieldElement::zero()) += sum.clone();
-                bus_senders
-                    .entry(bus_id)
-                    .or_default()
-                    .push((bus_inputs.table_name.clone(), sum.clone()));
-            }
-            for (&bus_id, sum) in &bus_inputs.per_bus_receiver_sums {
-                *global_receiver_sums
-                    .entry(bus_id)
-                    .or_insert(FieldElement::zero()) += sum.clone();
-                bus_receivers
-                    .entry(bus_id)
-                    .or_default()
-                    .push((bus_inputs.table_name.clone(), sum.clone()));
-            }
+    for bus_inputs in all_bus_public_inputs.iter().flatten() {
+        for (&bus_id, sum) in &bus_inputs.per_bus_sums {
+            *global_bus_sums
+                .entry(bus_id)
+                .or_insert(FieldElement::zero()) += sum.clone();
+        }
+        for (&bus_id, sum) in &bus_inputs.per_bus_sender_sums {
+            *global_sender_sums
+                .entry(bus_id)
+                .or_insert(FieldElement::zero()) += sum.clone();
+            bus_senders
+                .entry(bus_id)
+                .or_default()
+                .push((bus_inputs.table_name.clone(), sum.clone()));
+        }
+        for (&bus_id, sum) in &bus_inputs.per_bus_receiver_sums {
+            *global_receiver_sums
+                .entry(bus_id)
+                .or_insert(FieldElement::zero()) += sum.clone();
+            bus_receivers
+                .entry(bus_id)
+                .or_default()
+                .push((bus_inputs.table_name.clone(), sum.clone()));
         }
     }
 
@@ -2360,39 +2366,25 @@ fn print_bus_balance_report<Field, FieldExtension>(
 
 #[cfg(test)]
 mod tests {
-    use crate::domain::VerifierDomain;
-    use std::num::ParseIntError;
-
-    fn decode_hex(s: &str) -> Result<Vec<u8>, ParseIntError> {
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16))
-            .collect()
-    }
-
     use crate::{
-        Felt252,
-        examples::{
-            fibonacci_2_cols_shifted::{self, Fibonacci2ColsShifted},
-            simple_fibonacci::{self},
-        },
+        examples::simple_fibonacci::{self},
         proof::options::ProofOptions,
-        transcript::StoneProverTranscript,
-        verifier::{Challenges, IsStarkVerifier, Verifier},
     };
 
     use super::*;
     use math::{
         field::{
-            element::FieldElement, fields::fft_friendly::stark_252_prime_field::Stark252PrimeField,
+            element::FieldElement, fields::fft_friendly::u64_goldilocks::GoldilocksField,
             traits::IsFFTField,
         },
         polynomial::Polynomial,
     };
 
+    type Felt = FieldElement<GoldilocksField>;
+
     #[test]
     fn test_domain_constructor() {
-        let trace = simple_fibonacci::fibonacci_trace([Felt252::from(1), Felt252::from(1)], 8);
+        let trace = simple_fibonacci::fibonacci_trace([Felt::from(1), Felt::from(1)], 8);
         let trace_length = trace.num_rows();
         let coset_offset = 3;
         let blowup_factor: usize = 2;
@@ -2414,7 +2406,7 @@ mod tests {
         assert_eq!(domain.root_order, trace_length.trailing_zeros());
         assert_eq!(domain.coset_offset, FieldElement::from(coset_offset));
 
-        let primitive_root = Stark252PrimeField::get_primitive_root_of_unity(
+        let primitive_root = GoldilocksField::get_primitive_root_of_unity(
             (trace_length * blowup_factor).trailing_zeros() as u64,
         )
         .unwrap();
@@ -2433,16 +2425,16 @@ mod tests {
 
     #[test]
     fn test_evaluate_polynomial_on_lde_domain_on_trace_polys() {
-        let trace = simple_fibonacci::fibonacci_trace([Felt252::from(1), Felt252::from(1)], 8);
+        let trace = simple_fibonacci::fibonacci_trace([Felt::from(1), Felt::from(1)], 8);
 
         let trace_length = trace.num_rows();
 
-        let trace_polys = trace.compute_trace_polys_main::<Stark252PrimeField>();
-        let coset_offset = Felt252::from(3);
+        let trace_polys = trace.compute_trace_polys_main::<GoldilocksField>();
+        let coset_offset = Felt::from(3);
         let blowup_factor: usize = 2;
         let domain_size = 8;
 
-        let primitive_root = Stark252PrimeField::get_primitive_root_of_unity(
+        let primitive_root = GoldilocksField::get_primitive_root_of_unity(
             (trace_length * blowup_factor).trailing_zeros() as u64,
         )
         .unwrap();
@@ -2463,15 +2455,15 @@ mod tests {
 
     #[test]
     fn test_evaluate_polynomial_on_lde_domain_edge_case() {
-        let poly = Polynomial::new_monomial(Felt252::one(), 8);
+        let poly = Polynomial::new_monomial(Felt::one(), 8);
         let blowup_factor: usize = 4;
         let domain_size: usize = 8;
-        let offset = Felt252::from(3);
+        let offset = Felt::from(3);
         let evaluations =
             evaluate_polynomial_on_lde_domain(&poly, blowup_factor, domain_size, &offset).unwrap();
         assert_eq!(evaluations.len(), domain_size * blowup_factor);
 
-        let primitive_root: Felt252 = Stark252PrimeField::get_primitive_root_of_unity(
+        let primitive_root: Felt = GoldilocksField::get_primitive_root_of_unity(
             (domain_size * blowup_factor).trailing_zeros() as u64,
         )
         .unwrap();
@@ -2480,526 +2472,13 @@ mod tests {
         }
     }
 
-    #[allow(clippy::type_complexity)]
-    fn proof_parts_stone_compatibility_case_1() -> (
-        StarkProof<
-            Stark252PrimeField,
-            Stark252PrimeField,
-            fibonacci_2_cols_shifted::PublicInputs<Stark252PrimeField>,
-        >,
-        Fibonacci2ColsShifted<Stark252PrimeField>,
-        ProofOptions,
-        [u8; 4],
-        usize,
-    ) {
-        let mut trace = fibonacci_2_cols_shifted::compute_trace(FieldElement::one(), 4);
-
-        let claimed_index = 3;
-        let col = 0;
-        let claimed_value = *trace.get_main(claimed_index, col);
-        let mut proof_options = ProofOptions::default_test_options();
-        proof_options.blowup_factor = 4;
-        proof_options.coset_offset = 3;
-        proof_options.grinding_factor = 0;
-        proof_options.fri_number_of_queries = 1;
-
-        let pub_inputs = fibonacci_2_cols_shifted::PublicInputs {
-            claimed_value,
-            claimed_index,
-        };
-
-        let transcript_init_seed = [0xca, 0xfe, 0xca, 0xfe];
-
-        let air = Fibonacci2ColsShifted::<Stark252PrimeField>::new(&proof_options);
-        let trace_length = trace.num_rows();
-
-        let proof = Prover::prove(
-            &air,
-            &mut trace,
-            &pub_inputs,
-            &mut StoneProverTranscript::new(&transcript_init_seed),
-        )
-        .unwrap();
-        (
-            proof,
-            air,
-            proof_options,
-            transcript_init_seed,
-            trace_length,
-        )
-    }
-
-    fn stone_compatibility_case_1_proof() -> StarkProof<
-        Stark252PrimeField,
-        Stark252PrimeField,
-        fibonacci_2_cols_shifted::PublicInputs<Stark252PrimeField>,
-    > {
-        let (proof, _, _, _, _) = proof_parts_stone_compatibility_case_1();
-        proof
-    }
-
-    fn stone_compatibility_case_1_challenges() -> Challenges<Stark252PrimeField> {
-        let (proof, air, _, seed, trace_length) = proof_parts_stone_compatibility_case_1();
-
-        let domain = VerifierDomain::new(&air, trace_length);
-        Verifier::step_1_replay_rounds_and_recover_challenges(
-            &air,
-            &proof,
-            &domain,
-            &mut StoneProverTranscript::new(&seed),
-        )
-    }
-
-    #[test]
-    fn stone_compatibility_case_1_proof_is_valid() {
-        let (proof, air, _options, seed, _) = proof_parts_stone_compatibility_case_1();
-        assert!(Verifier::verify(
-            &proof,
-            &air,
-            &mut StoneProverTranscript::new(&seed)
-        ));
-    }
-
-    #[test]
-    fn stone_compatibility_case_1_trace_commitment() {
-        let proof = stone_compatibility_case_1_proof();
-
-        assert_eq!(
-            proof.lde_trace_main_merkle_root.to_vec(),
-            decode_hex("0eb9dcc0fb1854572a01236753ce05139d392aa3aeafe72abff150fe21175594").unwrap()
-        );
-    }
-
-    #[test]
-    fn stone_compatibility_case_1_composition_poly_challenges() {
-        let challenges = stone_compatibility_case_1_challenges();
-
-        assert_eq!(challenges.transition_coeffs[0], FieldElement::one());
-        let beta = challenges.transition_coeffs[1];
-        assert_eq!(
-            beta,
-            FieldElement::from_hex_unchecked(
-                "86105fff7b04ed4068ecccb8dbf1ed223bd45cd26c3532d6c80a818dbd4fa7"
-            ),
-        );
-
-        assert_eq!(challenges.boundary_coeffs[0], beta.pow(2u64));
-        assert_eq!(challenges.boundary_coeffs[1], beta.pow(3u64));
-    }
-
-    #[test]
-    fn stone_compatibility_case_1_composition_poly_commitment() {
-        let proof = stone_compatibility_case_1_proof();
-        // Composition polynomial commitment
-        assert_eq!(
-            proof.composition_poly_root.to_vec(),
-            decode_hex("7cdd8d5fe3bd62254a417e2e260e0fed4fccdb6c9005e828446f645879394f38").unwrap()
-        );
-    }
-
-    #[test]
-    fn stone_compatibility_case_1_out_of_domain_challenge() {
-        let challenges = stone_compatibility_case_1_challenges();
-        assert_eq!(
-            challenges.z,
-            FieldElement::from_hex_unchecked(
-                "317629e783794b52cd27ac3a5e418c057fec9dd42f2b537cdb3f24c95b3e550"
-            )
-        );
-    }
-
-    #[test]
-    fn stone_compatibility_case_1_out_of_domain_trace_evaluation() {
-        let proof = stone_compatibility_case_1_proof();
-
-        assert_eq!(
-            proof.trace_ood_evaluations.get_row(0)[0],
-            FieldElement::from_hex_unchecked(
-                "70d8181785336cc7e0a0a1078a79ee6541ca0803ed3ff716de5a13c41684037",
-            )
-        );
-        assert_eq!(
-            proof.trace_ood_evaluations.get_row(1)[0],
-            FieldElement::from_hex_unchecked(
-                "29808fc8b7480a69295e4b61600480ae574ca55f8d118100940501b789c1630",
-            )
-        );
-        assert_eq!(
-            proof.trace_ood_evaluations.get_row(0)[1],
-            FieldElement::from_hex_unchecked(
-                "7d8110f21d1543324cc5e472ab82037eaad785707f8cae3d64c5b9034f0abd2",
-            )
-        );
-        assert_eq!(
-            proof.trace_ood_evaluations.get_row(1)[1],
-            FieldElement::from_hex_unchecked(
-                "1b58470130218c122f71399bf1e04cf75a6e8556c4751629d5ce8c02cc4e62d",
-            )
-        );
-    }
-
-    #[test]
-    fn stone_compatibility_case_1_out_of_domain_composition_poly_evaluation() {
-        let proof = stone_compatibility_case_1_proof();
-
-        assert_eq!(
-            proof.composition_poly_parts_ood_evaluation[0],
-            FieldElement::from_hex_unchecked(
-                "1c0b7c2275e36d62dfb48c791be122169dcc00c616c63f8efb2c2a504687e85",
-            )
-        );
-    }
-
-    #[test]
-    fn stone_compatibility_case_1_deep_composition_poly_challenges() {
-        let challenges = stone_compatibility_case_1_challenges();
-
-        // Trace terms coefficients
-        assert_eq!(challenges.trace_term_coeffs[0][0], FieldElement::one());
-        let gamma = challenges.trace_term_coeffs[0][1];
-        assert_eq!(
-            &gamma,
-            &FieldElement::from_hex_unchecked(
-                "a0c79c1c77ded19520873d9c2440451974d23302e451d13e8124cf82fc15dd"
-            )
-        );
-        assert_eq!(&challenges.trace_term_coeffs[1][0], &gamma.pow(2_u64));
-        assert_eq!(&challenges.trace_term_coeffs[1][1], &gamma.pow(3_u64));
-
-        // Composition polynomial parts terms coefficient
-        assert_eq!(&challenges.gammas[0], &gamma.pow(4_u64));
-    }
-
-    #[test]
-    fn stone_compatibility_case_1_fri_commit_phase_challenge_0() {
-        let challenges = stone_compatibility_case_1_challenges();
-
-        // Challenge to fold FRI polynomial
-        assert_eq!(
-            challenges.zetas[0],
-            FieldElement::from_hex_unchecked(
-                "5c6b5a66c9fda19f583f0b10edbaade98d0e458288e62c2fa40e3da2b293cef"
-            )
-        );
-    }
-
-    #[test]
-    fn stone_compatibility_case_1_fri_commit_phase_layer_1_commitment() {
-        let proof = stone_compatibility_case_1_proof();
-
-        // Commitment of first layer of FRI
-        assert_eq!(
-            proof.fri_layers_merkle_roots[0].to_vec(),
-            decode_hex("327d47da86f5961ee012b2b0e412de16023ffba97c82bfe85102f00daabd49fb").unwrap()
-        );
-    }
-
-    #[test]
-    fn stone_compatibility_case_1_fri_commit_phase_challenge_1() {
-        let challenges = stone_compatibility_case_1_challenges();
-        assert_eq!(
-            challenges.zetas[1],
-            FieldElement::from_hex_unchecked(
-                "13c337c9dc727bea9eef1f82cab86739f17acdcef562f9e5151708f12891295"
-            )
-        );
-    }
-
-    #[test]
-    fn stone_compatibility_case_1_fri_commit_phase_last_value() {
-        let proof = stone_compatibility_case_1_proof();
-
-        assert_eq!(
-            proof.fri_last_value,
-            FieldElement::from_hex_unchecked(
-                "43fedf9f9e3d1469309862065c7d7ca0e7e9ce451906e9c01553056f695aec9"
-            )
-        );
-    }
-
-    #[test]
-    fn stone_compatibility_case_1_fri_query_iota_challenge() {
-        let challenges = stone_compatibility_case_1_challenges();
-        assert_eq!(challenges.iotas[0], 1);
-    }
-
-    #[test]
-    fn stone_compatibility_case_1_fri_query_phase_trace_openings() {
-        let proof = stone_compatibility_case_1_proof();
-
-        // Trace Col 0
-        assert_eq!(
-            proof.deep_poly_openings[0].main_trace_polys.evaluations[0],
-            FieldElement::from_hex_unchecked(
-                "4de0d56f9cf97dff326c26592fbd4ae9ee756080b12c51cfe4864e9b8734f43"
-            )
-        );
-
-        // Trace Col 1
-        assert_eq!(
-            proof.deep_poly_openings[0].main_trace_polys.evaluations[1],
-            FieldElement::from_hex_unchecked(
-                "1bc1aadf39f2faee64d84cb25f7a95d3dceac1016258a39fc90c9d370e69e8e"
-            )
-        );
-
-        // Trace Col 0 symmetric
-        assert_eq!(
-            proof.deep_poly_openings[0].main_trace_polys.evaluations_sym[0],
-            FieldElement::from_hex_unchecked(
-                "321f2a9063068310cd93d9a6d042b516118a9f7f4ed3ae301b79b16478cb0c6"
-            )
-        );
-
-        // Trace Col 1 symmetric
-        assert_eq!(
-            proof.deep_poly_openings[0].main_trace_polys.evaluations_sym[1],
-            FieldElement::from_hex_unchecked(
-                "643e5520c60d06219b27b34da0856a2c23153efe9da75c6036f362c8f196186"
-            )
-        );
-    }
-
-    #[test]
-    fn stone_compatibility_case_1_fri_query_phase_trace_terms_authentication_path() {
-        let proof = stone_compatibility_case_1_proof();
-
-        // Trace poly auth path level 1
-        assert_eq!(
-            proof.deep_poly_openings[0]
-                .main_trace_polys
-                .proof
-                .merkle_path[1]
-                .to_vec(),
-            decode_hex("91b0c0b24b9d00067b0efab50832b76cf97192091624d42b86740666c5d369e6").unwrap()
-        );
-
-        // Trace poly auth path level 2
-        assert_eq!(
-            proof.deep_poly_openings[0]
-                .main_trace_polys
-                .proof
-                .merkle_path[2]
-                .to_vec(),
-            decode_hex("993b044db22444c0c0ebf1095b9a51faeb001c9b4dea36abe905f7162620dbbd").unwrap()
-        );
-
-        // Trace poly auth path level 3
-        assert_eq!(
-            proof.deep_poly_openings[0]
-                .main_trace_polys
-                .proof
-                .merkle_path[3]
-                .to_vec(),
-            decode_hex("5017abeca33fa82576b5c5c2c61792693b48c9d4414a407eef66b6029dae07ea").unwrap()
-        );
-    }
-
-    #[test]
-    fn stone_compatibility_case_1_fri_query_phase_composition_poly_openings() {
-        let proof = stone_compatibility_case_1_proof();
-
-        // Composition poly
-        assert_eq!(
-            proof.deep_poly_openings[0].composition_poly.evaluations[0],
-            FieldElement::from_hex_unchecked(
-                "2b54852557db698e97253e9d110d60e9bf09f1d358b4c1a96f9f3cf9d2e8755"
-            )
-        );
-        // Composition poly sym
-        assert_eq!(
-            proof.deep_poly_openings[0].composition_poly.evaluations_sym[0],
-            FieldElement::from_hex_unchecked(
-                "190f1b0acb7858bd3f5285b68befcf32b436a5f1e3a280e1f42565c1f35c2c3"
-            )
-        );
-    }
-
-    #[test]
-    fn stone_compatibility_case_1_fri_query_phase_composition_poly_authentication_path() {
-        let proof = stone_compatibility_case_1_proof();
-
-        // Composition poly auth path level 0
-        assert_eq!(
-            proof.deep_poly_openings[0]
-                .composition_poly
-                .proof
-                .merkle_path[0]
-                .to_vec(),
-            decode_hex("403b75a122eaf90a298e5d3db2cc7ca096db478078122379a6e3616e72da7546").unwrap()
-        );
-
-        // Composition poly auth path level 1
-        assert_eq!(
-            proof.deep_poly_openings[0]
-                .composition_poly
-                .proof
-                .merkle_path[1]
-                .to_vec(),
-            decode_hex("07950888c0355c204a1e83ecbee77a0a6a89f93d41cc2be6b39ddd1e727cc965").unwrap()
-        );
-
-        // Composition poly auth path level 2
-        assert_eq!(
-            proof.deep_poly_openings[0]
-                .composition_poly
-                .proof
-                .merkle_path[2]
-                .to_vec(),
-            decode_hex("58befe2c5de74cc5a002aa82ea219c5b242e761b45fd266eb95521e9f53f44eb").unwrap()
-        );
-    }
-
-    #[test]
-    fn stone_compatibility_case_1_fri_query_phase_query_lengths() {
-        let proof = stone_compatibility_case_1_proof();
-
-        assert_eq!(proof.query_list.len(), 1);
-
-        assert_eq!(proof.query_list[0].layers_evaluations_sym.len(), 1);
-
-        assert_eq!(
-            proof.query_list[0].layers_auth_paths[0].merkle_path.len(),
-            2
-        );
-    }
-
-    #[test]
-    fn stone_compatibility_case_1_fri_query_phase_layer_1_evaluation_symmetric() {
-        let proof = stone_compatibility_case_1_proof();
-
-        assert_eq!(
-            proof.query_list[0].layers_evaluations_sym[0],
-            FieldElement::from_hex_unchecked(
-                "0684991e76e5c08db17f33ea7840596be876d92c143f863e77cad10548289fd0"
-            )
-        );
-    }
-
-    #[test]
-    fn stone_compatibility_case_1_fri_query_phase_layer_1_authentication_path() {
-        let proof = stone_compatibility_case_1_proof();
-
-        // FRI layer 1 auth path level 0
-        assert_eq!(
-            proof.query_list[0].layers_auth_paths[0].merkle_path[0].to_vec(),
-            decode_hex("0683622478e9e93cc2d18754872f043619f030b494d7ec8e003b1cbafe83b67b").unwrap()
-        );
-
-        // FRI layer 1 auth path level 1
-        assert_eq!(
-            proof.query_list[0].layers_auth_paths[0].merkle_path[1].to_vec(),
-            decode_hex("7985d945abe659a7502698051ec739508ed6bab594984c7f25e095a0a57a2e55").unwrap()
-        );
-    }
-
-    fn proof_parts_stone_compatibility_case_2() -> (
-        StarkProof<
-            Stark252PrimeField,
-            Stark252PrimeField,
-            fibonacci_2_cols_shifted::PublicInputs<Stark252PrimeField>,
-        >,
-        ProofOptions,
-        [u8; 4],
-    ) {
-        let mut trace = fibonacci_2_cols_shifted::compute_trace(FieldElement::from(12345), 512);
-
-        let claimed_index = 420;
-        let col = 0;
-        let claimed_value = *trace.get_main(claimed_index, col);
-        let mut proof_options = ProofOptions::default_test_options();
-        proof_options.blowup_factor = 1 << 6;
-        proof_options.coset_offset = 3;
-        proof_options.grinding_factor = 0;
-        proof_options.fri_number_of_queries = 1;
-
-        let pub_inputs = fibonacci_2_cols_shifted::PublicInputs {
-            claimed_value,
-            claimed_index,
-        };
-
-        let transcript_init_seed = [0xfa, 0xfa, 0xfa, 0xee];
-
-        let air = Fibonacci2ColsShifted::<Stark252PrimeField>::new(&proof_options);
-
-        let proof = Prover::prove(
-            &air,
-            &mut trace,
-            &pub_inputs,
-            &mut StoneProverTranscript::new(&transcript_init_seed),
-        )
-        .unwrap();
-        (proof, proof_options, transcript_init_seed)
-    }
-
-    fn stone_compatibility_case_2_proof() -> StarkProof<
-        Stark252PrimeField,
-        Stark252PrimeField,
-        fibonacci_2_cols_shifted::PublicInputs<Stark252PrimeField>,
-    > {
-        let (proof, _, _) = proof_parts_stone_compatibility_case_2();
-        proof
-    }
-
-    fn stone_compatibility_case_2_challenges() -> Challenges<Stark252PrimeField> {
-        let (proof, options, seed) = proof_parts_stone_compatibility_case_2();
-
-        let air = Fibonacci2ColsShifted::new(&options);
-        let domain = VerifierDomain::new(&air, proof.trace_length);
-        Verifier::step_1_replay_rounds_and_recover_challenges(
-            &air,
-            &proof,
-            &domain,
-            &mut StoneProverTranscript::new(&seed),
-        )
-    }
-
-    #[test]
-    fn stone_compatibility_case_2_trace_commitment() {
-        let proof = stone_compatibility_case_2_proof();
-
-        assert_eq!(
-            proof.lde_trace_main_merkle_root.to_vec(),
-            decode_hex("6d31dd00038974bde5fe0c5e3a765f8ddc822a5df3254fca85a1950ae0208cbe").unwrap()
-        );
-    }
-
-    #[test]
-    fn stone_compatibility_case_2_fri_query_iota_challenge() {
-        let challenges = stone_compatibility_case_2_challenges();
-        assert_eq!(challenges.iotas[0], 4239);
-    }
-
-    #[test]
-    fn stone_compatibility_case_2_fri_query_phase_layer_7_evaluation_symmetric() {
-        let proof = stone_compatibility_case_2_proof();
-
-        assert_eq!(
-            proof.query_list[0].layers_evaluations_sym[7],
-            FieldElement::from_hex_unchecked(
-                "7aa40c5a4e30b44fee5bcc47c54072a435aa35c1a31b805cad8126118cc6860"
-            )
-        );
-    }
-
-    #[test]
-    fn stone_compatibility_case_2_fri_query_phase_layer_8_authentication_path() {
-        let proof = stone_compatibility_case_2_proof();
-
-        // FRI layer 7 auth path level 5
-        assert_eq!(
-            proof.query_list[0].layers_auth_paths[7].merkle_path[5].to_vec(),
-            decode_hex("f12f159b548ca2c571a270870d43e7ec2ead78b3e93b635738c31eb9bcda3dda").unwrap()
-        );
-    }
-
     /// Tests that `get_trace_evaluations_from_lde` (barycentric) produces identical
     /// results to `get_trace_evaluations` (Horner) for the Fibonacci trace.
     #[test]
     fn barycentric_trace_eval_matches_horner_trace_eval() {
         use crate::trace::{get_trace_evaluations, get_trace_evaluations_from_lde, LDETraceTable};
 
-        let trace = simple_fibonacci::fibonacci_trace([Felt252::from(1), Felt252::from(1)], 8);
+        let trace = simple_fibonacci::fibonacci_trace([Felt::from(1), Felt::from(1)], 8);
         let trace_length = trace.num_rows();
         let blowup_factor: usize = 4;
         let coset_offset = 3u64;
@@ -3011,14 +2490,14 @@ mod tests {
             grinding_factor: 0,
         };
 
-        let air = simple_fibonacci::FibonacciAIR::<Stark252PrimeField>::new(&proof_options);
+        let air = simple_fibonacci::FibonacciAIR::<GoldilocksField>::new(&proof_options);
         let domain = Domain::new(&air, trace_length);
 
         // Compute trace polys (Horner path)
-        let trace_polys = trace.compute_trace_polys_main::<Stark252PrimeField>();
+        let trace_polys = trace.compute_trace_polys_main::<GoldilocksField>();
 
         // Compute LDE evaluations for each column
-        let lde_evaluations: Vec<Vec<Felt252>> = trace_polys
+        let lde_evaluations: Vec<Vec<Felt>> = trace_polys
             .iter()
             .map(|poly| {
                 evaluate_polynomial_on_lde_domain(
@@ -3027,26 +2506,26 @@ mod tests {
                     domain.interpolation_domain_size,
                     &domain.coset_offset,
                 )
-                .unwrap()
+                .expect("LDE evaluation failed")
             })
             .collect();
 
         // Build LDE trace table
         let lde_trace = LDETraceTable::from_columns(
             lde_evaluations,
-            Vec::<Vec<Felt252>>::new(),
+            Vec::<Vec<Felt>>::new(),
             air.step_size(),
             domain.blowup_factor,
         );
 
         // Pick OOD point (just a deterministic value)
-        let z = Felt252::from(12345u64);
+        let z = Felt::from(12345u64);
 
         let frame_offsets = air.context().transition_offsets.clone();
         let step_size = air.step_size();
 
         // Horner-based evaluation (ground truth)
-        let expected = get_trace_evaluations::<Stark252PrimeField, Stark252PrimeField>(
+        let expected = get_trace_evaluations::<GoldilocksField, GoldilocksField>(
             &trace_polys,
             &[],
             &z,
@@ -3088,17 +2567,17 @@ mod tests {
         // We need an AIR with composition_poly_degree_bound = 2 * trace_length.
         // Use QuadraticAIR for this.
         use crate::examples::quadratic_air::QuadraticAIR;
-        let air = QuadraticAIR::<Stark252PrimeField>::new(&proof_options);
+        let air = QuadraticAIR::<GoldilocksField>::new(&proof_options);
         let domain = Domain::new(&air, n);
 
         // Create a random-ish polynomial H(x) of degree < 2N (= 32 coefficients).
-        let coeffs: Vec<Felt252> = (0..two_n)
+        let coeffs: Vec<Felt> = (0..two_n)
             .map(|i| FieldElement::from((i * 37 + 13) as u64))
             .collect();
         let h_poly = Polynomial::new(&coeffs);
 
         // Evaluate H on the LDE coset (2N points: g·ω^i for i=0..2N-1)
-        let constraint_evaluations: Vec<Felt252> = domain
+        let constraint_evaluations: Vec<Felt> = domain
             .lde_roots_of_unity_coset
             .iter()
             .map(|x| h_poly.evaluate(x))
@@ -3108,20 +2587,20 @@ mod tests {
         // --- Original path: iFFT(2N) + break_in_parts(2) + FFT(2N) each ---
         let composition_poly =
             Polynomial::interpolate_offset_fft(&constraint_evaluations, &domain.coset_offset)
-                .unwrap();
+                .expect("interpolation failed");
         let parts = composition_poly.break_in_parts(2);
-        let original: Vec<Vec<Felt252>> = parts
+        let original: Vec<Vec<Felt>> = parts
             .iter()
             .map(|part| {
                 evaluate_polynomial_on_lde_domain(part, blowup_factor, n, &domain.coset_offset)
-                    .unwrap()
+                    .expect("LDE evaluation failed")
             })
             .collect();
 
         // --- New path: algebraic decomposition ---
         let new_result =
-            Prover::<Stark252PrimeField, Stark252PrimeField, ()>::decompose_and_extend_d2::<
-                Stark252PrimeField,
+            Prover::<GoldilocksField, GoldilocksField, ()>::decompose_and_extend_d2::<
+                GoldilocksField,
             >(&constraint_evaluations, &domain);
 
         assert_eq!(new_result.len(), 2);

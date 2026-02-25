@@ -8,7 +8,7 @@ use crate::{
     field::{errors::FieldError, extensions::quadratic::HasQuadraticNonResidue},
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct U64Field<const MODULUS: u64>;
 
 impl<const MODULUS: u64> IsField for U64Field<MODULUS> {

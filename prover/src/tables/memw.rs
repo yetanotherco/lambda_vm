@@ -39,6 +39,10 @@ use stark::traits::TransitionEvaluationContext;
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 use crate::constraints::templates::{AddConstraint, AddOperand};
 
+/// Maximum number of rows per MEMW table chunk.
+/// If operations exceed this, the trace is split into multiple tables.
+pub const MAX_ROWS: usize = super::max_rows::MEMW;
+
 // =========================================================================
 // Column indices for MEMW table
 // =========================================================================
@@ -1079,18 +1083,6 @@ where
     let write4 = step.get_main_evaluation_element(0, cols::WRITE4).clone();
     let write8 = step.get_main_evaluation_element(0, cols::WRITE8).clone();
     write2 + write4 + write8
-}
-
-/// Compute virtual w4 = write4 + write8
-#[allow(dead_code)]
-fn compute_w4<F, E>(step: &TableView<F, E>) -> FieldElement<F>
-where
-    F: IsSubFieldOf<E>,
-    E: IsField,
-{
-    let write4 = step.get_main_evaluation_element(0, cols::WRITE4).clone();
-    let write8 = step.get_main_evaluation_element(0, cols::WRITE8).clone();
-    write4 + write8
 }
 
 /// Compute virtual μ_sum = μ_read + μ_write

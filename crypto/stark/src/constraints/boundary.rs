@@ -65,13 +65,6 @@ pub struct BoundaryConstraints<F: IsField> {
 }
 
 impl<F: IsField> BoundaryConstraints<F> {
-    #[allow(dead_code)]
-    pub fn new() -> Self {
-        Self {
-            constraints: Vec::<BoundaryConstraint<F>>::new(),
-        }
-    }
-
     /// To instantiate from a vector of BoundaryConstraint elements
     pub fn from_constraints(constraints: Vec<BoundaryConstraint<F>>) -> Self {
         Self { constraints }
@@ -161,10 +154,8 @@ impl<F: IsField> BoundaryConstraints<F> {
 
 #[cfg(test)]
 mod test {
-    use math::field::{
-        fields::fft_friendly::stark_252_prime_field::Stark252PrimeField, traits::IsFFTField,
-    };
-    type PrimeField = Stark252PrimeField;
+    use math::field::{fields::fft_friendly::u64_goldilocks::GoldilocksField, traits::IsFFTField};
+    type PrimeField = GoldilocksField;
 
     use super::*;
 

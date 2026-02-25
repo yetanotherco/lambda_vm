@@ -155,9 +155,16 @@ pub trait AIR: Send + Sync {
     /// Returns the amount main trace columns and auxiliary trace columns
     fn trace_layout(&self) -> (usize, usize);
 
-    fn has_trace_interaction(&self) -> bool {
+    fn has_aux_trace(&self) -> bool {
         let (_main_trace_columns, aux_trace_columns) = self.trace_layout();
         aux_trace_columns != 0
+    }
+
+    /// Returns true if this AIR interacts with other traces (lookup), such is the case
+    /// of `AirWithBuses` (override to return true).
+    /// Generic RAP AIRs with auxiliary columns but no bus interactions must return false.
+    fn has_trace_interaction(&self) -> bool {
+        false
     }
 
     /// Returns true if this AIR has preprocessed (precomputed) columns.

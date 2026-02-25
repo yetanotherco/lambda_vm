@@ -6,7 +6,7 @@
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
 use math::field::fields::fft_friendly::{
-    babybear::Babybear31PrimeField, quartic_babybear::Degree4BabyBearExtensionField,
+    extensions_goldilocks::Degree3GoldilocksExtensionField, u64_goldilocks::GoldilocksField,
 };
 
 use crate::examples::multi_table_lookup::{
@@ -18,8 +18,8 @@ use crate::trace::TraceTable;
 use crate::traits::AIR;
 use crate::verifier::{IsStarkVerifier, Verifier};
 
-type F = Babybear31PrimeField;
-type E = Degree4BabyBearExtensionField;
+type F = GoldilocksField;
+type E = Degree3GoldilocksExtensionField;
 type FE = FieldElement<F>;
 
 /// Bus ID for packing mismatch tests (single bus)
@@ -593,6 +593,309 @@ fn test_missing_receiver() {
         &multi_proof,
         &mut DefaultTranscript::<E>::new(&[])
     ));
+}
+
+// =============================================================================
+// First-row boundary constraints
+// =============================================================================
+
+/// A proof where initial_terms[0] has been tampered with is rejected.
+///
+/// The ADD table exposes its term column value at row 0 as a public input
+/// (initial_terms[0]). The verifier enforces term_col_0(ω^0) = initial_terms[0]
+/// as a boundary constraint. We simulate a dishonest prover by corrupting
+/// initial_terms[0] in the proof after generation. The composition polynomial
+/// check then fails because the committed trace disagrees with the claimed value.
+#[test_log::test]
+fn test_tampered_accumulator_first_row() {
+    // Simple valid trace: CPU sends (5, 3, 8) to the ADD table.
+    let mut cpu_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()], // add_flag
+            vec![FE::zero(); 4],                                 // mul_flag
+            vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
+        ],
+        1,
+    );
+    let mut add_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()], // multiplicity = 1
+        ],
+        1,
+    );
+    let mut mul_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::zero(); 4],
+            vec![FE::zero(); 4],
+            vec![FE::zero(); 4],
+            vec![FE::zero(); 4],
+        ],
+        1,
+    );
+
+    let proof_options = ProofOptions::default_test_options();
+    let cpu_air = new_cpu_air_with_lookup(&proof_options);
+    let add_air = new_add_air_with_lookup(&proof_options);
+    let mul_air = new_mul_air_with_lookup(&proof_options);
+
+    let air_trace_pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&cpu_air, &mut cpu_trace, &()),
+        (&add_air, &mut add_trace, &()),
+        (&mul_air, &mut mul_trace, &()),
+    ];
+
+    let mut multi_proof =
+        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+
+    // Corrupt initial_terms[0] in the ADD table's bus public inputs.
+    // ADD has 1 interaction (receiver), so initial_terms has 1 element.
+    // Changing this breaks the boundary constraint for term_col_0 at row 0:
+    // the verifier will enforce term_col_0(ω^0) = corrupted value, but the
+    // committed trace has the honest value, causing the composition poly check to fail.
+    let add_proof = &mut multi_proof.proofs[1]; // proofs: [cpu=0, add=1, mul=2]
+    let bus_inputs = add_proof
+        .bus_public_inputs
+        .as_mut()
+        .expect("ADD table must have bus public inputs");
+    bus_inputs.initial_terms[0] += FieldElement::<E>::one();
+
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        vec![&cpu_air, &add_air, &mul_air];
+
+    assert!(
+        !Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
+        "Proof with corrupted initial_terms[0] must be rejected"
+    );
+}
+
+/// A proof where the acc column OOD evaluation at row 0 is tampered with is rejected.
+///
+/// The verifier enforces acc(ω^0) = Σ initial_terms as a boundary constraint.
+/// We keep initial_terms honest but corrupt the acc column's OOD evaluation directly.
+/// The composition polynomial check then fails because the committed acc(z) no longer
+/// matches the expected value Σ initial_terms.
+#[test_log::test]
+fn test_tampered_acc_ood_first_row() {
+    // Simple valid trace: CPU sends (5, 3, 8) to the ADD table.
+    let mut cpu_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()], // add_flag
+            vec![FE::zero(); 4],                                 // mul_flag
+            vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
+        ],
+        1,
+    );
+    let mut add_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()], // multiplicity = 1
+        ],
+        1,
+    );
+    let mut mul_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::zero(); 4],
+            vec![FE::zero(); 4],
+            vec![FE::zero(); 4],
+            vec![FE::zero(); 4],
+        ],
+        1,
+    );
+
+    let proof_options = ProofOptions::default_test_options();
+    let cpu_air = new_cpu_air_with_lookup(&proof_options);
+    let add_air = new_add_air_with_lookup(&proof_options);
+    let mul_air = new_mul_air_with_lookup(&proof_options);
+
+    let air_trace_pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&cpu_air, &mut cpu_trace, &()),
+        (&add_air, &mut add_trace, &()),
+        (&mul_air, &mut mul_trace, &()),
+    ];
+
+    let mut multi_proof =
+        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+
+    // Corrupt the acc column OOD evaluation in the ADD table proof.
+    // ADD has 4 main columns + 1 interaction column + 1 acc column, so the aux layout is:
+    //   column 4 (OOD) = term column,  column 5 (OOD) = acc column
+    // initial_terms is kept honest, so the verifier's expected value Σ initial_terms
+    // is correct. But acc(z) no longer matches it → composition poly check fails.
+    let num_main = 4usize;
+    let num_interactions = 1usize;
+    let acc_col_ood_idx = num_main + num_interactions;
+    let add_proof = &mut multi_proof.proofs[1]; // proofs: [cpu=0, add=1, mul=2]
+    let corrupted = *add_proof.trace_ood_evaluations.get(0, acc_col_ood_idx) + FieldElement::one();
+    add_proof
+        .trace_ood_evaluations
+        .set(0, acc_col_ood_idx, corrupted);
+
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        vec![&cpu_air, &add_air, &mul_air];
+
+    assert!(
+        !Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
+        "Proof with corrupted acc[0] OOD evaluation must be rejected"
+    );
+}
+
+// =============================================================================
+// Invalid bus public inputs
+// =============================================================================
+
+/// A proof where bus_public_inputs is None for a LogUp AIR is rejected.
+///
+/// The verifier must reject proofs where an AIR declares bus interactions
+/// (has_trace_interaction() = true) but the proof omits bus_public_inputs.
+/// Without this check, a dishonest prover could bypass both the boundary
+/// constraints and the bus balance check.
+#[test_log::test]
+fn test_missing_bus_public_inputs_rejected() {
+    let mut cpu_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::zero(); 4],
+            vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
+        ],
+        1,
+    );
+    let mut add_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()],
+        ],
+        1,
+    );
+    let mut mul_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::zero(); 4],
+            vec![FE::zero(); 4],
+            vec![FE::zero(); 4],
+            vec![FE::zero(); 4],
+        ],
+        1,
+    );
+
+    let proof_options = ProofOptions::default_test_options();
+    let cpu_air = new_cpu_air_with_lookup(&proof_options);
+    let add_air = new_add_air_with_lookup(&proof_options);
+    let mul_air = new_mul_air_with_lookup(&proof_options);
+
+    let air_trace_pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&cpu_air, &mut cpu_trace, &()),
+        (&add_air, &mut add_trace, &()),
+        (&mul_air, &mut mul_trace, &()),
+    ];
+
+    let mut multi_proof =
+        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+
+    // Remove bus_public_inputs from the ADD table proof entirely.
+    multi_proof.proofs[1].bus_public_inputs = None;
+
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        vec![&cpu_air, &add_air, &mul_air];
+
+    assert!(
+        !Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
+        "Proof with missing bus_public_inputs must be rejected"
+    );
+}
+
+/// A proof where initial_terms has fewer elements than expected is rejected.
+///
+/// The verifier checks that initial_terms.len() == num_interactions before
+/// evaluating boundary constraints. A shorter vector would otherwise cause
+/// some term boundary constraints to be silently skipped.
+#[test_log::test]
+fn test_initial_terms_length_mismatch_rejected() {
+    let mut cpu_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::zero(); 4],
+            vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
+        ],
+        1,
+    );
+    let mut add_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()],
+        ],
+        1,
+    );
+    let mut mul_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::zero(); 4],
+            vec![FE::zero(); 4],
+            vec![FE::zero(); 4],
+            vec![FE::zero(); 4],
+        ],
+        1,
+    );
+
+    let proof_options = ProofOptions::default_test_options();
+    let cpu_air = new_cpu_air_with_lookup(&proof_options);
+    let add_air = new_add_air_with_lookup(&proof_options);
+    let mul_air = new_mul_air_with_lookup(&proof_options);
+
+    let air_trace_pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&cpu_air, &mut cpu_trace, &()),
+        (&add_air, &mut add_trace, &()),
+        (&mul_air, &mut mul_trace, &()),
+    ];
+
+    let mut multi_proof =
+        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+
+    // Truncate initial_terms to empty — ADD has 1 interaction so expected length is 1.
+    let add_proof = &mut multi_proof.proofs[1];
+    let bus_inputs = add_proof
+        .bus_public_inputs
+        .as_mut()
+        .expect("ADD table must have bus public inputs");
+    bus_inputs.initial_terms.clear();
+
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        vec![&cpu_air, &add_air, &mul_air];
+
+    assert!(
+        !Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
+        "Proof with initial_terms length mismatch must be rejected"
+    );
 }
 
 // =============================================================================

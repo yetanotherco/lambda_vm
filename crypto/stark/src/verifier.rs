@@ -834,14 +834,23 @@ pub trait IsStarkVerifier<
     fn multi_verify(
         airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
         multi_proof: &MultiProof<Field, FieldExtension, PI>,
-        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        // Check if any AIR uses LogUp (has auxiliary trace for running sums)
-        let needs_logup_challenges = airs.iter().any(|air| air.has_trace_interaction());
+        if airs.len() != multi_proof.proofs.len() {
+            error!(
+                "AIR count ({}) does not match proof count ({})",
+                airs.len(),
+                multi_proof.proofs.len()
+            );
+            return false;
+        }
+
+        // Check if any AIR has an auxiliary trace
+        let needs_lookup_challenges = airs.iter().any(|air| air.has_aux_trace());
 
         // =====================================================================
         // Round 1, Phase A: Replay main trace commitments
@@ -887,7 +896,7 @@ pub trait IsStarkVerifier<
         // =====================================================================
         // Must match exactly what the prover sampled.
 
-        let logup_challenges: Vec<FieldElement<FieldExtension>> = if needs_logup_challenges {
+        let lookup_challenges: Vec<FieldElement<FieldExtension>> = if needs_lookup_challenges {
             (0..LOGUP_NUM_CHALLENGES)
                 .map(|_| transcript.sample_field_element())
                 .collect()
@@ -896,21 +905,67 @@ pub trait IsStarkVerifier<
         };
 
         // =====================================================================
-        // Round 1, Phase C: Replay auxiliary trace commitments
+        // Validate bus_public_inputs presence and length against AIR layout
         // =====================================================================
+        // A dishonest prover could omit bus_public_inputs entirely (None) to
+        // bypass the bus balance check and boundary constraints, or submit fewer
+        // initial_terms than expected to skip term boundary constraints.
 
-        for proof in &multi_proof.proofs {
-            if let Some(root) = proof.lde_trace_aux_merkle_root {
-                transcript.append_bytes(&root);
+        for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
+            if air.has_trace_interaction() && proof.bus_public_inputs.is_none() {
+                error!(
+                    "Table {idx}: AIR has LogUp interactions but proof is missing bus_public_inputs"
+                );
+                return false;
+            }
+            if let Some(bus_inputs) = &proof.bus_public_inputs {
+                let num_aux = air.num_auxiliary_rap_columns();
+                if num_aux == 0 {
+                    error!(
+                        "Table {idx}: proof has bus_public_inputs but AIR has no auxiliary columns"
+                    );
+                    return false;
+                }
+                let expected_interactions = num_aux - 1;
+                if bus_inputs.initial_terms.len() != expected_interactions {
+                    error!(
+                        "Table {idx}: initial_terms length mismatch: got {}, expected {}",
+                        bus_inputs.initial_terms.len(),
+                        expected_interactions
+                    );
+                    return false;
+                }
             }
         }
 
         // =====================================================================
-        // Rounds 2-4: Verify each proof
+        // Phase C + Rounds 2-4: Forked per table
         // =====================================================================
+        // Each table gets an independent transcript fork (cloned from the shared
+        // state after Phase B, domain-separated by table index). This matches
+        // the prover's forking and makes per-table verification independent.
 
         for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
-            if !Self::verify_rounds_2_to_4(*air, proof, transcript, logup_challenges.clone()) {
+            // Must match prover: fork with domain separator for multi-table,
+            // use original transcript directly for single-table.
+            let num_tables = airs.len();
+            let mut table_transcript = transcript.clone();
+            if num_tables > 1 {
+                table_transcript.append_bytes(&(idx as u64).to_le_bytes());
+            }
+
+            // Phase C: replay aux commitment
+            if let Some(root) = proof.lde_trace_aux_merkle_root {
+                table_transcript.append_bytes(&root);
+            }
+
+            // Rounds 2-4: verify
+            if !Self::verify_rounds_2_to_4(
+                *air,
+                proof,
+                &mut table_transcript,
+                lookup_challenges.clone(),
+            ) {
                 error!(
                     "Table {} failed verify_rounds_2_to_4 (num_constraints={}, trace_cols={})",
                     idx,
@@ -928,7 +983,7 @@ pub trait IsStarkVerifier<
         // The sign (sender vs receiver) is already baked into the accumulated values,
         // so the bus balances when the sum of all accumulated values equals zero.
 
-        if needs_logup_challenges {
+        if needs_lookup_challenges {
             let mut total = FieldElement::<FieldExtension>::zero();
             for proof in &multi_proof.proofs {
                 if let Some(interaction) = &proof.bus_public_inputs {
@@ -956,7 +1011,7 @@ pub trait IsStarkVerifier<
     fn verify(
         proof: &StarkProof<Field, FieldExtension, PI>,
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
-        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,

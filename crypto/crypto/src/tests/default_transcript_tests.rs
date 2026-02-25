@@ -1,12 +1,8 @@
 use alloc::vec::Vec;
-use math::{
-    elliptic_curve::short_weierstrass::curves::bls12_381::default_types::FrField,
-    field::{
-        element::FieldElement,
-        fields::fft_friendly::{
-            babybear_u32::Babybear31PrimeField,
-            quartic_babybear_u32::Degree4BabyBearU32ExtensionField,
-        },
+use math::field::{
+    element::FieldElement,
+    fields::fft_friendly::{
+        extensions_goldilocks::Degree3GoldilocksExtensionField, u64_goldilocks::GoldilocksField,
     },
 };
 
@@ -15,7 +11,7 @@ use crate::fiat_shamir::is_transcript::IsTranscript;
 
 #[test]
 fn basic_challenge() {
-    let mut transcript = DefaultTranscript::<FrField>::default();
+    let mut transcript = DefaultTranscript::<Degree3GoldilocksExtensionField>::default();
 
     let point_a: Vec<u8> = vec![0xFF, 0xAB];
     let point_b: Vec<u8> = vec![0xDD, 0x8C, 0x9D];
@@ -51,23 +47,95 @@ fn basic_challenge() {
     );
 }
 
-type FE = FieldElement<Babybear31PrimeField>;
-type Fp4E = FieldElement<Degree4BabyBearU32ExtensionField>;
+type GoldFE = FieldElement<GoldilocksField>;
+type Ext3FE = FieldElement<Degree3GoldilocksExtensionField>;
 
 #[test]
-fn quartic_baby_bear_transcript_distinguish_different_fe() {
-    let mut transcript_1 = DefaultTranscript::<Degree4BabyBearU32ExtensionField>::default();
-    transcript_1.append_field_element(&Fp4E::new([FE::one(), FE::zero(), FE::zero(), FE::zero()]));
+fn degree3_goldilocks_transcript_distinguish_different_fe() {
+    let mut transcript_1 = DefaultTranscript::<Degree3GoldilocksExtensionField>::default();
+    transcript_1.append_field_element(&Ext3FE::new([
+        GoldFE::one(),
+        GoldFE::zero(),
+        GoldFE::zero(),
+    ]));
     let sample_1 = transcript_1.sample_field_element();
 
-    let mut transcript_2 = DefaultTranscript::<Degree4BabyBearU32ExtensionField>::default();
-    transcript_2.append_field_element(&Fp4E::new([FE::zero(), FE::zero(), FE::zero(), FE::one()]));
+    let mut transcript_2 = DefaultTranscript::<Degree3GoldilocksExtensionField>::default();
+    transcript_2.append_field_element(&Ext3FE::new([
+        GoldFE::zero(),
+        GoldFE::zero(),
+        GoldFE::one(),
+    ]));
     let sample_2 = transcript_2.sample_field_element();
 
-    let mut transcript_3 = DefaultTranscript::<Degree4BabyBearU32ExtensionField>::default();
-    transcript_3.append_field_element(&Fp4E::new([FE::one(), FE::zero(), FE::zero(), FE::zero()]));
+    let mut transcript_3 = DefaultTranscript::<Degree3GoldilocksExtensionField>::default();
+    transcript_3.append_field_element(&Ext3FE::new([
+        GoldFE::one(),
+        GoldFE::zero(),
+        GoldFE::zero(),
+    ]));
     let sample_3 = transcript_3.sample_field_element();
 
     assert!(sample_1 != sample_2);
     assert!(sample_1 == sample_3);
+}
+
+#[test]
+fn fork_determinism() {
+    // Cloning a transcript twice and running the same operations must produce identical challenges.
+    let mut base = DefaultTranscript::<GoldilocksField>::default();
+    base.append_bytes(&[0x01, 0x02, 0x03]);
+    let _ = base.sample();
+    base.append_bytes(&[0xAA, 0xBB]);
+
+    let mut fork_a = base.clone();
+    let mut fork_b = base.clone();
+
+    fork_a.append_bytes(&[0x00]);
+    fork_b.append_bytes(&[0x00]);
+
+    assert_eq!(fork_a.sample(), fork_b.sample());
+    assert_eq!(fork_a.sample(), fork_b.sample());
+}
+
+#[test]
+fn fork_domain_separator_differentiates() {
+    // Two forks from the same base with different domain separators must produce different challenges.
+    let mut base = DefaultTranscript::<GoldilocksField>::default();
+    base.append_bytes(&[0x01, 0x02, 0x03]);
+    let _ = base.sample();
+    base.append_bytes(&[0xAA, 0xBB]);
+
+    let mut fork_0 = base.clone();
+    fork_0.append_bytes(&(0u64).to_le_bytes());
+
+    let mut fork_1 = base.clone();
+    fork_1.append_bytes(&(1u64).to_le_bytes());
+
+    assert_ne!(fork_0.sample(), fork_1.sample());
+}
+
+#[test]
+fn fork_isolation() {
+    // Appending data to one fork must not affect challenges sampled from another.
+    let mut base = DefaultTranscript::<GoldilocksField>::default();
+    base.append_bytes(&[0x01, 0x02, 0x03]);
+    let _ = base.sample();
+
+    let mut fork_a = base.clone();
+    fork_a.append_bytes(&(0u64).to_le_bytes());
+
+    let mut fork_b = base.clone();
+    fork_b.append_bytes(&(1u64).to_le_bytes());
+
+    // Pollute fork_b with extra data
+    fork_b.append_bytes(&[0xFF; 64]);
+    let _ = fork_b.sample();
+    fork_b.append_bytes(&[0xEE; 128]);
+
+    // fork_a should still produce the same challenge as a fresh identical fork
+    let mut fork_a_fresh = base.clone();
+    fork_a_fresh.append_bytes(&(0u64).to_le_bytes());
+
+    assert_eq!(fork_a.sample(), fork_a_fresh.sample());
 }
