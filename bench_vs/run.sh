@@ -156,11 +156,11 @@ for i in "${!RESULT_N[@]}"; do
 
     if $RUN_LAMBDA && $RUN_SP1; then
         if [ "$lt" != "n/a" ] && [ "$st" != "n/a" ]; then
-            RATIO=$(LC_NUMERIC=C awk "BEGIN {printf \"%.2fx\", $st / $lt}")
-            if (( $(LC_NUMERIC=C awk "BEGIN {print ($st > $lt)}") )); then
-                RATIO="${GREEN}${RATIO}${NC}"
-            else
+            RATIO=$(LC_NUMERIC=C awk "BEGIN {printf \"%.1fx\", $lt / $st}")
+            if (( $(LC_NUMERIC=C awk "BEGIN {print ($lt > $st)}") )); then
                 RATIO="${RED}${RATIO}${NC}"
+            else
+                RATIO="${GREEN}${RATIO}${NC}"
             fi
             printf "  %-10s  %11ss  %11ss  " "$n" "$lt" "$st"
             echo -e "$RATIO"
