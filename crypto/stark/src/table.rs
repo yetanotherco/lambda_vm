@@ -17,7 +17,7 @@ pub struct Table<F: IsField> {
     pub height: usize,
 }
 
-impl<'t, F: IsField> Table<F> {
+impl<F: IsField> Table<F> {
     /// Crates a new Table instance from a one-dimensional array in row major order
     /// and the intended width of the table.
     pub fn new(data: Vec<FieldElement<F>>, width: usize) -> Self {
@@ -142,8 +142,7 @@ impl<'t, F: IsField> Table<F> {
             output.len(),
             self.width
         );
-        for col_idx in 0..self.width {
-            let buf = &mut output[col_idx];
+        for (col_idx, buf) in output.iter_mut().enumerate().take(self.width) {
             buf.clear();
             buf.reserve(self.height.saturating_sub(buf.capacity()));
             for row_idx in 0..self.height {

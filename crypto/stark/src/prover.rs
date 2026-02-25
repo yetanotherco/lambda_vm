@@ -806,6 +806,7 @@ pub trait IsStarkProver<
 
     /// Phase A helper for sequential proving: compute main LDE, commit, return tree and root.
     /// Uses the provided pool buffers to avoid allocation; the pool retains capacity for reuse.
+    #[allow(clippy::type_complexity)]
     fn commit_main_trace_lightweight(
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
@@ -841,6 +842,7 @@ pub trait IsStarkProver<
 
     /// Phase A helper for sequential proving with preprocessed tables: commit separately,
     /// return trees and roots. Uses pool buffers to avoid allocation.
+    #[allow(clippy::type_complexity)]
     fn commit_preprocessed_trace_lightweight(
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
@@ -895,6 +897,7 @@ pub trait IsStarkProver<
 
     /// Phase C helper for sequential proving: build aux trace, commit, return tree, root,
     /// and bus_public_inputs. Uses pool buffers to avoid allocation.
+    #[allow(clippy::type_complexity)]
     fn commit_aux_trace_lightweight(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         trace: &mut TraceTable<Field, FieldExtension>,
@@ -1479,10 +1482,10 @@ pub trait IsStarkProver<
         }
 
         // Trace-term denominators: x_i - z_shifted[k]
-        for k in 0..num_eval_points {
+        for z_k in z_shifted.iter().take(num_eval_points) {
             for i in 0..domain_size {
                 let x_i = &domain.lde_roots_of_unity_coset[i * blowup_factor];
-                denoms.push(x_i - &z_shifted[k]);
+                denoms.push(x_i - z_k);
             }
         }
 
@@ -1510,7 +1513,7 @@ pub trait IsStarkProver<
                 let h_j_val = &round_2_result.lde_composition_poly_evaluations[j][row_idx];
                 let h_j_ood = &h_ood[j];
                 let numerator = h_j_val - h_j_ood;
-                result = result + &composition_poly_gammas[j] * numerator * &inv_h[i];
+                result += &composition_poly_gammas[j] * numerator * &inv_h[i];
             }
 
             // Trace terms: Σ_{j,k} γ'_{j,k} * (t_j(x_i) - t_j(z·w^k)) * inv_t_k[i]
@@ -1528,7 +1531,7 @@ pub trait IsStarkProver<
                     } else {
                         lde_trace.get_aux(row_idx, j - num_main_cols) - t_j_ood
                     };
-                    result = result + &gammas_j[k] * numerator * inv_t_k_i;
+                    result += &gammas_j[k] * numerator * inv_t_k_i;
                 }
             }
 

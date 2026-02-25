@@ -1441,7 +1441,7 @@ where
         evaluation_context: &TransitionEvaluationContext<F, E>,
         transition_evaluations: &mut [FieldElement<E>],
     ) {
-        fn evaluate_term_constraint<'a, A: IsSubFieldOf<B>, B: IsField>(
+        fn evaluate_term_constraint<A: IsSubFieldOf<B>, B: IsField>(
             step: &TableView<A, B>,
             term_column_idx: usize,
             interaction: &BusInteraction,
@@ -1748,7 +1748,7 @@ where
         evaluation_context: &TransitionEvaluationContext<F, E>,
         transition_evaluations: &mut [FieldElement<E>],
     ) {
-        fn evaluate_accumulated_constraint<'a, A: IsSubFieldOf<B>, B: IsField>(
+        fn evaluate_accumulated_constraint<A: IsSubFieldOf<B>, B: IsField>(
             first_step: &TableView<A, B>,
             second_step: &TableView<A, B>,
             acc_column_idx: usize,

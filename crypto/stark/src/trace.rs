@@ -306,8 +306,8 @@ where
         trace_step_size: usize,
         blowup_factor: usize,
     ) -> Self {
-        let main_cols: Vec<Vec<FieldElement<F>>> = main_columns.iter().map(|c| c.clone()).collect();
-        let aux_cols: Vec<Vec<FieldElement<E>>> = aux_columns.iter().map(|c| c.clone()).collect();
+        let main_cols: Vec<Vec<FieldElement<F>>> = main_columns.to_vec();
+        let aux_cols: Vec<Vec<FieldElement<E>>> = aux_columns.to_vec();
         let lde_step_size = trace_step_size * blowup_factor;
 
         Self {
@@ -319,6 +319,7 @@ where
     }
 
     /// Consume self and return the owned column vectors.
+    #[allow(clippy::type_complexity)]
     pub fn into_columns(self) -> (Vec<Vec<FieldElement<F>>>, Vec<Vec<FieldElement<E>>>) {
         (self.main_columns, self.aux_columns)
     }

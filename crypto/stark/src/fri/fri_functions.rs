@@ -256,22 +256,22 @@ mod tests {
         use math::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
         use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
 
-        type GFE = FieldElement<GoldilocksField>;
+        type Gfe = FieldElement<GoldilocksField>;
 
         // A degree-7 polynomial (8 coefficients)
         let poly = Polynomial::new(&[
-            GFE::from(3u64),
-            GFE::from(1u64),
-            GFE::from(2u64),
-            GFE::from(7u64),
-            GFE::from(3u64),
-            GFE::from(5u64),
-            GFE::from(4u64),
-            GFE::from(2u64),
+            Gfe::from(3u64),
+            Gfe::from(1u64),
+            Gfe::from(2u64),
+            Gfe::from(7u64),
+            Gfe::from(3u64),
+            Gfe::from(5u64),
+            Gfe::from(4u64),
+            Gfe::from(2u64),
         ]);
         let domain_size = 8usize;
-        let coset_offset = GFE::from(7u64); // arbitrary nonzero offset
-        let zeta = GFE::from(13u64);
+        let coset_offset = Gfe::from(7u64); // arbitrary nonzero offset
+        let zeta = Gfe::from(13u64);
 
         // Path A: coefficient fold + FFT + bit-reverse (old approach)
         let mut poly_coeff = poly.clone();
