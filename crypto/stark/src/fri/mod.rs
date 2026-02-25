@@ -7,12 +7,13 @@ use math::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
 use math::field::traits::{IsFFTField, IsField};
 use math::traits::AsBytes;
 use math::field::traits::IsSubFieldOf;
+use sha3::Digest;
 pub use math::{
     field::{element::FieldElement, fields::u64_prime_field::U64PrimeField},
     polynomial::Polynomial,
 };
 
-use crate::config::{FriLayerMerkleTree, FriLayerMerkleTreeBackend};
+use crate::config::{Commitment, FriLayerMerkleTree, FriLayerMerkleTreeBackend};
 
 use self::fri_commitment::FriLayer;
 use self::fri_decommit::FriDecommitment;
@@ -133,11 +134,22 @@ where
 
         // Commit post-fold evaluations (except for last round → final poly)
         if !is_last {
-            let leaves: Vec<Vec<FieldElement<E>>> = evals
+            // Hash each group of `group_size` evaluations directly without
+            // allocating Vec<Vec<FE>> leaves. This eliminates one allocation
+            // per leaf group per FRI layer.
+            let hashed_leaves: Vec<Commitment> = evals
                 .chunks_exact(group_size)
-                .map(|chunk| chunk.to_vec())
+                .map(|chunk| {
+                    let mut hasher = sha3::Keccak256::new();
+                    for elem in chunk {
+                        hasher.update(elem.as_bytes());
+                    }
+                    let mut result = [0u8; crate::config::COMMITMENT_SIZE];
+                    result.copy_from_slice(&hasher.finalize());
+                    result
+                })
                 .collect();
-            let merkle_tree = FriLayerMerkleTree::build(&leaves)
+            let merkle_tree = FriLayerMerkleTree::build_from_hashed_leaves(hashed_leaves)
                 .expect("FRI commit: Merkle tree construction must succeed");
             let root = merkle_tree.root;
             fri_layer_list.push(FriLayer::new(

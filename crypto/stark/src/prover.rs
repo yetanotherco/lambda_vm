@@ -4,7 +4,7 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
-use crypto::merkle_tree::traits::IsMerkleTreeBackend;
+use sha3::Digest;
 use math::fft::cpu::bit_reversing::{in_place_bit_reverse_permute, reverse_index};
 use math::fft::cpu::bowers_fft::LayerTwiddles;
 use math::fft::errors::FFTError;
@@ -32,7 +32,7 @@ use crate::proof::stark::{DeepPolynomialOpenings, PolynomialOpenings};
 use crate::table::Table;
 use crate::trace::LDETraceTable;
 
-use super::config::{BatchedMerkleTree, BatchedMerkleTreeBackend, Commitment};
+use super::config::{BatchedMerkleTree, Commitment};
 use super::constraints::evaluator::ConstraintEvaluator;
 use super::domain::Domain;
 use super::fri::fri_decommit::FriDecommitment;
@@ -261,6 +261,30 @@ where
     }
 }
 
+/// Hash a single row from column-major layout directly into a Keccak256 hasher.
+///
+/// Feeds each field element's bytes into the hasher without allocating a row Vec
+/// or per-element byte Vecs on the heap. The hasher is reset before use and the
+/// digest is finalized in-place, so the same hasher instance can be reused across rows.
+#[inline]
+fn hash_row_from_columns<E: IsField>(
+    columns: &[Vec<FieldElement<E>>],
+    row_idx: usize,
+    num_cols: usize,
+    hasher: &mut sha3::Keccak256,
+) -> Commitment
+where
+    FieldElement<E>: AsBytes,
+{
+    Digest::reset(hasher);
+    for col_idx in 0..num_cols {
+        hasher.update(columns[col_idx][row_idx].as_bytes());
+    }
+    let mut result = [0u8; super::config::COMMITMENT_SIZE];
+    result.copy_from_slice(&hasher.finalize_reset());
+    result
+}
+
 /// The functionality of a STARK prover providing methods to run the STARK Prove protocol
 /// https://lambdaclass.github.io/lambdaworks/starks/protocol.html
 /// The default implementation is complete and is compatible with Stone prover
@@ -320,19 +344,26 @@ pub trait IsStarkProver<
         let num_cols = columns.len();
 
         #[cfg(feature = "parallel")]
-        let iter = (0..num_rows).into_par_iter();
-        #[cfg(not(feature = "parallel"))]
-        let iter = 0..num_rows;
-
-        let hashed_leaves: Vec<Commitment> = iter
-            .map(|row_idx| {
-                let br_idx = reverse_index(row_idx, num_rows as u64);
-                let row: Vec<FieldElement<E>> = (0..num_cols)
-                    .map(|col_idx| columns[col_idx][br_idx].clone())
-                    .collect();
-                BatchedMerkleTreeBackend::<E>::hash_data(&row)
-            })
+        let hashed_leaves: Vec<Commitment> = (0..num_rows)
+            .into_par_iter()
+            .map_init(
+                || sha3::Keccak256::new(),
+                |hasher, row_idx| {
+                    let br_idx = reverse_index(row_idx, num_rows as u64);
+                    hash_row_from_columns(columns, br_idx, num_cols, hasher)
+                },
+            )
             .collect();
+        #[cfg(not(feature = "parallel"))]
+        let hashed_leaves: Vec<Commitment> = {
+            let mut hasher = sha3::Keccak256::new();
+            (0..num_rows)
+                .map(|row_idx| {
+                    let br_idx = reverse_index(row_idx, num_rows as u64);
+                    hash_row_from_columns(columns, br_idx, num_cols, &mut hasher)
+                })
+                .collect()
+        };
 
         let tree = BatchedMerkleTree::<E>::build_from_hashed_leaves(hashed_leaves)?;
         let root = tree.root;
@@ -360,18 +391,20 @@ pub trait IsStarkProver<
         let num_cols = columns.len();
 
         #[cfg(feature = "parallel")]
-        let iter = (0..num_rows).into_par_iter();
-        #[cfg(not(feature = "parallel"))]
-        let iter = 0..num_rows;
-
-        let hashed_leaves: Vec<Commitment> = iter
-            .map(|row_idx| {
-                let row: Vec<FieldElement<E>> = (0..num_cols)
-                    .map(|col_idx| columns[col_idx][row_idx].clone())
-                    .collect();
-                BatchedMerkleTreeBackend::<E>::hash_data(&row)
-            })
+        let hashed_leaves: Vec<Commitment> = (0..num_rows)
+            .into_par_iter()
+            .map_init(
+                || sha3::Keccak256::new(),
+                |hasher, row_idx| hash_row_from_columns(columns, row_idx, num_cols, hasher),
+            )
             .collect();
+        #[cfg(not(feature = "parallel"))]
+        let hashed_leaves: Vec<Commitment> = {
+            let mut hasher = sha3::Keccak256::new();
+            (0..num_rows)
+                .map(|row_idx| hash_row_from_columns(columns, row_idx, num_cols, &mut hasher))
+                .collect()
+        };
 
         let tree = BatchedMerkleTree::<E>::build_from_hashed_leaves(hashed_leaves)?;
         let root = tree.root;
