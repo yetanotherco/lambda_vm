@@ -657,7 +657,7 @@ pub fn generate_cpu_trace(
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let n = operations.len();
 
-    let num_rows = n.next_power_of_two();
+    let num_rows = n.next_power_of_two().max(4);
     let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
 
     for (row_idx, op) in operations.iter().enumerate() {
