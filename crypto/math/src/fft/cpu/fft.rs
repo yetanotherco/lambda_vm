@@ -54,21 +54,8 @@ where
     }
 }
 
-/// In-Place Radix-2 RN DIT FFT algorithm over a slice of two-adic field elements.
-/// It's required that the twiddle factors are naturally ordered (so w[i] = w^i). Else this
-/// function will not return fourier transformed values.
-/// Also the input size needs to be a power of two.
-/// It's recommended to use the current safe abstractions instead of this function.
-///
-/// Performs a fast fourier transform with the next attributes:
-/// - In-Place: an auxiliary vector of data isn't needed for storing the results.
-/// - Radix-2: the algorithm halves the problem size log(n) times.
-/// - RN: reverse to natural order, meaning that the input is bit-reversed ordered and the output will
-///   be naturally ordered.
-/// - DIT: decimation in time
-///
-/// It supports values in a field E and domain in a subfield F.
-#[allow(dead_code)]
+/// In-Place Radix-2 RN DIT FFT algorithm. Only used in tests.
+#[cfg(test)]
 pub fn in_place_rn_2radix_fft<F>(input: &mut [FieldElement<F>], twiddles: &[FieldElement<F>])
 where
     F: IsFFTField,
