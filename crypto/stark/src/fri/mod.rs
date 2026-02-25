@@ -52,12 +52,9 @@ where
         // Fold evaluations in-place (no FFT needed)
         fold_evaluations_in_place(&mut evals, &zeta, &inv_twiddles);
 
-        // Build Merkle tree from consecutive pairs
-        let leaves: Vec<[FieldElement<E>; 2]> = evals
-            .chunks_exact(2)
-            .map(|chunk| [chunk[0].clone(), chunk[1].clone()])
-            .collect();
-        let merkle_tree = FriLayerMerkleTree::build(&leaves)
+        // Build Merkle tree from consecutive pairs — zero-copy reinterpretation
+        let leaves = evals_as_pairs(&evals);
+        let merkle_tree = FriLayerMerkleTree::build(leaves)
             .expect("FRI commit: Merkle tree construction must succeed");
         let root = merkle_tree.root;
         fri_layer_list.push(FriLayer::new(
@@ -121,12 +118,9 @@ where
         // Fold evaluations in-place (no FFT needed)
         fold_evaluations_in_place(&mut evals, &zeta, &inv_twiddles);
 
-        // Build Merkle tree from consecutive pairs
-        let leaves: Vec<[FieldElement<E>; 2]> = evals
-            .chunks_exact(2)
-            .map(|chunk| [chunk[0].clone(), chunk[1].clone()])
-            .collect();
-        let merkle_tree = FriLayerMerkleTree::build(&leaves)
+        // Build Merkle tree from consecutive pairs — zero-copy reinterpretation
+        let leaves = evals_as_pairs(&evals);
+        let merkle_tree = FriLayerMerkleTree::build(leaves)
             .expect("FRI commit: Merkle tree construction must succeed");
         let root = merkle_tree.root;
         fri_layer_list.push(FriLayer::new(
@@ -155,6 +149,23 @@ where
     transcript.append_field_element(&last_value);
 
     (last_value, fri_layer_list)
+}
+
+/// Reinterpret a contiguous slice of field elements as pairs `[FieldElement<E>; 2]`.
+///
+/// This avoids allocating a `Vec<[FieldElement<E>; 2]>` by reinterpreting the memory layout.
+/// `FieldElement<E>` is `Copy` and `[T; 2]` has the same layout as two consecutive `T` values,
+/// so this cast is always valid.
+fn evals_as_pairs<E: IsField>(evals: &[FieldElement<E>]) -> &[[FieldElement<E>; 2]] {
+    assert!(evals.len() % 2 == 0, "evals length must be even for pair reinterpretation");
+    // SAFETY: [T; 2] has identical layout to two consecutive T values (no padding).
+    // FieldElement<E> is Copy (no drop glue), and the slice length is verified even.
+    unsafe {
+        std::slice::from_raw_parts(
+            evals.as_ptr() as *const [FieldElement<E>; 2],
+            evals.len() / 2,
+        )
+    }
 }
 
 pub fn query_phase<F: IsField>(
