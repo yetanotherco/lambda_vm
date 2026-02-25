@@ -9,5 +9,7 @@ main:
 	addw	a2, zero, t1		# 5. 0 + 20 = 20
 	addw	a3, t0, t0		# 6. 10 + 10 = 20
 	addw	a4, t1, t1		# 7. 20 + 20 = 40
+	mv	a1, a0
+	li	a0, 0
 	li	a7, 5
 	ecall		# 8. Return

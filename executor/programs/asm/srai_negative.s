@@ -4,6 +4,8 @@
 main:
 	addi    a2, zero, -16         # 0xFFFFFFF0 = -16
 	srai	a0, a2, 1
+	mv	a1, a0
+	li	a0, 0
 	li	a7, 5
 	ecall
 .Lfunc_end1:

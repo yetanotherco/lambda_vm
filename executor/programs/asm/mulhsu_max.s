@@ -9,6 +9,8 @@ main:
 	divu    a4, a3, a1
 	sub     a5, a4, a0
 	mulhsu    a0, a2, a5
+	mv	a1, a0
+	li	a0, 0
 	li	a7, 5
 	ecall
 .Lfunc_end1:

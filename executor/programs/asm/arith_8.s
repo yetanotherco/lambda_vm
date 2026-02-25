@@ -9,5 +9,7 @@ main:
 	addw	a2, t0, t1		# 5. ADDW: 10 + 20 = 30
 	subw	a3, t0, t1		# 6. SUBW: 10 - 20 = -10
 	sub	a4, zero, t0		# 7. 0 - 10 = -10
+	mv	a1, a0
+	li	a0, 0
 	li	a7, 5
 	ecall		# 8. Return

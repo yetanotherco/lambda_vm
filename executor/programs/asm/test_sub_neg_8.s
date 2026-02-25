@@ -9,5 +9,7 @@ main:
 	sub	a2, t0, t0		# 5. -1 - (-1) = 0
 	sub	a3, zero, t0		# 6. 0 - (-1) = 1
 	sub	a4, t0, zero		# 7. -1 - 0 = -1
+	mv	a1, a0
+	li	a0, 0
 	li	a7, 5
 	ecall		# 8. Return

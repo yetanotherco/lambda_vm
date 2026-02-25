@@ -9,5 +9,7 @@ main:
 	add	a1, t2, t0		# 5. 0x80000000 + 10 = 0x8000000A
 	sub	a2, t0, t1		# 6. 10 - 20 = -10
 	addw	a3, t0, t1		# 7. ADDW: 30
+	mv	a1, a0
+	li	a0, 0
 	li	a7, 5
 	ecall		# 8. Return

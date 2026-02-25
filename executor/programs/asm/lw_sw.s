@@ -6,6 +6,8 @@ main:
 	addi a3,zero,20
 	sw a2,0(a3)
 	lw a0,0(a3)
+	mv	a1, a0
+	li	a0, 0
 	li	a7, 5
 	ecall
 .Lfunc_end1:

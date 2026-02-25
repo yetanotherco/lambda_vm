@@ -3,6 +3,8 @@
 	.globl	main
 main:
 	addi	a0, zero, 2047
+	mv	a1, a0
+	li	a0, 0
 	li	a7, 5
 	ecall
 .Lfunc_end1:

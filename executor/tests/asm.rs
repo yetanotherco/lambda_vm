@@ -12,7 +12,13 @@ fn run_program_and_check_output(elf_path: &str, expected_output: i64) {
     while let Some(_logs) = executor.resume().expect("Failed to execute") {}
 
     let result = executor.finish().expect("Failed to get return values");
-    assert!(result.register_values.0 == expected_output);
+    // Programs that halt via ecall: result in a1 (a0 zeroed for exit code).
+    // Programs that halt via jalr-return: result in a0 (legacy).
+    let (a0, a1) = result.register_values;
+    assert!(
+        a0 == expected_output || a1 == expected_output,
+        "expected {expected_output} in a0 or a1, got a0={a0}, a1={a1}"
+    );
 }
 
 #[test]

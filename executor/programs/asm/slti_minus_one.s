@@ -3,6 +3,8 @@
 	.globl	main
 main:
 	slti	a0, zero, -1
+	mv	a1, a0
+	li	a0, 0
 	li	a7, 5
 	ecall
 .Lfunc_end1:

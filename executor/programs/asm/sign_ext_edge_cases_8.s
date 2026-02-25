@@ -28,5 +28,7 @@ main:
 
 	# === 7-8: Finalize ===
 	addi	a2, a0, 0		# 7: Copy result (NOP-like)
+	mv	a1, a0
+	li	a0, 0
 	li	a7, 5
 	ecall		# 8: Halt

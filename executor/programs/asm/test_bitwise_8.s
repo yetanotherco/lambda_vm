@@ -9,5 +9,7 @@ main:
 	xori	a2, t0, 0x0F		# 5. 255 ^ 15 = 240
 	and	a3, t0, t1		# 6. 255 & 15 = 15
 	or	a4, t0, t1		# 7. 255 | 15 = 255
+	mv	a1, a0
+	li	a0, 0
 	li	a7, 5
 	ecall		# 8. Return

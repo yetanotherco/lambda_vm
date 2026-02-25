@@ -7,5 +7,7 @@ main:
 	li	a2, 0x100000000
 	li	a3, 0x100000000
 	mulh	a0, a2, a3
+	mv	a1, a0
+	li	a0, 0
 	li	a7, 5
 	ecall

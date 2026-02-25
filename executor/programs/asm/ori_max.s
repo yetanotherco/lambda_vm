@@ -4,6 +4,8 @@
 main:
 	li	a2, -1
 	ori	a0, a2, -1        # OR with -1 immediate (valid 12-bit)
+	mv	a1, a0
+	li	a0, 0
 	li	a7, 5
 	ecall
 .Lfunc_end1:

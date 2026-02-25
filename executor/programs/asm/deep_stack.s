@@ -13,5 +13,7 @@ main:
 	sb	t0, 0(sp)		# Store byte in page D000
 	lb	a0, 0(sp)		# Load it back
 	add	sp, sp, t1		# Restore stack
+	mv	a1, a0
+	li	a0, 0
 	li	a7, 5
 	ecall

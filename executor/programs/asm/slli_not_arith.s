@@ -8,6 +8,8 @@ main:
 	srli	a2, a2, 1         # 0x7FFFFFFFFFFFFFFF = i64::MAX
 	addi	a2, a2, 2         # 0x8000000000000001 = i64::MIN + 1
 	slli    a0, a2, 1         # 0x0000000000000002 = 2 (top bit shifted out)
+	mv	a1, a0
+	li	a0, 0
 	li	a7, 5
 	ecall
 .Lfunc_end1:

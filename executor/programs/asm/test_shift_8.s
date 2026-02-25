@@ -9,5 +9,7 @@ main:
 	srli	a2, a1, 4		# 5. 256 >> 4 = 16
 	sra	a3, a0, t1		# 6. SRA: 16 >> 4 = 1
 	srl	a4, a1, t1		# 7. SRL: 256 >> 4 = 16
+	mv	a1, a0
+	li	a0, 0
 	li	a7, 5
 	ecall		# 8. Return

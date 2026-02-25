@@ -11,5 +11,7 @@ main:
 greater_eq:
 	addi	a0, zero, 3        # Taken path
 end:
+	mv	a1, a0
+	li	a0, 0
 	li	a7, 5
 	ecall

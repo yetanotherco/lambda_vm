@@ -9,5 +9,7 @@ main:
 	add	a2, t1, t0		# 5. 1 + -1 = 0
 	add	a3, t0, zero		# 6. -1 + 0 = -1
 	add	a4, zero, t0		# 7. 0 + -1 = -1
+	mv	a1, a0
+	li	a0, 0
 	li	a7, 5
 	ecall		# 8. Return

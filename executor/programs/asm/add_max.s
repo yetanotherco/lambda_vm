@@ -25,6 +25,8 @@ main:
 	add     a2, a2, a2     # 2_146_435_072
 	add     a2, a2, a3     # 2_147_483_136
 	addi    a0, a2, 511    # 2_147_483_647
+	mv	a1, a0
+	li	a0, 0
 	li	a7, 5
 	ecall
 .Lfunc_end1:

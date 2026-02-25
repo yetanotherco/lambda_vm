@@ -4,6 +4,8 @@
 main:
 	addi	a2, zero, -10
 	sltiu   a0, a2, -5
+	mv	a1, a0
+	li	a0, 0
 	li	a7, 5
 	ecall
 .Lfunc_end1:
