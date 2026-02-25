@@ -34,7 +34,6 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
-    // FFT evaluation produces bit-reversed output; use bitrev variant to skip redundant BRP.
     let evals = Polynomial::evaluate_offset_fft_bitrev(&p_0, 1, Some(domain_size), coset_offset)
         .expect("FRI commit: FFT evaluation of p₀ on coset domain must succeed");
     drop(p_0);
@@ -45,9 +44,22 @@ where
     )
 }
 
-/// Like [`commit_phase`], but takes pre-computed bit-reversed evaluations directly,
-/// skipping the initial FFT. Use this when the caller already has the evaluation
-/// vector (e.g. from a fused LDE pipeline).
+/// FRI commit phase from pre-computed bit-reversed evaluations.
+///
+/// # Protocol structure
+///
+/// The protocol proceeds in rounds. Each round samples one challenge and applies
+/// one or more sequential binary folds. The first round always does exactly 1 fold
+/// (matching the verifier's initial fold from the DEEP polynomial pair). Subsequent
+/// rounds fold `log_arity` times, with the challenge squaring between sub-folds:
+/// `zeta, zeta^2, zeta^4, ...`.
+///
+/// After each round's fold(s), if more folding remains, the evaluations are committed
+/// in a Merkle tree with leaves of `2^log_arity` consecutive elements. These leaves
+/// provide the verifier with enough data to locally replay `log_arity` folds.
+///
+/// The Fiat-Shamir transcript order is preserved:
+/// `sample challenge → fold → commit → sample challenge → fold → commit → ...`
 pub fn commit_phase_from_evaluations<F: IsFFTField + IsSubFieldOf<E>, E: IsField + Send + Sync>(
     number_layers: usize,
     mut evals: Vec<FieldElement<E>>,
@@ -66,25 +78,26 @@ where
 {
     let total_binary_folds = number_layers.saturating_sub(log_final_poly_len);
     let mut inv_twiddles = compute_coset_twiddles_inv(coset_offset, domain_size);
-    let num_committed_layers = if total_binary_folds > log_arity {
-        (total_binary_folds - 1) / log_arity - 1 + 1 // = ceil(total/arity) - 1
-    } else {
-        0
-    };
-    let mut fri_layer_list = Vec::with_capacity(num_committed_layers);
+    let mut fri_layer_list = Vec::new();
     let mut current_coset_offset = coset_offset.clone();
     let mut current_domain_size = domain_size;
     let mut binary_folds_done = 0;
+    let group_size = 1usize << log_arity;
 
     while binary_folds_done < total_binary_folds {
-        let folds_this_round = log_arity.min(total_binary_folds - binary_folds_done);
+        // First round: 1 fold (initial binary fold matching verifier's DEEP pair fold).
+        // Subsequent rounds: log_arity folds (verifier replays from committed leaf group).
+        let folds_this_round = if binary_folds_done == 0 {
+            1.min(total_binary_folds)
+        } else {
+            log_arity.min(total_binary_folds - binary_folds_done)
+        };
         let is_last = binary_folds_done + folds_this_round >= total_binary_folds;
 
         // <<<< Receive challenge: one per round
         let zeta: FieldElement<E> = transcript.sample_field_element();
 
-        // Apply folds_this_round sequential arity-2 folds
-        // Challenges: zeta, zeta^2, zeta^4, ..., zeta^(2^(k-1))
+        // Apply sequential binary folds with squaring challenges
         let mut challenge = zeta;
         for _ in 0..folds_this_round {
             fold_evaluations_in_place(&mut evals, &challenge, &inv_twiddles);
@@ -97,7 +110,6 @@ where
 
         // Commit post-fold evaluations (except for last round → final poly)
         if !is_last {
-            let group_size = 1usize << folds_this_round;
             let leaves: Vec<Vec<FieldElement<E>>> = evals
                 .chunks_exact(group_size)
                 .map(|chunk| chunk.to_vec())
@@ -172,8 +184,8 @@ where
 
                 let mut index = *iota_s;
                 for layer in fri_layers {
-                    // Sibling elements: all elements in the same leaf group except
-                    // the queried one. For arity 2^k, there are 2^k - 1 siblings.
+                    // The queried index falls within a leaf group. Extract all siblings
+                    // (group elements except the queried one).
                     let group_index = index / group_size;
                     let pos_in_group = index % group_size;
                     let group_start = group_index * group_size;
@@ -187,6 +199,8 @@ where
                     layers_evaluations_sym.push(siblings);
                     layers_auth_paths_sym.push(auth_path);
 
+                    // After folding the group of 2^log_arity values down to 1 value,
+                    // the next layer's index is the group_index.
                     index = group_index;
                 }
 
