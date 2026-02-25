@@ -1535,3 +1535,29 @@ fn test_small_max_rows_splits_tables() {
         .expect("Verifier should not error");
     assert!(verified, "Proof with small max_rows should verify");
 }
+
+/// Verify rejects inflated table_counts that don't match proof sub-proof count.
+#[test]
+fn test_verify_rejects_inflated_table_counts() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("sub");
+    let proof_options = ProofOptions::default_test_options();
+
+    let vm_proof = crate::prove_with_options(&elf_bytes, &proof_options, &Default::default())
+        .expect("Prover should succeed on valid program");
+
+    // Inflate cpu count — total won't match proof.proofs.len()
+    let tampered_proof = crate::VmProof {
+        table_counts: crate::TableCounts {
+            cpu: 10000,
+            ..vm_proof.table_counts.clone()
+        },
+        ..vm_proof
+    };
+
+    let result = crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options);
+    assert!(
+        result.is_err(),
+        "Inflated table_counts should be rejected, got {:?}",
+        result
+    );
+}

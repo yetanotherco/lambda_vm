@@ -72,6 +72,15 @@ impl TableCounts {
     ///
     /// A zero count for any table would remove its constraints from verification,
     /// allowing a malicious prover to bypass soundness checks.
+    /// Sum of all chunk counts across split tables.
+    pub fn total(&self) -> usize {
+        self.cpu + self.lt + self.memw + self.load + self.mul + self.dvrm + self.branch
+    }
+
+    /// Validate that all required tables have at least one chunk.
+    ///
+    /// A zero count for any table would remove its constraints from verification,
+    /// allowing a malicious prover to bypass soundness checks.
     pub fn validate(&self) -> Result<(), Error> {
         let checks = [
             ("cpu", self.cpu),
@@ -396,6 +405,20 @@ pub fn verify_with_options(
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let page_configs =
         Traces::page_configs_from_elf_and_runtime(&program, &vm_proof.runtime_page_ranges);
+
+    // Cross-check: table_counts must match the number of sub-proofs.
+    // Fixed tables (bitwise, decode, halt, register) = 4, plus page tables.
+    let expected_proof_count = vm_proof.table_counts.total() + 4 + page_configs.len();
+    if expected_proof_count != vm_proof.proof.proofs.len() {
+        return Err(Error::InvalidTableCounts(format!(
+            "table_counts total ({}) + 4 fixed + {} pages = {}, but proof contains {} sub-proofs",
+            vm_proof.table_counts.total(),
+            page_configs.len(),
+            expected_proof_count,
+            vm_proof.proof.proofs.len(),
+        )));
+    }
+
     let airs = VmAirs::new(
         &program,
         proof_options,

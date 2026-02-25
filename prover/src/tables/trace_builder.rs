@@ -22,7 +22,7 @@
 //! use lambda_vm_prover::tables::trace_builder::Traces;
 //!
 //! let traces = Traces::from_elf_and_logs(&elf, &logs)?;
-//! // Use traces.cpu, traces.bitwise, traces.lt, traces.memws, traces.load, traces.memory_init
+//! // Use traces.cpus, traces.bitwise, traces.lts, traces.memws, traces.loads
 //! ```
 
 use std::collections::HashMap;
@@ -1402,14 +1402,10 @@ impl Traces {
         // When CPU is split, each chunk pads independently
         let mut decode = decode_trace;
         let pc_to_row = decode_pc_to_row;
-        let num_padding_rows: usize = if cpu_ops.is_empty() {
-            0
-        } else {
-            cpu_ops
-                .chunks(max_rows.cpu)
-                .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
-                .sum()
-        };
+        let num_padding_rows: usize = cpu_ops
+            .chunks(max_rows.cpu)
+            .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
+            .sum();
         let mut decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
         decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
         decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
@@ -1568,14 +1564,10 @@ impl Traces {
         // Padding rows also look up pc=1 (the CPU padding entry)
         // When CPU is split, each chunk pads independently
         let (mut decode, pc_to_row) = decode::generate_decode_trace(&instructions);
-        let num_padding_rows: usize = if cpu_ops.is_empty() {
-            0
-        } else {
-            cpu_ops
-                .chunks(max_rows.cpu)
-                .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
-                .sum()
-        };
+        let num_padding_rows: usize = cpu_ops
+            .chunks(max_rows.cpu)
+            .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
+            .sum();
         let mut decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
         decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
         decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
