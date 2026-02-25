@@ -1,9 +1,5 @@
 # SIGN Template
 
-box( inset: (left: 4pt, right: 4pt), outset: (top: 4pt, bottom: 4pt), radius: 2pt, fill: luma(230), raw(code)) }
-
-= Interface The  constraint template has the following interface:
-
 It constrains that `sign` is set to `1` when both `X`'s most significant bit and `signed` are `1`, and `0` otherwise.
 
 = Variables The  template operates on three variables:

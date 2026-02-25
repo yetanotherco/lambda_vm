@@ -1,5 +1,7 @@
 # LT Chip
 
+The  chip constrains an indicator bit for the less-than relation, signed or unsigned.
+
 = Columns
 
 The `LT` chip is comprised of  variables that are expressed using  columns:
@@ -24,15 +26,15 @@ The polynomial `P` can be simplified to a total degree of two. We claim that the
 | `LT-C2` | `MSB16[rhs_msb; rhs[2]]` | μ |
 | `LT-C3` | `lt` = `signed` dot (A (1 - B) + A C + (1 - B) C) + (1 - `signed`) dot `unsigned_lt` |  |
 | | _polynomial:_ `lt - signed * (lhs_msb * (1 - rhs_msb) + lhs_msb * carry[1] + (1 - rhs_msb) * carry[1]) - (1 - signed) * unsigned_lt = 0` | |
-| `LT-C4` | `IS_HALFWORD[lhs[1]]` | μ |
-| `LT-C5` | `IS_HALFWORD[rhs[1]]` | μ |
+| `LT-C4` | `IS_HALF[lhs[1]]` | μ |
+| `LT-C5` | `IS_HALF[rhs[1]]` | μ |
 
 And then we constrain the subtraction, taking care of the remaining range checking not yet covered by the assumptions or the `MSB16` lookup.
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
 | `LT-C6.i` | i ∈ [0, 1] | `IS_BIT<carry[i]>` |  |
-| `LT-C7.i` | i ∈ [0, 3] | `IS_HALFWORD[lhs_sub_rhs[i]]` | μ |
+| `LT-C7.i` | i ∈ [0, 3] | `IS_HALF[lhs_sub_rhs[i]]` | μ |
 
 The chip contributes the following to the lookup argument.
 

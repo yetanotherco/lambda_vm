@@ -32,19 +32,13 @@ Each memory operation will then do two things:
 
 Naturally, for a read operation, the _values_ embedded in the consumed and emitted tokens must be identical. From the need to consume a token even on the first memory access, we can see the necessity for a memory initialization procedure ---in addition to having to make sure the initial memory content lines up with what the binary dictates.
 
-> **Note:** properly link/refer to the logup spec
-
-So long as we can properly constrain temporal integrity (that is, no memory operation can consume future tokens), this "balancing" act of tokens can be integrated (with sufficient domain separation) into the existing LogUp argument: consuming a token corresponds to a "receive" and emitting a new token is a "send".
+So long as we can properly constrain temporal integrity (that is, no memory operation can consume future tokens), this "balancing" act of tokens can be integrated (with sufficient domain separation) into the existing LogUp argument ([logup]): consuming a token corresponds to a "receive" and emitting a new token is a "send".
 
 = Temporal integrity
 
-> **Note:** Properly link/refer to the LT chip
-
-To ensure temporal integrity, every memory operation needs to be constrained for the newly emitted token to have a strictly greater timestamp than the consumed token. This raises the question of how to represent timestamps and cleanly perform this check, as over a finite field the “less than” relation is ill-defined (though it is common and natural to consider it as the less than relation over the natural lift of the field into the integers). We choose to represent timestamps as machine words, using the existing `LT` chip ([lt]) functionality for comparisons.
+To ensure temporal integrity, every memory operation needs to be constrained for the newly emitted token to have a strictly greater timestamp than the consumed token. This raises the question of how to represent timestamps and cleanly perform this check, as over a finite field the “less than” relation is ill-defined (though it is common and natural to consider it as the less than relation over the natural lift of the field into the integers). We choose to represent timestamps as machine words, using the existing `LT` chip ([lt]) functionality for comparisons. The full implementation of the timestamp system can be seen in the `timestamp` column of the `CPU` ([cpu]) and `MEMW` chips ([memw]). The `CPU` merely passes in the current timestamp, while `MEMW` can recall the previously written timestamp and constrain the correct sequencing.
 
 - Clean definition of “less-than”, using the already existing `LT` functionality in the ALU - Harder to perform increments, needing extra constraints beyond field arithmetic - But this can be alleviated by providing a precomputed column that has a fixed increment per CPU row ][ - Comparison is more annoying, but can work by: - Decomposition into a machine word and chip interaction with the LT chip - Bit decomposition and comparison constraints - Range-checking the difference to be sufficiently small w.r.t. the field characteristic. - Increments and basic arithmetic operations are cheap ] ]
-
-> **Note:** reference to CPU chip/timestamp column and MEMW chip
 
 = Initialization and Finalization
 
@@ -78,9 +72,7 @@ One or more STARK tables (depending on the amount of memory used) consisting of 
 
 ## Register initialization/finalization
 
-> **Note:** Properly link/reference ECALL/HALT chip
-
-The initial and final state of registers can be entirely known by the verifier, since the relevant initialization values are either zero, or embedded in the ELF, and the final values can be set to a known value by the HALT ecall. As additionally, the number of registers is small, the verifier can directly add the required balancing terms to the LogUp sum.
+The initial and final state of registers can be entirely known by the verifier, since the relevant initialization values are either zero, or embedded in the ELF, and the final values can be set to a known value by the `HALT` ecall ([ecall]). As additionally, the number of registers is small, the verifier can directly add the required balancing terms to the LogUp sum.
 
 = Notes and considerations
 
@@ -128,13 +120,7 @@ table( columns: 1fr, inset: 7pt, align: (top+left, center), stroke: none, table.
 
 # IS_BIT Template
 
-box( inset: (left: 4pt, right: 4pt), outset: (top: 4pt, bottom: 4pt), radius: 2pt, fill: luma(230), raw(code)) }
-
 Barring exceptional cases, this template is used to assert that a variable of type `Bit` assumes a valid value under some condition.
-
-= Interface The  constraint template has the following interface:
-
-where `cond` is any value described by an expression _of degree at most `1`_. Note that  can be used to denote the _unconditional_ application of the  template to `X`.
 
 = Variables The  template operates on two variables: `cond` and `X`:
 
@@ -170,10 +156,6 @@ where `cond` is any value described by an expression _of degree at most `1`_. No
 ---
 
 # SIGN Template
-
-box( inset: (left: 4pt, right: 4pt), outset: (top: 4pt, bottom: 4pt), radius: 2pt, fill: luma(230), raw(code)) }
-
-= Interface The  constraint template has the following interface:
 
 It constrains that `sign` is set to `1` when both `X`'s most significant bit and `signed` are `1`, and `0` otherwise.
 
@@ -219,19 +201,9 @@ It constrains that `sign` is set to `1` when both `X`'s most significant bit and
 
 # ADD/SUB Template
 
-box( inset: (left: 4pt, right: 4pt), outset: (top: 4pt, bottom: 4pt), radius: 2pt, fill: luma(230), raw(code)) }
+For ease of notation, we moreover introduce the  constraint template $
 
-= Notation The  constraint template has the following interface:
-
-where `cond` is any value described by an expression _of degree at most `1`_.
-
-## 
-
-For ease of notation, we moreover introduce the  constraint template. Its interface
-
-maps onto the  template as
-
-It constrains that ``diff` = `lhs` - `rhs` mod 2^64` when the expression `cond` is non-zero. As with ,  can be used to denote the _unconditional_ application of the template.
+$ in both conditional and unconditional versions. It constrains that ``diff` equiv `lhs` - `rhs` (mod 2^64)` when the expression `cond` is non-zero.
 
 = Variables
 
@@ -292,11 +264,7 @@ carry (when iter=1) := 2^-32 * (lhs[1] + rhs[1] + carry[0] - sum[1])
 
 # NEG Template
 
-box( inset: (left: 4pt, right: 4pt), outset: (top: 4pt, bottom: 4pt), radius: 2pt, fill: luma(230), raw(code)) }
-
-= Notation The  constraint template has the following interface:
-
-where `cond` is a bit value (i.e., lies in `{0, 1}`)  described by an expression _of degree at most `1`_.
+It requires `cond` to be a bit.
 
 = Variables
 
@@ -394,7 +362,7 @@ The `RV64C` extension for compressed instructions specifies that \~50% of all in
 
 show figure: set block(breakable: true)
 
-figure(table( columns: (auto, auto, 40pt, 40pt, 1fr, 15pt), stroke: 0pt, inset: (right: .5em), align: (left, right, center, center, left, right), fill: (_, y) => if calc.odd(y) and y <= lines.len() { luma(245) } else { white }, table.header([*Operation*], [*op-flag*], [*`w_instr`*], [*`signed`*], [*other*], []), table.hline(stroke: 1.5pt), table.vline(x: 1, start: 1, end: lines.len() + 1, stroke: .5pt), ..lines.flatten(), table.hline(stroke: 1.5pt), table.footer([*Operation*], [*op-flag*], [*`w_instr`*], [*`signed`*], [*other*]), ), caption: [Decoding table] }
+figure(table( columns: (auto, auto, auto, auto, 1fr, auto), stroke: 0pt, inset: (right: .5em), align: (left, right, center, center, left, right), fill: (_, y) => // Overlay a low-opacity fill color to distinguish the different rows better if calc.odd(y) and y <= lines.len() { color.rgb(0, 0, 100, 20) } else { color.rgb(255, 255, 255, 20) }, table.header([*Operation*], [*op-flag*], [*`w_instr`*], [*`signed`*], [*other*], []), table.hline(stroke: 1.5pt), table.vline(x: 1, start: 1, end: lines.len() + 1, stroke: .5pt), ..lines.flatten(), table.hline(stroke: 1.5pt), table.footer([*Operation*], [*op-flag*], [*`w_instr`*], [*`signed`*], [*other*]), ), caption: [Decoding table] }
 
 // OP-IMM ([`ADDI[W]   rd, rs1, imm`], [`ADD`], [`[W]`], [], [], []), ([`SLTI[U]   rd, rs1, imm`], [`SLT`], [], [.not`[U]`], [], []), ([`ANDI      rd, rs1, imm`], [`AND`], [], [], [], []), ([`ORI       rd, rs1, imm`], [`OR`],   [], [], [], []), ([`XORI      rd, rs1, imm`], [`XOR`], [], [], [], []), ([`SLLI[W]   rd, rs1, imm`], [`SHIFT`], [`[W]`], [], [], []), ([`SRLI[W]   rd, rs1, imm`], [`SHIFT`], [`[W]`], [], [`mp_selector`], []), ([`SRAI[W]   rd, rs1, imm`], [`SHIFT`], [`[W]`], [1], [`mp_selector`], []), // OP ([`ADD[W]    rd, rs1, rs2`], [`ADD`], [`[W]`], [], [], []), ([`SUB[W]    rd, rs1, rs2`], [`SUB`], [`[W]`], [], [], []), ([`SLT[U]    rd, rs1, rs2`], [`SLT`], [], [.not`[U]`], [], []), ([`AND       rd, rs1, rs2`], [`AND`], [], [], [], []), ([`OR        rd, rs1, rs2`], [`OR`], [], [], [], []), ([`XOR       rd, rs1, rs2`], [`XOR`], [], [], [], []), ([`SLL[W]    rd, rs1, rs2`], [`SHIFT`], [`[W]`], [], [], []), ([`SRL[W]    rd, rs1, rs2`], [`SHIFT`], [`[W]`], [], [`mp_selector`], []), ([`SRA[W]    rd, rs1, rs2`], [`SHIFT`], [`[W]`], [1], [`mp_selector`], []), // OP - M ([`MUL[W]    rd, rs1, rs2`], [`MUL`], [`[W]`], [1], [`mp_selector`], []), ([`MULH      rd, rs1, rs2`], [`MUL`], [], [1], [`mp_selector`, `muldiv_selector`], []), ([`MULHU     rd, rs1, rs2`], [`MUL`], [], [], [`muldiv_selector`], []), ([`MULHSU    rd, rs1, rs2`], [`MUL`], [], [1], [`muldiv_selector`], []), ([`DIV[U][W] rd, rs1, rs2`], [`DIVREM`], [`[W]`], [.not`[U]`], [], []), ([`REM[U][W] rd, rs1, rs2`], [`DIVREM`], [`[W]`], [.not`[U]`], [`muldiv_selector`], []), // LUI/AUIPC ([`LUI       rd, imm`], [`ADD`], [], [], [], []), ([`AUIPC     rd, imm`], [`ADD`], [], [], [`rs1 := x255`], []), ([`JAL       rd, imm`], [`JALR`], [], [], [`rs1 := x255`], []), // Branching ([`JALR      rd, rs1, imm`], [`JALR`], [], [], [], []), ([`BEQ      rs1, rs2, imm`], [`BEQ`], [], [], [], []), ([`BNE      rs1, rs2, imm`], [`BEQ`], [], [], [`mp_selector`], []), ([`BLT[U]   rs1, rs2, imm`], [`BLT`], [], [.not`[U]`], [], []), ([`BGE[U]   rs1, rs2, imm`], [`BLT`], [], [.not`[U]`], [`mp_selector`], []), // LOAD ([`LD        rd, rs1, imm`], [`LOAD`], [], [], [`mem_8B`], []), ([`LW[U]     rd, rs1, imm`], [`LOAD`], [], [.not`[U]`], [`mem_4B`], []), ([`LH[U]     rd, rs1, imm`], [`LOAD`], [], [.not`[U]`], [`mem_2B`], []), ([`LB[U]     rd, rs1, imm`], [`LOAD`], [], [.not`[U]`], [], []), // STORE ([`SD       rs1, rs2, imm`], [`STORE`], [], [], [`mem_8B`], []), ([`SW       rs1, rs2, imm`], [`STORE`], [], [], [`mem_4B`], []), ([`SH       rs1, rs2, imm`], [`STORE`], [], [], [`mem_2B`], []), ([`SB       rs1, rs2, imm`], [`STORE`], [], [], [], []), // ECALL/EBREAK ([`ECALL`], [`ECALL`], [], [], [``rs1` := `x17``], []), ([`EBREAK`], [`EBREAK`], [], [], [], []), // FENCE ([`FENCE`], [`ADD`], [], [], [], []),
 
@@ -432,6 +400,8 @@ This entry is used to pad the `CPU` table. More details on this matter are provi
 
 # CPU Chip
 
+The  chip coordinates memory accesses and dispatches to other chips for arithmetic and logical operations. It bases its decisions on the entry of the `DECODE` table ([decode]) corresponding the the current program counter (PC).
+
 = Columns
 
 The `CPU` chip is comprised of  variables that are expressed using  columns:
@@ -443,8 +413,6 @@ The `CPU` chip is comprised of  variables that are expressed using  columns:
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
 | `CPU-C1` | `DECODE[pc, imm, packed_decode]` | 1 |
-
-> **Note:** All casts for interactions will have to be reviewed once other chip interfaces stabilise
 
 ## Range checks
 
@@ -505,10 +473,10 @@ The ALU functionality is then obtained through judicious dispatching to the corr
 | `CPU-CA40.i` | i ∈ [0, 7] | `AND_BYTE[res[i]; arg1[i], arg2[i]]` | AND |
 | `CPU-CA41.i` | i ∈ [0, 7] | `OR_BYTE[res[i]; arg1[i], arg2[i]]` | OR |
 | `CPU-CA42.i` | i ∈ [0, 7] | `XOR_BYTE[res[i]; arg1[i], arg2[i]]` | XOR |
-| `CPU-CA43` |  | `SHIFT[res::DWordHL; arg1::DWordHL, arg2[0], mp_selector, signed, word_instr]` | SHIFT |
+| `CPU-CA43` |  | `SHIFT[res::DWordWL; arg1::DWordHL, arg2[0], mp_selector, signed, word_instr]` | SHIFT |
 | `CPU-CA44` |  | JALR ⇒ `ADD<res::DWordWL; pc, (2 * c_type_instruction + 4 * (1 - c_type_instruction)) * 1::DWordWL>` |  |
-| `CPU-CA45` |  | `MUL[res; arg1, signed, arg2, mp_selector, muldiv_selector]` | MUL |
-| `CPU-CA46` |  | `DVRM[res; arg1, arg2, signed, muldiv_selector]` | DIVREM |
+| `CPU-CA45` |  | `MUL[res::DWordWL; arg1::DWordHL, signed, arg2::DWordHL, mp_selector, muldiv_selector]` | MUL |
+| `CPU-CA46` |  | `DVRM[res::DWordWL; arg1::DWordHL, arg2::DWordHL, signed, muldiv_selector]` | DIVREM |
 
 ## Memory
 
@@ -516,16 +484,16 @@ The interactions with the memory, both for register loading and storing, as for 
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `CPU-CM47` |  | `MEMW[rv1; 1, 2 * rs1, rv1, timestamp + 0::DWordWL, 1, 0, 0]` | read_register1 |
+| `CPU-CM47` |  | `MEMW[['arr', ['idx', ['cast', 'rv1', 'DWordWL'], 0], ['idx', ['cast', 'rv1', 'DWordWL'], 1], 0, 0, 0, 0, 0, 0]; 1, 2::DWordWL * rs1, ['arr', ['idx', ['cast', 'rv1', 'DWordWL'], 0], ['idx', ['cast', 'rv1', 'DWordWL'], 1], 0, 0, 0, 0, 0, 0], timestamp + 0::DWordWL, 1, 0, 0]` | read_register1 |
 | `CPU-CM48.i` | i ∈ [0, 2] | `!read_register1` => `rv1[i]` = 0 |  |
 | | | _polynomial:_ `(1 - read_register1) * rv1[i] = 0` | |
-| `CPU-CM49` |  | `MEMW[rv2; 1, 2 * rs2, rv2, timestamp + 1::DWordWL, 1, 0, 0]` | read_register2 |
+| `CPU-CM49` |  | `MEMW[['arr', ['idx', ['cast', 'rv2', 'DWordWL'], 0], ['idx', ['cast', 'rv2', 'DWordWL'], 1], 0, 0, 0, 0, 0, 0]; 1, 2::DWordWL * rs2, ['arr', ['idx', ['cast', 'rv2', 'DWordWL'], 0], ['idx', ['cast', 'rv2', 'DWordWL'], 1], 0, 0, 0, 0, 0, 0], timestamp + 1::DWordWL, 1, 0, 0]` | read_register2 |
 | `CPU-CM50.i` | i ∈ [0, 2] | `!read_register2` => `rv2[i]` = 0 |  |
 | | | _polynomial:_ `(1 - read_register2) * rv2[i] = 0` | |
-| `CPU-CM51` |  | `MEMW[1, 2 * rd, rvd, timestamp + 2::DWordWL, 1, 0, 0]` | write_register |
-| `CPU-CM52` |  | `LOAD[rvd; 0, res, timestamp + 0::DWordWL, memory_2bytes, memory_4bytes, memory_8bytes, signed]` | LOAD |
-| `CPU-CM53` |  | `MEMW[0, res, arg2::Byte[8], timestamp + 1::DWordWL, memory_2bytes, memory_4bytes, memory_8bytes]` | STORE |
-| `CPU-CM54` |  | `MEMW[pc; 1, 2 * 255, next_pc, timestamp + 1::DWordWL, 1, 0, 0]` | 1 - pad |
+| `CPU-CM51` |  | `MEMW[1, 2::DWordWL * rd, ['arr', ['idx', 'rvd', 0], ['idx', 'rvd', 1], 0, 0, 0, 0, 0, 0], timestamp + 2::DWordWL, 1, 0, 0]` | write_register |
+| `CPU-CM52` |  | `LOAD[rvd; res::DWordWL, timestamp + 0::DWordWL, memory_2bytes, memory_4bytes, memory_8bytes, signed]` | LOAD |
+| `CPU-CM53` |  | `MEMW[0, res::DWordWL, arg2::Byte[8], timestamp + 1::DWordWL, memory_2bytes, memory_4bytes, memory_8bytes]` | STORE |
+| `CPU-CM54` |  | `MEMW[['arr', ['idx', 'pc', 0], ['idx', 'pc', 1], 0, 0, 0, 0, 0, 0]; 1, (2 * 255)::DWordWL, ['arr', ['idx', 'next_pc', 0], ['idx', 'next_pc', 1], 0, 0, 0, 0, 0, 0], timestamp + 1::DWordWL, 1, 0, 0]` | 1 - pad |
 
 ## System
 
@@ -570,7 +538,7 @@ For [cpu:c:is_equal], note that [cpu:c:sub] sets `res` to be the difference betw
 | `CPU-CO67` | `ZERO[is_equal; res[0] + res[1] + res[2] + res[3] + res[4] + res[5] + res[6] + res[7]]` | BEQ |
 | `CPU-CO68` | `branch_cond` = `JALR` or (`BLT` and (`res` xor `invert`)) or (`BEQ` and (`is_equal` xor `invert`)) |  |
 | | _polynomial:_ `-branch_cond + JALR + res[0] * (1 - mp_selector) * BLT + (1 - res[0]) * mp_selector * BLT + is_equal * (1 - mp_selector) * BEQ + (1 - is_equal) * mp_selector * BEQ = 0` | |
-| `CPU-CO69` | `BRANCH[next_pc; pc, imm[0], arg1::DWordWL, JALR]` | branch_cond |
+| `CPU-CO69` | `BRANCH[next_pc; pc, imm, arg1::DWordWL, JALR]` | branch_cond |
 | `CPU-CO70` | `ADD<next_pc; pc, (2 * c_type_instruction + 4 * (1 - c_type_instruction)) * 1::DWordWL>` |  |
 
 > **Note:** Document the choice to not have a multiplicity column here for padding
@@ -671,9 +639,7 @@ pad := 1 - ADD - SUB - SLT - AND - OR - XOR - SHIFT - JALR - BEQ - BLT - LOAD - 
 
 # SHIFT Chip
 
-= Interface The  chip has the following interface:
-
-``` // param in: the value being shifted // param shift: the number of bits to shift `in` by // param direction: whether to shift left (0) or right (1) // param signed: whether to interpret `in` as a signed (1) or unsigned (0) integer // param word_instr: whether to execute the SLL/SR* (0) or SLLW/SR*W (1) instruction // out shifted: the resulting value SHIFT[shifted: DWord; in: DWord, shift: Byte, direction: Bit, signed: Bit, word_instr: Bit] ``` In other words, the  chip is designed to constrain that $
+The  chip is designed to constrain that $
 
 $ $
 
@@ -847,13 +813,19 @@ shifted := left * Σ_j = 0^i limb_shift[j] * intra_limb_left[i - j] + right * (�
 
 | Tag | Range | Description |
 |-----|-------|-------------|
-| `SHIFT-A1.i` | i ∈ [0, 3] | `IS_HALFWORD[in[i]]` |
+| `SHIFT-A1.i` | i ∈ [0, 3] | `IS_HALF[in[i]]` |
 | `SHIFT-A2` |  | `IS_BYTE[shift]` |
 | `SHIFT-A3` |  | `IS_BIT<direction>` |
 | `SHIFT-A4` |  | `IS_BIT<signed>` |
 | `SHIFT-A5` |  | `IS_BIT<word_instr>` |
 
 ## Constraints
+
+### is_negative
+
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `SHIFT-C2` | `MSB16[is_negative; in[3]]` | signed |
 
 ### left_flag
 
@@ -862,15 +834,11 @@ shifted := left * Σ_j = 0^i limb_shift[j] * intra_limb_left[i - j] + right * (�
 | `SHIFT-C1` | `direction` => `μ` = 1 |
 | | _polynomial:_ `direction * (1 - μ) = 0` |
 
-### is_negative
-
-| Tag | Description | Multiplicity |
-|-----|-------------|--------------|
-| `SHIFT-C2` | `MSB16[is_negative; in[3]]` | signed |
-
 ---
 
 # BRANCH Chip
+
+The  chip computes the target address of a branching instruction.
 
 = Columns
 
@@ -879,8 +847,6 @@ The `BRANCH` chip is comprised of  variables that are expressed using  columns:
 = Assumptions
 
 = Constraints
-
-> **Note:** Check correspondence with CPU for passing in `offset` as word or dword
 
 We constrain `next_pc` to be ``base_address` + `offset``, where `base_address` equals `pc` when ``JALR` = 0` and `register` otherwise.
 
@@ -892,7 +858,7 @@ The range checks on `unmasked_low_byte` and `next_pc_low[0]` are performed impli
 | `BRANCH-C2` |  | JALR ⇒ `ADD<next_pc_unmasked; register, offset::DWordWL>` |  |
 | `BRANCH-C3` |  | `IS_BYTE[next_pc_low[1]]` | μ |
 | `BRANCH-C4` |  | `AND_BYTE[next_pc_low[0]; unmasked_low_byte, 254]` | μ |
-| `BRANCH-C5.i` | i ∈ [0, 2] | `IS_HALFWORD[next_pc_high[i]]` | μ |
+| `BRANCH-C5.i` | i ∈ [0, 2] | `IS_HALF[next_pc_high[i]]` | μ |
 
 This chip contributes the following to the lookup argument.
 
@@ -966,6 +932,8 @@ next_pc (when iter=1) := 2^16 * next_pc_high[2] + next_pc_high[1]
 
 # MEMW Chip
 
+The  chip is used to read and write memory locations (both RAM and registers) in chunks of 1, 2, 4 or 8 values. It introduces the old value and last-accessed timestamps of memory addresses internally, in order to satisfy the design of the memory argument ([memory]).
+
 = Columns
 
 The `MEMW` chip is comprised of  variables that are expressed using  columns:
@@ -981,12 +949,12 @@ Our assumptions do not explicitly cover any range checks for the `is_register` a
 | `MEMW-C1` |  | `IS_BIT<μ_sum>` |  |
 | `MEMW-C2` |  | `w2` => `μ_sum` |  |
 | | | _polynomial:_ `w2 * (1 - μ_sum) = 0` | |
-| `MEMW-C3` |  | w2 ⇒ `ADD<address_add[0]::DWordWL; base_address, 1>` |  |
-| `MEMW-C4.i` | i ∈ [1, 2] | w4 ⇒ `ADD<address_add[i]::DWordWL; base_address, i + 1>` |  |
-| `MEMW-C5.i` | i ∈ [3, 6] | write8 ⇒ `ADD<address_add[i]::DWordWL; base_address, i + 1>` |  |
-| `MEMW-C6.i` | i ∈ [0, 0], j ∈ [0, 3] | `IS_HALFWORD[address_add[i][j]]` | w2 |
-| `MEMW-C7.i` | i ∈ [1, 2], j ∈ [0, 3] | `IS_HALFWORD[address_add[i][j]]` | w4 |
-| `MEMW-C8.i` | i ∈ [3, 6], j ∈ [0, 3] | `IS_HALFWORD[address_add[i][j]]` | write8 |
+| `MEMW-C3` |  | w2 ⇒ `ADD<address_add[0]::DWordWL; base_address, 1::DWordWL>` |  |
+| `MEMW-C4.i` | i ∈ [1, 2] | w4 ⇒ `ADD<address_add[i]::DWordWL; base_address, (i + 1)::DWordWL>` |  |
+| `MEMW-C5.i` | i ∈ [3, 6] | write8 ⇒ `ADD<address_add[i]::DWordWL; base_address, (i + 1)::DWordWL>` |  |
+| `MEMW-C6.i` | i ∈ [0, 0], j ∈ [0, 3] | `IS_HALF[address_add[i][j]]` | w2 |
+| `MEMW-C7.i` | i ∈ [1, 2], j ∈ [0, 3] | `IS_HALF[address_add[i][j]]` | w4 |
+| `MEMW-C8.i` | i ∈ [3, 6], j ∈ [0, 3] | `IS_HALF[address_add[i][j]]` | write8 |
 | `MEMW-C9` |  | `LT[1; old_timestamp[0], timestamp, 0]` | μ_sum |
 | `MEMW-C10` |  | `LT[1; old_timestamp[1], timestamp, 0]` | w2 |
 | `MEMW-C11.i` | i ∈ [2, 3] | `LT[1; old_timestamp[i], timestamp, 0]` | w4 |
@@ -1008,12 +976,12 @@ The chip adds the following tuples to the lookup argument, to effectuate that pa
 |-----|-------|-------------|--------------|
 | `MEMW-CM16` |  | `memory[is_register, base_address, old_timestamp[0], old[0]]` | μ_sum |
 | `MEMW-CM17` |  | `memory[is_register, base_address, timestamp, value[0]]` | -μ_sum |
-| `MEMW-CM18` |  | `memory[is_register, address_add[0], old_timestamp[1], old[1]]` | w2 |
-| `MEMW-CM19` |  | `memory[is_register, address_add[0], timestamp, value[1]]` | -w2 |
-| `MEMW-CM20.i` | i ∈ [2, 3] | `memory[is_register, address_add[i - 1], old_timestamp[i], old[i]]` | w4 |
-| `MEMW-CM21.i` | i ∈ [2, 3] | `memory[is_register, address_add[i - 1], timestamp, value[i]]` | -w4 |
-| `MEMW-CM22.i` | i ∈ [4, 7] | `memory[is_register, address_add[i - 1], old_timestamp[i], old[i]]` | write8 |
-| `MEMW-CM23.i` | i ∈ [4, 7] | `memory[is_register, address_add[i - 1], timestamp, value[i]]` | -write8 |
+| `MEMW-CM18` |  | `memory[is_register, address_add[0]::DWordWL, old_timestamp[1], old[1]]` | w2 |
+| `MEMW-CM19` |  | `memory[is_register, address_add[0]::DWordWL, timestamp, value[1]]` | -w2 |
+| `MEMW-CM20.i` | i ∈ [2, 3] | `memory[is_register, address_add[i - 1]::DWordWL, old_timestamp[i], old[i]]` | w4 |
+| `MEMW-CM21.i` | i ∈ [2, 3] | `memory[is_register, address_add[i - 1]::DWordWL, timestamp, value[i]]` | -w4 |
+| `MEMW-CM22.i` | i ∈ [4, 7] | `memory[is_register, address_add[i - 1]::DWordWL, old_timestamp[i], old[i]]` | write8 |
+| `MEMW-CM23.i` | i ∈ [4, 7] | `memory[is_register, address_add[i - 1]::DWordWL, timestamp, value[i]]` | -write8 |
 
 This chip contributes the following to the lookup argument.
 
@@ -1024,7 +992,7 @@ This chip contributes the following to the lookup argument.
 
 = Future optimization ideas
 
-- Fast path for aligned memory access where all bytes have the same old timestamp - MEMB chip that deals does a one-byte write to remove old_timestamp from here (uncertain tradeoffs) - Compute `base_address[1] + 1` once and have high words of `address_add` as Words - Improve overflow trapping somehow so we don't need `LT` (could tie into previous one by checking carry bit of the +1) - Adding `μ_sum`/`w2`/`w4`/`write8` multiplicities to the `IS_HALFWORD` lookups may make some GKR things faster if there are known zeroes.
+- Fast path for aligned memory access where all bytes have the same old timestamp - MEMB chip that deals does a one-byte write to remove old_timestamp from here (uncertain tradeoffs) - Compute `base_address[1] + 1` once and have high words of `address_add` as Words - Improve overflow trapping somehow so we don't need `LT` (could tie into previous one by checking carry bit of the +1) - Adding `μ_sum`/`w2`/`w4`/`write8` multiplicities to the `IS_HALF` lookups may make some GKR things faster if there are known zeroes.
 
 ## Columns
 
@@ -1098,6 +1066,8 @@ w4 := write4 + write8
 
 # LT Chip
 
+The  chip constrains an indicator bit for the less-than relation, signed or unsigned.
+
 = Columns
 
 The `LT` chip is comprised of  variables that are expressed using  columns:
@@ -1122,15 +1092,15 @@ The polynomial `P` can be simplified to a total degree of two. We claim that the
 | `LT-C2` | `MSB16[rhs_msb; rhs[2]]` | μ |
 | `LT-C3` | `lt` = `signed` dot (A (1 - B) + A C + (1 - B) C) + (1 - `signed`) dot `unsigned_lt` |  |
 | | _polynomial:_ `lt - signed * (lhs_msb * (1 - rhs_msb) + lhs_msb * carry[1] + (1 - rhs_msb) * carry[1]) - (1 - signed) * unsigned_lt = 0` | |
-| `LT-C4` | `IS_HALFWORD[lhs[1]]` | μ |
-| `LT-C5` | `IS_HALFWORD[rhs[1]]` | μ |
+| `LT-C4` | `IS_HALF[lhs[1]]` | μ |
+| `LT-C5` | `IS_HALF[rhs[1]]` | μ |
 
 And then we constrain the subtraction, taking care of the remaining range checking not yet covered by the assumptions or the `MSB16` lookup.
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
 | `LT-C6.i` | i ∈ [0, 1] | `IS_BIT<carry[i]>` |  |
-| `LT-C7.i` | i ∈ [0, 3] | `IS_HALFWORD[lhs_sub_rhs[i]]` | μ |
+| `LT-C7.i` | i ∈ [0, 3] | `IS_HALF[lhs_sub_rhs[i]]` | μ |
 
 The chip contributes the following to the lookup argument.
 
@@ -1201,6 +1171,8 @@ unsigned_lt := carry[1]
 ---
 
 # MUL Chip
+
+The  chip constrains multiplication, both signed and unsigned, as well as providing access to the low and high halfs of the multiplication result.
 
 = Columns
 
@@ -1344,6 +1316,8 @@ carry (when iter=[1, 3]) := 2^-32 * (raw_product[i] + carry[i - 1] - res[i])
 ---
 
 # DVRM Chip
+
+The  chip provides division and remainder functionality, both signed and unsigned.
 
 = Columns
 
@@ -1508,6 +1482,13 @@ carry (when iter=[1, 3]) := 2^-32 * ((extended_n_sub_r::QuadWL)[i] + (extended_r
 | `DVRM-C1` | `r` eq.not 0 => `sign_r` = `sign_n` |
 | | _polynomial:_ `Σ_i = 0^3 r[i] * (sign_r - sign_n) = 0` |
 
+### output
+
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `DVRM-C21` | `DVRM[q::DWordWL; n, d, signed, 0]` | -μ_q |
+| `DVRM-C22` | `DVRM[r::DWordWL; n, d, signed, 1]` | -μ_r |
+
 ### n_sub_r
 
 | Tag | Range | Description | Multiplicity |
@@ -1517,14 +1498,6 @@ carry (when iter=[1, 3]) := 2^-32 * ((extended_n_sub_r::QuadWL)[i] + (extended_r
 | `DVRM-C11.i` | i ∈ [0, 3] | `IS_HALF[n_sub_r[i]]` | μ_sum |
 | `DVRM-C12` |  | `IS_BIT<sign_n_sub_r>` |  |
 
-### defs
-
-| Tag | Description |
-|-----|-------------|
-| `DVRM-C16` | `SIGN<sign_n; n[3], signed>` |
-| `DVRM-C17` | `SIGN<sign_r; r[3], signed>` |
-| `DVRM-C18` | `SIGN<sign_d; d[3], signed>` |
-
 ### div_by_zero
 
 | Tag | Range | Description | Multiplicity |
@@ -1533,13 +1506,13 @@ carry (when iter=[1, 3]) := 2^-32 * ((extended_n_sub_r::QuadWL)[i] + (extended_r
 | | | _polynomial:_ `div_by_zero * (q[i] - 65535) = 0` | |
 | `DVRM-C20` |  | `ZERO[div_by_zero; d[0] + d[1] + d[2] + d[3]]` | μ_sum |
 
-### equality
+### defs
 
-| Tag | Range | Description | Multiplicity |
-|-----|-------|-------------|--------------|
-| `DVRM-C13` |  | `MUL[n_sub_r::DWordWL; d, signed, q, sign_q, 0]` | μ_sum |
-| `DVRM-C14` |  | `MUL[extension_n_sub_r::DWordWL; d, signed, q, sign_q, 1]` | μ_sum |
-| `DVRM-C15.i` | i ∈ [0, 3] | `IS_HALF[q[i]]` | μ_sum |
+| Tag | Description |
+|-----|-------------|
+| `DVRM-C16` | `SIGN<sign_n; n[3], signed>` |
+| `DVRM-C17` | `SIGN<sign_r; r[3], signed>` |
+| `DVRM-C18` | `SIGN<sign_d; d[3], signed>` |
 
 ### abs_diff
 
@@ -1553,16 +1526,19 @@ carry (when iter=[1, 3]) := 2^-32 * ((extended_n_sub_r::QuadWL)[i] + (extended_r
 | `DVRM-C6.i` | i ∈ [0, 1] | not`sign_d` => `abs_d` = `d` |  |
 | | | _polynomial:_ `(1 - sign_d) * (abs_d[i] - (d::DWordWL)[i]) = 0` | |
 
-### output
+### equality
 
-| Tag | Description | Multiplicity |
-|-----|-------------|--------------|
-| `DVRM-C21` | `DVRM[q::DWordWL; n, d, signed, 0]` | -μ_q |
-| `DVRM-C22` | `DVRM[r::DWordWL; n, d, signed, 1]` | -μ_r |
+| Tag | Range | Description | Multiplicity |
+|-----|-------|-------------|--------------|
+| `DVRM-C13` |  | `MUL[n_sub_r::DWordWL; d, signed, q, sign_q, 0]` | μ_sum |
+| `DVRM-C14` |  | `MUL[extension_n_sub_r::DWordWL; d, signed, q, sign_q, 1]` | μ_sum |
+| `DVRM-C15.i` | i ∈ [0, 3] | `IS_HALF[q[i]]` | μ_sum |
 
 ---
 
 # LOAD Chip
+
+The  chip provides functionality to read values from memory and sign-extend them where appropriate. It delegates low-level memory handling to the `MEMW` chip ([memw]).
 
 = Columns
 
@@ -1655,6 +1631,12 @@ read1 := μ - read2 - read4 - read8
 
 # ECALL Chips
 
+ECALLs provide system-level functionalities to the guest program.
+
+When `ECALL` is executed, it is assumed that: - register `A7` contains the system call number
+
+- the arguments are located in registers `A0`-`A6`, and - the return value is written to `A0`, where `A0`-`A7` are symbolic names for the registers `x10`-`x17`
+
 =  chip
 
 ## Columns
@@ -1673,17 +1655,63 @@ The  chip: + makes sure register `x10` (containing the exit code) equals `0` ([h
 
 ### Lookup
 
-The HALT chip contributes the following interaction to the lookup-argument:
+In this VM, halting is considered equivalent to executing a `sys_exit`. Hence, this chip responds to `ECALL`s with system call number 93.
 
-*Note*: [`93` is the system call number corresponding to `sys_exit`.]
+The HALT chip therefore contributes the following interaction to the lookup-argument:
 
 ## Padding
 
 This chip should only contain a single row. Given that `2^0 = 1`, this chip does not need to be padded. As such, no padding is defined.
 
+=  chip
+
+## Columns
+
+The  chip leverages  variables, spanning  columns:
+
+## Constraints
+
+In this VM, committing is considered equivalent to writing a value to `stdout`. Hence, this chip responds to `ECALL`s with system call number 64.
+
+Since we do not know how many bytes are to be committed, this chip employs a recursive design: each iteration commits one byte, and recursively "calls" itself to commit the remaining bytes. As such, only the call from the CPU to this chip (i.e., the `first` in the recursion tree) should accept the `ECALL`; later recursive calls should not. This is why [commit:c:receive_ecall] has multiplicity `-`first``.
+
+The `write` operation --- writing to a file descriptor --- has the following signature:
+
+```c ssize_t write(size_t count; int fd, const void buf[count], size_t count); ```
+
+That is to say, - `A0` contains the file descriptor, - `A1` contains the address of `buf`'s first byte, - `A2` contains `count`, and - the written count should be written to `A0`.
+
+[commit:c:read_address] reads `address` from `x11` (=`A1`) and [commit:c:read_count] reads `count` from `x12` (=`A2`). Since we only support writing to `stdout` (which corresponds to ``fd` = 1`
+
+we assert that `x10` contains `1` in [commit:c:read_fd_write_count]. Note that this constraint _also_ writes `count` to `A0`; in this VM it is impossible for a commit to be interrupted or fail. Lastly, the `index` is read from `x254`; in the same operation, ``index` + `count`` is written back to this location by [commit:c:read_index]. This, too, leverages the fact that a commit will not be interrupted or fail to update the `index` for the next commit sequence. Again, each of these memory interactions only take place when this is the `first` call in the recursion tree.
+
+*Note*: the observant reader will notice that [commit:c:read_index] casts `count` to a `BaseField`, potentiallly losing information. This is indeed correct. However, since it is practically impossible to commit more than `2^64-2^32` bytes in a single VM execution, it was decided to permit this.
+
+Next, we read the `value` located at buffer address `address` and commit to it under the given `index`. This is only performed when we have not yet reached the `end` of the commit sequence.
+
+In parallel, we compute ``address_incr` = `address` + 1` ([commit:c:address_incr]) as address of the next byte to commit, and ``count_decr` = `count` - 1` ([commit:c:count_decr]) as the number of bytes that still has to be committed after committing this byte. [commit:c:range_address_incr] and [commit:c:range_count_decr] are included to satisfy [add:a:sum] respectively [add:a:rhs].
+
+When `count` hits `0`, we should stop performing further recursive calls. We use the `end` bit to indicate these circumstances.
+
+*Note*: + Rather than setting ``end` = 1` when ``count` = 0`, we do so when ``count_decr` = -1`. This technique allows `count` to be stored in a `DWordWL` rather than a `DWordHL`, saving two columns. + `forall i in [0, 3]: 65535 - `count_decr`_i >= 0` as a result of [commit:c:range_count_decr]. Hence, $ sum_(i=0)^3 65535 - `count_decr`_i = 0 arrow.l.r.double.long forall i in [0, 3]: `count_decr`_i = 65535 $
+
+When this was not the `end` byte to commit in this recursion sequence, we recursively _Commit the Next Byte_ (`CNB`), specifying the timestamp, address to continue reading and the number of bytes that should still be committed ([commit:c:send_commit_next_byte]). Since that certainly won't be the `first` call in the sequence, we read `address_incr` and `count_decr` from the previous recursion level into `address` and `count` and continue executing the commit.
+
+Lastly, we must make sure `first`, `end` and `μ` are bits ([commit:c:range_first], [commit:c:range_end], [commit:c:range_mu]), and that when either ``first` = 1` or ``end` = 1` imply that ``μ` = 1` ([commit:c:first_or_end_implies_mu]). These are required to ensure the multiplicities `-(`μ` - `first`)` and ``μ` - `end`` are binary.
+
+## Padding
+
+To pad this chip, use the below data.
+
+## Notes/optimizations
+
+- The current version only supports writing to `stdout`. This chip could potentially be extended to support writing to arbitrary `fd`s - One might be able to replace [commit:c:end] by `end => count = 0`. While loosening the constraint (`count = 0 => end` is no longer enforced), this should not cause any problems: if the prover does not set `end` when `count=0`, they simply cannot complete the proof. First of all, one would have to recursively work through all `2^64` values of `count`, something that is practically infeasible. Moreover, if this is done with a sequence that originally has ``count` > 0`, one will inevitably have to read a memory address twice at the same timestamp, which is impossible to prove. In addition to dropping the `ZERO` lookup, this optimization might also permit moving `count_decr` from a `DWordHL` to a `DWordWL`, saving two columns. - Given that it is practically infeasible to commit more than ``p`-1 = 2^64-2^32` bytes in a program, it might suffice to store `count_decr` in a `BaseField`. Note that this would probably involve having an extra (virtual) column storing `count` in `BaseField` form as well. Moreover, one might need to add a lookup to `LT` to ensure ``count` <= `p`-1` when being read from memory at the beginning of each commitment sequence.
+
 ---
 
 # BITWISE Chips
+
+The  chips deal with precomputed lookup tables for bitwise boolean operations and convenience functionalities over small domains.
 
 = Columns
 

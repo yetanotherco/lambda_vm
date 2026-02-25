@@ -1,8 +1,6 @@
 # SHIFT Chip
 
-= Interface The  chip has the following interface:
-
-``` // param in: the value being shifted // param shift: the number of bits to shift `in` by // param direction: whether to shift left (0) or right (1) // param signed: whether to interpret `in` as a signed (1) or unsigned (0) integer // param word_instr: whether to execute the SLL/SR* (0) or SLLW/SR*W (1) instruction // out shifted: the resulting value SHIFT[shifted: DWord; in: DWord, shift: Byte, direction: Bit, signed: Bit, word_instr: Bit] ``` In other words, the  chip is designed to constrain that $
+The  chip is designed to constrain that $
 
 $ $
 
@@ -176,7 +174,7 @@ shifted := left * Σ_j = 0^i limb_shift[j] * intra_limb_left[i - j] + right * (�
 
 | Tag | Range | Description |
 |-----|-------|-------------|
-| `SHIFT-A1.i` | i ∈ [0, 3] | `IS_HALFWORD[in[i]]` |
+| `SHIFT-A1.i` | i ∈ [0, 3] | `IS_HALF[in[i]]` |
 | `SHIFT-A2` |  | `IS_BYTE[shift]` |
 | `SHIFT-A3` |  | `IS_BIT<direction>` |
 | `SHIFT-A4` |  | `IS_BIT<signed>` |
@@ -184,15 +182,15 @@ shifted := left * Σ_j = 0^i limb_shift[j] * intra_limb_left[i - j] + right * (�
 
 ## Constraints
 
+### is_negative
+
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `SHIFT-C2` | `MSB16[is_negative; in[3]]` | signed |
+
 ### left_flag
 
 | Tag | Description |
 |-----|-------------|
 | `SHIFT-C1` | `direction` => `μ` = 1 |
 | | _polynomial:_ `direction * (1 - μ) = 0` |
-
-### is_negative
-
-| Tag | Description | Multiplicity |
-|-----|-------------|--------------|
-| `SHIFT-C2` | `MSB16[is_negative; in[3]]` | signed |

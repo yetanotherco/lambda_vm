@@ -1,10 +1,6 @@
 # NEG Template
 
-box( inset: (left: 4pt, right: 4pt), outset: (top: 4pt, bottom: 4pt), radius: 2pt, fill: luma(230), raw(code)) }
-
-= Notation The  constraint template has the following interface:
-
-where `cond` is a bit value (i.e., lies in `{0, 1}`)  described by an expression _of degree at most `1`_.
+It requires `cond` to be a bit.
 
 = Variables
 

@@ -1,12 +1,6 @@
 # IS_BIT Template
 
-box( inset: (left: 4pt, right: 4pt), outset: (top: 4pt, bottom: 4pt), radius: 2pt, fill: luma(230), raw(code)) }
-
 Barring exceptional cases, this template is used to assert that a variable of type `Bit` assumes a valid value under some condition.
-
-= Interface The  constraint template has the following interface:
-
-where `cond` is any value described by an expression _of degree at most `1`_. Note that  can be used to denote the _unconditional_ application of the  template to `X`.
 
 = Variables The  template operates on two variables: `cond` and `X`:
 

@@ -1,5 +1,7 @@
 # BITWISE Chips
 
+The  chips deal with precomputed lookup tables for bitwise boolean operations and convenience functionalities over small domains.
+
 = Columns
 
 The  chip is comprised of  variables that are expressed using  columns. Of these, the _input_ and _output_ variables ( in total) are precomputed.

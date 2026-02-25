@@ -1,5 +1,7 @@
 # CPU Chip
 
+The  chip coordinates memory accesses and dispatches to other chips for arithmetic and logical operations. It bases its decisions on the entry of the `DECODE` table ([decode]) corresponding the the current program counter (PC).
+
 = Columns
 
 The `CPU` chip is comprised of  variables that are expressed using  columns:
@@ -11,8 +13,6 @@ The `CPU` chip is comprised of  variables that are expressed using  columns:
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
 | `CPU-C1` | `DECODE[pc, imm, packed_decode]` | 1 |
-
-> **Note:** All casts for interactions will have to be reviewed once other chip interfaces stabilise
 
 ## Range checks
 
@@ -73,10 +73,10 @@ The ALU functionality is then obtained through judicious dispatching to the corr
 | `CPU-CA40.i` | i ∈ [0, 7] | `AND_BYTE[res[i]; arg1[i], arg2[i]]` | AND |
 | `CPU-CA41.i` | i ∈ [0, 7] | `OR_BYTE[res[i]; arg1[i], arg2[i]]` | OR |
 | `CPU-CA42.i` | i ∈ [0, 7] | `XOR_BYTE[res[i]; arg1[i], arg2[i]]` | XOR |
-| `CPU-CA43` |  | `SHIFT[res::DWordHL; arg1::DWordHL, arg2[0], mp_selector, signed, word_instr]` | SHIFT |
+| `CPU-CA43` |  | `SHIFT[res::DWordWL; arg1::DWordHL, arg2[0], mp_selector, signed, word_instr]` | SHIFT |
 | `CPU-CA44` |  | JALR ⇒ `ADD<res::DWordWL; pc, (2 * c_type_instruction + 4 * (1 - c_type_instruction)) * 1::DWordWL>` |  |
-| `CPU-CA45` |  | `MUL[res; arg1, signed, arg2, mp_selector, muldiv_selector]` | MUL |
-| `CPU-CA46` |  | `DVRM[res; arg1, arg2, signed, muldiv_selector]` | DIVREM |
+| `CPU-CA45` |  | `MUL[res::DWordWL; arg1::DWordHL, signed, arg2::DWordHL, mp_selector, muldiv_selector]` | MUL |
+| `CPU-CA46` |  | `DVRM[res::DWordWL; arg1::DWordHL, arg2::DWordHL, signed, muldiv_selector]` | DIVREM |
 
 ## Memory
 
@@ -84,16 +84,16 @@ The interactions with the memory, both for register loading and storing, as for 
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `CPU-CM47` |  | `MEMW[rv1; 1, 2 * rs1, rv1, timestamp + 0::DWordWL, 1, 0, 0]` | read_register1 |
+| `CPU-CM47` |  | `MEMW[['arr', ['idx', ['cast', 'rv1', 'DWordWL'], 0], ['idx', ['cast', 'rv1', 'DWordWL'], 1], 0, 0, 0, 0, 0, 0]; 1, 2::DWordWL * rs1, ['arr', ['idx', ['cast', 'rv1', 'DWordWL'], 0], ['idx', ['cast', 'rv1', 'DWordWL'], 1], 0, 0, 0, 0, 0, 0], timestamp + 0::DWordWL, 1, 0, 0]` | read_register1 |
 | `CPU-CM48.i` | i ∈ [0, 2] | `!read_register1` => `rv1[i]` = 0 |  |
 | | | _polynomial:_ `(1 - read_register1) * rv1[i] = 0` | |
-| `CPU-CM49` |  | `MEMW[rv2; 1, 2 * rs2, rv2, timestamp + 1::DWordWL, 1, 0, 0]` | read_register2 |
+| `CPU-CM49` |  | `MEMW[['arr', ['idx', ['cast', 'rv2', 'DWordWL'], 0], ['idx', ['cast', 'rv2', 'DWordWL'], 1], 0, 0, 0, 0, 0, 0]; 1, 2::DWordWL * rs2, ['arr', ['idx', ['cast', 'rv2', 'DWordWL'], 0], ['idx', ['cast', 'rv2', 'DWordWL'], 1], 0, 0, 0, 0, 0, 0], timestamp + 1::DWordWL, 1, 0, 0]` | read_register2 |
 | `CPU-CM50.i` | i ∈ [0, 2] | `!read_register2` => `rv2[i]` = 0 |  |
 | | | _polynomial:_ `(1 - read_register2) * rv2[i] = 0` | |
-| `CPU-CM51` |  | `MEMW[1, 2 * rd, rvd, timestamp + 2::DWordWL, 1, 0, 0]` | write_register |
-| `CPU-CM52` |  | `LOAD[rvd; 0, res, timestamp + 0::DWordWL, memory_2bytes, memory_4bytes, memory_8bytes, signed]` | LOAD |
-| `CPU-CM53` |  | `MEMW[0, res, arg2::Byte[8], timestamp + 1::DWordWL, memory_2bytes, memory_4bytes, memory_8bytes]` | STORE |
-| `CPU-CM54` |  | `MEMW[pc; 1, 2 * 255, next_pc, timestamp + 1::DWordWL, 1, 0, 0]` | 1 - pad |
+| `CPU-CM51` |  | `MEMW[1, 2::DWordWL * rd, ['arr', ['idx', 'rvd', 0], ['idx', 'rvd', 1], 0, 0, 0, 0, 0, 0], timestamp + 2::DWordWL, 1, 0, 0]` | write_register |
+| `CPU-CM52` |  | `LOAD[rvd; res::DWordWL, timestamp + 0::DWordWL, memory_2bytes, memory_4bytes, memory_8bytes, signed]` | LOAD |
+| `CPU-CM53` |  | `MEMW[0, res::DWordWL, arg2::Byte[8], timestamp + 1::DWordWL, memory_2bytes, memory_4bytes, memory_8bytes]` | STORE |
+| `CPU-CM54` |  | `MEMW[['arr', ['idx', 'pc', 0], ['idx', 'pc', 1], 0, 0, 0, 0, 0, 0]; 1, (2 * 255)::DWordWL, ['arr', ['idx', 'next_pc', 0], ['idx', 'next_pc', 1], 0, 0, 0, 0, 0, 0], timestamp + 1::DWordWL, 1, 0, 0]` | 1 - pad |
 
 ## System
 
@@ -138,7 +138,7 @@ For [cpu:c:is_equal], note that [cpu:c:sub] sets `res` to be the difference betw
 | `CPU-CO67` | `ZERO[is_equal; res[0] + res[1] + res[2] + res[3] + res[4] + res[5] + res[6] + res[7]]` | BEQ |
 | `CPU-CO68` | `branch_cond` = `JALR` or (`BLT` and (`res` xor `invert`)) or (`BEQ` and (`is_equal` xor `invert`)) |  |
 | | _polynomial:_ `-branch_cond + JALR + res[0] * (1 - mp_selector) * BLT + (1 - res[0]) * mp_selector * BLT + is_equal * (1 - mp_selector) * BEQ + (1 - is_equal) * mp_selector * BEQ = 0` | |
-| `CPU-CO69` | `BRANCH[next_pc; pc, imm[0], arg1::DWordWL, JALR]` | branch_cond |
+| `CPU-CO69` | `BRANCH[next_pc; pc, imm, arg1::DWordWL, JALR]` | branch_cond |
 | `CPU-CO70` | `ADD<next_pc; pc, (2 * c_type_instruction + 4 * (1 - c_type_instruction)) * 1::DWordWL>` |  |
 
 > **Note:** Document the choice to not have a multiplicity column here for padding

@@ -1,5 +1,7 @@
 # BRANCH Chip
 
+The  chip computes the target address of a branching instruction.
+
 = Columns
 
 The `BRANCH` chip is comprised of  variables that are expressed using  columns:
@@ -7,8 +9,6 @@ The `BRANCH` chip is comprised of  variables that are expressed using  columns:
 = Assumptions
 
 = Constraints
-
-> **Note:** Check correspondence with CPU for passing in `offset` as word or dword
 
 We constrain `next_pc` to be ``base_address` + `offset``, where `base_address` equals `pc` when ``JALR` = 0` and `register` otherwise.
 
@@ -20,7 +20,7 @@ The range checks on `unmasked_low_byte` and `next_pc_low[0]` are performed impli
 | `BRANCH-C2` |  | JALR ⇒ `ADD<next_pc_unmasked; register, offset::DWordWL>` |  |
 | `BRANCH-C3` |  | `IS_BYTE[next_pc_low[1]]` | μ |
 | `BRANCH-C4` |  | `AND_BYTE[next_pc_low[0]; unmasked_low_byte, 254]` | μ |
-| `BRANCH-C5.i` | i ∈ [0, 2] | `IS_HALFWORD[next_pc_high[i]]` | μ |
+| `BRANCH-C5.i` | i ∈ [0, 2] | `IS_HALF[next_pc_high[i]]` | μ |
 
 This chip contributes the following to the lookup argument.
 

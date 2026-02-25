@@ -1,18 +1,8 @@
 # ADD/SUB Template
 
-box( inset: (left: 4pt, right: 4pt), outset: (top: 4pt, bottom: 4pt), radius: 2pt, fill: luma(230), raw(code)) }
+For ease of notation, we moreover introduce the  constraint template $
 
-= Notation The  constraint template has the following interface:
-
-where `cond` is any value described by an expression _of degree at most `1`_.
-
-## 
-
-For ease of notation, we moreover introduce the  constraint template. Its interface
-
-maps onto the  template as
-
-It constrains that ``diff` = `lhs` - `rhs` mod 2^64` when the expression `cond` is non-zero. As with ,  can be used to denote the _unconditional_ application of the template.
+$ in both conditional and unconditional versions. It constrains that ``diff` equiv `lhs` - `rhs` (mod 2^64)` when the expression `cond` is non-zero.
 
 = Variables
 
