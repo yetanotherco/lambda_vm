@@ -140,9 +140,16 @@ pub trait IsStarkVerifier<
 
         let num_transition_constraints = air.context().num_transition_constraints;
 
-        let mut coefficients: Vec<_> = (0..num_boundary_constraints + num_transition_constraints)
-            .map(|i| beta.pow(i))
-            .collect();
+        let mut coefficients: Vec<_> = {
+            let n = num_boundary_constraints + num_transition_constraints;
+            let mut v = Vec::with_capacity(n);
+            let mut power = FieldElement::one();
+            for _ in 0..n {
+                v.push(power.clone());
+                power = &power * &beta;
+            }
+            v
+        };
 
         let transition_coeffs: Vec<_> = coefficients.drain(..num_transition_constraints).collect();
         let boundary_coeffs = coefficients;
@@ -1100,9 +1107,16 @@ pub trait IsStarkVerifier<
 
         let num_transition_constraints = air.context().num_transition_constraints;
 
-        let mut coefficients: Vec<_> = (0..num_boundary_constraints + num_transition_constraints)
-            .map(|i| beta.pow(i))
-            .collect();
+        let mut coefficients: Vec<_> = {
+            let n = num_boundary_constraints + num_transition_constraints;
+            let mut v = Vec::with_capacity(n);
+            let mut power = FieldElement::one();
+            for _ in 0..n {
+                v.push(power.clone());
+                power = &power * &beta;
+            }
+            v
+        };
 
         let transition_coeffs: Vec<_> = coefficients.drain(..num_transition_constraints).collect();
         let boundary_coeffs = coefficients;
