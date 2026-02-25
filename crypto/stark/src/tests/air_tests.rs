@@ -179,9 +179,7 @@ fn test_prove_quadratic() {
 
     let proof_options = ProofOptions::default_test_options();
 
-    let pub_inputs = QuadraticPublicInputs {
-        a0: Felt::from(3),
-    };
+    let pub_inputs = QuadraticPublicInputs { a0: Felt::from(3) };
 
     let air = QuadraticAIR::<GoldilocksField>::new(&proof_options);
 
