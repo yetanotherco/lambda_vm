@@ -28,7 +28,7 @@ use crate::{
 };
 
 type F = GoldilocksField;
-type Felt252 = FieldElement<GoldilocksField>;
+type Felt = FieldElement<GoldilocksField>;
 
 use crate::examples::read_only_memory_logup::{
     LogReadOnlyPublicInputs, LogReadOnlyRAP, read_only_logup_trace,
@@ -36,13 +36,13 @@ use crate::examples::read_only_memory_logup::{
 
 #[test_log::test]
 fn test_prove_fib() {
-    let mut trace = simple_fibonacci::fibonacci_trace([Felt252::from(1), Felt252::from(1)], 8);
+    let mut trace = simple_fibonacci::fibonacci_trace([Felt::from(1), Felt::from(1)], 8);
 
     let proof_options = ProofOptions::default_test_options();
 
     let pub_inputs = FibonacciPublicInputs {
-        a0: Felt252::one(),
-        a1: Felt252::one(),
+        a0: Felt::one(),
+        a1: Felt::one(),
     };
 
     let air = FibonacciAIR::<GoldilocksField>::new(&proof_options);
@@ -68,8 +68,8 @@ fn test_prove_simple_periodic_8() {
     let proof_options = ProofOptions::default_test_options();
 
     let pub_inputs = SimplePeriodicPublicInputs {
-        a0: Felt252::one(),
-        a1: Felt252::from(8),
+        a0: Felt::one(),
+        a1: Felt::from(8),
     };
 
     let air = SimplePeriodicAIR::<GoldilocksField>::new(&proof_options);
@@ -95,8 +95,8 @@ fn test_prove_simple_periodic_32() {
     let proof_options = ProofOptions::default_test_options();
 
     let pub_inputs = SimplePeriodicPublicInputs {
-        a0: Felt252::one(),
-        a1: Felt252::from(32768),
+        a0: Felt::one(),
+        a1: Felt::from(32768),
     };
 
     let air = SimplePeriodicAIR::<GoldilocksField>::new(&proof_options);
@@ -118,12 +118,12 @@ fn test_prove_simple_periodic_32() {
 
 #[test_log::test]
 fn test_prove_fib_2_cols() {
-    let mut trace = fibonacci_2_columns::compute_trace([Felt252::from(1), Felt252::from(1)], 16);
+    let mut trace = fibonacci_2_columns::compute_trace([Felt::from(1), Felt::from(1)], 16);
 
     let proof_options = ProofOptions::default_test_options();
     let pub_inputs = FibonacciPublicInputs {
-        a0: Felt252::one(),
-        a1: Felt252::one(),
+        a0: Felt::one(),
+        a1: Felt::one(),
     };
 
     let air = Fibonacci2ColsAIR::<GoldilocksField>::new(&proof_options);
@@ -175,12 +175,12 @@ fn test_prove_fib_2_cols_shifted() {
 
 #[test_log::test]
 fn test_prove_quadratic() {
-    let mut trace = quadratic_air::quadratic_trace(Felt252::from(3), 32);
+    let mut trace = quadratic_air::quadratic_trace(Felt::from(3), 32);
 
     let proof_options = ProofOptions::default_test_options();
 
     let pub_inputs = QuadraticPublicInputs {
-        a0: Felt252::from(3),
+        a0: Felt::from(3),
     };
 
     let air = QuadraticAIR::<GoldilocksField>::new(&proof_options);
@@ -203,14 +203,14 @@ fn test_prove_quadratic() {
 #[test_log::test]
 fn test_prove_rap_fib() {
     let steps = 16;
-    let mut trace = fibonacci_rap_trace([Felt252::from(1), Felt252::from(1)], steps);
+    let mut trace = fibonacci_rap_trace([Felt::from(1), Felt::from(1)], steps);
 
     let proof_options = ProofOptions::default_test_options();
 
     let pub_inputs = FibonacciRAPPublicInputs {
         steps,
-        a0: Felt252::one(),
-        a1: Felt252::one(),
+        a0: Felt::one(),
+        a1: Felt::one(),
     };
 
     let air = FibonacciRAP::<GoldilocksField>::new(&proof_options);
@@ -368,22 +368,22 @@ fn test_prove_log_read_only_memory() {
 
 #[test_log::test]
 fn test_multi_prove_fib_3_tables() {
-    let mut trace_1 = simple_fibonacci::fibonacci_trace([Felt252::from(1), Felt252::from(1)], 8);
-    let mut trace_2 = simple_fibonacci::fibonacci_trace([Felt252::from(1), Felt252::from(1)], 16);
-    let mut trace_3 = simple_fibonacci::fibonacci_trace([Felt252::from(1), Felt252::from(1)], 32);
+    let mut trace_1 = simple_fibonacci::fibonacci_trace([Felt::from(1), Felt::from(1)], 8);
+    let mut trace_2 = simple_fibonacci::fibonacci_trace([Felt::from(1), Felt::from(1)], 16);
+    let mut trace_3 = simple_fibonacci::fibonacci_trace([Felt::from(1), Felt::from(1)], 32);
     let proof_options = ProofOptions::default_test_options();
 
     let pub_inputs_1 = FibonacciPublicInputs {
-        a0: Felt252::one(),
-        a1: Felt252::one(),
+        a0: Felt::one(),
+        a1: Felt::one(),
     };
     let pub_inputs_2 = FibonacciPublicInputs {
-        a0: Felt252::one(),
-        a1: Felt252::one(),
+        a0: Felt::one(),
+        a1: Felt::one(),
     };
     let pub_inputs_3 = FibonacciPublicInputs {
-        a0: Felt252::one(),
-        a1: Felt252::one(),
+        a0: Felt::one(),
+        a1: Felt::one(),
     };
 
     let air_1 = FibonacciAIR::new(&proof_options);
