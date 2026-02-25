@@ -11,5 +11,5 @@ main:
 	lhu	a3, 0(sp)		# Unsigned half load: a3 = 65535
 	mv	a1, a0
 	li	a0, 0
-	li	a7, 5
+	li	a7, 93
 	ecall

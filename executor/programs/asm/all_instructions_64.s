@@ -98,5 +98,5 @@ main:
 	addi	zero, zero, 0		# 63: NOP (writes to zero register)
 	mv	a1, a0
 	li	a0, 0
-	li	a7, 5			# 64: Setup ecall halt
+	li	a7, 93			# 64: Setup ecall halt
 	ecall				# 65: Halt

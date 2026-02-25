@@ -11,7 +11,7 @@ enum SyscallNumbers {
     Panic = 2,
     Commit = 3,
     GetPrivateInputs = 4,
-    Halt = 5,
+    Halt = 93,
 }
 
 #[cfg(target_arch = "riscv64")]

@@ -326,9 +326,10 @@ fn test_bus_interactions_count() {
     // - 1 MUL (multiplication)
     // - 1 DVRM (division/remainder)
     // - 1 BRANCH (branch/jump target calculation)
+    // - 1 MEMW PC register (x255 read-write)
     // - 1 ECALL (send to HALT table)
-    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 5 + 1 + 1 + 1 + 1 + 1 = 39
-    assert_eq!(interactions.len(), 39);
+    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 5 + 1 + 1 + 1 + 1 + 1 + 1 = 40
+    assert_eq!(interactions.len(), 40);
 }
 
 #[test]

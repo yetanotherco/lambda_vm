@@ -11,5 +11,5 @@ main:
 	subw	a4, t0, t0		# 7. 10 - 10 = 0
 	mv	a1, a0
 	li	a0, 0
-	li	a7, 5
+	li	a7, 93
 	ecall		# 8. Return

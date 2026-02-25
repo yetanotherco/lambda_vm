@@ -1578,6 +1578,92 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
+    // M8: MEMW[next_pc; 1, 2*255, next_pc, timestamp+1, 1, 0, 0] | not(pad)
+    // -------------------------------------------------------------------------
+    // PC register (x255) read-write on every non-padding row.
+    // CO24 format (24 elements): old[8] + [is_register, addr[2], value[8], ts[2], flags[3]]
+    // - old = pc (asserts previous PC value)
+    // - value = next_pc (new PC value)
+    // - timestamp = timestamp + 1 (shares slot with M3/rs2, different address)
+    // - multiplicity = not(pad) = ADD + SUB + SLT + ... + EBREAK
+    interactions.push(BusInteraction::sender(
+        BusId::Memw,
+        Multiplicity::Linear(vec![
+            LinearTerm::Column { coefficient: 1, column: cols::ADD },
+            LinearTerm::Column { coefficient: 1, column: cols::SUB },
+            LinearTerm::Column { coefficient: 1, column: cols::SLT },
+            LinearTerm::Column { coefficient: 1, column: cols::AND },
+            LinearTerm::Column { coefficient: 1, column: cols::OR },
+            LinearTerm::Column { coefficient: 1, column: cols::XOR },
+            LinearTerm::Column { coefficient: 1, column: cols::SHIFT },
+            LinearTerm::Column { coefficient: 1, column: cols::JALR },
+            LinearTerm::Column { coefficient: 1, column: cols::BEQ },
+            LinearTerm::Column { coefficient: 1, column: cols::BLT },
+            LinearTerm::Column { coefficient: 1, column: cols::LOAD },
+            LinearTerm::Column { coefficient: 1, column: cols::STORE },
+            LinearTerm::Column { coefficient: 1, column: cols::MUL },
+            LinearTerm::Column { coefficient: 1, column: cols::DIVREM },
+            LinearTerm::Column { coefficient: 1, column: cols::ECALL },
+            LinearTerm::Column { coefficient: 1, column: cols::EBREAK },
+        ]),
+        vec![
+            // old[0] = pc_lo (Word)
+            BusValue::Packed {
+                start_column: cols::PC_0,
+                packing: Packing::Direct,
+            },
+            // old[1] = pc_hi (Word)
+            BusValue::Packed {
+                start_column: cols::PC_1,
+                packing: Packing::Direct,
+            },
+            // old[2..7] = 0
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            // is_register = 1
+            BusValue::constant(1),
+            // base_address[0] = 510 (2 * 255)
+            BusValue::constant(510),
+            // base_address[1] = 0
+            BusValue::constant(0),
+            // value[0] = next_pc_lo (Word)
+            BusValue::Packed {
+                start_column: cols::NEXT_PC_0,
+                packing: Packing::Direct,
+            },
+            // value[1] = next_pc_hi (Word)
+            BusValue::Packed {
+                start_column: cols::NEXT_PC_1,
+                packing: Packing::Direct,
+            },
+            // value[2..7] = 0
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            // timestamp[0] = timestamp + 1, timestamp[1] = 0
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::TIMESTAMP,
+                },
+                LinearTerm::Constant(1),
+            ]),
+            BusValue::constant(0),
+            // write2=1, write4=0, write8=0 (register access = 2 Words / 64 bits)
+            BusValue::constant(1),
+            BusValue::constant(0),
+            BusValue::constant(0),
+        ],
+    ));
+
+    // -------------------------------------------------------------------------
     // BRANCH interaction (for branch/jump target calculation)
     // -------------------------------------------------------------------------
     // CPU-CO68: BRANCH[next_pc; pc, imm, arg1::DWordWL, JALR] | branch_cond
@@ -1673,8 +1759,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     // ECALL interaction (CPU → HALT)
     // -------------------------------------------------------------------------
-    // When ECALL flag is set, send [timestamp_lo, timestamp_hi] to the HALT table.
-    // The CPU timestamp fits in a single field element (u32), so timestamp_hi = 0.
+    // Spec: ECALL[timestamp, cast(rv1, DWordWL)] | ECALL
+    // rv1 holds the syscall number read from a7 (rs1=17, read_register1=true).
     interactions.push(BusInteraction::sender(
         BusId::Ecall,
         Multiplicity::Column(cols::ECALL),
@@ -1684,8 +1770,22 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 packing: Packing::Direct,
             },
             BusValue::constant(0), // timestamp_hi = 0 (CPU timestamps fit in u32)
-            BusValue::constant(93), // syscall number (sys_exit) — DWordWL[0]
-            BusValue::constant(0),  // syscall number hi — DWordWL[1]
+            // rv1 as DWordWL: lo32 = RV1_0 + 2^16 * RV1_1
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::RV1_0,
+                },
+                LinearTerm::Column {
+                    coefficient: 65536,
+                    column: cols::RV1_1,
+                },
+            ]),
+            // rv1 hi32 = RV1_2
+            BusValue::Packed {
+                start_column: cols::RV1_2,
+                packing: Packing::Direct,
+            },
         ],
     ));
 

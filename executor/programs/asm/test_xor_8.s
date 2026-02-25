@@ -11,5 +11,5 @@ main:
 	addi	t3, zero, 0x55		# t3 = 0x55
 	mv	a1, a0
 	li	a0, 0
-	li	a7, 5
+	li	a7, 93
 	ecall

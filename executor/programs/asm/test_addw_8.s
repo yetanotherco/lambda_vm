@@ -11,5 +11,5 @@ main:
 	addw	a4, t1, t1		# 7. 20 + 20 = 40
 	mv	a1, a0
 	li	a0, 0
-	li	a7, 5
+	li	a7, 93
 	ecall		# 8. Return

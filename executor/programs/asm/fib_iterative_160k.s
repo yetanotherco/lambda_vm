@@ -21,5 +21,5 @@ main:
 	mv	a0, t1			# result = b
 	mv	a1, a0
 	li	a0, 0
-	li	a7, 5
+	li	a7, 93
 	ecall				# halt with result in a0

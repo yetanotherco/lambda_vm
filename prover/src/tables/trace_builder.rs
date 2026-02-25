@@ -494,6 +494,23 @@ fn collect_register_ops_from_cpu(
         register_state.write(d.rd, op.rvd, op.timestamp + 2);
     }
 
+    // M8: PC register (x255) read-write at timestamp+1
+    // Every non-padding CPU row reads old pc and writes next_pc at address 510.
+    // Uses CO24 format (is_read=true) because old values (pc) are asserted on the bus.
+    {
+        let reg_addr = 510u64; // 2 * 255
+        let next_pc_value = pack_register_value(op.next_pc);
+        let (_old_val, old_ts) = register_state.read(255);
+        let old_pc = pack_register_value(op.decode.pc);
+        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
+
+        let memw_op =
+            MemwOperation::new(true, reg_addr, next_pc_value, op.timestamp + 1, 2, true)
+                .with_old(old_pc, old_timestamps);
+        memw_ops.push(memw_op);
+        register_state.write(255, op.next_pc, op.timestamp + 1);
+    }
+
     memw_ops
 }
 

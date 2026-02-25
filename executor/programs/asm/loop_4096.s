@@ -21,5 +21,5 @@ loop:
 
     addi zero, zero, 0        # cleanup NOP
     addi zero, zero, 0        # cleanup NOP
-    li	a7, 5
+    li	a7, 93
 	ecall        # halt
