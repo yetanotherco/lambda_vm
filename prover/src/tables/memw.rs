@@ -1081,18 +1081,6 @@ where
     write2 + write4 + write8
 }
 
-/// Compute virtual w4 = write4 + write8
-#[allow(dead_code)]
-fn compute_w4<F, E>(step: &TableView<F, E>) -> FieldElement<F>
-where
-    F: IsSubFieldOf<E>,
-    E: IsField,
-{
-    let write4 = step.get_main_evaluation_element(0, cols::WRITE4).clone();
-    let write8 = step.get_main_evaluation_element(0, cols::WRITE8).clone();
-    write4 + write8
-}
-
 /// Compute virtual μ_sum = μ_read + μ_write
 fn compute_mu_sum<F, E>(step: &TableView<F, E>) -> FieldElement<F>
 where
