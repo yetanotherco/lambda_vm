@@ -29,6 +29,18 @@ use std::marker::PhantomData;
 #[cfg(feature = "instruments")]
 use std::time::Instant;
 
+/// Reverse the lowest `num_bits` bits of `val`.
+/// Used to map leaf positions to evaluation-point powers in bit-reversed NTT layout.
+fn bit_reverse(val: usize, num_bits: usize) -> usize {
+    let mut result = 0;
+    let mut v = val;
+    for _ in 0..num_bits {
+        result = (result << 1) | (v & 1);
+        v >>= 1;
+    }
+    result
+}
+
 /// A default STARK verifier implementing `IsStarkVerifier`.
 pub struct Verifier<
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
@@ -91,6 +103,50 @@ pub trait IsStarkVerifier<
         (0..number_of_queries)
             .map(|_| (transcript.sample_u64(domain_size >> 1)) as usize)
             .collect::<Vec<usize>>()
+    }
+
+    /// Replays the FRI commit phase on the transcript, returning the folding challenges (zetas).
+    ///
+    /// Shared between `step_1_replay_rounds_and_recover_challenges` and
+    /// `replay_rounds_after_round_1` to avoid duplicating the FRI transcript replay logic.
+    fn replay_fri_commit_phase(
+        proof: &StarkProof<Field, FieldExtension, PI>,
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        domain: &VerifierDomain<Field>,
+        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+    ) -> Vec<FieldElement<FieldExtension>>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        let folding_factor = air.context().proof_options.fri_folding_factor;
+        let last_layer_degree_bound = air.context().proof_options.fri_last_layer_degree_bound;
+        let log_f = folding_factor.trailing_zeros() as usize;
+        let merkle_roots = &proof.fri_layers_merkle_roots;
+
+        let number_layers = domain.root_order as usize;
+        let last_poly_log = if last_layer_degree_bound == 0 {
+            0
+        } else {
+            (last_layer_degree_bound + 1).trailing_zeros() as usize
+        };
+        let folds_to_perform = number_layers.saturating_sub(last_poly_log);
+        let mut zetas = Vec::new();
+
+        if folds_to_perform > 0 {
+            // Initial fold challenge (zetas[0])
+            zetas.push(transcript.sample_field_element());
+
+            // For each committed FRI layer: append root, then sample log_f challenges
+            for root in merkle_roots {
+                transcript.append_bytes(root);
+                for _ in 0..log_f {
+                    zetas.push(transcript.sample_field_element());
+                }
+            }
+        }
+
+        zetas
     }
 
     /// Returns the list of challenges sent to the prover.
@@ -195,23 +251,12 @@ pub trait IsStarkVerifier<
         let gammas = deep_composition_coefficients;
 
         // FRI commit phase
-        let merkle_roots = &proof.fri_layers_merkle_roots;
-        let mut zetas = merkle_roots
-            .iter()
-            .map(|root| {
-                // >>>> Send challenge 𝜁ₖ
-                let element = transcript.sample_field_element();
-                // <<<< Receive commitment: [pₖ] (the first one is [p₀])
-                transcript.append_bytes(root);
-                element
-            })
-            .collect::<Vec<FieldElement<FieldExtension>>>();
+        let zetas = Self::replay_fri_commit_phase(proof, air, domain, transcript);
 
-        // >>>> Send challenge 𝜁ₙ₋₁
-        zetas.push(transcript.sample_field_element());
-
-        // <<<< Receive value: pₙ
-        transcript.append_field_element(&proof.fri_last_value);
+        // <<<< Receive last polynomial coefficients
+        for coeff in &proof.fri_last_value {
+            transcript.append_field_element(coeff);
+        }
 
         // Receive grinding value
         let security_bits = air.context().proof_options.grinding_factor;
@@ -224,7 +269,6 @@ pub trait IsStarkVerifier<
         }
 
         // FRI query phase
-        // <<<< Send challenges 𝜄ₛ (iota_s)
         let number_of_queries = air.options().fri_number_of_queries;
         let iotas = Self::sample_query_indexes(number_of_queries, domain, transcript);
 
@@ -355,6 +399,7 @@ pub trait IsStarkVerifier<
         proof: &StarkProof<Field, FieldExtension, PI>,
         domain: &VerifierDomain<Field>,
         challenges: &Challenges<FieldExtension>,
+        folding_factor: usize,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
@@ -388,6 +433,7 @@ pub trait IsStarkVerifier<
                     eval,
                     &deep_poly_evaluations[i],
                     &deep_poly_evaluations_sym[i],
+                    folding_factor,
                 );
                 result
             })
@@ -560,38 +606,45 @@ pub trait IsStarkVerifier<
     }
 
     /// Verifies the openings of a fold polynomial of an inner layer of FRI.
+    /// `known_eval`: the evaluation the verifier computed (at position `iota % folding_factor` within the leaf).
+    /// `sym_evals`: the other `folding_factor - 1` evaluations from the decommitment.
     fn verify_fri_layer_openings(
         merkle_root: &Commitment,
-        auth_path_sym: &Proof<Commitment>,
-        evaluation: &FieldElement<FieldExtension>,
-        evaluation_sym: &FieldElement<FieldExtension>,
+        auth_path: &Proof<Commitment>,
+        known_eval: &FieldElement<FieldExtension>,
+        sym_evals: &[FieldElement<FieldExtension>],
         iota: usize,
+        folding_factor: usize,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        let evaluations = if iota % 2 == 1 {
-            vec![evaluation_sym.clone(), evaluation.clone()]
-        } else {
-            vec![evaluation.clone(), evaluation_sym.clone()]
-        };
+        let log_f = folding_factor.trailing_zeros() as usize;
+        let leaf_index = iota >> log_f;
+        let known_pos = iota % folding_factor;
 
-        auth_path_sym.verify::<BatchedMerkleTreeBackend<FieldExtension>>(
-            merkle_root,
-            iota >> 1,
-            &evaluations,
-        )
+        // Reconstruct the full leaf in order
+        let mut leaf = Vec::with_capacity(folding_factor);
+        let mut sym_idx = 0;
+        for pos in 0..folding_factor {
+            if pos == known_pos {
+                leaf.push(known_eval.clone());
+            } else {
+                leaf.push(sym_evals[sym_idx].clone());
+                sym_idx += 1;
+            }
+        }
+
+        auth_path.verify::<BatchedMerkleTreeBackend<FieldExtension>>(merkle_root, leaf_index, &leaf)
     }
 
-    /// Verify a single FRI query
-    /// `zetas`: the vector of all challenges sent by the verifier to the prover at the commit
-    /// phase to fold polynomials.
-    /// `iota`: the index challenge of this FRI query. This index uniquely determines two elements 𝜐 and -𝜐
-    /// of the evaluation domain of FRI layer 0.
-    /// `evaluation_point_inv`: precomputed value of 𝜐⁻¹.
-    /// `deep_composition_evaluation`: precomputed value of p₀(𝜐), where p₀ is the deep composition polynomial.
-    /// `deep_composition_evaluation_sym`: precomputed value of p₀(-𝜐), where p₀ is the deep composition polynomial.
+    /// Verify a single FRI query with configurable folding factor and early stopping.
+    ///
+    /// The fold formula `(v + sym) + eval_pt_inv * zeta * (v - sym)` is used for each
+    /// binary fold. This works because `eval_pt_inv` tracks the inverse of `v`'s actual
+    /// evaluation point. When `v` is at the "negative" position (odd index), the double
+    /// negation (negative eval_pt_inv times negative difference) cancels out.
     fn verify_query_and_sym_openings(
         proof: &StarkProof<Field, FieldExtension, PI>,
         zetas: &[FieldElement<FieldExtension>],
@@ -600,77 +653,171 @@ pub trait IsStarkVerifier<
         evaluation_point_inv: FieldElement<Field>,
         deep_composition_evaluation: &FieldElement<FieldExtension>,
         deep_composition_evaluation_sym: &FieldElement<FieldExtension>,
+        folding_factor: usize,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
+        let log_f = folding_factor.trailing_zeros() as usize;
         let fri_layers_merkle_roots = &proof.fri_layers_merkle_roots;
-        let evaluation_point_vec: Vec<FieldElement<Field>> =
-            core::iter::successors(Some(evaluation_point_inv.square()), |evaluation_point| {
-                Some(evaluation_point.square())
-            })
-            .take(fri_layers_merkle_roots.len())
-            .collect();
 
         let p0_eval = deep_composition_evaluation;
         let p0_eval_sym = deep_composition_evaluation_sym;
 
-        // Reconstruct p₁(𝜐²)
-        let mut v =
-            (p0_eval + p0_eval_sym) + evaluation_point_inv * &zetas[0] * (p0_eval - p0_eval_sym);
-        let mut index = iota;
-
-        // Handle case with 0 FRI layers (trace_length <= 2)
-        // In this case, the fold loop below doesn't iterate, so we need to verify
-        // the final value directly here.
-        if fri_layers_merkle_roots.is_empty() {
-            return v == proof.fri_last_value;
+        // Handle case with 0 folds (number_layers == 0, e.g. single-row trace)
+        if zetas.is_empty() {
+            // No folding at all — deep composition eval IS the last polynomial eval
+            if proof.fri_last_value.len() == 1 {
+                return *p0_eval == proof.fri_last_value[0];
+            }
+            let eval_point: FieldElement<FieldExtension> =
+                evaluation_point_inv.inv().unwrap().to_extension();
+            let last_poly_eval = proof
+                .fri_last_value
+                .iter()
+                .rev()
+                .fold(FieldElement::zero(), |acc, coeff| acc * &eval_point + coeff);
+            return *p0_eval == last_poly_eval;
         }
 
-        // For each FRI layer, starting from the layer 1: use the proof to verify the validity of values pᵢ(−𝜐^(2ⁱ)) (given by the prover) and
-        // pᵢ(𝜐^(2ⁱ)) (computed on the previous iteration by the verifier). Then use them to obtain pᵢ₊₁(𝜐^(2ⁱ⁺¹)).
-        // Finally, check that the final value coincides with the given by the prover.
-        fri_layers_merkle_roots
-            .iter()
-            .enumerate()
-            .zip(&fri_decommitment.layers_auth_paths)
-            .zip(&fri_decommitment.layers_evaluations_sym)
-            .zip(evaluation_point_vec)
-            .fold(
-                true,
-                |result,
-                 (
-                    (((i, merkle_root), auth_path_sym), evaluation_sym),
-                    evaluation_point_inv,
-                )| {
-                    // Verify opening Open(pᵢ(Dₖ), −𝜐^(2ⁱ)) and Open(pᵢ(Dₖ), 𝜐^(2ⁱ)).
-                    // `v` is pᵢ(𝜐^(2ⁱ)).
-                    // `evaluation_sym` is pᵢ(−𝜐^(2ⁱ)).
-                    let openings_ok = Self::verify_fri_layer_openings(
-                        merkle_root,
-                        auth_path_sym,
-                        &v,
-                        evaluation_sym,
-                        index,
-                    );
+        // Initial fold with zetas[0]
+        let mut v =
+            (p0_eval + p0_eval_sym) + &evaluation_point_inv * &zetas[0] * (p0_eval - p0_eval_sym);
+        let mut index = iota;
+        let mut eval_point_inv = evaluation_point_inv.square();
+        let mut zeta_idx = 1; // next zeta to use
 
-                    // Update `v` with next value pᵢ₊₁(𝜐^(2ⁱ⁺¹)).
-                    v = (&v + evaluation_sym) + evaluation_point_inv * &zetas[i + 1] * (&v - evaluation_sym);
+        let mut result = true;
 
-                    // Update index for next iteration. The index of the squares in the next layer
-                    // is obtained by halving the current index. This is due to the bit-reverse
-                    // ordering of the elements in the Merkle tree.
-                    index >>= 1;
+        // Handle case with 0 FRI layers but >=1 fold (small trace)
+        if fri_layers_merkle_roots.is_empty() {
+            if proof.fri_last_value.len() == 1 {
+                return v == proof.fri_last_value[0];
+            }
+            let eval_point: FieldElement<FieldExtension> =
+                eval_point_inv.inv().unwrap().to_extension();
+            let last_poly_eval = proof
+                .fri_last_value
+                .iter()
+                .rev()
+                .fold(FieldElement::zero(), |acc, coeff| acc * &eval_point + coeff);
+            return v == last_poly_eval;
+        }
 
-                    if i < fri_decommitment.layers_evaluations_sym.len() - 1 {
-                        result & openings_ok
+        // For each committed FRI layer
+        for (layer_idx, merkle_root) in fri_layers_merkle_roots.iter().enumerate() {
+            let auth_path = &fri_decommitment.layers_auth_paths[layer_idx];
+            let sym_evals = &fri_decommitment.layers_evaluations_sym[layer_idx];
+
+            // Verify Merkle opening for this layer
+            let openings_ok = Self::verify_fri_layer_openings(
+                merkle_root,
+                auth_path,
+                &v,
+                sym_evals,
+                index,
+                folding_factor,
+            );
+            result &= openings_ok;
+
+            // Apply log_f binary folds using the (v + sym) + eval_pt_inv * zeta * (v - sym) formula.
+            // For folding_factor=2: single fold with the one sibling.
+            // For folding_factor>2: apply log_f sequential folds, each time using the
+            // appropriate sibling from the reconstructed leaf.
+            if folding_factor == 2 {
+                // Simple case: one fold with the single sibling
+                let sym = &sym_evals[0];
+                v = (&v + sym) + &eval_point_inv * &zetas[zeta_idx] * (&v - sym);
+                zeta_idx += 1;
+            } else {
+                // General case (ff>2): reconstruct leaf and apply log_f binary folds.
+                //
+                // In the bit-reversed NTT layout, the ff evaluations in a leaf
+                // correspond to evaluation points:
+                //   eval_pt(p) = x_L * omega^{bit_rev(p, log_f)}
+                // where x_L is the base eval point for the leaf and omega is a
+                // primitive ff-th root of unity.
+                //
+                // Consecutive pairs (2j, 2j+1) always form (x, -x) fold pairs.
+                // Each pair has a different x, so we track eval_pt_inv per pair.
+                let known_pos = index % folding_factor;
+                let mut leaf = Vec::with_capacity(folding_factor);
+                let mut sym_idx = 0;
+                for pos in 0..folding_factor {
+                    if pos == known_pos {
+                        leaf.push(v.clone());
                     } else {
-                        // Check that final value is the given by the prover
-                        result & (v == proof.fri_last_value) & openings_ok
+                        leaf.push(sym_evals[sym_idx].clone());
+                        sym_idx += 1;
                     }
-                },
-            )
+                }
+
+                // Compute the ff-th primitive root of unity
+                let omega: FieldElement<Field> =
+                    Field::get_primitive_root_of_unity(log_f as u64).unwrap();
+
+                // Derive 1/x_L from eval_point_inv at known_pos:
+                // eval_pt_inv = 1/(x_L * omega^{bit_rev(known_pos, log_f)})
+                // => 1/x_L = eval_pt_inv * omega^{bit_rev(known_pos, log_f)}
+                let known_br = bit_reverse(known_pos, log_f);
+                let x_l_inv: FieldElement<Field> = &eval_point_inv * &omega.pow(known_br as u64);
+
+                // Compute eval_pt_inv for each position in the leaf:
+                // eval_pt_inv(p) = 1/(x_L * omega^{bit_rev(p, log_f)})
+                //                = x_l_inv * omega^{ff - bit_rev(p, log_f)}
+                let mut current_invs: Vec<FieldElement<Field>> = (0..folding_factor)
+                    .map(|p| {
+                        let br = bit_reverse(p, log_f);
+                        let neg_br = (folding_factor - br) % folding_factor;
+                        &x_l_inv * &omega.pow(neg_br as u64)
+                    })
+                    .collect();
+
+                // Apply log_f binary folds with consecutive pairing
+                let mut current_evals = leaf;
+                for _step in 0..log_f {
+                    let half = current_evals.len() / 2;
+                    let mut next_evals = Vec::with_capacity(half);
+                    let mut next_invs = Vec::with_capacity(half);
+                    for j in 0..half {
+                        let left = &current_evals[2 * j];
+                        let right = &current_evals[2 * j + 1];
+                        let pair_inv = &current_invs[2 * j];
+                        let folded = (left + right) + pair_inv * &zetas[zeta_idx] * (left - right);
+                        next_evals.push(folded);
+                        next_invs.push(current_invs[2 * j].square());
+                    }
+                    current_evals = next_evals;
+                    current_invs = next_invs;
+                    zeta_idx += 1;
+                }
+
+                v = current_evals[0].clone();
+            }
+
+            index >>= log_f;
+            for _ in 0..log_f {
+                eval_point_inv = eval_point_inv.square();
+            }
+        }
+
+        // Final check: evaluate the last polynomial at the current evaluation point
+        // and verify it matches v.
+        if proof.fri_last_value.len() == 1 {
+            result &= v == proof.fri_last_value[0];
+        } else {
+            let eval_point: FieldElement<FieldExtension> =
+                eval_point_inv.inv().unwrap().to_extension();
+            let last_poly_eval = proof
+                .fri_last_value
+                .iter()
+                .rev()
+                .fold(FieldElement::zero(), |acc, coeff| acc * &eval_point + coeff);
+            result &= v == last_poly_eval;
+        }
+
+        result
     }
 
     fn reconstruct_deep_composition_poly_evaluations_for_all_queries(
@@ -1106,23 +1253,12 @@ pub trait IsStarkVerifier<
         let gammas = deep_composition_coefficients;
 
         // FRI commit phase
-        let merkle_roots = &proof.fri_layers_merkle_roots;
-        let mut zetas = merkle_roots
-            .iter()
-            .map(|root| {
-                // >>>> Send challenge 𝜁ₖ
-                let element = transcript.sample_field_element();
-                // <<<< Receive commitment: [pₖ] (the first one is [p₀])
-                transcript.append_bytes(root);
-                element
-            })
-            .collect::<Vec<FieldElement<FieldExtension>>>();
+        let zetas = Self::replay_fri_commit_phase(proof, air, domain, transcript);
 
-        // >>>> Send challenge 𝜁ₙ₋₁
-        zetas.push(transcript.sample_field_element());
-
-        // <<<< Receive value: pₙ
-        transcript.append_field_element(&proof.fri_last_value);
+        // <<<< Receive last polynomial coefficients
+        for coeff in &proof.fri_last_value {
+            transcript.append_field_element(coeff);
+        }
 
         // Receive grinding value
         let security_bits = air.context().proof_options.grinding_factor;
@@ -1135,7 +1271,6 @@ pub trait IsStarkVerifier<
         }
 
         // FRI query phase
-        // <<<< Send challenges 𝜄ₛ (iota_s)
         let number_of_queries = air.options().fri_number_of_queries;
         let iotas = Self::sample_query_indexes(number_of_queries, domain, transcript);
 
@@ -1217,7 +1352,8 @@ pub trait IsStarkVerifier<
         #[cfg(feature = "instruments")]
         let timer3 = Instant::now();
 
-        if !Self::step_3_verify_fri(proof, &domain, &challenges) {
+        let folding_factor = air.context().proof_options.fri_folding_factor;
+        if !Self::step_3_verify_fri(proof, &domain, &challenges, folding_factor) {
             #[cfg(not(feature = "test_fiat_shamir"))]
             error!("FRI verification failed");
             return false;

@@ -165,8 +165,8 @@ pub struct Round3<F: IsField> {
 
 /// A container for the results of the fourth round of the STARK Prove protocol.
 pub struct Round4<F: IsSubFieldOf<E>, E: IsField> {
-    /// The final value resulting from folding the Deep composition polynomial all the way down to a constant value.
-    fri_last_value: FieldElement<E>,
+    /// Coefficients of the last FRI polynomial after folding.
+    fri_last_value: Vec<FieldElement<E>>,
     /// The commitments to the fold polynomials of the inner layers of FRI.
     fri_layers_merkle_roots: Vec<Commitment>,
     /// The values and proofs of validity of the evaluations of the trace polynomials and the composition polynomials
@@ -797,12 +797,16 @@ pub trait IsStarkProver<
         let domain_size = domain.lde_roots_of_unity_coset.len();
 
         // FRI commit and query phases
+        let folding_factor = air.context().proof_options.fri_folding_factor;
+        let last_layer_degree_bound = air.context().proof_options.fri_last_layer_degree_bound;
         let (fri_last_value, fri_layers) = fri::commit_phase::<Field, FieldExtension>(
             domain.root_order as usize,
             deep_composition_poly,
             transcript,
             &coset_offset,
             domain_size,
+            folding_factor,
+            last_layer_degree_bound,
         );
 
         // grinding: generate nonce and append it to the transcript
@@ -818,7 +822,7 @@ pub trait IsStarkProver<
         let number_of_queries = air.options().fri_number_of_queries;
         let iotas = Self::sample_query_indexes(number_of_queries, domain, transcript);
 
-        let query_list = fri::query_phase(&fri_layers, &iotas);
+        let query_list = fri::query_phase(&fri_layers, &iotas, folding_factor);
 
         let fri_layers_merkle_roots: Vec<_> = fri_layers
             .iter()
@@ -1646,6 +1650,8 @@ mod tests {
             fri_number_of_queries: 1,
             coset_offset,
             grinding_factor,
+            fri_last_layer_degree_bound: 0,
+            fri_folding_factor: 2,
         };
 
         let domain = Domain::new(

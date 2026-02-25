@@ -123,3 +123,80 @@ fn test_options_unchanged() {
     assert_eq!(opts.fri_number_of_queries, 3);
     assert_eq!(opts.grinding_factor, 1);
 }
+
+// --- ProofOptions::validate() tests ---
+
+#[test]
+fn rejects_non_power_of_two_folding_factor() {
+    let mut opts = ProofOptions::default_test_options();
+    opts.fri_folding_factor = 3;
+    assert!(matches!(
+        opts.validate(),
+        Err(ProofOptionsError::InvalidFoldingFactor(3))
+    ));
+
+    opts.fri_folding_factor = 6;
+    assert!(matches!(
+        opts.validate(),
+        Err(ProofOptionsError::InvalidFoldingFactor(6))
+    ));
+}
+
+#[test]
+fn rejects_folding_factor_one() {
+    let mut opts = ProofOptions::default_test_options();
+    opts.fri_folding_factor = 1;
+    assert!(matches!(
+        opts.validate(),
+        Err(ProofOptionsError::InvalidFoldingFactor(1))
+    ));
+}
+
+#[test]
+fn rejects_invalid_degree_bound() {
+    let mut opts = ProofOptions::default_test_options();
+    // 2 is invalid: bound+1 = 3 which is not a power of 2
+    opts.fri_last_layer_degree_bound = 2;
+    assert!(matches!(
+        opts.validate(),
+        Err(ProofOptionsError::InvalidDegreeBound(2))
+    ));
+
+    // 4 is invalid: bound+1 = 5 which is not a power of 2
+    opts.fri_last_layer_degree_bound = 4;
+    assert!(matches!(
+        opts.validate(),
+        Err(ProofOptionsError::InvalidDegreeBound(4))
+    ));
+}
+
+#[test]
+fn accepts_valid_fri_options() {
+    let mut opts = ProofOptions::default_test_options();
+
+    // Default values (ff=2, bound=0) are valid
+    assert!(opts.validate().is_ok());
+
+    // ff=4, bound=0
+    opts.fri_folding_factor = 4;
+    assert!(opts.validate().is_ok());
+
+    // ff=8, bound=0
+    opts.fri_folding_factor = 8;
+    assert!(opts.validate().is_ok());
+
+    // ff=2, bound=1 (bound+1=2 is power of 2)
+    opts.fri_folding_factor = 2;
+    opts.fri_last_layer_degree_bound = 1;
+    assert!(opts.validate().is_ok());
+
+    // ff=4, bound=3 (bound+1=4 is power of 2)
+    opts.fri_folding_factor = 4;
+    opts.fri_last_layer_degree_bound = 3;
+    assert!(opts.validate().is_ok());
+
+    // ff=2, bound=7 (bound+1=8 is power of 2)
+    opts.fri_folding_factor = 2;
+    opts.fri_last_layer_degree_bound = 7;
+    assert!(opts.validate().is_ok());
+}

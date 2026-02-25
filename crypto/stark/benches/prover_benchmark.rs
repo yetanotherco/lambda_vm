@@ -54,24 +54,52 @@ fn create_initial_values(num_columns: usize) -> Vec<(FE, FE)> {
         .collect()
 }
 
-/// Creates proof options suitable for benchmarking
-fn benchmark_proof_options() -> ProofOptions {
+/// FRI parameter set for benchmarking
+struct FriParams {
+    name: &'static str,
+    folding_factor: usize,
+    degree_bound: usize,
+}
+
+const FRI_PARAMS: &[FriParams] = &[
+    FriParams {
+        name: "default",
+        folding_factor: 2,
+        degree_bound: 0,
+    },
+    FriParams {
+        name: "ff4_deg7",
+        folding_factor: 4,
+        degree_bound: 7,
+    },
+    FriParams {
+        name: "ff8_deg7",
+        folding_factor: 8,
+        degree_bound: 7,
+    },
+];
+
+/// Creates proof options with the given FRI parameters
+fn benchmark_proof_options(fri: &FriParams) -> ProofOptions {
     ProofOptions {
         blowup_factor: 4,
         fri_number_of_queries: 30,
         coset_offset: 3,
         grinding_factor: 0,
+        fri_last_layer_degree_bound: fri.degree_bound,
+        fri_folding_factor: fri.folding_factor,
     }
 }
 
-/// Generates a proof for the given configuration
+/// Generates a proof for the given configuration and FRI parameters
 fn generate_proof(
     config: &BenchConfig,
+    fri: &FriParams,
 ) -> (
     StarkProof<F, E, FibonacciMultiColumnPublicInputs<F>>,
     FibonacciMultiColumnAIR<F, E>,
 ) {
-    let proof_options = benchmark_proof_options();
+    let proof_options = benchmark_proof_options(fri);
     let initial_values = create_initial_values(config.num_columns);
     let mut trace = compute_trace::<F, E>(&initial_values, config.trace_length);
     let pub_inputs = create_public_inputs(initial_values);
@@ -88,12 +116,13 @@ fn generate_proof(
     (proof, air)
 }
 
-/// Benchmark proving for a single configuration
-fn bench_prove(c: &mut Criterion, group_name: &str, config: &BenchConfig) {
-    let proof_options = benchmark_proof_options();
+/// Benchmark proving for a single configuration and FRI parameter set
+fn bench_prove(c: &mut Criterion, group_name: &str, config: &BenchConfig, fri: &FriParams) {
+    let proof_options = benchmark_proof_options(fri);
+    let id = format!("{}_{}", config.name, fri.name);
 
     c.bench_with_input(
-        BenchmarkId::new(format!("{}/prove", group_name), config.name),
+        BenchmarkId::new(format!("{}/prove", group_name), &id),
         config,
         |b, config| {
             b.iter_with_setup(
@@ -121,13 +150,13 @@ fn bench_prove(c: &mut Criterion, group_name: &str, config: &BenchConfig) {
     );
 }
 
-/// Benchmark verification for a single configuration
-fn bench_verify(c: &mut Criterion, group_name: &str, config: &BenchConfig) {
-    // Pre-generate the proof
-    let (proof, air) = generate_proof(config);
+/// Benchmark verification for a single configuration and FRI parameter set
+fn bench_verify(c: &mut Criterion, group_name: &str, config: &BenchConfig, fri: &FriParams) {
+    let (proof, air) = generate_proof(config, fri);
+    let id = format!("{}_{}", config.name, fri.name);
 
     c.bench_with_input(
-        BenchmarkId::new(format!("{}/verify", group_name), config.name),
+        BenchmarkId::new(format!("{}/verify", group_name), &id),
         &(proof, air),
         |b, (proof, air)| {
             b.iter(|| {
@@ -137,19 +166,23 @@ fn bench_verify(c: &mut Criterion, group_name: &str, config: &BenchConfig) {
     );
 }
 
-/// Quick benchmarks
+/// Quick benchmarks — all FRI parameter sets × quick configs
 fn quick_benchmarks(c: &mut Criterion) {
     for config in QUICK_CONFIGS {
-        bench_prove(c, "quick", config);
-        bench_verify(c, "quick", config);
+        for fri in FRI_PARAMS {
+            bench_prove(c, "quick", config, fri);
+            bench_verify(c, "quick", config, fri);
+        }
     }
 }
 
-/// Thorough benchmarks
+/// Thorough benchmarks — all FRI parameter sets × thorough configs
 fn thorough_benchmarks(c: &mut Criterion) {
     for config in THOROUGH_CONFIGS {
-        bench_prove(c, "thorough", config);
-        bench_verify(c, "thorough", config);
+        for fri in FRI_PARAMS {
+            bench_prove(c, "thorough", config, fri);
+            bench_verify(c, "thorough", config, fri);
+        }
     }
 }
 

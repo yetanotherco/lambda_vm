@@ -13,6 +13,10 @@ pub enum ProofOptionsError {
         security_bits: u8,
         grinding_factor: u8,
     },
+    /// fri_folding_factor must be a power of 2 >= 2
+    InvalidFoldingFactor(usize),
+    /// fri_last_layer_degree_bound must be 0 or (bound+1) must be a power of 2
+    InvalidDegreeBound(usize),
 }
 
 impl fmt::Display for ProofOptionsError {
@@ -28,6 +32,18 @@ impl fmt::Display for ProofOptionsError {
                 f,
                 "security_bits ({security_bits}) must exceed grinding_factor ({grinding_factor})"
             ),
+            Self::InvalidFoldingFactor(f_val) => {
+                write!(
+                    f,
+                    "fri_folding_factor must be a power of 2 >= 2, got {f_val}"
+                )
+            }
+            Self::InvalidDegreeBound(b) => {
+                write!(
+                    f,
+                    "fri_last_layer_degree_bound must be 0 or (bound+1) must be a power of 2, got {b}"
+                )
+            }
         }
     }
 }
@@ -45,6 +61,12 @@ pub struct ProofOptions {
     pub fri_number_of_queries: usize,
     pub coset_offset: u64,
     pub grinding_factor: u8,
+    /// Stop FRI folding when polynomial degree reaches this bound.
+    /// 0 = fold to constant (current behavior). Must be 0 or `(bound+1)` must be a power of 2.
+    pub fri_last_layer_degree_bound: usize,
+    /// Number of binary folds per FRI committed layer. Must be a power of 2 >= 2.
+    /// 2 = one fold per layer (current behavior). 4 = two folds per layer, etc.
+    pub fri_folding_factor: usize,
 }
 
 impl ProofOptions {
@@ -56,7 +78,29 @@ impl ProofOptions {
             fri_number_of_queries: 3,
             coset_offset: 3,
             grinding_factor: 1,
+            fri_last_layer_degree_bound: 0,
+            fri_folding_factor: 2,
         }
+    }
+
+    /// Validates the FRI-related fields.
+    ///
+    /// - `fri_folding_factor` must be a power of 2 >= 2.
+    /// - `fri_last_layer_degree_bound` must be 0 or `(bound + 1)` must be a power of 2.
+    pub fn validate(&self) -> Result<(), ProofOptionsError> {
+        if !self.fri_folding_factor.is_power_of_two() || self.fri_folding_factor < 2 {
+            return Err(ProofOptionsError::InvalidFoldingFactor(
+                self.fri_folding_factor,
+            ));
+        }
+        if self.fri_last_layer_degree_bound != 0
+            && !(self.fri_last_layer_degree_bound + 1).is_power_of_two()
+        {
+            return Err(ProofOptionsError::InvalidDegreeBound(
+                self.fri_last_layer_degree_bound,
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -107,11 +151,15 @@ impl GoldilocksCubicProofOptions {
         let fri_number_of_queries =
             ((security_bits as f64 - grinding_factor as f64) / bits_per_query).ceil() as usize;
 
-        Ok(ProofOptions {
+        let opts = ProofOptions {
             blowup_factor,
             fri_number_of_queries,
             coset_offset: 3,
             grinding_factor,
-        })
+            fri_last_layer_degree_bound: 0,
+            fri_folding_factor: 2,
+        };
+        opts.validate()?;
+        Ok(opts)
     }
 }
