@@ -67,8 +67,9 @@ pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     pub composition_poly_parts_ood_evaluation: Vec<FieldElement<E>>,
     // [pₖ]
     pub fri_layers_merkle_roots: Vec<Commitment>,
-    // pₙ
-    pub fri_last_value: FieldElement<E>,
+    // Coefficients of the final FRI polynomial (degree < 2^log_final_poly_len).
+    // For log_final_poly_len=0 (default), this is a single constant.
+    pub fri_final_poly: Vec<FieldElement<E>>,
     // Open(pₖ(Dₖ), −𝜐ₛ^(2ᵏ))
     pub query_list: Vec<FriDecommitment<E>>,
     // Open(H₁(D_LDE, 𝜐ᵢ), Open(H₂(D_LDE, 𝜐ᵢ), Open(tⱼ(D_LDE), 𝜐ᵢ)
@@ -188,7 +189,9 @@ impl StoneCompatibleSerializer {
                 .collect::<Vec<_>>(),
         );
 
-        output.extend_from_slice(&proof.fri_last_value.as_bytes());
+        for coeff in &proof.fri_final_poly {
+            output.extend_from_slice(&coeff.as_bytes());
+        }
     }
 
     /// Appends the proof of work nonce in case there is one. There could be none if the `grinding_factor`
@@ -357,14 +360,14 @@ impl StoneCompatibleSerializer {
             HashMap::new();
         for (decommitment, query_index) in proof.query_list.iter().zip(fri_query_indexes.iter()) {
             let mut query_layer_index = *query_index;
-            for (i, element) in decommitment.layers_evaluations_sym.iter().enumerate() {
+            for (i, siblings) in decommitment.layers_evaluations_sym.iter().enumerate() {
                 fri_layers_evaluations.insert(
                     (
                         i as u64,
                         query_layer_index >> 1,
                         (query_layer_index + 1) % 2,
                     ),
-                    *element,
+                    siblings[0],
                 );
                 query_layer_index >>= 1;
             }

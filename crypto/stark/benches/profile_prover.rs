@@ -21,6 +21,8 @@ fn main() {
         fri_number_of_queries: 100,
         coset_offset: 3,
         grinding_factor: 0,
+        fri_log_arity: 1,
+        fri_log_final_poly_len: 0,
     };
 
     let num_columns = 16;

@@ -24,7 +24,7 @@ pub fn commit_phase<F: IsFFTField + IsSubFieldOf<E>, E: IsField + Send + Sync>(
     coset_offset: &FieldElement<F>,
     domain_size: usize,
 ) -> (
-    FieldElement<E>,
+    Vec<FieldElement<E>>,
     Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>>,
 )
 where
@@ -53,9 +53,9 @@ where
         fold_evaluations_in_place(&mut evals, &zeta, &inv_twiddles);
 
         // Build Merkle tree from consecutive pairs
-        let leaves: Vec<[FieldElement<E>; 2]> = evals
+        let leaves: Vec<Vec<FieldElement<E>>> = evals
             .chunks_exact(2)
-            .map(|chunk| [chunk[0].clone(), chunk[1].clone()])
+            .map(|chunk| chunk.to_vec())
             .collect();
         let merkle_tree = FriLayerMerkleTree::build(&leaves)
             .expect("FRI commit: Merkle tree construction must succeed");
@@ -80,15 +80,17 @@ where
     // Final fold
     fold_evaluations_in_place(&mut evals, &zeta, &inv_twiddles);
 
-    let last_value = evals
+    let final_poly = vec![evals
         .first()
         .unwrap_or(&FieldElement::zero())
-        .clone();
+        .clone()];
 
     // >>>> Send value: pₙ
-    transcript.append_field_element(&last_value);
+    for coeff in &final_poly {
+        transcript.append_field_element(coeff);
+    }
 
-    (last_value, fri_layer_list)
+    (final_poly, fri_layer_list)
 }
 
 /// Like [`commit_phase`], but takes pre-computed bit-reversed evaluations directly,
@@ -101,7 +103,7 @@ pub fn commit_phase_from_evaluations<F: IsFFTField + IsSubFieldOf<E>, E: IsField
     coset_offset: &FieldElement<F>,
     domain_size: usize,
 ) -> (
-    FieldElement<E>,
+    Vec<FieldElement<E>>,
     Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>>,
 )
 where
@@ -125,9 +127,9 @@ where
         fold_evaluations_in_place(&mut evals, &zeta, &inv_twiddles);
 
         // Build Merkle tree from consecutive pairs
-        let leaves: Vec<[FieldElement<E>; 2]> = evals
+        let leaves: Vec<Vec<FieldElement<E>>> = evals
             .chunks_exact(2)
-            .map(|chunk| [chunk[0].clone(), chunk[1].clone()])
+            .map(|chunk| chunk.to_vec())
             .collect();
         let merkle_tree = FriLayerMerkleTree::build(&leaves)
             .expect("FRI commit: Merkle tree construction must succeed");
@@ -152,15 +154,17 @@ where
     // Final fold
     fold_evaluations_in_place(&mut evals, &zeta, &inv_twiddles);
 
-    let last_value = evals
+    let final_poly = vec![evals
         .first()
         .unwrap_or(&FieldElement::zero())
-        .clone();
+        .clone()];
 
     // >>>> Send value: pₙ
-    transcript.append_field_element(&last_value);
+    for coeff in &final_poly {
+        transcript.append_field_element(coeff);
+    }
 
-    (last_value, fri_layer_list)
+    (final_poly, fri_layer_list)
 }
 
 pub fn query_phase<F: IsField>(
@@ -180,8 +184,8 @@ where
 
                 let mut index = *iota_s;
                 for layer in fri_layers {
-                    // symmetric element
-                    let evaluation_sym = layer.evaluation[index ^ 1].clone();
+                    // sibling elements (arity-2: single symmetric element)
+                    let evaluation_sym = vec![layer.evaluation[index ^ 1].clone()];
                     let auth_path_sym = layer.merkle_tree.get_proof_by_pos(index >> 1).unwrap();
                     layers_evaluations_sym.push(evaluation_sym);
                     layers_auth_paths_sym.push(auth_path_sym);

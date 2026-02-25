@@ -19,6 +19,6 @@ pub type Commitment = [u8; COMMITMENT_SIZE];
 pub type BatchedMerkleTreeBackend<F> = BatchKeccak256Backend<F>;
 pub type BatchedMerkleTree<F> = MerkleTree<BatchedMerkleTreeBackend<F>>;
 
-// FRI layer uses fixed-size pairs for efficiency (avoids Vec allocation per pair)
-pub type FriLayerMerkleTreeBackend<F> = PairKeccak256Backend<F>;
+// FRI layer uses Vec leaves to support variable arity (2, 4, 8, ...)
+pub type FriLayerMerkleTreeBackend<F> = BatchKeccak256Backend<F>;
 pub type FriLayerMerkleTree<F> = MerkleTree<FriLayerMerkleTreeBackend<F>>;

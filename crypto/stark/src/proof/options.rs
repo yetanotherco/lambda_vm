@@ -45,6 +45,12 @@ pub struct ProofOptions {
     pub fri_number_of_queries: usize,
     pub coset_offset: u64,
     pub grinding_factor: u8,
+    /// Log2 of FRI folding arity per round. 1 = arity-2 (current), 2 = arity-4, 3 = arity-8.
+    /// Each round applies this many sequential binary folds before committing.
+    pub fri_log_arity: u8,
+    /// Log2 of final polynomial length. 0 = fold to constant (current).
+    /// FRI stops when the polynomial degree drops below 2^log_final_poly_len.
+    pub fri_log_final_poly_len: u8,
 }
 
 impl ProofOptions {
@@ -56,6 +62,8 @@ impl ProofOptions {
             fri_number_of_queries: 3,
             coset_offset: 3,
             grinding_factor: 1,
+            fri_log_arity: 1,
+            fri_log_final_poly_len: 0,
         }
     }
 }
@@ -112,6 +120,8 @@ impl GoldilocksCubicProofOptions {
             fri_number_of_queries,
             coset_offset: 3,
             grinding_factor,
+            fri_log_arity: 1,
+            fri_log_final_poly_len: 0,
         })
     }
 }

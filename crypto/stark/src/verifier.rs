@@ -211,7 +211,9 @@ pub trait IsStarkVerifier<
         zetas.push(transcript.sample_field_element());
 
         // <<<< Receive value: pₙ
-        transcript.append_field_element(&proof.fri_last_value);
+        for coeff in &proof.fri_final_poly {
+            transcript.append_field_element(coeff);
+        }
 
         // Receive grinding value
         let security_bits = air.context().proof_options.grinding_factor;
@@ -580,13 +582,15 @@ pub trait IsStarkVerifier<
         merkle_root: &Commitment,
         auth_path_sym: &Proof<Commitment>,
         evaluation: &FieldElement<FieldExtension>,
-        evaluation_sym: &FieldElement<FieldExtension>,
+        evaluation_siblings: &[FieldElement<FieldExtension>],
         iota: usize,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
+        // For arity-2: siblings has 1 element (the symmetric evaluation)
+        let evaluation_sym = &evaluation_siblings[0];
         let evaluations = if iota % 2 == 1 {
             vec![evaluation_sym.clone(), evaluation.clone()]
         } else {
@@ -641,7 +645,7 @@ pub trait IsStarkVerifier<
         // In this case, the fold loop below doesn't iterate, so we need to verify
         // the final value directly here.
         if fri_layers_merkle_roots.is_empty() {
-            return v == proof.fri_last_value;
+            return v == proof.fri_final_poly[0];
         }
 
         // For each FRI layer, starting from the layer 1: use the proof to verify the validity of values pᵢ(−𝜐^(2ⁱ)) (given by the prover) and
@@ -657,21 +661,22 @@ pub trait IsStarkVerifier<
                 true,
                 |result,
                  (
-                    (((i, merkle_root), auth_path_sym), evaluation_sym),
+                    (((i, merkle_root), auth_path_sym), siblings),
                     evaluation_point_inv,
                 )| {
                     // Verify opening Open(pᵢ(Dₖ), −𝜐^(2ⁱ)) and Open(pᵢ(Dₖ), 𝜐^(2ⁱ)).
                     // `v` is pᵢ(𝜐^(2ⁱ)).
-                    // `evaluation_sym` is pᵢ(−𝜐^(2ⁱ)).
+                    // `siblings[0]` is pᵢ(−𝜐^(2ⁱ)) (for arity-2).
                     let openings_ok = Self::verify_fri_layer_openings(
                         merkle_root,
                         auth_path_sym,
                         &v,
-                        evaluation_sym,
+                        siblings,
                         index,
                     );
 
                     // Update `v` with next value pᵢ₊₁(𝜐^(2ⁱ⁺¹)).
+                    let evaluation_sym = &siblings[0];
                     v = (&v + evaluation_sym) + evaluation_point_inv * &zetas[i + 1] * (&v - evaluation_sym);
 
                     // Update index for next iteration. The index of the squares in the next layer
@@ -683,7 +688,7 @@ pub trait IsStarkVerifier<
                         result & openings_ok
                     } else {
                         // Check that final value is the given by the prover
-                        result & (v == proof.fri_last_value) & openings_ok
+                        result & (v == proof.fri_final_poly[0]) & openings_ok
                     }
                 },
             )
@@ -1083,7 +1088,9 @@ pub trait IsStarkVerifier<
         zetas.push(transcript.sample_field_element());
 
         // <<<< Receive value: pₙ
-        transcript.append_field_element(&proof.fri_last_value);
+        for coeff in &proof.fri_final_poly {
+            transcript.append_field_element(coeff);
+        }
 
         // Receive grinding value
         let security_bits = air.context().proof_options.grinding_factor;

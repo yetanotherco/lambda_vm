@@ -226,8 +226,8 @@ pub struct Round3<F: IsField> {
 
 /// A container for the results of the fourth round of the STARK Prove protocol.
 pub struct Round4<F: IsSubFieldOf<E>, E: IsField> {
-    /// The final value resulting from folding the Deep composition polynomial all the way down to a constant value.
-    fri_last_value: FieldElement<E>,
+    /// Coefficients of the final FRI polynomial (single constant for default config).
+    fri_final_poly: Vec<FieldElement<E>>,
     /// The commitments to the fold polynomials of the inner layers of FRI.
     fri_layers_merkle_roots: Vec<Commitment>,
     /// The values and proofs of validity of the evaluations of the trace polynomials and the composition polynomials
@@ -1480,7 +1480,7 @@ pub trait IsStarkProver<
         ).expect("FFT should succeed");
 
         // FRI commit phase from pre-computed evaluations (no initial FFT)
-        let (fri_last_value, fri_layers) = fri::commit_phase_from_evaluations::<Field, FieldExtension>(
+        let (fri_final_poly, fri_layers) = fri::commit_phase_from_evaluations::<Field, FieldExtension>(
             domain.root_order as usize,
             lde_evals,
             transcript,
@@ -1512,7 +1512,7 @@ pub trait IsStarkProver<
             Self::open_deep_composition_poly(domain, round_1_result, round_2_result, &iotas);
 
         Round4 {
-            fri_last_value,
+            fri_final_poly,
             fri_layers_merkle_roots,
             deep_poly_openings,
             query_list,
@@ -2306,8 +2306,8 @@ pub trait IsStarkProver<
                 .composition_poly_parts_ood_evaluation,
             // [pₖ]
             fri_layers_merkle_roots: round_4_result.fri_layers_merkle_roots,
-            // pₙ
-            fri_last_value: round_4_result.fri_last_value,
+            // Final FRI polynomial coefficients
+            fri_final_poly: round_4_result.fri_final_poly,
             // Open(p₀(D₀), 𝜐ₛ), Open(pₖ(Dₖ), −𝜐ₛ^(2ᵏ))
             query_list: round_4_result.query_list,
             // Open(H₁(D_LDE, 𝜐₀), Open(H₂(D_LDE, 𝜐₀), Open(tⱼ(D_LDE), 𝜐₀)
@@ -2485,6 +2485,8 @@ mod tests {
             fri_number_of_queries: 1,
             coset_offset,
             grinding_factor,
+            fri_log_arity: 1,
+            fri_log_final_poly_len: 0,
         };
 
         let domain = Domain::new(
@@ -2792,7 +2794,7 @@ mod tests {
         let proof = stone_compatibility_case_1_proof();
 
         assert_eq!(
-            proof.fri_last_value,
+            proof.fri_final_poly[0],
             FieldElement::from_hex_unchecked(
                 "43fedf9f9e3d1469309862065c7d7ca0e7e9ce451906e9c01553056f695aec9"
             )
@@ -2951,7 +2953,7 @@ mod tests {
         let proof = stone_compatibility_case_1_proof();
 
         assert_eq!(
-            proof.query_list[0].layers_evaluations_sym[0],
+            proof.query_list[0].layers_evaluations_sym[0][0],
             FieldElement::from_hex_unchecked(
                 "0684991e76e5c08db17f33ea7840596be876d92c143f863e77cad10548289fd0"
             )
@@ -3057,7 +3059,7 @@ mod tests {
         let proof = stone_compatibility_case_2_proof();
 
         assert_eq!(
-            proof.query_list[0].layers_evaluations_sym[7],
+            proof.query_list[0].layers_evaluations_sym[7][0],
             FieldElement::from_hex_unchecked(
                 "7aa40c5a4e30b44fee5bcc47c54072a435aa35c1a31b805cad8126118cc6860"
             )
@@ -3091,6 +3093,8 @@ mod tests {
             fri_number_of_queries: 1,
             coset_offset,
             grinding_factor: 0,
+            fri_log_arity: 1,
+            fri_log_final_poly_len: 0,
         };
 
         let air = simple_fibonacci::FibonacciAIR::<Stark252PrimeField>::new(&proof_options);
@@ -3165,6 +3169,8 @@ mod tests {
             fri_number_of_queries: 1,
             coset_offset: 3,
             grinding_factor: 0,
+            fri_log_arity: 1,
+            fri_log_final_poly_len: 0,
         };
 
         // We need an AIR with composition_poly_degree_bound = 2 * trace_length.
