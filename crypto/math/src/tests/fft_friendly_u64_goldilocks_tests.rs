@@ -83,10 +83,6 @@ fn byte_serialization_and_deserialization_works_be() {
     assert_eq!(element, from_bytes);
 }
 
-// =====================================================
-// Field arithmetic tests (moved from goldilocks.rs)
-// =====================================================
-
 #[test]
 fn test_add_basic() {
     let a = 5u64;
