@@ -14,6 +14,11 @@ use self::fri_commitment::FriLayer;
 use self::fri_decommit::FriDecommitment;
 use self::fri_functions::fold_polynomial_doubled_inplace;
 
+type CommitResult<E> = (
+    Vec<FieldElement<E>>,
+    Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>>,
+);
+
 /// FRI commit phase with configurable folding factor and early stopping.
 ///
 /// - `number_layers`: total number of binary folds (= log2(trace_length))
@@ -29,10 +34,7 @@ pub fn commit_phase<F: IsFFTField + IsSubFieldOf<E>, E: IsField>(
     domain_size: usize,
     folding_factor: usize,
     last_layer_degree_bound: usize,
-) -> (
-    Vec<FieldElement<E>>,
-    Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>>,
-)
+) -> CommitResult<E>
 where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,

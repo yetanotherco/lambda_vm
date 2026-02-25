@@ -645,6 +645,7 @@ pub trait IsStarkVerifier<
     /// binary fold. This works because `eval_pt_inv` tracks the inverse of `v`'s actual
     /// evaluation point. When `v` is at the "negative" position (odd index), the double
     /// negation (negative eval_pt_inv times negative difference) cancels out.
+    #[allow(clippy::too_many_arguments)]
     fn verify_query_and_sym_openings(
         proof: &StarkProof<Field, FieldExtension, PI>,
         zetas: &[FieldElement<FieldExtension>],
