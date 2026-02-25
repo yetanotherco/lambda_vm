@@ -61,7 +61,7 @@ where
 /// The Fiat-Shamir transcript order is preserved:
 /// `sample challenge → fold → commit → sample challenge → fold → commit → ...`
 pub fn commit_phase_from_evaluations<F: IsFFTField + IsSubFieldOf<E>, E: IsField + Send + Sync>(
-    number_layers: usize,
+    _number_layers: usize,
     mut evals: Vec<FieldElement<E>>,
     transcript: &mut impl IsStarkTranscript<E, F>,
     coset_offset: &FieldElement<F>,
@@ -76,7 +76,30 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
-    let total_binary_folds = number_layers.saturating_sub(log_final_poly_len);
+    // Compute total binary folds. For higher-arity FRI (log_arity > 1), ensure that
+    // after the initial fold (1 binary fold matching the verifier's DEEP pair fold),
+    // the remaining folds are a multiple of log_arity. This guarantees each committed
+    // FRI layer has exactly log_arity sub-folds, matching the verifier's uniform
+    // per-layer fold count.
+    let base = _number_layers
+        .saturating_sub(log_final_poly_len)
+        .max(if evals.len() > 1 { 1 } else { 0 });
+    let total_binary_folds = if base <= 1 || log_arity <= 1 {
+        base
+    } else {
+        let after_initial = base - 1;
+        let rounded_up = after_initial.div_ceil(log_arity) * log_arity;
+        let candidate = 1 + rounded_up;
+        // Ensure we don't exceed available evaluations
+        let max_binary_folds = (domain_size.trailing_zeros() as usize)
+            .saturating_sub(log_final_poly_len);
+        if candidate <= max_binary_folds {
+            candidate
+        } else {
+            // Round down instead
+            1 + (after_initial / log_arity) * log_arity
+        }
+    };
     let mut inv_twiddles = compute_coset_twiddles_inv(coset_offset, domain_size);
     let mut fri_layer_list = Vec::new();
     let mut current_coset_offset = coset_offset.clone();
@@ -130,7 +153,7 @@ where
     }
 
     // Extract final polynomial coefficients
-    let final_poly = extract_final_poly::<F, E>(&evals, log_final_poly_len);
+    let final_poly = extract_final_poly::<F, E>(&evals, log_final_poly_len, &current_coset_offset);
 
     // >>>> Send value: pₙ
     for coeff in &final_poly {
@@ -144,10 +167,12 @@ where
 ///
 /// When `log_final_poly_len == 0`, the evaluations have been folded to a single constant.
 /// When `log_final_poly_len > 0`, there are `2^log_final_poly_len` evaluations remaining
-/// on a coset; recover coefficients via bit-reverse + iFFT.
+/// on a coset with offset `coset_offset`; recover coefficients via bit-reverse + iFFT
+/// + coset correction (divide coefficient j by offset^j).
 fn extract_final_poly<F: IsFFTField + IsSubFieldOf<E>, E: IsField>(
     evals: &[FieldElement<E>],
     log_final_poly_len: usize,
+    coset_offset: &FieldElement<F>,
 ) -> Vec<FieldElement<E>>
 where
     E: Send + Sync,
@@ -158,10 +183,20 @@ where
         let final_poly_len = 1usize << log_final_poly_len;
         let mut sub_evals: Vec<_> = evals[..final_poly_len].to_vec();
         in_place_bit_reverse_permute(&mut sub_evals);
-        Polynomial::interpolate_fft::<F>(&sub_evals)
+        // Standard iFFT treats evaluations as being at roots of unity.
+        // Since they're actually at coset points (offset * w^i), the iFFT
+        // gives d_j = c_j * offset^j. Divide by offset^j to recover c_j.
+        let mut coeffs = Polynomial::interpolate_fft::<F>(&sub_evals)
             .expect("iFFT for final poly must succeed")
             .coefficients()
-            .to_vec()
+            .to_vec();
+        let offset_inv = coset_offset.inv().expect("coset offset is nonzero");
+        let mut offset_inv_power = FieldElement::<F>::one();
+        for c in coeffs.iter_mut() {
+            *c = &offset_inv_power * &*c;
+            offset_inv_power = &offset_inv_power * &offset_inv;
+        }
+        coeffs
     }
 }
 

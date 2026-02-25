@@ -413,6 +413,7 @@ pub trait IsStarkVerifier<
                     &deep_poly_evaluations[i],
                     &deep_poly_evaluations_sym[i],
                     challenges.fri_log_arity,
+                    domain,
                 );
                 result
             })
@@ -627,6 +628,9 @@ pub trait IsStarkVerifier<
     /// The verifier performs an initial binary fold from the DEEP polynomial evaluation pair,
     /// then for each committed FRI layer: verifies the Merkle opening, reconstructs the full
     /// leaf group, and applies `log_arity` sequential binary folds with squaring challenges.
+    ///
+    /// For each sub-fold within a layer, twiddle factors are computed from domain parameters
+    /// (coset offset, roots of unity, bit-reversal) to match the prover's `fold_evaluations_in_place`.
     fn verify_query_and_sym_openings(
         proof: &StarkProof<Field, FieldExtension, PI>,
         zetas: &[FieldElement<FieldExtension>],
@@ -636,6 +640,7 @@ pub trait IsStarkVerifier<
         deep_composition_evaluation: &FieldElement<FieldExtension>,
         deep_composition_evaluation_sym: &FieldElement<FieldExtension>,
         log_arity: usize,
+        domain: &VerifierDomain<Field>,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
@@ -658,6 +663,12 @@ pub trait IsStarkVerifier<
             return Self::check_final_poly(&v, &eval_pt_inv, &proof.fri_final_poly);
         }
 
+        // Track domain state for twiddle computation across layers.
+        // After the initial fold: offset squared, domain log-size decremented by 1.
+        let mut sub_offset = domain.coset_offset.square();
+        let mut sub_domain_log_size =
+            (domain.lde_length as u64).trailing_zeros() - 1;
+
         let mut result = true;
 
         for (i, ((merkle_root, auth_path), siblings)) in fri_layers_merkle_roots
@@ -676,9 +687,10 @@ pub trait IsStarkVerifier<
                 log_arity,
             );
 
-            // Reconstruct full group of 2^log_arity elements in natural order
+            // Reconstruct full group of 2^log_arity elements in bit-reversed order
             let pos_in_group = index % group_size;
-            let mut group_evals: Vec<FieldElement<FieldExtension>> = Vec::with_capacity(group_size);
+            let mut group_evals: Vec<FieldElement<FieldExtension>> =
+                Vec::with_capacity(group_size);
             let mut sib_idx = 0;
             for j in 0..group_size {
                 if j == pos_in_group {
@@ -689,18 +701,59 @@ pub trait IsStarkVerifier<
                 }
             }
 
-            // Fold the group using sequential binary folds with the NEXT challenge.
-            // For log_arity=1: single fold matching the original verifier behavior.
-            // For log_arity>1: multiple sub-folds with squaring challenges.
-            let partner = &group_evals[pos_in_group ^ 1];
-            v = (&v + partner) + &eval_pt_inv * &(&zetas[i + 1] * &(&v - partner));
-            eval_pt_inv = eval_pt_inv.square();
+            // Apply log_arity sequential binary folds with squaring challenges.
+            // Each sub-fold computes twiddles from domain structure to match the prover.
+            let mut challenge = zetas[i + 1].clone();
+            let mut local_start = (index / group_size) * group_size;
 
-            index = index / group_size;
+            for _ in 0..log_arity {
+                let half = group_evals.len() / 2;
+
+                // Compute inverse twiddle factors for each pair in this sub-fold.
+                // inv_tw[j] = 1/(sub_offset * sub_root^bitrev(global_pair_idx, tw_bits))
+                let sub_root =
+                    Field::get_primitive_root_of_unity(sub_domain_log_size as u64).unwrap();
+                let tw_bits = sub_domain_log_size - 1;
+                let tw_domain_size = 1u64 << tw_bits;
+
+                let mut coset_pts: Vec<FieldElement<Field>> = (0..half)
+                    .map(|j| {
+                        let global_pair_idx = local_start / 2 + j;
+                        let natural_idx =
+                            reverse_index(global_pair_idx, tw_domain_size as u64);
+                        &sub_offset * sub_root.pow(natural_idx)
+                    })
+                    .collect();
+                FieldElement::inplace_batch_inverse(&mut coset_pts).unwrap();
+
+                let mut new_evals = Vec::with_capacity(half);
+                for j in 0..half {
+                    let lo = &group_evals[2 * j];
+                    let hi = &group_evals[2 * j + 1];
+                    let sum = lo + hi;
+                    let diff = lo - hi;
+                    new_evals.push(&sum + &coset_pts[j] * &(&challenge * &diff));
+                }
+
+                group_evals = new_evals;
+                sub_offset = sub_offset.square();
+                sub_domain_log_size -= 1;
+                challenge = challenge.square();
+                local_start /= 2;
+            }
+
+            v = group_evals[0].clone();
+            index /= group_size;
+
+            // Update eval_pt_inv: squared once per binary fold
+            for _ in 0..log_arity {
+                eval_pt_inv = eval_pt_inv.square();
+            }
         }
 
         // Check final value against the final polynomial
-        result & Self::check_final_poly(&v, &eval_pt_inv, &proof.fri_final_poly)
+        let final_ok = Self::check_final_poly(&v, &eval_pt_inv, &proof.fri_final_poly);
+        result & final_ok
     }
 
     /// Check that `v` equals the final polynomial evaluated at the corresponding point.
