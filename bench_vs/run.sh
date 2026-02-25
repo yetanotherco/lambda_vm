@@ -9,8 +9,7 @@
 # Prerequisites:
 #   - Lambda VM CLI built: cargo build --release -p cli
 #   - SP1 toolchain installed: curl -L https://sp1up.succinct.xyz | bash && sp1up
-#   - clang with RISC-V target support (macOS Homebrew clang works)
-#   - ld.lld linker
+#   - Rust nightly toolchain: rustup toolchain install nightly
 
 set -euo pipefail
 
@@ -65,6 +64,9 @@ rm -rf "$TMP_DIR" && mkdir -p "$TMP_DIR"
 # --- Pre-build ---------------------------------------------------------------
 
 CLI="$ROOT_DIR/target/release/cli"
+LAMBDA_DIR="$SCRIPT_DIR/lambda/fibonacci"
+TARGET_SPEC="$ROOT_DIR/executor/programs/riscv64im-lambda-vm-elf.json"
+
 if $RUN_LAMBDA && [ ! -f "$CLI" ]; then
     echo -e "${YELLOW}[Lambda VM] CLI not found, building...${NC}"
     cargo build --release -p cli --manifest-path "$ROOT_DIR/Cargo.toml" 2>&1 | tail -1
@@ -97,32 +99,14 @@ run_one() {
     local sp1_cycles=""
 
     if $RUN_LAMBDA; then
-        # Generate assembly
-        cat > "$TMP_DIR/fib.s" <<ASM
-	.attribute	5, "rv64i2p1_m2p0"
-	.globl	main
-main:
-	li	t0, 0
-	li	t1, 1
-	li	a0, ${N}
-
-.loop:
-	add	t2, t0, t1
-	mv	t0, t1
-	mv	t1, t2
-	addi	a0, a0, -1
-	bnez	a0, .loop
-
-	mv	a0, t1
-	li	a7, 5
-	ecall
-ASM
-        clang --target=riscv64 -march=rv64im -mabi=lp64 -nostdlib \
-            -c "$TMP_DIR/fib.s" -o "$TMP_DIR/fib.o"
-        ld.lld -o "$TMP_DIR/fib.elf" "$TMP_DIR/fib.o" --entry=main
+        echo -e "  ${GREEN}[Lambda VM] Building (n=${N})...${NC}"
+        (cd "$LAMBDA_DIR" && BENCH_N="$N" cargo +nightly build --release \
+            --target "$TARGET_SPEC" \
+            -Z build-std=core -Z build-std-features=compiler-builtins-mem 2>&1 | tail -1)
+        LAMBDA_ELF="$LAMBDA_DIR/target/riscv64im-lambda-vm-elf/release/fibonacci-bench"
 
         echo -e "  ${GREEN}[Lambda VM] Proving...${NC}"
-        LAMBDA_OUTPUT=$("$CLI" prove "$TMP_DIR/fib.elf" -o "$TMP_DIR/lambda_proof.bin" --time 2>/dev/null)
+        LAMBDA_OUTPUT=$("$CLI" prove "$LAMBDA_ELF" -o "$TMP_DIR/lambda_proof.bin" --time 2>/dev/null)
         lambda_time=$(echo "$LAMBDA_OUTPUT" | grep -o 'Proving time: [0-9.]*s' | grep -o '[0-9.]*')
         echo -e "  Lambda VM: ${BOLD}${lambda_time}s${NC}"
     fi

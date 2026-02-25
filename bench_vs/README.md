@@ -15,9 +15,9 @@ Compares proving time for an identical u64 wrapping Fibonacci computation.
    sp1up
    ```
 
-3. **RISC-V assembler** — Homebrew clang + ld.lld (macOS):
+3. **Rust nightly** (for cross-compiling Lambda VM guest):
    ```bash
-   brew install llvm
+   rustup toolchain install nightly
    ```
 
 ## Usage
