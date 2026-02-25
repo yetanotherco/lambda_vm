@@ -24,13 +24,13 @@ where
     B: IsMerkleTreeBackend,
 {
     pub fn new(
-        evaluation: &[FieldElement<F>],
+        evaluation: Vec<FieldElement<F>>,
         merkle_tree: MerkleTree<B>,
         coset_offset: FieldElement<F>,
         domain_size: usize,
     ) -> Self {
         Self {
-            evaluation: evaluation.to_vec(),
+            evaluation,
             merkle_tree,
             coset_offset,
             domain_size,

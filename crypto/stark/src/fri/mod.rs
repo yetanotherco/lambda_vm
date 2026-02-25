@@ -58,7 +58,7 @@ where
             .expect("FRI commit: Merkle tree construction must succeed");
         let root = merkle_tree.root;
         fri_layer_list.push(FriLayer::new(
-            &evals,
+            evals.clone(),
             merkle_tree,
             current_coset_offset.clone().to_extension(),
             current_domain_size,
@@ -124,7 +124,7 @@ where
             .expect("FRI commit: Merkle tree construction must succeed");
         let root = merkle_tree.root;
         fri_layer_list.push(FriLayer::new(
-            &evals,
+            evals.clone(),
             merkle_tree,
             current_coset_offset.clone().to_extension(),
             current_domain_size,
