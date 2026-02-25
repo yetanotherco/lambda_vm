@@ -6,7 +6,7 @@
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
 use math::field::fields::fft_friendly::{
-    babybear::Babybear31PrimeField, quartic_babybear::Degree4BabyBearExtensionField,
+    extensions_goldilocks::Degree3GoldilocksExtensionField, u64_goldilocks::GoldilocksField,
 };
 
 use crate::examples::multi_table_lookup::{
@@ -18,8 +18,8 @@ use crate::trace::TraceTable;
 use crate::traits::AIR;
 use crate::verifier::{IsStarkVerifier, Verifier};
 
-type F = Babybear31PrimeField;
-type E = Degree4BabyBearExtensionField;
+type F = GoldilocksField;
+type E = Degree3GoldilocksExtensionField;
 type FE = FieldElement<F>;
 
 /// Bus ID for packing mismatch tests (single bus)
@@ -666,7 +666,7 @@ fn test_tampered_accumulator_first_row() {
         .bus_public_inputs
         .as_mut()
         .expect("ADD table must have bus public inputs");
-    bus_inputs.initial_terms[0] = bus_inputs.initial_terms[0].clone() + FieldElement::one();
+    bus_inputs.initial_terms[0] += FieldElement::<E>::one();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
@@ -742,11 +742,7 @@ fn test_tampered_acc_ood_first_row() {
     let num_interactions = 1usize;
     let acc_col_ood_idx = num_main + num_interactions;
     let add_proof = &mut multi_proof.proofs[1]; // proofs: [cpu=0, add=1, mul=2]
-    let corrupted = add_proof
-        .trace_ood_evaluations
-        .get(0, acc_col_ood_idx)
-        .clone()
-        + FieldElement::one();
+    let corrupted = *add_proof.trace_ood_evaluations.get(0, acc_col_ood_idx) + FieldElement::one();
     add_proof
         .trace_ood_evaluations
         .set(0, acc_col_ood_idx, corrupted);

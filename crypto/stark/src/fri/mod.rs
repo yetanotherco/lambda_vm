@@ -6,10 +6,7 @@ use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use math::field::traits::{IsFFTField, IsField};
 use math::traits::AsBytes;
 use math::{fft::cpu::bit_reversing::in_place_bit_reverse_permute, field::traits::IsSubFieldOf};
-pub use math::{
-    field::{element::FieldElement, fields::u64_prime_field::U64PrimeField},
-    polynomial::Polynomial,
-};
+pub use math::{field::element::FieldElement, polynomial::Polynomial};
 
 use crate::config::{FriLayerMerkleTree, FriLayerMerkleTreeBackend};
 

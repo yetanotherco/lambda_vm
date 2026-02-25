@@ -1,7 +1,7 @@
 //! Unit tests for Packing combine logic.
 
 use math::field::element::FieldElement;
-use math::field::fields::fft_friendly::babybear::Babybear31PrimeField;
+use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
 
 use crate::lookup::{
     AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, Multiplicity,
@@ -10,7 +10,7 @@ use crate::lookup::{
 use crate::proof::options::ProofOptions;
 use crate::traits::AIR;
 
-type F = Babybear31PrimeField;
+type F = GoldilocksField;
 type FE = FieldElement<F>;
 
 /// Bus ID for packing tests (single bus)
@@ -305,7 +305,8 @@ fn test_quad_wl_equals_four_direct() {
 
 #[test]
 fn test_air_layout_single_interaction() {
-    type E = math::field::fields::fft_friendly::quartic_babybear::Degree4BabyBearExtensionField;
+    type E =
+        math::field::fields::fft_friendly::extensions_goldilocks::Degree3GoldilocksExtensionField;
 
     let interaction = BusInteraction::sender(
         TEST_BUS,
@@ -331,7 +332,8 @@ fn test_air_layout_single_interaction() {
 
 #[test]
 fn test_air_layout_multiple_interactions() {
-    type E = math::field::fields::fft_friendly::quartic_babybear::Degree4BabyBearExtensionField;
+    type E =
+        math::field::fields::fft_friendly::extensions_goldilocks::Degree3GoldilocksExtensionField;
 
     let interaction1 = BusInteraction::sender(
         TEST_BUS,
