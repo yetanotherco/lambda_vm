@@ -606,9 +606,9 @@ mod tests {
 
             let n_inv = FE::from(n as u64).inv().unwrap();
             let mut weights = Vec::with_capacity(n);
-            let mut offset_power = n_inv.clone();
+            let mut offset_power = n_inv;
             for _ in 0..n {
-                weights.push(offset_power.clone());
+                weights.push(offset_power);
                 offset_power = &offset_power * &offset;
             }
 
@@ -651,9 +651,9 @@ mod tests {
 
         let n_inv = FE::from(n as u64).inv().unwrap();
         let mut weights = Vec::with_capacity(n);
-        let mut offset_power = n_inv.clone();
+        let mut offset_power = n_inv;
         for _ in 0..n {
-            weights.push(offset_power.clone());
+            weights.push(offset_power);
             offset_power = &offset_power * &offset;
         }
 

@@ -1080,8 +1080,8 @@ mod barycentric_tests {
         let lde_evals: Vec<FE> = lde_coset.iter().map(|p| poly.evaluate(p)).collect();
 
         // Extract trace-size coset (stride = bf)
-        let trace_coset: Vec<FE> = (0..n).map(|i| lde_coset[i * bf].clone()).collect();
-        let trace_evals: Vec<FE> = (0..n).map(|i| lde_evals[i * bf].clone()).collect();
+        let trace_coset: Vec<FE> = (0..n).map(|i| lde_coset[i * bf]).collect();
+        let trace_evals: Vec<FE> = (0..n).map(|i| lde_evals[i * bf]).collect();
 
         let z = FE::from(42u64);
         let expected = poly.evaluate(&z);
