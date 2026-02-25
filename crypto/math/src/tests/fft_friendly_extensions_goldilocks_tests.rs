@@ -1,8 +1,9 @@
 use crate::field::{
     element::FieldElement,
-    extensions_goldilocks::{Fp2E, Fp3E},
+    extensions_goldilocks::{Degree3GoldilocksExtensionField, Fp2E, Fp3E},
     goldilocks::GoldilocksField,
 };
+use crate::traits::ByteConversion;
 
 type FpE = FieldElement<GoldilocksField>;
 
@@ -481,4 +482,86 @@ fn test_fp3_from_i64_arithmetic() {
     let a = Fp3E::from_i64(10);
     let b = Fp3E::from_i64(-3);
     assert_eq!(a + b, Fp3E::from_i64(7));
+}
+
+// ByteConversion tests
+
+#[test]
+fn fp2_byte_roundtrip_be() {
+    let elem = [FpE::from(42u64), FpE::from(99u64)];
+    let bytes = elem.to_bytes_be();
+    let recovered = <[FpE; 2]>::from_bytes_be(&bytes).unwrap();
+    assert_eq!(elem, recovered);
+}
+
+#[test]
+fn fp2_byte_roundtrip_le() {
+    let elem = [FpE::from(42u64), FpE::from(99u64)];
+    let bytes = elem.to_bytes_le();
+    let recovered = <[FpE; 2]>::from_bytes_le(&bytes).unwrap();
+    assert_eq!(elem, recovered);
+}
+
+#[test]
+fn fp2_from_bytes_be_short_input_errors() {
+    let bytes = [0u8; 15];
+    assert!(<[FpE; 2]>::from_bytes_be(&bytes).is_err());
+}
+
+#[test]
+fn fp2_from_bytes_le_short_input_errors() {
+    let bytes = [0u8; 15];
+    assert!(<[FpE; 2]>::from_bytes_le(&bytes).is_err());
+}
+
+#[test]
+fn fp3_byte_roundtrip_be() {
+    let elem = [FpE::from(1u64), FpE::from(2u64), FpE::from(3u64)];
+    let bytes = elem.to_bytes_be();
+    let recovered = <[FpE; 3]>::from_bytes_be(&bytes).unwrap();
+    assert_eq!(elem, recovered);
+}
+
+#[test]
+fn fp3_byte_roundtrip_le() {
+    let elem = [FpE::from(1u64), FpE::from(2u64), FpE::from(3u64)];
+    let bytes = elem.to_bytes_le();
+    let recovered = <[FpE; 3]>::from_bytes_le(&bytes).unwrap();
+    assert_eq!(elem, recovered);
+}
+
+#[test]
+fn fp3_from_bytes_be_short_input_errors() {
+    let bytes = [0u8; 23];
+    assert!(<[FpE; 3]>::from_bytes_be(&bytes).is_err());
+}
+
+#[test]
+fn fp3_from_bytes_le_short_input_errors() {
+    let bytes = [0u8; 23];
+    assert!(<[FpE; 3]>::from_bytes_le(&bytes).is_err());
+}
+
+#[test]
+fn fp3_element_byte_roundtrip_be() {
+    let elem = FieldElement::<Degree3GoldilocksExtensionField>::new([
+        FpE::from(10u64),
+        FpE::from(20u64),
+        FpE::from(30u64),
+    ]);
+    let bytes = elem.to_bytes_be();
+    let recovered = FieldElement::<Degree3GoldilocksExtensionField>::from_bytes_be(&bytes).unwrap();
+    assert_eq!(elem, recovered);
+}
+
+#[test]
+fn fp3_element_byte_roundtrip_le() {
+    let elem = FieldElement::<Degree3GoldilocksExtensionField>::new([
+        FpE::from(10u64),
+        FpE::from(20u64),
+        FpE::from(30u64),
+    ]);
+    let bytes = elem.to_bytes_le();
+    let recovered = FieldElement::<Degree3GoldilocksExtensionField>::from_bytes_le(&bytes).unwrap();
+    assert_eq!(elem, recovered);
 }

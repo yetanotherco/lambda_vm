@@ -14,52 +14,88 @@ use crate::traits::{AsBytes, ByteConversion};
 impl ByteConversion for [FpE; 2] {
     #[cfg(feature = "alloc")]
     fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
-        unimplemented!()
+        let mut bytes = ByteConversion::to_bytes_be(&self[0]);
+        bytes.extend(ByteConversion::to_bytes_be(&self[1]));
+        bytes
     }
 
     #[cfg(feature = "alloc")]
     fn to_bytes_le(&self) -> alloc::vec::Vec<u8> {
-        unimplemented!()
+        let mut bytes = ByteConversion::to_bytes_le(&self[0]);
+        bytes.extend(ByteConversion::to_bytes_le(&self[1]));
+        bytes
     }
 
-    fn from_bytes_be(_bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
+    fn from_bytes_be(bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
     where
         Self: Sized,
     {
-        unimplemented!()
+        const N: usize = 8;
+        if bytes.len() < N * 2 {
+            return Err(crate::errors::ByteConversionError::FromBEBytesError);
+        }
+        let x0 = FieldElement::from_bytes_be(&bytes[0..N])?;
+        let x1 = FieldElement::from_bytes_be(&bytes[N..N * 2])?;
+        Ok([x0, x1])
     }
 
-    fn from_bytes_le(_bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
+    fn from_bytes_le(bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
     where
         Self: Sized,
     {
-        unimplemented!()
+        const N: usize = 8;
+        if bytes.len() < N * 2 {
+            return Err(crate::errors::ByteConversionError::FromLEBytesError);
+        }
+        let x0 = FieldElement::from_bytes_le(&bytes[0..N])?;
+        let x1 = FieldElement::from_bytes_le(&bytes[N..N * 2])?;
+        Ok([x0, x1])
     }
 }
 
 impl ByteConversion for [FpE; 3] {
     #[cfg(feature = "alloc")]
     fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
-        unimplemented!()
+        let mut bytes = ByteConversion::to_bytes_be(&self[0]);
+        bytes.extend(ByteConversion::to_bytes_be(&self[1]));
+        bytes.extend(ByteConversion::to_bytes_be(&self[2]));
+        bytes
     }
 
     #[cfg(feature = "alloc")]
     fn to_bytes_le(&self) -> alloc::vec::Vec<u8> {
-        unimplemented!()
+        let mut bytes = ByteConversion::to_bytes_le(&self[0]);
+        bytes.extend(ByteConversion::to_bytes_le(&self[1]));
+        bytes.extend(ByteConversion::to_bytes_le(&self[2]));
+        bytes
     }
 
-    fn from_bytes_be(_bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
+    fn from_bytes_be(bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
     where
         Self: Sized,
     {
-        unimplemented!()
+        const N: usize = 8;
+        if bytes.len() < N * 3 {
+            return Err(crate::errors::ByteConversionError::FromBEBytesError);
+        }
+        let x0 = FieldElement::from_bytes_be(&bytes[0..N])?;
+        let x1 = FieldElement::from_bytes_be(&bytes[N..N * 2])?;
+        let x2 = FieldElement::from_bytes_be(&bytes[N * 2..N * 3])?;
+        Ok([x0, x1, x2])
     }
 
-    fn from_bytes_le(_bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
+    fn from_bytes_le(bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
     where
         Self: Sized,
     {
-        unimplemented!()
+        const N: usize = 8;
+        if bytes.len() < N * 3 {
+            return Err(crate::errors::ByteConversionError::FromLEBytesError);
+        }
+        let x0 = FieldElement::from_bytes_le(&bytes[0..N])?;
+        let x1 = FieldElement::from_bytes_le(&bytes[N..N * 2])?;
+        let x2 = FieldElement::from_bytes_le(&bytes[N * 2..N * 3])?;
+        Ok([x0, x1, x2])
     }
 }
 
