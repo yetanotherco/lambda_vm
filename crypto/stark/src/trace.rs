@@ -4,8 +4,8 @@ use itertools::Itertools;
 use math::fft::errors::FFTError;
 use math::field::traits::{IsField, IsSubFieldOf};
 use math::polynomial::{
-    barycentric_inv_denoms,
-    interpolate_coset_eval_ext_with_g_n_inv, interpolate_coset_eval_with_g_n_inv,
+    barycentric_inv_denoms, interpolate_coset_eval_ext_with_g_n_inv,
+    interpolate_coset_eval_with_g_n_inv,
 };
 use math::{
     field::{element::FieldElement, traits::IsFFTField},
@@ -319,9 +319,7 @@ where
     }
 
     /// Consume self and return the owned column vectors.
-    pub fn into_columns(
-        self,
-    ) -> (Vec<Vec<FieldElement<F>>>, Vec<Vec<FieldElement<E>>>) {
+    pub fn into_columns(self) -> (Vec<Vec<FieldElement<F>>>, Vec<Vec<FieldElement<E>>>) {
         (self.main_columns, self.aux_columns)
     }
 
@@ -559,8 +557,7 @@ where
         })
         .collect();
 
-    let mut table_data =
-        Vec::with_capacity(evaluation_points.len() * table_width);
+    let mut table_data = Vec::with_capacity(evaluation_points.len() * table_width);
 
     for eval_point in &evaluation_points {
         // z_pow_n for this evaluation point

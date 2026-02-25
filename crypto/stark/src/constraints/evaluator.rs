@@ -3,8 +3,8 @@ use super::boundary::BoundaryConstraints;
 use crate::debug::check_boundary_polys_divisibility;
 use crate::domain::Domain;
 use crate::lookup::BusPublicInputs;
+use crate::lookup::{LOGUP_CHALLENGE_ALPHA, compute_alpha_powers};
 use crate::trace::LDETraceTable;
-use crate::lookup::{compute_alpha_powers, LOGUP_CHALLENGE_ALPHA};
 use crate::traits::{AIR, TransitionEvaluationContext, ZerofierEvaluations};
 use crate::{frame::Frame, prover::evaluate_polynomial_on_lde_domain};
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
@@ -85,7 +85,12 @@ where
                         (
                             vec![FieldElement::<FieldExtension>::zero(); num_transition],
                             vec![FieldElement::<Field>::zero(); num_periodic],
-                            Frame::preallocate(num_offsets, rows_per_step, num_main_cols, num_aux_cols),
+                            Frame::preallocate(
+                                num_offsets,
+                                rows_per_step,
+                                num_main_cols,
+                                num_aux_cols,
+                            ),
                         )
                     },
                     |(transition_buf, periodic_buf, frame), (i, boundary)| {
@@ -109,21 +114,16 @@ where
                             let sum = transition_buf
                                 .iter()
                                 .zip(transition_coefficients)
-                                .fold(FieldElement::zero(), |acc, (eval, beta)| {
-                                    acc + eval * beta
-                                });
+                                .fold(FieldElement::zero(), |acc, (eval, beta)| acc + eval * beta);
                             z * &sum
                         } else {
                             transition_buf
                                 .iter()
                                 .enumerate()
                                 .zip(transition_coefficients)
-                                .fold(
-                                    FieldElement::zero(),
-                                    |acc, ((c_idx, eval), beta)| {
-                                        acc + zerofier_data.get(c_idx, i) * eval * beta
-                                    },
-                                )
+                                .fold(FieldElement::zero(), |acc, ((c_idx, eval), beta)| {
+                                    acc + zerofier_data.get(c_idx, i) * eval * beta
+                                })
                         };
 
                         acc_transition + boundary
@@ -135,10 +135,10 @@ where
 
         #[cfg(not(feature = "parallel"))]
         {
-            let mut transition_buf =
-                vec![FieldElement::<FieldExtension>::zero(); num_transition];
+            let mut transition_buf = vec![FieldElement::<FieldExtension>::zero(); num_transition];
             let mut periodic_buf = vec![FieldElement::<Field>::zero(); num_periodic];
-            let mut frame = Frame::preallocate(num_offsets, rows_per_step, num_main_cols, num_aux_cols);
+            let mut frame =
+                Frame::preallocate(num_offsets, rows_per_step, num_main_cols, num_aux_cols);
 
             boundary_evaluation
                 .into_iter()
@@ -163,21 +163,16 @@ where
                         let sum = transition_buf
                             .iter()
                             .zip(transition_coefficients)
-                            .fold(FieldElement::zero(), |acc, (eval, beta)| {
-                                acc + eval * beta
-                            });
+                            .fold(FieldElement::zero(), |acc, (eval, beta)| acc + eval * beta);
                         z * &sum
                     } else {
                         transition_buf
                             .iter()
                             .enumerate()
                             .zip(transition_coefficients)
-                            .fold(
-                                FieldElement::zero(),
-                                |acc, ((c_idx, eval), beta)| {
-                                    acc + zerofier_data.get(c_idx, i) * eval * beta
-                                },
-                            )
+                            .fold(FieldElement::zero(), |acc, ((c_idx, eval), beta)| {
+                                acc + zerofier_data.get(c_idx, i) * eval * beta
+                            })
                     };
 
                     acc_transition + boundary
@@ -277,11 +272,9 @@ where
                         FieldElement::zero(),
                         |acc, ((constraint, beta), zerofier_inv)| {
                             let bp = if constraint.is_aux {
-                                lde_trace.get_aux(domain_index, constraint.col)
-                                    - &constraint.value
+                                lde_trace.get_aux(domain_index, constraint.col) - &constraint.value
                             } else {
-                                lde_trace.get_main(domain_index, constraint.col)
-                                    - &constraint.value
+                                lde_trace.get_main(domain_index, constraint.col) - &constraint.value
                             };
                             acc + &zerofier_inv[domain_index] * beta * bp
                         },

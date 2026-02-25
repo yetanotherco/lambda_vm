@@ -2,13 +2,6 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
 
-use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
-use math::field::{
-    element::FieldElement,
-    traits::{IsFFTField, IsField, IsPrimeField, IsSubFieldOf},
-};
-#[cfg(feature = "parallel")]
-use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
@@ -20,6 +13,13 @@ use crate::{
     trace::TraceTable,
     traits::TransitionEvaluationContext,
 };
+use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
+use math::field::{
+    element::FieldElement,
+    traits::{IsFFTField, IsField, IsPrimeField, IsSubFieldOf},
+};
+#[cfg(feature = "parallel")]
+use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 
 // =============================================================================
 // Shift Constants for Type Combining
@@ -37,7 +37,10 @@ pub const SHIFT_32: u64 = 4294967296;
 /// This is more efficient than calling `alpha.pow(i)` for each i,
 /// as it only requires one multiplication per element instead of
 /// a full exponentiation.
-pub(crate) fn compute_alpha_powers<E: IsField>(alpha: &FieldElement<E>, count: usize) -> Vec<FieldElement<E>> {
+pub(crate) fn compute_alpha_powers<E: IsField>(
+    alpha: &FieldElement<E>,
+    count: usize,
+) -> Vec<FieldElement<E>> {
     let mut powers = Vec::with_capacity(count);
     let mut current = FieldElement::<E>::one();
     for _ in 0..count {
@@ -264,16 +267,14 @@ impl Packing {
                 // Direct + Word2L
                 *acc += &main_cols[start_col][row] * &alpha_powers[alpha_offset];
                 let shift_16 = FieldElement::<F>::from(SHIFT_16);
-                let w = &main_cols[start_col + 1][row]
-                    + &main_cols[start_col + 2][row] * &shift_16;
+                let w = &main_cols[start_col + 1][row] + &main_cols[start_col + 2][row] * &shift_16;
                 *acc += &w * &alpha_powers[alpha_offset + 1];
                 2
             }
             Packing::DWordWHH => {
                 // Word2L + Direct
                 let shift_16 = FieldElement::<F>::from(SHIFT_16);
-                let w = &main_cols[start_col][row]
-                    + &main_cols[start_col + 1][row] * &shift_16;
+                let w = &main_cols[start_col][row] + &main_cols[start_col + 1][row] * &shift_16;
                 *acc += &w * &alpha_powers[alpha_offset];
                 *acc += &main_cols[start_col + 2][row] * &alpha_powers[alpha_offset + 1];
                 2
@@ -281,11 +282,10 @@ impl Packing {
             Packing::DWordHL => {
                 // 2× Word2L
                 let shift_16 = FieldElement::<F>::from(SHIFT_16);
-                let w0 = &main_cols[start_col][row]
-                    + &main_cols[start_col + 1][row] * &shift_16;
+                let w0 = &main_cols[start_col][row] + &main_cols[start_col + 1][row] * &shift_16;
                 *acc += &w0 * &alpha_powers[alpha_offset];
-                let w1 = &main_cols[start_col + 2][row]
-                    + &main_cols[start_col + 3][row] * &shift_16;
+                let w1 =
+                    &main_cols[start_col + 2][row] + &main_cols[start_col + 3][row] * &shift_16;
                 *acc += &w1 * &alpha_powers[alpha_offset + 1];
                 2
             }
@@ -867,10 +867,7 @@ where
             .as_slice()
             .into_par_iter();
         #[cfg(not(feature = "parallel"))]
-        let interactions_iter = self
-            .auxiliary_trace_build_data
-            .interactions
-            .iter();
+        let interactions_iter = self.auxiliary_trace_build_data.interactions.iter();
 
         let term_columns: Vec<Vec<FieldElement<E>>> = interactions_iter
             .map(|interaction| {
@@ -1293,9 +1290,12 @@ where
         {
             // Reconstruct base_elements for debug logging
             let mut base_elements: Vec<FieldElement<F>> = vec![bus_id_f.clone()];
-            base_elements.extend(table_interaction.values.iter().flat_map(|bv| {
-                bv.combine_from(|col| main_segment_cols[col][row].clone())
-            }));
+            base_elements.extend(
+                table_interaction
+                    .values
+                    .iter()
+                    .flat_map(|bv| bv.combine_from(|col| main_segment_cols[col][row].clone())),
+            );
             crate::bus_debug::log_interaction(
                 _table_name,
                 row,
@@ -1500,16 +1500,22 @@ where
             let mut alpha_idx: usize = 1;
             for bv in &interaction.values {
                 match bv {
-                    BusValue::Packed { start_column, packing } => {
+                    BusValue::Packed {
+                        start_column,
+                        packing,
+                    } => {
                         match packing {
                             Packing::Direct => {
-                                linear_combination += step.get_main_evaluation_element(0, *start_column) * &alpha_powers[alpha_idx];
+                                linear_combination += step
+                                    .get_main_evaluation_element(0, *start_column)
+                                    * &alpha_powers[alpha_idx];
                                 alpha_idx += 1;
                             }
                             Packing::Word2L => {
                                 let shift_16 = FieldElement::<A>::from(SHIFT_16);
                                 let combined = step.get_main_evaluation_element(0, *start_column)
-                                    + step.get_main_evaluation_element(0, *start_column + 1) * &shift_16;
+                                    + step.get_main_evaluation_element(0, *start_column + 1)
+                                        * &shift_16;
                                 linear_combination += &combined * &alpha_powers[alpha_idx];
                                 alpha_idx += 1;
                             }
@@ -1518,26 +1524,35 @@ where
                                 let shift_16 = FieldElement::<A>::from(SHIFT_16);
                                 let shift_24 = &shift_8 * &shift_16;
                                 let combined = step.get_main_evaluation_element(0, *start_column)
-                                    + step.get_main_evaluation_element(0, *start_column + 1) * &shift_8
-                                    + step.get_main_evaluation_element(0, *start_column + 2) * &shift_16
-                                    + step.get_main_evaluation_element(0, *start_column + 3) * &shift_24;
+                                    + step.get_main_evaluation_element(0, *start_column + 1)
+                                        * &shift_8
+                                    + step.get_main_evaluation_element(0, *start_column + 2)
+                                        * &shift_16
+                                    + step.get_main_evaluation_element(0, *start_column + 3)
+                                        * &shift_24;
                                 linear_combination += &combined * &alpha_powers[alpha_idx];
                                 alpha_idx += 1;
                             }
                             Packing::DWordWL => {
                                 // 2× Direct
-                                linear_combination += step.get_main_evaluation_element(0, *start_column) * &alpha_powers[alpha_idx];
-                                linear_combination += step.get_main_evaluation_element(0, *start_column + 1) * &alpha_powers[alpha_idx + 1];
+                                linear_combination += step
+                                    .get_main_evaluation_element(0, *start_column)
+                                    * &alpha_powers[alpha_idx];
+                                linear_combination += step
+                                    .get_main_evaluation_element(0, *start_column + 1)
+                                    * &alpha_powers[alpha_idx + 1];
                                 alpha_idx += 2;
                             }
                             Packing::DWordHL => {
                                 // 2× Word2L
                                 let shift_16 = FieldElement::<A>::from(SHIFT_16);
                                 let w0 = step.get_main_evaluation_element(0, *start_column)
-                                    + step.get_main_evaluation_element(0, *start_column + 1) * &shift_16;
+                                    + step.get_main_evaluation_element(0, *start_column + 1)
+                                        * &shift_16;
                                 linear_combination += &w0 * &alpha_powers[alpha_idx];
                                 let w1 = step.get_main_evaluation_element(0, *start_column + 2)
-                                    + step.get_main_evaluation_element(0, *start_column + 3) * &shift_16;
+                                    + step.get_main_evaluation_element(0, *start_column + 3)
+                                        * &shift_16;
                                 linear_combination += &w1 * &alpha_powers[alpha_idx + 1];
                                 alpha_idx += 2;
                             }
@@ -1547,23 +1562,32 @@ where
                                 let shift_16 = FieldElement::<A>::from(SHIFT_16);
                                 let shift_24 = &shift_8 * &shift_16;
                                 let w0 = step.get_main_evaluation_element(0, *start_column)
-                                    + step.get_main_evaluation_element(0, *start_column + 1) * &shift_8
-                                    + step.get_main_evaluation_element(0, *start_column + 2) * &shift_16
-                                    + step.get_main_evaluation_element(0, *start_column + 3) * &shift_24;
+                                    + step.get_main_evaluation_element(0, *start_column + 1)
+                                        * &shift_8
+                                    + step.get_main_evaluation_element(0, *start_column + 2)
+                                        * &shift_16
+                                    + step.get_main_evaluation_element(0, *start_column + 3)
+                                        * &shift_24;
                                 linear_combination += &w0 * &alpha_powers[alpha_idx];
                                 let w1 = step.get_main_evaluation_element(0, *start_column + 4)
-                                    + step.get_main_evaluation_element(0, *start_column + 5) * &shift_8
-                                    + step.get_main_evaluation_element(0, *start_column + 6) * &shift_16
-                                    + step.get_main_evaluation_element(0, *start_column + 7) * &shift_24;
+                                    + step.get_main_evaluation_element(0, *start_column + 5)
+                                        * &shift_8
+                                    + step.get_main_evaluation_element(0, *start_column + 6)
+                                        * &shift_16
+                                    + step.get_main_evaluation_element(0, *start_column + 7)
+                                        * &shift_24;
                                 linear_combination += &w1 * &alpha_powers[alpha_idx + 1];
                                 alpha_idx += 2;
                             }
                             Packing::DWordHHW => {
                                 // Direct + Word2L
-                                linear_combination += step.get_main_evaluation_element(0, *start_column) * &alpha_powers[alpha_idx];
+                                linear_combination += step
+                                    .get_main_evaluation_element(0, *start_column)
+                                    * &alpha_powers[alpha_idx];
                                 let shift_16 = FieldElement::<A>::from(SHIFT_16);
                                 let w = step.get_main_evaluation_element(0, *start_column + 1)
-                                    + step.get_main_evaluation_element(0, *start_column + 2) * &shift_16;
+                                    + step.get_main_evaluation_element(0, *start_column + 2)
+                                        * &shift_16;
                                 linear_combination += &w * &alpha_powers[alpha_idx + 1];
                                 alpha_idx += 2;
                             }
@@ -1571,9 +1595,12 @@ where
                                 // Word2L + Direct
                                 let shift_16 = FieldElement::<A>::from(SHIFT_16);
                                 let w = step.get_main_evaluation_element(0, *start_column)
-                                    + step.get_main_evaluation_element(0, *start_column + 1) * &shift_16;
+                                    + step.get_main_evaluation_element(0, *start_column + 1)
+                                        * &shift_16;
                                 linear_combination += &w * &alpha_powers[alpha_idx];
-                                linear_combination += step.get_main_evaluation_element(0, *start_column + 2) * &alpha_powers[alpha_idx + 1];
+                                linear_combination += step
+                                    .get_main_evaluation_element(0, *start_column + 2)
+                                    * &alpha_powers[alpha_idx + 1];
                                 alpha_idx += 2;
                             }
                             Packing::QuadHL => {
@@ -1590,7 +1617,9 @@ where
                             Packing::QuadWL => {
                                 // 4× Direct
                                 for i in 0..4 {
-                                    linear_combination += step.get_main_evaluation_element(0, *start_column + i) * &alpha_powers[alpha_idx + i];
+                                    linear_combination += step
+                                        .get_main_evaluation_element(0, *start_column + i)
+                                        * &alpha_powers[alpha_idx + i];
                                 }
                                 alpha_idx += 4;
                             }
@@ -1600,11 +1629,17 @@ where
                         let mut result = FieldElement::<A>::zero();
                         for term in terms {
                             match term {
-                                LinearTerm::Column { coefficient, column } => {
+                                LinearTerm::Column {
+                                    coefficient,
+                                    column,
+                                } => {
                                     let coeff = FieldElement::<A>::from(*coefficient);
                                     result += step.get_main_evaluation_element(0, *column) * coeff;
                                 }
-                                LinearTerm::ColumnUnsigned { coefficient, column } => {
+                                LinearTerm::ColumnUnsigned {
+                                    coefficient,
+                                    column,
+                                } => {
                                     let coeff = FieldElement::<A>::from(*coefficient);
                                     result += step.get_main_evaluation_element(0, *column) * coeff;
                                 }

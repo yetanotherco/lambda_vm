@@ -1,7 +1,7 @@
 use super::domain::Domain;
 use super::trace::TraceTable;
 use super::traits::{AIR, TransitionEvaluationContext};
-use crate::lookup::{compute_alpha_powers, LOGUP_CHALLENGE_ALPHA};
+use crate::lookup::{LOGUP_CHALLENGE_ALPHA, compute_alpha_powers};
 use crate::{frame::Frame, trace::LDETraceTable};
 use log::{error, info};
 use math::field::traits::IsSubFieldOf;
@@ -109,8 +109,12 @@ pub fn validate_trace<
             .iter()
             .map(|col| col[step].clone())
             .collect();
-        let transition_evaluation_context =
-            TransitionEvaluationContext::new_prover(&frame, &periodic_values, rap_challenges, &logup_alpha_powers);
+        let transition_evaluation_context = TransitionEvaluationContext::new_prover(
+            &frame,
+            &periodic_values,
+            rap_challenges,
+            &logup_alpha_powers,
+        );
         let evaluations = air.compute_transition(&transition_evaluation_context);
 
         // Iterate over each transition evaluation. When the evaluated step is not from

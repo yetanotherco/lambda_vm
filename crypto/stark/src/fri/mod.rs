@@ -12,7 +12,9 @@ use crate::config::{FriLayerMerkleTree, FriLayerMerkleTreeBackend};
 
 use self::fri_commitment::FriLayer;
 use self::fri_decommit::FriDecommitment;
-use self::fri_functions::{compute_coset_twiddles_inv, fold_evaluations_in_place, update_twiddles_in_place};
+use self::fri_functions::{
+    compute_coset_twiddles_inv, fold_evaluations_in_place, update_twiddles_in_place,
+};
 
 pub fn commit_phase<F: IsFFTField + IsSubFieldOf<E>, E: IsField + Send + Sync>(
     number_layers: usize,
@@ -78,10 +80,7 @@ where
     // Final fold
     fold_evaluations_in_place(&mut evals, &zeta, &inv_twiddles);
 
-    let last_value = evals
-        .first()
-        .unwrap_or(&FieldElement::zero())
-        .clone();
+    let last_value = evals.first().unwrap_or(&FieldElement::zero()).clone();
 
     // >>>> Send value: pₙ
     transcript.append_field_element(&last_value);
@@ -150,10 +149,7 @@ where
     // Final fold
     fold_evaluations_in_place(&mut evals, &zeta, &inv_twiddles);
 
-    let last_value = evals
-        .first()
-        .unwrap_or(&FieldElement::zero())
-        .clone();
+    let last_value = evals.first().unwrap_or(&FieldElement::zero()).clone();
 
     // >>>> Send value: pₙ
     transcript.append_field_element(&last_value);
@@ -206,4 +202,3 @@ where
             .collect()
     }
 }
-

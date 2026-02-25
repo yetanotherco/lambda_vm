@@ -975,7 +975,9 @@ pub trait IsStarkProver<
             // Safe: has_aux_trace() is true only when Phase C stored aux tree/root
             let aux_commitment = Round1CommitmentData::<FieldExtension> {
                 lde_trace_merkle_tree: Rc::clone(
-                    metadata.aux_merkle_tree.as_ref()
+                    metadata
+                        .aux_merkle_tree
+                        .as_ref()
                         .expect("aux tree must exist when has_trace_interaction"),
                 ),
                 lde_trace_merkle_root: metadata
@@ -1000,12 +1002,8 @@ pub trait IsStarkProver<
             .iter_mut()
             .map(std::mem::take)
             .collect();
-        let lde_trace = LDETraceTable::from_columns(
-            main_cols,
-            aux_cols,
-            air.step_size(),
-            domain.blowup_factor,
-        );
+        let lde_trace =
+            LDETraceTable::from_columns(main_cols, aux_cols, air.step_size(), domain.blowup_factor);
 
         Ok(Round1 {
             lde_trace,
@@ -1083,8 +1081,7 @@ pub trait IsStarkProver<
         let mut inv_2x: Vec<FieldElement<Field>> = (0..n)
             .map(|i| &two_base * &domain.lde_roots_of_unity_coset[i])
             .collect();
-        FieldElement::inplace_batch_inverse(&mut inv_2x)
-            .expect("Coset points are non-zero");
+        FieldElement::inplace_batch_inverse(&mut inv_2x).expect("Coset points are non-zero");
 
         // Step 2: Pointwise decomposition.
         // H₀((g·ω^i)²) = (evals[i] + evals[i+N]) / 2
@@ -1124,34 +1121,14 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "parallel")]
         let (lde_h0, lde_h1) = rayon::join(
-            || {
-                Self::extend_half_to_lde::<FieldExtension>(
-                    &h0_evals,
-                    &coset_offset_squared,
-                    domain,
-                )
-            },
-            || {
-                Self::extend_half_to_lde::<FieldExtension>(
-                    &h1_evals,
-                    &coset_offset_squared,
-                    domain,
-                )
-            },
+            || Self::extend_half_to_lde::<FieldExtension>(&h0_evals, &coset_offset_squared, domain),
+            || Self::extend_half_to_lde::<FieldExtension>(&h1_evals, &coset_offset_squared, domain),
         );
 
         #[cfg(not(feature = "parallel"))]
         let (lde_h0, lde_h1) = (
-            Self::extend_half_to_lde::<FieldExtension>(
-                &h0_evals,
-                &coset_offset_squared,
-                domain,
-            ),
-            Self::extend_half_to_lde::<FieldExtension>(
-                &h1_evals,
-                &coset_offset_squared,
-                domain,
-            ),
+            Self::extend_half_to_lde::<FieldExtension>(&h0_evals, &coset_offset_squared, domain),
+            Self::extend_half_to_lde::<FieldExtension>(&h1_evals, &coset_offset_squared, domain),
         );
 
         vec![lde_h0, lde_h1]
@@ -1222,10 +1199,7 @@ pub trait IsStarkProver<
             //   H₀(x²) = (H(x) + H(-x)) / 2
             //   H₁(x²) = (H(x) - H(-x)) / (2x)
             // On the LDE coset {g·ω^i}, we have -g·ω^i = g·ω^{i+N} since ω^N = -1.
-            Self::decompose_and_extend_d2::<FieldExtension>(
-                &constraint_evaluations,
-                domain,
-            )
+            Self::decompose_and_extend_d2::<FieldExtension>(&constraint_evaluations, domain)
         } else if number_of_parts == 1 {
             // Degree bound equals trace length: constraint evals are the LDE directly.
             vec![constraint_evaluations]
@@ -1297,8 +1271,7 @@ pub trait IsStarkProver<
 
         // Precompute inv_denoms for z^num_parts (shared across all composition poly parts)
         let comp_z_pow_n = z_power.pow(domain_size);
-        let comp_inv_denoms =
-            math::polynomial::barycentric_inv_denoms(&z_power, &coset_points);
+        let comp_inv_denoms = math::polynomial::barycentric_inv_denoms(&z_power, &coset_points);
 
         let composition_poly_parts_ood_evaluation: Vec<_> = round_2_result
             .lde_composition_poly_evaluations
@@ -1392,21 +1365,21 @@ pub trait IsStarkProver<
         // deep_evals[i] = h(offset·ω_N^i) = f(ω_N^i) where f(x) = h(offset·x).
         // Standard iFFT+FFT recovers f and evaluates on the 2N-th roots: f(Ω^j) = h(offset·Ω^j).
         let domain_size = domain.lde_roots_of_unity_coset.len();
-        let deep_poly = Polynomial::interpolate_fft::<Field>(&deep_evals)
-            .expect("iFFT should succeed");
-        let mut lde_evals = Polynomial::evaluate_fft::<Field>(
-            &deep_poly, 1, Some(domain_size),
-        ).expect("FFT should succeed");
+        let deep_poly =
+            Polynomial::interpolate_fft::<Field>(&deep_evals).expect("iFFT should succeed");
+        let mut lde_evals = Polynomial::evaluate_fft::<Field>(&deep_poly, 1, Some(domain_size))
+            .expect("FFT should succeed");
         in_place_bit_reverse_permute(&mut lde_evals);
 
         // FRI commit phase from pre-computed evaluations (no initial FFT)
-        let (fri_last_value, fri_layers) = fri::commit_phase_from_evaluations::<Field, FieldExtension>(
-            domain.root_order as usize,
-            lde_evals,
-            transcript,
-            &coset_offset,
-            domain_size,
-        );
+        let (fri_last_value, fri_layers) =
+            fri::commit_phase_from_evaluations::<Field, FieldExtension>(
+                domain.root_order as usize,
+                lde_evals,
+                transcript,
+                &coset_offset,
+                domain_size,
+            );
 
         // grinding: generate nonce and append it to the transcript
         let security_bits = air.context().proof_options.grinding_factor;
@@ -1684,8 +1657,7 @@ pub trait IsStarkProver<
             proof: tree.get_proof_by_pos(index).unwrap(),
             proof_sym: tree.get_proof_by_pos(index_sym).unwrap(),
             evaluations: lde_trace.gather_aux_row(reverse_index(index, domain_size as u64)),
-            evaluations_sym: lde_trace
-                .gather_aux_row(reverse_index(index_sym, domain_size as u64)),
+            evaluations_sym: lde_trace.gather_aux_row(reverse_index(index_sym, domain_size as u64)),
         }
     }
 
@@ -1934,15 +1906,18 @@ pub trait IsStarkProver<
 
         // Pass 2: Sequential fork transcript → extract → LDE → commit.
         // Uses shared aux_pool. Each table gets its own transcript fork.
-        let mut metadatas: Vec<Round1Metadata<Field, FieldExtension>> = Vec::with_capacity(num_airs);
+        let mut metadatas: Vec<Round1Metadata<Field, FieldExtension>> =
+            Vec::with_capacity(num_airs);
         let mut table_transcripts = Vec::with_capacity(num_airs);
-        for (idx, ((((air, trace, _pub_inputs), bus_public_inputs), main_commit), (domain, twiddles)))
-            in air_trace_pairs
-                .iter()
-                .zip(bus_inputs_vec.into_iter())
-                .zip(main_commits.into_iter())
-                .zip(domains.iter().zip(twiddle_caches.iter()))
-                .enumerate()
+        for (
+            idx,
+            ((((air, trace, _pub_inputs), bus_public_inputs), main_commit), (domain, twiddles)),
+        ) in air_trace_pairs
+            .iter()
+            .zip(bus_inputs_vec.into_iter())
+            .zip(main_commits.into_iter())
+            .zip(domains.iter().zip(twiddle_caches.iter()))
+            .enumerate()
         {
             // Fork transcript with domain separator (must match verifier)
             let mut table_transcript = transcript.clone();
@@ -1960,9 +1935,8 @@ pub trait IsStarkProver<
                     twiddles,
                 );
 
-                let (tree, root) =
-                    Self::commit_columns_bit_reversed(&aux_pool[..num_aux_cols])
-                        .ok_or(ProvingError::EmptyCommitment)?;
+                let (tree, root) = Self::commit_columns_bit_reversed(&aux_pool[..num_aux_cols])
+                    .ok_or(ProvingError::EmptyCommitment)?;
 
                 table_transcript.append_bytes(&root);
                 (Some(Rc::new(tree)), Some(root))
@@ -1994,9 +1968,15 @@ pub trait IsStarkProver<
                 .zip(domains.iter().zip(twiddle_caches.iter()))
             {
                 let result = Self::reconstruct_round1(
-                    *air, *trace, domain, metadata, twiddles,
-                    &mut main_pool, &mut aux_pool,
-                ).expect("reconstruct_round1 failed in debug-checks");
+                    *air,
+                    *trace,
+                    domain,
+                    metadata,
+                    twiddles,
+                    &mut main_pool,
+                    &mut aux_pool,
+                )
+                .expect("reconstruct_round1 failed in debug-checks");
                 temp_results.push(result);
             }
 
@@ -2024,21 +2004,32 @@ pub trait IsStarkProver<
         // run rounds 2-4 with the table's forked transcript, then drop table data.
 
         let mut proofs = Vec::with_capacity(num_airs);
-        for (((((air, trace, pub_inputs), metadata), domain), twiddles), table_transcript) in air_trace_pairs
-            .iter()
-            .zip(metadatas.iter())
-            .zip(domains.iter())
-            .zip(twiddle_caches.iter())
-            .zip(table_transcripts.iter_mut())
+        for (((((air, trace, pub_inputs), metadata), domain), twiddles), table_transcript) in
+            air_trace_pairs
+                .iter()
+                .zip(metadatas.iter())
+                .zip(domains.iter())
+                .zip(twiddle_caches.iter())
+                .zip(table_transcripts.iter_mut())
         {
             // Recompute LDE evaluations into pool, reuse stored Merkle trees
             let round_1_result = Self::reconstruct_round1(
-                *air, *trace, domain, metadata, twiddles,
-                &mut main_pool, &mut aux_pool,
+                *air,
+                *trace,
+                domain,
+                metadata,
+                twiddles,
+                &mut main_pool,
+                &mut aux_pool,
             )?;
 
-            let proof =
-                Self::prove_rounds_2_to_4(*air, *pub_inputs, &round_1_result, table_transcript, domain)?;
+            let proof = Self::prove_rounds_2_to_4(
+                *air,
+                *pub_inputs,
+                &round_1_result,
+                table_transcript,
+                domain,
+            )?;
             proofs.push(proof);
 
             // Return column Vecs to pool (zero-copy move back). Pool slots that were
@@ -2476,7 +2467,7 @@ mod tests {
     /// results to `get_trace_evaluations` (Horner) for the Fibonacci trace.
     #[test]
     fn barycentric_trace_eval_matches_horner_trace_eval() {
-        use crate::trace::{get_trace_evaluations, get_trace_evaluations_from_lde, LDETraceTable};
+        use crate::trace::{LDETraceTable, get_trace_evaluations, get_trace_evaluations_from_lde};
 
         let trace = simple_fibonacci::fibonacci_trace([Felt::from(1), Felt::from(1)], 8);
         let trace_length = trace.num_rows();
@@ -2535,13 +2526,8 @@ mod tests {
         );
 
         // Barycentric evaluation (new path)
-        let result = get_trace_evaluations_from_lde(
-            &lde_trace,
-            &domain,
-            &z,
-            &frame_offsets,
-            step_size,
-        );
+        let result =
+            get_trace_evaluations_from_lde(&lde_trace, &domain, &z, &frame_offsets, step_size);
 
         assert_eq!(result.width, expected.width);
         assert_eq!(result.height, expected.height);
@@ -2598,23 +2584,16 @@ mod tests {
             .collect();
 
         // --- New path: algebraic decomposition ---
-        let new_result =
-            Prover::<GoldilocksField, GoldilocksField, ()>::decompose_and_extend_d2::<
-                GoldilocksField,
-            >(&constraint_evaluations, &domain);
+        let new_result = Prover::<GoldilocksField, GoldilocksField, ()>::decompose_and_extend_d2::<
+            GoldilocksField,
+        >(&constraint_evaluations, &domain);
 
         assert_eq!(new_result.len(), 2);
         assert_eq!(new_result[0].len(), original[0].len());
         assert_eq!(new_result[1].len(), original[1].len());
         for i in 0..new_result[0].len() {
-            assert_eq!(
-                new_result[0][i], original[0][i],
-                "H₀ mismatch at index {i}"
-            );
-            assert_eq!(
-                new_result[1][i], original[1][i],
-                "H₁ mismatch at index {i}"
-            );
+            assert_eq!(new_result[0][i], original[0][i], "H₀ mismatch at index {i}");
+            assert_eq!(new_result[1][i], original[1][i], "H₁ mismatch at index {i}");
         }
     }
 }

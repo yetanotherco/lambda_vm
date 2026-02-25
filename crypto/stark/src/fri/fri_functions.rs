@@ -1,7 +1,6 @@
 use super::Polynomial;
 use math::fft::cpu::{
-    bit_reversing::in_place_bit_reverse_permute,
-    roots_of_unity::get_powers_of_primitive_root_coset,
+    bit_reversing::in_place_bit_reverse_permute, roots_of_unity::get_powers_of_primitive_root_coset,
 };
 use math::field::{
     element::FieldElement,

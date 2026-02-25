@@ -13,7 +13,7 @@ use crate::fft::gpu::cuda::polynomial::{evaluate_fft_cuda, interpolate_fft_cuda}
 
 use super::cpu::{
     bit_reversing::in_place_bit_reverse_permute,
-    bowers_fft::{bowers_fft_opt_fused, bowers_ifft_opt, LayerTwiddles},
+    bowers_fft::{LayerTwiddles, bowers_fft_opt_fused, bowers_ifft_opt},
 };
 
 #[cfg(feature = "parallel")]
@@ -260,7 +260,14 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         }
         let lde_size = n * blowup_factor;
         let mut buffer = Vec::with_capacity(lde_size);
-        Self::coset_lde_full_into(evals, blowup_factor, weights, inv_twiddles, fwd_twiddles, &mut buffer)?;
+        Self::coset_lde_full_into(
+            evals,
+            blowup_factor,
+            weights,
+            inv_twiddles,
+            fwd_twiddles,
+            &mut buffer,
+        )?;
         Ok(buffer)
     }
 
@@ -541,13 +548,9 @@ mod tests {
 
             // Reference: interpolate → scale → evaluate (the old pipeline)
             let poly = Polynomial::interpolate_fft::<F>(&evals).unwrap();
-            let reference = Polynomial::evaluate_offset_fft::<F>(
-                &poly,
-                blowup_factor,
-                Some(n),
-                &offset,
-            )
-            .unwrap();
+            let reference =
+                Polynomial::evaluate_offset_fft::<F>(&poly, blowup_factor, Some(n), &offset)
+                    .unwrap();
 
             // Fused: coset_lde
             let fused = Polynomial::<FE>::coset_lde::<F>(&evals, blowup_factor, &offset).unwrap();
@@ -609,14 +612,24 @@ mod tests {
                 offset_power = &offset_power * &offset;
             }
 
-            let reference =
-                Polynomial::<FE>::coset_lde_full::<F>(&evals, blowup_factor, &weights, &inv_tw, &fwd_tw)
-                    .unwrap();
+            let reference = Polynomial::<FE>::coset_lde_full::<F>(
+                &evals,
+                blowup_factor,
+                &weights,
+                &inv_tw,
+                &fwd_tw,
+            )
+            .unwrap();
 
             // Test with pre-allocated buffer
             let mut buffer = Vec::with_capacity(lde_size);
             Polynomial::<FE>::coset_lde_full_into::<F>(
-                &evals, blowup_factor, &weights, &inv_tw, &fwd_tw, &mut buffer,
+                &evals,
+                blowup_factor,
+                &weights,
+                &inv_tw,
+                &fwd_tw,
+                &mut buffer,
             )
             .unwrap();
 
@@ -650,12 +663,22 @@ mod tests {
         for seed in [13u64, 42u64] {
             let evals: Vec<FE> = (0..n).map(|i| FE::from(i as u64 * seed + 1)).collect();
 
-            let reference =
-                Polynomial::<FE>::coset_lde_full::<F>(&evals, blowup_factor, &weights, &inv_tw, &fwd_tw)
-                    .unwrap();
+            let reference = Polynomial::<FE>::coset_lde_full::<F>(
+                &evals,
+                blowup_factor,
+                &weights,
+                &inv_tw,
+                &fwd_tw,
+            )
+            .unwrap();
 
             Polynomial::<FE>::coset_lde_full_into::<F>(
-                &evals, blowup_factor, &weights, &inv_tw, &fwd_tw, &mut buffer,
+                &evals,
+                blowup_factor,
+                &weights,
+                &inv_tw,
+                &fwd_tw,
+                &mut buffer,
             )
             .unwrap();
 

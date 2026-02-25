@@ -31,11 +31,7 @@ impl<F: IsSubFieldOf<E>, E: IsField> Frame<F, E> {
     ///
     /// Each step gathers elements from columns into owned Vecs. For the typical
     /// case (2 offsets, step_size=1), this gathers 2 rows of ~74 main + aux elements.
-    pub fn read_from_lde(
-        lde_trace: &LDETraceTable<F, E>,
-        row: usize,
-        offsets: &[usize],
-    ) -> Self {
+    pub fn read_from_lde(lde_trace: &LDETraceTable<F, E>, row: usize, offsets: &[usize]) -> Self {
         let blowup_factor = lde_trace.blowup_factor;
         let num_rows = lde_trace.num_rows();
         let step_size = lde_trace.lde_step_size;
@@ -139,8 +135,7 @@ impl<F: IsSubFieldOf<E>, E: IsField> Frame<F, E> {
 
                 // Overwrite aux row elements
                 for col in 0..num_aux_cols {
-                    step.aux_data[sub_row_idx][col] =
-                        lde_trace.get_aux(step_row_idx, col).clone();
+                    step.aux_data[sub_row_idx][col] = lde_trace.get_aux(step_row_idx, col).clone();
                 }
 
                 sub_row_idx += 1;

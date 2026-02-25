@@ -792,10 +792,7 @@ where
 {
     // z - p where z is in E and p is in F. Since Sub<E> is defined for F: IsSubFieldOf<E>,
     // we compute -(p - z) which equals z - p.
-    let mut denoms: Vec<FieldElement<E>> = coset_points
-        .iter()
-        .map(|p| -(p - z))
-        .collect();
+    let mut denoms: Vec<FieldElement<E>> = coset_points.iter().map(|p| -(p - z)).collect();
     FieldElement::inplace_batch_inverse(&mut denoms)
         .expect("z is sampled to avoid coset points, so z - g*w^i is never zero");
     denoms

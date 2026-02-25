@@ -1419,10 +1419,12 @@ impl Traces {
         #[cfg(feature = "parallel")]
         {
             let ((pages_val, register_val), halt_val) = rayon::join(
-                || rayon::join(
-                    || generate_page_tables(elf, &memory_state),
-                    || register::generate_register_trace(&register_final_state),
-                ),
+                || {
+                    rayon::join(
+                        || generate_page_tables(elf, &memory_state),
+                        || register::generate_register_trace(&register_final_state),
+                    )
+                },
                 || halt::generate_halt_trace(halt_timestamp),
             );
             let (pages_v, page_configs_v) = pages_val;
