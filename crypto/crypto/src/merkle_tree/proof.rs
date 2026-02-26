@@ -5,7 +5,7 @@ use math::{errors::DeserializationError, traits::Deserializable};
 
 use super::{
     traits::IsMerkleTreeBackend,
-    utils::{get_parent_pos, get_sibling_pos},
+    utils::{get_parent_pos, get_sibling_pos, parent_index_arity, total_nodes_arity},
 };
 
 /// Stores a merkle path to some leaf.
@@ -19,22 +19,45 @@ pub struct Proof<T: PartialEq + Eq> {
     pub merkle_path: Vec<T>,
 }
 
-impl<T: PartialEq + Eq> Proof<T> {
+impl<T: PartialEq + Eq + Clone> Proof<T> {
     /// Verifies a Merkle inclusion proof for the value contained at leaf index.
     pub fn verify<B>(&self, root_hash: &B::Node, mut index: usize, value: &B::Data) -> bool
     where
         B: IsMerkleTreeBackend<Node = T>,
     {
+        let arity = B::ARITY;
         let mut hashed_value = B::hash_data(value);
 
-        for sibling_node in self.merkle_path.iter() {
-            if index.is_multiple_of(2) {
-                hashed_value = B::hash_new_parent(&hashed_value, sibling_node);
-            } else {
-                hashed_value = B::hash_new_parent(sibling_node, &hashed_value);
+        if arity == 2 {
+            for sibling_node in self.merkle_path.iter() {
+                if index.is_multiple_of(2) {
+                    hashed_value = B::hash_new_parent(&hashed_value, sibling_node);
+                } else {
+                    hashed_value = B::hash_new_parent(sibling_node, &hashed_value);
+                }
+                index >>= 1;
             }
-
-            index >>= 1;
+        } else {
+            // For arity A, consume A-1 siblings per level.
+            let siblings_per_level = arity - 1;
+            let mut path_iter = self.merkle_path.chunks_exact(siblings_per_level);
+            for siblings in path_iter.by_ref() {
+                // The position of self among siblings
+                let pos = index % arity;
+                // Reconstruct the full children array
+                let mut children = Vec::with_capacity(arity);
+                let mut sib_idx = 0;
+                for i in 0..arity {
+                    if i == pos {
+                        children.push(hashed_value.clone());
+                    } else {
+                        children.push(siblings[sib_idx].clone());
+                        sib_idx += 1;
+                    }
+                }
+                hashed_value = B::hash_children(&children);
+                index /= arity;
+            }
         }
 
         root_hash == &hashed_value
@@ -109,26 +132,22 @@ impl<T: PartialEq + Eq + Clone> BatchProof<T> {
             return false;
         }
 
+        let arity = B::ARITY;
+
         // Index of the first leaf as it is ordered in the tree struct (from top to bottom).
-        let first_leaf_index = num_leaves - 1;
+        let total = total_nodes_arity(num_leaves, arity);
+        let first_leaf_index = total - num_leaves;
 
         // Build map of `position → hashed value`, validating that duplicate positions have the same value.
-        // Since the nodes in the tree are indexed from the root to the leaves, we need to redefine the
-        // given indices of the leaves.
-        // We also need to hash all the given leaf values.
-        // BTreeMap always maintains elements in ascending order, so here the leaves are ordered from
-        // left (smaller index) to right (larger index).
         let mut current_level_known_nodes: BTreeMap<usize, T> = BTreeMap::new();
         for (&pos, value) in pos_list.iter().zip(values.iter()) {
             let tree_index = pos + first_leaf_index;
             let hashed_value = B::hash_data(value);
 
             if let Some(existing) = current_level_known_nodes.get(&tree_index) {
-                // Duplicate position: values must be the same
                 if existing != &hashed_value {
                     return false;
                 }
-                // Same value, skip (deduplicate)
             } else {
                 current_level_known_nodes.insert(tree_index, hashed_value);
             }
@@ -136,44 +155,86 @@ impl<T: PartialEq + Eq + Clone> BatchProof<T> {
 
         let mut proof_path_iter = self.path.iter();
 
-        let num_levels = (2 * num_leaves).ilog2();
-        // Process level by level, from bottom to top, same as `get_batch_auth_path_positions`.
+        let num_levels = if arity == 2 {
+            (2 * num_leaves).ilog2()
+        } else {
+            let mut levels = 0u32;
+            let mut size = num_leaves;
+            while size > 1 {
+                size /= arity;
+                levels += 1;
+            }
+            levels + 1
+        };
+
+        // Process level by level, from bottom to top.
         for _ in 0..num_levels - 1 {
             let mut next_level_known_nodes: BTreeMap<usize, T> = BTreeMap::new();
 
             // Process each known node from right to left to match the order of the proof.
-            // Since in `current_level_known_nodes` the nodes are ordered from left to right we take `.rev()`.
             for (pos, value) in current_level_known_nodes.iter().rev() {
-                let parent_pos = get_parent_pos(*pos);
+                let parent_pos = if arity == 2 {
+                    get_parent_pos(*pos)
+                } else {
+                    parent_index_arity(*pos, arity)
+                };
 
-                // Skip if parent was already computed (i.e. sibling was processed first).
+                // Skip if parent was already computed
                 if next_level_known_nodes.contains_key(&parent_pos) {
                     continue;
                 }
 
-                // Get sibling position (None only for root, which shouldn't appear here)
-                let Some(sibling_pos) = get_sibling_pos(*pos) else {
-                    continue;
-                };
+                if arity == 2 {
+                    let Some(sibling_pos) = get_sibling_pos(*pos) else {
+                        continue;
+                    };
 
-                // Get sibling value: from known nodes or from proof path.
-                let sibling_hash = if let Some(hash) = current_level_known_nodes.get(&sibling_pos) {
-                    hash
+                    let sibling_hash =
+                        if let Some(hash) = current_level_known_nodes.get(&sibling_pos) {
+                            hash
+                        } else {
+                            match proof_path_iter.next() {
+                                Some(h) => h,
+                                None => return false,
+                            }
+                        };
+
+                    let parent_hash = if pos % 2 == 1 {
+                        B::hash_new_parent(value, sibling_hash)
+                    } else {
+                        B::hash_new_parent(sibling_hash, value)
+                    };
+
+                    next_level_known_nodes.insert(parent_pos, parent_hash);
                 } else {
-                    match proof_path_iter.next() {
-                        Some(h) => h,
-                        None => return false,
+                    // For arity A: collect all A children of the parent.
+                    // Consume proof nodes right-to-left (descending) to match proof ordering,
+                    // then assemble in correct left-to-right order for hashing.
+                    let first_child = parent_pos * arity + 1;
+                    let mut children: Vec<Option<T>> = (0..arity).map(|_| None).collect();
+
+                    // First pass: fill in known nodes
+                    for (i, slot) in children.iter_mut().enumerate() {
+                        let child_idx = first_child + i;
+                        if let Some(hash) = current_level_known_nodes.get(&child_idx) {
+                            *slot = Some(hash.clone());
+                        }
                     }
-                };
 
-                // Compute parent hash.
-                let parent_hash = if pos % 2 == 1 {
-                    B::hash_new_parent(value, sibling_hash)
-                } else {
-                    B::hash_new_parent(sibling_hash, value)
-                };
+                    // Second pass: consume proof nodes right-to-left (descending index)
+                    for i in (0..arity).rev() {
+                        if children[i].is_none() {
+                            match proof_path_iter.next() {
+                                Some(h) => children[i] = Some(h.clone()),
+                                None => return false,
+                            }
+                        }
+                    }
 
-                next_level_known_nodes.insert(parent_pos, parent_hash);
+                    let children: Vec<T> = children.into_iter().map(|c| c.unwrap()).collect();
+                    let parent_hash = B::hash_children(&children);
+                    next_level_known_nodes.insert(parent_pos, parent_hash);
+                }
             }
             current_level_known_nodes = next_level_known_nodes;
         }

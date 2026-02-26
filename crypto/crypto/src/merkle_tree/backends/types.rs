@@ -3,7 +3,10 @@ use sha3::{Keccak256, Keccak512, Sha3_256, Sha3_512};
 
 use super::{
     field_element::FieldElementBackend,
-    field_element_vector::{FieldElementPairBackend, FieldElementVectorBackend},
+    field_element_vector::{
+        FieldElementPairBackend, FieldElementVectorBackend,
+        QuaternaryFieldElementPairBackend, QuaternaryFieldElementVectorBackend,
+    },
 };
 
 // Field element backend definitions
@@ -36,3 +39,17 @@ pub type BatchSha2_512Backend<F> = FieldElementVectorBackend<F, Sha512, 64>;
 pub type PairKeccak256Backend<F> = FieldElementPairBackend<F, Keccak256, 32>;
 pub type PairSha3_256Backend<F> = FieldElementPairBackend<F, Sha3_256, 32>;
 pub type PairSha2_256Backend<F> = FieldElementPairBackend<F, Sha256, 32>;
+
+// Quaternary (arity-4) vector backends
+
+// - With 256 bit
+pub type QuaternaryBatchKeccak256Backend<F> =
+    QuaternaryFieldElementVectorBackend<F, Keccak256, 32>;
+pub type QuaternaryBatchSha3_256Backend<F> =
+    QuaternaryFieldElementVectorBackend<F, Sha3_256, 32>;
+
+// Quaternary (arity-4) pair backends
+
+// - With 256 bit
+pub type QuaternaryPairKeccak256Backend<F> =
+    QuaternaryFieldElementPairBackend<F, Keccak256, 32>;

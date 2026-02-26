@@ -3,7 +3,7 @@ use core::fmt::Display;
 use crate::merkle_tree::proof::BatchProof;
 
 use super::{proof::Proof, traits::IsMerkleTreeBackend, utils::*};
-use alloc::{collections::BTreeSet, vec::Vec};
+use alloc::{collections::BTreeSet, vec, vec::Vec};
 
 #[derive(Debug)]
 pub enum Error {
@@ -63,17 +63,26 @@ where
             return None;
         }
 
-        //The leaf must be a power of 2 set
-        let hashed_leaves = complete_until_power_of_two(hashed_leaves);
+        let arity = B::ARITY;
+
+        // Pad leaves to a power of arity
+        let hashed_leaves = complete_until_power_of_arity(hashed_leaves, arity);
         let leaves_len = hashed_leaves.len();
 
-        //The length of leaves minus one inner node in the merkle tree
-        //The first elements are overwritten by build function, it doesn't matter what it's there
-        let mut nodes = vec![hashed_leaves[0].clone(); leaves_len - 1];
+        // Number of internal nodes: (A * L - 1) / (A - 1) - L
+        let total = total_nodes_arity(leaves_len, arity);
+        let internal_nodes = total - leaves_len;
+
+        // Allocate: internal nodes (placeholder) followed by leaves
+        let mut nodes = vec![hashed_leaves[0].clone(); internal_nodes];
         nodes.extend(hashed_leaves);
 
-        //Build the inner nodes of the tree
-        build::<B>(&mut nodes, leaves_len);
+        // Build the internal nodes
+        if arity == 2 {
+            build::<B>(&mut nodes, leaves_len);
+        } else {
+            build_arity::<B>(&mut nodes, leaves_len);
+        }
 
         Some(MerkleTree {
             root: nodes[ROOT].clone(),
@@ -85,34 +94,52 @@ where
     /// For example, give me an inclusion proof for the 3rd element in the
     /// Merkle tree
     pub fn get_proof_by_pos(&self, pos: usize) -> Option<Proof<B::Node>> {
-        let pos = pos + self.nodes.len() / 2;
+        let num_leaves = self.num_leaves();
+        let leaf_offset = self.nodes.len() - num_leaves;
+        let pos = pos + leaf_offset;
         let Ok(merkle_path) = self.build_merkle_path(pos) else {
             return None;
         };
 
-        self.create_proof(merkle_path)
-    }
-
-    /// Creates a proof from a Merkle pasth
-    fn create_proof(&self, merkle_path: Vec<B::Node>) -> Option<Proof<B::Node>> {
         Some(Proof { merkle_path })
     }
 
-    /// Returns the Merkle path for the element/s for the leaf at position pos
+    /// Returns the number of leaves in the tree.
+    fn num_leaves(&self) -> usize {
+        let arity = B::ARITY;
+        if arity == 2 {
+            self.nodes.len().div_ceil(2)
+        } else {
+            // total = (A * L - 1) / (A - 1), solve for L:
+            // L = (total * (A - 1) + 1) / A
+            (self.nodes.len() * (arity - 1) + 1) / arity
+        }
+    }
+
+    /// Returns the Merkle path for the leaf at the given tree-internal index.
+    /// For arity A, each level pushes A-1 sibling nodes.
     fn build_merkle_path(&self, pos: usize) -> Result<Vec<B::Node>, Error> {
-        // Pre-allocate based on tree depth (log2 of tree size)
-        let tree_depth = (self.nodes.len() + 1).ilog2() as usize;
-        let mut merkle_path = Vec::with_capacity(tree_depth);
+        let arity = B::ARITY;
+        let mut merkle_path = Vec::new();
         let mut pos = pos;
 
         while pos != ROOT {
-            let Some(node) = self.nodes.get(sibling_index(pos)) else {
-                // out of bounds, exit returning the current merkle_path
-                return Err(Error::OutOfBounds);
-            };
-            merkle_path.push(node.clone());
-
-            pos = parent_index(pos);
+            if arity == 2 {
+                let Some(node) = self.nodes.get(sibling_index(pos)) else {
+                    return Err(Error::OutOfBounds);
+                };
+                merkle_path.push(node.clone());
+                pos = parent_index(pos);
+            } else {
+                let siblings = sibling_indices_arity(pos, arity);
+                for &sib in &siblings {
+                    let Some(node) = self.nodes.get(sib) else {
+                        return Err(Error::OutOfBounds);
+                    };
+                    merkle_path.push(node.clone());
+                }
+                pos = parent_index_arity(pos, arity);
+            }
         }
 
         Ok(merkle_path)
@@ -141,7 +168,7 @@ where
             return Err(Error::EmptyPositionList);
         }
 
-        let num_leaves = (self.nodes.len() + 1).div_ceil(2);
+        let num_leaves = self.num_leaves();
 
         // Validate all positions are within bounds
         for &pos in pos_list {
@@ -150,11 +177,13 @@ where
             }
         }
 
+        let leaf_offset = self.nodes.len() - num_leaves;
+
         // Since the nodes in the merkle tree are indexed from the root to the leaves, we redefine the indices
         // of the leaves.
         let leaf_positions = pos_list
             .iter()
-            .map(|pos| pos + self.nodes.len() / 2)
+            .map(|pos| pos + leaf_offset)
             .collect::<Vec<usize>>();
         // We get the positions of the nodes for the batch proof.
         let batch_auth_path_positions = self.get_batch_auth_path_positions(&leaf_positions);
@@ -183,38 +212,56 @@ where
     /// This ordering is critical because the verifier consumes proof nodes level-by-level
     /// starting from leaves, so it needs leaf-level siblings first.
     fn get_batch_auth_path_positions(&self, leaf_positions: &[usize]) -> Vec<usize> {
+        let arity = B::ARITY;
         // BTreeSet always maintains elements in ascending order (smaller indices first), regardless of insertion order.
         let mut auth_path_set = BTreeSet::<usize>::new();
         let mut obtainable: BTreeSet<usize> = leaf_positions.iter().cloned().collect();
 
         // Number of levels in tree
-        let num_levels = (self.nodes.len() + 1).ilog2();
+        let num_levels = if arity == 2 {
+            (self.nodes.len() + 1).ilog2()
+        } else {
+            let mut levels = 0u32;
+            let mut size = self.num_leaves();
+            while size > 1 {
+                size /= arity;
+                levels += 1;
+            }
+            levels + 1
+        };
 
-        // Iter lefevel-by-level from leaves to root.
+        // Iterate level-by-level from leaves to root.
         for _ in 0..num_levels - 1 {
             let mut next_obtainable = BTreeSet::new();
 
             for &pos in &obtainable {
-                // Check sibling (None only for root, which shouldn't appear here)
-                if let Some(sibling_pos) = get_sibling_pos(pos) {
-                    // If sibling not obtainable, include it in the proof
-                    let sibling_is_obtainable =
-                        obtainable.contains(&sibling_pos) || auth_path_set.contains(&sibling_pos);
-
-                    if !sibling_is_obtainable {
-                        auth_path_set.insert(sibling_pos);
+                if arity == 2 {
+                    if let Some(sibling_pos) = get_sibling_pos(pos) {
+                        let sibling_is_obtainable = obtainable.contains(&sibling_pos)
+                            || auth_path_set.contains(&sibling_pos);
+                        if !sibling_is_obtainable {
+                            auth_path_set.insert(sibling_pos);
+                        }
                     }
+                    next_obtainable.insert(get_parent_pos(pos));
+                } else {
+                    let siblings = sibling_indices_arity(pos, arity);
+                    for &sib in &siblings {
+                        let sib_is_obtainable =
+                            obtainable.contains(&sib) || auth_path_set.contains(&sib);
+                        if !sib_is_obtainable {
+                            auth_path_set.insert(sib);
+                        }
+                    }
+                    next_obtainable.insert(parent_index_arity(pos, arity));
                 }
-
-                // Parent becomes obtainable (computable from both children)
-                next_obtainable.insert(get_parent_pos(pos));
             }
 
             obtainable = next_obtainable;
         }
 
         // Reverse to get descending order (larger indices first).
-        // This makes the proof ordered from bottom (nodes closer to leaves) to top (nodes loser to root).
+        // This makes the proof ordered from bottom (nodes closer to leaves) to top (nodes closer to root).
         auth_path_set.into_iter().rev().collect()
     }
 }

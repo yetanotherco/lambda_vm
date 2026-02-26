@@ -9,6 +9,9 @@ pub trait IsMerkleTreeBackend {
     type Node: PartialEq + Eq + Clone + Sync + Send;
     type Data: Sync + Send;
 
+    /// Branching factor. Default 2 (binary).
+    const ARITY: usize = 2;
+
     /// This function takes a single variable `Data` and converts it to a node.
     fn hash_data(leaf: &Self::Data) -> Self::Node;
 
@@ -23,7 +26,14 @@ pub trait IsMerkleTreeBackend {
         iter.map(|leaf| Self::hash_data(leaf)).collect()
     }
 
-    /// This function takes to children nodes and builds a new parent node.
+    /// This function takes two children nodes and builds a new parent node.
     /// It will be used in the construction of the Merkle tree.
     fn hash_new_parent(child_1: &Self::Node, child_2: &Self::Node) -> Self::Node;
+
+    /// Hash ARITY children into one parent. Default delegates to hash_new_parent for arity 2.
+    /// Backends with ARITY > 2 must override this.
+    fn hash_children(children: &[Self::Node]) -> Self::Node {
+        debug_assert_eq!(children.len(), Self::ARITY);
+        Self::hash_new_parent(&children[0], &children[1])
+    }
 }

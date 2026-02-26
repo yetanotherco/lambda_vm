@@ -94,3 +94,86 @@ where
         level_begin_index = new_level_begin_index;
     }
 }
+
+// --- Arity-aware utilities ---
+
+/// Parent index in an A-ary tree stored in a flat array (root at 0).
+pub fn parent_index_arity(node_index: usize, arity: usize) -> usize {
+    if node_index == 0 {
+        return 0;
+    }
+    (node_index - 1) / arity
+}
+
+/// Indices of all siblings (same parent, excluding self). Empty for root.
+pub fn sibling_indices_arity(node_index: usize, arity: usize) -> Vec<usize> {
+    if node_index == 0 {
+        return Vec::new();
+    }
+    let parent = parent_index_arity(node_index, arity);
+    let first_child = parent * arity + 1;
+    (first_child..first_child + arity)
+        .filter(|&idx| idx != node_index)
+        .collect()
+}
+
+/// Position of a node among its siblings (0..arity-1).
+pub fn child_position(node_index: usize, arity: usize) -> usize {
+    (node_index - 1) % arity
+}
+
+/// Total number of nodes in an A-ary tree with `num_leaves` leaves.
+/// Formula: (A * L - 1) / (A - 1)
+pub fn total_nodes_arity(num_leaves: usize, arity: usize) -> usize {
+    (arity * num_leaves - 1) / (arity - 1)
+}
+
+/// Pad values to the next power of `arity`.
+pub fn complete_until_power_of_arity<T: Clone>(mut values: Vec<T>, arity: usize) -> Vec<T> {
+    let mut target = 1;
+    while target < values.len() {
+        target *= arity;
+    }
+    while values.len() < target {
+        values.push(values[values.len() - 1].clone());
+    }
+    values
+}
+
+/// Build internal nodes of an A-ary tree. The flat array `nodes` has `total_nodes_arity(leaves_len, A)`
+/// elements, with the last `leaves_len` positions already populated with leaf hashes.
+/// Processes level by level from leaves to root, writing parents in-place.
+pub fn build_arity<B: IsMerkleTreeBackend>(nodes: &mut [B::Node], leaves_len: usize)
+where
+    B::Node: Clone,
+{
+    let arity = B::ARITY;
+    let total = nodes.len();
+
+    let mut level_size = leaves_len;
+    let mut level_start = total - leaves_len;
+
+    while level_size > 1 {
+        let parent_size = level_size / arity;
+        let parent_start = level_start - parent_size;
+
+        let (parents_slice, children_area) =
+            nodes[parent_start..level_start + level_size].split_at_mut(parent_size);
+
+        #[cfg(feature = "parallel")]
+        let iter = parents_slice
+            .into_par_iter()
+            .zip(children_area.par_chunks_exact(arity));
+        #[cfg(not(feature = "parallel"))]
+        let iter = parents_slice
+            .iter_mut()
+            .zip(children_area.chunks_exact(arity));
+
+        iter.for_each(|(parent, children)| {
+            *parent = B::hash_children(children);
+        });
+
+        level_size = parent_size;
+        level_start = parent_start;
+    }
+}
