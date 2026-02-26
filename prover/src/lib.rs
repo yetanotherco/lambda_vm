@@ -327,6 +327,24 @@ impl VmAirs {
     }
 }
 
+/// Configure Rayon's global thread pool to use physical cores only.
+///
+/// FFT and Merkle hashing are memory-bandwidth-bound; HyperThreading threads
+/// contend on shared cache lines. Using physical cores reduces contention.
+/// The `RAYON_NUM_THREADS` env var still overrides if set.
+#[cfg(feature = "parallel")]
+fn configure_thread_pool() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(num_cpus::get_physical())
+            .stack_size(4 * 1024 * 1024) // 4MB stack for deep FFT recursion
+            .build_global()
+            .ok(); // Ignore if already initialized by caller
+    });
+}
+
 /// Prove an ELF binary execution. Returns a serializable proof bundle.
 pub fn prove(elf_bytes: &[u8]) -> Result<VmProof, Error> {
     prove_with_options(
@@ -342,6 +360,9 @@ pub fn prove_with_options(
     proof_options: &ProofOptions,
     max_rows: &MaxRowsConfig,
 ) -> Result<VmProof, Error> {
+    #[cfg(feature = "parallel")]
+    configure_thread_pool();
+
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let executor = Executor::new(&program, vec![]).map_err(|e| Error::Execution(format!("{e}")))?;
     let result = executor
