@@ -56,6 +56,25 @@ pub fn fold_evaluations_in_place<F: IsSubFieldOf<E>, E: IsField>(
     inv_twiddles: &[FieldElement<F>],
 ) {
     let half = evals.len() / 2;
+
+    #[cfg(feature = "parallel")]
+    if half >= 1 << 14 {
+        use rayon::prelude::*;
+        let folded: Vec<FieldElement<E>> = (0..half)
+            .into_par_iter()
+            .map(|j| {
+                let lo = &evals[2 * j];
+                let hi = &evals[2 * j + 1];
+                let sum = lo + hi;
+                let diff = lo - hi;
+                &sum + &(&inv_twiddles[j] * &(zeta * &diff))
+            })
+            .collect();
+        *evals = folded;
+        return;
+    }
+
+    // Sequential path (small domains or no parallel feature)
     for j in 0..half {
         let lo = &evals[2 * j];
         let hi = &evals[2 * j + 1];
