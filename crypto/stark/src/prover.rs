@@ -352,161 +352,21 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        // Create domain for LDE
         let domain = Domain::new(air, trace.num_rows());
-
-        // Interpolate columns to polynomials
-        let trace_polys = trace.compute_trace_polys_main::<Field>();
-
-        // Keep only precomputed columns
-        let precomputed_polys: Vec<_> =
-            trace_polys.into_iter().take(num_precomputed_cols).collect();
-
-        // Evaluate on LDE domain
-        let evaluations = Self::compute_lde_trace_evaluations::<Field>(&precomputed_polys, &domain);
-
-        let (_, commitment) = Self::commit_columns_bit_reversed(&evaluations)?;
-
+        let columns = trace.columns_main();
+        let precomputed: Vec<_> = columns.into_iter().take(num_precomputed_cols).collect();
+        let twiddles = LdeTwiddles::new(&domain);
+        let evals =
+            Self::compute_lde_from_columns_cached::<Field>(&precomputed, &domain, &twiddles);
+        let (_, commitment) = Self::commit_columns_bit_reversed(&evals)?;
         Some(commitment)
     }
 
-    /// Given a `TraceTable`, this method interpolates its columns, computes the commitment to the
-    /// table and appends it to the transcript.
-    /// Output: a tuple of length 3 with the following:
-    /// • The evaluations of the trace polynomials over the LDE domain.
-    /// • The Merkle tree of evaluations over the LDE domain.
-    /// • The root of the above Merkle tree.
-    ///
-    /// Note: trace polynomials (coefficients) are computed transiently for the LDE
-    /// but are NOT stored. All downstream operations use evaluation-form data.
-    #[allow(clippy::type_complexity)]
-    fn interpolate_and_commit_main(
-        trace: &TraceTable<Field, FieldExtension>,
-        domain: &Domain<Field>,
-        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
-    ) -> Option<(
-        Vec<Vec<FieldElement<Field>>>,
-        BatchedMerkleTree<Field>,
-        Commitment,
-    )>
-    where
-        FieldElement<Field>: AsBytes,
-        FieldElement<FieldExtension>: AsBytes,
-        Field: IsSubFieldOf<FieldExtension>,
-    {
-        // Compute LDE evaluations directly from columns using fused coset LDE
-        // (no intermediate coefficient-form polynomials).
-        let columns = trace.columns_main();
-        let lde_trace_evaluations = Self::compute_lde_from_columns::<Field>(&columns, domain);
-
-        // Hash rows on-the-fly from column-major data with bit-reversal,
-        // avoiding the full clone + transpose that the old code did.
-        let (lde_trace_merkle_tree, lde_trace_merkle_root) =
-            Self::commit_columns_bit_reversed(&lde_trace_evaluations)?;
-
-        // >>>> Send commitment.
-        transcript.append_bytes(&lde_trace_merkle_root);
-
-        Some((
-            lde_trace_evaluations,
-            lde_trace_merkle_tree,
-            lde_trace_merkle_root,
-        ))
-    }
-
-    /// Interpolates columns of a preprocessed trace table and computes LDE evaluations.
-    ///
-    /// Does NOT build a Merkle tree (the caller builds separate trees for
-    /// precomputed and multiplicity columns).
-    ///
-    /// Trace polynomials (coefficients) are transient and not stored.
-    fn interpolate_and_compute_lde(
-        trace: &TraceTable<Field, FieldExtension>,
-        domain: &Domain<Field>,
-    ) -> Option<Vec<Vec<FieldElement<Field>>>>
-    where
-        FieldElement<Field>: AsBytes,
-        FieldElement<FieldExtension>: AsBytes,
-        Field: IsSubFieldOf<FieldExtension>,
-    {
-        // Compute LDE evaluations directly from columns using fused coset LDE.
-        let columns = trace.columns_main();
-        let lde_trace_evaluations = Self::compute_lde_from_columns::<Field>(&columns, domain);
-
-        Some(lde_trace_evaluations)
-    }
-
-    /// Given a `TraceTable`, this method interpolates its auxiliary columns, computes the
-    /// commitment to the table and appends it to the transcript.
-    #[allow(clippy::type_complexity)]
-    fn interpolate_and_commit_aux(
-        trace: &TraceTable<Field, FieldExtension>,
-        domain: &Domain<Field>,
-        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
-    ) -> Option<(
-        Vec<Vec<FieldElement<FieldExtension>>>,
-        BatchedMerkleTree<FieldExtension>,
-        Commitment,
-    )>
-    where
-        FieldElement<Field>: AsBytes,
-        FieldElement<FieldExtension>: AsBytes,
-        Field: IsSubFieldOf<FieldExtension> + IsFFTField,
-    {
-        // Compute LDE evaluations directly from aux columns using fused coset LDE.
-        let columns = trace.columns_aux();
-        let lde_trace_evaluations =
-            Self::compute_lde_from_columns::<FieldExtension>(&columns, domain);
-
-        // Hash rows on-the-fly from column-major data with bit-reversal.
-        let (lde_trace_merkle_tree, lde_trace_merkle_root) =
-            Self::commit_columns_bit_reversed(&lde_trace_evaluations)?;
-
-        // >>>> Send commitment.
-        transcript.append_bytes(&lde_trace_merkle_root);
-
-        Some((
-            lde_trace_evaluations,
-            lde_trace_merkle_tree,
-            lde_trace_merkle_root,
-        ))
-    }
-
-    /// Evaluate polynomials `trace_polys` over the domain `domain`.
-    /// The i-th entry of the returned vector contains the evaluations of the i-th polynomial in `trace_polys`.
-    fn compute_lde_trace_evaluations<E>(
-        trace_polys: &[Polynomial<FieldElement<E>>],
-        domain: &Domain<Field>,
-    ) -> Vec<Vec<FieldElement<E>>>
-    where
-        E: IsSubFieldOf<FieldExtension> + Send + Sync,
-        Field: IsSubFieldOf<E>,
-    {
-        #[cfg(not(feature = "parallel"))]
-        let trace_polys_iter = trace_polys.iter();
-        #[cfg(feature = "parallel")]
-        let trace_polys_iter = trace_polys.par_iter();
-
-        trace_polys_iter
-            .map(|poly| {
-                evaluate_polynomial_on_lde_domain(
-                    poly,
-                    domain.blowup_factor,
-                    domain.interpolation_domain_size,
-                    &domain.coset_offset,
-                )
-            })
-            .collect::<Result<Vec<Vec<FieldElement<E>>>, FFTError>>()
-            .unwrap()
-    }
 
     /// Compute LDE evaluations directly from column data using the fused coset LDE.
     ///
-    /// This replaces the `compute_trace_polys_*` + `compute_lde_trace_evaluations` pipeline
-    /// with a single `coset_lde` call per column, saving 2 intermediate allocations per column.
-    ///
-    /// Twiddle factors and coset weights are precomputed once and shared across all columns,
-    /// eliminating redundant root-of-unity generation.
+    /// Uses a single `coset_lde` call per column. Twiddle factors and coset weights are
+    /// precomputed once and shared across all columns.
     fn compute_lde_from_columns<E>(
         columns: &[Vec<FieldElement<E>>],
         domain: &Domain<Field>,
@@ -663,151 +523,10 @@ pub trait IsStarkProver<
         }
     }
 
-    /// Phase 1a of Round 1: Commit only the main trace to the transcript.
-    /// Returns the main trace commitment data and LDE evaluations.
-    /// Does NOT sample RAP challenges or build auxiliary trace.
-    #[allow(clippy::type_complexity)]
-    fn round_1_commit_main_trace(
-        trace: &TraceTable<Field, FieldExtension>,
-        domain: &Domain<Field>,
-        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
-    ) -> Result<(Round1CommitmentData<Field>, Vec<Vec<FieldElement<Field>>>), ProvingError>
-    where
-        FieldElement<Field>: AsBytes,
-        FieldElement<FieldExtension>: AsBytes,
-    {
-        let Some((evaluations, main_merkle_tree, main_merkle_root)) =
-            Self::interpolate_and_commit_main(trace, domain, transcript)
-        else {
-            return Err(ProvingError::EmptyCommitment);
-        };
-
-        let main = Round1CommitmentData::<Field> {
-            lde_trace_merkle_tree: Rc::new(main_merkle_tree),
-            lde_trace_merkle_root: main_merkle_root,
-            precomputed_merkle_tree: None,
-            precomputed_merkle_root: None,
-            num_precomputed_cols: 0,
-        };
-
-        Ok((main, evaluations))
-    }
-
-    /// Phase 1a variant for preprocessed tables: commits precomputed and multiplicities separately.
-    ///
-    /// For preprocessed tables (e.g., bitwise lookup):
-    /// - Precomputed columns (0..num_precomputed_cols): separate tree, root must match hardcoded
-    /// - Multiplicity columns (num_precomputed_cols..): separate tree, root in proof
-    ///
-    /// Both commitments are added to the transcript for Fiat-Shamir binding.
-    #[allow(clippy::type_complexity)]
-    fn round_1_commit_preprocessed_trace(
-        trace: &TraceTable<Field, FieldExtension>,
-        domain: &Domain<Field>,
-        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
-        precomputed_commitment: Commitment,
-        num_precomputed_cols: usize,
-    ) -> Result<(Round1CommitmentData<Field>, Vec<Vec<FieldElement<Field>>>), ProvingError>
-    where
-        FieldElement<Field>: AsBytes,
-        FieldElement<FieldExtension>: AsBytes,
-    {
-        // Interpolate all columns and compute LDE evaluations (no tree building here).
-        let Some(evaluations) = Self::interpolate_and_compute_lde(trace, domain) else {
-            return Err(ProvingError::EmptyCommitment);
-        };
-
-        // --- Build PRECOMPUTED tree (cols 0..num_precomputed) ---
-        let (precomputed_tree, precomputed_root) =
-            Self::commit_columns_bit_reversed(&evaluations[..num_precomputed_cols])
-                .ok_or(ProvingError::EmptyCommitment)?;
-
-        // --- Build MULTIPLICITIES tree (cols num_precomputed..) ---
-        let (mult_tree, mult_root) =
-            Self::commit_columns_bit_reversed(&evaluations[num_precomputed_cols..])
-                .ok_or(ProvingError::EmptyCommitment)?;
-
-        // Verify that our computed precomputed root matches the hardcoded commitment.
-        // This is a sanity check - if they don't match, something is wrong with the trace.
-        debug_assert_eq!(
-            precomputed_root, precomputed_commitment,
-            "Prover's precomputed commitment doesn't match hardcoded AIR commitment"
-        );
-
-        // Add BOTH commitments to transcript for Fiat-Shamir binding.
-        // The precomputed commitment binds challenges to the correct precomputed values.
-        // The multiplicities commitment binds challenges to the actual lookups made.
-        transcript.append_bytes(&precomputed_commitment);
-        transcript.append_bytes(&mult_root);
-
-        // Store multiplicities tree as main (for FRI openings), precomputed tree separately
-        let main = Round1CommitmentData::<Field> {
-            lde_trace_merkle_tree: Rc::new(mult_tree),
-            lde_trace_merkle_root: mult_root,
-            precomputed_merkle_tree: Some(Rc::new(precomputed_tree)),
-            precomputed_merkle_root: Some(precomputed_root),
-            num_precomputed_cols,
-        };
-
-        // Return full evaluations (all columns) for constraint evaluation
-        Ok((main, evaluations))
-    }
-
-    /// Phase 1c of Round 1: Build and commit auxiliary trace using pre-sampled challenges.
-    /// This is called after all main traces are committed and shared challenges are sampled.
-    #[allow(clippy::type_complexity)]
-    fn round_1_build_auxiliary_trace(
-        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
-        trace: &mut TraceTable<Field, FieldExtension>,
-        domain: &Domain<Field>,
-        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
-        main: Round1CommitmentData<Field>,
-        main_evaluations: Vec<Vec<FieldElement<Field>>>,
-        rap_challenges: Vec<FieldElement<FieldExtension>>,
-    ) -> Result<Round1<Field, FieldExtension>, ProvingError>
-    where
-        FieldElement<Field>: AsBytes,
-        FieldElement<FieldExtension>: AsBytes,
-    {
-        let (aux, aux_evaluations, bus_public_inputs) = if air.has_aux_trace() {
-            let bus_public_inputs = air.build_auxiliary_trace(trace, &rap_challenges);
-            let Some((aux_trace_polys_evaluations, aux_merkle_tree, aux_merkle_root)) =
-                Self::interpolate_and_commit_aux(trace, domain, transcript)
-            else {
-                return Err(ProvingError::EmptyCommitment);
-            };
-            let aux = Some(Round1CommitmentData::<FieldExtension> {
-                lde_trace_merkle_tree: Rc::new(aux_merkle_tree),
-                lde_trace_merkle_root: aux_merkle_root,
-                precomputed_merkle_tree: None,
-                precomputed_merkle_root: None,
-                num_precomputed_cols: 0,
-            });
-            (aux, aux_trace_polys_evaluations, bus_public_inputs)
-        } else {
-            (None, Vec::new(), None)
-        };
-
-        let lde_trace = LDETraceTable::from_columns(
-            main_evaluations,
-            aux_evaluations,
-            air.step_size(),
-            domain.blowup_factor,
-        );
-
-        Ok(Round1 {
-            lde_trace,
-            main,
-            aux,
-            rap_challenges,
-            bus_public_inputs,
-        })
-    }
-
-    /// Phase A helper for sequential proving: compute main LDE, commit, return tree and root.
+    /// Compute main LDE, commit, return tree and root.
     /// Uses the provided pool buffers to avoid allocation; the pool retains capacity for reuse.
     #[allow(clippy::type_complexity)]
-    fn commit_main_trace_lightweight(
+    fn commit_main_trace(
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
@@ -840,10 +559,10 @@ pub trait IsStarkProver<
         Ok((tree, root, None, None, 0))
     }
 
-    /// Phase A helper for sequential proving with preprocessed tables: commit separately,
-    /// return trees and roots. Uses pool buffers to avoid allocation.
+    /// Commit preprocessed trace: precomputed and multiplicity columns get separate trees.
+    /// Uses pool buffers to avoid allocation.
     #[allow(clippy::type_complexity)]
-    fn commit_preprocessed_trace_lightweight(
+    fn commit_preprocessed_trace(
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
@@ -893,49 +612,6 @@ pub trait IsStarkProver<
             Some(precomputed_root),
             num_precomputed_cols,
         ))
-    }
-
-    /// Phase C helper for sequential proving: build aux trace, commit, return tree, root,
-    /// and bus_public_inputs. Uses pool buffers to avoid allocation.
-    #[allow(clippy::type_complexity)]
-    fn commit_aux_trace_lightweight(
-        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
-        trace: &mut TraceTable<Field, FieldExtension>,
-        domain: &Domain<Field>,
-        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
-        rap_challenges: &[FieldElement<FieldExtension>],
-        twiddles: &LdeTwiddles<Field>,
-        aux_pool: &mut [Vec<FieldElement<FieldExtension>>],
-    ) -> Result<
-        (
-            Option<BatchedMerkleTree<FieldExtension>>,
-            Option<Commitment>,
-            Option<BusPublicInputs<FieldExtension>>,
-        ),
-        ProvingError,
-    >
-    where
-        FieldElement<Field>: AsBytes,
-        FieldElement<FieldExtension>: AsBytes,
-    {
-        if !air.has_trace_interaction() {
-            return Ok((None, None, None));
-        }
-
-        let bus_public_inputs = air.build_auxiliary_trace(trace, rap_challenges);
-
-        let num_aux_cols = trace.num_aux_columns;
-        trace.extract_columns_aux_into(aux_pool);
-        Self::expand_pool_to_lde::<FieldExtension>(aux_pool, num_aux_cols, domain, twiddles);
-
-        let (aux_tree, aux_merkle_root) =
-            Self::commit_columns_bit_reversed(&aux_pool[..num_aux_cols])
-                .ok_or(ProvingError::EmptyCommitment)?;
-
-        transcript.append_bytes(&aux_merkle_root);
-
-        // Pool buffers retain capacity; tree is returned to caller
-        Ok((Some(aux_tree), Some(aux_merkle_root), bus_public_inputs))
     }
 
     /// Reconstruct a full Round1 struct by recomputing LDE evaluations and using
@@ -1830,7 +1506,7 @@ pub trait IsStarkProver<
             let domain = &domains[main_commits.len()];
 
             let (tree, root, pre_tree, pre_root, n_pre) = if air.is_preprocessed() {
-                Self::commit_preprocessed_trace_lightweight(
+                Self::commit_preprocessed_trace(
                     *trace,
                     domain,
                     transcript,
@@ -1840,7 +1516,7 @@ pub trait IsStarkProver<
                     &mut main_pool,
                 )?
             } else {
-                Self::commit_main_trace_lightweight(
+                Self::commit_main_trace(
                     *trace,
                     domain,
                     transcript,
