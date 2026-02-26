@@ -256,8 +256,7 @@ where
 ///
 /// Stores LDE evaluations as separate column vectors rather than a row-major Table.
 /// This eliminates the expensive T2 transpose (col→row) that `Table::from_columns`
-/// performs: for the CPU table with 74 cols × 524K LDE rows, this saves ~310MB of
-/// allocation and ~39M element clones.
+/// performs, significantly reducing allocation and element clones.
 ///
 /// Trade-off: row access requires gathering from columns (74 random reads per row),
 /// but this is negligible vs constraint evaluation cost. Column access (used by

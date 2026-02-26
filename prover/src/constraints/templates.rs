@@ -27,6 +27,12 @@ use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 /// 2^32 for word combining and carry extraction
 pub const SHIFT_32: u64 = 1u64 << 32;
 
+/// 2^(-32) in the field, used for carry extraction.
+#[inline]
+fn inv_2_32<F: IsField>() -> FieldElement<F> {
+    FieldElement::from(SHIFT_32).inv().unwrap()
+}
+
 // =========================================================================
 // IS_BIT Template
 // =========================================================================
@@ -449,8 +455,7 @@ impl AddConstraint {
         let sum_lo = self.sum.eval_lo(step);
 
         // carry_0 = (lhs_lo + rhs_lo - sum_lo) * 2^(-32)
-        let inv_2_32: FieldElement<F> = FieldElement::from(SHIFT_32).inv().unwrap();
-        (lhs_lo + rhs_lo - sum_lo) * inv_2_32
+        (lhs_lo + rhs_lo - sum_lo) * inv_2_32::<F>()
     }
 
     /// Compute carry_1 inline from trace values.
@@ -465,8 +470,7 @@ impl AddConstraint {
         let carry_0 = self.compute_carry_0(step);
 
         // carry_1 = (lhs_hi + rhs_hi + carry_0 - sum_hi) * 2^(-32)
-        let inv_2_32: FieldElement<F> = FieldElement::from(SHIFT_32).inv().unwrap();
-        (lhs_hi + rhs_hi + carry_0 - sum_hi) * inv_2_32
+        (lhs_hi + rhs_hi + carry_0 - sum_hi) * inv_2_32::<F>()
     }
 
     fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>

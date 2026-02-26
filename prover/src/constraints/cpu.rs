@@ -25,6 +25,32 @@ use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
 use super::templates::{AddConstraint, AddLinearTerm, AddOperand, IsBitConstraint};
 
+/// Pack 4 consecutive byte-column values into a 32-bit word field element.
+/// `col0 + col1*2^8 + col2*2^16 + col3*2^24`
+#[inline]
+fn pack_bytes_to_word<F, E>(
+    step: &TableView<F, E>,
+    col0: usize,
+    col1: usize,
+    col2: usize,
+    col3: usize,
+) -> FieldElement<F>
+where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+{
+    let b0 = step.get_main_evaluation_element(0, col0);
+    let b1 = step.get_main_evaluation_element(0, col1);
+    let b2 = step.get_main_evaluation_element(0, col2);
+    let b3 = step.get_main_evaluation_element(0, col3);
+
+    let shift_8: FieldElement<F> = FieldElement::from(1u64 << 8);
+    let shift_16: FieldElement<F> = FieldElement::from(1u64 << 16);
+    let shift_24: FieldElement<F> = FieldElement::from(1u64 << 24);
+
+    b0 + b1 * &shift_8 + b2 * &shift_16 + b3 * shift_24
+}
+
 // =========================================================================
 // CPU Constraint Collection
 // =========================================================================
@@ -306,23 +332,13 @@ impl Arg1LowerConstraint {
         F: IsSubFieldOf<E>,
         E: IsField,
     {
-        // arg1[0:4] as DWordWL[0] = sum of bytes
-        let arg1_0 = step.get_main_evaluation_element(0, cols::ARG1_0).clone();
-        let arg1_1 = step.get_main_evaluation_element(0, cols::ARG1_1).clone();
-        let arg1_2 = step.get_main_evaluation_element(0, cols::ARG1_2).clone();
-        let arg1_3 = step.get_main_evaluation_element(0, cols::ARG1_3).clone();
-
-        let shift_8: FieldElement<F> = FieldElement::from(1u64 << 8);
-        let shift_16: FieldElement<F> = FieldElement::from(1u64 << 16);
-        let shift_24: FieldElement<F> = FieldElement::from(1u64 << 24);
-
-        let arg1_lo =
-            arg1_0 + arg1_1 * shift_8.clone() + arg1_2 * shift_16.clone() + arg1_3 * shift_24;
+        let arg1_lo = pack_bytes_to_word(step, cols::ARG1_0, cols::ARG1_1, cols::ARG1_2, cols::ARG1_3);
 
         // rv1 is DWordWHH: [Half(0-15), Half(16-31), Word(32-63)]
         // rv1::DWordWL[0] = rv1[0] + rv1[1] * 2^16
-        let rv1_0 = step.get_main_evaluation_element(0, cols::RV1_0).clone();
-        let rv1_1 = step.get_main_evaluation_element(0, cols::RV1_1).clone();
+        let rv1_0 = step.get_main_evaluation_element(0, cols::RV1_0);
+        let rv1_1 = step.get_main_evaluation_element(0, cols::RV1_1);
+        let shift_16: FieldElement<F> = FieldElement::from(1u64 << 16);
         let rv1_lower = rv1_0 + rv1_1 * shift_16;
 
         // Constraint: arg1_lo - rv1_lower = 0
@@ -389,17 +405,7 @@ impl Arg1UpperConstraint {
         F: IsSubFieldOf<E>,
         E: IsField,
     {
-        // arg1[4:8] as DWordWL[1]
-        let arg1_4 = step.get_main_evaluation_element(0, cols::ARG1_4).clone();
-        let arg1_5 = step.get_main_evaluation_element(0, cols::ARG1_5).clone();
-        let arg1_6 = step.get_main_evaluation_element(0, cols::ARG1_6).clone();
-        let arg1_7 = step.get_main_evaluation_element(0, cols::ARG1_7).clone();
-
-        let shift_8: FieldElement<F> = FieldElement::from(1u64 << 8);
-        let shift_16: FieldElement<F> = FieldElement::from(1u64 << 16);
-        let shift_24: FieldElement<F> = FieldElement::from(1u64 << 24);
-
-        let arg1_hi = arg1_4 + arg1_5 * shift_8 + arg1_6 * shift_16.clone() + arg1_7 * shift_24;
+        let arg1_hi = pack_bytes_to_word(step, cols::ARG1_4, cols::ARG1_5, cols::ARG1_6, cols::ARG1_7);
 
         // rv1 is DWordWHH: rv1[2] IS the upper 32 bits directly (Word)
         let rv1_upper = step.get_main_evaluation_element(0, cols::RV1_2);
@@ -726,7 +732,7 @@ impl NextPcAddConstraint {
             .get_main_evaluation_element(0, cols::BRANCH_COND)
             .clone();
         let one = FieldElement::<F>::one();
-        let not_branch = one - branch_cond;
+        let not_branch = &one - branch_cond;
 
         let carry = match self.carry_idx {
             0 => self.compute_carry_0(step),
@@ -735,7 +741,7 @@ impl NextPcAddConstraint {
         };
 
         // (1 - branch_cond) * carry * (1 - carry)
-        not_branch * &carry * (FieldElement::<F>::one() - carry)
+        not_branch * &carry * (one - carry)
     }
 }
 
@@ -803,22 +809,13 @@ impl Arg2LowerConstraint {
         F: IsSubFieldOf<E>,
         E: IsField,
     {
-        // arg2[0:4] as DWordWL[0] = sum of bytes
-        let arg2_0 = step.get_main_evaluation_element(0, cols::ARG2[0]);
-        let arg2_1 = step.get_main_evaluation_element(0, cols::ARG2[1]);
-        let arg2_2 = step.get_main_evaluation_element(0, cols::ARG2[2]);
-        let arg2_3 = step.get_main_evaluation_element(0, cols::ARG2[3]);
-
-        let shift_8: FieldElement<F> = FieldElement::from(1u64 << 8);
-        let shift_16: FieldElement<F> = FieldElement::from(1u64 << 16);
-        let shift_24: FieldElement<F> = FieldElement::from(1u64 << 24);
-
-        let arg2_lo = arg2_0 + arg2_1 * &shift_8 + arg2_2 * &shift_16 + arg2_3 * shift_24;
+        let arg2_lo = pack_bytes_to_word(step, cols::ARG2[0], cols::ARG2[1], cols::ARG2[2], cols::ARG2[3]);
 
         // rv2 is DWordWHH: rv2[:2] = rv2[0] + rv2[1] * 2^16
         let rv2_0 = step.get_main_evaluation_element(0, cols::RV2_0);
         let rv2_1 = step.get_main_evaluation_element(0, cols::RV2_1);
-        let rv2_lower = rv2_0 + rv2_1 * &shift_16;
+        let shift_16: FieldElement<F> = FieldElement::from(1u64 << 16);
+        let rv2_lower = rv2_0 + rv2_1 * shift_16;
 
         // imm[0] is lower word of immediate
         let imm_0 = step.get_main_evaluation_element(0, cols::IMM_0);
@@ -888,17 +885,7 @@ impl Arg2UpperConstraint {
         F: IsSubFieldOf<E>,
         E: IsField,
     {
-        // arg2[4:8] as DWordWL[1]
-        let arg2_4 = step.get_main_evaluation_element(0, cols::ARG2[4]);
-        let arg2_5 = step.get_main_evaluation_element(0, cols::ARG2[5]);
-        let arg2_6 = step.get_main_evaluation_element(0, cols::ARG2[6]);
-        let arg2_7 = step.get_main_evaluation_element(0, cols::ARG2[7]);
-
-        let shift_8: FieldElement<F> = FieldElement::from(1u64 << 8);
-        let shift_16: FieldElement<F> = FieldElement::from(1u64 << 16);
-        let shift_24: FieldElement<F> = FieldElement::from(1u64 << 24);
-
-        let arg2_hi = arg2_4 + arg2_5 * &shift_8 + arg2_6 * &shift_16 + arg2_7 * shift_24;
+        let arg2_hi = pack_bytes_to_word(step, cols::ARG2[4], cols::ARG2[5], cols::ARG2[6], cols::ARG2[7]);
 
         // rv2 is DWordWHH: rv2[2] IS the upper 32 bits directly (Word)
         let rv2_upper = step.get_main_evaluation_element(0, cols::RV2_2);
@@ -988,17 +975,7 @@ impl RvdLowerConstraint {
         // rvd[0] is lower word
         let rvd_0 = step.get_main_evaluation_element(0, cols::RVD_0);
 
-        // res[:4] as DWordWL[0] = sum of bytes
-        let res_0 = step.get_main_evaluation_element(0, cols::RES[0]);
-        let res_1 = step.get_main_evaluation_element(0, cols::RES[1]);
-        let res_2 = step.get_main_evaluation_element(0, cols::RES[2]);
-        let res_3 = step.get_main_evaluation_element(0, cols::RES[3]);
-
-        let shift_8: FieldElement<F> = FieldElement::from(1u64 << 8);
-        let shift_16: FieldElement<F> = FieldElement::from(1u64 << 16);
-        let shift_24: FieldElement<F> = FieldElement::from(1u64 << 24);
-
-        let res_lo = res_0 + res_1 * &shift_8 + res_2 * &shift_16 + res_3 * shift_24;
+        let res_lo = pack_bytes_to_word(step, cols::RES[0], cols::RES[1], cols::RES[2], cols::RES[3]);
 
         let load = step.get_main_evaluation_element(0, cols::LOAD);
         let one = FieldElement::<F>::one();
@@ -1061,17 +1038,7 @@ impl RvdUpperConstraint {
         // rvd[1] is upper word
         let rvd_1 = step.get_main_evaluation_element(0, cols::RVD_1);
 
-        // res[4:] as DWordWL[1] = sum of bytes
-        let res_4 = step.get_main_evaluation_element(0, cols::RES[4]);
-        let res_5 = step.get_main_evaluation_element(0, cols::RES[5]);
-        let res_6 = step.get_main_evaluation_element(0, cols::RES[6]);
-        let res_7 = step.get_main_evaluation_element(0, cols::RES[7]);
-
-        let shift_8: FieldElement<F> = FieldElement::from(1u64 << 8);
-        let shift_16: FieldElement<F> = FieldElement::from(1u64 << 16);
-        let shift_24: FieldElement<F> = FieldElement::from(1u64 << 24);
-
-        let res_hi = res_4 + res_5 * &shift_8 + res_6 * &shift_16 + res_7 * shift_24;
+        let res_hi = pack_bytes_to_word(step, cols::RES[4], cols::RES[5], cols::RES[6], cols::RES[7]);
 
         let load = step.get_main_evaluation_element(0, cols::LOAD);
         let word_instr = step.get_main_evaluation_element(0, cols::WORD_INSTR);

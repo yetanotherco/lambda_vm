@@ -67,7 +67,7 @@ where
         // Per-thread buffers via map_init: each Rayon worker allocates once,
         // then reuses for all iterations assigned to that thread.
         // The Frame is pre-allocated and filled in-place to avoid Vec allocations
-        // on every LDE point (which was ~8% of total CPU time).
+        // on every LDE point (a significant fraction of total CPU time).
         let blowup_factor = lde_trace.blowup_factor;
         let lde_step_size = lde_trace.lde_step_size;
         let rows_per_step = lde_step_size / blowup_factor;

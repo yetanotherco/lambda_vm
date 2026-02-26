@@ -1,6 +1,6 @@
 pub mod fri_commitment;
 pub mod fri_decommit;
-mod fri_functions;
+pub(crate) mod fri_functions;
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use math::field::traits::{IsFFTField, IsField};
