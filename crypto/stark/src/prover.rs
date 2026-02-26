@@ -446,37 +446,21 @@ pub trait IsStarkProver<
             columns.len()
         );
 
-        #[cfg(not(feature = "parallel"))]
-        {
-            for (col, buf) in columns.iter().zip(output.iter_mut()) {
-                Polynomial::coset_lde_full_into::<Field>(
-                    col,
-                    domain.blowup_factor,
-                    &twiddles.coset_weights,
-                    &twiddles.inv,
-                    &twiddles.fwd,
-                    buf,
-                )
-                .expect("coset LDE into");
-            }
-        }
         #[cfg(feature = "parallel")]
-        {
-            columns
-                .par_iter()
-                .zip(output.par_iter_mut())
-                .for_each(|(col, buf)| {
-                    Polynomial::coset_lde_full_into::<Field>(
-                        col,
-                        domain.blowup_factor,
-                        &twiddles.coset_weights,
-                        &twiddles.inv,
-                        &twiddles.fwd,
-                        buf,
-                    )
-                    .expect("coset LDE into");
-                });
-        }
+        let iter = columns.par_iter().zip(output.par_iter_mut());
+        #[cfg(not(feature = "parallel"))]
+        let iter = columns.iter().zip(output.iter_mut());
+        iter.for_each(|(col, buf)| {
+            Polynomial::coset_lde_full_into::<Field>(
+                col,
+                domain.blowup_factor,
+                &twiddles.coset_weights,
+                &twiddles.inv,
+                &twiddles.fwd,
+                buf,
+            )
+            .expect("coset LDE into");
+        });
     }
 
     /// Expand pool buffers in-place from N column evaluations to N×blowup LDE evaluations.
@@ -499,7 +483,10 @@ pub trait IsStarkProver<
         }
 
         #[cfg(feature = "parallel")]
-        pool[..num_cols].par_iter_mut().for_each(|buf| {
+        let iter = pool[..num_cols].par_iter_mut();
+        #[cfg(not(feature = "parallel"))]
+        let iter = pool[..num_cols].iter_mut();
+        iter.for_each(|buf| {
             Polynomial::coset_lde_full_expand::<Field>(
                 buf,
                 domain.blowup_factor,
@@ -509,17 +496,6 @@ pub trait IsStarkProver<
             )
             .expect("coset LDE expansion");
         });
-        #[cfg(not(feature = "parallel"))]
-        for buf in pool[..num_cols].iter_mut() {
-            Polynomial::coset_lde_full_expand::<Field>(
-                buf,
-                domain.blowup_factor,
-                &twiddles.coset_weights,
-                &twiddles.inv,
-                &twiddles.fwd,
-            )
-            .expect("coset LDE expansion");
-        }
     }
 
     /// Compute main LDE, commit, return tree and root.
@@ -1610,19 +1586,10 @@ pub trait IsStarkProver<
         // Each build_auxiliary_trace has internal parallelism (batch_inverse, par_chunks),
         // but outer parallelism over 12 tables also helps on high-core-count machines.
         #[cfg(feature = "parallel")]
-        let bus_inputs_vec: Vec<Option<BusPublicInputs<FieldExtension>>> = air_trace_pairs
-            .par_iter_mut()
-            .map(|(air, trace, _)| {
-                if air.has_aux_trace() {
-                    air.build_auxiliary_trace(*trace, &lookup_challenges)
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let aux_iter = air_trace_pairs.par_iter_mut();
         #[cfg(not(feature = "parallel"))]
-        let bus_inputs_vec: Vec<Option<BusPublicInputs<FieldExtension>>> = air_trace_pairs
-            .iter_mut()
+        let aux_iter = air_trace_pairs.iter_mut();
+        let bus_inputs_vec: Vec<Option<BusPublicInputs<FieldExtension>>> = aux_iter
             .map(|(air, trace, _)| {
                 if air.has_aux_trace() {
                     air.build_auxiliary_trace(*trace, &lookup_challenges)

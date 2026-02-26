@@ -519,18 +519,11 @@ where
     // Coset points stay in base field — mixed F×E arithmetic is cheaper than E×E.
 
     // Extract trace-size evaluations from LDE for each column (stride = blowup_factor)
-    // Main columns: Vec of N base-field evaluations per column
     #[cfg(feature = "parallel")]
-    let main_col_evals: Vec<Vec<FieldElement<F>>> = (0..num_main_cols)
-        .into_par_iter()
-        .map(|col| {
-            (0..n)
-                .map(|i| lde_trace.get_main(i * bf, col).clone())
-                .collect()
-        })
-        .collect();
+    let main_iter = (0..num_main_cols).into_par_iter();
     #[cfg(not(feature = "parallel"))]
-    let main_col_evals: Vec<Vec<FieldElement<F>>> = (0..num_main_cols)
+    let main_iter = 0..num_main_cols;
+    let main_col_evals: Vec<Vec<FieldElement<F>>> = main_iter
         .map(|col| {
             (0..n)
                 .map(|i| lde_trace.get_main(i * bf, col).clone())
@@ -538,18 +531,11 @@ where
         })
         .collect();
 
-    // Aux columns: Vec of N extension-field evaluations per column
     #[cfg(feature = "parallel")]
-    let aux_col_evals: Vec<Vec<FieldElement<E>>> = (0..num_aux_cols)
-        .into_par_iter()
-        .map(|col| {
-            (0..n)
-                .map(|i| lde_trace.get_aux(i * bf, col).clone())
-                .collect()
-        })
-        .collect();
+    let aux_iter = (0..num_aux_cols).into_par_iter();
     #[cfg(not(feature = "parallel"))]
-    let aux_col_evals: Vec<Vec<FieldElement<E>>> = (0..num_aux_cols)
+    let aux_iter = 0..num_aux_cols;
+    let aux_col_evals: Vec<Vec<FieldElement<E>>> = aux_iter
         .map(|col| {
             (0..n)
                 .map(|i| lde_trace.get_aux(i * bf, col).clone())
@@ -566,25 +552,12 @@ where
         // Precompute inv_denoms = 1/(eval_point - coset_point_i) — shared across all columns
         let inv_denoms = barycentric_inv_denoms(eval_point, &coset_points);
 
-        // Evaluate all main columns in parallel (each barycentric eval is O(N) work)
+        // Evaluate all main columns (parallel when feature enabled)
         #[cfg(feature = "parallel")]
-        let main_evals: Vec<FieldElement<E>> = main_col_evals
-            .par_iter()
-            .map(|col_evals| {
-                interpolate_coset_eval_with_g_n_inv(
-                    &z_pow_n,
-                    &coset_offset_pow_n,
-                    &n_inv,
-                    &g_n_inv,
-                    &coset_points,
-                    col_evals,
-                    &inv_denoms,
-                )
-            })
-            .collect();
+        let main_iter = main_col_evals.par_iter();
         #[cfg(not(feature = "parallel"))]
-        let main_evals: Vec<FieldElement<E>> = main_col_evals
-            .iter()
+        let main_iter = main_col_evals.iter();
+        let main_evals: Vec<FieldElement<E>> = main_iter
             .map(|col_evals| {
                 interpolate_coset_eval_with_g_n_inv(
                     &z_pow_n,
@@ -599,25 +572,12 @@ where
             .collect();
         table_data.extend(main_evals);
 
-        // Evaluate all aux columns in parallel
+        // Evaluate all aux columns
         #[cfg(feature = "parallel")]
-        let aux_evals: Vec<FieldElement<E>> = aux_col_evals
-            .par_iter()
-            .map(|col_evals| {
-                interpolate_coset_eval_ext_with_g_n_inv(
-                    &z_pow_n,
-                    &coset_offset_pow_n,
-                    &n_inv,
-                    &g_n_inv,
-                    &coset_points,
-                    col_evals,
-                    &inv_denoms,
-                )
-            })
-            .collect();
+        let aux_iter = aux_col_evals.par_iter();
         #[cfg(not(feature = "parallel"))]
-        let aux_evals: Vec<FieldElement<E>> = aux_col_evals
-            .iter()
+        let aux_iter = aux_col_evals.iter();
+        let aux_evals: Vec<FieldElement<E>> = aux_iter
             .map(|col_evals| {
                 interpolate_coset_eval_ext_with_g_n_inv(
                     &z_pow_n,
