@@ -362,31 +362,10 @@ pub trait IsStarkProver<
         Some(commitment)
     }
 
-    /// Compute LDE evaluations directly from column data using the fused coset LDE.
-    ///
-    /// Uses a single `coset_lde` call per column. Twiddle factors and coset weights are
-    /// precomputed once and shared across all columns.
-    fn compute_lde_from_columns<E>(
-        columns: &[Vec<FieldElement<E>>],
-        domain: &Domain<Field>,
-    ) -> Vec<Vec<FieldElement<E>>>
-    where
-        E: IsSubFieldOf<FieldExtension> + Send + Sync,
-        Field: IsSubFieldOf<E>,
-        FieldElement<E>: Send + Sync,
-    {
-        if columns.is_empty() {
-            return Vec::new();
-        }
-
-        let twiddles = LdeTwiddles::new(domain);
-        Self::compute_lde_from_columns_cached(columns, domain, &twiddles)
-    }
-
     /// Compute LDE evaluations with pre-computed twiddle factors and coset weights.
     ///
-    /// Same as [`compute_lde_from_columns`] but accepts shared [`LdeTwiddles`] to avoid
-    /// redundant twiddle generation and weight computation across phases (A, C, Rounds 2-4).
+    /// Accepts shared [`LdeTwiddles`] to avoid redundant twiddle generation and weight
+    /// computation across phases (A, C, Rounds 2-4).
     fn compute_lde_from_columns_cached<E>(
         columns: &[Vec<FieldElement<E>>],
         domain: &Domain<Field>,
@@ -765,12 +744,11 @@ pub trait IsStarkProver<
     ///
     /// On the LDE coset {g·ω^i | i=0..2N-1}, we have -g·ω^i = g·ω^{i+N}
     /// since ω^N = -1 for a 2N-th root of unity ω.
-    fn decompose_and_extend_d2<E>(
+    fn decompose_and_extend_d2(
         constraint_evaluations: &[FieldElement<FieldExtension>],
         domain: &Domain<Field>,
     ) -> Vec<Vec<FieldElement<FieldExtension>>>
     where
-        E: IsField,
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
@@ -825,14 +803,14 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "parallel")]
         let (lde_h0, lde_h1) = rayon::join(
-            || Self::extend_half_to_lde::<FieldExtension>(&h0_evals, &coset_offset_squared, domain),
-            || Self::extend_half_to_lde::<FieldExtension>(&h1_evals, &coset_offset_squared, domain),
+            || Self::extend_half_to_lde(&h0_evals, &coset_offset_squared, domain),
+            || Self::extend_half_to_lde(&h1_evals, &coset_offset_squared, domain),
         );
 
         #[cfg(not(feature = "parallel"))]
         let (lde_h0, lde_h1) = (
-            Self::extend_half_to_lde::<FieldExtension>(&h0_evals, &coset_offset_squared, domain),
-            Self::extend_half_to_lde::<FieldExtension>(&h1_evals, &coset_offset_squared, domain),
+            Self::extend_half_to_lde(&h0_evals, &coset_offset_squared, domain),
+            Self::extend_half_to_lde(&h1_evals, &coset_offset_squared, domain),
         );
 
         vec![lde_h0, lde_h1]
@@ -841,13 +819,12 @@ pub trait IsStarkProver<
     /// Given N evaluations of a degree-<N polynomial on the g²-coset,
     /// extend to 2N evaluations on the g-coset (the full LDE domain).
     /// This is: iFFT(N, offset=g²) → coefficients → FFT(2N, offset=g).
-    fn extend_half_to_lde<E>(
+    fn extend_half_to_lde(
         half_evals: &[FieldElement<FieldExtension>],
         squared_offset: &FieldElement<Field>,
         domain: &Domain<Field>,
     ) -> Vec<FieldElement<FieldExtension>>
     where
-        E: IsField,
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
@@ -903,7 +880,7 @@ pub trait IsStarkProver<
             //   H₀(x²) = (H(x) + H(-x)) / 2
             //   H₁(x²) = (H(x) - H(-x)) / (2x)
             // On the LDE coset {g·ω^i}, we have -g·ω^i = g·ω^{i+N} since ω^N = -1.
-            Self::decompose_and_extend_d2::<FieldExtension>(&constraint_evaluations, domain)
+            Self::decompose_and_extend_d2(&constraint_evaluations, domain)
         } else if number_of_parts == 1 {
             // Degree bound equals trace length: constraint evals are the LDE directly.
             vec![constraint_evaluations]
