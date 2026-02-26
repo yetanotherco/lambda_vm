@@ -718,6 +718,312 @@ fn process_ifft_single_layer_block<F, E>(
     }
 }
 
+/// Optimized Bowers IFFT with 2-layer fusion and sequential twiddle access.
+///
+/// This is the recommended single-threaded IFFT. It fuses two consecutive DIT
+/// layers, keeping intermediate values in registers instead of writing them
+/// back to memory between layers. This reduces memory traffic by ~40%.
+///
+/// **Note**: This performs the inverse butterfly structure but does NOT apply
+/// the 1/n scaling factor. The caller must scale results by n^(-1) after the transform.
+///
+/// # Errors
+/// Returns `FFTError::InputError` if:
+/// - Input length is not a power of two
+/// - Twiddle table size doesn't match input size
+#[cfg(feature = "alloc")]
+#[allow(clippy::needless_range_loop)]
+pub fn bowers_ifft_opt_fused<F, E>(
+    input: &mut [FieldElement<E>],
+    layer_twiddles: &LayerTwiddles<F>,
+) -> Result<(), FFTError>
+where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField,
+{
+    let n = input.len();
+    if !n.is_power_of_two() {
+        return Err(FFTError::InputError(n));
+    }
+
+    if n <= 1 {
+        return Ok(());
+    }
+
+    let log_n = n.trailing_zeros() as usize;
+
+    // Validate that twiddle table size matches input size
+    if layer_twiddles.num_layers() != log_n {
+        return Err(FFTError::InputError(n));
+    }
+
+    // Handle small sizes with simple sequential processing
+    if n <= 4 {
+        for layer in (0..log_n).rev() {
+            let block_size = n >> layer;
+            let half_block = block_size >> 1;
+            let twiddles = layer_twiddles.get_layer(layer);
+
+            for block_start in (0..n).step_by(block_size) {
+                for j in 0..half_block {
+                    let i0 = block_start + j;
+                    let i1 = i0 + half_block;
+                    let w = &twiddles[j];
+
+                    let bw = w * &input[i1];
+                    let sum = &input[i0] + &bw;
+                    let diff = &input[i0] - &bw;
+
+                    input[i0] = sum;
+                    input[i1] = diff;
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    // DIT: iterate layers from innermost (log_n - 1) to outermost (0),
+    // fusing consecutive pairs of layers.
+    let mut remaining = log_n;
+
+    // Process pairs of layers with 2-layer fusion
+    while remaining >= 2 {
+        let inner_layer = remaining - 1; // smaller blocks, processed first
+        let outer_layer = remaining - 2; // larger blocks, processed second
+
+        let block_size = n >> outer_layer; // combined block size
+        let quarter = block_size >> 2;
+
+        let twiddles_inner = layer_twiddles.get_layer(inner_layer);
+        let twiddles_outer = layer_twiddles.get_layer(outer_layer);
+
+        for block_start in (0..n).step_by(block_size) {
+            let block = &mut input[block_start..block_start + block_size];
+
+            debug_assert!(
+                twiddles_inner.len() >= quarter,
+                "twiddles_inner too short: {} < {}",
+                twiddles_inner.len(),
+                quarter
+            );
+            debug_assert!(
+                twiddles_outer.len() >= 2 * quarter,
+                "twiddles_outer too short: {} < {}",
+                twiddles_outer.len(),
+                2 * quarter
+            );
+
+            for j in 0..quarter {
+                let i0 = j;
+                let i1 = j + quarter;
+                let i2 = j + 2 * quarter;
+                let i3 = j + 3 * quarter;
+
+                let w_inner = &twiddles_inner[j];
+                let w0 = &twiddles_outer[j];
+                let w1 = &twiddles_outer[j + quarter];
+
+                // Inner layer: DIT butterflies on (i0,i1) and (i2,i3)
+                let bw_1 = w_inner * &block[i1];
+                let a0 = &block[i0] + &bw_1;
+                let a1 = &block[i0] - &bw_1;
+
+                let bw_3 = w_inner * &block[i3];
+                let a2 = &block[i2] + &bw_3;
+                let a3 = &block[i2] - &bw_3;
+
+                // Outer layer: DIT butterflies on (a0,a2) and (a1,a3)
+                let a2_w0 = w0 * &a2;
+                let a3_w1 = w1 * &a3;
+
+                block[i0] = &a0 + &a2_w0;
+                block[i2] = &a0 - &a2_w0;
+                block[i1] = &a1 + &a3_w1;
+                block[i3] = &a1 - &a3_w1;
+            }
+        }
+        remaining -= 2;
+    }
+
+    // Process remaining single layer (if odd number of layers)
+    if remaining == 1 {
+        let block_size = n; // layer 0: one block of size n
+        let half_block = block_size >> 1;
+        let twiddles = layer_twiddles.get_layer(0);
+
+        for j in 0..half_block {
+            let w = &twiddles[j];
+
+            let bw = w * &input[j + half_block];
+            let sum = &input[j] + &bw;
+            let diff = &input[j] - &bw;
+
+            input[j] = sum;
+            input[j + half_block] = diff;
+        }
+    }
+
+    Ok(())
+}
+
+/// Parallel Bowers IFFT with 2-layer fusion and adaptive parallelization.
+///
+/// This is the recommended IFFT for large inputs (>= 2^14 elements) when
+/// the `parallel` feature is enabled. It combines the 2-layer fusion of
+/// `bowers_ifft_opt_fused` with `par_chunks_mut` parallelism.
+///
+/// **Note**: This performs the inverse butterfly structure but does NOT apply
+/// the 1/n scaling factor. The caller must scale results by n^(-1) after the transform.
+///
+/// # Errors
+/// Returns `FFTError::InputError` if input length is not a power of two or if
+/// twiddle table size doesn't match input size.
+#[cfg(all(feature = "alloc", feature = "parallel"))]
+#[allow(clippy::needless_range_loop)]
+pub fn bowers_ifft_opt_fused_parallel<F, E>(
+    input: &mut [FieldElement<E>],
+    layer_twiddles: &LayerTwiddles<F>,
+) -> Result<(), FFTError>
+where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField + Send + Sync,
+    FieldElement<F>: Send + Sync,
+    FieldElement<E>: Send + Sync,
+{
+    let parallel_threshold = adaptive_parallel_threshold();
+
+    let n = input.len();
+    if !n.is_power_of_two() {
+        return Err(FFTError::InputError(n));
+    }
+
+    if n <= 1 {
+        return Ok(());
+    }
+
+    if n <= 4 {
+        return bowers_ifft_opt_fused(input, layer_twiddles);
+    }
+
+    let log_n = n.trailing_zeros() as usize;
+
+    // Validate twiddle table matches input size
+    if layer_twiddles.num_layers() != log_n {
+        return Err(FFTError::InputError(n));
+    }
+
+    let mut remaining = log_n;
+
+    // Process pairs of layers with 2-layer fusion
+    while remaining >= 2 {
+        let inner_layer = remaining - 1;
+        let outer_layer = remaining - 2;
+
+        let block_size = n >> outer_layer;
+        let twiddles_inner = layer_twiddles.get_layer(inner_layer);
+        let twiddles_outer = layer_twiddles.get_layer(outer_layer);
+        let num_blocks = n / block_size;
+
+        if num_blocks >= parallel_threshold {
+            input.par_chunks_mut(block_size).for_each(|block| {
+                process_ifft_fused_block(block, twiddles_inner, twiddles_outer);
+            });
+        } else {
+            for block_start in (0..n).step_by(block_size) {
+                let block = &mut input[block_start..block_start + block_size];
+                process_ifft_fused_block(block, twiddles_inner, twiddles_outer);
+            }
+        }
+        remaining -= 2;
+    }
+
+    // Process remaining single layer (if odd number of layers)
+    if remaining == 1 {
+        let block_size = n;
+        let half_block = block_size >> 1;
+        let twiddles = layer_twiddles.get_layer(0);
+
+        // Layer 0 always has 1 block of size n — no parallelism possible
+        for j in 0..half_block {
+            let w = &twiddles[j];
+
+            let bw = w * &input[j + half_block];
+            let sum = &input[j] + &bw;
+            let diff = &input[j] - &bw;
+
+            input[j] = sum;
+            input[j + half_block] = diff;
+        }
+    }
+
+    Ok(())
+}
+
+/// Process a single block with 2-layer fused DIT butterfly (inverse FFT).
+///
+/// Fuses the inner layer (smaller blocks) and outer layer (larger blocks)
+/// of the DIT inverse FFT. Within a block of 4·quarter elements:
+///
+/// 1. Inner layer: DIT butterflies on pairs (i0,i1) and (i2,i3)
+/// 2. Outer layer: DIT butterflies on pairs (a0,a2) and (a1,a3)
+///
+/// All intermediates stay in registers — no memory writes between layers.
+#[cfg(all(feature = "alloc", feature = "parallel"))]
+#[inline]
+fn process_ifft_fused_block<F, E>(
+    block: &mut [FieldElement<E>],
+    twiddles_inner: &[FieldElement<F>],
+    twiddles_outer: &[FieldElement<F>],
+) where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField,
+{
+    let block_size = block.len();
+    let quarter = block_size >> 2;
+
+    debug_assert!(
+        twiddles_inner.len() >= quarter,
+        "twiddles_inner too short: {} < {}",
+        twiddles_inner.len(),
+        quarter
+    );
+    debug_assert!(
+        twiddles_outer.len() >= 2 * quarter,
+        "twiddles_outer too short: {} < {}",
+        twiddles_outer.len(),
+        2 * quarter
+    );
+
+    for j in 0..quarter {
+        let i0 = j;
+        let i1 = j + quarter;
+        let i2 = j + 2 * quarter;
+        let i3 = j + 3 * quarter;
+
+        let w_inner = &twiddles_inner[j];
+        let w0 = &twiddles_outer[j];
+        let w1 = &twiddles_outer[j + quarter];
+
+        // Inner layer: DIT butterflies on (i0,i1) and (i2,i3)
+        let bw_1 = w_inner * &block[i1];
+        let a0 = &block[i0] + &bw_1;
+        let a1 = &block[i0] - &bw_1;
+
+        let bw_3 = w_inner * &block[i3];
+        let a2 = &block[i2] + &bw_3;
+        let a3 = &block[i2] - &bw_3;
+
+        // Outer layer: DIT butterflies on (a0,a2) and (a1,a3)
+        let a2_w0 = w0 * &a2;
+        let a3_w1 = w1 * &a3;
+
+        block[i0] = &a0 + &a2_w0;
+        block[i2] = &a0 - &a2_w0;
+        block[i1] = &a1 + &a3_w1;
+        block[i3] = &a1 - &a3_w1;
+    }
+}
+
 /// Optimized Bowers FFT with 2-layer fusion and sequential twiddle access.
 ///
 /// This is the recommended single-threaded FFT. It combines:

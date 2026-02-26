@@ -13,11 +13,11 @@ use crate::fft::gpu::cuda::polynomial::{evaluate_fft_cuda, interpolate_fft_cuda}
 
 use super::cpu::{
     bit_reversing::in_place_bit_reverse_permute,
-    bowers_fft::{LayerTwiddles, bowers_fft_opt_fused, bowers_ifft_opt},
+    bowers_fft::{LayerTwiddles, bowers_fft_opt_fused, bowers_ifft_opt_fused},
 };
 
 #[cfg(feature = "parallel")]
-use super::cpu::bowers_fft::{bowers_fft_opt_fused_parallel, bowers_ifft_opt_parallel};
+use super::cpu::bowers_fft::{bowers_fft_opt_fused_parallel, bowers_ifft_opt_fused_parallel};
 
 /// Threshold for dispatching to parallel FFT.
 /// Below this size, sequential FFT is faster (avoids Rayon overhead).
@@ -42,6 +42,7 @@ fn dispatch_fft<F: IsFFTField + IsSubFieldOf<E>, E: IsField + Send + Sync>(
 }
 
 /// Dispatch inverse FFT (DIT) to parallel or sequential implementation based on buffer size.
+/// Uses 2-layer fused butterflies to keep intermediates in registers.
 #[inline]
 fn dispatch_ifft<F: IsFFTField + IsSubFieldOf<E>, E: IsField + Send + Sync>(
     buffer: &mut [FieldElement<E>],
@@ -50,10 +51,10 @@ fn dispatch_ifft<F: IsFFTField + IsSubFieldOf<E>, E: IsField + Send + Sync>(
     #[cfg(feature = "parallel")]
     {
         if buffer.len() >= PARALLEL_FFT_THRESHOLD {
-            return bowers_ifft_opt_parallel(buffer, twiddles);
+            return bowers_ifft_opt_fused_parallel(buffer, twiddles);
         }
     }
-    bowers_ifft_opt(buffer, twiddles)
+    bowers_ifft_opt_fused(buffer, twiddles)
 }
 
 impl<E: IsField> Polynomial<FieldElement<E>> {

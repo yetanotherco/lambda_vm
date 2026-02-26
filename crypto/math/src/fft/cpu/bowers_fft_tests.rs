@@ -601,6 +601,120 @@ proptest! {
 }
 
 // =========================================================================
+// Fused IFFT tests
+// =========================================================================
+
+#[test]
+fn test_bowers_ifft_fused_matches_unfused() {
+    // Verify fused IFFT produces identical results to unfused IFFT
+    for order in 1..=10u64 {
+        let n = 1 << order;
+        let input: Vec<FE> = (0..n).map(|i| FE::from((i * 7 + 3) as u64)).collect();
+        let inv_twiddles = LayerTwiddles::<F>::new_inverse(order).unwrap();
+
+        let mut result_unfused = input.clone();
+        bowers_ifft_opt(&mut result_unfused, &inv_twiddles).unwrap();
+
+        let mut result_fused = input.clone();
+        bowers_ifft_opt_fused(&mut result_fused, &inv_twiddles).unwrap();
+
+        assert_eq!(
+            result_unfused, result_fused,
+            "Fused IFFT differs from unfused for order {}",
+            order
+        );
+    }
+}
+
+#[test]
+fn test_bowers_ifft_fused_roundtrip() {
+    // FFT -> bit-reverse -> bit-reverse -> fused IFFT -> scale = identity
+    for order in 1..=10u64 {
+        let n = 1 << order;
+        let input: Vec<FE> = (0..n).map(|i| FE::from(i as u64)).collect();
+
+        let fwd_twiddles = LayerTwiddles::<F>::new(order).unwrap();
+        let inv_twiddles = LayerTwiddles::<F>::new_inverse(order).unwrap();
+
+        let mut result = input.clone();
+        bowers_fft_opt_fused(&mut result, &fwd_twiddles).unwrap();
+        in_place_bit_reverse_permute(&mut result);
+
+        in_place_bit_reverse_permute(&mut result);
+        bowers_ifft_opt_fused(&mut result, &inv_twiddles).unwrap();
+
+        let n_inv = FE::from(n as u64).inv().unwrap();
+        for val in result.iter_mut() {
+            *val = &*val * &n_inv;
+        }
+
+        assert_eq!(
+            result, input,
+            "Fused IFFT roundtrip failed for order {}",
+            order
+        );
+    }
+}
+
+#[test]
+fn test_bowers_ifft_fused_matches_naive() {
+    // Compare fused IFFT against naive IDFT
+    for order in 2..=8u64 {
+        let n = 1 << order;
+        let input: Vec<FE> = (0..n).map(|i| FE::from(i as u64)).collect();
+        let fwd_twiddles = LayerTwiddles::<F>::new(order).unwrap();
+
+        let mut evals = input.clone();
+        bowers_fft_opt_fused(&mut evals, &fwd_twiddles).unwrap();
+        in_place_bit_reverse_permute(&mut evals);
+
+        let expected = naive_idft(&evals);
+
+        let inv_twiddles = LayerTwiddles::<F>::new_inverse(order).unwrap();
+        let mut result = evals;
+        in_place_bit_reverse_permute(&mut result);
+        bowers_ifft_opt_fused(&mut result, &inv_twiddles).unwrap();
+
+        let n_inv = FE::from(n as u64).inv().unwrap();
+        for val in result.iter_mut() {
+            *val = &*val * &n_inv;
+        }
+
+        assert_eq!(
+            result, expected,
+            "Fused IFFT differs from naive IDFT for order {}",
+            order
+        );
+    }
+}
+
+#[test]
+fn test_bowers_ifft_fused_odd_even_layers() {
+    // Test both odd and even log_n to exercise the remainder path
+    // Odd log_n (e.g., 3, 5, 7): remainder == 1, processes layer 0 alone
+    // Even log_n (e.g., 2, 4, 6): remainder == 0, all layers fused
+    for order in 1..=8u64 {
+        let n = 1 << order;
+        let input: Vec<FE> = (0..n).map(|i| FE::from((i * 13 + 5) as u64)).collect();
+        let inv_twiddles = LayerTwiddles::<F>::new_inverse(order).unwrap();
+
+        let mut result_unfused = input.clone();
+        bowers_ifft_opt(&mut result_unfused, &inv_twiddles).unwrap();
+
+        let mut result_fused = input.clone();
+        bowers_ifft_opt_fused(&mut result_fused, &inv_twiddles).unwrap();
+
+        assert_eq!(
+            result_unfused,
+            result_fused,
+            "Fused IFFT differs for order {} ({})",
+            order,
+            if order % 2 == 0 { "even" } else { "odd" }
+        );
+    }
+}
+
+// =========================================================================
 // Parallel tests
 // =========================================================================
 
@@ -724,6 +838,58 @@ mod parallel_tests {
 
         assert_eq!(result_seq, result_par);
     }
+
+    // ---- Parallel fused IFFT tests ----
+
+    #[test]
+    fn test_bowers_ifft_fused_parallel_roundtrip() {
+        for order in 2..=10u64 {
+            let n = 1 << order;
+            let input: Vec<FE> = (0..n).map(|i| FE::from(i as u64)).collect();
+
+            let fwd_twiddles = LayerTwiddles::<F>::new(order).unwrap();
+            let inv_twiddles = LayerTwiddles::<F>::new_inverse(order).unwrap();
+
+            let mut result = input.clone();
+            bowers_fft_opt_fused_parallel(&mut result, &fwd_twiddles).unwrap();
+            in_place_bit_reverse_permute(&mut result);
+
+            in_place_bit_reverse_permute(&mut result);
+            bowers_ifft_opt_fused_parallel(&mut result, &inv_twiddles).unwrap();
+
+            let n_inv = FE::from(n as u64).inv().unwrap();
+            for val in result.iter_mut() {
+                *val = &*val * &n_inv;
+            }
+
+            assert_eq!(
+                result, input,
+                "Parallel fused FFT->IFFT roundtrip failed for order {}",
+                order
+            );
+        }
+    }
+
+    #[test]
+    fn test_parallel_fused_ifft_matches_sequential_fused() {
+        for order in 2..=10u64 {
+            let n = 1 << order;
+            let input: Vec<FE> = (0..n).map(|i| FE::from((i * 7 + 3) as u64)).collect();
+            let inv_twiddles = LayerTwiddles::<F>::new_inverse(order).unwrap();
+
+            let mut result_seq = input.clone();
+            bowers_ifft_opt_fused(&mut result_seq, &inv_twiddles).unwrap();
+
+            let mut result_par = input.clone();
+            bowers_ifft_opt_fused_parallel(&mut result_par, &inv_twiddles).unwrap();
+
+            assert_eq!(
+                result_seq, result_par,
+                "Parallel fused IFFT differs from sequential fused for order {}",
+                order
+            );
+        }
+    }
 }
 
 // =========================================================================
@@ -789,6 +955,14 @@ fn test_mismatched_twiddle_table_error() {
     assert!(
         result.is_err(),
         "IFFT should return error with mismatched twiddle table"
+    );
+
+    // Fused inverse FFT should also return error
+    let mut data = input.clone();
+    let result = bowers_ifft_opt_fused(&mut data, &wrong_inv_twiddles);
+    assert!(
+        result.is_err(),
+        "Fused IFFT should return error with mismatched twiddle table"
     );
 }
 
