@@ -206,7 +206,9 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         if n == 0 {
             return Ok(Vec::new());
         }
-        debug_assert!(n.is_power_of_two());
+        if !n.is_power_of_two() {
+            return Err(FFTError::InputError(n));
+        }
         let lde_size = n * blowup_factor;
 
         if (lde_size.trailing_zeros() as u64) > F::TWO_ADICITY {
@@ -294,7 +296,9 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
             buffer.clear();
             return Ok(());
         }
-        debug_assert!(n.is_power_of_two());
+        if !n.is_power_of_two() {
+            return Err(FFTError::InputError(n));
+        }
         let lde_size = n * blowup_factor;
 
         if (lde_size.trailing_zeros() as u64) > F::TWO_ADICITY {
@@ -344,7 +348,9 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         if n == 0 {
             return Ok(());
         }
-        debug_assert!(n.is_power_of_two());
+        if !n.is_power_of_two() {
+            return Err(FFTError::InputError(n));
+        }
         let lde_size = n * blowup_factor;
 
         if (lde_size.trailing_zeros() as u64) > F::TWO_ADICITY {
