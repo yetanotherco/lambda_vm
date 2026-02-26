@@ -1,12 +1,9 @@
 use crate::{
     domain::Domain,
-    examples::{
-        quadratic_air::QuadraticAIR,
-        simple_fibonacci,
-    },
+    examples::{quadratic_air::QuadraticAIR, simple_fibonacci},
     proof::options::ProofOptions,
-    prover::{evaluate_polynomial_on_lde_domain, IsStarkProver, Prover},
-    trace::{get_trace_evaluations, get_trace_evaluations_from_lde, LDETraceTable},
+    prover::{IsStarkProver, Prover, evaluate_polynomial_on_lde_domain},
+    trace::{LDETraceTable, get_trace_evaluations, get_trace_evaluations_from_lde},
     traits::AIR,
 };
 use math::{
@@ -170,8 +167,7 @@ fn barycentric_trace_eval_matches_horner_trace_eval() {
     );
 
     // Barycentric evaluation (new path)
-    let result =
-        get_trace_evaluations_from_lde(&lde_trace, &domain, &z, &frame_offsets, step_size);
+    let result = get_trace_evaluations_from_lde(&lde_trace, &domain, &z, &frame_offsets, step_size);
 
     assert_eq!(result.width, expected.width);
     assert_eq!(result.height, expected.height);

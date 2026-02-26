@@ -2,7 +2,7 @@ use crate::fft::cpu::roots_of_unity::get_powers_of_primitive_root_coset;
 use crate::field::element::FieldElement;
 use crate::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
 use crate::polynomial::{
-    barycentric_inv_denoms, interpolate_coset_eval, interpolate_coset_eval_ext, Polynomial,
+    Polynomial, barycentric_inv_denoms, interpolate_coset_eval, interpolate_coset_eval_ext,
 };
 
 type FE = FieldElement<GoldilocksField>;
