@@ -18,6 +18,84 @@ use super::{
     frame::Frame, proof::options::ProofOptions, trace::TraceTable,
 };
 
+/// Custom split evaluator for enum-dispatch constraint evaluation.
+///
+/// Tables provide a concrete implementation that iterates over a per-table constraint
+/// enum (with `match` dispatch → jump table) instead of `dyn TransitionConstraint`
+/// (vtable dispatch → indirect call + potential cache miss).
+///
+/// The evaluator handles only the table-specific (base-field) constraints.
+/// Lookup constraints (extension-field) are handled separately by the caller.
+pub trait SplitEvaluator<F, E>: Send + Sync
+where
+    F: IsSubFieldOf<E> + IsFFTField + Send + Sync,
+    E: IsField + Send + Sync,
+{
+    /// Evaluate all table-specific constraints, writing base-field results to
+    /// `base_evaluations` and extension-field results to `ext_evaluations`.
+    ///
+    /// Buffers are pre-zeroed by the caller.
+    fn evaluate_split(
+        &self,
+        frame: &Frame<F, E>,
+        periodic_values: &[FieldElement<F>],
+        rap_challenges: &[FieldElement<E>],
+        logup_alpha_powers: &[FieldElement<E>],
+        base_evaluations: &mut [FieldElement<F>],
+        ext_evaluations: &mut [FieldElement<E>],
+    );
+}
+
+/// Generic split evaluator for tables where all constraints compute in base field.
+///
+/// Wraps a `Vec<C>` where `C: TransitionConstraint<F, E>` and iterates with
+/// static dispatch. Works for any table-specific constraint type (concrete struct
+/// or enum with match dispatch).
+pub struct BaseSplitEvaluator<F, E, C>
+where
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
+    E: IsField + Send + Sync,
+    C: TransitionConstraint<F, E>,
+{
+    constraints: Vec<C>,
+    _phantom: std::marker::PhantomData<(F, E)>,
+}
+
+impl<F, E, C> BaseSplitEvaluator<F, E, C>
+where
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
+    E: IsField + Send + Sync,
+    C: TransitionConstraint<F, E>,
+{
+    pub fn new(constraints: Vec<C>) -> Self {
+        Self {
+            constraints,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<F, E, C> SplitEvaluator<F, E> for BaseSplitEvaluator<F, E, C>
+where
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
+    E: IsField + Send + Sync,
+    C: TransitionConstraint<F, E> + Send + Sync,
+{
+    fn evaluate_split(
+        &self,
+        frame: &Frame<F, E>,
+        periodic_values: &[FieldElement<F>],
+        _rap_challenges: &[FieldElement<E>],
+        _logup_alpha_powers: &[FieldElement<E>],
+        base_evaluations: &mut [FieldElement<F>],
+        _ext_evaluations: &mut [FieldElement<E>],
+    ) {
+        for c in &self.constraints {
+            c.evaluate_prover_base(frame, periodic_values, base_evaluations);
+        }
+    }
+}
+
 /// Deduplicated zerofier evaluations: unique zerofier vectors indexed by constraint.
 ///
 /// Multiple constraints often share the same zerofier (same period, offset, and exemptions).

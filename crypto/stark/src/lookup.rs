@@ -12,6 +12,7 @@ use crate::{
     proof::options::ProofOptions,
     table::TableView,
     trace::TraceTable,
+    traits::SplitEvaluator,
 };
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use math::field::{
@@ -676,6 +677,14 @@ pub struct AirWithBuses<
     num_precomputed_cols: Option<usize>,
     /// Optional name for debug output (per-table bus sum tracking)
     name: Option<String>,
+    /// Optional enum-dispatch evaluator for table-specific constraints.
+    /// When present, `compute_transition_prover_split` uses this for table-specific
+    /// constraints (static dispatch via jump table) and only falls back to dyn dispatch
+    /// for the lookup constraints automatically injected by AirWithBuses.
+    split_evaluator: Option<Box<dyn SplitEvaluator<F, E>>>,
+    /// Number of table-specific constraints (before the auto-injected lookup constraints).
+    /// Used to know which constraints the split_evaluator handles.
+    num_table_constraints: usize,
 }
 
 impl<
@@ -700,6 +709,7 @@ impl<
         step_size: usize,
         mut transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
     ) -> Self {
+        let num_table_constraints = transition_constraints.len();
         let num_interactions = auxiliary_trace_build_data.interactions.len();
 
         // Add a term constraint for each interaction
@@ -745,6 +755,8 @@ impl<
             preprocessed_commitment: None,
             num_precomputed_cols: None,
             name: None,
+            split_evaluator: None,
+            num_table_constraints,
         }
     }
 
@@ -780,6 +792,16 @@ impl<
     /// making it easy to identify which table is contributing to bus imbalances.
     pub fn with_name(mut self, name: &str) -> Self {
         self.name = Some(name.to_string());
+        self
+    }
+
+    /// Set a custom split evaluator for enum-dispatch constraint evaluation.
+    ///
+    /// When provided, `compute_transition_prover_split` uses this evaluator for
+    /// table-specific constraints (jump table dispatch) and only falls back to
+    /// dyn dispatch for the auto-injected lookup constraints.
+    pub fn with_split_evaluator(mut self, evaluator: Box<dyn SplitEvaluator<F, E>>) -> Self {
+        self.split_evaluator = Some(evaluator);
         self
     }
 }
@@ -833,6 +855,65 @@ where
         &self,
     ) -> &Vec<Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>> {
         &self.transition_constraints
+    }
+
+    fn compute_transition_prover_split(
+        &self,
+        frame: &Frame<Self::Field, Self::FieldExtension>,
+        periodic_values: &[FieldElement<Self::Field>],
+        rap_challenges: &[FieldElement<Self::FieldExtension>],
+        logup_alpha_powers: &[FieldElement<Self::FieldExtension>],
+        base_evaluations: &mut [FieldElement<Self::Field>],
+        ext_evaluations: &mut [FieldElement<Self::FieldExtension>],
+    ) {
+        for e in base_evaluations.iter_mut() {
+            *e = FieldElement::zero();
+        }
+        for e in ext_evaluations.iter_mut() {
+            *e = FieldElement::zero();
+        }
+
+        if let Some(ref evaluator) = self.split_evaluator {
+            // Fast path: use enum-dispatch for table-specific constraints
+            evaluator.evaluate_split(
+                frame,
+                periodic_values,
+                rap_challenges,
+                logup_alpha_powers,
+                base_evaluations,
+                ext_evaluations,
+            );
+            // Fall back to dyn dispatch only for lookup constraints
+            // (indices num_table_constraints..)
+            for c in self.transition_constraints[self.num_table_constraints..].iter() {
+                if c.computes_in_base_field() {
+                    c.evaluate_prover_base(frame, periodic_values, base_evaluations);
+                } else {
+                    c.evaluate_prover(
+                        frame,
+                        periodic_values,
+                        rap_challenges,
+                        logup_alpha_powers,
+                        ext_evaluations,
+                    );
+                }
+            }
+        } else {
+            // Default: dyn dispatch for all constraints
+            for c in self.transition_constraints.iter() {
+                if c.computes_in_base_field() {
+                    c.evaluate_prover_base(frame, periodic_values, base_evaluations);
+                } else {
+                    c.evaluate_prover(
+                        frame,
+                        periodic_values,
+                        rap_challenges,
+                        logup_alpha_powers,
+                        ext_evaluations,
+                    );
+                }
+            }
+        }
     }
 
     fn build_auxiliary_trace(

@@ -597,6 +597,28 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for LoadConstrai
     }
 }
 
+/// Creates all LOAD constraints as concrete types (for enum dispatch).
+pub fn load_constraints_enum() -> Vec<LoadConstraint> {
+    let mut constraints = Vec::new();
+    let mut idx = 0;
+
+    constraints.push(LoadConstraint::new(LoadConstraintKind::ReadImpliesMu, idx));
+    idx += 1;
+
+    for i in 4..8 {
+        constraints.push(LoadConstraint::new(LoadConstraintKind::ExtensionHigh(i), idx));
+        idx += 1;
+    }
+
+    for i in 2..4 {
+        constraints.push(LoadConstraint::new(LoadConstraintKind::ExtensionMid(i), idx));
+        idx += 1;
+    }
+
+    constraints.push(LoadConstraint::new(LoadConstraintKind::ExtensionLow, idx));
+    constraints
+}
+
 /// Creates all constraints for the LOAD table.
 pub fn constraints() -> Vec<Box<dyn TransitionConstraint<GoldilocksField, GoldilocksExtension>>> {
     let mut constraints: Vec<Box<dyn TransitionConstraint<GoldilocksField, GoldilocksExtension>>> =

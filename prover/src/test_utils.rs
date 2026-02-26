@@ -23,7 +23,8 @@ use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData, NullBoundaryConstrain
 use stark::proof::options::ProofOptions;
 use stark::trace::TraceTable;
 
-use crate::constraints::cpu::create_all_cpu_constraints;
+use crate::constraints::cpu::{CpuSplitEvaluator, create_all_cpu_constraints, create_cpu_constraints_enum};
+use stark::traits::BaseSplitEvaluator;
 use crate::tables::bitwise::{
     BitwiseOperation, BitwiseOperationType, bus_interactions as bitwise_bus_interactions,
     cols as bitwise_cols,
@@ -41,10 +42,12 @@ use crate::tables::dvrm::{
 use crate::tables::halt::{bus_interactions as halt_bus_interactions, cols as halt_cols};
 use crate::tables::load::{
     bus_interactions as load_bus_interactions, cols as load_cols, constraints as load_constraints,
+    load_constraints_enum,
 };
 use crate::tables::lt::{LtOperation, bus_interactions as lt_bus_interactions, cols as lt_cols};
 use crate::tables::memw::{
     bus_interactions as memw_bus_interactions, cols as memw_cols, constraints as memw_constraints,
+    memw_constraints_enum,
 };
 use crate::tables::mul::{bus_interactions as mul_bus_interactions, cols as mul_cols};
 use crate::tables::page::{bus_interactions as page_bus_interactions, cols as page_cols};
@@ -460,10 +463,8 @@ pub fn generate_minimal_bitwise_trace(ops: &[BitwiseOperation]) -> TraceTable<F,
 
 /// Create CPU AIR with all constraints and bus interactions.
 pub fn create_cpu_air(proof_options: &ProofOptions) -> VmAir {
-    // Get all CPU constraints
+    // Build boxed constraints (needed for zerofier computation and verifier)
     let (is_bit, add, other, _) = create_all_cpu_constraints();
-
-    // All CPU constraints
     let mut transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = Vec::new();
     for c in is_bit {
         transition_constraints.push(Box::new(c));
@@ -474,6 +475,10 @@ pub fn create_cpu_air(proof_options: &ProofOptions) -> VmAir {
     for c in other {
         transition_constraints.push(c);
     }
+
+    // Build enum variants for fast dispatch in the prover hot loop
+    let enum_constraints = create_cpu_constraints_enum();
+    let split_evaluator = CpuSplitEvaluator::new(enum_constraints);
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: cpu_bus_interactions(),
@@ -486,6 +491,7 @@ pub fn create_cpu_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_split_evaluator(Box::new(split_evaluator))
     .with_name("CPU")
 }
 
@@ -529,6 +535,10 @@ pub fn create_lt_air(proof_options: &ProofOptions) -> VmAir {
 pub fn create_memw_air(proof_options: &ProofOptions) -> VmAir {
     let transition_constraints = memw_constraints();
 
+    // Build enum constraints for fast dispatch
+    let enum_constraints = memw_constraints_enum();
+    let split_evaluator = BaseSplitEvaluator::new(enum_constraints);
+
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: memw_bus_interactions(),
     };
@@ -540,12 +550,17 @@ pub fn create_memw_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_split_evaluator(Box::new(split_evaluator))
     .with_name("MEMW")
 }
 
 /// Create LOAD AIR with constraints and bus interactions.
 pub fn create_load_air(proof_options: &ProofOptions) -> VmAir {
     let transition_constraints = load_constraints();
+
+    // Build enum constraints for fast dispatch
+    let enum_constraints = load_constraints_enum();
+    let split_evaluator = BaseSplitEvaluator::new(enum_constraints);
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: load_bus_interactions(),
@@ -558,6 +573,7 @@ pub fn create_load_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_split_evaluator(Box::new(split_evaluator))
     .with_name("LOAD")
 }
 
@@ -615,6 +631,10 @@ pub fn create_dvrm_air(proof_options: &ProofOptions) -> VmAir {
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> =
         constraints.into_iter().map(|c| Box::new(c) as _).collect();
 
+    // Build second copy for enum dispatch
+    let (enum_constraints, _) = dvrm_constraints(0);
+    let split_evaluator = BaseSplitEvaluator::new(enum_constraints);
+
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: dvrm_bus_interactions(),
     };
@@ -626,6 +646,7 @@ pub fn create_dvrm_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_split_evaluator(Box::new(split_evaluator))
     .with_name("DVRM")
 }
 
@@ -639,6 +660,10 @@ pub fn create_branch_air(proof_options: &ProofOptions) -> VmAir {
     let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> =
         constraints.into_iter().map(|c| Box::new(c) as _).collect();
 
+    // Build second copy for enum dispatch
+    let (enum_constraints, _) = branch_constraints(0);
+    let split_evaluator = BaseSplitEvaluator::new(enum_constraints);
+
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: branch_bus_interactions(),
     };
@@ -650,6 +675,7 @@ pub fn create_branch_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_split_evaluator(Box::new(split_evaluator))
     .with_name("BRANCH")
 }
 

@@ -19,6 +19,7 @@ use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::TransitionConstraint;
 use stark::frame::Frame;
 use stark::table::TableView;
+use stark::traits::SplitEvaluator;
 
 use crate::tables::cpu::cols;
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
@@ -1256,4 +1257,197 @@ pub fn create_all_cpu_constraints() -> (
     next_idx += 2;
 
     (is_bit, add_constraints, other, next_idx)
+}
+
+// =========================================================================
+// Enum Dispatch for CPU Constraints
+// =========================================================================
+
+/// Concrete enum wrapping all CPU constraint types.
+///
+/// When used via `match`, the compiler generates a jump table (1-2 cycles)
+/// instead of vtable dispatch (5-10 cycles + cache miss risk per call).
+/// With ~56 constraints evaluated per LDE point, this eliminates ~112 vtable
+/// lookups per point (one for `computes_in_base_field` + one for evaluate).
+pub enum CpuConstraint {
+    IsBit(IsBitConstraint),
+    Add(AddConstraint),
+    BranchCond(BranchCondConstraint),
+    Ebreak(EbreakConstraint),
+    Arg1Lower(Arg1LowerConstraint),
+    Arg1Upper(Arg1UpperConstraint),
+    Arg2Lower(Arg2LowerConstraint),
+    Arg2Upper(Arg2UpperConstraint),
+    RvdLower(RvdLowerConstraint),
+    RvdUpper(RvdUpperConstraint),
+    SltResZero(SltResZeroConstraint),
+    SignBitZero(SignBitZeroConstraint),
+    NextPcAdd(NextPcAddConstraint),
+}
+
+/// Macro to delegate a TransitionConstraint method to the inner type via match.
+macro_rules! delegate_to_inner {
+    ($self:expr, $method:ident $(, $arg:expr)*) => {
+        match $self {
+            CpuConstraint::IsBit(c) => c.$method($($arg),*),
+            CpuConstraint::Add(c) => c.$method($($arg),*),
+            CpuConstraint::BranchCond(c) => c.$method($($arg),*),
+            CpuConstraint::Ebreak(c) => c.$method($($arg),*),
+            CpuConstraint::Arg1Lower(c) => c.$method($($arg),*),
+            CpuConstraint::Arg1Upper(c) => c.$method($($arg),*),
+            CpuConstraint::Arg2Lower(c) => c.$method($($arg),*),
+            CpuConstraint::Arg2Upper(c) => c.$method($($arg),*),
+            CpuConstraint::RvdLower(c) => c.$method($($arg),*),
+            CpuConstraint::RvdUpper(c) => c.$method($($arg),*),
+            CpuConstraint::SltResZero(c) => c.$method($($arg),*),
+            CpuConstraint::SignBitZero(c) => c.$method($($arg),*),
+            CpuConstraint::NextPcAdd(c) => c.$method($($arg),*),
+        }
+    };
+}
+
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for CpuConstraint {
+    fn degree(&self) -> usize {
+        delegate_to_inner!(self, degree)
+    }
+
+    fn constraint_idx(&self) -> usize {
+        delegate_to_inner!(self, constraint_idx)
+    }
+
+    fn end_exemptions(&self) -> usize {
+        delegate_to_inner!(self, end_exemptions)
+    }
+
+    fn computes_in_base_field(&self) -> bool {
+        true // All CPU table-specific constraints are base-field
+    }
+
+    fn evaluate_prover_base(
+        &self,
+        frame: &Frame<GoldilocksField, GoldilocksExtension>,
+        periodic_values: &[FieldElement<GoldilocksField>],
+        base_evaluations: &mut [FieldElement<GoldilocksField>],
+    ) {
+        delegate_to_inner!(self, evaluate_prover_base, frame, periodic_values, base_evaluations)
+    }
+
+    fn evaluate_verifier(
+        &self,
+        frame: &Frame<GoldilocksExtension, GoldilocksExtension>,
+        periodic_values: &[FieldElement<GoldilocksExtension>],
+        rap_challenges: &[FieldElement<GoldilocksExtension>],
+        logup_alpha_powers: &[FieldElement<GoldilocksExtension>],
+        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
+    ) {
+        delegate_to_inner!(self, evaluate_verifier, frame, periodic_values, rap_challenges, logup_alpha_powers, transition_evaluations)
+    }
+}
+
+/// Split evaluator for CPU constraints using enum dispatch.
+pub struct CpuSplitEvaluator {
+    constraints: Vec<CpuConstraint>,
+}
+
+impl CpuSplitEvaluator {
+    pub fn new(constraints: Vec<CpuConstraint>) -> Self {
+        Self { constraints }
+    }
+}
+
+impl SplitEvaluator<GoldilocksField, GoldilocksExtension> for CpuSplitEvaluator {
+    fn evaluate_split(
+        &self,
+        frame: &Frame<GoldilocksField, GoldilocksExtension>,
+        periodic_values: &[FieldElement<GoldilocksField>],
+        _rap_challenges: &[FieldElement<GoldilocksExtension>],
+        _logup_alpha_powers: &[FieldElement<GoldilocksExtension>],
+        base_evaluations: &mut [FieldElement<GoldilocksField>],
+        _ext_evaluations: &mut [FieldElement<GoldilocksExtension>],
+    ) {
+        // All CPU table-specific constraints are base-field.
+        // Each `evaluate_prover_base` call goes through a match → jump table.
+        for c in &self.constraints {
+            c.evaluate_prover_base(frame, periodic_values, base_evaluations);
+        }
+    }
+}
+
+/// Creates all CPU constraints as a single enum vec.
+///
+/// The enum variants implement `TransitionConstraint`, so they can be boxed
+/// for the AIR trait while the `CpuSplitEvaluator` iterates them with static dispatch.
+pub fn create_cpu_constraints_enum() -> Vec<CpuConstraint> {
+    let mut constraints = Vec::with_capacity(NUM_CPU_CONSTRAINTS);
+    let mut next_idx = 0;
+
+    // IS_BIT constraints (30)
+    for &col in BIT_FLAG_COLUMNS {
+        constraints.push(CpuConstraint::IsBit(IsBitConstraint::unconditional(col, next_idx)));
+        next_idx += 1;
+    }
+
+    // ADD constraints for ADD + LOAD (2)
+    let (add, next) = create_add_constraints(next_idx);
+    next_idx = next;
+    for c in add {
+        constraints.push(CpuConstraint::Add(c));
+    }
+
+    // SUB constraints for SUB + BEQ (2)
+    let (sub, next) = create_sub_constraints(next_idx);
+    next_idx = next;
+    for c in sub {
+        constraints.push(CpuConstraint::Add(c));
+    }
+
+    // JALR constraints (2)
+    let (jalr, next) = create_jalr_constraints(next_idx);
+    next_idx = next;
+    for c in jalr {
+        constraints.push(CpuConstraint::Add(c));
+    }
+
+    // Branch condition (1)
+    constraints.push(CpuConstraint::BranchCond(BranchCondConstraint::new(next_idx)));
+    next_idx += 1;
+
+    // EBREAK (1)
+    constraints.push(CpuConstraint::Ebreak(EbreakConstraint::new(next_idx)));
+    next_idx += 1;
+
+    // Arg1 lower/upper (2)
+    constraints.push(CpuConstraint::Arg1Lower(Arg1LowerConstraint::new(next_idx)));
+    next_idx += 1;
+    constraints.push(CpuConstraint::Arg1Upper(Arg1UpperConstraint::new(next_idx)));
+    next_idx += 1;
+
+    // Arg2 lower/upper (2)
+    constraints.push(CpuConstraint::Arg2Lower(Arg2LowerConstraint::new(next_idx)));
+    next_idx += 1;
+    constraints.push(CpuConstraint::Arg2Upper(Arg2UpperConstraint::new(next_idx)));
+    next_idx += 1;
+
+    // Rvd lower/upper (2)
+    constraints.push(CpuConstraint::RvdLower(RvdLowerConstraint::new(next_idx)));
+    next_idx += 1;
+    constraints.push(CpuConstraint::RvdUpper(RvdUpperConstraint::new(next_idx)));
+    next_idx += 1;
+
+    // SLT res zero (7)
+    for i in 0..7 {
+        constraints.push(CpuConstraint::SltResZero(SltResZeroConstraint::new(i + 1, next_idx)));
+        next_idx += 1;
+    }
+
+    // Sign bit zero (1)
+    constraints.push(CpuConstraint::SignBitZero(SignBitZeroConstraint::new(next_idx)));
+    next_idx += 1;
+
+    // Next PC non-branching (2)
+    constraints.push(CpuConstraint::NextPcAdd(NextPcAddConstraint::new(0, next_idx)));
+    next_idx += 1;
+    constraints.push(CpuConstraint::NextPcAdd(NextPcAddConstraint::new(1, next_idx)));
+
+    constraints
 }

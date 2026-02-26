@@ -1188,6 +1188,109 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MemwConstrai
     }
 }
 
+/// Wrapper enum for all MEMW table constraint types (for enum dispatch).
+pub enum MemwTableConstraint {
+    Memw(MemwConstraint),
+    Add(AddConstraint),
+}
+
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MemwTableConstraint {
+    fn degree(&self) -> usize {
+        match self {
+            Self::Memw(c) => c.degree(),
+            Self::Add(c) => c.degree(),
+        }
+    }
+
+    fn constraint_idx(&self) -> usize {
+        match self {
+            Self::Memw(c) => c.constraint_idx(),
+            Self::Add(c) => c.constraint_idx(),
+        }
+    }
+
+    fn end_exemptions(&self) -> usize {
+        0
+    }
+
+    fn computes_in_base_field(&self) -> bool {
+        true
+    }
+
+    fn evaluate_prover_base(
+        &self,
+        frame: &Frame<GoldilocksField, GoldilocksExtension>,
+        periodic_values: &[FieldElement<GoldilocksField>],
+        base_evaluations: &mut [FieldElement<GoldilocksField>],
+    ) {
+        match self {
+            Self::Memw(c) => c.evaluate_prover_base(frame, periodic_values, base_evaluations),
+            Self::Add(c) => c.evaluate_prover_base(frame, periodic_values, base_evaluations),
+        }
+    }
+
+    fn evaluate_verifier(
+        &self,
+        frame: &Frame<GoldilocksExtension, GoldilocksExtension>,
+        periodic_values: &[FieldElement<GoldilocksExtension>],
+        rap_challenges: &[FieldElement<GoldilocksExtension>],
+        logup_alpha_powers: &[FieldElement<GoldilocksExtension>],
+        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
+    ) {
+        match self {
+            Self::Memw(c) => c.evaluate_verifier(
+                frame,
+                periodic_values,
+                rap_challenges,
+                logup_alpha_powers,
+                transition_evaluations,
+            ),
+            Self::Add(c) => c.evaluate_verifier(
+                frame,
+                periodic_values,
+                rap_challenges,
+                logup_alpha_powers,
+                transition_evaluations,
+            ),
+        }
+    }
+}
+
+/// Creates all MEMW constraints as concrete types (for enum dispatch).
+pub fn memw_constraints_enum() -> Vec<MemwTableConstraint> {
+    let mut constraints = Vec::new();
+    let mut idx = 0;
+
+    constraints.push(MemwTableConstraint::Memw(MemwConstraint::new(
+        MemwConstraintKind::MuSumIsBit,
+        idx,
+    )));
+    idx += 1;
+
+    constraints.push(MemwTableConstraint::Memw(MemwConstraint::new(
+        MemwConstraintKind::W2ImpliesMuSum,
+        idx,
+    )));
+    idx += 1;
+
+    for i in 0..7 {
+        let lhs = AddOperand::dword(cols::BASE_ADDRESS_0);
+        let rhs = AddOperand::constant((i + 1) as i64);
+        let sum = AddOperand::from_dword_hl(cols::address_add(i)[0]);
+        let condition = match i {
+            0 => vec![cols::WRITE2, cols::WRITE4, cols::WRITE8],
+            1 | 2 => vec![cols::WRITE4, cols::WRITE8],
+            _ => vec![cols::WRITE8],
+        };
+        let (c0, c1) = AddConstraint::new_pair(condition, lhs, rhs, sum, idx);
+        constraints.push(MemwTableConstraint::Add(c0));
+        constraints.push(MemwTableConstraint::Add(c1));
+        idx += 2;
+    }
+
+    constraints
+}
+
 /// Creates all constraints for the MEMW table.
 pub fn constraints() -> Vec<Box<dyn TransitionConstraint<GoldilocksField, GoldilocksExtension>>> {
     let mut constraints: Vec<Box<dyn TransitionConstraint<GoldilocksField, GoldilocksExtension>>> =
