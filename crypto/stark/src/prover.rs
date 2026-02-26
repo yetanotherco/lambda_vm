@@ -692,6 +692,62 @@ pub trait IsStarkProver<
         })
     }
 
+    /// Reconstruct Round1 for every table, print the bus balance report, and
+    /// validate each trace. Called once after Phase C commits.
+    #[cfg(feature = "debug-checks")]
+    fn run_debug_checks(
+        air_trace_pairs: &[AirTracePair<'_, Field, FieldExtension, PI>],
+        metadatas: &[Round1Metadata<Field, FieldExtension>],
+        domains: &[Domain<Field>],
+        twiddle_caches: &[LdeTwiddles<Field>],
+        main_pool: &mut [Vec<FieldElement<Field>>],
+        aux_pool: &mut [Vec<FieldElement<FieldExtension>>],
+    ) where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+        PI: Send + Sync + Clone,
+    {
+        let mut temp_results: Vec<Round1<Field, FieldExtension>> =
+            Vec::with_capacity(air_trace_pairs.len());
+        for (((air, trace, _), metadata), (domain, twiddles)) in air_trace_pairs
+            .iter()
+            .zip(metadatas.iter())
+            .zip(domains.iter().zip(twiddle_caches.iter()))
+        {
+            let result = Self::reconstruct_round1(
+                *air,
+                *trace,
+                domain,
+                metadata,
+                twiddles,
+                main_pool,
+                aux_pool,
+            )
+            .expect("reconstruct_round1 failed in debug-checks");
+            temp_results.push(result);
+        }
+
+        let all_bus_public_inputs: Vec<Option<BusPublicInputs<FieldExtension>>> = temp_results
+            .iter()
+            .map(|r| r.bus_public_inputs.clone())
+            .collect();
+        print_bus_balance_report(&all_bus_public_inputs);
+
+        for (((air, trace, pub_inputs), round_1_result), domain) in air_trace_pairs
+            .iter()
+            .zip(temp_results.iter())
+            .zip(domains.iter())
+        {
+            validate_trace(
+                *air,
+                *pub_inputs,
+                *trace,
+                domain,
+                &round_1_result.rap_challenges,
+            );
+        }
+    }
+
     /// Returns the Merkle tree and the commitment to the evaluations of the parts of the
     /// composition polynomial.
     fn commit_composition_polynomial(
@@ -1631,47 +1687,14 @@ pub trait IsStarkProver<
         }
 
         #[cfg(feature = "debug-checks")]
-        {
-            // For debug checks, we need to reconstruct Round1 temporarily.
-            let mut temp_results: Vec<Round1<Field, FieldExtension>> = Vec::with_capacity(num_airs);
-            for (((air, trace, _), metadata), (domain, twiddles)) in air_trace_pairs
-                .iter()
-                .zip(metadatas.iter())
-                .zip(domains.iter().zip(twiddle_caches.iter()))
-            {
-                let result = Self::reconstruct_round1(
-                    *air,
-                    *trace,
-                    domain,
-                    metadata,
-                    twiddles,
-                    &mut main_pool,
-                    &mut aux_pool,
-                )
-                .expect("reconstruct_round1 failed in debug-checks");
-                temp_results.push(result);
-            }
-
-            let all_bus_public_inputs: Vec<Option<BusPublicInputs<FieldExtension>>> = temp_results
-                .iter()
-                .map(|r| r.bus_public_inputs.clone())
-                .collect();
-            print_bus_balance_report(&all_bus_public_inputs);
-
-            for (((air, trace, pub_inputs), round_1_result), domain) in air_trace_pairs
-                .iter()
-                .zip(temp_results.iter())
-                .zip(domains.iter())
-            {
-                validate_trace(
-                    *air,
-                    *pub_inputs,
-                    *trace,
-                    domain,
-                    &round_1_result.rap_challenges,
-                );
-            }
-        }
+        Self::run_debug_checks(
+            &air_trace_pairs,
+            &metadatas,
+            &domains,
+            &twiddle_caches,
+            &mut main_pool,
+            &mut aux_pool,
+        );
 
         // =====================================================================
         // Rounds 2-4: Sequential per-table proving with forked transcripts
