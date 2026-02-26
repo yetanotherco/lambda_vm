@@ -39,25 +39,6 @@ where
     E: IsField,
     F: IsSubFieldOf<E> + IsFFTField,
 {
-    pub fn new(
-        main_data: Vec<FieldElement<F>>,
-        aux_data: Vec<FieldElement<E>>,
-        num_main_columns: usize,
-        num_aux_columns: usize,
-        step_size: usize,
-    ) -> Self {
-        let main_table = Table::new(main_data, num_main_columns);
-        let aux_table = Table::new(aux_data, num_aux_columns);
-
-        Self {
-            main_table,
-            aux_table,
-            num_main_columns,
-            num_aux_columns,
-            step_size,
-        }
-    }
-
     /// Creates a new TraceTable from from a one-dimensional array in row major order and the intended width of the table.
     /// Step size is how many are needed to represent a state of the VM
     pub fn new_main(
@@ -115,14 +96,6 @@ where
         }
     }
 
-    pub fn empty() -> Self {
-        Self::new(Vec::new(), Vec::new(), 0, 0, 0)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.main_table.width == 0 && self.aux_table.width == 0
-    }
-
     pub fn num_rows(&self) -> usize {
         self.main_table.height
     }
@@ -177,23 +150,6 @@ where
         self.num_aux_columns = num_aux_columns;
     }
 
-    pub fn allocate_with_zeros(
-        num_steps: usize,
-        num_main_columns: usize,
-        num_aux_columns: usize,
-        step_size: usize,
-    ) -> TraceTable<F, E> {
-        let main_data = vec![FieldElement::<F>::zero(); step_size * num_steps * num_main_columns];
-        let aux_data = vec![FieldElement::<E>::zero(); step_size * num_steps * num_aux_columns];
-        TraceTable::new(
-            main_data,
-            aux_data,
-            num_main_columns,
-            num_aux_columns,
-            step_size,
-        )
-    }
-
     pub fn compute_trace_polys_main<S>(&self) -> Vec<Polynomial<FieldElement<F>>>
     where
         S: IsFFTField + IsSubFieldOf<F>,
@@ -209,31 +165,6 @@ where
         iter.map(|col| Polynomial::interpolate_fft::<S>(col))
             .collect::<Result<Vec<Polynomial<FieldElement<F>>>, FFTError>>()
             .unwrap()
-    }
-
-    pub fn compute_trace_polys_aux<S>(&self) -> Vec<Polynomial<FieldElement<E>>>
-    where
-        S: IsFFTField + IsSubFieldOf<F>,
-        E: Send + Sync,
-        FieldElement<E>: Send + Sync,
-    {
-        let columns = self.columns_aux();
-        #[cfg(feature = "parallel")]
-        let iter = columns.par_iter();
-        #[cfg(not(feature = "parallel"))]
-        let iter = columns.iter();
-
-        iter.map(|col| Polynomial::interpolate_fft::<F>(col))
-            .collect::<Result<Vec<Polynomial<FieldElement<E>>>, FFTError>>()
-            .unwrap()
-    }
-
-    pub fn get_column_main(&self, col_idx: usize) -> Vec<FieldElement<F>> {
-        self.main_table.get_column(col_idx)
-    }
-
-    pub fn get_column_aux(&self, col_idx: usize) -> Vec<FieldElement<E>> {
-        self.aux_table.get_column(col_idx)
     }
 
     /// Extract main columns directly into pre-allocated output buffers.
@@ -295,36 +226,10 @@ where
         }
     }
 
-    /// Creates a column-major LDETraceTable by cloning column data from borrowed slices.
-    ///
-    /// Each column Vec is cloned sequentially (cache-friendly), avoiding the O(N×W)
-    /// row-major transpose that `Table::from_columns_borrowed` performs.
-    pub fn from_columns_borrowed(
-        main_columns: &[Vec<FieldElement<F>>],
-        aux_columns: &[Vec<FieldElement<E>>],
-        trace_step_size: usize,
-        blowup_factor: usize,
-    ) -> Self {
-        let main_cols: Vec<Vec<FieldElement<F>>> = main_columns.to_vec();
-        let aux_cols: Vec<Vec<FieldElement<E>>> = aux_columns.to_vec();
-        let lde_step_size = trace_step_size * blowup_factor;
-
-        Self {
-            main_columns: main_cols,
-            aux_columns: aux_cols,
-            lde_step_size,
-            blowup_factor,
-        }
-    }
-
     /// Consume self and return the owned column vectors.
     #[allow(clippy::type_complexity)]
     pub fn into_columns(self) -> (Vec<Vec<FieldElement<F>>>, Vec<Vec<FieldElement<E>>>) {
         (self.main_columns, self.aux_columns)
-    }
-
-    pub fn num_cols(&self) -> usize {
-        self.main_columns.len() + self.aux_columns.len()
     }
 
     pub fn num_main_cols(&self) -> usize {

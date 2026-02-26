@@ -19,8 +19,7 @@ use math::{
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::{
-    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
-    IntoParallelRefMutIterator, ParallelIterator,
+    IntoParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
 };
 
 #[cfg(feature = "debug-checks")]
@@ -272,19 +271,6 @@ pub trait IsStarkProver<
 >
 {
     /// Returns the Merkle tree and the commitment to the vectors `vectors`.
-    fn batch_commit_main(
-        vectors: &[Vec<FieldElement<Field>>],
-    ) -> Option<(BatchedMerkleTree<Field>, Commitment)>
-    where
-        FieldElement<Field>: AsBytes + Sync + Send,
-    {
-        let tree = BatchedMerkleTree::build(vectors)?;
-
-        let commitment = tree.root;
-        Some((tree, commitment))
-    }
-
-    /// Returns the Merkle tree and the commitment to the vectors `vectors`.
     fn batch_commit_extension(
         vectors: &[Vec<FieldElement<FieldExtension>>],
     ) -> Option<(BatchedMerkleTree<FieldExtension>, Commitment)>
@@ -397,49 +383,6 @@ pub trait IsStarkProver<
             })
             .collect::<Result<Vec<Vec<FieldElement<E>>>, _>>()
             .expect("coset LDE computation")
-    }
-
-    /// Compute LDE evaluations into pre-allocated column buffers.
-    ///
-    /// Same as [`compute_lde_from_columns_cached`] but writes into `output` buffers instead of
-    /// allocating new Vecs. When `output[i].capacity() >= lde_size`, no heap allocation occurs.
-    /// Used for LDE buffer reuse across tables in sequential proving.
-    fn compute_lde_from_columns_into<E>(
-        columns: &[Vec<FieldElement<E>>],
-        domain: &Domain<Field>,
-        twiddles: &LdeTwiddles<Field>,
-        output: &mut [Vec<FieldElement<E>>],
-    ) where
-        E: IsSubFieldOf<FieldExtension> + Send + Sync,
-        Field: IsSubFieldOf<E>,
-        FieldElement<E>: Send + Sync,
-    {
-        if columns.is_empty() {
-            return;
-        }
-
-        debug_assert!(
-            output.len() >= columns.len(),
-            "output pool has {} buffers but need {}",
-            output.len(),
-            columns.len()
-        );
-
-        #[cfg(feature = "parallel")]
-        let iter = columns.par_iter().zip(output.par_iter_mut());
-        #[cfg(not(feature = "parallel"))]
-        let iter = columns.iter().zip(output.iter_mut());
-        iter.for_each(|(col, buf)| {
-            Polynomial::coset_lde_full_into::<Field>(
-                col,
-                domain.blowup_factor,
-                &twiddles.coset_weights,
-                &twiddles.inv,
-                &twiddles.fwd,
-                buf,
-            )
-            .expect("coset LDE into");
-        });
     }
 
     /// Expand pool buffers in-place from N column evaluations to N×blowup LDE evaluations.

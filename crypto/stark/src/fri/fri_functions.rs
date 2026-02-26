@@ -1,4 +1,3 @@
-use super::Polynomial;
 use math::fft::cpu::{
     bit_reversing::in_place_bit_reverse_permute, roots_of_unity::get_powers_of_primitive_root_coset,
 };
@@ -6,6 +5,7 @@ use math::field::{
     element::FieldElement,
     traits::{IsFFTField, IsField, IsSubFieldOf},
 };
+use math::polynomial::Polynomial;
 
 /// In-place FRI polynomial folding with fused doubling: 2 * (P_even(x) + beta * P_odd(x))
 ///
