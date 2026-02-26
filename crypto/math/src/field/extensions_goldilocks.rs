@@ -40,9 +40,9 @@ impl ByteConversion for [FpE; 2] {
 impl ByteConversion for [FpE; 3] {
     #[cfg(feature = "alloc")]
     fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
-        let mut bytes = ByteConversion::to_bytes_be(&self[0]);
+        let mut bytes = ByteConversion::to_bytes_be(&self[2]);
         bytes.extend(ByteConversion::to_bytes_be(&self[1]));
-        bytes.extend(ByteConversion::to_bytes_be(&self[2]));
+        bytes.extend(ByteConversion::to_bytes_be(&self[0]));
         bytes
     }
 
@@ -62,9 +62,9 @@ impl ByteConversion for [FpE; 3] {
         if bytes.len() < N * 3 {
             return Err(crate::errors::ByteConversionError::FromBEBytesError);
         }
-        let x0 = FieldElement::from_bytes_be(&bytes[0..N])?;
+        let x2 = FieldElement::from_bytes_be(&bytes[0..N])?;
         let x1 = FieldElement::from_bytes_be(&bytes[N..N * 2])?;
-        let x2 = FieldElement::from_bytes_be(&bytes[N * 2..N * 3])?;
+        let x0 = FieldElement::from_bytes_be(&bytes[N * 2..N * 3])?;
         Ok([x0, x1, x2])
     }
 
@@ -451,9 +451,9 @@ impl Fp3E {
 impl ByteConversion for FieldElement<Degree3GoldilocksExtensionField> {
     #[cfg(feature = "alloc")]
     fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
-        let mut byte_slice = ByteConversion::to_bytes_be(&self.value()[0]);
+        let mut byte_slice = ByteConversion::to_bytes_be(&self.value()[2]);
         byte_slice.extend(ByteConversion::to_bytes_be(&self.value()[1]));
-        byte_slice.extend(ByteConversion::to_bytes_be(&self.value()[2]));
+        byte_slice.extend(ByteConversion::to_bytes_be(&self.value()[0]));
         byte_slice
     }
 
@@ -473,9 +473,9 @@ impl ByteConversion for FieldElement<Degree3GoldilocksExtensionField> {
         if bytes.len() < BYTES_PER_FIELD * 3 {
             return Err(crate::errors::ByteConversionError::FromBEBytesError);
         }
-        let x0 = FieldElement::from_bytes_be(&bytes[0..BYTES_PER_FIELD])?;
+        let x2 = FieldElement::from_bytes_be(&bytes[0..BYTES_PER_FIELD])?;
         let x1 = FieldElement::from_bytes_be(&bytes[BYTES_PER_FIELD..BYTES_PER_FIELD * 2])?;
-        let x2 = FieldElement::from_bytes_be(&bytes[BYTES_PER_FIELD * 2..BYTES_PER_FIELD * 3])?;
+        let x0 = FieldElement::from_bytes_be(&bytes[BYTES_PER_FIELD * 2..BYTES_PER_FIELD * 3])?;
 
         Ok(Self::new([x0, x1, x2]))
     }
