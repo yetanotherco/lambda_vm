@@ -138,6 +138,41 @@ impl IsField for GoldilocksField {
     fn double(a: &u64) -> u64 {
         Self::add(a, a)
     }
+
+    /// Pack two halfwords: `a + b * 2^16`.
+    /// Uses u128 accumulation with a single `reduce128`.
+    #[inline(always)]
+    fn pack_halves(a: &u64, b: &u64) -> u64 {
+        reduce128((*a as u128) + ((*b as u128) << 16))
+    }
+
+    /// Pack four bytes: `a + b*2^8 + c*2^16 + d*2^24`.
+    /// Uses u128 accumulation with a single `reduce128`.
+    #[inline(always)]
+    fn pack_bytes(a: &u64, b: &u64, c: &u64, d: &u64) -> u64 {
+        reduce128(
+            (*a as u128) + ((*b as u128) << 8) + ((*c as u128) << 16) + ((*d as u128) << 24),
+        )
+    }
+
+    /// Pack three components: `a + b*2^8 + c*2^16`.
+    /// Uses u128 accumulation with a single `reduce128`.
+    #[inline(always)]
+    fn pack_byte_byte_half(a: &u64, b: &u64, c: &u64) -> u64 {
+        reduce128((*a as u128) + ((*b as u128) << 8) + ((*c as u128) << 16))
+    }
+
+    /// Multiply by 2^k using u128 shift + single `reduce128`.
+    #[inline(always)]
+    fn mul_pow2(a: &u64, k: u32) -> u64 {
+        reduce128((*a as u128) << k)
+    }
+
+    /// Pre-computed 2^(-32) mod p = 18446744065119617026.
+    #[inline(always)]
+    fn inv_2_32() -> u64 {
+        18446744065119617026u64
+    }
 }
 
 /// Reduce a 128-bit value to a 64-bit Goldilocks field element.
@@ -152,7 +187,7 @@ impl IsField for GoldilocksField {
 /// x_hi_lo * EPSILON = x_hi_lo * (2^32 - 1) = (x_hi_lo << 32) - x_hi_lo
 /// Benchmarks show this is ~10% faster than using multiply.
 #[inline(always)]
-fn reduce128(x: u128) -> u64 {
+pub fn reduce128(x: u128) -> u64 {
     let x_lo = x as u64;
     let x_hi = (x >> 64) as u64;
     let x_hi_hi = x_hi >> 32;

@@ -1162,18 +1162,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MemwConstrai
         0
     }
 
-    fn evaluate_prover(
-        &self,
-        frame: &Frame<GoldilocksField, GoldilocksExtension>,
-        _periodic_values: &[FieldElement<GoldilocksField>],
-        _rap_challenges: &[FieldElement<GoldilocksExtension>],
-        _logup_alpha_powers: &[FieldElement<GoldilocksExtension>],
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        let constraint_value = self.compute(frame.get_evaluation_step(0));
-        transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-    }
-
     fn computes_in_base_field(&self) -> bool {
         true
     }

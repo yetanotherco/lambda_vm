@@ -26,12 +26,6 @@ use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 /// 2^32 for word combining and carry extraction
 pub const SHIFT_32: u64 = 1u64 << 32;
 
-/// 2^(-32) in the field, used for carry extraction.
-#[inline]
-fn inv_2_32<F: IsField>() -> FieldElement<F> {
-    FieldElement::from(SHIFT_32).inv().unwrap()
-}
-
 // =========================================================================
 // IS_BIT Template
 // =========================================================================
@@ -111,18 +105,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for IsBitConstra
         0
     }
 
-    fn evaluate_prover(
-        &self,
-        frame: &Frame<GoldilocksField, GoldilocksExtension>,
-        _periodic_values: &[FieldElement<GoldilocksField>],
-        _rap_challenges: &[FieldElement<GoldilocksExtension>],
-        _logup_alpha_powers: &[FieldElement<GoldilocksExtension>],
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        let constraint_value = self.compute(frame.get_evaluation_step(0));
-        transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-    }
-
     fn computes_in_base_field(&self) -> bool {
         true
     }
@@ -144,8 +126,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for IsBitConstra
         _logup_alpha_powers: &[FieldElement<GoldilocksExtension>],
         transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
     ) {
-        let constraint_value = self.compute(frame.get_evaluation_step(0));
-        transition_evaluations[self.constraint_idx] = constraint_value;
+        transition_evaluations[self.constraint_idx] = self.compute(frame.get_evaluation_step(0));
     }
 }
 
@@ -462,8 +443,7 @@ impl AddConstraint {
         let rhs_lo = self.rhs.eval_lo(step);
         let sum_lo = self.sum.eval_lo(step);
 
-        // carry_0 = (lhs_lo + rhs_lo - sum_lo) * 2^(-32)
-        (lhs_lo + rhs_lo - sum_lo) * inv_2_32::<F>()
+        (lhs_lo + rhs_lo - sum_lo) * FieldElement::<F>::inv_2_32()
     }
 
     /// Compute carry_1 inline from trace values.
@@ -477,8 +457,7 @@ impl AddConstraint {
         let sum_hi = self.sum.eval_hi(step);
         let carry_0 = self.compute_carry_0(step);
 
-        // carry_1 = (lhs_hi + rhs_hi + carry_0 - sum_hi) * 2^(-32)
-        (lhs_hi + rhs_hi + carry_0 - sum_hi) * inv_2_32::<F>()
+        (lhs_hi + rhs_hi + carry_0 - sum_hi) * FieldElement::<F>::inv_2_32()
     }
 
     fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
@@ -486,7 +465,6 @@ impl AddConstraint {
         F: IsSubFieldOf<E>,
         E: IsField,
     {
-        // Sum all condition columns: constraint active when any flag is set
         let cond = self
             .cond_cols
             .iter()
@@ -501,16 +479,12 @@ impl AddConstraint {
             _ => panic!("Invalid carry index"),
         };
 
-        // cond * carry * (1 - carry)
         cond * &carry * (one - carry)
     }
 }
 
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for AddConstraint {
     fn degree(&self) -> usize {
-        // The constraint is cond * carry * (1 - carry)
-        // where carry involves division by 2^32 (degree 1 in trace elements)
-        // So total degree: 1 (cond) * 1 (carry) * 1 (1-carry) = 3
         3
     }
 
@@ -520,18 +494,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for AddConstrain
 
     fn end_exemptions(&self) -> usize {
         0
-    }
-
-    fn evaluate_prover(
-        &self,
-        frame: &Frame<GoldilocksField, GoldilocksExtension>,
-        _periodic_values: &[FieldElement<GoldilocksField>],
-        _rap_challenges: &[FieldElement<GoldilocksExtension>],
-        _logup_alpha_powers: &[FieldElement<GoldilocksExtension>],
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        let constraint_value = self.compute(frame.get_evaluation_step(0));
-        transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
     }
 
     fn computes_in_base_field(&self) -> bool {
@@ -555,8 +517,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for AddConstrain
         _logup_alpha_powers: &[FieldElement<GoldilocksExtension>],
         transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
     ) {
-        let constraint_value = self.compute(frame.get_evaluation_step(0));
-        transition_evaluations[self.constraint_idx] = constraint_value;
+        transition_evaluations[self.constraint_idx] = self.compute(frame.get_evaluation_step(0));
     }
 }
 

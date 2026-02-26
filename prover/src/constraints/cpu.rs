@@ -26,7 +26,7 @@ use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 use super::templates::{AddConstraint, AddLinearTerm, AddOperand, IsBitConstraint};
 
 /// Pack 4 consecutive byte-column values into a 32-bit word field element.
-/// `col0 + col1*2^8 + col2*2^16 + col3*2^24`
+/// Uses `FieldElement::pack_bytes` which Goldilocks overrides with u128-shift optimization.
 #[inline]
 fn pack_bytes_to_word<F, E>(
     step: &TableView<F, E>,
@@ -44,11 +44,7 @@ where
     let b2 = step.get_main_evaluation_element(0, col2);
     let b3 = step.get_main_evaluation_element(0, col3);
 
-    let shift_8: FieldElement<F> = FieldElement::from(1u64 << 8);
-    let shift_16: FieldElement<F> = FieldElement::from(1u64 << 16);
-    let shift_24: FieldElement<F> = FieldElement::from(1u64 << 24);
-
-    b0 + b1 * &shift_8 + b2 * &shift_16 + b3 * shift_24
+    FieldElement::pack_bytes(b0, b1, b2, b3)
 }
 
 // =========================================================================
@@ -211,18 +207,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for BranchCondCo
         0
     }
 
-    fn evaluate_prover(
-        &self,
-        frame: &Frame<GoldilocksField, GoldilocksExtension>,
-        _periodic_values: &[FieldElement<GoldilocksField>],
-        _rap_challenges: &[FieldElement<GoldilocksExtension>],
-        _logup_alpha_powers: &[FieldElement<GoldilocksExtension>],
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        let constraint_value = self.compute(frame.get_evaluation_step(0));
-        transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-    }
-
     fn computes_in_base_field(&self) -> bool {
         true
     }
@@ -288,18 +272,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for EbreakConstr
         0
     }
 
-    fn evaluate_prover(
-        &self,
-        frame: &Frame<GoldilocksField, GoldilocksExtension>,
-        _periodic_values: &[FieldElement<GoldilocksField>],
-        _rap_challenges: &[FieldElement<GoldilocksExtension>],
-        _logup_alpha_powers: &[FieldElement<GoldilocksExtension>],
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        let constraint_value = self.compute(frame.get_evaluation_step(0));
-        transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-    }
-
     fn computes_in_base_field(&self) -> bool {
         true
     }
@@ -356,10 +328,8 @@ impl Arg1LowerConstraint {
         // rv1::DWordWL[0] = rv1[0] + rv1[1] * 2^16
         let rv1_0 = step.get_main_evaluation_element(0, cols::RV1_0);
         let rv1_1 = step.get_main_evaluation_element(0, cols::RV1_1);
-        let shift_16: FieldElement<F> = FieldElement::from(1u64 << 16);
-        let rv1_lower = rv1_0 + rv1_1 * shift_16;
+        let rv1_lower = rv1_0.pack_halves(rv1_1);
 
-        // Constraint: arg1_lo - rv1_lower = 0
         arg1_lo - rv1_lower
     }
 }
@@ -375,18 +345,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg1LowerCon
 
     fn end_exemptions(&self) -> usize {
         0
-    }
-
-    fn evaluate_prover(
-        &self,
-        frame: &Frame<GoldilocksField, GoldilocksExtension>,
-        _periodic_values: &[FieldElement<GoldilocksField>],
-        _rap_challenges: &[FieldElement<GoldilocksExtension>],
-        _logup_alpha_powers: &[FieldElement<GoldilocksExtension>],
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        let constraint_value = self.compute(frame.get_evaluation_step(0));
-        transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
     }
 
     fn computes_in_base_field(&self) -> bool {
@@ -470,18 +428,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg1UpperCon
         0
     }
 
-    fn evaluate_prover(
-        &self,
-        frame: &Frame<GoldilocksField, GoldilocksExtension>,
-        _periodic_values: &[FieldElement<GoldilocksField>],
-        _rap_challenges: &[FieldElement<GoldilocksExtension>],
-        _logup_alpha_powers: &[FieldElement<GoldilocksExtension>],
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        let constraint_value = self.compute(frame.get_evaluation_step(0));
-        transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-    }
-
     fn computes_in_base_field(&self) -> bool {
         true
     }
@@ -557,18 +503,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for SltResZeroCo
 
     fn end_exemptions(&self) -> usize {
         0
-    }
-
-    fn evaluate_prover(
-        &self,
-        frame: &Frame<GoldilocksField, GoldilocksExtension>,
-        _periodic_values: &[FieldElement<GoldilocksField>],
-        _rap_challenges: &[FieldElement<GoldilocksExtension>],
-        _logup_alpha_powers: &[FieldElement<GoldilocksExtension>],
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        let constraint_value = self.compute(frame.get_evaluation_step(0));
-        transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
     }
 
     fn computes_in_base_field(&self) -> bool {
@@ -663,18 +597,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for SignBitZeroC
         0
     }
 
-    fn evaluate_prover(
-        &self,
-        frame: &Frame<GoldilocksField, GoldilocksExtension>,
-        _periodic_values: &[FieldElement<GoldilocksField>],
-        _rap_challenges: &[FieldElement<GoldilocksExtension>],
-        _logup_alpha_powers: &[FieldElement<GoldilocksExtension>],
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        let constraint_value = self.compute(frame.get_evaluation_step(0));
-        transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-    }
-
     fn computes_in_base_field(&self) -> bool {
         true
     }
@@ -747,16 +669,11 @@ impl NextPcAddConstraint {
             .get_main_evaluation_element(0, cols::C_TYPE_INSTRUCTION)
             .clone();
 
-        // instr_size = 4 - 2 * c_type_instruction
         let four: FieldElement<F> = FieldElement::from(4u64);
         let two: FieldElement<F> = FieldElement::from(2u64);
         let instr_size = four - two * c_type;
 
-        // carry_0 = (pc_lo + instr_size - next_pc_lo) * 2^(-32)
-        let inv_2_32: FieldElement<F> = FieldElement::from(super::templates::SHIFT_32)
-            .inv()
-            .unwrap();
-        (pc_lo + instr_size - next_pc_lo) * inv_2_32
+        (pc_lo + instr_size - next_pc_lo) * FieldElement::<F>::inv_2_32()
     }
 
     /// Compute carry_1 = (pc_hi + carry_0 - next_pc_hi) / 2^32
@@ -769,12 +686,7 @@ impl NextPcAddConstraint {
         let next_pc_hi = step.get_main_evaluation_element(0, cols::NEXT_PC_1).clone();
         let carry_0 = self.compute_carry_0(step);
 
-        // rhs_hi = 0 (instruction size fits in low word)
-        // carry_1 = (pc_hi + 0 + carry_0 - next_pc_hi) * 2^(-32)
-        let inv_2_32: FieldElement<F> = FieldElement::from(super::templates::SHIFT_32)
-            .inv()
-            .unwrap();
-        (pc_hi + carry_0 - next_pc_hi) * inv_2_32
+        (pc_hi + carry_0 - next_pc_hi) * FieldElement::<F>::inv_2_32()
     }
 
     fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
@@ -794,7 +706,6 @@ impl NextPcAddConstraint {
             _ => panic!("Invalid carry index"),
         };
 
-        // (1 - branch_cond) * carry * (1 - carry)
         not_branch * &carry * (one - carry)
     }
 }
@@ -811,18 +722,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for NextPcAddCon
 
     fn end_exemptions(&self) -> usize {
         0
-    }
-
-    fn evaluate_prover(
-        &self,
-        frame: &Frame<GoldilocksField, GoldilocksExtension>,
-        _periodic_values: &[FieldElement<GoldilocksField>],
-        _rap_challenges: &[FieldElement<GoldilocksExtension>],
-        _logup_alpha_powers: &[FieldElement<GoldilocksExtension>],
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        let constraint_value = self.compute(frame.get_evaluation_step(0));
-        transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
     }
 
     fn computes_in_base_field(&self) -> bool {
@@ -877,8 +776,7 @@ impl Arg2LowerConstraint {
         // rv2 is DWordWHH: rv2[:2] = rv2[0] + rv2[1] * 2^16
         let rv2_0 = step.get_main_evaluation_element(0, cols::RV2_0);
         let rv2_1 = step.get_main_evaluation_element(0, cols::RV2_1);
-        let shift_16: FieldElement<F> = FieldElement::from(1u64 << 16);
-        let rv2_lower = rv2_0 + rv2_1 * shift_16;
+        let rv2_lower = rv2_0.pack_halves(rv2_1);
 
         // imm[0] is lower word of immediate
         let imm_0 = step.get_main_evaluation_element(0, cols::IMM_0);
@@ -911,18 +809,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg2LowerCon
 
     fn end_exemptions(&self) -> usize {
         0
-    }
-
-    fn evaluate_prover(
-        &self,
-        frame: &Frame<GoldilocksField, GoldilocksExtension>,
-        _periodic_values: &[FieldElement<GoldilocksField>],
-        _rap_challenges: &[FieldElement<GoldilocksExtension>],
-        _logup_alpha_powers: &[FieldElement<GoldilocksExtension>],
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        let constraint_value = self.compute(frame.get_evaluation_step(0));
-        transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
     }
 
     fn computes_in_base_field(&self) -> bool {
@@ -1014,18 +900,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg2UpperCon
         0
     }
 
-    fn evaluate_prover(
-        &self,
-        frame: &Frame<GoldilocksField, GoldilocksExtension>,
-        _periodic_values: &[FieldElement<GoldilocksField>],
-        _rap_challenges: &[FieldElement<GoldilocksExtension>],
-        _logup_alpha_powers: &[FieldElement<GoldilocksExtension>],
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        let constraint_value = self.compute(frame.get_evaluation_step(0));
-        transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-    }
-
     fn computes_in_base_field(&self) -> bool {
         true
     }
@@ -1099,18 +973,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RvdLowerCons
 
     fn end_exemptions(&self) -> usize {
         0
-    }
-
-    fn evaluate_prover(
-        &self,
-        frame: &Frame<GoldilocksField, GoldilocksExtension>,
-        _periodic_values: &[FieldElement<GoldilocksField>],
-        _rap_challenges: &[FieldElement<GoldilocksExtension>],
-        _logup_alpha_powers: &[FieldElement<GoldilocksExtension>],
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        let constraint_value = self.compute(frame.get_evaluation_step(0));
-        transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
     }
 
     fn computes_in_base_field(&self) -> bool {
@@ -1190,18 +1052,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RvdUpperCons
 
     fn end_exemptions(&self) -> usize {
         0
-    }
-
-    fn evaluate_prover(
-        &self,
-        frame: &Frame<GoldilocksField, GoldilocksExtension>,
-        _periodic_values: &[FieldElement<GoldilocksField>],
-        _rap_challenges: &[FieldElement<GoldilocksExtension>],
-        _logup_alpha_powers: &[FieldElement<GoldilocksExtension>],
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        let constraint_value = self.compute(frame.get_evaluation_step(0));
-        transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
     }
 
     fn computes_in_base_field(&self) -> bool {

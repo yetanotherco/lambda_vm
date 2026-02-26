@@ -34,7 +34,7 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16, SHIFT_32};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16};
 
 // =========================================================================
 // Column indices for BRANCH table
@@ -457,15 +457,12 @@ impl BranchConstraint {
             .get_main_evaluation_element(0, cols::NEXT_PC_HIGH_2)
             .clone();
 
-        let shift_8 = FieldElement::<F>::from(SHIFT_8);
-        let shift_16 = FieldElement::<F>::from(SHIFT_16);
-
         // next_pc_unmasked[0] = unmasked_low_byte + 2^8 * next_pc_low[1] + 2^16 * next_pc_high[0]
         let unmasked_0 =
-            &unmasked_low_byte + &next_pc_low_1 * &shift_8 + &next_pc_high_0 * &shift_16;
+            FieldElement::pack_byte_byte_half(&unmasked_low_byte, &next_pc_low_1, &next_pc_high_0);
 
         // next_pc_unmasked[1] = next_pc_high[1] + 2^16 * next_pc_high[2]
-        let unmasked_1 = &next_pc_high_1 + &next_pc_high_2 * &shift_16;
+        let unmasked_1 = next_pc_high_1.pack_halves(&next_pc_high_2);
 
         (unmasked_0, unmasked_1)
     }
@@ -490,10 +487,7 @@ impl BranchConstraint {
         // Compute carry_0 as (base + offset - result) / 2^32 in the field.
         // This works because: base + offset = result + carry_0 * 2^32 (mod field)
         // Rearranging: carry_0 = (base + offset - result) * (2^32)^-1 (mod field)
-        let inv_2_32 = FieldElement::<F>::from(SHIFT_32)
-            .inv()
-            .expect("2^32 must be invertible in field");
-        (&base_0 + &offset_0 - &unmasked_0) * &inv_2_32
+        (&base_0 + &offset_0 - &unmasked_0) * FieldElement::<F>::inv_2_32()
     }
 
     /// Compute virtual carry[1] from the addition check.
@@ -513,14 +507,9 @@ impl BranchConstraint {
         let (_unmasked_0, unmasked_1) = self.compute_next_pc_unmasked(step);
         let carry_0 = self.compute_carry_0(step);
 
-        // offset[1] already contains the sign-extended high word
         let offset_1 = step.get_main_evaluation_element(0, cols::OFFSET_1).clone();
 
-        // carry[1] = (base[1] + offset[1] + carry[0] - unmasked[1]) / 2^32
-        let inv_2_32 = FieldElement::<F>::from(SHIFT_32)
-            .inv()
-            .expect("2^32 must be invertible in field");
-        (&base_1 + &offset_1 + &carry_0 - &unmasked_1) * &inv_2_32
+        (&base_1 + &offset_1 + &carry_0 - &unmasked_1) * FieldElement::<F>::inv_2_32()
     }
 
     /// Compute the constraint value.
@@ -544,6 +533,7 @@ impl BranchConstraint {
             }
         }
     }
+
 }
 
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for BranchConstraint {
@@ -566,18 +556,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for BranchConstr
 
     fn end_exemptions(&self) -> usize {
         0
-    }
-
-    fn evaluate_prover(
-        &self,
-        frame: &Frame<GoldilocksField, GoldilocksExtension>,
-        _periodic_values: &[FieldElement<GoldilocksField>],
-        _rap_challenges: &[FieldElement<GoldilocksExtension>],
-        _logup_alpha_powers: &[FieldElement<GoldilocksExtension>],
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        transition_evaluations[self.constraint_idx] =
-            self.compute(frame.get_evaluation_step(0)).to_extension();
     }
 
     fn computes_in_base_field(&self) -> bool {

@@ -526,6 +526,46 @@ where
         self.value
     }
 
+    /// Pack two halfwords: `self + other * 2^16`.
+    #[inline(always)]
+    pub fn pack_halves(&self, other: &Self) -> Self {
+        Self {
+            value: F::pack_halves(&self.value, &other.value),
+        }
+    }
+
+    /// Pack four bytes: `a + b*2^8 + c*2^16 + d*2^24`.
+    #[inline(always)]
+    pub fn pack_bytes(a: &Self, b: &Self, c: &Self, d: &Self) -> Self {
+        Self {
+            value: F::pack_bytes(&a.value, &b.value, &c.value, &d.value),
+        }
+    }
+
+    /// Pack three components: `a + b*2^8 + c*2^16`.
+    #[inline(always)]
+    pub fn pack_byte_byte_half(a: &Self, b: &Self, c: &Self) -> Self {
+        Self {
+            value: F::pack_byte_byte_half(&a.value, &b.value, &c.value),
+        }
+    }
+
+    /// Multiply by 2^k.
+    #[inline(always)]
+    pub fn mul_pow2(&self, k: u32) -> Self {
+        Self {
+            value: F::mul_pow2(&self.value, k),
+        }
+    }
+
+    /// Returns 2^(-32) in the field.
+    #[inline(always)]
+    pub fn inv_2_32() -> Self {
+        Self {
+            value: F::inv_2_32(),
+        }
+    }
+
     #[inline(always)]
     pub fn to_extension<L: IsField>(self) -> FieldElement<L>
     where

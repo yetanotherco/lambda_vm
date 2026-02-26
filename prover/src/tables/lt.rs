@@ -33,7 +33,7 @@ use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16, SHIFT_32};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 
 // =========================================================================
 // Column indices for LT table
@@ -416,20 +416,12 @@ impl LtConstraint {
     {
         let lhs_0 = step.get_main_evaluation_element(0, cols::LHS_0).clone();
         let rhs_0 = step.get_main_evaluation_element(0, cols::RHS_0).clone();
-        let sub_0 = step
-            .get_main_evaluation_element(0, cols::LHS_SUB_RHS_0)
-            .clone();
-        let sub_1 = step
-            .get_main_evaluation_element(0, cols::LHS_SUB_RHS_1)
-            .clone();
+        let sub_0 = step.get_main_evaluation_element(0, cols::LHS_SUB_RHS_0);
+        let sub_1 = step.get_main_evaluation_element(0, cols::LHS_SUB_RHS_1);
 
-        // cast(lhs_sub_rhs, DWordWL)[0] = sub_0 + 2^16 * sub_1
-        let shift_16 = FieldElement::<F>::from(SHIFT_16);
-        let sub_lo = &sub_0 + &sub_1 * &shift_16;
+        let sub_lo = sub_0.pack_halves(sub_1);
 
-        // carry[0] = (rhs[0] + sub_lo - lhs[0]) / 2^32
-        let inv_2_32 = FieldElement::<F>::from(SHIFT_32).inv().unwrap();
-        (&rhs_0 + &sub_lo - &lhs_0) * &inv_2_32
+        (&rhs_0 + &sub_lo - &lhs_0) * FieldElement::<F>::inv_2_32()
     }
 
     /// Compute virtual carry[1] from the addition check.
@@ -445,34 +437,19 @@ impl LtConstraint {
         F: IsSubFieldOf<E>,
         E: IsField,
     {
-        let lhs_1 = step.get_main_evaluation_element(0, cols::LHS_1).clone();
-        let lhs_2 = step.get_main_evaluation_element(0, cols::LHS_2).clone();
-        let rhs_1 = step.get_main_evaluation_element(0, cols::RHS_1).clone();
-        let rhs_2 = step.get_main_evaluation_element(0, cols::RHS_2).clone();
-        let sub_2 = step
-            .get_main_evaluation_element(0, cols::LHS_SUB_RHS_2)
-            .clone();
-        let sub_3 = step
-            .get_main_evaluation_element(0, cols::LHS_SUB_RHS_3)
-            .clone();
+        let lhs_1 = step.get_main_evaluation_element(0, cols::LHS_1);
+        let lhs_2 = step.get_main_evaluation_element(0, cols::LHS_2);
+        let rhs_1 = step.get_main_evaluation_element(0, cols::RHS_1);
+        let rhs_2 = step.get_main_evaluation_element(0, cols::RHS_2);
+        let sub_2 = step.get_main_evaluation_element(0, cols::LHS_SUB_RHS_2);
+        let sub_3 = step.get_main_evaluation_element(0, cols::LHS_SUB_RHS_3);
 
-        let shift_16 = FieldElement::<F>::from(SHIFT_16);
-
-        // cast(lhs, DWordWL)[1] = lhs[1] + 2^16 * lhs[2]
-        let lhs_hi = &lhs_1 + &lhs_2 * &shift_16;
-
-        // cast(rhs, DWordWL)[1] = rhs[1] + 2^16 * rhs[2]
-        let rhs_hi = &rhs_1 + &rhs_2 * &shift_16;
-
-        // cast(lhs_sub_rhs, DWordWL)[1] = sub_2 + 2^16 * sub_3
-        let sub_hi = &sub_2 + &sub_3 * &shift_16;
-
-        // carry[0]
+        let lhs_hi = lhs_1.pack_halves(lhs_2);
+        let rhs_hi = rhs_1.pack_halves(rhs_2);
+        let sub_hi = sub_2.pack_halves(sub_3);
         let carry_0 = self.compute_carry_0(step);
 
-        // carry[1] = (rhs_hi + sub_hi + carry_0 - lhs_hi) / 2^32
-        let inv_2_32 = FieldElement::<F>::from(SHIFT_32).inv().unwrap();
-        (&rhs_hi + &sub_hi + &carry_0 - &lhs_hi) * &inv_2_32
+        (&rhs_hi + &sub_hi + &carry_0 - &lhs_hi) * FieldElement::<F>::inv_2_32()
     }
 
     /// Compute the constraint value.
@@ -521,6 +498,7 @@ impl LtConstraint {
             }
         }
     }
+
 }
 
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for LtConstraint {
@@ -540,18 +518,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for LtConstraint
 
     fn end_exemptions(&self) -> usize {
         0
-    }
-
-    fn evaluate_prover(
-        &self,
-        frame: &Frame<GoldilocksField, GoldilocksExtension>,
-        _periodic_values: &[FieldElement<GoldilocksField>],
-        _rap_challenges: &[FieldElement<GoldilocksExtension>],
-        _logup_alpha_powers: &[FieldElement<GoldilocksExtension>],
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        transition_evaluations[self.constraint_idx] =
-            self.compute(frame.get_evaluation_step(0)).to_extension();
     }
 
     fn computes_in_base_field(&self) -> bool {

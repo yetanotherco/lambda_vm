@@ -41,7 +41,7 @@ use stark::trace::TraceTable;
 
 use super::types::{
     BusId, FE, GoldilocksExtension, GoldilocksField, NEG_INV_2_16, NEG_INV_2_32, NEG_INV_2_48,
-    NEG_INV_2_64, SHIFT_16, SHIFT_32,
+    NEG_INV_2_64, SHIFT_16,
 };
 
 // =========================================================================
@@ -1058,40 +1058,35 @@ impl DvrmConstraint {
                 &r_sum * (&sign_r - &sign_n)
             }
             DvrmConstraintKind::AbsRFormula(i) => {
-                // (1-sign_r) * (abs_r[i] - (r::DWordWL)[i]) = 0
                 let sign_r = step.get_main_evaluation_element(0, cols::SIGN_R).clone();
                 let abs_r_col = if i == 0 { cols::ABS_R_0 } else { cols::ABS_R_1 };
                 let abs_r = step.get_main_evaluation_element(0, abs_r_col).clone();
 
-                // r::DWordWL[i]: lo32 = r[0] + r[1]*2^16, hi32 = r[2] + r[3]*2^16
-                let shift_16 = FieldElement::<F>::from(SHIFT_16);
                 let r_wl = if i == 0 {
-                    let r0 = step.get_main_evaluation_element(0, cols::R_0).clone();
-                    let r1 = step.get_main_evaluation_element(0, cols::R_1).clone();
-                    &r0 + &r1 * &shift_16
+                    let r0 = step.get_main_evaluation_element(0, cols::R_0);
+                    let r1 = step.get_main_evaluation_element(0, cols::R_1);
+                    r0.pack_halves(r1)
                 } else {
-                    let r2 = step.get_main_evaluation_element(0, cols::R_2).clone();
-                    let r3 = step.get_main_evaluation_element(0, cols::R_3).clone();
-                    &r2 + &r3 * &shift_16
+                    let r2 = step.get_main_evaluation_element(0, cols::R_2);
+                    let r3 = step.get_main_evaluation_element(0, cols::R_3);
+                    r2.pack_halves(r3)
                 };
 
                 (&one - &sign_r) * (&abs_r - &r_wl)
             }
             DvrmConstraintKind::AbsDFormula(i) => {
-                // (1-sign_d) * (abs_d[i] - (d::DWordWL)[i]) = 0
                 let sign_d = step.get_main_evaluation_element(0, cols::SIGN_D).clone();
                 let abs_d_col = if i == 0 { cols::ABS_D_0 } else { cols::ABS_D_1 };
                 let abs_d = step.get_main_evaluation_element(0, abs_d_col).clone();
 
-                let shift_16 = FieldElement::<F>::from(SHIFT_16);
                 let d_wl = if i == 0 {
-                    let d0 = step.get_main_evaluation_element(0, cols::D_0).clone();
-                    let d1 = step.get_main_evaluation_element(0, cols::D_1).clone();
-                    &d0 + &d1 * &shift_16
+                    let d0 = step.get_main_evaluation_element(0, cols::D_0);
+                    let d1 = step.get_main_evaluation_element(0, cols::D_1);
+                    d0.pack_halves(d1)
                 } else {
-                    let d2 = step.get_main_evaluation_element(0, cols::D_2).clone();
-                    let d3 = step.get_main_evaluation_element(0, cols::D_3).clone();
-                    &d2 + &d3 * &shift_16
+                    let d2 = step.get_main_evaluation_element(0, cols::D_2);
+                    let d3 = step.get_main_evaluation_element(0, cols::D_3);
+                    d2.pack_halves(d3)
                 };
 
                 (&one - &sign_d) * (&abs_d - &d_wl)
@@ -1162,8 +1157,6 @@ impl DvrmConstraint {
         F: IsSubFieldOf<E>,
         E: IsField,
     {
-        let shift_16 = FieldElement::<F>::from(SHIFT_16);
-        let inv_2_32 = FieldElement::<F>::from(SHIFT_32).inv().unwrap();
         let sign_fill = FieldElement::<F>::from(SIGN_FILL);
 
         // Get n, n_sub_r, r halfwords
@@ -1197,12 +1190,11 @@ impl DvrmConstraint {
         // extended_n[1] = n[2] + n[3]*2^16
         // extended_n[2] = sign_n * 0xFFFFFFFF
         // extended_n[3] = sign_n * 0xFFFFFFFF
-        let ext_n = self.build_extended_quad(&n, &sign_n, &shift_16, &sign_fill);
-        let ext_r = self.build_extended_quad(&r, &sign_r, &shift_16, &sign_fill);
-        let ext_nsr = self.build_extended_quad(&nsr, &sign_nsr, &shift_16, &sign_fill);
+        let ext_n = self.build_extended_quad(&n, &sign_n, &sign_fill);
+        let ext_r = self.build_extended_quad(&r, &sign_r, &sign_fill);
+        let ext_nsr = self.build_extended_quad(&nsr, &sign_nsr, &sign_fill);
 
-        // carry[0] = (ext_nsr[0] + ext_r[0] - ext_n[0]) / 2^32
-        // carry[i] = (ext_nsr[i] + ext_r[i] + carry[i-1] - ext_n[i]) / 2^32
+        let inv_2_32 = FieldElement::<F>::inv_2_32();
         if i == 0 {
             (&ext_nsr[0] + &ext_r[0] - &ext_n[0]) * &inv_2_32
         } else {
@@ -1216,17 +1208,18 @@ impl DvrmConstraint {
         &self,
         halfwords: &[FieldElement<F>; 4],
         sign: &FieldElement<F>,
-        shift_16: &FieldElement<F>,
         sign_fill: &FieldElement<F>,
     ) -> [FieldElement<F>; 4] {
-        let ext_word = sign * sign_fill + sign * sign_fill * shift_16;
+        let sign_times_fill = sign * sign_fill;
+        let ext_word = sign_times_fill.pack_halves(&sign_times_fill);
         [
-            &halfwords[0] + &halfwords[1] * shift_16,
-            &halfwords[2] + &halfwords[3] * shift_16,
+            halfwords[0].pack_halves(&halfwords[1]),
+            halfwords[2].pack_halves(&halfwords[3]),
             ext_word.clone(),
             ext_word,
         ]
     }
+
 }
 
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for DvrmConstraint {
@@ -1254,18 +1247,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for DvrmConstrai
         0
     }
 
-    fn evaluate_prover(
-        &self,
-        frame: &Frame<GoldilocksField, GoldilocksExtension>,
-        _periodic_values: &[FieldElement<GoldilocksField>],
-        _rap_challenges: &[FieldElement<GoldilocksExtension>],
-        _logup_alpha_powers: &[FieldElement<GoldilocksExtension>],
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        transition_evaluations[self.constraint_idx] =
-            self.compute(frame.get_evaluation_step(0)).to_extension();
-    }
-
     fn computes_in_base_field(&self) -> bool {
         true
     }
@@ -1276,7 +1257,8 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for DvrmConstrai
         _periodic_values: &[FieldElement<GoldilocksField>],
         base_evaluations: &mut [FieldElement<GoldilocksField>],
     ) {
-        base_evaluations[self.constraint_idx] = self.compute(frame.get_evaluation_step(0));
+        base_evaluations[self.constraint_idx] =
+            self.compute(frame.get_evaluation_step(0));
     }
 
     fn evaluate_verifier(

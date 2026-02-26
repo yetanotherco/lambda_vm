@@ -187,6 +187,58 @@ pub trait IsField: Debug + Clone {
     /// Takes as input an element of BaseType and returns the internal representation
     /// of that element in the field.
     fn from_base_type(x: Self::BaseType) -> Self::BaseType;
+
+    /// Pack two halfwords: `a + b * 2^16`.
+    /// Default uses generic mul+add. Fields may override with optimized implementations.
+    #[inline(always)]
+    fn pack_halves(a: &Self::BaseType, b: &Self::BaseType) -> Self::BaseType {
+        Self::add(a, &Self::mul(b, &Self::from_u64(1 << 16)))
+    }
+
+    /// Pack four bytes: `a + b*2^8 + c*2^16 + d*2^24`.
+    /// Default uses generic mul+add. Fields may override with optimized implementations.
+    #[inline(always)]
+    fn pack_bytes(
+        a: &Self::BaseType,
+        b: &Self::BaseType,
+        c: &Self::BaseType,
+        d: &Self::BaseType,
+    ) -> Self::BaseType {
+        let shift_8 = Self::from_u64(1 << 8);
+        let shift_16 = Self::from_u64(1 << 16);
+        let shift_24 = Self::from_u64(1 << 24);
+        Self::add(
+            &Self::add(&Self::add(a, &Self::mul(b, &shift_8)), &Self::mul(c, &shift_16)),
+            &Self::mul(d, &shift_24),
+        )
+    }
+
+    /// Pack three components: `a + b*2^8 + c*2^16`.
+    /// Default uses generic mul+add. Fields may override with optimized implementations.
+    #[inline(always)]
+    fn pack_byte_byte_half(
+        a: &Self::BaseType,
+        b: &Self::BaseType,
+        c: &Self::BaseType,
+    ) -> Self::BaseType {
+        let shift_8 = Self::from_u64(1 << 8);
+        let shift_16 = Self::from_u64(1 << 16);
+        Self::add(&Self::add(a, &Self::mul(b, &shift_8)), &Self::mul(c, &shift_16))
+    }
+
+    /// Multiply by 2^k.
+    /// Default uses generic mul. Fields may override with shift-based implementations.
+    #[inline(always)]
+    fn mul_pow2(a: &Self::BaseType, k: u32) -> Self::BaseType {
+        Self::mul(a, &Self::from_u64(1u64 << k))
+    }
+
+    /// Returns 2^(-32) in the field.
+    /// Default computes via field inversion. Fields may override with pre-computed constants.
+    #[inline(always)]
+    fn inv_2_32() -> Self::BaseType {
+        Self::inv(&Self::from_u64(1u64 << 32)).expect("2^32 must be invertible")
+    }
 }
 
 /// Provides the Legendre symbol for an element modulo p

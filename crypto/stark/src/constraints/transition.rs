@@ -25,14 +25,30 @@ where
     fn constraint_idx(&self) -> usize;
 
     /// Evaluate for the prover. Frame has main trace in F, aux trace in E.
+    ///
+    /// Default implementation for base-field constraints: delegates to
+    /// `evaluate_prover_base` and embeds the result into E. Only used by
+    /// debug path; the hot path uses `evaluate_prover_base` directly via
+    /// `compute_transition_prover_split`.
+    ///
+    /// Extension-field constraints must override this method.
     fn evaluate_prover(
         &self,
         frame: &Frame<F, E>,
         periodic_values: &[FieldElement<F>],
-        rap_challenges: &[FieldElement<E>],
-        logup_alpha_powers: &[FieldElement<E>],
+        _rap_challenges: &[FieldElement<E>],
+        _logup_alpha_powers: &[FieldElement<E>],
         transition_evaluations: &mut [FieldElement<E>],
-    );
+    ) {
+        debug_assert!(
+            self.computes_in_base_field(),
+            "Non-base-field constraints must override evaluate_prover"
+        );
+        let idx = self.constraint_idx();
+        let mut base_buf = vec![FieldElement::<F>::zero(); idx + 1];
+        self.evaluate_prover_base(frame, periodic_values, &mut base_buf);
+        transition_evaluations[idx] = base_buf[idx].clone().to_extension();
+    }
 
     /// Whether this constraint computes entirely in the base field F.
     /// Base-field constraints use evaluate_prover_base() for F×E accumulation.
