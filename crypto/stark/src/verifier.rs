@@ -4,7 +4,7 @@ use super::{
     fri::fri_decommit::FriDecommitment,
     grinding,
     proof::stark::StarkProof,
-    traits::{AIR, TransitionEvaluationContext},
+    traits::AIR,
 };
 use crate::{
     config::Commitment,
@@ -316,14 +316,12 @@ pub trait IsStarkVerifier<
             };
         let ood_frame =
             (proof.trace_ood_evaluations).into_frame(num_main_trace_columns, air.step_size());
-        let transition_evaluation_context = TransitionEvaluationContext::new_verifier(
+        let transition_ood_frame_evaluations = air.compute_transition_verifier(
             &ood_frame,
             &periodic_values,
             &challenges.rap_challenges,
             &logup_alpha_powers,
         );
-        let transition_ood_frame_evaluations =
-            air.compute_transition(&transition_evaluation_context);
 
         let mut denominators =
             vec![FieldElement::<FieldExtension>::zero(); air.num_transition_constraints()];

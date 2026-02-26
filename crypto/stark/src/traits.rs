@@ -61,65 +61,6 @@ struct ZerofierGroupKey {
     end_exemptions: usize,
 }
 
-/// This enum is necessary because, while both the prover and verifier perform the same operations
-///  to compute transition constraints, their frames differ.
-///  The prover uses a frame containing elements from both the base field and its extension
-/// (common when working with small fields and challengers in the extension).
-/// In contrast, the verifier, lacking access to the trace and relying solely on evaluations at the challengers,
-/// works with a frame that contains only elements from the extension.
-pub enum TransitionEvaluationContext<'a, F, E>
-where
-    F: IsSubFieldOf<E>,
-    E: IsField,
-{
-    Prover {
-        frame: &'a Frame<F, E>,
-        periodic_values: &'a [FieldElement<F>],
-        rap_challenges: &'a [FieldElement<E>],
-        logup_alpha_powers: &'a [FieldElement<E>],
-    },
-    Verifier {
-        frame: &'a Frame<E, E>,
-        periodic_values: &'a [FieldElement<E>],
-        rap_challenges: &'a [FieldElement<E>],
-        logup_alpha_powers: &'a [FieldElement<E>],
-    },
-}
-
-impl<'a, F, E> TransitionEvaluationContext<'a, F, E>
-where
-    F: IsSubFieldOf<E>,
-    E: IsField,
-{
-    pub fn new_prover(
-        frame: &'a Frame<F, E>,
-        periodic_values: &'a [FieldElement<F>],
-        rap_challenges: &'a [FieldElement<E>],
-        logup_alpha_powers: &'a [FieldElement<E>],
-    ) -> Self {
-        Self::Prover {
-            frame,
-            periodic_values,
-            rap_challenges,
-            logup_alpha_powers,
-        }
-    }
-
-    pub fn new_verifier(
-        frame: &'a Frame<E, E>,
-        periodic_values: &'a [FieldElement<E>],
-        rap_challenges: &'a [FieldElement<E>],
-        logup_alpha_powers: &'a [FieldElement<E>],
-    ) -> Self {
-        Self::Verifier {
-            frame,
-            periodic_values,
-            rap_challenges,
-            logup_alpha_powers,
-        }
-    }
-}
-
 /// AIR is a representation of the Constraints
 pub trait AIR: Send + Sync {
     type Field: IsFFTField + IsSubFieldOf<Self::FieldExtension> + Send + Sync;
@@ -196,38 +137,87 @@ pub trait AIR: Send + Sync {
 
     fn composition_poly_degree_bound(&self, trace_length: usize) -> usize;
 
-    /// The method called by the prover to evaluate the transitions corresponding to an evaluation frame.
-    /// In the case of the prover, the main evaluation table of the frame takes values in
-    /// `Self::Field`, since they are the evaluations of the main trace at the LDE domain.
-    /// In the case of the verifier, the frame take elements of Self::FieldExtension.
-    fn compute_transition(
+    /// Evaluate all transition constraints for the verifier (all values in extension field).
+    fn compute_transition_verifier(
         &self,
-        evaluation_context: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
+        frame: &Frame<Self::FieldExtension, Self::FieldExtension>,
+        periodic_values: &[FieldElement<Self::FieldExtension>],
+        rap_challenges: &[FieldElement<Self::FieldExtension>],
+        logup_alpha_powers: &[FieldElement<Self::FieldExtension>],
     ) -> Vec<FieldElement<Self::FieldExtension>> {
         let mut evaluations =
             vec![FieldElement::<Self::FieldExtension>::zero(); self.num_transition_constraints()];
-        self.transition_constraints()
-            .iter()
-            .for_each(|c| c.evaluate(evaluation_context, &mut evaluations));
-
+        self.transition_constraints().iter().for_each(|c| {
+            c.evaluate_verifier(
+                frame,
+                periodic_values,
+                rap_challenges,
+                logup_alpha_powers,
+                &mut evaluations,
+            )
+        });
         evaluations
     }
 
-    /// Evaluate all transition constraints into a caller-provided buffer.
+    /// Evaluate all transition constraints for the prover into a caller-provided buffer.
     ///
-    /// Same as `compute_transition` but reuses a pre-allocated buffer, avoiding
-    /// a `Vec` allocation per LDE domain point in the prover's hot loop.
-    fn compute_transition_into(
+    /// Reuses a pre-allocated buffer, avoiding a `Vec` allocation per LDE domain point
+    /// in the prover's hot loop.
+    fn compute_transition_prover_into(
         &self,
-        evaluation_context: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
+        frame: &Frame<Self::Field, Self::FieldExtension>,
+        periodic_values: &[FieldElement<Self::Field>],
+        rap_challenges: &[FieldElement<Self::FieldExtension>],
+        logup_alpha_powers: &[FieldElement<Self::FieldExtension>],
         evaluations: &mut [FieldElement<Self::FieldExtension>],
     ) {
         for e in evaluations.iter_mut() {
             *e = FieldElement::zero();
         }
-        self.transition_constraints()
-            .iter()
-            .for_each(|c| c.evaluate(evaluation_context, evaluations));
+        self.transition_constraints().iter().for_each(|c| {
+            c.evaluate_prover(
+                frame,
+                periodic_values,
+                rap_challenges,
+                logup_alpha_powers,
+                evaluations,
+            )
+        });
+    }
+
+    /// Evaluate transition constraints split into base-field and extension-field buffers.
+    ///
+    /// Base-field constraints write to `base_evaluations` (in F), extension-field constraints
+    /// write to `ext_evaluations` (in E). The caller accumulates base-field results using
+    /// F×E arithmetic (3 base muls) instead of E×E (9 base muls).
+    fn compute_transition_prover_split(
+        &self,
+        frame: &Frame<Self::Field, Self::FieldExtension>,
+        periodic_values: &[FieldElement<Self::Field>],
+        rap_challenges: &[FieldElement<Self::FieldExtension>],
+        logup_alpha_powers: &[FieldElement<Self::FieldExtension>],
+        base_evaluations: &mut [FieldElement<Self::Field>],
+        ext_evaluations: &mut [FieldElement<Self::FieldExtension>],
+    ) {
+        for e in base_evaluations.iter_mut() {
+            *e = FieldElement::zero();
+        }
+        for e in ext_evaluations.iter_mut() {
+            *e = FieldElement::zero();
+        }
+        for c in self.transition_constraints().iter() {
+            if c.computes_in_base_field() {
+                c.evaluate_prover_base(frame, periodic_values, base_evaluations);
+            } else {
+                c.evaluate_prover(
+                    frame,
+                    periodic_values,
+                    rap_challenges,
+                    logup_alpha_powers,
+                    ext_evaluations,
+                );
+            }
+        }
     }
 
     fn boundary_constraints(

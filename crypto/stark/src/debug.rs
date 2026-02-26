@@ -1,6 +1,6 @@
 use super::domain::Domain;
 use super::trace::TraceTable;
-use super::traits::{AIR, TransitionEvaluationContext};
+use super::traits::AIR;
 use crate::lookup::{LOGUP_CHALLENGE_ALPHA, compute_alpha_powers};
 use crate::{frame::Frame, trace::LDETraceTable};
 use log::{error, info};
@@ -109,13 +109,15 @@ pub fn validate_trace<
             .iter()
             .map(|col| col[step].clone())
             .collect();
-        let transition_evaluation_context = TransitionEvaluationContext::new_prover(
+        let mut evaluations =
+            vec![FieldElement::<FieldExtension>::zero(); n_transition_constraints];
+        air.compute_transition_prover_into(
             &frame,
             &periodic_values,
             rap_challenges,
             &logup_alpha_powers,
+            &mut evaluations,
         );
-        let evaluations = air.compute_transition(&transition_evaluation_context);
 
         // Iterate over each transition evaluation. When the evaluated step is not from
         // the exemption steps corresponding to the transition, it should have zero as a

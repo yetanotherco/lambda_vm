@@ -6,9 +6,10 @@ use crate::{
         transition::TransitionConstraint,
     },
     context::AirContext,
+    frame::Frame,
     proof::options::ProofOptions,
     trace::TraceTable,
-    traits::{AIR, TransitionEvaluationContext},
+    traits::AIR,
 };
 use math::field::{
     element::FieldElement,
@@ -61,53 +62,50 @@ where
         2
     }
 
-    fn evaluate(
+    fn evaluate_prover(
         &self,
-        evaluation_context: &TransitionEvaluationContext<F, E>,
+        frame: &Frame<F, E>,
+        _periodic_values: &[FieldElement<F>],
+        _rap_challenges: &[FieldElement<E>],
+        _logup_alpha_powers: &[FieldElement<E>],
         transition_evaluations: &mut [FieldElement<E>],
     ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let step_0 = frame.get_evaluation_step(0);
-                let step_1 = frame.get_evaluation_step(1);
-                let step_2 = frame.get_evaluation_step(2);
+        let step_0 = frame.get_evaluation_step(0);
+        let step_1 = frame.get_evaluation_step(1);
+        let step_2 = frame.get_evaluation_step(2);
 
-                // Get the values from the column at each step
-                let a0 = step_0.get_main_evaluation_element(0, self.column_idx);
-                let a1 = step_1.get_main_evaluation_element(0, self.column_idx);
-                let a2 = step_2.get_main_evaluation_element(0, self.column_idx);
+        // Get the values from the column at each step
+        let a0 = step_0.get_main_evaluation_element(0, self.column_idx);
+        let a1 = step_1.get_main_evaluation_element(0, self.column_idx);
+        let a2 = step_2.get_main_evaluation_element(0, self.column_idx);
 
-                // Constraint: a2 = a1 + a0  =>  a2 - a1 - a0 = 0
-                let res = a2 - a1 - a0;
+        // Constraint: a2 = a1 + a0  =>  a2 - a1 - a0 = 0
+        let res = a2 - a1 - a0;
 
-                transition_evaluations[self.constraint_idx] = res.to_extension();
-            }
-            TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let step_0 = frame.get_evaluation_step(0);
-                let step_1 = frame.get_evaluation_step(1);
-                let step_2 = frame.get_evaluation_step(2);
+        transition_evaluations[self.constraint_idx] = res.to_extension();
+    }
 
-                // Get the values from the column at each step
-                let a0 = step_0.get_main_evaluation_element(0, self.column_idx);
-                let a1 = step_1.get_main_evaluation_element(0, self.column_idx);
-                let a2 = step_2.get_main_evaluation_element(0, self.column_idx);
+    fn evaluate_verifier(
+        &self,
+        frame: &Frame<E, E>,
+        _periodic_values: &[FieldElement<E>],
+        _rap_challenges: &[FieldElement<E>],
+        _logup_alpha_powers: &[FieldElement<E>],
+        transition_evaluations: &mut [FieldElement<E>],
+    ) {
+        let step_0 = frame.get_evaluation_step(0);
+        let step_1 = frame.get_evaluation_step(1);
+        let step_2 = frame.get_evaluation_step(2);
 
-                // Constraint: a2 = a1 + a0  =>  a2 - a1 - a0 = 0
-                let res = a2 - a1 - a0;
+        // Get the values from the column at each step
+        let a0 = step_0.get_main_evaluation_element(0, self.column_idx);
+        let a1 = step_1.get_main_evaluation_element(0, self.column_idx);
+        let a2 = step_2.get_main_evaluation_element(0, self.column_idx);
 
-                transition_evaluations[self.constraint_idx] = res;
-            }
-        }
+        // Constraint: a2 = a1 + a0  =>  a2 - a1 - a0 = 0
+        let res = a2 - a1 - a0;
+
+        transition_evaluations[self.constraint_idx] = res;
     }
 }
 

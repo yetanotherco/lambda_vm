@@ -4,9 +4,10 @@ use crate::{
         transition::TransitionConstraint,
     },
     context::AirContext,
+    frame::Frame,
     proof::options::ProofOptions,
     trace::TraceTable,
-    traits::{AIR, TransitionEvaluationContext},
+    traits::AIR,
 };
 use math::{
     field::{element::FieldElement, traits::IsFFTField},
@@ -43,26 +44,33 @@ where
         1
     }
 
-    fn evaluate(
+    fn evaluate_prover(
         &self,
-        evaluation_context: &TransitionEvaluationContext<F, F>,
+        frame: &Frame<F, F>,
+        _periodic_values: &[FieldElement<F>],
+        _rap_challenges: &[FieldElement<F>],
+        _logup_alpha_powers: &[FieldElement<F>],
         transition_evaluations: &mut [FieldElement<F>],
     ) {
-        let (frame, _periodic_values, _rap_challenges) = match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values,
-                rap_challenges,
-                ..
-            }
-            | TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values,
-                rap_challenges,
-                ..
-            } => (frame, periodic_values, rap_challenges),
-        };
+        let first_row = frame.get_evaluation_step(0);
+        let second_row = frame.get_evaluation_step(1);
 
+        let a0_1 = first_row.get_main_evaluation_element(0, 1);
+        let a1_0 = second_row.get_main_evaluation_element(0, 0);
+
+        let res = a1_0 - a0_1;
+
+        transition_evaluations[self.constraint_idx()] = res;
+    }
+
+    fn evaluate_verifier(
+        &self,
+        frame: &Frame<F, F>,
+        _periodic_values: &[FieldElement<F>],
+        _rap_challenges: &[FieldElement<F>],
+        _logup_alpha_powers: &[FieldElement<F>],
+        transition_evaluations: &mut [FieldElement<F>],
+    ) {
         let first_row = frame.get_evaluation_step(0);
         let second_row = frame.get_evaluation_step(1);
 
@@ -104,26 +112,34 @@ where
         1
     }
 
-    fn evaluate(
+    fn evaluate_prover(
         &self,
-        evaluation_context: &TransitionEvaluationContext<F, F>,
+        frame: &Frame<F, F>,
+        _periodic_values: &[FieldElement<F>],
+        _rap_challenges: &[FieldElement<F>],
+        _logup_alpha_powers: &[FieldElement<F>],
         transition_evaluations: &mut [FieldElement<F>],
     ) {
-        let (frame, _periodic_values, _rap_challenges) = match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values,
-                rap_challenges,
-                ..
-            }
-            | TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values,
-                rap_challenges,
-                ..
-            } => (frame, periodic_values, rap_challenges),
-        };
+        let first_row = frame.get_evaluation_step(0);
+        let second_row = frame.get_evaluation_step(1);
 
+        let a0_0 = first_row.get_main_evaluation_element(0, 0);
+        let a0_1 = first_row.get_main_evaluation_element(0, 1);
+        let a1_1 = second_row.get_main_evaluation_element(0, 1);
+
+        let res = a1_1 - a0_0 - a0_1;
+
+        transition_evaluations[self.constraint_idx()] = res;
+    }
+
+    fn evaluate_verifier(
+        &self,
+        frame: &Frame<F, F>,
+        _periodic_values: &[FieldElement<F>],
+        _rap_challenges: &[FieldElement<F>],
+        _logup_alpha_powers: &[FieldElement<F>],
+        transition_evaluations: &mut [FieldElement<F>],
+    ) {
         let first_row = frame.get_evaluation_step(0);
         let second_row = frame.get_evaluation_step(1);
 

@@ -10,9 +10,10 @@ use crate::{
         transition::TransitionConstraint,
     },
     context::AirContext,
+    frame::Frame,
     proof::options::ProofOptions,
     trace::TraceTable,
-    traits::{AIR, TransitionEvaluationContext},
+    traits::AIR,
 };
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use itertools::Itertools;
@@ -63,56 +64,49 @@ where
         1
     }
 
-    fn evaluate(
+    fn evaluate_prover(
         &self,
-        evaluation_context: &TransitionEvaluationContext<F, E>,
+        frame: &Frame<F, E>,
+        _periodic_values: &[FieldElement<F>],
+        _rap_challenges: &[FieldElement<E>],
+        _logup_alpha_powers: &[FieldElement<E>],
         transition_evaluations: &mut [FieldElement<E>],
     ) {
-        // In both evaluation contexts, Prover and Verfier will evaluate the transition polynomial in the same way.
-        // The only difference is that the Prover's Frame has base field and field extension elements,
-        // while the Verfier's Frame has only field extension elements.
-        match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values: _periodic_values,
-                rap_challenges: _rap_challenges,
-                ..
-            } => {
-                let first_step = frame.get_evaluation_step(0);
-                let second_step = frame.get_evaluation_step(1);
+        let first_step = frame.get_evaluation_step(0);
+        let second_step = frame.get_evaluation_step(1);
 
-                let a_sorted_0 = first_step.get_main_evaluation_element(0, 2);
-                let a_sorted_1 = second_step.get_main_evaluation_element(0, 2);
-                // (a'_{i+1} - a'_i)(a'_{i+1} - a'_i - 1) = 0 where a' is the sorted address
-                let res = (a_sorted_1 - a_sorted_0)
-                    * (a_sorted_1 - a_sorted_0 - FieldElement::<F>::one());
+        let a_sorted_0 = first_step.get_main_evaluation_element(0, 2);
+        let a_sorted_1 = second_step.get_main_evaluation_element(0, 2);
+        // (a'_{i+1} - a'_i)(a'_{i+1} - a'_i - 1) = 0 where a' is the sorted address
+        let res = (a_sorted_1 - a_sorted_0)
+            * (a_sorted_1 - a_sorted_0 - FieldElement::<F>::one());
 
-                // The eval always exists, except if the constraint idx were incorrectly defined.
-                if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx()) {
-                    *eval = res.to_extension();
-                }
-            }
+        // The eval always exists, except if the constraint idx were incorrectly defined.
+        if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx()) {
+            *eval = res.to_extension();
+        }
+    }
 
-            TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values: _periodic_values,
-                rap_challenges: _rap_challenges,
-                ..
-            } => {
-                let first_step = frame.get_evaluation_step(0);
-                let second_step = frame.get_evaluation_step(1);
+    fn evaluate_verifier(
+        &self,
+        frame: &Frame<E, E>,
+        _periodic_values: &[FieldElement<E>],
+        _rap_challenges: &[FieldElement<E>],
+        _logup_alpha_powers: &[FieldElement<E>],
+        transition_evaluations: &mut [FieldElement<E>],
+    ) {
+        let first_step = frame.get_evaluation_step(0);
+        let second_step = frame.get_evaluation_step(1);
 
-                let a_sorted_0 = first_step.get_main_evaluation_element(0, 2);
-                let a_sorted_1 = second_step.get_main_evaluation_element(0, 2);
-                // (a'_{i+1} - a'_i)(a'_{i+1} - a'_i - 1) = 0 where a' is the sorted address
-                let res = (a_sorted_1 - a_sorted_0)
-                    * (a_sorted_1 - a_sorted_0 - FieldElement::<E>::one());
+        let a_sorted_0 = first_step.get_main_evaluation_element(0, 2);
+        let a_sorted_1 = second_step.get_main_evaluation_element(0, 2);
+        // (a'_{i+1} - a'_i)(a'_{i+1} - a'_i - 1) = 0 where a' is the sorted address
+        let res = (a_sorted_1 - a_sorted_0)
+            * (a_sorted_1 - a_sorted_0 - FieldElement::<E>::one());
 
-                // The eval always exists, except if the constraint idx were incorrectly defined.
-                if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx()) {
-                    *eval = res;
-                }
-            }
+        // The eval always exists, except if the constraint idx were incorrectly defined.
+        if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx()) {
+            *eval = res;
         }
     }
 }
@@ -157,60 +151,53 @@ where
         1
     }
 
-    fn evaluate(
+    fn evaluate_prover(
         &self,
-        evaluation_context: &TransitionEvaluationContext<F, E>,
+        frame: &Frame<F, E>,
+        _periodic_values: &[FieldElement<F>],
+        _rap_challenges: &[FieldElement<E>],
+        _logup_alpha_powers: &[FieldElement<E>],
         transition_evaluations: &mut [FieldElement<E>],
     ) {
-        // In both evaluation contexts, Prover and Verfier will evaluate the transition polynomial in the same way.
-        // The only difference is that the Prover's Frame has base field and field extension elements,
-        // while the Verfier's Frame has only field extension elements.
-        match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values: _periodic_values,
-                rap_challenges: _rap_challenges,
-                ..
-            } => {
-                let first_step = frame.get_evaluation_step(0);
-                let second_step = frame.get_evaluation_step(1);
+        let first_step = frame.get_evaluation_step(0);
+        let second_step = frame.get_evaluation_step(1);
 
-                let a_sorted_0 = first_step.get_main_evaluation_element(0, 2);
-                let a_sorted_1 = second_step.get_main_evaluation_element(0, 2);
-                let v_sorted_0 = first_step.get_main_evaluation_element(0, 3);
-                let v_sorted_1 = second_step.get_main_evaluation_element(0, 3);
-                // (v'_{i+1} - v'_i) * (a'_{i+1} - a'_i - 1) = 0
-                let res = (v_sorted_1 - v_sorted_0)
-                    * (a_sorted_1 - a_sorted_0 - FieldElement::<F>::one());
+        let a_sorted_0 = first_step.get_main_evaluation_element(0, 2);
+        let a_sorted_1 = second_step.get_main_evaluation_element(0, 2);
+        let v_sorted_0 = first_step.get_main_evaluation_element(0, 3);
+        let v_sorted_1 = second_step.get_main_evaluation_element(0, 3);
+        // (v'_{i+1} - v'_i) * (a'_{i+1} - a'_i - 1) = 0
+        let res = (v_sorted_1 - v_sorted_0)
+            * (a_sorted_1 - a_sorted_0 - FieldElement::<F>::one());
 
-                // The eval always exists, except if the constraint idx were incorrectly defined.
-                if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx()) {
-                    *eval = res.to_extension();
-                }
-            }
+        // The eval always exists, except if the constraint idx were incorrectly defined.
+        if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx()) {
+            *eval = res.to_extension();
+        }
+    }
 
-            TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values: _periodic_values,
-                rap_challenges: _rap_challenges,
-                ..
-            } => {
-                let first_step = frame.get_evaluation_step(0);
-                let second_step = frame.get_evaluation_step(1);
+    fn evaluate_verifier(
+        &self,
+        frame: &Frame<E, E>,
+        _periodic_values: &[FieldElement<E>],
+        _rap_challenges: &[FieldElement<E>],
+        _logup_alpha_powers: &[FieldElement<E>],
+        transition_evaluations: &mut [FieldElement<E>],
+    ) {
+        let first_step = frame.get_evaluation_step(0);
+        let second_step = frame.get_evaluation_step(1);
 
-                let a_sorted_0 = first_step.get_main_evaluation_element(0, 2);
-                let a_sorted_1 = second_step.get_main_evaluation_element(0, 2);
-                let v_sorted_0 = first_step.get_main_evaluation_element(0, 3);
-                let v_sorted_1 = second_step.get_main_evaluation_element(0, 3);
-                // (v'_{i+1} - v'_i) * (a'_{i+1} - a'_i - 1) = 0
-                let res = (v_sorted_1 - v_sorted_0)
-                    * (a_sorted_1 - a_sorted_0 - FieldElement::<E>::one());
+        let a_sorted_0 = first_step.get_main_evaluation_element(0, 2);
+        let a_sorted_1 = second_step.get_main_evaluation_element(0, 2);
+        let v_sorted_0 = first_step.get_main_evaluation_element(0, 3);
+        let v_sorted_1 = second_step.get_main_evaluation_element(0, 3);
+        // (v'_{i+1} - v'_i) * (a'_{i+1} - a'_i - 1) = 0
+        let res = (v_sorted_1 - v_sorted_0)
+            * (a_sorted_1 - a_sorted_0 - FieldElement::<E>::one());
 
-                // The eval always exists, except if the constraint idx were incorrectly defined.
-                if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx()) {
-                    *eval = res;
-                }
-            }
+        // The eval always exists, except if the constraint idx were incorrectly defined.
+        if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx()) {
+            *eval = res;
         }
     }
 }
@@ -257,94 +244,87 @@ where
         1
     }
 
-    fn evaluate(
+    fn evaluate_prover(
         &self,
-        evaluation_context: &TransitionEvaluationContext<F, E>,
+        frame: &Frame<F, E>,
+        _periodic_values: &[FieldElement<F>],
+        rap_challenges: &[FieldElement<E>],
+        _logup_alpha_powers: &[FieldElement<E>],
         transition_evaluations: &mut [FieldElement<E>],
     ) {
-        // In both evaluation contexts, Prover and Verfier will evaluate the transition polynomial in the same way.
-        // The only difference is that the Prover's Frame has base field and field extension elements,
-        // while the Verfier's Frame has only field extension elements.
-        match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values: _periodic_values,
-                rap_challenges,
-                ..
-            } => {
-                let first_step = frame.get_evaluation_step(0);
-                let second_step = frame.get_evaluation_step(1);
+        let first_step = frame.get_evaluation_step(0);
+        let second_step = frame.get_evaluation_step(1);
 
-                // Auxiliary frame elements
-                let s0 = first_step.get_aux_evaluation_element(0, 0);
-                let s1 = second_step.get_aux_evaluation_element(0, 0);
+        // Auxiliary frame elements
+        let s0 = first_step.get_aux_evaluation_element(0, 0);
+        let s1 = second_step.get_aux_evaluation_element(0, 0);
 
-                // Challenges
-                let z = &rap_challenges[0];
-                let alpha = &rap_challenges[1];
+        // Challenges
+        let z = &rap_challenges[0];
+        let alpha = &rap_challenges[1];
 
-                // Main frame elements
-                let a1 = second_step.get_main_evaluation_element(0, 0);
-                let v1 = second_step.get_main_evaluation_element(0, 1);
-                let a_sorted_1 = second_step.get_main_evaluation_element(0, 2);
-                let v_sorted_1 = second_step.get_main_evaluation_element(0, 3);
-                let m = second_step.get_main_evaluation_element(0, 4);
+        // Main frame elements
+        let a1 = second_step.get_main_evaluation_element(0, 0);
+        let v1 = second_step.get_main_evaluation_element(0, 1);
+        let a_sorted_1 = second_step.get_main_evaluation_element(0, 2);
+        let v_sorted_1 = second_step.get_main_evaluation_element(0, 3);
+        let m = second_step.get_main_evaluation_element(0, 4);
 
-                let unsorted_term = -(a1 + v1 * alpha) + z;
-                let sorted_term = -(a_sorted_1 + v_sorted_1 * alpha) + z;
+        let unsorted_term = -(a1 + v1 * alpha) + z;
+        let sorted_term = -(a_sorted_1 + v_sorted_1 * alpha) + z;
 
-                // We are using the following LogUp equation:
-                // s1 = s0 + m / sorted_term - 1/unsorted_term.
-                // Since constraints must be expressed without division, we multiply each term by sorted_term * unsorted_term:
-                let res = s0 * &unsorted_term * &sorted_term + m * &unsorted_term
-                    - &sorted_term
-                    - s1 * unsorted_term * sorted_term;
+        // We are using the following LogUp equation:
+        // s1 = s0 + m / sorted_term - 1/unsorted_term.
+        // Since constraints must be expressed without division, we multiply each term by sorted_term * unsorted_term:
+        let res = s0 * &unsorted_term * &sorted_term + m * &unsorted_term
+            - &sorted_term
+            - s1 * unsorted_term * sorted_term;
 
-                // The eval always exists, except if the constraint idx were incorrectly defined.
-                if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx()) {
-                    *eval = res;
-                }
-            }
+        // The eval always exists, except if the constraint idx were incorrectly defined.
+        if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx()) {
+            *eval = res;
+        }
+    }
 
-            TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values: _periodic_values,
-                rap_challenges,
-                ..
-            } => {
-                let first_step = frame.get_evaluation_step(0);
-                let second_step = frame.get_evaluation_step(1);
+    fn evaluate_verifier(
+        &self,
+        frame: &Frame<E, E>,
+        _periodic_values: &[FieldElement<E>],
+        rap_challenges: &[FieldElement<E>],
+        _logup_alpha_powers: &[FieldElement<E>],
+        transition_evaluations: &mut [FieldElement<E>],
+    ) {
+        let first_step = frame.get_evaluation_step(0);
+        let second_step = frame.get_evaluation_step(1);
 
-                // Auxiliary frame elements
-                let s0 = first_step.get_aux_evaluation_element(0, 0);
-                let s1 = second_step.get_aux_evaluation_element(0, 0);
+        // Auxiliary frame elements
+        let s0 = first_step.get_aux_evaluation_element(0, 0);
+        let s1 = second_step.get_aux_evaluation_element(0, 0);
 
-                // Challenges
-                let z = &rap_challenges[0];
-                let alpha = &rap_challenges[1];
+        // Challenges
+        let z = &rap_challenges[0];
+        let alpha = &rap_challenges[1];
 
-                // Main frame elements
-                let a1 = second_step.get_main_evaluation_element(0, 0);
-                let v1 = second_step.get_main_evaluation_element(0, 1);
-                let a_sorted_1 = second_step.get_main_evaluation_element(0, 2);
-                let v_sorted_1 = second_step.get_main_evaluation_element(0, 3);
-                let m = second_step.get_main_evaluation_element(0, 4);
+        // Main frame elements
+        let a1 = second_step.get_main_evaluation_element(0, 0);
+        let v1 = second_step.get_main_evaluation_element(0, 1);
+        let a_sorted_1 = second_step.get_main_evaluation_element(0, 2);
+        let v_sorted_1 = second_step.get_main_evaluation_element(0, 3);
+        let m = second_step.get_main_evaluation_element(0, 4);
 
-                let unsorted_term = z - (a1 + alpha * v1);
-                let sorted_term = z - (a_sorted_1 + alpha * v_sorted_1);
+        let unsorted_term = z - (a1 + alpha * v1);
+        let sorted_term = z - (a_sorted_1 + alpha * v_sorted_1);
 
-                // We are using the following LogUp equation:
-                // s1 = s0 + m / sorted_term - 1/unsorted_term.
-                // Since constraints must be expressed without division, we multiply each term by sorted_term * unsorted_term:
-                let res = s0 * &unsorted_term * &sorted_term + m * &unsorted_term
-                    - &sorted_term
-                    - s1 * unsorted_term * sorted_term;
+        // We are using the following LogUp equation:
+        // s1 = s0 + m / sorted_term - 1/unsorted_term.
+        // Since constraints must be expressed without division, we multiply each term by sorted_term * unsorted_term:
+        let res = s0 * &unsorted_term * &sorted_term + m * &unsorted_term
+            - &sorted_term
+            - s1 * unsorted_term * sorted_term;
 
-                // The eval always exists, except if the constraint idx were incorrectly defined.
-                if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx()) {
-                    *eval = res;
-                }
-            }
+        // The eval always exists, except if the constraint idx were incorrectly defined.
+        if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx()) {
+            *eval = res;
         }
     }
 }

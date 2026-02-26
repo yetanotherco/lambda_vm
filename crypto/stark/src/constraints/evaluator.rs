@@ -5,7 +5,7 @@ use crate::domain::Domain;
 use crate::lookup::BusPublicInputs;
 use crate::lookup::{LOGUP_CHALLENGE_ALPHA, compute_alpha_powers};
 use crate::trace::LDETraceTable;
-use crate::traits::{AIR, TransitionEvaluationContext, ZerofierEvaluations};
+use crate::traits::{AIR, ZerofierEvaluations};
 use crate::{frame::Frame, prover::evaluate_polynomial_on_lde_domain};
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 #[cfg(not(feature = "parallel"))]
@@ -54,9 +54,6 @@ where
         let is_uniform = zerofier_data.is_uniform();
 
         // Pre-compute LogUp alpha powers once for all LDE domain points.
-        // Each LookupTermConstraint::evaluate reuses these instead of computing
-        // incremental alpha_power = alpha_power * alpha per call.
-        // 32 powers is generous (max bus elements per interaction is ~15).
         let logup_alpha_powers: Vec<FieldElement<FieldExtension>> =
             if rap_challenges.len() > LOGUP_CHALLENGE_ALPHA {
                 compute_alpha_powers(&rap_challenges[LOGUP_CHALLENGE_ALPHA], 32)
@@ -64,10 +61,22 @@ where
                 Vec::new()
             };
 
-        // Per-thread buffers via map_init: each Rayon worker allocates once,
-        // then reuses for all iterations assigned to that thread.
-        // The Frame is pre-allocated and filled in-place to avoid Vec allocations
-        // on every LDE point (a significant fraction of total CPU time).
+        // Pre-compute constraint index partitions (base-field vs extension-field).
+        // Base-field constraints use F×E accumulation (3 base muls per term),
+        // extension-field constraints use E×E (9 base muls per term).
+        let constraints = air.transition_constraints();
+        let base_indices: Vec<usize> = constraints
+            .iter()
+            .filter(|c| c.computes_in_base_field())
+            .map(|c| c.constraint_idx())
+            .collect();
+        let ext_indices: Vec<usize> = constraints
+            .iter()
+            .filter(|c| !c.computes_in_base_field())
+            .map(|c| c.constraint_idx())
+            .collect();
+        let has_base_field_constraints = !base_indices.is_empty();
+
         let blowup_factor = lde_trace.blowup_factor;
         let lde_step_size = lde_trace.lde_step_size;
         let rows_per_step = lde_step_size / blowup_factor;
@@ -83,6 +92,7 @@ where
                 .map_init(
                     || {
                         (
+                            vec![FieldElement::<Field>::zero(); num_transition],
                             vec![FieldElement::<FieldExtension>::zero(); num_transition],
                             vec![FieldElement::<Field>::zero(); num_periodic],
                             Frame::preallocate(
@@ -93,37 +103,64 @@ where
                             ),
                         )
                     },
-                    |(transition_buf, periodic_buf, frame), (i, boundary)| {
+                    |(base_buf, ext_buf, periodic_buf, frame), (i, boundary)| {
                         frame.fill_from_lde(lde_trace, i, offsets);
 
                         for (j, col) in lde_periodic_columns.iter().enumerate() {
                             periodic_buf[j] = col[i].clone();
                         }
 
-                        let ctx = TransitionEvaluationContext::new_prover(
-                            frame,
-                            periodic_buf,
-                            rap_challenges,
-                            &logup_alpha_powers,
-                        );
-                        air.compute_transition_into(&ctx, transition_buf);
+                        if has_base_field_constraints {
+                            air.compute_transition_prover_split(
+                                frame,
+                                periodic_buf,
+                                rap_challenges,
+                                &logup_alpha_powers,
+                                base_buf,
+                                ext_buf,
+                            );
+                        } else {
+                            air.compute_transition_prover_into(
+                                frame,
+                                periodic_buf,
+                                rap_challenges,
+                                &logup_alpha_powers,
+                                ext_buf,
+                            );
+                        }
 
                         let acc_transition = if is_uniform {
-                            // All constraints share one zerofier: factor it out of the sum.
                             let z = zerofier_data.get_uniform(i);
-                            let sum = transition_buf
-                                .iter()
-                                .zip(transition_coefficients)
-                                .fold(FieldElement::zero(), |acc, (eval, beta)| acc + eval * beta);
-                            z * &sum
+
+                            // Base-field: F × E → E (3 base muls per term)
+                            let base_sum: FieldElement<FieldExtension> = base_indices.iter().fold(
+                                FieldElement::zero(),
+                                |acc, &idx| acc + &base_buf[idx] * &transition_coefficients[idx],
+                            );
+
+                            // Extension-field: E × E → E (9 base muls per term)
+                            let ext_sum: FieldElement<FieldExtension> = ext_indices.iter().fold(
+                                FieldElement::zero(),
+                                |acc, &idx| acc + &ext_buf[idx] * &transition_coefficients[idx],
+                            );
+
+                            z * &(base_sum + ext_sum)
                         } else {
-                            transition_buf
-                                .iter()
-                                .enumerate()
-                                .zip(transition_coefficients)
-                                .fold(FieldElement::zero(), |acc, ((c_idx, eval), beta)| {
-                                    acc + zerofier_data.get(c_idx, i) * eval * beta
-                                })
+                            let base_sum: FieldElement<FieldExtension> =
+                                base_indices.iter().fold(FieldElement::zero(), |acc, &idx| {
+                                    acc + zerofier_data.get(idx, i)
+                                        * &base_buf[idx]
+                                        * &transition_coefficients[idx]
+                                });
+
+                            let ext_sum: FieldElement<FieldExtension> =
+                                ext_indices.iter().fold(FieldElement::zero(), |acc, &idx| {
+                                    acc + zerofier_data.get(idx, i)
+                                        * &ext_buf[idx]
+                                        * &transition_coefficients[idx]
+                                });
+
+                            base_sum + ext_sum
                         };
 
                         acc_transition + boundary
@@ -135,7 +172,8 @@ where
 
         #[cfg(not(feature = "parallel"))]
         {
-            let mut transition_buf = vec![FieldElement::<FieldExtension>::zero(); num_transition];
+            let mut base_buf = vec![FieldElement::<Field>::zero(); num_transition];
+            let mut ext_buf = vec![FieldElement::<FieldExtension>::zero(); num_transition];
             let mut periodic_buf = vec![FieldElement::<Field>::zero(); num_periodic];
             let mut frame =
                 Frame::preallocate(num_offsets, rows_per_step, num_main_cols, num_aux_cols);
@@ -150,29 +188,55 @@ where
                         periodic_buf[j] = col[i].clone();
                     }
 
-                    let ctx = TransitionEvaluationContext::new_prover(
-                        &frame,
-                        &periodic_buf,
-                        rap_challenges,
-                        &logup_alpha_powers,
-                    );
-                    air.compute_transition_into(&ctx, &mut transition_buf);
+                    if has_base_field_constraints {
+                        air.compute_transition_prover_split(
+                            &frame,
+                            &periodic_buf,
+                            rap_challenges,
+                            &logup_alpha_powers,
+                            &mut base_buf,
+                            &mut ext_buf,
+                        );
+                    } else {
+                        air.compute_transition_prover_into(
+                            &frame,
+                            &periodic_buf,
+                            rap_challenges,
+                            &logup_alpha_powers,
+                            &mut ext_buf,
+                        );
+                    }
 
                     let acc_transition = if is_uniform {
                         let z = zerofier_data.get_uniform(i);
-                        let sum = transition_buf
-                            .iter()
-                            .zip(transition_coefficients)
-                            .fold(FieldElement::zero(), |acc, (eval, beta)| acc + eval * beta);
-                        z * &sum
+
+                        let base_sum: FieldElement<FieldExtension> = base_indices.iter().fold(
+                            FieldElement::zero(),
+                            |acc, &idx| acc + &base_buf[idx] * &transition_coefficients[idx],
+                        );
+
+                        let ext_sum: FieldElement<FieldExtension> = ext_indices.iter().fold(
+                            FieldElement::zero(),
+                            |acc, &idx| acc + &ext_buf[idx] * &transition_coefficients[idx],
+                        );
+
+                        z * &(base_sum + ext_sum)
                     } else {
-                        transition_buf
-                            .iter()
-                            .enumerate()
-                            .zip(transition_coefficients)
-                            .fold(FieldElement::zero(), |acc, ((c_idx, eval), beta)| {
-                                acc + zerofier_data.get(c_idx, i) * eval * beta
-                            })
+                        let base_sum: FieldElement<FieldExtension> =
+                            base_indices.iter().fold(FieldElement::zero(), |acc, &idx| {
+                                acc + zerofier_data.get(idx, i)
+                                    * &base_buf[idx]
+                                    * &transition_coefficients[idx]
+                            });
+
+                        let ext_sum: FieldElement<FieldExtension> =
+                            ext_indices.iter().fold(FieldElement::zero(), |acc, &idx| {
+                                acc + zerofier_data.get(idx, i)
+                                    * &ext_buf[idx]
+                                    * &transition_coefficients[idx]
+                            });
+
+                        base_sum + ext_sum
                     };
 
                     acc_transition + boundary

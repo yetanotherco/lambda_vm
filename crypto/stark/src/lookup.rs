@@ -8,10 +8,10 @@ use crate::{
         transition::TransitionConstraint,
     },
     context::AirContext,
+    frame::Frame,
     proof::options::ProofOptions,
     table::TableView,
     trace::TraceTable,
-    traits::TransitionEvaluationContext,
 };
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use math::field::{
@@ -1391,6 +1391,194 @@ where
     (bus_sums, sender_sums, receiver_sums)
 }
 
+/// Helper: evaluate term constraint for a generic frame step.
+/// Used by both prover and verifier paths.
+fn evaluate_term_constraint<A: IsSubFieldOf<B>, B: IsField>(
+    step: &TableView<A, B>,
+    term_column_idx: usize,
+    interaction: &BusInteraction,
+    rap_challenges: &&[FieldElement<B>],
+    alpha_powers: &[FieldElement<B>],
+) -> FieldElement<B> {
+    let term = step.get_aux_evaluation_element(0, term_column_idx);
+    let z = &rap_challenges[LOGUP_CHALLENGE_Z];
+
+    let multiplicity: FieldElement<A> = compute_multiplicity_from_step(step, &interaction.multiplicity);
+    let fingerprint = compute_fingerprint_from_step(step, interaction, z, alpha_powers);
+
+    let sign = if interaction.is_sender {
+        FieldElement::<B>::one()
+    } else {
+        -FieldElement::<B>::one()
+    };
+
+    term * &fingerprint - multiplicity * sign
+}
+
+/// Compute multiplicity value from a table view step.
+fn compute_multiplicity_from_step<A: IsSubFieldOf<B>, B: IsField>(
+    step: &TableView<A, B>,
+    multiplicity: &Multiplicity,
+) -> FieldElement<A> {
+    match multiplicity {
+        Multiplicity::One => FieldElement::<A>::one(),
+        Multiplicity::Column(col) => step.get_main_evaluation_element(0, *col).clone(),
+        Multiplicity::Sum(col_a, col_b) => {
+            step.get_main_evaluation_element(0, *col_a)
+                + step.get_main_evaluation_element(0, *col_b)
+        }
+        Multiplicity::Negated(col) => {
+            FieldElement::<A>::one() - step.get_main_evaluation_element(0, *col)
+        }
+        Multiplicity::Linear(terms) => {
+            let mut result = FieldElement::<A>::zero();
+            for term in terms {
+                match term {
+                    LinearTerm::Column { coefficient, column } => {
+                        let coeff = FieldElement::<A>::from(*coefficient);
+                        result += step.get_main_evaluation_element(0, *column) * coeff;
+                    }
+                    LinearTerm::ColumnUnsigned { coefficient, column } => {
+                        let coeff = FieldElement::<A>::from(*coefficient);
+                        result += step.get_main_evaluation_element(0, *column) * coeff;
+                    }
+                    LinearTerm::Constant(value) => {
+                        result += FieldElement::<A>::from(*value);
+                    }
+                }
+            }
+            result
+        }
+    }
+}
+
+/// Compute fingerprint from a table view step.
+fn compute_fingerprint_from_step<A: IsSubFieldOf<B>, B: IsField>(
+    step: &TableView<A, B>,
+    interaction: &BusInteraction,
+    z: &FieldElement<B>,
+    alpha_powers: &[FieldElement<B>],
+) -> FieldElement<B> {
+    let bus_id_f = FieldElement::<A>::from(interaction.bus_id);
+    let mut linear_combination = &bus_id_f * &alpha_powers[0];
+    #[allow(unused_assignments)]
+    let mut alpha_idx: usize = 1;
+    for bv in &interaction.values {
+        match bv {
+            BusValue::Packed { start_column, packing } => {
+                match packing {
+                    Packing::Direct => {
+                        linear_combination += step.get_main_evaluation_element(0, *start_column) * &alpha_powers[alpha_idx];
+                        alpha_idx += 1;
+                    }
+                    Packing::Word2L => {
+                        let shift_16 = FieldElement::<A>::from(SHIFT_16);
+                        let combined = step.get_main_evaluation_element(0, *start_column)
+                            + step.get_main_evaluation_element(0, *start_column + 1) * &shift_16;
+                        linear_combination += &combined * &alpha_powers[alpha_idx];
+                        alpha_idx += 1;
+                    }
+                    Packing::Word4L => {
+                        let shift_8 = FieldElement::<A>::from(SHIFT_8);
+                        let shift_16 = FieldElement::<A>::from(SHIFT_16);
+                        let shift_24 = &shift_8 * &shift_16;
+                        let combined = step.get_main_evaluation_element(0, *start_column)
+                            + step.get_main_evaluation_element(0, *start_column + 1) * &shift_8
+                            + step.get_main_evaluation_element(0, *start_column + 2) * &shift_16
+                            + step.get_main_evaluation_element(0, *start_column + 3) * &shift_24;
+                        linear_combination += &combined * &alpha_powers[alpha_idx];
+                        alpha_idx += 1;
+                    }
+                    Packing::DWordWL => {
+                        linear_combination += step.get_main_evaluation_element(0, *start_column) * &alpha_powers[alpha_idx];
+                        linear_combination += step.get_main_evaluation_element(0, *start_column + 1) * &alpha_powers[alpha_idx + 1];
+                        alpha_idx += 2;
+                    }
+                    Packing::DWordHL => {
+                        let shift_16 = FieldElement::<A>::from(SHIFT_16);
+                        let w0 = step.get_main_evaluation_element(0, *start_column)
+                            + step.get_main_evaluation_element(0, *start_column + 1) * &shift_16;
+                        linear_combination += &w0 * &alpha_powers[alpha_idx];
+                        let w1 = step.get_main_evaluation_element(0, *start_column + 2)
+                            + step.get_main_evaluation_element(0, *start_column + 3) * &shift_16;
+                        linear_combination += &w1 * &alpha_powers[alpha_idx + 1];
+                        alpha_idx += 2;
+                    }
+                    Packing::DWordBL => {
+                        let shift_8 = FieldElement::<A>::from(SHIFT_8);
+                        let shift_16 = FieldElement::<A>::from(SHIFT_16);
+                        let shift_24 = &shift_8 * &shift_16;
+                        let w0 = step.get_main_evaluation_element(0, *start_column)
+                            + step.get_main_evaluation_element(0, *start_column + 1) * &shift_8
+                            + step.get_main_evaluation_element(0, *start_column + 2) * &shift_16
+                            + step.get_main_evaluation_element(0, *start_column + 3) * &shift_24;
+                        linear_combination += &w0 * &alpha_powers[alpha_idx];
+                        let w1 = step.get_main_evaluation_element(0, *start_column + 4)
+                            + step.get_main_evaluation_element(0, *start_column + 5) * &shift_8
+                            + step.get_main_evaluation_element(0, *start_column + 6) * &shift_16
+                            + step.get_main_evaluation_element(0, *start_column + 7) * &shift_24;
+                        linear_combination += &w1 * &alpha_powers[alpha_idx + 1];
+                        alpha_idx += 2;
+                    }
+                    Packing::DWordHHW => {
+                        linear_combination += step.get_main_evaluation_element(0, *start_column) * &alpha_powers[alpha_idx];
+                        let shift_16 = FieldElement::<A>::from(SHIFT_16);
+                        let w = step.get_main_evaluation_element(0, *start_column + 1)
+                            + step.get_main_evaluation_element(0, *start_column + 2) * &shift_16;
+                        linear_combination += &w * &alpha_powers[alpha_idx + 1];
+                        alpha_idx += 2;
+                    }
+                    Packing::DWordWHH => {
+                        let shift_16 = FieldElement::<A>::from(SHIFT_16);
+                        let w = step.get_main_evaluation_element(0, *start_column)
+                            + step.get_main_evaluation_element(0, *start_column + 1) * &shift_16;
+                        linear_combination += &w * &alpha_powers[alpha_idx];
+                        linear_combination += step.get_main_evaluation_element(0, *start_column + 2) * &alpha_powers[alpha_idx + 1];
+                        alpha_idx += 2;
+                    }
+                    Packing::QuadHL => {
+                        let shift_16 = FieldElement::<A>::from(SHIFT_16);
+                        for i in 0..4 {
+                            let c = *start_column + i * 2;
+                            let w = step.get_main_evaluation_element(0, c)
+                                + step.get_main_evaluation_element(0, c + 1) * &shift_16;
+                            linear_combination += &w * &alpha_powers[alpha_idx + i];
+                        }
+                        alpha_idx += 4;
+                    }
+                    Packing::QuadWL => {
+                        for i in 0..4 {
+                            linear_combination += step.get_main_evaluation_element(0, *start_column + i) * &alpha_powers[alpha_idx + i];
+                        }
+                        alpha_idx += 4;
+                    }
+                }
+            }
+            BusValue::Linear(terms) => {
+                let mut result = FieldElement::<A>::zero();
+                for term in terms {
+                    match term {
+                        LinearTerm::Column { coefficient, column } => {
+                            let coeff = FieldElement::<A>::from(*coefficient);
+                            result += step.get_main_evaluation_element(0, *column) * coeff;
+                        }
+                        LinearTerm::ColumnUnsigned { coefficient, column } => {
+                            let coeff = FieldElement::<A>::from(*coefficient);
+                            result += step.get_main_evaluation_element(0, *column) * coeff;
+                        }
+                        LinearTerm::Constant(value) => {
+                            result += FieldElement::<A>::from(*value);
+                        }
+                    }
+                }
+                linear_combination += &result * &alpha_powers[alpha_idx];
+                alpha_idx += 1;
+            }
+        }
+    }
+    z - &linear_combination
+}
+
 /// Constraint for each term column.
 ///
 /// Verifies: `term[i] = sign * multiplicity[i] / fingerprint[i]`
@@ -1436,268 +1624,62 @@ where
         0 // Check all rows including the last
     }
 
-    fn evaluate(
+    fn evaluate_prover(
         &self,
-        evaluation_context: &TransitionEvaluationContext<F, E>,
+        frame: &Frame<F, E>,
+        _periodic_values: &[FieldElement<F>],
+        rap_challenges: &[FieldElement<E>],
+        logup_alpha_powers: &[FieldElement<E>],
         transition_evaluations: &mut [FieldElement<E>],
     ) {
-        fn evaluate_term_constraint<A: IsSubFieldOf<B>, B: IsField>(
-            step: &TableView<A, B>,
-            term_column_idx: usize,
-            interaction: &BusInteraction,
-            rap_challenges: &&[FieldElement<B>],
-            alpha_powers: &[FieldElement<B>],
-        ) -> FieldElement<B> {
-            // Term column value
-            let term = step.get_aux_evaluation_element(0, term_column_idx);
-
-            let z = &rap_challenges[LOGUP_CHALLENGE_Z];
-
-            // Compute multiplicity based on the Multiplicity variant
-            let multiplicity: FieldElement<A> = match &interaction.multiplicity {
-                Multiplicity::One => FieldElement::<A>::one(),
-                Multiplicity::Column(col) => step.get_main_evaluation_element(0, *col).clone(),
-                Multiplicity::Sum(col_a, col_b) => {
-                    step.get_main_evaluation_element(0, *col_a)
-                        + step.get_main_evaluation_element(0, *col_b)
-                }
-                Multiplicity::Negated(col) => {
-                    FieldElement::<A>::one() - step.get_main_evaluation_element(0, *col)
-                }
-                Multiplicity::Linear(terms) => {
-                    let mut result = FieldElement::<A>::zero();
-                    for term in terms {
-                        match term {
-                            LinearTerm::Column {
-                                coefficient,
-                                column,
-                            } => {
-                                let coeff = FieldElement::<A>::from(*coefficient);
-                                result += step.get_main_evaluation_element(0, *column) * coeff;
-                            }
-                            LinearTerm::ColumnUnsigned {
-                                coefficient,
-                                column,
-                            } => {
-                                let coeff = FieldElement::<A>::from(*coefficient);
-                                result += step.get_main_evaluation_element(0, *column) * coeff;
-                            }
-                            LinearTerm::Constant(value) => {
-                                result += FieldElement::<A>::from(*value);
-                            }
-                        }
-                    }
-                    result
-                }
-            };
-
-            // Compute fingerprint using pre-computed alpha powers (indexed access).
-            // fingerprint = z - (bus_id*α^0 + v[0]*α^1 + v[1]*α^2 + ...)
-            // alpha_powers[0] = 1, alpha_powers[1] = α, alpha_powers[2] = α², ...
-            let bus_id_f = FieldElement::<A>::from(interaction.bus_id);
-            let mut linear_combination = &bus_id_f * &alpha_powers[0];
-            #[allow(unused_assignments)]
-            let mut alpha_idx: usize = 1;
-            for bv in &interaction.values {
-                match bv {
-                    BusValue::Packed {
-                        start_column,
-                        packing,
-                    } => {
-                        match packing {
-                            Packing::Direct => {
-                                linear_combination += step
-                                    .get_main_evaluation_element(0, *start_column)
-                                    * &alpha_powers[alpha_idx];
-                                alpha_idx += 1;
-                            }
-                            Packing::Word2L => {
-                                let shift_16 = FieldElement::<A>::from(SHIFT_16);
-                                let combined = step.get_main_evaluation_element(0, *start_column)
-                                    + step.get_main_evaluation_element(0, *start_column + 1)
-                                        * &shift_16;
-                                linear_combination += &combined * &alpha_powers[alpha_idx];
-                                alpha_idx += 1;
-                            }
-                            Packing::Word4L => {
-                                let shift_8 = FieldElement::<A>::from(SHIFT_8);
-                                let shift_16 = FieldElement::<A>::from(SHIFT_16);
-                                let shift_24 = &shift_8 * &shift_16;
-                                let combined = step.get_main_evaluation_element(0, *start_column)
-                                    + step.get_main_evaluation_element(0, *start_column + 1)
-                                        * &shift_8
-                                    + step.get_main_evaluation_element(0, *start_column + 2)
-                                        * &shift_16
-                                    + step.get_main_evaluation_element(0, *start_column + 3)
-                                        * &shift_24;
-                                linear_combination += &combined * &alpha_powers[alpha_idx];
-                                alpha_idx += 1;
-                            }
-                            Packing::DWordWL => {
-                                // 2× Direct
-                                linear_combination += step
-                                    .get_main_evaluation_element(0, *start_column)
-                                    * &alpha_powers[alpha_idx];
-                                linear_combination += step
-                                    .get_main_evaluation_element(0, *start_column + 1)
-                                    * &alpha_powers[alpha_idx + 1];
-                                alpha_idx += 2;
-                            }
-                            Packing::DWordHL => {
-                                // 2× Word2L
-                                let shift_16 = FieldElement::<A>::from(SHIFT_16);
-                                let w0 = step.get_main_evaluation_element(0, *start_column)
-                                    + step.get_main_evaluation_element(0, *start_column + 1)
-                                        * &shift_16;
-                                linear_combination += &w0 * &alpha_powers[alpha_idx];
-                                let w1 = step.get_main_evaluation_element(0, *start_column + 2)
-                                    + step.get_main_evaluation_element(0, *start_column + 3)
-                                        * &shift_16;
-                                linear_combination += &w1 * &alpha_powers[alpha_idx + 1];
-                                alpha_idx += 2;
-                            }
-                            Packing::DWordBL => {
-                                // 2× Word4L
-                                let shift_8 = FieldElement::<A>::from(SHIFT_8);
-                                let shift_16 = FieldElement::<A>::from(SHIFT_16);
-                                let shift_24 = &shift_8 * &shift_16;
-                                let w0 = step.get_main_evaluation_element(0, *start_column)
-                                    + step.get_main_evaluation_element(0, *start_column + 1)
-                                        * &shift_8
-                                    + step.get_main_evaluation_element(0, *start_column + 2)
-                                        * &shift_16
-                                    + step.get_main_evaluation_element(0, *start_column + 3)
-                                        * &shift_24;
-                                linear_combination += &w0 * &alpha_powers[alpha_idx];
-                                let w1 = step.get_main_evaluation_element(0, *start_column + 4)
-                                    + step.get_main_evaluation_element(0, *start_column + 5)
-                                        * &shift_8
-                                    + step.get_main_evaluation_element(0, *start_column + 6)
-                                        * &shift_16
-                                    + step.get_main_evaluation_element(0, *start_column + 7)
-                                        * &shift_24;
-                                linear_combination += &w1 * &alpha_powers[alpha_idx + 1];
-                                alpha_idx += 2;
-                            }
-                            Packing::DWordHHW => {
-                                // Direct + Word2L
-                                linear_combination += step
-                                    .get_main_evaluation_element(0, *start_column)
-                                    * &alpha_powers[alpha_idx];
-                                let shift_16 = FieldElement::<A>::from(SHIFT_16);
-                                let w = step.get_main_evaluation_element(0, *start_column + 1)
-                                    + step.get_main_evaluation_element(0, *start_column + 2)
-                                        * &shift_16;
-                                linear_combination += &w * &alpha_powers[alpha_idx + 1];
-                                alpha_idx += 2;
-                            }
-                            Packing::DWordWHH => {
-                                // Word2L + Direct
-                                let shift_16 = FieldElement::<A>::from(SHIFT_16);
-                                let w = step.get_main_evaluation_element(0, *start_column)
-                                    + step.get_main_evaluation_element(0, *start_column + 1)
-                                        * &shift_16;
-                                linear_combination += &w * &alpha_powers[alpha_idx];
-                                linear_combination += step
-                                    .get_main_evaluation_element(0, *start_column + 2)
-                                    * &alpha_powers[alpha_idx + 1];
-                                alpha_idx += 2;
-                            }
-                            Packing::QuadHL => {
-                                // 4× Word2L
-                                let shift_16 = FieldElement::<A>::from(SHIFT_16);
-                                for i in 0..4 {
-                                    let c = *start_column + i * 2;
-                                    let w = step.get_main_evaluation_element(0, c)
-                                        + step.get_main_evaluation_element(0, c + 1) * &shift_16;
-                                    linear_combination += &w * &alpha_powers[alpha_idx + i];
-                                }
-                                alpha_idx += 4;
-                            }
-                            Packing::QuadWL => {
-                                // 4× Direct
-                                for i in 0..4 {
-                                    linear_combination += step
-                                        .get_main_evaluation_element(0, *start_column + i)
-                                        * &alpha_powers[alpha_idx + i];
-                                }
-                                alpha_idx += 4;
-                            }
-                        }
-                    }
-                    BusValue::Linear(terms) => {
-                        let mut result = FieldElement::<A>::zero();
-                        for term in terms {
-                            match term {
-                                LinearTerm::Column {
-                                    coefficient,
-                                    column,
-                                } => {
-                                    let coeff = FieldElement::<A>::from(*coefficient);
-                                    result += step.get_main_evaluation_element(0, *column) * coeff;
-                                }
-                                LinearTerm::ColumnUnsigned {
-                                    coefficient,
-                                    column,
-                                } => {
-                                    let coeff = FieldElement::<A>::from(*coefficient);
-                                    result += step.get_main_evaluation_element(0, *column) * coeff;
-                                }
-                                LinearTerm::Constant(value) => {
-                                    result += FieldElement::<A>::from(*value);
-                                }
-                            }
-                        }
-                        linear_combination += &result * &alpha_powers[alpha_idx];
-                        alpha_idx += 1;
-                    }
-                }
-            }
-            let fingerprint = z - &linear_combination;
-
-            // Sign: +1 for senders, -1 for receivers
-            let sign = if interaction.is_sender {
-                FieldElement::<B>::one()
-            } else {
-                -FieldElement::<B>::one()
-            };
-
-            // Constraint: term * fingerprint = sign * multiplicity
-            // Rearranged: term * fingerprint - sign * multiplicity = 0
-            term * &fingerprint - multiplicity * sign
-        }
-
-        let res = match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                rap_challenges,
-                logup_alpha_powers,
-                ..
-            } => evaluate_term_constraint(
-                frame.get_evaluation_step(0),
-                self.term_column_idx,
-                &self.interaction,
-                rap_challenges,
-                logup_alpha_powers,
-            ),
-            TransitionEvaluationContext::Verifier {
-                frame,
-                rap_challenges,
-                logup_alpha_powers,
-                ..
-            } => evaluate_term_constraint(
-                frame.get_evaluation_step(0),
-                self.term_column_idx,
-                &self.interaction,
-                rap_challenges,
-                logup_alpha_powers,
-            ),
-        };
-
+        let res = evaluate_term_constraint(
+            frame.get_evaluation_step(0),
+            self.term_column_idx,
+            &self.interaction,
+            &rap_challenges,
+            logup_alpha_powers,
+        );
         if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx) {
             *eval = res;
         }
     }
+
+    fn evaluate_verifier(
+        &self,
+        frame: &Frame<E, E>,
+        _periodic_values: &[FieldElement<E>],
+        rap_challenges: &[FieldElement<E>],
+        logup_alpha_powers: &[FieldElement<E>],
+        transition_evaluations: &mut [FieldElement<E>],
+    ) {
+        let res = evaluate_term_constraint(
+            frame.get_evaluation_step(0),
+            self.term_column_idx,
+            &self.interaction,
+            &rap_challenges,
+            logup_alpha_powers,
+        );
+        if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx) {
+            *eval = res;
+        }
+    }
+}
+
+/// Helper: evaluate accumulated constraint for a generic frame step pair.
+fn evaluate_accumulated_constraint<A: IsSubFieldOf<B>, B: IsField>(
+    first_step: &TableView<A, B>,
+    second_step: &TableView<A, B>,
+    acc_column_idx: usize,
+    num_term_columns: usize,
+) -> FieldElement<B> {
+    let acc_curr = first_step.get_aux_evaluation_element(0, acc_column_idx);
+    let acc_next = second_step.get_aux_evaluation_element(0, acc_column_idx);
+
+    let terms_sum: FieldElement<B> = (0..num_term_columns)
+        .map(|i| second_step.get_aux_evaluation_element(0, i).clone())
+        .sum();
+
+    acc_next - acc_curr - terms_sum
 }
 
 /// Constraint for the accumulated column.
@@ -1743,46 +1725,39 @@ where
         1 // Last row doesn't have a "next row"
     }
 
-    fn evaluate(
+    fn evaluate_prover(
         &self,
-        evaluation_context: &TransitionEvaluationContext<F, E>,
+        frame: &Frame<F, E>,
+        _periodic_values: &[FieldElement<F>],
+        _rap_challenges: &[FieldElement<E>],
+        _logup_alpha_powers: &[FieldElement<E>],
         transition_evaluations: &mut [FieldElement<E>],
     ) {
-        fn evaluate_accumulated_constraint<A: IsSubFieldOf<B>, B: IsField>(
-            first_step: &TableView<A, B>,
-            second_step: &TableView<A, B>,
-            acc_column_idx: usize,
-            num_term_columns: usize,
-        ) -> FieldElement<B> {
-            // Accumulated column values
-            let acc_curr = first_step.get_aux_evaluation_element(0, acc_column_idx);
-            let acc_next = second_step.get_aux_evaluation_element(0, acc_column_idx);
-
-            // Sum of all term columns at the next step
-            let terms_sum: FieldElement<B> = (0..num_term_columns)
-                .map(|i| second_step.get_aux_evaluation_element(0, i).clone())
-                .sum();
-
-            // Constraint: acc[i+1] = acc[i] + sum of terms at row i+1
-            // Rearranged: acc[i+1] - acc[i] - terms_sum = 0
-            acc_next - acc_curr - terms_sum
+        let res = evaluate_accumulated_constraint(
+            frame.get_evaluation_step(0),
+            frame.get_evaluation_step(1),
+            self.acc_column_idx,
+            self.num_term_columns,
+        );
+        if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx) {
+            *eval = res;
         }
+    }
 
-        let res = match evaluation_context {
-            TransitionEvaluationContext::Prover { frame, .. } => evaluate_accumulated_constraint(
-                frame.get_evaluation_step(0),
-                frame.get_evaluation_step(1),
-                self.acc_column_idx,
-                self.num_term_columns,
-            ),
-            TransitionEvaluationContext::Verifier { frame, .. } => evaluate_accumulated_constraint(
-                frame.get_evaluation_step(0),
-                frame.get_evaluation_step(1),
-                self.acc_column_idx,
-                self.num_term_columns,
-            ),
-        };
-
+    fn evaluate_verifier(
+        &self,
+        frame: &Frame<E, E>,
+        _periodic_values: &[FieldElement<E>],
+        _rap_challenges: &[FieldElement<E>],
+        _logup_alpha_powers: &[FieldElement<E>],
+        transition_evaluations: &mut [FieldElement<E>],
+    ) {
+        let res = evaluate_accumulated_constraint(
+            frame.get_evaluation_step(0),
+            frame.get_evaluation_step(1),
+            self.acc_column_idx,
+            self.num_term_columns,
+        );
         if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx) {
             *eval = res;
         }

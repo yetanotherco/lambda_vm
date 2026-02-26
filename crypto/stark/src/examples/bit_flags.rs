@@ -1,9 +1,10 @@
 use crate::{
     constraints::{boundary::BoundaryConstraints, transition::TransitionConstraint},
     context::AirContext,
+    frame::Frame,
     proof::options::ProofOptions,
     trace::TraceTable,
-    traits::{AIR, TransitionEvaluationContext},
+    traits::AIR,
 };
 use math::field::{element::FieldElement, fields::fft_friendly::u64_goldilocks::GoldilocksField};
 
@@ -39,26 +40,36 @@ impl TransitionConstraint<StarkField, StarkField> for BitConstraint {
         0
     }
 
-    fn evaluate(
+    fn evaluate_prover(
         &self,
-        evaluation_context: &TransitionEvaluationContext<StarkField, StarkField>,
+        frame: &Frame<StarkField, StarkField>,
+        _periodic_values: &[FieldElement<StarkField>],
+        _rap_challenges: &[FieldElement<StarkField>],
+        _logup_alpha_powers: &[FieldElement<StarkField>],
         transition_evaluations: &mut [FieldElement<StarkField>],
     ) {
-        let (frame, _periodic_values, _rap_challenges) = match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values,
-                rap_challenges,
-                ..
-            }
-            | TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values,
-                rap_challenges,
-                ..
-            } => (frame, periodic_values, rap_challenges),
-        };
+        let step = frame.get_evaluation_step(0);
 
+        let prefix_flag = step.get_main_evaluation_element(0, 0);
+        let next_prefix_flag = step.get_main_evaluation_element(1, 0);
+
+        let two = Felt::from(2);
+        let one = Felt::one();
+        let bit_flag = prefix_flag - two * next_prefix_flag;
+
+        let bit_constraint = bit_flag * (bit_flag - one);
+
+        transition_evaluations[self.constraint_idx()] = bit_constraint;
+    }
+
+    fn evaluate_verifier(
+        &self,
+        frame: &Frame<StarkField, StarkField>,
+        _periodic_values: &[FieldElement<StarkField>],
+        _rap_challenges: &[FieldElement<StarkField>],
+        _logup_alpha_powers: &[FieldElement<StarkField>],
+        transition_evaluations: &mut [FieldElement<StarkField>],
+    ) {
         let step = frame.get_evaluation_step(0);
 
         let prefix_flag = step.get_main_evaluation_element(0, 0);
@@ -99,26 +110,28 @@ impl TransitionConstraint<StarkField, StarkField> for ZeroFlagConstraint {
         16
     }
 
-    fn evaluate(
+    fn evaluate_prover(
         &self,
-        evaluation_context: &TransitionEvaluationContext<StarkField, StarkField>,
+        frame: &Frame<StarkField, StarkField>,
+        _periodic_values: &[FieldElement<StarkField>],
+        _rap_challenges: &[FieldElement<StarkField>],
+        _logup_alpha_powers: &[FieldElement<StarkField>],
         transition_evaluations: &mut [FieldElement<StarkField>],
     ) {
-        let (frame, _periodic_values, _rap_challenges) = match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values,
-                rap_challenges,
-                ..
-            }
-            | TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values,
-                rap_challenges,
-                ..
-            } => (frame, periodic_values, rap_challenges),
-        };
+        let step = frame.get_evaluation_step(0);
+        let zero_flag = step.get_main_evaluation_element(15, 0);
 
+        transition_evaluations[self.constraint_idx()] = *zero_flag;
+    }
+
+    fn evaluate_verifier(
+        &self,
+        frame: &Frame<StarkField, StarkField>,
+        _periodic_values: &[FieldElement<StarkField>],
+        _rap_challenges: &[FieldElement<StarkField>],
+        _logup_alpha_powers: &[FieldElement<StarkField>],
+        transition_evaluations: &mut [FieldElement<StarkField>],
+    ) {
         let step = frame.get_evaluation_step(0);
         let zero_flag = step.get_main_evaluation_element(15, 0);
 

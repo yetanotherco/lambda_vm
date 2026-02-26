@@ -2,11 +2,12 @@ use std::ops::Div;
 
 use crate::domain::Domain;
 use crate::prover::evaluate_polynomial_on_lde_domain;
-use crate::traits::TransitionEvaluationContext;
 use itertools::Itertools;
 use math::field::element::FieldElement;
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use math::polynomial::Polynomial;
+
+use super::super::frame::Frame;
 
 /// TransitionConstraint represents the behaviour that a transition constraint
 /// over the computation that wants to be proven must comply with.
@@ -23,17 +24,40 @@ where
     /// where N is the total number of transition constraints.
     fn constraint_idx(&self) -> usize;
 
-    /// The function representing the evaluation of the constraint over elements
-    /// of the trace table.
-    ///
-    /// Elements of the trace table are found in the `frame` input, and depending on the
-    /// constraint, elements of `periodic_values` and `rap_challenges` may be used in
-    /// the evaluation.
-    /// Once computed, the evaluation should be inserted in the `transition_evaluations`
-    /// vector, in the index corresponding to the constraint as given by `constraint_idx()`.
-    fn evaluate(
+    /// Evaluate for the prover. Frame has main trace in F, aux trace in E.
+    fn evaluate_prover(
         &self,
-        evaluation_context: &TransitionEvaluationContext<F, E>,
+        frame: &Frame<F, E>,
+        periodic_values: &[FieldElement<F>],
+        rap_challenges: &[FieldElement<E>],
+        logup_alpha_powers: &[FieldElement<E>],
+        transition_evaluations: &mut [FieldElement<E>],
+    );
+
+    /// Whether this constraint computes entirely in the base field F.
+    /// Base-field constraints use evaluate_prover_base() for F×E accumulation.
+    fn computes_in_base_field(&self) -> bool {
+        false
+    }
+
+    /// Evaluate in base field for prover path.
+    /// Only called when computes_in_base_field() is true.
+    fn evaluate_prover_base(
+        &self,
+        _frame: &Frame<F, E>,
+        _periodic_values: &[FieldElement<F>],
+        _base_evaluations: &mut [FieldElement<F>],
+    ) {
+        unimplemented!("not a base-field constraint")
+    }
+
+    /// Evaluate for the verifier. All values are in E.
+    fn evaluate_verifier(
+        &self,
+        frame: &Frame<E, E>,
+        periodic_values: &[FieldElement<E>],
+        rap_challenges: &[FieldElement<E>],
+        logup_alpha_powers: &[FieldElement<E>],
         transition_evaluations: &mut [FieldElement<E>],
     );
 
