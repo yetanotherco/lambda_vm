@@ -332,7 +332,8 @@ impl Arg1LowerConstraint {
         F: IsSubFieldOf<E>,
         E: IsField,
     {
-        let arg1_lo = pack_bytes_to_word(step, cols::ARG1_0, cols::ARG1_1, cols::ARG1_2, cols::ARG1_3);
+        let arg1_lo =
+            pack_bytes_to_word(step, cols::ARG1_0, cols::ARG1_1, cols::ARG1_2, cols::ARG1_3);
 
         // rv1 is DWordWHH: [Half(0-15), Half(16-31), Word(32-63)]
         // rv1::DWordWL[0] = rv1[0] + rv1[1] * 2^16
@@ -405,7 +406,8 @@ impl Arg1UpperConstraint {
         F: IsSubFieldOf<E>,
         E: IsField,
     {
-        let arg1_hi = pack_bytes_to_word(step, cols::ARG1_4, cols::ARG1_5, cols::ARG1_6, cols::ARG1_7);
+        let arg1_hi =
+            pack_bytes_to_word(step, cols::ARG1_4, cols::ARG1_5, cols::ARG1_6, cols::ARG1_7);
 
         // rv1 is DWordWHH: rv1[2] IS the upper 32 bits directly (Word)
         let rv1_upper = step.get_main_evaluation_element(0, cols::RV1_2);
@@ -809,7 +811,13 @@ impl Arg2LowerConstraint {
         F: IsSubFieldOf<E>,
         E: IsField,
     {
-        let arg2_lo = pack_bytes_to_word(step, cols::ARG2[0], cols::ARG2[1], cols::ARG2[2], cols::ARG2[3]);
+        let arg2_lo = pack_bytes_to_word(
+            step,
+            cols::ARG2[0],
+            cols::ARG2[1],
+            cols::ARG2[2],
+            cols::ARG2[3],
+        );
 
         // rv2 is DWordWHH: rv2[:2] = rv2[0] + rv2[1] * 2^16
         let rv2_0 = step.get_main_evaluation_element(0, cols::RV2_0);
@@ -885,7 +893,13 @@ impl Arg2UpperConstraint {
         F: IsSubFieldOf<E>,
         E: IsField,
     {
-        let arg2_hi = pack_bytes_to_word(step, cols::ARG2[4], cols::ARG2[5], cols::ARG2[6], cols::ARG2[7]);
+        let arg2_hi = pack_bytes_to_word(
+            step,
+            cols::ARG2[4],
+            cols::ARG2[5],
+            cols::ARG2[6],
+            cols::ARG2[7],
+        );
 
         // rv2 is DWordWHH: rv2[2] IS the upper 32 bits directly (Word)
         let rv2_upper = step.get_main_evaluation_element(0, cols::RV2_2);
@@ -975,7 +989,8 @@ impl RvdLowerConstraint {
         // rvd[0] is lower word
         let rvd_0 = step.get_main_evaluation_element(0, cols::RVD_0);
 
-        let res_lo = pack_bytes_to_word(step, cols::RES[0], cols::RES[1], cols::RES[2], cols::RES[3]);
+        let res_lo =
+            pack_bytes_to_word(step, cols::RES[0], cols::RES[1], cols::RES[2], cols::RES[3]);
 
         let load = step.get_main_evaluation_element(0, cols::LOAD);
         let one = FieldElement::<F>::one();
@@ -1038,7 +1053,8 @@ impl RvdUpperConstraint {
         // rvd[1] is upper word
         let rvd_1 = step.get_main_evaluation_element(0, cols::RVD_1);
 
-        let res_hi = pack_bytes_to_word(step, cols::RES[4], cols::RES[5], cols::RES[6], cols::RES[7]);
+        let res_hi =
+            pack_bytes_to_word(step, cols::RES[4], cols::RES[5], cols::RES[6], cols::RES[7]);
 
         let load = step.get_main_evaluation_element(0, cols::LOAD);
         let word_instr = step.get_main_evaluation_element(0, cols::WORD_INSTR);
