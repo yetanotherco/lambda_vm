@@ -362,7 +362,6 @@ pub trait IsStarkProver<
         Some(commitment)
     }
 
-
     /// Compute LDE evaluations directly from column data using the fused coset LDE.
     ///
     /// Uses a single `coset_lde` call per column. Twiddle factors and coset weights are
@@ -1516,13 +1515,7 @@ pub trait IsStarkProver<
                     &mut main_pool,
                 )?
             } else {
-                Self::commit_main_trace(
-                    *trace,
-                    domain,
-                    transcript,
-                    twiddles,
-                    &mut main_pool,
-                )?
+                Self::commit_main_trace(*trace, domain, transcript, twiddles, &mut main_pool)?
             };
 
             main_commits.push(MainCommitData {
