@@ -37,11 +37,10 @@ pub fn fold_polynomial_doubled_inplace<F>(
 mod tests {
     use super::fold_polynomial_doubled_inplace;
     use math::field::element::FieldElement;
-    use math::field::fields::u64_prime_field::U64PrimeField;
+    use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
     use math::polynomial::Polynomial;
 
-    const MODULUS: u64 = 293;
-    type FE = FieldElement<U64PrimeField<MODULUS>>;
+    type FE = FieldElement<GoldilocksField>;
 
     /// FRI polynomial folding: computes P_even(x) + beta * P_odd(x)
     /// where P(x) = P_even(x^2) + x * P_odd(x^2)

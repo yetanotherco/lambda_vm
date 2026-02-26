@@ -11,11 +11,11 @@ use crate::{
     traits::{AIR, TransitionEvaluationContext},
 };
 use math::field::{
-    element::FieldElement, fields::fft_friendly::stark_252_prime_field::Stark252PrimeField,
+    element::FieldElement, fields::fft_friendly::u64_goldilocks::GoldilocksField,
     traits::IsFFTField,
 };
 
-type StarkField = Stark252PrimeField;
+type StarkField = GoldilocksField;
 
 #[derive(Clone)]
 struct FibConstraint<F: IsFFTField> {

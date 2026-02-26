@@ -655,22 +655,22 @@ fn partial_order_works() {
         "b99323f09e135c631a80e01b452e68dd6ad3315e5776b713af4a2d7f5f9a2a75",
     );
 
-    assert!(&a <= &a);
-    assert!(&a >= &a);
-    assert!(&a >= &a);
-    assert!(&a <= &a);
-    assert!(&a < &(&a + U256::from_u64(1)));
-    assert!(&a <= &(&a + U256::from_u64(1)));
-    assert!(&a + U256::from_u64(1) > a);
-    assert!((&a + U256::from_u64(1) >= a));
-    assert!(&a <= &c);
-    assert!(&a < &c);
-    assert!(&a < &c);
-    assert!(&a <= &c);
-    assert!(&c > &a);
-    assert!(&c >= &a);
-    assert!(&c >= &a);
-    assert!(&c > &a);
+    assert!(a <= a);
+    assert!(a >= a);
+    assert!(a >= a);
+    assert!(a <= a);
+    assert!(a < (a + U256::from_u64(1)));
+    assert!(a <= (a + U256::from_u64(1)));
+    assert!(a + U256::from_u64(1) > a);
+    assert!((a + U256::from_u64(1) >= a));
+    assert!(a <= c);
+    assert!(a < c);
+    assert!(a < c);
+    assert!(a <= c);
+    assert!(c > a);
+    assert!(c >= a);
+    assert!(c >= a);
+    assert!(c > a);
     assert!(a < c);
 }
 
@@ -770,7 +770,7 @@ fn shift_left_on_256_bit_integer_works_6() {
     let b = U256::from_hex_unchecked(
         "2ed786ab132f0b5b0cacd385dd51de3a00000000000000000000000000000000",
     );
-    assert_eq!(&a << (64 * 2), b);
+    assert_eq!(a << (64 * 2), b);
 }
 
 #[test]
@@ -778,7 +778,7 @@ fn shift_left_on_256_bit_integer_works_7() {
     let a = U256::from_hex_unchecked("90823e0bd707f");
     let b =
         U256::from_hex_unchecked("90823e0bd707f000000000000000000000000000000000000000000000000");
-    assert_eq!(&a << (64 * 3), b);
+    assert_eq!(a << (64 * 3), b);
 }
 
 #[test]
@@ -835,7 +835,7 @@ fn shift_right_on_256_bit_integer_works_7() {
         "6a9ce35d8940a5ebd29604ce9a182ade76f03f7e9965760b84a8cfd1d3dd2e61",
     );
     let b = U256::from_hex_unchecked("6a9ce35d8940a5eb");
-    assert_eq!(&a >> (64 * 3), b);
+    assert_eq!(a >> (64 * 3), b);
 }
 
 #[test]
@@ -844,7 +844,7 @@ fn shift_right_on_256_bit_integer_works_8() {
         "5322c128ec84081b6c376c108ebd7fd36bbd44f71ee5e6ad6bcb3dd1c5265bd7",
     );
     let b = U256::from_hex_unchecked("5322c128ec84081b6c376c108ebd7fd3");
-    assert_eq!(&a >> (64 * 2), b);
+    assert_eq!(a >> (64 * 2), b);
 }
 
 #[test]

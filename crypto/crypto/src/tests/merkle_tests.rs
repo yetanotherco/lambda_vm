@@ -1,6 +1,6 @@
 use core::marker::PhantomData;
 
-use math::field::{element::FieldElement, fields::u64_prime_field::U64PrimeField, traits::IsField};
+use math::field::{element::FieldElement, test_fields::u64_test_field::U64Field, traits::IsField};
 
 use crate::merkle_tree::{merkle::MerkleTree, proof::BatchProof, traits::IsMerkleTreeBackend};
 
@@ -39,7 +39,7 @@ where
 }
 
 const MODULUS: u64 = 13;
-type U64PF = U64PrimeField<MODULUS>;
+type U64PF = U64Field<MODULUS>;
 type FE = FieldElement<U64PF>;
 
 #[test]
@@ -53,7 +53,7 @@ fn build_merkle_tree_from_a_power_of_two_list_of_values() {
 // expected | 8 | 7 | 1 | 6 | 1 | 7 | 7 | 2 | 4 | 6 | 8 | 10 | 10 | 10 | 10 |
 fn build_merkle_tree_from_an_odd_set_of_leaves() {
     const MODULUS: u64 = 13;
-    type U64PF = U64PrimeField<MODULUS>;
+    type U64PF = U64Field<MODULUS>;
     type FE = FieldElement<U64PF>;
 
     let values: Vec<FE> = (1..6).map(FE::new).collect();
@@ -64,7 +64,7 @@ fn build_merkle_tree_from_an_odd_set_of_leaves() {
 #[test]
 fn build_merkle_tree_from_a_single_value() {
     const MODULUS: u64 = 13;
-    type U64PF = U64PrimeField<MODULUS>;
+    type U64PF = U64Field<MODULUS>;
     type FE = FieldElement<U64PF>;
 
     let values: Vec<FE> = vec![FE::new(1)]; // Single element
@@ -85,7 +85,7 @@ fn batch_proof_len_is_expected() {
 #[test]
 fn batch_proof_is_expected() {
     const MODULUS: u64 = 70;
-    type U64PF = U64PrimeField<MODULUS>;
+    type U64PF = U64Field<MODULUS>;
     type FE = FieldElement<U64PF>;
 
     let values: Vec<FE> = (1..=8).map(FE::new).collect();
@@ -100,7 +100,7 @@ fn batch_proof_is_expected() {
 #[test]
 fn batch_proof_larger_path_contains_expected_elements() {
     const MODULUS: u64 = 70;
-    type U64PF = U64PrimeField<MODULUS>;
+    type U64PF = U64Field<MODULUS>;
     type FE = FieldElement<U64PF>;
 
     let values: Vec<FE> = (1..=16).map(FE::new).collect();
@@ -127,7 +127,7 @@ fn batch_proof_larger_path_contains_expected_elements() {
 #[test]
 fn batch_proof_len_is_expected_for_long_pos_list() {
     const MODULUS: u64 = 70;
-    type U64PF = U64PrimeField<MODULUS>;
+    type U64PF = U64Field<MODULUS>;
     type FE = FieldElement<U64PF>;
 
     let values: Vec<FE> = (1..=16).map(FE::new).collect();
