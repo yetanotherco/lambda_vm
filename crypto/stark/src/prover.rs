@@ -1603,6 +1603,11 @@ pub trait IsStarkProver<
                 &mut aux_pool,
             )?;
 
+            // Bind table_contribution (L) to transcript for defense-in-depth.
+            if let Some(ref bpi) = round_1_result.bus_public_inputs {
+                table_transcript.append_field_element(&bpi.table_contribution);
+            }
+
             let proof = Self::prove_rounds_2_to_4(
                 *air,
                 *pub_inputs,
