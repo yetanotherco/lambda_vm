@@ -52,7 +52,7 @@ impl ProofOptions {
     /// These options should never be used in production.
     pub fn default_test_options() -> Self {
         Self {
-            blowup_factor: 2,
+            blowup_factor: 4,
             fri_number_of_queries: 3,
             coset_offset: 3,
             grinding_factor: 1,

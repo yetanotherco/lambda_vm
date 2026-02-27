@@ -119,7 +119,7 @@ fn rejects_security_below_grinding() {
 #[test]
 fn test_options_unchanged() {
     let opts = ProofOptions::default_test_options();
-    assert_eq!(opts.blowup_factor, 2);
+    assert_eq!(opts.blowup_factor, 4);
     assert_eq!(opts.fri_number_of_queries, 3);
     assert_eq!(opts.grinding_factor, 1);
 }
