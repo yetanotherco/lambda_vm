@@ -8,22 +8,8 @@
 
 #let neg = raw(chip.name)
 
-#let highlighted_code(code) = {
-  box(
-    inset: (left: 4pt, right: 4pt), 
-    outset: (top: 4pt, bottom: 4pt), 
-    radius: 2pt,
-    fill: luma(230), 
-    raw(code))
-}
-
 #neg is a constraint template that is used to assert that $#`neg` = -#`x`$, under the condition that `cond` is non-zero.
-
-= Notation
-The #neg constraint template has the following interface:
-#block(radius: 5pt, width: 100%, inset: 1.5em, fill: luma(230), raw("cond => NEG<neg; x>"))
-where `cond` is a bit value (i.e., lies in ${0, 1}$)  described by an expression _of degree at most $1$_.
-#highlighted_code("NEG<neg; x>") can be used to denote the _unconditional_ application of the #neg template to `x` and `neg` (which is equivalent to $#`cond` = 1$).
+It requires `cond` to be a bit.
 
 = Variables
 #render_chip_column_table(chip, config)

@@ -1,16 +1,16 @@
-#import "/book.typ": style, meta
+#import "/book.typ": meta, common-formatting
 
 #set document(author: meta.authors, title: meta.title)
 
-#style.update((
-  foreground: black,
-))
-
 #align(center, title(meta.title))
+#align(center, text(style: "italic", fill: luma(40%))[Version #meta.version])
+#align(center, meta.authors.join(", "))
 #pagebreak(weak: true)
 #outline()
 
+#show: common-formatting
 #show heading: set heading(numbering: "1.1")
+#show raw.where(block: true): set block(fill: luma(230))
 
 #meta.summary.map(((ch, title, ref)) => [
   #pagebreak(weak: true)

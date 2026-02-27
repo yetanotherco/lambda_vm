@@ -133,7 +133,7 @@ pad = 0
 # Assumptions
 
 [[assumptions]]
-desc = "`IS_HALFWORD[in[i]]`"
+desc = "`IS_HALF[in[i]]`"
 iter = ["i", 0, 3]
 ref = "shift:a:range_in"
 

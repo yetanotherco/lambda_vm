@@ -130,21 +130,21 @@ iter = ["i", 0, 1]
 
 [[constraints.defs]]
 kind = "interaction"
-tag = "IS_HALFWORD"
+tag = "IS_HALF"
 input = [["idx", "lhs", 1]]
 multiplicity = "μ"
 ref = "lt:c:range_lhs"
 
 [[constraints.defs]]
 kind = "interaction"
-tag = "IS_HALFWORD"
+tag = "IS_HALF"
 input = [["idx", "rhs", 1]]
 multiplicity = "μ"
 ref = "lt:c:range_rhs"
 
 [[constraints.sub]]
 kind = "interaction"
-tag = "IS_HALFWORD"
+tag = "IS_HALF"
 input = [["idx", "lhs_sub_rhs", "i"]]
 iter = ["i", 0, 3]
 multiplicity = "μ"

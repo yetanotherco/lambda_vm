@@ -13,6 +13,13 @@
 
 #show: book-page(chip.name)
 
+#let memw = raw(chip.name)
+
+The #memw chip is used to read and write memory locations (both RAM and registers)
+in chunks of 1, 2, 4 or 8 values.
+It introduces the old value and last-accessed timestamps of memory addresses internally,
+in order to satisfy the design of the memory argument (@memory).
+
 = Columns
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
@@ -56,4 +63,4 @@ This chip contributes the following to the lookup argument.
 - MEMB chip that deals does a one-byte write to remove old_timestamp from here (uncertain tradeoffs)
 - Compute `base_address[1] + 1` once and have high words of `address_add` as Words
 - Improve overflow trapping somehow so we don't need `LT` (could tie into previous one by checking carry bit of the +1)
-- Adding `μ_sum`/`w2`/`w4`/`write8` multiplicities to the `IS_HALFWORD` lookups may make some GKR things faster if there are known zeroes.
+- Adding `μ_sum`/`w2`/`w4`/`write8` multiplicities to the `IS_HALF` lookups may make some GKR things faster if there are known zeroes.

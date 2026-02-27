@@ -53,7 +53,7 @@ output = "DWordWL"
 [[signatures]]
 tag = "BRANCH"
 kind = "interaction"
-input = ["DWordWL", "Word", "DWordWL", "Bit"]
+input = ["DWordWL", "DWordWL", "DWordWL", "Bit"]
 output = "DWordWL"
 
 # MEMW[old; is_register, base_address, value, timestamp, write2, write4, write8]
@@ -102,6 +102,18 @@ output = "DWordWL"
 tag = "ECALL"
 kind = "interaction"
 input = ["DWordWL", "DWordWL"]
+
+# CNB[timestamp, index, address, count]
+[[signatures]]
+tag = "CNB"
+kind = "interaction"
+input = ["DWordWL", "BaseField", "DWordWL", "DWordWL"]
+
+# COMMIT[index, value]
+[[signatures]]
+tag = "COMMIT"
+kind = "interaction"
+input = ["BaseField", "Byte"]
 
 # AND_BYTE[res; X, Y]
 [[signatures]]
@@ -176,3 +188,9 @@ tag = "HWSLC"
 kind = "interaction"
 input = ["Half", "B4"]
 output = "Half"
+
+# The actual memory tokens, see MEMW and PAGE
+[[signatures]]
+tag = "memory"
+kind = "interaction"
+input = ["Bit", "DWordWL", "DWordWL", "BaseField"]

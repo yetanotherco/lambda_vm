@@ -2,8 +2,7 @@ name = "PAGE"
 
 # Input
 
-# TODO: add `page` as "constant" column or smth
-[[variables.input]]
+[[variables.constant]]
 name = "page"
 type = "DWordWL"
 desc = "Constant column containing the page base address; should be integrated into the constraints directly"
@@ -55,7 +54,7 @@ multiplicity = 1
 [[constraints.all]]
 kind = "interaction"
 tag = "memory"
-input = [0, "address", 0, "init"]
+input = [0, "address", ["cast", 0, "DWordWL"], "init"]
 multiplicity = -1
 
 [[constraints.all]]
