@@ -1,3 +1,4 @@
+pub mod barycentric_tests;
 pub mod fft_friendly_extensions_goldilocks_tests;
 pub mod fft_friendly_u64_goldilocks_tests;
 pub mod fft_tests;
