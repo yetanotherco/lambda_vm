@@ -31,7 +31,7 @@
 #let TableSet = ${Table_i}_(i in [t])$
 #let numColumns = $sans(m)$
 #let numRows = $sans(n)$
-#let maxNumRows = $numRows_sans(max)$
+#let maxNumRows = $numRows_sans("max")$
 
 - $numTables in NN$: number of tables $Table_i$ in the arithmetisation of the VM.
 - $Table_i in BaseField^(numRows_i times numColumns_i)$: a table in the arithmetisation of the VM; $TableSet$ denotes set of all tables.
@@ -75,7 +75,7 @@ With this set chosen, it then holds that $traceColPoly_(i,j)(multGen_i^k) = Tabl
 === Codeword Evaluation
 
 #let FRIDomain = $D$
-#let FRIDomainMax = $D_(sans(max))$
+#let FRIDomainMax = $D_(sans("max"))$
 #let FRIRate = $rho$
 #let FRICodeword = $arrow(c)$
 
@@ -90,3 +90,19 @@ By this construction, $abs(FRIDomainMax)$ is also a power of two which allows fo
 Each column polynomial $traceColPoly_(i,j)$ is encoded as $FRICodeword_(i,j) in BaseField^abs(FRIDomain_i)$, where, looking ahead, $FRIDomain_i$ with $abs(FRIDomain_i) = 2^(- log(FRIRate)) dot numColumns_i$ is chosen for table $Table_i$ such that it is suitable for FRI pipelining.
 
 *Output:* for each table $Table_i$, $numColumns_i$ codewords $FRICodeword_(i,j)$.
+
+=== Codeword Commitment
+
+#let MerkleRoot = $sans("rt")$
+
+Before the protocol can continue, the column polynomials are committed to.
+This is achieved by committing to their encodings using a _Merkle commitment scheme_.
+Naïvely, each codeword would have its own Merkle tree, where the leaves contain the symbols of the codeword (or their hash with a salt for the hiding variant).
+
+However, looking ahead once more, the folding factor in the configuration of the FRI protocol will require the opening of more than one symbol of each codeword for every query point.
+Several symbols (selected by a fixed offset determined by the folding factor) can therefore be concatenated into the same leaf of the codeword's Merkle tree.
+
+Furthermore, all commitments to codewords of the same length will be opened in the same location.
+Therefore the leaves can be instead set to be concatenations of the set of symbols at the same position across different codewords.
+
+*Output:* for each table $Table_i$, a Merkle commitment $MerkleRoot_i$.
