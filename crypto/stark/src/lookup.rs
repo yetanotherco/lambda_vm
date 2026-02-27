@@ -698,7 +698,7 @@ impl<
     /// The last 1-2 interactions are "absorbed" into the accumulated constraint
     /// by clearing denominators, eliminating one committed term column per table.
     ///
-    /// Total aux columns = ⌈N/2⌉ where N is the number of interactions.
+    /// Total aux columns = ⌈N/4⌉ where N is the number of interactions.
     pub fn new(
         num_main_columns: usize,
         auxiliary_trace_build_data: AuxiliaryTraceBuildData,
@@ -708,44 +708,40 @@ impl<
     ) -> Self {
         let num_interactions = auxiliary_trace_build_data.interactions.len();
 
-        // Split interactions: committed pairs get term columns, last 1-2 are absorbed
-        let (num_committed_pairs, absorbed) = if num_interactions == 0 {
+        // Split interactions: committed groups of 4 get term columns, remainder are absorbed
+        let (num_committed_groups, absorbed) = if num_interactions == 0 {
             (0, vec![])
-        } else if num_interactions <= 2 {
+        } else if num_interactions <= 4 {
             // All interactions absorbed, no committed term columns
             (
                 0,
                 auxiliary_trace_build_data.interactions[..num_interactions].to_vec(),
             )
-        } else if num_interactions % 2 == 1 {
-            // Odd: pairs from [0..N-1), absorb last 1
-            (
-                (num_interactions - 1) / 2,
-                vec![auxiliary_trace_build_data.interactions[num_interactions - 1].clone()],
-            )
         } else {
-            // Even: pairs from [0..N-2), absorb last 2
+            let remainder = num_interactions % 4;
+            let absorbed_count = if remainder == 0 { 4 } else { remainder };
             (
-                (num_interactions - 2) / 2,
-                vec![
-                    auxiliary_trace_build_data.interactions[num_interactions - 2].clone(),
-                    auxiliary_trace_build_data.interactions[num_interactions - 1].clone(),
-                ],
+                (num_interactions - absorbed_count) / 4,
+                auxiliary_trace_build_data.interactions[num_interactions - absorbed_count..]
+                    .to_vec(),
             )
         };
 
-        // Create batched term constraints for committed pairs only
-        for pair_idx in 0..num_committed_pairs {
-            let constraint = LookupBatchedTermConstraint::new(
-                auxiliary_trace_build_data.interactions[pair_idx * 2].clone(),
-                auxiliary_trace_build_data.interactions[pair_idx * 2 + 1].clone(),
-                pair_idx,
+        // Create batched term constraints for committed groups of 4 only
+        for group_idx in 0..num_committed_groups {
+            let base = group_idx * 4;
+            let constraint = LookupBatchedTermConstraint4::new(
+                auxiliary_trace_build_data.interactions[base].clone(),
+                auxiliary_trace_build_data.interactions[base + 1].clone(),
+                auxiliary_trace_build_data.interactions[base + 2].clone(),
+                auxiliary_trace_build_data.interactions[base + 3].clone(),
+                group_idx,
                 transition_constraints.len(),
             );
             transition_constraints.push(Box::new(constraint));
         }
 
-        let num_term_columns = num_committed_pairs;
+        let num_term_columns = num_committed_groups;
 
         // Add the accumulated constraint with absorbed interactions
         if num_interactions > 0 {
@@ -757,7 +753,7 @@ impl<
             transition_constraints.push(Box::new(accumulated_constraint));
         }
 
-        // Layout: num_committed_pairs term columns + 1 accumulated = ⌈N/2⌉
+        // Layout: num_committed_groups term columns + 1 accumulated = ⌈N/4⌉
         let num_aux_columns = if num_interactions > 0 {
             num_term_columns + 1
         } else {
@@ -914,23 +910,26 @@ where
         let trace_len = trace.num_rows();
         let table_name = self.name.as_deref().unwrap_or("UNKNOWN");
 
-        // Split interactions: committed pairs get term columns, last 1-2 are absorbed (virtual)
-        let (num_committed_pairs, absorbed_count) = if num_interactions <= 2 {
+        // Split interactions: committed groups of 4 get term columns, remainder absorbed (virtual)
+        let (num_committed_groups, absorbed_count) = if num_interactions <= 4 {
             (0, num_interactions)
-        } else if num_interactions % 2 == 1 {
-            ((num_interactions - 1) / 2, 1usize)
         } else {
-            ((num_interactions - 2) / 2, 2usize)
+            let remainder = num_interactions % 4;
+            let absorbed_count = if remainder == 0 { 4 } else { remainder };
+            ((num_interactions - absorbed_count) / 4, absorbed_count)
         };
 
-        // Compute committed term columns in parallel (batched pairs only)
+        // Compute committed term columns in parallel (batched groups of 4 only)
         #[cfg(feature = "parallel")]
-        let committed_columns: Vec<Vec<FieldElement<E>>> = (0..num_committed_pairs)
+        let committed_columns: Vec<Vec<FieldElement<E>>> = (0..num_committed_groups)
             .into_par_iter()
             .map(|i| {
-                compute_logup_batched_term_column(
-                    &self.auxiliary_trace_build_data.interactions[i * 2],
-                    &self.auxiliary_trace_build_data.interactions[i * 2 + 1],
+                let base = i * 4;
+                compute_logup_batched_term_column_4(
+                    &self.auxiliary_trace_build_data.interactions[base],
+                    &self.auxiliary_trace_build_data.interactions[base + 1],
+                    &self.auxiliary_trace_build_data.interactions[base + 2],
+                    &self.auxiliary_trace_build_data.interactions[base + 3],
                     &main_segment_cols,
                     trace_len,
                     challenges,
@@ -939,11 +938,14 @@ where
             })
             .collect();
         #[cfg(not(feature = "parallel"))]
-        let committed_columns: Vec<Vec<FieldElement<E>>> = (0..num_committed_pairs)
+        let committed_columns: Vec<Vec<FieldElement<E>>> = (0..num_committed_groups)
             .map(|i| {
-                compute_logup_batched_term_column(
-                    &self.auxiliary_trace_build_data.interactions[i * 2],
-                    &self.auxiliary_trace_build_data.interactions[i * 2 + 1],
+                let base = i * 4;
+                compute_logup_batched_term_column_4(
+                    &self.auxiliary_trace_build_data.interactions[base],
+                    &self.auxiliary_trace_build_data.interactions[base + 1],
+                    &self.auxiliary_trace_build_data.interactions[base + 2],
+                    &self.auxiliary_trace_build_data.interactions[base + 3],
                     &main_segment_cols,
                     trace_len,
                     challenges,
@@ -953,24 +955,14 @@ where
             .collect();
 
         // Compute virtual column for absorbed interactions (NOT written to trace)
-        let virtual_column = if absorbed_count == 2 {
-            compute_logup_batched_term_column(
-                &self.auxiliary_trace_build_data.interactions[num_interactions - 2],
-                &self.auxiliary_trace_build_data.interactions[num_interactions - 1],
-                &main_segment_cols,
-                trace_len,
-                challenges,
-                table_name,
-            )
-        } else {
-            compute_logup_term_column(
-                &self.auxiliary_trace_build_data.interactions[num_interactions - 1],
-                &main_segment_cols,
-                trace_len,
-                challenges,
-                table_name,
-            )
-        };
+        let absorbed_start = num_interactions - absorbed_count;
+        let virtual_column = compute_logup_virtual_column(
+            &self.auxiliary_trace_build_data.interactions[absorbed_start..],
+            &main_segment_cols,
+            trace_len,
+            challenges,
+            table_name,
+        );
 
         // Write only committed columns to trace
         for (col_idx, col_data) in committed_columns.iter().enumerate() {
@@ -993,7 +985,7 @@ where
         // Build accumulated from all columns (committed + virtual)
         let mut all_columns = committed_columns;
         all_columns.push(virtual_column);
-        let acc_col_idx = num_committed_pairs; // accumulated column in trace follows committed columns
+        let acc_col_idx = num_committed_groups; // accumulated column in trace follows committed columns
         let table_contribution =
             build_accumulated_column_from_terms(acc_col_idx, &all_columns, trace);
 
@@ -1258,6 +1250,7 @@ where
 /// This is a pure function that takes shared main columns and returns the computed column,
 /// enabling parallel computation across interactions within a table.
 #[allow(clippy::needless_range_loop)]
+#[cfg_attr(not(feature = "debug-checks"), allow(dead_code))]
 fn compute_logup_term_column<F, E>(
     table_interaction: &BusInteraction,
     main_segment_cols: &[Vec<FieldElement<F>>],
@@ -1397,15 +1390,18 @@ where
         .collect()
 }
 
-/// Computes a batched term column for two interactions sharing one aux column.
+/// Computes a batched term column for four interactions sharing one aux column.
 ///
-/// Each row contains: `term[i] = sign_a * m_a[i] / fp_a[i] + sign_b * m_b[i] / fp_b[i]`
+/// Each row contains: `term[i] = Σ_{k=0..3} sign_k * m_k[i] / fp_k[i]`
 ///
-/// Uses a single batch inversion for both fingerprint vectors (2*N elements).
+/// Uses a single batch inversion for all fingerprint vectors (4*N elements).
 #[allow(clippy::needless_range_loop)]
-fn compute_logup_batched_term_column<F, E>(
+#[allow(clippy::too_many_arguments)]
+fn compute_logup_batched_term_column_4<F, E>(
     interaction_a: &BusInteraction,
     interaction_b: &BusInteraction,
+    interaction_c: &BusInteraction,
+    interaction_d: &BusInteraction,
     main_segment_cols: &[Vec<FieldElement<F>>],
     trace_len: usize,
     challenges: &[FieldElement<E>],
@@ -1418,21 +1414,25 @@ where
     let z = &challenges[LOGUP_CHALLENGE_Z];
     let alpha = &challenges[LOGUP_CHALLENGE_ALPHA];
 
-    let max_bus_elements = interaction_a
-        .num_bus_elements()
-        .max(interaction_b.num_bus_elements());
+    let interactions = [interaction_a, interaction_b, interaction_c, interaction_d];
+
+    let max_bus_elements = interactions
+        .iter()
+        .map(|i| i.num_bus_elements())
+        .max()
+        .unwrap();
     let alpha_powers = compute_alpha_powers(alpha, max_bus_elements);
 
-    let sign_a = if interaction_a.is_sender {
-        FieldElement::<E>::one()
-    } else {
-        -FieldElement::<E>::one()
-    };
-    let sign_b = if interaction_b.is_sender {
-        FieldElement::<E>::one()
-    } else {
-        -FieldElement::<E>::one()
-    };
+    let signs: Vec<FieldElement<E>> = interactions
+        .iter()
+        .map(|i| {
+            if i.is_sender {
+                FieldElement::<E>::one()
+            } else {
+                -FieldElement::<E>::one()
+            }
+        })
+        .collect();
 
     // Helper to compute multiplicities for an interaction
     let compute_multiplicities = |interaction: &BusInteraction| -> Vec<FieldElement<F>> {
@@ -1478,59 +1478,170 @@ where
         }
     };
 
-    let multiplicities_a = compute_multiplicities(interaction_a);
-    let multiplicities_b = compute_multiplicities(interaction_b);
+    let multiplicities: Vec<Vec<FieldElement<F>>> =
+        interactions.map(compute_multiplicities).to_vec();
 
-    // Compute fingerprints for both interactions using accumulate_fingerprint
-    // (zero-allocation inner loop: F×E multiplication instead of to_extension())
-    let bus_id_a = FieldElement::<F>::from(interaction_a.bus_id);
-    let bus_id_b = FieldElement::<F>::from(interaction_b.bus_id);
+    // Concatenate all 4 fingerprint vectors for a single batch inversion
+    let mut all_fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(4 * trace_len);
 
-    // Concatenate both fingerprint vectors for a single batch inversion
-    let mut all_fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(2 * trace_len);
-
-    for row in 0..trace_len {
-        let mut lc_a = &bus_id_a * &alpha_powers[0];
-        let mut alpha_offset = 1;
-        for bv in &interaction_a.values {
-            let consumed = bv.accumulate_fingerprint(
-                main_segment_cols,
-                row,
-                &alpha_powers,
-                alpha_offset,
-                &mut lc_a,
-            );
-            alpha_offset += consumed;
+    for k in 0..4 {
+        let bus_id = FieldElement::<F>::from(interactions[k].bus_id);
+        for row in 0..trace_len {
+            let mut lc = &bus_id * &alpha_powers[0];
+            let mut alpha_offset = 1;
+            for bv in &interactions[k].values {
+                let consumed = bv.accumulate_fingerprint(
+                    main_segment_cols,
+                    row,
+                    &alpha_powers,
+                    alpha_offset,
+                    &mut lc,
+                );
+                alpha_offset += consumed;
+            }
+            all_fingerprints.push(z - &lc);
         }
-        all_fingerprints.push(z - &lc_a);
-    }
-    for row in 0..trace_len {
-        let mut lc_b = &bus_id_b * &alpha_powers[0];
-        let mut alpha_offset = 1;
-        for bv in &interaction_b.values {
-            let consumed = bv.accumulate_fingerprint(
-                main_segment_cols,
-                row,
-                &alpha_powers,
-                alpha_offset,
-                &mut lc_b,
-            );
-            alpha_offset += consumed;
-        }
-        all_fingerprints.push(z - &lc_b);
     }
 
-    // Single batch inversion for all 2*N fingerprints
+    // Single batch inversion for all 4*N fingerprints
     FieldElement::inplace_batch_inverse(&mut all_fingerprints)
         .expect("fingerprint is zero - probability of sampling zero is negligible");
 
-    // Compute batched terms: term[i] = sign_a * m_a[i] * fp_a_inv[i] + sign_b * m_b[i] * fp_b_inv[i]
+    // Compute batched terms: term[i] = Σ sign_k * m_k[i] * fp_k_inv[i]
     (0..trace_len)
         .map(|row| {
-            let fp_a_inv = &all_fingerprints[row];
-            let fp_b_inv = &all_fingerprints[trace_len + row];
-            &multiplicities_a[row] * &sign_a * fp_a_inv
-                + &multiplicities_b[row] * &sign_b * fp_b_inv
+            let mut sum = FieldElement::<E>::zero();
+            for k in 0..4 {
+                let fp_inv = &all_fingerprints[k * trace_len + row];
+                sum += &multiplicities[k][row] * &signs[k] * fp_inv;
+            }
+            sum
+        })
+        .collect()
+}
+
+/// Computes a virtual term column for 1-4 absorbed interactions.
+///
+/// This is used for the absorbed interactions that are not committed to the trace
+/// but still contribute to the accumulated column's running sum.
+/// Each row: `virtual[i] = Σ sign_k * m_k[i] / fp_k[i]` for all absorbed interactions.
+#[allow(clippy::needless_range_loop)]
+fn compute_logup_virtual_column<F, E>(
+    interactions: &[BusInteraction],
+    main_segment_cols: &[Vec<FieldElement<F>>],
+    trace_len: usize,
+    challenges: &[FieldElement<E>],
+    #[cfg_attr(not(feature = "debug-checks"), allow(unused))] _table_name: &str,
+) -> Vec<FieldElement<E>>
+where
+    F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
+    E: IsField + Send + Sync,
+{
+    let n = interactions.len();
+    assert!((1..=4).contains(&n), "absorbed count must be 1-4");
+
+    let z = &challenges[LOGUP_CHALLENGE_Z];
+    let alpha = &challenges[LOGUP_CHALLENGE_ALPHA];
+
+    let max_bus_elements = interactions
+        .iter()
+        .map(|i| i.num_bus_elements())
+        .max()
+        .unwrap();
+    let alpha_powers = compute_alpha_powers(alpha, max_bus_elements);
+
+    let signs: Vec<FieldElement<E>> = interactions
+        .iter()
+        .map(|i| {
+            if i.is_sender {
+                FieldElement::<E>::one()
+            } else {
+                -FieldElement::<E>::one()
+            }
+        })
+        .collect();
+
+    // Helper to compute multiplicities for an interaction
+    let compute_multiplicities = |interaction: &BusInteraction| -> Vec<FieldElement<F>> {
+        match &interaction.multiplicity {
+            Multiplicity::One => vec![FieldElement::one(); trace_len],
+            Multiplicity::Column(col) => main_segment_cols[*col].clone(),
+            Multiplicity::Sum(col_a, col_b) => main_segment_cols[*col_a]
+                .iter()
+                .zip(main_segment_cols[*col_b].iter())
+                .map(|(a, b)| a + b)
+                .collect(),
+            Multiplicity::Negated(col) => main_segment_cols[*col]
+                .iter()
+                .map(|elem| FieldElement::<F>::one() - elem)
+                .collect(),
+            Multiplicity::Linear(terms) => (0..trace_len)
+                .map(|row| {
+                    let mut result = FieldElement::<F>::zero();
+                    for term in terms {
+                        match *term {
+                            LinearTerm::Column {
+                                coefficient,
+                                column,
+                            } => {
+                                let coeff = FieldElement::<F>::from(coefficient);
+                                result += &main_segment_cols[column][row] * coeff;
+                            }
+                            LinearTerm::ColumnUnsigned {
+                                coefficient,
+                                column,
+                            } => {
+                                let coeff = FieldElement::<F>::from(coefficient);
+                                result += &main_segment_cols[column][row] * coeff;
+                            }
+                            LinearTerm::Constant(value) => {
+                                result += FieldElement::<F>::from(value);
+                            }
+                        }
+                    }
+                    result
+                })
+                .collect(),
+        }
+    };
+
+    let multiplicities: Vec<Vec<FieldElement<F>>> =
+        interactions.iter().map(compute_multiplicities).collect();
+
+    // Concatenate all N fingerprint vectors for a single batch inversion
+    let mut all_fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(n * trace_len);
+
+    for k in 0..n {
+        let bus_id = FieldElement::<F>::from(interactions[k].bus_id);
+        for row in 0..trace_len {
+            let mut lc = &bus_id * &alpha_powers[0];
+            let mut alpha_offset = 1;
+            for bv in &interactions[k].values {
+                let consumed = bv.accumulate_fingerprint(
+                    main_segment_cols,
+                    row,
+                    &alpha_powers,
+                    alpha_offset,
+                    &mut lc,
+                );
+                alpha_offset += consumed;
+            }
+            all_fingerprints.push(z - &lc);
+        }
+    }
+
+    FieldElement::inplace_batch_inverse(&mut all_fingerprints)
+        .expect("fingerprint is zero - probability of sampling zero is negligible");
+
+    // Compute virtual terms: term[i] = Σ sign_k * m_k[i] * fp_k_inv[i]
+    (0..trace_len)
+        .map(|row| {
+            let mut sum = FieldElement::<E>::zero();
+            for k in 0..n {
+                let fp_inv = &all_fingerprints[k * trace_len + row];
+                sum += &multiplicities[k][row] * &signs[k] * fp_inv;
+            }
+            sum
         })
         .collect()
 }
@@ -1708,43 +1819,50 @@ fn compute_fingerprint_from_step<A: IsSubFieldOf<B>, B: IsField>(
     z - &linear_combination
 }
 
-/// Constraint for a batched pair of interactions sharing one aux column.
+/// Constraint for a batched group of 4 interactions sharing one aux column.
 ///
-/// Verifies: `c = m_a/fp_a + m_b/fp_b` where signs are baked into m_a, m_b.
+/// Verifies: `c = Σ_{k=0..3} sign_k * m_k / fp_k`
 ///
-/// Clearing denominators: `c * fp_a * fp_b - sign_a * m_a * fp_b - sign_b * m_b * fp_a = 0`
+/// Clearing denominators:
+/// `c * fp_a * fp_b * fp_c * fp_d - Σ(sign_k * m_k * ∏_{j≠k} fp_j) = 0`
 ///
-/// Degree 3: c (aux) × fp_a (linear in main) × fp_b (linear in main).
-struct LookupBatchedTermConstraint {
+/// Degree 5: c (aux) × fp_a × fp_b × fp_c × fp_d (each linear in main).
+struct LookupBatchedTermConstraint4 {
     interaction_a: BusInteraction,
     interaction_b: BusInteraction,
+    interaction_c: BusInteraction,
+    interaction_d: BusInteraction,
     term_column_idx: usize,
     constraint_idx: usize,
 }
 
-impl LookupBatchedTermConstraint {
+impl LookupBatchedTermConstraint4 {
     pub fn new(
         interaction_a: BusInteraction,
         interaction_b: BusInteraction,
+        interaction_c: BusInteraction,
+        interaction_d: BusInteraction,
         term_column_idx: usize,
         constraint_idx: usize,
     ) -> Self {
         Self {
             interaction_a,
             interaction_b,
+            interaction_c,
+            interaction_d,
             term_column_idx,
             constraint_idx,
         }
     }
 }
 
-impl<F, E> TransitionConstraint<F, E> for LookupBatchedTermConstraint
+impl<F, E> TransitionConstraint<F, E> for LookupBatchedTermConstraint4
 where
     F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
     E: IsField + Send + Sync,
 {
     fn degree(&self) -> usize {
-        3 // c * fp_a * fp_b
+        5 // c * fp_a * fp_b * fp_c * fp_d
     }
 
     fn constraint_idx(&self) -> usize {
@@ -1760,11 +1878,14 @@ where
         evaluation_context: &TransitionEvaluationContext<F, E>,
         transition_evaluations: &mut [FieldElement<E>],
     ) {
-        fn evaluate_batched_term_constraint<A: IsSubFieldOf<B>, B: IsField>(
+        #[allow(clippy::too_many_arguments)]
+        fn evaluate_batched_term_constraint_4<A: IsSubFieldOf<B>, B: IsField>(
             step: &TableView<A, B>,
             term_column_idx: usize,
             interaction_a: &BusInteraction,
             interaction_b: &BusInteraction,
+            interaction_c: &BusInteraction,
+            interaction_d: &BusInteraction,
             rap_challenges: &&[FieldElement<B>],
             alpha_powers: &[FieldElement<B>],
         ) -> FieldElement<B> {
@@ -1773,9 +1894,13 @@ where
 
             let m_a = compute_multiplicity_from_step(step, &interaction_a.multiplicity);
             let m_b = compute_multiplicity_from_step(step, &interaction_b.multiplicity);
+            let m_c = compute_multiplicity_from_step(step, &interaction_c.multiplicity);
+            let m_d = compute_multiplicity_from_step(step, &interaction_d.multiplicity);
 
             let fp_a = compute_fingerprint_from_step(step, interaction_a, z, alpha_powers);
             let fp_b = compute_fingerprint_from_step(step, interaction_b, z, alpha_powers);
+            let fp_c = compute_fingerprint_from_step(step, interaction_c, z, alpha_powers);
+            let fp_d = compute_fingerprint_from_step(step, interaction_d, z, alpha_powers);
 
             let sign_a: FieldElement<B> = if interaction_a.is_sender {
                 FieldElement::one()
@@ -1787,9 +1912,33 @@ where
             } else {
                 -FieldElement::one()
             };
+            let sign_c: FieldElement<B> = if interaction_c.is_sender {
+                FieldElement::one()
+            } else {
+                -FieldElement::one()
+            };
+            let sign_d: FieldElement<B> = if interaction_d.is_sender {
+                FieldElement::one()
+            } else {
+                -FieldElement::one()
+            };
 
-            // c * fp_a * fp_b - sign_a * m_a * fp_b - sign_b * m_b * fp_a = 0
-            c * &fp_a * &fp_b - m_a * sign_a * &fp_b - m_b * sign_b * &fp_a
+            // Partial products for efficient "leave one out":
+            let fab = &fp_a * &fp_b;
+            let fcd = &fp_c * &fp_d;
+            let fabcd = &fab * &fcd;
+
+            // ∏_{j≠k} fp_j:
+            let no_a = &fp_b * &fcd; // fp_b * fp_c * fp_d
+            let no_b = &fp_a * &fcd; // fp_a * fp_c * fp_d
+            let no_c = &fab * &fp_d; // fp_a * fp_b * fp_d
+            let no_d = &fab * &fp_c; // fp_a * fp_b * fp_c
+
+            c * fabcd
+                - m_a * sign_a * no_a
+                - m_b * sign_b * no_b
+                - m_c * sign_c * no_c
+                - m_d * sign_d * no_d
         }
 
         let res = match evaluation_context {
@@ -1798,11 +1947,13 @@ where
                 rap_challenges,
                 logup_alpha_powers,
                 ..
-            } => evaluate_batched_term_constraint(
+            } => evaluate_batched_term_constraint_4(
                 frame.get_evaluation_step(0),
                 self.term_column_idx,
                 &self.interaction_a,
                 &self.interaction_b,
+                &self.interaction_c,
+                &self.interaction_d,
                 rap_challenges,
                 logup_alpha_powers,
             ),
@@ -1811,11 +1962,13 @@ where
                 rap_challenges,
                 logup_alpha_powers,
                 ..
-            } => evaluate_batched_term_constraint(
+            } => evaluate_batched_term_constraint_4(
                 frame.get_evaluation_step(0),
                 self.term_column_idx,
                 &self.interaction_a,
                 &self.interaction_b,
+                &self.interaction_c,
+                &self.interaction_d,
                 rap_challenges,
                 logup_alpha_powers,
             ),
@@ -1830,20 +1983,17 @@ where
 /// Constraint for the accumulated column with absorbed interactions.
 ///
 /// The accumulated column tracks the running sum of all committed term columns
-/// plus 1-2 "absorbed" interactions whose terms are verified inline (not committed).
+/// plus 1-4 "absorbed" interactions whose terms are verified inline (not committed).
 ///
-/// For 1 absorbed interaction:
-///   `(acc_next - acc_curr - Σ terms + L/N) · f - sign · m = 0` (degree 2)
-///
-/// For 2 absorbed interactions:
-///   `(acc_next - acc_curr - Σ terms + L/N) · f₁·f₂ - sign₁·m₁·f₂ - sign₂·m₂·f₁ = 0` (degree 3)
+/// Degree = 1 + absorbed.len():
+///   1 absorbed → degree 2, 2 → degree 3, 3 → degree 4, 4 → degree 5
 struct LookupAccumulatedConstraint {
     constraint_idx: usize,
     /// Number of committed term columns (excludes absorbed interactions)
     num_term_columns: usize,
     /// Index of the accumulated column (= num_term_columns)
     acc_column_idx: usize,
-    /// 1 or 2 interactions absorbed into this constraint (not committed as columns)
+    /// 1-4 interactions absorbed into this constraint (not committed as columns)
     absorbed: Vec<BusInteraction>,
 }
 
@@ -1868,7 +2018,7 @@ where
     E: IsField + Send + Sync,
 {
     fn degree(&self) -> usize {
-        1 + self.absorbed.len() // 2 for 1 absorbed, 3 for 2 absorbed
+        1 + self.absorbed.len() // 2 for 1, 3 for 2, 4 for 3, 5 for 4 absorbed
     }
 
     fn constraint_idx(&self) -> usize {
@@ -1909,41 +2059,62 @@ where
 
             let z = &rap_challenges[LOGUP_CHALLENGE_Z];
 
-            // Clear denominators of absorbed interactions
+            // Compute fingerprints, multiplicities, and signs for all absorbed
+            let fps: Vec<FieldElement<B>> = absorbed
+                .iter()
+                .map(|a| compute_fingerprint_from_step(second_step, a, z, alpha_powers))
+                .collect();
+            let ms: Vec<FieldElement<B>> = absorbed
+                .iter()
+                .map(|a| {
+                    compute_multiplicity_from_step(second_step, &a.multiplicity).to_extension()
+                })
+                .collect();
+            let signs: Vec<FieldElement<B>> = absorbed
+                .iter()
+                .map(|a| {
+                    if a.is_sender {
+                        FieldElement::one()
+                    } else {
+                        -FieldElement::one()
+                    }
+                })
+                .collect();
+
+            // Clear denominators: delta * ∏f_k - Σ(sign_k * m_k * ∏_{j≠k} f_j) = 0
             match absorbed.len() {
-                1 => {
-                    // (delta) · f - sign · m = 0
-                    let m = compute_multiplicity_from_step(second_step, &absorbed[0].multiplicity);
-                    let f =
-                        compute_fingerprint_from_step(second_step, &absorbed[0], z, alpha_powers);
-                    let sign: FieldElement<B> = if absorbed[0].is_sender {
-                        FieldElement::one()
-                    } else {
-                        -FieldElement::one()
-                    };
-                    delta * &f - m * sign
-                }
+                1 => delta * &fps[0] - &ms[0] * &signs[0],
                 2 => {
-                    // (delta) · f₁ · f₂ - sign₁·m₁·f₂ - sign₂·m₂·f₁ = 0
-                    let m1 = compute_multiplicity_from_step(second_step, &absorbed[0].multiplicity);
-                    let m2 = compute_multiplicity_from_step(second_step, &absorbed[1].multiplicity);
-                    let f1 =
-                        compute_fingerprint_from_step(second_step, &absorbed[0], z, alpha_powers);
-                    let f2 =
-                        compute_fingerprint_from_step(second_step, &absorbed[1], z, alpha_powers);
-                    let sign1: FieldElement<B> = if absorbed[0].is_sender {
-                        FieldElement::one()
-                    } else {
-                        -FieldElement::one()
-                    };
-                    let sign2: FieldElement<B> = if absorbed[1].is_sender {
-                        FieldElement::one()
-                    } else {
-                        -FieldElement::one()
-                    };
-                    delta * &f1 * &f2 - m1 * sign1 * &f2 - m2 * sign2 * &f1
+                    delta * &fps[0] * &fps[1]
+                        - &ms[0] * &signs[0] * &fps[1]
+                        - &ms[1] * &signs[1] * &fps[0]
                 }
-                _ => unreachable!("absorbed must contain 1 or 2 interactions"),
+                3 => {
+                    let f01 = &fps[0] * &fps[1];
+                    let f012 = &f01 * &fps[2];
+                    let no_0 = &fps[1] * &fps[2];
+                    let no_1 = &fps[0] * &fps[2];
+                    let no_2 = f01; // fps[0] * fps[1]
+                    delta * f012
+                        - &ms[0] * &signs[0] * no_0
+                        - &ms[1] * &signs[1] * no_1
+                        - &ms[2] * &signs[2] * no_2
+                }
+                4 => {
+                    let f01 = &fps[0] * &fps[1];
+                    let f23 = &fps[2] * &fps[3];
+                    let f0123 = &f01 * &f23;
+                    let no_0 = &fps[1] * &f23;
+                    let no_1 = &fps[0] * &f23;
+                    let no_2 = &f01 * &fps[3];
+                    let no_3 = &f01 * &fps[2];
+                    delta * f0123
+                        - &ms[0] * &signs[0] * no_0
+                        - &ms[1] * &signs[1] * no_1
+                        - &ms[2] * &signs[2] * no_2
+                        - &ms[3] * &signs[3] * no_3
+                }
+                _ => unreachable!("absorbed must contain 1-4 interactions"),
             }
         }
 
