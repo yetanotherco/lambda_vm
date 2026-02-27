@@ -3,6 +3,8 @@
 #set document(author: meta.authors, title: meta.title)
 
 #align(center, title(meta.title))
+#align(center, text(style: "italic", fill: luma(40%))[Version #meta.version])
+#align(center, meta.authors.join(", "))
 #pagebreak(weak: true)
 #outline()
 

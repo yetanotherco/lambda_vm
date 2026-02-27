@@ -6,6 +6,7 @@
 #let meta = (
   title: "Lambda VM specification",
   authors: ("3MI Labs", "Aligned"),
+  version: "0.2",
   summary: (
     ("logup.typ", [LogUp argument], <logup>),
     ("memory.typ", [Memory argument], <memory>),
@@ -31,7 +32,7 @@
 #book-meta(
   title: meta.title,
   authors: meta.authors,
-  summary: meta.summary.map(((ch, title, _ref)) => chapter(ch, title)).join()
+  summary: prefix-chapter("front.typ", meta.title) + meta.summary.map(((ch, title, _ref)) => chapter(ch, title)).join()
 )
 
 #let common-formatting(body) = {
