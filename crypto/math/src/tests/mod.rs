@@ -1,3 +1,4 @@
+pub mod barycentric_tests;
 pub mod extensions_cubic_tests;
 pub mod extensions_quadratic_tests;
 pub mod fft_friendly_extensions_goldilocks_tests;
