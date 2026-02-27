@@ -1,0 +1,270 @@
+name = "SHA256"
+
+[[variables.input]]
+name = "timestamp"
+type = "DWordWL"
+desc = "Timestamp at which the ECALL is invoked. Used as unique identifier for this invocation."
+pad = ["cast", 0, "DWordWL"]
+
+[[variables.input]]
+name = "h"
+type = ["Byte", 32]
+desc = "The state of the hash function."
+pad = ["cast", 0, ["Byte", 32]]
+
+[[variables.input]]
+name = "h_base_addr"
+type = "DWordWL"
+desc = "The starting address of `h`."
+pad = ["cast", 0, "DWordWL"]
+
+[[variables.input]]
+name = "h_addr"
+type = ["DWordHL", 7]
+desc = "The addresses of the next doublewords of `h`: `h_base_addr + 8 * (i + 1)`"
+pad = ["arr", ["cast", 8, "DWordWL"], ["cast", 16, "DWordWL"], ["cast", 24, "DWordWL"], ["cast", 32, "DWordWL"], ["cast", 40, "DWordWL"], ["cast", 48, "DWordWL"], ["cast", 56, "DWordWL"]]
+
+[[variables.input]]
+name = "m"
+type = ["Byte", 64]
+desc = "The input chunk."
+pad = ["cast", 0, ["Word", 16]]
+
+[[variables.input]]
+name = "m_base_addr"
+type = "DWordWL"
+desc = "The starting address of `m`."
+pad = ["cast", 0, "DWordWL"]
+
+[[variables.input]]
+name = "m_addr"
+type = ["DWordHL", 7]
+desc = "The addresses of the next doublewords of `m`: `m_base_addr + 8 * (i + 1)`"
+pad = ["arr", ["cast", 8, "DWordWL"], ["cast", 16, "DWordWL"], ["cast", 24, "DWordWL"], ["cast", 32, "DWordWL"], ["cast", 40, "DWordWL"], ["cast", 48, "DWordWL"], ["cast", 56, "DWordWL"]]
+
+[[variables.output]]
+name = "out"
+type = ["Byte", 32]
+desc = "The new state."
+pad = ["cast", 0, ["Byte", 32]]
+
+[[variables.auxiliary]]
+name = "last_round_out"
+type = ["Word", 8]
+desc = "The output from the last compression round"
+pad = 0
+
+[[variables.multiplicity]]
+name = "μ"
+type = "Bit"
+desc = ""
+pad = 0
+
+
+[[constraint_groups]]
+name = "memory"
+
+[[constraints.memory]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "m_addr", "i"]]
+multiplicity = "μ"
+iter = ["i", 0, 7]
+
+[[constraints.memory]]
+kind = "template"
+tag = "ADD"
+input = ["m_base_addr", ["cast", ["*", 8, ["+", "i", 1]], "DWordWL"]]
+output = ["cast", ["idx", "m_addr", "i"], "DWordWL"]
+iter = ["i", 0, 7]
+
+[[constraints.memory]]
+kind = "interaction"
+tag = "MEMW"
+input = [1, ["*", 2, 11], "m_base_addr", "timestamp", 1, 0, 0]
+output = "m_base_addr"
+multiplicity = "μ"
+
+[[constraints.memory]]
+kind = "interaction"
+tag = "MEMW"
+input = [0, "m_base_addr", ["arr", ["idx", "m", 3], ["idx", "m", 2], ["idx", "m", 1], ["idx", "m", 0], ["idx", "m", 7], ["idx", "m", 6], ["idx", "m", 5], ["idx", "m", 4]], "timestamp", 0, 0, 1]
+output = ["arr", ["idx", "m", 3], ["idx", "m", 2], ["idx", "m", 1], ["idx", "m", 0], ["idx", "m", 7], ["idx", "m", 6], ["idx", "m", 5], ["idx", "m", 4]]
+multiplicity = "μ"
+
+[[constraints.memory]]
+kind = "interaction"
+tag = "MEMW"
+input = [0, ["idx", "m_addr", "i"], ["arr",
+    ["idx", "m", ["+", ["*", 8, "i"], 3]],
+    ["idx", "m", ["+", ["*", 8, "i"], 2]],
+    ["idx", "m", ["+", ["*", 8, "i"], 1]],
+    ["idx", "m", ["+", ["*", 8, "i"], 0]],
+    ["idx", "m", ["+", ["*", 8, "i"], 7]],
+    ["idx", "m", ["+", ["*", 8, "i"], 6]],
+    ["idx", "m", ["+", ["*", 8, "i"], 5]],
+    ["idx", "m", ["+", ["*", 8, "i"], 4]]],
+  "timestamp", 0, 0, 1]
+output = ["arr",
+    ["idx", "m", ["+", ["*", 8, "i"], 3]],
+    ["idx", "m", ["+", ["*", 8, "i"], 2]],
+    ["idx", "m", ["+", ["*", 8, "i"], 1]],
+    ["idx", "m", ["+", ["*", 8, "i"], 0]],
+    ["idx", "m", ["+", ["*", 8, "i"], 7]],
+    ["idx", "m", ["+", ["*", 8, "i"], 6]],
+    ["idx", "m", ["+", ["*", 8, "i"], 5]],
+    ["idx", "m", ["+", ["*", 8, "i"], 4]]]
+multiplicity = "μ"
+iter = ["i", 0, 7]
+
+[[constraints.memory]]
+kind = "interaction"
+tag = "MEMW"
+input = [1, ["*", 2, 10], "out", "timestamp", 1, 0, 0]
+output = "h_base_addr"
+multiplicity = "μ"
+
+[[constraints.memory]]
+kind = "interaction"
+tag = "MEMW"
+input = [
+  0,
+  "h_base_addr",
+  ["arr",
+      ["idx", "out", 3],
+      ["idx", "out", 2],
+      ["idx", "out", 1],
+      ["idx", "out", 0],
+      ["idx", "out", 7],
+      ["idx", "out", 6],
+      ["idx", "out", 5],
+      ["idx", "out", 4]],
+  ["+", "timestamp", 1],
+  0, 0, 1
+]
+output = ["arr",
+  ["idx", "h", 3],
+  ["idx", "h", 2],
+  ["idx", "h", 1],
+  ["idx", "h", 0],
+  ["idx", "h", 7],
+  ["idx", "h", 6],
+  ["idx", "h", 5],
+  ["idx", "h", 4],
+]
+multiplicity = "μ"
+
+[[constraints.memory]]
+kind = "interaction"
+tag = "MEMW"
+input = [
+  0,
+  ["idx", "h_addr", "i"],
+  ["arr",
+      ["idx", "out", ["+", ["*", ["+", "i", 1], 8], 3]],
+      ["idx", "out", ["+", ["*", ["+", "i", 1], 8], 2]],
+      ["idx", "out", ["+", ["*", ["+", "i", 1], 8], 1]],
+      ["idx", "out", ["+", ["*", ["+", "i", 1], 8], 0]],
+      ["idx", "out", ["+", ["*", ["+", "i", 1], 8], 7]],
+      ["idx", "out", ["+", ["*", ["+", "i", 1], 8], 6]],
+      ["idx", "out", ["+", ["*", ["+", "i", 1], 8], 5]],
+      ["idx", "out", ["+", ["*", ["+", "i", 1], 8], 4]]],
+  ["+", "timestamp", 1],
+  0, 0, 1
+]
+output = ["arr",
+  ["idx", "h", ["+", ["*", ["+", "i", 1], 8], 3]],
+  ["idx", "h", ["+", ["*", ["+", "i", 1], 8], 2]],
+  ["idx", "h", ["+", ["*", ["+", "i", 1], 8], 1]],
+  ["idx", "h", ["+", ["*", ["+", "i", 1], 8], 0]],
+  ["idx", "h", ["+", ["*", ["+", "i", 1], 8], 7]],
+  ["idx", "h", ["+", ["*", ["+", "i", 1], 8], 6]],
+  ["idx", "h", ["+", ["*", ["+", "i", 1], 8], 5]],
+  ["idx", "h", ["+", ["*", ["+", "i", 1], 8], 4]],
+]
+multiplicity = "μ"
+
+[[constraint_groups]]
+name = "sched"
+
+[[constraints.sched]]
+kind = "interaction"
+tag = "SHA256_M"
+input = ["timestamp", "i", ["+",
+  ["*", ["^", 2, 0], ["idx", "m", ["+", ["*", 4, "i"], 3]]],
+  ["*", ["^", 2, 8], ["idx", "m", ["+", ["*", 4, "i"], 2]]],
+  ["*", ["^", 2, 16], ["idx", "m", ["+", ["*", 4, "i"], 1]]],
+  ["*", ["^", 2, 24], ["idx", "m", ["+", ["*", 4, "i"], 0]]],
+]]
+multiplicity = ["*", -4, "μ"]
+iter = ["i", 0, 15]
+
+# TODO: we can probably avoid needing these by checking index >= 16 in the MSGSCHED chip and doing it "on demand"
+[[constraints.sched]]
+kind = "interaction"
+tag = "SHA256MSGSCHED"
+input = ["timestamp", "i", 4]
+multiplicity = "μ"
+iter = ["i", 16, 47]
+
+[[constraints.sched]]
+kind = "interaction"
+tag = "SHA256MSGSCHED"
+input = ["timestamp", 48, 3]
+multiplicity = "μ"
+
+[[constraints.sched]]
+kind = "interaction"
+tag = "SHA256MSGSCHED"
+input = ["timestamp", "i", 2]
+multiplicity = "μ"
+iter = ["i", 49, 61]
+
+[[constraints.sched]]
+kind = "interaction"
+tag = "SHA256MSGSCHED"
+input = ["timestamp", "i", 1]
+multiplicity = "μ"
+iter = ["i", 62, 63]
+
+[[constraint_groups]]
+name = "compress"
+
+[[constraints.compress]]
+kind = "interaction"
+tag = "SHA256ROUND"
+# TODO: types + big endian
+input = ["timestamp", "h", 0]
+multiplicity = "μ"
+
+[[constraints.compress]]
+kind = "interaction"
+tag = "SHA256ROUND"
+input = ["timestamp", "last_round_out", 64]
+multiplicity = ["-", "μ"]
+
+[[constraints.compress]]
+kind = "template"
+tag = "ADD"
+input = [["arr", 0, ["idx", "last_round_out", "i"]], ["arr", 0, ["+",
+  ["*", ["^", 2, 0], ["idx", "h", ["+", ["*", 4, "i"], 3]]],
+  ["*", ["^", 2, 8], ["idx", "h", ["+", ["*", 4, "i"], 2]]],
+  ["*", ["^", 2, 16], ["idx", "h", ["+", ["*", 4, "i"], 1]]],
+  ["*", ["^", 2, 24], ["idx", "h", ["+", ["*", 4, "i"], 0]]],
+]]]
+output = ["arr", 0, ["+",
+  ["*", ["^", 2, 0], ["idx", "out", ["+", ["*", 4, "i"], 3]]],
+  ["*", ["^", 2, 8], ["idx", "out", ["+", ["*", 4, "i"], 2]]],
+  ["*", ["^", 2, 16], ["idx", "out", ["+", ["*", 4, "i"], 1]]],
+  ["*", ["^", 2, 24], ["idx", "out", ["+", ["*", 4, "i"], 0]]],
+]]
+iter = ["i", 0, 7]
+
+[[constraint_groups]]
+name = "lookup"
+
+[[constraints.lookup]]
+kind = "interaction"
+tag = "ECALL"
+input = ["timestamp", ["cast", -1, "DWordWL"]]
+multiplicity = ["-", "μ"]

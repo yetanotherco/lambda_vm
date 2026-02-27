@@ -1,0 +1,288 @@
+name = "SHA256ROUND"
+
+[[variables.input]]
+name = "timestamp"
+type = "DWordWL"
+desc = "The timestamp/identifier for this execution of the "
+pad = 0
+
+[[variables.input]]
+name = "a"
+type = "WordBL"
+desc = "State element"
+pad = 0
+
+[[variables.input]]
+name = "b"
+type = "WordBL"
+desc = "State element"
+pad = 0
+
+[[variables.input]]
+name = "c"
+type = "WordBL"
+desc = "State element"
+pad = 0
+
+[[variables.input]]
+name = "d"
+type = "Word"
+desc = "State element"
+pad = 0
+
+[[variables.input]]
+name = "e"
+type = "WordBL"
+desc = "State element"
+pad = 0
+
+[[variables.input]]
+name = "f"
+type = "WordBL"
+desc = "State element"
+pad = 0
+
+[[variables.input]]
+name = "g"
+type = "WordBL"
+desc = "State element"
+pad = 0
+
+[[variables.input]]
+name = "h"
+type = "Word"
+desc = "State element"
+pad = 0
+
+[[variables.input]]
+name = "index"
+type = "BaseField"
+desc = "The round number/index"
+pad = 0
+
+[[variables.output]]
+name = "out_a"
+type = "WordHL"
+desc = "temp1 + temp2"
+pad = 0
+
+[[variables.output]]
+name = "out_e"
+type = "WordHL"
+desc = "d + temp1"
+pad = 0
+
+[[variables.auxiliary]]
+name = "S1"
+type = "Word"
+desc = "Transformation of `e`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "e_and_f"
+type = "WordBL"
+desc = "Part of `ch`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "not_e_and_g"
+type = "WordBL"
+desc = "Part of `ch`"
+pad = 0
+
+[[variables.virtual]]
+name = "S0"
+type = "Word"
+desc = "Transformation of `a`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "a_and_b"
+type = "WordBL"
+desc = "Part of `maj`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "a_xor_b"
+type = "WordBL"
+desc = "Part of `maj`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "c_and_a_xor_b"
+type = "WordBL"
+desc = "Part of `maj`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "kval"
+type = "Word"
+desc = "`k[index]`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "wval"
+type = "Word"
+desc = "`w[index]`"
+pad = 0
+
+[[variables.virtual]]
+name = "ch"
+type = "Word"
+desc = "ch value"
+def = ["+", ["cast", "e_and_f", "Word"], ["cast", "not_e_and_g", "Word"]]
+
+[[variables.virtual]]
+name = "temp1"
+type = "BaseField"
+desc = "temp1 value"
+def = ["+", "h", "S1", "ch", "kval", "wval"]
+
+[[variables.virtual]]
+name = "maj"
+type = "Word"
+desc = "maj value"
+def = ["+", "a_and_b", "c_and_a_xor_b"]
+
+[[variables.virtual]]
+name = "temp2"
+type = "BaseField"
+desc = "temp2 value"
+def = ["+", "S0", "maj"]
+
+[[variables.virtual]]
+name = "carry_a"
+type = "Byte"
+desc = "The carry from `out_a`"
+def = ["*", ["^", 2, -32], ["-", ["cast", "out_a", "Word"], "temp1", "temp2"]]
+
+[[variables.virtual]]
+name = "carry_e"
+type = "Byte"
+desc = "The carry from `out_e`"
+def = ["*", ["^", 2, -32], ["-", ["cast", "out_e", "Word"], "d", "temp1"]]
+
+[[variables.multiplicity]]
+name = "μ"
+type = "Bit"
+desc = ""
+pad = 0
+
+[[assumptions]]
+desc = "All state values are valid words"
+
+
+[[constraint_groups]]
+name = "value"
+
+[[constraints.value]]
+kind = "interaction"
+tag = "ROTXOR"
+input = [["cast", "e", "Word"], 9, 1, 11, 0, 6, 1]
+output = "S1"
+multiplicity = "μ"
+
+[[constraints.value]]
+kind = "interaction"
+tag = "AND_BYTE"
+input = [["idx", "e", "i"], ["idx", "f", "i"]]
+output = ["idx", "e_and_f", "i"]
+multiplicity = "μ"
+iter = ["i", 0, 3]
+
+[[constraints.value]]
+kind = "interaction"
+tag = "AND_BYTE"
+input = [["-", 255, ["idx", "e", "i"]], ["idx", "g", "i"]]
+output = ["idx", "not_e_and_g", "i"]
+multiplicity = "μ"
+iter = ["i", 0, 3]
+
+[[constraints.value]]
+kind = "interaction"
+tag = "SHA256_K"
+input = ["index"]
+output = "kval"
+multiplicity = "μ"
+
+[[constraints.value]]
+kind = "interaction"
+tag = "SHA256_M"
+input = ["timestamp", "index", "wval"]
+multiplicity = "μ"
+
+[[constraints.value]]
+kind = "interaction"
+tag = "ROTXOR"
+input = [["cast", "a", "Word"], 6, 1, 13, 0, 2, 1]
+output = "S0"
+multiplicity = "μ"
+
+[[constraints.value]]
+kind = "interaction"
+tag = "AND_BYTE"
+input = [["idx", "a", "i"], ["idx", "b", "i"]]
+output = ["idx", "a_and_b", "i"]
+multiplicity = "μ"
+iter = ["i", 0, 3]
+
+[[constraints.value]]
+kind = "interaction"
+tag = "XOR_BYTE"
+input = [["idx", "a", "i"], ["idx", "b", "i"]]
+output = ["idx", "a_xor_b", "i"]
+multiplicity = "μ"
+iter = ["i", 0, 3]
+
+[[constraints.value]]
+kind = "interaction"
+tag = "AND_BYTE"
+input = [["idx", "c", "i"], ["idx", "a_xor_b", "i"]]
+output = ["idx", "c_and_a_xor_b", "i"]
+multiplicity = "μ"
+iter = ["i", 0, 3]
+
+[[constraint_groups]]
+name = "addition"
+
+[[constraints.addition]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "out_a", "i"]]
+multiplicity = "μ"
+iter = ["i", 0, 1]
+
+[[constraints.addition]]
+kind = "interaction"
+tag = "IS_BYTE"
+input = ["carry_a"]
+multiplicity = "μ"
+
+[[constraints.addition]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "out_e", "i"]]
+multiplicity = "μ"
+iter = ["i", 0, 1]
+
+[[constraints.addition]]
+kind = "arith"
+constraint = "$#`carry_e` in {0, 1, 2}$"
+poly = ["*", "carry_e", ["-", "carry_e", 1], ["-", "carry_e", 2]]
+
+[[constraint_groups]]
+name = "output"
+
+[[constraints.output]]
+kind = "interaction"
+tag = "SHA256ROUND"
+# TODO: types
+input = ["timestamp", ["arr", "a", "b", "c", "d", "e", "f", "g", "h"], "index"]
+multiplicity = ["-", "μ"]
+
+[[constraints.output]]
+kind = "interaction"
+tag = "SHA256ROUND"
+# TODO: types
+input = ["timestamp", ["arr", "out_a", "a", "b", "c", "out_e", "e", "f", "g"], ["+", "index", 1]]
+multiplicity = "μ"
