@@ -8,8 +8,10 @@
   authors: ("3MI Labs", "Aligned"),
   version: "0.2",
   summary: (
+    ("stark.typ", [STARK protocol], <stark>),
     ("logup.typ", [LogUp argument], <logup>),
     ("memory.typ", [Memory argument], <memory>),
+    ("verifier.typ", [Verifier specification], <verifier>),
     ("variables.typ", [Variables], <vars>),
     ("signatures.typ", [Signatures], <signatures>),
     ("is_bit.typ", [IS_BIT template], <isbit>),
@@ -27,8 +29,6 @@
     ("load.typ", [LOAD chip], <load>),
     ("ecall.typ", [ECALL chips], <ecall>),
     ("bitwise.typ", [BITWISE chips], <bitwise>),
-    ("stark.typ", [STARK protocol], <stark>),
-    ("verifier.typ", [Verifier specification], <verifier>),
   )
 )
 #book-meta(
