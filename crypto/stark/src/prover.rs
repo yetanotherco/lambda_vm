@@ -636,6 +636,7 @@ pub trait IsStarkProver<
                 *trace,
                 domain,
                 &round_1_result.rap_challenges,
+                round_1_result.bus_public_inputs.as_ref(),
             );
         }
     }
