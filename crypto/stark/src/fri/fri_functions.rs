@@ -66,6 +66,36 @@ pub fn fold_evaluations_in_place<F: IsSubFieldOf<E>, E: IsField>(
     evals.truncate(half);
 }
 
+/// Compute inverse twiddle factors for evaluation-form FRI folding.
+///
+/// For a coset of size N with offset g, the twiddle factors are 1/x_j where
+/// x_j are the coset points at even bit-reversed positions. Specifically:
+/// generate g·w^i for i=0..N/2 (half the coset points), bit-reverse with
+/// (logN-1) bits, then batch-invert.
+pub fn compute_coset_twiddles_inv<F: IsFFTField>(
+    coset_offset: &FieldElement<F>,
+    domain_size: usize,
+) -> Vec<FieldElement<F>> {
+    let half = domain_size / 2;
+    let order = domain_size.trailing_zeros() as u64;
+    let mut points = get_powers_of_primitive_root_coset(order, half, coset_offset).unwrap();
+    in_place_bit_reverse_permute(&mut points);
+    FieldElement::inplace_batch_inverse(&mut points).unwrap();
+    points
+}
+
+/// Update inverse twiddle factors for the next FRI layer.
+///
+/// Between levels: new_tw[j'] = tw[2j']² (take even-indexed, square).
+/// This corresponds to the squared coset offset and halved domain.
+pub fn update_twiddles_in_place<F: IsField>(twiddles: &mut Vec<FieldElement<F>>) {
+    let new_len = twiddles.len() / 2;
+    for j in 0..new_len {
+        twiddles[j] = twiddles[2 * j].square();
+    }
+    twiddles.truncate(new_len);
+}
+
 #[cfg(test)]
 mod tests {
     use super::fold_polynomial_doubled_inplace;
@@ -216,34 +246,4 @@ mod tests {
         fold_polynomial_doubled_inplace(&mut p, &beta);
         assert_eq!(p, Polynomial::new(&[FE::new(10)])); // 5 * 2 = 10
     }
-}
-
-/// Compute inverse twiddle factors for evaluation-form FRI folding.
-///
-/// For a coset of size N with offset g, the twiddle factors are 1/x_j where
-/// x_j are the coset points at even bit-reversed positions. Specifically:
-/// generate g·w^i for i=0..N/2 (half the coset points), bit-reverse with
-/// (logN-1) bits, then batch-invert.
-pub fn compute_coset_twiddles_inv<F: IsFFTField>(
-    coset_offset: &FieldElement<F>,
-    domain_size: usize,
-) -> Vec<FieldElement<F>> {
-    let half = domain_size / 2;
-    let order = domain_size.trailing_zeros() as u64;
-    let mut points = get_powers_of_primitive_root_coset(order, half, coset_offset).unwrap();
-    in_place_bit_reverse_permute(&mut points);
-    FieldElement::inplace_batch_inverse(&mut points).unwrap();
-    points
-}
-
-/// Update inverse twiddle factors for the next FRI layer.
-///
-/// Between levels: new_tw[j'] = tw[2j']² (take even-indexed, square).
-/// This corresponds to the squared coset offset and halved domain.
-pub fn update_twiddles_in_place<F: IsField>(twiddles: &mut Vec<FieldElement<F>>) {
-    let new_len = twiddles.len() / 2;
-    for j in 0..new_len {
-        twiddles[j] = twiddles[2 * j].square();
-    }
-    twiddles.truncate(new_len);
 }
