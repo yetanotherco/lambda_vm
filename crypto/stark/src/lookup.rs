@@ -1481,37 +1481,42 @@ where
     let multiplicities_a = compute_multiplicities(interaction_a);
     let multiplicities_b = compute_multiplicities(interaction_b);
 
+    // Compute fingerprints for both interactions using accumulate_fingerprint
+    // (zero-allocation inner loop: F×E multiplication instead of to_extension())
+    let bus_id_a = FieldElement::<F>::from(interaction_a.bus_id);
+    let bus_id_b = FieldElement::<F>::from(interaction_b.bus_id);
+
     // Concatenate both fingerprint vectors for a single batch inversion
     let mut all_fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(2 * trace_len);
 
     for row in 0..trace_len {
-        let mut bus_elements_a: Vec<FieldElement<E>> =
-            vec![FieldElement::from(interaction_a.bus_id)];
-        bus_elements_a.extend(interaction_a.values.iter().flat_map(|bv| {
-            let combined: Vec<FieldElement<F>> =
-                bv.combine_from(|col| main_segment_cols[col][row].clone());
-            combined.into_iter().map(|v| v.to_extension())
-        }));
-        let lc_a: FieldElement<E> = bus_elements_a
-            .iter()
-            .zip(alpha_powers.iter())
-            .map(|(v, coeff)| v * coeff)
-            .sum();
+        let mut lc_a = &bus_id_a * &alpha_powers[0];
+        let mut alpha_offset = 1;
+        for bv in &interaction_a.values {
+            let consumed = bv.accumulate_fingerprint(
+                main_segment_cols,
+                row,
+                &alpha_powers,
+                alpha_offset,
+                &mut lc_a,
+            );
+            alpha_offset += consumed;
+        }
         all_fingerprints.push(z - &lc_a);
     }
     for row in 0..trace_len {
-        let mut bus_elements_b: Vec<FieldElement<E>> =
-            vec![FieldElement::from(interaction_b.bus_id)];
-        bus_elements_b.extend(interaction_b.values.iter().flat_map(|bv| {
-            let combined: Vec<FieldElement<F>> =
-                bv.combine_from(|col| main_segment_cols[col][row].clone());
-            combined.into_iter().map(|v| v.to_extension())
-        }));
-        let lc_b: FieldElement<E> = bus_elements_b
-            .iter()
-            .zip(alpha_powers.iter())
-            .map(|(v, coeff)| v * coeff)
-            .sum();
+        let mut lc_b = &bus_id_b * &alpha_powers[0];
+        let mut alpha_offset = 1;
+        for bv in &interaction_b.values {
+            let consumed = bv.accumulate_fingerprint(
+                main_segment_cols,
+                row,
+                &alpha_powers,
+                alpha_offset,
+                &mut lc_b,
+            );
+            alpha_offset += consumed;
+        }
         all_fingerprints.push(z - &lc_b);
     }
 
