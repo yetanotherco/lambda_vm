@@ -178,16 +178,18 @@ mod avx2 {
 
         for i in 0..simd_count {
             let j = i * 4;
-            let a = PackedGoldilocks4::load(&data[j..]);
-            let b = PackedGoldilocks4::load(&data[j + half_block..]);
-            let w = PackedGoldilocks4::load(&twiddles[j..]);
+            unsafe {
+                let a = PackedGoldilocks4::load(&data[j..]);
+                let b = PackedGoldilocks4::load(&data[j + half_block..]);
+                let w = PackedGoldilocks4::load(&twiddles[j..]);
 
-            let sum = a + b;
-            let diff = a - b;
-            let diff_w = w * diff;
+                let sum = a + b;
+                let diff = a - b;
+                let diff_w = w * diff;
 
-            sum.store(&mut data[j..]);
-            diff_w.store(&mut data[j + half_block..]);
+                sum.store(&mut data[j..]);
+                diff_w.store(&mut data[j + half_block..]);
+            }
         }
 
         for (j, &tw) in (scalar_start..).zip(&twiddles[scalar_start..half_block]) {
@@ -210,35 +212,37 @@ mod avx2 {
             let i2 = j + 2 * quarter;
             let i3 = j + 3 * quarter;
 
-            let a0 = PackedGoldilocks4::load(&block[i0..]);
-            let a1 = PackedGoldilocks4::load(&block[i1..]);
-            let a2 = PackedGoldilocks4::load(&block[i2..]);
-            let a3 = PackedGoldilocks4::load(&block[i3..]);
+            unsafe {
+                let a0 = PackedGoldilocks4::load(&block[i0..]);
+                let a1 = PackedGoldilocks4::load(&block[i1..]);
+                let a2 = PackedGoldilocks4::load(&block[i2..]);
+                let a3 = PackedGoldilocks4::load(&block[i3..]);
 
-            let w0 = PackedGoldilocks4::load(&tw0[j..]);
-            let w1 = PackedGoldilocks4::load(&tw0[j + quarter..]);
-            let w2 = PackedGoldilocks4::load(&tw1[j..]);
+                let w0 = PackedGoldilocks4::load(&tw0[j..]);
+                let w1 = PackedGoldilocks4::load(&tw0[j + quarter..]);
+                let w2 = PackedGoldilocks4::load(&tw1[j..]);
 
-            let sum_02 = a0 + a2;
-            let diff_02 = a0 - a2;
-            let diff_02_w = w0 * diff_02;
+                let sum_02 = a0 + a2;
+                let diff_02 = a0 - a2;
+                let diff_02_w = w0 * diff_02;
 
-            let sum_13 = a1 + a3;
-            let diff_13 = a1 - a3;
-            let diff_13_w = w1 * diff_13;
+                let sum_13 = a1 + a3;
+                let diff_13 = a1 - a3;
+                let diff_13_w = w1 * diff_13;
 
-            let final_0 = sum_02 + sum_13;
-            let diff_sums = sum_02 - sum_13;
-            let final_1 = w2 * diff_sums;
+                let final_0 = sum_02 + sum_13;
+                let diff_sums = sum_02 - sum_13;
+                let final_1 = w2 * diff_sums;
 
-            let final_2 = diff_02_w + diff_13_w;
-            let diff_diffs = diff_02_w - diff_13_w;
-            let final_3 = w2 * diff_diffs;
+                let final_2 = diff_02_w + diff_13_w;
+                let diff_diffs = diff_02_w - diff_13_w;
+                let final_3 = w2 * diff_diffs;
 
-            final_0.store(&mut block[i0..]);
-            final_1.store(&mut block[i1..]);
-            final_2.store(&mut block[i2..]);
-            final_3.store(&mut block[i3..]);
+                final_0.store(&mut block[i0..]);
+                final_1.store(&mut block[i1..]);
+                final_2.store(&mut block[i2..]);
+                final_3.store(&mut block[i3..]);
+            }
         }
 
         // Scalar tail
@@ -281,16 +285,18 @@ mod avx2 {
 
         for i in 0..simd_count {
             let j = i * 4;
-            let a = PackedGoldilocks4::load(&data[j..]);
-            let b = PackedGoldilocks4::load(&data[j + half_block..]);
-            let w = PackedGoldilocks4::load(&twiddles[j..]);
+            unsafe {
+                let a = PackedGoldilocks4::load(&data[j..]);
+                let b = PackedGoldilocks4::load(&data[j + half_block..]);
+                let w = PackedGoldilocks4::load(&twiddles[j..]);
 
-            let bw = w * b;
-            let sum = a + bw;
-            let diff = a - bw;
+                let bw = w * b;
+                let sum = a + bw;
+                let diff = a - bw;
 
-            sum.store(&mut data[j..]);
-            diff.store(&mut data[j + half_block..]);
+                sum.store(&mut data[j..]);
+                diff.store(&mut data[j + half_block..]);
+            }
         }
 
         for (j, &tw) in (scalar_start..).zip(&twiddles[scalar_start..half_block]) {
@@ -334,17 +340,17 @@ pub fn dit_butterfly_neon(data: &mut [u64], twiddles: &[u64], half_block: usize)
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub unsafe fn dif_butterfly_avx2(data: &mut [u64], twiddles: &[u64], half_block: usize) {
-    avx2::dif_butterfly(data, twiddles, half_block);
+    unsafe { avx2::dif_butterfly(data, twiddles, half_block) };
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub unsafe fn dif_fused_butterfly_avx2(block: &mut [u64], tw0: &[u64], tw1: &[u64]) {
-    avx2::dif_fused_butterfly(block, tw0, tw1);
+    unsafe { avx2::dif_fused_butterfly(block, tw0, tw1) };
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub unsafe fn dit_butterfly_avx2(data: &mut [u64], twiddles: &[u64], half_block: usize) {
-    avx2::dit_butterfly(data, twiddles, half_block);
+    unsafe { avx2::dit_butterfly(data, twiddles, half_block) };
 }
