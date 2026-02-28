@@ -8,3 +8,5 @@ pub mod fft;
 pub mod ops;
 #[cfg(feature = "alloc")]
 pub mod roots_of_unity;
+#[cfg(feature = "alloc")]
+pub(crate) mod simd_butterflies;

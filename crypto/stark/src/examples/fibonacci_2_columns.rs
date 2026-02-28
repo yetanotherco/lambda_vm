@@ -28,7 +28,7 @@ impl<F: IsFFTField> FibTransition1<F> {
 
 impl<F> TransitionConstraint<F, F> for FibTransition1<F>
 where
-    F: IsFFTField + Send + Sync,
+    F: IsFFTField + Send + Sync + 'static,
 {
     fn degree(&self) -> usize {
         1
@@ -91,7 +91,7 @@ impl<F: IsFFTField> FibTransition2<F> {
 
 impl<F> TransitionConstraint<F, F> for FibTransition2<F>
 where
-    F: IsFFTField + Send + Sync,
+    F: IsFFTField + Send + Sync + 'static,
 {
     fn degree(&self) -> usize {
         1
@@ -210,7 +210,7 @@ where
     }
 }
 
-pub fn compute_trace<F: IsFFTField>(
+pub fn compute_trace<F: IsFFTField + 'static>(
     initial_values: [FieldElement<F>; 2],
     trace_length: usize,
 ) -> TraceTable<F, F> {

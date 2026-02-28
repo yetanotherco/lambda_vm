@@ -26,7 +26,7 @@ impl<F: IsFFTField> FibConstraint<F> {
 
 impl<F> TransitionConstraint<F, F> for FibConstraint<F>
 where
-    F: IsFFTField + Send + Sync,
+    F: IsFFTField + Send + Sync + 'static,
 {
     fn degree(&self) -> usize {
         1
@@ -150,7 +150,7 @@ where
     }
 }
 
-pub fn fibonacci_trace<F: IsFFTField>(
+pub fn fibonacci_trace<F: IsFFTField + 'static>(
     initial_values: [FieldElement<F>; 2],
     trace_length: usize,
 ) -> TraceTable<F, F> {

@@ -122,8 +122,8 @@ where
 
 /// AIR is a representation of the Constraints
 pub trait AIR: Send + Sync {
-    type Field: IsFFTField + IsSubFieldOf<Self::FieldExtension> + Send + Sync;
-    type FieldExtension: IsField + Send + Sync;
+    type Field: IsFFTField + IsSubFieldOf<Self::FieldExtension> + Send + Sync + 'static;
+    type FieldExtension: IsField + Send + Sync + 'static;
     type PublicInputs;
 
     fn step_size(&self) -> usize;

@@ -31,16 +31,16 @@ use std::time::Instant;
 
 /// A default STARK verifier implementing `IsStarkVerifier`.
 pub struct Verifier<
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: Send + Sync + IsField,
+    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync + 'static,
+    FieldExtension: Send + Sync + IsField + 'static,
     PI,
 > {
     phantom: PhantomData<(Field, FieldExtension, PI)>,
 }
 
 impl<
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: IsField + Send + Sync,
+    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync + 'static,
+    FieldExtension: IsField + Send + Sync + 'static,
     PI,
 > IsStarkVerifier<Field, FieldExtension, PI> for Verifier<Field, FieldExtension, PI>
 {
@@ -77,8 +77,8 @@ pub type DeepPolynomialEvaluations<F> = (Vec<FieldElement<F>>, Vec<FieldElement<
 /// The functionality of a STARK verifier providing methods to run the STARK Verify protocol
 /// https://lambdaclass.github.io/lambdaworks/starks/protocol.html
 pub trait IsStarkVerifier<
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: Send + Sync + IsField,
+    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync + 'static,
+    FieldExtension: Send + Sync + IsField + 'static,
     PI,
 >
 {

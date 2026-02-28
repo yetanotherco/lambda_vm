@@ -12,7 +12,7 @@ use math::polynomial::Polynomial;
 /// over the computation that wants to be proven must comply with.
 pub trait TransitionConstraint<F, E>: Send + Sync
 where
-    F: IsSubFieldOf<E> + IsFFTField + Send + Sync,
+    F: IsSubFieldOf<E> + IsFFTField + Send + Sync + 'static,
     E: IsField + Send + Sync,
 {
     /// The degree of the constraint interpreting it as a multivariate polynomial.

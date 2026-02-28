@@ -32,7 +32,7 @@ impl<F: IsFFTField> AdditionConstraint<F> {
 
 impl<F> TransitionConstraint<F, F> for AdditionConstraint<F>
 where
-    F: IsFFTField + Send + Sync,
+    F: IsFFTField + Send + Sync + 'static,
 {
     fn degree(&self) -> usize {
         1
@@ -165,7 +165,7 @@ where
 
 /// Creates a trace table with `num_rows` rows where each row satisfies col0 + col1 = col2.
 /// The values are: row i has col0=i+1, col1=i+2, col2=2i+3
-pub fn simple_addition_trace<F: IsFFTField>(num_rows: usize) -> TraceTable<F, F> {
+pub fn simple_addition_trace<F: IsFFTField + 'static>(num_rows: usize) -> TraceTable<F, F> {
     let mut col0 = Vec::with_capacity(num_rows);
     let mut col1 = Vec::with_capacity(num_rows);
     let mut col2 = Vec::with_capacity(num_rows);

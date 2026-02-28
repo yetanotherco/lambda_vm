@@ -786,8 +786,8 @@ impl<
 
 impl<F, E, B, PI> crate::traits::AIR for AirWithBuses<F, E, B, PI>
 where
-    F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
-    E: IsField + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
     B: BoundaryConstraintBuilder<F, E, PI>,
     PI: Send + Sync,
 {
@@ -1330,7 +1330,7 @@ fn build_accumulated_column_from_terms<F, E>(
     term_columns: &[Vec<FieldElement<E>>],
     trace: &mut TraceTable<F, E>,
 ) where
-    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync + 'static,
     E: IsField + Send + Sync,
 {
     if term_columns.is_empty() {
@@ -1421,7 +1421,7 @@ impl LookupTermConstraint {
 
 impl<F, E> TransitionConstraint<F, E> for LookupTermConstraint
 where
-    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync + 'static,
     E: IsField + Send + Sync,
 {
     fn degree(&self) -> usize {
@@ -1728,7 +1728,7 @@ impl LookupAccumulatedConstraint {
 
 impl<F, E> TransitionConstraint<F, E> for LookupAccumulatedConstraint
 where
-    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync + 'static,
     E: IsField + Send + Sync,
 {
     fn degree(&self) -> usize {

@@ -85,8 +85,8 @@ pub fn new_domain<Field, FieldExtension, PI>(
     trace_length: usize,
 ) -> Domain<Field>
 where
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: Send + Sync + IsField,
+    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync + 'static,
+    FieldExtension: Send + Sync + IsField + 'static,
 {
     // Initial definitions
     let blowup_factor = air.options().blowup_factor as usize;
@@ -128,8 +128,8 @@ pub fn new_verifier_domain<Field, FieldExtension, PI>(
     trace_length: usize,
 ) -> VerifierDomain<Field>
 where
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: Send + Sync + IsField,
+    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync + 'static,
+    FieldExtension: Send + Sync + IsField + 'static,
 {
     let blowup_factor = air.options().blowup_factor as usize;
     let coset_offset = FieldElement::from(air.options().coset_offset);

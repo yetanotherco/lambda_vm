@@ -37,7 +37,7 @@ where
 impl<F, E> TraceTable<F, E>
 where
     E: IsField,
-    F: IsSubFieldOf<E> + IsFFTField,
+    F: IsSubFieldOf<E> + IsFFTField + 'static,
 {
     /// Creates a new TraceTable from from a one-dimensional array in row major order and the intended width of the table.
     /// Step size is how many are needed to represent a state of the VM
@@ -152,7 +152,7 @@ where
 
     pub fn compute_trace_polys_main<S>(&self) -> Vec<Polynomial<FieldElement<F>>>
     where
-        S: IsFFTField + IsSubFieldOf<F>,
+        S: IsFFTField + IsSubFieldOf<F> + 'static,
         F: Send + Sync,
         FieldElement<F>: Send + Sync,
     {

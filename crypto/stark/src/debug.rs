@@ -18,8 +18,8 @@ use math::{
 /// Accepts a `TraceTable` directly (no coefficient-form polynomials needed).
 /// The trace table contains the original trace values on the interpolation domain.
 pub fn validate_trace<
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: Send + Sync + IsField,
+    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync + 'static,
+    FieldExtension: Send + Sync + IsField + 'static,
     PI,
 >(
     air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,

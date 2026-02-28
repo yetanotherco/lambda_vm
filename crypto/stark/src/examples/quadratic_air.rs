@@ -27,7 +27,7 @@ impl<F: IsFFTField> QuadraticConstraint<F> {
 
 impl<F> TransitionConstraint<F, F> for QuadraticConstraint<F>
 where
-    F: IsFFTField + Send + Sync,
+    F: IsFFTField + Send + Sync + 'static,
 {
     fn degree(&self) -> usize {
         2
@@ -149,7 +149,7 @@ where
     }
 }
 
-pub fn quadratic_trace<F: IsFFTField>(
+pub fn quadratic_trace<F: IsFFTField + 'static>(
     initial_value: FieldElement<F>,
     trace_length: usize,
 ) -> TraceTable<F, F> {

@@ -34,7 +34,7 @@ impl<F: IsFFTField> ContinuityConstraint<F> {
 
 impl<F> TransitionConstraint<F, F> for ContinuityConstraint<F>
 where
-    F: IsFFTField + Send + Sync,
+    F: IsFFTField + Send + Sync + 'static,
 {
     fn degree(&self) -> usize {
         2
@@ -100,7 +100,7 @@ impl<F: IsFFTField> SingleValueConstraint<F> {
 
 impl<F> TransitionConstraint<F, F> for SingleValueConstraint<F>
 where
-    F: IsFFTField + Send + Sync,
+    F: IsFFTField + Send + Sync + 'static,
 {
     fn degree(&self) -> usize {
         2
@@ -168,7 +168,7 @@ impl<F: IsFFTField> PermutationConstraint<F> {
 
 impl<F> TransitionConstraint<F, F> for PermutationConstraint<F>
 where
-    F: IsFFTField + Send + Sync,
+    F: IsFFTField + Send + Sync + 'static,
 {
     fn degree(&self) -> usize {
         2
@@ -379,7 +379,7 @@ where
 
 /// Given the adress and value columns, it returns the trace table with 5 columns, which are:
 /// Addres, Value, Adress Sorted, Value Sorted and a Column of Zeroes (where we'll insert the auxiliary colunn).
-pub fn sort_rap_trace<F: IsFFTField + IsPrimeField>(
+pub fn sort_rap_trace<F: IsFFTField + IsPrimeField + 'static>(
     address: Vec<FieldElement<F>>,
     value: Vec<FieldElement<F>>,
 ) -> TraceTable<F, F> {

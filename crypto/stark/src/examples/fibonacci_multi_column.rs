@@ -46,7 +46,7 @@ where
 
 impl<F, E> TransitionConstraint<F, E> for FibColumnConstraint<F, E>
 where
-    F: IsSubFieldOf<E> + IsFFTField + Send + Sync,
+    F: IsSubFieldOf<E> + IsFFTField + Send + Sync + 'static,
     E: IsField + Send + Sync,
 {
     fn degree(&self) -> usize {
@@ -239,7 +239,7 @@ pub fn compute_trace<F, E>(
     trace_length: usize,
 ) -> TraceTable<F, E>
 where
-    F: IsSubFieldOf<E> + IsFFTField + Send + Sync,
+    F: IsSubFieldOf<E> + IsFFTField + Send + Sync + 'static,
     E: IsField + Send + Sync,
 {
     let num_columns = initial_values.len();

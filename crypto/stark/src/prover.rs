@@ -50,16 +50,16 @@ type AirTracePair<'a, Field, FieldExtension, PI> = (
 
 /// A default STARK prover implementing `IsStarkProver`.
 pub struct Prover<
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: Send + Sync + IsField,
+    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync + 'static,
+    FieldExtension: Send + Sync + IsField + 'static,
     PI,
 > {
     p: PhantomData<(Field, FieldExtension, PI)>,
 }
 
 impl<
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: Send + Sync + IsField,
+    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync + 'static,
+    FieldExtension: Send + Sync + IsField + 'static,
     PI,
 > IsStarkProver<Field, FieldExtension, PI> for Prover<Field, FieldExtension, PI>
 {
@@ -249,8 +249,8 @@ pub fn evaluate_polynomial_on_lde_domain<F, E>(
     offset: &FieldElement<F>,
 ) -> Result<Vec<FieldElement<E>>, FFTError>
 where
-    F: IsFFTField + IsSubFieldOf<E>,
-    E: IsField + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + 'static,
+    E: IsField + Send + Sync + 'static,
 {
     let evaluations = Polynomial::evaluate_offset_fft(p, blowup_factor, Some(domain_size), offset)?;
     let step = evaluations.len() / (domain_size * blowup_factor);
@@ -265,8 +265,8 @@ where
 /// The default implementation is complete and is compatible with Stone prover
 /// https://github.com/starkware-libs/stone-prover
 pub trait IsStarkProver<
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: Send + Sync + IsField,
+    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync + 'static,
+    FieldExtension: Send + Sync + IsField + 'static,
     PI,
 >
 {
@@ -358,7 +358,7 @@ pub trait IsStarkProver<
         twiddles: &LdeTwiddles<Field>,
     ) -> Vec<Vec<FieldElement<E>>>
     where
-        E: IsSubFieldOf<FieldExtension> + Send + Sync,
+        E: IsSubFieldOf<FieldExtension> + Send + Sync + 'static,
         Field: IsSubFieldOf<E>,
         FieldElement<E>: Send + Sync,
     {
@@ -397,7 +397,7 @@ pub trait IsStarkProver<
         twiddles: &LdeTwiddles<Field>,
     ) where
         Field: IsSubFieldOf<E>,
-        E: IsSubFieldOf<FieldExtension> + IsField + Send + Sync,
+        E: IsSubFieldOf<FieldExtension> + IsField + Send + Sync + 'static,
         FieldElement<E>: Send + Sync,
     {
         if num_cols == 0 {

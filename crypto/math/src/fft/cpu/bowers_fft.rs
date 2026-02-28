@@ -41,6 +41,9 @@ use crate::field::{
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
+#[cfg(feature = "alloc")]
+use crate::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
+
 /// Maximum supported FFT order to prevent integer overflow.
 /// With order 63, n = 2^63 which is the largest power of 2 that fits in usize on 64-bit.
 /// For 32-bit systems, max order is 31.
@@ -207,8 +210,8 @@ pub fn bowers_fft_opt_fused_parallel<F, E>(
     layer_twiddles: &LayerTwiddles<F>,
 ) -> Result<(), FFTError>
 where
-    F: IsFFTField + IsSubFieldOf<E>,
-    E: IsField + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + 'static,
+    E: IsField + Send + Sync + 'static,
     FieldElement<F>: Send + Sync,
     FieldElement<E>: Send + Sync,
 {
@@ -276,18 +279,8 @@ where
             });
         } else {
             for block_start in (0..n).step_by(block_size) {
-                for j in 0..half_block {
-                    let i0 = block_start + j;
-                    let i1 = i0 + half_block;
-                    let w = &twiddles[j];
-
-                    let sum = &input[i0] + &input[i1];
-                    let diff = &input[i0] - &input[i1];
-                    let diff_w = w * &diff;
-
-                    input[i0] = sum;
-                    input[i1] = diff_w;
-                }
+                let block = &mut input[block_start..block_start + block_size];
+                process_single_layer_block(block, twiddles, half_block);
             }
         }
         layer += 1;
@@ -304,9 +297,45 @@ fn process_fused_block<F, E>(
     twiddles_l0: &[FieldElement<F>],
     twiddles_l1: &[FieldElement<F>],
 ) where
-    F: IsFFTField + IsSubFieldOf<E>,
-    E: IsField,
+    F: IsFFTField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
 {
+    // SIMD dispatch for GoldilocksField
+    #[cfg(target_arch = "aarch64")]
+    if core::any::TypeId::of::<F>() == core::any::TypeId::of::<GoldilocksField>()
+        && core::any::TypeId::of::<E>() == core::any::TypeId::of::<GoldilocksField>()
+    {
+        let data =
+            unsafe { core::slice::from_raw_parts_mut(block.as_mut_ptr() as *mut u64, block.len()) };
+        let tw0 = unsafe {
+            core::slice::from_raw_parts(twiddles_l0.as_ptr() as *const u64, twiddles_l0.len())
+        };
+        let tw1 = unsafe {
+            core::slice::from_raw_parts(twiddles_l1.as_ptr() as *const u64, twiddles_l1.len())
+        };
+        super::simd_butterflies::dif_fused_butterfly_neon(data, tw0, tw1);
+        return;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    if core::any::TypeId::of::<F>() == core::any::TypeId::of::<GoldilocksField>()
+        && core::any::TypeId::of::<E>() == core::any::TypeId::of::<GoldilocksField>()
+    {
+        if is_x86_feature_detected!("avx2") {
+            let data = unsafe {
+                core::slice::from_raw_parts_mut(block.as_mut_ptr() as *mut u64, block.len())
+            };
+            let tw0 = unsafe {
+                core::slice::from_raw_parts(twiddles_l0.as_ptr() as *const u64, twiddles_l0.len())
+            };
+            let tw1 = unsafe {
+                core::slice::from_raw_parts(twiddles_l1.as_ptr() as *const u64, twiddles_l1.len())
+            };
+            unsafe { super::simd_butterflies::dif_fused_butterfly_avx2(data, tw0, tw1) };
+            return;
+        }
+    }
+
     let block_size = block.len();
     let quarter = block_size >> 2;
 
@@ -368,9 +397,40 @@ fn process_single_layer_block<F, E>(
     twiddles: &[FieldElement<F>],
     half_block: usize,
 ) where
-    F: IsFFTField + IsSubFieldOf<E>,
-    E: IsField,
+    F: IsFFTField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
 {
+    // SIMD dispatch for GoldilocksField
+    #[cfg(target_arch = "aarch64")]
+    if core::any::TypeId::of::<F>() == core::any::TypeId::of::<GoldilocksField>()
+        && core::any::TypeId::of::<E>() == core::any::TypeId::of::<GoldilocksField>()
+        && half_block >= super::simd_butterflies::NEON_MIN_HALF_BLOCK
+    {
+        let data =
+            unsafe { core::slice::from_raw_parts_mut(block.as_mut_ptr() as *mut u64, block.len()) };
+        let tw =
+            unsafe { core::slice::from_raw_parts(twiddles.as_ptr() as *const u64, twiddles.len()) };
+        super::simd_butterflies::dif_butterfly_neon(data, tw, half_block);
+        return;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    if core::any::TypeId::of::<F>() == core::any::TypeId::of::<GoldilocksField>()
+        && core::any::TypeId::of::<E>() == core::any::TypeId::of::<GoldilocksField>()
+        && half_block >= super::simd_butterflies::AVX2_MIN_HALF_BLOCK
+    {
+        if is_x86_feature_detected!("avx2") {
+            let data = unsafe {
+                core::slice::from_raw_parts_mut(block.as_mut_ptr() as *mut u64, block.len())
+            };
+            let tw = unsafe {
+                core::slice::from_raw_parts(twiddles.as_ptr() as *const u64, twiddles.len())
+            };
+            unsafe { super::simd_butterflies::dif_butterfly_avx2(data, tw, half_block) };
+            return;
+        }
+    }
+
     debug_assert!(
         twiddles.len() >= half_block,
         "twiddles too short: {} < {}",
@@ -567,8 +627,8 @@ pub fn bowers_ifft_opt<F, E>(
     layer_twiddles: &LayerTwiddles<F>,
 ) -> Result<(), FFTError>
 where
-    F: IsFFTField + IsSubFieldOf<E>,
-    E: IsField,
+    F: IsFFTField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
 {
     let n = input.len();
     if !n.is_power_of_two() {
@@ -629,8 +689,8 @@ pub fn bowers_ifft_opt_parallel<F, E>(
     layer_twiddles: &LayerTwiddles<F>,
 ) -> Result<(), FFTError>
 where
-    F: IsFFTField + IsSubFieldOf<E>,
-    E: IsField + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + 'static,
+    E: IsField + Send + Sync + 'static,
     FieldElement<F>: Send + Sync,
     FieldElement<E>: Send + Sync,
 {
@@ -669,18 +729,8 @@ where
             });
         } else {
             for block_start in (0..n).step_by(block_size) {
-                for j in 0..half_block {
-                    let i0 = block_start + j;
-                    let i1 = i0 + half_block;
-                    let w = &twiddles[j];
-
-                    let bw = w * &input[i1];
-                    let sum = &input[i0] + &bw;
-                    let diff = &input[i0] - &bw;
-
-                    input[i0] = sum;
-                    input[i1] = diff;
-                }
+                let block = &mut input[block_start..block_start + block_size];
+                process_ifft_single_layer_block(block, twiddles, half_block);
             }
         }
     }
@@ -696,9 +746,40 @@ fn process_ifft_single_layer_block<F, E>(
     twiddles: &[FieldElement<F>],
     half_block: usize,
 ) where
-    F: IsFFTField + IsSubFieldOf<E>,
-    E: IsField,
+    F: IsFFTField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
 {
+    // SIMD dispatch for GoldilocksField
+    #[cfg(target_arch = "aarch64")]
+    if core::any::TypeId::of::<F>() == core::any::TypeId::of::<GoldilocksField>()
+        && core::any::TypeId::of::<E>() == core::any::TypeId::of::<GoldilocksField>()
+        && half_block >= super::simd_butterflies::NEON_MIN_HALF_BLOCK
+    {
+        let data =
+            unsafe { core::slice::from_raw_parts_mut(block.as_mut_ptr() as *mut u64, block.len()) };
+        let tw =
+            unsafe { core::slice::from_raw_parts(twiddles.as_ptr() as *const u64, twiddles.len()) };
+        super::simd_butterflies::dit_butterfly_neon(data, tw, half_block);
+        return;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    if core::any::TypeId::of::<F>() == core::any::TypeId::of::<GoldilocksField>()
+        && core::any::TypeId::of::<E>() == core::any::TypeId::of::<GoldilocksField>()
+        && half_block >= super::simd_butterflies::AVX2_MIN_HALF_BLOCK
+    {
+        if is_x86_feature_detected!("avx2") {
+            let data = unsafe {
+                core::slice::from_raw_parts_mut(block.as_mut_ptr() as *mut u64, block.len())
+            };
+            let tw = unsafe {
+                core::slice::from_raw_parts(twiddles.as_ptr() as *const u64, twiddles.len())
+            };
+            unsafe { super::simd_butterflies::dit_butterfly_avx2(data, tw, half_block) };
+            return;
+        }
+    }
+
     debug_assert!(
         twiddles.len() >= half_block,
         "twiddles too short: {} < {}",
@@ -740,8 +821,8 @@ pub fn bowers_fft_opt_fused<F, E>(
     layer_twiddles: &LayerTwiddles<F>,
 ) -> Result<(), FFTError>
 where
-    F: IsFFTField + IsSubFieldOf<E>,
-    E: IsField,
+    F: IsFFTField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
 {
     let n = input.len();
     if !n.is_power_of_two() {
@@ -889,8 +970,8 @@ pub fn bowers_batch_fft_opt<F, E>(
     layer_twiddles: &LayerTwiddles<F>,
 ) -> Result<(), FFTError>
 where
-    F: IsFFTField + IsSubFieldOf<E>,
-    E: IsField,
+    F: IsFFTField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
 {
     if matrix.height == 0 || matrix.width <= 1 {
         return Ok(());

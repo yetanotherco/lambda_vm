@@ -32,7 +32,7 @@ impl<F: IsFFTField> FibConstraint<F> {
 
 impl<F> TransitionConstraint<F, F> for FibConstraint<F>
 where
-    F: IsFFTField + Send + Sync,
+    F: IsFFTField + Send + Sync + 'static,
 {
     fn degree(&self) -> usize {
         1
@@ -97,7 +97,7 @@ impl<F: IsFFTField> PermutationConstraint<F> {
 
 impl<F> TransitionConstraint<F, F> for PermutationConstraint<F>
 where
-    F: IsFFTField + Send + Sync,
+    F: IsFFTField + Send + Sync + 'static,
 {
     fn degree(&self) -> usize {
         2
@@ -278,7 +278,7 @@ where
     }
 }
 
-pub fn fibonacci_rap_trace<F: IsFFTField>(
+pub fn fibonacci_rap_trace<F: IsFFTField + 'static>(
     initial_values: [FieldElement<F>; 2],
     trace_length: usize,
 ) -> TraceTable<F, F> {

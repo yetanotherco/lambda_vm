@@ -31,7 +31,7 @@ impl<F: IsFFTField> FibConstraint<F> {
 
 impl<F> TransitionConstraint<F, F> for FibConstraint<F>
 where
-    F: IsFFTField + Send + Sync,
+    F: IsFFTField + Send + Sync + 'static,
 {
     fn degree(&self) -> usize {
         1
@@ -93,7 +93,7 @@ impl<F: IsFFTField> BitConstraint<F> {
 
 impl<F> TransitionConstraint<F, F> for BitConstraint<F>
 where
-    F: IsFFTField + Send + Sync,
+    F: IsFFTField + Send + Sync + 'static,
 {
     fn degree(&self) -> usize {
         2
@@ -204,7 +204,7 @@ impl AIR for DummyAIR {
     }
 }
 
-pub fn dummy_trace<F: IsFFTField>(trace_length: usize) -> TraceTable<F, F> {
+pub fn dummy_trace<F: IsFFTField + 'static>(trace_length: usize) -> TraceTable<F, F> {
     let mut ret: Vec<FieldElement<F>> = vec![];
 
     let a0 = FieldElement::one();

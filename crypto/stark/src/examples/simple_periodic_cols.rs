@@ -30,7 +30,7 @@ impl<F: IsFFTField> Default for PeriodicConstraint<F> {
 
 impl<F> TransitionConstraint<F, F> for PeriodicConstraint<F>
 where
-    F: IsFFTField + Send + Sync,
+    F: IsFFTField + Send + Sync + 'static,
 {
     fn degree(&self) -> usize {
         1
@@ -175,7 +175,7 @@ where
     }
 }
 
-pub fn simple_periodic_trace<F: IsFFTField>(trace_length: usize) -> TraceTable<F, F> {
+pub fn simple_periodic_trace<F: IsFFTField + 'static>(trace_length: usize) -> TraceTable<F, F> {
     let mut ret: Vec<FieldElement<F>> = vec![];
 
     ret.push(FieldElement::one());

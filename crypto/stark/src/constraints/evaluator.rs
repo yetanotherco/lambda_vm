@@ -31,8 +31,8 @@ pub struct ConstraintEvaluator<
 }
 impl<Field, FieldExtension, PI> ConstraintEvaluator<Field, FieldExtension, PI>
 where
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: Send + Sync + IsField,
+    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync + 'static,
+    FieldExtension: Send + Sync + IsField + 'static,
 {
     /// Evaluate transition + boundary constraints across the entire LDE domain.
     ///

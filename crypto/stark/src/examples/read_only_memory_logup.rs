@@ -47,7 +47,7 @@ where
 
 impl<F, E> TransitionConstraint<F, E> for ContinuityConstraint<F, E>
 where
-    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync + 'static,
     E: IsField + Send + Sync,
 {
     fn degree(&self) -> usize {
@@ -141,7 +141,7 @@ where
 
 impl<F, E> TransitionConstraint<F, E> for SingleValueConstraint<F, E>
 where
-    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync + 'static,
     E: IsField + Send + Sync,
 {
     fn degree(&self) -> usize {
@@ -242,7 +242,7 @@ where
 
 impl<F, E> TransitionConstraint<F, E> for PermutationConstraint<F, E>
 where
-    F: IsSubFieldOf<E> + IsFFTField + Send + Sync,
+    F: IsSubFieldOf<E> + IsFFTField + Send + Sync + 'static,
     E: IsField + Send + Sync,
 {
     fn degree(&self) -> usize {
@@ -526,7 +526,7 @@ where
 /// the multiplicities of each sorted address and value in the original ones (i.e. how many times
 /// they appear in the original address an value columns).
 pub fn read_only_logup_trace<
-    F: IsPrimeField + IsFFTField + IsSubFieldOf<E> + Send + Sync,
+    F: IsPrimeField + IsFFTField + IsSubFieldOf<E> + Send + Sync + 'static,
     E: IsField + Send + Sync,
 >(
     addresses: Vec<FieldElement<F>>,

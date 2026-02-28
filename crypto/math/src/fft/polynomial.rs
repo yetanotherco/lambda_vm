@@ -28,7 +28,7 @@ const PARALLEL_FFT_THRESHOLD: usize = 1 << 14;
 
 /// Dispatch forward FFT (DIF) to parallel or sequential implementation based on buffer size.
 #[inline]
-fn dispatch_fft<F: IsFFTField + IsSubFieldOf<E>, E: IsField + Send + Sync>(
+fn dispatch_fft<F: IsFFTField + IsSubFieldOf<E> + 'static, E: IsField + Send + Sync + 'static>(
     buffer: &mut [FieldElement<E>],
     twiddles: &LayerTwiddles<F>,
 ) -> Result<(), FFTError> {
@@ -43,7 +43,7 @@ fn dispatch_fft<F: IsFFTField + IsSubFieldOf<E>, E: IsField + Send + Sync>(
 
 /// Dispatch inverse FFT (DIT) to parallel or sequential implementation based on buffer size.
 #[inline]
-fn dispatch_ifft<F: IsFFTField + IsSubFieldOf<E>, E: IsField + Send + Sync>(
+fn dispatch_ifft<F: IsFFTField + IsSubFieldOf<E> + 'static, E: IsField + Send + Sync + 'static>(
     buffer: &mut [FieldElement<E>],
     twiddles: &LayerTwiddles<F>,
 ) -> Result<(), FFTError> {
@@ -56,12 +56,12 @@ fn dispatch_ifft<F: IsFFTField + IsSubFieldOf<E>, E: IsField + Send + Sync>(
     bowers_ifft_opt(buffer, twiddles)
 }
 
-impl<E: IsField> Polynomial<FieldElement<E>> {
+impl<E: IsField + 'static> Polynomial<FieldElement<E>> {
     /// Returns `N` evaluations of this polynomial using FFT over a domain in a subfield F of E (so the results
     /// are P(w^i), with w being a primitive root of unity).
     /// `N = max(self.coeff_len(), domain_size).next_power_of_two() * blowup_factor`.
     /// If `domain_size` is `None`, it defaults to 0.
-    pub fn evaluate_fft<F: IsFFTField + IsSubFieldOf<E>>(
+    pub fn evaluate_fft<F: IsFFTField + IsSubFieldOf<E> + 'static>(
         poly: &Polynomial<FieldElement<E>>,
         blowup_factor: usize,
         domain_size: Option<usize>,
@@ -102,7 +102,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     /// (so the results are P(w^i), with w being a primitive root of unity).
     /// `N = max(self.coeff_len(), domain_size).next_power_of_two() * blowup_factor`.
     /// If `domain_size` is `None`, it defaults to 0.
-    pub fn evaluate_offset_fft<F: IsFFTField + IsSubFieldOf<E>>(
+    pub fn evaluate_offset_fft<F: IsFFTField + IsSubFieldOf<E> + 'static>(
         poly: &Polynomial<FieldElement<E>>,
         blowup_factor: usize,
         domain_size: Option<usize>,
@@ -118,7 +118,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     /// Returns a new polynomial that interpolates `(w^i, fft_evals[i])`, with `w` being a
     /// Nth primitive root of unity in a subfield F of E, and `i in 0..N`, with `N = fft_evals.len()`.
     /// This is considered to be the inverse operation of [Self::evaluate_fft()].
-    pub fn interpolate_fft<F: IsFFTField + IsSubFieldOf<E>>(
+    pub fn interpolate_fft<F: IsFFTField + IsSubFieldOf<E> + 'static>(
         fft_evals: &[FieldElement<E>],
     ) -> Result<Self, FFTError>
     where
@@ -142,7 +142,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     /// Returns a new polynomial that interpolates offset `(w^i, fft_evals[i])`, with `w` being a
     /// Nth primitive root of unity in a subfield F of E, and `i in 0..N`, with `N = fft_evals.len()`.
     /// This is considered to be the inverse operation of [Self::evaluate_offset_fft()].
-    pub fn interpolate_offset_fft<F: IsFFTField + IsSubFieldOf<E>>(
+    pub fn interpolate_offset_fft<F: IsFFTField + IsSubFieldOf<E> + 'static>(
         fft_evals: &[FieldElement<E>],
         offset: &FieldElement<F>,
     ) -> Result<Polynomial<FieldElement<E>>, FFTError>
@@ -164,7 +164,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     ///
     /// Uses Bowers FFT internally. To share pre-computed twiddles across multiple
     /// columns, use [`coset_lde_with_twiddles`] instead.
-    pub fn coset_lde<F: IsFFTField + IsSubFieldOf<E>>(
+    pub fn coset_lde<F: IsFFTField + IsSubFieldOf<E> + 'static>(
         evals: &[FieldElement<E>],
         blowup_factor: usize,
         offset: &FieldElement<F>,
@@ -192,7 +192,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     ///
     /// - `inv_twiddles`: inverse twiddles for iFFT on the trace-size domain (order = log2(n))
     /// - `fwd_twiddles`: forward twiddles for FFT on the LDE-size domain (order = log2(n * blowup_factor))
-    pub fn coset_lde_with_twiddles<F: IsFFTField + IsSubFieldOf<E>>(
+    pub fn coset_lde_with_twiddles<F: IsFFTField + IsSubFieldOf<E> + 'static>(
         evals: &[FieldElement<E>],
         blowup_factor: usize,
         offset: &FieldElement<F>,
@@ -246,7 +246,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     /// Same as [`coset_lde_with_twiddles`], but also accepts pre-computed `weights[i] = offset^i / n`
     /// so that the scaling step avoids the running product across columns.
     /// Weights are in the base field F — the scaling `w * coeff` uses mixed F×E multiplication.
-    pub fn coset_lde_full<F: IsFFTField + IsSubFieldOf<E> + Send + Sync>(
+    pub fn coset_lde_full<F: IsFFTField + IsSubFieldOf<E> + Send + Sync + 'static>(
         evals: &[FieldElement<E>],
         blowup_factor: usize,
         weights: &[FieldElement<F>],
@@ -280,7 +280,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     /// The buffer is cleared and reused: `buffer.clear(); buffer.extend_from_slice(evals);
     /// buffer.resize(lde_size, zero)`. When the capacity is sufficient, no heap allocation occurs.
     /// Weights are in the base field F — the scaling `w * coeff` uses mixed F×E multiplication.
-    pub fn coset_lde_full_into<F: IsFFTField + IsSubFieldOf<E> + Send + Sync>(
+    pub fn coset_lde_full_into<F: IsFFTField + IsSubFieldOf<E> + Send + Sync + 'static>(
         evals: &[FieldElement<E>],
         blowup_factor: usize,
         weights: &[FieldElement<F>],
@@ -334,7 +334,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     /// Unlike [`coset_lde_full_into`], this skips the `clear + extend_from_slice` step
     /// since data is already in the buffer. Used for transpose elimination: columns are
     /// extracted directly into pool buffers, then expanded in-place.
-    pub fn coset_lde_full_expand<F: IsFFTField + IsSubFieldOf<E> + Send + Sync>(
+    pub fn coset_lde_full_expand<F: IsFFTField + IsSubFieldOf<E> + Send + Sync + 'static>(
         buffer: &mut Vec<FieldElement<E>>,
         blowup_factor: usize,
         weights: &[FieldElement<F>],
@@ -384,7 +384,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     /// This is an implementation of the fast division algorithm from
     /// [Gathen's book](https://www.cambridge.org/core/books/modern-computer-algebra/DB3563D4013401734851CF683D2F03F0)
     /// chapter 9
-    pub fn fast_fft_multiplication<F: IsFFTField + IsSubFieldOf<E>>(
+    pub fn fast_fft_multiplication<F: IsFFTField + IsSubFieldOf<E> + 'static>(
         &self,
         other: &Self,
     ) -> Result<Self, FFTError>
@@ -402,7 +402,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     /// Divides two polynomials with remainder.
     /// This is faster than the naive division if the degree of the divisor
     /// is greater than the degree of the dividend and both degrees are large enough.
-    pub fn fast_division<F: IsSubFieldOf<E> + IsFFTField>(
+    pub fn fast_division<F: IsSubFieldOf<E> + IsFFTField + 'static>(
         &self,
         divisor: &Self,
     ) -> Result<(Self, Self), FFTError>
@@ -437,7 +437,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
 
     /// Computes the inverse of polynomial P modulo x^k using Newton iteration.
     /// P must have an invertible constant term.
-    pub fn invert_polynomial_mod<F: IsSubFieldOf<E> + IsFFTField>(
+    pub fn invert_polynomial_mod<F: IsSubFieldOf<E> + IsFFTField + 'static>(
         &self,
         k: usize,
     ) -> Result<Self, FFTError>
@@ -474,8 +474,8 @@ pub fn compose_fft<F, E>(
     poly_2: &Polynomial<FieldElement<E>>,
 ) -> Polynomial<FieldElement<E>>
 where
-    F: IsFFTField + IsSubFieldOf<E>,
-    E: IsField + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + 'static,
+    E: IsField + Send + Sync + 'static,
 {
     let poly_2_evaluations = Polynomial::evaluate_fft::<F>(poly_2, 1, None).unwrap();
 
@@ -489,8 +489,8 @@ where
 
 pub fn evaluate_fft_cpu<F, E>(coeffs: &[FieldElement<E>]) -> Result<Vec<FieldElement<E>>, FFTError>
 where
-    F: IsFFTField + IsSubFieldOf<E>,
-    E: IsField + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + 'static,
+    E: IsField + Send + Sync + 'static,
 {
     let n = coeffs.len();
     if !n.is_power_of_two() {
@@ -510,8 +510,8 @@ pub fn interpolate_fft_cpu<F, E>(
     fft_evals: &[FieldElement<E>],
 ) -> Result<Polynomial<FieldElement<E>>, FFTError>
 where
-    F: IsFFTField + IsSubFieldOf<E>,
-    E: IsField + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + 'static,
+    E: IsField + Send + Sync + 'static,
 {
     let n = fft_evals.len();
     if !n.is_power_of_two() {
