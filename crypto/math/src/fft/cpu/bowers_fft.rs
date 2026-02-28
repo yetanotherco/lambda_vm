@@ -320,20 +320,18 @@ fn process_fused_block<F, E>(
     #[cfg(target_arch = "x86_64")]
     if core::any::TypeId::of::<F>() == core::any::TypeId::of::<GoldilocksField>()
         && core::any::TypeId::of::<E>() == core::any::TypeId::of::<GoldilocksField>()
+        && is_x86_feature_detected!("avx2")
     {
-        if is_x86_feature_detected!("avx2") {
-            let data = unsafe {
-                core::slice::from_raw_parts_mut(block.as_mut_ptr() as *mut u64, block.len())
-            };
-            let tw0 = unsafe {
-                core::slice::from_raw_parts(twiddles_l0.as_ptr() as *const u64, twiddles_l0.len())
-            };
-            let tw1 = unsafe {
-                core::slice::from_raw_parts(twiddles_l1.as_ptr() as *const u64, twiddles_l1.len())
-            };
-            unsafe { super::simd_butterflies::dif_fused_butterfly_avx2(data, tw0, tw1) };
-            return;
-        }
+        let data =
+            unsafe { core::slice::from_raw_parts_mut(block.as_mut_ptr() as *mut u64, block.len()) };
+        let tw0 = unsafe {
+            core::slice::from_raw_parts(twiddles_l0.as_ptr() as *const u64, twiddles_l0.len())
+        };
+        let tw1 = unsafe {
+            core::slice::from_raw_parts(twiddles_l1.as_ptr() as *const u64, twiddles_l1.len())
+        };
+        unsafe { super::simd_butterflies::dif_fused_butterfly_avx2(data, tw0, tw1) };
+        return;
     }
 
     let block_size = block.len();
@@ -418,17 +416,14 @@ fn process_single_layer_block<F, E>(
     if core::any::TypeId::of::<F>() == core::any::TypeId::of::<GoldilocksField>()
         && core::any::TypeId::of::<E>() == core::any::TypeId::of::<GoldilocksField>()
         && half_block >= super::simd_butterflies::AVX2_MIN_HALF_BLOCK
+        && is_x86_feature_detected!("avx2")
     {
-        if is_x86_feature_detected!("avx2") {
-            let data = unsafe {
-                core::slice::from_raw_parts_mut(block.as_mut_ptr() as *mut u64, block.len())
-            };
-            let tw = unsafe {
-                core::slice::from_raw_parts(twiddles.as_ptr() as *const u64, twiddles.len())
-            };
-            unsafe { super::simd_butterflies::dif_butterfly_avx2(data, tw, half_block) };
-            return;
-        }
+        let data =
+            unsafe { core::slice::from_raw_parts_mut(block.as_mut_ptr() as *mut u64, block.len()) };
+        let tw =
+            unsafe { core::slice::from_raw_parts(twiddles.as_ptr() as *const u64, twiddles.len()) };
+        unsafe { super::simd_butterflies::dif_butterfly_avx2(data, tw, half_block) };
+        return;
     }
 
     debug_assert!(
@@ -767,17 +762,14 @@ fn process_ifft_single_layer_block<F, E>(
     if core::any::TypeId::of::<F>() == core::any::TypeId::of::<GoldilocksField>()
         && core::any::TypeId::of::<E>() == core::any::TypeId::of::<GoldilocksField>()
         && half_block >= super::simd_butterflies::AVX2_MIN_HALF_BLOCK
+        && is_x86_feature_detected!("avx2")
     {
-        if is_x86_feature_detected!("avx2") {
-            let data = unsafe {
-                core::slice::from_raw_parts_mut(block.as_mut_ptr() as *mut u64, block.len())
-            };
-            let tw = unsafe {
-                core::slice::from_raw_parts(twiddles.as_ptr() as *const u64, twiddles.len())
-            };
-            unsafe { super::simd_butterflies::dit_butterfly_avx2(data, tw, half_block) };
-            return;
-        }
+        let data =
+            unsafe { core::slice::from_raw_parts_mut(block.as_mut_ptr() as *mut u64, block.len()) };
+        let tw =
+            unsafe { core::slice::from_raw_parts(twiddles.as_ptr() as *const u64, twiddles.len()) };
+        unsafe { super::simd_butterflies::dit_butterfly_avx2(data, tw, half_block) };
+        return;
     }
 
     debug_assert!(

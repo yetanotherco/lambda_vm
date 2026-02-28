@@ -3,9 +3,9 @@
 //! Provides `PackedGoldilocks4`, holding 4 Goldilocks field elements with
 //! parallel AVX2 operations. Used by the FFT butterfly kernels.
 //!
-//! **Important**: `_mm256_cmpgt_epi64` is signed. For unsigned overflow
-//! detection we compare `(a_signed > sum_signed)` which works because
-//! wrapping addition flips the sign bit on overflow.
+//! AVX2 only has signed 64-bit comparison (`_mm256_cmpgt_epi64`). For unsigned
+//! overflow/underflow detection, we XOR both operands with `0x8000_0000_0000_0000`
+//! to flip the sign bit, converting unsigned order to signed order.
 
 #[cfg(target_arch = "x86")]
 use core::arch::x86::*;
@@ -16,8 +16,15 @@ use core::ops::{Add, Mul, Sub};
 
 use super::u64_goldilocks::GOLDILOCKS_PRIME;
 
-const P: u64 = GOLDILOCKS_PRIME;
 const EPSILON: u64 = 0xFFFF_FFFF;
+
+/// Unsigned `a > b` via signed comparison with sign-bit flip.
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn unsigned_cmpgt(a: __m256i, b: __m256i) -> __m256i {
+    let sign = _mm256_set1_epi64x(i64::MIN);
+    _mm256_cmpgt_epi64(_mm256_xor_si256(a, sign), _mm256_xor_si256(b, sign))
+}
 
 /// 4-wide packed Goldilocks field elements using AVX2 `__m256i`.
 #[derive(Clone, Copy)]
@@ -25,6 +32,8 @@ const EPSILON: u64 = 0xFFFF_FFFF;
 pub struct PackedGoldilocks4(__m256i);
 
 impl PackedGoldilocks4 {
+    /// # Safety
+    /// Requires AVX2. `slice` must have at least 4 elements.
     #[inline]
     #[target_feature(enable = "avx2")]
     pub unsafe fn load(slice: &[u64]) -> Self {
@@ -32,6 +41,8 @@ impl PackedGoldilocks4 {
         unsafe { Self(_mm256_loadu_si256(slice.as_ptr() as *const __m256i)) }
     }
 
+    /// # Safety
+    /// Requires AVX2. `slice` must have at least 4 elements.
     #[inline]
     #[target_feature(enable = "avx2")]
     pub unsafe fn store(self, slice: &mut [u64]) {
@@ -39,12 +50,16 @@ impl PackedGoldilocks4 {
         unsafe { _mm256_storeu_si256(slice.as_mut_ptr() as *mut __m256i, self.0) }
     }
 
+    /// # Safety
+    /// Requires AVX2.
     #[inline]
     #[target_feature(enable = "avx2")]
     pub unsafe fn broadcast(val: u64) -> Self {
-        unsafe { Self(_mm256_set1_epi64x(val as i64)) }
+        Self(_mm256_set1_epi64x(val as i64))
     }
 
+    /// # Safety
+    /// Requires AVX2.
     #[inline]
     #[target_feature(enable = "avx2")]
     pub unsafe fn square(self) -> Self {
@@ -82,106 +97,97 @@ impl Mul for PackedGoldilocks4 {
 #[inline]
 #[target_feature(enable = "avx2")]
 unsafe fn add_avx2(a: PackedGoldilocks4, b: PackedGoldilocks4) -> PackedGoldilocks4 {
-    unsafe {
-        let epsilon = _mm256_set1_epi64x(EPSILON as i64);
-        let sum = _mm256_add_epi64(a.0, b.0);
-        // Unsigned overflow: sum < a (signed cmpgt detects wrapping)
-        let overflow = _mm256_cmpgt_epi64(a.0, sum);
-        let correction = _mm256_and_si256(overflow, epsilon);
-        let result = _mm256_add_epi64(sum, correction);
-        // Second overflow from adding epsilon
-        let overflow2 = _mm256_cmpgt_epi64(sum, result);
-        let correction2 = _mm256_and_si256(overflow2, epsilon);
-        PackedGoldilocks4(_mm256_add_epi64(result, correction2))
-    }
+    let epsilon = _mm256_set1_epi64x(EPSILON as i64);
+    let sum = _mm256_add_epi64(a.0, b.0);
+    // Unsigned overflow: a > sum means wrapping occurred
+    let overflow = unsafe { unsigned_cmpgt(a.0, sum) };
+    let correction = _mm256_and_si256(overflow, epsilon);
+    let result = _mm256_add_epi64(sum, correction);
+    // Second overflow from adding epsilon
+    let overflow2 = unsafe { unsigned_cmpgt(sum, result) };
+    let correction2 = _mm256_and_si256(overflow2, epsilon);
+    PackedGoldilocks4(_mm256_add_epi64(result, correction2))
 }
 
 #[inline]
 #[target_feature(enable = "avx2")]
 unsafe fn sub_avx2(a: PackedGoldilocks4, b: PackedGoldilocks4) -> PackedGoldilocks4 {
-    unsafe {
-        let epsilon = _mm256_set1_epi64x(EPSILON as i64);
-        let diff = _mm256_sub_epi64(a.0, b.0);
-        // Unsigned underflow: b > a (signed cmpgt)
-        let underflow = _mm256_cmpgt_epi64(b.0, a.0);
-        let correction = _mm256_and_si256(underflow, epsilon);
-        let result = _mm256_sub_epi64(diff, correction);
-        // Second underflow from subtracting epsilon
-        let underflow2 = _mm256_cmpgt_epi64(diff, result);
-        let correction2 = _mm256_and_si256(underflow2, epsilon);
-        PackedGoldilocks4(_mm256_sub_epi64(result, correction2))
-    }
+    let epsilon = _mm256_set1_epi64x(EPSILON as i64);
+    let diff = _mm256_sub_epi64(a.0, b.0);
+    // Unsigned underflow: b > a
+    let underflow = unsafe { unsigned_cmpgt(b.0, a.0) };
+    let correction = _mm256_and_si256(underflow, epsilon);
+    let result = _mm256_sub_epi64(diff, correction);
+    // Second underflow from subtracting epsilon
+    let underflow2 = unsafe { unsigned_cmpgt(diff, result) };
+    let correction2 = _mm256_and_si256(underflow2, epsilon);
+    PackedGoldilocks4(_mm256_sub_epi64(result, correction2))
 }
 
 #[inline]
 #[target_feature(enable = "avx2")]
 unsafe fn mul_avx2(a: PackedGoldilocks4, b: PackedGoldilocks4) -> PackedGoldilocks4 {
-    unsafe {
-        let low_mask = _mm256_set1_epi64x(0xFFFF_FFFF_i64);
+    let low_mask = _mm256_set1_epi64x(0xFFFF_FFFF_i64);
 
-        let a_lo = _mm256_and_si256(a.0, low_mask);
-        let a_hi = _mm256_srli_epi64(a.0, 32);
-        let b_lo = _mm256_and_si256(b.0, low_mask);
-        let b_hi = _mm256_srli_epi64(b.0, 32);
+    let a_lo = _mm256_and_si256(a.0, low_mask);
+    let a_hi = _mm256_srli_epi64(a.0, 32);
+    let b_lo = _mm256_and_si256(b.0, low_mask);
+    let b_hi = _mm256_srli_epi64(b.0, 32);
 
-        let p_ll = _mm256_mul_epu32(a_lo, b_lo);
-        let p_lh = _mm256_mul_epu32(a_lo, b_hi);
-        let p_hl = _mm256_mul_epu32(a_hi, b_lo);
-        let p_hh = _mm256_mul_epu32(a_hi, b_hi);
+    let p_ll = _mm256_mul_epu32(a_lo, b_lo);
+    let p_lh = _mm256_mul_epu32(a_lo, b_hi);
+    let p_hl = _mm256_mul_epu32(a_hi, b_lo);
+    let p_hh = _mm256_mul_epu32(a_hi, b_hi);
 
-        // Middle term
-        let p_mid = _mm256_add_epi64(p_lh, p_hl);
-        let p_mid_lo = _mm256_and_si256(p_mid, low_mask);
-        let p_mid_hi = _mm256_srli_epi64(p_mid, 32);
+    // Middle term
+    let p_mid = _mm256_add_epi64(p_lh, p_hl);
+    let p_mid_lo = _mm256_and_si256(p_mid, low_mask);
+    let p_mid_hi = _mm256_srli_epi64(p_mid, 32);
 
-        // Detect carry from p_lh + p_hl overflow (at bit 64 of mid, i.e. bit 96 total)
-        // When p_mid < p_lh, overflow happened
-        let mid_overflow = _mm256_cmpgt_epi64(p_lh, p_mid);
-        let mid_carry = _mm256_srli_epi64(mid_overflow, 63); // -1 >> 63 = 1 on overflow lanes
+    // Detect carry from p_lh + p_hl overflow (at bit 64 of mid, i.e. bit 96 total)
+    let mid_overflow = unsafe { unsigned_cmpgt(p_lh, p_mid) };
+    let mid_carry = _mm256_srli_epi64(mid_overflow, 63); // -1 >> 63 = 1 on overflow lanes
 
-        // lo = p_ll + (p_mid_lo << 32)
-        let mid_lo_shifted = _mm256_slli_epi64(p_mid_lo, 32);
-        let lo = _mm256_add_epi64(p_ll, mid_lo_shifted);
-        let lo_overflow = _mm256_cmpgt_epi64(p_ll, lo);
-        let lo_carry = _mm256_srli_epi64(lo_overflow, 63);
+    // lo = p_ll + (p_mid_lo << 32)
+    let mid_lo_shifted = _mm256_slli_epi64(p_mid_lo, 32);
+    let lo = _mm256_add_epi64(p_ll, mid_lo_shifted);
+    let lo_overflow = unsafe { unsigned_cmpgt(p_ll, lo) };
+    let lo_carry = _mm256_srli_epi64(lo_overflow, 63);
 
-        // hi = p_hh + p_mid_hi + mid_carry_shifted + lo_carry
-        let mid_carry_shifted = _mm256_slli_epi64(mid_carry, 32);
-        let hi = _mm256_add_epi64(
-            _mm256_add_epi64(p_hh, p_mid_hi),
-            _mm256_add_epi64(mid_carry_shifted, lo_carry),
-        );
+    // hi = p_hh + p_mid_hi + mid_carry_shifted + lo_carry
+    let mid_carry_shifted = _mm256_slli_epi64(mid_carry, 32);
+    let hi = _mm256_add_epi64(
+        _mm256_add_epi64(p_hh, p_mid_hi),
+        _mm256_add_epi64(mid_carry_shifted, lo_carry),
+    );
 
-        reduce_128_avx2(lo, hi)
-    }
+    unsafe { reduce_128_avx2(lo, hi) }
 }
 
 #[inline]
 #[target_feature(enable = "avx2")]
 unsafe fn reduce_128_avx2(lo: __m256i, hi: __m256i) -> PackedGoldilocks4 {
-    unsafe {
-        let epsilon = _mm256_set1_epi64x(EPSILON as i64);
-        let low_mask = epsilon; // same bit pattern
+    let epsilon = _mm256_set1_epi64x(EPSILON as i64);
+    let low_mask = epsilon; // same bit pattern
 
-        let hi_lo = _mm256_and_si256(hi, low_mask);
-        let hi_hi = _mm256_srli_epi64(hi, 32);
+    let hi_lo = _mm256_and_si256(hi, low_mask);
+    let hi_hi = _mm256_srli_epi64(hi, 32);
 
-        // t0 = lo - hi_hi
-        let borrow = _mm256_cmpgt_epi64(hi_hi, lo);
-        let t0 = _mm256_sub_epi64(lo, hi_hi);
-        let borrow_correction = _mm256_and_si256(borrow, epsilon);
-        let t0 = _mm256_sub_epi64(t0, borrow_correction);
+    // t0 = lo - hi_hi
+    let borrow = unsafe { unsigned_cmpgt(hi_hi, lo) };
+    let t0 = _mm256_sub_epi64(lo, hi_hi);
+    let borrow_correction = _mm256_and_si256(borrow, epsilon);
+    let t0 = _mm256_sub_epi64(t0, borrow_correction);
 
-        // t1 = hi_lo * EPSILON = (hi_lo << 32) - hi_lo
-        let hi_lo_shifted = _mm256_slli_epi64(hi_lo, 32);
-        let t1 = _mm256_sub_epi64(hi_lo_shifted, hi_lo);
+    // t1 = hi_lo * EPSILON = (hi_lo << 32) - hi_lo
+    let hi_lo_shifted = _mm256_slli_epi64(hi_lo, 32);
+    let t1 = _mm256_sub_epi64(hi_lo_shifted, hi_lo);
 
-        // result = t0 + t1
-        let sum = _mm256_add_epi64(t0, t1);
-        let carry = _mm256_cmpgt_epi64(t0, sum);
-        let carry_correction = _mm256_and_si256(carry, epsilon);
-        PackedGoldilocks4(_mm256_add_epi64(sum, carry_correction))
-    }
+    // result = t0 + t1
+    let sum = _mm256_add_epi64(t0, t1);
+    let carry = unsafe { unsigned_cmpgt(t0, sum) };
+    let carry_correction = _mm256_and_si256(carry, epsilon);
+    PackedGoldilocks4(_mm256_add_epi64(sum, carry_correction))
 }
 
 #[cfg(test)]
@@ -201,7 +207,13 @@ mod tests {
         if !is_x86_feature_detected!("avx2") {
             return;
         }
-        let cases: [(u64, u64); 4] = [(1, 3), (P - 1, 2), (P - 1, P - 1), (0, 0)];
+        let cases: [(u64, u64); 5] = [
+            (1, 3),
+            (GOLDILOCKS_PRIME - 1, 2),
+            (GOLDILOCKS_PRIME - 1, GOLDILOCKS_PRIME - 1),
+            (0, 0),
+            (0, GOLDILOCKS_PRIME - 1), // catches signed-comparison bug
+        ];
         for (a, b) in cases {
             unsafe {
                 let pa = PackedGoldilocks4::broadcast(a);
@@ -218,7 +230,12 @@ mod tests {
         if !is_x86_feature_detected!("avx2") {
             return;
         }
-        let cases: [(u64, u64); 4] = [(5, 3), (3, 5), (0, P - 1), (P - 1, P - 1)];
+        let cases: [(u64, u64); 4] = [
+            (5, 3),
+            (3, 5),
+            (0, GOLDILOCKS_PRIME - 1),
+            (GOLDILOCKS_PRIME - 1, GOLDILOCKS_PRIME - 1),
+        ];
         for (a, b) in cases {
             unsafe {
                 let pa = PackedGoldilocks4::broadcast(a);
@@ -239,8 +256,8 @@ mod tests {
             (1, 1),
             (2, 3),
             (EPSILON, EPSILON),
-            (P - 1, 2),
-            (P - 1, P - 1),
+            (GOLDILOCKS_PRIME - 1, 2),
+            (GOLDILOCKS_PRIME - 1, GOLDILOCKS_PRIME - 1),
         ];
         for (a, b) in cases {
             unsafe {
@@ -274,7 +291,7 @@ mod proptests {
     use proptest::prelude::*;
 
     fn arb_fe() -> impl Strategy<Value = u64> {
-        0..P
+        0..GOLDILOCKS_PRIME
     }
 
     proptest! {
