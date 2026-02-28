@@ -14,8 +14,6 @@ use core::arch::x86_64::*;
 
 use core::ops::{Add, Mul, Sub};
 
-use super::u64_goldilocks::GOLDILOCKS_PRIME;
-
 const EPSILON: u64 = 0xFFFF_FFFF;
 
 /// Unsigned `a > b` via signed comparison with sign-bit flip.
@@ -118,8 +116,8 @@ unsafe fn sub_avx2(a: PackedGoldilocks4, b: PackedGoldilocks4) -> PackedGoldiloc
     let underflow = unsafe { unsigned_cmpgt(b.0, a.0) };
     let correction = _mm256_and_si256(underflow, epsilon);
     let result = _mm256_sub_epi64(diff, correction);
-    // Second underflow from subtracting epsilon
-    let underflow2 = unsafe { unsigned_cmpgt(diff, result) };
+    // Second underflow: borrow from subtracting epsilon (result wraps past diff)
+    let underflow2 = unsafe { unsigned_cmpgt(result, diff) };
     let correction2 = _mm256_and_si256(underflow2, epsilon);
     PackedGoldilocks4(_mm256_sub_epi64(result, correction2))
 }
@@ -193,7 +191,7 @@ unsafe fn reduce_128_avx2(lo: __m256i, hi: __m256i) -> PackedGoldilocks4 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
+    use crate::field::fields::fft_friendly::u64_goldilocks::{GOLDILOCKS_PRIME, GoldilocksField};
     use crate::field::traits::IsField;
 
     unsafe fn to_array(p: PackedGoldilocks4) -> [u64; 4] {
@@ -286,7 +284,7 @@ mod tests {
 #[cfg(test)]
 mod proptests {
     use super::*;
-    use crate::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
+    use crate::field::fields::fft_friendly::u64_goldilocks::{GOLDILOCKS_PRIME, GoldilocksField};
     use crate::field::traits::IsField;
     use proptest::prelude::*;
 
