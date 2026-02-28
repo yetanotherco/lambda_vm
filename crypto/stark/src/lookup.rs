@@ -1361,7 +1361,7 @@ fn compute_debug_bus_sums<F, E>(
     HashMap<u64, FieldElement<E>>,
 )
 where
-    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync + 'static,
     E: IsField + Send + Sync,
 {
     let mut bus_sums: HashMap<u64, FieldElement<E>> = HashMap::new();
