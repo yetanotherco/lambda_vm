@@ -1582,13 +1582,6 @@ where
     let num_bus_elements = table_interaction.num_bus_elements();
     let alpha_powers = compute_alpha_powers(alpha, num_bus_elements);
 
-    // Sign: +1 for senders, -1 for receivers
-    let sign = if table_interaction.is_sender {
-        FieldElement::<E>::one()
-    } else {
-        -FieldElement::<E>::one()
-    };
-
     // Batch inversion: collect all fingerprints, invert once, then multiply back.
     // Compute fingerprint = z - (bus_id*α^0 + v0*α^1 + v1*α^2 + ...) using
     // base-field × extension-field multiplication (F×E→E) to avoid to_extension().
@@ -1713,11 +1706,34 @@ where
         .expect("fingerprint is zero - probability of sampling zero is negligible");
 
     // Compute terms: term[i] = sign * multiplicity[i] * fingerprint_inv[i]
-    multiplicities
-        .iter()
-        .zip(fingerprints.iter())
-        .map(|(multiplicity, fingerprint_inv)| multiplicity * &sign * fingerprint_inv)
-        .collect()
+    // Restructured to avoid E×E multiply: the original `m * sign * fp_inv` performs
+    // F×E (3 base muls) then E×E (6 base muls). Instead, do F×E + conditional negate
+    // (3 base muls + ~free), or skip arithmetic entirely when multiplicity is 1.
+    let is_sender = table_interaction.is_sender;
+    match (&table_interaction.multiplicity, is_sender) {
+        (Multiplicity::One, true) => {
+            // term = fp_inv, no arithmetic needed
+            fingerprints
+        }
+        (Multiplicity::One, false) => {
+            for fp in fingerprints.iter_mut() {
+                *fp = -&*fp;
+            }
+            fingerprints
+        }
+        (_, true) => {
+            for (fp, m) in fingerprints.iter_mut().zip(multiplicities.iter()) {
+                *fp = m * &*fp;
+            }
+            fingerprints
+        }
+        (_, false) => {
+            for (fp, m) in fingerprints.iter_mut().zip(multiplicities.iter()) {
+                *fp = -(m * &*fp);
+            }
+            fingerprints
+        }
+    }
 }
 
 /// Builds the accumulated column from pre-computed term columns.
