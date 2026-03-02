@@ -108,8 +108,10 @@ pub fn validate_trace<
 
     let logup_table_offset = match bus_public_inputs {
         Some(bpi) => {
-            let n = FieldElement::<FieldExtension>::from(trace_length as u64);
-            &bpi.table_contribution * n.inv().unwrap()
+            let n_inv = FieldElement::<Field>::from(trace_length as u64)
+                .inv()
+                .unwrap();
+            &bpi.table_contribution * n_inv.to_extension::<FieldExtension>()
         }
         None => FieldElement::zero(),
     };
