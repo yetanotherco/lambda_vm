@@ -3,6 +3,8 @@ use math::field::{
     element::FieldElement,
     traits::{IsField, IsSubFieldOf},
 };
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
 /// A two-dimensional Table holding field elements, arranged in a row-major order.
 /// This is the basic underlying data structure used for any two-dimensional component in the
@@ -142,13 +144,17 @@ impl<F: IsField> Table<F> {
             output.len(),
             self.width
         );
-        for (col_idx, buf) in output.iter_mut().enumerate().take(self.width) {
+        #[cfg(feature = "parallel")]
+        let iter = output[..self.width].par_iter_mut().enumerate();
+        #[cfg(not(feature = "parallel"))]
+        let iter = output[..self.width].iter_mut().enumerate();
+        iter.for_each(|(col_idx, buf)| {
             buf.clear();
             buf.reserve(self.height.saturating_sub(buf.capacity()));
             for row_idx in 0..self.height {
                 buf.push(self.data[row_idx * self.width + col_idx].clone());
             }
-        }
+        });
     }
 
     /// Given row and column indexes, returns the stored field element in that position of the table.
