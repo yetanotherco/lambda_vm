@@ -1203,7 +1203,7 @@ unsafe fn compute_fingerprints_avx2(
     use math::field::fields::fft_friendly::goldilocks_avx2::{add4, mul4, sub4};
 
     let num_elements = bus_element_cols.len();
-    debug_assert_eq!(alpha_powers_raw.len(), num_elements);
+    assert_eq!(alpha_powers_raw.len(), num_elements);
 
     let chunks = trace_len / 4;
     let mut result = Vec::with_capacity(trace_len);
@@ -1406,7 +1406,7 @@ fn precompute_bus_element_columns(
         }
     }
 
-    debug_assert_eq!(columns.len(), num_elements);
+    assert_eq!(columns.len(), num_elements);
     columns
 }
 
@@ -1597,51 +1597,62 @@ where
     // extension, process 4 rows simultaneously with SIMD.
     #[cfg(target_arch = "x86_64")]
     let avx2_fingerprints = 'avx2: {
-        // Check concrete types via size: GoldilocksField has BaseType=u64 (8 bytes),
-        // Degree3GoldilocksExtensionField has BaseType=[FpE;3] (24 bytes).
-        // Also verify FieldElement<F> is repr(transparent) over u64.
-        if std::mem::size_of::<FieldElement<F>>() != 8
-            || std::mem::size_of::<FieldElement<E>>() != 24
+        use math::field::fields::fft_friendly::extensions_goldilocks::Degree3GoldilocksExtensionField;
+        use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
+        type FpE = FieldElement<GoldilocksField>;
+        type Fp3E = FieldElement<Degree3GoldilocksExtensionField>;
+
+        // Guard: verify concrete types via size_of. In this codebase F is always
+        // GoldilocksField (BaseType = u64, 8 bytes) and E is always
+        // Degree3GoldilocksExtensionField (BaseType = [FpE; 3], 24 bytes).
+        // The AVX2 kernels use Goldilocks-specific reduction constants, so applying
+        // them to any other field would produce incorrect results immediately.
+        if std::mem::size_of::<FieldElement<F>>() != std::mem::size_of::<FpE>()
+            || std::mem::size_of::<FieldElement<E>>() != std::mem::size_of::<Fp3E>()
             || !is_x86_feature_detected!("avx2")
             || trace_len < 4
         {
             break 'avx2 None;
         }
 
-        // Cast main_segment_cols to raw u64 slices via repr(transparent)
-        let main_cols_raw: &[Vec<u64>] =
-            unsafe { &*(main_segment_cols as *const [Vec<FieldElement<F>>] as *const [Vec<u64>]) };
+        // SAFETY: All pointer casts below are on individual elements (not containers).
+        // FieldElement has #[repr(transparent)], so it has the same layout as its
+        // BaseType. The size checks above confirm FieldElement<F> is u64-sized (8 bytes)
+        // and FieldElement<E> is [u64; 3]-sized (24 bytes), making the casts sound.
+
+        // Extract raw u64 columns from main_segment_cols
+        let main_cols_raw: Vec<Vec<u64>> = main_segment_cols
+            .iter()
+            .map(|col| {
+                col.iter()
+                    .map(|fe| unsafe { std::ptr::read(fe as *const FieldElement<F> as *const u64) })
+                    .collect()
+            })
+            .collect();
 
         // Pre-compute bus element columns as raw u64
         let bus_element_cols =
-            precompute_bus_element_columns(table_interaction, main_cols_raw, trace_len);
+            precompute_bus_element_columns(table_interaction, &main_cols_raw, trace_len);
         let col_refs: Vec<&[u64]> = bus_element_cols.iter().map(|c| c.as_slice()).collect();
 
         // Extract alpha_powers as raw [u64; 3]
         let alpha_powers_raw: Vec<[u64; 3]> = alpha_powers
             .iter()
-            .map(|ap| {
-                // FieldElement<Degree3GoldilocksExtensionField> has BaseType = [FpE; 3]
-                // FpE = FieldElement<GoldilocksField> has BaseType = u64
-                let ptr = ap as *const FieldElement<E> as *const [u64; 3];
-                unsafe { *ptr }
-            })
+            .map(|ap| unsafe { std::ptr::read(ap as *const FieldElement<E> as *const [u64; 3]) })
             .collect();
 
         // Extract z as raw [u64; 3]
-        let z_raw: [u64; 3] = unsafe { *(z as *const FieldElement<E> as *const [u64; 3]) };
+        let z_raw: [u64; 3] =
+            unsafe { std::ptr::read(z as *const FieldElement<E> as *const [u64; 3]) };
 
         // Run AVX2 kernel
         let raw_fingerprints =
             unsafe { compute_fingerprints_avx2(&col_refs, &alpha_powers_raw, z_raw, trace_len) };
 
-        // Convert raw [u64; 3] back to Vec<FieldElement<E>>
+        // Convert raw [u64; 3] back to FieldElement<E>
         let fingerprints: Vec<FieldElement<E>> = raw_fingerprints
             .into_iter()
-            .map(|raw| unsafe {
-                let ptr = &raw as *const [u64; 3] as *const FieldElement<E>;
-                (*ptr).clone()
-            })
+            .map(|raw| unsafe { std::ptr::read(&raw as *const [u64; 3] as *const FieldElement<E>) })
             .collect();
 
         Some(fingerprints)
