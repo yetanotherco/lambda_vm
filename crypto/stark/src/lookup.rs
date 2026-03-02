@@ -983,7 +983,6 @@ where
         let (per_bus_sums, per_bus_sender_sums, per_bus_receiver_sums) =
             compute_debug_bus_sums_batched(
                 &self.auxiliary_trace_build_data.interactions,
-                &committed_columns,
                 &main_segment_cols,
                 trace_len,
                 challenges,
@@ -1591,7 +1590,6 @@ where
 #[allow(clippy::type_complexity)]
 fn compute_debug_bus_sums_batched<F, E>(
     interactions: &[BusInteraction],
-    _batched_term_columns: &[Vec<FieldElement<E>>],
     main_segment_cols: &[Vec<FieldElement<F>>],
     trace_len: usize,
     challenges: &[FieldElement<E>],
@@ -1910,6 +1908,7 @@ where
             let z = &rap_challenges[LOGUP_CHALLENGE_Z];
 
             // Clear denominators of absorbed interactions
+            debug_assert!(matches!(absorbed.len(), 1 | 2));
             match absorbed.len() {
                 1 => {
                     // (delta) · f - sign · m = 0
