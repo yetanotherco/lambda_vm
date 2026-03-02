@@ -187,6 +187,21 @@ pub trait IsField: Debug + Clone {
     /// Takes as input an element of BaseType and returns the internal representation
     /// of that element in the field.
     fn from_base_type(x: Self::BaseType) -> Self::BaseType;
+
+    /// Compute dot product of 4 evaluation vectors against shared coefficients.
+    /// Returns `[sum(evals[j][i] * coeffs[i]) for j in 0..4]`.
+    /// Override for SIMD-optimized implementations.
+    fn batch_dot_product_4(
+        evals: [&[FieldElement<Self>]; 4],
+        coeffs: &[FieldElement<Self>],
+    ) -> [FieldElement<Self>; 4] {
+        core::array::from_fn(|j| {
+            evals[j]
+                .iter()
+                .zip(coeffs)
+                .fold(FieldElement::zero(), |acc, (e, c)| acc + e * c)
+        })
+    }
 }
 
 /// Provides the Legendre symbol for an element modulo p

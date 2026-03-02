@@ -310,6 +310,24 @@ impl IsField for Degree3GoldilocksExtensionField {
     fn double(a: &Self::BaseType) -> Self::BaseType {
         [a[0].double(), a[1].double(), a[2].double()]
     }
+
+    #[cfg(target_arch = "x86_64")]
+    fn batch_dot_product_4(
+        evals: [&[FieldElement<Self>]; 4],
+        coeffs: &[FieldElement<Self>],
+    ) -> [FieldElement<Self>; 4] {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: AVX2 feature detected at runtime.
+            unsafe { avx2_batch_dot_product_4(evals, coeffs) }
+        } else {
+            core::array::from_fn(|j| {
+                evals[j]
+                    .iter()
+                    .zip(coeffs)
+                    .fold(FieldElement::zero(), |acc, (e, c)| acc + e * c)
+            })
+        }
+    }
 }
 
 impl IsSubFieldOf<Degree3GoldilocksExtensionField> for GoldilocksField {
@@ -442,6 +460,75 @@ impl HasDefaultTranscript for Degree3GoldilocksExtensionField {
         }
 
         FieldElement::<Self>::new(coeffs)
+    }
+}
+
+// =====================================================
+// AVX2 BATCH DOT PRODUCT
+// =====================================================
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn avx2_batch_dot_product_4(
+    evals: [&[FieldElement<Degree3GoldilocksExtensionField>]; 4],
+    coeffs: &[FieldElement<Degree3GoldilocksExtensionField>],
+) -> [FieldElement<Degree3GoldilocksExtensionField>; 4] {
+    use super::goldilocks_avx2::{ext3_add4, ext3_mul4};
+    use core::arch::x86_64::*;
+
+    // SAFETY: caller verified AVX2 is available; all intrinsic calls require unsafe.
+    unsafe {
+        let zero = _mm256_setzero_si256();
+        let mut acc = (zero, zero, zero);
+
+        for (i, coeff) in coeffs.iter().enumerate() {
+            let cv = coeff.value();
+            let b0 = _mm256_set1_epi64x(*cv[0].value() as i64);
+            let b1 = _mm256_set1_epi64x(*cv[1].value() as i64);
+            let b2 = _mm256_set1_epi64x(*cv[2].value() as i64);
+
+            let e0v = evals[0][i].value();
+            let e1v = evals[1][i].value();
+            let e2v = evals[2][i].value();
+            let e3v = evals[3][i].value();
+
+            let e0 = _mm256_set_epi64x(
+                *e3v[0].value() as i64,
+                *e2v[0].value() as i64,
+                *e1v[0].value() as i64,
+                *e0v[0].value() as i64,
+            );
+            let e1 = _mm256_set_epi64x(
+                *e3v[1].value() as i64,
+                *e2v[1].value() as i64,
+                *e1v[1].value() as i64,
+                *e0v[1].value() as i64,
+            );
+            let e2 = _mm256_set_epi64x(
+                *e3v[2].value() as i64,
+                *e2v[2].value() as i64,
+                *e1v[2].value() as i64,
+                *e0v[2].value() as i64,
+            );
+
+            let prod = ext3_mul4((e0, e1, e2), (b0, b1, b2));
+            acc = ext3_add4(acc, prod);
+        }
+
+        let mut c0 = [0u64; 4];
+        let mut c1 = [0u64; 4];
+        let mut c2 = [0u64; 4];
+        _mm256_storeu_si256(c0.as_mut_ptr() as *mut __m256i, acc.0);
+        _mm256_storeu_si256(c1.as_mut_ptr() as *mut __m256i, acc.1);
+        _mm256_storeu_si256(c2.as_mut_ptr() as *mut __m256i, acc.2);
+
+        core::array::from_fn(|j| {
+            FieldElement::new([
+                FieldElement::from_raw(c0[j]),
+                FieldElement::from_raw(c1[j]),
+                FieldElement::from_raw(c2[j]),
+            ])
+        })
     }
 }
 
