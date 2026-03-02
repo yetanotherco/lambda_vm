@@ -60,8 +60,10 @@ We additionally provide a constant multiplicity that takes into account the numb
 by the message schedule and the compression rounds combined.
 #render_constraint_table(sha256chip, config, groups: "sched")
 
-And finally, we provide the boundaries for the #sha256round chip.
-#rj[The result of the rounds should be _added_ to the initial state]
+And finally, we provide the boundaries for the #sha256round chip and the
+final addition of the compression to the old state.
+Observe that we embed the addition into the upper 32 bits of a double word,
+in order to satisfy and use the `ADD` chip.
 #render_constraint_table(sha256chip, config, groups: "compress")
 
 In this VM, we assign syscall number -1 to the #sha256 accelerator.
