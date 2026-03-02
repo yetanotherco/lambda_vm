@@ -187,3 +187,31 @@ output = ["Half", 2]
 tag = "memory"
 kind = "interaction"
 input = ["Bit", "DWordWL", "DWordWL", "BaseField"]
+
+# SHA256 things
+[[signatures]]
+tag = "SHA256_K"
+kind = "interaction"
+input = ["BaseField"]
+output = "Word"
+
+[[signatures]]
+tag = "SHA256_M"
+kind = "interaction"
+input = ["DWordWL", "BaseField", "Word"]
+
+[[signatures]]
+tag = "SHA256MSGSCHED"
+kind = "interaction"
+input = ["DWordWL", "BaseField", "Byte"]
+
+[[signatures]]
+tag = "SHA256ROUND"
+kind = "interaction"
+input = ["DWordWL", ["Word", 8], "BaseField"]
+
+[[signatures]]
+tag = "ROTXOR"
+kind = "interaction"
+input = ["Word", "Byte", "Bit", "Byte", "Bit", "Byte", "Bit"]
+output = "Word"

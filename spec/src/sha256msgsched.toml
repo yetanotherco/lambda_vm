@@ -126,12 +126,14 @@ multiplicity = "μ"
 kind = "interaction"
 tag = "IS_BYTE"
 input = ["carry"]
+multiplicity = "μ"
 
 [[constraints.calc]]
 kind = "interaction"
 tag = "IS_HALF"
 input = [["idx", "out", "i"]]
 iter = ["i", 0, 1]
+multiplicity = "μ"
 
 [[constraint_groups]]
 name = "output"

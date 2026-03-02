@@ -14,7 +14,7 @@ pad = 0
 
 [[variables.input]]
 name = "r0_high"
-type = "Byte"
+type = "Bit"
 desc = "The first amount of rotation, high bit"
 pad = 0
 
@@ -26,7 +26,7 @@ pad = 0
 
 [[variables.input]]
 name = "r1_high"
-type = "Byte"
+type = "Bit"
 desc = "The second amount of rotation, high bit"
 pad = 0
 
@@ -220,6 +220,6 @@ name = "output"
 [[constraints.output]]
 kind = "interaction"
 tag = "ROTXOR"
-input = ["a", "r0_low", "r0_high", "r1_low", "r1_high", "r2_low", "last_rot"]
+input = [["cast", "a", "Word"], "r0_low", "r0_high", "r1_low", "r1_high", "r2_low", "last_rot"]
 output = ["cast", "out", "Word"]
 multiplicity = ["-", "μ"]

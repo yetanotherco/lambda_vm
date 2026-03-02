@@ -90,7 +90,7 @@ type = "WordBL"
 desc = "Part of `ch`"
 pad = 0
 
-[[variables.virtual]]
+[[variables.auxiliary]]
 name = "S0"
 type = "Word"
 desc = "Transformation of `a`"
@@ -142,7 +142,7 @@ def = ["+", "h", "S1", "ch", "kval", "wval"]
 name = "maj"
 type = "Word"
 desc = "maj value"
-def = ["+", "a_and_b", "c_and_a_xor_b"]
+def = ["+", ["cast", "a_and_b", "Word"], ["cast", "c_and_a_xor_b", "Word"]]
 
 [[variables.virtual]]
 name = "temp2"
@@ -276,13 +276,11 @@ name = "output"
 [[constraints.output]]
 kind = "interaction"
 tag = "SHA256ROUND"
-# TODO: types
-input = ["timestamp", ["arr", "a", "b", "c", "d", "e", "f", "g", "h"], "index"]
+input = ["timestamp", ["arr", ["cast", "a", "Word"], ["cast", "b", "Word"], ["cast", "c", "Word"], "d", ["cast", "e", "Word"], ["cast", "f", "Word"], ["cast", "g", "Word"], "h"], "index"]
 multiplicity = ["-", "μ"]
 
 [[constraints.output]]
 kind = "interaction"
 tag = "SHA256ROUND"
-# TODO: types
-input = ["timestamp", ["arr", "out_a", "a", "b", "c", "out_e", "e", "f", "g"], ["+", "index", 1]]
+input = ["timestamp", ["arr", ["cast", "out_a", "Word"], ["cast", "a", "Word"], ["cast", "b", "Word"], ["cast", "c", "Word"], ["cast", "out_e", "Word"], ["cast", "e", "Word"], ["cast", "f", "Word"], ["cast", "g", "Word"]], ["+", "index", 1]]
 multiplicity = "μ"
