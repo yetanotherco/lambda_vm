@@ -18,8 +18,6 @@ use rayon::{
 };
 
 use std::marker::PhantomData;
-#[cfg(feature = "instruments")]
-use std::time::Instant;
 
 pub struct ConstraintEvaluator<
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
@@ -226,9 +224,6 @@ where
         #[cfg(all(debug_assertions, not(feature = "parallel")))]
         let boundary_polys: Vec<Polynomial<FieldElement<Field>>> = Vec::new();
 
-        #[cfg(feature = "instruments")]
-        let timer = Instant::now();
-
         let trace_length = domain.interpolation_domain_size;
         let lde_periodic_columns = air
             .get_periodic_column_polynomials(trace_length)
@@ -243,15 +238,6 @@ where
             })
             .collect::<Result<Vec<Vec<FieldElement<Field>>>, FFTError>>()
             .unwrap();
-
-        #[cfg(feature = "instruments")]
-        println!(
-            "     Evaluating periodic columns on lde: {:#?}",
-            timer.elapsed()
-        );
-
-        #[cfg(feature = "instruments")]
-        let timer = Instant::now();
 
         // Fused boundary evaluation: compute (trace[col] - value) on-the-fly
         // instead of pre-computing all boundary_polys_evaluations.
@@ -282,12 +268,6 @@ where
             })
             .collect();
 
-        #[cfg(feature = "instruments")]
-        println!(
-            "     Evaluated boundary polynomials on LDE: {:#?}",
-            timer.elapsed()
-        );
-
         #[cfg(all(debug_assertions, not(feature = "parallel")))]
         let boundary_zerofiers = Vec::new();
 
@@ -297,21 +277,11 @@ where
         #[cfg(all(debug_assertions, not(feature = "parallel")))]
         let _transition_evaluations: Vec<FieldElement<FieldExtension>> = Vec::new();
 
-        #[cfg(feature = "instruments")]
-        let timer = Instant::now();
         let zerofier_data = air.transition_zerofier_evaluations_grouped(domain);
-        #[cfg(feature = "instruments")]
-        println!(
-            "     Evaluated transition zerofiers: {:#?}",
-            timer.elapsed()
-        );
 
         // Iterate over all LDE domain and compute the part of the composition polynomial
         // related to the transition constraints and add it to the already computed part of the
         // boundary constraints.
-
-        #[cfg(feature = "instruments")]
-        let timer = Instant::now();
 
         let num_transition = air.num_transition_constraints();
         let num_periodic = lde_periodic_columns.len();
@@ -328,12 +298,6 @@ where
             num_transition,
             num_periodic,
             offsets,
-        );
-
-        #[cfg(feature = "instruments")]
-        println!(
-            "     Evaluated transitions and accumulated results: {:#?}",
-            timer.elapsed()
         );
 
         evaluations_t

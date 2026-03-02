@@ -13,6 +13,8 @@
 pub mod constraints;
 #[cfg(feature = "debug-checks")]
 mod debug_report;
+#[cfg(feature = "instruments")]
+pub mod instruments;
 pub mod tables;
 pub mod test_utils;
 pub mod tests;
@@ -342,15 +344,37 @@ pub fn prove_with_options(
     proof_options: &ProofOptions,
     max_rows: &MaxRowsConfig,
 ) -> Result<VmProof, Error> {
+    #[cfg(feature = "instruments")]
+    let total_start = std::time::Instant::now();
+
+    // Phase 1: Execute (ELF load + run)
+    #[cfg(feature = "instruments")]
+    let phase_start = std::time::Instant::now();
+
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let executor = Executor::new(&program, vec![]).map_err(|e| Error::Execution(format!("{e}")))?;
     let result = executor
         .run()
         .map_err(|e| Error::Execution(format!("{e}")))?;
 
+    #[cfg(feature = "instruments")]
+    let execute_elapsed = phase_start.elapsed();
+
+    // Phase 2: Trace build
+    #[cfg(feature = "instruments")]
+    let phase_start = std::time::Instant::now();
+
     // Generate all traces from ELF and execution logs.
     // Page tables are derived from the prover's MemoryState (all accessed pages).
     let mut traces = Traces::from_elf_and_logs(&program, &result.logs, max_rows)?;
+
+    #[cfg(feature = "instruments")]
+    let trace_build_elapsed = phase_start.elapsed();
+
+    // Phase 3: AIR construction
+    #[cfg(feature = "instruments")]
+    let phase_start = std::time::Instant::now();
+
     let table_counts = traces.table_counts();
     let airs = VmAirs::new(
         &program,
@@ -360,13 +384,32 @@ pub fn prove_with_options(
         &table_counts,
     );
 
+    #[cfg(feature = "instruments")]
+    let air_elapsed = phase_start.elapsed();
+
     let runtime_page_ranges = traces.runtime_page_ranges();
+
+    // Phase 4: Prove (multi_prove)
+    #[cfg(feature = "instruments")]
+    let phase_start = std::time::Instant::now();
 
     let proof = Prover::multi_prove(
         airs.air_trace_pairs(&mut traces),
         &mut DefaultTranscript::<E>::new(&[]),
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))?;
+
+    #[cfg(feature = "instruments")]
+    {
+        let prove_elapsed = phase_start.elapsed();
+        instruments::print_report(
+            execute_elapsed,
+            trace_build_elapsed,
+            air_elapsed,
+            prove_elapsed,
+            total_start.elapsed(),
+        );
+    }
 
     Ok(VmProof {
         proof,

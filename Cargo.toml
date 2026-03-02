@@ -15,3 +15,8 @@ resolver = "2"
 [profile.dev]
 opt-level = 3
 debug = true
+
+# debug=1 = line tables only: enables function names in profilers (samply, perf)
+# without slowing compilation or bloating the binary significantly.
+[profile.release]
+debug = 1
