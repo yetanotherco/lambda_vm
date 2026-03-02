@@ -1608,20 +1608,11 @@ where
             break 'avx2 None;
         }
 
-        // SAFETY: All pointer casts below are on individual elements (not containers).
-        // FieldElement has #[repr(transparent)], so it has the same layout as its
-        // BaseType. The size checks above confirm FieldElement<F> is u64-sized (8 bytes)
-        // and FieldElement<E> is [u64; 3]-sized (24 bytes), making the casts sound.
-
-        // Extract raw u64 columns from main_segment_cols
-        let main_cols_raw: Vec<Vec<u64>> = main_segment_cols
-            .iter()
-            .map(|col| {
-                col.iter()
-                    .map(|fe| unsafe { std::ptr::read(fe as *const FieldElement<F> as *const u64) })
-                    .collect()
-            })
-            .collect();
+        // SAFETY: FieldElement<F> is #[repr(transparent)] over u64 (verified by the
+        // size check above), so &[Vec<FieldElement<F>>] and &[Vec<u64>] have identical
+        // layout. This is a zero-cost reinterpret cast — no allocation or copy.
+        let main_cols_raw: &[Vec<u64>] =
+            unsafe { &*(main_segment_cols as *const [Vec<FieldElement<F>>] as *const [Vec<u64>]) };
 
         // Pre-compute bus element columns as raw u64
         let bus_element_cols =
