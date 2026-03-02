@@ -3,6 +3,8 @@ use math::field::{
     element::FieldElement,
     traits::{IsField, IsSubFieldOf},
 };
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
 /// A two-dimensional Table holding field elements, arranged in a row-major order.
 /// This is the basic underlying data structure used for any two-dimensional component in the
