@@ -130,6 +130,9 @@ pub unsafe fn mul4(a: __m256i, b: __m256i) -> __m256i {
 
 /// Square 4 packed Goldilocks elements. Saves one `_mm256_mul_epu32` vs `mul4(a, a)`
 /// since the cross term `a_lo * a_hi` only needs computing once (then doubled).
+///
+/// # Safety
+/// Caller must ensure AVX2 is available (`is_x86_feature_detected!("avx2")`).
 #[inline]
 #[target_feature(enable = "avx2")]
 pub unsafe fn square4(a: __m256i) -> __m256i {
@@ -166,40 +169,48 @@ pub unsafe fn square4(a: __m256i) -> __m256i {
         _mm256_add_epi64(lo_carry_val, mid_carry_shifted),
     );
 
-    reduce(res_lo, res_hi)
+    // SAFETY: reduce is unsafe because it calls add4/sub4 which require AVX2.
+    unsafe { reduce(res_lo, res_hi) }
 }
 
 /// Compute multiplicative inverse of 4 packed Goldilocks elements via the
 /// addition chain for x^(p-2), matching `u64_goldilocks::inv_addition_chain`.
+///
+/// # Safety
+/// Caller must ensure AVX2 is available (`is_x86_feature_detected!("avx2")`).
 #[inline]
 #[target_feature(enable = "avx2")]
 pub unsafe fn inv4(a: __m256i) -> __m256i {
     /// Square `base` n times, then multiply by `tail`.
     #[inline(always)]
     unsafe fn exp_acc4(base: __m256i, tail: __m256i, n: u32) -> __m256i {
-        let mut result = base;
-        for _ in 0..n {
-            result = square4(result);
+        unsafe {
+            let mut result = base;
+            for _ in 0..n {
+                result = square4(result);
+            }
+            mul4(result, tail)
         }
-        mul4(result, tail)
     }
 
-    let x = a;
-    let x2 = square4(x);
-    let x3 = mul4(x2, x);
-    let x7 = exp_acc4(x3, x, 1);
-    let x63 = exp_acc4(x7, x7, 3);
-    let x12m1 = exp_acc4(x63, x63, 6);
-    let x24m1 = exp_acc4(x12m1, x12m1, 12);
-    let x30m1 = exp_acc4(x24m1, x63, 6);
-    let x31m1 = exp_acc4(x30m1, x, 1);
-    let x32m1 = exp_acc4(x31m1, x, 1);
+    unsafe {
+        let x = a;
+        let x2 = square4(x);
+        let x3 = mul4(x2, x);
+        let x7 = exp_acc4(x3, x, 1);
+        let x63 = exp_acc4(x7, x7, 3);
+        let x12m1 = exp_acc4(x63, x63, 6);
+        let x24m1 = exp_acc4(x12m1, x12m1, 12);
+        let x30m1 = exp_acc4(x24m1, x63, 6);
+        let x31m1 = exp_acc4(x30m1, x, 1);
+        let x32m1 = exp_acc4(x31m1, x, 1);
 
-    let mut t = x31m1;
-    for _ in 0..33 {
-        t = square4(t);
+        let mut t = x31m1;
+        for _ in 0..33 {
+            t = square4(t);
+        }
+        mul4(t, x32m1)
     }
-    mul4(t, x32m1)
 }
 
 /// Reduce a 128-bit value (lo + hi * 2^64) to a Goldilocks field element.
@@ -235,46 +246,62 @@ unsafe fn reduce(lo: __m256i, hi: __m256i) -> __m256i {
 pub type Ext3x4 = (__m256i, __m256i, __m256i);
 
 /// Add 4 packed cubic extension elements component-wise.
+///
+/// # Safety
+/// Caller must ensure AVX2 is available (`is_x86_feature_detected!("avx2")`).
 #[inline]
 #[target_feature(enable = "avx2")]
 pub unsafe fn ext3_add4(a: Ext3x4, b: Ext3x4) -> Ext3x4 {
-    (add4(a.0, b.0), add4(a.1, b.1), add4(a.2, b.2))
+    unsafe { (add4(a.0, b.0), add4(a.1, b.1), add4(a.2, b.2)) }
 }
 
 /// Subtract 4 packed cubic extension elements component-wise.
+///
+/// # Safety
+/// Caller must ensure AVX2 is available (`is_x86_feature_detected!("avx2")`).
 #[inline]
 #[target_feature(enable = "avx2")]
 pub unsafe fn ext3_sub4(a: Ext3x4, b: Ext3x4) -> Ext3x4 {
-    (sub4(a.0, b.0), sub4(a.1, b.1), sub4(a.2, b.2))
+    unsafe { (sub4(a.0, b.0), sub4(a.1, b.1), sub4(a.2, b.2)) }
 }
 
 /// Multiply 4 packed cubic extension elements using Karatsuba with residue w^3 = 2.
 /// Uses 6 base-field `mul4` calls (vs 9 for schoolbook).
+///
+/// # Safety
+/// Caller must ensure AVX2 is available (`is_x86_feature_detected!("avx2")`).
 #[inline]
 #[target_feature(enable = "avx2")]
 pub unsafe fn ext3_mul4(a: Ext3x4, b: Ext3x4) -> Ext3x4 {
-    let v0 = mul4(a.0, b.0);
-    let v1 = mul4(a.1, b.1);
-    let v2 = mul4(a.2, b.2);
+    unsafe {
+        let v0 = mul4(a.0, b.0);
+        let v1 = mul4(a.1, b.1);
+        let v2 = mul4(a.2, b.2);
 
-    let t0 = sub4(sub4(mul4(add4(a.1, a.2), add4(b.1, b.2)), v1), v2);
-    let t1 = sub4(sub4(mul4(add4(a.0, a.1), add4(b.0, b.1)), v0), v1);
-    let t2 = sub4(sub4(mul4(add4(a.0, a.2), add4(b.0, b.2)), v0), v2);
+        let t0 = sub4(sub4(mul4(add4(a.1, a.2), add4(b.1, b.2)), v1), v2);
+        let t1 = sub4(sub4(mul4(add4(a.0, a.1), add4(b.0, b.1)), v0), v1);
+        let t2 = sub4(sub4(mul4(add4(a.0, a.2), add4(b.0, b.2)), v0), v2);
 
-    // c0 = v0 + 2*t0, c1 = t1 + 2*v2, c2 = t2 + v1
-    (add4(v0, add4(t0, t0)), add4(t1, add4(v2, v2)), add4(t2, v1))
+        // c0 = v0 + 2*t0, c1 = t1 + 2*v2, c2 = t2 + v1
+        (add4(v0, add4(t0, t0)), add4(t1, add4(v2, v2)), add4(t2, v1))
+    }
 }
 
 /// Multiply 4 packed cubic extension elements by a packed base field scalar.
-/// F × E multiplication: 3 base-field `mul4` calls.
+/// F x E multiplication: 3 base-field `mul4` calls.
+///
+/// # Safety
+/// Caller must ensure AVX2 is available (`is_x86_feature_detected!("avx2")`).
 #[inline]
 #[target_feature(enable = "avx2")]
 pub unsafe fn ext3_scalar_mul4(scalar: __m256i, ext: Ext3x4) -> Ext3x4 {
-    (
-        mul4(scalar, ext.0),
-        mul4(scalar, ext.1),
-        mul4(scalar, ext.2),
-    )
+    unsafe {
+        (
+            mul4(scalar, ext.0),
+            mul4(scalar, ext.1),
+            mul4(scalar, ext.2),
+        )
+    }
 }
 
 #[cfg(test)]

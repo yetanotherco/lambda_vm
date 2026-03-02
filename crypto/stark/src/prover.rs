@@ -1396,6 +1396,8 @@ pub trait IsStarkProver<
         PI: Send + Sync + Clone,
     {
         info!("Started proof generation...");
+        #[cfg(feature = "instruments")]
+        let timer_total = Instant::now();
 
         let num_airs = air_trace_pairs.len();
 
@@ -1443,6 +1445,11 @@ pub trait IsStarkProver<
         // All main trace commitments must be in the transcript before sampling
         // LogUp challenges. Pool buffers are reused across tables.
 
+        #[cfg(feature = "instruments")]
+        println!("- Phase A: Commit main traces ({} tables)", num_airs);
+        #[cfg(feature = "instruments")]
+        let timer_phase_a = Instant::now();
+
         let mut main_commits: Vec<MainCommitData<Field>> = Vec::with_capacity(num_airs);
 
         for ((air, trace, _pub_inputs), twiddles) in
@@ -1473,6 +1480,9 @@ pub trait IsStarkProver<
             });
         }
 
+        #[cfg(feature = "instruments")]
+        println!("  Phase A time: {:?}", timer_phase_a.elapsed());
+
         // =====================================================================
         // Round 1, Phase B: Sample shared LogUp challenges
         // =====================================================================
@@ -1499,6 +1509,11 @@ pub trait IsStarkProver<
         // Pass 1: Build aux traces in parallel.
         // Each build_auxiliary_trace has internal parallelism (batch_inverse, par_chunks),
         // but outer parallelism over 12 tables also helps on high-core-count machines.
+        #[cfg(feature = "instruments")]
+        println!("- Phase C: Build auxiliary traces");
+        #[cfg(feature = "instruments")]
+        let timer_phase_c = Instant::now();
+
         #[cfg(feature = "parallel")]
         let aux_iter = air_trace_pairs.par_iter_mut();
         #[cfg(not(feature = "parallel"))]
@@ -1512,6 +1527,14 @@ pub trait IsStarkProver<
                 }
             })
             .collect();
+
+        #[cfg(feature = "instruments")]
+        println!(
+            "  Phase C pass 1 (aux traces): {:?}",
+            timer_phase_c.elapsed()
+        );
+        #[cfg(feature = "instruments")]
+        let timer_phase_c2 = Instant::now();
 
         // Pass 2: Sequential fork transcript → extract → LDE → commit.
         // Uses shared aux_pool. Each table gets its own transcript fork.
@@ -1577,13 +1600,26 @@ pub trait IsStarkProver<
             &mut aux_pool,
         );
 
+        #[cfg(feature = "instruments")]
+        println!(
+            "  Phase C pass 2 (LDE + commit): {:?}",
+            timer_phase_c2.elapsed()
+        );
+
         // =====================================================================
         // Rounds 2-4: Sequential per-table proving with forked transcripts
         // =====================================================================
         // For each table, recompute LDE into pool buffers, reuse stored Merkle trees,
         // run rounds 2-4 with the table's forked transcript, then drop table data.
 
+        #[cfg(feature = "instruments")]
+        println!("- Rounds 2-4: Per-table proving ({} tables)", num_airs);
+        #[cfg(feature = "instruments")]
+        let timer_rounds = Instant::now();
+
         let mut proofs = Vec::with_capacity(num_airs);
+        #[cfg(feature = "instruments")]
+        let mut table_idx = 0usize;
         for (((((air, trace, pub_inputs), metadata), domain), twiddles), table_transcript) in
             air_trace_pairs
                 .iter()
@@ -1592,6 +1628,8 @@ pub trait IsStarkProver<
                 .zip(twiddle_caches.iter())
                 .zip(table_transcripts.iter_mut())
         {
+            #[cfg(feature = "instruments")]
+            let timer_table = Instant::now();
             // Recompute LDE evaluations into pool, reuse stored Merkle trees
             let round_1_result = Self::reconstruct_round1(
                 *air,
@@ -1610,6 +1648,19 @@ pub trait IsStarkProver<
                 table_transcript,
                 domain,
             )?;
+            #[cfg(feature = "instruments")]
+            println!(
+                "  Table {}: rows={} main_cols={} aux_cols={} time={:?}",
+                table_idx,
+                trace.num_rows(),
+                trace.num_main_columns,
+                trace.num_aux_columns,
+                timer_table.elapsed()
+            );
+            #[cfg(feature = "instruments")]
+            {
+                table_idx += 1;
+            }
             proofs.push(proof);
 
             // Return column Vecs to pool (zero-copy move back). Pool slots that were
@@ -1622,6 +1673,11 @@ pub trait IsStarkProver<
                 *slot = col;
             }
         }
+
+        #[cfg(feature = "instruments")]
+        println!("  Rounds 2-4 total: {:?}", timer_rounds.elapsed());
+        #[cfg(feature = "instruments")]
+        println!("  Total multi_prove: {:?}", timer_total.elapsed());
 
         Ok(MultiProof::new(proofs))
     }

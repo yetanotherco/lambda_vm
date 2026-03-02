@@ -15,7 +15,6 @@ use math::{fft::errors::FFTError, field::element::FieldElement};
 use rayon::{
     iter::IndexedParallelIterator,
     prelude::{IntoParallelIterator, ParallelIterator},
-    slice::ParallelSliceMut,
 };
 
 use std::marker::PhantomData;
@@ -78,93 +77,59 @@ where
 
         #[cfg(feature = "parallel")]
         {
-            // Process 4 LDE points per chunk so the accumulation inner loop
-            // can use FieldExtension::batch_dot_product_4 (AVX2 on Goldilocks).
-            let mut evaluations_t = boundary_evaluation;
-            evaluations_t.par_chunks_mut(4).enumerate().for_each_init(
-                || {
-                    let transition_bufs: Vec<Vec<FieldElement<FieldExtension>>> = (0..4)
-                        .map(|_| vec![FieldElement::zero(); num_transition])
-                        .collect();
-                    let periodic_buf = vec![FieldElement::<Field>::zero(); num_periodic];
-                    let frames: Vec<Frame<Field, FieldExtension>> = (0..4)
-                        .map(|_| {
+            let evaluations_t: Vec<_> = boundary_evaluation
+                .into_par_iter()
+                .enumerate()
+                .map_init(
+                    || {
+                        (
+                            vec![FieldElement::<FieldExtension>::zero(); num_transition],
+                            vec![FieldElement::<Field>::zero(); num_periodic],
                             Frame::preallocate(
                                 num_offsets,
                                 rows_per_step,
                                 num_main_cols,
                                 num_aux_cols,
-                            )
-                        })
-                        .collect();
-                    (transition_bufs, periodic_buf, frames)
-                },
-                |(transition_bufs, periodic_buf, frames), (chunk_idx, chunk)| {
-                    let base = chunk_idx * 4;
-                    let n = chunk.len();
+                            ),
+                        )
+                    },
+                    |(transition_buf, periodic_buf, frame), (i, boundary)| {
+                        frame.fill_from_lde(lde_trace, i, offsets);
 
-                    // Evaluate constraints for each point in the chunk (scalar).
-                    for j in 0..n {
-                        let i = base + j;
-                        frames[j].fill_from_lde(lde_trace, i, offsets);
-
-                        for (k, col) in lde_periodic_columns.iter().enumerate() {
-                            periodic_buf[k] = col[i].clone();
+                        for (j, col) in lde_periodic_columns.iter().enumerate() {
+                            periodic_buf[j] = col[i].clone();
                         }
 
                         let ctx = TransitionEvaluationContext::new_prover(
-                            &frames[j],
+                            frame,
                             periodic_buf,
                             rap_challenges,
                             &logup_alpha_powers,
                         );
-                        air.compute_transition_into(&ctx, &mut transition_bufs[j]);
-                    }
+                        air.compute_transition_into(&ctx, transition_buf);
 
-                    // Accumulate: dot(eval, coefficients) per point, then apply zerofier.
-                    if is_uniform && n == 4 {
-                        // Fast path: 4-wide batch dot product (AVX2 when available).
-                        let evals: [&[FieldElement<FieldExtension>]; 4] = [
-                            &transition_bufs[0],
-                            &transition_bufs[1],
-                            &transition_bufs[2],
-                            &transition_bufs[3],
-                        ];
-                        let sums =
-                            FieldExtension::batch_dot_product_4(evals, transition_coefficients);
-                        for j in 0..4 {
-                            let z = zerofier_data.get_uniform(base + j);
-                            let boundary = chunk[j].clone();
-                            chunk[j] = z * &sums[j] + boundary;
-                        }
-                    } else if is_uniform {
-                        // Scalar tail (< 4 remaining points).
-                        for j in 0..n {
-                            let z = zerofier_data.get_uniform(base + j);
-                            let sum = transition_bufs[j]
+                        let acc_transition = if is_uniform {
+                            // All constraints share one zerofier: factor it out of the sum.
+                            let z = zerofier_data.get_uniform(i);
+                            let sum = transition_buf
                                 .iter()
                                 .zip(transition_coefficients)
                                 .fold(FieldElement::zero(), |acc, (eval, beta)| acc + eval * beta);
-                            let boundary = chunk[j].clone();
-                            chunk[j] = z * &sum + boundary;
-                        }
-                    } else {
-                        // Non-uniform zerofier: per-constraint lookup.
-                        for j in 0..n {
-                            let i = base + j;
-                            let acc = transition_bufs[j]
+                            z * &sum
+                        } else {
+                            transition_buf
                                 .iter()
                                 .enumerate()
                                 .zip(transition_coefficients)
                                 .fold(FieldElement::zero(), |acc, ((c_idx, eval), beta)| {
                                     acc + zerofier_data.get(c_idx, i) * eval * beta
-                                });
-                            let boundary = chunk[j].clone();
-                            chunk[j] = acc + boundary;
-                        }
-                    }
-                },
-            );
+                                })
+                        };
+
+                        acc_transition + boundary
+                    },
+                )
+                .collect();
             evaluations_t
         }
 
