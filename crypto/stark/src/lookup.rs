@@ -75,6 +75,21 @@ pub const LOGUP_CHALLENGE_ALPHA: usize = 1;
 /// Number of challenges required by the LogUp protocol.
 pub const LOGUP_NUM_CHALLENGES: usize = 2;
 
+/// Split N interactions into committed batched pairs and absorbed remainder.
+///
+/// Returns `(num_committed_pairs, absorbed_count)` where:
+/// - Committed pairs get dedicated auxiliary term columns (2 interactions per column)
+/// - Absorbed interactions (1 or 2) are folded into the accumulated constraint
+fn split_interactions(num_interactions: usize) -> (usize, usize) {
+    if num_interactions <= 2 {
+        (0, num_interactions)
+    } else if num_interactions % 2 == 1 {
+        ((num_interactions - 1) / 2, 1)
+    } else {
+        ((num_interactions - 2) / 2, 2)
+    }
+}
+
 // =============================================================================
 // Bus Types
 // =============================================================================
@@ -709,30 +724,9 @@ impl<
         let num_interactions = auxiliary_trace_build_data.interactions.len();
 
         // Split interactions: committed pairs get term columns, last 1-2 are absorbed
-        let (num_committed_pairs, absorbed) = if num_interactions == 0 {
-            (0, vec![])
-        } else if num_interactions <= 2 {
-            // All interactions absorbed, no committed term columns
-            (
-                0,
-                auxiliary_trace_build_data.interactions[..num_interactions].to_vec(),
-            )
-        } else if num_interactions % 2 == 1 {
-            // Odd: pairs from [0..N-1), absorb last 1
-            (
-                (num_interactions - 1) / 2,
-                vec![auxiliary_trace_build_data.interactions[num_interactions - 1].clone()],
-            )
-        } else {
-            // Even: pairs from [0..N-2), absorb last 2
-            (
-                (num_interactions - 2) / 2,
-                vec![
-                    auxiliary_trace_build_data.interactions[num_interactions - 2].clone(),
-                    auxiliary_trace_build_data.interactions[num_interactions - 1].clone(),
-                ],
-            )
-        };
+        let (num_committed_pairs, absorbed_count) = split_interactions(num_interactions);
+        let absorbed =
+            auxiliary_trace_build_data.interactions[num_interactions - absorbed_count..].to_vec();
 
         // Create batched term constraints for committed pairs only
         for pair_idx in 0..num_committed_pairs {
@@ -915,13 +909,7 @@ where
         let table_name = self.name.as_deref().unwrap_or("UNKNOWN");
 
         // Split interactions: committed pairs get term columns, last 1-2 are absorbed (virtual)
-        let (num_committed_pairs, absorbed_count) = if num_interactions <= 2 {
-            (0, num_interactions)
-        } else if num_interactions % 2 == 1 {
-            ((num_interactions - 1) / 2, 1usize)
-        } else {
-            ((num_interactions - 2) / 2, 2usize)
-        };
+        let (num_committed_pairs, absorbed_count) = split_interactions(num_interactions);
 
         // Compute committed term columns in parallel (batched pairs only)
         #[cfg(feature = "parallel")]
