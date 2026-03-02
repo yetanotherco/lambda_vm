@@ -37,6 +37,31 @@ where
         transition_evaluations: &mut [FieldElement<E>],
     );
 
+    /// Prover-only evaluation that writes base-field constraints to `base_evaluations`
+    /// and extension-field constraints to `ext_evaluations`.
+    ///
+    /// The default delegates to `evaluate()`, writing into `ext_evaluations` (E×E path).
+    /// VM constraints override this to write `FieldElement<F>` directly into
+    /// `base_evaluations`, enabling cheaper F×E accumulation in the composition polynomial.
+    fn evaluate_prover(
+        &self,
+        ctx: &TransitionEvaluationContext<F, E>,
+        base_evaluations: &mut [FieldElement<F>],
+        ext_evaluations: &mut [FieldElement<E>],
+    ) {
+        // Safety: constraints with index < base_evaluations.len() MUST override this
+        // method to write into base_evaluations. The default writes to ext_evaluations,
+        // but the accumulator only reads ext_evaluations[num_base..], so a base-range
+        // constraint using this default would be silently dropped (soundness bug).
+        debug_assert!(
+            self.constraint_idx() >= base_evaluations.len(),
+            "Constraint idx {} < num_base {}: must override evaluate_prover()",
+            self.constraint_idx(),
+            base_evaluations.len()
+        );
+        self.evaluate(ctx, ext_evaluations);
+    }
+
     /// The periodicity the constraint is applied over the trace.
     ///
     /// Default value is 1, meaning that the constraint is applied to every

@@ -676,6 +676,8 @@ pub struct AirWithBuses<
     num_precomputed_cols: Option<usize>,
     /// Optional name for debug output (per-table bus sum tracking)
     name: Option<String>,
+    /// Number of inner (non-LogUp) constraints that produce base-field evaluations.
+    num_inner_constraints: usize,
 }
 
 impl<
@@ -701,6 +703,7 @@ impl<
         mut transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
     ) -> Self {
         let num_interactions = auxiliary_trace_build_data.interactions.len();
+        let num_inner_constraints = transition_constraints.len();
 
         // Add a term constraint for each interaction
         // Each term constraint verifies: term[i] = sign * multiplicity[i] / fingerprint[i]
@@ -745,6 +748,7 @@ impl<
             preprocessed_commitment: None,
             num_precomputed_cols: None,
             name: None,
+            num_inner_constraints,
         }
     }
 
@@ -833,6 +837,10 @@ where
         &self,
     ) -> &Vec<Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>> {
         &self.transition_constraints
+    }
+
+    fn num_base_transition_constraints(&self) -> usize {
+        self.num_inner_constraints
     }
 
     fn build_auxiliary_trace(
