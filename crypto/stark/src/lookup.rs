@@ -1173,6 +1173,334 @@ where
 {
 }
 
+// =============================================================================
+// AVX2 Fingerprint Acceleration (x86_64 only)
+// =============================================================================
+
+/// AVX2-accelerated fingerprint computation for Goldilocks cubic extension.
+///
+/// Processes 4 rows simultaneously using 256-bit SIMD. Each F×E multiply
+/// (base field × cubic extension) becomes 3 parallel 4-wide Goldilocks multiplies.
+///
+/// # Arguments
+/// * `bus_element_cols` - Pre-computed bus element columns (column-major, raw u64).
+///   Each inner slice has `trace_len` elements.
+/// * `alpha_powers_raw` - Alpha powers as raw [u64; 3] (cubic extension components).
+/// * `z_raw` - The z challenge as raw [u64; 3].
+/// * `trace_len` - Number of rows.
+///
+/// # Returns
+/// Fingerprints as Vec of [u64; 3] (cubic extension, SoA→AoS converted).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn compute_fingerprints_avx2(
+    bus_element_cols: &[&[u64]],
+    alpha_powers_raw: &[[u64; 3]],
+    z_raw: [u64; 3],
+    trace_len: usize,
+) -> Vec<[u64; 3]> {
+    use core::arch::x86_64::*;
+    use math::field::fields::fft_friendly::goldilocks_avx2::{add4, mul4, sub4};
+
+    let num_elements = bus_element_cols.len();
+    debug_assert_eq!(alpha_powers_raw.len(), num_elements);
+
+    let chunks = trace_len / 4;
+    let mut result = Vec::with_capacity(trace_len);
+
+    // SAFETY: caller verified AVX2 is available via is_x86_feature_detected
+    unsafe {
+        // Broadcast z components
+        let z0 = _mm256_set1_epi64x(z_raw[0] as i64);
+        let z1 = _mm256_set1_epi64x(z_raw[1] as i64);
+        let z2 = _mm256_set1_epi64x(z_raw[2] as i64);
+
+        // Process 4 rows at a time
+        for chunk in 0..chunks {
+            let base_row = chunk * 4;
+
+            // Accumulators for the linear combination (3 cubic components, 4 rows each)
+            let mut acc0 = _mm256_setzero_si256();
+            let mut acc1 = _mm256_setzero_si256();
+            let mut acc2 = _mm256_setzero_si256();
+
+            for k in 0..num_elements {
+                // Load 4 consecutive base-field values from column k
+                let vals = _mm256_loadu_si256(
+                    bus_element_cols[k].as_ptr().add(base_row) as *const __m256i
+                );
+
+                // Broadcast the 3 cubic components of alpha_powers[k]
+                let ap0 = _mm256_set1_epi64x(alpha_powers_raw[k][0] as i64);
+                let ap1 = _mm256_set1_epi64x(alpha_powers_raw[k][1] as i64);
+                let ap2 = _mm256_set1_epi64x(alpha_powers_raw[k][2] as i64);
+
+                // F×E multiply: val * [ap0, ap1, ap2] = [val*ap0, val*ap1, val*ap2]
+                // Accumulate into acc
+                acc0 = add4(acc0, mul4(vals, ap0));
+                acc1 = add4(acc1, mul4(vals, ap1));
+                acc2 = add4(acc2, mul4(vals, ap2));
+            }
+
+            // fingerprint = z - acc
+            let fp0 = sub4(z0, acc0);
+            let fp1 = sub4(z1, acc1);
+            let fp2 = sub4(z2, acc2);
+
+            // Store results (SoA → AoS)
+            let mut out0 = [0u64; 4];
+            let mut out1 = [0u64; 4];
+            let mut out2 = [0u64; 4];
+            _mm256_storeu_si256(out0.as_mut_ptr() as *mut __m256i, fp0);
+            _mm256_storeu_si256(out1.as_mut_ptr() as *mut __m256i, fp1);
+            _mm256_storeu_si256(out2.as_mut_ptr() as *mut __m256i, fp2);
+
+            for i in 0..4 {
+                result.push([out0[i], out1[i], out2[i]]);
+            }
+        }
+    }
+
+    // Scalar tail
+    for row in (chunks * 4)..trace_len {
+        let mut acc = [0u64; 3];
+        for k in 0..num_elements {
+            let val = bus_element_cols[k][row];
+            for (c, acc_c) in acc.iter_mut().enumerate() {
+                let product = (val as u128) * (alpha_powers_raw[k][c] as u128);
+                *acc_c = goldilocks_add(*acc_c, goldilocks_reduce128(product));
+            }
+        }
+        result.push([
+            goldilocks_sub(z_raw[0], acc[0]),
+            goldilocks_sub(z_raw[1], acc[1]),
+            goldilocks_sub(z_raw[2], acc[2]),
+        ]);
+    }
+
+    result
+}
+
+/// Scalar Goldilocks add (used in tail processing).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn goldilocks_add(a: u64, b: u64) -> u64 {
+    const EPSILON: u64 = 0xFFFF_FFFF;
+    let (sum, over) = a.overflowing_add(b);
+    let (sum, over2) = sum.overflowing_add((over as u64) * EPSILON);
+    if over2 {
+        sum.wrapping_add(EPSILON)
+    } else {
+        sum
+    }
+}
+
+/// Scalar Goldilocks sub (used in tail processing).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn goldilocks_sub(a: u64, b: u64) -> u64 {
+    const EPSILON: u64 = 0xFFFF_FFFF;
+    let (diff, under) = a.overflowing_sub(b);
+    let (diff, under2) = diff.overflowing_sub((under as u64) * EPSILON);
+    if under2 {
+        diff.wrapping_sub(EPSILON)
+    } else {
+        diff
+    }
+}
+
+/// Scalar Goldilocks reduce128 (used in tail processing).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn goldilocks_reduce128(x: u128) -> u64 {
+    const EPSILON: u64 = 0xFFFF_FFFF;
+    let x_lo = x as u64;
+    let x_hi = (x >> 64) as u64;
+    let x_hi_hi = x_hi >> 32;
+    let x_hi_lo = x_hi & EPSILON;
+    let (t0, borrow) = x_lo.overflowing_sub(x_hi_hi);
+    let t0 = if borrow { t0.wrapping_sub(EPSILON) } else { t0 };
+    let t1 = (x_hi_lo << 32).wrapping_sub(x_hi_lo);
+    let (result, carry) = t0.overflowing_add(t1);
+    if carry {
+        result.wrapping_add(EPSILON)
+    } else {
+        result
+    }
+}
+
+/// Pre-compute bus element columns as raw u64 values (column-major).
+///
+/// Flattens each `BusInteraction`'s bus elements into a Vec of u64 columns, handling
+/// packing/combining in the base field. The bus_id contributes the first element.
+#[cfg(target_arch = "x86_64")]
+fn precompute_bus_element_columns(
+    table_interaction: &BusInteraction,
+    main_segment_cols: &[Vec<u64>],
+    trace_len: usize,
+) -> Vec<Vec<u64>> {
+    let num_elements = table_interaction.num_bus_elements();
+    let mut columns: Vec<Vec<u64>> = Vec::with_capacity(num_elements);
+
+    // First element: bus_id (constant column)
+    columns.push(vec![table_interaction.bus_id; trace_len]);
+
+    // Remaining elements from bus values
+    for bv in &table_interaction.values {
+        match bv {
+            BusValue::Packed {
+                start_column,
+                packing,
+            } => {
+                precompute_packing_columns(
+                    *packing,
+                    *start_column,
+                    main_segment_cols,
+                    trace_len,
+                    &mut columns,
+                );
+            }
+            BusValue::Linear(terms) => {
+                let mut col = Vec::with_capacity(trace_len);
+                for row in 0..trace_len {
+                    let mut val = 0u64;
+                    for term in terms {
+                        match *term {
+                            LinearTerm::Column {
+                                coefficient,
+                                column,
+                            } => {
+                                let coeff = if coefficient >= 0 {
+                                    coefficient as u64
+                                } else {
+                                    math::field::fields::fft_friendly::u64_goldilocks::GOLDILOCKS_PRIME
+                                        .wrapping_sub((-coefficient) as u64)
+                                };
+                                let product =
+                                    (main_segment_cols[column][row] as u128) * (coeff as u128);
+                                val = goldilocks_add(val, goldilocks_reduce128(product));
+                            }
+                            LinearTerm::ColumnUnsigned {
+                                coefficient,
+                                column,
+                            } => {
+                                let product = (main_segment_cols[column][row] as u128)
+                                    * (coefficient as u128);
+                                val = goldilocks_add(val, goldilocks_reduce128(product));
+                            }
+                            LinearTerm::Constant(value) => {
+                                let c = if value >= 0 {
+                                    value as u64
+                                } else {
+                                    math::field::fields::fft_friendly::u64_goldilocks::GOLDILOCKS_PRIME
+                                        .wrapping_sub((-value) as u64)
+                                };
+                                val = goldilocks_add(val, c);
+                            }
+                        }
+                    }
+                    col.push(val);
+                }
+                columns.push(col);
+            }
+        }
+    }
+
+    debug_assert_eq!(columns.len(), num_elements);
+    columns
+}
+
+/// Pre-compute columns for a specific packing type.
+#[cfg(target_arch = "x86_64")]
+fn precompute_packing_columns(
+    packing: Packing,
+    start_col: usize,
+    main_cols: &[Vec<u64>],
+    trace_len: usize,
+    out: &mut Vec<Vec<u64>>,
+) {
+    match packing {
+        Packing::Direct => {
+            out.push(main_cols[start_col].clone());
+        }
+        Packing::Word2L => {
+            let mut col = Vec::with_capacity(trace_len);
+            for row in 0..trace_len {
+                let combined = goldilocks_add(
+                    main_cols[start_col][row],
+                    goldilocks_reduce128(main_cols[start_col + 1][row] as u128 * SHIFT_16 as u128),
+                );
+                col.push(combined);
+            }
+            out.push(col);
+        }
+        Packing::Word4L => {
+            let mut col = Vec::with_capacity(trace_len);
+            for row in 0..trace_len {
+                let mut combined = main_cols[start_col][row];
+                combined = goldilocks_add(
+                    combined,
+                    goldilocks_reduce128(main_cols[start_col + 1][row] as u128 * SHIFT_8 as u128),
+                );
+                combined = goldilocks_add(
+                    combined,
+                    goldilocks_reduce128(main_cols[start_col + 2][row] as u128 * SHIFT_16 as u128),
+                );
+                let shift_24 = SHIFT_8 as u128 * SHIFT_16 as u128;
+                combined = goldilocks_add(
+                    combined,
+                    goldilocks_reduce128(main_cols[start_col + 3][row] as u128 * shift_24),
+                );
+                col.push(combined);
+            }
+            out.push(col);
+        }
+        // Compound packings: decompose into primitives
+        Packing::DWordWL => {
+            precompute_packing_columns(Packing::Direct, start_col, main_cols, trace_len, out);
+            precompute_packing_columns(Packing::Direct, start_col + 1, main_cols, trace_len, out);
+        }
+        Packing::DWordHHW => {
+            precompute_packing_columns(Packing::Direct, start_col, main_cols, trace_len, out);
+            precompute_packing_columns(Packing::Word2L, start_col + 1, main_cols, trace_len, out);
+        }
+        Packing::DWordWHH => {
+            precompute_packing_columns(Packing::Word2L, start_col, main_cols, trace_len, out);
+            precompute_packing_columns(Packing::Direct, start_col + 2, main_cols, trace_len, out);
+        }
+        Packing::DWordHL => {
+            precompute_packing_columns(Packing::Word2L, start_col, main_cols, trace_len, out);
+            precompute_packing_columns(Packing::Word2L, start_col + 2, main_cols, trace_len, out);
+        }
+        Packing::DWordBL => {
+            precompute_packing_columns(Packing::Word4L, start_col, main_cols, trace_len, out);
+            precompute_packing_columns(Packing::Word4L, start_col + 4, main_cols, trace_len, out);
+        }
+        Packing::QuadHL => {
+            for i in 0..4 {
+                precompute_packing_columns(
+                    Packing::Word2L,
+                    start_col + i * 2,
+                    main_cols,
+                    trace_len,
+                    out,
+                );
+            }
+        }
+        Packing::QuadWL => {
+            for i in 0..4 {
+                precompute_packing_columns(
+                    Packing::Direct,
+                    start_col + i,
+                    main_cols,
+                    trace_len,
+                    out,
+                );
+            }
+        }
+    }
+}
+
 /// Computes a term column for a table interaction without writing to the trace.
 ///
 /// Each row contains the LogUp quotient: `term[i] = sign * multiplicity[i] / fingerprint[i]`
@@ -1265,30 +1593,92 @@ where
     // Compute fingerprint = z - (bus_id*α^0 + v0*α^1 + v1*α^2 + ...) using
     // base-field × extension-field multiplication (F×E→E) to avoid to_extension().
     //
-    // Zero-allocation inner loop: accumulate the linear combination directly
-    // into the fingerprint without collecting bus elements into intermediate Vecs.
-    let bus_id_f = FieldElement::<F>::from(table_interaction.bus_id);
-    let mut fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(trace_len);
-    for row in 0..trace_len {
-        // Accumulate fingerprint directly: bus_id * α^0 + Σ element_i * α^(1+i)
-        let mut linear_combination = &bus_id_f * &alpha_powers[0];
-        let mut alpha_offset = 1;
-        for bv in &table_interaction.values {
-            let consumed = bv.accumulate_fingerprint(
-                main_segment_cols,
-                row,
-                &alpha_powers,
-                alpha_offset,
-                &mut linear_combination,
-            );
-            alpha_offset += consumed;
+    // AVX2 fast path: when on x86_64 with AVX2 support and using Goldilocks + cubic
+    // extension, process 4 rows simultaneously with SIMD.
+    #[cfg(target_arch = "x86_64")]
+    let avx2_fingerprints = 'avx2: {
+        // Check concrete types via size: GoldilocksField has BaseType=u64 (8 bytes),
+        // Degree3GoldilocksExtensionField has BaseType=[FpE;3] (24 bytes).
+        // Also verify FieldElement<F> is repr(transparent) over u64.
+        if std::mem::size_of::<FieldElement<F>>() != 8
+            || std::mem::size_of::<FieldElement<E>>() != 24
+            || !is_x86_feature_detected!("avx2")
+            || trace_len < 4
+        {
+            break 'avx2 None;
         }
 
-        fingerprints.push(z - &linear_combination);
+        // Cast main_segment_cols to raw u64 slices via repr(transparent)
+        let main_cols_raw: &[Vec<u64>] =
+            unsafe { &*(main_segment_cols as *const [Vec<FieldElement<F>>] as *const [Vec<u64>]) };
 
-        #[cfg(feature = "debug-checks")]
-        {
-            // Reconstruct base_elements for debug logging
+        // Pre-compute bus element columns as raw u64
+        let bus_element_cols =
+            precompute_bus_element_columns(table_interaction, main_cols_raw, trace_len);
+        let col_refs: Vec<&[u64]> = bus_element_cols.iter().map(|c| c.as_slice()).collect();
+
+        // Extract alpha_powers as raw [u64; 3]
+        let alpha_powers_raw: Vec<[u64; 3]> = alpha_powers
+            .iter()
+            .map(|ap| {
+                // FieldElement<Degree3GoldilocksExtensionField> has BaseType = [FpE; 3]
+                // FpE = FieldElement<GoldilocksField> has BaseType = u64
+                let ptr = ap as *const FieldElement<E> as *const [u64; 3];
+                unsafe { *ptr }
+            })
+            .collect();
+
+        // Extract z as raw [u64; 3]
+        let z_raw: [u64; 3] = unsafe { *(z as *const FieldElement<E> as *const [u64; 3]) };
+
+        // Run AVX2 kernel
+        let raw_fingerprints =
+            unsafe { compute_fingerprints_avx2(&col_refs, &alpha_powers_raw, z_raw, trace_len) };
+
+        // Convert raw [u64; 3] back to Vec<FieldElement<E>>
+        let fingerprints: Vec<FieldElement<E>> = raw_fingerprints
+            .into_iter()
+            .map(|raw| unsafe {
+                let ptr = &raw as *const [u64; 3] as *const FieldElement<E>;
+                (*ptr).clone()
+            })
+            .collect();
+
+        Some(fingerprints)
+    };
+
+    #[cfg(not(target_arch = "x86_64"))]
+    let avx2_fingerprints: Option<Vec<FieldElement<E>>> = None;
+
+    let mut fingerprints = if let Some(fp) = avx2_fingerprints {
+        fp
+    } else {
+        // Scalar fallback: accumulate the linear combination directly
+        // into the fingerprint without collecting bus elements into intermediate Vecs.
+        let bus_id_f = FieldElement::<F>::from(table_interaction.bus_id);
+        let mut fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(trace_len);
+        for row in 0..trace_len {
+            let mut linear_combination = &bus_id_f * &alpha_powers[0];
+            let mut alpha_offset = 1;
+            for bv in &table_interaction.values {
+                let consumed = bv.accumulate_fingerprint(
+                    main_segment_cols,
+                    row,
+                    &alpha_powers,
+                    alpha_offset,
+                    &mut linear_combination,
+                );
+                alpha_offset += consumed;
+            }
+            fingerprints.push(z - &linear_combination);
+        }
+        fingerprints
+    };
+
+    #[cfg(feature = "debug-checks")]
+    {
+        let bus_id_f = FieldElement::<F>::from(table_interaction.bus_id);
+        for row in 0..trace_len {
             let mut base_elements: Vec<FieldElement<F>> = vec![bus_id_f.clone()];
             base_elements.extend(
                 table_interaction
@@ -1303,7 +1693,7 @@ where
                 table_interaction.is_sender,
                 &multiplicities[row].canonical(),
                 &base_elements,
-                fingerprints.last().unwrap(),
+                &fingerprints[row],
             );
         }
     }
