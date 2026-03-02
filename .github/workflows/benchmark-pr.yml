@@ -117,7 +117,7 @@ jobs:
           for i in $(seq 1 $RUNS); do
             echo "--- Run $i/$RUNS ---"
             ./target/release/cli prove "$ELF" -o /tmp/proof.bin --time \
-              2>&1 | tee /tmp/cli_output_$i.txt
+              | tee /tmp/cli_output_$i.txt
             rm -f /tmp/proof.bin
 
             T=$(grep -o 'Proving time: [0-9.]*' /tmp/cli_output_$i.txt | awk '{print $3}')
@@ -155,15 +155,6 @@ jobs:
           ALL_TIMES=$(echo $TIMES | tr ' ' '\n' | paste -sd '/' -)
           ALL_HEAPS=$(echo $HEAPS | tr ' ' '\n' | paste -sd '/' -)
 
-          # Detect AVX2 usage from CLI output
-          if grep -q '\[BENCH\] LogUp fingerprints: AVX2' /tmp/cli_output_1.txt; then
-            LOGUP_SIMD="AVX2"
-          elif grep -q '\[BENCH\] LogUp fingerprints: scalar' /tmp/cli_output_1.txt; then
-            LOGUP_SIMD="scalar"
-          else
-            LOGUP_SIMD="unknown"
-          fi
-
           echo "peak_mb=$HEAP_MEDIAN" >> "$GITHUB_OUTPUT"
           echo "time_s=$TIME_MEDIAN" >> "$GITHUB_OUTPUT"
           echo "time_spread=$TIME_SPREAD" >> "$GITHUB_OUTPUT"
@@ -171,7 +162,6 @@ jobs:
           echo "all_times=$ALL_TIMES" >> "$GITHUB_OUTPUT"
           echo "all_heaps=$ALL_HEAPS" >> "$GITHUB_OUTPUT"
           echo "runs=$RUNS" >> "$GITHUB_OUTPUT"
-          echo "logup_simd=$LOGUP_SIMD" >> "$GITHUB_OUTPUT"
 
           echo "peak_mb=$HEAP_MEDIAN" > /tmp/metrics.txt
           echo "time_s=$TIME_MEDIAN" >> /tmp/metrics.txt
@@ -427,8 +417,7 @@ jobs:
             }
 
             const sha = '${{ steps.pr-ref.outputs.sha || github.sha }}'.substring(0, 8);
-            const logupSimd = '${{ steps.pr.outputs.logup_simd }}';
-            body += `\n<sub>Commit: ${sha} · Baseline: ${baseSrc} · Runner: self-hosted bench · LogUp SIMD: ${logupSimd}</sub>\n`;
+            body += `\n<sub>Commit: ${sha} · Baseline: ${baseSrc} · Runner: self-hosted bench</sub>\n`;
 
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,

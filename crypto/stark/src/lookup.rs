@@ -1648,12 +1648,12 @@ where
     let mut fingerprints = if let Some(fp) = avx2_fingerprints {
         use std::sync::Once;
         static PRINT: Once = Once::new();
-        PRINT.call_once(|| eprintln!("[BENCH] LogUp fingerprints: AVX2"));
+        PRINT.call_once(|| println!("[BENCH] LogUp fingerprints: AVX2"));
         fp
     } else {
         use std::sync::Once;
         static PRINT: Once = Once::new();
-        PRINT.call_once(|| eprintln!("[BENCH] LogUp fingerprints: scalar"));
+        PRINT.call_once(|| println!("[BENCH] LogUp fingerprints: scalar"));
         // Scalar fallback: accumulate the linear combination directly
         // into the fingerprint without collecting bus elements into intermediate Vecs.
         let bus_id_f = FieldElement::<F>::from(table_interaction.bus_id);
