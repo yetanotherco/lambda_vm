@@ -142,11 +142,28 @@ impl<F: IsField> Table<F> {
             output.len(),
             self.width
         );
-        for (col_idx, buf) in output.iter_mut().enumerate().take(self.width) {
-            buf.clear();
-            buf.reserve(self.height.saturating_sub(buf.capacity()));
-            for row_idx in 0..self.height {
-                buf.push(self.data[row_idx * self.width + col_idx].clone());
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            output[..self.width]
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(col_idx, buf)| {
+                    buf.clear();
+                    buf.reserve(self.height.saturating_sub(buf.capacity()));
+                    for row_idx in 0..self.height {
+                        buf.push(self.data[row_idx * self.width + col_idx].clone());
+                    }
+                });
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            for (col_idx, buf) in output.iter_mut().enumerate().take(self.width) {
+                buf.clear();
+                buf.reserve(self.height.saturating_sub(buf.capacity()));
+                for row_idx in 0..self.height {
+                    buf.push(self.data[row_idx * self.width + col_idx].clone());
+                }
             }
         }
     }
