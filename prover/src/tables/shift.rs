@@ -795,18 +795,12 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ShiftConstra
     ) {
         match evaluation_context {
             TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
+                frame, ..
             } => {
                 let val = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = val.to_extension();
             }
-            TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-            } => {
+            TransitionEvaluationContext::Verifier { frame, .. } => {
                 let val = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = val;
             }
