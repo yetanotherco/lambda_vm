@@ -9,3 +9,5 @@ pub mod fields;
 pub mod test_fields;
 /// Common behaviour for field elements.
 pub mod traits;
+/// PackedField trait for SIMD-vectorized field arithmetic.
+pub mod packed;
