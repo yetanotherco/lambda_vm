@@ -22,7 +22,7 @@
 //! - `address_incr_hl`: DWordHL (4 cols) — halfword decomposition of address_incr for range checks
 //! - `borrow`: Bit — borrow from low 32-bit subtraction of count - 1
 //!
-//! ## Bus Interactions (18 total)
+//! ## Bus Interactions (17 total)
 //! - **Receiver**: EcallCommit bus — receives `[timestamp_lo, timestamp_hi]` from CPU (mult = first)
 //! - **Sender**: CommitNextByte bus — sends to next row (mult = mu - end)
 //! - **Receiver**: CommitNextByte bus — receives from prev row (mult = mu - first)
@@ -253,7 +253,7 @@ pub fn generate_commit_trace(
 
     // Padding rows are already zero (first=0, end=0, mu=0)
 
-    TraceTable::new_main(data, cols::NUM_COLUMNS, num_rows)
+    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
 }
 
 // =========================================================================
@@ -784,6 +784,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 /// 7. `address_incr_hi`: (mu - end) * (address_incr_1 - address_1 - carry) = 0
 /// 8. `address_incr_decomp_lo`: (mu - end) * (address_incr_0 - hl_0 - hl_1 * 65536) = 0
 /// 9. `address_incr_decomp_hi`: (mu - end) * (address_incr_1 - hl_2 - hl_3 * 65536) = 0
+/// 10. `borrow_is_bit`: borrow * (1 - borrow) = 0
+/// 11. `count_decr_lo`: (mu - end) * (count_decr_0 + count_decr_1*65536 + 1 - count_0 - borrow*2^32) = 0
+/// 12. `count_decr_hi`: (mu - end) * (count_decr_2 + count_decr_3*65536 - count_1 + borrow) = 0
 pub fn create_constraints(constraint_idx_start: usize) -> (Vec<CommitConstraint>, usize) {
     let constraints = vec![
         CommitConstraint {
@@ -845,7 +848,7 @@ pub fn create_constraints(constraint_idx_start: usize) -> (Vec<CommitConstraint>
 
 /// The kind of COMMIT constraint.
 #[derive(Debug, Clone, Copy)]
-enum CommitConstraintKind {
+pub enum CommitConstraintKind {
     /// first * (1 - first) = 0
     RangeFirst,
     /// end * (1 - end) = 0
