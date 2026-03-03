@@ -19,7 +19,7 @@ use math::field::{
     traits::{IsFFTField, IsField, IsPrimeField, IsSubFieldOf},
 };
 #[cfg(feature = "parallel")]
-use rayon::prelude::{IntoParallelIterator, ParallelIterator};
+use rayon::prelude::*;
 
 // =============================================================================
 // Shift Constants for Type Combining
@@ -1261,62 +1261,92 @@ where
         -FieldElement::<E>::one()
     };
 
-    // Batch inversion: collect all fingerprints, invert once, then multiply back.
-    // Compute fingerprint = z - (bus_id*α^0 + v0*α^1 + v1*α^2 + ...) using
-    // base-field × extension-field multiplication (F×E→E) to avoid to_extension().
-    //
-    // Zero-allocation inner loop: accumulate the linear combination directly
-    // into the fingerprint without collecting bus elements into intermediate Vecs.
+    // Fingerprint computation — each row is independent (reads immutable main_segment_cols).
+    // Use par_chunks_mut for row-level parallelism within each interaction.
     let bus_id_f = FieldElement::<F>::from(table_interaction.bus_id);
-    let mut fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(trace_len);
-    for row in 0..trace_len {
-        // Accumulate fingerprint directly: bus_id * α^0 + Σ element_i * α^(1+i)
-        let mut linear_combination = &bus_id_f * &alpha_powers[0];
-        let mut alpha_offset = 1;
-        for bv in &table_interaction.values {
-            let consumed = bv.accumulate_fingerprint(
-                main_segment_cols,
-                row,
-                &alpha_powers,
-                alpha_offset,
-                &mut linear_combination,
-            );
-            alpha_offset += consumed;
-        }
+    let mut fingerprints: Vec<FieldElement<E>> = vec![FieldElement::zero(); trace_len];
 
-        fingerprints.push(z - &linear_combination);
+    {
+        const FINGERPRINT_CHUNK_SIZE: usize = 1024;
 
-        #[cfg(feature = "debug-checks")]
-        {
-            // Reconstruct base_elements for debug logging
-            let mut base_elements: Vec<FieldElement<F>> = vec![bus_id_f.clone()];
-            base_elements.extend(
-                table_interaction
-                    .values
-                    .iter()
-                    .flat_map(|bv| bv.combine_from(|col| main_segment_cols[col][row].clone())),
-            );
-            crate::bus_debug::log_interaction(
-                _table_name,
-                row,
-                table_interaction.bus_id,
-                table_interaction.is_sender,
-                &multiplicities[row].canonical(),
-                &base_elements,
-                fingerprints.last().unwrap(),
-            );
+        let compute_row = |fp: &mut FieldElement<E>, row: usize| {
+            let mut linear_combination = &bus_id_f * &alpha_powers[0];
+            let mut alpha_offset = 1;
+            for bv in &table_interaction.values {
+                let consumed = bv.accumulate_fingerprint(
+                    main_segment_cols,
+                    row,
+                    &alpha_powers,
+                    alpha_offset,
+                    &mut linear_combination,
+                );
+                alpha_offset += consumed;
+            }
+            *fp = z - &linear_combination;
+        };
+
+        #[cfg(feature = "parallel")]
+        fingerprints
+            .par_chunks_mut(FINGERPRINT_CHUNK_SIZE)
+            .enumerate()
+            .for_each(|(chunk_idx, chunk)| {
+                let start = chunk_idx * FINGERPRINT_CHUNK_SIZE;
+                for (local_i, fp) in chunk.iter_mut().enumerate() {
+                    compute_row(fp, start + local_i);
+                }
+            });
+
+        #[cfg(not(feature = "parallel"))]
+        for row in 0..trace_len {
+            compute_row(&mut fingerprints[row], row);
         }
     }
 
+    #[cfg(feature = "debug-checks")]
+    for row in 0..trace_len {
+        let mut base_elements: Vec<FieldElement<F>> = vec![bus_id_f.clone()];
+        base_elements.extend(
+            table_interaction
+                .values
+                .iter()
+                .flat_map(|bv| bv.combine_from(|col| main_segment_cols[col][row].clone())),
+        );
+        crate::bus_debug::log_interaction(
+            _table_name,
+            row,
+            table_interaction.bus_id,
+            table_interaction.is_sender,
+            &multiplicities[row].canonical(),
+            &base_elements,
+            &fingerprints[row],
+        );
+    }
+
+    // Parallel batch inversion
+    #[cfg(feature = "parallel")]
+    FieldElement::parallel_batch_inverse(&mut fingerprints)
+        .expect("fingerprint is zero - probability of sampling zero is negligible");
+    #[cfg(not(feature = "parallel"))]
     FieldElement::inplace_batch_inverse(&mut fingerprints)
         .expect("fingerprint is zero - probability of sampling zero is negligible");
 
     // Compute terms: term[i] = sign * multiplicity[i] * fingerprint_inv[i]
-    multiplicities
-        .iter()
-        .zip(fingerprints.iter())
-        .map(|(multiplicity, fingerprint_inv)| multiplicity * &sign * fingerprint_inv)
-        .collect()
+    #[cfg(feature = "parallel")]
+    {
+        multiplicities
+            .par_iter()
+            .zip(fingerprints.par_iter())
+            .map(|(multiplicity, fingerprint_inv)| multiplicity * &sign * fingerprint_inv)
+            .collect()
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        multiplicities
+            .iter()
+            .zip(fingerprints.iter())
+            .map(|(multiplicity, fingerprint_inv)| multiplicity * &sign * fingerprint_inv)
+            .collect()
+    }
 }
 
 /// Builds the accumulated column from pre-computed term columns.
@@ -1324,7 +1354,10 @@ where
 /// acc[0] = sum of all term columns at row 0
 /// acc[i] = acc[i-1] + sum of all term columns at row i
 ///
-/// Takes term columns directly to avoid row-major trace access.
+/// Uses a 3-phase parallel prefix sum when the `parallel` feature is enabled:
+/// Phase A: Local prefix sums per chunk (parallel)
+/// Phase B: Sequential combine of chunk totals into global offsets
+/// Phase C: Fold global offsets into local prefix sums (parallel)
 fn build_accumulated_column_from_terms<F, E>(
     acc_column_idx: usize,
     term_columns: &[Vec<FieldElement<E>>],
@@ -1337,16 +1370,102 @@ fn build_accumulated_column_from_terms<F, E>(
         return;
     }
     let trace_len = term_columns[0].len();
-    let mut accumulated = FieldElement::<E>::zero();
 
+    // Compute row sums: for each row, sum all term columns
+    let mut row_sums: Vec<FieldElement<E>> = Vec::with_capacity(trace_len);
     for row in 0..trace_len {
-        let mut row_sum = FieldElement::<E>::zero();
+        let mut s = FieldElement::<E>::zero();
         for col in term_columns {
-            row_sum = row_sum + &col[row];
+            s = s + &col[row];
         }
-        accumulated += row_sum;
-        trace.set_aux(row, acc_column_idx, accumulated.clone());
+        row_sums.push(s);
     }
+
+    // Prefix sum
+    #[cfg(feature = "parallel")]
+    let acc = parallel_prefix_sum(&row_sums);
+
+    #[cfg(not(feature = "parallel"))]
+    let acc = {
+        let mut acc = Vec::with_capacity(trace_len);
+        let mut running = FieldElement::<E>::zero();
+        for s in &row_sums {
+            running = &running + s;
+            acc.push(running.clone());
+        }
+        acc
+    };
+
+    // Write to trace
+    for (row, value) in acc.iter().enumerate() {
+        trace.set_aux(row, acc_column_idx, value.clone());
+    }
+}
+
+/// 3-phase parallel prefix sum following Plonky3's pattern.
+///
+/// Given `data[0..N]`, computes `result[i] = Σ_{j=0..=i} data[j]`.
+///
+/// Phase A: Each chunk computes its local inclusive prefix sum.
+/// Phase B: Sequential scan of chunk totals into global offsets.
+/// Phase C: Each chunk (except first) adds its global offset.
+#[cfg(feature = "parallel")]
+fn parallel_prefix_sum<E>(data: &[FieldElement<E>]) -> Vec<FieldElement<E>>
+where
+    E: IsField + Send + Sync,
+{
+    const PREFIX_SUM_CHUNK_SIZE: usize = 1024;
+
+    let n = data.len();
+    if n <= PREFIX_SUM_CHUNK_SIZE {
+        let mut result = Vec::with_capacity(n);
+        let mut running = FieldElement::<E>::zero();
+        for d in data {
+            running = &running + d;
+            result.push(running.clone());
+        }
+        return result;
+    }
+
+    // Phase A: Local inclusive prefix sums per chunk, collecting chunk totals
+    let mut result: Vec<FieldElement<E>> = vec![FieldElement::zero(); n];
+    let chunk_totals: Vec<FieldElement<E>> = result
+        .par_chunks_mut(PREFIX_SUM_CHUNK_SIZE)
+        .enumerate()
+        .map(|(chunk_idx, chunk)| {
+            let start = chunk_idx * PREFIX_SUM_CHUNK_SIZE;
+            let mut running = FieldElement::<E>::zero();
+            for (local_i, slot) in chunk.iter_mut().enumerate() {
+                running = &running + &data[start + local_i];
+                *slot = running.clone();
+            }
+            running
+        })
+        .collect();
+
+    // Phase B: Sequential combine — compute global offsets from chunk totals
+    let num_chunks = chunk_totals.len();
+    let mut offsets: Vec<FieldElement<E>> = Vec::with_capacity(num_chunks);
+    offsets.push(FieldElement::zero());
+    let mut cumulative = FieldElement::<E>::zero();
+    for total in chunk_totals.iter().take(num_chunks - 1) {
+        cumulative = &cumulative + total;
+        offsets.push(cumulative.clone());
+    }
+
+    // Phase C: Fold offsets into local prefix sums (skip first chunk — offset is 0)
+    result
+        .par_chunks_mut(PREFIX_SUM_CHUNK_SIZE)
+        .enumerate()
+        .skip(1)
+        .for_each(|(chunk_idx, chunk)| {
+            let offset = &offsets[chunk_idx];
+            for slot in chunk.iter_mut() {
+                *slot = &*slot + offset;
+            }
+        });
+
+    result
 }
 
 /// Sum aux term columns by bus_id to produce per-bus totals for the debug report.

@@ -423,3 +423,57 @@ fn test_fp3_batch_inverse_large() {
         assert_eq!(*inv * *orig, Fp3E::one());
     }
 }
+
+/// Test parallel batch inverse for Fp3 (cubic extension, same type used in STARK).
+/// Uses > 1024 elements to exercise multi-chunk path.
+#[test]
+#[cfg(feature = "parallel")]
+fn test_fp3_parallel_batch_inverse() {
+    let elements: Vec<Fp3E> = (1u64..=2048)
+        .map(|i| Fp3E::new([FpE::from(i), FpE::from(i + 100), FpE::from(i + 200)]))
+        .collect();
+
+    let original = elements.clone();
+    let mut to_invert = elements;
+
+    Fp3E::parallel_batch_inverse(&mut to_invert).unwrap();
+
+    for (inv, orig) in to_invert.iter().zip(original.iter()) {
+        assert_eq!(*inv * *orig, Fp3E::one());
+    }
+}
+
+/// Test parallel batch inverse falls back to sequential for small slices.
+#[test]
+#[cfg(feature = "parallel")]
+fn test_fp3_parallel_batch_inverse_small() {
+    let elements: Vec<Fp3E> = (1u64..=10)
+        .map(|i| Fp3E::new([FpE::from(i), FpE::from(i + 100), FpE::from(i + 200)]))
+        .collect();
+
+    let original = elements.clone();
+    let mut to_invert = elements;
+
+    Fp3E::parallel_batch_inverse(&mut to_invert).unwrap();
+
+    for (inv, orig) in to_invert.iter().zip(original.iter()) {
+        assert_eq!(*inv * *orig, Fp3E::one());
+    }
+}
+
+/// Verify parallel and sequential batch inverse produce identical results.
+#[test]
+#[cfg(feature = "parallel")]
+fn test_fp3_parallel_batch_inverse_matches_sequential() {
+    let elements: Vec<Fp3E> = (1u64..=3000)
+        .map(|i| Fp3E::new([FpE::from(i), FpE::from(i + 100), FpE::from(i + 200)]))
+        .collect();
+
+    let mut sequential = elements.clone();
+    let mut parallel = elements;
+
+    Fp3E::inplace_batch_inverse(&mut sequential).unwrap();
+    Fp3E::parallel_batch_inverse(&mut parallel).unwrap();
+
+    assert_eq!(sequential, parallel);
+}

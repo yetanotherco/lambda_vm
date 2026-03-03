@@ -71,6 +71,29 @@ impl<F: IsField> FieldElement<F> {
         Ok(())
     }
 
+    /// Chunk size for parallel batch inversion. Each chunk runs independent
+    /// Montgomery's trick. For Goldilocks: 1 inversion ≈ 72 mults, so the
+    /// overhead of N/1024 inversions instead of 1 is negligible vs 3N total mults.
+    #[cfg(feature = "parallel")]
+    const BATCH_INV_CHUNK_SIZE: usize = 1024;
+
+    /// Parallel variant of `inplace_batch_inverse`. Splits the slice into chunks
+    /// of 1024 and runs independent Montgomery's trick per chunk via Rayon.
+    /// Falls back to sequential for small slices.
+    #[cfg(feature = "parallel")]
+    pub fn parallel_batch_inverse(numbers: &mut [Self]) -> Result<(), FieldError>
+    where
+        Self: Send,
+    {
+        use rayon::prelude::*;
+        if numbers.len() <= Self::BATCH_INV_CHUNK_SIZE {
+            return Self::inplace_batch_inverse(numbers);
+        }
+        numbers
+            .par_chunks_mut(Self::BATCH_INV_CHUNK_SIZE)
+            .try_for_each(|chunk| Self::inplace_batch_inverse(chunk))
+    }
+
     #[inline(always)]
     pub fn to_subfield_vec<S>(self) -> alloc::vec::Vec<FieldElement<S>>
     where
