@@ -72,31 +72,6 @@ pub struct VerifierDomain<F: IsFFTField> {
 }
 
 impl<F: IsFFTField> VerifierDomain<F> {
-    /// Creates a lightweight verifier domain without pre-computing roots of unity.
-    pub fn new<A>(air: &A, trace_length: usize) -> Self
-    where
-        A: AIR<Field = F>,
-    {
-        let blowup_factor = air.options().blowup_factor as usize;
-        let coset_offset = FieldElement::from(air.options().coset_offset);
-        let lde_length = trace_length * blowup_factor;
-        let root_order = trace_length.trailing_zeros();
-
-        let trace_primitive_root = F::get_primitive_root_of_unity(root_order as u64).unwrap();
-
-        let lde_root_order = lde_length.trailing_zeros();
-        let lde_primitive_root = F::get_primitive_root_of_unity(lde_root_order as u64).unwrap();
-
-        VerifierDomain {
-            root_order,
-            trace_length,
-            lde_length,
-            trace_primitive_root,
-            lde_primitive_root,
-            coset_offset,
-        }
-    }
-
     /// Compute an LDE coset element at a specific index on-demand.
     /// Element at index i is: coset_offset * lde_primitive_root^i
     #[inline]

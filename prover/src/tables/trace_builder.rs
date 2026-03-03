@@ -1398,7 +1398,7 @@ impl Traces {
         bitwise_ops.extend(collect_bitwise_from_page(elf, &memory_state));
 
         // =====================================================================
-        // PHASE 5: Generate final traces
+        // PHASE 5: Generate final traces (parallelized)
         // =====================================================================
 
         // Extract halt timestamp from the last ECALL instruction
@@ -1407,7 +1407,7 @@ impl Traces {
             .rev()
             .find(|op| op.decode.op_ecall)
             .ok_or(Error::MissingHaltEcall)?;
-        let halt_trace = halt::generate_halt_trace(halt_op.timestamp);
+        let halt_timestamp = halt_op.timestamp;
 
         let cpus = chunk_and_generate(&cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
         let memws = chunk_and_generate(&memw_ops, max_rows.memw, memw::generate_memw_trace);
@@ -1436,12 +1436,37 @@ impl Traces {
         decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
         decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
 
-        // Generate PAGE tables from ELF and final memory state
-        let (pages, page_configs) = generate_page_tables(elf, &memory_state);
-
-        // Generate REGISTER table from final register state
+        // Prepare register final state before scope (needs register_state ownership)
         let register_final_state = register_state.to_final_state_map();
-        let register_trace = register::generate_register_trace(&register_final_state);
+
+        // Generate remaining traces in parallel (page, register, halt).
+        // chunk_and_generate already handled cpu, lt, memw, load, mul, dvrm, branch above.
+        let (pages, page_configs, register_trace, halt_trace);
+        #[cfg(feature = "parallel")]
+        {
+            let ((pages_val, register_val), halt_val) = rayon::join(
+                || {
+                    rayon::join(
+                        || generate_page_tables(elf, &memory_state),
+                        || register::generate_register_trace(&register_final_state),
+                    )
+                },
+                || halt::generate_halt_trace(halt_timestamp),
+            );
+            let (pages_v, page_configs_v) = pages_val;
+            pages = pages_v;
+            page_configs = page_configs_v;
+            register_trace = register_val;
+            halt_trace = halt_val;
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            let (pages_v, page_configs_v) = generate_page_tables(elf, &memory_state);
+            pages = pages_v;
+            page_configs = page_configs_v;
+            register_trace = register::generate_register_trace(&register_final_state);
+            halt_trace = halt::generate_halt_trace(halt_timestamp);
+        }
 
         Ok(Traces {
             cpus,
@@ -1564,7 +1589,7 @@ impl Traces {
         bitwise_ops.extend(shift::collect_bitwise_from_shift(&shift_ops));
 
         // =====================================================================
-        // PHASE 5: Generate final traces
+        // PHASE 5: Generate final traces (parallelized)
         // =====================================================================
 
         // Extract halt timestamp from the last ECALL instruction
@@ -1573,7 +1598,7 @@ impl Traces {
             .rev()
             .find(|op| op.decode.op_ecall)
             .ok_or(Error::MissingHaltEcall)?;
-        let halt_trace = halt::generate_halt_trace(halt_op.timestamp);
+        let halt_timestamp = halt_op.timestamp;
 
         let cpus = chunk_and_generate(&cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
         let memws = chunk_and_generate(&memw_ops, max_rows.memw, memw::generate_memw_trace);
@@ -1600,15 +1625,30 @@ impl Traces {
         let mut decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
         decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
         decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
+        let register_final_state = register_state.to_final_state_map();
+
+        // Generate remaining traces in parallel (register, halt).
+        // chunk_and_generate already handled cpu, lt, memw, load, mul, dvrm, branch above.
+        let (register_trace, halt_trace);
+        #[cfg(feature = "parallel")]
+        {
+            let (register_val, halt_val) = rayon::join(
+                || register::generate_register_trace(&register_final_state),
+                || halt::generate_halt_trace(halt_timestamp),
+            );
+            register_trace = register_val;
+            halt_trace = halt_val;
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            register_trace = register::generate_register_trace(&register_final_state);
+            halt_trace = halt::generate_halt_trace(halt_timestamp);
+        }
 
         // Create empty PAGE tables for legacy API
         // (caller should use from_elf_and_logs for proper PAGE table support)
         let pages = Vec::new();
         let page_configs = Vec::new();
-
-        // Generate REGISTER table from final register state
-        let register_final_state = register_state.to_final_state_map();
-        let register_trace = register::generate_register_trace(&register_final_state);
 
         Ok(Traces {
             cpus,

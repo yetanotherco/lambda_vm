@@ -185,9 +185,12 @@ where
 
             FieldElement::inplace_batch_inverse(&mut evaluations).unwrap();
 
-            // FIXME: Instead of computing this evaluations for each constraint, they can be computed
-            // once for every constraint with the same end exemptions (combination of end_exemptions()
-            // and period).
+            // Fast path: when end_exemptions == 0, the end_exemptions_poly is constant 1,
+            // so the multiplication is identity. Skip the expensive FFT evaluation.
+            if self.end_exemptions() == 0 {
+                return evaluations;
+            }
+
             let end_exemption_evaluations = evaluate_polynomial_on_lde_domain(
                 &end_exemptions_poly,
                 blowup_factor,
