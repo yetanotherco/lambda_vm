@@ -1,13 +1,24 @@
 // Acknowledgement: Lambdaclass Ethrex Team (https://github.com/lambdaclass/ethrex)
 use clap::Parser;
-use report::{shell_summary, LinesOfCodeReport, LinesOfCodeReporterOptions};
-use spinoff::{spinners::Dots, Color, Spinner};
+use report::{LinesOfCodeReport, LinesOfCodeReporterOptions, shell_summary};
+use spinoff::{Color, Spinner, spinners::Dots};
 use std::{collections::HashMap, fs::DirEntry, path::PathBuf};
 use tokei::{Config, Language, LanguageType, Languages};
 
 mod report;
 
-const EXCLUDED: &[&str] = &["tooling", "*target*", "*tests*", "*bench*", "*benches*"];
+const EXCLUDED: &[&str] = &[
+    "tooling",
+    "*target*",
+    "*tests*",
+    "*test_utils*",
+    "*bench*",
+    "*benches*",
+    "*examples*",
+];
+
+/// Directories counted separately (not as crates).
+const CRATE_SKIPPED: &[&str] = &["tooling", "bin"];
 
 fn count_crates_loc(crates_path: &PathBuf, config: &Config) -> Vec<(String, usize)> {
     let top_level_crate_dirs = std::fs::read_dir(crates_path)
@@ -21,8 +32,8 @@ fn count_crates_loc(crates_path: &PathBuf, config: &Config) -> Vec<(String, usiz
             let crate_path = crate_dir_entry.path();
             let crate_name = crate_path.file_name().unwrap().to_str().unwrap();
 
-            // Skip excluded directories
-            if EXCLUDED.contains(&crate_name) {
+            // Skip excluded and separately-counted directories
+            if EXCLUDED.contains(&crate_name) || CRATE_SKIPPED.contains(&crate_name) {
                 return None;
             }
 
@@ -45,6 +56,42 @@ fn count_loc(path: PathBuf, config: &Config) -> Option<Language> {
     languages.get(&LanguageType::Rust).cloned()
 }
 
+fn count_tools_loc(bin_path: &PathBuf, config: &Config) -> Vec<(String, usize)> {
+    if !bin_path.exists() {
+        return Vec::new();
+    }
+
+    let tool_dirs = std::fs::read_dir(bin_path)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .collect::<Vec<DirEntry>>();
+
+    let mut tools_loc: Vec<(String, usize)> = tool_dirs
+        .into_iter()
+        .filter_map(|tool_dir_entry| {
+            let tool_path = tool_dir_entry.path();
+            let tool_name = tool_path.file_name().unwrap().to_str().unwrap().to_owned();
+
+            // Only count directories (crates)
+            if !tool_path.is_dir() {
+                return None;
+            }
+
+            let mut languages = Languages::new();
+            // Use a subset of exclusions for tools
+            let tool_excluded: &[&str] = &["*target*", "*tests*", "*bench*", "*benches*"];
+            languages.get_statistics(&[tool_path], tool_excluded, config);
+            languages
+                .get(&LanguageType::Rust)
+                .map(|rust_loc| (tool_name, rust_loc.code))
+        })
+        .collect();
+
+    tools_loc.sort_by_key(|(_tool_name, loc)| *loc);
+    tools_loc.reverse();
+    tools_loc
+}
+
 fn main() {
     let opts = LinesOfCodeReporterOptions::parse();
 
@@ -56,10 +103,12 @@ fn main() {
         .map(|path| path.parent().unwrap().parent().unwrap().to_path_buf())
         .unwrap();
     let repo_crates_path = repo_path.join(""); // TODO: change to "crates" when crates directory exists
+    let repo_bin_path = repo_path.join("bin");
     let config = Config::default();
 
-    let lambda_vm_loc = count_loc(repo_path, &config).unwrap();
+    let lambda_vm_loc = count_loc(repo_path.clone(), &config).unwrap();
     let crates_loc = count_crates_loc(&repo_crates_path, &config);
+    let tools_loc = count_tools_loc(&repo_bin_path, &config);
 
     spinner.success("Lines of code calculated!");
 
@@ -68,6 +117,7 @@ fn main() {
     let new_report = LinesOfCodeReport {
         lambda_vm: lambda_vm_loc.code,
         crates: crates_loc,
+        tools: tools_loc,
     };
 
     if opts.detailed {

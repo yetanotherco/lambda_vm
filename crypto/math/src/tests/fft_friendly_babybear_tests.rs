@@ -47,6 +47,14 @@ mod fft_tests {
     use alloc::vec::Vec;
     use proptest::{collection, prelude::*};
 
+    /// Evaluates a polynomial at a slice of points
+    fn evaluate_slice<F: IsFFTField>(
+        poly: &Polynomial<FieldElement<F>>,
+        input: &[FieldElement<F>],
+    ) -> Vec<FieldElement<F>> {
+        input.iter().map(|x| poly.evaluate(x)).collect()
+    }
+
     fn gen_fft_and_naive_evaluation<F: IsFFTField>(
         poly: Polynomial<FieldElement<F>>,
     ) -> (Vec<FieldElement<F>>, Vec<FieldElement<F>>) {
@@ -56,7 +64,7 @@ mod fft_tests {
             get_powers_of_primitive_root(order.into(), len, RootsConfig::Natural).unwrap();
 
         let fft_eval = Polynomial::evaluate_fft::<F>(&poly, 1, None).unwrap();
-        let naive_eval = poly.evaluate_slice(&twiddles);
+        let naive_eval = evaluate_slice(&poly, &twiddles);
 
         (fft_eval, naive_eval)
     }
@@ -73,7 +81,7 @@ mod fft_tests {
 
         let fft_eval =
             Polynomial::evaluate_offset_fft::<F>(&poly, blowup_factor, None, &offset).unwrap();
-        let naive_eval = poly.evaluate_slice(&twiddles);
+        let naive_eval = evaluate_slice(&poly, &twiddles);
 
         (fft_eval, naive_eval)
     }

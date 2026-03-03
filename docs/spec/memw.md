@@ -1,5 +1,7 @@
 # MEMW Chip
 
+The  chip is used to read and write memory locations (both RAM and registers) in chunks of 1, 2, 4 or 8 values. It introduces the old value and last-accessed timestamps of memory addresses internally, in order to satisfy the design of the memory argument ([memory]).
+
 = Columns
 
 The `MEMW` chip is comprised of  variables that are expressed using  columns:
@@ -15,12 +17,12 @@ Our assumptions do not explicitly cover any range checks for the `is_register` a
 | `MEMW-C1` |  | `IS_BIT<μ_sum>` |  |
 | `MEMW-C2` |  | `w2` => `μ_sum` |  |
 | | | _polynomial:_ `w2 * (1 - μ_sum) = 0` | |
-| `MEMW-C3` |  | w2 ⇒ `ADD<address_add[0]::DWordWL; base_address, 1>` |  |
-| `MEMW-C4.i` | i ∈ [1, 2] | w4 ⇒ `ADD<address_add[i]::DWordWL; base_address, i + 1>` |  |
-| `MEMW-C5.i` | i ∈ [3, 6] | write8 ⇒ `ADD<address_add[i]::DWordWL; base_address, i + 1>` |  |
-| `MEMW-C6.i` | i ∈ [0, 0], j ∈ [0, 3] | `IS_HALFWORD[address_add[i][j]]` | w2 |
-| `MEMW-C7.i` | i ∈ [1, 2], j ∈ [0, 3] | `IS_HALFWORD[address_add[i][j]]` | w4 |
-| `MEMW-C8.i` | i ∈ [3, 6], j ∈ [0, 3] | `IS_HALFWORD[address_add[i][j]]` | write8 |
+| `MEMW-C3` |  | w2 ⇒ `ADD<address_add[0]::DWordWL; base_address, 1::DWordWL>` |  |
+| `MEMW-C4.i` | i ∈ [1, 2] | w4 ⇒ `ADD<address_add[i]::DWordWL; base_address, (i + 1)::DWordWL>` |  |
+| `MEMW-C5.i` | i ∈ [3, 6] | write8 ⇒ `ADD<address_add[i]::DWordWL; base_address, (i + 1)::DWordWL>` |  |
+| `MEMW-C6.i` | i ∈ [0, 0], j ∈ [0, 3] | `IS_HALF[address_add[i][j]]` | w2 |
+| `MEMW-C7.i` | i ∈ [1, 2], j ∈ [0, 3] | `IS_HALF[address_add[i][j]]` | w4 |
+| `MEMW-C8.i` | i ∈ [3, 6], j ∈ [0, 3] | `IS_HALF[address_add[i][j]]` | write8 |
 | `MEMW-C9` |  | `LT[1; old_timestamp[0], timestamp, 0]` | μ_sum |
 | `MEMW-C10` |  | `LT[1; old_timestamp[1], timestamp, 0]` | w2 |
 | `MEMW-C11.i` | i ∈ [2, 3] | `LT[1; old_timestamp[i], timestamp, 0]` | w4 |
@@ -42,12 +44,12 @@ The chip adds the following tuples to the lookup argument, to effectuate that pa
 |-----|-------|-------------|--------------|
 | `MEMW-CM16` |  | `memory[is_register, base_address, old_timestamp[0], old[0]]` | μ_sum |
 | `MEMW-CM17` |  | `memory[is_register, base_address, timestamp, value[0]]` | -μ_sum |
-| `MEMW-CM18` |  | `memory[is_register, address_add[0], old_timestamp[1], old[1]]` | w2 |
-| `MEMW-CM19` |  | `memory[is_register, address_add[0], timestamp, value[1]]` | -w2 |
-| `MEMW-CM20.i` | i ∈ [2, 3] | `memory[is_register, address_add[i - 1], old_timestamp[i], old[i]]` | w4 |
-| `MEMW-CM21.i` | i ∈ [2, 3] | `memory[is_register, address_add[i - 1], timestamp, value[i]]` | -w4 |
-| `MEMW-CM22.i` | i ∈ [4, 7] | `memory[is_register, address_add[i - 1], old_timestamp[i], old[i]]` | write8 |
-| `MEMW-CM23.i` | i ∈ [4, 7] | `memory[is_register, address_add[i - 1], timestamp, value[i]]` | -write8 |
+| `MEMW-CM18` |  | `memory[is_register, address_add[0]::DWordWL, old_timestamp[1], old[1]]` | w2 |
+| `MEMW-CM19` |  | `memory[is_register, address_add[0]::DWordWL, timestamp, value[1]]` | -w2 |
+| `MEMW-CM20.i` | i ∈ [2, 3] | `memory[is_register, address_add[i - 1]::DWordWL, old_timestamp[i], old[i]]` | w4 |
+| `MEMW-CM21.i` | i ∈ [2, 3] | `memory[is_register, address_add[i - 1]::DWordWL, timestamp, value[i]]` | -w4 |
+| `MEMW-CM22.i` | i ∈ [4, 7] | `memory[is_register, address_add[i - 1]::DWordWL, old_timestamp[i], old[i]]` | write8 |
+| `MEMW-CM23.i` | i ∈ [4, 7] | `memory[is_register, address_add[i - 1]::DWordWL, timestamp, value[i]]` | -write8 |
 
 This chip contributes the following to the lookup argument.
 
@@ -58,7 +60,7 @@ This chip contributes the following to the lookup argument.
 
 = Future optimization ideas
 
-- Fast path for aligned memory access where all bytes have the same old timestamp - MEMB chip that deals does a one-byte write to remove old_timestamp from here (uncertain tradeoffs) - Compute `base_address[1] + 1` once and have high words of `address_add` as Words - Improve overflow trapping somehow so we don't need `LT` (could tie into previous one by checking carry bit of the +1) - Adding `μ_sum`/`w2`/`w4`/`write8` multiplicities to the `IS_HALFWORD` lookups may make some GKR things faster if there are known zeroes.
+- Fast path for aligned memory access where all bytes have the same old timestamp - MEMB chip that deals does a one-byte write to remove old_timestamp from here (uncertain tradeoffs) - Compute `base_address[1] + 1` once and have high words of `address_add` as Words - Improve overflow trapping somehow so we don't need `LT` (could tie into previous one by checking carry bit of the +1) - Adding `μ_sum`/`w2`/`w4`/`write8` multiplicities to the `IS_HALF` lookups may make some GKR things faster if there are known zeroes.
 
 ## Columns
 

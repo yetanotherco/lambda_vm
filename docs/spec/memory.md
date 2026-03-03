@@ -30,19 +30,13 @@ Each memory operation will then do two things:
 
 Naturally, for a read operation, the _values_ embedded in the consumed and emitted tokens must be identical. From the need to consume a token even on the first memory access, we can see the necessity for a memory initialization procedure ---in addition to having to make sure the initial memory content lines up with what the binary dictates.
 
-> **Note:** properly link/refer to the logup spec
-
-So long as we can properly constrain temporal integrity (that is, no memory operation can consume future tokens), this "balancing" act of tokens can be integrated (with sufficient domain separation) into the existing LogUp argument: consuming a token corresponds to a "receive" and emitting a new token is a "send".
+So long as we can properly constrain temporal integrity (that is, no memory operation can consume future tokens), this "balancing" act of tokens can be integrated (with sufficient domain separation) into the existing LogUp argument ([logup]): consuming a token corresponds to a "receive" and emitting a new token is a "send".
 
 = Temporal integrity
 
-> **Note:** Properly link/refer to the LT chip
-
-To ensure temporal integrity, every memory operation needs to be constrained for the newly emitted token to have a strictly greater timestamp than the consumed token. This raises the question of how to represent timestamps and cleanly perform this check, as over a finite field the “less than” relation is ill-defined (though it is common and natural to consider it as the less than relation over the natural lift of the field into the integers). We choose to represent timestamps as machine words, using the existing `LT` chip ([lt]) functionality for comparisons.
+To ensure temporal integrity, every memory operation needs to be constrained for the newly emitted token to have a strictly greater timestamp than the consumed token. This raises the question of how to represent timestamps and cleanly perform this check, as over a finite field the “less than” relation is ill-defined (though it is common and natural to consider it as the less than relation over the natural lift of the field into the integers). We choose to represent timestamps as machine words, using the existing `LT` chip ([lt]) functionality for comparisons. The full implementation of the timestamp system can be seen in the `timestamp` column of the `CPU` ([cpu]) and `MEMW` chips ([memw]). The `CPU` merely passes in the current timestamp, while `MEMW` can recall the previously written timestamp and constrain the correct sequencing.
 
 - Clean definition of “less-than”, using the already existing `LT` functionality in the ALU - Harder to perform increments, needing extra constraints beyond field arithmetic - But this can be alleviated by providing a precomputed column that has a fixed increment per CPU row ][ - Comparison is more annoying, but can work by: - Decomposition into a machine word and chip interaction with the LT chip - Bit decomposition and comparison constraints - Range-checking the difference to be sufficiently small w.r.t. the field characteristic. - Increments and basic arithmetic operations are cheap ] ]
-
-> **Note:** reference to CPU chip/timestamp column and MEMW chip
 
 = Initialization and Finalization
 
@@ -76,9 +70,7 @@ One or more STARK tables (depending on the amount of memory used) consisting of 
 
 ## Register initialization/finalization
 
-> **Note:** Properly link/reference ECALL/HALT chip
-
-The initial and final state of registers can be entirely known by the verifier, since the relevant initialization values are either zero, or embedded in the ELF, and the final values can be set to a known value by the HALT ecall. As additionally, the number of registers is small, the verifier can directly add the required balancing terms to the LogUp sum.
+The initial and final state of registers can be entirely known by the verifier, since the relevant initialization values are either zero, or embedded in the ELF, and the final values can be set to a known value by the `HALT` ecall ([ecall]). As additionally, the number of registers is small, the verifier can directly add the required balancing terms to the LogUp sum.
 
 = Notes and considerations
 

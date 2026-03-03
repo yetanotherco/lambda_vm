@@ -30,26 +30,54 @@ where
 {
     #[cfg(feature = "alloc")]
     fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
-        unimplemented!()
+        let mut byte_slice = ByteConversion::to_bytes_be(self[2].value());
+        byte_slice.extend(ByteConversion::to_bytes_be(self[1].value()));
+        byte_slice.extend(ByteConversion::to_bytes_be(self[0].value()));
+        byte_slice
     }
 
     #[cfg(feature = "alloc")]
     fn to_bytes_le(&self) -> alloc::vec::Vec<u8> {
-        unimplemented!()
+        let mut byte_slice = ByteConversion::to_bytes_le(self[0].value());
+        byte_slice.extend(ByteConversion::to_bytes_le(self[1].value()));
+        byte_slice.extend(ByteConversion::to_bytes_le(self[2].value()));
+        byte_slice
     }
 
-    fn from_bytes_be(_bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
+    fn from_bytes_be(bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
     where
         Self: Sized,
     {
-        unimplemented!()
+        if bytes.len() < 3 || !bytes.len().is_multiple_of(3) {
+            return Err(crate::errors::ByteConversionError::FromBEBytesError);
+        }
+        let elem_size = bytes.len() / 3;
+        let v2 = F::BaseType::from_bytes_be(&bytes[0..elem_size])?;
+        let v1 = F::BaseType::from_bytes_be(&bytes[elem_size..elem_size * 2])?;
+        let v0 = F::BaseType::from_bytes_be(&bytes[elem_size * 2..])?;
+        Ok([
+            FieldElement::from_raw(v0),
+            FieldElement::from_raw(v1),
+            FieldElement::from_raw(v2),
+        ])
     }
 
-    fn from_bytes_le(_bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
+    fn from_bytes_le(bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
     where
         Self: Sized,
     {
-        unimplemented!()
+        if bytes.len() < 3 || !bytes.len().is_multiple_of(3) {
+            return Err(crate::errors::ByteConversionError::FromLEBytesError);
+        }
+        let elem_size = bytes.len() / 3;
+        let v0 = F::BaseType::from_bytes_le(&bytes[0..elem_size])?;
+        let v1 = F::BaseType::from_bytes_le(&bytes[elem_size..elem_size * 2])?;
+        let v2 = F::BaseType::from_bytes_le(&bytes[elem_size * 2..])?;
+        Ok([
+            FieldElement::from_raw(v0),
+            FieldElement::from_raw(v1),
+            FieldElement::from_raw(v2),
+        ])
     }
 }
 

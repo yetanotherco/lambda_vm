@@ -4,6 +4,7 @@
 main:
 	li	a2, -1
 	ori	a0, a2, -1        # OR with -1 immediate (valid 12-bit)
-	jalr	zero, 0(ra)
+	li	a7, 5
+	ecall
 .Lfunc_end1:
 	.size	main, .Lfunc_end1-main

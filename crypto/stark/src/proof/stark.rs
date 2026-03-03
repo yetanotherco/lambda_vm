@@ -37,6 +37,9 @@ pub struct PolynomialOpenings<F: IsField> {
 pub struct DeepPolynomialOpening<F: IsSubFieldOf<E>, E: IsField> {
     pub composition_poly: PolynomialOpenings<E>,
     pub main_trace_polys: PolynomialOpenings<F>,
+    /// For preprocessed tables: openings for precomputed columns.
+    /// These are verified against the hardcoded precomputed commitment.
+    pub precomputed_trace_polys: Option<PolynomialOpenings<F>>,
     pub aux_trace_polys: Option<PolynomialOpenings<E>>,
 }
 
@@ -53,6 +56,9 @@ pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     // Commitments of auxiliary trace columns
     // [tⱼ]
     pub lde_trace_aux_merkle_root: Option<Commitment>,
+    // For preprocessed tables: commitment to precomputed columns only.
+    // Verifier checks this matches the hardcoded commitment from AIR.
+    pub lde_trace_precomputed_merkle_root: Option<Commitment>,
     // tⱼ(zgᵏ)
     pub trace_ood_evaluations: Table<E>,
     // Commitments to Hᵢ

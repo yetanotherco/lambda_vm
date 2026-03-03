@@ -6,4 +6,5 @@ main:
 	addi	a2, zero, -100
 	addi	a3, zero, 7
 	remw	a0, a2, a3
-	jalr	zero, 0(ra)
+	li	a7, 5
+	ecall

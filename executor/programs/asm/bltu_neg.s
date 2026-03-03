@@ -12,4 +12,5 @@ main:
 less:
 	addi	a0, zero, 3        # Taken path
 end:
-	jalr	zero, 0(ra)
+	li	a7, 5
+	ecall

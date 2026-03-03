@@ -1,5 +1,7 @@
 # DVRM Chip
 
+The  chip provides division and remainder functionality, both signed and unsigned.
+
 = Columns
 
 The `DVRM` chip is comprised of  variables that are expressed using  columns:
@@ -163,6 +165,13 @@ carry (when iter=[1, 3]) := 2^-32 * ((extended_n_sub_r::QuadWL)[i] + (extended_r
 | `DVRM-C1` | `r` eq.not 0 => `sign_r` = `sign_n` |
 | | _polynomial:_ `Σ_i = 0^3 r[i] * (sign_r - sign_n) = 0` |
 
+### output
+
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `DVRM-C21` | `DVRM[q::DWordWL; n, d, signed, 0]` | -μ_q |
+| `DVRM-C22` | `DVRM[r::DWordWL; n, d, signed, 1]` | -μ_r |
+
 ### n_sub_r
 
 | Tag | Range | Description | Multiplicity |
@@ -172,14 +181,6 @@ carry (when iter=[1, 3]) := 2^-32 * ((extended_n_sub_r::QuadWL)[i] + (extended_r
 | `DVRM-C11.i` | i ∈ [0, 3] | `IS_HALF[n_sub_r[i]]` | μ_sum |
 | `DVRM-C12` |  | `IS_BIT<sign_n_sub_r>` |  |
 
-### defs
-
-| Tag | Description |
-|-----|-------------|
-| `DVRM-C16` | `SIGN<sign_n; n[3], signed>` |
-| `DVRM-C17` | `SIGN<sign_r; r[3], signed>` |
-| `DVRM-C18` | `SIGN<sign_d; d[3], signed>` |
-
 ### div_by_zero
 
 | Tag | Range | Description | Multiplicity |
@@ -188,13 +189,13 @@ carry (when iter=[1, 3]) := 2^-32 * ((extended_n_sub_r::QuadWL)[i] + (extended_r
 | | | _polynomial:_ `div_by_zero * (q[i] - 65535) = 0` | |
 | `DVRM-C20` |  | `ZERO[div_by_zero; d[0] + d[1] + d[2] + d[3]]` | μ_sum |
 
-### equality
+### defs
 
-| Tag | Range | Description | Multiplicity |
-|-----|-------|-------------|--------------|
-| `DVRM-C13` |  | `MUL[n_sub_r::DWordWL; d, signed, q, sign_q, 0]` | μ_sum |
-| `DVRM-C14` |  | `MUL[extension_n_sub_r::DWordWL; d, signed, q, sign_q, 1]` | μ_sum |
-| `DVRM-C15.i` | i ∈ [0, 3] | `IS_HALF[q[i]]` | μ_sum |
+| Tag | Description |
+|-----|-------------|
+| `DVRM-C16` | `SIGN<sign_n; n[3], signed>` |
+| `DVRM-C17` | `SIGN<sign_r; r[3], signed>` |
+| `DVRM-C18` | `SIGN<sign_d; d[3], signed>` |
 
 ### abs_diff
 
@@ -208,9 +209,10 @@ carry (when iter=[1, 3]) := 2^-32 * ((extended_n_sub_r::QuadWL)[i] + (extended_r
 | `DVRM-C6.i` | i ∈ [0, 1] | not`sign_d` => `abs_d` = `d` |  |
 | | | _polynomial:_ `(1 - sign_d) * (abs_d[i] - (d::DWordWL)[i]) = 0` | |
 
-### output
+### equality
 
-| Tag | Description | Multiplicity |
-|-----|-------------|--------------|
-| `DVRM-C21` | `DVRM[q::DWordWL; n, d, signed, 0]` | -μ_q |
-| `DVRM-C22` | `DVRM[r::DWordWL; n, d, signed, 1]` | -μ_r |
+| Tag | Range | Description | Multiplicity |
+|-----|-------|-------------|--------------|
+| `DVRM-C13` |  | `MUL[n_sub_r::DWordWL; d, signed, q, sign_q, 0]` | μ_sum |
+| `DVRM-C14` |  | `MUL[extension_n_sub_r::DWordWL; d, signed, q, sign_q, 1]` | μ_sum |
+| `DVRM-C15.i` | i ∈ [0, 3] | `IS_HALF[q[i]]` | μ_sum |

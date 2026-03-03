@@ -5,4 +5,5 @@ main:
 	# 1 << 32 = 0x100000000
 	addi	a2, zero, 1
 	slli	a0, a2, 32
-	jalr	zero, 0(ra)
+	li	a7, 5
+	ecall

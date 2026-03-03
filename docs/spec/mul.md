@@ -1,5 +1,7 @@
 # MUL Chip
 
+The  chip constrains multiplication, both signed and unsigned, as well as providing access to the low and high halfs of the multiplication result.
+
 = Columns
 
 The `MUL` chip is comprised of  variables that are expressed using  columns:

@@ -4,6 +4,7 @@
 main:
 	ori	    a2, zero, 0x03   # 0011
 	ori	    a0, a2, 0x05     # 0101
-	jalr	zero, 0(ra)
+	li	a7, 5
+	ecall
 .Lfunc_end1:
 	.size	main, .Lfunc_end1-main

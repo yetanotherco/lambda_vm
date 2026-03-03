@@ -4,4 +4,5 @@ main:
 	# LUI: Load upper immediate
 	# lui x, 0x12345 loads 0x12345000 into x
 	lui	a0, 0x12345
-	jalr	zero, 0(ra)
+	li	a7, 5
+	ecall

@@ -1,6 +1,6 @@
 use executor::{
     elf::Elf,
-    vm::execution::{ReturnValues, run_program},
+    vm::execution::{Executor, ReturnValues},
 };
 
 // NOTE: These tests require 64-bit RISC-V ELF files (RV64IM).
@@ -8,16 +8,14 @@ use executor::{
 fn run_program_without_expect(
     elf_path: &str,
     private_inputs: Vec<u8>,
-) -> Result<(ReturnValues, Vec<executor::vm::logs::Log>), executor::vm::execution::ExecutorError> {
+) -> Result<ReturnValues, executor::vm::execution::ExecutorError> {
     println!("Testing {}", elf_path);
     let elf_data = std::fs::read(elf_path).unwrap();
     let program = Elf::load(&elf_data).unwrap();
     println!("Program entry: 0x{:016x}", program.entry_point);
-    program.image.iter().for_each(|(addr, word)| {
-        println!("0x{:016x}: 0x{:08x}", addr, word);
-    });
-
-    run_program(program.image, program.entry_point, private_inputs)
+    let mut executor = Executor::new(&program, private_inputs)?;
+    while let Some(_logs) = executor.resume()? {}
+    executor.finish()
 }
 
 fn run_program_and_check_public_output(
@@ -25,17 +23,17 @@ fn run_program_and_check_public_output(
     expected_output: Vec<u8>,
     private_inputs: Vec<u8>,
 ) {
-    let (results, _logs) =
+    let result =
         run_program_without_expect(elf_path, private_inputs).expect("Failed to run program");
 
-    assert_eq!(results.memory_values, expected_output);
+    assert_eq!(result.memory_values, expected_output);
 }
 
 fn run_program_and_check_output(elf_path: &str, expected_output: i64, private_inputs: Vec<u8>) {
-    let (results, _logs) =
+    let result =
         run_program_without_expect(elf_path, private_inputs).expect("Failed to run program");
 
-    assert!(results.register_values.0 == expected_output);
+    assert!(result.register_values.0 == expected_output);
 }
 
 #[test]
@@ -202,11 +200,8 @@ fn test_random() {
 
 #[test]
 fn test_memory() {
-    let mut output = vec![];
     let size = 100000u32;
-    for _ in 0..size {
-        output.push(1);
-    }
+    let output = vec![1; size as usize];
     run_program_and_check_public_output(
         "./program_artifacts/rust/memory.elf",
         output[(size - 1000) as usize..].to_vec(),
@@ -281,4 +276,10 @@ fn test_ethrex() {
         output.encode(),
         inputs,
     );
+}
+
+#[ignore = "Ignored until the vm is fast enough to run this test"]
+#[test]
+fn test_ckzg() {
+    run_program_and_check_public_output("./program_artifacts/rust/ckzg.elf", vec![1, 1], vec![]);
 }
