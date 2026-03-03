@@ -36,7 +36,7 @@ use math::polynomial::Polynomial;
 /// The Fiat-Shamir transcript order is preserved:
 /// `sample challenge -> fold -> commit -> sample challenge -> fold -> commit -> ...`
 pub fn commit_phase_from_evaluations<F: IsFFTField + IsSubFieldOf<E>, E: IsField + Send + Sync>(
-    _number_layers: usize,
+    number_layers: usize,
     mut evals: Vec<FieldElement<E>>,
     transcript: &mut impl IsStarkTranscript<E, F>,
     coset_offset: &FieldElement<F>,
@@ -51,30 +51,13 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
-    // Compute total binary folds. For higher-arity FRI (log_arity > 1), ensure that
-    // after the initial fold (1 binary fold matching the verifier's DEEP pair fold),
-    // the remaining folds are a multiple of log_arity. This guarantees each committed
-    // FRI layer has exactly log_arity sub-folds, matching the verifier's uniform
-    // per-layer fold count.
-    let base = _number_layers
-        .saturating_sub(log_final_poly_len)
-        .max(if evals.len() > 1 { 1 } else { 0 });
-    let total_binary_folds = if base <= 1 || log_arity <= 1 {
-        base
-    } else {
-        let after_initial = base - 1;
-        let rounded_up = after_initial.div_ceil(log_arity) * log_arity;
-        let candidate = 1 + rounded_up;
-        // Ensure we don't exceed available evaluations
-        let max_binary_folds = (domain_size.trailing_zeros() as usize)
-            .saturating_sub(log_final_poly_len);
-        if candidate <= max_binary_folds {
-            candidate
-        } else {
-            // Round down instead
-            1 + (after_initial / log_arity) * log_arity
-        }
-    };
+    let total_binary_folds = compute_total_binary_folds(
+        number_layers,
+        log_final_poly_len,
+        evals.len(),
+        log_arity,
+        domain_size,
+    );
     let mut inv_twiddles = compute_coset_twiddles_inv(coset_offset, domain_size);
     let mut fri_layer_list = Vec::new();
     let mut current_coset_offset = coset_offset.clone();
@@ -139,7 +122,36 @@ where
 }
 
 /// Extract final polynomial from evaluation-form FRI residual.
+/// Computes total number of binary folds for the FRI commit phase.
 ///
+/// For higher-arity FRI (log_arity > 1), after the initial binary fold (matching
+/// the verifier's DEEP pair fold), the remaining folds must be a multiple of
+/// log_arity. This ensures each committed FRI layer has exactly log_arity
+/// sub-folds, matching the verifier's uniform per-layer fold count.
+fn compute_total_binary_folds(
+    number_layers: usize,
+    log_final_poly_len: usize,
+    num_evals: usize,
+    log_arity: usize,
+    domain_size: usize,
+) -> usize {
+    let base = number_layers
+        .saturating_sub(log_final_poly_len)
+        .max(if num_evals > 1 { 1 } else { 0 });
+    if base <= 1 || log_arity <= 1 {
+        return base;
+    }
+    let after_initial = base - 1;
+    let rounded_up = after_initial.div_ceil(log_arity) * log_arity;
+    let candidate = 1 + rounded_up;
+    let max_binary_folds = (domain_size.trailing_zeros() as usize).saturating_sub(log_final_poly_len);
+    if candidate <= max_binary_folds {
+        candidate
+    } else {
+        1 + (after_initial / log_arity) * log_arity
+    }
+}
+
 /// Uses all remaining evaluations to recover polynomial coefficients via
 /// bit-reverse + iFFT + coset correction (divide coefficient j by offset^j).
 /// When only 1 evaluation remains, returns it directly as a constant.

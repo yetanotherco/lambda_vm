@@ -767,13 +767,13 @@ pub trait IsStarkVerifier<
         } else {
             // Horner evaluation: p(x) = c_0 + c_1*x + c_2*x^2 + ...
             // The evaluation point is 1/eval_pt_inv (the actual coset point).
-            let eval_point: FieldElement<FieldExtension> =
-                eval_pt_inv.inv().unwrap().to_extension();
+            // Keep in base field for F×E→E multiplication (avoids to_extension).
+            let eval_point: FieldElement<Field> = eval_pt_inv.inv().unwrap();
             let result = final_poly
                 .iter()
                 .rev()
                 .fold(FieldElement::zero(), |acc, coeff| {
-                    &acc * &eval_point + coeff
+                    &eval_point * &acc + coeff
                 });
             *v == result
         }
