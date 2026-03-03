@@ -53,6 +53,20 @@ pub fn num_leaves_from_total(total: usize, arity: usize) -> usize {
     ((arity - 1) * total + 1) / arity
 }
 
+/// Compute tree depth = log_arity(num_leaves)
+pub fn compute_depth(num_leaves: usize, arity: usize) -> usize {
+    if num_leaves <= 1 {
+        return 0;
+    }
+    let mut depth = 0;
+    let mut n = num_leaves;
+    while n > 1 {
+        n /= arity;
+        depth += 1;
+    }
+    depth
+}
+
 pub fn build<B: IsMerkleTreeBackend>(nodes: &mut [B::Node], leaves_len: usize)
 where
     B::Node: Clone,

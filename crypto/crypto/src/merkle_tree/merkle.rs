@@ -6,8 +6,8 @@ use super::{
     proof::Proof,
     traits::IsMerkleTreeBackend,
     utils::{
-        build, complete_until_power_of_arity, internal_node_count, num_leaves_from_total,
-        parent_index, sibling_indices,
+        build, complete_until_power_of_arity, compute_depth, internal_node_count,
+        num_leaves_from_total, parent_index, sibling_indices,
     },
 };
 use alloc::{collections::BTreeSet, vec::Vec};
@@ -168,21 +168,20 @@ where
         let mut result = Vec::new();
 
         for _ in 0..num_levels {
-            let mut level_auth = Vec::new();
+            let mut level_auth = BTreeSet::new();
             let mut next_obtainable = BTreeSet::new();
 
             for &pos in &obtainable {
                 let siblings = sibling_indices(pos, arity);
                 for sibling_pos in siblings {
-                    if !obtainable.contains(&sibling_pos) && !level_auth.contains(&sibling_pos) {
-                        level_auth.push(sibling_pos);
+                    if !obtainable.contains(&sibling_pos) {
+                        level_auth.insert(sibling_pos);
                     }
                 }
                 next_obtainable.insert(parent_index(pos, arity));
             }
 
-            level_auth.sort_unstable();
-            result.extend(level_auth);
+            result.extend(level_auth.iter());
 
             obtainable = next_obtainable;
         }
@@ -191,16 +190,3 @@ where
     }
 }
 
-/// Compute tree depth = log_arity(num_leaves)
-fn compute_depth(num_leaves: usize, arity: usize) -> usize {
-    if num_leaves <= 1 {
-        return 0;
-    }
-    let mut depth = 0;
-    let mut n = num_leaves;
-    while n > 1 {
-        n /= arity;
-        depth += 1;
-    }
-    depth
-}

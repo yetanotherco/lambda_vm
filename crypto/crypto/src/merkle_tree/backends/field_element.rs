@@ -72,6 +72,11 @@ where
     }
 
     fn hash_new_parent(children: &[Self::Node]) -> FieldElement<P::F> {
+        debug_assert!(
+            children.len() >= 2,
+            "hash_new_parent requires at least 2 children, got {}",
+            children.len()
+        );
         let mut acc = P::hash(&children[0], &children[1]);
         for child in &children[2..] {
             acc = P::hash(&acc, child);

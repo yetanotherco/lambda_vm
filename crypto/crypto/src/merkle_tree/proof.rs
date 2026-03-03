@@ -1,11 +1,10 @@
 use alloc::{collections::BTreeMap, vec::Vec};
 #[cfg(feature = "alloc")]
 use math::traits::Serializable;
-use math::{errors::DeserializationError, traits::Deserializable};
 
 use super::{
     traits::IsMerkleTreeBackend,
-    utils::{child_position, parent_index},
+    utils::{child_position, compute_depth, parent_index},
 };
 
 /// Stores a merkle path to some leaf.
@@ -39,6 +38,9 @@ impl<T: PartialEq + Eq + Clone> Proof<T> {
         let mut tree_index = index + internal_nodes;
 
         for siblings in self.merkle_path.iter() {
+            if siblings.len() != arity - 1 {
+                return false;
+            }
             let pos = child_position(tree_index, arity);
             let mut children = Vec::with_capacity(arity);
             let mut sibling_idx = 0;
@@ -71,22 +73,9 @@ where
     }
 }
 
-impl<T> Deserializable for Proof<T>
-where
-    T: Deserializable + PartialEq + Eq,
-{
-    fn deserialize(bytes: &[u8]) -> Result<Self, DeserializationError>
-    where
-        Self: Sized,
-    {
-        let mut merkle_path = Vec::new();
-        for elem in bytes[0..].chunks(8) {
-            let node = T::deserialize(elem)?;
-            merkle_path.push(vec![node]);
-        }
-        Ok(Self { merkle_path })
-    }
-}
+// NOTE: Generic Deserializable for Proof<T> is not implemented because it
+// requires knowledge of the tree arity to reconstruct the sibling groups.
+// Use stark::utils::deserialize_proof for STARK proof deserialization.
 
 /// Stores all the nodes needed to prove the inclusion of multiple leaves.
 ///
@@ -137,7 +126,7 @@ impl<T: PartialEq + Eq + Clone> BatchProof<T> {
         }
 
         let mut proof_iter = self.path.iter();
-        let num_levels = compute_depth_for_verify(num_leaves, arity);
+        let num_levels = compute_depth(num_leaves, arity);
 
         for _ in 0..num_levels {
             let mut next_known: BTreeMap<usize, T> = BTreeMap::new();
@@ -153,10 +142,6 @@ impl<T: PartialEq + Eq + Clone> BatchProof<T> {
             };
 
             for (parent, _known_children) in &parent_groups {
-                if next_known.contains_key(parent) {
-                    continue;
-                }
-
                 let first_child = parent * arity + 1;
                 let mut children = Vec::with_capacity(arity);
                 for i in 0..arity {
@@ -184,15 +169,3 @@ impl<T: PartialEq + Eq + Clone> BatchProof<T> {
     }
 }
 
-fn compute_depth_for_verify(num_leaves: usize, arity: usize) -> usize {
-    if num_leaves <= 1 {
-        return 0;
-    }
-    let mut depth = 0;
-    let mut n = num_leaves;
-    while n > 1 {
-        n /= arity;
-        depth += 1;
-    }
-    depth
-}
