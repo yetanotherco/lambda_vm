@@ -325,10 +325,25 @@ pub trait IsStarkVerifier<
 
         let logup_alpha_powers: Vec<FieldElement<FieldExtension>> =
             if challenges.rap_challenges.len() > LOGUP_CHALLENGE_ALPHA {
-                compute_alpha_powers(&challenges.rap_challenges[LOGUP_CHALLENGE_ALPHA], 32)
+                compute_alpha_powers(
+                    &challenges.rap_challenges[LOGUP_CHALLENGE_ALPHA],
+                    air.max_bus_elements(),
+                )
             } else {
                 Vec::new()
             };
+
+        let logup_table_offset = match &proof.bus_public_inputs {
+            Some(bpi) => {
+                let n = FieldElement::<Field>::from(trace_length as u64);
+                match n.inv() {
+                    Ok(n_inv) => n_inv * &bpi.table_contribution,
+                    Err(_) => return false, // trace_length == 0 is invalid
+                }
+            }
+            None => FieldElement::zero(),
+        };
+
         let ood_frame =
             (proof.trace_ood_evaluations).into_frame(num_main_trace_columns, air.step_size());
         let transition_evaluation_context = TransitionEvaluationContext::new_verifier(
@@ -336,6 +351,7 @@ pub trait IsStarkVerifier<
             &periodic_values,
             &challenges.rap_challenges,
             &logup_alpha_powers,
+            &logup_table_offset,
         );
         let transition_ood_frame_evaluations =
             air.compute_transition(&transition_evaluation_context);
@@ -1002,11 +1018,12 @@ pub trait IsStarkVerifier<
         };
 
         // =====================================================================
-        // Validate bus_public_inputs presence and length against AIR layout
+        // Validate bus_public_inputs presence against AIR layout
         // =====================================================================
         // A dishonest prover could omit bus_public_inputs entirely (None) to
-        // bypass the bus balance check and boundary constraints, or submit fewer
-        // initial_terms than expected to skip term boundary constraints.
+        // bypass the bus balance check. With circular constraints, there are no
+        // boundary constraints on LogUp columns, so the bus balance check is
+        // the only cross-table validation.
 
         for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
             if air.has_trace_interaction() && proof.bus_public_inputs.is_none() {
@@ -1015,23 +1032,11 @@ pub trait IsStarkVerifier<
                 );
                 return false;
             }
-            if let Some(bus_inputs) = &proof.bus_public_inputs {
-                let num_aux = air.num_auxiliary_rap_columns();
-                if num_aux == 0 {
-                    error!(
-                        "Table {idx}: proof has bus_public_inputs but AIR has no auxiliary columns"
-                    );
-                    return false;
-                }
-                let expected_interactions = num_aux - 1;
-                if bus_inputs.initial_terms.len() != expected_interactions {
-                    error!(
-                        "Table {idx}: initial_terms length mismatch: got {}, expected {}",
-                        bus_inputs.initial_terms.len(),
-                        expected_interactions
-                    );
-                    return false;
-                }
+            if !air.has_trace_interaction() && proof.bus_public_inputs.is_some() {
+                error!(
+                    "Table {idx}: AIR has no LogUp interactions but proof contains bus_public_inputs"
+                );
+                return false;
             }
         }
 
@@ -1056,6 +1061,11 @@ pub trait IsStarkVerifier<
                 table_transcript.append_bytes(&root);
             }
 
+            // Bind table_contribution (L) to transcript, matching prover.
+            if let Some(ref bpi) = proof.bus_public_inputs {
+                table_transcript.append_field_element(&bpi.table_contribution);
+            }
+
             // Rounds 2-4: verify
             if !Self::verify_rounds_2_to_4(
                 *air,
@@ -1074,17 +1084,19 @@ pub trait IsStarkVerifier<
         }
 
         // =====================================================================
-        // Bus Balance Check: Σ accumulated_values = 0
+        // Bus Balance Check: Σ table_contribution = 0
         // =====================================================================
-        // For LogUp, each table has one accumulated column that sums all its terms.
-        // The sign (sender vs receiver) is already baked into the accumulated values,
-        // so the bus balances when the sum of all accumulated values equals zero.
+        // For LogUp with circular constraints, each table's total contribution L
+        // (sum of all per-row terms) is exposed as a public input. The bus balances
+        // when the sum of all table contributions equals zero.
 
         if needs_lookup_challenges {
             let mut total = FieldElement::<FieldExtension>::zero();
-            for proof in &multi_proof.proofs {
-                if let Some(interaction) = &proof.bus_public_inputs {
-                    total = total + &interaction.final_accumulated;
+            for (air, proof) in airs.iter().zip(&multi_proof.proofs) {
+                if air.has_trace_interaction()
+                    && let Some(interaction) = &proof.bus_public_inputs
+                {
+                    total = total + &interaction.table_contribution;
                 }
             }
 

@@ -1,4 +1,5 @@
 use super::domain::Domain;
+use super::lookup::BusPublicInputs;
 use super::trace::TraceTable;
 use super::traits::{AIR, TransitionEvaluationContext};
 use crate::lookup::{LOGUP_CHALLENGE_ALPHA, compute_alpha_powers};
@@ -27,6 +28,7 @@ pub fn validate_trace<
     trace: &TraceTable<Field, FieldExtension>,
     domain: &Domain<Field>,
     rap_challenges: &[FieldElement<FieldExtension>],
+    bus_public_inputs: Option<&BusPublicInputs<FieldExtension>>,
 ) -> bool {
     info!("Starting constraints validation over trace...");
     let mut ret = true;
@@ -65,9 +67,8 @@ pub fn validate_trace<
         .collect();
 
     // --------- VALIDATE BOUNDARY CONSTRAINTS ------------
-    // Note: We pass None for aux_hints because debug validation doesn't need the LogUp hints
     let trace_length = domain.interpolation_domain_size;
-    air.boundary_constraints(pub_inputs, rap_challenges, None, trace_length)
+    air.boundary_constraints(pub_inputs, rap_challenges, bus_public_inputs, trace_length)
         .constraints
         .iter()
         .for_each(|constraint| {
@@ -97,10 +98,23 @@ pub fn validate_trace<
 
     let logup_alpha_powers: Vec<FieldElement<FieldExtension>> =
         if rap_challenges.len() > LOGUP_CHALLENGE_ALPHA {
-            compute_alpha_powers(&rap_challenges[LOGUP_CHALLENGE_ALPHA], 32)
+            compute_alpha_powers(
+                &rap_challenges[LOGUP_CHALLENGE_ALPHA],
+                air.max_bus_elements(),
+            )
         } else {
             Vec::new()
         };
+
+    let logup_table_offset = match bus_public_inputs {
+        Some(bpi) => {
+            let n_inv = FieldElement::<Field>::from(trace_length as u64)
+                .inv()
+                .unwrap();
+            n_inv * &bpi.table_contribution
+        }
+        None => FieldElement::zero(),
+    };
 
     // Iterate over trace and compute transitions
     for step in 0..lde_trace.num_steps() {
@@ -114,6 +128,7 @@ pub fn validate_trace<
             &periodic_values,
             rap_challenges,
             &logup_alpha_powers,
+            &logup_table_offset,
         );
         let evaluations = air.compute_transition(&transition_evaluation_context);
 
