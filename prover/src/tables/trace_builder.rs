@@ -255,6 +255,7 @@ fn collect_cpu_ops(
 /// MEMW and LOAD collection requires sequential processing with state tracking.
 ///
 /// Returns: (memw_ops, load_ops, lt_ops, shift_ops, bitwise_ops)
+#[allow(clippy::type_complexity)]
 fn collect_ops_from_cpu(
     cpu_ops: &[CpuOperation],
     memory_state: &mut MemoryState,

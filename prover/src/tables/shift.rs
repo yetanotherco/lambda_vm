@@ -264,13 +264,13 @@ impl ShiftOperation {
         let intra_right = |i: usize| -> u16 { y[i].wrapping_add(x[i + 1]) };
 
         let mut shifted = [0u16; 4];
-        for i in 0..4 {
+        for (i, shifted_i) in shifted.iter_mut().enumerate() {
             let mut val = 0u16;
 
             if left {
                 // left * Σ_j=0^i limb_shift[j] * intra_limb_left[i-j]
-                for j in 0..=i {
-                    if limb_shift[j] {
+                for (j, &ls_j) in limb_shift.iter().enumerate().take(i + 1) {
+                    if ls_j {
                         val = val.wrapping_add(intra_left(i - j));
                     }
                 }
@@ -279,19 +279,19 @@ impl ShiftOperation {
             if right {
                 // right * (Σ_j=0^(3-i) limb_shift[j] * intra_limb_right[i+j]
                 //          + extension * Σ_j=(3-i+1)^3 limb_shift[j])
-                for j in 0..=(3 - i) {
-                    if limb_shift[j] {
+                for (j, &ls_j) in limb_shift.iter().enumerate().take(3 - i + 1) {
+                    if ls_j {
                         val = val.wrapping_add(intra_right(i + j));
                     }
                 }
-                for j in (4 - i)..4 {
-                    if limb_shift[j] {
+                for &ls_j in limb_shift.iter().take(4).skip(4 - i) {
+                    if ls_j {
                         val = val.wrapping_add(extension);
                     }
                 }
             }
 
-            shifted[i] = val;
+            *shifted_i = val;
         }
         shifted
     }
@@ -685,21 +685,21 @@ impl ShiftConstraint {
         // left_part = left * Σ_j=0^i limb_shift[j] * intra_limb_left[i-j]
         let mut left_part = zero.clone();
         for j in 0..=i {
-            left_part = left_part + &get_ls(j) * intra_left(i - j);
+            left_part += &get_ls(j) * intra_left(i - j);
         }
         left_part = &left * left_part;
 
         // right_shift_part = right * Σ_j=0^(3-i) limb_shift[j] * intra_limb_right[i+j]
         let mut right_shift_part = zero.clone();
         for j in 0..=(3 - i) {
-            right_shift_part = right_shift_part + &get_ls(j) * intra_right(i + j);
+            right_shift_part += &get_ls(j) * intra_right(i + j);
         }
 
         // right_ext_part = right * extension * Σ_j=(4-i)^3 limb_shift[j]
         let mut ext_sum = zero.clone();
         if i < 4 {
             for j in (4 - i)..4 {
-                ext_sum = ext_sum + get_ls(j);
+                ext_sum += get_ls(j);
             }
         }
         let right_ext_part = &extension * ext_sum;
