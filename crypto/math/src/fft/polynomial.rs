@@ -19,6 +19,9 @@ use super::cpu::{
 #[cfg(feature = "parallel")]
 use super::cpu::bowers_fft::{bowers_fft_opt_fused_parallel, bowers_ifft_opt_parallel};
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 /// Threshold for dispatching to parallel FFT.
 /// Below this size, sequential FFT is faster (avoids Rayon overhead).
 /// At 2^14 = 16384 elements, the parallel version starts to win
@@ -54,6 +57,31 @@ fn dispatch_ifft<F: IsFFTField + IsSubFieldOf<E>, E: IsField + Send + Sync>(
         }
     }
     bowers_ifft_opt(buffer, twiddles)
+}
+
+/// Scale buffer elements by pre-computed weights: buffer[i] *= weights[i].
+/// Uses parallel iteration for large buffers (>= PARALLEL_FFT_THRESHOLD).
+#[inline]
+fn scale_by_weights<F, E>(buffer: &mut [FieldElement<E>], weights: &[FieldElement<F>])
+where
+    F: IsField + Send + Sync + IsSubFieldOf<E>,
+    E: IsField + Send + Sync,
+{
+    #[cfg(feature = "parallel")]
+    {
+        if buffer.len() >= PARALLEL_FFT_THRESHOLD {
+            buffer
+                .par_iter_mut()
+                .zip(weights.par_iter())
+                .for_each(|(coeff, w)| {
+                    *coeff = w * &*coeff;
+                });
+            return;
+        }
+    }
+    for (coeff, w) in buffer.iter_mut().zip(weights.iter()) {
+        *coeff = w * &*coeff;
+    }
 }
 
 impl<E: IsField> Polynomial<FieldElement<E>> {
@@ -98,6 +126,34 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         }
     }
 
+    /// Same as [`evaluate_fft`] but returns evaluations in **bit-reversed order**.
+    ///
+    /// Skips the final bit-reverse permutation, saving an O(N) pass.
+    /// Use when the consumer needs bit-reversed order (e.g. FRI commit phase).
+    pub fn evaluate_fft_bitrev<F: IsFFTField + IsSubFieldOf<E>>(
+        poly: &Polynomial<FieldElement<E>>,
+        blowup_factor: usize,
+        domain_size: Option<usize>,
+    ) -> Result<Vec<FieldElement<E>>, FFTError>
+    where
+        E: Send + Sync,
+    {
+        let domain_size = domain_size.unwrap_or(0);
+        let len = core::cmp::max(poly.coeff_len(), domain_size).next_power_of_two() * blowup_factor;
+        if len.trailing_zeros() as u64 > F::TWO_ADICITY {
+            return Err(FFTError::DomainSizeError(len.trailing_zeros() as usize));
+        }
+        if poly.coefficients().is_empty() {
+            return Ok(vec![FieldElement::zero(); len]);
+        }
+
+        let mut coeffs = poly.coefficients().to_vec();
+        coeffs.resize(len, FieldElement::zero());
+
+        evaluate_fft_cpu_bitrev::<F, E>(&mut coeffs)?;
+        Ok(coeffs)
+    }
+
     /// Returns `N` evaluations with an offset of this polynomial using FFT over a domain in a subfield F of E
     /// (so the results are P(w^i), with w being a primitive root of unity).
     /// `N = max(self.coeff_len(), domain_size).next_power_of_two() * blowup_factor`.
@@ -113,6 +169,22 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     {
         let scaled = poly.scale(offset);
         Polynomial::evaluate_fft::<F>(&scaled, blowup_factor, domain_size)
+    }
+
+    /// Same as [`evaluate_offset_fft`] but returns evaluations in **bit-reversed order**.
+    ///
+    /// Skips the final bit-reverse permutation, saving an O(N) pass.
+    pub fn evaluate_offset_fft_bitrev<F: IsFFTField + IsSubFieldOf<E>>(
+        poly: &Polynomial<FieldElement<E>>,
+        blowup_factor: usize,
+        domain_size: Option<usize>,
+        offset: &FieldElement<F>,
+    ) -> Result<Vec<FieldElement<E>>, FFTError>
+    where
+        E: Send + Sync,
+    {
+        let scaled = poly.scale(offset);
+        Polynomial::evaluate_fft_bitrev::<F>(&scaled, blowup_factor, domain_size)
     }
 
     /// Returns a new polynomial that interpolates `(w^i, fft_evals[i])`, with `w` being a
@@ -137,6 +209,18 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         {
             interpolate_fft_cpu::<F, E>(fft_evals)
         }
+    }
+
+    /// Same as [`interpolate_fft`] but accepts pre-computed inverse twiddles.
+    /// Use when multiple columns of the same size share twiddles.
+    pub fn interpolate_fft_with_twiddles<F: IsFFTField + IsSubFieldOf<E>>(
+        fft_evals: &[FieldElement<E>],
+        inv_twiddles: &LayerTwiddles<F>,
+    ) -> Result<Self, FFTError>
+    where
+        E: Send + Sync,
+    {
+        interpolate_fft_cpu_with_twiddles::<F, E>(fft_evals, inv_twiddles)
     }
 
     /// Returns a new polynomial that interpolates offset `(w^i, fft_evals[i])`, with `w` being a
@@ -312,10 +396,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         in_place_bit_reverse_permute(&mut buffer[..n]);
         dispatch_ifft(&mut buffer[..n], inv_twiddles)?;
 
-        // Scale using pre-computed weights (base field) — F × E → E mixed multiplication.
-        for (coeff, w) in buffer[..n].iter_mut().zip(weights.iter()) {
-            *coeff = w * &*coeff;
-        }
+        scale_by_weights(&mut buffer[..n], weights);
 
         dispatch_fft(buffer, fwd_twiddles)?;
         in_place_bit_reverse_permute(buffer);
@@ -372,6 +453,81 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         // 4. Forward FFT on the full buffer
         dispatch_fft(buffer, fwd_twiddles)?;
         in_place_bit_reverse_permute(buffer);
+
+        Ok(())
+    }
+
+    /// Same as [`coset_lde_full_into`], but returns evaluations in **bit-reversed order**.
+    /// Skips the final O(N) bit-reverse permutation. Use when the consumer
+    /// needs bit-reversed data (e.g. Merkle tree commit).
+    pub fn coset_lde_full_into_bitrev<F: IsFFTField + IsSubFieldOf<E> + Send + Sync>(
+        evals: &[FieldElement<E>],
+        blowup_factor: usize,
+        weights: &[FieldElement<F>],
+        inv_twiddles: &LayerTwiddles<F>,
+        fwd_twiddles: &LayerTwiddles<F>,
+        buffer: &mut Vec<FieldElement<E>>,
+    ) -> Result<(), FFTError>
+    where
+        E: Send + Sync,
+    {
+        let n = evals.len();
+        if n == 0 {
+            buffer.clear();
+            return Ok(());
+        }
+        debug_assert!(n.is_power_of_two());
+        let lde_size = n * blowup_factor;
+
+        if (lde_size.trailing_zeros() as u64) > F::TWO_ADICITY {
+            return Err(FFTError::DomainSizeError(lde_size.trailing_zeros() as usize));
+        }
+
+        buffer.clear();
+        buffer.extend_from_slice(evals);
+        buffer.resize(lde_size, FieldElement::zero());
+
+        in_place_bit_reverse_permute(&mut buffer[..n]);
+        dispatch_ifft(&mut buffer[..n], inv_twiddles)?;
+
+        scale_by_weights(&mut buffer[..n], weights);
+
+        dispatch_fft(buffer, fwd_twiddles)?;
+
+        Ok(())
+    }
+
+    /// Same as [`coset_lde_full_expand`], but returns evaluations in **bit-reversed order**.
+    /// Skips the final O(N) bit-reverse permutation.
+    pub fn coset_lde_full_expand_bitrev<F: IsFFTField + IsSubFieldOf<E> + Send + Sync>(
+        buffer: &mut Vec<FieldElement<E>>,
+        blowup_factor: usize,
+        weights: &[FieldElement<F>],
+        inv_twiddles: &LayerTwiddles<F>,
+        fwd_twiddles: &LayerTwiddles<F>,
+    ) -> Result<(), FFTError>
+    where
+        E: Send + Sync,
+    {
+        let n = buffer.len();
+        if n == 0 {
+            return Ok(());
+        }
+        debug_assert!(n.is_power_of_two());
+        let lde_size = n * blowup_factor;
+
+        if (lde_size.trailing_zeros() as u64) > F::TWO_ADICITY {
+            return Err(FFTError::DomainSizeError(lde_size.trailing_zeros() as usize));
+        }
+
+        in_place_bit_reverse_permute(&mut buffer[..n]);
+        dispatch_ifft(&mut buffer[..n], inv_twiddles)?;
+
+        scale_by_weights(&mut buffer[..n], weights);
+
+        buffer.resize(lde_size, FieldElement::zero());
+
+        dispatch_fft(buffer, fwd_twiddles)?;
 
         Ok(())
     }
@@ -500,10 +656,45 @@ where
     let layer_twiddles =
         LayerTwiddles::<F>::new(order).ok_or(FFTError::DomainSizeError(order as usize))?;
 
+    evaluate_fft_cpu_with_twiddles::<F, E>(coeffs, &layer_twiddles)
+}
+
+/// Same as [`evaluate_fft_cpu`] but accepts pre-computed forward twiddles.
+pub fn evaluate_fft_cpu_with_twiddles<F, E>(
+    coeffs: &[FieldElement<E>],
+    layer_twiddles: &LayerTwiddles<F>,
+) -> Result<Vec<FieldElement<E>>, FFTError>
+where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField + Send + Sync,
+{
+    let n = coeffs.len();
+    if !n.is_power_of_two() {
+        return Err(FFTError::InputError(n));
+    }
+
     let mut result = coeffs.to_vec();
-    dispatch_fft(&mut result, &layer_twiddles)?;
+    dispatch_fft(&mut result, layer_twiddles)?;
     in_place_bit_reverse_permute(&mut result);
     Ok(result)
+}
+
+/// In-place forward FFT that leaves the result in bit-reversed order.
+/// Skips the final bit-reverse permutation, saving an O(N) pass.
+pub fn evaluate_fft_cpu_bitrev<F, E>(buffer: &mut [FieldElement<E>]) -> Result<(), FFTError>
+where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField + Send + Sync,
+{
+    let n = buffer.len();
+    if !n.is_power_of_two() {
+        return Err(FFTError::InputError(n));
+    }
+    let order = n.trailing_zeros() as u64;
+    let layer_twiddles =
+        LayerTwiddles::<F>::new(order).ok_or(FFTError::DomainSizeError(order as usize))?;
+
+    dispatch_fft(buffer, &layer_twiddles)
 }
 
 pub fn interpolate_fft_cpu<F, E>(
@@ -521,10 +712,27 @@ where
     let inv_twiddles =
         LayerTwiddles::<F>::new_inverse(order).ok_or(FFTError::DomainSizeError(order as usize))?;
 
+    interpolate_fft_cpu_with_twiddles::<F, E>(fft_evals, &inv_twiddles)
+}
+
+/// Same as [`interpolate_fft_cpu`] but accepts pre-computed inverse twiddles.
+pub fn interpolate_fft_cpu_with_twiddles<F, E>(
+    fft_evals: &[FieldElement<E>],
+    inv_twiddles: &LayerTwiddles<F>,
+) -> Result<Polynomial<FieldElement<E>>, FFTError>
+where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField + Send + Sync,
+{
+    let n = fft_evals.len();
+    if !n.is_power_of_two() {
+        return Err(FFTError::InputError(n));
+    }
+
     let mut coeffs = fft_evals.to_vec();
     // Bowers iFFT: bit-reverse first (natural → bit-reversed), then DIT inverse butterflies
     in_place_bit_reverse_permute(&mut coeffs);
-    dispatch_ifft(&mut coeffs, &inv_twiddles)?;
+    dispatch_ifft(&mut coeffs, inv_twiddles)?;
 
     // Scale by 1/n
     let scale_factor = FieldElement::from(n as u64).inv().unwrap();
@@ -615,7 +823,7 @@ mod tests {
             let mut offset_power = n_inv;
             for _ in 0..n {
                 weights.push(offset_power);
-                offset_power = &offset_power * &offset;
+                offset_power *= offset;
             }
 
             let reference = Polynomial::<FE>::coset_lde_full::<F>(
@@ -660,7 +868,7 @@ mod tests {
         let mut offset_power = n_inv;
         for _ in 0..n {
             weights.push(offset_power);
-            offset_power = &offset_power * &offset;
+            offset_power *= offset;
         }
 
         // Pre-allocate buffer once, reuse for two different inputs
