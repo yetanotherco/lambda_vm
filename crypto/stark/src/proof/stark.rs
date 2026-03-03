@@ -62,9 +62,9 @@ pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     // nonce obtained from grinding
     pub nonce: Option<u64>,
     // Bus interaction public inputs for the accumulated column.
-    // Contains initial and final aux column values, used for:
-    // 1. Boundary constraints on aux columns (row 0 and last row)
-    // 2. Bus balance check: Σ final_accumulated across all tables = 0
+    // Contains the table contribution (L), used for:
+    // 1. Circular constraint offset: L/N per row
+    // 2. Bus balance check: Σ table_contribution across all tables = 0
     pub bus_public_inputs: Option<BusPublicInputs<E>>,
     // Public inputs used for boundary constraints
     pub public_inputs: PI,
