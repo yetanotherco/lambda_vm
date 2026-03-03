@@ -44,7 +44,15 @@ type E = GoldilocksExtension;
 ///
 /// Uses minimal bitwise (no full 2^20 preprocessed table) but DECODE is always preprocessed.
 fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
-    let proof_options = ProofOptions::default_test_options();
+    prove_and_verify_vm_with_options(elf, traces, ProofOptions::default_test_options())
+}
+
+fn prove_and_verify_vm_with_options(
+    elf: &Elf,
+    traces: &mut Traces,
+    proof_options: ProofOptions,
+) -> bool {
+    let proof_options = proof_options;
 
     // Create all AIRs including PAGE and REGISTER tables
     let table_counts = traces.table_counts();
@@ -1559,5 +1567,49 @@ fn test_verify_rejects_inflated_table_counts() {
         result.is_err(),
         "Inflated table_counts should be rejected, got {:?}",
         result
+    );
+}
+
+// =============================================================================
+// Higher-arity FRI VM tests
+// =============================================================================
+
+/// Test full VM prove+verify with arity-4 FRI (log_arity=2).
+#[test]
+fn test_vm_fri_arity4() {
+    let (elf, logs, instructions) = run_asm_elf("test_add_8");
+    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    let mut opts = ProofOptions::default_test_options();
+    opts.fri_log_arity = 2;
+    assert!(
+        prove_and_verify_vm_with_options(&elf, &mut traces, opts),
+        "VM prove+verify with arity-4 FRI failed"
+    );
+}
+
+/// Test full VM prove+verify with arity-4 FRI and early termination (log_final=2).
+#[test]
+fn test_vm_fri_arity4_early_term() {
+    let (elf, logs, instructions) = run_asm_elf("test_add_8");
+    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    let mut opts = ProofOptions::default_test_options();
+    opts.fri_log_arity = 2;
+    opts.fri_log_final_poly_len = 2;
+    assert!(
+        prove_and_verify_vm_with_options(&elf, &mut traces, opts),
+        "VM prove+verify with arity-4 + early termination failed"
+    );
+}
+
+/// Test full VM prove+verify with arity-8 FRI (log_arity=3).
+#[test]
+fn test_vm_fri_arity8() {
+    let (elf, logs, instructions) = run_asm_elf("test_add_8");
+    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    let mut opts = ProofOptions::default_test_options();
+    opts.fri_log_arity = 3;
+    assert!(
+        prove_and_verify_vm_with_options(&elf, &mut traces, opts),
+        "VM prove+verify with arity-8 FRI failed"
     );
 }

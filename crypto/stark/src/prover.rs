@@ -225,8 +225,8 @@ pub struct Round3<F: IsField> {
 
 /// A container for the results of the fourth round of the STARK Prove protocol.
 pub struct Round4<F: IsSubFieldOf<E>, E: IsField> {
-    /// The final value resulting from folding the Deep composition polynomial all the way down to a constant value.
-    fri_last_value: FieldElement<E>,
+    /// Coefficients of the final FRI polynomial (single constant for default config).
+    fri_final_poly: Vec<FieldElement<E>>,
     /// The commitments to the fold polynomials of the inner layers of FRI.
     fri_layers_merkle_roots: Vec<Commitment>,
     /// The values and proofs of validity of the evaluations of the trace polynomials and the composition polynomials
@@ -996,13 +996,17 @@ pub trait IsStarkProver<
         in_place_bit_reverse_permute(&mut lde_evals);
 
         // FRI commit phase from pre-computed evaluations (no initial FFT)
-        let (fri_last_value, fri_layers) =
+        let log_arity = air.options().fri_log_arity as usize;
+        let log_final_poly_len = air.options().fri_log_final_poly_len as usize;
+        let (fri_final_poly, fri_layers) =
             fri::commit_phase_from_evaluations::<Field, FieldExtension>(
                 domain.root_order as usize,
                 lde_evals,
                 transcript,
                 &coset_offset,
                 domain_size,
+                log_arity,
+                log_final_poly_len,
             );
 
         // grinding: generate nonce and append it to the transcript
@@ -1018,7 +1022,7 @@ pub trait IsStarkProver<
         let number_of_queries = air.options().fri_number_of_queries;
         let iotas = Self::sample_query_indexes(number_of_queries, domain, transcript);
 
-        let query_list = fri::query_phase(&fri_layers, &iotas);
+        let query_list = fri::query_phase(&fri_layers, &iotas, log_arity);
 
         let fri_layers_merkle_roots: Vec<_> = fri_layers
             .iter()
@@ -1029,7 +1033,7 @@ pub trait IsStarkProver<
             Self::open_deep_composition_poly(domain, round_1_result, round_2_result, &iotas);
 
         Round4 {
-            fri_last_value,
+            fri_final_poly,
             fri_layers_merkle_roots,
             deep_poly_openings,
             query_list,
@@ -1808,8 +1812,8 @@ pub trait IsStarkProver<
                 .composition_poly_parts_ood_evaluation,
             // [pₖ]
             fri_layers_merkle_roots: round_4_result.fri_layers_merkle_roots,
-            // pₙ
-            fri_last_value: round_4_result.fri_last_value,
+            // Final FRI polynomial coefficients
+            fri_final_poly: round_4_result.fri_final_poly,
             // Open(p₀(D₀), 𝜐ₛ), Open(pₖ(Dₖ), −𝜐ₛ^(2ᵏ))
             query_list: round_4_result.query_list,
             // Open(H₁(D_LDE, 𝜐₀), Open(H₂(D_LDE, 𝜐₀), Open(tⱼ(D_LDE), 𝜐₀)

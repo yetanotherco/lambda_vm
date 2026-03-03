@@ -3,7 +3,6 @@ use std::ops::Div;
 use crate::domain::Domain;
 use crate::prover::evaluate_polynomial_on_lde_domain;
 use crate::traits::TransitionEvaluationContext;
-use itertools::Itertools;
 use math::field::element::FieldElement;
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use math::polynomial::Polynomial;
@@ -118,11 +117,7 @@ where
         // If there is an exemptions period defined for this constraint, the evaluations are calculated directly
         // by computing P_exemptions(x) / Zerofier(x)
         if let Some(exemptions_period) = self.exemptions_period() {
-            // FIXME: Rather than making this assertions here, it would be better to handle these
-            // errors or make these checks when the AIR is initialized.
-
             debug_assert!(exemptions_period.is_multiple_of(self.period()));
-
             debug_assert!(self.periodic_exemptions_offset().is_some());
 
             // The elements of the domain have order `trace_length * blowup_factor`, so the zerofier evaluations
@@ -130,23 +125,33 @@ where
             // so we only need to compute those.
             let last_exponent = blowup_factor * exemptions_period;
 
-            let evaluations: Vec<_> = (0..last_exponent)
-                .map(|exponent| {
-                    let x = lde_root.pow(exponent);
-                    let offset_times_x = coset_offset * &x;
-                    let offset_exponent = trace_length * self.periodic_exemptions_offset().unwrap()
-                        / exemptions_period;
+            // Hoist loop-invariant constants
+            let offset_exponent =
+                trace_length * self.periodic_exemptions_offset().unwrap() / exemptions_period;
+            let num_exp = trace_length / exemptions_period;
+            let denom_exp = trace_length / self.period();
+            let num_constant = trace_primitive_root.pow(offset_exponent);
+            let denom_constant =
+                trace_primitive_root.pow(self.offset() * trace_length / self.period());
 
-                    let numerator = offset_times_x.pow(trace_length / exemptions_period)
-                        - trace_primitive_root.pow(offset_exponent);
-                    let denominator = offset_times_x.pow(trace_length / self.period())
-                        - trace_primitive_root.pow(self.offset() * trace_length / self.period());
+            // Compute numerators and denominators with incremental powers
+            let mut numerators = Vec::with_capacity(last_exponent);
+            let mut denominators = Vec::with_capacity(last_exponent);
+            let mut x_power = FieldElement::<F>::one();
+            for _ in 0..last_exponent {
+                let offset_times_x = coset_offset * &x_power;
+                numerators.push(offset_times_x.pow(num_exp) - &num_constant);
+                denominators.push(offset_times_x.pow(denom_exp) - &denom_constant);
+                x_power = &x_power * &lde_root;
+            }
 
-                    // The denominator is guaranteed to be non-zero because the sets of powers of `offset_times_x`
-                    // and `trace_primitive_root` are disjoint, provided that the offset is neither an element of the
-                    // interpolation domain nor part of a subgroup with order less than n.
-                    unsafe { numerator.div(denominator).unwrap_unchecked() }
-                })
+            // Batch-invert denominators (N multiplications + 1 inversion instead of N inversions)
+            FieldElement::inplace_batch_inverse(&mut denominators).unwrap();
+
+            let evaluations: Vec<_> = numerators
+                .iter()
+                .zip(denominators.iter())
+                .map(|(num, denom_inv)| num * denom_inv)
                 .collect();
 
             // FIXME: Instead of computing this evaluations for each constraint, they can be computed
@@ -174,14 +179,16 @@ where
         // useless divisions.
         } else {
             let last_exponent = blowup_factor * self.period();
+            let denom_exp = trace_length / self.period();
+            let denom_constant =
+                trace_primitive_root.pow(self.offset() * trace_length / self.period());
 
-            let mut evaluations = (0..last_exponent)
-                .map(|exponent| {
-                    let x = lde_root.pow(exponent);
-                    (coset_offset * &x).pow(trace_length / self.period())
-                        - trace_primitive_root.pow(self.offset() * trace_length / self.period())
-                })
-                .collect_vec();
+            let mut evaluations = Vec::with_capacity(last_exponent);
+            let mut x_power = FieldElement::<F>::one();
+            for _ in 0..last_exponent {
+                evaluations.push((coset_offset * &x_power).pow(denom_exp) - &denom_constant);
+                x_power = &x_power * &lde_root;
+            }
 
             FieldElement::inplace_batch_inverse(&mut evaluations).unwrap();
 

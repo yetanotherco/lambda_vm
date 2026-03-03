@@ -8,5 +8,5 @@ use crate::config::Commitment;
 #[serde(bound = "")]
 pub struct FriDecommitment<F: IsField> {
     pub layers_auth_paths: Vec<Proof<Commitment>>,
-    pub layers_evaluations_sym: Vec<FieldElement<F>>,
+    pub layers_evaluations_sym: Vec<Vec<FieldElement<F>>>,
 }

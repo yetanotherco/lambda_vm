@@ -95,3 +95,102 @@ pub fn update_twiddles_in_place<F: IsField>(twiddles: &mut Vec<FieldElement<F>>)
     }
     twiddles.truncate(new_len);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use math::fft::cpu::bit_reversing::reverse_index;
+    use math::field::element::FieldElement;
+    use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
+    use math::field::traits::IsFFTField;
+
+    type GFE = FieldElement<GoldilocksField>;
+
+    /// Verifies that the verifier's domain-based twiddle computation matches
+    /// the prover's sequential fold for multi-fold (log_arity > 1).
+    #[test]
+    fn test_verifier_multifold_matches_prover() {
+        // 16-element evaluation array, log_arity=2 (fold 2x per round)
+        let domain_size = 16usize;
+        let coset_offset = GFE::from(7u64);
+        let zeta = GFE::from(13u64);
+
+        // Create arbitrary evaluations
+        let evals: Vec<GFE> = (0..domain_size)
+            .map(|i| GFE::from((i * 3 + 5) as u64))
+            .collect();
+
+        // === Prover path: fold 2x using sequential fold_evaluations_in_place ===
+        let mut prover_evals = evals.clone();
+        let mut inv_twiddles = compute_coset_twiddles_inv(&coset_offset, domain_size);
+        let mut challenge = zeta.clone();
+
+        fold_evaluations_in_place(&mut prover_evals, &challenge, &inv_twiddles);
+        update_twiddles_in_place(&mut inv_twiddles);
+        challenge = challenge.square();
+        fold_evaluations_in_place(&mut prover_evals, &challenge, &inv_twiddles);
+
+        // prover_evals now has 4 elements (domain_size / 4)
+
+        // === Verifier path: for each group of 4, compute twiddles from domain and fold ===
+        let log_arity = 2usize;
+        let group_size = 1usize << log_arity;
+        let sub_offset_init = coset_offset.clone();
+        let sub_domain_log_size_init = domain_size.trailing_zeros();
+
+        for group_idx in 0..domain_size / group_size {
+            let group_start = group_idx * group_size;
+            let mut group_evals: Vec<GFE> =
+                evals[group_start..group_start + group_size].to_vec();
+
+            let mut sub_offset = sub_offset_init.clone();
+            let mut sub_domain_log_size = sub_domain_log_size_init;
+            let mut local_start = group_start;
+            let mut ch = zeta.clone();
+
+            for _ in 0..log_arity {
+                let half = group_evals.len() / 2;
+                let sub_root = GoldilocksField::get_primitive_root_of_unity(
+                    sub_domain_log_size as u64,
+                )
+                .unwrap();
+                let tw_bits = sub_domain_log_size - 1;
+                let tw_domain_size = 1u64 << tw_bits;
+
+                let mut coset_pts: Vec<GFE> = (0..half)
+                    .map(|j| {
+                        let gpi = local_start / 2 + j;
+                        let natural_idx = reverse_index(gpi, tw_domain_size as u64);
+                        &sub_offset * sub_root.pow(natural_idx)
+                    })
+                    .collect();
+                GFE::inplace_batch_inverse(&mut coset_pts).unwrap();
+
+                let mut new_evals = Vec::with_capacity(half);
+                for j in 0..half {
+                    let lo = &group_evals[2 * j];
+                    let hi = &group_evals[2 * j + 1];
+                    let sum = lo + hi;
+                    let diff = lo - hi;
+                    new_evals.push(&sum + &(&coset_pts[j] * &(&ch * &diff)));
+                }
+
+                group_evals = new_evals;
+                sub_offset = sub_offset.square();
+                sub_domain_log_size -= 1;
+                ch = ch.square();
+                local_start /= 2;
+            }
+
+            assert_eq!(
+                group_evals.len(),
+                1,
+                "After log_arity folds, group should collapse to 1 element"
+            );
+            assert_eq!(
+                group_evals[0], prover_evals[group_idx],
+                "Group {group_idx}: verifier fold result doesn't match prover"
+            );
+        }
+    }
+}
