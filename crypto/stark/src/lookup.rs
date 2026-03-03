@@ -1280,8 +1280,7 @@ where
         .collect();
 
     #[cfg(not(feature = "parallel"))]
-    let mut fingerprints: Vec<FieldElement<E>> =
-        (0..trace_len).map(compute_fingerprint).collect();
+    let mut fingerprints: Vec<FieldElement<E>> = (0..trace_len).map(compute_fingerprint).collect();
 
     #[cfg(feature = "debug-checks")]
     for row in 0..trace_len {
