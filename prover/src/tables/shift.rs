@@ -794,9 +794,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ShiftConstra
         transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
     ) {
         match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame, ..
-            } => {
+            TransitionEvaluationContext::Prover { frame, .. } => {
                 let val = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = val.to_extension();
             }
