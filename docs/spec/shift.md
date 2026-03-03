@@ -182,15 +182,15 @@ shifted := left * Σ_j = 0^i limb_shift[j] * intra_limb_left[i - j] + right * (�
 
 ## Constraints
 
-### is_negative
-
-| Tag | Description | Multiplicity |
-|-----|-------------|--------------|
-| `SHIFT-C2` | `MSB16[is_negative; in[3]]` | signed |
-
 ### left_flag
 
 | Tag | Description |
 |-----|-------------|
 | `SHIFT-C1` | `direction` => `μ` = 1 |
 | | _polynomial:_ `direction * (1 - μ) = 0` |
+
+### is_negative
+
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `SHIFT-C2` | `MSB16[is_negative; in[3]]` | signed |
