@@ -782,8 +782,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 /// 5. `carry_is_bit`: carry * (1 - carry) = 0
 /// 6. `address_incr_lo`: (mu - end) * (address_incr_0 + carry * 2^32 - address_0 - 1) = 0
 /// 7. `address_incr_hi`: (mu - end) * (address_incr_1 - address_1 - carry) = 0
-/// 8. `address_incr_decomp_lo`: mu * (address_incr_0 - hl_0 - hl_1 * 65536) = 0
-/// 9. `address_incr_decomp_hi`: mu * (address_incr_1 - hl_2 - hl_3 * 65536) = 0
+/// 8. `address_incr_decomp_lo`: (mu - end) * (address_incr_0 - hl_0 - hl_1 * 65536) = 0
+/// 9. `address_incr_decomp_hi`: (mu - end) * (address_incr_1 - hl_2 - hl_3 * 65536) = 0
 pub fn create_constraints(constraint_idx_start: usize) -> (Vec<CommitConstraint>, usize) {
     let constraints = vec![
         CommitConstraint {
