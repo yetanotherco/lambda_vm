@@ -46,6 +46,7 @@
 #let numConstraints = $sans(c)$
 #let ConstraintSet = $scr(C)$
 #let Constraint = $cal(C)$
+#let constraintDegree = $sans(d)$
 #let EnforcementDom = $scr(H)$
 
 - $indTuple_i = (indX_(i,1), dots, indX_(i, numColumns_i), indY_(i,1), dots, indY_(i, numColumns_i))$: _tuple of $2 numColumns_i$ indeterminates_, two for each column of a table: one $indX$ for the current row, and one $indY$ for the following row.
@@ -106,3 +107,21 @@ Furthermore, all commitments to codewords of the same length will be opened in t
 Therefore the leaves can be instead set to be concatenations of the set of symbols at the same position across different codewords.
 
 *Output:* for each table $Table_i$, a Merkle commitment $MerkleRoot_i$.
+
+== Claim Re-interpretation
+
+#let Zerofier = $cal(Z)$
+#let zerofierDegree = $sans(z)$
+#let ComposedConstraint = $hat(Constraint)$
+
+By committing to the $sum_i numColumns_i$ trace column polynomials across all $numTables$ tables, the Prover is implicitly making the claim "the set $ConstraintSet_i$ of constraint equations is satisfied by the expected values in table $Table_i$".
+This set of $sum_i numConstraints_i$ claims is not very algebraically "nice" so it needs to be re-interpreted.
+
+For a given constraint polynomial $Constraint_(i,j)$, first let $Zerofier_(i,j)(indX) = product_(k in EnforcementDom_(i,j)) (indX - x_(i,j,k))$ denote the _zerofier polynomial_ which equals $0$ for every interpolation point $x_(i,j,k)$ indexing a row for which $Constraint_(i,j)$ is expected to be satisfied, and let $zerofierDegree_(i,j)$ denote its degree.
+The claim that "the constraint equation is satisfied at every expected row" can now be rewritten as $ Constraint(i,j) compose arrow(traceColPoly)_i "is divisible by" Zerofier_(i,j) $ where $arrow(traceColPoly)_i = (traceColPoly_(i,1)(indX), dots, traceColPoly_(i, numColumns_i)(indX), traceColPoly_(i,1)(multGen dot indX), dots, traceColPoly_(i, numColumns_i)(multGen dot indX))$ denotes the variable substitution of each $indX_(i,j)$ and $indY_(i,j)$ in $indTuple$ with $traceColPoly_(i,j)(indX)$ and $traceColPoly_(i,j)(multGen dot indX)$ respectively, and $compose$ denotes function composition of the multivariate polynomial $Constraint_(i,j)$ with the univariate vector $arrow(traceColPoly)_i$, yielding a univariate polynomial.
+
+Polynomial divisibility is a difficult claim to prove in this initial form, but it can be re-interpreted as a low-degree claim with the observation that if one polynomial divides another, then the quotient is itself a polynomial, and it has a predictable degree.
+In our case, the constraint polynomial $Constraint_(i,j)$ has constraint degree $constraintDegree_(i,j)$, the column polynomials $traceColPoly_(i,j)$ all have degree strictly less than $numRows_i$, and the zerofier polynomial $Zerofier_(i,j)$ has degree $zerofierDegree_(i,j)$.
+This implies that the univariate _composed constraint polynomial_ $ComposedConstraint_(i,j) = (Constraint_(i,j) compose arrow(traceColPoly)_i) / Zerofier_(i,j)$ is expected to have degree strictly less than $constraintDegree_(i,j) dot numRows_i - zerofierDegree_(i,j)$.
+
+In conclusion, the $sum_(i in [numTables]) numConstraints_i$ claims that the constraint equation sets are satisfied by the table values can be re-interpreted as the equivalent claims that $ ComposedConstraint_(i,j)(indX) = (Constraint_(i,j) compose arrow(traceColPoly)_i (indX)) / (Zerofier_(i,j)(indX)) "has degree" < constraintDegree_(i,j) dot numRows_i - zerofierDegree_(i,j), $ for $i in [numTables]$ and $j in [numConstraints_i]$.
