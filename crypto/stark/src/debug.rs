@@ -111,7 +111,7 @@ pub fn validate_trace<
             let n_inv = FieldElement::<Field>::from(trace_length as u64)
                 .inv()
                 .unwrap();
-            &bpi.table_contribution * n_inv.to_extension::<FieldExtension>()
+            n_inv * &bpi.table_contribution
         }
         None => FieldElement::zero(),
     };

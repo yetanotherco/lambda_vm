@@ -1678,18 +1678,17 @@ fn compute_fingerprint_from_step<A: IsSubFieldOf<B>, B: IsField>(
     z: &FieldElement<B>,
     alpha_powers: &[FieldElement<B>],
 ) -> FieldElement<B> {
-    let mut bus_elements: Vec<FieldElement<B>> = vec![FieldElement::from(interaction.bus_id)];
-    bus_elements.extend(interaction.values.iter().flat_map(|bv| {
+    let bus_id_ext: FieldElement<B> = FieldElement::from(interaction.bus_id);
+    let mut linear_combination = &bus_id_ext * &alpha_powers[0];
+    let mut alpha_idx = 1;
+    for bv in &interaction.values {
         let combined: Vec<FieldElement<A>> =
             bv.combine_from(|col| step.get_main_evaluation_element(0, col).clone());
-        combined.into_iter().map(|v| v.to_extension())
-    }));
-
-    let linear_combination: FieldElement<B> = bus_elements
-        .iter()
-        .zip(alpha_powers.iter())
-        .map(|(v, coeff)| v * coeff)
-        .sum();
+        for v in combined {
+            linear_combination += v * &alpha_powers[alpha_idx];
+            alpha_idx += 1;
+        }
+    }
 
     z - &linear_combination
 }

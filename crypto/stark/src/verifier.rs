@@ -320,9 +320,9 @@ pub trait IsStarkVerifier<
 
         let logup_table_offset = match &proof.bus_public_inputs {
             Some(bpi) => {
-                let n = FieldElement::<FieldExtension>::from(trace_length as u64);
+                let n = FieldElement::<Field>::from(trace_length as u64);
                 match n.inv() {
-                    Ok(n_inv) => &bpi.table_contribution * n_inv,
+                    Ok(n_inv) => n_inv * &bpi.table_contribution,
                     Err(_) => return false, // trace_length == 0 is invalid
                 }
             }
