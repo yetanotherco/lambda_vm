@@ -305,34 +305,56 @@ pub trait IsStarkProver<
         let num_rows = columns[0].len();
         let num_cols = columns.len();
 
-        // Per-worker reusable buffer: each rayon thread allocates once, then
-        // clears + refills for every row it processes. Avoids 2M heap allocs.
         #[cfg(feature = "parallel")]
-        let hashed_leaves: Vec<Commitment> = (0..num_rows)
-            .into_par_iter()
-            .map_init(
-                || Vec::with_capacity(num_cols),
-                |row_buf, row_idx| {
-                    row_buf.clear();
-                    let br_idx = reverse_index(row_idx, num_rows as u64);
-                    row_buf.extend((0..num_cols).map(|col| columns[col][br_idx].clone()));
-                    BatchedMerkleTreeBackend::<E>::hash_data(row_buf)
-                },
-            )
+        let iter = (0..num_rows).into_par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let iter = 0..num_rows;
+
+        let hashed_leaves: Vec<Commitment> = iter
+            .map(|row_idx| {
+                let br_idx = reverse_index(row_idx, num_rows as u64);
+                let row: Vec<FieldElement<E>> = (0..num_cols)
+                    .map(|col_idx| columns[col_idx][br_idx].clone())
+                    .collect();
+                BatchedMerkleTreeBackend::<E>::hash_data(&row)
+            })
             .collect();
 
+        let tree = BatchedMerkleTree::<E>::build_from_hashed_leaves(hashed_leaves)?;
+        let root = tree.root;
+        Some((tree, root))
+    }
+
+    /// Builds a Merkle tree commitment from column-major LDE evaluations that are
+    /// already in bit-reversed order (i.e. the final bit-reverse permutation was skipped
+    /// in the FFT). Reads columns sequentially for cache-friendly access.
+    fn commit_columns_sequential<E>(
+        columns: &[Vec<FieldElement<E>>],
+    ) -> Option<(BatchedMerkleTree<E>, Commitment)>
+    where
+        FieldElement<E>: AsBytes + Sync + Send,
+        E: IsField,
+    {
+        if columns.is_empty() || columns[0].is_empty() {
+            return None;
+        }
+
+        let num_rows = columns[0].len();
+        let num_cols = columns.len();
+
+        #[cfg(feature = "parallel")]
+        let iter = (0..num_rows).into_par_iter();
         #[cfg(not(feature = "parallel"))]
-        let hashed_leaves: Vec<Commitment> = {
-            let mut row_buf = Vec::with_capacity(num_cols);
-            (0..num_rows)
-                .map(|row_idx| {
-                    row_buf.clear();
-                    let br_idx = reverse_index(row_idx, num_rows as u64);
-                    row_buf.extend((0..num_cols).map(|col| columns[col][br_idx].clone()));
-                    BatchedMerkleTreeBackend::<E>::hash_data(&row_buf)
-                })
-                .collect()
-        };
+        let iter = 0..num_rows;
+
+        let hashed_leaves: Vec<Commitment> = iter
+            .map(|row_idx| {
+                let row: Vec<FieldElement<E>> = (0..num_cols)
+                    .map(|col_idx| columns[col_idx][row_idx].clone())
+                    .collect();
+                BatchedMerkleTreeBackend::<E>::hash_data(&row)
+            })
+            .collect();
 
         let tree = BatchedMerkleTree::<E>::build_from_hashed_leaves(hashed_leaves)?;
         let root = tree.root;
@@ -467,10 +489,16 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        let (tree, root) = Self::commit_columns_bit_reversed(&main_pool[..num_cols])
+        // LDE data is in bit-reversed order (FFT output); commit reads sequentially.
+        let (tree, root) = Self::commit_columns_sequential(&main_pool[..num_cols])
             .ok_or(ProvingError::EmptyCommitment)?;
         #[cfg(feature = "instruments")]
         crate::instruments::accum_r1_main(main_lde_dur, t_sub.elapsed());
+
+        // Bit-reverse columns to natural order for constraint evaluation.
+        for col in main_pool[..num_cols].iter_mut() {
+            in_place_bit_reverse_permute(col);
+        }
 
         transcript.append_bytes(&root);
 
@@ -513,15 +541,21 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
+        // LDE data is in bit-reversed order (FFT output); commit reads sequentially.
         let (precomputed_tree, precomputed_root) =
-            Self::commit_columns_bit_reversed(&main_pool[..num_precomputed_cols])
+            Self::commit_columns_sequential(&main_pool[..num_precomputed_cols])
                 .ok_or(ProvingError::EmptyCommitment)?;
 
         let (mult_tree, mult_root) =
-            Self::commit_columns_bit_reversed(&main_pool[num_precomputed_cols..num_cols])
+            Self::commit_columns_sequential(&main_pool[num_precomputed_cols..num_cols])
                 .ok_or(ProvingError::EmptyCommitment)?;
         #[cfg(feature = "instruments")]
         crate::instruments::accum_r1_main(main_lde_dur, t_sub.elapsed());
+
+        // Bit-reverse columns to natural order for constraint evaluation.
+        for col in main_pool[..num_cols].iter_mut() {
+            in_place_bit_reverse_permute(col);
+        }
 
         debug_assert_eq!(
             precomputed_root, precomputed_commitment,
@@ -563,6 +597,10 @@ pub trait IsStarkProver<
         let num_main_cols = trace.num_main_columns;
         trace.extract_columns_main_into(main_pool);
         Self::expand_pool_to_lde::<Field>(main_pool, num_main_cols, domain, twiddles);
+        // Bit-reverse to natural order for constraint evaluation (no commit needed here).
+        for col in main_pool[..num_main_cols].iter_mut() {
+            in_place_bit_reverse_permute(col);
+        }
 
         // Use stored Merkle trees from Phase A/C via Rc (pointer copy, no deep clone)
         let main = Round1CommitmentData::<Field> {
@@ -578,6 +616,10 @@ pub trait IsStarkProver<
             let n_aux = trace.num_aux_columns;
             trace.extract_columns_aux_into(aux_pool);
             Self::expand_pool_to_lde::<FieldExtension>(aux_pool, n_aux, domain, twiddles);
+            // Bit-reverse aux columns to natural order for constraint evaluation.
+            for col in aux_pool[..n_aux].iter_mut() {
+                in_place_bit_reverse_permute(col);
+            }
             // Safe: has_aux_trace() is true only when Phase C stored aux tree/root
             let aux_commitment = Round1CommitmentData::<FieldExtension> {
                 lde_trace_merkle_tree: Rc::clone(
@@ -1636,10 +1678,16 @@ pub trait IsStarkProver<
 
                 #[cfg(feature = "instruments")]
                 let t_sub = Instant::now();
-                let (tree, root) = Self::commit_columns_bit_reversed(&aux_pool[..num_aux_cols])
+                // LDE data is in bit-reversed order; commit reads sequentially.
+                let (tree, root) = Self::commit_columns_sequential(&aux_pool[..num_aux_cols])
                     .ok_or(ProvingError::EmptyCommitment)?;
                 #[cfg(feature = "instruments")]
                 crate::instruments::accum_r1_aux(aux_lde_dur, t_sub.elapsed());
+
+                // Bit-reverse to natural order (pool will be reused by reconstruct_round1).
+                for col in aux_pool[..num_aux_cols].iter_mut() {
+                    in_place_bit_reverse_permute(col);
+                }
 
                 table_transcript.append_bytes(&root);
                 (Some(Rc::new(tree)), Some(root))

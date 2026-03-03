@@ -369,9 +369,9 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         // 3. Zero-pad to lde_size
         buffer.resize(lde_size, FieldElement::zero());
 
-        // 4. Forward FFT on the full buffer
+        // 4. Forward FFT on the full buffer — output is in bit-reversed order.
+        // The caller is responsible for bit-reversing if natural order is needed.
         dispatch_fft(buffer, fwd_twiddles)?;
-        in_place_bit_reverse_permute(buffer);
 
         Ok(())
     }
