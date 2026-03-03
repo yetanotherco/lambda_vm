@@ -1,6 +1,6 @@
 use crate::vm::{
     instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth},
-    logs::Log,
+    logs::{EcallInfo, Log},
     memory::Memory,
     registers::Registers,
 };
@@ -63,6 +63,7 @@ impl Instruction {
                     src1_val: op1 as u64,
                     src2_val: 0,
                     dst_val: res,
+                    ecall_info: None,
                 }
             }
             Instruction::ArithImmW { dst, src, imm, op } => {
@@ -80,6 +81,7 @@ impl Instruction {
                     src1_val: op1 as u64,
                     src2_val: 0,
                     dst_val: res,
+                    ecall_info: None,
                 }
             }
             Instruction::JumpAndLinkRegister { dst, base, offset } => {
@@ -92,6 +94,7 @@ impl Instruction {
                     src1_val: base_value,
                     src2_val: 0,
                     dst_val: pc.wrapping_add(REGULAR_PC_UPDATE),
+                    ecall_info: None,
                 }
             }
             Instruction::JumpAndLink { dst, offset } => {
@@ -102,6 +105,7 @@ impl Instruction {
                     src1_val: 0,
                     src2_val: 0,
                     dst_val: pc.wrapping_add(REGULAR_PC_UPDATE),
+                    ecall_info: None,
                 }
             }
             Instruction::Store {
@@ -144,6 +148,7 @@ impl Instruction {
                     src1_val: base,
                     src2_val: read_value,
                     dst_val: 0,
+                    ecall_info: None,
                 }
             }
             Instruction::Load {
@@ -177,6 +182,7 @@ impl Instruction {
                     src1_val: base,
                     src2_val: 0,
                     dst_val: value,
+                    ecall_info: None,
                 }
             }
             Instruction::Branch {
@@ -197,6 +203,7 @@ impl Instruction {
                     src1_val: a,
                     src2_val: b,
                     dst_val: 0,
+                    ecall_info: None,
                 }
             }
             Instruction::LoadUpperImm { dst, imm } => {
@@ -209,6 +216,7 @@ impl Instruction {
                     src1_val: 0,
                     src2_val: 0,
                     dst_val: value,
+                    ecall_info: None,
                 }
             }
             Instruction::AddUpperImmToPc { dst, imm } => {
@@ -221,6 +229,7 @@ impl Instruction {
                     src1_val: 0,
                     src2_val: 0,
                     dst_val: value,
+                    ecall_info: None,
                 }
             }
             Instruction::Arith {
@@ -239,6 +248,7 @@ impl Instruction {
                     src1_val: a,
                     src2_val: b,
                     dst_val: res,
+                    ecall_info: None,
                 }
             }
             Instruction::ArithW {
@@ -259,6 +269,7 @@ impl Instruction {
                     src1_val: a as u64,
                     src2_val: b as u64,
                     dst_val: res,
+                    ecall_info: None,
                 }
             }
             Instruction::CSR {
@@ -274,12 +285,14 @@ impl Instruction {
                     src1_val: 0,
                     src2_val: 0,
                     dst_val: 0,
+                    ecall_info: None,
                 }
             }
             Instruction::EcallEbreak => {
                 let syscall_number = registers.read(17)?; // a7
                 let syscall_number = SyscallNumbers::try_from(syscall_number)
                     .map_err(|_| ExecutionError::UnknownSyscall(syscall_number))?;
+                let mut ecall_info = None;
                 match syscall_number {
                     SyscallNumbers::Print => {
                         // print
@@ -302,10 +315,15 @@ impl Instruction {
                         return Err(ExecutionError::Panic(value.to_owned()));
                     }
                     SyscallNumbers::Commit => {
-                        // commit
-                        let pointer = registers.read(10)?;
-                        let len = registers.read(11)?;
-                        memory.commit_public_output(pointer, len)?;
+                        // commit: write(fd, buf_addr, count) per POSIX convention
+                        // x10 = fd (must be 1 for stdout, validated by COMMIT chip)
+                        // x11 = buf_addr (buffer address in memory)
+                        // x12 = count (number of bytes to write)
+                        let _fd = registers.read(10)?;
+                        let buf_addr = registers.read(11)?;
+                        let count = registers.read(12)?;
+                        memory.commit_public_output(buf_addr, count)?;
+                        ecall_info = Some(EcallInfo::Commit { buf_addr, count });
                     }
                     SyscallNumbers::GetPrivateInputs => {
                         // get private inputs
@@ -323,6 +341,7 @@ impl Instruction {
                             src1_val: 0,
                             src2_val: 0,
                             dst_val: 0,
+                            ecall_info: Some(EcallInfo::Halt),
                         });
                     }
                 }
@@ -332,6 +351,7 @@ impl Instruction {
                     src1_val: 0,
                     src2_val: 0,
                     dst_val: 0,
+                    ecall_info,
                 }
             }
             Instruction::Fence => {
@@ -342,6 +362,7 @@ impl Instruction {
                     src1_val: 0,
                     src2_val: 0,
                     dst_val: 0,
+                    ecall_info: None,
                 }
             }
         })

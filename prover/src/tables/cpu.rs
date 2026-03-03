@@ -149,88 +149,90 @@ pub mod cols {
     pub const DIVREM: usize = 32;
     /// ECALL (Environment Call)
     pub const ECALL: usize = 33;
+    /// ECALL_COMMIT: 1 when the ECALL is a Commit syscall, 0 otherwise
+    pub const ECALL_COMMIT: usize = 34;
     /// EBREAK (Environment Break)
-    pub const EBREAK: usize = 34;
+    pub const EBREAK: usize = 35;
 
     // -------------------------------------------------------------------------
     // Output columns
     // -------------------------------------------------------------------------
 
     /// next_pc[0]: Next program counter (low word)
-    pub const NEXT_PC_0: usize = 35;
+    pub const NEXT_PC_0: usize = 36;
     /// next_pc[1]: Next program counter (high word)
-    pub const NEXT_PC_1: usize = 36;
+    pub const NEXT_PC_1: usize = 37;
 
     /// rvd[0]: Value to write to destination register (low word)
-    pub const RVD_0: usize = 37;
+    pub const RVD_0: usize = 38;
     /// rvd[1]: Value to write to destination register (high word)
-    pub const RVD_1: usize = 38;
+    pub const RVD_1: usize = 39;
 
     // -------------------------------------------------------------------------
     // Auxiliary columns
     // -------------------------------------------------------------------------
 
     /// rv1[0]: Register rs1 value (Half - bits 0-15) [DWordWHH]
-    pub const RV1_0: usize = 39;
+    pub const RV1_0: usize = 40;
     /// rv1[1]: Register rs1 value (Half - bits 16-31) [DWordWHH]
-    pub const RV1_1: usize = 40;
+    pub const RV1_1: usize = 41;
     /// rv1[2]: Register rs1 value (Word - bits 32-63) [DWordWHH]
-    pub const RV1_2: usize = 41;
+    pub const RV1_2: usize = 42;
 
     /// rv2[0]: Register rs2 value (Half - bits 0-15) [DWordWHH]
-    pub const RV2_0: usize = 42;
+    pub const RV2_0: usize = 43;
     /// rv2[1]: Register rs2 value (Half - bits 16-31) [DWordWHH]
-    pub const RV2_1: usize = 43;
+    pub const RV2_1: usize = 44;
     /// rv2[2]: Register rs2 value (Word - bits 32-63) [DWordWHH]
-    pub const RV2_2: usize = 44;
+    pub const RV2_2: usize = 45;
 
     /// rv1_sign_bit: Sign bit of rv1 as 32-bit word (for word_instr extension)
-    pub const RV1_SIGN_BIT: usize = 45;
+    pub const RV1_SIGN_BIT: usize = 46;
 
     /// arg1[0..8]: Extended rv1 as DWordBL (8 bytes)
-    pub const ARG1_0: usize = 46;
-    pub const ARG1_1: usize = 47;
-    pub const ARG1_2: usize = 48;
-    pub const ARG1_3: usize = 49;
-    pub const ARG1_4: usize = 50;
-    pub const ARG1_5: usize = 51;
-    pub const ARG1_6: usize = 52;
-    pub const ARG1_7: usize = 53;
+    pub const ARG1_0: usize = 47;
+    pub const ARG1_1: usize = 48;
+    pub const ARG1_2: usize = 49;
+    pub const ARG1_3: usize = 50;
+    pub const ARG1_4: usize = 51;
+    pub const ARG1_5: usize = 52;
+    pub const ARG1_6: usize = 53;
+    pub const ARG1_7: usize = 54;
 
     /// arg2_sign_bit: Sign bit of arg2 as 32-bit word
-    pub const ARG2_SIGN_BIT: usize = 54;
+    pub const ARG2_SIGN_BIT: usize = 55;
 
     /// arg2[0..8]: Extended rv2/imm as DWordBL (8 bytes)
-    pub const ARG2_0: usize = 55;
-    pub const ARG2_1: usize = 56;
-    pub const ARG2_2: usize = 57;
-    pub const ARG2_3: usize = 58;
-    pub const ARG2_4: usize = 59;
-    pub const ARG2_5: usize = 60;
-    pub const ARG2_6: usize = 61;
-    pub const ARG2_7: usize = 62;
+    pub const ARG2_0: usize = 56;
+    pub const ARG2_1: usize = 57;
+    pub const ARG2_2: usize = 58;
+    pub const ARG2_3: usize = 59;
+    pub const ARG2_4: usize = 60;
+    pub const ARG2_5: usize = 61;
+    pub const ARG2_6: usize = 62;
+    pub const ARG2_7: usize = 63;
 
     /// res_sign_bit: Sign bit of res as 32-bit word
-    pub const RES_SIGN_BIT: usize = 63;
+    pub const RES_SIGN_BIT: usize = 64;
 
     /// res[0..8]: ALU result as DWordBL (8 bytes)
-    pub const RES_0: usize = 64;
-    pub const RES_1: usize = 65;
-    pub const RES_2: usize = 66;
-    pub const RES_3: usize = 67;
-    pub const RES_4: usize = 68;
-    pub const RES_5: usize = 69;
-    pub const RES_6: usize = 70;
-    pub const RES_7: usize = 71;
+    pub const RES_0: usize = 65;
+    pub const RES_1: usize = 66;
+    pub const RES_2: usize = 67;
+    pub const RES_3: usize = 68;
+    pub const RES_4: usize = 69;
+    pub const RES_5: usize = 70;
+    pub const RES_6: usize = 71;
+    pub const RES_7: usize = 72;
 
     /// is_equal: Whether rv1 == arg2 (for BEQ)
-    pub const IS_EQUAL: usize = 72;
+    pub const IS_EQUAL: usize = 73;
 
     /// branch_cond: Whether branch is taken
-    pub const BRANCH_COND: usize = 73;
+    pub const BRANCH_COND: usize = 74;
 
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 74;
+    pub const NUM_COLUMNS: usize = 75;
 
     // -------------------------------------------------------------------------
     // Helper ranges for iteration
@@ -286,6 +288,15 @@ pub struct CpuOperation {
 
     /// Whether branch is taken
     pub branch_cond: bool,
+
+    /// Whether this ECALL is a Commit syscall
+    pub ecall_commit: bool,
+
+    /// For Commit ECALLs: buffer address from x11
+    pub commit_buf_addr: u64,
+
+    /// For Commit ECALLs: byte count from x12
+    pub commit_count: u64,
 }
 
 impl CpuOperation {
@@ -555,6 +566,13 @@ impl CpuOperation {
     /// The DecodeEntry contains static instruction information. This method
     /// adds runtime values from the Log (register values, branch decisions, etc.).
     pub fn from_log(log: &Log, timestamp: u64, decode: DecodeEntry) -> Self {
+        use executor::vm::logs::EcallInfo;
+
+        let (ecall_commit, commit_buf_addr, commit_count) = match &log.ecall_info {
+            Some(EcallInfo::Commit { buf_addr, count }) => (true, *buf_addr, *count),
+            _ => (false, 0, 0),
+        };
+
         let mut op = Self {
             decode,
             timestamp,
@@ -565,6 +583,9 @@ impl CpuOperation {
             res: log.dst_val, // Default: result is destination value
             is_equal: false,
             branch_cond: false,
+            ecall_commit,
+            commit_buf_addr,
+            commit_count,
         };
 
         // Compute runtime-specific values based on instruction type
@@ -705,6 +726,7 @@ pub fn generate_cpu_trace(
         data[base + cols::MUL] = FE::from(d.op_mul as u64);
         data[base + cols::DIVREM] = FE::from(d.op_divrem as u64);
         data[base + cols::ECALL] = FE::from(d.op_ecall as u64);
+        data[base + cols::ECALL_COMMIT] = FE::from(op.ecall_commit as u64);
         data[base + cols::EBREAK] = FE::from(d.op_ebreak as u64);
 
         // Output columns
@@ -1671,13 +1693,38 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // ECALL interaction (CPU → HALT)
+    // ECALL → HALT interaction
     // -------------------------------------------------------------------------
-    // When ECALL flag is set, send [timestamp_lo, timestamp_hi] to the HALT table.
-    // The CPU timestamp fits in a single field element (u32), so timestamp_hi = 0.
+    // Sends to HALT table only for non-Commit ECALLs.
+    // multiplicity = ECALL - ECALL_COMMIT (1 for Halt, 0 for Commit)
     interactions.push(BusInteraction::sender(
         BusId::Ecall,
-        Multiplicity::Column(cols::ECALL),
+        Multiplicity::Linear(vec![
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::ECALL,
+            },
+            LinearTerm::Column {
+                coefficient: -1,
+                column: cols::ECALL_COMMIT,
+            },
+        ]),
+        vec![
+            BusValue::Packed {
+                start_column: cols::TIMESTAMP,
+                packing: Packing::Direct,
+            },
+            BusValue::constant(0), // timestamp_hi = 0 (CPU timestamps fit in u32)
+        ],
+    ));
+
+    // ECALL → COMMIT interaction
+    // -------------------------------------------------------------------------
+    // Sends to COMMIT table only for Commit ECALLs.
+    // multiplicity = ECALL_COMMIT
+    interactions.push(BusInteraction::sender(
+        BusId::EcallCommit,
+        Multiplicity::Column(cols::ECALL_COMMIT),
         vec![
             BusValue::Packed {
                 start_column: cols::TIMESTAMP,

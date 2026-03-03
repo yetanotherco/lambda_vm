@@ -326,14 +326,15 @@ fn test_bus_interactions_count() {
     // - 1 MUL (multiplication)
     // - 1 DVRM (division/remainder)
     // - 1 BRANCH (branch/jump target calculation)
-    // - 1 ECALL (send to HALT table)
-    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 5 + 1 + 1 + 1 + 1 + 1 = 39
-    assert_eq!(interactions.len(), 39);
+    // - 1 ECALL → HALT (send to HALT table, mult = ECALL - ECALL_COMMIT)
+    // - 1 ECALL → COMMIT (send to COMMIT table, mult = ECALL_COMMIT)
+    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 5 + 1 + 1 + 1 + 1 + 1 + 1 = 40
+    assert_eq!(interactions.len(), 40);
 }
 
 #[test]
 fn test_column_count() {
-    assert_eq!(cols::NUM_COLUMNS, 74);
+    assert_eq!(cols::NUM_COLUMNS, 75);
 }
 
 #[test]
@@ -403,6 +404,7 @@ fn test_cpu_operation_from_log_arith() {
         src1_val: 100,
         src2_val: 200,
         dst_val: 300,
+        ecall_info: None,
     };
 
     let op = CpuOperation::from_log_and_instruction(&log, 0, instruction);
@@ -437,6 +439,7 @@ fn test_cpu_operation_from_log_branch() {
         src1_val: 10,
         src2_val: 20,
         dst_val: 0,
+        ecall_info: None,
     };
 
     let op = CpuOperation::from_log_and_instruction(&log, 4, instruction);
@@ -469,6 +472,7 @@ fn test_cpu_operation_from_log_word_instr() {
         src1_val: 0xFFFF_FFFF_8000_0000, // Would be negative as 32-bit
         src2_val: 1,
         dst_val: 0xFFFF_FFFF_8000_0001, // Result sign-extended
+        ecall_info: None,
     };
 
     let op = CpuOperation::from_log_and_instruction(&log, 8, instruction);

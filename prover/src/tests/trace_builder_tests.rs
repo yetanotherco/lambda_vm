@@ -21,6 +21,7 @@ fn make_log(pc: u64, rs1_val: u64, rs2_val: u64, dst_val: u64, taken: bool, offs
         src1_val: rs1_val,
         src2_val: rs2_val,
         dst_val,
+        ecall_info: None,
     }
 }
 
@@ -58,6 +59,7 @@ fn append_ecall(logs: &mut Vec<Log>, instrs: &mut Vec<Instruction>) {
         src1_val: 0,
         src2_val: 0,
         dst_val: 0,
+        ecall_info: Some(executor::vm::logs::EcallInfo::Halt),
     });
     instrs.push(Instruction::EcallEbreak);
 }

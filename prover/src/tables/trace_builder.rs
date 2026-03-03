@@ -35,6 +35,7 @@ use stark::trace::TraceTable;
 
 use super::bitwise::{self, BitwiseOperation, BitwiseOperationType};
 use super::branch::{self, BranchOperation};
+use super::commit::{self, CommitOperation};
 use super::cpu::{self, CpuOperation};
 use super::decode;
 use super::dvrm::{self, DvrmOperation};
@@ -1000,6 +1001,86 @@ fn collect_bitwise_from_page(elf: &Elf, memory_state: &MemoryState) -> Vec<Bitwi
 }
 
 // =============================================================================
+// COMMIT Operation Expansion
+// =============================================================================
+
+/// Expand Commit ECALLs from CPU operations into individual byte rows.
+///
+/// For each Commit ECALL, generates count+1 rows:
+/// - Row 0: first=1, reads byte at buf_addr
+/// - Row i (0 < i < count): first=0, reads byte at buf_addr+i
+/// - Row count: end=1, count=0, no byte read
+fn expand_commit_operations(
+    cpu_ops: &[CpuOperation],
+    memory_state: &MemoryState,
+) -> Vec<CommitOperation> {
+    let mut ops = Vec::new();
+    let mut global_index: u64 = 0;
+
+    for ecall in cpu_ops.iter().filter(|op| op.ecall_commit) {
+        let timestamp = ecall.timestamp;
+        let buf_addr = ecall.commit_buf_addr;
+        let count = ecall.commit_count;
+
+        for i in 0..=count {
+            let remaining = count - i;
+            let is_end = remaining == 0;
+            let value = if !is_end {
+                let (byte_val, _ts) = memory_state.read_byte(buf_addr + i);
+                byte_val
+            } else {
+                0
+            };
+            ops.push(CommitOperation {
+                timestamp,
+                address: buf_addr + i,
+                count: remaining,
+                first: i == 0,
+                end: is_end,
+                value,
+                index: global_index + i,
+            });
+        }
+        global_index += count;
+    }
+    ops
+}
+
+/// Collect bitwise lookups from COMMIT operations.
+///
+/// The COMMIT table sends:
+/// - IsByte for value (1 per real row)
+/// - IsHalfword for count_decr components (4 per real row)
+fn collect_bitwise_from_commit(commit_ops: &[CommitOperation]) -> Vec<BitwiseOperation> {
+    let mut lookups = Vec::new();
+
+    for op in commit_ops {
+        // IsByte for value
+        lookups.push(BitwiseOperation::single_byte(
+            BitwiseOperationType::IsByte,
+            op.value,
+        ));
+
+        // IsHalfword for count_decr components (4 halfwords)
+        let count_decr = if op.count == 0 {
+            u64::MAX
+        } else {
+            op.count - 1
+        };
+        for shift in [0, 16, 32, 48] {
+            let half = ((count_decr >> shift) & 0xFFFF) as u16;
+            lookups.push(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
+                (half & 0xFF) as u8,
+                ((half >> 8) & 0xFF) as u8,
+            ));
+        }
+    }
+
+    lookups
+}
+
+// =============================================================================
 // PAGE Table Generation
 // =============================================================================
 
@@ -1117,6 +1198,9 @@ pub struct Traces {
 
     /// HALT single-row table for program termination
     pub halt: TraceTable<GoldilocksField, GoldilocksExtension>,
+
+    /// COMMIT table for write syscall (byte-by-byte commit with recursive bus)
+    pub commit: TraceTable<GoldilocksField, GoldilocksExtension>,
 }
 
 /// Chunk raw ops and generate one trace table per chunk.
@@ -1372,6 +1456,11 @@ impl Traces {
         // PAGE tables do IS_BYTE lookups for init and fini values (C1, C2)
         bitwise_ops.extend(collect_bitwise_from_page(elf, &memory_state));
 
+        // Expand COMMIT ECALL operations into per-byte rows
+        let commit_ops = expand_commit_operations(&cpu_ops, &memory_state);
+        // COMMIT table sends IsByte and IsHalfword lookups
+        bitwise_ops.extend(collect_bitwise_from_commit(&commit_ops));
+
         // =====================================================================
         // PHASE 5: Generate final traces (parallelized)
         // =====================================================================
@@ -1413,8 +1502,9 @@ impl Traces {
         // Prepare register final state before scope (needs register_state ownership)
         let register_final_state = register_state.to_final_state_map();
 
-        // Generate remaining traces in parallel (page, register, halt).
+        // Generate remaining traces in parallel (page, register, halt, commit).
         // chunk_and_generate already handled cpu, lt, memw, load, mul, dvrm, branch above.
+        let commit_trace = commit::generate_commit_trace(&commit_ops);
         let (pages, page_configs, register_trace, halt_trace);
         #[cfg(feature = "parallel")]
         {
@@ -1456,6 +1546,7 @@ impl Traces {
             register: register_trace,
             branches,
             halt: halt_trace,
+            commit: commit_trace,
         })
     }
 
@@ -1560,6 +1651,11 @@ impl Traces {
         bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops));
         bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
 
+        // Expand COMMIT ECALL operations into per-byte rows
+        let commit_ops = expand_commit_operations(&cpu_ops, &memory_state);
+        // COMMIT table sends IsByte and IsHalfword lookups
+        bitwise_ops.extend(collect_bitwise_from_commit(&commit_ops));
+
         // =====================================================================
         // PHASE 5: Generate final traces (parallelized)
         // =====================================================================
@@ -1598,6 +1694,8 @@ impl Traces {
         decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
         let register_final_state = register_state.to_final_state_map();
 
+        let commit_trace = commit::generate_commit_trace(&commit_ops);
+
         // Generate remaining traces in parallel (register, halt).
         // chunk_and_generate already handled cpu, lt, memw, load, mul, dvrm, branch above.
         let (register_trace, halt_trace);
@@ -1635,6 +1733,7 @@ impl Traces {
             register: register_trace,
             branches,
             halt: halt_trace,
+            commit: commit_trace,
         })
     }
 

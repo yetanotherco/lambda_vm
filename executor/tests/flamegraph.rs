@@ -167,6 +167,7 @@ fn test_flamegraph_simple_call_return() {
             src1_val: 0,
             src2_val: 0,
             dst_val: 0,
+            ecall_info: None,
         },
         Log {
             current_pc: 0x1004,
@@ -174,6 +175,7 @@ fn test_flamegraph_simple_call_return() {
             src1_val: 0,
             src2_val: 0,
             dst_val: 0,
+            ecall_info: None,
         },
         Log {
             current_pc: 0x1008,
@@ -181,6 +183,7 @@ fn test_flamegraph_simple_call_return() {
             src1_val: 0,
             src2_val: 0,
             dst_val: 0,
+            ecall_info: None,
         }, // call
         Log {
             current_pc: 0x2000,
@@ -188,6 +191,7 @@ fn test_flamegraph_simple_call_return() {
             src1_val: 0,
             src2_val: 0,
             dst_val: 0,
+            ecall_info: None,
         },
         Log {
             current_pc: 0x2004,
@@ -195,6 +199,7 @@ fn test_flamegraph_simple_call_return() {
             src1_val: 0,
             src2_val: 0,
             dst_val: 0,
+            ecall_info: None,
         },
         Log {
             current_pc: 0x2008,
@@ -202,6 +207,7 @@ fn test_flamegraph_simple_call_return() {
             src1_val: 0,
             src2_val: 0,
             dst_val: 0,
+            ecall_info: None,
         }, // return
         Log {
             current_pc: 0x100c,
@@ -209,6 +215,7 @@ fn test_flamegraph_simple_call_return() {
             src1_val: 0,
             src2_val: 0,
             dst_val: 0,
+            ecall_info: None,
         },
     ];
 
@@ -252,6 +259,7 @@ fn test_flamegraph_stack_underflow_protection() {
             src1_val: 0,
             src2_val: 0,
             dst_val: 0,
+            ecall_info: None,
         },
         Log {
             current_pc: 0x1004,
@@ -259,6 +267,7 @@ fn test_flamegraph_stack_underflow_protection() {
             src1_val: 0,
             src2_val: 0,
             dst_val: 0,
+            ecall_info: None,
         }, // return at root
         Log {
             current_pc: 0x1008,
@@ -266,6 +275,7 @@ fn test_flamegraph_stack_underflow_protection() {
             src1_val: 0,
             src2_val: 0,
             dst_val: 0,
+            ecall_info: None,
         },
     ];
 
@@ -318,6 +328,7 @@ fn test_flamegraph_tail_call() {
             src1_val: 0,
             src2_val: 0,
             dst_val: 0,
+            ecall_info: None,
         },
         Log {
             current_pc: 0x1004,
@@ -325,6 +336,7 @@ fn test_flamegraph_tail_call() {
             src1_val: 0,
             src2_val: 0,
             dst_val: 0,
+            ecall_info: None,
         }, // call foo
         Log {
             current_pc: 0x2000,
@@ -332,6 +344,7 @@ fn test_flamegraph_tail_call() {
             src1_val: 0,
             src2_val: 0,
             dst_val: 0,
+            ecall_info: None,
         },
         Log {
             current_pc: 0x2004,
@@ -339,6 +352,7 @@ fn test_flamegraph_tail_call() {
             src1_val: 0,
             src2_val: 0,
             dst_val: 0,
+            ecall_info: None,
         }, // tail call bar
         Log {
             current_pc: 0x3000,
@@ -346,6 +360,7 @@ fn test_flamegraph_tail_call() {
             src1_val: 0,
             src2_val: 0,
             dst_val: 0,
+            ecall_info: None,
         },
         Log {
             current_pc: 0x3004,
@@ -353,6 +368,7 @@ fn test_flamegraph_tail_call() {
             src1_val: 0,
             src2_val: 0,
             dst_val: 0,
+            ecall_info: None,
         }, // return
         Log {
             current_pc: 0x1008,
@@ -360,6 +376,7 @@ fn test_flamegraph_tail_call() {
             src1_val: 0,
             src2_val: 0,
             dst_val: 0,
+            ecall_info: None,
         },
     ];
 
@@ -412,6 +429,7 @@ fn test_flamegraph_indirect_call() {
             src1_val: 0,
             src2_val: 0,
             dst_val: 0,
+            ecall_info: None,
         },
         Log {
             current_pc: 0x1004,
@@ -419,6 +437,7 @@ fn test_flamegraph_indirect_call() {
             src1_val: 0,
             src2_val: 0,
             dst_val: 0,
+            ecall_info: None,
         }, // indirect call
         Log {
             current_pc: 0x2000,
@@ -426,6 +445,7 @@ fn test_flamegraph_indirect_call() {
             src1_val: 0,
             src2_val: 0,
             dst_val: 0,
+            ecall_info: None,
         },
         Log {
             current_pc: 0x2004,
@@ -433,6 +453,7 @@ fn test_flamegraph_indirect_call() {
             src1_val: 0,
             src2_val: 0,
             dst_val: 0,
+            ecall_info: None,
         }, // return
         Log {
             current_pc: 0x1008,
@@ -440,6 +461,7 @@ fn test_flamegraph_indirect_call() {
             src1_val: 0,
             src2_val: 0,
             dst_val: 0,
+            ecall_info: None,
         },
     ];
 
@@ -466,6 +488,7 @@ fn test_flamegraph_unknown_symbols() {
         src1_val: 0,
         src2_val: 0,
         dst_val: 0,
+        ecall_info: None,
     }];
 
     generator.process_logs(&logs, &instructions).unwrap();
@@ -492,6 +515,7 @@ fn test_flamegraph_instruction_not_found_error() {
         src1_val: 0,
         src2_val: 0,
         dst_val: 0,
+        ecall_info: None,
     }];
 
     let result = generator.process_logs(&logs, &instructions);

@@ -1,3 +1,17 @@
+/// Information about an ECALL instruction, distinguishing Halt from Commit.
+#[derive(Debug, Clone)]
+pub enum EcallInfo {
+    /// Halt syscall (syscall #5)
+    Halt,
+    /// Commit syscall (syscall #3): write(fd, buf_addr, count)
+    Commit {
+        /// Buffer address in memory (x11)
+        buf_addr: u64,
+        /// Number of bytes to commit (x12)
+        count: u64,
+    },
+}
+
 /// Log containing the execution state for one instruction
 /// Uses zero as default value if the instruction doesn't use either of src1, src2 or dst
 /// Note that values written to dst register zero will be ignored
@@ -17,4 +31,6 @@ pub struct Log {
     pub src2_val: u64,
     /// Value of dst register after execution (if used by the instruction)
     pub dst_val: u64,
+    /// ECALL-specific information (None for non-ECALL instructions)
+    pub ecall_info: Option<EcallInfo>,
 }
