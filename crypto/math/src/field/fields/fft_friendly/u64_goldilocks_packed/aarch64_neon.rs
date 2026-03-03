@@ -426,4 +426,91 @@ mod tests {
         assert_eq!(hi.as_slice()[0], FE::from(1u64));
         assert_eq!(hi.as_slice()[1], FE::from(11u64));
     }
+
+    // ---- Proptest randomized tests ----
+    use proptest::prelude::*;
+
+    fn arb_packed() -> impl Strategy<Value = PackedGoldilocksNeon> {
+        prop::array::uniform2(0u64..GOLDILOCKS_PRIME)
+            .prop_map(|arr| PackedGoldilocksNeon::from_fn(|i| FE::from(arr[i])))
+    }
+
+    proptest! {
+        #[test]
+        fn prop_add_commutative(a in arb_packed(), b in arb_packed()) {
+            let ab = a + b;
+            let ba = b + a;
+            prop_assert_eq!(ab.as_slice(), ba.as_slice());
+        }
+
+        #[test]
+        fn prop_mul_commutative(a in arb_packed(), b in arb_packed()) {
+            let ab = a * b;
+            let ba = b * a;
+            prop_assert_eq!(ab.as_slice(), ba.as_slice());
+        }
+
+        #[test]
+        fn prop_add_matches_scalar(
+            a_vals in prop::array::uniform2(0u64..GOLDILOCKS_PRIME),
+            b_vals in prop::array::uniform2(0u64..GOLDILOCKS_PRIME),
+        ) {
+            let a = PackedGoldilocksNeon::from_fn(|i| FE::from(a_vals[i]));
+            let b = PackedGoldilocksNeon::from_fn(|i| FE::from(b_vals[i]));
+            let packed = a + b;
+            for i in 0..2 {
+                let scalar = FE::from(a_vals[i]) + FE::from(b_vals[i]);
+                prop_assert_eq!(packed.as_slice()[i], scalar);
+            }
+        }
+
+        #[test]
+        fn prop_sub_matches_scalar(
+            a_vals in prop::array::uniform2(0u64..GOLDILOCKS_PRIME),
+            b_vals in prop::array::uniform2(0u64..GOLDILOCKS_PRIME),
+        ) {
+            let a = PackedGoldilocksNeon::from_fn(|i| FE::from(a_vals[i]));
+            let b = PackedGoldilocksNeon::from_fn(|i| FE::from(b_vals[i]));
+            let packed = a - b;
+            for i in 0..2 {
+                let scalar = FE::from(a_vals[i]) - FE::from(b_vals[i]);
+                prop_assert_eq!(packed.as_slice()[i], scalar);
+            }
+        }
+
+        #[test]
+        fn prop_mul_matches_scalar(
+            a_vals in prop::array::uniform2(0u64..GOLDILOCKS_PRIME),
+            b_vals in prop::array::uniform2(0u64..GOLDILOCKS_PRIME),
+        ) {
+            let a = PackedGoldilocksNeon::from_fn(|i| FE::from(a_vals[i]));
+            let b = PackedGoldilocksNeon::from_fn(|i| FE::from(b_vals[i]));
+            let packed = a * b;
+            for i in 0..2 {
+                let scalar = FE::from(a_vals[i]) * FE::from(b_vals[i]);
+                prop_assert_eq!(packed.as_slice()[i], scalar);
+            }
+        }
+
+        #[test]
+        fn prop_sub_is_add_neg(a in arb_packed(), b in arb_packed()) {
+            let sub_result = a - b;
+            let add_neg_result = a + (-b);
+            prop_assert_eq!(sub_result.as_slice(), add_neg_result.as_slice());
+        }
+
+        #[test]
+        fn prop_square_matches_mul(a in arb_packed()) {
+            let sq = a.square();
+            let mul = a * a;
+            prop_assert_eq!(sq.as_slice(), mul.as_slice());
+        }
+
+        #[test]
+        fn prop_distributivity(a in arb_packed(), b in arb_packed(), c in arb_packed()) {
+            let lhs = a * (b + c);
+            let rhs = a * b + a * c;
+            prop_assert_eq!(lhs.as_slice(), rhs.as_slice());
+        }
+    }
 }
