@@ -20,6 +20,7 @@ use stark::constraints::transition::TransitionConstraint;
 use stark::table::TableView;
 use stark::traits::TransitionEvaluationContext;
 
+use crate::impl_base_field_evaluate_prover;
 use crate::tables::cpu::cols;
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
@@ -181,13 +182,11 @@ impl BranchCondConstraint {
             .get_main_evaluation_element(0, cols::BRANCH_COND)
             .clone();
 
-        let two = FieldElement::<F>::from(2u64);
-
         // XOR computation: a XOR b = a + b - 2*a*b
         // res[0] XOR mp_selector
-        let res_xor_mp = &res_0 + &mp_selector - &two * &res_0 * &mp_selector;
+        let res_xor_mp = &res_0 + &mp_selector - (&res_0 * &mp_selector).double();
         // is_equal XOR mp_selector
-        let eq_xor_mp = &is_equal + &mp_selector - &two * &is_equal * &mp_selector;
+        let eq_xor_mp = &is_equal + &mp_selector - (&is_equal * &mp_selector).double();
 
         // branch_cond = JALR + BLT * res_xor_mp + BEQ * eq_xor_mp
         let expected = jalr + &blt * res_xor_mp + &beq * eq_xor_mp;
@@ -239,16 +238,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for BranchCondCo
         }
     }
 
-    fn evaluate_prover(
-        &self,
-        ctx: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        base_evaluations: &mut [FieldElement<GoldilocksField>],
-        _ext_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        if let TransitionEvaluationContext::Prover { frame, .. } = ctx {
-            base_evaluations[self.constraint_idx] = self.compute(frame.get_evaluation_step(0));
-        }
-    }
+    impl_base_field_evaluate_prover!();
 }
 
 // =========================================================================
@@ -318,16 +308,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for EbreakConstr
         }
     }
 
-    fn evaluate_prover(
-        &self,
-        ctx: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        base_evaluations: &mut [FieldElement<GoldilocksField>],
-        _ext_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        if let TransitionEvaluationContext::Prover { frame, .. } = ctx {
-            base_evaluations[self.constraint_idx] = self.compute(frame.get_evaluation_step(0));
-        }
-    }
+    impl_base_field_evaluate_prover!();
 }
 
 // =========================================================================
@@ -410,16 +391,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg1LowerCon
         }
     }
 
-    fn evaluate_prover(
-        &self,
-        ctx: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        base_evaluations: &mut [FieldElement<GoldilocksField>],
-        _ext_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        if let TransitionEvaluationContext::Prover { frame, .. } = ctx {
-            base_evaluations[self.constraint_idx] = self.compute(frame.get_evaluation_step(0));
-        }
-    }
+    impl_base_field_evaluate_prover!();
 }
 
 /// Constraint: arg1[4:8] = rv1[2] * (1 - word_instr) + (2^32 - 1) * rv1_sign_bit * signed
@@ -506,16 +478,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg1UpperCon
         }
     }
 
-    fn evaluate_prover(
-        &self,
-        ctx: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        base_evaluations: &mut [FieldElement<GoldilocksField>],
-        _ext_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        if let TransitionEvaluationContext::Prover { frame, .. } = ctx {
-            base_evaluations[self.constraint_idx] = self.compute(frame.get_evaluation_step(0));
-        }
-    }
+    impl_base_field_evaluate_prover!();
 }
 
 // =========================================================================
@@ -597,16 +560,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for SltResZeroCo
         }
     }
 
-    fn evaluate_prover(
-        &self,
-        ctx: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        base_evaluations: &mut [FieldElement<GoldilocksField>],
-        _ext_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        if let TransitionEvaluationContext::Prover { frame, .. } = ctx {
-            base_evaluations[self.constraint_idx] = self.compute(frame.get_evaluation_step(0));
-        }
-    }
+    impl_base_field_evaluate_prover!();
 }
 
 /// Creates all SLT/BLT zero constraints for res[1..8].
@@ -703,16 +657,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for SignBitZeroC
         }
     }
 
-    fn evaluate_prover(
-        &self,
-        ctx: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        base_evaluations: &mut [FieldElement<GoldilocksField>],
-        _ext_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        if let TransitionEvaluationContext::Prover { frame, .. } = ctx {
-            base_evaluations[self.constraint_idx] = self.compute(frame.get_evaluation_step(0));
-        }
-    }
+    impl_base_field_evaluate_prover!();
 }
 
 // =========================================================================
@@ -763,13 +708,10 @@ impl NextPcAddConstraint {
 
         // instr_size = 4 - 2 * c_type_instruction
         let four: FieldElement<F> = FieldElement::from(4u64);
-        let two: FieldElement<F> = FieldElement::from(2u64);
-        let instr_size = four - two * c_type;
+        let instr_size = four - c_type.double();
 
         // carry_0 = (pc_lo + instr_size - next_pc_lo) * 2^(-32)
-        let inv_2_32: FieldElement<F> = FieldElement::from(super::templates::SHIFT_32)
-            .inv()
-            .unwrap();
+        let inv_2_32 = FieldElement::<F>::from(super::templates::INV_SHIFT_32);
         (pc_lo + instr_size - next_pc_lo) * inv_2_32
     }
 
@@ -785,9 +727,7 @@ impl NextPcAddConstraint {
 
         // rhs_hi = 0 (instruction size fits in low word)
         // carry_1 = (pc_hi + 0 + carry_0 - next_pc_hi) * 2^(-32)
-        let inv_2_32: FieldElement<F> = FieldElement::from(super::templates::SHIFT_32)
-            .inv()
-            .unwrap();
+        let inv_2_32 = FieldElement::<F>::from(super::templates::INV_SHIFT_32);
         (pc_hi + carry_0 - next_pc_hi) * inv_2_32
     }
 
@@ -855,16 +795,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for NextPcAddCon
         }
     }
 
-    fn evaluate_prover(
-        &self,
-        ctx: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        base_evaluations: &mut [FieldElement<GoldilocksField>],
-        _ext_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        if let TransitionEvaluationContext::Prover { frame, .. } = ctx {
-            base_evaluations[self.constraint_idx] = self.compute(frame.get_evaluation_step(0));
-        }
-    }
+    impl_base_field_evaluate_prover!();
 }
 
 // =========================================================================
@@ -952,16 +883,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg2LowerCon
         }
     }
 
-    fn evaluate_prover(
-        &self,
-        ctx: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        base_evaluations: &mut [FieldElement<GoldilocksField>],
-        _ext_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        if let TransitionEvaluationContext::Prover { frame, .. } = ctx {
-            base_evaluations[self.constraint_idx] = self.compute(frame.get_evaluation_step(0));
-        }
-    }
+    impl_base_field_evaluate_prover!();
 }
 
 /// Constraint: arg2[4:] = (1-LOAD)*((1-word_instr)*rv2[2] + signed*arg2_sign_bit*(2^32-1)) + (1-BEQ-BLT-STORE)*imm[1]
@@ -1050,16 +972,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg2UpperCon
         }
     }
 
-    fn evaluate_prover(
-        &self,
-        ctx: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        base_evaluations: &mut [FieldElement<GoldilocksField>],
-        _ext_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        if let TransitionEvaluationContext::Prover { frame, .. } = ctx {
-            base_evaluations[self.constraint_idx] = self.compute(frame.get_evaluation_step(0));
-        }
-    }
+    impl_base_field_evaluate_prover!();
 }
 
 // =========================================================================
@@ -1129,16 +1042,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RvdLowerCons
         }
     }
 
-    fn evaluate_prover(
-        &self,
-        ctx: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        base_evaluations: &mut [FieldElement<GoldilocksField>],
-        _ext_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        if let TransitionEvaluationContext::Prover { frame, .. } = ctx {
-            base_evaluations[self.constraint_idx] = self.compute(frame.get_evaluation_step(0));
-        }
-    }
+    impl_base_field_evaluate_prover!();
 }
 
 /// Constraint: (1-LOAD) * (rvd[1] - ((1-word_instr)*res[4:] + res_sign_bit*(2^32-1))) = 0
@@ -1212,16 +1116,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RvdUpperCons
         }
     }
 
-    fn evaluate_prover(
-        &self,
-        ctx: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        base_evaluations: &mut [FieldElement<GoldilocksField>],
-        _ext_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        if let TransitionEvaluationContext::Prover { frame, .. } = ctx {
-            base_evaluations[self.constraint_idx] = self.compute(frame.get_evaluation_step(0));
-        }
-    }
+    impl_base_field_evaluate_prover!();
 }
 
 // =========================================================================

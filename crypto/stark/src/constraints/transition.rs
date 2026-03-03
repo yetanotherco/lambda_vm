@@ -53,7 +53,7 @@ where
         // method to write into base_evaluations. The default writes to ext_evaluations,
         // but the accumulator only reads ext_evaluations[num_base..], so a base-range
         // constraint using this default would be silently dropped (soundness bug).
-        debug_assert!(
+        assert!(
             self.constraint_idx() >= base_evaluations.len(),
             "Constraint idx {} < num_base {}: must override evaluate_prover()",
             self.constraint_idx(),

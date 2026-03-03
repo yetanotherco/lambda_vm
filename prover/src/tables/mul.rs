@@ -31,6 +31,7 @@
 
 use std::collections::HashMap;
 
+use crate::impl_base_field_evaluate_prover;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::TransitionConstraint;
@@ -870,16 +871,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MulConstrain
         }
     }
 
-    fn evaluate_prover(
-        &self,
-        ctx: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        base_evaluations: &mut [FieldElement<GoldilocksField>],
-        _ext_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        if let TransitionEvaluationContext::Prover { frame, .. } = ctx {
-            base_evaluations[self.constraint_idx] = self.compute(frame.get_evaluation_step(0));
-        }
-    }
+    impl_base_field_evaluate_prover!();
 }
 
 /// Creates all constraints for the MUL table.

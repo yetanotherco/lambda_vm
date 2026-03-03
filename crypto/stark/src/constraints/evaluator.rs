@@ -350,6 +350,10 @@ where
 
         let num_transition = air.num_transition_constraints();
         let num_base = air.num_base_transition_constraints();
+        assert!(
+            num_base <= num_transition,
+            "num_base_transition_constraints ({num_base}) > num_transition_constraints ({num_transition})"
+        );
         let num_periodic = lde_periodic_columns.len();
         let offsets = &air.context().transition_offsets;
 

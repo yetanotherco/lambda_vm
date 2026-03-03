@@ -18,6 +18,7 @@ use stark::{
     traits::TransitionEvaluationContext,
 };
 
+use crate::impl_base_field_evaluate_prover;
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
 // =========================================================================
@@ -27,10 +28,15 @@ use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 /// 2^32 for word combining and carry extraction
 pub const SHIFT_32: u64 = 1u64 << 32;
 
+/// Precomputed: (2^32)^(-1) mod p where p = 2^64 - 2^32 + 1.
+/// Avoids ~72 multiplications per inv() call in constraint hot loops.
+/// Verify: INV_SHIFT_32 * SHIFT_32 ≡ 1 (mod p)
+pub const INV_SHIFT_32: u64 = 18446744065119617026;
+
 /// 2^(-32) in the field, used for carry extraction.
 #[inline]
 fn inv_2_32<F: IsField>() -> FieldElement<F> {
-    FieldElement::from(SHIFT_32).inv().unwrap()
+    FieldElement::from(INV_SHIFT_32)
 }
 
 // =========================================================================
@@ -140,16 +146,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for IsBitConstra
         }
     }
 
-    fn evaluate_prover(
-        &self,
-        ctx: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        base_evaluations: &mut [FieldElement<GoldilocksField>],
-        _ext_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        if let TransitionEvaluationContext::Prover { frame, .. } = ctx {
-            base_evaluations[self.constraint_idx] = self.compute(frame.get_evaluation_step(0));
-        }
-    }
+    impl_base_field_evaluate_prover!();
 }
 
 // =========================================================================
@@ -553,16 +550,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for AddConstrain
         }
     }
 
-    fn evaluate_prover(
-        &self,
-        ctx: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        base_evaluations: &mut [FieldElement<GoldilocksField>],
-        _ext_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        if let TransitionEvaluationContext::Prover { frame, .. } = ctx {
-            base_evaluations[self.constraint_idx] = self.compute(frame.get_evaluation_step(0));
-        }
-    }
+    impl_base_field_evaluate_prover!();
 }
 
 // =========================================================================
@@ -588,4 +576,17 @@ pub fn new_is_bit_constraints(
         .collect();
 
     (constraints, constraint_idx_start + value_cols.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tables::types::GoldilocksField;
+
+    #[test]
+    fn test_inv_shift_32_is_correct() {
+        let inv = FieldElement::<GoldilocksField>::from(INV_SHIFT_32);
+        let shift = FieldElement::<GoldilocksField>::from(SHIFT_32);
+        assert_eq!(inv * shift, FieldElement::one());
+    }
 }
