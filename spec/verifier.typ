@@ -1,9 +1,15 @@
 #import "/book.typ": book-page, et
+#import "/stark.typ": * // Notation from STARK specification
 
 #show: book-page("verifier")
 
 = Definitions
 #et("Provide definitions for the notation used in this chapter. Perhaps this can be shared with some of the other theoretical chapters.")
+
+= Interactive Steps
+
+1. Receive table commitment(s) $MerkleRoot_i$.
+2. For each constraint $Constraint_(i,j)$, generate batching and degree-correcting challenges $batchingChallenge_(i,j)$ and $degreeChallenge_(i,j)$.
 
 
 = Proof contents

@@ -125,3 +125,23 @@ In our case, the constraint polynomial $Constraint_(i,j)$ has constraint degree 
 This implies that the univariate _composed constraint polynomial_ $ComposedConstraint_(i,j) = (Constraint_(i,j) compose arrow(traceColPoly)_i) / Zerofier_(i,j)$ is expected to have degree strictly less than $constraintDegree_(i,j) dot numRows_i - zerofierDegree_(i,j)$.
 
 In conclusion, the $sum_(i in [numTables]) numConstraints_i$ claims that the constraint equation sets are satisfied by the table values can be re-interpreted as the equivalent claims that $ ComposedConstraint_(i,j)(indX) = (Constraint_(i,j) compose arrow(traceColPoly)_i (indX)) / (Zerofier_(i,j)(indX)) "has degree" < constraintDegree_(i,j) dot numRows_i - zerofierDegree_(i,j), $ for $i in [numTables]$ and $j in [numConstraints_i]$.
+
+== Verifier Challenge for Degree Correction and Constraint Claim Batching
+
+#let degreeGap = $sans(g)$
+#let batchingChallenge = $alpha$
+#let degreeChallenge = $beta$
+
+When multiple claims are expected to hold simultaneously, the standard trick in cryptography is to compute a single claim, constructed as a random linear combination of the multiples ones, and verify that this batched claim holds.
+However, to apply this batching technique, the multiple claims need to be homogeneous, which is not necessarily the case of the low-degree claims the composed constraint polynomials $ComposedConstraint_(i, j)$ since each might have a different degree bound.
+
+To homogenise these claims, the protocol must first apply _degree correction_ with the help of randomisers provided by the verifier.
+First, let $constraintDegree in NN$ such that $ log_2(constraintDegree) = ceil(log_2 max_(i,j){constraintDegree_(i,j) dot numRows_i - zerofierDegree_(i,j)}) $ denote the next power-of-two degree bound on the composed constraint polynomials. That is, $constraintDegree$ is the smallest power of two that is greater than or equal to the degree of any composed constraint polynomial.
+Then let $ degreeGap_(i, j) = constraintDegree - (constraintDegree_(i, j) dot numRows_i - zerofierDegree_(i, j)) $ denote the _degree gap_ for the composed constraint polynomial $ComposedConstraint_(i,j)$ with respect to $constraintDegree$.
+
+Degree correction works by receiving two random extension field challenges $batchingChallenge_(i,j)$ and $degreeChallenge_(i,j)$ from the verifier for each low-degree claim and transforming each claim into $ ComposedConstraint_(i,j)(indX) dot (batchingChallenge_(i,j) + degreeChallenge_(i,j) dot indX^(degreeGap_(i,j))) "has degree" < constraintDegree. $
+This introduces a small soundness loss as there is the possibility that an invalid claim gets degree-corrected into a valid one.
+
+Now that every claim is corrected to be of the same degree, they can all be batched into the single claim $ ComposedConstraint(indX) = sum_(i,j) ComposedConstraint_(i,j)(indX) dot (batchingChallenge_(i,j) + degreeChallenge_(i,j) dot indX^(degreeGap_(i,j))) "has degree" < constraintDegree. $
+
+Note that the prover is implicitly committed to this claim by virtue of being committed to the column polynomials and having received the verifier challenges, so it does not need to send another commitment to make this claim.
