@@ -19,6 +19,12 @@ use self::fri_functions::{
 
 use math::polynomial::Polynomial;
 
+/// Return type for [`commit_phase_from_evaluations`]: final coefficients and FRI layers.
+type CommitPhaseResult<E> = (
+    Vec<FieldElement<E>>,
+    Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>>,
+);
+
 /// FRI commit phase from pre-computed bit-reversed evaluations.
 ///
 /// # Protocol structure
@@ -43,10 +49,7 @@ pub fn commit_phase_from_evaluations<F: IsFFTField + IsSubFieldOf<E>, E: IsField
     domain_size: usize,
     log_arity: usize,
     log_final_poly_len: usize,
-) -> (
-    Vec<FieldElement<E>>,
-    Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>>,
-)
+) -> CommitPhaseResult<E>
 where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
@@ -148,12 +151,13 @@ fn compute_total_binary_folds(
 /// Uses all remaining evaluations to recover polynomial coefficients via
 /// bit-reverse + iFFT + coset correction (divide coefficient j by offset^j).
 /// When only 1 evaluation remains, returns it directly as a constant.
-fn extract_final_poly<F: IsFFTField + IsSubFieldOf<E>, E: IsField>(
+fn extract_final_poly<F, E>(
     evals: &[FieldElement<E>],
     coset_offset: &FieldElement<F>,
 ) -> Vec<FieldElement<E>>
 where
-    E: Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField + Send + Sync,
 {
     if evals.len() <= 1 {
         vec![evals.first().unwrap_or(&FieldElement::zero()).clone()]

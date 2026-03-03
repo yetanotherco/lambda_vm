@@ -141,7 +141,7 @@ impl<T: PartialEq + Eq + Clone> BatchProof<T> {
                 groups
             };
 
-            for (parent, _known_children) in &parent_groups {
+            for parent in parent_groups.keys() {
                 let first_child = parent * arity + 1;
                 let mut children = Vec::with_capacity(arity);
                 for i in 0..arity {

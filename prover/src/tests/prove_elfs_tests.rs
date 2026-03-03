@@ -52,8 +52,6 @@ fn prove_and_verify_vm_with_options(
     traces: &mut Traces,
     proof_options: ProofOptions,
 ) -> bool {
-    let proof_options = proof_options;
-
     // Create all AIRs including PAGE and REGISTER tables
     let table_counts = traces.table_counts();
     let airs = VmAirs::new(

@@ -35,12 +35,12 @@ fn complete_the_length_of_a_list_of_fields_elements_to_be_a_power_of_four() {
     // 5 elements -> next power of 4 is 16
     assert_eq!(padded.len(), 16);
     // First 5 elements unchanged
-    for i in 0..5 {
-        assert_eq!(padded[i], FE::new((i + 1) as u64));
+    for (i, val) in padded.iter().enumerate().take(5) {
+        assert_eq!(*val, FE::new((i + 1) as u64));
     }
     // Remaining padded with last element (5)
-    for i in 5..16 {
-        assert_eq!(padded[i], FE::new(5));
+    for val in &padded[5..16] {
+        assert_eq!(*val, FE::new(5));
     }
 }
 

@@ -104,7 +104,7 @@ mod tests {
     use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
     use math::field::traits::IsFFTField;
 
-    type GFE = FieldElement<GoldilocksField>;
+    type Gfe = FieldElement<GoldilocksField>;
 
     /// Verifies that the verifier's domain-based twiddle computation matches
     /// the prover's sequential fold for multi-fold (log_arity > 1).
@@ -112,18 +112,18 @@ mod tests {
     fn test_verifier_multifold_matches_prover() {
         // 16-element evaluation array, log_arity=2 (fold 2x per round)
         let domain_size = 16usize;
-        let coset_offset = GFE::from(7u64);
-        let zeta = GFE::from(13u64);
+        let coset_offset = Gfe::from(7u64);
+        let zeta = Gfe::from(13u64);
 
         // Create arbitrary evaluations
-        let evals: Vec<GFE> = (0..domain_size)
-            .map(|i| GFE::from((i * 3 + 5) as u64))
+        let evals: Vec<Gfe> = (0..domain_size)
+            .map(|i| Gfe::from((i * 3 + 5) as u64))
             .collect();
 
         // === Prover path: fold 2x using sequential fold_evaluations_in_place ===
         let mut prover_evals = evals.clone();
         let mut inv_twiddles = compute_coset_twiddles_inv(&coset_offset, domain_size);
-        let mut challenge = zeta.clone();
+        let mut challenge = zeta;
 
         fold_evaluations_in_place(&mut prover_evals, &challenge, &inv_twiddles);
         update_twiddles_in_place(&mut inv_twiddles);
@@ -135,17 +135,17 @@ mod tests {
         // === Verifier path: for each group of 4, compute twiddles from domain and fold ===
         let log_arity = 2usize;
         let group_size = 1usize << log_arity;
-        let sub_offset_init = coset_offset.clone();
+        let sub_offset_init = coset_offset;
         let sub_domain_log_size_init = domain_size.trailing_zeros();
 
-        for group_idx in 0..domain_size / group_size {
+        for (group_idx, prover_eval) in prover_evals.iter().enumerate() {
             let group_start = group_idx * group_size;
-            let mut group_evals: Vec<GFE> = evals[group_start..group_start + group_size].to_vec();
+            let mut group_evals: Vec<Gfe> = evals[group_start..group_start + group_size].to_vec();
 
-            let mut sub_offset = sub_offset_init.clone();
+            let mut sub_offset = sub_offset_init;
             let mut sub_domain_log_size = sub_domain_log_size_init;
             let mut local_start = group_start;
-            let mut ch = zeta.clone();
+            let mut ch = zeta;
 
             for _ in 0..log_arity {
                 let half = group_evals.len() / 2;
@@ -155,22 +155,22 @@ mod tests {
                 let tw_bits = sub_domain_log_size - 1;
                 let tw_domain_size = 1u64 << tw_bits;
 
-                let mut coset_pts: Vec<GFE> = (0..half)
+                let mut coset_pts: Vec<Gfe> = (0..half)
                     .map(|j| {
                         let gpi = local_start / 2 + j;
-                        let natural_idx = reverse_index(gpi, tw_domain_size as u64);
-                        &sub_offset * sub_root.pow(natural_idx)
+                        let natural_idx = reverse_index(gpi, tw_domain_size);
+                        sub_offset * sub_root.pow(natural_idx)
                     })
                     .collect();
-                GFE::inplace_batch_inverse(&mut coset_pts).unwrap();
+                Gfe::inplace_batch_inverse(&mut coset_pts).unwrap();
 
                 let mut new_evals = Vec::with_capacity(half);
                 for j in 0..half {
-                    let lo = &group_evals[2 * j];
-                    let hi = &group_evals[2 * j + 1];
+                    let lo = group_evals[2 * j];
+                    let hi = group_evals[2 * j + 1];
                     let sum = lo + hi;
                     let diff = lo - hi;
-                    new_evals.push(&sum + &(&coset_pts[j] * &(&ch * &diff)));
+                    new_evals.push(sum + coset_pts[j] * (ch * diff));
                 }
 
                 group_evals = new_evals;
@@ -186,7 +186,7 @@ mod tests {
                 "After log_arity folds, group should collapse to 1 element"
             );
             assert_eq!(
-                group_evals[0], prover_evals[group_idx],
+                group_evals[0], *prover_eval,
                 "Group {group_idx}: verifier fold result doesn't match prover"
             );
         }

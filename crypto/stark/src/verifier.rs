@@ -629,6 +629,7 @@ pub trait IsStarkVerifier<
     ///
     /// For each sub-fold within a layer, twiddle factors are computed from domain parameters
     /// (coset offset, roots of unity, bit-reversal) to match the prover's `fold_evaluations_in_place`.
+    #[allow(clippy::too_many_arguments)]
     fn verify_query_and_sym_openings(
         proof: &StarkProof<Field, FieldExtension, PI>,
         zetas: &[FieldElement<FieldExtension>],
@@ -715,7 +716,7 @@ pub trait IsStarkVerifier<
                 let mut coset_pts: Vec<FieldElement<Field>> = (0..half)
                     .map(|j| {
                         let global_pair_idx = local_start / 2 + j;
-                        let natural_idx = reverse_index(global_pair_idx, tw_domain_size as u64);
+                        let natural_idx = reverse_index(global_pair_idx, tw_domain_size);
                         &sub_offset * sub_root.pow(natural_idx)
                     })
                     .collect();
