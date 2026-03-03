@@ -288,6 +288,12 @@ fn collect_ops_from_cpu(
         let reg_memw_ops = collect_register_ops_from_cpu(op, register_state);
         memw_ops.extend(reg_memw_ops);
 
+        // Collect COMMIT ECALL memory operations (register reads/writes + byte reads)
+        if op.ecall_commit {
+            let commit_ops = collect_commit_memw_ops(op, register_state, memory_state);
+            memw_ops.extend(commit_ops);
+        }
+
         // --- LT and Bitwise (no state tracking needed) ---
 
         // Collect LT operations from SLT/BLT instructions
@@ -458,6 +464,102 @@ fn collect_register_ops_from_cpu(
             .with_old(old_value, old_timestamps);
         memw_ops.push(memw_op);
         register_state.write(d.rd, op.rvd, op.timestamp + 2);
+    }
+
+    memw_ops
+}
+
+/// Collects MEMW operations for a COMMIT ECALL from CpuOperation.
+///
+/// Per the timestamp scheme:
+/// - ts+1: Read x10 (fd), x11 (buf_addr), x12 (count) — all at same ts, different addrs
+/// - ts+2: Write x10 (return value = count)
+/// - ts+3: Read committed bytes — all at same ts, sequential memory addrs
+///
+/// Returns: Vec of MEMW operations
+fn collect_commit_memw_ops(
+    op: &CpuOperation,
+    register_state: &mut RegisterState,
+    memory_state: &mut MemoryState,
+) -> Vec<MemwOperation> {
+    // ECALL decode must not set read_register1/2 or write_register,
+    // otherwise the CPU's MEMW interactions at ts+0/+1/+2 would collide
+    // with COMMIT's register interactions at ts+1/+2.
+    debug_assert!(
+        !op.decode.read_register1 && !op.decode.read_register2 && !op.decode.write_register,
+        "ECALL decode must not set register read/write flags"
+    );
+
+    let ts = op.timestamp;
+    let buf_addr = op.commit_buf_addr;
+    let count = op.commit_count;
+
+    let mut memw_ops = Vec::with_capacity(3 + 1 + count as usize);
+
+    // --- Register reads at ts+1 ---
+
+    // Read x10 (fd=1) at ts+1
+    {
+        let reg_value = pack_register_value(1); // fd = 1
+        let reg_addr = 2 * 10u64; // x10 → addr 20
+        let (_old_val, old_ts) = register_state.read(10);
+        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
+        let memw_op = MemwOperation::new(true, reg_addr, reg_value, ts + 1, 2, true)
+            .with_old(reg_value, old_timestamps);
+        memw_ops.push(memw_op);
+        register_state.write(10, 1, ts + 1);
+    }
+
+    // Read x11 (buf_addr) at ts+1
+    {
+        let reg_value = pack_register_value(buf_addr);
+        let reg_addr = 2 * 11u64; // x11 → addr 22
+        let (_old_val, old_ts) = register_state.read(11);
+        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
+        let memw_op = MemwOperation::new(true, reg_addr, reg_value, ts + 1, 2, true)
+            .with_old(reg_value, old_timestamps);
+        memw_ops.push(memw_op);
+        register_state.write(11, buf_addr, ts + 1);
+    }
+
+    // Read x12 (count) at ts+1
+    {
+        let reg_value = pack_register_value(count);
+        let reg_addr = 2 * 12u64; // x12 → addr 24
+        let (_old_val, old_ts) = register_state.read(12);
+        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
+        let memw_op = MemwOperation::new(true, reg_addr, reg_value, ts + 1, 2, true)
+            .with_old(reg_value, old_timestamps);
+        memw_ops.push(memw_op);
+        register_state.write(12, count, ts + 1);
+    }
+
+    // --- Register write at ts+2 ---
+
+    // Write x10 (return value = count) at ts+2
+    {
+        let new_value = pack_register_value(count);
+        let reg_addr = 2 * 10u64; // x10 → addr 20
+        let (old_val, old_ts) = register_state.read(10);
+        let old_value = pack_register_value(old_val);
+        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
+        let memw_op = MemwOperation::new(true, reg_addr, new_value, ts + 2, 2, false)
+            .with_old(old_value, old_timestamps);
+        memw_ops.push(memw_op);
+        register_state.write(10, count, ts + 2);
+    }
+
+    // --- Memory byte reads at ts+3 ---
+
+    for i in 0..count {
+        let addr = buf_addr.wrapping_add(i);
+        let (byte_val, old_ts) = memory_state.read_byte(addr);
+        let value = [byte_val as u64, 0, 0, 0, 0, 0, 0, 0];
+        let old_timestamps = [old_ts, 0, 0, 0, 0, 0, 0, 0];
+        let memw_op =
+            MemwOperation::new(false, addr, value, ts + 3, 1, true).with_old(value, old_timestamps);
+        memw_ops.push(memw_op);
+        memory_state.write_byte(addr, byte_val, ts + 3);
     }
 
     memw_ops
@@ -1051,6 +1153,7 @@ fn expand_commit_operations(
 /// The COMMIT table sends:
 /// - IsByte for value (1 per real row)
 /// - IsHalfword for count_decr components (4 per real row)
+/// - IsHalfword for address_incr halfwords (4 per real row)
 fn collect_bitwise_from_commit(commit_ops: &[CommitOperation]) -> Vec<BitwiseOperation> {
     let mut lookups = Vec::new();
 
@@ -1074,6 +1177,20 @@ fn collect_bitwise_from_commit(commit_ops: &[CommitOperation]) -> Vec<BitwiseOpe
                 (half & 0xFF) as u8,
                 ((half >> 8) & 0xFF) as u8,
             ));
+        }
+
+        // IsHalfword for address_incr halfwords (4 halfwords, mult = mu - end)
+        // End rows don't use address_incr, so skip their lookups.
+        if !op.end {
+            let address_incr = op.address.wrapping_add(1);
+            for shift in [0, 16, 32, 48] {
+                let half = ((address_incr >> shift) & 0xFFFF) as u16;
+                lookups.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::IsHalf,
+                    (half & 0xFF) as u8,
+                    ((half >> 8) & 0xFF) as u8,
+                ));
+            }
         }
     }
 
