@@ -1254,53 +1254,34 @@ where
     let num_bus_elements = table_interaction.num_bus_elements();
     let alpha_powers = compute_alpha_powers(alpha, num_bus_elements);
 
-    // Sign: +1 for senders, -1 for receivers
-    let sign = if table_interaction.is_sender {
-        FieldElement::<E>::one()
-    } else {
-        -FieldElement::<E>::one()
+    // Fingerprint computation — each row is independent (reads immutable main_segment_cols).
+    let bus_id_f = FieldElement::<F>::from(table_interaction.bus_id);
+
+    let compute_fingerprint = |row: usize| -> FieldElement<E> {
+        let mut linear_combination = &bus_id_f * &alpha_powers[0];
+        let mut alpha_offset = 1;
+        for bv in &table_interaction.values {
+            let consumed = bv.accumulate_fingerprint(
+                main_segment_cols,
+                row,
+                &alpha_powers,
+                alpha_offset,
+                &mut linear_combination,
+            );
+            alpha_offset += consumed;
+        }
+        z - &linear_combination
     };
 
-    // Fingerprint computation — each row is independent (reads immutable main_segment_cols).
-    // Use par_chunks_mut for row-level parallelism within each interaction.
-    let bus_id_f = FieldElement::<F>::from(table_interaction.bus_id);
-    let mut fingerprints: Vec<FieldElement<E>> = vec![FieldElement::zero(); trace_len];
+    #[cfg(feature = "parallel")]
+    let mut fingerprints: Vec<FieldElement<E>> = (0..trace_len)
+        .into_par_iter()
+        .map(compute_fingerprint)
+        .collect();
 
-    {
-        const FINGERPRINT_CHUNK_SIZE: usize = 1024;
-
-        let compute_row = |fp: &mut FieldElement<E>, row: usize| {
-            let mut linear_combination = &bus_id_f * &alpha_powers[0];
-            let mut alpha_offset = 1;
-            for bv in &table_interaction.values {
-                let consumed = bv.accumulate_fingerprint(
-                    main_segment_cols,
-                    row,
-                    &alpha_powers,
-                    alpha_offset,
-                    &mut linear_combination,
-                );
-                alpha_offset += consumed;
-            }
-            *fp = z - &linear_combination;
-        };
-
-        #[cfg(feature = "parallel")]
-        fingerprints
-            .par_chunks_mut(FINGERPRINT_CHUNK_SIZE)
-            .enumerate()
-            .for_each(|(chunk_idx, chunk)| {
-                let start = chunk_idx * FINGERPRINT_CHUNK_SIZE;
-                for (local_i, fp) in chunk.iter_mut().enumerate() {
-                    compute_row(fp, start + local_i);
-                }
-            });
-
-        #[cfg(not(feature = "parallel"))]
-        for row in 0..trace_len {
-            compute_row(&mut fingerprints[row], row);
-        }
-    }
+    #[cfg(not(feature = "parallel"))]
+    let mut fingerprints: Vec<FieldElement<E>> =
+        (0..trace_len).map(compute_fingerprint).collect();
 
     #[cfg(feature = "debug-checks")]
     for row in 0..trace_len {
@@ -1322,7 +1303,7 @@ where
         );
     }
 
-    // Parallel batch inversion
+    // Batch inversion: fingerprints[i] = 1 / fingerprints[i]
     #[cfg(feature = "parallel")]
     FieldElement::parallel_batch_inverse(&mut fingerprints)
         .expect("fingerprint is zero - probability of sampling zero is negligible");
@@ -1330,13 +1311,28 @@ where
     FieldElement::inplace_batch_inverse(&mut fingerprints)
         .expect("fingerprint is zero - probability of sampling zero is negligible");
 
-    // Compute terms: term[i] = sign * multiplicity[i] * fingerprint_inv[i]
+    // Fold sign into fingerprint inverses: negate for receivers.
+    // This avoids an E×E multiply in the term computation below — the term
+    // becomes just multiplicity * fingerprint_inv (F×E) instead of
+    // multiplicity * sign * fingerprint_inv (F×E + E×E).
+    if !table_interaction.is_sender {
+        #[cfg(feature = "parallel")]
+        fingerprints.par_iter_mut().for_each(|fp| {
+            *fp = -&*fp;
+        });
+        #[cfg(not(feature = "parallel"))]
+        for fp in fingerprints.iter_mut() {
+            *fp = -&*fp;
+        }
+    }
+
+    // Compute terms: term[i] = multiplicity[i] * signed_fingerprint_inv[i]  (F×E)
     #[cfg(feature = "parallel")]
     {
         multiplicities
             .par_iter()
             .zip(fingerprints.par_iter())
-            .map(|(multiplicity, fingerprint_inv)| multiplicity * &sign * fingerprint_inv)
+            .map(|(multiplicity, fingerprint_inv)| multiplicity * fingerprint_inv)
             .collect()
     }
     #[cfg(not(feature = "parallel"))]
@@ -1344,7 +1340,7 @@ where
         multiplicities
             .iter()
             .zip(fingerprints.iter())
-            .map(|(multiplicity, fingerprint_inv)| multiplicity * &sign * fingerprint_inv)
+            .map(|(multiplicity, fingerprint_inv)| multiplicity * fingerprint_inv)
             .collect()
     }
 }
@@ -1372,14 +1368,19 @@ fn build_accumulated_column_from_terms<F, E>(
     let trace_len = term_columns[0].len();
 
     // Compute row sums: for each row, sum all term columns
-    let mut row_sums: Vec<FieldElement<E>> = Vec::with_capacity(trace_len);
-    for row in 0..trace_len {
+    let sum_row = |row: usize| -> FieldElement<E> {
         let mut s = FieldElement::<E>::zero();
         for col in term_columns {
             s = s + &col[row];
         }
-        row_sums.push(s);
-    }
+        s
+    };
+
+    #[cfg(feature = "parallel")]
+    let row_sums: Vec<FieldElement<E>> = (0..trace_len).into_par_iter().map(sum_row).collect();
+
+    #[cfg(not(feature = "parallel"))]
+    let row_sums: Vec<FieldElement<E>> = (0..trace_len).map(sum_row).collect();
 
     // Prefix sum
     #[cfg(feature = "parallel")]
@@ -1397,8 +1398,8 @@ fn build_accumulated_column_from_terms<F, E>(
     };
 
     // Write to trace
-    for (row, value) in acc.iter().enumerate() {
-        trace.set_aux(row, acc_column_idx, value.clone());
+    for (row, value) in acc.into_iter().enumerate() {
+        trace.set_aux(row, acc_column_idx, value);
     }
 }
 

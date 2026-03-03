@@ -80,6 +80,11 @@ impl<F: IsField> FieldElement<F> {
     /// Parallel variant of `inplace_batch_inverse`. Splits the slice into chunks
     /// of 1024 and runs independent Montgomery's trick per chunk via Rayon.
     /// Falls back to sequential for small slices.
+    ///
+    /// Note: on error (non-invertible element), some chunks may already be
+    /// inverted in place. This differs from the sequential version which
+    /// leaves the input unchanged on error. In practice, callers use this
+    /// on random fingerprints where zero probability is negligible.
     #[cfg(feature = "parallel")]
     pub fn parallel_batch_inverse(numbers: &mut [Self]) -> Result<(), FieldError>
     where
