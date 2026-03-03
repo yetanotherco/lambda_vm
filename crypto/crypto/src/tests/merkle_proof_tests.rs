@@ -182,7 +182,9 @@ fn batch_proof_duplicate_positions_are_deduplicated() {
     let merkle_tree = MerkleTree::<TestBackend<U64PF>>::build(&values).unwrap();
 
     let pos_list_with_duplicates = vec![0, 0, 1];
-    let batch_proof = merkle_tree.get_batch_proof(&pos_list_with_duplicates).unwrap();
+    let batch_proof = merkle_tree
+        .get_batch_proof(&pos_list_with_duplicates)
+        .unwrap();
 
     let pos_list_clean = vec![0, 1];
     let batch_proof_clean = merkle_tree.get_batch_proof(&pos_list_clean).unwrap();

@@ -13,8 +13,6 @@ where
 {
     pub evaluation: Vec<FieldElement<F>>,
     pub merkle_tree: MerkleTree<B>,
-    pub coset_offset: FieldElement<F>,
-    pub domain_size: usize,
 }
 
 impl<F, B> FriLayer<F, B>
@@ -23,17 +21,10 @@ where
     FieldElement<F>: AsBytes,
     B: IsMerkleTreeBackend,
 {
-    pub fn new(
-        evaluation: &[FieldElement<F>],
-        merkle_tree: MerkleTree<B>,
-        coset_offset: FieldElement<F>,
-        domain_size: usize,
-    ) -> Self {
+    pub fn new(evaluation: &[FieldElement<F>], merkle_tree: MerkleTree<B>) -> Self {
         Self {
             evaluation: evaluation.to_vec(),
             merkle_tree,
-            coset_offset,
-            domain_size,
         }
     }
 }

@@ -6,8 +6,7 @@
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
 use math::field::fields::fft_friendly::{
-    extensions_goldilocks::Degree3GoldilocksExtensionField,
-    u64_goldilocks::GoldilocksField,
+    extensions_goldilocks::Degree3GoldilocksExtensionField, u64_goldilocks::GoldilocksField,
 };
 
 use crate::{
@@ -50,11 +49,7 @@ fn prove_and_verify(log_arity: u8, log_final_poly_len: u8) {
     .unwrap();
 
     assert!(
-        Verifier::<F, E, _>::verify(
-            &proof,
-            &air,
-            &mut DefaultTranscript::<E>::new(&[]),
-        ),
+        Verifier::<F, E, _>::verify(&proof, &air, &mut DefaultTranscript::<E>::new(&[]),),
         "Verification failed for log_arity={log_arity}, log_final_poly_len={log_final_poly_len}"
     );
 }

@@ -61,7 +61,6 @@ where
     let mut inv_twiddles = compute_coset_twiddles_inv(coset_offset, domain_size);
     let mut fri_layer_list = Vec::new();
     let mut current_coset_offset = coset_offset.clone();
-    let mut current_domain_size = domain_size;
     let mut binary_folds_done = 0;
     let group_size = 1usize << log_arity;
 
@@ -83,7 +82,6 @@ where
         for _ in 0..folds_this_round {
             fold_evaluations_in_place(&mut evals, &challenge, &inv_twiddles);
             current_coset_offset = current_coset_offset.square();
-            current_domain_size /= 2;
             update_twiddles_in_place(&mut inv_twiddles);
             challenge = challenge.square();
         }
@@ -98,12 +96,7 @@ where
             let merkle_tree = FriLayerMerkleTree::build(&leaves)
                 .expect("FRI commit: Merkle tree construction must succeed");
             let root = merkle_tree.root;
-            fri_layer_list.push(FriLayer::new(
-                &evals,
-                merkle_tree,
-                current_coset_offset.clone().to_extension(),
-                current_domain_size,
-            ));
+            fri_layer_list.push(FriLayer::new(&evals, merkle_tree));
 
             // >>>> Send commitment: [pk]
             transcript.append_bytes(&root);
@@ -121,7 +114,6 @@ where
     (final_poly, fri_layer_list)
 }
 
-/// Extract final polynomial from evaluation-form FRI residual.
 /// Computes total number of binary folds for the FRI commit phase.
 ///
 /// For higher-arity FRI (log_arity > 1), after the initial binary fold (matching
@@ -144,7 +136,8 @@ fn compute_total_binary_folds(
     let after_initial = base - 1;
     let rounded_up = after_initial.div_ceil(log_arity) * log_arity;
     let candidate = 1 + rounded_up;
-    let max_binary_folds = (domain_size.trailing_zeros() as usize).saturating_sub(log_final_poly_len);
+    let max_binary_folds =
+        (domain_size.trailing_zeros() as usize).saturating_sub(log_final_poly_len);
     if candidate <= max_binary_folds {
         candidate
     } else {

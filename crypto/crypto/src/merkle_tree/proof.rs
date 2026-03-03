@@ -168,4 +168,3 @@ impl<T: PartialEq + Eq + Clone> BatchProof<T> {
             && known_nodes.get(&0) == Some(root_hash)
     }
 }
-

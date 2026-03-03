@@ -664,8 +664,7 @@ pub trait IsStarkVerifier<
         // Track domain state for twiddle computation across layers.
         // After the initial fold: offset squared, domain log-size decremented by 1.
         let mut sub_offset = domain.coset_offset.square();
-        let mut sub_domain_log_size =
-            (domain.lde_length as u64).trailing_zeros() - 1;
+        let mut sub_domain_log_size = (domain.lde_length as u64).trailing_zeros() - 1;
 
         let mut result = true;
 
@@ -687,8 +686,7 @@ pub trait IsStarkVerifier<
 
             // Reconstruct full group of 2^log_arity elements in bit-reversed order
             let pos_in_group = index % group_size;
-            let mut group_evals: Vec<FieldElement<FieldExtension>> =
-                Vec::with_capacity(group_size);
+            let mut group_evals: Vec<FieldElement<FieldExtension>> = Vec::with_capacity(group_size);
             let mut sib_idx = 0;
             for j in 0..group_size {
                 if j == pos_in_group {
@@ -717,8 +715,7 @@ pub trait IsStarkVerifier<
                 let mut coset_pts: Vec<FieldElement<Field>> = (0..half)
                     .map(|j| {
                         let global_pair_idx = local_start / 2 + j;
-                        let natural_idx =
-                            reverse_index(global_pair_idx, tw_domain_size as u64);
+                        let natural_idx = reverse_index(global_pair_idx, tw_domain_size as u64);
                         &sub_offset * sub_root.pow(natural_idx)
                     })
                     .collect();

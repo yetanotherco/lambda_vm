@@ -140,8 +140,7 @@ mod tests {
 
         for group_idx in 0..domain_size / group_size {
             let group_start = group_idx * group_size;
-            let mut group_evals: Vec<GFE> =
-                evals[group_start..group_start + group_size].to_vec();
+            let mut group_evals: Vec<GFE> = evals[group_start..group_start + group_size].to_vec();
 
             let mut sub_offset = sub_offset_init.clone();
             let mut sub_domain_log_size = sub_domain_log_size_init;
@@ -150,10 +149,9 @@ mod tests {
 
             for _ in 0..log_arity {
                 let half = group_evals.len() / 2;
-                let sub_root = GoldilocksField::get_primitive_root_of_unity(
-                    sub_domain_log_size as u64,
-                )
-                .unwrap();
+                let sub_root =
+                    GoldilocksField::get_primitive_root_of_unity(sub_domain_log_size as u64)
+                        .unwrap();
                 let tw_bits = sub_domain_log_size - 1;
                 let tw_domain_size = 1u64 << tw_bits;
 

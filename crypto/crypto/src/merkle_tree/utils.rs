@@ -25,24 +25,16 @@ pub fn complete_until_power_of_arity<T: Clone>(mut values: Vec<T>, arity: usize)
     if values.len() <= 1 {
         return values;
     }
-    while !is_power_of(values.len(), arity) {
-        values.push(values[values.len() - 1].clone());
+    // Compute target length as the next power of arity >= values.len()
+    let mut target = 1;
+    while target < values.len() {
+        target *= arity;
+    }
+    if target > values.len() {
+        let pad = values.last().unwrap().clone();
+        values.resize(target, pad);
     }
     values
-}
-
-fn is_power_of(x: usize, base: usize) -> bool {
-    if x == 0 {
-        return false;
-    }
-    let mut n = x;
-    while n > 1 {
-        if n % base != 0 {
-            return false;
-        }
-        n /= base;
-    }
-    true
 }
 
 pub fn internal_node_count(leaves: usize, arity: usize) -> usize {
@@ -87,7 +79,9 @@ where
             nodes[parent_start..level_start + level_size].split_at_mut(parent_level_size);
 
         #[cfg(feature = "parallel")]
-        let iter = parents.into_par_iter().zip(children.par_chunks_exact(arity));
+        let iter = parents
+            .into_par_iter()
+            .zip(children.par_chunks_exact(arity));
         #[cfg(not(feature = "parallel"))]
         let iter = parents.iter_mut().zip(children.chunks_exact(arity));
 

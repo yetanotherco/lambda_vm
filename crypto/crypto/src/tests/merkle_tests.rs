@@ -33,7 +33,9 @@ where
     }
 
     fn hash_new_parent(children: &[Self::Node]) -> Self::Node {
-        children.iter().fold(FieldElement::<F>::zero(), |acc, x| acc + x)
+        children
+            .iter()
+            .fold(FieldElement::<F>::zero(), |acc, x| acc + x)
     }
 }
 

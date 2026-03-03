@@ -1578,7 +1578,8 @@ fn test_verify_rejects_inflated_table_counts() {
 #[test]
 fn test_vm_fri_arity4() {
     let (elf, logs, instructions) = run_asm_elf("test_add_8");
-    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
     let mut opts = ProofOptions::default_test_options();
     opts.fri_log_arity = 2;
     assert!(
@@ -1591,7 +1592,8 @@ fn test_vm_fri_arity4() {
 #[test]
 fn test_vm_fri_arity4_early_term() {
     let (elf, logs, instructions) = run_asm_elf("test_add_8");
-    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
     let mut opts = ProofOptions::default_test_options();
     opts.fri_log_arity = 2;
     opts.fri_log_final_poly_len = 2;
@@ -1605,7 +1607,8 @@ fn test_vm_fri_arity4_early_term() {
 #[test]
 fn test_vm_fri_arity8() {
     let (elf, logs, instructions) = run_asm_elf("test_add_8");
-    let mut traces = Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
     let mut opts = ProofOptions::default_test_options();
     opts.fri_log_arity = 3;
     assert!(
