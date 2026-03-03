@@ -94,7 +94,7 @@ Each column polynomial $traceColPoly_(i,j)$ is encoded as $FRICodeword_(i,j) in 
 
 === Codeword Commitment
 
-#let MerkleRoot = $sans("rt")$
+#let TableMerkleRoot = $sans("table-rt")$
 
 Before the protocol can continue, the column polynomials are committed to.
 This is achieved by committing to their encodings using a _Merkle commitment scheme_.
@@ -106,7 +106,7 @@ Several symbols (selected by a fixed offset determined by the folding factor) ca
 Furthermore, all commitments to codewords of the same length will be opened in the same location.
 Therefore the leaves can be instead set to be concatenations of the set of symbols at the same position across different codewords.
 
-*Output:* for each table $Table_i$, a Merkle commitment $MerkleRoot_i$.
+*Output:* for each table $Table_i$, a Merkle commitment $TableMerkleRoot_i$.
 
 == Claim Re-interpretation
 
@@ -142,6 +142,25 @@ Then let $ degreeGap_(i, j) = constraintDegree - (constraintDegree_(i, j) dot nu
 Degree correction works by receiving two random extension field challenges $batchingChallenge_(i,j)$ and $degreeChallenge_(i,j)$ from the verifier for each low-degree claim and transforming each claim into $ ComposedConstraint_(i,j)(indX) dot (batchingChallenge_(i,j) + degreeChallenge_(i,j) dot indX^(degreeGap_(i,j))) "has degree" < constraintDegree. $
 This introduces a small soundness loss as there is the possibility that an invalid claim gets degree-corrected into a valid one.
 
-Now that every claim is corrected to be of the same degree, they can all be batched into the single claim $ ComposedConstraint(indX) = sum_(i,j) ComposedConstraint_(i,j)(indX) dot (batchingChallenge_(i,j) + degreeChallenge_(i,j) dot indX^(degreeGap_(i,j))) "has degree" < constraintDegree. $
+Now that every claim is corrected to be of the same degree, they can all be batched into the single claim $ ComposedConstraint (indX) = sum_(i,j) ComposedConstraint_(i,j)(indX) dot (batchingChallenge_(i,j) + degreeChallenge_(i,j) dot indX^(degreeGap_(i,j))) "has degree" < constraintDegree. $
 
 Note that the prover is implicitly committed to this claim by virtue of being committed to the column polynomials and having received the verifier challenges, so it does not need to send another commitment to make this claim.
+
+== Committing to the Segment Polynomials
+
+#let numSegments = $sans(m)$
+#let segmentPoly = $cal(u)$
+#let SegmentMerkleRoot = $sans("seg-rt")$
+
+Depending on the maximum constraint degree $constraintDegree_(i, j)$ across all constraint equations and tables, the maximum degree bound $constraintDegree$ is going to be several times larger than $maxNumRows$.
+Therefore the batched claim about the degree of $ComposedConstraint (indX)$ cannot be proven as-is with an instance of the FRI protocol.
+
+Let $numSegments = constraintDegree / maxNumRows$, and recall that $constraintDegree$ is a power of two, so the division is clean and $numSegments$ is an integer.
+The prover then expresses the univariate polynomial $ComposedConstraint (indX)$ as $numSegments$ _segment polynomials_ $segmentPoly_i (indX)$, each of degree strictly less than $maxNumRows$, such that $ ComposedConstraint (indX) = sum_(i in [numSegments]) X^(i dot maxNumRows) dot segmentPoly_i (indX), $
+and commits to their encodings with the Merkle commitment scheme, _claiming_ that they encode polynomials which decompose the same batched constraint polynomial as the one to which they are already implicitly committed.
+
+Since the $numSegments$ segment polynomials have the same degree and their codeword commitments will need to be opened at the same location, they can be committed to using a single Merkle tree, thus producing just one root $SegmentMerkleRoot$.
+
+The single claim that $ComposedConstraint (indX)$ has degree strictly less than $constraintDegree$ is now transformed into the multiple claims that (1) each $segmentPoly_i (indX)$ has degree strictly less than $maxNumRows$, and (2) the polynomial $ComposedConstraint' (indX)$ implied by the committed segment polynomials is equal to the polynomial $ComposedConstraint (indX)$ implied by the committed column polynomials, equation constraints and verifier challenges.
+
+*Output:* a Merkle commitment $SegmentMerkleRoot$ to all $numSegments$ segment polynomials $segmentPoly_i$.

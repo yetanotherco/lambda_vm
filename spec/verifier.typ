@@ -8,8 +8,9 @@
 
 = Interactive Steps
 
-1. Receive table commitment(s) $MerkleRoot_i$.
+1. Receive table commitment(s) $TableMerkleRoot_i$.
 2. For each constraint $Constraint_(i,j)$, generate batching and degree-correcting challenges $batchingChallenge_(i,j)$ and $degreeChallenge_(i,j)$.
+3. Receive segments commitment $SegmentMerkleRoot$.
 
 
 = Proof contents
