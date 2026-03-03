@@ -77,7 +77,6 @@ where
         {
             let evaluations_t: Vec<_> = boundary_evaluation
                 .into_par_iter()
-                .with_min_len(1024)
                 .enumerate()
                 .map_init(
                     || {
@@ -244,8 +243,7 @@ where
         // instead of pre-computing all boundary_polys_evaluations.
         // This eliminates N_constraints × LDE_size intermediate allocations.
         #[cfg(feature = "parallel")]
-        let boundary_eval_iter =
-            (0..domain.lde_roots_of_unity_coset.len()).into_par_iter().with_min_len(1024);
+        let boundary_eval_iter = (0..domain.lde_roots_of_unity_coset.len()).into_par_iter();
         #[cfg(not(feature = "parallel"))]
         let boundary_eval_iter = 0..domain.lde_roots_of_unity_coset.len();
 

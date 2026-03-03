@@ -19,8 +19,7 @@ use math::{
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::{
-    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
-    IntoParallelRefMutIterator, ParallelIterator,
+    IntoParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
 };
 
 #[cfg(feature = "debug-checks")]
@@ -306,20 +305,34 @@ pub trait IsStarkProver<
         let num_rows = columns[0].len();
         let num_cols = columns.len();
 
+        // Per-worker reusable buffer: each rayon thread allocates once, then
+        // clears + refills for every row it processes. Avoids 2M heap allocs.
         #[cfg(feature = "parallel")]
-        let iter = (0..num_rows).into_par_iter().with_min_len(1024);
-        #[cfg(not(feature = "parallel"))]
-        let iter = 0..num_rows;
-
-        let hashed_leaves: Vec<Commitment> = iter
-            .map(|row_idx| {
-                let br_idx = reverse_index(row_idx, num_rows as u64);
-                let row: Vec<FieldElement<E>> = (0..num_cols)
-                    .map(|col_idx| columns[col_idx][br_idx].clone())
-                    .collect();
-                BatchedMerkleTreeBackend::<E>::hash_data(&row)
-            })
+        let hashed_leaves: Vec<Commitment> = (0..num_rows)
+            .into_par_iter()
+            .map_init(
+                || Vec::with_capacity(num_cols),
+                |row_buf, row_idx| {
+                    row_buf.clear();
+                    let br_idx = reverse_index(row_idx, num_rows as u64);
+                    row_buf.extend((0..num_cols).map(|col| columns[col][br_idx].clone()));
+                    BatchedMerkleTreeBackend::<E>::hash_data(row_buf)
+                },
+            )
             .collect();
+
+        #[cfg(not(feature = "parallel"))]
+        let hashed_leaves: Vec<Commitment> = {
+            let mut row_buf = Vec::with_capacity(num_cols);
+            (0..num_rows)
+                .map(|row_idx| {
+                    row_buf.clear();
+                    let br_idx = reverse_index(row_idx, num_rows as u64);
+                    row_buf.extend((0..num_cols).map(|col| columns[col][br_idx].clone()));
+                    BatchedMerkleTreeBackend::<E>::hash_data(&row_buf)
+                })
+                .collect()
+        };
 
         let tree = BatchedMerkleTree::<E>::build_from_hashed_leaves(hashed_leaves)?;
         let root = tree.root;
@@ -734,7 +747,6 @@ pub trait IsStarkProver<
             {
                 let (h0, h1): (Vec<_>, Vec<_>) = (0..n)
                     .into_par_iter()
-                    .with_min_len(1024)
                     .map(|i| {
                         let sum = &constraint_evaluations[i] + &constraint_evaluations[i + n];
                         let diff = &constraint_evaluations[i] - &constraint_evaluations[i + n];
@@ -1174,7 +1186,7 @@ pub trait IsStarkProver<
 
         // Compute deep(x_i) for each trace-size coset point
         #[cfg(feature = "parallel")]
-        let iter = (0..domain_size).into_par_iter().with_min_len(1024);
+        let iter = (0..domain_size).into_par_iter();
         #[cfg(not(feature = "parallel"))]
         let iter = 0..domain_size;
 
