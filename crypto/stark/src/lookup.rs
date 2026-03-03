@@ -1607,7 +1607,7 @@ where
 
         // Pre-compute bus element columns as raw u64
         let bus_element_cols =
-            precompute_bus_element_columns(table_interaction, &main_cols_raw, trace_len);
+            precompute_bus_element_columns(table_interaction, main_cols_raw, trace_len);
         let col_refs: Vec<&[u64]> = bus_element_cols.iter().map(|c| c.as_slice()).collect();
 
         // Extract alpha_powers as raw [u64; 3]
