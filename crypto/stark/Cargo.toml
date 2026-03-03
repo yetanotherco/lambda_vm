@@ -46,6 +46,7 @@ wasm-bindgen-test = "0.3.0"
 test_fiat_shamir = []
 instruments = []                                                     # This enables timing prints in prover and verifier
 debug-checks = []                                                    # Enables validate_trace + bus balance report in prover
+quaternary-merkle = []
 parallel = ["dep:rayon", "crypto/parallel"]
 wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "dep:web-sys"]
 

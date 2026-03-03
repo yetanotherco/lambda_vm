@@ -1,5 +1,5 @@
 use super::{
-    config::BatchedMerkleTreeBackend,
+    config::{BatchedMerkleTreeBackend, FriLayerVerifyBackend},
     domain::VerifierDomain,
     fri::fri_decommit::FriDecommitment,
     grinding,
@@ -584,7 +584,7 @@ pub trait IsStarkVerifier<
             vec![evaluation.clone(), evaluation_sym.clone()]
         };
 
-        auth_path_sym.verify::<BatchedMerkleTreeBackend<FieldExtension>>(
+        auth_path_sym.verify::<FriLayerVerifyBackend<FieldExtension>>(
             merkle_root,
             iota >> 1,
             &evaluations,
