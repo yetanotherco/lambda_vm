@@ -1233,6 +1233,48 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
+    // -------------------------------------------------------------------------
+    // SHIFT interaction (for SLL, SRL, SRA) — CPU-CA43
+    // -------------------------------------------------------------------------
+    // SHIFT[res::DWordWL; arg1::DWordHL, arg2[0], mp_selector, signed, word_instr]
+    // multiplicity = SHIFT
+    interactions.push(BusInteraction::sender(
+        BusId::Shift,
+        Multiplicity::Column(cols::SHIFT),
+        vec![
+            // res (result) as DWordBL (8 bytes → 2 elements, same as DWordWL)
+            BusValue::Packed {
+                start_column: cols::RES[0],
+                packing: Packing::DWordBL,
+            },
+            // arg1 (input) as DWordBL (8 bytes → 2 elements)
+            BusValue::Packed {
+                start_column: cols::ARG1[0],
+                packing: Packing::DWordBL,
+            },
+            // arg2[0] (shift amount byte)
+            BusValue::Packed {
+                start_column: cols::ARG2[0],
+                packing: Packing::Direct,
+            },
+            // mp_selector (direction: 0=left, 1=right)
+            BusValue::Packed {
+                start_column: cols::MP_SELECTOR,
+                packing: Packing::Direct,
+            },
+            // signed
+            BusValue::Packed {
+                start_column: cols::SIGNED,
+                packing: Packing::Direct,
+            },
+            // word_instr
+            BusValue::Packed {
+                start_column: cols::WORD_INSTR,
+                packing: Packing::Direct,
+            },
+        ],
+    ));
+
     // =========================================================================
     // MEMW and LOAD bus interactions (M1, M3, M5, M6, M7)
     // =========================================================================

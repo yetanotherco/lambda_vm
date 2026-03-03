@@ -1413,6 +1413,7 @@ fn test_verify_rejects_zero_table_counts() {
             load: 0,
             mul: 0,
             dvrm: 0,
+            shift: 0,
             branch: 0,
         },
         ..vm_proof
@@ -1478,6 +1479,7 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         load: 0,
         mul: 0,
         dvrm: 0,
+        shift: 0,
         branch: 0,
     };
     let airs = VmAirs::new(&elf, &proof_options, true, &[], &zero_counts);
