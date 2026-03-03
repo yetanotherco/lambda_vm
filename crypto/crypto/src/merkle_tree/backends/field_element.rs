@@ -9,12 +9,14 @@ use math::{
 };
 
 #[derive(Clone)]
-pub struct FieldElementBackend<F, D: Digest, const NUM_BYTES: usize> {
+pub struct FieldElementBackend<F, D: Digest, const NUM_BYTES: usize, const ARITY: usize = 4> {
     phantom1: PhantomData<F>,
     phantom2: PhantomData<D>,
 }
 
-impl<F, D: Digest, const NUM_BYTES: usize> Default for FieldElementBackend<F, D, NUM_BYTES> {
+impl<F, D: Digest, const NUM_BYTES: usize, const ARITY: usize> Default
+    for FieldElementBackend<F, D, NUM_BYTES, ARITY>
+{
     fn default() -> Self {
         Self {
             phantom1: PhantomData,
@@ -23,8 +25,8 @@ impl<F, D: Digest, const NUM_BYTES: usize> Default for FieldElementBackend<F, D,
     }
 }
 
-impl<F, D: Digest, const NUM_BYTES: usize> IsMerkleTreeBackend
-    for FieldElementBackend<F, D, NUM_BYTES>
+impl<F, D: Digest, const NUM_BYTES: usize, const ARITY: usize> IsMerkleTreeBackend
+    for FieldElementBackend<F, D, NUM_BYTES, ARITY>
 where
     F: IsField,
     FieldElement<F>: AsBytes + Sync + Send,
@@ -33,16 +35,19 @@ where
     type Node = [u8; NUM_BYTES];
     type Data = FieldElement<F>;
 
+    const ARITY: usize = ARITY;
+
     fn hash_data(input: &FieldElement<F>) -> [u8; NUM_BYTES] {
         let mut hasher = D::new();
         hasher.update(input.as_bytes());
         hasher.finalize().into()
     }
 
-    fn hash_new_parent(left: &[u8; NUM_BYTES], right: &[u8; NUM_BYTES]) -> [u8; NUM_BYTES] {
+    fn hash_new_parent(children: &[Self::Node]) -> [u8; NUM_BYTES] {
         let mut hasher = D::new();
-        hasher.update(left);
-        hasher.update(right);
+        for child in children {
+            hasher.update(child);
+        }
         hasher.finalize().into()
     }
 }
@@ -60,15 +65,14 @@ where
     type Node = FieldElement<P::F>;
     type Data = FieldElement<P::F>;
 
+    const ARITY: usize = 4;
+
     fn hash_data(input: &FieldElement<P::F>) -> FieldElement<P::F> {
         P::hash_single(input)
     }
 
-    fn hash_new_parent(
-        left: &FieldElement<P::F>,
-        right: &FieldElement<P::F>,
-    ) -> FieldElement<P::F> {
-        P::hash(left, right)
+    fn hash_new_parent(children: &[Self::Node]) -> FieldElement<P::F> {
+        P::hash_many(&children.to_vec())
     }
 }
 
@@ -137,15 +141,13 @@ mod tests {
         ));
     }
 
-    /// Tests batch proof with a real cryptographic hash (Keccak256).
-    /// This verifies that proof ordering works correctly with non-commutative hashes.
+    /// Tests batch proof with Keccak256 (non-commutative hash).
     #[test]
     fn batch_proof_with_keccak256_verifies_sparse_leaves() {
         let values: Vec<FE> = (1..=16).map(FE::from).collect();
         let merkle_tree =
             MerkleTree::<FieldElementBackend<F, Keccak256, 32>>::build(&values).unwrap();
 
-        // Test with sparse leaves across different subtrees
         let pos_list: Vec<usize> = vec![1, 8, 9, 15];
         let batch_proof = merkle_tree.get_batch_proof(&pos_list).unwrap();
         let leaves_to_verify: Vec<FE> = pos_list.iter().map(|&i| values[i]).collect();
@@ -161,14 +163,12 @@ mod tests {
         );
     }
 
-    /// Tests batch proof with adjacent leaves using real hash.
     #[test]
     fn batch_proof_with_keccak256_verifies_adjacent_leaves() {
         let values: Vec<FE> = (1..=8).map(FE::from).collect();
         let merkle_tree =
             MerkleTree::<FieldElementBackend<F, Keccak256, 32>>::build(&values).unwrap();
 
-        // Adjacent leaves (siblings)
         let pos_list: Vec<usize> = vec![0, 1];
         let batch_proof = merkle_tree.get_batch_proof(&pos_list).unwrap();
         let leaves_to_verify: Vec<FE> = pos_list.iter().map(|&i| values[i]).collect();
@@ -184,7 +184,6 @@ mod tests {
         );
     }
 
-    /// Tests that batch proof fails with wrong values using real hash.
     #[test]
     fn batch_proof_with_keccak256_fails_with_wrong_values() {
         let values: Vec<FE> = (1..=8).map(FE::from).collect();
@@ -194,7 +193,6 @@ mod tests {
         let pos_list: Vec<usize> = vec![0, 1];
         let batch_proof = merkle_tree.get_batch_proof(&pos_list).unwrap();
 
-        // Use wrong values
         let wrong_values: Vec<FE> = vec![FE::from(999), FE::from(998)];
 
         assert!(

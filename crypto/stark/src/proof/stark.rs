@@ -456,8 +456,10 @@ impl StoneCompatibleSerializer {
         let mut merkle_tree: HashMap<(usize, usize), Commitment> = HashMap::new();
         for (index_previous_layer, path) in leaf_indexes.iter().zip(authentication_paths.iter()) {
             let mut node_index = *index_previous_layer;
-            for (tree_level, node) in path.merkle_path.iter().enumerate() {
-                merkle_tree.insert((tree_level, node_index ^ 1), *node);
+            for (tree_level, siblings) in path.merkle_path.iter().enumerate() {
+                // Binary tree: exactly 1 sibling per level
+                debug_assert_eq!(siblings.len(), 1);
+                merkle_tree.insert((tree_level, node_index ^ 1), siblings[0]);
                 node_index >>= 1;
             }
         }

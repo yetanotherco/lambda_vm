@@ -2857,7 +2857,7 @@ mod tests {
             proof.deep_poly_openings[0]
                 .main_trace_polys
                 .proof
-                .merkle_path[1]
+                .merkle_path[1][0]
                 .to_vec(),
             decode_hex("91b0c0b24b9d00067b0efab50832b76cf97192091624d42b86740666c5d369e6").unwrap()
         );
@@ -2867,7 +2867,7 @@ mod tests {
             proof.deep_poly_openings[0]
                 .main_trace_polys
                 .proof
-                .merkle_path[2]
+                .merkle_path[2][0]
                 .to_vec(),
             decode_hex("993b044db22444c0c0ebf1095b9a51faeb001c9b4dea36abe905f7162620dbbd").unwrap()
         );
@@ -2877,7 +2877,7 @@ mod tests {
             proof.deep_poly_openings[0]
                 .main_trace_polys
                 .proof
-                .merkle_path[3]
+                .merkle_path[3][0]
                 .to_vec(),
             decode_hex("5017abeca33fa82576b5c5c2c61792693b48c9d4414a407eef66b6029dae07ea").unwrap()
         );
@@ -2912,7 +2912,7 @@ mod tests {
             proof.deep_poly_openings[0]
                 .composition_poly
                 .proof
-                .merkle_path[0]
+                .merkle_path[0][0]
                 .to_vec(),
             decode_hex("403b75a122eaf90a298e5d3db2cc7ca096db478078122379a6e3616e72da7546").unwrap()
         );
@@ -2922,7 +2922,7 @@ mod tests {
             proof.deep_poly_openings[0]
                 .composition_poly
                 .proof
-                .merkle_path[1]
+                .merkle_path[1][0]
                 .to_vec(),
             decode_hex("07950888c0355c204a1e83ecbee77a0a6a89f93d41cc2be6b39ddd1e727cc965").unwrap()
         );
@@ -2932,7 +2932,7 @@ mod tests {
             proof.deep_poly_openings[0]
                 .composition_poly
                 .proof
-                .merkle_path[2]
+                .merkle_path[2][0]
                 .to_vec(),
             decode_hex("58befe2c5de74cc5a002aa82ea219c5b242e761b45fd266eb95521e9f53f44eb").unwrap()
         );
@@ -2970,13 +2970,13 @@ mod tests {
 
         // FRI layer 1 auth path level 0
         assert_eq!(
-            proof.query_list[0].layers_auth_paths[0].merkle_path[0].to_vec(),
+            proof.query_list[0].layers_auth_paths[0].merkle_path[0][0].to_vec(),
             decode_hex("0683622478e9e93cc2d18754872f043619f030b494d7ec8e003b1cbafe83b67b").unwrap()
         );
 
         // FRI layer 1 auth path level 1
         assert_eq!(
-            proof.query_list[0].layers_auth_paths[0].merkle_path[1].to_vec(),
+            proof.query_list[0].layers_auth_paths[0].merkle_path[1][0].to_vec(),
             decode_hex("7985d945abe659a7502698051ec739508ed6bab594984c7f25e095a0a57a2e55").unwrap()
         );
     }
@@ -3076,7 +3076,7 @@ mod tests {
 
         // FRI layer 7 auth path level 5
         assert_eq!(
-            proof.query_list[0].layers_auth_paths[7].merkle_path[5].to_vec(),
+            proof.query_list[0].layers_auth_paths[7].merkle_path[5][0].to_vec(),
             decode_hex("f12f159b548ca2c571a270870d43e7ec2ead78b3e93b635738c31eb9bcda3dda").unwrap()
         );
     }

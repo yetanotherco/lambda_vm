@@ -47,6 +47,7 @@ test_fiat_shamir = []
 instruments = []                                                     # This enables timing prints in prover and verifier
 debug-checks = []                                                    # Enables validate_trace + bus balance report in prover
 parallel = ["dep:rayon", "crypto/parallel"]
+quaternary-merkle = []                                               # Use 4-ary Merkle trees instead of binary
 wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "dep:web-sys"]
 
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dev-dependencies]

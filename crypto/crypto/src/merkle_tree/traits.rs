@@ -5,9 +5,16 @@ use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 /// A backend for Merkle trees. This defines raw `Data` from which the Merkle
 /// tree is built from. It also defines the `Node` type and the hash function
 /// used to build parent nodes from children nodes.
+///
+/// The `ARITY` const determines how many children each internal node has:
+/// - `ARITY = 2`: Binary tree (1 sibling per proof level, `hash_new_parent`)
+/// - `ARITY = 4`: Quaternary tree (3 siblings per proof level, `hash_new_parent_4`)
 pub trait IsMerkleTreeBackend {
     type Node: PartialEq + Eq + Clone + Sync + Send;
     type Data: Sync + Send;
+
+    /// Tree arity: 2 for binary, 4 for quaternary.
+    const ARITY: usize;
 
     /// This function takes a single variable `Data` and converts it to a node.
     fn hash_data(leaf: &Self::Data) -> Self::Node;
@@ -23,7 +30,6 @@ pub trait IsMerkleTreeBackend {
         iter.map(|leaf| Self::hash_data(leaf)).collect()
     }
 
-    /// This function takes to children nodes and builds a new parent node.
-    /// It will be used in the construction of the Merkle tree.
-    fn hash_new_parent(child_1: &Self::Node, child_2: &Self::Node) -> Self::Node;
+    /// Hash child nodes into a parent. The slice length equals `ARITY`.
+    fn hash_new_parent(children: &[Self::Node]) -> Self::Node;
 }

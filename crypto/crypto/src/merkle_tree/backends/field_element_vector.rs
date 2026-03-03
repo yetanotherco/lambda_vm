@@ -10,15 +10,15 @@ use math::{
 };
 
 /// A backend for Merkle trees that uses fixed-size pairs of field elements.
-/// This is more efficient than `FieldElementVectorBackend` when the batch size is always 2,
-/// as it avoids Vec allocation overhead.
 #[derive(Clone)]
-pub struct FieldElementPairBackend<F, D: Digest, const NUM_BYTES: usize> {
+pub struct FieldElementPairBackend<F, D: Digest, const NUM_BYTES: usize, const ARITY: usize = 4> {
     phantom1: PhantomData<F>,
     phantom2: PhantomData<D>,
 }
 
-impl<F, D: Digest, const NUM_BYTES: usize> Default for FieldElementPairBackend<F, D, NUM_BYTES> {
+impl<F, D: Digest, const NUM_BYTES: usize, const ARITY: usize> Default
+    for FieldElementPairBackend<F, D, NUM_BYTES, ARITY>
+{
     fn default() -> Self {
         Self {
             phantom1: PhantomData,
@@ -27,8 +27,8 @@ impl<F, D: Digest, const NUM_BYTES: usize> Default for FieldElementPairBackend<F
     }
 }
 
-impl<F, D: Digest, const NUM_BYTES: usize> IsMerkleTreeBackend
-    for FieldElementPairBackend<F, D, NUM_BYTES>
+impl<F, D: Digest, const NUM_BYTES: usize, const ARITY: usize> IsMerkleTreeBackend
+    for FieldElementPairBackend<F, D, NUM_BYTES, ARITY>
 where
     F: IsField,
     FieldElement<F>: AsBytes,
@@ -36,6 +36,8 @@ where
 {
     type Node = [u8; NUM_BYTES];
     type Data = [FieldElement<F>; 2];
+
+    const ARITY: usize = ARITY;
 
     fn hash_data(input: &[FieldElement<F>; 2]) -> [u8; NUM_BYTES] {
         let mut hasher = D::new();
@@ -46,10 +48,11 @@ where
         result_hash
     }
 
-    fn hash_new_parent(left: &[u8; NUM_BYTES], right: &[u8; NUM_BYTES]) -> [u8; NUM_BYTES] {
+    fn hash_new_parent(children: &[Self::Node]) -> [u8; NUM_BYTES] {
         let mut hasher = D::new();
-        hasher.update(left);
-        hasher.update(right);
+        for child in children {
+            hasher.update(child);
+        }
         let mut result_hash = [0_u8; NUM_BYTES];
         result_hash.copy_from_slice(&hasher.finalize());
         result_hash
@@ -57,12 +60,15 @@ where
 }
 
 #[derive(Clone)]
-pub struct FieldElementVectorBackend<F, D: Digest, const NUM_BYTES: usize> {
+pub struct FieldElementVectorBackend<F, D: Digest, const NUM_BYTES: usize, const ARITY: usize = 4>
+{
     phantom1: PhantomData<F>,
     phantom2: PhantomData<D>,
 }
 
-impl<F, D: Digest, const NUM_BYTES: usize> Default for FieldElementVectorBackend<F, D, NUM_BYTES> {
+impl<F, D: Digest, const NUM_BYTES: usize, const ARITY: usize> Default
+    for FieldElementVectorBackend<F, D, NUM_BYTES, ARITY>
+{
     fn default() -> Self {
         Self {
             phantom1: PhantomData,
@@ -71,8 +77,8 @@ impl<F, D: Digest, const NUM_BYTES: usize> Default for FieldElementVectorBackend
     }
 }
 
-impl<F, D: Digest, const NUM_BYTES: usize> IsMerkleTreeBackend
-    for FieldElementVectorBackend<F, D, NUM_BYTES>
+impl<F, D: Digest, const NUM_BYTES: usize, const ARITY: usize> IsMerkleTreeBackend
+    for FieldElementVectorBackend<F, D, NUM_BYTES, ARITY>
 where
     F: IsField,
     FieldElement<F>: AsBytes,
@@ -81,6 +87,8 @@ where
 {
     type Node = [u8; NUM_BYTES];
     type Data = Vec<FieldElement<F>>;
+
+    const ARITY: usize = ARITY;
 
     fn hash_data(input: &Vec<FieldElement<F>>) -> [u8; NUM_BYTES] {
         let mut hasher = D::new();
@@ -92,10 +100,11 @@ where
         result_hash
     }
 
-    fn hash_new_parent(left: &[u8; NUM_BYTES], right: &[u8; NUM_BYTES]) -> [u8; NUM_BYTES] {
+    fn hash_new_parent(children: &[Self::Node]) -> [u8; NUM_BYTES] {
         let mut hasher = D::new();
-        hasher.update(left);
-        hasher.update(right);
+        for child in children {
+            hasher.update(child);
+        }
         let mut result_hash = [0_u8; NUM_BYTES];
         result_hash.copy_from_slice(&hasher.finalize());
         result_hash
@@ -116,15 +125,14 @@ where
     type Node = FieldElement<P::F>;
     type Data = Vec<FieldElement<P::F>>;
 
+    const ARITY: usize = 4;
+
     fn hash_data(input: &Vec<FieldElement<P::F>>) -> FieldElement<P::F> {
         P::hash_many(input)
     }
 
-    fn hash_new_parent(
-        left: &FieldElement<P::F>,
-        right: &FieldElement<P::F>,
-    ) -> FieldElement<P::F> {
-        P::hash(left, right)
+    fn hash_new_parent(children: &[Self::Node]) -> FieldElement<P::F> {
+        P::hash_many(&children.to_vec())
     }
 }
 

@@ -2,7 +2,14 @@ use core::fmt::Display;
 
 use crate::merkle_tree::proof::BatchProof;
 
-use super::{proof::Proof, traits::IsMerkleTreeBackend, utils::*};
+use super::{
+    proof::Proof,
+    traits::IsMerkleTreeBackend,
+    utils::{
+        build, complete_until_power_of_arity, internal_node_count, num_leaves_from_total,
+        parent_index, sibling_indices,
+    },
+};
 use alloc::{collections::BTreeSet, vec::Vec};
 
 #[derive(Debug)]
@@ -22,15 +29,24 @@ impl Display for Error {
 #[cfg(feature = "std")]
 impl std::error::Error for Error {}
 
-/// The struct for the Merkle tree, consisting of the root and the nodes.
-/// A typical tree would look like this
-///                 root
-///              /        \
-///          leaf 12     leaf 34
-///        /         \    /      \
-///    leaf 1     leaf 2 leaf 3  leaf 4
-/// The bottom leafs correspond to the hashes of the elements, while each upper
-/// layer contains the hash of the concatenation of the daughter nodes.
+/// A Merkle tree whose arity is determined by the backend's `ARITY` const.
+///
+/// For `ARITY = 2` (binary):
+///           root
+///          /    \
+///        n1      n2
+///       / \     / \
+///     l1  l2  l3  l4
+///
+/// For `ARITY = 4` (quaternary):
+///                root
+///        /     |     |     \
+///     n1      n2      n3      n4
+///   / | | \ / | | \  ...
+/// l1 l2 l3 l4 ...
+///
+/// Flat array layout: [root, level-1 nodes..., ..., leaves]
+/// Internal nodes = (leaves - 1) / (arity - 1)
 #[derive(Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MerkleTree<B: IsMerkleTreeBackend> {
@@ -55,24 +71,19 @@ where
     }
 
     /// Create a Merkle tree from pre-hashed leaf nodes.
-    ///
-    /// This skips the `hash_leaves` step, useful when leaves have already been
-    /// hashed externally (e.g., to avoid materializing large intermediate data).
     pub fn build_from_hashed_leaves(hashed_leaves: Vec<B::Node>) -> Option<Self> {
         if hashed_leaves.is_empty() {
             return None;
         }
 
-        //The leaf must be a power of 2 set
-        let hashed_leaves = complete_until_power_of_two(hashed_leaves);
+        let arity = B::ARITY;
+        let hashed_leaves = complete_until_power_of_arity(hashed_leaves, arity);
         let leaves_len = hashed_leaves.len();
+        let internal_nodes = internal_node_count(leaves_len, arity);
 
-        //The length of leaves minus one inner node in the merkle tree
-        //The first elements are overwritten by build function, it doesn't matter what it's there
-        let mut nodes = vec![hashed_leaves[0].clone(); leaves_len - 1];
+        let mut nodes = vec![hashed_leaves[0].clone(); internal_nodes];
         nodes.extend(hashed_leaves);
 
-        //Build the inner nodes of the tree
         build::<B>(&mut nodes, leaves_len);
 
         Some(MerkleTree {
@@ -81,85 +92,61 @@ where
         })
     }
 
-    /// Returns a Merkle proof for the element/s at position pos
-    /// For example, give me an inclusion proof for the 3rd element in the
-    /// Merkle tree
+    /// Returns the number of leaves in this tree.
+    fn num_leaves(&self) -> usize {
+        num_leaves_from_total(self.nodes.len(), B::ARITY)
+    }
+
+    /// Returns a Merkle proof for the element at position pos
     pub fn get_proof_by_pos(&self, pos: usize) -> Option<Proof<B::Node>> {
-        let pos = pos + self.nodes.len() / 2;
+        let num_leaves = self.num_leaves();
+        let internal_nodes = self.nodes.len() - num_leaves;
+        let pos = pos + internal_nodes;
         let Ok(merkle_path) = self.build_merkle_path(pos) else {
             return None;
         };
 
-        self.create_proof(merkle_path)
-    }
-
-    /// Creates a proof from a Merkle pasth
-    fn create_proof(&self, merkle_path: Vec<B::Node>) -> Option<Proof<B::Node>> {
         Some(Proof { merkle_path })
     }
 
-    /// Returns the Merkle path for the element/s for the leaf at position pos
-    fn build_merkle_path(&self, pos: usize) -> Result<Vec<B::Node>, Error> {
-        // Pre-allocate based on tree depth (log2 of tree size)
-        let tree_depth = (self.nodes.len() + 1).ilog2() as usize;
+    /// Returns the Merkle path for the leaf at position pos.
+    /// Each element in the path is a Vec of `arity - 1` sibling nodes at that level.
+    fn build_merkle_path(&self, pos: usize) -> Result<Vec<Vec<B::Node>>, Error> {
+        let arity = B::ARITY;
+        let num_leaves = self.num_leaves();
+        let tree_depth = compute_depth(num_leaves, arity);
         let mut merkle_path = Vec::with_capacity(tree_depth);
         let mut pos = pos;
 
         while pos != ROOT {
-            let Some(node) = self.nodes.get(sibling_index(pos)) else {
-                // out of bounds, exit returning the current merkle_path
+            let siblings = sibling_indices(pos, arity);
+            if siblings.iter().any(|&s| s >= self.nodes.len()) {
                 return Err(Error::OutOfBounds);
-            };
-            merkle_path.push(node.clone());
-
-            pos = parent_index(pos);
+            }
+            merkle_path.push(siblings.iter().map(|&s| self.nodes[s].clone()).collect());
+            pos = parent_index(pos, arity);
         }
 
         Ok(merkle_path)
     }
 
-    /// Given a list of indices, returns a batch proof containing the nodes needed to verify that all the leaves
-    /// in those indices belong to the tree.
-    /// It optimizes the number of nodes in the proof since the verifier can create some of them using
-    /// the leaves and the parent nodes known by hashing.
-    ///
-    /// # Proof Structure
-    /// The proof contains the nodes in **descending order by tree index**, that is, from bottom to
-    /// top and from right to left:
-    /// - Higher indices (closer to leaves) come first.
-    /// - Lower indices (closer to root) come last.
-    /// - Within the same level, nodes are ordered from right to left (higher index first).
-    ///
-    /// This ordering matches the verification consumption order, which processes
-    /// level-by-level from leaves to root.
-    ///
-    /// # Errors
-    /// - `Error::EmptyPositionList` if `pos_list` is empty
-    /// - `Error::OutOfBounds` if any position in `pos_list` is >= number of leaves
+    /// Given a list of leaf indices, returns a batch proof.
     pub fn get_batch_proof(&self, pos_list: &[usize]) -> Result<BatchProof<B::Node>, Error> {
         if pos_list.is_empty() {
             return Err(Error::EmptyPositionList);
         }
 
-        let num_leaves = (self.nodes.len() + 1).div_ceil(2);
-
-        // Validate all positions are within bounds
+        let num_leaves = self.num_leaves();
         for &pos in pos_list {
             if pos >= num_leaves {
                 return Err(Error::OutOfBounds);
             }
         }
 
-        // Since the nodes in the merkle tree are indexed from the root to the leaves, we redefine the indices
-        // of the leaves.
-        let leaf_positions = pos_list
-            .iter()
-            .map(|pos| pos + self.nodes.len() / 2)
-            .collect::<Vec<usize>>();
-        // We get the positions of the nodes for the batch proof.
+        let internal_nodes = self.nodes.len() - num_leaves;
+        let leaf_positions: Vec<usize> = pos_list.iter().map(|pos| pos + internal_nodes).collect();
         let batch_auth_path_positions = self.get_batch_auth_path_positions(&leaf_positions);
 
-        // We get the nodes for the batch proof.
         let batch_auth_path_nodes = batch_auth_path_positions
             .iter()
             .map(|pos| self.nodes[*pos].clone())
@@ -170,51 +157,50 @@ where
         })
     }
 
-    /// Returns the internal tree indices of nodes needed in the batch proof of the given
-    /// leaf positions.
-    ///
-    /// # Result Order:
-    /// The resulting indices are in descending order, that is, from bottom to
-    /// top and from right to left:
-    /// - Higher indices (closer to leaves) come first.
-    /// - Lower indices (closer to root) come last.
-    /// - Within the same level, nodes are ordered from right to left (higher index first).
-    ///
-    /// This ordering is critical because the verifier consumes proof nodes level-by-level
-    /// starting from leaves, so it needs leaf-level siblings first.
+    /// Returns the internal tree indices of nodes needed in the batch proof.
+    /// Ordered level by level from bottom to top, ascending within each level.
     fn get_batch_auth_path_positions(&self, leaf_positions: &[usize]) -> Vec<usize> {
-        // BTreeSet always maintains elements in ascending order (smaller indices first), regardless of insertion order.
-        let mut auth_path_set = BTreeSet::<usize>::new();
+        let arity = B::ARITY;
         let mut obtainable: BTreeSet<usize> = leaf_positions.iter().cloned().collect();
+        let num_leaves = self.num_leaves();
+        let num_levels = compute_depth(num_leaves, arity);
 
-        // Number of levels in tree
-        let num_levels = (self.nodes.len() + 1).ilog2();
+        let mut result = Vec::new();
 
-        // Iter lefevel-by-level from leaves to root.
-        for _ in 0..num_levels - 1 {
+        for _ in 0..num_levels {
+            let mut level_auth = Vec::new();
             let mut next_obtainable = BTreeSet::new();
 
             for &pos in &obtainable {
-                // Check sibling (None only for root, which shouldn't appear here)
-                if let Some(sibling_pos) = get_sibling_pos(pos) {
-                    // If sibling not obtainable, include it in the proof
-                    let sibling_is_obtainable =
-                        obtainable.contains(&sibling_pos) || auth_path_set.contains(&sibling_pos);
-
-                    if !sibling_is_obtainable {
-                        auth_path_set.insert(sibling_pos);
+                let siblings = sibling_indices(pos, arity);
+                for sibling_pos in siblings {
+                    if !obtainable.contains(&sibling_pos) && !level_auth.contains(&sibling_pos) {
+                        level_auth.push(sibling_pos);
                     }
                 }
-
-                // Parent becomes obtainable (computable from both children)
-                next_obtainable.insert(get_parent_pos(pos));
+                next_obtainable.insert(parent_index(pos, arity));
             }
+
+            level_auth.sort_unstable();
+            result.extend(level_auth);
 
             obtainable = next_obtainable;
         }
 
-        // Reverse to get descending order (larger indices first).
-        // This makes the proof ordered from bottom (nodes closer to leaves) to top (nodes loser to root).
-        auth_path_set.into_iter().rev().collect()
+        result
     }
+}
+
+/// Compute tree depth = log_arity(num_leaves)
+fn compute_depth(num_leaves: usize, arity: usize) -> usize {
+    if num_leaves <= 1 {
+        return 0;
+    }
+    let mut depth = 0;
+    let mut n = num_leaves;
+    while n > 1 {
+        n /= arity;
+        depth += 1;
+    }
+    depth
 }

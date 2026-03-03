@@ -2,7 +2,6 @@ use alloc::vec::Vec;
 use math::field::{element::FieldElement, fields::u64_prime_field::U64PrimeField};
 
 use crate::merkle_tree::merkle::MerkleTree;
-use crate::merkle_tree::proof::BatchProof;
 use crate::tests::merkle_tests::TestBackend;
 
 /// Small field useful for starks, sometimes called min i goldilocks
@@ -16,12 +15,11 @@ type U64PF = U64PrimeField<MODULUS>;
 type FE = FieldElement<U64PF>;
 
 #[test]
-// expected | 8 | 7 | 1 | 6 | 1 | 7 | 7 | 2 | 4 | 6 | 8 | 10 | 10 | 10 | 10 |
 fn create_a_proof_over_value_that_belongs_to_a_given_merkle_tree_when_given_the_leaf_position() {
+    // 5 values get padded to 16 leaves in a 4-ary tree
     let values: Vec<FE> = (1..6).map(FE::new).collect();
     let merkle_tree = MerkleTree::<TestBackend<U64PF>>::build(&values).unwrap();
-    let proof = &merkle_tree.get_proof_by_pos(1).unwrap();
-    assert_merkle_path(&proof.merkle_path, &[FE::new(2), FE::new(1), FE::new(1)]);
+    let proof = merkle_tree.get_proof_by_pos(1).unwrap();
     assert!(proof.verify::<TestBackend<U64PF>>(&merkle_tree.root, 1, &FE::new(2)));
 }
 
@@ -33,35 +31,62 @@ fn create_a_merkle_tree_with_10000_elements_and_verify_that_an_element_is_part_o
     assert!(proof.verify::<TestBackend<Ecgfp5>>(&merkle_tree.root, 9349, &Ecgfp5FE::new(9350)));
 }
 
-fn assert_merkle_path(values: &[FE], expected_values: &[FE]) {
-    for (node, expected_node) in values.iter().zip(expected_values) {
-        assert_eq!(node, expected_node);
-    }
-}
-
 #[test]
 fn verify_merkle_proof_for_single_value() {
-    const MODULUS: u64 = 13;
-    type U64PF = U64PrimeField<MODULUS>;
-    type FE = FieldElement<U64PF>;
-
-    let values: Vec<FE> = vec![FE::new(1)]; // Single element
+    let values: Vec<FE> = vec![FE::new(1)];
     let merkle_tree = MerkleTree::<TestBackend<U64PF>>::build(&values).unwrap();
 
-    // Update the expected root value based on the actual logic of TestBackend
-    // For example, in this case hashing a single `1` results in `2`
-    let expected_root = FE::new(2); // Assuming hashing a `1`s results in `2`
+    // hash_data(1) = 2, single leaf (1 is a power of 4), root = 2
+    let expected_root = FE::new(2);
     assert_eq!(
         merkle_tree.root, expected_root,
         "The root of the Merkle tree does not match the expected value."
     );
 
-    // Verify the proof for the single element
     let proof = merkle_tree.get_proof_by_pos(0).unwrap();
     assert!(
         proof.verify::<TestBackend<U64PF>>(&merkle_tree.root, 0, &values[0]),
         "The proof verification failed for the element at position 0."
     );
+}
+
+#[test]
+fn verify_merkle_proof_for_four_values() {
+    // 4 values = power of 4, no padding needed
+    let values: Vec<FE> = (1..5).map(FE::new).collect();
+    let merkle_tree = MerkleTree::<TestBackend<U64PF>>::build(&values).unwrap();
+
+    // hash_data: [2, 4, 6, 8], root = 2+4+6+8 = 20 mod 13 = 7
+    assert_eq!(merkle_tree.root, FE::new(7));
+
+    // Verify each position
+    for i in 0..4 {
+        let proof = merkle_tree.get_proof_by_pos(i).unwrap();
+        assert!(
+            proof.verify::<TestBackend<U64PF>>(&merkle_tree.root, i, &values[i]),
+            "Proof verification failed for position {i}."
+        );
+    }
+}
+
+#[test]
+fn verify_proof_fails_with_wrong_root() {
+    let values: Vec<FE> = (1..5).map(FE::new).collect();
+    let merkle_tree = MerkleTree::<TestBackend<U64PF>>::build(&values).unwrap();
+
+    let proof = merkle_tree.get_proof_by_pos(0).unwrap();
+    let wrong_root = FE::new(999);
+    assert!(!proof.verify::<TestBackend<U64PF>>(&wrong_root, 0, &values[0]));
+}
+
+#[test]
+fn verify_proof_fails_with_wrong_value() {
+    let values: Vec<FE> = (1..5).map(FE::new).collect();
+    let merkle_tree = MerkleTree::<TestBackend<U64PF>>::build(&values).unwrap();
+
+    let proof = merkle_tree.get_proof_by_pos(0).unwrap();
+    let wrong_value = FE::new(999);
+    assert!(!proof.verify::<TestBackend<U64PF>>(&merkle_tree.root, 0, &wrong_value));
 }
 
 #[test]
@@ -73,11 +98,12 @@ fn batch_proof_verify_adjacent_leaves() {
     let values: Vec<FE> = (1..=8).map(FE::new).collect();
     let merkle_tree = MerkleTree::<TestBackend<U64PF>>::build(&values).unwrap();
 
-    // Prove adjacent leaves (0 and 1 are siblings)
+    // Prove adjacent leaves (0 and 1 share the same parent in 4-ary)
     let pos_list = vec![0, 1];
     let batch_proof = merkle_tree.get_batch_proof(&pos_list).unwrap();
     let leaves_to_verify: Vec<FE> = pos_list.iter().map(|&i| values[i]).collect();
 
+    // num_leaves=8, verify internally pads to 16
     assert!(batch_proof.verify::<TestBackend<U64PF>>(
         &merkle_tree.root,
         &pos_list,
@@ -308,23 +334,10 @@ fn batch_proof_verify_sparse_leaves_across_tree() {
 
     let values: Vec<FE> = (1..=16).map(FE::new).collect();
     let merkle_tree = MerkleTree::<TestBackend<U64PF>>::build(&values).unwrap();
-    let batch_proof = merkle_tree.get_batch_proof(&[1, 8, 9, 15]).unwrap();
-
-    // Verify the proof structure is as expected
-    let expected_batch_proof = BatchProof {
-        path: vec![
-            FE::new(30), // index 29 - leaf level sibling
-            FE::new(2),  // index 15 - leaf level sibling
-            FE::new(54), // index 13 - internal node
-            FE::new(46), // index 12 - internal node
-            FE::new(14), // index 8  - internal node
-            FE::new(52), // index 4  - internal node (closest to root)
-        ],
-    };
-    assert_eq!(batch_proof.path, expected_batch_proof.path);
+    let pos_list = &[1, 8, 9, 15];
+    let batch_proof = merkle_tree.get_batch_proof(pos_list).unwrap();
 
     // Verify the proof validates correctly
-    let pos_list = &[1, 8, 9, 15];
     let leaves_to_verify: Vec<FE> = pos_list.iter().map(|&i| values[i]).collect();
     assert!(batch_proof.verify::<TestBackend<U64PF>>(
         &merkle_tree.root,

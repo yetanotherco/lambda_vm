@@ -5,7 +5,7 @@ edition = "2024"
 
 [features]
 default = ["parallel"]
-parallel = ["stark/parallel", "math/parallel", "crypto/parallel", "dep:rayon"]
+parallel = ["stark/parallel", "stark/quaternary-merkle", "math/parallel", "crypto/parallel", "dep:rayon"]
 debug-checks = ["stark/debug-checks"]
 
 [dependencies]
