@@ -820,9 +820,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ShiftConstra
 pub const NUM_SHIFT_CONSTRAINTS: usize = 16;
 
 /// Creates all polynomial constraints for the SHIFT table.
-pub fn shift_constraints(
-    constraint_idx_start: usize,
-) -> (Vec<ShiftConstraint>, usize) {
+pub fn shift_constraints(constraint_idx_start: usize) -> (Vec<ShiftConstraint>, usize) {
     let mut idx = constraint_idx_start;
     let mut constraints = Vec::with_capacity(NUM_SHIFT_CONSTRAINTS);
 
@@ -885,7 +883,11 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
         if op.signed {
             let x = (op.in_halves[3] & 0xFF) as u8;
             let y = (op.in_halves[3] >> 8) as u8;
-            bitwise_ops.push(BitwiseOperation::halfword(BitwiseOperationType::Msb16, x, y));
+            bitwise_ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::Msb16,
+                x,
+                y,
+            ));
         }
 
         // C3: AND_BYTE[shift, 15] | left (= μ - direction = 1 - direction)

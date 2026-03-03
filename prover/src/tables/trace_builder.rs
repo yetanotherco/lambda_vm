@@ -1412,8 +1412,7 @@ impl Traces {
         let memws = chunk_and_generate(&memw_ops, max_rows.memw, memw::generate_memw_trace);
         let loads = chunk_and_generate(&load_ops, max_rows.load, load::generate_load_trace);
         let lts = chunk_and_generate(&lt_ops, max_rows.lt, lt::generate_lt_trace);
-        let shifts =
-            chunk_and_generate(&shift_ops, max_rows.shift, shift::generate_shift_trace);
+        let shifts = chunk_and_generate(&shift_ops, max_rows.shift, shift::generate_shift_trace);
         let muls = chunk_and_generate(&mul_ops, max_rows.mul, mul::generate_mul_trace);
         let dvrms = chunk_and_generate(&dvrm_ops, max_rows.dvrm, dvrm::generate_dvrm_trace);
         let branches =
@@ -1579,8 +1578,7 @@ impl Traces {
         let memws = chunk_and_generate(&memw_ops, max_rows.memw, memw::generate_memw_trace);
         let loads = chunk_and_generate(&load_ops, max_rows.load, load::generate_load_trace);
         let lts = chunk_and_generate(&lt_ops, max_rows.lt, lt::generate_lt_trace);
-        let shifts =
-            chunk_and_generate(&shift_ops, max_rows.shift, shift::generate_shift_trace);
+        let shifts = chunk_and_generate(&shift_ops, max_rows.shift, shift::generate_shift_trace);
         let muls = chunk_and_generate(&mul_ops, max_rows.mul, mul::generate_mul_trace);
         let dvrms = chunk_and_generate(&dvrm_ops, max_rows.dvrm, dvrm::generate_dvrm_trace);
         let branches =
