@@ -306,7 +306,7 @@ pub trait IsStarkProver<
         let num_cols = columns.len();
 
         #[cfg(feature = "parallel")]
-        let iter = (0..num_rows).into_par_iter();
+        let iter = (0..num_rows).into_par_iter().with_min_len(1024);
         #[cfg(not(feature = "parallel"))]
         let iter = 0..num_rows;
 
@@ -733,6 +733,7 @@ pub trait IsStarkProver<
             {
                 let (h0, h1): (Vec<_>, Vec<_>) = (0..n)
                     .into_par_iter()
+                    .with_min_len(1024)
                     .map(|i| {
                         let sum = &constraint_evaluations[i] + &constraint_evaluations[i + n];
                         let diff = &constraint_evaluations[i] - &constraint_evaluations[i + n];
@@ -1172,7 +1173,7 @@ pub trait IsStarkProver<
 
         // Compute deep(x_i) for each trace-size coset point
         #[cfg(feature = "parallel")]
-        let iter = (0..domain_size).into_par_iter();
+        let iter = (0..domain_size).into_par_iter().with_min_len(1024);
         #[cfg(not(feature = "parallel"))]
         let iter = 0..domain_size;
 
