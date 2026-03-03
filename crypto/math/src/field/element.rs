@@ -56,19 +56,33 @@ impl<F: IsField> FieldElement<F> {
         if numbers.is_empty() {
             return Ok(());
         }
+
+        // Cache-tiled Montgomery's trick: process in blocks that fit L2 cache.
+        // 32K elements × 2 arrays (numbers + prod_prefix) × 24 bytes ≈ 1.5 MB.
+        const BLOCK_SIZE: usize = 32 * 1024;
+
         let count = numbers.len();
-        let mut prod_prefix = alloc::vec::Vec::with_capacity(count);
-        prod_prefix.push(numbers[0].clone());
-        for i in 1..count {
-            prod_prefix.push(&prod_prefix[i - 1] * &numbers[i]);
+        let mut prod_prefix = alloc::vec::Vec::with_capacity(count.min(BLOCK_SIZE));
+
+        for block_start in (0..count).step_by(BLOCK_SIZE) {
+            let block_end = (block_start + BLOCK_SIZE).min(count);
+            let block = &mut numbers[block_start..block_end];
+            let block_len = block.len();
+
+            prod_prefix.clear();
+            prod_prefix.push(block[0].clone());
+            for i in 1..block_len {
+                prod_prefix.push(&prod_prefix[i - 1] * &block[i]);
+            }
+
+            let mut bi_inv = prod_prefix[block_len - 1].inv()?;
+            for i in (1..block_len).rev() {
+                let ai_inv = &bi_inv * &prod_prefix[i - 1];
+                bi_inv = &bi_inv * &block[i];
+                block[i] = ai_inv;
+            }
+            block[0] = bi_inv;
         }
-        let mut bi_inv = prod_prefix[count - 1].inv()?;
-        for i in (1..count).rev() {
-            let ai_inv = &bi_inv * &prod_prefix[i - 1];
-            bi_inv = &bi_inv * &numbers[i];
-            numbers[i] = ai_inv;
-        }
-        numbers[0] = bi_inv;
         Ok(())
     }
 

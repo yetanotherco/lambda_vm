@@ -18,8 +18,6 @@ use math::field::{
     element::FieldElement,
     traits::{IsFFTField, IsField, IsPrimeField, IsSubFieldOf},
 };
-#[cfg(feature = "parallel")]
-use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 
 // =============================================================================
 // Shift Constants for Type Combining
@@ -857,19 +855,12 @@ where
         let trace_len = trace.num_rows();
         let table_name = self.name.as_deref().unwrap_or("UNKNOWN");
 
-        // Compute term columns in parallel — even with 1-3 interactions per table,
-        // each column computation is heavy enough to benefit from parallelism on
-        // high-core-count machines. Internal parallelism within each column is also used.
-        #[cfg(feature = "parallel")]
-        let interactions_iter = self
+        // Sequential over interactions (1-3 per table): outer par_iter over ~12 tables
+        // in prover.rs already saturates cores; inner rayon here just adds contention.
+        let term_columns: Vec<Vec<FieldElement<E>>> = self
             .auxiliary_trace_build_data
             .interactions
-            .as_slice()
-            .into_par_iter();
-        #[cfg(not(feature = "parallel"))]
-        let interactions_iter = self.auxiliary_trace_build_data.interactions.iter();
-
-        let term_columns: Vec<Vec<FieldElement<E>>> = interactions_iter
+            .iter()
             .map(|interaction| {
                 compute_logup_term_column(
                     interaction,
