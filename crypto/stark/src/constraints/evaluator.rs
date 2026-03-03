@@ -2,8 +2,7 @@ use super::boundary::BoundaryConstraints;
 #[cfg(all(debug_assertions, not(feature = "parallel")))]
 use crate::debug::check_boundary_polys_divisibility;
 use crate::domain::Domain;
-use crate::lookup::BusPublicInputs;
-use crate::lookup::{LOGUP_CHALLENGE_ALPHA, compute_alpha_powers};
+use crate::lookup::{BusPublicInputs, LOGUP_CHALLENGE_ALPHA, compute_alpha_powers};
 use crate::trace::LDETraceTable;
 use crate::traits::{AIR, TransitionEvaluationContext, ZerofierEvaluations};
 use crate::{frame::Frame, prover::evaluate_polynomial_on_lde_domain};
@@ -27,6 +26,7 @@ pub struct ConstraintEvaluator<
     PI,
 > {
     boundary_constraints: BoundaryConstraints<FieldExtension>,
+    logup_table_offset: FieldElement<FieldExtension>,
     phantom: PhantomData<(Field, PI)>,
 }
 impl<Field, FieldExtension, PI> ConstraintEvaluator<Field, FieldExtension, PI>
@@ -51,16 +51,17 @@ where
         num_base: usize,
         num_periodic: usize,
         offsets: &[usize],
+        logup_table_offset: &FieldElement<FieldExtension>,
     ) -> Vec<FieldElement<FieldExtension>> {
         let is_uniform = zerofier_data.is_uniform();
 
         // Pre-compute LogUp alpha powers once for all LDE domain points.
-        // Each LookupTermConstraint::evaluate reuses these instead of computing
-        // incremental alpha_power = alpha_power * alpha per call.
-        // 32 powers is generous (max bus elements per interaction is ~15).
         let logup_alpha_powers: Vec<FieldElement<FieldExtension>> =
             if rap_challenges.len() > LOGUP_CHALLENGE_ALPHA {
-                compute_alpha_powers(&rap_challenges[LOGUP_CHALLENGE_ALPHA], 32)
+                compute_alpha_powers(
+                    &rap_challenges[LOGUP_CHALLENGE_ALPHA],
+                    air.max_bus_elements(),
+                )
             } else {
                 Vec::new()
             };
@@ -107,6 +108,7 @@ where
                             periodic_buf,
                             rap_challenges,
                             &logup_alpha_powers,
+                            logup_table_offset,
                         );
                         air.compute_transition_prover(&ctx, base_buf, transition_buf);
 
@@ -174,6 +176,7 @@ where
                         &periodic_buf,
                         rap_challenges,
                         &logup_alpha_powers,
+                        logup_table_offset,
                     );
                     air.compute_transition_prover(&ctx, &mut base_buf, &mut transition_buf);
 
@@ -226,8 +229,20 @@ where
         let boundary_constraints =
             air.boundary_constraints(pub_inputs, rap_challenges, bus_public_inputs, trace_length);
 
+        // Compute logup_table_offset = table_contribution / trace_length
+        let logup_table_offset = match bus_public_inputs {
+            Some(bpi) => {
+                let n_inv = FieldElement::<Field>::from(trace_length as u64)
+                    .inv()
+                    .unwrap();
+                n_inv * &bpi.table_contribution
+            }
+            None => FieldElement::zero(),
+        };
+
         Self {
             boundary_constraints,
+            logup_table_offset,
             phantom: PhantomData::<(Field, PI)> {},
         }
     }
@@ -369,6 +384,7 @@ where
             num_base,
             num_periodic,
             offsets,
+            &self.logup_table_offset,
         );
 
         #[cfg(feature = "instruments")]
