@@ -75,7 +75,7 @@ impl TableCounts {
     /// allowing a malicious prover to bypass soundness checks.
     /// Sum of all chunk counts across split tables.
     pub fn total(&self) -> usize {
-        self.cpu + self.lt + self.memw + self.load + self.mul + self.dvrm + self.branch
+        self.cpu + self.lt + self.memw + self.load + self.mul + self.dvrm + self.shift + self.branch
     }
 
     /// Validate that all required tables have at least one chunk.

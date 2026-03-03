@@ -434,6 +434,8 @@ impl CpuOperation {
     ///
     /// For ADD: res = arg1 + arg2 (64-bit wrapping)
     /// For SUB: res = arg1 - arg2 (64-bit wrapping)
+    /// For SHIFT: res = raw 64-bit shift of arg1 by arg2 (no word sign extension;
+    ///            rvd handles sign extension for word instructions)
     /// For SLT: res = 0 or 1 (comparison result from executor)
     /// For other operations: uses the executor's result (self.res)
     ///
@@ -454,6 +456,23 @@ impl CpuOperation {
         } else if self.decode.op_sub {
             // SUB constraint checks: res + arg2 = arg1, so res = arg1 - arg2
             arg1.wrapping_sub(arg2)
+        } else if self.decode.op_shift {
+            // SHIFT: raw 64-bit shift matching the SHIFT chip's computation.
+            // The SHIFT chip shifts the full 64-bit arg1 by (shift mod 32*(2-word_instr)).
+            // Sign extension for word instructions is handled by rvd, not res.
+            let shift = (arg2 & 0xFF) as u32;
+            let modulus = if self.decode.word_instr { 32 } else { 64 };
+            let effective = shift % modulus;
+            if !self.decode.mp_selector {
+                // Left shift
+                arg1.wrapping_shl(effective)
+            } else if !self.decode.signed {
+                // Logical right shift
+                arg1.wrapping_shr(effective)
+            } else {
+                // Arithmetic right shift
+                (arg1 as i64).wrapping_shr(effective) as u64
+            }
         } else {
             // For SLT and other operations, use the executor's result
             // SLT res is 0 or 1, verified by SltResZeroConstraint
