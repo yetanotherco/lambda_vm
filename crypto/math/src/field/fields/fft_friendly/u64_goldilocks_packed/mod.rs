@@ -7,6 +7,7 @@
 //! - Scalar fallback: WIDTH=1
 
 mod scalar;
+pub mod fp3;
 
 #[cfg(all(
     target_arch = "x86_64",
