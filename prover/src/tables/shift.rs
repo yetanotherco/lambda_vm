@@ -136,7 +136,6 @@ impl ShiftOperation {
         }
     }
 
-
     /// Compute all auxiliary values for trace generation.
     fn compute_aux(&self) -> ShiftAux {
         let left = !self.direction;
