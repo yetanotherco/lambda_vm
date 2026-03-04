@@ -115,7 +115,11 @@ patch_max_rows() {
     fi
     for table in CPU MEMW DVRM MUL LT LOAD BRANCH; do
         # Match "pub const TABLE: usize = 1 << N" and replace N with our value
-        sed -i '' -E "s/(pub const ${table}: usize = 1 << )[0-9]+/\1${log2}/" "$mod_rs"
+        if [[ "$(uname)" == "Darwin" ]]; then
+            sed -i '' -E "s/(pub const ${table}: usize = 1 << )[0-9]+/\1${log2}/" "$mod_rs"
+        else
+            sed -i -E "s/(pub const ${table}: usize = 1 << )[0-9]+/\1${log2}/" "$mod_rs"
+        fi
     done
     echo -e "${GREEN}  Patched max_rows to 2^${log2} in mod.rs${NC}"
 }
