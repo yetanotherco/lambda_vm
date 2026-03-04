@@ -62,6 +62,244 @@ pub fn load_main_packed(
     }
 }
 
+/// Load WIDTH consecutive extension field values from a column-major aux LDE vector.
+///
+/// Returns a `PackedFp3<PackedGoldilocks>` with each lane holding one D3Ext value.
+#[inline(always)]
+fn load_aux_packed(
+    col: &[FieldElement<D3Ext>],
+    row: usize,
+    num_rows: usize,
+) -> PackedFp3<PackedGoldilocks> {
+    PackedFp3::from_fn(|j| {
+        let idx = (row + j) % num_rows;
+        let v = col[idx].value();
+        [v[0].clone(), v[1].clone(), v[2].clone()]
+    })
+}
+
+/// Compute multiplicity in packed form from main columns.
+///
+/// Returns a `PackedGoldilocks` with WIDTH multiplicities.
+#[inline(always)]
+fn compute_multiplicity_packed(
+    main_cols: &[Vec<FieldElement<GF>>],
+    row: usize,
+    num_rows: usize,
+    multiplicity: &Multiplicity,
+) -> PackedGoldilocks {
+    match multiplicity {
+        Multiplicity::One => PackedGoldilocks::ones(),
+        Multiplicity::Column(col) => load_main_packed(&main_cols[*col], row, num_rows),
+        Multiplicity::Sum(col_a, col_b) => {
+            load_main_packed(&main_cols[*col_a], row, num_rows)
+                + load_main_packed(&main_cols[*col_b], row, num_rows)
+        }
+        Multiplicity::Negated(col) => {
+            PackedGoldilocks::ones() - load_main_packed(&main_cols[*col], row, num_rows)
+        }
+        Multiplicity::Linear(terms) => {
+            let mut result = PackedGoldilocks::zero();
+            for term in terms {
+                match term {
+                    LinearTerm::Column { coefficient, column } => {
+                        let coeff =
+                            PackedGoldilocks::broadcast(FieldElement::<GF>::from(*coefficient));
+                        result = result
+                            + load_main_packed(&main_cols[*column], row, num_rows) * coeff;
+                    }
+                    LinearTerm::ColumnUnsigned { coefficient, column } => {
+                        let coeff =
+                            PackedGoldilocks::broadcast(FieldElement::<GF>::from(*coefficient));
+                        result = result
+                            + load_main_packed(&main_cols[*column], row, num_rows) * coeff;
+                    }
+                    LinearTerm::Constant(value) => {
+                        result = result
+                            + PackedGoldilocks::broadcast(FieldElement::<GF>::from(*value));
+                    }
+                }
+            }
+            result
+        }
+    }
+}
+
+/// Compute fingerprint in packed form for one interaction.
+///
+/// Returns `z - (bus_id * α^0 + v[0] * α^1 + v[1] * α^2 + ...)` as PackedFp3.
+/// The `z` and alpha powers are extension field constants broadcast to all lanes.
+#[inline(always)]
+fn compute_fingerprint_packed(
+    main_cols: &[Vec<FieldElement<GF>>],
+    row: usize,
+    num_rows: usize,
+    interaction: &BusInteraction,
+    z_packed: &PackedFp3<PackedGoldilocks>,
+    alpha_powers_packed: &[PackedFp3<PackedGoldilocks>],
+) -> PackedFp3<PackedGoldilocks> {
+    let bus_id = PackedGoldilocks::broadcast(FieldElement::<GF>::from(interaction.bus_id));
+    let mut lc = alpha_powers_packed[0].mul_scalar(bus_id);
+    let mut alpha_idx = 1;
+
+    for bv in &interaction.values {
+        match bv {
+            BusValue::Packed {
+                start_column,
+                packing,
+            } => {
+                let n_consumed = accumulate_fingerprint_packed(
+                    packing,
+                    main_cols,
+                    row,
+                    num_rows,
+                    *start_column,
+                    alpha_powers_packed,
+                    alpha_idx,
+                    &mut lc,
+                );
+                alpha_idx += n_consumed;
+            }
+            BusValue::Linear(terms) => {
+                let mut result = PackedGoldilocks::zero();
+                for term in terms {
+                    match term {
+                        LinearTerm::Column {
+                            coefficient,
+                            column,
+                        } => {
+                            let coeff = PackedGoldilocks::broadcast(FieldElement::<GF>::from(
+                                *coefficient,
+                            ));
+                            result = result
+                                + load_main_packed(&main_cols[*column], row, num_rows) * coeff;
+                        }
+                        LinearTerm::ColumnUnsigned {
+                            coefficient,
+                            column,
+                        } => {
+                            let coeff = PackedGoldilocks::broadcast(FieldElement::<GF>::from(
+                                *coefficient,
+                            ));
+                            result = result
+                                + load_main_packed(&main_cols[*column], row, num_rows) * coeff;
+                        }
+                        LinearTerm::Constant(value) => {
+                            result = result
+                                + PackedGoldilocks::broadcast(FieldElement::<GF>::from(*value));
+                        }
+                    }
+                }
+                lc = lc + alpha_powers_packed[alpha_idx].mul_scalar(result);
+                alpha_idx += 1;
+            }
+        }
+    }
+
+    *z_packed - lc
+}
+
+/// Packed version of Packing::accumulate_fingerprint.
+///
+/// Accumulates bus element contributions into `acc` using PackedGoldilocks for column loads
+/// and PackedFp3 for alpha power multiplication.
+#[inline(always)]
+fn accumulate_fingerprint_packed(
+    packing: &Packing,
+    main_cols: &[Vec<FieldElement<GF>>],
+    row: usize,
+    num_rows: usize,
+    start_col: usize,
+    alpha_powers: &[PackedFp3<PackedGoldilocks>],
+    alpha_offset: usize,
+    acc: &mut PackedFp3<PackedGoldilocks>,
+) -> usize {
+    let load =
+        |col: usize| -> PackedGoldilocks { load_main_packed(&main_cols[col], row, num_rows) };
+
+    match packing {
+        Packing::Direct => {
+            *acc = *acc + alpha_powers[alpha_offset].mul_scalar(load(start_col));
+            1
+        }
+        Packing::Word2L => {
+            let shift_16 = PackedGoldilocks::broadcast(FieldElement::<GF>::from(SHIFT_16));
+            let combined = load(start_col) + load(start_col + 1) * shift_16;
+            *acc = *acc + alpha_powers[alpha_offset].mul_scalar(combined);
+            1
+        }
+        Packing::Word4L => {
+            let shift_8 = PackedGoldilocks::broadcast(FieldElement::<GF>::from(SHIFT_8));
+            let shift_16 = PackedGoldilocks::broadcast(FieldElement::<GF>::from(SHIFT_16));
+            let shift_24 = shift_8 * shift_16;
+            let combined = load(start_col)
+                + load(start_col + 1) * shift_8
+                + load(start_col + 2) * shift_16
+                + load(start_col + 3) * shift_24;
+            *acc = *acc + alpha_powers[alpha_offset].mul_scalar(combined);
+            1
+        }
+        Packing::DWordWL => {
+            *acc = *acc + alpha_powers[alpha_offset].mul_scalar(load(start_col));
+            *acc = *acc + alpha_powers[alpha_offset + 1].mul_scalar(load(start_col + 1));
+            2
+        }
+        Packing::DWordHHW => {
+            *acc = *acc + alpha_powers[alpha_offset].mul_scalar(load(start_col));
+            let shift_16 = PackedGoldilocks::broadcast(FieldElement::<GF>::from(SHIFT_16));
+            let w = load(start_col + 1) + load(start_col + 2) * shift_16;
+            *acc = *acc + alpha_powers[alpha_offset + 1].mul_scalar(w);
+            2
+        }
+        Packing::DWordWHH => {
+            let shift_16 = PackedGoldilocks::broadcast(FieldElement::<GF>::from(SHIFT_16));
+            let w = load(start_col) + load(start_col + 1) * shift_16;
+            *acc = *acc + alpha_powers[alpha_offset].mul_scalar(w);
+            *acc = *acc + alpha_powers[alpha_offset + 1].mul_scalar(load(start_col + 2));
+            2
+        }
+        Packing::DWordHL => {
+            let shift_16 = PackedGoldilocks::broadcast(FieldElement::<GF>::from(SHIFT_16));
+            let w0 = load(start_col) + load(start_col + 1) * shift_16;
+            *acc = *acc + alpha_powers[alpha_offset].mul_scalar(w0);
+            let w1 = load(start_col + 2) + load(start_col + 3) * shift_16;
+            *acc = *acc + alpha_powers[alpha_offset + 1].mul_scalar(w1);
+            2
+        }
+        Packing::DWordBL => {
+            let shift_8 = PackedGoldilocks::broadcast(FieldElement::<GF>::from(SHIFT_8));
+            let shift_16 = PackedGoldilocks::broadcast(FieldElement::<GF>::from(SHIFT_16));
+            let shift_24 = shift_8 * shift_16;
+            let w0 = load(start_col)
+                + load(start_col + 1) * shift_8
+                + load(start_col + 2) * shift_16
+                + load(start_col + 3) * shift_24;
+            *acc = *acc + alpha_powers[alpha_offset].mul_scalar(w0);
+            let w1 = load(start_col + 4)
+                + load(start_col + 5) * shift_8
+                + load(start_col + 6) * shift_16
+                + load(start_col + 7) * shift_24;
+            *acc = *acc + alpha_powers[alpha_offset + 1].mul_scalar(w1);
+            2
+        }
+        Packing::QuadHL => {
+            let shift_16 = PackedGoldilocks::broadcast(FieldElement::<GF>::from(SHIFT_16));
+            for i in 0..4 {
+                let c = start_col + i * 2;
+                let w = load(c) + load(c + 1) * shift_16;
+                *acc = *acc + alpha_powers[alpha_offset + i].mul_scalar(w);
+            }
+            4
+        }
+        Packing::QuadWL => {
+            for i in 0..4 {
+                *acc = *acc + alpha_powers[alpha_offset + i].mul_scalar(load(start_col + i));
+            }
+            4
+        }
+    }
+}
+
 // =============================================================================
 // Shift Constants for Type Combining
 // =============================================================================
@@ -1030,50 +1268,166 @@ where
             }
         }
 
-        // Phase B: Evaluate lookup constraints using scalar fallback
-        let num_total = self.transition_constraints.len();
-        if num_total > num_table {
-            for local_j in 0..chunk_len {
-                let i = base_row + local_j;
-                let rows_per_step = lde_step_size / blowup_factor;
-                for (step_idx, &offset) in offsets.iter().enumerate() {
-                    let initial_step_row = i + offset * lde_step_size;
-                    let step = &mut frame.steps[step_idx];
-                    for sub_row in 0..rows_per_step {
-                        let step_row_idx =
-                            (initial_step_row + sub_row * blowup_factor) % lde_domain_size;
-                        for col in 0..lde_main_cols.len() {
-                            step.data[sub_row][col] = lde_main_cols[col][step_row_idx].clone();
-                        }
-                        for col in 0..lde_aux_cols.len() {
-                            step.aux_data[sub_row][col] =
-                                lde_aux_cols[col][step_row_idx].clone();
-                        }
-                    }
-                }
-                for (k, col) in lde_periodic_cols.iter().enumerate() {
-                    periodic_buf[k] = col[i].clone();
-                }
-                let ctx = TransitionEvaluationContext::new_prover(
-                    frame,
-                    periodic_buf,
-                    rap_challenges,
-                    logup_alpha_powers,
-                    logup_table_offset,
+        // Phase B: Evaluate lookup constraints using packed SIMD
+        let num_interactions = self.auxiliary_trace_build_data.interactions.len();
+        if num_interactions > 0 {
+            let (num_committed_pairs, absorbed_count) = split_interactions(num_interactions);
+            let interactions = &self.auxiliary_trace_build_data.interactions;
+
+            // Pre-broadcast z and alpha powers to packed form
+            let z_packed = PackedFp3::broadcast(&rap_challenges[LOGUP_CHALLENGE_Z]);
+            let alpha_powers_packed: Vec<PackedFp3<PackedGoldilocks>> = logup_alpha_powers
+                .iter()
+                .map(|ap| PackedFp3::broadcast(ap))
+                .collect();
+
+            // Step 0 row = base_row, Step 1 row = base_row + lde_step_size
+            let step1_row = (base_row + lde_step_size) % lde_domain_size;
+
+            // Evaluate batched term constraints (each reads from step 0)
+            for pair_idx in 0..num_committed_pairs {
+                let ia = &interactions[pair_idx * 2];
+                let ib = &interactions[pair_idx * 2 + 1];
+                let term_col_idx = pair_idx;
+
+                // Load c from aux column at step 0
+                let c = load_aux_packed(&lde_aux_cols[term_col_idx], base_row, lde_domain_size);
+
+                // Compute multiplicities (base field)
+                let m_a =
+                    compute_multiplicity_packed(lde_main_cols, base_row, lde_domain_size, &ia.multiplicity);
+                let m_b =
+                    compute_multiplicity_packed(lde_main_cols, base_row, lde_domain_size, &ib.multiplicity);
+
+                // Compute fingerprints (extension field)
+                let fp_a = compute_fingerprint_packed(
+                    lde_main_cols,
+                    base_row,
+                    lde_domain_size,
+                    ia,
+                    &z_packed,
+                    &alpha_powers_packed,
                 );
-                // Zero only the lookup constraint slots
-                for e in transition_buf[num_table..num_total].iter_mut() {
-                    *e = FieldElement::zero();
-                }
-                for c_obj in &self.transition_constraints[num_table..] {
-                    c_obj.evaluate(
-                        unsafe { &*(&ctx as *const _ as *const _) },
-                        unsafe { &mut *(transition_buf as *mut _ as *mut _) },
+                let fp_b = compute_fingerprint_packed(
+                    lde_main_cols,
+                    base_row,
+                    lde_domain_size,
+                    ib,
+                    &z_packed,
+                    &alpha_powers_packed,
+                );
+
+                // Signs
+                let sign_a = if ia.is_sender {
+                    PackedFp3::one()
+                } else {
+                    -PackedFp3::one()
+                };
+                let sign_b = if ib.is_sender {
+                    PackedFp3::one()
+                } else {
+                    -PackedFp3::one()
+                };
+
+                // c * fp_a * fp_b - sign_a * m_a * fp_b - sign_b * m_b * fp_a
+                let constraint_idx = num_table + pair_idx;
+                results[constraint_idx] =
+                    c * fp_a * fp_b - sign_a.mul_scalar(m_a) * fp_b - sign_b.mul_scalar(m_b) * fp_a;
+            }
+
+            // Evaluate accumulated constraint (reads from step 0 and step 1)
+            let acc_col_idx = num_committed_pairs; // accumulated column is after term columns
+            let acc_constraint_idx = num_table + num_committed_pairs;
+
+            // Load accumulated column values from step 0 and step 1
+            let acc_curr =
+                load_aux_packed(&lde_aux_cols[acc_col_idx], base_row, lde_domain_size);
+            let acc_next =
+                load_aux_packed(&lde_aux_cols[acc_col_idx], step1_row, lde_domain_size);
+
+            // Sum term columns at step 1 (next row)
+            let mut terms_sum = PackedFp3::<PackedGoldilocks>::zero();
+            for i in 0..num_committed_pairs {
+                terms_sum = terms_sum
+                    + load_aux_packed(&lde_aux_cols[i], step1_row, lde_domain_size);
+            }
+
+            // delta = acc_next - acc_curr - terms_sum + L/N
+            let logup_offset_packed = PackedFp3::broadcast(logup_table_offset);
+            let delta = acc_next - acc_curr - terms_sum + logup_offset_packed;
+
+            // Clear denominators of absorbed interactions (from step 1)
+            let absorbed_start = num_interactions - absorbed_count;
+            match absorbed_count {
+                1 => {
+                    let absorbed = &interactions[absorbed_start];
+                    let m = compute_multiplicity_packed(
+                        lde_main_cols,
+                        step1_row,
+                        lde_domain_size,
+                        &absorbed.multiplicity,
                     );
+                    let f = compute_fingerprint_packed(
+                        lde_main_cols,
+                        step1_row,
+                        lde_domain_size,
+                        absorbed,
+                        &z_packed,
+                        &alpha_powers_packed,
+                    );
+                    let sign = if absorbed.is_sender {
+                        PackedFp3::one()
+                    } else {
+                        -PackedFp3::one()
+                    };
+                    results[acc_constraint_idx] = delta * f - sign.mul_scalar(m);
                 }
-                for c in num_table..num_total {
-                    results[c].set_lane(local_j, &transition_buf[c]);
+                2 => {
+                    let abs0 = &interactions[absorbed_start];
+                    let abs1 = &interactions[absorbed_start + 1];
+                    let m1 = compute_multiplicity_packed(
+                        lde_main_cols,
+                        step1_row,
+                        lde_domain_size,
+                        &abs0.multiplicity,
+                    );
+                    let m2 = compute_multiplicity_packed(
+                        lde_main_cols,
+                        step1_row,
+                        lde_domain_size,
+                        &abs1.multiplicity,
+                    );
+                    let f1 = compute_fingerprint_packed(
+                        lde_main_cols,
+                        step1_row,
+                        lde_domain_size,
+                        abs0,
+                        &z_packed,
+                        &alpha_powers_packed,
+                    );
+                    let f2 = compute_fingerprint_packed(
+                        lde_main_cols,
+                        step1_row,
+                        lde_domain_size,
+                        abs1,
+                        &z_packed,
+                        &alpha_powers_packed,
+                    );
+                    let sign1 = if abs0.is_sender {
+                        PackedFp3::one()
+                    } else {
+                        -PackedFp3::one()
+                    };
+                    let sign2 = if abs1.is_sender {
+                        PackedFp3::one()
+                    } else {
+                        -PackedFp3::one()
+                    };
+                    results[acc_constraint_idx] = delta * f1 * f2
+                        - sign1.mul_scalar(m1) * f2
+                        - sign2.mul_scalar(m2) * f1;
                 }
+                _ => unreachable!("absorbed must contain 1 or 2 interactions"),
             }
         }
     }
