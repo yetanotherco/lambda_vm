@@ -404,7 +404,6 @@ fn test_cpu_operation_from_log_arith() {
         src1_val: 100,
         src2_val: 200,
         dst_val: 300,
-        ecall_info: None,
     };
 
     let op = CpuOperation::from_log_and_instruction(&log, 0, instruction);
@@ -439,7 +438,6 @@ fn test_cpu_operation_from_log_branch() {
         src1_val: 10,
         src2_val: 20,
         dst_val: 0,
-        ecall_info: None,
     };
 
     let op = CpuOperation::from_log_and_instruction(&log, 4, instruction);
@@ -472,7 +470,6 @@ fn test_cpu_operation_from_log_word_instr() {
         src1_val: 0xFFFF_FFFF_8000_0000, // Would be negative as 32-bit
         src2_val: 1,
         dst_val: 0xFFFF_FFFF_8000_0001, // Result sign-extended
-        ecall_info: None,
     };
 
     let op = CpuOperation::from_log_and_instruction(&log, 8, instruction);

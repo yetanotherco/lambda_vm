@@ -1,17 +1,3 @@
-/// Information about an ECALL instruction, distinguishing Halt from Commit.
-#[derive(Debug, Clone)]
-pub enum EcallInfo {
-    /// Halt syscall (syscall #5)
-    Halt,
-    /// Commit syscall (syscall #3): write(fd, buf_addr, count)
-    Commit {
-        /// Buffer address in memory (x11)
-        buf_addr: u64,
-        /// Number of bytes to commit (x12)
-        count: u64,
-    },
-}
-
 /// Log containing the execution state for one instruction
 /// Uses zero as default value if the instruction doesn't use either of src1, src2 or dst
 /// Note that values written to dst register zero will be ignored
@@ -19,18 +5,25 @@ pub enum EcallInfo {
 /// In case of Store instruction: value of base will be at src1_val and value to be stored will be at src2_val
 /// In case of Load instruction: value of base will be at src1_val
 /// The instruction itself is not stored here - use current_pc to look it up from the predecoded instructions map
+///
+/// For ECALL instructions, these fields are repurposed (since decode sets read_register1/2=false,
+/// write_register=false, so src/dst are unconstrained):
+/// - `src1_val` = syscall number (from x17): 3=Commit, 5=Halt, etc.
+/// - `src2_val` = buf_addr (x11) for Commit, 0 otherwise
+/// - `dst_val` = count (x12) for Commit, 0 otherwise
 #[derive(Debug, Clone)]
 pub struct Log {
     /// PC before instruction execution (use this to look up the instruction)
     pub current_pc: u64,
     /// PC after instruction execution
     pub next_pc: u64,
-    /// Value of src1 register before execution (if used by the instruction)
+    /// Value of src1 register before execution (if used by the instruction).
+    /// For ECALL: syscall number from x17.
     pub src1_val: u64,
-    /// Value of src2 register before execution (if used by the instruction)
+    /// Value of src2 register before execution (if used by the instruction).
+    /// For ECALL Commit: buf_addr from x11.
     pub src2_val: u64,
-    /// Value of dst register after execution (if used by the instruction)
+    /// Value of dst register after execution (if used by the instruction).
+    /// For ECALL Commit: count from x12.
     pub dst_val: u64,
-    /// ECALL-specific information (None for non-ECALL instructions)
-    pub ecall_info: Option<EcallInfo>,
 }

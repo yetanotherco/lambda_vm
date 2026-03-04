@@ -21,7 +21,6 @@ fn make_log(pc: u64, rs1_val: u64, rs2_val: u64, dst_val: u64, taken: bool, offs
         src1_val: rs1_val,
         src2_val: rs2_val,
         dst_val,
-        ecall_info: None,
     }
 }
 
@@ -55,11 +54,10 @@ fn append_ecall(logs: &mut Vec<Log>, instrs: &mut Vec<Instruction>) {
     let last_pc = logs.last().map(|l| l.current_pc + 4).unwrap_or(0x1000);
     logs.push(Log {
         current_pc: last_pc,
-        next_pc: 0, // executor sets next_pc=0 for halt; prover overrides to pc+4
-        src1_val: 0,
+        next_pc: 0,  // executor sets next_pc=0 for halt; prover overrides to pc+4
+        src1_val: 5, // Halt syscall number
         src2_val: 0,
         dst_val: 0,
-        ecall_info: Some(executor::vm::logs::EcallInfo::Halt),
     });
     instrs.push(Instruction::EcallEbreak);
 }

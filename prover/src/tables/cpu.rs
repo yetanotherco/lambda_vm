@@ -566,11 +566,11 @@ impl CpuOperation {
     /// The DecodeEntry contains static instruction information. This method
     /// adds runtime values from the Log (register values, branch decisions, etc.).
     pub fn from_log(log: &Log, timestamp: u64, decode: DecodeEntry) -> Self {
-        use executor::vm::logs::EcallInfo;
-
-        let (ecall_commit, commit_buf_addr, commit_count) = match &log.ecall_info {
-            Some(EcallInfo::Commit { buf_addr, count }) => (true, *buf_addr, *count),
-            _ => (false, 0, 0),
+        let ecall_commit = decode.op_ecall && log.src1_val == 3;
+        let (commit_buf_addr, commit_count) = if ecall_commit {
+            (log.src2_val, log.dst_val)
+        } else {
+            (0, 0)
         };
 
         let mut op = Self {
