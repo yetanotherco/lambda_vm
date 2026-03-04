@@ -104,6 +104,27 @@ where
                     unsafe { &*(fe as *const _ as *const FieldElement<GF>) }
                 };
 
+                // Cast LDE columns to concrete Goldilocks types for packed evaluation.
+                // SAFETY: TypeId check guarantees Field == GF and FieldExtension == D3Ext.
+                let lde_main_cols: &[Vec<FieldElement<GF>>] = unsafe {
+                    &*(&lde_trace.main_columns as *const _ as *const Vec<Vec<FieldElement<GF>>>)
+                };
+                let lde_aux_cols: &[Vec<FieldElement<D3Ext>>] = unsafe {
+                    &*(&lde_trace.aux_columns as *const _ as *const Vec<Vec<FieldElement<D3Ext>>>)
+                };
+                let lde_periodic_gf: &[Vec<FieldElement<GF>>] = unsafe {
+                    &*(lde_periodic_columns as *const _ as *const [Vec<FieldElement<GF>>])
+                };
+                let rap_challenges_d3: &[FieldElement<D3Ext>] = unsafe {
+                    &*(rap_challenges as *const _ as *const [FieldElement<D3Ext>])
+                };
+                let logup_alpha_d3: &[FieldElement<D3Ext>] = unsafe {
+                    &*(&logup_alpha_powers as *const _ as *const Vec<FieldElement<D3Ext>>)
+                };
+                let logup_offset_d3: &FieldElement<D3Ext> = unsafe {
+                    &*(logup_table_offset as *const _ as *const FieldElement<D3Ext>)
+                };
+
                 // Pre-broadcast coefficients (computed once, reused for all chunks)
                 let packed_betas: Vec<PackedFp3<PackedGoldilocks>> = transition_coefficients
                     .iter()
@@ -120,9 +141,9 @@ where
                     .for_each_init(
                         || {
                             (
-                                vec![FieldElement::<FieldExtension>::zero(); num_transition],
-                                vec![FieldElement::<Field>::zero(); num_periodic],
-                                Frame::preallocate(
+                                vec![FieldElement::<D3Ext>::zero(); num_transition],
+                                vec![FieldElement::<GF>::zero(); num_periodic],
+                                Frame::<GF, D3Ext>::preallocate(
                                     num_offsets, rows_per_step, num_main_cols, num_aux_cols,
                                 ),
                                 vec![PackedFp3::<PackedGoldilocks>::zero(); num_transition],
@@ -138,27 +159,25 @@ where
                                 *pe = PackedFp3::zero();
                             }
 
-                            // Phase 1: Scalar constraint eval + scatter into packed lanes
-                            for local_j in 0..chunk_len {
-                                let i = base + local_j;
-                                frame.fill_from_lde(lde_trace, i, offsets);
-                                for (k, col) in lde_periodic_columns.iter().enumerate() {
-                                    periodic_buf[k] = col[i].clone();
-                                }
-                                let ctx = TransitionEvaluationContext::new_prover(
-                                    frame,
-                                    periodic_buf,
-                                    rap_challenges,
-                                    &logup_alpha_powers,
-                                    logup_table_offset,
-                                );
-                                air.compute_transition_into(&ctx, transition_buf);
-
-                                // Scatter: generic FieldElement<E> → concrete packed lanes
-                                for c in 0..num_transition {
-                                    packed_evals[c].set_lane(local_j, as_ext(&transition_buf[c]));
-                                }
-                            }
+                            // Phase 1: Packed constraint evaluation
+                            // Dispatches to AIR-specific packed implementation or default scalar fallback.
+                            air.compute_transitions_packed(
+                                lde_main_cols,
+                                lde_aux_cols,
+                                lde_periodic_gf,
+                                base,
+                                lde_size,
+                                offsets,
+                                rap_challenges_d3,
+                                logup_alpha_d3,
+                                logup_offset_d3,
+                                blowup_factor,
+                                lde_step_size,
+                                transition_buf,
+                                periodic_buf,
+                                frame,
+                                packed_evals,
+                            );
 
                             // Phase 2: Packed accumulation
                             if is_uniform {

@@ -4,6 +4,12 @@ use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use math::{
     field::{
         element::FieldElement,
+        fields::fft_friendly::{
+            extensions_goldilocks::Degree3GoldilocksExtensionField,
+            u64_goldilocks::GoldilocksField,
+            u64_goldilocks_packed::{fp3::PackedFp3, PackedGoldilocks},
+        },
+        packed::PackedField,
         traits::{IsFFTField, IsField, IsSubFieldOf},
     },
     polynomial::Polynomial,
@@ -296,6 +302,102 @@ pub trait AIR: Send + Sync {
             result.push(poly);
         }
         result
+    }
+
+    /// Evaluate all transition constraints at WIDTH consecutive LDE points using packed SIMD.
+    ///
+    /// Default implementation: scalar fallback (calls compute_transition_into WIDTH times,
+    /// scatters results into packed registers). Override in concrete AIR implementations
+    /// to evaluate constraints directly on packed inputs for better performance.
+    ///
+    /// Only called from the Goldilocks packed path (gated by TypeId check in evaluator),
+    /// so all parameters use concrete Goldilocks types.
+    ///
+    /// # Arguments
+    /// * `lde_main_cols` - Column-major main trace LDE: `lde_main_cols[col][row]`
+    /// * `lde_aux_cols` - Column-major aux trace LDE: `lde_aux_cols[col][row]`
+    /// * `lde_periodic_cols` - Periodic column values on LDE domain
+    /// * `base_row` - Starting LDE row index for this WIDTH-wide chunk
+    /// * `lde_domain_size` - Total number of LDE domain points
+    /// * `offsets` - Evaluation step offsets (typically [0, 1] for step_size=1)
+    /// * `rap_challenges` - RAP challenges (z, alpha for LogUp)
+    /// * `logup_alpha_powers` - Precomputed alpha powers for LogUp fingerprints
+    /// * `logup_table_offset` - L/N offset for circular constraint
+    /// * `blowup_factor` - LDE blowup factor
+    /// * `lde_step_size` - LDE step size (trace step_size × blowup_factor)
+    /// * `transition_buf` - Scratch buffer for scalar constraint evaluations
+    /// * `periodic_buf` - Scratch buffer for periodic column values
+    /// * `frame` - Pre-allocated frame for scalar constraint evaluation
+    /// * `results` - Output buffer: `results[constraint_idx]` receives packed evaluation
+    #[allow(clippy::too_many_arguments)]
+    fn compute_transitions_packed(
+        &self,
+        lde_main_cols: &[Vec<FieldElement<GoldilocksField>>],
+        lde_aux_cols: &[Vec<FieldElement<Degree3GoldilocksExtensionField>>],
+        lde_periodic_cols: &[Vec<FieldElement<GoldilocksField>>],
+        base_row: usize,
+        lde_domain_size: usize,
+        offsets: &[usize],
+        rap_challenges: &[FieldElement<Degree3GoldilocksExtensionField>],
+        logup_alpha_powers: &[FieldElement<Degree3GoldilocksExtensionField>],
+        logup_table_offset: &FieldElement<Degree3GoldilocksExtensionField>,
+        blowup_factor: usize,
+        lde_step_size: usize,
+        transition_buf: &mut [FieldElement<Degree3GoldilocksExtensionField>],
+        periodic_buf: &mut [FieldElement<GoldilocksField>],
+        frame: &mut Frame<GoldilocksField, Degree3GoldilocksExtensionField>,
+        results: &mut [PackedFp3<PackedGoldilocks>],
+    ) {
+        let _ = (lde_main_cols, lde_aux_cols, blowup_factor);
+        let chunk_len = PackedGoldilocks::WIDTH.min(lde_domain_size - base_row);
+
+        // Default: scalar fallback. Fill frame from column-major LDE data,
+        // evaluate constraints, scatter into packed lanes.
+        for local_j in 0..chunk_len {
+            let i = base_row + local_j;
+
+            // Fill frame from column-major LDE
+            let rows_per_step = lde_step_size / blowup_factor;
+            for (step_idx, &offset) in offsets.iter().enumerate() {
+                let initial_step_row = i + offset * lde_step_size;
+                let step = &mut frame.steps[step_idx];
+                for sub_row in 0..rows_per_step {
+                    let step_row_idx =
+                        (initial_step_row + sub_row * blowup_factor) % lde_domain_size;
+                    for col in 0..lde_main_cols.len() {
+                        step.data[sub_row][col] = lde_main_cols[col][step_row_idx].clone();
+                    }
+                    for col in 0..lde_aux_cols.len() {
+                        step.aux_data[sub_row][col] = lde_aux_cols[col][step_row_idx].clone();
+                    }
+                }
+            }
+
+            for (k, col) in lde_periodic_cols.iter().enumerate() {
+                periodic_buf[k] = col[i].clone();
+            }
+
+            // SAFETY: This method is only called from the Goldilocks packed path,
+            // where TypeId checks guarantee Self::Field == GoldilocksField and
+            // Self::FieldExtension == Degree3GoldilocksExtensionField.
+            // FieldElement is #[repr(transparent)], so pointer casts are safe.
+            let ctx = TransitionEvaluationContext::new_prover(
+                frame,
+                periodic_buf,
+                rap_challenges,
+                logup_alpha_powers,
+                logup_table_offset,
+            );
+            let ctx_generic: &TransitionEvaluationContext<Self::Field, Self::FieldExtension> =
+                unsafe { &*(&ctx as *const _ as *const _) };
+            let buf_generic: &mut [FieldElement<Self::FieldExtension>] =
+                unsafe { &mut *(transition_buf as *mut _ as *mut _) };
+            self.compute_transition_into(ctx_generic, buf_generic);
+
+            for c in 0..transition_buf.len() {
+                results[c].set_lane(local_j, &transition_buf[c]);
+            }
+        }
     }
 
     fn transition_constraints(

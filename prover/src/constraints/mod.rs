@@ -4,4 +4,5 @@
 //! using the Goldilocks field.
 
 pub mod cpu;
+pub mod packed;
 pub mod templates;

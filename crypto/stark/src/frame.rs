@@ -15,7 +15,7 @@ where
     E: IsField,
     F: IsSubFieldOf<E>,
 {
-    steps: Vec<TableView<F, E>>,
+    pub(crate) steps: Vec<TableView<F, E>>,
 }
 
 impl<F: IsSubFieldOf<E>, E: IsField> Frame<F, E> {

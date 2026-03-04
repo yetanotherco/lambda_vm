@@ -197,10 +197,10 @@ where
     E: IsField,
     F: IsSubFieldOf<E> + IsField,
 {
-    pub(crate) main_columns: Vec<Vec<FieldElement<F>>>,
-    pub(crate) aux_columns: Vec<Vec<FieldElement<E>>>,
-    pub(crate) lde_step_size: usize,
-    pub(crate) blowup_factor: usize,
+    pub main_columns: Vec<Vec<FieldElement<F>>>,
+    pub aux_columns: Vec<Vec<FieldElement<E>>>,
+    pub lde_step_size: usize,
+    pub blowup_factor: usize,
 }
 
 impl<F, E> LDETraceTable<F, E>

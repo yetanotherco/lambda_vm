@@ -16,10 +16,51 @@ use crate::{
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use math::field::{
     element::FieldElement,
+    fields::fft_friendly::{
+        extensions_goldilocks::Degree3GoldilocksExtensionField as D3Ext,
+        u64_goldilocks::GoldilocksField as GF,
+        u64_goldilocks_packed::{fp3::PackedFp3, PackedGoldilocks},
+    },
+    packed::PackedField,
     traits::{IsFFTField, IsField, IsPrimeField, IsSubFieldOf},
 };
 #[cfg(feature = "parallel")]
 use rayon::prelude::{IntoParallelIterator, ParallelIterator};
+
+/// Function type for packed evaluation of table-specific transition constraints.
+///
+/// Evaluates all table constraints at WIDTH consecutive LDE points using packed SIMD.
+/// The function reads columns as `PackedGoldilocks` from column-major LDE storage
+/// and writes results into `results[constraint_idx]`.
+///
+/// # Arguments
+/// * `lde_main_cols` - Column-major main trace LDE
+/// * `base_row` - Starting LDE row index
+/// * `lde_domain_size` - Total LDE domain size
+/// * `results` - Output buffer indexed by constraint_idx
+pub type PackedTableConstraintsFn = fn(
+    lde_main_cols: &[Vec<FieldElement<GF>>],
+    base_row: usize,
+    lde_domain_size: usize,
+    results: &mut [PackedGoldilocks],
+);
+
+/// Load WIDTH consecutive base field values from a column-major LDE vector.
+///
+/// Fast path: contiguous `from_slice` when no wrap-around.
+/// Slow path: `from_fn` with modular indexing near domain boundary.
+#[inline(always)]
+pub fn load_main_packed(
+    col: &[FieldElement<GF>],
+    row: usize,
+    num_rows: usize,
+) -> PackedGoldilocks {
+    if row + PackedGoldilocks::WIDTH <= num_rows {
+        PackedGoldilocks::from_slice(&col[row..row + PackedGoldilocks::WIDTH])
+    } else {
+        PackedGoldilocks::from_fn(|j| col[(row + j) % num_rows].clone())
+    }
+}
 
 // =============================================================================
 // Shift Constants for Type Combining
@@ -694,6 +735,14 @@ pub struct AirWithBuses<
     /// Maximum number of bus elements across all interactions.
     /// Used to compute the correct number of alpha powers.
     max_bus_elements: usize,
+    /// Number of table-specific transition constraints (before lookup constraints).
+    /// Used by packed evaluation to identify which constraints are table constraints
+    /// vs. lookup constraints added by AirWithBuses::new().
+    num_table_constraints: usize,
+    /// Optional packed evaluation function for table-specific constraints.
+    /// When set, `compute_transitions_packed` uses this for table constraints
+    /// instead of the scalar Frame-based fallback.
+    packed_table_constraints: Option<PackedTableConstraintsFn>,
 }
 
 impl<
@@ -722,6 +771,7 @@ impl<
         mut transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
     ) -> Self {
         let num_interactions = auxiliary_trace_build_data.interactions.len();
+        let num_table_constraints = transition_constraints.len();
 
         // Split interactions: committed pairs get term columns, last 1-2 are absorbed
         let (num_committed_pairs, absorbed_count) = split_interactions(num_interactions);
@@ -786,6 +836,8 @@ impl<
             num_precomputed_cols: None,
             name: None,
             max_bus_elements,
+            num_table_constraints,
+            packed_table_constraints: None,
         }
     }
 
@@ -821,6 +873,16 @@ impl<
     /// making it easy to identify which table is contributing to bus imbalances.
     pub fn with_name(mut self, name: &str) -> Self {
         self.name = Some(name.to_string());
+        self
+    }
+
+    /// Register a packed evaluation function for table-specific constraints.
+    ///
+    /// When set, the prover's SIMD-accelerated constraint evaluation path
+    /// calls this function to evaluate table constraints directly on packed
+    /// column data, bypassing Frame::fill_from_lde.
+    pub fn with_packed_constraints(mut self, f: PackedTableConstraintsFn) -> Self {
+        self.packed_table_constraints = Some(f);
         self
     }
 }
@@ -884,6 +946,136 @@ where
         &self,
     ) -> &Vec<Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>> {
         &self.transition_constraints
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compute_transitions_packed(
+        &self,
+        lde_main_cols: &[Vec<FieldElement<GF>>],
+        lde_aux_cols: &[Vec<FieldElement<D3Ext>>],
+        lde_periodic_cols: &[Vec<FieldElement<GF>>],
+        base_row: usize,
+        lde_domain_size: usize,
+        offsets: &[usize],
+        rap_challenges: &[FieldElement<D3Ext>],
+        logup_alpha_powers: &[FieldElement<D3Ext>],
+        logup_table_offset: &FieldElement<D3Ext>,
+        blowup_factor: usize,
+        lde_step_size: usize,
+        transition_buf: &mut [FieldElement<D3Ext>],
+        periodic_buf: &mut [FieldElement<GF>],
+        frame: &mut crate::frame::Frame<GF, D3Ext>,
+        results: &mut [PackedFp3<PackedGoldilocks>],
+    ) {
+        let chunk_len = PackedGoldilocks::WIDTH.min(lde_domain_size - base_row);
+        let num_table = self.num_table_constraints;
+
+        // Phase A: Evaluate table constraints using packed function (if available)
+        if num_table > 0 {
+            if let Some(packed_fn) = self.packed_table_constraints {
+                // Fast path: evaluate table constraints directly on packed column data.
+                // The packed function writes PackedGoldilocks (base field) results.
+                let mut packed_base_results =
+                    vec![PackedGoldilocks::zero(); num_table];
+                packed_fn(lde_main_cols, base_row, lde_domain_size, &mut packed_base_results);
+
+                // Convert base field results to extension field (embed in c0 component)
+                for c in 0..num_table {
+                    results[c] = PackedFp3 {
+                        c0: packed_base_results[c],
+                        c1: PackedGoldilocks::zero(),
+                        c2: PackedGoldilocks::zero(),
+                    };
+                }
+            } else {
+                // Scalar fallback for table constraints
+                for local_j in 0..chunk_len {
+                    let i = base_row + local_j;
+                    let rows_per_step = lde_step_size / blowup_factor;
+                    for (step_idx, &offset) in offsets.iter().enumerate() {
+                        let initial_step_row = i + offset * lde_step_size;
+                        let step = &mut frame.steps[step_idx];
+                        for sub_row in 0..rows_per_step {
+                            let step_row_idx =
+                                (initial_step_row + sub_row * blowup_factor) % lde_domain_size;
+                            for col in 0..lde_main_cols.len() {
+                                step.data[sub_row][col] =
+                                    lde_main_cols[col][step_row_idx].clone();
+                            }
+                        }
+                    }
+                    for (k, col) in lde_periodic_cols.iter().enumerate() {
+                        periodic_buf[k] = col[i].clone();
+                    }
+                    let ctx = TransitionEvaluationContext::new_prover(
+                        frame,
+                        periodic_buf,
+                        rap_challenges,
+                        logup_alpha_powers,
+                        logup_table_offset,
+                    );
+                    for e in transition_buf[..num_table].iter_mut() {
+                        *e = FieldElement::zero();
+                    }
+                    for c_obj in &self.transition_constraints[..num_table] {
+                        c_obj.evaluate(
+                            unsafe { &*(&ctx as *const _ as *const _) },
+                            unsafe { &mut *(transition_buf as *mut _ as *mut _) },
+                        );
+                    }
+                    for c in 0..num_table {
+                        results[c].set_lane(local_j, &transition_buf[c]);
+                    }
+                }
+            }
+        }
+
+        // Phase B: Evaluate lookup constraints using scalar fallback
+        let num_total = self.transition_constraints.len();
+        if num_total > num_table {
+            for local_j in 0..chunk_len {
+                let i = base_row + local_j;
+                let rows_per_step = lde_step_size / blowup_factor;
+                for (step_idx, &offset) in offsets.iter().enumerate() {
+                    let initial_step_row = i + offset * lde_step_size;
+                    let step = &mut frame.steps[step_idx];
+                    for sub_row in 0..rows_per_step {
+                        let step_row_idx =
+                            (initial_step_row + sub_row * blowup_factor) % lde_domain_size;
+                        for col in 0..lde_main_cols.len() {
+                            step.data[sub_row][col] = lde_main_cols[col][step_row_idx].clone();
+                        }
+                        for col in 0..lde_aux_cols.len() {
+                            step.aux_data[sub_row][col] =
+                                lde_aux_cols[col][step_row_idx].clone();
+                        }
+                    }
+                }
+                for (k, col) in lde_periodic_cols.iter().enumerate() {
+                    periodic_buf[k] = col[i].clone();
+                }
+                let ctx = TransitionEvaluationContext::new_prover(
+                    frame,
+                    periodic_buf,
+                    rap_challenges,
+                    logup_alpha_powers,
+                    logup_table_offset,
+                );
+                // Zero only the lookup constraint slots
+                for e in transition_buf[num_table..num_total].iter_mut() {
+                    *e = FieldElement::zero();
+                }
+                for c_obj in &self.transition_constraints[num_table..] {
+                    c_obj.evaluate(
+                        unsafe { &*(&ctx as *const _ as *const _) },
+                        unsafe { &mut *(transition_buf as *mut _ as *mut _) },
+                    );
+                }
+                for c in num_table..num_total {
+                    results[c].set_lane(local_j, &transition_buf[c]);
+                }
+            }
+        }
     }
 
     fn build_auxiliary_trace(

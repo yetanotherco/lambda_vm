@@ -24,6 +24,9 @@ use stark::proof::options::ProofOptions;
 use stark::trace::TraceTable;
 
 use crate::constraints::cpu::create_all_cpu_constraints;
+use crate::constraints::packed::{
+    evaluate_branch_packed, evaluate_dvrm_packed, evaluate_load_packed, evaluate_memw_packed,
+};
 use crate::tables::bitwise::{
     BitwiseOperation, BitwiseOperationType, bus_interactions as bitwise_bus_interactions,
     cols as bitwise_cols,
@@ -540,6 +543,7 @@ pub fn create_memw_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_packed_constraints(evaluate_memw_packed)
     .with_name("MEMW")
 }
 
@@ -558,6 +562,7 @@ pub fn create_load_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_packed_constraints(evaluate_load_packed)
     .with_name("LOAD")
 }
 
@@ -626,6 +631,7 @@ pub fn create_dvrm_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_packed_constraints(evaluate_dvrm_packed)
     .with_name("DVRM")
 }
 
@@ -650,6 +656,7 @@ pub fn create_branch_air(proof_options: &ProofOptions) -> VmAir {
         1,
         transition_constraints,
     )
+    .with_packed_constraints(evaluate_branch_packed)
     .with_name("BRANCH")
 }
 
