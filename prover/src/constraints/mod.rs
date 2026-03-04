@@ -36,6 +36,8 @@ macro_rules! impl_base_field_evaluate_prover {
             );
             if let stark::traits::TransitionEvaluationContext::Prover { frame, .. } = ctx {
                 base_evaluations[self.constraint_idx] = self.compute(frame.get_evaluation_step(0));
+            } else {
+                unreachable!("evaluate_prover called with non-Prover context");
             }
         }
     };

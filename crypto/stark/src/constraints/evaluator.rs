@@ -115,7 +115,7 @@ where
                         let acc_transition = if is_uniform {
                             // All constraints share one zerofier: factor it out of the sum.
                             let z = zerofier_data.get_uniform(i);
-                            // F×E for base constraints (cheap: 3 base muls per term)
+                            // F×E inner product (3 muls per term), then E×E zerofier (9 muls once)
                             let mut sum = base_buf
                                 .iter()
                                 .zip(&transition_coefficients[..num_base])
@@ -127,7 +127,7 @@ where
                                 .fold(sum, |acc, (eval, beta)| acc + eval * beta);
                             z * &sum
                         } else {
-                            // F×E for base constraints with per-constraint zerofier
+                            // F×E inner product (3 muls per term), then E×E per-constraint zerofier (9 muls each)
                             let mut sum = base_buf
                                 .iter()
                                 .enumerate()
@@ -182,7 +182,7 @@ where
 
                     let acc_transition = if is_uniform {
                         let z = zerofier_data.get_uniform(i);
-                        // F×E for base constraints
+                        // F×E inner product (3 muls per term), then E×E zerofier (9 muls once)
                         let mut sum = base_buf
                             .iter()
                             .zip(&transition_coefficients[..num_base])
@@ -194,7 +194,7 @@ where
                             .fold(sum, |acc, (eval, beta)| acc + eval * beta);
                         z * &sum
                     } else {
-                        // F×E for base constraints
+                        // F×E inner product (3 muls per term), then E×E per-constraint zerofier (9 muls each)
                         let mut sum = base_buf
                             .iter()
                             .enumerate()
