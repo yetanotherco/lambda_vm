@@ -702,9 +702,7 @@ impl NextPcAddConstraint {
         let instr_size = four - two * c_type;
 
         // carry_0 = (pc_lo + instr_size - next_pc_lo) * 2^(-32)
-        let inv_2_32: FieldElement<F> = FieldElement::from(super::templates::SHIFT_32)
-            .inv()
-            .unwrap();
+        let inv_2_32 = FieldElement::<F>::from(super::templates::INV_SHIFT_32);
         (pc_lo + instr_size - next_pc_lo) * inv_2_32
     }
 
@@ -720,9 +718,7 @@ impl NextPcAddConstraint {
 
         // rhs_hi = 0 (instruction size fits in low word)
         // carry_1 = (pc_hi + 0 + carry_0 - next_pc_hi) * 2^(-32)
-        let inv_2_32: FieldElement<F> = FieldElement::from(super::templates::SHIFT_32)
-            .inv()
-            .unwrap();
+        let inv_2_32 = FieldElement::<F>::from(super::templates::INV_SHIFT_32);
         (pc_hi + carry_0 - next_pc_hi) * inv_2_32
     }
 

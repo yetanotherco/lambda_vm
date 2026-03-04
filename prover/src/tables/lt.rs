@@ -33,7 +33,7 @@ use stark::table::TableView;
 use stark::trace::TraceTable;
 use stark::traits::TransitionEvaluationContext;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16, SHIFT_32};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16};
 
 // =========================================================================
 // Column indices for LT table
@@ -428,7 +428,7 @@ impl LtConstraint {
         let sub_lo = &sub_0 + &sub_1 * &shift_16;
 
         // carry[0] = (rhs[0] + sub_lo - lhs[0]) / 2^32
-        let inv_2_32 = FieldElement::<F>::from(SHIFT_32).inv().unwrap();
+        let inv_2_32 = FieldElement::<F>::from(crate::constraints::templates::INV_SHIFT_32);
         (&rhs_0 + &sub_lo - &lhs_0) * &inv_2_32
     }
 
@@ -471,7 +471,7 @@ impl LtConstraint {
         let carry_0 = self.compute_carry_0(step);
 
         // carry[1] = (rhs_hi + sub_hi + carry_0 - lhs_hi) / 2^32
-        let inv_2_32 = FieldElement::<F>::from(SHIFT_32).inv().unwrap();
+        let inv_2_32 = FieldElement::<F>::from(crate::constraints::templates::INV_SHIFT_32);
         (&rhs_hi + &sub_hi + &carry_0 - &lhs_hi) * &inv_2_32
     }
 
