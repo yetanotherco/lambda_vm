@@ -1483,7 +1483,7 @@ fn test_crafted_zero_count_proof_must_not_verify() {
     let airs = VmAirs::new(&elf, &proof_options, true, &[], &zero_counts);
 
     let verifier_air_refs = airs.air_refs();
-    assert_eq!(verifier_air_refs.len(), 4);
+    assert_eq!(verifier_air_refs.len(), 5);
 
     let mut bitwise_trace = crate::tables::bitwise::generate_bitwise_trace();
 
