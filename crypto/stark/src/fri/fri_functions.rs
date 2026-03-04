@@ -50,11 +50,37 @@ pub fn fold_polynomial_doubled_inplace<F>(
 ///
 /// After folding, the N/2 results are evaluations on the squared coset
 /// in bit-reversed order, preserving conjugate pairing for the next fold.
-pub fn fold_evaluations_in_place<F: IsSubFieldOf<E>, E: IsField>(
+pub fn fold_evaluations_in_place<F: IsSubFieldOf<E> + 'static, E: IsField + 'static>(
     evals: &mut Vec<FieldElement<E>>,
     zeta: &FieldElement<E>,
     inv_twiddles: &[FieldElement<F>],
 ) {
+    // Packed fast path for Goldilocks + D3 extension
+    #[cfg(feature = "parallel")]
+    {
+        use std::any::TypeId;
+        use math::field::fields::fft_friendly::extensions_goldilocks::Degree3GoldilocksExtensionField as D3Ext;
+        use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField as GF;
+
+        if TypeId::of::<E>() == TypeId::of::<D3Ext>()
+            && TypeId::of::<F>() == TypeId::of::<GF>()
+        {
+            // SAFETY: TypeId check guarantees type identity, FieldElement is repr(transparent)
+            let evals_d3: &mut Vec<FieldElement<D3Ext>> = unsafe {
+                &mut *(evals as *mut Vec<FieldElement<E>> as *mut Vec<FieldElement<D3Ext>>)
+            };
+            let zeta_d3: &FieldElement<D3Ext> = unsafe {
+                &*(zeta as *const FieldElement<E> as *const FieldElement<D3Ext>)
+            };
+            let tw_gf: &[FieldElement<GF>] = unsafe {
+                &*(inv_twiddles as *const [FieldElement<F>] as *const [FieldElement<GF>])
+            };
+            fold_evaluations_packed(evals_d3, zeta_d3, tw_gf);
+            return;
+        }
+    }
+
+    // Scalar fallback
     let half = evals.len() / 2;
     for j in 0..half {
         let lo = &evals[2 * j];
@@ -63,6 +89,78 @@ pub fn fold_evaluations_in_place<F: IsSubFieldOf<E>, E: IsField>(
         let diff = lo - hi;
         evals[j] = &sum + &(&inv_twiddles[j] * &(zeta * &diff));
     }
+    evals.truncate(half);
+}
+
+/// Packed FRI fold using PackedFp3<PackedGoldilocks> to process WIDTH pairs simultaneously.
+///
+/// Each iteration loads WIDTH (lo, hi) pairs via gather, computes the fold formula
+/// using packed Fp3 arithmetic, and scatters results back. The zeta challenge is
+/// broadcast once and reused for all chunks.
+#[cfg(feature = "parallel")]
+fn fold_evaluations_packed(
+    evals: &mut Vec<
+        FieldElement<
+            math::field::fields::fft_friendly::extensions_goldilocks::Degree3GoldilocksExtensionField,
+        >,
+    >,
+    zeta: &FieldElement<
+        math::field::fields::fft_friendly::extensions_goldilocks::Degree3GoldilocksExtensionField,
+    >,
+    inv_twiddles: &[FieldElement<
+        math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField,
+    >],
+) {
+    use math::field::fields::fft_friendly::u64_goldilocks_packed::{
+        fp3::PackedFp3, PackedGoldilocks,
+    };
+    use math::field::packed::PackedField;
+
+    let half = evals.len() / 2;
+    let width = PackedGoldilocks::WIDTH;
+    let zeta_packed = PackedFp3::<PackedGoldilocks>::broadcast(zeta);
+
+    let packed_count = half / width;
+    let remainder_start = packed_count * width;
+
+    for chunk in 0..packed_count {
+        let j = chunk * width;
+
+        // Gather WIDTH lo values from stride-2 positions
+        let lo = PackedFp3::from_fn(|i| {
+            let v = evals[2 * (j + i)].value();
+            [v[0].clone(), v[1].clone(), v[2].clone()]
+        });
+
+        // Gather WIDTH hi values from stride-2 positions
+        let hi = PackedFp3::from_fn(|i| {
+            let v = evals[2 * (j + i) + 1].value();
+            [v[0].clone(), v[1].clone(), v[2].clone()]
+        });
+
+        // Load WIDTH contiguous base-field twiddles
+        let tw = PackedGoldilocks::from_fn(|i| inv_twiddles[j + i].clone());
+
+        // fold: sum + tw * (zeta * diff)
+        let sum = lo + hi;
+        let diff = lo - hi;
+        let result = sum + (zeta_packed * diff).mul_scalar(tw);
+
+        // Scatter WIDTH results back
+        for i in 0..width {
+            evals[j + i] = result.get_lane(i);
+        }
+    }
+
+    // Scalar remainder
+    for j in remainder_start..half {
+        let lo = &evals[2 * j];
+        let hi = &evals[2 * j + 1];
+        let sum = lo + hi;
+        let diff = lo - hi;
+        evals[j] = &sum + &(&inv_twiddles[j] * &(zeta * &diff));
+    }
+
     evals.truncate(half);
 }
 
