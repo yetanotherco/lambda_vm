@@ -71,6 +71,7 @@ where
                 frame,
                 periodic_values: _,
                 rap_challenges: _,
+                ..
             } => {
                 let step_0 = frame.get_evaluation_step(0);
                 let step_1 = frame.get_evaluation_step(1);
@@ -90,6 +91,7 @@ where
                 frame,
                 periodic_values: _,
                 rap_challenges: _,
+                ..
             } => {
                 let step_0 = frame.get_evaluation_step(0);
                 let step_1 = frame.get_evaluation_step(1);

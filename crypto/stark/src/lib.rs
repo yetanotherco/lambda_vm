@@ -1,6 +1,8 @@
 #[cfg(feature = "debug-checks")]
 pub mod bus_debug;
 pub mod constraints;
+#[cfg(feature = "instruments")]
+pub mod instruments;
 pub mod context;
 pub mod debug;
 pub mod domain;

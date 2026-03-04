@@ -34,7 +34,7 @@ use stark::table::TableView;
 use stark::trace::TraceTable;
 use stark::traits::TransitionEvaluationContext;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16, SHIFT_32};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16};
 
 // =========================================================================
 // Column indices for BRANCH table
@@ -490,9 +490,7 @@ impl BranchConstraint {
         // Compute carry_0 as (base + offset - result) / 2^32 in the field.
         // This works because: base + offset = result + carry_0 * 2^32 (mod field)
         // Rearranging: carry_0 = (base + offset - result) * (2^32)^-1 (mod field)
-        let inv_2_32 = FieldElement::<F>::from(SHIFT_32)
-            .inv()
-            .expect("2^32 must be invertible in field");
+        let inv_2_32 = FieldElement::<F>::from(crate::constraints::templates::INV_SHIFT_32);
         (&base_0 + &offset_0 - &unmasked_0) * &inv_2_32
     }
 
@@ -517,9 +515,7 @@ impl BranchConstraint {
         let offset_1 = step.get_main_evaluation_element(0, cols::OFFSET_1).clone();
 
         // carry[1] = (base[1] + offset[1] + carry[0] - unmasked[1]) / 2^32
-        let inv_2_32 = FieldElement::<F>::from(SHIFT_32)
-            .inv()
-            .expect("2^32 must be invertible in field");
+        let inv_2_32 = FieldElement::<F>::from(crate::constraints::templates::INV_SHIFT_32);
         (&base_1 + &offset_1 + &carry_0 - &unmasked_1) * &inv_2_32
     }
 
@@ -578,6 +574,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for BranchConstr
                 frame,
                 periodic_values: _,
                 rap_challenges: _,
+                ..
             } => {
                 let constraint_value = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
@@ -586,6 +583,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for BranchConstr
                 frame,
                 periodic_values: _,
                 rap_challenges: _,
+                ..
             } => {
                 let constraint_value = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = constraint_value;

@@ -1,22 +1,27 @@
 pub mod fri_commitment;
 pub mod fri_decommit;
-mod fri_functions;
+pub(crate) mod fri_functions;
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
+pub use math::field::element::FieldElement;
+use math::field::traits::IsSubFieldOf;
 use math::field::traits::{IsFFTField, IsField};
 use math::traits::AsBytes;
-use math::{fft::cpu::bit_reversing::in_place_bit_reverse_permute, field::traits::IsSubFieldOf};
-pub use math::{field::element::FieldElement, polynomial::Polynomial};
 
 use crate::config::{FriLayerMerkleTree, FriLayerMerkleTreeBackend};
 
 use self::fri_commitment::FriLayer;
 use self::fri_decommit::FriDecommitment;
-use self::fri_functions::fold_polynomial_doubled_inplace;
+use self::fri_functions::{
+    compute_coset_twiddles_inv, fold_evaluations_in_place, update_twiddles_in_place,
+};
 
-pub fn commit_phase<F: IsFFTField + IsSubFieldOf<E>, E: IsField>(
+/// FRI commit phase from pre-computed bit-reversed evaluations.
+/// skipping the initial FFT. Use this when the caller already has the evaluation
+/// vector (e.g. from a fused LDE pipeline).
+pub fn commit_phase_from_evaluations<F: IsFFTField + IsSubFieldOf<E>, E: IsField>(
     number_layers: usize,
-    p_0: Polynomial<FieldElement<E>>,
+    mut evals: Vec<FieldElement<E>>,
     transcript: &mut impl IsStarkTranscript<E, F>,
     coset_offset: &FieldElement<F>,
     domain_size: usize,
@@ -28,42 +33,51 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
-    let mut domain_size = domain_size;
+    // Inverse twiddle factors for evaluation-form folding
+    let mut inv_twiddles = compute_coset_twiddles_inv(coset_offset, domain_size);
 
     let mut fri_layer_list = Vec::with_capacity(number_layers);
-    let mut current_layer: FriLayer<E, FriLayerMerkleTreeBackend<E>>;
-    let mut current_poly = p_0;
-
-    let mut coset_offset = coset_offset.clone();
+    let mut current_coset_offset = coset_offset.clone();
+    let mut current_domain_size = domain_size;
 
     for _ in 1..number_layers {
         // <<<< Receive challenge 𝜁ₖ₋₁
         let zeta = transcript.sample_field_element();
-        coset_offset = coset_offset.square();
-        domain_size /= 2;
+        current_coset_offset = current_coset_offset.square();
+        current_domain_size /= 2;
 
-        // In-place folding avoids memory allocation
-        fold_polynomial_doubled_inplace(&mut current_poly, &zeta);
-        current_layer = new_fri_layer(&current_poly, &coset_offset, domain_size);
-        // Copy just the root (small, 32 bytes) before moving the layer
-        let new_data = current_layer.merkle_tree.root;
-        fri_layer_list.push(current_layer);
+        // Fold evaluations in-place (no FFT needed)
+        fold_evaluations_in_place(&mut evals, &zeta, &inv_twiddles);
+
+        // Build Merkle tree from consecutive pairs
+        let leaves: Vec<[FieldElement<E>; 2]> = evals
+            .chunks_exact(2)
+            .map(|chunk| [chunk[0].clone(), chunk[1].clone()])
+            .collect();
+        let merkle_tree = FriLayerMerkleTree::build(&leaves)
+            .expect("FRI commit: Merkle tree construction must succeed");
+        let root = merkle_tree.root;
+        fri_layer_list.push(FriLayer::new(
+            &evals,
+            merkle_tree,
+            current_coset_offset.clone().to_extension(),
+            current_domain_size,
+        ));
 
         // >>>> Send commitment: [pₖ]
-        transcript.append_bytes(&new_data);
+        transcript.append_bytes(&root);
+
+        // Update twiddles for next level
+        update_twiddles_in_place(&mut inv_twiddles);
     }
 
     // <<<< Receive challenge: 𝜁ₙ₋₁
     let zeta = transcript.sample_field_element();
 
-    // Final fold - still in-place
-    fold_polynomial_doubled_inplace(&mut current_poly, &zeta);
+    // Final fold
+    fold_evaluations_in_place(&mut evals, &zeta, &inv_twiddles);
 
-    let last_value = current_poly
-        .coefficients()
-        .first()
-        .unwrap_or(&FieldElement::zero())
-        .clone();
+    let last_value = evals.first().unwrap_or(&FieldElement::zero()).clone();
 
     // >>>> Send value: pₙ
     transcript.append_field_element(&last_value);
@@ -115,34 +129,4 @@ where
             })
             .collect()
     }
-}
-
-pub fn new_fri_layer<F: IsFFTField + IsSubFieldOf<E>, E: IsField>(
-    poly: &Polynomial<FieldElement<E>>,
-    coset_offset: &FieldElement<F>,
-    domain_size: usize,
-) -> FriLayer<E, FriLayerMerkleTreeBackend<E>>
-where
-    FieldElement<F>: AsBytes + Sync + Send,
-    FieldElement<E>: AsBytes + Sync + Send,
-{
-    let mut evaluation =
-        Polynomial::evaluate_offset_fft(poly, 1, Some(domain_size), coset_offset).unwrap(); // TODO: return error
-
-    in_place_bit_reverse_permute(&mut evaluation);
-
-    // Use fixed-size arrays instead of Vec for each pair (avoids allocation per pair)
-    let leaves: Vec<[FieldElement<E>; 2]> = evaluation
-        .chunks_exact(2)
-        .map(|chunk| [chunk[0].clone(), chunk[1].clone()])
-        .collect();
-
-    let merkle_tree = FriLayerMerkleTree::build(&leaves).unwrap();
-
-    FriLayer::new(
-        &evaluation,
-        merkle_tree,
-        coset_offset.clone().to_extension(),
-        domain_size,
-    )
 }
