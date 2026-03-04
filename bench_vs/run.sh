@@ -102,7 +102,8 @@ run_one() {
         echo -e "  ${GREEN}[Lambda VM] Building (n=${N})...${NC}"
         (cd "$LAMBDA_DIR" && BENCH_N="$N" cargo +nightly build --release \
             --target "$TARGET_SPEC" \
-            -Z build-std=core -Z build-std-features=compiler-builtins-mem 2>&1 | tail -1)
+            -Z build-std=core -Z build-std-features=compiler-builtins-mem 2>&1 \
+            -Z json-target-spec 2>&1 | tail -1)
         LAMBDA_ELF="$LAMBDA_DIR/target/riscv64im-lambda-vm-elf/release/fibonacci-bench"
 
         echo -e "  ${GREEN}[Lambda VM] Proving...${NC}"
