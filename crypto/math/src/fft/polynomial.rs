@@ -637,6 +637,81 @@ where
     Ok(())
 }
 
+/// In-place coset LDE for extension-field data using packed (SIMD) base-field FFT.
+///
+/// For extension-field data (D3Ext) with base-field twiddles (GoldilocksField), each
+/// component of the extension undergoes identical butterfly operations. This function
+/// transposes the AoS extension-field buffer into 3 SoA base-field component arrays,
+/// runs packed base-field LDE on each component independently, then interleaves the
+/// results back into extension-field elements.
+///
+/// This avoids the gather/scatter overhead of packed extension-field butterflies,
+/// instead reusing the existing zero-cost packed base-field FFT infrastructure.
+#[cfg(feature = "parallel")]
+pub fn coset_lde_full_expand_ext_packed(
+    buffer: &mut Vec<
+        FieldElement<
+            crate::field::fields::fft_friendly::extensions_goldilocks::Degree3GoldilocksExtensionField,
+        >,
+    >,
+    blowup_factor: usize,
+    weights: &[FieldElement<crate::field::fields::fft_friendly::u64_goldilocks::GoldilocksField>],
+    inv_twiddles: &LayerTwiddles<
+        crate::field::fields::fft_friendly::u64_goldilocks::GoldilocksField,
+    >,
+    fwd_twiddles: &LayerTwiddles<
+        crate::field::fields::fft_friendly::u64_goldilocks::GoldilocksField,
+    >,
+) -> Result<(), FFTError> {
+    use crate::field::fields::fft_friendly::u64_goldilocks::GoldilocksField as GF;
+
+    type FE = FieldElement<GF>;
+
+    let n = buffer.len();
+    if n == 0 {
+        return Ok(());
+    }
+    if !n.is_power_of_two() {
+        return Err(FFTError::InputError(n));
+    }
+    let lde_size = n * blowup_factor;
+
+    if (lde_size.trailing_zeros() as u64) > GF::TWO_ADICITY {
+        return Err(FFTError::DomainSizeError(lde_size.trailing_zeros() as usize));
+    }
+
+    // 1. Transpose AoS → SoA: extract 3 component arrays from extension-field buffer
+    let mut comp0: Vec<FE> = Vec::with_capacity(n);
+    let mut comp1: Vec<FE> = Vec::with_capacity(n);
+    let mut comp2: Vec<FE> = Vec::with_capacity(n);
+    for elem in buffer.iter() {
+        let v = elem.value();
+        comp0.push(v[0].clone());
+        comp1.push(v[1].clone());
+        comp2.push(v[2].clone());
+    }
+
+    // 2. Run packed base-field LDE on each component independently
+    //    Each component undergoes identical iFFT + weight scaling + FFT
+    //    because extension-field butterflies with base-field twiddles are component-wise.
+    coset_lde_full_expand_packed::<GF>(&mut comp0, blowup_factor, weights, inv_twiddles, fwd_twiddles)?;
+    coset_lde_full_expand_packed::<GF>(&mut comp1, blowup_factor, weights, inv_twiddles, fwd_twiddles)?;
+    coset_lde_full_expand_packed::<GF>(&mut comp2, blowup_factor, weights, inv_twiddles, fwd_twiddles)?;
+
+    // 3. Transpose SoA → AoS: interleave components back into extension-field elements
+    buffer.clear();
+    buffer.reserve(lde_size);
+    for i in 0..lde_size {
+        buffer.push(FieldElement::from_raw([
+            comp0[i].clone(),
+            comp1[i].clone(),
+            comp2[i].clone(),
+        ]));
+    }
+
+    Ok(())
+}
+
 #[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::*;
@@ -983,6 +1058,75 @@ mod tests {
                 .unwrap();
 
                 assert_eq!(scalar_buf, packed_buf, "Blowup-4 mismatch at order {}", order);
+            }
+        }
+
+        #[test]
+        fn packed_ext_coset_lde_matches_scalar() {
+            // Verify coset_lde_full_expand_ext_packed matches scalar coset_lde_full_expand
+            // for extension-field (D3Ext) data with base-field (GoldilocksField) twiddles.
+            use crate::fft::polynomial::coset_lde_full_expand_ext_packed;
+            use crate::field::fields::fft_friendly::extensions_goldilocks::Degree3GoldilocksExtensionField;
+
+            type D3Ext = Degree3GoldilocksExtensionField;
+            type ExtFE = FieldElement<D3Ext>;
+
+            let offset = FE::from(3u64);
+            let blowup_factor = 2;
+
+            for order in 2..=12 {
+                let n = 1usize << order;
+                let lde_size = n * blowup_factor;
+
+                // Create extension-field evaluations
+                let evals: Vec<ExtFE> = (0..n)
+                    .map(|i| {
+                        FieldElement::from_raw([
+                            FE::from((i * 7 + 13) as u64),
+                            FE::from((i * 11 + 5) as u64),
+                            FE::from((i * 3 + 29) as u64),
+                        ])
+                    })
+                    .collect();
+
+                let inv_tw = LayerTwiddles::<F>::new_inverse(n.trailing_zeros() as u64).unwrap();
+                let fwd_tw = LayerTwiddles::<F>::new(lde_size.trailing_zeros() as u64).unwrap();
+
+                let n_inv = FE::from(n as u64).inv().unwrap();
+                let mut weights = Vec::with_capacity(n);
+                let mut offset_power = n_inv;
+                for _ in 0..n {
+                    weights.push(offset_power);
+                    offset_power = &offset_power * &offset;
+                }
+
+                // Scalar reference: generic extension-field LDE
+                let mut scalar_buf = evals.clone();
+                Polynomial::<ExtFE>::coset_lde_full_expand::<F>(
+                    &mut scalar_buf,
+                    blowup_factor,
+                    &weights,
+                    &inv_tw,
+                    &fwd_tw,
+                )
+                .unwrap();
+
+                // Packed path: SoA decomposition + 3 packed base-field FFTs
+                let mut packed_buf = evals;
+                coset_lde_full_expand_ext_packed(
+                    &mut packed_buf,
+                    blowup_factor,
+                    &weights,
+                    &inv_tw,
+                    &fwd_tw,
+                )
+                .unwrap();
+
+                assert_eq!(
+                    scalar_buf, packed_buf,
+                    "Ext coset LDE mismatch at order {}",
+                    order
+                );
             }
         }
     }

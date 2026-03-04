@@ -12,6 +12,10 @@ use math::fft::errors::FFTError;
 #[cfg(feature = "parallel")]
 use math::fft::polynomial::coset_lde_full_expand_packed;
 
+#[cfg(feature = "parallel")]
+use math::fft::polynomial::coset_lde_full_expand_ext_packed;
+
+
 use log::info;
 use math::field::traits::{IsField, IsSubFieldOf};
 use math::traits::AsBytes;
@@ -400,11 +404,46 @@ pub trait IsStarkProver<
         twiddles: &LdeTwiddles<Field>,
     ) where
         Field: IsSubFieldOf<E>,
-        E: IsSubFieldOf<FieldExtension> + IsField + Send + Sync,
+        E: IsSubFieldOf<FieldExtension> + IsField + Send + Sync + 'static,
         FieldElement<E>: Send + Sync,
     {
         if num_cols == 0 {
             return;
+        }
+
+        // Packed fast path: when E = D3Ext and Field = GoldilocksField, decompose each
+        // extension-field column into 3 base-field component arrays and run packed
+        // base-field LDE on each. This works because extension-field FFT with base-field
+        // twiddles is component-wise (each Fp3 component undergoes identical butterflies).
+        #[cfg(feature = "parallel")]
+        {
+            use std::any::TypeId;
+            use math::field::fields::fft_friendly::extensions_goldilocks::Degree3GoldilocksExtensionField as D3Ext;
+            use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField as GF;
+
+            if TypeId::of::<E>() == TypeId::of::<D3Ext>()
+                && TypeId::of::<Field>() == TypeId::of::<GF>()
+            {
+                // SAFETY: TypeId check guarantees type identity.
+                let pool_ext: &mut [Vec<FieldElement<D3Ext>>] = unsafe {
+                    &mut *(pool as *mut [Vec<FieldElement<E>>]
+                        as *mut [Vec<FieldElement<D3Ext>>])
+                };
+                let twiddles_gf: &LdeTwiddles<GF> = unsafe {
+                    &*(twiddles as *const LdeTwiddles<Field> as *const LdeTwiddles<GF>)
+                };
+                pool_ext[..num_cols].par_iter_mut().for_each(|buf| {
+                    coset_lde_full_expand_ext_packed(
+                        buf,
+                        domain.blowup_factor,
+                        &twiddles_gf.coset_weights,
+                        &twiddles_gf.inv,
+                        &twiddles_gf.fwd,
+                    )
+                    .expect("packed ext coset LDE expansion");
+                });
+                return;
+            }
         }
 
         #[cfg(feature = "parallel")]
@@ -1873,6 +1912,7 @@ fn expand_pool_to_lde_packed<F>(
         .expect("packed coset LDE expansion");
     });
 }
+
 
 /// Print a global bus balance report aggregating per-bus sums across all tables.
 ///
