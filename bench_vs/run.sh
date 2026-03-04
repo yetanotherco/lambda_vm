@@ -24,7 +24,7 @@ BOLD='\033[1m'
 NC='\033[0m'
 
 # --- Defaults ----------------------------------------------------------------
-DEFAULT_SERIES=(1000 10000 100000 300000)
+DEFAULT_SERIES=(1000 10000 100000 300000 600000 1000000)
 SERIES=()
 RUN_LAMBDA=true
 RUN_SP1=true
@@ -102,8 +102,7 @@ run_one() {
         echo -e "  ${GREEN}[Lambda VM] Building (n=${N})...${NC}"
         (cd "$LAMBDA_DIR" && BENCH_N="$N" cargo +nightly build --release \
             --target "$TARGET_SPEC" \
-            -Z build-std=core -Z build-std-features=compiler-builtins-mem 2>&1 \
-            -Z json-target-spec 2>&1 | tail -1)
+            -Z build-std=core -Z build-std-features=compiler-builtins-mem 2>&1 | tail -1)
         LAMBDA_ELF="$LAMBDA_DIR/target/riscv64im-lambda-vm-elf/release/fibonacci-bench"
 
         echo -e "  ${GREEN}[Lambda VM] Proving...${NC}"

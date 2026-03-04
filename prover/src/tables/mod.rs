@@ -78,6 +78,23 @@ pub struct MaxRowsConfig {
 
 impl Default for MaxRowsConfig {
     fn default() -> Self {
+        // MAX_ROWS_SHIFT env var overrides all table limits to 1 << shift.
+        // Useful for benchmarking: smaller shift = more chunks = more parallelism but more overhead.
+        if let Some(shift) = std::env::var("MAX_ROWS_SHIFT")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+        {
+            let limit = 1usize << shift;
+            return Self {
+                cpu: limit,
+                memw: limit,
+                dvrm: limit,
+                mul: limit,
+                lt: limit,
+                load: limit,
+                branch: limit,
+            };
+        }
         Self {
             cpu: max_rows::CPU,
             memw: max_rows::MEMW,
