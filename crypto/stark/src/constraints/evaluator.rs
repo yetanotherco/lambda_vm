@@ -14,6 +14,7 @@ use math::{fft::errors::FFTError, field::element::FieldElement};
 use rayon::{
     iter::IndexedParallelIterator,
     prelude::{IntoParallelIterator, ParallelIterator},
+    slice::ParallelSliceMut,
 };
 
 use std::marker::PhantomData;
@@ -21,8 +22,8 @@ use std::marker::PhantomData;
 use std::time::Instant;
 
 pub struct ConstraintEvaluator<
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: Send + Sync + IsField,
+    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync + 'static,
+    FieldExtension: Send + Sync + IsField + 'static,
     PI,
 > {
     boundary_constraints: BoundaryConstraints<FieldExtension>,
@@ -31,8 +32,8 @@ pub struct ConstraintEvaluator<
 }
 impl<Field, FieldExtension, PI> ConstraintEvaluator<Field, FieldExtension, PI>
 where
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: Send + Sync + IsField,
+    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync + 'static,
+    FieldExtension: Send + Sync + IsField + 'static,
 {
     /// Evaluate transition + boundary constraints across the entire LDE domain.
     ///
@@ -78,6 +79,135 @@ where
 
         #[cfg(feature = "parallel")]
         {
+            use std::any::TypeId;
+            use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField as GF;
+            use math::field::fields::fft_friendly::extensions_goldilocks::Degree3GoldilocksExtensionField as D3Ext;
+            use math::field::fields::fft_friendly::u64_goldilocks_packed::{
+                PackedGoldilocks, fp3::PackedFp3,
+            };
+            use math::field::packed::PackedField;
+
+            let is_goldilocks = TypeId::of::<FieldExtension>() == TypeId::of::<D3Ext>()
+                && TypeId::of::<Field>() == TypeId::of::<GF>();
+
+            if is_goldilocks {
+                // === PACKED PATH ===
+                // Type conversion helpers. SAFETY: TypeId check guarantees type identity.
+                // FieldElement is #[repr(transparent)] → layouts are identical.
+                let as_ext = |fe: &FieldElement<FieldExtension>| -> &FieldElement<D3Ext> {
+                    unsafe { &*(fe as *const _ as *const FieldElement<D3Ext>) }
+                };
+                let from_ext = |fe: FieldElement<D3Ext>| -> FieldElement<FieldExtension> {
+                    unsafe { std::mem::transmute_copy(&fe) }
+                };
+                let as_base = |fe: &FieldElement<Field>| -> &FieldElement<GF> {
+                    unsafe { &*(fe as *const _ as *const FieldElement<GF>) }
+                };
+
+                // Pre-broadcast coefficients (computed once, reused for all chunks)
+                let packed_betas: Vec<PackedFp3<PackedGoldilocks>> = transition_coefficients
+                    .iter()
+                    .map(|beta| PackedFp3::broadcast(as_ext(beta)))
+                    .collect();
+
+                let width = PackedGoldilocks::WIDTH;
+                let lde_size = boundary_evaluation.len();
+
+                let mut evaluations_t = boundary_evaluation;
+                evaluations_t
+                    .par_chunks_mut(width)
+                    .enumerate()
+                    .for_each_init(
+                        || {
+                            (
+                                vec![FieldElement::<FieldExtension>::zero(); num_transition],
+                                vec![FieldElement::<Field>::zero(); num_periodic],
+                                Frame::preallocate(
+                                    num_offsets, rows_per_step, num_main_cols, num_aux_cols,
+                                ),
+                                vec![PackedFp3::<PackedGoldilocks>::zero(); num_transition],
+                            )
+                        },
+                        |(transition_buf, periodic_buf, frame, packed_evals),
+                         (chunk_idx, chunk)| {
+                            let base = chunk_idx * width;
+                            let chunk_len = chunk.len();
+
+                            // Reset packed evals
+                            for pe in packed_evals.iter_mut() {
+                                *pe = PackedFp3::zero();
+                            }
+
+                            // Phase 1: Scalar constraint eval + scatter into packed lanes
+                            for local_j in 0..chunk_len {
+                                let i = base + local_j;
+                                frame.fill_from_lde(lde_trace, i, offsets);
+                                for (k, col) in lde_periodic_columns.iter().enumerate() {
+                                    periodic_buf[k] = col[i].clone();
+                                }
+                                let ctx = TransitionEvaluationContext::new_prover(
+                                    frame,
+                                    periodic_buf,
+                                    rap_challenges,
+                                    &logup_alpha_powers,
+                                    logup_table_offset,
+                                );
+                                air.compute_transition_into(&ctx, transition_buf);
+
+                                // Scatter: generic FieldElement<E> → concrete packed lanes
+                                for c in 0..num_transition {
+                                    packed_evals[c].set_lane(local_j, as_ext(&transition_buf[c]));
+                                }
+                            }
+
+                            // Phase 2: Packed accumulation
+                            if is_uniform {
+                                let packed_z = PackedGoldilocks::from_fn(|j| {
+                                    if base + j < lde_size {
+                                        as_base(zerofier_data.get_uniform(base + j)).clone()
+                                    } else {
+                                        FieldElement::<GF>::one()
+                                    }
+                                });
+                                let mut packed_sum = PackedFp3::zero();
+                                for c in 0..num_transition {
+                                    packed_sum = packed_sum + packed_evals[c] * packed_betas[c];
+                                }
+                                let packed_result = packed_sum.mul_scalar(packed_z);
+                                for j in 0..chunk_len {
+                                    chunk[j] = from_ext(packed_result.get_lane(j)) + &chunk[j];
+                                }
+                            } else {
+                                let packed_zerofiers: Vec<PackedGoldilocks> = zerofier_data
+                                    .groups
+                                    .iter()
+                                    .map(|group| {
+                                        PackedGoldilocks::from_fn(|j| {
+                                            if base + j < lde_size {
+                                                as_base(&group[(base + j) % group.len()]).clone()
+                                            } else {
+                                                FieldElement::<GF>::one()
+                                            }
+                                        })
+                                    })
+                                    .collect();
+                                let mut packed_acc = PackedFp3::zero();
+                                for c in 0..num_transition {
+                                    let packed_z =
+                                        packed_zerofiers[zerofier_data.constraint_to_group[c]];
+                                    let z_eval = packed_evals[c].mul_scalar(packed_z);
+                                    packed_acc = packed_acc + z_eval * packed_betas[c];
+                                }
+                                for j in 0..chunk_len {
+                                    chunk[j] = from_ext(packed_acc.get_lane(j)) + &chunk[j];
+                                }
+                            }
+                        },
+                    );
+                return evaluations_t;
+            }
+
+            // === SCALAR FALLBACK (non-Goldilocks fields) ===
             let evaluations_t: Vec<_> = boundary_evaluation
                 .into_par_iter()
                 .enumerate()
@@ -111,7 +241,6 @@ where
                         air.compute_transition_into(&ctx, transition_buf);
 
                         let acc_transition = if is_uniform {
-                            // All constraints share one zerofier: factor it out of the sum.
                             let z = zerofier_data.get_uniform(i);
                             let sum = transition_buf
                                 .iter()

@@ -3,6 +3,7 @@
 //! Holds WIDTH independent Fp3 elements across 3 packed base field values.
 
 use crate::field::element::FieldElement;
+use crate::field::fields::fft_friendly::extensions_goldilocks::Degree3GoldilocksExtensionField;
 use crate::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
 use crate::field::packed::PackedField;
 use core::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
@@ -60,6 +61,36 @@ impl<P: PackedField<Scalar = GoldilocksField>> PackedFp3<P> {
             c1: P::from_fn(|i| c1s[i]),
             c2: P::from_fn(|i| c2s[i]),
         }
+    }
+
+    /// Broadcast a scalar Fp3 to all WIDTH lanes.
+    #[inline(always)]
+    pub fn broadcast(val: &FieldElement<Degree3GoldilocksExtensionField>) -> Self {
+        let components = val.value();
+        Self {
+            c0: P::broadcast(components[0].clone()),
+            c1: P::broadcast(components[1].clone()),
+            c2: P::broadcast(components[2].clone()),
+        }
+    }
+
+    /// Set a single lane from a scalar Fp3.
+    #[inline(always)]
+    pub fn set_lane(&mut self, lane: usize, val: &FieldElement<Degree3GoldilocksExtensionField>) {
+        let components = val.value();
+        self.c0.as_slice_mut()[lane] = components[0].clone();
+        self.c1.as_slice_mut()[lane] = components[1].clone();
+        self.c2.as_slice_mut()[lane] = components[2].clone();
+    }
+
+    /// Extract a single lane as a scalar Fp3.
+    #[inline(always)]
+    pub fn get_lane(&self, lane: usize) -> FieldElement<Degree3GoldilocksExtensionField> {
+        FieldElement::from_raw([
+            self.c0.as_slice()[lane].clone(),
+            self.c1.as_slice()[lane].clone(),
+            self.c2.as_slice()[lane].clone(),
+        ])
     }
 
     /// Optimized squaring: 3 squares + 3 cross-products (no Karatsuba overhead).
@@ -268,6 +299,36 @@ mod tests {
         let result = a * one;
         for i in 0..PackedGoldilocks::WIDTH {
             assert_eq!(to_scalar_fp3(&result, i), to_scalar_fp3(&a, i), "lane {i}");
+        }
+    }
+
+    #[test]
+    fn test_packed_fp3_broadcast() {
+        let val = Fp3E::from_raw([FE::from(42u64), FE::from(99u64), FE::from(7u64)]);
+        let packed = PackedFp3::<PackedGoldilocks>::broadcast(&val);
+        for i in 0..PackedGoldilocks::WIDTH {
+            assert_eq!(packed.get_lane(i), val, "lane {i}");
+        }
+    }
+
+    #[test]
+    fn test_packed_fp3_set_get_lane() {
+        let mut packed = PackedFp3::<PackedGoldilocks>::zero();
+        for i in 0..PackedGoldilocks::WIDTH {
+            let val = Fp3E::from_raw([
+                FE::from((i as u64 + 1) * 11),
+                FE::from((i as u64 + 1) * 22),
+                FE::from((i as u64 + 1) * 33),
+            ]);
+            packed.set_lane(i, &val);
+        }
+        for i in 0..PackedGoldilocks::WIDTH {
+            let expected = Fp3E::from_raw([
+                FE::from((i as u64 + 1) * 11),
+                FE::from((i as u64 + 1) * 22),
+                FE::from((i as u64 + 1) * 33),
+            ]);
+            assert_eq!(packed.get_lane(i), expected, "lane {i}");
         }
     }
 
