@@ -12,7 +12,7 @@ enum SyscallNumbers {
     Panic = 2,
     Commit = 3,
     GetPrivateInputs = 4,
-    Halt = 5,
+    Halt = 93,
 }
 
 impl TryFrom<u64> for SyscallNumbers {
@@ -23,7 +23,7 @@ impl TryFrom<u64> for SyscallNumbers {
             2 => Ok(SyscallNumbers::Panic),
             3 => Ok(SyscallNumbers::Commit),
             4 => Ok(SyscallNumbers::GetPrivateInputs),
-            5 => Ok(SyscallNumbers::Halt),
+            93 => Ok(SyscallNumbers::Halt),
             _ => Err(()),
         }
     }
@@ -277,9 +277,9 @@ impl Instruction {
                 }
             }
             Instruction::EcallEbreak => {
-                let syscall_number = registers.read(17)?; // a7
-                let syscall_number = SyscallNumbers::try_from(syscall_number)
-                    .map_err(|_| ExecutionError::UnknownSyscall(syscall_number))?;
+                let syscall_number_raw = registers.read(17)?; // a7
+                let syscall_number = SyscallNumbers::try_from(syscall_number_raw)
+                    .map_err(|_| ExecutionError::UnknownSyscall(syscall_number_raw))?;
                 match syscall_number {
                     SyscallNumbers::Print => {
                         // print
@@ -320,7 +320,7 @@ impl Instruction {
                         return Ok(Log {
                             current_pc: pc,
                             next_pc: 0, // We halt by setting pc to 0
-                            src1_val: 0,
+                            src1_val: syscall_number_raw, // actual a7 value for rv1
                             src2_val: 0,
                             dst_val: 0,
                         });

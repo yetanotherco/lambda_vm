@@ -9,5 +9,6 @@ main:
 	addw	a2, t0, t0		# 5. 1 + 1 = 2
 	addw	a3, zero, t1		# 6. 0 + 0x80000000 = 0x80000000
 	addw	a4, t1, t1		# 7. overflow test
-	li	a7, 5
+	li	a0, 0
+	li	a7, 93
 	ecall		# 8. Return

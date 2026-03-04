@@ -96,5 +96,6 @@ main:
 
 	# === 63-64: Finalize ===
 	addi	zero, zero, 0		# 63: NOP (writes to zero register)
-	li	a7, 5			# 64: Setup ecall halt
+	li	a0, 0
+	li	a7, 93			# 64: Setup ecall halt
 	ecall				# 65: Halt
