@@ -9,6 +9,9 @@ use math::fft::cpu::bit_reversing::{in_place_bit_reverse_permute, reverse_index}
 use math::fft::cpu::bowers_fft::LayerTwiddles;
 use math::fft::errors::FFTError;
 
+#[cfg(feature = "parallel")]
+use math::fft::polynomial::coset_lde_full_expand_packed;
+
 use log::info;
 use math::field::traits::{IsField, IsSubFieldOf};
 use math::traits::AsBytes;
@@ -50,7 +53,7 @@ type AirTracePair<'a, Field, FieldExtension, PI> = (
 
 /// A default STARK prover implementing `IsStarkProver`.
 pub struct Prover<
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
+    Field: IsSubFieldOf<FieldExtension> + IsFFTField + math::field::packed::HasPacking + Send + Sync,
     FieldExtension: Send + Sync + IsField,
     PI,
 > {
@@ -58,7 +61,7 @@ pub struct Prover<
 }
 
 impl<
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
+    Field: IsSubFieldOf<FieldExtension> + IsFFTField + math::field::packed::HasPacking + Send + Sync,
     FieldExtension: Send + Sync + IsField,
     PI,
 > IsStarkProver<Field, FieldExtension, PI> for Prover<Field, FieldExtension, PI>
@@ -265,7 +268,7 @@ where
 /// The default implementation is complete and is compatible with Stone prover
 /// https://github.com/starkware-libs/stone-prover
 pub trait IsStarkProver<
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
+    Field: IsSubFieldOf<FieldExtension> + IsFFTField + math::field::packed::HasPacking + Send + Sync,
     FieldExtension: Send + Sync + IsField,
     PI,
 >
@@ -445,6 +448,9 @@ pub trait IsStarkProver<
     {
         let num_cols = trace.num_main_columns;
         trace.extract_columns_main_into(main_pool);
+        #[cfg(feature = "parallel")]
+        expand_pool_to_lde_packed(main_pool, num_cols, domain.blowup_factor, twiddles);
+        #[cfg(not(feature = "parallel"))]
         Self::expand_pool_to_lde::<Field>(main_pool, num_cols, domain, twiddles);
 
         let (tree, root) = Self::commit_columns_bit_reversed(&main_pool[..num_cols])
@@ -483,6 +489,9 @@ pub trait IsStarkProver<
     {
         let num_cols = trace.num_main_columns;
         trace.extract_columns_main_into(main_pool);
+        #[cfg(feature = "parallel")]
+        expand_pool_to_lde_packed(main_pool, num_cols, domain.blowup_factor, twiddles);
+        #[cfg(not(feature = "parallel"))]
         Self::expand_pool_to_lde::<Field>(main_pool, num_cols, domain, twiddles);
 
         let (precomputed_tree, precomputed_root) =
@@ -532,6 +541,9 @@ pub trait IsStarkProver<
         // Recompute main LDE into pool buffers (extract columns directly, no T1 transpose)
         let num_main_cols = trace.num_main_columns;
         trace.extract_columns_main_into(main_pool);
+        #[cfg(feature = "parallel")]
+        expand_pool_to_lde_packed(main_pool, num_main_cols, domain.blowup_factor, twiddles);
+        #[cfg(not(feature = "parallel"))]
         Self::expand_pool_to_lde::<Field>(main_pool, num_main_cols, domain, twiddles);
 
         // Use stored Merkle trees from Phase A/C via Rc (pointer copy, no deep clone)
@@ -1830,6 +1842,36 @@ pub trait IsStarkProver<
             trace_length: domain.interpolation_domain_size,
         })
     }
+}
+
+/// Expand pool buffers using packed (SIMD) FFT butterflies for base-field columns.
+///
+/// Uses `coset_lde_full_expand_packed` which processes `WIDTH` field elements per SIMD
+/// instruction in the butterfly inner loops.
+#[cfg(feature = "parallel")]
+fn expand_pool_to_lde_packed<F>(
+    pool: &mut [Vec<FieldElement<F>>],
+    num_cols: usize,
+    blowup_factor: usize,
+    twiddles: &LdeTwiddles<F>,
+) where
+    F: IsFFTField + math::field::packed::HasPacking + Send + Sync,
+    FieldElement<F>: Send + Sync,
+{
+    if num_cols == 0 {
+        return;
+    }
+
+    pool[..num_cols].par_iter_mut().for_each(|buf| {
+        coset_lde_full_expand_packed::<F>(
+            buf,
+            blowup_factor,
+            &twiddles.coset_weights,
+            &twiddles.inv,
+            &twiddles.fwd,
+        )
+        .expect("packed coset LDE expansion");
+    });
 }
 
 /// Print a global bus balance report aggregating per-bus sums across all tables.

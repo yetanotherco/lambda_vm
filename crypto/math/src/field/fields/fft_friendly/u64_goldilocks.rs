@@ -382,6 +382,13 @@ impl IsFFTField for GoldilocksField {
     }
 }
 
+use crate::field::fields::fft_friendly::u64_goldilocks_packed::PackedGoldilocks;
+use crate::field::packed::HasPacking;
+
+impl HasPacking for GoldilocksField {
+    type Packing = PackedGoldilocks;
+}
+
 impl HasDefaultTranscript for GoldilocksField {
     fn get_random_field_element_from_rng(rng: &mut impl rand::Rng) -> FieldElement<Self> {
         let mut sample = [0u8; 8];

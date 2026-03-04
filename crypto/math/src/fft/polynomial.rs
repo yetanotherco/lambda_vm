@@ -19,6 +19,12 @@ use super::cpu::{
 #[cfg(feature = "parallel")]
 use super::cpu::bowers_fft::{bowers_fft_opt_fused_parallel, bowers_ifft_opt_parallel};
 
+#[cfg(feature = "parallel")]
+use super::cpu::bowers_fft::{bowers_fft_opt_fused_packed, bowers_ifft_opt_packed};
+
+#[cfg(feature = "parallel")]
+use crate::field::packed::HasPacking;
+
 /// Threshold for dispatching to parallel FFT.
 /// Below this size, sequential FFT is faster (avoids Rayon overhead).
 /// At 2^14 = 16384 elements, the parallel version starts to win
@@ -54,6 +60,43 @@ fn dispatch_ifft<F: IsFFTField + IsSubFieldOf<E>, E: IsField + Send + Sync>(
         }
     }
     bowers_ifft_opt(buffer, twiddles)
+}
+
+/// Dispatch forward FFT using packed (SIMD) butterflies.
+/// Only for base-field FFT (F = E, data and twiddles same field).
+#[cfg(feature = "parallel")]
+#[inline]
+fn dispatch_fft_packed<F>(
+    buffer: &mut [FieldElement<F>],
+    twiddles: &LayerTwiddles<F>,
+) -> Result<(), FFTError>
+where
+    F: IsFFTField + HasPacking + Send + Sync,
+    FieldElement<F>: Send + Sync,
+{
+    if buffer.len() >= PARALLEL_FFT_THRESHOLD {
+        return bowers_fft_opt_fused_packed::<F, F::Packing>(buffer, twiddles);
+    }
+    // Below threshold, packed sequential still benefits from SIMD
+    bowers_fft_opt_fused_packed::<F, F::Packing>(buffer, twiddles)
+}
+
+/// Dispatch inverse FFT using packed (SIMD) butterflies.
+/// Only for base-field FFT (F = E, data and twiddles same field).
+#[cfg(feature = "parallel")]
+#[inline]
+fn dispatch_ifft_packed<F>(
+    buffer: &mut [FieldElement<F>],
+    twiddles: &LayerTwiddles<F>,
+) -> Result<(), FFTError>
+where
+    F: IsFFTField + HasPacking + Send + Sync,
+    FieldElement<F>: Send + Sync,
+{
+    if buffer.len() >= PARALLEL_FFT_THRESHOLD {
+        return bowers_ifft_opt_packed::<F, F::Packing>(buffer, twiddles);
+    }
+    bowers_ifft_opt_packed::<F, F::Packing>(buffer, twiddles)
 }
 
 impl<E: IsField> Polynomial<FieldElement<E>> {
@@ -531,6 +574,69 @@ where
     Ok(Polynomial::new(&coeffs).scale_coeffs(&scale_factor))
 }
 
+/// In-place coset LDE using packed (SIMD) FFT butterflies.
+///
+/// Same as `Polynomial::coset_lde_full_expand` but uses packed FFT/IFFT for base-field data.
+/// The weight scaling step is also packed: `P::WIDTH` multiplications per iteration.
+///
+/// Only for base-field data (main trace LDE). Extension-field data should use the
+/// scalar `coset_lde_full_expand`.
+#[cfg(feature = "parallel")]
+pub fn coset_lde_full_expand_packed<F>(
+    buffer: &mut Vec<FieldElement<F>>,
+    blowup_factor: usize,
+    weights: &[FieldElement<F>],
+    inv_twiddles: &LayerTwiddles<F>,
+    fwd_twiddles: &LayerTwiddles<F>,
+) -> Result<(), FFTError>
+where
+    F: IsFFTField + HasPacking + Send + Sync,
+    FieldElement<F>: Send + Sync,
+{
+    use crate::field::packed::PackedField;
+
+    let n = buffer.len();
+    if n == 0 {
+        return Ok(());
+    }
+    if !n.is_power_of_two() {
+        return Err(FFTError::InputError(n));
+    }
+    let lde_size = n * blowup_factor;
+
+    if (lde_size.trailing_zeros() as u64) > F::TWO_ADICITY {
+        return Err(FFTError::DomainSizeError(lde_size.trailing_zeros() as usize));
+    }
+
+    // 1. iFFT on buffer[..n] using packed butterflies
+    in_place_bit_reverse_permute(&mut buffer[..n]);
+    dispatch_ifft_packed(&mut buffer[..n], inv_twiddles)?;
+
+    // 2. Packed weight scaling: process WIDTH elements at a time
+    {
+        let (packed_coeffs, scalar_coeffs) =
+            <F::Packing as PackedField>::pack_slice_with_suffix_mut(&mut buffer[..n]);
+        let (packed_weights, scalar_weights) =
+            <F::Packing as PackedField>::pack_slice_with_suffix(weights);
+
+        for (c, w) in packed_coeffs.iter_mut().zip(packed_weights.iter()) {
+            *c = *w * *c;
+        }
+        for (c, w) in scalar_coeffs.iter_mut().zip(scalar_weights.iter()) {
+            *c = w * &*c;
+        }
+    }
+
+    // 3. Zero-pad to lde_size
+    buffer.resize(lde_size, FieldElement::zero());
+
+    // 4. Forward FFT on the full buffer using packed butterflies
+    dispatch_fft_packed(buffer, fwd_twiddles)?;
+    in_place_bit_reverse_permute(buffer);
+
+    Ok(())
+}
+
 #[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::*;
@@ -689,6 +795,195 @@ mod tests {
             .unwrap();
 
             assert_eq!(reference, buffer, "Mismatch for seed {}", seed);
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    mod packed_tests {
+        use super::*;
+        use crate::fft::cpu::bowers_fft::{
+            LayerTwiddles, bowers_fft_opt_fused, bowers_fft_opt_fused_packed,
+            bowers_ifft_opt, bowers_ifft_opt_packed,
+        };
+        use crate::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
+        use crate::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
+        use crate::field::fields::fft_friendly::u64_goldilocks_packed::PackedGoldilocks;
+
+        type F = GoldilocksField;
+        type FE = FieldElement<F>;
+
+        #[test]
+        fn packed_fft_matches_scalar_fft() {
+            // Verify packed FFT produces identical results to scalar FFT
+            // across various sizes.
+            for order in 2..=16 {
+                let n = 1usize << order;
+                let twiddles = LayerTwiddles::<F>::new(order as u64).unwrap();
+
+                let input: Vec<FE> = (0..n).map(|i| FE::from((i * 7 + 13) as u64)).collect();
+
+                // Scalar path
+                let mut scalar = input.clone();
+                bowers_fft_opt_fused(&mut scalar, &twiddles).unwrap();
+                in_place_bit_reverse_permute(&mut scalar);
+
+                // Packed path
+                let mut packed = input;
+                bowers_fft_opt_fused_packed::<F, PackedGoldilocks>(&mut packed, &twiddles).unwrap();
+                in_place_bit_reverse_permute(&mut packed);
+
+                assert_eq!(scalar, packed, "FFT mismatch at order {}", order);
+            }
+        }
+
+        #[test]
+        fn packed_ifft_matches_scalar_ifft() {
+            // Verify packed IFFT produces identical results to scalar IFFT.
+            for order in 2..=16 {
+                let n = 1usize << order;
+                let inv_twiddles = LayerTwiddles::<F>::new_inverse(order as u64).unwrap();
+
+                let input: Vec<FE> = (0..n).map(|i| FE::from((i * 11 + 3) as u64)).collect();
+
+                // Scalar path
+                let mut scalar = input.clone();
+                in_place_bit_reverse_permute(&mut scalar);
+                bowers_ifft_opt(&mut scalar, &inv_twiddles).unwrap();
+
+                // Packed path
+                let mut packed = input;
+                in_place_bit_reverse_permute(&mut packed);
+                bowers_ifft_opt_packed::<F, PackedGoldilocks>(&mut packed, &inv_twiddles).unwrap();
+
+                assert_eq!(scalar, packed, "IFFT mismatch at order {}", order);
+            }
+        }
+
+        #[test]
+        fn packed_fft_roundtrip() {
+            // FFT → IFFT should recover original data (up to 1/n scaling).
+            for order in 2..=14 {
+                let n = 1usize << order;
+                let twiddles = LayerTwiddles::<F>::new(order as u64).unwrap();
+                let inv_twiddles = LayerTwiddles::<F>::new_inverse(order as u64).unwrap();
+
+                let original: Vec<FE> = (0..n).map(|i| FE::from((i * 3 + 1) as u64)).collect();
+
+                let mut data = original.clone();
+
+                // Forward FFT (packed)
+                bowers_fft_opt_fused_packed::<F, PackedGoldilocks>(&mut data, &twiddles).unwrap();
+                in_place_bit_reverse_permute(&mut data);
+
+                // Inverse FFT (packed)
+                in_place_bit_reverse_permute(&mut data);
+                bowers_ifft_opt_packed::<F, PackedGoldilocks>(&mut data, &inv_twiddles).unwrap();
+
+                // Scale by 1/n
+                let n_inv = FE::from(n as u64).inv().unwrap();
+                for val in data.iter_mut() {
+                    *val = &*val * &n_inv;
+                }
+
+                assert_eq!(original, data, "Roundtrip mismatch at order {}", order);
+            }
+        }
+
+        #[test]
+        fn packed_coset_lde_matches_scalar() {
+            // Verify coset_lde_full_expand_packed matches coset_lde_full_expand.
+            let offset = FE::from(3u64);
+            let blowup_factor = 2;
+
+            for order in 2..=14 {
+                let n = 1usize << order;
+                let lde_size = n * blowup_factor;
+
+                let evals: Vec<FE> = (0..n).map(|i| FE::from((i * 7 + 13) as u64)).collect();
+
+                let inv_tw = LayerTwiddles::<F>::new_inverse(n.trailing_zeros() as u64).unwrap();
+                let fwd_tw = LayerTwiddles::<F>::new(lde_size.trailing_zeros() as u64).unwrap();
+
+                let n_inv = FE::from(n as u64).inv().unwrap();
+                let mut weights = Vec::with_capacity(n);
+                let mut offset_power = n_inv;
+                for _ in 0..n {
+                    weights.push(offset_power);
+                    offset_power = &offset_power * &offset;
+                }
+
+                // Scalar path
+                let mut scalar_buf = evals.clone();
+                Polynomial::<FE>::coset_lde_full_expand::<F>(
+                    &mut scalar_buf,
+                    blowup_factor,
+                    &weights,
+                    &inv_tw,
+                    &fwd_tw,
+                )
+                .unwrap();
+
+                // Packed path
+                let mut packed_buf = evals;
+                coset_lde_full_expand_packed::<F>(
+                    &mut packed_buf,
+                    blowup_factor,
+                    &weights,
+                    &inv_tw,
+                    &fwd_tw,
+                )
+                .unwrap();
+
+                assert_eq!(scalar_buf, packed_buf, "Coset LDE mismatch at order {}", order);
+            }
+        }
+
+        #[test]
+        fn packed_coset_lde_blowup_4() {
+            let offset = FE::from(7u64);
+            let blowup_factor = 4;
+
+            for order in 2..=12 {
+                let n = 1usize << order;
+                let lde_size = n * blowup_factor;
+
+                let evals: Vec<FE> = (0..n).map(|i| FE::from((i * 11 + 5) as u64)).collect();
+
+                let inv_tw = LayerTwiddles::<F>::new_inverse(n.trailing_zeros() as u64).unwrap();
+                let fwd_tw = LayerTwiddles::<F>::new(lde_size.trailing_zeros() as u64).unwrap();
+
+                let n_inv = FE::from(n as u64).inv().unwrap();
+                let mut weights = Vec::with_capacity(n);
+                let mut offset_power = n_inv;
+                for _ in 0..n {
+                    weights.push(offset_power);
+                    offset_power = &offset_power * &offset;
+                }
+
+                // Scalar reference
+                let mut scalar_buf = evals.clone();
+                Polynomial::<FE>::coset_lde_full_expand::<F>(
+                    &mut scalar_buf,
+                    blowup_factor,
+                    &weights,
+                    &inv_tw,
+                    &fwd_tw,
+                )
+                .unwrap();
+
+                // Packed path
+                let mut packed_buf = evals;
+                coset_lde_full_expand_packed::<F>(
+                    &mut packed_buf,
+                    blowup_factor,
+                    &weights,
+                    &inv_tw,
+                    &fwd_tw,
+                )
+                .unwrap();
+
+                assert_eq!(scalar_buf, packed_buf, "Blowup-4 mismatch at order {}", order);
+            }
         }
     }
 }

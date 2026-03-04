@@ -72,6 +72,14 @@ pub unsafe trait PackedField:
     fn interleave(&self, other: Self, block_len: usize) -> (Self, Self);
 }
 
+/// Fields that have a SIMD-accelerated packed representation.
+///
+/// This trait connects a scalar field to its best available packed type,
+/// enabling generic code to dispatch to packed FFT butterflies when available.
+pub trait HasPacking: IsField {
+    type Packing: PackedField<Scalar = Self>;
+}
+
 /// Scalar "packed" field — WIDTH=1 fallback for platforms without SIMD.
 #[derive(Debug, Default, PartialEq, Eq)]
 #[repr(transparent)]

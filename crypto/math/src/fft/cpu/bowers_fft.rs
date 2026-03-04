@@ -35,6 +35,7 @@ use crate::fft::errors::FFTError;
 #[cfg(feature = "alloc")]
 use crate::field::{
     element::FieldElement,
+    packed::{HasPacking, PackedField},
     traits::{IsFFTField, IsField, IsSubFieldOf},
 };
 
@@ -718,6 +719,217 @@ fn process_ifft_single_layer_block<F, E>(
     }
 }
 
+// =====================================================
+// PACKED (SIMD) BUTTERFLY FUNCTIONS
+// =====================================================
+
+/// Packed 2-layer fused DIF butterfly.
+///
+/// Operates on a single block of `block_size` elements, processing `WIDTH` lanes at a time.
+/// The block is split into 4 contiguous quarters, each packed into SIMD vectors via
+/// zero-cost pointer cast (`pack_slice_with_suffix_mut`).
+///
+/// Twiddles must be in the same field as the data (base field only).
+#[cfg(all(feature = "alloc", feature = "parallel"))]
+#[inline]
+fn process_fused_block_packed<P: PackedField>(
+    block: &mut [FieldElement<P::Scalar>],
+    twiddles_l0: &[FieldElement<P::Scalar>],
+    twiddles_l1: &[FieldElement<P::Scalar>],
+) where
+    P::Scalar: IsFFTField,
+{
+    let block_size = block.len();
+    let quarter = block_size >> 2;
+
+    debug_assert!(
+        twiddles_l0.len() >= 2 * quarter,
+        "twiddles_l0 too short: {} < {}",
+        twiddles_l0.len(),
+        2 * quarter
+    );
+    debug_assert!(
+        twiddles_l1.len() >= quarter,
+        "twiddles_l1 too short: {} < {}",
+        twiddles_l1.len(),
+        quarter
+    );
+
+    // Split into 4 contiguous quarters
+    let (q01, q23) = block.split_at_mut(2 * quarter);
+    let (q0, q1) = q01.split_at_mut(quarter);
+    let (q2, q3) = q23.split_at_mut(quarter);
+
+    // Zero-cost pack each quarter
+    let (pq0, _) = P::pack_slice_with_suffix_mut(q0);
+    let (pq1, _) = P::pack_slice_with_suffix_mut(q1);
+    let (pq2, _) = P::pack_slice_with_suffix_mut(q2);
+    let (pq3, _) = P::pack_slice_with_suffix_mut(q3);
+
+    // Pack twiddles (contiguous per-layer)
+    let (tw0_first, tw0_second) = twiddles_l0.split_at(quarter);
+    let (ptw0_f, _) = P::pack_slice_with_suffix(tw0_first);
+    let (ptw0_s, _) = P::pack_slice_with_suffix(tw0_second);
+    let (ptw1, _) = P::pack_slice_with_suffix(twiddles_l1);
+
+    // Packed butterfly loop (WIDTH iterations per step)
+    for j in 0..pq0.len() {
+        let w0 = ptw0_f[j];
+        let w1 = ptw0_s[j];
+
+        // First layer butterflies
+        let sum_02 = pq0[j] + pq2[j];
+        let diff_02 = pq0[j] - pq2[j];
+        let diff_02_w = w0 * diff_02;
+
+        let sum_13 = pq1[j] + pq3[j];
+        let diff_13 = pq1[j] - pq3[j];
+        let diff_13_w = w1 * diff_13;
+
+        let w2 = ptw1[j];
+
+        // Second layer butterflies
+        let final_0 = sum_02 + sum_13;
+        let diff_sums = sum_02 - sum_13;
+        let final_1 = w2 * diff_sums;
+
+        let final_2 = diff_02_w + diff_13_w;
+        let diff_diffs = diff_02_w - diff_13_w;
+        let final_3 = w2 * diff_diffs;
+
+        pq0[j] = final_0;
+        pq1[j] = final_1;
+        pq2[j] = final_2;
+        pq3[j] = final_3;
+    }
+
+    // Scalar tail for remainder (quarter % WIDTH != 0)
+    let packed_count = pq0.len() * P::WIDTH;
+    for j in packed_count..quarter {
+        let w0 = &twiddles_l0[j];
+        let w1 = &twiddles_l0[j + quarter];
+
+        let sum_02 = &q0[j] + &q2[j];
+        let diff_02 = &q0[j] - &q2[j];
+        let diff_02_w = w0 * &diff_02;
+
+        let sum_13 = &q1[j] + &q3[j];
+        let diff_13 = &q1[j] - &q3[j];
+        let diff_13_w = w1 * &diff_13;
+
+        let w2 = &twiddles_l1[j];
+
+        let final_0 = &sum_02 + &sum_13;
+        let diff_sums = &sum_02 - &sum_13;
+        let final_1 = w2 * &diff_sums;
+
+        let final_2 = &diff_02_w + &diff_13_w;
+        let diff_diffs = &diff_02_w - &diff_13_w;
+        let final_3 = w2 * &diff_diffs;
+
+        q0[j] = final_0;
+        q1[j] = final_1;
+        q2[j] = final_2;
+        q3[j] = final_3;
+    }
+}
+
+/// Packed single-layer DIF butterfly.
+///
+/// Splits the block into two halves, packs each, and processes WIDTH lanes at a time.
+#[cfg(all(feature = "alloc", feature = "parallel"))]
+#[inline]
+fn process_single_layer_block_packed<P: PackedField>(
+    block: &mut [FieldElement<P::Scalar>],
+    twiddles: &[FieldElement<P::Scalar>],
+    half_block: usize,
+) where
+    P::Scalar: IsFFTField,
+{
+    debug_assert!(
+        twiddles.len() >= half_block,
+        "twiddles too short: {} < {}",
+        twiddles.len(),
+        half_block
+    );
+
+    let (lo, hi) = block.split_at_mut(half_block);
+
+    let (plo, _) = P::pack_slice_with_suffix_mut(lo);
+    let (phi, _) = P::pack_slice_with_suffix_mut(hi);
+    let (ptw, _) = P::pack_slice_with_suffix(twiddles);
+
+    for j in 0..plo.len() {
+        let w = ptw[j];
+        let sum = plo[j] + phi[j];
+        let diff = plo[j] - phi[j];
+        let diff_w = w * diff;
+
+        plo[j] = sum;
+        phi[j] = diff_w;
+    }
+
+    // Scalar tail
+    let packed_count = plo.len() * P::WIDTH;
+    for j in packed_count..half_block {
+        let w = &twiddles[j];
+        let sum = &lo[j] + &hi[j];
+        let diff = &lo[j] - &hi[j];
+        let diff_w = w * &diff;
+
+        lo[j] = sum;
+        hi[j] = diff_w;
+    }
+}
+
+/// Packed single-layer DIT (inverse) butterfly.
+///
+/// Splits the block into two halves, packs each, and processes WIDTH lanes at a time.
+#[cfg(all(feature = "alloc", feature = "parallel"))]
+#[inline]
+fn process_ifft_single_layer_block_packed<P: PackedField>(
+    block: &mut [FieldElement<P::Scalar>],
+    twiddles: &[FieldElement<P::Scalar>],
+    half_block: usize,
+) where
+    P::Scalar: IsFFTField,
+{
+    debug_assert!(
+        twiddles.len() >= half_block,
+        "twiddles too short: {} < {}",
+        twiddles.len(),
+        half_block
+    );
+
+    let (lo, hi) = block.split_at_mut(half_block);
+
+    let (plo, _) = P::pack_slice_with_suffix_mut(lo);
+    let (phi, _) = P::pack_slice_with_suffix_mut(hi);
+    let (ptw, _) = P::pack_slice_with_suffix(twiddles);
+
+    for j in 0..plo.len() {
+        let w = ptw[j];
+        let bw = w * phi[j];
+        let sum = plo[j] + bw;
+        let diff = plo[j] - bw;
+
+        plo[j] = sum;
+        phi[j] = diff;
+    }
+
+    // Scalar tail
+    let packed_count = plo.len() * P::WIDTH;
+    for j in packed_count..half_block {
+        let w = &twiddles[j];
+        let bw = w * &hi[j];
+        let sum = &lo[j] + &bw;
+        let diff = &lo[j] - &bw;
+
+        lo[j] = sum;
+        hi[j] = diff;
+    }
+}
+
 /// Optimized Bowers FFT with 2-layer fusion and sequential twiddle access.
 ///
 /// This is the recommended single-threaded FFT. It combines:
@@ -900,6 +1112,158 @@ where
         let poly = matrix.row_mut(row);
         bowers_fft_opt_fused(poly, layer_twiddles)?;
         in_place_bit_reverse_permute(poly);
+    }
+
+    Ok(())
+}
+
+// =====================================================
+// PACKED (SIMD) BOWERS FFT
+// =====================================================
+
+/// Parallel Bowers FFT with packed (SIMD) inner butterflies.
+///
+/// This is identical to `bowers_fft_opt_fused_parallel` but uses packed butterfly
+/// functions that process `P::WIDTH` lanes simultaneously via SIMD.
+///
+/// Only works when data and twiddles are in the same field (base field FFT).
+/// For extension-field FFT (aux trace), use the scalar variants.
+///
+/// The parallel outer loop (rayon `par_chunks_mut`) and the packed inner loop
+/// compose naturally: each rayon thread processes one block using packed butterflies.
+#[cfg(all(feature = "alloc", feature = "parallel"))]
+pub fn bowers_fft_opt_fused_packed<F, P>(
+    input: &mut [FieldElement<F>],
+    layer_twiddles: &LayerTwiddles<F>,
+) -> Result<(), FFTError>
+where
+    F: IsFFTField + HasPacking<Packing = P>,
+    P: PackedField<Scalar = F>,
+    FieldElement<F>: Send + Sync,
+{
+    let parallel_threshold = adaptive_parallel_threshold();
+
+    let n = input.len();
+    if !n.is_power_of_two() {
+        return Err(FFTError::InputError(n));
+    }
+
+    if n <= 1 {
+        return Ok(());
+    }
+
+    let log_n = n.trailing_zeros() as usize;
+
+    if layer_twiddles.num_layers() != log_n {
+        return Err(FFTError::InputError(n));
+    }
+
+    if n <= 4 {
+        return bowers_fft_opt_fused(input, layer_twiddles);
+    }
+
+    let mut layer = 0;
+
+    // Process pairs of layers with 2-layer fusion + packed butterflies
+    while layer + 1 < log_n {
+        let block_size = n >> layer;
+
+        if block_size >= 4 {
+            let twiddles_l0 = layer_twiddles.get_layer(layer);
+            let twiddles_l1 = layer_twiddles.get_layer(layer + 1);
+            let num_blocks = n / block_size;
+
+            if num_blocks >= parallel_threshold {
+                input.par_chunks_mut(block_size).for_each(|block| {
+                    process_fused_block_packed::<P>(block, twiddles_l0, twiddles_l1);
+                });
+            } else {
+                for block_start in (0..n).step_by(block_size) {
+                    let block = &mut input[block_start..block_start + block_size];
+                    process_fused_block_packed::<P>(block, twiddles_l0, twiddles_l1);
+                }
+            }
+            layer += 2;
+        } else {
+            break;
+        }
+    }
+
+    // Process remaining single layers (if odd number of layers)
+    while layer < log_n {
+        let block_size = n >> layer;
+        let half_block = block_size >> 1;
+        let num_blocks = n / block_size;
+        let twiddles = layer_twiddles.get_layer(layer);
+
+        if num_blocks >= parallel_threshold {
+            input.par_chunks_mut(block_size).for_each(|block| {
+                process_single_layer_block_packed::<P>(block, twiddles, half_block);
+            });
+        } else {
+            for block_start in (0..n).step_by(block_size) {
+                let block = &mut input[block_start..block_start + block_size];
+                process_single_layer_block_packed::<P>(block, twiddles, half_block);
+            }
+        }
+        layer += 1;
+    }
+
+    Ok(())
+}
+
+/// Parallel Bowers IFFT with packed (SIMD) inner butterflies.
+///
+/// Counterpart of `bowers_fft_opt_fused_packed` for the inverse transform.
+/// Does NOT apply 1/n scaling (caller must scale after).
+#[cfg(all(feature = "alloc", feature = "parallel"))]
+pub fn bowers_ifft_opt_packed<F, P>(
+    input: &mut [FieldElement<F>],
+    layer_twiddles: &LayerTwiddles<F>,
+) -> Result<(), FFTError>
+where
+    F: IsFFTField + HasPacking<Packing = P>,
+    P: PackedField<Scalar = F>,
+    FieldElement<F>: Send + Sync,
+{
+    let parallel_threshold = adaptive_parallel_threshold();
+
+    let n = input.len();
+    if !n.is_power_of_two() {
+        return Err(FFTError::InputError(n));
+    }
+
+    if n <= 1 {
+        return Ok(());
+    }
+
+    if n <= 4 {
+        return bowers_ifft_opt(input, layer_twiddles);
+    }
+
+    let log_n = n.trailing_zeros() as usize;
+
+    if layer_twiddles.num_layers() != log_n {
+        return Err(FFTError::InputError(n));
+    }
+
+    // DIT: iterate layers from bottom (log_n - 1) to top (0)
+    for layer in (0..log_n).rev() {
+        let block_size = n >> layer;
+        let half_block = block_size >> 1;
+        let num_blocks = n / block_size;
+        let twiddles = layer_twiddles.get_layer(layer);
+
+        if num_blocks >= parallel_threshold {
+            input.par_chunks_mut(block_size).for_each(|block| {
+                process_ifft_single_layer_block_packed::<P>(block, twiddles, half_block);
+            });
+        } else {
+            for block_start in (0..n).step_by(block_size) {
+                let block = &mut input[block_start..block_start + block_size];
+                process_ifft_single_layer_block_packed::<P>(block, twiddles, half_block);
+            }
+        }
     }
 
     Ok(())
