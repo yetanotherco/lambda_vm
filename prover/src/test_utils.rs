@@ -677,9 +677,7 @@ pub fn create_halt_air(proof_options: &ProofOptions) -> VmAir {
 
 /// Create COMMIT AIR with constraints and bus interactions.
 pub fn create_commit_air(proof_options: &ProofOptions) -> VmAir {
-    let (constraints, _) = commit_constraints(0);
-    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> =
-        constraints.into_iter().map(|c| Box::new(c) as _).collect();
+    let (transition_constraints, _) = commit_constraints(0);
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: commit_bus_interactions(),
