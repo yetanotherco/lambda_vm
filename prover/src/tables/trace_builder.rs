@@ -527,9 +527,8 @@ fn collect_register_ops_from_cpu(
         let (_old_val, old_ts) = register_state.read_pc();
         let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
 
-        let memw_op =
-            MemwOperation::new(true, 510, next_pc_value, op.timestamp + 1, 2, true)
-                .with_old(pc_value, old_timestamps);
+        let memw_op = MemwOperation::new(true, 510, next_pc_value, op.timestamp + 1, 2, true)
+            .with_old(pc_value, old_timestamps);
         memw_ops.push(memw_op);
         register_state.write_pc(op.next_pc, op.timestamp + 1);
     }
@@ -567,8 +566,8 @@ fn collect_halt_ops(register_state: &mut RegisterState) -> Vec<MemwOperation> {
         let (old_val, old_ts) = register_state.read(10);
         let old_value = pack_register_value(old_val);
         let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
-        let memw_op = MemwOperation::new(true, 20, [0; 8], ts, 2, true)
-            .with_old(old_value, old_timestamps);
+        let memw_op =
+            MemwOperation::new(true, 20, [0; 8], ts, 2, true).with_old(old_value, old_timestamps);
         ops.push(memw_op);
         register_state.write(10, 0, ts);
     }
@@ -1569,7 +1568,12 @@ impl Traces {
                 || {
                     rayon::join(
                         || generate_page_tables(elf, &memory_state),
-                        || register::generate_register_trace(&register_final_state, elf.entry_point),
+                        || {
+                            register::generate_register_trace(
+                                &register_final_state,
+                                elf.entry_point,
+                            )
+                        },
                     )
                 },
                 || halt::generate_halt_trace(halt_timestamp),
@@ -1585,7 +1589,8 @@ impl Traces {
             let (pages_v, page_configs_v) = generate_page_tables(elf, &memory_state);
             pages = pages_v;
             page_configs = page_configs_v;
-            register_trace = register::generate_register_trace(&register_final_state, elf.entry_point);
+            register_trace =
+                register::generate_register_trace(&register_final_state, elf.entry_point);
             halt_trace = halt::generate_halt_trace(halt_timestamp);
         }
 

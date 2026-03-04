@@ -87,22 +87,22 @@ fn halt_read_bus_values(base_addr: u64) -> Vec<BusValue> {
         BusValue::constant(0),
         BusValue::constant(0),
         // input (same 16 elements as write format)
-        BusValue::constant(1),                // is_register = 1
-        BusValue::constant(base_addr),        // base_address[0]
-        BusValue::constant(0),                // base_address[1]
-        BusValue::constant(0),                // value[0] = 0
-        BusValue::constant(0),                // value[1]
-        BusValue::constant(0),                // value[2]
-        BusValue::constant(0),                // value[3]
-        BusValue::constant(0),                // value[4]
-        BusValue::constant(0),                // value[5]
-        BusValue::constant(0),                // value[6]
-        BusValue::constant(0),                // value[7]
-        BusValue::constant(0xFFFF_FFFF),      // timestamp[0] = lo(2^64-1)
-        BusValue::constant(0xFFFF_FFFF),      // timestamp[1] = hi(2^64-1)
-        BusValue::constant(1),                // write2 = 1
-        BusValue::constant(0),                // write4 = 0
-        BusValue::constant(0),                // write8 = 0
+        BusValue::constant(1),           // is_register = 1
+        BusValue::constant(base_addr),   // base_address[0]
+        BusValue::constant(0),           // base_address[1]
+        BusValue::constant(0),           // value[0] = 0
+        BusValue::constant(0),           // value[1]
+        BusValue::constant(0),           // value[2]
+        BusValue::constant(0),           // value[3]
+        BusValue::constant(0),           // value[4]
+        BusValue::constant(0),           // value[5]
+        BusValue::constant(0),           // value[6]
+        BusValue::constant(0),           // value[7]
+        BusValue::constant(0xFFFF_FFFF), // timestamp[0] = lo(2^64-1)
+        BusValue::constant(0xFFFF_FFFF), // timestamp[1] = hi(2^64-1)
+        BusValue::constant(1),           // write2 = 1
+        BusValue::constant(0),           // write4 = 0
+        BusValue::constant(0),           // write8 = 0
     ]
 }
 
@@ -112,22 +112,22 @@ fn halt_read_bus_values(base_addr: u64) -> Vec<BusValue> {
 /// timestamp[0..1], write2, write4, write8]`.
 fn halt_write_bus_values(base_addr: u64, value_lo: u64) -> Vec<BusValue> {
     vec![
-        BusValue::constant(1),                // is_register = 1
-        BusValue::constant(base_addr),        // base_address[0]
-        BusValue::constant(0),                // base_address[1]
-        BusValue::constant(value_lo),         // value[0]
-        BusValue::constant(0),                // value[1]
-        BusValue::constant(0),                // value[2]
-        BusValue::constant(0),                // value[3]
-        BusValue::constant(0),                // value[4]
-        BusValue::constant(0),                // value[5]
-        BusValue::constant(0),                // value[6]
-        BusValue::constant(0),                // value[7]
-        BusValue::constant(0xFFFF_FFFF),      // timestamp[0] = lo(2^64-1)
-        BusValue::constant(0xFFFF_FFFF),      // timestamp[1] = hi(2^64-1)
-        BusValue::constant(1),                // write2 = 1
-        BusValue::constant(0),                // write4 = 0
-        BusValue::constant(0),                // write8 = 0
+        BusValue::constant(1),           // is_register = 1
+        BusValue::constant(base_addr),   // base_address[0]
+        BusValue::constant(0),           // base_address[1]
+        BusValue::constant(value_lo),    // value[0]
+        BusValue::constant(0),           // value[1]
+        BusValue::constant(0),           // value[2]
+        BusValue::constant(0),           // value[3]
+        BusValue::constant(0),           // value[4]
+        BusValue::constant(0),           // value[5]
+        BusValue::constant(0),           // value[6]
+        BusValue::constant(0),           // value[7]
+        BusValue::constant(0xFFFF_FFFF), // timestamp[0] = lo(2^64-1)
+        BusValue::constant(0xFFFF_FFFF), // timestamp[1] = hi(2^64-1)
+        BusValue::constant(1),           // write2 = 1
+        BusValue::constant(0),           // write4 = 0
+        BusValue::constant(0),           // write8 = 0
     ]
 }
 

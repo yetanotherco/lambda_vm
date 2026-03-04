@@ -319,7 +319,7 @@ impl Instruction {
                         // halt
                         return Ok(Log {
                             current_pc: pc,
-                            next_pc: 0, // We halt by setting pc to 0
+                            next_pc: 0,                   // We halt by setting pc to 0
                             src1_val: syscall_number_raw, // actual a7 value for rv1
                             src2_val: 0,
                             dst_val: 0,

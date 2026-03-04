@@ -1649,22 +1649,70 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions.push(BusInteraction::sender(
         BusId::Memw,
         Multiplicity::Linear(vec![
-            LinearTerm::Column { coefficient: 1, column: cols::ADD },
-            LinearTerm::Column { coefficient: 1, column: cols::SUB },
-            LinearTerm::Column { coefficient: 1, column: cols::SLT },
-            LinearTerm::Column { coefficient: 1, column: cols::AND },
-            LinearTerm::Column { coefficient: 1, column: cols::OR },
-            LinearTerm::Column { coefficient: 1, column: cols::XOR },
-            LinearTerm::Column { coefficient: 1, column: cols::SHIFT },
-            LinearTerm::Column { coefficient: 1, column: cols::JALR },
-            LinearTerm::Column { coefficient: 1, column: cols::BEQ },
-            LinearTerm::Column { coefficient: 1, column: cols::BLT },
-            LinearTerm::Column { coefficient: 1, column: cols::LOAD },
-            LinearTerm::Column { coefficient: 1, column: cols::STORE },
-            LinearTerm::Column { coefficient: 1, column: cols::MUL },
-            LinearTerm::Column { coefficient: 1, column: cols::DIVREM },
-            LinearTerm::Column { coefficient: 1, column: cols::ECALL },
-            LinearTerm::Column { coefficient: 1, column: cols::EBREAK },
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::ADD,
+            },
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::SUB,
+            },
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::SLT,
+            },
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::AND,
+            },
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::OR,
+            },
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::XOR,
+            },
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::SHIFT,
+            },
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::JALR,
+            },
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::BEQ,
+            },
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::BLT,
+            },
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::LOAD,
+            },
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::STORE,
+            },
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::MUL,
+            },
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::DIVREM,
+            },
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::ECALL,
+            },
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::EBREAK,
+            },
         ]),
         vec![
             // old[0] = PC_0 (low word of current pc)
