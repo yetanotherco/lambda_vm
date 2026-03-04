@@ -352,13 +352,12 @@ pub fn generate_shift_trace(
         data[base + cols::MU] = FE::one();
     }
 
-    // Padding rows: set ZBS=1 and LIMB_SHIFT[0]=1 for consistency.
-    // On padding rows all input/output/MU are 0, so bit_shift=0 → zbs=1,
-    // and the limb_shift one-hot must have exactly one bit set.
+    // Padding rows: set ZBS=1 per spec. All other columns remain 0.
+    // μ=0 so C13 (limb_shift encoding) is inactive. left=right=0 so shifted=0,
+    // making C14 (out=shifted) trivially satisfied regardless of limb_shift.
     for row_idx in operations.len()..num_rows {
         let base = row_idx * cols::NUM_COLUMNS;
         data[base + cols::ZBS] = FE::one();
-        data[base + cols::LIMB_SHIFT[0]] = FE::one();
     }
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
