@@ -432,6 +432,17 @@ fn test_prove_elfs_test_shift_8() {
 }
 
 #[test]
+fn test_prove_elfs_sllw() {
+    let (elf, logs, instructions) = run_asm_elf("sllw");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "sllw failed"
+    );
+}
+
+#[test]
 fn test_prove_elfs_test_bitwise_8() {
     let (elf, logs, instructions) = run_asm_elf("test_bitwise_8");
     let mut traces =
