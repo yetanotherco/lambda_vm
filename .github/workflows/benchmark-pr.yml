@@ -88,6 +88,9 @@ jobs:
             fi
           done
 
+      - name: Add cargo to PATH
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
       - name: Build CLI (PR)
         run: cargo build --release -p cli --features jemalloc-stats
 
