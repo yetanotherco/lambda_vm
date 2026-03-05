@@ -120,6 +120,11 @@ enum Commands {
         #[arg(long)]
         blowup: Option<u8>,
 
+        /// Maximum rows per split table (as a power of 2, e.g. 15 means 2^15 = 32768).
+        /// Smaller values force more table splits, useful for memory scaling benchmarks.
+        #[arg(long)]
+        max_rows_log2: Option<u8>,
+
         /// Print timing breakdown
         #[arg(long)]
         time: bool,
@@ -154,8 +159,9 @@ fn main() -> ExitCode {
             elf,
             output,
             blowup,
+            max_rows_log2,
             time,
-        } => cmd_prove(elf, output, blowup, time),
+        } => cmd_prove(elf, output, blowup, max_rows_log2, time),
         Commands::Verify {
             proof,
             elf,
@@ -249,7 +255,13 @@ fn cmd_execute(elf_path: PathBuf, flamegraph_path: Option<PathBuf>) -> ExitCode 
     ExitCode::SUCCESS
 }
 
-fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, blowup: Option<u8>, time: bool) -> ExitCode {
+fn cmd_prove(
+    elf_path: PathBuf,
+    output_path: PathBuf,
+    blowup: Option<u8>,
+    max_rows_log2: Option<u8>,
+    time: bool,
+) -> ExitCode {
     eprintln!("Reading ELF file...");
     let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
@@ -257,6 +269,23 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, blowup: Option<u8>, time: 
             eprintln!("Failed to read ELF file: {}", e);
             return ExitCode::FAILURE;
         }
+    };
+
+    let max_rows = match max_rows_log2 {
+        Some(log2) => {
+            let n = 1usize << log2;
+            eprintln!("Using max_rows = 2^{log2} = {n} for all tables");
+            prover::MaxRowsConfig {
+                cpu: n,
+                memw: n,
+                dvrm: n,
+                mul: n,
+                lt: n,
+                load: n,
+                branch: n,
+            }
+        }
+        None => prover::MaxRowsConfig::default(),
     };
 
     #[cfg(feature = "jemalloc-stats")]
@@ -276,11 +305,16 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, blowup: Option<u8>, time: 
                 "Generating proof (blowup={b}, queries={})...",
                 opts.fri_number_of_queries
             );
-            prover::prove_with_options(&elf_data, &opts, &Default::default())
+            prover::prove_with_options(&elf_data, &opts, &max_rows)
         }
         None => {
             eprintln!("Generating proof...");
-            prover::prove(&elf_data)
+            prover::prove_with_options(
+                &elf_data,
+                &GoldilocksCubicProofOptions::with_blowup(2)
+                    .expect("blowup=2 is always valid"),
+                &max_rows,
+            )
         }
     };
     let prove_elapsed = start.elapsed();

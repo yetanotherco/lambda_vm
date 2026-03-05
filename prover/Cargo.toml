@@ -8,6 +8,7 @@ default = ["parallel"]
 parallel = ["stark/parallel", "math/parallel", "crypto/parallel", "dep:rayon"]
 debug-checks = ["stark/debug-checks"]
 instruments = ["stark/instruments"]
+memory-trace = ["stark/memory-trace"]
 
 [dependencies]
 stark = { path = "../crypto/stark" }

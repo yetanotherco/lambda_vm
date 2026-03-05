@@ -364,6 +364,9 @@ pub fn prove_with_options(
     #[cfg(feature = "instruments")]
     let phase_start = std::time::Instant::now();
 
+    #[cfg(feature = "memory-trace")]
+    stark::prover::mem_checkpoint("execution done");
+
     // Generate all traces from ELF and execution logs.
     // Page tables are derived from the prover's MemoryState (all accessed pages).
     let mut traces = Traces::from_elf_and_logs(&program, &result.logs, max_rows)?;
@@ -376,6 +379,10 @@ pub fn prove_with_options(
     let phase_start = std::time::Instant::now();
 
     let table_counts = traces.table_counts();
+
+    #[cfg(feature = "memory-trace")]
+    stark::prover::mem_checkpoint(&format!("traces generated ({})", table_counts.total() + 5));
+
     let airs = VmAirs::new(
         &program,
         proof_options,
