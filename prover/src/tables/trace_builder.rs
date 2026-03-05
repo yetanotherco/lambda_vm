@@ -503,7 +503,11 @@ fn collect_commit_memw_ops(
         let old_value = pack_register_value(1); // fd = 1
         let new_value = pack_register_value(count);
         let reg_addr = 2 * 10u64; // x10 → addr 20
-        let (_old_val, old_ts) = register_state.read(10);
+        let (old_val, old_ts) = register_state.read(10);
+        debug_assert_eq!(
+            old_val, 1,
+            "ECALL commit: x10 (fd) must be 1, got {old_val}"
+        );
         let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
         let memw_op = MemwOperation::new(true, reg_addr, new_value, ts, 2, false)
             .with_old(old_value, old_timestamps);
