@@ -672,6 +672,14 @@ where
     if !n.is_power_of_two() {
         return Err(FFTError::InputError(n));
     }
+    debug_assert_eq!(
+        layer_twiddles.num_layers(),
+        n.trailing_zeros() as usize,
+        "twiddle table has {} layers but input size {} requires {}",
+        layer_twiddles.num_layers(),
+        n,
+        n.trailing_zeros()
+    );
 
     let mut result = coeffs.to_vec();
     dispatch_fft(&mut result, layer_twiddles)?;
@@ -728,6 +736,14 @@ where
     if !n.is_power_of_two() {
         return Err(FFTError::InputError(n));
     }
+    debug_assert_eq!(
+        inv_twiddles.num_layers(),
+        n.trailing_zeros() as usize,
+        "twiddle table has {} layers but input size {} requires {}",
+        inv_twiddles.num_layers(),
+        n,
+        n.trailing_zeros()
+    );
 
     let mut coeffs = fft_evals.to_vec();
     // Bowers iFFT: bit-reverse first (natural → bit-reversed), then DIT inverse butterflies

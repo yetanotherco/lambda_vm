@@ -263,8 +263,8 @@ where
         }
     }
 
-    // Process remaining single layers (if odd number of layers)
-    while layer < log_n {
+    // Process remaining single layer (if odd number of layers)
+    if layer < log_n {
         let block_size = n >> layer;
         let half_block = block_size >> 1;
         let num_blocks = n / block_size;
@@ -290,14 +290,13 @@ where
                 }
             }
         }
-        layer += 1;
     }
 
     Ok(())
 }
 
 /// Process a single block with 2-layer fusion (DIF butterfly).
-#[cfg(all(feature = "alloc", feature = "parallel"))]
+#[cfg(feature = "alloc")]
 #[inline]
 fn process_fused_block<F, E>(
     block: &mut [FieldElement<E>],
@@ -637,40 +636,10 @@ where
         if outer_block_size >= 4 {
             let twiddles_inner = layer_twiddles.get_layer(inner_layer);
             let twiddles_outer = layer_twiddles.get_layer(outer_layer);
-            let quarter = outer_block_size >> 2;
 
             for block_start in (0..n).step_by(outer_block_size) {
                 let block = &mut input[block_start..block_start + outer_block_size];
-
-                for j in 0..quarter {
-                    let i0 = j;
-                    let i1 = j + quarter;
-                    let i2 = j + 2 * quarter;
-                    let i3 = j + 3 * quarter;
-
-                    let w_inner = &twiddles_inner[j];
-
-                    // Inner layer: DIT butterflies on two sub-blocks
-                    let bw_01 = w_inner * &block[i1];
-                    let r0 = &block[i0] + &bw_01;
-                    let r1 = &block[i0] - &bw_01;
-
-                    let bw_23 = w_inner * &block[i3];
-                    let r2 = &block[i2] + &bw_23;
-                    let r3 = &block[i2] - &bw_23;
-
-                    // Outer layer: DIT butterflies on results
-                    let w0 = &twiddles_outer[j];
-                    let w1 = &twiddles_outer[j + quarter];
-
-                    let bw_r2 = w0 * &r2;
-                    block[i0] = &r0 + &bw_r2;
-                    block[i2] = &r0 - &bw_r2;
-
-                    let bw_r3 = w1 * &r3;
-                    block[i1] = &r1 + &bw_r3;
-                    block[i3] = &r1 - &bw_r3;
-                }
+                process_ifft_fused_block(block, twiddles_inner, twiddles_outer);
             }
             layers_remaining -= 2;
         } else {
@@ -679,8 +648,8 @@ where
     }
 
     // Process remaining single layer (if odd number of layers)
-    while layers_remaining >= 1 {
-        let layer = layers_remaining - 1;
+    if layers_remaining == 1 {
+        let layer = 0;
         let block_size = n >> layer;
         let half_block = block_size >> 1;
         let twiddles = layer_twiddles.get_layer(layer);
@@ -699,7 +668,6 @@ where
                 input[i1] = diff;
             }
         }
-        layers_remaining -= 1;
     }
 
     Ok(())
@@ -781,8 +749,8 @@ where
     }
 
     // Process remaining single layer (if odd number of layers)
-    while layers_remaining >= 1 {
-        let layer = layers_remaining - 1;
+    if layers_remaining == 1 {
+        let layer = 0;
         let block_size = n >> layer;
         let half_block = block_size >> 1;
         let num_blocks = n / block_size;
@@ -808,7 +776,6 @@ where
                 }
             }
         }
-        layers_remaining -= 1;
     }
 
     Ok(())
@@ -845,7 +812,7 @@ fn process_ifft_single_layer_block<F, E>(
 }
 
 /// Process a fused 2-layer IFFT block (DIT butterfly: inner layer then outer layer).
-#[cfg(all(feature = "alloc", feature = "parallel"))]
+#[cfg(feature = "alloc")]
 #[inline]
 fn process_ifft_fused_block<F, E>(
     block: &mut [FieldElement<E>],
@@ -965,57 +932,8 @@ where
             let twiddles_l1 = layer_twiddles.get_layer(layer + 1);
 
             for block_start in (0..n).step_by(block_size) {
-                let quarter = block_size >> 2;
                 let block = &mut input[block_start..block_start + block_size];
-
-                // Verify twiddle arrays have sufficient length
-                debug_assert!(
-                    twiddles_l0.len() >= 2 * quarter,
-                    "twiddles_l0 too short: {} < {}",
-                    twiddles_l0.len(),
-                    2 * quarter
-                );
-                debug_assert!(
-                    twiddles_l1.len() >= quarter,
-                    "twiddles_l1 too short: {} < {}",
-                    twiddles_l1.len(),
-                    quarter
-                );
-
-                for j in 0..quarter {
-                    let i0 = j;
-                    let i1 = j + quarter;
-                    let i2 = j + 2 * quarter;
-                    let i3 = j + 3 * quarter;
-
-                    let w0 = &twiddles_l0[j];
-                    let w1 = &twiddles_l0[j + quarter];
-
-                    // First layer butterflies
-                    let sum_02 = &block[i0] + &block[i2];
-                    let diff_02 = &block[i0] - &block[i2];
-                    let diff_02_w = w0 * &diff_02;
-
-                    let sum_13 = &block[i1] + &block[i3];
-                    let diff_13 = &block[i1] - &block[i3];
-                    let diff_13_w = w1 * &diff_13;
-
-                    let w2 = &twiddles_l1[j];
-
-                    // Second layer butterflies
-                    let final_0 = &sum_02 + &sum_13;
-                    let diff_sums = &sum_02 - &sum_13;
-                    let final_1 = w2 * &diff_sums;
-
-                    let final_2 = &diff_02_w + &diff_13_w;
-                    let diff_diffs = &diff_02_w - &diff_13_w;
-                    let final_3 = w2 * &diff_diffs;
-
-                    block[i0] = final_0;
-                    block[i1] = final_1;
-                    block[i2] = final_2;
-                    block[i3] = final_3;
-                }
+                process_fused_block(block, twiddles_l0, twiddles_l1);
             }
             layer += 2;
         } else {
@@ -1023,8 +941,8 @@ where
         }
     }
 
-    // Process remaining single layers (if odd number of layers)
-    while layer < log_n {
+    // Process remaining single layer (if odd number of layers)
+    if layer < log_n {
         let block_size = n >> layer;
         let half_block = block_size >> 1;
         let twiddles = layer_twiddles.get_layer(layer);
@@ -1043,7 +961,6 @@ where
                 input[i1] = diff_w;
             }
         }
-        layer += 1;
     }
 
     Ok(())
