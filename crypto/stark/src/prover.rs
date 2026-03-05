@@ -10,6 +10,17 @@ use math::fft::cpu::bowers_fft::LayerTwiddles;
 use math::fft::errors::FFTError;
 
 use log::info;
+
+/// Print current jemalloc allocated bytes as a memory checkpoint.
+/// Only available when the `memory-trace` feature is enabled.
+#[cfg(feature = "memory-trace")]
+pub fn mem_checkpoint(label: &str) {
+    tikv_jemalloc_ctl::epoch::advance().ok();
+    if let Ok(allocated) = tikv_jemalloc_ctl::stats::allocated::read() {
+        let mb = allocated / (1024 * 1024);
+        eprintln!("[mem] {label}: {mb} MB");
+    }
+}
 use math::field::traits::{IsField, IsSubFieldOf};
 use math::traits::AsBytes;
 use math::{
@@ -1399,6 +1410,8 @@ pub trait IsStarkProver<
         info!("Started proof generation...");
 
         let num_airs = air_trace_pairs.len();
+        #[cfg(feature = "memory-trace")]
+        mem_checkpoint(&format!("multi_prove start ({num_airs} tables)"));
 
         // Check if any AIR has an auxiliary trace
         let needs_lookup_challenges = air_trace_pairs
@@ -1438,6 +1451,9 @@ pub trait IsStarkProver<
             .map(|_| Vec::with_capacity(max_lde_size))
             .collect();
 
+        #[cfg(feature = "memory-trace")]
+        mem_checkpoint("pools allocated");
+
         // =====================================================================
         // Round 1, Phase A: Commit all main traces (lightweight)
         // =====================================================================
@@ -1472,7 +1488,16 @@ pub trait IsStarkProver<
                 precomputed_root: pre_root,
                 num_precomputed_cols: n_pre,
             });
+
+            #[cfg(feature = "memory-trace")]
+            {
+                let name = air.name();
+                mem_checkpoint(&format!("Phase A: committed {name} ({}/{})", main_commits.len(), num_airs));
+            }
         }
+
+        #[cfg(feature = "memory-trace")]
+        mem_checkpoint("Phase A done (all main traces committed)");
 
         // =====================================================================
         // Round 1, Phase B: Sample shared LogUp challenges
@@ -1513,6 +1538,9 @@ pub trait IsStarkProver<
                 }
             })
             .collect();
+
+        #[cfg(feature = "memory-trace")]
+        mem_checkpoint("Phase C pass 1 done (all aux traces built)");
 
         // Pass 2: Sequential fork transcript → extract → LDE → commit.
         // Uses shared aux_pool. Each table gets its own transcript fork.
@@ -1566,7 +1594,16 @@ pub trait IsStarkProver<
                 bus_public_inputs,
             });
             table_transcripts.push(table_transcript);
+
+            #[cfg(feature = "memory-trace")]
+            {
+                let name = air.name();
+                mem_checkpoint(&format!("Phase C pass 2: committed aux {name} ({}/{})", metadatas.len(), num_airs));
+            }
         }
+
+        #[cfg(feature = "memory-trace")]
+        mem_checkpoint("Phase C done (all aux committed, entering Rounds 2-4)");
 
         #[cfg(feature = "debug-checks")]
         Self::run_debug_checks(
@@ -1609,6 +1646,12 @@ pub trait IsStarkProver<
                 table_transcript.append_field_element(&bpi.table_contribution);
             }
 
+            #[cfg(feature = "memory-trace")]
+            {
+                let name = air.name();
+                mem_checkpoint(&format!("Rounds 2-4: reconstructed LDE for {name} ({}/{})", proofs.len() + 1, num_airs));
+            }
+
             let proof = Self::prove_rounds_2_to_4(
                 *air,
                 *pub_inputs,
@@ -1626,6 +1669,12 @@ pub trait IsStarkProver<
             }
             for (slot, col) in aux_pool.iter_mut().zip(aux_cols) {
                 *slot = col;
+            }
+
+            #[cfg(feature = "memory-trace")]
+            {
+                let name = air.name();
+                mem_checkpoint(&format!("Rounds 2-4: finished {name} ({}/{})", proofs.len(), num_airs));
             }
         }
 

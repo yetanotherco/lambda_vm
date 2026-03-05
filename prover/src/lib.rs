@@ -348,10 +348,17 @@ pub fn prove_with_options(
         .run()
         .map_err(|e| Error::Execution(format!("{e}")))?;
 
+    #[cfg(feature = "memory-trace")]
+    stark::prover::mem_checkpoint("execution done");
+
     // Generate all traces from ELF and execution logs.
     // Page tables are derived from the prover's MemoryState (all accessed pages).
     let mut traces = Traces::from_elf_and_logs(&program, &result.logs, max_rows)?;
     let table_counts = traces.table_counts();
+
+    #[cfg(feature = "memory-trace")]
+    stark::prover::mem_checkpoint(&format!("traces generated ({})", table_counts.total() + 5));
+
     let airs = VmAirs::new(
         &program,
         proof_options,
