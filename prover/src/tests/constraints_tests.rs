@@ -624,11 +624,11 @@ fn test_create_all_cpu_constraints() {
     assert_eq!(is_bit.len(), 31);
     // ADD constraints: 2 (ADD+LOAD) + 2 (STORE: arg1+imm) + 2 (SUB+BEQ) + 2 (JALR) = 8
     assert_eq!(add.len(), 8);
-    // Other: branch_cond(1) + ebreak(1) + arg1(2) + arg2(2) + rvd(2) + slt_zero(7) + sign_bit_zero(1) + next_pc(2) = 18
-    assert_eq!(other.len(), 18);
+    // Other: branch_cond(1) + ebreak(1) + arg1(2) + arg2(2) + rvd(2) + slt_zero(7) + sign_bit_zero(1) + ecall_commit_implies_ecall(1) + next_pc(2) = 19
+    assert_eq!(other.len(), 19);
 
-    // Total should be 31 + 8 + 18 = 57
-    assert_eq!(total, 57);
+    // Total should be 31 + 8 + 19 = 58
+    assert_eq!(total, 58);
     assert_eq!(total, NUM_CPU_CONSTRAINTS);
 }
 

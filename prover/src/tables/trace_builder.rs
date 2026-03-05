@@ -499,6 +499,8 @@ fn collect_commit_memw_ops(
 
     // Combined read+write x10 at ts: old=fd=1, new=count
     // This atomically asserts x10 held fd=1 and writes count as return value.
+    // Uses is_read=true so MEMW activates the CO24 receiver (24 elements with old[]),
+    // matching the COMMIT chip's CO24 bus send format.
     {
         let old_value = pack_register_value(1); // fd = 1
         let new_value = pack_register_value(count);
@@ -509,7 +511,7 @@ fn collect_commit_memw_ops(
             "ECALL commit: x10 (fd) must be 1, got {old_val}"
         );
         let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
-        let memw_op = MemwOperation::new(true, reg_addr, new_value, ts, 2, false)
+        let memw_op = MemwOperation::new(true, reg_addr, new_value, ts, 2, true)
             .with_old(old_value, old_timestamps);
         memw_ops.push(memw_op);
         register_state.write(10, count, ts);
