@@ -1526,32 +1526,13 @@ pub trait IsStarkProver<
         //   Pass 1 (parallel): Build all auxiliary traces (fingerprint + batch inversion)
         //   Pass 2 (sequential): Fork transcript → extract → LDE → commit (shared pool)
 
-        // Pass 1: Build aux traces in parallel.
-        // Each build_auxiliary_trace has internal parallelism (batch_inverse, par_chunks),
-        // but outer parallelism over 12 tables also helps on high-core-count machines.
-        #[cfg(feature = "parallel")]
-        let aux_iter = air_trace_pairs.par_iter_mut();
-        #[cfg(not(feature = "parallel"))]
-        let aux_iter = air_trace_pairs.iter_mut();
-        let bus_inputs_vec: Vec<Option<BusPublicInputs<FieldExtension>>> = aux_iter
-            .map(|(air, trace, _)| {
-                if air.has_aux_trace() {
-                    air.build_auxiliary_trace(*trace, &lookup_challenges)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        #[cfg(feature = "memory-trace")]
-        mem_checkpoint("Phase C pass 1 done (all aux traces built)");
-
         // =====================================================================
-        // Pass 2 + Rounds 2-4: Merged per-table loop
+        // Per-table loop: build aux + commit + prove + drop
         // =====================================================================
-        // For each table: fork transcript → commit aux → recompute main LDE →
+        // For each table: build aux trace → commit aux → recompute main LDE →
         // build Round1 directly → prove rounds 2-4 → drop (frees Merkle trees).
-        // This keeps peak memory at Phase A (all main commits) + one table's aux.
+        // Aux is built one table at a time (internal parallelism via batch_inverse/par_chunks)
+        // so only one table's aux data exists at a time. Peak memory = Phase A.
 
         let mut proofs = Vec::with_capacity(num_airs);
         #[cfg(feature = "debug-checks")]
@@ -1560,14 +1541,25 @@ pub trait IsStarkProver<
 
         for (
             idx,
-            ((((air, trace, pub_inputs), bus_public_inputs), main_commit), (domain, twiddles)),
+            (((air, trace, pub_inputs), main_commit), (domain, twiddles)),
         ) in air_trace_pairs
-            .iter()
-            .zip(bus_inputs_vec.into_iter())
+            .iter_mut()
             .zip(main_commits.into_iter())
             .zip(domains.iter().zip(twiddle_caches.iter()))
             .enumerate()
         {
+            // Build auxiliary trace for this table
+            let bus_public_inputs = if air.has_aux_trace() {
+                air.build_auxiliary_trace(*trace, &lookup_challenges)
+            } else {
+                None
+            };
+
+            #[cfg(feature = "memory-trace")]
+            {
+                let name = air.name();
+                mem_checkpoint(&format!("table {name}: aux built ({}/{})", idx + 1, num_airs));
+            }
             // Fork transcript with domain separator (must match verifier)
             let mut table_transcript = transcript.clone();
             if num_airs > 1 {
