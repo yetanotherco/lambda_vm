@@ -599,15 +599,14 @@ fn test_missing_receiver() {
 // First-row boundary constraints
 // =============================================================================
 
-/// A proof where initial_terms[0] has been tampered with is rejected.
+/// A proof where table_contribution has been tampered with is rejected.
 ///
-/// The ADD table exposes its term column value at row 0 as a public input
-/// (initial_terms[0]). The verifier enforces term_col_0(ω^0) = initial_terms[0]
-/// as a boundary constraint. We simulate a dishonest prover by corrupting
-/// initial_terms[0] in the proof after generation. The composition polynomial
-/// check then fails because the committed trace disagrees with the claimed value.
+/// The table_contribution (L) is used both for the bus balance check
+/// (Σ L = 0 across all tables) and for the per-row circular constraint
+/// offset (L/N). Corrupting it causes the circular transition constraint
+/// to fail, since the committed trace was built with the honest L.
 #[test_log::test]
-fn test_tampered_accumulator_first_row() {
+fn test_tampered_table_contribution() {
     // Simple valid trace: CPU sends (5, 3, 8) to the ADD table.
     let mut cpu_trace = TraceTable::from_columns_main(
         vec![
@@ -656,35 +655,33 @@ fn test_tampered_accumulator_first_row() {
     let mut multi_proof =
         Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
-    // Corrupt initial_terms[0] in the ADD table's bus public inputs.
-    // ADD has 1 interaction (receiver), so initial_terms has 1 element.
-    // Changing this breaks the boundary constraint for term_col_0 at row 0:
-    // the verifier will enforce term_col_0(ω^0) = corrupted value, but the
-    // committed trace has the honest value, causing the composition poly check to fail.
+    // Corrupt table_contribution in the ADD table's bus public inputs.
+    // This changes the per-row offset L/N used in the circular constraint,
+    // so the verifier's transition constraint evaluation will disagree with the
+    // committed trace (which was built with the honest L).
     let add_proof = &mut multi_proof.proofs[1]; // proofs: [cpu=0, add=1, mul=2]
     let bus_inputs = add_proof
         .bus_public_inputs
         .as_mut()
         .expect("ADD table must have bus public inputs");
-    bus_inputs.initial_terms[0] += FieldElement::<E>::one();
+    bus_inputs.table_contribution += FieldElement::<E>::one();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
 
     assert!(
         !Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
-        "Proof with corrupted initial_terms[0] must be rejected"
+        "Proof with corrupted table_contribution must be rejected"
     );
 }
 
-/// A proof where the acc column OOD evaluation at row 0 is tampered with is rejected.
+/// A proof where the acc column OOD evaluation is tampered with is rejected.
 ///
-/// The verifier enforces acc(ω^0) = Σ initial_terms as a boundary constraint.
-/// We keep initial_terms honest but corrupt the acc column's OOD evaluation directly.
-/// The composition polynomial check then fails because the committed acc(z) no longer
-/// matches the expected value Σ initial_terms.
+/// The circular transition constraint enforces the relationship between
+/// consecutive acc column values at every step. Corrupting the acc column's
+/// OOD evaluation breaks this constraint at the OOD point.
 #[test_log::test]
-fn test_tampered_acc_ood_first_row() {
+fn test_tampered_acc_ood_evaluation() {
     // Simple valid trace: CPU sends (5, 3, 8) to the ADD table.
     let mut cpu_trace = TraceTable::from_columns_main(
         vec![
@@ -734,13 +731,11 @@ fn test_tampered_acc_ood_first_row() {
         Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     // Corrupt the acc column OOD evaluation in the ADD table proof.
-    // ADD has 4 main columns + 1 interaction column + 1 acc column, so the aux layout is:
-    //   column 4 (OOD) = term column,  column 5 (OOD) = acc column
-    // initial_terms is kept honest, so the verifier's expected value Σ initial_terms
-    // is correct. But acc(z) no longer matches it → composition poly check fails.
+    // With batching + absorption, ADD has 4 main columns and 1 aux column
+    // (the accumulated column — all interactions are absorbed).
+    // The acc column is the last aux column.
     let num_main = 4usize;
-    let num_interactions = 1usize;
-    let acc_col_ood_idx = num_main + num_interactions;
+    let acc_col_ood_idx = num_main; // first (and only) aux column
     let add_proof = &mut multi_proof.proofs[1]; // proofs: [cpu=0, add=1, mul=2]
     let corrupted = *add_proof.trace_ood_evaluations.get(0, acc_col_ood_idx) + FieldElement::one();
     add_proof
@@ -752,7 +747,7 @@ fn test_tampered_acc_ood_first_row() {
 
     assert!(
         !Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
-        "Proof with corrupted acc[0] OOD evaluation must be rejected"
+        "Proof with corrupted acc OOD evaluation must be rejected"
     );
 }
 
@@ -827,13 +822,63 @@ fn test_missing_bus_public_inputs_rejected() {
     );
 }
 
-/// A proof where initial_terms has fewer elements than expected is rejected.
+/// A proof where a non-LogUp AIR has bus_public_inputs injected is rejected.
 ///
-/// The verifier checks that initial_terms.len() == num_interactions before
-/// evaluating boundary constraints. A shorter vector would otherwise cause
-/// some term boundary constraints to be silently skipped.
+/// A dishonest prover could inject a compensating table_contribution into a
+/// table that has no LogUp constraints, making the bus balance ΣL = 0 while
+/// the actual lookup interactions don't balance. The verifier must reject
+/// any proof that contains bus_public_inputs for an AIR without trace interaction.
 #[test_log::test]
-fn test_initial_terms_length_mismatch_rejected() {
+fn test_injected_bus_public_inputs_on_non_logup_air_rejected() {
+    use crate::examples::dummy_air::{self, DummyAIR};
+    use crate::lookup::BusPublicInputs;
+
+    type DummyF = F; // GoldilocksField (same base and extension for DummyAIR)
+
+    let trace_length = 16;
+    let mut trace = dummy_air::dummy_trace::<DummyF>(trace_length);
+    let proof_options = ProofOptions::default_test_options();
+    let air = DummyAIR::new(&proof_options);
+
+    let mut proof = Prover::<DummyF, DummyF, ()>::prove(
+        &air,
+        &mut trace,
+        &(),
+        &mut DefaultTranscript::<DummyF>::new(&[]),
+    )
+    .unwrap();
+
+    // Inject fake bus_public_inputs into a non-LogUp proof.
+    // DummyAIR has has_trace_interaction() = false, so this must be rejected.
+    proof.bus_public_inputs = Some(BusPublicInputs {
+        table_contribution: FieldElement::<DummyF>::from(42u64),
+        #[cfg(feature = "debug-checks")]
+        per_bus_sums: Default::default(),
+        #[cfg(feature = "debug-checks")]
+        per_bus_sender_sums: Default::default(),
+        #[cfg(feature = "debug-checks")]
+        per_bus_receiver_sums: Default::default(),
+        #[cfg(feature = "debug-checks")]
+        table_name: "FAKE".to_string(),
+    });
+
+    assert!(
+        !Verifier::<DummyF, DummyF, ()>::verify(
+            &proof,
+            &air,
+            &mut DefaultTranscript::<DummyF>::new(&[])
+        ),
+        "Proof with injected bus_public_inputs on non-LogUp AIR must be rejected"
+    );
+}
+
+/// A proof where table_contribution is zeroed out is rejected.
+///
+/// Setting table_contribution to zero changes the per-row offset L/N to zero,
+/// which breaks the circular transition constraint since the committed trace
+/// was built with the honest (non-zero) L.
+#[test_log::test]
+fn test_zeroed_table_contribution_rejected() {
     let mut cpu_trace = TraceTable::from_columns_main(
         vec![
             vec![FE::one(), FE::zero(), FE::zero(), FE::zero()],
@@ -881,20 +926,20 @@ fn test_initial_terms_length_mismatch_rejected() {
     let mut multi_proof =
         Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
-    // Truncate initial_terms to empty — ADD has 1 interaction so expected length is 1.
+    // Zero out table_contribution for the ADD table.
     let add_proof = &mut multi_proof.proofs[1];
     let bus_inputs = add_proof
         .bus_public_inputs
         .as_mut()
         .expect("ADD table must have bus public inputs");
-    bus_inputs.initial_terms.clear();
+    bus_inputs.table_contribution = FieldElement::<E>::zero();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
 
     assert!(
         !Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
-        "Proof with initial_terms length mismatch must be rejected"
+        "Proof with zeroed table_contribution must be rejected"
     );
 }
 

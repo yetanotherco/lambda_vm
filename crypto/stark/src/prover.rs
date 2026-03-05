@@ -636,6 +636,7 @@ pub trait IsStarkProver<
                 *trace,
                 domain,
                 &round_1_result.rap_challenges,
+                round_1_result.bus_public_inputs.as_ref(),
             );
         }
     }
@@ -1602,6 +1603,11 @@ pub trait IsStarkProver<
                 &mut main_pool,
                 &mut aux_pool,
             )?;
+
+            // Bind table_contribution (L) to transcript for defense-in-depth.
+            if let Some(ref bpi) = round_1_result.bus_public_inputs {
+                table_transcript.append_field_element(&bpi.table_contribution);
+            }
 
             let proof = Self::prove_rounds_2_to_4(
                 *air,
