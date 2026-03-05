@@ -521,8 +521,8 @@ summarize_mem_trace() {
         if (line ~ /Phase C pass 1 done/)        { tag = "aux traces";     keep = 1 }
         if (line ~ /Phase C done/)               { tag = "Phase C done";   keep = 1 }
 
-        # New code: per-table proving (last entry = final)
-        if (line ~ /Rounds 2-4: finished/) {
+        # New code (merged loop): per-table proving (last entry = final)
+        if (line ~ /Rounds 2-4: finished/ || line ~ /: proved/) {
             last_r24_mb = mb
             r24_count++
             if (r24_count == 1) first_r24_mb = mb

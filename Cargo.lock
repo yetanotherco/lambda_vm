@@ -3739,6 +3739,7 @@ dependencies = [
  "sha3",
  "test-log",
  "thiserror 1.0.69",
+ "tikv-jemalloc-ctl",
  "wasm-bindgen",
  "wasm-bindgen-test",
  "web-sys",
