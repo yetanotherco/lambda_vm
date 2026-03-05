@@ -195,8 +195,10 @@ patch_memory_trace() {
         next
     }
 
-    # After main_commits.push(...) -> per-table Phase A checkpoint (a0035c1+ code)
-    /main_commits\.push\(/ {
+    # After main_commits.push(MainCommitData { ... }); -> Phase A checkpoint (a0035c1+ code)
+    /main_commits\.push\(/ { in_main_push = 1 }
+    in_main_push == 1 && /\}\);/ {
+        in_main_push = 0
         print
         print ""
         print "            #[cfg(feature = \"memory-trace\")]"
