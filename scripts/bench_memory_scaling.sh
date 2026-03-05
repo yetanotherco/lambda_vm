@@ -602,10 +602,16 @@ summarize_mem_trace() {
             printf "    %-14s %6d MB  %s MB  %s\n", names[i], vals[i], ds, bar
         }
 
-        # Show per-table loop trend
-        if (table_count > 1) {
-            diff = last_table_mb - first_table_mb
-            printf "\n    Per-table loop: %d tables, 1st=%d MB, last=%d MB, delta=%+d MB\n", table_count, first_table_mb, last_table_mb, diff
+        # Show per-table loop trend (use whichever counter has data)
+        loop_count = 0; loop_first = 0; loop_last = 0
+        if (r24_count > 1) {
+            loop_count = r24_count; loop_first = first_r24_mb; loop_last = last_r24_mb
+        } else if (table_count > 1) {
+            loop_count = table_count; loop_first = first_table_mb; loop_last = last_table_mb
+        }
+        if (loop_count > 1) {
+            diff = loop_last - loop_first
+            printf "\n    Per-table loop: %d tables, 1st=%d MB, last=%d MB, delta=%+d MB\n", loop_count, loop_first, loop_last, diff
             if (diff < 50 && diff > -50)
                 print "    -> Memory FLAT during per-table proving (good)"
             else if (diff < 0)
@@ -613,15 +619,21 @@ summarize_mem_trace() {
             else
                 print "    -> Memory GREW during per-table proving (bad)"
         }
-        if (r24_count > 1) {
-            diff = last_r24_mb - first_r24_mb
-            printf "\n    Per-table loop: %d tables, 1st=%d MB, last=%d MB, delta=%+d MB\n", r24_count, first_r24_mb, last_r24_mb, diff
-            if (diff < 50 && diff > -50)
-                print "    -> Memory FLAT during per-table proving (good)"
-            else if (diff < 0)
-                print "    -> Memory DECREASED during per-table proving (good)"
+
+        # Show bottleneck: where is peak relative to Phase A?
+        phase_a_mb = 0
+        for (i = 0; i < n; i++) {
+            if (names[i] == "Phase A done") phase_a_mb = vals[i]
+        }
+        if (phase_a_mb > 0 && loop_count > 1) {
+            overshoot = loop_last - phase_a_mb
+            printf "    Bottleneck: Phase A = %d MB, end of proving = %d MB", phase_a_mb, loop_last
+            if (overshoot < 100 && overshoot > -100)
+                print " -> peak at Phase A (controllable)"
+            else if (overshoot > 0)
+                printf " (+%d MB after Phase A -> bottleneck in proving)\n", overshoot
             else
-                print "    -> Memory GREW during per-table proving (bad)"
+                printf " (%d MB below Phase A -> peak at Phase A)\n", overshoot
         }
     }
     ' "$trace_file"

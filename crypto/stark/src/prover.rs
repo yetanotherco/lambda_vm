@@ -1570,6 +1570,9 @@ pub trait IsStarkProver<
             let (aux_commitment, num_aux_cols) = if air.has_aux_trace() {
                 let num_aux_cols = trace.num_aux_columns;
                 trace.extract_columns_aux_into(&mut aux_pool);
+                // Free aux data from trace — it's been copied into the pool.
+                // Without this, aux data accumulates across all TraceTables.
+                trace.aux_table = Table::new(Vec::new(), 0);
                 Self::expand_pool_to_lde::<FieldExtension>(
                     &mut aux_pool,
                     num_aux_cols,
