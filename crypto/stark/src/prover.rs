@@ -1509,10 +1509,8 @@ pub trait IsStarkProver<
                 let (tree, root, pre_tree, pre_root, n_pre) = result?;
                 if let Some(ref pre_r) = pre_root {
                     transcript.append_bytes(pre_r);
-                    transcript.append_bytes(&root);
-                } else {
-                    transcript.append_bytes(&root);
                 }
+                transcript.append_bytes(&root);
                 main_commits.push(MainCommitData {
                     main_tree: Arc::new(tree),
                     main_root: root,
@@ -1634,8 +1632,8 @@ pub trait IsStarkProver<
             Vec::with_capacity(num_airs);
         for ((main_commit, (aux_tree, aux_root)), bus_public_inputs) in main_commits
             .into_iter()
-            .zip(aux_results.into_iter())
-            .zip(bus_inputs_vec.into_iter())
+            .zip(aux_results)
+            .zip(bus_inputs_vec)
         {
             metadatas.push(Round1Metadata {
                 main_merkle_tree: Arc::clone(&main_commit.main_tree),
