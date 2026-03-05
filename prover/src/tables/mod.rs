@@ -28,6 +28,7 @@ pub mod dvrm;
 pub mod halt;
 pub mod load;
 pub mod lt;
+pub mod memory_bridge;
 pub mod memw;
 pub mod mul;
 pub mod page;

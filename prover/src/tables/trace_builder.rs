@@ -41,6 +41,7 @@ use super::dvrm::{self, DvrmOperation};
 use super::halt;
 use super::load::{self, LoadOperation};
 use super::lt::{self, LtOperation};
+use super::memory_bridge::{self, BridgeEntry};
 use super::memw::{self, MemwOperation};
 use super::mul::{self, MulOperation};
 use super::page::{self, FinalByteState, FinalStateMap, PageConfig};
@@ -215,6 +216,67 @@ impl SegmentCheckpoint {
             register_state: RegisterState::new(),
             global_timestamp: 0,
         }
+    }
+
+    /// Compute bridge entries by comparing this checkpoint with ELF/default initial state.
+    ///
+    /// Returns entries for all memory cells and register words where the checkpoint
+    /// state differs from the initial (ELF/default) state. For segment 0, this
+    /// returns an empty vec (checkpoint == ELF state).
+    pub fn bridge_entries(&self, elf: &Elf) -> Vec<BridgeEntry> {
+        let elf_memory = MemoryState::from_elf(elf);
+        let default_registers = RegisterState::new();
+        let mut entries = Vec::new();
+
+        // Memory entries: compare each checkpoint cell with ELF initial value.
+        // Cells not in ELF have init_val=0, ts=0.
+        for (&addr, &(ckpt_val, ckpt_ts)) in &self.memory_state.cells {
+            let (elf_val, _elf_ts) = elf_memory.read_byte(addr);
+            if ckpt_val != elf_val || ckpt_ts != 0 {
+                entries.push(BridgeEntry {
+                    is_register: false,
+                    addr,
+                    init_val: elf_val as u64,
+                    checkpoint_ts: ckpt_ts,
+                    checkpoint_val: ckpt_val as u64,
+                });
+            }
+        }
+
+        // Register entries: compare each register with default state.
+        // Each register produces 2 entries (lo word, hi word) if it differs.
+        for reg_idx in 0..32u8 {
+            let (ckpt_val, ckpt_ts) = self.register_state.read(reg_idx);
+            let (default_val, _default_ts) = default_registers.read(reg_idx);
+
+            if ckpt_val != default_val || ckpt_ts != 0 {
+                let base_addr = register::register_base_address(reg_idx);
+                let val_lo = ckpt_val & 0xFFFF_FFFF;
+                let val_hi = ckpt_val >> 32;
+                let default_lo = default_val & 0xFFFF_FFFF;
+                let default_hi = default_val >> 32;
+
+                // Lo word
+                entries.push(BridgeEntry {
+                    is_register: true,
+                    addr: base_addr,
+                    init_val: default_lo,
+                    checkpoint_ts: ckpt_ts,
+                    checkpoint_val: val_lo,
+                });
+
+                // Hi word
+                entries.push(BridgeEntry {
+                    is_register: true,
+                    addr: base_addr + 1,
+                    init_val: default_hi,
+                    checkpoint_ts: ckpt_ts,
+                    checkpoint_val: val_hi,
+                });
+            }
+        }
+
+        entries
     }
 }
 
@@ -1161,6 +1223,10 @@ pub struct Traces {
 
     /// HALT single-row table for program termination
     pub halt: TraceTable<GoldilocksField, GoldilocksExtension>,
+
+    /// MemoryBridge table for segment boundary state (continuation proofs only).
+    /// None for single-segment proofs or segment 0.
+    pub memory_bridge: Option<TraceTable<GoldilocksField, GoldilocksExtension>>,
 }
 
 /// Chunk raw ops and generate one trace table per chunk.
@@ -1500,6 +1566,7 @@ impl Traces {
             register: register_trace,
             branches,
             halt: halt_trace,
+            memory_bridge: None,
         })
     }
 
@@ -1679,6 +1746,7 @@ impl Traces {
             register: register_trace,
             branches,
             halt: halt_trace,
+            memory_bridge: None,
         })
     }
 
@@ -1886,6 +1954,15 @@ impl Traces {
             halt_trace = halt::generate_halt_trace(halt_timestamp);
         }
 
+        // Generate MemoryBridge table for segments > 0.
+        // For segment 0 (log_offset == 0), checkpoint == ELF state, so no bridge needed.
+        let memory_bridge_trace = if log_offset > 0 {
+            let bridge_entries = checkpoint.bridge_entries(elf);
+            Some(memory_bridge::generate_memory_bridge_trace(&bridge_entries))
+        } else {
+            None
+        };
+
         // Compute the outgoing checkpoint for the next segment.
         // The global timestamp is the timestamp after the last log in this segment.
         let next_global_timestamp = (log_offset + segment_logs.len() as u64) * 4 + 4;
@@ -1909,6 +1986,7 @@ impl Traces {
             register: register_trace,
             branches,
             halt: halt_trace,
+            memory_bridge: memory_bridge_trace,
         };
 
         Ok((traces, outgoing_checkpoint))

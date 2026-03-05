@@ -1040,6 +1040,7 @@ fn test_decode_soundness_same_elf_accepted() {
         false,
         &traces.page_configs,
         &table_counts,
+        false,
     );
 
     let proof = Prover::multi_prove(
@@ -1057,6 +1058,7 @@ fn test_decode_soundness_same_elf_accepted() {
         false,
         &traces.page_configs,
         &table_counts,
+        false,
     );
 
     let result = Verifier::multi_verify(

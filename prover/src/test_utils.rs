@@ -45,6 +45,9 @@ use crate::tables::halt::{bus_interactions as halt_bus_interactions, cols as hal
 use crate::tables::load::{
     bus_interactions as load_bus_interactions, cols as load_cols, constraints as load_constraints,
 };
+use crate::tables::memory_bridge::{
+    bus_interactions as memory_bridge_bus_interactions, cols as memory_bridge_cols,
+};
 use crate::tables::lt::{LtOperation, bus_interactions as lt_bus_interactions, cols as lt_cols};
 use crate::tables::memw::{
     bus_interactions as memw_bus_interactions, cols as memw_cols, constraints as memw_constraints,
@@ -724,4 +727,26 @@ pub fn create_register_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("REGISTER")
+}
+
+/// Create MEMORY_BRIDGE AIR with bus interactions.
+///
+/// The MemoryBridge table resolves bus mismatches in continuation proof segments >0.
+/// It sends ELF/default initial state tokens (balancing PAGE-C3/REGISTER receives)
+/// and receives checkpoint state tokens (balancing MEMW old-state sends or PAGE-C4 sends).
+pub fn create_memory_bridge_air(proof_options: &ProofOptions) -> VmAir {
+    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: memory_bridge_bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        memory_bridge_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+    .with_name("MEMORY_BRIDGE")
 }

@@ -54,6 +54,7 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
         true,
         &traces.page_configs,
         &table_counts,
+        false,
     );
 
     // Build air_trace_pairs for all tables
@@ -1240,6 +1241,7 @@ fn test_deep_stack_runtime_pages_roundtrip() {
         true,
         &traces.page_configs,
         &table_counts,
+        false,
     );
     let proof = Prover::multi_prove(
         prover_airs.air_trace_pairs(&mut traces),
@@ -1250,7 +1252,7 @@ fn test_deep_stack_runtime_pages_roundtrip() {
     // Verifier reconstructs from ELF + runtime_page_ranges hint
     let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges);
     let verifier_airs =
-        crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs, &table_counts);
+        crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs, &table_counts, false);
 
     let verified = Verifier::multi_verify(
         &verifier_airs.air_refs(),
@@ -1287,6 +1289,7 @@ fn test_deep_stack_missing_pages_rejected() {
         true,
         &traces.page_configs,
         &table_counts,
+        false,
     );
     let proof = Prover::multi_prove(
         prover_airs.air_trace_pairs(&mut traces),
@@ -1297,7 +1300,7 @@ fn test_deep_stack_missing_pages_rejected() {
     // Verifier uses EMPTY runtime_page_ranges → missing stack/heap pages
     let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[]);
     let verifier_airs =
-        crate::VmAirs::new(&elf, &proof_options, true, &wrong_configs, &table_counts);
+        crate::VmAirs::new(&elf, &proof_options, true, &wrong_configs, &table_counts, false);
 
     let verified = Verifier::multi_verify(
         &verifier_airs.air_refs(),
@@ -1367,6 +1370,7 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
         true,
         &traces.page_configs,
         &table_counts,
+        false,
     );
     let proof = Prover::multi_prove(
         prover_airs.air_trace_pairs(&mut traces),
@@ -1377,7 +1381,7 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
     // Verifier reconstructs from ELF + runtime hint (ranges decoded to pages)
     let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges);
     let verifier_airs =
-        crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs, &table_counts);
+        crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs, &table_counts, false);
 
     let verified = Verifier::multi_verify(
         &verifier_airs.air_refs(),
@@ -1480,7 +1484,7 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         dvrm: 0,
         branch: 0,
     };
-    let airs = VmAirs::new(&elf, &proof_options, true, &[], &zero_counts);
+    let airs = VmAirs::new(&elf, &proof_options, true, &[], &zero_counts, false);
 
     let verifier_air_refs = airs.air_refs();
     assert_eq!(verifier_air_refs.len(), 4);

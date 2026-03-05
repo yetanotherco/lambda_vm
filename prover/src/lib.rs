@@ -36,7 +36,7 @@ use crate::tables::trace_builder::Traces;
 use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_cpu_air, create_decode_air,
     create_dvrm_air, create_halt_air, create_load_air, create_lt_air, create_memw_air,
-    create_mul_air, create_page_air, create_register_air,
+    create_memory_bridge_air, create_mul_air, create_page_air, create_register_air,
 };
 
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
@@ -172,6 +172,8 @@ pub(crate) struct VmAirs {
     pub halt: VmAir,
     pub register: VmAir,
     pub pages: Vec<VmAir>,
+    /// MemoryBridge AIR for continuation proof segments > 0.
+    pub memory_bridge: Option<VmAir>,
 }
 
 impl VmAirs {
@@ -208,6 +210,11 @@ impl VmAirs {
         for (air, trace) in self.pages.iter().zip(traces.pages.iter_mut()) {
             pairs.push((air, trace, &()));
         }
+        if let Some(ref bridge_air) = self.memory_bridge {
+            if let Some(ref mut bridge_trace) = traces.memory_bridge {
+                pairs.push((bridge_air, bridge_trace, &()));
+            }
+        }
 
         pairs
     }
@@ -241,6 +248,9 @@ impl VmAirs {
         for air in &self.pages {
             refs.push(air);
         }
+        if let Some(ref bridge_air) = self.memory_bridge {
+            refs.push(bridge_air);
+        }
 
         refs
     }
@@ -257,6 +267,7 @@ impl VmAirs {
         minimal_bitwise: bool,
         page_configs: &[crate::tables::page::PageConfig],
         table_counts: &TableCounts,
+        has_memory_bridge: bool,
     ) -> Self {
         let cpus: Vec<_> = (0..table_counts.cpu)
             .map(|i| create_cpu_air(proof_options).with_name(&format!("CPU[{}]", i)))
@@ -307,6 +318,12 @@ impl VmAirs {
             })
             .collect();
 
+        let memory_bridge = if has_memory_bridge {
+            Some(create_memory_bridge_air(proof_options))
+        } else {
+            None
+        };
+
         #[cfg(feature = "debug-checks")]
         debug_report::print_bus_legend();
 
@@ -323,6 +340,7 @@ impl VmAirs {
             halt,
             register,
             pages,
+            memory_bridge,
         }
     }
 }
@@ -358,6 +376,7 @@ pub fn prove_with_options(
         false,
         &traces.page_configs,
         &table_counts,
+        false, // no memory bridge for single-segment proofs
     );
 
     let runtime_page_ranges = traces.runtime_page_ranges();
@@ -425,6 +444,7 @@ pub fn verify_with_options(
         false,
         &page_configs,
         &vm_proof.table_counts,
+        false, // no memory bridge for single-segment proofs
     );
 
     Ok(Verifier::multi_verify(
@@ -461,6 +481,9 @@ pub struct SegmentProof {
     pub bus_residual: FieldElement<E>,
     /// Index of this segment in the continuation.
     pub segment_index: usize,
+    /// Whether this segment includes a MemoryBridge table.
+    /// True for segments > 0 in a continuation proof.
+    pub has_memory_bridge: bool,
 }
 
 /// A continuation proof: multiple segment proofs that together prove full program execution.
@@ -533,12 +556,14 @@ pub fn prove_continuation_with_options(
         )?;
 
         let table_counts = traces.table_counts();
+        let has_memory_bridge = traces.memory_bridge.is_some();
         let airs = VmAirs::new(
             &program,
             proof_options,
             false,
             &traces.page_configs,
             &table_counts,
+            has_memory_bridge,
         );
 
         let runtime_page_ranges = traces.runtime_page_ranges();
@@ -557,6 +582,7 @@ pub fn prove_continuation_with_options(
             table_counts,
             bus_residual,
             segment_index: seg_idx,
+            has_memory_bridge,
         });
 
         checkpoint = next_checkpoint;
@@ -598,13 +624,16 @@ pub fn verify_continuation_with_options(
         let page_configs =
             Traces::page_configs_from_elf_and_runtime(&program, &segment.runtime_page_ranges);
 
-        let expected_proof_count = segment.table_counts.total() + 4 + page_configs.len();
+        let bridge_count = if segment.has_memory_bridge { 1 } else { 0 };
+        let expected_proof_count =
+            segment.table_counts.total() + 4 + page_configs.len() + bridge_count;
         if expected_proof_count != segment.proof.proofs.len() {
             return Err(Error::InvalidTableCounts(format!(
-                "segment {}: table_counts total ({}) + 4 fixed + {} pages = {}, but proof has {} sub-proofs",
+                "segment {}: table_counts total ({}) + 4 fixed + {} pages + {} bridge = {}, but proof has {} sub-proofs",
                 segment.segment_index,
                 segment.table_counts.total(),
                 page_configs.len(),
+                bridge_count,
                 expected_proof_count,
                 segment.proof.proofs.len(),
             )));
@@ -616,6 +645,7 @@ pub fn verify_continuation_with_options(
             false,
             &page_configs,
             &segment.table_counts,
+            segment.has_memory_bridge,
         );
 
         // Use multi_verify_segment (skips bus balance check).
