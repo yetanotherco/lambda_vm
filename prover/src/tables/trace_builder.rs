@@ -59,6 +59,7 @@ type MemoryCell = (u8, u64);
 type RegisterCell = (u64, u64);
 
 /// Memory state tracker for generating MEMW/LOAD traces.
+#[derive(Clone)]
 struct MemoryState {
     /// Map from byte address to (value, timestamp)
     cells: HashMap<u64, MemoryCell>,
@@ -125,6 +126,7 @@ impl MemoryState {
 }
 
 /// Register state tracker for generating MEMW register traces.
+#[derive(Clone)]
 struct RegisterState {
     /// Register file: (value, last_write_timestamp)
     regs: [RegisterCell; 32],
@@ -187,6 +189,36 @@ impl RegisterState {
 }
 
 // =============================================================================
+// Segment Checkpoints (for continuation proofs)
+// =============================================================================
+
+/// Checkpoint capturing memory and register state at a segment boundary.
+///
+/// This is used by continuation proving: each segment initializes its
+/// `MemoryState` and `RegisterState` from the previous segment's checkpoint
+/// instead of from the ELF. The first segment (index 0) uses the ELF state.
+#[derive(Clone)]
+pub struct SegmentCheckpoint {
+    /// Memory state at segment boundary: byte address → (value, last_write_timestamp)
+    memory_state: MemoryState,
+    /// Register state at segment boundary: (value, last_write_timestamp) per register
+    register_state: RegisterState,
+    /// Global timestamp at segment boundary (first timestamp for the next segment)
+    pub global_timestamp: u64,
+}
+
+impl SegmentCheckpoint {
+    /// Create the initial checkpoint from ELF (for segment 0).
+    pub fn from_elf(elf: &Elf) -> Self {
+        Self {
+            memory_state: MemoryState::from_elf(elf),
+            register_state: RegisterState::new(),
+            global_timestamp: 0,
+        }
+    }
+}
+
+// =============================================================================
 // Helper Functions
 // =============================================================================
 
@@ -222,12 +254,24 @@ fn collect_cpu_ops(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,
 ) -> Result<Vec<CpuOperation>, Error> {
+    collect_cpu_ops_with_offset(logs, instructions, 0)
+}
+
+/// Collect CPU operations from logs with a timestamp offset.
+///
+/// When `log_offset > 0`, timestamps continue from a previous segment:
+/// `timestamp = (log_offset + i) * 4 + 4`.
+fn collect_cpu_ops_with_offset(
+    logs: &[Log],
+    instructions: &U64HashMap<Instruction>,
+    log_offset: u64,
+) -> Result<Vec<CpuOperation>, Error> {
     let mut cpu_ops = Vec::with_capacity(logs.len());
 
     // Timestamps start at 4 (not 0) to ensure old_timestamp < timestamp holds
     // for the first access to any register/memory location (where old_timestamp=0).
     for (i, log) in logs.iter().enumerate() {
-        let timestamp = (i as u64) * 4 + 4;
+        let timestamp = (log_offset + i as u64) * 4 + 4;
         let instruction = instructions
             .get(&log.current_pc)
             .copied()
@@ -1684,5 +1728,189 @@ impl Traces {
         max_rows: &super::MaxRowsConfig,
     ) -> Result<Self, Error> {
         Self::from_logs_trimmed(logs, instructions, max_rows)
+    }
+
+    /// Generate traces for a single segment of a continuation proof.
+    ///
+    /// This is the segmented equivalent of `from_elf_and_logs`. The key differences:
+    /// - Memory and register state are initialized from `checkpoint` instead of ELF
+    /// - Timestamps continue from the checkpoint's `global_timestamp`
+    /// - PAGE tables represent the segment's initial state (from checkpoint)
+    /// - Returns the outgoing checkpoint for the next segment
+    ///
+    /// The first segment (index 0) should use `SegmentCheckpoint::from_elf(elf)`.
+    pub fn from_segment(
+        elf: &Elf,
+        segment_logs: &[Log],
+        checkpoint: &SegmentCheckpoint,
+        log_offset: u64,
+        max_rows: &super::MaxRowsConfig,
+    ) -> Result<(Self, SegmentCheckpoint), Error> {
+        // PHASE 0: DECODE + instructions (same for all segments)
+        let instructions = decode::instructions_from_elf(elf)
+            .map_err(|e| Error::Execution(format!("Failed to parse instructions: {e}")))?;
+        let (decode_trace, decode_pc_to_row) = decode::generate_decode_trace(&instructions);
+
+        // PHASE 1: Logs → CPU operations with timestamp offset
+        let cpu_ops = collect_cpu_ops_with_offset(segment_logs, &instructions, log_offset)?;
+
+        // PHASE 2: CPU ops → derived operations
+        // Initialize state from checkpoint instead of ELF
+        let mut memory_state = checkpoint.memory_state.clone();
+        let mut register_state = checkpoint.register_state.clone();
+        let (memw_ops, load_ops, mut lt_ops, mut bitwise_ops) =
+            collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
+
+        let branch_ops: Vec<BranchOperation> = cpu_ops
+            .iter()
+            .filter(|op| op.branch_cond)
+            .map(|op| {
+                BranchOperation::new(
+                    op.decode.pc,
+                    op.decode.imm,
+                    op.compute_arg1(),
+                    op.decode.op_jalr,
+                )
+            })
+            .collect();
+
+        let mut mul_ops: Vec<(MulOperation, bool)> = cpu_ops
+            .iter()
+            .filter(|op| op.decode.op_mul)
+            .map(|op| {
+                let lhs = op.compute_arg1();
+                let lhs_signed = op.decode.signed;
+                let rhs_signed = op.decode.mp_selector;
+                let rhs = op.compute_arg2();
+                let wants_hi = op.decode.muldiv_selector;
+                (
+                    MulOperation::new(lhs, lhs_signed, rhs, rhs_signed),
+                    wants_hi,
+                )
+            })
+            .collect();
+
+        let dvrm_ops: Vec<(DvrmOperation, bool)> = cpu_ops
+            .iter()
+            .filter(|op| op.decode.op_divrem)
+            .map(|op| {
+                let n = op.compute_arg1();
+                let d = op.compute_arg2();
+                let signed = op.decode.signed;
+                let wants_remainder = op.decode.muldiv_selector;
+                (DvrmOperation::new(n, d, signed), wants_remainder)
+            })
+            .collect();
+
+        for (op, _wants_remainder) in &dvrm_ops {
+            lt_ops.push(LtOperation::new(op.abs_r(), op.abs_d(), false));
+        }
+
+        for (op, _wants_remainder) in &dvrm_ops {
+            let d = op.d;
+            let d_signed = op.signed;
+            let q = op.compute_quotient();
+            let q_signed = op.sign_q();
+            let mul_op = MulOperation::new(d, d_signed, q, q_signed);
+            mul_ops.push((mul_op.clone(), false));
+            mul_ops.push((mul_op, true));
+        }
+
+        // PHASE 3: MEMW → LT
+        lt_ops.extend(collect_lt_from_memw(&memw_ops));
+
+        // PHASE 4: All → Bitwise
+        bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
+        bitwise_ops.extend(collect_bitwise_from_memw(&memw_ops));
+        bitwise_ops.extend(collect_bitwise_from_mul(&mul_ops));
+        bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops));
+        bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
+        bitwise_ops.extend(collect_bitwise_from_page(elf, &memory_state));
+
+        // PHASE 5: Generate traces
+        let halt_op = cpu_ops
+            .iter()
+            .rev()
+            .find(|op| op.decode.op_ecall)
+            .ok_or(Error::MissingHaltEcall)?;
+        let halt_timestamp = halt_op.timestamp;
+
+        let cpus = chunk_and_generate(&cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
+        let memws = chunk_and_generate(&memw_ops, max_rows.memw, memw::generate_memw_trace);
+        let loads = chunk_and_generate(&load_ops, max_rows.load, load::generate_load_trace);
+        let lts = chunk_and_generate(&lt_ops, max_rows.lt, lt::generate_lt_trace);
+        let muls = chunk_and_generate(&mul_ops, max_rows.mul, mul::generate_mul_trace);
+        let dvrms = chunk_and_generate(&dvrm_ops, max_rows.dvrm, dvrm::generate_dvrm_trace);
+        let branches =
+            chunk_and_generate(&branch_ops, max_rows.branch, branch::generate_branch_trace);
+
+        let mut bitwise = bitwise::generate_bitwise_trace();
+        bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
+
+        let mut decode = decode_trace;
+        let pc_to_row = decode_pc_to_row;
+        let num_padding_rows: usize = cpu_ops
+            .chunks(max_rows.cpu)
+            .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
+            .sum();
+        let mut decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
+        decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
+        decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
+
+        let register_final_state = register_state.to_final_state_map();
+
+        let (pages, page_configs, register_trace, halt_trace);
+        #[cfg(feature = "parallel")]
+        {
+            let ((pages_val, register_val), halt_val) = rayon::join(
+                || {
+                    rayon::join(
+                        || generate_page_tables(elf, &memory_state),
+                        || register::generate_register_trace(&register_final_state),
+                    )
+                },
+                || halt::generate_halt_trace(halt_timestamp),
+            );
+            let (pages_v, page_configs_v) = pages_val;
+            pages = pages_v;
+            page_configs = page_configs_v;
+            register_trace = register_val;
+            halt_trace = halt_val;
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            let (pages_v, page_configs_v) = generate_page_tables(elf, &memory_state);
+            pages = pages_v;
+            page_configs = page_configs_v;
+            register_trace = register::generate_register_trace(&register_final_state);
+            halt_trace = halt::generate_halt_trace(halt_timestamp);
+        }
+
+        // Compute the outgoing checkpoint for the next segment.
+        // The global timestamp is the timestamp after the last log in this segment.
+        let next_global_timestamp = (log_offset + segment_logs.len() as u64) * 4 + 4;
+        let outgoing_checkpoint = SegmentCheckpoint {
+            memory_state,
+            register_state,
+            global_timestamp: next_global_timestamp,
+        };
+
+        let traces = Traces {
+            cpus,
+            bitwise,
+            lts,
+            memws,
+            loads,
+            decode,
+            muls,
+            dvrms,
+            pages,
+            page_configs,
+            register: register_trace,
+            branches,
+            halt: halt_trace,
+        };
+
+        Ok((traces, outgoing_checkpoint))
     }
 }

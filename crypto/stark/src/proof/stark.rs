@@ -83,4 +83,20 @@ impl<F: IsSubFieldOf<E>, E: IsField, PI> MultiProof<F, E, PI> {
     pub fn new(proofs: Vec<StarkProof<F, E, PI>>) -> Self {
         Self { proofs }
     }
+
+    /// Compute the bus residual: sum of all `table_contribution` values.
+    ///
+    /// For a standalone proof this should be zero (bus balance).
+    /// For a segment of a continuation proof, this may be non-zero;
+    /// the cross-segment check verifies that the sum of all segment
+    /// residuals equals zero.
+    pub fn bus_residual(&self) -> FieldElement<E> {
+        let mut total = FieldElement::<E>::zero();
+        for proof in &self.proofs {
+            if let Some(ref bpi) = proof.bus_public_inputs {
+                total = total + &bpi.table_contribution;
+            }
+        }
+        total
+    }
 }

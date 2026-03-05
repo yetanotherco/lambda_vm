@@ -439,3 +439,214 @@ pub fn prove_and_verify(elf_bytes: &[u8]) -> Result<bool, Error> {
     let vm_proof = prove(elf_bytes)?;
     verify(&vm_proof, elf_bytes)
 }
+
+// =============================================================================
+// Continuation Proofs (Segment-based)
+// =============================================================================
+
+use crate::tables::trace_builder::SegmentCheckpoint;
+use math::field::element::FieldElement;
+
+/// A single segment's proof within a continuation.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct SegmentProof {
+    /// The multi-table STARK proof for this segment.
+    pub proof: MultiProof<F, E, ()>,
+    /// Run-length encoded runtime page ranges for this segment.
+    pub runtime_page_ranges: Vec<RuntimePageRange>,
+    /// Table chunk counts for this segment.
+    pub table_counts: TableCounts,
+    /// Bus residual for this segment (sum of table_contribution values).
+    /// For a standalone proof this is zero; for continuation segments it may be non-zero.
+    pub bus_residual: FieldElement<E>,
+    /// Index of this segment in the continuation.
+    pub segment_index: usize,
+}
+
+/// A continuation proof: multiple segment proofs that together prove full program execution.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct ContinuationProof {
+    /// Per-segment proofs, ordered by segment index.
+    pub segment_proofs: Vec<SegmentProof>,
+}
+
+/// Default segment size (number of instruction logs per segment).
+/// `usize::MAX` effectively disables segmentation (single segment = full execution).
+pub const DEFAULT_SEGMENT_SIZE: usize = usize::MAX;
+
+/// Prove an ELF binary execution using continuation (segmented) proving.
+///
+/// Splits execution into segments of `segment_size` logs each.
+/// Each segment generates its own traces and multi-table STARK proof.
+/// Segments are proved sequentially (trace generation requires state from
+/// the previous segment), but the proving step for each segment is independent.
+///
+/// When `segment_size == usize::MAX`, this produces a single-segment proof
+/// equivalent to [`prove`].
+pub fn prove_continuation(
+    elf_bytes: &[u8],
+    segment_size: usize,
+) -> Result<ContinuationProof, Error> {
+    prove_continuation_with_options(
+        elf_bytes,
+        segment_size,
+        &GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid"),
+        &MaxRowsConfig::default(),
+    )
+}
+
+/// Prove with continuation using custom options.
+pub fn prove_continuation_with_options(
+    elf_bytes: &[u8],
+    segment_size: usize,
+    proof_options: &ProofOptions,
+    max_rows: &MaxRowsConfig,
+) -> Result<ContinuationProof, Error> {
+    let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let executor = Executor::new(&program, vec![]).map_err(|e| Error::Execution(format!("{e}")))?;
+    let result = executor
+        .run()
+        .map_err(|e| Error::Execution(format!("{e}")))?;
+
+    let logs = &result.logs;
+
+    // Split logs into segments.
+    let segments: Vec<&[executor::vm::logs::Log]> = if segment_size >= logs.len() {
+        vec![logs]
+    } else {
+        logs.chunks(segment_size).collect()
+    };
+
+    let mut segment_proofs = Vec::with_capacity(segments.len());
+    let mut checkpoint = SegmentCheckpoint::from_elf(&program);
+
+    for (seg_idx, segment_logs) in segments.iter().enumerate() {
+        let log_offset = seg_idx * segment_size;
+
+        // Generate traces for this segment.
+        let (mut traces, next_checkpoint) = Traces::from_segment(
+            &program,
+            segment_logs,
+            &checkpoint,
+            log_offset as u64,
+            max_rows,
+        )?;
+
+        let table_counts = traces.table_counts();
+        let airs = VmAirs::new(
+            &program,
+            proof_options,
+            false,
+            &traces.page_configs,
+            &table_counts,
+        );
+
+        let runtime_page_ranges = traces.runtime_page_ranges();
+
+        let proof = Prover::multi_prove(
+            airs.air_trace_pairs(&mut traces),
+            &mut DefaultTranscript::<E>::new(&[]),
+        )
+        .map_err(|e| Error::Prover(format!("{e:?}")))?;
+
+        let bus_residual = proof.bus_residual();
+
+        segment_proofs.push(SegmentProof {
+            proof,
+            runtime_page_ranges,
+            table_counts,
+            bus_residual,
+            segment_index: seg_idx,
+        });
+
+        checkpoint = next_checkpoint;
+    }
+
+    Ok(ContinuationProof { segment_proofs })
+}
+
+/// Verify a continuation proof.
+///
+/// Checks:
+/// 1. Each segment's multi-table STARK proof verifies independently
+///    (constraint satisfaction, commitment integrity, FRI soundness).
+///    Bus balance is NOT checked per-segment.
+/// 2. Global bus balance: Σ segment_residual = 0 across all segments.
+pub fn verify_continuation(
+    continuation_proof: &ContinuationProof,
+    elf_bytes: &[u8],
+) -> Result<bool, Error> {
+    verify_continuation_with_options(
+        continuation_proof,
+        elf_bytes,
+        &GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid"),
+    )
+}
+
+/// Verify a continuation proof with custom options.
+pub fn verify_continuation_with_options(
+    continuation_proof: &ContinuationProof,
+    elf_bytes: &[u8],
+    proof_options: &ProofOptions,
+) -> Result<bool, Error> {
+    let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+
+    // 1. Verify each segment's STARK proof (without bus balance check).
+    for segment in &continuation_proof.segment_proofs {
+        segment.table_counts.validate()?;
+
+        let page_configs =
+            Traces::page_configs_from_elf_and_runtime(&program, &segment.runtime_page_ranges);
+
+        let expected_proof_count = segment.table_counts.total() + 4 + page_configs.len();
+        if expected_proof_count != segment.proof.proofs.len() {
+            return Err(Error::InvalidTableCounts(format!(
+                "segment {}: table_counts total ({}) + 4 fixed + {} pages = {}, but proof has {} sub-proofs",
+                segment.segment_index,
+                segment.table_counts.total(),
+                page_configs.len(),
+                expected_proof_count,
+                segment.proof.proofs.len(),
+            )));
+        }
+
+        let airs = VmAirs::new(
+            &program,
+            proof_options,
+            false,
+            &page_configs,
+            &segment.table_counts,
+        );
+
+        // Use multi_verify_segment (skips bus balance check).
+        let valid = Verifier::multi_verify_segment(
+            &airs.air_refs(),
+            &segment.proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+        );
+
+        if !valid {
+            return Ok(false);
+        }
+
+        // Cross-check: bus_residual in proof metadata must match computed residual.
+        let computed_residual = segment.proof.bus_residual();
+        if computed_residual != segment.bus_residual {
+            return Ok(false);
+        }
+    }
+
+    // 2. Global bus balance: Σ bus_residual = 0.
+    let total_residual: FieldElement<E> = continuation_proof
+        .segment_proofs
+        .iter()
+        .fold(FieldElement::<E>::zero(), |acc, seg| {
+            acc + &seg.bus_residual
+        });
+
+    if total_residual != FieldElement::<E>::zero() {
+        return Ok(false);
+    }
+
+    Ok(true)
+}

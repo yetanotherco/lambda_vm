@@ -1561,3 +1561,30 @@ fn test_verify_rejects_inflated_table_counts() {
         result
     );
 }
+
+// =============================================================================
+// Continuation Proof Tests
+// =============================================================================
+
+/// Single-segment continuation proof (segment_size = MAX) should produce
+/// a valid proof equivalent to the standard `prove` path.
+#[test]
+fn test_continuation_single_segment() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_add_8");
+    let continuation_proof =
+        crate::prove_continuation(&elf_bytes, usize::MAX).expect("prove_continuation failed");
+
+    assert_eq!(continuation_proof.segment_proofs.len(), 1);
+    assert_eq!(continuation_proof.segment_proofs[0].segment_index, 0);
+
+    // Bus residual should be zero for a single segment (full execution).
+    assert_eq!(
+        continuation_proof.segment_proofs[0].bus_residual,
+        math::field::element::FieldElement::<E>::zero(),
+        "Single-segment bus residual should be zero"
+    );
+
+    let valid = crate::verify_continuation(&continuation_proof, &elf_bytes)
+        .expect("verify_continuation failed");
+    assert!(valid, "Single-segment continuation proof should verify");
+}

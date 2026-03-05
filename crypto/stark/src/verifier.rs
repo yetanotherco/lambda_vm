@@ -856,6 +856,41 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
+        Self::multi_verify_impl(airs, multi_proof, transcript, true)
+    }
+
+    /// Verify a segment's multi-table proof without the bus balance check.
+    ///
+    /// This verifies all per-table STARK constraints (commitment integrity,
+    /// constraint satisfaction, FRI soundness) but does NOT check that the
+    /// bus residual is zero. For continuation proofs, the bus residual is
+    /// checked at the cross-segment level: Σ segment_residual = 0.
+    fn multi_verify_segment(
+        airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
+        multi_proof: &MultiProof<Field, FieldExtension, PI>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+    ) -> bool
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    {
+        Self::multi_verify_impl(airs, multi_proof, transcript, false)
+    }
+
+    /// Internal implementation of multi-table verification.
+    ///
+    /// When `check_bus_balance` is true, verifies that Σ table_contribution = 0.
+    /// When false, skips the bus balance check (for continuation proof segments).
+    fn multi_verify_impl(
+        airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
+        multi_proof: &MultiProof<Field, FieldExtension, PI>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+        check_bus_balance: bool,
+    ) -> bool
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    {
         if airs.len() != multi_proof.proofs.len() {
             error!(
                 "AIR count ({}) does not match proof count ({})",
@@ -993,7 +1028,7 @@ pub trait IsStarkVerifier<
         // (sum of all per-row terms) is exposed as a public input. The bus balances
         // when the sum of all table contributions equals zero.
 
-        if needs_lookup_challenges {
+        if needs_lookup_challenges && check_bus_balance {
             let mut total = FieldElement::<FieldExtension>::zero();
             for (air, proof) in airs.iter().zip(&multi_proof.proofs) {
                 if air.has_trace_interaction()
