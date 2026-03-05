@@ -28,7 +28,7 @@ macro_rules! impl_base_field_evaluate_prover {
                 $crate::tables::types::GoldilocksExtension,
             >],
         ) {
-            debug_assert!(
+            assert!(
                 self.constraint_idx < base_evaluations.len(),
                 "constraint_idx {} out of bounds for base_evaluations (len {})",
                 self.constraint_idx,

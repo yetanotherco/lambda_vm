@@ -254,8 +254,9 @@ pub trait AIR: Send + Sync {
     /// Prover-only: evaluate constraints into split base/extension buffers.
     ///
     /// `base_evals` has length `num_base_transition_constraints()`.
-    /// `ext_evals` has length `num_transition_constraints()` (only indices `num_base..`
-    /// are used by default constraints; indices `0..num_base` are unused padding).
+    /// `ext_evals` has length `num_transition_constraints()`. Only indices `[num_base..]`
+    /// are written and read; `[0..num_base]` exist as padding because `evaluate()` uses
+    /// absolute `constraint_idx` indexing. We skip zeroing the padding slots.
     fn compute_transition_prover(
         &self,
         evaluation_context: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
@@ -265,7 +266,10 @@ pub trait AIR: Send + Sync {
         for e in base_evals.iter_mut() {
             *e = FieldElement::zero();
         }
-        for e in ext_evals.iter_mut() {
+        // Only zero the extension-constraint slots; [0..num_base] is unused padding
+        // (evaluate() indexes by absolute constraint_idx, so we can't shrink the buffer).
+        let num_base = base_evals.len();
+        for e in ext_evals[num_base..].iter_mut() {
             *e = FieldElement::zero();
         }
         self.transition_constraints()
