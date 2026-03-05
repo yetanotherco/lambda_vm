@@ -66,8 +66,8 @@ jobs:
         if: github.event_name == 'issue_comment'
         env:
           GH_TOKEN: ${{ github.token }}
+          PR_NUM: ${{ github.event.issue.number }}
         run: |
-          PR_NUM=${{ github.event.issue.number }}
           SHA=$(gh pr view "$PR_NUM" --json headRefOid -q .headRefOid)
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
@@ -95,11 +95,12 @@ jobs:
         id: config
         env:
           COMMENT_BODY: ${{ github.event.comment.body }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          if [ "${{ github.event_name }}" = "issue_comment" ]; then
+          if [ "$EVENT_NAME" = "issue_comment" ]; then
             CUSTOM_N=$(echo "$COMMENT_BODY" | sed -n 's|^/bench[[:space:]]*\([0-9]\+\).*|\1|p')
             RUNS=${CUSTOM_N:-$BENCH_RUNS_PR}
-          elif [ "${{ github.event_name }}" = "push" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          elif [ "$EVENT_NAME" = "push" ] || [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             RUNS=$BENCH_RUNS_BASELINE
           else
             RUNS=$BENCH_RUNS_PR
@@ -116,8 +117,9 @@ jobs:
 
       - name: Benchmark PR
         id: pr
+        env:
+          RUNS: ${{ steps.config.outputs.runs }}
         run: |
-          RUNS="${{ steps.config.outputs.runs }}"
           TIMES=""
           HEAPS=""
           for i in $(seq 1 $RUNS); do
@@ -179,9 +181,10 @@ jobs:
 
       - name: Memory growth (PR)
         id: pr-growth
+        env:
+          PR_HEAP: ${{ steps.pr.outputs.peak_mb }}
+          PR_TIME: ${{ steps.pr.outputs.time_s }}
         run: |
-          PR_HEAP="${{ steps.pr.outputs.peak_mb }}"
-          PR_TIME="${{ steps.pr.outputs.time_s }}"
           PROGRAMS=($GROWTH_PROGRAMS)
           STEPS_ARR=($GROWTH_STEPS)
           GROWTH_HEAPS=""
@@ -191,8 +194,8 @@ jobs:
             prog="${PROGRAMS[$idx]}"
             ELF_PATH="executor/program_artifacts/asm/${prog}.elf"
             if [ "$prog" = "fib_iterative_2M" ]; then
-              H="$PR_HEAP"
-              T="$PR_TIME"
+              H="${PR_HEAP}"
+              T="${PR_TIME}"
             else
               echo "--- Growth: $prog ---"
               ./target/release/cli prove "$ELF_PATH" -o /tmp/proof.bin --time \
@@ -294,6 +297,7 @@ jobs:
         if: github.event_name != 'push' && github.event_name != 'workflow_dispatch' && steps.baseline-artifact.outputs.found != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          RUNS: ${{ steps.config.outputs.runs }}
         run: |
           # Save current HEAD
           PR_SHA=$(git rev-parse HEAD)
@@ -305,7 +309,6 @@ jobs:
           cargo build --release -p cli --features jemalloc-stats
 
           # --- Primary benchmark (2M) ---
-          RUNS="${{ steps.config.outputs.runs }}"
           TIMES=""
           HEAPS=""
           for i in $(seq 1 $RUNS); do
@@ -419,38 +422,74 @@ jobs:
       - name: Compare
         id: compare
         if: github.event_name != 'push' && github.event_name != 'workflow_dispatch'
+        env:
+          # Baseline artifact outputs
+          BASELINE_FOUND: ${{ steps.baseline-artifact.outputs.found }}
+          BA_PEAK_MB: ${{ steps.baseline-artifact.outputs.peak_mb }}
+          BA_TIME_S: ${{ steps.baseline-artifact.outputs.time_s }}
+          BA_TIME_SPREAD: ${{ steps.baseline-artifact.outputs.time_spread }}
+          BA_HEAP_SPREAD: ${{ steps.baseline-artifact.outputs.heap_spread }}
+          BA_ALL_TIMES: ${{ steps.baseline-artifact.outputs.all_times }}
+          BA_ALL_HEAPS: ${{ steps.baseline-artifact.outputs.all_heaps }}
+          BA_RUNS: ${{ steps.baseline-artifact.outputs.runs }}
+          BA_GROWTH_HEAPS: ${{ steps.baseline-artifact.outputs.growth_heaps }}
+          BA_GROWTH_TIMES: ${{ steps.baseline-artifact.outputs.growth_times }}
+          BA_GROWTH_SLOPE: ${{ steps.baseline-artifact.outputs.growth_slope_mb }}
+          BA_GROWTH_R2: ${{ steps.baseline-artifact.outputs.growth_r2 }}
+          # Baseline run outputs
+          BR_PEAK_MB: ${{ steps.baseline-run.outputs.peak_mb }}
+          BR_TIME_S: ${{ steps.baseline-run.outputs.time_s }}
+          BR_TIME_SPREAD: ${{ steps.baseline-run.outputs.time_spread }}
+          BR_HEAP_SPREAD: ${{ steps.baseline-run.outputs.heap_spread }}
+          BR_ALL_TIMES: ${{ steps.baseline-run.outputs.all_times }}
+          BR_ALL_HEAPS: ${{ steps.baseline-run.outputs.all_heaps }}
+          BR_RUNS: ${{ steps.baseline-run.outputs.runs }}
+          BR_GROWTH_HEAPS: ${{ steps.baseline-run.outputs.growth_heaps }}
+          BR_GROWTH_TIMES: ${{ steps.baseline-run.outputs.growth_times }}
+          BR_GROWTH_SLOPE: ${{ steps.baseline-run.outputs.growth_slope_mb }}
+          BR_GROWTH_R2: ${{ steps.baseline-run.outputs.growth_r2 }}
+          # PR outputs
+          CURRENT_PEAK: ${{ steps.pr.outputs.peak_mb }}
+          CURRENT_TIME: ${{ steps.pr.outputs.time_s }}
+          PR_TIME_SPREAD: ${{ steps.pr.outputs.time_spread }}
+          PR_HEAP_SPREAD: ${{ steps.pr.outputs.heap_spread }}
+          PR_ALL_TIMES: ${{ steps.pr.outputs.all_times }}
+          PR_ALL_HEAPS: ${{ steps.pr.outputs.all_heaps }}
+          PR_RUNS: ${{ steps.pr.outputs.runs }}
+          # PR growth outputs
+          PR_GROWTH_HEAPS: ${{ steps.pr-growth.outputs.growth_heaps }}
+          PR_GROWTH_TIMES: ${{ steps.pr-growth.outputs.growth_times }}
+          PR_GROWTH_SLOPE: ${{ steps.pr-growth.outputs.growth_slope_mb }}
+          PR_GROWTH_R2: ${{ steps.pr-growth.outputs.growth_r2 }}
         run: |
           # Pick baseline source
-          if [ "${{ steps.baseline-artifact.outputs.found }}" = "true" ]; then
-            BASELINE_PEAK=${{ steps.baseline-artifact.outputs.peak_mb }}
-            BASELINE_TIME=${{ steps.baseline-artifact.outputs.time_s }}
+          if [ "$BASELINE_FOUND" = "true" ]; then
+            BASELINE_PEAK="$BA_PEAK_MB"
+            BASELINE_TIME="$BA_TIME_S"
             BASELINE_SRC="cached"
-            BASELINE_TIME_SPREAD="${{ steps.baseline-artifact.outputs.time_spread }}"
-            BASELINE_HEAP_SPREAD="${{ steps.baseline-artifact.outputs.heap_spread }}"
-            BASELINE_ALL_TIMES="${{ steps.baseline-artifact.outputs.all_times }}"
-            BASELINE_ALL_HEAPS="${{ steps.baseline-artifact.outputs.all_heaps }}"
-            BASELINE_RUNS="${{ steps.baseline-artifact.outputs.runs }}"
-            BASELINE_GROWTH_HEAPS="${{ steps.baseline-artifact.outputs.growth_heaps }}"
-            BASELINE_GROWTH_TIMES="${{ steps.baseline-artifact.outputs.growth_times }}"
-            BASELINE_GROWTH_SLOPE="${{ steps.baseline-artifact.outputs.growth_slope_mb }}"
-            BASELINE_GROWTH_R2="${{ steps.baseline-artifact.outputs.growth_r2 }}"
+            BASELINE_TIME_SPREAD="$BA_TIME_SPREAD"
+            BASELINE_HEAP_SPREAD="$BA_HEAP_SPREAD"
+            BASELINE_ALL_TIMES="$BA_ALL_TIMES"
+            BASELINE_ALL_HEAPS="$BA_ALL_HEAPS"
+            BASELINE_RUNS="$BA_RUNS"
+            BASELINE_GROWTH_HEAPS="$BA_GROWTH_HEAPS"
+            BASELINE_GROWTH_TIMES="$BA_GROWTH_TIMES"
+            BASELINE_GROWTH_SLOPE="$BA_GROWTH_SLOPE"
+            BASELINE_GROWTH_R2="$BA_GROWTH_R2"
           else
-            BASELINE_PEAK=${{ steps.baseline-run.outputs.peak_mb }}
-            BASELINE_TIME=${{ steps.baseline-run.outputs.time_s }}
+            BASELINE_PEAK="$BR_PEAK_MB"
+            BASELINE_TIME="$BR_TIME_S"
             BASELINE_SRC="built from main"
-            BASELINE_TIME_SPREAD="${{ steps.baseline-run.outputs.time_spread }}"
-            BASELINE_HEAP_SPREAD="${{ steps.baseline-run.outputs.heap_spread }}"
-            BASELINE_ALL_TIMES="${{ steps.baseline-run.outputs.all_times }}"
-            BASELINE_ALL_HEAPS="${{ steps.baseline-run.outputs.all_heaps }}"
-            BASELINE_RUNS="${{ steps.baseline-run.outputs.runs }}"
-            BASELINE_GROWTH_HEAPS="${{ steps.baseline-run.outputs.growth_heaps }}"
-            BASELINE_GROWTH_TIMES="${{ steps.baseline-run.outputs.growth_times }}"
-            BASELINE_GROWTH_SLOPE="${{ steps.baseline-run.outputs.growth_slope_mb }}"
-            BASELINE_GROWTH_R2="${{ steps.baseline-run.outputs.growth_r2 }}"
+            BASELINE_TIME_SPREAD="$BR_TIME_SPREAD"
+            BASELINE_HEAP_SPREAD="$BR_HEAP_SPREAD"
+            BASELINE_ALL_TIMES="$BR_ALL_TIMES"
+            BASELINE_ALL_HEAPS="$BR_ALL_HEAPS"
+            BASELINE_RUNS="$BR_RUNS"
+            BASELINE_GROWTH_HEAPS="$BR_GROWTH_HEAPS"
+            BASELINE_GROWTH_TIMES="$BR_GROWTH_TIMES"
+            BASELINE_GROWTH_SLOPE="$BR_GROWTH_SLOPE"
+            BASELINE_GROWTH_R2="$BR_GROWTH_R2"
           fi
-
-          CURRENT_PEAK=${{ steps.pr.outputs.peak_mb }}
-          CURRENT_TIME=${{ steps.pr.outputs.time_s }}
 
           if [ -z "$BASELINE_PEAK" ] || [ "$BASELINE_PEAK" -eq 0 ] 2>/dev/null ||
              [ -z "$BASELINE_TIME" ]; then
@@ -470,11 +509,11 @@ jobs:
           echo "peak_pct=$PEAK_PCT" >> "$GITHUB_OUTPUT"
           echo "time_diff=$TIME_DIFF" >> "$GITHUB_OUTPUT"
           echo "time_pct=$TIME_PCT" >> "$GITHUB_OUTPUT"
-          echo "pr_time_spread=${{ steps.pr.outputs.time_spread }}" >> "$GITHUB_OUTPUT"
-          echo "pr_heap_spread=${{ steps.pr.outputs.heap_spread }}" >> "$GITHUB_OUTPUT"
-          echo "pr_all_times=${{ steps.pr.outputs.all_times }}" >> "$GITHUB_OUTPUT"
-          echo "pr_all_heaps=${{ steps.pr.outputs.all_heaps }}" >> "$GITHUB_OUTPUT"
-          echo "pr_runs=${{ steps.pr.outputs.runs }}" >> "$GITHUB_OUTPUT"
+          echo "pr_time_spread=$PR_TIME_SPREAD" >> "$GITHUB_OUTPUT"
+          echo "pr_heap_spread=$PR_HEAP_SPREAD" >> "$GITHUB_OUTPUT"
+          echo "pr_all_times=$PR_ALL_TIMES" >> "$GITHUB_OUTPUT"
+          echo "pr_all_heaps=$PR_ALL_HEAPS" >> "$GITHUB_OUTPUT"
+          echo "pr_runs=$PR_RUNS" >> "$GITHUB_OUTPUT"
           echo "baseline_time_spread=$BASELINE_TIME_SPREAD" >> "$GITHUB_OUTPUT"
           echo "baseline_heap_spread=$BASELINE_HEAP_SPREAD" >> "$GITHUB_OUTPUT"
           echo "baseline_all_times=$BASELINE_ALL_TIMES" >> "$GITHUB_OUTPUT"
@@ -482,11 +521,6 @@ jobs:
           echo "baseline_runs=$BASELINE_RUNS" >> "$GITHUB_OUTPUT"
 
           # Growth comparison
-          PR_GROWTH_HEAPS="${{ steps.pr-growth.outputs.growth_heaps }}"
-          PR_GROWTH_TIMES="${{ steps.pr-growth.outputs.growth_times }}"
-          PR_GROWTH_SLOPE="${{ steps.pr-growth.outputs.growth_slope_mb }}"
-          PR_GROWTH_R2="${{ steps.pr-growth.outputs.growth_r2 }}"
-
           echo "pr_growth_heaps=$PR_GROWTH_HEAPS" >> "$GITHUB_OUTPUT"
           echo "pr_growth_times=$PR_GROWTH_TIMES" >> "$GITHUB_OUTPUT"
           echo "pr_growth_slope=$PR_GROWTH_SLOPE" >> "$GITHUB_OUTPUT"
@@ -507,38 +541,68 @@ jobs:
       - name: Comment on PR
         if: github.event_name != 'push' && github.event_name != 'workflow_dispatch'
         uses: actions/github-script@v7
+        env:
+          PR_PEAK: ${{ steps.pr.outputs.peak_mb }}
+          PR_TIME: ${{ steps.pr.outputs.time_s }}
+          BASELINE_PEAK: ${{ steps.compare.outputs.baseline_peak }}
+          BASELINE_TIME: ${{ steps.compare.outputs.baseline_time }}
+          BASELINE_SRC: ${{ steps.compare.outputs.baseline_src }}
+          PEAK_PCT: ${{ steps.compare.outputs.peak_pct }}
+          TIME_PCT: ${{ steps.compare.outputs.time_pct }}
+          PEAK_DIFF: ${{ steps.compare.outputs.peak_diff }}
+          TIME_DIFF: ${{ steps.compare.outputs.time_diff }}
+          PR_RUNS: ${{ steps.compare.outputs.pr_runs }}
+          PR_TIME_SPREAD: ${{ steps.compare.outputs.pr_time_spread }}
+          PR_HEAP_SPREAD: ${{ steps.compare.outputs.pr_heap_spread }}
+          PR_ALL_TIMES: ${{ steps.compare.outputs.pr_all_times }}
+          PR_ALL_HEAPS: ${{ steps.compare.outputs.pr_all_heaps }}
+          BASE_TIME_SPREAD: ${{ steps.compare.outputs.baseline_time_spread }}
+          BASE_HEAP_SPREAD: ${{ steps.compare.outputs.baseline_heap_spread }}
+          BASE_ALL_TIMES: ${{ steps.compare.outputs.baseline_all_times }}
+          BASE_ALL_HEAPS: ${{ steps.compare.outputs.baseline_all_heaps }}
+          PR_GROWTH_HEAPS: ${{ steps.compare.outputs.pr_growth_heaps }}
+          PR_GROWTH_TIMES: ${{ steps.compare.outputs.pr_growth_times }}
+          PR_GROWTH_SLOPE: ${{ steps.compare.outputs.pr_growth_slope }}
+          PR_GROWTH_R2: ${{ steps.compare.outputs.pr_growth_r2 }}
+          BASE_GROWTH_HEAPS: ${{ steps.compare.outputs.baseline_growth_heaps }}
+          BASE_GROWTH_TIMES: ${{ steps.compare.outputs.baseline_growth_times }}
+          BASE_GROWTH_SLOPE: ${{ steps.compare.outputs.baseline_growth_slope }}
+          BASE_GROWTH_R2: ${{ steps.compare.outputs.baseline_growth_r2 }}
+          GROWTH_SLOPE_DIFF: ${{ steps.compare.outputs.growth_slope_diff }}
+          GROWTH_SLOPE_PCT: ${{ steps.compare.outputs.growth_slope_pct }}
+          COMMIT_SHA: ${{ steps.pr-ref.outputs.sha || github.sha }}
         with:
           script: |
-            const peak = '${{ steps.pr.outputs.peak_mb }}';
-            const time = '${{ steps.pr.outputs.time_s }}';
-            const basePeak = '${{ steps.compare.outputs.baseline_peak }}';
-            const baseTime = '${{ steps.compare.outputs.baseline_time }}';
-            const baseSrc = '${{ steps.compare.outputs.baseline_src }}';
-            const peakPct = '${{ steps.compare.outputs.peak_pct }}';
-            const timePct = '${{ steps.compare.outputs.time_pct }}';
-            const peakDiff = '${{ steps.compare.outputs.peak_diff }}';
-            const timeDiff = '${{ steps.compare.outputs.time_diff }}';
-            const runs = '${{ steps.compare.outputs.pr_runs }}' || '1';
-            const prTimeSpread = '${{ steps.compare.outputs.pr_time_spread }}';
-            const prHeapSpread = '${{ steps.compare.outputs.pr_heap_spread }}';
-            const prAllTimes = '${{ steps.compare.outputs.pr_all_times }}';
-            const prAllHeaps = '${{ steps.compare.outputs.pr_all_heaps }}';
-            const baseTimeSpread = '${{ steps.compare.outputs.baseline_time_spread }}';
-            const baseHeapSpread = '${{ steps.compare.outputs.baseline_heap_spread }}';
-            const baseAllTimes = '${{ steps.compare.outputs.baseline_all_times }}';
-            const baseAllHeaps = '${{ steps.compare.outputs.baseline_all_heaps }}';
+            const peak = process.env.PR_PEAK;
+            const time = process.env.PR_TIME;
+            const basePeak = process.env.BASELINE_PEAK;
+            const baseTime = process.env.BASELINE_TIME;
+            const baseSrc = process.env.BASELINE_SRC;
+            const peakPct = process.env.PEAK_PCT;
+            const timePct = process.env.TIME_PCT;
+            const peakDiff = process.env.PEAK_DIFF;
+            const timeDiff = process.env.TIME_DIFF;
+            const runs = process.env.PR_RUNS || '1';
+            const prTimeSpread = process.env.PR_TIME_SPREAD;
+            const prHeapSpread = process.env.PR_HEAP_SPREAD;
+            const prAllTimes = process.env.PR_ALL_TIMES;
+            const prAllHeaps = process.env.PR_ALL_HEAPS;
+            const baseTimeSpread = process.env.BASE_TIME_SPREAD;
+            const baseHeapSpread = process.env.BASE_HEAP_SPREAD;
+            const baseAllTimes = process.env.BASE_ALL_TIMES;
+            const baseAllHeaps = process.env.BASE_ALL_HEAPS;
 
             // Growth data
-            const prGrowthHeaps = '${{ steps.compare.outputs.pr_growth_heaps }}';
-            const prGrowthTimes = '${{ steps.compare.outputs.pr_growth_times }}';
-            const prGrowthSlope = '${{ steps.compare.outputs.pr_growth_slope }}';
-            const prGrowthR2 = '${{ steps.compare.outputs.pr_growth_r2 }}';
-            const baseGrowthHeaps = '${{ steps.compare.outputs.baseline_growth_heaps }}';
-            const baseGrowthTimes = '${{ steps.compare.outputs.baseline_growth_times }}';
-            const baseGrowthSlope = '${{ steps.compare.outputs.baseline_growth_slope }}';
-            const baseGrowthR2 = '${{ steps.compare.outputs.baseline_growth_r2 }}';
-            const growthSlopeDiff = '${{ steps.compare.outputs.growth_slope_diff }}';
-            const growthSlopePct = '${{ steps.compare.outputs.growth_slope_pct }}';
+            const prGrowthHeaps = process.env.PR_GROWTH_HEAPS;
+            const prGrowthTimes = process.env.PR_GROWTH_TIMES;
+            const prGrowthSlope = process.env.PR_GROWTH_SLOPE;
+            const prGrowthR2 = process.env.PR_GROWTH_R2;
+            const baseGrowthHeaps = process.env.BASE_GROWTH_HEAPS;
+            const baseGrowthTimes = process.env.BASE_GROWTH_TIMES;
+            const baseGrowthSlope = process.env.BASE_GROWTH_SLOPE;
+            const baseGrowthR2 = process.env.BASE_GROWTH_R2;
+            const growthSlopeDiff = process.env.GROWTH_SLOPE_DIFF;
+            const growthSlopePct = process.env.GROWTH_SLOPE_PCT;
 
             const fmt = (v) => parseFloat(v) >= 0 ? `+${v}` : v;
             const icon = (pct) => parseFloat(pct) > 5 ? '🔴' : parseFloat(pct) < -5 ? '🟢' : '⚪';
@@ -642,7 +706,7 @@ jobs:
             }
 
             // --- Footer ---
-            const sha = '${{ steps.pr-ref.outputs.sha || github.sha }}'.substring(0, 8);
+            const sha = process.env.COMMIT_SHA.substring(0, 8);
             body += `\n<sub>Commit: ${sha} · Baseline: ${baseSrc} · Runner: self-hosted bench</sub>\n`;
 
             const { data: comments } = await github.rest.issues.listComments({
