@@ -293,6 +293,8 @@ build_cli() {
     local label=$1
     local ref=${2:-}
     if [ -n "$ref" ]; then
+        # Save current branch to restore later
+        ORIG_BRANCH=$(git -C "$ROOT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")
         # Stash any local modifications so checkout is clean
         echo -e "${GREEN}[$label] Stashing local changes...${NC}"
         git -C "$ROOT_DIR" stash --quiet 2>/dev/null || true
@@ -305,12 +307,25 @@ build_cli() {
         patch_memory_trace
     fi
     echo -e "${GREEN}[$label] Building CLI (release + jemalloc-stats)...${NC}"
-    cargo build --release -p cli --features jemalloc-stats,memory-trace --manifest-path "$ROOT_DIR/Cargo.toml" 2>&1 | tail -1
+    if ! cargo build --release -p cli --features jemalloc-stats,memory-trace --manifest-path "$ROOT_DIR/Cargo.toml" 2>&1; then
+        echo -e "${RED}[$label] Build FAILED${NC}"
+        # Restore before aborting
+        if [ "$label" = "compare" ]; then
+            restore_all_patches
+            git -C "$ROOT_DIR" checkout -- Cargo.lock 2>/dev/null || true
+            git -C "$ROOT_DIR" checkout "${ORIG_BRANCH:-main}" --quiet 2>/dev/null
+            git -C "$ROOT_DIR" stash pop --quiet 2>/dev/null || true
+        fi
+        exit 1
+    fi
     cp "$ROOT_DIR/target/release/cli" "$OUTPUT_DIR/cli-$label"
     echo -e "${GREEN}[$label] Binary ready.${NC}"
-    # Restore patched files so checkout is clean
+    # Restore patched files and go back to original branch
     if [ "$label" = "compare" ]; then
         restore_all_patches
+        git -C "$ROOT_DIR" checkout -- Cargo.lock 2>/dev/null || true
+        git -C "$ROOT_DIR" checkout "${ORIG_BRANCH:-main}" --quiet 2>/dev/null
+        git -C "$ROOT_DIR" stash pop --quiet 2>/dev/null || true
     fi
 }
 
