@@ -1703,7 +1703,6 @@ pub trait IsStarkProver<
                         &mut pool.aux,
                     )?;
 
-                    // Bind table_contribution (L) to transcript for defense-in-depth.
                     if let Some(ref bpi) = round_1_result.bus_public_inputs {
                         table_transcript.append_field_element(&bpi.table_contribution);
                     }
