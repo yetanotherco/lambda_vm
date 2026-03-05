@@ -703,6 +703,17 @@ jobs:
                 }
                 body += `\n`;
               }
+
+              if (baseGrowthSlope && growthSlopePct) {
+                const slopePctVal = parseFloat(growthSlopePct);
+                if (slopePctVal > 10) {
+                  body += `\n> ⚠️ **Memory scaling regression** — growth rate increased by ${fmt(growthSlopePct)}%\n`;
+                } else if (slopePctVal < -10) {
+                  body += `\n> 🎉 **Memory scaling improvement** — growth rate decreased by ${growthSlopePct}%\n`;
+                } else {
+                  body += `\n> ✅ No significant change in memory scaling.\n`;
+                }
+              }
             }
 
             // --- Footer ---
