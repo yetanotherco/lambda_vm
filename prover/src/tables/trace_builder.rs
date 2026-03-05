@@ -1221,8 +1221,9 @@ pub struct Traces {
     /// BRANCH target calculation traces (wrapped in Vec for uniform architecture)
     pub branches: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 
-    /// HALT single-row table for program termination
-    pub halt: TraceTable<GoldilocksField, GoldilocksExtension>,
+    /// HALT single-row table for program termination.
+    /// None for non-final segments in a continuation proof (no ecall in intermediate segments).
+    pub halt: Option<TraceTable<GoldilocksField, GoldilocksExtension>>,
 
     /// MemoryBridge table for segment boundary state (continuation proofs only).
     /// None for single-segment proofs or segment 0.
@@ -1565,7 +1566,7 @@ impl Traces {
             page_configs,
             register: register_trace,
             branches,
-            halt: halt_trace,
+            halt: Some(halt_trace),
             memory_bridge: None,
         })
     }
@@ -1745,7 +1746,7 @@ impl Traces {
             page_configs,
             register: register_trace,
             branches,
-            halt: halt_trace,
+            halt: Some(halt_trace),
             memory_bridge: None,
         })
     }
@@ -1896,12 +1897,10 @@ impl Traces {
         bitwise_ops.extend(collect_bitwise_from_page(elf, &memory_state));
 
         // PHASE 5: Generate traces
-        let halt_op = cpu_ops
-            .iter()
-            .rev()
-            .find(|op| op.decode.op_ecall)
-            .ok_or(Error::MissingHaltEcall)?;
-        let halt_timestamp = halt_op.timestamp;
+        // In continuation proofs, only the final segment has the halt ecall.
+        // Intermediate segments have no ecall → no HALT table.
+        let halt_op = cpu_ops.iter().rev().find(|op| op.decode.op_ecall);
+        let halt_timestamp = halt_op.map(|op| op.timestamp);
 
         let cpus = chunk_and_generate(&cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
         let memws = chunk_and_generate(&memw_ops, max_rows.memw, memw::generate_memw_trace);
@@ -1927,23 +1926,17 @@ impl Traces {
 
         let register_final_state = register_state.to_final_state_map();
 
-        let (pages, page_configs, register_trace, halt_trace);
+        let (pages, page_configs, register_trace);
         #[cfg(feature = "parallel")]
         {
-            let ((pages_val, register_val), halt_val) = rayon::join(
-                || {
-                    rayon::join(
-                        || generate_page_tables(elf, &memory_state),
-                        || register::generate_register_trace(&register_final_state),
-                    )
-                },
-                || halt::generate_halt_trace(halt_timestamp),
+            let (pages_val, register_val) = rayon::join(
+                || generate_page_tables(elf, &memory_state),
+                || register::generate_register_trace(&register_final_state),
             );
             let (pages_v, page_configs_v) = pages_val;
             pages = pages_v;
             page_configs = page_configs_v;
             register_trace = register_val;
-            halt_trace = halt_val;
         }
         #[cfg(not(feature = "parallel"))]
         {
@@ -1951,8 +1944,11 @@ impl Traces {
             pages = pages_v;
             page_configs = page_configs_v;
             register_trace = register::generate_register_trace(&register_final_state);
-            halt_trace = halt::generate_halt_trace(halt_timestamp);
         }
+
+        // Generate HALT table only for the final segment (the one with ecall).
+        // Intermediate segments have no ecall → no HALT table.
+        let halt_trace = halt_timestamp.map(halt::generate_halt_trace);
 
         // Generate MemoryBridge table for segments > 0.
         // For segment 0 (log_offset == 0), checkpoint == ELF state, so no bridge needed.

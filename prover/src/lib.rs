@@ -169,7 +169,9 @@ pub(crate) struct VmAirs {
     pub muls: Vec<VmAir>,
     pub dvrms: Vec<VmAir>,
     pub branches: Vec<VmAir>,
-    pub halt: VmAir,
+    /// HALT AIR for program termination.
+    /// None for non-final segments in continuation proofs (no ecall in intermediate segments).
+    pub halt: Option<VmAir>,
     pub register: VmAir,
     pub pages: Vec<VmAir>,
     /// MemoryBridge AIR for continuation proof segments > 0.
@@ -182,9 +184,13 @@ impl VmAirs {
         let mut pairs: Vec<AirTracePair<'a>> = vec![
             (&self.bitwise, &mut traces.bitwise, &()),
             (&self.decode, &mut traces.decode, &()),
-            (&self.halt, &mut traces.halt, &()),
             (&self.register, &mut traces.register, &()),
         ];
+        if let Some(ref halt_air) = self.halt {
+            if let Some(ref mut halt_trace) = traces.halt {
+                pairs.push((halt_air, halt_trace, &()));
+            }
+        }
 
         for (air, trace) in self.cpus.iter().zip(traces.cpus.iter_mut()) {
             pairs.push((air, trace, &()));
@@ -222,7 +228,10 @@ impl VmAirs {
     /// Collect AIR references for [`Verifier::multi_verify`].
     pub fn air_refs(&self) -> Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> {
         let mut refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
-            vec![&self.bitwise, &self.decode, &self.halt, &self.register];
+            vec![&self.bitwise, &self.decode, &self.register];
+        if let Some(ref halt_air) = self.halt {
+            refs.push(halt_air);
+        }
 
         for air in &self.cpus {
             refs.push(air);
@@ -267,6 +276,7 @@ impl VmAirs {
         minimal_bitwise: bool,
         page_configs: &[crate::tables::page::PageConfig],
         table_counts: &TableCounts,
+        has_halt: bool,
         has_memory_bridge: bool,
     ) -> Self {
         let cpus: Vec<_> = (0..table_counts.cpu)
@@ -303,7 +313,11 @@ impl VmAirs {
         let branches: Vec<_> = (0..table_counts.branch)
             .map(|i| create_branch_air(proof_options).with_name(&format!("BRANCH[{}]", i)))
             .collect();
-        let halt = create_halt_air(proof_options);
+        let halt = if has_halt {
+            Some(create_halt_air(proof_options))
+        } else {
+            None
+        };
         let register = create_register_air(proof_options).with_preprocessed(
             register::preprocessed_commitment(proof_options),
             register::NUM_PREPROCESSED_COLS,
@@ -376,6 +390,7 @@ pub fn prove_with_options(
         false,
         &traces.page_configs,
         &table_counts,
+        true,  // always has halt for single-segment proofs
         false, // no memory bridge for single-segment proofs
     );
 
@@ -426,7 +441,7 @@ pub fn verify_with_options(
         Traces::page_configs_from_elf_and_runtime(&program, &vm_proof.runtime_page_ranges);
 
     // Cross-check: table_counts must match the number of sub-proofs.
-    // Fixed tables (bitwise, decode, halt, register) = 4, plus page tables.
+    // Fixed tables: bitwise + decode + register = 3, plus halt + page tables.
     let expected_proof_count = vm_proof.table_counts.total() + 4 + page_configs.len();
     if expected_proof_count != vm_proof.proof.proofs.len() {
         return Err(Error::InvalidTableCounts(format!(
@@ -444,6 +459,7 @@ pub fn verify_with_options(
         false,
         &page_configs,
         &vm_proof.table_counts,
+        true,  // always has halt for single-segment proofs
         false, // no memory bridge for single-segment proofs
     );
 
@@ -481,6 +497,9 @@ pub struct SegmentProof {
     pub bus_residual: FieldElement<E>,
     /// Index of this segment in the continuation.
     pub segment_index: usize,
+    /// Whether this segment includes a HALT table.
+    /// True for the final segment, false for intermediate segments.
+    pub has_halt: bool,
     /// Whether this segment includes a MemoryBridge table.
     /// True for segments > 0 in a continuation proof.
     pub has_memory_bridge: bool,
@@ -556,6 +575,7 @@ pub fn prove_continuation_with_options(
         )?;
 
         let table_counts = traces.table_counts();
+        let has_halt = traces.halt.is_some();
         let has_memory_bridge = traces.memory_bridge.is_some();
         let airs = VmAirs::new(
             &program,
@@ -563,6 +583,7 @@ pub fn prove_continuation_with_options(
             false,
             &traces.page_configs,
             &table_counts,
+            has_halt,
             has_memory_bridge,
         );
 
@@ -582,6 +603,7 @@ pub fn prove_continuation_with_options(
             table_counts,
             bus_residual,
             segment_index: seg_idx,
+            has_halt,
             has_memory_bridge,
         });
 
@@ -624,14 +646,17 @@ pub fn verify_continuation_with_options(
         let page_configs =
             Traces::page_configs_from_elf_and_runtime(&program, &segment.runtime_page_ranges);
 
+        let halt_count = if segment.has_halt { 1 } else { 0 };
         let bridge_count = if segment.has_memory_bridge { 1 } else { 0 };
+        // Fixed tables: bitwise + decode + register = 3
         let expected_proof_count =
-            segment.table_counts.total() + 4 + page_configs.len() + bridge_count;
+            segment.table_counts.total() + 3 + halt_count + page_configs.len() + bridge_count;
         if expected_proof_count != segment.proof.proofs.len() {
             return Err(Error::InvalidTableCounts(format!(
-                "segment {}: table_counts total ({}) + 4 fixed + {} pages + {} bridge = {}, but proof has {} sub-proofs",
+                "segment {}: table_counts total ({}) + 3 fixed + {} halt + {} pages + {} bridge = {}, but proof has {} sub-proofs",
                 segment.segment_index,
                 segment.table_counts.total(),
+                halt_count,
                 page_configs.len(),
                 bridge_count,
                 expected_proof_count,
@@ -645,6 +670,7 @@ pub fn verify_continuation_with_options(
             false,
             &page_configs,
             &segment.table_counts,
+            segment.has_halt,
             segment.has_memory_bridge,
         );
 

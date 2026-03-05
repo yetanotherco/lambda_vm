@@ -945,7 +945,7 @@ fn test_decode_soundness_different_elf_rejected() {
         (&prover_memw_air, &mut traces.memws[0], &()),
         (&prover_load_air, &mut traces.loads[0], &()),
         (&prover_branch_air, &mut traces.branches[0], &()),
-        (&prover_halt_air, &mut traces.halt, &()),
+        (&prover_halt_air, traces.halt.as_mut().unwrap(), &()),
         (&prover_decode_air, &mut traces.decode, &()),
     ];
 
@@ -1040,6 +1040,7 @@ fn test_decode_soundness_same_elf_accepted() {
         false,
         &traces.page_configs,
         &table_counts,
+        true,
         false,
     );
 
@@ -1058,6 +1059,7 @@ fn test_decode_soundness_same_elf_accepted() {
         false,
         &traces.page_configs,
         &table_counts,
+        true,
         false,
     );
 

@@ -54,6 +54,7 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
         true,
         &traces.page_configs,
         &table_counts,
+        true,
         false,
     );
 
@@ -1241,6 +1242,7 @@ fn test_deep_stack_runtime_pages_roundtrip() {
         true,
         &traces.page_configs,
         &table_counts,
+        true,
         false,
     );
     let proof = Prover::multi_prove(
@@ -1252,7 +1254,7 @@ fn test_deep_stack_runtime_pages_roundtrip() {
     // Verifier reconstructs from ELF + runtime_page_ranges hint
     let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges);
     let verifier_airs =
-        crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs, &table_counts, false);
+        crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs, &table_counts, true, false);
 
     let verified = Verifier::multi_verify(
         &verifier_airs.air_refs(),
@@ -1289,6 +1291,7 @@ fn test_deep_stack_missing_pages_rejected() {
         true,
         &traces.page_configs,
         &table_counts,
+        true,
         false,
     );
     let proof = Prover::multi_prove(
@@ -1300,7 +1303,7 @@ fn test_deep_stack_missing_pages_rejected() {
     // Verifier uses EMPTY runtime_page_ranges → missing stack/heap pages
     let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[]);
     let verifier_airs =
-        crate::VmAirs::new(&elf, &proof_options, true, &wrong_configs, &table_counts, false);
+        crate::VmAirs::new(&elf, &proof_options, true, &wrong_configs, &table_counts, true, false);
 
     let verified = Verifier::multi_verify(
         &verifier_airs.air_refs(),
@@ -1370,6 +1373,7 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
         true,
         &traces.page_configs,
         &table_counts,
+        true,
         false,
     );
     let proof = Prover::multi_prove(
@@ -1381,7 +1385,7 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
     // Verifier reconstructs from ELF + runtime hint (ranges decoded to pages)
     let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges);
     let verifier_airs =
-        crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs, &table_counts, false);
+        crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs, &table_counts, true, false);
 
     let verified = Verifier::multi_verify(
         &verifier_airs.air_refs(),
@@ -1484,7 +1488,7 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         dvrm: 0,
         branch: 0,
     };
-    let airs = VmAirs::new(&elf, &proof_options, true, &[], &zero_counts, false);
+    let airs = VmAirs::new(&elf, &proof_options, true, &[], &zero_counts, true, false);
 
     let verifier_air_refs = airs.air_refs();
     assert_eq!(verifier_air_refs.len(), 4);
@@ -1591,4 +1595,70 @@ fn test_continuation_single_segment() {
     let valid = crate::verify_continuation(&continuation_proof, &elf_bytes)
         .expect("verify_continuation failed");
     assert!(valid, "Single-segment continuation proof should verify");
+}
+
+/// Multi-segment continuation proof with MemoryBridge.
+/// Uses a small segment_size to force 2+ segments, exercising:
+/// - SegmentCheckpoint state propagation
+/// - MemoryBridge table for segment > 0 (ELF-vs-checkpoint diff)
+/// - Optional HALT (only in final segment)
+/// - Global bus residual balance (Σ residual = 0)
+#[test]
+fn test_continuation_multi_segment() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_add_8");
+
+    // Use segment_size=4 to split ~22 logs into multiple segments.
+    let segment_size = 4;
+    let continuation_proof =
+        crate::prove_continuation(&elf_bytes, segment_size).expect("prove_continuation failed");
+
+    // Must have at least 2 segments.
+    assert!(
+        continuation_proof.segment_proofs.len() >= 2,
+        "Expected >= 2 segments with segment_size={}, got {}",
+        segment_size,
+        continuation_proof.segment_proofs.len(),
+    );
+
+    // Segment 0: no bridge, no halt (unless it's also the last)
+    let first = &continuation_proof.segment_proofs[0];
+    assert_eq!(first.segment_index, 0);
+    assert!(!first.has_memory_bridge, "Segment 0 should not have MemoryBridge");
+
+    // Last segment: has halt
+    let last = continuation_proof.segment_proofs.last().unwrap();
+    assert!(last.has_halt, "Final segment should have HALT table");
+
+    // Non-final segments: no halt, but segments > 0 have bridge
+    for seg in &continuation_proof.segment_proofs[..continuation_proof.segment_proofs.len() - 1] {
+        assert!(
+            !seg.has_halt,
+            "Non-final segment {} should not have HALT",
+            seg.segment_index,
+        );
+    }
+    for seg in &continuation_proof.segment_proofs[1..] {
+        assert!(
+            seg.has_memory_bridge,
+            "Segment {} (> 0) should have MemoryBridge",
+            seg.segment_index,
+        );
+    }
+
+    // With MemoryBridge properly covering all modified memory/registers,
+    // each segment is self-balanced (bus residual = 0).
+    // The bridge cancels the ELF-vs-checkpoint mismatch within each segment.
+    for seg in &continuation_proof.segment_proofs {
+        assert_eq!(
+            seg.bus_residual,
+            math::field::element::FieldElement::<E>::zero(),
+            "Segment {} bus residual should be zero (MemoryBridge makes each segment self-consistent)",
+            seg.segment_index,
+        );
+    }
+
+    // Verify the continuation proof.
+    let valid = crate::verify_continuation(&continuation_proof, &elf_bytes)
+        .expect("verify_continuation failed");
+    assert!(valid, "Multi-segment continuation proof should verify");
 }
