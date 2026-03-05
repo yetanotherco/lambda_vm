@@ -14,6 +14,21 @@ sudo apt-get install -y time
 sudo apt install lsb-release wget software-properties-common gnupg tmux
 ```
 
+Install gh CLI (v2.87.3):
+
+```bash
+(type -p wget >/dev/null || (sudo apt update && sudo apt install wget -y)) \
+    && sudo mkdir -p -m 755 /etc/apt/keyrings \
+    && out=$(mktemp) && wget -nv -O"$out" https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+    && cat "$out" | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \
+    && sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && sudo mkdir -p -m 755 /etc/apt/sources.list.d \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+    && sudo apt update \
+    && sudo apt install gh=2.87.3 -y
+gh --version
+```
+
 Install and set up LLVM 18 toolchain:
 
 ```bash
@@ -67,6 +82,12 @@ make compile-programs-asm
 ### 5. Install GitHub Actions runner
 
 Go to **GitHub repo > Settings > Actions > Runners > New self-hosted runner**, select Linux, and follow the download and configuration steps. When prompted for labels, add `bench`.
+
+Add the environment file so the runner can find cargo and other tools:
+
+```bash
+echo "PATH=/usr/bin:/usr/local/bin:/home/app/.cargo/bin" > ~/actions-runner/.env
+```
 
 Start the runner inside a tmux session so it persists after disconnecting:
 
