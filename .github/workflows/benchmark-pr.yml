@@ -68,7 +68,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUM: ${{ github.event.issue.number }}
         run: |
-          SHA=$(gh pr view "$PR_NUM" --json headRefOid -q .headRefOid)
+          SHA=$(gh pr view "$PR_NUM" --repo "$GITHUB_REPOSITORY" --json headRefOid -q .headRefOid)
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
       - name: Checkout
@@ -87,6 +87,9 @@ jobs:
                 "$SRC" -o "$OUT"
             fi
           done
+
+      - name: Add cargo to PATH
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Build CLI (PR)
         run: cargo build --release -p cli --features jemalloc-stats
