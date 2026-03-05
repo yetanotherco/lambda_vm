@@ -30,10 +30,12 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  PROGRAM: executor/programs/asm/fib_iterative_372k.s
-  ELF: executor/program_artifacts/asm/fib_iterative_372k.elf
+  PROGRAM: executor/programs/asm/fib_iterative_2M.s
+  ELF: executor/program_artifacts/asm/fib_iterative_2M.elf
   BENCH_RUNS_PR: 3
   BENCH_RUNS_BASELINE: 5
+  GROWTH_PROGRAMS: "fib_iterative_250k fib_iterative_500k fib_iterative_1M fib_iterative_2M"
+  GROWTH_STEPS: "250000 500000 1000000 2000000"
 
 jobs:
   benchmark:
@@ -74,13 +76,17 @@ jobs:
         with:
           ref: ${{ steps.pr-ref.outputs.sha || github.sha }}
 
-      - name: Compile benchmark ELF
+      - name: Compile benchmark ELFs
         run: |
           mkdir -p executor/program_artifacts/asm
-          if [ ! -f "$ELF" ]; then
-            clang --target=riscv64 -march=rv64im -fuse-ld=lld -nostdlib -Wl,-e,main \
-              "$PROGRAM" -o "$ELF"
-          fi
+          for prog in $GROWTH_PROGRAMS; do
+            SRC="executor/programs/asm/${prog}.s"
+            OUT="executor/program_artifacts/asm/${prog}.elf"
+            if [ ! -f "$OUT" ]; then
+              clang --target=riscv64 -march=rv64im -fuse-ld=lld -nostdlib -Wl,-e,main \
+                "$SRC" -o "$OUT"
+            fi
+          done
 
       - name: Build CLI (PR)
         run: cargo build --release -p cli --features jemalloc-stats
@@ -171,6 +177,75 @@ jobs:
           echo "all_heaps=$ALL_HEAPS" >> /tmp/metrics.txt
           echo "runs=$RUNS" >> /tmp/metrics.txt
 
+      - name: Memory growth (PR)
+        id: pr-growth
+        run: |
+          PR_HEAP="${{ steps.pr.outputs.peak_mb }}"
+          PR_TIME="${{ steps.pr.outputs.time_s }}"
+          PROGRAMS=($GROWTH_PROGRAMS)
+          STEPS_ARR=($GROWTH_STEPS)
+          GROWTH_HEAPS=""
+          GROWTH_TIMES=""
+
+          for idx in "${!PROGRAMS[@]}"; do
+            prog="${PROGRAMS[$idx]}"
+            ELF_PATH="executor/program_artifacts/asm/${prog}.elf"
+            if [ "$prog" = "fib_iterative_2M" ]; then
+              H="$PR_HEAP"
+              T="$PR_TIME"
+            else
+              echo "--- Growth: $prog ---"
+              ./target/release/cli prove "$ELF_PATH" -o /tmp/proof.bin --time \
+                | tee /tmp/growth_${prog}.txt
+              rm -f /tmp/proof.bin
+              T=$(grep -o 'Proving time: [0-9.]*' /tmp/growth_${prog}.txt | awk '{print $3}')
+              H=$(grep -o 'Peak heap: [0-9]*' /tmp/growth_${prog}.txt | awk '{print $3}')
+              if [ -z "$T" ] || [ -z "$H" ]; then
+                echo "::error::Failed to parse growth metrics for $prog"
+                exit 1
+              fi
+            fi
+            GROWTH_HEAPS="${GROWTH_HEAPS:+$GROWTH_HEAPS/}$H"
+            GROWTH_TIMES="${GROWTH_TIMES:+$GROWTH_TIMES/}$T"
+          done
+
+          # Linear regression: heap (MB) vs steps (millions)
+          STEPS_SLASH=$(echo "${STEPS_ARR[@]}" | tr ' ' '/')
+          read SLOPE R2 <<< $(awk -v steps="$STEPS_SLASH" -v heaps="$GROWTH_HEAPS" 'BEGIN {
+            n = split(steps, xs, "/")
+            split(heaps, ys, "/")
+            sx = 0; sy = 0; sxy = 0; sx2 = 0
+            for (i = 1; i <= n; i++) {
+              x = xs[i] / 1000000; y = ys[i] + 0
+              sx += x; sy += y; sxy += x * y; sx2 += x * x
+            }
+            d = n * sx2 - sx * sx
+            if (d == 0) { print "0 0.0000"; exit }
+            slope = (n * sxy - sx * sy) / d
+            my = sy / n; ss_tot = 0; ss_res = 0
+            for (i = 1; i <= n; i++) {
+              x = xs[i] / 1000000; y = ys[i] + 0
+              pred = slope * x + (sy - slope * sx) / n
+              ss_res += (y - pred) * (y - pred)
+              ss_tot += (y - my) * (y - my)
+            }
+            r2 = (ss_tot > 0) ? 1 - ss_res / ss_tot : 0
+            printf "%.0f %.4f\n", slope, r2
+          }')
+
+          echo "growth_steps=$STEPS_SLASH" >> "$GITHUB_OUTPUT"
+          echo "growth_heaps=$GROWTH_HEAPS" >> "$GITHUB_OUTPUT"
+          echo "growth_times=$GROWTH_TIMES" >> "$GITHUB_OUTPUT"
+          echo "growth_slope_mb=$SLOPE" >> "$GITHUB_OUTPUT"
+          echo "growth_r2=$R2" >> "$GITHUB_OUTPUT"
+
+          # Append to metrics artifact
+          echo "growth_steps=$STEPS_SLASH" >> /tmp/metrics.txt
+          echo "growth_heaps=$GROWTH_HEAPS" >> /tmp/metrics.txt
+          echo "growth_times=$GROWTH_TIMES" >> /tmp/metrics.txt
+          echo "growth_slope_mb=$SLOPE" >> /tmp/metrics.txt
+          echo "growth_r2=$R2" >> /tmp/metrics.txt
+
       - name: Upload metrics artifact
         uses: actions/upload-artifact@v4
         with:
@@ -203,6 +278,10 @@ jobs:
                 echo "all_times=$(grep 'all_times=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
                 echo "all_heaps=$(grep 'all_heaps=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
                 echo "runs=$(grep 'runs=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+                echo "growth_heaps=$(grep 'growth_heaps=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+                echo "growth_times=$(grep 'growth_times=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+                echo "growth_slope_mb=$(grep 'growth_slope_mb=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+                echo "growth_r2=$(grep 'growth_r2=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
                 exit 0
               fi
             fi
@@ -225,6 +304,7 @@ jobs:
 
           cargo build --release -p cli --features jemalloc-stats
 
+          # --- Primary benchmark (2M) ---
           RUNS="${{ steps.config.outputs.runs }}"
           TIMES=""
           HEAPS=""
@@ -275,6 +355,62 @@ jobs:
           echo "all_heaps=$ALL_HEAPS" >> "$GITHUB_OUTPUT"
           echo "runs=$RUNS" >> "$GITHUB_OUTPUT"
 
+          # --- Growth benchmarks (250k, 500k, 1M + reuse 2M median) ---
+          PROGRAMS=($GROWTH_PROGRAMS)
+          STEPS_ARR=($GROWTH_STEPS)
+          GROWTH_HEAPS=""
+          GROWTH_TIMES=""
+
+          for idx in "${!PROGRAMS[@]}"; do
+            prog="${PROGRAMS[$idx]}"
+            ELF_PATH="executor/program_artifacts/asm/${prog}.elf"
+            if [ "$prog" = "fib_iterative_2M" ]; then
+              H="$HEAP_MEDIAN"
+              T="$TIME_MEDIAN"
+            else
+              echo "--- Baseline growth: $prog ---"
+              ./target/release/cli prove "$ELF_PATH" -o /tmp/proof.bin --time \
+                | tee /tmp/baseline_growth_${prog}.txt
+              rm -f /tmp/proof.bin
+              T=$(grep -o 'Proving time: [0-9.]*' /tmp/baseline_growth_${prog}.txt | awk '{print $3}')
+              H=$(grep -o 'Peak heap: [0-9]*' /tmp/baseline_growth_${prog}.txt | awk '{print $3}')
+              if [ -z "$T" ] || [ -z "$H" ]; then
+                echo "::error::Failed to parse baseline growth metrics for $prog"
+                exit 1
+              fi
+            fi
+            GROWTH_HEAPS="${GROWTH_HEAPS:+$GROWTH_HEAPS/}$H"
+            GROWTH_TIMES="${GROWTH_TIMES:+$GROWTH_TIMES/}$T"
+          done
+
+          STEPS_SLASH=$(echo "${STEPS_ARR[@]}" | tr ' ' '/')
+          read SLOPE R2 <<< $(awk -v steps="$STEPS_SLASH" -v heaps="$GROWTH_HEAPS" 'BEGIN {
+            n = split(steps, xs, "/")
+            split(heaps, ys, "/")
+            sx = 0; sy = 0; sxy = 0; sx2 = 0
+            for (i = 1; i <= n; i++) {
+              x = xs[i] / 1000000; y = ys[i] + 0
+              sx += x; sy += y; sxy += x * y; sx2 += x * x
+            }
+            d = n * sx2 - sx * sx
+            if (d == 0) { print "0 0.0000"; exit }
+            slope = (n * sxy - sx * sy) / d
+            my = sy / n; ss_tot = 0; ss_res = 0
+            for (i = 1; i <= n; i++) {
+              x = xs[i] / 1000000; y = ys[i] + 0
+              pred = slope * x + (sy - slope * sx) / n
+              ss_res += (y - pred) * (y - pred)
+              ss_tot += (y - my) * (y - my)
+            }
+            r2 = (ss_tot > 0) ? 1 - ss_res / ss_tot : 0
+            printf "%.0f %.4f\n", slope, r2
+          }')
+
+          echo "growth_heaps=$GROWTH_HEAPS" >> "$GITHUB_OUTPUT"
+          echo "growth_times=$GROWTH_TIMES" >> "$GITHUB_OUTPUT"
+          echo "growth_slope_mb=$SLOPE" >> "$GITHUB_OUTPUT"
+          echo "growth_r2=$R2" >> "$GITHUB_OUTPUT"
+
           # Restore PR checkout
           git checkout "$PR_SHA"
 
@@ -294,6 +430,10 @@ jobs:
             BASELINE_ALL_TIMES="${{ steps.baseline-artifact.outputs.all_times }}"
             BASELINE_ALL_HEAPS="${{ steps.baseline-artifact.outputs.all_heaps }}"
             BASELINE_RUNS="${{ steps.baseline-artifact.outputs.runs }}"
+            BASELINE_GROWTH_HEAPS="${{ steps.baseline-artifact.outputs.growth_heaps }}"
+            BASELINE_GROWTH_TIMES="${{ steps.baseline-artifact.outputs.growth_times }}"
+            BASELINE_GROWTH_SLOPE="${{ steps.baseline-artifact.outputs.growth_slope_mb }}"
+            BASELINE_GROWTH_R2="${{ steps.baseline-artifact.outputs.growth_r2 }}"
           else
             BASELINE_PEAK=${{ steps.baseline-run.outputs.peak_mb }}
             BASELINE_TIME=${{ steps.baseline-run.outputs.time_s }}
@@ -303,6 +443,10 @@ jobs:
             BASELINE_ALL_TIMES="${{ steps.baseline-run.outputs.all_times }}"
             BASELINE_ALL_HEAPS="${{ steps.baseline-run.outputs.all_heaps }}"
             BASELINE_RUNS="${{ steps.baseline-run.outputs.runs }}"
+            BASELINE_GROWTH_HEAPS="${{ steps.baseline-run.outputs.growth_heaps }}"
+            BASELINE_GROWTH_TIMES="${{ steps.baseline-run.outputs.growth_times }}"
+            BASELINE_GROWTH_SLOPE="${{ steps.baseline-run.outputs.growth_slope_mb }}"
+            BASELINE_GROWTH_R2="${{ steps.baseline-run.outputs.growth_r2 }}"
           fi
 
           CURRENT_PEAK=${{ steps.pr.outputs.peak_mb }}
@@ -337,6 +481,29 @@ jobs:
           echo "baseline_all_heaps=$BASELINE_ALL_HEAPS" >> "$GITHUB_OUTPUT"
           echo "baseline_runs=$BASELINE_RUNS" >> "$GITHUB_OUTPUT"
 
+          # Growth comparison
+          PR_GROWTH_HEAPS="${{ steps.pr-growth.outputs.growth_heaps }}"
+          PR_GROWTH_TIMES="${{ steps.pr-growth.outputs.growth_times }}"
+          PR_GROWTH_SLOPE="${{ steps.pr-growth.outputs.growth_slope_mb }}"
+          PR_GROWTH_R2="${{ steps.pr-growth.outputs.growth_r2 }}"
+
+          echo "pr_growth_heaps=$PR_GROWTH_HEAPS" >> "$GITHUB_OUTPUT"
+          echo "pr_growth_times=$PR_GROWTH_TIMES" >> "$GITHUB_OUTPUT"
+          echo "pr_growth_slope=$PR_GROWTH_SLOPE" >> "$GITHUB_OUTPUT"
+          echo "pr_growth_r2=$PR_GROWTH_R2" >> "$GITHUB_OUTPUT"
+          echo "baseline_growth_heaps=$BASELINE_GROWTH_HEAPS" >> "$GITHUB_OUTPUT"
+          echo "baseline_growth_times=$BASELINE_GROWTH_TIMES" >> "$GITHUB_OUTPUT"
+          echo "baseline_growth_slope=$BASELINE_GROWTH_SLOPE" >> "$GITHUB_OUTPUT"
+          echo "baseline_growth_r2=$BASELINE_GROWTH_R2" >> "$GITHUB_OUTPUT"
+
+          # Growth slope comparison
+          if [ -n "$BASELINE_GROWTH_SLOPE" ] && [ -n "$PR_GROWTH_SLOPE" ]; then
+            SLOPE_DIFF=$((PR_GROWTH_SLOPE - BASELINE_GROWTH_SLOPE))
+            SLOPE_PCT=$(awk "BEGIN { if ($BASELINE_GROWTH_SLOPE != 0) printf \"%.1f\", ($SLOPE_DIFF * 100) / $BASELINE_GROWTH_SLOPE; else print \"0.0\" }")
+            echo "growth_slope_diff=$SLOPE_DIFF" >> "$GITHUB_OUTPUT"
+            echo "growth_slope_pct=$SLOPE_PCT" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Comment on PR
         if: github.event_name != 'push' && github.event_name != 'workflow_dispatch'
         uses: actions/github-script@v7
@@ -361,12 +528,25 @@ jobs:
             const baseAllTimes = '${{ steps.compare.outputs.baseline_all_times }}';
             const baseAllHeaps = '${{ steps.compare.outputs.baseline_all_heaps }}';
 
+            // Growth data
+            const prGrowthHeaps = '${{ steps.compare.outputs.pr_growth_heaps }}';
+            const prGrowthTimes = '${{ steps.compare.outputs.pr_growth_times }}';
+            const prGrowthSlope = '${{ steps.compare.outputs.pr_growth_slope }}';
+            const prGrowthR2 = '${{ steps.compare.outputs.pr_growth_r2 }}';
+            const baseGrowthHeaps = '${{ steps.compare.outputs.baseline_growth_heaps }}';
+            const baseGrowthTimes = '${{ steps.compare.outputs.baseline_growth_times }}';
+            const baseGrowthSlope = '${{ steps.compare.outputs.baseline_growth_slope }}';
+            const baseGrowthR2 = '${{ steps.compare.outputs.baseline_growth_r2 }}';
+            const growthSlopeDiff = '${{ steps.compare.outputs.growth_slope_diff }}';
+            const growthSlopePct = '${{ steps.compare.outputs.growth_slope_pct }}';
+
             const fmt = (v) => parseFloat(v) >= 0 ? `+${v}` : v;
             const icon = (pct) => parseFloat(pct) > 5 ? '🔴' : parseFloat(pct) < -5 ? '🟢' : '⚪';
             const SPREAD_THRESHOLD = 5.0;
 
+            // --- Section 1: Primary benchmark ---
             const nLabel = parseInt(runs) > 1 ? ` (median of ${runs})` : '';
-            let body = `## Benchmark — fib_iterative_372k${nLabel}\n\n`;
+            let body = `## Benchmark — fib_iterative_2M${nLabel}\n\n`;
             body += `| Metric | main | PR | Δ |\n`;
             body += `|--------|------|----|---|\n`;
             body += `| **Peak heap** | ${basePeak} MB | ${peak} MB | ${fmt(peakDiff)} MB (${fmt(peakPct)}%) ${icon(peakPct)} |\n`;
@@ -416,6 +596,52 @@ jobs:
               body += `\n> ✅ Low variance (time: ${prTimeSpread || '0.0'}%, heap: ${prHeapSpread || '0.0'}%)\n`;
             }
 
+            // --- Section 2: Memory growth ---
+            if (prGrowthHeaps) {
+              const prHeaps = prGrowthHeaps.split('/');
+              const baseHeaps = baseGrowthHeaps ? baseGrowthHeaps.split('/') : null;
+              const labels = ['250k', '500k', '1M', '2M'];
+              const programs = ['fib_iterative_250k', 'fib_iterative_500k', 'fib_iterative_1M', 'fib_iterative_2M'];
+
+              body += `\n## Memory Growth\n\n`;
+
+              if (baseHeaps && baseHeaps.length === 4 && baseHeaps[0]) {
+                body += `| Program | Steps | main (MB) | PR (MB) | Δ |\n`;
+                body += `|---------|-------|-----------|---------|---|\n`;
+                for (let i = 0; i < 4; i++) {
+                  const bh = parseInt(baseHeaps[i]);
+                  const ph = parseInt(prHeaps[i]);
+                  const diff = ph - bh;
+                  const pct = bh > 0 ? ((diff / bh) * 100).toFixed(1) : '0.0';
+                  body += `| ${programs[i]} | ${labels[i]} | ${baseHeaps[i]} | ${prHeaps[i]} | ${fmt(diff)} MB (${fmt(pct)}%) |\n`;
+                }
+              } else {
+                body += `| Program | Steps | PR (MB) |\n`;
+                body += `|---------|-------|---------|\n`;
+                for (let i = 0; i < 4; i++) {
+                  body += `| ${programs[i]} | ${labels[i]} | ${prHeaps[i]} |\n`;
+                }
+              }
+
+              body += `\n`;
+
+              if (prGrowthSlope) {
+                body += `**Growth rate:** ${prGrowthSlope} MB / 1M steps`;
+                if (baseGrowthSlope && growthSlopePct) {
+                  body += ` (main: ${baseGrowthSlope}, Δ: ${fmt(growthSlopePct)}%)`;
+                }
+                body += `\n`;
+              }
+              if (prGrowthR2) {
+                body += `**Fit:** R² = ${prGrowthR2}`;
+                if (baseGrowthR2) {
+                  body += ` (main: ${baseGrowthR2})`;
+                }
+                body += `\n`;
+              }
+            }
+
+            // --- Footer ---
             const sha = '${{ steps.pr-ref.outputs.sha || github.sha }}'.substring(0, 8);
             body += `\n<sub>Commit: ${sha} · Baseline: ${baseSrc} · Runner: self-hosted bench</sub>\n`;
 
@@ -425,9 +651,12 @@ jobs:
               issue_number: context.issue.number,
             });
 
-            const marker = 'Benchmark — fib_iterative_372k';
+            // Find existing comment (check both old and new markers for transition)
             const existing = comments.find(c =>
-              c.user.type === 'Bot' && c.body.includes(marker)
+              c.user.type === 'Bot' && (
+                c.body.includes('Benchmark — fib_iterative_2M') ||
+                c.body.includes('Benchmark — fib_iterative_372k')
+              )
             );
 
             if (existing) {
