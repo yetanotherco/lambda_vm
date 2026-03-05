@@ -195,12 +195,12 @@ patch_memory_trace() {
         next
     }
 
-    # After "domains.push(domain);" -> per-table Phase A checkpoint
-    /domains\.push\(domain\);/ {
+    # After main_commits.push(...) -> per-table Phase A checkpoint (a0035c1+ code)
+    /main_commits\.push\(/ {
         print
         print ""
         print "            #[cfg(feature = \"memory-trace\")]"
-        print "            mem_checkpoint(&format!(\"Phase A: committed ({}/{})\", main_commitments.len(), num_airs));"
+        print "            mem_checkpoint(&format!(\"Phase A: committed ({}/{})\", main_commits.len(), num_airs));"
         next
     }
 
@@ -211,7 +211,7 @@ patch_memory_trace() {
         print ""
     }
 
-    # Track round_1_build_auxiliary_trace call to insert after its )?;
+    # Old code (92666dc): track round_1_build_auxiliary_trace call to insert after its )?;
     /round_1_build_auxiliary_trace\(/ { in_r1_build = 1 }
     in_r1_build == 1 && /\)\?;/ {
         in_r1_build = 0
@@ -222,10 +222,18 @@ patch_memory_trace() {
         next
     }
 
-    # After "proofs.push(proof);" -> drop round1 and checkpoint
+    # a0035c1 code: after table_transcripts.push -> aux committed checkpoint
+    /table_transcripts\.push\(table_transcript\);/ {
+        print
+        print ""
+        print "            #[cfg(feature = \"memory-trace\")]"
+        print "            mem_checkpoint(&format!(\"aux built + committed ({}/{})\", metadatas.len(), num_airs));"
+        next
+    }
+
+    # After "proofs.push(proof);" -> checkpoint (no drop — round_1_result may be used after)
     /proofs\.push\(proof\);/ {
         print
-        print "            drop(round_1_result);"
         print ""
         print "            #[cfg(feature = \"memory-trace\")]"
         print "            mem_checkpoint(&format!(\"table done ({}/{})\", proofs.len(), num_airs));"
