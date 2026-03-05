@@ -1563,13 +1563,8 @@ pub trait IsStarkProver<
             })
             .collect();
 
-        #[cfg(feature = "instruments")]
-        let aux_build_elapsed = phase_start.elapsed();
-
         // Pass 2: Parallel fork transcript → extract → LDE → commit in chunks of K.
         // Each table gets its own transcript fork and pool set.
-        #[cfg(feature = "instruments")]
-        let phase_start = Instant::now();
 
         // Pre-fork all transcripts (cheap, sequential — must match verifier ordering)
         let mut table_transcripts: Vec<_> = (0..num_airs)
@@ -1583,8 +1578,11 @@ pub trait IsStarkProver<
             .collect();
 
         // Parallel aux commit in chunks of K
-        let mut aux_results: Vec<(Option<Arc<BatchedMerkleTree<FieldExtension>>>, Option<Commitment>)> =
-            Vec::with_capacity(num_airs);
+        #[allow(clippy::type_complexity)]
+        let mut aux_results: Vec<(
+            Option<Arc<BatchedMerkleTree<FieldExtension>>>,
+            Option<Commitment>,
+        )> = Vec::with_capacity(num_airs);
 
         for chunk_start in (0..num_airs).step_by(k) {
             let chunk_end = (chunk_start + k).min(num_airs);
@@ -1670,12 +1668,6 @@ pub trait IsStarkProver<
         // =====================================================================
         // Each chunk of K tables is processed in parallel. Each worker gets its
         // own pool set and transcript fork. Pool sets are reused across chunks.
-
-        #[cfg(feature = "instruments")]
-        let phase_start = Instant::now();
-        #[cfg(feature = "instruments")]
-        let table_timings: Vec<(String, usize, std::time::Duration, crate::instruments::TableSubOps)> =
-            Vec::with_capacity(num_airs);
 
         let mut proofs = Vec::with_capacity(num_airs);
         for chunk_start in (0..num_airs).step_by(k) {
