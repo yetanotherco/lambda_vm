@@ -1116,14 +1116,14 @@ fn expand_commit_operations(
             let remaining = count - i;
             let is_end = remaining == 0;
             let value = if !is_end {
-                let (byte_val, _ts) = memory_state.read_byte(buf_addr + i);
+                let (byte_val, _ts) = memory_state.read_byte(buf_addr.wrapping_add(i));
                 byte_val
             } else {
                 0
             };
             ops.push(CommitOperation {
                 timestamp,
-                address: buf_addr + i,
+                address: buf_addr.wrapping_add(i),
                 count: remaining,
                 first: i == 0,
                 end: is_end,

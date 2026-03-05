@@ -7,7 +7,7 @@ use crate::vm::{
 
 const REGULAR_PC_UPDATE: u64 = 4;
 
-enum SyscallNumbers {
+pub enum SyscallNumbers {
     Print = 1,
     Panic = 2,
     Commit = 3,
@@ -305,10 +305,13 @@ impl Instruction {
                     }
                     SyscallNumbers::Commit => {
                         // commit: write(fd, buf_addr, count) per POSIX convention
-                        // x10 = fd (must be 1 for stdout, validated by COMMIT chip)
+                        // x10 = fd (must be 1 for stdout)
                         // x11 = buf_addr (buffer address in memory)
                         // x12 = count (number of bytes to write)
-                        let _fd = registers.read(10)?;
+                        let fd = registers.read(10)?;
+                        if fd != 1 {
+                            return Err(ExecutionError::InvalidCommitFd(fd));
+                        }
                         let buf_addr = registers.read(11)?;
                         let count = registers.read(12)?;
                         memory.commit_public_output(buf_addr, count)?;
@@ -493,4 +496,6 @@ pub enum ExecutionError {
     IncorrectMessage,
     #[error("Invalid W-suffix operation: {0:?}")]
     InvalidWSuffixOperation(ArithOp),
+    #[error("Invalid commit fd: expected 1 (stdout), got {0}")]
+    InvalidCommitFd(u64),
 }

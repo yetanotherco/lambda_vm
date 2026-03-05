@@ -55,7 +55,11 @@
 
 use super::types::{BusId, DecodeEntry, FE, GoldilocksExtension, GoldilocksField};
 use crate::Error;
-use executor::vm::{instruction::decoding::Instruction, logs::Log, memory::U64HashMap};
+use executor::vm::{
+    instruction::{decoding::Instruction, execution::SyscallNumbers},
+    logs::Log,
+    memory::U64HashMap,
+};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
@@ -566,7 +570,7 @@ impl CpuOperation {
     /// The DecodeEntry contains static instruction information. This method
     /// adds runtime values from the Log (register values, branch decisions, etc.).
     pub fn from_log(log: &Log, timestamp: u64, decode: DecodeEntry) -> Self {
-        let ecall_commit = decode.op_ecall && log.src1_val == 3;
+        let ecall_commit = decode.op_ecall && log.src1_val == SyscallNumbers::Commit as u64;
         let (commit_buf_addr, commit_count) = if ecall_commit {
             (log.src2_val, log.dst_val)
         } else {
