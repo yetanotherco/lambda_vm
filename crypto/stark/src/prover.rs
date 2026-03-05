@@ -1,5 +1,5 @@
 use std::marker::PhantomData;
-use std::rc::Rc;
+use std::sync::Arc;
 #[cfg(feature = "instruments")]
 use std::time::Instant;
 
@@ -30,7 +30,8 @@ use math::{
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::{
-    IntoParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
+    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
+    IntoParallelRefMutIterator, ParallelIterator,
 };
 
 #[cfg(feature = "debug-checks")]
@@ -58,6 +59,34 @@ type AirTracePair<'a, Field, FieldExtension, PI> = (
     &'a mut TraceTable<Field, FieldExtension>,
     &'a PI,
 );
+
+/// A set of LDE column buffer pools for one concurrent table slot.
+/// Each parallel worker gets its own `PoolSet` to avoid sharing buffer state.
+struct PoolSet<F: IsField, E: IsField> {
+    main: Vec<Vec<FieldElement<F>>>,
+    aux: Vec<Vec<FieldElement<E>>>,
+}
+
+/// Returns the number of tables to process concurrently in `multi_prove`.
+/// Default: `num_cores / 3`. Override with `TABLE_PARALLELISM` env var.
+fn table_parallelism() -> usize {
+    #[cfg(feature = "parallel")]
+    {
+        std::env::var("TABLE_PARALLELISM")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| {
+                let cores = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4);
+                (cores / 3).max(1)
+            })
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        1
+    }
+}
 
 /// A default STARK prover implementing `IsStarkProver`.
 pub struct Prover<
@@ -92,11 +121,11 @@ where
     /// The Merkle trees constructed to obtain the commitment of the entire trace table.
     /// For preprocessed tables, this contains only the multiplicity columns.
     /// Wrapped in Rc for potential sharing without deep-cloning (~64MB per table).
-    pub(crate) lde_trace_merkle_tree: Rc<BatchedMerkleTree<F>>,
+    pub(crate) lde_trace_merkle_tree: Arc<BatchedMerkleTree<F>>,
     /// The root of the Merkle tree in `lde_trace_merkle_tree`.
     pub(crate) lde_trace_merkle_root: Commitment,
     /// For preprocessed tables: Merkle tree over precomputed columns only.
-    pub(crate) precomputed_merkle_tree: Option<Rc<BatchedMerkleTree<F>>>,
+    pub(crate) precomputed_merkle_tree: Option<Arc<BatchedMerkleTree<F>>>,
     /// For preprocessed tables: root of the precomputed Merkle tree.
     pub(crate) precomputed_merkle_root: Option<Commitment>,
     /// For preprocessed tables: number of precomputed columns (for splitting during opening).
@@ -129,9 +158,9 @@ struct MainCommitData<Field: IsFFTField>
 where
     FieldElement<Field>: AsBytes,
 {
-    main_tree: Rc<BatchedMerkleTree<Field>>,
+    main_tree: Arc<BatchedMerkleTree<Field>>,
     main_root: Commitment,
-    precomputed_tree: Option<Rc<BatchedMerkleTree<Field>>>,
+    precomputed_tree: Option<Arc<BatchedMerkleTree<Field>>>,
     precomputed_root: Option<Commitment>,
     num_precomputed_cols: usize,
 }
@@ -150,17 +179,17 @@ where
 {
     /// Merkle tree of the main trace (multiplicities for preprocessed tables).
     /// Wrapped in Rc to share with Round1CommitmentData without deep-cloning.
-    main_merkle_tree: Rc<BatchedMerkleTree<Field>>,
+    main_merkle_tree: Arc<BatchedMerkleTree<Field>>,
     /// Root of the main trace Merkle tree.
     main_merkle_root: Commitment,
     /// For preprocessed tables: Merkle tree over precomputed columns.
-    precomputed_merkle_tree: Option<Rc<BatchedMerkleTree<Field>>>,
+    precomputed_merkle_tree: Option<Arc<BatchedMerkleTree<Field>>>,
     /// For preprocessed tables: root of the precomputed Merkle tree.
     precomputed_merkle_root: Option<Commitment>,
     /// For preprocessed tables: number of precomputed columns.
     num_precomputed_cols: usize,
     /// Merkle tree of the auxiliary trace (None if no aux trace).
-    aux_merkle_tree: Option<Rc<BatchedMerkleTree<FieldExtension>>>,
+    aux_merkle_tree: Option<Arc<BatchedMerkleTree<FieldExtension>>>,
     /// Root of the auxiliary trace Merkle tree (None if no aux trace).
     aux_merkle_root: Option<Commitment>,
     /// The RAP challenges used for auxiliary trace construction.
@@ -439,7 +468,6 @@ pub trait IsStarkProver<
     fn commit_main_trace(
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
-        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
         twiddles: &LdeTwiddles<Field>,
         main_pool: &mut [Vec<FieldElement<Field>>],
     ) -> Result<
@@ -463,8 +491,6 @@ pub trait IsStarkProver<
         let (tree, root) = Self::commit_columns_bit_reversed(&main_pool[..num_cols])
             .ok_or(ProvingError::EmptyCommitment)?;
 
-        transcript.append_bytes(&root);
-
         // Pool buffers retain capacity; tree is returned to caller
         Ok((tree, root, None, None, 0))
     }
@@ -475,7 +501,6 @@ pub trait IsStarkProver<
     fn commit_preprocessed_trace(
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
-        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
         precomputed_commitment: Commitment,
         num_precomputed_cols: usize,
         twiddles: &LdeTwiddles<Field>,
@@ -510,9 +535,6 @@ pub trait IsStarkProver<
             precomputed_root, precomputed_commitment,
             "Prover's precomputed commitment doesn't match hardcoded AIR commitment"
         );
-
-        transcript.append_bytes(&precomputed_commitment);
-        transcript.append_bytes(&mult_root);
 
         // Pool buffers retain capacity; trees are returned to caller
         Ok((
@@ -551,9 +573,9 @@ pub trait IsStarkProver<
 
         // Use stored Merkle trees from Phase A/C via Rc (pointer copy, no deep clone)
         let main = Round1CommitmentData::<Field> {
-            lde_trace_merkle_tree: Rc::clone(&metadata.main_merkle_tree),
+            lde_trace_merkle_tree: Arc::clone(&metadata.main_merkle_tree),
             lde_trace_merkle_root: metadata.main_merkle_root,
-            precomputed_merkle_tree: metadata.precomputed_merkle_tree.as_ref().map(Rc::clone),
+            precomputed_merkle_tree: metadata.precomputed_merkle_tree.as_ref().map(Arc::clone),
             precomputed_merkle_root: metadata.precomputed_merkle_root,
             num_precomputed_cols: metadata.num_precomputed_cols,
         };
@@ -565,7 +587,7 @@ pub trait IsStarkProver<
             Self::expand_pool_to_lde::<FieldExtension>(aux_pool, n_aux, domain, twiddles);
             // Safe: has_aux_trace() is true only when Phase C stored aux tree/root
             let aux_commitment = Round1CommitmentData::<FieldExtension> {
-                lde_trace_merkle_tree: Rc::clone(
+                lde_trace_merkle_tree: Arc::clone(
                     metadata
                         .aux_merkle_tree
                         .as_ref()
@@ -1404,7 +1426,7 @@ pub trait IsStarkProver<
     /// The transcript must be safely initialized before passing it to this method.
     fn multi_prove(
         mut air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
-        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
     ) -> Result<MultiProof<Field, FieldExtension, PI>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
@@ -1447,56 +1469,78 @@ pub trait IsStarkProver<
             twiddle_caches.push(twiddles);
         }
 
-        // Allocate LDE column buffer pools — reused across all tables and phases.
-        let mut main_pool: Vec<Vec<FieldElement<Field>>> = (0..max_main_cols)
-            .map(|_| Vec::with_capacity(max_lde_size))
-            .collect();
-        let mut aux_pool: Vec<Vec<FieldElement<FieldExtension>>> = (0..max_aux_cols)
-            .map(|_| Vec::with_capacity(max_lde_size))
+        // Allocate K pool sets — one per concurrent worker in the parallel chunk loop.
+        let k = table_parallelism().min(num_airs);
+        let mut pool_sets: Vec<PoolSet<Field, FieldExtension>> = (0..k)
+            .map(|_| PoolSet {
+                main: (0..max_main_cols)
+                    .map(|_| Vec::with_capacity(max_lde_size))
+                    .collect(),
+                aux: (0..max_aux_cols)
+                    .map(|_| Vec::with_capacity(max_lde_size))
+                    .collect(),
+            })
             .collect();
 
         #[cfg(feature = "memory-trace")]
-        mem_checkpoint("pools allocated");
+        mem_checkpoint(&format!("pools allocated (k={k})"));
 
         // =====================================================================
-        // Round 1, Phase A: Commit all main traces (lightweight)
+        // Round 1, Phase A: Commit all main traces (parallel in chunks of K)
         // =====================================================================
         // All main trace commitments must be in the transcript before sampling
-        // LogUp challenges. Pool buffers are reused across tables.
+        // LogUp challenges. K tables commit in parallel; transcript append is sequential.
 
         let mut main_commits: Vec<MainCommitData<Field>> = Vec::with_capacity(num_airs);
 
-        for ((air, trace, _pub_inputs), twiddles) in
-            air_trace_pairs.iter().zip(twiddle_caches.iter())
-        {
-            let domain = &domains[main_commits.len()];
+        for chunk_start in (0..num_airs).step_by(k) {
+            let chunk_end = (chunk_start + k).min(num_airs);
+            let chunk_size = chunk_end - chunk_start;
 
-            let (tree, root, pre_tree, pre_root, n_pre) = if air.is_preprocessed() {
-                Self::commit_preprocessed_trace(
-                    *trace,
-                    domain,
-                    transcript,
-                    air.precomputed_commitment(),
-                    air.num_precomputed_columns(),
-                    twiddles,
-                    &mut main_pool,
-                )?
-            } else {
-                Self::commit_main_trace(*trace, domain, transcript, twiddles, &mut main_pool)?
-            };
+            #[cfg(feature = "parallel")]
+            let iter = pool_sets[..chunk_size].par_iter_mut().enumerate();
+            #[cfg(not(feature = "parallel"))]
+            let iter = pool_sets[..chunk_size].iter_mut().enumerate();
 
-            main_commits.push(MainCommitData {
-                main_tree: Rc::new(tree),
-                main_root: root,
-                precomputed_tree: pre_tree.map(Rc::new),
-                precomputed_root: pre_root,
-                num_precomputed_cols: n_pre,
-            });
+            let chunk_results: Vec<Result<_, ProvingError>> = iter
+                .map(|(j, pool)| {
+                    let idx = chunk_start + j;
+                    let (air, trace, _) = &air_trace_pairs[idx];
+                    let domain = &domains[idx];
+                    let twiddles = &twiddle_caches[idx];
 
-            #[cfg(feature = "memory-trace")]
-            {
-                let name = air.name();
-                mem_checkpoint(&format!("Phase A: committed {name} ({}/{})", main_commits.len(), num_airs));
+                    if air.is_preprocessed() {
+                        Self::commit_preprocessed_trace(
+                            *trace,
+                            domain,
+                            air.precomputed_commitment(),
+                            air.num_precomputed_columns(),
+                            twiddles,
+                            &mut pool.main,
+                        )
+                    } else {
+                        Self::commit_main_trace(*trace, domain, twiddles, &mut pool.main)
+                    }
+                })
+                .collect();
+
+            // Sequential: append roots to shared transcript (Fiat-Shamir ordering)
+            for result in chunk_results {
+                let (tree, root, pre_tree, pre_root, n_pre) = result?;
+                if let Some(ref pre_r) = pre_root {
+                    transcript.append_bytes(pre_r);
+                }
+                transcript.append_bytes(&root);
+                main_commits.push(MainCommitData {
+                    main_tree: Arc::new(tree),
+                    main_root: root,
+                    precomputed_tree: pre_tree.map(Arc::new),
+                    precomputed_root: pre_root,
+                    num_precomputed_cols: n_pre,
+                });
+
+                #[cfg(feature = "memory-trace")]
+                mem_checkpoint(&format!("Phase A: committed {}/{}",  main_commits.len(), num_airs));
             }
         }
 
@@ -1516,181 +1560,201 @@ pub trait IsStarkProver<
         };
 
         // =====================================================================
-        // Phase C + Rounds 2-4: Forked per table
+        // Phase C + Rounds 2-4: Parallel merged chunk loop
         // =====================================================================
-        // Each table gets an independent transcript fork (cloned from the shared
-        // state after Phase B, domain-separated by table index). This matches
-        // the verifier's forking and makes per-table proving independent.
-        //
-        // Split into two passes for parallelism:
-        //   Pass 1 (parallel): Build all auxiliary traces (fingerprint + batch inversion)
-        //   Pass 2 (sequential): Fork transcript → extract → LDE → commit (shared pool)
-
-        // =====================================================================
-        // Per-table loop: build aux + commit + prove + drop
-        // =====================================================================
-        // For each table: build aux trace → commit aux → recompute main LDE →
+        // For each chunk of K tables: build aux → commit aux → recompute main LDE →
         // build Round1 directly → prove rounds 2-4 → drop (frees Merkle trees).
-        // Aux is built one table at a time (internal parallelism via batch_inverse/par_chunks)
-        // so only one table's aux data exists at a time. Peak memory = Phase A.
+        // K tables run in parallel; after each chunk, trees are freed.
+        // Peak memory = Phase A (all main trees). Per-chunk: DECREASING.
 
-        let mut proofs = Vec::with_capacity(num_airs);
-        #[cfg(feature = "debug-checks")]
-        let mut all_bus_public_inputs: Vec<Option<BusPublicInputs<FieldExtension>>> =
+        // Build ALL aux traces sequentially (needs &mut traces), collect bus inputs
+        let mut all_bus_inputs: Vec<Option<BusPublicInputs<FieldExtension>>> =
             Vec::with_capacity(num_airs);
-
-        for (
-            idx,
-            (((air, trace, pub_inputs), main_commit), (domain, twiddles)),
-        ) in air_trace_pairs
-            .iter_mut()
-            .zip(main_commits.into_iter())
-            .zip(domains.iter().zip(twiddle_caches.iter()))
-            .enumerate()
-        {
-            // Build auxiliary trace for this table
-            let bus_public_inputs = if air.has_aux_trace() {
+        for (air, trace, _) in air_trace_pairs.iter_mut() {
+            let bpi = if air.has_aux_trace() {
                 air.build_auxiliary_trace(*trace, &lookup_challenges)
             } else {
                 None
             };
+            all_bus_inputs.push(bpi);
+        }
 
-            #[cfg(feature = "memory-trace")]
-            {
-                let name = air.name();
-                mem_checkpoint(&format!("table {name}: aux built ({}/{})", idx + 1, num_airs));
-            }
-            // Fork transcript with domain separator (must match verifier)
-            let mut table_transcript = transcript.clone();
-            if num_airs > 1 {
-                table_transcript.append_bytes(&(idx as u64).to_le_bytes());
-            }
+        #[cfg(feature = "memory-trace")]
+        mem_checkpoint("aux traces built (all tables)");
 
-            // --- Commit aux trace (from Phase C Pass 2) ---
-            let (aux_commitment, num_aux_cols) = if air.has_aux_trace() {
-                let num_aux_cols = trace.num_aux_columns;
-                trace.extract_columns_aux_into(&mut aux_pool);
+        let mut proofs = Vec::with_capacity(num_airs);
+
+        let mut main_commits_iter = main_commits.into_iter();
+
+        for chunk_start in (0..num_airs).step_by(k) {
+            let chunk_end = (chunk_start + k).min(num_airs);
+            let chunk_size = chunk_end - chunk_start;
+
+            // Drain this chunk's main commits (frees previous chunk's trees)
+            let chunk_main: Vec<_> = main_commits_iter.by_ref().take(chunk_size).collect();
+
+            // Pre-fork transcripts for this chunk (sequential, cheap)
+            let mut chunk_transcripts: Vec<_> = (0..chunk_size)
+                .map(|j| {
+                    let idx = chunk_start + j;
+                    let mut t = transcript.clone();
+                    if num_airs > 1 {
+                        t.append_bytes(&(idx as u64).to_le_bytes());
+                    }
+                    t
+                })
+                .collect();
+
+            // Parallel: K tables do the full pipeline (aux commit + main LDE + prove)
+            // Scoped block so shared borrows of air_trace_pairs end before mutable access.
+            let chunk_results: Vec<Result<_, ProvingError>> = {
+                let chunk_refs: Vec<(
+                    &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+                    &TraceTable<Field, FieldExtension>,
+                    &PI,
+                )> = air_trace_pairs[chunk_start..chunk_end]
+                    .iter()
+                    .map(|(air, trace, pi)| (*air, &**trace, *pi))
+                    .collect();
+
+                #[cfg(feature = "parallel")]
+                let iter = pool_sets[..chunk_size]
+                    .par_iter_mut()
+                    .zip(chunk_transcripts.par_iter_mut())
+                    .enumerate();
+                #[cfg(not(feature = "parallel"))]
+                let iter = pool_sets[..chunk_size]
+                    .iter_mut()
+                    .zip(chunk_transcripts.iter_mut())
+                    .enumerate();
+
+                iter.map(|(j, (pool, table_transcript))| {
+                    let idx = chunk_start + j;
+                    let (air, trace, pub_inputs) = chunk_refs[j];
+                    let main_commit = &chunk_main[j];
+                    let domain = &domains[idx];
+                    let twiddles = &twiddle_caches[idx];
+
+                    // --- Commit aux trace ---
+                    let (aux_commitment, num_aux_cols) = if air.has_aux_trace() {
+                        let num_aux_cols = trace.num_aux_columns;
+                        trace.extract_columns_aux_into(&mut pool.aux);
+                        Self::expand_pool_to_lde::<FieldExtension>(
+                            &mut pool.aux,
+                            num_aux_cols,
+                            domain,
+                            twiddles,
+                        );
+
+                        let (tree, root) =
+                            Self::commit_columns_bit_reversed(&pool.aux[..num_aux_cols])
+                                .ok_or(ProvingError::EmptyCommitment)?;
+
+                        table_transcript.append_bytes(&root);
+                        let commitment = Round1CommitmentData::<FieldExtension> {
+                            lde_trace_merkle_tree: Arc::new(tree),
+                            lde_trace_merkle_root: root,
+                            precomputed_merkle_tree: None,
+                            precomputed_merkle_root: None,
+                            num_precomputed_cols: 0,
+                        };
+                        (Some(commitment), num_aux_cols)
+                    } else {
+                        (None, 0)
+                    };
+
+                    // --- Recompute main LDE into pool ---
+                    let num_main_cols = trace.num_main_columns;
+                    trace.extract_columns_main_into(&mut pool.main);
+                    Self::expand_pool_to_lde::<Field>(
+                        &mut pool.main,
+                        num_main_cols,
+                        domain,
+                        twiddles,
+                    );
+
+                    let main_commitment = Round1CommitmentData::<Field> {
+                        lde_trace_merkle_tree: Arc::clone(&main_commit.main_tree),
+                        lde_trace_merkle_root: main_commit.main_root,
+                        precomputed_merkle_tree: main_commit
+                            .precomputed_tree
+                            .as_ref()
+                            .map(Arc::clone),
+                        precomputed_merkle_root: main_commit.precomputed_root,
+                        num_precomputed_cols: main_commit.num_precomputed_cols,
+                    };
+
+                    // Take column Vecs from pool (zero-copy move)
+                    let main_cols: Vec<_> = pool.main[..num_main_cols]
+                        .iter_mut()
+                        .map(std::mem::take)
+                        .collect();
+                    let aux_cols: Vec<_> = pool.aux[..num_aux_cols]
+                        .iter_mut()
+                        .map(std::mem::take)
+                        .collect();
+                    let lde_trace = LDETraceTable::from_columns(
+                        main_cols,
+                        aux_cols,
+                        air.step_size(),
+                        domain.blowup_factor,
+                    );
+
+                    let round_1_result = Round1 {
+                        lde_trace,
+                        main: main_commitment,
+                        aux: aux_commitment,
+                        rap_challenges: lookup_challenges.clone(),
+                        bus_public_inputs: all_bus_inputs[idx].clone(),
+                    };
+
+                    // Bind table_contribution (L) to transcript for defense-in-depth.
+                    if let Some(ref bpi) = round_1_result.bus_public_inputs {
+                        table_transcript.append_field_element(&bpi.table_contribution);
+                    }
+
+                    let proof = Self::prove_rounds_2_to_4(
+                        air,
+                        pub_inputs,
+                        &round_1_result,
+                        table_transcript,
+                        domain,
+                    )?;
+
+                    // Return column Vecs to pool (zero-copy move back)
+                    let (main_cols, aux_cols) = round_1_result.lde_trace.into_columns();
+                    for (slot, col) in pool.main.iter_mut().zip(main_cols) {
+                        *slot = col;
+                    }
+                    for (slot, col) in pool.aux.iter_mut().zip(aux_cols) {
+                        *slot = col;
+                    }
+
+                    Ok(proof)
+                })
+                .collect()
+            };
+            // chunk_refs dropped here — air_trace_pairs can be mutably accessed again
+
+            // Collect proofs and clear aux data from traces
+            for (j, result) in chunk_results.into_iter().enumerate() {
+                let idx = chunk_start + j;
+                proofs.push(result?);
                 // Free aux data from trace — it's been copied into the pool.
-                // Without this, aux data accumulates across all TraceTables.
-                trace.aux_table = Table::new(Vec::new(), 0);
-                Self::expand_pool_to_lde::<FieldExtension>(
-                    &mut aux_pool,
-                    num_aux_cols,
-                    domain,
-                    twiddles,
-                );
-
-                let (tree, root) = Self::commit_columns_bit_reversed(&aux_pool[..num_aux_cols])
-                    .ok_or(ProvingError::EmptyCommitment)?;
-
-                table_transcript.append_bytes(&root);
-                let commitment = Round1CommitmentData::<FieldExtension> {
-                    lde_trace_merkle_tree: Rc::new(tree),
-                    lde_trace_merkle_root: root,
-                    precomputed_merkle_tree: None,
-                    precomputed_merkle_root: None,
-                    num_precomputed_cols: 0,
-                };
-                (Some(commitment), num_aux_cols)
-            } else {
-                (None, 0)
-            };
-
-            #[cfg(feature = "memory-trace")]
-            {
-                let name = air.name();
-                mem_checkpoint(&format!("table {name}: aux committed ({}/{})", idx + 1, num_airs));
-            }
-
-            // --- Recompute main LDE into pool (aux LDE still in aux_pool from above) ---
-            let num_main_cols = trace.num_main_columns;
-            trace.extract_columns_main_into(&mut main_pool);
-            Self::expand_pool_to_lde::<Field>(&mut main_pool, num_main_cols, domain, twiddles);
-
-            let main_commitment = Round1CommitmentData::<Field> {
-                lde_trace_merkle_tree: main_commit.main_tree,
-                lde_trace_merkle_root: main_commit.main_root,
-                precomputed_merkle_tree: main_commit.precomputed_tree,
-                precomputed_merkle_root: main_commit.precomputed_root,
-                num_precomputed_cols: main_commit.num_precomputed_cols,
-            };
-
-            // Take column Vecs from pool (zero-copy move)
-            let main_cols: Vec<_> = main_pool[..num_main_cols]
-                .iter_mut()
-                .map(std::mem::take)
-                .collect();
-            let aux_cols: Vec<_> = aux_pool[..num_aux_cols]
-                .iter_mut()
-                .map(std::mem::take)
-                .collect();
-            let lde_trace = LDETraceTable::from_columns(
-                main_cols,
-                aux_cols,
-                air.step_size(),
-                domain.blowup_factor,
-            );
-
-            let round_1_result = Round1 {
-                lde_trace,
-                main: main_commitment,
-                aux: aux_commitment,
-                rap_challenges: lookup_challenges.clone(),
-                bus_public_inputs,
-            };
-
-            // --- Debug checks: validate trace inline ---
-            #[cfg(feature = "debug-checks")]
-            {
-                all_bus_public_inputs.push(round_1_result.bus_public_inputs.clone());
-                validate_trace(
-                    *air,
-                    *pub_inputs,
-                    *trace,
-                    domain,
-                    &round_1_result.rap_challenges,
-                    round_1_result.bus_public_inputs.as_ref(),
-                );
-            }
-
-            // Bind table_contribution (L) to transcript for defense-in-depth.
-            if let Some(ref bpi) = round_1_result.bus_public_inputs {
-                table_transcript.append_field_element(&bpi.table_contribution);
+                air_trace_pairs[idx].1.aux_table = Table::new(Vec::new(), 0);
             }
 
             #[cfg(feature = "memory-trace")]
-            {
-                let name = air.name();
-                mem_checkpoint(&format!("table {name}: LDE reconstructed ({}/{})", idx + 1, num_airs));
-            }
-
-            let proof = Self::prove_rounds_2_to_4(
-                *air,
-                *pub_inputs,
-                &round_1_result,
-                &mut table_transcript,
-                domain,
-            )?;
-            proofs.push(proof);
-
-            // Return column Vecs to pool (zero-copy move back).
-            let (main_cols, aux_cols) = round_1_result.lde_trace.into_columns();
-            for (slot, col) in main_pool.iter_mut().zip(main_cols) {
-                *slot = col;
-            }
-            for (slot, col) in aux_pool.iter_mut().zip(aux_cols) {
-                *slot = col;
-            }
-
-            #[cfg(feature = "memory-trace")]
-            {
-                let name = air.name();
-                mem_checkpoint(&format!("table {name}: proved ({}/{})", proofs.len(), num_airs));
-            }
+            mem_checkpoint(&format!(
+                "chunk {chunk_start}..{chunk_end} proved ({}/{})",
+                proofs.len(),
+                num_airs
+            ));
+            // chunk_main dropped here → Arc refcount decreases → trees freed
         }
 
         #[cfg(feature = "debug-checks")]
-        print_bus_balance_report(&all_bus_public_inputs);
+        print_bus_balance_report(&all_bus_inputs);
 
         Ok(MultiProof::new(proofs))
     }
@@ -1701,7 +1765,7 @@ pub trait IsStarkProver<
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         trace: &mut TraceTable<Field, FieldExtension>,
         pub_inputs: &PI,
-        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
     ) -> Result<StarkProof<Field, FieldExtension, PI>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
