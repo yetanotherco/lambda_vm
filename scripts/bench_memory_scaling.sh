@@ -11,7 +11,8 @@
 #   --sizes "160 372 700 1400"    Space-separated list of program sizes in thousands of cycles
 #   --max-rows-log2 15            Power of 2 for max rows per table (default: use production defaults)
 #   --runs 1                      Number of runs per size (median is reported if >1)
-#   --compare <commit>            Also benchmark a comparison commit (e.g. ea254b8, main~3)
+#   --compare <ref>                Also benchmark a comparison ref (repeatable, e.g. --compare main --compare branch)
+#   --table-parallelism <N>       Set TABLE_PARALLELISM env var for all prove runs
 #   --output <dir>                Directory for results and artifacts (default: /tmp/bench_scaling)
 #
 # Examples:
@@ -40,7 +41,8 @@ NC='\033[0m'
 SIZES="160 372 700 1400"
 MAX_ROWS_LOG2=""
 RUNS=1
-COMPARE_REF=""
+COMPARE_REFS=()
+TABLE_PARALLELISM=""
 OUTPUT_DIR="/tmp/bench_scaling"
 
 # --- Parse args ---------------------------------------------------------------
@@ -50,7 +52,8 @@ while [[ $# -gt 0 ]]; do
         --sizes)        SIZES="$2"; shift 2 ;;
         --max-rows-log2) MAX_ROWS_LOG2="$2"; shift 2 ;;
         --runs)         RUNS="$2"; shift 2 ;;
-        --compare)      COMPARE_REF="$2"; shift 2 ;;
+        --compare)      COMPARE_REFS+=("$2"); shift 2 ;;
+        --table-parallelism) TABLE_PARALLELISM="$2"; shift 2 ;;
         --output)       OUTPUT_DIR="$2"; shift 2 ;;
         -h|--help)
             head -25 "$0" | tail -23
@@ -63,7 +66,7 @@ CURRENT_BRANCH=$(git -C "$ROOT_DIR" rev-parse --abbrev-ref HEAD)
 CURRENT_SHA=$(git -C "$ROOT_DIR" rev-parse --short HEAD)
 
 # Restore branch + stash on exit if we checked out something else
-if [ -n "$COMPARE_REF" ]; then
+if [ ${#COMPARE_REFS[@]} -gt 0 ]; then
     trap 'git -C "$ROOT_DIR" checkout -- "$ROOT_DIR/Cargo.lock" 2>/dev/null; git -C "$ROOT_DIR" checkout "$CURRENT_BRANCH" --quiet 2>/dev/null; git -C "$ROOT_DIR" checkout -- "$ROOT_DIR/Cargo.lock" 2>/dev/null; git -C "$ROOT_DIR" stash pop --quiet 2>/dev/null || true' EXIT
 fi
 
@@ -304,7 +307,7 @@ build_cli() {
         git -C "$ROOT_DIR" checkout "$ref" --quiet 2>/dev/null
     fi
     # For compare builds, patch max_rows and memory-trace into old source
-    if [ "$label" = "compare" ]; then
+    if [[ "$label" == compare* ]]; then
         [ -n "$MAX_ROWS_LOG2" ] && patch_max_rows "$MAX_ROWS_LOG2"
         patch_memory_trace
     fi
@@ -323,7 +326,7 @@ build_cli() {
     cp "$ROOT_DIR/target/release/cli" "$OUTPUT_DIR/cli-$label"
     echo -e "${GREEN}[$label] Binary ready.${NC}"
     # Restore patched files and go back to original branch
-    if [ "$label" = "compare" ]; then
+    if [[ "$label" == compare* ]]; then
         restore_all_patches
         git -C "$ROOT_DIR" checkout -- Cargo.lock 2>/dev/null || true
         git -C "$ROOT_DIR" checkout "${ORIG_BRANCH:-main}" --quiet 2>/dev/null
@@ -338,11 +341,18 @@ bench_size() {
     local cycles_k=$3
     local elf="$OUTPUT_DIR/elfs/fib_${cycles_k}k.elf"
 
-    # Only pass --max-rows-log2 for the current build (which has the flag).
+    # Pass --max-rows-log2 for the current build (which has the flag).
     # Compare builds have max_rows patched at compile time instead.
+    # Exception: if the compare binary supports the flag, it will be handled by the patch.
     local max_rows_flag=""
     if [ -n "$MAX_ROWS_LOG2" ] && [ "$label" = "current" ]; then
         max_rows_flag="--max-rows-log2 $MAX_ROWS_LOG2"
+    fi
+
+    # Set TABLE_PARALLELISM env var if requested
+    local env_prefix=""
+    if [ -n "$TABLE_PARALLELISM" ]; then
+        env_prefix="TABLE_PARALLELISM=$TABLE_PARALLELISM"
     fi
 
     local heap_file="$OUTPUT_DIR/results/${label}_${cycles_k}k_heap.txt"
@@ -359,7 +369,7 @@ bench_size() {
         local stdout_tmp="$OUTPUT_DIR/tmp_stdout.txt"
         local stderr_tmp="$OUTPUT_DIR/tmp_stderr.txt"
         # shellcheck disable=SC2086
-        if ! "$cli" prove "$elf" -o "$OUTPUT_DIR/tmp_proof.bin" --time $max_rows_flag \
+        if ! env $env_prefix "$cli" prove "$elf" -o "$OUTPUT_DIR/tmp_proof.bin" --time $max_rows_flag \
             > "$stdout_tmp" 2>"$stderr_tmp"; then
             echo -e " ${RED}FAILED${NC}"
             cat "$stderr_tmp"
@@ -396,7 +406,8 @@ echo -e "${BOLD}=== Memory Scaling Benchmark ===${NC}"
 echo "  Sizes (k cycles): $SIZES"
 echo "  Max rows log2:    ${MAX_ROWS_LOG2:-default}"
 echo "  Runs per size:    $RUNS"
-echo "  Compare ref:      ${COMPARE_REF:-none}"
+echo "  Table parallel:   ${TABLE_PARALLELISM:-default}"
+echo "  Compare refs:     ${COMPARE_REFS[*]:-none}"
 echo ""
 
 # --- Generate ELFs ------------------------------------------------------------
@@ -410,14 +421,18 @@ echo ""
 # --- Build binaries -----------------------------------------------------------
 
 build_cli "current"
-if [ -n "$COMPARE_REF" ]; then
-    build_cli "compare" "$COMPARE_REF"
+for i in "${!COMPARE_REFS[@]}"; do
+    ref="${COMPARE_REFS[$i]}"
+    # Use short name: branch basename or short sha
+    short_name=$(basename "$ref")
+    label="compare_${short_name}"
+    build_cli "$label" "$ref"
     # Reset Cargo.lock (modified by cargo build on old ref) so stash pop won't conflict
     git -C "$ROOT_DIR" checkout -- "$ROOT_DIR/Cargo.lock" 2>/dev/null || true
     git -C "$ROOT_DIR" checkout "$CURRENT_BRANCH" --quiet 2>/dev/null
     git -C "$ROOT_DIR" checkout -- "$ROOT_DIR/Cargo.lock" 2>/dev/null || true
     git -C "$ROOT_DIR" stash pop --quiet 2>/dev/null || true
-fi
+done
 echo ""
 
 # --- Run benchmarks -----------------------------------------------------------
@@ -432,9 +447,12 @@ run_all_sizes() {
 }
 
 run_all_sizes "$OUTPUT_DIR/cli-current" "current"
-if [ -n "$COMPARE_REF" ]; then
-    run_all_sizes "$OUTPUT_DIR/cli-compare" "compare"
-fi
+for i in "${!COMPARE_REFS[@]}"; do
+    ref="${COMPARE_REFS[$i]}"
+    short_name=$(basename "$ref")
+    label="compare_${short_name}"
+    run_all_sizes "$OUTPUT_DIR/cli-${label}" "$label"
+done
 
 # --- Print results ------------------------------------------------------------
 
@@ -489,30 +507,35 @@ else
 fi
 echo "  Runs:     $RUNS"
 
-print_table "current"
-if [ -n "$COMPARE_REF" ]; then
-    print_table "compare"
+ALL_LABELS=("current")
+for i in "${!COMPARE_REFS[@]}"; do
+    short_name=$(basename "${COMPARE_REFS[$i]}")
+    ALL_LABELS+=("compare_${short_name}")
+done
 
-    # Summary: growth rate comparison
+for label in "${ALL_LABELS[@]}"; do
+    print_table "$label"
+done
+
+# Summary: growth rate comparison across all labels
+if [ ${#ALL_LABELS[@]} -gt 1 ]; then
     echo ""
     echo -e "${BOLD}  Scaling comparison:${NC}"
     read -ra SIZES_ARR <<< "$SIZES"
     FIRST_K=${SIZES_ARR[0]}
     LAST_K=${SIZES_ARR[${#SIZES_ARR[@]}-1]}
 
-    cur_first=$(cat "$OUTPUT_DIR/results/current_${FIRST_K}k_heap.txt" 2>/dev/null || echo 0)
-    cur_last=$(cat "$OUTPUT_DIR/results/current_${LAST_K}k_heap.txt" 2>/dev/null || echo 0)
-    cmp_first=$(cat "$OUTPUT_DIR/results/compare_${FIRST_K}k_heap.txt" 2>/dev/null || echo 0)
-    cmp_last=$(cat "$OUTPUT_DIR/results/compare_${LAST_K}k_heap.txt" 2>/dev/null || echo 0)
-
-    if [ "$cur_first" -gt 0 ] && [ "$cmp_first" -gt 0 ] && [ "$FIRST_K" != "$LAST_K" ]; then
-        cur_growth=$((cur_last - cur_first))
-        cmp_growth=$((cmp_last - cmp_first))
-        cycle_range=$(( (LAST_K - FIRST_K) ))
-        cur_rate=$(awk "BEGIN {printf \"%.1f\", $cur_growth / $cycle_range}")
-        cmp_rate=$(awk "BEGIN {printf \"%.1f\", $cmp_growth / $cycle_range}")
-        echo "    current: ${FIRST_K}k→${LAST_K}k = +${cur_growth} MB  (${cur_rate} MB/k-cycle)"
-        echo "    compare: ${FIRST_K}k→${LAST_K}k = +${cmp_growth} MB  (${cmp_rate} MB/k-cycle)"
+    if [ "$FIRST_K" != "$LAST_K" ]; then
+        cycle_range=$(( LAST_K - FIRST_K ))
+        for label in "${ALL_LABELS[@]}"; do
+            first_heap=$(cat "$OUTPUT_DIR/results/${label}_${FIRST_K}k_heap.txt" 2>/dev/null || echo 0)
+            last_heap=$(cat "$OUTPUT_DIR/results/${label}_${LAST_K}k_heap.txt" 2>/dev/null || echo 0)
+            if [ "$first_heap" -gt 0 ] 2>/dev/null && [ "$last_heap" -gt 0 ] 2>/dev/null; then
+                growth=$((last_heap - first_heap))
+                rate=$(awk "BEGIN {printf \"%.1f\", $growth / $cycle_range}")
+                printf "    %-25s %sk→%sk = +%d MB  (%s MB/k-cycle)\n" "$label" "$FIRST_K" "$LAST_K" "$growth" "$rate"
+            fi
+        done
     fi
 fi
 
@@ -546,8 +569,8 @@ summarize_mem_trace() {
         if (line ~ /Phase C pass 1 done/)        { tag = "aux traces";     keep = 1 }
         if (line ~ /Phase C done/)               { tag = "Phase C done";   keep = 1 }
 
-        # New code (merged loop): per-table proving (last entry = final)
-        if (line ~ /Rounds 2-4: finished/ || line ~ /: proved/) {
+        # New code (merged loop or chunk loop): per-table/chunk proving
+        if (line ~ /Rounds 2-4: finished/ || line ~ /: proved/ || line ~ /chunk.*proved/) {
             last_r24_mb = mb
             r24_count++
             if (r24_count == 1) first_r24_mb = mb
@@ -669,10 +692,9 @@ print_mem_traces() {
     done
 }
 
-print_mem_traces "current"
-if [ -n "$COMPARE_REF" ]; then
-    print_mem_traces "compare"
-fi
+for label in "${ALL_LABELS[@]}"; do
+    print_mem_traces "$label"
+done
 
 echo ""
 echo "Raw data in $OUTPUT_DIR/results/"
