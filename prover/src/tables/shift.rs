@@ -333,7 +333,7 @@ pub fn generate_shift_trace(
 pub fn bus_interactions() -> Vec<BusInteraction> {
     let mut interactions = Vec::with_capacity(15);
 
-    // SHIFT-C2: MSB16[in[3]] → is_negative | signed
+    // SHIFT-C14: MSB16[in[3]] → is_negative | signed
     interactions.push(BusInteraction::sender(
         BusId::Msb16,
         Multiplicity::Column(cols::SIGNED),
@@ -350,7 +350,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // SHIFT-C3: AND_BYTE[shift, 15] → bit_shift | left (= μ - direction)
+    // SHIFT-C1: AND_BYTE[shift, 15] → bit_shift | left (= μ - direction)
     interactions.push(BusInteraction::sender(
         BusId::AndByte,
         Multiplicity::Linear(vec![
@@ -376,9 +376,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // SHIFT-C4: AND_BYTE[256*(1-zbs) - shift, 15] → bit_shift | right (= direction)
-    // When shift>0 (zbs=0): sends AND_BYTE[bit_shift; 256-shift, 15].
-    // When shift=0 (zbs=1): sends AND_BYTE[0; 0, 15] — avoids out-of-range value 256.
+    // SHIFT-C2: AND_BYTE[256 - zbs * 16 - shift, 15] → bit_shift | right (= direction)
+    // 256 - shift would overflow a byte when shift = 0. Subtracting zbs * 16 keeps it in
+    // [0,255].
+    // When zbs = 1, shift is a multiple of 16 (i.e. shift ∈ [0, 240]), so
+    // 256 - 16 - shift ∈ [0,255].
     interactions.push(BusInteraction::sender(
         BusId::AndByte,
         Multiplicity::Column(cols::DIRECTION),
@@ -386,7 +388,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             BusValue::linear(vec![
                 LinearTerm::Constant(256),
                 LinearTerm::Column {
-                    coefficient: -256,
+                    coefficient: -16,
                     column: cols::ZBS,
                 },
                 LinearTerm::Column {
@@ -402,7 +404,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // SHIFT-C5: ZERO[bit_shift] → zbs | μ
+    // SHIFT-C3: ZERO[bit_shift] → zbs | μ
     // ZERO receiver expects [x + 256*y + 65536*z, zero_flag]
     // bit_shift is a byte (0-15), so y=0, z=0: just send bit_shift directly
     interactions.push(BusInteraction::sender(
@@ -420,7 +422,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // SHIFT-C6.i: HWSL[in[i], bit_shift] → X[i] for i∈[0,3] | 1 - zbs
+    // SHIFT-C4.i: HWSL[in[i], bit_shift] → X[i] for i∈[0,3] | 1 - zbs
     // HWSL receiver: [x + 256*y (halfword), z (shift amount), SLL (result)]
     let one_minus_zbs = Multiplicity::Linear(vec![
         LinearTerm::Constant(1),
@@ -450,7 +452,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
-    // SHIFT-C8: HWSL[extension, bit_shift] → X[4] | 1 - zbs
+    // SHIFT-C6: HWSL[extension, bit_shift] → X[4] | 1 - zbs
     // extension = 65535 * is_negative (virtual)
     interactions.push(BusInteraction::sender(
         BusId::Hwsl,
@@ -471,7 +473,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // SHIFT-C10.i: HWSLC[in[i], bit_shift] → Y[i] for i∈[0,3] | 1 - zbs
+    // SHIFT-C8.i: HWSLC[in[i], bit_shift] → Y[i] for i∈[0,3] | 1 - zbs
     for i in 0..4 {
         interactions.push(BusInteraction::sender(
             BusId::Hwslc,
@@ -493,7 +495,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
-    // SHIFT-C13: AND_BYTE[encoded_limb; shift, mask] | μ
+    // SHIFT-C11: AND_BYTE[encoded_limb; shift, mask] | μ
     // encoded = (1 - ls[0]) + 15*ls[1] + 31*ls[2] + 47*ls[3]
     // mask = 48 - 32 * word_instr
     interactions.push(BusInteraction::sender(
@@ -584,17 +586,17 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 /// Polynomial constraint kinds for the SHIFT table.
 #[derive(Debug, Clone, Copy)]
 pub enum ShiftConstraintKind {
-    /// SHIFT-C1: direction * (1 - μ) = 0
+    /// SHIFT-C13: direction * (1 - μ) = 0
     DirectionImpliesMu,
-    /// SHIFT-C7.i: zbs * (X[i] - in[i] * left) = 0
+    /// SHIFT-C5.i: zbs * (X[i] - in[i] * left) = 0
     ZbsOverrideX(usize),
-    /// SHIFT-C9: zbs * X[4] = 0
+    /// SHIFT-C7: zbs * X[4] = 0
     ZbsOverrideX4,
-    /// SHIFT-C11.i: zbs * (Y[i] - in[i] * right) = 0
+    /// SHIFT-C9.i: zbs * (Y[i] - in[i] * right) = 0
     ZbsOverrideY(usize),
-    /// SHIFT-C12.i: IS_BIT<limb_shift[i]>
+    /// SHIFT-C10.i: IS_BIT<limb_shift[i]>
     LimbShiftIsBit(usize),
-    /// SHIFT-C14.i: out[i] - (shifted::DWordWL)[i] = 0
+    /// SHIFT-C12.i: out[i] - (shifted::DWordWL)[i] = 0
     OutputMatchesShifted(usize),
 }
 
@@ -858,17 +860,13 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
             ));
         }
 
-        // C4: AND_BYTE[256*(1-zbs) - shift, 15] | right (= direction)
-        // When shift=0 (zbs=1): sends 0. When shift>0 (zbs=0): sends 256-shift.
+        // C4: AND_BYTE[256 - zbs*16 - shift, 15] | right (= direction)
         if right {
-            let neg_shift: u8 = if op.shift == 0 {
-                0
-            } else {
-                (256u16 - op.shift as u16) as u8
-            };
+            let zbs_16: u16 = if aux.zbs { 16 } else { 0 };
+            let complement = (256u16 - zbs_16 - op.shift as u16) as u8;
             bitwise_ops.push(BitwiseOperation::byte_op(
                 BitwiseOperationType::AndByte,
-                neg_shift,
+                complement,
                 15,
             ));
         }
