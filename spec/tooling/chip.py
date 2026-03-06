@@ -627,7 +627,7 @@ class VirtualVariable(Variable):
     def_: VirtualDef
 
     def __init__(self, config: Config, category: str, data: dict):
-        assert_no_unexpected(data, set(Variable.__annotations__.keys()) | {"def"})
+        assert_no_unexpected(data, (set(Variable.__annotations__.keys()) | {"def"}) - {"pad"})
         reporter.asserts("def" in data, f"Missing def for virtual column: {data!r}")
         def_ = data.pop("def", {})
         super().__init__(config, category, data)
