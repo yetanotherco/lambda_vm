@@ -861,7 +861,11 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
         // C4: AND_BYTE[256*(1-zbs) - shift, 15] | right (= direction)
         // When shift=0 (zbs=1): sends 0. When shift>0 (zbs=0): sends 256-shift.
         if right {
-            let neg_shift: u8 = if op.shift == 0 { 0 } else { (256u16 - op.shift as u16) as u8 };
+            let neg_shift: u8 = if op.shift == 0 {
+                0
+            } else {
+                (256u16 - op.shift as u16) as u8
+            };
             bitwise_ops.push(BitwiseOperation::byte_op(
                 BitwiseOperationType::AndByte,
                 neg_shift,
