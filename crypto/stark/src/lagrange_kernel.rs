@@ -2,6 +2,8 @@ use math::field::{
     element::FieldElement,
     traits::{IsField, IsSubFieldOf},
 };
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
 /// Compute the Lagrange kernel (eq polynomial) for a random point `r`.
 ///
@@ -26,11 +28,36 @@ pub fn compute_lagrange_kernel<E: IsField>(r: &[FieldElement<E>]) -> Vec<FieldEl
     for j in 0..n {
         let rj = &r[j];
         let one_minus_rj = &one - rj;
-        for i in 0..big_n {
-            if (i >> j) & 1 == 1 {
-                s[i] = &s[i] * rj;
+
+        #[cfg(feature = "parallel")]
+        {
+            if big_n >= 1024 {
+                s.par_iter_mut().enumerate().for_each(|(i, s_i)| {
+                    if (i >> j) & 1 == 1 {
+                        *s_i = &*s_i * rj;
+                    } else {
+                        *s_i = &*s_i * &one_minus_rj;
+                    }
+                });
             } else {
-                s[i] = &s[i] * &one_minus_rj;
+                for i in 0..big_n {
+                    if (i >> j) & 1 == 1 {
+                        s[i] = &s[i] * rj;
+                    } else {
+                        s[i] = &s[i] * &one_minus_rj;
+                    }
+                }
+            }
+        }
+
+        #[cfg(not(feature = "parallel"))]
+        {
+            for i in 0..big_n {
+                if (i >> j) & 1 == 1 {
+                    s[i] = &s[i] * rj;
+                } else {
+                    s[i] = &s[i] * &one_minus_rj;
+                }
             }
         }
     }
