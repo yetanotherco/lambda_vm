@@ -393,8 +393,10 @@ pub fn gkr_prove<E: IsField>(
                         let dr_r = &dr_table[2 * j + 1];
 
                         // t=0: interpolated values are just the left values
+                        // gate = nl*dr + nr*dl + lambda*dl*dr
+                        //      = nl*dr + dl*(nr + lambda*dr)   [3 muls instead of 4]
                         let gate_0 =
-                            &(nl_l * dr_l) + &(nr_l * dl_l) + &(&lambda * &(dl_l * dr_l));
+                            &(nl_l * dr_l) + &(dl_l * &(nr_l + &(&lambda * dr_l)));
                         let h0 = &eq_rem * &gate_0;
 
                         // t=2: val = 2*right - left
@@ -402,9 +404,8 @@ pub fn gkr_prove<E: IsField>(
                         let nr_2 = &(nr_r + nr_r) - nr_l;
                         let dl_2 = &(dl_r + dl_r) - dl_l;
                         let dr_2 = &(dr_r + dr_r) - dr_l;
-                        let gate_2 = &(&nl_2 * &dr_2)
-                            + &(&nr_2 * &dl_2)
-                            + &(&lambda * &(&dl_2 * &dr_2));
+                        let gate_2 =
+                            &(&nl_2 * &dr_2) + &(&dl_2 * &(&nr_2 + &(&lambda * &dr_2)));
                         let h2 = &eq_rem * &gate_2;
 
                         [h0, h2]
