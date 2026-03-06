@@ -18,7 +18,7 @@
 //! - `value`: Byte — the byte being committed
 //! - `mu`: Bit — multiplicity (1 for real rows, 0 for padding)
 //!
-//! ## Bus Interactions (17 total)
+//! ## Bus Interactions (18 total)
 //! - **Receiver**: EcallCommit bus — receives `[timestamp_lo, timestamp_hi]` from CPU (mult = first)
 //! - **Sender**: CommitNextByte bus — sends to next row (mult = mu - end)
 //! - **Receiver**: CommitNextByte bus — receives from prev row (mult = mu - first)
@@ -29,6 +29,7 @@
 //! - **Sender**: Memw bus — read+write x10 register (fd=1→count) at ts (mult = first)
 //! - **Sender**: Memw bus — read x11 register (buf_addr) at ts (mult = first)
 //! - **Sender**: Memw bus — read x12 register (count) at ts (mult = first)
+//! - **Sender**: Memw bus — read x17 register (syscall number=3) at ts (mult = first)
 //! - **Sender**: Memw bus — read memory byte at ts (mult = mu - end)
 //!
 //! ## Constraints (8 total)
@@ -231,7 +232,7 @@ pub fn generate_commit_trace(
 // Bus interactions
 // =========================================================================
 
-/// Creates all bus interactions for the COMMIT table (17 total).
+/// Creates all bus interactions for the COMMIT table (18 total).
 ///
 /// The COMMIT table:
 /// - **Receives** EcallCommit from CPU with `[timestamp_lo, timestamp_hi]` (mult = first)
@@ -241,7 +242,7 @@ pub fn generate_commit_trace(
 /// - **Sends** to IsByte for value range check (mult = mu - end)
 /// - **Sends** to IsHalfword for address_incr range checks (×4, mult = mu)
 /// - **Sends** to Zero for end detection (mult = mu)
-/// - **Sends** to Memw for register/memory accesses (×4, mult varies)
+/// - **Sends** to Memw for register/memory accesses (×5, mult varies)
 pub fn bus_interactions() -> Vec<BusInteraction> {
     // Reusable multiplicity expressions
     let mu_minus_end = Multiplicity::Linear(vec![
@@ -607,7 +608,52 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 BusValue::constant(0),
             ],
         ),
-        // 17. MEMW read byte at ts (mult = mu - end)
+        // 17. MEMW read x17 (syscall number = 3) at ts (mult = first)
+        // Constrains that this COMMIT row corresponds to an actual Commit ECALL,
+        // not a Halt or other ECALL type. All values are constants except timestamp.
+        BusInteraction::sender(
+            BusId::Memw,
+            Multiplicity::Column(cols::FIRST),
+            vec![
+                // old[0..7] = [3, 0, 0, 0, 0, 0, 0, 0] (SyscallNumbers::Commit = 3)
+                BusValue::constant(3),
+                BusValue::constant(0),
+                BusValue::constant(0),
+                BusValue::constant(0),
+                BusValue::constant(0),
+                BusValue::constant(0),
+                BusValue::constant(0),
+                BusValue::constant(0),
+                // is_register = 1
+                BusValue::constant(1),
+                // base_address = [34, 0] (x17 → addr 2*17 = 34)
+                BusValue::constant(34),
+                BusValue::constant(0),
+                // value[0..7] = same as old (read: old == value)
+                BusValue::constant(3),
+                BusValue::constant(0),
+                BusValue::constant(0),
+                BusValue::constant(0),
+                BusValue::constant(0),
+                BusValue::constant(0),
+                BusValue::constant(0),
+                BusValue::constant(0),
+                // timestamp = [TIMESTAMP_0, TIMESTAMP_1]
+                BusValue::Packed {
+                    start_column: cols::TIMESTAMP_0,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::TIMESTAMP_1,
+                    packing: Packing::Direct,
+                },
+                // w2=1, w4=0, w8=0 (register = 2 words)
+                BusValue::constant(1),
+                BusValue::constant(0),
+                BusValue::constant(0),
+            ],
+        ),
+        // 18. MEMW read byte at ts (mult = mu - end)
         // 24-element read format for 1-byte memory access
         BusInteraction::sender(
             BusId::Memw,

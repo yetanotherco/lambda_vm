@@ -29,6 +29,7 @@ use std::collections::HashMap;
 
 use executor::elf::Elf;
 use executor::vm::instruction::decoding::Instruction;
+use executor::vm::instruction::execution::SyscallNumbers;
 use executor::vm::logs::Log;
 use executor::vm::memory::U64HashMap;
 use stark::trace::TraceTable;
@@ -478,6 +479,7 @@ fn collect_register_ops_from_cpu(
 /// - Read+write x10 at ts: asserts fd=1 (old), writes count (new)
 /// - Read x11 at ts: reads buf_addr
 /// - Read x12 at ts: reads count
+/// - Read x17 at ts: asserts syscall number = 3 (SyscallNumbers::Commit)
 /// - Read bytes at ts: reads committed bytes from memory
 ///
 /// Returns: Vec of MEMW operations
@@ -495,7 +497,7 @@ fn collect_commit_memw_ops(
     let buf_addr = op.commit_buf_addr;
     let count = op.commit_count;
 
-    let mut memw_ops = Vec::with_capacity(3 + count as usize);
+    let mut memw_ops = Vec::with_capacity(4 + count as usize);
 
     // Combined read+write x10 at ts: old=fd=1, new=count
     // This atomically asserts x10 held fd=1 and writes count as return value.
@@ -539,6 +541,24 @@ fn collect_commit_memw_ops(
             .with_old(reg_value, old_timestamps);
         memw_ops.push(memw_op);
         register_state.write(12, count, ts);
+    }
+
+    // Read x17 (syscall number) at ts — must be SyscallNumbers::Commit = 3
+    {
+        let reg_value = pack_register_value(SyscallNumbers::Commit as u64);
+        let reg_addr = 2 * 17u64; // x17 → addr 34
+        let (old_val, old_ts) = register_state.read(17);
+        debug_assert_eq!(
+            old_val,
+            SyscallNumbers::Commit as u64,
+            "ECALL commit: x17 (syscall number) must be {}, got {old_val}",
+            SyscallNumbers::Commit as u64
+        );
+        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
+        let memw_op = MemwOperation::new(true, reg_addr, reg_value, ts, 2, true)
+            .with_old(reg_value, old_timestamps);
+        memw_ops.push(memw_op);
+        register_state.write(17, SyscallNumbers::Commit as u64, ts);
     }
 
     // Memory byte reads at ts
