@@ -185,32 +185,35 @@ jobs:
       - name: Memory growth (PR)
         id: pr-growth
         env:
-          PR_HEAP: ${{ steps.pr.outputs.peak_mb }}
-          PR_TIME: ${{ steps.pr.outputs.time_s }}
+          TABLE_PARALLELISM: "1"
         run: |
           PROGRAMS=($GROWTH_PROGRAMS)
           STEPS_ARR=($GROWTH_STEPS)
           GROWTH_HEAPS=""
           GROWTH_TIMES=""
+          SAMPLES=2
 
           for idx in "${!PROGRAMS[@]}"; do
             prog="${PROGRAMS[$idx]}"
             ELF_PATH="executor/program_artifacts/asm/${prog}.elf"
-            if [ "$prog" = "fib_iterative_2M" ]; then
-              H="${PR_HEAP}"
-              T="${PR_TIME}"
-            else
-              echo "--- Growth: $prog ---"
+            SAMPLE_HEAPS=""
+            SAMPLE_TIMES=""
+            for s in $(seq 1 $SAMPLES); do
+              echo "--- Growth: $prog (sample $s/$SAMPLES, TABLE_PARALLELISM=1) ---"
               ./target/release/cli prove "$ELF_PATH" -o /tmp/proof.bin --time \
-                | tee /tmp/growth_${prog}.txt
+                | tee /tmp/growth_${prog}_${s}.txt
               rm -f /tmp/proof.bin
-              T=$(grep -o 'Proving time: [0-9.]*' /tmp/growth_${prog}.txt | awk '{print $3}')
-              H=$(grep -o 'Peak heap: [0-9]*' /tmp/growth_${prog}.txt | awk '{print $3}')
+              T=$(grep -o 'Proving time: [0-9.]*' /tmp/growth_${prog}_${s}.txt | awk '{print $3}')
+              H=$(grep -o 'Peak heap: [0-9]*' /tmp/growth_${prog}_${s}.txt | awk '{print $3}')
               if [ -z "$T" ] || [ -z "$H" ]; then
-                echo "::error::Failed to parse growth metrics for $prog"
+                echo "::error::Failed to parse growth metrics for $prog sample $s"
                 exit 1
               fi
-            fi
+              SAMPLE_HEAPS="$SAMPLE_HEAPS $H"
+              SAMPLE_TIMES="$SAMPLE_TIMES $T"
+            done
+            H=$(echo $SAMPLE_HEAPS | tr ' ' '\n' | sort -n | head -1)
+            T=$(echo $SAMPLE_TIMES | tr ' ' '\n' | sort -n | head -1)
             GROWTH_HEAPS="${GROWTH_HEAPS:+$GROWTH_HEAPS/}$H"
             GROWTH_TIMES="${GROWTH_TIMES:+$GROWTH_TIMES/}$T"
           done
@@ -361,30 +364,34 @@ jobs:
           echo "all_heaps=$ALL_HEAPS" >> "$GITHUB_OUTPUT"
           echo "runs=$RUNS" >> "$GITHUB_OUTPUT"
 
-          # --- Growth benchmarks (250k, 500k, 1M + reuse 2M median) ---
+          # --- Growth benchmarks (TABLE_PARALLELISM=1, 2 samples each) ---
           PROGRAMS=($GROWTH_PROGRAMS)
           STEPS_ARR=($GROWTH_STEPS)
           GROWTH_HEAPS=""
           GROWTH_TIMES=""
+          SAMPLES=2
 
           for idx in "${!PROGRAMS[@]}"; do
             prog="${PROGRAMS[$idx]}"
             ELF_PATH="executor/program_artifacts/asm/${prog}.elf"
-            if [ "$prog" = "fib_iterative_2M" ]; then
-              H="$HEAP_MEDIAN"
-              T="$TIME_MEDIAN"
-            else
-              echo "--- Baseline growth: $prog ---"
-              ./target/release/cli prove "$ELF_PATH" -o /tmp/proof.bin --time \
-                | tee /tmp/baseline_growth_${prog}.txt
+            SAMPLE_HEAPS=""
+            SAMPLE_TIMES=""
+            for s in $(seq 1 $SAMPLES); do
+              echo "--- Baseline growth: $prog (sample $s/$SAMPLES, TABLE_PARALLELISM=1) ---"
+              TABLE_PARALLELISM=1 ./target/release/cli prove "$ELF_PATH" -o /tmp/proof.bin --time \
+                | tee /tmp/baseline_growth_${prog}_${s}.txt
               rm -f /tmp/proof.bin
-              T=$(grep -o 'Proving time: [0-9.]*' /tmp/baseline_growth_${prog}.txt | awk '{print $3}')
-              H=$(grep -o 'Peak heap: [0-9]*' /tmp/baseline_growth_${prog}.txt | awk '{print $3}')
+              T=$(grep -o 'Proving time: [0-9.]*' /tmp/baseline_growth_${prog}_${s}.txt | awk '{print $3}')
+              H=$(grep -o 'Peak heap: [0-9]*' /tmp/baseline_growth_${prog}_${s}.txt | awk '{print $3}')
               if [ -z "$T" ] || [ -z "$H" ]; then
-                echo "::error::Failed to parse baseline growth metrics for $prog"
+                echo "::error::Failed to parse baseline growth metrics for $prog sample $s"
                 exit 1
               fi
-            fi
+              SAMPLE_HEAPS="$SAMPLE_HEAPS $H"
+              SAMPLE_TIMES="$SAMPLE_TIMES $T"
+            done
+            H=$(echo $SAMPLE_HEAPS | tr ' ' '\n' | sort -n | head -1)
+            T=$(echo $SAMPLE_TIMES | tr ' ' '\n' | sort -n | head -1)
             GROWTH_HEAPS="${GROWTH_HEAPS:+$GROWTH_HEAPS/}$H"
             GROWTH_TIMES="${GROWTH_TIMES:+$GROWTH_TIMES/}$T"
           done
@@ -614,6 +621,7 @@ jobs:
             // --- Section 1: Primary benchmark ---
             const nLabel = parseInt(runs) > 1 ? ` (median of ${runs})` : '';
             let body = `## Benchmark — fib_iterative_2M${nLabel}\n\n`;
+            body += `<sub>Table parallelism: 32 (auto = cores / 3)</sub>\n\n`;
             body += `| Metric | main | PR | Δ |\n`;
             body += `|--------|------|----|---|\n`;
             body += `| **Peak heap** | ${basePeak} MB | ${peak} MB | ${fmt(peakDiff)} MB (${fmt(peakPct)}%) ${icon(peakPct)} |\n`;
@@ -671,6 +679,7 @@ jobs:
               const programs = ['fib_iterative_250k', 'fib_iterative_500k', 'fib_iterative_1M', 'fib_iterative_2M'];
 
               body += `\n## Memory Growth\n\n`;
+              body += `<sub>Measured with \`TABLE_PARALLELISM=1\` (sequential) · best of 2 samples per point</sub>\n\n`;
 
               if (baseHeaps && baseHeaps.length === 4 && baseHeaps[0]) {
                 body += `| Program | Steps | main (MB) | PR (MB) | Δ |\n`;
