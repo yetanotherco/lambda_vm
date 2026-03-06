@@ -16,6 +16,11 @@ enum.item([ _For both signed and unsigned division, except in the case of_ overf
 
 We start with R3, which is straightforwardly asserted by constraint [dvrm:c:sign_r_equals_sign_n].
 
+| Tag | Description |
+|-----|-------------|
+| `DVRM-C1` | `r` eq.not 0 => `sign_r` = `sign_n` |
+| | _polynomial:_ `Σ_i = 0^3 r[i] * (sign_r - sign_n) = 0` |
+
 ## R2: rounding towards zero
 
 R2 states that "_[in] signed and unsigned integer division [the quotient is] round[ed] towards zero._" In other words, + the sign of ``n`-`qd`` must match that of `n` (unless ``qd` = `n``), and + `|`n`-`qd`|  < |`d`|` (unless ``d` = 0`).
@@ -23,6 +28,16 @@ R2 states that "_[in] signed and unsigned integer division [the quotient is] rou
 Leveraging R1 , we can rewrite these as + the sign of ``r`` must match that of `n` (unless ``r` = 0`), and + `|`r`|  < |`d`|` (unless ``d` = 0`).
 
 Focusing on the first statement, we observe that this trivially holds when ``signed` = 0`, while R3 deals with the case that ``signed` = 1`. The second statement is enforced by [dvrm:c:abs_r_lt_abs_d]. [dvrm:c:abs_r_if_negative] and [dvrm:c:abs_r_if_nonnegative] (resp. [dvrm:c:abs_d_if_negative] and [dvrm:c:abs_d_if_nonnegative]) are included to ensure that `abs_r` (resp. `abs_d`) is the absolute values of `r` (resp. `d`).
+
+| Tag | Range | Description | Multiplicity |
+|-----|-------|-------------|--------------|
+| `DVRM-C2` |  | `LT[1 - div_by_zero; abs_r, abs_d, 0]` | μ_sum |
+| `DVRM-C3` |  | sign_r ⇒ `NEG<abs_r; r>` |  |
+| `DVRM-C4.i` | i ∈ [0, 1] | not`sign_r` => `abs_r` = `r` |  |
+| | | _polynomial:_ `(1 - sign_r) * (abs_r[i] - (r::DWordWL)[i]) = 0` | |
+| `DVRM-C5` |  | sign_d ⇒ `NEG<abs_d; d>` |  |
+| `DVRM-C6.i` | i ∈ [0, 1] | not`sign_d` => `abs_d` = `d` |  |
+| | | _polynomial:_ `(1 - sign_d) * (abs_d[i] - (d::DWordWL)[i]) = 0` | |
 
 ## R5: overflow
 
@@ -46,21 +61,51 @@ Rewriting R1, we find the constraint `not`overflow` => `n` - `r` = `qd``.
 
 Since `n`, `d`, `q` and `r` are all 64-bit integers, we must assert this equality `mod 2^128`, rather than `mod 2^64`. To this end, we introduce `extended_n_sub_r` and leverage the `MUL` chip to verify that it is equal to ``qd` mod 2^128` using constraints [dvrm:c:mul_lower] and [dvrm:c:mul_upper]; [dvrm:c:q_range] is included to uphold assumption [mul:a:rhs].
 
+| Tag | Range | Description | Multiplicity |
+|-----|-------|-------------|--------------|
+| `DVRM-C9` |  | `MUL[n_sub_r::DWordWL; d, signed, q, sign_q, 0]` | μ_sum |
+| `DVRM-C10` |  | `MUL[extension_n_sub_r::DWordWL; d, signed, q, sign_q, 1]` | μ_sum |
+| `DVRM-C11.i` | i ∈ [0, 3] | `IS_HALF[q[i]]` | μ_sum |
+
 It now remains to enforce that `extended_n_sub_r` is the _signed_ 128-bit representation of ``n`-`r``. Here, we introduce `extended_n` and `extended_r`. By their definition, these variables contain the signed 128-bit representations of `n` and `r`. The `carry` variable has been defined such that it mimics those in the `ADD` chip, except that here we add two `QuadHL`s rather than two `DWordHL`, thus needing four carry bits instead of two. With this in place, [dvrm:c:n_sub_r] (mimicking [add:c:carry]) ensures `extended_n_sub_r` must contain the correct value.
 
 Lastly, observe that ``n` - `r` in (-2^64, 2^64)`, _regardless_ of the value of `signed`. Moreover, note that the upper halves of the 128-bit representations of all values in this range are either `0xFFFFFFFF` (negative) or `0x00000000` (non-negative). This means that we do not need to store all 128 bits of `extended_n_sub_r`. Rather, we need only store the lower 64-bits, and a separate bit (`sign_n_sub_r`) indicating whether the top limbs are all-ones or all-zeroes. The prover is free to select the value for `sign_n_sub_r`; only one of the two will fit the proof.
+
+| Tag | Range | Description | Multiplicity |
+|-----|-------|-------------|--------------|
+| `DVRM-C12.i` | i ∈ [0, 3] | `IS_BIT<carry[i]>` |  |
+| `DVRM-C13.i` | i ∈ [0, 3] | `IS_HALF[r[i]]` | μ_sum |
+| `DVRM-C14.i` | i ∈ [0, 3] | `IS_HALF[n_sub_r[i]]` | μ_sum |
+| `DVRM-C15` |  | `IS_BIT<sign_n_sub_r>` |  |
 
 ## R4: division-by-zero
 
 R4 requires that ``q` = 2^64-1` (unsigned) or `-1` (signed) and ``r` = n` when ``d` = 0`. Recalling R1, we see that ``n` = `q` `d` + `r` = `r`` when ``d` = 0`, already enforces the latter. Next, we note that, in two's complement, the _unsigned_ value `2^64-1` and _signed_ value `-1` are both represented by the bit string `0xFFFFFFFF`. Hence, only [dvrm:c:q_if_div_by_zero] is required to completely constrain R4; [dvrm:c:div_by_zero] just ensures the `div_by_zero` flag is set when ``d` = 0`.
 
+| Tag | Range | Description | Multiplicity |
+|-----|-------|-------------|--------------|
+| `DVRM-C16.i` | i ∈ [0, 3] | `div_by_zero` => `q[i]` = 65535 |  |
+| | | _polynomial:_ `div_by_zero * (q[i] - 65535) = 0` | |
+| `DVRM-C17` |  | `ZERO[div_by_zero; d[0] + d[1] + d[2] + d[3]]` | μ_sum |
+
 ## Other
 
 The following constraints are included to enforce the values of `sign_n`, `sign_r` and `sign_d` are correct.
 
+| Tag | Description |
+|-----|-------------|
+| `DVRM-C18` | `SIGN<sign_n; n[3], signed>` |
+| `DVRM-C19` | `SIGN<sign_r; r[3], signed>` |
+| `DVRM-C20` | `SIGN<sign_d; d[3], signed>` |
+
 ## Output
 
 Lastly, this chip contributes the following to the lookup:
+
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `DVRM-C21` | `DVRM[q::DWordWL; n, d, signed, 0]` | -μ_q |
+| `DVRM-C22` | `DVRM[r::DWordWL; n, d, signed, 1]` | -μ_r |
 
 = Padding To pad the  table, we use the following data, representing the unsigned division `frac(0, 0, style: "horizontal")`:
 
@@ -155,64 +200,3 @@ carry (when iter=[1, 3]) := 2^-32 * ((extended_n_sub_r::QuadWL)[i] + (extended_r
 | `DVRM-A1.i` | i ∈ [0, 3] | `IS_HALF[n[i]]` |
 | `DVRM-A2.i` | i ∈ [0, 3] | `IS_HALF[d[i]]` |
 | `DVRM-A3` |  | `IS_BIT<signed>` |
-
-## Constraints
-
-### equality
-
-| Tag | Range | Description | Multiplicity |
-|-----|-------|-------------|--------------|
-| `DVRM-C13` |  | `MUL[n_sub_r::DWordWL; d, signed, q, sign_q, 0]` | μ_sum |
-| `DVRM-C14` |  | `MUL[extension_n_sub_r::DWordWL; d, signed, q, sign_q, 1]` | μ_sum |
-| `DVRM-C15.i` | i ∈ [0, 3] | `IS_HALF[q[i]]` | μ_sum |
-
-### sign_equality
-
-| Tag | Description |
-|-----|-------------|
-| `DVRM-C1` | `r` eq.not 0 => `sign_r` = `sign_n` |
-| | _polynomial:_ `Σ_i = 0^3 r[i] * (sign_r - sign_n) = 0` |
-
-### defs
-
-| Tag | Description |
-|-----|-------------|
-| `DVRM-C16` | `SIGN<sign_n; n[3], signed>` |
-| `DVRM-C17` | `SIGN<sign_r; r[3], signed>` |
-| `DVRM-C18` | `SIGN<sign_d; d[3], signed>` |
-
-### output
-
-| Tag | Description | Multiplicity |
-|-----|-------------|--------------|
-| `DVRM-C21` | `DVRM[q::DWordWL; n, d, signed, 0]` | -μ_q |
-| `DVRM-C22` | `DVRM[r::DWordWL; n, d, signed, 1]` | -μ_r |
-
-### div_by_zero
-
-| Tag | Range | Description | Multiplicity |
-|-----|-------|-------------|--------------|
-| `DVRM-C19.i` | i ∈ [0, 3] | `div_by_zero` => `q[i]` = 65535 |  |
-| | | _polynomial:_ `div_by_zero * (q[i] - 65535) = 0` | |
-| `DVRM-C20` |  | `ZERO[div_by_zero; d[0] + d[1] + d[2] + d[3]]` | μ_sum |
-
-### abs_diff
-
-| Tag | Range | Description | Multiplicity |
-|-----|-------|-------------|--------------|
-| `DVRM-C2` |  | `LT[1 - div_by_zero; abs_r, abs_d, 0]` | μ_sum |
-| `DVRM-C3` |  | sign_r ⇒ `NEG<abs_r; r>` |  |
-| `DVRM-C4.i` | i ∈ [0, 1] | not`sign_r` => `abs_r` = `r` |  |
-| | | _polynomial:_ `(1 - sign_r) * (abs_r[i] - (r::DWordWL)[i]) = 0` | |
-| `DVRM-C5` |  | sign_d ⇒ `NEG<abs_d; d>` |  |
-| `DVRM-C6.i` | i ∈ [0, 1] | not`sign_d` => `abs_d` = `d` |  |
-| | | _polynomial:_ `(1 - sign_d) * (abs_d[i] - (d::DWordWL)[i]) = 0` | |
-
-### n_sub_r
-
-| Tag | Range | Description | Multiplicity |
-|-----|-------|-------------|--------------|
-| `DVRM-C9.i` | i ∈ [0, 3] | `IS_BIT<carry[i]>` |  |
-| `DVRM-C10.i` | i ∈ [0, 3] | `IS_HALF[r[i]]` | μ_sum |
-| `DVRM-C11.i` | i ∈ [0, 3] | `IS_HALF[n_sub_r[i]]` | μ_sum |
-| `DVRM-C12` |  | `IS_BIT<sign_n_sub_r>` |  |

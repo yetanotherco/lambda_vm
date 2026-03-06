@@ -224,10 +224,17 @@ def parse_typst_prose(content: str) -> list:
             if current_para:
                 elements.append(('para', ' '.join(current_para)))
                 current_para = []
-            # Extract group name: #render_constraint_table(chip, config, groups: "range")
-            match = re.search(r'groups:\s*"([^"]+)"', stripped)
-            if match:
-                elements.append(('render_constraints', match.group(1)))
+            # Extract group names: handles both single `groups: "g"` and array `groups: ("g1", "g2")`
+            groups = []
+            array_match = re.search(r'groups:\s*\(([^)]*)\)', stripped)
+            if array_match:
+                groups = re.findall(r'"([^"]+)"', array_match.group(1))
+            else:
+                single_match = re.search(r'groups:\s*"([^"]+)"', stripped)
+                if single_match:
+                    groups = [single_match.group(1)]
+            if groups:
+                elements.append(('render_constraints', groups))
             i += 1
             continue
 
@@ -527,6 +534,8 @@ def convert_chapter(typ_path: Path, toml_path: Path, title: str, config: dict) -
     rendered_assumptions = False
     rendered_constraints = False
     rendered_constraint_groups = set()
+    # Counter incremented in render order (matching Typst's global figure counter)
+    constraint_counter = 1
 
     # Parse Typst prose
     if typ_path.exists():
@@ -553,14 +562,17 @@ def convert_chapter(typ_path: Path, toml_path: Path, title: str, config: dict) -
                     rendered_constraints = True
 
             elif elem_type == 'render_constraints' and chip:
-                # Render the constraint group specified in the typst file
-                group_name = content
-                if group_name not in rendered_constraint_groups:
-                    # Skip heading since prose already has the section title
-                    group_table = render_constraints_table(chip, config, group_filter=group_name, skip_heading=True)
-                    if group_table.strip():
-                        lines.append(group_table)
+                # content is a list of group names to render (in order)
+                group_names = content
+                for group_name in group_names:
+                    if group_name not in rendered_constraint_groups:
+                        # Use the running render-order counter so numbering matches Typst
+                        group_table = render_constraints_table(chip, config, group_filter=group_name, skip_heading=True, start_counter=constraint_counter)
+                        if group_table.strip():
+                            lines.append(group_table)
                         rendered_constraint_groups.add(group_name)
+                    # Always advance the counter for this group (rendered or already seen)
+                    constraint_counter += len(chip.get("constraints", {}).get(group_name, []))
 
             elif elem_type == 'para':
                 lines.append(content)
@@ -583,20 +595,21 @@ def convert_chapter(typ_path: Path, toml_path: Path, title: str, config: dict) -
             lines.append(render_assumptions_table(chip, config))
 
         if chip.get("constraints"):
-            # Get all constraint groups from TOML
-            all_groups = set(chip.get("constraints", {}).keys())
-            remaining_groups = all_groups - rendered_constraint_groups
+            # Get remaining groups in TOML order
+            all_groups_ordered = [cg["name"] for cg in chip.get("constraint_groups", [])]
+            remaining_groups = [g for g in all_groups_ordered if g not in rendered_constraint_groups]
 
             if remaining_groups and not rendered_constraints:
                 # No prose Constraints section existed, add one
                 lines.append("## Constraints")
                 lines.append("")
 
-            # Render any constraint groups not already rendered inline
+            # Render any constraint groups not already rendered inline, continuing the counter
             for group_name in remaining_groups:
-                group_table = render_constraints_table(chip, config, group_filter=group_name)
+                group_table = render_constraints_table(chip, config, group_filter=group_name, start_counter=constraint_counter)
                 if group_table.strip():
                     lines.append(group_table)
+                constraint_counter += len(chip.get("constraints", {}).get(group_name, []))
 
     result = "\n".join(lines)
     result = re.sub(r'\n{3,}', '\n\n', result)

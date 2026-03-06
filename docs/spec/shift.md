@@ -44,9 +44,9 @@ Lastly, we discuss the case of performing the _arithmetic_ right shift. Here, `e
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `SHIFT-C3` | `AND_BYTE[bit_shift; shift, 15]` | left |
-| `SHIFT-C4` | `AND_BYTE[bit_shift; 2^8 - shift, 15]` | right |
-| `SHIFT-C5` | `ZERO[zbs; bit_shift]` | μ |
+| `SHIFT-C1` | `AND_BYTE[bit_shift; shift, 15]` | left |
+| `SHIFT-C2` | `AND_BYTE[bit_shift; 2^8 - shift, 15]` | right |
+| `SHIFT-C3` | `ZERO[zbs; bit_shift]` | μ |
 
 Next, we shift the limbs of `in` left and right by the appropriate amount, storing the results in `X` and `Y` respectively. When `zbs = 1`, the output cannot be used to compose ``in >>/>>> shift` mod 16`. To resolve this, we override `Y[i] := in[i]` and `X[i] := 0` in this case.
 
@@ -54,14 +54,14 @@ The case of `left`-shifting and ``bit_shift` = 0` will be used for padding rows.
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `SHIFT-C6.i` | i ∈ [0, 3] | `HWSL[X[i]; in[i], bit_shift]` | 1 - zbs |
-| `SHIFT-C7.i` | i ∈ [0, 3] | `zbs` => `X[i]` = `in[i]` dot `left` |  |
+| `SHIFT-C4.i` | i ∈ [0, 3] | `HWSL[X[i]; in[i], bit_shift]` | 1 - zbs |
+| `SHIFT-C5.i` | i ∈ [0, 3] | `zbs` => `X[i]` = `in[i]` dot `left` |  |
 | | | _polynomial:_ `zbs * (X[i] - in[i] * left) = 0` | |
-| `SHIFT-C8` |  | `HWSL[X[4]; extension, bit_shift]` | 1 - zbs |
-| `SHIFT-C9` |  | `zbs` => `X[4]` = 0 |  |
+| `SHIFT-C6` |  | `HWSL[X[4]; extension, bit_shift]` | 1 - zbs |
+| `SHIFT-C7` |  | `zbs` => `X[4]` = 0 |  |
 | | | _polynomial:_ `zbs * X[4] = 0` | |
-| `SHIFT-C10.i` | i ∈ [0, 3] | `HWSLC[Y[i]; in[i], bit_shift]` | 1 - zbs |
-| `SHIFT-C11.i` | i ∈ [0, 3] | `zbs` => `Y[i]` = `in[i]` dot `right` |  |
+| `SHIFT-C8.i` | i ∈ [0, 3] | `HWSLC[Y[i]; in[i], bit_shift]` | 1 - zbs |
+| `SHIFT-C9.i` | i ∈ [0, 3] | `zbs` => `Y[i]` = `in[i]` dot `right` |  |
 | | | _polynomial:_ `zbs * (Y[i] - in[i] * right) = 0` | |
 
 ## Full-limb shifting
@@ -72,12 +72,21 @@ Hereafter, one must only check that `out` is the proper cast of `shifted` into a
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `SHIFT-C12.i` | i ∈ [0, 3] | `IS_BIT<limb_shift[i]>` |  |
-| `SHIFT-C13` |  | `AND_BYTE[(1 - limb_shift[0]) + 15 * limb_shift[1] + 31 * limb_shift[2] + 47 * limb_shift[3]; shift, 48 - 32 * word_instr]` | μ |
-| `SHIFT-C14.i` | i ∈ [0, 1] | `out[:2]` = `shifted[:4]` |  |
+| `SHIFT-C10.i` | i ∈ [0, 3] | `IS_BIT<limb_shift[i]>` |  |
+| `SHIFT-C11` |  | `AND_BYTE[(1 - limb_shift[0]) + 15 * limb_shift[1] + 31 * limb_shift[2] + 47 * limb_shift[3]; shift, 48 - 32 * word_instr]` | μ |
+| `SHIFT-C12.i` | i ∈ [0, 1] | `out[:2]` = `shifted[:4]` |  |
 | | | _polynomial:_ `out[i] - (shifted::DWordWL)[i] = 0` | |
 
 ## Miscellaneous
+
+| Tag | Description |
+|-----|-------------|
+| `SHIFT-C13` | `direction` => `μ` = 1 |
+| | _polynomial:_ `direction * (1 - μ) = 0` |
+
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `SHIFT-C14` | `MSB16[is_negative; in[3]]` | signed |
 
 *Note*: `is_negative` is not used when `signed = 0`. As such, there is no problem with it being unconstrained in this case.
 
@@ -179,18 +188,3 @@ shifted := left * Σ_j = 0^i limb_shift[j] * intra_limb_left[i - j] + right * (�
 | `SHIFT-A3` |  | `IS_BIT<direction>` |
 | `SHIFT-A4` |  | `IS_BIT<signed>` |
 | `SHIFT-A5` |  | `IS_BIT<word_instr>` |
-
-## Constraints
-
-### left_flag
-
-| Tag | Description |
-|-----|-------------|
-| `SHIFT-C1` | `direction` => `μ` = 1 |
-| | _polynomial:_ `direction * (1 - μ) = 0` |
-
-### is_negative
-
-| Tag | Description | Multiplicity |
-|-----|-------------|--------------|
-| `SHIFT-C2` | `MSB16[is_negative; in[3]]` | signed |
