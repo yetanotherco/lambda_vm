@@ -117,6 +117,8 @@ pub fn build_summation_tree<E: IsField>(
 /// Contains the sumcheck proof that reduces claims about a parent layer's MLEs
 /// to claims about the children layer's MLEs, plus the four claimed evaluations
 /// of the children's numerator/denominator MLEs at the reduced point.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound = "")]
 pub struct GkrLayerProof<E: IsField> {
     /// Sumcheck proof for the layer reduction (degree-3 round polynomials).
     pub sumcheck_proof: SumcheckProof<E>,
@@ -130,6 +132,8 @@ pub struct GkrLayerProof<E: IsField> {
 ///
 /// Proves that the root of the summation tree has a specific value by
 /// layer-by-layer reduction from the root to the leaves via fractional sumcheck.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound = "")]
 pub struct GkrProof<E: IsField> {
     /// The claimed sum at the root: numerator / denominator as a field element.
     pub claimed_sum: FieldElement<E>,

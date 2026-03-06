@@ -1825,6 +1825,8 @@ pub trait IsStarkProver<
             nonce: round_4_result.nonce,
             // Bus interaction public inputs (for boundary constraints and bus balance check)
             bus_public_inputs: round_1_result.bus_public_inputs.clone(),
+            // LogUp-GKR proof (not yet used; will replace accumulated column in future)
+            logup_gkr_proof: None,
             // Public inputs for boundary constraints
             public_inputs: pub_inputs.clone(),
             trace_length: domain.interpolation_domain_size,
