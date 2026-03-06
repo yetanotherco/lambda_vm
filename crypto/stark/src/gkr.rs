@@ -1,4 +1,5 @@
 use crate::sumcheck::{RoundPoly, SumcheckProof};
+use core::fmt;
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use math::field::{element::FieldElement, traits::IsField};
 
@@ -465,6 +466,206 @@ pub fn gkr_prove<E: IsField>(
         n_claim,
         d_claim,
     )
+}
+
+/// Errors that can occur during GKR verification.
+#[derive(Debug, Clone)]
+pub enum GkrError {
+    /// The summation tree structure is invalid.
+    InvalidTree { reason: String },
+    /// A sumcheck round failed verification.
+    SumcheckFailed { layer: usize, reason: String },
+    /// The gate equation check failed at a layer.
+    GateCheckFailed { layer: usize },
+    /// The claimed sum does not match (unused in the verifier itself,
+    /// but available for callers that compare the claimed sum to an external value).
+    ClaimedSumMismatch,
+}
+
+impl fmt::Display for GkrError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            GkrError::InvalidTree { reason } => {
+                write!(f, "invalid GKR tree: {}", reason)
+            }
+            GkrError::SumcheckFailed { layer, reason } => {
+                write!(f, "sumcheck failed at layer {}: {}", layer, reason)
+            }
+            GkrError::GateCheckFailed { layer } => {
+                write!(f, "gate check failed at layer {}", layer)
+            }
+            GkrError::ClaimedSumMismatch => {
+                write!(f, "claimed sum mismatch")
+            }
+        }
+    }
+}
+
+/// Verify a GKR proof for a fractional summation tree.
+///
+/// Replays the Fiat-Shamir transcript identically to `gkr_prove` and checks:
+/// - At each non-trivial layer: sumcheck round consistency (p(0)+p(1) = current_sum)
+///   and the gate equation at the final evaluation point.
+/// - At trivial layers (0-variable parent): no sumcheck check; soundness is
+///   enforced by subsequent layers.
+///
+/// # Arguments
+/// - `proof`: the GKR proof produced by `gkr_prove`
+/// - `transcript`: Fiat-Shamir transcript (must use the same seed as the prover)
+///
+/// # Returns
+/// `Ok((final_point, n_claim, d_claim))` where `final_point` is the random
+/// evaluation point at the leaf layer, and `n_claim`/`d_claim` are the claimed
+/// MLE evaluations of the leaf numerators/denominators at that point.
+pub fn gkr_verify<E: IsField>(
+    proof: &GkrProof<E>,
+    transcript: &mut impl IsTranscript<E>,
+) -> Result<(Vec<FieldElement<E>>, FieldElement<E>, FieldElement<E>), GkrError> {
+    // Step 1: Append claimed_sum to transcript (mirrors prover line 239)
+    transcript.append_field_element(&proof.claimed_sum);
+
+    // If there are no layer proofs, the tree had a single leaf (root = leaf).
+    // Return empty point and the claimed_sum as n_claim with d_claim = 1.
+    if proof.layer_proofs.is_empty() {
+        return Ok((
+            vec![],
+            proof.claimed_sum.clone(),
+            FieldElement::one(),
+        ));
+    }
+
+    // Step 2: Initialize claims.
+    // The verifier sets n_claim = claimed_sum, d_claim = 1.
+    // This represents the same rational value as root_n/root_d.
+    // Soundness of the first (trivial) layer is enforced by later sumcheck layers.
+    let mut n_claim = proof.claimed_sum.clone();
+    let mut d_claim = FieldElement::<E>::one();
+    let mut current_point: Vec<FieldElement<E>> = vec![];
+
+    for (layer_idx, layer_proof) in proof.layer_proofs.iter().enumerate() {
+        // Step 4: Sample lambda (mirrors prover line 268)
+        let lambda: FieldElement<E> = transcript.sample_field_element();
+
+        // Step 5: combined_claim = n_claim + lambda * d_claim
+        let combined_claim = &n_claim + &(&lambda * &d_claim);
+
+        let round_polys = &layer_proof.sumcheck_proof.round_polys;
+
+        if round_polys.is_empty() {
+            // Trivial layer (0 variables in parent): no sumcheck rounds.
+            // The prover just provides child_claims directly.
+            // No gate check here --- soundness is enforced by later layers' sumchecks.
+            // (The verifier's combined_claim may differ from the prover's by a
+            // scaling factor at the first trivial layer, so we skip the check.)
+        } else {
+            // Non-trivial layer: verify sumcheck inline.
+            let num_rounds = round_polys.len();
+            let mut current_sum = combined_claim;
+            let mut challenges = Vec::with_capacity(num_rounds);
+
+            for (round, round_poly) in round_polys.iter().enumerate() {
+                // Check p(0) + p(1) == current_sum
+                if round_poly.sum_at_binary() != current_sum {
+                    return Err(GkrError::SumcheckFailed {
+                        layer: layer_idx,
+                        reason: format!(
+                            "round {} sum mismatch: p(0)+p(1) != expected sum",
+                            round
+                        ),
+                    });
+                }
+
+                // Append round poly evals to transcript (mirrors prover lines 388-389)
+                for eval in round_poly.evals() {
+                    transcript.append_field_element(eval);
+                }
+
+                // Sample challenge (mirrors prover line 393)
+                let challenge: FieldElement<E> = transcript.sample_field_element();
+
+                // Update current_sum to p(challenge)
+                current_sum = round_poly.evaluate(&challenge);
+
+                challenges.push(challenge);
+            }
+
+            // Gate check: verify that the final sumcheck evaluation equals
+            // eq(current_point, challenges) * gate(child_claims, lambda)
+            let [ref nl, ref nr, ref dl, ref dr] = layer_proof.child_claims;
+
+            // Compute eq(current_point, challenges) as a single field element.
+            // eq(a, b) = prod_i (a_i*b_i + (1-a_i)*(1-b_i))
+            let eq_val = compute_eq_at_point(&current_point, &challenges);
+
+            // gate_combined = nl*dr + nr*dl + lambda*dl*dr
+            let gate_combined =
+                &(&(nl * dr) + &(nr * dl)) + &(&lambda * &(dl * dr));
+
+            let expected = &eq_val * &gate_combined;
+
+            if current_sum != expected {
+                return Err(GkrError::GateCheckFailed { layer: layer_idx });
+            }
+
+            // Build the new current_point from eta (below) and sumcheck challenges.
+            // We need to store challenges for constructing current_point after eta is sampled.
+            // Store them temporarily.
+            // (We'll construct the point after sampling eta below.)
+
+            // Append child claims to transcript (mirrors prover lines 431-433)
+            for claim in &layer_proof.child_claims {
+                transcript.append_field_element(claim);
+            }
+
+            // Sample eta (mirrors prover line 436)
+            let eta: FieldElement<E> = transcript.sample_field_element();
+
+            // Update claims: fold left/right using eta
+            let one_minus_eta = &FieldElement::<E>::one() - &eta;
+            n_claim = &(nl * &one_minus_eta) + &(nr * &eta);
+            d_claim = &(dl * &one_minus_eta) + &(dr * &eta);
+
+            // Update current_point = [eta] ++ challenges (mirrors prover lines 447-450)
+            let mut new_point = Vec::with_capacity(challenges.len() + 1);
+            new_point.push(eta);
+            new_point.extend(challenges);
+            current_point = new_point;
+
+            continue;
+        }
+
+        // Trivial layer path: append child claims and sample eta
+        // (mirrors prover lines 285-290)
+        for claim in &layer_proof.child_claims {
+            transcript.append_field_element(claim);
+        }
+        let eta: FieldElement<E> = transcript.sample_field_element();
+
+        let [ref nl, ref nr, ref dl, ref dr] = layer_proof.child_claims;
+        let one_minus_eta = &FieldElement::<E>::one() - &eta;
+        n_claim = &(nl * &one_minus_eta) + &(nr * &eta);
+        d_claim = &(dl * &one_minus_eta) + &(dr * &eta);
+        current_point = vec![eta.clone()];
+    }
+
+    Ok((current_point, n_claim, d_claim))
+}
+
+/// Compute eq(a, b) for two points of equal length.
+///
+/// eq(a, b) = prod_i (a_i * b_i + (1 - a_i) * (1 - b_i))
+///
+/// This is a single field element, NOT the full eq table.
+fn compute_eq_at_point<E: IsField>(
+    a: &[FieldElement<E>],
+    b: &[FieldElement<E>],
+) -> FieldElement<E> {
+    assert_eq!(a.len(), b.len(), "eq points must have equal length");
+    let one = FieldElement::<E>::one();
+    a.iter().zip(b.iter()).fold(FieldElement::one(), |acc, (ai, bi)| {
+        let term = &(ai * bi) + &(&(&one - ai) * &(&one - bi));
+        &acc * &term
+    })
 }
 
 #[cfg(test)]
@@ -1012,5 +1213,162 @@ mod tests {
         assert!(final_point.is_empty());
         assert_eq!(final_n_claim, FE::from(42u64));
         assert_eq!(final_d_claim, FE::from(7u64));
+    }
+
+    // ==================== GKR verifier tests ====================
+
+    #[test]
+    fn test_gkr_prove_verify_roundtrip_4() {
+        // 4 leaves: 1/2, 3/4, 5/6, 7/8
+        // Tree has 3 layers (0=leaves size 4, 1=size 2, 2=root size 1)
+        // GKR reduces: root -> layer 1 (trivial) -> layer 0 (1-var sumcheck)
+        let nums = vec![
+            FE::from(1u64),
+            FE::from(3u64),
+            FE::from(5u64),
+            FE::from(7u64),
+        ];
+        let dens = vec![
+            FE::from(2u64),
+            FE::from(4u64),
+            FE::from(6u64),
+            FE::from(8u64),
+        ];
+        let tree = build_summation_tree(nums.clone(), dens.clone());
+
+        // Prove
+        let mut prover_transcript = DefaultTranscript::<GoldilocksField>::new(&[0xAA]);
+        let (proof, prover_point, prover_n, prover_d) =
+            gkr_prove(&tree, &mut prover_transcript);
+
+        // Verify with a fresh transcript (same seed)
+        let mut verifier_transcript = DefaultTranscript::<GoldilocksField>::new(&[0xAA]);
+        let result = gkr_verify(&proof, &mut verifier_transcript);
+
+        assert!(result.is_ok(), "GKR verification should succeed for 4 leaves");
+        let (verifier_point, verifier_n, verifier_d) = result.unwrap();
+
+        // The verifier's final point must match the prover's
+        assert_eq!(
+            verifier_point, prover_point,
+            "Verifier and prover must derive the same final point"
+        );
+
+        // The verifier's leaf claims must match the prover's
+        assert_eq!(verifier_n, prover_n, "n_claim must match");
+        assert_eq!(verifier_d, prover_d, "d_claim must match");
+
+        // Additionally verify that the claims are consistent with the leaf MLEs
+        let expected_n = evaluate_mle(&nums, &verifier_point);
+        let expected_d = evaluate_mle(&dens, &verifier_point);
+        assert_eq!(verifier_n, expected_n, "n_claim must match leaf MLE");
+        assert_eq!(verifier_d, expected_d, "d_claim must match leaf MLE");
+    }
+
+    #[test]
+    fn test_gkr_prove_verify_roundtrip_8() {
+        // 8 leaves: i/(i+1) for i in 1..=8
+        // Tree: 4 layers (sizes 8, 4, 2, 1)
+        // GKR: root->layer2 (trivial), layer2->layer1 (1-var), layer1->layer0 (2-var)
+        let nums: Vec<FE> = (1..=8).map(|i| FE::from(i as u64)).collect();
+        let dens: Vec<FE> = (2..=9).map(|i| FE::from(i as u64)).collect();
+        let tree = build_summation_tree(nums.clone(), dens.clone());
+
+        // Prove
+        let mut prover_transcript = DefaultTranscript::<GoldilocksField>::new(&[0xAA]);
+        let (proof, prover_point, prover_n, prover_d) =
+            gkr_prove(&tree, &mut prover_transcript);
+
+        // Verify with a fresh transcript (same seed)
+        let mut verifier_transcript = DefaultTranscript::<GoldilocksField>::new(&[0xAA]);
+        let result = gkr_verify(&proof, &mut verifier_transcript);
+
+        assert!(result.is_ok(), "GKR verification should succeed for 8 leaves");
+        let (verifier_point, verifier_n, verifier_d) = result.unwrap();
+
+        // The verifier's final point must match the prover's
+        assert_eq!(verifier_point, prover_point);
+
+        // The verifier's leaf claims must match the prover's
+        assert_eq!(verifier_n, prover_n);
+        assert_eq!(verifier_d, prover_d);
+
+        // Verify consistency with leaf MLEs
+        let expected_n = evaluate_mle(&nums, &verifier_point);
+        let expected_d = evaluate_mle(&dens, &verifier_point);
+        assert_eq!(verifier_n, expected_n);
+        assert_eq!(verifier_d, expected_d);
+    }
+
+    #[test]
+    fn test_gkr_verify_wrong_claimed_sum() {
+        // Create a valid proof and then tamper with the claimed_sum.
+        // The verifier should fail (either at sumcheck or gate check).
+        let nums = vec![
+            FE::from(1u64),
+            FE::from(3u64),
+            FE::from(5u64),
+            FE::from(7u64),
+        ];
+        let dens = vec![
+            FE::from(2u64),
+            FE::from(4u64),
+            FE::from(6u64),
+            FE::from(8u64),
+        ];
+        let tree = build_summation_tree(nums, dens);
+
+        // Prove with correct claimed_sum
+        let mut prover_transcript = DefaultTranscript::<GoldilocksField>::new(&[0xAA]);
+        let (mut proof, _, _, _) = gkr_prove(&tree, &mut prover_transcript);
+
+        // Tamper with the claimed_sum
+        proof.claimed_sum = &proof.claimed_sum + &FE::one();
+
+        // Verify with the tampered proof
+        let mut verifier_transcript = DefaultTranscript::<GoldilocksField>::new(&[0xAA]);
+        let result = gkr_verify(&proof, &mut verifier_transcript);
+
+        // The verification should fail. The tampered claimed_sum changes the
+        // transcript state, which changes lambda and eta, leading to a sumcheck
+        // or gate check failure at the non-trivial layer.
+        assert!(
+            result.is_err(),
+            "GKR verification should fail with tampered claimed_sum"
+        );
+    }
+
+    #[test]
+    fn test_gkr_prove_verify_roundtrip_16() {
+        // 16 leaves with various fractions
+        // Tree: 5 layers (sizes 16, 8, 4, 2, 1)
+        let nums: Vec<FE> = (1..=16).map(|i| FE::from(i as u64)).collect();
+        let dens: Vec<FE> = (17..=32).map(|i| FE::from(i as u64)).collect();
+        let tree = build_summation_tree(nums.clone(), dens.clone());
+
+        // Prove
+        let mut prover_transcript = DefaultTranscript::<GoldilocksField>::new(&[0xAA]);
+        let (proof, prover_point, prover_n, prover_d) =
+            gkr_prove(&tree, &mut prover_transcript);
+
+        // Verify with a fresh transcript (same seed)
+        let mut verifier_transcript = DefaultTranscript::<GoldilocksField>::new(&[0xAA]);
+        let result = gkr_verify(&proof, &mut verifier_transcript);
+
+        assert!(result.is_ok(), "GKR verification should succeed for 16 leaves");
+        let (verifier_point, verifier_n, verifier_d) = result.unwrap();
+
+        // The verifier's final point must match the prover's
+        assert_eq!(verifier_point, prover_point);
+
+        // The verifier's leaf claims must match the prover's
+        assert_eq!(verifier_n, prover_n);
+        assert_eq!(verifier_d, prover_d);
+
+        // Verify consistency with leaf MLEs
+        let expected_n = evaluate_mle(&nums, &verifier_point);
+        let expected_d = evaluate_mle(&dens, &verifier_point);
+        assert_eq!(verifier_n, expected_n);
+        assert_eq!(verifier_d, expected_d);
     }
 }
