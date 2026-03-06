@@ -195,12 +195,9 @@ def parse_typst_prose(content: str) -> list:
     """
     elements = []
 
-    # Remove imports and let bindings at the start
+    # Remove multi-line import blocks and top-level #import/#show lines
     content = re.sub(r'^#import[^\n]*\n', '', content, flags=re.MULTILINE)
-    content = re.sub(r'^#let[^\n]*\n', '', content, flags=re.MULTILINE)
     content = re.sub(r'^#show:[^\n]*\n', '', content, flags=re.MULTILINE)
-
-    # Remove multi-line import blocks
     content = re.sub(r'#import[^)]+\)', '', content)
 
     lines = content.split('\n')
@@ -248,6 +245,16 @@ def parse_typst_prose(content: str) -> list:
 
         # Skip lines that are just function names (from multi-line imports)
         if re.match(r'^[a-z_]+,?\s*$', stripped) or stripped == ')':
+            i += 1
+            continue
+
+        # Detect chip switches: #let chip = load_chip("src/foo.toml", config)
+        load_chip_match = re.match(r'#let\s+chip\s*=\s*load_chip\("([^"]+)"', stripped)
+        if load_chip_match:
+            if current_para:
+                elements.append(('para', ' '.join(current_para)))
+                current_para = []
+            elements.append(('load_chip', load_chip_match.group(1)))
             i += 1
             continue
 
@@ -522,20 +529,23 @@ def render_assumptions_table(chip: dict, config: dict) -> str:
     return "\n".join(lines)
 
 
-def convert_chapter(typ_path: Path, toml_path: Path, title: str, config: dict) -> str:
+def convert_chapter(typ_path: Path, toml_path: Path, title: str, config: dict, spec_dir: Path = None) -> str:
     """Convert a chapter from .typ and .toml to Markdown."""
     lines = [f"# {title}", ""]
 
-    # Load TOML data
+    # Load TOML data (may be empty for multi-chip files like ecall)
     chip = load_toml(toml_path)
 
-    # Track what sections we've rendered from TOML
-    rendered_columns = False
-    rendered_assumptions = False
-    rendered_constraints = False
-    rendered_constraint_groups = set()
-    # Counter incremented in render order (matching Typst's global figure counter)
-    constraint_counter = 1
+    def reset_chip_state():
+        return {
+            'rendered_columns': False,
+            'rendered_assumptions': False,
+            'rendered_constraints': False,
+            'rendered_constraint_groups': set(),
+            'constraint_counter': 1,
+        }
+
+    state = reset_chip_state()
 
     # Parse Typst prose
     if typ_path.exists():
@@ -543,36 +553,52 @@ def convert_chapter(typ_path: Path, toml_path: Path, title: str, config: dict) -
         elements = parse_typst_prose(typst_content)
 
         for elem_type, content in elements:
+            if elem_type == 'load_chip':
+                # Multi-chip file: switch active chip and reset per-chip state
+                chip_toml_path = spec_dir / content if spec_dir else Path(content)
+                chip = load_toml(chip_toml_path)
+                state = reset_chip_state()
+                continue
+
+            rendered_columns = state['rendered_columns']
+            rendered_assumptions = state['rendered_assumptions']
+            rendered_constraints = state['rendered_constraints']
+            rendered_constraint_groups = state['rendered_constraint_groups']
+            constraint_counter = state['constraint_counter']
+
             if elem_type.startswith('h'):
                 level = int(elem_type[1])
                 lines.append("")
-                lines.append("#" * level + " " + content)
+                # Replace Typst variable references in headings with chip name if available
+                heading_text = content
+                if chip and chip.get('name'):
+                    heading_text = re.sub(r'`[^`]*`\s*chip\b', f"`{chip['name']}` chip", heading_text)
+                lines.append("#" * level + " " + heading_text)
                 lines.append("")
 
                 # Render TOML data after relevant headings
                 content_lower = content.lower()
                 if 'column' in content_lower and chip and not rendered_columns:
                     lines.append(render_variables_table(chip, config))
-                    rendered_columns = True
+                    state['rendered_columns'] = True
                 elif 'assumption' in content_lower and chip and not rendered_assumptions:
                     lines.append(render_assumptions_table(chip, config))
-                    rendered_assumptions = True
+                    state['rendered_assumptions'] = True
                 elif content_lower == "constraints" and chip:
-                    # Mark that we've hit the Constraints section
-                    rendered_constraints = True
+                    state['rendered_constraints'] = True
 
             elif elem_type == 'render_constraints' and chip:
                 # content is a list of group names to render (in order)
                 group_names = content
                 for group_name in group_names:
-                    if group_name not in rendered_constraint_groups:
+                    if group_name not in state['rendered_constraint_groups']:
                         # Use the running render-order counter so numbering matches Typst
-                        group_table = render_constraints_table(chip, config, group_filter=group_name, skip_heading=True, start_counter=constraint_counter)
+                        group_table = render_constraints_table(chip, config, group_filter=group_name, skip_heading=True, start_counter=state['constraint_counter'])
                         if group_table.strip():
                             lines.append(group_table)
-                        rendered_constraint_groups.add(group_name)
+                        state['rendered_constraint_groups'].add(group_name)
                     # Always advance the counter for this group (rendered or already seen)
-                    constraint_counter += len(chip.get("constraints", {}).get(group_name, []))
+                    state['constraint_counter'] += len(chip.get("constraints", {}).get(group_name, []))
 
             elif elem_type == 'para':
                 lines.append(content)
@@ -582,7 +608,13 @@ def convert_chapter(typ_path: Path, toml_path: Path, title: str, config: dict) -
                 lines.append(f"> **Note:** {content}")
                 lines.append("")
 
-    # Render any TOML data that wasn't triggered by prose headings
+    # Render any TOML data that wasn't triggered by prose headings (for the last active chip)
+    rendered_columns = state['rendered_columns']
+    rendered_assumptions = state['rendered_assumptions']
+    rendered_constraints = state['rendered_constraints']
+    rendered_constraint_groups = state['rendered_constraint_groups']
+    constraint_counter = state['constraint_counter']
+
     if chip:
         if chip.get("variables") and not rendered_columns:
             lines.append("## Columns")
@@ -675,7 +707,7 @@ def main():
         print(f"Converting: {name} ({title})")
 
         try:
-            markdown = convert_chapter(typ_path, toml_path, title, config)
+            markdown = convert_chapter(typ_path, toml_path, title, config, spec_dir=spec_dir)
 
             output_file = output_dir / f"{name}.md"
             output_file.write_text(markdown)

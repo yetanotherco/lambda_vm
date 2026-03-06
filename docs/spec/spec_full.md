@@ -82,6 +82,39 @@ The initial and final state of registers can be entirely known by the verifier, 
 
 - Optimize memory systems after determining factual bottlenecks (e.g. taking inspiration from Twist and Shout, or other recent research) - Double check whether IS_BYTE constraints are needed for fini
 
+## Columns
+
+### Input
+
+| Name | Type | Description |
+|------|------|-------------|
+| `offset` | `RowIndex` | The offset from the page base address. |
+| `init` | `Byte` | The initial value of this address. Can be replaced by a constant zero for zero-initialization |
+| `fini` | `Byte` | The final value this address took |
+| `timestamp` | `DWordWL` | The timestamp at which this address was last accessed |
+
+### Virtual
+
+| Name | Type | Description |
+|------|------|-------------|
+| `address` | `DWordWL` | Adding `offset` to the page base address `page`. `page` is a constant with respect to a single instance of this table. |
+
+**Definition of `address`:**
+```
+address := page + offset * 1::DWordWL
+```
+
+## Constraints
+
+### all
+
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `PAGE-C1` | `IS_BYTE[init]` | 1 |
+| `PAGE-C2` | `IS_BYTE[fini]` | 1 |
+| `PAGE-C3` | `memory[0, address, 0::DWordWL, init]` | -1 |
+| `PAGE-C4` | `memory[0, address, timestamp, fini]` | 1 |
+
 ---
 
 # Variables
@@ -94,7 +127,9 @@ columns: (auto, 1fr, auto), inset: 7pt, align: (top+left, top+left, top+center, 
 
 # Signatures
 
-// Render a signature let (lb, rb) = if sig.kind == "interaction" { (`[`, `]`) } else if sig.kind == "template" { (`<`, `>`) }
+// Render a signature
+
+let (lb, rb) = if sig.kind == "interaction" { (`[`, `]`) } else if sig.kind == "template" { (`<`, `>`) }
 
 let cond = sig.at("cond", default: none) let cond_str = if cond != none { raw(cond) + ` => ` } else {``}
 
@@ -104,7 +139,9 @@ let output = sig.at("output", default: none) let output_str = if output != none 
 
 return [] }
 
-// Compute the bus size of an interaction let vars = sig.input + if "output" in sig { (sig.output, )} else {()}
+// Compute the bus size of an interaction
+
+let vars = sig.input + if "output" in sig { (sig.output, )} else {()}
 
 return vars.map(v => { let (label, factor) = if type(v) == array { (v.at(0), v.at(1)) } else { (v, 1) } config.variables.types.filter(type => type.label == label).first().subtypes.len() * factor }) .sum() }
 
@@ -358,7 +395,9 @@ Further clarification is provided in the notes following the table.
 
 The `RV64C` extension for compressed instructions specifies that \~50% of all instructions can be represented using a 16-bit instruction (rather than 32-bits), saving \~25% in code size. This execution of assembly code is _not_ agnostic to an instruction's compression state; after executing a compressed instruction, the `pc` should be incremented by `2` rather than `4`. To indicate an instruction is provided in compressed form, the `c_type` flag is introduced. *This flag should be set to `1` whenever the decoded instruction is provided in compressed form and `0` otherwise.*
 
-/// Add a reference to one or more notes following this table. super("[" + refs.pos().map(r => ref(r)).join(",") + "]") }
+/// Add a reference to one or more notes following this table.
+
+super("[" + refs.pos().map(r => ref(r)).join(",") + "]") }
 
 show figure: set block(breakable: true)
 
@@ -366,7 +405,9 @@ figure(table( columns: (auto, auto, auto, auto, 1fr, auto), stroke: 0pt, inset: 
 
 // OP-IMM ([`ADDI[W]   rd, rs1, imm`], [`ADD`], [`[W]`], [], [], []), ([`SLTI[U]   rd, rs1, imm`], [`SLT`], [], [.not`[U]`], [], []), ([`ANDI      rd, rs1, imm`], [`AND`], [], [], [], []), ([`ORI       rd, rs1, imm`], [`OR`],   [], [], [], []), ([`XORI      rd, rs1, imm`], [`XOR`], [], [], [], []), ([`SLLI[W]   rd, rs1, imm`], [`SHIFT`], [`[W]`], [], [], []), ([`SRLI[W]   rd, rs1, imm`], [`SHIFT`], [`[W]`], [], [`mp_selector`], []), ([`SRAI[W]   rd, rs1, imm`], [`SHIFT`], [`[W]`], [1], [`mp_selector`], []), // OP ([`ADD[W]    rd, rs1, rs2`], [`ADD`], [`[W]`], [], [], []), ([`SUB[W]    rd, rs1, rs2`], [`SUB`], [`[W]`], [], [], []), ([`SLT[U]    rd, rs1, rs2`], [`SLT`], [], [.not`[U]`], [], []), ([`AND       rd, rs1, rs2`], [`AND`], [], [], [], []), ([`OR        rd, rs1, rs2`], [`OR`], [], [], [], []), ([`XOR       rd, rs1, rs2`], [`XOR`], [], [], [], []), ([`SLL[W]    rd, rs1, rs2`], [`SHIFT`], [`[W]`], [], [], []), ([`SRL[W]    rd, rs1, rs2`], [`SHIFT`], [`[W]`], [], [`mp_selector`], []), ([`SRA[W]    rd, rs1, rs2`], [`SHIFT`], [`[W]`], [1], [`mp_selector`], []), // OP - M ([`MUL[W]    rd, rs1, rs2`], [`MUL`], [`[W]`], [1], [`mp_selector`], []), ([`MULH      rd, rs1, rs2`], [`MUL`], [], [1], [`mp_selector`, `muldiv_selector`], []), ([`MULHU     rd, rs1, rs2`], [`MUL`], [], [], [`muldiv_selector`], []), ([`MULHSU    rd, rs1, rs2`], [`MUL`], [], [1], [`muldiv_selector`], []), ([`DIV[U][W] rd, rs1, rs2`], [`DIVREM`], [`[W]`], [.not`[U]`], [], []), ([`REM[U][W] rd, rs1, rs2`], [`DIVREM`], [`[W]`], [.not`[U]`], [`muldiv_selector`], []), // LUI/AUIPC ([`LUI       rd, imm`], [`ADD`], [], [], [], []), ([`AUIPC     rd, imm`], [`ADD`], [], [], [`rs1 := x255`], []), ([`JAL       rd, imm`], [`JALR`], [], [], [`rs1 := x255`], []), // Branching ([`JALR      rd, rs1, imm`], [`JALR`], [], [], [], []), ([`BEQ      rs1, rs2, imm`], [`BEQ`], [], [], [], []), ([`BNE      rs1, rs2, imm`], [`BEQ`], [], [], [`mp_selector`], []), ([`BLT[U]   rs1, rs2, imm`], [`BLT`], [], [.not`[U]`], [], []), ([`BGE[U]   rs1, rs2, imm`], [`BLT`], [], [.not`[U]`], [`mp_selector`], []), // LOAD ([`LD        rd, rs1, imm`], [`LOAD`], [], [], [`mem_8B`], []), ([`LW[U]     rd, rs1, imm`], [`LOAD`], [], [.not`[U]`], [`mem_4B`], []), ([`LH[U]     rd, rs1, imm`], [`LOAD`], [], [.not`[U]`], [`mem_2B`], []), ([`LB[U]     rd, rs1, imm`], [`LOAD`], [], [.not`[U]`], [], []), // STORE ([`SD       rs1, rs2, imm`], [`STORE`], [], [], [`mem_8B`], []), ([`SW       rs1, rs2, imm`], [`STORE`], [], [], [`mem_4B`], []), ([`SH       rs1, rs2, imm`], [`STORE`], [], [], [`mem_2B`], []), ([`SB       rs1, rs2, imm`], [`STORE`], [], [], [], []), // ECALL/EBREAK ([`ECALL`], [`ECALL`], [], [], [``rs1` := `x17``], []), ([`EBREAK`], [`EBREAK`], [], [], [], []), // FENCE ([`FENCE`], [`ADD`], [], [], [], []),
 
-// Construct a note that can be referenced through `lbl` show figure: (it) => align(left, []) [ ] }
+// Construct a note that can be referenced through `lbl`
+
+show figure: (it) => align(left, []) [ ] }
 
 ## Notes
 
@@ -1619,15 +1660,32 @@ When `ECALL` is executed, it is assumed that: - register `A7` contains the syste
 
 ## Columns
 
+### Input
+
+| Name | Type | Description |
+|------|------|-------------|
+| `timestamp` | `DWordWL` | timestamp at which to halt the program |
+
 The  chip leverages  variable, spanning  columns:
 
 ## Assumptions
+
+| Tag | Range | Description |
+|-----|-------|-------------|
+| `HALT-A1.i` | i ∈ [0, 1] | `IS_WORD[timestamp[i]]` |
 
 It is assumed the input is range checked:
 
 ## Constraints
 
 The  chip: + makes sure register `x10` (containing the exit code) equals `0` ([halt:c:read_zero_exit_code]), + writes `0` to all other registers ([halt:c:zeroize_registers_lo]/[halt:c:zeroize_registers_hi]), and + sets `pc` equal to `1` ([halt:c:pc]). Note that the writes performed by all these interactions are accompanied by the timestamp `2^64-1`; the maximum timestamp. This prevents any other operation involving memory from being executed hereafter.
+
+| Tag | Range | Description | Multiplicity |
+|-----|-------|-------------|--------------|
+| `HALT-C1.i` | i ∈ [1, 9] | `MEMW[1, (2 * i)::DWordWL, 0::BaseField[8], (2^64 - 1)::DWordWL, 1, 0, 0]` | 1 |
+| `HALT-C2` |  | `MEMW[0::BaseField[8]; 1, (2 * 10)::DWordWL, 0::BaseField[8], (2^64 - 1)::DWordWL, 1, 0, 0]` | 1 |
+| `HALT-C3.i` | i ∈ [11, 31] | `MEMW[1, (2 * i)::DWordWL, 0::BaseField[8], (2^64 - 1)::DWordWL, 1, 0, 0]` | 1 |
+| `HALT-C4` |  | `MEMW[1, (2 * 255)::DWordWL, ['arr', 1, 0, 0, 0, 0, 0, 0, 0], (2^64 - 1)::DWordWL, 1, 0, 0]` | 1 |
 
 [ Observe that --- in its current state --- this solution puts the burden of verifying the register cleanup on the verifier inside of the lookup argument. Alternatively, one could add 31 lookups to the "memory" table to remove the _known_ final tokens for the registers there. ])
 
@@ -1637,6 +1695,10 @@ In this VM, halting is considered equivalent to executing a `sys_exit`. Hence, t
 
 The HALT chip therefore contributes the following interaction to the lookup-argument:
 
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `HALT-C5` | `ECALL[timestamp, 93::DWordWL]` | -1 |
+
 ## Padding
 
 This chip should only contain a single row. Given that `2^0 = 1`, this chip does not need to be padded. As such, no padding is defined.
@@ -1645,6 +1707,31 @@ This chip should only contain a single row. Given that `2^0 = 1`, this chip does
 
 ## Columns
 
+### Input
+
+| Name | Type | Description |
+|------|------|-------------|
+| `timestamp` | `DWordWL` | timestamp at which to commit |
+
+### Auxiliary
+
+| Name | Type | Description |
+|------|------|-------------|
+| `index` | `BaseField` | Index of value being committed. |
+| `address` | `DWordWL` | Address of first byte to commit. |
+| `address_incr` | `DWordHL` | $`address` + 1$ |
+| `count` | `DWordWL` | number of bytes to commit |
+| `count_decr` | `DWordHL` | $`count` - 1$ |
+| `first` | `Bit` | Whether this is the first commitment in this sequence. |
+| `end` | `Bit` | Whether this is the end of the commitment sequence. |
+| `value` | `Byte` | Byte stored at `address`. |
+
+### Multiplicity
+
+| Name | Type | Description |
+|------|------|-------------|
+| `μ` | `Bit` |  |
+
 The  chip leverages  variables, spanning  columns:
 
 ## Constraints
@@ -1652,6 +1739,10 @@ The  chip leverages  variables, spanning  columns:
 In this VM, committing is considered equivalent to writing a value to `stdout`. Hence, this chip responds to `ECALL`s with system call number 64.
 
 Since we do not know how many bytes are to be committed, this chip employs a recursive design: each iteration commits one byte, and recursively "calls" itself to commit the remaining bytes. As such, only the call from the CPU to this chip (i.e., the `first` in the recursion tree) should accept the `ECALL`; later recursive calls should not. This is why [commit:c:receive_ecall] has multiplicity `-`first``.
+
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `COMMIT-C1` | `ECALL[timestamp, 64::DWordWL]` | -first |
 
 The `write` operation --- writing to a file descriptor --- has the following signature:
 
@@ -1663,19 +1754,55 @@ That is to say, - `A0` contains the file descriptor, - `A1` contains the address
 
 we assert that `x10` contains `1` in [commit:c:read_fd_write_count]. Note that this constraint _also_ writes `count` to `A0`; in this VM it is impossible for a commit to be interrupted or fail. Lastly, the `index` is read from `x254`; in the same operation, ``index` + `count`` is written back to this location by [commit:c:read_index]. This, too, leverages the fact that a commit will not be interrupted or fail to update the `index` for the next commit sequence. Again, each of these memory interactions only take place when this is the `first` call in the recursion tree.
 
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `COMMIT-C2` | `MEMW[['arr', ['idx', 'address', 0], ['idx', 'address', 1], 0, 0, 0, 0, 0, 0]; 1, (2 * 11)::DWordWL, ['arr', ['idx', 'address', 0], ['idx', 'address', 1], 0, 0, 0, 0, 0, 0], timestamp, 1, 0, 0]` | first |
+| `COMMIT-C3` | `MEMW[['arr', ['idx', 'count', 0], ['idx', 'count', 1], 0, 0, 0, 0, 0, 0]; 1, (2 * 12)::DWordWL, ['arr', ['idx', 'count', 0], ['idx', 'count', 1], 0, 0, 0, 0, 0, 0], timestamp, 1, 0, 0]` | first |
+| `COMMIT-C4` | `MEMW[['arr', 1, 0, 0, 0, 0, 0, 0, 0]; 1, (2 * 10)::DWordWL, ['arr', ['idx', 'count', 0], ['idx', 'count', 1], 0, 0, 0, 0, 0, 0], timestamp, 1, 0, 0]` | first |
+| `COMMIT-C5` | `MEMW[['arr', 'index', 0, 0, 0, 0, 0, 0, 0]; 1, (2 * 254)::DWordWL, ['arr', ['+', 'index', ['cast', 'count', 'BaseField']], 0, 0, 0, 0, 0, 0, 0], timestamp, 0, 0, 0]` | first |
+
 *Note*: the observant reader will notice that [commit:c:read_index] casts `count` to a `BaseField`, potentiallly losing information. This is indeed correct. However, since it is practically impossible to commit more than `2^64-2^32` bytes in a single VM execution, it was decided to permit this.
 
 Next, we read the `value` located at buffer address `address` and commit to it under the given `index`. This is only performed when we have not yet reached the `end` of the commit sequence.
 
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `COMMIT-C6` | `MEMW[['arr', 'value', 0, 0, 0, 0, 0, 0, 0]; 0, address, ['arr', 'value', 0, 0, 0, 0, 0, 0, 0], timestamp, 0, 0, 0]` | μ - end |
+| `COMMIT-C7` | `COMMIT[index, value]` | μ - end |
+
 In parallel, we compute ``address_incr` = `address` + 1` ([commit:c:address_incr]) as address of the next byte to commit, and ``count_decr` = `count` - 1` ([commit:c:count_decr]) as the number of bytes that still has to be committed after committing this byte. [commit:c:range_address_incr] and [commit:c:range_count_decr] are included to satisfy [add:a:sum] respectively [add:a:rhs].
 
+| Tag | Range | Description | Multiplicity |
+|-----|-------|-------------|--------------|
+| `COMMIT-C8` |  | `ADD<address_incr::DWordWL; address, 1::DWordWL>` |  |
+| `COMMIT-C9.i` | i ∈ [0, 3] | `IS_HALF[address_incr[i]]` | μ |
+| `COMMIT-C10` |  | `SUB<count_decr::DWordWL; count, 1::DWordWL>` |  |
+| `COMMIT-C11.i` | i ∈ [0, 3] | `IS_HALF[count_decr[i]]` | μ |
+
 When `count` hits `0`, we should stop performing further recursive calls. We use the `end` bit to indicate these circumstances.
+
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `COMMIT-C12` | `ZERO[end; (65535 - count_decr[0]) + (65535 - count_decr[1]) + (65535 - count_decr[2]) + (65535 - count_decr[3])]` | μ |
 
 *Note*: + Rather than setting ``end` = 1` when ``count` = 0`, we do so when ``count_decr` = -1`. This technique allows `count` to be stored in a `DWordWL` rather than a `DWordHL`, saving two columns. + `forall i in [0, 3]: 65535 - `count_decr`_i >= 0` as a result of [commit:c:range_count_decr]. Hence, $ sum_(i=0)^3 65535 - `count_decr`_i = 0 arrow.l.r.double.long forall i in [0, 3]: `count_decr`_i = 65535 $
 
 When this was not the `end` byte to commit in this recursion sequence, we recursively _Commit the Next Byte_ (`CNB`), specifying the timestamp, address to continue reading and the number of bytes that should still be committed ([commit:c:send_commit_next_byte]). Since that certainly won't be the `first` call in the sequence, we read `address_incr` and `count_decr` from the previous recursion level into `address` and `count` and continue executing the commit.
 
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `COMMIT-C13` | `CNB[timestamp, index + 1, address_incr::DWordWL, count_decr::DWordWL]` | μ - end |
+| `COMMIT-C14` | `CNB[timestamp, index, address, count]` | -(μ - first) |
+
 Lastly, we must make sure `first`, `end` and `μ` are bits ([commit:c:range_first], [commit:c:range_end], [commit:c:range_mu]), and that when either ``first` = 1` or ``end` = 1` imply that ``μ` = 1` ([commit:c:first_or_end_implies_mu]). These are required to ensure the multiplicities `-(`μ` - `first`)` and ``μ` - `end`` are binary.
+
+| Tag | Description |
+|-----|-------------|
+| `COMMIT-C15` | `IS_BIT<first>` |
+| `COMMIT-C16` | `IS_BIT<end>` |
+| `COMMIT-C17` | `IS_BIT<μ>` |
+| `COMMIT-C18` | `first` + `end` => `μ` = 1 |
+| | _polynomial:_ `(first + end) * (1 - μ) = 0` |
 
 ## Padding
 

@@ -79,3 +79,36 @@ The initial and final state of registers can be entirely known by the verifier, 
 = Future topics of interest
 
 - Optimize memory systems after determining factual bottlenecks (e.g. taking inspiration from Twist and Shout, or other recent research) - Double check whether IS_BYTE constraints are needed for fini
+
+## Columns
+
+### Input
+
+| Name | Type | Description |
+|------|------|-------------|
+| `offset` | `RowIndex` | The offset from the page base address. |
+| `init` | `Byte` | The initial value of this address. Can be replaced by a constant zero for zero-initialization |
+| `fini` | `Byte` | The final value this address took |
+| `timestamp` | `DWordWL` | The timestamp at which this address was last accessed |
+
+### Virtual
+
+| Name | Type | Description |
+|------|------|-------------|
+| `address` | `DWordWL` | Adding `offset` to the page base address `page`. `page` is a constant with respect to a single instance of this table. |
+
+**Definition of `address`:**
+```
+address := page + offset * 1::DWordWL
+```
+
+## Constraints
+
+### all
+
+| Tag | Description | Multiplicity |
+|-----|-------------|--------------|
+| `PAGE-C1` | `IS_BYTE[init]` | 1 |
+| `PAGE-C2` | `IS_BYTE[fini]` | 1 |
+| `PAGE-C3` | `memory[0, address, 0::DWordWL, init]` | -1 |
+| `PAGE-C4` | `memory[0, address, timestamp, fini]` | 1 |

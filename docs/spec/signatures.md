@@ -1,6 +1,8 @@
 # Signatures
 
-// Render a signature let (lb, rb) = if sig.kind == "interaction" { (`[`, `]`) } else if sig.kind == "template" { (`<`, `>`) }
+// Render a signature
+
+let (lb, rb) = if sig.kind == "interaction" { (`[`, `]`) } else if sig.kind == "template" { (`<`, `>`) }
 
 let cond = sig.at("cond", default: none) let cond_str = if cond != none { raw(cond) + ` => ` } else {``}
 
@@ -10,7 +12,9 @@ let output = sig.at("output", default: none) let output_str = if output != none 
 
 return [] }
 
-// Compute the bus size of an interaction let vars = sig.input + if "output" in sig { (sig.output, )} else {()}
+// Compute the bus size of an interaction
+
+let vars = sig.input + if "output" in sig { (sig.output, )} else {()}
 
 return vars.map(v => { let (label, factor) = if type(v) == array { (v.at(0), v.at(1)) } else { (v, 1) } config.variables.types.filter(type => type.label == label).first().subtypes.len() * factor }) .sum() }
 
