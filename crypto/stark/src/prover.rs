@@ -1810,10 +1810,15 @@ pub trait IsStarkProver<
                     // defaults to zero in parallel mode since TLS is per-worker-thread).
                     #[cfg(feature = "instruments")]
                     let table_timing = {
-                        let mut sub_ops = crate::instruments::take_round_sub_ops()
-                            .unwrap_or_default();
+                        let mut sub_ops =
+                            crate::instruments::take_round_sub_ops().unwrap_or_default();
                         sub_ops.trace_lde += lde_dur;
-                        (air.name().to_string(), trace.num_rows(), table_start.elapsed(), sub_ops)
+                        (
+                            air.name().to_string(),
+                            trace.num_rows(),
+                            table_start.elapsed(),
+                            sub_ops,
+                        )
                     };
 
                     // Return column Vecs to pool (zero-copy move back)
