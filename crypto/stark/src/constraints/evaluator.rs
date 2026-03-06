@@ -302,7 +302,7 @@ where
         let num_periodic = lde_periodic_columns.len();
         let offsets = &air.context().transition_offsets;
 
-        let evaluations_t = Self::evaluate_transitions(
+        Self::evaluate_transitions(
             air,
             lde_trace,
             &lde_periodic_columns,
@@ -314,8 +314,6 @@ where
             num_periodic,
             offsets,
             &self.logup_table_offset,
-        );
-
-        evaluations_t
+        )
     }
 }
