@@ -70,44 +70,44 @@ impl<E: IsField> RoundPoly<E> {
             }
         }
 
-        // Compute the "master" numerator product: N(x) = prod_{j=0}^{d} (x - j)
+        // Barycentric Lagrange interpolation with batch inversion.
+        //
+        // Barycentric weights: w_i = 1 / prod_{j≠i}(i - j) for integer nodes.
+        // We batch-invert the weights together with point_minus_j to use only
+        // 1 field inversion total (instead of 2(d+1) individual inversions).
+
+        // Compute barycentric weight denominators: prod_{j≠i}(i - j)
+        let mut to_invert: Vec<FieldElement<E>> = (0..=d)
+            .map(|i| {
+                let mut denom = FieldElement::<E>::one();
+                for j in 0..=d {
+                    if j != i {
+                        denom = &denom * &FieldElement::from((i as i64) - (j as i64));
+                    }
+                }
+                denom
+            })
+            .collect();
+
+        // Append point_minus_j values; batch-invert everything in one call
+        to_invert.extend(point_minus_j.iter().cloned());
+        FieldElement::inplace_batch_inverse(&mut to_invert)
+            .expect("All values are nonzero");
+
+        let (w_inv, pm_inv) = to_invert.split_at(d + 1);
+
+        // master_product = prod_{j=0}^{d} (point - j)
         let master_product = point_minus_j
             .iter()
             .fold(FieldElement::one(), |acc, v| &acc * v);
 
-        // For each node i, the Lagrange basis polynomial value is:
-        //   L_i(x) = N(x) / (x - i) / prod_{j != i}(i - j)
-        //
-        // The denominator prod_{j != i}(i - j) for integer nodes is:
-        //   prod_{j=0, j!=i}^{d} (i - j) = i! * (-1)^(d-i) * (d-i)!
-        //   which simplifies to: (-1)^(d-i) * i! * (d-i)!
-        //
-        // We compute this directly as a field element.
-        let mut result = FieldElement::zero();
-
+        // result = master_product * Σ_i (evals[i] * w_inv[i] * pm_inv[i])
+        let mut sum = FieldElement::zero();
         for i in 0..=d {
-            // Compute the barycentric weight: 1 / prod_{j != i}(i - j)
-            let mut denom = FieldElement::one();
-            for j in 0..=d {
-                if j != i {
-                    // (i - j) as a signed integer, converted to field element
-                    let diff = (i as i64) - (j as i64);
-                    denom = &denom * &FieldElement::from(diff);
-                }
-            }
-            let denom_inv = denom.inv().expect("Lagrange denominator must be nonzero");
-
-            // L_i(point) = master_product / (point - i) * (1 / denom)
-            // We already have (point - i) in point_minus_j[i]
-            let point_minus_i_inv = point_minus_j[i]
-                .inv()
-                .expect("Already checked point != node");
-
-            let basis_value = &(&master_product * &point_minus_i_inv) * &denom_inv;
-            result = &result + &(&self.evals[i] * &basis_value);
+            sum = &sum + &(&self.evals[i] * &(&w_inv[i] * &pm_inv[i]));
         }
 
-        result
+        &master_product * &sum
     }
 
     /// Returns the number of evaluations (degree + 1).
@@ -146,7 +146,7 @@ pub struct SumcheckProof<E: IsField> {
 /// and `challenges` is the vector of random points sampled during the protocol.
 pub fn sumcheck_prove<E: IsField>(
     evals: &[FieldElement<E>],
-    _claimed_sum: &FieldElement<E>,
+    claimed_sum: &FieldElement<E>,
     num_vars: usize,
     max_degree: usize,
     transcript: &mut impl IsTranscript<E>,
@@ -164,25 +164,33 @@ pub fn sumcheck_prove<E: IsField>(
     let mut table = evals.to_vec();
     let mut round_polys = Vec::with_capacity(num_vars);
     let mut challenges = Vec::with_capacity(num_vars);
+    let mut round_claimed_sum = claimed_sum.clone();
 
     for _round in 0..num_vars {
         let half = table.len() / 2;
 
-        // Evaluate the round polynomial at t = 0, 1, ..., max_degree.
-        // The bookkeeping table pairs are (table[2j], table[2j+1]) which
-        // represent f(..., x_r=0, ...) and f(..., x_r=1, ...) respectively.
-        // The multilinear interpolation at point t is:
-        //   table[2j] * (1 - t) + table[2j+1] * t
-        let mut poly_evals = Vec::with_capacity(max_degree + 1);
+        // p(0) = sum of left halves (zero multiplications)
+        let mut p0 = FieldElement::<E>::zero();
+        for j in 0..half {
+            p0 = &p0 + &table[2 * j];
+        }
 
-        for t in 0..=max_degree {
+        // p(1) = round_claimed_sum - p(0) (free, from sumcheck identity p(0)+p(1)=sum)
+        let p1 = &round_claimed_sum - &p0;
+
+        let mut poly_evals = Vec::with_capacity(max_degree + 1);
+        poly_evals.push(p0);
+        poly_evals.push(p1);
+
+        // For t >= 2: use delta form.
+        // Linear interpolation at t: table[2j] + t * (table[2j+1] - table[2j])
+        // p(t) = Σ_j [table[2j] + t * delta_j] where delta_j = table[2j+1] - table[2j]
+        for t in 2..=max_degree {
             let t_fe = FieldElement::<E>::from(t as u64);
-            let one_minus_t = &FieldElement::<E>::one() - &t_fe;
             let mut sum = FieldElement::<E>::zero();
             for j in 0..half {
-                // Linear interpolation: table[2j]*(1-t) + table[2j+1]*t
-                let contrib = &(&table[2 * j] * &one_minus_t) + &(&table[2 * j + 1] * &t_fe);
-                sum = &sum + &contrib;
+                let delta = &table[2 * j + 1] - &table[2 * j];
+                sum = &sum + &(&table[2 * j] + &(&t_fe * &delta));
             }
             poly_evals.push(sum);
         }
@@ -197,12 +205,15 @@ pub fn sumcheck_prove<E: IsField>(
         // Sample the challenge for this round
         let challenge: FieldElement<E> = transcript.sample_field_element();
 
+        // Update round_claimed_sum for next round: p(challenge)
+        round_claimed_sum = round_poly.evaluate(&challenge);
+
         // Bind the table: fold using the challenge
-        // table[j] = table[2j] * (1 - challenge) + table[2j+1] * challenge
-        let one_minus_challenge = &FieldElement::<E>::one() - &challenge;
+        // table[j] = table[2j] + challenge * (table[2j+1] - table[2j])
         for j in 0..half {
-            table[j] =
-                &(&table[2 * j] * &one_minus_challenge) + &(&table[2 * j + 1] * &challenge);
+            let left = &table[2 * j];
+            let right = &table[2 * j + 1];
+            table[j] = left + &(&challenge * &(right - left));
         }
         table.truncate(half);
 
