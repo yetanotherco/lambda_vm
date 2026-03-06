@@ -366,35 +366,81 @@ pub fn gkr_prove<E: IsField>(
                 // Evaluate the round polynomial at t = 0, 1, 2, 3
                 // For each pair (2j, 2j+1) in the five tables, linearly interpolate
                 // each table independently at t, then compute the gate function.
-                let mut poly_evals = Vec::with_capacity(4);
+                // Compute all 4 evaluation points in a single pass over pairs.
+                let t_vals: [FieldElement<E>; 4] = [
+                    FieldElement::<E>::from(0u64),
+                    FieldElement::<E>::from(1u64),
+                    FieldElement::<E>::from(2u64),
+                    FieldElement::<E>::from(3u64),
+                ];
+                let one_minus_t_vals: [FieldElement<E>; 4] = [
+                    &FieldElement::<E>::one() - &t_vals[0],
+                    &FieldElement::<E>::one() - &t_vals[1],
+                    &FieldElement::<E>::one() - &t_vals[2],
+                    &FieldElement::<E>::one() - &t_vals[3],
+                ];
 
-                for t in 0u64..4 {
-                    let t_fe = FieldElement::<E>::from(t);
-                    let one_minus_t = &FieldElement::<E>::one() - &t_fe;
-                    let mut sum = FieldElement::<E>::zero();
+                let compute_pair_sums =
+                    |j: usize|
+                     -> [FieldElement<E>; 4] {
+                        let mut sums = [
+                            FieldElement::<E>::zero(),
+                            FieldElement::<E>::zero(),
+                            FieldElement::<E>::zero(),
+                            FieldElement::<E>::zero(),
+                        ];
+                        for t in 0..4 {
+                            let eq_t = &(&eq_table[2 * j] * &one_minus_t_vals[t])
+                                + &(&eq_table[2 * j + 1] * &t_vals[t]);
+                            let nl_t = &(&nl_table[2 * j] * &one_minus_t_vals[t])
+                                + &(&nl_table[2 * j + 1] * &t_vals[t]);
+                            let nr_t = &(&nr_table[2 * j] * &one_minus_t_vals[t])
+                                + &(&nr_table[2 * j + 1] * &t_vals[t]);
+                            let dl_t = &(&dl_table[2 * j] * &one_minus_t_vals[t])
+                                + &(&dl_table[2 * j + 1] * &t_vals[t]);
+                            let dr_t = &(&dr_table[2 * j] * &one_minus_t_vals[t])
+                                + &(&dr_table[2 * j + 1] * &t_vals[t]);
 
-                    for j in 0..half {
-                        // Linear interpolation of each table at t
-                        let eq_t = &(&eq_table[2 * j] * &one_minus_t)
-                            + &(&eq_table[2 * j + 1] * &t_fe);
-                        let nl_t = &(&nl_table[2 * j] * &one_minus_t)
-                            + &(&nl_table[2 * j + 1] * &t_fe);
-                        let nr_t = &(&nr_table[2 * j] * &one_minus_t)
-                            + &(&nr_table[2 * j + 1] * &t_fe);
-                        let dl_t = &(&dl_table[2 * j] * &one_minus_t)
-                            + &(&dl_table[2 * j + 1] * &t_fe);
-                        let dr_t = &(&dr_table[2 * j] * &one_minus_t)
-                            + &(&dr_table[2 * j + 1] * &t_fe);
+                            let gate_val = &(&nl_t * &dr_t)
+                                + &(&nr_t * &dl_t)
+                                + &(&lambda * &(&dl_t * &dr_t));
+                            sums[t] = &eq_t * &gate_val;
+                        }
+                        sums
+                    };
 
-                        // Gate: eq * (nl*dr + nr*dl + lambda*dl*dr)
-                        let gate_val = &(&nl_t * &dr_t)
-                            + &(&nr_t * &dl_t)
-                            + &(&lambda * &(&dl_t * &dr_t));
-                        sum = &sum + &(&eq_t * &gate_val);
-                    }
+                let zero4 = || {
+                    [
+                        FieldElement::<E>::zero(),
+                        FieldElement::<E>::zero(),
+                        FieldElement::<E>::zero(),
+                        FieldElement::<E>::zero(),
+                    ]
+                };
+                let add4 = |a: [FieldElement<E>; 4], b: [FieldElement<E>; 4]| {
+                    [
+                        &a[0] + &b[0],
+                        &a[1] + &b[1],
+                        &a[2] + &b[2],
+                        &a[3] + &b[3],
+                    ]
+                };
 
-                    poly_evals.push(sum);
-                }
+                #[cfg(feature = "parallel")]
+                let totals: [FieldElement<E>; 4] = if half >= 256 {
+                    (0..half)
+                        .into_par_iter()
+                        .fold(zero4, |acc, j| add4(acc, compute_pair_sums(j)))
+                        .reduce(zero4, add4)
+                } else {
+                    (0..half).fold(zero4(), |acc, j| add4(acc, compute_pair_sums(j)))
+                };
+
+                #[cfg(not(feature = "parallel"))]
+                let totals: [FieldElement<E>; 4] =
+                    (0..half).fold(zero4(), |acc, j| add4(acc, compute_pair_sums(j)));
+
+                let poly_evals = totals.to_vec();
 
                 let round_poly = RoundPoly::new(poly_evals);
 
@@ -408,25 +454,53 @@ pub fn gkr_prove<E: IsField>(
 
                 // Bind all five tables: fold pairs using the challenge
                 let one_minus_challenge = &FieldElement::<E>::one() - &challenge;
-                for j in 0..half {
-                    eq_table[j] = &(&eq_table[2 * j] * &one_minus_challenge)
-                        + &(&eq_table[2 * j + 1] * &challenge);
-                    nl_table[j] = &(&nl_table[2 * j] * &one_minus_challenge)
-                        + &(&nl_table[2 * j + 1] * &challenge);
-                    nr_table[j] = &(&nr_table[2 * j] * &one_minus_challenge)
-                        + &(&nr_table[2 * j + 1] * &challenge);
-                    dl_table[j] = &(&dl_table[2 * j] * &one_minus_challenge)
-                        + &(&dl_table[2 * j + 1] * &challenge);
-                    dr_table[j] = &(&dr_table[2 * j] * &one_minus_challenge)
-                        + &(&dr_table[2 * j + 1] * &challenge);
+
+                let fold_table = |table: &mut Vec<FieldElement<E>>| {
+                    for j in 0..half {
+                        table[j] = &(&table[2 * j] * &one_minus_challenge)
+                            + &(&table[2 * j + 1] * &challenge);
+                    }
+                    table.truncate(half);
+                };
+
+                #[cfg(feature = "parallel")]
+                {
+                    if half >= 256 {
+                        // Fold tables in parallel (each table independently)
+                        rayon::join(
+                            || {
+                                rayon::join(
+                                    || fold_table(&mut eq_table),
+                                    || fold_table(&mut nl_table),
+                                );
+                            },
+                            || {
+                                rayon::join(
+                                    || fold_table(&mut nr_table),
+                                    || rayon::join(
+                                        || fold_table(&mut dl_table),
+                                        || fold_table(&mut dr_table),
+                                    ),
+                                );
+                            },
+                        );
+                    } else {
+                        fold_table(&mut eq_table);
+                        fold_table(&mut nl_table);
+                        fold_table(&mut nr_table);
+                        fold_table(&mut dl_table);
+                        fold_table(&mut dr_table);
+                    }
                 }
 
-                // Truncate all tables to their folded size
-                eq_table.truncate(half);
-                nl_table.truncate(half);
-                nr_table.truncate(half);
-                dl_table.truncate(half);
-                dr_table.truncate(half);
+                #[cfg(not(feature = "parallel"))]
+                {
+                    fold_table(&mut eq_table);
+                    fold_table(&mut nl_table);
+                    fold_table(&mut nr_table);
+                    fold_table(&mut dl_table);
+                    fold_table(&mut dr_table);
+                }
 
                 round_polys.push(round_poly);
                 challenges.push(challenge);
