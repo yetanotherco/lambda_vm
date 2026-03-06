@@ -1582,7 +1582,7 @@ pub trait IsStarkProver<
                         .map(|row| {
                             let mut batched = FieldElement::<FieldExtension>::zero();
                             for (j, (col_idx, _)) in column_claims.iter().enumerate() {
-                                batched = batched + &main_cols[*col_idx][row] * &gamma_powers[j];
+                                batched += &main_cols[*col_idx][row] * &gamma_powers[j];
                             }
                             batched
                         })

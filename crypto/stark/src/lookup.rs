@@ -925,8 +925,8 @@ where
                 let n = rap_challenges.len() - rp_start;
                 let mut l0_expected = FieldElement::<E>::one();
                 for j in 0..n {
-                    l0_expected =
-                        l0_expected * (FieldElement::<E>::one() - &rap_challenges[rp_start + j]);
+                    l0_expected *=
+                        FieldElement::<E>::one() - &rap_challenges[rp_start + j];
                 }
                 // Aux column 0 is the Lagrange kernel; constrain l[0] = prod(1 - r_j)
                 boundary_constraints.push(BoundaryConstraint::new_aux(0, 0, l0_expected));
@@ -1357,7 +1357,7 @@ pub fn compute_bridge_params<E: IsField>(
 
     let mut target = FieldElement::<E>::zero();
     for ((_, c_j), gp) in column_claims.iter().zip(gamma_powers.iter()) {
-        target = target + c_j * gp;
+        target += c_j * gp;
     }
 
     let n_inv = FieldElement::<E>::from(trace_len as u64).inv().unwrap();
@@ -1459,7 +1459,7 @@ where
                     let gamma_j = &rap_challenges[LOGUP_GAMMA_POWERS_START + j];
                     let col_val = step0.get_main_evaluation_element(0, col_idx);
                     // F×E→E: base field column × extension field gamma power
-                    batched = batched + col_val * gamma_j;
+                    batched += col_val * gamma_j;
                 }
 
                 // σ_next - σ_curr - l_curr * batched + bridge_offset
@@ -1485,7 +1485,7 @@ where
                     let gamma_j = &rap_challenges[LOGUP_GAMMA_POWERS_START + j];
                     // In verifier path, main cols are also in E
                     let col_val = step0.get_main_evaluation_element(0, col_idx);
-                    batched = batched + col_val * gamma_j;
+                    batched += col_val * gamma_j;
                 }
 
                 transition_evaluations[self.constraint_idx] =

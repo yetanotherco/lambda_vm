@@ -878,10 +878,8 @@ pub trait IsStarkVerifier<
         if needs_lookup_challenges {
             let mut total = FieldElement::<FieldExtension>::zero();
             for (air, proof) in airs.iter().zip(&multi_proof.proofs) {
-                if air.has_trace_interaction() {
-                    if let Some(ref gkr_proof) = proof.logup_gkr_proof {
-                        total = total + &gkr_proof.gkr_proof.claimed_sum;
-                    }
+                if air.has_trace_interaction() && let Some(ref gkr_proof) = proof.logup_gkr_proof {
+                    total = total + &gkr_proof.gkr_proof.claimed_sum;
                 }
             }
 
