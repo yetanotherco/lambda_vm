@@ -1744,8 +1744,12 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
         #[cfg(feature = "instruments")]
-        let mut table_timings: Vec<(String, usize, std::time::Duration, crate::instruments::TableSubOps)> =
-            Vec::with_capacity(num_airs);
+        let mut table_timings: Vec<(
+            String,
+            usize,
+            std::time::Duration,
+            crate::instruments::TableSubOps,
+        )> = Vec::with_capacity(num_airs);
 
         let mut proofs = Vec::with_capacity(num_airs);
         for chunk_start in (0..num_airs).step_by(k) {
