@@ -10,7 +10,7 @@ use math::fft::cpu::bowers_fft::LayerTwiddles;
 use math::fft::errors::FFTError;
 
 use log::info;
-use math::field::traits::{IsField, IsSubFieldOf};
+use math::field::traits::{IsField, IsPrimeField, IsSubFieldOf};
 use math::traits::AsBytes;
 use math::{
     field::{element::FieldElement, traits::IsFFTField},
@@ -36,8 +36,8 @@ use super::constraints::evaluator::ConstraintEvaluator;
 use super::domain::Domain;
 use super::fri::fri_decommit::FriDecommitment;
 use super::grinding;
-use super::lookup::BusPublicInputs;
-use super::proof::stark::{DeepPolynomialOpening, MultiProof, StarkProof};
+use super::lookup::{BusPublicInputs, LogUpGkrResult};
+use super::proof::stark::{DeepPolynomialOpening, LogUpGkrProof, MultiProof, StarkProof};
 use super::trace::TraceTable;
 use super::traits::AIR;
 
@@ -154,6 +154,8 @@ where
     rap_challenges: Vec<FieldElement<FieldExtension>>,
     /// Bus interaction public inputs (initial and final aux column values).
     bus_public_inputs: Option<BusPublicInputs<FieldExtension>>,
+    /// LogUp-GKR result (when using GKR-based LogUp alongside traditional accumulated column).
+    logup_gkr_result: Option<LogUpGkrResult<FieldExtension>>,
 }
 
 /// Pre-computed twiddle factors and coset weights for a given domain size.
@@ -1394,6 +1396,7 @@ pub trait IsStarkProver<
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
+        Field: IsPrimeField,
         PI: Send + Sync + Clone,
     {
         info!("Started proof generation...");
@@ -1487,6 +1490,36 @@ pub trait IsStarkProver<
         };
 
         // =====================================================================
+        // Round 1, Phase B': GKR sub-protocol (isolated transcript)
+        // =====================================================================
+        // For each table with bus interactions, run the LogUp-GKR sub-protocol.
+        // Uses a cloned transcript so the GKR proof generation does not alter
+        // the main transcript state — the verifier does not process GKR yet.
+        // Once the verifier is updated (Task 11+), the GKR will use the main
+        // transcript directly.
+
+        let gkr_results: Vec<Option<LogUpGkrResult<FieldExtension>>> = air_trace_pairs
+            .iter()
+            .map(|(air, trace, _)| {
+                if air.has_trace_interaction() {
+                    let interactions = air.bus_interactions();
+                    let main_segment_cols = trace.columns_main();
+                    let trace_len = trace.num_rows();
+                    let mut gkr_transcript = transcript.clone();
+                    Some(crate::lookup::run_logup_gkr(
+                        interactions,
+                        &main_segment_cols,
+                        trace_len,
+                        &lookup_challenges,
+                        &mut gkr_transcript,
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // =====================================================================
         // Phase C + Rounds 2-4: Forked per table
         // =====================================================================
         // Each table gets an independent transcript fork (cloned from the shared
@@ -1519,6 +1552,7 @@ pub trait IsStarkProver<
         let mut metadatas: Vec<Round1Metadata<Field, FieldExtension>> =
             Vec::with_capacity(num_airs);
         let mut table_transcripts = Vec::with_capacity(num_airs);
+        let mut gkr_results_iter = gkr_results.into_iter();
         for (
             idx,
             ((((air, trace, _pub_inputs), bus_public_inputs), main_commit), (domain, twiddles)),
@@ -1529,6 +1563,7 @@ pub trait IsStarkProver<
             .zip(domains.iter().zip(twiddle_caches.iter()))
             .enumerate()
         {
+            let gkr_result = gkr_results_iter.next().unwrap();
             // Fork transcript with domain separator (must match verifier)
             let mut table_transcript = transcript.clone();
             if num_airs > 1 {
@@ -1564,6 +1599,7 @@ pub trait IsStarkProver<
                 aux_merkle_root: aux_root,
                 rap_challenges: lookup_challenges.clone(),
                 bus_public_inputs,
+                logup_gkr_result: gkr_result,
             });
             table_transcripts.push(table_transcript);
         }
@@ -1609,13 +1645,21 @@ pub trait IsStarkProver<
                 table_transcript.append_field_element(&bpi.table_contribution);
             }
 
-            let proof = Self::prove_rounds_2_to_4(
+            let mut proof = Self::prove_rounds_2_to_4(
                 *air,
                 *pub_inputs,
                 &round_1_result,
                 table_transcript,
                 domain,
             )?;
+
+            // Attach LogUp-GKR proof from Phase B' (if this table had bus interactions)
+            proof.logup_gkr_proof = metadata.logup_gkr_result.as_ref().map(|r| LogUpGkrProof {
+                gkr_proof: r.gkr_proof.clone(),
+                random_point: r.random_point.clone(),
+                column_claims: r.column_claims.clone(),
+            });
+
             proofs.push(proof);
 
             // Return column Vecs to pool (zero-copy move back). Pool slots that were
@@ -1643,6 +1687,7 @@ pub trait IsStarkProver<
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
+        Field: IsPrimeField,
         PI: Send + Sync + Clone,
     {
         let air_trace_pairs = vec![(air, trace, pub_inputs)];

@@ -1,4 +1,7 @@
-use math::field::{element::FieldElement, traits::IsField};
+use math::field::{
+    element::FieldElement,
+    traits::{IsField, IsSubFieldOf},
+};
 
 /// Compute the Lagrange kernel (eq polynomial) for a random point `r`.
 ///
@@ -64,6 +67,42 @@ pub fn eval_mle<E: IsField>(
 
     let mut result = FieldElement::<E>::zero();
     for i in 0..big_n {
+        result = &result + &(&values[i] * &kernel[i]);
+    }
+
+    result
+}
+
+/// Evaluate the multilinear extension (MLE) of base-field `values` at an extension-field point `r`.
+///
+/// Same as `eval_mle` but accepts base-field values and an extension-field evaluation point.
+/// Uses `F * E -> E` multiplication directly (no `to_extension()` conversion).
+///
+/// Panics if `values.len()` is not a power of 2 or if `r.len() != log2(values.len())`.
+pub fn eval_mle_base<F, E>(
+    values: &[FieldElement<F>],
+    r: &[FieldElement<E>],
+) -> FieldElement<E>
+where
+    F: IsField + IsSubFieldOf<E>,
+    E: IsField,
+{
+    let n = r.len();
+    let big_n = 1usize << n;
+    assert_eq!(
+        values.len(),
+        big_n,
+        "values length ({}) must equal 2^r.len() = 2^{} = {}",
+        values.len(),
+        n,
+        big_n
+    );
+
+    let kernel = compute_lagrange_kernel(r);
+
+    let mut result = FieldElement::<E>::zero();
+    for i in 0..big_n {
+        // F * E -> E multiplication (no to_extension)
         result = &result + &(&values[i] * &kernel[i]);
     }
 

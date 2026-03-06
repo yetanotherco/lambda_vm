@@ -862,6 +862,10 @@ where
         !self.auxiliary_trace_build_data.interactions.is_empty()
     }
 
+    fn bus_interactions(&self) -> &[BusInteraction] {
+        &self.auxiliary_trace_build_data.interactions
+    }
+
     fn max_bus_elements(&self) -> usize {
         self.max_bus_elements
     }
@@ -2163,6 +2167,127 @@ where
     }
 
     (numerators, denominators)
+}
+
+// =============================================================================
+// LogUp-GKR Integration
+// =============================================================================
+
+use crate::gkr::{build_summation_tree, gkr_prove, GkrProof};
+use crate::lagrange_kernel::eval_mle_base;
+use crypto::fiat_shamir::is_transcript::IsTranscript;
+
+/// Result of running the LogUp-GKR sub-protocol for a single table.
+///
+/// Contains the GKR proof, the random evaluation point, leaf-level claims,
+/// and MLE claims for each distinct main trace column used in bus interactions.
+#[derive(Debug, Clone)]
+pub struct LogUpGkrResult<E: IsField> {
+    /// Total table contribution (claimed_sum from GKR root = sum of all fractions).
+    pub table_contribution: FieldElement<E>,
+    /// The complete GKR proof for the summation tree.
+    pub gkr_proof: GkrProof<E>,
+    /// The random evaluation point produced by the GKR protocol (length = log2(trace_len)).
+    pub random_point: Vec<FieldElement<E>>,
+    /// Claimed MLE evaluation of the leaf numerator at the random point.
+    pub n_claim: FieldElement<E>,
+    /// Claimed MLE evaluation of the leaf denominator at the random point.
+    pub d_claim: FieldElement<E>,
+    /// MLE claims for each distinct main trace column used in bus interactions.
+    /// Each entry is (column_index, MLE evaluation at random_point).
+    pub column_claims: Vec<(usize, FieldElement<E>)>,
+}
+
+/// Run the LogUp-GKR sub-protocol for a single table's bus interactions.
+///
+/// This function:
+/// 1. Computes per-row leaf fractions (numerator, denominator) from interactions
+/// 2. Builds a binary summation tree over the leaf fractions
+/// 3. Runs the GKR protocol to prove the summation tree root
+/// 4. Extracts MLE claims for each distinct main trace column at the GKR random point
+///
+/// The GKR proof replaces the traditional per-row accumulated column with a
+/// logarithmic-depth interactive proof, reducing auxiliary trace columns.
+pub fn run_logup_gkr<F, E>(
+    interactions: &[BusInteraction],
+    main_segment_cols: &[Vec<FieldElement<F>>],
+    trace_len: usize,
+    challenges: &[FieldElement<E>],
+    transcript: &mut impl IsTranscript<E>,
+) -> LogUpGkrResult<E>
+where
+    F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
+    E: IsField + Send + Sync,
+{
+    // Step 1: Compute per-row leaf fractions
+    let (numerators, denominators) =
+        compute_logup_leaf_fractions(interactions, main_segment_cols, trace_len, challenges);
+
+    // Step 2: Build the summation tree
+    let tree = build_summation_tree(numerators, denominators);
+
+    // Step 3: Run the GKR protocol
+    let (gkr_proof, random_point, n_claim, d_claim) = gkr_prove(&tree, transcript);
+
+    let table_contribution = gkr_proof.claimed_sum.clone();
+
+    // Step 4: Extract column claims — compute MLE at the random point for each
+    // distinct main trace column index referenced by any interaction.
+    let mut seen_cols = std::collections::HashSet::new();
+    for inter in interactions {
+        for val in &inter.values {
+            for col_idx in val.column_indices() {
+                seen_cols.insert(col_idx);
+            }
+        }
+        // Also collect column indices from multiplicities
+        match &inter.multiplicity {
+            Multiplicity::One => {}
+            Multiplicity::Column(c) => {
+                seen_cols.insert(*c);
+            }
+            Multiplicity::Sum(a, b) => {
+                seen_cols.insert(*a);
+                seen_cols.insert(*b);
+            }
+            Multiplicity::Negated(c) => {
+                seen_cols.insert(*c);
+            }
+            Multiplicity::Linear(terms) => {
+                for term in terms {
+                    match term {
+                        LinearTerm::Column { column, .. } => {
+                            seen_cols.insert(*column);
+                        }
+                        LinearTerm::ColumnUnsigned { column, .. } => {
+                            seen_cols.insert(*column);
+                        }
+                        LinearTerm::Constant(_) => {}
+                    }
+                }
+            }
+        }
+    }
+
+    let mut col_indices: Vec<usize> = seen_cols.into_iter().collect();
+    col_indices.sort_unstable();
+
+    let column_claims: Vec<(usize, FieldElement<E>)> = col_indices
+        .into_iter()
+        .map(|col_idx| {
+            let claim = eval_mle_base(&main_segment_cols[col_idx], &random_point);
+            (col_idx, claim)
+        })
+        .collect();
+
+    LogUpGkrResult {
+        table_contribution,
+        gkr_proof,
+        random_point,
+        n_claim,
+        d_claim,
+        column_claims,
+    }
 }
 
 #[cfg(test)]
