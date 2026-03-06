@@ -376,13 +376,19 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // SHIFT-C4: AND_BYTE[256 - shift, 15] → bit_shift | right (= direction)
+    // SHIFT-C4: AND_BYTE[256*(1-zbs) - shift, 15] → bit_shift | right (= direction)
+    // When shift>0 (zbs=0): sends AND_BYTE[bit_shift; 256-shift, 15].
+    // When shift=0 (zbs=1): sends AND_BYTE[0; 0, 15] — avoids out-of-range value 256.
     interactions.push(BusInteraction::sender(
         BusId::AndByte,
         Multiplicity::Column(cols::DIRECTION),
         vec![
             BusValue::linear(vec![
                 LinearTerm::Constant(256),
+                LinearTerm::Column {
+                    coefficient: -256,
+                    column: cols::ZBS,
+                },
                 LinearTerm::Column {
                     coefficient: -1,
                     column: cols::SHIFT_AMOUNT,
@@ -852,9 +858,10 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
             ));
         }
 
-        // C4: AND_BYTE[256-shift, 15] | right (= direction)
+        // C4: AND_BYTE[256*(1-zbs) - shift, 15] | right (= direction)
+        // When shift=0 (zbs=1): sends 0. When shift>0 (zbs=0): sends 256-shift.
         if right {
-            let neg_shift = (256u16 - op.shift as u16) as u8;
+            let neg_shift: u8 = if op.shift == 0 { 0 } else { (256u16 - op.shift as u16) as u8 };
             bitwise_ops.push(BitwiseOperation::byte_op(
                 BitwiseOperationType::AndByte,
                 neg_shift,
