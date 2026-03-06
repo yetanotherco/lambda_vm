@@ -1930,6 +1930,312 @@ pub struct LogUpGkrResult<E: IsField> {
     pub column_claims: Vec<(usize, FieldElement<E>)>,
 }
 
+/// Verifies that column_claims are consistent with the GKR output (n_claim, d_claim).
+///
+/// The GKR protocol outputs `(random_point, n_claim, d_claim)` where `n_claim` and
+/// `d_claim` are the claimed MLE evaluations of the leaf numerator and denominator
+/// at `random_point`. The prover also provides `column_claims` which are MLE
+/// evaluations of individual main trace columns at the same point.
+///
+/// For single-interaction tables: the leaf numerator and denominator are linear
+/// functions of column values (n = sign * m, d = fp), so their MLEs can be exactly
+/// reconstructed from column_claims. This gives a direct equality check.
+///
+/// For multi-interaction tables: the leaf fraction involves products of per-interaction
+/// fingerprints and multiplicities (cross-multiplication), making it a nonlinear
+/// function of column values. Since MLE does not preserve products, the direct
+/// reconstruction from column_claims differs from the true MLE values. For these
+/// tables, soundness of column_claims is guaranteed by the bridge running sum
+/// constraint (which is verified as part of the STARK proof). We still verify
+/// structural completeness (all referenced columns are present in column_claims).
+///
+/// # Arguments
+/// * `n_claim` - Claimed MLE evaluation of leaf numerator at random_point (from GKR)
+/// * `d_claim` - Claimed MLE evaluation of leaf denominator at random_point (from GKR)
+/// * `column_claims` - `(column_index, claimed_value)` pairs from the proof
+/// * `interactions` - The AIR's bus interactions
+/// * `challenges` - LogUp challenges `[z, alpha]`
+///
+/// # Returns
+/// `true` if verification passes, `false` otherwise.
+pub fn reconstruct_and_verify_gkr_claims<E: IsField>(
+    n_claim: &FieldElement<E>,
+    d_claim: &FieldElement<E>,
+    column_claims: &[(usize, FieldElement<E>)],
+    interactions: &[BusInteraction],
+    challenges: &[FieldElement<E>],
+) -> bool {
+    // Build a map from column index to claimed MLE value
+    let claim_map: std::collections::HashMap<usize, &FieldElement<E>> = column_claims
+        .iter()
+        .map(|(col_idx, val)| (*col_idx, val))
+        .collect();
+
+    // Verify structural completeness: all columns referenced by interactions
+    // must be present in column_claims.
+    for inter in interactions {
+        for val in &inter.values {
+            for col_idx in val.column_indices() {
+                if !claim_map.contains_key(&col_idx) {
+                    return false;
+                }
+            }
+        }
+        match &inter.multiplicity {
+            Multiplicity::One => {}
+            Multiplicity::Column(c) => {
+                if !claim_map.contains_key(c) {
+                    return false;
+                }
+            }
+            Multiplicity::Sum(a, b) => {
+                if !claim_map.contains_key(a) || !claim_map.contains_key(b) {
+                    return false;
+                }
+            }
+            Multiplicity::Negated(c) => {
+                if !claim_map.contains_key(c) {
+                    return false;
+                }
+            }
+            Multiplicity::Linear(terms) => {
+                for term in terms {
+                    match term {
+                        LinearTerm::Column { column, .. }
+                        | LinearTerm::ColumnUnsigned { column, .. } => {
+                            if !claim_map.contains_key(column) {
+                                return false;
+                            }
+                        }
+                        LinearTerm::Constant(_) => {}
+                    }
+                }
+            }
+        }
+    }
+
+    let z = &challenges[LOGUP_CHALLENGE_Z];
+    let alpha = &challenges[LOGUP_CHALLENGE_ALPHA];
+
+    // Compute enough alpha powers for the largest interaction
+    let max_bus_elements = interactions
+        .iter()
+        .map(|inter| inter.num_bus_elements())
+        .max()
+        .unwrap_or(0);
+    let alpha_powers = compute_alpha_powers(alpha, max_bus_elements);
+
+    // For each interaction, compute fingerprint and multiplicity from column claims,
+    // then accumulate into a running fraction, same as compute_logup_leaf_fractions.
+    let mut running_n = FieldElement::<E>::zero();
+    let mut running_d = FieldElement::<E>::one();
+
+    for inter in interactions {
+        // Compute fingerprint: z - (bus_id * alpha^0 + sum of value contributions)
+        let bus_id_e = FieldElement::<E>::from(inter.bus_id);
+        let mut linear_combination = &bus_id_e * &alpha_powers[0];
+        let mut alpha_offset = 1;
+
+        for bv in &inter.values {
+            alpha_offset += accumulate_fingerprint_from_claims(
+                bv,
+                &claim_map,
+                &alpha_powers,
+                alpha_offset,
+                &mut linear_combination,
+            );
+        }
+
+        let fp_claim = z - &linear_combination;
+
+        // Compute multiplicity from column claims
+        let m_claim = multiplicity_from_claims(&inter.multiplicity, &claim_map);
+
+        // Sign: +1 for sender, -1 for receiver
+        let sign = if inter.is_sender {
+            FieldElement::<E>::one()
+        } else {
+            -FieldElement::<E>::one()
+        };
+
+        // Accumulate: n_new = n_old * fp + sign * m * d_old
+        //             d_new = d_old * fp
+        let new_n = &running_n * &fp_claim + &m_claim * &sign * &running_d;
+        let new_d = &running_d * &fp_claim;
+
+        running_n = new_n;
+        running_d = new_d;
+    }
+
+    // For single-interaction tables, the leaf fraction is linear in column values:
+    //   N(i) = sign * m(i), D(i) = fp(i)
+    // so MLE(N)(r) and MLE(D)(r) can be exactly reconstructed from column MLEs.
+    //
+    // For multi-interaction tables, the cross-multiplication introduces nonlinear
+    // terms (products of fingerprints/multiplicities across interactions), so
+    // MLE(N)(r) != n_recon and MLE(D)(r) != d_recon in general.
+    // Soundness for these tables is ensured by the bridge running sum constraint.
+    if interactions.len() == 1 {
+        // Direct check: reconstructed values must exactly match GKR output
+        &running_n == n_claim && &running_d == d_claim
+    } else {
+        // Multi-interaction: structural check passed above.
+        // The bridge constraint (verified during STARK proof) ensures column_claims
+        // are consistent with the committed trace.
+        true
+    }
+}
+
+/// Accumulates the fingerprint contribution of a BusValue from column claims.
+///
+/// This mirrors `BusValue::accumulate_fingerprint` but operates on the claim map
+/// (MLE evaluations at the GKR random point) instead of raw trace data.
+///
+/// Returns the number of alpha powers consumed.
+fn accumulate_fingerprint_from_claims<E: IsField>(
+    bv: &BusValue,
+    claim_map: &std::collections::HashMap<usize, &FieldElement<E>>,
+    alpha_powers: &[FieldElement<E>],
+    alpha_offset: usize,
+    acc: &mut FieldElement<E>,
+) -> usize {
+    match bv {
+        BusValue::Packed {
+            start_column,
+            packing,
+        } => {
+            // Collect column claim values for this packing
+            let columns: Vec<FieldElement<E>> = (*start_column
+                ..*start_column + packing.num_columns())
+                .map(|col| {
+                    claim_map
+                        .get(&col)
+                        .cloned()
+                        .cloned()
+                        .unwrap_or_else(|| FieldElement::<E>::zero())
+                })
+                .collect();
+
+            // Use Packing::combine to get bus elements, then accumulate with alpha powers
+            let combined = packing.combine(&columns);
+            for (i, elem) in combined.iter().enumerate() {
+                *acc += elem * &alpha_powers[alpha_offset + i];
+            }
+            combined.len()
+        }
+        BusValue::Linear(terms) => {
+            let mut result = FieldElement::<E>::zero();
+            for term in terms {
+                match term {
+                    LinearTerm::Column {
+                        coefficient,
+                        column,
+                    } => {
+                        let coeff = FieldElement::<E>::from(*coefficient);
+                        let val = claim_map
+                            .get(column)
+                            .cloned()
+                            .cloned()
+                            .unwrap_or_else(|| FieldElement::<E>::zero());
+                        result += &val * coeff;
+                    }
+                    LinearTerm::ColumnUnsigned {
+                        coefficient,
+                        column,
+                    } => {
+                        let coeff = FieldElement::<E>::from(*coefficient);
+                        let val = claim_map
+                            .get(column)
+                            .cloned()
+                            .cloned()
+                            .unwrap_or_else(|| FieldElement::<E>::zero());
+                        result += &val * coeff;
+                    }
+                    LinearTerm::Constant(value) => {
+                        result += FieldElement::<E>::from(*value);
+                    }
+                }
+            }
+            *acc += &result * &alpha_powers[alpha_offset];
+            1
+        }
+    }
+}
+
+/// Computes the multiplicity value from column claims at the GKR random point.
+///
+/// This mirrors `compute_multiplicities_for_interaction` but operates on scalar
+/// claim values instead of column vectors.
+fn multiplicity_from_claims<E: IsField>(
+    multiplicity: &Multiplicity,
+    claim_map: &std::collections::HashMap<usize, &FieldElement<E>>,
+) -> FieldElement<E> {
+    match multiplicity {
+        Multiplicity::One => FieldElement::<E>::one(),
+        Multiplicity::Column(c) => claim_map
+            .get(c)
+            .cloned()
+            .cloned()
+            .unwrap_or_else(|| FieldElement::<E>::zero()),
+        Multiplicity::Sum(a, b) => {
+            let va = claim_map
+                .get(a)
+                .cloned()
+                .cloned()
+                .unwrap_or_else(|| FieldElement::<E>::zero());
+            let vb = claim_map
+                .get(b)
+                .cloned()
+                .cloned()
+                .unwrap_or_else(|| FieldElement::<E>::zero());
+            va + vb
+        }
+        Multiplicity::Negated(c) => {
+            let val = claim_map
+                .get(c)
+                .cloned()
+                .cloned()
+                .unwrap_or_else(|| FieldElement::<E>::zero());
+            FieldElement::<E>::one() - val
+        }
+        Multiplicity::Linear(terms) => {
+            let mut result = FieldElement::<E>::zero();
+            for term in terms {
+                match term {
+                    LinearTerm::Column {
+                        coefficient,
+                        column,
+                    } => {
+                        let coeff = FieldElement::<E>::from(*coefficient);
+                        let val = claim_map
+                            .get(column)
+                            .cloned()
+                            .cloned()
+                            .unwrap_or_else(|| FieldElement::<E>::zero());
+                        result += &val * coeff;
+                    }
+                    LinearTerm::ColumnUnsigned {
+                        coefficient,
+                        column,
+                    } => {
+                        let coeff = FieldElement::<E>::from(*coefficient);
+                        let val = claim_map
+                            .get(column)
+                            .cloned()
+                            .cloned()
+                            .unwrap_or_else(|| FieldElement::<E>::zero());
+                        result += &val * coeff;
+                    }
+                    LinearTerm::Constant(value) => {
+                        result += FieldElement::<E>::from(*value);
+                    }
+                }
+            }
+            result
+        }
+    }
+}
+
 /// Run the LogUp-GKR sub-protocol for a single table's bus interactions.
 ///
 /// This function:

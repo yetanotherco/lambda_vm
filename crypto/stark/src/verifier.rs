@@ -921,8 +921,24 @@ pub trait IsStarkVerifier<
 
                 // Replay GKR verification on the main transcript
                 match crate::gkr::gkr_verify(&gkr_proof.gkr_proof, transcript) {
-                    Ok((_random_point, _n_claim, _d_claim)) => {
-                        // GKR verification passed — transcript state matches prover
+                    Ok((_random_point, n_claim, d_claim)) => {
+                        // Verify that column_claims are consistent with GKR output.
+                        // A malicious prover could provide fake column_claims that don't
+                        // match the (n_claim, d_claim) returned by GKR verification.
+                        if !crate::lookup::reconstruct_and_verify_gkr_claims(
+                            &n_claim,
+                            &d_claim,
+                            &gkr_proof.column_claims,
+                            air.bus_interactions(),
+                            &lookup_challenges,
+                        ) {
+                            #[cfg(not(feature = "test_fiat_shamir"))]
+                            error!(
+                                "Table {idx}: GKR column claims verification failed — \
+                                 column_claims are inconsistent with GKR output (n_claim, d_claim)"
+                            );
+                            return false;
+                        }
                     }
                     Err(_e) => {
                         #[cfg(not(feature = "test_fiat_shamir"))]
