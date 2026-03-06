@@ -358,6 +358,10 @@ pub fn gkr_prove<E: IsField>(
             let mut round_polys = Vec::with_capacity(parent_num_vars);
             let mut challenges = Vec::with_capacity(parent_num_vars);
             let mut round_combined_claim = combined_claim.clone();
+            // Eq correction factor: accumulates eq(r_k, c_k) from previous rounds.
+            // Instead of folding eq_table (N/2 multiplications per round), we halve
+            // it (N/2 additions) and track the missing fold factors in this scalar.
+            let mut eq_correction = FieldElement::<E>::one();
 
             for round_idx in 0..parent_num_vars {
                 let half = nl_table.len() / 2;
@@ -365,23 +369,32 @@ pub fn gkr_prove<E: IsField>(
                 // Eq polynomial factoring (Dao-Thaler, ePrint 2024/1210):
                 //
                 // Factor eq(current_point, b) into:
-                //   eq_prefix (scalar from previous rounds) *
+                //   eq_correction (scalar from previous rounds' fold factors) *
                 //   eq_round(r, t) (linear in t, constant across pairs) *
-                //   eq_remaining[j] (per-pair scalar, independent of t)
+                //   eq_table[j] (per-pair scalar, independent of t)
                 //
                 // where r = current_point[round_idx] and
-                //   eq_remaining[j] = eq_table[2j] + eq_table[2j+1]
+                //   eq_table[j] = eq_orig[2j] + eq_orig[2j+1] (pre-halved)
                 //
-                // The inner sum h(t) = Σ_j eq_rem[j] * gate(t, j) is degree 2,
+                // The inner sum h_raw(t) = Σ_j eq_table[j] * gate(t, j) is degree 2,
                 // needing only 2 eval points (t=0, t=2) per pair instead of 3.
-                // Then S(t) = eq_round(r, t) * h(t) recovers the degree-3 round poly.
+                // Then h(t) = eq_correction * h_raw(t), and
+                // S(t) = eq_round(r, t) * h(t) recovers the degree-3 round poly.
                 let r_round = &current_point[round_idx];
                 let one = FieldElement::<E>::one();
 
+                // Pre-halve eq_table: compute eq_rem[j] = eq_table[2j] + eq_table[2j+1]
+                // in-place. This replaces fold (which would multiply each entry by the
+                // challenge) with a simple sum. The fold factor is tracked in eq_correction.
+                for j in 0..half {
+                    eq_table[j] = &eq_table[2 * j] + &eq_table[2 * j + 1];
+                }
+                eq_table.truncate(half);
+
                 let compute_pair_sums =
                     |j: usize| -> [FieldElement<E>; 2] {
-                        // Per-pair eq weight (scalar, independent of t)
-                        let eq_rem = &eq_table[2 * j] + &eq_table[2 * j + 1];
+                        // Pre-halved eq weight (scalar, independent of t)
+                        let eq_rem = &eq_table[j];
 
                         let nl_l = &nl_table[2 * j];
                         let nl_r = &nl_table[2 * j + 1];
@@ -397,7 +410,7 @@ pub fn gkr_prove<E: IsField>(
                         //      = nl*dr + dl*(nr + lambda*dr)   [3 muls instead of 4]
                         let gate_0 =
                             &(nl_l * dr_l) + &(dl_l * &(nr_l + &(&lambda * dr_l)));
-                        let h0 = &eq_rem * &gate_0;
+                        let h0 = eq_rem * &gate_0;
 
                         // t=2: val = 2*right - left
                         let nl_2 = &(nl_r + nl_r) - nl_l;
@@ -406,7 +419,7 @@ pub fn gkr_prove<E: IsField>(
                         let dr_2 = &(dr_r + dr_r) - dr_l;
                         let gate_2 =
                             &(&nl_2 * &dr_2) + &(&dl_2 * &(&nr_2 + &(&lambda * &dr_2)));
-                        let h2 = &eq_rem * &gate_2;
+                        let h2 = eq_rem * &gate_2;
 
                         [h0, h2]
                     };
@@ -433,6 +446,10 @@ pub fn gkr_prove<E: IsField>(
 
                 // Phase 2: Recover S(t) from h(t) and eq_round(r, t).
                 //
+                // The inner sum h_raw(t) doesn't include the eq_correction factor
+                // (accumulated from previous rounds' fold factors). Apply it now:
+                //   h(t) = eq_correction * h_raw(t)
+                //
                 // eq_round(r, t) = (1-r)(1-t) + r*t
                 //   eq_round(r, 0) = 1-r,  eq_round(r, 1) = r,
                 //   eq_round(r, 2) = 3r-1,  eq_round(r, 3) = 5r-2
@@ -440,7 +457,9 @@ pub fn gkr_prove<E: IsField>(
                 // S(0) = (1-r)*h(0), S(1) = round_combined_claim - S(0)
                 // h(1) = S(1)/r, h(3) = 3*h(2) - 3*h(1) + h(0)  (degree-2 extrapolation)
                 // S(2) = (3r-1)*h(2), S(3) = (5r-2)*h(3)
-                let [total_h0, total_h2] = totals;
+                let [raw_h0, raw_h2] = totals;
+                let total_h0 = &eq_correction * &raw_h0;
+                let total_h2 = &eq_correction * &raw_h2;
 
                 let one_minus_r = &one - r_round;
                 let s0 = &one_minus_r * &total_h0;
@@ -476,7 +495,13 @@ pub fn gkr_prove<E: IsField>(
                 // Update round_combined_claim for next round
                 round_combined_claim = round_poly.evaluate(&challenge);
 
-                // Bind all five tables: fold pairs using the challenge
+                // Update eq_correction: accumulate eq(r_round, challenge).
+                // eq(r, c) = r*c + (1-r)*(1-c), the fold factor we skip for eq_table.
+                let eq_update =
+                    &(r_round * &challenge) + &(&one_minus_r * &(&one - &challenge));
+                eq_correction = &eq_correction * &eq_update;
+
+                // Fold the four gate tables (eq_table was already halved before inner loop)
                 // table[j] = table[2j] + challenge * (table[2j+1] - table[2j])
                 let fold_table = |table: &mut Vec<FieldElement<E>>| {
                     for j in 0..half {
@@ -494,22 +519,18 @@ pub fn gkr_prove<E: IsField>(
                         rayon::join(
                             || {
                                 rayon::join(
-                                    || fold_table(&mut eq_table),
                                     || fold_table(&mut nl_table),
+                                    || fold_table(&mut nr_table),
                                 );
                             },
                             || {
                                 rayon::join(
-                                    || fold_table(&mut nr_table),
-                                    || rayon::join(
-                                        || fold_table(&mut dl_table),
-                                        || fold_table(&mut dr_table),
-                                    ),
+                                    || fold_table(&mut dl_table),
+                                    || fold_table(&mut dr_table),
                                 );
                             },
                         );
                     } else {
-                        fold_table(&mut eq_table);
                         fold_table(&mut nl_table);
                         fold_table(&mut nr_table);
                         fold_table(&mut dl_table);
@@ -519,7 +540,6 @@ pub fn gkr_prove<E: IsField>(
 
                 #[cfg(not(feature = "parallel"))]
                 {
-                    fold_table(&mut eq_table);
                     fold_table(&mut nl_table);
                     fold_table(&mut nr_table);
                     fold_table(&mut dl_table);
