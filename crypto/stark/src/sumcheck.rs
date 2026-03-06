@@ -1,3 +1,4 @@
+use core::fmt;
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use math::field::{element::FieldElement, traits::IsField};
 
@@ -206,6 +207,88 @@ pub fn sumcheck_prove<E: IsField>(
     }
 
     (SumcheckProof { round_polys }, challenges)
+}
+
+/// Errors that can occur during sumcheck verification.
+#[derive(Debug, Clone)]
+pub enum SumcheckError {
+    /// The proof contains a different number of round polynomials than expected.
+    WrongNumberOfRounds { expected: usize, got: usize },
+    /// The round polynomial's p(0) + p(1) does not match the expected sum.
+    RoundSumMismatch { round: usize },
+}
+
+impl fmt::Display for SumcheckError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SumcheckError::WrongNumberOfRounds { expected, got } => {
+                write!(
+                    f,
+                    "wrong number of rounds: expected {}, got {}",
+                    expected, got
+                )
+            }
+            SumcheckError::RoundSumMismatch { round } => {
+                write!(f, "round sum mismatch at round {}", round)
+            }
+        }
+    }
+}
+
+/// Verify a sumcheck proof (non-interactive via Fiat-Shamir).
+///
+/// Checks that the prover's round polynomials are consistent with the claimed
+/// sum. The transcript operations must exactly mirror those of `sumcheck_prove`
+/// so that the same challenges are derived.
+///
+/// # Arguments
+/// - `proof`: the sumcheck proof containing one round polynomial per variable
+/// - `claimed_sum`: the asserted sum over the Boolean hypercube
+/// - `num_vars`: number of Boolean variables
+/// - `transcript`: Fiat-Shamir transcript (must have the same seed as the prover's)
+///
+/// # Returns
+/// `Ok((challenges, final_eval))` where `challenges` is the random point and
+/// `final_eval` is the evaluation claim at that point (i.e., the last round
+/// polynomial evaluated at the last challenge).
+pub fn sumcheck_verify<E: IsField>(
+    proof: &SumcheckProof<E>,
+    claimed_sum: &FieldElement<E>,
+    num_vars: usize,
+    transcript: &mut impl IsTranscript<E>,
+) -> Result<(Vec<FieldElement<E>>, FieldElement<E>), SumcheckError> {
+    if proof.round_polys.len() != num_vars {
+        return Err(SumcheckError::WrongNumberOfRounds {
+            expected: num_vars,
+            got: proof.round_polys.len(),
+        });
+    }
+
+    let mut current_sum = claimed_sum.clone();
+    let mut challenges = Vec::with_capacity(num_vars);
+
+    for round in 0..num_vars {
+        // Check that p_r(0) + p_r(1) == current_sum
+        if proof.round_polys[round].sum_at_binary() != current_sum {
+            return Err(SumcheckError::RoundSumMismatch { round });
+        }
+
+        // Append all evaluations of the round polynomial to the transcript
+        // (must match the prover exactly)
+        for eval in proof.round_polys[round].evals() {
+            transcript.append_field_element(eval);
+        }
+
+        // Sample the challenge for this round
+        let challenge: FieldElement<E> = transcript.sample_field_element();
+
+        // Update the running sum: next round's claimed sum is p_r(challenge)
+        current_sum = proof.round_polys[round].evaluate(&challenge);
+
+        challenges.push(challenge);
+    }
+
+    Ok((challenges, current_sum))
 }
 
 #[cfg(test)]
@@ -593,5 +676,138 @@ mod tests {
         let evals = vec![FE::from(1u64), FE::from(2u64), FE::from(3u64)]; // length 3, not a power of 2
         let mut transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
         let _ = sumcheck_prove(&evals, &FE::from(6u64), 2, 1, &mut transcript);
+    }
+
+    // ==================== Sumcheck verifier tests ====================
+
+    #[test]
+    fn test_sumcheck_verify() {
+        // f(x1, x2) = 3*x1 + 5*x2 + 7
+        // Hypercube evaluations (little-endian bit order):
+        //   (0,0)=7, (1,0)=10, (0,1)=12, (1,1)=15
+        let evals = vec![
+            FE::from(7u64),
+            FE::from(10u64),
+            FE::from(12u64),
+            FE::from(15u64),
+        ];
+        let claimed_sum = FE::from(44u64); // 7 + 10 + 12 + 15
+
+        // Prove
+        let mut prover_transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
+        let (proof, prover_challenges) =
+            sumcheck_prove(&evals, &claimed_sum, 2, 1, &mut prover_transcript);
+
+        // Verify with a fresh transcript (same seed)
+        let mut verifier_transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
+        let result = sumcheck_verify(&proof, &claimed_sum, 2, &mut verifier_transcript);
+
+        assert!(result.is_ok(), "Verification should succeed");
+        let (challenges, _final_eval) = result.unwrap();
+
+        // Verifier must derive the same challenges as the prover
+        assert_eq!(challenges, prover_challenges);
+    }
+
+    #[test]
+    fn test_sumcheck_verify_wrong_sum() {
+        // f(x1, x2) = 3*x1 + 5*x2 + 7
+        let evals = vec![
+            FE::from(7u64),
+            FE::from(10u64),
+            FE::from(12u64),
+            FE::from(15u64),
+        ];
+        let claimed_sum = FE::from(44u64);
+
+        // Prove with the correct sum
+        let mut prover_transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
+        let (proof, _) = sumcheck_prove(&evals, &claimed_sum, 2, 1, &mut prover_transcript);
+
+        // Verify with a WRONG claimed sum
+        let wrong_sum = FE::from(99u64);
+        let mut verifier_transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
+        let result = sumcheck_verify(&proof, &wrong_sum, 2, &mut verifier_transcript);
+
+        assert!(result.is_err(), "Verification should fail with wrong sum");
+        match result.unwrap_err() {
+            SumcheckError::RoundSumMismatch { round } => {
+                assert_eq!(round, 0, "Mismatch should be detected at round 0");
+            }
+            other => panic!("Expected RoundSumMismatch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_sumcheck_verify_roundtrip_3var() {
+        // f(x1, x2, x3) = x1 * x2 + x3 + 2
+        // Hypercube evaluations in little-endian bit order:
+        //   index = b0 + 2*b1 + 4*b2, where b0=x1, b1=x2, b2=x3
+        //   (0,0,0)=2, (1,0,0)=2, (0,1,0)=2, (1,1,0)=3, (0,0,1)=3, (1,0,1)=3, (0,1,1)=3, (1,1,1)=4
+        let evals = vec![
+            FE::from(2u64), // f(0,0,0) = 0*0 + 0 + 2 = 2
+            FE::from(2u64), // f(1,0,0) = 1*0 + 0 + 2 = 2
+            FE::from(2u64), // f(0,1,0) = 0*1 + 0 + 2 = 2
+            FE::from(3u64), // f(1,1,0) = 1*1 + 0 + 2 = 3
+            FE::from(3u64), // f(0,0,1) = 0*0 + 1 + 2 = 3
+            FE::from(3u64), // f(1,0,1) = 1*0 + 1 + 2 = 3
+            FE::from(3u64), // f(0,1,1) = 0*1 + 1 + 2 = 3
+            FE::from(4u64), // f(1,1,1) = 1*1 + 1 + 2 = 4
+        ];
+        let claimed_sum: FE = evals.iter().fold(FE::zero(), |acc, v| &acc + v); // = 22
+
+        // Prove
+        let mut prover_transcript = DefaultTranscript::<GoldilocksField>::new(&[0xAB]);
+        let (proof, prover_challenges) =
+            sumcheck_prove(&evals, &claimed_sum, 3, 1, &mut prover_transcript);
+
+        // Verify
+        let mut verifier_transcript = DefaultTranscript::<GoldilocksField>::new(&[0xAB]);
+        let result = sumcheck_verify(&proof, &claimed_sum, 3, &mut verifier_transcript);
+
+        assert!(result.is_ok(), "3-var verification should succeed");
+        let (challenges, _final_eval) = result.unwrap();
+        assert_eq!(challenges.len(), 3);
+        assert_eq!(challenges, prover_challenges);
+    }
+
+    #[test]
+    fn test_sumcheck_verify_final_eval() {
+        // Verify that final_eval matches the MLE evaluated at the challenge point.
+        // f(x1, x2) = 3*x1 + 5*x2 + 7
+        let evals = vec![
+            FE::from(7u64),
+            FE::from(10u64),
+            FE::from(12u64),
+            FE::from(15u64),
+        ];
+        let claimed_sum = FE::from(44u64);
+
+        // Prove
+        let mut prover_transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
+        let (proof, _) = sumcheck_prove(&evals, &claimed_sum, 2, 1, &mut prover_transcript);
+
+        // Verify
+        let mut verifier_transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
+        let (challenges, final_eval) =
+            sumcheck_verify(&proof, &claimed_sum, 2, &mut verifier_transcript).unwrap();
+
+        // Compute MLE at the challenge point manually:
+        // f(r1, r2) = f(0,0)*(1-r1)*(1-r2) + f(1,0)*r1*(1-r2)
+        //           + f(0,1)*(1-r1)*r2     + f(1,1)*r1*r2
+        let r1 = &challenges[0];
+        let r2 = &challenges[1];
+        let one = FE::one();
+        let one_minus_r1 = &one - r1;
+        let one_minus_r2 = &one - r2;
+        let mle_at_r = &(&(&evals[0] * &one_minus_r1) * &one_minus_r2)
+            + &(&(&evals[1] * r1) * &one_minus_r2)
+            + &(&(&evals[2] * &one_minus_r1) * r2)
+            + &(&(&evals[3] * r1) * r2);
+
+        assert_eq!(
+            final_eval, mle_at_r,
+            "final_eval from verifier must match MLE evaluated at challenge point"
+        );
     }
 }
