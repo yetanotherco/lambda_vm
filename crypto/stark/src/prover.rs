@@ -1571,16 +1571,29 @@ pub trait IsStarkProver<
                         );
                     let main_cols = trace.columns_main();
 
+                    // Pre-compute batched values in parallel: batched[i] = Σ_j main_cols[col_j][i] * γ^j
+                    #[cfg(feature = "parallel")]
+                    let batched_iter = (0..trace_len).into_par_iter();
+                    #[cfg(not(feature = "parallel"))]
+                    let batched_iter = 0..trace_len;
+
+                    let column_claims = &result.column_claims;
+                    let batched_values: Vec<FieldElement<FieldExtension>> = batched_iter
+                        .map(|row| {
+                            let mut batched = FieldElement::<FieldExtension>::zero();
+                            for (j, (col_idx, _)) in column_claims.iter().enumerate() {
+                                batched = batched + &main_cols[*col_idx][row] * &gamma_powers[j];
+                            }
+                            batched
+                        })
+                        .collect();
+
                     // Set σ[0] = 0, then build forward: σ[i+1] = σ[i] + l[i]*batched[i] - Δ
                     trace.set_aux(0, 1, FieldElement::<FieldExtension>::zero());
                     let mut sigma = FieldElement::<FieldExtension>::zero();
                     for row in 0..trace_len - 1 {
-                        let mut batched = FieldElement::<FieldExtension>::zero();
-                        for (j, (col_idx, _)) in result.column_claims.iter().enumerate() {
-                            batched = batched + &main_cols[*col_idx][row] * &gamma_powers[j];
-                        }
                         let l_val = trace.get_aux(row, 0);
-                        sigma = sigma + l_val * &batched - &bridge_offset;
+                        sigma = sigma + l_val * &batched_values[row] - &bridge_offset;
                         trace.set_aux(row + 1, 1, sigma.clone());
                     }
                 }
