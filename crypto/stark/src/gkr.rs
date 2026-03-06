@@ -183,6 +183,7 @@ pub fn compute_eq_evals<E: IsField>(point: &[FieldElement<E>]) -> Vec<FieldEleme
 ///   MLE(point) = sum_{b in {0,1}^n} table[b] * eq(point, b)
 ///
 /// This is equivalent to multilinear interpolation of the table at the point.
+#[cfg(test)]
 fn evaluate_mle<E: IsField>(
     table: &[FieldElement<E>],
     point: &[FieldElement<E>],
