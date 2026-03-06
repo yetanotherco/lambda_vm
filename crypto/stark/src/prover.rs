@@ -1542,8 +1542,7 @@ pub trait IsStarkProver<
         {
             if air.has_trace_interaction() {
                 if let Some(result) = gkr_result {
-                    let kernel =
-                        crate::lagrange_kernel::compute_lagrange_kernel(&result.random_point);
+                    let kernel = &result.lagrange_kernel;
                     let trace_len = trace.num_rows();
 
                     // Allocate aux table (2 columns: l + σ)
@@ -1553,8 +1552,8 @@ pub trait IsStarkProver<
                     }
 
                     // Column 0: Lagrange kernel
-                    for (row, val) in kernel.into_iter().enumerate() {
-                        trace.set_aux(row, 0, val);
+                    for (row, val) in kernel.iter().enumerate() {
+                        trace.set_aux(row, 0, val.clone());
                     }
 
                     // Column 1: Bridge running sum σ

@@ -136,6 +136,52 @@ where
     result
 }
 
+/// Evaluate the MLE of base-field `values` at an extension-field point, using a pre-computed
+/// Lagrange kernel.
+///
+/// This avoids recomputing `compute_lagrange_kernel(r)` when evaluating multiple columns
+/// at the same point `r`.
+///
+/// Panics if `values.len() != kernel.len()`.
+pub fn eval_mle_base_with_kernel<F, E>(
+    values: &[FieldElement<F>],
+    kernel: &[FieldElement<E>],
+) -> FieldElement<E>
+where
+    F: IsField + IsSubFieldOf<E>,
+    E: IsField + Send + Sync,
+    FieldElement<F>: Send + Sync,
+{
+    let big_n = values.len();
+    assert_eq!(
+        big_n,
+        kernel.len(),
+        "values length ({}) must equal kernel length ({})",
+        big_n,
+        kernel.len()
+    );
+
+    #[cfg(feature = "parallel")]
+    {
+        if big_n >= 1024 {
+            return (0..big_n)
+                .into_par_iter()
+                .fold(
+                    || FieldElement::<E>::zero(),
+                    |acc, i| acc + &values[i] * &kernel[i],
+                )
+                .reduce(|| FieldElement::<E>::zero(), |a, b| a + b);
+        }
+    }
+
+    // Sequential fallback
+    let mut result = FieldElement::<E>::zero();
+    for i in 0..big_n {
+        result = &result + &(&values[i] * &kernel[i]);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

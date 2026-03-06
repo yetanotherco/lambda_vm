@@ -2,6 +2,9 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
@@ -1300,7 +1303,7 @@ where
 ///
 /// These are the columns referenced by `column_claims` in the GKR result.
 /// The order must be consistent between the trace builder and the constraint evaluator.
-fn extract_column_indices(interactions: &[BusInteraction]) -> Vec<usize> {
+pub(crate) fn extract_column_indices(interactions: &[BusInteraction]) -> Vec<usize> {
     let mut seen_cols = std::collections::HashSet::new();
     for inter in interactions {
         for val in &inter.values {
@@ -1500,90 +1503,75 @@ where
 // LogUp-GKR Leaf Fraction Computation
 // =============================================================================
 
-/// Computes multiplicities for a single interaction across all rows.
-///
-/// Returns a vector of `FieldElement<F>` with length `trace_len`.
-fn compute_multiplicities_for_interaction<F: IsField + IsPrimeField>(
+/// Computes the multiplicity for a single interaction at a single row.
+#[inline]
+fn compute_multiplicity_at_row<F: IsField + IsPrimeField>(
     interaction: &BusInteraction,
     main_segment_cols: &[Vec<FieldElement<F>>],
-    trace_len: usize,
-) -> Vec<FieldElement<F>> {
+    row: usize,
+) -> FieldElement<F> {
     match &interaction.multiplicity {
-        Multiplicity::One => vec![FieldElement::one(); trace_len],
-        Multiplicity::Column(col) => main_segment_cols[*col].clone(),
-        Multiplicity::Sum(col_a, col_b) => main_segment_cols[*col_a]
-            .iter()
-            .zip(main_segment_cols[*col_b].iter())
-            .map(|(a, b)| a + b)
-            .collect(),
-        Multiplicity::Negated(col) => main_segment_cols[*col]
-            .iter()
-            .map(|elem| FieldElement::<F>::one() - elem)
-            .collect(),
-        Multiplicity::Linear(terms) => (0..trace_len)
-            .map(|row| {
-                let mut result = FieldElement::<F>::zero();
-                for term in terms {
-                    match *term {
-                        LinearTerm::Column {
-                            coefficient,
-                            column,
-                        } => {
-                            let coeff = FieldElement::<F>::from(coefficient);
-                            result += &main_segment_cols[column][row] * coeff;
-                        }
-                        LinearTerm::ColumnUnsigned {
-                            coefficient,
-                            column,
-                        } => {
-                            let coeff = FieldElement::<F>::from(coefficient);
-                            result += &main_segment_cols[column][row] * coeff;
-                        }
-                        LinearTerm::Constant(value) => {
-                            result += FieldElement::<F>::from(value);
-                        }
+        Multiplicity::One => FieldElement::one(),
+        Multiplicity::Column(col) => main_segment_cols[*col][row].clone(),
+        Multiplicity::Sum(col_a, col_b) => {
+            &main_segment_cols[*col_a][row] + &main_segment_cols[*col_b][row]
+        }
+        Multiplicity::Negated(col) => FieldElement::<F>::one() - &main_segment_cols[*col][row],
+        Multiplicity::Linear(terms) => {
+            let mut result = FieldElement::<F>::zero();
+            for term in terms {
+                match *term {
+                    LinearTerm::Column {
+                        coefficient,
+                        column,
+                    } => {
+                        let coeff = FieldElement::<F>::from(coefficient);
+                        result += &main_segment_cols[column][row] * coeff;
+                    }
+                    LinearTerm::ColumnUnsigned {
+                        coefficient,
+                        column,
+                    } => {
+                        let coeff = FieldElement::<F>::from(coefficient);
+                        result += &main_segment_cols[column][row] * coeff;
+                    }
+                    LinearTerm::Constant(value) => {
+                        result += FieldElement::<F>::from(value);
                     }
                 }
-                result
-            })
-            .collect(),
+            }
+            result
+        }
     }
 }
 
-/// Computes fingerprints for a single interaction across all rows.
-///
-/// Each fingerprint is: `z - (bus_id * α^0 + Σ values * α^{1+...})`
-///
-/// Returns a vector of `FieldElement<E>` with length `trace_len`.
-fn compute_fingerprints_for_interaction<F, E>(
+/// Computes the fingerprint for a single interaction at a single row.
+#[inline]
+fn compute_fingerprint_at_row<F, E>(
     interaction: &BusInteraction,
     main_segment_cols: &[Vec<FieldElement<F>>],
-    trace_len: usize,
+    row: usize,
     z: &FieldElement<E>,
     alpha_powers: &[FieldElement<E>],
-) -> Vec<FieldElement<E>>
+) -> FieldElement<E>
 where
     F: IsField + IsSubFieldOf<E> + IsPrimeField,
     E: IsField,
 {
     let bus_id_f = FieldElement::<F>::from(interaction.bus_id);
-    let mut fingerprints = Vec::with_capacity(trace_len);
-    for row in 0..trace_len {
-        let mut linear_combination = &bus_id_f * &alpha_powers[0];
-        let mut alpha_offset = 1;
-        for bv in &interaction.values {
-            let consumed = bv.accumulate_fingerprint(
-                main_segment_cols,
-                row,
-                alpha_powers,
-                alpha_offset,
-                &mut linear_combination,
-            );
-            alpha_offset += consumed;
-        }
-        fingerprints.push(z - &linear_combination);
+    let mut linear_combination = &bus_id_f * &alpha_powers[0];
+    let mut alpha_offset = 1;
+    for bv in &interaction.values {
+        let consumed = bv.accumulate_fingerprint(
+            main_segment_cols,
+            row,
+            alpha_powers,
+            alpha_offset,
+            &mut linear_combination,
+        );
+        alpha_offset += consumed;
     }
-    fingerprints
+    z - &linear_combination
 }
 
 /// Computes the leaf fractions for the GKR summation tree from a table's bus
@@ -1633,19 +1621,7 @@ where
         .unwrap();
     let alpha_powers = compute_alpha_powers(alpha, max_bus_elements);
 
-    // Precompute fingerprints and multiplicities for all interactions
-    let all_fingerprints: Vec<Vec<FieldElement<E>>> = interactions
-        .iter()
-        .map(|inter| {
-            compute_fingerprints_for_interaction(inter, main_segment_cols, trace_len, z, &alpha_powers)
-        })
-        .collect();
-
-    let all_multiplicities: Vec<Vec<FieldElement<F>>> = interactions
-        .iter()
-        .map(|inter| compute_multiplicities_for_interaction(inter, main_segment_cols, trace_len))
-        .collect();
-
+    // Precompute signs (cheap, interaction-count dependent)
     let all_signs: Vec<FieldElement<E>> = interactions
         .iter()
         .map(|inter| {
@@ -1657,32 +1633,33 @@ where
         })
         .collect();
 
-    // For each row, combine all interactions into a single fraction using
-    // iterative cross-multiplication.
-    let mut numerators = Vec::with_capacity(trace_len);
-    let mut denominators = Vec::with_capacity(trace_len);
+    // Fused parallel computation: for each row, compute fingerprints, multiplicities,
+    // and cross-multiply all interactions in a single pass.
+    #[cfg(feature = "parallel")]
+    let iter = (0..trace_len).into_par_iter();
+    #[cfg(not(feature = "parallel"))]
+    let iter = 0..trace_len;
 
-    for row in 0..trace_len {
-        // Start with fraction 0/1
-        let mut running_n = FieldElement::<E>::zero();
-        let mut running_d = FieldElement::<E>::one();
+    let (numerators, denominators): (Vec<_>, Vec<_>) = iter
+        .map(|row| {
+            let mut running_n = FieldElement::<E>::zero();
+            let mut running_d = FieldElement::<E>::one();
 
-        for k in 0..interactions.len() {
-            let fp_k = &all_fingerprints[k][row];
-            let m_k = &all_multiplicities[k][row];
+            for (k, inter) in interactions.iter().enumerate() {
+                let fp_k = compute_fingerprint_at_row(inter, main_segment_cols, row, z, &alpha_powers);
+                let m_k = compute_multiplicity_at_row(inter, main_segment_cols, row);
 
-            // running_n = running_n * fp_k + sign_k * m_k * running_d
-            // running_d = running_d * fp_k
-            let new_n = &running_n * fp_k + m_k * &all_signs[k] * &running_d;
-            let new_d = &running_d * fp_k;
+                // F * E -> E multiplication (no to_extension)
+                let new_n = &running_n * &fp_k + &m_k * &all_signs[k] * &running_d;
+                let new_d = &running_d * &fp_k;
 
-            running_n = new_n;
-            running_d = new_d;
-        }
+                running_n = new_n;
+                running_d = new_d;
+            }
 
-        numerators.push(running_n);
-        denominators.push(running_d);
-    }
+            (running_n, running_d)
+        })
+        .unzip();
 
     (numerators, denominators)
 }
@@ -1692,7 +1669,7 @@ where
 // =============================================================================
 
 use crate::gkr::{build_summation_tree, gkr_prove, GkrProof};
-use crate::lagrange_kernel::eval_mle_base;
+use crate::lagrange_kernel::{compute_lagrange_kernel, eval_mle_base_with_kernel};
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 
 /// Result of running the LogUp-GKR sub-protocol for a single table.
@@ -1714,6 +1691,8 @@ pub struct LogUpGkrResult<E: IsField> {
     /// MLE claims for each distinct main trace column used in bus interactions.
     /// Each entry is (column_index, MLE evaluation at random_point).
     pub column_claims: Vec<(usize, FieldElement<E>)>,
+    /// Pre-computed Lagrange kernel at `random_point`, for reuse in aux trace construction.
+    pub lagrange_kernel: Vec<FieldElement<E>>,
 }
 
 /// Verifies that column_claims are consistent with the GKR output (n_claim, d_claim).
@@ -2096,10 +2075,17 @@ where
     let mut col_indices: Vec<usize> = seen_cols.into_iter().collect();
     col_indices.sort_unstable();
 
-    let column_claims: Vec<(usize, FieldElement<E>)> = col_indices
-        .into_iter()
+    // Compute kernel once and reuse for all column claims (and later for aux trace)
+    let kernel = compute_lagrange_kernel(&random_point);
+
+    #[cfg(feature = "parallel")]
+    let col_iter = col_indices.into_par_iter();
+    #[cfg(not(feature = "parallel"))]
+    let col_iter = col_indices.into_iter();
+
+    let column_claims: Vec<(usize, FieldElement<E>)> = col_iter
         .map(|col_idx| {
-            let claim = eval_mle_base(&main_segment_cols[col_idx], &random_point);
+            let claim = eval_mle_base_with_kernel(&main_segment_cols[col_idx], &kernel);
             (col_idx, claim)
         })
         .collect();
@@ -2111,6 +2097,7 @@ where
         n_claim,
         d_claim,
         column_claims,
+        lagrange_kernel: kernel,
     }
 }
 

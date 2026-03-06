@@ -9,7 +9,7 @@ use super::{
 use crate::{
     config::Commitment,
     domain::new_verifier_domain,
-    lookup::{LOGUP_NUM_CHALLENGES, extend_rap_challenges_with_bridge},
+    lookup::{LOGUP_NUM_CHALLENGES, extend_rap_challenges_with_bridge, extract_column_indices},
     proof::stark::{DeepPolynomialOpening, MultiProof},
 };
 use crypto::{fiat_shamir::is_transcript::IsStarkTranscript, merkle_tree::proof::Proof};
@@ -776,6 +776,18 @@ pub trait IsStarkVerifier<
                 // Replay GKR verification on the main transcript
                 match crate::gkr::gkr_verify(&gkr_proof.gkr_proof, transcript) {
                     Ok((_random_point, n_claim, d_claim)) => {
+                        // Validate column_claims length matches AIR-expected column set
+                        let expected_cols = extract_column_indices(air.bus_interactions());
+                        if gkr_proof.column_claims.len() != expected_cols.len() {
+                            #[cfg(not(feature = "test_fiat_shamir"))]
+                            error!(
+                                "Table {idx}: column_claims length mismatch: got {}, expected {}",
+                                gkr_proof.column_claims.len(),
+                                expected_cols.len()
+                            );
+                            return false;
+                        }
+
                         // Verify that column_claims are consistent with GKR output.
                         // A malicious prover could provide fake column_claims that don't
                         // match the (n_claim, d_claim) returned by GKR verification.
