@@ -2,6 +2,8 @@ use crate::sumcheck::{RoundPoly, SumcheckProof};
 use core::fmt;
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use math::field::{element::FieldElement, traits::IsField};
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
 /// A rational number `numerator / denominator` in a field.
 ///
@@ -86,10 +88,7 @@ pub fn build_summation_tree<E: IsField>(
         let prev_len = prev.numerators.len();
         let new_len = prev_len / 2;
 
-        let mut numerators = Vec::with_capacity(new_len);
-        let mut denominators = Vec::with_capacity(new_len);
-
-        for i in 0..new_len {
+        let compute_pair = |i: usize| -> (FieldElement<E>, FieldElement<E>) {
             let left_n = &prev.numerators[2 * i];
             let left_d = &prev.denominators[2 * i];
             let right_n = &prev.numerators[2 * i + 1];
@@ -98,10 +97,19 @@ pub fn build_summation_tree<E: IsField>(
             // Cross-multiply: (left_n * right_d + right_n * left_d) / (left_d * right_d)
             let parent_n = &(left_n * right_d) + &(right_n * left_d);
             let parent_d = left_d * right_d;
+            (parent_n, parent_d)
+        };
 
-            numerators.push(parent_n);
-            denominators.push(parent_d);
-        }
+        #[cfg(feature = "parallel")]
+        let (numerators, denominators): (Vec<_>, Vec<_>) = if new_len >= 256 {
+            (0..new_len).into_par_iter().map(compute_pair).unzip()
+        } else {
+            (0..new_len).map(compute_pair).unzip()
+        };
+
+        #[cfg(not(feature = "parallel"))]
+        let (numerators, denominators): (Vec<_>, Vec<_>) =
+            (0..new_len).map(compute_pair).unzip();
 
         layers.push(SummationLayer {
             numerators,
