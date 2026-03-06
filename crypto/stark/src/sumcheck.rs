@@ -1,3 +1,4 @@
+use crypto::fiat_shamir::is_transcript::IsTranscript;
 use math::field::{element::FieldElement, traits::IsField};
 
 /// A degree-d univariate polynomial represented by its evaluations at the
@@ -117,9 +118,100 @@ impl<E: IsField> RoundPoly<E> {
     }
 }
 
+/// Proof produced by the sumcheck prover: one round polynomial per variable.
+pub struct SumcheckProof<E: IsField> {
+    pub round_polys: Vec<RoundPoly<E>>,
+}
+
+/// Run the sumcheck interactive proof (made non-interactive via Fiat-Shamir).
+///
+/// Proves that `claimed_sum == sum_{x in {0,1}^num_vars} f(x)` where `evals`
+/// holds the evaluations of f over the Boolean hypercube in little-endian bit
+/// order (index = b_0 + 2*b_1 + ...).
+///
+/// # Arguments
+/// - `evals`: evaluations of f over {0,1}^num_vars, length must be 2^num_vars
+/// - `claimed_sum`: the asserted sum
+/// - `num_vars`: number of Boolean variables
+/// - `max_degree`: maximum degree of round polynomials (need max_degree+1 evaluation points)
+/// - `transcript`: Fiat-Shamir transcript for deterministic challenge sampling
+///
+/// # Returns
+/// `(proof, challenges)` where `proof` contains one round polynomial per variable
+/// and `challenges` is the vector of random points sampled during the protocol.
+pub fn sumcheck_prove<E: IsField>(
+    evals: &[FieldElement<E>],
+    _claimed_sum: &FieldElement<E>,
+    num_vars: usize,
+    max_degree: usize,
+    transcript: &mut impl IsTranscript<E>,
+) -> (SumcheckProof<E>, Vec<FieldElement<E>>) {
+    assert_eq!(
+        evals.len(),
+        1 << num_vars,
+        "evals length must be 2^num_vars"
+    );
+    assert!(
+        max_degree >= 1,
+        "max_degree must be at least 1 for a meaningful sumcheck"
+    );
+
+    let mut table = evals.to_vec();
+    let mut round_polys = Vec::with_capacity(num_vars);
+    let mut challenges = Vec::with_capacity(num_vars);
+
+    for _round in 0..num_vars {
+        let half = table.len() / 2;
+
+        // Evaluate the round polynomial at t = 0, 1, ..., max_degree.
+        // The bookkeeping table pairs are (table[2j], table[2j+1]) which
+        // represent f(..., x_r=0, ...) and f(..., x_r=1, ...) respectively.
+        // The multilinear interpolation at point t is:
+        //   table[2j] * (1 - t) + table[2j+1] * t
+        let mut poly_evals = Vec::with_capacity(max_degree + 1);
+
+        for t in 0..=max_degree {
+            let t_fe = FieldElement::<E>::from(t as u64);
+            let one_minus_t = &FieldElement::<E>::one() - &t_fe;
+            let mut sum = FieldElement::<E>::zero();
+            for j in 0..half {
+                // Linear interpolation: table[2j]*(1-t) + table[2j+1]*t
+                let contrib = &(&table[2 * j] * &one_minus_t) + &(&table[2 * j + 1] * &t_fe);
+                sum = &sum + &contrib;
+            }
+            poly_evals.push(sum);
+        }
+
+        let round_poly = RoundPoly::new(poly_evals);
+
+        // Append all evaluations of the round polynomial to the transcript
+        for eval in round_poly.evals() {
+            transcript.append_field_element(eval);
+        }
+
+        // Sample the challenge for this round
+        let challenge: FieldElement<E> = transcript.sample_field_element();
+
+        // Bind the table: fold using the challenge
+        // table[j] = table[2j] * (1 - challenge) + table[2j+1] * challenge
+        let one_minus_challenge = &FieldElement::<E>::one() - &challenge;
+        for j in 0..half {
+            table[j] =
+                &(&table[2 * j] * &one_minus_challenge) + &(&table[2 * j + 1] * &challenge);
+        }
+        table.truncate(half);
+
+        round_polys.push(round_poly);
+        challenges.push(challenge);
+    }
+
+    (SumcheckProof { round_polys }, challenges)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
     use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
 
     // Use the base Goldilocks field for tests. The cubic extension would work
@@ -310,5 +402,196 @@ mod tests {
                 x
             );
         }
+    }
+
+    // ==================== Sumcheck prover tests ====================
+
+    #[test]
+    fn test_sumcheck_prove_2var_linear() {
+        // f(x1, x2) = 3*x1 + 5*x2 + 7
+        // Hypercube evaluations in little-endian bit order:
+        //   index 0 = (x1=0, x2=0): f = 7
+        //   index 1 = (x1=1, x2=0): f = 10
+        //   index 2 = (x1=0, x2=1): f = 12
+        //   index 3 = (x1=1, x2=1): f = 15
+        let evals = vec![
+            FE::from(7u64),
+            FE::from(10u64),
+            FE::from(12u64),
+            FE::from(15u64),
+        ];
+        let claimed_sum = FE::from(44u64); // 7 + 10 + 12 + 15
+
+        let mut transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
+        let (proof, challenges) = sumcheck_prove(&evals, &claimed_sum, 2, 1, &mut transcript);
+
+        // Should have 2 round polynomials (one per variable)
+        assert_eq!(proof.round_polys.len(), 2);
+        assert_eq!(challenges.len(), 2);
+
+        // First round poly: sum over x2 of f(x1, x2)
+        //   p1(0) = f(0,0) + f(0,1) = 7 + 12 = 19
+        //   p1(1) = f(1,0) + f(1,1) = 10 + 15 = 25
+        //   p1(0) + p1(1) = 19 + 25 = 44 = claimed_sum
+        assert_eq!(proof.round_polys[0].sum_at_binary(), claimed_sum);
+        assert_eq!(proof.round_polys[0].evals()[0], FE::from(19u64));
+        assert_eq!(proof.round_polys[0].evals()[1], FE::from(25u64));
+
+        // Each round poly should have max_degree+1 = 2 evaluations
+        assert_eq!(proof.round_polys[0].num_evals(), 2);
+        assert_eq!(proof.round_polys[1].num_evals(), 2);
+
+        // Second round: the claimed sum for round 2 is p1(r1) where r1 = challenges[0].
+        // Verify that p2(0) + p2(1) = p1(r1).
+        let r1_eval = proof.round_polys[0].evaluate(&challenges[0]);
+        assert_eq!(proof.round_polys[1].sum_at_binary(), r1_eval);
+    }
+
+    #[test]
+    fn test_sumcheck_prove_1var() {
+        // f(x) = 2x + 3 => f(0) = 3, f(1) = 5
+        // Sum = 3 + 5 = 8
+        let evals = vec![FE::from(3u64), FE::from(5u64)];
+        let claimed_sum = FE::from(8u64);
+
+        let mut transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
+        let (proof, challenges) = sumcheck_prove(&evals, &claimed_sum, 1, 1, &mut transcript);
+
+        assert_eq!(proof.round_polys.len(), 1);
+        assert_eq!(challenges.len(), 1);
+        assert_eq!(proof.round_polys[0].sum_at_binary(), claimed_sum);
+        assert_eq!(proof.round_polys[0].evals()[0], FE::from(3u64));
+        assert_eq!(proof.round_polys[0].evals()[1], FE::from(5u64));
+    }
+
+    #[test]
+    fn test_sumcheck_prove_3var_constant() {
+        // f(x1, x2, x3) = 1 for all inputs
+        // Sum = 8 (2^3 points, each contributing 1)
+        let evals = vec![FE::one(); 8];
+        let claimed_sum = FE::from(8u64);
+
+        let mut transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
+        let (proof, challenges) = sumcheck_prove(&evals, &claimed_sum, 3, 1, &mut transcript);
+
+        assert_eq!(proof.round_polys.len(), 3);
+
+        // First round: p(0) = 4, p(1) = 4, sum = 8
+        assert_eq!(proof.round_polys[0].sum_at_binary(), claimed_sum);
+        assert_eq!(proof.round_polys[0].evals()[0], FE::from(4u64));
+        assert_eq!(proof.round_polys[0].evals()[1], FE::from(4u64));
+
+        // Each subsequent round's sum should match the previous round's evaluation at challenge
+        for r in 1..3 {
+            let prev_eval = proof.round_polys[r - 1].evaluate(&challenges[r - 1]);
+            assert_eq!(proof.round_polys[r].sum_at_binary(), prev_eval);
+        }
+    }
+
+    #[test]
+    fn test_sumcheck_prove_higher_degree() {
+        // Test with max_degree = 3 (4 evaluation points per round poly).
+        // For a multilinear f, higher-degree evaluations are determined by
+        // the degree-1 interpolation, so they are just linear extrapolation.
+        let evals = vec![
+            FE::from(7u64),
+            FE::from(10u64),
+            FE::from(12u64),
+            FE::from(15u64),
+        ];
+        let claimed_sum = FE::from(44u64);
+
+        let mut transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
+        let (proof, challenges) = sumcheck_prove(&evals, &claimed_sum, 2, 3, &mut transcript);
+
+        assert_eq!(proof.round_polys.len(), 2);
+
+        // Each round poly should have max_degree+1 = 4 evaluations
+        assert_eq!(proof.round_polys[0].num_evals(), 4);
+        assert_eq!(proof.round_polys[1].num_evals(), 4);
+
+        // p(0) + p(1) must still equal claimed sum
+        assert_eq!(proof.round_polys[0].sum_at_binary(), claimed_sum);
+
+        // Since the underlying function is multilinear, the round poly is degree 1.
+        // Verify that evaluations at t=2 and t=3 are consistent with linear interpolation.
+        let p0 = &proof.round_polys[0].evals()[0];
+        let p1 = &proof.round_polys[0].evals()[1];
+        // p(t) = p0*(1-t) + p1*t = p0 + (p1 - p0)*t
+        let slope = p1 - p0;
+        let p2_expected = p0 + &(&slope * &FE::from(2u64));
+        let p3_expected = p0 + &(&slope * &FE::from(3u64));
+        assert_eq!(proof.round_polys[0].evals()[2], p2_expected);
+        assert_eq!(proof.round_polys[0].evals()[3], p3_expected);
+
+        // Consistency between rounds
+        for r in 1..2 {
+            let prev_eval = proof.round_polys[r - 1].evaluate(&challenges[r - 1]);
+            assert_eq!(proof.round_polys[r].sum_at_binary(), prev_eval);
+        }
+    }
+
+    #[test]
+    fn test_sumcheck_prove_deterministic() {
+        // Same inputs and transcript seed should produce identical proofs
+        let evals = vec![
+            FE::from(7u64),
+            FE::from(10u64),
+            FE::from(12u64),
+            FE::from(15u64),
+        ];
+        let claimed_sum = FE::from(44u64);
+
+        let mut t1 = DefaultTranscript::<GoldilocksField>::new(&[0x42]);
+        let (proof1, challenges1) = sumcheck_prove(&evals, &claimed_sum, 2, 1, &mut t1);
+
+        let mut t2 = DefaultTranscript::<GoldilocksField>::new(&[0x42]);
+        let (proof2, challenges2) = sumcheck_prove(&evals, &claimed_sum, 2, 1, &mut t2);
+
+        assert_eq!(challenges1, challenges2);
+        for (rp1, rp2) in proof1.round_polys.iter().zip(proof2.round_polys.iter()) {
+            assert_eq!(rp1.evals(), rp2.evals());
+        }
+    }
+
+    #[test]
+    fn test_sumcheck_prove_final_value() {
+        // After all rounds, the table should contain a single element which is
+        // f evaluated at the random challenge point. We verify by checking that
+        // the last round poly evaluated at the last challenge gives this value.
+        let evals = vec![
+            FE::from(7u64),
+            FE::from(10u64),
+            FE::from(12u64),
+            FE::from(15u64),
+        ];
+        let claimed_sum = FE::from(44u64);
+
+        let mut transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
+        let (proof, challenges) = sumcheck_prove(&evals, &claimed_sum, 2, 1, &mut transcript);
+
+        // Manually compute f(r1, r2) by multilinear evaluation
+        let r1 = &challenges[0];
+        let r2 = &challenges[1];
+        // f(r1, r2) = f(0,0)*(1-r1)*(1-r2) + f(1,0)*r1*(1-r2) + f(0,1)*(1-r1)*r2 + f(1,1)*r1*r2
+        let one = FE::one();
+        let one_minus_r1 = &one - r1;
+        let one_minus_r2 = &one - r2;
+        let f_at_r = &(&(&evals[0] * &one_minus_r1) * &one_minus_r2)
+            + &(&(&evals[1] * r1) * &one_minus_r2)
+            + &(&(&evals[2] * &one_minus_r1) * r2)
+            + &(&(&evals[3] * r1) * r2);
+
+        // The last round poly evaluated at the last challenge should give f(r1, r2)
+        let last_round_eval = proof.round_polys[1].evaluate(&challenges[1]);
+        assert_eq!(last_round_eval, f_at_r);
+    }
+
+    #[test]
+    #[should_panic(expected = "evals length must be 2^num_vars")]
+    fn test_sumcheck_prove_wrong_length_panics() {
+        let evals = vec![FE::from(1u64), FE::from(2u64), FE::from(3u64)]; // length 3, not a power of 2
+        let mut transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
+        let _ = sumcheck_prove(&evals, &FE::from(6u64), 2, 1, &mut transcript);
     }
 }
