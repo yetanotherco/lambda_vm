@@ -795,6 +795,8 @@ pub trait IsStarkProver<
         round_1_result: &Round1<Field, FieldExtension>,
         transition_coefficients: &[FieldElement<FieldExtension>],
         boundary_coefficients: &[FieldElement<FieldExtension>],
+        bridge_claims: &[(usize, FieldElement<FieldExtension>)],
+        bridge_coefficients: &[FieldElement<FieldExtension>],
     ) -> Result<Round2<FieldExtension>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
@@ -809,7 +811,7 @@ pub trait IsStarkProver<
             round_1_result.bus_public_inputs.as_ref(),
             trace_length,
         );
-        let constraint_evaluations = evaluator.evaluate(
+        let mut constraint_evaluations = evaluator.evaluate(
             air,
             &round_1_result.lde_trace,
             domain,
@@ -817,6 +819,19 @@ pub trait IsStarkProver<
             boundary_coefficients,
             &round_1_result.rap_challenges,
         );
+
+        // Add bridge quotient terms for LogUp-GKR column claims.
+        // For each claim (col_idx, c): bridge(X) = [col(X)*s(X)*N - c] / (X^N - 1)
+        // where s is the Lagrange kernel (aux column 0).
+        if !bridge_claims.is_empty() {
+            Self::add_bridge_quotients(
+                &mut constraint_evaluations,
+                &round_1_result.lde_trace,
+                domain,
+                bridge_claims,
+                bridge_coefficients,
+            );
+        }
 
         let number_of_parts = air.composition_poly_degree_bound(trace_length) / trace_length;
 
@@ -861,6 +876,76 @@ pub trait IsStarkProver<
             composition_poly_merkle_tree,
             composition_poly_root,
         })
+    }
+
+    /// Adds bridge quotient evaluations to the constraint evaluations vector.
+    ///
+    /// For each GKR column claim (col_idx, c), computes:
+    ///   bridge(X) = [col(X) * s(X) * N - c] / (X^N - 1)
+    /// on the LDE domain, weighted by the corresponding beta coefficient.
+    ///
+    /// Bridge quotients are degree < N (numerator < 2N, denominator = N),
+    /// fitting within the existing composition polynomial framework.
+    fn add_bridge_quotients(
+        constraint_evaluations: &mut [FieldElement<FieldExtension>],
+        lde_trace: &LDETraceTable<Field, FieldExtension>,
+        domain: &Domain<Field>,
+        bridge_claims: &[(usize, FieldElement<FieldExtension>)],
+        bridge_coefficients: &[FieldElement<FieldExtension>],
+    ) {
+        let trace_length = domain.interpolation_domain_size;
+        let blowup = domain.blowup_factor;
+        let n_fe = FieldElement::<FieldExtension>::from(trace_length as u64);
+
+        // Precompute (X^N - 1)^{-1} on the LDE domain.
+        // On the coset {g·ω_lde^i}: (g·ω_lde^i)^N = g^N · ρ^i where ρ = ω_lde^N
+        // has order B (blowup factor). So vanishing[i] = g^N·ρ^i - 1 is periodic
+        // with period B. Compute B values and tile.
+        let g_n = domain.coset_offset.pow(trace_length);
+        let rho = Field::get_primitive_root_of_unity(blowup.trailing_zeros() as u64).unwrap();
+        let mut vanishing_inv_tile = Vec::with_capacity(blowup);
+        let mut rho_power = FieldElement::<Field>::one();
+        for _ in 0..blowup {
+            let val = &g_n * &rho_power - FieldElement::<Field>::one();
+            vanishing_inv_tile.push(val);
+            rho_power = &rho_power * &rho;
+        }
+        FieldElement::inplace_batch_inverse(&mut vanishing_inv_tile).unwrap();
+
+        // Add bridge quotient terms per LDE point.
+        // bridge_k(point_i) = (col_k(point_i) · s(point_i) · N - c_k) · vanishing_inv[i % B]
+        // Use F×E→E mixed arithmetic: col is in base field F, s and c are in extension E.
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            constraint_evaluations
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(i, eval)| {
+                    let s_val = lde_trace.get_aux(i, 0);
+                    let v_inv = &vanishing_inv_tile[i % blowup];
+                    for ((col_idx, c), beta) in bridge_claims.iter().zip(bridge_coefficients.iter())
+                    {
+                        // col is base field, s is extension: F×E→E
+                        let col_s = lde_trace.get_main(i, *col_idx) * s_val;
+                        let numerator = col_s * &n_fe - c;
+                        *eval = &*eval + v_inv * beta * &numerator;
+                    }
+                });
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            for i in 0..constraint_evaluations.len() {
+                let s_val = lde_trace.get_aux(i, 0);
+                let v_inv = &vanishing_inv_tile[i % blowup];
+                for ((col_idx, c), beta) in bridge_claims.iter().zip(bridge_coefficients.iter()) {
+                    let col_s = lde_trace.get_main(i, *col_idx) * s_val;
+                    let numerator = col_s * &n_fe - c;
+                    constraint_evaluations[i] =
+                        &constraint_evaluations[i] + v_inv * beta * &numerator;
+                }
+            }
+        }
     }
 
     /// Returns the result of the third round of the STARK Prove protocol.
@@ -1647,12 +1732,18 @@ pub trait IsStarkProver<
                 table_transcript.append_field_element(&bpi.table_contribution);
             }
 
+            let claims = metadata
+                .logup_gkr_result
+                .as_ref()
+                .map(|r| r.column_claims.as_slice())
+                .unwrap_or(&[]);
             let mut proof = Self::prove_rounds_2_to_4(
                 *air,
                 *pub_inputs,
                 &round_1_result,
                 table_transcript,
                 domain,
+                claims,
             )?;
 
             // Attach LogUp-GKR proof from Phase B' (if this table had bus interactions)
@@ -1706,6 +1797,7 @@ pub trait IsStarkProver<
         round_1_result: &Round1<Field, FieldExtension>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
         domain: &Domain<Field>,
+        bridge_claims: &[(usize, FieldElement<FieldExtension>)],
     ) -> Result<StarkProof<Field, FieldExtension, PI>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
@@ -1737,15 +1829,18 @@ pub trait IsStarkProver<
             .len();
 
         let num_transition_constraints = air.context().num_transition_constraints;
+        let num_bridge_claims = bridge_claims.len();
 
         let mut coefficients: Vec<_> =
             core::iter::successors(Some(FieldElement::one()), |x| Some(x * &beta))
-                .take(num_boundary_constraints + num_transition_constraints)
+                .take(num_boundary_constraints + num_transition_constraints + num_bridge_claims)
                 .collect();
 
         let transition_coefficients: Vec<_> =
             coefficients.drain(..num_transition_constraints).collect();
-        let boundary_coefficients = coefficients;
+        let boundary_coefficients: Vec<_> =
+            coefficients.drain(..num_boundary_constraints).collect();
+        let bridge_coefficients = coefficients;
 
         let round_2_result = Self::round_2_compute_composition_polynomial(
             air,
@@ -1754,6 +1849,8 @@ pub trait IsStarkProver<
             round_1_result,
             &transition_coefficients,
             &boundary_coefficients,
+            bridge_claims,
+            &bridge_coefficients,
         )?;
 
         // >>>> Send commitments: [H₁], [H₂]
