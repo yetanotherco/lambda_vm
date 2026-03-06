@@ -1841,8 +1841,12 @@ pub fn reconstruct_and_verify_gkr_claims<E: IsField>(
     // MLE(N)(r) != n_recon and MLE(D)(r) != d_recon in general.
     // Soundness for these tables is ensured by the bridge running sum constraint.
     if interactions.len() == 1 {
-        // Direct check: reconstructed values must exactly match GKR output
-        &running_n == n_claim && &running_d == d_claim
+        // Direct check: reconstructed values must match GKR output as rational numbers.
+        // The GKR verifier may return (n_claim, d_claim) in a different representation
+        // than the prover's raw (numerator, denominator) — e.g. (claimed_sum, 1) instead
+        // of (root_n, root_d). So we compare as rationals: running_n / running_d == n_claim / d_claim
+        // i.e. running_n * d_claim == n_claim * running_d.
+        &running_n * d_claim == n_claim * &running_d
     } else {
         // Multi-interaction: structural check passed above.
         // The bridge constraint (verified during STARK proof) ensures column_claims
