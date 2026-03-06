@@ -675,13 +675,204 @@ fn test_tampered_acc_ood_evaluation() {
     );
 }
 
-// =============================================================================
-// Old LogUp bus_public_inputs soundness tests removed.
-// With LogUp-GKR, soundness comes from:
+// LogUp-GKR soundness comes from:
 // 1. GKR proof verification (verified in Phase B')
 // 2. Bridge running sum transition constraint (σ column)
 // 3. Bus balance check (Σ GKR claimed_sums = 0)
 // 4. Column claims verified through GKR protocol
+//
+// The following tests tamper with specific GKR proof fields to verify rejection.
+
+/// Helper: generate a valid multi-proof from the standard 3-table scenario
+/// (CPU sends to ADD and MUL, all values correct).
+fn generate_valid_multi_proof() -> (
+    crate::proof::stark::MultiProof<F, E, ()>,
+    Vec<crate::lookup::AirWithBuses<F, E, crate::lookup::NullBoundaryConstraintBuilder, ()>>,
+) {
+    let mut cpu_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::zero(); 4],
+            vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
+        ],
+        1,
+    );
+    let mut add_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()],
+        ],
+        1,
+    );
+    let mut mul_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::zero(); 4],
+            vec![FE::zero(); 4],
+            vec![FE::zero(); 4],
+            vec![FE::zero(); 4],
+        ],
+        1,
+    );
+
+    let proof_options = ProofOptions::default_test_options();
+    let cpu_air = new_cpu_air_with_lookup(&proof_options);
+    let add_air = new_add_air_with_lookup(&proof_options);
+    let mul_air = new_mul_air_with_lookup(&proof_options);
+
+    let air_trace_pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&cpu_air, &mut cpu_trace, &()),
+        (&add_air, &mut add_trace, &()),
+        (&mul_air, &mut mul_trace, &()),
+    ];
+
+    let multi_proof =
+        Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+
+    (multi_proof, vec![cpu_air, add_air, mul_air])
+}
+
+/// Tampered GKR column claims are rejected.
+///
+/// The column_claims in the LogUp-GKR proof contain MLE evaluations of main
+/// trace columns at the GKR random point. These claims feed into the bridge
+/// running sum computation via extend_rap_challenges_with_bridge: the bridge
+/// offset = (sum of gamma^j * c_j) / N. If we tamper with a column claim,
+/// the bridge offset will be wrong and the bridge transition constraint will
+/// fail at the OOD point.
+#[test_log::test]
+fn test_tampered_gkr_column_claims_rejected() {
+    let (mut multi_proof, airs) = generate_valid_multi_proof();
+
+    // Tamper with the CPU table's column_claims (table index 0).
+    // CPU has interactions referencing columns 0-4, so column_claims is non-empty.
+    let cpu_proof = &mut multi_proof.proofs[0];
+    if let Some(ref mut gkr_proof) = cpu_proof.logup_gkr_proof {
+        // Corrupt the first column claim value by adding 1.
+        assert!(
+            !gkr_proof.column_claims.is_empty(),
+            "CPU must have column claims"
+        );
+        gkr_proof.column_claims[0].1 =
+            gkr_proof.column_claims[0].1.clone() + FieldElement::one();
+    } else {
+        panic!("CPU table must have a logup_gkr_proof");
+    }
+
+    let air_refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        airs.iter().map(|a| a as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>).collect();
+
+    assert!(
+        !Verifier::multi_verify(
+            &air_refs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[])
+        ),
+        "Tampered column_claims must cause verification failure (wrong bridge offset)"
+    );
+}
+
+/// Tampered GKR claimed_sum is rejected.
+///
+/// The bus balance check enforces that the sum of all tables' GKR claimed_sums
+/// equals zero. If we tamper with one table's claimed_sum, this balance check
+/// will fail. Additionally, the tampered claimed_sum will desynchronize the
+/// Fiat-Shamir transcript (since claimed_sum is appended during GKR verification),
+/// causing further downstream verification failures.
+#[test_log::test]
+fn test_tampered_gkr_claimed_sum_rejected() {
+    let (mut multi_proof, airs) = generate_valid_multi_proof();
+
+    // Tamper with the ADD table's GKR claimed_sum (table index 1).
+    let add_proof = &mut multi_proof.proofs[1];
+    if let Some(ref mut gkr_proof) = add_proof.logup_gkr_proof {
+        gkr_proof.gkr_proof.claimed_sum =
+            gkr_proof.gkr_proof.claimed_sum.clone() + FieldElement::one();
+    } else {
+        panic!("ADD table must have a logup_gkr_proof");
+    }
+
+    let air_refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        airs.iter().map(|a| a as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>).collect();
+
+    assert!(
+        !Verifier::multi_verify(
+            &air_refs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[])
+        ),
+        "Tampered claimed_sum must cause verification failure (bus balance or GKR verify)"
+    );
+}
+
+/// Missing GKR proof for a table with bus interactions is rejected.
+///
+/// When an AIR has bus interactions (has_trace_interaction() = true), the
+/// verifier requires a logup_gkr_proof. Setting it to None should cause
+/// immediate rejection in Phase B' where the verifier checks for the proof.
+#[test_log::test]
+fn test_missing_gkr_proof_rejected() {
+    let (mut multi_proof, airs) = generate_valid_multi_proof();
+
+    // Remove the GKR proof from the ADD table (table index 1).
+    // ADD has bus interactions, so the verifier will reject.
+    multi_proof.proofs[1].logup_gkr_proof = None;
+
+    let air_refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        airs.iter().map(|a| a as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>).collect();
+
+    assert!(
+        !Verifier::multi_verify(
+            &air_refs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[])
+        ),
+        "Missing logup_gkr_proof for a table with interactions must be rejected"
+    );
+}
+
+/// Tampered sigma (bridge running sum) OOD evaluation is rejected.
+///
+/// The bridge running sum column (sigma, aux column 1) is constrained by the
+/// LookupBridgeSumConstraint transition constraint:
+///   sigma_next - sigma_curr - l_curr * batched_curr + bridge_offset = 0
+///
+/// Corrupting sigma's OOD evaluation breaks this constraint at the OOD point,
+/// causing the composition polynomial check to fail.
+#[test_log::test]
+fn test_tampered_sigma_ood_rejected() {
+    let (mut multi_proof, airs) = generate_valid_multi_proof();
+
+    // Corrupt the sigma column OOD evaluation in the CPU table proof.
+    // CPU has 5 main columns + 2 aux columns (Lagrange=aux0, sigma=aux1).
+    // In trace_ood_evaluations, sigma is at column index 5 + 1 = 6.
+    let num_main_cpu = 5usize;
+    let sigma_col_ood_idx = num_main_cpu + 1; // aux column 1 = sigma
+    let cpu_proof = &mut multi_proof.proofs[0];
+    let corrupted = *cpu_proof.trace_ood_evaluations.get(0, sigma_col_ood_idx) + FieldElement::one();
+    cpu_proof
+        .trace_ood_evaluations
+        .set(0, sigma_col_ood_idx, corrupted);
+
+    let air_refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        airs.iter().map(|a| a as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>).collect();
+
+    assert!(
+        !Verifier::multi_verify(
+            &air_refs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[])
+        ),
+        "Tampered sigma OOD evaluation must cause verification failure (bridge constraint)"
+    );
+}
 
 // =============================================================================
 // Complex scenarios
