@@ -11,6 +11,7 @@ pub mod grinding;
 pub mod lookup;
 pub mod proof;
 pub mod prover;
+pub mod sumcheck;
 pub mod table;
 pub mod trace;
 pub mod traits;
