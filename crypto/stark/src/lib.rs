@@ -9,6 +9,7 @@ pub mod frame;
 pub mod fri;
 pub mod gkr;
 pub mod grinding;
+pub mod lagrange_kernel;
 pub mod lookup;
 pub mod proof;
 pub mod prover;
