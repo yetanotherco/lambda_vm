@@ -9,7 +9,7 @@ use super::{
 use crate::{
     config::Commitment,
     domain::new_verifier_domain,
-    lookup::LOGUP_NUM_CHALLENGES,
+    lookup::{LOGUP_NUM_CHALLENGES, extend_rap_challenges_with_bridge},
     proof::stark::{DeepPolynomialOpening, MultiProof},
 };
 use crypto::{fiat_shamir::is_transcript::IsStarkTranscript, merkle_tree::proof::Proof};
@@ -898,38 +898,64 @@ pub trait IsStarkVerifier<
         };
 
         // =====================================================================
-        // Validate bus_public_inputs presence against AIR layout
+        // Phase B': Replay GKR proofs (main transcript)
         // =====================================================================
-        // A dishonest prover could omit bus_public_inputs entirely (None) to
-        // bypass the bus balance check. With circular constraints, there are no
-        // boundary constraints on LogUp columns, so the bus balance check is
-        // the only cross-table validation.
+        // For each table with bus interactions, replay the GKR verification
+        // on the main transcript. This must match the prover's Phase B' exactly.
+
+        let mut gkr_bridge_claims: Vec<Vec<(usize, FieldElement<FieldExtension>)>> =
+            Vec::with_capacity(airs.len());
 
         for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
-            if air.has_trace_interaction() && proof.bus_public_inputs.is_none() {
-                error!(
-                    "Table {idx}: AIR has LogUp interactions but proof is missing bus_public_inputs"
-                );
-                return false;
-            }
-            if !air.has_trace_interaction() && proof.bus_public_inputs.is_some() {
-                error!(
-                    "Table {idx}: AIR has no LogUp interactions but proof contains bus_public_inputs"
-                );
-                return false;
+            if air.has_trace_interaction() {
+                let gkr_proof = match &proof.logup_gkr_proof {
+                    Some(p) => p,
+                    None => {
+                        #[cfg(not(feature = "test_fiat_shamir"))]
+                        error!(
+                            "Table {idx}: AIR has interactions but proof missing logup_gkr_proof"
+                        );
+                        return false;
+                    }
+                };
+
+                // Replay GKR verification on the main transcript
+                match crate::gkr::gkr_verify(&gkr_proof.gkr_proof, transcript) {
+                    Ok((_random_point, _n_claim, _d_claim)) => {
+                        // GKR verification passed — transcript state matches prover
+                    }
+                    Err(_e) => {
+                        #[cfg(not(feature = "test_fiat_shamir"))]
+                        error!("Table {idx}: GKR verification failed: {:?}", _e);
+                        return false;
+                    }
+                }
+
+                gkr_bridge_claims.push(gkr_proof.column_claims.clone());
+            } else {
+                gkr_bridge_claims.push(Vec::new());
             }
         }
+
+        // =====================================================================
+        // Phase B'': Sample γ for bridge batching (main transcript)
+        // =====================================================================
+        // Must match prover: γ sampled AFTER all GKR messages, BEFORE forking.
+
+        let gamma: FieldElement<FieldExtension> = if needs_lookup_challenges {
+            transcript.sample_field_element()
+        } else {
+            FieldElement::zero()
+        };
 
         // =====================================================================
         // Phase C + Rounds 2-4: Forked per table
         // =====================================================================
         // Each table gets an independent transcript fork (cloned from the shared
-        // state after Phase B, domain-separated by table index). This matches
+        // state after Phase B'', domain-separated by table index). This matches
         // the prover's forking and makes per-table verification independent.
 
         for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
-            // Must match prover: fork with domain separator for multi-table,
-            // use original transcript directly for single-table.
             let num_tables = airs.len();
             let mut table_transcript = transcript.clone();
             if num_tables > 1 {
@@ -941,18 +967,25 @@ pub trait IsStarkVerifier<
                 table_transcript.append_bytes(&root);
             }
 
-            // Bind table_contribution (L) to transcript, matching prover.
-            if let Some(ref bpi) = proof.bus_public_inputs {
-                table_transcript.append_field_element(&bpi.table_contribution);
+            // Build per-table rap_challenges with bridge params
+            let mut table_rap_challenges = lookup_challenges.clone();
+            if !gkr_bridge_claims[idx].is_empty() {
+                extend_rap_challenges_with_bridge(
+                    &mut table_rap_challenges,
+                    &gkr_bridge_claims[idx],
+                    &gamma,
+                    proof.trace_length,
+                );
             }
 
-            // Rounds 2-4: verify
+            // Rounds 2-4: verify (bridge is now a transition constraint)
             if !Self::verify_rounds_2_to_4(
                 *air,
                 proof,
                 &mut table_transcript,
-                lookup_challenges.clone(),
+                table_rap_challenges,
             ) {
+                #[cfg(not(feature = "test_fiat_shamir"))]
                 error!(
                     "Table {} failed verify_rounds_2_to_4 (num_constraints={}, trace_cols={})",
                     idx,
@@ -966,24 +999,23 @@ pub trait IsStarkVerifier<
         // =====================================================================
         // Bus Balance Check: Σ table_contribution = 0
         // =====================================================================
-        // For LogUp with circular constraints, each table's total contribution L
-        // (sum of all per-row terms) is exposed as a public input. The bus balances
-        // when the sum of all table contributions equals zero.
+        // With LogUp-GKR, the table contribution is the GKR claimed_sum.
+        // The bus balances when the sum of all claimed_sums equals zero.
 
         if needs_lookup_challenges {
             let mut total = FieldElement::<FieldExtension>::zero();
             for (air, proof) in airs.iter().zip(&multi_proof.proofs) {
-                if air.has_trace_interaction()
-                    && let Some(interaction) = &proof.bus_public_inputs
-                {
-                    total = total + &interaction.table_contribution;
+                if air.has_trace_interaction() {
+                    if let Some(ref gkr_proof) = proof.logup_gkr_proof {
+                        total = total + &gkr_proof.gkr_proof.claimed_sum;
+                    }
                 }
             }
 
             if total != FieldElement::zero() {
                 #[cfg(not(feature = "test_fiat_shamir"))]
                 error!(
-                    "LogUp bus does not balance: sum of accumulated values is not zero. total={:?}",
+                    "LogUp bus does not balance: sum of GKR claimed_sums is not zero. total={:?}",
                     total
                 );
                 return false;
@@ -1043,9 +1075,10 @@ pub trait IsStarkVerifier<
 
         let num_transition_constraints = air.context().num_transition_constraints;
 
-        let mut coefficients: Vec<_> = (0..num_boundary_constraints + num_transition_constraints)
-            .map(|i| beta.pow(i))
-            .collect();
+        let mut coefficients: Vec<_> =
+            (0..num_boundary_constraints + num_transition_constraints)
+                .map(|i| beta.pow(i))
+                .collect();
 
         let transition_coeffs: Vec<_> = coefficients.drain(..num_transition_constraints).collect();
         let boundary_coeffs = coefficients;
@@ -1171,8 +1204,13 @@ pub trait IsStarkVerifier<
         #[cfg(feature = "instruments")]
         let timer1 = Instant::now();
 
-        let challenges =
-            Self::replay_rounds_after_round_1(air, proof, &domain, transcript, rap_challenges);
+        let challenges = Self::replay_rounds_after_round_1(
+            air,
+            proof,
+            &domain,
+            transcript,
+            rap_challenges,
+        );
 
         // verify grinding
         let security_bits = air.context().proof_options.grinding_factor;

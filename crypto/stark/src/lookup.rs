@@ -10,6 +10,7 @@ use crate::{
     context::AirContext,
     proof::options::ProofOptions,
     trace::TraceTable,
+    traits::TransitionEvaluationContext,
 };
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use math::field::{
@@ -68,8 +69,22 @@ pub const LOGUP_CHALLENGE_Z: usize = 0;
 /// Used as the base for linear combination of row values.
 pub const LOGUP_CHALLENGE_ALPHA: usize = 1;
 
-/// Number of challenges required by the LogUp protocol.
+/// Number of challenges required by the LogUp protocol (z and alpha).
+/// The gamma challenge is sampled separately after GKR for soundness.
 pub const LOGUP_NUM_CHALLENGES: usize = 2;
+
+/// Index of the `gamma` (γ) challenge in the per-table rap_challenges vector.
+/// Used for batching column claims in the bridge running sum.
+/// Sampled after GKR on the main transcript (not during Phase B).
+pub const LOGUP_CHALLENGE_GAMMA: usize = 2;
+
+/// Index of the bridge offset (target/N) in the per-table rap_challenges vector.
+/// This is a derived value, not a random challenge.
+pub const LOGUP_BRIDGE_OFFSET_IDX: usize = 3;
+
+/// Start index of precomputed gamma powers in the per-table rap_challenges vector.
+/// rap_challenges[LOGUP_GAMMA_POWERS_START + j] = γ^j for j = 0, 1, ..., K-1.
+pub const LOGUP_GAMMA_POWERS_START: usize = 4;
 
 
 // =============================================================================
@@ -705,10 +720,12 @@ impl<
     ) -> Self {
         let num_interactions = auxiliary_trace_build_data.interactions.len();
 
-        // LogUp-GKR: no LogUp constraints added to transition constraints.
+        // LogUp-GKR: aux trace has 2 columns if interactions exist:
+        //   - Column 0: Lagrange kernel (l)
+        //   - Column 1: Bridge running sum (σ)
         // The GKR sub-protocol replaces the old accumulated/term constraints.
-        // Aux trace has exactly 1 column (Lagrange kernel) if interactions exist, 0 otherwise.
-        let num_aux_columns = if num_interactions > 0 { 1 } else { 0 };
+        // A single LookupBridgeSumConstraint enforces the bridge.
+        let num_aux_columns = if num_interactions > 0 { 2 } else { 0 };
         let trace_layout = (num_main_columns, num_aux_columns);
 
         // Compute max bus elements across all interactions for alpha power count
@@ -719,19 +736,31 @@ impl<
             .max()
             .unwrap_or(0);
 
+        // Add bridge running sum constraint for LogUp-GKR tables
+        let mut all_constraints = transition_constraints;
+        if num_interactions > 0 {
+            let column_indices =
+                extract_column_indices(&auxiliary_trace_build_data.interactions);
+            let bridge_constraint = LookupBridgeSumConstraint {
+                constraint_idx: all_constraints.len(),
+                column_indices,
+            };
+            all_constraints.push(Box::new(bridge_constraint));
+        }
+
         // Create context
         let context = AirContext {
             proof_options: proof_options.clone(),
             trace_columns: trace_layout.0 + trace_layout.1,
             transition_offsets: vec![0, 1],
-            num_transition_constraints: transition_constraints.len(),
+            num_transition_constraints: all_constraints.len(),
         };
 
         Self {
             context,
             step_size,
             trace_layout,
-            transition_constraints,
+            transition_constraints: all_constraints,
             auxiliary_trace_build_data,
             boundary_constraint_builder: PhantomData,
             preprocessed_commitment: None,
@@ -847,9 +876,10 @@ where
         trace: &mut TraceTable<F, E>,
         _challenges: &[FieldElement<E>],
     ) -> Option<BusPublicInputs<E>> {
-        // LogUp-GKR: the auxiliary trace is a single Lagrange kernel column.
-        // The actual kernel values are filled in by the prover (multi_prove)
-        // using the GKR random point. Here we just allocate the column.
+        // LogUp-GKR: auxiliary trace has 2 columns:
+        //   - Column 0: Lagrange kernel (l) — filled by prover from GKR random point
+        //   - Column 1: Bridge running sum (σ) — filled by prover after γ sampling
+        // Here we just allocate the columns.
         let (_, num_aux_columns) = self.trace_layout();
         if num_aux_columns > 0 && trace.num_aux_columns == 0 {
             trace.allocate_aux_table(num_aux_columns);
@@ -1481,10 +1511,203 @@ where
     (bus_sums, sender_sums, receiver_sums)
 }
 
-// LogUp constraints (LookupBatchedTermConstraint, LookupAccumulatedConstraint) and
-// per-row helper functions (compute_multiplicity_from_step, compute_fingerprint_from_step)
-// have been removed. The LogUp-GKR sub-protocol replaces per-row accumulated columns with a
-// Lagrange kernel column and bridge quotients in the composition polynomial.
+// =============================================================================
+// LogUp-GKR Bridge Running Sum
+// =============================================================================
+
+/// Extract sorted distinct main column indices from bus interactions.
+///
+/// These are the columns referenced by `column_claims` in the GKR result.
+/// The order must be consistent between the trace builder and the constraint evaluator.
+fn extract_column_indices(interactions: &[BusInteraction]) -> Vec<usize> {
+    let mut seen_cols = std::collections::HashSet::new();
+    for inter in interactions {
+        for val in &inter.values {
+            for col_idx in val.column_indices() {
+                seen_cols.insert(col_idx);
+            }
+        }
+        match &inter.multiplicity {
+            Multiplicity::One => {}
+            Multiplicity::Column(c) => {
+                seen_cols.insert(*c);
+            }
+            Multiplicity::Sum(a, b) => {
+                seen_cols.insert(*a);
+                seen_cols.insert(*b);
+            }
+            Multiplicity::Negated(c) => {
+                seen_cols.insert(*c);
+            }
+            Multiplicity::Linear(terms) => {
+                for term in terms {
+                    match term {
+                        LinearTerm::Column { column, .. } => {
+                            seen_cols.insert(*column);
+                        }
+                        LinearTerm::ColumnUnsigned { column, .. } => {
+                            seen_cols.insert(*column);
+                        }
+                        LinearTerm::Constant(_) => {}
+                    }
+                }
+            }
+        }
+    }
+    let mut col_indices: Vec<usize> = seen_cols.into_iter().collect();
+    col_indices.sort_unstable();
+    col_indices
+}
+
+/// Compute the bridge offset (target/N) and gamma powers from column claims.
+///
+/// Returns (bridge_offset, gamma_powers) where:
+/// - bridge_offset = (Σ_j γ^j · c_j) / N
+/// - gamma_powers = [γ^0, γ^1, ..., γ^{K-1}]
+///
+/// Both prover and verifier call this to derive the same values.
+pub fn compute_bridge_params<E: IsField>(
+    column_claims: &[(usize, FieldElement<E>)],
+    gamma: &FieldElement<E>,
+    trace_len: usize,
+) -> (FieldElement<E>, Vec<FieldElement<E>>) {
+    let k = column_claims.len();
+    let gamma_powers = compute_alpha_powers(gamma, k);
+
+    let mut target = FieldElement::<E>::zero();
+    for ((_, c_j), gp) in column_claims.iter().zip(gamma_powers.iter()) {
+        target = target + c_j * gp;
+    }
+
+    let n_inv = FieldElement::<E>::from(trace_len as u64).inv().unwrap();
+    let bridge_offset = &target * &n_inv;
+
+    (bridge_offset, gamma_powers)
+}
+
+/// Extend rap_challenges with bridge parameters (γ, bridge_offset, gamma_powers).
+///
+/// After calling this, the rap_challenges vector has:
+/// - [0] = z, [1] = α (original)
+/// - [2] = γ
+/// - [3] = bridge_offset (target/N)
+/// - [4..4+K] = γ^0, γ^1, ..., γ^{K-1}
+pub fn extend_rap_challenges_with_bridge<E: IsField>(
+    rap_challenges: &mut Vec<FieldElement<E>>,
+    column_claims: &[(usize, FieldElement<E>)],
+    gamma: &FieldElement<E>,
+    trace_len: usize,
+) {
+    let (bridge_offset, gamma_powers) = compute_bridge_params(column_claims, gamma, trace_len);
+    rap_challenges.push(gamma.clone()); // index 2
+    rap_challenges.push(bridge_offset); // index 3
+    for gp in gamma_powers {
+        rap_challenges.push(gp); // indices 4, 5, ...
+    }
+}
+
+/// Transition constraint for the bridge running sum column (σ).
+///
+/// Enforces the circular constraint:
+///   σ_next - σ_curr - l_curr · batched_curr + bridge_offset = 0
+///
+/// where:
+/// - σ is the running sum (aux column 1)
+/// - l is the Lagrange kernel (aux column 0)
+/// - batched_curr = Σ_j γ^j · col_j_curr (from main trace columns)
+/// - bridge_offset = (Σ_j γ^j · c_j) / N (from rap_challenges)
+///
+/// The circular constraint (end_exemptions=0) telescopes to:
+///   Σ_{i=0}^{N-1} l[i] · batched[i] = target
+/// which, by γ-batching (Schwartz-Zippel), proves all individual claims
+/// <l, col_j> = c_j with high probability.
+pub struct LookupBridgeSumConstraint {
+    constraint_idx: usize,
+    /// Sorted distinct main column indices from bus interactions
+    column_indices: Vec<usize>,
+}
+
+impl<F, E> TransitionConstraint<F, E> for LookupBridgeSumConstraint
+where
+    F: IsSubFieldOf<E> + IsFFTField + Send + Sync,
+    E: IsField + Send + Sync,
+{
+    fn degree(&self) -> usize {
+        2 // l_curr * batched_curr
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    fn end_exemptions(&self) -> usize {
+        0 // circular: checked on all N rows (including wrap-around)
+    }
+
+    fn evaluate(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<F, E>,
+        transition_evaluations: &mut [FieldElement<E>],
+    ) {
+        match evaluation_context {
+            TransitionEvaluationContext::Prover {
+                frame,
+                rap_challenges,
+                ..
+            } => {
+                let bridge_offset = &rap_challenges[LOGUP_BRIDGE_OFFSET_IDX];
+
+                let step0 = frame.get_evaluation_step(0);
+                let step1 = frame.get_evaluation_step(1);
+
+                // σ (aux column 1)
+                let sigma_curr = step0.get_aux_evaluation_element(0, 1);
+                let sigma_next = step1.get_aux_evaluation_element(0, 1);
+
+                // l (aux column 0)
+                let l_curr = step0.get_aux_evaluation_element(0, 0);
+
+                // batched_curr = Σ_j γ^j · col_j_curr using precomputed gamma powers
+                let mut batched = FieldElement::<E>::zero();
+                for (j, &col_idx) in self.column_indices.iter().enumerate() {
+                    let gamma_j = &rap_challenges[LOGUP_GAMMA_POWERS_START + j];
+                    let col_val = step0.get_main_evaluation_element(0, col_idx);
+                    // F×E→E: base field column × extension field gamma power
+                    batched = batched + col_val * gamma_j;
+                }
+
+                // σ_next - σ_curr - l_curr * batched + bridge_offset
+                transition_evaluations[self.constraint_idx] =
+                    sigma_next - sigma_curr - l_curr * &batched + bridge_offset;
+            }
+            TransitionEvaluationContext::Verifier {
+                frame,
+                rap_challenges,
+                ..
+            } => {
+                let bridge_offset = &rap_challenges[LOGUP_BRIDGE_OFFSET_IDX];
+
+                let step0 = frame.get_evaluation_step(0);
+                let step1 = frame.get_evaluation_step(1);
+
+                let sigma_curr = step0.get_aux_evaluation_element(0, 1);
+                let sigma_next = step1.get_aux_evaluation_element(0, 1);
+                let l_curr = step0.get_aux_evaluation_element(0, 0);
+
+                let mut batched = FieldElement::<E>::zero();
+                for (j, &col_idx) in self.column_indices.iter().enumerate() {
+                    let gamma_j = &rap_challenges[LOGUP_GAMMA_POWERS_START + j];
+                    // In verifier path, main cols are also in E
+                    let col_val = step0.get_main_evaluation_element(0, col_idx);
+                    batched = batched + col_val * gamma_j;
+                }
+
+                transition_evaluations[self.constraint_idx] =
+                    sigma_next - sigma_curr - l_curr * &batched + bridge_offset;
+            }
+        }
+    }
+}
 
 
 // =============================================================================
