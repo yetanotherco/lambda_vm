@@ -326,8 +326,8 @@ fn test_air_layout_single_interaction() {
         vec![],
     );
 
-    // 4 main, 2 aux (1 term + 1 accumulated)
-    assert_eq!(air.trace_layout(), (4, 2));
+    // 4 main, 1 aux (0 committed pairs + 1 accumulated with 1 absorbed)
+    assert_eq!(air.trace_layout(), (4, 1));
 }
 
 #[test]
@@ -358,6 +358,6 @@ fn test_air_layout_multiple_interactions() {
         vec![],
     );
 
-    // 5 main, 3 aux (2 term + 1 accumulated)
-    assert_eq!(air.trace_layout(), (5, 3));
+    // 5 main, 1 aux (0 committed pairs + 1 accumulated with 2 absorbed)
+    assert_eq!(air.trace_layout(), (5, 1));
 }

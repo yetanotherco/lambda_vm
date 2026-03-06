@@ -77,12 +77,14 @@ where
         periodic_values: &'a [FieldElement<F>],
         rap_challenges: &'a [FieldElement<E>],
         logup_alpha_powers: &'a [FieldElement<E>],
+        logup_table_offset: &'a FieldElement<E>,
     },
     Verifier {
         frame: &'a Frame<E, E>,
         periodic_values: &'a [FieldElement<E>],
         rap_challenges: &'a [FieldElement<E>],
         logup_alpha_powers: &'a [FieldElement<E>],
+        logup_table_offset: &'a FieldElement<E>,
     },
 }
 
@@ -96,12 +98,14 @@ where
         periodic_values: &'a [FieldElement<F>],
         rap_challenges: &'a [FieldElement<E>],
         logup_alpha_powers: &'a [FieldElement<E>],
+        logup_table_offset: &'a FieldElement<E>,
     ) -> Self {
         Self::Prover {
             frame,
             periodic_values,
             rap_challenges,
             logup_alpha_powers,
+            logup_table_offset,
         }
     }
 
@@ -110,12 +114,14 @@ where
         periodic_values: &'a [FieldElement<E>],
         rap_challenges: &'a [FieldElement<E>],
         logup_alpha_powers: &'a [FieldElement<E>],
+        logup_table_offset: &'a FieldElement<E>,
     ) -> Self {
         Self::Verifier {
             frame,
             periodic_values,
             rap_challenges,
             logup_alpha_powers,
+            logup_table_offset,
         }
     }
 }
@@ -165,6 +171,12 @@ pub trait AIR: Send + Sync {
     /// Generic RAP AIRs with auxiliary columns but no bus interactions must return false.
     fn has_trace_interaction(&self) -> bool {
         false
+    }
+
+    /// Returns the maximum number of bus elements across all interactions.
+    /// Used to compute the correct number of alpha powers for LogUp fingerprints.
+    fn max_bus_elements(&self) -> usize {
+        0
     }
 
     /// Returns true if this AIR has preprocessed (precomputed) columns.
