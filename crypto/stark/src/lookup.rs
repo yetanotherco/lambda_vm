@@ -9,17 +9,13 @@ use crate::{
     },
     context::AirContext,
     proof::options::ProofOptions,
-    table::TableView,
     trace::TraceTable,
-    traits::TransitionEvaluationContext,
 };
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use math::field::{
     element::FieldElement,
     traits::{IsFFTField, IsField, IsPrimeField, IsSubFieldOf},
 };
-#[cfg(feature = "parallel")]
-use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 
 // =============================================================================
 // Shift Constants for Type Combining
@@ -75,20 +71,6 @@ pub const LOGUP_CHALLENGE_ALPHA: usize = 1;
 /// Number of challenges required by the LogUp protocol.
 pub const LOGUP_NUM_CHALLENGES: usize = 2;
 
-/// Split N interactions into committed batched pairs and absorbed remainder.
-///
-/// Returns `(num_committed_pairs, absorbed_count)` where:
-/// - Committed pairs get dedicated auxiliary term columns (2 interactions per column)
-/// - Absorbed interactions (1 or 2) are folded into the accumulated constraint
-fn split_interactions(num_interactions: usize) -> (usize, usize) {
-    if num_interactions <= 2 {
-        (0, num_interactions)
-    } else if num_interactions % 2 == 1 {
-        ((num_interactions - 1) / 2, 1)
-    } else {
-        ((num_interactions - 2) / 2, 2)
-    }
-}
 
 // =============================================================================
 // Bus Types
@@ -719,44 +701,14 @@ impl<
         auxiliary_trace_build_data: AuxiliaryTraceBuildData,
         proof_options: &ProofOptions,
         step_size: usize,
-        mut transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
+        transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
     ) -> Self {
         let num_interactions = auxiliary_trace_build_data.interactions.len();
 
-        // Split interactions: committed pairs get term columns, last 1-2 are absorbed
-        let (num_committed_pairs, absorbed_count) = split_interactions(num_interactions);
-        let absorbed =
-            auxiliary_trace_build_data.interactions[num_interactions - absorbed_count..].to_vec();
-
-        // Create batched term constraints for committed pairs only
-        for pair_idx in 0..num_committed_pairs {
-            let constraint = LookupBatchedTermConstraint::new(
-                auxiliary_trace_build_data.interactions[pair_idx * 2].clone(),
-                auxiliary_trace_build_data.interactions[pair_idx * 2 + 1].clone(),
-                pair_idx,
-                transition_constraints.len(),
-            );
-            transition_constraints.push(Box::new(constraint));
-        }
-
-        let num_term_columns = num_committed_pairs;
-
-        // Add the accumulated constraint with absorbed interactions
-        if num_interactions > 0 {
-            let accumulated_constraint = LookupAccumulatedConstraint::new(
-                transition_constraints.len(),
-                num_term_columns,
-                absorbed,
-            );
-            transition_constraints.push(Box::new(accumulated_constraint));
-        }
-
-        // Layout: num_committed_pairs term columns + 1 accumulated = ⌈N/2⌉
-        let num_aux_columns = if num_interactions > 0 {
-            num_term_columns + 1
-        } else {
-            0
-        };
+        // LogUp-GKR: no LogUp constraints added to transition constraints.
+        // The GKR sub-protocol replaces the old accumulated/term constraints.
+        // Aux trace has exactly 1 column (Lagrange kernel) if interactions exist, 0 otherwise.
+        let num_aux_columns = if num_interactions > 0 { 1 } else { 0 };
         let trace_layout = (num_main_columns, num_aux_columns);
 
         // Compute max bus elements across all interactions for alpha power count
@@ -893,112 +845,18 @@ where
     fn build_auxiliary_trace(
         &self,
         trace: &mut TraceTable<F, E>,
-        challenges: &[FieldElement<E>],
+        _challenges: &[FieldElement<E>],
     ) -> Option<BusPublicInputs<E>> {
-        // Allocate aux table if not already present
+        // LogUp-GKR: the auxiliary trace is a single Lagrange kernel column.
+        // The actual kernel values are filled in by the prover (multi_prove)
+        // using the GKR random point. Here we just allocate the column.
         let (_, num_aux_columns) = self.trace_layout();
         if num_aux_columns > 0 && trace.num_aux_columns == 0 {
             trace.allocate_aux_table(num_aux_columns);
         }
 
-        let num_interactions = self.auxiliary_trace_build_data.interactions.len();
-
-        if num_interactions == 0 {
-            return None;
-        }
-
-        // Clone main columns once (shared across all interactions)
-        let main_segment_cols = trace.columns_main();
-        let trace_len = trace.num_rows();
-        let table_name = self.name.as_deref().unwrap_or("UNKNOWN");
-
-        // Split interactions: committed pairs get term columns, last 1-2 are absorbed (virtual)
-        let (num_committed_pairs, absorbed_count) = split_interactions(num_interactions);
-
-        // Compute committed term columns in parallel (batched pairs only)
-        #[cfg(feature = "parallel")]
-        let committed_columns: Vec<Vec<FieldElement<E>>> = (0..num_committed_pairs)
-            .into_par_iter()
-            .map(|i| {
-                compute_logup_batched_term_column(
-                    &self.auxiliary_trace_build_data.interactions[i * 2],
-                    &self.auxiliary_trace_build_data.interactions[i * 2 + 1],
-                    &main_segment_cols,
-                    trace_len,
-                    challenges,
-                    table_name,
-                )
-            })
-            .collect();
-        #[cfg(not(feature = "parallel"))]
-        let committed_columns: Vec<Vec<FieldElement<E>>> = (0..num_committed_pairs)
-            .map(|i| {
-                compute_logup_batched_term_column(
-                    &self.auxiliary_trace_build_data.interactions[i * 2],
-                    &self.auxiliary_trace_build_data.interactions[i * 2 + 1],
-                    &main_segment_cols,
-                    trace_len,
-                    challenges,
-                    table_name,
-                )
-            })
-            .collect();
-
-        // Compute virtual column for absorbed interactions (NOT written to trace)
-        let virtual_column = if absorbed_count == 2 {
-            compute_logup_batched_term_column(
-                &self.auxiliary_trace_build_data.interactions[num_interactions - 2],
-                &self.auxiliary_trace_build_data.interactions[num_interactions - 1],
-                &main_segment_cols,
-                trace_len,
-                challenges,
-                table_name,
-            )
-        } else {
-            compute_logup_term_column(
-                &self.auxiliary_trace_build_data.interactions[num_interactions - 1],
-                &main_segment_cols,
-                trace_len,
-                challenges,
-                table_name,
-            )
-        };
-
-        // Write only committed columns to trace
-        for (col_idx, col_data) in committed_columns.iter().enumerate() {
-            for (row, value) in col_data.iter().enumerate() {
-                trace.set_aux(row, col_idx, value.clone());
-            }
-        }
-
-        #[cfg(feature = "debug-checks")]
-        let (per_bus_sums, per_bus_sender_sums, per_bus_receiver_sums) =
-            compute_debug_bus_sums_batched(
-                &self.auxiliary_trace_build_data.interactions,
-                &main_segment_cols,
-                trace_len,
-                challenges,
-                table_name,
-            );
-
-        // Build accumulated from all columns (committed + virtual)
-        let mut all_columns = committed_columns;
-        all_columns.push(virtual_column);
-        let acc_col_idx = num_committed_pairs; // accumulated column in trace follows committed columns
-        let table_contribution =
-            build_accumulated_column_from_terms(acc_col_idx, &all_columns, trace);
-
-        Some(BusPublicInputs {
-            table_contribution,
-            #[cfg(feature = "debug-checks")]
-            per_bus_sums,
-            #[cfg(feature = "debug-checks")]
-            per_bus_sender_sums,
-            #[cfg(feature = "debug-checks")]
-            per_bus_receiver_sums,
-            #[cfg(feature = "debug-checks")]
-            table_name: self.name.clone().unwrap_or_else(|| "UNKNOWN".to_string()),
-        })
+        // No BusPublicInputs needed for GKR path — the GKR result replaces it.
+        None
     }
 
     fn build_rap_challenges(
@@ -1015,20 +873,12 @@ where
         pub_inputs: &Self::PublicInputs,
         rap_challenges: &[FieldElement<E>],
         _bus_public_inputs: Option<&BusPublicInputs<E>>,
-        trace_length: usize,
+        _trace_length: usize,
     ) -> BoundaryConstraints<E> {
-        let mut boundary_constraints = B::boundary_constraints(pub_inputs, rap_challenges);
+        let boundary_constraints = B::boundary_constraints(pub_inputs, rap_challenges);
 
-        // Pin acc[N-1] = 0 to remove the constant-shift degree of freedom
-        // in the circular transition constraint.
-        if !self.auxiliary_trace_build_data.interactions.is_empty() {
-            let acc_col_idx = self.trace_layout.1 - 1; // last aux column = accumulated
-            boundary_constraints.push(BoundaryConstraint::new_aux(
-                acc_col_idx,
-                trace_length - 1,
-                FieldElement::zero(),
-            ));
-        }
+        // LogUp-GKR: no boundary constraints on the Lagrange kernel column.
+        // The old acc[N-1]=0 pin is no longer needed since there is no accumulated column.
 
         BoundaryConstraints::from_constraints(boundary_constraints)
     }
@@ -1248,7 +1098,7 @@ where
 ///
 /// This is a pure function that takes shared main columns and returns the computed column,
 /// enabling parallel computation across interactions within a table.
-#[allow(clippy::needless_range_loop)]
+#[allow(dead_code, clippy::needless_range_loop)]
 fn compute_logup_term_column<F, E>(
     table_interaction: &BusInteraction,
     main_segment_cols: &[Vec<FieldElement<F>>],
@@ -1393,7 +1243,7 @@ where
 /// Each row contains: `term[i] = sign_a * m_a[i] / fp_a[i] + sign_b * m_b[i] / fp_b[i]`
 ///
 /// Uses a single batch inversion for both fingerprint vectors (2*N elements).
-#[allow(clippy::needless_range_loop)]
+#[allow(dead_code, clippy::needless_range_loop)]
 fn compute_logup_batched_term_column<F, E>(
     interaction_a: &BusInteraction,
     interaction_b: &BusInteraction,
@@ -1533,6 +1383,7 @@ where
 /// Result: acc[N-1] = L - N*(L/N) = 0
 ///
 /// Returns L (table_contribution = sum of all terms across all rows).
+#[allow(dead_code)]
 fn build_accumulated_column_from_terms<F, E>(
     acc_column_idx: usize,
     term_columns: &[Vec<FieldElement<E>>],
@@ -1630,353 +1481,11 @@ where
     (bus_sums, sender_sums, receiver_sums)
 }
 
-/// Computes multiplicity for an interaction from a `TableView`.
-fn compute_multiplicity_from_step<A: IsSubFieldOf<B>, B: IsField>(
-    step: &TableView<A, B>,
-    multiplicity: &Multiplicity,
-) -> FieldElement<A> {
-    match multiplicity {
-        Multiplicity::One => FieldElement::<A>::one(),
-        Multiplicity::Column(col) => step.get_main_evaluation_element(0, *col).clone(),
-        Multiplicity::Sum(col_a, col_b) => {
-            step.get_main_evaluation_element(0, *col_a)
-                + step.get_main_evaluation_element(0, *col_b)
-        }
-        Multiplicity::Negated(col) => {
-            FieldElement::<A>::one() - step.get_main_evaluation_element(0, *col)
-        }
-        Multiplicity::Linear(terms) => {
-            let mut result = FieldElement::<A>::zero();
-            for term in terms {
-                match term {
-                    LinearTerm::Column {
-                        coefficient,
-                        column,
-                    } => {
-                        let coeff = FieldElement::<A>::from(*coefficient);
-                        result += step.get_main_evaluation_element(0, *column) * coeff;
-                    }
-                    LinearTerm::ColumnUnsigned {
-                        coefficient,
-                        column,
-                    } => {
-                        let coeff = FieldElement::<A>::from(*coefficient);
-                        result += step.get_main_evaluation_element(0, *column) * coeff;
-                    }
-                    LinearTerm::Constant(value) => {
-                        result += FieldElement::<A>::from(*value);
-                    }
-                }
-            }
-            result
-        }
-    }
-}
+// LogUp constraints (LookupBatchedTermConstraint, LookupAccumulatedConstraint) and
+// per-row helper functions (compute_multiplicity_from_step, compute_fingerprint_from_step)
+// have been removed. The LogUp-GKR sub-protocol replaces per-row accumulated columns with a
+// Lagrange kernel column and bridge quotients in the composition polynomial.
 
-/// Computes the fingerprint for an interaction from a `TableView`.
-///
-/// Returns `z - (bus_id*α^0 + v[0]*α^1 + v[1]*α^2 + ...)`
-fn compute_fingerprint_from_step<A: IsSubFieldOf<B>, B: IsField>(
-    step: &TableView<A, B>,
-    interaction: &BusInteraction,
-    z: &FieldElement<B>,
-    alpha_powers: &[FieldElement<B>],
-) -> FieldElement<B> {
-    let bus_id_ext: FieldElement<B> = FieldElement::from(interaction.bus_id);
-    let mut linear_combination = &bus_id_ext * &alpha_powers[0];
-    let mut alpha_idx = 1;
-    for bv in &interaction.values {
-        let combined: Vec<FieldElement<A>> =
-            bv.combine_from(|col| step.get_main_evaluation_element(0, col).clone());
-        for v in combined {
-            linear_combination += v * &alpha_powers[alpha_idx];
-            alpha_idx += 1;
-        }
-    }
-
-    z - &linear_combination
-}
-
-/// Constraint for a batched pair of interactions sharing one aux column.
-///
-/// Verifies: `c = m_a/fp_a + m_b/fp_b` where signs are baked into m_a, m_b.
-///
-/// Clearing denominators: `c * fp_a * fp_b - sign_a * m_a * fp_b - sign_b * m_b * fp_a = 0`
-///
-/// Degree 3: c (aux) × fp_a (linear in main) × fp_b (linear in main).
-struct LookupBatchedTermConstraint {
-    interaction_a: BusInteraction,
-    interaction_b: BusInteraction,
-    term_column_idx: usize,
-    constraint_idx: usize,
-}
-
-impl LookupBatchedTermConstraint {
-    pub fn new(
-        interaction_a: BusInteraction,
-        interaction_b: BusInteraction,
-        term_column_idx: usize,
-        constraint_idx: usize,
-    ) -> Self {
-        Self {
-            interaction_a,
-            interaction_b,
-            term_column_idx,
-            constraint_idx,
-        }
-    }
-}
-
-impl<F, E> TransitionConstraint<F, E> for LookupBatchedTermConstraint
-where
-    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
-    E: IsField + Send + Sync,
-{
-    fn degree(&self) -> usize {
-        3 // c * fp_a * fp_b
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn end_exemptions(&self) -> usize {
-        0
-    }
-
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<F, E>,
-        transition_evaluations: &mut [FieldElement<E>],
-    ) {
-        fn evaluate_batched_term_constraint<A: IsSubFieldOf<B>, B: IsField>(
-            step: &TableView<A, B>,
-            term_column_idx: usize,
-            interaction_a: &BusInteraction,
-            interaction_b: &BusInteraction,
-            rap_challenges: &&[FieldElement<B>],
-            alpha_powers: &[FieldElement<B>],
-        ) -> FieldElement<B> {
-            let c = step.get_aux_evaluation_element(0, term_column_idx);
-            let z = &rap_challenges[LOGUP_CHALLENGE_Z];
-
-            let m_a = compute_multiplicity_from_step(step, &interaction_a.multiplicity);
-            let m_b = compute_multiplicity_from_step(step, &interaction_b.multiplicity);
-
-            let fp_a = compute_fingerprint_from_step(step, interaction_a, z, alpha_powers);
-            let fp_b = compute_fingerprint_from_step(step, interaction_b, z, alpha_powers);
-
-            let sign_a: FieldElement<B> = if interaction_a.is_sender {
-                FieldElement::one()
-            } else {
-                -FieldElement::one()
-            };
-            let sign_b: FieldElement<B> = if interaction_b.is_sender {
-                FieldElement::one()
-            } else {
-                -FieldElement::one()
-            };
-
-            // c * fp_a * fp_b - sign_a * m_a * fp_b - sign_b * m_b * fp_a = 0
-            c * &fp_a * &fp_b - m_a * sign_a * &fp_b - m_b * sign_b * &fp_a
-        }
-
-        let res = match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                rap_challenges,
-                logup_alpha_powers,
-                ..
-            } => evaluate_batched_term_constraint(
-                frame.get_evaluation_step(0),
-                self.term_column_idx,
-                &self.interaction_a,
-                &self.interaction_b,
-                rap_challenges,
-                logup_alpha_powers,
-            ),
-            TransitionEvaluationContext::Verifier {
-                frame,
-                rap_challenges,
-                logup_alpha_powers,
-                ..
-            } => evaluate_batched_term_constraint(
-                frame.get_evaluation_step(0),
-                self.term_column_idx,
-                &self.interaction_a,
-                &self.interaction_b,
-                rap_challenges,
-                logup_alpha_powers,
-            ),
-        };
-
-        if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx) {
-            *eval = res;
-        }
-    }
-}
-
-/// Constraint for the accumulated column with absorbed interactions.
-///
-/// The accumulated column tracks the running sum of all committed term columns
-/// plus 1-2 "absorbed" interactions whose terms are verified inline (not committed).
-///
-/// For 1 absorbed interaction:
-///   `(acc_next - acc_curr - Σ terms + L/N) · f - sign · m = 0` (degree 2)
-///
-/// For 2 absorbed interactions:
-///   `(acc_next - acc_curr - Σ terms + L/N) · f₁·f₂ - sign₁·m₁·f₂ - sign₂·m₂·f₁ = 0` (degree 3)
-struct LookupAccumulatedConstraint {
-    constraint_idx: usize,
-    /// Number of committed term columns (excludes absorbed interactions)
-    num_term_columns: usize,
-    /// Index of the accumulated column (= num_term_columns)
-    acc_column_idx: usize,
-    /// 1 or 2 interactions absorbed into this constraint (not committed as columns)
-    absorbed: Vec<BusInteraction>,
-}
-
-impl LookupAccumulatedConstraint {
-    pub fn new(
-        constraint_idx: usize,
-        num_term_columns: usize,
-        absorbed: Vec<BusInteraction>,
-    ) -> Self {
-        Self {
-            constraint_idx,
-            num_term_columns,
-            acc_column_idx: num_term_columns,
-            absorbed,
-        }
-    }
-}
-
-impl<F, E> TransitionConstraint<F, E> for LookupAccumulatedConstraint
-where
-    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
-    E: IsField + Send + Sync,
-{
-    fn degree(&self) -> usize {
-        1 + self.absorbed.len() // 2 for 1 absorbed, 3 for 2 absorbed
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn end_exemptions(&self) -> usize {
-        0 // Circular constraint applies to all rows including last→first wrap
-    }
-
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<F, E>,
-        transition_evaluations: &mut [FieldElement<E>],
-    ) {
-        #[allow(clippy::too_many_arguments)]
-        fn evaluate_accumulated_constraint<A: IsSubFieldOf<B>, B: IsField>(
-            first_step: &TableView<A, B>,
-            second_step: &TableView<A, B>,
-            acc_column_idx: usize,
-            num_term_columns: usize,
-            logup_table_offset: &FieldElement<B>,
-            absorbed: &[BusInteraction],
-            rap_challenges: &&[FieldElement<B>],
-            alpha_powers: &[FieldElement<B>],
-        ) -> FieldElement<B> {
-            // Accumulated column values
-            let acc_curr = first_step.get_aux_evaluation_element(0, acc_column_idx);
-            let acc_next = second_step.get_aux_evaluation_element(0, acc_column_idx);
-
-            // Sum of all committed term columns at the next step
-            let terms_sum: FieldElement<B> = (0..num_term_columns)
-                .map(|i| second_step.get_aux_evaluation_element(0, i).clone())
-                .sum();
-
-            // delta = acc_next - acc_curr - terms_sum + L/N
-            let delta = acc_next - acc_curr - terms_sum + logup_table_offset;
-
-            let z = &rap_challenges[LOGUP_CHALLENGE_Z];
-
-            // Clear denominators of absorbed interactions
-            debug_assert!(matches!(absorbed.len(), 1 | 2));
-            match absorbed.len() {
-                1 => {
-                    // (delta) · f - sign · m = 0
-                    let m = compute_multiplicity_from_step(second_step, &absorbed[0].multiplicity);
-                    let f =
-                        compute_fingerprint_from_step(second_step, &absorbed[0], z, alpha_powers);
-                    let sign: FieldElement<B> = if absorbed[0].is_sender {
-                        FieldElement::one()
-                    } else {
-                        -FieldElement::one()
-                    };
-                    delta * &f - m * sign
-                }
-                2 => {
-                    // (delta) · f₁ · f₂ - sign₁·m₁·f₂ - sign₂·m₂·f₁ = 0
-                    let m1 = compute_multiplicity_from_step(second_step, &absorbed[0].multiplicity);
-                    let m2 = compute_multiplicity_from_step(second_step, &absorbed[1].multiplicity);
-                    let f1 =
-                        compute_fingerprint_from_step(second_step, &absorbed[0], z, alpha_powers);
-                    let f2 =
-                        compute_fingerprint_from_step(second_step, &absorbed[1], z, alpha_powers);
-                    let sign1: FieldElement<B> = if absorbed[0].is_sender {
-                        FieldElement::one()
-                    } else {
-                        -FieldElement::one()
-                    };
-                    let sign2: FieldElement<B> = if absorbed[1].is_sender {
-                        FieldElement::one()
-                    } else {
-                        -FieldElement::one()
-                    };
-                    delta * &f1 * &f2 - m1 * sign1 * &f2 - m2 * sign2 * &f1
-                }
-                _ => unreachable!("absorbed must contain 1 or 2 interactions"),
-            }
-        }
-
-        let res = match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                logup_table_offset,
-                rap_challenges,
-                logup_alpha_powers,
-                ..
-            } => evaluate_accumulated_constraint(
-                frame.get_evaluation_step(0),
-                frame.get_evaluation_step(1),
-                self.acc_column_idx,
-                self.num_term_columns,
-                logup_table_offset,
-                &self.absorbed,
-                rap_challenges,
-                logup_alpha_powers,
-            ),
-            TransitionEvaluationContext::Verifier {
-                frame,
-                logup_table_offset,
-                rap_challenges,
-                logup_alpha_powers,
-                ..
-            } => evaluate_accumulated_constraint(
-                frame.get_evaluation_step(0),
-                frame.get_evaluation_step(1),
-                self.acc_column_idx,
-                self.num_term_columns,
-                logup_table_offset,
-                &self.absorbed,
-                rap_challenges,
-                logup_alpha_powers,
-            ),
-        };
-
-        if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx) {
-            *eval = res;
-        }
-    }
-}
 
 // =============================================================================
 // LogUp-GKR Leaf Fraction Computation

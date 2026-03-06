@@ -1490,13 +1490,11 @@ pub trait IsStarkProver<
         };
 
         // =====================================================================
-        // Round 1, Phase B': GKR sub-protocol (isolated transcript)
+        // Round 1, Phase B': GKR sub-protocol (main transcript)
         // =====================================================================
         // For each table with bus interactions, run the LogUp-GKR sub-protocol.
-        // Uses a cloned transcript so the GKR proof generation does not alter
-        // the main transcript state — the verifier does not process GKR yet.
-        // Once the verifier is updated (Task 11+), the GKR will use the main
-        // transcript directly.
+        // GKR messages are bound to the main Fiat-Shamir chain so the verifier
+        // can replay them.
 
         let gkr_results: Vec<Option<LogUpGkrResult<FieldExtension>>> = air_trace_pairs
             .iter()
@@ -1505,13 +1503,12 @@ pub trait IsStarkProver<
                     let interactions = air.bus_interactions();
                     let main_segment_cols = trace.columns_main();
                     let trace_len = trace.num_rows();
-                    let mut gkr_transcript = transcript.clone();
                     Some(crate::lookup::run_logup_gkr(
                         interactions,
                         &main_segment_cols,
                         trace_len,
                         &lookup_challenges,
-                        &mut gkr_transcript,
+                        transcript,
                     ))
                 } else {
                     None
@@ -1523,29 +1520,35 @@ pub trait IsStarkProver<
         // Phase C + Rounds 2-4: Forked per table
         // =====================================================================
         // Each table gets an independent transcript fork (cloned from the shared
-        // state after Phase B, domain-separated by table index). This matches
+        // state after Phase B', domain-separated by table index). This matches
         // the verifier's forking and makes per-table proving independent.
         //
-        // Split into two passes for parallelism:
-        //   Pass 1 (parallel): Build all auxiliary traces (fingerprint + batch inversion)
-        //   Pass 2 (sequential): Fork transcript → extract → LDE → commit (shared pool)
+        // For LogUp-GKR tables: build Lagrange kernel as the single aux column.
+        // For tables without interactions: no aux trace.
 
-        // Pass 1: Build aux traces in parallel.
-        // Each build_auxiliary_trace has internal parallelism (batch_inverse, par_chunks),
-        // but outer parallelism over 12 tables also helps on high-core-count machines.
-        #[cfg(feature = "parallel")]
-        let aux_iter = air_trace_pairs.par_iter_mut();
-        #[cfg(not(feature = "parallel"))]
-        let aux_iter = air_trace_pairs.iter_mut();
-        let bus_inputs_vec: Vec<Option<BusPublicInputs<FieldExtension>>> = aux_iter
-            .map(|(air, trace, _)| {
-                if air.has_aux_trace() {
-                    air.build_auxiliary_trace(*trace, &lookup_challenges)
-                } else {
-                    None
+        // Pass 1: Build aux traces (Lagrange kernel for GKR tables).
+        for ((air, trace, _), gkr_result) in
+            air_trace_pairs.iter_mut().zip(gkr_results.iter())
+        {
+            if air.has_trace_interaction() {
+                if let Some(result) = gkr_result {
+                    // Compute Lagrange kernel from the GKR random point
+                    let kernel =
+                        crate::lagrange_kernel::compute_lagrange_kernel(&result.random_point);
+                    // Allocate aux table (1 column) and fill with kernel values
+                    let (_, num_aux_columns) = air.trace_layout();
+                    if num_aux_columns > 0 && trace.num_aux_columns == 0 {
+                        trace.allocate_aux_table(num_aux_columns);
+                    }
+                    for (row, val) in kernel.into_iter().enumerate() {
+                        trace.set_aux(row, 0, val);
+                    }
                 }
-            })
-            .collect();
+            } else if air.has_aux_trace() {
+                // Non-interaction aux traces (generic RAP) — build as before
+                air.build_auxiliary_trace(*trace, &lookup_challenges);
+            }
+        }
 
         // Pass 2: Sequential fork transcript → extract → LDE → commit.
         // Uses shared aux_pool. Each table gets its own transcript fork.
@@ -1555,10 +1558,9 @@ pub trait IsStarkProver<
         let mut gkr_results_iter = gkr_results.into_iter();
         for (
             idx,
-            ((((air, trace, _pub_inputs), bus_public_inputs), main_commit), (domain, twiddles)),
+            (((air, trace, _pub_inputs), main_commit), (domain, twiddles)),
         ) in air_trace_pairs
             .iter()
-            .zip(bus_inputs_vec.into_iter())
             .zip(main_commits.into_iter())
             .zip(domains.iter().zip(twiddle_caches.iter()))
             .enumerate()
@@ -1598,7 +1600,7 @@ pub trait IsStarkProver<
                 aux_merkle_tree: aux_tree,
                 aux_merkle_root: aux_root,
                 rap_challenges: lookup_challenges.clone(),
-                bus_public_inputs,
+                bus_public_inputs: None, // LogUp-GKR: no bus_public_inputs needed
                 logup_gkr_result: gkr_result,
             });
             table_transcripts.push(table_transcript);
