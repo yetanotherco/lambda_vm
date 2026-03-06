@@ -92,12 +92,7 @@ pub fn accum_r1_aux(lde: Duration, merkle: Duration) {
 }
 
 pub fn take_r1_sub() -> Round1SubOps {
-    R1_SUB.with(|cell| {
-        std::mem::replace(
-            &mut *cell.borrow_mut(),
-            Round1SubOps::default(),
-        )
-    })
+    R1_SUB.with(|cell| std::mem::replace(&mut *cell.borrow_mut(), Round1SubOps::default()))
 }
 
 pub fn store_r2_sub(constraints: Duration, fft: Duration, merkle: Duration) {
