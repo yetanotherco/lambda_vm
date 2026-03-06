@@ -725,7 +725,7 @@ impl ShiftConstraint {
                 &ls * (&one - &ls)
             }
             ShiftConstraintKind::OutputMatchesShifted(i) => {
-                // C14: out[i] - (shifted::DWordWL)[i] = 0
+                // C12.i: out[i] - (shifted::DWordWL)[i] = 0
                 // (shifted::DWordWL)[i] = shifted[2*i] + shifted[2*i+1] * 2^16
                 let out_col = if i == 0 { cols::OUT_0 } else { cols::OUT_1 };
                 let out = step.get_main_evaluation_element(0, out_col).clone();
@@ -790,28 +790,28 @@ pub fn shift_constraints(constraint_idx_start: usize) -> (Vec<ShiftConstraint>, 
         idx += 1;
     };
 
-    // C1: direction * (1 - μ) = 0
+    // C13: direction * (1 - μ) = 0
     push(ShiftConstraintKind::DirectionImpliesMu);
 
-    // C7.i: zbs * (X[i] - in[i] * left) = 0
+    // C5.i: zbs * (X[i] - in[i] * left) = 0
     for i in 0..4 {
         push(ShiftConstraintKind::ZbsOverrideX(i));
     }
 
-    // C9: zbs * X[4] = 0
+    // C7: zbs * X[4] = 0
     push(ShiftConstraintKind::ZbsOverrideX4);
 
-    // C11.i: zbs * (Y[i] - in[i] * right) = 0
+    // C9.i: zbs * (Y[i] - in[i] * right) = 0
     for i in 0..4 {
         push(ShiftConstraintKind::ZbsOverrideY(i));
     }
 
-    // C12.i: IS_BIT<limb_shift[i]>
+    // C10.i: IS_BIT<limb_shift[i]>
     for i in 0..4 {
         push(ShiftConstraintKind::LimbShiftIsBit(i));
     }
 
-    // C14.i: out[i] - (shifted::DWordWL)[i] = 0
+    // C12.i: out[i] - (shifted::DWordWL)[i] = 0
     for i in 0..2 {
         push(ShiftConstraintKind::OutputMatchesShifted(i));
     }
@@ -840,7 +840,7 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
         let left = !op.direction;
         let right = op.direction;
 
-        // C2: MSB16[in[3]] | signed
+        // C14: MSB16[in[3]] | signed
         if op.signed {
             let x = (op.in_halves[3] & 0xFF) as u8;
             let y = (op.in_halves[3] >> 8) as u8;
@@ -851,7 +851,7 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
             ));
         }
 
-        // C3: AND_BYTE[shift, 15] | left (= μ - direction = 1 - direction)
+        // C1: AND_BYTE[shift, 15] | left (= μ - direction = 1 - direction)
         if left {
             bitwise_ops.push(BitwiseOperation::byte_op(
                 BitwiseOperationType::AndByte,
@@ -860,7 +860,7 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
             ));
         }
 
-        // C4: AND_BYTE[256 - zbs*16 - shift, 15] | right (= direction)
+        // C2: AND_BYTE[256 - zbs*16 - shift, 15] | right (= direction)
         if right {
             let zbs_16: u16 = if aux.zbs { 16 } else { 0 };
             let complement = (256u16 - zbs_16 - op.shift as u16) as u8;
@@ -871,10 +871,10 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
             ));
         }
 
-        // C5: ZERO[bit_shift] | μ (= 1)
+        // C3: ZERO[bit_shift] | μ (= 1)
         bitwise_ops.push(BitwiseOperation::zero(aux.bit_shift as u32));
 
-        // C6.i + C8 + C10.i: HWSL/HWSLC lookups | 1-zbs
+        // C4.i + C6 + C8.i: HWSL/HWSLC lookups | 1-zbs
         if !aux.zbs {
             for i in 0..4 {
                 let x = (op.in_halves[i] & 0xFF) as u8;
@@ -886,7 +886,7 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
                     aux.bit_shift,
                 ));
             }
-            // C8: HWSL[extension, bit_shift]
+            // C6: HWSL[extension, bit_shift]
             let extension: u16 = if aux.is_negative { 0xFFFF } else { 0 };
             let ext_x = (extension & 0xFF) as u8;
             let ext_y = (extension >> 8) as u8;
@@ -897,7 +897,7 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
                 aux.bit_shift,
             ));
 
-            // C10.i: HWSLC lookups | 1-zbs
+            // C8.i: HWSLC lookups | 1-zbs
             for i in 0..4 {
                 let x = (op.in_halves[i] & 0xFF) as u8;
                 let y = (op.in_halves[i] >> 8) as u8;
@@ -910,7 +910,7 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
             }
         }
 
-        // C13: AND_BYTE[shift, mask] | μ (= 1)
+        // C11: AND_BYTE[shift, mask] | μ (= 1)
         let mask = if op.word_instr { 16 } else { 48 };
         bitwise_ops.push(BitwiseOperation::byte_op(
             BitwiseOperationType::AndByte,
