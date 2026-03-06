@@ -359,20 +359,30 @@ pub fn gkr_prove<E: IsField>(
             let mut challenges = Vec::with_capacity(parent_num_vars);
             let mut round_combined_claim = combined_claim.clone();
 
-            for _round in 0..parent_num_vars {
+            for round_idx in 0..parent_num_vars {
                 let half = nl_table.len() / 2;
 
-                // Evaluate the round polynomial at t = 0, 2, 3 (skip t=1).
-                // p(1) = round_combined_claim - p(0) from the sumcheck identity.
+                // Eq polynomial factoring (Dao-Thaler, ePrint 2024/1210):
                 //
-                // For linear interpolation f(t) = l*(1-t) + r*t:
-                //   t=0: f = l (no multiply)
-                //   t=2: f = 2r - l (additions only)
-                //   t=3: f = 3r - 2l = (2r-l) + (r-l) (additions only, builds on t=2)
+                // Factor eq(current_point, b) into:
+                //   eq_prefix (scalar from previous rounds) *
+                //   eq_round(r, t) (linear in t, constant across pairs) *
+                //   eq_remaining[j] (per-pair scalar, independent of t)
+                //
+                // where r = current_point[round_idx] and
+                //   eq_remaining[j] = eq_table[2j] + eq_table[2j+1]
+                //
+                // The inner sum h(t) = Σ_j eq_rem[j] * gate(t, j) is degree 2,
+                // needing only 2 eval points (t=0, t=2) per pair instead of 3.
+                // Then S(t) = eq_round(r, t) * h(t) recovers the degree-3 round poly.
+                let r_round = &current_point[round_idx];
+                let one = FieldElement::<E>::one();
+
                 let compute_pair_sums =
-                    |j: usize|
-                     -> [FieldElement<E>; 3] {
-                        let eq_l = &eq_table[2 * j];
+                    |j: usize| -> [FieldElement<E>; 2] {
+                        // Per-pair eq weight (scalar, independent of t)
+                        let eq_rem = &eq_table[2 * j] + &eq_table[2 * j + 1];
+
                         let nl_l = &nl_table[2 * j];
                         let nl_r = &nl_table[2 * j + 1];
                         let nr_l = &nr_table[2 * j];
@@ -383,66 +393,74 @@ pub fn gkr_prove<E: IsField>(
                         let dr_r = &dr_table[2 * j + 1];
 
                         // t=0: interpolated values are just the left values
-                        let gate_0 = &(nl_l * dr_l) + &(nr_l * dl_l) + &(&lambda * &(dl_l * dr_l));
-                        let s0 = eq_l * &gate_0;
+                        let gate_0 =
+                            &(nl_l * dr_l) + &(nr_l * dl_l) + &(&lambda * &(dl_l * dr_l));
+                        let h0 = &eq_rem * &gate_0;
 
-                        // t=1 skipped — derived from round_combined_claim
-
-                        // t=2: val = 2*right - left = right + (right - left)
-                        let eq_r = &eq_table[2 * j + 1];
-                        let eq_2 = &(eq_r + eq_r) - eq_l;
+                        // t=2: val = 2*right - left
                         let nl_2 = &(nl_r + nl_r) - nl_l;
                         let nr_2 = &(nr_r + nr_r) - nr_l;
                         let dl_2 = &(dl_r + dl_r) - dl_l;
                         let dr_2 = &(dr_r + dr_r) - dr_l;
-                        let gate_2 = &(&nl_2 * &dr_2) + &(&nr_2 * &dl_2) + &(&lambda * &(&dl_2 * &dr_2));
-                        let s2 = &eq_2 * &gate_2;
+                        let gate_2 = &(&nl_2 * &dr_2)
+                            + &(&nr_2 * &dl_2)
+                            + &(&lambda * &(&dl_2 * &dr_2));
+                        let h2 = &eq_rem * &gate_2;
 
-                        // t=3: val = 3*right - 2*left = (2r-l) + (r-l)
-                        let eq_3 = &(&eq_2 + eq_r) - eq_l;
-                        let nl_3 = &(&nl_2 + nl_r) - nl_l;
-                        let nr_3 = &(&nr_2 + nr_r) - nr_l;
-                        let dl_3 = &(&dl_2 + dl_r) - dl_l;
-                        let dr_3 = &(&dr_2 + dr_r) - dr_l;
-                        let gate_3 = &(&nl_3 * &dr_3) + &(&nr_3 * &dl_3) + &(&lambda * &(&dl_3 * &dr_3));
-                        let s3 = &eq_3 * &gate_3;
-
-                        [s0, s2, s3]
+                        [h0, h2]
                     };
 
-                let zero3 = || {
-                    [
-                        FieldElement::<E>::zero(),
-                        FieldElement::<E>::zero(),
-                        FieldElement::<E>::zero(),
-                    ]
-                };
-                let add3 = |a: [FieldElement<E>; 3], b: [FieldElement<E>; 3]| {
-                    [
-                        &a[0] + &b[0],
-                        &a[1] + &b[1],
-                        &a[2] + &b[2],
-                    ]
+                let zero2 =
+                    || [FieldElement::<E>::zero(), FieldElement::<E>::zero()];
+                let add2 = |a: [FieldElement<E>; 2], b: [FieldElement<E>; 2]| {
+                    [&a[0] + &b[0], &a[1] + &b[1]]
                 };
 
                 #[cfg(feature = "parallel")]
-                let totals: [FieldElement<E>; 3] = if half >= 256 {
+                let totals: [FieldElement<E>; 2] = if half >= 256 {
                     (0..half)
                         .into_par_iter()
-                        .fold(zero3, |acc, j| add3(acc, compute_pair_sums(j)))
-                        .reduce(zero3, add3)
+                        .fold(zero2, |acc, j| add2(acc, compute_pair_sums(j)))
+                        .reduce(zero2, add2)
                 } else {
-                    (0..half).fold(zero3(), |acc, j| add3(acc, compute_pair_sums(j)))
+                    (0..half).fold(zero2(), |acc, j| add2(acc, compute_pair_sums(j)))
                 };
 
                 #[cfg(not(feature = "parallel"))]
-                let totals: [FieldElement<E>; 3] =
-                    (0..half).fold(zero3(), |acc, j| add3(acc, compute_pair_sums(j)));
+                let totals: [FieldElement<E>; 2] =
+                    (0..half).fold(zero2(), |acc, j| add2(acc, compute_pair_sums(j)));
 
-                // Derive p(1) = round_combined_claim - p(0) from the sumcheck identity
-                let [total_0, total_2, total_3] = totals;
-                let total_1 = &round_combined_claim - &total_0;
-                let poly_evals = vec![total_0, total_1, total_2, total_3];
+                // Phase 2: Recover S(t) from h(t) and eq_round(r, t).
+                //
+                // eq_round(r, t) = (1-r)(1-t) + r*t
+                //   eq_round(r, 0) = 1-r,  eq_round(r, 1) = r,
+                //   eq_round(r, 2) = 3r-1,  eq_round(r, 3) = 5r-2
+                //
+                // S(0) = (1-r)*h(0), S(1) = round_combined_claim - S(0)
+                // h(1) = S(1)/r, h(3) = 3*h(2) - 3*h(1) + h(0)  (degree-2 extrapolation)
+                // S(2) = (3r-1)*h(2), S(3) = (5r-2)*h(3)
+                let [total_h0, total_h2] = totals;
+
+                let one_minus_r = &one - r_round;
+                let s0 = &one_minus_r * &total_h0;
+                let s1 = &round_combined_claim - &s0;
+
+                let r_inv = r_round
+                    .inv()
+                    .expect("r_round = 0 is probability 2^{-64} for random challenges");
+                let h1 = &s1 * &r_inv;
+
+                let three = FieldElement::<E>::from(3u64);
+                let h3 = &(&(&three * &total_h2) - &(&three * &h1)) + &total_h0;
+
+                let eq_at_2 = &(&three * r_round) - &one;
+                let s2 = &eq_at_2 * &total_h2;
+
+                let eq_at_3 =
+                    &(&FieldElement::<E>::from(5u64) * r_round) - &FieldElement::<E>::from(2u64);
+                let s3 = &eq_at_3 * &h3;
+
+                let poly_evals = vec![s0, s1, s2, s3];
 
                 let round_poly = RoundPoly::new(poly_evals);
 
