@@ -1639,6 +1639,7 @@ pub trait IsStarkProver<
                     &result.column_claims,
                     &gamma,
                     trace_len,
+                    &result.random_point,
                 );
             }
 

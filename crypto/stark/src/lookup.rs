@@ -86,6 +86,14 @@ pub const LOGUP_BRIDGE_OFFSET_IDX: usize = 3;
 /// rap_challenges[LOGUP_GAMMA_POWERS_START + j] = γ^j for j = 0, 1, ..., K-1.
 pub const LOGUP_GAMMA_POWERS_START: usize = 4;
 
+/// Start index of GKR random_point coordinates in rap_challenges.
+/// After gamma_powers[0..K], we append random_point[0..n].
+/// The actual index is LOGUP_GAMMA_POWERS_START + K where K = number of distinct column indices.
+/// Use `logup_random_point_start(interactions)` to compute the concrete index.
+pub fn logup_random_point_start(interactions: &[BusInteraction]) -> usize {
+    LOGUP_GAMMA_POWERS_START + extract_column_indices(interactions).len()
+}
+
 
 // =============================================================================
 // Bus Types
@@ -905,10 +913,25 @@ where
         _bus_public_inputs: Option<&BusPublicInputs<E>>,
         _trace_length: usize,
     ) -> BoundaryConstraints<E> {
-        let boundary_constraints = B::boundary_constraints(pub_inputs, rap_challenges);
+        let mut boundary_constraints = B::boundary_constraints(pub_inputs, rap_challenges);
 
-        // LogUp-GKR: no boundary constraints on the Lagrange kernel column.
-        // The old acc[N-1]=0 pin is no longer needed since there is no accumulated column.
+        // LogUp-GKR: boundary constraint on Lagrange kernel column.
+        // l[0] = eq(bits(0), r) = prod_{j=0}^{n-1} (1 - r_j)
+        // where r_j are the GKR random point coordinates stored in rap_challenges.
+        if self.has_trace_interaction() {
+            let k = extract_column_indices(&self.auxiliary_trace_build_data.interactions).len();
+            let rp_start = LOGUP_GAMMA_POWERS_START + k;
+            if rap_challenges.len() > rp_start {
+                let n = rap_challenges.len() - rp_start;
+                let mut l0_expected = FieldElement::<E>::one();
+                for j in 0..n {
+                    l0_expected =
+                        l0_expected * (FieldElement::<E>::one() - &rap_challenges[rp_start + j]);
+                }
+                // Aux column 0 is the Lagrange kernel; constrain l[0] = prod(1 - r_j)
+                boundary_constraints.push(BoundaryConstraint::new_aux(0, 0, l0_expected));
+            }
+        }
 
         BoundaryConstraints::from_constraints(boundary_constraints)
     }
@@ -1585,24 +1608,29 @@ pub fn compute_bridge_params<E: IsField>(
     (bridge_offset, gamma_powers)
 }
 
-/// Extend rap_challenges with bridge parameters (γ, bridge_offset, gamma_powers).
+/// Extend rap_challenges with bridge parameters (γ, bridge_offset, gamma_powers, random_point).
 ///
 /// After calling this, the rap_challenges vector has:
 /// - [0] = z, [1] = α (original)
 /// - [2] = γ
 /// - [3] = bridge_offset (target/N)
 /// - [4..4+K] = γ^0, γ^1, ..., γ^{K-1}
+/// - [4+K..4+K+n] = random_point[0], ..., random_point[n-1]
 pub fn extend_rap_challenges_with_bridge<E: IsField>(
     rap_challenges: &mut Vec<FieldElement<E>>,
     column_claims: &[(usize, FieldElement<E>)],
     gamma: &FieldElement<E>,
     trace_len: usize,
+    random_point: &[FieldElement<E>],
 ) {
     let (bridge_offset, gamma_powers) = compute_bridge_params(column_claims, gamma, trace_len);
     rap_challenges.push(gamma.clone()); // index 2
     rap_challenges.push(bridge_offset); // index 3
     for gp in gamma_powers {
         rap_challenges.push(gp); // indices 4, 5, ...
+    }
+    for rp in random_point {
+        rap_challenges.push(rp.clone()); // indices 4+K, 4+K+1, ...
     }
 }
 

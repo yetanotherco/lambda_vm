@@ -874,6 +874,47 @@ fn test_tampered_sigma_ood_rejected() {
     );
 }
 
+/// Tampered Lagrange kernel random_point is rejected.
+///
+/// The Lagrange kernel column l[i] is constrained by a boundary constraint:
+///   l[0] = prod_{j=0}^{n-1} (1 - r_j)
+/// where r_j are the GKR random point coordinates stored in the proof.
+///
+/// If we tamper with the random_point in the proof, the verifier will compute
+/// a different expected l[0] value from the (now-corrupted) random_point, which
+/// will not match the committed l[0] in the trace. This causes the boundary
+/// constraint check to fail.
+#[test_log::test]
+fn test_tampered_lagrange_kernel_random_point_rejected() {
+    let (mut multi_proof, airs) = generate_valid_multi_proof();
+
+    // Tamper with the random_point in the CPU table's LogUp-GKR proof.
+    let cpu_proof = &mut multi_proof.proofs[0];
+    if let Some(ref mut gkr_proof) = cpu_proof.logup_gkr_proof {
+        assert!(
+            !gkr_proof.random_point.is_empty(),
+            "CPU must have a non-empty random_point"
+        );
+        // Corrupt the first coordinate by adding 1.
+        gkr_proof.random_point[0] =
+            gkr_proof.random_point[0].clone() + FieldElement::one();
+    } else {
+        panic!("CPU table must have a logup_gkr_proof");
+    }
+
+    let air_refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        airs.iter().map(|a| a as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>).collect();
+
+    assert!(
+        !Verifier::multi_verify(
+            &air_refs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[])
+        ),
+        "Tampered random_point must cause verification failure (Lagrange kernel boundary constraint)"
+    );
+}
+
 // =============================================================================
 // Complex scenarios
 // =============================================================================

@@ -905,6 +905,8 @@ pub trait IsStarkVerifier<
 
         let mut gkr_bridge_claims: Vec<Vec<(usize, FieldElement<FieldExtension>)>> =
             Vec::with_capacity(airs.len());
+        let mut gkr_random_points: Vec<Vec<FieldElement<FieldExtension>>> =
+            Vec::with_capacity(airs.len());
 
         for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
             if air.has_trace_interaction() {
@@ -948,8 +950,10 @@ pub trait IsStarkVerifier<
                 }
 
                 gkr_bridge_claims.push(gkr_proof.column_claims.clone());
+                gkr_random_points.push(gkr_proof.random_point.clone());
             } else {
                 gkr_bridge_claims.push(Vec::new());
+                gkr_random_points.push(Vec::new());
             }
         }
 
@@ -991,6 +995,7 @@ pub trait IsStarkVerifier<
                     &gkr_bridge_claims[idx],
                     &gamma,
                     proof.trace_length,
+                    &gkr_random_points[idx],
                 );
             }
 
