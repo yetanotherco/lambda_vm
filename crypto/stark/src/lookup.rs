@@ -1973,3 +1973,444 @@ where
         }
     }
 }
+
+// =============================================================================
+// LogUp-GKR Leaf Fraction Computation
+// =============================================================================
+
+/// Computes multiplicities for a single interaction across all rows.
+///
+/// Returns a vector of `FieldElement<F>` with length `trace_len`.
+fn compute_multiplicities_for_interaction<F: IsField + IsPrimeField>(
+    interaction: &BusInteraction,
+    main_segment_cols: &[Vec<FieldElement<F>>],
+    trace_len: usize,
+) -> Vec<FieldElement<F>> {
+    match &interaction.multiplicity {
+        Multiplicity::One => vec![FieldElement::one(); trace_len],
+        Multiplicity::Column(col) => main_segment_cols[*col].clone(),
+        Multiplicity::Sum(col_a, col_b) => main_segment_cols[*col_a]
+            .iter()
+            .zip(main_segment_cols[*col_b].iter())
+            .map(|(a, b)| a + b)
+            .collect(),
+        Multiplicity::Negated(col) => main_segment_cols[*col]
+            .iter()
+            .map(|elem| FieldElement::<F>::one() - elem)
+            .collect(),
+        Multiplicity::Linear(terms) => (0..trace_len)
+            .map(|row| {
+                let mut result = FieldElement::<F>::zero();
+                for term in terms {
+                    match *term {
+                        LinearTerm::Column {
+                            coefficient,
+                            column,
+                        } => {
+                            let coeff = FieldElement::<F>::from(coefficient);
+                            result += &main_segment_cols[column][row] * coeff;
+                        }
+                        LinearTerm::ColumnUnsigned {
+                            coefficient,
+                            column,
+                        } => {
+                            let coeff = FieldElement::<F>::from(coefficient);
+                            result += &main_segment_cols[column][row] * coeff;
+                        }
+                        LinearTerm::Constant(value) => {
+                            result += FieldElement::<F>::from(value);
+                        }
+                    }
+                }
+                result
+            })
+            .collect(),
+    }
+}
+
+/// Computes fingerprints for a single interaction across all rows.
+///
+/// Each fingerprint is: `z - (bus_id * α^0 + Σ values * α^{1+...})`
+///
+/// Returns a vector of `FieldElement<E>` with length `trace_len`.
+fn compute_fingerprints_for_interaction<F, E>(
+    interaction: &BusInteraction,
+    main_segment_cols: &[Vec<FieldElement<F>>],
+    trace_len: usize,
+    z: &FieldElement<E>,
+    alpha_powers: &[FieldElement<E>],
+) -> Vec<FieldElement<E>>
+where
+    F: IsField + IsSubFieldOf<E> + IsPrimeField,
+    E: IsField,
+{
+    let bus_id_f = FieldElement::<F>::from(interaction.bus_id);
+    let mut fingerprints = Vec::with_capacity(trace_len);
+    for row in 0..trace_len {
+        let mut linear_combination = &bus_id_f * &alpha_powers[0];
+        let mut alpha_offset = 1;
+        for bv in &interaction.values {
+            let consumed = bv.accumulate_fingerprint(
+                main_segment_cols,
+                row,
+                alpha_powers,
+                alpha_offset,
+                &mut linear_combination,
+            );
+            alpha_offset += consumed;
+        }
+        fingerprints.push(z - &linear_combination);
+    }
+    fingerprints
+}
+
+/// Computes the leaf fractions for the GKR summation tree from a table's bus
+/// interactions and main trace.
+///
+/// For each row `i` in `0..trace_len`, this function combines all K interactions
+/// into a single fraction `N(i) / D(i)` where:
+///
+/// - `D(i) = Π_k fp_k(i)` (product of all fingerprints at row i)
+/// - `N(i) = Σ_k sign_k * m_k(i) * Π_{j≠k} fp_j(i)` (cross-terms)
+///
+/// This is computed iteratively: starting with fraction 0/1, for each interaction k
+/// the running fraction is updated via cross-multiplication:
+///   `n_new = n_old * fp_k + sign_k * m_k * d_old`
+///   `d_new = d_old * fp_k`
+///
+/// Returns `(numerators, denominators)` each of length `trace_len`.
+///
+/// # Arguments
+/// * `interactions` - The bus interactions for this table
+/// * `main_segment_cols` - Column-major main trace data: `main_segment_cols[col][row]`
+/// * `trace_len` - Number of rows in the trace
+/// * `challenges` - LogUp challenges `[z, alpha, ...]`
+pub fn compute_logup_leaf_fractions<F, E>(
+    interactions: &[BusInteraction],
+    main_segment_cols: &[Vec<FieldElement<F>>],
+    trace_len: usize,
+    challenges: &[FieldElement<E>],
+) -> (Vec<FieldElement<E>>, Vec<FieldElement<E>>)
+where
+    F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
+    E: IsField + Send + Sync,
+{
+    assert!(
+        !interactions.is_empty(),
+        "Must have at least one interaction"
+    );
+
+    let z = &challenges[LOGUP_CHALLENGE_Z];
+    let alpha = &challenges[LOGUP_CHALLENGE_ALPHA];
+
+    // Find max bus elements across all interactions for alpha power precomputation
+    let max_bus_elements = interactions
+        .iter()
+        .map(|inter| inter.num_bus_elements())
+        .max()
+        .unwrap();
+    let alpha_powers = compute_alpha_powers(alpha, max_bus_elements);
+
+    // Precompute fingerprints and multiplicities for all interactions
+    let all_fingerprints: Vec<Vec<FieldElement<E>>> = interactions
+        .iter()
+        .map(|inter| {
+            compute_fingerprints_for_interaction(inter, main_segment_cols, trace_len, z, &alpha_powers)
+        })
+        .collect();
+
+    let all_multiplicities: Vec<Vec<FieldElement<F>>> = interactions
+        .iter()
+        .map(|inter| compute_multiplicities_for_interaction(inter, main_segment_cols, trace_len))
+        .collect();
+
+    let all_signs: Vec<FieldElement<E>> = interactions
+        .iter()
+        .map(|inter| {
+            if inter.is_sender {
+                FieldElement::<E>::one()
+            } else {
+                -FieldElement::<E>::one()
+            }
+        })
+        .collect();
+
+    // For each row, combine all interactions into a single fraction using
+    // iterative cross-multiplication.
+    let mut numerators = Vec::with_capacity(trace_len);
+    let mut denominators = Vec::with_capacity(trace_len);
+
+    for row in 0..trace_len {
+        // Start with fraction 0/1
+        let mut running_n = FieldElement::<E>::zero();
+        let mut running_d = FieldElement::<E>::one();
+
+        for k in 0..interactions.len() {
+            let fp_k = &all_fingerprints[k][row];
+            let m_k = &all_multiplicities[k][row];
+
+            // running_n = running_n * fp_k + sign_k * m_k * running_d
+            // running_d = running_d * fp_k
+            let new_n = &running_n * fp_k + m_k * &all_signs[k] * &running_d;
+            let new_d = &running_d * fp_k;
+
+            running_n = new_n;
+            running_d = new_d;
+        }
+
+        numerators.push(running_n);
+        denominators.push(running_d);
+    }
+
+    (numerators, denominators)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
+
+    type F = GoldilocksField;
+    type FE = FieldElement<F>;
+
+    /// Test with 1 sender interaction, 4 rows, 1 column value, Multiplicity::One.
+    ///
+    /// For a single interaction with multiplicity 1 and sign +1 (sender):
+    ///   N(i) = +1 * 1 = 1
+    ///   D(i) = fp(i) = z - (bus_id * α^0 + col_val * α^1)
+    #[test]
+    fn test_compute_logup_leaf_fractions_single_sender() {
+        let trace_len = 4;
+
+        // Column data: 4 rows with values [10, 20, 30, 40]
+        let col0: Vec<FE> = vec![
+            FE::from(10u64),
+            FE::from(20u64),
+            FE::from(30u64),
+            FE::from(40u64),
+        ];
+        let main_segment_cols = vec![col0.clone()];
+
+        // Single sender interaction: bus_id=1, Multiplicity::One, one Direct column
+        let interaction = BusInteraction::sender(
+            1u64,
+            Multiplicity::One,
+            Packing::Direct.columns(&[0]),
+        );
+        let interactions = vec![interaction];
+
+        // Challenges: z=100, alpha=3
+        let z = FE::from(100u64);
+        let alpha = FE::from(3u64);
+        let challenges = vec![z.clone(), alpha.clone()];
+
+        let (numerators, denominators) =
+            compute_logup_leaf_fractions::<F, F>(&interactions, &main_segment_cols, trace_len, &challenges);
+
+        assert_eq!(numerators.len(), trace_len);
+        assert_eq!(denominators.len(), trace_len);
+
+        // For each row, verify:
+        //   fp = z - (bus_id * α^0 + col_val * α^1) = 100 - (1*1 + col_val * 3)
+        //   numerator = 1 (multiplicity * sign)
+        //   denominator = fp
+        let alpha_powers = compute_alpha_powers(&alpha, 2); // [1, 3]
+
+        for row in 0..trace_len {
+            let bus_id_f = FE::from(1u64);
+            let linear_comb = &bus_id_f * &alpha_powers[0] + &col0[row] * &alpha_powers[1];
+            let expected_fp = &z - &linear_comb;
+
+            assert_eq!(
+                numerators[row],
+                FE::one(),
+                "Row {}: numerator should be 1 for sender with Multiplicity::One",
+                row
+            );
+            assert_eq!(
+                denominators[row], expected_fp,
+                "Row {}: denominator should equal fingerprint",
+                row
+            );
+        }
+    }
+
+    /// Test with 1 receiver interaction, Multiplicity::Column, to verify sign and
+    /// multiplicity column extraction.
+    #[test]
+    fn test_compute_logup_leaf_fractions_single_receiver_with_column_multiplicity() {
+        let trace_len = 4;
+
+        // Column 0: values for fingerprint
+        let col0: Vec<FE> = vec![
+            FE::from(5u64),
+            FE::from(6u64),
+            FE::from(7u64),
+            FE::from(8u64),
+        ];
+        // Column 1: multiplicities
+        let col1: Vec<FE> = vec![
+            FE::from(2u64),
+            FE::from(0u64),
+            FE::from(1u64),
+            FE::from(3u64),
+        ];
+        let main_segment_cols = vec![col0.clone(), col1.clone()];
+
+        // Receiver interaction: bus_id=0, Multiplicity from column 1
+        let interaction = BusInteraction::receiver(
+            0u64,
+            Multiplicity::Column(1),
+            Packing::Direct.columns(&[0]),
+        );
+        let interactions = vec![interaction];
+
+        let z = FE::from(50u64);
+        let alpha = FE::from(7u64);
+        let challenges = vec![z.clone(), alpha.clone()];
+
+        let (numerators, denominators) =
+            compute_logup_leaf_fractions::<F, F>(&interactions, &main_segment_cols, trace_len, &challenges);
+
+        let alpha_powers = compute_alpha_powers(&alpha, 2);
+
+        for row in 0..trace_len {
+            let bus_id_f = FE::from(0u64);
+            let linear_comb = &bus_id_f * &alpha_powers[0] + &col0[row] * &alpha_powers[1];
+            let expected_fp = &z - &linear_comb;
+
+            // sign = -1 for receiver, so numerator = -multiplicity
+            let expected_num = -col1[row].clone();
+
+            assert_eq!(
+                numerators[row], expected_num,
+                "Row {}: numerator should be -multiplicity for receiver",
+                row
+            );
+            assert_eq!(
+                denominators[row], expected_fp,
+                "Row {}: denominator should equal fingerprint",
+                row
+            );
+        }
+    }
+
+    /// Test with 2 interactions to verify cross-multiplication combining.
+    ///
+    /// Two interactions combined at each row:
+    ///   fraction = sign_0 * m_0 / fp_0 + sign_1 * m_1 / fp_1
+    ///   = (sign_0 * m_0 * fp_1 + sign_1 * m_1 * fp_0) / (fp_0 * fp_1)
+    #[test]
+    fn test_compute_logup_leaf_fractions_two_interactions() {
+        let trace_len = 2;
+
+        // Column 0: values for interaction 0
+        let col0: Vec<FE> = vec![FE::from(10u64), FE::from(20u64)];
+        // Column 1: values for interaction 1
+        let col1: Vec<FE> = vec![FE::from(30u64), FE::from(40u64)];
+        let main_segment_cols = vec![col0.clone(), col1.clone()];
+
+        // Interaction 0: sender, bus_id=0, Multiplicity::One, column 0
+        let inter0 = BusInteraction::sender(
+            0u64,
+            Multiplicity::One,
+            Packing::Direct.columns(&[0]),
+        );
+        // Interaction 1: receiver, bus_id=1, Multiplicity::One, column 1
+        let inter1 = BusInteraction::receiver(
+            1u64,
+            Multiplicity::One,
+            Packing::Direct.columns(&[1]),
+        );
+        let interactions = vec![inter0, inter1];
+
+        let z = FE::from(200u64);
+        let alpha = FE::from(5u64);
+        let challenges = vec![z.clone(), alpha.clone()];
+
+        let (numerators, denominators) =
+            compute_logup_leaf_fractions::<F, F>(&interactions, &main_segment_cols, trace_len, &challenges);
+
+        let alpha_powers = compute_alpha_powers(&alpha, 2);
+
+        for row in 0..trace_len {
+            // Fingerprint for interaction 0: z - (0 * α^0 + col0[row] * α^1)
+            let bus_id_0 = FE::from(0u64);
+            let lc_0 = &bus_id_0 * &alpha_powers[0] + &col0[row] * &alpha_powers[1];
+            let fp_0 = &z - &lc_0;
+
+            // Fingerprint for interaction 1: z - (1 * α^0 + col1[row] * α^1)
+            let bus_id_1 = FE::from(1u64);
+            let lc_1 = &bus_id_1 * &alpha_powers[0] + &col1[row] * &alpha_powers[1];
+            let fp_1 = &z - &lc_1;
+
+            // Combined fraction:
+            //   n = (+1) * 1 * fp_1 + (-1) * 1 * fp_0
+            //   d = fp_0 * fp_1
+            let expected_n = &fp_1 - &fp_0;
+            let expected_d = &fp_0 * &fp_1;
+
+            assert_eq!(
+                numerators[row], expected_n,
+                "Row {}: numerator mismatch for two-interaction combine",
+                row
+            );
+            assert_eq!(
+                denominators[row], expected_d,
+                "Row {}: denominator mismatch for two-interaction combine",
+                row
+            );
+        }
+    }
+
+    /// Verify that the leaf fractions are consistent with the existing
+    /// `compute_logup_term_column` function for a single interaction.
+    ///
+    /// For 1 interaction: term[i] = sign * m[i] / fp[i] = N[i] / D[i]
+    /// So term[i] * D[i] should equal N[i].
+    #[test]
+    fn test_leaf_fractions_consistent_with_term_column() {
+        let trace_len = 8;
+
+        // Column with some values
+        let col0: Vec<FE> = (1..=8).map(|v| FE::from(v as u64)).collect();
+        let main_segment_cols = vec![col0];
+
+        let interaction = BusInteraction::sender(
+            2u64,
+            Multiplicity::One,
+            Packing::Direct.columns(&[0]),
+        );
+
+        let z = FE::from(1000u64);
+        let alpha = FE::from(11u64);
+        let challenges = vec![z, alpha];
+
+        // Compute leaf fractions
+        let (numerators, denominators) = compute_logup_leaf_fractions::<F, F>(
+            &[interaction.clone()],
+            &main_segment_cols,
+            trace_len,
+            &challenges,
+        );
+
+        // Compute term column (= sign * m / fp)
+        let terms = compute_logup_term_column::<F, F>(
+            &interaction,
+            &main_segment_cols,
+            trace_len,
+            &challenges,
+            "test",
+        );
+
+        // Verify: term[i] * denominator[i] == numerator[i]
+        for row in 0..trace_len {
+            let lhs = &terms[row] * &denominators[row];
+            assert_eq!(
+                lhs, numerators[row],
+                "Row {}: term * denominator should equal numerator",
+                row
+            );
+        }
+    }
+}
