@@ -245,12 +245,13 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 packing: Packing::Direct,
             }],
         ),
-        // AND_BYTE[next_pc_low[0]; unmasked_low_byte, 254]
+        // BitwiseByte[AND, unmasked_low_byte, 254] → next_pc_low[0]
         // Verifies: next_pc_low[0] = unmasked_low_byte & 0xFE
         BusInteraction::sender(
-            BusId::AndByte,
+            BusId::BitwiseByte,
             Multiplicity::Column(cols::MU),
             vec![
+                BusValue::constant(0), // opcode = AND
                 BusValue::Packed {
                     start_column: cols::UNMASKED_LOW_BYTE,
                     packing: Packing::Direct,

@@ -889,10 +889,10 @@ fn collect_bitwise_from_branch(branch_ops: &[BranchOperation]) -> Vec<BitwiseOpe
             next_pc_low_1,
         ));
 
-        // AND_BYTE[unmasked_low_byte, 254] → next_pc_low[0]
+        // BitwiseByte[AND, unmasked_low_byte, 254] → next_pc_low[0]
         // Verifies: next_pc_low[0] = unmasked_low_byte & 0xFE
         bitwise_ops.push(BitwiseOperation::byte_op(
-            BitwiseOperationType::AndByte,
+            bitwise::BITWISE_OP_AND,
             unmasked_low_byte,
             254, // 0xFE mask
         ));

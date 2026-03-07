@@ -52,7 +52,7 @@ pub mod cols {
     pub const X: usize = 0;
     /// Y: Byte input (0-255)
     pub const Y: usize = 1;
-    /// Z: 4-bit input (0-15) for shift amount
+    /// Z: 4-bit input (0-15) for shift amount / bitwise opcode
     pub const Z: usize = 2;
 
     /// AND result: X & Y
@@ -71,40 +71,45 @@ pub mod cols {
     pub const SLL: usize = 9;
     /// Shift left carry: (X + 256*Y) >> (16 - Z)
     pub const SLLC: usize = 10;
+    /// Bitwise result selected by Z: AND when Z=0, OR when Z=1, XOR when Z=2
+    pub const BITWISE_RESULT: usize = 11;
 
     // Multiplicity columns for each lookup type
-    /// Multiplicity for AND_BYTE lookups
-    pub const MU_AND: usize = 11;
-    /// Multiplicity for OR_BYTE lookups
-    pub const MU_OR: usize = 12;
-    /// Multiplicity for XOR_BYTE lookups
-    pub const MU_XOR: usize = 13;
+    /// Multiplicity for unified BitwiseByte lookups (AND/OR/XOR)
+    pub const MU_BITWISE_BYTE: usize = 12;
     /// Multiplicity for MSB8 lookups
-    pub const MU_MSB8: usize = 14;
+    pub const MU_MSB8: usize = 13;
     /// Multiplicity for MSB16 lookups
-    pub const MU_MSB16: usize = 15;
+    pub const MU_MSB16: usize = 14;
     /// Multiplicity for ZERO lookups
-    pub const MU_ZERO: usize = 16;
+    pub const MU_ZERO: usize = 15;
     /// Multiplicity for IS_BYTE lookups
-    pub const MU_IS_BYTE: usize = 17;
+    pub const MU_IS_BYTE: usize = 16;
     /// Multiplicity for IS_HALF lookups
-    pub const MU_IS_HALF: usize = 18;
+    pub const MU_IS_HALF: usize = 17;
     /// Multiplicity for IS_B20 lookups
-    pub const MU_IS_B20: usize = 19;
+    pub const MU_IS_B20: usize = 18;
     /// Multiplicity for HWSL lookups
-    pub const MU_HWSL: usize = 20;
+    pub const MU_HWSL: usize = 19;
     /// Multiplicity for HWSLC lookups
-    pub const MU_HWSLC: usize = 21;
+    pub const MU_HWSLC: usize = 20;
 
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 22;
+    pub const NUM_COLUMNS: usize = 21;
 }
 
 /// Number of rows in the BITWISE table: 256 * 256 * 16 = 2^20
 pub const NUM_ROWS: usize = 256 * 256 * 16;
 
 /// Number of precomputed (non-multiplicity) columns
-pub const NUM_PRECOMPUTED_COLS: usize = 11;
+pub const NUM_PRECOMPUTED_COLS: usize = 12;
+
+/// Opcode for AND in the unified BitwiseByte bus
+pub const BITWISE_OP_AND: u8 = 0;
+/// Opcode for OR in the unified BitwiseByte bus
+pub const BITWISE_OP_OR: u8 = 1;
+/// Opcode for XOR in the unified BitwiseByte bus
+pub const BITWISE_OP_XOR: u8 = 2;
 
 // =========================================================================
 // Compile-time row generation
@@ -118,7 +123,7 @@ pub const NUM_PRECOMPUTED_COLS: usize = 11;
 /// Index encoding: `index = x + y * 256 + z * 65536`
 /// where x, y ∈ [0, 255] and z ∈ [0, 15]
 ///
-/// Returns the 11 precomputed columns: [X, Y, Z, AND, OR, XOR, MSB8, MSB16, ZERO, SLL, SLLC]
+/// Returns the 12 precomputed columns: [X, Y, Z, AND, OR, XOR, MSB8, MSB16, ZERO, SLL, SLLC, BITWISE_RESULT]
 #[inline]
 pub const fn generate_bitwise_row(index: usize) -> [u64; NUM_PRECOMPUTED_COLS] {
     let x = (index & 0xFF) as u32;
@@ -146,18 +151,30 @@ pub const fn generate_bitwise_row(index: usize) -> [u64; NUM_PRECOMPUTED_COLS] {
     };
     let sllc = if z == 0 { 0 } else { halfword >> (16 - z) };
 
+    // Bitwise result selected by opcode (Z)
+    let bitwise_result = if z == 0 {
+        and_val
+    } else if z == 1 {
+        or_val
+    } else if z == 2 {
+        xor_val
+    } else {
+        0
+    };
+
     [
-        x as u64,       // X
-        y as u64,       // Y
-        z as u64,       // Z
-        and_val as u64, // AND
-        or_val as u64,  // OR
-        xor_val as u64, // XOR
-        msb8 as u64,    // MSB8
-        msb16 as u64,   // MSB16
-        is_zero as u64, // ZERO
-        sll as u64,     // SLL
-        sllc as u64,    // SLLC
+        x as u64,              // X
+        y as u64,              // Y
+        z as u64,              // Z
+        and_val as u64,        // AND
+        or_val as u64,         // OR
+        xor_val as u64,        // XOR
+        msb8 as u64,           // MSB8
+        msb16 as u64,          // MSB16
+        is_zero as u64,        // ZERO
+        sll as u64,            // SLL
+        sllc as u64,           // SLLC
+        bitwise_result as u64, // BITWISE_RESULT
     ]
 }
 
@@ -345,6 +362,15 @@ pub fn generate_bitwise_trace() -> TraceTable<GoldilocksField, GoldilocksExtensi
                 data[base + cols::SLL] = FE::from(sll as u64);
                 data[base + cols::SLLC] = FE::from(sllc as u64);
 
+                // Bitwise result selected by opcode (Z)
+                let bitwise_result = match z {
+                    0 => x & y,
+                    1 => x | y,
+                    2 => x ^ y,
+                    _ => 0,
+                };
+                data[base + cols::BITWISE_RESULT] = FE::from(bitwise_result as u64);
+
                 // Multiplicity columns start at zero
                 // They will be updated by update_multiplicities()
             }
@@ -375,9 +401,7 @@ pub fn update_multiplicities(
     for op in ops {
         let row = row_index(op.x, op.y, op.z);
         let mu_col = match op.lookup_type {
-            BitwiseOperationType::AndByte => cols::MU_AND,
-            BitwiseOperationType::OrByte => cols::MU_OR,
-            BitwiseOperationType::XorByte => cols::MU_XOR,
+            BitwiseOperationType::BitwiseByte => cols::MU_BITWISE_BYTE,
             BitwiseOperationType::Msb8 => cols::MU_MSB8,
             BitwiseOperationType::Msb16 => cols::MU_MSB16,
             BitwiseOperationType::Zero => cols::MU_ZERO,
@@ -422,7 +446,7 @@ pub(crate) fn trim_zero_rows(
         .filter(|&row| {
             let row_data = trace.main_table.get_row(row);
             // Check all multiplicity columns (indices 11-21)
-            (cols::MU_AND..=cols::MU_HWSLC).any(|col| row_data[col] != FE::zero())
+            (cols::MU_BITWISE_BYTE..=cols::MU_HWSLC).any(|col| row_data[col] != FE::zero())
         })
         .collect();
 
@@ -453,9 +477,7 @@ pub(crate) fn trim_zero_rows(
 /// Types of lookups the BITWISE table provides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BitwiseOperationType {
-    AndByte,
-    OrByte,
-    XorByte,
+    BitwiseByte,
     Msb8,
     Msb16,
     Zero,
@@ -503,9 +525,11 @@ impl BitwiseOperation {
         }
     }
 
-    /// Create an operation for byte ops (AND, OR, XOR) where z is unused.
-    pub fn byte_op(lookup_type: BitwiseOperationType, x: u8, y: u8) -> Self {
-        Self::new(lookup_type, x, y, 0)
+    /// Create an operation for byte ops (AND, OR, XOR).
+    /// The opcode is encoded in the Z field: 0=AND, 1=OR, 2=XOR.
+    pub fn byte_op(opcode: u8, x: u8, y: u8) -> Self {
+        debug_assert!(opcode <= 2, "Bitwise opcode must be 0 (AND), 1 (OR), or 2 (XOR)");
+        Self::new(BitwiseOperationType::BitwiseByte, x, y, opcode)
     }
 
     /// Create an operation for single-byte ops (MSB8, IS_BYTE).
@@ -551,11 +575,16 @@ impl BitwiseOperation {
 /// in the spec corresponds to receiving lookups from other tables).
 pub fn bus_interactions() -> Vec<BusInteraction> {
     vec![
-        // AND_BYTE[X, Y] -> AND
+        // BitwiseByte[Z, X, Y] -> BITWISE_RESULT
+        // Z encodes opcode: 0=AND, 1=OR, 2=XOR
         BusInteraction::receiver(
-            BusId::AndByte,
-            Multiplicity::Column(cols::MU_AND),
+            BusId::BitwiseByte,
+            Multiplicity::Column(cols::MU_BITWISE_BYTE),
             vec![
+                BusValue::Packed {
+                    start_column: cols::Z,
+                    packing: Packing::Direct,
+                },
                 BusValue::Packed {
                     start_column: cols::X,
                     packing: Packing::Direct,
@@ -565,45 +594,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     packing: Packing::Direct,
                 },
                 BusValue::Packed {
-                    start_column: cols::AND,
-                    packing: Packing::Direct,
-                },
-            ],
-        ),
-        // OR_BYTE[X, Y] -> OR
-        BusInteraction::receiver(
-            BusId::OrByte,
-            Multiplicity::Column(cols::MU_OR),
-            vec![
-                BusValue::Packed {
-                    start_column: cols::X,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::Y,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::OR,
-                    packing: Packing::Direct,
-                },
-            ],
-        ),
-        // XOR_BYTE[X, Y] -> XOR
-        BusInteraction::receiver(
-            BusId::XorByte,
-            Multiplicity::Column(cols::MU_XOR),
-            vec![
-                BusValue::Packed {
-                    start_column: cols::X,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::Y,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::XOR,
+                    start_column: cols::BITWISE_RESULT,
                     packing: Packing::Direct,
                 },
             ],

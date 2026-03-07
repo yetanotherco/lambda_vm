@@ -53,14 +53,12 @@ pub enum BusId {
     // =========================================================================
     // Bitwise operations (BITWISE table provides)
     // =========================================================================
-    /// Bitwise AND of two bytes: AND_BYTE[X, Y] -> X & Y
-    AndByte,
-    /// Bitwise OR of two bytes: OR_BYTE[X, Y] -> X | Y
-    OrByte,
-    /// Bitwise XOR of two bytes: XOR_BYTE[X, Y] -> X ^ Y
-    XorByte,
+    /// Unified bitwise byte operation: BITWISE_BYTE[opcode, X, Y] -> result
+    /// Opcode: 0=AND, 1=OR, 2=XOR (encoded in BITWISE table's Z column)
+    BitwiseByte,
+    // IDs 4 and 5 are unused (gap from removed OrByte/XorByte)
     /// Most significant bit of a byte: MSB8[X] -> (X >> 7) & 1
-    Msb8,
+    Msb8 = 6,
     /// Most significant bit of a halfword: MSB16[X] -> (X >> 15) & 1
     Msb16,
     /// Check if value is zero: ZERO[X] -> X == 0 ? 1 : 0
@@ -115,9 +113,7 @@ impl BusId {
             BusId::IsByte => "IsByte",
             BusId::IsHalfword => "IsHalfword",
             BusId::IsB20 => "IsB20",
-            BusId::AndByte => "AndByte",
-            BusId::OrByte => "OrByte",
-            BusId::XorByte => "XorByte",
+            BusId::BitwiseByte => "BitwiseByte",
             BusId::Msb8 => "Msb8",
             BusId::Msb16 => "Msb16",
             BusId::Zero => "Zero",
@@ -145,9 +141,7 @@ impl TryFrom<u64> for BusId {
             0 => Ok(BusId::IsByte),
             1 => Ok(BusId::IsHalfword),
             2 => Ok(BusId::IsB20),
-            3 => Ok(BusId::AndByte),
-            4 => Ok(BusId::OrByte),
-            5 => Ok(BusId::XorByte),
+            3 => Ok(BusId::BitwiseByte),
             6 => Ok(BusId::Msb8),
             7 => Ok(BusId::Msb16),
             8 => Ok(BusId::Zero),

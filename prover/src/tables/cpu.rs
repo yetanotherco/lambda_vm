@@ -507,43 +507,27 @@ impl CpuOperation {
             lookups.push(BitwiseOperation::zero(sum as u32));
         }
 
-        // AND/OR/XOR lookups (×8 each for each byte)
+        // AND/OR/XOR lookups (×8 for each byte, unified via BitwiseByte bus)
         let arg1 = self.compute_arg1();
         let arg2 = self.compute_arg2();
 
-        if self.decode.op_and {
-            for i in 0..8 {
-                let a = ((arg1 >> (i * 8)) & 0xFF) as u8;
-                let b = ((arg2 >> (i * 8)) & 0xFF) as u8;
-                lookups.push(BitwiseOperation::byte_op(
-                    BitwiseOperationType::AndByte,
-                    a,
-                    b,
-                ));
-            }
-        }
+        use super::bitwise::{BITWISE_OP_AND, BITWISE_OP_OR, BITWISE_OP_XOR};
 
-        if self.decode.op_or {
-            for i in 0..8 {
-                let a = ((arg1 >> (i * 8)) & 0xFF) as u8;
-                let b = ((arg2 >> (i * 8)) & 0xFF) as u8;
-                lookups.push(BitwiseOperation::byte_op(
-                    BitwiseOperationType::OrByte,
-                    a,
-                    b,
-                ));
-            }
-        }
+        let opcode = if self.decode.op_and {
+            Some(BITWISE_OP_AND)
+        } else if self.decode.op_or {
+            Some(BITWISE_OP_OR)
+        } else if self.decode.op_xor {
+            Some(BITWISE_OP_XOR)
+        } else {
+            None
+        };
 
-        if self.decode.op_xor {
+        if let Some(opcode) = opcode {
             for i in 0..8 {
                 let a = ((arg1 >> (i * 8)) & 0xFF) as u8;
                 let b = ((arg2 >> (i * 8)) & 0xFF) as u8;
-                lookups.push(BitwiseOperation::byte_op(
-                    BitwiseOperationType::XorByte,
-                    a,
-                    b,
-                ));
+                lookups.push(BitwiseOperation::byte_op(opcode, a, b));
             }
         }
 
@@ -931,61 +915,38 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // ));
 
     // -------------------------------------------------------------------------
-    // AND_BYTE interactions (×8 for each byte)
+    // BitwiseByte interactions (×8 for each byte, unified AND/OR/XOR)
     // -------------------------------------------------------------------------
     for i in 0..8 {
         interactions.push(BusInteraction::sender(
-            BusId::AndByte,
-            Multiplicity::Column(cols::AND),
+            BusId::BitwiseByte,
+            // Multiplicity: AND + OR + XOR (at most one is 1 per row)
+            Multiplicity::Linear(vec![
+                stark::lookup::LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::AND,
+                },
+                stark::lookup::LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::OR,
+                },
+                stark::lookup::LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::XOR,
+                },
+            ]),
             vec![
-                BusValue::Packed {
-                    start_column: cols::ARG1[i],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::ARG2[i],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::RES[i],
-                    packing: Packing::Direct,
-                },
-            ],
-        ));
-    }
-
-    // -------------------------------------------------------------------------
-    // OR_BYTE interactions (×8)
-    // -------------------------------------------------------------------------
-    for i in 0..8 {
-        interactions.push(BusInteraction::sender(
-            BusId::OrByte,
-            Multiplicity::Column(cols::OR),
-            vec![
-                BusValue::Packed {
-                    start_column: cols::ARG1[i],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::ARG2[i],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::RES[i],
-                    packing: Packing::Direct,
-                },
-            ],
-        ));
-    }
-
-    // -------------------------------------------------------------------------
-    // XOR_BYTE interactions (×8)
-    // -------------------------------------------------------------------------
-    for i in 0..8 {
-        interactions.push(BusInteraction::sender(
-            BusId::XorByte,
-            Multiplicity::Column(cols::XOR),
-            vec![
+                // Opcode: 0*AND + 1*OR + 2*XOR = OR + 2*XOR
+                BusValue::linear(vec![
+                    stark::lookup::LinearTerm::Column {
+                        coefficient: 1,
+                        column: cols::OR,
+                    },
+                    stark::lookup::LinearTerm::Column {
+                        coefficient: 2,
+                        column: cols::XOR,
+                    },
+                ]),
                 BusValue::Packed {
                     start_column: cols::ARG1[i],
                     packing: Packing::Direct,
