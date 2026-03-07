@@ -310,9 +310,7 @@ fn test_bus_interactions_count() {
     let interactions = bus_interactions();
 
     // Expected interactions:
-    // - 8 AND_BYTE
-    // - 8 OR_BYTE
-    // - 8 XOR_BYTE
+    // - 8 BITWISE_BYTE (unified AND/OR/XOR with opcode)
     // - 2 MSB16 (rv1_sign_bit, arg2_sign_bit)
     // - 1 MSB8 (res_sign_bit)
     // - 1 ZERO (is_equal for BEQ)
@@ -327,8 +325,8 @@ fn test_bus_interactions_count() {
     // - 1 DVRM (division/remainder)
     // - 1 BRANCH (branch/jump target calculation)
     // - 1 ECALL (send to HALT table)
-    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 5 + 1 + 1 + 1 + 1 + 1 = 39
-    assert_eq!(interactions.len(), 39);
+    // Total: 8 + 2 + 1 + 1 + 1 + 5 + 1 + 1 + 1 + 1 + 1 = 23
+    assert_eq!(interactions.len(), 23);
 }
 
 #[test]

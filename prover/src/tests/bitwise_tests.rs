@@ -93,8 +93,8 @@ fn test_zero_check() {
 #[test]
 fn test_bus_interactions_count() {
     let interactions = bus_interactions();
-    // Should have 11 interactions (one for each lookup type)
-    assert_eq!(interactions.len(), 11);
+    // Should have 9 interactions: 1 BitwiseByte + 8 others (Msb8, Msb16, Zero, IsByte, IsHalf, IsB20, HWSL, HWSLC)
+    assert_eq!(interactions.len(), 9);
 }
 
 #[test]
@@ -115,6 +115,7 @@ fn test_first_row() {
     assert_eq!(row_data[cols::ZERO], FE::from(1u64)); // 0 and 0 are both zero
     assert_eq!(row_data[cols::SLL], FE::from(0u64)); // 0 << 0 = 0
     assert_eq!(row_data[cols::SLLC], FE::from(0u64)); // 0 >> 16 = 0
+    assert_eq!(row_data[cols::BITWISE_RESULT], FE::from(0u64)); // z=0 (AND): 0 & 0 = 0
 }
 
 #[test]
@@ -138,6 +139,7 @@ fn test_last_row() {
     assert_eq!(row_data[cols::SLL], FE::from(32768u64));
     // SLLC: 65535 >> (16 - 15) = 65535 >> 1 = 32767
     assert_eq!(row_data[cols::SLLC], FE::from(32767u64));
+    assert_eq!(row_data[cols::BITWISE_RESULT], FE::from(0u64)); // z=15 (not AND/OR/XOR): 0
 }
 
 #[test]
@@ -248,7 +250,7 @@ fn test_generate_bitwise_row_matches_trace() {
         let const_row = generate_bitwise_row(idx);
         let trace_row = trace.main_table.get_row(idx);
 
-        // Verify all 11 precomputed columns match
+        // Verify all 12 precomputed columns match
         assert_eq!(const_row.len(), NUM_PRECOMPUTED_COLS);
 
         assert_eq!(
@@ -305,6 +307,11 @@ fn test_generate_bitwise_row_matches_trace() {
             const_row[10],
             trace_row[cols::SLLC].canonical_u64(),
             "SLLC mismatch at index {idx}"
+        );
+        assert_eq!(
+            const_row[11],
+            trace_row[cols::BITWISE_RESULT].canonical_u64(),
+            "BITWISE_RESULT mismatch at index {idx}"
         );
     }
 }
@@ -398,18 +405,20 @@ mod soundness_tests {
     mod sender_cols {
         pub const X: usize = 0;
         pub const Y: usize = 1;
-        pub const AND_RESULT: usize = 2;
-        pub const FLAG: usize = 3; // 1 = perform AND lookup
-        pub const NUM_COLUMNS: usize = 4;
+        pub const RESULT: usize = 2;
+        pub const FLAG: usize = 3; // 1 = perform bitwise lookup
+        pub const OPCODE: usize = 4; // 0=AND, 1=OR, 2=XOR
+        pub const NUM_COLUMNS: usize = 5;
     }
 
     // Column indices for receiver (BITWISE-like) table
     mod receiver_cols {
         pub const X: usize = 0;
         pub const Y: usize = 1;
-        pub const AND: usize = 2;
-        pub const MU_AND: usize = 3;
-        pub const NUM_COLUMNS: usize = 4;
+        pub const OPCODE: usize = 2;
+        pub const BITWISE_RESULT: usize = 3;
+        pub const MU: usize = 4;
+        pub const NUM_COLUMNS: usize = 5;
     }
 
     fn create_sender_air(
@@ -420,9 +429,13 @@ mod soundness_tests {
         let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![BusInteraction::sender(
-                BusId::AndByte,
+                BusId::BitwiseByte,
                 Multiplicity::Column(sender_cols::FLAG),
                 vec![
+                    BusValue::Packed {
+                        start_column: sender_cols::OPCODE,
+                        packing: Packing::Direct,
+                    },
                     BusValue::Packed {
                         start_column: sender_cols::X,
                         packing: Packing::Direct,
@@ -432,7 +445,7 @@ mod soundness_tests {
                         packing: Packing::Direct,
                     },
                     BusValue::Packed {
-                        start_column: sender_cols::AND_RESULT,
+                        start_column: sender_cols::RESULT,
                         packing: Packing::Direct,
                     },
                 ],
@@ -458,8 +471,8 @@ mod soundness_tests {
         proof_options: &ProofOptions,
         commitment: stark::config::Commitment,
     ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
-        // 3 precomputed columns: X, Y, AND (column 3 = MU_AND is multiplicity)
-        create_receiver_air_impl(proof_options, Some((commitment, 3)))
+        // 4 precomputed columns: X, Y, OPCODE, BITWISE_RESULT (column 4 = MU is multiplicity)
+        create_receiver_air_impl(proof_options, Some((commitment, 4)))
     }
 
     fn create_receiver_air_impl(
@@ -471,9 +484,13 @@ mod soundness_tests {
         let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![BusInteraction::receiver(
-                BusId::AndByte,
-                Multiplicity::Column(receiver_cols::MU_AND),
+                BusId::BitwiseByte,
+                Multiplicity::Column(receiver_cols::MU),
                 vec![
+                    BusValue::Packed {
+                        start_column: receiver_cols::OPCODE,
+                        packing: Packing::Direct,
+                    },
                     BusValue::Packed {
                         start_column: receiver_cols::X,
                         packing: Packing::Direct,
@@ -483,7 +500,7 @@ mod soundness_tests {
                         packing: Packing::Direct,
                     },
                     BusValue::Packed {
-                        start_column: receiver_cols::AND,
+                        start_column: receiver_cols::BITWISE_RESULT,
                         packing: Packing::Direct,
                     },
                 ],
@@ -520,8 +537,8 @@ mod soundness_tests {
         // Create a dummy AIR just to get the domain parameters
         let dummy_air = create_receiver_air(proof_options);
 
-        // Use the prover's commitment computation (3 precomputed cols: X, Y, AND)
-        Prover::compute_precomputed_commitment_for_testing(trace, &dummy_air, 3)
+        // Use the prover's commitment computation (4 precomputed cols: X, Y, OPCODE, BITWISE_RESULT)
+        Prover::compute_precomputed_commitment_for_testing(trace, &dummy_air, 4)
             .expect("Failed to compute commitment")
     }
 
@@ -529,24 +546,26 @@ mod soundness_tests {
         let num_rows = 4; // minimum power of 2
         let mut data = vec![FE::zero(); num_rows * sender_cols::NUM_COLUMNS];
 
-        // Row 0: perform AND lookup
+        // Row 0: perform AND lookup (opcode=0)
         data[sender_cols::X] = FE::from(x as u64);
         data[sender_cols::Y] = FE::from(y as u64);
-        data[sender_cols::AND_RESULT] = FE::from(claimed_result as u64);
+        data[sender_cols::RESULT] = FE::from(claimed_result as u64);
         data[sender_cols::FLAG] = FE::one();
+        data[sender_cols::OPCODE] = FE::zero(); // AND
 
         TraceTable::new_main(data, sender_cols::NUM_COLUMNS, 1)
     }
 
-    fn create_malicious_receiver_trace(x: u8, y: u8, fake_and: u8) -> TraceTable<F, E> {
+    fn create_malicious_receiver_trace(x: u8, y: u8, fake_result: u8) -> TraceTable<F, E> {
         let num_rows = 4;
         let mut data = vec![FE::zero(); num_rows * receiver_cols::NUM_COLUMNS];
 
-        // Row 0: MALICIOUS - wrong AND value!
+        // Row 0: MALICIOUS - wrong result value!
         data[receiver_cols::X] = FE::from(x as u64);
         data[receiver_cols::Y] = FE::from(y as u64);
-        data[receiver_cols::AND] = FE::from(fake_and as u64); // WRONG!
-        data[receiver_cols::MU_AND] = FE::one();
+        data[receiver_cols::OPCODE] = FE::zero(); // AND
+        data[receiver_cols::BITWISE_RESULT] = FE::from(fake_result as u64); // WRONG!
+        data[receiver_cols::MU] = FE::one();
 
         TraceTable::new_main(data, receiver_cols::NUM_COLUMNS, 1)
     }
@@ -559,8 +578,9 @@ mod soundness_tests {
         let correct_and = x & y;
         data[receiver_cols::X] = FE::from(x as u64);
         data[receiver_cols::Y] = FE::from(y as u64);
-        data[receiver_cols::AND] = FE::from(correct_and as u64);
-        data[receiver_cols::MU_AND] = FE::one();
+        data[receiver_cols::OPCODE] = FE::zero(); // AND
+        data[receiver_cols::BITWISE_RESULT] = FE::from(correct_and as u64);
+        data[receiver_cols::MU] = FE::one();
 
         TraceTable::new_main(data, receiver_cols::NUM_COLUMNS, 1)
     }
