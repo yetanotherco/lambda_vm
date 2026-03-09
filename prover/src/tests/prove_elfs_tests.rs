@@ -431,6 +431,31 @@ fn test_prove_elfs_test_shift_8() {
     );
 }
 
+// Tests that right shift by 0 bits (srli a0, a2, 0) is provable.
+// Regression test for SHIFT-C4: previously C4 sent AND_BYTE[bit_shift; 256, 15] when
+// shift=0, which is out of AND_BYTE's byte range (0-255), making the proof fail.
+#[test]
+fn test_prove_elfs_srli_one_zero() {
+    let (elf, logs, instructions) = run_asm_elf("srli_one_zero");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "srli_one_zero failed"
+    );
+}
+
+#[test]
+fn test_prove_elfs_sllw() {
+    let (elf, logs, instructions) = run_asm_elf("sllw");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "sllw failed"
+    );
+}
+
 #[test]
 fn test_prove_elfs_test_bitwise_8() {
     let (elf, logs, instructions) = run_asm_elf("test_bitwise_8");
@@ -1413,6 +1438,7 @@ fn test_verify_rejects_zero_table_counts() {
             load: 0,
             mul: 0,
             dvrm: 0,
+            shift: 0,
             branch: 0,
         },
         ..vm_proof
@@ -1478,6 +1504,7 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         load: 0,
         mul: 0,
         dvrm: 0,
+        shift: 0,
         branch: 0,
     };
     let airs = VmAirs::new(&elf, &proof_options, true, &[], &zero_counts);
