@@ -56,7 +56,7 @@ pub struct MerkleTree<B: IsMerkleTreeBackend> {
 impl<B: IsMerkleTreeBackend> Clone for MerkleTree<B> {
     fn clone(&self) -> Self {
         #[cfg(feature = "disk-spill")]
-        debug_assert!(
+        assert!(
             self.mmap_backing.is_none(),
             "cannot clone a spilled MerkleTree — nodes have been freed; use Arc instead"
         );

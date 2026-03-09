@@ -460,6 +460,8 @@ where
 
         let num_cols = columns.len();
         let num_rows = if num_cols > 0 { columns[0].len() } else { 0 };
+        debug_assert!(columns.iter().all(|c| c.len() == num_rows),
+            "all columns must have the same length");
         let total_bytes = (num_cols * num_rows * elem_size) as u64;
 
         let file = tempfile::tempfile()?;
