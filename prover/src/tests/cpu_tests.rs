@@ -328,10 +328,11 @@ fn test_bus_interactions_count() {
     // - 1 SHIFT (shift operations)
     // - 1 BRANCH (branch/jump target calculation)
     // - 1 ECALL (send to HALT table)
+    // - 1 M8 (MEMW PC register update)
     // - 13 IS_BYTE_PAIR (byte range checks, paired)
     // - 1 IS_BYTE (byte range check, remaining odd byte)
-    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 5 + 1 + 1 + 1 + 1 + 1 + 1 + 13 + 1 = 54
-    assert_eq!(interactions.len(), 54);
+    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 5 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 13 + 1 = 55
+    assert_eq!(interactions.len(), 55);
 }
 
 #[test]

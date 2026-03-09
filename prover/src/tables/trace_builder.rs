@@ -129,14 +129,19 @@ impl MemoryState {
 struct RegisterState {
     /// Register file: (value, last_write_timestamp)
     regs: [RegisterCell; 32],
+    /// PC register (255): (value, last_write_timestamp)
+    pc: RegisterCell,
 }
 
 impl RegisterState {
-    fn new() -> Self {
+    fn new(entry_pc: u64) -> Self {
         let mut regs = [(0u64, 0u64); 32];
         // SP (x2) starts at STACK_TOP
         regs[2] = (page::STACK_TOP, 0);
-        Self { regs }
+        Self {
+            regs,
+            pc: (entry_pc, 0),
+        }
     }
 
     /// Read a register. Returns (value, last_write_timestamp).
@@ -182,6 +187,26 @@ impl RegisterState {
                 },
             );
         }
+
+        // PC register (255) at base address 510
+        let (pc_value, pc_timestamp) = self.pc;
+        let pc_base = register::register_base_address(255);
+        let pc_lo = (pc_value & 0xFFFF_FFFF) as u32;
+        let pc_hi = (pc_value >> 32) as u32;
+        map.insert(
+            pc_base,
+            FinalRegisterWordState {
+                timestamp: pc_timestamp,
+                value: pc_lo,
+            },
+        );
+        map.insert(
+            pc_base + 1,
+            FinalRegisterWordState {
+                timestamp: pc_timestamp,
+                value: pc_hi,
+            },
+        );
 
         map
     }
@@ -267,7 +292,7 @@ fn collect_ops_from_cpu(
     Vec<ShiftOperation>,
     Vec<BitwiseOperation>,
 ) {
-    let mut memw_ops = Vec::with_capacity(cpu_ops.len() * 3);
+    let mut memw_ops = Vec::with_capacity(cpu_ops.len() * 5);
     let mut load_ops = Vec::with_capacity(cpu_ops.len() / 8 + 1);
     let mut lt_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
     let mut shift_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
@@ -432,7 +457,7 @@ fn collect_register_ops_from_cpu(
     op: &CpuOperation,
     register_state: &mut RegisterState,
 ) -> Vec<MemwOperation> {
-    let mut memw_ops = Vec::with_capacity(3);
+    let mut memw_ops = Vec::with_capacity(4);
     let d = &op.decode;
 
     // M1: Read rs1 register at timestamp+0
@@ -477,6 +502,24 @@ fn collect_register_ops_from_cpu(
             .with_old(old_value, old_timestamps);
         memw_ops.push(memw_op);
         register_state.write(d.rd, op.rvd, op.timestamp + 2);
+    }
+
+    // M8: PC register update at timestamp+1 (every non-padding row)
+    // Per spec: MEMW[old=pc; 1, 2*255, next_pc, timestamp+1, 1, 0, 0] | !pad
+    // Updates PC register (address 510) from pc to next_pc.
+    // Uses is_read=true because the spec has `output` (old=pc), matching CO24 (24-element
+    // read format with old values on BusId::Memw). M5 uses is_read=false because its
+    // spec has no `output`, matching CO25 (16-element write format).
+    {
+        let old_pc_value = pack_register_value(op.decode.pc);
+        let new_pc_value = pack_register_value(op.next_pc);
+        let (_pc_val, old_ts) = register_state.pc;
+        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
+
+        let memw_op = MemwOperation::new(true, 510, new_pc_value, op.timestamp + 1, 2, true)
+            .with_old(old_pc_value, old_timestamps);
+        memw_ops.push(memw_op);
+        register_state.pc = (op.next_pc, op.timestamp + 1);
     }
 
     memw_ops
@@ -1345,7 +1388,8 @@ impl Traces {
         // Processes cpu_ops in order. MEMW/LOAD need state tracking, LT/Bitwise don't.
         // Initialize memory state from ELF so first accesses get correct old_value.
         let mut memory_state = MemoryState::from_elf(elf);
-        let mut register_state = RegisterState::new();
+        let entry_pc = cpu_ops.first().map(|op| op.decode.pc).unwrap_or(0);
+        let mut register_state = RegisterState::new(entry_pc);
         let (memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops) =
             collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
 
@@ -1484,7 +1528,7 @@ impl Traces {
                 || {
                     rayon::join(
                         || generate_page_tables(elf, &memory_state),
-                        || register::generate_register_trace(&register_final_state),
+                        || register::generate_register_trace(&register_final_state, entry_pc),
                     )
                 },
                 || halt::generate_halt_trace(halt_timestamp),
@@ -1500,7 +1544,7 @@ impl Traces {
             let (pages_v, page_configs_v) = generate_page_tables(elf, &memory_state);
             pages = pages_v;
             page_configs = page_configs_v;
-            register_trace = register::generate_register_trace(&register_final_state);
+            register_trace = register::generate_register_trace(&register_final_state, entry_pc);
             halt_trace = halt::generate_halt_trace(halt_timestamp);
         }
 
@@ -1543,7 +1587,8 @@ impl Traces {
         // =====================================================================
         // Processes cpu_ops in order. MEMW/LOAD need state tracking, LT/Bitwise don't.
         let mut memory_state = MemoryState::new();
-        let mut register_state = RegisterState::new();
+        let entry_pc = cpu_ops.first().map(|op| op.decode.pc).unwrap_or(0);
+        let mut register_state = RegisterState::new(entry_pc);
         let (memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops) =
             collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
 
@@ -1673,7 +1718,7 @@ impl Traces {
         #[cfg(feature = "parallel")]
         {
             let (register_val, halt_val) = rayon::join(
-                || register::generate_register_trace(&register_final_state),
+                || register::generate_register_trace(&register_final_state, entry_pc),
                 || halt::generate_halt_trace(halt_timestamp),
             );
             register_trace = register_val;
@@ -1681,7 +1726,7 @@ impl Traces {
         }
         #[cfg(not(feature = "parallel"))]
         {
-            register_trace = register::generate_register_trace(&register_final_state);
+            register_trace = register::generate_register_trace(&register_final_state, entry_pc);
             halt_trace = halt::generate_halt_trace(halt_timestamp);
         }
 
