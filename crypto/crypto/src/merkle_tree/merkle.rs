@@ -55,6 +55,11 @@ pub struct MerkleTree<B: IsMerkleTreeBackend> {
 
 impl<B: IsMerkleTreeBackend> Clone for MerkleTree<B> {
     fn clone(&self) -> Self {
+        #[cfg(feature = "disk-spill")]
+        debug_assert!(
+            self.mmap_backing.is_none(),
+            "cannot clone a spilled MerkleTree — nodes have been freed; use Arc instead"
+        );
         Self {
             root: self.root.clone(),
             nodes: self.nodes.clone(),
@@ -287,6 +292,9 @@ where
     ///
     /// Requires `B::Node: Copy` to ensure nodes have a trivial byte representation
     /// suitable for raw serialization and mmap casting.
+    ///
+    /// Note: the concrete `Node` type is `[u8; 32]` (Keccak hash), which has no
+    /// padding bytes. The raw byte round-trip is therefore well-defined.
     #[cfg(feature = "disk-spill")]
     pub fn spill_nodes_to_disk(&mut self) -> std::io::Result<()>
     where

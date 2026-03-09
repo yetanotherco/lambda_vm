@@ -300,6 +300,9 @@ where
     pub fn get_main(&self, row: usize, col: usize) -> &FieldElement<F> {
         #[cfg(feature = "disk-spill")]
         if let Some(ref backing) = self.mmap_backing {
+            debug_assert!(row < backing.num_rows && col < backing.num_main_cols,
+                "get_main out of bounds: row={row}, col={col}, num_rows={}, num_main_cols={}",
+                backing.num_rows, backing.num_main_cols);
             let offset = (col * backing.num_rows + row) * backing.main_elem_size;
             // SAFETY: FieldElement<F> is #[repr(transparent)] over F::BaseType.
             // The mmap is page-aligned and elements are contiguously packed at
@@ -315,6 +318,9 @@ where
     pub fn get_aux(&self, row: usize, col: usize) -> &FieldElement<E> {
         #[cfg(feature = "disk-spill")]
         if let Some(ref backing) = self.mmap_backing {
+            debug_assert!(row < backing.num_rows && col < backing.num_aux_cols,
+                "get_aux out of bounds: row={row}, col={col}, num_rows={}, num_aux_cols={}",
+                backing.num_rows, backing.num_aux_cols);
             let aux_mmap = backing
                 .aux_mmap
                 .as_ref()
@@ -440,6 +446,11 @@ where
 
     /// Write borrowed pool columns to a temp file and mmap them.
     /// Does NOT consume the pool — columns keep their capacity.
+    ///
+    /// Note: the concrete element types are `FieldElement<Goldilocks>` (8 bytes,
+    /// `#[repr(transparent)]` over `u64`) and `FieldElement<Degree3Extension>`
+    /// (24 bytes, `#[repr(transparent)]` over `[u64; 3]`). Neither has padding,
+    /// so the raw byte round-trip is well-defined.
     #[cfg(feature = "disk-spill")]
     fn write_pool_columns_to_mmap<T>(
         columns: &[Vec<T>],
