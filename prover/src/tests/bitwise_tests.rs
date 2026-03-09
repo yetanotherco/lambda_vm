@@ -93,8 +93,8 @@ fn test_zero_check() {
 #[test]
 fn test_bus_interactions_count() {
     let interactions = bus_interactions();
-    // Should have 11 interactions (one for each lookup type)
-    assert_eq!(interactions.len(), 11);
+    // Should have 12 interactions (one for each lookup type, including IS_BYTE_PAIR)
+    assert_eq!(interactions.len(), 12);
 }
 
 #[test]

@@ -106,6 +106,8 @@ pub enum BusId {
     Decode,
     /// System call handling
     Ecall,
+    /// Range check: two values are valid bytes [0, 256) simultaneously
+    IsBytePair,
 }
 
 impl BusId {
@@ -133,6 +135,7 @@ impl BusId {
             BusId::Decode => "Decode",
             BusId::Ecall => "Ecall",
             BusId::Dvrm => "Dvrm",
+            BusId::IsBytePair => "IsBytePair",
         }
     }
 }
@@ -162,6 +165,7 @@ impl TryFrom<u64> for BusId {
             17 => Ok(BusId::Branch),
             18 => Ok(BusId::Decode),
             19 => Ok(BusId::Ecall),
+            21 => Ok(BusId::IsBytePair),
             other => Err(other),
         }
     }

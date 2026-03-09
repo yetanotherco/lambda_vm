@@ -942,6 +942,37 @@ fn collect_bitwise_from_branch(branch_ops: &[BranchOperation]) -> Vec<BitwiseOpe
     bitwise_ops
 }
 
+/// Generates IS_BYTE_PAIR and IS_BYTE ops for CPU padding rows.
+///
+/// CPU padding rows have all byte columns = 0 (RS1=0, RS2=0, RD=0, etc.).
+/// Since the CPU bus interactions use Multiplicity::One for byte checks,
+/// padding rows also send, so we need matching bitwise ops.
+///
+/// Per padding row: 13 IsBytePair(0, 0) + 1 IsByte(0) = 14 ops.
+fn collect_byte_check_ops_for_padding(num_padding_rows: usize) -> Vec<BitwiseOperation> {
+    if num_padding_rows == 0 {
+        return Vec::new();
+    }
+
+    let mut ops = Vec::with_capacity(num_padding_rows * 14);
+    for _ in 0..num_padding_rows {
+        // 13 IS_BYTE_PAIR(0, 0) — one per pair
+        for _ in 0..13 {
+            ops.push(BitwiseOperation::byte_op(
+                BitwiseOperationType::IsBytePair,
+                0,
+                0,
+            ));
+        }
+        // 1 IS_BYTE(0) — the odd remaining byte
+        ops.push(BitwiseOperation::single_byte(
+            BitwiseOperationType::IsByte,
+            0,
+        ));
+    }
+    ops
+}
+
 /// Collects IS_BYTE lookups from PAGE data (init and fini values).
 ///
 /// Each PAGE byte generates 2 IS_BYTE lookups:
@@ -1397,6 +1428,14 @@ impl Traces {
         // PAGE tables do IS_BYTE lookups for init and fini values (C1, C2)
         bitwise_ops.extend(collect_bitwise_from_page(elf, &memory_state));
 
+        // CPU padding rows send IS_BYTE_PAIR and IS_BYTE with all-zero values.
+        // Add corresponding ops so the bitwise table multiplicities balance.
+        let num_padding_rows: usize = cpu_ops
+            .chunks(max_rows.cpu)
+            .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
+            .sum();
+        bitwise_ops.extend(collect_byte_check_ops_for_padding(num_padding_rows));
+
         // =====================================================================
         // PHASE 5: Generate final traces (parallelized)
         // =====================================================================
@@ -1428,10 +1467,7 @@ impl Traces {
         // When CPU is split, each chunk pads independently
         let mut decode = decode_trace;
         let pc_to_row = decode_pc_to_row;
-        let num_padding_rows: usize = cpu_ops
-            .chunks(max_rows.cpu)
-            .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
-            .sum();
+        // num_padding_rows already computed above for byte checks
         let mut decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
         decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
         decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
@@ -1588,6 +1624,13 @@ impl Traces {
         bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
         bitwise_ops.extend(shift::collect_bitwise_from_shift(&shift_ops));
 
+        // CPU padding rows send IS_BYTE_PAIR and IS_BYTE with all-zero values.
+        let num_padding_rows: usize = cpu_ops
+            .chunks(max_rows.cpu)
+            .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
+            .sum();
+        bitwise_ops.extend(collect_byte_check_ops_for_padding(num_padding_rows));
+
         // =====================================================================
         // PHASE 5: Generate final traces (parallelized)
         // =====================================================================
@@ -1618,10 +1661,7 @@ impl Traces {
         // Padding rows also look up pc=1 (the CPU padding entry)
         // When CPU is split, each chunk pads independently
         let (mut decode, pc_to_row) = decode::generate_decode_trace(&instructions);
-        let num_padding_rows: usize = cpu_ops
-            .chunks(max_rows.cpu)
-            .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
-            .sum();
+        // num_padding_rows already computed above for byte checks
         let mut decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
         decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
         decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);

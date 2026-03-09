@@ -95,9 +95,11 @@ pub mod cols {
     pub const MU_HWSL: usize = 20;
     /// Multiplicity for HWSLC lookups
     pub const MU_HWSLC: usize = 21;
+    /// Multiplicity for IS_BYTE_PAIR lookups
+    pub const MU_IS_BYTE_PAIR: usize = 22;
 
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 22;
+    pub const NUM_COLUMNS: usize = 23;
 }
 
 /// Number of rows in the BITWISE table: 256 * 256 * 16 = 2^20
@@ -386,6 +388,7 @@ pub fn update_multiplicities(
             BitwiseOperationType::IsB20 => cols::MU_IS_B20,
             BitwiseOperationType::Hwsl => cols::MU_HWSL,
             BitwiseOperationType::Hwslc => cols::MU_HWSLC,
+            BitwiseOperationType::IsBytePair => cols::MU_IS_BYTE_PAIR,
         };
 
         // Increment multiplicity
@@ -421,8 +424,8 @@ pub(crate) fn trim_zero_rows(
     let kept_rows: Vec<usize> = (0..num_rows)
         .filter(|&row| {
             let row_data = trace.main_table.get_row(row);
-            // Check all multiplicity columns (indices 11-21)
-            (cols::MU_AND..=cols::MU_HWSLC).any(|col| row_data[col] != FE::zero())
+            // Check all multiplicity columns (indices 11-22)
+            (cols::MU_AND..=cols::MU_IS_BYTE_PAIR).any(|col| row_data[col] != FE::zero())
         })
         .collect();
 
@@ -464,6 +467,7 @@ pub enum BitwiseOperationType {
     IsB20,
     Hwsl,
     Hwslc,
+    IsBytePair,
 }
 
 /// A lookup request to the BITWISE precomputed table.
@@ -761,6 +765,21 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 },
                 BusValue::Packed {
                     start_column: cols::SLLC,
+                    packing: Packing::Direct,
+                },
+            ],
+        ),
+        // IS_BYTE_PAIR[X, Y] - range check two bytes at once
+        BusInteraction::receiver(
+            BusId::IsBytePair,
+            Multiplicity::Column(cols::MU_IS_BYTE_PAIR),
+            vec![
+                BusValue::Packed {
+                    start_column: cols::X,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: cols::Y,
                     packing: Packing::Direct,
                 },
             ],
