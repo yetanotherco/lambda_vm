@@ -7,7 +7,7 @@ use rand::{RngCore, SeedableRng};
 
 // Native form (base field)
 use math::field::element::FieldElement;
-use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
+use math::field::goldilocks::GoldilocksField;
 
 type NativeFE = FieldElement<GoldilocksField>;
 

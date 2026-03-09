@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::field::element::FieldElement;
-    use crate::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
+    use crate::field::goldilocks::GoldilocksField;
     use crate::field::traits::{IsField, IsPrimeField, IsSubFieldOf};
     use crate::polynomial::{Polynomial, pad_with_zero_coefficients};
     use alloc::string::{String, ToString};

@@ -506,7 +506,7 @@ where
 #[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::*;
-    use crate::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
+    use crate::field::goldilocks::GoldilocksField;
 
     type F = GoldilocksField;
     type FE = FieldElement<F>;
