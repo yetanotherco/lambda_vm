@@ -74,12 +74,21 @@ desc = "scratch variable."
 pad = ["arr", 0, 0, 0, 0]
 
 [[variables.auxiliary]]
-name = "limb_shift"
-type = ["Bit", 4]
-desc = "One-hot vector indicating whether $floor.l #`shift` / 16 floor.r equiv i mod s$, where $s = 2$ when $#`word_instr` = 1$ and $4$ otherwise."
-pad = ["arr", 0, 0, 0, 0]
+name = "limb_shift_raw"
+type = ["Bit", 3]
+desc = "One-hot vector indicating whether $floor.l #`shift` / 16 floor.r equiv i mod s$, where $s = 2$ when $#`word_instr` = 1$ and $4$ otherwise. These columns store the first 3 values, and the 4th is derived from the one-hot proberty."
+pad = ["arr", 0, 0, 0]
 
 # Virtual
+
+[[variables.virtual]]
+name = "limb_shift"
+type = ["Bit", 4]
+desc = ""
+def = {idx = "i", polys = [
+    {iter = [0, 2], poly = ["idx", "limb_shift_raw", "i"]},
+    {iter = 3, poly = ["-", 1, ["sum", ["=", "j", 0], 2, ["idx", "limb_shift_raw", "j"]]]},
+]}
 
 [[variables.virtual]]
 name = "extension"
@@ -118,7 +127,7 @@ def = {idx="i", iter=[0, 3], poly=["+", ["idx", "Y", "i"], ["idx", "X", ["+", "i
 name = "shifted"
 type = "DWordHL"
 desc = "$#`in <</>>/>>>` (#`shift` mod 32 dot (2 - #`word_instr`))$"
-def = {idx="i", iter=[0, 3], poly=["+", ["*", "left", ["sum", ["=", "j", 0], "i", ["*", ["idx", "limb_shift", "j"], ["idx", "intra_limb_left", ["-", "i", "j"]]]]], ["*", "right", ["+", ["sum", ["=", "j", 0], ["-", 3, "i"], ["*", ["idx", "limb_shift", "j"], ["idx", "intra_limb_right", ["+", "i", "j"]]]], ["*", "extension", ["sum", ["=", "j", ["-", 3, "i"]], 3, ["idx", "limb_shift", "j"]]]]]]}
+def = {idx="i", iter=[0, 3], poly=["+", ["*", "left", ["sum", ["=", "j", 0], "i", ["*", ["idx", "limb_shift", "j"], ["idx", "intra_limb_left", ["-", "i", "j"]]]]], ["*", "right", ["+", ["sum", ["=", "j", 0], ["-", 3, "i"], ["*", ["idx", "limb_shift", "j"], ["idx", "intra_limb_right", ["+", "i", "j"]]]], ["*", "extension", ["sum", ["=", "j", ["-", 4, "i"]], 3, ["idx", "limb_shift", "j"]]]]]]}
 
 # Multiplicities
 
@@ -192,7 +201,7 @@ multiplicity = "left"
 [[constraints.bit_shift]]
 kind = "interaction"
 tag = "AND_BYTE"
-input = [["-", ["^", 2, 8], "shift"], 0x0F]
+input = [["-", ["^", 2, 8], ["*", 16, "zbs"], "shift"], 0x0F]
 output = "bit_shift"
 ref = "shift:c:bit_shift_if_right"
 multiplicity = "right"
