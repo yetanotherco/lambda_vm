@@ -31,22 +31,5 @@ default = ["asm", "std"]
 asm = ["sha3/asm"]
 std = ["math/std", "sha2/std", "sha3/std", "serde?/std"]
 serde = ["dep:serde"]
-test_fiat_shamir = []
 parallel = ["dep:rayon"]
 alloc = []
-
-[[bench]]
-name = "criterion_merkle"
-harness = false
-
-[[bench]]
-name = "iai_merkle"
-harness = false
-
-[[bench]]
-name = "criterion_poseidon"
-harness = false
-
-[[bench]]
-name = "criterion_pedersen"
-harness = false

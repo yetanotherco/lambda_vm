@@ -53,11 +53,13 @@ where
                 frame,
                 periodic_values,
                 rap_challenges,
+                ..
             }
             | TransitionEvaluationContext::Verifier {
                 frame,
                 periodic_values,
                 rap_challenges,
+                ..
             } => (frame, periodic_values, rap_challenges),
         };
 
@@ -112,11 +114,13 @@ where
                 frame,
                 periodic_values,
                 rap_challenges,
+                ..
             }
             | TransitionEvaluationContext::Verifier {
                 frame,
                 periodic_values,
                 rap_challenges,
+                ..
             } => (frame, periodic_values, rap_challenges),
         };
 
@@ -159,8 +163,6 @@ where
     F: IsFFTField,
 {
     context: AirContext,
-    trace_length: usize,
-    pub_inputs: PublicInputs<F>,
     transition_constraints: Vec<Box<dyn TransitionConstraint<F, F>>>,
 }
 
@@ -180,11 +182,7 @@ where
         1
     }
 
-    fn new(
-        trace_length: usize,
-        pub_inputs: &Self::PublicInputs,
-        proof_options: &ProofOptions,
-    ) -> Self {
+    fn new(proof_options: &ProofOptions) -> Self {
         let transition_constraints: Vec<
             Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>,
         > = vec![
@@ -200,22 +198,23 @@ where
         };
 
         Self {
-            trace_length,
             context,
-            pub_inputs: pub_inputs.clone(),
             transition_constraints,
         }
     }
 
     fn boundary_constraints(
         &self,
+        pub_inputs: &Self::PublicInputs,
         _rap_challenges: &[FieldElement<Self::FieldExtension>],
+        _bus_public_inputs: Option<&crate::lookup::BusPublicInputs<Self::FieldExtension>>,
+        _trace_length: usize,
     ) -> BoundaryConstraints<Self::Field> {
         let initial_condition = BoundaryConstraint::new_main(0, 0, FieldElement::one());
         let claimed_value_constraint = BoundaryConstraint::new_main(
             0,
-            self.pub_inputs.claimed_index,
-            self.pub_inputs.claimed_value.clone(),
+            pub_inputs.claimed_index,
+            pub_inputs.claimed_value.clone(),
         );
 
         BoundaryConstraints::from_constraints(vec![initial_condition, claimed_value_constraint])
@@ -231,20 +230,12 @@ where
         &self.context
     }
 
-    fn composition_poly_degree_bound(&self) -> usize {
-        self.trace_length()
-    }
-
-    fn trace_length(&self) -> usize {
-        self.trace_length
+    fn composition_poly_degree_bound(&self, trace_length: usize) -> usize {
+        trace_length
     }
 
     fn trace_layout(&self) -> (usize, usize) {
         (2, 0)
-    }
-
-    fn pub_inputs(&self) -> &Self::PublicInputs {
-        &self.pub_inputs
     }
 }
 
@@ -268,18 +259,16 @@ pub fn compute_trace<F: IsFFTField>(
 
 #[cfg(test)]
 mod tests {
-    use math::field::{
-        element::FieldElement, fields::fft_friendly::stark_252_prime_field::Stark252PrimeField,
-    };
+    use math::field::{element::FieldElement, goldilocks::GoldilocksField};
 
     use super::compute_trace;
 
     #[test]
     fn trace_has_expected_rows() {
-        let trace = compute_trace(FieldElement::<Stark252PrimeField>::one(), 8);
+        let trace = compute_trace(FieldElement::<GoldilocksField>::one(), 8);
         assert_eq!(trace.num_rows(), 8);
 
-        let trace = compute_trace(FieldElement::<Stark252PrimeField>::one(), 64);
+        let trace = compute_trace(FieldElement::<GoldilocksField>::one(), 64);
         assert_eq!(trace.num_rows(), 64);
     }
 }

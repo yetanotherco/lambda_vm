@@ -1,12 +1,7 @@
 use super::field::element::FieldElement;
-use crate::field::traits::{IsField, IsPrimeField, IsSubFieldOf};
-use alloc::string::{String, ToString};
-use alloc::{borrow::ToOwned, format, vec, vec::Vec};
+use crate::field::traits::{IsField, IsSubFieldOf};
+use alloc::{borrow::ToOwned, vec, vec::Vec};
 use core::{fmt::Display, ops, slice};
-pub mod dense_multilinear_poly;
-mod error;
-pub mod sparse_multilinear_poly;
-
 /// Represents the polynomial c_0 + c_1 * X + c_2 * X^2 + ... + c_n * X^n
 /// as a vector of coefficients `[c_0, c_1, ... , c_n]`
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,12 +108,6 @@ impl<F: IsField> Polynomial<FieldElement<F>> {
             })
     }
 
-    /// Evaluates a polynomial P(t) at a slice of points x
-    /// Returns a vector y such that y[i] = P(input[i])
-    pub fn evaluate_slice(&self, input: &[FieldElement<F>]) -> Vec<FieldElement<F>> {
-        input.iter().map(|x| self.evaluate(x)).collect()
-    }
-
     /// Returns the degree of a polynomial, which corresponds to the highest power of x^d
     /// with non-zero coefficient
     pub fn degree(&self) -> usize {
@@ -151,19 +140,6 @@ impl<F: IsField> Polynomial<FieldElement<F>> {
         self.coefficients().len()
     }
 
-    /// Returns the derivative of the polynomial with respect to x.
-    pub fn differentiate(&self) -> Self {
-        let degree = self.degree();
-        if degree == 0 {
-            return Polynomial::zero();
-        }
-        let mut derivative = Vec::with_capacity(degree);
-        for (i, coeff) in self.coefficients().iter().enumerate().skip(1) {
-            derivative.push(FieldElement::<F>::from(i as u64) * coeff);
-        }
-        Polynomial::new(&derivative)
-    }
-
     /// Computes quotient with `x - b` in place.
     pub fn ruffini_division_inplace(&mut self, b: &FieldElement<F>) {
         let mut c = FieldElement::zero();
@@ -172,26 +148,6 @@ impl<F: IsField> Polynomial<FieldElement<F>> {
             core::mem::swap(coeff, &mut c);
         }
         self.coefficients.pop();
-    }
-
-    /// Computes the quotient of the division of P(x) with x - b using Ruffini's rule
-    pub fn ruffini_division<L>(&self, b: &FieldElement<L>) -> Polynomial<FieldElement<L>>
-    where
-        L: IsField,
-        F: IsSubFieldOf<L>,
-    {
-        if let Some(c) = self.coefficients.last() {
-            let mut c = c.clone().to_extension();
-            let mut coefficients = Vec::with_capacity(self.degree());
-            for coeff in self.coefficients.iter().rev().skip(1) {
-                coefficients.push(c.clone());
-                c = coeff + c * b;
-            }
-            coefficients = coefficients.into_iter().rev().collect();
-            Polynomial::new(&coefficients)
-        } else {
-            Polynomial::zero()
-        }
     }
 
     /// Computes quotient and remainder of polynomial division.
@@ -215,41 +171,6 @@ impl<F: IsField> Polynomial<FieldElement<F>> {
             }
             (Polynomial::new(&q), n)
         }
-    }
-
-    /// Extended Euclidean Algorithm for polynomials.
-    ///
-    /// This method computes the extended greatest common divisor (GCD) of two polynomials `self` and `y`.
-    /// It returns a tuple of three elements: `(a, b, g)` such that `a * self + b * y = g`, where `g` is the
-    /// greatest common divisor of `self` and `y`.
-    pub fn xgcd(&self, y: &Self) -> (Self, Self, Self) {
-        let one = Polynomial::new(&[FieldElement::one()]);
-        let zero = Polynomial::zero();
-        let (mut old_r, mut r) = (self.clone(), y.clone());
-        let (mut old_s, mut s) = (one.clone(), zero.clone());
-        let (mut old_t, mut t) = (zero.clone(), one.clone());
-
-        while r != Polynomial::zero() {
-            let quotient = old_r.clone().div_with_ref(&r);
-            old_r = old_r - &quotient * &r;
-            core::mem::swap(&mut old_r, &mut r);
-            old_s = old_s - &quotient * &s;
-            core::mem::swap(&mut old_s, &mut s);
-            old_t = old_t - &quotient * &t;
-            core::mem::swap(&mut old_t, &mut t);
-        }
-
-        let lcinv = old_r.leading_coefficient().inv().unwrap();
-        (
-            old_s.scale_coeffs(&lcinv),
-            old_t.scale_coeffs(&lcinv),
-            old_r.scale_coeffs(&lcinv),
-        )
-    }
-
-    pub fn div_with_ref(self, dividend: &Self) -> Self {
-        let (quotient, _remainder) = self.long_division_with_remainder(dividend);
-        quotient
     }
 
     pub fn mul_with_ref(&self, factor: &Self) -> Self {
@@ -351,44 +272,6 @@ impl<F: IsField> Polynomial<FieldElement<F>> {
     }
 }
 
-impl<F: IsPrimeField> Polynomial<FieldElement<F>> {
-    // Print the polynomial as a string ready to be used in SageMath, or just for pretty printing.
-    pub fn print_as_sage_poly(&self, var_name: Option<char>) -> String {
-        let var_name = var_name.unwrap_or('x');
-        if self.coefficients.is_empty()
-            || self.coefficients.len() == 1 && self.coefficients[0] == FieldElement::zero()
-        {
-            return String::new();
-        }
-
-        let mut string = String::new();
-        let zero = FieldElement::<F>::zero();
-
-        for (i, coeff) in self.coefficients.iter().rev().enumerate() {
-            if *coeff == zero {
-                continue;
-            }
-
-            let coeff_str = coeff.representative().to_string();
-
-            if i == self.coefficients.len() - 1 {
-                string.push_str(&coeff_str);
-            } else if i == self.coefficients.len() - 2 {
-                string.push_str(&format!("{coeff_str}*{var_name} + "));
-            } else {
-                string.push_str(&format!(
-                    "{}*{}^{} + ",
-                    coeff_str,
-                    var_name,
-                    self.coefficients.len() - 1 - i
-                ));
-            }
-        }
-
-        string
-    }
-}
-
 /// Pads a polynomial with zeros until the desired length
 /// This function can be useful when evaluating polynomials with the FFT
 pub fn pad_with_zero_coefficients_to_length<F: IsField>(
@@ -412,38 +295,6 @@ pub fn pad_with_zero_coefficients<L: IsField, F: IsSubFieldOf<L>>(
         pad_with_zero_coefficients_to_length(&mut pa, pb.coefficients.len());
     }
     (pa, pb)
-}
-
-/// Computes the composition of polynomials P1(t) and P2(t), that is P1(P2(t))
-/// It uses interpolation to determine the evaluation at points x_i and evaluates
-/// P1(P2(x[i])). The interpolation theorem ensures that we can reconstruct the polynomial
-/// uniquely by interpolation over a suitable number of points
-/// This is an inefficient version, for something more efficient, use FFT for evaluation,
-/// provided the field satisfies the necessary traits
-pub fn compose<F>(
-    poly_1: &Polynomial<FieldElement<F>>,
-    poly_2: &Polynomial<FieldElement<F>>,
-) -> Polynomial<FieldElement<F>>
-where
-    F: IsField,
-{
-    let max_degree: u64 = (poly_1.degree() * poly_2.degree()) as u64;
-
-    let mut interpolation_points = vec![];
-    for i in 0_u64..max_degree + 1 {
-        interpolation_points.push(FieldElement::<F>::from(i));
-    }
-
-    let values: Vec<_> = interpolation_points
-        .iter()
-        .map(|value| {
-            let intermediate_value = poly_2.evaluate(value);
-            poly_1.evaluate(&intermediate_value)
-        })
-        .collect();
-
-    Polynomial::interpolate(interpolation_points.as_slice(), values.as_slice())
-        .expect("xs and ys have equal length and xs are unique")
 }
 
 // impl Add
@@ -568,17 +419,6 @@ where
 
     fn sub(self, substrahend: Polynomial<FieldElement<L>>) -> Polynomial<FieldElement<L>> {
         self - &substrahend
-    }
-}
-
-impl<F> ops::Div<Polynomial<FieldElement<F>>> for Polynomial<FieldElement<F>>
-where
-    F: IsField,
-{
-    type Output = Polynomial<FieldElement<F>>;
-
-    fn div(self, dividend: Polynomial<FieldElement<F>>) -> Polynomial<FieldElement<F>> {
-        self.div_with_ref(&dividend)
     }
 }
 
@@ -932,382 +772,192 @@ impl Display for InterpolateError {
 #[cfg(feature = "std")]
 impl std::error::Error for InterpolateError {}
 
-#[cfg(test)]
-mod tests {
-    use crate::field::fields::u64_prime_field::U64PrimeField;
+// ── Barycentric coset interpolation ──────────────────────────────────────
+// Four evaluation variants along two axes:
+//   - eval field: base field (F) or extension field (E)
+//   - g_n_inv:    computed on demand, or precomputed by caller
+// Use `_with_g_n_inv` variants when evaluating multiple columns at the
+// same coset (g_n_inv is constant across columns).
 
-    // Some of these tests work when the finite field has order greater than 2.
-    use super::*;
-    const ORDER: u64 = 23;
-    type F = U64PrimeField<ORDER>;
-    type FE = FieldElement<F>;
+/// Precompute `1/(z - point_i)` for each coset point, using batch inversion.
+///
+/// Given an evaluation point `z` (in extension field E) and coset points in base field F,
+/// returns the vector of inverse denominators needed for barycentric interpolation.
+/// Uses Montgomery's trick: 1 field inversion + O(N) multiplications.
+#[cfg(feature = "alloc")]
+pub fn barycentric_inv_denoms<F, E>(
+    z: &FieldElement<E>,
+    coset_points: &[FieldElement<F>],
+) -> Vec<FieldElement<E>>
+where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+{
+    // z - p where z is in E and p is in F. Since Sub<E> is defined for F: IsSubFieldOf<E>,
+    // we compute -(p - z) which equals z - p.
+    let mut denoms: Vec<FieldElement<E>> = coset_points.iter().map(|p| -(p - z)).collect();
+    FieldElement::inplace_batch_inverse(&mut denoms)
+        .expect("z is sampled to avoid coset points, so z - g*w^i is never zero");
+    denoms
+}
 
-    fn polynomial_a() -> Polynomial<FE> {
-        Polynomial::new(&[FE::new(1), FE::new(2), FE::new(3)])
-    }
+/// Evaluate a polynomial at point `z` given its evaluations on a coset `{g * w^i}`,
+/// using the barycentric interpolation formula.
+///
+/// Formula: f(z) = (z^N - g^N) / N * sum_{i=0}^{N-1} [ (g*w^i) * f(g*w^i) / (z - g*w^i) ] / g^N
+///
+/// This variant takes base-field evaluations (main trace columns) and returns an
+/// extension-field result.
+///
+/// # Arguments
+/// * `z_pow_n` - z^N where N = coset_points.len()
+/// * `coset_offset_pow_n` - g^N where g = coset_offset
+/// * `n_inv` - 1/N in the extension field
+/// * `coset_points` - the coset {g*w^0, g*w^1, ..., g*w^{N-1}}
+/// * `evaluations` - f(g*w^i) for each coset point (base field)
+/// * `inv_denoms` - precomputed 1/(z - g*w^i)
+#[cfg(feature = "alloc")]
+pub fn interpolate_coset_eval<F, E>(
+    z_pow_n: &FieldElement<E>,
+    coset_offset_pow_n: &FieldElement<E>,
+    n_inv: &FieldElement<E>,
+    coset_points: &[FieldElement<F>],
+    evaluations: &[FieldElement<F>],
+    inv_denoms: &[FieldElement<E>],
+) -> FieldElement<E>
+where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+{
+    debug_assert_eq!(coset_points.len(), evaluations.len());
+    debug_assert_eq!(coset_points.len(), inv_denoms.len());
 
-    fn polynomial_minus_a() -> Polynomial<FE> {
-        Polynomial::new(&[FE::new(ORDER - 1), FE::new(ORDER - 2), FE::new(ORDER - 3)])
-    }
+    let sum: FieldElement<E> = coset_points
+        .iter()
+        .zip(evaluations.iter())
+        .zip(inv_denoms.iter())
+        .fold(FieldElement::<E>::zero(), |acc, ((point, eval), inv_d)| {
+            acc + (point * eval) * inv_d
+        });
 
-    fn polynomial_b() -> Polynomial<FE> {
-        Polynomial::new(&[FE::new(3), FE::new(4), FE::new(5)])
-    }
+    let vanishing = z_pow_n - coset_offset_pow_n;
+    let g_n_inv = coset_offset_pow_n
+        .inv()
+        .expect("coset_offset_pow_n is non-zero");
+    vanishing * n_inv * &sum * &g_n_inv
+}
 
-    fn polynomial_a_plus_b() -> Polynomial<FE> {
-        Polynomial::new(&[FE::new(4), FE::new(6), FE::new(8)])
-    }
+/// Like `interpolate_coset_eval` but takes a precomputed `g_n_inv = (g^N)^{-1}`.
+///
+/// Use this when evaluating multiple columns at the same coset — the inverse is
+/// constant across all columns and should be computed once.
+///
+/// Both `coset_offset_pow_n` and `g_n_inv` stay in the base field F. The function
+/// uses F×E→E mixed arithmetic for the final multiplication, avoiding any field
+/// embedding/conversion overhead.
+pub fn interpolate_coset_eval_with_g_n_inv<F, E>(
+    z_pow_n: &FieldElement<E>,
+    coset_offset_pow_n: &FieldElement<F>,
+    n_inv: &FieldElement<F>,
+    g_n_inv: &FieldElement<F>,
+    coset_points: &[FieldElement<F>],
+    evaluations: &[FieldElement<F>],
+    inv_denoms: &[FieldElement<E>],
+) -> FieldElement<E>
+where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+{
+    debug_assert_eq!(coset_points.len(), evaluations.len());
+    debug_assert_eq!(coset_points.len(), inv_denoms.len());
 
-    fn polynomial_b_minus_a() -> Polynomial<FE> {
-        Polynomial::new(&[FE::new(2), FE::new(2), FE::new(2)])
-    }
+    // sum = sum_{i} (g*w^i) * f(g*w^i) / (z - g*w^i)
+    // point * eval is in base field F; multiply by inv_d lifts to E
+    let sum: FieldElement<E> = coset_points
+        .iter()
+        .zip(evaluations.iter())
+        .zip(inv_denoms.iter())
+        .fold(FieldElement::<E>::zero(), |acc, ((point, eval), inv_d)| {
+            acc + (point * eval) * inv_d
+        });
 
-    #[test]
-    fn adding_a_and_b_equals_a_plus_b() {
-        assert_eq!(polynomial_a() + polynomial_b(), polynomial_a_plus_b());
-    }
+    // f(z) = (z^N - g^N) / (N * g^N) * sum
+    // All scalar factors in base field F; vanishing via sub_subfield.
+    let vanishing = z_pow_n.sub_subfield(coset_offset_pow_n); // E - F → E
+    let scalar = n_inv * g_n_inv; // F * F → F
+    &scalar * &(vanishing * &sum) // F × E → E
+}
 
-    #[test]
-    fn adding_a_and_a_plus_b_does_not_equal_b() {
-        assert_ne!(polynomial_a() + polynomial_a_plus_b(), polynomial_b());
-    }
+/// Evaluate a polynomial at point `z` given its evaluations on a coset `{g * w^i}`,
+/// using the barycentric interpolation formula.
+///
+/// This variant takes extension-field evaluations (aux trace / composition poly columns)
+/// but keeps coset points in the base field to avoid unnecessary extension-field arithmetic.
+/// The `point * eval` computation uses mixed F×E multiplication (cheaper than E×E).
+#[cfg(feature = "alloc")]
+pub fn interpolate_coset_eval_ext<F, E>(
+    z_pow_n: &FieldElement<E>,
+    coset_offset_pow_n: &FieldElement<E>,
+    n_inv: &FieldElement<E>,
+    coset_points: &[FieldElement<F>],
+    evaluations: &[FieldElement<E>],
+    inv_denoms: &[FieldElement<E>],
+) -> FieldElement<E>
+where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+{
+    debug_assert_eq!(coset_points.len(), evaluations.len());
+    debug_assert_eq!(coset_points.len(), inv_denoms.len());
 
-    #[test]
-    fn add_5_to_0_is_5() {
-        let p1 = Polynomial::new(&[FE::new(5)]);
-        let p2 = Polynomial::new(&[FE::new(0)]);
-        assert_eq!(p1 + p2, Polynomial::new(&[FE::new(5)]));
-    }
+    let sum: FieldElement<E> = coset_points
+        .iter()
+        .zip(evaluations.iter())
+        .zip(inv_denoms.iter())
+        .fold(FieldElement::<E>::zero(), |acc, ((point, eval), inv_d)| {
+            let numerator = point * eval;
+            acc + numerator * inv_d
+        });
 
-    #[test]
-    fn add_0_to_5_is_5() {
-        let p1 = Polynomial::new(&[FE::new(5)]);
-        let p2 = Polynomial::new(&[FE::new(0)]);
-        assert_eq!(p2 + p1, Polynomial::new(&[FE::new(5)]));
-    }
+    let vanishing = z_pow_n - coset_offset_pow_n;
+    let g_n_inv = coset_offset_pow_n
+        .inv()
+        .expect("coset_offset_pow_n is non-zero");
+    vanishing * n_inv * &sum * &g_n_inv
+}
 
-    #[test]
-    fn negating_0_returns_0() {
-        let p1 = Polynomial::new(&[FE::new(0)]);
-        assert_eq!(-p1, Polynomial::new(&[FE::new(0)]));
-    }
+/// Like `interpolate_coset_eval_ext` but takes a precomputed `g_n_inv = (g^N)^{-1}`.
+///
+/// Both `coset_offset_pow_n` and `g_n_inv` stay in the base field F.
+#[cfg(feature = "alloc")]
+pub fn interpolate_coset_eval_ext_with_g_n_inv<F, E>(
+    z_pow_n: &FieldElement<E>,
+    coset_offset_pow_n: &FieldElement<F>,
+    n_inv: &FieldElement<F>,
+    g_n_inv: &FieldElement<F>,
+    coset_points: &[FieldElement<F>],
+    evaluations: &[FieldElement<E>],
+    inv_denoms: &[FieldElement<E>],
+) -> FieldElement<E>
+where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+{
+    debug_assert_eq!(coset_points.len(), evaluations.len());
+    debug_assert_eq!(coset_points.len(), inv_denoms.len());
 
-    #[test]
-    fn negating_a_is_equal_to_minus_a() {
-        assert_eq!(-polynomial_a(), polynomial_minus_a());
-    }
+    // point * eval: F × E → E (mixed multiplication, cheaper than E × E)
+    let sum: FieldElement<E> = coset_points
+        .iter()
+        .zip(evaluations.iter())
+        .zip(inv_denoms.iter())
+        .fold(FieldElement::<E>::zero(), |acc, ((point, eval), inv_d)| {
+            let numerator = point * eval;
+            acc + numerator * inv_d
+        });
 
-    #[test]
-    fn negating_a_is_not_equal_to_a() {
-        assert_ne!(-polynomial_a(), polynomial_a());
-    }
-
-    #[test]
-    fn substracting_5_5_gives_0() {
-        let p1 = Polynomial::new(&[FE::new(5)]);
-        let p2 = Polynomial::new(&[FE::new(5)]);
-        let p3 = Polynomial::new(&[FE::new(0)]);
-        assert_eq!(p1 - p2, p3);
-    }
-
-    #[test]
-    fn substracting_b_and_a_equals_b_minus_a() {
-        assert_eq!(polynomial_b() - polynomial_a(), polynomial_b_minus_a());
-    }
-
-    #[test]
-    fn constructor_removes_zeros_at_the_end_of_polynomial() {
-        let p1 = Polynomial::new(&[FE::new(3), FE::new(4), FE::new(0)]);
-        assert_eq!(p1.coefficients, &[FE::new(3), FE::new(4)]);
-    }
-
-    #[test]
-    fn pad_with_zero_coefficients_returns_polynomials_with_zeros_until_matching_size() {
-        let p1 = Polynomial::new(&[FE::new(3), FE::new(4)]);
-        let p2 = Polynomial::new(&[FE::new(3)]);
-
-        assert_eq!(p2.coefficients, &[FE::new(3)]);
-        let (pp1, pp2) = pad_with_zero_coefficients(&p1, &p2);
-        assert_eq!(pp1, p1);
-        assert_eq!(pp2.coefficients, &[FE::new(3), FE::new(0)]);
-    }
-
-    #[test]
-    fn multiply_5_and_0_is_0() {
-        let p1 = Polynomial::new(&[FE::new(5)]);
-        let p2 = Polynomial::new(&[FE::new(0)]);
-        assert_eq!(p1 * p2, Polynomial::new(&[FE::new(0)]));
-    }
-
-    #[test]
-    fn multiply_0_and_x_is_0() {
-        let p1 = Polynomial::new(&[FE::new(0)]);
-        let p2 = Polynomial::new(&[FE::new(0), FE::new(1)]);
-        assert_eq!(p1 * p2, Polynomial::new(&[FE::new(0)]));
-    }
-
-    #[test]
-    fn multiply_2_by_3_is_6() {
-        let p1 = Polynomial::new(&[FE::new(2)]);
-        let p2 = Polynomial::new(&[FE::new(3)]);
-        assert_eq!(p1 * p2, Polynomial::new(&[FE::new(6)]));
-    }
-
-    #[test]
-    fn multiply_2xx_3x_3_times_x_4() {
-        let p1 = Polynomial::new(&[FE::new(3), FE::new(3), FE::new(2)]);
-        let p2 = Polynomial::new(&[FE::new(4), FE::new(1)]);
-        assert_eq!(
-            p1 * p2,
-            Polynomial::new(&[FE::new(12), FE::new(15), FE::new(11), FE::new(2)])
-        );
-    }
-
-    #[test]
-    fn multiply_x_4_times_2xx_3x_3() {
-        let p1 = Polynomial::new(&[FE::new(3), FE::new(3), FE::new(2)]);
-        let p2 = Polynomial::new(&[FE::new(4), FE::new(1)]);
-        assert_eq!(
-            p2 * p1,
-            Polynomial::new(&[FE::new(12), FE::new(15), FE::new(11), FE::new(2)])
-        );
-    }
-
-    #[test]
-    fn division_works() {
-        let p1 = Polynomial::new(&[FE::new(1), FE::new(3)]);
-        let p2 = Polynomial::new(&[FE::new(1), FE::new(3)]);
-        let p3 = p1.mul_with_ref(&p2);
-        assert_eq!(p3 / p2, p1);
-    }
-
-    #[test]
-    fn division_by_zero_degree_polynomial_works() {
-        let four = FE::new(4);
-        let two = FE::new(2);
-        let p1 = Polynomial::new(&[four, four]);
-        let p2 = Polynomial::new(&[two]);
-        assert_eq!(Polynomial::new(&[two, two]), p1 / p2);
-    }
-
-    #[test]
-    fn evaluate_constant_polynomial_returns_constant() {
-        let three = FE::new(3);
-        let p = Polynomial::new(&[three]);
-        assert_eq!(p.evaluate(&FE::new(10)), three);
-    }
-
-    #[test]
-    fn evaluate_slice() {
-        let three = FE::new(3);
-        let p = Polynomial::new(&[three]);
-        let ret = p.evaluate_slice(&[FE::new(10), FE::new(15)]);
-        assert_eq!(ret, [three, three]);
-    }
-
-    #[test]
-    fn create_degree_0_new_monomial() {
-        assert_eq!(
-            Polynomial::new_monomial(FE::new(3), 0),
-            Polynomial::new(&[FE::new(3)])
-        );
-    }
-
-    #[test]
-    fn zero_poly_evals_0_in_3() {
-        assert_eq!(
-            Polynomial::new_monomial(FE::new(0), 0).evaluate(&FE::new(3)),
-            FE::new(0)
-        );
-    }
-
-    #[test]
-    fn evaluate_degree_1_new_monomial() {
-        let two = FE::new(2);
-        let four = FE::new(4);
-        let p = Polynomial::new_monomial(two, 1);
-        assert_eq!(p.evaluate(&two), four);
-    }
-
-    #[test]
-    fn evaluate_degree_2_monomyal() {
-        let two = FE::new(2);
-        let eight = FE::new(8);
-        let p = Polynomial::new_monomial(two, 2);
-        assert_eq!(p.evaluate(&two), eight);
-    }
-
-    #[test]
-    fn evaluate_3_term_polynomial() {
-        let p = Polynomial::new(&[FE::new(3), -FE::new(2), FE::new(4)]);
-        assert_eq!(p.evaluate(&FE::new(2)), FE::new(15));
-    }
-
-    #[test]
-    fn simple_interpolating_polynomial_by_hand_works() {
-        let denominator = Polynomial::new(&[FE::new(1) * (FE::new(2) - FE::new(4)).inv().unwrap()]);
-        let numerator = Polynomial::new(&[-FE::new(4), FE::new(1)]);
-        let interpolating = numerator * denominator;
-        assert_eq!(
-            (FE::new(2) - FE::new(4)) * (FE::new(1) * (FE::new(2) - FE::new(4)).inv().unwrap()),
-            FE::new(1)
-        );
-        assert_eq!(interpolating.evaluate(&FE::new(2)), FE::new(1));
-        assert_eq!(interpolating.evaluate(&FE::new(4)), FE::new(0));
-    }
-
-    #[test]
-    fn interpolate_x_2_y_3() {
-        let p = Polynomial::interpolate(&[FE::new(2)], &[FE::new(3)]).unwrap();
-        assert_eq!(FE::new(3), p.evaluate(&FE::new(2)));
-    }
-
-    #[test]
-    fn interpolate_x_0_2_y_3_4() {
-        let p =
-            Polynomial::interpolate(&[FE::new(0), FE::new(2)], &[FE::new(3), FE::new(4)]).unwrap();
-        assert_eq!(FE::new(3), p.evaluate(&FE::new(0)));
-        assert_eq!(FE::new(4), p.evaluate(&FE::new(2)));
-    }
-
-    #[test]
-    fn interpolate_x_2_5_7_y_10_19_43() {
-        let p = Polynomial::interpolate(
-            &[FE::new(2), FE::new(5), FE::new(7)],
-            &[FE::new(10), FE::new(19), FE::new(43)],
-        )
-        .unwrap();
-
-        assert_eq!(FE::new(10), p.evaluate(&FE::new(2)));
-        assert_eq!(FE::new(19), p.evaluate(&FE::new(5)));
-        assert_eq!(FE::new(43), p.evaluate(&FE::new(7)));
-    }
-
-    #[test]
-    fn interpolate_x_0_0_y_1_1() {
-        let p =
-            Polynomial::interpolate(&[FE::new(0), FE::new(1)], &[FE::new(0), FE::new(1)]).unwrap();
-
-        assert_eq!(FE::new(0), p.evaluate(&FE::new(0)));
-        assert_eq!(FE::new(1), p.evaluate(&FE::new(1)));
-    }
-
-    #[test]
-    fn interpolate_x_0_y_0() {
-        let p = Polynomial::interpolate(&[FE::new(0)], &[FE::new(0)]).unwrap();
-        assert_eq!(FE::new(0), p.evaluate(&FE::new(0)));
-    }
-
-    #[test]
-    fn composition_works() {
-        let p = Polynomial::new(&[FE::new(0), FE::new(2)]);
-        let q = Polynomial::new(&[FE::new(0), FE::new(0), FE::new(1)]);
-        assert_eq!(
-            compose(&p, &q),
-            Polynomial::new(&[FE::new(0), FE::new(0), FE::new(2)])
-        );
-    }
-
-    #[test]
-    fn break_in_parts() {
-        // p = 3 X^3 + X^2 + 2X + 1
-        let p = Polynomial::new(&[FE::new(1), FE::new(2), FE::new(1), FE::new(3)]);
-        let p0_expected = Polynomial::new(&[FE::new(1), FE::new(1)]);
-        let p1_expected = Polynomial::new(&[FE::new(2), FE::new(3)]);
-        let parts = p.break_in_parts(2);
-        assert_eq!(parts.len(), 2);
-        let p0 = &parts[0];
-        let p1 = &parts[1];
-        assert_eq!(p0, &p0_expected);
-        assert_eq!(p1, &p1_expected);
-    }
-
-    use proptest::prelude::*;
-    proptest! {
-        #[test]
-        fn ruffini_inplace_equals_division(p in any::<Vec<u64>>(), b in any::<u64>()) {
-            let p: Vec<_> = p.into_iter().map(FE::from).collect();
-            let mut p = Polynomial::new(&p);
-            let b = FE::from(b);
-
-            let p_ref = p.clone();
-            let m = Polynomial::new_monomial(FE::one(), 1) - b;
-
-            p.ruffini_division_inplace(&b);
-            prop_assert_eq!(p, p_ref / m);
-        }
-    }
-
-    proptest! {
-        #[test]
-        fn ruffini_inplace_equals_ruffini(p in any::<Vec<u64>>(), b in any::<u64>()) {
-            let p: Vec<_> = p.into_iter().map(FE::from).collect();
-            let mut p = Polynomial::new(&p);
-            let b = FE::from(b);
-            let q = p.ruffini_division(&b);
-            p.ruffini_division_inplace(&b);
-            prop_assert_eq!(q, p);
-        }
-    }
-    #[test]
-    fn test_xgcd() {
-        // Case 1: Simple polynomials
-        let p1 = Polynomial::new(&[FE::new(1), FE::new(0), FE::new(1)]); // x^2 + 1
-        let p2 = Polynomial::new(&[FE::new(1), FE::new(1)]); // x + 1
-        let (a, b, g) = p1.xgcd(&p2);
-        // Check that a * p1 + b * p2 = g
-        let lhs = a.mul_with_ref(&p1) + b.mul_with_ref(&p2);
-        assert_eq!(a, Polynomial::new(&[FE::new(12)]));
-        assert_eq!(b, Polynomial::new(&[FE::new(12), FE::new(11)]));
-        assert_eq!(lhs, g);
-        assert_eq!(g, Polynomial::new(&[FE::new(1)]));
-
-        // x^2-1 :
-        let p3 = Polynomial::new(&[FE::new(ORDER - 1), FE::new(0), FE::new(1)]);
-        // x^3-x = x(x^2-1)
-        let p4 = Polynomial::new(&[FE::new(0), FE::new(ORDER - 1), FE::new(0), FE::new(1)]);
-        let (a, b, g) = p3.xgcd(&p4);
-
-        let lhs = a.mul_with_ref(&p3) + b.mul_with_ref(&p4);
-        assert_eq!(a, Polynomial::new(&[FE::new(1)]));
-        assert_eq!(b, Polynomial::zero());
-        assert_eq!(lhs, g);
-        assert_eq!(g, p3);
-    }
-
-    #[test]
-    fn test_differentiate() {
-        // 3x^2 + 2x + 42
-        let px = Polynomial::new(&[FE::new(42), FE::new(2), FE::new(3)]);
-        // 6x + 2
-        let dpdx = px.differentiate();
-        assert_eq!(dpdx, Polynomial::new(&[FE::new(2), FE::new(6)]));
-
-        // 128
-        let px = Polynomial::new(&[FE::new(128)]);
-        // 0
-        let dpdx = px.differentiate();
-        assert_eq!(dpdx, Polynomial::new(&[FE::new(0)]));
-    }
-
-    #[test]
-    fn test_reverse() {
-        let p = Polynomial::new(&[FE::new(3), FE::new(2), FE::new(1)]);
-        assert_eq!(
-            p.reverse(3),
-            Polynomial::new(&[FE::new(0), FE::new(1), FE::new(2), FE::new(3)])
-        );
-    }
-
-    #[test]
-    fn test_truncate() {
-        let p = Polynomial::new(&[FE::new(3), FE::new(2), FE::new(1)]);
-        assert_eq!(p.truncate(2), Polynomial::new(&[FE::new(3), FE::new(2)]));
-    }
-
-    #[test]
-    fn test_print_as_sage_poly() {
-        let p = Polynomial::new(&[FE::new(1), FE::new(2), FE::new(3)]);
-        assert_eq!(p.print_as_sage_poly(None), "3*x^2 + 2*x + 1");
-    }
+    // All scalar factors in base field F; vanishing via sub_subfield.
+    let vanishing = z_pow_n.sub_subfield(coset_offset_pow_n); // E - F → E
+    let scalar = n_inv * g_n_inv; // F * F → F
+    &scalar * &(vanishing * &sum) // F × E → E
 }

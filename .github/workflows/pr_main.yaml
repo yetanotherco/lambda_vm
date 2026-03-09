@@ -20,48 +20,229 @@ jobs:
     # "Lint" is a required check, don't change the name
     name: Lint
     runs-on: ubuntu-latest
+    if: github.event_name != 'push' || github.actor != 'github-merge-queue[bot]'
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
 
       - name: Setup Rust Environment
         uses: ./.github/actions/setup-rust
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
         with:
-          components: rustfmt, clippy
+          shared-key: "lambda-vm-lint"
+          cache-all-crates: "true"
 
-      - name: Run cargo check
-        run: cargo check
+      - name: Run lint checks
+        run: make lint
 
-      - name: Run cargo clippy
+  test-executor:
+    name: Executor tests
+    runs-on: ubuntu-latest
+    if: github.event_name != 'push' || github.actor != 'github-merge-queue[bot]'
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Setup Rust Environment
+        uses: ./.github/actions/setup-rust
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "lambda-vm-test"
+          cache-all-crates: "true"
+
+      - name: Cache compiled ASM ELF artifacts
+        id: cache-asm-elfs
+        uses: actions/cache@v4
+        with:
+          path: executor/program_artifacts/asm
+          key: asm-elf-artifacts-${{ hashFiles('executor/programs/asm/**') }}
+
+      - name: Compile ASM programs to ELF
+        if: steps.cache-asm-elfs.outputs.cache-hit != 'true'
         run: |
-          cargo clippy -- -D warnings
+          make compile-programs-asm
 
-      - name: Run cargo fmt
+      - name: Cache compiled Rust ELF artifacts and build cache
+        id: cache-rust-elfs
+        uses: actions/cache@v4
+        with:
+          path: |
+            executor/program_artifacts/rust
+            executor/shared_target
+          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**') }}
+          restore-keys: |
+            rust-elf-artifacts-
+
+      - name: Compile Rust programs to ELF
+        if: steps.cache-rust-elfs.outputs.cache-hit != 'true'
         run: |
-          cargo fmt --all -- --check
+          make compile-programs-rust
 
+      - name: Run asm tests (no compile)
+        run: |
+          cargo test --release -p executor --test asm
+
+      - name: Run rust tests (no compile)
+        run: |
+          cargo test --release -p executor --test rust
+
+      - name: Run flamegraph tests
+        run: |
+          cargo test --release -p executor --test flamegraph
+
+      - name: Run ignored executor tests
+        run: |
+          make prepare-test-data
+          cargo test --release -p executor test_ethrex -- --ignored
+          cargo test --release -p executor test_ckzg -- --ignored
+
+  # "Test" is a required check — keep this name to avoid branch protection changes.
+  # This gate job passes only when executor tests AND all prover shards succeed.
   test:
-    # "Test" is a required check, don't change the name
     name: Test
+    if: always()
+    needs: [test-executor, test-prover]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check results
+        run: |
+          executor="${{ needs.test-executor.result }}"
+          prover="${{ needs.test-prover.result }}"
+
+          echo "test-executor: $executor"
+          echo "test-prover: $prover"
+
+          # Allow "success" or "skipped" (skipped on merge queue pushes)
+          if [[ "$executor" != "success" && "$executor" != "skipped" ]]; then
+            exit 1
+          fi
+          if [[ "$prover" != "success" && "$prover" != "skipped" ]]; then
+            exit 1
+          fi
+
+  build-prover-tests:
+    name: Build prover tests
+    runs-on: ubuntu-latest
+    if: github.event_name != 'push' || github.actor != 'github-merge-queue[bot]'
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Setup Rust Environment
+        uses: ./.github/actions/setup-rust
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "lambda-vm-prover-test"
+          cache-all-crates: "true"
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Build and archive prover + crypto tests
+        run: |
+          cargo nextest archive --release \
+            -p lambda-vm-prover -p stark -p crypto \
+            --archive-file prover-tests.tar.zst
+
+      - name: Upload test archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: prover-tests
+          path: prover-tests.tar.zst
+          retention-days: 1
+
+  test-prover:
+    name: Prover tests (${{ matrix.partition }}/4)
+    needs: build-prover-tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3, 4]
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Cache compiled ASM ELF artifacts
+        id: cache-asm-elfs
+        uses: actions/cache@v4
+        with:
+          path: executor/program_artifacts/asm
+          key: asm-elf-artifacts-${{ hashFiles('executor/programs/asm/**') }}
+
+      - name: Install clang and lld
+        if: steps.cache-asm-elfs.outputs.cache-hit != 'true'
+        run: sudo apt-get update && sudo apt-get install -y clang lld
+
+      - name: Compile ASM programs to ELF
+        if: steps.cache-asm-elfs.outputs.cache-hit != 'true'
+        run: |
+          make compile-programs-asm
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Download test archive
+        uses: actions/download-artifact@v4
+        with:
+          name: prover-tests
+
+      - name: Run prover tests (shard ${{ matrix.partition }}/4)
+        run: |
+          cargo nextest run \
+            --archive-file prover-tests.tar.zst \
+            --partition hash:${{ matrix.partition }}/4 \
+            --test-threads=1
+
+  test-prover-comprehensive:
+    name: Prover comprehensive tests
+    needs: build-prover-tests
+    if: github.event_name == 'merge_group'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
 
-      - name: Setup Rust Environment
-        uses: ./.github/actions/setup-rust
+      - name: Cache compiled ASM ELF artifacts
+        id: cache-asm-elfs
+        uses: actions/cache@v4
+        with:
+          path: executor/program_artifacts/asm
+          key: asm-elf-artifacts-${{ hashFiles('executor/programs/asm/**') }}
 
-      - name: Install rust nightly
-        run: rustup component add rust-src --toolchain nightly-x86_64-unknown-linux-gnu
+      - name: Install clang and lld
+        if: steps.cache-asm-elfs.outputs.cache-hit != 'true'
+        run: sudo apt-get update && sudo apt-get install -y clang lld
 
-      - name: Run asm tests
+      - name: Compile ASM programs to ELF
+        if: steps.cache-asm-elfs.outputs.cache-hit != 'true'
         run: |
-          cd executor && make test-asm-no-compile
+          make compile-programs-asm
 
-      - name: Run rust tests
-        run: |
-          cd executor && rustup target add riscv32im-unknown-none-elf && make test-rust
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
 
-      - name: Run prover tests
+      - name: Download test archive
+        uses: actions/download-artifact@v4
+        with:
+          name: prover-tests
+
+      - name: Run comprehensive prover tests
         run: |
-          cd prover && cargo test
+          cargo nextest run \
+            --archive-file prover-tests.tar.zst \
+            --test-threads=1 \
+            -E 'test(test_prove_elfs_all_instructions_64_full)' \
+            --run-ignored ignored-only

@@ -1,14 +1,12 @@
 use crate::{
     errors::CreationError,
     field::{
-        element::FieldElement,
-        extensions::quadratic::QuadraticExtensionField,
+        errors::FieldError,
         traits::{IsFFTField, IsField, IsPrimeField},
     },
-    field::{errors::FieldError, extensions::quadratic::HasQuadraticNonResidue},
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct U64Field<const MODULUS: u64>;
 
 impl<const MODULUS: u64> IsField for U64Field<MODULUS> {
@@ -64,9 +62,9 @@ impl<const MODULUS: u64> IsField for U64Field<MODULUS> {
 }
 
 impl<const MODULUS: u64> IsPrimeField for U64Field<MODULUS> {
-    type RepresentativeType = u64;
+    type CanonicalType = u64;
 
-    fn representative(x: &u64) -> u64 {
+    fn canonical(x: &u64) -> u64 {
         *x
     }
 
@@ -102,54 +100,4 @@ pub type U64TestField = U64Field<18446744069414584321>;
 impl IsFFTField for U64TestField {
     const TWO_ADICITY: u64 = 32;
     const TWO_ADIC_PRIMITVE_ROOT_OF_UNITY: u64 = 1753635133440165772;
-}
-
-#[derive(Clone, Debug)]
-pub struct TestNonResidue;
-impl HasQuadraticNonResidue<U64TestField> for TestNonResidue {
-    fn residue() -> FieldElement<U64TestField> {
-        FieldElement::from(7)
-    }
-}
-
-pub type U64TestFieldExtension = QuadraticExtensionField<U64TestField, TestNonResidue>;
-
-#[cfg(test)]
-mod tests_u64_test_field {
-    use crate::field::{
-        element::FieldElement,
-        test_fields::u64_test_field::{U64TestField, U64TestFieldExtension},
-        traits::IsPrimeField,
-    };
-
-    #[test]
-    fn from_hex_for_b_is_11() {
-        assert_eq!(U64TestField::from_hex("B").unwrap(), 11);
-    }
-
-    #[test]
-    fn bit_size_of_test_field_is_64() {
-        assert_eq!(
-            <U64TestField as crate::field::traits::IsPrimeField>::field_bit_size(),
-            64
-        );
-    }
-
-    #[cfg(feature = "alloc")]
-    #[test]
-    fn test_to_subfield_vec() {
-        let a = FieldElement::<U64TestFieldExtension>::from(&[
-            FieldElement::from(1),
-            FieldElement::from(3),
-        ]);
-        let b = a.to_subfield_vec::<U64TestField>();
-        assert_eq!(b, alloc::vec![FieldElement::from(1), FieldElement::from(3)]);
-    }
-
-    #[cfg(feature = "std")]
-    #[test]
-    fn to_hex_test() {
-        let num = U64TestField::from_hex("B").unwrap();
-        assert_eq!(U64TestField::to_hex(&num), "B");
-    }
 }

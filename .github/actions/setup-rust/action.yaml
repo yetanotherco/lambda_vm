@@ -1,27 +1,17 @@
 name: 'Setup Rust Environment'
 description: 'Sets up Rust and caches dependencies'
-inputs:
-  components:
-    description: "Rust components to install (e.g., rustfmt, clippy)"
-    required: false
-    default: ""
 runs:
   using: "composite"
   steps:
-    - name: Extract Rust version from rust-toolchain.toml
-      id: rustver
-      shell: bash
-      run: |
-        rust_version=$(grep -E '^[[:space:]]*channel[[:space:]]*=' rust-toolchain.toml \
-                 | sed -E 's/.*"([^"]+)".*/\1/')
-        echo "rust_version=${rust_version}" >>"$GITHUB_OUTPUT"
-        echo "Rust version: ${rust_version}"
 
-    - name: Install Rust
-      uses: dtolnay/rust-toolchain@master
+    - name: Free Disk Space
+      uses: ./.github/actions/free-disk
+
+    - name: Install Rust stable
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install Rust nightly for build-std
+      uses: dtolnay/rust-toolchain@nightly
       with:
-        toolchain: ${{ steps.rustver.outputs.rust_version }}
-        components: ${{ inputs.components }}
-
-    - name: Add Rust Cache
-      uses: Swatinem/rust-cache@v2
+        toolchain: nightly-2026-02-01
+        components: rust-src

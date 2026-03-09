@@ -9,14 +9,57 @@ use math::{
     polynomial::Polynomial,
 };
 
-use crate::{constraints::transition::TransitionConstraint, domain::Domain};
-
-use super::{
-    constraints::boundary::BoundaryConstraints, context::AirContext, frame::Frame,
-    proof::options::ProofOptions, trace::TraceTable,
+use crate::{
+    constraints::transition::TransitionConstraint, domain::Domain, lookup::BusPublicInputs,
 };
 
-type ZerofierGroupKey = (usize, usize, Option<usize>, Option<usize>, usize);
+use super::{
+    config::Commitment, constraints::boundary::BoundaryConstraints, context::AirContext,
+    frame::Frame, proof::options::ProofOptions, trace::TraceTable,
+};
+
+/// Deduplicated zerofier evaluations: unique zerofier vectors indexed by constraint.
+///
+/// Multiple constraints often share the same zerofier (same period, offset, and exemptions).
+/// Instead of cloning a `Vec<FieldElement<F>>` per constraint, this struct stores each unique
+/// zerofier vector once and maps each constraint index to its group.
+pub struct ZerofierEvaluations<F: IsField> {
+    /// Unique zerofier evaluation vectors (deduplicated).
+    pub groups: Vec<Vec<FieldElement<F>>>,
+    /// constraint_idx → group index.
+    pub constraint_to_group: Vec<usize>,
+}
+
+impl<F: IsField> ZerofierEvaluations<F> {
+    #[inline]
+    pub fn get(&self, constraint_idx: usize, lde_idx: usize) -> &FieldElement<F> {
+        let group = &self.groups[self.constraint_to_group[constraint_idx]];
+        &group[lde_idx % group.len()]
+    }
+
+    /// Returns true if all constraints share the same zerofier group.
+    pub fn is_uniform(&self) -> bool {
+        self.groups.len() == 1
+    }
+
+    /// Fast path for uniform case: all constraints share one zerofier.
+    #[inline]
+    pub fn get_uniform(&self, lde_idx: usize) -> &FieldElement<F> {
+        let group = &self.groups[0];
+        &group[lde_idx % group.len()]
+    }
+}
+
+/// Key identifying a unique zerofier shape — constraints with the same key share
+/// the same zerofier evaluations on the extended domain.
+#[derive(Clone, Copy, Hash, Eq, PartialEq)]
+struct ZerofierGroupKey {
+    period: usize,
+    offset: usize,
+    exemptions_period: Option<usize>,
+    periodic_exemptions_offset: Option<usize>,
+    end_exemptions: usize,
+}
 
 /// This enum is necessary because, while both the prover and verifier perform the same operations
 ///  to compute transition constraints, their frames differ.
@@ -30,14 +73,18 @@ where
     E: IsField,
 {
     Prover {
-        frame: &'a Frame<'a, F, E>,
+        frame: &'a Frame<F, E>,
         periodic_values: &'a [FieldElement<F>],
         rap_challenges: &'a [FieldElement<E>],
+        logup_alpha_powers: &'a [FieldElement<E>],
+        logup_table_offset: &'a FieldElement<E>,
     },
     Verifier {
-        frame: &'a Frame<'a, E, E>,
+        frame: &'a Frame<E, E>,
         periodic_values: &'a [FieldElement<E>],
         rap_challenges: &'a [FieldElement<E>],
+        logup_alpha_powers: &'a [FieldElement<E>],
+        logup_table_offset: &'a FieldElement<E>,
     },
 }
 
@@ -47,26 +94,34 @@ where
     E: IsField,
 {
     pub fn new_prover(
-        frame: &'a Frame<'a, F, E>,
+        frame: &'a Frame<F, E>,
         periodic_values: &'a [FieldElement<F>],
         rap_challenges: &'a [FieldElement<E>],
+        logup_alpha_powers: &'a [FieldElement<E>],
+        logup_table_offset: &'a FieldElement<E>,
     ) -> Self {
         Self::Prover {
             frame,
             periodic_values,
             rap_challenges,
+            logup_alpha_powers,
+            logup_table_offset,
         }
     }
 
     pub fn new_verifier(
-        frame: &'a Frame<'a, E, E>,
+        frame: &'a Frame<E, E>,
         periodic_values: &'a [FieldElement<E>],
         rap_challenges: &'a [FieldElement<E>],
+        logup_alpha_powers: &'a [FieldElement<E>],
+        logup_table_offset: &'a FieldElement<E>,
     ) -> Self {
         Self::Verifier {
             frame,
             periodic_values,
             rap_challenges,
+            logup_alpha_powers,
+            logup_table_offset,
         }
     }
 }
@@ -79,11 +134,12 @@ pub trait AIR: Send + Sync {
 
     fn step_size(&self) -> usize;
 
-    fn new(
-        trace_length: usize,
-        pub_inputs: &Self::PublicInputs,
-        proof_options: &ProofOptions,
-    ) -> Self
+    /// Human-readable name for this AIR (used in profiling output).
+    fn name(&self) -> &str {
+        "unknown"
+    }
+
+    fn new(proof_options: &ProofOptions) -> Self
     where
         Self: Sized;
 
@@ -91,7 +147,8 @@ pub trait AIR: Send + Sync {
         &self,
         _main_trace: &mut TraceTable<Self::Field, Self::FieldExtension>,
         _rap_challenges: &[FieldElement<Self::FieldExtension>],
-    ) {
+    ) -> Option<BusPublicInputs<Self::FieldExtension>> {
+        None
     }
 
     fn build_rap_challenges(
@@ -104,16 +161,52 @@ pub trait AIR: Send + Sync {
     /// Returns the amount main trace columns and auxiliary trace columns
     fn trace_layout(&self) -> (usize, usize);
 
-    fn has_trace_interaction(&self) -> bool {
+    fn has_aux_trace(&self) -> bool {
         let (_main_trace_columns, aux_trace_columns) = self.trace_layout();
         aux_trace_columns != 0
+    }
+
+    /// Returns true if this AIR interacts with other traces (lookup), such is the case
+    /// of `AirWithBuses` (override to return true).
+    /// Generic RAP AIRs with auxiliary columns but no bus interactions must return false.
+    fn has_trace_interaction(&self) -> bool {
+        false
+    }
+
+    /// Returns the maximum number of bus elements across all interactions.
+    /// Used to compute the correct number of alpha powers for LogUp fingerprints.
+    fn max_bus_elements(&self) -> usize {
+        0
+    }
+
+    /// Returns true if this AIR has preprocessed (precomputed) columns.
+    ///
+    /// Preprocessed tables have columns that are fully deterministic and known
+    /// to both prover and verifier (e.g., bitwise lookup tables).
+    fn is_preprocessed(&self) -> bool {
+        false
+    }
+
+    /// Returns the number of precomputed columns (columns 0..n are precomputed).
+    ///
+    /// Only meaningful if `is_preprocessed()` returns true.
+    /// The remaining columns (n..) are multiplicities.
+    fn num_precomputed_columns(&self) -> usize {
+        0
+    }
+
+    /// Returns the hardcoded commitment to the precomputed columns.
+    ///
+    /// Only meaningful if `is_preprocessed()` returns true.
+    fn precomputed_commitment(&self) -> Commitment {
+        [0u8; 32]
     }
 
     fn num_auxiliary_rap_columns(&self) -> usize {
         self.trace_layout().1
     }
 
-    fn composition_poly_degree_bound(&self) -> usize;
+    fn composition_poly_degree_bound(&self, trace_length: usize) -> usize;
 
     /// The method called by the prover to evaluate the transitions corresponding to an evaluation frame.
     /// In the case of the prover, the main evaluation table of the frame takes values in
@@ -132,14 +225,32 @@ pub trait AIR: Send + Sync {
         evaluations
     }
 
+    /// Evaluate all transition constraints into a caller-provided buffer.
+    ///
+    /// Same as `compute_transition` but reuses a pre-allocated buffer, avoiding
+    /// a `Vec` allocation per LDE domain point in the prover's hot loop.
+    fn compute_transition_into(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
+        evaluations: &mut [FieldElement<Self::FieldExtension>],
+    ) {
+        for e in evaluations.iter_mut() {
+            *e = FieldElement::zero();
+        }
+        self.transition_constraints()
+            .iter()
+            .for_each(|c| c.evaluate(evaluation_context, evaluations));
+    }
+
     fn boundary_constraints(
         &self,
+        pub_inputs: &Self::PublicInputs,
         rap_challenges: &[FieldElement<Self::FieldExtension>],
+        bus_public_inputs: Option<&BusPublicInputs<Self::FieldExtension>>,
+        trace_length: usize,
     ) -> BoundaryConstraints<Self::FieldExtension>;
 
     fn context(&self) -> &AirContext;
-
-    fn trace_length(&self) -> usize;
 
     fn options(&self) -> &ProofOptions {
         &self.context().proof_options
@@ -153,8 +264,7 @@ pub trait AIR: Send + Sync {
         FieldElement::from(self.options().coset_offset)
     }
 
-    fn trace_primitive_root(&self) -> FieldElement<Self::Field> {
-        let trace_length = self.trace_length();
+    fn trace_primitive_root(&self, trace_length: usize) -> FieldElement<Self::Field> {
         let root_of_unity_order = u64::from(trace_length.trailing_zeros());
 
         Self::Field::get_primitive_root_of_unity(root_of_unity_order).unwrap()
@@ -164,19 +274,20 @@ pub trait AIR: Send + Sync {
         self.context().num_transition_constraints
     }
 
-    fn pub_inputs(&self) -> &Self::PublicInputs;
-
     fn get_periodic_column_values(&self) -> Vec<Vec<FieldElement<Self::Field>>> {
         vec![]
     }
 
-    fn get_periodic_column_polynomials(&self) -> Vec<Polynomial<FieldElement<Self::Field>>> {
+    fn get_periodic_column_polynomials(
+        &self,
+        trace_length: usize,
+    ) -> Vec<Polynomial<FieldElement<Self::Field>>> {
         let mut result = Vec::new();
         for periodic_column in self.get_periodic_column_values() {
             let values: Vec<_> = periodic_column
                 .iter()
                 .cycle()
-                .take(self.trace_length())
+                .take(trace_length)
                 .cloned()
                 .collect();
             let poly =
@@ -211,13 +322,13 @@ pub trait AIR: Send + Sync {
             // If there are multiple domain and subdomains it can be further optimized
             // as to share computation between them
 
-            let zerofier_group_key = (
+            let zerofier_group_key = ZerofierGroupKey {
                 period,
                 offset,
                 exemptions_period,
                 periodic_exemptions_offset,
                 end_exemptions,
-            );
+            };
             zerofier_groups
                 .entry(zerofier_group_key)
                 .or_insert_with(|| c.zerofier_evaluations_on_extended_domain(domain));
@@ -227,5 +338,41 @@ pub trait AIR: Send + Sync {
         });
 
         evals
+    }
+
+    /// Compute zerofier evaluations as deduplicated groups with index mapping.
+    ///
+    /// This replaces `transition_zerofier_evaluations` for the prover's constraint
+    /// evaluation loop. Instead of cloning `Vec<FieldElement<F>>` per constraint,
+    /// each unique zerofier is computed once and constraints map to group indices.
+    fn transition_zerofier_evaluations_grouped(
+        &self,
+        domain: &Domain<Self::Field>,
+    ) -> ZerofierEvaluations<Self::Field> {
+        let num_constraints = self.num_transition_constraints();
+        let mut constraint_to_group = vec![0usize; num_constraints];
+        let mut zerofier_groups_map: HashMap<ZerofierGroupKey, usize> = HashMap::new();
+        let mut groups: Vec<Vec<FieldElement<Self::Field>>> = Vec::new();
+
+        self.transition_constraints().iter().for_each(|c| {
+            let key = ZerofierGroupKey {
+                period: c.period(),
+                offset: c.offset(),
+                exemptions_period: c.exemptions_period(),
+                periodic_exemptions_offset: c.periodic_exemptions_offset(),
+                end_exemptions: c.end_exemptions(),
+            };
+            let group_idx = *zerofier_groups_map.entry(key).or_insert_with(|| {
+                let idx = groups.len();
+                groups.push(c.zerofier_evaluations_on_extended_domain(domain));
+                idx
+            });
+            constraint_to_group[c.constraint_idx()] = group_idx;
+        });
+
+        ZerofierEvaluations {
+            groups,
+            constraint_to_group,
+        }
     }
 }

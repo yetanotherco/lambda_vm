@@ -1,16 +1,14 @@
 use crate::{
-    Felt252,
     constraints::{boundary::BoundaryConstraints, transition::TransitionConstraint},
     context::AirContext,
     proof::options::ProofOptions,
     trace::TraceTable,
     traits::{AIR, TransitionEvaluationContext},
 };
-use math::field::{
-    element::FieldElement, fields::fft_friendly::stark_252_prime_field::Stark252PrimeField,
-};
+use math::field::{element::FieldElement, goldilocks::GoldilocksField};
 
-type StarkField = Stark252PrimeField;
+type StarkField = GoldilocksField;
+type Felt = FieldElement<GoldilocksField>;
 
 #[derive(Clone)]
 pub struct BitConstraint;
@@ -51,11 +49,13 @@ impl TransitionConstraint<StarkField, StarkField> for BitConstraint {
                 frame,
                 periodic_values,
                 rap_challenges,
+                ..
             }
             | TransitionEvaluationContext::Verifier {
                 frame,
                 periodic_values,
                 rap_challenges,
+                ..
             } => (frame, periodic_values, rap_challenges),
         };
 
@@ -64,8 +64,8 @@ impl TransitionConstraint<StarkField, StarkField> for BitConstraint {
         let prefix_flag = step.get_main_evaluation_element(0, 0);
         let next_prefix_flag = step.get_main_evaluation_element(1, 0);
 
-        let two = Felt252::from(2);
-        let one = Felt252::one();
+        let two = Felt::from(2);
+        let one = Felt::one();
         let bit_flag = prefix_flag - two * next_prefix_flag;
 
         let bit_constraint = bit_flag * (bit_flag - one);
@@ -109,11 +109,13 @@ impl TransitionConstraint<StarkField, StarkField> for ZeroFlagConstraint {
                 frame,
                 periodic_values,
                 rap_challenges,
+                ..
             }
             | TransitionEvaluationContext::Verifier {
                 frame,
                 periodic_values,
                 rap_challenges,
+                ..
             } => (frame, periodic_values, rap_challenges),
         };
 
@@ -127,7 +129,6 @@ impl TransitionConstraint<StarkField, StarkField> for ZeroFlagConstraint {
 pub struct BitFlagsAIR {
     context: AirContext,
     constraints: Vec<Box<dyn TransitionConstraint<StarkField, StarkField>>>,
-    trace_length: usize,
 }
 
 impl AIR for BitFlagsAIR {
@@ -139,11 +140,7 @@ impl AIR for BitFlagsAIR {
         16
     }
 
-    fn new(
-        trace_length: usize,
-        _pub_inputs: &Self::PublicInputs,
-        proof_options: &ProofOptions,
-    ) -> Self {
+    fn new(proof_options: &ProofOptions) -> Self {
         let bit_constraint = Box::new(BitConstraint::new());
         let flag_constraint = Box::new(ZeroFlagConstraint::new());
         let constraints: Vec<Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>> =
@@ -160,7 +157,6 @@ impl AIR for BitFlagsAIR {
 
         Self {
             context,
-            trace_length,
             constraints,
         }
     }
@@ -173,7 +169,10 @@ impl AIR for BitFlagsAIR {
 
     fn boundary_constraints(
         &self,
+        _pub_inputs: &Self::PublicInputs,
         _rap_challenges: &[FieldElement<Self::FieldExtension>],
+        _bus_public_inputs: Option<&crate::lookup::BusPublicInputs<Self::FieldExtension>>,
+        _trace_length: usize,
     ) -> BoundaryConstraints<Self::FieldExtension> {
         BoundaryConstraints::from_constraints(vec![])
     }
@@ -182,36 +181,28 @@ impl AIR for BitFlagsAIR {
         &self.context
     }
 
-    fn composition_poly_degree_bound(&self) -> usize {
-        self.trace_length * 2
-    }
-
-    fn trace_length(&self) -> usize {
-        self.trace_length
+    fn composition_poly_degree_bound(&self, trace_length: usize) -> usize {
+        trace_length * 2
     }
 
     fn trace_layout(&self) -> (usize, usize) {
         (1, 0)
     }
-
-    fn pub_inputs(&self) -> &Self::PublicInputs {
-        &()
-    }
 }
 
 pub fn bit_prefix_flag_trace(num_steps: usize) -> TraceTable<StarkField, StarkField> {
     debug_assert!(num_steps.is_power_of_two());
-    let step: Vec<Felt252> = [
+    let step: Vec<Felt> = [
         1031u64, 515, 257, 128, 64, 32, 16, 8, 4, 2, 1, 0, 0, 0, 0, 0,
     ]
     .iter()
-    .map(|t| Felt252::from(*t))
+    .map(|t| Felt::from(*t))
     .collect();
 
-    let mut data: Vec<Felt252> = std::iter::repeat_n(step, num_steps).flatten().collect();
-    data[0] = Felt252::from(1030);
+    let mut data: Vec<Felt> = std::iter::repeat_n(step, num_steps).flatten().collect();
+    data[0] = Felt::from(1030);
 
-    let mut dummy_column = (0..16).map(Felt252::from).collect();
+    let mut dummy_column = (0..16).map(Felt::from).collect();
     dummy_column = std::iter::repeat_n(dummy_column, num_steps)
         .flatten()
         .collect();

@@ -54,11 +54,13 @@ where
                 frame,
                 periodic_values,
                 rap_challenges,
+                ..
             }
             | TransitionEvaluationContext::Verifier {
                 frame,
                 periodic_values,
                 rap_challenges,
+                ..
             } => (frame, periodic_values, rap_challenges),
         };
 
@@ -95,8 +97,6 @@ where
     F: IsFFTField,
 {
     context: AirContext,
-    trace_length: usize,
-    pub_inputs: SimplePeriodicPublicInputs<F>,
     transition_constraints: Vec<Box<dyn TransitionConstraint<F, F>>>,
 }
 
@@ -121,11 +121,7 @@ where
         1
     }
 
-    fn new(
-        trace_length: usize,
-        pub_inputs: &Self::PublicInputs,
-        proof_options: &ProofOptions,
-    ) -> Self {
+    fn new(proof_options: &ProofOptions) -> Self {
         let transition_constraints: Vec<
             Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>,
         > = vec![Box::new(PeriodicConstraint::new())];
@@ -138,26 +134,24 @@ where
         };
 
         Self {
-            pub_inputs: pub_inputs.clone(),
             context,
-            trace_length,
             transition_constraints,
         }
     }
 
-    fn composition_poly_degree_bound(&self) -> usize {
-        self.trace_length()
+    fn composition_poly_degree_bound(&self, trace_length: usize) -> usize {
+        trace_length
     }
 
     fn boundary_constraints(
         &self,
+        pub_inputs: &Self::PublicInputs,
         _rap_challenges: &[FieldElement<Self::FieldExtension>],
+        _bus_public_inputs: Option<&crate::lookup::BusPublicInputs<Self::FieldExtension>>,
+        trace_length: usize,
     ) -> BoundaryConstraints<Self::Field> {
-        let a0 = BoundaryConstraint::new_simple_main(0, self.pub_inputs.a0.clone());
-        let a1 = BoundaryConstraint::new_simple_main(
-            self.trace_length() - 1,
-            self.pub_inputs.a1.clone(),
-        );
+        let a0 = BoundaryConstraint::new_simple_main(0, pub_inputs.a0.clone());
+        let a1 = BoundaryConstraint::new_simple_main(trace_length - 1, pub_inputs.a1.clone());
 
         BoundaryConstraints::from_constraints(vec![a0, a1])
     }
@@ -176,16 +170,8 @@ where
         &self.context
     }
 
-    fn trace_length(&self) -> usize {
-        self.trace_length
-    }
-
     fn trace_layout(&self) -> (usize, usize) {
         (1, 0)
-    }
-
-    fn pub_inputs(&self) -> &Self::PublicInputs {
-        &self.pub_inputs
     }
 }
 

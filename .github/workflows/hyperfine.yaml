@@ -1,0 +1,248 @@
+name: Hyperfine Benchmark
+
+on:
+  pull_request:
+    branches: ["**"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-programs:
+    strategy:
+      matrix:
+        branch: [base, head]
+    name: Build Programs for ${{ matrix.branch }}
+    runs-on: ubuntu-24.04
+    outputs:
+      benchmark-hashes-base: ${{ steps.export-hashes.outputs.benchmark-hashes-base }}
+      benchmark-hashes-head: ${{ steps.export-hashes.outputs.benchmark-hashes-head }}
+    steps:
+      - name: Checkout base commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request[matrix.branch].sha }}
+
+      - name: Fetch from cache
+        uses: actions/cache@v4
+        id: cache
+        with:
+          path: ${{ matrix.branch }}_programs/*.elf
+          key: benchmarks-${{ matrix.branch }}-${{ hashFiles( 'executor/programs/bench/*' ) }}
+          restore-keys: benchmarks-${{ matrix.branch }}-
+
+      - name: Setup Rust Environment
+        if: ${{ steps.cache.outputs.cache-hit != 'true' }}
+        uses: ./.github/actions/setup-rust
+
+      - name: Build programs
+        if: ${{ steps.cache.outputs.cache-hit != 'true' }}
+        run: |
+          mkdir -p ${{ matrix.branch }}_programs
+          make -j compile-bench
+          cp executor/program_artifacts/bench/*.elf ${{ matrix.branch }}_programs
+
+      - name: Export benchmark hashes
+        id: export-hashes
+        run: echo "benchmark-hashes-${{ matrix.branch }}=${{ hashFiles( 'executor/programs/bench/*' ) }}" >> "$GITHUB_OUTPUT"
+
+  build-binaries:
+    strategy:
+      matrix:
+        branch: [base, head]
+    name: Build cli for ${{ matrix.branch }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Populate cache
+        uses: actions/cache@v4
+        id: cache
+        with:
+          path: bench-bin/cli-${{ matrix.branch }}
+          key: binary-${{ github.event.pull_request[matrix.branch].sha }}
+
+      - name: Checkout
+        if: ${{ steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request[matrix.branch].sha }}
+
+      - name: Install Rust
+        if: ${{ steps.cache.outputs.cache-hit != 'true' }}
+        uses: ./.github/actions/setup-rust
+
+      - name: Fetch Rust cache
+        if: ${{ steps.cache.outputs.cache-hit != 'true' }}
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "lambda-vm-bench"
+          cache-all-crates: "true"
+
+      - name: Build binary
+        if: ${{ steps.cache.outputs.cache-hit != 'true' }}
+        run: |
+          cargo build --release --bin cli
+          mkdir bench-bin
+          cp target/release/cli bench-bin/cli-${{ matrix.branch }}
+
+  run-hyperfine:
+    strategy:
+      fail-fast: false
+      matrix:
+        program_state: [modified, unmodified]
+    name: Run benchmarks for ${{ matrix.program_state }} programs
+    needs: [build-programs, build-binaries]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install Hyperfine
+        uses: taiki-e/install-action@v2
+        with:
+          tool: hyperfine@1.19
+
+      - name: Fetch base binary
+        uses: actions/cache/restore@v4
+        with:
+          path: bench-bin/cli-base
+          key: binary-${{ github.event.pull_request.base.sha }}
+
+      - name: Fetch HEAD binary
+        uses: actions/cache/restore@v4
+        with:
+          path: bench-bin/cli-head
+          key: binary-${{ github.event.pull_request.head.sha }}
+
+      - name: Fetch base programs
+        uses: actions/cache/restore@v4
+        with:
+          path: base_programs/*.elf
+          key: benchmarks-base-${{ needs.build-programs.outputs.benchmark-hashes-base }}
+
+      - name: Fetch head programs
+        uses: actions/cache/restore@v4
+        with:
+          path: head_programs/*.elf
+          key: benchmarks-head-${{ needs.build-programs.outputs.benchmark-hashes-head }}
+
+      - name: Benchmark ${{ matrix.program_state }} programs
+        id: run-benchmarks
+        run: |
+          sudo swapoff -a
+          mkdir target_programs
+
+          # TODO(#290): Simplify to always use `execute` once all branches have the new CLI
+          # Detect if each CLI supports the execute subcommand by checking help output
+          if ./bench-bin/cli-base --help 2>&1 | grep -q "execute"; then
+            BASE_CMD="./bench-bin/cli-base execute"
+          else
+            BASE_CMD="./bench-bin/cli-base"
+          fi
+          if ./bench-bin/cli-head --help 2>&1 | grep -q "execute"; then
+            HEAD_CMD="./bench-bin/cli-head execute"
+          else
+            HEAD_CMD="./bench-bin/cli-head"
+          fi
+
+          if [ 'modified' = ${{ matrix.program_state }} ]; then
+            for f in head_programs/*.elf; do
+              # Only run new or modified benchmarks
+              if ! cmp -s ${f/head/base} $f; then
+                cp $f target_programs/
+              fi
+            done
+            # Modified programs - only test head
+            find target_programs -name '*.elf' -exec basename -s .elf '{}' '+' | \
+            sort | xargs -I '{program}' \
+            hyperfine -N -w 5 -r 10 --export-markdown "target_programs/{program}.md" \
+            -n "head {program}" \
+            -s "cat ./bench-bin/cli-head target_programs/{program}.elf" \
+            "$HEAD_CMD target_programs/{program}.elf"
+          else
+            for f in base_programs/*.elf; do
+              # Only run unmodified benchmarks
+              if cmp -s ${f/base/head} $f; then
+                cp $f target_programs/
+              fi
+            done
+            # Unmodified programs - test both base and head
+            find target_programs -name '*.elf' -exec basename -s .elf '{}' '+' | \
+            sort | xargs -I '{program}' \
+            hyperfine -N -w 5 -r 10 \
+            --export-markdown "target_programs/{program}.md" \
+            --export-json "target_programs/{program}.json" \
+            -n "base {program}" "$BASE_CMD target_programs/{program}.elf" \
+            -n "head {program}" "$HEAD_CMD target_programs/{program}.elf"
+          fi
+          echo "benchmark_count=$(find target_programs/*.md | wc -l)" >> $GITHUB_OUTPUT
+
+      - name: Detect regression
+        id: detect-regression
+        if: steps.run-benchmarks.outputs.benchmark_count != 0
+        run: |
+          if [ 'modified' = '${{ matrix.program_state }}' ]; then
+            echo "Modified programs have no baseline, always report"
+            echo "regressed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          REGRESSED=false
+          for json in target_programs/*.json; do
+            [ -f "$json" ] || continue
+            BASE_MEAN=$(jq '.results[0].mean' "$json")
+            HEAD_MEAN=$(jq '.results[1].mean' "$json")
+            PROGRAM=$(basename "$json" .json)
+
+            RESULT=$(awk -v bm="$BASE_MEAN" -v hm="$HEAD_MEAN" -v prog="$PROGRAM" 'BEGIN {
+              if (bm <= 0) {
+                printf "%s: base=%.2fs (invalid baseline, skipping)\n", prog, bm > "/dev/stderr"
+                print "false"
+                exit
+              }
+              pct = ((hm - bm) / bm) * 100
+              printf "%s: base=%.2fs  head=%.2fs  change=%+.1f%%\n", prog, bm, hm, pct > "/dev/stderr"
+              print (pct > 5 ? "true" : "false")
+            }')
+
+            if [ "$RESULT" = "true" ]; then
+              REGRESSED=true
+            fi
+          done
+
+          echo "regressed=$REGRESSED" >> "$GITHUB_OUTPUT"
+
+      - name: Print tables
+        if: steps.detect-regression.outputs.regressed == 'true'
+        run: |
+          {
+            echo "Benchmark Results for ${{ matrix.program_state }} programs :rocket:"
+            for f in target_programs/*.md; do
+              echo
+              cat $f
+            done
+          } | tee -a comment_body.md
+
+      - name: Find comment
+        if: steps.detect-regression.outputs.regressed == 'true'
+        uses: peter-evans/find-comment@v3
+        id: fc
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-author: "github-actions[bot]"
+          body-includes: Benchmark Results for ${{ matrix.program_state }} programs
+
+      - name: Create comment
+        if: steps.fc.outputs.comment-id == '' && steps.detect-regression.outputs.regressed == 'true'
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          body-path: comment_body.md
+
+      - name: Update comment
+        if: steps.fc.outputs.comment-id != '' && steps.detect-regression.outputs.regressed == 'true'
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          comment-id: ${{ steps.fc.outputs.comment-id }}
+          body-path: comment_body.md
+          edit-mode: replace

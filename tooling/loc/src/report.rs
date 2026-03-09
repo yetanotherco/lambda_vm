@@ -19,6 +19,8 @@ pub struct LinesOfCodeReporterOptions {
 pub struct LinesOfCodeReport {
     pub lambda_vm: usize,
     pub crates: Vec<(String, usize)>,
+    #[serde(default)]
+    pub tools: Vec<(String, usize)>,
 }
 
 pub fn pr_message(
@@ -143,31 +145,78 @@ fn pr_message_summary(
 pub fn slack_message(old_report: LinesOfCodeReport, new_report: LinesOfCodeReport) -> String {
     let diff_total = new_report.lambda_vm.abs_diff(old_report.lambda_vm);
 
-    let crates_mrkdwn =
-        new_report
-            .crates
-            .iter()
-            .fold(String::new(), |acc, (crate_name, loc)| {
-                let old_loc = old_report
-                    .crates
-                    .iter()
-                    .find(|(old_crate_name, _)| old_crate_name == crate_name)
-                    .map(|(_, old_loc)| old_loc)
-                    .unwrap_or(&0);
+    let crates_mrkdwn = new_report
+        .crates
+        .iter()
+        .fold(String::new(), |acc, (crate_name, loc)| {
+            let old_loc = old_report
+                .crates
+                .iter()
+                .find(|(old_crate_name, _)| old_crate_name == crate_name)
+                .map(|(_, old_loc)| old_loc)
+                .unwrap_or(&0);
 
-                let loc_diff = loc.abs_diff(*old_loc);
-                format!(
-                    "{}*{}*: {} {}\\n",
-                    acc,
-                    crate_name,
-                    loc,
-                    match loc.cmp(old_loc) {
-                        std::cmp::Ordering::Greater => format!("(+{loc_diff})"),
-                        std::cmp::Ordering::Less => format!("(-{loc_diff})"),
-                        std::cmp::Ordering::Equal => "".to_string(),
-                    }
-                )
-            });
+            let loc_diff = loc.abs_diff(*old_loc);
+            format!(
+                "{}*{}*: {} {}\\n",
+                acc,
+                crate_name,
+                loc,
+                match loc.cmp(old_loc) {
+                    std::cmp::Ordering::Greater => format!("(+{loc_diff})"),
+                    std::cmp::Ordering::Less => format!("(-{loc_diff})"),
+                    std::cmp::Ordering::Equal => "".to_string(),
+                }
+            )
+        });
+
+    let tools_mrkdwn = new_report
+        .tools
+        .iter()
+        .fold(String::new(), |acc, (tool_name, loc)| {
+            let old_loc = old_report
+                .tools
+                .iter()
+                .find(|(old_tool_name, _)| old_tool_name == tool_name)
+                .map(|(_, old_loc)| old_loc)
+                .unwrap_or(&0);
+
+            let loc_diff = loc.abs_diff(*old_loc);
+            format!(
+                "{}*{}*: {} {}\\n",
+                acc,
+                tool_name,
+                loc,
+                match loc.cmp(old_loc) {
+                    std::cmp::Ordering::Greater => format!("(+{loc_diff})"),
+                    std::cmp::Ordering::Less => format!("(-{loc_diff})"),
+                    std::cmp::Ordering::Equal => "".to_string(),
+                }
+            )
+        });
+
+    let tools_block = if !new_report.tools.is_empty() {
+        format!(
+            r#",
+        {{
+            "type": "header",
+            "text": {{
+                "type": "plain_text",
+                "text": "Tools"
+            }}
+        }},
+        {{
+            "type": "section",
+            "text": {{
+                "type": "mrkdwn",
+                "text": "{}"
+            }}
+        }}"#,
+            tools_mrkdwn
+        )
+    } else {
+        String::new()
+    };
 
     format!(
         r#"{{
@@ -209,7 +258,7 @@ pub fn slack_message(old_report: LinesOfCodeReport, new_report: LinesOfCodeRepor
                 "type": "mrkdwn",
                 "text": "{}"
             }}
-        }}
+        }}{}
     ]
 }}"#,
         new_report.lambda_vm,
@@ -218,22 +267,48 @@ pub fn slack_message(old_report: LinesOfCodeReport, new_report: LinesOfCodeRepor
             std::cmp::Ordering::Less => format!("(-{diff_total})"),
             std::cmp::Ordering::Equal => "".to_string(),
         },
-        crates_mrkdwn
+        crates_mrkdwn,
+        tools_block
     )
 }
 
 pub fn github_step_summary(old_report: LinesOfCodeReport, new_report: LinesOfCodeReport) -> String {
     let diff_total = new_report.lambda_vm.abs_diff(old_report.lambda_vm);
 
-    let crates_github =
-        new_report
-            .crates
+    let crates_github = new_report
+        .crates
+        .iter()
+        .fold(String::new(), |acc, (crate_name, loc)| {
+            let old_loc = old_report
+                .crates
+                .iter()
+                .find(|(old_crate_name, _)| old_crate_name == crate_name)
+                .map(|(_, old_loc)| old_loc)
+                .unwrap_or(&0);
+
+            let loc_diff = loc.abs_diff(*old_loc);
+            format!(
+                "{}{}: {} {}\n",
+                acc,
+                crate_name,
+                loc,
+                match loc.cmp(old_loc) {
+                    std::cmp::Ordering::Greater => format!("(+{loc_diff})"),
+                    std::cmp::Ordering::Less => format!("(-{loc_diff})"),
+                    std::cmp::Ordering::Equal => "".to_string(),
+                }
+            )
+        });
+
+    let tools_github = if !new_report.tools.is_empty() {
+        let tools_list = new_report
+            .tools
             .iter()
-            .fold(String::new(), |acc, (crate_name, loc)| {
+            .fold(String::new(), |acc, (tool_name, loc)| {
                 let old_loc = old_report
-                    .crates
+                    .tools
                     .iter()
-                    .find(|(old_crate_name, _)| old_crate_name == crate_name)
+                    .find(|(old_tool_name, _)| old_tool_name == tool_name)
                     .map(|(_, old_loc)| old_loc)
                     .unwrap_or(&0);
 
@@ -241,7 +316,7 @@ pub fn github_step_summary(old_report: LinesOfCodeReport, new_report: LinesOfCod
                 format!(
                     "{}{}: {} {}\n",
                     acc,
-                    crate_name,
+                    tool_name,
                     loc,
                     match loc.cmp(old_loc) {
                         std::cmp::Ordering::Greater => format!("(+{loc_diff})"),
@@ -250,6 +325,10 @@ pub fn github_step_summary(old_report: LinesOfCodeReport, new_report: LinesOfCod
                     }
                 )
             });
+        format!("\nlambda_vm tools loc\n=================\n{}", tools_list)
+    } else {
+        String::new()
+    };
 
     format!(
         r#"```
@@ -259,27 +338,48 @@ lambda_vm (total): {} {}
 
 lambda_vm crates loc
 =================
-{}
+{}{}
 ```"#,
-
         new_report.lambda_vm,
         if new_report.lambda_vm > old_report.lambda_vm {
             format!("(+{diff_total})")
         } else {
             format!("(-{diff_total})")
         },
-        crates_github
+        crates_github,
+        tools_github
     )
 }
 
 pub fn shell_summary(new_report: LinesOfCodeReport) -> String {
+    let tools_line = if !new_report.tools.is_empty() {
+        format!(
+            "\n{} {}",
+            "tools:".bold(),
+            new_report
+                .tools
+                .iter()
+                .map(|(name, loc)| format!("{}: {}", name, loc))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    } else {
+        String::new()
+    };
+
     format!(
-        "{}\n{}\n{} {}\n{} {}",
+        "{}\n{}\n{} {}\n{} {}{}",
         "Lines of Code".bold(),
         "=============".bold(),
         "lambda_vm (total):".bold(),
         new_report.lambda_vm,
         "crates:".bold(),
-        new_report.crates.iter().map(|(name, loc)| format!("{}: {}", name, loc)).collect::<Vec<_>>().join(", "),
+        new_report
+            .crates
+            .iter()
+            .map(|(name, loc)| format!("{}: {}", name, loc))
+            .collect::<Vec<_>>()
+            .join(", "),
+        tools_line
     )
 }

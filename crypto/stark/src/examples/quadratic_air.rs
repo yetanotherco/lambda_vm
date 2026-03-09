@@ -51,11 +51,13 @@ where
                 frame,
                 periodic_values,
                 rap_challenges,
+                ..
             }
             | TransitionEvaluationContext::Verifier {
                 frame,
                 periodic_values,
                 rap_challenges,
+                ..
             } => (frame, periodic_values, rap_challenges),
         };
 
@@ -76,8 +78,6 @@ where
     F: IsFFTField,
 {
     context: AirContext,
-    trace_length: usize,
-    pub_inputs: QuadraticPublicInputs<F>,
     constraints: Vec<Box<dyn TransitionConstraint<F, F>>>,
 }
 
@@ -101,11 +101,7 @@ where
         1
     }
 
-    fn new(
-        trace_length: usize,
-        pub_inputs: &Self::PublicInputs,
-        proof_options: &ProofOptions,
-    ) -> Self {
+    fn new(proof_options: &ProofOptions) -> Self {
         let constraints: Vec<Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>> =
             vec![Box::new(QuadraticConstraint::new())];
 
@@ -117,18 +113,19 @@ where
         };
 
         Self {
-            trace_length,
             context,
-            pub_inputs: pub_inputs.clone(),
             constraints,
         }
     }
 
     fn boundary_constraints(
         &self,
+        pub_inputs: &Self::PublicInputs,
         _rap_challenges: &[FieldElement<Self::Field>],
+        _bus_public_inputs: Option<&crate::lookup::BusPublicInputs<Self::FieldExtension>>,
+        _trace_length: usize,
     ) -> BoundaryConstraints<Self::Field> {
-        let a0 = BoundaryConstraint::new_simple_main(0, self.pub_inputs.a0.clone());
+        let a0 = BoundaryConstraint::new_simple_main(0, pub_inputs.a0.clone());
 
         BoundaryConstraints::from_constraints(vec![a0])
     }
@@ -143,20 +140,12 @@ where
         &self.context
     }
 
-    fn composition_poly_degree_bound(&self) -> usize {
-        2 * self.trace_length()
+    fn composition_poly_degree_bound(&self, trace_length: usize) -> usize {
+        2 * trace_length
     }
 
     fn trace_layout(&self) -> (usize, usize) {
         (1, 0)
-    }
-
-    fn trace_length(&self) -> usize {
-        self.trace_length
-    }
-
-    fn pub_inputs(&self) -> &Self::PublicInputs {
-        &self.pub_inputs
     }
 }
 

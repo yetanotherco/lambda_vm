@@ -59,11 +59,13 @@ where
                 frame,
                 periodic_values,
                 rap_challenges,
+                ..
             }
             | TransitionEvaluationContext::Verifier {
                 frame,
                 periodic_values,
                 rap_challenges,
+                ..
             } => (frame, periodic_values, rap_challenges),
         };
 
@@ -123,11 +125,13 @@ where
                 frame,
                 periodic_values,
                 rap_challenges,
+                ..
             }
             | TransitionEvaluationContext::Verifier {
                 frame,
                 periodic_values,
                 rap_challenges,
+                ..
             } => (frame, periodic_values, rap_challenges),
         };
 
@@ -188,11 +192,13 @@ where
                 frame,
                 periodic_values,
                 rap_challenges,
+                ..
             }
             | TransitionEvaluationContext::Verifier {
                 frame,
                 periodic_values,
                 rap_challenges,
+                ..
             } => (frame, periodic_values, rap_challenges),
         };
 
@@ -223,8 +229,6 @@ where
     F: IsFFTField,
 {
     context: AirContext,
-    trace_length: usize,
-    pub_inputs: ReadOnlyPublicInputs<F>,
     transition_constraints: Vec<Box<dyn TransitionConstraint<F, F>>>,
 }
 
@@ -252,11 +256,7 @@ where
         1
     }
 
-    fn new(
-        trace_length: usize,
-        pub_inputs: &Self::PublicInputs,
-        proof_options: &ProofOptions,
-    ) -> Self {
+    fn new(proof_options: &ProofOptions) -> Self {
         let transition_constraints: Vec<
             Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>,
         > = vec![
@@ -274,8 +274,6 @@ where
 
         Self {
             context,
-            trace_length,
-            pub_inputs: pub_inputs.clone(),
             transition_constraints,
         }
     }
@@ -284,7 +282,7 @@ where
         &self,
         trace: &mut TraceTable<Self::Field, Self::FieldExtension>,
         challenges: &[FieldElement<F>],
-    ) {
+    ) -> Option<crate::lookup::BusPublicInputs<Self::FieldExtension>> {
         let main_segment_cols = trace.columns_main();
         let a = &main_segment_cols[0];
         let v = &main_segment_cols[1];
@@ -311,6 +309,8 @@ where
         for (i, aux_elem) in aux_col.iter().enumerate().take(trace.num_rows()) {
             trace.set_aux(i, 0, aux_elem.clone())
         }
+
+        None
     }
 
     fn build_rap_challenges(
@@ -329,12 +329,15 @@ where
 
     fn boundary_constraints(
         &self,
+        pub_inputs: &Self::PublicInputs,
         rap_challenges: &[FieldElement<Self::FieldExtension>],
+        _bus_public_inputs: Option<&crate::lookup::BusPublicInputs<Self::FieldExtension>>,
+        trace_length: usize,
     ) -> BoundaryConstraints<Self::FieldExtension> {
-        let a0 = &self.pub_inputs.a0;
-        let v0 = &self.pub_inputs.v0;
-        let a_sorted0 = &self.pub_inputs.a_sorted0;
-        let v_sorted0 = &self.pub_inputs.v_sorted0;
+        let a0 = &pub_inputs.a0;
+        let v0 = &pub_inputs.v0;
+        let a_sorted0 = &pub_inputs.a_sorted0;
+        let v_sorted0 = &pub_inputs.v_sorted0;
         let z = &rap_challenges[0];
         let alpha = &rap_challenges[1];
 
@@ -352,7 +355,7 @@ where
         let c_aux1 = BoundaryConstraint::new_aux(0, 0, p0_value.unwrap());
         let c_aux2 = BoundaryConstraint::new_aux(
             0,
-            self.trace_length - 1,
+            trace_length - 1,
             FieldElement::<Self::FieldExtension>::one(),
         );
 
@@ -369,16 +372,8 @@ where
         &self.context
     }
 
-    fn composition_poly_degree_bound(&self) -> usize {
-        self.trace_length()
-    }
-
-    fn trace_length(&self) -> usize {
-        self.trace_length
-    }
-
-    fn pub_inputs(&self) -> &Self::PublicInputs {
-        &self.pub_inputs
+    fn composition_poly_degree_bound(&self, trace_length: usize) -> usize {
+        trace_length
     }
 }
 
@@ -390,7 +385,7 @@ pub fn sort_rap_trace<F: IsFFTField + IsPrimeField>(
 ) -> TraceTable<F, F> {
     let mut address_value_pairs: Vec<_> = address.iter().zip(value.iter()).collect();
 
-    address_value_pairs.sort_by_key(|(addr, _)| addr.representative());
+    address_value_pairs.sort_by_key(|(addr, _)| addr.canonical());
 
     let (sorted_address, sorted_value): (Vec<FieldElement<F>>, Vec<FieldElement<F>>) =
         address_value_pairs
@@ -406,52 +401,54 @@ pub fn sort_rap_trace<F: IsFFTField + IsPrimeField>(
 #[cfg(test)]
 mod test {
     use super::*;
-    use math::field::fields::u64_prime_field::FE17;
+    use math::field::goldilocks::GoldilocksField;
+
+    type GoldilocksFE = FieldElement<GoldilocksField>;
 
     #[test]
     fn test_sort_rap_trace() {
         let address_col = vec![
-            FE17::from(5),
-            FE17::from(2),
-            FE17::from(3),
-            FE17::from(4),
-            FE17::from(1),
-            FE17::from(6),
-            FE17::from(7),
-            FE17::from(8),
+            GoldilocksFE::from(5u64),
+            GoldilocksFE::from(2u64),
+            GoldilocksFE::from(3u64),
+            GoldilocksFE::from(4u64),
+            GoldilocksFE::from(1u64),
+            GoldilocksFE::from(6u64),
+            GoldilocksFE::from(7u64),
+            GoldilocksFE::from(8u64),
         ];
         let value_col = vec![
-            FE17::from(50),
-            FE17::from(20),
-            FE17::from(30),
-            FE17::from(40),
-            FE17::from(10),
-            FE17::from(60),
-            FE17::from(70),
-            FE17::from(80),
+            GoldilocksFE::from(50u64),
+            GoldilocksFE::from(20u64),
+            GoldilocksFE::from(30u64),
+            GoldilocksFE::from(40u64),
+            GoldilocksFE::from(10u64),
+            GoldilocksFE::from(60u64),
+            GoldilocksFE::from(70u64),
+            GoldilocksFE::from(80u64),
         ];
 
         let sorted_trace = sort_rap_trace(address_col.clone(), value_col.clone());
 
         let expected_sorted_addresses = vec![
-            FE17::from(1),
-            FE17::from(2),
-            FE17::from(3),
-            FE17::from(4),
-            FE17::from(5),
-            FE17::from(6),
-            FE17::from(7),
-            FE17::from(8),
+            GoldilocksFE::from(1u64),
+            GoldilocksFE::from(2u64),
+            GoldilocksFE::from(3u64),
+            GoldilocksFE::from(4u64),
+            GoldilocksFE::from(5u64),
+            GoldilocksFE::from(6u64),
+            GoldilocksFE::from(7u64),
+            GoldilocksFE::from(8u64),
         ];
         let expected_sorted_values = vec![
-            FE17::from(10),
-            FE17::from(20),
-            FE17::from(30),
-            FE17::from(40),
-            FE17::from(50),
-            FE17::from(60),
-            FE17::from(70),
-            FE17::from(80),
+            GoldilocksFE::from(10u64),
+            GoldilocksFE::from(20u64),
+            GoldilocksFE::from(30u64),
+            GoldilocksFE::from(40u64),
+            GoldilocksFE::from(50u64),
+            GoldilocksFE::from(60u64),
+            GoldilocksFE::from(70u64),
+            GoldilocksFE::from(80u64),
         ];
 
         assert_eq!(sorted_trace.columns_main()[2], expected_sorted_addresses);

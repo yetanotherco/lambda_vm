@@ -1,0 +1,10 @@
+	.attribute	5, "rv64i2p1_m2p0_zmmul1p0"
+	.globl	main
+main:
+	# SUB: result is negative
+	# 10 - 30 = -20
+	addi	a2, zero, 10
+	addi	a3, zero, 30
+	sub	a0, a2, a3
+	li	a7, 5
+	ecall

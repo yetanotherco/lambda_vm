@@ -19,10 +19,6 @@ rand = { version = "0.8.5", default-features = false }
 # rayon
 rayon = { version = "1.7", optional = true }
 
-# cuda
-cudarc = { version = "0.9.7", optional = true }
-
-lambdaworks-gpu = { git = "https://github.com/lambdaclass/lambdaworks.git", optional = true }
 num-bigint = { version = "0.4.6", default-features = false }
 num-traits = { version = "0.2.19", default-features = false }
 
@@ -33,8 +29,6 @@ const-random = "0.1.15"
 iai-callgrind = "0.3.1"
 proptest = "1.1.0"
 pprof = { version = "0.13.0", features = ["criterion", "flamegraph"] }
-p3-baby-bear = { git = "https://github.com/Plonky3/Plonky3" }
-p3-field = { git = "https://github.com/Plonky3/Plonky3" }
 rand = { version = "0.8.5", features = ["std"] }
 
 [features]
@@ -47,46 +41,9 @@ lambdaworks-serde-string = ["dep:serde", "dep:serde_json", "alloc"]
 proptest = ["dep:proptest"]
 instruments = []
 
-
-# gpu
-cuda = ["dep:cudarc", "dep:lambdaworks-gpu"]
-
 [target.wasm32-unknown-unknown.dependencies]
 getrandom = { version = "0.2.15", features = ["js"] }
 
 [[bench]]
-name = "criterion_elliptic_curve"
-harness = false
-
-[[bench]]
-name = "iai_elliptic_curve"
-harness = false
-
-[[bench]]
-name = "criterion_polynomial"
-harness = false
-
-[[bench]]
-name = "iai_polynomial"
-harness = false
-
-[[bench]]
-name = "criterion_field"
-harness = false
-
-[[bench]]
-name = "iai_field"
-harness = false
-
-[[bench]]
-name = "criterion_msm"
-harness = false
-required-features = ["parallel"]
-
-[[bench]]
-name = "criterion_fft"
-harness = false
-
-[[bench]]
-name = "iai_fft"
+name = "goldilocks_benchmark"
 harness = false

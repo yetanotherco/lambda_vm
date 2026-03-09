@@ -98,8 +98,7 @@ pub trait IsFFTField: IsField {
 /// Trait to add field behaviour to a struct.
 pub trait IsField: Debug + Clone {
     /// The underlying base type for representing elements from the field.
-    // TODO: Relax Unpin for non cuda usage
-    type BaseType: Clone + Debug + Unpin + ByteConversion + Default + Send + Sync;
+    type BaseType: Clone + Debug + ByteConversion + Default + Send + Sync;
 
     /// Returns the sum of `a` and `b`.
     fn add(a: &Self::BaseType, b: &Self::BaseType) -> Self::BaseType;
@@ -203,15 +202,15 @@ pub enum LegendreSymbol {
 }
 
 pub trait IsPrimeField: IsField {
-    type RepresentativeType: IsUnsignedInteger;
+    type CanonicalType: IsUnsignedInteger;
 
-    /// Returns the integer representative in
+    /// Returns the integer canonical in
     /// the range [0, p-1], where p the modulus
-    fn representative(a: &Self::BaseType) -> Self::RepresentativeType;
+    fn canonical(a: &Self::BaseType) -> Self::CanonicalType;
 
     /// Returns p - 1, which is -1 mod p
-    fn modulus_minus_one() -> Self::RepresentativeType {
-        Self::representative(&Self::neg(&Self::one()))
+    fn modulus_minus_one() -> Self::CanonicalType {
+        Self::canonical(&Self::neg(&Self::one()))
     }
 
     /// Creates a BaseType from a Hex String
@@ -248,7 +247,7 @@ pub trait IsPrimeField: IsField {
             LegendreSymbol::One => (),
         };
 
-        let integer_one = Self::RepresentativeType::from(1_u16);
+        let integer_one = Self::CanonicalType::from(1_u16);
         let mut s: usize = 0;
         let mut q = Self::modulus_minus_one();
 

@@ -3,18 +3,55 @@ use crate::fft::errors::FFTError;
 use crate::field::errors::FieldError;
 use crate::field::traits::{IsField, IsSubFieldOf};
 use crate::{
-    field::{
-        element::FieldElement,
-        traits::{IsFFTField, RootsConfig},
-    },
+    field::{element::FieldElement, traits::IsFFTField},
     polynomial::Polynomial,
 };
 use alloc::{vec, vec::Vec};
 
-#[cfg(feature = "cuda")]
-use crate::fft::gpu::cuda::polynomial::{evaluate_fft_cuda, interpolate_fft_cuda};
+use super::cpu::{
+    bit_reversing::in_place_bit_reverse_permute,
+    bowers_fft::{LayerTwiddles, bowers_fft_opt_fused, bowers_ifft_opt},
+};
 
-use super::cpu::{ops, roots_of_unity};
+#[cfg(feature = "parallel")]
+use super::cpu::bowers_fft::{bowers_fft_opt_fused_parallel, bowers_ifft_opt_parallel};
+
+/// Threshold for dispatching to parallel FFT.
+/// Below this size, sequential FFT is faster (avoids Rayon overhead).
+/// At 2^14 = 16384 elements, the parallel version starts to win
+/// because later butterfly layers have enough blocks for effective parallelism.
+#[cfg(feature = "parallel")]
+const PARALLEL_FFT_THRESHOLD: usize = 1 << 14;
+
+/// Dispatch forward FFT (DIF) to parallel or sequential implementation based on buffer size.
+#[inline]
+fn dispatch_fft<F: IsFFTField + IsSubFieldOf<E>, E: IsField + Send + Sync>(
+    buffer: &mut [FieldElement<E>],
+    twiddles: &LayerTwiddles<F>,
+) -> Result<(), FFTError> {
+    #[cfg(feature = "parallel")]
+    {
+        if buffer.len() >= PARALLEL_FFT_THRESHOLD {
+            return bowers_fft_opt_fused_parallel(buffer, twiddles);
+        }
+    }
+    bowers_fft_opt_fused(buffer, twiddles)
+}
+
+/// Dispatch inverse FFT (DIT) to parallel or sequential implementation based on buffer size.
+#[inline]
+fn dispatch_ifft<F: IsFFTField + IsSubFieldOf<E>, E: IsField + Send + Sync>(
+    buffer: &mut [FieldElement<E>],
+    twiddles: &LayerTwiddles<F>,
+) -> Result<(), FFTError> {
+    #[cfg(feature = "parallel")]
+    {
+        if buffer.len() >= PARALLEL_FFT_THRESHOLD {
+            return bowers_ifft_opt_parallel(buffer, twiddles);
+        }
+    }
+    bowers_ifft_opt(buffer, twiddles)
+}
 
 impl<E: IsField> Polynomial<FieldElement<E>> {
     /// Returns `N` evaluations of this polynomial using FFT over a domain in a subfield F of E (so the results
@@ -25,7 +62,10 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         poly: &Polynomial<FieldElement<E>>,
         blowup_factor: usize,
         domain_size: Option<usize>,
-    ) -> Result<Vec<FieldElement<E>>, FFTError> {
+    ) -> Result<Vec<FieldElement<E>>, FFTError>
+    where
+        E: Send + Sync,
+    {
         let domain_size = domain_size.unwrap_or(0);
         let len = core::cmp::max(poly.coeff_len(), domain_size).next_power_of_two() * blowup_factor;
         if len.trailing_zeros() as u64 > F::TWO_ADICITY {
@@ -39,20 +79,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         coeffs.resize(len, FieldElement::zero());
         // padding with zeros will make FFT return more evaluations of the same polynomial.
 
-        #[cfg(feature = "cuda")]
-        {
-            // TODO: support multiple fields with CUDA
-            if F::field_name() == "stark256" {
-                Ok(evaluate_fft_cuda(&coeffs)?)
-            } else {
-                evaluate_fft_cpu::<F, E>(&coeffs)
-            }
-        }
-
-        #[cfg(not(feature = "cuda"))]
-        {
-            evaluate_fft_cpu::<F, E>(&coeffs)
-        }
+        evaluate_fft_cpu::<F, E>(&coeffs)
     }
 
     /// Returns `N` evaluations with an offset of this polynomial using FFT over a domain in a subfield F of E
@@ -64,7 +91,10 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         blowup_factor: usize,
         domain_size: Option<usize>,
         offset: &FieldElement<F>,
-    ) -> Result<Vec<FieldElement<E>>, FFTError> {
+    ) -> Result<Vec<FieldElement<E>>, FFTError>
+    where
+        E: Send + Sync,
+    {
         let scaled = poly.scale(offset);
         Polynomial::evaluate_fft::<F>(&scaled, blowup_factor, domain_size)
     }
@@ -74,20 +104,11 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     /// This is considered to be the inverse operation of [Self::evaluate_fft()].
     pub fn interpolate_fft<F: IsFFTField + IsSubFieldOf<E>>(
         fft_evals: &[FieldElement<E>],
-    ) -> Result<Self, FFTError> {
-        #[cfg(feature = "cuda")]
-        {
-            if !F::field_name().is_empty() {
-                Ok(interpolate_fft_cuda(fft_evals)?)
-            } else {
-                interpolate_fft_cpu::<F, E>(fft_evals)
-            }
-        }
-
-        #[cfg(not(feature = "cuda"))]
-        {
-            interpolate_fft_cpu::<F, E>(fft_evals)
-        }
+    ) -> Result<Self, FFTError>
+    where
+        E: Send + Sync,
+    {
+        interpolate_fft_cpu::<F, E>(fft_evals)
     }
 
     /// Returns a new polynomial that interpolates offset `(w^i, fft_evals[i])`, with `w` being a
@@ -96,9 +117,235 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     pub fn interpolate_offset_fft<F: IsFFTField + IsSubFieldOf<E>>(
         fft_evals: &[FieldElement<E>],
         offset: &FieldElement<F>,
-    ) -> Result<Polynomial<FieldElement<E>>, FFTError> {
+    ) -> Result<Polynomial<FieldElement<E>>, FFTError>
+    where
+        E: Send + Sync,
+    {
         let scaled = Polynomial::interpolate_fft::<F>(fft_evals)?;
         Ok(scaled.scale(&offset.inv().unwrap()))
+    }
+
+    /// Compute the coset LDE of evaluations on the standard domain.
+    ///
+    /// Given `n` evaluations `f(ω^i)` on the standard domain `{ω^i}`, returns
+    /// `n * blowup_factor` evaluations `f(offset · ω_LDE^j)` on the coset LDE domain,
+    /// with a single allocation of the output buffer.
+    ///
+    /// This fuses the `interpolate_fft` → `scale(offset)` → `evaluate_fft(blowup)` pipeline
+    /// into one pass, avoiding 2 intermediate allocations per column.
+    ///
+    /// Uses Bowers FFT internally. To share pre-computed twiddles across multiple
+    /// columns, use [`coset_lde_with_twiddles`] instead.
+    pub fn coset_lde<F: IsFFTField + IsSubFieldOf<E>>(
+        evals: &[FieldElement<E>],
+        blowup_factor: usize,
+        offset: &FieldElement<F>,
+    ) -> Result<Vec<FieldElement<E>>, FFTError>
+    where
+        E: Send + Sync,
+    {
+        let n = evals.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let inv_order = n.trailing_zeros() as u64;
+        let fwd_order = (n * blowup_factor).trailing_zeros() as u64;
+        let inv_tw = LayerTwiddles::<F>::new_inverse(inv_order)
+            .ok_or(FFTError::DomainSizeError(inv_order as usize))?;
+        let fwd_tw = LayerTwiddles::<F>::new(fwd_order)
+            .ok_or(FFTError::DomainSizeError(fwd_order as usize))?;
+        Self::coset_lde_with_twiddles(evals, blowup_factor, offset, &inv_tw, &fwd_tw)
+    }
+
+    /// Compute the coset LDE with pre-computed twiddle factors.
+    ///
+    /// Same as [`coset_lde`], but accepts pre-computed [`LayerTwiddles`] so that
+    /// multiple columns sharing the same domain can avoid redundant twiddle generation.
+    ///
+    /// - `inv_twiddles`: inverse twiddles for iFFT on the trace-size domain (order = log2(n))
+    /// - `fwd_twiddles`: forward twiddles for FFT on the LDE-size domain (order = log2(n * blowup_factor))
+    pub fn coset_lde_with_twiddles<F: IsFFTField + IsSubFieldOf<E>>(
+        evals: &[FieldElement<E>],
+        blowup_factor: usize,
+        offset: &FieldElement<F>,
+        inv_twiddles: &LayerTwiddles<F>,
+        fwd_twiddles: &LayerTwiddles<F>,
+    ) -> Result<Vec<FieldElement<E>>, FFTError>
+    where
+        E: Send + Sync,
+    {
+        let n = evals.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        if !n.is_power_of_two() {
+            return Err(FFTError::InputError(n));
+        }
+        let lde_size = n * blowup_factor;
+
+        if (lde_size.trailing_zeros() as u64) > F::TWO_ADICITY {
+            return Err(FFTError::DomainSizeError(lde_size.trailing_zeros() as usize));
+        }
+
+        // 1. Allocate buffer of lde_size, copy evals into first n slots, zero-pad rest.
+        let mut buffer = Vec::with_capacity(lde_size);
+        buffer.extend_from_slice(evals);
+        buffer.resize(lde_size, FieldElement::zero());
+
+        // 2. iFFT on buffer[..n] using Bowers:
+        //    bit-reverse permute (natural → bit-reversed), then DIT inverse butterflies.
+        in_place_bit_reverse_permute(&mut buffer[..n]);
+        dispatch_ifft(&mut buffer[..n], inv_twiddles)?;
+
+        // 3. Scale by offset^i / n simultaneously (fused inverse-scaling + coset shift).
+        let n_inv = FieldElement::<F>::from(n as u64).inv().unwrap();
+        let mut offset_power = n_inv.clone();
+        for coeff in buffer[..n].iter_mut() {
+            *coeff = &offset_power * &*coeff;
+            offset_power = &offset_power * offset;
+        }
+
+        // 4. Forward FFT on the full buffer using Bowers:
+        //    DIF forward butterflies (natural → bit-reversed), then bit-reverse permute.
+        dispatch_fft(&mut buffer, fwd_twiddles)?;
+        in_place_bit_reverse_permute(&mut buffer);
+
+        Ok(buffer)
+    }
+
+    /// Compute the coset LDE with pre-computed twiddle factors and pre-computed weights.
+    ///
+    /// Same as [`coset_lde_with_twiddles`], but also accepts pre-computed `weights[i] = offset^i / n`
+    /// so that the scaling step avoids the running product across columns.
+    /// Weights are in the base field F — the scaling `w * coeff` uses mixed F×E multiplication.
+    pub fn coset_lde_full<F: IsFFTField + IsSubFieldOf<E> + Send + Sync>(
+        evals: &[FieldElement<E>],
+        blowup_factor: usize,
+        weights: &[FieldElement<F>],
+        inv_twiddles: &LayerTwiddles<F>,
+        fwd_twiddles: &LayerTwiddles<F>,
+    ) -> Result<Vec<FieldElement<E>>, FFTError>
+    where
+        E: Send + Sync,
+    {
+        let n = evals.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let lde_size = n * blowup_factor;
+        let mut buffer = Vec::with_capacity(lde_size);
+        Self::coset_lde_full_into(
+            evals,
+            blowup_factor,
+            weights,
+            inv_twiddles,
+            fwd_twiddles,
+            &mut buffer,
+        )?;
+        Ok(buffer)
+    }
+
+    /// Compute the coset LDE into a caller-provided buffer, avoiding allocation when
+    /// `buffer.capacity() >= n * blowup_factor`.
+    ///
+    /// Same as [`coset_lde_full`], but writes into `buffer` instead of allocating a new Vec.
+    /// The buffer is cleared and reused: `buffer.clear(); buffer.extend_from_slice(evals);
+    /// buffer.resize(lde_size, zero)`. When the capacity is sufficient, no heap allocation occurs.
+    /// Weights are in the base field F — the scaling `w * coeff` uses mixed F×E multiplication.
+    pub fn coset_lde_full_into<F: IsFFTField + IsSubFieldOf<E> + Send + Sync>(
+        evals: &[FieldElement<E>],
+        blowup_factor: usize,
+        weights: &[FieldElement<F>],
+        inv_twiddles: &LayerTwiddles<F>,
+        fwd_twiddles: &LayerTwiddles<F>,
+        buffer: &mut Vec<FieldElement<E>>,
+    ) -> Result<(), FFTError>
+    where
+        E: Send + Sync,
+    {
+        let n = evals.len();
+        if n == 0 {
+            buffer.clear();
+            return Ok(());
+        }
+        if !n.is_power_of_two() {
+            return Err(FFTError::InputError(n));
+        }
+        let lde_size = n * blowup_factor;
+
+        if (lde_size.trailing_zeros() as u64) > F::TWO_ADICITY {
+            return Err(FFTError::DomainSizeError(lde_size.trailing_zeros() as usize));
+        }
+
+        buffer.clear();
+        buffer.extend_from_slice(evals);
+        buffer.resize(lde_size, FieldElement::zero());
+
+        in_place_bit_reverse_permute(&mut buffer[..n]);
+        dispatch_ifft(&mut buffer[..n], inv_twiddles)?;
+
+        // Scale using pre-computed weights (base field) — F × E → E mixed multiplication.
+        for (coeff, w) in buffer[..n].iter_mut().zip(weights.iter()) {
+            *coeff = w * &*coeff;
+        }
+
+        dispatch_fft(buffer, fwd_twiddles)?;
+        in_place_bit_reverse_permute(buffer);
+
+        Ok(())
+    }
+
+    /// In-place coset LDE: the buffer already contains N evaluation points at `[0..N]`.
+    ///
+    /// This expands the buffer from N elements to `N * blowup_factor` by performing:
+    /// 1. iFFT on buffer[..N]
+    /// 2. Scale by pre-computed weights
+    /// 3. Zero-pad to N * blowup_factor
+    /// 4. Forward FFT on the full buffer
+    ///
+    /// Unlike [`coset_lde_full_into`], this skips the `clear + extend_from_slice` step
+    /// since data is already in the buffer. Used for transpose elimination: columns are
+    /// extracted directly into pool buffers, then expanded in-place.
+    pub fn coset_lde_full_expand<F: IsFFTField + IsSubFieldOf<E> + Send + Sync>(
+        buffer: &mut Vec<FieldElement<E>>,
+        blowup_factor: usize,
+        weights: &[FieldElement<F>],
+        inv_twiddles: &LayerTwiddles<F>,
+        fwd_twiddles: &LayerTwiddles<F>,
+    ) -> Result<(), FFTError>
+    where
+        E: Send + Sync,
+    {
+        let n = buffer.len();
+        if n == 0 {
+            return Ok(());
+        }
+        if !n.is_power_of_two() {
+            return Err(FFTError::InputError(n));
+        }
+        let lde_size = n * blowup_factor;
+
+        if (lde_size.trailing_zeros() as u64) > F::TWO_ADICITY {
+            return Err(FFTError::DomainSizeError(lde_size.trailing_zeros() as usize));
+        }
+
+        // 1. iFFT on buffer[..n]
+        in_place_bit_reverse_permute(&mut buffer[..n]);
+        dispatch_ifft(&mut buffer[..n], inv_twiddles)?;
+
+        // 2. Scale using pre-computed weights (base field) — F × E → E mixed multiplication.
+        for (coeff, w) in buffer[..n].iter_mut().zip(weights.iter()) {
+            *coeff = w * &*coeff;
+        }
+
+        // 3. Zero-pad to lde_size
+        buffer.resize(lde_size, FieldElement::zero());
+
+        // 4. Forward FFT on the full buffer
+        dispatch_fft(buffer, fwd_twiddles)?;
+        in_place_bit_reverse_permute(buffer);
+
+        Ok(())
     }
 
     /// Multiplies two polynomials using FFT.
@@ -112,7 +359,10 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     pub fn fast_fft_multiplication<F: IsFFTField + IsSubFieldOf<E>>(
         &self,
         other: &Self,
-    ) -> Result<Self, FFTError> {
+    ) -> Result<Self, FFTError>
+    where
+        E: Send + Sync,
+    {
         let domain_size = self.degree() + other.degree() + 1;
         let p = Polynomial::evaluate_fft::<F>(self, 1, Some(domain_size))?;
         let q = Polynomial::evaluate_fft::<F>(other, 1, Some(domain_size))?;
@@ -127,7 +377,10 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     pub fn fast_division<F: IsSubFieldOf<E> + IsFFTField>(
         &self,
         divisor: &Self,
-    ) -> Result<(Self, Self), FFTError> {
+    ) -> Result<(Self, Self), FFTError>
+    where
+        E: Send + Sync,
+    {
         let n = self.degree();
         let m = divisor.degree();
         if divisor.coefficients.is_empty()
@@ -159,7 +412,10 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     pub fn invert_polynomial_mod<F: IsSubFieldOf<E> + IsFFTField>(
         &self,
         k: usize,
-    ) -> Result<Self, FFTError> {
+    ) -> Result<Self, FFTError>
+    where
+        E: Send + Sync,
+    {
         if self.coefficients.is_empty()
             || self.coefficients.iter().all(|c| c == &FieldElement::zero())
         {
@@ -191,7 +447,7 @@ pub fn compose_fft<F, E>(
 ) -> Polynomial<FieldElement<E>>
 where
     F: IsFFTField + IsSubFieldOf<E>,
-    E: IsField,
+    E: IsField + Send + Sync,
 {
     let poly_2_evaluations = Polynomial::evaluate_fft::<F>(poly_2, 1, None).unwrap();
 
@@ -206,12 +462,20 @@ where
 pub fn evaluate_fft_cpu<F, E>(coeffs: &[FieldElement<E>]) -> Result<Vec<FieldElement<E>>, FFTError>
 where
     F: IsFFTField + IsSubFieldOf<E>,
-    E: IsField,
+    E: IsField + Send + Sync,
 {
-    let order = coeffs.len().trailing_zeros();
-    let twiddles = roots_of_unity::get_twiddles::<F>(order.into(), RootsConfig::BitReverse)?;
-    // Bit reverse order is needed for NR DIT FFT.
-    ops::fft(coeffs, &twiddles)
+    let n = coeffs.len();
+    if !n.is_power_of_two() {
+        return Err(FFTError::InputError(n));
+    }
+    let order = n.trailing_zeros() as u64;
+    let layer_twiddles =
+        LayerTwiddles::<F>::new(order).ok_or(FFTError::DomainSizeError(order as usize))?;
+
+    let mut result = coeffs.to_vec();
+    dispatch_fft(&mut result, &layer_twiddles)?;
+    in_place_bit_reverse_permute(&mut result);
+    Ok(result)
 }
 
 pub fn interpolate_fft_cpu<F, E>(
@@ -219,348 +483,184 @@ pub fn interpolate_fft_cpu<F, E>(
 ) -> Result<Polynomial<FieldElement<E>>, FFTError>
 where
     F: IsFFTField + IsSubFieldOf<E>,
-    E: IsField,
+    E: IsField + Send + Sync,
 {
-    let order = fft_evals.len().trailing_zeros();
-    let twiddles =
-        roots_of_unity::get_twiddles::<F>(order.into(), RootsConfig::BitReverseInversed)?;
+    let n = fft_evals.len();
+    if !n.is_power_of_two() {
+        return Err(FFTError::InputError(n));
+    }
+    let order = n.trailing_zeros() as u64;
+    let inv_twiddles =
+        LayerTwiddles::<F>::new_inverse(order).ok_or(FFTError::DomainSizeError(order as usize))?;
 
-    let coeffs = ops::fft(fft_evals, &twiddles)?;
+    let mut coeffs = fft_evals.to_vec();
+    // Bowers iFFT: bit-reverse first (natural → bit-reversed), then DIT inverse butterflies
+    in_place_bit_reverse_permute(&mut coeffs);
+    dispatch_ifft(&mut coeffs, &inv_twiddles)?;
 
-    let scale_factor = FieldElement::from(fft_evals.len() as u64).inv().unwrap();
+    // Scale by 1/n
+    let scale_factor = FieldElement::from(n as u64).inv().unwrap();
     Ok(Polynomial::new(&coeffs).scale_coeffs(&scale_factor))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "alloc"))]
 mod tests {
-    #[cfg(not(feature = "cuda"))]
-    use crate::field::traits::IsField;
-
-    use crate::field::{
-        test_fields::u64_test_field::{U64TestField, U64TestFieldExtension},
-        traits::RootsConfig,
-    };
-    use proptest::{collection, prelude::*};
-
-    use roots_of_unity::{get_powers_of_primitive_root, get_powers_of_primitive_root_coset};
-
     use super::*;
+    use crate::field::goldilocks::GoldilocksField;
 
-    fn gen_fft_and_naive_evaluation<F: IsFFTField>(
-        poly: Polynomial<FieldElement<F>>,
-    ) -> (Vec<FieldElement<F>>, Vec<FieldElement<F>>) {
-        let len = poly.coeff_len().next_power_of_two();
-        let order = len.trailing_zeros();
-        let twiddles =
-            get_powers_of_primitive_root(order.into(), len, RootsConfig::Natural).unwrap();
+    type F = GoldilocksField;
+    type FE = FieldElement<F>;
 
-        let fft_eval = Polynomial::evaluate_fft::<F>(&poly, 1, None).unwrap();
-        let naive_eval = poly.evaluate_slice(&twiddles);
+    #[test]
+    fn coset_lde_matches_interpolate_then_evaluate() {
+        // Test that coset_lde produces identical results to the
+        // interpolate_fft + evaluate_offset_fft pipeline.
+        let offset = FE::from(3u64);
+        let blowup_factor = 2;
 
-        (fft_eval, naive_eval)
-    }
+        for order in 1..=10 {
+            let n = 1usize << order;
 
-    fn gen_fft_coset_and_naive_evaluation<F: IsFFTField>(
-        poly: Polynomial<FieldElement<F>>,
-        offset: FieldElement<F>,
-        blowup_factor: usize,
-    ) -> (Vec<FieldElement<F>>, Vec<FieldElement<F>>) {
-        let len = poly.coeff_len().next_power_of_two();
-        let order = (len * blowup_factor).trailing_zeros();
-        let twiddles =
-            get_powers_of_primitive_root_coset(order.into(), len * blowup_factor, &offset).unwrap();
+            // Create random-ish evaluations
+            let evals: Vec<FE> = (0..n).map(|i| FE::from((i * 7 + 13) as u64)).collect();
 
-        let fft_eval =
-            Polynomial::evaluate_offset_fft::<F>(&poly, blowup_factor, None, &offset).unwrap();
-        let naive_eval = poly.evaluate_slice(&twiddles);
+            // Reference: interpolate → scale → evaluate (the old pipeline)
+            let poly = Polynomial::interpolate_fft::<F>(&evals).unwrap();
+            let reference =
+                Polynomial::evaluate_offset_fft::<F>(&poly, blowup_factor, Some(n), &offset)
+                    .unwrap();
 
-        (fft_eval, naive_eval)
-    }
+            // Fused: coset_lde
+            let fused = Polynomial::<FE>::coset_lde::<F>(&evals, blowup_factor, &offset).unwrap();
 
-    fn gen_fft_and_naive_interpolate<F: IsFFTField>(
-        fft_evals: &[FieldElement<F>],
-    ) -> (Polynomial<FieldElement<F>>, Polynomial<FieldElement<F>>) {
-        let order = fft_evals.len().trailing_zeros() as u64;
-        let twiddles =
-            get_powers_of_primitive_root(order, 1 << order, RootsConfig::Natural).unwrap();
-
-        let naive_poly = Polynomial::interpolate(&twiddles, fft_evals).unwrap();
-        let fft_poly = Polynomial::interpolate_fft::<F>(fft_evals).unwrap();
-
-        (fft_poly, naive_poly)
-    }
-
-    fn gen_fft_and_naive_coset_interpolate<F: IsFFTField>(
-        fft_evals: &[FieldElement<F>],
-        offset: &FieldElement<F>,
-    ) -> (Polynomial<FieldElement<F>>, Polynomial<FieldElement<F>>) {
-        let order = fft_evals.len().trailing_zeros() as u64;
-        let twiddles = get_powers_of_primitive_root_coset(order, 1 << order, offset).unwrap();
-
-        let naive_poly = Polynomial::interpolate(&twiddles, fft_evals).unwrap();
-        let fft_poly = Polynomial::interpolate_offset_fft(fft_evals, offset).unwrap();
-
-        (fft_poly, naive_poly)
-    }
-
-    fn gen_fft_interpolate_and_evaluate<F: IsFFTField>(
-        poly: Polynomial<FieldElement<F>>,
-    ) -> (Polynomial<FieldElement<F>>, Polynomial<FieldElement<F>>) {
-        let eval = Polynomial::evaluate_fft::<F>(&poly, 1, None).unwrap();
-        let new_poly = Polynomial::interpolate_fft::<F>(&eval).unwrap();
-
-        (poly, new_poly)
-    }
-
-    #[cfg(not(feature = "cuda"))]
-    mod u64_field_tests {
-        use super::*;
-        use crate::field::test_fields::u64_test_field::U64TestField;
-
-        // FFT related tests
-        type F = U64TestField;
-        type FE = FieldElement<F>;
-
-        prop_compose! {
-            fn powers_of_two(max_exp: u8)(exp in 1..max_exp) -> usize { 1 << exp }
-            // max_exp cannot be multiple of the bits that represent a usize, generally 64 or 32.
-            // also it can't exceed the test field's two-adicity.
-        }
-        prop_compose! {
-            fn field_element()(num in any::<u64>().prop_filter("Avoid null coefficients", |x| x != &0)) -> FE {
-                FE::from(num)
-            }
-        }
-        prop_compose! {
-            fn offset()(num in 1..F::neg(&1)) -> FE { FE::from(num) }
-        }
-        prop_compose! {
-            fn field_vec(max_exp: u8)(vec in collection::vec(field_element(), 0..1 << max_exp)) -> Vec<FE> {
-                vec
-            }
-        }
-        prop_compose! {
-            fn non_empty_field_vec(max_exp: u8)(vec in collection::vec(field_element(), 1 << max_exp)) -> Vec<FE> {
-                vec
-            }
-        }
-        prop_compose! {
-            fn non_power_of_two_sized_field_vec(max_exp: u8)(vec in collection::vec(field_element(), 2..1<<max_exp).prop_filter("Avoid polynomials of size power of two", |vec| !vec.len().is_power_of_two())) -> Vec<FE> {
-                vec
-            }
-        }
-        prop_compose! {
-            fn poly(max_exp: u8)(coeffs in field_vec(max_exp)) -> Polynomial<FE> {
-                Polynomial::new(&coeffs)
-            }
-        }
-        prop_compose! {
-            fn non_zero_poly(max_exp: u8)(coeffs in non_empty_field_vec(max_exp)) -> Polynomial<FE> {
-                Polynomial::new(&coeffs)
-            }
-        }
-        prop_compose! {
-            fn poly_with_non_power_of_two_coeffs(max_exp: u8)(coeffs in non_power_of_two_sized_field_vec(max_exp)) -> Polynomial<FE> {
-                Polynomial::new(&coeffs)
-            }
-        }
-
-        proptest! {
-            // Property-based test that ensures FFT eval. gives same result as a naive polynomial evaluation.
-            #[test]
-            fn test_fft_matches_naive_evaluation(poly in poly(8)) {
-                let (fft_eval, naive_eval) = gen_fft_and_naive_evaluation(poly);
-                prop_assert_eq!(fft_eval, naive_eval);
-            }
-
-            // Property-based test that ensures FFT eval. with coset gives same result as a naive polynomial evaluation.
-            #[test]
-            fn test_fft_coset_matches_naive_evaluation(poly in poly(6), offset in offset(), blowup_factor in powers_of_two(4)) {
-                let (fft_eval, naive_eval) = gen_fft_coset_and_naive_evaluation(poly, offset, blowup_factor);
-                prop_assert_eq!(fft_eval, naive_eval);
-            }
-
-            // Property-based test that ensures FFT interpolation is the same as naive.
-            #[test]
-            fn test_fft_interpolate_matches_naive(fft_evals in field_vec(4)
-                                                           .prop_filter("Avoid polynomials of size not power of two",
-                                                                        |evals| evals.len().is_power_of_two())) {
-                let (fft_poly, naive_poly) = gen_fft_and_naive_interpolate(&fft_evals);
-                prop_assert_eq!(fft_poly, naive_poly);
-            }
-
-            // Property-based test that ensures FFT interpolation with an offset is the same as naive.
-            #[test]
-            fn test_fft_interpolate_coset_matches_naive(offset in offset(), fft_evals in field_vec(4)
-                                                           .prop_filter("Avoid polynomials of size not power of two",
-                                                                        |evals| evals.len().is_power_of_two())) {
-                let (fft_poly, naive_poly) = gen_fft_and_naive_coset_interpolate(&fft_evals, &offset);
-                prop_assert_eq!(fft_poly, naive_poly);
-            }
-
-            // Property-based test that ensures interpolation is the inverse operation of evaluation.
-            #[test]
-            fn test_fft_interpolate_is_inverse_of_evaluate(poly in poly(4)
-                                                           .prop_filter("Avoid polynomials of size not power of two",
-                                                                        |poly| poly.coeff_len().is_power_of_two())) {
-                let (poly, new_poly) = gen_fft_interpolate_and_evaluate(poly);
-
-                prop_assert_eq!(poly, new_poly);
-            }
-
-            #[test]
-            fn test_fft_multiplication_works(poly in poly(7), other in poly(7)) {
-                prop_assert_eq!(poly.fast_fft_multiplication::<F>(&other).unwrap(), poly * other);
-            }
-
-            #[test]
-            fn test_fft_division_works(poly in non_zero_poly(7), other in non_zero_poly(7)) {
-                prop_assert_eq!(poly.fast_division::<F>(&other).unwrap(), poly.long_division_with_remainder(&other));
-            }
-
-            #[test]
-            fn test_invert_polynomial_mod_works(poly in non_zero_poly(7), k in powers_of_two(4)) {
-                let inverted_poly = poly.invert_polynomial_mod::<F>(k).unwrap();
-                prop_assert_eq!((poly * inverted_poly).truncate(k), Polynomial::new(&[FE::one()]));
-            }
-        }
-
-        #[test]
-        fn composition_fft_works() {
-            let p = Polynomial::new(&[FE::new(0), FE::new(2)]);
-            let q = Polynomial::new(&[FE::new(0), FE::new(0), FE::new(0), FE::new(1)]);
             assert_eq!(
-                compose_fft::<F, F>(&p, &q),
-                Polynomial::new(&[FE::new(0), FE::new(0), FE::new(0), FE::new(2)])
+                reference.len(),
+                fused.len(),
+                "Length mismatch at order {}",
+                order
             );
-        }
-    }
-
-    mod u256_field_tests {
-        use super::*;
-        use crate::field::fields::fft_friendly::stark_252_prime_field::Stark252PrimeField;
-
-        prop_compose! {
-            fn powers_of_two(max_exp: u8)(exp in 1..max_exp) -> usize { 1 << exp }
-            // max_exp cannot be multiple of the bits that represent a usize, generally 64 or 32.
-            // also it can't exceed the test field's two-adicity.
-        }
-        prop_compose! {
-            fn field_element()(num in any::<u64>().prop_filter("Avoid null coefficients", |x| x != &0)) -> FE {
-                FE::from(num)
-            }
-        }
-        prop_compose! {
-            fn offset()(num in any::<u64>(), factor in any::<u64>()) -> FE { FE::from(num).pow(factor) }
-        }
-        prop_compose! {
-            fn field_vec(max_exp: u8)(vec in collection::vec(field_element(), 0..1 << max_exp)) -> Vec<FE> {
-                vec
-            }
-        }
-        prop_compose! {
-            fn non_empty_field_vec(max_exp: u8)(vec in collection::vec(field_element(), 1 << max_exp)) -> Vec<FE> {
-                vec
-            }
-        }
-        prop_compose! {
-            fn non_power_of_two_sized_field_vec(max_exp: u8)(vec in collection::vec(field_element(), 2..1<<max_exp).prop_filter("Avoid polynomials of size power of two", |vec| !vec.len().is_power_of_two())) -> Vec<FE> {
-                vec
-            }
-        }
-        prop_compose! {
-            fn poly(max_exp: u8)(coeffs in field_vec(max_exp)) -> Polynomial<FE> {
-                Polynomial::new(&coeffs)
-            }
-        }
-        prop_compose! {
-            fn non_zero_poly(max_exp: u8)(coeffs in non_empty_field_vec(max_exp)) -> Polynomial<FE> {
-                Polynomial::new(&coeffs)
-            }
-        }
-        prop_compose! {
-            fn poly_with_non_power_of_two_coeffs(max_exp: u8)(coeffs in non_power_of_two_sized_field_vec(max_exp)) -> Polynomial<FE> {
-                Polynomial::new(&coeffs)
-            }
-        }
-
-        // FFT related tests
-        type F = Stark252PrimeField;
-        type FE = FieldElement<F>;
-
-        proptest! {
-            // Property-based test that ensures FFT eval. gives same result as a naive polynomial evaluation.
-            #[test]
-            fn test_fft_matches_naive_evaluation(poly in poly(8)) {
-                let (fft_eval, naive_eval) = gen_fft_and_naive_evaluation(poly);
-                prop_assert_eq!(fft_eval, naive_eval);
-            }
-
-            // Property-based test that ensures FFT eval. with coset gives same result as a naive polynomial evaluation.
-            #[test]
-            fn test_fft_coset_matches_naive_evaluation(poly in poly(4), offset in offset(), blowup_factor in powers_of_two(4)) {
-                let (fft_eval, naive_eval) = gen_fft_coset_and_naive_evaluation(poly, offset, blowup_factor);
-                prop_assert_eq!(fft_eval, naive_eval);
-            }
-
-            // Property-based test that ensures FFT interpolation is the same as naive..
-            #[test]
-            fn test_fft_interpolate_matches_naive(fft_evals in field_vec(4)
-                                                           .prop_filter("Avoid polynomials of size not power of two",
-                                                                        |evals| evals.len().is_power_of_two())) {
-                let (fft_poly, naive_poly) = gen_fft_and_naive_interpolate(&fft_evals);
-                prop_assert_eq!(fft_poly, naive_poly);
-            }
-
-            // Property-based test that ensures FFT interpolation with an offset is the same as naive.
-            #[test]
-            fn test_fft_interpolate_coset_matches_naive(offset in offset(), fft_evals in field_vec(4)
-                                                           .prop_filter("Avoid polynomials of size not power of two",
-                                                                        |evals| evals.len().is_power_of_two())) {
-                let (fft_poly, naive_poly) = gen_fft_and_naive_coset_interpolate(&fft_evals, &offset);
-                prop_assert_eq!(fft_poly, naive_poly);
-            }
-
-            // Property-based test that ensures interpolation is the inverse operation of evaluation.
-            #[test]
-            fn test_fft_interpolate_is_inverse_of_evaluate(
-                poly in poly(4).prop_filter("Avoid non pows of two", |poly| poly.coeff_len().is_power_of_two())) {
-                let (poly, new_poly) = gen_fft_interpolate_and_evaluate(poly);
-                prop_assert_eq!(poly, new_poly);
-            }
-
-            #[test]
-            fn test_fft_multiplication_works(poly in poly(7), other in poly(7)) {
-                prop_assert_eq!(poly.fast_fft_multiplication::<F>(&other).unwrap(), poly * other);
-            }
-
-            #[test]
-            fn test_fft_division_works(poly in poly(7), other in non_zero_poly(7)) {
-                prop_assert_eq!(poly.fast_division::<F>(&other).unwrap(), poly.long_division_with_remainder(&other));
-            }
-
-            #[test]
-            fn test_invert_polynomial_mod_works(poly in non_zero_poly(7), k in powers_of_two(4)) {
-                let inverted_poly = poly.invert_polynomial_mod::<F>(k).unwrap();
-                prop_assert_eq!((poly * inverted_poly).truncate(k), Polynomial::new(&[FE::one()]));
-            }
+            assert_eq!(reference, fused, "Value mismatch at order {}", order);
         }
     }
 
     #[test]
-    fn test_fft_with_values_in_field_extension_over_domain_in_prime_field() {
-        type TF = U64TestField;
-        type TL = U64TestFieldExtension;
+    fn coset_lde_blowup_factor_4() {
+        let offset = FE::from(7u64);
+        let blowup_factor = 4;
+        let n = 16;
 
-        let a = FieldElement::<TL>::from(&[FieldElement::one(), FieldElement::one()]);
-        let b = FieldElement::<TL>::from(&[-FieldElement::from(2), FieldElement::from(17)]);
-        let c = FieldElement::<TL>::one();
-        let poly = Polynomial::new(&[a, b, c]);
+        let evals: Vec<FE> = (0..n).map(|i| FE::from((i * 3 + 1) as u64)).collect();
 
-        let eval = Polynomial::evaluate_offset_fft::<TF>(&poly, 8, Some(4), &FieldElement::from(2))
+        let poly = Polynomial::interpolate_fft::<F>(&evals).unwrap();
+        let reference =
+            Polynomial::evaluate_offset_fft::<F>(&poly, blowup_factor, Some(n), &offset).unwrap();
+
+        let fused = Polynomial::<FE>::coset_lde::<F>(&evals, blowup_factor, &offset).unwrap();
+
+        assert_eq!(reference, fused);
+    }
+
+    #[test]
+    fn coset_lde_empty_input() {
+        let offset = FE::from(3u64);
+        let result = Polynomial::<FE>::coset_lde::<F>(&[], 2, &offset).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn coset_lde_full_into_matches_coset_lde_full() {
+        use crate::fft::cpu::bowers_fft::LayerTwiddles;
+
+        let offset = FE::from(3u64);
+        let blowup_factor = 2;
+
+        for order in 1..=10 {
+            let n = 1usize << order;
+            let evals: Vec<FE> = (0..n).map(|i| FE::from((i * 7 + 13) as u64)).collect();
+
+            let lde_size = n * blowup_factor;
+            let inv_tw = LayerTwiddles::<F>::new_inverse(n.trailing_zeros() as u64).unwrap();
+            let fwd_tw = LayerTwiddles::<F>::new(lde_size.trailing_zeros() as u64).unwrap();
+
+            let n_inv = FE::from(n as u64).inv().unwrap();
+            let mut weights = Vec::with_capacity(n);
+            let mut offset_power = n_inv;
+            for _ in 0..n {
+                weights.push(offset_power);
+                offset_power = &offset_power * &offset;
+            }
+
+            let reference = Polynomial::<FE>::coset_lde_full::<F>(
+                &evals,
+                blowup_factor,
+                &weights,
+                &inv_tw,
+                &fwd_tw,
+            )
             .unwrap();
-        let new_poly =
-            Polynomial::interpolate_offset_fft::<TF>(&eval, &FieldElement::from(2)).unwrap();
-        assert_eq!(poly, new_poly);
+
+            // Test with pre-allocated buffer
+            let mut buffer = Vec::with_capacity(lde_size);
+            Polynomial::<FE>::coset_lde_full_into::<F>(
+                &evals,
+                blowup_factor,
+                &weights,
+                &inv_tw,
+                &fwd_tw,
+                &mut buffer,
+            )
+            .unwrap();
+
+            assert_eq!(reference, buffer, "Mismatch at order {}", order);
+        }
+    }
+
+    #[test]
+    fn coset_lde_full_into_reuses_buffer() {
+        use crate::fft::cpu::bowers_fft::LayerTwiddles;
+
+        let offset = FE::from(5u64);
+        let blowup_factor = 2usize;
+        let n = 16usize;
+        let lde_size = n * blowup_factor;
+
+        let inv_tw = LayerTwiddles::<F>::new_inverse(n.trailing_zeros() as u64).unwrap();
+        let fwd_tw = LayerTwiddles::<F>::new(lde_size.trailing_zeros() as u64).unwrap();
+
+        let n_inv = FE::from(n as u64).inv().unwrap();
+        let mut weights = Vec::with_capacity(n);
+        let mut offset_power = n_inv;
+        for _ in 0..n {
+            weights.push(offset_power);
+            offset_power = &offset_power * &offset;
+        }
+
+        // Pre-allocate buffer once, reuse for two different inputs
+        let mut buffer = Vec::with_capacity(lde_size);
+
+        for seed in [13u64, 42u64] {
+            let evals: Vec<FE> = (0..n).map(|i| FE::from(i as u64 * seed + 1)).collect();
+
+            let reference = Polynomial::<FE>::coset_lde_full::<F>(
+                &evals,
+                blowup_factor,
+                &weights,
+                &inv_tw,
+                &fwd_tw,
+            )
+            .unwrap();
+
+            Polynomial::<FE>::coset_lde_full_into::<F>(
+                &evals,
+                blowup_factor,
+                &weights,
+                &inv_tw,
+                &fwd_tw,
+                &mut buffer,
+            )
+            .unwrap();
+
+            assert_eq!(reference, buffer, "Mismatch for seed {}", seed);
+        }
     }
 }

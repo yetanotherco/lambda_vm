@@ -1,24 +1,24 @@
 use std::fmt::Display;
 
-const STACK_MEMORY_SIZE: u32 = 0xFFFFFFFC; // 4GB (Multiple of 4)
+pub const STACK_TOP: u64 = 0xFFFFFFFFFFFFFFF0; // 64-bit max (Multiple of 16 for RV64 ABI)
 
 #[derive(Debug)]
 /// Holds the current value of all 32 registers
 /// Register zero is implicit as it cannot hold any value other than zero
-pub struct Registers([u32; 31]);
+pub struct Registers([u64; 31]);
 
 impl Default for Registers {
     fn default() -> Self {
         let mut registers = Registers(Default::default());
         // Initialize stack pointer according to available memory size
-        registers.0[1] = STACK_MEMORY_SIZE;
+        registers.0[1] = STACK_TOP;
         registers
     }
 }
 
 impl Registers {
     /// Read the current value of the given register
-    pub fn read(&self, register: u32) -> Result<u32, RegisterError> {
+    pub fn read(&self, register: u32) -> Result<u64, RegisterError> {
         if register > 31 {
             return Err(RegisterError::InvalidRegister(register));
         }
@@ -31,7 +31,7 @@ impl Registers {
 
     /// Update the value of the given register
     /// Writes to register zero are a no-op
-    pub fn write(&mut self, register: u32, value: u32) -> Result<(), RegisterError> {
+    pub fn write(&mut self, register: u32, value: u64) -> Result<(), RegisterError> {
         if register > 31 {
             return Err(RegisterError::InvalidRegister(register));
         }
@@ -42,26 +42,36 @@ impl Registers {
     }
 
     /// Read the return values (aka registers a0 & a1)
-    pub fn read_return_values(&self) -> (u32, u32) {
+    pub fn read_return_values(&self) -> (u64, u64) {
         (self.0[9], self.0[10])
     }
 }
 
 impl Display for Registers {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        const REGISTER_NAMES: [&str; 31] = [
-            "ra", "sp", "gp", "tp", "t0", "t1", "t2", "s0", "s1", "a0", "a1", "a2", "a3", "a4",
-            "a5", "a6", "a7", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "t3",
-            "t4", "t5", "t6",
+        const REGISTER_NAMES: [&str; 32] = [
+            "zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2", "s0", "s1", "a0", "a1", "a2", "a3",
+            "a4", "a5", "a6", "a7", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11",
+            "t3", "t4", "t5", "t6",
         ];
-        let registers = self
-            .0
+        let values = std::iter::once(0u64).chain(self.0.iter().copied());
+
+        for (i, chunk) in REGISTER_NAMES
             .iter()
-            .zip(REGISTER_NAMES)
-            .map(|(reg, name)| format!("{name}: {reg}"))
-            .collect::<Vec<String>>()
-            .join(", ");
-        writeln!(f, "[{}]", registers)
+            .zip(values)
+            .collect::<Vec<_>>()
+            .chunks(4)
+            .enumerate()
+        {
+            if i != 0 {
+                writeln!(f)?;
+            }
+
+            for (name, value) in chunk {
+                write!(f, "{name:>4}: {value:#018x}",)?;
+            }
+        }
+        Ok(())
     }
 }
 

@@ -3,9 +3,11 @@
 #[macro_use]
 extern crate alloc;
 
-pub mod commitments;
 #[cfg(feature = "std")]
 pub mod errors;
 pub mod fiat_shamir;
 pub mod hash;
 pub mod merkle_tree;
+
+#[cfg(test)]
+pub mod tests;

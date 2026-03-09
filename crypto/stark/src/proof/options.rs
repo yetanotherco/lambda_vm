@@ -1,16 +1,35 @@
-use super::errors::InsecureOptionError;
-use math::field::traits::IsPrimeField;
+use core::fmt;
 
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::wasm_bindgen;
 
-pub enum SecurityLevel {
-    Conjecturable80Bits,
-    Conjecturable100Bits,
-    Conjecturable128Bits,
-    Provable80Bits,
-    Provable100Bits,
-    Provable128Bits,
+/// Error returned when proof options are invalid.
+#[derive(Debug, Clone)]
+pub enum ProofOptionsError {
+    /// blowup_factor must be a power of 2 >= 2
+    InvalidBlowup(u8),
+    /// security_bits must exceed grinding_factor
+    SecurityTooLow {
+        security_bits: u8,
+        grinding_factor: u8,
+    },
+}
+
+impl fmt::Display for ProofOptionsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidBlowup(b) => {
+                write!(f, "blowup_factor must be a power of 2 >= 2, got {b}")
+            }
+            Self::SecurityTooLow {
+                security_bits,
+                grinding_factor,
+            } => write!(
+                f,
+                "security_bits ({security_bits}) must exceed grinding_factor ({grinding_factor})"
+            ),
+        }
+    }
 }
 
 /// The options for the proof
@@ -20,7 +39,7 @@ pub enum SecurityLevel {
 /// - `coset_offset`: the offset for the coset
 /// - `grinding_factor`: the number of leading zeros that we want for the Hash(hash || nonce)
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ProofOptions {
     pub blowup_factor: u8,
     pub fri_number_of_queries: usize,
@@ -29,124 +48,11 @@ pub struct ProofOptions {
 }
 
 impl ProofOptions {
-    // TODO: Make it work for extended fields
-    const EXTENSION_DEGREE: usize = 1;
-    // Estimated maximum domain size. 2^40 = 1 TB
-    const NUM_BITS_MAX_DOMAIN_SIZE: usize = 40;
-
-    /// See section 5.10.1 of https://eprint.iacr.org/2021/582.pdf
-    pub fn new_secure(security_level: SecurityLevel, coset_offset: u64) -> Self {
-        match security_level {
-            SecurityLevel::Conjecturable80Bits => ProofOptions {
-                blowup_factor: 4,
-                fri_number_of_queries: 31,
-                coset_offset,
-                grinding_factor: 20,
-            },
-            SecurityLevel::Conjecturable100Bits => ProofOptions {
-                blowup_factor: 4,
-                fri_number_of_queries: 41,
-                coset_offset,
-                grinding_factor: 20,
-            },
-            SecurityLevel::Conjecturable128Bits => ProofOptions {
-                blowup_factor: 4,
-                fri_number_of_queries: 55,
-                coset_offset,
-                grinding_factor: 20,
-            },
-            SecurityLevel::Provable80Bits => ProofOptions {
-                blowup_factor: 4,
-                fri_number_of_queries: 80,
-                coset_offset,
-                grinding_factor: 20,
-            },
-            SecurityLevel::Provable100Bits => ProofOptions {
-                blowup_factor: 4,
-                fri_number_of_queries: 104,
-                coset_offset,
-                grinding_factor: 20,
-            },
-            SecurityLevel::Provable128Bits => ProofOptions {
-                blowup_factor: 4,
-                fri_number_of_queries: 140,
-                coset_offset,
-                grinding_factor: 20,
-            },
-        }
-    }
-
-    /// Checks security of proof options given 128 bits of security
-    pub fn new_with_checked_security<F: IsPrimeField>(
-        blowup_factor: u8,
-        fri_number_of_queries: usize,
-        coset_offset: u64,
-        grinding_factor: u8,
-        security_target: u8,
-    ) -> Result<Self, InsecureOptionError> {
-        Self::check_field_security::<F>(security_target)?;
-
-        let num_bits_blowup_factor = blowup_factor.trailing_zeros() as usize;
-
-        if security_target as usize
-            >= grinding_factor as usize + num_bits_blowup_factor * fri_number_of_queries - 1
-        {
-            return Err(InsecureOptionError::LowSecurityBits);
-        }
-
-        Ok(ProofOptions {
-            blowup_factor,
-            fri_number_of_queries,
-            coset_offset,
-            grinding_factor,
-        })
-    }
-
-    /// Checks provable security of proof options given 128 bits of security
-    /// This is an approximation. It's stricter than the formula in the paper.
-    /// See https://eprint.iacr.org/2021/582.pdf
-    pub fn new_with_checked_provable_security<F: IsPrimeField>(
-        blowup_factor: u8,
-        fri_number_of_queries: usize,
-        coset_offset: u64,
-        grinding_factor: u8,
-        security_target: u8,
-    ) -> Result<Self, InsecureOptionError> {
-        Self::check_field_security::<F>(security_target)?;
-
-        let num_bits_blowup_factor = blowup_factor.leading_zeros() as usize;
-
-        if (security_target as usize)
-            < grinding_factor as usize + num_bits_blowup_factor * fri_number_of_queries / 2
-        {
-            return Err(InsecureOptionError::LowSecurityBits);
-        }
-
-        Ok(ProofOptions {
-            blowup_factor,
-            fri_number_of_queries,
-            coset_offset,
-            grinding_factor,
-        })
-    }
-
-    fn check_field_security<F: IsPrimeField>(
-        security_target: u8,
-    ) -> Result<(), InsecureOptionError> {
-        if F::field_bit_size() * Self::EXTENSION_DEGREE
-            <= security_target as usize + Self::NUM_BITS_MAX_DOMAIN_SIZE
-        {
-            return Err(InsecureOptionError::FieldSize);
-        }
-
-        Ok(())
-    }
-
     /// Default proof options used for testing purposes.
     /// These options should never be used in production.
     pub fn default_test_options() -> Self {
         Self {
-            blowup_factor: 4,
+            blowup_factor: 2,
             fri_number_of_queries: 3,
             coset_offset: 3,
             grinding_factor: 1,
@@ -154,116 +60,58 @@ impl ProofOptions {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use math::field::fields::{
-        fft_friendly::stark_252_prime_field::Stark252PrimeField, u64_prime_field::F17,
-    };
+/// Proof options builder for Goldilocks **cubic** extension field (degree 3).
+///
+/// Goldilocks base field: 64 bits (p = 2^64 - 2^32 + 1)
+/// Cubic extension: degree 3 (w^3 = 2), giving 192-bit effective field size.
+///
+/// Computes FRI query count using the Johnson Bound Regime (JBR):
+///   proximity = 1 - sqrt(1/blowup) - 1/300
+///   bits_per_query = -log2(1 - proximity)
+///   queries = ceil((security_bits - grinding) / bits_per_query)
+///
+/// The 192-bit effective field comfortably supports up to 152-bit security
+/// (192 - 40 bits max domain), so the FRI query count is always the
+/// security bottleneck — field size is not.
+pub struct GoldilocksCubicProofOptions;
 
-    use crate::proof::{errors::InsecureOptionError, options::SecurityLevel};
+impl GoldilocksCubicProofOptions {
+    const DEFAULT_GRINDING: u8 = 20;
 
-    use super::ProofOptions;
-
-    #[test]
-    fn u64_prime_field_is_not_large_enough_to_be_secure() {
-        let ProofOptions {
-            blowup_factor,
-            fri_number_of_queries,
-            coset_offset,
-            grinding_factor,
-        } = ProofOptions::new_secure(SecurityLevel::Conjecturable128Bits, 1);
-
-        let u64_options = ProofOptions::new_with_checked_security::<F17>(
-            blowup_factor,
-            fri_number_of_queries,
-            coset_offset,
-            grinding_factor,
-            128,
-        );
-
-        assert!(matches!(u64_options, Err(InsecureOptionError::FieldSize)));
+    /// Create proof options targeting 128-bit security with default grinding (20 bits).
+    ///
+    /// `blowup_factor` must be a power of 2 >= 2 (e.g., 2, 4, 8, 16, 32, 64).
+    pub fn with_blowup(blowup_factor: u8) -> Result<ProofOptions, ProofOptionsError> {
+        Self::with_params(blowup_factor, 128, Self::DEFAULT_GRINDING)
     }
 
-    #[test]
-    fn generated_stark_proof_options_for_128_bits_are_secure() {
-        let ProofOptions {
+    /// Create proof options with custom security target and grinding factor.
+    pub fn with_params(
+        blowup_factor: u8,
+        security_bits: u8,
+        grinding_factor: u8,
+    ) -> Result<ProofOptions, ProofOptionsError> {
+        if !blowup_factor.is_power_of_two() || blowup_factor < 2 {
+            return Err(ProofOptionsError::InvalidBlowup(blowup_factor));
+        }
+        if security_bits <= grinding_factor {
+            return Err(ProofOptionsError::SecurityTooLow {
+                security_bits,
+                grinding_factor,
+            });
+        }
+
+        let rate = 1.0 / blowup_factor as f64;
+        let proximity = 1.0 - rate.sqrt() - 1.0 / 300.0;
+        let bits_per_query = -(1.0 - proximity).log2();
+        let fri_number_of_queries =
+            ((security_bits as f64 - grinding_factor as f64) / bits_per_query).ceil() as usize;
+
+        Ok(ProofOptions {
             blowup_factor,
             fri_number_of_queries,
-            coset_offset,
+            coset_offset: 3,
             grinding_factor,
-        } = ProofOptions::new_secure(SecurityLevel::Conjecturable128Bits, 1);
-
-        let secure_options = ProofOptions::new_with_checked_security::<Stark252PrimeField>(
-            blowup_factor,
-            fri_number_of_queries,
-            coset_offset,
-            grinding_factor,
-            128,
-        );
-
-        assert!(secure_options.is_ok());
-    }
-
-    #[test]
-    fn generated_proof_options_for_128_bits_with_one_fri_query_less_are_insecure() {
-        let ProofOptions {
-            blowup_factor,
-            fri_number_of_queries,
-            coset_offset,
-            grinding_factor,
-        } = ProofOptions::new_secure(SecurityLevel::Conjecturable128Bits, 1);
-
-        let insecure_options = ProofOptions::new_with_checked_security::<Stark252PrimeField>(
-            blowup_factor,
-            fri_number_of_queries - 1,
-            coset_offset,
-            grinding_factor,
-            128,
-        );
-
-        assert!(matches!(
-            insecure_options,
-            Err(InsecureOptionError::LowSecurityBits)
-        ));
-    }
-
-    #[test]
-    fn generated_stark_proof_options_for_100_bits_are_secure_for_100_target_bits() {
-        let ProofOptions {
-            blowup_factor,
-            fri_number_of_queries,
-            coset_offset,
-            grinding_factor,
-        } = ProofOptions::new_secure(SecurityLevel::Conjecturable100Bits, 1);
-
-        let secure_options = ProofOptions::new_with_checked_security::<Stark252PrimeField>(
-            blowup_factor,
-            fri_number_of_queries,
-            coset_offset,
-            grinding_factor,
-            100,
-        );
-
-        assert!(secure_options.is_ok());
-    }
-
-    #[test]
-    fn generated_stark_proof_options_for_80_bits_are_secure_for_80_target_bits() {
-        let ProofOptions {
-            blowup_factor,
-            fri_number_of_queries,
-            coset_offset,
-            grinding_factor,
-        } = ProofOptions::new_secure(SecurityLevel::Conjecturable80Bits, 1);
-
-        let secure_options = ProofOptions::new_with_checked_security::<Stark252PrimeField>(
-            blowup_factor,
-            fri_number_of_queries,
-            coset_offset,
-            grinding_factor,
-            80,
-        );
-
-        assert!(secure_options.is_ok());
+        })
     }
 }
