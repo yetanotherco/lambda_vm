@@ -1,6 +1,8 @@
 use crate::field::element::FieldElement;
-use crate::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
-use crate::field::traits::IsFFTField;
+use crate::field::fields::fft_friendly::u64_goldilocks::{
+    GOLDILOCKS_PRIME, GoldilocksElement, GoldilocksField, inv_addition_chain,
+};
+use crate::field::traits::{IsFFTField, IsField, IsPrimeField};
 use crate::traits::ByteConversion;
 
 type F = GoldilocksField;
@@ -81,7 +83,191 @@ fn byte_serialization_and_deserialization_works_be() {
     assert_eq!(element, from_bytes);
 }
 
-#[cfg(all(feature = "std", not(feature = "instruments"), not(feature = "cuda")))]
+#[test]
+fn test_add_basic() {
+    let a = 5u64;
+    let b = 7u64;
+    assert_eq!(GoldilocksField::add(&a, &b), 12);
+}
+
+#[test]
+fn test_add_overflow() {
+    let a = GOLDILOCKS_PRIME - 1;
+    let b = 2u64;
+    let result = GoldilocksField::add(&a, &b);
+    assert_eq!(GoldilocksField::canonical(&result), 1);
+}
+
+#[test]
+fn test_sub_basic() {
+    let a = 10u64;
+    let b = 3u64;
+    assert_eq!(GoldilocksField::sub(&a, &b), 7);
+}
+
+#[test]
+fn test_sub_underflow() {
+    let a = 3u64;
+    let b = 10u64;
+    let result = GoldilocksField::sub(&a, &b);
+    assert_eq!(GoldilocksField::canonical(&result), GOLDILOCKS_PRIME - 7);
+}
+
+#[test]
+fn test_mul_basic() {
+    let a = 5u64;
+    let b = 7u64;
+    assert_eq!(GoldilocksField::mul(&a, &b), 35);
+}
+
+#[test]
+fn test_mul_large() {
+    let a = 1u64 << 40;
+    let b = 1u64 << 40;
+    let result = GoldilocksField::mul(&a, &b);
+    let expected = ((a as u128 * b as u128) % GOLDILOCKS_PRIME as u128) as u64;
+    assert_eq!(GoldilocksField::canonical(&result), expected);
+}
+
+#[test]
+fn test_inv() {
+    let a = 5u64;
+    let a_inv = GoldilocksField::inv(&a).unwrap();
+    let product = GoldilocksField::mul(&a, &a_inv);
+    assert_eq!(GoldilocksField::canonical(&product), 1);
+}
+
+#[test]
+fn test_inv_larger() {
+    let a = 123456789u64;
+    let a_inv = GoldilocksField::inv(&a).unwrap();
+    let product = GoldilocksField::mul(&a, &a_inv);
+    assert_eq!(GoldilocksField::canonical(&product), 1);
+}
+
+#[test]
+fn test_zero_inv() {
+    assert!(GoldilocksField::inv(&0).is_err());
+}
+
+#[test]
+fn test_neg() {
+    let a = 5u64;
+    let neg_a = GoldilocksField::neg(&a);
+    let sum = GoldilocksField::add(&a, &neg_a);
+    assert_eq!(GoldilocksField::canonical(&sum), 0);
+}
+
+#[test]
+fn test_primitive_root() {
+    let root = GoldilocksField::get_primitive_root_of_unity(GoldilocksField::TWO_ADICITY).unwrap();
+    let mut result = *root.value();
+    for _ in 0..32 {
+        result = GoldilocksField::square(&result);
+    }
+    assert_eq!(GoldilocksField::canonical(&result), 1);
+}
+
+#[test]
+fn test_inv_addition_chain() {
+    for a in [5u64, 123456789, GOLDILOCKS_PRIME - 1, 0xDEADBEEF, 1, 2] {
+        let a_inv = inv_addition_chain(a);
+        let product = GoldilocksField::mul(&a, &a_inv);
+        assert_eq!(
+            GoldilocksField::canonical(&product),
+            1,
+            "Failed for a = {}",
+            a
+        );
+    }
+}
+
+#[test]
+fn test_square() {
+    for a in [5u64, 123456789, GOLDILOCKS_PRIME - 1, 0xDEADBEEF, 1, 2] {
+        let sq = GoldilocksField::square(&a);
+        let mul = GoldilocksField::mul(&a, &a);
+        assert_eq!(
+            GoldilocksField::canonical(&sq),
+            GoldilocksField::canonical(&mul),
+            "Square mismatch for a = {}",
+            a
+        );
+    }
+}
+
+#[test]
+fn test_from_i64_positive() {
+    let fe_from_i64 = GoldilocksElement::from(42i64);
+    let fe_from_u64 = GoldilocksElement::from(42u64);
+    assert_eq!(fe_from_i64, fe_from_u64);
+}
+
+#[test]
+fn test_from_i64_zero() {
+    let fe = GoldilocksElement::from(0i64);
+    assert_eq!(fe, GoldilocksElement::zero());
+}
+
+#[test]
+fn test_from_i64_negative_one() {
+    let fe = GoldilocksElement::from(-1i64);
+    let expected = GoldilocksElement::from(GOLDILOCKS_PRIME - 1);
+    assert_eq!(fe, expected);
+    let one = GoldilocksElement::one();
+    assert_eq!(fe + one, GoldilocksElement::zero());
+}
+
+#[test]
+fn test_from_i64_negative_values() {
+    for x in [1i64, 5, 100, 1000, 123456789] {
+        let pos = GoldilocksElement::from(x);
+        let neg = GoldilocksElement::from(-x);
+        assert_eq!(pos + neg, GoldilocksElement::zero(), "Failed for x = {}", x);
+    }
+}
+
+#[test]
+fn test_from_i64_negative_equals_negation() {
+    for x in [1i64, 42, 1000, 999999] {
+        let from_neg = GoldilocksElement::from(-x);
+        let neg_from = -GoldilocksElement::from(x);
+        assert_eq!(from_neg, neg_from, "Failed for x = {}", x);
+    }
+}
+
+#[test]
+fn test_from_i64_arithmetic() {
+    let five = GoldilocksElement::from(5i64);
+    let ten = GoldilocksElement::from(10i64);
+    let minus_five = GoldilocksElement::from(-5i64);
+    assert_eq!(five - ten, minus_five);
+}
+
+#[test]
+fn test_from_i64_large_negative() {
+    let large_neg = GoldilocksElement::from(-1_000_000_000i64);
+    let large_pos = GoldilocksElement::from(1_000_000_000i64);
+    assert_eq!(large_neg + large_pos, GoldilocksElement::zero());
+    assert_eq!(large_neg, -large_pos);
+}
+
+#[test]
+fn test_from_i64_min_value() {
+    let min_val = GoldilocksElement::from(i64::MIN);
+    let expected_val = GOLDILOCKS_PRIME - (1u64 << 63);
+    let expected = GoldilocksElement::from(expected_val);
+    assert_eq!(min_val, expected);
+}
+
+#[test]
+fn test_from_i64_max_value() {
+    let max_val = GoldilocksElement::from(i64::MAX);
+    let expected = GoldilocksElement::from(i64::MAX as u64);
+    assert_eq!(max_val, expected);
+}
+
+#[cfg(all(feature = "std", not(feature = "instruments")))]
 mod fft_tests {
     use super::*;
     use crate::fft::cpu::roots_of_unity::{

@@ -46,7 +46,6 @@ mod fft_helpers_test {
 
 #[cfg(test)]
 mod fft_polynomial_tests {
-    #[cfg(not(feature = "cuda"))]
     use crate::field::traits::IsField;
 
     use crate::fft::cpu::roots_of_unity::{
@@ -133,7 +132,6 @@ mod fft_polynomial_tests {
         (poly, new_poly)
     }
 
-    #[cfg(not(feature = "cuda"))]
     mod u64_field_tests {
         use super::*;
         use crate::field::test_fields::u64_test_field::U64TestField;
