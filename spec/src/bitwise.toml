@@ -116,11 +116,6 @@ name = "μ_HWSL"
 type = "BaseField"
 desc = ""
 
-[[variables.multiplicity]]
-name = "μ_HWSLC"
-type = "BaseField"
-desc = ""
-
 
 [[constraint_groups]]
 name = "contributions"
@@ -189,12 +184,5 @@ multiplicity = ["-", "μ_IS_B20"]
 kind = "interaction"
 tag = "HWSL"
 input = [["+", "X", ["*", 256, "Y"]], "Z"]
-output = "SLL"
+output = ["arr", "SLL", "SLLC"]
 multiplicity = ["-", "μ_HWSL"]
-
-[[constraints.contributions]]
-kind = "interaction"
-tag = "HWSLC"
-input = [["+", "X", ["*", 256, "Y"]], "Z"]
-output = "SLLC"
-multiplicity = ["-", "μ_HWSLC"]

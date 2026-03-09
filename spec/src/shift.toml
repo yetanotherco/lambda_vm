@@ -222,7 +222,7 @@ name = "intra_limb_shift"
 kind = "interaction"
 tag = "HWSL"
 input = [["idx", "in", "i"], "bit_shift"]
-output = ["idx", "X", "i"]
+output = ["arr", ["idx", "X", "i"], ["idx", "Y", "i"]]
 iter = ["i", 0, 3]
 ref = "shift:c:hwsl_if_not_zero"
 multiplicity = ["not", "zbs"]
@@ -235,10 +235,17 @@ iter = ["i", 0, 3]
 ref = "shift:c:zbs_implies_X"
 
 [[constraints.intra_limb_shift]]
+kind = "arith"
+constraint = "$#`zbs` => #`Y[i]` = #`in[i]` dot #`right`$"
+poly = ["*", "zbs", ["-", ["idx", "Y", "i"], ["*", ["idx", "in", "i"], "right"]]]
+iter = ["i", 0, 3]
+ref = "shift:c:zbs_implies_Y"
+
+[[constraints.intra_limb_shift]]
 kind = "interaction"
 tag = "HWSL"
 input = ["extension", "bit_shift"]
-output = ["idx", "X", 4]
+output = ["arr", ["idx", "X", 4], ["-", "extension", ["idx", "X", 4]]]
 ref = "shift:c:hwsl_x4_if_not_zero"
 multiplicity = ["not", "zbs"]
 
@@ -247,22 +254,6 @@ kind = "arith"
 constraint = "$#`zbs` => #`X[4]` = 0$"
 poly = ["*", "zbs", ["idx", "X", 4]]
 ref = "shift:c:zbs_implies_X_4"
-
-[[constraints.intra_limb_shift]]
-kind = "interaction"
-tag = "HWSLC"
-input = [["idx", "in", "i"], "bit_shift"]
-output = ["idx", "Y", "i"]
-iter = ["i", 0, 3]
-ref = "shift:c:hwslc_if_not_zero"
-multiplicity = ["not", "zbs"]
-
-[[constraints.intra_limb_shift]]
-kind = "arith"
-constraint = "$#`zbs` => #`Y[i]` = #`in[i]` dot #`right`$"
-poly = ["*", "zbs", ["-", ["idx", "Y", "i"], ["*", ["idx", "in", "i"], "right"]]]
-iter = ["i", 0, 3]
-ref = "shift:c:zbs_implies_Y"
 
 
 [[constraint_groups]]
