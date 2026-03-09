@@ -718,3 +718,241 @@ mod soundness_tests {
         );
     }
 }
+
+// =============================================================================
+// IS_BYTE_PAIR Soundness Tests
+// =============================================================================
+//
+// Tests that the IS_BYTE_PAIR bus interaction correctly enforces that both
+// values in a pair are valid bytes [0, 255].
+//
+// The IS_BYTE_PAIR bus checks two values simultaneously by looking them up
+// as (X, Y) in the bitwise table. Since the bitwise table only contains
+// rows where X ∈ [0,255] and Y ∈ [0,255], any out-of-range value will
+// have no matching receiver row, causing the LogUp argument to fail.
+
+#[cfg(test)]
+mod byte_pair_tests {
+    use super::*;
+    use crate::tables::types::BusId;
+    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+    use stark::constraints::transition::TransitionConstraint;
+    use stark::lookup::{
+        AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, BusValue, Multiplicity,
+        NullBoundaryConstraintBuilder, Packing,
+    };
+    use stark::proof::options::ProofOptions;
+    use stark::prover::{IsStarkProver, Prover};
+    use stark::trace::TraceTable;
+    use stark::traits::AIR;
+    use stark::verifier::{IsStarkVerifier, Verifier};
+
+    use crate::tables::types::{GoldilocksExtension, GoldilocksField};
+
+    type F = GoldilocksField;
+    type E = GoldilocksExtension;
+
+    // Sender table: sends IS_BYTE_PAIR(A, B) when FLAG=1
+    mod sender_cols {
+        pub const A: usize = 0;
+        pub const B: usize = 1;
+        pub const FLAG: usize = 2;
+        pub const NUM_COLUMNS: usize = 3;
+    }
+
+    // Receiver table: receives IS_BYTE_PAIR(X, Y) with multiplicity MU
+    mod receiver_cols {
+        pub const X: usize = 0;
+        pub const Y: usize = 1;
+        pub const MU: usize = 2;
+        pub const NUM_COLUMNS: usize = 3;
+    }
+
+    fn create_sender_air(
+        proof_options: &ProofOptions,
+    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+        let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+            interactions: vec![BusInteraction::sender(
+                BusId::IsBytePair,
+                Multiplicity::Column(sender_cols::FLAG),
+                vec![
+                    BusValue::Packed {
+                        start_column: sender_cols::A,
+                        packing: Packing::Direct,
+                    },
+                    BusValue::Packed {
+                        start_column: sender_cols::B,
+                        packing: Packing::Direct,
+                    },
+                ],
+            )],
+        };
+
+        let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+        AirWithBuses::new(
+            sender_cols::NUM_COLUMNS,
+            auxiliary_trace_build_data,
+            proof_options,
+            1,
+            transition_constraints,
+        )
+    }
+
+    fn create_receiver_air(
+        proof_options: &ProofOptions,
+    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+        let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+            interactions: vec![BusInteraction::receiver(
+                BusId::IsBytePair,
+                Multiplicity::Column(receiver_cols::MU),
+                vec![
+                    BusValue::Packed {
+                        start_column: receiver_cols::X,
+                        packing: Packing::Direct,
+                    },
+                    BusValue::Packed {
+                        start_column: receiver_cols::Y,
+                        packing: Packing::Direct,
+                    },
+                ],
+            )],
+        };
+
+        let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+        AirWithBuses::new(
+            receiver_cols::NUM_COLUMNS,
+            auxiliary_trace_build_data,
+            proof_options,
+            1,
+            transition_constraints,
+        )
+    }
+
+    fn create_sender_trace(a: u64, b: u64) -> TraceTable<F, E> {
+        let num_rows = 4;
+        let mut data = vec![FE::zero(); num_rows * sender_cols::NUM_COLUMNS];
+        data[sender_cols::A] = FE::from(a);
+        data[sender_cols::B] = FE::from(b);
+        data[sender_cols::FLAG] = FE::one();
+        TraceTable::new_main(data, sender_cols::NUM_COLUMNS, 1)
+    }
+
+    fn create_receiver_trace(x: u64, y: u64, mu: u64) -> TraceTable<F, E> {
+        let num_rows = 4;
+        let mut data = vec![FE::zero(); num_rows * receiver_cols::NUM_COLUMNS];
+        data[receiver_cols::X] = FE::from(x);
+        data[receiver_cols::Y] = FE::from(y);
+        data[receiver_cols::MU] = FE::from(mu);
+        TraceTable::new_main(data, receiver_cols::NUM_COLUMNS, 1)
+    }
+
+    fn prove_and_verify(
+        sender_trace: &mut TraceTable<F, E>,
+        receiver_trace: &mut TraceTable<F, E>,
+    ) -> bool {
+        let proof_options = ProofOptions::default_test_options();
+        let sender_air = create_sender_air(&proof_options);
+        let receiver_air = create_receiver_air(&proof_options);
+
+        let air_trace_pairs: Vec<(
+            &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+            _,
+            _,
+        )> = vec![
+            (&sender_air, sender_trace, &()),
+            (&receiver_air, receiver_trace, &()),
+        ];
+
+        let multi_proof =
+            Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+
+        let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+            vec![&sender_air, &receiver_air];
+
+        Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[]))
+    }
+
+    /// Valid byte pair (both in [0, 255]) with matching receiver → accepted.
+    #[test]
+    fn test_byte_pair_valid_bytes_accepted() {
+        let mut sender = create_sender_trace(100, 200);
+        let mut receiver = create_receiver_trace(100, 200, 1);
+        assert!(
+            prove_and_verify(&mut sender, &mut receiver),
+            "Valid byte pair (100, 200) should be accepted"
+        );
+    }
+
+    /// Boundary: both zero → accepted.
+    #[test]
+    fn test_byte_pair_zero_pair_accepted() {
+        let mut sender = create_sender_trace(0, 0);
+        let mut receiver = create_receiver_trace(0, 0, 1);
+        assert!(
+            prove_and_verify(&mut sender, &mut receiver),
+            "Valid byte pair (0, 0) should be accepted"
+        );
+    }
+
+    /// Boundary: both max byte (255) → accepted.
+    #[test]
+    fn test_byte_pair_max_bytes_accepted() {
+        let mut sender = create_sender_trace(255, 255);
+        let mut receiver = create_receiver_trace(255, 255, 1);
+        assert!(
+            prove_and_verify(&mut sender, &mut receiver),
+            "Valid byte pair (255, 255) should be accepted"
+        );
+    }
+
+    /// First value out of range (256): no matching receiver row → rejected.
+    ///
+    /// The honest bitwise table has no row for X=256, so the LogUp accumulator
+    /// doesn't balance. The receiver here has a different value (0,0), creating
+    /// an unmatched sender fingerprint.
+    #[test]
+    fn test_byte_pair_first_out_of_range_rejected() {
+        let mut sender = create_sender_trace(256, 0);
+        // Receiver has (0,0) — no matching row for (256, 0)
+        let mut receiver = create_receiver_trace(0, 0, 0);
+        assert!(
+            !prove_and_verify(&mut sender, &mut receiver),
+            "Out-of-range first byte (256, 0) should be rejected"
+        );
+    }
+
+    /// Second value out of range (256): no matching receiver row → rejected.
+    #[test]
+    fn test_byte_pair_second_out_of_range_rejected() {
+        let mut sender = create_sender_trace(0, 256);
+        let mut receiver = create_receiver_trace(0, 0, 0);
+        assert!(
+            !prove_and_verify(&mut sender, &mut receiver),
+            "Out-of-range second byte (0, 256) should be rejected"
+        );
+    }
+
+    /// Both values out of range: no matching receiver row → rejected.
+    #[test]
+    fn test_byte_pair_both_out_of_range_rejected() {
+        let mut sender = create_sender_trace(256, 300);
+        let mut receiver = create_receiver_trace(0, 0, 0);
+        assert!(
+            !prove_and_verify(&mut sender, &mut receiver),
+            "Both out-of-range (256, 300) should be rejected"
+        );
+    }
+
+    /// Mismatched values: sender sends (100, 200), receiver has (100, 201) → rejected.
+    ///
+    /// Different fingerprints cause the LogUp accumulator to not balance.
+    #[test]
+    fn test_byte_pair_mismatched_values_rejected() {
+        let mut sender = create_sender_trace(100, 200);
+        let mut receiver = create_receiver_trace(100, 201, 1);
+        assert!(
+            !prove_and_verify(&mut sender, &mut receiver),
+            "Mismatched values should be rejected"
+        );
+    }
+}
