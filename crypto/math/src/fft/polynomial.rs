@@ -8,9 +8,6 @@ use crate::{
 };
 use alloc::{vec, vec::Vec};
 
-#[cfg(feature = "cuda")]
-use crate::fft::gpu::cuda::polynomial::{evaluate_fft_cuda, interpolate_fft_cuda};
-
 use super::cpu::{
     bit_reversing::in_place_bit_reverse_permute,
     bowers_fft::{LayerTwiddles, bowers_fft_opt_fused, bowers_ifft_opt},
@@ -110,20 +107,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         coeffs.resize(len, FieldElement::zero());
         // padding with zeros will make FFT return more evaluations of the same polynomial.
 
-        #[cfg(feature = "cuda")]
-        {
-            // TODO: support multiple fields with CUDA
-            if F::field_name() == "stark256" {
-                Ok(evaluate_fft_cuda(&coeffs)?)
-            } else {
-                evaluate_fft_cpu::<F, E>(&coeffs)
-            }
-        }
-
-        #[cfg(not(feature = "cuda"))]
-        {
-            evaluate_fft_cpu::<F, E>(&coeffs)
-        }
+        evaluate_fft_cpu::<F, E>(&coeffs)
     }
 
     /// Same as [`evaluate_fft`] but returns evaluations in **bit-reversed order**.
@@ -196,19 +180,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     where
         E: Send + Sync,
     {
-        #[cfg(feature = "cuda")]
-        {
-            if !F::field_name().is_empty() {
-                Ok(interpolate_fft_cuda(fft_evals)?)
-            } else {
-                interpolate_fft_cpu::<F, E>(fft_evals)
-            }
-        }
-
-        #[cfg(not(feature = "cuda"))]
-        {
-            interpolate_fft_cpu::<F, E>(fft_evals)
-        }
+        interpolate_fft_cpu::<F, E>(fft_evals)
     }
 
     /// Same as [`interpolate_fft`] but accepts pre-computed inverse twiddles.
@@ -758,7 +730,7 @@ where
 #[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::*;
-    use crate::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
+    use crate::field::goldilocks::GoldilocksField;
 
     type F = GoldilocksField;
     type FE = FieldElement<F>;

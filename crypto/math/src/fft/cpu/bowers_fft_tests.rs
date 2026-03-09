@@ -7,7 +7,7 @@ use crate::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
 use crate::fft::cpu::fft::in_place_nr_2radix_fft;
 use crate::fft::cpu::roots_of_unity::get_twiddles;
 use crate::field::element::FieldElement;
-use crate::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
+use crate::field::goldilocks::GoldilocksField;
 use crate::field::traits::{IsFFTField, RootsConfig};
 use alloc::vec;
 use alloc::vec::Vec;
