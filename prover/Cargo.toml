@@ -7,6 +7,7 @@ edition = "2024"
 default = ["parallel"]
 parallel = ["stark/parallel", "math/parallel", "crypto/parallel", "dep:rayon"]
 debug-checks = ["stark/debug-checks"]
+disk-spill = ["stark/disk-spill"]
 
 [dependencies]
 stark = { path = "../crypto/stark" }

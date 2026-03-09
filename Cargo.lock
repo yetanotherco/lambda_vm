@@ -864,12 +864,14 @@ dependencies = [
  "digest",
  "iai-callgrind",
  "math",
+ "memmap2",
  "rand 0.8.5",
  "rand_chacha 0.3.1",
  "rayon",
  "serde",
  "sha2",
  "sha3",
+ "tempfile",
 ]
 
 [[package]]
@@ -3727,6 +3729,7 @@ dependencies = [
  "itertools 0.11.0",
  "log",
  "math",
+ "memmap2",
  "num-integer",
  "proptest",
  "rand 0.8.5",
@@ -3737,6 +3740,7 @@ dependencies = [
  "serde_cbor",
  "serde_json",
  "sha3",
+ "tempfile",
  "test-log",
  "thiserror 1.0.69",
  "wasm-bindgen",
