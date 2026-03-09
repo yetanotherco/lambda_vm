@@ -305,9 +305,7 @@ where
             // The mmap is page-aligned and elements are contiguously packed at
             // multiples of main_elem_size, so alignment is satisfied.
             // The data was written from identical types on the same machine.
-            return unsafe {
-                &*(backing.main_mmap.as_ptr().add(offset) as *const FieldElement<F>)
-            };
+            return unsafe { &*(backing.main_mmap.as_ptr().add(offset) as *const FieldElement<F>) };
         }
         &self.main_columns[col][row]
     }
@@ -460,8 +458,9 @@ where
             for col in columns {
                 // SAFETY: FieldElement<F/E> is #[repr(transparent)] over BaseType,
                 // so the Vec has the same byte layout as a contiguous array.
-                let bytes: &[u8] =
-                    unsafe { std::slice::from_raw_parts(col.as_ptr() as *const u8, col.len() * elem_size) };
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(col.as_ptr() as *const u8, col.len() * elem_size)
+                };
                 writer.write_all(bytes)?;
             }
             writer.flush()?;

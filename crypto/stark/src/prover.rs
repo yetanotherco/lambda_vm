@@ -1537,17 +1537,15 @@ pub trait IsStarkProver<
                     );
 
                     // Spill Merkle tree nodes to disk
-                    tree.spill_nodes_to_disk()
-                        .map_err(|e| {
-                            ProvingError::WrongParameter(format!("disk-spill main tree: {e}"))
-                        })?;
+                    tree.spill_nodes_to_disk().map_err(|e| {
+                        ProvingError::WrongParameter(format!("disk-spill main tree: {e}"))
+                    })?;
                     if let Some(ref mut pt) = pre_tree {
-                        pt.spill_nodes_to_disk()
-                            .map_err(|e| {
-                                ProvingError::WrongParameter(format!(
-                                    "disk-spill precomputed tree: {e}"
-                                ))
-                            })?;
+                        pt.spill_nodes_to_disk().map_err(|e| {
+                            ProvingError::WrongParameter(format!(
+                                "disk-spill precomputed tree: {e}"
+                            ))
+                        })?;
                     }
                 }
                 if let Some(ref pre_r) = pre_root {
@@ -1677,18 +1675,14 @@ pub trait IsStarkProver<
                             spilled
                                 .add_aux_from_pool(&pool.aux, _num_aux_cols)
                                 .map_err(|e| {
-                                    ProvingError::WrongParameter(format!(
-                                        "disk-spill aux LDE: {e}"
-                                    ))
+                                    ProvingError::WrongParameter(format!("disk-spill aux LDE: {e}"))
                                 })?;
                         }
 
                         // Spill aux Merkle tree nodes to disk
                         if let Some(ref mut tree) = aux_tree {
                             tree.spill_nodes_to_disk().map_err(|e| {
-                                ProvingError::WrongParameter(format!(
-                                    "disk-spill aux tree: {e}"
-                                ))
+                                ProvingError::WrongParameter(format!("disk-spill aux tree: {e}"))
                             })?;
                         }
                     }
@@ -1794,17 +1788,19 @@ pub trait IsStarkProver<
                             num_precomputed_cols: metadata.num_precomputed_cols,
                         };
 
-                        let aux = metadata.aux_merkle_tree.as_ref().map(|tree| {
-                            Round1CommitmentData {
-                                lde_trace_merkle_tree: Arc::clone(tree),
-                                lde_trace_merkle_root: metadata
-                                    .aux_merkle_root
-                                    .expect("aux root must exist when aux tree exists"),
-                                precomputed_merkle_tree: None,
-                                precomputed_merkle_root: None,
-                                num_precomputed_cols: 0,
-                            }
-                        });
+                        let aux =
+                            metadata
+                                .aux_merkle_tree
+                                .as_ref()
+                                .map(|tree| Round1CommitmentData {
+                                    lde_trace_merkle_tree: Arc::clone(tree),
+                                    lde_trace_merkle_root: metadata
+                                        .aux_merkle_root
+                                        .expect("aux root must exist when aux tree exists"),
+                                    precomputed_merkle_tree: None,
+                                    precomputed_merkle_root: None,
+                                    num_precomputed_cols: 0,
+                                });
 
                         let round_1_result = Round1 {
                             lde_trace,
