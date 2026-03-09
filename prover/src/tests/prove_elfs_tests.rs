@@ -557,6 +557,75 @@ fn test_prove_elfs_all_instructions_64() {
     );
 }
 
+#[test]
+fn test_prove_elfs_test_commit_4() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+
+    // Verify public output matches the committed bytes [0xAA, 0xBB, 0xCC, 0xDD]
+    assert_eq!(
+        result.return_values.memory_values,
+        vec![0xAA, 0xBB, 0xCC, 0xDD],
+        "Public output should match committed bytes"
+    );
+
+    let mut traces = Traces::from_elf_and_logs(&elf, &result.logs, &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "test_commit_4 failed"
+    );
+}
+
+/// Verifier REJECTS when page configs don't match the proven commit trace.
+///
+/// The prover generates a valid proof for test_commit_4 (which writes to page 0).
+/// The verifier uses only ELF pages (no runtime pages) → page mismatch →
+/// verification must fail.
+#[test]
+fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+
+    let proof_options = ProofOptions::default_test_options();
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+    let mut traces = Traces::from_elf_and_logs(&elf, &result.logs, &Default::default()).unwrap();
+
+    // Prover uses correct page configs
+    let table_counts = traces.table_counts();
+    let prover_airs = crate::VmAirs::new(
+        &elf,
+        &proof_options,
+        true,
+        &traces.page_configs,
+        &table_counts,
+    );
+    let proof = Prover::multi_prove(
+        prover_airs.air_trace_pairs(&mut traces),
+        &mut DefaultTranscript::<E>::new(&[]),
+    )
+    .expect("Prover failed");
+
+    // Verifier uses EMPTY runtime pages → missing stack/public-output pages
+    let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[]);
+    let verifier_airs =
+        crate::VmAirs::new(&elf, &proof_options, true, &wrong_configs, &table_counts);
+
+    let verified = Verifier::multi_verify(
+        &verifier_airs.air_refs(),
+        &proof,
+        &mut DefaultTranscript::<E>::new(&[]),
+    );
+    assert!(
+        !verified,
+        "Verifier should REJECT when runtime pages are missing (commit public output page)"
+    );
+}
+
 /// Slow version using full bitwise table (2^20 rows) - production-safe
 ///
 /// This is the most comprehensive test covering all RV64IM instructions:
