@@ -1,11 +1,9 @@
 use crate::{
     errors::CreationError,
     field::{
-        element::FieldElement,
-        extensions::quadratic::QuadraticExtensionField,
+        errors::FieldError,
         traits::{IsFFTField, IsField, IsPrimeField},
     },
-    field::{errors::FieldError, extensions::quadratic::HasQuadraticNonResidue},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,13 +101,3 @@ impl IsFFTField for U64TestField {
     const TWO_ADICITY: u64 = 32;
     const TWO_ADIC_PRIMITVE_ROOT_OF_UNITY: u64 = 1753635133440165772;
 }
-
-#[derive(Clone, Debug)]
-pub struct TestNonResidue;
-impl HasQuadraticNonResidue<U64TestField> for TestNonResidue {
-    fn residue() -> FieldElement<U64TestField> {
-        FieldElement::from(7)
-    }
-}
-
-pub type U64TestFieldExtension = QuadraticExtensionField<U64TestField, TestNonResidue>;
