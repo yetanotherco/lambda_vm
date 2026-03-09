@@ -47,6 +47,7 @@ use super::memw::{self, MemwOperation};
 use super::mul::{self, MulOperation};
 use super::page::{self, FinalByteState, FinalStateMap, PageConfig};
 use super::register::{self, FinalRegisterStateMap, FinalRegisterWordState};
+use super::shift::{self, ShiftOperation};
 use super::types::{GoldilocksExtension, GoldilocksField};
 use crate::Error;
 
@@ -255,7 +256,8 @@ fn collect_cpu_ops(
 ///
 /// MEMW and LOAD collection requires sequential processing with state tracking.
 ///
-/// Returns: (memw_ops, load_ops, lt_ops, bitwise_ops)
+/// Returns: (memw_ops, load_ops, lt_ops, shift_ops, bitwise_ops)
+#[allow(clippy::type_complexity)]
 fn collect_ops_from_cpu(
     cpu_ops: &[CpuOperation],
     memory_state: &mut MemoryState,
@@ -264,11 +266,13 @@ fn collect_ops_from_cpu(
     Vec<MemwOperation>,
     Vec<LoadOperation>,
     Vec<LtOperation>,
+    Vec<ShiftOperation>,
     Vec<BitwiseOperation>,
 ) {
     let mut memw_ops = Vec::with_capacity(cpu_ops.len() * 3);
     let mut load_ops = Vec::with_capacity(cpu_ops.len() / 8 + 1);
     let mut lt_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
+    let mut shift_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
     let mut bitwise_ops = Vec::with_capacity(cpu_ops.len() * 4);
 
     for op in cpu_ops {
@@ -295,7 +299,7 @@ fn collect_ops_from_cpu(
             memw_ops.extend(commit_ops);
         }
 
-        // --- LT and Bitwise (no state tracking needed) ---
+        // --- LT, SHIFT, and Bitwise (no state tracking needed) ---
 
         // Collect LT operations from SLT/BLT instructions
         if op.decode.op_slt || op.decode.op_blt {
@@ -304,11 +308,27 @@ fn collect_ops_from_cpu(
             lt_ops.push(LtOperation::new(arg1, arg2, op.decode.signed));
         }
 
+        // Collect SHIFT operations
+        if op.decode.op_shift {
+            let input = op.compute_arg1();
+            let shift_amount = (op.compute_arg2() & 0xFF) as u8;
+            let direction = op.decode.mp_selector; // 0=left, 1=right
+            let signed = op.decode.signed;
+            let word_instr = op.decode.word_instr;
+            shift_ops.push(ShiftOperation::new(
+                input,
+                shift_amount,
+                direction,
+                signed,
+                word_instr,
+            ));
+        }
+
         // Collect bitwise lookups
         bitwise_ops.extend(op.collect_bitwise_ops());
     }
 
-    (memw_ops, load_ops, lt_ops, bitwise_ops)
+    (memw_ops, load_ops, lt_ops, shift_ops, bitwise_ops)
 }
 
 /// Collects a LOAD operation and corresponding MEMW read from CpuOperation.
@@ -1305,6 +1325,9 @@ pub struct Traces {
     /// LT comparison traces (split into chunks of max_rows::LT)
     pub lts: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 
+    /// SHIFT shift operation traces (split into chunks of max_rows::SHIFT)
+    pub shifts: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+
     /// MEMW memory/register read/write traces (split into chunks of max_rows::MEMW)
     pub memws: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 
@@ -1362,6 +1385,7 @@ impl Traces {
             load: self.loads.len(),
             mul: self.muls.len(),
             dvrm: self.dvrms.len(),
+            shift: self.shifts.len(),
             branch: self.branches.len(),
         }
     }
@@ -1511,7 +1535,7 @@ impl Traces {
         // Initialize memory state from ELF so first accesses get correct old_value.
         let mut memory_state = MemoryState::from_elf(elf);
         let mut register_state = RegisterState::new();
-        let (memw_ops, load_ops, mut lt_ops, mut bitwise_ops) =
+        let (memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops) =
             collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
 
         // Collect BRANCH operations from CPU ops where branch_cond = true
@@ -1589,6 +1613,7 @@ impl Traces {
         bitwise_ops.extend(collect_bitwise_from_mul(&mul_ops));
         bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops));
         bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
+        bitwise_ops.extend(shift::collect_bitwise_from_shift(&shift_ops));
         // PAGE tables do IS_BYTE lookups for init and fini values (C1, C2)
         bitwise_ops.extend(collect_bitwise_from_page(elf, &memory_state));
 
@@ -1613,6 +1638,7 @@ impl Traces {
         let memws = chunk_and_generate(&memw_ops, max_rows.memw, memw::generate_memw_trace);
         let loads = chunk_and_generate(&load_ops, max_rows.load, load::generate_load_trace);
         let lts = chunk_and_generate(&lt_ops, max_rows.lt, lt::generate_lt_trace);
+        let shifts = chunk_and_generate(&shift_ops, max_rows.shift, shift::generate_shift_trace);
         let muls = chunk_and_generate(&mul_ops, max_rows.mul, mul::generate_mul_trace);
         let dvrms = chunk_and_generate(&dvrm_ops, max_rows.dvrm, dvrm::generate_dvrm_trace);
         let branches =
@@ -1672,6 +1698,7 @@ impl Traces {
             cpus,
             bitwise,
             lts,
+            shifts,
             memws,
             loads,
             decode,
@@ -1708,7 +1735,7 @@ impl Traces {
         // Processes cpu_ops in order. MEMW/LOAD need state tracking, LT/Bitwise don't.
         let mut memory_state = MemoryState::new();
         let mut register_state = RegisterState::new();
-        let (memw_ops, load_ops, mut lt_ops, mut bitwise_ops) =
+        let (memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops) =
             collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
 
         // Collect MUL operations from CPU ops where op_mul = true
@@ -1786,6 +1813,7 @@ impl Traces {
         bitwise_ops.extend(collect_bitwise_from_mul(&mul_ops));
         bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops));
         bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
+        bitwise_ops.extend(shift::collect_bitwise_from_shift(&shift_ops));
 
         // Expand COMMIT ECALL operations into per-byte rows
         let commit_ops = expand_commit_operations(&cpu_ops, &memory_state);
@@ -1808,6 +1836,7 @@ impl Traces {
         let memws = chunk_and_generate(&memw_ops, max_rows.memw, memw::generate_memw_trace);
         let loads = chunk_and_generate(&load_ops, max_rows.load, load::generate_load_trace);
         let lts = chunk_and_generate(&lt_ops, max_rows.lt, lt::generate_lt_trace);
+        let shifts = chunk_and_generate(&shift_ops, max_rows.shift, shift::generate_shift_trace);
         let muls = chunk_and_generate(&mul_ops, max_rows.mul, mul::generate_mul_trace);
         let dvrms = chunk_and_generate(&dvrm_ops, max_rows.dvrm, dvrm::generate_dvrm_trace);
         let branches =
@@ -1859,6 +1888,7 @@ impl Traces {
             cpus,
             bitwise,
             lts,
+            shifts,
             memws,
             loads,
             decode,

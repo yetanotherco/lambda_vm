@@ -55,6 +55,9 @@ use crate::tables::page::{bus_interactions as page_bus_interactions, cols as pag
 use crate::tables::register::{
     bus_interactions as register_bus_interactions, cols as register_cols,
 };
+use crate::tables::shift::{
+    bus_interactions as shift_bus_interactions, cols as shift_cols, shift_constraints,
+};
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
 pub type F = GoldilocksField;
@@ -527,6 +530,26 @@ pub fn create_lt_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("LT")
+}
+
+/// Create SHIFT AIR with constraints and bus interactions.
+pub fn create_shift_air(proof_options: &ProofOptions) -> VmAir {
+    let (constraints, _) = shift_constraints(0);
+    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> =
+        constraints.into_iter().map(|c| Box::new(c) as _).collect();
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: shift_bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        shift_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+    .with_name("SHIFT")
 }
 
 /// Create MEMW AIR with constraints and bus interactions.

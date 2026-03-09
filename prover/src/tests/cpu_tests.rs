@@ -325,6 +325,7 @@ fn test_bus_interactions_count() {
     // - 1 DECODE (instruction fetch)
     // - 1 MUL (multiplication)
     // - 1 DVRM (division/remainder)
+    // - 1 SHIFT (shift operations)
     // - 1 BRANCH (branch/jump target calculation)
     // - 1 ECALL → HALT (send to HALT table, mult = ECALL - ECALL_COMMIT)
     // - 1 ECALL → COMMIT (send to COMMIT table, mult = ECALL_COMMIT)
