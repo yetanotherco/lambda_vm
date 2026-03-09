@@ -300,9 +300,12 @@ where
     pub fn get_main(&self, row: usize, col: usize) -> &FieldElement<F> {
         #[cfg(feature = "disk-spill")]
         if let Some(ref backing) = self.mmap_backing {
-            debug_assert!(row < backing.num_rows && col < backing.num_main_cols,
+            debug_assert!(
+                row < backing.num_rows && col < backing.num_main_cols,
                 "get_main out of bounds: row={row}, col={col}, num_rows={}, num_main_cols={}",
-                backing.num_rows, backing.num_main_cols);
+                backing.num_rows,
+                backing.num_main_cols
+            );
             let offset = (col * backing.num_rows + row) * backing.main_elem_size;
             // SAFETY: FieldElement<F> is #[repr(transparent)] over F::BaseType.
             // The mmap is page-aligned and elements are contiguously packed at
@@ -318,9 +321,12 @@ where
     pub fn get_aux(&self, row: usize, col: usize) -> &FieldElement<E> {
         #[cfg(feature = "disk-spill")]
         if let Some(ref backing) = self.mmap_backing {
-            debug_assert!(row < backing.num_rows && col < backing.num_aux_cols,
+            debug_assert!(
+                row < backing.num_rows && col < backing.num_aux_cols,
                 "get_aux out of bounds: row={row}, col={col}, num_rows={}, num_aux_cols={}",
-                backing.num_rows, backing.num_aux_cols);
+                backing.num_rows,
+                backing.num_aux_cols
+            );
             let aux_mmap = backing
                 .aux_mmap
                 .as_ref()
@@ -460,8 +466,10 @@ where
 
         let num_cols = columns.len();
         let num_rows = if num_cols > 0 { columns[0].len() } else { 0 };
-        debug_assert!(columns.iter().all(|c| c.len() == num_rows),
-            "all columns must have the same length");
+        debug_assert!(
+            columns.iter().all(|c| c.len() == num_rows),
+            "all columns must have the same length"
+        );
         let total_bytes = (num_cols * num_rows * elem_size) as u64;
 
         let file = tempfile::tempfile()?;
