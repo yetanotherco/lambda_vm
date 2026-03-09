@@ -25,6 +25,7 @@ use stark::trace::TraceTable;
 use stark::traits::TransitionEvaluationContext;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16};
+use crate::impl_base_field_evaluate_prover;
 
 // =========================================================================
 // Column indices
@@ -773,6 +774,8 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ShiftConstra
             }
         }
     }
+
+    impl_base_field_evaluate_prover!();
 }
 
 /// Number of polynomial constraints in the SHIFT table.
