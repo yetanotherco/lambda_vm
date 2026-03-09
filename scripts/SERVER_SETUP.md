@@ -86,7 +86,7 @@ Go to **GitHub repo > Settings > Actions > Runners > New self-hosted runner**, s
 Add the environment file so the runner can find cargo and other tools:
 
 ```bash
-echo "PATH=/usr/bin:/usr/local/bin:/home/app/.cargo/bin" > ~/actions-runner/.env
+echo "PATH=/bin:/usr/bin:/usr/local/bin:/home/app/.cargo/bin" > ~/actions-runner/.env
 ```
 
 Start the runner inside a tmux session so it persists after disconnecting:
