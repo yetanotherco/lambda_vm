@@ -36,7 +36,7 @@ use crate::tables::trace_builder::Traces;
 use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_cpu_air, create_decode_air,
     create_dvrm_air, create_halt_air, create_load_air, create_lt_air, create_memw_air,
-    create_mul_air, create_page_air, create_register_air,
+    create_mul_air, create_page_air, create_register_air, create_shift_air,
 };
 
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
@@ -64,6 +64,7 @@ pub struct TableCounts {
     pub load: usize,
     pub mul: usize,
     pub dvrm: usize,
+    pub shift: usize,
     pub branch: usize,
 }
 
@@ -74,7 +75,7 @@ impl TableCounts {
     /// allowing a malicious prover to bypass soundness checks.
     /// Sum of all chunk counts across split tables.
     pub fn total(&self) -> usize {
-        self.cpu + self.lt + self.memw + self.load + self.mul + self.dvrm + self.branch
+        self.cpu + self.lt + self.memw + self.load + self.mul + self.dvrm + self.shift + self.branch
     }
 
     /// Validate that all required tables have at least one chunk.
@@ -89,6 +90,7 @@ impl TableCounts {
             ("load", self.load),
             ("mul", self.mul),
             ("dvrm", self.dvrm),
+            ("shift", self.shift),
             ("branch", self.branch),
         ];
         for (name, count) in checks {
@@ -163,6 +165,7 @@ pub(crate) struct VmAirs {
     pub cpus: Vec<VmAir>,
     pub bitwise: VmAir,
     pub lts: Vec<VmAir>,
+    pub shifts: Vec<VmAir>,
     pub memws: Vec<VmAir>,
     pub loads: Vec<VmAir>,
     pub decode: VmAir,
@@ -188,6 +191,9 @@ impl VmAirs {
             pairs.push((air, trace, &()));
         }
         for (air, trace) in self.lts.iter().zip(traces.lts.iter_mut()) {
+            pairs.push((air, trace, &()));
+        }
+        for (air, trace) in self.shifts.iter().zip(traces.shifts.iter_mut()) {
             pairs.push((air, trace, &()));
         }
         for (air, trace) in self.memws.iter().zip(traces.memws.iter_mut()) {
@@ -221,6 +227,9 @@ impl VmAirs {
             refs.push(air);
         }
         for air in &self.lts {
+            refs.push(air);
+        }
+        for air in &self.shifts {
             refs.push(air);
         }
         for air in &self.memws {
@@ -272,6 +281,9 @@ impl VmAirs {
         let lts: Vec<_> = (0..table_counts.lt)
             .map(|i| create_lt_air(proof_options).with_name(&format!("LT[{}]", i)))
             .collect();
+        let shifts: Vec<_> = (0..table_counts.shift)
+            .map(|i| create_shift_air(proof_options).with_name(&format!("SHIFT[{}]", i)))
+            .collect();
         let memws: Vec<_> = (0..table_counts.memw)
             .map(|i| create_memw_air(proof_options).with_name(&format!("MEMW[{}]", i)))
             .collect();
@@ -314,6 +326,7 @@ impl VmAirs {
             cpus,
             bitwise,
             lts,
+            shifts,
             memws,
             loads,
             decode,
