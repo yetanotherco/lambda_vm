@@ -7,10 +7,7 @@ use crate::{
     traits::AIR,
 };
 use math::{
-    field::{
-        element::FieldElement, fields::fft_friendly::u64_goldilocks::GoldilocksField,
-        traits::IsFFTField,
-    },
+    field::{element::FieldElement, goldilocks::GoldilocksField, traits::IsFFTField},
     polynomial::Polynomial,
 };
 

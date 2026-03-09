@@ -2,8 +2,8 @@
 // It can run using `samply record cargo bench --bench profile_prover --features parallel`.
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
-use math::field::fields::fft_friendly::extensions_goldilocks::Degree3GoldilocksExtensionField;
-use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
+use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
+use math::field::goldilocks::GoldilocksField;
 use stark::examples::fibonacci_multi_column::{
     FibonacciMultiColumnAIR, compute_trace, create_public_inputs,
 };
