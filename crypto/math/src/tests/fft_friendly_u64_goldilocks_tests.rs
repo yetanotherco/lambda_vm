@@ -1,5 +1,5 @@
 use crate::field::element::FieldElement;
-use crate::field::fields::fft_friendly::u64_goldilocks::{
+use crate::field::goldilocks::{
     GOLDILOCKS_PRIME, GoldilocksElement, GoldilocksField, inv_addition_chain,
 };
 use crate::field::traits::{IsFFTField, IsField, IsPrimeField};

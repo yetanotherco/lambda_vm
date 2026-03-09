@@ -1,7 +1,4 @@
-use math::field::{
-    element::FieldElement, fields::fft_friendly::u64_goldilocks::GoldilocksField,
-    traits::IsFFTField,
-};
+use math::field::{element::FieldElement, goldilocks::GoldilocksField, traits::IsFFTField};
 use math::polynomial::Polynomial;
 
 use crate::constraints::boundary::{BoundaryConstraint, BoundaryConstraints};
