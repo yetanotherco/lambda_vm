@@ -2,14 +2,14 @@
 	.globl	main
 main:
 	# Iterative Fibonacci - pure register arithmetic
-	# ~1000k steps
+	# ~500k steps
 	#
 	# Loop body: 5 instructions per iteration
-	# 199999 iterations × 5 = 999995 + 4 setup/teardown = 999999
+	# 99999 iterations × 5 = 499995 + 4 setup/teardown = 499999
 
 	li	t0, 0			# a = fib(0) = 0
 	li	t1, 1			# b = fib(1) = 1
-	li	a0, 199999		# iteration count
+	li	a0, 99999		# iteration count
 
 .loop:
 	add	t2, t0, t1		# t2 = a + b
