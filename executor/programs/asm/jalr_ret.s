@@ -4,6 +4,7 @@
 main:
 	jal     a2, 4
 	jalr    a0, 4(a2)
+	li	a0, 0
 	jalr	zero, 0(ra)
 	addi    a0, zero, 1
 	li	a0, 0

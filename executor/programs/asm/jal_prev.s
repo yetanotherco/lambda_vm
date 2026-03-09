@@ -1,7 +1,7 @@
 	.attribute	5, "rv64i2p1_m2p0_zmmul1p0"
 .Lfunc_end0:
 	.globl	main
-	addi    a0, zero, 2
+	li	a0, 0
 	jalr	zero, 0(ra)
 main:
 	jal     zero, -8

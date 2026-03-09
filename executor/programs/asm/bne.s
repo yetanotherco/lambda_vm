@@ -5,7 +5,8 @@ main:
 	addi    a2,zero,1
 	addi    a3,zero,1
 	addi    a0,zero,2
-	bne     a2, a3, 8
+	bne     a2, a3, 12
+	li	a0, 0
 	jalr	zero, 0(ra)
 	addi    a0, zero, 1
 	li	a0, 0
