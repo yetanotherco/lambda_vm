@@ -480,11 +480,11 @@ impl CpuOperation {
         }
     }
 
-    /// Collects IS_BYTE_PAIR and IS_BYTE lookups for CPU byte range checks.
+    /// Collects IS_BYTE lookups for CPU byte range checks.
     ///
     /// The CPU has 27 byte columns that must be range-checked: RS1, RS2, RD,
-    /// ARG1[0..7], ARG2[0..7], RES[0..7]. Using IS_BYTE_PAIR, we check two
-    /// bytes simultaneously, yielding 13 pairs + 1 single IS_BYTE = 14 interactions.
+    /// ARG1[0..7], ARG2[0..7], RES[0..7]. Using IS_BYTE with two elements,
+    /// we check two bytes simultaneously, yielding 13 pairs + 1 single = 14 interactions.
     pub fn collect_byte_check_ops(&self) -> Vec<super::bitwise::BitwiseOperation> {
         use super::bitwise::{BitwiseOperation, BitwiseOperationType};
 
@@ -501,7 +501,7 @@ impl CpuOperation {
         let arg2_bytes: [u8; 8] = std::array::from_fn(|i| ((arg2 >> (i * 8)) & 0xFF) as u8);
         let res_bytes: [u8; 8] = std::array::from_fn(|i| ((res >> (i * 8)) & 0xFF) as u8);
 
-        // 13 IS_BYTE_PAIR interactions (check two bytes each)
+        // 13 IS_BYTE interactions with two elements (check two bytes each)
         let pairs: [(u8, u8); 13] = [
             (rs1, rs2),
             (rd, arg1_bytes[0]),
@@ -521,7 +521,7 @@ impl CpuOperation {
         let mut ops = Vec::with_capacity(14);
         for (a, b) in pairs {
             ops.push(BitwiseOperation::byte_op(
-                BitwiseOperationType::IsBytePair,
+                BitwiseOperationType::IsByte,
                 a,
                 b,
             ));
@@ -541,7 +541,7 @@ impl CpuOperation {
         use super::bitwise::{BitwiseOperation, BitwiseOperationType};
         let mut lookups = Vec::new();
 
-        // Byte range checks: 13 IS_BYTE_PAIR + 1 IS_BYTE
+        // Byte range checks: 14 IS_BYTE (13 pairs + 1 single)
         lookups.extend(self.collect_byte_check_ops());
 
         // MSB16 lookups for sign bit extraction (when word_instr=1)
@@ -1930,10 +1930,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // IS_BYTE_PAIR interactions (byte range checks, 13 pairs)
+    // IS_BYTE interactions (byte range checks, 13 pairs + 1 single)
     // -------------------------------------------------------------------------
-    // Check 26 of 27 byte columns in pairs. Every CPU row (including padding) sends.
-    // Pairing: (RS1,RS2), (RD,ARG1[0]), (ARG1[1],ARG1[2]), ..., (RES[5],RES[6])
+    // Check 27 byte columns. Every CPU row (including padding) sends.
+    // 13 pairs: (RS1,RS2), (RD,ARG1[0]), ..., (RES[5],RES[6])
+    // 1 single: (RES[7], 0)
     let byte_pairs: [(usize, usize); 13] = [
         (cols::RS1, cols::RS2),
         (cols::RD, cols::ARG1[0]),
@@ -1951,7 +1952,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ];
     for (col_a, col_b) in byte_pairs {
         interactions.push(BusInteraction::sender(
-            BusId::IsBytePair,
+            BusId::IsByte,
             Multiplicity::One,
             vec![
                 BusValue::Packed {
@@ -1966,16 +1967,17 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
-    // -------------------------------------------------------------------------
-    // IS_BYTE interaction (remaining odd byte: RES[7])
-    // -------------------------------------------------------------------------
+    // Remaining odd byte: (RES[7], 0)
     interactions.push(BusInteraction::sender(
         BusId::IsByte,
         Multiplicity::One,
-        vec![BusValue::Packed {
-            start_column: cols::RES[7],
-            packing: Packing::Direct,
-        }],
+        vec![
+            BusValue::Packed {
+                start_column: cols::RES[7],
+                packing: Packing::Direct,
+            },
+            BusValue::constant(0),
+        ],
     ));
 
     // ECALL interaction (CPU → HALT)

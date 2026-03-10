@@ -985,13 +985,13 @@ fn collect_bitwise_from_branch(branch_ops: &[BranchOperation]) -> Vec<BitwiseOpe
     bitwise_ops
 }
 
-/// Generates IS_BYTE_PAIR and IS_BYTE ops for CPU padding rows.
+/// Generates IS_BYTE ops for CPU padding rows.
 ///
 /// CPU padding rows have all byte columns = 0 (RS1=0, RS2=0, RD=0, etc.).
 /// Since the CPU bus interactions use Multiplicity::One for byte checks,
 /// padding rows also send, so we need matching bitwise ops.
 ///
-/// Per padding row: 13 IsBytePair(0, 0) + 1 IsByte(0) = 14 ops.
+/// Per padding row: 13 IsByte(0, 0) pairs + 1 IsByte(0, 0) single = 14 ops.
 fn collect_byte_check_ops_for_padding(num_padding_rows: usize) -> Vec<BitwiseOperation> {
     if num_padding_rows == 0 {
         return Vec::new();
@@ -999,15 +999,15 @@ fn collect_byte_check_ops_for_padding(num_padding_rows: usize) -> Vec<BitwiseOpe
 
     let mut ops = Vec::with_capacity(num_padding_rows * 14);
     for _ in 0..num_padding_rows {
-        // 13 IS_BYTE_PAIR(0, 0) — one per pair
+        // 13 IS_BYTE(0, 0) — one per pair
         for _ in 0..13 {
             ops.push(BitwiseOperation::byte_op(
-                BitwiseOperationType::IsBytePair,
+                BitwiseOperationType::IsByte,
                 0,
                 0,
             ));
         }
-        // 1 IS_BYTE(0) — the odd remaining byte
+        // 1 IS_BYTE(0, 0) — the odd remaining byte
         ops.push(BitwiseOperation::single_byte(
             BitwiseOperationType::IsByte,
             0,
@@ -1472,7 +1472,7 @@ impl Traces {
         // PAGE tables do IS_BYTE lookups for init and fini values (C1, C2)
         bitwise_ops.extend(collect_bitwise_from_page(elf, &memory_state));
 
-        // CPU padding rows send IS_BYTE_PAIR and IS_BYTE with all-zero values.
+        // CPU padding rows send IS_BYTE with all-zero values.
         // Add corresponding ops so the bitwise table multiplicities balance.
         let num_padding_rows: usize = cpu_ops
             .chunks(max_rows.cpu)
@@ -1669,7 +1669,7 @@ impl Traces {
         bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
         bitwise_ops.extend(shift::collect_bitwise_from_shift(&shift_ops));
 
-        // CPU padding rows send IS_BYTE_PAIR and IS_BYTE with all-zero values.
+        // CPU padding rows send IS_BYTE with all-zero values.
         let num_padding_rows: usize = cpu_ops
             .chunks(max_rows.cpu)
             .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())

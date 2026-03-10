@@ -93,8 +93,8 @@ fn test_zero_check() {
 #[test]
 fn test_bus_interactions_count() {
     let interactions = bus_interactions();
-    // Should have 12 interactions (one for each lookup type, including IS_BYTE_PAIR)
-    assert_eq!(interactions.len(), 12);
+    // Should have 11 interactions (one for each lookup type)
+    assert_eq!(interactions.len(), 11);
 }
 
 #[test]
@@ -720,13 +720,13 @@ mod soundness_tests {
 }
 
 // =============================================================================
-// IS_BYTE_PAIR Soundness Tests
+// IS_BYTE Pair Soundness Tests
 // =============================================================================
 //
-// Tests that the IS_BYTE_PAIR bus interaction correctly enforces that both
+// Tests that the IS_BYTE bus interaction correctly enforces that both
 // values in a pair are valid bytes [0, 255].
 //
-// The IS_BYTE_PAIR bus checks two values simultaneously by looking them up
+// The IS_BYTE bus checks two values simultaneously by looking them up
 // as (X, Y) in the bitwise table. Since the bitwise table only contains
 // rows where X ∈ [0,255] and Y ∈ [0,255], any out-of-range value will
 // have no matching receiver row, causing the LogUp argument to fail.
@@ -752,7 +752,7 @@ mod byte_pair_tests {
     type F = GoldilocksField;
     type E = GoldilocksExtension;
 
-    // Sender table: sends IS_BYTE_PAIR(A, B) when FLAG=1
+    // Sender table: sends IS_BYTE(A, B) when FLAG=1
     mod sender_cols {
         pub const A: usize = 0;
         pub const B: usize = 1;
@@ -760,7 +760,7 @@ mod byte_pair_tests {
         pub const NUM_COLUMNS: usize = 3;
     }
 
-    // Receiver table: receives IS_BYTE_PAIR(X, Y) with multiplicity MU
+    // Receiver table: receives IS_BYTE(X, Y) with multiplicity MU
     mod receiver_cols {
         pub const X: usize = 0;
         pub const Y: usize = 1;
@@ -773,7 +773,7 @@ mod byte_pair_tests {
     ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![BusInteraction::sender(
-                BusId::IsBytePair,
+                BusId::IsByte,
                 Multiplicity::Column(sender_cols::FLAG),
                 vec![
                     BusValue::Packed {
@@ -803,7 +803,7 @@ mod byte_pair_tests {
     ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![BusInteraction::receiver(
-                BusId::IsBytePair,
+                BusId::IsByte,
                 Multiplicity::Column(receiver_cols::MU),
                 vec![
                     BusValue::Packed {
