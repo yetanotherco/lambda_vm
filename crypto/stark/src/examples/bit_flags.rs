@@ -5,7 +5,7 @@ use crate::{
     trace::TraceTable,
     traits::{AIR, TransitionEvaluationContext},
 };
-use math::field::{element::FieldElement, fields::fft_friendly::u64_goldilocks::GoldilocksField};
+use math::field::{element::FieldElement, goldilocks::GoldilocksField};
 
 type StarkField = GoldilocksField;
 type Felt = FieldElement<GoldilocksField>;

@@ -1,10 +1,10 @@
 /// Implementation of FieldElement, a generic element of a field.
 pub mod element;
 pub mod errors;
-/// Implementation of quadratic extensions of fields.
-pub mod extensions;
-/// Implementation of particular cases of fields.
-pub mod fields;
+/// Quadratic and cubic extensions of the Goldilocks field.
+pub mod extensions_goldilocks;
+/// Optimized Goldilocks field p = 2^64 - 2^32 + 1 (no Montgomery form)
+pub mod goldilocks;
 /// Field for test purposes.
 pub mod test_fields;
 /// Common behaviour for field elements.

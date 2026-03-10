@@ -17,8 +17,8 @@
 
 use executor::vm::instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth};
 use math::field::element::FieldElement;
-use math::field::fields::fft_friendly::extensions_goldilocks::Degree3GoldilocksExtensionField;
-use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField as GoldilocksBaseField;
+use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
+use math::field::goldilocks::GoldilocksField as GoldilocksBaseField;
 
 /// Base field type: Goldilocks prime field (p = 2^64 - 2^32 + 1)
 pub type GoldilocksField = GoldilocksBaseField;
