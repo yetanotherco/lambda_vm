@@ -686,21 +686,17 @@ impl DecodeEntry {
             }
 
             Instruction::EcallEbreak => {
-                // ECALL is handled specially: the executor Log returns src1_val=0, src2_val=0,
-                // dst_val=0 for Halt syscalls (regardless of actual register values).
-                // To avoid corrupting register state in the trace builder, we don't set
-                // read_register or write_register flags. The HALT table handles termination.
                 entry.op_ecall = true;
-                // Set register indices for reference, but don't mark them as read/written
                 entry.rs1 = 17; // a7 (syscall number)
+                entry.read_register1 = true; // M1 reads a7 → rv1 = syscall number
                 entry.rs2 = 10; // a0 (arg)
                 entry.rd = 10; // a0 (result)
-                // Note: read_register1, read_register2, write_register remain false
+                // read_register2, write_register remain false
             }
 
             Instruction::Fence => {
-                // FENCE is a memory barrier - in single-threaded, in-order execution it's a no-op
-                // No operation flags needed, just advance PC (handled by default)
+                // Per spec, FENCE is a no-op interpreted as ADDI x0, x0, 0.
+                entry.op_add = true;
             }
         }
 
