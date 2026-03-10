@@ -699,8 +699,7 @@ impl DecodeEntry {
             }
 
             Instruction::Fence => {
-                // FENCE is treated as ADDI x0, x0, 0 per spec: a harmless no-op that sets op_add=1
-                // so pad=0 and CM54 fires correctly for PC linkage.
+                // Per spec, FENCE is a no-op interpreted as ADDI x0, x0, 0.
                 entry.op_add = true;
             }
         }

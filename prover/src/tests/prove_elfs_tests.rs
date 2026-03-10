@@ -456,7 +456,8 @@ fn test_prove_elfs_sllw() {
     );
 }
 
-/// FENCE is treated as ADDI x0, x0, 0 — verifies CM54 PC linkage fires correctly.
+/// Proves and verifies a program containing a FENCE instruction.
+/// FENCE is mapped to a no-op ADDI x0, x0, 0.
 #[test]
 fn test_prove_elfs_fence() {
     let (elf, logs, instructions) = run_asm_elf("fence");
