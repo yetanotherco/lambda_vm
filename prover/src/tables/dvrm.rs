@@ -373,6 +373,25 @@ pub fn generate_dvrm_trace(
 // Bus Interactions
 // =========================================================================
 
+/// SIGN template: MSB16[x] → sign with multiplicity `signed`.
+/// Mirrors spec template `sign.toml`.
+fn sign_interactions(x_col: usize, signed_col: usize, sign_col: usize) -> Vec<BusInteraction> {
+    vec![BusInteraction::sender(
+        BusId::Msb16,
+        Multiplicity::Column(signed_col),
+        vec![
+            BusValue::Packed {
+                start_column: x_col,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: sign_col,
+                packing: Packing::Direct,
+            },
+        ],
+    )]
+}
+
 /// Creates all bus interactions for the DVRM table.
 ///
 /// The DVRM table:
@@ -461,60 +480,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     }
 
     // -------------------------------------------------------------------------
-    // DVRM-C16 (SIGN): MSB16[sign_n; n[3]] when signed=1
-    // Multiplicity: Column(SIGNED) = 0 or 1 per unique row.
-    // The trace builder deduplicates MSB16 lookups per unique op.
+    // SIGN templates: MSB16 sign extraction (spec DVRM-C16, C17, C18)
     // -------------------------------------------------------------------------
-    interactions.push(BusInteraction::sender(
-        BusId::Msb16,
-        Multiplicity::Column(cols::SIGNED),
-        vec![
-            BusValue::Packed {
-                start_column: cols::N_3,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::SIGN_N,
-                packing: Packing::Direct,
-            },
-        ],
-    ));
-
-    // -------------------------------------------------------------------------
-    // DVRM-C17 (SIGN): MSB16[sign_r; r[3]] when signed=1
-    // -------------------------------------------------------------------------
-    interactions.push(BusInteraction::sender(
-        BusId::Msb16,
-        Multiplicity::Column(cols::SIGNED),
-        vec![
-            BusValue::Packed {
-                start_column: cols::R_3,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::SIGN_R,
-                packing: Packing::Direct,
-            },
-        ],
-    ));
-
-    // -------------------------------------------------------------------------
-    // DVRM-C18 (SIGN): MSB16[sign_d; d[3]] when signed=1
-    // -------------------------------------------------------------------------
-    interactions.push(BusInteraction::sender(
-        BusId::Msb16,
-        Multiplicity::Column(cols::SIGNED),
-        vec![
-            BusValue::Packed {
-                start_column: cols::D_3,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::SIGN_D,
-                packing: Packing::Direct,
-            },
-        ],
-    ));
+    interactions.extend(sign_interactions(cols::N_3, cols::SIGNED, cols::SIGN_N));
+    interactions.extend(sign_interactions(cols::R_3, cols::SIGNED, cols::SIGN_R));
+    interactions.extend(sign_interactions(cols::D_3, cols::SIGNED, cols::SIGN_D));
 
     // -------------------------------------------------------------------------
     // DVRM-C2: LT[1-div_by_zero; abs_r, abs_d, 0]
