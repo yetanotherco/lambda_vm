@@ -488,6 +488,7 @@ impl CpuOperation {
     pub fn collect_byte_check_ops(&self) -> Vec<super::bitwise::BitwiseOperation> {
         use super::bitwise::{BitwiseOperation, BitwiseOperationType};
 
+        // Compute full 64-bit values for byte decomposition below
         let arg1 = self.compute_arg1();
         let arg2 = self.compute_arg2();
         let res = self.compute_res();
@@ -519,7 +520,11 @@ impl CpuOperation {
 
         let mut ops = Vec::with_capacity(14);
         for (a, b) in pairs {
-            ops.push(BitwiseOperation::byte_op(BitwiseOperationType::IsBytePair, a, b));
+            ops.push(BitwiseOperation::byte_op(
+                BitwiseOperationType::IsBytePair,
+                a,
+                b,
+            ));
         }
 
         // 1 IS_BYTE for the remaining odd byte
