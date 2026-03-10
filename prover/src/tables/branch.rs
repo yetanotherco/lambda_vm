@@ -414,9 +414,7 @@ impl BranchConstraint {
     ///
     /// next_pc_unmasked[0] = unmasked_low_byte + 2^8 * next_pc_low[1] + 2^16 * next_pc_high[0]
     /// next_pc_unmasked[1] = next_pc_high[1] + 2^16 * next_pc_high[2]
-    fn compute_next_pc_unmasked<F, E>(
-        step: &TableView<F, E>,
-    ) -> (FieldElement<F>, FieldElement<F>)
+    fn compute_next_pc_unmasked<F, E>(step: &TableView<F, E>) -> (FieldElement<F>, FieldElement<F>)
     where
         F: IsSubFieldOf<E>,
         E: IsField,
@@ -450,10 +448,7 @@ impl BranchConstraint {
     /// Compute carry_0 for a given base column pair.
     ///
     /// carry_0 = (base[0] + offset[0] - next_pc_unmasked[0]) / 2^32
-    fn compute_carry_0_for<F, E>(
-        base_col_0: usize,
-        step: &TableView<F, E>,
-    ) -> FieldElement<F>
+    fn compute_carry_0_for<F, E>(base_col_0: usize, step: &TableView<F, E>) -> FieldElement<F>
     where
         F: IsSubFieldOf<E>,
         E: IsField,
@@ -596,7 +591,7 @@ pub fn branch_constraints(constraint_idx_start: usize) -> (Vec<BranchConstraint>
 /// where offset is already sign-extended to 64 bits as DWordWL.
 ///
 /// Returns (carry_0, carry_1) where both should be 0 or 1.
-pub fn compute_carries(base: u64, offset: u64, _next_pc_unmasked: u64) -> (u64, u64) {
+pub fn compute_carries(base: u64, offset: u64) -> (u64, u64) {
     // Split into DWordWL format
     let base_lo = base & 0xFFFF_FFFF;
     let base_hi = base >> 32;
