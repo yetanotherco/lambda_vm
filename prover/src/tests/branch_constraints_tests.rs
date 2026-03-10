@@ -17,11 +17,10 @@ use stark::constraints::transition::TransitionConstraint;
 fn test_branch_constraint_degree() {
     let (constraints, _) = branch_constraints(0);
 
-    // Both carry IS_BIT constraints have degree 4
-    // (degree 2 for base computation due to JALR multiplication,
-    //  then degree 2 for IS_BIT X*(1-X), total degree 4)
+    // All 4 conditional carry IS_BIT constraints have degree 3:
+    // cond (degree 1) * carry (degree 1) * (1 - carry) (degree 1)
     for c in &constraints {
-        assert_eq!(c.degree(), 4);
+        assert_eq!(c.degree(), 3);
     }
 }
 
@@ -29,10 +28,12 @@ fn test_branch_constraint_degree() {
 fn test_branch_constraint_indices_unique() {
     let (constraints, next_idx) = branch_constraints(0);
 
-    assert_eq!(constraints.len(), 2);
+    assert_eq!(constraints.len(), 4);
     assert_eq!(constraints[0].constraint_idx(), 0);
     assert_eq!(constraints[1].constraint_idx(), 1);
-    assert_eq!(next_idx, 2);
+    assert_eq!(constraints[2].constraint_idx(), 2);
+    assert_eq!(constraints[3].constraint_idx(), 3);
+    assert_eq!(next_idx, 4);
 }
 
 #[test]
@@ -41,7 +42,9 @@ fn test_branch_constraint_indices_with_offset() {
 
     assert_eq!(constraints[0].constraint_idx(), 10);
     assert_eq!(constraints[1].constraint_idx(), 11);
-    assert_eq!(next_idx, 12);
+    assert_eq!(constraints[2].constraint_idx(), 12);
+    assert_eq!(constraints[3].constraint_idx(), 13);
+    assert_eq!(next_idx, 14);
 }
 
 // =========================================================================
@@ -54,9 +57,8 @@ fn test_carry_computation_simple_positive() {
     // next_pc = 0x1004
     let base: u64 = 0x1000;
     let offset: u64 = 4;
-    let next_pc_unmasked: u64 = 0x1004;
 
-    let (carry_0, carry_1) = compute_carries(base, offset, next_pc_unmasked);
+    let (carry_0, carry_1) = compute_carries(base, offset);
 
     // Small values, no carries expected
     assert_eq!(carry_0, 0);
@@ -69,9 +71,8 @@ fn test_carry_computation_with_carry_0() {
     // next_pc = 0x1_0000_0000
     let base: u64 = 0xFFFF_FFFF;
     let offset: u64 = 1;
-    let next_pc_unmasked: u64 = 0x1_0000_0000;
 
-    let (carry_0, carry_1) = compute_carries(base, offset, next_pc_unmasked);
+    let (carry_0, carry_1) = compute_carries(base, offset);
 
     // Overflow from low word to high word
     assert_eq!(carry_0, 1);
@@ -80,33 +81,30 @@ fn test_carry_computation_with_carry_0() {
 
 #[test]
 fn test_carry_computation_negative_offset() {
-    // pc = 0x1000, offset = -4 (sign-extended to 64-bit)
-    // next_pc = 0x0FFC (no carry since subtraction)
+    // pc = 0x1000, offset = -4 (sign-extended to 64-bit = 0xFFFF_FFFF_FFFF_FFFC)
+    // lo: 0x1000 + 0xFFFF_FFFC = 0x1_0000_0FFC → carry_0 = 1
+    // hi: 0 + 0xFFFF_FFFF + 1 = 0x1_0000_0000 → carry_1 = 1
     let base: u64 = 0x1000;
-    let offset: u64 = (-4i64) as u64; // 0xFFFF_FFFF_FFFF_FFFC
-    let op = BranchOperation::new(base, offset, 0, false);
-    let next_pc_unmasked = op.compute_next_pc_unmasked();
+    let offset: u64 = (-4i64) as u64;
 
-    let (carry_0, carry_1) = compute_carries(base, offset, next_pc_unmasked);
+    let (carry_0, carry_1) = compute_carries(base, offset);
 
-    // With negative offset (sign-extended), carries can be 0 or 1
-    assert!(carry_0 == 0 || carry_0 == 1);
-    assert!(carry_1 == 0 || carry_1 == 1);
+    assert_eq!(carry_0, 1);
+    assert_eq!(carry_1, 1);
 }
 
 #[test]
 fn test_carry_computation_large_negative_offset() {
-    // pc = 0x1000_0000_0000, offset = -0x1000 (large negative, sign-extended)
+    // pc = 0x1000_0000_0000, offset = -0x1000 (sign-extended = 0xFFFF_FFFF_FFFF_F000)
+    // lo: 0 + 0xFFFF_F000 = 0xFFFF_F000 → carry_0 = 0
+    // hi: 0x1000 + 0xFFFF_FFFF + 0 = 0x1_0000_0FFF → carry_1 = 1
     let base: u64 = 0x1000_0000_0000;
     let offset: u64 = (-0x1000i64) as u64;
-    let op = BranchOperation::new(base, offset, 0, false);
-    let next_pc_unmasked = op.compute_next_pc_unmasked();
 
-    let (carry_0, carry_1) = compute_carries(base, offset, next_pc_unmasked);
+    let (carry_0, carry_1) = compute_carries(base, offset);
 
-    // Carries should be valid bits
-    assert!(carry_0 == 0 || carry_0 == 1);
-    assert!(carry_1 == 0 || carry_1 == 1);
+    assert_eq!(carry_0, 0);
+    assert_eq!(carry_1, 1);
 }
 
 // =========================================================================
