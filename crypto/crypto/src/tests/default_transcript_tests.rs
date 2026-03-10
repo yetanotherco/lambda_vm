@@ -124,6 +124,10 @@ fn sample_u64_consecutive_calls_return_different_values() {
     let sample2 = transcript.sample_u64(1000);
     let sample3 = transcript.sample_u64(1000);
 
+    assert!(sample1 < 1000);
+    assert!(sample2 < 1000);
+    assert!(sample3 < 1000);
+
     assert_ne!(
         sample1, sample2,
         "consecutive sample_u64 calls should return different values"
@@ -132,6 +136,16 @@ fn sample_u64_consecutive_calls_return_different_values() {
         sample2, sample3,
         "consecutive sample_u64 calls should return different values"
     );
+}
+
+#[test]
+fn sample_u64_upper_bound_one_always_returns_zero() {
+    let mut transcript = DefaultTranscript::<Degree3GoldilocksExtensionField>::default();
+    transcript.append_bytes(&[0x01, 0x02, 0x03]);
+
+    for _ in 0..10 {
+        assert_eq!(transcript.sample_u64(1), 0);
+    }
 }
 
 #[test]

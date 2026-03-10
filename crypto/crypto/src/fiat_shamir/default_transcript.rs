@@ -82,10 +82,10 @@ where
 
     fn sample_u64(&mut self, upper_bound: u64) -> u64 {
         assert!(upper_bound > 0, "upper_bound must be greater than 0");
-        let zone = u64::MAX - (u64::MAX % upper_bound);
+        let threshold = upper_bound.wrapping_neg() % upper_bound;
         loop {
             let candidate = u64::from_be_bytes(self.sample()[..8].try_into().unwrap());
-            if candidate < zone {
+            if candidate >= threshold {
                 return candidate % upper_bound;
             }
         }
