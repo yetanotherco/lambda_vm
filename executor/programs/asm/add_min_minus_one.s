@@ -7,7 +7,8 @@ main:
 	srli	a0, a0, 1         # 0x7FFFFFFFFFFFFFFF = i64::MAX
 	addi	a0, a0, 1         # 0x8000000000000000 = i64::MIN
 	addi	a0, a0, -1        # overflow to i64::MAX
-	li	a7, 5
+	li	a0, 0
+	li	a7, 93
 	ecall
 .Lfunc_end1:
 	.size	main, .Lfunc_end1-main

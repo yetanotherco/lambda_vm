@@ -129,14 +129,20 @@ impl MemoryState {
 struct RegisterState {
     /// Register file: (value, last_write_timestamp)
     regs: [RegisterCell; 32],
+    /// PC register x255: (value, last_write_timestamp)
+    pc_register: RegisterCell,
 }
 
 impl RegisterState {
-    fn new() -> Self {
+    fn new(entry_point: u64) -> Self {
         let mut regs = [(0u64, 0u64); 32];
         // SP (x2) starts at STACK_TOP
         regs[2] = (page::STACK_TOP, 0);
-        Self { regs }
+        Self {
+            regs,
+            // PC register (x255) starts at entry_point, timestamp 0
+            pc_register: (entry_point, 0),
+        }
     }
 
     /// Read a register. Returns (value, last_write_timestamp).
@@ -152,6 +158,16 @@ impl RegisterState {
         }
     }
 
+    /// Read the PC register (x255). Returns (value, last_write_timestamp).
+    fn read_pc(&self) -> RegisterCell {
+        self.pc_register
+    }
+
+    /// Write the PC register (x255) with the given timestamp.
+    fn write_pc(&mut self, value: u64, timestamp: u64) {
+        self.pc_register = (value, timestamp);
+    }
+
     /// Generate the final register state map for the REGISTER table.
     ///
     /// Returns a map from register Word address to final (timestamp, value).
@@ -164,6 +180,29 @@ impl RegisterState {
             let base_addr = register::register_base_address(reg_idx);
 
             // Each register is stored as 2 Words (32-bit each) in little-endian order
+            let value_lo = (value & 0xFFFF_FFFF) as u32;
+            let value_hi = (value >> 32) as u32;
+
+            map.insert(
+                base_addr,
+                FinalRegisterWordState {
+                    timestamp,
+                    value: value_lo,
+                },
+            );
+            map.insert(
+                base_addr + 1,
+                FinalRegisterWordState {
+                    timestamp,
+                    value: value_hi,
+                },
+            );
+        }
+
+        // PC register (x255) at addresses 510, 511
+        {
+            let (value, timestamp) = self.pc_register;
+            let base_addr = register::register_base_address(255);
             let value_lo = (value & 0xFFFF_FFFF) as u32;
             let value_hi = (value >> 32) as u32;
 
@@ -432,7 +471,7 @@ fn collect_register_ops_from_cpu(
     op: &CpuOperation,
     register_state: &mut RegisterState,
 ) -> Vec<MemwOperation> {
-    let mut memw_ops = Vec::with_capacity(3);
+    let mut memw_ops = Vec::with_capacity(4);
     let d = &op.decode;
 
     // M1: Read rs1 register at timestamp+0
@@ -479,7 +518,83 @@ fn collect_register_ops_from_cpu(
         register_state.write(d.rd, op.rvd, op.timestamp + 2);
     }
 
+    // CM54: PC register read-write at timestamp+1
+    // Every non-padding CPU row sends a MEMW for x255 (address 510).
+    // old = pc (current), value = next_pc (new).
+    {
+        let pc_value = pack_register_value(op.decode.pc);
+        let next_pc_value = pack_register_value(op.next_pc);
+        let (_old_val, old_ts) = register_state.read_pc();
+        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
+
+        let memw_op = MemwOperation::new(true, 510, next_pc_value, op.timestamp + 1, 2, true)
+            .with_old(pc_value, old_timestamps);
+        memw_ops.push(memw_op);
+        register_state.write_pc(op.next_pc, op.timestamp + 1);
+    }
+
     memw_ops
+}
+
+/// Collects HALT finalization MEMW operations for all 33 registers.
+///
+/// Per spec (halt.toml): at timestamp 2^64-1, HALT finalizes every register:
+/// - x1-x9, x11-x31: write 0 (zeroize)
+/// - x10: read (verify exit code = 0; if x10 ≠ 0, proof fails via bus mismatch)
+/// - x255 (PC): write 1 (halted sentinel)
+///
+/// Also updates `register_state` so `to_final_state_map()` reflects the finalized values.
+fn collect_halt_ops(register_state: &mut RegisterState) -> Vec<MemwOperation> {
+    let mut ops = Vec::with_capacity(32);
+    let ts = u64::MAX;
+
+    // x1-x9: write 0
+    for i in 1..=9u8 {
+        let (old_val, old_ts) = register_state.read(i);
+        let old_value = pack_register_value(old_val);
+        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
+        let memw_op = MemwOperation::new(true, 2 * i as u64, [0; 8], ts, 2, false)
+            .with_old(old_value, old_timestamps);
+        ops.push(memw_op);
+        register_state.write(i, 0, ts);
+    }
+
+    // x10: read with old=0 at ts=2^64-1 (enforce exit_code=0)
+    // Per spec halt:c:read_zero_exit_code: old=0 enforces x10 was 0 at halt.
+    // Non-zero exit code → bus imbalance → proof failure.
+    {
+        let (old_val, old_ts) = register_state.read(10);
+        let old_value = pack_register_value(old_val);
+        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
+        let memw_op =
+            MemwOperation::new(true, 20, [0; 8], ts, 2, true).with_old(old_value, old_timestamps);
+        ops.push(memw_op);
+        register_state.write(10, 0, ts);
+    }
+
+    // x11-x31: write 0
+    for i in 11..=31u8 {
+        let (old_val, old_ts) = register_state.read(i);
+        let old_value = pack_register_value(old_val);
+        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
+        let memw_op = MemwOperation::new(true, 2 * i as u64, [0; 8], ts, 2, false)
+            .with_old(old_value, old_timestamps);
+        ops.push(memw_op);
+        register_state.write(i, 0, ts);
+    }
+
+    // x255 (PC): write 1
+    {
+        let (old_val, old_ts) = register_state.read_pc();
+        let old_value = pack_register_value(old_val);
+        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
+        let memw_op = MemwOperation::new(true, 510, pack_register_value(1), ts, 2, false)
+            .with_old(old_value, old_timestamps);
+        ops.push(memw_op);
+        register_state.write_pc(1, ts);
+    }
+
+    ops
 }
 
 // =============================================================================
@@ -1338,9 +1453,14 @@ impl Traces {
         // Processes cpu_ops in order. MEMW/LOAD need state tracking, LT/Bitwise don't.
         // Initialize memory state from ELF so first accesses get correct old_value.
         let mut memory_state = MemoryState::from_elf(elf);
-        let mut register_state = RegisterState::new();
-        let (memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops) =
+        let mut register_state = RegisterState::new(elf.entry_point);
+        let (mut memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops) =
             collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
+
+        // HALT finalization: 33 register MEMW operations at timestamp u64::MAX.
+        // Must come before Phase 3 (LT from MEMW) so HALT ops get timestamp checks.
+        let halt_memw_ops = collect_halt_ops(&mut register_state);
+        memw_ops.extend(halt_memw_ops);
 
         // Collect BRANCH operations from CPU ops where branch_cond = true
         let branch_ops: Vec<BranchOperation> = cpu_ops
@@ -1480,7 +1600,12 @@ impl Traces {
                 || {
                     rayon::join(
                         || generate_page_tables(elf, &memory_state),
-                        || register::generate_register_trace(&register_final_state),
+                        || {
+                            register::generate_register_trace(
+                                &register_final_state,
+                                elf.entry_point,
+                            )
+                        },
                     )
                 },
                 || halt::generate_halt_trace(halt_timestamp),
@@ -1496,7 +1621,8 @@ impl Traces {
             let (pages_v, page_configs_v) = generate_page_tables(elf, &memory_state);
             pages = pages_v;
             page_configs = page_configs_v;
-            register_trace = register::generate_register_trace(&register_final_state);
+            register_trace =
+                register::generate_register_trace(&register_final_state, elf.entry_point);
             halt_trace = halt::generate_halt_trace(halt_timestamp);
         }
 
@@ -1539,9 +1665,16 @@ impl Traces {
         // =====================================================================
         // Processes cpu_ops in order. MEMW/LOAD need state tracking, LT/Bitwise don't.
         let mut memory_state = MemoryState::new();
-        let mut register_state = RegisterState::new();
-        let (memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops) =
+        // Entry point = first instruction's PC (start of execution)
+        let entry_point = cpu_ops.first().map_or(0, |op| op.decode.pc);
+        let mut register_state = RegisterState::new(entry_point);
+        let (mut memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops) =
             collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
+
+        // HALT finalization: 33 register MEMW operations at timestamp u64::MAX.
+        // Must come before Phase 3 (LT from MEMW) so HALT ops get timestamp checks.
+        let halt_memw_ops = collect_halt_ops(&mut register_state);
+        memw_ops.extend(halt_memw_ops);
 
         // Collect MUL operations from CPU ops where op_mul = true
         let mut mul_ops: Vec<(MulOperation, bool)> = cpu_ops
@@ -1672,7 +1805,7 @@ impl Traces {
         #[cfg(feature = "parallel")]
         {
             let (register_val, halt_val) = rayon::join(
-                || register::generate_register_trace(&register_final_state),
+                || register::generate_register_trace(&register_final_state, entry_point),
                 || halt::generate_halt_trace(halt_timestamp),
             );
             register_trace = register_val;
@@ -1680,7 +1813,7 @@ impl Traces {
         }
         #[cfg(not(feature = "parallel"))]
         {
-            register_trace = register::generate_register_trace(&register_final_state);
+            register_trace = register::generate_register_trace(&register_final_state, entry_point);
             halt_trace = halt::generate_halt_trace(halt_timestamp);
         }
 

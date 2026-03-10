@@ -19,7 +19,6 @@
 //! | timestamp | DWordWL | Final timestamp (0 if never accessed) |
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
 
 use math::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
 use math::polynomial::Polynomial;
@@ -36,19 +35,20 @@ use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 // Constants
 // =========================================================================
 
-/// Number of general-purpose registers (x0-x31).
-pub const NUM_REGISTERS: usize = 32;
+/// Number of registers: x0-x31 (32 GPRs) + x255 (PC register) = 33.
+pub const NUM_REGISTERS: usize = 33;
 
 /// Words per register access (registers are 64-bit = 2 Words of 32 bits each).
 /// Per spec: registers use write2=1 meaning 2 addresses accessed.
 pub const WORDS_PER_REGISTER: usize = 2;
 
 /// Total number of register Word addresses.
-/// Each register uses 2 Word addresses in the Memory bus.
+/// x0-x31 use addresses 0..63, x255 uses addresses 510..511.
 pub const NUM_REGISTER_ADDRESSES: usize = NUM_REGISTERS * WORDS_PER_REGISTER;
 
 /// Number of preprocessed columns (OFFSET, INIT).
-/// OFFSET is 0..63 and INIT is 0 except SP (x2) words which hold STACK_TOP.
+/// OFFSET encodes the Word address, INIT holds the initial value.
+/// Program-dependent: x255 init = ELF entry point.
 pub const NUM_PREPROCESSED_COLS: usize = 2;
 
 // =========================================================================
@@ -95,42 +95,66 @@ pub type FinalRegisterStateMap = HashMap<u64, FinalRegisterWordState>;
 // Trace generation
 // =========================================================================
 
+/// Returns the Word addresses for all register table rows.
+///
+/// x0-x31 use addresses 0..63, x255 uses addresses 510..511.
+/// Total: 66 addresses (33 registers × 2 Words).
+fn register_word_address_list() -> [u64; NUM_REGISTER_ADDRESSES] {
+    let mut addrs = [0u64; NUM_REGISTER_ADDRESSES];
+    // x0-x31: addresses 0..63
+    for (i, addr) in addrs.iter_mut().enumerate().take(64) {
+        *addr = i as u64;
+    }
+    // x255: addresses 510, 511
+    addrs[64] = 510;
+    addrs[65] = 511;
+    addrs
+}
+
+/// Compute the initial value for a register Word address.
+///
+/// - SP (x2) words at offset 4,5 hold STACK_TOP
+/// - PC (x255) words at offset 510,511 hold entry_point
+/// - All others are 0
+fn init_value_for_address(word_addr: u64, entry_point: u64) -> u32 {
+    match word_addr {
+        4 => (STACK_TOP & 0xFFFF_FFFF) as u32,
+        5 => (STACK_TOP >> 32) as u32,
+        510 => (entry_point & 0xFFFF_FFFF) as u32,
+        511 => (entry_point >> 32) as u32,
+        _ => 0,
+    }
+}
+
 /// Generates the REGISTER trace table.
 ///
-/// Creates a table with NUM_REGISTER_ADDRESSES rows (32 regs × 2 Words = 64).
+/// Creates a table with NUM_REGISTER_ADDRESSES rows (33 regs × 2 Words = 66).
 /// Each row represents one Word address in register space.
+/// x0-x31 at addresses 0..63, x255 (PC) at addresses 510..511.
 ///
 /// ## Arguments
 ///
 /// * `final_state` - Map from register Word address to final (timestamp, value)
+/// * `entry_point` - ELF entry point (initial PC value for x255)
 ///
 /// ## Returns
 ///
 /// The trace table for registers.
 pub fn generate_register_trace(
     final_state: &FinalRegisterStateMap,
+    entry_point: u64,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let num_rows = NUM_REGISTER_ADDRESSES.next_power_of_two();
     let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+    let addr_list = register_word_address_list();
 
-    for offset in 0..NUM_REGISTER_ADDRESSES {
-        let word_addr = offset as u64;
-        let base = offset * cols::NUM_COLUMNS;
+    for (row, &word_addr) in addr_list.iter().enumerate().take(NUM_REGISTER_ADDRESSES) {
+        let base = row * cols::NUM_COLUMNS;
 
-        // Offset (row index = Word address in register space)
-        data[base + cols::OFFSET] = FE::from(offset as u64);
+        // Offset = actual Word address in register space
+        data[base + cols::OFFSET] = FE::from(word_addr);
 
-        // Initial value: all registers start at 0, except SP (x2) which starts at STACK_TOP
-        // Register x2 (SP) uses Word addresses 4 (lo) and 5 (hi)
-        let init_value = if offset == 4 {
-            // SP low word: STACK_TOP & 0xFFFFFFFF
-            (STACK_TOP & 0xFFFF_FFFF) as u32
-        } else if offset == 5 {
-            // SP high word: STACK_TOP >> 32
-            (STACK_TOP >> 32) as u32
-        } else {
-            0u32
-        };
+        let init_value = init_value_for_address(word_addr, entry_point);
         data[base + cols::INIT] = FE::from(init_value as u64);
 
         // Final state: if accessed use final, otherwise use initial
@@ -147,7 +171,7 @@ pub fn generate_register_trace(
     }
 
     // Padding rows (if num_rows > NUM_REGISTER_ADDRESSES)
-    // Already zero-initialized, which is correct (init=fini=0, ts=0)
+    // Zero-initialized: offset=0, init=fini=0, ts=0 — self-cancelling on bus.
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
 }
@@ -156,42 +180,22 @@ pub fn generate_register_trace(
 // Preprocessed commitment
 // =========================================================================
 
-/// Cached commitment for the REGISTER preprocessed columns.
-///
-/// INVARIANT: All callers within a process must use identical `ProofOptions`.
-/// The cache is keyed only by table content, not by options.
-static REGISTER_COMMITMENT: OnceLock<Commitment> = OnceLock::new();
-
 /// Computes the Merkle root commitment over the LDE of REGISTER precomputed columns.
 ///
-/// The REGISTER table is program-independent: OFFSET=0..63, INIT=0 except
-/// SP (x2) words at offset 4 and 5 which hold STACK_TOP.
-pub fn compute_precomputed_commitment(options: &ProofOptions) -> Commitment {
+/// Program-dependent: x255 (PC) init = entry_point.
+/// OFFSET encodes the Word address (0..63 for x0-x31, 510-511 for x255).
+/// INIT holds the initial value (SP=STACK_TOP, PC=entry_point, rest=0).
+pub fn compute_precomputed_commitment(options: &ProofOptions, entry_point: u64) -> Commitment {
     let num_rows = NUM_REGISTER_ADDRESSES.next_power_of_two();
+    let addr_list = register_word_address_list();
 
-    // Precomputed columns: OFFSET and INIT.
-    //
-    // OFFSET (col 0): deterministic row index 0..63 (32 registers × 2 words each).
-    //   Identical for every program.
-    //
-    // INIT (col 1): initial word value for each register address. All zeros except
-    //   for the stack pointer (x2), whose two 32-bit words hold STACK_TOP:
-    //     - offset 4 (SP low word):  STACK_TOP & 0xFFFF_FFFF
-    //     - offset 5 (SP high word): STACK_TOP >> 32
-    //   This is program-independent (STACK_TOP is a fixed constant), so the entire
-    //   REGISTER preprocessed commitment can be computed once and cached globally.
     let mut offset_col = vec![FE::zero(); num_rows];
     let mut init_col = vec![FE::zero(); num_rows];
 
     for i in 0..NUM_REGISTER_ADDRESSES {
-        offset_col[i] = FE::from(i as u64);
-        init_col[i] = if i == 4 {
-            FE::from(STACK_TOP & 0xFFFF_FFFF)
-        } else if i == 5 {
-            FE::from(STACK_TOP >> 32)
-        } else {
-            FE::zero()
-        };
+        let word_addr = addr_list[i];
+        offset_col[i] = FE::from(word_addr);
+        init_col[i] = FE::from(init_value_for_address(word_addr, entry_point) as u64);
     }
 
     let columns = [offset_col, init_col];
@@ -224,9 +228,11 @@ pub fn compute_precomputed_commitment(options: &ProofOptions) -> Commitment {
     tree.root
 }
 
-/// Returns the preprocessed commitment for the REGISTER table, with caching.
-pub fn preprocessed_commitment(options: &ProofOptions) -> Commitment {
-    *REGISTER_COMMITMENT.get_or_init(|| compute_precomputed_commitment(options))
+/// Returns the preprocessed commitment for the REGISTER table.
+///
+/// Program-dependent (entry_point varies per ELF), so not globally cached.
+pub fn preprocessed_commitment(options: &ProofOptions, entry_point: u64) -> Commitment {
+    compute_precomputed_commitment(options, entry_point)
 }
 
 // =========================================================================
@@ -333,14 +339,16 @@ mod tests {
         assert_eq!(register_base_address(1), 2);
         assert_eq!(register_base_address(2), 4);
         assert_eq!(register_base_address(31), 62);
+        assert_eq!(register_base_address(255), 510);
     }
 
     #[test]
     fn test_generate_register_trace_empty() {
+        let entry_point = 0x1000u64;
         let final_state = FinalRegisterStateMap::new();
-        let trace = generate_register_trace(&final_state);
+        let trace = generate_register_trace(&final_state, entry_point);
 
-        // Should have power-of-2 rows >= 64 (32 regs × 2 Words)
+        // Should have power-of-2 rows >= 66 (33 regs × 2 Words)
         assert!(trace.num_rows() >= NUM_REGISTER_ADDRESSES);
         assert!(trace.num_rows().is_power_of_two());
 
@@ -349,10 +357,27 @@ mod tests {
         assert_eq!(*trace.main_table.get(0, cols::INIT), FE::zero());
         assert_eq!(*trace.main_table.get(0, cols::FINI), FE::zero());
         assert_eq!(*trace.main_table.get(0, cols::TIMESTAMP_LO), FE::zero());
+
+        // Check x255 rows (row 64 = addr 510, row 65 = addr 511)
+        assert_eq!(*trace.main_table.get(64, cols::OFFSET), FE::from(510u64));
+        assert_eq!(
+            *trace.main_table.get(64, cols::INIT),
+            FE::from(entry_point & 0xFFFF_FFFF)
+        );
+        assert_eq!(
+            *trace.main_table.get(64, cols::FINI),
+            FE::from(entry_point & 0xFFFF_FFFF)
+        ); // fini=init when never accessed
+        assert_eq!(*trace.main_table.get(65, cols::OFFSET), FE::from(511u64));
+        assert_eq!(
+            *trace.main_table.get(65, cols::INIT),
+            FE::from(entry_point >> 32)
+        );
     }
 
     #[test]
     fn test_generate_register_trace_with_access() {
+        let entry_point = 0x1000u64;
         let mut final_state = FinalRegisterStateMap::new();
         // Register x5 low Word was written with value 0x42 at timestamp 100
         let addr = register_base_address(5); // = 10
@@ -364,7 +389,7 @@ mod tests {
             },
         );
 
-        let trace = generate_register_trace(&final_state);
+        let trace = generate_register_trace(&final_state, entry_point);
 
         // Row 10 (address 10) should have the final state
         assert_eq!(*trace.main_table.get(10, cols::OFFSET), FE::from(10u64));
