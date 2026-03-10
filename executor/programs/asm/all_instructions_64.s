@@ -94,8 +94,8 @@ main:
 	rem	s6, t1, t0		# 61: s6 = 20 % 10 = 0
 	remu	s7, t1, t0		# 62: s7 = 20 %u 10 = 0
 
-	# === 63-64: Finalize ===
+	# === 63-66: Finalize ===
 	addi	zero, zero, 0		# 63: NOP (writes to zero register)
-	li	a0, 0
-	li	a7, 93			# 64: Setup ecall halt
-	ecall				# 65: Halt
+	li	a0, 0			# 64: Clear exit code
+	li	a7, 93			# 65: Setup ecall halt
+	ecall				# 66: Halt
