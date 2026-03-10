@@ -695,8 +695,8 @@ impl DecodeEntry {
             }
 
             Instruction::Fence => {
-                // FENCE is a memory barrier - in single-threaded, in-order execution it's a no-op
-                // No operation flags needed, just advance PC (handled by default)
+                // Per spec, FENCE is a no-op interpreted as ADDI x0, x0, 0.
+                entry.op_add = true;
             }
         }
 
