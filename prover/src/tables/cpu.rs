@@ -1785,6 +1785,144 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
+    // M8: MEMW PC register update (every non-padding row)
+    // -------------------------------------------------------------------------
+    // Per spec: MEMW[old=pc; is_register=1, addr=2*255, value=next_pc, timestamp+1, 1, 0, 0]
+    // multiplicity = !pad = sum of all ALU selector flags
+    //
+    // This is the memory argument for PC consistency. Each instruction step reads
+    // the current PC and writes next_pc to the PC register (register 255, address 510).
+    // The REGISTER table provides initial/final tokens to close the chain.
+    //
+    // Format: 24 elements (read format with old values)
+    // [old[8], is_register, base_address[2], value[8], timestamp[2], write2, write4, write8]
+    let not_pad = Multiplicity::Linear(vec![
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::ADD,
+        },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::SUB,
+        },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::SLT,
+        },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::AND,
+        },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::OR,
+        },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::XOR,
+        },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::SHIFT,
+        },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::JALR,
+        },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::BEQ,
+        },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::BLT,
+        },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::LOAD,
+        },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::STORE,
+        },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::MUL,
+        },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::DIVREM,
+        },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::ECALL,
+        },
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::EBREAK,
+        },
+    ]);
+    interactions.push(BusInteraction::sender(
+        BusId::Memw,
+        not_pad,
+        vec![
+            // old[0] = pc_lo (current PC, low word)
+            BusValue::Packed {
+                start_column: cols::PC_0,
+                packing: Packing::Direct,
+            },
+            // old[1] = pc_hi (current PC, high word)
+            BusValue::Packed {
+                start_column: cols::PC_1,
+                packing: Packing::Direct,
+            },
+            // old[2..7] = 0 (registers only use 2 Words)
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            // is_register = 1
+            BusValue::constant(1),
+            // base_address[0] = 2 * 255 = 510 (PC register address)
+            BusValue::constant(510),
+            // base_address[1] = 0
+            BusValue::constant(0),
+            // value[0] = next_pc_lo (new PC, low word)
+            BusValue::Packed {
+                start_column: cols::NEXT_PC_0,
+                packing: Packing::Direct,
+            },
+            // value[1] = next_pc_hi (new PC, high word)
+            BusValue::Packed {
+                start_column: cols::NEXT_PC_1,
+                packing: Packing::Direct,
+            },
+            // value[2..7] = 0
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            BusValue::constant(0),
+            // timestamp[0] = timestamp + 1, timestamp[1] = 0
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::TIMESTAMP,
+                },
+                LinearTerm::Constant(1),
+            ]),
+            BusValue::constant(0),
+            // write2=1, write4=0, write8=0 (register access = 2 Words)
+            BusValue::constant(1),
+            BusValue::constant(0),
+            BusValue::constant(0),
+        ],
+    ));
+
+    // -------------------------------------------------------------------------
     // IS_BYTE interactions (byte range checks, 27 total)
     // -------------------------------------------------------------------------
     // Range-check all 27 byte columns: RS1, RS2, RD, ARG1[0..7], ARG2[0..7], RES[0..7].
