@@ -392,6 +392,116 @@ fn sign_interactions(x_col: usize, signed_col: usize, sign_col: usize) -> Vec<Bu
     )]
 }
 
+/// NEG template: Two ZERO interactions verifying neg(x) = abs when cond holds.
+/// Mirrors spec template `neg.toml`.
+///
+/// Emits:
+/// - ZERO[x[0]+x[1], 1-carry[0]] with multiplicity cond
+/// - ZERO[x[0]+x[1]+x[2]+x[3], 1-carry[1]] with multiplicity cond
+///
+/// Where:
+/// - carry[0] = 2^-32 * (x_wl[0] + neg[0])
+/// - carry[1] = 2^-32 * (x_wl[1] + neg[1] + carry[0])
+fn neg_interactions(
+    x_cols: [usize; 4],
+    neg_cols: [usize; 2],
+    cond_col: usize,
+) -> Vec<BusInteraction> {
+    // ZERO interaction 0: input = x[0]+x[1], output = 1 - carry[0]
+    // carry[0] = 2^-32 * (x[0] + x[1]*2^16 + neg[0])
+    // so 1 - carry[0] = 1 - 2^-32*x[0] - 2^-16*x[1] - 2^-32*neg[0]
+    let zero_0 = BusInteraction::sender(
+        BusId::Zero,
+        Multiplicity::Column(cond_col),
+        vec![
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: x_cols[0],
+                },
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: x_cols[1],
+                },
+            ]),
+            BusValue::linear(vec![
+                LinearTerm::Constant(1),
+                LinearTerm::ColumnUnsigned {
+                    coefficient: NEG_INV_2_32,
+                    column: neg_cols[0],
+                },
+                LinearTerm::ColumnUnsigned {
+                    coefficient: NEG_INV_2_32,
+                    column: x_cols[0],
+                },
+                LinearTerm::ColumnUnsigned {
+                    coefficient: NEG_INV_2_16,
+                    column: x_cols[1],
+                },
+            ]),
+        ],
+    );
+
+    // ZERO interaction 1: input = x[0]+x[1]+x[2]+x[3], output = 1 - carry[1]
+    // carry[1] = 2^-32 * (x[2] + x[3]*2^16 + neg[1] + carry[0])
+    // Substituting carry[0] and simplifying:
+    // 1 - carry[1] = 1 - 2^-32*x[2] - 2^-16*x[3] - 2^-32*neg[1]
+    //                  - 2^-64*x[0] - 2^-48*x[1] - 2^-64*neg[0]
+    let zero_1 = BusInteraction::sender(
+        BusId::Zero,
+        Multiplicity::Column(cond_col),
+        vec![
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: x_cols[0],
+                },
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: x_cols[1],
+                },
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: x_cols[2],
+                },
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: x_cols[3],
+                },
+            ]),
+            BusValue::linear(vec![
+                LinearTerm::Constant(1),
+                LinearTerm::ColumnUnsigned {
+                    coefficient: NEG_INV_2_32,
+                    column: neg_cols[1],
+                },
+                LinearTerm::ColumnUnsigned {
+                    coefficient: NEG_INV_2_32,
+                    column: x_cols[2],
+                },
+                LinearTerm::ColumnUnsigned {
+                    coefficient: NEG_INV_2_16,
+                    column: x_cols[3],
+                },
+                LinearTerm::ColumnUnsigned {
+                    coefficient: NEG_INV_2_64,
+                    column: neg_cols[0],
+                },
+                LinearTerm::ColumnUnsigned {
+                    coefficient: NEG_INV_2_64,
+                    column: x_cols[0],
+                },
+                LinearTerm::ColumnUnsigned {
+                    coefficient: NEG_INV_2_48,
+                    column: x_cols[1],
+                },
+            ]),
+        ],
+    );
+
+    vec![zero_0, zero_1]
+}
+
 /// Creates all bus interactions for the DVRM table.
 ///
 /// The DVRM table:
@@ -608,195 +718,21 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // =========================================================================
 
     // -------------------------------------------------------------------------
+    // NEG templates: absolute value via ZERO carry chain (spec DVRM-C3, C5)
+    // -------------------------------------------------------------------------
+
     // DVRM-C3: sign_r ⇒ NEG<abs_r; r>
-    // carry[0] = 2^-32 * ((r::DWordWL)[0] + abs_r[0])
-    // carry[1] = 2^-32 * ((r::DWordWL)[1] + abs_r[1] + carry[0])
-    // ZERO[1-carry[0]; r[0]+r[1]] with multiplicity sign_r
-    // ZERO[1-carry[1]; r[0]+r[1]+r[2]+r[3]] with multiplicity sign_r
-    // -------------------------------------------------------------------------
-
-    // C3a: 1 - carry[0] = 1 - 2^-32*r[0] - 2^-16*r[1] - 2^-32*abs_r[0]
-    interactions.push(BusInteraction::sender(
-        BusId::Zero,
-        Multiplicity::Column(cols::SIGN_R),
-        vec![
-            BusValue::linear(vec![
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::R_0,
-                },
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::R_1,
-                },
-            ]),
-            BusValue::linear(vec![
-                LinearTerm::Constant(1),
-                LinearTerm::ColumnUnsigned {
-                    coefficient: NEG_INV_2_32,
-                    column: cols::ABS_R_0,
-                },
-                LinearTerm::ColumnUnsigned {
-                    coefficient: NEG_INV_2_32,
-                    column: cols::R_0,
-                },
-                LinearTerm::ColumnUnsigned {
-                    coefficient: NEG_INV_2_16,
-                    column: cols::R_1,
-                },
-            ]),
-        ],
+    interactions.extend(neg_interactions(
+        [cols::R_0, cols::R_1, cols::R_2, cols::R_3],
+        [cols::ABS_R_0, cols::ABS_R_1],
+        cols::SIGN_R,
     ));
 
-    // C3b: 1 - carry[1] = 1 - 2^-32*r[2] - 2^-16*r[3] - 2^-32*abs_r[1]
-    //                        - 2^-64*r[0] - 2^-48*r[1] - 2^-64*abs_r[0]
-    interactions.push(BusInteraction::sender(
-        BusId::Zero,
-        Multiplicity::Column(cols::SIGN_R),
-        vec![
-            BusValue::linear(vec![
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::R_0,
-                },
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::R_1,
-                },
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::R_2,
-                },
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::R_3,
-                },
-            ]),
-            BusValue::linear(vec![
-                LinearTerm::Constant(1),
-                // Current-level terms (carry[1] direct)
-                LinearTerm::ColumnUnsigned {
-                    coefficient: NEG_INV_2_32,
-                    column: cols::ABS_R_1,
-                },
-                LinearTerm::ColumnUnsigned {
-                    coefficient: NEG_INV_2_32,
-                    column: cols::R_2,
-                },
-                LinearTerm::ColumnUnsigned {
-                    coefficient: NEG_INV_2_16,
-                    column: cols::R_3,
-                },
-                // carry[0]-dependent terms (shifted by additional 2^-32)
-                LinearTerm::ColumnUnsigned {
-                    coefficient: NEG_INV_2_64,
-                    column: cols::ABS_R_0,
-                },
-                LinearTerm::ColumnUnsigned {
-                    coefficient: NEG_INV_2_64,
-                    column: cols::R_0,
-                },
-                LinearTerm::ColumnUnsigned {
-                    coefficient: NEG_INV_2_48,
-                    column: cols::R_1,
-                },
-            ]),
-        ],
-    ));
-
-    // -------------------------------------------------------------------------
     // DVRM-C5: sign_d ⇒ NEG<abs_d; d>
-    // carry[0] = 2^-32 * ((d::DWordWL)[0] + abs_d[0])
-    // carry[1] = 2^-32 * ((d::DWordWL)[1] + abs_d[1] + carry[0])
-    // -------------------------------------------------------------------------
-
-    // C5a: 1 - carry[0] = 1 - 2^-32*d[0] - 2^-16*d[1] - 2^-32*abs_d[0]
-    interactions.push(BusInteraction::sender(
-        BusId::Zero,
-        Multiplicity::Column(cols::SIGN_D),
-        vec![
-            BusValue::linear(vec![
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::D_0,
-                },
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::D_1,
-                },
-            ]),
-            BusValue::linear(vec![
-                LinearTerm::Constant(1),
-                LinearTerm::ColumnUnsigned {
-                    coefficient: NEG_INV_2_32,
-                    column: cols::ABS_D_0,
-                },
-                LinearTerm::ColumnUnsigned {
-                    coefficient: NEG_INV_2_32,
-                    column: cols::D_0,
-                },
-                LinearTerm::ColumnUnsigned {
-                    coefficient: NEG_INV_2_16,
-                    column: cols::D_1,
-                },
-            ]),
-        ],
-    ));
-
-    // C5b: 1 - carry[1] = 1 - 2^-32*d[2] - 2^-16*d[3] - 2^-32*abs_d[1]
-    //                        - 2^-64*d[0] - 2^-48*d[1] - 2^-64*abs_d[0]
-    interactions.push(BusInteraction::sender(
-        BusId::Zero,
-        Multiplicity::Column(cols::SIGN_D),
-        vec![
-            BusValue::linear(vec![
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::D_0,
-                },
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::D_1,
-                },
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::D_2,
-                },
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::D_3,
-                },
-            ]),
-            BusValue::linear(vec![
-                LinearTerm::Constant(1),
-                // Current-level terms (carry[1] direct)
-                LinearTerm::ColumnUnsigned {
-                    coefficient: NEG_INV_2_32,
-                    column: cols::ABS_D_1,
-                },
-                LinearTerm::ColumnUnsigned {
-                    coefficient: NEG_INV_2_32,
-                    column: cols::D_2,
-                },
-                LinearTerm::ColumnUnsigned {
-                    coefficient: NEG_INV_2_16,
-                    column: cols::D_3,
-                },
-                // carry[0]-dependent terms (shifted by additional 2^-32)
-                LinearTerm::ColumnUnsigned {
-                    coefficient: NEG_INV_2_64,
-                    column: cols::ABS_D_0,
-                },
-                LinearTerm::ColumnUnsigned {
-                    coefficient: NEG_INV_2_64,
-                    column: cols::D_0,
-                },
-                LinearTerm::ColumnUnsigned {
-                    coefficient: NEG_INV_2_48,
-                    column: cols::D_1,
-                },
-            ]),
-        ],
+    interactions.extend(neg_interactions(
+        [cols::D_0, cols::D_1, cols::D_2, cols::D_3],
+        [cols::ABS_D_0, cols::ABS_D_1],
+        cols::SIGN_D,
     ));
 
     // -------------------------------------------------------------------------
