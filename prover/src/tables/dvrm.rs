@@ -913,12 +913,8 @@ pub enum DvrmConstraintKind {
     CarryIsBit(usize),
     /// DVRM-C12: sign_n_sub_r * (1-sign_n_sub_r) = 0
     SignNSubRIsBit,
-    /// DVRM-C16b: (1-signed) * sign_n = 0
-    UnsignedSignN,
-    /// DVRM-C17b: (1-signed) * sign_r = 0
-    UnsignedSignR,
-    /// DVRM-C18b: (1-signed) * sign_d = 0
-    UnsignedSignD,
+    /// SIGN template arith part: (1-signed) * sign = 0 (spec DVRM-C16b, C17b, C18b)
+    SignUnsignedZero { sign_col: usize },
     /// DVRM-C19.i: div_by_zero * (q[i] - 65535) = 0
     DivByZeroQ(usize),
 }
@@ -1022,23 +1018,11 @@ impl DvrmConstraint {
                     .clone();
                 &sign * (&one - &sign)
             }
-            DvrmConstraintKind::UnsignedSignN => {
-                // (1-signed) * sign_n = 0
+            DvrmConstraintKind::SignUnsignedZero { sign_col } => {
+                // SIGN template: (1-signed) * sign = 0
                 let signed = step.get_main_evaluation_element(0, cols::SIGNED).clone();
-                let sign_n = step.get_main_evaluation_element(0, cols::SIGN_N).clone();
-                (&one - &signed) * &sign_n
-            }
-            DvrmConstraintKind::UnsignedSignR => {
-                // (1-signed) * sign_r = 0
-                let signed = step.get_main_evaluation_element(0, cols::SIGNED).clone();
-                let sign_r = step.get_main_evaluation_element(0, cols::SIGN_R).clone();
-                (&one - &signed) * &sign_r
-            }
-            DvrmConstraintKind::UnsignedSignD => {
-                // (1-signed) * sign_d = 0
-                let signed = step.get_main_evaluation_element(0, cols::SIGNED).clone();
-                let sign_d = step.get_main_evaluation_element(0, cols::SIGN_D).clone();
-                (&one - &signed) * &sign_d
+                let sign = step.get_main_evaluation_element(0, sign_col).clone();
+                (&one - &signed) * &sign
             }
             DvrmConstraintKind::DivByZeroQ(i) => {
                 // div_by_zero * (q[i] - 65535) = 0
@@ -1145,9 +1129,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for DvrmConstrai
             DvrmConstraintKind::SignQFormula => 2,
             DvrmConstraintKind::CarryIsBit(_) => 2,
             DvrmConstraintKind::SignNSubRIsBit => 2,
-            DvrmConstraintKind::UnsignedSignN => 2,
-            DvrmConstraintKind::UnsignedSignR => 2,
-            DvrmConstraintKind::UnsignedSignD => 2,
+            DvrmConstraintKind::SignUnsignedZero { .. } => 2,
             DvrmConstraintKind::DivByZeroQ(_) => 2,
         }
     }
@@ -1232,17 +1214,14 @@ pub fn dvrm_constraints(constraint_idx_start: usize) -> (Vec<DvrmConstraint>, us
     constraints.push(DvrmConstraint::new(DvrmConstraintKind::SignNSubRIsBit, idx));
     idx += 1;
 
-    // DVRM-C16b: unsigned sign_n = 0
-    constraints.push(DvrmConstraint::new(DvrmConstraintKind::UnsignedSignN, idx));
-    idx += 1;
-
-    // DVRM-C17b: unsigned sign_r = 0
-    constraints.push(DvrmConstraint::new(DvrmConstraintKind::UnsignedSignR, idx));
-    idx += 1;
-
-    // DVRM-C18b: unsigned sign_d = 0
-    constraints.push(DvrmConstraint::new(DvrmConstraintKind::UnsignedSignD, idx));
-    idx += 1;
+    // SIGN template arith: (1-signed) * sign = 0 (spec DVRM-C16b, C17b, C18b)
+    for &sign_col in &[cols::SIGN_N, cols::SIGN_R, cols::SIGN_D] {
+        constraints.push(DvrmConstraint::new(
+            DvrmConstraintKind::SignUnsignedZero { sign_col },
+            idx,
+        ));
+        idx += 1;
+    }
 
     // DVRM-C19: div_by_zero implies q = all 1s (×4)
     for i in 0..4 {
