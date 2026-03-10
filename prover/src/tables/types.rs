@@ -699,8 +699,9 @@ impl DecodeEntry {
             }
 
             Instruction::Fence => {
-                // FENCE is a memory barrier - in single-threaded, in-order execution it's a no-op
-                // No operation flags needed, just advance PC (handled by default)
+                // FENCE is treated as ADDI x0, x0, 0 per spec: a harmless no-op that sets op_add=1
+                // so pad=0 and CM54 fires correctly for PC linkage.
+                entry.op_add = true;
             }
         }
 
