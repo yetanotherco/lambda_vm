@@ -9,5 +9,6 @@ main:
 	subw	a2, t0, t1		# 5. 1 - 0x80000000 = 0x80000001
 	subw	a3, zero, t1		# 6. 0 - 0x80000000 = 0x80000000
 	subw	a4, t1, t1		# 7. 0x80000000 - 0x80000000 = 0
-	li	a7, 5
+	li	a0, 0
+	li	a7, 93
 	ecall		# 8. Return

@@ -11,7 +11,7 @@ enum SyscallNumbers {
     Panic = 2,
     Commit = 3,
     GetPrivateInputs = 4,
-    Halt = 5,
+    Halt = 93,
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -108,6 +108,7 @@ pub fn sys_halt() -> ! {
     unsafe {
         asm!(
             "ecall",
+            in("a0") 0usize, // exit_code = 0 (enforced by HALT read on x10)
             in("a7") SyscallNumbers::Halt as usize,
         );
     }

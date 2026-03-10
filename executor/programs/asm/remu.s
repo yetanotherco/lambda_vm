@@ -5,7 +5,8 @@ main:
 	li	a2, -1
 	addi	a3, zero, 55
 	remu    a0, a2, a3
-	li	a7, 5
+	li	a0, 0
+	li	a7, 93
 	ecall
 .Lfunc_end1:
 	.size	main, .Lfunc_end1-main
