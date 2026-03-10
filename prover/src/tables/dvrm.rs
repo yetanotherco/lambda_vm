@@ -22,11 +22,12 @@
 //! - `sign_n`, `sign_d`, `sign_q`, `sign_r`: Bit - sign bits
 //!
 //! ## Bus Interactions
-//! - Sender: IS_HALF (×16: n, d, r, n_sub_r, q)
-//! - Sender: MSB16 (×3 for sign extraction: n, d, r)
+//! - Sender: IS_HALF (×20: n, d, r, n_sub_r, q)
+//! - Sender: SIGN template (×3: MSB16 for sign_n, sign_d, sign_r)
+//! - Sender: NEG template (×2: ZERO carry chain for abs_r, abs_d)
 //! - Sender: LT (×1 for abs_r < abs_d)
 //! - Sender: MUL (×2 for n_sub_r = d * q verification)
-//! - Sender: ZERO (×5 for div_by_zero, overflow, NEG template)
+//! - Sender: ZERO (×2 for div_by_zero, overflow)
 //! - Receiver: DVRM (×2 for quotient and remainder results)
 
 use std::collections::HashMap;
