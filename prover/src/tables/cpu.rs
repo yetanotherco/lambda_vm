@@ -434,6 +434,8 @@ impl CpuOperation {
     ///
     /// For ADD: res = arg1 + arg2 (64-bit wrapping)
     /// For SUB: res = arg1 - arg2 (64-bit wrapping)
+    /// For SHIFT: res = raw 64-bit shift of arg1 by arg2 (no word sign extension;
+    ///            rvd handles sign extension for word instructions)
     /// For SLT: res = 0 or 1 (comparison result from executor)
     /// For other operations: uses the executor's result (self.res)
     ///
@@ -454,6 +456,23 @@ impl CpuOperation {
         } else if self.decode.op_sub {
             // SUB constraint checks: res + arg2 = arg1, so res = arg1 - arg2
             arg1.wrapping_sub(arg2)
+        } else if self.decode.op_shift {
+            // SHIFT: raw 64-bit shift matching the SHIFT chip's computation.
+            // The SHIFT chip shifts the full 64-bit arg1 by (shift mod 32*(2-word_instr)).
+            // Sign extension for word instructions is handled by rvd, not res.
+            let shift = (arg2 & 0xFF) as u32;
+            let modulus = if self.decode.word_instr { 32 } else { 64 };
+            let effective = shift % modulus;
+            if !self.decode.mp_selector {
+                // Left shift
+                arg1.wrapping_shl(effective)
+            } else if !self.decode.signed {
+                // Logical right shift
+                arg1.wrapping_shr(effective)
+            } else {
+                // Arithmetic right shift
+                (arg1 as i64).wrapping_shr(effective) as u64
+            }
         } else {
             // For SLT and other operations, use the executor's result
             // SLT res is 0 or 1, verified by SltResZeroConstraint
@@ -1228,6 +1247,48 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             // muldiv_selector: 0=quotient (DIV), 1=remainder (REM)
             BusValue::Packed {
                 start_column: cols::MULDIV_SELECTOR,
+                packing: Packing::Direct,
+            },
+        ],
+    ));
+
+    // -------------------------------------------------------------------------
+    // SHIFT interaction (for SLL, SRL, SRA) — CPU-CA43
+    // -------------------------------------------------------------------------
+    // SHIFT[res::DWordWL; arg1::DWordHL, arg2[0], mp_selector, signed, word_instr]
+    // multiplicity = SHIFT
+    interactions.push(BusInteraction::sender(
+        BusId::Shift,
+        Multiplicity::Column(cols::SHIFT),
+        vec![
+            // res (result) as DWordBL (8 bytes → 2 elements, same as DWordWL)
+            BusValue::Packed {
+                start_column: cols::RES[0],
+                packing: Packing::DWordBL,
+            },
+            // arg1 (input) as DWordBL (8 bytes → 2 elements)
+            BusValue::Packed {
+                start_column: cols::ARG1[0],
+                packing: Packing::DWordBL,
+            },
+            // arg2[0] (shift amount byte)
+            BusValue::Packed {
+                start_column: cols::ARG2[0],
+                packing: Packing::Direct,
+            },
+            // mp_selector (direction: 0=left, 1=right)
+            BusValue::Packed {
+                start_column: cols::MP_SELECTOR,
+                packing: Packing::Direct,
+            },
+            // signed
+            BusValue::Packed {
+                start_column: cols::SIGNED,
+                packing: Packing::Direct,
+            },
+            // word_instr
+            BusValue::Packed {
+                start_column: cols::WORD_INSTR,
                 packing: Packing::Direct,
             },
         ],

@@ -1,9 +1,7 @@
 use alloc::vec::Vec;
 use math::field::{
-    element::FieldElement,
-    fields::fft_friendly::{
-        extensions_goldilocks::Degree3GoldilocksExtensionField, u64_goldilocks::GoldilocksField,
-    },
+    element::FieldElement, extensions_goldilocks::Degree3GoldilocksExtensionField,
+    goldilocks::GoldilocksField,
 };
 
 use crate::fiat_shamir::default_transcript::DefaultTranscript;
