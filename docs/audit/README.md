@@ -19,13 +19,13 @@ Verifying the prover implementation matches the spec exactly.
 | 3 | LT | 12 (3 poly + 9 bus) | PASS | carry IS_BIT x2, LT formula, MSB16 x2, IS_HALF x6, LT receiver |
 | 4 | Load | 13 (8 poly + 5 bus) | PASS | Extension constraints, MEMW sender, MSB8 x3, LOAD receiver |
 | 5 | MUL | 22 (6 poly + 16 bus) | PASS | SIGN x2, raw_product x4, IS_HALF x8, IS_B20 x4, MUL receiver x2 |
-| 6 | DVRM | 22 | | Uses SIGN + NEG |
+| 6 | DVRM | 34 (19 poly + 26 bus + 8 extra) | PASS | SIGN x3, NEG x2, 8 extra IS_HALF for input assumptions |
 | 7 | Shift | 15 | | |
 | 8 | MEMW | 25 | | Memory argument core |
-| 9 | HALT | ~10 | | Part of ecall.md |
+| 9 | HALT | 33 (0 poly + 33 bus) | PASS | 1 ECALL receiver + 32 MEMW senders (register finalization) |
 | 10 | COMMIT | ~12 | | Part of ecall.md |
-| 11 | Decode | special | | Preprocessed, bit layout |
-| 12 | CPU | ~70 | | Largest table, audit last |
+| 11 | Decode | 1 (0 poly + 1 bus) | PASS | Preprocessed lookup table, packed_decode 51-bit layout verified |
+| 12 | CPU | 56 poly + ~60 bus | **FINDINGS** | 4 CRITICAL missing constraints, 2 MODERATE deviations |
 
 ## Cross-Cutting Audits
 
@@ -643,3 +643,470 @@ Code uses DWordHL packing (4 halves → 2 words) for lhs, rhs, lo/hi — produce
 **MUL TABLE: PASS**
 
 All 26 columns, 6 polynomial constraints (2 SIGN template + 4 raw_product convolution), 16 bus interactions (2 MSB16 + 8 IS_HALF + 4 IS_B20 carry + 2 MUL receivers), carry formula expansions, and trace generation match the spec exactly. No findings.
+
+---
+
+### 6. DVRM
+
+**Spec**: `docs/spec/dvrm.md` on `md_spec` branch
+**Code**: `prover/src/tables/dvrm.rs`
+**Templates used**: SIGN (sign.md), NEG (neg.md), IS_BIT (is_bit.md)
+
+#### Columns
+
+| Check | Status | Details |
+|-------|--------|---------|
+| Input columns match spec | PASS | n: DWordHL (N_0..N_3, cols 0-3), d: DWordHL (D_0..D_3, cols 4-7), signed: Bit (col 8) |
+| Output columns match spec | PASS | q: DWordHL (Q_0..Q_3, cols 9-12), r: DWordHL (R_0..R_3, cols 13-16) |
+| Auxiliary columns match spec | PASS | div_by_zero (17), overflow (18), abs_r DWordWL (19-20), abs_d DWordWL (21-22), n_sub_r DWordHL (23-26), sign_n_sub_r (27), sign_n (28), sign_d (29), sign_q (30), sign_r (31) |
+| Multiplicity columns match spec | PASS | μ_q (32), μ_r (33) |
+| Virtual columns | PASS | extended_n, extended_r, extension_n_sub_r, extended_n_sub_r (QuadHL→QuadWL), carry[0..3]: all computed inline in CarryIsBit constraint |
+| Column count | PASS | NUM_COLUMNS = 34 |
+| Column ordering contiguous | PASS | 0-33, no gaps |
+| No extra columns | PASS | |
+| No missing columns | PASS | |
+| Type correctness | PASS | DWordHL=4 Half cols, DWordWL=2 Word cols, Bit=1 col, BaseField=1 col |
+
+#### Assumptions
+
+| Tag | Spec | Code | Status | Notes |
+|-----|------|------|--------|-------|
+| DVRM-A1.i | IS_HALF[n[i]] | IS_HALF sender for N_0..N_3 (μ_sum) | PASS* | Code enforces as bus interaction; spec treats as assumption. Overconstrained but sound. |
+| DVRM-A2.i | IS_HALF[d[i]] | IS_HALF sender for D_0..D_3 (μ_sum) | PASS* | Same as A1. |
+| DVRM-A3 | IS_BIT\<signed\> | SignedIsBit: signed*(1-signed)=0 | PASS | IS_BIT template expanded to polynomial |
+
+*Note: The code sends 8 extra IS_HALF interactions (4 for n, 4 for d) that the spec lists only as assumptions (to be enforced by the CPU sender). This is redundant but sound — it means the DVRM table self-enforces its input range checks rather than relying on the sender.
+
+#### Polynomial Constraints
+
+| Spec Tag | Code Kind | Polynomial | Status |
+|----------|-----------|-----------|--------|
+| DVRM-A3 | SignedIsBit | `signed * (1-signed) = 0` | PASS |
+| DVRM-C1 | RemainderSignMatchesNumerator | `(r[0]+r[1]+r[2]+r[3]) * (sign_r - sign_n) = 0` | PASS |
+| DVRM-C4.0 | AbsRFormula(0) | `(1-sign_r) * (abs_r[0] - (r[0]+r[1]*2^16)) = 0` | PASS |
+| DVRM-C4.1 | AbsRFormula(1) | `(1-sign_r) * (abs_r[1] - (r[2]+r[3]*2^16)) = 0` | PASS |
+| DVRM-C6.0 | AbsDFormula(0) | `(1-sign_d) * (abs_d[0] - (d[0]+d[1]*2^16)) = 0` | PASS |
+| DVRM-C6.1 | AbsDFormula(1) | `(1-sign_d) * (abs_d[1] - (d[2]+d[3]*2^16)) = 0` | PASS |
+| DVRM-C7 | SignQFormula | `signed * (1-overflow) - sign_q = 0` | PASS |
+| DVRM-C12.0 | CarryIsBit(0) | `carry[0] * (1-carry[0]) = 0` where carry[0] = 2^-32 * (ext_nsr[0]+ext_r[0]-ext_n[0]) | PASS |
+| DVRM-C12.1 | CarryIsBit(1) | `carry[1] * (1-carry[1]) = 0` where carry[1] recursive | PASS |
+| DVRM-C12.2 | CarryIsBit(2) | `carry[2] * (1-carry[2]) = 0` | PASS |
+| DVRM-C12.3 | CarryIsBit(3) | `carry[3] * (1-carry[3]) = 0` | PASS |
+| DVRM-C15 | SignNSubRIsBit | `sign_n_sub_r * (1-sign_n_sub_r) = 0` | PASS |
+| DVRM-C18 (SIGN-C2) | UnsignedSignN | `(1-signed) * sign_n = 0` | PASS |
+| DVRM-C19 (SIGN-C2) | UnsignedSignR | `(1-signed) * sign_r = 0` | PASS |
+| DVRM-C20 (SIGN-C2) | UnsignedSignD | `(1-signed) * sign_d = 0` | PASS |
+| DVRM-C16.0-3 | DivByZeroQ(0..3) | `div_by_zero * (q[i]-65535) = 0` | PASS |
+
+Total: 19 polynomial constraints. All degree 2. All match spec exactly.
+
+**Carry computation verification**: Virtual carries use sign-extended QuadWL representation via `build_extended_quad`. Extended values: lower 2 words = halfword pairs packed to words, upper 2 words = sign * 0xFFFFFFFF. Carry formula matches spec definition exactly: `carry[0] = 2^-32 * ((ext_nsr::QuadWL)[0] + (ext_r::QuadWL)[0] - (ext_n::QuadWL)[0])`, recursive for carry[1..3].
+
+#### Bus Interactions
+
+| Spec Tag | Code | Bus ID | Direction | Mult | Values | Status |
+|----------|------|--------|-----------|------|--------|--------|
+| DVRM-C2 | LT sender | Lt | Sender | μ_sum | [abs_r(DWordWL), abs_d(DWordWL), 0, 1-div_by_zero] | PASS |
+| DVRM-C3 (NEG-C1) | ZERO carry0 | Zero | Sender | sign_r | [r[0]+r[1], 1-carry[0] expanded] | PASS |
+| DVRM-C3 (NEG-C2) | ZERO carry1 | Zero | Sender | sign_r | [r[0]+r[1]+r[2]+r[3], 1-carry[1] expanded] | PASS |
+| DVRM-C5 (NEG-C1) | ZERO carry0 | Zero | Sender | sign_d | [d[0]+d[1], 1-carry[0] expanded] | PASS |
+| DVRM-C5 (NEG-C2) | ZERO carry1 | Zero | Sender | sign_d | [d[0]+d[1]+d[2]+d[3], 1-carry[1] expanded] | PASS |
+| DVRM-C8 | ZERO overflow | Zero | Sender | μ_sum | [overflow_sum, overflow] | PASS |
+| DVRM-C9 | MUL lo | Mul | Sender | μ_sum | [d(DWordHL), signed, q(DWordHL), sign_q, n_sub_r(DWordHL), 0] | PASS |
+| DVRM-C10 | MUL hi | Mul | Sender | μ_sum | [d(DWordHL), signed, q(DWordHL), sign_q, ext_nsr(linear), 1] | PASS |
+| DVRM-C11.i | IS_HALF q[i] | IsHalfword | Sender | μ_sum | [Q_i] ×4 | PASS |
+| DVRM-C13.i | IS_HALF r[i] | IsHalfword | Sender | μ_sum | [R_i] ×4 | PASS |
+| DVRM-C14.i | IS_HALF n_sub_r[i] | IsHalfword | Sender | μ_sum | [N_SUB_R_i] ×4 | PASS |
+| DVRM-C17 | ZERO div_by_zero | Zero | Sender | μ_sum | [d[0]+d[1]+d[2]+d[3], div_by_zero] | PASS |
+| DVRM-C18 (SIGN-C1) | MSB16 sign_n | Msb16 | Sender | signed | [N_3, SIGN_N] | PASS |
+| DVRM-C19 (SIGN-C1) | MSB16 sign_r | Msb16 | Sender | signed | [R_3, SIGN_R] | PASS |
+| DVRM-C20 (SIGN-C1) | MSB16 sign_d | Msb16 | Sender | signed | [D_3, SIGN_D] | PASS |
+| DVRM-C21 | DVRM q | Dvrm | Receiver | μ_q | [n(DWordHL), d(DWordHL), signed, q(DWordHL), 0] | PASS |
+| DVRM-C22 | DVRM r | Dvrm | Receiver | μ_r | [n(DWordHL), d(DWordHL), signed, r(DWordHL), 1] | PASS |
+
+Total spec interactions: 26. Code: 34 (26 + 8 extra IS_HALF for inputs).
+
+**Cross-check: MUL sender ordering** matches MUL receiver (mul.rs lines 600-670): [lhs, lhs_signed, rhs, rhs_signed, result, selector]. Verified consistent.
+
+**C8 overflow_sum verification**: `n[0]+n[1]+n[2]+n[3]-(2^15+1)*sign_n+(1+4*65535)-d[0]-d[1]-d[2]-d[3]`. Code coefficient: -32769 for SIGN_N, constant 262141 = 1+4*65535. When overflow holds: n=0x8000_0000_0000_0000, d=0xFFFF_FFFF_FFFF_FFFF, signed=1 → sum=0. ZERO lookup correctly constrains overflow bit.
+
+**C10 extension_n_sub_r**: Each word = `sign_n_sub_r * (65535 + 65535*2^16)` = `sign_n_sub_r * 0xFFFFFFFF`. Matches spec: `extension_n_sub_r[i] = 65535 * sign_n_sub_r` as DWordHL→DWordWL.
+
+**NEG carry expansion verification**: C3a: `1-carry[0] = 1 - 2^-32*abs_r[0] - 2^-32*r[0] - 2^-16*r[1]`. Matches `1 - 2^-32*((r::DWordWL)[0] + abs_r[0])` where `(r::DWordWL)[0] = r[0]+r[1]*2^16`. C3b: recursive expansion with carry[0] substituted inline. All coefficients verified: NEG_INV_2_32, NEG_INV_2_16, NEG_INV_2_48, NEG_INV_2_64.
+
+#### Padding
+
+| Check | Status | Details |
+|-------|--------|---------|
+| Padding values | PASS | All zeros (n=0, d=0, signed=0, q=0, r=0, all aux=0, μ_q=μ_r=0) |
+| Polynomial constraints hold | PASS | All constraints evaluate to 0 on all-zero rows |
+| Bus interactions silent | PASS | All multiplicities are 0 on padding (μ_q=μ_r=0, signed=0, sign_*=0) |
+
+#### Trace Generation
+
+| Check | Status | Details |
+|-------|--------|---------|
+| Column filling | PASS | All halfword/word decompositions correct for n, d, q, r, n_sub_r, abs_r, abs_d |
+| Computation | PASS | compute_quotient/compute_remainder handle div_by_zero, overflow, signed/unsigned |
+| sign_q formula | PASS | `signed && !is_overflow()` matches spec C7 |
+| Deduplication | PASS | HashMap by (n, d, signed), separate μ_q and μ_r |
+| Padding | PASS | Remaining rows zero-filled, power-of-2 sizing |
+
+#### Completeness
+
+| Check | Status | Details |
+|-------|--------|---------|
+| All spec constraints have code | PASS | C1-C22 all implemented (19 poly + 26 bus) |
+| No extra code constraints | PASS | 8 extra IS_HALF for inputs (sound but not in spec) |
+
+#### Tag Numbering Note
+
+Code comments use different C-tag numbers than spec (e.g., code "C9" for carry IS_BIT, spec C12). This is a documentation-only mismatch. All constraints are functionally correct regardless of tag labels.
+
+#### Summary
+
+**DVRM TABLE: PASS**
+
+All 34 columns, 19 polynomial constraints (1 IS_BIT signed, 1 remainder sign, 2+2 abs formulas, 1 sign_q, 4 carry IS_BIT, 1 sign_n_sub_r IS_BIT, 3 unsigned sign, 4 div_by_zero q), and 26 bus interactions (1 LT, 4 ZERO NEG carry, 1 ZERO overflow, 1 ZERO div_by_zero, 2 MUL, 12 IS_HALF, 3 MSB16, 2 DVRM receivers) match the spec. 8 additional IS_HALF interactions for input range checks (spec assumptions A1, A2) are overconstrained but sound. Virtual carry computation for 128-bit sign-extended addition verified. No findings.
+
+---
+
+### 7. HALT
+
+**Spec**: `docs/spec/ecall.md` (HALT section) on `md_spec` branch
+**Code**: `prover/src/tables/halt.rs`
+
+#### Columns
+
+| Check | Status | Details |
+|-------|--------|---------|
+| Input columns match spec | PASS | timestamp: DWordWL (TIMESTAMP_0 col 0, TIMESTAMP_1 col 1) |
+| Column count | PASS | NUM_COLUMNS = 2 |
+| No extra columns | PASS | |
+| No missing columns | PASS | |
+| Type correctness | PASS | DWordWL = 2 Word columns |
+
+#### Assumptions
+
+| Tag | Spec | Code | Status | Notes |
+|-----|------|------|--------|-------|
+| HALT-A1.i | IS_WORD[timestamp[i]] | Not enforced locally | PASS | Assumption — enforced by CPU sender |
+
+#### Polynomial Constraints
+
+None in spec, none in code. PASS.
+
+#### Bus Interactions
+
+| Spec Tag | Code | Bus ID | Direction | Mult | Values | Status |
+|----------|------|--------|-----------|------|--------|--------|
+| HALT-C1.i (i∈[1,9]) | x1-x9 write | Memw | Sender | 1 | MEMW write format: [is_reg=1, addr=2*i, val=0, ts=2^64-1, w2=1, w4=0, w8=0] (16 elems) | PASS |
+| HALT-C2 | x10 read | Memw | Sender | 1 | MEMW read format: [old=0, is_reg=1, addr=20, val=0, ts=2^64-1, w2=1, w4=0, w8=0] (24 elems) | PASS |
+| HALT-C3.i (i∈[11,31]) | x11-x31 write | Memw | Sender | 1 | Same write format, addr=2*i, val=0 (16 elems) | PASS |
+| HALT-C4 | x255 write | Memw | Sender | 1 | Write format: [is_reg=1, addr=510, val=[1,0..0], ts=2^64-1, w2=1, w4=0, w8=0] (16 elems) | PASS |
+| HALT-C5 | ECALL receiver | Ecall | Receiver | -1 | [timestamp[0], timestamp[1], 93, 0] (4 elems) | PASS |
+
+Total: 33 interactions (9 + 1 + 21 + 1 MEMW senders + 1 ECALL receiver). Code `Vec::with_capacity(33)` matches.
+
+**MEMW format verification**:
+- Write format (CO25, 16 elems): `[is_register(1), base_addr(2), value(8), timestamp(2), write2(1), write4(1), write8(1)]`
+- Read format (CO24, 24 elems): `[old(8), is_register(1), base_addr(2), value(8), timestamp(2), write2(1), write4(1), write8(1)]`
+- C2 (x10 read) uses old=0 to enforce exit_code=0: if x10≠0 at halt, bus imbalance → proof failure. ✓
+- C4 (x255) uses value[0]=1 (PC halted sentinel). ✓
+- All use ts=0xFFFFFFFF_FFFFFFFF (2^64-1, maximum timestamp preventing further operations). ✓
+
+**ECALL signature verification**: `ECALL[timestamp, syscall_number]` where input=[DWordWL, DWordWL]. Code: [TIMESTAMP_0, TIMESTAMP_1, 93, 0]. Syscall 93 = sys_exit. ✓
+
+#### Padding
+
+| Check | Status | Details |
+|-------|--------|---------|
+| Single-row table | PASS | 2^0 = 1 row, no padding needed per spec |
+| Trace generation | PASS | `generate_halt_trace` produces 1 row with timestamp split into lo/hi words |
+
+#### Trace Generation
+
+| Check | Status | Details |
+|-------|--------|---------|
+| Column filling | PASS | timestamp_lo = ts & 0xFFFF_FFFF, timestamp_hi = ts >> 32 |
+| Table size | PASS | TraceTable::new_main with 2 cols, 1 row |
+| All values constant | PASS | No computation — all MEMW values are hardcoded constants in bus_interactions() |
+
+#### Completeness
+
+| Check | Status | Details |
+|-------|--------|---------|
+| All spec constraints have code | PASS | C1-C5 all implemented |
+| No extra code constraints | PASS | 33 bus interactions, all mapped to spec |
+
+#### Summary
+
+**HALT TABLE: PASS**
+
+All 2 columns, 0 polynomial constraints, and 33 bus interactions (9 write-zero x1-x9, 1 read-zero x10 exit code, 21 write-zero x11-x31, 1 write-1 x255 PC sentinel, 1 ECALL receiver for syscall 93) match the spec exactly. Register addresses use `2*i` convention. All MEMW interactions use timestamp 2^64-1 (maximum). Exit code enforcement via read-with-old=0 is correct. No findings.
+
+---
+
+### 8. Decode
+
+**Spec**: `docs/spec/decode.md` on `md_spec` branch
+**Code**: `prover/src/tables/decode.rs`, `prover/src/tables/types.rs` (DecodeEntry, packed_decode)
+
+This is a preprocessed lookup table — no polynomial constraints. The audit focuses on column layout, packed_decode bit format, instruction-to-flags mapping, bus interaction, and padding.
+
+#### Columns
+
+| Check | Status | Details |
+|-------|--------|---------|
+| Output columns match spec | PASS | pc: DWordWL (PC_0 col 0, PC_1 col 1), packed_decode: BaseField (col 2), imm: DWordWL (IMM_0 col 3, IMM_1 col 4) |
+| Multiplicity column | PASS | μ (MU col 5) |
+| Column count | PASS | NUM_COLUMNS = 6, NUM_PRECOMPUTED_COLS = 5 (excludes MU) |
+| No extra columns | PASS | |
+| No missing columns | PASS | |
+
+#### packed_decode Bit Layout (51 bits)
+
+| Bit(s) | Spec | Code (packed_decode module) | Status |
+|--------|------|---------------------------|--------|
+| [0] | read_register1 | READ_REG1 = 0 | PASS |
+| [1] | read_register2 | READ_REG2 = 1 | PASS |
+| [2] | write_register | WRITE_REG = 2 | PASS |
+| [3] | memory_2bytes | MEMORY_2BYTES = 3 | PASS |
+| [4] | memory_4bytes | MEMORY_4BYTES = 4 | PASS |
+| [5] | memory_8bytes | MEMORY_8BYTES = 5 | PASS |
+| [6] | c_type | C_TYPE = 6 | PASS |
+| [7] | signed | SIGNED = 7 | PASS |
+| [8] | mp_selector | MP_SELECTOR = 8 | PASS |
+| [9] | muldiv_selector | MULDIV_SELECTOR = 9 | PASS |
+| [10] | word_instr | WORD_INSTR = 10 | PASS |
+| [11] | ADD | OP_ADD = 11 | PASS |
+| [12] | SUB | OP_SUB = 12 | PASS |
+| [13] | SLT | OP_SLT = 13 | PASS |
+| [14] | AND | OP_AND = 14 | PASS |
+| [15] | OR | OP_OR = 15 | PASS |
+| [16] | XOR | OP_XOR = 16 | PASS |
+| [17] | SHIFT | OP_SHIFT = 17 | PASS |
+| [18] | JALR | OP_JALR = 18 | PASS |
+| [19] | BEQ | OP_BEQ = 19 | PASS |
+| [20] | BLT | OP_BLT = 20 | PASS |
+| [21] | LOAD | OP_LOAD = 21 | PASS |
+| [22] | STORE | OP_STORE = 22 | PASS |
+| [23] | MUL | OP_MUL = 23 | PASS |
+| [24] | DIVREM | OP_DIVREM = 24 | PASS |
+| [25] | ECALL | OP_ECALL = 25 | PASS |
+| [26] | EBREAK | OP_EBREAK = 26 | PASS |
+| [27:35] | rs1 (8 bits) | RS1 = 27 | PASS |
+| [35:43] | rs2 (8 bits) | RS2 = 35 | PASS |
+| [43:51] | rd (8 bits) | RD = 43 | PASS |
+
+All 51 bit positions match spec exactly.
+
+#### Instruction Decoding (from_instruction)
+
+| Instruction | op-flag | w_instr | signed | other | Status |
+|-------------|---------|---------|--------|-------|--------|
+| ADDI[W] | ADD | [W] | 0 | | PASS |
+| SLTI | SLT | 0 | 1 | | PASS |
+| SLTIU | SLT | 0 | 0 | | PASS |
+| ANDI | AND | 0 | 0 | | PASS |
+| ORI | OR | 0 | 0 | | PASS |
+| XORI | XOR | 0 | 0 | | PASS |
+| SLLI[W] | SHIFT | [W] | 0 | | PASS |
+| SRLI[W] | SHIFT | [W] | 0 | mp_selector | PASS |
+| SRAI[W] | SHIFT | [W] | 1 | mp_selector | PASS |
+| ADD[W] | ADD | [W] | 0 | | PASS |
+| SUB[W] | SUB | [W] | 0 | | PASS |
+| SLT[U] | SLT | 0 | !U | | PASS |
+| AND/OR/XOR | flags | 0 | 0 | | PASS |
+| SLL[W]/SRL[W]/SRA[W] | SHIFT | [W] | SRA:1 | SRL/SRA:mp_sel | PASS |
+| MUL | MUL | 0 | 1 | mp_selector | PASS |
+| MULW | MUL | 1 | **0** | mp_selector | **NOTE** |
+| MULH | MUL | 0 | 1 | mp_sel+muldiv_sel | PASS |
+| MULHU | MUL | 0 | 0 | muldiv_sel | PASS |
+| MULHSU | MUL | 0 | 1 | muldiv_sel | PASS |
+| DIV[U][W] | DIVREM | [W] | !U | | PASS |
+| REM[U][W] | DIVREM | [W] | !U | muldiv_sel | PASS |
+| LUI | ADD | 0 | 0 | rs1=0 | PASS |
+| AUIPC | ADD | 0 | 0 | rs1=x255 | PASS |
+| JAL | JALR | 0 | 0 | rs1=x255 | PASS |
+| JALR | JALR | 0 | 0 | | PASS |
+| BEQ/BNE | BEQ | 0 | 0 | BNE:mp_sel | PASS |
+| BLT[U]/BGE[U] | BLT | 0 | !U | BGE:mp_sel | PASS |
+| LD | LOAD | 0 | 0 | mem_8B | PASS |
+| LW[U] | LOAD | 0 | !U | mem_4B | PASS |
+| LH[U] | LOAD | 0 | !U | mem_2B | PASS |
+| LB[U] | LOAD | 0 | !U | | PASS |
+| SD/SW/SH/SB | STORE | 0 | 0 | mem flags | PASS |
+| ECALL | ECALL | 0 | 0 | rs1=x17 | **NOTE** |
+| FENCE | ADD | 0 | 0 | (no-op) | PASS |
+
+**MULW note**: Spec says `MUL[W]` has `signed=1` always. Code sets `signed=false` for MULW (`if !is_word { signed=true }`). For 32-bit multiplication, the lower 32 bits are identical regardless of signed/unsigned interpretation, so this does not affect correctness. Still, it is a spec deviation.
+
+**ECALL note**: Code sets `rs2=10` (a0) and `rd=10` (a0) for ECALL, but `read_register2=false` and `write_register=false`. The spec defaults rs2/rd to 0 when not specified. This changes the packed_decode value (bits 35-50). However, this is consistent with the CPU table which constructs the same packed_decode. Not a soundness issue but a spec deviation.
+
+**read_register1 and x255**: Code excludes `rs1=255` from `read_register1` (types.rs:444, cpu.rs:750, trace_builder.rs:479). The spec text says `read_register1=1` when `rs1≠0`, which would include x255. Code deviates because x255 (PC) is not a physical register requiring a MEMW read — the CPU already has the PC value. This is consistent across all tables.
+
+**c_type (compressed instructions)**: The c_type bit is defined but never set to `true` in actual decoding (`from_instruction`). RV64C support is not yet implemented. The bit position is reserved and correctly placed at position 6 per spec.
+
+#### Bus Interactions
+
+| Check | Status | Details |
+|-------|--------|---------|
+| DECODE receiver | PASS | BusId::Decode, Multiplicity::Column(MU), values: [pc(DWordWL), imm(DWordWL), packed_decode(Direct)] = 5 elements |
+| Signature match | PASS | Spec: `DECODE[pc, imm, packed_decode]`, input=[DWordWL, DWordWL, BaseField] = 2+2+1 = 5 elements |
+| No extra interactions | PASS | |
+
+#### Padding
+
+| Check | Status | Details |
+|-------|--------|---------|
+| Padding pattern | PASS | pc=7, EBREAK=1, all else 0. Per spec: "smallest odd number > 1+4" |
+| CPU padding entry | PASS | pc=1 (`CPU_PADDING_PC`), all flags=0. Per spec: "pc=1 and every other variable set to 0" |
+| Padding μ=0 | PASS | Bus interaction silent on padding rows |
+| EBREAK trap safety | PASS | CPU asserts EBREAK=0, so padding rows are unprovable if referenced |
+
+#### Precomputed Commitment
+
+| Check | Status | Details |
+|-------|--------|---------|
+| Commitment computation | PASS | LDE of 5 precomputed cols → Merkle tree. Verifier recomputes from ELF. |
+| Columns committed | PASS | PC_0, PC_1, PACKED_DECODE, IMM_0, IMM_1 (excludes MU) |
+
+#### Summary
+
+**DECODE TABLE: PASS**
+
+All 6 columns, 51-bit packed_decode layout, 1 bus interaction (DECODE receiver from CPU), instruction-to-flags mapping for all RV64IM instructions, padding (pc=7, EBREAK=1), and CPU padding entry (pc=1, all zeros) match the spec. Precomputed commitment mechanism is sound (verifier recomputes from ELF).
+
+Minor spec deviations (all internally consistent, not soundness issues):
+- MULW: `signed=0` in code vs `signed=1` in spec (lower 32-bit multiplication unaffected)
+- ECALL: `rs2=10, rd=10` in code vs `rs2=0, rd=0` in spec (consistent with CPU table)
+- `read_register1` excludes `rs1=255` (consistent across CPU, DECODE, trace_builder)
+- `c_type` (RV64C) not yet implemented (bit reserved at correct position)
+
+---
+
+### 12. CPU
+
+**Spec**: `docs/spec/cpu.md` on `md_spec` branch
+**Code**: `prover/src/tables/cpu.rs`, `prover/src/constraints/cpu.rs`
+
+#### Columns
+
+| Check | Status | Details |
+|-------|--------|---------|
+| Input columns match spec | PASS | timestamp(1), pc(DWordWL=2), rs1/rs2/rd(Byte=3), read_register1/2(Bit=2), write_register(Bit=1), memory_Xbytes(Bit=3), c_type(Bit=1), imm(DWordWL=2), signed/mp_selector/muldiv_selector/word_instr(Bit=4), 16 ALU flags(Bit=16) |
+| Output columns match spec | PASS | next_pc(DWordWL=2), rvd(DWordWL=2) |
+| Auxiliary columns match spec | PASS | rv1(DWordWHH=3), rv2(DWordWHH=3), rv1_sign_bit(1), arg1(DWordBL=8), arg2_sign_bit(1), arg2(DWordBL=8), res_sign_bit(1), res(DWordBL=8), is_equal(1), branch_cond(1) |
+| Virtual columns match spec | PASS | packed_decode (linear combination of decode columns), pad (1 - sum of ALU flags) |
+| Column count | PASS | NUM_COLUMNS = 74, matches spec total |
+| Column ordering contiguous | PASS | 0-73, no gaps |
+| No extra columns | PASS | |
+| No missing columns | PASS | |
+
+#### Polynomial Constraints
+
+| Check | Status | Details |
+|-------|--------|---------|
+| CR2: IS_BIT\<read_register1\> | **FAIL** | **MISSING** — not in BIT_FLAG_COLUMNS list. See DEV-7. |
+| CR3: IS_BIT\<read_register2\> | **FAIL** | **MISSING** — not in BIT_FLAG_COLUMNS list. See DEV-8. |
+| CR4-CR28: IS_BIT for all other flags | PASS | 25 flags in BIT_FLAG_COLUMNS: write_register, memory flags(3), c_type, signed, mp_selector, muldiv_selector, word_instr, 16 ALU flags |
+| Extra IS_BIT (not in spec) | NOTE | 5 extra IS_BIT for rv1_sign_bit, arg2_sign_bit, res_sign_bit, is_equal, branch_cond — overconstrained, harmless |
+| CA35: ADD+LOAD → ADD\<res; arg1, arg2\> | PASS | `create_add_constraints` with cond=[ADD,LOAD], 2 carry constraints |
+| CA36: STORE → ADD\<res; arg1, imm\> | PASS | STORE ADD with cond=[STORE], lhs=ARG1, rhs=IMM, sum=RES |
+| CA37: SUB+BEQ → SUB\<res; arg1, arg2\> | PASS | `create_sub_constraints` verifies arg2+res=arg1, cond=[SUB,BEQ] |
+| CA39.i: (SLT+BLT)\*res[i]=0 for i∈[1,7] | PASS | `SltResZeroConstraint` for bytes 1-7 |
+| CA44: JALR → ADD\<res; pc, instr_size\> | PASS | `create_jalr_constraints` with instr_size = 4 - 2\*c_type |
+| CE57: sign bits zero when word_instr=0 | PASS | `SignBitZeroConstraint`: (sum of sign bits)\*(1-word_instr)=0 |
+| CE59: arg1[:4] = rv1[:2] | PASS | `Arg1LowerConstraint`: arg1_lo = rv1_0 + rv1_1\*2^16 |
+| CE60: arg1[4:] = rv1[2]\*(1-word_instr) + (2^32-1)\*rv1_sign_bit\*signed | PASS | `Arg1UpperConstraint` matches spec formula |
+| CE62: arg2[:4] = (1-LOAD)\*rv2[:2] + (1-BEQ-BLT-STORE)\*imm[0] | PASS | `Arg2LowerConstraint` matches spec formula |
+| CE63: arg2[4:] = (1-LOAD)\*((1-word_instr)\*rv2[2] + signed\*arg2_sign_bit\*(2^32-1)) + (1-BEQ-BLT-STORE)\*imm[1] | PASS | `Arg2UpperConstraint` matches spec formula |
+| CE65: (1-LOAD)\*(rvd[0]-res[:4])=0 | PASS | `RvdLowerConstraint` |
+| CE66: (1-LOAD)\*(rvd[1]-(1-word_instr)\*res[4:]-res_sign_bit\*(2^32-1))=0 | PASS | `RvdUpperConstraint` |
+| CM48: (1-read_register1)\*rv1[i]=0 for i∈[0,2] | **FAIL** | **MISSING** — no polynomial constraining rv1 to zero when not reading rs1. See DEV-9. |
+| CM50: (1-read_register2)\*rv2[i]=0 for i∈[0,2] | **FAIL** | **MISSING** — no polynomial constraining rv2 to zero when not reading rs2. See DEV-10. |
+| CS55: EBREAK = 0 | PASS | `EbreakConstraint` correctly enforces EBREAK=0. Note: spec says "1-EBREAK=0" which would mean EBREAK=1 — likely spec typo. Code follows intent. |
+| CO68: branch_cond formula | PASS | `BranchCondConstraint`: JALR + BLT\*(res[0] XOR mp_selector) + BEQ\*(is_equal XOR mp_selector) |
+| CO70: ADD\<next_pc; pc, instr_size\> | PASS | `NextPcAddConstraint` with condition (1-branch_cond). Spec doesn't show explicit condition but code is correct — unconditional would fail on branching rows. |
+| Constraint count | PASS | NUM_CPU_CONSTRAINTS = 56 (30 IS_BIT + 8 ADD/SUB carries + 1 branch_cond + 1 EBREAK + 2 arg1 + 2 arg2 + 2 rvd + 7 SLT zero + 1 sign_bit_zero + 2 next_pc) |
+
+#### Bus Interactions
+
+| Check | Status | Details |
+|-------|--------|---------|
+| C1: DECODE[pc, imm, packed_decode] \| 1 | PASS | Multiplicity::One, packed_decode as linear combination of all decode columns using correct bit positions |
+| CR29: IS_BYTE[rs1] \| 1 | PASS | Multiplicity::One |
+| CR30: IS_BYTE[rs2] \| 1 | PASS | Multiplicity::One |
+| CR31: IS_BYTE[rd] \| 1 | PASS | Multiplicity::One |
+| CR32.i: IS_BYTE[arg1[i]] \| 1 (×8) | PASS | 8 interactions, Multiplicity::One |
+| CR33.i: IS_BYTE[arg2[i]] \| 1 (×8) | PASS | 8 interactions, Multiplicity::One |
+| CR34.i: IS_BYTE[res[i]] \| 1 (×8) | PASS | 8 interactions, Multiplicity::One |
+| CA38: LT[res[0]; arg1, arg2, signed] \| SLT+BLT | PASS | BusId::Lt, Multiplicity::Sum(SLT,BLT), arg1/arg2 as DWordBL (compatible with LT receiver DWordHHW: both → 2 words) |
+| CA40.i: AND_BYTE[res[i]; arg1[i], arg2[i]] \| AND (×8) | PASS | BusId::AndByte, Multiplicity::Column(AND) |
+| CA41.i: OR_BYTE[res[i]; arg1[i], arg2[i]] \| OR (×8) | PASS | BusId::OrByte, Multiplicity::Column(OR) |
+| CA42.i: XOR_BYTE[res[i]; arg1[i], arg2[i]] \| XOR (×8) | PASS | BusId::XorByte, Multiplicity::Column(XOR) |
+| CA43: SHIFT[res; arg1, arg2[0], mp_selector, signed, word_instr] \| SHIFT | PASS | BusId::Shift, Multiplicity::Column(SHIFT), 6 values matching signature |
+| CA45: MUL[res; arg1, signed, arg2, mp_selector, muldiv_selector] \| MUL | **DEV** | BusId::Mul, Multiplicity::Column(MUL). **Code sends rvd instead of res.** See DEV-11. |
+| CA46: DVRM[res; arg1, arg2, signed, muldiv_selector] \| DIVREM | **DEV** | BusId::Dvrm, Multiplicity::Column(DIVREM). **Code sends rvd instead of res.** See DEV-12. |
+| CM47: MEMW read rs1 (24 elems) \| read_register1 | PASS | old=rv1 as WL+6zeros, is_reg=1, addr=2\*rs1, val=rv1, ts=timestamp+0, write2=1 |
+| CM49: MEMW read rs2 (24 elems) \| read_register2 | PASS | old=rv2 as WL+6zeros, is_reg=1, addr=2\*rs2, val=rv2, ts=timestamp+1, write2=1 |
+| CM51: MEMW write rd (16 elems) \| write_register | PASS | is_reg=1, addr=2\*rd, val=rvd as WL+6zeros, ts=timestamp+2, write2=1 |
+| CM52: LOAD[rvd; res, timestamp, memory_flags, signed] \| LOAD | PASS | BusId::Load, 10 elements matching LOAD signature |
+| CM53: MEMW write memory (16 elems) \| STORE | PASS | is_reg=0, addr=res::DWordBL, val=arg2 (8 bytes), ts=timestamp+1, write flags from decode |
+| CM54: MEMW PC register (24 elems) \| 1-pad | PASS | old=pc, is_reg=1, addr=510 (2\*255), val=next_pc, ts=timestamp+1, write2=1. Multiplicity = Linear(sum of all 16 ALU flags) = 1-pad. |
+| CS56: ECALL[timestamp, rv1] \| ECALL | PASS | BusId::Ecall, [timestamp::DWordWL, rv1::DWordWL], Multiplicity::Column(ECALL) |
+| CE58: MSB16[rv1_sign_bit; rv1[1]] \| word_instr | PASS | BusId::Msb16, Multiplicity::Column(WORD_INSTR) |
+| CE61: MSB16[arg2_sign_bit; rv2[1]] \| word_instr | PASS | BusId::Msb16, Multiplicity::Column(WORD_INSTR) |
+| CE64: MSB8[res_sign_bit; res[3]] \| word_instr | PASS | BusId::Msb8, Multiplicity::Column(WORD_INSTR) |
+| CO67: ZERO[is_equal; sum(res[0..7])] \| BEQ | PASS | BusId::Zero, linear sum of 8 res bytes, Multiplicity::Column(BEQ) |
+| CO69: BRANCH[next_pc; pc, imm, arg1, JALR] \| branch_cond | PASS | BusId::Branch, 9 elements, arg1 repacked from bytes to words via Linear, Multiplicity::Column(BRANCH_COND) |
+| Bus interaction count | PASS | 1 DECODE + 27 IS_BYTE + 1 LT + 24 AND/OR/XOR + 1 SHIFT + 1 MUL + 1 DVRM + 5 MEMW + 1 LOAD + 1 ECALL + 3 MSB/ZERO + 1 BRANCH = ~67 interactions |
+
+#### Padding
+
+| Check | Status | Details |
+|-------|--------|---------|
+| Padding PC | PASS | CPU_PADDING_PC = 1 (odd address, unreachable) |
+| Padding next_pc | PASS | next_pc = 5 = 1 + 4. NextPcAdd carry = (1+4-5)/2^32 = 0. ✓ |
+| All flags = 0 on padding | PASS | pad = 1, no ALU interactions fire |
+| IS_BYTE still fires on padding | PASS | Multiplicity::One, so 27 IS_BYTE lookups fire for zero-valued columns |
+| DECODE fires on padding | PASS | Multiplicity::One, DECODE table has entry at pc=1 |
+| CM54 (PC MEMW) does NOT fire | PASS | Multiplicity = sum(ALU flags) = 0 on padding rows |
+| No constraints break on padding | PASS | All polynomial constraints hold: arg1/arg2/res/rvd all zero, sign bits zero, branch_cond=0 |
+
+#### Trace Generation
+
+| Check | Status | Details |
+|-------|--------|---------|
+| Column filling | PASS | All 74 columns correctly filled from CpuOperation fields |
+| rv1 as DWordWHH | PASS | [rv1&0xFFFF, (rv1>>16)&0xFFFF, rv1>>32] |
+| rv2 as DWordWHH | PASS | Same pattern |
+| arg1 computation | PASS | `compute_arg1()`: pass-through for 64-bit, sign/zero-extend for word_instr |
+| arg2 computation | PASS | `compute_arg2()`: LOAD→imm, STORE→rv2, BEQ/BLT→rv2, else→imm or rv2 with word extension |
+| res computation | PASS | `compute_res()`: ADD/LOAD→wrapping_add, STORE→arg1+imm, SUB→wrapping_sub, SHIFT→raw shift, else→executor result |
+| rvd computation | PASS | LOAD→executor value, else→`compute_rvd()` (res with word sign extension) |
+| read_register1 excludes x0 and x255 | NOTE | Matches DEV-5 (spec says rs1≠0, code also excludes rs1=255) |
+| Timestamp stride | PASS | 4 slots per CPU row (timestamp = i * 4) |
+| ECALL next_pc override | PASS | Forces next_pc = pc + 4 even though executor sets next_pc=0 |
+| AUIPC/JAL rv1 = pc | PASS | When rs1=255, rv1 = current_pc from executor log |
+| Padding rows | PASS | pc=1, next_pc=5, all other columns zero |
+
+#### Summary
+
+**CPU TABLE: FINDINGS — 4 CRITICAL missing constraints, 2 MODERATE deviations**
+
+The CPU table has 74 columns (matching spec), 56 polynomial constraints, and ~67 bus interactions. Column layout, ALU dispatch, memory interactions, extension constraints, branch condition, and next_pc computation all match the spec.
+
+**CRITICAL findings** (potential soundness issues):
+- **DEV-7/8**: Missing IS_BIT for `read_register1` and `read_register2`. These multiplicity columns are unconstrained to binary values. The packed_decode provides only one equation for two unknowns, leaving a degree of freedom exploitable by a dishonest prover.
+- **DEV-9/10**: Missing rv1/rv2 zero-forcing polynomials (`CM48`, `CM50`). When `read_register1=0`, rv1 is completely unconstrained — no MEMW read and no zero polynomial. The prover can forge rv1 for instructions using x0 (zero register) or x255 (virtual PC). Same for rv2 when `read_register2=0`.
+
+**MODERATE deviations** (functional difference, needs cross-table verification):
+- **DEV-11/12**: MUL and DVRM interactions send `rvd` (sign-extended for word instructions) instead of `res` (raw result). For word instructions (MULW, DIVW, REMW), rvd differs from the chip's computed result in the upper 32 bits.
+
+---
+
+## Spec Deviations
+
+See **[DEVIATIONS.md](DEVIATIONS.md)** for the detailed report. 12 deviations found across DVRM (2), Decode (4), and CPU (6). CPU has 4 CRITICAL and 2 MODERATE findings.
