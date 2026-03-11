@@ -136,6 +136,44 @@ impl ShiftOperation {
         }
     }
 
+    /// Compute the full result.
+    pub fn compute_result(&self) -> u64 {
+        let val = self.in_halves[0] as u64
+            | (self.in_halves[1] as u64) << 16
+            | (self.in_halves[2] as u64) << 32
+            | (self.in_halves[3] as u64) << 48;
+
+        let modulus = if self.word_instr { 32 } else { 64 };
+        let effective_shift = (self.shift as u32) % modulus;
+
+        if !self.direction {
+            // Left shift
+            if self.word_instr {
+                // 32-bit: shift lower 32 bits, sign-extend
+                let lo = (val as u32).wrapping_shl(effective_shift);
+                lo as i32 as i64 as u64
+            } else {
+                val.wrapping_shl(effective_shift)
+            }
+        } else if !self.signed {
+            // Logical right shift
+            if self.word_instr {
+                let lo = (val as u32).wrapping_shr(effective_shift);
+                lo as i32 as i64 as u64
+            } else {
+                val.wrapping_shr(effective_shift)
+            }
+        } else {
+            // Arithmetic right shift
+            if self.word_instr {
+                let lo = (val as i32).wrapping_shr(effective_shift);
+                lo as i64 as u64
+            } else {
+                (val as i64).wrapping_shr(effective_shift) as u64
+            }
+        }
+    }
+
     /// Compute all auxiliary values for trace generation.
     fn compute_aux(&self) -> ShiftAux {
         let left = !self.direction;
