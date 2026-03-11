@@ -1894,6 +1894,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // -------------------------------------------------------------------------
     // Sends to HALT table only for non-Commit ECALLs.
     // multiplicity = ECALL - ECALL_COMMIT (1 for Halt, 0 for Commit)
+    // rv1 = value of a7 register (syscall number). For sys_exit, rv1 = 93.
     interactions.push(BusInteraction::sender(
         BusId::Ecall,
         Multiplicity::Linear(vec![
