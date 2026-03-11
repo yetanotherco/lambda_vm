@@ -9,5 +9,6 @@ main:
 	div	a2, t0, t0		# 5. 10 / 10 = 1
 	rem	a3, t0, t0		# 6. 10 % 10 = 0
 	addi	a4, zero, 0		# 7. nop
-	li	a7, 5
+	li	a0, 0
+	li	a7, 93
 	ecall		# 8. Return
