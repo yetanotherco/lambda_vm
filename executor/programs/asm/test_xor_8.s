@@ -9,5 +9,6 @@ main:
 	xor	a1, t2, t0		# a1 = ~0xFF = 0xFFFFFFFFFFFFFF00
 	xor	a2, t0, t0		# a2 = 0 (self XOR)
 	addi	t3, zero, 0x55		# t3 = 0x55
-	li	a7, 5
+	li	a0, 0
+	li	a7, 93
 	ecall

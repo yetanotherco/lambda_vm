@@ -322,14 +322,15 @@ fn test_bus_interactions_count() {
     // - 1 M5 (MEMW write rd register)
     // - 1 M6 (LOAD from memory)
     // - 1 M7 (STORE to memory)
+    // - 1 CM54 (MEMW PC register read-write)
     // - 1 DECODE (instruction fetch)
     // - 1 MUL (multiplication)
     // - 1 DVRM (division/remainder)
     // - 1 SHIFT (shift operations)
     // - 1 BRANCH (branch/jump target calculation)
     // - 1 ECALL (send to HALT table)
-    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 5 + 1 + 1 + 1 + 1 + 1 + 1 = 40
-    assert_eq!(interactions.len(), 40);
+    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 6 + 1 + 1 + 1 + 1 + 1 + 1 = 41
+    assert_eq!(interactions.len(), 41);
 }
 
 #[test]

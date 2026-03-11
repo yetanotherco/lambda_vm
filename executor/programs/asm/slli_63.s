@@ -5,5 +5,6 @@ main:
 	# 1 << 63 = 0x8000000000000000 = i64::MIN
 	addi	a2, zero, 1
 	slli	a0, a2, 63
-	li	a7, 5
+	li	a0, 0
+	li	a7, 93
 	ecall

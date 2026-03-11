@@ -1576,6 +1576,36 @@ fn test_small_max_rows_splits_tables() {
     assert!(verified, "Proof with small max_rows should verify");
 }
 
+// =============================================================================
+// Soundness tests: tampered traces must be rejected
+// =============================================================================
+
+/// Tamper with NEXT_PC on a CPU row and verify the proof is rejected.
+///
+/// The PC linkage works via MEMW bus (CM54): each CPU row sends a read-write
+/// for register x255 with old=pc, value=next_pc. If next_pc is wrong in the
+/// CPU trace, the CM54 bus value won't match the MEMW table → bus imbalance
+/// → verification failure.
+#[test]
+fn test_tampered_next_pc_rejected() {
+    use crate::tables::cpu::cols;
+    use math::field::element::FieldElement;
+
+    let (elf, logs, instructions) = run_asm_elf("sub");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+
+    // Tamper: change NEXT_PC_0 on row 0 to a wrong value
+    let original = *traces.cpus[0].get_main(0, cols::NEXT_PC_0);
+    let tampered = original + FieldElement::<F>::from(42u64);
+    traces.cpus[0].set_main(0, cols::NEXT_PC_0, tampered);
+
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "Tampered next_pc should cause verification failure"
+    );
+}
+
 /// Verify rejects inflated table_counts that don't match proof sub-proof count.
 #[test]
 fn test_verify_rejects_inflated_table_counts() {
