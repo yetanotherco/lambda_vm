@@ -544,7 +544,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     }
 
     // -------------------------------------------------------------------------
-    // DVRM-C10.i: IS_HALF[r[i]] (×4), multiplicity: μ_q + μ_r
+    // DVRM-C13.i: IS_HALF[r[i]] (×4), multiplicity: μ_q + μ_r
     // -------------------------------------------------------------------------
     for col in [cols::R_0, cols::R_1, cols::R_2, cols::R_3] {
         interactions.push(BusInteraction::sender(
@@ -558,7 +558,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     }
 
     // -------------------------------------------------------------------------
-    // DVRM-C11.i: IS_HALF[n_sub_r[i]] (×4), multiplicity: μ_q + μ_r
+    // DVRM-C14.i: IS_HALF[n_sub_r[i]] (×4), multiplicity: μ_q + μ_r
     // -------------------------------------------------------------------------
     for col in [
         cols::N_SUB_R_0,
@@ -577,7 +577,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     }
 
     // -------------------------------------------------------------------------
-    // DVRM-C15.i: IS_HALF[q[i]] (×4), multiplicity: μ_q + μ_r
+    // DVRM-C11.i: IS_HALF[q[i]] (×4), multiplicity: μ_q + μ_r
     // -------------------------------------------------------------------------
     for col in [cols::Q_0, cols::Q_1, cols::Q_2, cols::Q_3] {
         interactions.push(BusInteraction::sender(
@@ -591,7 +591,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     }
 
     // -------------------------------------------------------------------------
-    // SIGN templates: MSB16 sign extraction (spec DVRM-C16, C17, C18)
+    // SIGN templates: MSB16 sign extraction (spec DVRM-C18, C19, C20)
     // -------------------------------------------------------------------------
     interactions.extend(sign_interactions(cols::N_3, cols::SIGNED, cols::SIGN_N));
     interactions.extend(sign_interactions(cols::R_3, cols::SIGNED, cols::SIGN_R));
@@ -630,7 +630,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // DVRM-C13: MUL[n_sub_r::DWordWL; d, signed, q, sign_q, 0]
+    // DVRM-C9: MUL[n_sub_r::DWordWL; d, signed, q, sign_q, 0]
     // Verify n - r = d * q (lower 64 bits)
     // multiplicity: μ_q + μ_r
     // -------------------------------------------------------------------------
@@ -669,7 +669,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // DVRM-C14: MUL[extension_n_sub_r::DWordWL; d, signed, q, sign_q, 1]
+    // DVRM-C10: MUL[extension_n_sub_r::DWordWL; d, signed, q, sign_q, 1]
     // Verify upper 64 bits of d * q = sign extension of n_sub_r
     // multiplicity: μ_q + μ_r
     // -------------------------------------------------------------------------
@@ -715,7 +715,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // =========================================================================
-    // ZERO interactions (C3, C5, C8, C20)
+    // ZERO interactions (C3, C5, C8, C17)
     // =========================================================================
 
     // -------------------------------------------------------------------------
@@ -792,7 +792,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // DVRM-C20: ZERO[div_by_zero; d[0]+d[1]+d[2]+d[3]]
+    // DVRM-C17: ZERO[div_by_zero; d[0]+d[1]+d[2]+d[3]]
     // multiplicity: μ_q + μ_r
     // -------------------------------------------------------------------------
     interactions.push(BusInteraction::sender(
@@ -910,13 +910,13 @@ pub enum DvrmConstraintKind {
     AbsDFormula(usize),
     /// DVRM-C7: signed * (1-overflow) - sign_q = 0
     SignQFormula,
-    /// DVRM-C9.i: carry[i] * (1 - carry[i]) = 0 (virtual carries from n = n_sub_r + r)
+    /// DVRM-C12.i: carry[i] * (1 - carry[i]) = 0 (virtual carries from n = n_sub_r + r)
     CarryIsBit(usize),
-    /// DVRM-C12: sign_n_sub_r * (1-sign_n_sub_r) = 0
+    /// DVRM-C15: sign_n_sub_r * (1-sign_n_sub_r) = 0
     SignNSubRIsBit,
-    /// SIGN template arith part: (1-signed) * sign = 0 (spec DVRM-C16b, C17b, C18b)
+    /// SIGN template arith part: (1-signed) * sign = 0 (spec DVRM-C18b, C19b, C20b)
     SignUnsignedZero { sign_col: usize },
-    /// DVRM-C19.i: div_by_zero * (q[i] - 65535) = 0
+    /// DVRM-C16.i: div_by_zero * (q[i] - 65535) = 0
     DivByZeroQ(usize),
 }
 
@@ -1205,17 +1205,17 @@ pub fn dvrm_constraints(constraint_idx_start: usize) -> (Vec<DvrmConstraint>, us
     constraints.push(DvrmConstraint::new(DvrmConstraintKind::SignQFormula, idx));
     idx += 1;
 
-    // DVRM-C9: carry is bit (×4)
+    // DVRM-C12: carry is bit (×4)
     for i in 0..4 {
         constraints.push(DvrmConstraint::new(DvrmConstraintKind::CarryIsBit(i), idx));
         idx += 1;
     }
 
-    // DVRM-C12: sign_n_sub_r is bit
+    // DVRM-C15: sign_n_sub_r is bit
     constraints.push(DvrmConstraint::new(DvrmConstraintKind::SignNSubRIsBit, idx));
     idx += 1;
 
-    // SIGN template arith: (1-signed) * sign = 0 (spec DVRM-C16b, C17b, C18b)
+    // SIGN template arith: (1-signed) * sign = 0 (spec DVRM-C18b, C19b, C20b)
     for &sign_col in &[cols::SIGN_N, cols::SIGN_R, cols::SIGN_D] {
         constraints.push(DvrmConstraint::new(
             DvrmConstraintKind::SignUnsignedZero { sign_col },
@@ -1224,7 +1224,7 @@ pub fn dvrm_constraints(constraint_idx_start: usize) -> (Vec<DvrmConstraint>, us
         idx += 1;
     }
 
-    // DVRM-C19: div_by_zero implies q = all 1s (×4)
+    // DVRM-C16: div_by_zero implies q = all 1s (×4)
     for i in 0..4 {
         constraints.push(DvrmConstraint::new(DvrmConstraintKind::DivByZeroQ(i), idx));
         idx += 1;
