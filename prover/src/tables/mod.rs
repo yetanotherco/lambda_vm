@@ -22,6 +22,7 @@ pub mod types;
 
 pub mod bitwise;
 pub mod branch;
+pub mod commit;
 pub mod cpu;
 pub mod decode;
 pub mod dvrm;

@@ -483,13 +483,6 @@ impl AddConstraint {
         F: IsSubFieldOf<E>,
         E: IsField,
     {
-        // Sum all condition columns: constraint active when any flag is set
-        let cond = self
-            .cond_cols
-            .iter()
-            .map(|&col| step.get_main_evaluation_element(0, col).clone())
-            .fold(FieldElement::<F>::zero(), |acc, x| acc + x);
-
         let one = FieldElement::<F>::one();
 
         let carry = match self.carry_idx {
@@ -498,17 +491,30 @@ impl AddConstraint {
             _ => panic!("Invalid carry index"),
         };
 
-        // cond * carry * (1 - carry)
-        cond * &carry * (one - carry)
+        if self.cond_cols.is_empty() {
+            // Unconditional: carry * (1 - carry)
+            &carry * (one - &carry)
+        } else {
+            // Conditional: cond * carry * (1 - carry)
+            let cond = self
+                .cond_cols
+                .iter()
+                .map(|&col| step.get_main_evaluation_element(0, col).clone())
+                .fold(FieldElement::<F>::zero(), |acc, x| acc + x);
+            cond * &carry * (one - carry)
+        }
     }
 }
 
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for AddConstraint {
     fn degree(&self) -> usize {
-        // The constraint is cond * carry * (1 - carry)
-        // where carry involves division by 2^32 (degree 1 in trace elements)
-        // So total degree: 1 (cond) * 1 (carry) * 1 (1-carry) = 3
-        3
+        if self.cond_cols.is_empty() {
+            // Unconditional: carry * (1 - carry) → degree 2
+            2
+        } else {
+            // Conditional: cond * carry * (1 - carry) → degree 3
+            3
+        }
     }
 
     fn constraint_idx(&self) -> usize {

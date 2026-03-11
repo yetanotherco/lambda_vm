@@ -82,6 +82,7 @@ pub const BIT_FLAG_COLUMNS: &[usize] = &[
     cols::MUL,
     cols::DIVREM,
     cols::ECALL,
+    cols::ECALL_COMMIT,
     cols::EBREAK,
     // Sign bits
     cols::RV1_SIGN_BIT,
@@ -97,6 +98,82 @@ pub const BIT_FLAG_COLUMNS: &[usize] = &[
 /// Returns the constraints and the next available constraint index.
 pub fn create_is_bit_constraints(constraint_idx_start: usize) -> (Vec<IsBitConstraint>, usize) {
     super::templates::new_is_bit_constraints(BIT_FLAG_COLUMNS, constraint_idx_start)
+}
+
+// =========================================================================
+// ECALL_COMMIT Implication Constraint
+// =========================================================================
+
+/// Constraint: ECALL_COMMIT * (1 - ECALL) = 0
+///
+/// Ensures ECALL_COMMIT can only be 1 when ECALL is 1. Without this,
+/// a malicious prover could set ECALL_COMMIT=1 on any row and fabricate
+/// COMMIT bus interactions.
+pub struct EcallCommitImpliesEcallConstraint {
+    constraint_idx: usize,
+}
+
+impl EcallCommitImpliesEcallConstraint {
+    pub fn new(constraint_idx: usize) -> Self {
+        Self { constraint_idx }
+    }
+
+    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        let ecall_commit = step
+            .get_main_evaluation_element(0, cols::ECALL_COMMIT)
+            .clone();
+        let ecall = step.get_main_evaluation_element(0, cols::ECALL).clone();
+        let one = FieldElement::<F>::one();
+        ecall_commit * (one - ecall)
+    }
+}
+
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension>
+    for EcallCommitImpliesEcallConstraint
+{
+    fn degree(&self) -> usize {
+        2
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    fn end_exemptions(&self) -> usize {
+        0
+    }
+
+    fn evaluate(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
+    ) {
+        match evaluation_context {
+            TransitionEvaluationContext::Prover {
+                frame,
+                periodic_values: _,
+                rap_challenges: _,
+                ..
+            } => {
+                let constraint_value = self.compute(frame.get_evaluation_step(0));
+                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
+            }
+
+            TransitionEvaluationContext::Verifier {
+                frame,
+                periodic_values: _,
+                rap_challenges: _,
+                ..
+            } => {
+                let constraint_value = self.compute(frame.get_evaluation_step(0));
+                transition_evaluations[self.constraint_idx] = constraint_value;
+            }
+        }
+    }
 }
 
 // =========================================================================
@@ -1191,11 +1268,12 @@ pub fn create_jalr_constraints(constraint_idx_start: usize) -> (Vec<AddConstrain
 /// - Rvd upper: 1
 /// - SLT res zero: 7 (bytes 1-7)
 /// - Sign bit zero: 1
+/// - ECALL_COMMIT implies ECALL: 1
 /// - Next PC (non-branching): 2
 ///
-/// Total: 56 constraints
+/// Total: 58 constraints (31 IS_BIT + 8 ADD + 19 other)
 pub const NUM_CPU_CONSTRAINTS: usize =
-    30 + 2 + 2 + 2 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 7 + 1 + 2;
+    31 + 2 + 2 + 2 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 7 + 1 + 1 + 2;
 
 /// Creates all CPU constraints.
 ///
@@ -1266,6 +1344,10 @@ pub fn create_all_cpu_constraints() -> (
 
     // Sign bit zero constraint
     other.push(Box::new(SignBitZeroConstraint::new(next_idx)));
+    next_idx += 1;
+
+    // ECALL_COMMIT implies ECALL
+    other.push(Box::new(EcallCommitImpliesEcallConstraint::new(next_idx)));
     next_idx += 1;
 
     // Next PC (non-branching) constraints
