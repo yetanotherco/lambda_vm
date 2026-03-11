@@ -1760,9 +1760,17 @@ where
             // c * fp_a * fp_b - sign_a * m_a * fp_b - sign_b * m_b * fp_a = 0
             // Use conditional negation instead of E×E sign multiplication
             let term_a = m_a * &fp_b;
-            let term_a = if interaction_a.is_sender { term_a } else { -term_a };
+            let term_a = if interaction_a.is_sender {
+                term_a
+            } else {
+                -term_a
+            };
             let term_b = m_b * &fp_a;
-            let term_b = if interaction_b.is_sender { term_b } else { -term_b };
+            let term_b = if interaction_b.is_sender {
+                term_b
+            } else {
+                -term_b
+            };
             c * &fp_a * &fp_b - term_a - term_b
         }
 
