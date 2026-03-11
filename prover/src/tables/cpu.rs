@@ -1918,6 +1918,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     // -------------------------------------------------------------------------
     // IS_BYTE interactions (byte range checks, 27 total)
+    // CPU-CR29: IS_BYTE[rs1], CPU-CR30: IS_BYTE[rs2], CPU-CR31: IS_BYTE[rd]
+    // CPU-CR32.i: IS_BYTE[arg1[i]], CPU-CR33.i: IS_BYTE[arg2[i]], CPU-CR34.i: IS_BYTE[res[i]]
     // -------------------------------------------------------------------------
     // Range-check all 27 byte columns: RS1, RS2, RD, ARG1[0..7], ARG2[0..7], RES[0..7].
     // Every CPU row (including padding) sends with Multiplicity::One.
