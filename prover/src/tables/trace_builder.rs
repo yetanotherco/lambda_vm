@@ -1148,6 +1148,30 @@ fn collect_bitwise_from_branch(branch_ops: &[BranchOperation]) -> Vec<BitwiseOpe
     bitwise_ops
 }
 
+/// Generates IS_BYTE ops for CPU padding rows.
+///
+/// CPU padding rows have all byte columns = 0 (RS1=0, RS2=0, RD=0, etc.).
+/// Since the CPU bus interactions use Multiplicity::One for byte checks,
+/// padding rows also send, so we need matching bitwise ops.
+///
+/// Per padding row: 27 IsByte(0) = 27 ops.
+fn collect_byte_check_ops_for_padding(num_padding_rows: usize) -> Vec<BitwiseOperation> {
+    if num_padding_rows == 0 {
+        return Vec::new();
+    }
+
+    let mut ops = Vec::with_capacity(num_padding_rows * 27);
+    for _ in 0..num_padding_rows {
+        for _ in 0..27 {
+            ops.push(BitwiseOperation::single_byte(
+                BitwiseOperationType::IsByte,
+                0,
+            ));
+        }
+    }
+    ops
+}
+
 /// Collects IS_BYTE lookups from PAGE data (init and fini values).
 ///
 /// Each PAGE byte generates 2 IS_BYTE lookups:
@@ -1712,6 +1736,14 @@ impl Traces {
         // COMMIT table sends IsByte and IsHalfword lookups
         bitwise_ops.extend(collect_bitwise_from_commit(&commit_ops));
 
+        // CPU padding rows send IS_BYTE with all-zero values.
+        // Add corresponding ops so the bitwise table multiplicities balance.
+        let num_padding_rows: usize = cpu_ops
+            .chunks(max_rows.cpu)
+            .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
+            .sum();
+        bitwise_ops.extend(collect_byte_check_ops_for_padding(num_padding_rows));
+
         // =====================================================================
         // PHASE 5: Generate final traces (parallelized)
         // =====================================================================
@@ -1922,6 +1954,13 @@ impl Traces {
         let commit_ops = expand_commit_operations(&cpu_ops, &memory_state);
         // COMMIT table sends IsByte and IsHalfword lookups
         bitwise_ops.extend(collect_bitwise_from_commit(&commit_ops));
+
+        // CPU padding rows send IS_BYTE with all-zero values.
+        let num_padding_rows: usize = cpu_ops
+            .chunks(max_rows.cpu)
+            .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
+            .sum();
+        bitwise_ops.extend(collect_byte_check_ops_for_padding(num_padding_rows));
 
         // =====================================================================
         // PHASE 5: Generate final traces (parallelized)
