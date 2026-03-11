@@ -23,5 +23,6 @@ main:
 
 	# Halt
 	addi	sp, sp, 16		# 15: deallocate stack
-	li	a7, 5			# 16: syscall = Halt
-	ecall				# 17: halt
+	li	a0, 0			# 16: exit_code = 0
+	li	a7, 93			# 17: syscall = Halt (sys_exit)
+	ecall				# 18: halt

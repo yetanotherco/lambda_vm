@@ -419,7 +419,7 @@ fn test_address_incr_halfword_carry() {
 fn test_bus_interactions_count() {
     use crate::tables::commit::bus_interactions;
     let interactions = bus_interactions();
-    assert_eq!(interactions.len(), 18);
+    assert_eq!(interactions.len(), 17);
 }
 
 #[test]

@@ -314,7 +314,7 @@ impl VmAirs {
         let halt = create_halt_air(proof_options);
         let commit = create_commit_air(proof_options);
         let register = create_register_air(proof_options).with_preprocessed(
-            register::preprocessed_commitment(proof_options),
+            register::preprocessed_commitment(proof_options, elf.entry_point),
             register::NUM_PREPROCESSED_COLS,
         );
         let pages: Vec<_> = page_configs

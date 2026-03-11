@@ -3,6 +3,9 @@ name: Hyperfine Benchmark
 on:
   pull_request:
     branches: ["**"]
+    paths:
+      - 'executor/src/**'
+      - 'executor/Cargo.toml'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

@@ -1,8 +1,7 @@
 	.attribute	5, "rv64i2p1_m2p0_zmmul1p0"
-.Lfunc_end0:
 	.globl	main
 main:
-	slti	a0, zero, 0
+	fence
 	li	a0, 0
 	li	a7, 93
 	ecall
