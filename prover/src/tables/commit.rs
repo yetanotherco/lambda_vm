@@ -18,18 +18,16 @@
 //! - `value`: Byte — the byte being committed
 //! - `mu`: Bit — multiplicity (1 for real rows, 0 for padding)
 //!
-//! ## Bus Interactions (18 total)
-//! - **Receiver**: EcallCommit bus — receives `[timestamp_lo, timestamp_hi]` from CPU (mult = first)
+//! ## Bus Interactions (16 total)
+//! - **Receiver**: EcallCommit bus — receives `[timestamp, syscall_number]` from CPU (mult = first)
 //! - **Sender**: CommitNextByte bus — sends to next row (mult = mu - end)
 //! - **Receiver**: CommitNextByte bus — receives from prev row (mult = mu - first)
 //! - **Sender**: IsHalfword bus — range checks for count_decr halfwords (×4, mult = mu)
-//! - **Sender**: IsByte bus — range check for value (mult = mu - end)
 //! - **Sender**: IsHalfword bus — range checks for address_incr halfwords (×4, mult = mu)
 //! - **Sender**: Zero bus — end detection via count_decr (mult = mu)
 //! - **Sender**: Memw bus — read+write x10 register (fd=1→count) at ts (mult = first)
 //! - **Sender**: Memw bus — read x11 register (buf_addr) at ts (mult = first)
 //! - **Sender**: Memw bus — read x12 register (count) at ts (mult = first)
-//! - *(x17 read now handled by CPU M1 interaction)*
 //! - **Sender**: Memw bus — read memory byte at ts (mult = mu - end)
 //!
 //! ## Constraints (8 total)
@@ -232,7 +230,7 @@ pub fn generate_commit_trace(
 // Bus interactions
 // =========================================================================
 
-/// Creates all bus interactions for the COMMIT table (18 total).
+/// Creates all bus interactions for the COMMIT table (16 total).
 ///
 /// The COMMIT table:
 /// - **Receives** EcallCommit from CPU with `[timestamp_lo, timestamp_hi]` (mult = first)
@@ -268,6 +266,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     vec![
         // 1. Receive ECALL from CPU (mult = first)
+        // Payload: [timestamp_lo, timestamp_hi, syscall_lo32, syscall_hi32]
+        // Hardcoded syscall number = 3 (Commit). Bus matching enforces CPU's rv1 == 3.
         BusInteraction::receiver(
             BusId::EcallCommit,
             Multiplicity::Column(cols::FIRST),
@@ -280,6 +280,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     start_column: cols::TIMESTAMP_1,
                     packing: Packing::Direct,
                 },
+                BusValue::constant(3), // syscall number lo32 = Commit (3)
+                BusValue::constant(0), // syscall number hi32 = 0
             ],
         ),
         // 2. Send to CommitNextByte (mult = mu - end)
@@ -373,16 +375,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 packing: Packing::Direct,
             }],
         ),
-        // 8. IsByte for value (mult = mu - end)
-        BusInteraction::sender(
-            BusId::IsByte,
-            mu_minus_end.clone(),
-            vec![BusValue::Packed {
-                start_column: cols::VALUE,
-                packing: Packing::Direct,
-            }],
-        ),
-        // 9-12. IsHalfword for address_incr (×4, mult = mu)
+        // 8-11. IsHalfword for address_incr (×4, mult = mu)
         BusInteraction::sender(
             BusId::IsHalfword,
             Multiplicity::Column(cols::MU),
@@ -415,7 +408,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 packing: Packing::Direct,
             }],
         ),
-        // 13. ZERO bus for end detection (mult = mu)
+        // 12. ZERO bus for end detection (mult = mu)
         // Input: (65535 - cd_0) + (65535 - cd_1) + (65535 - cd_2) + (65535 - cd_3)
         // Output: end (1 when all count_decr halfwords are 0xFFFF, i.e., count was 0)
         BusInteraction::sender(
@@ -447,7 +440,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 },
             ],
         ),
-        // 14. MEMW read+write x10 (fd=1 → count) at ts (mult = first)
+        // 13. MEMW read+write x10 (fd=1 → count) at ts (mult = first)
         // CO24 format: [old[8], is_register, base_addr[2], value[8], ts[2], w2, w4, w8]
         // old = [1,0,...,0] (asserts x10=1=fd), value = [count_0, count_1, 0,...,0] (writes count)
         BusInteraction::sender(
@@ -498,7 +491,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 BusValue::constant(0),
             ],
         ),
-        // 15. MEMW read x11 (buf_addr) at ts (mult = first)
+        // 14. MEMW read x11 (buf_addr) at ts (mult = first)
         BusInteraction::sender(
             BusId::Memw,
             Multiplicity::Column(cols::FIRST),
@@ -553,7 +546,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 BusValue::constant(0),
             ],
         ),
-        // 16. MEMW read x12 (count) at ts (mult = first)
+        // 15. MEMW read x12 (count) at ts (mult = first)
         BusInteraction::sender(
             BusId::Memw,
             Multiplicity::Column(cols::FIRST),
@@ -608,11 +601,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 BusValue::constant(0),
             ],
         ),
-        // 17. MEMW read byte at ts (mult = mu - end)
-        // Note: x17 syscall number check is now handled by CPU's M1 interaction
-        // (read_register1=true, rs1=17), which reads x17 → rv1 = syscall_number.
-        // ECALL_COMMIT flag is only set when rv1 == SyscallNumbers::Commit.
-        // 24-element read format for 1-byte memory access
+        // 16. MEMW read byte at ts (mult = mu - end)
         BusInteraction::sender(
             BusId::Memw,
             mu_minus_end,

@@ -1271,22 +1271,15 @@ fn expand_commit_operations(
 /// Collect bitwise lookups from COMMIT operations.
 ///
 /// The COMMIT table sends:
-/// - IsByte for value (1 per non-end row, mult = mu - end)
 /// - IsHalfword for count_decr components (4 per real row, mult = mu)
 /// - IsHalfword for address_incr halfwords (4 per real row, mult = mu)
 /// - Zero for end detection (1 per real row, mult = mu)
+///
+/// Note: IsByte for value is intentionally omitted per spec.
 fn collect_bitwise_from_commit(commit_ops: &[CommitOperation]) -> Vec<BitwiseOperation> {
     let mut lookups = Vec::new();
 
     for op in commit_ops {
-        // IsByte for value (mult = mu - end, skip end rows)
-        if !op.end {
-            lookups.push(BitwiseOperation::single_byte(
-                BitwiseOperationType::IsByte,
-                op.value,
-            ));
-        }
-
         // IsHalfword for count_decr components (4 halfwords, mult = mu)
         let count_decr = if op.count == 0 {
             u64::MAX

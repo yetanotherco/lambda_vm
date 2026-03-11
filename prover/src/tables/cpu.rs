@@ -1944,6 +1944,21 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 packing: Packing::Direct,
             },
             BusValue::constant(0), // timestamp_hi = 0 (CPU timestamps fit in u32)
+            // rv1 = syscall number (must match COMMIT receiver's hardcoded value)
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::RV1_0,
+                },
+                LinearTerm::Column {
+                    coefficient: 65536,
+                    column: cols::RV1_1,
+                },
+            ]),
+            BusValue::Packed {
+                start_column: cols::RV1_2,
+                packing: Packing::Direct,
+            },
         ],
     ));
 
