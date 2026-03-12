@@ -24,6 +24,7 @@ use stark::proof::options::ProofOptions;
 use stark::trace::TraceTable;
 
 use crate::constraints::cpu::create_all_cpu_constraints;
+use crate::constraints::templates::IsBitConstraint;
 use crate::tables::bitwise::{
     BitwiseOperation, BitwiseOperationType, bus_interactions as bitwise_bus_interactions,
     cols as bitwise_cols,
@@ -769,7 +770,9 @@ pub fn create_register_air(proof_options: &ProofOptions) -> VmAir {
 
 /// Create PUBLIC_OUTPUT AIR with bus interactions.
 pub fn create_public_output_air(proof_options: &ProofOptions) -> VmAir {
-    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![Box::new(
+        IsBitConstraint::unconditional(public_output_cols::MU, 0),
+    )];
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: public_output_bus_interactions(),

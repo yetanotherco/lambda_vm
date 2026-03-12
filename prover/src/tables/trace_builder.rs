@@ -337,7 +337,7 @@ fn collect_ops_from_cpu(
     let mut shift_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
     let mut bitwise_ops = Vec::with_capacity(cpu_ops.len() * 4);
     let mut commit_ops = Vec::new();
-    let mut current_commit_index = 0u64;
+    let mut current_commit_index = 0u32;
 
     for op in cpu_ops {
         // --- MEMW and LOAD (require state tracking, order matters) ---
@@ -362,11 +362,13 @@ fn collect_ops_from_cpu(
             commit_ops.extend(expand_commit_operations_for_ecall(
                 op,
                 memory_state,
-                current_commit_index,
+                current_commit_index as u64,
             ));
             let commit_ops = collect_commit_memw_ops(op, register_state, memory_state);
             memw_ops.extend(commit_ops);
-            current_commit_index = current_commit_index.wrapping_add(op.commit_count);
+            current_commit_index = current_commit_index
+                .checked_add(op.commit_count as u32)
+                .expect("commit index exceeds u32 range");
         }
 
         // --- LT, SHIFT, and Bitwise (no state tracking needed) ---
