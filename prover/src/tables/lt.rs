@@ -474,7 +474,6 @@ impl LtConstraint {
         let inv_2_32 = FieldElement::<F>::from(crate::constraints::templates::INV_SHIFT_32);
         (&rhs_hi + &sub_hi + &carry_0 - &lhs_hi) * &inv_2_32
     }
-
 }
 
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for LtConstraint {

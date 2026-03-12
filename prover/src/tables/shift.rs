@@ -714,7 +714,6 @@ impl ShiftConstraint {
 
         left_part + right_part
     }
-
 }
 
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ShiftConstraint {

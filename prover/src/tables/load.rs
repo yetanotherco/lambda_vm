@@ -573,42 +573,32 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for LoadConstrai
 }
 
 /// Creates all constraints for the LOAD table.
-pub fn constraints() -> Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>> {
-    let mut constraints: Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>> =
-        Vec::new();
+pub fn constraints()
+-> Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>> {
+    let mut constraints: Vec<
+        Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>,
+    > = Vec::new();
 
     let mut idx = 0;
 
     // (read2 + read4 + read8) => μ
-    constraints.push(LoadConstraint::new(
-        LoadConstraintKind::ReadImpliesMu,
-        idx,
-    ).boxed());
+    constraints.push(LoadConstraint::new(LoadConstraintKind::ReadImpliesMu, idx).boxed());
     idx += 1;
 
     // Extension constraints for high bytes (4..8): !read8 => res[i] = extended
     for i in 4..8 {
-        constraints.push(LoadConstraint::new(
-            LoadConstraintKind::ExtensionHigh(i),
-            idx,
-        ).boxed());
+        constraints.push(LoadConstraint::new(LoadConstraintKind::ExtensionHigh(i), idx).boxed());
         idx += 1;
     }
 
     // Extension constraints for mid bytes (2..4): !(read4 + read8) => res[i] = extended
     for i in 2..4 {
-        constraints.push(LoadConstraint::new(
-            LoadConstraintKind::ExtensionMid(i),
-            idx,
-        ).boxed());
+        constraints.push(LoadConstraint::new(LoadConstraintKind::ExtensionMid(i), idx).boxed());
         idx += 1;
     }
 
     // Extension constraint for low byte (1): !(read2 + read4 + read8) => res[1] = extended
-    constraints.push(LoadConstraint::new(
-        LoadConstraintKind::ExtensionLow,
-        idx,
-    ).boxed());
+    constraints.push(LoadConstraint::new(LoadConstraintKind::ExtensionLow, idx).boxed());
 
     constraints
 }

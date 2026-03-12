@@ -112,8 +112,9 @@ where
     }
 
     fn new(proof_options: &ProofOptions) -> Self {
-        let constraints: Vec<Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>> =
-            vec![Box::new(AdditionConstraint::new())];
+        let constraints: Vec<
+            Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>,
+        > = vec![Box::new(AdditionConstraint::new())];
 
         let context = AirContext {
             proof_options: proof_options.clone(),

@@ -1010,8 +1010,9 @@ pub fn create_all_cpu_constraints() -> (
     add_constraints.extend(jalr);
 
     // Other constraints
-    let mut other: Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>> =
-        Vec::new();
+    let mut other: Vec<
+        Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>,
+    > = Vec::new();
 
     // Branch condition
     other.push(BranchCondConstraint::new(next_idx).boxed());

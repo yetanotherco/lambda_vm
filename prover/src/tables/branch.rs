@@ -481,7 +481,6 @@ impl BranchConstraint {
         let inv_2_32 = FieldElement::<F>::from(crate::constraints::templates::INV_SHIFT_32);
         (base_1 + offset_1 + carry_0 - unmasked_1) * inv_2_32
     }
-
 }
 
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for BranchConstraint {

@@ -381,8 +381,7 @@ where
                     self.0.evaluate(frame.get_evaluation_step(0)).to_extension();
             }
             TransitionEvaluationContext::Verifier { frame, .. } => {
-                evals[self.0.constraint_idx()] =
-                    self.0.evaluate(frame.get_evaluation_step(0));
+                evals[self.0.constraint_idx()] = self.0.evaluate(frame.get_evaluation_step(0));
             }
         }
     }

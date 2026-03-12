@@ -1164,24 +1164,20 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MemwConstrai
 }
 
 /// Creates all constraints for the MEMW table.
-pub fn constraints() -> Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>> {
-    let mut constraints: Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>> =
-        Vec::new();
+pub fn constraints()
+-> Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>> {
+    let mut constraints: Vec<
+        Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>,
+    > = Vec::new();
 
     let mut idx = 0;
 
     // IS_BIT<μ_sum>
-    constraints.push(MemwConstraint::new(
-        MemwConstraintKind::MuSumIsBit,
-        idx,
-    ).boxed());
+    constraints.push(MemwConstraint::new(MemwConstraintKind::MuSumIsBit, idx).boxed());
     idx += 1;
 
     // w2 => μ_sum
-    constraints.push(MemwConstraint::new(
-        MemwConstraintKind::W2ImpliesMuSum,
-        idx,
-    ).boxed());
+    constraints.push(MemwConstraint::new(MemwConstraintKind::W2ImpliesMuSum, idx).boxed());
     idx += 1;
 
     // ADD constraints for address_add[0..6]

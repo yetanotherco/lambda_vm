@@ -678,8 +678,9 @@ pub fn create_constraints(
     Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>>,
     usize,
 ) {
-    let mut constraints: Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>> =
-        Vec::with_capacity(8);
+    let mut constraints: Vec<
+        Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>,
+    > = Vec::with_capacity(8);
     let mut idx = constraint_idx_start;
 
     // 0-2: IS_BIT for first, end, mu
@@ -693,10 +694,13 @@ pub fn create_constraints(
     idx = next;
 
     // 3: (first + end) * (1 - mu) = 0
-    constraints.push(CommitConstraint {
-        kind: CommitConstraintKind::FirstOrEndImpliesMu,
-        constraint_idx: idx,
-    }.boxed());
+    constraints.push(
+        CommitConstraint {
+            kind: CommitConstraintKind::FirstOrEndImpliesMu,
+            constraint_idx: idx,
+        }
+        .boxed(),
+    );
     idx += 1;
 
     // 4-5: ADD template for address + 1 = address_incr (unconditional, degree 2)
