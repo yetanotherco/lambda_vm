@@ -1038,6 +1038,7 @@ fn test_decode_soundness_same_elf_accepted() {
         &prover_elf,
         &proof_options,
         false,
+        &traces.public_output_bytes,
         &traces.page_configs,
         &table_counts,
     );
@@ -1055,6 +1056,7 @@ fn test_decode_soundness_same_elf_accepted() {
         &verifier_elf,
         &proof_options,
         false,
+        &traces.public_output_bytes,
         &traces.page_configs,
         &table_counts,
     );

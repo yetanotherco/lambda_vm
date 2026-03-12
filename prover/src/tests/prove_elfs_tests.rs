@@ -44,6 +44,7 @@ type E = GoldilocksExtension;
 ///
 /// Uses minimal bitwise (no full 2^20 preprocessed table) but DECODE is always preprocessed.
 fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
+    let _ = env_logger::builder().is_test(true).try_init();
     let proof_options = ProofOptions::default_test_options();
 
     // Create all AIRs including PAGE and REGISTER tables
@@ -52,6 +53,7 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
         elf,
         &proof_options,
         true,
+        &traces.public_output_bytes,
         &traces.page_configs,
         &table_counts,
     );
@@ -608,6 +610,10 @@ fn test_prove_elfs_test_commit_4() {
     );
 
     let mut traces = Traces::from_elf_and_logs(&elf, &result.logs, &Default::default()).unwrap();
+    assert_eq!(
+        traces.public_output_bytes,
+        result.return_values.memory_values
+    );
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "test_commit_4 failed"
@@ -636,6 +642,7 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
         &elf,
         &proof_options,
         true,
+        &traces.public_output_bytes,
         &traces.page_configs,
         &table_counts,
     );
@@ -647,8 +654,14 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
 
     // Verifier uses EMPTY runtime pages → missing stack/public-output pages
     let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[]);
-    let verifier_airs =
-        crate::VmAirs::new(&elf, &proof_options, true, &wrong_configs, &table_counts);
+    let verifier_airs = crate::VmAirs::new(
+        &elf,
+        &proof_options,
+        true,
+        &traces.public_output_bytes,
+        &wrong_configs,
+        &table_counts,
+    );
 
     let verified = Verifier::multi_verify(
         &verifier_airs.air_refs(),
@@ -658,6 +671,33 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
     assert!(
         !verified,
         "Verifier should REJECT when runtime pages are missing (commit public output page)"
+    );
+}
+
+#[test]
+fn test_verify_rejects_tampered_public_output() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let proof_options = ProofOptions::default_test_options();
+    let vm_proof = crate::prove_with_options(&elf_bytes, &proof_options, &Default::default())
+        .expect("Prover should succeed for test_commit_4");
+    assert!(
+        crate::verify_with_options(&vm_proof, &elf_bytes, &proof_options)
+            .expect("Valid commit proof should verify"),
+        "Baseline proof should verify before tampering"
+    );
+    let mut tampered_output = vm_proof.public_output.clone();
+    tampered_output[0] ^= 0x01;
+
+    let tampered_proof = crate::VmProof {
+        public_output: tampered_output,
+        ..vm_proof
+    };
+
+    let verified = crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options)
+        .expect("Verifier should not error on tampered public output");
+    assert!(
+        !verified,
+        "Verifier should reject proof when VmProof.public_output is tampered"
     );
 }
 
@@ -841,7 +881,7 @@ fn test_debug_memory_bus_tokens() {
 
     let z: i128 = 1000;
     let alpha: i128 = 2;
-    let bus_id: i128 = 16; // BusId::Memory
+    let bus_id: i128 = 17; // BusId::Memory
 
     // Compute fingerprint for a token
     let fingerprint =
@@ -1342,6 +1382,7 @@ fn test_deep_stack_runtime_pages_roundtrip() {
         &elf,
         &proof_options,
         true,
+        &traces.public_output_bytes,
         &traces.page_configs,
         &table_counts,
     );
@@ -1353,8 +1394,14 @@ fn test_deep_stack_runtime_pages_roundtrip() {
 
     // Verifier reconstructs from ELF + runtime_page_ranges hint
     let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges);
-    let verifier_airs =
-        crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs, &table_counts);
+    let verifier_airs = crate::VmAirs::new(
+        &elf,
+        &proof_options,
+        true,
+        &traces.public_output_bytes,
+        &verifier_configs,
+        &table_counts,
+    );
 
     let verified = Verifier::multi_verify(
         &verifier_airs.air_refs(),
@@ -1389,6 +1436,7 @@ fn test_deep_stack_missing_pages_rejected() {
         &elf,
         &proof_options,
         true,
+        &traces.public_output_bytes,
         &traces.page_configs,
         &table_counts,
     );
@@ -1400,8 +1448,14 @@ fn test_deep_stack_missing_pages_rejected() {
 
     // Verifier uses EMPTY runtime_page_ranges → missing stack/heap pages
     let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[]);
-    let verifier_airs =
-        crate::VmAirs::new(&elf, &proof_options, true, &wrong_configs, &table_counts);
+    let verifier_airs = crate::VmAirs::new(
+        &elf,
+        &proof_options,
+        true,
+        &traces.public_output_bytes,
+        &wrong_configs,
+        &table_counts,
+    );
 
     let verified = Verifier::multi_verify(
         &verifier_airs.air_refs(),
@@ -1469,6 +1523,7 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
         &elf,
         &proof_options,
         true,
+        &traces.public_output_bytes,
         &traces.page_configs,
         &table_counts,
     );
@@ -1480,8 +1535,14 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
 
     // Verifier reconstructs from ELF + runtime hint (ranges decoded to pages)
     let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges);
-    let verifier_airs =
-        crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs, &table_counts);
+    let verifier_airs = crate::VmAirs::new(
+        &elf,
+        &proof_options,
+        true,
+        &traces.public_output_bytes,
+        &verifier_configs,
+        &table_counts,
+    );
 
     let verified = Verifier::multi_verify(
         &verifier_airs.air_refs(),
@@ -1586,10 +1647,10 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         shift: 0,
         branch: 0,
     };
-    let airs = VmAirs::new(&elf, &proof_options, true, &[], &zero_counts);
+    let airs = VmAirs::new(&elf, &proof_options, true, &[], &[], &zero_counts);
 
     let verifier_air_refs = airs.air_refs();
-    assert_eq!(verifier_air_refs.len(), 5);
+    assert_eq!(verifier_air_refs.len(), 6);
 
     let mut bitwise_trace = crate::tables::bitwise::generate_bitwise_trace();
 

@@ -31,12 +31,14 @@ pub use crate::tables::MaxRowsConfig;
 use crate::tables::bitwise;
 use crate::tables::decode;
 use crate::tables::page;
+use crate::tables::public_output;
 use crate::tables::register;
 use crate::tables::trace_builder::Traces;
 use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_commit_air, create_cpu_air,
     create_decode_air, create_dvrm_air, create_halt_air, create_load_air, create_lt_air,
-    create_memw_air, create_mul_air, create_page_air, create_register_air, create_shift_air,
+    create_memw_air, create_mul_air, create_page_air, create_public_output_air,
+    create_register_air, create_shift_air,
 };
 
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
@@ -117,6 +119,8 @@ pub struct VmProof {
     /// Number of chunks for each split table.
     /// The verifier needs this to reconstruct matching AIRs.
     pub table_counts: TableCounts,
+    /// Committed public output bytes.
+    pub public_output: Vec<u8>,
 }
 
 /// Error type for the prover crate.
@@ -174,6 +178,7 @@ pub(crate) struct VmAirs {
     pub branches: Vec<VmAir>,
     pub halt: VmAir,
     pub commit: VmAir,
+    pub public_output: VmAir,
     pub register: VmAir,
     pub pages: Vec<VmAir>,
 }
@@ -186,6 +191,7 @@ impl VmAirs {
             (&self.decode, &mut traces.decode, &()),
             (&self.halt, &mut traces.halt, &()),
             (&self.commit, &mut traces.commit, &()),
+            (&self.public_output, &mut traces.public_output, &()),
             (&self.register, &mut traces.register, &()),
         ];
 
@@ -227,6 +233,7 @@ impl VmAirs {
             &self.decode,
             &self.halt,
             &self.commit,
+            &self.public_output,
             &self.register,
         ];
 
@@ -271,6 +278,7 @@ impl VmAirs {
         elf: &Elf,
         proof_options: &ProofOptions,
         minimal_bitwise: bool,
+        public_output_bytes: &[u8],
         page_configs: &[crate::tables::page::PageConfig],
         table_counts: &TableCounts,
     ) -> Self {
@@ -313,6 +321,10 @@ impl VmAirs {
             .collect();
         let halt = create_halt_air(proof_options);
         let commit = create_commit_air(proof_options);
+        let public_output = create_public_output_air(proof_options).with_preprocessed(
+            public_output::preprocessed_commitment(public_output_bytes, proof_options),
+            public_output::NUM_PREPROCESSED_COLS,
+        );
         let register = create_register_air(proof_options).with_preprocessed(
             register::preprocessed_commitment(proof_options, elf.entry_point),
             register::NUM_PREPROCESSED_COLS,
@@ -343,6 +355,7 @@ impl VmAirs {
             branches,
             halt,
             commit,
+            public_output,
             register,
             pages,
         }
@@ -378,6 +391,7 @@ pub fn prove_with_options(
         &program,
         proof_options,
         false,
+        &traces.public_output_bytes,
         &traces.page_configs,
         &table_counts,
     );
@@ -394,6 +408,7 @@ pub fn prove_with_options(
         proof,
         runtime_page_ranges,
         table_counts,
+        public_output: traces.public_output_bytes.clone(),
     })
 }
 
@@ -429,11 +444,11 @@ pub fn verify_with_options(
         Traces::page_configs_from_elf_and_runtime(&program, &vm_proof.runtime_page_ranges);
 
     // Cross-check: table_counts must match the number of sub-proofs.
-    // Fixed tables (bitwise, decode, halt, commit, register) = 5, plus page tables.
-    let expected_proof_count = vm_proof.table_counts.total() + 5 + page_configs.len();
+    // Fixed tables (bitwise, decode, halt, commit, public_output, register) = 6, plus page tables.
+    let expected_proof_count = vm_proof.table_counts.total() + 6 + page_configs.len();
     if expected_proof_count != vm_proof.proof.proofs.len() {
         return Err(Error::InvalidTableCounts(format!(
-            "table_counts total ({}) + 5 fixed + {} pages = {}, but proof contains {} sub-proofs",
+            "table_counts total ({}) + 6 fixed + {} pages = {}, but proof contains {} sub-proofs",
             vm_proof.table_counts.total(),
             page_configs.len(),
             expected_proof_count,
@@ -445,6 +460,7 @@ pub fn verify_with_options(
         &program,
         proof_options,
         false,
+        &vm_proof.public_output,
         &page_configs,
         &vm_proof.table_counts,
     );

@@ -47,7 +47,7 @@ const MAX_PRIVATE_INPUT_SIZE: u64 = 6700000;
 const PRIVATE_INPUT_START_INDEX: u64 = 0xFF000000;
 
 #[derive(Default, Debug)]
-pub struct Memory(U64HashMap<[u8; 4]>);
+pub struct Memory(U64HashMap<[u8; 4]>, u64);
 
 impl Memory {
     pub fn load_byte(&self, address: u64) -> u8 {
@@ -137,12 +137,17 @@ impl Memory {
     }
 
     pub fn commit_public_output(&mut self, address: u64, length: u64) -> Result<(), MemoryError> {
-        if length > MAX_PUBLIC_OUTPUT_COMMIT_SIZE {
+        let new_cursor = self.1.saturating_add(length);
+        if new_cursor > MAX_PUBLIC_OUTPUT_COMMIT_SIZE {
             return Err(MemoryError::CommitSizeExceeded);
         }
-        self.store_word(PUBLIC_OUTPUT_START_INDEX, length as u32)?;
+
         let inputs = self.load_bytes(address, length);
-        self.set_bytes_aligned(PUBLIC_OUTPUT_START_INDEX + 4, &inputs)?;
+        for (offset, byte) in inputs.into_iter().enumerate() {
+            self.store_byte(PUBLIC_OUTPUT_START_INDEX + 4 + self.1 + offset as u64, byte);
+        }
+        self.1 = new_cursor;
+        self.store_word(PUBLIC_OUTPUT_START_INDEX, self.1 as u32)?;
         Ok(())
     }
 
@@ -207,4 +212,53 @@ pub enum MemoryError {
     CommitSizeExceeded,
     #[error("Private input size exceeded")]
     PrivateInputSizeExceeded,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Memory;
+
+    #[test]
+    fn test_commit_public_output_appends() {
+        let mut memory = Memory::default();
+        memory.store_byte(0x100, b'a');
+        memory.store_byte(0x101, b'b');
+        memory.store_byte(0x104, b'c');
+        memory.store_byte(0x105, b'd');
+
+        memory
+            .commit_public_output(0x100, 2)
+            .expect("first commit should succeed");
+        memory
+            .commit_public_output(0x104, 2)
+            .expect("second commit should succeed");
+
+        assert_eq!(
+            memory
+                .read_return_value()
+                .expect("public output should be readable"),
+            b"abcd".to_vec()
+        );
+    }
+
+    #[test]
+    fn test_commit_public_output_zero_length_is_noop() {
+        let mut memory = Memory::default();
+        memory.store_byte(0x100, b'x');
+        memory.store_byte(0x101, b'y');
+
+        memory
+            .commit_public_output(0x100, 2)
+            .expect("initial commit should succeed");
+        memory
+            .commit_public_output(0x200, 0)
+            .expect("zero-length commit should succeed");
+
+        assert_eq!(
+            memory
+                .read_return_value()
+                .expect("public output should be readable"),
+            b"xy".to_vec()
+        );
+    }
 }

@@ -110,6 +110,8 @@ pub enum BusId {
     EcallCommit,
     /// COMMIT self-referencing recursive bus (row N → row N+1)
     CommitNextByte,
+    /// COMMIT output bus consumed by the public-output table
+    Commit,
 }
 
 impl BusId {
@@ -139,6 +141,7 @@ impl BusId {
             BusId::Dvrm => "Dvrm",
             BusId::EcallCommit => "EcallCommit",
             BusId::CommitNextByte => "CommitNextByte",
+            BusId::Commit => "Commit",
         }
     }
 }
@@ -161,15 +164,17 @@ impl TryFrom<u64> for BusId {
             10 => Ok(BusId::Hwslc),
             11 => Ok(BusId::Lt),
             12 => Ok(BusId::Mul),
-            13 => Ok(BusId::Shift),
-            14 => Ok(BusId::Memw),
-            15 => Ok(BusId::Load),
-            16 => Ok(BusId::Memory),
-            17 => Ok(BusId::Branch),
-            18 => Ok(BusId::Decode),
-            19 => Ok(BusId::Ecall),
-            20 => Ok(BusId::EcallCommit),
-            21 => Ok(BusId::CommitNextByte),
+            13 => Ok(BusId::Dvrm),
+            14 => Ok(BusId::Shift),
+            15 => Ok(BusId::Memw),
+            16 => Ok(BusId::Load),
+            17 => Ok(BusId::Memory),
+            18 => Ok(BusId::Branch),
+            19 => Ok(BusId::Decode),
+            20 => Ok(BusId::Ecall),
+            21 => Ok(BusId::EcallCommit),
+            22 => Ok(BusId::CommitNextByte),
+            23 => Ok(BusId::Commit),
             other => Err(other),
         }
     }
