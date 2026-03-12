@@ -331,6 +331,13 @@ impl AsBytes for FieldElement<GoldilocksField> {
     fn as_bytes(&self) -> alloc::vec::Vec<u8> {
         ByteConversion::to_bytes_be(self)
     }
+
+    #[inline(always)]
+    fn write_bytes(&self, buf: &mut [u8]) -> usize {
+        let bytes = self.to_bytes_be(); // [u8; 8], stack-allocated
+        buf[..8].copy_from_slice(&bytes);
+        8
+    }
 }
 
 // Implement IsPrimeField for the native Goldilocks

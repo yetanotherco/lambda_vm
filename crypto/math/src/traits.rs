@@ -33,6 +33,17 @@ pub trait ByteConversion {
 pub trait AsBytes {
     /// Default serialize without args
     fn as_bytes(&self) -> alloc::vec::Vec<u8>;
+
+    /// Write the byte representation into `buf`, which must be at least `as_bytes().len()` bytes.
+    /// Returns the number of bytes written.
+    ///
+    /// The default implementation calls `as_bytes()` and copies; field-element types override
+    /// this to avoid heap allocation entirely.
+    fn write_bytes(&self, buf: &mut [u8]) -> usize {
+        let v = self.as_bytes();
+        buf[..v.len()].copy_from_slice(&v);
+        v.len()
+    }
 }
 
 #[cfg(feature = "alloc")]
