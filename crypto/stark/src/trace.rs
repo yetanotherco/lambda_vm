@@ -700,6 +700,108 @@ where
     Table::new(table_data, table_width)
 }
 
+#[cfg(all(test, feature = "disk-spill"))]
+mod disk_spill_tests {
+    use super::*;
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
+    use math::field::goldilocks::GoldilocksField;
+
+    type F = GoldilocksField;
+    type E = Degree3GoldilocksExtensionField;
+
+    /// Spill main LDE columns from a simulated pool, then verify `get_main()`
+    /// returns the correct values from the mmap backing.
+    #[test]
+    fn test_lde_spill_main_roundtrip() {
+        let num_cols = 3;
+        let num_rows = 16;
+
+        // Simulate pool: column-major Vec<Vec<FE>>
+        let pool: Vec<Vec<FieldElement<F>>> = (0..num_cols)
+            .map(|c| {
+                (0..num_rows)
+                    .map(|r| FieldElement::<F>::from((c * num_rows + r) as u64))
+                    .collect()
+            })
+            .collect();
+
+        let lde = LDETraceTable::<F, E>::spill_main_from_pool(
+            &pool,
+            num_cols,
+            /*trace_step_size=*/ 1,
+            /*blowup_factor=*/ 1,
+        )
+        .expect("spill_main_from_pool failed");
+
+        assert_eq!(lde.num_main_cols(), num_cols);
+        assert_eq!(lde.num_rows(), num_rows);
+        assert!(lde.main_columns.is_empty(), "main_columns should be empty after spill");
+
+        // Verify every element
+        for c in 0..num_cols {
+            for r in 0..num_rows {
+                assert_eq!(
+                    lde.get_main(r, c),
+                    &pool[c][r],
+                    "mismatch at (row={r}, col={c})"
+                );
+            }
+        }
+    }
+
+    /// Spill main + aux LDE columns and verify both are accessible.
+    #[test]
+    fn test_lde_spill_main_and_aux_roundtrip() {
+        let num_main = 2;
+        let num_aux = 2;
+        let num_rows = 8;
+
+        let main_pool: Vec<Vec<FieldElement<F>>> = (0..num_main)
+            .map(|c| {
+                (0..num_rows)
+                    .map(|r| FieldElement::<F>::from((c * num_rows + r) as u64))
+                    .collect()
+            })
+            .collect();
+
+        let aux_pool: Vec<Vec<FieldElement<E>>> = (0..num_aux)
+            .map(|c| {
+                (0..num_rows)
+                    .map(|r| FieldElement::<E>::from((100 + c * num_rows + r) as u64))
+                    .collect()
+            })
+            .collect();
+
+        let mut lde = LDETraceTable::<F, E>::spill_main_from_pool(
+            &main_pool,
+            num_main,
+            1,
+            1,
+        )
+        .expect("spill_main_from_pool failed");
+
+        lde.add_aux_from_pool(&aux_pool, num_aux)
+            .expect("add_aux_from_pool failed");
+
+        assert_eq!(lde.num_main_cols(), num_main);
+        assert_eq!(lde.num_aux_cols(), num_aux);
+
+        // Verify main
+        for c in 0..num_main {
+            for r in 0..num_rows {
+                assert_eq!(lde.get_main(r, c), &main_pool[c][r]);
+            }
+        }
+
+        // Verify aux
+        for c in 0..num_aux {
+            for r in 0..num_rows {
+                assert_eq!(lde.get_aux(r, c), &aux_pool[c][r]);
+            }
+        }
+    }
+}
+
 pub fn columns2rows<F>(columns: Vec<Vec<F>>) -> Vec<Vec<F>>
 where
     F: Clone,

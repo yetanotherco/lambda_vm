@@ -380,3 +380,81 @@ where
         &self.aux_data[row][col]
     }
 }
+
+#[cfg(all(test, feature = "disk-spill"))]
+mod disk_spill_tests {
+    use super::*;
+    use math::field::goldilocks::GoldilocksField;
+
+    type F = GoldilocksField;
+
+    /// Create a Table, spill it to disk, and verify that `get()` and `get_row()`
+    /// return the same values as before the spill.
+    #[test]
+    fn test_table_spill_roundtrip() {
+        let width = 4;
+        let height = 8;
+        let data: Vec<FieldElement<F>> = (0..width * height)
+            .map(|i| FieldElement::<F>::from(i as u64))
+            .collect();
+
+        let mut table = Table::new(data.clone(), width);
+        assert!(!table.is_spilled());
+
+        // Snapshot values before spill
+        let pre_spill: Vec<Vec<FieldElement<F>>> = (0..height)
+            .map(|r| (0..width).map(|c| table.get(r, c).clone()).collect())
+            .collect();
+
+        table.spill_to_disk().expect("spill_to_disk failed");
+        assert!(table.is_spilled());
+        assert!(table.data.is_empty(), "heap data should be freed after spill");
+
+        // Verify get() returns the same values
+        for r in 0..height {
+            for c in 0..width {
+                assert_eq!(
+                    table.get(r, c),
+                    &pre_spill[r][c],
+                    "mismatch at ({r}, {c})"
+                );
+            }
+        }
+
+        // Verify get_row() returns the same values
+        for r in 0..height {
+            let row = table.get_row(r);
+            assert_eq!(row.len(), width);
+            for c in 0..width {
+                assert_eq!(&row[c], &pre_spill[r][c], "get_row mismatch at ({r}, {c})");
+            }
+        }
+    }
+
+    /// Spilling an empty table is a no-op.
+    #[test]
+    fn test_table_spill_empty_is_noop() {
+        let mut table = Table::<F>::new(Vec::new(), 0);
+        table.spill_to_disk().expect("spill_to_disk on empty table failed");
+        assert!(!table.is_spilled());
+    }
+
+    /// Spilling twice is idempotent (second call is a no-op).
+    #[test]
+    fn test_table_spill_idempotent() {
+        let data: Vec<FieldElement<F>> = (0..16)
+            .map(|i| FieldElement::<F>::from(i as u64))
+            .collect();
+        let mut table = Table::new(data, 4);
+
+        table.spill_to_disk().expect("first spill failed");
+        assert!(table.is_spilled());
+
+        table.spill_to_disk().expect("second spill should be no-op");
+        assert!(table.is_spilled());
+
+        // Still readable
+        assert_eq!(table.get(0, 0), &FieldElement::<F>::from(0u64));
+        assert_eq!(table.get(3, 3), &FieldElement::<F>::from(15u64));
+    }
+}
