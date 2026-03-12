@@ -687,6 +687,10 @@ pub trait IsStarkProver<
 
     /// Returns the Merkle tree and the commitment to the evaluations of the parts of the
     /// composition polynomial.
+    ///
+    /// Streams Keccak256 leaf hashes directly from column-major data with bit-reverse
+    /// and pair-merging done during hashing. This avoids allocating the transposed row
+    /// matrix, the bit-reversed copy, and the merged pair vectors.
     fn commit_composition_polynomial(
         lde_composition_poly_parts_evaluations: &[Vec<FieldElement<FieldExtension>>],
     ) -> Option<(BatchedMerkleTree<FieldExtension>, Commitment)>
@@ -694,31 +698,44 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        let num_parts = lde_composition_poly_parts_evaluations.len();
+        if lde_composition_poly_parts_evaluations.is_empty()
+            || lde_composition_poly_parts_evaluations[0].is_empty()
+        {
+            return None;
+        }
         let num_rows = lde_composition_poly_parts_evaluations[0].len();
+        let num_leaves = num_rows / 2;
 
-        // Transpose columns → rows with pre-allocated capacity.
-        let mut rows: Vec<Vec<FieldElement<FieldExtension>>> = Vec::with_capacity(num_rows);
-        for i in 0..num_rows {
-            let mut row = Vec::with_capacity(num_parts);
-            for part in lde_composition_poly_parts_evaluations.iter() {
-                row.push(part[i].clone());
-            }
-            rows.push(row);
-        }
+        // Each Merkle leaf k hashes: for each part, part[br(2k)] then part[br(2k+1)].
+        #[cfg(feature = "parallel")]
+        let iter = (0..num_leaves).into_par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let iter = 0..num_leaves;
 
-        in_place_bit_reverse_permute(&mut rows);
+        let hashed_leaves: Vec<Commitment> = iter
+            .map(|leaf_idx| {
+                let br_even = reverse_index(leaf_idx * 2, num_rows as u64);
+                let br_odd = reverse_index(leaf_idx * 2 + 1, num_rows as u64);
+                let mut hasher = sha3::Keccak256::new();
+                let mut buf = [0u8; 32];
+                for part in lde_composition_poly_parts_evaluations.iter() {
+                    let n = part[br_even].write_bytes(&mut buf);
+                    hasher.update(&buf[..n]);
+                }
+                for part in lde_composition_poly_parts_evaluations.iter() {
+                    let n = part[br_odd].write_bytes(&mut buf);
+                    hasher.update(&buf[..n]);
+                }
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&hasher.finalize());
+                hash
+            })
+            .collect();
 
-        // Merge consecutive pairs: [row0, row1] → row0 ++ row1.
-        // Drain pairs from the original vec to avoid cloning.
-        let mut merged: Vec<Vec<FieldElement<FieldExtension>>> = Vec::with_capacity(num_rows / 2);
-        let mut iter = rows.into_iter();
-        while let (Some(mut first), Some(second)) = (iter.next(), iter.next()) {
-            first.extend(second);
-            merged.push(first);
-        }
-
-        Self::batch_commit_extension(&merged)
+        let tree =
+            BatchedMerkleTree::<FieldExtension>::build_from_hashed_leaves(hashed_leaves)?;
+        let root = tree.root;
+        Some((tree, root))
     }
 
     /// Algebraically decompose H(x) = H₀(x²) + x·H₁(x²) on the LDE coset, then
