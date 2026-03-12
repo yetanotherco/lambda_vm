@@ -5,5 +5,6 @@ main:
 	# 1 << 31 = 0x80000000, sign-extends to 0xFFFFFFFF80000000
 	addi	a2, zero, 1
 	slliw	a0, a2, 31
-	li	a7, 5
+	li	a0, 0
+	li	a7, 93
 	ecall

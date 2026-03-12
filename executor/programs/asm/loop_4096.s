@@ -4,9 +4,8 @@ main:
     # Program with exactly 4096 (2^12) instructions
     # Setup: 4 instructions
     # Loop: 1363 iterations * 3 instructions = 4089 instructions
-    # Cleanup: 2 instructions
-    # Halt: 1 instruction
-    # Total: 4 + 4089 + 2 + 1 = 4096
+    # Halt: 3 instructions (li a0, li a7, ecall)
+    # Total: 4 + 4089 + 3 = 4096
 
     addi t0, zero, 1363       # 1: counter = 1363
     addi t1, zero, 0          # 2: accumulator = 0
@@ -19,7 +18,6 @@ loop:
     bne  t0, zero, loop       # if counter != 0, continue
     # 1363 * 3 = 4089 instructions
 
-    addi zero, zero, 0        # cleanup NOP
-    addi zero, zero, 0        # cleanup NOP
-    li	a7, 5
+    li	a0, 0
+    li	a7, 93
 	ecall        # halt

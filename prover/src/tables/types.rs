@@ -104,8 +104,12 @@ pub enum BusId {
     // =========================================================================
     /// Instruction decode lookup
     Decode,
-    /// System call handling
+    /// System call handling (CPU → HALT for Halt ECALLs)
     Ecall,
+    /// ECALL dispatch for Commit syscall (CPU → COMMIT)
+    EcallCommit,
+    /// COMMIT self-referencing recursive bus (row N → row N+1)
+    CommitNextByte,
 }
 
 impl BusId {
@@ -133,6 +137,8 @@ impl BusId {
             BusId::Decode => "Decode",
             BusId::Ecall => "Ecall",
             BusId::Dvrm => "Dvrm",
+            BusId::EcallCommit => "EcallCommit",
+            BusId::CommitNextByte => "CommitNextByte",
         }
     }
 }
@@ -162,6 +168,8 @@ impl TryFrom<u64> for BusId {
             17 => Ok(BusId::Branch),
             18 => Ok(BusId::Decode),
             19 => Ok(BusId::Ecall),
+            20 => Ok(BusId::EcallCommit),
+            21 => Ok(BusId::CommitNextByte),
             other => Err(other),
         }
     }
@@ -686,16 +694,12 @@ impl DecodeEntry {
             }
 
             Instruction::EcallEbreak => {
-                // ECALL is handled specially: the executor Log returns src1_val=0, src2_val=0,
-                // dst_val=0 for Halt syscalls (regardless of actual register values).
-                // To avoid corrupting register state in the trace builder, we don't set
-                // read_register or write_register flags. The HALT table handles termination.
                 entry.op_ecall = true;
-                // Set register indices for reference, but don't mark them as read/written
                 entry.rs1 = 17; // a7 (syscall number)
+                entry.read_register1 = true; // M1 reads a7 → rv1 = syscall number
                 entry.rs2 = 10; // a0 (arg)
                 entry.rd = 10; // a0 (result)
-                // Note: read_register1, read_register2, write_register remain false
+                // read_register2, write_register remain false
             }
 
             Instruction::Fence => {

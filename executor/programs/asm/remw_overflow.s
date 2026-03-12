@@ -6,5 +6,6 @@ main:
 	li	a2, -2147483648      # i32::MIN
 	addi	a3, zero, -1
 	remw	a0, a2, a3
-	li	a7, 5
+	li	a0, 0
+	li	a7, 93
 	ecall

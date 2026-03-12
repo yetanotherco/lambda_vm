@@ -54,8 +54,8 @@ fn append_ecall(logs: &mut Vec<Log>, instrs: &mut Vec<Instruction>) {
     let last_pc = logs.last().map(|l| l.current_pc + 4).unwrap_or(0x1000);
     logs.push(Log {
         current_pc: last_pc,
-        next_pc: 0, // executor sets next_pc=0 for halt; prover overrides to pc+4
-        src1_val: 0,
+        next_pc: 0,   // executor sets next_pc=0 for halt; prover overrides to pc+4
+        src1_val: 93, // a7 = 93 (sys_exit); ECALL has read_register1=true, rs1=17
         src2_val: 0,
         dst_val: 0,
     });

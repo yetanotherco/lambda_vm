@@ -31,6 +31,10 @@ use crate::tables::bitwise::{
 use crate::tables::branch::{
     branch_constraints, bus_interactions as branch_bus_interactions, cols as branch_cols,
 };
+use crate::tables::commit::{
+    bus_interactions as commit_bus_interactions, cols as commit_cols,
+    create_constraints as commit_constraints,
+};
 use crate::tables::cpu::{
     CpuOperation, bus_interactions as cpu_bus_interactions, cols as cpu_cols,
 };
@@ -692,6 +696,24 @@ pub fn create_halt_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("HALT")
+}
+
+/// Create COMMIT AIR with constraints and bus interactions.
+pub fn create_commit_air(proof_options: &ProofOptions) -> VmAir {
+    let (transition_constraints, _) = commit_constraints(0);
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: commit_bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        commit_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+    .with_name("COMMIT")
 }
 
 /// Create PAGE AIR with bus interactions for a specific page.

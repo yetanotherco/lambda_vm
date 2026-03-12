@@ -6,5 +6,6 @@ main:
 	addi	a2, zero, 1
 	addi	a3, zero, 33
 	sllw	a0, a2, a3
-	li	a7, 5
+	li	a0, 0
+	li	a7, 93
 	ecall
