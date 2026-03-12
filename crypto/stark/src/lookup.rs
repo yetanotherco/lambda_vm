@@ -1319,12 +1319,7 @@ where
     let num_bus_elements = table_interaction.num_bus_elements();
     let alpha_powers = compute_alpha_powers(alpha, num_bus_elements);
 
-    // Sign: +1 for senders, -1 for receivers
-    let sign = if table_interaction.is_sender {
-        FieldElement::<E>::one()
-    } else {
-        -FieldElement::<E>::one()
-    };
+    let negate = !table_interaction.is_sender;
 
     // Batch inversion: collect all fingerprints, invert once, then multiply back.
     // Compute fingerprint = z - (bus_id*α^0 + v0*α^1 + v1*α^2 + ...) using
@@ -1376,11 +1371,15 @@ where
     FieldElement::inplace_batch_inverse(&mut fingerprints)
         .expect("fingerprint is zero - probability of sampling zero is negligible");
 
-    // Compute terms: term[i] = sign * multiplicity[i] * fingerprint_inv[i]
+    // Compute terms: term[i] = ±(multiplicity[i] * fingerprint_inv[i])
+    // Use conditional negation instead of E×E sign multiplication
     multiplicities
         .iter()
         .zip(fingerprints.iter())
-        .map(|(multiplicity, fingerprint_inv)| multiplicity * &sign * fingerprint_inv)
+        .map(|(multiplicity, fingerprint_inv)| {
+            let term = multiplicity * fingerprint_inv;
+            if negate { -term } else { term }
+        })
         .collect()
 }
 
@@ -1410,16 +1409,8 @@ where
         .max(interaction_b.num_bus_elements());
     let alpha_powers = compute_alpha_powers(alpha, max_bus_elements);
 
-    let sign_a = if interaction_a.is_sender {
-        FieldElement::<E>::one()
-    } else {
-        -FieldElement::<E>::one()
-    };
-    let sign_b = if interaction_b.is_sender {
-        FieldElement::<E>::one()
-    } else {
-        -FieldElement::<E>::one()
-    };
+    let negate_a = !interaction_a.is_sender;
+    let negate_b = !interaction_b.is_sender;
 
     // Helper to compute multiplicities for an interaction
     let compute_multiplicities = |interaction: &BusInteraction| -> Vec<FieldElement<F>> {
@@ -1511,13 +1502,17 @@ where
     FieldElement::inplace_batch_inverse(&mut all_fingerprints)
         .expect("fingerprint is zero - probability of sampling zero is negligible");
 
-    // Compute batched terms: term[i] = sign_a * m_a[i] * fp_a_inv[i] + sign_b * m_b[i] * fp_b_inv[i]
+    // Compute batched terms: term[i] = m_a[i] / fp_a[i] ± m_b[i] / fp_b[i]
+    // Use conditional negation instead of E×E sign multiplication
     (0..trace_len)
         .map(|row| {
             let fp_a_inv = &all_fingerprints[row];
             let fp_b_inv = &all_fingerprints[trace_len + row];
-            &multiplicities_a[row] * &sign_a * fp_a_inv
-                + &multiplicities_b[row] * &sign_b * fp_b_inv
+            let term_a = &multiplicities_a[row] * fp_a_inv;
+            let term_b = &multiplicities_b[row] * fp_b_inv;
+            let term_a = if negate_a { -term_a } else { term_a };
+            let term_b = if negate_b { -term_b } else { term_b };
+            term_a + term_b
         })
         .collect()
 }
@@ -1762,19 +1757,21 @@ where
             let fp_a = compute_fingerprint_from_step(step, interaction_a, z, alpha_powers);
             let fp_b = compute_fingerprint_from_step(step, interaction_b, z, alpha_powers);
 
-            let sign_a: FieldElement<B> = if interaction_a.is_sender {
-                FieldElement::one()
-            } else {
-                -FieldElement::one()
-            };
-            let sign_b: FieldElement<B> = if interaction_b.is_sender {
-                FieldElement::one()
-            } else {
-                -FieldElement::one()
-            };
-
             // c * fp_a * fp_b - sign_a * m_a * fp_b - sign_b * m_b * fp_a = 0
-            c * &fp_a * &fp_b - m_a * sign_a * &fp_b - m_b * sign_b * &fp_a
+            // Use conditional negation instead of E×E sign multiplication
+            let term_a = m_a * &fp_b;
+            let term_a = if interaction_a.is_sender {
+                term_a
+            } else {
+                -term_a
+            };
+            let term_b = m_b * &fp_a;
+            let term_b = if interaction_b.is_sender {
+                term_b
+            } else {
+                -term_b
+            };
+            c * &fp_a * &fp_b - term_a - term_b
         }
 
         let res = match evaluation_context {
@@ -1896,9 +1893,11 @@ where
 
             // Clear denominators of absorbed interactions
             debug_assert!(matches!(absorbed.len(), 1 | 2));
+            // Use conditional negation instead of E×E sign multiplication where possible
             match absorbed.len() {
                 1 => {
                     // (delta) · f - sign · m = 0
+                    // sign multiply also promotes m from base field A to extension B
                     let m = compute_multiplicity_from_step(second_step, &absorbed[0].multiplicity);
                     let f =
                         compute_fingerprint_from_step(second_step, &absorbed[0], z, alpha_powers);
@@ -1911,23 +1910,18 @@ where
                 }
                 2 => {
                     // (delta) · f₁ · f₂ - sign₁·m₁·f₂ - sign₂·m₂·f₁ = 0
+                    // m_i * f_j naturally promotes A→B, then conditionally negate
                     let m1 = compute_multiplicity_from_step(second_step, &absorbed[0].multiplicity);
                     let m2 = compute_multiplicity_from_step(second_step, &absorbed[1].multiplicity);
                     let f1 =
                         compute_fingerprint_from_step(second_step, &absorbed[0], z, alpha_powers);
                     let f2 =
                         compute_fingerprint_from_step(second_step, &absorbed[1], z, alpha_powers);
-                    let sign1: FieldElement<B> = if absorbed[0].is_sender {
-                        FieldElement::one()
-                    } else {
-                        -FieldElement::one()
-                    };
-                    let sign2: FieldElement<B> = if absorbed[1].is_sender {
-                        FieldElement::one()
-                    } else {
-                        -FieldElement::one()
-                    };
-                    delta * &f1 * &f2 - m1 * sign1 * &f2 - m2 * sign2 * &f1
+                    let term1 = m1 * &f2;
+                    let term1 = if absorbed[0].is_sender { term1 } else { -term1 };
+                    let term2 = m2 * &f1;
+                    let term2 = if absorbed[1].is_sender { term2 } else { -term2 };
+                    delta * &f1 * &f2 - term1 - term2
                 }
                 _ => unreachable!("absorbed must contain 1 or 2 interactions"),
             }
