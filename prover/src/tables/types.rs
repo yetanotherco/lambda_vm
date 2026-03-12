@@ -448,8 +448,10 @@ impl DecodeEntry {
         let mut packed: u64 = 0;
 
         // Control flags (bits 0-10)
-        // Note: Register flags exclude x0 and x255 (virtual PC) to match CPU trace
-        let read_reg1_physical = self.read_register1 && self.rs1 != 0 && self.rs1 != 255;
+        // x0 is hardwired to zero and never physically read.
+        // x255 is the register where the pc is stored (per spec decode.md),
+        // so read_register1=1 for rs1=255.
+        let read_reg1_physical = self.read_register1 && self.rs1 != 0;
         let read_reg2_physical = self.read_register2 && self.rs2 != 0;
         let write_reg_physical = self.write_register && self.rd != 0;
         packed |= (read_reg1_physical as u64) << bits::READ_REG1;
