@@ -153,6 +153,15 @@ where
         self.num_aux_columns = num_aux_columns;
     }
 
+    /// Spill the main trace data to disk via mmap.
+    /// After this call, `main_table.data` is freed but all accessors
+    /// (`get_main`, `columns_main`, `extract_columns_main_into`) continue
+    /// to work transparently through mmap.
+    #[cfg(feature = "disk-spill")]
+    pub fn spill_main_to_disk(&mut self) -> std::io::Result<()> {
+        self.main_table.spill_to_disk()
+    }
+
     pub fn compute_trace_polys_main<S>(&self) -> Vec<Polynomial<FieldElement<F>>>
     where
         S: IsFFTField + IsSubFieldOf<F>,

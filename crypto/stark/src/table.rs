@@ -6,6 +6,60 @@ use math::field::{
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
+/// Mmap-backed storage for a spilled Table.
+///
+/// The table data is written row-major to a temp file and mmapped back.
+/// Access goes through pointer arithmetic on the mmap, matching the
+/// original `data[row * width + col]` layout.
+#[cfg(feature = "disk-spill")]
+pub(crate) struct TableMmapBacking {
+    mmap: memmap2::Mmap,
+    _file: std::fs::File,
+    width: usize,
+    height: usize,
+    elem_size: usize,
+}
+
+// Manual trait impls so Table<F> can keep its derive macros.
+// Spilled tables should not be cloned during proving.
+#[cfg(feature = "disk-spill")]
+impl Clone for TableMmapBacking {
+    fn clone(&self) -> Self {
+        panic!("TableMmapBacking cannot be cloned — spilled tables should not be cloned")
+    }
+}
+
+#[cfg(feature = "disk-spill")]
+impl Default for TableMmapBacking {
+    fn default() -> Self {
+        panic!("TableMmapBacking has no default — use None")
+    }
+}
+
+#[cfg(feature = "disk-spill")]
+impl std::fmt::Debug for TableMmapBacking {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TableMmapBacking")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("elem_size", &self.elem_size)
+            .finish()
+    }
+}
+
+#[cfg(feature = "disk-spill")]
+impl PartialEq for TableMmapBacking {
+    fn eq(&self, other: &Self) -> bool {
+        self.width == other.width
+            && self.height == other.height
+            && self.elem_size == other.elem_size
+            && self.mmap[..] == other.mmap[..]
+    }
+}
+
+#[cfg(feature = "disk-spill")]
+impl Eq for TableMmapBacking {}
+
 /// A two-dimensional Table holding field elements, arranged in a row-major order.
 /// This is the basic underlying data structure used for any two-dimensional component in the
 /// the STARK protocol implementation, such as the `TraceTable` and the `EvaluationFrame`.
@@ -17,6 +71,9 @@ pub struct Table<F: IsField> {
     pub data: Vec<FieldElement<F>>,
     pub width: usize,
     pub height: usize,
+    #[cfg(feature = "disk-spill")]
+    #[serde(skip)]
+    pub(crate) mmap_backing: Option<TableMmapBacking>,
 }
 
 impl<F: IsField> Table<F> {
@@ -29,6 +86,8 @@ impl<F: IsField> Table<F> {
                 data: Vec::new(),
                 width,
                 height: 0,
+                #[cfg(feature = "disk-spill")]
+                mmap_backing: None,
             };
         }
 
@@ -40,6 +99,8 @@ impl<F: IsField> Table<F> {
             data,
             width,
             height,
+            #[cfg(feature = "disk-spill")]
+            mmap_backing: None,
         }
     }
 
@@ -92,11 +153,30 @@ impl<F: IsField> Table<F> {
 
     /// Returns a vector of vectors of field elements representing the table rows
     pub fn rows(&self) -> Vec<Vec<FieldElement<F>>> {
-        self.data.chunks(self.width).map(|r| r.to_vec()).collect()
+        (0..self.height)
+            .map(|row_idx| self.get_row(row_idx).to_vec())
+            .collect()
     }
 
     /// Given a row index, returns a reference to that row as a slice of field elements.
     pub fn get_row(&self, row_idx: usize) -> &[FieldElement<F>] {
+        #[cfg(feature = "disk-spill")]
+        if let Some(ref backing) = self.mmap_backing {
+            debug_assert!(
+                row_idx < backing.height,
+                "Table::get_row out of bounds: row={row_idx}, height={}",
+                backing.height
+            );
+            let offset = row_idx * backing.width * backing.elem_size;
+            // SAFETY: Row-major layout means width elements are contiguous.
+            // Same repr(transparent) + page-aligned guarantees as get().
+            return unsafe {
+                std::slice::from_raw_parts(
+                    backing.mmap.as_ptr().add(offset) as *const FieldElement<F>,
+                    backing.width,
+                )
+            };
+        }
         let row_offset = row_idx * self.width;
         &self.data[row_offset..row_offset + self.width]
     }
@@ -120,7 +200,7 @@ impl<F: IsField> Table<F> {
         (0..self.width)
             .map(|col_idx| {
                 (0..self.height)
-                    .map(|row_idx| self.data[row_idx * self.width + col_idx].clone())
+                    .map(|row_idx| self.get(row_idx, col_idx).clone())
                     .collect()
             })
             .collect()
@@ -128,7 +208,7 @@ impl<F: IsField> Table<F> {
 
     pub fn get_column(&self, col_idx: usize) -> Vec<FieldElement<F>> {
         (0..self.height)
-            .map(|row_idx| self.data[row_idx * self.width + col_idx].clone())
+            .map(|row_idx| self.get(row_idx, col_idx).clone())
             .collect()
     }
 
@@ -148,17 +228,34 @@ impl<F: IsField> Table<F> {
         let iter = output[..self.width].par_iter_mut().enumerate();
         #[cfg(not(feature = "parallel"))]
         let iter = output[..self.width].iter_mut().enumerate();
+        // Use get() which transparently reads from mmap or data Vec
         iter.for_each(|(col_idx, buf)| {
             buf.clear();
             buf.reserve(self.height.saturating_sub(buf.capacity()));
             for row_idx in 0..self.height {
-                buf.push(self.data[row_idx * self.width + col_idx].clone());
+                buf.push(self.get(row_idx, col_idx).clone());
             }
         });
     }
 
     /// Given row and column indexes, returns the stored field element in that position of the table.
+    #[inline]
     pub fn get(&self, row: usize, col: usize) -> &FieldElement<F> {
+        #[cfg(feature = "disk-spill")]
+        if let Some(ref backing) = self.mmap_backing {
+            debug_assert!(
+                row < backing.height && col < backing.width,
+                "Table::get out of bounds: row={row}, col={col}, height={}, width={}",
+                backing.height,
+                backing.width
+            );
+            // Row-major layout: offset = (row * width + col) * elem_size
+            let offset = (row * backing.width + col) * backing.elem_size;
+            // SAFETY: FieldElement<F> is #[repr(transparent)] over F::BaseType.
+            // The mmap is page-aligned and elements are contiguously packed.
+            // The data was written from identical types on the same machine.
+            return unsafe { &*(backing.mmap.as_ptr().add(offset) as *const FieldElement<F>) };
+        }
         let idx = row * self.width + col;
         &self.data[idx]
     }
@@ -166,6 +263,64 @@ impl<F: IsField> Table<F> {
     pub fn set(&mut self, row: usize, col: usize, value: FieldElement<F>) {
         let idx = row * self.width + col;
         self.data[idx] = value;
+    }
+
+    /// Returns true if this table's data has been spilled to disk via mmap.
+    pub fn is_spilled(&self) -> bool {
+        #[cfg(feature = "disk-spill")]
+        {
+            self.mmap_backing.is_some()
+        }
+        #[cfg(not(feature = "disk-spill"))]
+        {
+            false
+        }
+    }
+
+    /// Spill the table's row-major data to a temp file and mmap it back.
+    /// Frees the heap `data` Vec while preserving access through `get()`,
+    /// `get_row()`, `columns()`, and `extract_columns_into()`.
+    ///
+    /// No-op if the table is empty or already spilled.
+    #[cfg(feature = "disk-spill")]
+    pub fn spill_to_disk(&mut self) -> std::io::Result<()> {
+        use std::io::Write;
+
+        if self.data.is_empty() || self.mmap_backing.is_some() {
+            return Ok(());
+        }
+
+        let elem_size = std::mem::size_of::<FieldElement<F>>();
+        let total_bytes = self.data.len() * elem_size;
+
+        let file = tempfile::tempfile()?;
+        file.set_len(total_bytes as u64)?;
+        {
+            let mut writer = std::io::BufWriter::new(&file);
+            // SAFETY: FieldElement<F> is #[repr(transparent)] over F::BaseType.
+            // The Vec has the same byte layout as a contiguous array.
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(self.data.as_ptr() as *const u8, total_bytes)
+            };
+            writer.write_all(bytes)?;
+            writer.flush()?;
+        }
+
+        // SAFETY: We own the file exclusively.
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+
+        self.mmap_backing = Some(TableMmapBacking {
+            mmap,
+            _file: file,
+            width: self.width,
+            height: self.height,
+            elem_size,
+        });
+
+        // Free heap allocation
+        self.data = Vec::new();
+
+        Ok(())
     }
 
     /// Given a step size, converts the given table into a `Frame`.

@@ -1562,6 +1562,17 @@ pub trait IsStarkProver<
             }
         }
 
+        // When disk-spill is enabled, spill all main trace data to disk now.
+        // Phase A is done (main LDE committed), so the original trace data is only
+        // needed for aux trace generation (Phase C). Spilling it here frees the
+        // heap Vec while keeping data accessible through mmap for build_auxiliary_trace.
+        #[cfg(feature = "disk-spill")]
+        for (_, trace, _) in air_trace_pairs.iter_mut() {
+            trace.main_table.spill_to_disk().map_err(|e| {
+                ProvingError::WrongParameter(format!("disk-spill main trace: {e}"))
+            })?;
+        }
+
         // =====================================================================
         // Round 1, Phase B: Sample shared LogUp challenges
         // =====================================================================

@@ -15,3 +15,4 @@ tikv-jemalloc-ctl = { version = "0.6", features = ["stats"], optional = true }
 
 [features]
 jemalloc-stats = ["dep:tikv-jemalloc-ctl"]
+disk-spill = ["prover/disk-spill"]
