@@ -1568,9 +1568,10 @@ pub trait IsStarkProver<
         // heap Vec while keeping data accessible through mmap for build_auxiliary_trace.
         #[cfg(feature = "disk-spill")]
         for (_, trace, _) in air_trace_pairs.iter_mut() {
-            trace.main_table.spill_to_disk().map_err(|e| {
-                ProvingError::WrongParameter(format!("disk-spill main trace: {e}"))
-            })?;
+            trace
+                .main_table
+                .spill_to_disk()
+                .map_err(|e| ProvingError::WrongParameter(format!("disk-spill main trace: {e}")))?;
         }
 
         // =====================================================================

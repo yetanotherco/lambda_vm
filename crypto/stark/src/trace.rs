@@ -726,16 +726,16 @@ mod disk_spill_tests {
             .collect();
 
         let lde = LDETraceTable::<F, E>::spill_main_from_pool(
-            &pool,
-            num_cols,
-            /*trace_step_size=*/ 1,
-            /*blowup_factor=*/ 1,
+            &pool, num_cols, /*trace_step_size=*/ 1, /*blowup_factor=*/ 1,
         )
         .expect("spill_main_from_pool failed");
 
         assert_eq!(lde.num_main_cols(), num_cols);
         assert_eq!(lde.num_rows(), num_rows);
-        assert!(lde.main_columns.is_empty(), "main_columns should be empty after spill");
+        assert!(
+            lde.main_columns.is_empty(),
+            "main_columns should be empty after spill"
+        );
 
         // Verify every element
         for c in 0..num_cols {
@@ -772,13 +772,8 @@ mod disk_spill_tests {
             })
             .collect();
 
-        let mut lde = LDETraceTable::<F, E>::spill_main_from_pool(
-            &main_pool,
-            num_main,
-            1,
-            1,
-        )
-        .expect("spill_main_from_pool failed");
+        let mut lde = LDETraceTable::<F, E>::spill_main_from_pool(&main_pool, num_main, 1, 1)
+            .expect("spill_main_from_pool failed");
 
         lde.add_aux_from_pool(&aux_pool, num_aux)
             .expect("add_aux_from_pool failed");

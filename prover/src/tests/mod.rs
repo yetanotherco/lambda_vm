@@ -12,6 +12,8 @@ pub mod constraints_tests;
 pub mod cpu_tests;
 #[cfg(test)]
 pub mod decode_tests;
+#[cfg(all(test, feature = "disk-spill"))]
+pub mod disk_spill_tests;
 #[cfg(test)]
 pub mod dvrm_tests;
 #[cfg(test)]
@@ -24,5 +26,3 @@ pub mod mul_tests;
 pub mod prove_elfs_tests;
 #[cfg(test)]
 pub mod trace_builder_tests;
-#[cfg(all(test, feature = "disk-spill"))]
-pub mod disk_spill_tests;

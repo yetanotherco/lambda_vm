@@ -3,8 +3,8 @@
 //! Verifies that proving and verification produce correct results when main
 //! traces, LDE columns, and Merkle tree nodes are spilled to disk via mmap.
 
-use crate::test_utils::asm_elf_bytes;
 use crate::tables::MaxRowsConfig;
+use crate::test_utils::asm_elf_bytes;
 
 /// Prove + verify a small program end-to-end with disk-spill enabled.
 /// This exercises the full pipeline: trace generation, main-trace spill,
@@ -13,7 +13,11 @@ use crate::tables::MaxRowsConfig;
 fn test_disk_spill_prove_and_verify_small() {
     let elf_bytes = asm_elf_bytes("sub");
     let result = crate::prove_and_verify(&elf_bytes);
-    assert!(result.is_ok(), "prove_and_verify failed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "prove_and_verify failed: {:?}",
+        result.err()
+    );
     assert!(result.unwrap(), "verification returned false");
 }
 
@@ -23,12 +27,14 @@ fn test_disk_spill_prove_and_verify_small() {
 #[test]
 fn test_disk_spill_prove_and_verify_with_chunks() {
     let elf_bytes = asm_elf_bytes("sub");
-    let proof_options =
-        stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2)
-            .expect("blowup=2 is always valid");
-    let vm_proof =
-        crate::prove_with_options(&elf_bytes, &proof_options, &MaxRowsConfig::small());
-    assert!(vm_proof.is_ok(), "prove_with_options failed: {:?}", vm_proof.err());
+    let proof_options = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2)
+        .expect("blowup=2 is always valid");
+    let vm_proof = crate::prove_with_options(&elf_bytes, &proof_options, &MaxRowsConfig::small());
+    assert!(
+        vm_proof.is_ok(),
+        "prove_with_options failed: {:?}",
+        vm_proof.err()
+    );
     let vm_proof = vm_proof.unwrap();
 
     let ok = crate::verify_with_options(&vm_proof, &elf_bytes, &proof_options);

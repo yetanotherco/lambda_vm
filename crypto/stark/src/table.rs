@@ -299,9 +299,8 @@ impl<F: IsField> Table<F> {
             let mut writer = std::io::BufWriter::new(&file);
             // SAFETY: FieldElement<F> is #[repr(transparent)] over F::BaseType.
             // The Vec has the same byte layout as a contiguous array.
-            let bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(self.data.as_ptr() as *const u8, total_bytes)
-            };
+            let bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(self.data.as_ptr() as *const u8, total_bytes) };
             writer.write_all(bytes)?;
             writer.flush()?;
         }
@@ -408,16 +407,15 @@ mod disk_spill_tests {
 
         table.spill_to_disk().expect("spill_to_disk failed");
         assert!(table.is_spilled());
-        assert!(table.data.is_empty(), "heap data should be freed after spill");
+        assert!(
+            table.data.is_empty(),
+            "heap data should be freed after spill"
+        );
 
         // Verify get() returns the same values
         for r in 0..height {
             for c in 0..width {
-                assert_eq!(
-                    table.get(r, c),
-                    &pre_spill[r][c],
-                    "mismatch at ({r}, {c})"
-                );
+                assert_eq!(table.get(r, c), &pre_spill[r][c], "mismatch at ({r}, {c})");
             }
         }
 
@@ -435,16 +433,17 @@ mod disk_spill_tests {
     #[test]
     fn test_table_spill_empty_is_noop() {
         let mut table = Table::<F>::new(Vec::new(), 0);
-        table.spill_to_disk().expect("spill_to_disk on empty table failed");
+        table
+            .spill_to_disk()
+            .expect("spill_to_disk on empty table failed");
         assert!(!table.is_spilled());
     }
 
     /// Spilling twice is idempotent (second call is a no-op).
     #[test]
     fn test_table_spill_idempotent() {
-        let data: Vec<FieldElement<F>> = (0..16)
-            .map(|i| FieldElement::<F>::from(i as u64))
-            .collect();
+        let data: Vec<FieldElement<F>> =
+            (0..16).map(|i| FieldElement::<F>::from(i as u64)).collect();
         let mut table = Table::new(data, 4);
 
         table.spill_to_disk().expect("first spill failed");
