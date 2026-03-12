@@ -354,45 +354,6 @@ pub trait IsStarkProver<
         Some((tree, root))
     }
 
-    /// Commit columns that are already in **bit-reversed order** (as produced by
-    /// `coset_lde_full_expand_bitrev` / `coset_lde_full_into_bitrev`).
-    ///
-    /// Since the columns are already bit-reversed, we iterate rows sequentially
-    /// instead of using `reverse_index`. Produces the same Merkle tree as
-    /// `commit_columns_bit_reversed` when given the corresponding natural-order data.
-    fn commit_columns<E>(
-        columns: &[Vec<FieldElement<E>>],
-    ) -> Option<(BatchedMerkleTree<E>, Commitment)>
-    where
-        FieldElement<E>: AsBytes + Sync + Send,
-        E: IsField,
-    {
-        if columns.is_empty() || columns[0].is_empty() {
-            return None;
-        }
-
-        let num_rows = columns[0].len();
-        let num_cols = columns.len();
-
-        #[cfg(feature = "parallel")]
-        let iter = (0..num_rows).into_par_iter();
-        #[cfg(not(feature = "parallel"))]
-        let iter = 0..num_rows;
-
-        let hashed_leaves: Vec<Commitment> = iter
-            .map(|row_idx| {
-                let row: Vec<FieldElement<E>> = (0..num_cols)
-                    .map(|col_idx| columns[col_idx][row_idx].clone())
-                    .collect();
-                BatchedMerkleTreeBackend::<E>::hash_data(&row)
-            })
-            .collect();
-
-        let tree = BatchedMerkleTree::<E>::build_from_hashed_leaves(hashed_leaves)?;
-        let root = tree.root;
-        Some((tree, root))
-    }
-
     /// Compute the LDE commitment for a subset of columns from a trace (for testing).
     ///
     /// This helper computes the same commitment the prover generates internally,
@@ -488,38 +449,6 @@ pub trait IsStarkProver<
         });
     }
 
-    /// Same as [`expand_pool_to_lde`], but returns evaluations in **bit-reversed order**.
-    /// Use for commit-only paths where data won't be used for constraint evaluation.
-    fn expand_pool_to_lde_bitrev<E>(
-        pool: &mut [Vec<FieldElement<E>>],
-        num_cols: usize,
-        domain: &Domain<Field>,
-        twiddles: &LdeTwiddles<Field>,
-    ) where
-        Field: IsSubFieldOf<E>,
-        E: IsSubFieldOf<FieldExtension> + IsField + Send + Sync,
-        FieldElement<E>: Send + Sync,
-    {
-        if num_cols == 0 {
-            return;
-        }
-
-        #[cfg(feature = "parallel")]
-        let iter = pool[..num_cols].par_iter_mut();
-        #[cfg(not(feature = "parallel"))]
-        let iter = pool[..num_cols].iter_mut();
-        iter.for_each(|buf| {
-            Polynomial::coset_lde_full_expand_bitrev::<Field>(
-                buf,
-                domain.blowup_factor,
-                &twiddles.coset_weights,
-                &twiddles.inv,
-                &twiddles.fwd,
-            )
-            .expect("coset LDE expansion");
-        });
-    }
-
     /// Compute main LDE, commit, return tree and root.
     /// Uses the provided pool buffers to avoid allocation; the pool retains capacity for reuse.
     #[allow(clippy::type_complexity)]
@@ -544,10 +473,10 @@ pub trait IsStarkProver<
     {
         let num_cols = trace.num_main_columns;
         trace.extract_columns_main_into(main_pool);
-        Self::expand_pool_to_lde_bitrev::<Field>(main_pool, num_cols, domain, twiddles);
+        Self::expand_pool_to_lde::<Field>(main_pool, num_cols, domain, twiddles);
 
-        let (tree, root) =
-            Self::commit_columns(&main_pool[..num_cols]).ok_or(ProvingError::EmptyCommitment)?;
+        let (tree, root) = Self::commit_columns_bit_reversed(&main_pool[..num_cols])
+            .ok_or(ProvingError::EmptyCommitment)?;
 
         // Pool buffers retain capacity; tree is returned to caller
         Ok((tree, root, None, None, 0))
@@ -579,14 +508,14 @@ pub trait IsStarkProver<
     {
         let num_cols = trace.num_main_columns;
         trace.extract_columns_main_into(main_pool);
-        Self::expand_pool_to_lde_bitrev::<Field>(main_pool, num_cols, domain, twiddles);
+        Self::expand_pool_to_lde::<Field>(main_pool, num_cols, domain, twiddles);
 
         let (precomputed_tree, precomputed_root) =
-            Self::commit_columns(&main_pool[..num_precomputed_cols])
+            Self::commit_columns_bit_reversed(&main_pool[..num_precomputed_cols])
                 .ok_or(ProvingError::EmptyCommitment)?;
 
         let (mult_tree, mult_root) =
-            Self::commit_columns(&main_pool[num_precomputed_cols..num_cols])
+            Self::commit_columns_bit_reversed(&main_pool[num_precomputed_cols..num_cols])
                 .ok_or(ProvingError::EmptyCommitment)?;
 
         debug_assert_eq!(
@@ -796,17 +725,16 @@ pub trait IsStarkProver<
         // Step 1: Compute 1/(2·g·ω^i) for i=0..N-1 via batch inversion.
         // The LDE coset points are g·ω^i = domain.lde_roots_of_unity_coset[i].
         // Compute entirely in base field — mixed F×E multiplication when used with extension values.
+        let two_base = FieldElement::<Field>::from(2u64);
         let mut inv_2x: Vec<FieldElement<Field>> = (0..n)
-            .map(|i| domain.lde_roots_of_unity_coset[i].double())
+            .map(|i| &two_base * &domain.lde_roots_of_unity_coset[i])
             .collect();
         FieldElement::inplace_batch_inverse(&mut inv_2x).expect("Coset points are non-zero");
 
         // Step 2: Pointwise decomposition.
         // H₀((g·ω^i)²) = (evals[i] + evals[i+N]) / 2
         // H₁((g·ω^i)²) = (evals[i] - evals[i+N]) / (2·g·ω^i)
-        let two_inv = FieldElement::<Field>::from(2u64)
-            .inv()
-            .expect("2 is non-zero in the field");
+        let two_inv = two_base.inv().expect("2 is non-zero in the field");
         let (h0_evals, h1_evals) = {
             #[cfg(feature = "parallel")]
             {
@@ -1083,13 +1011,12 @@ pub trait IsStarkProver<
         // Extend N trace-coset evaluations to 2N LDE-coset evaluations via standard LDE.
         // deep_evals[i] = h(offset·ω_N^i) = f(ω_N^i) where f(x) = h(offset·x).
         // Standard iFFT+FFT recovers f and evaluates on the 2N-th roots: f(Ω^j) = h(offset·Ω^j).
-        // Use bitrev variant: FRI needs bit-reversed order, and FFT naturally produces it.
-        // This skips two redundant bit-reverse permutations (FFT→BRP→natural→BRP→bitrev).
         let domain_size = domain.lde_roots_of_unity_coset.len();
         let deep_poly =
             Polynomial::interpolate_fft::<Field>(&deep_evals).expect("iFFT should succeed");
-        let lde_evals = Polynomial::evaluate_fft_bitrev::<Field>(&deep_poly, 1, Some(domain_size))
+        let mut lde_evals = Polynomial::evaluate_fft::<Field>(&deep_poly, 1, Some(domain_size))
             .expect("FFT should succeed");
+        in_place_bit_reverse_permute(&mut lde_evals);
 
         // FRI commit phase from pre-computed evaluations (no initial FFT)
         let (fri_last_value, fri_layers) =

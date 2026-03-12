@@ -27,7 +27,7 @@ pub fn naive_dft(input: &[FE]) -> Vec<FE> {
 
     for (k, res) in result.iter_mut().enumerate() {
         for (j, inp) in input.iter().enumerate() {
-            *res += inp * root.pow((j * k) as u64);
+            *res = &*res + &(inp * &root.pow((j * k) as u64));
         }
     }
 
@@ -86,15 +86,15 @@ fn test_layer_twiddles_creation() {
     let order = 4u64;
     let layer_twiddles = LayerTwiddles::<F>::new(order).unwrap();
 
-    assert_eq!(layer_twiddles.num_layers(), 4);
-    assert_eq!(layer_twiddles.get_layer(0).len(), 8);
-    assert_eq!(layer_twiddles.get_layer(1).len(), 4);
-    assert_eq!(layer_twiddles.get_layer(2).len(), 2);
-    assert_eq!(layer_twiddles.get_layer(3).len(), 1);
+    assert_eq!(layer_twiddles.layers.len(), 4);
+    assert_eq!(layer_twiddles.layers[0].len(), 8);
+    assert_eq!(layer_twiddles.layers[1].len(), 4);
+    assert_eq!(layer_twiddles.layers[2].len(), 2);
+    assert_eq!(layer_twiddles.layers[3].len(), 1);
 
     // First twiddle of each layer should be 1
-    for k in 0..layer_twiddles.num_layers() {
-        assert_eq!(layer_twiddles.get_layer(k)[0], FE::one());
+    for layer in &layer_twiddles.layers {
+        assert_eq!(layer[0], FE::one());
     }
 }
 
@@ -241,10 +241,10 @@ pub fn naive_idft(input: &[FE]) -> Vec<FE> {
 
     for (k, res) in result.iter_mut().enumerate() {
         for (j, inp) in input.iter().enumerate() {
-            *res += inp * inv_root.pow((j * k) as u64);
+            *res = &*res + &(inp * &inv_root.pow((j * k) as u64));
         }
         // Scale by 1/n
-        *res *= n_inv;
+        *res = &*res * &n_inv;
     }
 
     result
@@ -274,7 +274,7 @@ fn test_bowers_ifft_basic() {
     // Scale by 1/n
     let n_inv = FE::from(n as u64).inv().unwrap();
     for val in fft_result.iter_mut() {
-        *val *= n_inv;
+        *val = &*val * &n_inv;
     }
 
     assert_eq!(fft_result, input);
@@ -301,7 +301,7 @@ fn test_bowers_fft_ifft_roundtrip_small() {
         // Scale by 1/n
         let n_inv = FE::from(n as u64).inv().unwrap();
         for val in result.iter_mut() {
-            *val *= n_inv;
+            *val = &*val * &n_inv;
         }
 
         assert_eq!(result, input, "Roundtrip failed for order {}", order);
@@ -328,7 +328,7 @@ fn test_bowers_fft_ifft_roundtrip_medium() {
         // Scale by 1/n
         let n_inv = FE::from(n as u64).inv().unwrap();
         for val in result.iter_mut() {
-            *val *= n_inv;
+            *val = &*val * &n_inv;
         }
 
         assert_eq!(
@@ -363,7 +363,7 @@ fn test_bowers_ifft_fft_roundtrip() {
         // The FFT and IFFT should cancel out (both contribute n factor, so we need 1/n)
         let n_inv = FE::from(n as u64).inv().unwrap();
         for val in result.iter_mut() {
-            *val *= n_inv;
+            *val = &*val * &n_inv;
         }
 
         assert_eq!(
@@ -399,7 +399,7 @@ fn test_bowers_ifft_matches_naive() {
         // Scale by 1/n
         let n_inv = FE::from(n as u64).inv().unwrap();
         for val in result.iter_mut() {
-            *val *= n_inv;
+            *val = &*val * &n_inv;
         }
 
         assert_eq!(
@@ -415,15 +415,15 @@ fn test_layer_twiddles_inverse_creation() {
     let order = 4u64;
     let inv_twiddles = LayerTwiddles::<F>::new_inverse(order).unwrap();
 
-    assert_eq!(inv_twiddles.num_layers(), 4);
-    assert_eq!(inv_twiddles.get_layer(0).len(), 8);
-    assert_eq!(inv_twiddles.get_layer(1).len(), 4);
-    assert_eq!(inv_twiddles.get_layer(2).len(), 2);
-    assert_eq!(inv_twiddles.get_layer(3).len(), 1);
+    assert_eq!(inv_twiddles.layers.len(), 4);
+    assert_eq!(inv_twiddles.layers[0].len(), 8);
+    assert_eq!(inv_twiddles.layers[1].len(), 4);
+    assert_eq!(inv_twiddles.layers[2].len(), 2);
+    assert_eq!(inv_twiddles.layers[3].len(), 1);
 
     // First twiddle of each layer should still be 1
-    for k in 0..inv_twiddles.num_layers() {
-        assert_eq!(inv_twiddles.get_layer(k)[0], FE::one());
+    for layer in &inv_twiddles.layers {
+        assert_eq!(layer[0], FE::one());
     }
 }
 
@@ -444,7 +444,7 @@ fn test_fft_ifft_roundtrip_edge_cases() {
     in_place_bit_reverse_permute(&mut result);
     bowers_ifft_opt(&mut result, &inv_twiddles).unwrap();
     for val in result.iter_mut() {
-        *val *= n_inv;
+        *val = &*val * &n_inv;
     }
     assert_eq!(result, zeros, "Roundtrip failed for all zeros");
 
@@ -456,7 +456,7 @@ fn test_fft_ifft_roundtrip_edge_cases() {
     in_place_bit_reverse_permute(&mut result);
     bowers_ifft_opt(&mut result, &inv_twiddles).unwrap();
     for val in result.iter_mut() {
-        *val *= n_inv;
+        *val = &*val * &n_inv;
     }
     assert_eq!(result, ones, "Roundtrip failed for all ones");
 
@@ -469,7 +469,7 @@ fn test_fft_ifft_roundtrip_edge_cases() {
     in_place_bit_reverse_permute(&mut result);
     bowers_ifft_opt(&mut result, &inv_twiddles).unwrap();
     for val in result.iter_mut() {
-        *val *= n_inv;
+        *val = &*val * &n_inv;
     }
     assert_eq!(result, sparse, "Roundtrip failed for sparse input");
 }
@@ -593,7 +593,7 @@ proptest! {
 
         let n_inv = FE::from(n as u64).inv().unwrap();
         for val in result.iter_mut() {
-            *val *= n_inv;
+            *val = &*val * &n_inv;
         }
 
         prop_assert_eq!(result, coeffs);
@@ -631,7 +631,7 @@ mod parallel_tests {
             // Scale by 1/n
             let n_inv = FE::from(n as u64).inv().unwrap();
             for val in result.iter_mut() {
-                *val *= n_inv;
+                *val = &*val * &n_inv;
             }
 
             assert_eq!(
