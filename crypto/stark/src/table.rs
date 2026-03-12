@@ -402,7 +402,7 @@ mod disk_spill_tests {
 
         // Snapshot values before spill
         let pre_spill: Vec<Vec<FieldElement<F>>> = (0..height)
-            .map(|r| (0..width).map(|c| table.get(r, c).clone()).collect())
+            .map(|r| (0..width).map(|c| *table.get(r, c)).collect())
             .collect();
 
         table.spill_to_disk().expect("spill_to_disk failed");
@@ -413,18 +413,18 @@ mod disk_spill_tests {
         );
 
         // Verify get() returns the same values
-        for r in 0..height {
-            for c in 0..width {
-                assert_eq!(table.get(r, c), &pre_spill[r][c], "mismatch at ({r}, {c})");
+        for (r, pre_row) in pre_spill.iter().enumerate() {
+            for (c, pre_val) in pre_row.iter().enumerate() {
+                assert_eq!(table.get(r, c), pre_val, "mismatch at ({r}, {c})");
             }
         }
 
         // Verify get_row() returns the same values
-        for r in 0..height {
+        for (r, pre_row) in pre_spill.iter().enumerate() {
             let row = table.get_row(r);
             assert_eq!(row.len(), width);
-            for c in 0..width {
-                assert_eq!(&row[c], &pre_spill[r][c], "get_row mismatch at ({r}, {c})");
+            for (c, pre_val) in pre_row.iter().enumerate() {
+                assert_eq!(&row[c], pre_val, "get_row mismatch at ({r}, {c})");
             }
         }
     }

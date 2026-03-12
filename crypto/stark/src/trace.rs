@@ -738,11 +738,11 @@ mod disk_spill_tests {
         );
 
         // Verify every element
-        for c in 0..num_cols {
-            for r in 0..num_rows {
+        for (c, pool_col) in pool.iter().enumerate() {
+            for (r, pool_val) in pool_col.iter().enumerate() {
                 assert_eq!(
                     lde.get_main(r, c),
-                    &pool[c][r],
+                    pool_val,
                     "mismatch at (row={r}, col={c})"
                 );
             }
@@ -782,16 +782,16 @@ mod disk_spill_tests {
         assert_eq!(lde.num_aux_cols(), num_aux);
 
         // Verify main
-        for c in 0..num_main {
-            for r in 0..num_rows {
-                assert_eq!(lde.get_main(r, c), &main_pool[c][r]);
+        for (c, main_col) in main_pool.iter().enumerate() {
+            for (r, main_val) in main_col.iter().enumerate() {
+                assert_eq!(lde.get_main(r, c), main_val);
             }
         }
 
         // Verify aux
-        for c in 0..num_aux {
-            for r in 0..num_rows {
-                assert_eq!(lde.get_aux(r, c), &aux_pool[c][r]);
+        for (c, aux_col) in aux_pool.iter().enumerate() {
+            for (r, aux_val) in aux_col.iter().enumerate() {
+                assert_eq!(lde.get_aux(r, c), aux_val);
             }
         }
     }
