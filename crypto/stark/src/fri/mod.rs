@@ -3,6 +3,7 @@ pub mod fri_decommit;
 pub(crate) mod fri_functions;
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
+use sha3::Digest;
 pub use math::field::element::FieldElement;
 use math::field::traits::IsSubFieldOf;
 use math::field::traits::{IsFFTField, IsField};
@@ -37,32 +38,37 @@ where
     let mut inv_twiddles = compute_coset_twiddles_inv(coset_offset, domain_size);
 
     let mut fri_layer_list = Vec::with_capacity(number_layers);
-    let mut current_coset_offset = coset_offset.clone();
     let mut current_domain_size = domain_size;
 
     for _ in 1..number_layers {
         // <<<< Receive challenge 𝜁ₖ₋₁
         let zeta = transcript.sample_field_element();
-        current_coset_offset = current_coset_offset.square();
         current_domain_size /= 2;
 
         // Fold evaluations in-place (no FFT needed)
         fold_evaluations_in_place(&mut evals, &zeta, &inv_twiddles);
 
-        // Build Merkle tree from consecutive pairs
-        let leaves: Vec<[FieldElement<E>; 2]> = evals
-            .chunks_exact(2)
-            .map(|chunk| [chunk[0].clone(), chunk[1].clone()])
+        // Stream Keccak256 leaf hashes from consecutive pairs, avoiding [FieldElement; 2] allocs
+        let num_pairs = evals.len() / 2;
+        let hashed_leaves: Vec<[u8; 32]> = (0..num_pairs)
+            .map(|k| {
+                let mut hasher = sha3::Keccak256::new();
+                let mut buf = [0u8; 32];
+                let n0 = evals[2 * k].write_bytes(&mut buf);
+                hasher.update(&buf[..n0]);
+                let n1 = evals[2 * k + 1].write_bytes(&mut buf);
+                hasher.update(&buf[..n1]);
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&hasher.finalize());
+                hash
+            })
             .collect();
-        let merkle_tree = FriLayerMerkleTree::build(&leaves)
+        let merkle_tree = FriLayerMerkleTree::<E>::build_from_hashed_leaves(hashed_leaves)
             .expect("FRI commit: Merkle tree construction must succeed");
         let root = merkle_tree.root;
-        fri_layer_list.push(FriLayer::new(
-            &evals,
-            merkle_tree,
-            current_coset_offset.clone().to_extension(),
-            current_domain_size,
-        ));
+
+        // Clone folded evals for query phase; next iteration folds in-place again
+        fri_layer_list.push(FriLayer::new(evals.clone(), merkle_tree, current_domain_size));
 
         // >>>> Send commitment: [pₖ]
         transcript.append_bytes(&root);
