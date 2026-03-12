@@ -22,10 +22,8 @@ use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
 use stark::trace::TraceTable;
-use stark::traits::TransitionEvaluationContext;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16};
-use crate::impl_base_field_evaluate_prover;
 
 // =========================================================================
 // Column indices
@@ -717,7 +715,29 @@ impl ShiftConstraint {
         left_part + right_part
     }
 
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+}
+
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ShiftConstraint {
+    fn degree(&self) -> usize {
+        match self.kind {
+            ShiftConstraintKind::DirectionImpliesMu => 2,
+            ShiftConstraintKind::ZbsOverrideX(_) => 3, // zbs * (X - in * left), left = 1 - dir
+            ShiftConstraintKind::ZbsOverrideX4 => 2,
+            ShiftConstraintKind::ZbsOverrideY(_) => 3, // zbs * (Y - in * dir)
+            ShiftConstraintKind::LimbShiftIsBit(_) => 2,
+            ShiftConstraintKind::OutputMatchesShifted(_) => 3, // out - left*ls*intra (degree 3)
+        }
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    fn end_exemptions(&self) -> usize {
+        0
+    }
+
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
     where
         F: IsSubFieldOf<E>,
         E: IsField,
@@ -774,46 +794,6 @@ impl ShiftConstraint {
             }
         }
     }
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ShiftConstraint {
-    fn degree(&self) -> usize {
-        match self.kind {
-            ShiftConstraintKind::DirectionImpliesMu => 2,
-            ShiftConstraintKind::ZbsOverrideX(_) => 3, // zbs * (X - in * left), left = 1 - dir
-            ShiftConstraintKind::ZbsOverrideX4 => 2,
-            ShiftConstraintKind::ZbsOverrideY(_) => 3, // zbs * (Y - in * dir)
-            ShiftConstraintKind::LimbShiftIsBit(_) => 2,
-            ShiftConstraintKind::OutputMatchesShifted(_) => 3, // out - left*ls*intra (degree 3)
-        }
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn end_exemptions(&self) -> usize {
-        0
-    }
-
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover { frame, .. } => {
-                let val = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = val.to_extension();
-            }
-            TransitionEvaluationContext::Verifier { frame, .. } => {
-                let val = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = val;
-            }
-        }
-    }
-
-    impl_base_field_evaluate_prover!();
 }
 
 /// Number of polynomial constraints in the SHIFT table.

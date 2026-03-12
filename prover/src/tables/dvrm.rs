@@ -31,14 +31,12 @@
 
 use std::collections::HashMap;
 
-use crate::impl_base_field_evaluate_prover;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
 use stark::trace::TraceTable;
-use stark::traits::TransitionEvaluationContext;
 
 use super::types::{
     BusId, FE, GoldilocksExtension, GoldilocksField, NEG_INV_2_16, NEG_INV_2_32, NEG_INV_2_48,
@@ -1033,8 +1031,108 @@ impl DvrmConstraint {
         }
     }
 
-    /// Compute the constraint value.
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    /// Compute virtual carry[i] for the addition n_sub_r + r = n.
+    ///
+    /// The carries verify that n = n_sub_r + r by checking the carry chain.
+    /// We use sign-extended versions for signed arithmetic.
+    fn compute_carry<F, E>(&self, i: usize, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        let shift_16 = FieldElement::<F>::from(SHIFT_16);
+        let inv_2_32 = FieldElement::<F>::from(crate::constraints::templates::INV_SHIFT_32);
+        let sign_fill = FieldElement::<F>::from(SIGN_FILL);
+
+        // Get n, n_sub_r, r halfwords
+        let n: [FieldElement<F>; 4] = [
+            step.get_main_evaluation_element(0, cols::N_0).clone(),
+            step.get_main_evaluation_element(0, cols::N_1).clone(),
+            step.get_main_evaluation_element(0, cols::N_2).clone(),
+            step.get_main_evaluation_element(0, cols::N_3).clone(),
+        ];
+        let nsr: [FieldElement<F>; 4] = [
+            step.get_main_evaluation_element(0, cols::N_SUB_R_0).clone(),
+            step.get_main_evaluation_element(0, cols::N_SUB_R_1).clone(),
+            step.get_main_evaluation_element(0, cols::N_SUB_R_2).clone(),
+            step.get_main_evaluation_element(0, cols::N_SUB_R_3).clone(),
+        ];
+        let r: [FieldElement<F>; 4] = [
+            step.get_main_evaluation_element(0, cols::R_0).clone(),
+            step.get_main_evaluation_element(0, cols::R_1).clone(),
+            step.get_main_evaluation_element(0, cols::R_2).clone(),
+            step.get_main_evaluation_element(0, cols::R_3).clone(),
+        ];
+
+        let sign_n = step.get_main_evaluation_element(0, cols::SIGN_N).clone();
+        let sign_r = step.get_main_evaluation_element(0, cols::SIGN_R).clone();
+        let sign_nsr = step
+            .get_main_evaluation_element(0, cols::SIGN_N_SUB_R)
+            .clone();
+
+        // Build extended QuadWL values (4 words each)
+        // extended_n[0] = n[0] + n[1]*2^16
+        // extended_n[1] = n[2] + n[3]*2^16
+        // extended_n[2] = sign_n * 0xFFFFFFFF
+        // extended_n[3] = sign_n * 0xFFFFFFFF
+        let ext_n = self.build_extended_quad(&n, &sign_n, &shift_16, &sign_fill);
+        let ext_r = self.build_extended_quad(&r, &sign_r, &shift_16, &sign_fill);
+        let ext_nsr = self.build_extended_quad(&nsr, &sign_nsr, &shift_16, &sign_fill);
+
+        // carry[0] = (ext_nsr[0] + ext_r[0] - ext_n[0]) / 2^32
+        // carry[i] = (ext_nsr[i] + ext_r[i] + carry[i-1] - ext_n[i]) / 2^32
+        if i == 0 {
+            (&ext_nsr[0] + &ext_r[0] - &ext_n[0]) * &inv_2_32
+        } else {
+            let prev_carry = self.compute_carry(i - 1, step);
+            (&ext_nsr[i] + &ext_r[i] + &prev_carry - &ext_n[i]) * &inv_2_32
+        }
+    }
+
+    /// Build sign-extended QuadWL representation.
+    fn build_extended_quad<F: IsSubFieldOf<E>, E: IsField>(
+        &self,
+        halfwords: &[FieldElement<F>; 4],
+        sign: &FieldElement<F>,
+        shift_16: &FieldElement<F>,
+        sign_fill: &FieldElement<F>,
+    ) -> [FieldElement<F>; 4] {
+        let ext_word = sign * sign_fill + sign * sign_fill * shift_16;
+        [
+            &halfwords[0] + &halfwords[1] * shift_16,
+            &halfwords[2] + &halfwords[3] * shift_16,
+            ext_word.clone(),
+            ext_word,
+        ]
+    }
+}
+
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for DvrmConstraint {
+    fn degree(&self) -> usize {
+        match self.kind {
+            DvrmConstraintKind::SignedIsBit => 2,
+            DvrmConstraintKind::RemainderSignMatchesNumerator => 2,
+            DvrmConstraintKind::AbsRFormula(_) => 2,
+            DvrmConstraintKind::AbsDFormula(_) => 2,
+            DvrmConstraintKind::SignQFormula => 2,
+            DvrmConstraintKind::CarryIsBit(_) => 2,
+            DvrmConstraintKind::SignNSubRIsBit => 2,
+            DvrmConstraintKind::UnsignedSignN => 2,
+            DvrmConstraintKind::UnsignedSignR => 2,
+            DvrmConstraintKind::UnsignedSignD => 2,
+            DvrmConstraintKind::DivByZeroQ(_) => 2,
+        }
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    fn end_exemptions(&self) -> usize {
+        0
+    }
+
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
     where
         F: IsSubFieldOf<E>,
         E: IsField,
@@ -1153,136 +1251,6 @@ impl DvrmConstraint {
             }
         }
     }
-
-    /// Compute virtual carry[i] for the addition n_sub_r + r = n.
-    ///
-    /// The carries verify that n = n_sub_r + r by checking the carry chain.
-    /// We use sign-extended versions for signed arithmetic.
-    fn compute_carry<F, E>(&self, i: usize, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let shift_16 = FieldElement::<F>::from(SHIFT_16);
-        let inv_2_32 = FieldElement::<F>::from(crate::constraints::templates::INV_SHIFT_32);
-        let sign_fill = FieldElement::<F>::from(SIGN_FILL);
-
-        // Get n, n_sub_r, r halfwords
-        let n: [FieldElement<F>; 4] = [
-            step.get_main_evaluation_element(0, cols::N_0).clone(),
-            step.get_main_evaluation_element(0, cols::N_1).clone(),
-            step.get_main_evaluation_element(0, cols::N_2).clone(),
-            step.get_main_evaluation_element(0, cols::N_3).clone(),
-        ];
-        let nsr: [FieldElement<F>; 4] = [
-            step.get_main_evaluation_element(0, cols::N_SUB_R_0).clone(),
-            step.get_main_evaluation_element(0, cols::N_SUB_R_1).clone(),
-            step.get_main_evaluation_element(0, cols::N_SUB_R_2).clone(),
-            step.get_main_evaluation_element(0, cols::N_SUB_R_3).clone(),
-        ];
-        let r: [FieldElement<F>; 4] = [
-            step.get_main_evaluation_element(0, cols::R_0).clone(),
-            step.get_main_evaluation_element(0, cols::R_1).clone(),
-            step.get_main_evaluation_element(0, cols::R_2).clone(),
-            step.get_main_evaluation_element(0, cols::R_3).clone(),
-        ];
-
-        let sign_n = step.get_main_evaluation_element(0, cols::SIGN_N).clone();
-        let sign_r = step.get_main_evaluation_element(0, cols::SIGN_R).clone();
-        let sign_nsr = step
-            .get_main_evaluation_element(0, cols::SIGN_N_SUB_R)
-            .clone();
-
-        // Build extended QuadWL values (4 words each)
-        // extended_n[0] = n[0] + n[1]*2^16
-        // extended_n[1] = n[2] + n[3]*2^16
-        // extended_n[2] = sign_n * 0xFFFFFFFF
-        // extended_n[3] = sign_n * 0xFFFFFFFF
-        let ext_n = self.build_extended_quad(&n, &sign_n, &shift_16, &sign_fill);
-        let ext_r = self.build_extended_quad(&r, &sign_r, &shift_16, &sign_fill);
-        let ext_nsr = self.build_extended_quad(&nsr, &sign_nsr, &shift_16, &sign_fill);
-
-        // carry[0] = (ext_nsr[0] + ext_r[0] - ext_n[0]) / 2^32
-        // carry[i] = (ext_nsr[i] + ext_r[i] + carry[i-1] - ext_n[i]) / 2^32
-        if i == 0 {
-            (&ext_nsr[0] + &ext_r[0] - &ext_n[0]) * &inv_2_32
-        } else {
-            let prev_carry = self.compute_carry(i - 1, step);
-            (&ext_nsr[i] + &ext_r[i] + &prev_carry - &ext_n[i]) * &inv_2_32
-        }
-    }
-
-    /// Build sign-extended QuadWL representation.
-    fn build_extended_quad<F: IsSubFieldOf<E>, E: IsField>(
-        &self,
-        halfwords: &[FieldElement<F>; 4],
-        sign: &FieldElement<F>,
-        shift_16: &FieldElement<F>,
-        sign_fill: &FieldElement<F>,
-    ) -> [FieldElement<F>; 4] {
-        let ext_word = sign * sign_fill + sign * sign_fill * shift_16;
-        [
-            &halfwords[0] + &halfwords[1] * shift_16,
-            &halfwords[2] + &halfwords[3] * shift_16,
-            ext_word.clone(),
-            ext_word,
-        ]
-    }
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for DvrmConstraint {
-    fn degree(&self) -> usize {
-        match self.kind {
-            DvrmConstraintKind::SignedIsBit => 2,
-            DvrmConstraintKind::RemainderSignMatchesNumerator => 2,
-            DvrmConstraintKind::AbsRFormula(_) => 2,
-            DvrmConstraintKind::AbsDFormula(_) => 2,
-            DvrmConstraintKind::SignQFormula => 2,
-            DvrmConstraintKind::CarryIsBit(_) => 2,
-            DvrmConstraintKind::SignNSubRIsBit => 2,
-            DvrmConstraintKind::UnsignedSignN => 2,
-            DvrmConstraintKind::UnsignedSignR => 2,
-            DvrmConstraintKind::UnsignedSignD => 2,
-            DvrmConstraintKind::DivByZeroQ(_) => 2,
-        }
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn end_exemptions(&self) -> usize {
-        0
-    }
-
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-            }
-            TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
-            }
-        }
-    }
-
-    impl_base_field_evaluate_prover!();
 }
 
 /// Creates all constraints for the DVRM table.

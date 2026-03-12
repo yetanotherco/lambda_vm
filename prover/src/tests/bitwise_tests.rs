@@ -378,7 +378,7 @@ fn test_preprocessed_commitment_is_nonzero() {
 mod soundness_tests {
     use super::*;
     use crypto::fiat_shamir::default_transcript::DefaultTranscript;
-    use stark::constraints::transition::TransitionConstraint;
+    use stark::constraints::transition::TransitionConstraintEvaluator;
     use stark::lookup::{
         AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, BusValue, Multiplicity,
         NullBoundaryConstraintBuilder, Packing,
@@ -417,7 +417,7 @@ mod soundness_tests {
     ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
         use crate::tables::types::BusId;
 
-        let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+        let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![BusInteraction::sender(
                 BusId::AndByte,
@@ -468,7 +468,7 @@ mod soundness_tests {
     ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
         use crate::tables::types::BusId;
 
-        let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+        let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![BusInteraction::receiver(
                 BusId::AndByte,

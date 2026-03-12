@@ -155,22 +155,6 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         Polynomial::evaluate_fft::<F>(&scaled, blowup_factor, domain_size)
     }
 
-    /// Same as [`evaluate_offset_fft`] but returns evaluations in **bit-reversed order**.
-    ///
-    /// Skips the final bit-reverse permutation, saving an O(N) pass.
-    pub fn evaluate_offset_fft_bitrev<F: IsFFTField + IsSubFieldOf<E>>(
-        poly: &Polynomial<FieldElement<E>>,
-        blowup_factor: usize,
-        domain_size: Option<usize>,
-        offset: &FieldElement<F>,
-    ) -> Result<Vec<FieldElement<E>>, FFTError>
-    where
-        E: Send + Sync,
-    {
-        let scaled = poly.scale(offset);
-        Polynomial::evaluate_fft_bitrev::<F>(&scaled, blowup_factor, domain_size)
-    }
-
     /// Returns a new polynomial that interpolates `(w^i, fft_evals[i])`, with `w` being a
     /// Nth primitive root of unity in a subfield F of E, and `i in 0..N`, with `N = fft_evals.len()`.
     /// This is considered to be the inverse operation of [Self::evaluate_fft()].
@@ -425,48 +409,6 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         // 4. Forward FFT on the full buffer
         dispatch_fft(buffer, fwd_twiddles)?;
         in_place_bit_reverse_permute(buffer);
-
-        Ok(())
-    }
-
-    /// Same as [`coset_lde_full_into`], but returns evaluations in **bit-reversed order**.
-    /// Skips the final O(N) bit-reverse permutation. Use when the consumer
-    /// needs bit-reversed data (e.g. Merkle tree commit).
-    pub fn coset_lde_full_into_bitrev<F: IsFFTField + IsSubFieldOf<E> + Send + Sync>(
-        evals: &[FieldElement<E>],
-        blowup_factor: usize,
-        weights: &[FieldElement<F>],
-        inv_twiddles: &LayerTwiddles<F>,
-        fwd_twiddles: &LayerTwiddles<F>,
-        buffer: &mut Vec<FieldElement<E>>,
-    ) -> Result<(), FFTError>
-    where
-        E: Send + Sync,
-    {
-        let n = evals.len();
-        if n == 0 {
-            buffer.clear();
-            return Ok(());
-        }
-        if !n.is_power_of_two() {
-            return Err(FFTError::InputError(n));
-        }
-        let lde_size = n * blowup_factor;
-
-        if (lde_size.trailing_zeros() as u64) > F::TWO_ADICITY {
-            return Err(FFTError::DomainSizeError(lde_size.trailing_zeros() as usize));
-        }
-
-        buffer.clear();
-        buffer.extend_from_slice(evals);
-        buffer.resize(lde_size, FieldElement::zero());
-
-        in_place_bit_reverse_permute(&mut buffer[..n]);
-        dispatch_ifft(&mut buffer[..n], inv_twiddles)?;
-
-        scale_by_weights(&mut buffer[..n], weights);
-
-        dispatch_fft(buffer, fwd_twiddles)?;
 
         Ok(())
     }

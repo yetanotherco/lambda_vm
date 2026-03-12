@@ -16,11 +16,9 @@
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
-use stark::constraints::transition::TransitionConstraint;
+use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::table::TableView;
-use stark::traits::TransitionEvaluationContext;
 
-use crate::impl_base_field_evaluate_prover;
 use crate::tables::cpu::cols;
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
@@ -118,19 +116,6 @@ impl EcallCommitImpliesEcallConstraint {
     pub fn new(constraint_idx: usize) -> Self {
         Self { constraint_idx }
     }
-
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let ecall_commit = step
-            .get_main_evaluation_element(0, cols::ECALL_COMMIT)
-            .clone();
-        let ecall = step.get_main_evaluation_element(0, cols::ECALL).clone();
-        let one = FieldElement::<F>::one();
-        ecall_commit * (one - ecall)
-    }
 }
 
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension>
@@ -148,32 +133,17 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension>
         0
     }
 
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-            }
-
-            TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
-            }
-        }
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        let ecall_commit = step
+            .get_main_evaluation_element(0, cols::ECALL_COMMIT)
+            .clone();
+        let ecall = step.get_main_evaluation_element(0, cols::ECALL).clone();
+        let one = FieldElement::<F>::one();
+        ecall_commit * (one - ecall)
     }
 }
 
@@ -241,8 +211,23 @@ impl BranchCondConstraint {
     pub fn new(constraint_idx: usize) -> Self {
         Self { constraint_idx }
     }
+}
 
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for BranchCondConstraint {
+    fn degree(&self) -> usize {
+        // BLT * res_0 * mp_selector has degree 3
+        3
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    fn end_exemptions(&self) -> usize {
+        0
+    }
+
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
     where
         F: IsSubFieldOf<E>,
         E: IsField,
@@ -273,51 +258,6 @@ impl BranchCondConstraint {
     }
 }
 
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for BranchCondConstraint {
-    fn degree(&self) -> usize {
-        // BLT * res_0 * mp_selector has degree 3
-        3
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn end_exemptions(&self) -> usize {
-        0
-    }
-
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-            }
-
-            TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
-            }
-        }
-    }
-
-    impl_base_field_evaluate_prover!();
-}
-
 // =========================================================================
 // EBREAK Constraint
 // =========================================================================
@@ -332,15 +272,6 @@ pub struct EbreakConstraint {
 impl EbreakConstraint {
     pub fn new(constraint_idx: usize) -> Self {
         Self { constraint_idx }
-    }
-
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        // EBREAK must be 0
-        step.get_main_evaluation_element(0, cols::EBREAK).clone()
     }
 }
 
@@ -357,35 +288,14 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for EbreakConstr
         0
     }
 
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-            }
-
-            TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
-            }
-        }
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        // EBREAK must be 0
+        step.get_main_evaluation_element(0, cols::EBREAK).clone()
     }
-
-    impl_base_field_evaluate_prover!();
 }
 
 // =========================================================================
@@ -406,8 +316,22 @@ impl Arg1LowerConstraint {
     pub fn new(constraint_idx: usize) -> Self {
         Self { constraint_idx }
     }
+}
 
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg1LowerConstraint {
+    fn degree(&self) -> usize {
+        1
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    fn end_exemptions(&self) -> usize {
+        0
+    }
+
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
     where
         F: IsSubFieldOf<E>,
         E: IsField,
@@ -427,50 +351,6 @@ impl Arg1LowerConstraint {
     }
 }
 
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg1LowerConstraint {
-    fn degree(&self) -> usize {
-        1
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn end_exemptions(&self) -> usize {
-        0
-    }
-
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-            }
-
-            TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
-            }
-        }
-    }
-
-    impl_base_field_evaluate_prover!();
-}
-
 /// Constraint: arg1[4:8] = rv1[2] * (1 - word_instr) + (2^32 - 1) * rv1_sign_bit * signed
 ///
 /// Upper 32 bits of arg1 depends on word_instr and sign extension.
@@ -482,8 +362,23 @@ impl Arg1UpperConstraint {
     pub fn new(constraint_idx: usize) -> Self {
         Self { constraint_idx }
     }
+}
 
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg1UpperConstraint {
+    fn degree(&self) -> usize {
+        // rv1_sign_bit * signed * word_instr has degree 3
+        3
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    fn end_exemptions(&self) -> usize {
+        0
+    }
+
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
     where
         F: IsSubFieldOf<E>,
         E: IsField,
@@ -513,51 +408,6 @@ impl Arg1UpperConstraint {
     }
 }
 
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg1UpperConstraint {
-    fn degree(&self) -> usize {
-        // rv1_sign_bit * signed * word_instr has degree 3
-        3
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn end_exemptions(&self) -> usize {
-        0
-    }
-
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-            }
-
-            TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
-            }
-        }
-    }
-
-    impl_base_field_evaluate_prover!();
-}
-
 // =========================================================================
 // SLT/BLT Zero Upper Bytes Constraint
 // =========================================================================
@@ -579,21 +429,6 @@ impl SltResZeroConstraint {
             constraint_idx,
         }
     }
-
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let slt = step.get_main_evaluation_element(0, cols::SLT).clone();
-        let blt = step.get_main_evaluation_element(0, cols::BLT).clone();
-        let res_i = step
-            .get_main_evaluation_element(0, cols::RES[self.byte_idx])
-            .clone();
-
-        // (SLT + BLT) * res[i] = 0
-        (slt + blt) * res_i
-    }
 }
 
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for SltResZeroConstraint {
@@ -609,35 +444,20 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for SltResZeroCo
         0
     }
 
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-            }
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        let slt = step.get_main_evaluation_element(0, cols::SLT).clone();
+        let blt = step.get_main_evaluation_element(0, cols::BLT).clone();
+        let res_i = step
+            .get_main_evaluation_element(0, cols::RES[self.byte_idx])
+            .clone();
 
-            TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
-            }
-        }
+        // (SLT + BLT) * res[i] = 0
+        (slt + blt) * res_i
     }
-
-    impl_base_field_evaluate_prover!();
 }
 
 /// Creates all SLT/BLT zero constraints for res[1..8].
@@ -667,8 +487,22 @@ impl SignBitZeroConstraint {
     pub fn new(constraint_idx: usize) -> Self {
         Self { constraint_idx }
     }
+}
 
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for SignBitZeroConstraint {
+    fn degree(&self) -> usize {
+        2
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    fn end_exemptions(&self) -> usize {
+        0
+    }
+
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
     where
         F: IsSubFieldOf<E>,
         E: IsField,
@@ -691,50 +525,6 @@ impl SignBitZeroConstraint {
         // (sum of sign bits) * (1 - word_instr) = 0
         (rv1_sign_bit + arg2_sign_bit + res_sign_bit) * (one - word_instr)
     }
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for SignBitZeroConstraint {
-    fn degree(&self) -> usize {
-        2
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn end_exemptions(&self) -> usize {
-        0
-    }
-
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-            }
-
-            TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
-            }
-        }
-    }
-
-    impl_base_field_evaluate_prover!();
 }
 
 // =========================================================================
@@ -807,8 +597,23 @@ impl NextPcAddConstraint {
         let inv_2_32 = FieldElement::<F>::from(super::templates::INV_SHIFT_32);
         (pc_hi + carry_0 - next_pc_hi) * inv_2_32
     }
+}
 
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for NextPcAddConstraint {
+    fn degree(&self) -> usize {
+        // (1 - branch_cond) * carry * (1 - carry) has degree 3
+        3
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    fn end_exemptions(&self) -> usize {
+        0
+    }
+
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
     where
         F: IsSubFieldOf<E>,
         E: IsField,
@@ -830,51 +635,6 @@ impl NextPcAddConstraint {
     }
 }
 
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for NextPcAddConstraint {
-    fn degree(&self) -> usize {
-        // (1 - branch_cond) * carry * (1 - carry) has degree 3
-        3
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn end_exemptions(&self) -> usize {
-        0
-    }
-
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-            }
-
-            TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
-            }
-        }
-    }
-
-    impl_base_field_evaluate_prover!();
-}
-
 // =========================================================================
 // Arg2 Constraints
 // =========================================================================
@@ -890,8 +650,22 @@ impl Arg2LowerConstraint {
     pub fn new(constraint_idx: usize) -> Self {
         Self { constraint_idx }
     }
+}
 
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg2LowerConstraint {
+    fn degree(&self) -> usize {
+        2
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    fn end_exemptions(&self) -> usize {
+        0
+    }
+
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
     where
         F: IsSubFieldOf<E>,
         E: IsField,
@@ -930,39 +704,6 @@ impl Arg2LowerConstraint {
     }
 }
 
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg2LowerConstraint {
-    fn degree(&self) -> usize {
-        2
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn end_exemptions(&self) -> usize {
-        0
-    }
-
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover { frame, .. } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-            }
-            TransitionEvaluationContext::Verifier { frame, .. } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
-            }
-        }
-    }
-
-    impl_base_field_evaluate_prover!();
-}
-
 /// Constraint: arg2[4:] = (1-LOAD)*((1-word_instr)*rv2[2] + signed*arg2_sign_bit*(2^32-1)) + (1-BEQ-BLT-STORE)*imm[1]
 ///
 /// arg2 upper 32 bits with sign extension logic.
@@ -974,8 +715,23 @@ impl Arg2UpperConstraint {
     pub fn new(constraint_idx: usize) -> Self {
         Self { constraint_idx }
     }
+}
 
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg2UpperConstraint {
+    fn degree(&self) -> usize {
+        // (1-LOAD) * signed * arg2_sign_bit has degree 3
+        3
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    fn end_exemptions(&self) -> usize {
+        0
+    }
+
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
     where
         F: IsSubFieldOf<E>,
         E: IsField,
@@ -1018,40 +774,6 @@ impl Arg2UpperConstraint {
     }
 }
 
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg2UpperConstraint {
-    fn degree(&self) -> usize {
-        // (1-LOAD) * signed * arg2_sign_bit has degree 3
-        3
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn end_exemptions(&self) -> usize {
-        0
-    }
-
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover { frame, .. } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-            }
-            TransitionEvaluationContext::Verifier { frame, .. } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
-            }
-        }
-    }
-
-    impl_base_field_evaluate_prover!();
-}
-
 // =========================================================================
 // RVD Constraints
 // =========================================================================
@@ -1069,8 +791,22 @@ impl RvdLowerConstraint {
     pub fn new(constraint_idx: usize) -> Self {
         Self { constraint_idx }
     }
+}
 
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RvdLowerConstraint {
+    fn degree(&self) -> usize {
+        2
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    fn end_exemptions(&self) -> usize {
+        0
+    }
+
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
     where
         F: IsSubFieldOf<E>,
         E: IsField,
@@ -1089,39 +825,6 @@ impl RvdLowerConstraint {
     }
 }
 
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RvdLowerConstraint {
-    fn degree(&self) -> usize {
-        2
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn end_exemptions(&self) -> usize {
-        0
-    }
-
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover { frame, .. } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-            }
-            TransitionEvaluationContext::Verifier { frame, .. } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
-            }
-        }
-    }
-
-    impl_base_field_evaluate_prover!();
-}
-
 /// Constraint: (1-LOAD) * (rvd[1] - ((1-word_instr)*res[4:] + res_sign_bit*(2^32-1))) = 0
 ///
 /// When not LOAD, rvd upper 32 bits equals res upper with sign extension.
@@ -1135,8 +838,23 @@ impl RvdUpperConstraint {
     pub fn new(constraint_idx: usize) -> Self {
         Self { constraint_idx }
     }
+}
 
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RvdUpperConstraint {
+    fn degree(&self) -> usize {
+        // (1-LOAD) * (1-word_instr) * res_hi has degree 3
+        3
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    fn end_exemptions(&self) -> usize {
+        0
+    }
+
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
     where
         F: IsSubFieldOf<E>,
         E: IsField,
@@ -1160,40 +878,6 @@ impl RvdUpperConstraint {
         // (1 - LOAD) * (rvd[1] - expected) = 0
         (one - load) * (rvd_1 - expected)
     }
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RvdUpperConstraint {
-    fn degree(&self) -> usize {
-        // (1-LOAD) * (1-word_instr) * res_hi has degree 3
-        3
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn end_exemptions(&self) -> usize {
-        0
-    }
-
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover { frame, .. } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-            }
-            TransitionEvaluationContext::Verifier { frame, .. } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
-            }
-        }
-    }
-
-    impl_base_field_evaluate_prover!();
 }
 
 // =========================================================================
@@ -1302,7 +986,7 @@ pub const NUM_CPU_CONSTRAINTS: usize =
 pub fn create_all_cpu_constraints() -> (
     Vec<IsBitConstraint>,
     Vec<AddConstraint>,
-    Vec<Box<dyn TransitionConstraint<GoldilocksField, GoldilocksExtension>>>,
+    Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>>,
     usize,
 ) {
     let mut next_idx = 0;
@@ -1326,54 +1010,54 @@ pub fn create_all_cpu_constraints() -> (
     add_constraints.extend(jalr);
 
     // Other constraints
-    let mut other: Vec<Box<dyn TransitionConstraint<GoldilocksField, GoldilocksExtension>>> =
+    let mut other: Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>> =
         Vec::new();
 
     // Branch condition
-    other.push(Box::new(BranchCondConstraint::new(next_idx)));
+    other.push(BranchCondConstraint::new(next_idx).boxed());
     next_idx += 1;
 
     // EBREAK
-    other.push(Box::new(EbreakConstraint::new(next_idx)));
+    other.push(EbreakConstraint::new(next_idx).boxed());
     next_idx += 1;
 
     // Arg1 constraints
-    other.push(Box::new(Arg1LowerConstraint::new(next_idx)));
+    other.push(Arg1LowerConstraint::new(next_idx).boxed());
     next_idx += 1;
-    other.push(Box::new(Arg1UpperConstraint::new(next_idx)));
+    other.push(Arg1UpperConstraint::new(next_idx).boxed());
     next_idx += 1;
 
     // Arg2 constraints
-    other.push(Box::new(Arg2LowerConstraint::new(next_idx)));
+    other.push(Arg2LowerConstraint::new(next_idx).boxed());
     next_idx += 1;
-    other.push(Box::new(Arg2UpperConstraint::new(next_idx)));
+    other.push(Arg2UpperConstraint::new(next_idx).boxed());
     next_idx += 1;
 
     // Rvd constraints
-    other.push(Box::new(RvdLowerConstraint::new(next_idx)));
+    other.push(RvdLowerConstraint::new(next_idx).boxed());
     next_idx += 1;
-    other.push(Box::new(RvdUpperConstraint::new(next_idx)));
+    other.push(RvdUpperConstraint::new(next_idx).boxed());
     next_idx += 1;
 
     // SLT res zero constraints
     let (slt_zero, next) = create_slt_res_zero_constraints(next_idx);
     next_idx = next;
     for c in slt_zero {
-        other.push(Box::new(c));
+        other.push(c.boxed());
     }
 
     // Sign bit zero constraint
-    other.push(Box::new(SignBitZeroConstraint::new(next_idx)));
+    other.push(SignBitZeroConstraint::new(next_idx).boxed());
     next_idx += 1;
 
     // ECALL_COMMIT implies ECALL
-    other.push(Box::new(EcallCommitImpliesEcallConstraint::new(next_idx)));
+    other.push(EcallCommitImpliesEcallConstraint::new(next_idx).boxed());
     next_idx += 1;
 
     // Next PC (non-branching) constraints
     let (next_pc_0, next_pc_1) = NextPcAddConstraint::new_pair(next_idx);
-    other.push(Box::new(next_pc_0));
-    other.push(Box::new(next_pc_1));
+    other.push(next_pc_0.boxed());
+    other.push(next_pc_1.boxed());
     next_idx += 2;
 
     (is_bit, add_constraints, other, next_idx)

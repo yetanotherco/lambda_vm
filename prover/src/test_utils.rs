@@ -18,7 +18,7 @@ use executor::vm::instruction::decoding::Instruction;
 use executor::vm::logs::Log;
 use executor::vm::memory::U64HashMap;
 use math::field::element::FieldElement;
-use stark::constraints::transition::TransitionConstraint;
+use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData, NullBoundaryConstraintBuilder};
 use stark::proof::options::ProofOptions;
 use stark::trace::TraceTable;
@@ -471,12 +471,12 @@ pub fn create_cpu_air(proof_options: &ProofOptions) -> VmAir {
     let (is_bit, add, other, _) = create_all_cpu_constraints();
 
     // All CPU constraints
-    let mut transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = Vec::new();
+    let mut transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = Vec::new();
     for c in is_bit {
-        transition_constraints.push(Box::new(c));
+        transition_constraints.push(c.boxed());
     }
     for c in add {
-        transition_constraints.push(Box::new(c));
+        transition_constraints.push(c.boxed());
     }
     for c in other {
         transition_constraints.push(c);
@@ -498,7 +498,7 @@ pub fn create_cpu_air(proof_options: &ProofOptions) -> VmAir {
 
 /// Create Bitwise AIR with bus interactions.
 pub fn create_bitwise_air(proof_options: &ProofOptions) -> VmAir {
-    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: bitwise_bus_interactions(),
@@ -516,7 +516,7 @@ pub fn create_bitwise_air(proof_options: &ProofOptions) -> VmAir {
 
 /// Create LT AIR with bus interactions.
 pub fn create_lt_air(proof_options: &ProofOptions) -> VmAir {
-    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: lt_bus_interactions(),
@@ -535,8 +535,8 @@ pub fn create_lt_air(proof_options: &ProofOptions) -> VmAir {
 /// Create SHIFT AIR with constraints and bus interactions.
 pub fn create_shift_air(proof_options: &ProofOptions) -> VmAir {
     let (constraints, _) = shift_constraints(0);
-    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> =
-        constraints.into_iter().map(|c| Box::new(c) as _).collect();
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> =
+        constraints.into_iter().map(|c| c.boxed()).collect();
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: shift_bus_interactions(),
@@ -602,7 +602,7 @@ pub fn create_load_air(proof_options: &ProofOptions) -> VmAir {
 ///     );
 /// ```
 pub fn create_decode_air(proof_options: &ProofOptions) -> VmAir {
-    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: decode_bus_interactions(),
@@ -620,7 +620,7 @@ pub fn create_decode_air(proof_options: &ProofOptions) -> VmAir {
 
 /// Create MUL AIR with bus interactions.
 pub fn create_mul_air(proof_options: &ProofOptions) -> VmAir {
-    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: mul_bus_interactions(),
@@ -639,8 +639,8 @@ pub fn create_mul_air(proof_options: &ProofOptions) -> VmAir {
 /// Create DVRM AIR with constraints and bus interactions.
 pub fn create_dvrm_air(proof_options: &ProofOptions) -> VmAir {
     let (constraints, _) = dvrm_constraints(0);
-    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> =
-        constraints.into_iter().map(|c| Box::new(c) as _).collect();
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> =
+        constraints.into_iter().map(|c| c.boxed()).collect();
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: dvrm_bus_interactions(),
@@ -663,8 +663,8 @@ pub fn create_dvrm_air(proof_options: &ProofOptions) -> VmAir {
 /// - For JALR: next_pc = (register + sign_extend(offset)) & ~1
 pub fn create_branch_air(proof_options: &ProofOptions) -> VmAir {
     let (constraints, _) = branch_constraints(0);
-    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> =
-        constraints.into_iter().map(|c| Box::new(c) as _).collect();
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> =
+        constraints.into_iter().map(|c| c.boxed()).collect();
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: branch_bus_interactions(),
@@ -682,7 +682,7 @@ pub fn create_branch_air(proof_options: &ProofOptions) -> VmAir {
 
 /// Create HALT AIR with bus interactions (no transition constraints).
 pub fn create_halt_air(proof_options: &ProofOptions) -> VmAir {
-    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: halt_bus_interactions(),
@@ -727,7 +727,7 @@ pub fn create_commit_air(proof_options: &ProofOptions) -> VmAir {
 /// - IS_BYTE bus: range checks for init/fini values
 /// - Memory bus: provides initial and final memory tokens
 pub fn create_page_air(proof_options: &ProofOptions, page_base: u64) -> VmAir {
-    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: page_bus_interactions(page_base),
@@ -748,7 +748,7 @@ pub fn create_page_air(proof_options: &ProofOptions, page_base: u64) -> VmAir {
 /// The REGISTER table provides initial and final tokens for register accesses
 /// on the Memory bus (is_register=1).
 pub fn create_register_air(proof_options: &ProofOptions) -> VmAir {
-    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![];
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: register_bus_interactions(),

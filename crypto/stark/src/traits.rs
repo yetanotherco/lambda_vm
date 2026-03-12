@@ -10,7 +10,7 @@ use math::{
 };
 
 use crate::{
-    constraints::transition::TransitionConstraint, domain::Domain, lookup::BusPublicInputs,
+    constraints::transition::TransitionConstraintEvaluator, domain::Domain, lookup::BusPublicInputs,
 };
 
 use super::{
@@ -220,26 +220,9 @@ pub trait AIR: Send + Sync {
             vec![FieldElement::<Self::FieldExtension>::zero(); self.num_transition_constraints()];
         self.transition_constraints()
             .iter()
-            .for_each(|c| c.evaluate(evaluation_context, &mut evaluations));
+            .for_each(|c| c.evaluate_verifier(evaluation_context, &mut evaluations));
 
         evaluations
-    }
-
-    /// Evaluate all transition constraints into a caller-provided buffer.
-    ///
-    /// Same as `compute_transition` but reuses a pre-allocated buffer, avoiding
-    /// a `Vec` allocation per LDE domain point in the prover's hot loop.
-    fn compute_transition_into(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
-        evaluations: &mut [FieldElement<Self::FieldExtension>],
-    ) {
-        for e in evaluations.iter_mut() {
-            *e = FieldElement::zero();
-        }
-        self.transition_constraints()
-            .iter()
-            .for_each(|c| c.evaluate(evaluation_context, evaluations));
     }
 
     /// Number of transition constraints that produce base-field evaluations.
@@ -335,7 +318,7 @@ pub trait AIR: Send + Sync {
 
     fn transition_constraints(
         &self,
-    ) -> &Vec<Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>>;
+    ) -> &Vec<Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>>;
 
     fn transition_zerofier_evaluations(
         &self,

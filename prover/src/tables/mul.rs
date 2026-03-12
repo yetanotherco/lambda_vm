@@ -31,14 +31,12 @@
 
 use std::collections::HashMap;
 
-use crate::impl_base_field_evaluate_prover;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
 use stark::trace::TraceTable;
-use stark::traits::TransitionEvaluationContext;
 
 use super::types::{
     BusId, FE, GoldilocksExtension, GoldilocksField, INV_2_32, INV_2_64, INV_2_96, INV_2_128,
@@ -703,43 +701,6 @@ impl MulConstraint {
         }
     }
 
-    /// Compute the constraint value.
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        match self.kind {
-            MulConstraintKind::LhsSign => {
-                // (1 - lhs_signed) * lhs_is_negative = 0
-                let lhs_signed = step
-                    .get_main_evaluation_element(0, cols::LHS_SIGNED)
-                    .clone();
-                let lhs_is_neg = step
-                    .get_main_evaluation_element(0, cols::LHS_IS_NEGATIVE)
-                    .clone();
-                let one = FieldElement::<F>::one();
-                (&one - &lhs_signed) * &lhs_is_neg
-            }
-            MulConstraintKind::RhsSign => {
-                // (1 - rhs_signed) * rhs_is_negative = 0
-                let rhs_signed = step
-                    .get_main_evaluation_element(0, cols::RHS_SIGNED)
-                    .clone();
-                let rhs_is_neg = step
-                    .get_main_evaluation_element(0, cols::RHS_IS_NEGATIVE)
-                    .clone();
-                let one = FieldElement::<F>::one();
-                (&one - &rhs_signed) * &rhs_is_neg
-            }
-            MulConstraintKind::RawProduct(i) => {
-                // raw_product[i] = convolution formula
-                // This requires computing the sign-extended values and convolution
-                self.compute_raw_product_constraint(i, step)
-            }
-        }
-    }
-
     /// Compute raw_product constraint for index i.
     ///
     /// raw_product[i] = Σ_k=0^1 2^(16k) × Σ_j=0^(2i+k) lhs_ext[j] × rhs_ext[2i+k-j]
@@ -844,34 +805,41 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MulConstrain
         0
     }
 
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        match self.kind {
+            MulConstraintKind::LhsSign => {
+                // (1 - lhs_signed) * lhs_is_negative = 0
+                let lhs_signed = step
+                    .get_main_evaluation_element(0, cols::LHS_SIGNED)
+                    .clone();
+                let lhs_is_neg = step
+                    .get_main_evaluation_element(0, cols::LHS_IS_NEGATIVE)
+                    .clone();
+                let one = FieldElement::<F>::one();
+                (&one - &lhs_signed) * &lhs_is_neg
             }
-            TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
+            MulConstraintKind::RhsSign => {
+                // (1 - rhs_signed) * rhs_is_negative = 0
+                let rhs_signed = step
+                    .get_main_evaluation_element(0, cols::RHS_SIGNED)
+                    .clone();
+                let rhs_is_neg = step
+                    .get_main_evaluation_element(0, cols::RHS_IS_NEGATIVE)
+                    .clone();
+                let one = FieldElement::<F>::one();
+                (&one - &rhs_signed) * &rhs_is_neg
+            }
+            MulConstraintKind::RawProduct(i) => {
+                // raw_product[i] = convolution formula
+                // This requires computing the sign-extended values and convolution
+                self.compute_raw_product_constraint(i, step)
             }
         }
     }
-
-    impl_base_field_evaluate_prover!();
 }
 
 /// Creates all constraints for the MUL table.
