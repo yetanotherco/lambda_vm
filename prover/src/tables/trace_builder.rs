@@ -338,6 +338,7 @@ fn collect_ops_from_cpu(
     let mut bitwise_ops = Vec::with_capacity(cpu_ops.len() * 4);
     let mut commit_ops = Vec::new();
     let mut current_commit_index = 0u32;
+    let mut commit_ecall_count = 0u32;
 
     for op in cpu_ops {
         // --- MEMW and LOAD (require state tracking, order matters) ---
@@ -364,11 +365,13 @@ fn collect_ops_from_cpu(
                 memory_state,
                 current_commit_index as u64,
             ));
-            let commit_ops = collect_commit_memw_ops(op, register_state, memory_state);
-            memw_ops.extend(commit_ops);
+            let reg_commit_ops = collect_commit_memw_ops(op, register_state, memory_state);
+            memw_ops.extend(reg_commit_ops);
+            let count = u32::try_from(op.commit_count).expect("commit_count exceeds u32 range");
             current_commit_index = current_commit_index
-                .checked_add(op.commit_count as u32)
+                .checked_add(count)
                 .expect("commit index exceeds u32 range");
+            commit_ecall_count += 1;
         }
 
         // --- LT, SHIFT, and Bitwise (no state tracking needed) ---
@@ -399,6 +402,13 @@ fn collect_ops_from_cpu(
         // Collect bitwise lookups
         bitwise_ops.extend(op.collect_bitwise_ops());
     }
+
+    // Each ecall generates count+1 operations (count real rows + 1 end row)
+    debug_assert_eq!(
+        commit_ops.len(),
+        current_commit_index as usize + commit_ecall_count as usize,
+        "commit_ops count should match accumulated commit index plus end rows"
+    );
 
     (
         memw_ops,
