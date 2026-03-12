@@ -1350,19 +1350,20 @@ pub trait IsStarkProver<
         indexes_to_open: &[usize],
     ) -> DeepPolynomialOpenings<Field, FieldExtension>
     where
-        FieldElement<Field>: AsBytes,
-        FieldElement<FieldExtension>: AsBytes,
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        let mut openings = Vec::with_capacity(indexes_to_open.len());
-
         // Check if this is a preprocessed table (has separate precomputed tree)
         let is_preprocessed = round_1_result.main.precomputed_merkle_tree.is_some();
         let num_precomputed_cols = round_1_result.main.num_precomputed_cols;
         let total_cols = round_1_result.lde_trace.num_main_cols();
 
-        for index in indexes_to_open.iter() {
-            // For preprocessed tables, open main (multiplicities) with column range
-            // For normal tables, open all columns
+        #[cfg(feature = "parallel")]
+        let iter = indexes_to_open.par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let iter = indexes_to_open.iter();
+
+        iter.map(|index| {
             let main_trace_opening = if is_preprocessed {
                 Self::open_trace_polys_main_range(
                     domain,
@@ -1381,7 +1382,6 @@ pub trait IsStarkProver<
                 )
             };
 
-            // For preprocessed tables, also open precomputed tree
             let precomputed_trace_opening = round_1_result
                 .main
                 .precomputed_merkle_tree
@@ -1412,15 +1412,14 @@ pub trait IsStarkProver<
                 )
             });
 
-            openings.push(DeepPolynomialOpening {
+            DeepPolynomialOpening {
                 composition_poly: composition_openings,
                 main_trace_polys: main_trace_opening,
                 precomputed_trace_polys: precomputed_trace_opening,
                 aux_trace_polys,
-            });
-        }
-
-        openings
+            }
+        })
+        .collect()
     }
 
     // TODO: propagate errors instead of unwrap() in commit_columns, reconstruct_round1, and expand_pool_to_lde

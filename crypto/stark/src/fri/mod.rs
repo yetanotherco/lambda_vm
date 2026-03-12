@@ -9,6 +9,9 @@ use math::field::traits::IsSubFieldOf;
 use math::field::traits::{IsFFTField, IsField};
 use math::traits::AsBytes;
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
+
 use crate::config::{FriLayerMerkleTree, FriLayerMerkleTreeBackend};
 
 use self::fri_commitment::FriLayer;
@@ -100,9 +103,13 @@ where
 {
     if !fri_layers.is_empty() {
         let num_layers = fri_layers.len();
-        iotas
-            .iter()
-            .map(|iota_s| {
+
+        #[cfg(feature = "parallel")]
+        let iter = iotas.par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let iter = iotas.iter();
+
+        iter.map(|iota_s| {
                 let mut layers_evaluations_sym = Vec::with_capacity(num_layers);
                 let mut layers_auth_paths_sym = Vec::with_capacity(num_layers);
 
@@ -124,9 +131,6 @@ where
             })
             .collect()
     } else {
-        // For 0 FRI layers (small traces), return empty decommitments for each query.
-        // The verifier still needs one decommitment entry per query, even if the
-        // FRI layer data is empty.
         iotas
             .iter()
             .map(|_| FriDecommitment {
