@@ -1031,14 +1031,14 @@ pub trait IsStarkProver<
             &trace_term_coeffs,
         );
 
-        // Extend N trace-coset evaluations to 2N LDE-coset evaluations via standard LDE.
+        // Extend N trace-coset evaluations to 2N LDE-coset evaluations via fused coset LDE.
         // deep_evals[i] = h(offset·ω_N^i) = f(ω_N^i) where f(x) = h(offset·x).
-        // Standard iFFT+FFT recovers f and evaluates on the 2N-th roots: f(Ω^j) = h(offset·Ω^j).
+        // coset_lde with offset=1 does iFFT → zero-pad → FFT in a single pass,
+        // avoiding the intermediate Polynomial allocation.
         let domain_size = domain.lde_roots_of_unity_coset.len();
-        let deep_poly =
-            Polynomial::interpolate_fft::<Field>(&deep_evals).expect("iFFT should succeed");
-        let mut lde_evals = Polynomial::evaluate_fft::<Field>(&deep_poly, 1, Some(domain_size))
-            .expect("FFT should succeed");
+        let mut lde_evals =
+            Polynomial::coset_lde::<Field>(&deep_evals, 2, &FieldElement::<Field>::one())
+                .expect("coset LDE should succeed");
         in_place_bit_reverse_permute(&mut lde_evals);
 
         // FRI commit phase from pre-computed evaluations (no initial FFT)
