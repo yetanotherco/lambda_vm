@@ -1,6 +1,6 @@
 	.attribute	5, "rv64i2p1_m2p0"
-	.globl	main
-main:
+	.globl	_start
+_start:
 	# Iterative Fibonacci - pure register arithmetic
 	# ~8M steps
 	#
@@ -19,5 +19,6 @@ main:
 	bnez	a0, .loop		# loop if n != 0
 
 	mv	a0, t1			# result = b
+	li	a0, 0
 	li	a7, 93
 	ecall				# halt with result in a0
