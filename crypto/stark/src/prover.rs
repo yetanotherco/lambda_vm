@@ -1201,33 +1201,44 @@ pub trait IsStarkProver<
 
         iter.map(|i| {
             let row_idx = i * blowup_factor; // LDE row index
-
-            // H terms: Σ_j γ_j * (H_j(x_i) - H_j(z^K)) * inv_h[i]
             let mut result = FieldElement::<FieldExtension>::zero();
-            for j in 0..num_parts {
-                let h_j_val = &round_2_result.lde_composition_poly_evaluations[j][row_idx];
-                let h_j_ood = &h_ood[j];
-                let numerator = h_j_val - h_j_ood;
-                result += &composition_poly_gammas[j] * numerator * &inv_h[i];
+
+            // H terms: factor inv_h[i] out of the sum to save (num_parts - 1) E-muls
+            // Compute: inv_h[i] * Σ_j γ_j * (H_j(x_i) - H_j(z^K))
+            {
+                let mut h_sum = FieldElement::<FieldExtension>::zero();
+                for j in 0..num_parts {
+                    let h_j_val = &round_2_result.lde_composition_poly_evaluations[j][row_idx];
+                    let numerator = h_j_val - &h_ood[j];
+                    h_sum += &composition_poly_gammas[j] * numerator;
+                }
+                result += h_sum * &inv_h[i];
             }
 
-            // Trace terms: Σ_{j,k} γ'_{j,k} * (t_j(x_i) - t_j(z·w^k)) * inv_t_k[i]
-            let num_total_cols = num_main_cols + num_aux_cols;
-            for j in 0..num_total_cols {
-                let gammas_j = &trace_terms_gammas[j];
-                let ood_evals_j = &trace_ood_columns[j];
+            // Trace terms: k-outer j-inner loop. For each eval point k, accumulate
+            // Σ_j γ'_{j,k} * (t_j(x_i) - t_j(z·w^k)) then multiply by inv_t_k_i once.
+            // This saves (num_total_cols - 1) E-muls per eval point.
+            // Split main and aux loops to eliminate per-iteration branch.
+            for k in 0..num_eval_points {
+                let inv_t_k_i = &denoms[(1 + k) * domain_size + i];
+                let mut col_sum = FieldElement::<FieldExtension>::zero();
 
-                for k in 0..num_eval_points {
-                    let inv_t_k_i = &denoms[(1 + k) * domain_size + i];
-
-                    let t_j_ood = &ood_evals_j[k];
-                    let numerator: FieldElement<FieldExtension> = if j < num_main_cols {
-                        lde_trace.get_main(row_idx, j) - t_j_ood
-                    } else {
-                        lde_trace.get_aux(row_idx, j - num_main_cols) - t_j_ood
-                    };
-                    result += &gammas_j[k] * numerator * inv_t_k_i;
+                // Main trace columns
+                for j in 0..num_main_cols {
+                    let t_j_ood = &trace_ood_columns[j][k];
+                    let numerator = lde_trace.get_main(row_idx, j) - t_j_ood;
+                    col_sum += &trace_terms_gammas[j][k] * numerator;
                 }
+
+                // Auxiliary trace columns
+                for j in 0..num_aux_cols {
+                    let col_idx = num_main_cols + j;
+                    let t_j_ood = &trace_ood_columns[col_idx][k];
+                    let numerator = lde_trace.get_aux(row_idx, j) - t_j_ood;
+                    col_sum += &trace_terms_gammas[col_idx][k] * numerator;
+                }
+
+                result += col_sum * inv_t_k_i;
             }
 
             result
