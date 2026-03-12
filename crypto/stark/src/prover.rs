@@ -338,14 +338,16 @@ pub trait IsStarkProver<
         #[cfg(not(feature = "parallel"))]
         let iter = 0..num_rows;
 
-        // Stream column bytes directly to Keccak256, avoiding per-row Vec allocation.
-        // This eliminates num_rows × num_cols field element clones + num_rows Vec allocs.
+        // Stream column bytes directly to Keccak256 via write_bytes, avoiding per-element
+        // heap allocation. Each field element writes to a stack buffer instead of Vec<u8>.
         let hashed_leaves: Vec<Commitment> = iter
             .map(|row_idx| {
                 let br_idx = reverse_index(row_idx, num_rows as u64);
                 let mut hasher = sha3::Keccak256::new();
+                let mut buf = [0u8; 32]; // enough for base (8) or extension (24) elements
                 for col in columns.iter() {
-                    hasher.update(col[br_idx].as_bytes());
+                    let n = col[br_idx].write_bytes(&mut buf);
+                    hasher.update(&buf[..n]);
                 }
                 let mut hash = [0u8; 32];
                 hash.copy_from_slice(&hasher.finalize());

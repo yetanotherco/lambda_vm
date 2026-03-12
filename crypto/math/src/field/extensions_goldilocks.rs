@@ -501,6 +501,18 @@ impl AsBytes for FieldElement<Degree3GoldilocksExtensionField> {
     fn as_bytes(&self) -> alloc::vec::Vec<u8> {
         self.to_bytes_be()
     }
+
+    #[inline(always)]
+    fn write_bytes(&self, buf: &mut [u8]) -> usize {
+        let v = self.value();
+        let b0 = v[0].to_bytes_be(); // [u8; 8]
+        let b1 = v[1].to_bytes_be();
+        let b2 = v[2].to_bytes_be();
+        buf[0..8].copy_from_slice(&b0);
+        buf[8..16].copy_from_slice(&b1);
+        buf[16..24].copy_from_slice(&b2);
+        24
+    }
 }
 
 impl HasDefaultTranscript for Degree3GoldilocksExtensionField {
