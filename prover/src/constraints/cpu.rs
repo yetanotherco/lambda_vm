@@ -57,6 +57,8 @@ where
 
 /// All bit flag columns that need IS_BIT constraints.
 pub const BIT_FLAG_COLUMNS: &[usize] = &[
+    cols::READ_REGISTER1,
+    cols::READ_REGISTER2,
     cols::WRITE_REGISTER,
     cols::MEMORY_2BYTES,
     cols::MEMORY_4BYTES,
@@ -1271,9 +1273,9 @@ pub fn create_jalr_constraints(constraint_idx_start: usize) -> (Vec<AddConstrain
 /// - ECALL_COMMIT implies ECALL: 1
 /// - Next PC (non-branching): 2
 ///
-/// Total: 58 constraints (31 IS_BIT + 8 ADD + 19 other)
+/// Total: 60 constraints (33 IS_BIT + 8 ADD + 19 other)
 pub const NUM_CPU_CONSTRAINTS: usize =
-    31 + 2 + 2 + 2 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 7 + 1 + 1 + 2;
+    33 + 2 + 2 + 2 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 7 + 1 + 1 + 2;
 
 /// Creates all CPU constraints.
 ///
