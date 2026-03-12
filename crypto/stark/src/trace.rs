@@ -153,6 +153,15 @@ where
         self.num_aux_columns = num_aux_columns;
     }
 
+    /// Spill the main trace data to disk via mmap.
+    /// After this call, `main_table.data` is freed but all accessors
+    /// (`get_main`, `columns_main`, `extract_columns_main_into`) continue
+    /// to work transparently through mmap.
+    #[cfg(feature = "disk-spill")]
+    pub fn spill_main_to_disk(&mut self) -> std::io::Result<()> {
+        self.main_table.spill_to_disk()
+    }
+
     pub fn compute_trace_polys_main<S>(&self) -> Vec<Polynomial<FieldElement<F>>>
     where
         S: IsFFTField + IsSubFieldOf<F>,
@@ -689,6 +698,103 @@ where
     }
 
     Table::new(table_data, table_width)
+}
+
+#[cfg(all(test, feature = "disk-spill"))]
+mod disk_spill_tests {
+    use super::*;
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
+    use math::field::goldilocks::GoldilocksField;
+
+    type F = GoldilocksField;
+    type E = Degree3GoldilocksExtensionField;
+
+    /// Spill main LDE columns from a simulated pool, then verify `get_main()`
+    /// returns the correct values from the mmap backing.
+    #[test]
+    fn test_lde_spill_main_roundtrip() {
+        let num_cols = 3;
+        let num_rows = 16;
+
+        // Simulate pool: column-major Vec<Vec<FE>>
+        let pool: Vec<Vec<FieldElement<F>>> = (0..num_cols)
+            .map(|c| {
+                (0..num_rows)
+                    .map(|r| FieldElement::<F>::from((c * num_rows + r) as u64))
+                    .collect()
+            })
+            .collect();
+
+        let lde = LDETraceTable::<F, E>::spill_main_from_pool(
+            &pool, num_cols, /*trace_step_size=*/ 1, /*blowup_factor=*/ 1,
+        )
+        .expect("spill_main_from_pool failed");
+
+        assert_eq!(lde.num_main_cols(), num_cols);
+        assert_eq!(lde.num_rows(), num_rows);
+        assert!(
+            lde.main_columns.is_empty(),
+            "main_columns should be empty after spill"
+        );
+
+        // Verify every element
+        for (c, pool_col) in pool.iter().enumerate() {
+            for (r, pool_val) in pool_col.iter().enumerate() {
+                assert_eq!(
+                    lde.get_main(r, c),
+                    pool_val,
+                    "mismatch at (row={r}, col={c})"
+                );
+            }
+        }
+    }
+
+    /// Spill main + aux LDE columns and verify both are accessible.
+    #[test]
+    fn test_lde_spill_main_and_aux_roundtrip() {
+        let num_main = 2;
+        let num_aux = 2;
+        let num_rows = 8;
+
+        let main_pool: Vec<Vec<FieldElement<F>>> = (0..num_main)
+            .map(|c| {
+                (0..num_rows)
+                    .map(|r| FieldElement::<F>::from((c * num_rows + r) as u64))
+                    .collect()
+            })
+            .collect();
+
+        let aux_pool: Vec<Vec<FieldElement<E>>> = (0..num_aux)
+            .map(|c| {
+                (0..num_rows)
+                    .map(|r| FieldElement::<E>::from((100 + c * num_rows + r) as u64))
+                    .collect()
+            })
+            .collect();
+
+        let mut lde = LDETraceTable::<F, E>::spill_main_from_pool(&main_pool, num_main, 1, 1)
+            .expect("spill_main_from_pool failed");
+
+        lde.add_aux_from_pool(&aux_pool, num_aux)
+            .expect("add_aux_from_pool failed");
+
+        assert_eq!(lde.num_main_cols(), num_main);
+        assert_eq!(lde.num_aux_cols(), num_aux);
+
+        // Verify main
+        for (c, main_col) in main_pool.iter().enumerate() {
+            for (r, main_val) in main_col.iter().enumerate() {
+                assert_eq!(lde.get_main(r, c), main_val);
+            }
+        }
+
+        // Verify aux
+        for (c, aux_col) in aux_pool.iter().enumerate() {
+            for (r, aux_val) in aux_col.iter().enumerate() {
+                assert_eq!(lde.get_aux(r, c), aux_val);
+            }
+        }
+    }
 }
 
 pub fn columns2rows<F>(columns: Vec<Vec<F>>) -> Vec<Vec<F>>
