@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use math::fft::cpu::bit_reversing::{in_place_bit_reverse_permute, reverse_index};
+use sha3::Digest;
 use math::fft::cpu::bowers_fft::LayerTwiddles;
 use math::fft::errors::FFTError;
 
@@ -372,16 +373,11 @@ pub trait IsStarkProver<
         FieldElement<E>: AsBytes + Sync + Send + math::traits::ByteConversion,
         E: IsField,
     {
-        use math::traits::ByteConversion;
-
         if columns.is_empty() || columns[0].is_empty() {
             return None;
         }
 
         let num_rows = columns[0].len();
-        let num_cols = columns.len();
-        let byte_len = <FieldElement<E> as ByteConversion>::BYTE_LEN;
-
         debug_assert!(
             num_rows.is_power_of_two(),
             "num_rows must be a power of two for reverse_index"
@@ -392,18 +388,18 @@ pub trait IsStarkProver<
         #[cfg(not(feature = "parallel"))]
         let iter = 0..num_rows;
 
-        // One allocation per row (was one per field element): write all columns
-        // into a single buffer, then hash once.
+        // Stream column bytes directly to Keccak256, avoiding per-row Vec allocation.
+        // This eliminates num_rows × num_cols field element clones + num_rows Vec allocs.
         let hashed_leaves: Vec<Commitment> = iter
             .map(|row_idx| {
                 let br_idx = reverse_index(row_idx, num_rows as u64);
-                let total_bytes = num_cols * byte_len;
-                let mut buf = vec![0u8; total_bytes];
-                for col_idx in 0..num_cols {
-                    columns[col_idx][br_idx]
-                        .write_bytes_be(&mut buf[col_idx * byte_len..(col_idx + 1) * byte_len]);
+                let mut hasher = sha3::Keccak256::new();
+                for col in columns.iter() {
+                    hasher.update(col[br_idx].as_bytes());
                 }
-                BatchedMerkleTreeBackend::<E>::hash_bytes(&buf)
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&hasher.finalize());
+                hash
             })
             .collect();
 
