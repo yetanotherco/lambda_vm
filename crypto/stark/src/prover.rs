@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
-use crypto::merkle_tree::traits::IsMerkleTreeBackend;
 use math::fft::cpu::bit_reversing::{in_place_bit_reverse_permute, reverse_index};
+use sha3::Digest;
 use math::fft::cpu::bowers_fft::LayerTwiddles;
 use math::fft::errors::FFTError;
 
@@ -32,7 +32,7 @@ use crate::proof::stark::{DeepPolynomialOpenings, PolynomialOpenings};
 use crate::table::Table;
 use crate::trace::LDETraceTable;
 
-use super::config::{BatchedMerkleTree, BatchedMerkleTreeBackend, Commitment};
+use super::config::{BatchedMerkleTree, Commitment};
 use super::constraints::evaluator::ConstraintEvaluator;
 use super::domain::Domain;
 use super::fri::fri_decommit::FriDecommitment;
@@ -332,20 +332,24 @@ pub trait IsStarkProver<
         }
 
         let num_rows = columns[0].len();
-        let num_cols = columns.len();
 
         #[cfg(feature = "parallel")]
         let iter = (0..num_rows).into_par_iter();
         #[cfg(not(feature = "parallel"))]
         let iter = 0..num_rows;
 
+        // Stream column bytes directly to Keccak256, avoiding per-row Vec allocation.
+        // This eliminates num_rows × num_cols field element clones + num_rows Vec allocs.
         let hashed_leaves: Vec<Commitment> = iter
             .map(|row_idx| {
                 let br_idx = reverse_index(row_idx, num_rows as u64);
-                let row: Vec<FieldElement<E>> = (0..num_cols)
-                    .map(|col_idx| columns[col_idx][br_idx].clone())
-                    .collect();
-                BatchedMerkleTreeBackend::<E>::hash_data(&row)
+                let mut hasher = sha3::Keccak256::new();
+                for col in columns.iter() {
+                    hasher.update(col[br_idx].as_bytes());
+                }
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&hasher.finalize());
+                hash
             })
             .collect();
 
