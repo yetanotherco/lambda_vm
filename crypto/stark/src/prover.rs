@@ -1234,29 +1234,25 @@ pub trait IsStarkProver<
             .get_proof_by_pos(index)
             .unwrap();
 
-        let lde_composition_poly_parts_evaluation: Vec<_> = lde_composition_poly_evaluations
-            .iter()
-            .flat_map(|part| {
-                vec![
-                    part[reverse_index(index * 2, part.len() as u64)].clone(),
-                    part[reverse_index(index * 2 + 1, part.len() as u64)].clone(),
-                ]
-            })
-            .collect();
+        // Build evaluations and evaluations_sym directly in one pass,
+        // avoiding the intermediate Vec + clone + step_by pattern.
+        let num_parts = lde_composition_poly_evaluations.len();
+        let mut evaluations = Vec::with_capacity(num_parts);
+        let mut evaluations_sym = Vec::with_capacity(num_parts);
+        for part in lde_composition_poly_evaluations.iter() {
+            let len = part.len() as u64;
+            evaluations.push(part[reverse_index(index * 2, len)].clone());
+            evaluations_sym.push(part[reverse_index(index * 2 + 1, len)].clone());
+        }
 
+        // proof and proof_sym are identical (same leaf covers both consecutive rows).
+        // Move proof into proof field, clone for proof_sym.
+        let proof_sym = proof.clone();
         PolynomialOpenings {
-            proof: proof.clone(),
-            proof_sym: proof,
-            evaluations: lde_composition_poly_parts_evaluation
-                .clone()
-                .into_iter()
-                .step_by(2)
-                .collect(),
-            evaluations_sym: lde_composition_poly_parts_evaluation
-                .into_iter()
-                .skip(1)
-                .step_by(2)
-                .collect(),
+            proof,
+            proof_sym,
+            evaluations,
+            evaluations_sym,
         }
     }
 
