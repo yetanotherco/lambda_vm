@@ -714,7 +714,7 @@ impl DecodeEntry {
     }
 
     /// Helper to set ALU operation flags based on ArithOp.
-    fn set_arith_op(entry: &mut Self, arith_op: ArithOp, is_word: bool) {
+    fn set_arith_op(entry: &mut Self, arith_op: ArithOp, _is_word: bool) {
         match arith_op {
             ArithOp::Add => {
                 entry.op_add = true;
@@ -748,9 +748,7 @@ impl DecodeEntry {
             ArithOp::Mul => {
                 entry.op_mul = true;
                 entry.mp_selector = true;
-                if !is_word {
-                    entry.signed = true;
-                }
+                entry.signed = true;
             }
             ArithOp::MulHigh => {
                 entry.op_mul = true;

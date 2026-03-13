@@ -405,6 +405,17 @@ fn test_prove_elfs_test_mul_8() {
 }
 
 #[test]
+fn test_prove_elfs_mulw_neg() {
+    let (elf, logs, instructions) = run_asm_elf("mulw_neg");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "mulw_neg failed"
+    );
+}
+
+#[test]
 fn test_prove_elfs_test_div_8() {
     let (elf, logs, instructions) = run_asm_elf("test_div_8");
     let mut traces =

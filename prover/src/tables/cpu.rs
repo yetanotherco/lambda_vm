@@ -1283,10 +1283,13 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::MP_SELECTOR,
                 packing: Packing::Direct,
             },
-            // result (rvd) as DWordWL (2 words → 2 elements)
+            // result (res) as DWordBL (8 bytes → 2 elements) per spec CPU-CA44.
+            // Must use res, not rvd: for word instructions (MULW), rvd is
+            // sign-extended from res, so upper 32 bits differ when bit 31 is set.
+            // The MUL chip computes the raw product; sign extension is CPU-only.
             BusValue::Packed {
-                start_column: cols::RVD_0,
-                packing: Packing::DWordWL,
+                start_column: cols::RES[0],
+                packing: Packing::DWordBL,
             },
             // muldiv_selector: 0=lo (MUL), 1=hi (MULH/MULHSU/MULHU)
             BusValue::Packed {
@@ -1320,10 +1323,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::SIGNED,
                 packing: Packing::Direct,
             },
-            // result (rvd) as DWordWL (2 words → 2 elements)
+            // result (res) as DWordBL (8 bytes → 2 elements) per spec CPU-CA45.
+            // Must use res, not rvd: for word instructions (DIVW, REMW), rvd is
+            // sign-extended from res, so upper 32 bits differ when bit 31 is set.
             BusValue::Packed {
-                start_column: cols::RVD_0,
-                packing: Packing::DWordWL,
+                start_column: cols::RES[0],
+                packing: Packing::DWordBL,
             },
             // muldiv_selector: 0=quotient (DIV), 1=remainder (REM)
             BusValue::Packed {
