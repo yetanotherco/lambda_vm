@@ -1059,7 +1059,8 @@ fn test_decode_soundness_same_elf_accepted() {
     );
     let verifier_air_refs = verifier_airs.air_refs();
     let bus_target =
-        crate::commit_bus_target(&verifier_air_refs, &proof, &traces.public_output_bytes);
+        crate::commit_bus_target(&verifier_air_refs, &proof, &traces.public_output_bytes)
+            .expect("fingerprint collision in test");
 
     let result = Verifier::multi_verify(
         &verifier_air_refs,

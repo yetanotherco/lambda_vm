@@ -386,15 +386,17 @@ pub(crate) fn replay_transcript_phase_a(
 ///   `fingerprint = z - (BusId::Commit * α^0 + i * α^1 + v * α^2)`
 ///   `term = +1 / fingerprint`
 ///
-/// Returns `Σ term` — the positive receiver contribution that is no longer
-/// present as an in-trace table. For empty public output, returns zero.
+/// Returns `Some(Σ term)` — the positive receiver contribution that is no
+/// longer present as an in-trace table. For empty public output, returns
+/// `Some(zero)`. Returns `None` on a fingerprint collision (zero divisor),
+/// which the caller should treat as verification failure.
 pub(crate) fn compute_commit_bus_offset(
     public_output: &[u8],
     z: &FieldElement<E>,
     alpha: &FieldElement<E>,
-) -> FieldElement<E> {
+) -> Option<FieldElement<E>> {
     if public_output.is_empty() {
-        return FieldElement::zero();
+        return Some(FieldElement::zero());
     }
 
     let bus_id = FieldElement::<E>::from(BusId::Commit as u64);
@@ -406,11 +408,9 @@ pub(crate) fn compute_commit_bus_offset(
             + &(FieldElement::<E>::from(i as u64) * alpha)
             + &(FieldElement::<E>::from(value as u64) * &alpha_sq);
         let fingerprint = z - &linear_combination;
-        total += fingerprint
-            .inv()
-            .expect("fingerprint collision in commit bus offset");
+        total += fingerprint.inv().ok()?;
     }
-    total
+    Some(total)
 }
 
 /// Compute the COMMIT output bus balance target for a `MultiProof`.
@@ -422,7 +422,7 @@ pub(crate) fn commit_bus_target(
     airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
     proof: &MultiProof<F, E, ()>,
     public_output_bytes: &[u8],
-) -> FieldElement<E> {
+) -> Option<FieldElement<E>> {
     let (z, alpha) = replay_transcript_phase_a(airs, proof);
     compute_commit_bus_offset(public_output_bytes, &z, &alpha)
 }
@@ -536,7 +536,11 @@ pub fn verify_with_options(
     // If public_output was tampered, the recomputed offset won't match the
     // actual bus total in the proof, and multi_verify will reject.
     let air_refs = airs.air_refs();
-    let expected_offset = commit_bus_target(&air_refs, &vm_proof.proof, &vm_proof.public_output);
+    let expected_offset =
+        match commit_bus_target(&air_refs, &vm_proof.proof, &vm_proof.public_output) {
+            Some(offset) => offset,
+            None => return Ok(false),
+        };
 
     Ok(Verifier::multi_verify(
         &air_refs,

@@ -370,6 +370,11 @@ fn collect_ops_from_cpu(
             current_commit_index = current_commit_index
                 .checked_add(count)
                 .expect("commit index exceeds u32 range");
+            debug_assert_eq!(
+                current_commit_index,
+                register_state.read_index().0,
+                "commit index drift: current_commit_index and register_state.index_register must stay in sync"
+            );
             commit_ecall_count += 1;
         }
 
@@ -667,7 +672,7 @@ fn collect_commit_memw_ops(
     {
         let (old_index, old_ts) = register_state.read_index();
         let new_index = old_index
-            .checked_add(count as u32)
+            .checked_add(u32::try_from(count).expect("commit_count exceeds u32 range"))
             .expect("commit index exceeds u32 range");
         let old_value = [old_index as u64, 0, 0, 0, 0, 0, 0, 0];
         let new_value = [new_index as u64, 0, 0, 0, 0, 0, 0, 0];
