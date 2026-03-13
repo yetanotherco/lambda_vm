@@ -1786,11 +1786,42 @@ impl Traces {
         // =====================================================================
         lt_ops.extend(collect_lt_from_memw(&memw_ops));
 
+        // Generate traces, largest tables first.
+        // With disk-spill: use chunk_generate_and_spill — each chunk is spilled to disk
+        // immediately so peak memory is bounded by one chunk + raw ops.
+        // Without disk-spill: use chunk_and_generate (standard in-memory path).
+        // Drop raw ops after each generation to free heap before the next table.
+        #[cfg(feature = "disk-spill")]
+        macro_rules! gen_traces {
+            ($ops:expr, $max:expr, $gen:expr) => {
+                chunk_generate_and_spill($ops, $max, $gen)?
+            };
+        }
+        #[cfg(not(feature = "disk-spill"))]
+        macro_rules! gen_traces {
+            ($ops:expr, $max:expr, $gen:expr) => {
+                chunk_and_generate($ops, $max, $gen)
+            };
+        }
+
         // =====================================================================
-        // PHASE 4: All → Bitwise lookups
+        // PHASE 4+5 interleaved: collect bitwise ops then generate+drop traces
+        // to free the largest raw ops vectors as early as possible.
+        // memw_ops (~41.5 GB for 64M) and lt_ops (~6 GB) are freed first.
         // =====================================================================
-        bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
+
+        // MEMW bitwise, then generate MEMW traces and free memw_ops
         bitwise_ops.extend(collect_bitwise_from_memw(&memw_ops));
+        let memws = gen_traces!(&memw_ops, max_rows.memw, memw::generate_memw_trace);
+        drop(memw_ops);
+
+        // LT bitwise (needs lt_ops which already includes MEMW LT ops from Phase 3),
+        // then generate LT traces and free lt_ops
+        bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
+        let lts = gen_traces!(&lt_ops, max_rows.lt, lt::generate_lt_trace);
+        drop(lt_ops);
+
+        // Remaining bitwise collections (don't need memw_ops or lt_ops)
         bitwise_ops.extend(collect_bitwise_from_mul(&mul_ops));
         bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops));
         bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
@@ -1812,7 +1843,7 @@ impl Traces {
         bitwise_ops.extend(collect_byte_check_ops_for_padding(num_padding_rows));
 
         // =====================================================================
-        // PHASE 5: Generate final traces (parallelized)
+        // Remaining trace generation
         // =====================================================================
 
         // Extract halt timestamp from the last ECALL instruction
@@ -1823,27 +1854,6 @@ impl Traces {
             .ok_or(Error::MissingHaltEcall)?;
         let halt_timestamp = halt_op.timestamp;
 
-        // Generate traces, largest tables first.
-        // With disk-spill: use chunk_generate_and_spill — each chunk is spilled to disk
-        // immediately so peak memory is bounded by one chunk + raw ops.
-        // Without disk-spill: use chunk_and_generate (standard in-memory path).
-        // Drop raw ops after each generation to free heap before the next table.
-        #[cfg(feature = "disk-spill")]
-        macro_rules! gen_traces {
-            ($ops:expr, $max:expr, $gen:expr) => {
-                chunk_generate_and_spill($ops, $max, $gen)?
-            };
-        }
-        #[cfg(not(feature = "disk-spill"))]
-        macro_rules! gen_traces {
-            ($ops:expr, $max:expr, $gen:expr) => {
-                chunk_and_generate($ops, $max, $gen)
-            };
-        }
-        let memws = gen_traces!(&memw_ops, max_rows.memw, memw::generate_memw_trace);
-        drop(memw_ops);
-        let lts = gen_traces!(&lt_ops, max_rows.lt, lt::generate_lt_trace);
-        drop(lt_ops);
         let cpus = gen_traces!(&cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
         // cpu_ops kept alive — needed for decode multiplicities below
         let loads = gen_traces!(&load_ops, max_rows.load, load::generate_load_trace);
