@@ -66,7 +66,7 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
             Err(_) => return false,
         };
 
-    // Compute bus balance target for the removed PUBLIC_OUTPUT receiver
+    // Compute the verifier-side COMMIT bus balance target from public output bytes
     let bus_target =
         crate::commit_bus_target(&airs.air_refs(), &multi_proof, &traces.public_output_bytes)
             .expect("fingerprint collision in test");
