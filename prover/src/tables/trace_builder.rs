@@ -1711,7 +1711,7 @@ impl Traces {
         // Initialize memory state from ELF so first accesses get correct old_value.
         let mut memory_state = MemoryState::from_elf(elf);
         let mut register_state = RegisterState::new(elf.entry_point);
-        let (mut memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops) =
+        let (mut memw_ops, load_ops, mut lt_ops, shift_ops, bitwise_ops) =
             collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
 
         // HALT finalization: 33 register MEMW operations at timestamp u64::MAX.
@@ -1805,42 +1805,70 @@ impl Traces {
         }
 
         // =====================================================================
-        // PHASE 4+5 interleaved: collect bitwise ops then generate+drop traces
-        // to free the largest raw ops vectors as early as possible.
-        // memw_ops (~41.5 GB for 64M) and lt_ops (~6 GB) are freed first.
+        // PHASE 4+5 interleaved: collect bitwise, update multiplicities
+        // incrementally, generate traces, and drop raw ops ASAP.
+        //
+        // Key insight: bitwise_ops can be enormous (43 GB for MEMW alone at 64M).
+        // Instead of accumulating all bitwise_ops into one Vec, we generate the
+        // bitwise trace early and update multiplicities in small batches, dropping
+        // each batch immediately. This keeps bitwise memory bounded.
         // =====================================================================
+        let mut bitwise = bitwise::generate_bitwise_trace();
 
-        // MEMW bitwise, then generate MEMW traces and free memw_ops
-        bitwise_ops.extend(collect_bitwise_from_memw(&memw_ops));
+        // Flush initial CPU bitwise ops (from Phase 2's collect_ops_from_cpu)
+        bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
+        drop(bitwise_ops);
+
+        // Collect-and-flush macro: collects bitwise ops from a chunk of source
+        // data, updates multiplicities immediately, then drops the ops vec.
+        // This keeps peak bitwise memory bounded to ~224 MB per batch.
+        macro_rules! flush_bitwise {
+            ($source:expr, $chunk_size:expr, $collect_fn:expr) => {
+                for chunk in $source.chunks($chunk_size) {
+                    let ops = $collect_fn(chunk);
+                    bitwise::update_multiplicities(&mut bitwise, &ops);
+                }
+            };
+        }
+
+        // MEMW: 28 bitwise ops per row → process in 1M-row chunks (~224 MB each)
+        flush_bitwise!(&memw_ops, 1_000_000, collect_bitwise_from_memw);
         let memws = gen_traces!(&memw_ops, max_rows.memw, memw::generate_memw_trace);
         drop(memw_ops);
 
-        // LT bitwise (needs lt_ops which already includes MEMW LT ops from Phase 3),
-        // then generate LT traces and free lt_ops
-        bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
+        // LT: 8 bitwise ops per row → process in 1M-row chunks (~64 MB each)
+        flush_bitwise!(&lt_ops, 1_000_000, collect_bitwise_from_lt);
         let lts = gen_traces!(&lt_ops, max_rows.lt, lt::generate_lt_trace);
         drop(lt_ops);
 
-        // Remaining bitwise collections (don't need memw_ops or lt_ops)
-        bitwise_ops.extend(collect_bitwise_from_mul(&mul_ops));
-        bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops));
-        bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
-        bitwise_ops.extend(shift::collect_bitwise_from_shift(&shift_ops));
-        // PAGE tables do IS_BYTE lookups for init and fini values (C1, C2)
-        bitwise_ops.extend(collect_bitwise_from_page(elf, &memory_state));
+        // Remaining bitwise sources (small for typical programs, but still chunked)
+        flush_bitwise!(&mul_ops, 1_000_000, collect_bitwise_from_mul);
+        flush_bitwise!(&dvrm_ops, 1_000_000, collect_bitwise_from_dvrm);
+        flush_bitwise!(&branch_ops, 1_000_000, collect_bitwise_from_branch);
+        flush_bitwise!(&shift_ops, 1_000_000, shift::collect_bitwise_from_shift);
+
+        // PAGE bitwise (small, no chunking needed)
+        {
+            let ops = collect_bitwise_from_page(elf, &memory_state);
+            bitwise::update_multiplicities(&mut bitwise, &ops);
+        }
 
         // Expand COMMIT ECALL operations into per-byte rows
         let commit_ops = expand_commit_operations(&cpu_ops, &memory_state);
-        // COMMIT table sends IsByte and IsHalfword lookups
-        bitwise_ops.extend(collect_bitwise_from_commit(&commit_ops));
+        {
+            let ops = collect_bitwise_from_commit(&commit_ops);
+            bitwise::update_multiplicities(&mut bitwise, &ops);
+        }
 
         // CPU padding rows send IS_BYTE with all-zero values.
-        // Add corresponding ops so the bitwise table multiplicities balance.
         let num_padding_rows: usize = cpu_ops
             .chunks(max_rows.cpu)
             .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
             .sum();
-        bitwise_ops.extend(collect_byte_check_ops_for_padding(num_padding_rows));
+        {
+            let ops = collect_byte_check_ops_for_padding(num_padding_rows);
+            bitwise::update_multiplicities(&mut bitwise, &ops);
+        }
 
         // =====================================================================
         // Remaining trace generation
@@ -1866,10 +1894,6 @@ impl Traces {
         drop(dvrm_ops);
         let branches = gen_traces!(&branch_ops, max_rows.branch, branch::generate_branch_trace);
         drop(branch_ops);
-
-        let mut bitwise = bitwise::generate_bitwise_trace();
-        bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
-        drop(bitwise_ops);
 
         // Update DECODE multiplicities
         // Each CPU operation looks up the DECODE table once
