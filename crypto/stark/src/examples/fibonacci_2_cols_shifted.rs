@@ -53,11 +53,13 @@ where
                 frame,
                 periodic_values,
                 rap_challenges,
+                ..
             }
             | TransitionEvaluationContext::Verifier {
                 frame,
                 periodic_values,
                 rap_challenges,
+                ..
             } => (frame, periodic_values, rap_challenges),
         };
 
@@ -112,11 +114,13 @@ where
                 frame,
                 periodic_values,
                 rap_challenges,
+                ..
             }
             | TransitionEvaluationContext::Verifier {
                 frame,
                 periodic_values,
                 rap_challenges,
+                ..
             } => (frame, periodic_values, rap_challenges),
         };
 
@@ -255,18 +259,16 @@ pub fn compute_trace<F: IsFFTField>(
 
 #[cfg(test)]
 mod tests {
-    use math::field::{
-        element::FieldElement, fields::fft_friendly::stark_252_prime_field::Stark252PrimeField,
-    };
+    use math::field::{element::FieldElement, goldilocks::GoldilocksField};
 
     use super::compute_trace;
 
     #[test]
     fn trace_has_expected_rows() {
-        let trace = compute_trace(FieldElement::<Stark252PrimeField>::one(), 8);
+        let trace = compute_trace(FieldElement::<GoldilocksField>::one(), 8);
         assert_eq!(trace.num_rows(), 8);
 
-        let trace = compute_trace(FieldElement::<Stark252PrimeField>::one(), 64);
+        let trace = compute_trace(FieldElement::<GoldilocksField>::one(), 64);
         assert_eq!(trace.num_rows(), 64);
     }
 }

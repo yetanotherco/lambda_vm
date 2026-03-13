@@ -22,7 +22,7 @@
 //! use lambda_vm_prover::tables::trace_builder::Traces;
 //!
 //! let traces = Traces::from_elf_and_logs(&elf, &logs)?;
-//! // Use traces.cpu, traces.bitwise, traces.lt, traces.memw, traces.load, traces.memory_init
+//! // Use traces.cpus, traces.bitwise, traces.lts, traces.memws, traces.loads
 //! ```
 
 use std::collections::HashMap;
@@ -45,6 +45,7 @@ use super::memw::{self, MemwOperation};
 use super::mul::{self, MulOperation};
 use super::page::{self, FinalByteState, FinalStateMap, PageConfig};
 use super::register::{self, FinalRegisterStateMap, FinalRegisterWordState};
+use super::shift::{self, ShiftOperation};
 use super::types::{GoldilocksExtension, GoldilocksField};
 use crate::Error;
 
@@ -253,7 +254,8 @@ fn collect_cpu_ops(
 ///
 /// MEMW and LOAD collection requires sequential processing with state tracking.
 ///
-/// Returns: (memw_ops, load_ops, lt_ops, bitwise_ops)
+/// Returns: (memw_ops, load_ops, lt_ops, shift_ops, bitwise_ops)
+#[allow(clippy::type_complexity)]
 fn collect_ops_from_cpu(
     cpu_ops: &[CpuOperation],
     memory_state: &mut MemoryState,
@@ -262,11 +264,13 @@ fn collect_ops_from_cpu(
     Vec<MemwOperation>,
     Vec<LoadOperation>,
     Vec<LtOperation>,
+    Vec<ShiftOperation>,
     Vec<BitwiseOperation>,
 ) {
     let mut memw_ops = Vec::with_capacity(cpu_ops.len() * 3);
     let mut load_ops = Vec::with_capacity(cpu_ops.len() / 8 + 1);
     let mut lt_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
+    let mut shift_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
     let mut bitwise_ops = Vec::with_capacity(cpu_ops.len() * 4);
 
     for op in cpu_ops {
@@ -287,7 +291,7 @@ fn collect_ops_from_cpu(
         let reg_memw_ops = collect_register_ops_from_cpu(op, register_state);
         memw_ops.extend(reg_memw_ops);
 
-        // --- LT and Bitwise (no state tracking needed) ---
+        // --- LT, SHIFT, and Bitwise (no state tracking needed) ---
 
         // Collect LT operations from SLT/BLT instructions
         if op.decode.op_slt || op.decode.op_blt {
@@ -296,11 +300,27 @@ fn collect_ops_from_cpu(
             lt_ops.push(LtOperation::new(arg1, arg2, op.decode.signed));
         }
 
+        // Collect SHIFT operations
+        if op.decode.op_shift {
+            let input = op.compute_arg1();
+            let shift_amount = (op.compute_arg2() & 0xFF) as u8;
+            let direction = op.decode.mp_selector; // 0=left, 1=right
+            let signed = op.decode.signed;
+            let word_instr = op.decode.word_instr;
+            shift_ops.push(ShiftOperation::new(
+                input,
+                shift_amount,
+                direction,
+                signed,
+                word_instr,
+            ));
+        }
+
         // Collect bitwise lookups
         bitwise_ops.extend(op.collect_bitwise_ops());
     }
 
-    (memw_ops, load_ops, lt_ops, bitwise_ops)
+    (memw_ops, load_ops, lt_ops, shift_ops, bitwise_ops)
 }
 
 /// Collects a LOAD operation and corresponding MEMW read from CpuOperation.
@@ -1079,29 +1099,32 @@ fn generate_page_tables(
 
 /// All generated trace tables.
 pub struct Traces {
-    /// CPU execution trace (one row per instruction)
-    pub cpu: TraceTable<GoldilocksField, GoldilocksExtension>,
+    /// CPU execution traces (split into chunks of max_rows::CPU)
+    pub cpus: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 
     /// BITWISE precomputed lookup table (2^20 rows)
     pub bitwise: TraceTable<GoldilocksField, GoldilocksExtension>,
 
-    /// LT comparison trace (deduplicated operations)
-    pub lt: TraceTable<GoldilocksField, GoldilocksExtension>,
+    /// LT comparison traces (split into chunks of max_rows::LT)
+    pub lts: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 
-    /// MEMW memory/register read/write trace
-    pub memw: TraceTable<GoldilocksField, GoldilocksExtension>,
+    /// SHIFT shift operation traces (split into chunks of max_rows::SHIFT)
+    pub shifts: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 
-    /// LOAD memory load with extension trace
-    pub load: TraceTable<GoldilocksField, GoldilocksExtension>,
+    /// MEMW memory/register read/write traces (split into chunks of max_rows::MEMW)
+    pub memws: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+
+    /// LOAD memory load with extension traces (split into chunks of max_rows::LOAD)
+    pub loads: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 
     /// DECODE instruction decoding table (preprocessed from ELF)
     pub decode: TraceTable<GoldilocksField, GoldilocksExtension>,
 
-    /// MUL multiplication trace
-    pub mul: TraceTable<GoldilocksField, GoldilocksExtension>,
+    /// MUL multiplication traces (wrapped in Vec for uniform architecture)
+    pub muls: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 
-    /// DVRM division/remainder trace
-    pub dvrm: TraceTable<GoldilocksField, GoldilocksExtension>,
+    /// DVRM division/remainder traces (wrapped in Vec for uniform architecture)
+    pub dvrms: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 
     /// PAGE tables for memory initialization/finalization (one per page)
     pub pages: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
@@ -1112,14 +1135,41 @@ pub struct Traces {
     /// REGISTER table for register initialization/finalization
     pub register: TraceTable<GoldilocksField, GoldilocksExtension>,
 
-    /// BRANCH target calculation trace
-    pub branch: TraceTable<GoldilocksField, GoldilocksExtension>,
+    /// BRANCH target calculation traces (wrapped in Vec for uniform architecture)
+    pub branches: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 
     /// HALT single-row table for program termination
     pub halt: TraceTable<GoldilocksField, GoldilocksExtension>,
 }
 
+/// Chunk raw ops and generate one trace table per chunk.
+fn chunk_and_generate<T>(
+    ops: &[T],
+    max_rows: usize,
+    generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension>,
+) -> Vec<TraceTable<GoldilocksField, GoldilocksExtension>> {
+    if ops.is_empty() {
+        vec![generate(&[])]
+    } else {
+        ops.chunks(max_rows).map(generate).collect()
+    }
+}
+
 impl Traces {
+    /// Returns the number of chunks for each split table.
+    pub fn table_counts(&self) -> crate::TableCounts {
+        crate::TableCounts {
+            cpu: self.cpus.len(),
+            lt: self.lts.len(),
+            memw: self.memws.len(),
+            load: self.loads.len(),
+            mul: self.muls.len(),
+            dvrm: self.dvrms.len(),
+            shift: self.shifts.len(),
+            branch: self.branches.len(),
+        }
+    }
+
     /// Extract page configurations from ELF only (deterministic from binary).
     ///
     /// Returns PageConfigs for pages covered by ELF segments, with their
@@ -1237,7 +1287,11 @@ impl Traces {
     /// 3. MEMW → LT operations (timestamp ordering)
     /// 4. LT, MEMW, Branch → Bitwise lookups
     /// 5. Generate all traces including PAGE tables
-    pub fn from_elf_and_logs(elf: &Elf, logs: &[Log]) -> Result<Self, Error> {
+    pub fn from_elf_and_logs(
+        elf: &Elf,
+        logs: &[Log],
+        max_rows: &super::MaxRowsConfig,
+    ) -> Result<Self, Error> {
         // =====================================================================
         // PHASE 0: ELF → DECODE + instructions
         // =====================================================================
@@ -1261,7 +1315,7 @@ impl Traces {
         // Initialize memory state from ELF so first accesses get correct old_value.
         let mut memory_state = MemoryState::from_elf(elf);
         let mut register_state = RegisterState::new();
-        let (memw_ops, load_ops, mut lt_ops, mut bitwise_ops) =
+        let (memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops) =
             collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
 
         // Collect BRANCH operations from CPU ops where branch_cond = true
@@ -1339,11 +1393,12 @@ impl Traces {
         bitwise_ops.extend(collect_bitwise_from_mul(&mul_ops));
         bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops));
         bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
+        bitwise_ops.extend(shift::collect_bitwise_from_shift(&shift_ops));
         // PAGE tables do IS_BYTE lookups for init and fini values (C1, C2)
         bitwise_ops.extend(collect_bitwise_from_page(elf, &memory_state));
 
         // =====================================================================
-        // PHASE 5: Generate final traces
+        // PHASE 5: Generate final traces (parallelized)
         // =====================================================================
 
         // Extract halt timestamp from the last ECALL instruction
@@ -1352,15 +1407,17 @@ impl Traces {
             .rev()
             .find(|op| op.decode.op_ecall)
             .ok_or(Error::MissingHaltEcall)?;
-        let halt_trace = halt::generate_halt_trace(halt_op.timestamp);
+        let halt_timestamp = halt_op.timestamp;
 
-        let cpu = cpu::generate_cpu_trace(&cpu_ops);
-        let lt = lt::generate_lt_trace(&lt_ops);
-        let memw = memw::generate_memw_trace(&memw_ops);
-        let load = load::generate_load_trace(&load_ops);
-        let mul = mul::generate_mul_trace(&mul_ops);
-        let dvrm = dvrm::generate_dvrm_trace(&dvrm_ops);
-        let branch = branch::generate_branch_trace(&branch_ops);
+        let cpus = chunk_and_generate(&cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
+        let memws = chunk_and_generate(&memw_ops, max_rows.memw, memw::generate_memw_trace);
+        let loads = chunk_and_generate(&load_ops, max_rows.load, load::generate_load_trace);
+        let lts = chunk_and_generate(&lt_ops, max_rows.lt, lt::generate_lt_trace);
+        let shifts = chunk_and_generate(&shift_ops, max_rows.shift, shift::generate_shift_trace);
+        let muls = chunk_and_generate(&mul_ops, max_rows.mul, mul::generate_mul_trace);
+        let dvrms = chunk_and_generate(&dvrm_ops, max_rows.dvrm, dvrm::generate_dvrm_trace);
+        let branches =
+            chunk_and_generate(&branch_ops, max_rows.branch, branch::generate_branch_trace);
 
         let mut bitwise = bitwise::generate_bitwise_trace();
         bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
@@ -1368,33 +1425,63 @@ impl Traces {
         // Update DECODE multiplicities
         // Each CPU operation looks up the DECODE table once
         // Padding rows also look up pc=1 (the CPU padding entry)
+        // When CPU is split, each chunk pads independently
         let mut decode = decode_trace;
         let pc_to_row = decode_pc_to_row;
-        let num_padding_rows = cpu_ops.len().next_power_of_two() - cpu_ops.len();
+        let num_padding_rows: usize = cpu_ops
+            .chunks(max_rows.cpu)
+            .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
+            .sum();
         let mut decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
         decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
         decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
 
-        // Generate PAGE tables from ELF and final memory state
-        let (pages, page_configs) = generate_page_tables(elf, &memory_state);
-
-        // Generate REGISTER table from final register state
+        // Prepare register final state before scope (needs register_state ownership)
         let register_final_state = register_state.to_final_state_map();
-        let register_trace = register::generate_register_trace(&register_final_state);
+
+        // Generate remaining traces in parallel (page, register, halt).
+        // chunk_and_generate already handled cpu, lt, memw, load, mul, dvrm, branch above.
+        let (pages, page_configs, register_trace, halt_trace);
+        #[cfg(feature = "parallel")]
+        {
+            let ((pages_val, register_val), halt_val) = rayon::join(
+                || {
+                    rayon::join(
+                        || generate_page_tables(elf, &memory_state),
+                        || register::generate_register_trace(&register_final_state),
+                    )
+                },
+                || halt::generate_halt_trace(halt_timestamp),
+            );
+            let (pages_v, page_configs_v) = pages_val;
+            pages = pages_v;
+            page_configs = page_configs_v;
+            register_trace = register_val;
+            halt_trace = halt_val;
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            let (pages_v, page_configs_v) = generate_page_tables(elf, &memory_state);
+            pages = pages_v;
+            page_configs = page_configs_v;
+            register_trace = register::generate_register_trace(&register_final_state);
+            halt_trace = halt::generate_halt_trace(halt_timestamp);
+        }
 
         Ok(Traces {
-            cpu,
+            cpus,
             bitwise,
-            lt,
-            memw,
-            load,
+            lts,
+            shifts,
+            memws,
+            loads,
             decode,
-            mul,
-            dvrm,
+            muls,
+            dvrms,
             pages,
             page_configs,
             register: register_trace,
-            branch,
+            branches,
             halt: halt_trace,
         })
     }
@@ -1405,7 +1492,11 @@ impl Traces {
     /// as it generates PAGE tables from ELF data.
     ///
     /// Note: This creates empty PAGE tables since no ELF is provided.
-    pub fn from_logs(logs: &[Log], instructions: U64HashMap<Instruction>) -> Result<Self, Error> {
+    pub fn from_logs(
+        logs: &[Log],
+        instructions: U64HashMap<Instruction>,
+        max_rows: &super::MaxRowsConfig,
+    ) -> Result<Self, Error> {
         // =====================================================================
         // PHASE 1: Logs → CPU operations
         // =====================================================================
@@ -1417,7 +1508,7 @@ impl Traces {
         // Processes cpu_ops in order. MEMW/LOAD need state tracking, LT/Bitwise don't.
         let mut memory_state = MemoryState::new();
         let mut register_state = RegisterState::new();
-        let (memw_ops, load_ops, mut lt_ops, mut bitwise_ops) =
+        let (memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops) =
             collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
 
         // Collect MUL operations from CPU ops where op_mul = true
@@ -1495,9 +1586,10 @@ impl Traces {
         bitwise_ops.extend(collect_bitwise_from_mul(&mul_ops));
         bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops));
         bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
+        bitwise_ops.extend(shift::collect_bitwise_from_shift(&shift_ops));
 
         // =====================================================================
-        // PHASE 5: Generate final traces
+        // PHASE 5: Generate final traces (parallelized)
         // =====================================================================
 
         // Extract halt timestamp from the last ECALL instruction
@@ -1506,15 +1598,17 @@ impl Traces {
             .rev()
             .find(|op| op.decode.op_ecall)
             .ok_or(Error::MissingHaltEcall)?;
-        let halt_trace = halt::generate_halt_trace(halt_op.timestamp);
+        let halt_timestamp = halt_op.timestamp;
 
-        let cpu = cpu::generate_cpu_trace(&cpu_ops);
-        let lt = lt::generate_lt_trace(&lt_ops);
-        let memw = memw::generate_memw_trace(&memw_ops);
-        let load = load::generate_load_trace(&load_ops);
-        let mul = mul::generate_mul_trace(&mul_ops);
-        let dvrm = dvrm::generate_dvrm_trace(&dvrm_ops);
-        let branch = branch::generate_branch_trace(&branch_ops);
+        let cpus = chunk_and_generate(&cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
+        let memws = chunk_and_generate(&memw_ops, max_rows.memw, memw::generate_memw_trace);
+        let loads = chunk_and_generate(&load_ops, max_rows.load, load::generate_load_trace);
+        let lts = chunk_and_generate(&lt_ops, max_rows.lt, lt::generate_lt_trace);
+        let shifts = chunk_and_generate(&shift_ops, max_rows.shift, shift::generate_shift_trace);
+        let muls = chunk_and_generate(&mul_ops, max_rows.mul, mul::generate_mul_trace);
+        let dvrms = chunk_and_generate(&dvrm_ops, max_rows.dvrm, dvrm::generate_dvrm_trace);
+        let branches =
+            chunk_and_generate(&branch_ops, max_rows.branch, branch::generate_branch_trace);
 
         let mut bitwise = bitwise::generate_bitwise_trace();
         bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
@@ -1522,34 +1616,54 @@ impl Traces {
         // Generate DECODE trace and update multiplicities
         // Each CPU operation looks up the DECODE table once
         // Padding rows also look up pc=1 (the CPU padding entry)
+        // When CPU is split, each chunk pads independently
         let (mut decode, pc_to_row) = decode::generate_decode_trace(&instructions);
-        let num_padding_rows = cpu_ops.len().next_power_of_two() - cpu_ops.len();
+        let num_padding_rows: usize = cpu_ops
+            .chunks(max_rows.cpu)
+            .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
+            .sum();
         let mut decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
         decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
         decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
+        let register_final_state = register_state.to_final_state_map();
+
+        // Generate remaining traces in parallel (register, halt).
+        // chunk_and_generate already handled cpu, lt, memw, load, mul, dvrm, branch above.
+        let (register_trace, halt_trace);
+        #[cfg(feature = "parallel")]
+        {
+            let (register_val, halt_val) = rayon::join(
+                || register::generate_register_trace(&register_final_state),
+                || halt::generate_halt_trace(halt_timestamp),
+            );
+            register_trace = register_val;
+            halt_trace = halt_val;
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            register_trace = register::generate_register_trace(&register_final_state);
+            halt_trace = halt::generate_halt_trace(halt_timestamp);
+        }
 
         // Create empty PAGE tables for legacy API
         // (caller should use from_elf_and_logs for proper PAGE table support)
         let pages = Vec::new();
         let page_configs = Vec::new();
 
-        // Generate REGISTER table from final register state
-        let register_final_state = register_state.to_final_state_map();
-        let register_trace = register::generate_register_trace(&register_final_state);
-
         Ok(Traces {
-            cpu,
+            cpus,
             bitwise,
-            lt,
-            memw,
-            load,
+            lts,
+            shifts,
+            memws,
+            loads,
             decode,
-            mul,
-            dvrm,
+            muls,
+            dvrms,
             pages,
             page_configs,
             register: register_trace,
-            branch,
+            branches,
             halt: halt_trace,
         })
     }
@@ -1579,9 +1693,10 @@ impl Traces {
     pub fn from_logs_trimmed(
         logs: &[Log],
         instructions: U64HashMap<Instruction>,
+        max_rows: &super::MaxRowsConfig,
     ) -> Result<Self, Error> {
         // Generate full traces (including full 2^20 bitwise table with multiplicities)
-        let mut traces = Self::from_logs(logs, instructions)?;
+        let mut traces = Self::from_logs(logs, instructions, max_rows)?;
 
         // Trim the bitwise table to only rows with non-zero multiplicities
         traces.bitwise = bitwise::trim_zero_rows(traces.bitwise);
@@ -1596,7 +1711,8 @@ impl Traces {
     pub fn from_logs_minimal(
         logs: &[Log],
         instructions: U64HashMap<Instruction>,
+        max_rows: &super::MaxRowsConfig,
     ) -> Result<Self, Error> {
-        Self::from_logs_trimmed(logs, instructions)
+        Self::from_logs_trimmed(logs, instructions, max_rows)
     }
 }

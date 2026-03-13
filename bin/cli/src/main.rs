@@ -276,7 +276,7 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, blowup: Option<u8>, time: 
                 "Generating proof (blowup={b}, queries={})...",
                 opts.fri_number_of_queries
             );
-            prover::prove_with_options(&elf_data, &opts)
+            prover::prove_with_options(&elf_data, &opts, &Default::default())
         }
         None => {
             eprintln!("Generating proof...");

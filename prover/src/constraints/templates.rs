@@ -27,6 +27,17 @@ use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 /// 2^32 for word combining and carry extraction
 pub const SHIFT_32: u64 = 1u64 << 32;
 
+/// Precomputed: (2^32)^(-1) mod p where p = 2^64 - 2^32 + 1.
+/// Avoids ~72 multiplications per inv() call in constraint hot loops.
+/// Verify: INV_SHIFT_32 * SHIFT_32 ≡ 1 (mod p)
+pub const INV_SHIFT_32: u64 = 18446744065119617026;
+
+/// 2^(-32) in the field, used for carry extraction.
+#[inline]
+fn inv_2_32<F: IsField>() -> FieldElement<F> {
+    FieldElement::from(INV_SHIFT_32)
+}
+
 // =========================================================================
 // IS_BIT Template
 // =========================================================================
@@ -116,6 +127,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for IsBitConstra
                 frame,
                 periodic_values: _,
                 rap_challenges: _,
+                ..
             } => {
                 let constraint_value = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
@@ -125,6 +137,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for IsBitConstra
                 frame,
                 periodic_values: _,
                 rap_challenges: _,
+                ..
             } => {
                 let constraint_value = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = constraint_value;
@@ -447,8 +460,7 @@ impl AddConstraint {
         let sum_lo = self.sum.eval_lo(step);
 
         // carry_0 = (lhs_lo + rhs_lo - sum_lo) * 2^(-32)
-        let inv_2_32: FieldElement<F> = FieldElement::from(SHIFT_32).inv().unwrap();
-        (lhs_lo + rhs_lo - sum_lo) * inv_2_32
+        (lhs_lo + rhs_lo - sum_lo) * inv_2_32::<F>()
     }
 
     /// Compute carry_1 inline from trace values.
@@ -463,8 +475,7 @@ impl AddConstraint {
         let carry_0 = self.compute_carry_0(step);
 
         // carry_1 = (lhs_hi + rhs_hi + carry_0 - sum_hi) * 2^(-32)
-        let inv_2_32: FieldElement<F> = FieldElement::from(SHIFT_32).inv().unwrap();
-        (lhs_hi + rhs_hi + carry_0 - sum_hi) * inv_2_32
+        (lhs_hi + rhs_hi + carry_0 - sum_hi) * inv_2_32::<F>()
     }
 
     fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
@@ -518,6 +529,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for AddConstrain
                 frame,
                 periodic_values: _,
                 rap_challenges: _,
+                ..
             } => {
                 let constraint_value = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
@@ -527,6 +539,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for AddConstrain
                 frame,
                 periodic_values: _,
                 rap_challenges: _,
+                ..
             } => {
                 let constraint_value = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = constraint_value;
@@ -558,4 +571,17 @@ pub fn new_is_bit_constraints(
         .collect();
 
     (constraints, constraint_idx_start + value_cols.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tables::types::GoldilocksField;
+
+    #[test]
+    fn test_inv_shift_32_is_correct() {
+        let inv = FieldElement::<GoldilocksField>::from(INV_SHIFT_32);
+        let shift = FieldElement::<GoldilocksField>::from(SHIFT_32);
+        assert_eq!(inv * shift, FieldElement::one());
+    }
 }

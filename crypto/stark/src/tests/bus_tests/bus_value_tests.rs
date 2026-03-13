@@ -1,11 +1,11 @@
 //! Unit tests for BusValue and LinearTerm combine logic.
 
 use math::field::element::FieldElement;
-use math::field::fields::fft_friendly::babybear::Babybear31PrimeField;
+use math::field::goldilocks::GoldilocksField;
 
 use crate::lookup::{BusValue, LinearTerm, Packing};
 
-type F = Babybear31PrimeField;
+type F = GoldilocksField;
 type FE = FieldElement<F>;
 
 // =============================================================================
@@ -22,7 +22,7 @@ fn test_packed_delegates_to_packing() {
 
     // Simulate columns: [0x1234, 0x5678]
     let columns = [FE::from(0x1234u64), FE::from(0x5678u64)];
-    let combined: Vec<FE> = bv.combine_from(|col| columns[col].clone());
+    let combined: Vec<FE> = bv.combine_from(|col| columns[col]);
 
     // Expected: 0x56781234 (same as Packing::Word2L)
     assert_eq!(combined.len(), 1);
@@ -38,7 +38,7 @@ fn test_linear_single_column() {
     }]);
 
     let columns = [FE::from(42u64)];
-    let combined: Vec<FE> = bv.combine_from(|col| columns[col].clone());
+    let combined: Vec<FE> = bv.combine_from(|col| columns[col]);
 
     assert_eq!(combined.len(), 1);
     assert_eq!(combined[0], FE::from(42u64));
@@ -53,7 +53,7 @@ fn test_linear_column_with_coefficient() {
     }]);
 
     let columns = [FE::from(10u64)];
-    let combined: Vec<FE> = bv.combine_from(|col| columns[col].clone());
+    let combined: Vec<FE> = bv.combine_from(|col| columns[col]);
 
     assert_eq!(combined.len(), 1);
     assert_eq!(combined[0], FE::from(50u64)); // 5 * 10 = 50
@@ -74,7 +74,7 @@ fn test_linear_multiple_columns() {
     ]);
 
     let columns = [FE::from(10u64), FE::from(20u64)];
-    let combined: Vec<FE> = bv.combine_from(|col| columns[col].clone());
+    let combined: Vec<FE> = bv.combine_from(|col| columns[col]);
 
     assert_eq!(combined.len(), 1);
     assert_eq!(combined[0], FE::from(170u64)); // 3*10 + 7*20 = 30 + 140 = 170
@@ -108,7 +108,7 @@ fn test_linear_mixed_columns_and_constant() {
     ]);
 
     let columns = [FE::from(5u64), FE::from(7u64)];
-    let combined: Vec<FE> = bv.combine_from(|col| columns[col].clone());
+    let combined: Vec<FE> = bv.combine_from(|col| columns[col]);
 
     assert_eq!(combined.len(), 1);
     assert_eq!(combined[0], FE::from(41u64)); // 2*5 + 3*7 + 10 = 10 + 21 + 10 = 41
@@ -277,7 +277,7 @@ fn test_linear_column_unsigned_single() {
     }]);
 
     let columns = [FE::from(2u64)];
-    let combined: Vec<FE> = bv.combine_from(|col| columns[col].clone());
+    let combined: Vec<FE> = bv.combine_from(|col| columns[col]);
 
     assert_eq!(combined.len(), 1);
     // Result = large_coeff * 2 in field
@@ -295,7 +295,7 @@ fn test_linear_column_unsigned_with_coefficient() {
     }]);
 
     let columns = [FE::from(100u64)];
-    let combined: Vec<FE> = bv.combine_from(|col| columns[col].clone());
+    let combined: Vec<FE> = bv.combine_from(|col| columns[col]);
 
     assert_eq!(combined.len(), 1);
     let expected = FE::from(coeff) * FE::from(100u64);
@@ -318,7 +318,7 @@ fn test_linear_mixed_column_and_column_unsigned() {
     ]);
 
     let columns = [FE::from(10u64), FE::from(2u64)];
-    let combined: Vec<FE> = bv.combine_from(|col| columns[col].clone());
+    let combined: Vec<FE> = bv.combine_from(|col| columns[col]);
 
     assert_eq!(combined.len(), 1);
     // 3*10 + large_coeff*2
@@ -343,7 +343,7 @@ fn test_linear_mixed_all_term_types() {
     ]);
 
     let columns = [FE::from(5u64), FE::from(3u64)];
-    let combined: Vec<FE> = bv.combine_from(|col| columns[col].clone());
+    let combined: Vec<FE> = bv.combine_from(|col| columns[col]);
 
     assert_eq!(combined.len(), 1);
     // 2*5 + large*3 + 10

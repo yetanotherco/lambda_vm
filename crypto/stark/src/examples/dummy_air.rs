@@ -10,12 +10,9 @@ use crate::{
     trace::TraceTable,
     traits::{AIR, TransitionEvaluationContext},
 };
-use math::field::{
-    element::FieldElement, fields::fft_friendly::stark_252_prime_field::Stark252PrimeField,
-    traits::IsFFTField,
-};
+use math::field::{element::FieldElement, goldilocks::GoldilocksField, traits::IsFFTField};
 
-type StarkField = Stark252PrimeField;
+type StarkField = GoldilocksField;
 
 #[derive(Clone)]
 struct FibConstraint<F: IsFFTField> {
@@ -55,11 +52,13 @@ where
                 frame,
                 periodic_values,
                 rap_challenges,
+                ..
             }
             | TransitionEvaluationContext::Verifier {
                 frame,
                 periodic_values,
                 rap_challenges,
+                ..
             } => (frame, periodic_values, rap_challenges),
         };
 
@@ -115,11 +114,13 @@ where
                 frame,
                 periodic_values,
                 rap_challenges,
+                ..
             }
             | TransitionEvaluationContext::Verifier {
                 frame,
                 periodic_values,
                 rap_challenges,
+                ..
             } => (frame, periodic_values, rap_challenges),
         };
 

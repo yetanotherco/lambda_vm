@@ -474,25 +474,6 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     interactions
 }
-
-// =========================================================================
-// Virtual column computations
-// =========================================================================
-
-/// Compute virtual read1 = μ - read2 - read4 - read8
-#[allow(dead_code)]
-fn compute_read1<F, E>(step: &TableView<F, E>) -> FieldElement<F>
-where
-    F: IsSubFieldOf<E>,
-    E: IsField,
-{
-    let mu = step.get_main_evaluation_element(0, cols::MU).clone();
-    let read2 = step.get_main_evaluation_element(0, cols::READ2).clone();
-    let read4 = step.get_main_evaluation_element(0, cols::READ4).clone();
-    let read8 = step.get_main_evaluation_element(0, cols::READ8).clone();
-    mu - read2 - read4 - read8
-}
-
 // =========================================================================
 // Constraints
 // =========================================================================
@@ -600,6 +581,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for LoadConstrai
                 frame,
                 periodic_values: _,
                 rap_challenges: _,
+                ..
             } => {
                 let constraint_value = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
@@ -608,6 +590,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for LoadConstrai
                 frame,
                 periodic_values: _,
                 rap_challenges: _,
+                ..
             } => {
                 let constraint_value = self.compute(frame.get_evaluation_step(0));
                 transition_evaluations[self.constraint_idx] = constraint_value;

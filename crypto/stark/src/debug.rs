@@ -1,5 +1,8 @@
 use super::domain::Domain;
+use super::lookup::BusPublicInputs;
+use super::trace::TraceTable;
 use super::traits::{AIR, TransitionEvaluationContext};
+use crate::lookup::{LOGUP_CHALLENGE_ALPHA, compute_alpha_powers};
 use crate::{frame::Frame, trace::LDETraceTable};
 use log::{error, info};
 use math::field::traits::IsSubFieldOf;
@@ -11,7 +14,10 @@ use math::{
     polynomial::Polynomial,
 };
 
-/// Validates that the trace is valid with respect to the supplied AIR constraints
+/// Validates that the trace is valid with respect to the supplied AIR constraints.
+///
+/// Accepts a `TraceTable` directly (no coefficient-form polynomials needed).
+/// The trace table contains the original trace values on the interpolation domain.
 pub fn validate_trace<
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
     FieldExtension: Send + Sync + IsField,
@@ -19,31 +25,28 @@ pub fn validate_trace<
 >(
     air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
     pub_inputs: &PI,
-    main_trace_polys: &[Polynomial<FieldElement<Field>>],
-    aux_trace_polys: &[Polynomial<FieldElement<FieldExtension>>],
+    trace: &TraceTable<Field, FieldExtension>,
     domain: &Domain<Field>,
     rap_challenges: &[FieldElement<FieldExtension>],
+    bus_public_inputs: Option<&BusPublicInputs<FieldExtension>>,
 ) -> bool {
     info!("Starting constraints validation over trace...");
     let mut ret = true;
 
-    let main_trace_columns: Vec<_> = main_trace_polys
-        .iter()
-        .map(|poly| {
-            Polynomial::<FieldElement<Field>>::evaluate_fft::<Field>(
-                poly,
-                1,
-                Some(domain.interpolation_domain_size),
-            )
-            .unwrap()
+    // Build an LDE trace with blowup=1 from the trace table columns.
+    let main_trace_columns: Vec<Vec<FieldElement<Field>>> = (0..trace.num_main_columns)
+        .map(|col| {
+            (0..trace.num_rows())
+                .map(|row| trace.main_table.get(row, col).clone())
+                .collect()
         })
         .collect();
 
-    let aux_trace_columns: Vec<_> = aux_trace_polys
-        .iter()
-        .map(|poly| {
-            Polynomial::evaluate_fft::<Field>(poly, 1, Some(domain.interpolation_domain_size))
-                .unwrap()
+    let aux_trace_columns: Vec<Vec<FieldElement<FieldExtension>>> = (0..trace.num_aux_columns)
+        .map(|col| {
+            (0..trace.num_rows())
+                .map(|row| trace.aux_table.get(row, col).clone())
+                .collect()
         })
         .collect();
 
@@ -64,9 +67,8 @@ pub fn validate_trace<
         .collect();
 
     // --------- VALIDATE BOUNDARY CONSTRAINTS ------------
-    // Note: We pass None for aux_hints because debug validation doesn't need the LogUp hints
     let trace_length = domain.interpolation_domain_size;
-    air.boundary_constraints(pub_inputs, rap_challenges, None, trace_length)
+    air.boundary_constraints(pub_inputs, rap_challenges, bus_public_inputs, trace_length)
         .constraints
         .iter()
         .for_each(|constraint| {
@@ -94,6 +96,26 @@ pub fn validate_trace<
             .map(|(trace_steps, constraint)| trace_steps - constraint.end_exemptions())
             .collect();
 
+    let logup_alpha_powers: Vec<FieldElement<FieldExtension>> =
+        if rap_challenges.len() > LOGUP_CHALLENGE_ALPHA {
+            compute_alpha_powers(
+                &rap_challenges[LOGUP_CHALLENGE_ALPHA],
+                air.max_bus_elements(),
+            )
+        } else {
+            Vec::new()
+        };
+
+    let logup_table_offset = match bus_public_inputs {
+        Some(bpi) => {
+            let n_inv = FieldElement::<Field>::from(trace_length as u64)
+                .inv()
+                .unwrap();
+            n_inv * &bpi.table_contribution
+        }
+        None => FieldElement::zero(),
+    };
+
     // Iterate over trace and compute transitions
     for step in 0..lde_trace.num_steps() {
         let frame = Frame::read_step_from_lde(&lde_trace, step, &air.context().transition_offsets);
@@ -101,8 +123,13 @@ pub fn validate_trace<
             .iter()
             .map(|col| col[step].clone())
             .collect();
-        let transition_evaluation_context =
-            TransitionEvaluationContext::new_prover(&frame, &periodic_values, rap_challenges);
+        let transition_evaluation_context = TransitionEvaluationContext::new_prover(
+            &frame,
+            &periodic_values,
+            rap_challenges,
+            &logup_alpha_powers,
+            &logup_table_offset,
+        );
         let evaluations = air.compute_transition(&transition_evaluation_context);
 
         // Iterate over each transition evaluation. When the evaluated step is not from

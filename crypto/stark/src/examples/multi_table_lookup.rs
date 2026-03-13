@@ -6,11 +6,11 @@ use crate::{
     },
     proof::options::ProofOptions,
 };
-use math::field::fields::fft_friendly::{
-    babybear::Babybear31PrimeField, quartic_babybear::Degree4BabyBearExtensionField,
+use math::field::{
+    extensions_goldilocks::Degree3GoldilocksExtensionField, goldilocks::GoldilocksField,
 };
-type F = Babybear31PrimeField;
-type E = Degree4BabyBearExtensionField;
+type F = GoldilocksField;
+type E = Degree3GoldilocksExtensionField;
 
 /// Bus IDs for the multi-table lookup example
 #[repr(u64)]

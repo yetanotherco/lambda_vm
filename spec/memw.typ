@@ -38,6 +38,13 @@ we document it here, keeping the type information as a reading help.
 
 = Constraints
 
+We can compute the addresses for the later bytes based on a single bit each,
+indicating whether adding `i` to `base_address` overflows the lower limb.
+We can safely assume that additions for which this bit is not correctly set
+will have either an overflow on the upper or lower word, and hence not match
+any existing memory tokens, which are only initialized for correctly formatted
+and range-checked doublewords (see @memory).
+
 #render_constraint_table(chip, config, groups: "consistency")
 
 As long as `timestamp` is properly range-checked, the presence of `old_timestamp`
@@ -45,9 +52,9 @@ in the memory argument automatically ensures appropriate range checking
 (as long as no external entities provide negative multiplicities without range checking the timestamp).
 This ensures the assumptions for `LT` are satisfied.
 
-We additionally check that the address does not overflow
-for more significant bytes of the access.
-#render_constraint_table(chip, config, groups: "overflow")
+There is no need to check that the address does not overflow,
+as our address calculations are not performed modulo $2^64$ here,
+and any overflow will result in an address without matching initialization.
 
 The chip adds the following tuples to the lookup argument,
 to effectuate that part of the memory argument.
@@ -56,11 +63,32 @@ to effectuate that part of the memory argument.
 This chip contributes the following to the lookup argument.
 #render_constraint_table(chip, config, groups: "output")
 
+= Read-size aligned fast path
+
+#let alignedchip = load_chip("src/memw_aligned.toml", config)
+#let aligned = raw(alignedchip.name)
+
+When a memory access happens at an address with proper alignment
+(that is, enough trailing zeros) for its access size, and all accessed
+elements were last accessed at the same timestamp, we can 
+instead use the #aligned chip to save on total column count.
+The saving comes from only requiring a single old timestamp to be stored,
+as well as being able to guarantee that all values of `add_limb_overflow` would be zero.
+A minor extra cost is introduced in the form of a check that the alignment is indeed correct,
+and the corresponding decomposition of the `base_address`.
+
+Further logic remains essentially the same, so we briefly present the relevant tables for this chip.
+#let nr_variables = total_nr_variables(alignedchip)
+#let nr_columns = total_nr_instantiated_columns(alignedchip, config)
+
+The #aligned chip only needs #nr_variables variables, expressed through #nr_columns columns.
+#render_chip_column_table(alignedchip, config)
+#render_chip_assumptions(alignedchip, config)
+#render_constraint_table(alignedchip, config)
+
 
 = Future optimization ideas
 
-- Fast path for aligned memory access where all bytes have the same old timestamp
-- MEMB chip that deals does a one-byte write to remove old_timestamp from here (uncertain tradeoffs)
-- Compute `base_address[1] + 1` once and have high words of `address_add` as Words
-- Improve overflow trapping somehow so we don't need `LT` (could tie into previous one by checking carry bit of the +1)
+- `MEMB` chip that does a one-byte write to remove old_timestamp from here (uncertain tradeoffs)
+- Additional fast path for registers? (Always guaranteed same timestamp, alignment could be an assumption, always only two values)
 - Adding `μ_sum`/`w2`/`w4`/`write8` multiplicities to the `IS_HALF` lookups may make some GKR things faster if there are known zeroes.

@@ -1,5 +1,5 @@
 use alloc::vec::Vec;
-use math::field::{element::FieldElement, fields::u64_prime_field::U64PrimeField};
+use math::field::{element::FieldElement, test_fields::u64_test_field::U64Field};
 
 use crate::merkle_tree::{
     traits::IsMerkleTreeBackend,
@@ -8,7 +8,7 @@ use crate::merkle_tree::{
 use crate::tests::merkle_tests::TestBackend;
 
 const MODULUS: u64 = 13;
-type U64PF = U64PrimeField<MODULUS>;
+type U64PF = U64Field<MODULUS>;
 type FE = FieldElement<U64PF>;
 
 #[test]

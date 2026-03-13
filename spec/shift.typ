@@ -59,25 +59,24 @@ Here, we start with discussing the _logical_ left/right shift operations only; t
 
 == First phase
 We zoom in on the first step.
-Here, we make use of the two lookup operations 
-- $#`HWSL[x: Half, y: B4]` := (#`x` #`<<` #`y`) mod 2^16$ (short for "HalfWord Shift Left"), and
-- $#`HWSLC[x: Half, y: B4]` := #`x` #`>>` (16-#`y`)$ (short for "HalfWord Shift Left's Carry")
-Note here that one can use these two lookups to compute `out: Half[4] := in << y` as:
+Here, we make use of the lookup operation `HWSL` (short for "HalfWord Shift Left"):
+$ #`HWSL[x: Half, y: B4]` := [(#`x` #`<<` #`y`) mod 2^16, #`x` #`>>` (16 - #`y`)]. $
+One can use this to compute `out: Half[4] := in << y` as:
 $
   #`out[`i#`]` = cases(
-    #`HWSL[in[`0#`], y]` &"if" i = 0,
-    #`HWSL[in[`i#`], y] | HWSLC[in[`i-1#`], y]` &"if" i in [1, 3]   
+    #`HWSL[in[`0#`], y]`_0 &"if" i = 0,
+    #`HWSL[in[`i#`], y]`_0 | #`HWSL[in[`i-1#`], y]`_1 &"if" i in [1, 3]   
   )
 $
 as long as $#`y` < 16$.
 Observing that 
-$#`HWSL[x,` 16-#`y]` = (#`x` #`<<` (16-#`y`)) mod 2^16$, and
-$#`HWSLC[x,` 16-#`y]` = #`x` #`>>` #`y`$ for $#`y` in [1, 15]$,
-one can also use these lookups to compute `out := in >> y` as
+$#`HWSL[x,` 16-#`y]`_0 = (#`x` #`<<` (16-#`y`)) mod 2^16$, and
+$#`HWSL[x,` 16-#`y]`_1 = #`x` #`>>` #`y`$ for $#`y` in [1, 15]$,
+one can also use it to compute `out := in >> y` as
 $
   #`out[`i#`]` = cases(
-    #`HWSLC[in[`i#`],` 16-#`y] | HWSL[in[`i+1#`], y]` &"if" i in [0, 2],
-    #`HWSLC[in[`3#`],` 16-#`y]` &"if" i = 3
+    #`HWSL[in[`i#`],` 16-#`y]`_1 | #`HWSL[in[`i+1#`], y]`_0 &"if" i in [0, 2],
+    #`HWSL[in[`3#`],` 16-#`y]`_1 &"if" i = 3
   )
 $
 as long as $0 < #`y` < 16$.
@@ -90,7 +89,7 @@ $
     (16-#`shift`) mod 16 & "when shifting right"
   ),  
 $
-it only takes some rearranging and combining of the values $#`X[`i#`] := HWSL[in[`i#`], bit_shift]`$ and $#`Y[`i#`] := HWSLC[in[`i#`], bit_shift]`$ to form the limbs of $#`in <</>> shift` mod 16$.
+it only takes some rearranging and combining of the values $#`X[`i#`] := HWSL[in[`i#`], bit_shift]`_0$ and $#`Y[`i#`] := HWSL[in[`i#`], bit_shift]`_1$ to form the limbs of $#`in <</>> shift` mod 16$.
 In the remaining case that $#`right` = 1$ and $#`shift` = 0 mod 16$, the limbs of $#`in <</>> shift` mod 16$ simply match those of `in`.
 
 == Second phase

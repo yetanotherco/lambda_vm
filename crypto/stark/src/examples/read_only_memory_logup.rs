@@ -76,6 +76,7 @@ where
                 frame,
                 periodic_values: _periodic_values,
                 rap_challenges: _rap_challenges,
+                ..
             } => {
                 let first_step = frame.get_evaluation_step(0);
                 let second_step = frame.get_evaluation_step(1);
@@ -96,6 +97,7 @@ where
                 frame,
                 periodic_values: _periodic_values,
                 rap_challenges: _rap_challenges,
+                ..
             } => {
                 let first_step = frame.get_evaluation_step(0);
                 let second_step = frame.get_evaluation_step(1);
@@ -168,6 +170,7 @@ where
                 frame,
                 periodic_values: _periodic_values,
                 rap_challenges: _rap_challenges,
+                ..
             } => {
                 let first_step = frame.get_evaluation_step(0);
                 let second_step = frame.get_evaluation_step(1);
@@ -190,6 +193,7 @@ where
                 frame,
                 periodic_values: _periodic_values,
                 rap_challenges: _rap_challenges,
+                ..
             } => {
                 let first_step = frame.get_evaluation_step(0);
                 let second_step = frame.get_evaluation_step(1);
@@ -266,6 +270,7 @@ where
                 frame,
                 periodic_values: _periodic_values,
                 rap_challenges,
+                ..
             } => {
                 let first_step = frame.get_evaluation_step(0);
                 let second_step = frame.get_evaluation_step(1);
@@ -305,6 +310,7 @@ where
                 frame,
                 periodic_values: _periodic_values,
                 rap_challenges,
+                ..
             } => {
                 let first_step = frame.get_evaluation_step(0);
                 let second_step = frame.get_evaluation_step(1);
@@ -562,67 +568,67 @@ pub fn read_only_logup_trace<
 #[cfg(test)]
 mod test {
     use super::*;
-    use math::field::fields::{
-        fft_friendly::{
-            babybear::Babybear31PrimeField, quartic_babybear::Degree4BabyBearExtensionField,
-        },
-        u64_prime_field::{F17, FE17},
+    use math::field::{
+        extensions_goldilocks::Degree3GoldilocksExtensionField, goldilocks::GoldilocksField,
     };
+
+    type GoldilocksFE = FieldElement<GoldilocksField>;
 
     #[test]
     fn tes_logup_trace_construction() {
         let address_col = vec![
-            FE17::from(3),
-            FE17::from(7),
-            FE17::from(2),
-            FE17::from(8),
-            FE17::from(4),
-            FE17::from(5),
-            FE17::from(1),
-            FE17::from(6),
+            GoldilocksFE::from(3u64),
+            GoldilocksFE::from(7u64),
+            GoldilocksFE::from(2u64),
+            GoldilocksFE::from(8u64),
+            GoldilocksFE::from(4u64),
+            GoldilocksFE::from(5u64),
+            GoldilocksFE::from(1u64),
+            GoldilocksFE::from(6u64),
         ];
         let value_col = vec![
-            FE17::from(30),
-            FE17::from(70),
-            FE17::from(20),
-            FE17::from(80),
-            FE17::from(40),
-            FE17::from(50),
-            FE17::from(10),
-            FE17::from(60),
+            GoldilocksFE::from(30u64),
+            GoldilocksFE::from(70u64),
+            GoldilocksFE::from(20u64),
+            GoldilocksFE::from(80u64),
+            GoldilocksFE::from(40u64),
+            GoldilocksFE::from(50u64),
+            GoldilocksFE::from(10u64),
+            GoldilocksFE::from(60u64),
         ];
 
-        let logup_trace: TraceTable<F17, F17> = read_only_logup_trace(address_col, value_col);
+        let logup_trace: TraceTable<GoldilocksField, GoldilocksField> =
+            read_only_logup_trace(address_col, value_col);
 
         let expected_sorted_addresses = vec![
-            FE17::from(1),
-            FE17::from(2),
-            FE17::from(3),
-            FE17::from(4),
-            FE17::from(5),
-            FE17::from(6),
-            FE17::from(7),
-            FE17::from(8),
+            GoldilocksFE::from(1u64),
+            GoldilocksFE::from(2u64),
+            GoldilocksFE::from(3u64),
+            GoldilocksFE::from(4u64),
+            GoldilocksFE::from(5u64),
+            GoldilocksFE::from(6u64),
+            GoldilocksFE::from(7u64),
+            GoldilocksFE::from(8u64),
         ];
         let expected_sorted_values = vec![
-            FE17::from(10),
-            FE17::from(20),
-            FE17::from(30),
-            FE17::from(40),
-            FE17::from(50),
-            FE17::from(60),
-            FE17::from(70),
-            FE17::from(80),
+            GoldilocksFE::from(10u64),
+            GoldilocksFE::from(20u64),
+            GoldilocksFE::from(30u64),
+            GoldilocksFE::from(40u64),
+            GoldilocksFE::from(50u64),
+            GoldilocksFE::from(60u64),
+            GoldilocksFE::from(70u64),
+            GoldilocksFE::from(80u64),
         ];
         let expected_multiplicities = vec![
-            FE17::one(),
-            FE17::one(),
-            FE17::one(),
-            FE17::one(),
-            FE17::one(),
-            FE17::one(),
-            FE17::one(),
-            FE17::one(),
+            GoldilocksFE::one(),
+            GoldilocksFE::one(),
+            GoldilocksFE::one(),
+            GoldilocksFE::one(),
+            GoldilocksFE::one(),
+            GoldilocksFE::one(),
+            GoldilocksFE::one(),
+            GoldilocksFE::one(),
         ];
         assert_eq!(logup_trace.columns_main()[2], expected_sorted_addresses);
         assert_eq!(logup_trace.columns_main()[3], expected_sorted_values);
@@ -632,58 +638,58 @@ mod test {
     #[test]
     fn test_logup_trace_construction_2() {
         let address_col = vec![
-            FieldElement::<Babybear31PrimeField>::from(3), // a0
-            FieldElement::<Babybear31PrimeField>::from(2), // a1
-            FieldElement::<Babybear31PrimeField>::from(2), // a2
-            FieldElement::<Babybear31PrimeField>::from(3), // a3
-            FieldElement::<Babybear31PrimeField>::from(4), // a4
-            FieldElement::<Babybear31PrimeField>::from(5), // a5
-            FieldElement::<Babybear31PrimeField>::from(1), // a6
-            FieldElement::<Babybear31PrimeField>::from(3), // a7
+            FieldElement::<GoldilocksField>::from(3u64), // a0
+            FieldElement::<GoldilocksField>::from(2u64), // a1
+            FieldElement::<GoldilocksField>::from(2u64), // a2
+            FieldElement::<GoldilocksField>::from(3u64), // a3
+            FieldElement::<GoldilocksField>::from(4u64), // a4
+            FieldElement::<GoldilocksField>::from(5u64), // a5
+            FieldElement::<GoldilocksField>::from(1u64), // a6
+            FieldElement::<GoldilocksField>::from(3u64), // a7
         ];
         let value_col = vec![
-            FieldElement::<Babybear31PrimeField>::from(30), // v0
-            FieldElement::<Babybear31PrimeField>::from(20), // v1
-            FieldElement::<Babybear31PrimeField>::from(20), // v2
-            FieldElement::<Babybear31PrimeField>::from(30), // v3
-            FieldElement::<Babybear31PrimeField>::from(40), // v4
-            FieldElement::<Babybear31PrimeField>::from(50), // v5
-            FieldElement::<Babybear31PrimeField>::from(10), // v6
-            FieldElement::<Babybear31PrimeField>::from(30), // v7
+            FieldElement::<GoldilocksField>::from(30u64), // v0
+            FieldElement::<GoldilocksField>::from(20u64), // v1
+            FieldElement::<GoldilocksField>::from(20u64), // v2
+            FieldElement::<GoldilocksField>::from(30u64), // v3
+            FieldElement::<GoldilocksField>::from(40u64), // v4
+            FieldElement::<GoldilocksField>::from(50u64), // v5
+            FieldElement::<GoldilocksField>::from(10u64), // v6
+            FieldElement::<GoldilocksField>::from(30u64), // v7
         ];
 
         let sorted_address_col = vec![
-            FieldElement::<Babybear31PrimeField>::from(1), // a0
-            FieldElement::<Babybear31PrimeField>::from(2), // a1
-            FieldElement::<Babybear31PrimeField>::from(3), // a2
-            FieldElement::<Babybear31PrimeField>::from(4), // a3
-            FieldElement::<Babybear31PrimeField>::from(5), // a4
-            FieldElement::<Babybear31PrimeField>::from(5), // a5
-            FieldElement::<Babybear31PrimeField>::from(5), // a6
-            FieldElement::<Babybear31PrimeField>::from(5), // a7
+            FieldElement::<GoldilocksField>::from(1u64), // a0
+            FieldElement::<GoldilocksField>::from(2u64), // a1
+            FieldElement::<GoldilocksField>::from(3u64), // a2
+            FieldElement::<GoldilocksField>::from(4u64), // a3
+            FieldElement::<GoldilocksField>::from(5u64), // a4
+            FieldElement::<GoldilocksField>::from(5u64), // a5
+            FieldElement::<GoldilocksField>::from(5u64), // a6
+            FieldElement::<GoldilocksField>::from(5u64), // a7
         ];
         let sorted_value_col = vec![
-            FieldElement::<Babybear31PrimeField>::from(10), // v0
-            FieldElement::<Babybear31PrimeField>::from(20), // v1
-            FieldElement::<Babybear31PrimeField>::from(30), // v2
-            FieldElement::<Babybear31PrimeField>::from(40), // v3
-            FieldElement::<Babybear31PrimeField>::from(50), // v4
-            FieldElement::<Babybear31PrimeField>::from(50), // v5
-            FieldElement::<Babybear31PrimeField>::from(50), // v6
-            FieldElement::<Babybear31PrimeField>::from(50), // v7
+            FieldElement::<GoldilocksField>::from(10u64), // v0
+            FieldElement::<GoldilocksField>::from(20u64), // v1
+            FieldElement::<GoldilocksField>::from(30u64), // v2
+            FieldElement::<GoldilocksField>::from(40u64), // v3
+            FieldElement::<GoldilocksField>::from(50u64), // v4
+            FieldElement::<GoldilocksField>::from(50u64), // v5
+            FieldElement::<GoldilocksField>::from(50u64), // v6
+            FieldElement::<GoldilocksField>::from(50u64), // v7
         ];
 
         let multiplicity_col = vec![
-            FieldElement::<Babybear31PrimeField>::from(1), // v0
-            FieldElement::<Babybear31PrimeField>::from(2), // v1
-            FieldElement::<Babybear31PrimeField>::from(3), // v2
-            FieldElement::<Babybear31PrimeField>::from(1), // v3
-            FieldElement::<Babybear31PrimeField>::from(1), // v4
-            FieldElement::<Babybear31PrimeField>::from(0), // v5
-            FieldElement::<Babybear31PrimeField>::from(0), // v6
-            FieldElement::<Babybear31PrimeField>::from(0), // v7
+            FieldElement::<GoldilocksField>::from(1u64), // v0
+            FieldElement::<GoldilocksField>::from(2u64), // v1
+            FieldElement::<GoldilocksField>::from(3u64), // v2
+            FieldElement::<GoldilocksField>::from(1u64), // v3
+            FieldElement::<GoldilocksField>::from(1u64), // v4
+            FieldElement::<GoldilocksField>::from(0u64), // v5
+            FieldElement::<GoldilocksField>::from(0u64), // v6
+            FieldElement::<GoldilocksField>::from(0u64), // v7
         ];
-        let logup_trace: TraceTable<Babybear31PrimeField, Degree4BabyBearExtensionField> =
+        let logup_trace: TraceTable<GoldilocksField, Degree3GoldilocksExtensionField> =
             read_only_logup_trace(address_col, value_col);
 
         assert_eq!(logup_trace.columns_main()[2], sorted_address_col);

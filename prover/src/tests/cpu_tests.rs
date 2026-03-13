@@ -325,10 +325,11 @@ fn test_bus_interactions_count() {
     // - 1 DECODE (instruction fetch)
     // - 1 MUL (multiplication)
     // - 1 DVRM (division/remainder)
+    // - 1 SHIFT (shift operations)
     // - 1 BRANCH (branch/jump target calculation)
     // - 1 ECALL (send to HALT table)
-    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 5 + 1 + 1 + 1 + 1 + 1 = 39
-    assert_eq!(interactions.len(), 39);
+    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 5 + 1 + 1 + 1 + 1 + 1 + 1 = 40
+    assert_eq!(interactions.len(), 40);
 }
 
 #[test]
@@ -377,10 +378,11 @@ fn run_asm_elf(name: &str) -> (Vec<executor::vm::logs::Log>, U64HashMap<Instruct
 fn test_trace_from_logs_subw() {
     // subw test - 4 steps (power of 2, works without padding)
     let (logs, instructions) = run_asm_elf("subw");
-    let traces = Traces::from_logs(&logs, instructions).unwrap();
+    let traces = Traces::from_logs(&logs, instructions, &Default::default()).unwrap();
 
     // Should have SUB instruction with word_instr flag
-    let has_sub = (0..logs.len()).any(|i| traces.cpu.main_table.get_row(i)[cols::SUB] == FE::one());
+    let has_sub =
+        (0..logs.len()).any(|i| traces.cpus[0].main_table.get_row(i)[cols::SUB] == FE::one());
     assert!(has_sub, "subw.elf should have SUB instruction");
 }
 
