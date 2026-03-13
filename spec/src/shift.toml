@@ -76,7 +76,7 @@ pad = ["arr", 0, 0, 0, 0]
 [[variables.auxiliary]]
 name = "limb_shift_raw"
 type = ["Bit", 3]
-desc = "One-hot vector indicating whether $floor.l #`shift` / 16 floor.r equiv i mod s$, where $s = 2$ when $#`word_instr` = 1$ and $4$ otherwise. These columns store the first 3 values, and the 4th is derived from the one-hot proberty."
+desc = "One-hot vector indicating whether $floor.l #`shift` / 16 floor.r equiv i mod s$, where $s = 2$ when $#`word_instr` = 1$ and $4$ otherwise. These columns store the first 3 values, and the 4th is derived from the one-hot property."
 pad = ["arr", 0, 0, 0]
 
 # Virtual
