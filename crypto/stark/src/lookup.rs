@@ -341,6 +341,111 @@ impl Packing {
         }
     }
 
+    /// Zero-allocation fingerprint accumulation from a `TableView` (constraint evaluation).
+    ///
+    /// Mirrors `accumulate_fingerprint` but reads from `step.get_main_evaluation_element`
+    /// instead of column-major `main_cols[col][row]`.
+    pub fn accumulate_fingerprint_step<A, B>(
+        &self,
+        step: &TableView<A, B>,
+        start_col: usize,
+        alpha_powers: &[FieldElement<B>],
+        alpha_offset: usize,
+        acc: &mut FieldElement<B>,
+    ) -> usize
+    where
+        A: IsSubFieldOf<B>,
+        B: IsField,
+    {
+        match self {
+            Packing::Direct => {
+                *acc += step.get_main_evaluation_element(0, start_col) * &alpha_powers[alpha_offset];
+                1
+            }
+            Packing::Word2L => {
+                let shift_16 = FieldElement::<A>::from(SHIFT_16);
+                let combined = step.get_main_evaluation_element(0, start_col)
+                    + step.get_main_evaluation_element(0, start_col + 1) * &shift_16;
+                *acc += &combined * &alpha_powers[alpha_offset];
+                1
+            }
+            Packing::Word4L => {
+                let shift_8 = FieldElement::<A>::from(SHIFT_8);
+                let shift_16 = FieldElement::<A>::from(SHIFT_16);
+                let shift_24 = &shift_8 * &shift_16;
+                let combined = step.get_main_evaluation_element(0, start_col)
+                    + step.get_main_evaluation_element(0, start_col + 1) * &shift_8
+                    + step.get_main_evaluation_element(0, start_col + 2) * &shift_16
+                    + step.get_main_evaluation_element(0, start_col + 3) * &shift_24;
+                *acc += &combined * &alpha_powers[alpha_offset];
+                1
+            }
+            Packing::DWordWL => {
+                *acc += step.get_main_evaluation_element(0, start_col) * &alpha_powers[alpha_offset];
+                *acc += step.get_main_evaluation_element(0, start_col + 1) * &alpha_powers[alpha_offset + 1];
+                2
+            }
+            Packing::DWordHHW => {
+                *acc += step.get_main_evaluation_element(0, start_col) * &alpha_powers[alpha_offset];
+                let shift_16 = FieldElement::<A>::from(SHIFT_16);
+                let w = step.get_main_evaluation_element(0, start_col + 1)
+                    + step.get_main_evaluation_element(0, start_col + 2) * &shift_16;
+                *acc += &w * &alpha_powers[alpha_offset + 1];
+                2
+            }
+            Packing::DWordWHH => {
+                let shift_16 = FieldElement::<A>::from(SHIFT_16);
+                let w = step.get_main_evaluation_element(0, start_col)
+                    + step.get_main_evaluation_element(0, start_col + 1) * &shift_16;
+                *acc += &w * &alpha_powers[alpha_offset];
+                *acc += step.get_main_evaluation_element(0, start_col + 2) * &alpha_powers[alpha_offset + 1];
+                2
+            }
+            Packing::DWordHL => {
+                let shift_16 = FieldElement::<A>::from(SHIFT_16);
+                let w0 = step.get_main_evaluation_element(0, start_col)
+                    + step.get_main_evaluation_element(0, start_col + 1) * &shift_16;
+                *acc += &w0 * &alpha_powers[alpha_offset];
+                let w1 = step.get_main_evaluation_element(0, start_col + 2)
+                    + step.get_main_evaluation_element(0, start_col + 3) * &shift_16;
+                *acc += &w1 * &alpha_powers[alpha_offset + 1];
+                2
+            }
+            Packing::DWordBL => {
+                let shift_8 = FieldElement::<A>::from(SHIFT_8);
+                let shift_16 = FieldElement::<A>::from(SHIFT_16);
+                let shift_24 = &shift_8 * &shift_16;
+                let w0 = step.get_main_evaluation_element(0, start_col)
+                    + step.get_main_evaluation_element(0, start_col + 1) * &shift_8
+                    + step.get_main_evaluation_element(0, start_col + 2) * &shift_16
+                    + step.get_main_evaluation_element(0, start_col + 3) * &shift_24;
+                *acc += &w0 * &alpha_powers[alpha_offset];
+                let w1 = step.get_main_evaluation_element(0, start_col + 4)
+                    + step.get_main_evaluation_element(0, start_col + 5) * &shift_8
+                    + step.get_main_evaluation_element(0, start_col + 6) * &shift_16
+                    + step.get_main_evaluation_element(0, start_col + 7) * &shift_24;
+                *acc += &w1 * &alpha_powers[alpha_offset + 1];
+                2
+            }
+            Packing::QuadHL => {
+                let shift_16 = FieldElement::<A>::from(SHIFT_16);
+                for i in 0..4 {
+                    let c = start_col + i * 2;
+                    let w = step.get_main_evaluation_element(0, c)
+                        + step.get_main_evaluation_element(0, c + 1) * &shift_16;
+                    *acc += &w * &alpha_powers[alpha_offset + i];
+                }
+                4
+            }
+            Packing::QuadWL => {
+                for i in 0..4 {
+                    *acc += step.get_main_evaluation_element(0, start_col + i) * &alpha_powers[alpha_offset + i];
+                }
+                4
+            }
+        }
+    }
+
     /// Combines column values into bus elements using powers of 2.
     ///
     /// Primitive packings define the combining formulas.
@@ -608,6 +713,61 @@ impl BusValue {
                         }
                         LinearTerm::Constant(value) => {
                             result += FieldElement::<F>::from(*value);
+                        }
+                    }
+                }
+                *acc += &result * &alpha_powers[alpha_offset];
+                1
+            }
+        }
+    }
+
+    /// Zero-allocation fingerprint accumulation from a `TableView` (constraint evaluation).
+    ///
+    /// Mirrors `accumulate_fingerprint` but reads from `step.get_main_evaluation_element`
+    /// instead of column-major `main_cols[col][row]`.
+    pub fn accumulate_fingerprint_step<A, B>(
+        &self,
+        step: &TableView<A, B>,
+        alpha_powers: &[FieldElement<B>],
+        alpha_offset: usize,
+        acc: &mut FieldElement<B>,
+    ) -> usize
+    where
+        A: IsSubFieldOf<B>,
+        B: IsField,
+    {
+        match self {
+            BusValue::Packed {
+                start_column,
+                packing,
+            } => packing.accumulate_fingerprint_step(
+                step,
+                *start_column,
+                alpha_powers,
+                alpha_offset,
+                acc,
+            ),
+            BusValue::Linear(terms) => {
+                let mut result = FieldElement::<A>::zero();
+                for term in terms {
+                    match term {
+                        LinearTerm::Column {
+                            coefficient,
+                            column,
+                        } => {
+                            let coeff = FieldElement::<A>::from(*coefficient);
+                            result += step.get_main_evaluation_element(0, *column) * coeff;
+                        }
+                        LinearTerm::ColumnUnsigned {
+                            coefficient,
+                            column,
+                        } => {
+                            let coeff = FieldElement::<A>::from(*coefficient);
+                            result += step.get_main_evaluation_element(0, *column) * coeff;
+                        }
+                        LinearTerm::Constant(value) => {
+                            result += FieldElement::<A>::from(*value);
                         }
                     }
                 }
@@ -1074,6 +1234,12 @@ pub enum Multiplicity {
     /// Useful for "all rows except those marked by this flag".
     Negated(usize),
 
+    /// Difference of two columns: `col_a - col_b`.
+    Diff(usize, usize),
+
+    /// Sum of three columns: `col_a + col_b + col_c`.
+    Sum3(usize, usize, usize),
+
     /// Arbitrary linear combination of columns and constants.
     /// Supports signed coefficients for subtraction.
     /// Example: `μ - read2 - read4 - read8` can be expressed as:
@@ -1279,6 +1445,24 @@ where
                 .collect();
             &multiplicities_owned
         }
+        Multiplicity::Diff(col_a, col_b) => {
+            multiplicities_owned = main_segment_cols[col_a]
+                .iter()
+                .zip(main_segment_cols[col_b].iter())
+                .map(|(a, b)| a - b)
+                .collect();
+            &multiplicities_owned
+        }
+        Multiplicity::Sum3(col_a, col_b, col_c) => {
+            multiplicities_owned = (0..trace_len)
+                .map(|row| {
+                    &main_segment_cols[col_a][row]
+                        + &main_segment_cols[col_b][row]
+                        + &main_segment_cols[col_c][row]
+                })
+                .collect();
+            &multiplicities_owned
+        }
         Multiplicity::Linear(ref terms) => {
             multiplicities_owned = (0..trace_len)
                 .map(|row| {
@@ -1425,6 +1609,18 @@ where
             Multiplicity::Negated(col) => main_segment_cols[*col]
                 .iter()
                 .map(|elem| FieldElement::<F>::one() - elem)
+                .collect(),
+            Multiplicity::Diff(col_a, col_b) => main_segment_cols[*col_a]
+                .iter()
+                .zip(main_segment_cols[*col_b].iter())
+                .map(|(a, b)| a - b)
+                .collect(),
+            Multiplicity::Sum3(col_a, col_b, col_c) => (0..trace_len)
+                .map(|row| {
+                    &main_segment_cols[*col_a][row]
+                        + &main_segment_cols[*col_b][row]
+                        + &main_segment_cols[*col_c][row]
+                })
                 .collect(),
             Multiplicity::Linear(terms) => (0..trace_len)
                 .map(|row| {
@@ -1636,6 +1832,15 @@ fn compute_multiplicity_from_step<A: IsSubFieldOf<B>, B: IsField>(
         Multiplicity::Negated(col) => {
             FieldElement::<A>::one() - step.get_main_evaluation_element(0, *col)
         }
+        Multiplicity::Diff(col_a, col_b) => {
+            step.get_main_evaluation_element(0, *col_a)
+                - step.get_main_evaluation_element(0, *col_b)
+        }
+        Multiplicity::Sum3(col_a, col_b, col_c) => {
+            step.get_main_evaluation_element(0, *col_a)
+                + step.get_main_evaluation_element(0, *col_b)
+                + step.get_main_evaluation_element(0, *col_c)
+        }
         Multiplicity::Linear(terms) => {
             let mut result = FieldElement::<A>::zero();
             for term in terms {
@@ -1673,18 +1878,12 @@ fn compute_fingerprint_from_step<A: IsSubFieldOf<B>, B: IsField>(
     z: &FieldElement<B>,
     alpha_powers: &[FieldElement<B>],
 ) -> FieldElement<B> {
-    let bus_id_ext: FieldElement<B> = FieldElement::from(interaction.bus_id);
-    let mut linear_combination = &bus_id_ext * &alpha_powers[0];
+    let bus_id_f = FieldElement::<A>::from(interaction.bus_id);
+    let mut linear_combination = &bus_id_f * &alpha_powers[0];
     let mut alpha_idx = 1;
     for bv in &interaction.values {
-        let combined: Vec<FieldElement<A>> =
-            bv.combine_from(|col| step.get_main_evaluation_element(0, col).clone());
-        for v in combined {
-            linear_combination += v * &alpha_powers[alpha_idx];
-            alpha_idx += 1;
-        }
+        alpha_idx += bv.accumulate_fingerprint_step(step, alpha_powers, alpha_idx, &mut linear_combination);
     }
-
     z - &linear_combination
 }
 
