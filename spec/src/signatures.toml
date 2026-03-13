@@ -180,14 +180,7 @@ input = ["B20"]
 tag = "HWSL"
 kind = "interaction"
 input = ["Half", "B4"]
-output = "Half"
-
-# HWSLC[res; X, shift]
-[[signatures]]
-tag = "HWSLC"
-kind = "interaction"
-input = ["Half", "B4"]
-output = "Half"
+output = ["Half", 2]
 
 # The actual memory tokens, see MEMW and PAGE
 [[signatures]]
