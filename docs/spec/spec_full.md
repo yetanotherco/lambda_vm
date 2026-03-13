@@ -667,15 +667,15 @@ In the following, we cover how these two phases were designed to complement one 
 
 ## First phase
 
-We zoom in on the first step. Here, we make use of the two lookup operations - ``HWSL[x: Half, y: B4]` := (`x` `<<` `y`) mod 2^16` (short for "HalfWord Shift Left"), and - ``HWSLC[x: Half, y: B4]` := `x` `>>` (16-`y`)` (short for "HalfWord Shift Left's Carry") Note here that one can use these two lookups to compute `out: Half[4] := in << y` as: $
+We zoom in on the first step. Here, we make use of the lookup operation `HWSL` (short for "HalfWord Shift Left"): ` `HWSL[x: Half, y: B4]` := [(`x` `<<` `y`) mod 2^16, `x` `>>` (16 - `y`)]. ` One can use this to compute `out: Half[4] := in << y` as: $
 
-$ as long as ``y` < 16`. Observing that ``HWSL[x,` 16-`y]` = (`x` `<<` (16-`y`)) mod 2^16`, and ``HWSLC[x,` 16-`y]` = `x` `>>` `y`` for ``y` in [1, 15]`, one can also use these lookups to compute `out := in >> y` as $
+$ as long as ``y` < 16`. Observing that ``HWSL[x,` 16-`y]`_0 = (`x` `<<` (16-`y`)) mod 2^16`, and ``HWSL[x,` 16-`y]`_1 = `x` `>>` `y`` for ``y` in [1, 15]`, one can also use it to compute `out := in >> y` as $
 
 $ as long as `0 < `y` < 16`.
 
 Observe now that the values being looked up are (almost) independent from the direction of the shift: only the shift-amount varies slightly. When we now define $
 
-(16-`shift`) mod 16 & "when shifting right" ), $ it only takes some rearranging and combining of the values ``X[`i`] := HWSL[in[`i`], bit_shift]`` and ``Y[`i`] := HWSLC[in[`i`], bit_shift]`` to form the limbs of ``in <</>> shift` mod 16`. In the remaining case that ``right` = 1` and ``shift` = 0 mod 16`, the limbs of ``in <</>> shift` mod 16` simply match those of `in`.
+(16-`shift`) mod 16 & "when shifting right" ), $ it only takes some rearranging and combining of the values ``X[`i`] := HWSL[in[`i`], bit_shift]`_0` and ``Y[`i`] := HWSL[in[`i`], bit_shift]`_1` to form the limbs of ``in <</>> shift` mod 16`. In the remaining case that ``right` = 1` and ``shift` = 0 mod 16`, the limbs of ``in <</>> shift` mod 16` simply match those of `in`.
 
 ## Second phase
 
@@ -692,7 +692,7 @@ Lastly, we discuss the case of performing the _arithmetic_ right shift. Here, `e
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
 | `SHIFT-C1` | `AND_BYTE[bit_shift; shift, 15]` | left |
-| `SHIFT-C2` | `AND_BYTE[bit_shift; 2^8 - shift, 15]` | right |
+| `SHIFT-C2` | `AND_BYTE[bit_shift; 2^8 - 16 * zbs - shift, 15]` | right |
 | `SHIFT-C3` | `ZERO[zbs; bit_shift]` | μ |
 
 Next, we shift the limbs of `in` left and right by the appropriate amount, storing the results in `X` and `Y` respectively. When `zbs = 1`, the output cannot be used to compose ``in >>/>>> shift` mod 16`. To resolve this, we override `Y[i] := in[i]` and `X[i] := 0` in this case.
@@ -701,15 +701,14 @@ The case of `left`-shifting and ``bit_shift` = 0` will be used for padding rows.
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `SHIFT-C4.i` | i ∈ [0, 3] | `HWSL[X[i]; in[i], bit_shift]` | 1 - zbs |
+| `SHIFT-C4.i` | i ∈ [0, 3] | `HWSL[['arr', ['idx', 'X', 'i'], ['idx', 'Y', 'i']]; in[i], bit_shift]` | 1 - zbs |
 | `SHIFT-C5.i` | i ∈ [0, 3] | `zbs` => `X[i]` = `in[i]` dot `left` |  |
 | | | _polynomial:_ `zbs * (X[i] - in[i] * left) = 0` | |
-| `SHIFT-C6` |  | `HWSL[X[4]; extension, bit_shift]` | 1 - zbs |
-| `SHIFT-C7` |  | `zbs` => `X[4]` = 0 |  |
-| | | _polynomial:_ `zbs * X[4] = 0` | |
-| `SHIFT-C8.i` | i ∈ [0, 3] | `HWSLC[Y[i]; in[i], bit_shift]` | 1 - zbs |
-| `SHIFT-C9.i` | i ∈ [0, 3] | `zbs` => `Y[i]` = `in[i]` dot `right` |  |
+| `SHIFT-C6.i` | i ∈ [0, 3] | `zbs` => `Y[i]` = `in[i]` dot `right` |  |
 | | | _polynomial:_ `zbs * (Y[i] - in[i] * right) = 0` | |
+| `SHIFT-C7` |  | `HWSL[['arr', ['idx', 'X', 4], ['-', 'extension', ['idx', 'X', 4]]]; extension, bit_shift]` | 1 - zbs |
+| `SHIFT-C8` |  | `zbs` => `X[4]` = 0 |  |
+| | | _polynomial:_ `zbs * X[4] = 0` | |
 
 ## Full-limb shifting
 
@@ -719,21 +718,21 @@ Hereafter, one must only check that `out` is the proper cast of `shifted` into a
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `SHIFT-C10.i` | i ∈ [0, 3] | `IS_BIT<limb_shift[i]>` |  |
-| `SHIFT-C11` |  | `AND_BYTE[(1 - limb_shift[0]) + 15 * limb_shift[1] + 31 * limb_shift[2] + 47 * limb_shift[3]; shift, 48 - 32 * word_instr]` | μ |
-| `SHIFT-C12.i` | i ∈ [0, 1] | `out[:2]` = `shifted[:4]` |  |
+| `SHIFT-C9.i` | i ∈ [0, 3] | `IS_BIT<limb_shift[i]>` |  |
+| `SHIFT-C10` |  | `AND_BYTE[(1 - limb_shift[0]) + 15 * limb_shift[1] + 31 * limb_shift[2] + 47 * limb_shift[3]; shift, 48 - 32 * word_instr]` | μ |
+| `SHIFT-C11.i` | i ∈ [0, 1] | `out[:2]` = `shifted[:4]` |  |
 | | | _polynomial:_ `out[i] - (shifted::DWordWL)[i] = 0` | |
 
 ## Miscellaneous
 
 | Tag | Description |
 |-----|-------------|
-| `SHIFT-C13` | `direction` => `μ` = 1 |
+| `SHIFT-C12` | `direction` => `μ` = 1 |
 | | _polynomial:_ `direction * (1 - μ) = 0` |
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `SHIFT-C14` | `MSB16[is_negative; in[3]]` | signed |
+| `SHIFT-C13` | `MSB16[is_negative; in[3]]` | signed |
 
 *Note*: `is_negative` is not used when `signed = 0`. As such, there is no problem with it being unconstrained in this case.
 
@@ -743,7 +742,7 @@ This chip adds the following interaction to the lookup.
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `SHIFT-C15` | `SHIFT[out; in, shift, direction, signed, word_instr]` | -μ |
+| `SHIFT-C14` | `SHIFT[out; in, shift, direction, signed, word_instr]` | -μ |
 
 = Padding
 
@@ -776,18 +775,25 @@ The table can be padded to the next power of two with the following value assign
 | `zbs` | `Bit` | Whether `bit_shift` is zero (1) or not (0). |
 | `X` | `Half[5]` | scratch variable. |
 | `Y` | `Half[4]` | scratch variable. |
-| `limb_shift` | `Bit[4]` | One-hot vector indicating whether $floor.l `shift` / 16 floor.r equiv i mod s$, where $s = 2$ when $`word_instr` = 1$ and $4$ otherwise. |
+| `limb_shift_raw` | `Bit[3]` | One-hot vector indicating whether $floor.l `shift` / 16 floor.r equiv i mod s$, where $s = 2$ when $`word_instr` = 1$ and $4$ otherwise. These columns store the first 3 values, and the 4th is derived from the one-hot property. |
 
 ### Virtual
 
 | Name | Type | Description |
 |------|------|-------------|
+| `limb_shift` | `Bit[4]` |  |
 | `extension` | `Half` | sign extension of `in`. |
 | `left` | `Bit` | Whether to perform a left-shift. |
 | `right` | `Bit` | Whether to perform a right-shift. |
 | `intra_limb_left` | `DWordHL` | `in << (shift % 16)` if `left` |
 | `intra_limb_right` | `DWordHL` | `in >>> (shift % 16)` if `right` and `signed`;\ `in >> (shift % 16)` if `right` and `!signed` |
 | `shifted` | `DWordHL` | $`in <</>>/>>>` (`shift` mod 32 dot (2 - `word_instr`))$ |
+
+**Definition of `limb_shift`:**
+```
+limb_shift (when iter=[0, 2]) := limb_shift_raw[i]
+limb_shift (when iter=3) := 1 - Σ_j = 0^2 limb_shift_raw[j]
+```
 
 **Definition of `extension`:**
 ```
@@ -817,7 +823,7 @@ intra_limb_right := Y[i] + X[i + 1]
 
 **Definition of `shifted`:**
 ```
-shifted := left * Σ_j = 0^i limb_shift[j] * intra_limb_left[i - j] + right * (Σ_j = 0^3 - i limb_shift[j] * intra_limb_right[i + j] + extension * Σ_j = 3 - i^3 limb_shift[j])
+shifted := left * Σ_j = 0^i limb_shift[j] * intra_limb_left[i - j] + right * (Σ_j = 0^3 - i limb_shift[j] * intra_limb_right[i + j] + extension * Σ_j = 4 - i^3 limb_shift[j])
 ```
 
 ### Multiplicity
@@ -946,55 +952,54 @@ Our assumptions do not explicitly cover any range checks for the `is_register` a
 
 = Constraints
 
+We can compute the addresses for the later bytes based on a single bit each, indicating whether adding `i` to `base_address` overflows the lower limb. We can safely assume that additions for which this bit is not correctly set will have either an overflow on the upper or lower word, and hence not match any existing memory tokens, which are only initialized for correctly formatted and range-checked doublewords (see [memory]).
+
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
 | `MEMW-C1` |  | `IS_BIT<μ_sum>` |  |
 | `MEMW-C2` |  | `w2` => `μ_sum` |  |
 | | | _polynomial:_ `w2 * (1 - μ_sum) = 0` | |
-| `MEMW-C3` |  | w2 ⇒ `ADD<address_add[0]::DWordWL; base_address, 1::DWordWL>` |  |
-| `MEMW-C4.i` | i ∈ [1, 2] | w4 ⇒ `ADD<address_add[i]::DWordWL; base_address, (i + 1)::DWordWL>` |  |
-| `MEMW-C5.i` | i ∈ [3, 6] | write8 ⇒ `ADD<address_add[i]::DWordWL; base_address, (i + 1)::DWordWL>` |  |
-| `MEMW-C6.i` | i ∈ [0, 0], j ∈ [0, 3] | `IS_HALF[address_add[i][j]]` | w2 |
-| `MEMW-C7.i` | i ∈ [1, 2], j ∈ [0, 3] | `IS_HALF[address_add[i][j]]` | w4 |
-| `MEMW-C8.i` | i ∈ [3, 6], j ∈ [0, 3] | `IS_HALF[address_add[i][j]]` | write8 |
-| `MEMW-C9` |  | `LT[1; old_timestamp[0], timestamp, 0]` | μ_sum |
-| `MEMW-C10` |  | `LT[1; old_timestamp[1], timestamp, 0]` | w2 |
-| `MEMW-C11.i` | i ∈ [2, 3] | `LT[1; old_timestamp[i], timestamp, 0]` | w4 |
-| `MEMW-C12.i` | i ∈ [4, 7] | `LT[1; old_timestamp[i], timestamp, 0]` | write8 |
+| `MEMW-C3.i` | i ∈ [0, 6] | `IS_BIT<add_limb_overflow[i]>` |  |
+| `MEMW-C4` |  | `LT[1; old_timestamp[0], timestamp, 0]` | μ_sum |
+| `MEMW-C5` |  | `LT[1; old_timestamp[1], timestamp, 0]` | w2 |
+| `MEMW-C6.i` | i ∈ [2, 3] | `LT[1; old_timestamp[i], timestamp, 0]` | w4 |
+| `MEMW-C7.i` | i ∈ [4, 7] | `LT[1; old_timestamp[i], timestamp, 0]` | write8 |
 
 As long as `timestamp` is properly range-checked, the presence of `old_timestamp` in the memory argument automatically ensures appropriate range checking (as long as no external entities provide negative multiplicities without range checking the timestamp). This ensures the assumptions for `LT` are satisfied.
 
-We additionally check that the address does not overflow for more significant bytes of the access.
-
-| Tag | Description | Multiplicity |
-|-----|-------------|--------------|
-| `MEMW-CR13` | `LT[1; base_address, address_add[0]::DWordWL, 0]` | write2 |
-| `MEMW-CR14` | `LT[1; base_address, address_add[2]::DWordWL, 0]` | write4 |
-| `MEMW-CR15` | `LT[1; base_address, address_add[6]::DWordWL, 0]` | write8 |
+There is no need to check that the address does not overflow, as our address calculations are not performed modulo `2^64` here, and any overflow will result in an address without matching initialization.
 
 The chip adds the following tuples to the lookup argument, to effectuate that part of the memory argument.
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `MEMW-CM16` |  | `memory[is_register, base_address, old_timestamp[0], old[0]]` | μ_sum |
-| `MEMW-CM17` |  | `memory[is_register, base_address, timestamp, value[0]]` | -μ_sum |
-| `MEMW-CM18` |  | `memory[is_register, address_add[0]::DWordWL, old_timestamp[1], old[1]]` | w2 |
-| `MEMW-CM19` |  | `memory[is_register, address_add[0]::DWordWL, timestamp, value[1]]` | -w2 |
-| `MEMW-CM20.i` | i ∈ [2, 3] | `memory[is_register, address_add[i - 1]::DWordWL, old_timestamp[i], old[i]]` | w4 |
-| `MEMW-CM21.i` | i ∈ [2, 3] | `memory[is_register, address_add[i - 1]::DWordWL, timestamp, value[i]]` | -w4 |
-| `MEMW-CM22.i` | i ∈ [4, 7] | `memory[is_register, address_add[i - 1]::DWordWL, old_timestamp[i], old[i]]` | write8 |
-| `MEMW-CM23.i` | i ∈ [4, 7] | `memory[is_register, address_add[i - 1]::DWordWL, timestamp, value[i]]` | -write8 |
+| `MEMW-CM8` |  | `memory[is_register, base_address, old_timestamp[0], old[0]]` | μ_sum |
+| `MEMW-CM9` |  | `memory[is_register, base_address, timestamp, value[0]]` | -μ_sum |
+| `MEMW-CM10` |  | `memory[is_register, address_add[0], old_timestamp[1], old[1]]` | w2 |
+| `MEMW-CM11` |  | `memory[is_register, address_add[0], timestamp, value[1]]` | -w2 |
+| `MEMW-CM12.i` | i ∈ [2, 3] | `memory[is_register, address_add[i - 1], old_timestamp[i], old[i]]` | w4 |
+| `MEMW-CM13.i` | i ∈ [2, 3] | `memory[is_register, address_add[i - 1], timestamp, value[i]]` | -w4 |
+| `MEMW-CM14.i` | i ∈ [4, 7] | `memory[is_register, address_add[i - 1], old_timestamp[i], old[i]]` | write8 |
+| `MEMW-CM15.i` | i ∈ [4, 7] | `memory[is_register, address_add[i - 1], timestamp, value[i]]` | -write8 |
 
 This chip contributes the following to the lookup argument.
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `MEMW-CO24` | `MEMW[old; is_register, base_address, value, timestamp, write2, write4, write8]` | μ_read |
-| `MEMW-CO25` | `MEMW[is_register, base_address, value, timestamp, write2, write4, write8]` | μ_write |
+| `MEMW-CO16` | `MEMW[old; is_register, base_address, value, timestamp, write2, write4, write8]` | μ_read |
+| `MEMW-CO17` | `MEMW[is_register, base_address, value, timestamp, write2, write4, write8]` | μ_write |
+
+= Read-size aligned fast path
+
+When a memory access happens at an address with proper alignment (that is, enough trailing zeros) for its access size, and all accessed elements were last accessed at the same timestamp, we can instead use the  chip to save on total column count. The saving comes from only requiring a single old timestamp to be stored, as well as being able to guarantee that all values of `add_limb_overflow` would be zero. A minor extra cost is introduced in the form of a check that the alignment is indeed correct, and the corresponding decomposition of the `base_address`.
+
+Further logic remains essentially the same, so we briefly present the relevant tables for this chip.
+
+The  chip only needs  variables, expressed through  columns.
 
 = Future optimization ideas
 
-- Fast path for aligned memory access where all bytes have the same old timestamp - MEMB chip that deals does a one-byte write to remove old_timestamp from here (uncertain tradeoffs) - Compute `base_address[1] + 1` once and have high words of `address_add` as Words - Improve overflow trapping somehow so we don't need `LT` (could tie into previous one by checking carry bit of the +1) - Adding `μ_sum`/`w2`/`w4`/`write8` multiplicities to the `IS_HALF` lookups may make some GKR things faster if there are known zeroes.
+- `MEMB` chip that does a one-byte write to remove old_timestamp from here (uncertain tradeoffs) - Additional fast path for registers? (Always guaranteed same timestamp, alignment could be an assumption, always only two values) - Adding `μ_sum`/`w2`/`w4`/`write8` multiplicities to the `IS_HALF` lookups may make some GKR things faster if there are known zeroes.
 
 ## Columns
 
@@ -1020,7 +1025,7 @@ This chip contributes the following to the lookup argument.
 
 | Name | Type | Description |
 |------|------|-------------|
-| `address_add` | `DWordHL[7]` | `address_add[i] = base_address + i + 1` |
+| `add_limb_overflow` | `Bit[7]` | Whether adding `i` to `base_address[0]` as a field element exceeds $2^32$ |
 | `old_timestamp` | `DWordWL[8]` | The timestamp at which the address was last accessed |
 
 ### Virtual
@@ -1029,6 +1034,7 @@ This chip contributes the following to the lookup argument.
 |------|------|-------------|
 | `w2` | `Bit` | writing at least 2 bytes |
 | `w4` | `Bit` | writing at least 4 bytes |
+| `address_add` | `DWordWL[7]` | `address_add[i] = base_address + i + 1` |
 | `μ_sum` | `Bit` |  |
 
 **Definition of `w2`:**
@@ -1039,6 +1045,11 @@ w2 := write2 + write4 + write8
 **Definition of `w4`:**
 ```
 w4 := write4 + write8
+```
+
+**Definition of `address_add`:**
+```
+address_add := ['arr', ['+', ['idx', 'base_address', 0], 'i', 1, ['*', ['-', ['^', 2, 32]], ['idx', 'add_limb_overflow', 'i']]], ['+', ['idx', 'base_address', 1], ['idx', 'add_limb_overflow', 'i']]]
 ```
 
 **Definition of `μ_sum`:**
@@ -1793,7 +1804,7 @@ The  chip is comprised of  variables that are expressed using  columns. Of these
 
 = Lookup This chip adds the following interactions to the lookup:
 
-= Areas of Optimization The following ideas may prove to be optimizations for the  chip: + Extend `IS_BYTE[X]` to `ARE_BYTES[X, Y]`, such that two bytes are range checked at once. When only a single check is required, one can still execute `IS_BYTE[X] := ARE_BYTES[X, 0]`. + Drop `MSB8` column, and instead define the `MSB8` lookup as `MSB8<X> := MSB16[256X]`. Note: currently, `MSB8` also implicity range checks the input `X` (the lookup fails if `X` is not a `Byte`). This optimization should only be executed when all chips leveraging `MSB8` do _not_ need this implicit range check. + Place the 16-bit (`AND`, `OR`, `XOR`, `MSB16`, etc.) and 20-bit (`HWSL`, `HWSLC`, `IS_B20`, `ZERO`) lookups in separate tables. + Combine `HWSL` and `HWSLC` into a single lookup (see also \).
+= Areas of Optimization The following ideas may prove to be optimizations for the  chip: + Extend `IS_BYTE[X]` to `ARE_BYTES[X, Y]`, such that two bytes are range checked at once. When only a single check is required, one can still execute `IS_BYTE[X] := ARE_BYTES[X, 0]`. + Drop `MSB8` column, and instead define the `MSB8` lookup as `MSB8<X> := MSB16[256X]`. Note: currently, `MSB8` also implicity range checks the input `X` (the lookup fails if `X` is not a `Byte`). This optimization should only be executed when all chips leveraging `MSB8` do _not_ need this implicit range check. + Place the 16-bit (`AND`, `OR`, `XOR`, `MSB16`, etc.) and 20-bit (`HWSL`, `IS_B20`, `ZERO`) lookups in separate tables.
 
 ## Columns
 
@@ -1832,7 +1843,6 @@ The  chip is comprised of  variables that are expressed using  columns. Of these
 | `μ_IS_HALF` | `BaseField` |  |
 | `μ_IS_B20` | `BaseField` |  |
 | `μ_HWSL` | `BaseField` |  |
-| `μ_HWSLC` | `BaseField` |  |
 
 ## Constraints
 
@@ -1849,5 +1859,4 @@ The  chip is comprised of  variables that are expressed using  columns. Of these
 | `BITWISE-C7` | `IS_BYTE[X]` | -μ_IS_BYTE |
 | `BITWISE-C8` | `IS_HALF[X + 256 * Y]` | -μ_IS_HALF |
 | `BITWISE-C9` | `IS_B20[X + 256 * Y + 65536 * Z]` | -μ_IS_B20 |
-| `BITWISE-C10` | `HWSL[SLL; X + 256 * Y, Z]` | -μ_HWSL |
-| `BITWISE-C11` | `HWSLC[SLLC; X + 256 * Y, Z]` | -μ_HWSLC |
+| `BITWISE-C10` | `HWSL[['arr', 'SLL', 'SLLC']; X + 256 * Y, Z]` | -μ_HWSL |

@@ -10,7 +10,7 @@ The  chip is comprised of  variables that are expressed using  columns. Of these
 
 = Lookup This chip adds the following interactions to the lookup:
 
-= Areas of Optimization The following ideas may prove to be optimizations for the  chip: + Extend `IS_BYTE[X]` to `ARE_BYTES[X, Y]`, such that two bytes are range checked at once. When only a single check is required, one can still execute `IS_BYTE[X] := ARE_BYTES[X, 0]`. + Drop `MSB8` column, and instead define the `MSB8` lookup as `MSB8<X> := MSB16[256X]`. Note: currently, `MSB8` also implicity range checks the input `X` (the lookup fails if `X` is not a `Byte`). This optimization should only be executed when all chips leveraging `MSB8` do _not_ need this implicit range check. + Place the 16-bit (`AND`, `OR`, `XOR`, `MSB16`, etc.) and 20-bit (`HWSL`, `HWSLC`, `IS_B20`, `ZERO`) lookups in separate tables. + Combine `HWSL` and `HWSLC` into a single lookup (see also \).
+= Areas of Optimization The following ideas may prove to be optimizations for the  chip: + Extend `IS_BYTE[X]` to `ARE_BYTES[X, Y]`, such that two bytes are range checked at once. When only a single check is required, one can still execute `IS_BYTE[X] := ARE_BYTES[X, 0]`. + Drop `MSB8` column, and instead define the `MSB8` lookup as `MSB8<X> := MSB16[256X]`. Note: currently, `MSB8` also implicity range checks the input `X` (the lookup fails if `X` is not a `Byte`). This optimization should only be executed when all chips leveraging `MSB8` do _not_ need this implicit range check. + Place the 16-bit (`AND`, `OR`, `XOR`, `MSB16`, etc.) and 20-bit (`HWSL`, `IS_B20`, `ZERO`) lookups in separate tables.
 
 ## Columns
 
@@ -49,7 +49,6 @@ The  chip is comprised of  variables that are expressed using  columns. Of these
 | `μ_IS_HALF` | `BaseField` |  |
 | `μ_IS_B20` | `BaseField` |  |
 | `μ_HWSL` | `BaseField` |  |
-| `μ_HWSLC` | `BaseField` |  |
 
 ## Constraints
 
@@ -66,5 +65,4 @@ The  chip is comprised of  variables that are expressed using  columns. Of these
 | `BITWISE-C7` | `IS_BYTE[X]` | -μ_IS_BYTE |
 | `BITWISE-C8` | `IS_HALF[X + 256 * Y]` | -μ_IS_HALF |
 | `BITWISE-C9` | `IS_B20[X + 256 * Y + 65536 * Z]` | -μ_IS_B20 |
-| `BITWISE-C10` | `HWSL[SLL; X + 256 * Y, Z]` | -μ_HWSL |
-| `BITWISE-C11` | `HWSLC[SLLC; X + 256 * Y, Z]` | -μ_HWSLC |
+| `BITWISE-C10` | `HWSL[['arr', 'SLL', 'SLLC']; X + 256 * Y, Z]` | -μ_HWSL |

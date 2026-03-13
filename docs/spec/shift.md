@@ -20,15 +20,15 @@ In the following, we cover how these two phases were designed to complement one 
 
 ## First phase
 
-We zoom in on the first step. Here, we make use of the two lookup operations - ``HWSL[x: Half, y: B4]` := (`x` `<<` `y`) mod 2^16` (short for "HalfWord Shift Left"), and - ``HWSLC[x: Half, y: B4]` := `x` `>>` (16-`y`)` (short for "HalfWord Shift Left's Carry") Note here that one can use these two lookups to compute `out: Half[4] := in << y` as: $
+We zoom in on the first step. Here, we make use of the lookup operation `HWSL` (short for "HalfWord Shift Left"): ` `HWSL[x: Half, y: B4]` := [(`x` `<<` `y`) mod 2^16, `x` `>>` (16 - `y`)]. ` One can use this to compute `out: Half[4] := in << y` as: $
 
-$ as long as ``y` < 16`. Observing that ``HWSL[x,` 16-`y]` = (`x` `<<` (16-`y`)) mod 2^16`, and ``HWSLC[x,` 16-`y]` = `x` `>>` `y`` for ``y` in [1, 15]`, one can also use these lookups to compute `out := in >> y` as $
+$ as long as ``y` < 16`. Observing that ``HWSL[x,` 16-`y]`_0 = (`x` `<<` (16-`y`)) mod 2^16`, and ``HWSL[x,` 16-`y]`_1 = `x` `>>` `y`` for ``y` in [1, 15]`, one can also use it to compute `out := in >> y` as $
 
 $ as long as `0 < `y` < 16`.
 
 Observe now that the values being looked up are (almost) independent from the direction of the shift: only the shift-amount varies slightly. When we now define $
 
-(16-`shift`) mod 16 & "when shifting right" ), $ it only takes some rearranging and combining of the values ``X[`i`] := HWSL[in[`i`], bit_shift]`` and ``Y[`i`] := HWSLC[in[`i`], bit_shift]`` to form the limbs of ``in <</>> shift` mod 16`. In the remaining case that ``right` = 1` and ``shift` = 0 mod 16`, the limbs of ``in <</>> shift` mod 16` simply match those of `in`.
+(16-`shift`) mod 16 & "when shifting right" ), $ it only takes some rearranging and combining of the values ``X[`i`] := HWSL[in[`i`], bit_shift]`_0` and ``Y[`i`] := HWSL[in[`i`], bit_shift]`_1` to form the limbs of ``in <</>> shift` mod 16`. In the remaining case that ``right` = 1` and ``shift` = 0 mod 16`, the limbs of ``in <</>> shift` mod 16` simply match those of `in`.
 
 ## Second phase
 
@@ -45,7 +45,7 @@ Lastly, we discuss the case of performing the _arithmetic_ right shift. Here, `e
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
 | `SHIFT-C1` | `AND_BYTE[bit_shift; shift, 15]` | left |
-| `SHIFT-C2` | `AND_BYTE[bit_shift; 2^8 - shift, 15]` | right |
+| `SHIFT-C2` | `AND_BYTE[bit_shift; 2^8 - 16 * zbs - shift, 15]` | right |
 | `SHIFT-C3` | `ZERO[zbs; bit_shift]` | μ |
 
 Next, we shift the limbs of `in` left and right by the appropriate amount, storing the results in `X` and `Y` respectively. When `zbs = 1`, the output cannot be used to compose ``in >>/>>> shift` mod 16`. To resolve this, we override `Y[i] := in[i]` and `X[i] := 0` in this case.
@@ -54,15 +54,14 @@ The case of `left`-shifting and ``bit_shift` = 0` will be used for padding rows.
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `SHIFT-C4.i` | i ∈ [0, 3] | `HWSL[X[i]; in[i], bit_shift]` | 1 - zbs |
+| `SHIFT-C4.i` | i ∈ [0, 3] | `HWSL[['arr', ['idx', 'X', 'i'], ['idx', 'Y', 'i']]; in[i], bit_shift]` | 1 - zbs |
 | `SHIFT-C5.i` | i ∈ [0, 3] | `zbs` => `X[i]` = `in[i]` dot `left` |  |
 | | | _polynomial:_ `zbs * (X[i] - in[i] * left) = 0` | |
-| `SHIFT-C6` |  | `HWSL[X[4]; extension, bit_shift]` | 1 - zbs |
-| `SHIFT-C7` |  | `zbs` => `X[4]` = 0 |  |
-| | | _polynomial:_ `zbs * X[4] = 0` | |
-| `SHIFT-C8.i` | i ∈ [0, 3] | `HWSLC[Y[i]; in[i], bit_shift]` | 1 - zbs |
-| `SHIFT-C9.i` | i ∈ [0, 3] | `zbs` => `Y[i]` = `in[i]` dot `right` |  |
+| `SHIFT-C6.i` | i ∈ [0, 3] | `zbs` => `Y[i]` = `in[i]` dot `right` |  |
 | | | _polynomial:_ `zbs * (Y[i] - in[i] * right) = 0` | |
+| `SHIFT-C7` |  | `HWSL[['arr', ['idx', 'X', 4], ['-', 'extension', ['idx', 'X', 4]]]; extension, bit_shift]` | 1 - zbs |
+| `SHIFT-C8` |  | `zbs` => `X[4]` = 0 |  |
+| | | _polynomial:_ `zbs * X[4] = 0` | |
 
 ## Full-limb shifting
 
@@ -72,21 +71,21 @@ Hereafter, one must only check that `out` is the proper cast of `shifted` into a
 
 | Tag | Range | Description | Multiplicity |
 |-----|-------|-------------|--------------|
-| `SHIFT-C10.i` | i ∈ [0, 3] | `IS_BIT<limb_shift[i]>` |  |
-| `SHIFT-C11` |  | `AND_BYTE[(1 - limb_shift[0]) + 15 * limb_shift[1] + 31 * limb_shift[2] + 47 * limb_shift[3]; shift, 48 - 32 * word_instr]` | μ |
-| `SHIFT-C12.i` | i ∈ [0, 1] | `out[:2]` = `shifted[:4]` |  |
+| `SHIFT-C9.i` | i ∈ [0, 3] | `IS_BIT<limb_shift[i]>` |  |
+| `SHIFT-C10` |  | `AND_BYTE[(1 - limb_shift[0]) + 15 * limb_shift[1] + 31 * limb_shift[2] + 47 * limb_shift[3]; shift, 48 - 32 * word_instr]` | μ |
+| `SHIFT-C11.i` | i ∈ [0, 1] | `out[:2]` = `shifted[:4]` |  |
 | | | _polynomial:_ `out[i] - (shifted::DWordWL)[i] = 0` | |
 
 ## Miscellaneous
 
 | Tag | Description |
 |-----|-------------|
-| `SHIFT-C13` | `direction` => `μ` = 1 |
+| `SHIFT-C12` | `direction` => `μ` = 1 |
 | | _polynomial:_ `direction * (1 - μ) = 0` |
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `SHIFT-C14` | `MSB16[is_negative; in[3]]` | signed |
+| `SHIFT-C13` | `MSB16[is_negative; in[3]]` | signed |
 
 *Note*: `is_negative` is not used when `signed = 0`. As such, there is no problem with it being unconstrained in this case.
 
@@ -96,7 +95,7 @@ This chip adds the following interaction to the lookup.
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `SHIFT-C15` | `SHIFT[out; in, shift, direction, signed, word_instr]` | -μ |
+| `SHIFT-C14` | `SHIFT[out; in, shift, direction, signed, word_instr]` | -μ |
 
 = Padding
 
@@ -129,18 +128,25 @@ The table can be padded to the next power of two with the following value assign
 | `zbs` | `Bit` | Whether `bit_shift` is zero (1) or not (0). |
 | `X` | `Half[5]` | scratch variable. |
 | `Y` | `Half[4]` | scratch variable. |
-| `limb_shift` | `Bit[4]` | One-hot vector indicating whether $floor.l `shift` / 16 floor.r equiv i mod s$, where $s = 2$ when $`word_instr` = 1$ and $4$ otherwise. |
+| `limb_shift_raw` | `Bit[3]` | One-hot vector indicating whether $floor.l `shift` / 16 floor.r equiv i mod s$, where $s = 2$ when $`word_instr` = 1$ and $4$ otherwise. These columns store the first 3 values, and the 4th is derived from the one-hot property. |
 
 ### Virtual
 
 | Name | Type | Description |
 |------|------|-------------|
+| `limb_shift` | `Bit[4]` |  |
 | `extension` | `Half` | sign extension of `in`. |
 | `left` | `Bit` | Whether to perform a left-shift. |
 | `right` | `Bit` | Whether to perform a right-shift. |
 | `intra_limb_left` | `DWordHL` | `in << (shift % 16)` if `left` |
 | `intra_limb_right` | `DWordHL` | `in >>> (shift % 16)` if `right` and `signed`;\ `in >> (shift % 16)` if `right` and `!signed` |
 | `shifted` | `DWordHL` | $`in <</>>/>>>` (`shift` mod 32 dot (2 - `word_instr`))$ |
+
+**Definition of `limb_shift`:**
+```
+limb_shift (when iter=[0, 2]) := limb_shift_raw[i]
+limb_shift (when iter=3) := 1 - Σ_j = 0^2 limb_shift_raw[j]
+```
 
 **Definition of `extension`:**
 ```
@@ -170,7 +176,7 @@ intra_limb_right := Y[i] + X[i + 1]
 
 **Definition of `shifted`:**
 ```
-shifted := left * Σ_j = 0^i limb_shift[j] * intra_limb_left[i - j] + right * (Σ_j = 0^3 - i limb_shift[j] * intra_limb_right[i + j] + extension * Σ_j = 3 - i^3 limb_shift[j])
+shifted := left * Σ_j = 0^i limb_shift[j] * intra_limb_left[i - j] + right * (Σ_j = 0^3 - i limb_shift[j] * intra_limb_right[i + j] + extension * Σ_j = 4 - i^3 limb_shift[j])
 ```
 
 ### Multiplicity
