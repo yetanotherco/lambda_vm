@@ -10,9 +10,9 @@
 //! ```text
 //! PHASE 0: ELF → DECODE, MEMORY_INIT (preprocessed tables)
 //! PHASE 1: Logs → CPU ops
-//! PHASE 2: CPU ops → MEMW, LOAD, LT, Bitwise (with state tracking for MEMW/LOAD)
-//! PHASE 3: MEMW → LT ops (timestamp ordering, overflow checks)
-//! PHASE 4: LT, MEMW → Bitwise lookups
+//! PHASE 2: CPU ops → MEMW, MEMW_A, LOAD, LT, Bitwise (with state tracking for MEMW/LOAD)
+//! PHASE 3: MEMW/MEMW_A → LT ops (timestamp ordering)
+//! PHASE 4: LT, MEMW_A → Bitwise lookups
 //! PHASE 5: Generate all traces
 //! ```
 //!
@@ -43,6 +43,7 @@ use super::halt;
 use super::load::{self, LoadOperation};
 use super::lt::{self, LtOperation};
 use super::memw::{self, MemwOperation};
+use super::memw_aligned;
 use super::mul::{self, MulOperation};
 use super::page::{self, FinalByteState, FinalStateMap, PageConfig};
 use super::register::{self, FinalRegisterStateMap, FinalRegisterWordState};
@@ -692,11 +693,10 @@ fn collect_halt_ops(register_state: &mut RegisterState) -> Vec<MemwOperation> {
 // Phase 3: MEMW → LT
 // =============================================================================
 
-/// Collects LT operations from MEMW for timestamp ordering and overflow checks.
+/// Collects LT operations from MEMW for timestamp ordering.
 ///
 /// From spec memw.md:
 /// - C7-C10: old_timestamp[i] < timestamp (based on width)
-/// - R1-R3: base_address < base_address + offset (overflow checks)
 ///
 /// Returns: Vec of LT operations
 fn collect_lt_from_memw(memw_ops: &[MemwOperation]) -> Vec<LtOperation> {
@@ -743,25 +743,43 @@ fn collect_lt_from_memw(memw_ops: &[MemwOperation]) -> Vec<LtOperation> {
                 ));
             }
         }
-
-        // R1-R3: Address overflow checks (unconditional per MEMW-CR13/14/15)
-        // If overflow occurs, LT returns lt=0 and the constraint (expecting lt=1)
-        // rejects the proof via value mismatch.
-        if memw_op.width == 2 {
-            let addr_plus_1 = memw_op.base_address.wrapping_add(1);
-            lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_1, false));
-        }
-        if memw_op.width == 4 {
-            let addr_plus_3 = memw_op.base_address.wrapping_add(3);
-            lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_3, false));
-        }
-        if memw_op.width == 8 {
-            let addr_plus_7 = memw_op.base_address.wrapping_add(7);
-            lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_7, false));
-        }
     }
 
     lt_ops
+}
+
+/// Collects LT operations from MEMW_A for timestamp ordering.
+///
+/// Each aligned operation has a single old_timestamp < timestamp check.
+fn collect_lt_from_memw_aligned(memw_aligned_ops: &[MemwOperation]) -> Vec<LtOperation> {
+    memw_aligned_ops
+        .iter()
+        .map(|op| LtOperation::new(op.old_timestamp[0], op.timestamp, false))
+        .collect()
+}
+
+/// Checks whether a MEMW operation qualifies for the aligned fast path (MEMW_A).
+///
+/// An operation is aligned if:
+/// 1. For width > 1: base_address is aligned to width (low bits are zero)
+/// 2. All accessed bytes share the same old_timestamp
+fn is_aligned_op(op: &MemwOperation) -> bool {
+    let low = (op.base_address & 0xFFFF_FFFF) as u32;
+    let width = op.width as u32;
+
+    // Check alignment (trivially true for width=1)
+    if width > 1 && (low & (width - 1)) != 0 {
+        return false;
+    }
+
+    // Check uniform old_timestamp
+    for i in 1..op.width as usize {
+        if op.old_timestamp[i] != op.old_timestamp[0] {
+            return false;
+        }
+    }
+
+    true
 }
 
 // =============================================================================
@@ -1062,25 +1080,45 @@ fn collect_bitwise_from_dvrm(dvrm_ops: &[(DvrmOperation, bool)]) -> Vec<BitwiseO
     bitwise_ops
 }
 
-/// Collects IS_HALFWORD lookups from MEMW address_add columns.
+/// Collects bitwise lookups from MEMW_A operations.
 ///
-/// Returns: Vec of bitwise lookups
-fn collect_bitwise_from_memw(memw_ops: &[MemwOperation]) -> Vec<BitwiseOperation> {
-    let mut bitwise_ops = Vec::with_capacity(memw_ops.len() * 28); // 7 addresses * 4 halfwords
+/// Per operation:
+/// - 1 IS_HALFWORD for base_address_mid
+/// - 1 IS_BYTE for base_address_low[1]
+/// - 1 AND_BYTE for alignment check (low[0] & mask == 0)
+fn collect_bitwise_from_memw_aligned(ops: &[MemwOperation]) -> Vec<BitwiseOperation> {
+    let mut bitwise_ops = Vec::with_capacity(ops.len() * 3);
 
-    for memw_op in memw_ops {
-        for i in 0..7u64 {
-            let addr_add = memw_op.base_address.wrapping_add(i + 1);
-            // Extract 4 halfwords (DWordHL packing)
-            for shift in [0, 16, 32, 48] {
-                let half = ((addr_add >> shift) & 0xFFFF) as u16;
-                bitwise_ops.push(BitwiseOperation::halfword(
-                    BitwiseOperationType::IsHalf,
-                    (half & 0xFF) as u8,
-                    (half >> 8) as u8,
-                ));
-            }
-        }
+    for op in ops {
+        let low_0 = (op.base_address & 0xFF) as u8;
+        let low_1 = ((op.base_address >> 8) & 0xFF) as u8;
+        let mid = ((op.base_address >> 16) & 0xFFFF) as u16;
+        let mask: u8 = match op.width {
+            2 => 1,
+            4 => 3,
+            8 => 7,
+            _ => 0,
+        };
+
+        // IS_HALFWORD[mid]
+        bitwise_ops.push(BitwiseOperation::halfword(
+            BitwiseOperationType::IsHalf,
+            (mid & 0xFF) as u8,
+            (mid >> 8) as u8,
+        ));
+
+        // IS_BYTE[low_1]
+        bitwise_ops.push(BitwiseOperation::single_byte(
+            BitwiseOperationType::IsByte,
+            low_1,
+        ));
+
+        // AND_BYTE[low_0, mask] → expects result 0
+        bitwise_ops.push(BitwiseOperation::byte_op(
+            BitwiseOperationType::AndByte,
+            low_0,
+            mask,
+        ));
     }
 
     bitwise_ops
@@ -1440,6 +1478,9 @@ pub struct Traces {
     /// MEMW memory/register read/write traces (split into chunks of max_rows::MEMW)
     pub memws: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 
+    /// MEMW_A aligned memory/register read/write traces (split into chunks of max_rows::MEMW_A)
+    pub memw_aligneds: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+
     /// LOAD memory load with extension traces (split into chunks of max_rows::LOAD)
     pub loads: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 
@@ -1491,6 +1532,7 @@ impl Traces {
             cpu: self.cpus.len(),
             lt: self.lts.len(),
             memw: self.memws.len(),
+            memw_aligned: self.memw_aligneds.len(),
             load: self.loads.len(),
             mul: self.muls.len(),
             dvrm: self.dvrms.len(),
@@ -1652,6 +1694,10 @@ impl Traces {
         let halt_memw_ops = collect_halt_ops(&mut register_state);
         memw_ops.extend(halt_memw_ops);
 
+        // Route MEMW operations: aligned ops → MEMW_A, rest → MEMW
+        let (memw_aligned_ops, memw_ops): (Vec<_>, Vec<_>) =
+            memw_ops.into_iter().partition(is_aligned_op);
+
         // Collect BRANCH operations from CPU ops where branch_cond = true
         let branch_ops: Vec<BranchOperation> = cpu_ops
             .iter()
@@ -1715,15 +1761,16 @@ impl Traces {
         }
 
         // =====================================================================
-        // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
+        // PHASE 3: MEMW/MEMW_A → LT (timestamp ordering)
         // =====================================================================
         lt_ops.extend(collect_lt_from_memw(&memw_ops));
+        lt_ops.extend(collect_lt_from_memw_aligned(&memw_aligned_ops));
 
         // =====================================================================
         // PHASE 4: All → Bitwise lookups
         // =====================================================================
         bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
-        bitwise_ops.extend(collect_bitwise_from_memw(&memw_ops));
+        bitwise_ops.extend(collect_bitwise_from_memw_aligned(&memw_aligned_ops));
         bitwise_ops.extend(collect_bitwise_from_mul(&mul_ops));
         bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops));
         bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
@@ -1758,6 +1805,11 @@ impl Traces {
 
         let cpus = chunk_and_generate(&cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
         let memws = chunk_and_generate(&memw_ops, max_rows.memw, memw::generate_memw_trace);
+        let memw_aligneds = chunk_and_generate(
+            &memw_aligned_ops,
+            max_rows.memw_aligned,
+            memw_aligned::generate_memw_aligned_trace,
+        );
         let loads = chunk_and_generate(&load_ops, max_rows.load, load::generate_load_trace);
         let lts = chunk_and_generate(&lt_ops, max_rows.lt, lt::generate_lt_trace);
         let shifts = chunk_and_generate(&shift_ops, max_rows.shift, shift::generate_shift_trace);
@@ -1828,6 +1880,7 @@ impl Traces {
             lts,
             shifts,
             memws,
+            memw_aligneds,
             loads,
             decode,
             muls,
@@ -1872,6 +1925,10 @@ impl Traces {
         // Must come before Phase 3 (LT from MEMW) so HALT ops get timestamp checks.
         let halt_memw_ops = collect_halt_ops(&mut register_state);
         memw_ops.extend(halt_memw_ops);
+
+        // Route MEMW operations: aligned ops → MEMW_A, rest → MEMW
+        let (memw_aligned_ops, memw_ops): (Vec<_>, Vec<_>) =
+            memw_ops.into_iter().partition(is_aligned_op);
 
         // Collect MUL operations from CPU ops where op_mul = true
         let mut mul_ops: Vec<(MulOperation, bool)> = cpu_ops
@@ -1936,15 +1993,16 @@ impl Traces {
         }
 
         // =====================================================================
-        // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
+        // PHASE 3: MEMW/MEMW_A → LT (timestamp ordering)
         // =====================================================================
         lt_ops.extend(collect_lt_from_memw(&memw_ops));
+        lt_ops.extend(collect_lt_from_memw_aligned(&memw_aligned_ops));
 
         // =====================================================================
         // PHASE 4: All → Bitwise lookups
         // =====================================================================
         bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
-        bitwise_ops.extend(collect_bitwise_from_memw(&memw_ops));
+        bitwise_ops.extend(collect_bitwise_from_memw_aligned(&memw_aligned_ops));
         bitwise_ops.extend(collect_bitwise_from_mul(&mul_ops));
         bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops));
         bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
@@ -1976,6 +2034,11 @@ impl Traces {
 
         let cpus = chunk_and_generate(&cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
         let memws = chunk_and_generate(&memw_ops, max_rows.memw, memw::generate_memw_trace);
+        let memw_aligneds = chunk_and_generate(
+            &memw_aligned_ops,
+            max_rows.memw_aligned,
+            memw_aligned::generate_memw_aligned_trace,
+        );
         let loads = chunk_and_generate(&load_ops, max_rows.load, load::generate_load_trace);
         let lts = chunk_and_generate(&lt_ops, max_rows.lt, lt::generate_lt_trace);
         let shifts = chunk_and_generate(&shift_ops, max_rows.shift, shift::generate_shift_trace);
@@ -2032,6 +2095,7 @@ impl Traces {
             lts,
             shifts,
             memws,
+            memw_aligneds,
             loads,
             decode,
             muls,
