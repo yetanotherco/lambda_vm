@@ -1996,16 +1996,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // rv1 = value of a7 register (syscall number). For sys_exit, rv1 = 93.
     interactions.push(BusInteraction::sender(
         BusId::Ecall,
-        Multiplicity::Linear(vec![
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::ECALL,
-            },
-            LinearTerm::Column {
-                coefficient: -1,
-                column: cols::ECALL_COMMIT,
-            },
-        ]),
+        Multiplicity::Diff(cols::ECALL, cols::ECALL_COMMIT),
         vec![
             BusValue::Packed {
                 start_column: cols::TIMESTAMP,

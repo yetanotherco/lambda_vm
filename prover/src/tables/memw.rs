@@ -31,7 +31,7 @@
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::TransitionConstraint;
-use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
+use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::table::TableView;
 use stark::trace::TraceTable;
 use stark::traits::TransitionEvaluationContext;
@@ -91,7 +91,7 @@ pub mod cols {
     pub const MU_WRITE: usize = 69;
 
     /// Total number of columns
-    /// Note: w2, w4, μ_sum are now computed inline via Multiplicity::Linear/Sum
+    /// Note: w2, w4, μ_sum are now computed inline via Multiplicity::Sum3/Sum
     pub const NUM_COLUMNS: usize = 70;
 
     /// Helper to get address_add[i] column indices (4 halfwords each)
@@ -330,7 +330,7 @@ pub fn generate_memw_trace(
         // Multiplicity
         data[base + cols::MU_READ] = FE::from(op.is_read as u64);
         data[base + cols::MU_WRITE] = FE::from(!op.is_read as u64);
-        // Note: w2, w4, μ_sum are computed inline via Multiplicity::Linear/Sum
+        // Note: w2, w4, μ_sum are computed inline via Multiplicity::Sum3/Sum
     }
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
@@ -483,20 +483,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // w2 = write2 + write4 + write8
     interactions.push(BusInteraction::sender(
         BusId::Memory,
-        Multiplicity::Linear(vec![
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::WRITE2,
-            },
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::WRITE4,
-            },
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::WRITE8,
-            },
-        ]),
+        Multiplicity::Sum3(cols::WRITE2, cols::WRITE4, cols::WRITE8),
         vec![
             BusValue::Packed {
                 start_column: cols::IS_REGISTER,
@@ -522,20 +509,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // CM19: memory[is_register, address_add[0], timestamp, value[1]] with -w2
     interactions.push(BusInteraction::receiver(
         BusId::Memory,
-        Multiplicity::Linear(vec![
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::WRITE2,
-            },
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::WRITE4,
-            },
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::WRITE8,
-            },
-        ]),
+        Multiplicity::Sum3(cols::WRITE2, cols::WRITE4, cols::WRITE8),
         vec![
             BusValue::Packed {
                 start_column: cols::IS_REGISTER,
@@ -572,16 +546,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         // CM22.i: send old token
         interactions.push(BusInteraction::sender(
             BusId::Memory,
-            Multiplicity::Linear(vec![
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::WRITE4,
-                },
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::WRITE8,
-                },
-            ]),
+            Multiplicity::Sum(cols::WRITE4, cols::WRITE8),
             vec![
                 BusValue::Packed {
                     start_column: cols::IS_REGISTER,
@@ -607,16 +572,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         // CM23.i: receive new token
         interactions.push(BusInteraction::receiver(
             BusId::Memory,
-            Multiplicity::Linear(vec![
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::WRITE4,
-                },
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::WRITE8,
-                },
-            ]),
+            Multiplicity::Sum(cols::WRITE4, cols::WRITE8),
             vec![
                 BusValue::Packed {
                     start_column: cols::IS_REGISTER,
@@ -935,20 +891,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // Constraint 8: LT[1; old_timestamp[1], timestamp] with w2
     interactions.push(BusInteraction::sender(
         BusId::Lt,
-        Multiplicity::Linear(vec![
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::WRITE2,
-            },
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::WRITE4,
-            },
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::WRITE8,
-            },
-        ]),
+        Multiplicity::Sum3(cols::WRITE2, cols::WRITE4, cols::WRITE8),
         vec![
             BusValue::Packed {
                 start_column: cols::old_timestamp(1)[0],
