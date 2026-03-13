@@ -1452,6 +1452,19 @@ pub trait IsStarkProver<
             twiddle_caches.push(twiddles);
         }
 
+        // With disk-spill, move all main trace data from heap to mmap BEFORE
+        // allocating pools. For large programs (64M+ instructions) the total main
+        // trace data can exceed available RAM; spilling early converts it to
+        // demand-paged mmap so the OS can evict pages under memory pressure.
+        // extract_columns_main_into uses get() which reads transparently from mmap.
+        #[cfg(feature = "disk-spill")]
+        for (_, trace, _) in air_trace_pairs.iter_mut() {
+            trace
+                .main_table
+                .spill_to_disk()
+                .map_err(|e| ProvingError::WrongParameter(format!("disk-spill early main: {e}")))?;
+        }
+
         // Allocate K independent LDE column buffer pool sets for parallel table processing.
         let k = table_parallelism().min(num_airs).max(1);
         let mut pool_sets: Vec<PoolSet<Field, FieldExtension>> = (0..k)
