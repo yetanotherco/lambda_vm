@@ -648,10 +648,14 @@ impl CpuOperation {
         } else {
             (0, 0)
         };
-        // ECALL sets read_register2=false (spec: rs2 defaults to 0 for ECALL).
-        // CM50 requires rv2=0 when read_register2=0. The commit buf_addr is
+        // CM50: (1 - read_register2) * rv2[i] = 0. When read_register2=0, rv2 must be 0.
+        // For example, ECALL has read_register2=0 (rs2 defaults to 0). The commit buf_addr is
         // carried separately in commit_buf_addr and does not go through rv2.
-        let rv2 = if decode.op_ecall { 0 } else { log.src2_val };
+        let rv2 = if !decode.read_register2 {
+            0
+        } else {
+            log.src2_val
+        };
 
         let mut op = Self {
             decode,
@@ -1284,9 +1288,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 packing: Packing::Direct,
             },
             // result (res) as DWordBL (8 bytes → 2 elements) per spec CPU-CA44.
-            // Must use res, not rvd: for word instructions (MULW), rvd is
-            // sign-extended from res, so upper 32 bits differ when bit 31 is set.
-            // The MUL chip computes the raw product; sign extension is CPU-only.
+            // Must send res (raw MUL output), not rvd. For MULW, rvd = sign_extend(res[31:0]),
+            // which can differ from res when bits [63:32] ≠ sign_extend(bit31) of res.
             BusValue::Packed {
                 start_column: cols::RES[0],
                 packing: Packing::DWordBL,
@@ -1324,8 +1327,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 packing: Packing::Direct,
             },
             // result (res) as DWordBL (8 bytes → 2 elements) per spec CPU-CA45.
-            // Must use res, not rvd: for word instructions (DIVW, REMW), rvd is
-            // sign-extended from res, so upper 32 bits differ when bit 31 is set.
+            // Must send res (raw DVRM output), not rvd. For DIVW/REMW, rvd = sign_extend(res[31:0]),
+            // which can differ from res when bits [63:32] ≠ sign_extend(bit31) of res.
             BusValue::Packed {
                 start_column: cols::RES[0],
                 packing: Packing::DWordBL,

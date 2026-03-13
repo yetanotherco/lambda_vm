@@ -516,7 +516,7 @@ impl DecodeEntry {
                 if dst != 0 {
                     entry.write_register = true;
                 }
-                Self::set_arith_op(&mut entry, op, false);
+                Self::set_arith_op(&mut entry, op);
             }
 
             Instruction::ArithImm { dst, src, imm, op } => {
@@ -528,7 +528,7 @@ impl DecodeEntry {
                 if dst != 0 {
                     entry.write_register = true;
                 }
-                Self::set_arith_op(&mut entry, op, false);
+                Self::set_arith_op(&mut entry, op);
             }
 
             Instruction::ArithW {
@@ -546,7 +546,7 @@ impl DecodeEntry {
                 if dst != 0 {
                     entry.write_register = true;
                 }
-                Self::set_arith_op(&mut entry, op, true);
+                Self::set_arith_op(&mut entry, op);
             }
 
             Instruction::ArithImmW { dst, src, imm, op } => {
@@ -559,7 +559,7 @@ impl DecodeEntry {
                 if dst != 0 {
                     entry.write_register = true;
                 }
-                Self::set_arith_op(&mut entry, op, true);
+                Self::set_arith_op(&mut entry, op);
             }
 
             Instruction::JumpAndLink { dst, offset } => {
@@ -714,7 +714,7 @@ impl DecodeEntry {
     }
 
     /// Helper to set ALU operation flags based on ArithOp.
-    fn set_arith_op(entry: &mut Self, arith_op: ArithOp, _is_word: bool) {
+    fn set_arith_op(entry: &mut Self, arith_op: ArithOp) {
         match arith_op {
             ArithOp::Add => {
                 entry.op_add = true;
