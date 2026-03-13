@@ -1,4 +1,4 @@
-name = "MEMW-A"
+name = "MEMW_A"
 
 # Input
 
@@ -68,7 +68,9 @@ desc = "The timestamp at which the address was last accessed"
 name = "base_address"
 type = "DWordWL"
 desc = "Recomposing the base address from its parts"
-defs = {idx = "i", polys = [["+", ["*", ["^", 2, 16], "base_address_mid"], ["*", ["^", 2, 8], ["idx", "base_address_low", 1]], ["idx", "base_address_low", 0]], "base_address_high"]}
+def = {idx = "i", polys = [
+  { iter = 0, poly = ["+", ["*", ["^", 2, 16], "base_address_mid"], ["*", ["^", 2, 8], ["idx", "base_address_low", 1]], ["idx", "base_address_low", 0]] },
+  { iter = 1, poly = "base_address_high" }]}
 
 [[variables.virtual]]
 name = "w2"
@@ -131,10 +133,11 @@ iter = ["i", 0, 1]
 name = "consistency"
 
 [[constraints.consistency]]
-kind = "template"
+kind = "interaction"
 tag = "AND_BYTE"
 input = [["idx", "base_address_low", 0], ["+", ["*", "write2", 1], ["*", "write4", 3], ["*", "write8", 7]]]
 output = 0
+multiplicity = "μ_sum"
 
 [[constraints.consistency]]
 kind = "template"
