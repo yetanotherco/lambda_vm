@@ -1484,6 +1484,31 @@ fn chunk_and_generate<T>(
     }
 }
 
+/// Like [`chunk_and_generate`], but spills each chunk to disk immediately after
+/// generation. Peak memory is bounded by one chunk instead of all chunks combined.
+/// This is critical for large tables (e.g. MEMW with 192M rows for 64M instructions).
+#[cfg(feature = "disk-spill")]
+fn chunk_generate_and_spill<T>(
+    ops: &[T],
+    max_rows: usize,
+    generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension>,
+) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
+    let op_chunks: Vec<&[T]> = if ops.is_empty() {
+        vec![&[][..]]
+    } else {
+        ops.chunks(max_rows).collect()
+    };
+    let mut tables = Vec::with_capacity(op_chunks.len());
+    for chunk in op_chunks {
+        let mut t = generate(chunk);
+        t.main_table
+            .spill_to_disk()
+            .map_err(|e| Error::Prover(format!("disk-spill trace: {e}")))?;
+        tables.push(t);
+    }
+    Ok(tables)
+}
+
 impl Traces {
     /// Returns the number of chunks for each split table.
     pub fn table_counts(&self) -> crate::TableCounts {
@@ -1798,18 +1823,43 @@ impl Traces {
             .ok_or(Error::MissingHaltEcall)?;
         let halt_timestamp = halt_op.timestamp;
 
-        let cpus = chunk_and_generate(&cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
-        let memws = chunk_and_generate(&memw_ops, max_rows.memw, memw::generate_memw_trace);
-        let loads = chunk_and_generate(&load_ops, max_rows.load, load::generate_load_trace);
-        let lts = chunk_and_generate(&lt_ops, max_rows.lt, lt::generate_lt_trace);
-        let shifts = chunk_and_generate(&shift_ops, max_rows.shift, shift::generate_shift_trace);
-        let muls = chunk_and_generate(&mul_ops, max_rows.mul, mul::generate_mul_trace);
-        let dvrms = chunk_and_generate(&dvrm_ops, max_rows.dvrm, dvrm::generate_dvrm_trace);
-        let branches =
-            chunk_and_generate(&branch_ops, max_rows.branch, branch::generate_branch_trace);
+        // Generate traces, largest tables first.
+        // With disk-spill: use chunk_generate_and_spill — each chunk is spilled to disk
+        // immediately so peak memory is bounded by one chunk + raw ops.
+        // Without disk-spill: use chunk_and_generate (standard in-memory path).
+        // Drop raw ops after each generation to free heap before the next table.
+        #[cfg(feature = "disk-spill")]
+        macro_rules! gen_traces {
+            ($ops:expr, $max:expr, $gen:expr) => {
+                chunk_generate_and_spill($ops, $max, $gen)?
+            };
+        }
+        #[cfg(not(feature = "disk-spill"))]
+        macro_rules! gen_traces {
+            ($ops:expr, $max:expr, $gen:expr) => {
+                chunk_and_generate($ops, $max, $gen)
+            };
+        }
+        let memws = gen_traces!(&memw_ops, max_rows.memw, memw::generate_memw_trace);
+        drop(memw_ops);
+        let lts = gen_traces!(&lt_ops, max_rows.lt, lt::generate_lt_trace);
+        drop(lt_ops);
+        let cpus = gen_traces!(&cpu_ops, max_rows.cpu, cpu::generate_cpu_trace);
+        // cpu_ops kept alive — needed for decode multiplicities below
+        let loads = gen_traces!(&load_ops, max_rows.load, load::generate_load_trace);
+        drop(load_ops);
+        let shifts = gen_traces!(&shift_ops, max_rows.shift, shift::generate_shift_trace);
+        drop(shift_ops);
+        let muls = gen_traces!(&mul_ops, max_rows.mul, mul::generate_mul_trace);
+        drop(mul_ops);
+        let dvrms = gen_traces!(&dvrm_ops, max_rows.dvrm, dvrm::generate_dvrm_trace);
+        drop(dvrm_ops);
+        let branches = gen_traces!(&branch_ops, max_rows.branch, branch::generate_branch_trace);
+        drop(branch_ops);
 
         let mut bitwise = bitwise::generate_bitwise_trace();
         bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
+        drop(bitwise_ops);
 
         // Update DECODE multiplicities
         // Each CPU operation looks up the DECODE table once
@@ -1824,6 +1874,8 @@ impl Traces {
         let mut decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
         decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
         decode::update_multiplicities(&mut decode, &pc_to_row, &decode_lookups);
+        drop(cpu_ops);
+        drop(decode_lookups);
 
         // Prepare register final state before scope (needs register_state ownership)
         let register_final_state = register_state.to_final_state_map();
