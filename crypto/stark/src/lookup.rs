@@ -606,6 +606,12 @@ pub enum BusValue {
         packing: Packing,
     },
 
+    /// A constant value (no columns). Consumes 1 alpha power slot.
+    ///
+    /// For value 0, the accumulate methods skip all arithmetic (zero contributes nothing).
+    /// For non-zero values, computes `FieldElement::from(value) * alpha_power`.
+    Constant(u64),
+
     /// Custom linear combination of columns and/or constants.
     ///
     /// Computes: `a₀·col[i₀] + a₁·col[i₁] + ... + c`
@@ -618,7 +624,7 @@ impl BusValue {
     ///
     /// Example: `BusValue::constant(0x42)` for a table ID or opcode.
     pub fn constant(value: u64) -> Self {
-        BusValue::Linear(vec![LinearTerm::Constant(value as i64)])
+        BusValue::Constant(value)
     }
 
     /// Creates a single column value with coefficient 1.
@@ -643,7 +649,7 @@ impl BusValue {
     pub fn num_bus_elements(&self) -> usize {
         match self {
             BusValue::Packed { packing, .. } => packing.num_bus_elements(),
-            BusValue::Linear(_) => 1,
+            BusValue::Constant(_) | BusValue::Linear(_) => 1,
         }
     }
 
@@ -654,6 +660,7 @@ impl BusValue {
                 start_column,
                 packing,
             } => (*start_column..*start_column + packing.num_columns()).collect(),
+            BusValue::Constant(_) => vec![],
             BusValue::Linear(terms) => terms
                 .iter()
                 .filter_map(|term| match term {
@@ -693,6 +700,12 @@ impl BusValue {
                 alpha_offset,
                 acc,
             ),
+            BusValue::Constant(value) => {
+                if *value != 0 {
+                    *acc += FieldElement::<F>::from(*value) * &alpha_powers[alpha_offset];
+                }
+                1
+            }
             BusValue::Linear(terms) => {
                 let mut result = FieldElement::<F>::zero();
                 for term in terms {
@@ -748,6 +761,12 @@ impl BusValue {
                 alpha_offset,
                 acc,
             ),
+            BusValue::Constant(value) => {
+                if *value != 0 {
+                    *acc += FieldElement::<A>::from(*value) * &alpha_powers[alpha_offset];
+                }
+                1
+            }
             BusValue::Linear(terms) => {
                 let mut result = FieldElement::<A>::zero();
                 for term in terms {
@@ -797,6 +816,9 @@ impl BusValue {
                     .map(&get_column)
                     .collect();
                 packing.combine(&columns)
+            }
+            BusValue::Constant(value) => {
+                vec![FieldElement::<E>::from(*value)]
             }
             BusValue::Linear(terms) => {
                 let mut result = FieldElement::<E>::zero();
@@ -1068,6 +1090,17 @@ where
         let trace_len = trace.num_rows();
         let table_name = self.name.as_deref().unwrap_or("UNKNOWN");
 
+        // Precompute alpha powers once (shared across all interactions)
+        let max_bus_elements = self
+            .auxiliary_trace_build_data
+            .interactions
+            .iter()
+            .map(|i| i.num_bus_elements())
+            .max()
+            .unwrap_or(1);
+        let alpha_powers =
+            compute_alpha_powers(&challenges[LOGUP_CHALLENGE_ALPHA], max_bus_elements);
+
         // Split interactions: committed pairs get term columns, last 1-2 are absorbed (virtual)
         let (num_committed_pairs, absorbed_count) = split_interactions(num_interactions);
 
@@ -1082,6 +1115,7 @@ where
                     &main_segment_cols,
                     trace_len,
                     challenges,
+                    &alpha_powers,
                     table_name,
                 )
             })
@@ -1095,6 +1129,7 @@ where
                     &main_segment_cols,
                     trace_len,
                     challenges,
+                    &alpha_powers,
                     table_name,
                 )
             })
@@ -1108,6 +1143,7 @@ where
                 &main_segment_cols,
                 trace_len,
                 challenges,
+                &alpha_powers,
                 table_name,
             )
         } else {
@@ -1116,6 +1152,7 @@ where
                 &main_segment_cols,
                 trace_len,
                 challenges,
+                &alpha_powers,
                 table_name,
             )
         };
@@ -1134,6 +1171,7 @@ where
                 &main_segment_cols,
                 trace_len,
                 challenges,
+                &alpha_powers,
                 table_name,
             );
 
@@ -1416,6 +1454,7 @@ fn compute_logup_term_column<F, E>(
     main_segment_cols: &[Vec<FieldElement<F>>],
     trace_len: usize,
     challenges: &[FieldElement<E>],
+    alpha_powers: &[FieldElement<E>],
     #[cfg_attr(not(feature = "debug-checks"), allow(unused))] _table_name: &str,
 ) -> Vec<FieldElement<E>>
 where
@@ -1423,10 +1462,12 @@ where
     E: IsField + Send + Sync,
 {
     // Handle multiplicity column(s)
+    // For Multiplicity::One, we skip allocation — the final computation
+    // special-cases this to avoid both the alloc and the N multiplications.
     let multiplicities_owned: Vec<FieldElement<F>>;
     let multiplicities: &[FieldElement<F>] = match table_interaction.multiplicity {
         Multiplicity::One => {
-            multiplicities_owned = vec![FieldElement::one(); trace_len];
+            multiplicities_owned = Vec::new();
             &multiplicities_owned
         }
         Multiplicity::Column(col) => &main_segment_cols[col],
@@ -1497,11 +1538,6 @@ where
 
     // LogUp challenges (must be shared across all tables for bus to balance)
     let z = &challenges[LOGUP_CHALLENGE_Z];
-    let alpha = &challenges[LOGUP_CHALLENGE_ALPHA];
-
-    // Precompute powers of alpha for all bus elements (using incremental multiplication)
-    let num_bus_elements = table_interaction.num_bus_elements();
-    let alpha_powers = compute_alpha_powers(alpha, num_bus_elements);
 
     let negate = !table_interaction.is_sender;
 
@@ -1521,7 +1557,7 @@ where
             let consumed = bv.accumulate_fingerprint(
                 main_segment_cols,
                 row,
-                &alpha_powers,
+                alpha_powers,
                 alpha_offset,
                 &mut linear_combination,
             );
@@ -1540,12 +1576,17 @@ where
                     .iter()
                     .flat_map(|bv| bv.combine_from(|col| main_segment_cols[col][row].clone())),
             );
+            let mult_str = if matches!(table_interaction.multiplicity, Multiplicity::One) {
+                "1".to_string()
+            } else {
+                multiplicities[row].canonical()
+            };
             crate::bus_debug::log_interaction(
                 _table_name,
                 row,
                 table_interaction.bus_id,
                 table_interaction.is_sender,
-                &multiplicities[row].canonical(),
+                &mult_str,
                 &base_elements,
                 fingerprints.last().unwrap(),
             );
@@ -1556,15 +1597,24 @@ where
         .expect("fingerprint is zero - probability of sampling zero is negligible");
 
     // Compute terms: term[i] = ±(multiplicity[i] * fingerprint_inv[i])
-    // Use conditional negation instead of E×E sign multiplication
-    multiplicities
-        .iter()
-        .zip(fingerprints.iter())
-        .map(|(multiplicity, fingerprint_inv)| {
-            let term = multiplicity * fingerprint_inv;
-            if negate { -term } else { term }
-        })
-        .collect()
+    // For Multiplicity::One, skip the multiply by 1 entirely.
+    let is_one = matches!(table_interaction.multiplicity, Multiplicity::One);
+    if is_one {
+        if negate {
+            fingerprints.iter().map(|fp_inv| -fp_inv).collect()
+        } else {
+            fingerprints
+        }
+    } else {
+        multiplicities
+            .iter()
+            .zip(fingerprints.iter())
+            .map(|(multiplicity, fingerprint_inv)| {
+                let term = multiplicity * fingerprint_inv;
+                if negate { -term } else { term }
+            })
+            .collect()
+    }
 }
 
 /// Computes a batched term column for two interactions sharing one aux column.
@@ -1579,6 +1629,7 @@ fn compute_logup_batched_term_column<F, E>(
     main_segment_cols: &[Vec<FieldElement<F>>],
     trace_len: usize,
     challenges: &[FieldElement<E>],
+    alpha_powers: &[FieldElement<E>],
     #[cfg_attr(not(feature = "debug-checks"), allow(unused))] _table_name: &str,
 ) -> Vec<FieldElement<E>>
 where
@@ -1586,20 +1637,15 @@ where
     E: IsField + Send + Sync,
 {
     let z = &challenges[LOGUP_CHALLENGE_Z];
-    let alpha = &challenges[LOGUP_CHALLENGE_ALPHA];
-
-    let max_bus_elements = interaction_a
-        .num_bus_elements()
-        .max(interaction_b.num_bus_elements());
-    let alpha_powers = compute_alpha_powers(alpha, max_bus_elements);
 
     let negate_a = !interaction_a.is_sender;
     let negate_b = !interaction_b.is_sender;
 
-    // Helper to compute multiplicities for an interaction
+    // Helper to compute multiplicities for an interaction.
+    // For Multiplicity::One, returns an empty Vec — callers check is_one to skip multiply.
     let compute_multiplicities = |interaction: &BusInteraction| -> Vec<FieldElement<F>> {
         match &interaction.multiplicity {
-            Multiplicity::One => vec![FieldElement::one(); trace_len],
+            Multiplicity::One => Vec::new(),
             Multiplicity::Column(col) => main_segment_cols[*col].clone(),
             Multiplicity::Sum(col_a, col_b) => main_segment_cols[*col_a]
                 .iter()
@@ -1670,7 +1716,7 @@ where
             let consumed = bv.accumulate_fingerprint(
                 main_segment_cols,
                 row,
-                &alpha_powers,
+                alpha_powers,
                 alpha_offset,
                 &mut lc_a,
             );
@@ -1685,7 +1731,7 @@ where
             let consumed = bv.accumulate_fingerprint(
                 main_segment_cols,
                 row,
-                &alpha_powers,
+                alpha_powers,
                 alpha_offset,
                 &mut lc_b,
             );
@@ -1698,14 +1744,24 @@ where
     FieldElement::inplace_batch_inverse(&mut all_fingerprints)
         .expect("fingerprint is zero - probability of sampling zero is negligible");
 
-    // Compute batched terms: term[i] = m_a[i] / fp_a[i] ± m_b[i] / fp_b[i]
-    // Use conditional negation instead of E×E sign multiplication
+    // Compute batched terms: term[i] = ±m_a[i] / fp_a[i] ± m_b[i] / fp_b[i]
+    // For Multiplicity::One, skip the multiply by 1 entirely.
+    let is_one_a = matches!(interaction_a.multiplicity, Multiplicity::One);
+    let is_one_b = matches!(interaction_b.multiplicity, Multiplicity::One);
     (0..trace_len)
         .map(|row| {
             let fp_a_inv = &all_fingerprints[row];
             let fp_b_inv = &all_fingerprints[trace_len + row];
-            let term_a = &multiplicities_a[row] * fp_a_inv;
-            let term_b = &multiplicities_b[row] * fp_b_inv;
+            let term_a = if is_one_a {
+                fp_a_inv.clone()
+            } else {
+                &multiplicities_a[row] * fp_a_inv
+            };
+            let term_b = if is_one_b {
+                fp_b_inv.clone()
+            } else {
+                &multiplicities_b[row] * fp_b_inv
+            };
             let term_a = if negate_a { -term_a } else { term_a };
             let term_b = if negate_b { -term_b } else { term_b };
             term_a + term_b
@@ -1772,6 +1828,7 @@ fn compute_debug_bus_sums_batched<F, E>(
     main_segment_cols: &[Vec<FieldElement<F>>],
     trace_len: usize,
     challenges: &[FieldElement<E>],
+    alpha_powers: &[FieldElement<E>],
     table_name: &str,
 ) -> (
     HashMap<u64, FieldElement<E>>,
@@ -1793,6 +1850,7 @@ where
             main_segment_cols,
             trace_len,
             challenges,
+            alpha_powers,
             table_name,
         );
         let col_sum: FieldElement<E> = individual_terms
