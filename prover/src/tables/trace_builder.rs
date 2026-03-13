@@ -45,7 +45,6 @@ use super::lt::{self, LtOperation};
 use super::memw::{self, MemwOperation};
 use super::mul::{self, MulOperation};
 use super::page::{self, FinalByteState, FinalStateMap, PageConfig};
-use super::public_output;
 use super::register::{self, FinalRegisterStateMap, FinalRegisterWordState};
 use super::shift::{self, ShiftOperation};
 use super::types::{GoldilocksExtension, GoldilocksField};
@@ -1528,9 +1527,6 @@ pub struct Traces {
     /// Committed public output bytes recovered during trace generation.
     pub public_output_bytes: Vec<u8>,
 
-    /// PUBLIC_OUTPUT table for verifier-bound COMMIT bytes.
-    pub public_output: TraceTable<GoldilocksField, GoldilocksExtension>,
-
     /// BRANCH target calculation traces (wrapped in Vec for uniform architecture)
     pub branches: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 
@@ -1862,7 +1858,6 @@ impl Traces {
         // Generate remaining traces in parallel (page, register, halt, commit).
         // chunk_and_generate already handled cpu, lt, memw, load, mul, dvrm, branch above.
         let commit_trace = commit::generate_commit_trace(&commit_ops);
-        let public_output_trace = public_output::generate_public_output_trace(&public_output_bytes);
         let (pages, page_configs, register_trace, halt_trace);
         #[cfg(feature = "parallel")]
         {
@@ -1910,7 +1905,6 @@ impl Traces {
             page_configs,
             register: register_trace,
             public_output_bytes,
-            public_output: public_output_trace,
             branches,
             halt: halt_trace,
             commit: commit_trace,
@@ -2081,7 +2075,6 @@ impl Traces {
         let register_final_state = register_state.to_final_state_map();
 
         let commit_trace = commit::generate_commit_trace(&commit_ops);
-        let public_output_trace = public_output::generate_public_output_trace(&public_output_bytes);
 
         // Generate remaining traces in parallel (register, halt).
         // chunk_and_generate already handled cpu, lt, memw, load, mul, dvrm, branch above.
@@ -2120,7 +2113,6 @@ impl Traces {
             page_configs,
             register: register_trace,
             public_output_bytes,
-            public_output: public_output_trace,
             branches,
             halt: halt_trace,
             commit: commit_trace,

@@ -110,7 +110,8 @@ pub enum BusId {
     EcallCommit,
     /// COMMIT self-referencing recursive bus (row N → row N+1)
     CommitNextByte,
-    /// COMMIT output bus consumed by the public-output table
+    /// COMMIT output bus: verifier computes the receiver contribution externally
+    /// from `VmProof.public_output` using the shared LogUp challenges
     Commit,
 }
 

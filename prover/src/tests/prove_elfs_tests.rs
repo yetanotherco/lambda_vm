@@ -14,7 +14,7 @@
 //! TODO: LT bus (needs LT table integration)
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
-
+use math::field::element::FieldElement;
 use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData};
 use stark::proof::options::ProofOptions;
@@ -53,7 +53,6 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
         elf,
         &proof_options,
         true,
-        &traces.public_output_bytes,
         &traces.page_configs,
         &table_counts,
     );
@@ -67,11 +66,16 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
             Err(_) => return false,
         };
 
+    // Compute bus balance target for the removed PUBLIC_OUTPUT receiver
+    let bus_target =
+        crate::commit_bus_target(&airs.air_refs(), &multi_proof, &traces.public_output_bytes);
+
     // Verify using centralized air_refs() which includes all tables
     Verifier::multi_verify(
         &airs.air_refs(),
         &multi_proof,
         &mut DefaultTranscript::<E>::new(&[]),
+        &bus_target,
     )
 }
 
@@ -122,7 +126,12 @@ fn test_cpu_only_no_bus() {
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![&cpu_air];
     assert!(
-        Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
+        Verifier::multi_verify(
+            &airs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero(),
+        ),
         "CPU-only verification failed"
     );
 }
@@ -642,7 +651,6 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
         &elf,
         &proof_options,
         true,
-        &traces.public_output_bytes,
         &traces.page_configs,
         &table_counts,
     );
@@ -654,19 +662,17 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
 
     // Verifier uses EMPTY runtime pages → missing stack/public-output pages
     let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[]);
-    let verifier_airs = crate::VmAirs::new(
-        &elf,
-        &proof_options,
-        true,
-        &traces.public_output_bytes,
-        &wrong_configs,
-        &table_counts,
-    );
+    let verifier_airs =
+        crate::VmAirs::new(&elf, &proof_options, true, &wrong_configs, &table_counts);
+    let verifier_air_refs = verifier_airs.air_refs();
+    let bus_target =
+        crate::commit_bus_target(&verifier_air_refs, &proof, &traces.public_output_bytes);
 
     let verified = Verifier::multi_verify(
-        &verifier_airs.air_refs(),
+        &verifier_air_refs,
         &proof,
         &mut DefaultTranscript::<E>::new(&[]),
+        &bus_target,
     );
     assert!(
         !verified,
@@ -1382,7 +1388,6 @@ fn test_deep_stack_runtime_pages_roundtrip() {
         &elf,
         &proof_options,
         true,
-        &traces.public_output_bytes,
         &traces.page_configs,
         &table_counts,
     );
@@ -1391,22 +1396,19 @@ fn test_deep_stack_runtime_pages_roundtrip() {
         &mut DefaultTranscript::<E>::new(&[]),
     )
     .expect("Prover failed");
-
     // Verifier reconstructs from ELF + runtime_page_ranges hint
     let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges);
-    let verifier_airs = crate::VmAirs::new(
-        &elf,
-        &proof_options,
-        true,
-        &traces.public_output_bytes,
-        &verifier_configs,
-        &table_counts,
-    );
+    let verifier_airs =
+        crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs, &table_counts);
+    let verifier_air_refs = verifier_airs.air_refs();
+    let bus_target =
+        crate::commit_bus_target(&verifier_air_refs, &proof, &traces.public_output_bytes);
 
     let verified = Verifier::multi_verify(
-        &verifier_airs.air_refs(),
+        &verifier_air_refs,
         &proof,
         &mut DefaultTranscript::<E>::new(&[]),
+        &bus_target,
     );
     assert!(
         verified,
@@ -1436,7 +1438,6 @@ fn test_deep_stack_missing_pages_rejected() {
         &elf,
         &proof_options,
         true,
-        &traces.public_output_bytes,
         &traces.page_configs,
         &table_counts,
     );
@@ -1445,22 +1446,19 @@ fn test_deep_stack_missing_pages_rejected() {
         &mut DefaultTranscript::<E>::new(&[]),
     )
     .expect("Prover failed");
-
     // Verifier uses EMPTY runtime_page_ranges → missing stack/heap pages
     let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[]);
-    let verifier_airs = crate::VmAirs::new(
-        &elf,
-        &proof_options,
-        true,
-        &traces.public_output_bytes,
-        &wrong_configs,
-        &table_counts,
-    );
+    let verifier_airs =
+        crate::VmAirs::new(&elf, &proof_options, true, &wrong_configs, &table_counts);
+    let verifier_air_refs = verifier_airs.air_refs();
+    let bus_target =
+        crate::commit_bus_target(&verifier_air_refs, &proof, &traces.public_output_bytes);
 
     let verified = Verifier::multi_verify(
-        &verifier_airs.air_refs(),
+        &verifier_air_refs,
         &proof,
         &mut DefaultTranscript::<E>::new(&[]),
+        &bus_target,
     );
     assert!(
         !verified,
@@ -1523,7 +1521,6 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
         &elf,
         &proof_options,
         true,
-        &traces.public_output_bytes,
         &traces.page_configs,
         &table_counts,
     );
@@ -1532,22 +1529,19 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
         &mut DefaultTranscript::<E>::new(&[]),
     )
     .expect("Prover failed");
-
     // Verifier reconstructs from ELF + runtime hint (ranges decoded to pages)
     let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges);
-    let verifier_airs = crate::VmAirs::new(
-        &elf,
-        &proof_options,
-        true,
-        &traces.public_output_bytes,
-        &verifier_configs,
-        &table_counts,
-    );
+    let verifier_airs =
+        crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs, &table_counts);
+    let verifier_air_refs = verifier_airs.air_refs();
+    let bus_target =
+        crate::commit_bus_target(&verifier_air_refs, &proof, &traces.public_output_bytes);
 
     let verified = Verifier::multi_verify(
-        &verifier_airs.air_refs(),
+        &verifier_air_refs,
         &proof,
         &mut DefaultTranscript::<E>::new(&[]),
+        &bus_target,
     );
     assert!(
         verified,
@@ -1647,10 +1641,10 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         shift: 0,
         branch: 0,
     };
-    let airs = VmAirs::new(&elf, &proof_options, true, &[], &[], &zero_counts);
+    let airs = VmAirs::new(&elf, &proof_options, true, &[], &zero_counts);
 
     let verifier_air_refs = airs.air_refs();
-    assert_eq!(verifier_air_refs.len(), 6);
+    assert_eq!(verifier_air_refs.len(), 5);
 
     let mut bitwise_trace = crate::tables::bitwise::generate_bitwise_trace();
 
@@ -1676,6 +1670,7 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         &verifier_air_refs,
         &proof,
         &mut DefaultTranscript::<E>::new(&[]),
+        &FieldElement::zero(),
     );
 
     assert!(!verified);

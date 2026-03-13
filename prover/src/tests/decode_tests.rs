@@ -3,6 +3,7 @@
 use executor::elf::Elf;
 use executor::vm::instruction::decoding::{ArithOp, Instruction};
 use executor::vm::memory::U64HashMap;
+use math::field::element::FieldElement;
 
 use crate::tables::decode::{
     DecodeEntry, bus_interactions, cols, generate_decode_trace, instructions_from_elf,
@@ -980,6 +981,7 @@ fn test_decode_soundness_different_elf_rejected() {
         &verifier_airs,
         &proof,
         &mut DefaultTranscript::<E>::new(&[]),
+        &FieldElement::zero(),
     );
 
     // With different ELFs, verification should FAIL (secure!)
@@ -1036,7 +1038,6 @@ fn test_decode_soundness_same_elf_accepted() {
         &prover_elf,
         &proof_options,
         false,
-        &traces.public_output_bytes,
         &traces.page_configs,
         &table_counts,
     );
@@ -1046,7 +1047,6 @@ fn test_decode_soundness_same_elf_accepted() {
         &mut DefaultTranscript::<E>::new(&[]),
     )
     .expect("Prover failed to generate proof");
-
     // =========================================================================
     // VERIFIER: Loads same ELF independently, verifies proof
     // =========================================================================
@@ -1054,15 +1054,18 @@ fn test_decode_soundness_same_elf_accepted() {
         &verifier_elf,
         &proof_options,
         false,
-        &traces.public_output_bytes,
         &traces.page_configs,
         &table_counts,
     );
+    let verifier_air_refs = verifier_airs.air_refs();
+    let bus_target =
+        crate::commit_bus_target(&verifier_air_refs, &proof, &traces.public_output_bytes);
 
     let result = Verifier::multi_verify(
-        &verifier_airs.air_refs(),
+        &verifier_air_refs,
         &proof,
         &mut DefaultTranscript::<E>::new(&[]),
+        &bus_target,
     );
 
     // With same ELF, verification should SUCCEED

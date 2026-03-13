@@ -21,8 +21,10 @@ pub mod utils;
 use std::fmt;
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+use crypto::fiat_shamir::is_transcript::IsTranscript;
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
+use math::field::element::FieldElement;
 use stark::prover::{IsStarkProver, Prover};
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
@@ -31,14 +33,13 @@ pub use crate::tables::MaxRowsConfig;
 use crate::tables::bitwise;
 use crate::tables::decode;
 use crate::tables::page;
-use crate::tables::public_output;
 use crate::tables::register;
 use crate::tables::trace_builder::Traces;
+use crate::tables::types::BusId;
 use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_commit_air, create_cpu_air,
     create_decode_air, create_dvrm_air, create_halt_air, create_load_air, create_lt_air,
-    create_memw_air, create_mul_air, create_page_air, create_public_output_air,
-    create_register_air, create_shift_air,
+    create_memw_air, create_mul_air, create_page_air, create_register_air, create_shift_air,
 };
 
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
@@ -178,7 +179,6 @@ pub(crate) struct VmAirs {
     pub branches: Vec<VmAir>,
     pub halt: VmAir,
     pub commit: VmAir,
-    pub public_output: VmAir,
     pub register: VmAir,
     pub pages: Vec<VmAir>,
 }
@@ -191,7 +191,6 @@ impl VmAirs {
             (&self.decode, &mut traces.decode, &()),
             (&self.halt, &mut traces.halt, &()),
             (&self.commit, &mut traces.commit, &()),
-            (&self.public_output, &mut traces.public_output, &()),
             (&self.register, &mut traces.register, &()),
         ];
 
@@ -233,7 +232,6 @@ impl VmAirs {
             &self.decode,
             &self.halt,
             &self.commit,
-            &self.public_output,
             &self.register,
         ];
 
@@ -278,7 +276,6 @@ impl VmAirs {
         elf: &Elf,
         proof_options: &ProofOptions,
         minimal_bitwise: bool,
-        public_output_bytes: &[u8],
         page_configs: &[crate::tables::page::PageConfig],
         table_counts: &TableCounts,
     ) -> Self {
@@ -321,10 +318,6 @@ impl VmAirs {
             .collect();
         let halt = create_halt_air(proof_options);
         let commit = create_commit_air(proof_options);
-        let public_output = create_public_output_air(proof_options).with_preprocessed(
-            public_output::preprocessed_commitment(public_output_bytes, proof_options),
-            public_output::NUM_PREPROCESSED_COLS,
-        );
         let register = create_register_air(proof_options).with_preprocessed(
             register::preprocessed_commitment(proof_options, elf.entry_point),
             register::NUM_PREPROCESSED_COLS,
@@ -355,12 +348,88 @@ impl VmAirs {
             branches,
             halt,
             commit,
-            public_output,
             register,
             pages,
         }
     }
 }
+
+// =============================================================================
+// Bus Balance Target: Verifier-Computed COMMIT Output Bus
+// =============================================================================
+
+/// Replay the prover's Phase A (main trace commitments) to recover the shared
+/// LogUp challenges (z, alpha). Creates a fresh transcript, appends all main
+/// trace commitments in the same order as the prover, then samples two
+/// challenge elements.
+pub(crate) fn replay_transcript_phase_a(
+    airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
+    multi_proof: &MultiProof<F, E, ()>,
+) -> (FieldElement<E>, FieldElement<E>) {
+    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    for (air, proof) in airs.iter().zip(&multi_proof.proofs) {
+        if air.is_preprocessed() {
+            transcript.append_bytes(&air.precomputed_commitment());
+            transcript.append_bytes(&proof.lde_trace_main_merkle_root);
+        } else {
+            transcript.append_bytes(&proof.lde_trace_main_merkle_root);
+        }
+    }
+    let z: FieldElement<E> = transcript.sample_field_element();
+    let alpha: FieldElement<E> = transcript.sample_field_element();
+    (z, alpha)
+}
+
+/// Compute the bus balance offset for the COMMIT[index, value] bus.
+///
+/// For each public output byte at index `i` with value `v`:
+///   `fingerprint = z - (BusId::Commit * α^0 + i * α^1 + v * α^2)`
+///   `term = +1 / fingerprint`
+///
+/// Returns `Σ term` — the positive receiver contribution that is no longer
+/// present as an in-trace table. For empty public output, returns zero.
+pub(crate) fn compute_commit_bus_offset(
+    public_output: &[u8],
+    z: &FieldElement<E>,
+    alpha: &FieldElement<E>,
+) -> FieldElement<E> {
+    if public_output.is_empty() {
+        return FieldElement::zero();
+    }
+
+    let bus_id = FieldElement::<E>::from(BusId::Commit as u64);
+    let alpha_sq = alpha * alpha;
+
+    let mut total = FieldElement::<E>::zero();
+    for (i, &value) in public_output.iter().enumerate() {
+        let linear_combination = &bus_id
+            + &(FieldElement::<E>::from(i as u64) * alpha)
+            + &(FieldElement::<E>::from(value as u64) * &alpha_sq);
+        let fingerprint = z - &linear_combination;
+        total += fingerprint
+            .inv()
+            .expect("fingerprint collision in commit bus offset");
+    }
+    total
+}
+
+/// Compute the COMMIT output bus balance target for a `MultiProof`.
+///
+/// Replays Phase A of the transcript to recover (z, alpha), then computes
+/// the offset from the given public output bytes. Call this after `multi_prove`
+/// and before `multi_verify`.
+pub(crate) fn commit_bus_target(
+    airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
+    proof: &MultiProof<F, E, ()>,
+    public_output_bytes: &[u8],
+) -> FieldElement<E> {
+    let (z, alpha) = replay_transcript_phase_a(airs, proof);
+    compute_commit_bus_offset(public_output_bytes, &z, &alpha)
+}
+
+// =============================================================================
+// Public API: Prove / Verify
+// =============================================================================
 
 /// Prove an ELF binary execution. Returns a serializable proof bundle.
 pub fn prove(elf_bytes: &[u8]) -> Result<VmProof, Error> {
@@ -391,7 +460,6 @@ pub fn prove_with_options(
         &program,
         proof_options,
         false,
-        &traces.public_output_bytes,
         &traces.page_configs,
         &table_counts,
     );
@@ -444,11 +512,11 @@ pub fn verify_with_options(
         Traces::page_configs_from_elf_and_runtime(&program, &vm_proof.runtime_page_ranges);
 
     // Cross-check: table_counts must match the number of sub-proofs.
-    // Fixed tables (bitwise, decode, halt, commit, public_output, register) = 6, plus page tables.
-    let expected_proof_count = vm_proof.table_counts.total() + 6 + page_configs.len();
+    // Fixed tables (bitwise, decode, halt, commit, register) = 5, plus page tables.
+    let expected_proof_count = vm_proof.table_counts.total() + 5 + page_configs.len();
     if expected_proof_count != vm_proof.proof.proofs.len() {
         return Err(Error::InvalidTableCounts(format!(
-            "table_counts total ({}) + 6 fixed + {} pages = {}, but proof contains {} sub-proofs",
+            "table_counts total ({}) + 5 fixed + {} pages = {}, but proof contains {} sub-proofs",
             vm_proof.table_counts.total(),
             page_configs.len(),
             expected_proof_count,
@@ -460,15 +528,21 @@ pub fn verify_with_options(
         &program,
         proof_options,
         false,
-        &vm_proof.public_output,
         &page_configs,
         &vm_proof.table_counts,
     );
 
+    // Recompute the COMMIT output bus offset from VmProof.public_output.
+    // If public_output was tampered, the recomputed offset won't match the
+    // actual bus total in the proof, and multi_verify will reject.
+    let air_refs = airs.air_refs();
+    let expected_offset = commit_bus_target(&air_refs, &vm_proof.proof, &vm_proof.public_output);
+
     Ok(Verifier::multi_verify(
-        &airs.air_refs(),
+        &air_refs,
         &vm_proof.proof,
         &mut DefaultTranscript::<E>::new(&[]),
+        &expected_offset,
     ))
 }
 

@@ -78,9 +78,3 @@ pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
 pub struct MultiProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     pub proofs: Vec<StarkProof<F, E, PI>>,
 }
-
-impl<F: IsSubFieldOf<E>, E: IsField, PI> MultiProof<F, E, PI> {
-    pub fn new(proofs: Vec<StarkProof<F, E, PI>>) -> Self {
-        Self { proofs }
-    }
-}

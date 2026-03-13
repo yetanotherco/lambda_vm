@@ -24,7 +24,6 @@ use stark::proof::options::ProofOptions;
 use stark::trace::TraceTable;
 
 use crate::constraints::cpu::create_all_cpu_constraints;
-use crate::constraints::templates::IsBitConstraint;
 use crate::tables::bitwise::{
     BitwiseOperation, BitwiseOperationType, bus_interactions as bitwise_bus_interactions,
     cols as bitwise_cols,
@@ -53,9 +52,6 @@ use crate::tables::memw::{
 };
 use crate::tables::mul::{bus_interactions as mul_bus_interactions, cols as mul_cols};
 use crate::tables::page::{bus_interactions as page_bus_interactions, cols as page_cols};
-use crate::tables::public_output::{
-    bus_interactions as public_output_bus_interactions, cols as public_output_cols,
-};
 use crate::tables::register::{
     bus_interactions as register_bus_interactions, cols as register_cols,
 };
@@ -766,24 +762,4 @@ pub fn create_register_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("REGISTER")
-}
-
-/// Create PUBLIC_OUTPUT AIR with bus interactions.
-pub fn create_public_output_air(proof_options: &ProofOptions) -> VmAir {
-    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = vec![Box::new(
-        IsBitConstraint::unconditional(public_output_cols::MU, 0),
-    )];
-
-    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: public_output_bus_interactions(),
-    };
-
-    AirWithBuses::new(
-        public_output_cols::NUM_COLUMNS,
-        auxiliary_trace_build_data,
-        proof_options,
-        1,
-        transition_constraints,
-    )
-    .with_name("PUBLIC_OUTPUT")
 }

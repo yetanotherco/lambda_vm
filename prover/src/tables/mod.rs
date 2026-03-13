@@ -32,7 +32,6 @@ pub mod lt;
 pub mod memw;
 pub mod mul;
 pub mod page;
-pub mod public_output;
 pub mod register;
 pub mod shift;
 pub mod trace_builder;

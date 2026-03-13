@@ -241,7 +241,6 @@ pub fn generate_commit_trace(
 /// - **Sends** to CommitNextByte with `[timestamp, address_incr, count_decr]` (mult = mu - end)
 /// - **Receives** from CommitNextByte with `[timestamp, address, count]` (mult = mu - first)
 /// - **Sends** to IsHalfword for count_decr range checks (×4, mult = mu)
-/// - **Sends** to IsByte for value range check (mult = mu - end)
 /// - **Sends** to IsHalfword for address_incr range checks (×4, mult = mu)
 /// - **Sends** to Zero for end detection (mult = mu)
 /// - **Sends** to Memw for register/memory accesses (×5, mult varies)
