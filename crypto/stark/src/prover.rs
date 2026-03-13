@@ -1587,35 +1587,16 @@ pub trait IsStarkProver<
         };
 
         // =====================================================================
-        // Phase C + Rounds 2-4: Forked per table
+        // Phase C: Build + commit aux traces in chunks of K
         // =====================================================================
         // Each table gets an independent transcript fork (cloned from the shared
         // state after Phase B, domain-separated by table index). This matches
         // the verifier's forking and makes per-table proving independent.
         //
-        // Split into two passes for parallelism:
-        //   Pass 1 (parallel): Build all auxiliary traces (fingerprint + batch inversion)
-        //   Pass 2 (sequential): Fork transcript → extract → LDE → commit (shared pool)
-
-        // Pass 1: Build aux traces in parallel.
-        // Each build_auxiliary_trace has internal parallelism (batch_inverse, par_chunks),
-        // but outer parallelism over 12 tables also helps on high-core-count machines.
-        #[cfg(feature = "parallel")]
-        let aux_iter = air_trace_pairs.par_iter_mut();
-        #[cfg(not(feature = "parallel"))]
-        let aux_iter = air_trace_pairs.iter_mut();
-        let bus_inputs_vec: Vec<Option<BusPublicInputs<FieldExtension>>> = aux_iter
-            .map(|(air, trace, _)| {
-                if air.has_aux_trace() {
-                    air.build_auxiliary_trace(*trace, &lookup_challenges)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // Pass 2: Parallel fork transcript → extract → LDE → commit in chunks of K.
-        // Each table gets its own transcript fork and pool set.
+        // Aux build and aux commit are merged into a single chunked loop so that
+        // at most K aux traces are alive at any time. Without this, all N aux
+        // traces would be allocated simultaneously — for large programs (N=500+
+        // table chunks) this easily exceeds available RAM.
 
         // Pre-fork all transcripts (cheap, sequential — must match verifier ordering)
         let mut table_transcripts: Vec<_> = (0..num_airs)
@@ -1628,7 +1609,8 @@ pub trait IsStarkProver<
             })
             .collect();
 
-        // Parallel aux commit in chunks of K
+        let mut bus_inputs_vec: Vec<Option<BusPublicInputs<FieldExtension>>> =
+            Vec::with_capacity(num_airs);
         #[allow(clippy::type_complexity)]
         let mut aux_results: Vec<(
             Option<Arc<BatchedMerkleTree<FieldExtension>>>,
@@ -1639,6 +1621,27 @@ pub trait IsStarkProver<
             let chunk_end = (chunk_start + k).min(num_airs);
             let chunk_size = chunk_end - chunk_start;
 
+            // Step 1: Build aux traces for this chunk (parallel within chunk).
+            // The mutable borrow of air_trace_pairs ends after collect().
+            {
+                #[cfg(feature = "parallel")]
+                let iter = air_trace_pairs[chunk_start..chunk_end].par_iter_mut();
+                #[cfg(not(feature = "parallel"))]
+                let iter = air_trace_pairs[chunk_start..chunk_end].iter_mut();
+
+                let chunk_bus_inputs: Vec<Option<BusPublicInputs<FieldExtension>>> = iter
+                    .map(|(air, trace, _)| {
+                        if air.has_aux_trace() {
+                            air.build_auxiliary_trace(*trace, &lookup_challenges)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                bus_inputs_vec.extend(chunk_bus_inputs);
+            }
+
+            // Step 2: Extract aux columns → LDE → commit (parallel, using pools)
             #[cfg(feature = "parallel")]
             let iter = pool_sets[..chunk_size].par_iter_mut().enumerate();
             #[cfg(not(feature = "parallel"))]
@@ -1670,7 +1673,7 @@ pub trait IsStarkProver<
                 })
                 .collect();
 
-            // Sequential: spill aux LDE + tree, append roots to transcripts
+            // Step 3: Sequential — spill aux LDE + tree, append roots to transcripts
             #[allow(unused_variables)]
             for (j, result) in chunk_aux.into_iter().enumerate() {
                 #[allow(unused_mut)]
@@ -1704,6 +1707,16 @@ pub trait IsStarkProver<
                     table_transcripts[chunk_start + j].append_bytes(root);
                 }
                 aux_results.push((aux_tree.map(Arc::new), aux_root));
+            }
+
+            // Step 4 (disk-spill): Free aux trace data for this chunk.
+            // The aux data has been LDE'd, committed, and spilled to disk.
+            // Freeing it now caps peak heap at K aux traces instead of all N.
+            #[cfg(feature = "disk-spill")]
+            for idx in chunk_start..chunk_end {
+                let (_, trace, _) = &mut air_trace_pairs[idx];
+                trace.aux_table.data = Vec::new();
+                trace.aux_table.height = 0;
             }
         }
 
