@@ -239,7 +239,7 @@ pub fn generate_memw_trace(
 /// - 16 Memory bus tokens (read old + write new per byte)
 /// - 2 MEMW output interactions (read + write from CPU)
 pub fn bus_interactions() -> Vec<BusInteraction> {
-    let mut interactions = Vec::new();
+    let mut interactions = Vec::with_capacity(26);
 
     // -------------------------------------------------------------------------
     // Memory bus interactions (16 total)

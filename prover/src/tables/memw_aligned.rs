@@ -138,7 +138,7 @@ pub fn generate_memw_aligned_trace(
 // =========================================================================
 
 pub fn bus_interactions() -> Vec<BusInteraction> {
-    let mut interactions = Vec::new();
+    let mut interactions = Vec::with_capacity(22);
 
     let mu_sum = Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE);
 
@@ -279,7 +279,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // CM17: memory[is_register, base_address, timestamp, value[0]] with -μ_sum
     interactions.push(BusInteraction::receiver(
         BusId::Memory,
-        mu_sum.clone(),
+        mu_sum,
         vec![
             BusValue::Packed {
                 start_column: cols::IS_REGISTER,
