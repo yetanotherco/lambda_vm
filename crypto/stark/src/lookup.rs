@@ -1022,54 +1022,60 @@ where
         let trace_len = trace.num_rows();
         let table_name = self.name.as_deref().unwrap_or("UNKNOWN");
 
+        // Precompute alpha powers once (shared across all interactions)
+        let z = &challenges[LOGUP_CHALLENGE_Z];
+        let alpha = &challenges[LOGUP_CHALLENGE_ALPHA];
+        let alpha_powers = compute_alpha_powers(alpha, self.max_bus_elements);
+
         // Split interactions: committed pairs get term columns, last 1-2 are absorbed (virtual)
         let (num_committed_pairs, absorbed_count) = split_interactions(num_interactions);
 
-        // Compute committed term columns in parallel (batched pairs only)
+        // Compute committed term columns in parallel (batched pairs, dispatched by multiplicity pattern)
         #[cfg(feature = "parallel")]
         let committed_columns: Vec<Vec<FieldElement<E>>> = (0..num_committed_pairs)
             .into_par_iter()
             .map(|i| {
-                compute_logup_batched_term_column(
+                compute_logup_batched_term_dispatch(
                     &self.auxiliary_trace_build_data.interactions[i * 2],
                     &self.auxiliary_trace_build_data.interactions[i * 2 + 1],
                     &main_segment_cols,
                     trace_len,
-                    challenges,
-                    table_name,
+                    z,
+                    &alpha_powers,
                 )
             })
             .collect();
         #[cfg(not(feature = "parallel"))]
         let committed_columns: Vec<Vec<FieldElement<E>>> = (0..num_committed_pairs)
             .map(|i| {
-                compute_logup_batched_term_column(
+                compute_logup_batched_term_dispatch(
                     &self.auxiliary_trace_build_data.interactions[i * 2],
                     &self.auxiliary_trace_build_data.interactions[i * 2 + 1],
                     &main_segment_cols,
                     trace_len,
-                    challenges,
-                    table_name,
+                    z,
+                    &alpha_powers,
                 )
             })
             .collect();
 
         // Compute virtual column for absorbed interactions (NOT written to trace)
         let virtual_column = if absorbed_count == 2 {
-            compute_logup_batched_term_column(
+            compute_logup_batched_term_dispatch(
                 &self.auxiliary_trace_build_data.interactions[num_interactions - 2],
                 &self.auxiliary_trace_build_data.interactions[num_interactions - 1],
                 &main_segment_cols,
                 trace_len,
-                challenges,
-                table_name,
+                z,
+                &alpha_powers,
             )
         } else {
             compute_logup_term_column(
                 &self.auxiliary_trace_build_data.interactions[num_interactions - 1],
                 &main_segment_cols,
                 trace_len,
-                challenges,
+                z,
+                &alpha_powers,
                 table_name,
             )
         };
@@ -1087,7 +1093,8 @@ where
                 &self.auxiliary_trace_build_data.interactions,
                 &main_segment_cols,
                 trace_len,
-                challenges,
+                z,
+                &alpha_powers,
                 table_name,
             );
 
@@ -1358,7 +1365,7 @@ where
 {
 }
 
-/// Computes a term column for a table interaction without writing to the trace.
+/// Computes a term column for a single interaction without writing to the trace.
 ///
 /// Each row contains the LogUp quotient: `term[i] = sign * multiplicity[i] / fingerprint[i]`
 ///
@@ -1369,126 +1376,30 @@ fn compute_logup_term_column<F, E>(
     table_interaction: &BusInteraction,
     main_segment_cols: &[Vec<FieldElement<F>>],
     trace_len: usize,
-    challenges: &[FieldElement<E>],
+    z: &FieldElement<E>,
+    alpha_powers: &[FieldElement<E>],
     #[cfg_attr(not(feature = "debug-checks"), allow(unused))] _table_name: &str,
 ) -> Vec<FieldElement<E>>
 where
     F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
     E: IsField + Send + Sync,
 {
-    // Handle multiplicity column(s)
-    let multiplicities_owned: Vec<FieldElement<F>>;
-    let multiplicities: &[FieldElement<F>] = match table_interaction.multiplicity {
-        Multiplicity::One => {
-            multiplicities_owned = vec![FieldElement::one(); trace_len];
-            &multiplicities_owned
-        }
-        Multiplicity::Column(col) => &main_segment_cols[col],
-        Multiplicity::Sum(col_a, col_b) => {
-            multiplicities_owned = main_segment_cols[col_a]
-                .iter()
-                .zip(main_segment_cols[col_b].iter())
-                .map(|(a, b)| a + b)
-                .collect();
-            &multiplicities_owned
-        }
-        Multiplicity::Negated(col) => {
-            multiplicities_owned = main_segment_cols[col]
-                .iter()
-                .map(|elem| FieldElement::<F>::one() - elem)
-                .collect();
-            &multiplicities_owned
-        }
-        Multiplicity::Diff(col_a, col_b) => {
-            multiplicities_owned = main_segment_cols[col_a]
-                .iter()
-                .zip(main_segment_cols[col_b].iter())
-                .map(|(a, b)| a - b)
-                .collect();
-            &multiplicities_owned
-        }
-        Multiplicity::Sum3(col_a, col_b, col_c) => {
-            multiplicities_owned = (0..trace_len)
-                .map(|row| {
-                    &main_segment_cols[col_a][row]
-                        + &main_segment_cols[col_b][row]
-                        + &main_segment_cols[col_c][row]
-                })
-                .collect();
-            &multiplicities_owned
-        }
-        Multiplicity::Linear(ref terms) => {
-            multiplicities_owned = (0..trace_len)
-                .map(|row| {
-                    let mut result = FieldElement::<F>::zero();
-                    for term in terms {
-                        match *term {
-                            LinearTerm::Column {
-                                coefficient,
-                                column,
-                            } => {
-                                let coeff = FieldElement::<F>::from(coefficient);
-                                result += &main_segment_cols[column][row] * coeff;
-                            }
-                            LinearTerm::ColumnUnsigned {
-                                coefficient,
-                                column,
-                            } => {
-                                let coeff = FieldElement::<F>::from(coefficient);
-                                result += &main_segment_cols[column][row] * coeff;
-                            }
-                            LinearTerm::Constant(value) => {
-                                result += FieldElement::<F>::from(value);
-                            }
-                        }
-                    }
-                    result
-                })
-                .collect();
-            &multiplicities_owned
-        }
+    let is_one = matches!(table_interaction.multiplicity, Multiplicity::One);
+    let multiplicities = if is_one {
+        Vec::new()
+    } else {
+        compute_multiplicities(table_interaction, main_segment_cols, trace_len)
     };
-
-    // LogUp challenges (must be shared across all tables for bus to balance)
-    let z = &challenges[LOGUP_CHALLENGE_Z];
-    let alpha = &challenges[LOGUP_CHALLENGE_ALPHA];
-
-    // Precompute powers of alpha for all bus elements (using incremental multiplication)
-    let num_bus_elements = table_interaction.num_bus_elements();
-    let alpha_powers = compute_alpha_powers(alpha, num_bus_elements);
 
     let negate = !table_interaction.is_sender;
 
-    // Batch inversion: collect all fingerprints, invert once, then multiply back.
-    // Compute fingerprint = z - (bus_id*α^0 + v0*α^1 + v1*α^2 + ...) using
-    // base-field × extension-field multiplication (F×E→E) to avoid to_extension().
-    //
-    // Zero-allocation inner loop: accumulate the linear combination directly
-    // into the fingerprint without collecting bus elements into intermediate Vecs.
-    let bus_id_f = FieldElement::<F>::from(table_interaction.bus_id);
-    let shifts = PackingShifts::<F>::new();
     let mut fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(trace_len);
-    for row in 0..trace_len {
-        // Accumulate fingerprint directly: bus_id * α^0 + Σ element_i * α^(1+i)
-        let mut linear_combination = &bus_id_f * &alpha_powers[0];
-        let mut alpha_offset = 1;
-        for bv in &table_interaction.values {
-            let consumed = bv.accumulate_fingerprint(
-                main_segment_cols,
-                row,
-                &alpha_powers,
-                alpha_offset,
-                &mut linear_combination,
-                &shifts,
-            );
-            alpha_offset += consumed;
-        }
+    compute_fingerprints_into(table_interaction, main_segment_cols, trace_len, z, alpha_powers, &mut fingerprints);
 
-        fingerprints.push(z - &linear_combination);
-
-        #[cfg(feature = "debug-checks")]
-        {
-            // Reconstruct base_elements for debug logging
+    #[cfg(feature = "debug-checks")]
+    {
+        let bus_id_f = FieldElement::<F>::from(table_interaction.bus_id);
+        for row in 0..trace_len {
             let mut base_elements: Vec<FieldElement<F>> = vec![bus_id_f.clone()];
             base_elements.extend(
                 table_interaction
@@ -1496,14 +1407,19 @@ where
                     .iter()
                     .flat_map(|bv| bv.combine_from(|col| main_segment_cols[col][row].clone())),
             );
+            let mult_str = if is_one {
+                "1".to_string()
+            } else {
+                multiplicities[row].canonical()
+            };
             crate::bus_debug::log_interaction(
                 _table_name,
                 row,
                 table_interaction.bus_id,
                 table_interaction.is_sender,
-                &multiplicities[row].canonical(),
+                &mult_str,
                 &base_elements,
-                fingerprints.last().unwrap(),
+                &fingerprints[row],
             );
         }
     }
@@ -1511,19 +1427,204 @@ where
     FieldElement::inplace_batch_inverse(&mut fingerprints)
         .expect("fingerprint is zero - probability of sampling zero is negligible");
 
-    // Compute terms: term[i] = ±(multiplicity[i] * fingerprint_inv[i])
-    // Use conditional negation instead of E×E sign multiplication
-    multiplicities
-        .iter()
-        .zip(fingerprints.iter())
-        .map(|(multiplicity, fingerprint_inv)| {
-            let term = multiplicity * fingerprint_inv;
-            if negate { -term } else { term }
+    // For Multiplicity::One, skip the multiply by 1 entirely.
+    if is_one {
+        if negate {
+            fingerprints.iter().map(|fp_inv| -fp_inv).collect()
+        } else {
+            fingerprints
+        }
+    } else {
+        multiplicities
+            .iter()
+            .zip(fingerprints.iter())
+            .map(|(multiplicity, fingerprint_inv)| {
+                let term = multiplicity * fingerprint_inv;
+                if negate { -term } else { term }
+            })
+            .collect()
+    }
+}
+
+/// Helper to compute multiplicities for an interaction (used by general batched term).
+fn compute_multiplicities<F>(
+    interaction: &BusInteraction,
+    main_segment_cols: &[Vec<FieldElement<F>>],
+    trace_len: usize,
+) -> Vec<FieldElement<F>>
+where
+    F: IsFFTField + IsPrimeField + Send + Sync,
+{
+    match &interaction.multiplicity {
+        Multiplicity::One => vec![FieldElement::one(); trace_len],
+        Multiplicity::Column(col) => main_segment_cols[*col].clone(),
+        Multiplicity::Sum(col_a, col_b) => main_segment_cols[*col_a]
+            .iter()
+            .zip(main_segment_cols[*col_b].iter())
+            .map(|(a, b)| a + b)
+            .collect(),
+        Multiplicity::Negated(col) => main_segment_cols[*col]
+            .iter()
+            .map(|elem| FieldElement::<F>::one() - elem)
+            .collect(),
+        Multiplicity::Diff(col_a, col_b) => main_segment_cols[*col_a]
+            .iter()
+            .zip(main_segment_cols[*col_b].iter())
+            .map(|(a, b)| a - b)
+            .collect(),
+        Multiplicity::Sum3(col_a, col_b, col_c) => (0..trace_len)
+            .map(|row| {
+                &main_segment_cols[*col_a][row]
+                    + &main_segment_cols[*col_b][row]
+                    + &main_segment_cols[*col_c][row]
+            })
+            .collect(),
+        Multiplicity::Linear(terms) => (0..trace_len)
+            .map(|row| {
+                let mut result = FieldElement::<F>::zero();
+                for term in terms {
+                    match *term {
+                        LinearTerm::Column {
+                            coefficient,
+                            column,
+                        } => {
+                            let coeff = FieldElement::<F>::from(coefficient);
+                            result += &main_segment_cols[column][row] * coeff;
+                        }
+                        LinearTerm::ColumnUnsigned {
+                            coefficient,
+                            column,
+                        } => {
+                            let coeff = FieldElement::<F>::from(coefficient);
+                            result += &main_segment_cols[column][row] * coeff;
+                        }
+                        LinearTerm::Constant(value) => {
+                            result += FieldElement::<F>::from(value);
+                        }
+                    }
+                }
+                result
+            })
+            .collect(),
+    }
+}
+
+/// Computes fingerprints for an interaction across all rows into a pre-allocated buffer.
+///
+/// Appends `trace_len` fingerprints to `all_fingerprints`.
+#[allow(clippy::needless_range_loop)]
+fn compute_fingerprints_into<F, E>(
+    interaction: &BusInteraction,
+    main_segment_cols: &[Vec<FieldElement<F>>],
+    trace_len: usize,
+    z: &FieldElement<E>,
+    alpha_powers: &[FieldElement<E>],
+    all_fingerprints: &mut Vec<FieldElement<E>>,
+) where
+    F: IsField + IsSubFieldOf<E>,
+    E: IsField,
+{
+    let bus_id_f = FieldElement::<F>::from(interaction.bus_id);
+    let shifts = PackingShifts::<F>::new();
+    for row in 0..trace_len {
+        let mut lc = &bus_id_f * &alpha_powers[0];
+        let mut alpha_offset = 1;
+        for bv in &interaction.values {
+            let consumed = bv.accumulate_fingerprint(
+                main_segment_cols,
+                row,
+                alpha_powers,
+                alpha_offset,
+                &mut lc,
+                &shifts,
+            );
+            alpha_offset += consumed;
+        }
+        all_fingerprints.push(z - &lc);
+    }
+}
+
+/// Batched term for two interactions where BOTH have `Multiplicity::One`.
+///
+/// No multiplicity vectors allocated. Each row:
+/// `term[i] = ±1/fp_a[i] ± 1/fp_b[i]`
+///
+/// The negate flags are loop-invariant, so the branch predictor handles them perfectly.
+#[allow(clippy::needless_range_loop)]
+fn compute_logup_batched_term_both_unit<F, E>(
+    interaction_a: &BusInteraction,
+    interaction_b: &BusInteraction,
+    main_segment_cols: &[Vec<FieldElement<F>>],
+    trace_len: usize,
+    z: &FieldElement<E>,
+    alpha_powers: &[FieldElement<E>],
+) -> Vec<FieldElement<E>>
+where
+    F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
+    E: IsField + Send + Sync,
+{
+    let negate_a = !interaction_a.is_sender;
+    let negate_b = !interaction_b.is_sender;
+
+    let mut all_fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(2 * trace_len);
+    compute_fingerprints_into(interaction_a, main_segment_cols, trace_len, z, alpha_powers, &mut all_fingerprints);
+    compute_fingerprints_into(interaction_b, main_segment_cols, trace_len, z, alpha_powers, &mut all_fingerprints);
+
+    FieldElement::inplace_batch_inverse(&mut all_fingerprints)
+        .expect("fingerprint is zero - probability of sampling zero is negligible");
+
+    // No multiplicity multiply — just sign-flip and sum
+    (0..trace_len)
+        .map(|row| {
+            let a = if negate_a { -all_fingerprints[row].clone() } else { all_fingerprints[row].clone() };
+            let b = if negate_b { -all_fingerprints[trace_len + row].clone() } else { all_fingerprints[trace_len + row].clone() };
+            a + b
         })
         .collect()
 }
 
-/// Computes a batched term column for two interactions sharing one aux column.
+/// Batched term where the FIRST interaction has `Multiplicity::One`, the second is general.
+///
+/// Only one multiplicity vector computed. Each row:
+/// `term[i] = ±1/fp_unit[i] + sign_gen * m_gen[i] / fp_gen[i]`
+#[allow(clippy::needless_range_loop)]
+fn compute_logup_batched_term_one_unit<F, E>(
+    unit_interaction: &BusInteraction,
+    general_interaction: &BusInteraction,
+    main_segment_cols: &[Vec<FieldElement<F>>],
+    trace_len: usize,
+    z: &FieldElement<E>,
+    alpha_powers: &[FieldElement<E>],
+) -> Vec<FieldElement<E>>
+where
+    F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
+    E: IsField + Send + Sync,
+{
+    let negate_unit = !unit_interaction.is_sender;
+    let negate_gen = !general_interaction.is_sender;
+
+    let multiplicities_gen = compute_multiplicities(general_interaction, main_segment_cols, trace_len);
+
+    let mut all_fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(2 * trace_len);
+    compute_fingerprints_into(unit_interaction, main_segment_cols, trace_len, z, alpha_powers, &mut all_fingerprints);
+    compute_fingerprints_into(general_interaction, main_segment_cols, trace_len, z, alpha_powers, &mut all_fingerprints);
+
+    FieldElement::inplace_batch_inverse(&mut all_fingerprints)
+        .expect("fingerprint is zero - probability of sampling zero is negligible");
+
+    (0..trace_len)
+        .map(|row| {
+            // Unit side: just ±fp_inv (no multiplicity multiply)
+            let term_unit = if negate_unit { -all_fingerprints[row].clone() } else { all_fingerprints[row].clone() };
+            // General side: m * fp_inv with sign
+            let term_gen = &multiplicities_gen[row] * &all_fingerprints[trace_len + row];
+            let term_gen = if negate_gen { -term_gen } else { term_gen };
+            term_unit + term_gen
+        })
+        .collect()
+}
+
+/// Computes a batched term column for two interactions sharing one aux column (general case).
 ///
 /// Each row contains: `term[i] = sign_a * m_a[i] / fp_a[i] + sign_b * m_b[i] / fp_b[i]`
 ///
@@ -1534,131 +1635,28 @@ fn compute_logup_batched_term_column<F, E>(
     interaction_b: &BusInteraction,
     main_segment_cols: &[Vec<FieldElement<F>>],
     trace_len: usize,
-    challenges: &[FieldElement<E>],
-    #[cfg_attr(not(feature = "debug-checks"), allow(unused))] _table_name: &str,
+    z: &FieldElement<E>,
+    alpha_powers: &[FieldElement<E>],
 ) -> Vec<FieldElement<E>>
 where
     F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
     E: IsField + Send + Sync,
 {
-    let z = &challenges[LOGUP_CHALLENGE_Z];
-    let alpha = &challenges[LOGUP_CHALLENGE_ALPHA];
-
-    let max_bus_elements = interaction_a
-        .num_bus_elements()
-        .max(interaction_b.num_bus_elements());
-    let alpha_powers = compute_alpha_powers(alpha, max_bus_elements);
-
     let negate_a = !interaction_a.is_sender;
     let negate_b = !interaction_b.is_sender;
 
-    // Helper to compute multiplicities for an interaction
-    let compute_multiplicities = |interaction: &BusInteraction| -> Vec<FieldElement<F>> {
-        match &interaction.multiplicity {
-            Multiplicity::One => vec![FieldElement::one(); trace_len],
-            Multiplicity::Column(col) => main_segment_cols[*col].clone(),
-            Multiplicity::Sum(col_a, col_b) => main_segment_cols[*col_a]
-                .iter()
-                .zip(main_segment_cols[*col_b].iter())
-                .map(|(a, b)| a + b)
-                .collect(),
-            Multiplicity::Negated(col) => main_segment_cols[*col]
-                .iter()
-                .map(|elem| FieldElement::<F>::one() - elem)
-                .collect(),
-            Multiplicity::Diff(col_a, col_b) => main_segment_cols[*col_a]
-                .iter()
-                .zip(main_segment_cols[*col_b].iter())
-                .map(|(a, b)| a - b)
-                .collect(),
-            Multiplicity::Sum3(col_a, col_b, col_c) => (0..trace_len)
-                .map(|row| {
-                    &main_segment_cols[*col_a][row]
-                        + &main_segment_cols[*col_b][row]
-                        + &main_segment_cols[*col_c][row]
-                })
-                .collect(),
-            Multiplicity::Linear(terms) => (0..trace_len)
-                .map(|row| {
-                    let mut result = FieldElement::<F>::zero();
-                    for term in terms {
-                        match *term {
-                            LinearTerm::Column {
-                                coefficient,
-                                column,
-                            } => {
-                                let coeff = FieldElement::<F>::from(coefficient);
-                                result += &main_segment_cols[column][row] * coeff;
-                            }
-                            LinearTerm::ColumnUnsigned {
-                                coefficient,
-                                column,
-                            } => {
-                                let coeff = FieldElement::<F>::from(coefficient);
-                                result += &main_segment_cols[column][row] * coeff;
-                            }
-                            LinearTerm::Constant(value) => {
-                                result += FieldElement::<F>::from(value);
-                            }
-                        }
-                    }
-                    result
-                })
-                .collect(),
-        }
-    };
+    let multiplicities_a = compute_multiplicities(interaction_a, main_segment_cols, trace_len);
+    let multiplicities_b = compute_multiplicities(interaction_b, main_segment_cols, trace_len);
 
-    let multiplicities_a = compute_multiplicities(interaction_a);
-    let multiplicities_b = compute_multiplicities(interaction_b);
-
-    // Compute fingerprints for both interactions using accumulate_fingerprint
-    // (zero-allocation inner loop: F×E multiplication instead of to_extension())
-    let bus_id_a = FieldElement::<F>::from(interaction_a.bus_id);
-    let bus_id_b = FieldElement::<F>::from(interaction_b.bus_id);
-    let shifts = PackingShifts::<F>::new();
-
-    // Concatenate both fingerprint vectors for a single batch inversion
     let mut all_fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(2 * trace_len);
-
-    for row in 0..trace_len {
-        let mut lc_a = &bus_id_a * &alpha_powers[0];
-        let mut alpha_offset = 1;
-        for bv in &interaction_a.values {
-            let consumed = bv.accumulate_fingerprint(
-                main_segment_cols,
-                row,
-                &alpha_powers,
-                alpha_offset,
-                &mut lc_a,
-                &shifts,
-            );
-            alpha_offset += consumed;
-        }
-        all_fingerprints.push(z - &lc_a);
-    }
-    for row in 0..trace_len {
-        let mut lc_b = &bus_id_b * &alpha_powers[0];
-        let mut alpha_offset = 1;
-        for bv in &interaction_b.values {
-            let consumed = bv.accumulate_fingerprint(
-                main_segment_cols,
-                row,
-                &alpha_powers,
-                alpha_offset,
-                &mut lc_b,
-                &shifts,
-            );
-            alpha_offset += consumed;
-        }
-        all_fingerprints.push(z - &lc_b);
-    }
+    compute_fingerprints_into(interaction_a, main_segment_cols, trace_len, z, alpha_powers, &mut all_fingerprints);
+    compute_fingerprints_into(interaction_b, main_segment_cols, trace_len, z, alpha_powers, &mut all_fingerprints);
 
     // Single batch inversion for all 2*N fingerprints
     FieldElement::inplace_batch_inverse(&mut all_fingerprints)
         .expect("fingerprint is zero - probability of sampling zero is negligible");
 
     // Compute batched terms: term[i] = m_a[i] / fp_a[i] ± m_b[i] / fp_b[i]
-    // Use conditional negation instead of E×E sign multiplication
     (0..trace_len)
         .map(|row| {
             let fp_a_inv = &all_fingerprints[row];
@@ -1670,6 +1668,39 @@ where
             term_a + term_b
         })
         .collect()
+}
+
+/// Dispatches batched term computation to the optimal specialized function
+/// based on the multiplicity patterns of the two interactions.
+fn compute_logup_batched_term_dispatch<F, E>(
+    interaction_a: &BusInteraction,
+    interaction_b: &BusInteraction,
+    main_segment_cols: &[Vec<FieldElement<F>>],
+    trace_len: usize,
+    z: &FieldElement<E>,
+    alpha_powers: &[FieldElement<E>],
+) -> Vec<FieldElement<E>>
+where
+    F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
+    E: IsField + Send + Sync,
+{
+    let a_is_one = matches!(interaction_a.multiplicity, Multiplicity::One);
+    let b_is_one = matches!(interaction_b.multiplicity, Multiplicity::One);
+
+    match (a_is_one, b_is_one) {
+        (true, true) => compute_logup_batched_term_both_unit(
+            interaction_a, interaction_b, main_segment_cols, trace_len, z, alpha_powers,
+        ),
+        (true, false) => compute_logup_batched_term_one_unit(
+            interaction_a, interaction_b, main_segment_cols, trace_len, z, alpha_powers,
+        ),
+        (false, true) => compute_logup_batched_term_one_unit(
+            interaction_b, interaction_a, main_segment_cols, trace_len, z, alpha_powers,
+        ),
+        (false, false) => compute_logup_batched_term_column(
+            interaction_a, interaction_b, main_segment_cols, trace_len, z, alpha_powers,
+        ),
+    }
 }
 
 /// Builds the circular accumulated column from pre-computed term columns.
@@ -1730,7 +1761,8 @@ fn compute_debug_bus_sums_batched<F, E>(
     interactions: &[BusInteraction],
     main_segment_cols: &[Vec<FieldElement<F>>],
     trace_len: usize,
-    challenges: &[FieldElement<E>],
+    z: &FieldElement<E>,
+    alpha_powers: &[FieldElement<E>],
     table_name: &str,
 ) -> (
     HashMap<u64, FieldElement<E>>,
@@ -1751,7 +1783,8 @@ where
             interaction,
             main_segment_cols,
             trace_len,
-            challenges,
+            z,
+            alpha_powers,
             table_name,
         );
         let col_sum: FieldElement<E> = individual_terms
@@ -1853,6 +1886,29 @@ fn compute_fingerprint_from_step<A: IsSubFieldOf<B>, B: IsField>(
     z - &linear_combination
 }
 
+/// Classifies a batched pair of interactions by multiplicity pattern.
+///
+/// Determines which specialized constraint evaluation path to use.
+/// Dispatch happens once at constraint construction, not per evaluation point.
+#[derive(Clone, Copy)]
+enum BatchedPairKind {
+    /// Both interactions have Multiplicity::One.
+    /// Constraint: `c * fp_a * fp_b - sign_a * fp_b - sign_b * fp_a = 0`
+    /// Saves: 2 multiplicity computations + 2 field multiplies per eval point.
+    BothUnit,
+    /// Only interaction_a has Multiplicity::One (interaction_b is general).
+    /// Constraint: `c * fp_a * fp_b - sign_a * fp_b - sign_b * m_b * fp_a = 0`
+    /// Saves: 1 multiplicity computation + 1 field multiply per eval point.
+    UnitFirst,
+    /// Only interaction_b has Multiplicity::One (interaction_a is general).
+    /// Constraint: `c * fp_a * fp_b - sign_a * m_a * fp_b - sign_b * fp_a = 0`
+    /// Saves: 1 multiplicity computation + 1 field multiply per eval point.
+    UnitSecond,
+    /// Neither interaction has Multiplicity::One (general case).
+    /// Constraint: `c * fp_a * fp_b - sign_a * m_a * fp_b - sign_b * m_b * fp_a = 0`
+    General,
+}
+
 /// Constraint for a batched pair of interactions sharing one aux column.
 ///
 /// Verifies: `c = m_a/fp_a + m_b/fp_b` where signs are baked into m_a, m_b.
@@ -1860,11 +1916,15 @@ fn compute_fingerprint_from_step<A: IsSubFieldOf<B>, B: IsField>(
 /// Clearing denominators: `c * fp_a * fp_b - sign_a * m_a * fp_b - sign_b * m_b * fp_a = 0`
 ///
 /// Degree 3: c (aux) × fp_a (linear in main) × fp_b (linear in main).
+///
+/// The `pair_kind` field enables specialized evaluation paths that skip
+/// multiplicity computation for `Multiplicity::One` interactions.
 struct LookupBatchedTermConstraint {
     interaction_a: BusInteraction,
     interaction_b: BusInteraction,
     term_column_idx: usize,
     constraint_idx: usize,
+    pair_kind: BatchedPairKind,
 }
 
 impl LookupBatchedTermConstraint {
@@ -1874,11 +1934,20 @@ impl LookupBatchedTermConstraint {
         term_column_idx: usize,
         constraint_idx: usize,
     ) -> Self {
+        let a_is_one = matches!(interaction_a.multiplicity, Multiplicity::One);
+        let b_is_one = matches!(interaction_b.multiplicity, Multiplicity::One);
+        let pair_kind = match (a_is_one, b_is_one) {
+            (true, true) => BatchedPairKind::BothUnit,
+            (true, false) => BatchedPairKind::UnitFirst,
+            (false, true) => BatchedPairKind::UnitSecond,
+            (false, false) => BatchedPairKind::General,
+        };
         Self {
             interaction_a,
             interaction_b,
             term_column_idx,
             constraint_idx,
+            pair_kind,
         }
     }
 }
@@ -1910,6 +1979,7 @@ where
             term_column_idx: usize,
             interaction_a: &BusInteraction,
             interaction_b: &BusInteraction,
+            pair_kind: BatchedPairKind,
             rap_challenges: &&[FieldElement<B>],
             alpha_powers: &[FieldElement<B>],
             shifts: &PackingShifts<A>,
@@ -1917,27 +1987,44 @@ where
             let c = step.get_aux_evaluation_element(0, term_column_idx);
             let z = &rap_challenges[LOGUP_CHALLENGE_Z];
 
-            let m_a = compute_multiplicity_from_step(step, &interaction_a.multiplicity);
-            let m_b = compute_multiplicity_from_step(step, &interaction_b.multiplicity);
-
             let fp_a = compute_fingerprint_from_step(step, interaction_a, z, alpha_powers, shifts);
             let fp_b = compute_fingerprint_from_step(step, interaction_b, z, alpha_powers, shifts);
 
-            // c * fp_a * fp_b - sign_a * m_a * fp_b - sign_b * m_b * fp_a = 0
-            // Use conditional negation instead of E×E sign multiplication
-            let term_a = m_a * &fp_b;
-            let term_a = if interaction_a.is_sender {
-                term_a
-            } else {
-                -term_a
-            };
-            let term_b = m_b * &fp_a;
-            let term_b = if interaction_b.is_sender {
-                term_b
-            } else {
-                -term_b
-            };
-            c * &fp_a * &fp_b - term_a - term_b
+            // c * fp_a * fp_b - sign_a * [m_a *] fp_b - sign_b * [m_b *] fp_a = 0
+            // For unit interactions, m=1 so we skip compute_multiplicity and the multiply.
+            match pair_kind {
+                BatchedPairKind::BothUnit => {
+                    // Both m_a=1, m_b=1: skip both multiplicity computations
+                    let term_a = if interaction_a.is_sender { fp_b.clone() } else { -fp_b.clone() };
+                    let term_b = if interaction_b.is_sender { fp_a.clone() } else { -fp_a.clone() };
+                    c * &fp_a * &fp_b - term_a - term_b
+                }
+                BatchedPairKind::UnitFirst => {
+                    // m_a=1, m_b=general
+                    let m_b = compute_multiplicity_from_step(step, &interaction_b.multiplicity);
+                    let term_a = if interaction_a.is_sender { fp_b.clone() } else { -fp_b.clone() };
+                    let term_b = m_b * &fp_a;
+                    let term_b = if interaction_b.is_sender { term_b } else { -term_b };
+                    c * &fp_a * &fp_b - term_a - term_b
+                }
+                BatchedPairKind::UnitSecond => {
+                    // m_a=general, m_b=1
+                    let m_a = compute_multiplicity_from_step(step, &interaction_a.multiplicity);
+                    let term_a = m_a * &fp_b;
+                    let term_a = if interaction_a.is_sender { term_a } else { -term_a };
+                    let term_b = if interaction_b.is_sender { fp_a.clone() } else { -fp_a.clone() };
+                    c * &fp_a * &fp_b - term_a - term_b
+                }
+                BatchedPairKind::General => {
+                    let m_a = compute_multiplicity_from_step(step, &interaction_a.multiplicity);
+                    let m_b = compute_multiplicity_from_step(step, &interaction_b.multiplicity);
+                    let term_a = m_a * &fp_b;
+                    let term_a = if interaction_a.is_sender { term_a } else { -term_a };
+                    let term_b = m_b * &fp_a;
+                    let term_b = if interaction_b.is_sender { term_b } else { -term_b };
+                    c * &fp_a * &fp_b - term_a - term_b
+                }
+            }
         }
 
         let res = match evaluation_context {
@@ -1952,6 +2039,7 @@ where
                 self.term_column_idx,
                 &self.interaction_a,
                 &self.interaction_b,
+                self.pair_kind,
                 rap_challenges,
                 logup_alpha_powers,
                 packing_shifts,
@@ -1967,6 +2055,7 @@ where
                 self.term_column_idx,
                 &self.interaction_a,
                 &self.interaction_b,
+                self.pair_kind,
                 rap_challenges,
                 logup_alpha_powers,
                 packing_shifts,
@@ -1977,6 +2066,28 @@ where
             *eval = res;
         }
     }
+}
+
+/// Classifies absorbed interactions by multiplicity pattern for the accumulated constraint.
+#[derive(Clone, Copy)]
+enum AbsorbedKind {
+    /// 1 absorbed interaction with Multiplicity::One.
+    /// `delta * f - sign = 0` — no multiplicity computation at all.
+    SingleUnit,
+    /// 1 absorbed interaction with general multiplicity.
+    /// `delta * f - sign * m = 0`
+    SingleGeneral,
+    /// 2 absorbed interactions, both with Multiplicity::One.
+    /// `delta * f1 * f2 - sign1 * f2 - sign2 * f1 = 0`
+    PairBothUnit,
+    /// 2 absorbed interactions, first is One, second is general.
+    /// `delta * f1 * f2 - sign1 * f2 - sign2 * m2 * f1 = 0`
+    PairUnitFirst,
+    /// 2 absorbed interactions, second is One, first is general.
+    /// `delta * f1 * f2 - sign1 * m1 * f2 - sign2 * f1 = 0`
+    PairUnitSecond,
+    /// 2 absorbed interactions, both general.
+    PairGeneral,
 }
 
 /// Constraint for the accumulated column with absorbed interactions.
@@ -1997,6 +2108,8 @@ struct LookupAccumulatedConstraint {
     acc_column_idx: usize,
     /// 1 or 2 interactions absorbed into this constraint (not committed as columns)
     absorbed: Vec<BusInteraction>,
+    /// Classified kind for specialized evaluation
+    absorbed_kind: AbsorbedKind,
 }
 
 impl LookupAccumulatedConstraint {
@@ -2005,11 +2118,32 @@ impl LookupAccumulatedConstraint {
         num_term_columns: usize,
         absorbed: Vec<BusInteraction>,
     ) -> Self {
+        let absorbed_kind = match absorbed.len() {
+            1 => {
+                if matches!(absorbed[0].multiplicity, Multiplicity::One) {
+                    AbsorbedKind::SingleUnit
+                } else {
+                    AbsorbedKind::SingleGeneral
+                }
+            }
+            2 => {
+                let a_is_one = matches!(absorbed[0].multiplicity, Multiplicity::One);
+                let b_is_one = matches!(absorbed[1].multiplicity, Multiplicity::One);
+                match (a_is_one, b_is_one) {
+                    (true, true) => AbsorbedKind::PairBothUnit,
+                    (true, false) => AbsorbedKind::PairUnitFirst,
+                    (false, true) => AbsorbedKind::PairUnitSecond,
+                    (false, false) => AbsorbedKind::PairGeneral,
+                }
+            }
+            _ => unreachable!("absorbed must contain 1 or 2 interactions"),
+        };
         Self {
             constraint_idx,
             num_term_columns,
             acc_column_idx: num_term_columns,
             absorbed,
+            absorbed_kind,
         }
     }
 }
@@ -2044,6 +2178,7 @@ where
             num_term_columns: usize,
             logup_table_offset: &FieldElement<B>,
             absorbed: &[BusInteraction],
+            absorbed_kind: AbsorbedKind,
             rap_challenges: &&[FieldElement<B>],
             alpha_powers: &[FieldElement<B>],
             shifts: &PackingShifts<A>,
@@ -2062,21 +2197,20 @@ where
 
             let z = &rap_challenges[LOGUP_CHALLENGE_Z];
 
-            // Clear denominators of absorbed interactions
-            debug_assert!(matches!(absorbed.len(), 1 | 2));
-            // Use conditional negation instead of E×E sign multiplication where possible
-            match absorbed.len() {
-                1 => {
-                    // (delta) · f - sign · m = 0
-                    // sign multiply also promotes m from base field A to extension B
+            match absorbed_kind {
+                AbsorbedKind::SingleUnit => {
+                    // m=1: delta * f - sign = 0
+                    let f = compute_fingerprint_from_step(second_step, &absorbed[0], z, alpha_powers, shifts);
+                    if absorbed[0].is_sender {
+                        delta * &f - FieldElement::<B>::one()
+                    } else {
+                        delta * &f + FieldElement::<B>::one()
+                    }
+                }
+                AbsorbedKind::SingleGeneral => {
+                    // delta * f - sign * m = 0
                     let m = compute_multiplicity_from_step(second_step, &absorbed[0].multiplicity);
-                    let f = compute_fingerprint_from_step(
-                        second_step,
-                        &absorbed[0],
-                        z,
-                        alpha_powers,
-                        shifts,
-                    );
+                    let f = compute_fingerprint_from_step(second_step, &absorbed[0], z, alpha_powers, shifts);
                     let sign: FieldElement<B> = if absorbed[0].is_sender {
                         FieldElement::one()
                     } else {
@@ -2084,32 +2218,45 @@ where
                     };
                     delta * &f - m * sign
                 }
-                2 => {
-                    // (delta) · f₁ · f₂ - sign₁·m₁·f₂ - sign₂·m₂·f₁ = 0
-                    // m_i * f_j naturally promotes A→B, then conditionally negate
+                AbsorbedKind::PairBothUnit => {
+                    // Both m1=1, m2=1: delta * f1 * f2 - sign1 * f2 - sign2 * f1 = 0
+                    let f1 = compute_fingerprint_from_step(second_step, &absorbed[0], z, alpha_powers, shifts);
+                    let f2 = compute_fingerprint_from_step(second_step, &absorbed[1], z, alpha_powers, shifts);
+                    let term1 = if absorbed[0].is_sender { f2.clone() } else { -f2.clone() };
+                    let term2 = if absorbed[1].is_sender { f1.clone() } else { -f1.clone() };
+                    delta * &f1 * &f2 - term1 - term2
+                }
+                AbsorbedKind::PairUnitFirst => {
+                    // m1=1, m2=general
+                    let f1 = compute_fingerprint_from_step(second_step, &absorbed[0], z, alpha_powers, shifts);
+                    let f2 = compute_fingerprint_from_step(second_step, &absorbed[1], z, alpha_powers, shifts);
+                    let m2 = compute_multiplicity_from_step(second_step, &absorbed[1].multiplicity);
+                    let term1 = if absorbed[0].is_sender { f2.clone() } else { -f2.clone() };
+                    let term2 = m2 * &f1;
+                    let term2 = if absorbed[1].is_sender { term2 } else { -term2 };
+                    delta * &f1 * &f2 - term1 - term2
+                }
+                AbsorbedKind::PairUnitSecond => {
+                    // m1=general, m2=1
+                    let f1 = compute_fingerprint_from_step(second_step, &absorbed[0], z, alpha_powers, shifts);
+                    let f2 = compute_fingerprint_from_step(second_step, &absorbed[1], z, alpha_powers, shifts);
+                    let m1 = compute_multiplicity_from_step(second_step, &absorbed[0].multiplicity);
+                    let term1 = m1 * &f2;
+                    let term1 = if absorbed[0].is_sender { term1 } else { -term1 };
+                    let term2 = if absorbed[1].is_sender { f1.clone() } else { -f1.clone() };
+                    delta * &f1 * &f2 - term1 - term2
+                }
+                AbsorbedKind::PairGeneral => {
                     let m1 = compute_multiplicity_from_step(second_step, &absorbed[0].multiplicity);
                     let m2 = compute_multiplicity_from_step(second_step, &absorbed[1].multiplicity);
-                    let f1 = compute_fingerprint_from_step(
-                        second_step,
-                        &absorbed[0],
-                        z,
-                        alpha_powers,
-                        shifts,
-                    );
-                    let f2 = compute_fingerprint_from_step(
-                        second_step,
-                        &absorbed[1],
-                        z,
-                        alpha_powers,
-                        shifts,
-                    );
+                    let f1 = compute_fingerprint_from_step(second_step, &absorbed[0], z, alpha_powers, shifts);
+                    let f2 = compute_fingerprint_from_step(second_step, &absorbed[1], z, alpha_powers, shifts);
                     let term1 = m1 * &f2;
                     let term1 = if absorbed[0].is_sender { term1 } else { -term1 };
                     let term2 = m2 * &f1;
                     let term2 = if absorbed[1].is_sender { term2 } else { -term2 };
                     delta * &f1 * &f2 - term1 - term2
                 }
-                _ => unreachable!("absorbed must contain 1 or 2 interactions"),
             }
         }
 
@@ -2128,6 +2275,7 @@ where
                 self.num_term_columns,
                 logup_table_offset,
                 &self.absorbed,
+                self.absorbed_kind,
                 rap_challenges,
                 logup_alpha_powers,
                 packing_shifts,
@@ -2146,6 +2294,7 @@ where
                 self.num_term_columns,
                 logup_table_offset,
                 &self.absorbed,
+                self.absorbed_kind,
                 rap_challenges,
                 logup_alpha_powers,
                 packing_shifts,
