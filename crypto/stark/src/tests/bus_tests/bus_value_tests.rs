@@ -120,12 +120,18 @@ fn test_linear_mixed_columns_and_constant() {
 
 #[test]
 fn test_constant_helper() {
-    // BusValue::constant(42) should create Constant(42)
+    // BusValue::constant(42) should create Linear([Constant(42)])
     let bv = BusValue::constant(42);
 
     match bv {
-        BusValue::Constant(v) => assert_eq!(v, 42),
-        _ => panic!("expected Constant variant"),
+        BusValue::Linear(terms) => {
+            assert_eq!(terms.len(), 1);
+            match &terms[0] {
+                LinearTerm::Constant(v) => assert_eq!(*v, 42),
+                _ => panic!("expected Constant term"),
+            }
+        }
+        _ => panic!("expected Linear variant"),
     }
 }
 
