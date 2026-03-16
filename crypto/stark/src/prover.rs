@@ -1680,9 +1680,8 @@ pub trait IsStarkProver<
                             domain,
                             twiddles,
                         );
-                        let (tree, root) =
-                            Self::commit_columns(&pool.aux[..num_aux_cols])
-                                .ok_or(ProvingError::EmptyCommitment)?;
+                        let (tree, root) = Self::commit_columns(&pool.aux[..num_aux_cols])
+                            .ok_or(ProvingError::EmptyCommitment)?;
                         Ok((Some(Arc::new(tree)), Some(root)))
                     } else {
                         Ok((None, None))
