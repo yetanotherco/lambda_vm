@@ -648,13 +648,21 @@ impl CpuOperation {
         } else {
             (0, 0)
         };
+        // CM50: (1 - read_register2) * rv2[i] = 0. When read_register2=0, rv2 must be 0.
+        // For example, ECALL has read_register2=0 (rs2 defaults to 0). The commit buf_addr is
+        // carried separately in commit_buf_addr and does not go through rv2.
+        let rv2 = if !decode.read_register2 {
+            0
+        } else {
+            log.src2_val
+        };
 
         let mut op = Self {
             decode,
             timestamp,
             next_pc: log.next_pc,
             rv1: log.src1_val,
-            rv2: log.src2_val,
+            rv2,
             rvd: log.dst_val,
             res: log.dst_val, // Default: result is destination value
             is_equal: false,
@@ -768,11 +776,10 @@ pub fn generate_cpu_trace(
         data[base + cols::RS1] = FE::from(d.rs1 as u64);
         data[base + cols::RS2] = FE::from(d.rs2 as u64);
         data[base + cols::RD] = FE::from(d.rd as u64);
-        // Only set read/write register flags when register is a real register
-        // Skip x0 (hardwired zero) and x255 (virtual PC register for AUIPC/JAL)
-        // This matches trace_builder which only generates MEMW rows for real registers
-        data[base + cols::READ_REGISTER1] =
-            FE::from((d.read_register1 && d.rs1 != 0 && d.rs1 != 255) as u64);
+        // Skip x0 (hardwired zero). x255 is the register where the pc is stored
+        // (per spec decode.md). read_register1=1 for rs1=255 ensures the CM47 MEMW
+        // interaction is sent and rv1 is not forced to zero by CM48.
+        data[base + cols::READ_REGISTER1] = FE::from((d.read_register1 && d.rs1 != 0) as u64);
         data[base + cols::READ_REGISTER2] = FE::from((d.read_register2 && d.rs2 != 0) as u64);
         data[base + cols::WRITE_REGISTER] = FE::from((d.write_register && d.rd != 0) as u64);
         data[base + cols::MEMORY_2BYTES] = FE::from(d.memory_2bytes as u64);
@@ -1280,10 +1287,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::MP_SELECTOR,
                 packing: Packing::Direct,
             },
-            // result (rvd) as DWordWL (2 words → 2 elements)
+            // result (res) as DWordBL (8 bytes → 2 elements) per spec CPU-CA44.
+            // Must send res (raw MUL output), not rvd. For MULW, rvd = sign_extend(res[31:0]),
+            // which can differ from res when bits [63:32] ≠ sign_extend(bit31) of res.
             BusValue::Packed {
-                start_column: cols::RVD_0,
-                packing: Packing::DWordWL,
+                start_column: cols::RES[0],
+                packing: Packing::DWordBL,
             },
             // muldiv_selector: 0=lo (MUL), 1=hi (MULH/MULHSU/MULHU)
             BusValue::Packed {
@@ -1317,10 +1326,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::SIGNED,
                 packing: Packing::Direct,
             },
-            // result (rvd) as DWordWL (2 words → 2 elements)
+            // result (res) as DWordBL (8 bytes → 2 elements) per spec CPU-CA45.
+            // Must send res (raw DVRM output), not rvd. For DIVW/REMW, rvd = sign_extend(res[31:0]),
+            // which can differ from res when bits [63:32] ≠ sign_extend(bit31) of res.
             BusValue::Packed {
-                start_column: cols::RVD_0,
-                packing: Packing::DWordWL,
+                start_column: cols::RES[0],
+                packing: Packing::DWordBL,
             },
             // muldiv_selector: 0=quotient (DIV), 1=remainder (REM)
             BusValue::Packed {
