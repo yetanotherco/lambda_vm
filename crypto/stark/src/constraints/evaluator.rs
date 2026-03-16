@@ -67,35 +67,50 @@ where
 
         // Per-thread buffers via map_init: each Rayon worker allocates once,
         // then reuses for all iterations assigned to that thread.
-        // The Frame is pre-allocated and filled in-place to avoid Vec allocations
-        // on every LDE point (a significant fraction of total CPU time).
+        //
+        // When rows_per_step == 1 (all VM tables), the Frame uses LDE base pointers
+        // for zero-copy access — only the row offset is updated per LDE point,
+        // eliminating all element copies. For step_size > 1, we fall back to the
+        // copy-based path.
         let blowup_factor = lde_trace.blowup_factor;
         let lde_step_size = lde_trace.lde_step_size;
         let rows_per_step = lde_step_size / blowup_factor;
-        let num_main_cols = lde_trace.num_main_cols();
-        let num_aux_cols = lde_trace.num_aux_cols();
+        let num_rows = lde_trace.num_rows();
         let num_offsets = offsets.len();
+        let use_zero_copy = rows_per_step == 1;
 
         #[cfg(feature = "parallel")]
         {
+            let num_main_cols = lde_trace.num_main_cols();
+            let num_aux_cols = lde_trace.num_aux_cols();
+
             let evaluations_t: Vec<_> = boundary_evaluation
                 .into_par_iter()
                 .enumerate()
                 .map_init(
                     || {
-                        (
-                            vec![FieldElement::<FieldExtension>::zero(); num_transition],
-                            vec![FieldElement::<Field>::zero(); num_periodic],
+                        let frame = if use_zero_copy {
+                            Frame::preallocate_lde(lde_trace, num_offsets)
+                        } else {
                             Frame::preallocate(
                                 num_offsets,
                                 rows_per_step,
                                 num_main_cols,
                                 num_aux_cols,
-                            ),
+                            )
+                        };
+                        (
+                            vec![FieldElement::<FieldExtension>::zero(); num_transition],
+                            vec![FieldElement::<Field>::zero(); num_periodic],
+                            frame,
                         )
                     },
                     |(transition_buf, periodic_buf, frame), (i, boundary)| {
-                        frame.fill_from_lde(lde_trace, i, offsets);
+                        if use_zero_copy {
+                            frame.bind_to_lde(i, num_rows, lde_step_size, offsets);
+                        } else {
+                            frame.fill_from_lde(lde_trace, i, offsets);
+                        }
 
                         for (j, col) in lde_periodic_columns.iter().enumerate() {
                             periodic_buf[j] = col[i].clone();
@@ -137,16 +152,26 @@ where
 
         #[cfg(not(feature = "parallel"))]
         {
+            let num_main_cols = lde_trace.num_main_cols();
+            let num_aux_cols = lde_trace.num_aux_cols();
+
             let mut transition_buf = vec![FieldElement::<FieldExtension>::zero(); num_transition];
             let mut periodic_buf = vec![FieldElement::<Field>::zero(); num_periodic];
-            let mut frame =
-                Frame::preallocate(num_offsets, rows_per_step, num_main_cols, num_aux_cols);
+            let mut frame = if use_zero_copy {
+                Frame::preallocate_lde(lde_trace, num_offsets)
+            } else {
+                Frame::preallocate(num_offsets, rows_per_step, num_main_cols, num_aux_cols)
+            };
 
             boundary_evaluation
                 .into_iter()
                 .enumerate()
                 .map(|(i, boundary)| {
-                    frame.fill_from_lde(lde_trace, i, offsets);
+                    if use_zero_copy {
+                        frame.bind_to_lde(i, num_rows, lde_step_size, offsets);
+                    } else {
+                        frame.fill_from_lde(lde_trace, i, offsets);
+                    }
 
                     for (j, col) in lde_periodic_columns.iter().enumerate() {
                         periodic_buf[j] = col[i].clone();

@@ -1,4 +1,7 @@
-use crate::{table::TableView, trace::LDETraceTable};
+use crate::{
+    table::{LdeRowRef, TableView},
+    trace::LDETraceTable,
+};
 use itertools::Itertools;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
@@ -140,6 +143,59 @@ impl<F: IsSubFieldOf<E>, E: IsField> Frame<F, E> {
 
                 sub_row_idx += 1;
                 step_row += blowup_factor;
+            }
+        }
+    }
+
+    /// Pre-allocate a Frame for LDE-backed zero-copy access.
+    ///
+    /// Base pointers are captured from `lde_trace` columns and never change.
+    /// Only `row_offset` is updated per LDE point via `bind_to_lde`.
+    /// This eliminates all per-point element copies in the constraint evaluation loop.
+    pub fn preallocate_lde(lde_trace: &LDETraceTable<F, E>, num_offsets: usize) -> Self {
+        let main_base: Vec<*const FieldElement<F>> =
+            lde_trace.main_columns.iter().map(|c| c.as_ptr()).collect();
+        let aux_base: Vec<*const FieldElement<E>> =
+            lde_trace.aux_columns.iter().map(|c| c.as_ptr()).collect();
+
+        let steps = (0..num_offsets)
+            .map(|_| TableView {
+                data: Vec::new(),
+                aux_data: Vec::new(),
+                lde_main: Some(LdeRowRef {
+                    base_ptrs: main_base.clone(),
+                    row_offset: 0,
+                }),
+                lde_aux: Some(LdeRowRef {
+                    base_ptrs: aux_base.clone(),
+                    row_offset: 0,
+                }),
+            })
+            .collect();
+        Frame { steps }
+    }
+
+    /// Update row offsets for the current LDE domain point. No element copies.
+    ///
+    /// Each step's LDE references are rebased to point at the correct row in
+    /// the LDE column buffers. This replaces the element-by-element copying
+    /// that `fill_from_lde` performs.
+    #[inline]
+    pub fn bind_to_lde(
+        &mut self,
+        row: usize,
+        num_rows: usize,
+        step_size: usize,
+        offsets: &[usize],
+    ) {
+        for (step_idx, &offset) in offsets.iter().enumerate() {
+            let step_row_idx = (row + offset * step_size) % num_rows;
+            let step = &mut self.steps[step_idx];
+            if let Some(ref mut lde) = step.lde_main {
+                lde.row_offset = step_row_idx;
+            }
+            if let Some(ref mut lde) = step.lde_aux {
+                lde.row_offset = step_row_idx;
             }
         }
     }

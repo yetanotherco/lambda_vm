@@ -194,10 +194,53 @@ impl<F: IsField> Table<F> {
     }
 }
 
+/// Base pointers to LDE column data + row offset for zero-copy access.
+///
+/// # Safety
+/// The raw pointers in `base_ptrs` must remain valid and the underlying data
+/// must not be mutated for the entire lifetime of the `LdeRowRef`. This is
+/// guaranteed when the `LDETraceTable` is immutably borrowed for the duration
+/// of `evaluate_transitions`.
+pub(crate) struct LdeRowRef<T: IsField> {
+    pub(crate) base_ptrs: Vec<*const FieldElement<T>>,
+    pub(crate) row_offset: usize,
+}
+
+// SAFETY: All threads read from the same immutable LDE data; no mutable aliasing.
+unsafe impl<T: IsField> Send for LdeRowRef<T> {}
+unsafe impl<T: IsField> Sync for LdeRowRef<T> {}
+
+impl<T: IsField> Clone for LdeRowRef<T> {
+    fn clone(&self) -> Self {
+        Self {
+            base_ptrs: self.base_ptrs.clone(),
+            row_offset: self.row_offset,
+        }
+    }
+}
+
+impl<T: IsField> std::fmt::Debug for LdeRowRef<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LdeRowRef")
+            .field("num_cols", &self.base_ptrs.len())
+            .field("row_offset", &self.row_offset)
+            .finish()
+    }
+}
+
+impl<T: IsField> PartialEq for LdeRowRef<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.base_ptrs == other.base_ptrs && self.row_offset == other.row_offset
+    }
+}
+
+impl<T: IsField> Eq for LdeRowRef<T> {}
+
 /// A view of a contiguous subset of rows of a table.
 ///
-/// Owns its row data (Vec per row) so it can be built from either row-major Tables
-/// (verifier path) or column-major LDE data (prover path) without lifetime issues.
+/// In the verifier path, row data is owned (`data`/`aux_data` Vecs).
+/// In the prover hot loop, `lde_main`/`lde_aux` provide zero-copy access
+/// to column-major LDE data via base pointers + row offset.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TableView<F, E>
 where
@@ -206,6 +249,8 @@ where
 {
     pub data: Vec<Vec<FieldElement<F>>>,
     pub aux_data: Vec<Vec<FieldElement<E>>>,
+    pub(crate) lde_main: Option<LdeRowRef<F>>,
+    pub(crate) lde_aux: Option<LdeRowRef<E>>,
 }
 
 impl<F, E> TableView<F, E>
@@ -214,14 +259,40 @@ where
     F: IsSubFieldOf<F>,
 {
     pub fn new(data: Vec<Vec<FieldElement<F>>>, aux_data: Vec<Vec<FieldElement<E>>>) -> Self {
-        Self { data, aux_data }
+        Self {
+            data,
+            aux_data,
+            lde_main: None,
+            lde_aux: None,
+        }
     }
 
+    #[inline]
     pub fn get_main_evaluation_element(&self, row: usize, col: usize) -> &FieldElement<F> {
-        &self.data[row][col]
+        if let Some(ref lde) = self.lde_main {
+            debug_assert_eq!(
+                row, 0,
+                "LDE-backed TableView only supports row 0 (step_size=1)"
+            );
+            // SAFETY: base_ptrs[col] points to lde_column[col][0], and row_offset < column.len().
+            // The LDETraceTable is immutably borrowed for the entire evaluate_transitions call.
+            unsafe { &*lde.base_ptrs[col].add(lde.row_offset) }
+        } else {
+            &self.data[row][col]
+        }
     }
 
+    #[inline]
     pub fn get_aux_evaluation_element(&self, row: usize, col: usize) -> &FieldElement<E> {
-        &self.aux_data[row][col]
+        if let Some(ref lde) = self.lde_aux {
+            debug_assert_eq!(
+                row, 0,
+                "LDE-backed TableView only supports row 0 (step_size=1)"
+            );
+            // SAFETY: same as get_main_evaluation_element.
+            unsafe { &*lde.base_ptrs[col].add(lde.row_offset) }
+        } else {
+            &self.aux_data[row][col]
+        }
     }
 }
