@@ -425,8 +425,13 @@ fn process_single_layer_block<F, E>(
 #[cfg(feature = "alloc")]
 #[derive(Clone)]
 pub struct LayerTwiddles<F: IsField> {
-    /// Twiddles organized by layer, stored contiguously for sequential access.
-    pub layers: Vec<Vec<FieldElement<F>>>,
+    /// All twiddle factors stored in a single contiguous allocation.
+    /// Layers are packed sequentially: layer 0 (n/2 elements), layer 1 (n/4), ..., last layer (1).
+    data: Vec<FieldElement<F>>,
+    /// Total FFT size (2^order).
+    fft_size: usize,
+    /// FFT order (number of layers).
+    order: usize,
 }
 
 #[cfg(feature = "alloc")]
@@ -480,7 +485,8 @@ impl<F: IsFFTField> LayerTwiddles<F> {
         }
 
         let n = 1usize << order;
-        let mut layers = Vec::with_capacity(order as usize);
+        let total = if n > 0 { n - 1 } else { 0 };
+        let mut data = Vec::with_capacity(total);
 
         for layer in 0..order as usize {
             debug_assert!(
@@ -491,19 +497,20 @@ impl<F: IsFFTField> LayerTwiddles<F> {
             let stride = 1usize << layer;
             let count = n >> (layer + 1);
 
-            let mut layer_twiddles = Vec::with_capacity(count);
             let w_stride = root.pow(stride as u64);
             let mut current = FieldElement::<F>::one();
 
             for _ in 0..count {
-                layer_twiddles.push(current.clone());
+                data.push(current.clone());
                 current = &current * &w_stride;
             }
-
-            layers.push(layer_twiddles);
         }
 
-        Some(Self { layers })
+        Some(Self {
+            data,
+            fft_size: n,
+            order: order as usize,
+        })
     }
 
     /// Get the twiddles for a specific layer.
@@ -513,18 +520,20 @@ impl<F: IsFFTField> LayerTwiddles<F> {
     #[inline(always)]
     pub fn get_layer(&self, layer: usize) -> &[FieldElement<F>] {
         assert!(
-            layer < self.layers.len(),
+            layer < self.order,
             "Layer index out of bounds: {} >= {}",
             layer,
-            self.layers.len()
+            self.order
         );
-        &self.layers[layer]
+        let start = self.fft_size - (self.fft_size >> layer);
+        let count = self.fft_size >> (layer + 1);
+        &self.data[start..start + count]
     }
 
     /// Returns the number of layers (equal to the FFT order).
     #[inline(always)]
     pub fn num_layers(&self) -> usize {
-        self.layers.len()
+        self.order
     }
 }
 
