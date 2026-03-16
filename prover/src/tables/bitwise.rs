@@ -16,8 +16,7 @@
 //! - `ZERO[X]` -> whether X is zero
 //!
 //! ## Shift Helpers
-//! - `HWSL[X, Z]` -> (X << Z) mod 2^16
-//! - `HWSLC[X, Z]` -> X >> (16 - Z)
+//! - `HWSL[X, Z]` -> [(X << Z) mod 2^16, X >> (16 - Z)]
 //!
 //! ## Table Structure
 //!
@@ -93,11 +92,9 @@ pub mod cols {
     pub const MU_IS_B20: usize = 19;
     /// Multiplicity for HWSL lookups
     pub const MU_HWSL: usize = 20;
-    /// Multiplicity for HWSLC lookups
-    pub const MU_HWSLC: usize = 21;
 
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 22;
+    pub const NUM_COLUMNS: usize = 21;
 }
 
 /// Number of rows in the BITWISE table: 256 * 256 * 16 = 2^20
@@ -385,7 +382,6 @@ pub fn update_multiplicities(
             BitwiseOperationType::IsHalf => cols::MU_IS_HALF,
             BitwiseOperationType::IsB20 => cols::MU_IS_B20,
             BitwiseOperationType::Hwsl => cols::MU_HWSL,
-            BitwiseOperationType::Hwslc => cols::MU_HWSLC,
         };
 
         // Increment multiplicity
@@ -422,7 +418,7 @@ pub(crate) fn trim_zero_rows(
         .filter(|&row| {
             let row_data = trace.main_table.get_row(row);
             // Check all multiplicity columns (indices 11-21)
-            (cols::MU_AND..=cols::MU_HWSLC).any(|col| row_data[col] != FE::zero())
+            (cols::MU_AND..=cols::MU_HWSL).any(|col| row_data[col] != FE::zero())
         })
         .collect();
 
@@ -463,7 +459,6 @@ pub enum BitwiseOperationType {
     IsHalf,
     IsB20,
     Hwsl,
-    Hwslc,
 }
 
 /// A lookup request to the BITWISE precomputed table.
@@ -715,7 +710,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 },
             ])],
         ),
-        // HWSL[X + 256*Y, Z] -> SLL
+        // HWSL[X + 256*Y, Z] -> [SLL, SLLC]
         BusInteraction::receiver(
             BusId::Hwsl,
             Multiplicity::Column(cols::MU_HWSL),
@@ -736,27 +731,6 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 },
                 BusValue::Packed {
                     start_column: cols::SLL,
-                    packing: Packing::Direct,
-                },
-            ],
-        ),
-        // HWSLC[X + 256*Y, Z] -> SLLC
-        BusInteraction::receiver(
-            BusId::Hwslc,
-            Multiplicity::Column(cols::MU_HWSLC),
-            vec![
-                BusValue::linear(vec![
-                    stark::lookup::LinearTerm::Column {
-                        coefficient: 1,
-                        column: cols::X,
-                    },
-                    stark::lookup::LinearTerm::Column {
-                        coefficient: 256,
-                        column: cols::Y,
-                    },
-                ]),
-                BusValue::Packed {
-                    start_column: cols::Z,
                     packing: Packing::Direct,
                 },
                 BusValue::Packed {

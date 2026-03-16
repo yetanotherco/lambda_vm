@@ -12,8 +12,8 @@
 //! - Auxiliary: `is_negative`, `bit_shift`, `zbs`, `X[0..4]`, `Y[0..3]`, `limb_shift[0..3]`
 //! - Multiplicity: `μ`
 //!
-//! ## Bus Interactions (15 total)
-//! - Senders: MSB16, AND_BYTE (×3), ZERO, HWSL (×5), HWSLC (×4)
+//! ## Bus Interactions (11 total)
+//! - Senders: MSB16, AND_BYTE (×3), ZERO, HWSL (×5)
 //! - Receiver: SHIFT (from CPU)
 
 use math::field::element::FieldElement;
@@ -369,7 +369,7 @@ pub fn generate_shift_trace(
 
 /// Creates all bus interactions for the SHIFT table.
 pub fn bus_interactions() -> Vec<BusInteraction> {
-    let mut interactions = Vec::with_capacity(15);
+    let mut interactions = Vec::with_capacity(11);
 
     // SHIFT-C14: MSB16[in[3]] → is_negative | signed
     interactions.push(BusInteraction::sender(
@@ -460,8 +460,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // SHIFT-C4.i: HWSL[in[i], bit_shift] → X[i] for i∈[0,3] | 1 - zbs
-    // HWSL receiver: [x + 256*y (halfword), z (shift amount), SLL (result)]
+    // SHIFT-C4.i: HWSL[in[i], bit_shift] → [X[i], Y[i]] for i∈[0,3] | 1 - zbs
+    // HWSL receiver: [x + 256*y (halfword), z (shift amount), SLL, SLLC]
     let one_minus_zbs = Multiplicity::Linear(vec![
         LinearTerm::Constant(1),
         LinearTerm::Column {
@@ -486,12 +486,17 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     start_column: cols::X[i],
                     packing: Packing::Direct,
                 },
+                BusValue::Packed {
+                    start_column: cols::Y[i],
+                    packing: Packing::Direct,
+                },
             ],
         ));
     }
 
-    // SHIFT-C6: HWSL[extension, bit_shift] → X[4] | 1 - zbs
+    // SHIFT-C7: HWSL[extension, bit_shift] → [X[4], extension - X[4]] | 1 - zbs
     // extension = 65535 * is_negative (virtual)
+    // second output = extension - X[4] (the carry, expressed as a linear combination)
     interactions.push(BusInteraction::sender(
         BusId::Hwsl,
         one_minus_zbs.clone(),
@@ -508,30 +513,18 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::X_4,
                 packing: Packing::Direct,
             },
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 65535,
+                    column: cols::IS_NEGATIVE,
+                },
+                LinearTerm::Column {
+                    coefficient: -1,
+                    column: cols::X_4,
+                },
+            ]),
         ],
     ));
-
-    // SHIFT-C8.i: HWSLC[in[i], bit_shift] → Y[i] for i∈[0,3] | 1 - zbs
-    for i in 0..4 {
-        interactions.push(BusInteraction::sender(
-            BusId::Hwslc,
-            one_minus_zbs.clone(),
-            vec![
-                BusValue::Packed {
-                    start_column: cols::IN[i],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::BIT_SHIFT,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::Y[i],
-                    packing: Packing::Direct,
-                },
-            ],
-        ));
-    }
 
     // SHIFT-C11: AND_BYTE[encoded_limb; shift, mask] | μ
     // encoded = (1 - ls[0]) + 15*ls[1] + 31*ls[2] + 47*ls[3]
@@ -912,7 +905,9 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
         // C3: ZERO[bit_shift] | μ (= 1)
         bitwise_ops.push(BitwiseOperation::zero(aux.bit_shift as u32));
 
-        // C4.i + C6 + C8.i: HWSL/HWSLC lookups | 1-zbs
+        // C4.i + C7: HWSL paired lookups | 1-zbs
+        // Each HWSL lookup returns [SLL, SLLC], constraining both X[i] and Y[i]
+        // from the same input in a single bus interaction.
         if !aux.zbs {
             for i in 0..4 {
                 let x = (op.in_halves[i] & 0xFF) as u8;
@@ -924,7 +919,7 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
                     aux.bit_shift,
                 ));
             }
-            // C6: HWSL[extension, bit_shift]
+            // C7: HWSL[extension, bit_shift] → [X[4], extension - X[4]]
             let extension: u16 = if aux.is_negative { 0xFFFF } else { 0 };
             let ext_x = (extension & 0xFF) as u8;
             let ext_y = (extension >> 8) as u8;
@@ -934,18 +929,6 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
                 ext_y,
                 aux.bit_shift,
             ));
-
-            // C8.i: HWSLC lookups | 1-zbs
-            for i in 0..4 {
-                let x = (op.in_halves[i] & 0xFF) as u8;
-                let y = (op.in_halves[i] >> 8) as u8;
-                bitwise_ops.push(BitwiseOperation::shift_op(
-                    BitwiseOperationType::Hwslc,
-                    x,
-                    y,
-                    aux.bit_shift,
-                ));
-            }
         }
 
         // C11: AND_BYTE[shift, mask] | μ (= 1)
