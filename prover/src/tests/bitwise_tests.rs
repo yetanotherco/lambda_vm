@@ -93,8 +93,8 @@ fn test_zero_check() {
 #[test]
 fn test_bus_interactions_count() {
     let interactions = bus_interactions();
-    // Should have 11 interactions (one for each lookup type)
-    assert_eq!(interactions.len(), 11);
+    // Should have 10 interactions (one for each lookup type; HWSLC merged into HWSL)
+    assert_eq!(interactions.len(), 10);
 }
 
 #[test]

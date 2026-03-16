@@ -69,10 +69,8 @@ pub enum BusId {
     // =========================================================================
     // Shift helpers (BITWISE table provides)
     // =========================================================================
-    /// Halfword shift left: HWSL[X, Z] -> (X << Z) & 0xFFFF
+    /// Halfword shift left: HWSL[X, Z] -> [(X << Z) & 0xFFFF, X >> (16 - Z)]
     Hwsl,
-    /// Halfword shift left carry: HWSLC[X, Z] -> X >> (16 - Z)
-    Hwslc,
 
     // =========================================================================
     // Arithmetic operations (separate tables)
@@ -126,7 +124,6 @@ impl BusId {
             BusId::Msb16 => "Msb16",
             BusId::Zero => "Zero",
             BusId::Hwsl => "Hwsl",
-            BusId::Hwslc => "Hwslc",
             BusId::Lt => "Lt",
             BusId::Mul => "Mul",
             BusId::Shift => "Shift",
@@ -158,9 +155,9 @@ impl TryFrom<u64> for BusId {
             7 => Ok(BusId::Msb16),
             8 => Ok(BusId::Zero),
             9 => Ok(BusId::Hwsl),
-            10 => Ok(BusId::Hwslc),
-            11 => Ok(BusId::Lt),
-            12 => Ok(BusId::Mul),
+            10 => Ok(BusId::Lt),
+            11 => Ok(BusId::Mul),
+            12 => Ok(BusId::Dvrm),
             13 => Ok(BusId::Shift),
             14 => Ok(BusId::Memw),
             15 => Ok(BusId::Load),
