@@ -16,9 +16,6 @@ use super::cpu::{
 #[cfg(feature = "parallel")]
 use super::cpu::bowers_fft::{bowers_fft_opt_fused_parallel, bowers_ifft_opt_parallel};
 
-#[cfg(feature = "parallel")]
-use rayon::prelude::*;
-
 /// Threshold for dispatching to parallel FFT.
 /// Below this size, sequential FFT is faster (avoids Rayon overhead).
 /// At 2^14 = 16384 elements, the parallel version starts to win
@@ -54,31 +51,6 @@ fn dispatch_ifft<F: IsFFTField + IsSubFieldOf<E>, E: IsField + Send + Sync>(
         }
     }
     bowers_ifft_opt(buffer, twiddles)
-}
-
-/// Scale buffer elements by pre-computed weights: buffer[i] *= weights[i].
-/// Uses parallel iteration for large buffers (>= PARALLEL_FFT_THRESHOLD).
-#[inline]
-fn scale_by_weights<F, E>(buffer: &mut [FieldElement<E>], weights: &[FieldElement<F>])
-where
-    F: IsField + Send + Sync + IsSubFieldOf<E>,
-    E: IsField + Send + Sync,
-{
-    #[cfg(feature = "parallel")]
-    {
-        if buffer.len() >= PARALLEL_FFT_THRESHOLD {
-            buffer
-                .par_iter_mut()
-                .zip(weights.par_iter())
-                .for_each(|(coeff, w)| {
-                    *coeff = w * &*coeff;
-                });
-            return;
-        }
-    }
-    for (coeff, w) in buffer.iter_mut().zip(weights.iter()) {
-        *coeff = w * &*coeff;
-    }
 }
 
 impl<E: IsField> Polynomial<FieldElement<E>> {
@@ -165,18 +137,6 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         E: Send + Sync,
     {
         interpolate_fft_cpu::<F, E>(fft_evals)
-    }
-
-    /// Same as [`interpolate_fft`] but accepts pre-computed inverse twiddles.
-    /// Use when multiple columns of the same size share twiddles.
-    pub fn interpolate_fft_with_twiddles<F: IsFFTField + IsSubFieldOf<E>>(
-        fft_evals: &[FieldElement<E>],
-        inv_twiddles: &LayerTwiddles<F>,
-    ) -> Result<Self, FFTError>
-    where
-        E: Send + Sync,
-    {
-        interpolate_fft_cpu_with_twiddles::<F, E>(fft_evals, inv_twiddles)
     }
 
     /// Returns a new polynomial that interpolates offset `(w^i, fft_evals[i])`, with `w` being a
@@ -352,7 +312,10 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         in_place_bit_reverse_permute(&mut buffer[..n]);
         dispatch_ifft(&mut buffer[..n], inv_twiddles)?;
 
-        scale_by_weights(&mut buffer[..n], weights);
+        // Scale using pre-computed weights (base field) — F × E → E mixed multiplication.
+        for (coeff, w) in buffer[..n].iter_mut().zip(weights.iter()) {
+            *coeff = w * &*coeff;
+        }
 
         dispatch_fft(buffer, fwd_twiddles)?;
         in_place_bit_reverse_permute(buffer);
@@ -361,16 +324,6 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     }
 
     /// In-place coset LDE: the buffer already contains N evaluation points at `[0..N]`.
-    ///
-    /// This expands the buffer from N elements to `N * blowup_factor` by performing:
-    /// 1. iFFT on buffer[..N]
-    /// 2. Scale by pre-computed weights
-    /// 3. Zero-pad to N * blowup_factor
-    /// 4. Forward FFT on the full buffer
-    ///
-    /// Unlike [`coset_lde_full_into`], this skips the `clear + extend_from_slice` step
-    /// since data is already in the buffer. Used for transpose elimination: columns are
-    /// extracted directly into pool buffers, then expanded in-place.
     ///
     /// This expands the buffer from N elements to `N * blowup_factor` by performing:
     /// 1. iFFT on buffer[..N]
@@ -408,7 +361,10 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         in_place_bit_reverse_permute(&mut buffer[..n]);
         dispatch_ifft(&mut buffer[..n], inv_twiddles)?;
 
-        scale_by_weights(&mut buffer[..n], weights);
+        // 2. Scale using pre-computed weights (base field) — F × E → E mixed multiplication.
+        for (coeff, w) in buffer[..n].iter_mut().zip(weights.iter()) {
+            *coeff = w * &*coeff;
+        }
 
         // 3. Zero-pad to lde_size
         buffer.resize(lde_size, FieldElement::zero());
@@ -448,7 +404,10 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         in_place_bit_reverse_permute(&mut buffer[..n]);
         dispatch_ifft(&mut buffer[..n], inv_twiddles)?;
 
-        scale_by_weights(&mut buffer[..n], weights);
+        // Scale using pre-computed weights (base field) — F × E → E mixed multiplication.
+        for (coeff, w) in buffer[..n].iter_mut().zip(weights.iter()) {
+            *coeff = w * &*coeff;
+        }
 
         buffer.resize(lde_size, FieldElement::zero());
 
@@ -581,33 +540,8 @@ where
     let layer_twiddles =
         LayerTwiddles::<F>::new(order).ok_or(FFTError::DomainSizeError(order as usize))?;
 
-    evaluate_fft_cpu_with_twiddles::<F, E>(coeffs, &layer_twiddles)
-}
-
-/// Same as [`evaluate_fft_cpu`] but accepts pre-computed forward twiddles.
-pub fn evaluate_fft_cpu_with_twiddles<F, E>(
-    coeffs: &[FieldElement<E>],
-    layer_twiddles: &LayerTwiddles<F>,
-) -> Result<Vec<FieldElement<E>>, FFTError>
-where
-    F: IsFFTField + IsSubFieldOf<E>,
-    E: IsField + Send + Sync,
-{
-    let n = coeffs.len();
-    if !n.is_power_of_two() {
-        return Err(FFTError::InputError(n));
-    }
-    debug_assert_eq!(
-        layer_twiddles.num_layers(),
-        n.trailing_zeros() as usize,
-        "twiddle table has {} layers but input size {} requires {}",
-        layer_twiddles.num_layers(),
-        n,
-        n.trailing_zeros()
-    );
-
     let mut result = coeffs.to_vec();
-    dispatch_fft(&mut result, layer_twiddles)?;
+    dispatch_fft(&mut result, &layer_twiddles)?;
     in_place_bit_reverse_permute(&mut result);
     Ok(result)
 }
@@ -645,35 +579,10 @@ where
     let inv_twiddles =
         LayerTwiddles::<F>::new_inverse(order).ok_or(FFTError::DomainSizeError(order as usize))?;
 
-    interpolate_fft_cpu_with_twiddles::<F, E>(fft_evals, &inv_twiddles)
-}
-
-/// Same as [`interpolate_fft_cpu`] but accepts pre-computed inverse twiddles.
-pub fn interpolate_fft_cpu_with_twiddles<F, E>(
-    fft_evals: &[FieldElement<E>],
-    inv_twiddles: &LayerTwiddles<F>,
-) -> Result<Polynomial<FieldElement<E>>, FFTError>
-where
-    F: IsFFTField + IsSubFieldOf<E>,
-    E: IsField + Send + Sync,
-{
-    let n = fft_evals.len();
-    if !n.is_power_of_two() {
-        return Err(FFTError::InputError(n));
-    }
-    debug_assert_eq!(
-        inv_twiddles.num_layers(),
-        n.trailing_zeros() as usize,
-        "twiddle table has {} layers but input size {} requires {}",
-        inv_twiddles.num_layers(),
-        n,
-        n.trailing_zeros()
-    );
-
     let mut coeffs = fft_evals.to_vec();
     // Bowers iFFT: bit-reverse first (natural → bit-reversed), then DIT inverse butterflies
     in_place_bit_reverse_permute(&mut coeffs);
-    dispatch_ifft(&mut coeffs, inv_twiddles)?;
+    dispatch_ifft(&mut coeffs, &inv_twiddles)?;
 
     // Scale by 1/n
     let scale_factor = FieldElement::from(n as u64).inv().unwrap();
