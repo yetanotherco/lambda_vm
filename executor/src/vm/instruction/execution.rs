@@ -6,12 +6,11 @@ use crate::vm::{
 };
 
 const REGULAR_PC_UPDATE: u64 = 4;
-pub const COMMIT_SYSCALL_NUMBER: u64 = 3;
 
 pub enum SyscallNumbers {
     Print = 1,
     Panic = 2,
-    Commit = COMMIT_SYSCALL_NUMBER as isize,
+    Commit = 3,
     GetPrivateInputs = 4,
     Halt = 93,
 }
@@ -22,7 +21,7 @@ impl TryFrom<u64> for SyscallNumbers {
         match value {
             1 => Ok(SyscallNumbers::Print),
             2 => Ok(SyscallNumbers::Panic),
-            COMMIT_SYSCALL_NUMBER => Ok(SyscallNumbers::Commit),
+            3 => Ok(SyscallNumbers::Commit),
             4 => Ok(SyscallNumbers::GetPrivateInputs),
             93 => Ok(SyscallNumbers::Halt),
             _ => Err(()),

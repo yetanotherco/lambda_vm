@@ -1,6 +1,6 @@
 //! COMMIT (ECALL) table for writing bytes to stdout.
 //!
-//! This table handles the repo's `Commit` syscall (ECALL #3): writing bytes from a memory
+//! This table handles the `write` syscall (ECALL #64): writing bytes from a memory
 //! buffer to stdout. It uses a **recursive design** — each row commits one byte,
 //! and rows are linked via a self-referencing "CommitNextByte" bus.
 //!
@@ -43,7 +43,6 @@
 //! - `count_decr_carry_0`: SUB template carry_0 for count_decr + 1 = count (degree 2)
 //! - `count_decr_carry_1`: SUB template carry_1 for count_decr + 1 = count (degree 2)
 //!
-use executor::vm::instruction::execution::COMMIT_SYSCALL_NUMBER;
 use math::field::element::FieldElement;
 use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
@@ -282,8 +281,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     start_column: cols::TIMESTAMP_1,
                     packing: Packing::Direct,
                 },
-                BusValue::constant(COMMIT_SYSCALL_NUMBER), // syscall number lo32 = Commit
-                BusValue::constant(0),                     // syscall number hi32 = 0
+                BusValue::constant(3), // syscall number lo32 = Commit (3)
+                BusValue::constant(0), // syscall number hi32 = 0
             ],
         ),
         // 2. Send to CommitNextByte (mult = mu - end)

@@ -44,8 +44,9 @@ pub const NUM_REGISTERS: usize = 34;
 pub const WORDS_PER_REGISTER: usize = 2;
 
 /// Total number of register Word addresses.
-/// x0-x31 use addresses 0..63, x254 uses 508, x255 uses 510..511.
-pub const NUM_REGISTER_ADDRESSES: usize = 67;
+/// x0-x31 use addresses 0..63, x254 uses address 508, x255 uses addresses 510..511.
+/// -1 because x254 is single-word (1 address instead of 2).
+pub const NUM_REGISTER_ADDRESSES: usize = NUM_REGISTERS * WORDS_PER_REGISTER - 1;
 
 /// Number of preprocessed columns (OFFSET, INIT).
 /// OFFSET encodes the Word address, INIT holds the initial value.
