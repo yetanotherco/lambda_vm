@@ -69,10 +69,8 @@ pub enum BusId {
     // =========================================================================
     // Shift helpers (BITWISE table provides)
     // =========================================================================
-    /// Halfword shift left: HWSL[X, Z] -> (X << Z) & 0xFFFF
+    /// Halfword shift left: HWSL[X, Z] -> [(X << Z) & 0xFFFF, X >> (16 - Z)]
     Hwsl,
-    /// Halfword shift left carry: HWSLC[X, Z] -> X >> (16 - Z)
-    Hwslc,
 
     // =========================================================================
     // Arithmetic operations (separate tables)
@@ -126,7 +124,6 @@ impl BusId {
             BusId::Msb16 => "Msb16",
             BusId::Zero => "Zero",
             BusId::Hwsl => "Hwsl",
-            BusId::Hwslc => "Hwslc",
             BusId::Lt => "Lt",
             BusId::Mul => "Mul",
             BusId::Shift => "Shift",
@@ -158,9 +155,9 @@ impl TryFrom<u64> for BusId {
             7 => Ok(BusId::Msb16),
             8 => Ok(BusId::Zero),
             9 => Ok(BusId::Hwsl),
-            10 => Ok(BusId::Hwslc),
-            11 => Ok(BusId::Lt),
-            12 => Ok(BusId::Mul),
+            10 => Ok(BusId::Lt),
+            11 => Ok(BusId::Mul),
+            12 => Ok(BusId::Dvrm),
             13 => Ok(BusId::Shift),
             14 => Ok(BusId::Memw),
             15 => Ok(BusId::Load),
@@ -448,8 +445,10 @@ impl DecodeEntry {
         let mut packed: u64 = 0;
 
         // Control flags (bits 0-10)
-        // Note: Register flags exclude x0 and x255 (virtual PC) to match CPU trace
-        let read_reg1_physical = self.read_register1 && self.rs1 != 0 && self.rs1 != 255;
+        // x0 is hardwired to zero and never physically read.
+        // x255 is the register where the pc is stored (per spec decode.md),
+        // so read_register1=1 for rs1=255.
+        let read_reg1_physical = self.read_register1 && self.rs1 != 0;
         let read_reg2_physical = self.read_register2 && self.rs2 != 0;
         let write_reg_physical = self.write_register && self.rd != 0;
         packed |= (read_reg1_physical as u64) << bits::READ_REG1;
@@ -514,7 +513,7 @@ impl DecodeEntry {
                 if dst != 0 {
                     entry.write_register = true;
                 }
-                Self::set_arith_op(&mut entry, op, false);
+                Self::set_arith_op(&mut entry, op);
             }
 
             Instruction::ArithImm { dst, src, imm, op } => {
@@ -526,7 +525,7 @@ impl DecodeEntry {
                 if dst != 0 {
                     entry.write_register = true;
                 }
-                Self::set_arith_op(&mut entry, op, false);
+                Self::set_arith_op(&mut entry, op);
             }
 
             Instruction::ArithW {
@@ -544,7 +543,7 @@ impl DecodeEntry {
                 if dst != 0 {
                     entry.write_register = true;
                 }
-                Self::set_arith_op(&mut entry, op, true);
+                Self::set_arith_op(&mut entry, op);
             }
 
             Instruction::ArithImmW { dst, src, imm, op } => {
@@ -557,7 +556,7 @@ impl DecodeEntry {
                 if dst != 0 {
                     entry.write_register = true;
                 }
-                Self::set_arith_op(&mut entry, op, true);
+                Self::set_arith_op(&mut entry, op);
             }
 
             Instruction::JumpAndLink { dst, offset } => {
@@ -711,7 +710,7 @@ impl DecodeEntry {
     }
 
     /// Helper to set ALU operation flags based on ArithOp.
-    fn set_arith_op(entry: &mut Self, arith_op: ArithOp, is_word: bool) {
+    fn set_arith_op(entry: &mut Self, arith_op: ArithOp) {
         match arith_op {
             ArithOp::Add => {
                 entry.op_add = true;
@@ -745,9 +744,7 @@ impl DecodeEntry {
             ArithOp::Mul => {
                 entry.op_mul = true;
                 entry.mp_selector = true;
-                if !is_word {
-                    entry.signed = true;
-                }
+                entry.signed = true;
             }
             ArithOp::MulHigh => {
                 entry.op_mul = true;
