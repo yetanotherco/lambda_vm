@@ -3,7 +3,7 @@
 //! Constrains: `out = in <</>>/>>> (shift mod (32 * (2 - word_instr)))`.
 //!
 //! Two-phase design:
-//! 1. Intra-limb shift by `bit_shift = shift mod 16` using HWSL/HWSLC lookups.
+//! 1. Intra-limb shift by `bit_shift = shift mod 16` using paired HWSL lookups (returning [SLL, SLLC]).
 //! 2. Full-limb shift by `limb_shift` (unary encoding of `shift >> 4`).
 //!
 //! ## Columns (26 total)
@@ -128,7 +128,8 @@ impl ShiftOperation {
         }
     }
 
-    /// Compute HWSLC: halfword >> (16 - z)
+    /// Compute the carry output of HWSL: halfword >> (16 - z)
+    /// This is the second element of the HWSL pair [SLL, SLLC].
     fn hwslc(halfword: u16, z: u8) -> u16 {
         if z == 0 {
             0
@@ -875,7 +876,7 @@ use super::bitwise::{BitwiseOperation, BitwiseOperationType};
 
 /// Collect BITWISE table lookups needed by a set of unique shift operations.
 ///
-/// Each unique operation (with its multiplicity) generates HWSL/HWSLC/AND_BYTE/MSB16/ZERO
+/// Each unique operation (with its multiplicity) generates HWSL/AND_BYTE/MSB16/ZERO
 /// lookups. The lookups must be generated per-unique-operation (matching the SHIFT table's
 /// deduplication and μ column), and repeated `multiplicity` times.
 pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseOperation> {

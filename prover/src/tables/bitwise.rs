@@ -470,14 +470,14 @@ pub enum BitwiseOperationType {
 /// - `lookup_type`: Which operation result to look up
 /// - `x`: Byte input (0-255)
 /// - `y`: Byte input (0-255)
-/// - `z`: 4-bit value (0-15), shift amount for HWSL/HWSLC
+/// - `z`: 4-bit value (0-15), shift amount for HWSL
 ///
 /// # How inputs map to operations
 /// - AND/OR/XOR: `x OP y`
 /// - MSB8: MSB of `x`
 /// - MSB16: MSB of halfword `x + y * 256`
 /// - IS_BYTE/IS_HALF: Range check on `x + y * 256`
-/// - HWSL/HWSLC: Shift `x + y * 256` by `z` bits
+/// - HWSL: Shift `x + y * 256` by `z` bits, returning [SLL, SLLC] as a pair
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BitwiseOperation {
     pub lookup_type: BitwiseOperationType,
@@ -523,7 +523,7 @@ impl BitwiseOperation {
         Self::new(BitwiseOperationType::Zero, x, y, z)
     }
 
-    /// Create an operation for shift ops (HWSL, HWSLC).
+    /// Create an operation for HWSL shift lookups.
     pub fn shift_op(lookup_type: BitwiseOperationType, x: u8, y: u8, z: u8) -> Self {
         Self::new(lookup_type, x, y, z)
     }
