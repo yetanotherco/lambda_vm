@@ -1531,12 +1531,11 @@ where
             .zip(main_segment_cols[*col_b].iter())
             .map(|(a, b)| a - b)
             .collect(),
-        Multiplicity::Sum3(col_a, col_b, col_c) => (0..trace_len)
-            .map(|row| {
-                &main_segment_cols[*col_a][row]
-                    + &main_segment_cols[*col_b][row]
-                    + &main_segment_cols[*col_c][row]
-            })
+        Multiplicity::Sum3(col_a, col_b, col_c) => main_segment_cols[*col_a]
+            .iter()
+            .zip(main_segment_cols[*col_b].iter())
+            .zip(main_segment_cols[*col_c].iter())
+            .map(|((a, b), c)| a + b + c)
             .collect(),
         Multiplicity::Linear(terms) => (0..trace_len)
             .map(|row| {
