@@ -359,7 +359,8 @@ impl Packing {
     {
         match self {
             Packing::Direct => {
-                *acc += step.get_main_evaluation_element(0, start_col) * &alpha_powers[alpha_offset];
+                *acc +=
+                    step.get_main_evaluation_element(0, start_col) * &alpha_powers[alpha_offset];
                 1
             }
             Packing::Word2L => {
@@ -381,12 +382,15 @@ impl Packing {
                 1
             }
             Packing::DWordWL => {
-                *acc += step.get_main_evaluation_element(0, start_col) * &alpha_powers[alpha_offset];
-                *acc += step.get_main_evaluation_element(0, start_col + 1) * &alpha_powers[alpha_offset + 1];
+                *acc +=
+                    step.get_main_evaluation_element(0, start_col) * &alpha_powers[alpha_offset];
+                *acc += step.get_main_evaluation_element(0, start_col + 1)
+                    * &alpha_powers[alpha_offset + 1];
                 2
             }
             Packing::DWordHHW => {
-                *acc += step.get_main_evaluation_element(0, start_col) * &alpha_powers[alpha_offset];
+                *acc +=
+                    step.get_main_evaluation_element(0, start_col) * &alpha_powers[alpha_offset];
                 let shift_16 = FieldElement::<A>::from(SHIFT_16);
                 let w = step.get_main_evaluation_element(0, start_col + 1)
                     + step.get_main_evaluation_element(0, start_col + 2) * &shift_16;
@@ -398,7 +402,8 @@ impl Packing {
                 let w = step.get_main_evaluation_element(0, start_col)
                     + step.get_main_evaluation_element(0, start_col + 1) * &shift_16;
                 *acc += &w * &alpha_powers[alpha_offset];
-                *acc += step.get_main_evaluation_element(0, start_col + 2) * &alpha_powers[alpha_offset + 1];
+                *acc += step.get_main_evaluation_element(0, start_col + 2)
+                    * &alpha_powers[alpha_offset + 1];
                 2
             }
             Packing::DWordHL => {
@@ -439,7 +444,8 @@ impl Packing {
             }
             Packing::QuadWL => {
                 for i in 0..4 {
-                    *acc += step.get_main_evaluation_element(0, start_col + i) * &alpha_powers[alpha_offset + i];
+                    *acc += step.get_main_evaluation_element(0, start_col + i)
+                        * &alpha_powers[alpha_offset + i];
                 }
                 4
             }
@@ -1440,7 +1446,14 @@ where
     let negate = !table_interaction.is_sender;
 
     let mut fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(trace_len);
-    compute_fingerprints_into(table_interaction, main_segment_cols, trace_len, z, alpha_powers, &mut fingerprints);
+    compute_fingerprints_into(
+        table_interaction,
+        main_segment_cols,
+        trace_len,
+        z,
+        alpha_powers,
+        &mut fingerprints,
+    );
 
     #[cfg(feature = "debug-checks")]
     {
@@ -1611,8 +1624,22 @@ where
     let negate_b = !interaction_b.is_sender;
 
     let mut all_fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(2 * trace_len);
-    compute_fingerprints_into(interaction_a, main_segment_cols, trace_len, z, alpha_powers, &mut all_fingerprints);
-    compute_fingerprints_into(interaction_b, main_segment_cols, trace_len, z, alpha_powers, &mut all_fingerprints);
+    compute_fingerprints_into(
+        interaction_a,
+        main_segment_cols,
+        trace_len,
+        z,
+        alpha_powers,
+        &mut all_fingerprints,
+    );
+    compute_fingerprints_into(
+        interaction_b,
+        main_segment_cols,
+        trace_len,
+        z,
+        alpha_powers,
+        &mut all_fingerprints,
+    );
 
     FieldElement::inplace_batch_inverse(&mut all_fingerprints)
         .expect("fingerprint is zero - probability of sampling zero is negligible");
@@ -1620,8 +1647,16 @@ where
     // No multiplicity multiply — just sign-flip and sum
     (0..trace_len)
         .map(|row| {
-            let a = if negate_a { -all_fingerprints[row].clone() } else { all_fingerprints[row].clone() };
-            let b = if negate_b { -all_fingerprints[trace_len + row].clone() } else { all_fingerprints[trace_len + row].clone() };
+            let a = if negate_a {
+                -all_fingerprints[row].clone()
+            } else {
+                all_fingerprints[row].clone()
+            };
+            let b = if negate_b {
+                -all_fingerprints[trace_len + row].clone()
+            } else {
+                all_fingerprints[trace_len + row].clone()
+            };
             a + b
         })
         .collect()
@@ -1647,11 +1682,26 @@ where
     let negate_unit = !unit_interaction.is_sender;
     let negate_gen = !general_interaction.is_sender;
 
-    let multiplicities_gen = compute_multiplicities(general_interaction, main_segment_cols, trace_len);
+    let multiplicities_gen =
+        compute_multiplicities(general_interaction, main_segment_cols, trace_len);
 
     let mut all_fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(2 * trace_len);
-    compute_fingerprints_into(unit_interaction, main_segment_cols, trace_len, z, alpha_powers, &mut all_fingerprints);
-    compute_fingerprints_into(general_interaction, main_segment_cols, trace_len, z, alpha_powers, &mut all_fingerprints);
+    compute_fingerprints_into(
+        unit_interaction,
+        main_segment_cols,
+        trace_len,
+        z,
+        alpha_powers,
+        &mut all_fingerprints,
+    );
+    compute_fingerprints_into(
+        general_interaction,
+        main_segment_cols,
+        trace_len,
+        z,
+        alpha_powers,
+        &mut all_fingerprints,
+    );
 
     FieldElement::inplace_batch_inverse(&mut all_fingerprints)
         .expect("fingerprint is zero - probability of sampling zero is negligible");
@@ -1659,7 +1709,11 @@ where
     (0..trace_len)
         .map(|row| {
             // Unit side: just ±fp_inv (no multiplicity multiply)
-            let term_unit = if negate_unit { -all_fingerprints[row].clone() } else { all_fingerprints[row].clone() };
+            let term_unit = if negate_unit {
+                -all_fingerprints[row].clone()
+            } else {
+                all_fingerprints[row].clone()
+            };
             // General side: m * fp_inv with sign
             let term_gen = &multiplicities_gen[row] * &all_fingerprints[trace_len + row];
             let term_gen = if negate_gen { -term_gen } else { term_gen };
@@ -1693,8 +1747,22 @@ where
     let multiplicities_b = compute_multiplicities(interaction_b, main_segment_cols, trace_len);
 
     let mut all_fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(2 * trace_len);
-    compute_fingerprints_into(interaction_a, main_segment_cols, trace_len, z, alpha_powers, &mut all_fingerprints);
-    compute_fingerprints_into(interaction_b, main_segment_cols, trace_len, z, alpha_powers, &mut all_fingerprints);
+    compute_fingerprints_into(
+        interaction_a,
+        main_segment_cols,
+        trace_len,
+        z,
+        alpha_powers,
+        &mut all_fingerprints,
+    );
+    compute_fingerprints_into(
+        interaction_b,
+        main_segment_cols,
+        trace_len,
+        z,
+        alpha_powers,
+        &mut all_fingerprints,
+    );
 
     // Single batch inversion for all 2*N fingerprints
     FieldElement::inplace_batch_inverse(&mut all_fingerprints)
@@ -1733,16 +1801,36 @@ where
 
     match (a_is_one, b_is_one) {
         (true, true) => compute_logup_batched_term_both_unit(
-            interaction_a, interaction_b, main_segment_cols, trace_len, z, alpha_powers,
+            interaction_a,
+            interaction_b,
+            main_segment_cols,
+            trace_len,
+            z,
+            alpha_powers,
         ),
         (true, false) => compute_logup_batched_term_one_unit(
-            interaction_a, interaction_b, main_segment_cols, trace_len, z, alpha_powers,
+            interaction_a,
+            interaction_b,
+            main_segment_cols,
+            trace_len,
+            z,
+            alpha_powers,
         ),
         (false, true) => compute_logup_batched_term_one_unit(
-            interaction_b, interaction_a, main_segment_cols, trace_len, z, alpha_powers,
+            interaction_b,
+            interaction_a,
+            main_segment_cols,
+            trace_len,
+            z,
+            alpha_powers,
         ),
         (false, false) => compute_logup_batched_term_column(
-            interaction_a, interaction_b, main_segment_cols, trace_len, z, alpha_powers,
+            interaction_a,
+            interaction_b,
+            main_segment_cols,
+            trace_len,
+            z,
+            alpha_powers,
         ),
     }
 }
@@ -1918,7 +2006,8 @@ fn compute_fingerprint_from_step<A: IsSubFieldOf<B>, B: IsField>(
     let mut linear_combination = &bus_id_f * &alpha_powers[0];
     let mut alpha_idx = 1;
     for bv in &interaction.values {
-        alpha_idx += bv.accumulate_fingerprint_step(step, alpha_powers, alpha_idx, &mut linear_combination);
+        alpha_idx +=
+            bv.accumulate_fingerprint_step(step, alpha_powers, alpha_idx, &mut linear_combination);
     }
     z - &linear_combination
 }
@@ -2031,33 +2120,65 @@ where
             match pair_kind {
                 BatchedPairKind::BothUnit => {
                     // Both m_a=1, m_b=1: skip both multiplicity computations
-                    let term_a = if interaction_a.is_sender { fp_b.clone() } else { -fp_b.clone() };
-                    let term_b = if interaction_b.is_sender { fp_a.clone() } else { -fp_a.clone() };
+                    let term_a = if interaction_a.is_sender {
+                        fp_b.clone()
+                    } else {
+                        -fp_b.clone()
+                    };
+                    let term_b = if interaction_b.is_sender {
+                        fp_a.clone()
+                    } else {
+                        -fp_a.clone()
+                    };
                     c * &fp_a * &fp_b - term_a - term_b
                 }
                 BatchedPairKind::UnitFirst => {
                     // m_a=1, m_b=general
                     let m_b = compute_multiplicity_from_step(step, &interaction_b.multiplicity);
-                    let term_a = if interaction_a.is_sender { fp_b.clone() } else { -fp_b.clone() };
+                    let term_a = if interaction_a.is_sender {
+                        fp_b.clone()
+                    } else {
+                        -fp_b.clone()
+                    };
                     let term_b = m_b * &fp_a;
-                    let term_b = if interaction_b.is_sender { term_b } else { -term_b };
+                    let term_b = if interaction_b.is_sender {
+                        term_b
+                    } else {
+                        -term_b
+                    };
                     c * &fp_a * &fp_b - term_a - term_b
                 }
                 BatchedPairKind::UnitSecond => {
                     // m_a=general, m_b=1
                     let m_a = compute_multiplicity_from_step(step, &interaction_a.multiplicity);
                     let term_a = m_a * &fp_b;
-                    let term_a = if interaction_a.is_sender { term_a } else { -term_a };
-                    let term_b = if interaction_b.is_sender { fp_a.clone() } else { -fp_a.clone() };
+                    let term_a = if interaction_a.is_sender {
+                        term_a
+                    } else {
+                        -term_a
+                    };
+                    let term_b = if interaction_b.is_sender {
+                        fp_a.clone()
+                    } else {
+                        -fp_a.clone()
+                    };
                     c * &fp_a * &fp_b - term_a - term_b
                 }
                 BatchedPairKind::General => {
                     let m_a = compute_multiplicity_from_step(step, &interaction_a.multiplicity);
                     let m_b = compute_multiplicity_from_step(step, &interaction_b.multiplicity);
                     let term_a = m_a * &fp_b;
-                    let term_a = if interaction_a.is_sender { term_a } else { -term_a };
+                    let term_a = if interaction_a.is_sender {
+                        term_a
+                    } else {
+                        -term_a
+                    };
                     let term_b = m_b * &fp_a;
-                    let term_b = if interaction_b.is_sender { term_b } else { -term_b };
+                    let term_b = if interaction_b.is_sender {
+                        term_b
+                    } else {
+                        -term_b
+                    };
                     c * &fp_a * &fp_b - term_a - term_b
                 }
             }
@@ -2231,7 +2352,8 @@ where
             match absorbed_kind {
                 AbsorbedKind::SingleUnit => {
                     // m=1: delta * f - sign = 0
-                    let f = compute_fingerprint_from_step(second_step, &absorbed[0], z, alpha_powers);
+                    let f =
+                        compute_fingerprint_from_step(second_step, &absorbed[0], z, alpha_powers);
                     if absorbed[0].is_sender {
                         delta * &f - FieldElement::<B>::one()
                     } else {
@@ -2241,7 +2363,8 @@ where
                 AbsorbedKind::SingleGeneral => {
                     // delta * f - sign * m = 0
                     let m = compute_multiplicity_from_step(second_step, &absorbed[0].multiplicity);
-                    let f = compute_fingerprint_from_step(second_step, &absorbed[0], z, alpha_powers);
+                    let f =
+                        compute_fingerprint_from_step(second_step, &absorbed[0], z, alpha_powers);
                     let sign: FieldElement<B> = if absorbed[0].is_sender {
                         FieldElement::one()
                     } else {
@@ -2251,37 +2374,61 @@ where
                 }
                 AbsorbedKind::PairBothUnit => {
                     // Both m1=1, m2=1: delta * f1 * f2 - sign1 * f2 - sign2 * f1 = 0
-                    let f1 = compute_fingerprint_from_step(second_step, &absorbed[0], z, alpha_powers);
-                    let f2 = compute_fingerprint_from_step(second_step, &absorbed[1], z, alpha_powers);
-                    let term1 = if absorbed[0].is_sender { f2.clone() } else { -f2.clone() };
-                    let term2 = if absorbed[1].is_sender { f1.clone() } else { -f1.clone() };
+                    let f1 =
+                        compute_fingerprint_from_step(second_step, &absorbed[0], z, alpha_powers);
+                    let f2 =
+                        compute_fingerprint_from_step(second_step, &absorbed[1], z, alpha_powers);
+                    let term1 = if absorbed[0].is_sender {
+                        f2.clone()
+                    } else {
+                        -f2.clone()
+                    };
+                    let term2 = if absorbed[1].is_sender {
+                        f1.clone()
+                    } else {
+                        -f1.clone()
+                    };
                     delta * &f1 * &f2 - term1 - term2
                 }
                 AbsorbedKind::PairUnitFirst => {
                     // m1=1, m2=general
-                    let f1 = compute_fingerprint_from_step(second_step, &absorbed[0], z, alpha_powers);
-                    let f2 = compute_fingerprint_from_step(second_step, &absorbed[1], z, alpha_powers);
+                    let f1 =
+                        compute_fingerprint_from_step(second_step, &absorbed[0], z, alpha_powers);
+                    let f2 =
+                        compute_fingerprint_from_step(second_step, &absorbed[1], z, alpha_powers);
                     let m2 = compute_multiplicity_from_step(second_step, &absorbed[1].multiplicity);
-                    let term1 = if absorbed[0].is_sender { f2.clone() } else { -f2.clone() };
+                    let term1 = if absorbed[0].is_sender {
+                        f2.clone()
+                    } else {
+                        -f2.clone()
+                    };
                     let term2 = m2 * &f1;
                     let term2 = if absorbed[1].is_sender { term2 } else { -term2 };
                     delta * &f1 * &f2 - term1 - term2
                 }
                 AbsorbedKind::PairUnitSecond => {
                     // m1=general, m2=1
-                    let f1 = compute_fingerprint_from_step(second_step, &absorbed[0], z, alpha_powers);
-                    let f2 = compute_fingerprint_from_step(second_step, &absorbed[1], z, alpha_powers);
+                    let f1 =
+                        compute_fingerprint_from_step(second_step, &absorbed[0], z, alpha_powers);
+                    let f2 =
+                        compute_fingerprint_from_step(second_step, &absorbed[1], z, alpha_powers);
                     let m1 = compute_multiplicity_from_step(second_step, &absorbed[0].multiplicity);
                     let term1 = m1 * &f2;
                     let term1 = if absorbed[0].is_sender { term1 } else { -term1 };
-                    let term2 = if absorbed[1].is_sender { f1.clone() } else { -f1.clone() };
+                    let term2 = if absorbed[1].is_sender {
+                        f1.clone()
+                    } else {
+                        -f1.clone()
+                    };
                     delta * &f1 * &f2 - term1 - term2
                 }
                 AbsorbedKind::PairGeneral => {
                     let m1 = compute_multiplicity_from_step(second_step, &absorbed[0].multiplicity);
                     let m2 = compute_multiplicity_from_step(second_step, &absorbed[1].multiplicity);
-                    let f1 = compute_fingerprint_from_step(second_step, &absorbed[0], z, alpha_powers);
-                    let f2 = compute_fingerprint_from_step(second_step, &absorbed[1], z, alpha_powers);
+                    let f1 =
+                        compute_fingerprint_from_step(second_step, &absorbed[0], z, alpha_powers);
+                    let f2 =
+                        compute_fingerprint_from_step(second_step, &absorbed[1], z, alpha_powers);
                     let term1 = m1 * &f2;
                     let term1 = if absorbed[0].is_sender { term1 } else { -term1 };
                     let term2 = m2 * &f1;
