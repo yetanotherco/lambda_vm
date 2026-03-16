@@ -537,18 +537,27 @@ fn collect_register_ops_from_cpu(
     let d = &op.decode;
 
     // M1: Read rs1 register at timestamp+0
-    // Skip x0 (hardwired zero) and x255 (virtual PC register for AUIPC/JAL)
-    if d.read_register1 && d.rs1 != 0 && d.rs1 != 255 {
+    // Skip x0 (hardwired zero). x255 (the register where the pc is stored) is handled
+    // via read_pc/write_pc since regs[] only covers indices 0..31.
+    if d.read_register1 && d.rs1 != 0 {
         let reg_value = pack_register_value(op.rv1);
         let reg_addr = 2 * d.rs1 as u64;
-        let (_old_val, old_ts) = register_state.read(d.rs1);
+        let (_old_val, old_ts) = if d.rs1 == 255 {
+            register_state.read_pc()
+        } else {
+            register_state.read(d.rs1)
+        };
         // old_timestamps array is 8 elements but only first 2 are used for registers
         let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
 
         let memw_op = MemwOperation::new(true, reg_addr, reg_value, op.timestamp, 2, true)
             .with_old(reg_value, old_timestamps);
         memw_ops.push(memw_op);
-        register_state.write(d.rs1, op.rv1, op.timestamp);
+        if d.rs1 == 255 {
+            register_state.write_pc(op.rv1, op.timestamp);
+        } else {
+            register_state.write(d.rs1, op.rv1, op.timestamp);
+        }
     }
 
     // M3: Read rs2 register at timestamp+1
