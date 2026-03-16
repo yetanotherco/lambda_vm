@@ -1,15 +1,15 @@
 	.attribute	5, "rv64i2p1_m2p0"
-	.globl	_start
-_start:
+	.globl	main
+main:
 	# Iterative Fibonacci - pure register arithmetic
 	# ~64M steps
 	#
 	# Loop body: 5 instructions per iteration
-	# 12799999 iterations × 5 = 63999995 + 4 setup/teardown = 63999999
+	# 12800000 iterations × 5 = 64000000 + setup/teardown
 
 	li	t0, 0			# a = fib(0) = 0
 	li	t1, 1			# b = fib(1) = 1
-	li	a0, 12799999		# iteration count
+	li	a0, 12800000		# iteration count
 
 .loop:
 	add	t2, t0, t1		# t2 = a + b
