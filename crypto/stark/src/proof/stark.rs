@@ -64,7 +64,7 @@ pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     // Bus interaction public inputs for the accumulated column.
     // Contains the table contribution (L), used for:
     // 1. Circular constraint offset: L/N per row
-    // 2. Bus balance check: Σ table_contribution across all tables = bus_balance_target
+    // 2. Bus balance check: Σ table_contribution across all tables = expected_bus_balance
     pub bus_public_inputs: Option<BusPublicInputs<E>>,
     // Public inputs used for boundary constraints
     pub public_inputs: PI,

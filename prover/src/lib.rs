@@ -413,12 +413,12 @@ pub(crate) fn compute_commit_bus_offset(
     Some(total)
 }
 
-/// Compute the COMMIT output bus balance target for a `MultiProof`.
+/// Compute the expected COMMIT bus balance for a `MultiProof`.
 ///
 /// Replays Phase A of the transcript to recover (z, alpha), then computes
 /// the offset from the given public output bytes. Call this after `multi_prove`
 /// and before `multi_verify`.
-pub(crate) fn commit_bus_target(
+pub(crate) fn compute_expected_commit_bus_balance(
     airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
     proof: &MultiProof<F, E, ()>,
     public_output_bytes: &[u8],
@@ -536,17 +536,20 @@ pub fn verify_with_options(
     // If public_output was tampered, the recomputed offset won't match the
     // actual bus total in the proof, and multi_verify will reject.
     let air_refs = airs.air_refs();
-    let expected_offset =
-        match commit_bus_target(&air_refs, &vm_proof.proof, &vm_proof.public_output) {
-            Some(offset) => offset,
-            None => return Ok(false),
-        };
+    let expected_bus_balance = match compute_expected_commit_bus_balance(
+        &air_refs,
+        &vm_proof.proof,
+        &vm_proof.public_output,
+    ) {
+        Some(balance) => balance,
+        None => return Ok(false),
+    };
 
     Ok(Verifier::multi_verify(
         &air_refs,
         &vm_proof.proof,
         &mut DefaultTranscript::<E>::new(&[]),
-        &expected_offset,
+        &expected_bus_balance,
     ))
 }
 

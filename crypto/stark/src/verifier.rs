@@ -851,7 +851,7 @@ pub trait IsStarkVerifier<
         airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
         multi_proof: &MultiProof<Field, FieldExtension, PI>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
-        bus_balance_target: &FieldElement<FieldExtension>,
+        expected_bus_balance: &FieldElement<FieldExtension>,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
@@ -988,7 +988,7 @@ pub trait IsStarkVerifier<
         }
 
         // =====================================================================
-        // Bus Balance Check: Σ table_contribution = bus_balance_target
+        // Bus Balance Check: Σ table_contribution = expected_bus_balance
         // =====================================================================
         // For LogUp with circular constraints, each table's total contribution L
         // (sum of all per-row terms) is exposed as a public input. The bus balances
@@ -1007,11 +1007,11 @@ pub trait IsStarkVerifier<
                 }
             }
 
-            if total != *bus_balance_target {
+            if total != *expected_bus_balance {
                 #[cfg(not(feature = "test_fiat_shamir"))]
                 error!(
                     "LogUp bus does not balance: sum of accumulated values does not match target. total={:?}, target={:?}",
-                    total, bus_balance_target
+                    total, expected_bus_balance
                 );
                 return false;
             }

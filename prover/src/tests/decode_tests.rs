@@ -1058,15 +1058,18 @@ fn test_decode_soundness_same_elf_accepted() {
         &table_counts,
     );
     let verifier_air_refs = verifier_airs.air_refs();
-    let bus_target =
-        crate::commit_bus_target(&verifier_air_refs, &proof, &traces.public_output_bytes)
-            .expect("fingerprint collision in test");
+    let expected_bus_balance = crate::compute_expected_commit_bus_balance(
+        &verifier_air_refs,
+        &proof,
+        &traces.public_output_bytes,
+    )
+    .expect("fingerprint collision in test");
 
     let result = Verifier::multi_verify(
         &verifier_air_refs,
         &proof,
         &mut DefaultTranscript::<E>::new(&[]),
-        &bus_target,
+        &expected_bus_balance,
     );
 
     // With same ELF, verification should SUCCEED
