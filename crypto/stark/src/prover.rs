@@ -1674,14 +1674,14 @@ pub trait IsStarkProver<
                     if air.has_aux_trace() {
                         let num_aux_cols = trace.num_aux_columns;
                         trace.extract_columns_aux_into(&mut pool.aux);
-                        Self::expand_pool_to_lde::<FieldExtension>(
+                        Self::expand_pool_to_lde_bitrev::<FieldExtension>(
                             &mut pool.aux,
                             num_aux_cols,
                             domain,
                             twiddles,
                         );
                         let (tree, root) =
-                            Self::commit_columns_bit_reversed(&pool.aux[..num_aux_cols])
+                            Self::commit_columns(&pool.aux[..num_aux_cols])
                                 .ok_or(ProvingError::EmptyCommitment)?;
                         Ok((Some(Arc::new(tree)), Some(root)))
                     } else {
