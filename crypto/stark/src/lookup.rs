@@ -1469,7 +1469,7 @@ where
             let mult_str = if is_one {
                 "1".to_string()
             } else {
-                multiplicities[row].canonical()
+                multiplicities[row].canonical().to_string()
             };
             crate::bus_debug::log_interaction(
                 _table_name,
