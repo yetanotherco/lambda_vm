@@ -6,10 +6,11 @@
 //! 1. Intra-limb shift by `bit_shift = shift mod 16` using HWSL/HWSLC lookups.
 //! 2. Full-limb shift by `limb_shift` (unary encoding of `shift >> 4`).
 //!
-//! ## Columns (27 total)
+//! ## Columns (26 total)
 //! - Input: `in[0..3]` (DWordHL), `shift` (Byte), `direction` (Bit), `signed` (Bit), `word_instr` (Bit)
 //! - Output: `out[0..1]` (DWordWL)
-//! - Auxiliary: `is_negative`, `bit_shift`, `zbs`, `X[0..4]`, `Y[0..3]`, `limb_shift[0..3]`
+//! - Auxiliary: `is_negative`, `bit_shift`, `zbs`, `X[0..4]`, `Y[0..3]`, `limb_shift_raw[0..2]`
+//! - Virtual: `limb_shift[3] = 1 - limb_shift_raw[0] - limb_shift_raw[1] - limb_shift_raw[2]`
 //! - Multiplicity: `μ`
 //!
 //! ## Bus Interactions (11 total)
@@ -65,22 +66,22 @@ pub mod cols {
     pub const Y_2: usize = 20;
     pub const Y_3: usize = 21;
 
-    // limb_shift[0..3]: one-hot encoding of full-limb shift amount
-    pub const LIMB_SHIFT_0: usize = 22;
-    pub const LIMB_SHIFT_1: usize = 23;
-    pub const LIMB_SHIFT_2: usize = 24;
-    pub const LIMB_SHIFT_3: usize = 25;
+    // limb_shift_raw[0..2]: first 3 values of the one-hot limb_shift encoding.
+    // limb_shift[3] is virtual: 1 - limb_shift_raw[0] - limb_shift_raw[1] - limb_shift_raw[2]
+    pub const LIMB_SHIFT_RAW_0: usize = 22;
+    pub const LIMB_SHIFT_RAW_1: usize = 23;
+    pub const LIMB_SHIFT_RAW_2: usize = 24;
 
     // Multiplicity
-    pub const MU: usize = 26;
+    pub const MU: usize = 25;
 
-    pub const NUM_COLUMNS: usize = 27;
+    pub const NUM_COLUMNS: usize = 26;
 
     // Helpers for iteration
     pub const IN: [usize; 4] = [IN_0, IN_1, IN_2, IN_3];
     pub const X: [usize; 5] = [X_0, X_1, X_2, X_3, X_4];
     pub const Y: [usize; 4] = [Y_0, Y_1, Y_2, Y_3];
-    pub const LIMB_SHIFT: [usize; 4] = [LIMB_SHIFT_0, LIMB_SHIFT_1, LIMB_SHIFT_2, LIMB_SHIFT_3];
+    pub const LIMB_SHIFT_RAW: [usize; 3] = [LIMB_SHIFT_RAW_0, LIMB_SHIFT_RAW_1, LIMB_SHIFT_RAW_2];
 }
 
 // =========================================================================
@@ -344,9 +345,10 @@ pub fn generate_shift_trace(
         for i in 0..4 {
             data[base + cols::Y[i]] = FE::from(aux.y[i] as u64);
         }
-        for i in 0..4 {
-            data[base + cols::LIMB_SHIFT[i]] = FE::from(aux.limb_shift[i] as u64);
+        for i in 0..3 {
+            data[base + cols::LIMB_SHIFT_RAW[i]] = FE::from(aux.limb_shift[i] as u64);
         }
+        // limb_shift[3] is virtual: not stored in the trace
 
         // μ = 1 for all active rows (Bit)
         data[base + cols::MU] = FE::one();
@@ -547,23 +549,22 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 },
             ]),
             // result: encoded limb_shift
+            // = (1 - ls[0]) + 15*ls[1] + 31*ls[2] + 47*ls[3]
+            // substituting ls[3] = 1 - ls_raw[0] - ls_raw[1] - ls_raw[2]:
+            // = 48 - 48*ls_raw[0] - 32*ls_raw[1] - 16*ls_raw[2]
             BusValue::linear(vec![
-                LinearTerm::Constant(1),
+                LinearTerm::Constant(48),
                 LinearTerm::Column {
-                    coefficient: -1,
-                    column: cols::LIMB_SHIFT_0,
+                    coefficient: -48,
+                    column: cols::LIMB_SHIFT_RAW_0,
                 },
                 LinearTerm::Column {
-                    coefficient: 15,
-                    column: cols::LIMB_SHIFT_1,
+                    coefficient: -32,
+                    column: cols::LIMB_SHIFT_RAW_1,
                 },
                 LinearTerm::Column {
-                    coefficient: 31,
-                    column: cols::LIMB_SHIFT_2,
-                },
-                LinearTerm::Column {
-                    coefficient: 47,
-                    column: cols::LIMB_SHIFT_3,
+                    coefficient: -16,
+                    column: cols::LIMB_SHIFT_RAW_2,
                 },
             ]),
         ],
@@ -662,9 +663,17 @@ impl ShiftConstraint {
         // Get X, Y, limb_shift, in columns
         let get_x = |i: usize| step.get_main_evaluation_element(0, cols::X[i]).clone();
         let get_y = |i: usize| step.get_main_evaluation_element(0, cols::Y[i]).clone();
-        let get_ls = |i: usize| {
-            step.get_main_evaluation_element(0, cols::LIMB_SHIFT[i])
-                .clone()
+        let get_ls = |i: usize| -> FieldElement<F> {
+            if i < 3 {
+                step.get_main_evaluation_element(0, cols::LIMB_SHIFT_RAW[i])
+                    .clone()
+            } else {
+                // limb_shift[3] is virtual: 1 - ls_raw[0] - ls_raw[1] - ls_raw[2]
+                FieldElement::<F>::one()
+                    - step.get_main_evaluation_element(0, cols::LIMB_SHIFT_RAW[0])
+                    - step.get_main_evaluation_element(0, cols::LIMB_SHIFT_RAW[1])
+                    - step.get_main_evaluation_element(0, cols::LIMB_SHIFT_RAW[2])
+            }
         };
 
         // intra_limb_left[i]: X[0] for i=0, X[i]+Y[i-1] for i>0
@@ -750,9 +759,16 @@ impl ShiftConstraint {
             }
             ShiftConstraintKind::LimbShiftIsBit(i) => {
                 // limb_shift[i] * (1 - limb_shift[i]) = 0
-                let ls = step
-                    .get_main_evaluation_element(0, cols::LIMB_SHIFT[i])
-                    .clone();
+                // limb_shift[3] is virtual: 1 - ls_raw[0] - ls_raw[1] - ls_raw[2]
+                let ls = if i < 3 {
+                    step.get_main_evaluation_element(0, cols::LIMB_SHIFT_RAW[i])
+                        .clone()
+                } else {
+                    one.clone()
+                        - step.get_main_evaluation_element(0, cols::LIMB_SHIFT_RAW[0])
+                        - step.get_main_evaluation_element(0, cols::LIMB_SHIFT_RAW[1])
+                        - step.get_main_evaluation_element(0, cols::LIMB_SHIFT_RAW[2])
+                };
                 &ls * (&one - &ls)
             }
             ShiftConstraintKind::OutputMatchesShifted(i) => {
