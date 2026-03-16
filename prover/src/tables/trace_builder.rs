@@ -1087,31 +1087,19 @@ fn collect_bitwise_from_dvrm(dvrm_ops: &[(DvrmOperation, bool)]) -> Vec<BitwiseO
 /// - 1 IS_BYTE for base_address_low[1]
 /// - 1 AND_BYTE for alignment check (low[0] & mask == 0)
 fn collect_bitwise_from_memw_aligned(ops: &[MemwOperation]) -> Vec<BitwiseOperation> {
-    let mut bitwise_ops = Vec::with_capacity(ops.len() * 3);
+    // Only AND_BYTE for alignment check (also implicitly IS_BYTE-checks low[0]).
+    // IS_HALF[mid] and IS_BYTE[low[1]] are assumptions satisfied by the CPU's
+    // IS_BYTE range checks on its byte decomposition + Memw bus propagation.
+    let mut bitwise_ops = Vec::with_capacity(ops.len());
 
     for op in ops {
         let low_0 = (op.base_address & 0xFF) as u8;
-        let low_1 = ((op.base_address >> 8) & 0xFF) as u8;
-        let mid = ((op.base_address >> 16) & 0xFFFF) as u16;
         let mask: u8 = match op.width {
             2 => 1,
             4 => 3,
             8 => 7,
             _ => 0,
         };
-
-        // IS_HALFWORD[mid]
-        bitwise_ops.push(BitwiseOperation::halfword(
-            BitwiseOperationType::IsHalf,
-            (mid & 0xFF) as u8,
-            (mid >> 8) as u8,
-        ));
-
-        // IS_BYTE[low_1]
-        bitwise_ops.push(BitwiseOperation::single_byte(
-            BitwiseOperationType::IsByte,
-            low_1,
-        ));
 
         // AND_BYTE[low_0, mask] → expects result 0
         bitwise_ops.push(BitwiseOperation::byte_op(

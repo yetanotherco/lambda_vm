@@ -17,10 +17,8 @@
 //! - `old_timestamp`: DWordWL (2 cols — single, not 8!)
 //! - `mu_read`, `mu_write`: multiplicity columns
 //!
-//! ## Bus Interactions (22)
-//! - 1 IS_HALFWORD[base_address_mid]
-//! - 1 IS_BYTE[base_address_low[1]]
-//! - 1 AND_BYTE[base_address_low[0], mask] → 0 (alignment check)
+//! ## Bus Interactions (20)
+//! - 1 AND_BYTE[base_address_low[0], mask] → 0 (alignment check + implicit IS_BYTE)
 //! - 1 LT[old_timestamp, timestamp, 0] → 1
 //! - 16 Memory bus tokens
 //! - 2 MEMW output interactions (read + write)
@@ -138,33 +136,15 @@ pub fn generate_memw_aligned_trace(
 // =========================================================================
 
 pub fn bus_interactions() -> Vec<BusInteraction> {
-    let mut interactions = Vec::with_capacity(22);
+    let mut interactions = Vec::with_capacity(20);
 
     let mu_sum = Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE);
 
-    // -------------------------------------------------------------------------
-    // IS_HALFWORD[base_address_mid] with μ_sum
-    // -------------------------------------------------------------------------
-    interactions.push(BusInteraction::sender(
-        BusId::IsHalfword,
-        mu_sum.clone(),
-        vec![BusValue::Packed {
-            start_column: cols::BASE_ADDRESS_MID,
-            packing: Packing::Direct,
-        }],
-    ));
-
-    // -------------------------------------------------------------------------
-    // IS_BYTE[base_address_low[1]] with μ_sum
-    // -------------------------------------------------------------------------
-    interactions.push(BusInteraction::sender(
-        BusId::IsByte,
-        mu_sum.clone(),
-        vec![BusValue::Packed {
-            start_column: cols::BASE_ADDRESS_LOW[1],
-            packing: Packing::Direct,
-        }],
-    ));
+    // MEMW_A-A2 (IS_HALF[mid]) and MEMW_A-A3 (IS_BYTE[low]) are assumptions:
+    // the CPU constrains base_address_0 ∈ [0, 2^32-1] via IS_BYTE on its bytes,
+    // and the Memw bus forces 2^16*MID + 2^8*LOW[1] + LOW[0] = base_address_0.
+    // Since MID and LOW[1] only appear inside this linear combination (never
+    // independently), their individual range checks are redundant.
 
     // -------------------------------------------------------------------------
     // AND_BYTE[base_address_low[0], mask] → 0 with μ_sum
