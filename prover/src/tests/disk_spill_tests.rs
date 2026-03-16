@@ -5,6 +5,7 @@
 
 use crate::tables::MaxRowsConfig;
 use crate::test_utils::asm_elf_bytes;
+use crate::VmProof;
 
 /// Prove + verify a small program end-to-end with disk-spill enabled.
 /// This exercises the full pipeline: trace generation, main-trace spill,
@@ -40,4 +41,46 @@ fn test_disk_spill_prove_and_verify_with_chunks() {
     let ok = crate::verify_with_options(&vm_proof, &elf_bytes, &proof_options);
     assert!(ok.is_ok(), "verify_with_options failed: {:?}", ok.err());
     assert!(ok.unwrap(), "verification returned false");
+}
+
+/// Prove, serialize with bincode, deserialize, then verify.
+/// This reproduces the exact CLI path: prove → write → read → verify.
+#[test]
+fn test_disk_spill_serialization_roundtrip() {
+    let elf_bytes = asm_elf_bytes("sub");
+    let proof = crate::prove(&elf_bytes).expect("prove failed");
+
+    let bytes = bincode::serialize(&proof).expect("serialize failed");
+    eprintln!("Proof serialized: {} bytes", bytes.len());
+
+    let proof2: VmProof = bincode::deserialize(&bytes).expect("deserialize failed");
+    let valid = crate::verify(&proof2, &elf_bytes).expect("verify failed");
+    assert!(valid, "verification failed after serialization roundtrip");
+}
+
+/// Test prove+verify with a larger program (2M instructions).
+/// This catches bugs that only manifest at scale (multiple chunks, larger tables).
+#[test]
+fn test_disk_spill_prove_and_verify_2m() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let elf_bytes = asm_elf_bytes("fib_iterative_2M");
+    let result = crate::prove_and_verify(&elf_bytes).expect("prove_and_verify failed");
+    assert!(result, "verification returned false for fib_iterative_2M");
+}
+
+/// Same as above but with small chunks (MaxRowsConfig::small()).
+#[test]
+fn test_disk_spill_serialization_roundtrip_chunked() {
+    let elf_bytes = asm_elf_bytes("sub");
+    let opts = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2)
+        .expect("blowup=2 is always valid");
+    let proof =
+        crate::prove_with_options(&elf_bytes, &opts, &MaxRowsConfig::small()).expect("prove failed");
+
+    let bytes = bincode::serialize(&proof).expect("serialize failed");
+    eprintln!("Chunked proof serialized: {} bytes", bytes.len());
+
+    let proof2: VmProof = bincode::deserialize(&bytes).expect("deserialize failed");
+    let valid = crate::verify_with_options(&proof2, &elf_bytes, &opts).expect("verify failed");
+    assert!(valid, "verification failed after serialization roundtrip (chunked)");
 }
