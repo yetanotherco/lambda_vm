@@ -50,10 +50,11 @@
 //! These will add INDEX columns and bus interactions when the infrastructure is ready.
 
 use math::field::element::FieldElement;
-use stark::constraints::transition::TransitionConstraint;
+use math::field::traits::{IsField, IsSubFieldOf};
+use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
+use stark::table::TableView;
 use stark::trace::TraceTable;
-use stark::traits::TransitionEvaluationContext;
 
 use crate::constraints::templates::{AddConstraint, AddOperand};
 
@@ -674,10 +675,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 pub fn create_constraints(
     constraint_idx_start: usize,
 ) -> (
-    Vec<Box<dyn TransitionConstraint<GoldilocksField, GoldilocksExtension>>>,
+    Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>>,
     usize,
 ) {
-    let mut constraints: Vec<Box<dyn TransitionConstraint<GoldilocksField, GoldilocksExtension>>> =
+    let mut constraints: Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>> =
         Vec::with_capacity(8);
     let mut idx = constraint_idx_start;
 
@@ -687,15 +688,15 @@ pub fn create_constraints(
         idx,
     );
     for c in is_bit_constraints {
-        constraints.push(Box::new(c));
+        constraints.push(c.boxed());
     }
     idx = next;
 
     // 3: (first + end) * (1 - mu) = 0
-    constraints.push(Box::new(CommitConstraint {
+    constraints.push(CommitConstraint {
         kind: CommitConstraintKind::FirstOrEndImpliesMu,
         constraint_idx: idx,
-    }));
+    }.boxed());
     idx += 1;
 
     // 4-5: ADD template for address + 1 = address_incr (unconditional, degree 2)
@@ -707,8 +708,8 @@ pub fn create_constraints(
         AddOperand::from_dword_hl(cols::ADDRESS_INCR_0),
         idx,
     );
-    constraints.push(Box::new(add_c0));
-    constraints.push(Box::new(add_c1));
+    constraints.push(add_c0.boxed());
+    constraints.push(add_c1.boxed());
     idx += 2;
 
     // 6-7: SUB template for count - 1 = count_decr (unconditional, degree 2)
@@ -721,8 +722,8 @@ pub fn create_constraints(
         AddOperand::dword(cols::COUNT_0),
         idx,
     );
-    constraints.push(Box::new(sub_c0));
-    constraints.push(Box::new(sub_c1));
+    constraints.push(sub_c0.boxed());
+    constraints.push(sub_c1.boxed());
     idx += 2;
 
     (constraints, idx)
@@ -741,29 +742,6 @@ struct CommitConstraint {
     constraint_idx: usize,
 }
 
-impl CommitConstraint {
-    fn compute<F, E>(
-        &self,
-        step: &stark::table::TableView<F, E>,
-    ) -> math::field::element::FieldElement<F>
-    where
-        F: math::field::traits::IsSubFieldOf<E>,
-        E: math::field::traits::IsField,
-    {
-        let one = math::field::element::FieldElement::<F>::one();
-
-        match self.kind {
-            CommitConstraintKind::FirstOrEndImpliesMu => {
-                let first = step.get_main_evaluation_element(0, cols::FIRST).clone();
-                let end = step.get_main_evaluation_element(0, cols::END).clone();
-                let mu = step.get_main_evaluation_element(0, cols::MU).clone();
-                // (first + end) * (1 - mu) = 0
-                (first + end) * (one - mu)
-            }
-        }
-    }
-}
-
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for CommitConstraint {
     fn degree(&self) -> usize {
         2
@@ -777,30 +755,20 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for CommitConstr
         0
     }
 
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-            }
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        let one = FieldElement::<F>::one();
 
-            TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
+        match self.kind {
+            CommitConstraintKind::FirstOrEndImpliesMu => {
+                let first = step.get_main_evaluation_element(0, cols::FIRST).clone();
+                let end = step.get_main_evaluation_element(0, cols::END).clone();
+                let mu = step.get_main_evaluation_element(0, cols::MU).clone();
+                // (first + end) * (1 - mu) = 0
+                (first + end) * (one - mu)
             }
         }
     }

@@ -30,9 +30,9 @@ use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
+
 use stark::table::TableView;
 use stark::trace::TraceTable;
-use stark::traits::TransitionEvaluationContext;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16};
 
@@ -482,8 +482,23 @@ impl BranchConstraint {
         (base_1 + offset_1 + carry_0 - unmasked_1) * inv_2_32
     }
 
-    /// Compute the constraint value: `cond * carry * (1 - carry)`.
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+}
+
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for BranchConstraint {
+    fn degree(&self) -> usize {
+        // cond (degree 1) * carry (degree 1) * (1 - carry) (degree 1) = degree 3
+        3
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    fn end_exemptions(&self) -> usize {
+        0
+    }
+
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
     where
         F: IsSubFieldOf<E>,
         E: IsField,
@@ -511,48 +526,6 @@ impl BranchConstraint {
                 let cond = jalr;
                 let c = Self::compute_carry_1_for(cols::REGISTER_0, cols::REGISTER_1, step);
                 cond * &c * (&one - c)
-            }
-        }
-    }
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for BranchConstraint {
-    fn degree(&self) -> usize {
-        // cond (degree 1) * carry (degree 1) * (1 - carry) (degree 1) = degree 3
-        3
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn end_exemptions(&self) -> usize {
-        0
-    }
-
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-            }
-            TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
             }
         }
     }

@@ -6,7 +6,7 @@ use std::marker::PhantomData;
 use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
-        transition::TransitionConstraint,
+        transition::TransitionConstraintEvaluator,
     },
     context::AirContext,
     proof::options::ProofOptions,
@@ -30,7 +30,7 @@ impl<F: IsFFTField> AdditionConstraint<F> {
     }
 }
 
-impl<F> TransitionConstraint<F, F> for AdditionConstraint<F>
+impl<F> TransitionConstraintEvaluator<F, F> for AdditionConstraint<F>
 where
     F: IsFFTField + Send + Sync,
 {
@@ -47,7 +47,7 @@ where
         0
     }
 
-    fn evaluate(
+    fn evaluate_verifier(
         &self,
         evaluation_context: &TransitionEvaluationContext<F, F>,
         transition_evaluations: &mut [FieldElement<F>],
@@ -85,7 +85,7 @@ where
     F: IsFFTField,
 {
     context: AirContext,
-    constraints: Vec<Box<dyn TransitionConstraint<F, F>>>,
+    constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, F>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -112,7 +112,7 @@ where
     }
 
     fn new(proof_options: &ProofOptions) -> Self {
-        let constraints: Vec<Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>> =
+        let constraints: Vec<Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>> =
             vec![Box::new(AdditionConstraint::new())];
 
         let context = AirContext {
@@ -145,7 +145,7 @@ where
 
     fn transition_constraints(
         &self,
-    ) -> &Vec<Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>> {
+    ) -> &Vec<Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>> {
         &self.constraints
     }
 

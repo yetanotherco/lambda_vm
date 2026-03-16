@@ -30,11 +30,11 @@
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
-use stark::constraints::transition::TransitionConstraint;
+use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
+
 use stark::table::TableView;
 use stark::trace::TraceTable;
-use stark::traits::TransitionEvaluationContext;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 use crate::constraints::templates::{AddConstraint, AddOperand};
@@ -1122,8 +1122,25 @@ impl MemwConstraint {
             kind,
         }
     }
+}
 
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MemwConstraint {
+    fn degree(&self) -> usize {
+        match self.kind {
+            MemwConstraintKind::MuSumIsBit => 2,
+            MemwConstraintKind::W2ImpliesMuSum => 2,
+        }
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    fn end_exemptions(&self) -> usize {
+        0
+    }
+
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
     where
         F: IsSubFieldOf<E>,
         E: IsField,
@@ -1146,69 +1163,25 @@ impl MemwConstraint {
     }
 }
 
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MemwConstraint {
-    fn degree(&self) -> usize {
-        match self.kind {
-            MemwConstraintKind::MuSumIsBit => 2,
-            MemwConstraintKind::W2ImpliesMuSum => 2,
-        }
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn end_exemptions(&self) -> usize {
-        0
-    }
-
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-            }
-            TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
-            }
-        }
-    }
-}
-
 /// Creates all constraints for the MEMW table.
-pub fn constraints() -> Vec<Box<dyn TransitionConstraint<GoldilocksField, GoldilocksExtension>>> {
-    let mut constraints: Vec<Box<dyn TransitionConstraint<GoldilocksField, GoldilocksExtension>>> =
+pub fn constraints() -> Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>> {
+    let mut constraints: Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>> =
         Vec::new();
 
     let mut idx = 0;
 
     // IS_BIT<μ_sum>
-    constraints.push(Box::new(MemwConstraint::new(
+    constraints.push(MemwConstraint::new(
         MemwConstraintKind::MuSumIsBit,
         idx,
-    )));
+    ).boxed());
     idx += 1;
 
     // w2 => μ_sum
-    constraints.push(Box::new(MemwConstraint::new(
+    constraints.push(MemwConstraint::new(
         MemwConstraintKind::W2ImpliesMuSum,
         idx,
-    )));
+    ).boxed());
     idx += 1;
 
     // ADD constraints for address_add[0..6]
@@ -1231,8 +1204,8 @@ pub fn constraints() -> Vec<Box<dyn TransitionConstraint<GoldilocksField, Goldil
 
         // ADD constraint produces 2 constraints (carry_0, carry_1)
         let (c0, c1) = AddConstraint::new_pair(condition, lhs, rhs, sum, idx);
-        constraints.push(Box::new(c0));
-        constraints.push(Box::new(c1));
+        constraints.push(c0.boxed());
+        constraints.push(c1.boxed());
         idx += 2;
     }
 

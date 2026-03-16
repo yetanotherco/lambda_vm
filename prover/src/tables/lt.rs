@@ -29,9 +29,9 @@ use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
+
 use stark::table::TableView;
 use stark::trace::TraceTable;
-use stark::traits::TransitionEvaluationContext;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16};
 
@@ -475,8 +475,28 @@ impl LtConstraint {
         (&rhs_hi + &sub_hi + &carry_0 - &lhs_hi) * &inv_2_32
     }
 
-    /// Compute the constraint value.
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+}
+
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for LtConstraint {
+    fn degree(&self) -> usize {
+        match self.kind {
+            // IS_BIT on virtual carry involves computing carry (degree 1) then X*(1-X) (degree 2)
+            LtConstraintKind::Carry0IsBit => 2,
+            LtConstraintKind::Carry1IsBit => 2,
+            // LT formula involves products like signed * A * (1-B)
+            LtConstraintKind::LtFormula => 3,
+        }
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    fn end_exemptions(&self) -> usize {
+        0
+    }
+
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
     where
         F: IsSubFieldOf<E>,
         E: IsField,
@@ -518,53 +538,6 @@ impl LtConstraint {
 
                 // Constraint: lt - expected_lt = 0
                 lt - expected_lt
-            }
-        }
-    }
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for LtConstraint {
-    fn degree(&self) -> usize {
-        match self.kind {
-            // IS_BIT on virtual carry involves computing carry (degree 1) then X*(1-X) (degree 2)
-            LtConstraintKind::Carry0IsBit => 2,
-            LtConstraintKind::Carry1IsBit => 2,
-            // LT formula involves products like signed * A * (1-B)
-            LtConstraintKind::LtFormula => 3,
-        }
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn end_exemptions(&self) -> usize {
-        0
-    }
-
-    fn evaluate(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
-        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
-    ) {
-        match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
-            }
-            TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values: _,
-                rap_challenges: _,
-                ..
-            } => {
-                let constraint_value = self.compute(frame.get_evaluation_step(0));
-                transition_evaluations[self.constraint_idx] = constraint_value;
             }
         }
     }

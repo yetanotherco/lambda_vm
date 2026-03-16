@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
-        transition::TransitionConstraint,
+        transition::TransitionConstraintEvaluator,
     },
     context::AirContext,
     proof::options::ProofOptions,
@@ -44,7 +44,7 @@ where
     }
 }
 
-impl<F, E> TransitionConstraint<F, E> for FibColumnConstraint<F, E>
+impl<F, E> TransitionConstraintEvaluator<F, E> for FibColumnConstraint<F, E>
 where
     F: IsSubFieldOf<E> + IsFFTField + Send + Sync,
     E: IsField + Send + Sync,
@@ -61,7 +61,7 @@ where
         2
     }
 
-    fn evaluate(
+    fn evaluate_verifier(
         &self,
         evaluation_context: &TransitionEvaluationContext<F, E>,
         transition_evaluations: &mut [FieldElement<E>],
@@ -127,7 +127,7 @@ where
     E: IsField + Send + Sync,
 {
     context: AirContext,
-    constraints: Vec<Box<dyn TransitionConstraint<F, E>>>,
+    constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>>,
     num_columns: usize,
 }
 
@@ -153,7 +153,7 @@ where
         trace_length
     }
 
-    fn transition_constraints(&self) -> &Vec<Box<dyn TransitionConstraint<F, E>>> {
+    fn transition_constraints(&self) -> &Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> {
         &self.constraints
     }
 
@@ -202,10 +202,10 @@ where
     /// Creates a new multi-column Fibonacci AIR with the specified number of columns.
     pub fn with_num_columns(proof_options: &ProofOptions, num_columns: usize) -> Self {
         // Create one constraint per column
-        let constraints: Vec<Box<dyn TransitionConstraint<F, E>>> = (0..num_columns)
+        let constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = (0..num_columns)
             .map(|col_idx| {
                 Box::new(FibColumnConstraint::new(col_idx, col_idx))
-                    as Box<dyn TransitionConstraint<F, E>>
+                    as Box<dyn TransitionConstraintEvaluator<F, E>>
             })
             .collect();
 

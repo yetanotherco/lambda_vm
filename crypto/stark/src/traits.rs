@@ -10,7 +10,7 @@ use math::{
 };
 
 use crate::{
-    constraints::transition::TransitionConstraint, domain::Domain, lookup::BusPublicInputs,
+    constraints::transition::TransitionConstraintEvaluator, domain::Domain, lookup::BusPublicInputs,
 };
 
 use super::{
@@ -220,26 +220,44 @@ pub trait AIR: Send + Sync {
             vec![FieldElement::<Self::FieldExtension>::zero(); self.num_transition_constraints()];
         self.transition_constraints()
             .iter()
-            .for_each(|c| c.evaluate(evaluation_context, &mut evaluations));
+            .for_each(|c| c.evaluate_verifier(evaluation_context, &mut evaluations));
 
         evaluations
     }
 
-    /// Evaluate all transition constraints into a caller-provided buffer.
+    /// Number of transition constraints that produce base-field evaluations.
     ///
-    /// Same as `compute_transition` but reuses a pre-allocated buffer, avoiding
-    /// a `Vec` allocation per LDE domain point in the prover's hot loop.
-    fn compute_transition_into(
+    /// Constraints `0..num_base` write `FieldElement<F>` via `evaluate_prover`,
+    /// enabling cheaper F×E accumulation. Constraints `num_base..num_total` use
+    /// the E×E path. Default is 0 (all constraints use E×E).
+    fn num_base_transition_constraints(&self) -> usize {
+        0
+    }
+
+    /// Prover-only: evaluate constraints into split base/extension buffers.
+    ///
+    /// `base_evals` has length `num_base_transition_constraints()`.
+    /// `ext_evals` has length `num_transition_constraints()`. Only indices `[num_base..]`
+    /// are written and read; `[0..num_base]` exist as padding because `evaluate()` uses
+    /// absolute `constraint_idx` indexing. We skip zeroing the padding slots.
+    fn compute_transition_prover(
         &self,
         evaluation_context: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
-        evaluations: &mut [FieldElement<Self::FieldExtension>],
+        base_evals: &mut [FieldElement<Self::Field>],
+        ext_evals: &mut [FieldElement<Self::FieldExtension>],
     ) {
-        for e in evaluations.iter_mut() {
+        for e in base_evals.iter_mut() {
+            *e = FieldElement::zero();
+        }
+        // Only zero the extension-constraint slots; [0..num_base] is unused padding
+        // (evaluate() indexes by absolute constraint_idx, so we can't shrink the buffer).
+        let num_base = base_evals.len();
+        for e in ext_evals[num_base..].iter_mut() {
             *e = FieldElement::zero();
         }
         self.transition_constraints()
             .iter()
-            .for_each(|c| c.evaluate(evaluation_context, evaluations));
+            .for_each(|c| c.evaluate_prover(evaluation_context, base_evals, ext_evals));
     }
 
     fn boundary_constraints(
@@ -300,7 +318,7 @@ pub trait AIR: Send + Sync {
 
     fn transition_constraints(
         &self,
-    ) -> &Vec<Box<dyn TransitionConstraint<Self::Field, Self::FieldExtension>>>;
+    ) -> &Vec<Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>>;
 
     fn transition_zerofier_evaluations(
         &self,
