@@ -894,34 +894,17 @@ fn collect_bitwise_from_mul(mul_ops: &[(MulOperation, bool)]) -> Vec<BitwiseOper
 
 /// Collects bitwise lookups from DVRM operations.
 ///
-/// Generates: IS_HALF (×20), MSB16 (×3), ZERO (×2 per raw op + up to ×4 per unique signed op).
+/// Generates: IS_HALF (×12), MSB16 (×3), ZERO (×2 per raw op + up to ×4 per unique signed op).
+///
+/// DVRM-A1 (IS_HALF[n]) and DVRM-A2 (IS_HALF[d]) are assumptions enforced by the CPU sender,
+/// not by the DVRM table. Only constraint-level IS_HALF lookups are generated here.
 ///
 /// Returns: Vec of bitwise lookups
 fn collect_bitwise_from_dvrm(dvrm_ops: &[(DvrmOperation, bool)]) -> Vec<BitwiseOperation> {
-    let mut bitwise_ops = Vec::with_capacity(dvrm_ops.len() * 24);
+    let mut bitwise_ops = Vec::with_capacity(dvrm_ops.len() * 16);
 
     for (op, _wants_remainder) in dvrm_ops {
-        // IS_HALF for n[0..4] (DVRM-A1)
-        for shift in [0, 16, 32, 48] {
-            let half = ((op.n >> shift) & 0xFFFF) as u16;
-            bitwise_ops.push(BitwiseOperation::halfword(
-                BitwiseOperationType::IsHalf,
-                (half & 0xFF) as u8,
-                (half >> 8) as u8,
-            ));
-        }
-
-        // IS_HALF for d[0..4] (DVRM-A2)
-        for shift in [0, 16, 32, 48] {
-            let half = ((op.d >> shift) & 0xFFFF) as u16;
-            bitwise_ops.push(BitwiseOperation::halfword(
-                BitwiseOperationType::IsHalf,
-                (half & 0xFF) as u8,
-                (half >> 8) as u8,
-            ));
-        }
-
-        // IS_HALF for r[0..4] (DVRM-C10)
+        // IS_HALF for r[0..4] (DVRM-C13)
         let r = op.compute_remainder();
         for shift in [0, 16, 32, 48] {
             let half = ((r >> shift) & 0xFFFF) as u16;
@@ -932,7 +915,7 @@ fn collect_bitwise_from_dvrm(dvrm_ops: &[(DvrmOperation, bool)]) -> Vec<BitwiseO
             ));
         }
 
-        // IS_HALF for n_sub_r[0..4] (DVRM-C11)
+        // IS_HALF for n_sub_r[0..4] (DVRM-C14)
         let n_sub_r = op.n.wrapping_sub(r);
         for shift in [0, 16, 32, 48] {
             let half = ((n_sub_r >> shift) & 0xFFFF) as u16;
@@ -943,7 +926,7 @@ fn collect_bitwise_from_dvrm(dvrm_ops: &[(DvrmOperation, bool)]) -> Vec<BitwiseO
             ));
         }
 
-        // IS_HALF for q[0..4] (DVRM-C15)
+        // IS_HALF for q[0..4] (DVRM-C11)
         let q = op.compute_quotient();
         for shift in [0, 16, 32, 48] {
             let half = ((q >> shift) & 0xFFFF) as u16;

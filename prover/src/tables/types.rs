@@ -697,9 +697,8 @@ impl DecodeEntry {
                 entry.op_ecall = true;
                 entry.rs1 = 17; // a7 (syscall number)
                 entry.read_register1 = true; // M1 reads a7 → rv1 = syscall number
-                entry.rs2 = 10; // a0 (arg)
-                entry.rd = 10; // a0 (result)
-                // read_register2, write_register remain false
+                // rs2 and rd default to 0; read_register2 and write_register remain false.
+                // HALT/COMMIT chips access registers via direct MEMW interactions.
             }
 
             Instruction::Fence => {
