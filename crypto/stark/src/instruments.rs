@@ -103,10 +103,18 @@ pub fn reset_all() {
     R1_MAIN_MERKLE_NS.store(0, Ordering::Relaxed);
     R1_AUX_LDE_NS.store(0, Ordering::Relaxed);
     R1_AUX_MERKLE_NS.store(0, Ordering::Relaxed);
-    TIMING_DATA.with(|cell| { cell.borrow_mut().take(); });
-    R2_SUB.with(|cell| { cell.borrow_mut().take(); });
-    R4_SUB.with(|cell| { cell.borrow_mut().take(); });
-    ROUND_SUB_OPS.with(|cell| { cell.borrow_mut().take(); });
+    TIMING_DATA.with(|cell| {
+        cell.borrow_mut().take();
+    });
+    R2_SUB.with(|cell| {
+        cell.borrow_mut().take();
+    });
+    R4_SUB.with(|cell| {
+        cell.borrow_mut().take();
+    });
+    ROUND_SUB_OPS.with(|cell| {
+        cell.borrow_mut().take();
+    });
 }
 
 pub fn store_r2_sub(constraints: Duration, fft: Duration, merkle: Duration) {
