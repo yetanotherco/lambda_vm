@@ -1784,7 +1784,35 @@ impl Traces {
         // =====================================================================
         // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
         // =====================================================================
+        let mem_before_phase3 = cpu_ops.len() * std::mem::size_of::<CpuOperation>()
+            + memw_ops.len() * std::mem::size_of::<MemwOperation>()
+            + lt_ops.len() * std::mem::size_of::<LtOperation>()
+            + branch_ops.len() * std::mem::size_of::<BranchOperation>()
+            + shift_ops.len() * std::mem::size_of::<ShiftOperation>();
+        eprintln!("MEMORY before Phase 3: {:.2} GB (cpu={:.2} memw={:.2} lt={:.2} branch={:.2} shift={:.2})",
+            mem_before_phase3 as f64 / 1e9,
+            (cpu_ops.len() * std::mem::size_of::<CpuOperation>()) as f64 / 1e9,
+            (memw_ops.len() * std::mem::size_of::<MemwOperation>()) as f64 / 1e9,
+            (lt_ops.len() * std::mem::size_of::<LtOperation>()) as f64 / 1e9,
+            (branch_ops.len() * std::mem::size_of::<BranchOperation>()) as f64 / 1e9,
+            (shift_ops.len() * std::mem::size_of::<ShiftOperation>()) as f64 / 1e9,
+        );
+
         lt_ops.extend(collect_lt_from_memw(&memw_ops));
+
+        let mem_after_phase3 = cpu_ops.len() * std::mem::size_of::<CpuOperation>()
+            + memw_ops.len() * std::mem::size_of::<MemwOperation>()
+            + lt_ops.len() * std::mem::size_of::<LtOperation>()
+            + branch_ops.len() * std::mem::size_of::<BranchOperation>()
+            + shift_ops.len() * std::mem::size_of::<ShiftOperation>();
+        eprintln!("MEMORY after Phase 3:  {:.2} GB (cpu={:.2} memw={:.2} lt={:.2} branch={:.2} shift={:.2})",
+            mem_after_phase3 as f64 / 1e9,
+            (cpu_ops.len() * std::mem::size_of::<CpuOperation>()) as f64 / 1e9,
+            (memw_ops.len() * std::mem::size_of::<MemwOperation>()) as f64 / 1e9,
+            (lt_ops.len() * std::mem::size_of::<LtOperation>()) as f64 / 1e9,
+            (branch_ops.len() * std::mem::size_of::<BranchOperation>()) as f64 / 1e9,
+            (shift_ops.len() * std::mem::size_of::<ShiftOperation>()) as f64 / 1e9,
+        );
 
         // Generate traces, largest tables first.
         // With disk-spill: use chunk_generate_and_spill — each chunk is spilled to disk
@@ -1835,11 +1863,18 @@ impl Traces {
         flush_bitwise!(&memw_ops, 1_000_000, collect_bitwise_from_memw);
         let memws = gen_traces!(&memw_ops, max_rows.memw, memw::generate_memw_trace);
         drop(memw_ops);
+        eprintln!("MEMORY after drop(memw_ops): cpu={:.2} lt={:.2} GB",
+            (cpu_ops.len() * std::mem::size_of::<CpuOperation>()) as f64 / 1e9,
+            (lt_ops.len() * std::mem::size_of::<LtOperation>()) as f64 / 1e9,
+        );
 
         // LT: 8 bitwise ops per row → process in 1M-row chunks (~64 MB each)
         flush_bitwise!(&lt_ops, 1_000_000, collect_bitwise_from_lt);
         let lts = gen_traces!(&lt_ops, max_rows.lt, lt::generate_lt_trace);
         drop(lt_ops);
+        eprintln!("MEMORY after drop(lt_ops): cpu={:.2} GB",
+            (cpu_ops.len() * std::mem::size_of::<CpuOperation>()) as f64 / 1e9,
+        );
 
         // Remaining bitwise sources (small for typical programs, but still chunked)
         flush_bitwise!(&mul_ops, 1_000_000, collect_bitwise_from_mul);
