@@ -223,5 +223,22 @@ else
     print_stats "current"
 fi
 
+# --- Instruments run (optional) -----------------------------------------------
+
+if $INSTRUMENTS; then
+    echo ""
+    echo -e "${BOLD}=== Instruments Breakdown ===${NC}"
+    echo -e "${GREEN}Building with --features instruments...${NC}"
+    cargo build --release -p cli --features instruments --manifest-path "$ROOT_DIR/Cargo.toml" 2>&1 | tail -1
+
+    INSTRUMENTS_OUTPUT="$TMP_DIR/instruments.txt"
+    echo -e "${GREEN}Running instrumented prove...${NC}"
+    "$ROOT_DIR/target/release/cli" prove "$ELF" -o "$TMP_DIR/proof_instruments.bin" 2>&1 | tee "$INSTRUMENTS_OUTPUT"
+    rm -f "$TMP_DIR/proof_instruments.bin"
+
+    echo ""
+    echo -e "Instruments report saved to: ${BOLD}$INSTRUMENTS_OUTPUT${NC}"
+fi
+
 echo ""
 echo "Raw data in $TMP_DIR/"
