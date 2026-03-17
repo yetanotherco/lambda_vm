@@ -77,6 +77,37 @@ fn barycentric_matches_horner_various_sizes() {
 }
 
 #[test]
+fn barycentric_ext_matches_horner() {
+    let n = 16usize;
+    let coset_offset = FE::from(5u64);
+    let poly = test_poly(n);
+
+    let root_order = n.trailing_zeros() as u64;
+    let coset_points = get_powers_of_primitive_root_coset(root_order, n, &coset_offset).unwrap();
+    let evaluations: Vec<FE> = coset_points.iter().map(|p| poly.evaluate(p)).collect();
+
+    let z = FE::from(999u64);
+    let expected = poly.evaluate(&z);
+
+    let z_pow_n = z.pow(n);
+    let g_pow_n = coset_offset.pow(n);
+    let n_inv = FE::from(n as u64).inv().unwrap();
+    let g_n_inv = g_pow_n.inv().unwrap();
+    let inv_denoms = barycentric_inv_denoms(&z, &coset_points);
+    let result = interpolate_coset_eval_with_g_n_inv(
+        &z_pow_n,
+        &g_pow_n,
+        &n_inv,
+        &g_n_inv,
+        &coset_points,
+        &evaluations,
+        &inv_denoms,
+    );
+
+    assert_eq!(result, expected);
+}
+
+#[test]
 fn barycentric_from_lde_stride() {
     // Simulate what the prover does: given an LDE of size n*bf, extract stride-bf
     // evaluations and use barycentric to evaluate at an OOD point

@@ -1,5 +1,3 @@
-use crate::hash::poseidon::Poseidon;
-
 use crate::merkle_tree::traits::IsMerkleTreeBackend;
 use core::marker::PhantomData;
 use digest::{Digest, Output};
@@ -44,31 +42,6 @@ where
         hasher.update(left);
         hasher.update(right);
         hasher.finalize().into()
-    }
-}
-
-#[derive(Clone, Default)]
-pub struct TreePoseidon<P: Poseidon + Default> {
-    _poseidon: PhantomData<P>,
-}
-
-impl<P> IsMerkleTreeBackend for TreePoseidon<P>
-where
-    P: Poseidon + Default,
-    FieldElement<P::F>: Sync + Send,
-{
-    type Node = FieldElement<P::F>;
-    type Data = FieldElement<P::F>;
-
-    fn hash_data(input: &FieldElement<P::F>) -> FieldElement<P::F> {
-        P::hash_single(input)
-    }
-
-    fn hash_new_parent(
-        left: &FieldElement<P::F>,
-        right: &FieldElement<P::F>,
-    ) -> FieldElement<P::F> {
-        P::hash(left, right)
     }
 }
 

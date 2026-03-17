@@ -1,3 +1,5 @@
+use crate::fri::fri_functions::{compute_coset_twiddles_inv, fold_evaluations_in_place};
+use math::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
 use math::field::element::FieldElement;
 use math::field::goldilocks::GoldilocksField;
 use math::field::traits::IsField;
@@ -68,5 +70,67 @@ fn test_fold_size_2() {
     let beta = FE::new(3);
     let result = fold_polynomial(&p2, &beta);
     assert_eq!(result, Polynomial::new(&[FE::new(70)]));
+}
+
+/// Reference coefficient-form FRI fold with doubling: 2 * (P_even(x) + beta * P_odd(x))
+fn fold_polynomial_doubled_reference<F: IsField>(
+    poly: &Polynomial<FieldElement<F>>,
+    beta: &FieldElement<F>,
+) -> Polynomial<FieldElement<F>> {
+    let coefficients = poly.coefficients();
+    if coefficients.is_empty() {
+        return Polynomial::new(&[]);
+    }
+    let mut result = Vec::with_capacity(coefficients.len().div_ceil(2));
+    for chunk in coefficients.chunks(2) {
+        let folded = if chunk.len() == 2 {
+            (&chunk[0] + &(&chunk[1] * beta)).double()
+        } else {
+            chunk[0].double()
+        };
+        result.push(folded);
+    }
+    Polynomial::new(&result)
+}
+
+#[test]
+fn test_eval_fold_matches_coeff_fold() {
+    use math::fft::cpu::roots_of_unity::get_powers_of_primitive_root_coset;
+
+    let coset_offset = FE::from(3u64);
+    let beta = FE::from(7u64);
+
+    // Use a degree-7 polynomial (8 coefficients)
+    let poly = Polynomial::new(&[
+        FE::from(1u64),
+        FE::from(2u64),
+        FE::from(3u64),
+        FE::from(4u64),
+        FE::from(5u64),
+        FE::from(6u64),
+        FE::from(7u64),
+        FE::from(8u64),
+    ]);
+    let n = 8usize;
+
+    // Evaluate polynomial on coset via FFT
+    let evals_fft =
+        Polynomial::evaluate_offset_fft::<GoldilocksField>(&poly, 1, None, &coset_offset).unwrap();
+
+    // Path A: reference coeff fold -> FFT -> bit-reverse
+    let folded_poly = fold_polynomial_doubled_reference(&poly, &beta);
+    let squared_offset = coset_offset.square();
+    let mut path_a_evals =
+        Polynomial::evaluate_offset_fft::<GoldilocksField>(&folded_poly, 1, None, &squared_offset)
+            .unwrap();
+    in_place_bit_reverse_permute(&mut path_a_evals);
+
+    // Path B: FFT -> bit-reverse -> eval fold (live fold_evaluations_in_place)
+    let mut path_b_evals = evals_fft;
+    in_place_bit_reverse_permute(&mut path_b_evals);
+    let inv_twiddles = compute_coset_twiddles_inv::<GoldilocksField>(&coset_offset, n);
+    fold_evaluations_in_place(&mut path_b_evals, &beta, &inv_twiddles);
+
+    assert_eq!(path_a_evals, path_b_evals);
 }
 

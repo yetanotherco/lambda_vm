@@ -1,7 +1,9 @@
 use super::field::element::FieldElement;
 use crate::field::traits::{IsField, IsSubFieldOf};
 use alloc::{borrow::ToOwned, vec, vec::Vec};
-use core::{fmt::Display, ops, slice};
+use core::{fmt::Display, ops};
+#[cfg(test)]
+use core::slice;
 /// Represents the polynomial c_0 + c_1 * X + c_2 * X^2 + ... + c_n * X^n
 /// as a vector of coefficients `[c_0, c_1, ... , c_n]`
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +43,7 @@ impl<F: IsField> Polynomial<FieldElement<F>> {
     /// `xs` and `ys`.
     /// `xs` and `ys` must be the same length, and `xs` values should be unique. If not, panics.
     /// In short, it finds P(x) such that P(xs[i]) = ys[i]
+    #[cfg(test)]
     pub fn interpolate(
         xs: &[FieldElement<F>],
         ys: &[FieldElement<F>],
@@ -141,6 +144,7 @@ impl<F: IsField> Polynomial<FieldElement<F>> {
     }
 
     /// Computes quotient with `x - b` in place.
+    #[cfg(test)]
     pub fn ruffini_division_inplace(&mut self, b: &FieldElement<F>) {
         let mut c = FieldElement::zero();
         for coeff in self.coefficients.iter_mut().rev() {

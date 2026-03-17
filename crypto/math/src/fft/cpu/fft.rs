@@ -1,3 +1,4 @@
+#[cfg(test)]
 use crate::field::{
     element::FieldElement,
     traits::{IsFFTField, IsField, IsSubFieldOf},
@@ -17,6 +18,7 @@ use crate::field::{
 /// - DIT: decimation in time
 ///
 /// It supports values in a field E and domain in a subfield F.
+#[cfg(test)]
 pub fn in_place_nr_2radix_fft<F, E>(input: &mut [FieldElement<E>], twiddles: &[FieldElement<F>])
 where
     F: IsFFTField + IsSubFieldOf<E>,

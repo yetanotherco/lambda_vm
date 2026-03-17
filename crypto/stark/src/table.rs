@@ -65,20 +65,10 @@ impl<F: IsField> Table<F> {
         Self::new(data, width)
     }
 
-    /// Returns a vector of vectors of field elements representing the table rows
-    pub fn rows(&self) -> Vec<Vec<FieldElement<F>>> {
-        self.data.chunks(self.width).map(|r| r.to_vec()).collect()
-    }
-
     /// Given a row index, returns a reference to that row as a slice of field elements.
     pub fn get_row(&self, row_idx: usize) -> &[FieldElement<F>] {
         let row_offset = row_idx * self.width;
         &self.data[row_offset..row_offset + self.width]
-    }
-
-    /// Returns a reference to the last row of the table
-    pub fn last_row(&self) -> &[FieldElement<F>] {
-        self.get_row(self.height - 1)
     }
 
     /// Returns a vector of vectors of field elements representing the table
@@ -90,12 +80,6 @@ impl<F: IsField> Table<F> {
                     .map(|row_idx| self.data[row_idx * self.width + col_idx].clone())
                     .collect()
             })
-            .collect()
-    }
-
-    pub fn get_column(&self, col_idx: usize) -> Vec<FieldElement<F>> {
-        (0..self.height)
-            .map(|row_idx| self.data[row_idx * self.width + col_idx].clone())
             .collect()
     }
 

@@ -1,5 +1,6 @@
 use crate::fft::errors::FFTError;
 
+#[cfg(test)]
 use crate::field::errors::FieldError;
 use crate::field::traits::{IsField, IsSubFieldOf};
 use crate::{
@@ -268,6 +269,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     /// This is an implementation of the fast division algorithm from
     /// [Gathen's book](https://www.cambridge.org/core/books/modern-computer-algebra/DB3563D4013401734851CF683D2F03F0)
     /// chapter 9
+    #[cfg(test)]
     pub fn fast_fft_multiplication<F: IsFFTField + IsSubFieldOf<E>>(
         &self,
         other: &Self,
@@ -286,6 +288,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     /// Divides two polynomials with remainder.
     /// This is faster than the naive division if the degree of the divisor
     /// is greater than the degree of the dividend and both degrees are large enough.
+    #[cfg(test)]
     pub fn fast_division<F: IsSubFieldOf<E> + IsFFTField>(
         &self,
         divisor: &Self,
@@ -321,6 +324,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
 
     /// Computes the inverse of polynomial P modulo x^k using Newton iteration.
     /// P must have an invertible constant term.
+    #[cfg(test)]
     pub fn invert_polynomial_mod<F: IsSubFieldOf<E> + IsFFTField>(
         &self,
         k: usize,
@@ -353,6 +357,7 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     }
 }
 
+#[cfg(test)]
 pub fn compose_fft<F, E>(
     poly_1: &Polynomial<FieldElement<E>>,
     poly_2: &Polynomial<FieldElement<E>>,
