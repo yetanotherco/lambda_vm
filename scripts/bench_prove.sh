@@ -1,10 +1,11 @@
 #!/bin/bash
 # Benchmark the prover: wall-clock time + peak heap (jemalloc).
 #
-# Usage: bench_prove.sh [elf_path] [runs=1] [base_branch=main | --no-compare]
+# Usage: bench_prove.sh [elf_path] [runs=1] [base_branch=main | --no-compare] [--instruments]
 #
 # If on a feature branch, automatically benchmarks base_branch too and prints a comparison.
 # Pass --no-compare to skip comparison and only benchmark the current branch.
+# Pass --instruments to also build with instruments and capture detailed timing breakdown.
 #
 # Peak heap is deterministic (jemalloc stats.allocated high-water mark, 10ms polling).
 # Peak RSS is collected in raw data for reference but not shown in summary (it's noisy).
@@ -21,10 +22,21 @@ YELLOW='\033[1;33m'
 BOLD='\033[1m'
 NC='\033[0m'
 
+# Parse --instruments from any position in args
+INSTRUMENTS=false
+POSITIONAL=()
+for arg in "$@"; do
+    if [ "$arg" = "--instruments" ]; then
+        INSTRUMENTS=true
+    else
+        POSITIONAL+=("$arg")
+    fi
+done
+
 DEFAULT_ELF="$ROOT_DIR/executor/program_artifacts/asm/fib_iterative_372k.elf"
-ELF=${1:-$DEFAULT_ELF}
-RUNS=${2:-1}
-BASE_BRANCH=${3:-main}
+ELF=${POSITIONAL[0]:-$DEFAULT_ELF}
+RUNS=${POSITIONAL[1]:-1}
+BASE_BRANCH=${POSITIONAL[2]:-main}
 OUTPUT="$TMP_DIR/proof.bin"
 
 CURRENT_BRANCH=$(git -C "$ROOT_DIR" rev-parse --abbrev-ref HEAD)
