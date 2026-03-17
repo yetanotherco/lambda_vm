@@ -162,6 +162,20 @@ mean() {
     awk '{s+=$1} END {printf "%.0f", s/NR}' "$1"
 }
 
+stddev() {
+    awk '{s+=$1; ss+=$1*$1} END {
+        m=s/NR; printf "%.0f", sqrt(ss/NR - m*m)
+    }' "$1"
+}
+
+cv_pct() {
+    awk '{s+=$1; ss+=$1*$1} END {
+        m=s/NR; sd=sqrt(ss/NR - m*m);
+        if (m > 0) printf "%.1f", sd*100/m;
+        else printf "0.0";
+    }' "$1"
+}
+
 # Format a signed percentage: "+0.3%" or "-12.6%"
 signed_pct() {
     local diff=$1 base=$2
@@ -197,8 +211,15 @@ print_stats() {
         heap_str="${median_heap} MB"
     fi
 
-    printf "  %-10s  time(mean): %7ss  time(median): %7ss  heap(median): %s\n" \
-        "$label" "$mean_s" "$median_s" "$heap_str"
+    local cv_str=""
+    local num_runs=$(wc -l < "$time_file" | tr -d ' ')
+    if [ "$num_runs" -gt 1 ]; then
+        local cv=$(cv_pct "$time_file")
+        cv_str="  CV: ${cv}%"
+    fi
+
+    printf "  %-10s  time(mean): %7ss  time(median): %7ss  heap(median): %s%s\n" \
+        "$label" "$mean_s" "$median_s" "$heap_str" "$cv_str"
 }
 
 if $COMPARE; then
