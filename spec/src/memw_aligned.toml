@@ -8,19 +8,9 @@ type = "Bit"
 desc = "Whether the address represents a register index"
 
 [[variables.input]]
-name = "base_address_high"
-type = "Word"
-desc = "The high word of the base address to read from/write to, gets offset by $[0, 7]$, depending on how big the access is"
-
-[[variables.input]]
-name = "base_address_mid"
-type = "Half"
-desc = "The middle halfword of the base address to read from/write to, gets offset by $[0, 7]$, depending on how big the access is"
-
-[[variables.input]]
-name = "base_address_low"
-type = ["Byte", 2]
-desc = "The low bytes of the base address to read from/write to, gets offset by $[0, 7]$, depending on how big the access is"
+name = "base_address"
+type = "DWordWHH"
+desc = "The base address to read from/write to. Gets offset by $[0, 7]$ depending on the size of the access"
 
 [[variables.input]]
 name = "value"
@@ -52,7 +42,7 @@ desc = "Whether to write exactly 8 values"
 [[variables.output]]
 name = "old"
 type = ["BaseField", 8]
-desc = """The old value written at `base_address`. See `value` for information about representation.
+desc = """The old value written at `base_address + i`. See `value` for information about representation.
 Only the elements corresponding to the `writeN` bits are guaranteed"""
 
 # Auxiliary
@@ -63,14 +53,6 @@ type = "DWordWL"
 desc = "The timestamp at which the address was last accessed"
 
 # Virtual
-
-[[variables.virtual]]
-name = "base_address"
-type = "DWordWL"
-desc = "Recomposing the base address from its parts"
-def = {idx = "i", polys = [
-  { iter = 0, poly = ["+", ["*", ["^", 2, 16], "base_address_mid"], ["*", ["^", 2, 8], ["idx", "base_address_low", 1]], ["idx", "base_address_low", 0]] },
-  { iter = 1, poly = "base_address_high" }]}
 
 [[variables.virtual]]
 name = "w2"
@@ -103,13 +85,7 @@ type = "Bit"
 desc = "Whether we are performing a write (and hence not return `out`)"
 
 [[assumptions]]
-desc = "`IS_WORD[base_address_high]`"
-
-[[assumptions]]
-desc = "`IS_HALF[base_address_mid]`"
-
-[[assumptions]]
-desc = "`IS_BYTE[base_address_low[i]]`"
+desc = "`IS_WORD[base_address[i]]`"
 iter = ["i", 0, 1]
 
 [[assumptions]]
@@ -134,9 +110,8 @@ name = "consistency"
 
 [[constraints.consistency]]
 kind = "interaction"
-tag = "AND_BYTE"
-input = [["idx", "base_address_low", 0], ["+", ["*", "write2", 1], ["*", "write4", 3], ["*", "write8", 7]]]
-output = 0
+tag = "IS_HALFWORD"
+input = [["+", ["idx", "base_address", 0], "write2", ["*", 3, "write4"], ["*", 7, "write8"]]]
 multiplicity = "μ_sum"
 
 [[constraints.consistency]]
@@ -163,52 +138,52 @@ prefix = "M"
 [[constraints.memory]]
 kind = "interaction"
 tag = "memory"
-input = ["is_register", "base_address", "old_timestamp", ["idx", "old", 0]]
+input = ["is_register", ["cast", "base_address", "DWordWL"], "old_timestamp", ["idx", "old", 0]]
 multiplicity = "μ_sum"
 
 [[constraints.memory]]
 kind = "interaction"
 tag = "memory"
-input = ["is_register", "base_address", "timestamp", ["idx", "value", 0]]
+input = ["is_register", ["cast", "base_address", "DWordWL"], "timestamp", ["idx", "value", 0]]
 multiplicity = ["-", "μ_sum"]
 
 [[constraints.memory]]
 kind = "interaction"
 tag = "memory"
-input = ["is_register", ["+", "base_address", ["cast", 1, "DWordWL"]], "old_timestamp", ["idx", "old", 1]]
+input = ["is_register", ["+", ["cast", "base_address", "DWordWL"], ["cast", 1, "DWordWL"]], "old_timestamp", ["idx", "old", 1]]
 multiplicity = "w2"
 
 [[constraints.memory]]
 kind = "interaction"
 tag = "memory"
-input = ["is_register", ["+", "base_address", ["cast", 1, "DWordWL"]], "timestamp", ["idx", "value", 1]]
+input = ["is_register", ["+", ["cast", "base_address", "DWordWL"], ["cast", 1, "DWordWL"]], "timestamp", ["idx", "value", 1]]
 multiplicity = ["-", "w2"]
 
 [[constraints.memory]]
 kind = "interaction"
 tag = "memory"
-input = ["is_register", ["+", "base_address", ["cast", "i", "DWordWL"]], "old_timestamp", ["idx", "old", "i"]]
+input = ["is_register", ["+", ["cast", "base_address", "DWordWL"], ["cast", "i", "DWordWL"]], "old_timestamp", ["idx", "old", "i"]]
 multiplicity = "w4"
 iter = ["i", 2, 3]
 
 [[constraints.memory]]
 kind = "interaction"
 tag = "memory"
-input = ["is_register", ["+", "base_address", ["cast", "i", "DWordWL"]], "timestamp", ["idx", "value", "i"]]
+input = ["is_register", ["+", ["cast", "base_address", "DWordWL"], ["cast", "i", "DWordWL"]], "timestamp", ["idx", "value", "i"]]
 multiplicity = ["-", "w4"]
 iter = ["i", 2, 3]
 
 [[constraints.memory]]
 kind = "interaction"
 tag = "memory"
-input = ["is_register", ["+", "base_address", ["cast", "i", "DWordWL"]], "old_timestamp", ["idx", "old", "i"]]
+input = ["is_register", ["+", ["cast", "base_address", "DWordWL"], ["cast", "i", "DWordWL"]], "old_timestamp", ["idx", "old", "i"]]
 multiplicity = "write8"
 iter = ["i", 4, 7]
 
 [[constraints.memory]]
 kind = "interaction"
 tag = "memory"
-input = ["is_register", ["+", "base_address", ["cast", "i", "DWordWL"]], "timestamp", ["idx", "value", "i"]]
+input = ["is_register", ["+", ["cast", "base_address", "DWordWL"], ["cast", "i", "DWordWL"]], "timestamp", ["idx", "value", "i"]]
 multiplicity = ["-", "write8"]
 iter = ["i", 4, 7]
 
