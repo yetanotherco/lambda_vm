@@ -93,7 +93,6 @@ where
     }
 }
 
-
 #[cfg(all(test, feature = "alloc"))]
 mod tests {
     use crate::fft::cpu::bit_reversing::in_place_bit_reverse_permute;

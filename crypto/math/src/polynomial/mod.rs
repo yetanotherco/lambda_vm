@@ -1,9 +1,9 @@
 use super::field::element::FieldElement;
 use crate::field::traits::{IsField, IsSubFieldOf};
 use alloc::{borrow::ToOwned, vec, vec::Vec};
-use core::{fmt::Display, ops};
 #[cfg(test)]
 use core::slice;
+use core::{fmt::Display, ops};
 /// Represents the polynomial c_0 + c_1 * X + c_2 * X^2 + ... + c_n * X^n
 /// as a vector of coefficients `[c_0, c_1, ... , c_n]`
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -805,7 +805,6 @@ where
     denoms
 }
 
-
 /// Like `interpolate_coset_eval` but takes a precomputed `g_n_inv = (g^N)^{-1}`.
 ///
 /// Use this when evaluating multiple columns at the same coset — the inverse is
@@ -846,7 +845,6 @@ where
     let scalar = n_inv * g_n_inv; // F * F → F
     &scalar * &(vanishing * &sum) // F × E → E
 }
-
 
 /// Like `interpolate_coset_eval_ext` but takes a precomputed `g_n_inv = (g^N)^{-1}`.
 ///

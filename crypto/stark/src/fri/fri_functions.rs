@@ -57,4 +57,3 @@ pub fn update_twiddles_in_place<F: IsField>(twiddles: &mut Vec<FieldElement<F>>)
     }
     twiddles.truncate(new_len);
 }
-

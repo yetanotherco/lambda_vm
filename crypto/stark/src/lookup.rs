@@ -21,6 +21,16 @@ use math::field::{
 #[cfg(feature = "parallel")]
 use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 
+// =============================================================================
+// Shift Constants for Type Combining
+// =============================================================================
+
+/// 2^8 - shift for combining bytes
+pub const SHIFT_8: u64 = 256;
+/// 2^16 - shift for combining halves
+pub const SHIFT_16: u64 = 65536;
+/// 2^32 - shift for combining words
+pub const SHIFT_32: u64 = 4294967296;
 
 /// Precomputed field element shift constants for packing operations.
 ///

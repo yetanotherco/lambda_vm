@@ -95,8 +95,6 @@ fn fold_polynomial_doubled_reference<F: IsField>(
 
 #[test]
 fn test_eval_fold_matches_coeff_fold() {
-    use math::fft::cpu::roots_of_unity::get_powers_of_primitive_root_coset;
-
     let coset_offset = FE::from(3u64);
     let beta = FE::from(7u64);
 
@@ -133,4 +131,3 @@ fn test_eval_fold_matches_coeff_fold() {
 
     assert_eq!(path_a_evals, path_b_evals);
 }
-

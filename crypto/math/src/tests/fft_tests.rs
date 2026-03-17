@@ -302,4 +302,3 @@ mod roots_of_unity_tests {
         assert!(result.is_err());
     }
 }
-

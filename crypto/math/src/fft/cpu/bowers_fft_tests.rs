@@ -422,7 +422,9 @@ fn compare_bowers_vs_native(input: &[FE]) {
     let order = input.len().trailing_zeros() as u64;
 
     // Native Cooley-Tukey FFT
-    let native_twiddles = get_powers_of_primitive_root::<F>(order, (1 << order) / 2, RootsConfig::BitReverse).unwrap();
+    let native_twiddles =
+        get_powers_of_primitive_root::<F>(order, (1 << order) / 2, RootsConfig::BitReverse)
+            .unwrap();
     let mut native_result = input.to_vec();
     in_place_nr_2radix_fft::<F, F>(&mut native_result, &native_twiddles);
     in_place_bit_reverse_permute(&mut native_result);
