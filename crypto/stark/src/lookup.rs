@@ -682,105 +682,106 @@ impl BusValue {
             BusValue::Packed {
                 start_column,
                 packing,
-            } => {
-                match packing {
-                    Packing::Direct => {
-                        let v = step.get_main_evaluation_element(0, *start_column);
-                        *acc += v * &alpha_powers[alpha_offset];
-                        1
-                    }
-                    Packing::Word2L => {
-                        let shift_16 = FieldElement::<A>::from(SHIFT_16);
-                        let c0 = step.get_main_evaluation_element(0, *start_column);
-                        let c1 = step.get_main_evaluation_element(0, *start_column + 1);
-                        let combined = c0 + c1 * &shift_16;
-                        *acc += combined * &alpha_powers[alpha_offset];
-                        1
-                    }
-                    Packing::Word4L => {
-                        let shift_8 = FieldElement::<A>::from(SHIFT_8);
-                        let shift_16 = FieldElement::<A>::from(SHIFT_16);
-                        let shift_24 = &shift_8 * &shift_16;
-                        let sc = *start_column;
-                        let combined = step.get_main_evaluation_element(0, sc)
-                            + step.get_main_evaluation_element(0, sc + 1) * &shift_8
-                            + step.get_main_evaluation_element(0, sc + 2) * &shift_16
-                            + step.get_main_evaluation_element(0, sc + 3) * &shift_24;
-                        *acc += combined * &alpha_powers[alpha_offset];
-                        1
-                    }
-                    Packing::DWordWL => {
-                        let sc = *start_column;
-                        *acc += step.get_main_evaluation_element(0, sc) * &alpha_powers[alpha_offset];
-                        *acc += step.get_main_evaluation_element(0, sc + 1) * &alpha_powers[alpha_offset + 1];
-                        2
-                    }
-                    Packing::DWordHHW => {
-                        let shift_16 = FieldElement::<A>::from(SHIFT_16);
-                        let sc = *start_column;
-                        *acc += step.get_main_evaluation_element(0, sc) * &alpha_powers[alpha_offset];
-                        let w = step.get_main_evaluation_element(0, sc + 1)
-                            + step.get_main_evaluation_element(0, sc + 2) * &shift_16;
-                        *acc += w * &alpha_powers[alpha_offset + 1];
-                        2
-                    }
-                    Packing::DWordWHH => {
-                        let shift_16 = FieldElement::<A>::from(SHIFT_16);
-                        let sc = *start_column;
-                        let w = step.get_main_evaluation_element(0, sc)
-                            + step.get_main_evaluation_element(0, sc + 1) * &shift_16;
-                        *acc += w * &alpha_powers[alpha_offset];
-                        *acc += step.get_main_evaluation_element(0, sc + 2) * &alpha_powers[alpha_offset + 1];
-                        2
-                    }
-                    Packing::DWordHL => {
-                        let shift_16 = FieldElement::<A>::from(SHIFT_16);
-                        let sc = *start_column;
-                        let w0 = step.get_main_evaluation_element(0, sc)
-                            + step.get_main_evaluation_element(0, sc + 1) * &shift_16;
-                        *acc += w0 * &alpha_powers[alpha_offset];
-                        let w1 = step.get_main_evaluation_element(0, sc + 2)
-                            + step.get_main_evaluation_element(0, sc + 3) * &shift_16;
-                        *acc += w1 * &alpha_powers[alpha_offset + 1];
-                        2
-                    }
-                    Packing::DWordBL => {
-                        let shift_8 = FieldElement::<A>::from(SHIFT_8);
-                        let shift_16 = FieldElement::<A>::from(SHIFT_16);
-                        let shift_24 = &shift_8 * &shift_16;
-                        let sc = *start_column;
-                        let w0 = step.get_main_evaluation_element(0, sc)
-                            + step.get_main_evaluation_element(0, sc + 1) * &shift_8
-                            + step.get_main_evaluation_element(0, sc + 2) * &shift_16
-                            + step.get_main_evaluation_element(0, sc + 3) * &shift_24;
-                        *acc += w0 * &alpha_powers[alpha_offset];
-                        let w1 = step.get_main_evaluation_element(0, sc + 4)
-                            + step.get_main_evaluation_element(0, sc + 5) * &shift_8
-                            + step.get_main_evaluation_element(0, sc + 6) * &shift_16
-                            + step.get_main_evaluation_element(0, sc + 7) * &shift_24;
-                        *acc += w1 * &alpha_powers[alpha_offset + 1];
-                        2
-                    }
-                    Packing::QuadHL => {
-                        let shift_16 = FieldElement::<A>::from(SHIFT_16);
-                        let sc = *start_column;
-                        for i in 0..4 {
-                            let c = sc + i * 2;
-                            let w = step.get_main_evaluation_element(0, c)
-                                + step.get_main_evaluation_element(0, c + 1) * &shift_16;
-                            *acc += w * &alpha_powers[alpha_offset + i];
-                        }
-                        4
-                    }
-                    Packing::QuadWL => {
-                        let sc = *start_column;
-                        for i in 0..4 {
-                            *acc += step.get_main_evaluation_element(0, sc + i) * &alpha_powers[alpha_offset + i];
-                        }
-                        4
-                    }
+            } => match packing {
+                Packing::Direct => {
+                    let v = step.get_main_evaluation_element(0, *start_column);
+                    *acc += v * &alpha_powers[alpha_offset];
+                    1
                 }
-            }
+                Packing::Word2L => {
+                    let shift_16 = FieldElement::<A>::from(SHIFT_16);
+                    let c0 = step.get_main_evaluation_element(0, *start_column);
+                    let c1 = step.get_main_evaluation_element(0, *start_column + 1);
+                    let combined = c0 + c1 * &shift_16;
+                    *acc += combined * &alpha_powers[alpha_offset];
+                    1
+                }
+                Packing::Word4L => {
+                    let shift_8 = FieldElement::<A>::from(SHIFT_8);
+                    let shift_16 = FieldElement::<A>::from(SHIFT_16);
+                    let shift_24 = &shift_8 * &shift_16;
+                    let sc = *start_column;
+                    let combined = step.get_main_evaluation_element(0, sc)
+                        + step.get_main_evaluation_element(0, sc + 1) * &shift_8
+                        + step.get_main_evaluation_element(0, sc + 2) * &shift_16
+                        + step.get_main_evaluation_element(0, sc + 3) * &shift_24;
+                    *acc += combined * &alpha_powers[alpha_offset];
+                    1
+                }
+                Packing::DWordWL => {
+                    let sc = *start_column;
+                    *acc += step.get_main_evaluation_element(0, sc) * &alpha_powers[alpha_offset];
+                    *acc += step.get_main_evaluation_element(0, sc + 1)
+                        * &alpha_powers[alpha_offset + 1];
+                    2
+                }
+                Packing::DWordHHW => {
+                    let shift_16 = FieldElement::<A>::from(SHIFT_16);
+                    let sc = *start_column;
+                    *acc += step.get_main_evaluation_element(0, sc) * &alpha_powers[alpha_offset];
+                    let w = step.get_main_evaluation_element(0, sc + 1)
+                        + step.get_main_evaluation_element(0, sc + 2) * &shift_16;
+                    *acc += w * &alpha_powers[alpha_offset + 1];
+                    2
+                }
+                Packing::DWordWHH => {
+                    let shift_16 = FieldElement::<A>::from(SHIFT_16);
+                    let sc = *start_column;
+                    let w = step.get_main_evaluation_element(0, sc)
+                        + step.get_main_evaluation_element(0, sc + 1) * &shift_16;
+                    *acc += w * &alpha_powers[alpha_offset];
+                    *acc += step.get_main_evaluation_element(0, sc + 2)
+                        * &alpha_powers[alpha_offset + 1];
+                    2
+                }
+                Packing::DWordHL => {
+                    let shift_16 = FieldElement::<A>::from(SHIFT_16);
+                    let sc = *start_column;
+                    let w0 = step.get_main_evaluation_element(0, sc)
+                        + step.get_main_evaluation_element(0, sc + 1) * &shift_16;
+                    *acc += w0 * &alpha_powers[alpha_offset];
+                    let w1 = step.get_main_evaluation_element(0, sc + 2)
+                        + step.get_main_evaluation_element(0, sc + 3) * &shift_16;
+                    *acc += w1 * &alpha_powers[alpha_offset + 1];
+                    2
+                }
+                Packing::DWordBL => {
+                    let shift_8 = FieldElement::<A>::from(SHIFT_8);
+                    let shift_16 = FieldElement::<A>::from(SHIFT_16);
+                    let shift_24 = &shift_8 * &shift_16;
+                    let sc = *start_column;
+                    let w0 = step.get_main_evaluation_element(0, sc)
+                        + step.get_main_evaluation_element(0, sc + 1) * &shift_8
+                        + step.get_main_evaluation_element(0, sc + 2) * &shift_16
+                        + step.get_main_evaluation_element(0, sc + 3) * &shift_24;
+                    *acc += w0 * &alpha_powers[alpha_offset];
+                    let w1 = step.get_main_evaluation_element(0, sc + 4)
+                        + step.get_main_evaluation_element(0, sc + 5) * &shift_8
+                        + step.get_main_evaluation_element(0, sc + 6) * &shift_16
+                        + step.get_main_evaluation_element(0, sc + 7) * &shift_24;
+                    *acc += w1 * &alpha_powers[alpha_offset + 1];
+                    2
+                }
+                Packing::QuadHL => {
+                    let shift_16 = FieldElement::<A>::from(SHIFT_16);
+                    let sc = *start_column;
+                    for i in 0..4 {
+                        let c = sc + i * 2;
+                        let w = step.get_main_evaluation_element(0, c)
+                            + step.get_main_evaluation_element(0, c + 1) * &shift_16;
+                        *acc += w * &alpha_powers[alpha_offset + i];
+                    }
+                    4
+                }
+                Packing::QuadWL => {
+                    let sc = *start_column;
+                    for i in 0..4 {
+                        *acc += step.get_main_evaluation_element(0, sc + i)
+                            * &alpha_powers[alpha_offset + i];
+                    }
+                    4
+                }
+            },
             BusValue::Linear(terms) => {
                 let mut result = FieldElement::<A>::zero();
                 for term in terms {
@@ -1820,8 +1821,12 @@ fn compute_fingerprint_from_step<A: IsSubFieldOf<B>, B: IsField>(
     let mut linear_combination = bus_id_f * &alpha_powers[0];
     let mut alpha_idx = 1;
     for bv in &interaction.values {
-        let consumed =
-            bv.accumulate_fingerprint_from_step(step, alpha_powers, alpha_idx, &mut linear_combination);
+        let consumed = bv.accumulate_fingerprint_from_step(
+            step,
+            alpha_powers,
+            alpha_idx,
+            &mut linear_combination,
+        );
         alpha_idx += consumed;
     }
 
