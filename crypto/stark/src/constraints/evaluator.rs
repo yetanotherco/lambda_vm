@@ -68,29 +68,48 @@ where
         // Per-thread buffers via map_init: each Rayon worker allocates once,
         // then reuses for all iterations assigned to that thread.
         //
-        // When rows_per_step == 1 (all VM tables), the Frame uses LDE base pointers
-        // for zero-copy access — only the row offset is updated per LDE point,
-        // eliminating all element copies. For step_size > 1, we fall back to the
-        // copy-based path.
+        // When rows_per_step == 1 (all VM tables), transpose the column-major LDE
+        // into a row-major flat buffer once upfront. This makes row access contiguous
+        // in memory — all columns for a given row are adjacent — eliminating cache
+        // misses from jumping between column Vecs. For step_size > 1, we fall back
+        // to the copy-based path.
         let blowup_factor = lde_trace.blowup_factor;
         let lde_step_size = lde_trace.lde_step_size;
         let rows_per_step = lde_step_size / blowup_factor;
         let num_rows = lde_trace.num_rows();
+        let num_main_cols = lde_trace.num_main_cols();
+        let num_aux_cols = lde_trace.num_aux_cols();
         let num_offsets = offsets.len();
-        let use_zero_copy = rows_per_step == 1;
+        let use_row_major = rows_per_step == 1;
+
+        // Transpose column-major LDE to row-major for cache-friendly constraint access.
+        // Cost: O(num_rows × num_cols) element copies, done once.
+        // Benefit: every row read during constraint evaluation is a sequential memory scan.
+        let row_major_main: Vec<FieldElement<Field>>;
+        let row_major_aux: Vec<FieldElement<FieldExtension>>;
+        if use_row_major {
+            row_major_main = Self::transpose_to_row_major(&lde_trace.main_columns);
+            row_major_aux = Self::transpose_to_row_major(&lde_trace.aux_columns);
+        } else {
+            row_major_main = Vec::new();
+            row_major_aux = Vec::new();
+        }
 
         #[cfg(feature = "parallel")]
         {
-            let num_main_cols = lde_trace.num_main_cols();
-            let num_aux_cols = lde_trace.num_aux_cols();
-
             let evaluations_t: Vec<_> = boundary_evaluation
                 .into_par_iter()
                 .enumerate()
                 .map_init(
                     || {
-                        let frame = if use_zero_copy {
-                            Frame::preallocate_lde(lde_trace, num_offsets)
+                        let frame = if use_row_major {
+                            Frame::preallocate_row_major(
+                                &row_major_main,
+                                num_main_cols,
+                                &row_major_aux,
+                                num_aux_cols,
+                                num_offsets,
+                            )
                         } else {
                             Frame::preallocate(
                                 num_offsets,
@@ -106,7 +125,7 @@ where
                         )
                     },
                     |(transition_buf, periodic_buf, frame), (i, boundary)| {
-                        if use_zero_copy {
+                        if use_row_major {
                             frame.bind_to_lde(i, num_rows, lde_step_size, offsets);
                         } else {
                             frame.fill_from_lde(lde_trace, i, offsets);
@@ -152,13 +171,16 @@ where
 
         #[cfg(not(feature = "parallel"))]
         {
-            let num_main_cols = lde_trace.num_main_cols();
-            let num_aux_cols = lde_trace.num_aux_cols();
-
             let mut transition_buf = vec![FieldElement::<FieldExtension>::zero(); num_transition];
             let mut periodic_buf = vec![FieldElement::<Field>::zero(); num_periodic];
-            let mut frame = if use_zero_copy {
-                Frame::preallocate_lde(lde_trace, num_offsets)
+            let mut frame = if use_row_major {
+                Frame::preallocate_row_major(
+                    &row_major_main,
+                    num_main_cols,
+                    &row_major_aux,
+                    num_aux_cols,
+                    num_offsets,
+                )
             } else {
                 Frame::preallocate(num_offsets, rows_per_step, num_main_cols, num_aux_cols)
             };
@@ -167,7 +189,7 @@ where
                 .into_iter()
                 .enumerate()
                 .map(|(i, boundary)| {
-                    if use_zero_copy {
+                    if use_row_major {
                         frame.bind_to_lde(i, num_rows, lde_step_size, offsets);
                     } else {
                         frame.fill_from_lde(lde_trace, i, offsets);
@@ -207,6 +229,57 @@ where
                 })
                 .collect()
         }
+    }
+
+    /// Transpose column-major data `columns[col][row]` into a flat row-major
+    /// buffer `[row0_col0, row0_col1, ..., row1_col0, ...]`.
+    fn transpose_to_row_major<T: IsField + Send + Sync>(
+        columns: &[Vec<FieldElement<T>>],
+    ) -> Vec<FieldElement<T>>
+    where
+        FieldElement<T>: Send + Sync,
+    {
+        if columns.is_empty() {
+            return Vec::new();
+        }
+        let num_cols = columns.len();
+        let num_rows = columns[0].len();
+        let total = num_rows * num_cols;
+
+        // Initialize with zeros then overwrite — avoids push-per-element overhead.
+        #[cfg(feature = "parallel")]
+        let data = vec![FieldElement::<T>::zero(); total];
+        #[cfg(not(feature = "parallel"))]
+        let mut data = vec![FieldElement::<T>::zero(); total];
+
+        // Parallel by column: each thread writes a full column into the row-major
+        // layout. Writes are non-overlapping since each column writes to distinct
+        // positions (col_idx, col_idx + num_cols, col_idx + 2*num_cols, ...).
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            columns.par_iter().enumerate().for_each(|(col_idx, col)| {
+                // SAFETY: each column writes to disjoint positions in `data`.
+                // col_idx + row * num_cols is unique per (col_idx, row) pair.
+                let data_ptr = data.as_ptr() as *mut FieldElement<T>;
+                for (row, val) in col.iter().enumerate() {
+                    unsafe {
+                        data_ptr.add(row * num_cols + col_idx).write(val.clone());
+                    }
+                }
+            });
+        }
+
+        #[cfg(not(feature = "parallel"))]
+        {
+            for (col_idx, col) in columns.iter().enumerate() {
+                for (row, val) in col.iter().enumerate() {
+                    data[row * num_cols + col_idx] = val.clone();
+                }
+            }
+        }
+
+        data
     }
 
     pub fn new(

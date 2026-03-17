@@ -147,27 +147,33 @@ impl<F: IsSubFieldOf<E>, E: IsField> Frame<F, E> {
         }
     }
 
-    /// Pre-allocate a Frame for LDE-backed zero-copy access.
+    /// Pre-allocate a Frame backed by row-major transposed LDE buffers.
     ///
-    /// Base pointers are captured from `lde_trace` columns and never change.
+    /// Each step stores a pointer into the flat row-major buffer + stride.
     /// Only `row_offset` is updated per LDE point via `bind_to_lde`.
-    /// This eliminates all per-point element copies in the constraint evaluation loop.
-    pub fn preallocate_lde(lde_trace: &LDETraceTable<F, E>, num_offsets: usize) -> Self {
-        let main_base: Vec<*const FieldElement<F>> =
-            lde_trace.main_columns.iter().map(|c| c.as_ptr()).collect();
-        let aux_base: Vec<*const FieldElement<E>> =
-            lde_trace.aux_columns.iter().map(|c| c.as_ptr()).collect();
+    /// Row access is fully contiguous — all columns for a row are adjacent in memory.
+    pub fn preallocate_row_major(
+        main_buf: &[FieldElement<F>],
+        num_main_cols: usize,
+        aux_buf: &[FieldElement<E>],
+        num_aux_cols: usize,
+        num_offsets: usize,
+    ) -> Self {
+        let main_ptr = main_buf.as_ptr();
+        let aux_ptr = aux_buf.as_ptr();
 
         let steps = (0..num_offsets)
             .map(|_| TableView {
                 data: Vec::new(),
                 aux_data: Vec::new(),
                 lde_main: Some(LdeRowRef {
-                    base_ptrs: main_base.clone(),
+                    data_ptr: main_ptr,
+                    num_cols: num_main_cols,
                     row_offset: 0,
                 }),
                 lde_aux: Some(LdeRowRef {
-                    base_ptrs: aux_base.clone(),
+                    data_ptr: aux_ptr,
+                    num_cols: num_aux_cols,
                     row_offset: 0,
                 }),
             })

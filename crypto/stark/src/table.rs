@@ -194,26 +194,31 @@ impl<F: IsField> Table<F> {
     }
 }
 
-/// Base pointers to LDE column data + row offset for zero-copy access.
+/// Pointer into a row-major flat buffer for zero-copy access during constraint evaluation.
+///
+/// Stores a base pointer to a flat `[row0_col0, row0_col1, ..., row1_col0, ...]` buffer,
+/// the number of columns (stride), and the current row offset. Accessing element (row, col)
+/// is `data_ptr[row_offset * num_cols + col]` — fully contiguous for a given row.
 ///
 /// # Safety
-/// The raw pointers in `base_ptrs` must remain valid and the underlying data
-/// must not be mutated for the entire lifetime of the `LdeRowRef`. This is
-/// guaranteed when the `LDETraceTable` is immutably borrowed for the duration
-/// of `evaluate_transitions`.
+/// `data_ptr` must remain valid and the underlying buffer must not be mutated or
+/// deallocated for the entire lifetime of the `LdeRowRef`. This is guaranteed when
+/// the transposed buffer lives on the stack of `evaluate_transitions`.
 pub(crate) struct LdeRowRef<T: IsField> {
-    pub(crate) base_ptrs: Vec<*const FieldElement<T>>,
+    pub(crate) data_ptr: *const FieldElement<T>,
+    pub(crate) num_cols: usize,
     pub(crate) row_offset: usize,
 }
 
-// SAFETY: All threads read from the same immutable LDE data; no mutable aliasing.
+// SAFETY: All threads read from the same immutable transposed buffer; no mutable aliasing.
 unsafe impl<T: IsField> Send for LdeRowRef<T> {}
 unsafe impl<T: IsField> Sync for LdeRowRef<T> {}
 
 impl<T: IsField> Clone for LdeRowRef<T> {
     fn clone(&self) -> Self {
         Self {
-            base_ptrs: self.base_ptrs.clone(),
+            data_ptr: self.data_ptr,
+            num_cols: self.num_cols,
             row_offset: self.row_offset,
         }
     }
@@ -222,7 +227,7 @@ impl<T: IsField> Clone for LdeRowRef<T> {
 impl<T: IsField> std::fmt::Debug for LdeRowRef<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LdeRowRef")
-            .field("num_cols", &self.base_ptrs.len())
+            .field("num_cols", &self.num_cols)
             .field("row_offset", &self.row_offset)
             .finish()
     }
@@ -230,7 +235,9 @@ impl<T: IsField> std::fmt::Debug for LdeRowRef<T> {
 
 impl<T: IsField> PartialEq for LdeRowRef<T> {
     fn eq(&self, other: &Self) -> bool {
-        self.base_ptrs == other.base_ptrs && self.row_offset == other.row_offset
+        self.data_ptr == other.data_ptr
+            && self.num_cols == other.num_cols
+            && self.row_offset == other.row_offset
     }
 }
 
@@ -239,8 +246,8 @@ impl<T: IsField> Eq for LdeRowRef<T> {}
 /// A view of a contiguous subset of rows of a table.
 ///
 /// In the verifier path, row data is owned (`data`/`aux_data` Vecs).
-/// In the prover hot loop, `lde_main`/`lde_aux` provide zero-copy access
-/// to column-major LDE data via base pointers + row offset.
+/// In the prover hot loop, `lde_main`/`lde_aux` point into row-major
+/// transposed buffers for cache-friendly sequential access.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TableView<F, E>
 where
@@ -274,9 +281,9 @@ where
                 row, 0,
                 "LDE-backed TableView only supports row 0 (step_size=1)"
             );
-            // SAFETY: base_ptrs[col] points to lde_column[col][0], and row_offset < column.len().
-            // The LDETraceTable is immutably borrowed for the entire evaluate_transitions call.
-            unsafe { &*lde.base_ptrs[col].add(lde.row_offset) }
+            // SAFETY: data_ptr points to a flat row-major buffer of size num_rows * num_cols.
+            // row_offset < num_rows and col < num_cols, so the index is in bounds.
+            unsafe { &*lde.data_ptr.add(lde.row_offset * lde.num_cols + col) }
         } else {
             &self.data[row][col]
         }
@@ -290,7 +297,7 @@ where
                 "LDE-backed TableView only supports row 0 (step_size=1)"
             );
             // SAFETY: same as get_main_evaluation_element.
-            unsafe { &*lde.base_ptrs[col].add(lde.row_offset) }
+            unsafe { &*lde.data_ptr.add(lde.row_offset * lde.num_cols + col) }
         } else {
             &self.aux_data[row][col]
         }
