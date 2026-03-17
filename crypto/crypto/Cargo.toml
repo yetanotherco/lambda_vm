@@ -21,8 +21,7 @@ rand = { version = "0.8.5", default-features = false }
 rand_chacha = { version = "0.3.1", default-features = false }
 
 [dev-dependencies]
-criterion = "0.4"
-iai-callgrind = "0.3.1"
+math = { path = "../math", features = ["test-utils"] }
 rand = "0.8.5"
 rand_chacha = "0.3.1"
 

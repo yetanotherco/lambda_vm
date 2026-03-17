@@ -59,17 +59,3 @@ pub fn get_powers_of_primitive_root_coset<F: IsFFTField>(
 
     Ok(results.collect())
 }
-
-/// Returns 2^`order` / 2 twiddle factors for FFT in some configuration `config`.
-/// Twiddle factors are powers of a primitive root of unity of the field, used for FFT
-/// computations. FFT only requires the first half of all the powers
-pub fn get_twiddles<F: IsFFTField>(
-    order: u64,
-    config: RootsConfig,
-) -> Result<Vec<FieldElement<F>>, FFTError> {
-    if order > 63 {
-        return Err(FFTError::OrderError(order));
-    }
-
-    get_powers_of_primitive_root(order, (1 << order) / 2, config)
-}

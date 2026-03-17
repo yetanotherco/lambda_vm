@@ -801,51 +801,6 @@ where
     denoms
 }
 
-/// Evaluate a polynomial at point `z` given its evaluations on a coset `{g * w^i}`,
-/// using the barycentric interpolation formula.
-///
-/// Formula: f(z) = (z^N - g^N) / N * sum_{i=0}^{N-1} [ (g*w^i) * f(g*w^i) / (z - g*w^i) ] / g^N
-///
-/// This variant takes base-field evaluations (main trace columns) and returns an
-/// extension-field result.
-///
-/// # Arguments
-/// * `z_pow_n` - z^N where N = coset_points.len()
-/// * `coset_offset_pow_n` - g^N where g = coset_offset
-/// * `n_inv` - 1/N in the extension field
-/// * `coset_points` - the coset {g*w^0, g*w^1, ..., g*w^{N-1}}
-/// * `evaluations` - f(g*w^i) for each coset point (base field)
-/// * `inv_denoms` - precomputed 1/(z - g*w^i)
-#[cfg(feature = "alloc")]
-pub fn interpolate_coset_eval<F, E>(
-    z_pow_n: &FieldElement<E>,
-    coset_offset_pow_n: &FieldElement<E>,
-    n_inv: &FieldElement<E>,
-    coset_points: &[FieldElement<F>],
-    evaluations: &[FieldElement<F>],
-    inv_denoms: &[FieldElement<E>],
-) -> FieldElement<E>
-where
-    F: IsSubFieldOf<E>,
-    E: IsField,
-{
-    debug_assert_eq!(coset_points.len(), evaluations.len());
-    debug_assert_eq!(coset_points.len(), inv_denoms.len());
-
-    let sum: FieldElement<E> = coset_points
-        .iter()
-        .zip(evaluations.iter())
-        .zip(inv_denoms.iter())
-        .fold(FieldElement::<E>::zero(), |acc, ((point, eval), inv_d)| {
-            acc + (point * eval) * inv_d
-        });
-
-    let vanishing = z_pow_n - coset_offset_pow_n;
-    let g_n_inv = coset_offset_pow_n
-        .inv()
-        .expect("coset_offset_pow_n is non-zero");
-    vanishing * n_inv * &sum * &g_n_inv
-}
 
 /// Like `interpolate_coset_eval` but takes a precomputed `g_n_inv = (g^N)^{-1}`.
 ///
@@ -888,43 +843,6 @@ where
     &scalar * &(vanishing * &sum) // F × E → E
 }
 
-/// Evaluate a polynomial at point `z` given its evaluations on a coset `{g * w^i}`,
-/// using the barycentric interpolation formula.
-///
-/// This variant takes extension-field evaluations (aux trace / composition poly columns)
-/// but keeps coset points in the base field to avoid unnecessary extension-field arithmetic.
-/// The `point * eval` computation uses mixed F×E multiplication (cheaper than E×E).
-#[cfg(feature = "alloc")]
-pub fn interpolate_coset_eval_ext<F, E>(
-    z_pow_n: &FieldElement<E>,
-    coset_offset_pow_n: &FieldElement<E>,
-    n_inv: &FieldElement<E>,
-    coset_points: &[FieldElement<F>],
-    evaluations: &[FieldElement<E>],
-    inv_denoms: &[FieldElement<E>],
-) -> FieldElement<E>
-where
-    F: IsSubFieldOf<E>,
-    E: IsField,
-{
-    debug_assert_eq!(coset_points.len(), evaluations.len());
-    debug_assert_eq!(coset_points.len(), inv_denoms.len());
-
-    let sum: FieldElement<E> = coset_points
-        .iter()
-        .zip(evaluations.iter())
-        .zip(inv_denoms.iter())
-        .fold(FieldElement::<E>::zero(), |acc, ((point, eval), inv_d)| {
-            let numerator = point * eval;
-            acc + numerator * inv_d
-        });
-
-    let vanishing = z_pow_n - coset_offset_pow_n;
-    let g_n_inv = coset_offset_pow_n
-        .inv()
-        .expect("coset_offset_pow_n is non-zero");
-    vanishing * n_inv * &sum * &g_n_inv
-}
 
 /// Like `interpolate_coset_eval_ext` but takes a precomputed `g_n_inv = (g^N)^{-1}`.
 ///

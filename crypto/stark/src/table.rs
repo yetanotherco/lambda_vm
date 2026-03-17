@@ -65,31 +65,6 @@ impl<F: IsField> Table<F> {
         Self::new(data, width)
     }
 
-    /// Creates a Table instance by borrowing column data without consuming it.
-    ///
-    /// Same transpose logic as [`from_columns`], but the column Vecs are NOT consumed —
-    /// the caller retains them. This is used for LDE buffer reuse where the pool
-    /// retains the column buffers for the next table.
-    pub fn from_columns_borrowed(columns: &[Vec<FieldElement<F>>]) -> Self {
-        if columns.is_empty() {
-            return Self::new(Vec::new(), 0);
-        }
-        let height = columns[0].len();
-
-        debug_assert!(columns.iter().all(|c| c.len() == height));
-
-        let width = columns.len();
-        let mut data = Vec::with_capacity(width * height);
-
-        for row_idx in 0..height {
-            for column in columns.iter() {
-                data.push(column[row_idx].clone());
-            }
-        }
-
-        Self::new(data, width)
-    }
-
     /// Returns a vector of vectors of field elements representing the table rows
     pub fn rows(&self) -> Vec<Vec<FieldElement<F>>> {
         self.data.chunks(self.width).map(|r| r.to_vec()).collect()
@@ -99,14 +74,6 @@ impl<F: IsField> Table<F> {
     pub fn get_row(&self, row_idx: usize) -> &[FieldElement<F>] {
         let row_offset = row_idx * self.width;
         &self.data[row_offset..row_offset + self.width]
-    }
-
-    /// Given a slice of field elements representing a row, appends it to
-    /// the end of the table.
-    pub fn append_row(&mut self, row: &[FieldElement<F>]) {
-        debug_assert_eq!(row.len(), self.width);
-        self.data.extend_from_slice(row);
-        self.height += 1
     }
 
     /// Returns a reference to the last row of the table

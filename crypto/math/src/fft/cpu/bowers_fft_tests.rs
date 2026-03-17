@@ -5,7 +5,7 @@
 use super::bowers_fft::*;
 use crate::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
 use crate::fft::cpu::fft::in_place_nr_2radix_fft;
-use crate::fft::cpu::roots_of_unity::get_twiddles;
+use crate::fft::cpu::roots_of_unity::get_powers_of_primitive_root;
 use crate::field::element::FieldElement;
 use crate::field::goldilocks::GoldilocksField;
 use crate::field::traits::{IsFFTField, RootsConfig};
@@ -32,49 +32,6 @@ pub fn naive_dft(input: &[FE]) -> Vec<FE> {
     }
 
     result
-}
-
-// =========================================================================
-// FftMatrix tests
-// =========================================================================
-
-#[test]
-fn test_fft_matrix_roundtrip() {
-    let polys = vec![
-        (0..8).map(|i| FE::from(i as u64)).collect::<Vec<_>>(),
-        (8..16).map(|i| FE::from(i as u64)).collect::<Vec<_>>(),
-    ];
-
-    let matrix = FftMatrix::from_polynomials(polys.clone());
-    assert_eq!(matrix.width, 8);
-    assert_eq!(matrix.height, 2);
-
-    let recovered = matrix.to_polynomials();
-    assert_eq!(recovered, polys);
-}
-
-#[test]
-fn test_fft_matrix_empty() {
-    let polys: Vec<Vec<FE>> = vec![];
-    let matrix = FftMatrix::from_polynomials(polys);
-    assert_eq!(matrix.width, 0);
-    assert_eq!(matrix.height, 0);
-}
-
-#[test]
-#[should_panic(expected = "Row index out of bounds")]
-fn test_fft_matrix_row_out_of_bounds() {
-    let polys = vec![(0..8).map(|i| FE::from(i as u64)).collect::<Vec<_>>()];
-    let matrix = FftMatrix::from_polynomials(polys);
-    let _ = matrix.row(1); // Should panic
-}
-
-#[test]
-#[should_panic(expected = "Row index out of bounds")]
-fn test_fft_matrix_row_mut_out_of_bounds() {
-    let polys = vec![(0..8).map(|i| FE::from(i as u64)).collect::<Vec<_>>()];
-    let mut matrix = FftMatrix::from_polynomials(polys);
-    let _ = matrix.row_mut(1); // Should panic
 }
 
 // =========================================================================
@@ -174,23 +131,6 @@ fn test_bowers_fft_size_two() {
     bowers_fft_opt_fused(&mut result, &layer_twiddles).unwrap();
     in_place_bit_reverse_permute(&mut result);
 
-    assert_eq!(result, expected);
-}
-
-#[test]
-fn test_bowers_batch_fft_opt() {
-    let polys = vec![
-        (0..8).map(|i| FE::from(i as u64)).collect::<Vec<_>>(),
-        (8..16).map(|i| FE::from(i as u64)).collect::<Vec<_>>(),
-    ];
-
-    let expected: Vec<Vec<FE>> = polys.iter().map(|p| naive_dft(p)).collect();
-
-    let mut matrix = FftMatrix::from_polynomials(polys);
-    let layer_twiddles = LayerTwiddles::<F>::new(3).unwrap();
-    bowers_batch_fft_opt(&mut matrix, &layer_twiddles).unwrap();
-
-    let result = matrix.to_polynomials();
     assert_eq!(result, expected);
 }
 
@@ -482,7 +422,7 @@ fn compare_bowers_vs_native(input: &[FE]) {
     let order = input.len().trailing_zeros() as u64;
 
     // Native Cooley-Tukey FFT
-    let native_twiddles = get_twiddles(order, RootsConfig::BitReverse).unwrap();
+    let native_twiddles = get_powers_of_primitive_root::<F>(order, (1 << order) / 2, RootsConfig::BitReverse).unwrap();
     let mut native_result = input.to_vec();
     in_place_nr_2radix_fft::<F, F>(&mut native_result, &native_twiddles);
     in_place_bit_reverse_permute(&mut native_result);
@@ -561,7 +501,7 @@ proptest! {
         let order = coeffs.len().trailing_zeros() as u64;
 
         // Native FFT
-        let native_twiddles = get_twiddles(order, RootsConfig::BitReverse).unwrap();
+        let native_twiddles = get_powers_of_primitive_root::<F>(order, (1 << order) / 2, RootsConfig::BitReverse).unwrap();
         let mut native_result = coeffs.clone();
         in_place_nr_2radix_fft::<F, F>(&mut native_result, &native_twiddles);
         in_place_bit_reverse_permute(&mut native_result);

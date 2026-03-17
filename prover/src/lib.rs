@@ -17,8 +17,8 @@ mod debug_report;
 pub mod instruments;
 pub mod tables;
 pub mod test_utils;
+#[cfg(test)]
 pub mod tests;
-pub mod utils;
 
 use std::fmt;
 
