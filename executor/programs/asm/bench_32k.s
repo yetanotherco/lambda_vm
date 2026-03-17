@@ -66,7 +66,8 @@ loop:
 	addi	zero, zero, 0		# NOP 25
 	addi	zero, zero, 0		# NOP 26
 	addi	zero, zero, 0		# NOP 27
-	li	a7, 5
+	li	a0, 0
+	li	a7, 93
 	ecall		# 28: Halt
 
 	# Verification:

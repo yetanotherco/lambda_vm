@@ -62,10 +62,7 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
     let multi_proof =
         match Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])) {
             Ok(proof) => proof,
-            Err(e) => {
-                eprintln!("Prover error: {:?}", e);
-                return false;
-            }
+            Err(_) => return false,
         };
 
     // Verify using centralized air_refs() which includes all tables
@@ -224,6 +221,20 @@ fn test_prove_elfs_arith_lui_8() {
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "Proof verification failed for arith_lui_8 program"
+    );
+}
+
+// Test AUIPC.
+// AUIPC uses rs1=x255 (PC register).
+// read_register1 must be 1 for rs1≠0, triggering the MEMW M1 interaction.
+#[test]
+fn test_prove_elfs_auipc() {
+    let (elf, logs, instructions) = run_asm_elf("auipc");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "auipc failed"
     );
 }
 
@@ -408,6 +419,17 @@ fn test_prove_elfs_test_mul_8() {
 }
 
 #[test]
+fn test_prove_elfs_mulw_neg() {
+    let (elf, logs, instructions) = run_asm_elf("mulw_neg");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "mulw_neg failed"
+    );
+}
+
+#[test]
 fn test_prove_elfs_test_div_8() {
     let (elf, logs, instructions) = run_asm_elf("test_div_8");
     let mut traces =
@@ -416,6 +438,45 @@ fn test_prove_elfs_test_div_8() {
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "test_div_8 failed"
+    );
+}
+
+// Test DIVW with negative operands (−100 / 7 = −14).
+// Result bit 31 is set, so rvd ≠ res. The DVRM bus must send res (CPU-CA46), not rvd.
+#[test]
+fn test_prove_elfs_divw() {
+    let (elf, logs, instructions) = run_asm_elf("divw");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "divw failed"
+    );
+}
+
+// Test REMW with negative operands (−100 % 7 = −2).
+// Result bit 31 is set, so rvd ≠ res. The DVRM bus must send res (CPU-CA46), not rvd.
+#[test]
+fn test_prove_elfs_remw() {
+    let (elf, logs, instructions) = run_asm_elf("remw");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "remw failed"
+    );
+}
+
+// Test DIVW/REMW with a negative divisor (arg2 bit 31 set).
+// Exercises arg2 sign extension via CPU-CE63 (signed * arg2_sign_bit).
+#[test]
+fn test_prove_elfs_sign_ext_edge_cases_8() {
+    let (elf, logs, instructions) = run_asm_elf("sign_ext_edge_cases_8");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "sign_ext_edge_cases_8 failed"
     );
 }
 
@@ -428,6 +489,44 @@ fn test_prove_elfs_test_shift_8() {
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "test_shift_8 failed"
+    );
+}
+
+// Tests that right shift by 0 bits (srli a0, a2, 0) is provable.
+// Regression test for SHIFT-C4: previously C4 sent AND_BYTE[bit_shift; 256, 15] when
+// shift=0, which is out of AND_BYTE's byte range (0-255), making the proof fail.
+#[test]
+fn test_prove_elfs_srli_one_zero() {
+    let (elf, logs, instructions) = run_asm_elf("srli_one_zero");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "srli_one_zero failed"
+    );
+}
+
+#[test]
+fn test_prove_elfs_sllw() {
+    let (elf, logs, instructions) = run_asm_elf("sllw");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "sllw failed"
+    );
+}
+
+/// Proves and verifies a program containing a FENCE instruction.
+/// FENCE is mapped to a no-op ADDI x0, x0, 0.
+#[test]
+fn test_prove_elfs_fence() {
+    let (elf, logs, instructions) = run_asm_elf("fence");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "fence failed"
     );
 }
 
@@ -554,6 +653,75 @@ fn test_prove_elfs_all_instructions_64() {
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "all_instructions_64 failed"
+    );
+}
+
+#[test]
+fn test_prove_elfs_test_commit_4() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+
+    // Verify public output matches the committed bytes [0xAA, 0xBB, 0xCC, 0xDD]
+    assert_eq!(
+        result.return_values.memory_values,
+        vec![0xAA, 0xBB, 0xCC, 0xDD],
+        "Public output should match committed bytes"
+    );
+
+    let mut traces = Traces::from_elf_and_logs(&elf, &result.logs, &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "test_commit_4 failed"
+    );
+}
+
+/// Verifier REJECTS when page configs don't match the proven commit trace.
+///
+/// The prover generates a valid proof for test_commit_4 (which writes to page 0).
+/// The verifier uses only ELF pages (no runtime pages) → page mismatch →
+/// verification must fail.
+#[test]
+fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+
+    let proof_options = ProofOptions::default_test_options();
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+    let mut traces = Traces::from_elf_and_logs(&elf, &result.logs, &Default::default()).unwrap();
+
+    // Prover uses correct page configs
+    let table_counts = traces.table_counts();
+    let prover_airs = crate::VmAirs::new(
+        &elf,
+        &proof_options,
+        true,
+        &traces.page_configs,
+        &table_counts,
+    );
+    let proof = Prover::multi_prove(
+        prover_airs.air_trace_pairs(&mut traces),
+        &mut DefaultTranscript::<E>::new(&[]),
+    )
+    .expect("Prover failed");
+
+    // Verifier uses EMPTY runtime pages → missing stack/public-output pages
+    let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[]);
+    let verifier_airs =
+        crate::VmAirs::new(&elf, &proof_options, true, &wrong_configs, &table_counts);
+
+    let verified = Verifier::multi_verify(
+        &verifier_airs.air_refs(),
+        &proof,
+        &mut DefaultTranscript::<E>::new(&[]),
+    );
+    assert!(
+        !verified,
+        "Verifier should REJECT when runtime pages are missing (commit public output page)"
     );
 }
 
@@ -1413,6 +1581,7 @@ fn test_verify_rejects_zero_table_counts() {
             load: 0,
             mul: 0,
             dvrm: 0,
+            shift: 0,
             branch: 0,
         },
         ..vm_proof
@@ -1478,12 +1647,13 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         load: 0,
         mul: 0,
         dvrm: 0,
+        shift: 0,
         branch: 0,
     };
     let airs = VmAirs::new(&elf, &proof_options, true, &[], &zero_counts);
 
     let verifier_air_refs = airs.air_refs();
-    assert_eq!(verifier_air_refs.len(), 4);
+    assert_eq!(verifier_air_refs.len(), 5);
 
     let mut bitwise_trace = crate::tables::bitwise::generate_bitwise_trace();
 
@@ -1534,6 +1704,36 @@ fn test_small_max_rows_splits_tables() {
     let verified = crate::verify_with_options(&vm_proof, &elf_bytes, &proof_options)
         .expect("Verifier should not error");
     assert!(verified, "Proof with small max_rows should verify");
+}
+
+// =============================================================================
+// Soundness tests: tampered traces must be rejected
+// =============================================================================
+
+/// Tamper with NEXT_PC on a CPU row and verify the proof is rejected.
+///
+/// The PC linkage works via MEMW bus (CM54): each CPU row sends a read-write
+/// for register x255 with old=pc, value=next_pc. If next_pc is wrong in the
+/// CPU trace, the CM54 bus value won't match the MEMW table → bus imbalance
+/// → verification failure.
+#[test]
+fn test_tampered_next_pc_rejected() {
+    use crate::tables::cpu::cols;
+    use math::field::element::FieldElement;
+
+    let (elf, logs, instructions) = run_asm_elf("sub");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+
+    // Tamper: change NEXT_PC_0 on row 0 to a wrong value
+    let original = *traces.cpus[0].get_main(0, cols::NEXT_PC_0);
+    let tampered = original + FieldElement::<F>::from(42u64);
+    traces.cpus[0].set_main(0, cols::NEXT_PC_0, tampered);
+
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "Tampered next_pc should cause verification failure"
+    );
 }
 
 /// Verify rejects inflated table_counts that don't match proof sub-proof count.

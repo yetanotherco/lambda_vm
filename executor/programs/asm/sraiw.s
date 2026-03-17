@@ -6,5 +6,6 @@ main:
 	# Sign-extended to 64 bits: 0xFFFFFFFFC0000000 (-1073741824)
 	li	a2, 0x80000000
 	sraiw	a0, a2, 1
-	li	a7, 5
+	li	a0, 0
+	li	a7, 93
 	ecall

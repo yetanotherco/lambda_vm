@@ -30,5 +30,6 @@ main:
 	ld	a0, 0(sp)
 	addi	sp, sp, 16
 
-	li	a7, 5
+	li	a0, 0
+	li	a7, 93
 	ecall

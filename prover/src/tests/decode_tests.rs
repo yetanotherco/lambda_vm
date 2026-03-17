@@ -113,7 +113,6 @@ fn test_packed_decode_flags() {
         entry.packed_decode() & (1 << bits::WORD_INSTR),
         1 << bits::WORD_INSTR
     );
-    entry.word_instr = false;
 }
 
 #[test]
@@ -228,7 +227,6 @@ fn test_packed_decode_alu_flags() {
         entry.packed_decode() & (1 << bits::OP_EBREAK),
         1 << bits::OP_EBREAK
     );
-    entry.op_ebreak = false;
 }
 
 #[test]

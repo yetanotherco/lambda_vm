@@ -29,5 +29,6 @@ skip5:
 	bgeu	t0, t1, done		# 14: 10 >=u 20? No, fall through
 	addi	a0, a0, 1		# 15: a0 = 6 (executed)
 done:
-	li	a7, 5
+	li	a0, 0
+	li	a7, 93
 	ecall		# 16: Halt

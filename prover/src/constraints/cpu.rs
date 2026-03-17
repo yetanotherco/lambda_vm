@@ -57,6 +57,8 @@ where
 
 /// All bit flag columns that need IS_BIT constraints.
 pub const BIT_FLAG_COLUMNS: &[usize] = &[
+    cols::READ_REGISTER1,
+    cols::READ_REGISTER2,
     cols::WRITE_REGISTER,
     cols::MEMORY_2BYTES,
     cols::MEMORY_4BYTES,
@@ -82,6 +84,7 @@ pub const BIT_FLAG_COLUMNS: &[usize] = &[
     cols::MUL,
     cols::DIVREM,
     cols::ECALL,
+    cols::ECALL_COMMIT,
     cols::EBREAK,
     // Sign bits
     cols::RV1_SIGN_BIT,
@@ -97,6 +100,82 @@ pub const BIT_FLAG_COLUMNS: &[usize] = &[
 /// Returns the constraints and the next available constraint index.
 pub fn create_is_bit_constraints(constraint_idx_start: usize) -> (Vec<IsBitConstraint>, usize) {
     super::templates::new_is_bit_constraints(BIT_FLAG_COLUMNS, constraint_idx_start)
+}
+
+// =========================================================================
+// ECALL_COMMIT Implication Constraint
+// =========================================================================
+
+/// Constraint: ECALL_COMMIT * (1 - ECALL) = 0
+///
+/// Ensures ECALL_COMMIT can only be 1 when ECALL is 1. Without this,
+/// a malicious prover could set ECALL_COMMIT=1 on any row and fabricate
+/// COMMIT bus interactions.
+pub struct EcallCommitImpliesEcallConstraint {
+    constraint_idx: usize,
+}
+
+impl EcallCommitImpliesEcallConstraint {
+    pub fn new(constraint_idx: usize) -> Self {
+        Self { constraint_idx }
+    }
+
+    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        let ecall_commit = step
+            .get_main_evaluation_element(0, cols::ECALL_COMMIT)
+            .clone();
+        let ecall = step.get_main_evaluation_element(0, cols::ECALL).clone();
+        let one = FieldElement::<F>::one();
+        ecall_commit * (one - ecall)
+    }
+}
+
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension>
+    for EcallCommitImpliesEcallConstraint
+{
+    fn degree(&self) -> usize {
+        2
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    fn end_exemptions(&self) -> usize {
+        0
+    }
+
+    fn evaluate(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
+    ) {
+        match evaluation_context {
+            TransitionEvaluationContext::Prover {
+                frame,
+                periodic_values: _,
+                rap_challenges: _,
+                ..
+            } => {
+                let constraint_value = self.compute(frame.get_evaluation_step(0));
+                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
+            }
+
+            TransitionEvaluationContext::Verifier {
+                frame,
+                periodic_values: _,
+                rap_challenges: _,
+                ..
+            } => {
+                let constraint_value = self.compute(frame.get_evaluation_step(0));
+                transition_evaluations[self.constraint_idx] = constraint_value;
+            }
+        }
+    }
 }
 
 // =========================================================================
@@ -1100,6 +1179,79 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RvdUpperCons
 }
 
 // =========================================================================
+// read_register - register Constraints (CM48, CM50)
+// =========================================================================
+
+/// Constraint: `(1 - flag_col) * value_col = 0`
+///
+/// Forces `value_col` to zero whenever `flag_col` is 0.
+///
+/// Used for:
+/// - CPU-CM48.i: `(1 - read_register1) * rv1[i] = 0` for i ∈ [0, 2]
+///   When read_register1 = 0 (rs1 is x0), rv1 is not loaded from memory,
+///   so it must be forced to zero by a polynomial constraint.
+/// - CPU-CM50.i: `(1 - read_register2) * rv2[i] = 0` for i ∈ [0, 2]
+///   Same logic for rv2 when read_register2 = 0 (I-type instructions).
+pub struct RegNotReadIsZeroConstraint {
+    flag_col: usize,
+    value_col: usize,
+    constraint_idx: usize,
+}
+
+impl RegNotReadIsZeroConstraint {
+    pub fn new(flag_col: usize, value_col: usize, constraint_idx: usize) -> Self {
+        Self {
+            flag_col,
+            value_col,
+            constraint_idx,
+        }
+    }
+
+    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        let flag = step.get_main_evaluation_element(0, self.flag_col).clone();
+        let value = step.get_main_evaluation_element(0, self.value_col).clone();
+        let one = FieldElement::<F>::one();
+        // (1 - flag) * value = 0
+        (one - flag) * value
+    }
+}
+
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RegNotReadIsZeroConstraint {
+    fn degree(&self) -> usize {
+        2
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    fn end_exemptions(&self) -> usize {
+        0
+    }
+
+    fn evaluate(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
+    ) {
+        match evaluation_context {
+            TransitionEvaluationContext::Prover { frame, .. } => {
+                let constraint_value = self.compute(frame.get_evaluation_step(0));
+                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
+            }
+            TransitionEvaluationContext::Verifier { frame, .. } => {
+                let constraint_value = self.compute(frame.get_evaluation_step(0));
+                transition_evaluations[self.constraint_idx] = constraint_value;
+            }
+        }
+    }
+}
+
+// =========================================================================
 // SUB Constraints
 // =========================================================================
 
@@ -1176,7 +1328,7 @@ pub fn create_jalr_constraints(constraint_idx_start: usize) -> (Vec<AddConstrain
 
 /// Total number of CPU constraints.
 ///
-/// - IS_BIT: 30 (all bit flags)
+/// - IS_BIT: 33 (all bit flags, including read_register1/2)
 /// - ADD carry: 2 (for ADD + LOAD)
 /// - STORE ADD carry: 2 (for STORE: res = arg1 + imm)
 /// - SUB carry: 2 (for SUB + BEQ)
@@ -1191,11 +1343,14 @@ pub fn create_jalr_constraints(constraint_idx_start: usize) -> (Vec<AddConstrain
 /// - Rvd upper: 1
 /// - SLT res zero: 7 (bytes 1-7)
 /// - Sign bit zero: 1
+/// - rv1 zero-forcing (CM48): 3 (rv1[0..2] when read_register1 = 0)
+/// - rv2 zero-forcing (CM50): 3 (rv2[0..2] when read_register2 = 0)
+/// - ECALL_COMMIT implies ECALL: 1
 /// - Next PC (non-branching): 2
 ///
-/// Total: 56 constraints
+/// Total: 66 constraints (33 IS_BIT + 8 ADD + 25 other)
 pub const NUM_CPU_CONSTRAINTS: usize =
-    30 + 2 + 2 + 2 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 7 + 1 + 2;
+    33 + 2 + 2 + 2 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 7 + 1 + 3 + 3 + 1 + 2;
 
 /// Creates all CPU constraints.
 ///
@@ -1239,6 +1394,26 @@ pub fn create_all_cpu_constraints() -> (
     other.push(Box::new(EbreakConstraint::new(next_idx)));
     next_idx += 1;
 
+    // rv1 zero-forcing (CM48): (1 - read_register1) * rv1[i] = 0 for i ∈ [0, 2]
+    for &value_col in &[cols::RV1_0, cols::RV1_1, cols::RV1_2] {
+        other.push(Box::new(RegNotReadIsZeroConstraint::new(
+            cols::READ_REGISTER1,
+            value_col,
+            next_idx,
+        )));
+        next_idx += 1;
+    }
+
+    // rv2 zero-forcing (CM50): (1 - read_register2) * rv2[i] = 0 for i ∈ [0, 2]
+    for &value_col in &[cols::RV2_0, cols::RV2_1, cols::RV2_2] {
+        other.push(Box::new(RegNotReadIsZeroConstraint::new(
+            cols::READ_REGISTER2,
+            value_col,
+            next_idx,
+        )));
+        next_idx += 1;
+    }
+
     // Arg1 constraints
     other.push(Box::new(Arg1LowerConstraint::new(next_idx)));
     next_idx += 1;
@@ -1266,6 +1441,10 @@ pub fn create_all_cpu_constraints() -> (
 
     // Sign bit zero constraint
     other.push(Box::new(SignBitZeroConstraint::new(next_idx)));
+    next_idx += 1;
+
+    // ECALL_COMMIT implies ECALL
+    other.push(Box::new(EcallCommitImpliesEcallConstraint::new(next_idx)));
     next_idx += 1;
 
     // Next PC (non-branching) constraints

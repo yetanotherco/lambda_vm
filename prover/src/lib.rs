@@ -36,9 +36,9 @@ use crate::tables::page;
 use crate::tables::register;
 use crate::tables::trace_builder::Traces;
 use crate::test_utils::{
-    E, F, VmAir, create_bitwise_air, create_branch_air, create_cpu_air, create_decode_air,
-    create_dvrm_air, create_halt_air, create_load_air, create_lt_air, create_memw_air,
-    create_mul_air, create_page_air, create_register_air,
+    E, F, VmAir, create_bitwise_air, create_branch_air, create_commit_air, create_cpu_air,
+    create_decode_air, create_dvrm_air, create_halt_air, create_load_air, create_lt_air,
+    create_memw_air, create_mul_air, create_page_air, create_register_air, create_shift_air,
 };
 
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
@@ -66,6 +66,7 @@ pub struct TableCounts {
     pub load: usize,
     pub mul: usize,
     pub dvrm: usize,
+    pub shift: usize,
     pub branch: usize,
 }
 
@@ -76,7 +77,7 @@ impl TableCounts {
     /// allowing a malicious prover to bypass soundness checks.
     /// Sum of all chunk counts across split tables.
     pub fn total(&self) -> usize {
-        self.cpu + self.lt + self.memw + self.load + self.mul + self.dvrm + self.branch
+        self.cpu + self.lt + self.memw + self.load + self.mul + self.dvrm + self.shift + self.branch
     }
 
     /// Validate that all required tables have at least one chunk.
@@ -91,6 +92,7 @@ impl TableCounts {
             ("load", self.load),
             ("mul", self.mul),
             ("dvrm", self.dvrm),
+            ("shift", self.shift),
             ("branch", self.branch),
         ];
         for (name, count) in checks {
@@ -165,6 +167,7 @@ pub(crate) struct VmAirs {
     pub cpus: Vec<VmAir>,
     pub bitwise: VmAir,
     pub lts: Vec<VmAir>,
+    pub shifts: Vec<VmAir>,
     pub memws: Vec<VmAir>,
     pub loads: Vec<VmAir>,
     pub decode: VmAir,
@@ -172,6 +175,7 @@ pub(crate) struct VmAirs {
     pub dvrms: Vec<VmAir>,
     pub branches: Vec<VmAir>,
     pub halt: VmAir,
+    pub commit: VmAir,
     pub register: VmAir,
     pub pages: Vec<VmAir>,
 }
@@ -183,6 +187,7 @@ impl VmAirs {
             (&self.bitwise, &mut traces.bitwise, &()),
             (&self.decode, &mut traces.decode, &()),
             (&self.halt, &mut traces.halt, &()),
+            (&self.commit, &mut traces.commit, &()),
             (&self.register, &mut traces.register, &()),
         ];
 
@@ -190,6 +195,9 @@ impl VmAirs {
             pairs.push((air, trace, &()));
         }
         for (air, trace) in self.lts.iter().zip(traces.lts.iter_mut()) {
+            pairs.push((air, trace, &()));
+        }
+        for (air, trace) in self.shifts.iter().zip(traces.shifts.iter_mut()) {
             pairs.push((air, trace, &()));
         }
         for (air, trace) in self.memws.iter().zip(traces.memws.iter_mut()) {
@@ -216,13 +224,21 @@ impl VmAirs {
 
     /// Collect AIR references for [`Verifier::multi_verify`].
     pub fn air_refs(&self) -> Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> {
-        let mut refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
-            vec![&self.bitwise, &self.decode, &self.halt, &self.register];
+        let mut refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
+            &self.bitwise,
+            &self.decode,
+            &self.halt,
+            &self.commit,
+            &self.register,
+        ];
 
         for air in &self.cpus {
             refs.push(air);
         }
         for air in &self.lts {
+            refs.push(air);
+        }
+        for air in &self.shifts {
             refs.push(air);
         }
         for air in &self.memws {
@@ -274,6 +290,9 @@ impl VmAirs {
         let lts: Vec<_> = (0..table_counts.lt)
             .map(|i| create_lt_air(proof_options).with_name(&format!("LT[{}]", i)))
             .collect();
+        let shifts: Vec<_> = (0..table_counts.shift)
+            .map(|i| create_shift_air(proof_options).with_name(&format!("SHIFT[{}]", i)))
+            .collect();
         let memws: Vec<_> = (0..table_counts.memw)
             .map(|i| create_memw_air(proof_options).with_name(&format!("MEMW[{}]", i)))
             .collect();
@@ -295,8 +314,9 @@ impl VmAirs {
             .map(|i| create_branch_air(proof_options).with_name(&format!("BRANCH[{}]", i)))
             .collect();
         let halt = create_halt_air(proof_options);
+        let commit = create_commit_air(proof_options);
         let register = create_register_air(proof_options).with_preprocessed(
-            register::preprocessed_commitment(proof_options),
+            register::preprocessed_commitment(proof_options, elf.entry_point),
             register::NUM_PREPROCESSED_COLS,
         );
         let pages: Vec<_> = page_configs
@@ -316,6 +336,7 @@ impl VmAirs {
             cpus,
             bitwise,
             lts,
+            shifts,
             memws,
             loads,
             decode,
@@ -323,6 +344,7 @@ impl VmAirs {
             dvrms,
             branches,
             halt,
+            commit,
             register,
             pages,
         }
@@ -450,11 +472,11 @@ pub fn verify_with_options(
         Traces::page_configs_from_elf_and_runtime(&program, &vm_proof.runtime_page_ranges);
 
     // Cross-check: table_counts must match the number of sub-proofs.
-    // Fixed tables (bitwise, decode, halt, register) = 4, plus page tables.
-    let expected_proof_count = vm_proof.table_counts.total() + 4 + page_configs.len();
+    // Fixed tables (bitwise, decode, halt, commit, register) = 5, plus page tables.
+    let expected_proof_count = vm_proof.table_counts.total() + 5 + page_configs.len();
     if expected_proof_count != vm_proof.proof.proofs.len() {
         return Err(Error::InvalidTableCounts(format!(
-            "table_counts total ({}) + 4 fixed + {} pages = {}, but proof contains {} sub-proofs",
+            "table_counts total ({}) + 5 fixed + {} pages = {}, but proof contains {} sub-proofs",
             vm_proof.table_counts.total(),
             page_configs.len(),
             expected_proof_count,

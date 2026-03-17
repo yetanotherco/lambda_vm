@@ -31,6 +31,10 @@ use crate::tables::bitwise::{
 use crate::tables::branch::{
     branch_constraints, bus_interactions as branch_bus_interactions, cols as branch_cols,
 };
+use crate::tables::commit::{
+    bus_interactions as commit_bus_interactions, cols as commit_cols,
+    create_constraints as commit_constraints,
+};
 use crate::tables::cpu::{
     CpuOperation, bus_interactions as cpu_bus_interactions, cols as cpu_cols,
 };
@@ -50,6 +54,9 @@ use crate::tables::mul::{bus_interactions as mul_bus_interactions, cols as mul_c
 use crate::tables::page::{bus_interactions as page_bus_interactions, cols as page_cols};
 use crate::tables::register::{
     bus_interactions as register_bus_interactions, cols as register_cols,
+};
+use crate::tables::shift::{
+    bus_interactions as shift_bus_interactions, cols as shift_cols, shift_constraints,
 };
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
@@ -373,7 +380,7 @@ pub fn generate_minimal_bitwise_trace(ops: &[BitwiseOperation]) -> TraceTable<F,
     use std::collections::HashMap;
 
     // Collect unique (lo_byte, hi_byte, shift) tuples and count multiplicities per lookup type
-    let mut row_data: HashMap<(u8, u8, u8), [u64; 11]> = HashMap::new();
+    let mut row_data: HashMap<(u8, u8, u8), [u64; 10]> = HashMap::new();
 
     for op in ops {
         let key = (op.x, op.y, op.z);
@@ -388,9 +395,8 @@ pub fn generate_minimal_bitwise_trace(ops: &[BitwiseOperation]) -> TraceTable<F,
             BitwiseOperationType::IsHalf => 7,
             BitwiseOperationType::IsB20 => 8,
             BitwiseOperationType::Hwsl => 9,
-            BitwiseOperationType::Hwslc => 10,
         };
-        row_data.entry(key).or_insert([0; 11])[mu_idx] += 1;
+        row_data.entry(key).or_insert([0; 10])[mu_idx] += 1;
     }
 
     // Need at least 4 rows for FRI, pad to power of 2
@@ -448,7 +454,6 @@ pub fn generate_minimal_bitwise_trace(ops: &[BitwiseOperation]) -> TraceTable<F,
         data[base + bitwise_cols::MU_IS_HALF] = FE::from(mus[7]);
         data[base + bitwise_cols::MU_IS_B20] = FE::from(mus[8]);
         data[base + bitwise_cols::MU_HWSL] = FE::from(mus[9]);
-        data[base + bitwise_cols::MU_HWSLC] = FE::from(mus[10]);
     }
 
     TraceTable::new_main(data, bitwise_cols::NUM_COLUMNS, 1)
@@ -523,6 +528,26 @@ pub fn create_lt_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("LT")
+}
+
+/// Create SHIFT AIR with constraints and bus interactions.
+pub fn create_shift_air(proof_options: &ProofOptions) -> VmAir {
+    let (constraints, _) = shift_constraints(0);
+    let transition_constraints: Vec<Box<dyn TransitionConstraint<F, E>>> =
+        constraints.into_iter().map(|c| Box::new(c) as _).collect();
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: shift_bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        shift_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+    .with_name("SHIFT")
 }
 
 /// Create MEMW AIR with constraints and bus interactions.
@@ -669,6 +694,24 @@ pub fn create_halt_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("HALT")
+}
+
+/// Create COMMIT AIR with constraints and bus interactions.
+pub fn create_commit_air(proof_options: &ProofOptions) -> VmAir {
+    let (transition_constraints, _) = commit_constraints(0);
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: commit_bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        commit_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+    .with_name("COMMIT")
 }
 
 /// Create PAGE AIR with bus interactions for a specific page.
