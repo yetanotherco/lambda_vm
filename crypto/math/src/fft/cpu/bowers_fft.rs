@@ -682,18 +682,15 @@ where
         let layer_lo = layer - 2;
         let block_size = n >> layer_lo;
 
-        if block_size >= 4 {
-            let twiddles_hi = layer_twiddles.get_layer(layer_hi);
-            let twiddles_lo = layer_twiddles.get_layer(layer_lo);
+        debug_assert!(block_size >= 4);
+        let twiddles_hi = layer_twiddles.get_layer(layer_hi);
+        let twiddles_lo = layer_twiddles.get_layer(layer_lo);
 
-            for block_start in (0..n).step_by(block_size) {
-                let block = &mut input[block_start..block_start + block_size];
-                process_ifft_fused_block(block, twiddles_hi, twiddles_lo);
-            }
-            layer -= 2;
-        } else {
-            break;
+        for block_start in (0..n).step_by(block_size) {
+            let block = &mut input[block_start..block_start + block_size];
+            process_ifft_fused_block(block, twiddles_hi, twiddles_lo);
         }
+        layer -= 2;
     }
 
     // Process remaining single layer (if odd number of layers)
@@ -776,25 +773,22 @@ where
         let layer_lo = layer - 2;
         let block_size = n >> layer_lo;
 
-        if block_size >= 4 {
-            let twiddles_hi = layer_twiddles.get_layer(layer_hi);
-            let twiddles_lo = layer_twiddles.get_layer(layer_lo);
-            let num_blocks = n / block_size;
+        debug_assert!(block_size >= 4);
+        let twiddles_hi = layer_twiddles.get_layer(layer_hi);
+        let twiddles_lo = layer_twiddles.get_layer(layer_lo);
+        let num_blocks = n / block_size;
 
-            if num_blocks >= parallel_threshold {
-                input.par_chunks_mut(block_size).for_each(|block| {
-                    process_ifft_fused_block(block, twiddles_hi, twiddles_lo);
-                });
-            } else {
-                for block_start in (0..n).step_by(block_size) {
-                    let block = &mut input[block_start..block_start + block_size];
-                    process_ifft_fused_block(block, twiddles_hi, twiddles_lo);
-                }
-            }
-            layer -= 2;
+        if num_blocks >= parallel_threshold {
+            input.par_chunks_mut(block_size).for_each(|block| {
+                process_ifft_fused_block(block, twiddles_hi, twiddles_lo);
+            });
         } else {
-            break;
+            for block_start in (0..n).step_by(block_size) {
+                let block = &mut input[block_start..block_start + block_size];
+                process_ifft_fused_block(block, twiddles_hi, twiddles_lo);
+            }
         }
+        layer -= 2;
     }
 
     // Process remaining single layer (if odd number of layers)
