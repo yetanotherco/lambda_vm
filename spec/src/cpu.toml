@@ -722,16 +722,10 @@ name = "ext"
 prefix = "E"
 
 [[constraints.ext]]
-kind = "arith"
-constraint = "$(#`rv1_sign_bit` or #`arg2_sign_bit` or #`res_sign_bit`) => #`word_instr`$"
-poly = ["*", ["+", "rv1_sign_bit", "arg2_sign_bit", "res_sign_bit"], ["not", "word_instr"]]
-
-[[constraints.ext]]
-kind = "interaction"
-tag = "MSB16"
-input = [["idx", "rv1", 1]]
+kind = "template"
+tag = "SIGN"
+input = [["idx", "rv1", 1], "word_instr"]
 output = "rv1_sign_bit"
-multiplicity = "word_instr"
 
 [[constraints.ext]]
 kind = "arith"
@@ -744,11 +738,10 @@ constraint = "$#`arg1[4:]` = #`rv1[2]` dot (1 - #`word_instr`) + (2^(32) - 1) do
 poly = ["-", ["idx", ["cast", "arg1", "DWordWL"], 1], ["*", ["not", "word_instr"], ["idx", "rv1", 2]], ["*", "signed", "rv1_sign_bit", ["-", ["^", 2, 32], 1]]]
 
 [[constraints.ext]]
-kind = "interaction"
-tag = "MSB16"
-input = [["idx", "rv2", 1]]
+kind = "template"
+tag = "SIGN"
+input = [["idx", "rv2", 1], "word_instr"]
 output = "arg2_sign_bit"
-multiplicity = "word_instr"
 
 [[constraints.ext]]
 kind = "arith"
@@ -761,11 +754,10 @@ constraint = "$#`arg2[4:]` = (1 - #`LOAD`) dot ((1 - #`word_instr`) dot #`rv2[2]
 poly = ["-", ["idx", ["cast", "arg2", "DWordWL"], 1], ["*", ["not", "LOAD"], ["not", "word_instr"], ["idx", "rv2", 2]], ["*", ["not", "LOAD"], "signed", "arg2_sign_bit", ["-", ["^", 2, 32], 1]], ["*", ["-", 1, "BEQ", "BLT", "STORE"], ["idx", "imm", 1]]]
 
 [[constraints.ext]]
-kind = "interaction"
-tag = "MSB8"
-input = [["idx", "res", 3]]
+kind = "template"
+tag = "SIGN"
+input = [["idx", ["cast", "res", "DWordHL"], 1],  "word_instr"]
 output = "res_sign_bit"
-multiplicity = "word_instr"
 
 [[constraints.ext]]
 kind = "arith"
