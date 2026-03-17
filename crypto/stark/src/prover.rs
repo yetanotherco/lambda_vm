@@ -1471,6 +1471,9 @@ pub trait IsStarkProver<
     {
         info!("Started proof generation...");
 
+        #[cfg(feature = "instruments")]
+        crate::instruments::reset_all();
+
         let num_airs = air_trace_pairs.len();
 
         // Check if any AIR has an auxiliary trace
@@ -1672,15 +1675,23 @@ pub trait IsStarkProver<
                     if air.has_aux_trace() {
                         let num_aux_cols = trace.num_aux_columns;
                         trace.extract_columns_aux_into(&mut pool.aux);
+                        #[cfg(feature = "instruments")]
+                        let t_sub = Instant::now();
                         Self::expand_pool_to_lde::<FieldExtension>(
                             &mut pool.aux,
                             num_aux_cols,
                             domain,
                             twiddles,
                         );
+                        #[cfg(feature = "instruments")]
+                        let aux_lde_dur = t_sub.elapsed();
+                        #[cfg(feature = "instruments")]
+                        let t_sub = Instant::now();
                         let (tree, root) =
                             Self::commit_columns_bit_reversed(&pool.aux[..num_aux_cols])
                                 .ok_or(ProvingError::EmptyCommitment)?;
+                        #[cfg(feature = "instruments")]
+                        crate::instruments::accum_r1_aux(aux_lde_dur, t_sub.elapsed());
                         Ok((Some(Arc::new(tree)), Some(root)))
                     } else {
                         Ok((None, None))
@@ -1806,8 +1817,10 @@ pub trait IsStarkProver<
                         domain,
                     )?;
 
-                    // Collect per-table sub-op timing (works via TLS in sequential mode;
-                    // defaults to zero in parallel mode since TLS is per-worker-thread).
+                    // Collect per-table sub-op timing via TLS.
+                    // Both the store (inside prove_rounds_2_to_4) and this take run on the
+                    // same rayon worker thread, so sub-ops are valid in both sequential and
+                    // parallel mode.
                     #[cfg(feature = "instruments")]
                     let table_timing = {
                         let mut sub_ops =

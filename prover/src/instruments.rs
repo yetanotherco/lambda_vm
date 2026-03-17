@@ -5,7 +5,7 @@ fn fmt_rows(rows: usize) -> String {
     if rows >= 1_000_000 {
         format!("{:.1}M", rows as f64 / 1_000_000.0)
     } else if rows >= 1_000 {
-        format!("{}K", rows / 1_000)
+        format!("{}K", (rows + 500) / 1_000)
     } else {
         format!("{rows}")
     }
@@ -56,7 +56,6 @@ pub fn print_report(
     execute: Duration,
     trace_build: Duration,
     air_construction: Duration,
-    _prove: Duration,
     total: Duration,
 ) {
     let mp = stark::instruments::take();

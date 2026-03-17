@@ -412,9 +412,6 @@ pub fn prove_with_options(
     let runtime_page_ranges = traces.runtime_page_ranges();
 
     // Phase 4: Prove (multi_prove)
-    #[cfg(feature = "instruments")]
-    let phase_start = std::time::Instant::now();
-
     let proof = Prover::multi_prove(
         airs.air_trace_pairs(&mut traces),
         &mut DefaultTranscript::<E>::new(&[]),
@@ -423,12 +420,10 @@ pub fn prove_with_options(
 
     #[cfg(feature = "instruments")]
     {
-        let prove_elapsed = phase_start.elapsed();
         instruments::print_report(
             execute_elapsed,
             trace_build_elapsed,
             air_elapsed,
-            prove_elapsed,
             total_start.elapsed(),
         );
     }

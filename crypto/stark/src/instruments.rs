@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Sub-operation timing breakdown for a single table in Rounds 2-4.
@@ -50,13 +51,14 @@ pub struct MultiProveTiming {
     pub table_timings: Vec<(String, usize, Duration, TableSubOps)>,
 }
 
+/// Round 1 sub-timings: atomics so parallel rayon workers can accumulate safely.
+static R1_MAIN_LDE_NS: AtomicU64 = AtomicU64::new(0);
+static R1_MAIN_MERKLE_NS: AtomicU64 = AtomicU64::new(0);
+static R1_AUX_LDE_NS: AtomicU64 = AtomicU64::new(0);
+static R1_AUX_MERKLE_NS: AtomicU64 = AtomicU64::new(0);
+
 thread_local! {
     static TIMING_DATA: RefCell<Option<MultiProveTiming>> = const { RefCell::new(None) };
-    /// Round 1 sub-timings accumulated across the main-commit and aux-commit loops.
-    static R1_SUB: RefCell<Round1SubOps> = const { RefCell::new(Round1SubOps {
-        main_lde: Duration::ZERO, main_merkle: Duration::ZERO,
-        aux_lde: Duration::ZERO, aux_merkle: Duration::ZERO,
-    }) };
     /// Round 2 sub-timings: (constraints, fft, merkle)
     static R2_SUB: RefCell<Option<(Duration, Duration, Duration)>> = const { RefCell::new(None) };
     /// Round 4 sub-timings: (fft, merkle, deep_comp, queries)
@@ -76,23 +78,35 @@ pub fn take() -> Option<MultiProveTiming> {
 }
 
 pub fn accum_r1_main(lde: Duration, merkle: Duration) {
-    R1_SUB.with(|cell| {
-        let mut s = cell.borrow_mut();
-        s.main_lde += lde;
-        s.main_merkle += merkle;
-    });
+    R1_MAIN_LDE_NS.fetch_add(lde.as_nanos() as u64, Ordering::Relaxed);
+    R1_MAIN_MERKLE_NS.fetch_add(merkle.as_nanos() as u64, Ordering::Relaxed);
 }
 
 pub fn accum_r1_aux(lde: Duration, merkle: Duration) {
-    R1_SUB.with(|cell| {
-        let mut s = cell.borrow_mut();
-        s.aux_lde += lde;
-        s.aux_merkle += merkle;
-    });
+    R1_AUX_LDE_NS.fetch_add(lde.as_nanos() as u64, Ordering::Relaxed);
+    R1_AUX_MERKLE_NS.fetch_add(merkle.as_nanos() as u64, Ordering::Relaxed);
 }
 
 pub fn take_r1_sub() -> Round1SubOps {
-    R1_SUB.with(|cell| std::mem::replace(&mut *cell.borrow_mut(), Round1SubOps::default()))
+    Round1SubOps {
+        main_lde: Duration::from_nanos(R1_MAIN_LDE_NS.swap(0, Ordering::Relaxed)),
+        main_merkle: Duration::from_nanos(R1_MAIN_MERKLE_NS.swap(0, Ordering::Relaxed)),
+        aux_lde: Duration::from_nanos(R1_AUX_LDE_NS.swap(0, Ordering::Relaxed)),
+        aux_merkle: Duration::from_nanos(R1_AUX_MERKLE_NS.swap(0, Ordering::Relaxed)),
+    }
+}
+
+/// Reset all instrument state. Call at the start of `multi_prove` to avoid
+/// stale data from a previous run in the same process.
+pub fn reset_all() {
+    R1_MAIN_LDE_NS.store(0, Ordering::Relaxed);
+    R1_MAIN_MERKLE_NS.store(0, Ordering::Relaxed);
+    R1_AUX_LDE_NS.store(0, Ordering::Relaxed);
+    R1_AUX_MERKLE_NS.store(0, Ordering::Relaxed);
+    TIMING_DATA.with(|cell| { cell.borrow_mut().take(); });
+    R2_SUB.with(|cell| { cell.borrow_mut().take(); });
+    R4_SUB.with(|cell| { cell.borrow_mut().take(); });
+    ROUND_SUB_OPS.with(|cell| { cell.borrow_mut().take(); });
 }
 
 pub fn store_r2_sub(constraints: Duration, fft: Duration, merkle: Duration) {
