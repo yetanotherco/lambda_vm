@@ -1,3 +1,10 @@
+# Notes:
+# 1. this version is a teeny-bit more memory aligned than its predecessor: 
+#       0xFF..FF overflows to 0x100..00 rather than 0x00..00.
+# 2. perhaps "is_register: Bit" should be replaced by "domain: BaseField", 
+#    where it is elsewhere explained that RAM <-> domain=0 and registers <-> domain=1.
+#    this also opens the possibility of further memory domains (e.g. for the kernel)
+
 name = "MEMW"
 
 # Input
@@ -77,7 +84,7 @@ type = ["DWordWL", 7]
 desc = "`address_add[i] = base_address + i + 1`"
 def.iter = ["i", 0, 6]
 def.poly = ["arr",
-  ["+", ["idx", "base_address", 0], "i", 1, ["*", ["-", ["^", 2, 32]], ["idx", "carry", "i"]]],
+  ["-", ["+", ["idx", "base_address", 0], "i", 1], ["*", ["^", 2, 32], ["idx", "carry", "i"]]],
   ["+", ["idx", "base_address", 1], ["idx", "carry", "i"]]]
 
 [[variables.virtual]]
