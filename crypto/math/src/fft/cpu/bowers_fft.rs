@@ -297,7 +297,7 @@ where
 }
 
 /// Process a single block with 2-layer fusion (DIF butterfly).
-#[cfg(all(feature = "alloc", feature = "parallel"))]
+#[cfg(feature = "alloc")]
 #[inline]
 fn process_fused_block<F, E>(
     block: &mut [FieldElement<E>],
@@ -537,7 +537,70 @@ impl<F: IsFFTField> LayerTwiddles<F> {
     }
 }
 
-/// Optimized Bowers IFFT with sequential twiddle access.
+/// Process a single block with 2-layer IFFT fusion (DIT butterfly).
+///
+/// Processes two consecutive IFFT layers in a single pass. The `twiddles_hi` are
+/// for the higher-numbered layer (processed first in DIT order) and `twiddles_lo`
+/// are for the lower-numbered layer (processed second).
+#[cfg(feature = "alloc")]
+#[inline]
+fn process_ifft_fused_block<F, E>(
+    block: &mut [FieldElement<E>],
+    twiddles_hi: &[FieldElement<F>],
+    twiddles_lo: &[FieldElement<F>],
+) where
+    F: IsFFTField + IsSubFieldOf<E>,
+    E: IsField,
+{
+    let block_size = block.len();
+    let quarter = block_size >> 2;
+
+    debug_assert!(
+        twiddles_hi.len() >= quarter,
+        "twiddles_hi too short: {} < {}",
+        twiddles_hi.len(),
+        quarter
+    );
+    debug_assert!(
+        twiddles_lo.len() >= 2 * quarter,
+        "twiddles_lo too short: {} < {}",
+        twiddles_lo.len(),
+        2 * quarter
+    );
+
+    for j in 0..quarter {
+        let i0 = j;
+        let i1 = j + quarter;
+        let i2 = j + 2 * quarter;
+        let i3 = j + 3 * quarter;
+
+        let w_hi = &twiddles_hi[j];
+
+        // Layer hi: first sub-block butterfly (DIT: multiply then add/subtract)
+        let bw0 = w_hi * &block[i1];
+        let a0 = &block[i0] + &bw0;
+        let b0 = &block[i0] - &bw0;
+
+        // Layer hi: second sub-block butterfly
+        let bw1 = w_hi * &block[i3];
+        let a1 = &block[i2] + &bw1;
+        let b1 = &block[i2] - &bw1;
+
+        let w_lo_0 = &twiddles_lo[j];
+        let w_lo_1 = &twiddles_lo[j + quarter];
+
+        // Layer lo: butterfly on combined results
+        let bw2 = w_lo_0 * &a1;
+        block[i0] = &a0 + &bw2;
+        block[i2] = &a0 - &bw2;
+
+        let bw3 = w_lo_1 * &b1;
+        block[i1] = &b0 + &bw3;
+        block[i3] = &b0 - &bw3;
+    }
+}
+
+/// Optimized Bowers IFFT with 2-layer fusion and sequential twiddle access.
 ///
 /// **Note**: This performs the inverse butterfly structure but does NOT apply
 /// the 1/n scaling factor. The caller must:
@@ -595,10 +658,56 @@ where
         return Err(FFTError::InputError(n));
     }
 
-    for layer in (0..log_n).rev() {
-        let block_size = n >> layer;
+    // Handle small sizes with simple sequential processing
+    if n <= 4 {
+        for layer in (0..log_n).rev() {
+            let block_size = n >> layer;
+            let half_block = block_size >> 1;
+            let twiddles = layer_twiddles.get_layer(layer);
+
+            for block_start in (0..n).step_by(block_size) {
+                for j in 0..half_block {
+                    let i0 = block_start + j;
+                    let i1 = i0 + half_block;
+                    let w = &twiddles[j];
+
+                    let bw = w * &input[i1];
+                    let sum = &input[i0] + &bw;
+                    let diff = &input[i0] - &bw;
+
+                    input[i0] = sum;
+                    input[i1] = diff;
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    // Process pairs of layers with 2-layer fusion (DIT, reverse order)
+    let mut layer = log_n;
+
+    while layer >= 2 {
+        let layer_hi = layer - 1;
+        let layer_lo = layer - 2;
+        let block_size = n >> layer_lo;
+
+        debug_assert!(block_size >= 4);
+        let twiddles_hi = layer_twiddles.get_layer(layer_hi);
+        let twiddles_lo = layer_twiddles.get_layer(layer_lo);
+
+        for block_start in (0..n).step_by(block_size) {
+            let block = &mut input[block_start..block_start + block_size];
+            process_ifft_fused_block(block, twiddles_hi, twiddles_lo);
+        }
+        layer -= 2;
+    }
+
+    // Process remaining single layer (if odd number of layers)
+    if layer >= 1 {
+        let remaining_layer = layer - 1;
+        let block_size = n >> remaining_layer;
         let half_block = block_size >> 1;
-        let twiddles = layer_twiddles.get_layer(layer);
+        let twiddles = layer_twiddles.get_layer(remaining_layer);
 
         for block_start in (0..n).step_by(block_size) {
             for j in 0..half_block {
@@ -619,7 +728,7 @@ where
     Ok(())
 }
 
-/// Parallel Bowers IFFT with adaptive parallelization.
+/// Parallel Bowers IFFT with 2-layer fusion and adaptive parallelization.
 ///
 /// This is the parallel counterpart to `bowers_ifft_opt`. Like the forward parallel
 /// variant, it uses `par_chunks_mut` to process independent blocks in parallel when
@@ -665,12 +774,39 @@ where
         return Err(FFTError::InputError(n));
     }
 
-    // DIT: iterate layers from bottom (log_n - 1) to top (0)
-    for layer in (0..log_n).rev() {
-        let block_size = n >> layer;
+    // Process pairs of layers with 2-layer fusion (DIT, reverse order)
+    let mut layer = log_n;
+
+    while layer >= 2 {
+        let layer_hi = layer - 1;
+        let layer_lo = layer - 2;
+        let block_size = n >> layer_lo;
+
+        debug_assert!(block_size >= 4);
+        let twiddles_hi = layer_twiddles.get_layer(layer_hi);
+        let twiddles_lo = layer_twiddles.get_layer(layer_lo);
+        let num_blocks = n / block_size;
+
+        if num_blocks >= parallel_threshold {
+            input.par_chunks_mut(block_size).for_each(|block| {
+                process_ifft_fused_block(block, twiddles_hi, twiddles_lo);
+            });
+        } else {
+            for block_start in (0..n).step_by(block_size) {
+                let block = &mut input[block_start..block_start + block_size];
+                process_ifft_fused_block(block, twiddles_hi, twiddles_lo);
+            }
+        }
+        layer -= 2;
+    }
+
+    // Process remaining single layer (if odd number of layers)
+    if layer >= 1 {
+        let remaining_layer = layer - 1;
+        let block_size = n >> remaining_layer;
         let half_block = block_size >> 1;
         let num_blocks = n / block_size;
-        let twiddles = layer_twiddles.get_layer(layer);
+        let twiddles = layer_twiddles.get_layer(remaining_layer);
 
         if num_blocks >= parallel_threshold {
             input.par_chunks_mut(block_size).for_each(|block| {
@@ -804,57 +940,8 @@ where
             let twiddles_l1 = layer_twiddles.get_layer(layer + 1);
 
             for block_start in (0..n).step_by(block_size) {
-                let quarter = block_size >> 2;
                 let block = &mut input[block_start..block_start + block_size];
-
-                // Verify twiddle arrays have sufficient length
-                debug_assert!(
-                    twiddles_l0.len() >= 2 * quarter,
-                    "twiddles_l0 too short: {} < {}",
-                    twiddles_l0.len(),
-                    2 * quarter
-                );
-                debug_assert!(
-                    twiddles_l1.len() >= quarter,
-                    "twiddles_l1 too short: {} < {}",
-                    twiddles_l1.len(),
-                    quarter
-                );
-
-                for j in 0..quarter {
-                    let i0 = j;
-                    let i1 = j + quarter;
-                    let i2 = j + 2 * quarter;
-                    let i3 = j + 3 * quarter;
-
-                    let w0 = &twiddles_l0[j];
-                    let w1 = &twiddles_l0[j + quarter];
-
-                    // First layer butterflies
-                    let sum_02 = &block[i0] + &block[i2];
-                    let diff_02 = &block[i0] - &block[i2];
-                    let diff_02_w = w0 * &diff_02;
-
-                    let sum_13 = &block[i1] + &block[i3];
-                    let diff_13 = &block[i1] - &block[i3];
-                    let diff_13_w = w1 * &diff_13;
-
-                    let w2 = &twiddles_l1[j];
-
-                    // Second layer butterflies
-                    let final_0 = &sum_02 + &sum_13;
-                    let diff_sums = &sum_02 - &sum_13;
-                    let final_1 = w2 * &diff_sums;
-
-                    let final_2 = &diff_02_w + &diff_13_w;
-                    let diff_diffs = &diff_02_w - &diff_13_w;
-                    let final_3 = w2 * &diff_diffs;
-
-                    block[i0] = final_0;
-                    block[i1] = final_1;
-                    block[i2] = final_2;
-                    block[i3] = final_3;
-                }
+                process_fused_block(block, twiddles_l0, twiddles_l1);
             }
             layer += 2;
         } else {
@@ -862,8 +949,8 @@ where
         }
     }
 
-    // Process remaining single layers (if odd number of layers)
-    while layer < log_n {
+    // Process remaining single layer (if odd number of layers)
+    if layer < log_n {
         let block_size = n >> layer;
         let half_block = block_size >> 1;
         let twiddles = layer_twiddles.get_layer(layer);
@@ -882,7 +969,6 @@ where
                 input[i1] = diff_w;
             }
         }
-        layer += 1;
     }
 
     Ok(())
