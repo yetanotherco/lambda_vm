@@ -11,8 +11,8 @@
 //! PHASE 0: ELF → DECODE, MEMORY_INIT (preprocessed tables)
 //! PHASE 1: Logs → CPU ops
 //! PHASE 2: CPU ops → MEMW, LOAD, LT, Bitwise (with state tracking for MEMW/LOAD)
-//! PHASE 3: MEMW → LT ops (timestamp ordering, overflow checks)
-//! PHASE 4: LT, MEMW → Bitwise lookups
+//! PHASE 3: MEMW → LT ops (timestamp ordering)
+//! PHASE 4: LT → Bitwise lookups
 //! PHASE 5: Generate all traces
 //! ```
 //!
@@ -692,11 +692,10 @@ fn collect_halt_ops(register_state: &mut RegisterState) -> Vec<MemwOperation> {
 // Phase 3: MEMW → LT
 // =============================================================================
 
-/// Collects LT operations from MEMW for timestamp ordering and overflow checks.
+/// Collects LT operations from MEMW for timestamp ordering.
 ///
 /// From spec memw.md:
-/// - C7-C10: old_timestamp[i] < timestamp (based on width)
-/// - R1-R3: base_address < base_address + offset (overflow checks)
+/// - C4-C7: old_timestamp[i] < timestamp (based on width)
 ///
 /// Returns: Vec of LT operations
 fn collect_lt_from_memw(memw_ops: &[MemwOperation]) -> Vec<LtOperation> {
@@ -742,22 +741,6 @@ fn collect_lt_from_memw(memw_ops: &[MemwOperation]) -> Vec<LtOperation> {
                     false,
                 ));
             }
-        }
-
-        // R1-R3: Address overflow checks (unconditional per MEMW-CR13/14/15)
-        // If overflow occurs, LT returns lt=0 and the constraint (expecting lt=1)
-        // rejects the proof via value mismatch.
-        if memw_op.width == 2 {
-            let addr_plus_1 = memw_op.base_address.wrapping_add(1);
-            lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_1, false));
-        }
-        if memw_op.width == 4 {
-            let addr_plus_3 = memw_op.base_address.wrapping_add(3);
-            lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_3, false));
-        }
-        if memw_op.width == 8 {
-            let addr_plus_7 = memw_op.base_address.wrapping_add(7);
-            lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_7, false));
         }
     }
 
@@ -1054,30 +1037,6 @@ fn collect_bitwise_from_dvrm(dvrm_ops: &[(DvrmOperation, bool)]) -> Vec<BitwiseO
                 // C5b: ZERO[1-carry_d[1]; d[0]+d[1]+d[2]+d[3]]
                 bitwise_ops.push(BitwiseOperation::zero(
                     d_halves[0] + d_halves[1] + d_halves[2] + d_halves[3],
-                ));
-            }
-        }
-    }
-
-    bitwise_ops
-}
-
-/// Collects IS_HALFWORD lookups from MEMW address_add columns.
-///
-/// Returns: Vec of bitwise lookups
-fn collect_bitwise_from_memw(memw_ops: &[MemwOperation]) -> Vec<BitwiseOperation> {
-    let mut bitwise_ops = Vec::with_capacity(memw_ops.len() * 28); // 7 addresses * 4 halfwords
-
-    for memw_op in memw_ops {
-        for i in 0..7u64 {
-            let addr_add = memw_op.base_address.wrapping_add(i + 1);
-            // Extract 4 halfwords (DWordHL packing)
-            for shift in [0, 16, 32, 48] {
-                let half = ((addr_add >> shift) & 0xFFFF) as u16;
-                bitwise_ops.push(BitwiseOperation::halfword(
-                    BitwiseOperationType::IsHalf,
-                    (half & 0xFF) as u8,
-                    (half >> 8) as u8,
                 ));
             }
         }
@@ -1723,7 +1682,6 @@ impl Traces {
         // PHASE 4: All → Bitwise lookups
         // =====================================================================
         bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
-        bitwise_ops.extend(collect_bitwise_from_memw(&memw_ops));
         bitwise_ops.extend(collect_bitwise_from_mul(&mul_ops));
         bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops));
         bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
@@ -1944,7 +1902,6 @@ impl Traces {
         // PHASE 4: All → Bitwise lookups
         // =====================================================================
         bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
-        bitwise_ops.extend(collect_bitwise_from_memw(&memw_ops));
         bitwise_ops.extend(collect_bitwise_from_mul(&mul_ops));
         bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops));
         bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
