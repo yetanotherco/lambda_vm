@@ -695,21 +695,21 @@ fn collect_halt_ops(register_state: &mut RegisterState) -> Vec<MemwOperation> {
 /// Collects LT operations from MEMW for timestamp ordering.
 ///
 /// From spec memw.md:
-/// - C4-C7: old_timestamp[i] < timestamp (based on width)
+/// - MEMW-C4 through MEMW-C7: old_timestamp[i] < timestamp (based on width)
 ///
 /// Returns: Vec of LT operations
 fn collect_lt_from_memw(memw_ops: &[MemwOperation]) -> Vec<LtOperation> {
     let mut lt_ops = Vec::with_capacity(memw_ops.len() * 8);
 
     for memw_op in memw_ops {
-        // C7: old_timestamp[0] < timestamp (all accesses)
+        // MEMW-C4: old_timestamp[0] < timestamp (all accesses)
         lt_ops.push(LtOperation::new(
             memw_op.old_timestamp[0],
             memw_op.timestamp,
             false,
         ));
 
-        // C8: old_timestamp[1] < timestamp (width >= 2)
+        // MEMW-C5: old_timestamp[1] < timestamp (width >= 2)
         if memw_op.width >= 2 {
             lt_ops.push(LtOperation::new(
                 memw_op.old_timestamp[1],
@@ -718,7 +718,7 @@ fn collect_lt_from_memw(memw_ops: &[MemwOperation]) -> Vec<LtOperation> {
             ));
         }
 
-        // C9: old_timestamp[2,3] < timestamp (width >= 4)
+        // MEMW-C6: old_timestamp[2,3] < timestamp (width >= 4)
         if memw_op.width >= 4 {
             lt_ops.push(LtOperation::new(
                 memw_op.old_timestamp[2],
@@ -732,7 +732,7 @@ fn collect_lt_from_memw(memw_ops: &[MemwOperation]) -> Vec<LtOperation> {
             ));
         }
 
-        // C10: old_timestamp[4..7] < timestamp (width == 8)
+        // MEMW-C7: old_timestamp[4..7] < timestamp (width == 8)
         if memw_op.width == 8 {
             for i in 4..8 {
                 lt_ops.push(LtOperation::new(

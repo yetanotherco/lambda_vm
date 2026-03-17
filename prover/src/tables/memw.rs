@@ -752,10 +752,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // LT interactions for timestamp ordering (constraints 7-10)
+    // LT interactions for timestamp ordering (MEMW-C4 through MEMW-C7)
     // -------------------------------------------------------------------------
 
-    // C7: LT[1; old_timestamp[0], timestamp] with μ_sum
+    // MEMW-C4: LT[1; old_timestamp[0], timestamp] with μ_sum
     interactions.push(BusInteraction::sender(
         BusId::Lt,
         Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE),
@@ -773,7 +773,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // C8: LT[1; old_timestamp[1], timestamp] with w2
+    // MEMW-C5: LT[1; old_timestamp[1], timestamp] with w2
     interactions.push(BusInteraction::sender(
         BusId::Lt,
         Multiplicity::Linear(vec![
@@ -804,7 +804,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // C9: LT[1; old_timestamp[i], timestamp] for i ∈ [2,3] with w4
+    // MEMW-C6: LT[1; old_timestamp[i], timestamp] for i ∈ [2,3] with w4
     for i in 2..4 {
         interactions.push(BusInteraction::sender(
             BusId::Lt,
@@ -824,7 +824,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
-    // C10: LT[1; old_timestamp[i], timestamp] for i ∈ [4,7] with write8
+    // MEMW-C7: LT[1; old_timestamp[i], timestamp] for i ∈ [4,7] with write8
     for i in 4..8 {
         interactions.push(BusInteraction::sender(
             BusId::Lt,
