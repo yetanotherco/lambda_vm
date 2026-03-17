@@ -225,15 +225,122 @@ impl Packing {
             .collect()
     }
 
-    /// Accumulates the fingerprint contribution of this packing into `acc`.
+    /// Accumulates the fingerprint contribution of this packing into `acc`,
+    /// using `get_col` to access column data by index.
     ///
     /// Computes: `acc += Σ combined_element_i * alpha_powers[alpha_offset + i]`
     /// where `combined_element_i` are the bus elements produced by this packing.
     ///
     /// Returns the number of alpha powers consumed (= num_bus_elements()).
     ///
-    /// This avoids allocating intermediate Vecs for the combined elements.
-    /// `main_cols` are column-major: `main_cols[col][row]`.
+    /// This is the single canonical implementation of packing arithmetic for
+    /// fingerprint accumulation. Both column-major (`main_cols[col][row]`) and
+    /// TableView callers delegate here with an appropriate closure.
+    pub fn accumulate_fingerprint_with<'a, F, E>(
+        &self,
+        start_col: usize,
+        get_col: impl Fn(usize) -> &'a FieldElement<F>,
+        alpha_powers: &[FieldElement<E>],
+        alpha_offset: usize,
+        acc: &mut FieldElement<E>,
+    ) -> usize
+    where
+        F: IsField + IsSubFieldOf<E> + 'a,
+        E: IsField,
+    {
+        debug_assert!(
+            alpha_powers.len() >= alpha_offset + self.num_bus_elements(),
+            "alpha_powers too short: len={}, need={}",
+            alpha_powers.len(),
+            alpha_offset + self.num_bus_elements()
+        );
+
+        match self {
+            Packing::Direct => {
+                *acc += get_col(start_col) * &alpha_powers[alpha_offset];
+                1
+            }
+            Packing::Word2L => {
+                let shift_16 = FieldElement::<F>::from(SHIFT_16);
+                let combined = get_col(start_col) + get_col(start_col + 1) * &shift_16;
+                *acc += &combined * &alpha_powers[alpha_offset];
+                1
+            }
+            Packing::Word4L => {
+                let shift_8 = FieldElement::<F>::from(SHIFT_8);
+                let shift_16 = FieldElement::<F>::from(SHIFT_16);
+                let shift_24 = &shift_8 * &shift_16;
+                let combined = get_col(start_col)
+                    + get_col(start_col + 1) * &shift_8
+                    + get_col(start_col + 2) * &shift_16
+                    + get_col(start_col + 3) * &shift_24;
+                *acc += &combined * &alpha_powers[alpha_offset];
+                1
+            }
+            Packing::DWordWL => {
+                *acc += get_col(start_col) * &alpha_powers[alpha_offset];
+                *acc += get_col(start_col + 1) * &alpha_powers[alpha_offset + 1];
+                2
+            }
+            Packing::DWordHHW => {
+                *acc += get_col(start_col) * &alpha_powers[alpha_offset];
+                let shift_16 = FieldElement::<F>::from(SHIFT_16);
+                let w = get_col(start_col + 1) + get_col(start_col + 2) * &shift_16;
+                *acc += &w * &alpha_powers[alpha_offset + 1];
+                2
+            }
+            Packing::DWordWHH => {
+                let shift_16 = FieldElement::<F>::from(SHIFT_16);
+                let w = get_col(start_col) + get_col(start_col + 1) * &shift_16;
+                *acc += &w * &alpha_powers[alpha_offset];
+                *acc += get_col(start_col + 2) * &alpha_powers[alpha_offset + 1];
+                2
+            }
+            Packing::DWordHL => {
+                let shift_16 = FieldElement::<F>::from(SHIFT_16);
+                let w0 = get_col(start_col) + get_col(start_col + 1) * &shift_16;
+                *acc += &w0 * &alpha_powers[alpha_offset];
+                let w1 = get_col(start_col + 2) + get_col(start_col + 3) * &shift_16;
+                *acc += &w1 * &alpha_powers[alpha_offset + 1];
+                2
+            }
+            Packing::DWordBL => {
+                let shift_8 = FieldElement::<F>::from(SHIFT_8);
+                let shift_16 = FieldElement::<F>::from(SHIFT_16);
+                let shift_24 = &shift_8 * &shift_16;
+                let w0 = get_col(start_col)
+                    + get_col(start_col + 1) * &shift_8
+                    + get_col(start_col + 2) * &shift_16
+                    + get_col(start_col + 3) * &shift_24;
+                *acc += &w0 * &alpha_powers[alpha_offset];
+                let w1 = get_col(start_col + 4)
+                    + get_col(start_col + 5) * &shift_8
+                    + get_col(start_col + 6) * &shift_16
+                    + get_col(start_col + 7) * &shift_24;
+                *acc += &w1 * &alpha_powers[alpha_offset + 1];
+                2
+            }
+            Packing::QuadHL => {
+                let shift_16 = FieldElement::<F>::from(SHIFT_16);
+                for i in 0..4 {
+                    let c = start_col + i * 2;
+                    let w = get_col(c) + get_col(c + 1) * &shift_16;
+                    *acc += &w * &alpha_powers[alpha_offset + i];
+                }
+                4
+            }
+            Packing::QuadWL => {
+                for i in 0..4 {
+                    *acc += get_col(start_col + i) * &alpha_powers[alpha_offset + i];
+                }
+                4
+            }
+        }
+    }
+
+    /// Accumulates fingerprint from column-major trace data.
+    ///
+    /// Delegates to `accumulate_fingerprint_with` using `main_cols[col][row]`.
     pub fn accumulate_fingerprint<F, E>(
         &self,
         main_cols: &[Vec<FieldElement<F>>],
@@ -247,98 +354,13 @@ impl Packing {
         F: IsField + IsSubFieldOf<E>,
         E: IsField,
     {
-        match self {
-            Packing::Direct => {
-                *acc += &main_cols[start_col][row] * &alpha_powers[alpha_offset];
-                1
-            }
-            Packing::Word2L => {
-                let shift_16 = FieldElement::<F>::from(SHIFT_16);
-                let combined =
-                    &main_cols[start_col][row] + &main_cols[start_col + 1][row] * &shift_16;
-                *acc += &combined * &alpha_powers[alpha_offset];
-                1
-            }
-            Packing::Word4L => {
-                let shift_8 = FieldElement::<F>::from(SHIFT_8);
-                let shift_16 = FieldElement::<F>::from(SHIFT_16);
-                let shift_24 = &shift_8 * &shift_16;
-                let combined = &main_cols[start_col][row]
-                    + &main_cols[start_col + 1][row] * &shift_8
-                    + &main_cols[start_col + 2][row] * &shift_16
-                    + &main_cols[start_col + 3][row] * &shift_24;
-                *acc += &combined * &alpha_powers[alpha_offset];
-                1
-            }
-            // Compound packings: decompose into primitives.
-            // No recursion through generic closures — all reference main_cols directly.
-            Packing::DWordWL => {
-                // 2× Direct
-                *acc += &main_cols[start_col][row] * &alpha_powers[alpha_offset];
-                *acc += &main_cols[start_col + 1][row] * &alpha_powers[alpha_offset + 1];
-                2
-            }
-            Packing::DWordHHW => {
-                // Direct + Word2L
-                *acc += &main_cols[start_col][row] * &alpha_powers[alpha_offset];
-                let shift_16 = FieldElement::<F>::from(SHIFT_16);
-                let w = &main_cols[start_col + 1][row] + &main_cols[start_col + 2][row] * &shift_16;
-                *acc += &w * &alpha_powers[alpha_offset + 1];
-                2
-            }
-            Packing::DWordWHH => {
-                // Word2L + Direct
-                let shift_16 = FieldElement::<F>::from(SHIFT_16);
-                let w = &main_cols[start_col][row] + &main_cols[start_col + 1][row] * &shift_16;
-                *acc += &w * &alpha_powers[alpha_offset];
-                *acc += &main_cols[start_col + 2][row] * &alpha_powers[alpha_offset + 1];
-                2
-            }
-            Packing::DWordHL => {
-                // 2× Word2L
-                let shift_16 = FieldElement::<F>::from(SHIFT_16);
-                let w0 = &main_cols[start_col][row] + &main_cols[start_col + 1][row] * &shift_16;
-                *acc += &w0 * &alpha_powers[alpha_offset];
-                let w1 =
-                    &main_cols[start_col + 2][row] + &main_cols[start_col + 3][row] * &shift_16;
-                *acc += &w1 * &alpha_powers[alpha_offset + 1];
-                2
-            }
-            Packing::DWordBL => {
-                // 2× Word4L
-                let shift_8 = FieldElement::<F>::from(SHIFT_8);
-                let shift_16 = FieldElement::<F>::from(SHIFT_16);
-                let shift_24 = &shift_8 * &shift_16;
-                let w0 = &main_cols[start_col][row]
-                    + &main_cols[start_col + 1][row] * &shift_8
-                    + &main_cols[start_col + 2][row] * &shift_16
-                    + &main_cols[start_col + 3][row] * &shift_24;
-                *acc += &w0 * &alpha_powers[alpha_offset];
-                let w1 = &main_cols[start_col + 4][row]
-                    + &main_cols[start_col + 5][row] * &shift_8
-                    + &main_cols[start_col + 6][row] * &shift_16
-                    + &main_cols[start_col + 7][row] * &shift_24;
-                *acc += &w1 * &alpha_powers[alpha_offset + 1];
-                2
-            }
-            Packing::QuadHL => {
-                // 4× Word2L
-                let shift_16 = FieldElement::<F>::from(SHIFT_16);
-                for i in 0..4 {
-                    let c = start_col + i * 2;
-                    let w = &main_cols[c][row] + &main_cols[c + 1][row] * &shift_16;
-                    *acc += &w * &alpha_powers[alpha_offset + i];
-                }
-                4
-            }
-            Packing::QuadWL => {
-                // 4× Direct
-                for i in 0..4 {
-                    *acc += &main_cols[start_col + i][row] * &alpha_powers[alpha_offset + i];
-                }
-                4
-            }
-        }
+        self.accumulate_fingerprint_with(
+            start_col,
+            |col| &main_cols[col][row],
+            alpha_powers,
+            alpha_offset,
+            acc,
+        )
     }
 
     /// Combines column values into bus elements using powers of 2.
@@ -671,6 +693,7 @@ impl BusValue {
     ///
     /// Equivalent to `combine_from` + multiply by alpha powers, but avoids
     /// the intermediate `Vec<FieldElement>` allocation per call.
+    /// Packed variants delegate to `Packing::accumulate_fingerprint_with`.
     pub fn accumulate_fingerprint_from_step<A: IsSubFieldOf<B>, B: IsField>(
         &self,
         step: &TableView<A, B>,
@@ -682,107 +705,20 @@ impl BusValue {
             BusValue::Packed {
                 start_column,
                 packing,
-            } => match packing {
-                Packing::Direct => {
-                    let v = step.get_main_evaluation_element(0, *start_column);
-                    *acc += v * &alpha_powers[alpha_offset];
-                    1
-                }
-                Packing::Word2L => {
-                    let shift_16 = FieldElement::<A>::from(SHIFT_16);
-                    let c0 = step.get_main_evaluation_element(0, *start_column);
-                    let c1 = step.get_main_evaluation_element(0, *start_column + 1);
-                    let combined = c0 + c1 * &shift_16;
-                    *acc += combined * &alpha_powers[alpha_offset];
-                    1
-                }
-                Packing::Word4L => {
-                    let shift_8 = FieldElement::<A>::from(SHIFT_8);
-                    let shift_16 = FieldElement::<A>::from(SHIFT_16);
-                    let shift_24 = &shift_8 * &shift_16;
-                    let sc = *start_column;
-                    let combined = step.get_main_evaluation_element(0, sc)
-                        + step.get_main_evaluation_element(0, sc + 1) * &shift_8
-                        + step.get_main_evaluation_element(0, sc + 2) * &shift_16
-                        + step.get_main_evaluation_element(0, sc + 3) * &shift_24;
-                    *acc += combined * &alpha_powers[alpha_offset];
-                    1
-                }
-                Packing::DWordWL => {
-                    let sc = *start_column;
-                    *acc += step.get_main_evaluation_element(0, sc) * &alpha_powers[alpha_offset];
-                    *acc += step.get_main_evaluation_element(0, sc + 1)
-                        * &alpha_powers[alpha_offset + 1];
-                    2
-                }
-                Packing::DWordHHW => {
-                    let shift_16 = FieldElement::<A>::from(SHIFT_16);
-                    let sc = *start_column;
-                    *acc += step.get_main_evaluation_element(0, sc) * &alpha_powers[alpha_offset];
-                    let w = step.get_main_evaluation_element(0, sc + 1)
-                        + step.get_main_evaluation_element(0, sc + 2) * &shift_16;
-                    *acc += w * &alpha_powers[alpha_offset + 1];
-                    2
-                }
-                Packing::DWordWHH => {
-                    let shift_16 = FieldElement::<A>::from(SHIFT_16);
-                    let sc = *start_column;
-                    let w = step.get_main_evaluation_element(0, sc)
-                        + step.get_main_evaluation_element(0, sc + 1) * &shift_16;
-                    *acc += w * &alpha_powers[alpha_offset];
-                    *acc += step.get_main_evaluation_element(0, sc + 2)
-                        * &alpha_powers[alpha_offset + 1];
-                    2
-                }
-                Packing::DWordHL => {
-                    let shift_16 = FieldElement::<A>::from(SHIFT_16);
-                    let sc = *start_column;
-                    let w0 = step.get_main_evaluation_element(0, sc)
-                        + step.get_main_evaluation_element(0, sc + 1) * &shift_16;
-                    *acc += w0 * &alpha_powers[alpha_offset];
-                    let w1 = step.get_main_evaluation_element(0, sc + 2)
-                        + step.get_main_evaluation_element(0, sc + 3) * &shift_16;
-                    *acc += w1 * &alpha_powers[alpha_offset + 1];
-                    2
-                }
-                Packing::DWordBL => {
-                    let shift_8 = FieldElement::<A>::from(SHIFT_8);
-                    let shift_16 = FieldElement::<A>::from(SHIFT_16);
-                    let shift_24 = &shift_8 * &shift_16;
-                    let sc = *start_column;
-                    let w0 = step.get_main_evaluation_element(0, sc)
-                        + step.get_main_evaluation_element(0, sc + 1) * &shift_8
-                        + step.get_main_evaluation_element(0, sc + 2) * &shift_16
-                        + step.get_main_evaluation_element(0, sc + 3) * &shift_24;
-                    *acc += w0 * &alpha_powers[alpha_offset];
-                    let w1 = step.get_main_evaluation_element(0, sc + 4)
-                        + step.get_main_evaluation_element(0, sc + 5) * &shift_8
-                        + step.get_main_evaluation_element(0, sc + 6) * &shift_16
-                        + step.get_main_evaluation_element(0, sc + 7) * &shift_24;
-                    *acc += w1 * &alpha_powers[alpha_offset + 1];
-                    2
-                }
-                Packing::QuadHL => {
-                    let shift_16 = FieldElement::<A>::from(SHIFT_16);
-                    let sc = *start_column;
-                    for i in 0..4 {
-                        let c = sc + i * 2;
-                        let w = step.get_main_evaluation_element(0, c)
-                            + step.get_main_evaluation_element(0, c + 1) * &shift_16;
-                        *acc += w * &alpha_powers[alpha_offset + i];
-                    }
-                    4
-                }
-                Packing::QuadWL => {
-                    let sc = *start_column;
-                    for i in 0..4 {
-                        *acc += step.get_main_evaluation_element(0, sc + i)
-                            * &alpha_powers[alpha_offset + i];
-                    }
-                    4
-                }
-            },
+            } => packing.accumulate_fingerprint_with(
+                *start_column,
+                |col| step.get_main_evaluation_element(0, col),
+                alpha_powers,
+                alpha_offset,
+                acc,
+            ),
             BusValue::Linear(terms) => {
+                debug_assert!(
+                    alpha_powers.len() > alpha_offset,
+                    "alpha_powers too short: len={}, need={}",
+                    alpha_powers.len(),
+                    alpha_offset + 1
+                );
                 let mut result = FieldElement::<A>::zero();
                 for term in terms {
                     match term {
