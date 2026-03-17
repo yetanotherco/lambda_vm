@@ -32,6 +32,35 @@ pub const SHIFT_16: u64 = 65536;
 /// 2^32 - shift for combining words
 pub const SHIFT_32: u64 = 4294967296;
 
+/// Precomputed field element shift constants for packing operations.
+///
+/// Avoids repeated `FieldElement::from()` conversions in hot loops.
+/// Create once before a loop and pass by reference.
+pub struct PackingShifts<F: IsField> {
+    pub shift_8: FieldElement<F>,
+    pub shift_16: FieldElement<F>,
+    pub shift_24: FieldElement<F>,
+}
+
+impl<F: IsField> Default for PackingShifts<F> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<F: IsField> PackingShifts<F> {
+    pub fn new() -> Self {
+        let shift_8 = FieldElement::<F>::from(SHIFT_8);
+        let shift_16 = FieldElement::<F>::from(SHIFT_16);
+        let shift_24 = &shift_8 * &shift_16;
+        Self {
+            shift_8,
+            shift_16,
+            shift_24,
+        }
+    }
+}
+
 /// Computes powers of alpha incrementally: [1, α, α², α³, ...]
 ///
 /// This is more efficient than calling `alpha.pow(i)` for each i,
@@ -234,6 +263,7 @@ impl Packing {
     ///
     /// This avoids allocating intermediate Vecs for the combined elements.
     /// `main_cols` are column-major: `main_cols[col][row]`.
+    #[allow(clippy::too_many_arguments)]
     pub fn accumulate_fingerprint<F, E>(
         &self,
         main_cols: &[Vec<FieldElement<F>>],
@@ -242,6 +272,7 @@ impl Packing {
         alpha_powers: &[FieldElement<E>],
         alpha_offset: usize,
         acc: &mut FieldElement<E>,
+        shifts: &PackingShifts<F>,
     ) -> usize
     where
         F: IsField + IsSubFieldOf<E>,
@@ -253,20 +284,16 @@ impl Packing {
                 1
             }
             Packing::Word2L => {
-                let shift_16 = FieldElement::<F>::from(SHIFT_16);
                 let combined =
-                    &main_cols[start_col][row] + &main_cols[start_col + 1][row] * &shift_16;
+                    &main_cols[start_col][row] + &main_cols[start_col + 1][row] * &shifts.shift_16;
                 *acc += &combined * &alpha_powers[alpha_offset];
                 1
             }
             Packing::Word4L => {
-                let shift_8 = FieldElement::<F>::from(SHIFT_8);
-                let shift_16 = FieldElement::<F>::from(SHIFT_16);
-                let shift_24 = &shift_8 * &shift_16;
                 let combined = &main_cols[start_col][row]
-                    + &main_cols[start_col + 1][row] * &shift_8
-                    + &main_cols[start_col + 2][row] * &shift_16
-                    + &main_cols[start_col + 3][row] * &shift_24;
+                    + &main_cols[start_col + 1][row] * &shifts.shift_8
+                    + &main_cols[start_col + 2][row] * &shifts.shift_16
+                    + &main_cols[start_col + 3][row] * &shifts.shift_24;
                 *acc += &combined * &alpha_powers[alpha_offset];
                 1
             }
@@ -281,52 +308,48 @@ impl Packing {
             Packing::DWordHHW => {
                 // Direct + Word2L
                 *acc += &main_cols[start_col][row] * &alpha_powers[alpha_offset];
-                let shift_16 = FieldElement::<F>::from(SHIFT_16);
-                let w = &main_cols[start_col + 1][row] + &main_cols[start_col + 2][row] * &shift_16;
+                let w = &main_cols[start_col + 1][row]
+                    + &main_cols[start_col + 2][row] * &shifts.shift_16;
                 *acc += &w * &alpha_powers[alpha_offset + 1];
                 2
             }
             Packing::DWordWHH => {
                 // Word2L + Direct
-                let shift_16 = FieldElement::<F>::from(SHIFT_16);
-                let w = &main_cols[start_col][row] + &main_cols[start_col + 1][row] * &shift_16;
+                let w =
+                    &main_cols[start_col][row] + &main_cols[start_col + 1][row] * &shifts.shift_16;
                 *acc += &w * &alpha_powers[alpha_offset];
                 *acc += &main_cols[start_col + 2][row] * &alpha_powers[alpha_offset + 1];
                 2
             }
             Packing::DWordHL => {
                 // 2× Word2L
-                let shift_16 = FieldElement::<F>::from(SHIFT_16);
-                let w0 = &main_cols[start_col][row] + &main_cols[start_col + 1][row] * &shift_16;
+                let w0 =
+                    &main_cols[start_col][row] + &main_cols[start_col + 1][row] * &shifts.shift_16;
                 *acc += &w0 * &alpha_powers[alpha_offset];
-                let w1 =
-                    &main_cols[start_col + 2][row] + &main_cols[start_col + 3][row] * &shift_16;
+                let w1 = &main_cols[start_col + 2][row]
+                    + &main_cols[start_col + 3][row] * &shifts.shift_16;
                 *acc += &w1 * &alpha_powers[alpha_offset + 1];
                 2
             }
             Packing::DWordBL => {
                 // 2× Word4L
-                let shift_8 = FieldElement::<F>::from(SHIFT_8);
-                let shift_16 = FieldElement::<F>::from(SHIFT_16);
-                let shift_24 = &shift_8 * &shift_16;
                 let w0 = &main_cols[start_col][row]
-                    + &main_cols[start_col + 1][row] * &shift_8
-                    + &main_cols[start_col + 2][row] * &shift_16
-                    + &main_cols[start_col + 3][row] * &shift_24;
+                    + &main_cols[start_col + 1][row] * &shifts.shift_8
+                    + &main_cols[start_col + 2][row] * &shifts.shift_16
+                    + &main_cols[start_col + 3][row] * &shifts.shift_24;
                 *acc += &w0 * &alpha_powers[alpha_offset];
                 let w1 = &main_cols[start_col + 4][row]
-                    + &main_cols[start_col + 5][row] * &shift_8
-                    + &main_cols[start_col + 6][row] * &shift_16
-                    + &main_cols[start_col + 7][row] * &shift_24;
+                    + &main_cols[start_col + 5][row] * &shifts.shift_8
+                    + &main_cols[start_col + 6][row] * &shifts.shift_16
+                    + &main_cols[start_col + 7][row] * &shifts.shift_24;
                 *acc += &w1 * &alpha_powers[alpha_offset + 1];
                 2
             }
             Packing::QuadHL => {
                 // 4× Word2L
-                let shift_16 = FieldElement::<F>::from(SHIFT_16);
                 for i in 0..4 {
                     let c = start_col + i * 2;
-                    let w = &main_cols[c][row] + &main_cols[c + 1][row] * &shift_16;
+                    let w = &main_cols[c][row] + &main_cols[c + 1][row] * &shifts.shift_16;
                     *acc += &w * &alpha_powers[alpha_offset + i];
                 }
                 4
@@ -352,6 +375,7 @@ impl Packing {
         alpha_powers: &[FieldElement<B>],
         alpha_offset: usize,
         acc: &mut FieldElement<B>,
+        shifts: &PackingShifts<A>,
     ) -> usize
     where
         A: IsSubFieldOf<B>,
@@ -359,87 +383,82 @@ impl Packing {
     {
         match self {
             Packing::Direct => {
-                *acc += step.get_main_evaluation_element(0, start_col) * &alpha_powers[alpha_offset];
+                *acc +=
+                    step.get_main_evaluation_element(0, start_col) * &alpha_powers[alpha_offset];
                 1
             }
             Packing::Word2L => {
-                let shift_16 = FieldElement::<A>::from(SHIFT_16);
                 let combined = step.get_main_evaluation_element(0, start_col)
-                    + step.get_main_evaluation_element(0, start_col + 1) * &shift_16;
+                    + step.get_main_evaluation_element(0, start_col + 1) * &shifts.shift_16;
                 *acc += &combined * &alpha_powers[alpha_offset];
                 1
             }
             Packing::Word4L => {
-                let shift_8 = FieldElement::<A>::from(SHIFT_8);
-                let shift_16 = FieldElement::<A>::from(SHIFT_16);
-                let shift_24 = &shift_8 * &shift_16;
                 let combined = step.get_main_evaluation_element(0, start_col)
-                    + step.get_main_evaluation_element(0, start_col + 1) * &shift_8
-                    + step.get_main_evaluation_element(0, start_col + 2) * &shift_16
-                    + step.get_main_evaluation_element(0, start_col + 3) * &shift_24;
+                    + step.get_main_evaluation_element(0, start_col + 1) * &shifts.shift_8
+                    + step.get_main_evaluation_element(0, start_col + 2) * &shifts.shift_16
+                    + step.get_main_evaluation_element(0, start_col + 3) * &shifts.shift_24;
                 *acc += &combined * &alpha_powers[alpha_offset];
                 1
             }
             Packing::DWordWL => {
-                *acc += step.get_main_evaluation_element(0, start_col) * &alpha_powers[alpha_offset];
-                *acc += step.get_main_evaluation_element(0, start_col + 1) * &alpha_powers[alpha_offset + 1];
+                *acc +=
+                    step.get_main_evaluation_element(0, start_col) * &alpha_powers[alpha_offset];
+                *acc += step.get_main_evaluation_element(0, start_col + 1)
+                    * &alpha_powers[alpha_offset + 1];
                 2
             }
             Packing::DWordHHW => {
-                *acc += step.get_main_evaluation_element(0, start_col) * &alpha_powers[alpha_offset];
-                let shift_16 = FieldElement::<A>::from(SHIFT_16);
+                *acc +=
+                    step.get_main_evaluation_element(0, start_col) * &alpha_powers[alpha_offset];
                 let w = step.get_main_evaluation_element(0, start_col + 1)
-                    + step.get_main_evaluation_element(0, start_col + 2) * &shift_16;
+                    + step.get_main_evaluation_element(0, start_col + 2) * &shifts.shift_16;
                 *acc += &w * &alpha_powers[alpha_offset + 1];
                 2
             }
             Packing::DWordWHH => {
-                let shift_16 = FieldElement::<A>::from(SHIFT_16);
                 let w = step.get_main_evaluation_element(0, start_col)
-                    + step.get_main_evaluation_element(0, start_col + 1) * &shift_16;
+                    + step.get_main_evaluation_element(0, start_col + 1) * &shifts.shift_16;
                 *acc += &w * &alpha_powers[alpha_offset];
-                *acc += step.get_main_evaluation_element(0, start_col + 2) * &alpha_powers[alpha_offset + 1];
+                *acc += step.get_main_evaluation_element(0, start_col + 2)
+                    * &alpha_powers[alpha_offset + 1];
                 2
             }
             Packing::DWordHL => {
-                let shift_16 = FieldElement::<A>::from(SHIFT_16);
                 let w0 = step.get_main_evaluation_element(0, start_col)
-                    + step.get_main_evaluation_element(0, start_col + 1) * &shift_16;
+                    + step.get_main_evaluation_element(0, start_col + 1) * &shifts.shift_16;
                 *acc += &w0 * &alpha_powers[alpha_offset];
                 let w1 = step.get_main_evaluation_element(0, start_col + 2)
-                    + step.get_main_evaluation_element(0, start_col + 3) * &shift_16;
+                    + step.get_main_evaluation_element(0, start_col + 3) * &shifts.shift_16;
                 *acc += &w1 * &alpha_powers[alpha_offset + 1];
                 2
             }
             Packing::DWordBL => {
-                let shift_8 = FieldElement::<A>::from(SHIFT_8);
-                let shift_16 = FieldElement::<A>::from(SHIFT_16);
-                let shift_24 = &shift_8 * &shift_16;
                 let w0 = step.get_main_evaluation_element(0, start_col)
-                    + step.get_main_evaluation_element(0, start_col + 1) * &shift_8
-                    + step.get_main_evaluation_element(0, start_col + 2) * &shift_16
-                    + step.get_main_evaluation_element(0, start_col + 3) * &shift_24;
+                    + step.get_main_evaluation_element(0, start_col + 1) * &shifts.shift_8
+                    + step.get_main_evaluation_element(0, start_col + 2) * &shifts.shift_16
+                    + step.get_main_evaluation_element(0, start_col + 3) * &shifts.shift_24;
                 *acc += &w0 * &alpha_powers[alpha_offset];
                 let w1 = step.get_main_evaluation_element(0, start_col + 4)
-                    + step.get_main_evaluation_element(0, start_col + 5) * &shift_8
-                    + step.get_main_evaluation_element(0, start_col + 6) * &shift_16
-                    + step.get_main_evaluation_element(0, start_col + 7) * &shift_24;
+                    + step.get_main_evaluation_element(0, start_col + 5) * &shifts.shift_8
+                    + step.get_main_evaluation_element(0, start_col + 6) * &shifts.shift_16
+                    + step.get_main_evaluation_element(0, start_col + 7) * &shifts.shift_24;
                 *acc += &w1 * &alpha_powers[alpha_offset + 1];
                 2
             }
             Packing::QuadHL => {
-                let shift_16 = FieldElement::<A>::from(SHIFT_16);
                 for i in 0..4 {
                     let c = start_col + i * 2;
                     let w = step.get_main_evaluation_element(0, c)
-                        + step.get_main_evaluation_element(0, c + 1) * &shift_16;
+                        + step.get_main_evaluation_element(0, c + 1) * &shifts.shift_16;
                     *acc += &w * &alpha_powers[alpha_offset + i];
                 }
                 4
             }
             Packing::QuadWL => {
                 for i in 0..4 {
-                    *acc += step.get_main_evaluation_element(0, start_col + i) * &alpha_powers[alpha_offset + i];
+                    *acc += step.get_main_evaluation_element(0, start_col + i)
+                        * &alpha_powers[alpha_offset + i];
                 }
                 4
             }
@@ -676,6 +695,7 @@ impl BusValue {
         alpha_powers: &[FieldElement<E>],
         alpha_offset: usize,
         acc: &mut FieldElement<E>,
+        shifts: &PackingShifts<F>,
     ) -> usize
     where
         F: IsField + IsSubFieldOf<E>,
@@ -692,6 +712,7 @@ impl BusValue {
                 alpha_powers,
                 alpha_offset,
                 acc,
+                shifts,
             ),
             BusValue::Linear(terms) => {
                 let mut result = FieldElement::<F>::zero();
@@ -732,6 +753,7 @@ impl BusValue {
         alpha_powers: &[FieldElement<B>],
         alpha_offset: usize,
         acc: &mut FieldElement<B>,
+        shifts: &PackingShifts<A>,
     ) -> usize
     where
         A: IsSubFieldOf<B>,
@@ -747,6 +769,7 @@ impl BusValue {
                 alpha_powers,
                 alpha_offset,
                 acc,
+                shifts,
             ),
             BusValue::Linear(terms) => {
                 let mut result = FieldElement::<A>::zero();
@@ -1512,6 +1535,7 @@ where
     // Zero-allocation inner loop: accumulate the linear combination directly
     // into the fingerprint without collecting bus elements into intermediate Vecs.
     let bus_id_f = FieldElement::<F>::from(table_interaction.bus_id);
+    let shifts = PackingShifts::<F>::new();
     let mut fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(trace_len);
     for row in 0..trace_len {
         // Accumulate fingerprint directly: bus_id * α^0 + Σ element_i * α^(1+i)
@@ -1524,6 +1548,7 @@ where
                 &alpha_powers,
                 alpha_offset,
                 &mut linear_combination,
+                &shifts,
             );
             alpha_offset += consumed;
         }
@@ -1659,6 +1684,7 @@ where
     // (zero-allocation inner loop: F×E multiplication instead of to_extension())
     let bus_id_a = FieldElement::<F>::from(interaction_a.bus_id);
     let bus_id_b = FieldElement::<F>::from(interaction_b.bus_id);
+    let shifts = PackingShifts::<F>::new();
 
     // Concatenate both fingerprint vectors for a single batch inversion
     let mut all_fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(2 * trace_len);
@@ -1673,6 +1699,7 @@ where
                 &alpha_powers,
                 alpha_offset,
                 &mut lc_a,
+                &shifts,
             );
             alpha_offset += consumed;
         }
@@ -1688,6 +1715,7 @@ where
                 &alpha_powers,
                 alpha_offset,
                 &mut lc_b,
+                &shifts,
             );
             alpha_offset += consumed;
         }
@@ -1877,12 +1905,19 @@ fn compute_fingerprint_from_step<A: IsSubFieldOf<B>, B: IsField>(
     interaction: &BusInteraction,
     z: &FieldElement<B>,
     alpha_powers: &[FieldElement<B>],
+    shifts: &PackingShifts<A>,
 ) -> FieldElement<B> {
     let bus_id_f = FieldElement::<A>::from(interaction.bus_id);
     let mut linear_combination = &bus_id_f * &alpha_powers[0];
     let mut alpha_idx = 1;
     for bv in &interaction.values {
-        alpha_idx += bv.accumulate_fingerprint_step(step, alpha_powers, alpha_idx, &mut linear_combination);
+        alpha_idx += bv.accumulate_fingerprint_step(
+            step,
+            alpha_powers,
+            alpha_idx,
+            &mut linear_combination,
+            shifts,
+        );
     }
     z - &linear_combination
 }
@@ -1949,12 +1984,13 @@ where
         ) -> FieldElement<B> {
             let c = step.get_aux_evaluation_element(0, term_column_idx);
             let z = &rap_challenges[LOGUP_CHALLENGE_Z];
+            let shifts = PackingShifts::<A>::new();
 
             let m_a = compute_multiplicity_from_step(step, &interaction_a.multiplicity);
             let m_b = compute_multiplicity_from_step(step, &interaction_b.multiplicity);
 
-            let fp_a = compute_fingerprint_from_step(step, interaction_a, z, alpha_powers);
-            let fp_b = compute_fingerprint_from_step(step, interaction_b, z, alpha_powers);
+            let fp_a = compute_fingerprint_from_step(step, interaction_a, z, alpha_powers, &shifts);
+            let fp_b = compute_fingerprint_from_step(step, interaction_b, z, alpha_powers, &shifts);
 
             // c * fp_a * fp_b - sign_a * m_a * fp_b - sign_b * m_b * fp_a = 0
             // Use conditional negation instead of E×E sign multiplication
@@ -2089,6 +2125,7 @@ where
             let delta = acc_next - acc_curr - terms_sum + logup_table_offset;
 
             let z = &rap_challenges[LOGUP_CHALLENGE_Z];
+            let shifts = PackingShifts::<A>::new();
 
             // Clear denominators of absorbed interactions
             debug_assert!(matches!(absorbed.len(), 1 | 2));
@@ -2098,8 +2135,13 @@ where
                     // (delta) · f - sign · m = 0
                     // sign multiply also promotes m from base field A to extension B
                     let m = compute_multiplicity_from_step(second_step, &absorbed[0].multiplicity);
-                    let f =
-                        compute_fingerprint_from_step(second_step, &absorbed[0], z, alpha_powers);
+                    let f = compute_fingerprint_from_step(
+                        second_step,
+                        &absorbed[0],
+                        z,
+                        alpha_powers,
+                        &shifts,
+                    );
                     let sign: FieldElement<B> = if absorbed[0].is_sender {
                         FieldElement::one()
                     } else {
@@ -2112,10 +2154,20 @@ where
                     // m_i * f_j naturally promotes A→B, then conditionally negate
                     let m1 = compute_multiplicity_from_step(second_step, &absorbed[0].multiplicity);
                     let m2 = compute_multiplicity_from_step(second_step, &absorbed[1].multiplicity);
-                    let f1 =
-                        compute_fingerprint_from_step(second_step, &absorbed[0], z, alpha_powers);
-                    let f2 =
-                        compute_fingerprint_from_step(second_step, &absorbed[1], z, alpha_powers);
+                    let f1 = compute_fingerprint_from_step(
+                        second_step,
+                        &absorbed[0],
+                        z,
+                        alpha_powers,
+                        &shifts,
+                    );
+                    let f2 = compute_fingerprint_from_step(
+                        second_step,
+                        &absorbed[1],
+                        z,
+                        alpha_powers,
+                        &shifts,
+                    );
                     let term1 = m1 * &f2;
                     let term1 = if absorbed[0].is_sender { term1 } else { -term1 };
                     let term2 = m2 * &f1;
