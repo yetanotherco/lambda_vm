@@ -10,17 +10,17 @@ desc = "Whether the address represents a register index"
 [[variables.input]]
 name = "base_address_high"
 type = "Word"
-desc = "The high word of the base address to read/write from/to, gets offset by $[0, 7]$, depending on how big the access is"
+desc = "The high word of the base address to read from/write to, gets offset by $[0, 7]$, depending on how big the access is"
 
 [[variables.input]]
 name = "base_address_mid"
 type = "Half"
-desc = "The middle halfword of the base address to read/write from/to, gets offset by $[0, 7]$, depending on how big the access is"
+desc = "The middle halfword of the base address to read from/write to, gets offset by $[0, 7]$, depending on how big the access is"
 
 [[variables.input]]
 name = "base_address_low"
 type = ["Byte", 2]
-desc = "The low bytes of the base address to read/write from/to, gets offset by $[0, 7]$, depending on how big the access is"
+desc = "The low bytes of the base address to read from/write to, gets offset by $[0, 7]$, depending on how big the access is"
 
 [[variables.input]]
 name = "value"
