@@ -198,12 +198,12 @@ prefix = "O"
 [[constraints.output]]
 kind = "interaction"
 tag = "MEMW"
-input = ["is_register", "base_address", "value", "timestamp", "write2", "write4", "write8"]
+input = ["is_register", ["cast", "base_address", "DWordWL"], "value", "timestamp", "write2", "write4", "write8"]
 output = "old"
 multiplicity = "μ_read"
 
 [[constraints.output]]
 kind = "interaction"
 tag = "MEMW"
-input = ["is_register", "base_address", "value", "timestamp", "write2", "write4", "write8"]
+input = ["is_register", ["cast", "base_address", "DWordWL"], "value", "timestamp", "write2", "write4", "write8"]
 multiplicity = "μ_write"
