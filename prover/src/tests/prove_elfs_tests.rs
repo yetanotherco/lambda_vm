@@ -635,6 +635,30 @@ fn test_prove_elfs_lw_sw() {
     );
 }
 
+/// Exercises both MEMW and MEMW_A in the same program.
+///
+/// Two separate `sb` instructions write to adjacent bytes (sp+0 and sp+1) at
+/// different timestamps. The subsequent `lh` read spans both bytes and sees
+/// mismatched old_timestamps, routing to MEMW. Register ops and the aligned
+/// `sw`/`lw` pair route to MEMW_A.
+#[test]
+fn test_prove_elfs_test_memw_split_ts() {
+    let (elf, logs, _instructions) = run_asm_elf("test_memw_split_ts");
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default()).unwrap();
+    assert!(
+        !traces.memws.is_empty(),
+        "test_memw_split_ts should produce MEMW rows (split old_timestamps from sb+sb+lh)"
+    );
+    assert!(
+        !traces.memw_aligneds.is_empty(),
+        "test_memw_split_ts should produce MEMW_A rows (register ops and aligned sw/lw)"
+    );
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "test_memw_split_ts failed"
+    );
+}
+
 #[test]
 fn test_prove_elfs_all_branches_16() {
     // Initialize logger to see debug constraint validation output
