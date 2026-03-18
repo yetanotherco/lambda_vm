@@ -689,30 +689,42 @@ pub trait IsStarkProver<
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
         let num_parts = lde_composition_poly_parts_evaluations.len();
+        if num_parts == 0 {
+            return None;
+        }
         let num_rows = lde_composition_poly_parts_evaluations[0].len();
-
-        // Transpose columns → rows with pre-allocated capacity.
-        let mut rows: Vec<Vec<FieldElement<FieldExtension>>> = Vec::with_capacity(num_rows);
-        for i in 0..num_rows {
-            let mut row = Vec::with_capacity(num_parts);
-            for part in lde_composition_poly_parts_evaluations.iter() {
-                row.push(part[i].clone());
-            }
-            rows.push(row);
+        if num_rows == 0 {
+            return None;
         }
 
-        in_place_bit_reverse_permute(&mut rows);
+        let num_leaves = num_rows / 2;
 
-        // Merge consecutive pairs: [row0, row1] → row0 ++ row1.
-        // Drain pairs from the original vec to avoid cloning.
-        let mut merged: Vec<Vec<FieldElement<FieldExtension>>> = Vec::with_capacity(num_rows / 2);
-        let mut iter = rows.into_iter();
-        while let (Some(mut first), Some(second)) = (iter.next(), iter.next()) {
-            first.extend(second);
-            merged.push(first);
-        }
+        // Skip the transpose + merge by computing leaf data inline.
+        // Each leaf = row_pair[2*i] ++ row_pair[2*i+1] after bit-reverse.
+        // Build the merged leaf data and hash in one pass.
+        #[cfg(feature = "parallel")]
+        let iter = (0..num_leaves).into_par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let iter = 0..num_leaves;
 
-        Self::batch_commit_extension(&merged)
+        let hashed_leaves: Vec<Commitment> = iter
+            .map(|leaf_idx| {
+                let br_0 = reverse_index(2 * leaf_idx, num_rows as u64);
+                let br_1 = reverse_index(2 * leaf_idx + 1, num_rows as u64);
+                let mut leaf = Vec::with_capacity(2 * num_parts);
+                for part in lde_composition_poly_parts_evaluations.iter() {
+                    leaf.push(part[br_0].clone());
+                }
+                for part in lde_composition_poly_parts_evaluations.iter() {
+                    leaf.push(part[br_1].clone());
+                }
+                BatchedMerkleTreeBackend::<FieldExtension>::hash_data(&leaf)
+            })
+            .collect();
+
+        let tree = BatchedMerkleTree::<FieldExtension>::build_from_hashed_leaves(hashed_leaves)?;
+        let root = tree.root;
+        Some((tree, root))
     }
 
     /// Algebraically decompose H(x) = H₀(x²) + x·H₁(x²) on the LDE coset, then
