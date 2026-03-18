@@ -703,9 +703,9 @@ fn process_ifft_fused_block<F, E>(
 #[inline]
 fn process_ifft_triple_fused_block<F, E>(
     block: &mut [FieldElement<E>],
-    twiddles_hi: &[FieldElement<F>],   // innermost layer (highest index)
-    twiddles_mid: &[FieldElement<F>],  // middle layer
-    twiddles_lo: &[FieldElement<F>],   // outermost layer (lowest index)
+    twiddles_hi: &[FieldElement<F>], // innermost layer (highest index)
+    twiddles_mid: &[FieldElement<F>], // middle layer
+    twiddles_lo: &[FieldElement<F>], // outermost layer (lowest index)
 ) where
     F: IsFFTField + IsSubFieldOf<E>,
     E: IsField,
