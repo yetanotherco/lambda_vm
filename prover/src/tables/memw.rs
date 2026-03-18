@@ -36,7 +36,7 @@ use stark::table::TableView;
 use stark::trace::TraceTable;
 use stark::traits::TransitionEvaluationContext;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, fill_dword_wl};
 use crate::constraints::templates::{AddConstraint, AddOperand};
 
 /// Maximum number of rows per MEMW table chunk.
@@ -287,8 +287,12 @@ pub fn generate_memw_trace(
         data[base + cols::IS_REGISTER] = FE::from(op.is_register as u64);
 
         // base_address as DWordWL (2 words)
-        data[base + cols::BASE_ADDRESS_0] = FE::from(op.base_address & 0xFFFF_FFFF);
-        data[base + cols::BASE_ADDRESS_1] = FE::from(op.base_address >> 32);
+        fill_dword_wl(
+            &mut data,
+            base,
+            [cols::BASE_ADDRESS_0, cols::BASE_ADDRESS_1],
+            op.base_address,
+        );
 
         // value[8]
         for i in 0..8 {
@@ -296,8 +300,12 @@ pub fn generate_memw_trace(
         }
 
         // timestamp as DWordWL (2 words)
-        data[base + cols::TIMESTAMP_0] = FE::from(op.timestamp & 0xFFFF_FFFF);
-        data[base + cols::TIMESTAMP_1] = FE::from(op.timestamp >> 32);
+        fill_dword_wl(
+            &mut data,
+            base,
+            [cols::TIMESTAMP_0, cols::TIMESTAMP_1],
+            op.timestamp,
+        );
 
         // write flags
         let (w2, w4, w8) = op.write_flags();

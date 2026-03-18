@@ -34,13 +34,10 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use math::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
-use math::polynomial::Polynomial;
-use stark::config::{BatchedMerkleTree, Commitment};
+use stark::config::Commitment;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::proof::options::ProofOptions;
-use stark::prover::evaluate_polynomial_on_lde_domain;
-use stark::trace::{TraceTable, columns2rows};
+use stark::trace::TraceTable;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 
@@ -229,9 +226,7 @@ pub fn compute_precomputed_commitment(config: &PageConfig, options: &ProofOption
     //
     // INIT (col 1): the initial byte value at each offset. For zero-init pages
     //   (stack, heap, BSS) this is all zeros. For ELF data pages it holds the
-    //   bytes loaded from the binary. Either way the column is fully determined
-    //   before execution, so the verifier can check it against a preprocessed
-    //   commitment instead of including it in the main trace.
+    //   bytes loaded from the binary.
     let mut offset_col = vec![FE::zero(); num_rows];
     let mut init_col = vec![FE::zero(); num_rows];
 
@@ -244,34 +239,7 @@ pub fn compute_precomputed_commitment(config: &PageConfig, options: &ProofOption
         };
     }
 
-    let columns = [offset_col, init_col];
-
-    let polys: Vec<Polynomial<FE>> = columns
-        .iter()
-        .map(|col| {
-            Polynomial::interpolate_fft::<GoldilocksField>(col)
-                .expect("FFT interpolation failed for page column")
-        })
-        .collect();
-
-    let blowup_factor = options.blowup_factor as usize;
-    let coset_offset = FE::from(options.coset_offset);
-    let mut lde_columns: Vec<Vec<FE>> = polys
-        .iter()
-        .map(|poly| {
-            evaluate_polynomial_on_lde_domain(poly, blowup_factor, num_rows, &coset_offset)
-                .expect("LDE evaluation failed for page polynomial")
-        })
-        .collect();
-
-    for col in lde_columns.iter_mut() {
-        in_place_bit_reverse_permute(col);
-    }
-
-    let lde_rows = columns2rows(lde_columns);
-    let tree = BatchedMerkleTree::<GoldilocksField>::build(&lde_rows)
-        .expect("Failed to build Merkle tree for page LDE");
-    tree.root
+    super::commit_columns_to_lde(vec![offset_col, init_col], num_rows, options)
 }
 
 /// Returns the preprocessed commitment for a PAGE table, with caching for zero-init pages.

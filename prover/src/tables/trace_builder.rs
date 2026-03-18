@@ -709,73 +709,28 @@ fn collect_halt_ops(register_state: &mut RegisterState) -> Vec<MemwOperation> {
 ///
 /// Returns: Vec of LT operations
 fn collect_lt_from_memw(memw_ops: &[MemwOperation]) -> Vec<LtOperation> {
-    let mut lt_ops = Vec::with_capacity(memw_ops.len() * 8);
-
-    for memw_op in memw_ops {
-        // C7: old_timestamp[0] < timestamp (all accesses)
-        lt_ops.push(LtOperation::new(
-            memw_op.old_timestamp[0],
-            memw_op.timestamp,
-            false,
-        ));
-
-        // C8: old_timestamp[1] < timestamp (width >= 2)
-        if memw_op.width >= 2 {
-            lt_ops.push(LtOperation::new(
-                memw_op.old_timestamp[1],
-                memw_op.timestamp,
-                false,
-            ));
-        }
-
-        // C9: old_timestamp[2,3] < timestamp (width >= 4)
-        if memw_op.width >= 4 {
-            lt_ops.push(LtOperation::new(
-                memw_op.old_timestamp[2],
-                memw_op.timestamp,
-                false,
-            ));
-            lt_ops.push(LtOperation::new(
-                memw_op.old_timestamp[3],
-                memw_op.timestamp,
-                false,
-            ));
-        }
-
-        // C10: old_timestamp[4..7] < timestamp (width == 8)
-        if memw_op.width == 8 {
-            for i in 4..8 {
-                lt_ops.push(LtOperation::new(
-                    memw_op.old_timestamp[i],
-                    memw_op.timestamp,
-                    false,
-                ));
-            }
-        }
-
-        // R1-R3: Address overflow checks (unconditional per MEMW-CR13/14/15)
-        // If overflow occurs, LT returns lt=0 and the constraint (expecting lt=1)
-        // rejects the proof via value mismatch.
-        if memw_op.width == 2 {
-            let addr_plus_1 = memw_op.base_address.wrapping_add(1);
-            lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_1, false));
-        }
-        if memw_op.width == 4 {
-            let addr_plus_3 = memw_op.base_address.wrapping_add(3);
-            lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_3, false));
-        }
-        if memw_op.width == 8 {
-            let addr_plus_7 = memw_op.base_address.wrapping_add(7);
-            lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_7, false));
-        }
-    }
-
-    lt_ops
+    memw_ops
+        .iter()
+        .flat_map(|op| op.collect_lt_lookups())
+        .collect()
 }
 
 // =============================================================================
 // Phase 4: All → Bitwise lookups
 // =============================================================================
+
+/// Push 4 IsHalf bitwise operations for the 4 halfwords of a u64 value.
+#[inline]
+fn push_is_half_u64(ops: &mut Vec<BitwiseOperation>, value: u64) {
+    for shift in [0u32, 16, 32, 48] {
+        let half = ((value >> shift) & 0xFFFF) as u16;
+        ops.push(BitwiseOperation::halfword(
+            BitwiseOperationType::IsHalf,
+            (half & 0xFF) as u8,
+            (half >> 8) as u8,
+        ));
+    }
+}
 
 /// Collects bitwise lookups from LT operations (MSB16 and IS_HALFWORD).
 ///
@@ -801,14 +756,7 @@ fn collect_bitwise_from_lt(lt_ops: &[LtOperation]) -> Vec<BitwiseOperation> {
 
         // IS_HALFWORD lookups for lhs_sub_rhs[0..4]
         let lhs_sub_rhs = op.lhs.wrapping_sub(op.rhs);
-        for shift in [0, 16, 32, 48] {
-            let half = ((lhs_sub_rhs >> shift) & 0xFFFF) as u16;
-            bitwise_ops.push(BitwiseOperation::halfword(
-                BitwiseOperationType::IsHalf,
-                (half & 0xFF) as u8,
-                (half >> 8) as u8,
-            ));
-        }
+        push_is_half_u64(&mut bitwise_ops, lhs_sub_rhs);
 
         // IS_HALFWORD lookups for lhs[1] and rhs[1]
         let lhs_1 = ((op.lhs >> 32) & 0xFFFF) as u16;
@@ -842,24 +790,10 @@ fn collect_bitwise_from_mul(mul_ops: &[(MulOperation, bool)]) -> Vec<BitwiseOper
         let (lo, hi) = op.compute_product();
 
         // IS_HALF for lo halfwords
-        for shift in [0, 16, 32, 48] {
-            let half = ((lo >> shift) & 0xFFFF) as u16;
-            bitwise_ops.push(BitwiseOperation::halfword(
-                BitwiseOperationType::IsHalf,
-                (half & 0xFF) as u8,
-                (half >> 8) as u8,
-            ));
-        }
+        push_is_half_u64(&mut bitwise_ops, lo);
 
         // IS_HALF for hi halfwords
-        for shift in [0, 16, 32, 48] {
-            let half = ((hi >> shift) & 0xFFFF) as u16;
-            bitwise_ops.push(BitwiseOperation::halfword(
-                BitwiseOperationType::IsHalf,
-                (half & 0xFF) as u8,
-                (half >> 8) as u8,
-            ));
-        }
+        push_is_half_u64(&mut bitwise_ops, hi);
 
         // IS_B20 for carry[0..4] range checks
         let raw_products = op.compute_raw_products();
@@ -911,57 +845,22 @@ fn collect_bitwise_from_dvrm(dvrm_ops: &[(DvrmOperation, bool)]) -> Vec<BitwiseO
 
     for (op, _wants_remainder) in dvrm_ops {
         // IS_HALF for n[0..4] (DVRM-A1)
-        for shift in [0, 16, 32, 48] {
-            let half = ((op.n >> shift) & 0xFFFF) as u16;
-            bitwise_ops.push(BitwiseOperation::halfword(
-                BitwiseOperationType::IsHalf,
-                (half & 0xFF) as u8,
-                (half >> 8) as u8,
-            ));
-        }
+        push_is_half_u64(&mut bitwise_ops, op.n);
 
         // IS_HALF for d[0..4] (DVRM-A2)
-        for shift in [0, 16, 32, 48] {
-            let half = ((op.d >> shift) & 0xFFFF) as u16;
-            bitwise_ops.push(BitwiseOperation::halfword(
-                BitwiseOperationType::IsHalf,
-                (half & 0xFF) as u8,
-                (half >> 8) as u8,
-            ));
-        }
+        push_is_half_u64(&mut bitwise_ops, op.d);
 
         // IS_HALF for r[0..4] (DVRM-C10)
         let r = op.compute_remainder();
-        for shift in [0, 16, 32, 48] {
-            let half = ((r >> shift) & 0xFFFF) as u16;
-            bitwise_ops.push(BitwiseOperation::halfword(
-                BitwiseOperationType::IsHalf,
-                (half & 0xFF) as u8,
-                (half >> 8) as u8,
-            ));
-        }
+        push_is_half_u64(&mut bitwise_ops, r);
 
         // IS_HALF for n_sub_r[0..4] (DVRM-C11)
         let n_sub_r = op.n.wrapping_sub(r);
-        for shift in [0, 16, 32, 48] {
-            let half = ((n_sub_r >> shift) & 0xFFFF) as u16;
-            bitwise_ops.push(BitwiseOperation::halfword(
-                BitwiseOperationType::IsHalf,
-                (half & 0xFF) as u8,
-                (half >> 8) as u8,
-            ));
-        }
+        push_is_half_u64(&mut bitwise_ops, n_sub_r);
 
         // IS_HALF for q[0..4] (DVRM-C15)
         let q = op.compute_quotient();
-        for shift in [0, 16, 32, 48] {
-            let half = ((q >> shift) & 0xFFFF) as u16;
-            bitwise_ops.push(BitwiseOperation::halfword(
-                BitwiseOperationType::IsHalf,
-                (half & 0xFF) as u8,
-                (half >> 8) as u8,
-            ));
-        }
+        push_is_half_u64(&mut bitwise_ops, q);
 
         // ZERO lookups per raw op (multiplicity = μ_sum = μ_q + μ_r)
 
@@ -1081,14 +980,7 @@ fn collect_bitwise_from_memw(memw_ops: &[MemwOperation]) -> Vec<BitwiseOperation
         for i in 0..7u64 {
             let addr_add = memw_op.base_address.wrapping_add(i + 1);
             // Extract 4 halfwords (DWordHL packing)
-            for shift in [0, 16, 32, 48] {
-                let half = ((addr_add >> shift) & 0xFFFF) as u16;
-                bitwise_ops.push(BitwiseOperation::halfword(
-                    BitwiseOperationType::IsHalf,
-                    (half & 0xFF) as u8,
-                    (half >> 8) as u8,
-                ));
-            }
+            push_is_half_u64(&mut bitwise_ops, addr_add);
         }
     }
 
@@ -1319,26 +1211,12 @@ fn collect_bitwise_from_commit(commit_ops: &[CommitOperation]) -> Vec<BitwiseOpe
         } else {
             op.count - 1
         };
-        for shift in [0, 16, 32, 48] {
-            let half = ((count_decr >> shift) & 0xFFFF) as u16;
-            lookups.push(BitwiseOperation::halfword(
-                BitwiseOperationType::IsHalf,
-                (half & 0xFF) as u8,
-                ((half >> 8) & 0xFF) as u8,
-            ));
-        }
+        push_is_half_u64(&mut lookups, count_decr);
 
         // IsHalfword for address_incr halfwords (4 halfwords, mult = mu)
         // All real rows send these, matching the spec's unconditional mult = mu.
         let address_incr = op.address.wrapping_add(1);
-        for shift in [0, 16, 32, 48] {
-            let half = ((address_incr >> shift) & 0xFFFF) as u16;
-            lookups.push(BitwiseOperation::halfword(
-                BitwiseOperationType::IsHalf,
-                (half & 0xFF) as u8,
-                ((half >> 8) & 0xFF) as u8,
-            ));
-        }
+        push_is_half_u64(&mut lookups, address_incr);
 
         // Zero bus for end detection (mult = mu)
         // Input: (65535 - cd_0) + (65535 - cd_1) + (65535 - cd_2) + (65535 - cd_3)

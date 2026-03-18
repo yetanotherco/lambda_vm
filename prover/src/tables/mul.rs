@@ -42,7 +42,7 @@ use stark::traits::TransitionEvaluationContext;
 use super::types::{
     BusId, FE, GoldilocksExtension, GoldilocksField, INV_2_32, INV_2_64, INV_2_96, INV_2_128,
     NEG_INV_2_16, NEG_INV_2_32, NEG_INV_2_48, NEG_INV_2_64, NEG_INV_2_80, NEG_INV_2_96,
-    NEG_INV_2_112, NEG_INV_2_128, SHIFT_16,
+    NEG_INV_2_112, NEG_INV_2_128, SHIFT_16, SIGN_FILL, fill_dword_hl,
 };
 
 // =========================================================================
@@ -122,13 +122,6 @@ pub mod cols {
     /// Total number of columns
     pub const NUM_COLUMNS: usize = 26;
 }
-
-// =========================================================================
-// Constants
-// =========================================================================
-
-/// Sign extension fill value: 0xFFFF (all 1s for 16 bits)
-const SIGN_FILL: u64 = 0xFFFF;
 
 // =========================================================================
 // MulOperation struct
@@ -307,30 +300,38 @@ pub fn generate_mul_trace(
         let (lo, hi) = op.compute_product();
 
         // Fill lhs as DWordHL (4 halfwords)
-        data[base + cols::LHS_0] = FE::from(op.lhs & 0xFFFF);
-        data[base + cols::LHS_1] = FE::from((op.lhs >> 16) & 0xFFFF);
-        data[base + cols::LHS_2] = FE::from((op.lhs >> 32) & 0xFFFF);
-        data[base + cols::LHS_3] = FE::from((op.lhs >> 48) & 0xFFFF);
+        fill_dword_hl(
+            &mut data,
+            base,
+            [cols::LHS_0, cols::LHS_1, cols::LHS_2, cols::LHS_3],
+            op.lhs,
+        );
         data[base + cols::LHS_SIGNED] = FE::from(op.lhs_signed as u64);
 
         // Fill rhs as DWordHL (4 halfwords)
-        data[base + cols::RHS_0] = FE::from(op.rhs & 0xFFFF);
-        data[base + cols::RHS_1] = FE::from((op.rhs >> 16) & 0xFFFF);
-        data[base + cols::RHS_2] = FE::from((op.rhs >> 32) & 0xFFFF);
-        data[base + cols::RHS_3] = FE::from((op.rhs >> 48) & 0xFFFF);
+        fill_dword_hl(
+            &mut data,
+            base,
+            [cols::RHS_0, cols::RHS_1, cols::RHS_2, cols::RHS_3],
+            op.rhs,
+        );
         data[base + cols::RHS_SIGNED] = FE::from(op.rhs_signed as u64);
 
         // Fill lo as DWordHL (4 halfwords)
-        data[base + cols::LO_0] = FE::from(lo & 0xFFFF);
-        data[base + cols::LO_1] = FE::from((lo >> 16) & 0xFFFF);
-        data[base + cols::LO_2] = FE::from((lo >> 32) & 0xFFFF);
-        data[base + cols::LO_3] = FE::from((lo >> 48) & 0xFFFF);
+        fill_dword_hl(
+            &mut data,
+            base,
+            [cols::LO_0, cols::LO_1, cols::LO_2, cols::LO_3],
+            lo,
+        );
 
         // Fill hi as DWordHL (4 halfwords)
-        data[base + cols::HI_0] = FE::from(hi & 0xFFFF);
-        data[base + cols::HI_1] = FE::from((hi >> 16) & 0xFFFF);
-        data[base + cols::HI_2] = FE::from((hi >> 32) & 0xFFFF);
-        data[base + cols::HI_3] = FE::from((hi >> 48) & 0xFFFF);
+        fill_dword_hl(
+            &mut data,
+            base,
+            [cols::HI_0, cols::HI_1, cols::HI_2, cols::HI_3],
+            hi,
+        );
 
         // Fill auxiliary columns
         data[base + cols::LHS_IS_NEGATIVE] = FE::from(op.lhs_is_negative() as u64);
@@ -354,6 +355,24 @@ pub fn generate_mul_trace(
 // =========================================================================
 // Bus Interactions
 // =========================================================================
+
+/// Pushes one `IsHalfword` sender interaction per column in `cols`.
+fn push_is_half_columns(
+    interactions: &mut Vec<BusInteraction>,
+    cols: &[usize],
+    multiplicity: Multiplicity,
+) {
+    for &col in cols {
+        interactions.push(BusInteraction::sender(
+            BusId::IsHalfword,
+            multiplicity.clone(),
+            vec![BusValue::Packed {
+                start_column: col,
+                packing: Packing::Direct,
+            }],
+        ));
+    }
+}
 
 /// Creates all bus interactions for the MUL table.
 ///
@@ -401,32 +420,19 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // IS_HALF lookups for lo range checks (multiplicity: mu_lo + mu_hi)
+    // IS_HALF lookups for lo/hi range checks (multiplicity: mu_lo + mu_hi)
     // -------------------------------------------------------------------------
-    for col in [cols::LO_0, cols::LO_1, cols::LO_2, cols::LO_3] {
-        interactions.push(BusInteraction::sender(
-            BusId::IsHalfword,
-            Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
-            vec![BusValue::Packed {
-                start_column: col,
-                packing: Packing::Direct,
-            }],
-        ));
-    }
-
-    // -------------------------------------------------------------------------
-    // IS_HALF lookups for hi range checks (multiplicity: mu_lo + mu_hi)
-    // -------------------------------------------------------------------------
-    for col in [cols::HI_0, cols::HI_1, cols::HI_2, cols::HI_3] {
-        interactions.push(BusInteraction::sender(
-            BusId::IsHalfword,
-            Multiplicity::Sum(cols::MU_LO, cols::MU_HI),
-            vec![BusValue::Packed {
-                start_column: col,
-                packing: Packing::Direct,
-            }],
-        ));
-    }
+    let mu_lohi = Multiplicity::Sum(cols::MU_LO, cols::MU_HI);
+    push_is_half_columns(
+        &mut interactions,
+        &[cols::LO_0, cols::LO_1, cols::LO_2, cols::LO_3],
+        mu_lohi.clone(),
+    );
+    push_is_half_columns(
+        &mut interactions,
+        &[cols::HI_0, cols::HI_1, cols::HI_2, cols::HI_3],
+        mu_lohi,
+    );
 
     // -------------------------------------------------------------------------
     // IS_B20 lookups for carry range checks (multiplicity: mu_lo + mu_hi)

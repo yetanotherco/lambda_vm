@@ -95,8 +95,7 @@ pub mod cols {
 // Constants
 // =========================================================================
 
-/// 2^8 for byte combining
-const SHIFT_8: u64 = 1 << 8;
+use super::types::SHIFT_8;
 
 /// Mask value 254 = 0xFE (clears LSB)
 const MASK_254: u64 = 254;

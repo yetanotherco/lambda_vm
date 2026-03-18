@@ -28,18 +28,15 @@
 
 use std::sync::OnceLock;
 
-use math::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
-use math::polynomial::Polynomial;
-use stark::config::{BatchedMerkleTree, Commitment};
+use stark::config::Commitment;
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::proof::options::ProofOptions;
-use stark::prover::evaluate_polynomial_on_lde_domain;
-use stark::trace::{TraceTable, columns2rows};
+use stark::trace::TraceTable;
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_8, SHIFT_16};
 
 // =========================================================================
 // Column indices for BITWISE table
@@ -188,8 +185,7 @@ static BITWISE_COMMITMENT: OnceLock<Commitment> = OnceLock::new();
 /// because FRI queries can target any index in [0, N*blowup). A raw-value commitment
 /// would only have N leaves, unable to verify queries at indices >= N.
 fn compute_preprocessed_commitment(options: &ProofOptions) -> Commitment {
-    // Step 1: Generate precomputed columns in parallel
-    // Each column is generated independently by iterating over all row indices
+    // Step 1: Generate precomputed columns (parallel when available)
     #[cfg(feature = "parallel")]
     let columns: Vec<Vec<FE>> = (0..NUM_PRECOMPUTED_COLS)
         .into_par_iter()
@@ -217,66 +213,8 @@ fn compute_preprocessed_commitment(options: &ProofOptions) -> Commitment {
         cols
     };
 
-    // Step 2: Interpolate each column to a polynomial (parallel)
-    #[cfg(feature = "parallel")]
-    let polys: Vec<Polynomial<FE>> = columns
-        .par_iter()
-        .map(|col| {
-            Polynomial::interpolate_fft::<GoldilocksField>(col)
-                .expect("FFT interpolation failed for bitwise column")
-        })
-        .collect();
-
-    #[cfg(not(feature = "parallel"))]
-    let polys: Vec<Polynomial<FE>> = columns
-        .iter()
-        .map(|col| {
-            Polynomial::interpolate_fft::<GoldilocksField>(col)
-                .expect("FFT interpolation failed for bitwise column")
-        })
-        .collect();
-
-    // Step 3: Evaluate polynomials on LDE domain (parallel)
-    let blowup_factor = options.blowup_factor as usize;
-    let coset_offset = FE::from(options.coset_offset);
-
-    #[cfg(feature = "parallel")]
-    let mut lde_columns: Vec<Vec<FE>> = polys
-        .par_iter()
-        .map(|poly| {
-            evaluate_polynomial_on_lde_domain(poly, blowup_factor, NUM_ROWS, &coset_offset)
-                .expect("LDE evaluation failed for bitwise polynomial")
-        })
-        .collect();
-
-    #[cfg(not(feature = "parallel"))]
-    let mut lde_columns: Vec<Vec<FE>> = polys
-        .iter()
-        .map(|poly| {
-            evaluate_polynomial_on_lde_domain(poly, blowup_factor, NUM_ROWS, &coset_offset)
-                .expect("LDE evaluation failed for bitwise polynomial")
-        })
-        .collect();
-
-    // Step 4: Bit-reverse permute (parallel)
-    #[cfg(feature = "parallel")]
-    lde_columns.par_iter_mut().for_each(|col| {
-        in_place_bit_reverse_permute(col);
-    });
-
-    #[cfg(not(feature = "parallel"))]
-    for col in lde_columns.iter_mut() {
-        in_place_bit_reverse_permute(col);
-    }
-
-    // Step 5: Convert columns to rows for Merkle tree
-    let lde_rows = columns2rows(lde_columns);
-
-    // Step 6: Build Merkle tree over LDE (N * blowup leaves)
-    let tree = BatchedMerkleTree::<GoldilocksField>::build(&lde_rows)
-        .expect("Failed to build Merkle tree for bitwise LDE");
-
-    tree.root
+    // Steps 2-6: interpolate → LDE → bit-reverse → columns2rows → Merkle root
+    super::commit_columns_to_lde(columns, NUM_ROWS, options)
 }
 
 /// Returns the preprocessed commitment for the bitwise table, with caching.
@@ -632,7 +570,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                         column: cols::X,
                     },
                     stark::lookup::LinearTerm::Column {
-                        coefficient: 256,
+                        coefficient: SHIFT_8 as i64,
                         column: cols::Y,
                     },
                 ]),
@@ -653,11 +591,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                         column: cols::X,
                     },
                     stark::lookup::LinearTerm::Column {
-                        coefficient: 256,
+                        coefficient: SHIFT_8 as i64,
                         column: cols::Y,
                     },
                     stark::lookup::LinearTerm::Column {
-                        coefficient: 65536,
+                        coefficient: SHIFT_16 as i64,
                         column: cols::Z,
                     },
                 ]),
@@ -721,7 +659,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                         column: cols::X,
                     },
                     stark::lookup::LinearTerm::Column {
-                        coefficient: 256,
+                        coefficient: SHIFT_8 as i64,
                         column: cols::Y,
                     },
                 ]),

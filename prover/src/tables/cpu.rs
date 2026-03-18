@@ -53,7 +53,9 @@
 //! - BRANCH: for branch target calculation
 //! - ECALL: for system calls
 
-use super::types::{BusId, DecodeEntry, FE, GoldilocksExtension, GoldilocksField};
+use super::types::{
+    BusId, DecodeEntry, FE, GoldilocksExtension, GoldilocksField, SHIFT_8, SHIFT_16, SHIFT_24,
+};
 use crate::Error;
 use executor::vm::{
     instruction::{decoding::Instruction, execution::SyscallNumbers},
@@ -1035,75 +1037,33 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // ));
 
     // -------------------------------------------------------------------------
-    // AND_BYTE interactions (×8 for each byte)
+    // AND_BYTE / OR_BYTE / XOR_BYTE interactions (×8 each)
     // -------------------------------------------------------------------------
-    for i in 0..8 {
-        interactions.push(BusInteraction::sender(
-            BusId::AndByte,
-            Multiplicity::Column(cols::AND),
-            vec![
-                BusValue::Packed {
-                    start_column: cols::ARG1[i],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::ARG2[i],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::RES[i],
-                    packing: Packing::Direct,
-                },
-            ],
-        ));
-    }
-
-    // -------------------------------------------------------------------------
-    // OR_BYTE interactions (×8)
-    // -------------------------------------------------------------------------
-    for i in 0..8 {
-        interactions.push(BusInteraction::sender(
-            BusId::OrByte,
-            Multiplicity::Column(cols::OR),
-            vec![
-                BusValue::Packed {
-                    start_column: cols::ARG1[i],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::ARG2[i],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::RES[i],
-                    packing: Packing::Direct,
-                },
-            ],
-        ));
-    }
-
-    // -------------------------------------------------------------------------
-    // XOR_BYTE interactions (×8)
-    // -------------------------------------------------------------------------
-    for i in 0..8 {
-        interactions.push(BusInteraction::sender(
-            BusId::XorByte,
-            Multiplicity::Column(cols::XOR),
-            vec![
-                BusValue::Packed {
-                    start_column: cols::ARG1[i],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::ARG2[i],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::RES[i],
-                    packing: Packing::Direct,
-                },
-            ],
-        ));
+    for &(bus_id, mult_col) in &[
+        (BusId::AndByte, cols::AND),
+        (BusId::OrByte, cols::OR),
+        (BusId::XorByte, cols::XOR),
+    ] {
+        for i in 0..8 {
+            interactions.push(BusInteraction::sender(
+                bus_id,
+                Multiplicity::Column(mult_col),
+                vec![
+                    BusValue::Packed {
+                        start_column: cols::ARG1[i],
+                        packing: Packing::Direct,
+                    },
+                    BusValue::Packed {
+                        start_column: cols::ARG2[i],
+                        packing: Packing::Direct,
+                    },
+                    BusValue::Packed {
+                        start_column: cols::RES[i],
+                        packing: Packing::Direct,
+                    },
+                ],
+            ));
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -1406,7 +1366,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     column: cols::RV1_0,
                 },
                 LinearTerm::Column {
-                    coefficient: 65536,
+                    coefficient: SHIFT_16 as i64,
                     column: cols::RV1_1,
                 },
             ]),
@@ -1438,7 +1398,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     column: cols::RV1_0,
                 },
                 LinearTerm::Column {
-                    coefficient: 65536,
+                    coefficient: SHIFT_16 as i64,
                     column: cols::RV1_1,
                 },
             ]),
@@ -1480,7 +1440,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     column: cols::RV2_0,
                 },
                 LinearTerm::Column {
-                    coefficient: 65536,
+                    coefficient: SHIFT_16 as i64,
                     column: cols::RV2_1,
                 },
             ]),
@@ -1512,7 +1472,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     column: cols::RV2_0,
                 },
                 LinearTerm::Column {
-                    coefficient: 65536,
+                    coefficient: SHIFT_16 as i64,
                     column: cols::RV2_1,
                 },
             ]),
@@ -1913,15 +1873,15 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     column: cols::ARG1[0],
                 },
                 LinearTerm::Column {
-                    coefficient: 256,
+                    coefficient: SHIFT_8 as i64,
                     column: cols::ARG1[1],
                 },
                 LinearTerm::Column {
-                    coefficient: 65536,
+                    coefficient: SHIFT_16 as i64,
                     column: cols::ARG1[2],
                 },
                 LinearTerm::Column {
-                    coefficient: 16777216,
+                    coefficient: SHIFT_24 as i64,
                     column: cols::ARG1[3],
                 },
             ]),
@@ -1933,15 +1893,15 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     column: cols::ARG1[4],
                 },
                 LinearTerm::Column {
-                    coefficient: 256,
+                    coefficient: SHIFT_8 as i64,
                     column: cols::ARG1[5],
                 },
                 LinearTerm::Column {
-                    coefficient: 65536,
+                    coefficient: SHIFT_16 as i64,
                     column: cols::ARG1[6],
                 },
                 LinearTerm::Column {
-                    coefficient: 16777216,
+                    coefficient: SHIFT_24 as i64,
                     column: cols::ARG1[7],
                 },
             ]),
@@ -2030,7 +1990,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     column: cols::RV1_0,
                 },
                 LinearTerm::Column {
-                    coefficient: 65536,
+                    coefficient: SHIFT_16 as i64,
                     column: cols::RV1_1,
                 },
             ]),
@@ -2062,7 +2022,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     column: cols::RV1_0,
                 },
                 LinearTerm::Column {
-                    coefficient: 65536,
+                    coefficient: SHIFT_16 as i64,
                     column: cols::RV1_1,
                 },
             ]),

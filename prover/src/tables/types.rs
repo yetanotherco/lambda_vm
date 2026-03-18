@@ -182,11 +182,20 @@ impl From<BusId> for u64 {
 // Constants for 64-bit arithmetic
 // =========================================================================
 
+/// 2^8 for byte combining
+pub const SHIFT_8: u64 = 1 << 8;
+
 /// 2^16 for halfword combining
 pub const SHIFT_16: u64 = 1 << 16;
 
+/// 2^24 for three-byte combining
+pub const SHIFT_24: u64 = 1 << 24;
+
 /// 2^32 for word combining
 pub const SHIFT_32: u64 = 1 << 32;
+
+/// Sign extension fill for 16-bit values: 0xFFFF (all 1s for negative sign extension)
+pub const SIGN_FILL: u64 = 0xFFFF;
 
 // Field inverses for Goldilocks prime p = 2^64 - 2^32 + 1
 // Used for virtual carry computation in MUL table
@@ -195,8 +204,13 @@ pub const SHIFT_32: u64 = 1 << 32;
 // - Positive: INV_2_32, INV_2_64, INV_2_96, INV_2_128 (for raw_product terms)
 // - Negative: NEG_INV_2_* (for lo/hi terms which are subtracted)
 
-/// 2^(-32) mod p
+/// 2^(-32) mod p — inverse of 2^32, used for carry extraction in ADD/BRANCH constraints.
+/// Alias: `INV_SHIFT_32` (used in templates.rs ADD constraint).
+/// Verify: INV_2_32 * SHIFT_32 ≡ 1 (mod p)
 pub const INV_2_32: u64 = 18446744065119617026;
+
+/// Alias for `INV_2_32`: (2^32)^(-1) mod p, precomputed to avoid costly inv() in constraint loops.
+pub const INV_SHIFT_32: u64 = INV_2_32;
 /// 2^(-64) mod p
 pub const INV_2_64: u64 = 18446744065119617025;
 /// 2^(-96) mod p
@@ -220,6 +234,26 @@ pub const NEG_INV_2_96: u64 = 1;
 pub const NEG_INV_2_112: u64 = 18446462594437939201;
 /// -(2^-128) mod p = p - 2^(-128)
 pub const NEG_INV_2_128: u64 = 18446744065119617026;
+
+// =========================================================================
+// Trace fill helpers
+// =========================================================================
+
+/// Write a 64-bit value into 4 consecutive halfword (16-bit) columns.
+#[inline(always)]
+pub fn fill_dword_hl(data: &mut [FE], base: usize, cols: [usize; 4], val: u64) {
+    data[base + cols[0]] = FE::from(val & 0xFFFF);
+    data[base + cols[1]] = FE::from((val >> 16) & 0xFFFF);
+    data[base + cols[2]] = FE::from((val >> 32) & 0xFFFF);
+    data[base + cols[3]] = FE::from((val >> 48) & 0xFFFF);
+}
+
+/// Write a 64-bit value into 2 consecutive word (32-bit) columns.
+#[inline(always)]
+pub fn fill_dword_wl(data: &mut [FE], base: usize, cols: [usize; 2], val: u64) {
+    data[base + cols[0]] = FE::from(val & 0xFFFF_FFFF);
+    data[base + cols[1]] = FE::from(val >> 32);
+}
 
 // =========================================================================
 // Column index helpers

@@ -41,7 +41,7 @@ use stark::traits::TransitionEvaluationContext;
 
 use super::types::{
     BusId, FE, GoldilocksExtension, GoldilocksField, NEG_INV_2_16, NEG_INV_2_32, NEG_INV_2_48,
-    NEG_INV_2_64, SHIFT_16,
+    NEG_INV_2_64, SHIFT_16, SIGN_FILL, fill_dword_hl, fill_dword_wl,
 };
 
 // =========================================================================
@@ -142,13 +142,6 @@ pub mod cols {
     /// Total number of columns
     pub const NUM_COLUMNS: usize = 34;
 }
-
-// =========================================================================
-// Constants
-// =========================================================================
-
-/// Sign extension fill value: 0xFFFF (all 1s for 16 bits)
-const SIGN_FILL: u64 = 0xFFFF;
 
 // =========================================================================
 // DvrmOperation struct
@@ -314,46 +307,59 @@ pub fn generate_dvrm_trace(
         let abs_d = op.abs_d();
 
         // Fill n as DWordHL (4 halfwords)
-        data[base + cols::N_0] = FE::from(op.n & 0xFFFF);
-        data[base + cols::N_1] = FE::from((op.n >> 16) & 0xFFFF);
-        data[base + cols::N_2] = FE::from((op.n >> 32) & 0xFFFF);
-        data[base + cols::N_3] = FE::from((op.n >> 48) & 0xFFFF);
+        fill_dword_hl(
+            &mut data,
+            base,
+            [cols::N_0, cols::N_1, cols::N_2, cols::N_3],
+            op.n,
+        );
 
         // Fill d as DWordHL (4 halfwords)
-        data[base + cols::D_0] = FE::from(op.d & 0xFFFF);
-        data[base + cols::D_1] = FE::from((op.d >> 16) & 0xFFFF);
-        data[base + cols::D_2] = FE::from((op.d >> 32) & 0xFFFF);
-        data[base + cols::D_3] = FE::from((op.d >> 48) & 0xFFFF);
+        fill_dword_hl(
+            &mut data,
+            base,
+            [cols::D_0, cols::D_1, cols::D_2, cols::D_3],
+            op.d,
+        );
 
         data[base + cols::SIGNED] = FE::from(op.signed as u64);
 
         // Fill q as DWordHL (4 halfwords)
-        data[base + cols::Q_0] = FE::from(q & 0xFFFF);
-        data[base + cols::Q_1] = FE::from((q >> 16) & 0xFFFF);
-        data[base + cols::Q_2] = FE::from((q >> 32) & 0xFFFF);
-        data[base + cols::Q_3] = FE::from((q >> 48) & 0xFFFF);
+        fill_dword_hl(
+            &mut data,
+            base,
+            [cols::Q_0, cols::Q_1, cols::Q_2, cols::Q_3],
+            q,
+        );
 
         // Fill r as DWordHL (4 halfwords)
-        data[base + cols::R_0] = FE::from(r & 0xFFFF);
-        data[base + cols::R_1] = FE::from((r >> 16) & 0xFFFF);
-        data[base + cols::R_2] = FE::from((r >> 32) & 0xFFFF);
-        data[base + cols::R_3] = FE::from((r >> 48) & 0xFFFF);
+        fill_dword_hl(
+            &mut data,
+            base,
+            [cols::R_0, cols::R_1, cols::R_2, cols::R_3],
+            r,
+        );
 
         // Fill auxiliary columns
         data[base + cols::DIV_BY_ZERO] = FE::from(op.is_div_by_zero() as u64);
         data[base + cols::OVERFLOW] = FE::from(op.is_overflow() as u64);
 
-        data[base + cols::ABS_R_0] = FE::from(abs_r & 0xFFFF_FFFF);
-        data[base + cols::ABS_R_1] = FE::from(abs_r >> 32);
+        fill_dword_wl(&mut data, base, [cols::ABS_R_0, cols::ABS_R_1], abs_r);
 
-        data[base + cols::ABS_D_0] = FE::from(abs_d & 0xFFFF_FFFF);
-        data[base + cols::ABS_D_1] = FE::from(abs_d >> 32);
+        fill_dword_wl(&mut data, base, [cols::ABS_D_0, cols::ABS_D_1], abs_d);
 
         // Fill n_sub_r as DWordHL (4 halfwords)
-        data[base + cols::N_SUB_R_0] = FE::from(n_sub_r & 0xFFFF);
-        data[base + cols::N_SUB_R_1] = FE::from((n_sub_r >> 16) & 0xFFFF);
-        data[base + cols::N_SUB_R_2] = FE::from((n_sub_r >> 32) & 0xFFFF);
-        data[base + cols::N_SUB_R_3] = FE::from((n_sub_r >> 48) & 0xFFFF);
+        fill_dword_hl(
+            &mut data,
+            base,
+            [
+                cols::N_SUB_R_0,
+                cols::N_SUB_R_1,
+                cols::N_SUB_R_2,
+                cols::N_SUB_R_3,
+            ],
+            n_sub_r,
+        );
 
         data[base + cols::SIGN_N_SUB_R] = FE::from(op.sign_n_sub_r() as u64);
         data[base + cols::SIGN_N] = FE::from(op.sign_n() as u64);
@@ -373,6 +379,24 @@ pub fn generate_dvrm_trace(
 // Bus Interactions
 // =========================================================================
 
+/// Pushes one `IsHalfword` sender interaction per column in `cols`.
+fn push_is_half_columns(
+    interactions: &mut Vec<BusInteraction>,
+    cols: &[usize],
+    multiplicity: Multiplicity,
+) {
+    for &col in cols {
+        interactions.push(BusInteraction::sender(
+            BusId::IsHalfword,
+            multiplicity.clone(),
+            vec![BusValue::Packed {
+                start_column: col,
+                packing: Packing::Direct,
+            }],
+        ));
+    }
+}
+
 /// Creates all bus interactions for the DVRM table.
 ///
 /// The DVRM table:
@@ -387,78 +411,42 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     // -------------------------------------------------------------------------
     // DVRM-A1.i: IS_HALF[n[i]] (×4), multiplicity: μ_q + μ_r
-    // -------------------------------------------------------------------------
-    for col in [cols::N_0, cols::N_1, cols::N_2, cols::N_3] {
-        interactions.push(BusInteraction::sender(
-            BusId::IsHalfword,
-            Multiplicity::Sum(cols::MU_Q, cols::MU_R),
-            vec![BusValue::Packed {
-                start_column: col,
-                packing: Packing::Direct,
-            }],
-        ));
-    }
-
-    // -------------------------------------------------------------------------
     // DVRM-A2.i: IS_HALF[d[i]] (×4), multiplicity: μ_q + μ_r
-    // -------------------------------------------------------------------------
-    for col in [cols::D_0, cols::D_1, cols::D_2, cols::D_3] {
-        interactions.push(BusInteraction::sender(
-            BusId::IsHalfword,
-            Multiplicity::Sum(cols::MU_Q, cols::MU_R),
-            vec![BusValue::Packed {
-                start_column: col,
-                packing: Packing::Direct,
-            }],
-        ));
-    }
-
-    // -------------------------------------------------------------------------
     // DVRM-C10.i: IS_HALF[r[i]] (×4), multiplicity: μ_q + μ_r
-    // -------------------------------------------------------------------------
-    for col in [cols::R_0, cols::R_1, cols::R_2, cols::R_3] {
-        interactions.push(BusInteraction::sender(
-            BusId::IsHalfword,
-            Multiplicity::Sum(cols::MU_Q, cols::MU_R),
-            vec![BusValue::Packed {
-                start_column: col,
-                packing: Packing::Direct,
-            }],
-        ));
-    }
-
-    // -------------------------------------------------------------------------
     // DVRM-C11.i: IS_HALF[n_sub_r[i]] (×4), multiplicity: μ_q + μ_r
-    // -------------------------------------------------------------------------
-    for col in [
-        cols::N_SUB_R_0,
-        cols::N_SUB_R_1,
-        cols::N_SUB_R_2,
-        cols::N_SUB_R_3,
-    ] {
-        interactions.push(BusInteraction::sender(
-            BusId::IsHalfword,
-            Multiplicity::Sum(cols::MU_Q, cols::MU_R),
-            vec![BusValue::Packed {
-                start_column: col,
-                packing: Packing::Direct,
-            }],
-        ));
-    }
-
-    // -------------------------------------------------------------------------
     // DVRM-C15.i: IS_HALF[q[i]] (×4), multiplicity: μ_q + μ_r
     // -------------------------------------------------------------------------
-    for col in [cols::Q_0, cols::Q_1, cols::Q_2, cols::Q_3] {
-        interactions.push(BusInteraction::sender(
-            BusId::IsHalfword,
-            Multiplicity::Sum(cols::MU_Q, cols::MU_R),
-            vec![BusValue::Packed {
-                start_column: col,
-                packing: Packing::Direct,
-            }],
-        ));
-    }
+    let mu_qr = Multiplicity::Sum(cols::MU_Q, cols::MU_R);
+    push_is_half_columns(
+        &mut interactions,
+        &[cols::N_0, cols::N_1, cols::N_2, cols::N_3],
+        mu_qr.clone(),
+    );
+    push_is_half_columns(
+        &mut interactions,
+        &[cols::D_0, cols::D_1, cols::D_2, cols::D_3],
+        mu_qr.clone(),
+    );
+    push_is_half_columns(
+        &mut interactions,
+        &[cols::R_0, cols::R_1, cols::R_2, cols::R_3],
+        mu_qr.clone(),
+    );
+    push_is_half_columns(
+        &mut interactions,
+        &[
+            cols::N_SUB_R_0,
+            cols::N_SUB_R_1,
+            cols::N_SUB_R_2,
+            cols::N_SUB_R_3,
+        ],
+        mu_qr.clone(),
+    );
+    push_is_half_columns(
+        &mut interactions,
+        &[cols::Q_0, cols::Q_1, cols::Q_2, cols::Q_3],
+        mu_qr,
+    );
 
     // -------------------------------------------------------------------------
     // DVRM-C16 (SIGN): MSB16[sign_n; n[3]] when signed=1

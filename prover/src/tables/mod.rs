@@ -38,6 +38,81 @@ pub mod trace_builder;
 
 pub use types::BusId;
 
+use math::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
+use math::polynomial::Polynomial;
+use stark::config::{BatchedMerkleTree, Commitment};
+use stark::proof::options::ProofOptions;
+use stark::prover::evaluate_polynomial_on_lde_domain;
+use stark::trace::columns2rows;
+
+use self::types::{FE, GoldilocksField};
+
+/// Commits precomputed columns to a Merkle root over their LDE.
+///
+/// Pipeline: interpolate_fft → coset-LDE → bit-reverse → columns2rows → BatchedMerkleTree
+///
+/// # Arguments
+/// * `columns` - Precomputed columns (each column is a `Vec<FE>` of length `num_rows`)
+/// * `num_rows` - Number of rows in the original (non-extended) domain
+/// * `options` - Proof options containing blowup factor and coset offset
+pub(crate) fn commit_columns_to_lde(
+    columns: Vec<Vec<FE>>,
+    num_rows: usize,
+    options: &ProofOptions,
+) -> Commitment {
+    let blowup_factor = options.blowup_factor as usize;
+    let coset_offset = FE::from(options.coset_offset);
+
+    // Interpolate each column to a polynomial, evaluate on LDE domain, then bit-reverse.
+    let lde_columns: Vec<Vec<FE>>;
+
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        lde_columns = columns
+            .par_iter()
+            .map(|col| {
+                let poly = Polynomial::interpolate_fft::<GoldilocksField>(col)
+                    .expect("FFT interpolation failed");
+                let mut lde = evaluate_polynomial_on_lde_domain(
+                    &poly,
+                    blowup_factor,
+                    num_rows,
+                    &coset_offset,
+                )
+                .expect("LDE evaluation failed");
+                in_place_bit_reverse_permute(&mut lde);
+                lde
+            })
+            .collect();
+    }
+
+    #[cfg(not(feature = "parallel"))]
+    {
+        lde_columns = columns
+            .iter()
+            .map(|col| {
+                let poly = Polynomial::interpolate_fft::<GoldilocksField>(col)
+                    .expect("FFT interpolation failed");
+                let mut lde = evaluate_polynomial_on_lde_domain(
+                    &poly,
+                    blowup_factor,
+                    num_rows,
+                    &coset_offset,
+                )
+                .expect("LDE evaluation failed");
+                in_place_bit_reverse_permute(&mut lde);
+                lde
+            })
+            .collect();
+    }
+
+    let lde_rows = columns2rows(lde_columns);
+    BatchedMerkleTree::<GoldilocksField>::build(&lde_rows)
+        .expect("Failed to build Merkle tree")
+        .root
+}
+
 /// Per-table maximum rows, sized so each chunk uses roughly the same memory.
 ///
 /// Effective width = main_cols + 3 × bus_interactions (extension field = 3× cost).
