@@ -618,6 +618,23 @@ fn test_prove_elfs_test_sb_sh_8() {
     );
 }
 
+/// Exercises the MEMW_A (aligned fast path) table.
+/// lw_sw stores a word (4 bytes) at aligned address 20 and loads it back,
+/// routing both operations through MEMW_A instead of the unaligned MEMW table.
+#[test]
+fn test_prove_elfs_lw_sw() {
+    let (elf, logs, _instructions) = run_asm_elf("lw_sw");
+    let mut traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default()).unwrap();
+    assert!(
+        !traces.memw_aligneds.is_empty(),
+        "lw_sw should produce MEMW_A rows for aligned word accesses"
+    );
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "lw_sw failed"
+    );
+}
+
 #[test]
 fn test_prove_elfs_all_branches_16() {
     // Initialize logger to see debug constraint validation output
