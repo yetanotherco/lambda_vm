@@ -530,6 +530,10 @@ fn test_prove_elfs_test_sb_sh_8() {
     let (elf, logs, _instructions) = run_asm_elf("test_sb_sh_8");
     let mut traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default()).unwrap();
     assert!(
+        !traces.memws.is_empty(),
+        "test_sb_sh_8 should produce MEMW rows for byte/halfword memory accesses"
+    );
+    assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "test_sb_sh_8 failed"
     );
