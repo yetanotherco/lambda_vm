@@ -1729,8 +1729,7 @@ pub trait IsStarkProver<
             // The aux data has been LDE'd, committed, and spilled to disk.
             // Freeing it now caps peak heap at K aux traces instead of all N.
             #[cfg(feature = "disk-spill")]
-            for idx in chunk_start..chunk_end {
-                let (_, trace, _) = &mut air_trace_pairs[idx];
+            for (_, trace, _) in &mut air_trace_pairs[chunk_start..chunk_end] {
                 trace.aux_table.data = Vec::new();
                 trace.aux_table.height = 0;
             }
