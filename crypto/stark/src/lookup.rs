@@ -277,11 +277,13 @@ impl Packing {
                 *acc += &combined * &alpha_powers[alpha_offset];
                 1
             }
+            // 2× Direct
             Packing::DWordWL => {
                 *acc += get_col(start_col) * &alpha_powers[alpha_offset];
                 *acc += get_col(start_col + 1) * &alpha_powers[alpha_offset + 1];
                 2
             }
+            // Direct + Word2L
             Packing::DWordHHW => {
                 *acc += get_col(start_col) * &alpha_powers[alpha_offset];
                 let shift_16 = FieldElement::<F>::from(SHIFT_16);
@@ -289,6 +291,7 @@ impl Packing {
                 *acc += &w * &alpha_powers[alpha_offset + 1];
                 2
             }
+            // Word2L + Direct
             Packing::DWordWHH => {
                 let shift_16 = FieldElement::<F>::from(SHIFT_16);
                 let w = get_col(start_col) + get_col(start_col + 1) * &shift_16;
@@ -296,6 +299,7 @@ impl Packing {
                 *acc += get_col(start_col + 2) * &alpha_powers[alpha_offset + 1];
                 2
             }
+            // 2× Word2L
             Packing::DWordHL => {
                 let shift_16 = FieldElement::<F>::from(SHIFT_16);
                 let w0 = get_col(start_col) + get_col(start_col + 1) * &shift_16;
@@ -304,6 +308,7 @@ impl Packing {
                 *acc += &w1 * &alpha_powers[alpha_offset + 1];
                 2
             }
+            // 2× Word4L
             Packing::DWordBL => {
                 let shift_8 = FieldElement::<F>::from(SHIFT_8);
                 let shift_16 = FieldElement::<F>::from(SHIFT_16);
@@ -320,6 +325,7 @@ impl Packing {
                 *acc += &w1 * &alpha_powers[alpha_offset + 1];
                 2
             }
+            // 4× Word2L
             Packing::QuadHL => {
                 let shift_16 = FieldElement::<F>::from(SHIFT_16);
                 for i in 0..4 {
@@ -329,6 +335,7 @@ impl Packing {
                 }
                 4
             }
+            // 4× Direct
             Packing::QuadWL => {
                 for i in 0..4 {
                     *acc += get_col(start_col + i) * &alpha_powers[alpha_offset + i];
