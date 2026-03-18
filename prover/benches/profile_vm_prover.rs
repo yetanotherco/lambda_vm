@@ -3,13 +3,17 @@
 // Run with: `samply record cargo bench --bench profile_vm_prover --features parallel`
 // Or with hyperfine: `hyperfine --runs 1 './target/release/deps/profile_vm_prover-*'`
 //
-// Uses all_instructions_64.elf which exercises all supported RISC-V instructions.
+// Default ELF: fib_iterative_372k (~372k steps, realistic workload).
+// Override:    cargo bench --bench profile_vm_prover --features parallel -- <elf_name>
 
 use lambda_vm_prover::test_utils::asm_elf_bytes;
 
 fn main() {
-    let elf_name = "all_instructions_64";
-    let elf_bytes = asm_elf_bytes(elf_name);
+    let elf_name = std::env::args()
+        .skip(1)
+        .find(|a| !a.starts_with('-'))
+        .unwrap_or_else(|| "fib_iterative_372k".to_string());
+    let elf_bytes = asm_elf_bytes(&elf_name);
 
     println!("Starting VM prover profiling...");
     println!("Configuration:");
