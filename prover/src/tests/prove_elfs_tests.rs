@@ -224,6 +224,20 @@ fn test_prove_elfs_arith_lui_8() {
     );
 }
 
+// Test AUIPC.
+// AUIPC uses rs1=x255 (PC register).
+// read_register1 must be 1 for rs1≠0, triggering the MEMW M1 interaction.
+#[test]
+fn test_prove_elfs_auipc() {
+    let (elf, logs, instructions) = run_asm_elf("auipc");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "auipc failed"
+    );
+}
+
 /// 8-instruction test with ADD, SUB, ADDW, SUBW
 #[test]
 fn test_prove_elfs_arith_8() {
@@ -405,6 +419,17 @@ fn test_prove_elfs_test_mul_8() {
 }
 
 #[test]
+fn test_prove_elfs_mulw_neg() {
+    let (elf, logs, instructions) = run_asm_elf("mulw_neg");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "mulw_neg failed"
+    );
+}
+
+#[test]
 fn test_prove_elfs_test_div_8() {
     let (elf, logs, instructions) = run_asm_elf("test_div_8");
     let mut traces =
@@ -413,6 +438,45 @@ fn test_prove_elfs_test_div_8() {
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "test_div_8 failed"
+    );
+}
+
+// Test DIVW with negative operands (−100 / 7 = −14).
+// Result bit 31 is set, so rvd ≠ res. The DVRM bus must send res (CPU-CA46), not rvd.
+#[test]
+fn test_prove_elfs_divw() {
+    let (elf, logs, instructions) = run_asm_elf("divw");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "divw failed"
+    );
+}
+
+// Test REMW with negative operands (−100 % 7 = −2).
+// Result bit 31 is set, so rvd ≠ res. The DVRM bus must send res (CPU-CA46), not rvd.
+#[test]
+fn test_prove_elfs_remw() {
+    let (elf, logs, instructions) = run_asm_elf("remw");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "remw failed"
+    );
+}
+
+// Test DIVW/REMW with a negative divisor (arg2 bit 31 set).
+// Exercises arg2 sign extension via CPU-CE63 (signed * arg2_sign_bit).
+#[test]
+fn test_prove_elfs_sign_ext_edge_cases_8() {
+    let (elf, logs, instructions) = run_asm_elf("sign_ext_edge_cases_8");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "sign_ext_edge_cases_8 failed"
     );
 }
 
