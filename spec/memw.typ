@@ -69,9 +69,9 @@ This chip contributes the following to the lookup argument:
 #let alignedchip = load_chip("src/memw_aligned.toml", config)
 #let aligned = raw(alignedchip.name)
 
-When a memory access happens at an address with proper alignment
-(that is, enough trailing zeros) for its access size, and all accessed
-elements were last accessed at the same timestamp, we can 
+When a memory access happens at an address with proper alignment for its access size
+(i.e., adding the access size to `base_address`'s lowest limb does not overflow), 
+and all accessed elements were last accessed at the same timestamp, we can 
 instead use the #aligned chip to save on total column count.
 The saving comes from only requiring a single old timestamp to be stored,
 as well as being able to guarantee that all values of `add_limb_overflow` would be zero.
