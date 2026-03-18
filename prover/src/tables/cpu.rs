@@ -368,48 +368,40 @@ impl CpuOperation {
         }
     }
 
-    /// Compute arg2 based on instruction type (returns imm or rv2 depending on opcode).
+    /// Compute arg2 following the spec formula exactly (CPU-CE62/CE63).
     ///
-    /// Per spec constraint for arg2[4:]:
-    /// (1-LOAD) * ((1-word_instr)*rv2[2] + signed*arg2_sign_bit*(2^32-1)) + (1-BEQ-BLT-STORE)*imm[1]
+    /// arg2[:4] = (1-LOAD)*rv2[:2] + (1-BEQ-BLT-STORE)*imm[0]
+    /// arg2[4:] = (1-LOAD)*((1-word_instr)*rv2[2] + signed*arg2_sign_bit*(2^32-1))
+    ///            + (1-BEQ-BLT-STORE)*imm[1]
     ///
-    /// For LOAD: uses imm (full 64-bit, for address calculation)
-    /// For STORE: uses rv2 (byte-decomposed data to store; address via separate ADD)
-    /// For BEQ/BLT: uses rv2 (full 64-bit, comparing register values)
-    /// Otherwise: uses imm (when rs2=0) or rv2, with sign extension for signed word instructions
+    /// Per CPU-A2, the decode guarantees that at most one of rv2/imm is non-zero
+    /// when STORE+LOAD+BEQ+BLT=0, so the addition acts as a selection.
     pub fn compute_arg2(&self) -> u64 {
-        if self.decode.op_load {
-            // LOAD: address = rv1 + imm, use full imm
-            self.decode.imm
-        } else if self.decode.op_store {
-            // STORE: arg2 = rv2 (byte-decomposed data to store)
-            // Address computed separately as res = arg1 + imm
-            self.rv2
-        } else if self.decode.op_beq || self.decode.op_blt {
-            // BEQ/BLT: compare rv1 vs rv2, use full rv2
-            self.rv2
-        } else {
-            // For other ops, use imm (when rs2=0) or rv2
-            let base = if self.decode.rs2 == 0 {
-                self.decode.imm
-            } else {
-                self.rv2
-            };
+        let d = &self.decode;
 
-            // For word instructions, apply sign/zero extension based on signed flag
-            if self.decode.word_instr {
-                let lower_32 = base & 0xFFFF_FFFF;
-                if self.decode.signed && Self::sign_bit_32(base) {
-                    // Sign extend: set upper 32 bits to all 1s
-                    lower_32 | (0xFFFF_FFFF_u64 << 32)
-                } else {
-                    // Zero extend: upper 32 bits are 0
-                    lower_32
-                }
+        // rv2 contribution: zeroed when LOAD (spec: (1-LOAD) factor)
+        let rv2_extended = if d.op_load {
+            0
+        } else if d.word_instr {
+            // Word-instruction sign/zero extension on upper 32 bits
+            let lower_32 = self.rv2 & 0xFFFF_FFFF;
+            if d.signed && Self::sign_bit_32(self.rv2) {
+                lower_32 | (0xFFFF_FFFF_u64 << 32)
             } else {
-                base
+                lower_32
             }
-        }
+        } else {
+            self.rv2
+        };
+
+        // imm contribution: zeroed when BEQ, BLT, or STORE (spec: (1-BEQ-BLT-STORE) factor)
+        let imm_contrib = if d.op_beq || d.op_blt || d.op_store {
+            0
+        } else {
+            d.imm
+        };
+
+        rv2_extended.wrapping_add(imm_contrib)
     }
 
     /// Extract sign bit of a 32-bit word (bit 31).
@@ -648,13 +640,21 @@ impl CpuOperation {
         } else {
             (0, 0)
         };
+        // CM50: (1 - read_register2) * rv2[i] = 0. When read_register2=0, rv2 must be 0.
+        // For example, ECALL has read_register2=0 (rs2 defaults to 0). The commit buf_addr is
+        // carried separately in commit_buf_addr and does not go through rv2.
+        let rv2 = if !decode.read_register2 {
+            0
+        } else {
+            log.src2_val
+        };
 
         let mut op = Self {
             decode,
             timestamp,
             next_pc: log.next_pc,
             rv1: log.src1_val,
-            rv2: log.src2_val,
+            rv2,
             rvd: log.dst_val,
             res: log.dst_val, // Default: result is destination value
             is_equal: false,
@@ -768,11 +768,10 @@ pub fn generate_cpu_trace(
         data[base + cols::RS1] = FE::from(d.rs1 as u64);
         data[base + cols::RS2] = FE::from(d.rs2 as u64);
         data[base + cols::RD] = FE::from(d.rd as u64);
-        // Only set read/write register flags when register is a real register
-        // Skip x0 (hardwired zero) and x255 (virtual PC register for AUIPC/JAL)
-        // This matches trace_builder which only generates MEMW rows for real registers
-        data[base + cols::READ_REGISTER1] =
-            FE::from((d.read_register1 && d.rs1 != 0 && d.rs1 != 255) as u64);
+        // Skip x0 (hardwired zero). x255 is the register where the pc is stored
+        // (per spec decode.md). read_register1=1 for rs1=255 ensures the CM47 MEMW
+        // interaction is sent and rv1 is not forced to zero by CM48.
+        data[base + cols::READ_REGISTER1] = FE::from((d.read_register1 && d.rs1 != 0) as u64);
         data[base + cols::READ_REGISTER2] = FE::from((d.read_register2 && d.rs2 != 0) as u64);
         data[base + cols::WRITE_REGISTER] = FE::from((d.write_register && d.rd != 0) as u64);
         data[base + cols::MEMORY_2BYTES] = FE::from(d.memory_2bytes as u64);
@@ -1280,10 +1279,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::MP_SELECTOR,
                 packing: Packing::Direct,
             },
-            // result (rvd) as DWordWL (2 words → 2 elements)
+            // result (res) as DWordBL (8 bytes → 2 elements) per spec CPU-CA44.
+            // Must send res (raw MUL output), not rvd. For MULW, rvd = sign_extend(res[31:0]),
+            // which can differ from res when bits [63:32] ≠ sign_extend(bit31) of res.
             BusValue::Packed {
-                start_column: cols::RVD_0,
-                packing: Packing::DWordWL,
+                start_column: cols::RES[0],
+                packing: Packing::DWordBL,
             },
             // muldiv_selector: 0=lo (MUL), 1=hi (MULH/MULHSU/MULHU)
             BusValue::Packed {
@@ -1317,10 +1318,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::SIGNED,
                 packing: Packing::Direct,
             },
-            // result (rvd) as DWordWL (2 words → 2 elements)
+            // result (res) as DWordBL (8 bytes → 2 elements) per spec CPU-CA45.
+            // Must send res (raw DVRM output), not rvd. For DIVW/REMW, rvd = sign_extend(res[31:0]),
+            // which can differ from res when bits [63:32] ≠ sign_extend(bit31) of res.
             BusValue::Packed {
-                start_column: cols::RVD_0,
-                packing: Packing::DWordWL,
+                start_column: cols::RES[0],
+                packing: Packing::DWordBL,
             },
             // muldiv_selector: 0=quotient (DIV), 1=remainder (REM)
             BusValue::Packed {
