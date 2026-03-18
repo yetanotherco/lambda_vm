@@ -1,10 +1,11 @@
 #!/bin/bash
 # Benchmark the prover: wall-clock time + peak heap (jemalloc).
 #
-# Usage: bench_prove.sh [elf_path] [runs=1] [base_branch=main | --no-compare]
+# Usage: bench_prove.sh [elf_path] [runs=1] [base_branch=main | --no-compare] [--instruments]
 #
 # If on a feature branch, automatically benchmarks base_branch too and prints a comparison.
 # Pass --no-compare to skip comparison and only benchmark the current branch.
+# Pass --instruments to also build with instruments and capture detailed timing breakdown.
 #
 # Peak heap is deterministic (jemalloc stats.allocated high-water mark, 10ms polling).
 # Peak RSS is collected in raw data for reference but not shown in summary (it's noisy).
@@ -21,10 +22,21 @@ YELLOW='\033[1;33m'
 BOLD='\033[1m'
 NC='\033[0m'
 
+# Parse --instruments from any position in args
+INSTRUMENTS=false
+POSITIONAL=()
+for arg in "$@"; do
+    if [ "$arg" = "--instruments" ]; then
+        INSTRUMENTS=true
+    else
+        POSITIONAL+=("$arg")
+    fi
+done
+
 DEFAULT_ELF="$ROOT_DIR/executor/program_artifacts/asm/fib_iterative_372k.elf"
-ELF=${1:-$DEFAULT_ELF}
-RUNS=${2:-1}
-BASE_BRANCH=${3:-main}
+ELF=${POSITIONAL[0]:-$DEFAULT_ELF}
+RUNS=${POSITIONAL[1]:-1}
+BASE_BRANCH=${POSITIONAL[2]:-main}
 OUTPUT="$TMP_DIR/proof.bin"
 
 CURRENT_BRANCH=$(git -C "$ROOT_DIR" rev-parse --abbrev-ref HEAD)
@@ -150,6 +162,20 @@ mean() {
     awk '{s+=$1} END {printf "%.0f", s/NR}' "$1"
 }
 
+stddev() {
+    awk '{s+=$1; ss+=$1*$1} END {
+        m=s/NR; printf "%.0f", sqrt(ss/NR - m*m)
+    }' "$1"
+}
+
+cv_pct() {
+    awk '{s+=$1; ss+=$1*$1} END {
+        m=s/NR; sd=sqrt(ss/NR - m*m);
+        if (m > 0) printf "%.1f", sd*100/m;
+        else printf "0.0";
+    }' "$1"
+}
+
 # Format a signed percentage: "+0.3%" or "-12.6%"
 signed_pct() {
     local diff=$1 base=$2
@@ -185,8 +211,15 @@ print_stats() {
         heap_str="${median_heap} MB"
     fi
 
-    printf "  %-10s  time(mean): %7ss  time(median): %7ss  heap(median): %s\n" \
-        "$label" "$mean_s" "$median_s" "$heap_str"
+    local cv_str=""
+    local num_runs=$(wc -l < "$time_file" | tr -d ' ')
+    if [ "$num_runs" -gt 1 ]; then
+        local cv=$(cv_pct "$time_file")
+        cv_str="  CV: ${cv}%"
+    fi
+
+    printf "  %-10s  time(mean): %7ss  time(median): %7ss  heap(median): %s%s\n" \
+        "$label" "$mean_s" "$median_s" "$heap_str" "$cv_str"
 }
 
 if $COMPARE; then
@@ -209,6 +242,23 @@ if $COMPARE; then
     fi
 else
     print_stats "current"
+fi
+
+# --- Instruments run (optional) -----------------------------------------------
+
+if $INSTRUMENTS; then
+    echo ""
+    echo -e "${BOLD}=== Instruments Breakdown ===${NC}"
+    echo -e "${GREEN}Building with --features instruments...${NC}"
+    cargo build --release -p cli --features instruments --manifest-path "$ROOT_DIR/Cargo.toml" 2>&1 | tail -1
+
+    INSTRUMENTS_OUTPUT="$TMP_DIR/instruments.txt"
+    echo -e "${GREEN}Running instrumented prove...${NC}"
+    "$ROOT_DIR/target/release/cli" prove "$ELF" -o "$TMP_DIR/proof_instruments.bin" 2>&1 | tee "$INSTRUMENTS_OUTPUT"
+    rm -f "$TMP_DIR/proof_instruments.bin"
+
+    echo ""
+    echo -e "Instruments report saved to: ${BOLD}$INSTRUMENTS_OUTPUT${NC}"
 fi
 
 echo ""

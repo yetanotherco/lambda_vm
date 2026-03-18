@@ -130,10 +130,10 @@ fn test_cpu_operation_compute_arg2_add_with_rs2() {
     let mut op = CpuOperation::new();
     op.rv2 = 0xABCD_EF00;
     op.decode.rs2 = 5; // Non-zero rs2
-    op.decode.imm = 0x1234_5678;
+    op.decode.imm = 0; // Per CPU-A2: when rs2 != 0, imm must be 0
     op.decode.op_add = true;
 
-    // ADD with rs2 != 0 uses rv2
+    // ADD with rs2 != 0: arg2 = rv2 + imm = rv2 + 0 = rv2
     assert_eq!(op.compute_arg2(), 0xABCD_EF00);
 }
 
