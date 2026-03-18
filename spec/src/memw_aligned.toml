@@ -85,8 +85,11 @@ type = "Bit"
 desc = "Whether we are performing a write (and hence not return `out`)"
 
 [[assumptions]]
-desc = "`IS_WORD[base_address[i]]`"
+desc = "`IS_HALF[base_address[i]]`"
 iter = ["i", 0, 1]
+
+[[assumptions]]
+desc = "`IS_WORD[base_address[2]]`"
 
 [[assumptions]]
 desc = "`IS_BIT<write2>`"
@@ -110,7 +113,7 @@ name = "consistency"
 
 [[constraints.consistency]]
 kind = "interaction"
-tag = "IS_HALFWORD"
+tag = "IS_HALF"
 input = [["+", ["idx", "base_address", 0], "write2", ["*", 3, "write4"], ["*", 7, "write8"]]]
 multiplicity = "μ_sum"
 
