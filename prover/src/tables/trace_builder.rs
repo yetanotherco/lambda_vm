@@ -1703,6 +1703,11 @@ impl Traces {
         // PHASE 1: Logs → CPU operations
         // =====================================================================
         let cpu_ops = collect_cpu_ops(logs, &instructions)?;
+        eprintln!("MEMORY Phase 1 done: cpu_ops={} ({:.2} GB), logs still alive ({:.2} GB est)",
+            cpu_ops.len(),
+            (cpu_ops.len() * std::mem::size_of::<CpuOperation>()) as f64 / 1e9,
+            (logs.len() * std::mem::size_of::<executor::vm::logs::Log>()) as f64 / 1e9,
+        );
 
         // =====================================================================
         // PHASE 2: CPU ops → MEMW, LOAD, LT, Bitwise, Branch
@@ -1713,6 +1718,12 @@ impl Traces {
         let mut register_state = RegisterState::new(elf.entry_point);
         let (mut memw_ops, load_ops, mut lt_ops, shift_ops, bitwise_ops) =
             collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
+        eprintln!("MEMORY Phase 2 done: memw={} ({:.2} GB), bitwise={} ({:.2} GB)",
+            memw_ops.len(),
+            (memw_ops.len() * std::mem::size_of::<MemwOperation>()) as f64 / 1e9,
+            bitwise_ops.len(),
+            (bitwise_ops.len() * std::mem::size_of::<bitwise::BitwiseOperation>()) as f64 / 1e9,
+        );
 
         // HALT finalization: 33 register MEMW operations at timestamp u64::MAX.
         // Must come before Phase 3 (LT from MEMW) so HALT ops get timestamp checks.
