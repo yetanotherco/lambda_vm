@@ -17,13 +17,15 @@
 //! - `old_timestamp`: DWordWL (2 cols — single, not 8!)
 //! - `mu_read`, `mu_write`: multiplicity columns
 //!
-//! ## Bus Interactions (22)
-//! - 1 IS_HALFWORD[base_address_mid]
-//! - 1 IS_BYTE[base_address_low[1]]
+//! ## Bus Interactions (20)
 //! - 1 AND_BYTE[base_address_low[0], mask] → 0 (alignment check)
 //! - 1 LT[old_timestamp, timestamp, 0] → 1
 //! - 16 Memory bus tokens
 //! - 2 MEMW output interactions (read + write)
+//!
+//! ## Assumptions (caller's responsibility, not enforced here)
+//! - MEMW_A-A2: IS_HALF[base_address_mid]
+//! - MEMW_A-A3.i: IS_BYTE[base_address_low[i]] for i ∈ [0, 1]
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
@@ -138,33 +140,9 @@ pub fn generate_memw_aligned_trace(
 // =========================================================================
 
 pub fn bus_interactions() -> Vec<BusInteraction> {
-    let mut interactions = Vec::with_capacity(22);
+    let mut interactions = Vec::with_capacity(20);
 
     let mu_sum = Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE);
-
-    // -------------------------------------------------------------------------
-    // IS_HALFWORD[base_address_mid] with μ_sum
-    // -------------------------------------------------------------------------
-    interactions.push(BusInteraction::sender(
-        BusId::IsHalfword,
-        mu_sum.clone(),
-        vec![BusValue::Packed {
-            start_column: cols::BASE_ADDRESS_MID,
-            packing: Packing::Direct,
-        }],
-    ));
-
-    // -------------------------------------------------------------------------
-    // IS_BYTE[base_address_low[1]] with μ_sum
-    // -------------------------------------------------------------------------
-    interactions.push(BusInteraction::sender(
-        BusId::IsByte,
-        mu_sum.clone(),
-        vec![BusValue::Packed {
-            start_column: cols::BASE_ADDRESS_LOW[1],
-            packing: Packing::Direct,
-        }],
-    ));
 
     // -------------------------------------------------------------------------
     // AND_BYTE[base_address_low[0], mask] → 0 with μ_sum

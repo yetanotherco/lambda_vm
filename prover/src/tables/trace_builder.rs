@@ -865,35 +865,21 @@ fn is_aligned_op(op: &MemwOperation) -> bool {
 /// Collects bitwise lookups from MEMW_A operations.
 ///
 /// Per operation:
-/// - 1 IS_HALFWORD for base_address_mid
-/// - 1 IS_BYTE for base_address_low[1]
 /// - 1 AND_BYTE for alignment check (low[0] & mask == 0)
+///
+/// IS_HALFWORD[base_address_mid] and IS_BYTE[base_address_low[1]] are
+/// assumptions (MEMW_A-A2, MEMW_A-A3.i) — the caller's (CPU's) responsibility.
 fn collect_bitwise_from_memw_aligned(ops: &[MemwOperation]) -> Vec<BitwiseOperation> {
-    let mut bitwise_ops = Vec::with_capacity(ops.len() * 3);
+    let mut bitwise_ops = Vec::with_capacity(ops.len());
 
     for op in ops {
         let low_0 = (op.base_address & 0xFF) as u8;
-        let low_1 = ((op.base_address >> 8) & 0xFF) as u8;
-        let mid = ((op.base_address >> 16) & 0xFFFF) as u16;
         let mask: u8 = match op.width {
             2 => 1,
             4 => 3,
             8 => 7,
             _ => 0,
         };
-
-        // IS_HALFWORD[mid]
-        bitwise_ops.push(BitwiseOperation::halfword(
-            BitwiseOperationType::IsHalf,
-            (mid & 0xFF) as u8,
-            (mid >> 8) as u8,
-        ));
-
-        // IS_BYTE[low_1]
-        bitwise_ops.push(BitwiseOperation::single_byte(
-            BitwiseOperationType::IsByte,
-            low_1,
-        ));
 
         // AND_BYTE[low_0, mask] → expects result 0
         bitwise_ops.push(BitwiseOperation::byte_op(
