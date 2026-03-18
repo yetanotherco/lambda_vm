@@ -29,6 +29,8 @@ use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 pub const SHIFT_8: u64 = 256;
 /// 2^16 - shift for combining halves
 pub const SHIFT_16: u64 = 65536;
+/// 2^24 - shift for combining 3-byte positions
+pub const SHIFT_24: u64 = 1 << 24;
 /// 2^32 - shift for combining words
 pub const SHIFT_32: u64 = 4294967296;
 
@@ -434,7 +436,7 @@ impl Packing {
                 // b₀ + 2⁸·b₁ + 2¹⁶·b₂ + 2²⁴·b₃
                 let shift_8 = FieldElement::<E>::from(SHIFT_8);
                 let shift_16 = FieldElement::<E>::from(SHIFT_16);
-                let shift_24 = &shift_8 * &shift_16;
+                let shift_24 = FieldElement::<E>::from(SHIFT_24);
                 vec![
                     &columns[0]
                         + &columns[1] * &shift_8
@@ -1575,8 +1577,16 @@ where
     // No multiplicity multiply — just sign-flip and sum
     (0..trace_len)
         .map(|row| {
-            let a = if negate_a { -all_fingerprints[row].clone() } else { all_fingerprints[row].clone() };
-            let b = if negate_b { -all_fingerprints[trace_len + row].clone() } else { all_fingerprints[trace_len + row].clone() };
+            let a = if negate_a {
+                -&all_fingerprints[row]
+            } else {
+                all_fingerprints[row].clone()
+            };
+            let b = if negate_b {
+                -&all_fingerprints[trace_len + row]
+            } else {
+                all_fingerprints[trace_len + row].clone()
+            };
             a + b
         })
         .collect()
@@ -1614,7 +1624,11 @@ where
     (0..trace_len)
         .map(|row| {
             // Unit side: just ±fp_inv (no multiplicity multiply)
-            let term_unit = if negate_unit { -all_fingerprints[row].clone() } else { all_fingerprints[row].clone() };
+            let term_unit = if negate_unit {
+                -&all_fingerprints[row]
+            } else {
+                all_fingerprints[row].clone()
+            };
             // General side: m * fp_inv with sign
             let term_gen = &multiplicities_gen[row] * &all_fingerprints[trace_len + row];
             let term_gen = if negate_gen { -term_gen } else { term_gen };
@@ -1994,14 +2008,26 @@ where
             match pair_kind {
                 BatchedPairKind::BothUnit => {
                     // Both m_a=1, m_b=1: skip both multiplicity computations
-                    let term_a = if interaction_a.is_sender { fp_b.clone() } else { -fp_b.clone() };
-                    let term_b = if interaction_b.is_sender { fp_a.clone() } else { -fp_a.clone() };
+                    let term_a = if interaction_a.is_sender {
+                        fp_b.clone()
+                    } else {
+                        -&fp_b
+                    };
+                    let term_b = if interaction_b.is_sender {
+                        fp_a.clone()
+                    } else {
+                        -&fp_a
+                    };
                     c * &fp_a * &fp_b - term_a - term_b
                 }
                 BatchedPairKind::UnitFirst => {
                     // m_a=1, m_b=general
                     let m_b = compute_multiplicity_from_step(step, &interaction_b.multiplicity);
-                    let term_a = if interaction_a.is_sender { fp_b.clone() } else { -fp_b.clone() };
+                    let term_a = if interaction_a.is_sender {
+                        fp_b.clone()
+                    } else {
+                        -&fp_b
+                    };
                     let term_b = m_b * &fp_a;
                     let term_b = if interaction_b.is_sender { term_b } else { -term_b };
                     c * &fp_a * &fp_b - term_a - term_b
@@ -2010,8 +2036,16 @@ where
                     // m_a=general, m_b=1
                     let m_a = compute_multiplicity_from_step(step, &interaction_a.multiplicity);
                     let term_a = m_a * &fp_b;
-                    let term_a = if interaction_a.is_sender { term_a } else { -term_a };
-                    let term_b = if interaction_b.is_sender { fp_a.clone() } else { -fp_a.clone() };
+                    let term_a = if interaction_a.is_sender {
+                        term_a
+                    } else {
+                        -term_a
+                    };
+                    let term_b = if interaction_b.is_sender {
+                        fp_a.clone()
+                    } else {
+                        -&fp_a
+                    };
                     c * &fp_a * &fp_b - term_a - term_b
                 }
                 BatchedPairKind::General => {
