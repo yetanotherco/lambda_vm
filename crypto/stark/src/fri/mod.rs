@@ -3,10 +3,14 @@ pub mod fri_decommit;
 pub(crate) mod fri_functions;
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
+use crypto::merkle_tree::traits::IsMerkleTreeBackend;
 pub use math::field::element::FieldElement;
 use math::field::traits::IsSubFieldOf;
 use math::field::traits::{IsFFTField, IsField};
 use math::traits::AsBytes;
+
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
 use crate::config::{FriLayerMerkleTree, FriLayerMerkleTreeBackend};
 
@@ -49,12 +53,24 @@ where
         // Fold evaluations in-place (no FFT needed)
         fold_evaluations_in_place(&mut evals, &zeta, &inv_twiddles);
 
-        // Build Merkle tree from consecutive pairs
-        let leaves: Vec<[FieldElement<E>; 2]> = evals
-            .chunks_exact(2)
-            .map(|chunk| [chunk[0].clone(), chunk[1].clone()])
+        // Build Merkle tree from consecutive pairs — hash leaves in parallel.
+        #[cfg(feature = "parallel")]
+        let hashed_leaves: Vec<_> = evals
+            .par_chunks_exact(2)
+            .map(|chunk| {
+                let pair = [chunk[0].clone(), chunk[1].clone()];
+                FriLayerMerkleTreeBackend::<E>::hash_data(&pair)
+            })
             .collect();
-        let merkle_tree = FriLayerMerkleTree::build(&leaves)
+        #[cfg(not(feature = "parallel"))]
+        let hashed_leaves: Vec<_> = evals
+            .chunks_exact(2)
+            .map(|chunk| {
+                let pair = [chunk[0].clone(), chunk[1].clone()];
+                FriLayerMerkleTreeBackend::<E>::hash_data(&pair)
+            })
+            .collect();
+        let merkle_tree = FriLayerMerkleTree::build_from_hashed_leaves(hashed_leaves)
             .expect("FRI commit: Merkle tree construction must succeed");
         let root = merkle_tree.root;
         fri_layer_list.push(FriLayer::new(
