@@ -1166,10 +1166,6 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MemwConstrai
         self.constraint_idx
     }
 
-    fn end_exemptions(&self) -> usize {
-        0
-    }
-
     fn evaluate(
         &self,
         evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
