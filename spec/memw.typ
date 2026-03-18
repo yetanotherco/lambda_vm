@@ -40,7 +40,7 @@ we document it here, keeping the type information as a reading help.
 
 Depending on the values of `write2`, `write4` and `write8`, the addresses following `base_address` need to be constructed.
 Rather than computing these in full (which would require the later addresses to be instantiated), 
-it suffices to know the `carry`: the bit indicating whether $#`base_address`_0 + i >= 2^32$, i.e., whether adding $i$ to `base_address` requires a carry from the lower to the upper limb.
+it suffices to know the `carry`: the bit indicating whether $#`base_address`_0 + t >= 2^32$, i.e., whether adding $t in [1, 7]$ to `base_address` requires a carry from the lower to the upper limb.
 Note that it is safe for the prover to chose these bits: additions for which this bit is not correctly set
 will yield an address where either the lower or upper limb is out of bounds.
 As such, the constructed address will not match any existing memory tokens, 
