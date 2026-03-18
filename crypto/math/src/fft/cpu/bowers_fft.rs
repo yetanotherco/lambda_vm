@@ -239,29 +239,26 @@ where
     let mut layer = 0;
 
     // Process triples of layers with 3-layer fusion (radix-8 DIF).
+    // Invariant: when layer + 2 < log_n, block_size = n >> layer >= 2^3 = 8.
     while layer + 2 < log_n {
         let block_size = n >> layer;
+        debug_assert!(block_size >= 8);
+        let tw0 = layer_twiddles.get_layer(layer);
+        let tw1 = layer_twiddles.get_layer(layer + 1);
+        let tw2 = layer_twiddles.get_layer(layer + 2);
+        let num_blocks = n / block_size;
 
-        if block_size >= 8 {
-            let tw0 = layer_twiddles.get_layer(layer);
-            let tw1 = layer_twiddles.get_layer(layer + 1);
-            let tw2 = layer_twiddles.get_layer(layer + 2);
-            let num_blocks = n / block_size;
-
-            if num_blocks >= parallel_threshold {
-                input.par_chunks_mut(block_size).for_each(|block| {
-                    process_triple_fused_block(block, tw0, tw1, tw2);
-                });
-            } else {
-                for block_start in (0..n).step_by(block_size) {
-                    let block = &mut input[block_start..block_start + block_size];
-                    process_triple_fused_block(block, tw0, tw1, tw2);
-                }
-            }
-            layer += 3;
+        if num_blocks >= parallel_threshold {
+            input.par_chunks_mut(block_size).for_each(|block| {
+                process_triple_fused_block(block, tw0, tw1, tw2);
+            });
         } else {
-            break;
+            for block_start in (0..n).step_by(block_size) {
+                let block = &mut input[block_start..block_start + block_size];
+                process_triple_fused_block(block, tw0, tw1, tw2);
+            }
         }
+        layer += 3;
     }
 
     // Process remaining pairs of layers with 2-layer fusion.
@@ -965,32 +962,30 @@ where
     // Process triples of layers with 3-layer fusion (DIT, reverse order)
     let mut layer = log_n;
 
+    // Invariant: when layer >= 3, block_size = n >> (layer - 3) >= 2^3 = 8.
     while layer >= 3 {
         let layer_hi = layer - 1;
         let layer_mid = layer - 2;
         let layer_lo = layer - 3;
         let block_size = n >> layer_lo;
+        debug_assert!(block_size >= 8);
 
-        if block_size >= 8 {
-            let tw_hi = layer_twiddles.get_layer(layer_hi);
-            let tw_mid = layer_twiddles.get_layer(layer_mid);
-            let tw_lo = layer_twiddles.get_layer(layer_lo);
-            let num_blocks = n / block_size;
+        let tw_hi = layer_twiddles.get_layer(layer_hi);
+        let tw_mid = layer_twiddles.get_layer(layer_mid);
+        let tw_lo = layer_twiddles.get_layer(layer_lo);
+        let num_blocks = n / block_size;
 
-            if num_blocks >= parallel_threshold {
-                input.par_chunks_mut(block_size).for_each(|block| {
-                    process_ifft_triple_fused_block(block, tw_hi, tw_mid, tw_lo);
-                });
-            } else {
-                for block_start in (0..n).step_by(block_size) {
-                    let block = &mut input[block_start..block_start + block_size];
-                    process_ifft_triple_fused_block(block, tw_hi, tw_mid, tw_lo);
-                }
-            }
-            layer -= 3;
+        if num_blocks >= parallel_threshold {
+            input.par_chunks_mut(block_size).for_each(|block| {
+                process_ifft_triple_fused_block(block, tw_hi, tw_mid, tw_lo);
+            });
         } else {
-            break;
+            for block_start in (0..n).step_by(block_size) {
+                let block = &mut input[block_start..block_start + block_size];
+                process_ifft_triple_fused_block(block, tw_hi, tw_mid, tw_lo);
+            }
         }
+        layer -= 3;
     }
 
     // Process remaining pairs of layers with 2-layer fusion (DIT, reverse order)
