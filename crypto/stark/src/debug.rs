@@ -2,7 +2,7 @@ use super::domain::Domain;
 use super::lookup::BusPublicInputs;
 use super::trace::TraceTable;
 use super::traits::{AIR, TransitionEvaluationContext};
-use crate::lookup::{LOGUP_CHALLENGE_ALPHA, compute_alpha_powers};
+use crate::lookup::{LOGUP_CHALLENGE_ALPHA, PackingShifts, compute_alpha_powers};
 use crate::{frame::Frame, trace::LDETraceTable};
 use log::{error, info};
 use math::field::traits::IsSubFieldOf;
@@ -117,6 +117,7 @@ pub fn validate_trace<
     };
 
     // Iterate over trace and compute transitions
+    let packing_shifts = PackingShifts::<Field>::new();
     for step in 0..lde_trace.num_steps() {
         let frame = Frame::read_step_from_lde(&lde_trace, step, &air.context().transition_offsets);
         let periodic_values: Vec<_> = periodic_columns
@@ -129,6 +130,7 @@ pub fn validate_trace<
             rap_challenges,
             &logup_alpha_powers,
             &logup_table_offset,
+            &packing_shifts,
         );
         let evaluations = air.compute_transition(&transition_evaluation_context);
 

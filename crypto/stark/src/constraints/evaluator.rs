@@ -2,7 +2,7 @@ use super::boundary::BoundaryConstraints;
 #[cfg(all(debug_assertions, not(feature = "parallel")))]
 use crate::debug::check_boundary_polys_divisibility;
 use crate::domain::Domain;
-use crate::lookup::{BusPublicInputs, LOGUP_CHALLENGE_ALPHA, compute_alpha_powers};
+use crate::lookup::{BusPublicInputs, LOGUP_CHALLENGE_ALPHA, PackingShifts, compute_alpha_powers};
 use crate::trace::LDETraceTable;
 use crate::traits::{AIR, TransitionEvaluationContext, ZerofierEvaluations};
 use crate::{frame::Frame, prover::evaluate_polynomial_on_lde_domain};
@@ -65,6 +65,9 @@ where
                 Vec::new()
             };
 
+        // Precompute packing shift constants once for all LDE domain points.
+        let packing_shifts = PackingShifts::<Field>::new();
+
         // Per-thread buffers via map_init: each Rayon worker allocates once,
         // then reuses for all iterations assigned to that thread.
         // The Frame is pre-allocated and filled in-place to avoid Vec allocations
@@ -107,6 +110,7 @@ where
                             rap_challenges,
                             &logup_alpha_powers,
                             logup_table_offset,
+                            &packing_shifts,
                         );
                         air.compute_transition_into(&ctx, transition_buf);
 
@@ -158,6 +162,7 @@ where
                         rap_challenges,
                         &logup_alpha_powers,
                         logup_table_offset,
+                        &packing_shifts,
                     );
                     air.compute_transition_into(&ctx, &mut transition_buf);
 

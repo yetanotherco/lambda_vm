@@ -1981,10 +1981,10 @@ where
             interaction_b: &BusInteraction,
             rap_challenges: &&[FieldElement<B>],
             alpha_powers: &[FieldElement<B>],
+            shifts: &PackingShifts<A>,
         ) -> FieldElement<B> {
             let c = step.get_aux_evaluation_element(0, term_column_idx);
             let z = &rap_challenges[LOGUP_CHALLENGE_Z];
-            let shifts = PackingShifts::<A>::new();
 
             let m_a = compute_multiplicity_from_step(step, &interaction_a.multiplicity);
             let m_b = compute_multiplicity_from_step(step, &interaction_b.multiplicity);
@@ -2014,6 +2014,7 @@ where
                 frame,
                 rap_challenges,
                 logup_alpha_powers,
+                packing_shifts,
                 ..
             } => evaluate_batched_term_constraint(
                 frame.get_evaluation_step(0),
@@ -2022,11 +2023,13 @@ where
                 &self.interaction_b,
                 rap_challenges,
                 logup_alpha_powers,
+                packing_shifts,
             ),
             TransitionEvaluationContext::Verifier {
                 frame,
                 rap_challenges,
                 logup_alpha_powers,
+                packing_shifts,
                 ..
             } => evaluate_batched_term_constraint(
                 frame.get_evaluation_step(0),
@@ -2035,6 +2038,7 @@ where
                 &self.interaction_b,
                 rap_challenges,
                 logup_alpha_powers,
+                packing_shifts,
             ),
         };
 
@@ -2111,6 +2115,7 @@ where
             absorbed: &[BusInteraction],
             rap_challenges: &&[FieldElement<B>],
             alpha_powers: &[FieldElement<B>],
+            shifts: &PackingShifts<A>,
         ) -> FieldElement<B> {
             // Accumulated column values
             let acc_curr = first_step.get_aux_evaluation_element(0, acc_column_idx);
@@ -2125,7 +2130,6 @@ where
             let delta = acc_next - acc_curr - terms_sum + logup_table_offset;
 
             let z = &rap_challenges[LOGUP_CHALLENGE_Z];
-            let shifts = PackingShifts::<A>::new();
 
             // Clear denominators of absorbed interactions
             debug_assert!(matches!(absorbed.len(), 1 | 2));
@@ -2184,6 +2188,7 @@ where
                 logup_table_offset,
                 rap_challenges,
                 logup_alpha_powers,
+                packing_shifts,
                 ..
             } => evaluate_accumulated_constraint(
                 frame.get_evaluation_step(0),
@@ -2194,12 +2199,14 @@ where
                 &self.absorbed,
                 rap_challenges,
                 logup_alpha_powers,
+                packing_shifts,
             ),
             TransitionEvaluationContext::Verifier {
                 frame,
                 logup_table_offset,
                 rap_challenges,
                 logup_alpha_powers,
+                packing_shifts,
                 ..
             } => evaluate_accumulated_constraint(
                 frame.get_evaluation_step(0),
@@ -2210,6 +2217,7 @@ where
                 &self.absorbed,
                 rap_challenges,
                 logup_alpha_powers,
+                packing_shifts,
             ),
         };
 
