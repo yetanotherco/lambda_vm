@@ -247,6 +247,16 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // address_add[i] is VIRTUAL:
     //   lo = base_address_0 + (i+1) - 2^32 * add_limb_overflow[i]
     //   hi = base_address_1 + add_limb_overflow[i]
+    //
+    // Safety: `hi` is at most `base_address_1 + 1`. This never reaches 2^32
+    // because the CPU table splits addresses into (lo, hi) with both halves
+    // in [0, 2^32), and the Memw bus ties MEMW's base_address to the CPU's
+    // value. MEMW only receives accesses where base_address_1 <= 0xFFFF_FFFE
+    // (addresses near u64::MAX are rejected by the executor before proving).
+    // Consequently, `add_limb_overflow[i]` is implicitly correct: a wrong
+    // carry bit produces a memory token at a wrong address that has no
+    // matching PAGE/REGISTER token, causing multiset imbalance and an
+    // invalid proof.
 
     // CM8: memory[is_register, base_address, old_timestamp[0], old[0]] with +μ_sum
     interactions.push(BusInteraction::sender(
@@ -1054,6 +1064,27 @@ mod tests {
         for i in 0..7 {
             let val = trace2.get_main(0, cols::ADD_LIMB_OVERFLOW[i]);
             assert_eq!(*val, FE::zero(), "overflow[{i}] should be 0");
+        }
+
+        // Address 0xFFFF_FFFE with width=8 exercises mixed per-byte carry bits:
+        // overflow[0]=0 (0xFFFF_FFFE+1 = 0xFFFF_FFFF < 2^32)
+        // overflow[1..6]=1 (0xFFFF_FFFE+2..8 >= 2^32)
+        let op3 =
+            MemwOperation::new(false, 0xFFFF_FFFE, [0; 8], 100, 8, false).with_old([0; 8], [50; 8]);
+        let trace3 = generate_memw_trace(&[op3]);
+        let val0 = trace3.get_main(0, cols::ADD_LIMB_OVERFLOW[0]);
+        assert_eq!(
+            *val0,
+            FE::zero(),
+            "overflow[0] should be 0 for base 0xFFFF_FFFE"
+        );
+        for i in 1..7 {
+            let val = trace3.get_main(0, cols::ADD_LIMB_OVERFLOW[i]);
+            assert_eq!(
+                *val,
+                FE::one(),
+                "overflow[{i}] should be 1 for base 0xFFFF_FFFE"
+            );
         }
     }
 }
