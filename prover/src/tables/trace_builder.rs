@@ -832,6 +832,9 @@ fn collect_lt_from_memw(memw_ops: &[MemwOperation]) -> Vec<LtOperation> {
 ///
 /// Each aligned operation has a single old_timestamp < timestamp check.
 fn collect_lt_from_memw_aligned(memw_aligned_ops: &[MemwOperation]) -> Vec<LtOperation> {
+    // Address overflow LT checks (R1-R3 in MEMW) are intentionally absent.
+    // Alignment guarantees addr + (width-1) never wraps: the largest width-N
+    // aligned address is 2^64-N, and 2^64-N+(N-1) = 2^64-1, so no u64 overflow.
     memw_aligned_ops
         .iter()
         .map(|op| LtOperation::new(op.old_timestamp[0], op.timestamp, false))
