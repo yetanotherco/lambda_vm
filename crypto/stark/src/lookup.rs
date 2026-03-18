@@ -29,6 +29,8 @@ use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 pub const SHIFT_8: u64 = 256;
 /// 2^16 - shift for combining halves
 pub const SHIFT_16: u64 = 65536;
+/// 2^24 - shift for combining 3-byte positions
+pub const SHIFT_24: u64 = 1 << 24;
 /// 2^32 - shift for combining words
 pub const SHIFT_32: u64 = 4294967296;
 
@@ -262,7 +264,7 @@ impl Packing {
             Packing::Word4L => {
                 let shift_8 = FieldElement::<F>::from(SHIFT_8);
                 let shift_16 = FieldElement::<F>::from(SHIFT_16);
-                let shift_24 = &shift_8 * &shift_16;
+                let shift_24 = FieldElement::<F>::from(SHIFT_24);
                 let combined = &main_cols[start_col][row]
                     + &main_cols[start_col + 1][row] * &shift_8
                     + &main_cols[start_col + 2][row] * &shift_16
@@ -308,7 +310,7 @@ impl Packing {
                 // 2× Word4L
                 let shift_8 = FieldElement::<F>::from(SHIFT_8);
                 let shift_16 = FieldElement::<F>::from(SHIFT_16);
-                let shift_24 = &shift_8 * &shift_16;
+                let shift_24 = FieldElement::<F>::from(SHIFT_24);
                 let w0 = &main_cols[start_col][row]
                     + &main_cols[start_col + 1][row] * &shift_8
                     + &main_cols[start_col + 2][row] * &shift_16
@@ -373,7 +375,7 @@ impl Packing {
             Packing::Word4L => {
                 let shift_8 = FieldElement::<A>::from(SHIFT_8);
                 let shift_16 = FieldElement::<A>::from(SHIFT_16);
-                let shift_24 = &shift_8 * &shift_16;
+                let shift_24 = FieldElement::<A>::from(SHIFT_24);
                 let combined = step.get_main_evaluation_element(0, start_col)
                     + step.get_main_evaluation_element(0, start_col + 1) * &shift_8
                     + step.get_main_evaluation_element(0, start_col + 2) * &shift_16
@@ -419,7 +421,7 @@ impl Packing {
             Packing::DWordBL => {
                 let shift_8 = FieldElement::<A>::from(SHIFT_8);
                 let shift_16 = FieldElement::<A>::from(SHIFT_16);
-                let shift_24 = &shift_8 * &shift_16;
+                let shift_24 = FieldElement::<A>::from(SHIFT_24);
                 let w0 = step.get_main_evaluation_element(0, start_col)
                     + step.get_main_evaluation_element(0, start_col + 1) * &shift_8
                     + step.get_main_evaluation_element(0, start_col + 2) * &shift_16
@@ -493,7 +495,7 @@ impl Packing {
                 // b₀ + 2⁸·b₁ + 2¹⁶·b₂ + 2²⁴·b₃
                 let shift_8 = FieldElement::<E>::from(SHIFT_8);
                 let shift_16 = FieldElement::<E>::from(SHIFT_16);
-                let shift_24 = &shift_8 * &shift_16;
+                let shift_24 = FieldElement::<E>::from(SHIFT_24);
                 vec![
                     &columns[0]
                         + &columns[1] * &shift_8
@@ -1647,12 +1649,12 @@ where
     (0..trace_len)
         .map(|row| {
             let a = if negate_a {
-                -all_fingerprints[row].clone()
+                -&all_fingerprints[row]
             } else {
                 all_fingerprints[row].clone()
             };
             let b = if negate_b {
-                -all_fingerprints[trace_len + row].clone()
+                -&all_fingerprints[trace_len + row]
             } else {
                 all_fingerprints[trace_len + row].clone()
             };
@@ -1709,7 +1711,7 @@ where
         .map(|row| {
             // Unit side: just ±fp_inv (no multiplicity multiply)
             let term_unit = if negate_unit {
-                -all_fingerprints[row].clone()
+                -&all_fingerprints[row]
             } else {
                 all_fingerprints[row].clone()
             };
@@ -2122,12 +2124,12 @@ where
                     let term_a = if interaction_a.is_sender {
                         fp_b.clone()
                     } else {
-                        -fp_b.clone()
+                        -&fp_b
                     };
                     let term_b = if interaction_b.is_sender {
                         fp_a.clone()
                     } else {
-                        -fp_a.clone()
+                        -&fp_a
                     };
                     c * &fp_a * &fp_b - term_a - term_b
                 }
@@ -2137,7 +2139,7 @@ where
                     let term_a = if interaction_a.is_sender {
                         fp_b.clone()
                     } else {
-                        -fp_b.clone()
+                        -&fp_b
                     };
                     let term_b = m_b * &fp_a;
                     let term_b = if interaction_b.is_sender {
@@ -2159,7 +2161,7 @@ where
                     let term_b = if interaction_b.is_sender {
                         fp_a.clone()
                     } else {
-                        -fp_a.clone()
+                        -&fp_a
                     };
                     c * &fp_a * &fp_b - term_a - term_b
                 }
