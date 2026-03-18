@@ -237,8 +237,8 @@ pub fn generate_commit_trace(
 ///
 /// The COMMIT table:
 /// - **Receives** EcallCommit from CPU with `[timestamp_lo, timestamp_hi]` (mult = first)
-/// - **Sends** to CommitNextByte with `[timestamp, address_incr, count_decr]` (mult = mu - end)
-/// - **Receives** from CommitNextByte with `[timestamp, address, count]` (mult = mu - first)
+/// - **Sends** to CommitNextByte with `[timestamp, index + 1, address_incr, count_decr]` (mult = mu - end)
+/// - **Receives** from CommitNextByte with `[timestamp, index, address, count]` (mult = mu - first)
 /// - **Sends** to IsHalfword for count_decr range checks (×4, mult = mu)
 /// - **Sends** to IsHalfword for address_incr range checks (×4, mult = mu)
 /// - **Sends** to Zero for end detection (mult = mu)
