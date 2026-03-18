@@ -1060,3 +1060,6 @@ if __name__ == "__main__":
         reported |= reporter.reported
     if reported:
         sys.exit(1)
+    else:
+        print("No issues were found.")
+        sys.exit(0)
