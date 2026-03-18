@@ -211,7 +211,11 @@ impl AddLinearTerm {
                 column,
             } => {
                 let col_val = step.get_main_evaluation_element(0, *column);
-                col_val * FieldElement::<F>::from(*coefficient)
+                match *coefficient {
+                    1 => col_val.clone(),
+                    -1 => -col_val.clone(),
+                    c => col_val * FieldElement::<F>::from(c),
+                }
             }
             AddLinearTerm::Constant(value) => FieldElement::<F>::from(*value),
         }
