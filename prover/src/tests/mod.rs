@@ -1,3 +1,5 @@
+#[cfg(all(test, feature = "disk-spill"))]
+pub mod disk_spill_tests;
 #[cfg(test)]
 pub mod bitwise_bus_tests;
 #[cfg(test)]
