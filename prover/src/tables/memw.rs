@@ -248,7 +248,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     //   lo = base_address_0 + (i+1) - 2^32 * add_limb_overflow[i]
     //   hi = base_address_1 + add_limb_overflow[i]
 
-    // CM16: memory[is_register, base_address, old_timestamp[0], old[0]] with +μ_sum
+    // CM8: memory[is_register, base_address, old_timestamp[0], old[0]] with +μ_sum
     interactions.push(BusInteraction::sender(
         BusId::Memory,
         Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE),
@@ -280,7 +280,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // CM17: memory[is_register, base_address, timestamp, value[0]] with -μ_sum
+    // CM9: memory[is_register, base_address, timestamp, value[0]] with -μ_sum
     interactions.push(BusInteraction::receiver(
         BusId::Memory,
         Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE),
@@ -312,7 +312,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // CM18/19: byte 1, multiplicity w2 = write2 + write4 + write8
+    // CM10/11: byte 1, multiplicity w2 = write2 + write4 + write8
     // address_add[0] is virtual: lo = base_address_0 + 1 - 2^32 * overflow[0]
     //                            hi = base_address_1 + overflow[0]
     let w2_mult = Multiplicity::Linear(vec![
@@ -352,7 +352,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         },
     ]);
 
-    // CM18: send old token for byte 1
+    // CM10: send old token for byte 1
     interactions.push(BusInteraction::sender(
         BusId::Memory,
         w2_mult.clone(),
@@ -378,7 +378,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // CM19: receive new token for byte 1
+    // CM11: receive new token for byte 1
     interactions.push(BusInteraction::receiver(
         BusId::Memory,
         w2_mult,
@@ -404,7 +404,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // CM20/21: bytes 2-3 with multiplicity w4 = write4 + write8
+    // CM12/13: bytes 2-3 with multiplicity w4 = write4 + write8
     for i in 2..=3 {
         let overflow_col = cols::ADD_LIMB_OVERFLOW[i - 1];
         let addr_add_lo = BusValue::linear(vec![
@@ -482,7 +482,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
-    // CM22/23: bytes 4-7 with multiplicity write8
+    // CM14/15: bytes 4-7 with multiplicity write8
     for i in 4..=7 {
         let overflow_col = cols::ADD_LIMB_OVERFLOW[i - 1];
         let addr_add_lo = BusValue::linear(vec![
@@ -561,7 +561,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     }
 
     // -------------------------------------------------------------------------
-    // CO24: Read receiver (from CPU)
+    // CO16: Read receiver (from CPU)
     // -------------------------------------------------------------------------
     interactions.push(BusInteraction::receiver(
         BusId::Memw,
@@ -673,7 +673,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // CO25: Write receiver (from CPU)
+    // CO17: Write receiver (from CPU)
     // -------------------------------------------------------------------------
     interactions.push(BusInteraction::receiver(
         BusId::Memw,
@@ -752,7 +752,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // LT interactions for timestamp ordering (MEMW-C4 through MEMW-C7)
+    // LT interactions for timestamp ordering (MEMW-C4 through C7)
     // -------------------------------------------------------------------------
 
     // MEMW-C4: LT[1; old_timestamp[0], timestamp] with μ_sum
