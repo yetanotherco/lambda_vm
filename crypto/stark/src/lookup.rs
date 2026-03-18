@@ -1989,8 +1989,8 @@ where
             let m_a = compute_multiplicity_from_step(step, &interaction_a.multiplicity);
             let m_b = compute_multiplicity_from_step(step, &interaction_b.multiplicity);
 
-            let fp_a = compute_fingerprint_from_step(step, interaction_a, z, alpha_powers, &shifts);
-            let fp_b = compute_fingerprint_from_step(step, interaction_b, z, alpha_powers, &shifts);
+            let fp_a = compute_fingerprint_from_step(step, interaction_a, z, alpha_powers, shifts);
+            let fp_b = compute_fingerprint_from_step(step, interaction_b, z, alpha_powers, shifts);
 
             // c * fp_a * fp_b - sign_a * m_a * fp_b - sign_b * m_b * fp_a = 0
             // Use conditional negation instead of E×E sign multiplication
@@ -2144,7 +2144,7 @@ where
                         &absorbed[0],
                         z,
                         alpha_powers,
-                        &shifts,
+                        shifts,
                     );
                     let sign: FieldElement<B> = if absorbed[0].is_sender {
                         FieldElement::one()
@@ -2163,14 +2163,14 @@ where
                         &absorbed[0],
                         z,
                         alpha_powers,
-                        &shifts,
+                        shifts,
                     );
                     let f2 = compute_fingerprint_from_step(
                         second_step,
                         &absorbed[1],
                         z,
                         alpha_powers,
-                        &shifts,
+                        shifts,
                     );
                     let term1 = m1 * &f2;
                     let term1 = if absorbed[0].is_sender { term1 } else { -term1 };
