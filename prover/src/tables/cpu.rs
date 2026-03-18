@@ -368,48 +368,40 @@ impl CpuOperation {
         }
     }
 
-    /// Compute arg2 based on instruction type (returns imm or rv2 depending on opcode).
+    /// Compute arg2 following the spec formula exactly (CPU-CE62/CE63).
     ///
-    /// Per spec constraint for arg2[4:]:
-    /// (1-LOAD) * ((1-word_instr)*rv2[2] + signed*arg2_sign_bit*(2^32-1)) + (1-BEQ-BLT-STORE)*imm[1]
+    /// arg2[:4] = (1-LOAD)*rv2[:2] + (1-BEQ-BLT-STORE)*imm[0]
+    /// arg2[4:] = (1-LOAD)*((1-word_instr)*rv2[2] + signed*arg2_sign_bit*(2^32-1))
+    ///            + (1-BEQ-BLT-STORE)*imm[1]
     ///
-    /// For LOAD: uses imm (full 64-bit, for address calculation)
-    /// For STORE: uses rv2 (byte-decomposed data to store; address via separate ADD)
-    /// For BEQ/BLT: uses rv2 (full 64-bit, comparing register values)
-    /// Otherwise: uses imm (when rs2=0) or rv2, with sign extension for signed word instructions
+    /// Per CPU-A2, the decode guarantees that at most one of rv2/imm is non-zero
+    /// when STORE+LOAD+BEQ+BLT=0, so the addition acts as a selection.
     pub fn compute_arg2(&self) -> u64 {
-        if self.decode.op_load {
-            // LOAD: address = rv1 + imm, use full imm
-            self.decode.imm
-        } else if self.decode.op_store {
-            // STORE: arg2 = rv2 (byte-decomposed data to store)
-            // Address computed separately as res = arg1 + imm
-            self.rv2
-        } else if self.decode.op_beq || self.decode.op_blt {
-            // BEQ/BLT: compare rv1 vs rv2, use full rv2
-            self.rv2
-        } else {
-            // For other ops, use imm (when rs2=0) or rv2
-            let base = if self.decode.rs2 == 0 {
-                self.decode.imm
-            } else {
-                self.rv2
-            };
+        let d = &self.decode;
 
-            // For word instructions, apply sign/zero extension based on signed flag
-            if self.decode.word_instr {
-                let lower_32 = base & 0xFFFF_FFFF;
-                if self.decode.signed && Self::sign_bit_32(base) {
-                    // Sign extend: set upper 32 bits to all 1s
-                    lower_32 | (0xFFFF_FFFF_u64 << 32)
-                } else {
-                    // Zero extend: upper 32 bits are 0
-                    lower_32
-                }
+        // rv2 contribution: zeroed when LOAD (spec: (1-LOAD) factor)
+        let rv2_extended = if d.op_load {
+            0
+        } else if d.word_instr {
+            // Word-instruction sign/zero extension on upper 32 bits
+            let lower_32 = self.rv2 & 0xFFFF_FFFF;
+            if d.signed && Self::sign_bit_32(self.rv2) {
+                lower_32 | (0xFFFF_FFFF_u64 << 32)
             } else {
-                base
+                lower_32
             }
-        }
+        } else {
+            self.rv2
+        };
+
+        // imm contribution: zeroed when BEQ, BLT, or STORE (spec: (1-BEQ-BLT-STORE) factor)
+        let imm_contrib = if d.op_beq || d.op_blt || d.op_store {
+            0
+        } else {
+            d.imm
+        };
+
+        rv2_extended.wrapping_add(imm_contrib)
     }
 
     /// Extract sign bit of a 32-bit word (bit 31).
