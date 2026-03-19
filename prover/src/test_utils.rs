@@ -43,6 +43,10 @@ use crate::tables::dvrm::{
     bus_interactions as dvrm_bus_interactions, cols as dvrm_cols, dvrm_constraints,
 };
 use crate::tables::halt::{bus_interactions as halt_bus_interactions, cols as halt_cols};
+use crate::tables::keccak::{
+    bus_interactions as keccak_bus_interactions, cols as keccak_cols,
+    create_constraints as keccak_constraints,
+};
 use crate::tables::load::{
     bus_interactions as load_bus_interactions, cols as load_cols, constraints as load_constraints,
 };
@@ -739,6 +743,24 @@ pub fn create_page_air(proof_options: &ProofOptions, page_base: u64) -> VmAir {
         transition_constraints,
     )
     .with_name(&format!("PAGE:0x{:x}", page_base))
+}
+
+/// Create KECCAK AIR with constraints and bus interactions.
+pub fn create_keccak_air(proof_options: &ProofOptions) -> VmAir {
+    let (transition_constraints, _) = keccak_constraints(0);
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: keccak_bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        keccak_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+    .with_name("KECCAK")
 }
 
 /// Create REGISTER AIR with bus interactions.

@@ -40,6 +40,7 @@ use super::cpu::{self, CpuOperation};
 use super::decode;
 use super::dvrm::{self, DvrmOperation};
 use super::halt;
+use super::keccak::{self, KeccakOperation};
 use super::load::{self, LoadOperation};
 use super::lt::{self, LtOperation};
 use super::memw::{self, MemwOperation};
@@ -336,6 +337,12 @@ fn collect_ops_from_cpu(
             let commit_ops = collect_commit_memw_ops(op, register_state, memory_state);
             memw_ops.extend(commit_ops);
         }
+
+        // KeccakPermute ECALL: currently no MEMW operations generated.
+        // The keccak table proves the permutation internally. Memory reads/writes
+        // will be added when the keccak chip's byte-level bus interactions are implemented.
+        // For now, memory_state is NOT updated — the test program doesn't read keccak
+        // output back from memory, so PAGE tables remain consistent.
 
         // --- LT, SHIFT, and Bitwise (no state tracking needed) ---
 
@@ -1284,6 +1291,127 @@ fn expand_commit_operations(
     ops
 }
 
+/// Collects MEMW operations for a KeccakPermute ECALL.
+///
+/// Currently unused — will be enabled when the keccak chip implements
+/// Bus 14 (Memw) sender interactions with byte-level value columns.
+///
+/// Generates:
+/// - 1 register read (x10 = state_addr) at ts
+/// - 25 doubleword reads at ts (input state)
+/// - 25 doubleword writes at ts+1 (output state)
+///
+/// Also updates memory_state and register_state so subsequent operations see correct values.
+#[allow(dead_code, clippy::needless_range_loop)]
+fn collect_keccak_memw_ops(
+    op: &CpuOperation,
+    register_state: &mut RegisterState,
+    memory_state: &mut MemoryState,
+) -> Vec<MemwOperation> {
+    use executor::vm::instruction::execution::keccak_f1600;
+
+    let ts = op.timestamp;
+    let state_addr = op.keccak_state_addr;
+
+    let mut memw_ops = Vec::with_capacity(51);
+
+    // Read x10 (state_addr) at ts
+    {
+        let reg_value = pack_register_value(state_addr);
+        let reg_addr = 2 * 10u64; // x10 → addr 20
+        let (_old_val, old_ts) = register_state.read(10);
+        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
+        let memw_op = MemwOperation::new(true, reg_addr, reg_value, ts, 2, true)
+            .with_old(reg_value, old_timestamps);
+        memw_ops.push(memw_op);
+        register_state.write(10, state_addr, ts);
+    }
+
+    // Read 25 doublewords at ts
+    let mut input_state = [0u64; 25];
+    for (i, lane) in input_state.iter_mut().enumerate() {
+        let addr = state_addr.wrapping_add(i as u64 * 8);
+        let (values, old_timestamps) = memory_state.read_bytes(addr, 8);
+        *lane = values[0]
+            | (values[1] << 8)
+            | (values[2] << 16)
+            | (values[3] << 24)
+            | (values[4] << 32)
+            | (values[5] << 40)
+            | (values[6] << 48)
+            | (values[7] << 56);
+
+        let memw_op =
+            MemwOperation::new(false, addr, values, ts, 8, true).with_old(values, old_timestamps);
+        memw_ops.push(memw_op);
+        memory_state.write_bytes(addr, *lane, 8, ts);
+    }
+
+    // Compute output
+    let mut output_state = input_state;
+    keccak_f1600(&mut output_state);
+
+    // Write 25 doublewords at ts+1
+    for (i, &output_val) in output_state.iter().enumerate() {
+        let addr = state_addr.wrapping_add(i as u64 * 8);
+        let input_val = input_state[i];
+
+        let mut old_values = [0u64; 8];
+        for j in 0..8 {
+            old_values[j] = (input_val >> (j * 8)) & 0xFF;
+        }
+        let old_timestamps = [ts; 8];
+
+        let mut new_values = [0u64; 8];
+        for j in 0..8 {
+            new_values[j] = (output_val >> (j * 8)) & 0xFF;
+        }
+
+        let memw_op = MemwOperation::new(false, addr, new_values, ts + 1, 8, false)
+            .with_old(old_values, old_timestamps);
+        memw_ops.push(memw_op);
+        memory_state.write_bytes(addr, output_val, 8, ts + 1);
+    }
+
+    memw_ops
+}
+
+/// Expand Keccak ECALLs from CPU operations into KeccakOperations.
+///
+/// For each KeccakPermute ECALL, reads the 25-lane input state and computes the output.
+fn expand_keccak_operations(
+    cpu_ops: &[CpuOperation],
+    memory_state: &MemoryState,
+) -> Vec<KeccakOperation> {
+    use executor::vm::instruction::execution::keccak_f1600;
+
+    cpu_ops
+        .iter()
+        .filter(|op| op.ecall_keccak)
+        .map(|op| {
+            let state_addr = op.keccak_state_addr;
+            let mut input = [0u64; 25];
+            for (i, lane) in input.iter_mut().enumerate() {
+                let addr = state_addr.wrapping_add(i as u64 * 8);
+                let mut val = 0u64;
+                for byte_idx in 0..8 {
+                    let (byte_val, _ts) = memory_state.read_byte(addr.wrapping_add(byte_idx));
+                    val |= (byte_val as u64) << (byte_idx * 8);
+                }
+                *lane = val;
+            }
+            let mut output = input;
+            keccak_f1600(&mut output);
+            KeccakOperation {
+                timestamp: op.timestamp,
+                state_addr,
+                input,
+                output,
+            }
+        })
+        .collect()
+}
+
 /// Collect bitwise lookups from COMMIT operations.
 ///
 /// The COMMIT table sends:
@@ -1461,6 +1589,9 @@ pub struct Traces {
 
     /// COMMIT table for write syscall (byte-by-byte commit with recursive bus)
     pub commit: TraceTable<GoldilocksField, GoldilocksExtension>,
+
+    /// KECCAK table for keccak-f[1600] permutation precompile
+    pub keccak: TraceTable<GoldilocksField, GoldilocksExtension>,
 }
 
 /// Chunk raw ops and generate one trace table per chunk.
@@ -1728,6 +1859,9 @@ impl Traces {
         // COMMIT table sends IsByte and IsHalfword lookups
         bitwise_ops.extend(collect_bitwise_from_commit(&commit_ops));
 
+        // Expand Keccak ECALL operations
+        let keccak_ops = expand_keccak_operations(&cpu_ops, &memory_state);
+
         // CPU padding rows send IS_BYTE with all-zero values.
         // Add corresponding ops so the bitwise table multiplicities balance.
         let num_padding_rows: usize = cpu_ops
@@ -1778,9 +1912,10 @@ impl Traces {
         // Prepare register final state before scope (needs register_state ownership)
         let register_final_state = register_state.to_final_state_map();
 
-        // Generate remaining traces in parallel (page, register, halt, commit).
+        // Generate remaining traces in parallel (page, register, halt, commit, keccak).
         // chunk_and_generate already handled cpu, lt, memw, load, mul, dvrm, branch above.
         let commit_trace = commit::generate_commit_trace(&commit_ops);
+        let keccak_trace = keccak::generate_keccak_trace(&keccak_ops);
         let (pages, page_configs, register_trace, halt_trace);
         #[cfg(feature = "parallel")]
         {
@@ -1830,6 +1965,7 @@ impl Traces {
             branches,
             halt: halt_trace,
             commit: commit_trace,
+            keccak: keccak_trace,
         })
     }
 
@@ -1994,6 +2130,8 @@ impl Traces {
         let register_final_state = register_state.to_final_state_map();
 
         let commit_trace = commit::generate_commit_trace(&commit_ops);
+        let keccak_ops = expand_keccak_operations(&cpu_ops, &memory_state);
+        let keccak_trace = keccak::generate_keccak_trace(&keccak_ops);
 
         // Generate remaining traces in parallel (register, halt).
         // chunk_and_generate already handled cpu, lt, memw, load, mul, dvrm, branch above.
@@ -2034,6 +2172,7 @@ impl Traces {
             branches,
             halt: halt_trace,
             commit: commit_trace,
+            keccak: keccak_trace,
         })
     }
 

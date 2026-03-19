@@ -108,6 +108,8 @@ pub enum BusId {
     EcallCommit,
     /// COMMIT self-referencing recursive bus (row N → row N+1)
     CommitNextByte,
+    /// ECALL dispatch for KeccakPermute syscall (CPU → KECCAK)
+    EcallKeccak,
 }
 
 impl BusId {
@@ -136,6 +138,7 @@ impl BusId {
             BusId::Dvrm => "Dvrm",
             BusId::EcallCommit => "EcallCommit",
             BusId::CommitNextByte => "CommitNextByte",
+            BusId::EcallKeccak => "EcallKeccak",
         }
     }
 }
@@ -167,6 +170,7 @@ impl TryFrom<u64> for BusId {
             19 => Ok(BusId::Ecall),
             20 => Ok(BusId::EcallCommit),
             21 => Ok(BusId::CommitNextByte),
+            22 => Ok(BusId::EcallKeccak),
             other => Err(other),
         }
     }

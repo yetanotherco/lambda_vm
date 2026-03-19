@@ -13,7 +13,13 @@ pub enum SyscallNumbers {
     Commit = 3,
     GetPrivateInputs = 4,
     Halt = 93,
+    KeccakPermute = 94, // Actual syscall number is KECCAK_SYSCALL_NUMBER (u64::MAX - 1)
 }
+
+/// Syscall number for KeccakPermute (u64::MAX - 1 = 0xFFFF_FFFF_FFFF_FFFE).
+///
+/// Cannot be an enum discriminant because it exceeds isize::MAX.
+pub const KECCAK_SYSCALL_NUMBER: u64 = u64::MAX - 1;
 
 impl TryFrom<u64> for SyscallNumbers {
     type Error = ();
@@ -24,6 +30,7 @@ impl TryFrom<u64> for SyscallNumbers {
             3 => Ok(SyscallNumbers::Commit),
             4 => Ok(SyscallNumbers::GetPrivateInputs),
             93 => Ok(SyscallNumbers::Halt),
+            v if v == KECCAK_SYSCALL_NUMBER => Ok(SyscallNumbers::KeccakPermute),
             _ => Err(()),
         }
     }
@@ -326,6 +333,19 @@ impl Instruction {
                             memory.store_byte(pointer + i as u64, *byte);
                         }
                     }
+                    SyscallNumbers::KeccakPermute => {
+                        // keccak-f[1600] permutation on 200 bytes (25 × u64) at address in x10
+                        let state_addr = registers.read(10)?;
+                        let mut state = [0u64; 25];
+                        for (i, lane) in state.iter_mut().enumerate() {
+                            *lane = memory.load_doubleword(state_addr + (i as u64) * 8)?;
+                        }
+                        keccak_f1600(&mut state);
+                        for (i, &lane) in state.iter().enumerate() {
+                            memory.store_doubleword(state_addr + (i as u64) * 8, lane)?;
+                        }
+                        src2_val = state_addr;
+                    }
                     SyscallNumbers::Halt => {
                         // halt
                         return Ok(Log {
@@ -474,6 +494,88 @@ impl Comparison {
     }
 }
 
+// =============================================================================
+// Keccak-f[1600] permutation
+// =============================================================================
+
+/// Round constants for Keccak-f[1600] (24 rounds).
+const KECCAK_RC: [u64; 24] = [
+    0x0000000000000001,
+    0x0000000000008082,
+    0x800000000000808A,
+    0x8000000080008000,
+    0x000000000000808B,
+    0x0000000080000001,
+    0x8000000080008081,
+    0x8000000000008009,
+    0x000000000000008A,
+    0x0000000000000088,
+    0x0000000080008009,
+    0x000000008000000A,
+    0x000000008000808B,
+    0x800000000000008B,
+    0x8000000000008089,
+    0x8000000000008003,
+    0x8000000000008002,
+    0x8000000000000080,
+    0x000000000000800A,
+    0x800000008000000A,
+    0x8000000080008081,
+    0x8000000000008080,
+    0x0000000080000001,
+    0x8000000080008008,
+];
+
+/// Rotation offsets R[x][y] for the rho step of Keccak-f[1600].
+const KECCAK_RHO: [[u32; 5]; 5] = [
+    [0, 36, 3, 41, 18],
+    [1, 44, 10, 45, 2],
+    [62, 6, 43, 15, 61],
+    [28, 55, 25, 21, 56],
+    [27, 20, 39, 8, 14],
+];
+
+/// Apply the Keccak-f[1600] permutation (24 rounds) to a 25-word state.
+///
+/// The state is indexed as `state[x + 5*y]` where `x, y ∈ {0..4}`.
+pub fn keccak_f1600(state: &mut [u64; 25]) {
+    for &rc in &KECCAK_RC {
+        // θ (theta)
+        let mut c = [0u64; 5];
+        for x in 0..5 {
+            c[x] = state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20];
+        }
+        let mut d = [0u64; 5];
+        for x in 0..5 {
+            d[x] = c[(x + 4) % 5] ^ c[(x + 1) % 5].rotate_left(1);
+        }
+        for x in 0..5 {
+            for y in 0..5 {
+                state[x + 5 * y] ^= d[x];
+            }
+        }
+
+        // ρ (rho) and π (pi)
+        let mut b = [0u64; 25];
+        for x in 0..5 {
+            for y in 0..5 {
+                b[y + 5 * ((2 * x + 3 * y) % 5)] = state[x + 5 * y].rotate_left(KECCAK_RHO[x][y]);
+            }
+        }
+
+        // χ (chi)
+        for x in 0..5 {
+            for y in 0..5 {
+                state[x + 5 * y] =
+                    b[x + 5 * y] ^ (!b[(x + 1) % 5 + 5 * y] & b[(x + 2) % 5 + 5 * y]);
+            }
+        }
+
+        // ι (iota)
+        state[0] ^= rc;
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum ExecutionError {
     #[error("Sub immediate instruction is not supported")]
@@ -498,4 +600,65 @@ pub enum ExecutionError {
     InvalidWSuffixOperation(ArithOp),
     #[error("Invalid commit fd: expected 1 (stdout), got {0}")]
     InvalidCommitFd(u64),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test keccak-f[1600] on the all-zeros input.
+    ///
+    /// Reference: NIST FIPS 202, or the Keccak team's test vectors.
+    /// The expected output is the state after applying keccak-f[1600] to 25 zero u64s.
+    #[test]
+    fn test_keccak_f1600_zero_input() {
+        let mut state = [0u64; 25];
+        keccak_f1600(&mut state);
+
+        // Expected output verified against tiny-keccak crate
+        let expected: [u64; 25] = [
+            0xF1258F7940E1DDE7,
+            0x84D5CCF933C0478A,
+            0xD598261EA65AA9EE,
+            0xBD1547306F80494D,
+            0x8B284E056253D057,
+            0xFF97A42D7F8E6FD4,
+            0x90FEE5A0A44647C4,
+            0x8C5BDA0CD6192E76,
+            0xAD30A6F71B19059C,
+            0x30935AB7D08FFC64,
+            0xEB5AA93F2317D635,
+            0xA9A6E6260D712103,
+            0x81A57C16DBCF555F,
+            0x43B831CD0347C826,
+            0x01F22F1A11A5569F,
+            0x05E5635A21D9AE61,
+            0x64BEFEF28CC970F2,
+            0x613670957BC46611,
+            0xB87C5A554FD00ECB,
+            0x8C3EE88A1CCF32C8,
+            0x940C7922AE3A2614,
+            0x1841F924A2C509E4,
+            0x16F53526E70465C2,
+            0x75F644E97F30A13B,
+            0xEAF1FF7B5CECA249,
+        ];
+
+        assert_eq!(state, expected, "keccak-f[1600] on zero input mismatch");
+    }
+
+    /// Test keccak-f[1600] is a permutation (applying it multiple times yields distinct states).
+    #[test]
+    fn test_keccak_f1600_nonzero_input() {
+        let mut state = [0u64; 25];
+        state[0] = 1; // single bit set
+        let original = state;
+        keccak_f1600(&mut state);
+
+        // Output should differ from input
+        assert_ne!(state, original);
+
+        // State should not be all zeros
+        assert!(state.iter().any(|&x| x != 0));
+    }
 }

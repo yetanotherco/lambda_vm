@@ -85,6 +85,7 @@ pub const BIT_FLAG_COLUMNS: &[usize] = &[
     cols::DIVREM,
     cols::ECALL,
     cols::ECALL_COMMIT,
+    cols::ECALL_KECCAK,
     cols::EBREAK,
     // Sign bits
     cols::RV1_SIGN_BIT,
@@ -136,6 +137,80 @@ impl EcallCommitImpliesEcallConstraint {
 
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension>
     for EcallCommitImpliesEcallConstraint
+{
+    fn degree(&self) -> usize {
+        2
+    }
+
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+
+    fn end_exemptions(&self) -> usize {
+        0
+    }
+
+    fn evaluate(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<GoldilocksField, GoldilocksExtension>,
+        transition_evaluations: &mut [FieldElement<GoldilocksExtension>],
+    ) {
+        match evaluation_context {
+            TransitionEvaluationContext::Prover {
+                frame,
+                periodic_values: _,
+                rap_challenges: _,
+                ..
+            } => {
+                let constraint_value = self.compute(frame.get_evaluation_step(0));
+                transition_evaluations[self.constraint_idx] = constraint_value.to_extension();
+            }
+
+            TransitionEvaluationContext::Verifier {
+                frame,
+                periodic_values: _,
+                rap_challenges: _,
+                ..
+            } => {
+                let constraint_value = self.compute(frame.get_evaluation_step(0));
+                transition_evaluations[self.constraint_idx] = constraint_value;
+            }
+        }
+    }
+}
+
+// =========================================================================
+// ECALL_KECCAK Implication Constraint
+// =========================================================================
+
+/// Constraint: ECALL_KECCAK * (1 - ECALL) = 0
+///
+/// Ensures ECALL_KECCAK can only be 1 when ECALL is 1.
+pub struct EcallKeccakImpliesEcallConstraint {
+    constraint_idx: usize,
+}
+
+impl EcallKeccakImpliesEcallConstraint {
+    pub fn new(constraint_idx: usize) -> Self {
+        Self { constraint_idx }
+    }
+
+    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        let ecall_keccak = step
+            .get_main_evaluation_element(0, cols::ECALL_KECCAK)
+            .clone();
+        let ecall = step.get_main_evaluation_element(0, cols::ECALL).clone();
+        let one = FieldElement::<F>::one();
+        ecall_keccak * (one - ecall)
+    }
+}
+
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension>
+    for EcallKeccakImpliesEcallConstraint
 {
     fn degree(&self) -> usize {
         2
@@ -1346,11 +1421,12 @@ pub fn create_jalr_constraints(constraint_idx_start: usize) -> (Vec<AddConstrain
 /// - rv1 zero-forcing (CM48): 3 (rv1[0..2] when read_register1 = 0)
 /// - rv2 zero-forcing (CM50): 3 (rv2[0..2] when read_register2 = 0)
 /// - ECALL_COMMIT implies ECALL: 1
+/// - ECALL_KECCAK implies ECALL: 1
 /// - Next PC (non-branching): 2
 ///
-/// Total: 66 constraints (33 IS_BIT + 8 ADD + 25 other)
+/// Total: 68 constraints (34 IS_BIT + 8 ADD + 26 other)
 pub const NUM_CPU_CONSTRAINTS: usize =
-    33 + 2 + 2 + 2 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 7 + 1 + 3 + 3 + 1 + 2;
+    34 + 2 + 2 + 2 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 7 + 1 + 3 + 3 + 1 + 1 + 2;
 
 /// Creates all CPU constraints.
 ///
@@ -1445,6 +1521,10 @@ pub fn create_all_cpu_constraints() -> (
 
     // ECALL_COMMIT implies ECALL
     other.push(Box::new(EcallCommitImpliesEcallConstraint::new(next_idx)));
+    next_idx += 1;
+
+    // ECALL_KECCAK implies ECALL
+    other.push(Box::new(EcallKeccakImpliesEcallConstraint::new(next_idx)));
     next_idx += 1;
 
     // Next PC (non-branching) constraints
