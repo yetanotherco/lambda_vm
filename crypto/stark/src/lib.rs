@@ -8,6 +8,8 @@ pub mod examples;
 pub mod frame;
 pub mod fri;
 pub mod grinding;
+#[cfg(feature = "instruments")]
+pub mod instruments;
 pub mod lookup;
 pub mod proof;
 pub mod prover;
