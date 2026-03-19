@@ -9,8 +9,8 @@ const MAX_PRIVATE_INPUT_SIZE: usize = 6700000;
 enum SyscallNumbers {
     Print = 1,
     Panic = 2,
-    Commit = 3,
     GetPrivateInputs = 4,
+    Commit = 64,
     Halt = 93,
 }
 

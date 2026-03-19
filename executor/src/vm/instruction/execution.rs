@@ -10,8 +10,8 @@ const REGULAR_PC_UPDATE: u64 = 4;
 pub enum SyscallNumbers {
     Print = 1,
     Panic = 2,
-    Commit = 3,
     GetPrivateInputs = 4,
+    Commit = 64,
     Halt = 93,
 }
 
@@ -21,8 +21,8 @@ impl TryFrom<u64> for SyscallNumbers {
         match value {
             1 => Ok(SyscallNumbers::Print),
             2 => Ok(SyscallNumbers::Panic),
-            3 => Ok(SyscallNumbers::Commit),
             4 => Ok(SyscallNumbers::GetPrivateInputs),
+            64 => Ok(SyscallNumbers::Commit),
             93 => Ok(SyscallNumbers::Halt),
             _ => Err(()),
         }
