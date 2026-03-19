@@ -33,7 +33,7 @@ fn p3_matrix(n: usize) -> RowMajorMatrix<Goldilocks> {
 
 fn bench_fft_comparison(c: &mut Criterion) {
     // Same log sizes as Plonky3's own FFT benchmark.
-    let log_sizes: &[u32] = &[14, 16, 18, 20];
+    let log_sizes: &[u32] = &[16, 18, 20, 22];
 
     for &log_n in log_sizes {
         let n = 1usize << log_n;
