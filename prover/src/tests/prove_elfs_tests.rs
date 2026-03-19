@@ -609,6 +609,10 @@ fn test_prove_elfs_test_sb_sh_8() {
     let (elf, logs, _instructions) = run_asm_elf("test_sb_sh_8");
     let mut traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default()).unwrap();
     assert!(
+        !traces.memws.is_empty(),
+        "test_sb_sh_8 should produce MEMW rows for byte/halfword memory accesses"
+    );
+    assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "test_sb_sh_8 failed"
     );
@@ -1227,25 +1231,13 @@ fn test_debug_memory_tokens_sb_sh() {
             let val1 = memw.main_table.get(row, memw_cols::VALUE[1]).to_raw();
             let old1 = memw.main_table.get(row, memw_cols::OLD[1]).to_raw();
 
-            // address_add(0) = base + 1, stored as DWordHL
-            let addr1_lo0 = memw
+            // address_add(0) = base + 1, now virtual (computed from base + overflow)
+            let overflow0 = memw
                 .main_table
-                .get(row, memw_cols::address_add(0)[0])
+                .get(row, memw_cols::ADD_LIMB_OVERFLOW[0])
                 .to_raw();
-            let addr1_lo1 = memw
-                .main_table
-                .get(row, memw_cols::address_add(0)[1])
-                .to_raw();
-            let addr1_hi0 = memw
-                .main_table
-                .get(row, memw_cols::address_add(0)[2])
-                .to_raw();
-            let addr1_hi1 = memw
-                .main_table
-                .get(row, memw_cols::address_add(0)[3])
-                .to_raw();
-            let addr1_lo = addr1_lo0 + (addr1_lo1 << 16);
-            let addr1_hi = addr1_hi0 + (addr1_hi1 << 16);
+            let addr1_lo = base_lo + 1 - overflow0 * (1u64 << 32);
+            let addr1_hi = base_hi + overflow0;
 
             // CM16: SEND old token for byte 1
             let send_token1: Token = (is_reg, addr1_lo, addr1_hi, old_ts1_lo, old_ts1_hi, old1);
