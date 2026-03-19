@@ -136,7 +136,7 @@ pub fn generate_memw_aligned_trace(
 }
 
 // =========================================================================
-// Bus interactions (22 total)
+// Bus interactions (20 total)
 // =========================================================================
 
 pub fn bus_interactions() -> Vec<BusInteraction> {
