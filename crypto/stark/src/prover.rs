@@ -5,9 +5,9 @@ use std::time::Instant;
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use math::fft::cpu::bit_reversing::{in_place_bit_reverse_permute, reverse_index};
-use sha3::Digest;
 use math::fft::cpu::bowers_fft::LayerTwiddles;
 use math::fft::errors::FFTError;
+use sha3::Digest;
 
 use log::info;
 use math::field::traits::{IsField, IsSubFieldOf};
@@ -732,8 +732,7 @@ pub trait IsStarkProver<
             })
             .collect();
 
-        let tree =
-            BatchedMerkleTree::<FieldExtension>::build_from_hashed_leaves(hashed_leaves)?;
+        let tree = BatchedMerkleTree::<FieldExtension>::build_from_hashed_leaves(hashed_leaves)?;
         let root = tree.root;
         Some((tree, root))
     }
