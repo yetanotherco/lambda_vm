@@ -295,14 +295,14 @@ fn test_different_signed_flags_separate_rows() {
 fn test_bus_interactions_count() {
     let interactions = bus_interactions();
     // Expected interactions:
-    // - 20x IS_HALF senders (n×4, d×4, r×4, n_sub_r×4, q×4)
+    // - 12x IS_HALF senders (r×4, n_sub_r×4, q×4) — n and d are assumptions (A1, A2)
     // - 3x MSB16 senders (sign_n, sign_r, sign_d)
     // - 1x LT sender (|r| < |d|)
     // - 2x MUL senders (n_sub_r = d*q lo + hi)
-    // - 6x ZERO senders (C3×2 NEG r, C5×2 NEG d, C8 overflow, C20 div_by_zero)
+    // - 6x ZERO senders (C3×2 NEG r, C5×2 NEG d, C8 overflow, C17 div_by_zero)
     // - 2x DVRM receivers (quotient, remainder)
-    // Total: 20 + 3 + 1 + 2 + 6 + 2 = 34
-    assert_eq!(interactions.len(), 34, "Expected 34 bus interactions");
+    // Total: 12 + 3 + 1 + 2 + 6 + 2 = 26
+    assert_eq!(interactions.len(), 26, "Expected 26 bus interactions");
 }
 
 #[test]

@@ -98,97 +98,152 @@ pub fn update_twiddles_in_place<F: IsField>(twiddles: &mut Vec<FieldElement<F>>)
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use math::fft::cpu::bit_reversing::reverse_index;
+    use super::fold_polynomial_doubled_inplace;
     use math::field::element::FieldElement;
-    use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
-    use math::field::traits::IsFFTField;
+    use math::field::goldilocks::GoldilocksField;
+    use math::polynomial::Polynomial;
 
-    type Gfe = FieldElement<GoldilocksField>;
+    type FE = FieldElement<GoldilocksField>;
 
-    /// Verifies that the verifier's domain-based twiddle computation matches
-    /// the prover's sequential fold for multi-fold (log_arity > 1).
-    #[test]
-    fn test_verifier_multifold_matches_prover() {
-        // 16-element evaluation array, log_arity=2 (fold 2x per round)
-        let domain_size = 16usize;
-        let coset_offset = Gfe::from(7u64);
-        let zeta = Gfe::from(13u64);
-
-        // Create arbitrary evaluations
-        let evals: Vec<Gfe> = (0..domain_size)
-            .map(|i| Gfe::from((i * 3 + 5) as u64))
-            .collect();
-
-        // === Prover path: fold 2x using sequential fold_evaluations_in_place ===
-        let mut prover_evals = evals.clone();
-        let mut inv_twiddles = compute_coset_twiddles_inv(&coset_offset, domain_size);
-        let mut challenge = zeta;
-
-        fold_evaluations_in_place(&mut prover_evals, &challenge, &inv_twiddles);
-        update_twiddles_in_place(&mut inv_twiddles);
-        challenge = challenge.square();
-        fold_evaluations_in_place(&mut prover_evals, &challenge, &inv_twiddles);
-
-        // prover_evals now has 4 elements (domain_size / 4)
-
-        // === Verifier path: for each group of 4, compute twiddles from domain and fold ===
-        let log_arity = 2usize;
-        let group_size = 1usize << log_arity;
-        let sub_offset_init = coset_offset;
-        let sub_domain_log_size_init = domain_size.trailing_zeros();
-
-        for (group_idx, prover_eval) in prover_evals.iter().enumerate() {
-            let group_start = group_idx * group_size;
-            let mut group_evals: Vec<Gfe> = evals[group_start..group_start + group_size].to_vec();
-
-            let mut sub_offset = sub_offset_init;
-            let mut sub_domain_log_size = sub_domain_log_size_init;
-            let mut local_start = group_start;
-            let mut ch = zeta;
-
-            for _ in 0..log_arity {
-                let half = group_evals.len() / 2;
-                let sub_root =
-                    GoldilocksField::get_primitive_root_of_unity(sub_domain_log_size as u64)
-                        .unwrap();
-                let tw_bits = sub_domain_log_size - 1;
-                let tw_domain_size = 1u64 << tw_bits;
-
-                let mut coset_pts: Vec<Gfe> = (0..half)
-                    .map(|j| {
-                        let gpi = local_start / 2 + j;
-                        let natural_idx = reverse_index(gpi, tw_domain_size);
-                        sub_offset * sub_root.pow(natural_idx)
-                    })
-                    .collect();
-                Gfe::inplace_batch_inverse(&mut coset_pts).unwrap();
-
-                let mut new_evals = Vec::with_capacity(half);
-                for j in 0..half {
-                    let lo = group_evals[2 * j];
-                    let hi = group_evals[2 * j + 1];
-                    let sum = lo + hi;
-                    let diff = lo - hi;
-                    new_evals.push(sum + coset_pts[j] * (ch * diff));
-                }
-
-                group_evals = new_evals;
-                sub_offset = sub_offset.square();
-                sub_domain_log_size -= 1;
-                ch = ch.square();
-                local_start /= 2;
-            }
-
-            assert_eq!(
-                group_evals.len(),
-                1,
-                "After log_arity folds, group should collapse to 1 element"
-            );
-            assert_eq!(
-                group_evals[0], *prover_eval,
-                "Group {group_idx}: verifier fold result doesn't match prover"
-            );
+    /// FRI polynomial folding: computes P_even(x) + beta * P_odd(x)
+    /// where P(x) = P_even(x^2) + x * P_odd(x^2)
+    fn fold_polynomial<F>(
+        poly: &Polynomial<FieldElement<F>>,
+        beta: &FieldElement<F>,
+    ) -> Polynomial<FieldElement<F>>
+    where
+        F: math::field::traits::IsField,
+    {
+        let coefficients = poly.coefficients();
+        if coefficients.is_empty() {
+            return Polynomial::new(&[]);
         }
+
+        let mut result = Vec::with_capacity(coefficients.len().div_ceil(2));
+
+        for chunk in coefficients.chunks(2) {
+            let folded = if chunk.len() == 2 {
+                &chunk[0] + &(&chunk[1] * beta)
+            } else {
+                chunk[0].clone()
+            };
+            result.push(folded);
+        }
+
+        Polynomial::new(&result)
+    }
+
+    /// FRI polynomial folding with fused doubling: 2 * (P_even(x) + beta * P_odd(x))
+    ///
+    /// Uses `double()` which is more efficient than multiplication by 2.
+    fn fold_polynomial_doubled<F>(
+        poly: &Polynomial<FieldElement<F>>,
+        beta: &FieldElement<F>,
+    ) -> Polynomial<FieldElement<F>>
+    where
+        F: math::field::traits::IsField,
+    {
+        let coefficients = poly.coefficients();
+        if coefficients.is_empty() {
+            return Polynomial::new(&[]);
+        }
+
+        let mut result = Vec::with_capacity(coefficients.len().div_ceil(2));
+
+        for chunk in coefficients.chunks(2) {
+            let folded = if chunk.len() == 2 {
+                (&chunk[0] + &(&chunk[1] * beta)).double()
+            } else {
+                chunk[0].double()
+            };
+            result.push(folded);
+        }
+
+        Polynomial::new(&result)
+    }
+
+    #[test]
+    fn test_fold_power_of_2() {
+        let p0 = Polynomial::new(&[
+            FE::new(3),
+            FE::new(1),
+            FE::new(2),
+            FE::new(7),
+            FE::new(3),
+            FE::new(5),
+            FE::new(4),
+            FE::new(2),
+        ]);
+        let beta = FE::new(4);
+        let p1 = fold_polynomial(&p0, &beta);
+        assert_eq!(
+            p1,
+            Polynomial::new(&[FE::new(7), FE::new(30), FE::new(23), FE::new(12)])
+        );
+
+        let gamma = FE::new(3);
+        let p2 = fold_polynomial(&p1, &gamma);
+        assert_eq!(p2, Polynomial::new(&[FE::new(97), FE::new(59)]));
+
+        let delta = FE::new(2);
+        let p3 = fold_polynomial(&p2, &delta);
+        assert_eq!(p3, Polynomial::new(&[FE::new(215)]));
+        assert_eq!(p3.degree(), 0);
+    }
+
+    #[test]
+    fn test_fold_size_2() {
+        let p2 = Polynomial::new(&[FE::new(10), FE::new(20)]);
+        let beta = FE::new(3);
+        let result = fold_polynomial(&p2, &beta);
+        assert_eq!(result, Polynomial::new(&[FE::new(70)]));
+    }
+
+    #[test]
+    fn test_inplace_matches_regular() {
+        let p0 = Polynomial::new(&[
+            FE::new(3),
+            FE::new(1),
+            FE::new(2),
+            FE::new(7),
+            FE::new(3),
+            FE::new(5),
+            FE::new(4),
+            FE::new(2),
+        ]);
+        let beta = FE::new(4);
+
+        // Test that in-place matches regular folding with doubling
+        let expected = fold_polynomial_doubled(&p0, &beta);
+        let mut p_inplace = p0.clone();
+        fold_polynomial_doubled_inplace(&mut p_inplace, &beta);
+        assert_eq!(p_inplace, expected);
+
+        // Test multiple folds
+        let gamma = FE::new(3);
+        let expected2 = fold_polynomial_doubled(&expected, &gamma);
+        fold_polynomial_doubled_inplace(&mut p_inplace, &gamma);
+        assert_eq!(p_inplace, expected2);
+
+        let delta = FE::new(2);
+        let expected3 = fold_polynomial_doubled(&expected2, &delta);
+        fold_polynomial_doubled_inplace(&mut p_inplace, &delta);
+        assert_eq!(p_inplace, expected3);
+    }
+
+    #[test]
+    fn test_inplace_empty() {
+        let mut p: Polynomial<FE> = Polynomial::new(&[]);
+        let beta = FE::new(4);
+        fold_polynomial_doubled_inplace(&mut p, &beta);
+        assert!(p.coefficients.is_empty());
+    }
+
+    #[test]
+    fn test_inplace_single() {
+        let mut p = Polynomial::new(&[FE::new(5)]);
+        let beta = FE::new(4);
+        fold_polynomial_doubled_inplace(&mut p, &beta);
+        assert_eq!(p, Polynomial::new(&[FE::new(10)])); // 5 * 2 = 10
     }
 }

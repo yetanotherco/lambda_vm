@@ -7,5 +7,6 @@ main:
 	li	a2, 100000
 	li	a3, 30000
 	mulw	a0, a2, a3
-	li	a7, 5
+	li	a0, 0
+	li	a7, 93
 	ecall

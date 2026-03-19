@@ -4,5 +4,6 @@ main:
 	# LUI: Maximum positive value
 	# lui x, 0x7FFFF loads 0x7FFFF000
 	lui	a0, 0x7FFFF
-	li	a7, 5
+	li	a0, 0
+	li	a7, 93
 	ecall

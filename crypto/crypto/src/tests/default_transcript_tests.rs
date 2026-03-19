@@ -1,9 +1,7 @@
 use alloc::vec::Vec;
 use math::field::{
-    element::FieldElement,
-    fields::fft_friendly::{
-        extensions_goldilocks::Degree3GoldilocksExtensionField, u64_goldilocks::GoldilocksField,
-    },
+    element::FieldElement, extensions_goldilocks::Degree3GoldilocksExtensionField,
+    goldilocks::GoldilocksField,
 };
 
 use crate::fiat_shamir::default_transcript::DefaultTranscript;
@@ -113,6 +111,39 @@ fn fork_domain_separator_differentiates() {
     fork_1.append_bytes(&(1u64).to_le_bytes());
 
     assert_ne!(fork_0.sample(), fork_1.sample());
+}
+
+#[test]
+fn sample_u64_consecutive_calls_return_different_values() {
+    let mut transcript = DefaultTranscript::<Degree3GoldilocksExtensionField>::default();
+    transcript.append_bytes(&[0x01, 0x02, 0x03]);
+
+    let sample1 = transcript.sample_u64(1000);
+    let sample2 = transcript.sample_u64(1000);
+    let sample3 = transcript.sample_u64(1000);
+
+    assert!(sample1 < 1000);
+    assert!(sample2 < 1000);
+    assert!(sample3 < 1000);
+
+    assert_ne!(
+        sample1, sample2,
+        "consecutive sample_u64 calls should return different values"
+    );
+    assert_ne!(
+        sample2, sample3,
+        "consecutive sample_u64 calls should return different values"
+    );
+}
+
+#[test]
+fn sample_u64_upper_bound_one_always_returns_zero() {
+    let mut transcript = DefaultTranscript::<Degree3GoldilocksExtensionField>::default();
+    transcript.append_bytes(&[0x01, 0x02, 0x03]);
+
+    for _ in 0..10 {
+        assert_eq!(transcript.sample_u64(1), 0);
+    }
 }
 
 #[test]

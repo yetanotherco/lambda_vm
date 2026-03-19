@@ -5,8 +5,8 @@
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
-use math::field::fields::fft_friendly::{
-    extensions_goldilocks::Degree3GoldilocksExtensionField, u64_goldilocks::GoldilocksField,
+use math::field::{
+    extensions_goldilocks::Degree3GoldilocksExtensionField, goldilocks::GoldilocksField,
 };
 
 use crate::examples::multi_table_lookup::{
@@ -87,7 +87,8 @@ fn test_wrong_result_value() {
     assert!(!Verifier::multi_verify(
         &airs,
         &multi_proof,
-        &mut DefaultTranscript::<E>::new(&[])
+        &mut DefaultTranscript::<E>::new(&[]),
+        &FieldElement::zero(),
     ));
 }
 
@@ -149,7 +150,8 @@ fn test_off_by_one() {
     assert!(!Verifier::multi_verify(
         &airs,
         &multi_proof,
-        &mut DefaultTranscript::<E>::new(&[])
+        &mut DefaultTranscript::<E>::new(&[]),
+        &FieldElement::zero(),
     ));
 }
 
@@ -211,7 +213,8 @@ fn test_swapped_operands() {
     assert!(!Verifier::multi_verify(
         &airs,
         &multi_proof,
-        &mut DefaultTranscript::<E>::new(&[])
+        &mut DefaultTranscript::<E>::new(&[]),
+        &FieldElement::zero(),
     ));
 }
 
@@ -273,7 +276,8 @@ fn test_single_column_wrong() {
     assert!(!Verifier::multi_verify(
         &airs,
         &multi_proof,
-        &mut DefaultTranscript::<E>::new(&[])
+        &mut DefaultTranscript::<E>::new(&[]),
+        &FieldElement::zero(),
     ));
 }
 
@@ -339,7 +343,8 @@ fn test_over_report_multiplicity() {
     assert!(!Verifier::multi_verify(
         &airs,
         &multi_proof,
-        &mut DefaultTranscript::<E>::new(&[])
+        &mut DefaultTranscript::<E>::new(&[]),
+        &FieldElement::zero(),
     ));
 }
 
@@ -401,7 +406,8 @@ fn test_under_report_multiplicity() {
     assert!(!Verifier::multi_verify(
         &airs,
         &multi_proof,
-        &mut DefaultTranscript::<E>::new(&[])
+        &mut DefaultTranscript::<E>::new(&[]),
+        &FieldElement::zero(),
     ));
 }
 
@@ -463,7 +469,8 @@ fn test_zero_multiplicity_skip() {
     assert!(!Verifier::multi_verify(
         &airs,
         &multi_proof,
-        &mut DefaultTranscript::<E>::new(&[])
+        &mut DefaultTranscript::<E>::new(&[]),
+        &FieldElement::zero(),
     ));
 }
 
@@ -529,7 +536,8 @@ fn test_phantom_receive() {
     assert!(!Verifier::multi_verify(
         &airs,
         &multi_proof,
-        &mut DefaultTranscript::<E>::new(&[])
+        &mut DefaultTranscript::<E>::new(&[]),
+        &FieldElement::zero(),
     ));
 }
 
@@ -591,7 +599,8 @@ fn test_missing_receiver() {
     assert!(!Verifier::multi_verify(
         &airs,
         &multi_proof,
-        &mut DefaultTranscript::<E>::new(&[])
+        &mut DefaultTranscript::<E>::new(&[]),
+        &FieldElement::zero(),
     ));
 }
 
@@ -670,7 +679,12 @@ fn test_tampered_table_contribution() {
         vec![&cpu_air, &add_air, &mul_air];
 
     assert!(
-        !Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
+        !Verifier::multi_verify(
+            &airs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero(),
+        ),
         "Proof with corrupted table_contribution must be rejected"
     );
 }
@@ -746,7 +760,12 @@ fn test_tampered_acc_ood_evaluation() {
         vec![&cpu_air, &add_air, &mul_air];
 
     assert!(
-        !Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
+        !Verifier::multi_verify(
+            &airs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero(),
+        ),
         "Proof with corrupted acc OOD evaluation must be rejected"
     );
 }
@@ -817,7 +836,12 @@ fn test_missing_bus_public_inputs_rejected() {
         vec![&cpu_air, &add_air, &mul_air];
 
     assert!(
-        !Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
+        !Verifier::multi_verify(
+            &airs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero(),
+        ),
         "Proof with missing bus_public_inputs must be rejected"
     );
 }
@@ -938,7 +962,12 @@ fn test_zeroed_table_contribution_rejected() {
         vec![&cpu_air, &add_air, &mul_air];
 
     assert!(
-        !Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
+        !Verifier::multi_verify(
+            &airs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero(),
+        ),
         "Proof with zeroed table_contribution must be rejected"
     );
 }
@@ -1005,7 +1034,8 @@ fn test_one_of_many_wrong() {
     assert!(!Verifier::multi_verify(
         &airs,
         &multi_proof,
-        &mut DefaultTranscript::<E>::new(&[])
+        &mut DefaultTranscript::<E>::new(&[]),
+        &FieldElement::zero(),
     ));
 }
 
@@ -1112,7 +1142,8 @@ fn test_full_scenario_wrong_add() {
     assert!(!Verifier::multi_verify(
         &airs,
         &multi_proof,
-        &mut DefaultTranscript::<E>::new(&[])
+        &mut DefaultTranscript::<E>::new(&[]),
+        &FieldElement::zero(),
     ));
 }
 
@@ -1185,7 +1216,12 @@ fn test_wrong_table_consumes_value_rejected() {
     // Verification MUST fail: MUL table cannot consume values sent to ADD bus
     // because bus_id is included in the fingerprint
     assert!(
-        !Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
+        !Verifier::multi_verify(
+            &airs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero(),
+        ),
         "Bus labels should prevent wrong table from consuming values"
     );
 }
@@ -1297,7 +1333,12 @@ fn test_packing_mismatch_direct_vs_word2l() {
     // Sender: z - (100 + 200*α)
     // Receiver: z - (100 + 200*2^16) = z - (100 + 13107200)
     assert!(
-        !Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
+        !Verifier::multi_verify(
+            &airs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero(),
+        ),
         "Packing mismatch should cause verification failure"
     );
 }
@@ -1397,7 +1438,12 @@ fn test_packing_mismatch_element_count() {
     // Receiver: z - ((10 + 20*65536) + 30*α) = z - (1310730 + 30*α)  [2 bus elements]
     // Different fingerprints!
     assert!(
-        !Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
+        !Verifier::multi_verify(
+            &airs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero(),
+        ),
         "Element count mismatch (3 vs 2 bus elements) should cause verification failure"
     );
 }
@@ -1491,7 +1537,12 @@ fn test_packing_mismatch_shift_constant() {
         vec![&sender, &receiver];
 
     assert!(
-        !Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
+        !Verifier::multi_verify(
+            &airs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero(),
+        ),
         "Different shift constants (Word4L vs DWordHL) should cause verification failure"
     );
 }
@@ -1589,7 +1640,12 @@ fn test_compound_mismatch_dwordhhw_vs_dwordwhh() {
         vec![&sender, &receiver];
 
     assert!(
-        !Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
+        !Verifier::multi_verify(
+            &airs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero(),
+        ),
         "Compound layout mismatch (DWordHHW vs DWordWHH) should cause verification failure"
     );
 }
@@ -1678,7 +1734,12 @@ fn test_compound_equals_primitive_expansion() {
 
     // This should PASS - compound and primitive expansion are equivalent
     assert!(
-        Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
+        Verifier::multi_verify(
+            &airs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero(),
+        ),
         "Compound should be equivalent to its primitive expansion"
     );
 }
@@ -1790,6 +1851,7 @@ fn test_full_scenario_wrong_mul() {
     assert!(!Verifier::multi_verify(
         &airs,
         &multi_proof,
-        &mut DefaultTranscript::<E>::new(&[])
+        &mut DefaultTranscript::<E>::new(&[]),
+        &FieldElement::zero(),
     ));
 }

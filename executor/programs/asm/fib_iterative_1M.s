@@ -2,7 +2,7 @@
 	.globl	main
 main:
 	# Iterative Fibonacci - pure register arithmetic
-	# ~1000k steps
+	# ~1M steps
 	#
 	# Loop body: 5 instructions per iteration
 	# 199999 iterations × 5 = 999995 + 4 setup/teardown = 999999
@@ -19,5 +19,6 @@ main:
 	bnez	a0, .loop		# loop if n != 0
 
 	mv	a0, t1			# result = b
-	li	a7, 5
+	li	a0, 0
+	li	a7, 93
 	ecall				# halt with result in a0

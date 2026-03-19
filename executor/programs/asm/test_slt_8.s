@@ -9,5 +9,6 @@ main:
 	sltiu	a2, t0, 20		# 5. unsigned: 10 < 20 = 1
 	slt	a3, t0, t1		# 6. 10 < 20 = 1
 	sltu	a4, t1, t0		# 7. unsigned: 20 < 10 = 0
-	li	a7, 5
+	li	a0, 0
+	li	a7, 93
 	ecall		# 8. Return

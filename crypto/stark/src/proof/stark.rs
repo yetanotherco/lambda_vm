@@ -65,7 +65,7 @@ pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     // Bus interaction public inputs for the accumulated column.
     // Contains the table contribution (L), used for:
     // 1. Circular constraint offset: L/N per row
-    // 2. Bus balance check: Σ table_contribution across all tables = 0
+    // 2. Bus balance check: Σ table_contribution across all tables = expected_bus_balance
     pub bus_public_inputs: Option<BusPublicInputs<E>>,
     // Public inputs used for boundary constraints
     pub public_inputs: PI,
@@ -78,10 +78,4 @@ pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
 #[serde(bound = "PI: serde::Serialize + serde::de::DeserializeOwned")]
 pub struct MultiProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     pub proofs: Vec<StarkProof<F, E, PI>>,
-}
-
-impl<F: IsSubFieldOf<E>, E: IsField, PI> MultiProof<F, E, PI> {
-    pub fn new(proofs: Vec<StarkProof<F, E, PI>>) -> Self {
-        Self { proofs }
-    }
 }

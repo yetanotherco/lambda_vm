@@ -3,7 +3,7 @@ use crate::fri::fri_functions::{
 };
 use math::fft::cpu::bit_reversing::in_place_bit_reverse_permute;
 use math::field::element::FieldElement;
-use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
+use math::field::goldilocks::GoldilocksField;
 use math::field::traits::IsField;
 use math::polynomial::Polynomial;
 

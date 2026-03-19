@@ -4,7 +4,7 @@
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
-use math::field::fields::fft_friendly::u64_goldilocks::GoldilocksField;
+use math::field::goldilocks::GoldilocksField;
 use math::field::traits::IsField;
 
 /// Input for fuzzing field operations

@@ -93,5 +93,6 @@ main:
 
 	# === Return ===
 	# 32. Return (a0 still has result from first add = 30)
-	li	a7, 5
+	li	a0, 0
+	li	a7, 93
 	ecall

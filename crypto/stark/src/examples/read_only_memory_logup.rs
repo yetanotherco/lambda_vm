@@ -573,8 +573,8 @@ pub fn read_only_logup_trace<
 #[cfg(test)]
 mod test {
     use super::*;
-    use math::field::fields::fft_friendly::{
-        extensions_goldilocks::Degree3GoldilocksExtensionField, u64_goldilocks::GoldilocksField,
+    use math::field::{
+        extensions_goldilocks::Degree3GoldilocksExtensionField, goldilocks::GoldilocksField,
     };
 
     type GoldilocksFE = FieldElement<GoldilocksField>;

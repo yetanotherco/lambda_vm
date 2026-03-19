@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+use math::field::element::FieldElement;
 
 use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{
@@ -344,7 +345,12 @@ fn prove_and_verify(ops: &[BranchOperation]) -> bool {
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender_air, &receiver_air];
 
-    Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[]))
+    Verifier::multi_verify(
+        &airs,
+        &multi_proof,
+        &mut DefaultTranscript::<E>::new(&[]),
+        &FieldElement::zero(),
+    )
 }
 
 /// Create a custom receiver trace for soundness tests.
@@ -429,7 +435,12 @@ fn prove_and_verify_custom(ops: &[BranchOperation], receiver_rows: &[CustomBranc
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender_air, &receiver_air];
 
-    Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[]))
+    Verifier::multi_verify(
+        &airs,
+        &multi_proof,
+        &mut DefaultTranscript::<E>::new(&[]),
+        &FieldElement::zero(),
+    )
 }
 
 // =============================================================================
