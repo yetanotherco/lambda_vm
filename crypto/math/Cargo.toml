@@ -30,6 +30,9 @@ iai-callgrind = "0.3.1"
 proptest = "1.1.0"
 pprof = { version = "0.13.0", features = ["criterion", "flamegraph"] }
 rand = { version = "0.8.5", features = ["std"] }
+p3-dft = { path = "../../../Plonky3/dft", default-features = false }
+p3-goldilocks = { path = "../../../Plonky3/goldilocks" }
+p3-matrix = { path = "../../../Plonky3/matrix" }
 
 [features]
 default = ["parallel", "std"]
@@ -46,4 +49,8 @@ getrandom = { version = "0.2.15", features = ["js"] }
 
 [[bench]]
 name = "goldilocks_benchmark"
+harness = false
+
+[[bench]]
+name = "fft_comparison"
 harness = false
