@@ -20,7 +20,7 @@
 //! - `mu`: Bit — multiplicity (1 for real rows, 0 for padding)
 //!
 //! ## Bus Interactions (18 total)
-//! - **Receiver**: Ecall bus — receives `[timestamp, syscall_number]` from CPU (mult = first)
+//! - **Receiver**: Ecall bus — receives `[timestamp_lo, timestamp_hi, constant(64), constant(0)]` from CPU (mult = first)
 //! - **Sender**: CommitNextByte bus — sends to next row (mult = mu - end)
 //! - **Receiver**: CommitNextByte bus — receives from prev row (mult = mu - first)
 //! - **Sender**: IsHalfword bus — range checks for count_decr halfwords (×4, mult = mu)
@@ -236,7 +236,7 @@ pub fn generate_commit_trace(
 /// Creates all bus interactions for the COMMIT table (18 total).
 ///
 /// The COMMIT table:
-/// - **Receives** Ecall from CPU with `[timestamp_lo, timestamp_hi]` (mult = first)
+/// - **Receives** Ecall from CPU with `[timestamp_lo, timestamp_hi, constant(64), constant(0)]` (mult = first)
 /// - **Sends** to CommitNextByte with `[timestamp, index + 1, address_incr, count_decr]` (mult = mu - end)
 /// - **Receives** from CommitNextByte with `[timestamp, index, address, count]` (mult = mu - first)
 /// - **Sends** to IsHalfword for count_decr range checks (×4, mult = mu)
