@@ -153,90 +153,88 @@ pub mod cols {
     pub const DIVREM: usize = 32;
     /// ECALL (Environment Call)
     pub const ECALL: usize = 33;
-    /// ECALL_COMMIT: 1 when the ECALL is a Commit syscall, 0 otherwise
-    pub const ECALL_COMMIT: usize = 34;
     /// EBREAK (Environment Break)
-    pub const EBREAK: usize = 35;
+    pub const EBREAK: usize = 34;
 
     // -------------------------------------------------------------------------
     // Output columns
     // -------------------------------------------------------------------------
 
     /// next_pc[0]: Next program counter (low word)
-    pub const NEXT_PC_0: usize = 36;
+    pub const NEXT_PC_0: usize = 35;
     /// next_pc[1]: Next program counter (high word)
-    pub const NEXT_PC_1: usize = 37;
+    pub const NEXT_PC_1: usize = 36;
 
     /// rvd[0]: Value to write to destination register (low word)
-    pub const RVD_0: usize = 38;
+    pub const RVD_0: usize = 37;
     /// rvd[1]: Value to write to destination register (high word)
-    pub const RVD_1: usize = 39;
+    pub const RVD_1: usize = 38;
 
     // -------------------------------------------------------------------------
     // Auxiliary columns
     // -------------------------------------------------------------------------
 
     /// rv1[0]: Register rs1 value (Half - bits 0-15) [DWordWHH]
-    pub const RV1_0: usize = 40;
+    pub const RV1_0: usize = 39;
     /// rv1[1]: Register rs1 value (Half - bits 16-31) [DWordWHH]
-    pub const RV1_1: usize = 41;
+    pub const RV1_1: usize = 40;
     /// rv1[2]: Register rs1 value (Word - bits 32-63) [DWordWHH]
-    pub const RV1_2: usize = 42;
+    pub const RV1_2: usize = 41;
 
     /// rv2[0]: Register rs2 value (Half - bits 0-15) [DWordWHH]
-    pub const RV2_0: usize = 43;
+    pub const RV2_0: usize = 42;
     /// rv2[1]: Register rs2 value (Half - bits 16-31) [DWordWHH]
-    pub const RV2_1: usize = 44;
+    pub const RV2_1: usize = 43;
     /// rv2[2]: Register rs2 value (Word - bits 32-63) [DWordWHH]
-    pub const RV2_2: usize = 45;
+    pub const RV2_2: usize = 44;
 
     /// rv1_sign_bit: Sign bit of rv1 as 32-bit word (for word_instr extension)
-    pub const RV1_SIGN_BIT: usize = 46;
+    pub const RV1_SIGN_BIT: usize = 45;
 
     /// arg1[0..8]: Extended rv1 as DWordBL (8 bytes)
-    pub const ARG1_0: usize = 47;
-    pub const ARG1_1: usize = 48;
-    pub const ARG1_2: usize = 49;
-    pub const ARG1_3: usize = 50;
-    pub const ARG1_4: usize = 51;
-    pub const ARG1_5: usize = 52;
-    pub const ARG1_6: usize = 53;
-    pub const ARG1_7: usize = 54;
+    pub const ARG1_0: usize = 46;
+    pub const ARG1_1: usize = 47;
+    pub const ARG1_2: usize = 48;
+    pub const ARG1_3: usize = 49;
+    pub const ARG1_4: usize = 50;
+    pub const ARG1_5: usize = 51;
+    pub const ARG1_6: usize = 52;
+    pub const ARG1_7: usize = 53;
 
     /// arg2_sign_bit: Sign bit of arg2 as 32-bit word
-    pub const ARG2_SIGN_BIT: usize = 55;
+    pub const ARG2_SIGN_BIT: usize = 54;
 
     /// arg2[0..8]: Extended rv2/imm as DWordBL (8 bytes)
-    pub const ARG2_0: usize = 56;
-    pub const ARG2_1: usize = 57;
-    pub const ARG2_2: usize = 58;
-    pub const ARG2_3: usize = 59;
-    pub const ARG2_4: usize = 60;
-    pub const ARG2_5: usize = 61;
-    pub const ARG2_6: usize = 62;
-    pub const ARG2_7: usize = 63;
+    pub const ARG2_0: usize = 55;
+    pub const ARG2_1: usize = 56;
+    pub const ARG2_2: usize = 57;
+    pub const ARG2_3: usize = 58;
+    pub const ARG2_4: usize = 59;
+    pub const ARG2_5: usize = 60;
+    pub const ARG2_6: usize = 61;
+    pub const ARG2_7: usize = 62;
 
     /// res_sign_bit: Sign bit of res as 32-bit word
-    pub const RES_SIGN_BIT: usize = 64;
+    pub const RES_SIGN_BIT: usize = 63;
 
     /// res[0..8]: ALU result as DWordBL (8 bytes)
-    pub const RES_0: usize = 65;
-    pub const RES_1: usize = 66;
-    pub const RES_2: usize = 67;
-    pub const RES_3: usize = 68;
-    pub const RES_4: usize = 69;
-    pub const RES_5: usize = 70;
-    pub const RES_6: usize = 71;
-    pub const RES_7: usize = 72;
+    pub const RES_0: usize = 64;
+    pub const RES_1: usize = 65;
+    pub const RES_2: usize = 66;
+    pub const RES_3: usize = 67;
+    pub const RES_4: usize = 68;
+    pub const RES_5: usize = 69;
+    pub const RES_6: usize = 70;
+    pub const RES_7: usize = 71;
 
     /// is_equal: Whether rv1 == arg2 (for BEQ)
-    pub const IS_EQUAL: usize = 73;
+    pub const IS_EQUAL: usize = 72;
 
     /// branch_cond: Whether branch is taken
-    pub const BRANCH_COND: usize = 74;
+    pub const BRANCH_COND: usize = 73;
 
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 75;
+    pub const NUM_COLUMNS: usize = 74;
 
     // -------------------------------------------------------------------------
     // Helper ranges for iteration
@@ -368,48 +366,40 @@ impl CpuOperation {
         }
     }
 
-    /// Compute arg2 based on instruction type (returns imm or rv2 depending on opcode).
+    /// Compute arg2 following the spec formula exactly (CPU-CE62/CE63).
     ///
-    /// Per spec constraint for arg2[4:]:
-    /// (1-LOAD) * ((1-word_instr)*rv2[2] + signed*arg2_sign_bit*(2^32-1)) + (1-BEQ-BLT-STORE)*imm[1]
+    /// arg2[:4] = (1-LOAD)*rv2[:2] + (1-BEQ-BLT-STORE)*imm[0]
+    /// arg2[4:] = (1-LOAD)*((1-word_instr)*rv2[2] + signed*arg2_sign_bit*(2^32-1))
+    ///            + (1-BEQ-BLT-STORE)*imm[1]
     ///
-    /// For LOAD: uses imm (full 64-bit, for address calculation)
-    /// For STORE: uses rv2 (byte-decomposed data to store; address via separate ADD)
-    /// For BEQ/BLT: uses rv2 (full 64-bit, comparing register values)
-    /// Otherwise: uses imm (when rs2=0) or rv2, with sign extension for signed word instructions
+    /// Per CPU-A2, the decode guarantees that at most one of rv2/imm is non-zero
+    /// when STORE+LOAD+BEQ+BLT=0, so the addition acts as a selection.
     pub fn compute_arg2(&self) -> u64 {
-        if self.decode.op_load {
-            // LOAD: address = rv1 + imm, use full imm
-            self.decode.imm
-        } else if self.decode.op_store {
-            // STORE: arg2 = rv2 (byte-decomposed data to store)
-            // Address computed separately as res = arg1 + imm
-            self.rv2
-        } else if self.decode.op_beq || self.decode.op_blt {
-            // BEQ/BLT: compare rv1 vs rv2, use full rv2
-            self.rv2
-        } else {
-            // For other ops, use imm (when rs2=0) or rv2
-            let base = if self.decode.rs2 == 0 {
-                self.decode.imm
-            } else {
-                self.rv2
-            };
+        let d = &self.decode;
 
-            // For word instructions, apply sign/zero extension based on signed flag
-            if self.decode.word_instr {
-                let lower_32 = base & 0xFFFF_FFFF;
-                if self.decode.signed && Self::sign_bit_32(base) {
-                    // Sign extend: set upper 32 bits to all 1s
-                    lower_32 | (0xFFFF_FFFF_u64 << 32)
-                } else {
-                    // Zero extend: upper 32 bits are 0
-                    lower_32
-                }
+        // rv2 contribution: zeroed when LOAD (spec: (1-LOAD) factor)
+        let rv2_extended = if d.op_load {
+            0
+        } else if d.word_instr {
+            // Word-instruction sign/zero extension on upper 32 bits
+            let lower_32 = self.rv2 & 0xFFFF_FFFF;
+            if d.signed && Self::sign_bit_32(self.rv2) {
+                lower_32 | (0xFFFF_FFFF_u64 << 32)
             } else {
-                base
+                lower_32
             }
-        }
+        } else {
+            self.rv2
+        };
+
+        // imm contribution: zeroed when BEQ, BLT, or STORE (spec: (1-BEQ-BLT-STORE) factor)
+        let imm_contrib = if d.op_beq || d.op_blt || d.op_store {
+            0
+        } else {
+            d.imm
+        };
+
+        rv2_extended.wrapping_add(imm_contrib)
     }
 
     /// Extract sign bit of a 32-bit word (bit 31).
@@ -809,7 +799,6 @@ pub fn generate_cpu_trace(
         data[base + cols::MUL] = FE::from(d.op_mul as u64);
         data[base + cols::DIVREM] = FE::from(d.op_divrem as u64);
         data[base + cols::ECALL] = FE::from(d.op_ecall as u64);
-        data[base + cols::ECALL_COMMIT] = FE::from(op.ecall_commit as u64);
         data[base + cols::EBREAK] = FE::from(d.op_ebreak as u64);
 
         // Output columns
@@ -2000,23 +1989,15 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
-    // ECALL → HALT interaction
+    // ECALL interaction (single shared bus for HALT and COMMIT)
     // -------------------------------------------------------------------------
-    // Sends to HALT table only for non-Commit ECALLs.
-    // multiplicity = ECALL - ECALL_COMMIT (1 for Halt, 0 for Commit)
-    // rv1 = value of a7 register (syscall number). For sys_exit, rv1 = 93.
+    // Sends to both HALT and COMMIT tables. Each receiver pattern-matches on
+    // the syscall number in the payload.
+    // multiplicity = ECALL
+    // rv1 = value of a7 register (syscall number).
     interactions.push(BusInteraction::sender(
         BusId::Ecall,
-        Multiplicity::Linear(vec![
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::ECALL,
-            },
-            LinearTerm::Column {
-                coefficient: -1,
-                column: cols::ECALL_COMMIT,
-            },
-        ]),
+        Multiplicity::Column(cols::ECALL),
         vec![
             BusValue::Packed {
                 start_column: cols::TIMESTAMP,
@@ -2035,37 +2016,6 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 },
             ]),
             // cast(rv1, DWordWL)[1] = rv1_hi32 = RV1_2
-            BusValue::Packed {
-                start_column: cols::RV1_2,
-                packing: Packing::Direct,
-            },
-        ],
-    ));
-
-    // ECALL → COMMIT interaction
-    // -------------------------------------------------------------------------
-    // Sends to COMMIT table only for Commit ECALLs.
-    // multiplicity = ECALL_COMMIT
-    interactions.push(BusInteraction::sender(
-        BusId::EcallCommit,
-        Multiplicity::Column(cols::ECALL_COMMIT),
-        vec![
-            BusValue::Packed {
-                start_column: cols::TIMESTAMP,
-                packing: Packing::Direct,
-            },
-            BusValue::constant(0), // timestamp_hi = 0 (CPU timestamps fit in u32)
-            // rv1 = syscall number (must match COMMIT receiver's hardcoded value)
-            BusValue::linear(vec![
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::RV1_0,
-                },
-                LinearTerm::Column {
-                    coefficient: 65536,
-                    column: cols::RV1_1,
-                },
-            ]),
             BusValue::Packed {
                 start_column: cols::RV1_2,
                 packing: Packing::Direct,
