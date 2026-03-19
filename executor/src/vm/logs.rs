@@ -8,7 +8,7 @@
 ///
 /// For ECALL instructions, these fields are repurposed (since decode sets read_register1/2=false,
 /// write_register=false, so src/dst are unconstrained):
-/// - `src1_val` = syscall number (from x17): 3=Commit, 5=Halt, etc.
+/// - `src1_val` = syscall number (from x17): 64=Commit, 93=Halt, etc.
 /// - `src2_val` = buf_addr (x11) for Commit, 0 otherwise
 /// - `dst_val` = count (x12) for Commit, 0 otherwise
 #[derive(Debug, Clone)]

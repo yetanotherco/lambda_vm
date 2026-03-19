@@ -52,10 +52,10 @@ pub struct MultiProveTiming {
 }
 
 /// Round 1 sub-timings: atomics so parallel rayon workers can accumulate safely.
-static R1_MAIN_LDE_NS: AtomicU64 = AtomicU64::new(0);
-static R1_MAIN_MERKLE_NS: AtomicU64 = AtomicU64::new(0);
-static R1_AUX_LDE_NS: AtomicU64 = AtomicU64::new(0);
-static R1_AUX_MERKLE_NS: AtomicU64 = AtomicU64::new(0);
+static R1_MAIN_LDE_US: AtomicU64 = AtomicU64::new(0);
+static R1_MAIN_MERKLE_US: AtomicU64 = AtomicU64::new(0);
+static R1_AUX_LDE_US: AtomicU64 = AtomicU64::new(0);
+static R1_AUX_MERKLE_US: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     static TIMING_DATA: RefCell<Option<MultiProveTiming>> = const { RefCell::new(None) };
@@ -78,31 +78,37 @@ pub fn take() -> Option<MultiProveTiming> {
 }
 
 pub fn accum_r1_main(lde: Duration, merkle: Duration) {
-    R1_MAIN_LDE_NS.fetch_add(lde.as_nanos() as u64, Ordering::Relaxed);
-    R1_MAIN_MERKLE_NS.fetch_add(merkle.as_nanos() as u64, Ordering::Relaxed);
+    R1_MAIN_LDE_US.fetch_add(lde.as_micros() as u64, Ordering::Relaxed);
+    R1_MAIN_MERKLE_US.fetch_add(merkle.as_micros() as u64, Ordering::Relaxed);
 }
 
 pub fn accum_r1_aux(lde: Duration, merkle: Duration) {
-    R1_AUX_LDE_NS.fetch_add(lde.as_nanos() as u64, Ordering::Relaxed);
-    R1_AUX_MERKLE_NS.fetch_add(merkle.as_nanos() as u64, Ordering::Relaxed);
+    R1_AUX_LDE_US.fetch_add(lde.as_micros() as u64, Ordering::Relaxed);
+    R1_AUX_MERKLE_US.fetch_add(merkle.as_micros() as u64, Ordering::Relaxed);
 }
 
 pub fn take_r1_sub() -> Round1SubOps {
     Round1SubOps {
-        main_lde: Duration::from_nanos(R1_MAIN_LDE_NS.swap(0, Ordering::Relaxed)),
-        main_merkle: Duration::from_nanos(R1_MAIN_MERKLE_NS.swap(0, Ordering::Relaxed)),
-        aux_lde: Duration::from_nanos(R1_AUX_LDE_NS.swap(0, Ordering::Relaxed)),
-        aux_merkle: Duration::from_nanos(R1_AUX_MERKLE_NS.swap(0, Ordering::Relaxed)),
+        main_lde: Duration::from_micros(R1_MAIN_LDE_US.swap(0, Ordering::Relaxed)),
+        main_merkle: Duration::from_micros(R1_MAIN_MERKLE_US.swap(0, Ordering::Relaxed)),
+        aux_lde: Duration::from_micros(R1_AUX_LDE_US.swap(0, Ordering::Relaxed)),
+        aux_merkle: Duration::from_micros(R1_AUX_MERKLE_US.swap(0, Ordering::Relaxed)),
     }
 }
 
 /// Reset all instrument state. Call at the start of `multi_prove` to avoid
 /// stale data from a previous run in the same process.
+///
+/// Note: thread-local stores (R2_SUB, R4_SUB, ROUND_SUB_OPS) are only cleared
+/// for the calling thread. Rayon worker threads are not reset — stale data is
+/// possible if a previous run panicked without consuming stored values.
+/// In practice this is safe because store/take pairs always execute within the
+/// same rayon task closure.
 pub fn reset_all() {
-    R1_MAIN_LDE_NS.store(0, Ordering::Relaxed);
-    R1_MAIN_MERKLE_NS.store(0, Ordering::Relaxed);
-    R1_AUX_LDE_NS.store(0, Ordering::Relaxed);
-    R1_AUX_MERKLE_NS.store(0, Ordering::Relaxed);
+    R1_MAIN_LDE_US.store(0, Ordering::Relaxed);
+    R1_MAIN_MERKLE_US.store(0, Ordering::Relaxed);
+    R1_AUX_LDE_US.store(0, Ordering::Relaxed);
+    R1_AUX_MERKLE_US.store(0, Ordering::Relaxed);
     TIMING_DATA.with(|cell| {
         cell.borrow_mut().take();
     });
