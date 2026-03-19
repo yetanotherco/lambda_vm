@@ -518,12 +518,13 @@ use crate::constraints::cpu::{
     create_add_constraints, create_all_cpu_constraints, create_is_bit_constraints,
     create_slt_res_zero_constraints,
 };
+
 use crate::tables::cpu::cols as cpu_cols;
 
 #[test]
 fn test_cpu_bit_flag_columns_count() {
-    // Should have 33 bit flag columns (includes read_register1, read_register2, ECALL_COMMIT)
-    assert_eq!(BIT_FLAG_COLUMNS.len(), 33);
+    // Should have 32 bit flag columns (includes read_register1, read_register2)
+    assert_eq!(BIT_FLAG_COLUMNS.len(), 32);
 }
 
 #[test]
@@ -538,8 +539,8 @@ fn test_cpu_bit_flag_columns_valid() {
 fn test_create_is_bit_constraints() {
     let (constraints, next_idx) = create_is_bit_constraints(0);
 
-    assert_eq!(constraints.len(), 33);
-    assert_eq!(next_idx, 33);
+    assert_eq!(constraints.len(), 32);
+    assert_eq!(next_idx, 32);
 
     // Check constraint indices are sequential
     for (i, c) in constraints.iter().enumerate() {
@@ -621,14 +622,14 @@ fn test_next_pc_add_constraint_new_pair() {
 fn test_create_all_cpu_constraints() {
     let (is_bit, add, other, total) = create_all_cpu_constraints();
 
-    assert_eq!(is_bit.len(), 33);
+    assert_eq!(is_bit.len(), 32);
     // ADD constraints: 2 (ADD+LOAD) + 2 (STORE: arg1+imm) + 2 (SUB+BEQ) + 2 (JALR) = 8
     assert_eq!(add.len(), 8);
-    // Other: branch_cond(1) + ebreak(1) + rv1_zero_forcing(3) + rv2_zero_forcing(3) + arg1(2) + arg2(2) + rvd(2) + slt_zero(7) + sign_bit_zero(1) + ecall_commit_implies_ecall(1) + next_pc(2) = 25
-    assert_eq!(other.len(), 25);
+    // Other: branch_cond(1) + ebreak(1) + rv1_zero_forcing(3) + rv2_zero_forcing(3) + arg1(2) + arg2(2) + rvd(2) + slt_zero(7) + sign_bit_zero(1) + next_pc(2) = 24
+    assert_eq!(other.len(), 24);
 
-    // Total should be 33 + 8 + 25 = 66
-    assert_eq!(total, 66);
+    // Total should be 32 + 8 + 24 = 64
+    assert_eq!(total, 64);
     assert_eq!(total, NUM_CPU_CONSTRAINTS);
 }
 

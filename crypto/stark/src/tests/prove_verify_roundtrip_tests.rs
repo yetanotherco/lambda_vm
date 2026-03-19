@@ -174,6 +174,7 @@ fn test_verify_serialized_multi_table_proofs() {
             &airs,
             &received_proofs,
             &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero(),
         ),
         "Verification should succeed for valid proofs"
     );

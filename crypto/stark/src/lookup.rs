@@ -1186,7 +1186,7 @@ impl BusInteraction {
 /// Each table has exactly one BusPublicInputs, representing the total
 /// contribution of all its LogUp terms (L = Σ all terms across all rows).
 /// The sign (sender vs receiver) is already baked into the values,
-/// so the bus balance check is: Σ table_contribution across all tables = 0.
+/// so the bus balance check is: Σ table_contribution across all tables = expected_bus_balance.
 ///
 /// For the circular constraint, `table_contribution / N` is the per-row offset
 /// that makes the accumulated column wrap to zero at row N-1.
