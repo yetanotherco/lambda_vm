@@ -414,6 +414,7 @@ fn test_multi_prove_fib_3_tables() {
         &airs,
         &multi_proof,
         &mut DefaultTranscript::<F>::new(&[]),
+        &FieldElement::zero(),
     ));
 }
 
@@ -517,6 +518,7 @@ fn test_multi_prove_2_tables_small_field() {
         &airs,
         &multi_proof,
         &mut DefaultTranscript::<Degree3GoldilocksExtensionField>::new(&[]),
+        &FieldElement::zero(),
     ));
 }
 
@@ -546,6 +548,7 @@ fn test_multi_prove_different_airs() {
         &airs,
         &multi_proof,
         &mut DefaultTranscript::<F>::new(&[]),
+        &FieldElement::zero(),
     ));
 }
 

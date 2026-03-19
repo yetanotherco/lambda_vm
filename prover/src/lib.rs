@@ -13,6 +13,8 @@
 pub mod constraints;
 #[cfg(feature = "debug-checks")]
 mod debug_report;
+#[cfg(feature = "instruments")]
+pub mod instruments;
 pub mod tables;
 pub mod test_utils;
 pub mod tests;
@@ -21,8 +23,10 @@ pub mod utils;
 use std::fmt;
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+use crypto::fiat_shamir::is_transcript::IsTranscript;
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
+use math::field::element::FieldElement;
 use stark::prover::{IsStarkProver, Prover};
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
@@ -33,6 +37,7 @@ use crate::tables::decode;
 use crate::tables::page;
 use crate::tables::register;
 use crate::tables::trace_builder::Traces;
+use crate::tables::types::BusId;
 use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_commit_air, create_cpu_air,
     create_decode_air, create_dvrm_air, create_halt_air, create_load_air, create_lt_air,
@@ -117,6 +122,8 @@ pub struct VmProof {
     /// Number of chunks for each split table.
     /// The verifier needs this to reconstruct matching AIRs.
     pub table_counts: TableCounts,
+    /// Committed public output bytes.
+    pub public_output: Vec<u8>,
 }
 
 /// Error type for the prover crate.
@@ -349,6 +356,83 @@ impl VmAirs {
     }
 }
 
+// =============================================================================
+// Bus Balance Target: Verifier-Computed COMMIT Output Bus
+// =============================================================================
+
+/// Replay the prover's Phase A (main trace commitments) to recover the shared
+/// LogUp challenges (z, alpha). Creates a fresh transcript, appends all main
+/// trace commitments in the same order as the prover, then samples two
+/// challenge elements.
+pub(crate) fn replay_transcript_phase_a(
+    airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
+    multi_proof: &MultiProof<F, E, ()>,
+) -> (FieldElement<E>, FieldElement<E>) {
+    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    for (air, proof) in airs.iter().zip(&multi_proof.proofs) {
+        if air.is_preprocessed() {
+            transcript.append_bytes(&air.precomputed_commitment());
+            transcript.append_bytes(&proof.lde_trace_main_merkle_root);
+        } else {
+            transcript.append_bytes(&proof.lde_trace_main_merkle_root);
+        }
+    }
+    let z: FieldElement<E> = transcript.sample_field_element();
+    let alpha: FieldElement<E> = transcript.sample_field_element();
+    (z, alpha)
+}
+
+/// Compute the bus balance offset for the COMMIT[index, value] bus.
+///
+/// For each public output byte at index `i` with value `v`:
+///   `fingerprint = z - (BusId::Commit * α^0 + i * α^1 + v * α^2)`
+///   `term = +1 / fingerprint`
+///
+/// Returns `Some(Σ term)` — the positive receiver contribution that is no
+/// longer present as an in-trace table. For empty public output, returns
+/// `Some(zero)`. Returns `None` on a fingerprint collision (zero divisor),
+/// which the caller should treat as verification failure.
+pub(crate) fn compute_commit_bus_offset(
+    public_output: &[u8],
+    z: &FieldElement<E>,
+    alpha: &FieldElement<E>,
+) -> Option<FieldElement<E>> {
+    if public_output.is_empty() {
+        return Some(FieldElement::zero());
+    }
+
+    let bus_id = FieldElement::<E>::from(BusId::Commit as u64);
+    let alpha_sq = alpha * alpha;
+
+    let mut total = FieldElement::<E>::zero();
+    for (i, &value) in public_output.iter().enumerate() {
+        let linear_combination = &bus_id
+            + &(FieldElement::<E>::from(i as u64) * alpha)
+            + &(FieldElement::<E>::from(value as u64) * &alpha_sq);
+        let fingerprint = z - &linear_combination;
+        total += fingerprint.inv().ok()?;
+    }
+    Some(total)
+}
+
+/// Compute the expected COMMIT bus balance for a `MultiProof`.
+///
+/// Replays Phase A of the transcript to recover (z, alpha), then computes
+/// the offset from the given public output bytes. Call this after `multi_prove`
+/// and before `multi_verify`.
+pub(crate) fn compute_expected_commit_bus_balance(
+    airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
+    proof: &MultiProof<F, E, ()>,
+    public_output_bytes: &[u8],
+) -> Option<FieldElement<E>> {
+    let (z, alpha) = replay_transcript_phase_a(airs, proof);
+    compute_commit_bus_offset(public_output_bytes, &z, &alpha)
+}
+
+// =============================================================================
+// Public API: Prove / Verify
+// =============================================================================
+
 /// Prove an ELF binary execution. Returns a serializable proof bundle.
 pub fn prove(elf_bytes: &[u8]) -> Result<VmProof, Error> {
     prove_with_options(
@@ -364,15 +448,37 @@ pub fn prove_with_options(
     proof_options: &ProofOptions,
     max_rows: &MaxRowsConfig,
 ) -> Result<VmProof, Error> {
+    #[cfg(feature = "instruments")]
+    let total_start = std::time::Instant::now();
+
+    // Phase 1: Execute (ELF load + run)
+    #[cfg(feature = "instruments")]
+    let phase_start = std::time::Instant::now();
+
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let executor = Executor::new(&program, vec![]).map_err(|e| Error::Execution(format!("{e}")))?;
     let result = executor
         .run()
         .map_err(|e| Error::Execution(format!("{e}")))?;
 
+    #[cfg(feature = "instruments")]
+    let execute_elapsed = phase_start.elapsed();
+
+    // Phase 2: Trace build
+    #[cfg(feature = "instruments")]
+    let phase_start = std::time::Instant::now();
+
     // Generate all traces from ELF and execution logs.
     // Page tables are derived from the prover's MemoryState (all accessed pages).
     let mut traces = Traces::from_elf_and_logs(&program, &result.logs, max_rows)?;
+
+    #[cfg(feature = "instruments")]
+    let trace_build_elapsed = phase_start.elapsed();
+
+    // Phase 3: AIR construction
+    #[cfg(feature = "instruments")]
+    let phase_start = std::time::Instant::now();
+
     let table_counts = traces.table_counts();
     let airs = VmAirs::new(
         &program,
@@ -382,18 +488,33 @@ pub fn prove_with_options(
         &table_counts,
     );
 
+    #[cfg(feature = "instruments")]
+    let air_elapsed = phase_start.elapsed();
+
     let runtime_page_ranges = traces.runtime_page_ranges();
 
+    // Phase 4: Prove (multi_prove)
     let proof = Prover::multi_prove(
         airs.air_trace_pairs(&mut traces),
         &mut DefaultTranscript::<E>::new(&[]),
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))?;
 
+    #[cfg(feature = "instruments")]
+    {
+        instruments::print_report(
+            execute_elapsed,
+            trace_build_elapsed,
+            air_elapsed,
+            total_start.elapsed(),
+        );
+    }
+
     Ok(VmProof {
         proof,
         runtime_page_ranges,
         table_counts,
+        public_output: traces.public_output_bytes.clone(),
     })
 }
 
@@ -449,10 +570,24 @@ pub fn verify_with_options(
         &vm_proof.table_counts,
     );
 
+    // Recompute the COMMIT output bus offset from VmProof.public_output.
+    // If public_output was tampered, the recomputed offset won't match the
+    // actual bus total in the proof, and multi_verify will reject.
+    let air_refs = airs.air_refs();
+    let expected_bus_balance = match compute_expected_commit_bus_balance(
+        &air_refs,
+        &vm_proof.proof,
+        &vm_proof.public_output,
+    ) {
+        Some(balance) => balance,
+        None => return Ok(false),
+    };
+
     Ok(Verifier::multi_verify(
-        &airs.air_refs(),
+        &air_refs,
         &vm_proof.proof,
         &mut DefaultTranscript::<E>::new(&[]),
+        &expected_bus_balance,
     ))
 }
 

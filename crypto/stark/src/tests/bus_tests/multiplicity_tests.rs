@@ -119,7 +119,12 @@ fn test_multiplicity_one() {
         vec![&sender, &receiver];
 
     assert!(
-        Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
+        Verifier::multi_verify(
+            &airs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero(),
+        ),
         "Multiplicity::One should work for matching sender/receiver"
     );
 }
@@ -224,7 +229,12 @@ fn test_multiplicity_sum() {
         vec![&sender, &receiver];
 
     assert!(
-        Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
+        Verifier::multi_verify(
+            &airs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero(),
+        ),
         "Multiplicity::Sum should work for matching sender/receiver"
     );
 }
@@ -327,7 +337,12 @@ fn test_multiplicity_negated() {
         vec![&sender, &receiver];
 
     assert!(
-        Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
+        Verifier::multi_verify(
+            &airs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero(),
+        ),
         "Multiplicity::Negated should work for skipping flagged rows"
     );
 }
