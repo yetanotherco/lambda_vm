@@ -11,8 +11,8 @@
 //! PHASE 0: ELF → DECODE, MEMORY_INIT (preprocessed tables)
 //! PHASE 1: Logs → CPU ops
 //! PHASE 2: CPU ops → MEMW, LOAD, LT, Bitwise (with state tracking for MEMW/LOAD)
-//! PHASE 3: MEMW → LT ops (timestamp ordering, overflow checks)
-//! PHASE 4: LT, MEMW → Bitwise lookups
+//! PHASE 3: MEMW → LT ops (timestamp ordering)
+//! PHASE 4: LT → Bitwise lookups
 //! PHASE 5: Generate all traces
 //! ```
 //!
@@ -130,6 +130,8 @@ impl MemoryState {
 struct RegisterState {
     /// Register file: (value, last_write_timestamp)
     regs: [RegisterCell; 32],
+    /// Synthetic x254 commit index register: (value, last_write_timestamp)
+    index_register: (u32, u64),
     /// PC register x255: (value, last_write_timestamp)
     pc_register: RegisterCell,
 }
@@ -141,6 +143,7 @@ impl RegisterState {
         regs[2] = (page::STACK_TOP, 0);
         Self {
             regs,
+            index_register: (0, 0),
             // PC register (x255) starts at entry_point, timestamp 0
             pc_register: (entry_point, 0),
         }
@@ -167,6 +170,16 @@ impl RegisterState {
     /// Write the PC register (x255) with the given timestamp.
     fn write_pc(&mut self, value: u64, timestamp: u64) {
         self.pc_register = (value, timestamp);
+    }
+
+    /// Read the synthetic x254 commit index register.
+    fn read_index(&self) -> (u32, u64) {
+        self.index_register
+    }
+
+    /// Write the synthetic x254 commit index register.
+    fn write_index(&mut self, value: u32, timestamp: u64) {
+        self.index_register = (value, timestamp);
     }
 
     /// Generate the final register state map for the REGISTER table.
@@ -197,6 +210,15 @@ impl RegisterState {
                     timestamp,
                     value: value_hi,
                 },
+            );
+        }
+
+        // Synthetic x254 commit index at address 508 (single-word per spec).
+        {
+            let (value, timestamp) = self.index_register;
+            map.insert(
+                register::register_base_address(254),
+                FinalRegisterWordState { timestamp, value },
             );
         }
 
@@ -294,7 +316,7 @@ fn collect_cpu_ops(
 ///
 /// MEMW and LOAD collection requires sequential processing with state tracking.
 ///
-/// Returns: (memw_ops, load_ops, lt_ops, shift_ops, bitwise_ops)
+/// Returns: (memw_ops, load_ops, lt_ops, shift_ops, bitwise_ops, commit_ops)
 #[allow(clippy::type_complexity)]
 fn collect_ops_from_cpu(
     cpu_ops: &[CpuOperation],
@@ -306,12 +328,16 @@ fn collect_ops_from_cpu(
     Vec<LtOperation>,
     Vec<ShiftOperation>,
     Vec<BitwiseOperation>,
+    Vec<CommitOperation>,
 ) {
     let mut memw_ops = Vec::with_capacity(cpu_ops.len() * 3);
     let mut load_ops = Vec::with_capacity(cpu_ops.len() / 8 + 1);
     let mut lt_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
     let mut shift_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
     let mut bitwise_ops = Vec::with_capacity(cpu_ops.len() * 4);
+    let mut commit_ops = Vec::new();
+    let mut current_commit_index = 0u32;
+    let mut commit_ecall_count = 0u32;
 
     for op in cpu_ops {
         // --- MEMW and LOAD (require state tracking, order matters) ---
@@ -333,8 +359,23 @@ fn collect_ops_from_cpu(
 
         // Collect COMMIT ECALL memory operations (register reads/writes + byte reads)
         if op.ecall_commit {
-            let commit_ops = collect_commit_memw_ops(op, register_state, memory_state);
-            memw_ops.extend(commit_ops);
+            commit_ops.extend(expand_commit_operations_for_ecall(
+                op,
+                memory_state,
+                current_commit_index as u64,
+            ));
+            let reg_commit_ops = collect_commit_memw_ops(op, register_state, memory_state);
+            memw_ops.extend(reg_commit_ops);
+            let count = u32::try_from(op.commit_count).expect("commit_count exceeds u32 range");
+            current_commit_index = current_commit_index
+                .checked_add(count)
+                .expect("commit index exceeds u32 range");
+            debug_assert_eq!(
+                current_commit_index,
+                register_state.read_index().0,
+                "commit index drift: current_commit_index and register_state.index_register must stay in sync"
+            );
+            commit_ecall_count += 1;
         }
 
         // --- LT, SHIFT, and Bitwise (no state tracking needed) ---
@@ -366,7 +407,21 @@ fn collect_ops_from_cpu(
         bitwise_ops.extend(op.collect_bitwise_ops());
     }
 
-    (memw_ops, load_ops, lt_ops, shift_ops, bitwise_ops)
+    // Each ecall generates count+1 operations (count real rows + 1 end row)
+    debug_assert_eq!(
+        commit_ops.len(),
+        current_commit_index as usize + commit_ecall_count as usize,
+        "commit_ops count should match accumulated commit index plus end rows"
+    );
+
+    (
+        memw_ops,
+        load_ops,
+        lt_ops,
+        shift_ops,
+        bitwise_ops,
+        commit_ops,
+    )
 }
 
 /// Collects a LOAD operation and corresponding MEMW read from CpuOperation.
@@ -561,6 +616,7 @@ fn collect_register_ops_from_cpu(
 /// - Read+write x10 at ts: asserts fd=1 (old), writes count (new)
 /// - Read x11 at ts: reads buf_addr
 /// - Read x12 at ts: reads count
+/// - Read+write x254 at ts: updates the global commit index
 /// - Read bytes at ts: reads committed bytes from memory
 ///
 /// Note: x17 (syscall number) is read by CPU's M1 interaction (read_register1=true, rs1=17).
@@ -575,7 +631,7 @@ fn collect_commit_memw_ops(
     let buf_addr = op.commit_buf_addr;
     let count = op.commit_count;
 
-    let mut memw_ops = Vec::with_capacity(4 + count as usize);
+    let mut memw_ops = Vec::with_capacity(5 + count as usize);
 
     // Combined read+write x10 at ts: old=fd=1, new=count
     // This atomically asserts x10 held fd=1 and writes count as return value.
@@ -619,6 +675,21 @@ fn collect_commit_memw_ops(
             .with_old(reg_value, old_timestamps);
         memw_ops.push(memw_op);
         register_state.write(12, count, ts);
+    }
+
+    // Read+write x254 (global commit index) at ts
+    {
+        let (old_index, old_ts) = register_state.read_index();
+        let new_index = old_index
+            .checked_add(u32::try_from(count).expect("commit_count exceeds u32 range"))
+            .expect("commit index exceeds u32 range");
+        let old_value = [old_index as u64, 0, 0, 0, 0, 0, 0, 0];
+        let new_value = [new_index as u64, 0, 0, 0, 0, 0, 0, 0];
+        let old_timestamps = [old_ts, 0, 0, 0, 0, 0, 0, 0];
+        let memw_op = MemwOperation::new(true, 508, new_value, ts, 1, true)
+            .with_old(old_value, old_timestamps);
+        memw_ops.push(memw_op);
+        register_state.write_index(new_index, ts);
     }
 
     // Memory byte reads at ts
@@ -701,25 +772,24 @@ fn collect_halt_ops(register_state: &mut RegisterState) -> Vec<MemwOperation> {
 // Phase 3: MEMW → LT
 // =============================================================================
 
-/// Collects LT operations from MEMW for timestamp ordering and overflow checks.
+/// Collects LT operations from MEMW for timestamp ordering.
 ///
 /// From spec memw.md:
-/// - C7-C10: old_timestamp[i] < timestamp (based on width)
-/// - R1-R3: base_address < base_address + offset (overflow checks)
+/// - MEMW-C4 through MEMW-C7: old_timestamp[i] < timestamp (based on width)
 ///
 /// Returns: Vec of LT operations
 fn collect_lt_from_memw(memw_ops: &[MemwOperation]) -> Vec<LtOperation> {
     let mut lt_ops = Vec::with_capacity(memw_ops.len() * 8);
 
     for memw_op in memw_ops {
-        // C7: old_timestamp[0] < timestamp (all accesses)
+        // MEMW-C4: old_timestamp[0] < timestamp (all accesses)
         lt_ops.push(LtOperation::new(
             memw_op.old_timestamp[0],
             memw_op.timestamp,
             false,
         ));
 
-        // C8: old_timestamp[1] < timestamp (width >= 2)
+        // MEMW-C5: old_timestamp[1] < timestamp (width >= 2)
         if memw_op.width >= 2 {
             lt_ops.push(LtOperation::new(
                 memw_op.old_timestamp[1],
@@ -728,7 +798,7 @@ fn collect_lt_from_memw(memw_ops: &[MemwOperation]) -> Vec<LtOperation> {
             ));
         }
 
-        // C9: old_timestamp[2,3] < timestamp (width >= 4)
+        // MEMW-C6: old_timestamp[2,3] < timestamp (width >= 4)
         if memw_op.width >= 4 {
             lt_ops.push(LtOperation::new(
                 memw_op.old_timestamp[2],
@@ -742,7 +812,7 @@ fn collect_lt_from_memw(memw_ops: &[MemwOperation]) -> Vec<LtOperation> {
             ));
         }
 
-        // C10: old_timestamp[4..7] < timestamp (width == 8)
+        // MEMW-C7: old_timestamp[4..7] < timestamp (width == 8)
         if memw_op.width == 8 {
             for i in 4..8 {
                 lt_ops.push(LtOperation::new(
@@ -751,22 +821,6 @@ fn collect_lt_from_memw(memw_ops: &[MemwOperation]) -> Vec<LtOperation> {
                     false,
                 ));
             }
-        }
-
-        // R1-R3: Address overflow checks (unconditional per MEMW-CR13/14/15)
-        // If overflow occurs, LT returns lt=0 and the constraint (expecting lt=1)
-        // rejects the proof via value mismatch.
-        if memw_op.width == 2 {
-            let addr_plus_1 = memw_op.base_address.wrapping_add(1);
-            lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_1, false));
-        }
-        if memw_op.width == 4 {
-            let addr_plus_3 = memw_op.base_address.wrapping_add(3);
-            lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_3, false));
-        }
-        if memw_op.width == 8 {
-            let addr_plus_7 = memw_op.base_address.wrapping_add(7);
-            lt_ops.push(LtOperation::new(memw_op.base_address, addr_plus_7, false));
         }
     }
 
@@ -1054,30 +1108,6 @@ fn collect_bitwise_from_dvrm(dvrm_ops: &[(DvrmOperation, bool)]) -> Vec<BitwiseO
     bitwise_ops
 }
 
-/// Collects IS_HALFWORD lookups from MEMW address_add columns.
-///
-/// Returns: Vec of bitwise lookups
-fn collect_bitwise_from_memw(memw_ops: &[MemwOperation]) -> Vec<BitwiseOperation> {
-    let mut bitwise_ops = Vec::with_capacity(memw_ops.len() * 28); // 7 addresses * 4 halfwords
-
-    for memw_op in memw_ops {
-        for i in 0..7u64 {
-            let addr_add = memw_op.base_address.wrapping_add(i + 1);
-            // Extract 4 halfwords (DWordHL packing)
-            for shift in [0, 16, 32, 48] {
-                let half = ((addr_add >> shift) & 0xFFFF) as u16;
-                bitwise_ops.push(BitwiseOperation::halfword(
-                    BitwiseOperationType::IsHalf,
-                    (half & 0xFF) as u8,
-                    (half >> 8) as u8,
-                ));
-            }
-        }
-    }
-
-    bitwise_ops
-}
-
 /// Collects bitwise lookups from BRANCH operations.
 ///
 /// BRANCH sends:
@@ -1245,42 +1275,39 @@ fn collect_bitwise_from_page(elf: &Elf, memory_state: &MemoryState) -> Vec<Bitwi
 // COMMIT Operation Expansion
 // =============================================================================
 
-/// Expand Commit ECALLs from CPU operations into individual byte rows.
-///
-/// For each Commit ECALL, generates count+1 rows:
-/// - Row 0: first=1, reads byte at buf_addr
-/// - Row i (0 < i < count): first=0, reads byte at buf_addr+i
-/// - Row count: end=1, count=0, no byte read
-fn expand_commit_operations(
-    cpu_ops: &[CpuOperation],
+/// Expand one Commit ECALL into its per-byte COMMIT rows using the memory state
+/// at the moment the ECALL executes.
+fn expand_commit_operations_for_ecall(
+    ecall: &CpuOperation,
     memory_state: &MemoryState,
+    start_index: u64,
 ) -> Vec<CommitOperation> {
     let mut ops = Vec::new();
 
-    for ecall in cpu_ops.iter().filter(|op| op.ecall_commit) {
-        let timestamp = ecall.timestamp;
-        let buf_addr = ecall.commit_buf_addr;
-        let count = ecall.commit_count;
+    let timestamp = ecall.timestamp;
+    let buf_addr = ecall.commit_buf_addr;
+    let count = ecall.commit_count;
 
-        for i in 0..=count {
-            let remaining = count - i;
-            let is_end = remaining == 0;
-            let value = if !is_end {
-                let (byte_val, _ts) = memory_state.read_byte(buf_addr.wrapping_add(i));
-                byte_val
-            } else {
-                0
-            };
-            ops.push(CommitOperation {
-                timestamp,
-                address: buf_addr.wrapping_add(i),
-                count: remaining,
-                first: i == 0,
-                end: is_end,
-                value,
-            });
-        }
+    for i in 0..=count {
+        let remaining = count - i;
+        let is_end = remaining == 0;
+        let value = if !is_end {
+            let (byte_val, _ts) = memory_state.read_byte(buf_addr.wrapping_add(i));
+            byte_val
+        } else {
+            0
+        };
+        ops.push(CommitOperation {
+            timestamp,
+            index: start_index.wrapping_add(i),
+            address: buf_addr.wrapping_add(i),
+            count: remaining,
+            first: i == 0,
+            end: is_end,
+            value,
+        });
     }
+
     ops
 }
 
@@ -1452,6 +1479,9 @@ pub struct Traces {
 
     /// REGISTER table for register initialization/finalization
     pub register: TraceTable<GoldilocksField, GoldilocksExtension>,
+
+    /// Committed public output bytes recovered during trace generation.
+    pub public_output_bytes: Vec<u8>,
 
     /// BRANCH target calculation traces (wrapped in Vec for uniform architecture)
     pub branches: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
@@ -1636,7 +1666,7 @@ impl Traces {
         // Initialize memory state from ELF so first accesses get correct old_value.
         let mut memory_state = MemoryState::from_elf(elf);
         let mut register_state = RegisterState::new(elf.entry_point);
-        let (mut memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops) =
+        let (mut memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops, commit_ops) =
             collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
 
         // HALT finalization: 33 register MEMW operations at timestamp u64::MAX.
@@ -1715,7 +1745,6 @@ impl Traces {
         // PHASE 4: All → Bitwise lookups
         // =====================================================================
         bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
-        bitwise_ops.extend(collect_bitwise_from_memw(&memw_ops));
         bitwise_ops.extend(collect_bitwise_from_mul(&mul_ops));
         bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops));
         bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
@@ -1723,8 +1752,11 @@ impl Traces {
         // PAGE tables do IS_BYTE lookups for init and fini values (C1, C2)
         bitwise_ops.extend(collect_bitwise_from_page(elf, &memory_state));
 
-        // Expand COMMIT ECALL operations into per-byte rows
-        let commit_ops = expand_commit_operations(&cpu_ops, &memory_state);
+        let public_output_bytes: Vec<u8> = commit_ops
+            .iter()
+            .filter(|op| !op.end)
+            .map(|op| op.value)
+            .collect();
         // COMMIT table sends IsByte and IsHalfword lookups
         bitwise_ops.extend(collect_bitwise_from_commit(&commit_ops));
 
@@ -1827,6 +1859,7 @@ impl Traces {
             pages,
             page_configs,
             register: register_trace,
+            public_output_bytes,
             branches,
             halt: halt_trace,
             commit: commit_trace,
@@ -1857,7 +1890,7 @@ impl Traces {
         // Entry point = first instruction's PC (start of execution)
         let entry_point = cpu_ops.first().map_or(0, |op| op.decode.pc);
         let mut register_state = RegisterState::new(entry_point);
-        let (mut memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops) =
+        let (mut memw_ops, load_ops, mut lt_ops, shift_ops, mut bitwise_ops, commit_ops) =
             collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
 
         // HALT finalization: 33 register MEMW operations at timestamp u64::MAX.
@@ -1936,15 +1969,17 @@ impl Traces {
         // PHASE 4: All → Bitwise lookups
         // =====================================================================
         bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
-        bitwise_ops.extend(collect_bitwise_from_memw(&memw_ops));
         bitwise_ops.extend(collect_bitwise_from_mul(&mul_ops));
         bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops));
         bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
         bitwise_ops.extend(shift::collect_bitwise_from_shift(&shift_ops));
 
-        // Expand COMMIT ECALL operations into per-byte rows
-        let commit_ops = expand_commit_operations(&cpu_ops, &memory_state);
-        // COMMIT table sends IsByte and IsHalfword lookups
+        let public_output_bytes: Vec<u8> = commit_ops
+            .iter()
+            .filter(|op| !op.end)
+            .map(|op| op.value)
+            .collect();
+        // COMMIT table sends IsHalfword lookups
         bitwise_ops.extend(collect_bitwise_from_commit(&commit_ops));
 
         // CPU padding rows send IS_BYTE with all-zero values.
@@ -2031,6 +2066,7 @@ impl Traces {
             pages,
             page_configs,
             register: register_trace,
+            public_output_bytes,
             branches,
             halt: halt_trace,
             commit: commit_trace,

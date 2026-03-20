@@ -9,7 +9,7 @@ use super::{
 use crate::{
     config::Commitment,
     domain::new_verifier_domain,
-    lookup::{LOGUP_CHALLENGE_ALPHA, LOGUP_NUM_CHALLENGES, compute_alpha_powers},
+    lookup::{LOGUP_CHALLENGE_ALPHA, LOGUP_NUM_CHALLENGES, PackingShifts, compute_alpha_powers},
     proof::stark::{DeepPolynomialOpening, MultiProof},
 };
 use crypto::{fiat_shamir::is_transcript::IsStarkTranscript, merkle_tree::proof::Proof};
@@ -331,12 +331,14 @@ pub trait IsStarkVerifier<
 
         let ood_frame =
             (proof.trace_ood_evaluations).into_frame(num_main_trace_columns, air.step_size());
+        let packing_shifts = PackingShifts::<FieldExtension>::new();
         let transition_evaluation_context = TransitionEvaluationContext::new_verifier(
             &ood_frame,
             &periodic_values,
             &challenges.rap_challenges,
             &logup_alpha_powers,
             &logup_table_offset,
+            &packing_shifts,
         );
         let transition_ood_frame_evaluations =
             air.compute_transition(&transition_evaluation_context);
@@ -851,6 +853,7 @@ pub trait IsStarkVerifier<
         airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
         multi_proof: &MultiProof<Field, FieldExtension, PI>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+        expected_bus_balance: &FieldElement<FieldExtension>,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
@@ -987,11 +990,14 @@ pub trait IsStarkVerifier<
         }
 
         // =====================================================================
-        // Bus Balance Check: Σ table_contribution = 0
+        // Bus Balance Check: Σ table_contribution = expected_bus_balance
         // =====================================================================
         // For LogUp with circular constraints, each table's total contribution L
         // (sum of all per-row terms) is exposed as a public input. The bus balances
-        // when the sum of all table contributions equals zero.
+        // when the sum of all table contributions equals the expected target.
+        // When all bus participants are in-trace, the target is zero. When some
+        // receiver contributions are computed externally (e.g. verifier-computed
+        // COMMIT output bus), the target is the missing positive remainder.
 
         if needs_lookup_challenges {
             let mut total = FieldElement::<FieldExtension>::zero();
@@ -1003,11 +1009,11 @@ pub trait IsStarkVerifier<
                 }
             }
 
-            if total != FieldElement::zero() {
+            if total != *expected_bus_balance {
                 #[cfg(not(feature = "test_fiat_shamir"))]
                 error!(
-                    "LogUp bus does not balance: sum of accumulated values is not zero. total={:?}",
-                    total
+                    "LogUp bus does not balance: sum of accumulated values does not match target. total={:?}, target={:?}",
+                    total, expected_bus_balance
                 );
                 return false;
             }
@@ -1030,8 +1036,10 @@ pub trait IsStarkVerifier<
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
         PI: Clone,
     {
-        let multi_proof = MultiProof::new(vec![proof.clone()]);
-        Self::multi_verify(&[air], &multi_proof, transcript)
+        let multi_proof = MultiProof {
+            proofs: vec![proof.clone()],
+        };
+        Self::multi_verify(&[air], &multi_proof, transcript, &FieldElement::zero())
     }
 
     /// Replays rounds 2, 3 and 4 of the protocol for a given proof, assuming round 1 has
