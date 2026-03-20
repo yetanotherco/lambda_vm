@@ -254,7 +254,13 @@ fn cmd_execute(elf_path: PathBuf, flamegraph_path: Option<PathBuf>) -> ExitCode 
     ExitCode::SUCCESS
 }
 
-fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, blowup: Option<u8>, time: bool, max_rows: Option<usize>) -> ExitCode {
+fn cmd_prove(
+    elf_path: PathBuf,
+    output_path: PathBuf,
+    blowup: Option<u8>,
+    time: bool,
+    max_rows: Option<usize>,
+) -> ExitCode {
     eprintln!("Reading ELF file...");
     let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
@@ -305,8 +311,8 @@ fn cmd_prove(elf_path: PathBuf, output_path: PathBuf, blowup: Option<u8>, time: 
             prover::prove_with_options(&elf_data, &opts, &max_rows_config)
         }
         None => {
-            let opts = GoldilocksCubicProofOptions::with_blowup(2)
-                .expect("blowup=2 is always valid");
+            let opts =
+                GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid");
             eprintln!("Generating proof...");
             prover::prove_with_options(&elf_data, &opts, &max_rows_config)
         }

@@ -1514,7 +1514,9 @@ pub trait IsStarkProver<
         // making room for the LDE pool buffers which are much larger (blowup_factor × N).
         #[cfg(feature = "disk-spill")]
         for (_, trace, _) in air_trace_pairs.iter_mut() {
-            trace.main_table.spill_to_disk()
+            trace
+                .main_table
+                .spill_to_disk()
                 .map_err(|e| ProvingError::WrongParameter(format!("disk-spill early main: {e}")))?;
         }
 
@@ -1664,7 +1666,9 @@ pub trait IsStarkProver<
         // needed in heap — push it back to mmap to free RAM for aux trace building.
         #[cfg(feature = "disk-spill")]
         for (_, trace, _) in air_trace_pairs.iter_mut() {
-            trace.main_table.spill_to_disk()
+            trace
+                .main_table
+                .spill_to_disk()
                 .map_err(|e| ProvingError::WrongParameter(format!("disk-spill late main: {e}")))?;
         }
 
@@ -1951,8 +1955,7 @@ pub trait IsStarkProver<
 
                 #[cfg(feature = "instruments")]
                 {
-                    let sub_ops =
-                        crate::instruments::take_round_sub_ops().unwrap_or_default();
+                    let sub_ops = crate::instruments::take_round_sub_ops().unwrap_or_default();
                     table_timings.push((
                         air.name().to_string(),
                         air_trace_pairs[idx].1.num_rows(),
@@ -1968,104 +1971,104 @@ pub trait IsStarkProver<
         // ----- non-disk-spill path: reconstruct LDE from trace (original flow) -----
         #[cfg(not(feature = "disk-spill"))]
         {
-        for chunk_start in (0..num_airs).step_by(k) {
-            let chunk_end = (chunk_start + k).min(num_airs);
-            let chunk_size = chunk_end - chunk_start;
+            for chunk_start in (0..num_airs).step_by(k) {
+                let chunk_end = (chunk_start + k).min(num_airs);
+                let chunk_size = chunk_end - chunk_start;
 
-            let chunk_transcripts = &mut table_transcripts[chunk_start..chunk_end];
+                let chunk_transcripts = &mut table_transcripts[chunk_start..chunk_end];
 
-            #[cfg(feature = "parallel")]
-            let iter = pool_sets[..chunk_size]
-                .par_iter_mut()
-                .zip(chunk_transcripts.par_iter_mut())
-                .enumerate();
-            #[cfg(not(feature = "parallel"))]
-            let iter = pool_sets[..chunk_size]
-                .iter_mut()
-                .zip(chunk_transcripts.iter_mut())
-                .enumerate();
+                #[cfg(feature = "parallel")]
+                let iter = pool_sets[..chunk_size]
+                    .par_iter_mut()
+                    .zip(chunk_transcripts.par_iter_mut())
+                    .enumerate();
+                #[cfg(not(feature = "parallel"))]
+                let iter = pool_sets[..chunk_size]
+                    .iter_mut()
+                    .zip(chunk_transcripts.iter_mut())
+                    .enumerate();
 
-            let chunk_results: Vec<Result<_, ProvingError>> = iter
-                .map(|(j, (pool, table_transcript))| {
-                    let idx = chunk_start + j;
-                    let (air, trace, pub_inputs) = &air_trace_pairs[idx];
-                    let metadata = &metadatas[idx];
-                    let domain = &domains[idx];
-                    let twiddles = &twiddle_caches[idx];
+                let chunk_results: Vec<Result<_, ProvingError>> = iter
+                    .map(|(j, (pool, table_transcript))| {
+                        let idx = chunk_start + j;
+                        let (air, trace, pub_inputs) = &air_trace_pairs[idx];
+                        let metadata = &metadatas[idx];
+                        let domain = &domains[idx];
+                        let twiddles = &twiddle_caches[idx];
 
+                        #[cfg(feature = "instruments")]
+                        let table_start = Instant::now();
+
+                        #[cfg(feature = "instruments")]
+                        let lde_start = Instant::now();
+                        let round_1_result = Self::reconstruct_round1(
+                            *air,
+                            *trace,
+                            domain,
+                            metadata,
+                            twiddles,
+                            &mut pool.main,
+                            &mut pool.aux,
+                        )?;
+                        #[cfg(feature = "instruments")]
+                        let lde_dur = lde_start.elapsed();
+
+                        if let Some(ref bpi) = round_1_result.bus_public_inputs {
+                            table_transcript.append_field_element(&bpi.table_contribution);
+                        }
+
+                        let proof = Self::prove_rounds_2_to_4(
+                            *air,
+                            *pub_inputs,
+                            &round_1_result,
+                            table_transcript,
+                            domain,
+                        )?;
+
+                        // Collect per-table sub-op timing via TLS.
+                        // Both the store (inside prove_rounds_2_to_4) and this take run on the
+                        // same rayon worker thread, so sub-ops are valid in both sequential and
+                        // parallel mode.
+                        #[cfg(feature = "instruments")]
+                        let table_timing = {
+                            let mut sub_ops =
+                                crate::instruments::take_round_sub_ops().unwrap_or_default();
+                            sub_ops.trace_lde += lde_dur;
+                            (
+                                air.name().to_string(),
+                                trace.num_rows(),
+                                table_start.elapsed(),
+                                sub_ops,
+                            )
+                        };
+
+                        // Return column Vecs to pool (zero-copy move back)
+                        let (main_cols, aux_cols) = round_1_result.lde_trace.into_columns();
+                        for (slot, col) in pool.main.iter_mut().zip(main_cols) {
+                            *slot = col;
+                        }
+                        for (slot, col) in pool.aux.iter_mut().zip(aux_cols) {
+                            *slot = col;
+                        }
+
+                        #[cfg(feature = "instruments")]
+                        return Ok((proof, table_timing));
+                        #[cfg(not(feature = "instruments"))]
+                        Ok(proof)
+                    })
+                    .collect();
+
+                for result in chunk_results {
                     #[cfg(feature = "instruments")]
-                    let table_start = Instant::now();
-
-                    #[cfg(feature = "instruments")]
-                    let lde_start = Instant::now();
-                    let round_1_result = Self::reconstruct_round1(
-                        *air,
-                        *trace,
-                        domain,
-                        metadata,
-                        twiddles,
-                        &mut pool.main,
-                        &mut pool.aux,
-                    )?;
-                    #[cfg(feature = "instruments")]
-                    let lde_dur = lde_start.elapsed();
-
-                    if let Some(ref bpi) = round_1_result.bus_public_inputs {
-                        table_transcript.append_field_element(&bpi.table_contribution);
+                    {
+                        let (proof, timing) = result?;
+                        proofs.push(proof);
+                        table_timings.push(timing);
                     }
-
-                    let proof = Self::prove_rounds_2_to_4(
-                        *air,
-                        *pub_inputs,
-                        &round_1_result,
-                        table_transcript,
-                        domain,
-                    )?;
-
-                    // Collect per-table sub-op timing via TLS.
-                    // Both the store (inside prove_rounds_2_to_4) and this take run on the
-                    // same rayon worker thread, so sub-ops are valid in both sequential and
-                    // parallel mode.
-                    #[cfg(feature = "instruments")]
-                    let table_timing = {
-                        let mut sub_ops =
-                            crate::instruments::take_round_sub_ops().unwrap_or_default();
-                        sub_ops.trace_lde += lde_dur;
-                        (
-                            air.name().to_string(),
-                            trace.num_rows(),
-                            table_start.elapsed(),
-                            sub_ops,
-                        )
-                    };
-
-                    // Return column Vecs to pool (zero-copy move back)
-                    let (main_cols, aux_cols) = round_1_result.lde_trace.into_columns();
-                    for (slot, col) in pool.main.iter_mut().zip(main_cols) {
-                        *slot = col;
-                    }
-                    for (slot, col) in pool.aux.iter_mut().zip(aux_cols) {
-                        *slot = col;
-                    }
-
-                    #[cfg(feature = "instruments")]
-                    return Ok((proof, table_timing));
                     #[cfg(not(feature = "instruments"))]
-                    Ok(proof)
-                })
-                .collect();
-
-            for result in chunk_results {
-                #[cfg(feature = "instruments")]
-                {
-                    let (proof, timing) = result?;
-                    proofs.push(proof);
-                    table_timings.push(timing);
+                    proofs.push(result?);
                 }
-                #[cfg(not(feature = "instruments"))]
-                proofs.push(result?);
             }
-        }
         } // end #[cfg(not(feature = "disk-spill"))]
 
         #[cfg(feature = "instruments")]
