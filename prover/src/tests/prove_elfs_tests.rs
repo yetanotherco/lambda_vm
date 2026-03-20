@@ -1831,9 +1831,9 @@ fn test_verify_rejects_inflated_table_counts() {
 }
 
 /// Regression test: addiw with negative immediate must verify.
-/// Bug: arg2_sign_bit was computed from arg2 (sign-extended immediate)
-/// instead of rv2 (raw register value). The bus sends MSB16[rv2[1]] → arg2_sign_bit,
-/// so for I-type instructions (rs2=0, rv2=0), arg2_sign_bit must be 0.
+/// arg2_sign_bit is the sign bit of rv2 (bit 31), not of arg2, per spec
+/// constraint CPU-CE61: MSB16[arg2_sign_bit; rv2[1]].
+/// For I-type word instructions (rs2=x0, rv2=0), arg2_sign_bit must be 0.
 #[test]
 fn test_addiw_neg_immediate() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_addiw_neg");
