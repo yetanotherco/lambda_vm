@@ -201,7 +201,7 @@ pub mod cols {
     pub const ARG1_6: usize = 52;
     pub const ARG1_7: usize = 53;
 
-    /// arg2_sign_bit: Sign bit of arg2 as 32-bit word
+    /// arg2_sign_bit: Sign bit of rv2 as 32-bit word (bit 31 of rv2; used to define arg2's extension)
     pub const ARG2_SIGN_BIT: usize = 54;
 
     /// arg2[0..8]: Extended rv2/imm as DWordBL (8 bytes)
@@ -839,7 +839,7 @@ pub fn generate_cpu_trace(
 
         // Compute and store arg2
         let arg2 = op.compute_arg2();
-        let arg2_sign_bit = d.word_instr && CpuOperation::sign_bit_32(arg2);
+        let arg2_sign_bit = d.word_instr && CpuOperation::sign_bit_32(op.rv2);
         data[base + cols::ARG2_SIGN_BIT] = FE::from(arg2_sign_bit as u64);
         for i in 0..8 {
             data[base + cols::ARG2[i]] = FE::from((arg2 >> (i * 8)) & 0xFF);
