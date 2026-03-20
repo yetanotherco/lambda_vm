@@ -394,16 +394,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // SHIFT-C1: AND_BYTE[shift, 15] → bit_shift | left (= μ - direction)
     interactions.push(BusInteraction::sender(
         BusId::AndByte,
-        Multiplicity::Linear(vec![
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::MU,
-            },
-            LinearTerm::Column {
-                coefficient: -1,
-                column: cols::DIRECTION,
-            },
-        ]),
+        Multiplicity::Diff(cols::MU, cols::DIRECTION),
         vec![
             BusValue::Packed {
                 start_column: cols::SHIFT_AMOUNT,
@@ -465,13 +456,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     // SHIFT-C4.i: HWSL[in[i], bit_shift] → [X[i], Y[i]] for i∈[0,3] | 1 - zbs
     // HWSL receiver: [x + 256*y (halfword), z (shift amount), SLL, SLLC]
-    let one_minus_zbs = Multiplicity::Linear(vec![
-        LinearTerm::Constant(1),
-        LinearTerm::Column {
-            coefficient: -1,
-            column: cols::ZBS,
-        },
-    ]);
+    let one_minus_zbs = Multiplicity::Negated(cols::ZBS);
     for i in 0..4 {
         interactions.push(BusInteraction::sender(
             BusId::Hwsl,

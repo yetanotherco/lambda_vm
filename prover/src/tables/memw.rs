@@ -325,21 +325,6 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // CM10/11: byte 1, multiplicity w2 = write2 + write4 + write8
     // address_add[0] is virtual: lo = base_address_0 + 1 - 2^32 * overflow[0]
     //                            hi = base_address_1 + overflow[0]
-    let w2_mult = Multiplicity::Linear(vec![
-        LinearTerm::Column {
-            coefficient: 1,
-            column: cols::WRITE2,
-        },
-        LinearTerm::Column {
-            coefficient: 1,
-            column: cols::WRITE4,
-        },
-        LinearTerm::Column {
-            coefficient: 1,
-            column: cols::WRITE8,
-        },
-    ]);
-
     let addr_add_0_lo = BusValue::linear(vec![
         LinearTerm::Column {
             coefficient: 1,
@@ -365,7 +350,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // CM10: send old token for byte 1
     interactions.push(BusInteraction::sender(
         BusId::Memory,
-        w2_mult.clone(),
+        Multiplicity::Sum3(cols::WRITE2, cols::WRITE4, cols::WRITE8),
         vec![
             BusValue::Packed {
                 start_column: cols::IS_REGISTER,
@@ -391,7 +376,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // CM11: receive new token for byte 1
     interactions.push(BusInteraction::receiver(
         BusId::Memory,
-        w2_mult,
+        Multiplicity::Sum3(cols::WRITE2, cols::WRITE4, cols::WRITE8),
         vec![
             BusValue::Packed {
                 start_column: cols::IS_REGISTER,
@@ -786,20 +771,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // MEMW-C5: LT[1; old_timestamp[1], timestamp] with w2
     interactions.push(BusInteraction::sender(
         BusId::Lt,
-        Multiplicity::Linear(vec![
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::WRITE2,
-            },
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::WRITE4,
-            },
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::WRITE8,
-            },
-        ]),
+        Multiplicity::Sum3(cols::WRITE2, cols::WRITE4, cols::WRITE8),
         vec![
             BusValue::Packed {
                 start_column: cols::old_timestamp(1)[0],
