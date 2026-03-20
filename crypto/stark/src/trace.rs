@@ -141,6 +141,14 @@ where
         self.aux_table.set(row, col, value);
     }
 
+    /// Writes an entire column to the auxiliary table, consuming the Vec (no clone).
+    pub fn set_aux_column(&mut self, col_idx: usize, column: Vec<FieldElement<E>>) {
+        let width = self.aux_table.width;
+        for (row, value) in column.into_iter().enumerate() {
+            self.aux_table.data[row * width + col_idx] = value;
+        }
+    }
+
     /// Allocates the auxiliary table with zeros.
     /// Single allocation - efficient for large tables.
     pub fn allocate_aux_table(&mut self, num_aux_columns: usize) {
