@@ -1092,9 +1092,8 @@ where
             build_accumulated_column_from_terms(acc_col_idx, &all_columns, trace);
 
         // Write committed columns to trace using move semantics (no clone per element)
-        for col_idx in 0..num_committed_pairs {
-            let col_data = std::mem::take(&mut all_columns[col_idx]);
-            trace.set_aux_column(col_idx, col_data);
+        for (col_idx, col) in all_columns.iter_mut().take(num_committed_pairs).enumerate() {
+            trace.set_aux_column(col_idx, std::mem::take(col));
         }
 
         Some(BusPublicInputs {
