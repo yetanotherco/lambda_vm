@@ -1509,6 +1509,15 @@ pub trait IsStarkProver<
             twiddle_caches.push(twiddles);
         }
 
+        // Spill all main trace tables to mmap before allocating pool buffers.
+        // This frees the heap-allocated main trace data (~120 cols × N rows × 8 bytes each),
+        // making room for the LDE pool buffers which are much larger (blowup_factor × N).
+        #[cfg(feature = "disk-spill")]
+        for (_, trace, _) in air_trace_pairs.iter_mut() {
+            trace.main_table.spill_to_disk()
+                .map_err(|e| ProvingError::WrongParameter(format!("disk-spill early main: {e}")))?;
+        }
+
         // Allocate K independent LDE column buffer pool sets for parallel table processing.
         let k = table_parallelism().min(num_airs).max(1);
         let mut pool_sets: Vec<PoolSet<Field, FieldExtension>> = (0..k)
@@ -1535,6 +1544,13 @@ pub trait IsStarkProver<
         let phase_start = Instant::now();
 
         let mut main_commits: Vec<MainCommitData<Field>> = Vec::with_capacity(num_airs);
+
+        // Spilled LDE trace tables: one per AIR, populated during Phase A (main) and Phase C (aux).
+        // In Rounds 2-4 these replace the reconstruct_round1 flow — LDE data is read from mmap
+        // instead of being recomputed from the trace.
+        #[cfg(feature = "disk-spill")]
+        let mut spilled_ldes: Vec<Option<LDETraceTable<Field, FieldExtension>>> =
+            (0..num_airs).map(|_| None).collect();
 
         for chunk_start in (0..num_airs).step_by(k) {
             let chunk_end = (chunk_start + k).min(num_airs);
@@ -1568,16 +1584,71 @@ pub trait IsStarkProver<
                 .collect();
 
             // Sequential: append roots to shared transcript (Fiat-Shamir ordering)
-            for result in chunk_results {
+            #[allow(unused_variables, unused_mut)]
+            for (j, result) in chunk_results.into_iter().enumerate() {
                 let (tree, root, pre_tree, pre_root, n_pre) = result?;
                 if let Some(ref pre_r) = pre_root {
                     transcript.append_bytes(pre_r);
                 }
                 transcript.append_bytes(&root);
+
+                // Spill the main LDE columns from the pool to a temp-file mmap before
+                // the pool is overwritten by the next chunk. Also spill Merkle tree nodes
+                // to disk — they remain accessible through mmap for Rounds 2-4 openings.
+                #[cfg(feature = "disk-spill")]
+                {
+                    let idx = chunk_start + j;
+                    let (air, trace, _) = &air_trace_pairs[idx];
+                    let num_main_cols = trace.num_main_columns;
+                    let spilled = LDETraceTable::spill_main_from_pool(
+                        &pool_sets[j].main,
+                        num_main_cols,
+                        air.step_size(),
+                        domains[idx].blowup_factor,
+                    )
+                    .map_err(|e| {
+                        ProvingError::WrongParameter(format!(
+                            "disk-spill main LDE table {idx}: {e}"
+                        ))
+                    })?;
+                    spilled_ldes[idx] = Some(spilled);
+                }
+
+                #[allow(unused_mut)]
+                let mut main_tree = Arc::new(tree);
+                #[cfg(feature = "disk-spill")]
+                {
+                    Arc::get_mut(&mut main_tree)
+                        .expect("sole Arc owner")
+                        .spill_nodes_to_disk()
+                        .map_err(|e| {
+                            ProvingError::WrongParameter(format!(
+                                "disk-spill main Merkle tree: {e}"
+                            ))
+                        })?;
+                }
+
+                let precomputed_tree = pre_tree.map(|t| {
+                    let mut arc = Arc::new(t);
+                    #[cfg(feature = "disk-spill")]
+                    {
+                        Arc::get_mut(&mut arc)
+                            .expect("sole Arc owner")
+                            .spill_nodes_to_disk()
+                            .map_err(|e| {
+                                ProvingError::WrongParameter(format!(
+                                    "disk-spill precomputed Merkle tree: {e}"
+                                ))
+                            })
+                            .unwrap();
+                    }
+                    arc
+                });
+
                 main_commits.push(MainCommitData {
-                    main_tree: Arc::new(tree),
+                    main_tree,
                     main_root: root,
-                    precomputed_tree: pre_tree.map(Arc::new),
+                    precomputed_tree,
                     precomputed_root: pre_root,
                     num_precomputed_cols: n_pre,
                 });
@@ -1586,6 +1657,16 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let main_commits_elapsed = phase_start.elapsed();
+
+        // Re-spill main traces that were rehydrated by extract_columns_main_into
+        // during Phase A. After Phase A the pool holds the LDE data (already
+        // snapshotted to mmap above), so the original trace data is no longer
+        // needed in heap — push it back to mmap to free RAM for aux trace building.
+        #[cfg(feature = "disk-spill")]
+        for (_, trace, _) in air_trace_pairs.iter_mut() {
+            trace.main_table.spill_to_disk()
+                .map_err(|e| ProvingError::WrongParameter(format!("disk-spill late main: {e}")))?;
+        }
 
         // =====================================================================
         // Round 1, Phase B: Sample shared LogUp challenges
@@ -1700,11 +1781,43 @@ pub trait IsStarkProver<
                 .collect();
 
             // Sequential: append aux roots to forked transcripts
+            #[allow(unused_variables)]
             for (j, result) in chunk_aux.into_iter().enumerate() {
-                let (aux_tree, aux_root) = result?;
+                #[allow(unused_mut)]
+                let (mut aux_tree, aux_root) = result?;
                 if let Some(ref root) = aux_root {
                     table_transcripts[chunk_start + j].append_bytes(root);
                 }
+
+                // Spill aux LDE columns from pool and aux Merkle tree nodes to disk.
+                #[cfg(feature = "disk-spill")]
+                {
+                    let idx = chunk_start + j;
+                    let (air, trace, _) = &air_trace_pairs[idx];
+                    if air.has_aux_trace() {
+                        let num_aux_cols = trace.num_aux_columns;
+                        if let Some(ref mut spilled) = spilled_ldes[idx] {
+                            spilled
+                                .add_aux_from_pool(&pool_sets[j].aux, num_aux_cols)
+                                .map_err(|e| {
+                                    ProvingError::WrongParameter(format!(
+                                        "disk-spill aux LDE table {idx}: {e}"
+                                    ))
+                                })?;
+                        }
+                    }
+                    if let Some(ref mut tree_arc) = aux_tree {
+                        Arc::get_mut(tree_arc)
+                            .expect("sole Arc owner")
+                            .spill_nodes_to_disk()
+                            .map_err(|e| {
+                                ProvingError::WrongParameter(format!(
+                                    "disk-spill aux Merkle tree {idx}: {e}"
+                                ))
+                            })?;
+                    }
+                }
+
                 aux_results.push((aux_tree, aux_root));
             }
         }
@@ -1751,6 +1864,10 @@ pub trait IsStarkProver<
         // =====================================================================
         // Each chunk of K tables is processed in parallel. Each worker gets its
         // own pool set and transcript fork. Pool sets are reused across chunks.
+        //
+        // disk-spill path: LDE data is read from mmap-backed spilled_ldes instead
+        // of being recomputed via reconstruct_round1. This avoids the peak memory
+        // spike of holding both the trace and its LDE in RAM simultaneously.
 
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
@@ -1763,6 +1880,94 @@ pub trait IsStarkProver<
         )> = Vec::with_capacity(num_airs);
 
         let mut proofs = Vec::with_capacity(num_airs);
+
+        // ----- disk-spill path: read from spilled LDEs -----
+        #[cfg(feature = "disk-spill")]
+        {
+            for idx in 0..num_airs {
+                let (air, _trace, pub_inputs) = &air_trace_pairs[idx];
+                let metadata = &metadatas[idx];
+                let domain = &domains[idx];
+                let table_transcript = &mut table_transcripts[idx];
+
+                #[cfg(feature = "instruments")]
+                let table_start = Instant::now();
+
+                // Take the spilled LDE (mmap-backed) — no LDE recomputation needed
+                let lde_trace = spilled_ldes[idx]
+                    .take()
+                    .expect("spilled LDE must exist for every AIR");
+
+                // Build Round1 from the spilled LDE + stored Merkle trees
+                let main = Round1CommitmentData::<Field> {
+                    lde_trace_merkle_tree: Arc::clone(&metadata.main_merkle_tree),
+                    lde_trace_merkle_root: metadata.main_merkle_root,
+                    precomputed_merkle_tree: metadata
+                        .precomputed_merkle_tree
+                        .as_ref()
+                        .map(Arc::clone),
+                    precomputed_merkle_root: metadata.precomputed_merkle_root,
+                    num_precomputed_cols: metadata.num_precomputed_cols,
+                };
+
+                let aux = if air.has_aux_trace() {
+                    Some(Round1CommitmentData::<FieldExtension> {
+                        lde_trace_merkle_tree: Arc::clone(
+                            metadata
+                                .aux_merkle_tree
+                                .as_ref()
+                                .expect("aux tree must exist when has_aux_trace"),
+                        ),
+                        lde_trace_merkle_root: metadata
+                            .aux_merkle_root
+                            .expect("aux root must exist when has_aux_trace"),
+                        precomputed_merkle_tree: None,
+                        precomputed_merkle_root: None,
+                        num_precomputed_cols: 0,
+                    })
+                } else {
+                    None
+                };
+
+                let round_1_result = Round1 {
+                    lde_trace,
+                    main,
+                    aux,
+                    rap_challenges: metadata.rap_challenges.clone(),
+                    bus_public_inputs: metadata.bus_public_inputs.clone(),
+                };
+
+                if let Some(ref bpi) = round_1_result.bus_public_inputs {
+                    table_transcript.append_field_element(&bpi.table_contribution);
+                }
+
+                let proof = Self::prove_rounds_2_to_4(
+                    *air,
+                    *pub_inputs,
+                    &round_1_result,
+                    table_transcript,
+                    domain,
+                )?;
+
+                #[cfg(feature = "instruments")]
+                {
+                    let sub_ops =
+                        crate::instruments::take_round_sub_ops().unwrap_or_default();
+                    table_timings.push((
+                        air.name().to_string(),
+                        air_trace_pairs[idx].1.num_rows(),
+                        table_start.elapsed(),
+                        sub_ops,
+                    ));
+                }
+
+                proofs.push(proof);
+            }
+        }
+
+        // ----- non-disk-spill path: reconstruct LDE from trace (original flow) -----
+        #[cfg(not(feature = "disk-spill"))]
+        {
         for chunk_start in (0..num_airs).step_by(k) {
             let chunk_end = (chunk_start + k).min(num_airs);
             let chunk_size = chunk_end - chunk_start;
@@ -1861,6 +2066,7 @@ pub trait IsStarkProver<
                 proofs.push(result?);
             }
         }
+        } // end #[cfg(not(feature = "disk-spill"))]
 
         #[cfg(feature = "instruments")]
         {
