@@ -1074,13 +1074,6 @@ where
             )
         };
 
-        // Write only committed columns to trace
-        for (col_idx, col_data) in committed_columns.iter().enumerate() {
-            for (row, value) in col_data.iter().enumerate() {
-                trace.set_aux(row, col_idx, value.clone());
-            }
-        }
-
         #[cfg(feature = "debug-checks")]
         let (per_bus_sums, per_bus_sender_sums, per_bus_receiver_sums) =
             compute_debug_bus_sums_batched(
@@ -1097,6 +1090,12 @@ where
         let acc_col_idx = num_committed_pairs; // accumulated column in trace follows committed columns
         let table_contribution =
             build_accumulated_column_from_terms(acc_col_idx, &all_columns, trace);
+
+        // Write committed columns to trace using move semantics (no clone per element)
+        for col_idx in 0..num_committed_pairs {
+            let col_data = std::mem::take(&mut all_columns[col_idx]);
+            trace.set_aux_column(col_idx, col_data);
+        }
 
         Some(BusPublicInputs {
             table_contribution,
@@ -1459,6 +1458,50 @@ where
 
     let negate = !table_interaction.is_sender;
 
+    // Sparse path: skip rows where multiplicity is zero.
+    // For tables like BITWISE (2^20 rows, ~1K active), this skips 99.9% of work.
+    // Short-circuit: Multiplicity::One means all rows active — skip the scan.
+    #[cfg(not(feature = "debug-checks"))]
+    if !matches!(table_interaction.multiplicity, Multiplicity::One) {
+        let zero_f = FieldElement::<F>::zero();
+        let active_rows: Vec<usize> = (0..trace_len)
+            .filter(|&row| multiplicities[row] != zero_f)
+            .collect();
+        let k = active_rows.len();
+        if k == 0 {
+            return vec![FieldElement::<E>::zero(); trace_len];
+        }
+
+        let shifts = PackingShifts::<F>::new();
+        let bus_id_f = FieldElement::<F>::from(table_interaction.bus_id);
+        let mut fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(k);
+        for &row in &active_rows {
+            let mut lc = &bus_id_f * &alpha_powers[0];
+            let mut alpha_offset = 1;
+            for bv in &table_interaction.values {
+                let consumed = bv.accumulate_fingerprint(
+                    main_segment_cols,
+                    row,
+                    &alpha_powers,
+                    alpha_offset,
+                    &mut lc,
+                    &shifts,
+                );
+                alpha_offset += consumed;
+            }
+            fingerprints.push(z - &lc);
+        }
+
+        FieldElement::inplace_batch_inverse(&mut fingerprints).expect("fingerprint is zero");
+
+        let mut result = vec![FieldElement::<E>::zero(); trace_len];
+        for (idx, &row) in active_rows.iter().enumerate() {
+            let term = &multiplicities[row] * &fingerprints[idx];
+            result[row] = if negate { -term } else { term };
+        }
+        return result;
+    }
+
     // Batch inversion: collect all fingerprints, invert once, then multiply back.
     // Compute fingerprint = z - (bus_id*α^0 + v0*α^1 + v1*α^2 + ...) using
     // base-field × extension-field multiplication (F×E→E) to avoid to_extension().
@@ -1610,6 +1653,84 @@ where
 
     let multiplicities_a = compute_multiplicities(interaction_a);
     let multiplicities_b = compute_multiplicities(interaction_b);
+
+    // Sparse path: collect active rows independently per interaction.
+    // AND/OR/XOR have mutually exclusive multiplicities, so active row sets differ.
+    // Skip fingerprint computation for rows where both multiplicities are zero.
+    #[cfg(not(feature = "debug-checks"))]
+    {
+        let both_dense = matches!(interaction_a.multiplicity, Multiplicity::One)
+            && matches!(interaction_b.multiplicity, Multiplicity::One);
+        if !both_dense {
+            let zero_f = FieldElement::<F>::zero();
+            let active_a: Vec<usize> = (0..trace_len)
+                .filter(|&row| multiplicities_a[row] != zero_f)
+                .collect();
+            let active_b: Vec<usize> = (0..trace_len)
+                .filter(|&row| multiplicities_b[row] != zero_f)
+                .collect();
+
+            let ka = active_a.len();
+            let kb = active_b.len();
+
+            // If both interactions are entirely zero, return zero column
+            if ka == 0 && kb == 0 {
+                return vec![FieldElement::<E>::zero(); trace_len];
+            }
+
+            let shifts = PackingShifts::<F>::new();
+            let bus_id_a = FieldElement::<F>::from(interaction_a.bus_id);
+            let bus_id_b = FieldElement::<F>::from(interaction_b.bus_id);
+
+            // Compute fingerprints for active rows only, concatenated for a single batch inverse
+            let mut all_fps: Vec<FieldElement<E>> = Vec::with_capacity(ka + kb);
+            for &row in &active_a {
+                let mut lc = &bus_id_a * &alpha_powers[0];
+                let mut alpha_offset = 1;
+                for bv in &interaction_a.values {
+                    let consumed = bv.accumulate_fingerprint(
+                        main_segment_cols,
+                        row,
+                        &alpha_powers,
+                        alpha_offset,
+                        &mut lc,
+                        &shifts,
+                    );
+                    alpha_offset += consumed;
+                }
+                all_fps.push(z - &lc);
+            }
+            for &row in &active_b {
+                let mut lc = &bus_id_b * &alpha_powers[0];
+                let mut alpha_offset = 1;
+                for bv in &interaction_b.values {
+                    let consumed = bv.accumulate_fingerprint(
+                        main_segment_cols,
+                        row,
+                        &alpha_powers,
+                        alpha_offset,
+                        &mut lc,
+                        &shifts,
+                    );
+                    alpha_offset += consumed;
+                }
+                all_fps.push(z - &lc);
+            }
+
+            FieldElement::inplace_batch_inverse(&mut all_fps).expect("fingerprint is zero");
+
+            let mut result = vec![FieldElement::<E>::zero(); trace_len];
+            for (idx, &row) in active_a.iter().enumerate() {
+                let term = &multiplicities_a[row] * &all_fps[idx];
+                result[row] = result[row].clone() + if negate_a { -term } else { term };
+            }
+            for (idx, &row) in active_b.iter().enumerate() {
+                let term = &multiplicities_b[row] * &all_fps[ka + idx];
+                result[row] = result[row].clone() + if negate_b { -term } else { term };
+            }
+            return result;
+        }
+    }
 
     // Compute fingerprints for both interactions using accumulate_fingerprint
     // (zero-allocation inner loop: F×E multiplication instead of to_extension())
