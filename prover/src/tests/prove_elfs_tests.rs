@@ -14,7 +14,7 @@
 //! TODO: LT bus (needs LT table integration)
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
-
+use math::field::element::FieldElement;
 use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData};
 use stark::proof::options::ProofOptions;
@@ -44,6 +44,7 @@ type E = GoldilocksExtension;
 ///
 /// Uses minimal bitwise (no full 2^20 preprocessed table) but DECODE is always preprocessed.
 fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
+    let _ = env_logger::builder().is_test(true).try_init();
     let proof_options = ProofOptions::default_test_options();
 
     // Create all AIRs including PAGE and REGISTER tables
@@ -62,17 +63,23 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
     let multi_proof =
         match Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])) {
             Ok(proof) => proof,
-            Err(e) => {
-                eprintln!("Prover error: {:?}", e);
-                return false;
-            }
+            Err(_) => return false,
         };
+
+    // Compute the verifier-side expected COMMIT bus balance from public output bytes
+    let expected_bus_balance = crate::compute_expected_commit_bus_balance(
+        &airs.air_refs(),
+        &multi_proof,
+        &traces.public_output_bytes,
+    )
+    .expect("fingerprint collision in test");
 
     // Verify using centralized air_refs() which includes all tables
     Verifier::multi_verify(
         &airs.air_refs(),
         &multi_proof,
         &mut DefaultTranscript::<E>::new(&[]),
+        &expected_bus_balance,
     )
 }
 
@@ -123,7 +130,12 @@ fn test_cpu_only_no_bus() {
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![&cpu_air];
     assert!(
-        Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
+        Verifier::multi_verify(
+            &airs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero(),
+        ),
         "CPU-only verification failed"
     );
 }
@@ -224,6 +236,20 @@ fn test_prove_elfs_arith_lui_8() {
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "Proof verification failed for arith_lui_8 program"
+    );
+}
+
+// Test AUIPC.
+// AUIPC uses rs1=x255 (PC register).
+// read_register1 must be 1 for rs1≠0, triggering the MEMW M1 interaction.
+#[test]
+fn test_prove_elfs_auipc() {
+    let (elf, logs, instructions) = run_asm_elf("auipc");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "auipc failed"
     );
 }
 
@@ -408,6 +434,17 @@ fn test_prove_elfs_test_mul_8() {
 }
 
 #[test]
+fn test_prove_elfs_mulw_neg() {
+    let (elf, logs, instructions) = run_asm_elf("mulw_neg");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "mulw_neg failed"
+    );
+}
+
+#[test]
 fn test_prove_elfs_test_div_8() {
     let (elf, logs, instructions) = run_asm_elf("test_div_8");
     let mut traces =
@@ -416,6 +453,45 @@ fn test_prove_elfs_test_div_8() {
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "test_div_8 failed"
+    );
+}
+
+// Test DIVW with negative operands (−100 / 7 = −14).
+// Result bit 31 is set, so rvd ≠ res. The DVRM bus must send res (CPU-CA46), not rvd.
+#[test]
+fn test_prove_elfs_divw() {
+    let (elf, logs, instructions) = run_asm_elf("divw");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "divw failed"
+    );
+}
+
+// Test REMW with negative operands (−100 % 7 = −2).
+// Result bit 31 is set, so rvd ≠ res. The DVRM bus must send res (CPU-CA46), not rvd.
+#[test]
+fn test_prove_elfs_remw() {
+    let (elf, logs, instructions) = run_asm_elf("remw");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "remw failed"
+    );
+}
+
+// Test DIVW/REMW with a negative divisor (arg2 bit 31 set).
+// Exercises arg2 sign extension via CPU-CE63 (signed * arg2_sign_bit).
+#[test]
+fn test_prove_elfs_sign_ext_edge_cases_8() {
+    let (elf, logs, instructions) = run_asm_elf("sign_ext_edge_cases_8");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "sign_ext_edge_cases_8 failed"
     );
 }
 
@@ -533,6 +609,10 @@ fn test_prove_elfs_test_sb_sh_8() {
     let (elf, logs, _instructions) = run_asm_elf("test_sb_sh_8");
     let mut traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default()).unwrap();
     assert!(
+        !traces.memws.is_empty(),
+        "test_sb_sh_8 should produce MEMW rows for byte/halfword memory accesses"
+    );
+    assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "test_sb_sh_8 failed"
     );
@@ -592,6 +672,114 @@ fn test_prove_elfs_all_instructions_64() {
     assert!(
         prove_and_verify_vm_minimal(&elf, &mut traces),
         "all_instructions_64 failed"
+    );
+}
+
+#[test]
+fn test_prove_elfs_test_commit_4() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+
+    // Verify public output matches the committed bytes [0xAA, 0xBB, 0xCC, 0xDD]
+    assert_eq!(
+        result.return_values.memory_values,
+        vec![0xAA, 0xBB, 0xCC, 0xDD],
+        "Public output should match committed bytes"
+    );
+
+    let mut traces = Traces::from_elf_and_logs(&elf, &result.logs, &Default::default()).unwrap();
+    assert_eq!(
+        traces.public_output_bytes,
+        result.return_values.memory_values
+    );
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "test_commit_4 failed"
+    );
+}
+
+/// Verifier REJECTS when page configs don't match the proven commit trace.
+///
+/// The prover generates a valid proof for test_commit_4 (which writes to page 0).
+/// The verifier uses only ELF pages (no runtime pages) → page mismatch →
+/// verification must fail.
+#[test]
+fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+
+    let proof_options = ProofOptions::default_test_options();
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+    let mut traces = Traces::from_elf_and_logs(&elf, &result.logs, &Default::default()).unwrap();
+
+    // Prover uses correct page configs
+    let table_counts = traces.table_counts();
+    let prover_airs = crate::VmAirs::new(
+        &elf,
+        &proof_options,
+        true,
+        &traces.page_configs,
+        &table_counts,
+    );
+    let proof = Prover::multi_prove(
+        prover_airs.air_trace_pairs(&mut traces),
+        &mut DefaultTranscript::<E>::new(&[]),
+    )
+    .expect("Prover failed");
+
+    // Verifier uses EMPTY runtime pages → missing stack/public-output pages
+    let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[]);
+    let verifier_airs =
+        crate::VmAirs::new(&elf, &proof_options, true, &wrong_configs, &table_counts);
+    let verifier_air_refs = verifier_airs.air_refs();
+    let expected_bus_balance = crate::compute_expected_commit_bus_balance(
+        &verifier_air_refs,
+        &proof,
+        &traces.public_output_bytes,
+    )
+    .expect("fingerprint collision in test");
+
+    let verified = Verifier::multi_verify(
+        &verifier_air_refs,
+        &proof,
+        &mut DefaultTranscript::<E>::new(&[]),
+        &expected_bus_balance,
+    );
+    assert!(
+        !verified,
+        "Verifier should REJECT when runtime pages are missing (commit public output page)"
+    );
+}
+
+#[test]
+fn test_verify_rejects_tampered_public_output() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_commit_4");
+    let proof_options = ProofOptions::default_test_options();
+    let vm_proof = crate::prove_with_options(&elf_bytes, &proof_options, &Default::default())
+        .expect("Prover should succeed for test_commit_4");
+    assert!(
+        crate::verify_with_options(&vm_proof, &elf_bytes, &proof_options)
+            .expect("Valid commit proof should verify"),
+        "Baseline proof should verify before tampering"
+    );
+    let mut tampered_output = vm_proof.public_output.clone();
+    tampered_output[0] ^= 0x01;
+
+    let tampered_proof = crate::VmProof {
+        public_output: tampered_output,
+        ..vm_proof
+    };
+
+    let verified = crate::verify_with_options(&tampered_proof, &elf_bytes, &proof_options)
+        .expect("Verifier should not error on tampered public output");
+    assert!(
+        !verified,
+        "Verifier should reject proof when VmProof.public_output is tampered"
     );
 }
 
@@ -775,7 +963,7 @@ fn test_debug_memory_bus_tokens() {
 
     let z: i128 = 1000;
     let alpha: i128 = 2;
-    let bus_id: i128 = 16; // BusId::Memory
+    let bus_id: i128 = 17; // BusId::Memory
 
     // Compute fingerprint for a token
     let fingerprint =
@@ -1043,25 +1231,13 @@ fn test_debug_memory_tokens_sb_sh() {
             let val1 = memw.main_table.get(row, memw_cols::VALUE[1]).to_raw();
             let old1 = memw.main_table.get(row, memw_cols::OLD[1]).to_raw();
 
-            // address_add(0) = base + 1, stored as DWordHL
-            let addr1_lo0 = memw
+            // address_add(0) = base + 1, now virtual (computed from base + overflow)
+            let overflow0 = memw
                 .main_table
-                .get(row, memw_cols::address_add(0)[0])
+                .get(row, memw_cols::ADD_LIMB_OVERFLOW[0])
                 .to_raw();
-            let addr1_lo1 = memw
-                .main_table
-                .get(row, memw_cols::address_add(0)[1])
-                .to_raw();
-            let addr1_hi0 = memw
-                .main_table
-                .get(row, memw_cols::address_add(0)[2])
-                .to_raw();
-            let addr1_hi1 = memw
-                .main_table
-                .get(row, memw_cols::address_add(0)[3])
-                .to_raw();
-            let addr1_lo = addr1_lo0 + (addr1_lo1 << 16);
-            let addr1_hi = addr1_hi0 + (addr1_hi1 << 16);
+            let addr1_lo = base_lo + 1 - overflow0 * (1u64 << 32);
+            let addr1_hi = base_hi + overflow0;
 
             // CM16: SEND old token for byte 1
             let send_token1: Token = (is_reg, addr1_lo, addr1_hi, old_ts1_lo, old_ts1_hi, old1);
@@ -1284,16 +1460,23 @@ fn test_deep_stack_runtime_pages_roundtrip() {
         &mut DefaultTranscript::<E>::new(&[]),
     )
     .expect("Prover failed");
-
     // Verifier reconstructs from ELF + runtime_page_ranges hint
     let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges);
     let verifier_airs =
         crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs, &table_counts);
+    let verifier_air_refs = verifier_airs.air_refs();
+    let expected_bus_balance = crate::compute_expected_commit_bus_balance(
+        &verifier_air_refs,
+        &proof,
+        &traces.public_output_bytes,
+    )
+    .expect("fingerprint collision in test");
 
     let verified = Verifier::multi_verify(
-        &verifier_airs.air_refs(),
+        &verifier_air_refs,
         &proof,
         &mut DefaultTranscript::<E>::new(&[]),
+        &expected_bus_balance,
     );
     assert!(
         verified,
@@ -1331,16 +1514,23 @@ fn test_deep_stack_missing_pages_rejected() {
         &mut DefaultTranscript::<E>::new(&[]),
     )
     .expect("Prover failed");
-
     // Verifier uses EMPTY runtime_page_ranges → missing stack/heap pages
     let wrong_configs = Traces::page_configs_from_elf_and_runtime(&elf, &[]);
     let verifier_airs =
         crate::VmAirs::new(&elf, &proof_options, true, &wrong_configs, &table_counts);
+    let verifier_air_refs = verifier_airs.air_refs();
+    let expected_bus_balance = crate::compute_expected_commit_bus_balance(
+        &verifier_air_refs,
+        &proof,
+        &traces.public_output_bytes,
+    )
+    .expect("fingerprint collision in test");
 
     let verified = Verifier::multi_verify(
-        &verifier_airs.air_refs(),
+        &verifier_air_refs,
         &proof,
         &mut DefaultTranscript::<E>::new(&[]),
+        &expected_bus_balance,
     );
     assert!(
         !verified,
@@ -1411,16 +1601,23 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
         &mut DefaultTranscript::<E>::new(&[]),
     )
     .expect("Prover failed");
-
     // Verifier reconstructs from ELF + runtime hint (ranges decoded to pages)
     let verifier_configs = Traces::page_configs_from_elf_and_runtime(&elf, &runtime_page_ranges);
     let verifier_airs =
         crate::VmAirs::new(&elf, &proof_options, true, &verifier_configs, &table_counts);
+    let verifier_air_refs = verifier_airs.air_refs();
+    let expected_bus_balance = crate::compute_expected_commit_bus_balance(
+        &verifier_air_refs,
+        &proof,
+        &traces.public_output_bytes,
+    )
+    .expect("fingerprint collision in test");
 
     let verified = Verifier::multi_verify(
-        &verifier_airs.air_refs(),
+        &verifier_air_refs,
         &proof,
         &mut DefaultTranscript::<E>::new(&[]),
+        &expected_bus_balance,
     );
     assert!(
         verified,
@@ -1523,7 +1720,7 @@ fn test_crafted_zero_count_proof_must_not_verify() {
     let airs = VmAirs::new(&elf, &proof_options, true, &[], &zero_counts);
 
     let verifier_air_refs = airs.air_refs();
-    assert_eq!(verifier_air_refs.len(), 4);
+    assert_eq!(verifier_air_refs.len(), 5);
 
     let mut bitwise_trace = crate::tables::bitwise::generate_bitwise_trace();
 
@@ -1549,6 +1746,7 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         &verifier_air_refs,
         &proof,
         &mut DefaultTranscript::<E>::new(&[]),
+        &FieldElement::zero(),
     );
 
     assert!(!verified);
