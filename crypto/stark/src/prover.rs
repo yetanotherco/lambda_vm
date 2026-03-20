@@ -1877,7 +1877,7 @@ pub trait IsStarkProver<
             });
         }
 
-        Ok(MultiProof::new(proofs))
+        Ok(MultiProof { proofs })
     }
 
     /// Generate a STARK proof for a single AIR/trace.

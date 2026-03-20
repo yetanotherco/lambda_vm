@@ -2,7 +2,7 @@
 	.globl	main
 main:
 	# Store 4 bytes [0xAA, 0xBB, 0xCC, 0xDD] on the stack, then commit them.
-	# Commit syscall: x17=3, x10=1(fd), x11=buf_addr, x12=count
+	# Commit syscall: x17=64, x10=1(fd), x11=buf_addr, x12=count
 
 	addi	sp, sp, -16		# 1: allocate stack
 	addi	t0, zero, 0xAA		# 2: t0 = 0xAA (170)
@@ -18,7 +18,7 @@ main:
 	li	a0, 1			# 10: fd = 1 (stdout)
 	mv	a1, sp			# 11: buf_addr = sp
 	li	a2, 4			# 12: count = 4
-	li	a7, 3			# 13: syscall = Commit
+	li	a7, 64			# 13: syscall = Commit
 	ecall				# 14: commit
 
 	# Halt
