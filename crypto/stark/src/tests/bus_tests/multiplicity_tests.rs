@@ -443,7 +443,12 @@ fn test_multiplicity_diff() {
         vec![&sender, &receiver];
 
     assert!(
-        Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
+        Verifier::multi_verify(
+            &airs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero()
+        ),
         "Multiplicity::Diff should work for difference of two columns"
     );
 }
@@ -546,7 +551,12 @@ fn test_multiplicity_sum3() {
         vec![&sender, &receiver];
 
     assert!(
-        Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[])),
+        Verifier::multi_verify(
+            &airs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero()
+        ),
         "Multiplicity::Sum3 should work for sum of three columns"
     );
 }
