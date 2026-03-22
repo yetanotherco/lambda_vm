@@ -14,9 +14,46 @@
 //! - Plonky2: <https://github.com/0xPolygonZero/plonky2>
 //! - Remco Bloemen: <https://xn--2-umb.com/23/gold-reduce/>
 
+use core::hint::unreachable_unchecked;
+
 use crate::field::traits::HasDefaultTranscript;
 use crate::field::{element::FieldElement, errors::FieldError, traits::IsField};
 use crate::traits::{AsBytes, ByteConversion};
+
+// =====================================================
+// COMPILER HINTS (inspired by Plonky3)
+// =====================================================
+
+/// Hint to the compiler that a branch is unlikely to be taken.
+/// The empty asm block acts as a barrier that prevents the compiler from
+/// converting the branch into a conditional move, which is slower when
+/// the branch is highly predictable.
+#[inline(always)]
+fn branch_hint() {
+    #[cfg(any(
+        target_arch = "aarch64",
+        target_arch = "arm",
+        target_arch = "x86",
+        target_arch = "x86_64",
+    ))]
+    unsafe {
+        core::arch::asm!("", options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// Inform the compiler that a condition is always true.
+///
+/// # Safety
+/// The caller must guarantee that `p` is true.
+#[inline(always)]
+const unsafe fn assume(p: bool) {
+    debug_assert!(p);
+    if !p {
+        unsafe {
+            unreachable_unchecked();
+        }
+    }
+}
 
 /// The Goldilocks prime: p = 2^64 - 2^32 + 1
 pub const GOLDILOCKS_PRIME: u64 = 0xFFFF_FFFF_0000_0001;
@@ -35,32 +72,37 @@ pub struct GoldilocksField;
 impl IsField for GoldilocksField {
     type BaseType = u64;
 
-    /// Addition with overflow handling.
-    /// If a + b overflows, we add EPSILON (since 2^64 ≡ EPSILON mod p)
+    /// Addition with branch hint for rare double-overflow.
+    /// Compiles to a 3-instruction common path (add + csel + adds on ARM)
+    /// with a predicted-not-taken branch for the exceedingly rare double overflow.
     #[inline(always)]
     fn add(a: &u64, b: &u64) -> u64 {
         let (sum, over) = a.overflowing_add(*b);
-        let (sum, over2) = sum.overflowing_add((over as u64) * EPSILON);
-        // Second overflow is rare but possible
-        if over2 {
-            sum.wrapping_add(EPSILON)
-        } else {
-            sum
+        let (mut sum, over) = sum.overflowing_add((over as u64) * EPSILON);
+        if over {
+            // Double overflow requires both inputs > ORDER, which is exceedingly rare.
+            unsafe {
+                assume(*a > GOLDILOCKS_PRIME && *b > GOLDILOCKS_PRIME);
+            }
+            branch_hint();
+            sum += EPSILON; // Cannot overflow.
         }
+        sum
     }
 
-    /// Subtraction with underflow handling.
-    /// If a - b underflows, we subtract EPSILON (since -2^64 ≡ -EPSILON mod p)
+    /// Subtraction with branch hint for rare double-underflow.
     #[inline(always)]
     fn sub(a: &u64, b: &u64) -> u64 {
         let (diff, under) = a.overflowing_sub(*b);
-        let (diff, under2) = diff.overflowing_sub((under as u64) * EPSILON);
-        // Second underflow is rare but possible
-        if under2 {
-            diff.wrapping_sub(EPSILON)
-        } else {
-            diff
+        let (mut diff, under) = diff.overflowing_sub((under as u64) * EPSILON);
+        if under {
+            unsafe {
+                assume(*a < EPSILON - 1 && *b > GOLDILOCKS_PRIME);
+            }
+            branch_hint();
+            diff -= EPSILON;
         }
+        diff
     }
 
     /// Multiplication using 128-bit intermediate and fast reduction.
@@ -142,37 +184,60 @@ impl IsField for GoldilocksField {
 
 /// Reduce a 128-bit value to a 64-bit Goldilocks field element.
 ///
-/// Uses the identity: 2^64 ≡ 2^32 - 1 (mod p)
-/// and: 2^96 ≡ -1 (mod p)
-///
-/// For x = x_lo + x_hi * 2^64, where x_hi = x_hi_hi * 2^32 + x_hi_lo:
-/// x ≡ x_lo + x_hi_lo * EPSILON - x_hi_hi (mod p)
-///
-/// **Optimization**: Uses shift instead of multiply for EPSILON computation:
-/// x_hi_lo * EPSILON = x_hi_lo * (2^32 - 1) = (x_hi_lo << 32) - x_hi_lo
-/// Benchmarks show this is ~10% faster than using multiply.
+/// Uses the identities: 2^64 ≡ 2^32 - 1 (mod p), 2^96 ≡ -1 (mod p).
+/// Branch hints mark rare borrow/carry paths for better branch prediction.
 #[inline(always)]
 fn reduce128(x: u128) -> u64 {
-    let x_lo = x as u64;
-    let x_hi = (x >> 64) as u64;
+    let (x_lo, x_hi) = (x as u64, (x >> 64) as u64);
     let x_hi_hi = x_hi >> 32;
     let x_hi_lo = x_hi & EPSILON;
 
-    // Step 1: t0 = x_lo - x_hi_hi
-    let (t0, borrow) = x_lo.overflowing_sub(x_hi_hi);
-    let t0 = if borrow { t0.wrapping_sub(EPSILON) } else { t0 };
+    // 2^96 ≡ -1 (mod p), so x_hi_hi * 2^96 becomes -x_hi_hi
+    let (mut t0, borrow) = x_lo.overflowing_sub(x_hi_hi);
+    if borrow {
+        branch_hint();
+        t0 -= EPSILON; // Cannot underflow
+    }
 
-    // Step 2: t1 = x_hi_lo * EPSILON = (x_hi_lo << 32) - x_hi_lo
-    // Using shift is ~10% faster than multiply
+    // 2^64 ≡ EPSILON (mod p), so x_hi_lo * 2^64 = x_hi_lo * EPSILON
+    // Compute as (x_hi_lo << 32) - x_hi_lo to avoid a multiply
     let t1 = (x_hi_lo << 32).wrapping_sub(x_hi_lo);
 
-    // Step 3: result = t0 + t1
-    let (result, carry) = t0.overflowing_add(t1);
-    if carry {
-        result.wrapping_add(EPSILON)
-    } else {
-        result
+    // Final addition with overflow correction
+    // Safety: t0 + t1 < 2^64 + ORDER
+    unsafe { add_no_canonicalize_trashing_input(t0, t1) }
+}
+
+/// Fast modular addition: returns (x + y) mod p, assuming x + y < 2^64 + ORDER.
+/// On x86_64, uses inline asm (add + sbb trick) for 2-instruction modular add.
+/// On other architectures, uses portable overflowing_add + conditional correction.
+///
+/// # Safety
+/// Caller must ensure x + y < 2^64 + ORDER.
+#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+unsafe fn add_no_canonicalize_trashing_input(x: u64, y: u64) -> u64 {
+    let res_wrapped: u64;
+    let adjustment: u64;
+    unsafe {
+        core::arch::asm!(
+            "add {0}, {1}",
+            // sbb {1:e}, {1:e} sets the low 32 bits to 0xFFFFFFFF on carry (= NEG_ORDER),
+            // or 0 otherwise. The high 32 bits are zeroed by the 32-bit register write.
+            "sbb {1:e}, {1:e}",
+            inlateout(reg) x => res_wrapped,
+            inlateout(reg) y => adjustment,
+            options(pure, nomem, nostack),
+        );
     }
+    res_wrapped + adjustment
+}
+
+#[inline(always)]
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn add_no_canonicalize_trashing_input(x: u64, y: u64) -> u64 {
+    let (res_wrapped, carry) = x.overflowing_add(y);
+    res_wrapped.wrapping_add(EPSILON * (carry as u64))
 }
 
 /// Inversion using optimized addition chain for a^(p-2).
