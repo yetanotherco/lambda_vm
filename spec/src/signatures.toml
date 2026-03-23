@@ -208,5 +208,5 @@ input = ["DWordWL", ["Word", 8], "BaseField"]
 [[signatures]]
 tag = "ROTXOR"
 kind = "interaction"
-input = ["Word", "Byte", "Bit", "Byte", "Bit", "Byte", "Bit"]
+input = ["Word", "Byte", "Byte", "Byte", "Bit"]
 output = "Word"

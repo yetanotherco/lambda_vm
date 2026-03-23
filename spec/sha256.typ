@@ -28,11 +28,11 @@ to perform the message schedule and the compression rounds, respectively.
 The `SHA2_M` interaction signature is used to represent the output of the message schedule.
 The `SHA2_K` interaction signature is used to represent the `k` constants.
 It could either be instantiated with a (short) precomputed table, or through hardcoded LogUp contributions in this chip.
-Additionally, we introduce a #rotxor chip that takes as input `a`, `r0`, `r1`, `r2` (pre-split into high bit and low nibble) and a bit `last_rot` and computes
+Additionally, we introduce a #rotxor chip that takes as input `a`, `r0`, `r1`, `r2` (4-bit values) and a bit `last_rot` and computes
 $
   cases(
-    (a >>> r_0) xor (a >>> r_1) xor (a >>> r_2) quad "if" #`last_rot`,
-    (a >>> r_0) xor (a >>> r_1) xor (a >> r_2) quad "if" #`!last_rot`
+    (a >>> (16 + r_0)) xor (a >>> (16 + r_0 - r_1)) xor (a >>> r_2) quad "if" #`last_rot`,
+    (a >>> (16 + r_0)) xor (a >>> (16 + r_0 - r_1)) xor (a >> r_2) quad "if" #`!last_rot`
   ),
 $
 where we let $>>>$ denote right rotation and $>>$ logical shift right.
@@ -158,12 +158,14 @@ The #rotxor chip leverages #nr_variables variables, spanning #nr_columns columns
 == Assumptions
 
 Range checking for all elements is inherited from the bitwise lookups.
-We can safely assume that no `ri_low` will be zero, and avoid extra work due to right rotation needing `16 - shift` as arguments to the `HWSL` interactions.
+We can safely assume that no `r_i` will be zero, and avoid extra work due to right rotation needing `16 - shift` as arguments to the `HWSL` interactions.
 #render_chip_assumptions(rotxorchip, config)
 
 == Constraints
 
 We first compute all rotations (or shifts) of `a`.
+`a1` is computed as a left rotation of `a0`, in order to not need
+additional columns to represent the full right-rotation amounts.
 #render_constraint_table(rotxorchip, config, groups: "shift")
 
 Then the bitwise XOR of the results.
@@ -179,5 +181,7 @@ And finally contribute to the lookup argument.
 = Notes/optimizations
 - This could instead be designed following the #link("https://github.com/riscv/riscv-crypto")[RISC-V Crypto Scalar extension `Zknh`],
   for wider compatibility, but this design is likely to be more efficient.
+  It is still possible, if desired, to expose #rotxor (or a selection of parameter instantiations thereof)
+  as implementation for these primitives.
 - The message schedule could be exposed as its own ECALL instead, but the direct integration leads to better efficiency.
 - Some of these chips could be made narrower, at the cost of introducing some extra lookups and extra tables to compute and store intermediate results.

@@ -7,31 +7,19 @@ desc = "The input value"
 pad = 0
 
 [[variables.input]]
-name = "r0_low"
+name = "r0"
 type = "Byte"
 desc = "The first amount of rotation, low nibble"
 pad = 0
 
 [[variables.input]]
-name = "r0_high"
-type = "Bit"
-desc = "The first amount of rotation, high bit"
-pad = 0
-
-[[variables.input]]
-name = "r1_low"
+name = "r1"
 type = "Byte"
 desc = "The second amount of rotation, low nibble"
 pad = 0
 
 [[variables.input]]
-name = "r1_high"
-type = "Bit"
-desc = "The second amount of rotation, high bit"
-pad = 0
-
-[[variables.input]]
-name = "r2_low"
+name = "r2"
 type = "Byte"
 desc = "The third amount of rotation, low nibble"
 pad = 0
@@ -51,49 +39,49 @@ pad = 0
 [[variables.auxiliary]]
 name = "a0_left"
 type = "WordHL"
-desc = "`a << r0_low`"
+desc = "`a << (16 - r0)`"
 pad = 0
 
 [[variables.auxiliary]]
 name = "a0_right"
 type = "WordHL"
-desc = "`a >> r0_low`"
+desc = "`a >> r0`"
 pad = 0
 
 [[variables.auxiliary]]
 name = "a1_left"
 type = "WordHL"
-desc = "`a << r1_low`"
+desc = "`a0 << r1`"
 pad = 0
 
 [[variables.auxiliary]]
 name = "a1_right"
 type = "WordHL"
-desc = "`a >> r1_low`"
+desc = "`a0 >> (16 - r1)`"
 pad = 0
 
 [[variables.auxiliary]]
 name = "a2_left"
 type = "WordHL"
-desc = "`a << r2_low`"
+desc = "`a << (16 - r2)`"
 pad = 0
 
 [[variables.auxiliary]]
 name = "a2_right"
 type = "WordHL"
-desc = "`a >> r2_low`"
+desc = "`a >> r2`"
 pad = 0
 
 [[variables.auxiliary]]
 name = "a0"
 type = "WordBL"
-desc = "`a >>> r0`"
+desc = "`a >>> (16 + r0)`"
 pad = 0
 
 [[variables.auxiliary]]
 name = "a1"
 type = "WordBL"
-desc = "`a >>> r1`"
+desc = "`a >>> (16 + r0 - r1)` (which is `a0 <<< r1`)"
 pad = 0
 
 [[variables.auxiliary]]
@@ -116,10 +104,7 @@ pad = 0
 
 
 [[assumptions]]
-desc = "$#`r0_low`, #`r1_low`, #`r2_low` in [1, 15]$"
-
-[[assumptions]]
-desc = "$#`r0_high`, #`r1_high` in [0, 1]$"
+desc = "$#`r0`, #`r1`, #`r2` in [1, 15]$"
 
 
 [[constraint_groups]]
@@ -128,7 +113,7 @@ name = "shift"
 [[constraints.shift]]
 kind = "interaction"
 tag = "HWSL"
-input = [["idx", "a", "i"], ["-", 16, "r0_low"]]
+input = [["idx", "a", "i"], ["-", 16, "r0"]]
 output = ["arr", ["idx", "a0_left", "i"], ["idx", "a0_right", "i"]]
 iter = ["i", 0, 1]
 multiplicity = "μ"
@@ -136,7 +121,7 @@ multiplicity = "μ"
 [[constraints.shift]]
 kind = "interaction"
 tag = "HWSL"
-input = [["idx", "a", "i"], ["-", 16, "r1_low"]]
+input = [["idx", ["cast", "a0", "WordHL"], "i"], "r1"]
 output = ["arr", ["idx", "a1_left", "i"], ["idx", "a1_right", "i"]]
 iter = ["i", 0, 1]
 multiplicity = "μ"
@@ -144,21 +129,21 @@ multiplicity = "μ"
 [[constraints.shift]]
 kind = "interaction"
 tag = "HWSL"
-input = [["idx", "a", "i"], ["-", 16, "r2_low"]]
+input = [["idx", "a", "i"], ["-", 16, "r2"]]
 output = ["arr", ["idx", "a2_left", "i"], ["idx", "a2_right", "i"]]
 iter = ["i", 0, 1]
 multiplicity = "μ"
 
 [[constraints.shift]]
 kind = "arith"
-constraint = "$#`a0[i]` = (1 - #`r0_high`) dot (#`a0_left[1 - i]` + #`a0_right[i]`) + #`r0_high` dot (#`a0_left[i]` + #`a0_right[1 - i]`)$"
-poly = ["-", ["idx", ["cast", "a0", "WordHL"], "i"], ["*", ["not", "r0_high"], ["+", ["idx", "a0_left", ["-", 1, "i"]], ["idx", "a0_right", "i"]]], ["*", "r0_high", ["+", ["idx", "a0_left", "i"], ["idx", "a0_right", ["-", 1, "i"]]]]]
+constraint = "$#`a0[i]` = #`a0_left[i]` + #`a0_right[1 - i]`$"
+poly = ["-", ["idx", ["cast", "a0", "WordHL"], "i"], ["idx", "a0_left", "i"], ["idx", "a0_right", ["-", 1, "i"]]]
 iter = ["i", 0, 1]
 
 [[constraints.shift]]
 kind = "arith"
-constraint = "$#`a1[i]` = (1 - #`r1_high`) dot (#`a1_left[1 - i]` + #`a1_right[i]`) + #`r1_high` dot (#`a1_left[i]` + #`a1_right[1 - i]`)$"
-poly = ["-", ["idx", ["cast", "a1", "WordHL"], "i"], ["*", ["not", "r1_high"], ["+", ["idx", "a1_left", ["-", 1, "i"]], ["idx", "a1_right", "i"]]], ["*", "r1_high", ["+", ["idx", "a1_left", "i"], ["idx", "a1_right", ["-", 1, "i"]]]]]
+constraint = "$#`a1[i]` = #`a1_left[i]` + #`a1_right[1 - i]`$"
+poly = ["-", ["idx", ["cast", "a1", "WordHL"], "i"], ["idx", "a1_left", "i"], ["idx", "a1_right", ["-", 1, "i"]]]
 iter = ["i", 0, 1]
 
 [[constraints.shift]]
@@ -196,6 +181,6 @@ name = "output"
 [[constraints.output]]
 kind = "interaction"
 tag = "ROTXOR"
-input = [["cast", "a", "Word"], "r0_low", "r0_high", "r1_low", "r1_high", "r2_low", "last_rot"]
+input = [["cast", "a", "Word"], "r0", "r1", "r2", "last_rot"]
 output = ["cast", "out", "Word"]
 multiplicity = ["-", "μ"]

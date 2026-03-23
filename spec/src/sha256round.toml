@@ -231,14 +231,14 @@ multiplicity = "μ"
 [[constraints.value]]
 kind = "interaction"
 tag = "ROTXOR"
-input = [["cast", "a", "Word"], 6, 1, 13, 0, 2, 1]
+input = [["cast", "a", "Word"], 6, 9, 2, 1]
 output = "S0"
 multiplicity = "μ"
 
 [[constraints.value]]
 kind = "interaction"
 tag = "ROTXOR"
-input = [["cast", "e", "Word"], 9, 1, 11, 0, 6, 1]
+input = [["cast", "e", "Word"], 9, 14, 6, 1]
 output = "S1"
 multiplicity = "μ"
 
