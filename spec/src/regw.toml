@@ -1,0 +1,167 @@
+name = "REGW"
+
+# Variables
+
+[[variables.input]]
+name = "index"
+type = "Byte"
+desc = "index of the register being accessed"
+pad = 0
+
+[[variables.input]]
+name = "timestamp"
+type = "DWordWL"
+desc = "timestamp at which the access takes place"
+pad = 0
+
+[[variables.input]]
+name = "val"
+type = "DWordWL"
+desc = "value being written to this register"
+pad = 0
+
+[[variables.output]]
+name = "old"
+type = "DWordWL"
+desc = "value of this register at `old_timestamp`."
+pad = 0
+
+[[variables.auxiliary]]
+name = "old_timestamp"
+type = "DWordWL"
+desc = "timestamp at which this register was last accessed"
+pad = 0
+
+[[variables.auxiliary]]
+name = "timestamp_diff"
+type = "DWordHL"
+desc = "$#`old_timestamp` - #`timestamp`$"
+pad = 0
+
+[[variables.virtual]]
+name = "carry"
+desc = "Carry values used to constrain that $#`old_timestamp`<#`timestamp`$"
+type = ["Bit", 2]
+def = {idx="i", polys=[
+    {iter=0, poly=["*", ["^", 2, -32], ["-", ["+", ["idx", "timestamp", 0], ["idx", ["cast", "timestamp_diff", "DWordWL"], 0]], ["idx", "old_timestamp", 0]]]},
+    {iter=1, poly=["*", ["^", 2, -32], ["-", ["+", ["idx", "timestamp", 1], ["idx", ["cast", "timestamp_diff", "DWordWL"], 1], ["idx", "carry", 0]], ["idx", "old_timestamp", 1]]]},
+]}
+
+[[variables.virtual]]
+name = "μ_sum"
+type = "Bit"
+desc = ""
+def = ["+", "μ_read", "μ_write"]
+
+[[variables.multiplicity]]
+name = "μ_read"
+type = "Bit"
+desc = "Whether we are performing a read (and hence return `out`)"
+pad = 0
+
+[[variables.multiplicity]]
+name = "μ_write"
+type = "Bit"
+desc = "Whether we are performing a write (and hence not return `out`)"
+pad = 0
+
+
+
+# Assumptions
+
+[[assumptions]]
+desc = "`IS_BYTE[index]`"
+ref = "regw:a:index"
+
+[[assumptions]]
+desc = "`IS_WORD[val[i]]`"
+iter = ["i", 0, 1]
+ref = "regw:a:val"
+
+[[assumptions]]
+desc = "`IS_WORD[timestamp[i]]`"
+iter = ["i", 0, 1]
+ref = "regw:a:timestamp"
+
+# Constraints
+
+[[constraint_groups]]
+name = "sub"
+
+[[constraints.sub]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "timestamp_diff", "i"]]
+iter = ["i", 0, 3]
+multiplicity = "μ_sum"
+ref = "regw:c:range_timestamp_diff"
+
+[[constraints.sub]]
+kind = "template"
+tag = "IS_BIT"
+input = [["idx", "carry", 0]]
+ref = "regw:c:carry"
+
+[[constraints.sub]]
+kind = "arith"
+constraint = "$#`carry`_1 = 1$"
+poly = ["-", 1, ["idx", "carry", 1]]
+ref = "regw:c:no_overflow"
+
+
+[[constraint_groups]]
+name = "multiplicities"
+
+[[constraints.multiplicities]]
+kind = "template"
+tag = "IS_BIT"
+input = ["μ_read"]
+ref = "regw:c:μ_read_is_bit"
+
+[[constraints.multiplicities]]
+kind = "template"
+tag = "IS_BIT"
+input = ["μ_write"]
+ref = "regw:c:μ_write_is_bit"
+
+[[constraints.multiplicities]]
+kind = "template"
+tag = "IS_BIT"
+input = ["μ_sum"]
+ref = "regw:c:μ_sum_is_bit"
+
+[[constraint_groups]]
+name = "interactions"
+
+[[constraints.interactions]]
+kind = "interaction"
+tag = "memory"
+input = [1, ["cast", ["arr", ["cast", ["+", ["*", 2, "index"], "i"], "Word"], 0], "DWordWL"], "old_timestamp", ["idx", "old", "i"]]
+iter = ["i", 0, 1]
+multiplicity = "μ_sum"
+ref = "regw:c:read_old"
+
+[[constraints.interactions]]
+kind = "interaction"
+tag = "memory"
+input = [1, ["cast", ["arr", ["cast", ["+", ["*", 2, "index"], "i"], "Word"], 0], "DWordWL"], "timestamp", ["idx", "val", "i"]]
+iter = ["i", 0, 1]
+multiplicity = ["-", "μ_sum"]
+ref = "regw:c:write_val"
+
+
+[[constraint_groups]]
+name = "output"
+
+[[constraints.output]]
+kind = "interaction"
+tag = "REG"
+input = ["index", "timestamp", "val"]
+output = "old"
+multiplicity = ["-", "μ_read"]
+
+[[constraints.output]]
+kind = "interaction"
+tag = "REG"
+input = ["index", "timestamp", "val"]
+multiplicity = ["-", "μ_write"]

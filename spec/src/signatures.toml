@@ -69,6 +69,19 @@ tag = "MEMW"
 kind = "interaction"
 input = ["Bit", "DWordWL", ["BaseField", 8], "DWordWL", "Bit", "Bit", "Bit"]
 
+# REG[old; index, value, timestamp]
+[[signatures]]
+tag = "REG"
+kind = "interaction"
+input = ["Byte", "DWordWL", "DWordWL"]
+output = "DWordWL"
+
+# REG[index, value, timestamp]
+[[signatures]]
+tag = "REG"
+kind = "interaction"
+input = ["Byte", "DWordWL", "DWordWL"]
+
 # LT[lt; lhs, rhs, signed]
 [[signatures]]
 tag = "LT"
