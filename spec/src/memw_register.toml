@@ -27,25 +27,16 @@ desc = "value of this register at `old_timestamp`."
 pad = 0
 
 [[variables.auxiliary]]
-name = "old_timestamp"
-type = "DWordWL"
-desc = "timestamp at which this register was last accessed"
-pad = 0
-
-[[variables.auxiliary]]
-name = "timestamp_diff"
-type = "DWordHL"
-desc = "$#`old_timestamp` - #`timestamp`$"
+name = "old_timestamp_lo"
+type = "Word"
+desc = "the lower limb of `old_timestamp`"
 pad = 0
 
 [[variables.virtual]]
-name = "carry"
-desc = "Carry values used to constrain that $#`old_timestamp`<#`timestamp`$"
-type = ["Bit", 2]
-def = {idx="i", polys=[
-    {iter=0, poly=["*", ["^", 2, -32], ["-", ["+", ["idx", "timestamp", 0], ["idx", ["cast", "timestamp_diff", "DWordWL"], 0]], ["idx", "old_timestamp", 0]]]},
-    {iter=1, poly=["*", ["^", 2, -32], ["-", ["+", ["idx", "timestamp", 1], ["idx", ["cast", "timestamp_diff", "DWordWL"], 1], ["idx", "carry", 0]], ["idx", "old_timestamp", 1]]]},
-]}
+name = "old_timestamp"
+type = "DWordWL"
+desc = "timestamp at which this register was last accessed"
+def = ["cast", ["arr", "old_timestamp_lo", ["idx", "timestamp", 1]], "DWordWL"]
 
 [[variables.virtual]]
 name = "μ_sum"
@@ -86,15 +77,14 @@ ref = "regw:a:timestamp"
 # Constraints
 
 [[constraint_groups]]
-name = "sub"
+name = "diff"
 
-[[constraints.sub]]
+[[constraints.diff]]
 kind = "interaction"
 tag = "IS_HALF"
-input = [["idx", "timestamp_diff", "i"]]
-iter = ["i", 0, 3]
+input = [["-", ["idx", "timestamp", 0], ["idx", "old_timestamp", 0], 1]]
 multiplicity = "μ_sum"
-ref = "regw:c:range_timestamp_diff"
+ref = "regw:c:diff"
 
 [[constraints.sub]]
 kind = "template"
