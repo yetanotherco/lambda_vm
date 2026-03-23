@@ -88,6 +88,10 @@ The #aligned chip only needs #nr_variables variables, expressed through #nr_colu
 #render_chip_assumptions(alignedchip, config)
 #render_constraint_table(alignedchip, config)
 
+== Padding
+The table can be padded to the next power of two with the following value assignments:
+#render_chip_padding_table(alignedchip, config)
+
 = Register fast-path
 
 #let config = load_config()
