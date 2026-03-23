@@ -65,6 +65,10 @@ to effectuate that part of the memory argument.
 This chip contributes the following to the lookup argument:
 #render_constraint_table(chip, config, groups: "output")
 
+= Padding
+The table can be padded to the next power of two with the following value assignments:
+#render_chip_padding_table(chip, config)
+
 = Read-size aligned fast path
 
 #let alignedchip = load_chip("src/memw_aligned.toml", config)
