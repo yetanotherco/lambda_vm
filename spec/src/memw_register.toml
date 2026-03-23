@@ -86,18 +86,6 @@ input = [["-", ["idx", "timestamp", 0], ["idx", "old_timestamp", 0], 1]]
 multiplicity = "μ_sum"
 ref = "regw:c:diff"
 
-[[constraints.sub]]
-kind = "template"
-tag = "IS_BIT"
-input = [["idx", "carry", 0]]
-ref = "regw:c:carry"
-
-[[constraints.sub]]
-kind = "arith"
-constraint = "$#`carry`_1 = 1$"
-poly = ["-", 1, ["idx", "carry", 1]]
-ref = "regw:c:no_overflow"
-
 
 [[constraint_groups]]
 name = "multiplicities"
