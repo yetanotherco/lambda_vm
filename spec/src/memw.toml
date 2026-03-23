@@ -51,7 +51,7 @@ name = "old"
 type = ["BaseField", 8]
 desc = """The old value written at `base_address`. See `value` for information about representation.
 Only the elements corresponding to the `writeN` bits are guaranteed"""
-pad = ["arr", 0,0,0,0,0,0,0,0]
+pad = 0
 
 # Auxiliary
 
@@ -59,13 +59,13 @@ pad = ["arr", 0,0,0,0,0,0,0,0]
 name = "carry"
 type = ["Bit", 7]
 desc = "Whether `base_address[0] + i + 1` $>= 2^32$"
-pad = ["arr", 0,0,0,0,0,0,0]
+pad = 0
 
 [[variables.auxiliary]]
 name = "old_timestamp"
 type = ["DWordWL", 8]
 desc = "The timestamp at which address `base_address + i` was last accessed"
-pad = ["arr", 0,0,0,0,0,0,0,0]
+pad = 0
 
 # Virtual
 

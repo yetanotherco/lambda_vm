@@ -6,11 +6,7 @@
   total_nr_variables,
   total_nr_instantiated_columns,
   render_constraint_table,
-<<<<<<< spec/MEMW_R
   render_chip_padding_table
-=======
-  render_chip_padding_table,
->>>>>>> spec/memw_update2
 )
 
 #let config = load_config()
