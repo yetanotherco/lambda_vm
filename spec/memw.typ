@@ -99,15 +99,15 @@ The table can be padded to the next power of two with the following value assign
 #let reg = raw(register_chip.name)
 
 The #reg chip provides a fast-path for accessing registers.
-This fast-path leverages that the facts that registers
+This fast-path leverages that registers
 + can be addressed using a `Byte`, rather than a full `DWord`,
 + are constantly accessed, i.e., $#`timestamp` - #`old_timestamp`$ is small, and
 + have a fixed access pattern
 to achieve a footprint that is significantly smaller than both #memw and #aligned.
 
-Note: as a result of hard optimization on the second point above, this chip can only be used for register accesses for which 
+Note: as a result of hard optimization, this chip can only be used for register accesses for which 
 + $#`timestamp` - #`old_timestamp` in [1, 2^16]$, and
-+ $#`timestamp`_0 > #`old_timestamp`_0$
++ $#`timestamp` mod 2^ > #`old_timestamp`_0$
 If either of these rules does not apply to your access, you should fall back to using `MEMW_A`.
 
 == Columns
