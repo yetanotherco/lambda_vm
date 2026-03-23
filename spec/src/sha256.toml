@@ -211,36 +211,44 @@ input = ["timestamp", "i", ["+",
   ["*", ["^", 2, 16], ["idx", "m", ["+", ["*", 4, "i"], 1]]],
   ["*", ["^", 2, 24], ["idx", "m", ["+", ["*", 4, "i"], 0]]],
 ]]
+multiplicity = ["*", -2, "μ"]
+iter = ["i", 0, 0]
+
+[[constraints.sched]]
+kind = "interaction"
+tag = "SHA256_M"
+input = ["timestamp", "i", ["+",
+  ["*", ["^", 2, 0], ["idx", "m", ["+", ["*", 4, "i"], 3]]],
+  ["*", ["^", 2, 8], ["idx", "m", ["+", ["*", 4, "i"], 2]]],
+  ["*", ["^", 2, 16], ["idx", "m", ["+", ["*", 4, "i"], 1]]],
+  ["*", ["^", 2, 24], ["idx", "m", ["+", ["*", 4, "i"], 0]]],
+]]
+multiplicity = ["*", -3, "μ"]
+iter = ["i", 1, 8]
+
+[[constraints.sched]]
+kind = "interaction"
+tag = "SHA256_M"
+input = ["timestamp", "i", ["+",
+  ["*", ["^", 2, 0], ["idx", "m", ["+", ["*", 4, "i"], 3]]],
+  ["*", ["^", 2, 8], ["idx", "m", ["+", ["*", 4, "i"], 2]]],
+  ["*", ["^", 2, 16], ["idx", "m", ["+", ["*", 4, "i"], 1]]],
+  ["*", ["^", 2, 24], ["idx", "m", ["+", ["*", 4, "i"], 0]]],
+]]
 multiplicity = ["*", -4, "μ"]
-iter = ["i", 0, 15]
-
-# TODO: we can probably avoid needing these by checking index >= 16 in the MSGSCHED chip and doing it "on demand"
-[[constraints.sched]]
-kind = "interaction"
-tag = "SHA256MSGSCHED"
-input = ["timestamp", "i", 4]
-multiplicity = "μ"
-iter = ["i", 16, 47]
+iter = ["i", 9, 13]
 
 [[constraints.sched]]
 kind = "interaction"
-tag = "SHA256MSGSCHED"
-input = ["timestamp", 48, 3]
-multiplicity = "μ"
-
-[[constraints.sched]]
-kind = "interaction"
-tag = "SHA256MSGSCHED"
-input = ["timestamp", "i", 2]
-multiplicity = "μ"
-iter = ["i", 49, 61]
-
-[[constraints.sched]]
-kind = "interaction"
-tag = "SHA256MSGSCHED"
-input = ["timestamp", "i", 1]
-multiplicity = "μ"
-iter = ["i", 62, 63]
+tag = "SHA256_M"
+input = ["timestamp", "i", ["+",
+  ["*", ["^", 2, 0], ["idx", "m", ["+", ["*", 4, "i"], 3]]],
+  ["*", ["^", 2, 8], ["idx", "m", ["+", ["*", 4, "i"], 2]]],
+  ["*", ["^", 2, 16], ["idx", "m", ["+", ["*", 4, "i"], 1]]],
+  ["*", ["^", 2, 24], ["idx", "m", ["+", ["*", 4, "i"], 0]]],
+]]
+multiplicity = ["*", -5, "μ"]
+iter = ["i", 14, 15]
 
 [[constraint_groups]]
 name = "compress"
@@ -265,6 +273,13 @@ kind = "interaction"
 tag = "SHA256ROUND"
 input = ["timestamp", "last_round_out", 64]
 multiplicity = ["-", "μ"]
+
+[[constraints.compress]]
+kind = "interaction"
+tag = "IS_BYTE"
+input = [["idx", "out", "i"]]
+multiplicity = "μ"
+iter = ["i", 0, 64]
 
 [[constraints.compress]]
 kind = "template"

@@ -63,7 +63,7 @@ pad = 0
 name = "carry"
 type = "Byte"
 desc = "The carry of computing `out`"
-def = ["*", ["^", 2, -32], ["-", ["+", "back16", "s0", "back7", "s1"], ["cast", "out", "Word"]]
+def = ["*", ["^", 2, -32], ["-", ["+", "back16", "s0", "back7", "s1"], ["cast", "out", "Word"]]]
 
 [[variables.multiplicity]]
 name = "μ"
@@ -72,14 +72,17 @@ desc = ""
 pad = 0
 
 [[assumptions]]
-desc = "$#`index` >= 16$"
-
-[[assumptions]]
 desc = "#`IS_WORD[SHA256_M[i]]` for $0 <= i < #`index`$"
 
 
 [[constraint_groups]]
 name = "lookback"
+
+[[constraints.lookback]]
+kind = "interaction"
+tag = "IS_BYTE"
+input = [["-", "index", 16]]
+multiplicity = "μ"
 
 [[constraints.lookback]]
 kind = "interaction"

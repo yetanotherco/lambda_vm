@@ -37,6 +37,8 @@ $
 $
 where we let $>>>$ denote right rotation and $>>$ logical shift right.
 
+Most of the structure and variable naming follows the pseudocode at #link("https://en.wikipedia.org/wiki/SHA-2#Pseudocode").
+
 = #sha256 chip
 
 == Columns
@@ -55,9 +57,10 @@ The state is passed in argument `A0 = x10`, and the chunk as `A1 = x11`.
 Note that following the SHA256 spec, this state and the chunks are read and written as big-endian.
 #render_constraint_table(sha256chip, config, groups: "memory")
 
-Then we prepare the message schedule, by emitting the input chunk and then invoking the message schedule for every remaining index.
-We additionally provide a constant multiplicity that takes into account the number of times this word will be read
-by the message schedule and the compression rounds combined.
+Then we prepare the message schedule, by emitting the input chunk with multiplicities
+corresponding to the number of times it will be read during a compression evaluation.
+The #sha256msgsched chip itself is implicitly invoked by itself and #sha256round, setting the `amount`
+column appropriately for the number of times the `w` value is required.
 #render_constraint_table(sha256chip, config, groups: "sched")
 
 And finally, we provide the boundaries for the #sha256round chip and the
@@ -97,6 +100,8 @@ First, we gather the dependencies from earlier in the message schedule.
 Then, we calculate the result.
 It suffices to check that the carry of adding four range-checked words
 into a range-checked word is not too big, following the logic from @add.
+In this case, using the `IS_BYTE` constraint allows us to add multiple words together
+at the same time, without needing to store and range-check intermediate results.
 #render_constraint_table(sha256msgschedchip, config, groups: "calc")
 
 Finally, we contribute to the LogUp.

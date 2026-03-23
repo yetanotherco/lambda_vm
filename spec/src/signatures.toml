@@ -201,11 +201,6 @@ kind = "interaction"
 input = ["DWordWL", "BaseField", "Word"]
 
 [[signatures]]
-tag = "SHA256MSGSCHED"
-kind = "interaction"
-input = ["DWordWL", "BaseField", "Byte"]
-
-[[signatures]]
 tag = "SHA256ROUND"
 kind = "interaction"
 input = ["DWordWL", ["Word", 8], "BaseField"]

@@ -73,15 +73,27 @@ desc = "d + temp1"
 pad = 0
 
 [[variables.auxiliary]]
-name = "S1"
-type = "Word"
-desc = "Transformation of `e`"
+name = "a_and_b"
+type = "WordBL"
+desc = "$a class(\"binary\", amp) b$. Part of `maj`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "a_xor_b"
+type = "WordBL"
+desc = "$a xor b$. Part of `maj`"
+pad = 0
+
+[[variables.auxiliary]]
+name = "c_and_a_xor_b"
+type = "WordBL"
+desc = "$c class(\"binary\", amp) (a xor b)$. Part of `maj`"
 pad = 0
 
 [[variables.auxiliary]]
 name = "e_and_f"
 type = "WordBL"
-desc = "Part of `ch`"
+desc = "$e class(\"binary\", amp) f$. Part of `ch`"
 pad = 0
 
 [[variables.auxiliary]]
@@ -91,33 +103,21 @@ desc = "$(not e) class(\"binary\", amp) g$. Part of `ch`"
 pad = 0
 
 [[variables.auxiliary]]
+name = "kval"
+type = "Word"
+desc = "`k[index]`"
+pad = 0
+
+[[variables.auxiliary]]
 name = "S0"
 type = "Word"
 desc = "Transformation of `a`"
 pad = 0
 
 [[variables.auxiliary]]
-name = "a_and_b"
-type = "WordBL"
-desc = "Part of `maj`"
-pad = 0
-
-[[variables.auxiliary]]
-name = "a_xor_b"
-type = "WordBL"
-desc = "Part of `maj`"
-pad = 0
-
-[[variables.auxiliary]]
-name = "c_and_a_xor_b"
-type = "WordBL"
-desc = "Part of `maj`"
-pad = 0
-
-[[variables.auxiliary]]
-name = "kval"
+name = "S1"
 type = "Word"
-desc = "`k[index]`"
+desc = "Transformation of `e`"
 pad = 0
 
 [[variables.auxiliary]]
@@ -125,30 +125,6 @@ name = "wval"
 type = "Word"
 desc = "`w[index]`"
 pad = 0
-
-[[variables.virtual]]
-name = "ch"
-type = "Word"
-desc = "ch value"
-def = ["+", ["cast", "e_and_f", "Word"], ["cast", "not_e_and_g", "Word"]]
-
-[[variables.virtual]]
-name = "temp1"
-type = "BaseField"
-desc = "temp1 value"
-def = ["+", "h", "S1", "ch", "kval", "wval"]
-
-[[variables.virtual]]
-name = "maj"
-type = "Word"
-desc = "maj value"
-def = ["+", ["cast", "a_and_b", "Word"], ["cast", "c_and_a_xor_b", "Word"]]
-
-[[variables.virtual]]
-name = "temp2"
-type = "BaseField"
-desc = "temp2 value"
-def = ["+", "S0", "maj"]
 
 [[variables.virtual]]
 name = "carry_a"
@@ -161,6 +137,30 @@ name = "carry_e"
 type = "Byte"
 desc = "The carry from `out_e`"
 def = ["*", ["^", 2, -32], ["-", ["+", "d", "temp1"], ["cast", "out_e", "Word"]]]
+
+[[variables.virtual]]
+name = "ch"
+type = "Word"
+desc = "ch value"
+def = ["+", ["cast", "e_and_f", "Word"], ["cast", "not_e_and_g", "Word"]]
+
+[[variables.virtual]]
+name = "maj"
+type = "Word"
+desc = "maj value"
+def = ["+", ["cast", "a_and_b", "Word"], ["cast", "c_and_a_xor_b", "Word"]]
+
+[[variables.virtual]]
+name = "temp1"
+type = "BaseField"
+desc = "temp1 value"
+def = ["+", "h", "S1", "ch", "kval", "wval"]
+
+[[variables.virtual]]
+name = "temp2"
+type = "BaseField"
+desc = "temp2 value"
+def = ["+", "S0", "maj"]
 
 [[variables.multiplicity]]
 name = "μ"
@@ -177,10 +177,27 @@ name = "value"
 
 [[constraints.value]]
 kind = "interaction"
-tag = "ROTXOR"
-input = [["cast", "e", "Word"], 9, 1, 11, 0, 6, 1]
-output = "S1"
+tag = "AND_BYTE"
+input = [["idx", "a", "i"], ["idx", "b", "i"]]
+output = ["idx", "a_and_b", "i"]
 multiplicity = "μ"
+iter = ["i", 0, 3]
+
+[[constraints.value]]
+kind = "interaction"
+tag = "XOR_BYTE"
+input = [["idx", "a", "i"], ["idx", "b", "i"]]
+output = ["idx", "a_xor_b", "i"]
+multiplicity = "μ"
+iter = ["i", 0, 3]
+
+[[constraints.value]]
+kind = "interaction"
+tag = "AND_BYTE"
+input = [["idx", "c", "i"], ["idx", "a_xor_b", "i"]]
+output = ["idx", "c_and_a_xor_b", "i"]
+multiplicity = "μ"
+iter = ["i", 0, 3]
 
 [[constraints.value]]
 kind = "interaction"
@@ -220,27 +237,10 @@ multiplicity = "μ"
 
 [[constraints.value]]
 kind = "interaction"
-tag = "AND_BYTE"
-input = [["idx", "a", "i"], ["idx", "b", "i"]]
-output = ["idx", "a_and_b", "i"]
+tag = "ROTXOR"
+input = [["cast", "e", "Word"], 9, 1, 11, 0, 6, 1]
+output = "S1"
 multiplicity = "μ"
-iter = ["i", 0, 3]
-
-[[constraints.value]]
-kind = "interaction"
-tag = "XOR_BYTE"
-input = [["idx", "a", "i"], ["idx", "b", "i"]]
-output = ["idx", "a_xor_b", "i"]
-multiplicity = "μ"
-iter = ["i", 0, 3]
-
-[[constraints.value]]
-kind = "interaction"
-tag = "AND_BYTE"
-input = [["idx", "c", "i"], ["idx", "a_xor_b", "i"]]
-output = ["idx", "c_and_a_xor_b", "i"]
-multiplicity = "μ"
-iter = ["i", 0, 3]
 
 [[constraint_groups]]
 name = "addition"
