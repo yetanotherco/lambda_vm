@@ -129,7 +129,7 @@ The following range checks are assumed to be performed/enforced outside of this 
 
 == Constraints
 Since most registers are frequently accessed, the difference between `timestamp` and `old_timestamp` is small most of the times.
-Rather than storing their (nearly) identical upperlimbs twice, it is instead assumed that
+Rather than storing their (nearly) identical upper limbs twice, it is instead assumed that
 $#`old_timestamp[1]` = #`timestamp[1]`$; #aligned can be used for accesses where this is not the case.
 
 Verifying that $#`timestamp` > #`old_timestamp`$ now simplifies to verifying that $#`timestamp[0]` - #`old_timestamp[0]` > 0$.
