@@ -10,17 +10,17 @@ desc = "Whether the address represents a register index"
 [[variables.input]]
 name = "base_address"
 type = "DWordWL"
-desc = "The base address to read/write from/to, gets offset by $[0, 7]$, depending on how big the access is"
+desc = "The base address to read from/write to. Gets offset by $[0, 7]$ depending on the size of the access"
 
 [[variables.input]]
 name = "value"
 type = ["BaseField", 8]
-desc = "The values to store in memory. For regular memory, these should be (up to) 8 range-checked `Byte`s; registers are stored as two range-checked `Word`s"
+desc = "The values to store in memory. For RAM, these should be (up to) 8 range-checked `Byte`s; registers are stored as two range-checked `Word`s"
 
 [[variables.input]]
 name = "timestamp"
 type = "DWordWL"
-desc = "The timestamp at which this memory access is said to occur"
+desc = "The timestamp at which this memory access occurs"
 
 [[variables.input]]
 name = "write2"
@@ -48,14 +48,14 @@ Only the elements corresponding to the `writeN` bits are guaranteed"""
 # Auxiliary
 
 [[variables.auxiliary]]
-name = "add_limb_overflow"
+name = "carry"
 type = ["Bit", 7]
-desc = "Whether adding `i` to `base_address[0]` as a field element exceeds $2^32$"
+desc = "Whether `base_address[0] + i + 1` $>= 2^32$"
 
 [[variables.auxiliary]]
 name = "old_timestamp"
 type = ["DWordWL", 8]
-desc = "The timestamp at which the address was last accessed"
+desc = "The timestamp at which address `base_address + i` was last accessed"
 
 # Virtual
 
@@ -77,8 +77,8 @@ type = ["DWordWL", 7]
 desc = "`address_add[i] = base_address + i + 1`"
 def.iter = ["i", 0, 6]
 def.poly = ["arr",
-  ["+", ["idx", "base_address", 0], "i", 1, ["*", ["-", ["^", 2, 32]], ["idx", "add_limb_overflow", "i"]]],
-  ["+", ["idx", "base_address", 1], ["idx", "add_limb_overflow", "i"]]]
+  ["-", ["+", ["idx", "base_address", 0], "i", 1], ["*", ["^", 2, 32], ["idx", "carry", "i"]]],
+  ["+", ["idx", "base_address", 1], ["idx", "carry", "i"]]]
 
 [[variables.virtual]]
 name = "μ_sum"
@@ -136,7 +136,7 @@ poly = ["*", "w2", ["not", "μ_sum"]]
 [[constraints.consistency]]
 kind = "template"
 tag = "IS_BIT"
-input = [["idx", "add_limb_overflow", "i"]]
+input = [["idx", "carry", "i"]]
 iter = ["i", 0, 6]
 
 [[constraints.consistency]]

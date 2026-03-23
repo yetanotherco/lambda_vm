@@ -33,26 +33,27 @@ The `MEMW` chip is comprised of #nr_variables variables that are expressed using
 
 Our assumptions do not explicitly cover any range checks for the `is_register` and `value` columns,
 as these are not necessary for the correctness of this chip in isolation.
-These properties are necessary for the consistency of the system as a whole, and therefore
+Still, these properties are necessary for the consistency of the system as a whole, and therefore
 we document it here, keeping the type information as a reading help.
 
 = Constraints
 
-We can compute the addresses for the later bytes based on a single bit each,
-indicating whether adding `i` to `base_address` overflows the lower limb.
-We can safely assume that additions for which this bit is not correctly set
-will have either an overflow on the upper or lower word, and hence not match
-any existing memory tokens, which are only initialized for correctly formatted
-and range-checked doublewords (see @memory).
+Depending on the values of `write2`, `write4` and `write8`, the addresses following `base_address` need to be constructed.
+Rather than computing these in full (which would require the later addresses to be instantiated), 
+it suffices to know the `carry`: the bit indicating whether $#`base_address`_0 + t >= 2^32$, i.e., whether adding $t in [1, 7]$ to `base_address` requires a carry from the lower to the upper limb.
+Note that it is safe for the prover to chose these bits: additions for which this bit is not correctly set
+will yield an address where either the lower or upper limb is out of bounds.
+As such, the constructed address will not match any existing memory tokens, 
+which are only initialized for correctly formatted and range-checked doublewords (see @memory).
 
 #render_constraint_table(chip, config, groups: "consistency")
 
 As long as `timestamp` is properly range-checked, the presence of `old_timestamp`
-in the memory argument automatically ensures appropriate range checking
-(as long as no external entities provide negative multiplicities without range checking the timestamp).
+in the memory argument automatically ensures it is appropriately range checked
+(this assumes no external entities provide negative multiplicities without range checking the timestamp).
 This ensures the assumptions for `LT` are satisfied.
 
-There is no need to check that the address does not overflow,
+There is no need to check that the additions do not overflow,
 as our address calculations are not performed modulo $2^64$ here,
 and any overflow will result in an address without matching initialization.
 
@@ -60,7 +61,7 @@ The chip adds the following tuples to the lookup argument,
 to effectuate that part of the memory argument.
 #render_constraint_table(chip, config, groups: "memory")
 
-This chip contributes the following to the lookup argument.
+This chip contributes the following to the lookup argument:
 #render_constraint_table(chip, config, groups: "output")
 
 = Read-size aligned fast path
@@ -68,9 +69,9 @@ This chip contributes the following to the lookup argument.
 #let alignedchip = load_chip("src/memw_aligned.toml", config)
 #let aligned = raw(alignedchip.name)
 
-When a memory access happens at an address with proper alignment
-(that is, enough trailing zeros) for its access size, and all accessed
-elements were last accessed at the same timestamp, we can 
+When a memory access happens at an address with proper alignment for its access size
+(i.e., adding the access size to `base_address`'s lowest limb does not overflow), 
+and all accessed elements were last accessed at the same timestamp, we can 
 instead use the #aligned chip to save on total column count.
 The saving comes from only requiring a single old timestamp to be stored,
 as well as being able to guarantee that all values of `add_limb_overflow` would be zero.
