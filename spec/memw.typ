@@ -6,6 +6,7 @@
   total_nr_variables,
   total_nr_instantiated_columns,
   render_constraint_table,
+  render_chip_padding_table
 )
 
 #let config = load_config()
@@ -87,6 +88,56 @@ The #aligned chip only needs #nr_variables variables, expressed through #nr_colu
 #render_chip_assumptions(alignedchip, config)
 #render_constraint_table(alignedchip, config)
 
+= Register fast-path
+
+#let config = load_config()
+#let register_chip = load_chip("src/memw_register.toml", config)
+#let reg = raw(register_chip.name)
+
+Given that i) there are significantly fewer registers than memory addresses, and ii) registers are accessed far more frequently, a fast-path is devised.
+
+== Columns
+#let nr_variables = total_nr_variables(register_chip)
+#let nr_columns = total_nr_instantiated_columns(register_chip, config)
+
+The #reg chip is comprised of #nr_variables variables that are expressed using #nr_columns columns:
+#render_chip_column_table(register_chip, config)
+
+== Assumptions
+The following range checks are assumed to be performed/enforced outside of this chip:
+#render_chip_assumptions(register_chip, config)
+
+== Constraints
+One of the primary tests this chip performs, is verify that $#`old_timestamp`<#`timestamp`$.
+This is achieved by ensuring that adding $#`timestamp_diff` := #`old_timestamp` - #`timestamp`$ to `timestamp` overflows.
+This is asserted by means of the following constraints:
+#render_constraint_table(register_chip, config, groups: "sub")
+
+With $#`old_timestamp`<#`timestamp`$ asserted, `old` is read from the register (@regw:c:read_old) and `val` is written back (@regw:c:write_val).
+#render_constraint_table(register_chip, config, groups: "interactions")
+
+This chip can either just write ($#`μ_write` = 1$), or read&written in the same cycle ($#`μ_read` = 1$).
+However, it must be asserted that at most one of these two options is selected:
+#render_constraint_table(register_chip, config, groups: "multiplicities")
+
+Lastly, this chip contributes the following interactions to the logup:
+#render_constraint_table(register_chip, config, groups: "output")
+
+== Padding
+The table can be padded to the next power of two with the following value assignments:
+
+#render_chip_padding_table(register_chip, config)
+
+== Notes
+- Given that most accesses are to "hot" register (i.e., registers that are accessed often), `timestamp_diff` will rarely be large.
+  This might allow `timestamp_diff` to be reduced to `Half` in a fast-path version of this chip.
+  It could even be that `old_timestamp[1]` can be dropped. Things would then be computed as
+  - `carry[0] = (old_timestamp[0] + timestamp_diff - timestamp[0]) / 2^32`
+  - `IS_HALF[timestamp_diff-1]` to ensure diff is at least 1
+  - `old_timestamp[1] = timestamp[1] - carry[0]`
+  - `carry[1] = 0` to ensure old_ts < ts
+  (-4 col)
+- Most register accesses both read&write (and not just read). The fast-path chip could assume this to always be the case, allowing the two multiplicities to be merged. (-1 col)
 
 = Future optimization ideas
 

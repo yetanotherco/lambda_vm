@@ -21,7 +21,6 @@
     ("shift.typ", [SHIFT chip], <shift>),
     ("branch.typ", [BRANCH chip], <branch>),
     ("memw.typ", [MEMW chip], <memw>),
-    ("regw.typ", [REGW chip], <regw>),
     ("lt.typ", [LT chip], <lt>),
     ("mul.typ", [MUL chip], <mul>),
     ("dvrm.typ", [DVRM chip], <dvrm>),

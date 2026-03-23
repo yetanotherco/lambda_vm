@@ -1,11 +1,11 @@
-name = "REGW"
+name = "MEMW_R"
 
 # Variables
 
 [[variables.input]]
-name = "index"
+name = "address"
 type = "Byte"
-desc = "index of the register being accessed"
+desc = "address of the register being accessed"
 pad = 0
 
 [[variables.input]]
@@ -70,8 +70,8 @@ pad = 0
 # Assumptions
 
 [[assumptions]]
-desc = "`IS_BYTE[index]`"
-ref = "regw:a:index"
+desc = "`IS_BYTE[address]`"
+ref = "regw:a:address"
 
 [[assumptions]]
 desc = "`IS_WORD[val[i]]`"
@@ -136,7 +136,7 @@ name = "interactions"
 [[constraints.interactions]]
 kind = "interaction"
 tag = "memory"
-input = [1, ["cast", ["arr", ["cast", ["+", ["*", 2, "index"], "i"], "Word"], 0], "DWordWL"], "old_timestamp", ["idx", "old", "i"]]
+input = [1, ["cast", ["arr", ["cast", ["+", ["*", 2, "address"], "i"], "Word"], 0], "DWordWL"], "old_timestamp", ["idx", "old", "i"]]
 iter = ["i", 0, 1]
 multiplicity = "μ_sum"
 ref = "regw:c:read_old"
@@ -144,7 +144,7 @@ ref = "regw:c:read_old"
 [[constraints.interactions]]
 kind = "interaction"
 tag = "memory"
-input = [1, ["cast", ["arr", ["cast", ["+", ["*", 2, "index"], "i"], "Word"], 0], "DWordWL"], "timestamp", ["idx", "val", "i"]]
+input = [1, ["cast", ["arr", ["cast", ["+", ["*", 2, "address"], "i"], "Word"], 0], "DWordWL"], "timestamp", ["idx", "val", "i"]]
 iter = ["i", 0, 1]
 multiplicity = ["-", "μ_sum"]
 ref = "regw:c:write_val"
@@ -155,13 +155,13 @@ name = "output"
 
 [[constraints.output]]
 kind = "interaction"
-tag = "REG"
-input = ["index", "timestamp", "val"]
-output = "old"
+tag = "MEMW"
+input = [1, ["cast", ["arr", ["cast", "address", "Word"], 0], "DWordWL"], ["arr", ["idx", "val", 0], ["idx", "val", 1], 0, 0, 0, 0, 0, 0], "timestamp", 1, 0, 0]
+output = ["arr", ["idx", "old", 0], ["idx", "old", 1], 0, 0, 0, 0, 0, 0]
 multiplicity = ["-", "μ_read"]
 
 [[constraints.output]]
 kind = "interaction"
-tag = "REG"
-input = ["index", "timestamp", "val"]
+tag = "MEMW"
+input = [1, ["cast", ["arr", ["cast", "address", "Word"], 0], "DWordWL"], ["arr", ["idx", "val", 0], ["idx", "val", 1], 0, 0, 0, 0, 0, 0], "timestamp", 1, 0, 0]
 multiplicity = ["-", "μ_write"]
