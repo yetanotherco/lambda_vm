@@ -4,7 +4,7 @@ name = "MEMW_R"
 
 [[variables.input]]
 name = "address"
-type = "Byte"
+type = "Half"
 desc = "address of the register being accessed"
 pad = 0
 
@@ -114,7 +114,7 @@ name = "interactions"
 [[constraints.interactions]]
 kind = "interaction"
 tag = "memory"
-input = [1, ["cast", ["arr", ["cast", ["+", ["*", 2, "address"], "i"], "Word"], 0], "DWordWL"], "old_timestamp", ["idx", "old", "i"]]
+input = [1, ["cast", ["arr", ["cast", ["+", "address", "i"], "Word"], 0], "DWordWL"], "old_timestamp", ["idx", "old", "i"]]
 iter = ["i", 0, 1]
 multiplicity = "μ_sum"
 ref = "regw:c:read_old"
@@ -122,7 +122,7 @@ ref = "regw:c:read_old"
 [[constraints.interactions]]
 kind = "interaction"
 tag = "memory"
-input = [1, ["cast", ["arr", ["cast", ["+", ["*", 2, "address"], "i"], "Word"], 0], "DWordWL"], "timestamp", ["idx", "val", "i"]]
+input = [1, ["cast", ["arr", ["cast", ["+", "address", "i"], "Word"], 0], "DWordWL"], "timestamp", ["idx", "val", "i"]]
 iter = ["i", 0, 1]
 multiplicity = ["-", "μ_sum"]
 ref = "regw:c:write_val"
