@@ -266,9 +266,10 @@ multiplicity = "μ"
 iter = ["i", 0, 1]
 
 [[constraints.addition]]
-kind = "arith"
-constraint = "$#`carry_e` in {0, 1, 2}$"
-poly = ["*", "carry_e", ["-", "carry_e", 1], ["-", "carry_e", 2]]
+kind = "interaction"
+tag = "IS_BYTE"
+input = ["carry_e"]
+multiplicity = "μ"
 
 [[constraint_groups]]
 name = "output"

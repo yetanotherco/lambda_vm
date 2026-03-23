@@ -133,9 +133,7 @@ needing fewer intermediate columns.
 Similarly, `ch` can be written as $(e bitand f) + ((2^32 - 1 - e) bitand g)$.
 #render_constraint_table(sha256roundchip, config, groups: "value")
 
-Then we constrain the addition for the new state.
-Since `out_e` is the range-checked sum of three range-checked words, we
-can constrain `carry_e` to be 0, 1 or 2 with a degree 3 constraint instead of a lookup.
+Then we constrain the addition for the new state, constraining additions with the same `IS_BYTE` trick as before.
 #render_constraint_table(sha256roundchip, config, groups: "addition")
 
 Finally, we chain the rounds together through the interactions.
