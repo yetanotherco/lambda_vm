@@ -129,15 +129,7 @@ name = "shift"
 kind = "interaction"
 tag = "HWSL"
 input = [["idx", "a", "i"], ["-", 16, "r0_low"]]
-output = ["idx", "a0_left", "i"]
-iter = ["i", 0, 1]
-multiplicity = "μ"
-
-[[constraints.shift]]
-kind = "interaction"
-tag = "HWSLC"
-input = [["idx", "a", "i"], ["-", 16, "r0_low"]]
-output = ["idx", "a0_right", "i"]
+output = ["arr", ["idx", "a0_left", "i"], ["idx", "a0_right", "i"]]
 iter = ["i", 0, 1]
 multiplicity = "μ"
 
@@ -145,15 +137,7 @@ multiplicity = "μ"
 kind = "interaction"
 tag = "HWSL"
 input = [["idx", "a", "i"], ["-", 16, "r1_low"]]
-output = ["idx", "a1_left", "i"]
-iter = ["i", 0, 1]
-multiplicity = "μ"
-
-[[constraints.shift]]
-kind = "interaction"
-tag = "HWSLC"
-input = [["idx", "a", "i"], ["-", 16, "r1_low"]]
-output = ["idx", "a1_right", "i"]
+output = ["arr", ["idx", "a1_left", "i"], ["idx", "a1_right", "i"]]
 iter = ["i", 0, 1]
 multiplicity = "μ"
 
@@ -161,15 +145,7 @@ multiplicity = "μ"
 kind = "interaction"
 tag = "HWSL"
 input = [["idx", "a", "i"], ["-", 16, "r2_low"]]
-output = ["idx", "a2_left", "i"]
-iter = ["i", 0, 1]
-multiplicity = "μ"
-
-[[constraints.shift]]
-kind = "interaction"
-tag = "HWSLC"
-input = [["idx", "a", "i"], ["-", 16, "r2_low"]]
-output = ["idx", "a2_right", "i"]
+output = ["arr", ["idx", "a2_left", "i"], ["idx", "a2_right", "i"]]
 iter = ["i", 0, 1]
 multiplicity = "μ"
 
