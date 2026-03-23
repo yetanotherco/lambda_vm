@@ -279,7 +279,7 @@ kind = "interaction"
 tag = "IS_BYTE"
 input = [["idx", "out", "i"]]
 multiplicity = "μ"
-iter = ["i", 0, 64]
+iter = ["i", 0, 31]
 
 [[constraints.compress]]
 kind = "template"
