@@ -235,10 +235,10 @@ kind = "interaction"
 tag = "MEMW"
 input = ["is_register", "base_address", "value", "timestamp", "write2", "write4", "write8"]
 output = "old"
-multiplicity = "μ_read"
+multiplicity = ["-", "μ_read"]
 
 [[constraints.output]]
 kind = "interaction"
 tag = "MEMW"
 input = ["is_register", "base_address", "value", "timestamp", "write2", "write4", "write8"]
-multiplicity = "μ_write"
+multiplicity = ["-", "μ_write"]
