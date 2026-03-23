@@ -6,6 +6,7 @@
   total_nr_variables,
   total_nr_instantiated_columns,
   render_constraint_table,
+  render_chip_padding_table,
 )
 
 #let config = load_config()
@@ -64,6 +65,10 @@ to effectuate that part of the memory argument.
 This chip contributes the following to the lookup argument:
 #render_constraint_table(chip, config, groups: "output")
 
+= Padding
+The table can be padded to the next power of two with the following value assignments:
+#render_chip_padding_table(chip, config)
+
 = Read-size aligned fast path
 
 #let alignedchip = load_chip("src/memw_aligned.toml", config)
@@ -87,6 +92,9 @@ The #aligned chip only needs #nr_variables variables, expressed through #nr_colu
 #render_chip_assumptions(alignedchip, config)
 #render_constraint_table(alignedchip, config)
 
+== Padding
+The table can be padded to the next power of two with the following value assignments:
+#render_chip_padding_table(alignedchip, config)
 
 = Future optimization ideas
 
