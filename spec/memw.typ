@@ -114,6 +114,8 @@ Note: as a result of hard optimization, this chip can only be used for register 
 + $#`timestamp[0]` > #`old_timestamp[0]`$
 If either of these rules does not apply to your access, you should fall back to using `MEMW_A`.
 
+Note moreover that this chip does not guard against misaligned register access faults: to access register with a given `address`, one must provide $2 dot #`address`$ in the lookup. 
+
 == Columns
 #let nr_variables = total_nr_variables(register_chip)
 #let nr_columns = total_nr_instantiated_columns(register_chip, config)

@@ -114,7 +114,7 @@ name = "interactions"
 [[constraints.interactions]]
 kind = "interaction"
 tag = "memory"
-input = [1, ["cast", ["arr", ["cast", ["+", "address", "i"], "Word"], 0], "DWordWL"], "old_timestamp", ["idx", "old", "i"]]
+input = [1, ["cast", ["arr", ["cast", ["+", ["*", 2, "address"], "i"], "Word"], 0], "DWordWL"], "old_timestamp", ["idx", "old", "i"]]
 iter = ["i", 0, 1]
 multiplicity = "μ_sum"
 ref = "regw:c:read_old"
@@ -122,7 +122,7 @@ ref = "regw:c:read_old"
 [[constraints.interactions]]
 kind = "interaction"
 tag = "memory"
-input = [1, ["cast", ["arr", ["cast", ["+", "address", "i"], "Word"], 0], "DWordWL"], "timestamp", ["idx", "val", "i"]]
+input = [1, ["cast", ["arr", ["cast", ["+", ["*", 2, "address"], "i"], "Word"], 0], "DWordWL"], "timestamp", ["idx", "val", "i"]]
 iter = ["i", 0, 1]
 multiplicity = ["-", "μ_sum"]
 ref = "regw:c:write_val"
@@ -134,12 +134,12 @@ name = "output"
 [[constraints.output]]
 kind = "interaction"
 tag = "MEMW"
-input = [1, ["cast", ["arr", ["cast", "address", "Word"], 0], "DWordWL"], ["arr", ["idx", "val", 0], ["idx", "val", 1], 0, 0, 0, 0, 0, 0], "timestamp", 1, 0, 0]
+input = [1, ["cast", ["arr", ["cast", ["*", 2, "address"], "Word"], 0], "DWordWL"], ["arr", ["idx", "val", 0], ["idx", "val", 1], 0, 0, 0, 0, 0, 0], "timestamp", 1, 0, 0]
 output = ["arr", ["idx", "old", 0], ["idx", "old", 1], 0, 0, 0, 0, 0, 0]
 multiplicity = ["-", "μ_read"]
 
 [[constraints.output]]
 kind = "interaction"
 tag = "MEMW"
-input = [1, ["cast", ["arr", ["cast", "address", "Word"], 0], "DWordWL"], ["arr", ["idx", "val", 0], ["idx", "val", 1], 0, 0, 0, 0, 0, 0], "timestamp", 1, 0, 0]
+input = [1, ["cast", ["arr", ["cast", ["*", 2, "address"], "Word"], 0], "DWordWL"], ["arr", ["idx", "val", 0], ["idx", "val", 1], 0, 0, 0, 0, 0, 0], "timestamp", 1, 0, 0]
 multiplicity = ["-", "μ_write"]
