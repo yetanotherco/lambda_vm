@@ -154,3 +154,4 @@ The table can be padded to the next power of two with the following value assign
 = Future optimization ideas
 - `MEMB` chip that does a one-byte write to remove old_timestamp from here (uncertain tradeoffs)
 - Adding `μ_sum`/`w2`/`w4`/`write8` multiplicities to the `IS_HALF` lookups may make some GKR things faster if there are known zeroes.
+- For the register fast-path, one may upgrade the `IS_HALF` check to an `IS_B20` check for extended range at the cost of looking through a larger table.
