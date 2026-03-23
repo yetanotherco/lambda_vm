@@ -116,10 +116,10 @@ pad = 0
 
 
 [[assumptions]]
-desc = "$1 <= #`r0_low`, #`r1_low`, #`r2_low` < 16$"
+desc = "$#`r0_low`, #`r1_low`, #`r2_low` in [1, 15]$"
 
 [[assumptions]]
-desc = "$0 <= #`r0_high`, #`r1_high` < 2$"
+desc = "$#`r0_high`, #`r1_high` in [0, 1]$"
 
 
 [[constraint_groups]]
@@ -151,13 +151,13 @@ multiplicity = "μ"
 
 [[constraints.shift]]
 kind = "arith"
-constraint = "$#`a0[i]` = (1 - #`r0_high`) * (#`a0_left[1 - i]` + #`a0_right[i]`) + #`r0_high` * (#`a0_left[i]` + #`a0_right[i - i]`)$"
+constraint = "$#`a0[i]` = (1 - #`r0_high`) dot (#`a0_left[1 - i]` + #`a0_right[i]`) + #`r0_high` dot (#`a0_left[i]` + #`a0_right[1 - i]`)$"
 poly = ["-", ["idx", ["cast", "a0", "WordHL"], "i"], ["*", ["not", "r0_high"], ["+", ["idx", "a0_left", ["-", 1, "i"]], ["idx", "a0_right", "i"]]], ["*", "r0_high", ["+", ["idx", "a0_left", "i"], ["idx", "a0_right", ["-", 1, "i"]]]]]
 iter = ["i", 0, 1]
 
 [[constraints.shift]]
 kind = "arith"
-constraint = "$#`a1[i]` = (1 - #`r1_high`) * (#`a1_left[1 - i]` + #`a1_right[i]`) + #`r1_high` * (#`a1_left[i]` + #`a1_right[i - i]`)$"
+constraint = "$#`a1[i]` = (1 - #`r1_high`) dot (#`a1_left[1 - i]` + #`a1_right[i]`) + #`r1_high` dot (#`a1_left[i]` + #`a1_right[1 - i]`)$"
 poly = ["-", ["idx", ["cast", "a1", "WordHL"], "i"], ["*", ["not", "r1_high"], ["+", ["idx", "a1_left", ["-", 1, "i"]], ["idx", "a1_right", "i"]]], ["*", "r1_high", ["+", ["idx", "a1_left", "i"], ["idx", "a1_right", ["-", 1, "i"]]]]]
 iter = ["i", 0, 1]
 

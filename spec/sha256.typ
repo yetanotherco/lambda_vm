@@ -95,7 +95,7 @@ First, we gather the dependencies from earlier in the message schedule.
 #render_constraint_table(sha256msgschedchip, config, groups: "lookback")
 
 Then, we calculate the result.
-It suffices to check that the overflow of adding four range-checked words
+It suffices to check that the carry of adding four range-checked words
 into a range-checked word is not too big, following the logic from @add.
 #render_constraint_table(sha256msgschedchip, config, groups: "calc")
 

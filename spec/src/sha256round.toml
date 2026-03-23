@@ -87,7 +87,7 @@ pad = 0
 [[variables.auxiliary]]
 name = "not_e_and_g"
 type = "WordBL"
-desc = "Part of `ch`"
+desc = "$(not e) class(\"binary\", amp) g$. Part of `ch`"
 pad = 0
 
 [[variables.auxiliary]]
@@ -154,13 +154,13 @@ def = ["+", "S0", "maj"]
 name = "carry_a"
 type = "Byte"
 desc = "The carry from `out_a`"
-def = ["*", ["^", 2, -32], ["-", ["cast", "out_a", "Word"], "temp1", "temp2"]]
+def = ["*", ["^", 2, -32], ["-", ["+", "temp1", "temp2"], ["cast", "out_a", "Word"]]]
 
 [[variables.virtual]]
 name = "carry_e"
 type = "Byte"
 desc = "The carry from `out_e`"
-def = ["*", ["^", 2, -32], ["-", ["cast", "out_e", "Word"], "d", "temp1"]]
+def = ["*", ["^", 2, -32], ["-", ["+", "d", "temp1"], ["cast", "out_e", "Word"]]]
 
 [[variables.multiplicity]]
 name = "μ"

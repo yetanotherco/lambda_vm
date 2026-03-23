@@ -21,7 +21,7 @@ pad = 0
 [[variables.input]]
 name = "h_addr"
 type = ["DWordHL", 3]
-desc = "The addresses of the next doublewords of `h`: `h_base_addr + 8 * (i + 1)`"
+desc = "The addresses of the next doublewords of `h`: $#`h_base_addr` + 8 dot (i + 1)$"
 pad = ["arr", 8, 16, 24]
 
 [[variables.input]]
@@ -39,7 +39,7 @@ pad = 0
 [[variables.input]]
 name = "m_addr"
 type = ["DWordHL", 7]
-desc = "The addresses of the next doublewords of `m`: `m_base_addr + 8 * (i + 1)`"
+desc = "The addresses of the next doublewords of `m`: $#`m_base_addr` + 8 dot (i + 1)$"
 pad = ["arr", 8, 16, 24, 32, 40, 48, 56]
 
 [[variables.output]]
