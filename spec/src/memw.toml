@@ -6,36 +6,43 @@ name = "MEMW"
 name = "is_register"
 type = "Bit"
 desc = "Whether the address represents a register index"
+pad = 0
 
 [[variables.input]]
 name = "base_address"
 type = "DWordWL"
 desc = "The base address to read from/write to. Gets offset by $[0, 7]$ depending on the size of the access"
+pad = 0
 
 [[variables.input]]
 name = "value"
 type = ["BaseField", 8]
 desc = "The values to store in memory. For RAM, these should be (up to) 8 range-checked `Byte`s; registers are stored as two range-checked `Word`s"
+pad = 0
 
 [[variables.input]]
 name = "timestamp"
 type = "DWordWL"
 desc = "The timestamp at which this memory access occurs"
+pad = 0
 
 [[variables.input]]
 name = "write2"
 type = "Bit"
 desc = "Whether to write exactly 2 values"
+pad = 0
 
 [[variables.input]]
 name = "write4"
 type = "Bit"
 desc = "Whether to write exactly 4 values"
+pad = 0
 
 [[variables.input]]
 name = "write8"
 type = "Bit"
 desc = "Whether to write exactly 8 values"
+pad = 0
 
 # Output
 
@@ -44,6 +51,7 @@ name = "old"
 type = ["BaseField", 8]
 desc = """The old value written at `base_address`. See `value` for information about representation.
 Only the elements corresponding to the `writeN` bits are guaranteed"""
+pad = ["arr", 0,0,0,0,0,0,0,0]
 
 # Auxiliary
 
@@ -51,11 +59,13 @@ Only the elements corresponding to the `writeN` bits are guaranteed"""
 name = "carry"
 type = ["Bit", 7]
 desc = "Whether `base_address[0] + i + 1` $>= 2^32$"
+pad = ["arr", 0,0,0,0,0,0,0]
 
 [[variables.auxiliary]]
 name = "old_timestamp"
 type = ["DWordWL", 8]
 desc = "The timestamp at which address `base_address + i` was last accessed"
+pad = ["arr", 0,0,0,0,0,0,0,0]
 
 # Virtual
 
@@ -92,12 +102,13 @@ def = ["+", "μ_read", "μ_write"]
 name = "μ_read"
 type = "Bit"
 desc = "Whether we are performing a read (and hence return `out`)"
+pad = 0
 
 [[variables.multiplicity]]
 name = "μ_write"
 type = "Bit"
 desc = "Whether we are performing a write (and hence not return `out`)"
-
+pad = 0
 
 [[assumptions]]
 desc = "`IS_WORD[base_address[i]]`"
@@ -122,6 +133,16 @@ iter = ["i", 0, 1]
 
 [[constraint_groups]]
 name = "consistency"
+
+[[constraints.consistency]]
+kind = "template"
+tag = "IS_BIT"
+input = ["μ_read"]
+
+[[constraints.consistency]]
+kind = "template"
+tag = "IS_BIT"
+input = ["μ_write"]
 
 [[constraints.consistency]]
 kind = "template"
@@ -235,10 +256,10 @@ kind = "interaction"
 tag = "MEMW"
 input = ["is_register", "base_address", "value", "timestamp", "write2", "write4", "write8"]
 output = "old"
-multiplicity = "μ_read"
+multiplicity = ["-", "μ_read"]
 
 [[constraints.output]]
 kind = "interaction"
 tag = "MEMW"
 input = ["is_register", "base_address", "value", "timestamp", "write2", "write4", "write8"]
-multiplicity = "μ_write"
+multiplicity = ["-", "μ_write"]

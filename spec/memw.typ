@@ -6,7 +6,11 @@
   total_nr_variables,
   total_nr_instantiated_columns,
   render_constraint_table,
+<<<<<<< spec/MEMW_R
   render_chip_padding_table
+=======
+  render_chip_padding_table,
+>>>>>>> spec/memw_update2
 )
 
 #let config = load_config()
@@ -64,6 +68,10 @@ to effectuate that part of the memory argument.
 
 This chip contributes the following to the lookup argument:
 #render_constraint_table(chip, config, groups: "output")
+
+= Padding
+The table can be padded to the next power of two with the following value assignments:
+#render_chip_padding_table(chip, config)
 
 = Read-size aligned fast path
 

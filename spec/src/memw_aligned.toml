@@ -131,6 +131,16 @@ multiplicity = "μ_sum"
 [[constraints.consistency]]
 kind = "template"
 tag = "IS_BIT"
+input = ["μ_read"]
+
+[[constraints.consistency]]
+kind = "template"
+tag = "IS_BIT"
+input = ["μ_write"]
+
+[[constraints.consistency]]
+kind = "template"
+tag = "IS_BIT"
 input = ["μ_sum"]
 
 [[constraints.consistency]]
@@ -211,10 +221,10 @@ kind = "interaction"
 tag = "MEMW"
 input = ["is_register", ["cast", "base_address", "DWordWL"], "value", "timestamp", "write2", "write4", "write8"]
 output = "old"
-multiplicity = "μ_read"
+multiplicity = ["-", "μ_read"]
 
 [[constraints.output]]
 kind = "interaction"
 tag = "MEMW"
 input = ["is_register", ["cast", "base_address", "DWordWL"], "value", "timestamp", "write2", "write4", "write8"]
-multiplicity = "μ_write"
+multiplicity = ["-", "μ_write"]
