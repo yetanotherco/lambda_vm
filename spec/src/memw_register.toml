@@ -4,7 +4,7 @@ name = "MEMW_R"
 
 [[variables.input]]
 name = "address"
-type = "Half"
+type = "Byte"
 desc = "address of the register being accessed"
 pad = 0
 
@@ -59,10 +59,6 @@ pad = 0
 
 
 # Assumptions
-
-[[assumptions]]
-desc = "`IS_BYTE[address]`"
-ref = "regw:a:address"
 
 [[assumptions]]
 desc = "`IS_WORD[val[i]]`"
