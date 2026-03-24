@@ -234,9 +234,9 @@ desc = "The value of register `rs2`"
 pad = 0
 
 [[variables.auxiliary]]
-name = "rv1_sign_bit"
+name = "rv1_ext_bit"
 type = "Bit"
-desc = "The sign bit of `rv1` if seen as a 32-bit word"
+desc = "The sign bit of `rv1` if seen as a 32-bit word, used for sign extension with `word_instr`"
 pad = 0
 
 [[variables.auxiliary]]
@@ -246,9 +246,9 @@ desc = "The extended version of `rv1`, depending on `word_instr`"
 pad = 0
 
 [[variables.auxiliary]]
-name = "arg2_sign_bit"
+name = "rv2_ext_bit"
 type = "Bit"
-desc = "The sign bit of `arg2` if seen as a 32-bit word"
+desc = "The sign bit of `rv2` if seen as a 32-bit word, used for sign extension with `word_instr`"
 pad = 0
 
 [[variables.auxiliary]]
@@ -258,9 +258,9 @@ desc = "A multiplexed version of `rv2` and `imm`, to be used as second argument 
 pad = 0
 
 [[variables.auxiliary]]
-name = "res_sign_bit"
+name = "res_ext_bit"
 type = "Bit"
-desc = "The sign bit of `res`, if seen as a 32-bit word"
+desc = "The sign bit of `res`, if seen as a 32-bit word, used for sign extension with `word_instr`"
 pad = 0
 
 [[variables.auxiliary]]
@@ -725,7 +725,7 @@ prefix = "E"
 kind = "template"
 tag = "SIGN"
 input = [["idx", "rv1", 1], "word_instr"]
-output = "rv1_sign_bit"
+output = "rv1_ext_bit"
 
 [[constraints.ext]]
 kind = "arith"
@@ -734,14 +734,14 @@ poly = ["-", ["idx", ["cast", "arg1", "DWordWL"], 0], ["idx", ["cast", "rv1", "D
 
 [[constraints.ext]]
 kind = "arith"
-constraint = "$#`arg1[4:]` = #`rv1[2]` dot (1 - #`word_instr`) + (2^(32) - 1) dot #`rv1_sign_bit` dot #`signed`$"
-poly = ["-", ["idx", ["cast", "arg1", "DWordWL"], 1], ["*", ["not", "word_instr"], ["idx", "rv1", 2]], ["*", "signed", "rv1_sign_bit", ["-", ["^", 2, 32], 1]]]
+constraint = "$#`arg1[4:]` = #`rv1[2]` dot (1 - #`word_instr`) + (2^(32) - 1) dot #`rv1_ext_bit` dot #`signed`$"
+poly = ["-", ["idx", ["cast", "arg1", "DWordWL"], 1], ["*", ["not", "word_instr"], ["idx", "rv1", 2]], ["*", "signed", "rv1_ext_bit", ["-", ["^", 2, 32], 1]]]
 
 [[constraints.ext]]
 kind = "template"
 tag = "SIGN"
 input = [["idx", "rv2", 1], "word_instr"]
-output = "arg2_sign_bit"
+output = "rv2_ext_bit"
 
 [[constraints.ext]]
 kind = "arith"
@@ -750,14 +750,14 @@ poly = ["-", ["idx", ["cast", "arg2", "DWordWL"], 0], ["*", ["not", "LOAD"], ["i
 
 [[constraints.ext]]
 kind = "arith"
-constraint = "$#`arg2[4:]` = (1 - #`LOAD`) dot ((1 - #`word_instr`) dot #`rv2[2]` + #`signed` dot #`arg2_sign_bit` dot (2^(32) - 1)) + (1 - #`BEQ` - #`BLT` - #`STORE`) dot #`imm[1]`$"
-poly = ["-", ["idx", ["cast", "arg2", "DWordWL"], 1], ["*", ["not", "LOAD"], ["not", "word_instr"], ["idx", "rv2", 2]], ["*", ["not", "LOAD"], "signed", "arg2_sign_bit", ["-", ["^", 2, 32], 1]], ["*", ["-", 1, "BEQ", "BLT", "STORE"], ["idx", "imm", 1]]]
+constraint = "$#`arg2[4:]` = (1 - #`LOAD`) dot ((1 - #`word_instr`) dot #`rv2[2]` + #`signed` dot #`rv2_ext_bit` dot (2^(32) - 1)) + (1 - #`BEQ` - #`BLT` - #`STORE`) dot #`imm[1]`$"
+poly = ["-", ["idx", ["cast", "arg2", "DWordWL"], 1], ["*", ["not", "LOAD"], ["not", "word_instr"], ["idx", "rv2", 2]], ["*", ["not", "LOAD"], "signed", "rv2_ext_bit", ["-", ["^", 2, 32], 1]], ["*", ["-", 1, "BEQ", "BLT", "STORE"], ["idx", "imm", 1]]]
 
 [[constraints.ext]]
 kind = "template"
 tag = "SIGN"
 input = [["idx", ["cast", "res", "DWordHL"], 1],  "word_instr"]
-output = "res_sign_bit"
+output = "res_ext_bit"
 
 [[constraints.ext]]
 kind = "arith"
@@ -766,10 +766,9 @@ poly = ["*", ["not", "LOAD"], ["-", ["idx", "rvd", 0], ["idx", ["cast", "res", "
 
 [[constraints.ext]]
 kind = "arith"
-constraint = "$#`!LOAD` => #`rvd[1]` = (1 - #`word_instr`) dot #`res[4:]` + #`res_sign_bit` dot (2^(32) - 1)$"
+constraint = "$#`!LOAD` => #`rvd[1]` = (1 - #`word_instr`) dot #`res[4:]` + #`res_ext_bit` dot (2^(32) - 1)$"
 desc = "_Sign_ extend the output if it wasn't a `LOAD`. Only `LOAD` has both `write_register = 1` and `rvd ≠ res`. `LOAD` and `word_instr` are disjoint"
-poly = ["*", ["not", "LOAD"], ["-", ["idx", "rvd", 1], ["*", ["not", "word_instr"], ["idx", ["cast", "res", "DWordWL"], 1]], ["*", "res_sign_bit", ["-", ["^", 2, 32], 1]]]]
-
+poly = ["*", ["not", "LOAD"], ["-", ["idx", "rvd", 1], ["*", ["not", "word_instr"], ["idx", ["cast", "res", "DWordWL"], 1]], ["*", "res_ext_bit", ["-", ["^", 2, 32], 1]]]]
 
 
 [[constraint_groups]]
