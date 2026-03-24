@@ -25,9 +25,10 @@
 
 The base #sha256 chip provides the `ECALL` interface, interacts with memory and then delegates to the #sha256msgsched and #sha256round chips
 to perform the message schedule and the compression rounds, respectively.
-The `SHA2_M` interaction signature is used to represent the output of the message schedule.
-The `SHA2_K` interaction signature is used to represent the `k` constants.
+The `SHA256_M` interaction signature is used to represent the output of the message schedule.
+The `SHA256_K` interaction signature is used to represent the `k` constants.
 It could either be instantiated with a (short) precomputed table, or through hardcoded LogUp contributions in this chip.
+For this exposition, we choose the former option, and present a table further below.
 Additionally, we introduce a #rotxor chip that takes as input `a`, `r0`, `r1`, `r2` (4-bit values) and a bit `last_rot` and computes
 $
   cases(
@@ -177,6 +178,16 @@ And finally contribute to the lookup argument.
 == Padding
 
 #render_chip_padding_table(rotxorchip, config)
+
+= Constant lookup
+
+#let sha256_kchip = load_chip("src/sha256consts.toml", config)
+#let sha256_k = sha256_kchip.name
+
+As mentioned, we provide the round constants through a short precomputed lookup table: #sha256_k.
+
+#render_chip_column_table(sha256_kchip, config)
+#render_constraint_table(sha256_kchip, config)
 
 = Notes/optimizations
 - This could instead be designed following the #link("https://github.com/riscv/riscv-crypto")[RISC-V Crypto Scalar extension `Zknh`],
