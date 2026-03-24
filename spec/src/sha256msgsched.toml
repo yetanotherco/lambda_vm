@@ -72,7 +72,7 @@ desc = ""
 pad = 0
 
 [[assumptions]]
-desc = "#`IS_WORD[SHA256_M[i]]` for $0 <= i < #`index`$"
+desc = "#`IS_WORD[SHA256_M[timestamp, i]]` for $0 <= i < #`index`$"
 
 
 [[constraint_groups]]
@@ -87,25 +87,29 @@ multiplicity = "μ"
 [[constraints.lookback]]
 kind = "interaction"
 tag = "SHA256_M"
-input = ["timestamp", ["-", "index", 2], "back2"]
+input = ["timestamp", ["-", "index", 2]]
+output = "back2"
 multiplicity = "μ"
 
 [[constraints.lookback]]
 kind = "interaction"
 tag = "SHA256_M"
-input = ["timestamp", ["-", "index", 7], "back7"]
+input = ["timestamp", ["-", "index", 7]]
+output = "back7"
 multiplicity = "μ"
 
 [[constraints.lookback]]
 kind = "interaction"
 tag = "SHA256_M"
-input = ["timestamp", ["-", "index", 15], "back15"]
+input = ["timestamp", ["-", "index", 15]]
+output = "back15"
 multiplicity = "μ"
 
 [[constraints.lookback]]
 kind = "interaction"
 tag = "SHA256_M"
-input = ["timestamp", ["-", "index", 16], "back16"]
+input = ["timestamp", ["-", "index", 16]]
+output = "back16"
 multiplicity = "μ"
 
 [[constraint_groups]]
@@ -154,5 +158,6 @@ poly = ["*", ["not", "μ"], "amount"]
 [[constraints.output]]
 kind = "interaction"
 tag = "SHA256_M"
-input = ["timestamp", "index", ["cast", "out", "Word"]]
+input = ["timestamp", "index"]
+output = ["cast", "out", "Word"]
 multiplicity = ["-", "amount"]

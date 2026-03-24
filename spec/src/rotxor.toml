@@ -98,7 +98,7 @@ pad = 0
 
 [[variables.multiplicity]]
 name = "μ"
-type = "Bit"
+type = "BaseField"
 desc = ""
 pad = 0
 

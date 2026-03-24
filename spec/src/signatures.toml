@@ -198,7 +198,8 @@ output = "Word"
 [[signatures]]
 tag = "SHA256_M"
 kind = "interaction"
-input = ["DWordWL", "BaseField", "Word"]
+input = ["DWordWL", "BaseField"]
+output = "Word"
 
 [[signatures]]
 tag = "SHA256ROUND"

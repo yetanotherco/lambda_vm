@@ -22,6 +22,9 @@
 #let sha256round = raw(sha256roundchip.name)
 #let rotxor = raw(rotxorchip.name)
 
+The purpose of this set of chips is to provide an accelerator for the SHA256 compression function.
+They do not intend to handle the requisite repeated invocations of this compression,
+nor with padding or the preparation of the initial state.
 
 The base #sha256 chip provides the `ECALL` interface, interacts with memory and then delegates to the #sha256msgsched and #sha256round chips
 to perform the message schedule and the compression rounds, respectively.
@@ -38,7 +41,7 @@ $
 $
 where we let $>>>$ denote right rotation and $>>$ logical shift right.
 
-Most of the structure and variable naming follows the pseudocode at #link("https://en.wikipedia.org/wiki/SHA-2#Pseudocode").
+Most of the structure and variable naming follows the pseudocode of the wikipedia page#footnote(link("https://web.archive.org/web/20260320010021/https://en.wikipedia.org/wiki/SHA-2#Pseudocode")).
 
 = #sha256 chip
 
@@ -146,7 +149,9 @@ Finally, we chain the rounds together through the interactions.
 
 = #rotxor chip
 
-Since all uses of the chip can be reordered to have `r2 < 16`, we can leave out the high bit of `r2` from the chip.
+Refer to the start of this chapter for the formulation of what this chip constrains.
+We choose this representation so that all shift amounts required fit into 4 bits,
+making the usage of `HWSL` more straightforward and avoid extra columns to represent more bits.
 
 == Columns
 
@@ -182,7 +187,7 @@ And finally contribute to the lookup argument.
 = Constant lookup
 
 #let sha256_kchip = load_chip("src/sha256consts.toml", config)
-#let sha256_k = sha256_kchip.name
+#let sha256_k = raw(sha256_kchip.name)
 
 As mentioned, we provide the round constants through a short precomputed lookup table: #sha256_k.
 

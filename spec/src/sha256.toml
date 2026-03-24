@@ -205,48 +205,52 @@ name = "sched"
 [[constraints.sched]]
 kind = "interaction"
 tag = "SHA256_M"
-input = ["timestamp", "i", ["+",
+input = ["timestamp", "i"]
+output = ["+",
   ["*", ["^", 2, 0], ["idx", "m", ["+", ["*", 4, "i"], 3]]],
   ["*", ["^", 2, 8], ["idx", "m", ["+", ["*", 4, "i"], 2]]],
   ["*", ["^", 2, 16], ["idx", "m", ["+", ["*", 4, "i"], 1]]],
   ["*", ["^", 2, 24], ["idx", "m", ["+", ["*", 4, "i"], 0]]],
-]]
+]
 multiplicity = ["*", -2, "μ"]
 iter = ["i", 0, 0]
 
 [[constraints.sched]]
 kind = "interaction"
 tag = "SHA256_M"
-input = ["timestamp", "i", ["+",
+input = ["timestamp", "i"]
+output = ["+",
   ["*", ["^", 2, 0], ["idx", "m", ["+", ["*", 4, "i"], 3]]],
   ["*", ["^", 2, 8], ["idx", "m", ["+", ["*", 4, "i"], 2]]],
   ["*", ["^", 2, 16], ["idx", "m", ["+", ["*", 4, "i"], 1]]],
   ["*", ["^", 2, 24], ["idx", "m", ["+", ["*", 4, "i"], 0]]],
-]]
+]
 multiplicity = ["*", -3, "μ"]
 iter = ["i", 1, 8]
 
 [[constraints.sched]]
 kind = "interaction"
 tag = "SHA256_M"
-input = ["timestamp", "i", ["+",
+input = ["timestamp", "i"]
+output = ["+",
   ["*", ["^", 2, 0], ["idx", "m", ["+", ["*", 4, "i"], 3]]],
   ["*", ["^", 2, 8], ["idx", "m", ["+", ["*", 4, "i"], 2]]],
   ["*", ["^", 2, 16], ["idx", "m", ["+", ["*", 4, "i"], 1]]],
   ["*", ["^", 2, 24], ["idx", "m", ["+", ["*", 4, "i"], 0]]],
-]]
+]
 multiplicity = ["*", -4, "μ"]
 iter = ["i", 9, 13]
 
 [[constraints.sched]]
 kind = "interaction"
 tag = "SHA256_M"
-input = ["timestamp", "i", ["+",
+input = ["timestamp", "i"]
+output = ["+",
   ["*", ["^", 2, 0], ["idx", "m", ["+", ["*", 4, "i"], 3]]],
   ["*", ["^", 2, 8], ["idx", "m", ["+", ["*", 4, "i"], 2]]],
   ["*", ["^", 2, 16], ["idx", "m", ["+", ["*", 4, "i"], 1]]],
   ["*", ["^", 2, 24], ["idx", "m", ["+", ["*", 4, "i"], 0]]],
-]]
+]
 multiplicity = ["*", -5, "μ"]
 iter = ["i", 14, 15]
 

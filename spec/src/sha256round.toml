@@ -63,43 +63,43 @@ pad = 0
 [[variables.output]]
 name = "out_a"
 type = "WordHL"
-desc = "temp1 + temp2"
+desc = "$#`temp1` + #`temp2`$"
 pad = 0
 
 [[variables.output]]
 name = "out_e"
 type = "WordHL"
-desc = "d + temp1"
+desc = "$#`d` + #`temp1`$"
 pad = 0
 
 [[variables.auxiliary]]
 name = "a_and_b"
 type = "WordBL"
-desc = "$a class(\"binary\", amp) b$. Part of `maj`"
+desc = "$#`a` class(\"binary\", amp) #`b`$. Part of `maj`"
 pad = 0
 
 [[variables.auxiliary]]
 name = "a_xor_b"
 type = "WordBL"
-desc = "$a xor b$. Part of `maj`"
+desc = "$#`a` xor #`b`$. Part of `maj`"
 pad = 0
 
 [[variables.auxiliary]]
 name = "c_and_a_xor_b"
 type = "WordBL"
-desc = "$c class(\"binary\", amp) (a xor b)$. Part of `maj`"
+desc = "$#`c` class(\"binary\", amp) (#`a` xor #`b`)$. Part of `maj`"
 pad = 0
 
 [[variables.auxiliary]]
 name = "e_and_f"
 type = "WordBL"
-desc = "$e class(\"binary\", amp) f$. Part of `ch`"
+desc = "$#`e` class(\"binary\", amp) #`f`$. Part of `ch`"
 pad = 0
 
 [[variables.auxiliary]]
 name = "not_e_and_g"
 type = "WordBL"
-desc = "$(not e) class(\"binary\", amp) g$. Part of `ch`"
+desc = "$(not #`e`) class(\"binary\", amp) #`g`$. Part of `ch`"
 pad = 0
 
 [[variables.auxiliary]]
@@ -225,7 +225,8 @@ multiplicity = "μ"
 [[constraints.value]]
 kind = "interaction"
 tag = "SHA256_M"
-input = ["timestamp", "index", "wval"]
+input = ["timestamp", "index"]
+output = "wval"
 multiplicity = "μ"
 
 [[constraints.value]]
