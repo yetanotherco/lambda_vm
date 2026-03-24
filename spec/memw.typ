@@ -6,7 +6,7 @@
   total_nr_variables,
   total_nr_instantiated_columns,
   render_constraint_table,
-  render_chip_padding_table,
+  render_chip_padding_table
 )
 
 #let config = load_config()
@@ -96,8 +96,62 @@ The #aligned chip only needs #nr_variables variables, expressed through #nr_colu
 The table can be padded to the next power of two with the following value assignments:
 #render_chip_padding_table(alignedchip, config)
 
-= Future optimization ideas
+= Register fast-path
 
+#let config = load_config()
+#let register_chip = load_chip("src/memw_register.toml", config)
+#let reg = raw(register_chip.name)
+
+The #reg chip provides a fast-path for accessing registers.
+This fast-path leverages that registers
++ can be addressed using a `Byte`, rather than a full `DWord`,
++ are constantly accessed, i.e., $#`timestamp` - #`old_timestamp`$ is small, and
++ have a fixed access pattern
+to achieve a footprint that is significantly smaller than both #memw and #aligned.
+
+Note: as a result of hard optimization, this chip can only be used for register accesses for which 
++ $#`timestamp` - #`old_timestamp` in [1, 2^16]$, and
++ $#`timestamp[0]` > #`old_timestamp[0]`$
+If either of these rules does not apply to your access, you should fall back to using `MEMW_A`.
+
+Note moreover that this chip does not guard against misaligned register access faults: to access register with a given `address`, one must provide $2 dot #`address`$ in the lookup. 
+
+== Columns
+#let nr_variables = total_nr_variables(register_chip)
+#let nr_columns = total_nr_instantiated_columns(register_chip, config)
+
+The #reg chip is comprised of #nr_variables variables that are expressed using #nr_columns columns:
+#render_chip_column_table(register_chip, config)
+
+== Assumptions
+The following range checks are assumed to be performed/enforced outside of this chip:
+#render_chip_assumptions(register_chip, config)
+
+== Constraints
+Since most registers are frequently accessed, the difference between `timestamp` and `old_timestamp` is small most of the times.
+Rather than storing their (nearly) identical upper limbs twice, it is instead assumed that
+$#`old_timestamp[1]` = #`timestamp[1]`$; #aligned can be used for accesses where this is not the case.
+
+Verifying that $#`timestamp` > #`old_timestamp`$ now simplifies to verifying that $#`timestamp[0]` - #`old_timestamp[0]` > 0$.
+For most accesses, this value will be small enough to fit in a `Half`.
+This chip thus enforces this by means of the following constraint:
+#render_constraint_table(register_chip, config, groups: "diff")
+
+With $#`old_timestamp`<#`timestamp`$ asserted, `old` is read from the register (@regw:c:read_old) and `val` is written back (@regw:c:write_val).
+#render_constraint_table(register_chip, config, groups: "interactions")
+
+This chip can either just write ($#`μ_write` = 1$), or both read and write ($#`μ_read` = 1$) in the same cycle.
+It must be asserted that at most one of these two options is selected:
+#render_constraint_table(register_chip, config, groups: "multiplicities")
+
+Lastly, this chip contributes the following interactions to the logup:
+#render_constraint_table(register_chip, config, groups: "output")
+
+== Padding
+The table can be padded to the next power of two with the following value assignments:
+#render_chip_padding_table(register_chip, config)
+
+= Future optimization ideas
 - `MEMB` chip that does a one-byte write to remove old_timestamp from here (uncertain tradeoffs)
-- Additional fast path for registers? (Always guaranteed same timestamp, alignment could be an assumption, always only two values)
 - Adding `μ_sum`/`w2`/`w4`/`write8` multiplicities to the `IS_HALF` lookups may make some GKR things faster if there are known zeroes.
+- For the register fast-path, one may upgrade the `IS_HALF` check to an `IS_B20` check for extended range at the cost of looking through a larger table.
