@@ -406,10 +406,10 @@ pub(crate) fn compute_commit_bus_offset(
 
     let mut total = FieldElement::<E>::zero();
     for (i, &value) in public_output.iter().enumerate() {
-        let linear_combination = &bus_id
-            + &(FieldElement::<E>::from(i as u64) * alpha)
-            + &(FieldElement::<E>::from(value as u64) * &alpha_sq);
-        let fingerprint = z - &linear_combination;
+        let linear_combination = bus_id
+            + (FieldElement::<E>::from(i as u64) * alpha)
+            + (FieldElement::<E>::from(value as u64) * alpha_sq);
+        let fingerprint = z - linear_combination;
         total += fingerprint.inv().ok()?;
     }
     Some(total)
