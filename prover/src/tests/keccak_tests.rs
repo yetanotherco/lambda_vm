@@ -1,12 +1,52 @@
 use crate::tables::keccak::{self, KeccakOperation, cols};
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::FE;
-use crate::test_utils::asm_elf_bytes;
+use crate::test_utils::{E, F, asm_elf_bytes};
+use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
 use executor::vm::instruction::execution::keccak_f1600;
+use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData, NullBoundaryConstraintBuilder};
+use stark::proof::options::ProofOptions;
 use stark::prover::IsStarkProver;
+use stark::trace::TraceTable;
+use stark::traits::AIR;
 use stark::verifier::IsStarkVerifier;
+
+fn create_busless_keccak_air(
+    proof_options: &ProofOptions,
+) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+    let (transition_constraints, _) = keccak::create_constraints(0);
+
+    AirWithBuses::new(
+        cols::NUM_COLUMNS,
+        AuxiliaryTraceBuildData {
+            interactions: vec![],
+        },
+        proof_options,
+        1,
+        transition_constraints,
+    )
+    .with_name("KECCAK_TEST")
+}
+
+fn prove_and_verify_keccak_trace(trace: &mut TraceTable<F, E>) -> bool {
+    let proof_options = ProofOptions::default_test_options();
+    let air = create_busless_keccak_air(&proof_options);
+
+    let air_trace_pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![(&air, trace, &())];
+
+    let proof =
+        stark::prover::Prover::multi_prove(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
+            .expect("Prover failed to generate keccak-only proof");
+
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![&air];
+    stark::verifier::Verifier::multi_verify(&airs, &proof, &mut DefaultTranscript::<E>::new(&[]))
+}
 
 /// Test that the trace has the correct number of rows per permutation.
 #[test]
@@ -30,7 +70,7 @@ fn test_keccak_trace_rows_per_permutation() {
 /// Test that column count matches the constant.
 #[test]
 fn test_keccak_column_count() {
-    assert_eq!(cols::NUM_COLUMNS, 2638);
+    assert_eq!(cols::NUM_COLUMNS, 3139);
 }
 
 /// Test trace generation with zero input: step flags, export, mu.
@@ -76,6 +116,16 @@ fn test_keccak_trace_zero_input_flags() {
             assert_eq!(r[cols::EXPORT], FE::one());
         } else {
             assert_eq!(r[cols::EXPORT], FE::zero());
+        }
+    }
+
+    // Verify first flag is only set on round 0
+    for row in 0..24 {
+        let r = trace.main_table.get_row(row);
+        if row == 0 {
+            assert_eq!(r[cols::FIRST], FE::one());
+        } else {
+            assert_eq!(r[cols::FIRST], FE::zero());
         }
     }
 
@@ -171,6 +221,61 @@ fn test_keccak_trace_preimage_round_0() {
     assert_eq!(r0[cols::PREIMAGE + 5], FE::from(0x7654u64));
     assert_eq!(r0[cols::PREIMAGE + 6], FE::from(0xBA98u64));
     assert_eq!(r0[cols::PREIMAGE + 7], FE::from(0xFEDCu64));
+}
+
+/// Preimage stays constant across the 24 rows of a permutation, while A advances round-to-round.
+#[test]
+fn test_keccak_trace_preimage_constant_across_rounds() {
+    let mut input = [0u64; 25];
+    input[0] = 0x0123456789ABCDEF;
+    input[1] = 0xFEDCBA9876543210;
+    let mut output = input;
+    keccak_f1600(&mut output);
+
+    let op = KeccakOperation {
+        timestamp: 4,
+        state_addr: 0x1000,
+        input,
+        output,
+    };
+
+    let trace = keccak::generate_keccak_trace(&[op]);
+    let r0 = trace.main_table.get_row(0);
+    let r7 = trace.main_table.get_row(7);
+
+    for col in cols::PREIMAGE..cols::PREIMAGE_END {
+        assert_eq!(
+            r0[col], r7[col],
+            "preimage should stay constant across rounds"
+        );
+    }
+}
+
+#[test]
+fn test_keccak_empty_trace_prove_and_verify() {
+    let mut trace = keccak::generate_keccak_trace(&[]);
+    assert!(prove_and_verify_keccak_trace(&mut trace));
+}
+
+#[test]
+fn test_keccak_tampered_preimage_consistency_rejected() {
+    let mut input = [0u64; 25];
+    input[0] = 1;
+    let mut output = input;
+    keccak_f1600(&mut output);
+
+    let op = KeccakOperation {
+        timestamp: 4,
+        state_addr: 0x1000,
+        input,
+        output,
+    };
+
+    let mut trace = keccak::generate_keccak_trace(&[op]);
+    let original = trace.get_main(1, cols::PREIMAGE).clone();
+    trace.set_main(1, cols::PREIMAGE, original + FE::one());
+
+    assert!(!prove_and_verify_keccak_trace(&mut trace));
 }
 
 /// Test that trace generation succeeds for a program with keccak ECALL.

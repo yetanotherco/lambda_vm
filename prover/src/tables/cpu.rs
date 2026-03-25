@@ -2083,10 +2083,36 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // TODO: ECALL → KECCAK interaction (BusId::EcallKeccak)
-    // Will be added when keccak chip implements the receiver + MEMW bus interactions.
-    // For now, keccak ECALLs have mult=0 on Bus 19 (excluded via ECALL_KECCAK subtraction)
-    // and no Bus 22 interaction, so buses remain balanced.
+    // ECALL → KECCAK interaction
+    // -------------------------------------------------------------------------
+    // Sends to the KECCAK table only for KeccakPermute ECALLs.
+    // Payload matches the KECCAK receiver:
+    // [timestamp_lo, timestamp_hi, syscall_lo32, syscall_hi32]
+    interactions.push(BusInteraction::sender(
+        BusId::EcallKeccak,
+        Multiplicity::Column(cols::ECALL_KECCAK),
+        vec![
+            BusValue::Packed {
+                start_column: cols::TIMESTAMP,
+                packing: Packing::Direct,
+            },
+            BusValue::constant(0), // CPU timestamps fit in u32
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::RV1_0,
+                },
+                LinearTerm::Column {
+                    coefficient: 65536,
+                    column: cols::RV1_1,
+                },
+            ]),
+            BusValue::Packed {
+                start_column: cols::RV1_2,
+                packing: Packing::Direct,
+            },
+        ],
+    ));
 
     interactions
 }

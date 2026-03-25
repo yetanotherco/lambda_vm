@@ -1,6 +1,6 @@
 //! Keccak-f[1600] permutation chip.
 //!
-//! A single wide table (2,634 columns) that proves Keccak-f[1600] permutations.
+//! A single wide table (2,638 columns) that proves Keccak-f[1600] permutations.
 //! Each permutation uses 24 rows (one per round). All intermediate values are
 //! stored as columns and verified via purely polynomial constraints — no lookups.
 //!
@@ -10,11 +10,13 @@
 //! Keccak state allows expressing theta, rho, pi, chi, and iota as degree-1
 //! to degree-3 polynomial constraints.
 //!
-//! ## Column Layout (2,634 columns)
+//! ## Column Layout (3,139 columns)
 //!
 //! - `step_flags[24]`: One-hot round selector
-//! - `export`: Final round flag (= step_flags[23])
+//! - `first`: First-round real-row flag (= step_flags[0] * mu)
+//! - `export`: Final round flag (= step_flags[23] * mu)
 //! - `preimage[5][5][4]`: Input state in 16-bit limbs (100 cols)
+//! - `preimage_bytes[25][8]`: Byte view of the input state (200 cols)
 //! - `a[5][5][4]`: State after theta input (100 cols)
 //! - `c[5][64]`: Column parities (320 cols)
 //! - `c_prime[5][64]`: Rotated column parities (320 cols)
@@ -22,17 +24,21 @@
 //! - `a_prime_prime[5][5][4]`: After chi in 16-bit limbs (100 cols)
 //! - `a_prime_prime_0_0_bits[64]`: Lane [0,0] bit decomposition (64 cols)
 //! - `a_prime_prime_prime_0_0_limbs[4]`: Lane [0,0] after iota (4 cols)
+//! - `lane_addr[25]`: DWordHL address for each 8-byte lane (100 cols)
+//! - `output_bytes[25][8]`: Byte view of the current round output (200 cols)
 //! - `mu`: Multiplicity flag (1 col)
 //!
 //! ## Bus Interactions
 //!
-//! Currently empty — bus interactions will be added incrementally to connect
-//! to the ECALL and MEMW buses.
+//! The table binds one input snapshot and one output snapshot per permutation:
+//! - `EcallKeccak` receive on `first`
+//! - 25 `Memw` reads on `first`
+//! - 25 `Memw` writes on `export`
 //!
 //! ## Constraints
 //!
-//! Constraints will be added incrementally. The trace generation computes
-//! all intermediate values correctly; constraints verify them.
+//! Constraints follow the Plonky3 keccak-air structure: boolean/range checks,
+//! theta/chi/iota relations, and row-to-row consistency across rounds.
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
@@ -43,6 +49,7 @@ use stark::trace::TraceTable;
 use stark::traits::TransitionEvaluationContext;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use crate::constraints::templates::{AddConstraint, AddOperand};
 
 use executor::vm::instruction::execution::KECCAK_SYSCALL_NUMBER;
 
@@ -96,16 +103,23 @@ pub mod cols {
     pub const STEP_FLAGS: usize = 0;
     pub const STEP_FLAGS_END: usize = STEP_FLAGS + 24;
 
+    /// First-round real-row flag: 1 only on round 0 of real permutations.
+    pub const FIRST: usize = STEP_FLAGS_END;
+
     /// Export flag: 1 on the final round (round 23) of a real permutation.
-    pub const EXPORT: usize = STEP_FLAGS_END;
+    pub const EXPORT: usize = FIRST + 1;
 
     /// Preimage: 25 lanes × 4 limbs (16-bit each) = 100 columns.
     /// Layout: preimage[y][x][limb] at offset PREIMAGE + (y*5 + x)*4 + limb.
     pub const PREIMAGE: usize = EXPORT + 1;
     pub const PREIMAGE_END: usize = PREIMAGE + 100;
 
+    /// Preimage bytes: 25 lanes × 8 bytes = 200 columns.
+    pub const PREIMAGE_BYTES: usize = PREIMAGE_END;
+    pub const PREIMAGE_BYTES_END: usize = PREIMAGE_BYTES + 200;
+
     /// State A (theta input): same layout as preimage.
-    pub const A: usize = PREIMAGE_END;
+    pub const A: usize = PREIMAGE_BYTES_END;
     pub const A_END: usize = A + 100;
 
     /// Column parities C[x][z]: 5 columns × 64 bits = 320 columns.
@@ -145,12 +159,25 @@ pub mod cols {
     pub const STATE_ADDR_0: usize = TIMESTAMP_1 + 1;
     pub const STATE_ADDR_1: usize = STATE_ADDR_0 + 1;
 
+    /// Per-lane addresses as DWordHL (4 halfwords each): state_addr + 8 * lane_idx.
+    pub const LANE_ADDR_START: usize = STATE_ADDR_1 + 1;
+
+    /// Output bytes for the current round output: 25 lanes × 8 bytes = 200 columns.
+    pub const OUTPUT_BYTES: usize = LANE_ADDR_START + 100;
+    pub const OUTPUT_BYTES_END: usize = OUTPUT_BYTES + 200;
+
     /// Total number of columns.
-    pub const NUM_COLUMNS: usize = STATE_ADDR_1 + 1;
+    pub const NUM_COLUMNS: usize = OUTPUT_BYTES_END;
+
+    /// Per-lane address columns as DWordHL (4 halfwords).
+    pub fn lane_addr(lane_idx: usize) -> [usize; 4] {
+        let base = LANE_ADDR_START + lane_idx * 4;
+        [base, base + 1, base + 2, base + 3]
+    }
 }
 
 // Verify column count at compile time
-const _: () = assert!(cols::NUM_COLUMNS == 2638);
+const _: () = assert!(cols::NUM_COLUMNS == 3139);
 
 // =============================================================================
 // Column index helpers
@@ -160,6 +187,12 @@ const _: () = assert!(cols::NUM_COLUMNS == 2638);
 #[inline]
 const fn lane_limb_idx(x: usize, y: usize, limb: usize) -> usize {
     (y * 5 + x) * 4 + limb
+}
+
+/// Index into byte arrays: [y][x][byte]
+#[inline]
+const fn lane_byte_idx(x: usize, y: usize, byte: usize) -> usize {
+    (y * 5 + x) * 8 + byte
 }
 
 /// Index into c/c_prime arrays: [x][z]
@@ -210,7 +243,168 @@ fn bit(lane: u64, z: usize) -> u64 {
 /// Generate the Keccak trace table from a list of permutation operations.
 ///
 /// Each operation produces 24 rows (one per Keccak round).
-/// Padding rows have mu=0 and valid round flag rotation.
+/// Padding rows have mu=0 and follow valid dummy zero-input rounds so all
+/// transition constraints remain satisfied.
+fn fill_round(
+    data: &mut [FE],
+    row_idx: usize,
+    round: usize,
+    preimage: &[u64; 25],
+    a: &[u64; 25],
+    timestamp: u64,
+    state_addr: u64,
+    is_real: bool,
+) -> [u64; 25] {
+    let base = row_idx * cols::NUM_COLUMNS;
+
+    // Step flags (one-hot)
+    data[base + cols::STEP_FLAGS + round] = FE::one();
+
+    // First row only for real permutations.
+    if is_real && round == 0 {
+        data[base + cols::FIRST] = FE::one();
+    }
+
+    // Export only on the final round of a real permutation.
+    if is_real && round == 23 {
+        data[base + cols::EXPORT] = FE::one();
+    }
+
+    // Mu = 1 for real rows, 0 for padding.
+    if is_real {
+        data[base + cols::MU] = FE::one();
+    }
+
+    // Timestamp and state address are attached to every row in the permutation.
+    data[base + cols::TIMESTAMP_0] = FE::from(timestamp & 0xFFFF_FFFF);
+    data[base + cols::TIMESTAMP_1] = FE::from(timestamp >> 32);
+    data[base + cols::STATE_ADDR_0] = FE::from(state_addr & 0xFFFF_FFFF);
+    data[base + cols::STATE_ADDR_1] = FE::from(state_addr >> 32);
+
+    // Preimage is constant across a permutation. A is the current round input.
+    for y in 0..5 {
+        for x in 0..5 {
+            let preimage_lane = preimage[x + 5 * y];
+            let a_lane = a[x + 5 * y];
+            for limb in 0..4 {
+                data[base + cols::PREIMAGE + lane_limb_idx(x, y, limb)] =
+                    FE::from(limb16(preimage_lane, limb));
+                data[base + cols::A + lane_limb_idx(x, y, limb)] = FE::from(limb16(a_lane, limb));
+            }
+            for byte in 0..8 {
+                data[base + cols::PREIMAGE_BYTES + lane_byte_idx(x, y, byte)] =
+                    FE::from((preimage_lane >> (byte * 8)) & 0xFF);
+            }
+        }
+    }
+
+    for lane_idx in 0..25 {
+        let addr = state_addr.wrapping_add(lane_idx as u64 * 8);
+        let addr_cols = cols::lane_addr(lane_idx);
+        data[base + addr_cols[0]] = FE::from(addr & 0xFFFF);
+        data[base + addr_cols[1]] = FE::from((addr >> 16) & 0xFFFF);
+        data[base + addr_cols[2]] = FE::from((addr >> 32) & 0xFFFF);
+        data[base + addr_cols[3]] = FE::from((addr >> 48) & 0xFFFF);
+    }
+
+    // === THETA ===
+    // C[x][z] = XOR over y of A[x][y][z]
+    let mut c = [[0u64; 64]; 5];
+    for x in 0..5 {
+        for z in 0..64 {
+            let mut parity = 0u64;
+            for y in 0..5 {
+                parity ^= bit(a[x + 5 * y], z);
+            }
+            c[x][z] = parity;
+            data[base + cols::C + parity_idx(x, z)] = FE::from(parity);
+        }
+    }
+
+    // Plonky3 convention:
+    // C'[x][z] = C[x][z] XOR C[(x-1) mod 5][z] XOR C[(x+1) mod 5][(z-1) mod 64]
+    let mut c_prime = [[0u64; 64]; 5];
+    for x in 0..5 {
+        for z in 0..64 {
+            let val = c[x][z] ^ c[(x + 4) % 5][z] ^ c[(x + 1) % 5][(z + 63) % 64];
+            c_prime[x][z] = val;
+            data[base + cols::C_PRIME + parity_idx(x, z)] = FE::from(val);
+        }
+    }
+
+    // A'[x][y][z] = A[x][y][z] XOR C[x][z] XOR C'[x][z]
+    let mut a_prime = [[[0u64; 64]; 5]; 5];
+    for y in 0..5 {
+        for x in 0..5 {
+            for z in 0..64 {
+                let val = bit(a[x + 5 * y], z) ^ c[x][z] ^ c_prime[x][z];
+                a_prime[x][y][z] = val;
+                data[base + cols::A_PRIME + a_prime_idx(x, y, z)] = FE::from(val);
+            }
+        }
+    }
+
+    // === RHO + PI ===
+    // B[y][(2x+3y) mod 5][z] = A'[x][y][(z - R[x][y]) mod 64]
+    let mut b = [[[0u64; 64]; 5]; 5];
+    for x in 0..5 {
+        for y in 0..5 {
+            let dst_x = y;
+            let dst_y = (2 * x + 3 * y) % 5;
+            let rot = RHO[x][y] as usize;
+            for z in 0..64 {
+                b[dst_x][dst_y][z] = a_prime[x][y][(z + 64 - rot) % 64];
+            }
+        }
+    }
+
+    // === CHI ===
+    // A''[x][y][z] = B[x][y][z] XOR ((NOT B[(x+1)%5][y][z]) AND B[(x+2)%5][y][z])
+    let mut a_pp_lanes = [0u64; 25];
+    for y in 0..5 {
+        for x in 0..5 {
+            let mut lane = 0u64;
+            #[allow(clippy::needless_range_loop)]
+            for z in 0..64 {
+                let chi_bit = b[x][y][z] ^ ((1 - b[(x + 1) % 5][y][z]) & b[(x + 2) % 5][y][z]);
+                lane |= chi_bit << z;
+            }
+            a_pp_lanes[x + 5 * y] = lane;
+            for limb in 0..4 {
+                data[base + cols::A_PRIME_PRIME + lane_limb_idx(x, y, limb)] =
+                    FE::from(limb16(lane, limb));
+            }
+        }
+    }
+
+    // Bit decomposition of A''[0][0]
+    let a_pp_0_0 = a_pp_lanes[0];
+    for z in 0..64 {
+        data[base + cols::A_PRIME_PRIME_0_0_BITS + z] = FE::from(bit(a_pp_0_0, z));
+    }
+
+    // === IOTA ===
+    // A'''[0][0] = A''[0][0] XOR RC[round]
+    let a_ppp_0_0 = a_pp_0_0 ^ KECCAK_RC[round];
+    for limb in 0..4 {
+        data[base + cols::A_PRIME_PRIME_PRIME_0_0_LIMBS + limb] = FE::from(limb16(a_ppp_0_0, limb));
+    }
+
+    // Compute output state for this round
+    let mut output = a_pp_lanes;
+    output[0] = a_ppp_0_0;
+    for y in 0..5 {
+        for x in 0..5 {
+            let lane = output[x + 5 * y];
+            for byte in 0..8 {
+                data[base + cols::OUTPUT_BYTES + lane_byte_idx(x, y, byte)] =
+                    FE::from((lane >> (byte * 8)) & 0xFF);
+            }
+        }
+    }
+    output
+}
+
 pub fn generate_keccak_trace(
     ops: &[KeccakOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
@@ -220,149 +414,33 @@ pub fn generate_keccak_trace(
 
     for (perm_idx, op) in ops.iter().enumerate() {
         let mut state = op.input;
+        let preimage = op.input;
 
         for round in 0..24 {
             let row_idx = perm_idx * 24 + round;
-            let base = row_idx * cols::NUM_COLUMNS;
-
-            // Step flags (one-hot)
-            data[base + cols::STEP_FLAGS + round] = FE::one();
-
-            // Export flag (round 23 only)
-            if round == 23 {
-                data[base + cols::EXPORT] = FE::one();
-            }
-
-            // Mu = 1 for real rows
-            data[base + cols::MU] = FE::one();
-
-            // Timestamp (same for all 24 rows of this permutation)
-            data[base + cols::TIMESTAMP_0] = FE::from(op.timestamp & 0xFFFF_FFFF);
-            data[base + cols::TIMESTAMP_1] = FE::from(op.timestamp >> 32);
-
-            // State address (same for all 24 rows)
-            data[base + cols::STATE_ADDR_0] = FE::from(op.state_addr & 0xFFFF_FFFF);
-            data[base + cols::STATE_ADDR_1] = FE::from(op.state_addr >> 32);
-
-            // Preimage and A: both equal to the current state
-            let a = state;
-            for y in 0..5 {
-                for x in 0..5 {
-                    let lane = a[x + 5 * y];
-                    for limb in 0..4 {
-                        let val = FE::from(limb16(lane, limb));
-                        data[base + cols::PREIMAGE + lane_limb_idx(x, y, limb)] = val;
-                        data[base + cols::A + lane_limb_idx(x, y, limb)] = val;
-                    }
-                }
-            }
-
-            // === THETA ===
-
-            // C[x][z] = XOR over y of A[x][y][z]
-            let mut c = [[0u64; 64]; 5];
-            for x in 0..5 {
-                for z in 0..64 {
-                    let mut parity = 0u64;
-                    for y in 0..5 {
-                        parity ^= bit(a[x + 5 * y], z);
-                    }
-                    c[x][z] = parity;
-                    data[base + cols::C + parity_idx(x, z)] = FE::from(parity);
-                }
-            }
-
-            // C'[x][z] = C[(x-1) mod 5][z] XOR C[(x+1) mod 5][(z-1) mod 64]
-            let mut c_prime = [[0u64; 64]; 5];
-            for x in 0..5 {
-                for z in 0..64 {
-                    let val = c[(x + 4) % 5][z] ^ c[(x + 1) % 5][(z + 63) % 64];
-                    c_prime[x][z] = val;
-                    data[base + cols::C_PRIME + parity_idx(x, z)] = FE::from(val);
-                }
-            }
-
-            // A'[x][y][z] = bit(a[x+5y], z) XOR C'[x][z]
-            let mut a_prime = [[[0u64; 64]; 5]; 5];
-            for y in 0..5 {
-                for x in 0..5 {
-                    for z in 0..64 {
-                        let val = bit(a[x + 5 * y], z) ^ c_prime[x][z];
-                        a_prime[x][y][z] = val;
-                        data[base + cols::A_PRIME + a_prime_idx(x, y, z)] = FE::from(val);
-                    }
-                }
-            }
-
-            // === RHO + PI ===
-            // B[y][(2x+3y) mod 5][z] = A'[x][y][(z - R[x][y]) mod 64]
-            let mut b = [[[0u64; 64]; 5]; 5];
-            for x in 0..5 {
-                for y in 0..5 {
-                    let dst_x = y;
-                    let dst_y = (2 * x + 3 * y) % 5;
-                    let rot = RHO[x][y] as usize;
-                    for z in 0..64 {
-                        b[dst_x][dst_y][z] = a_prime[x][y][(z + 64 - rot) % 64];
-                    }
-                }
-            }
-
-            // === CHI ===
-            // A''[x][y][z] = B[x][y][z] XOR ((NOT B[(x+1)%5][y][z]) AND B[(x+2)%5][y][z])
-            let mut a_pp_lanes = [0u64; 25];
-            for y in 0..5 {
-                for x in 0..5 {
-                    let mut lane = 0u64;
-                    #[allow(clippy::needless_range_loop)]
-                    for z in 0..64 {
-                        let chi_bit =
-                            b[x][y][z] ^ ((1 - b[(x + 1) % 5][y][z]) & b[(x + 2) % 5][y][z]);
-                        lane |= chi_bit << z;
-                    }
-                    a_pp_lanes[x + 5 * y] = lane;
-                    for limb in 0..4 {
-                        data[base + cols::A_PRIME_PRIME + lane_limb_idx(x, y, limb)] =
-                            FE::from(limb16(lane, limb));
-                    }
-                }
-            }
-
-            // Bit decomposition of A''[0][0]
-            let a_pp_0_0 = a_pp_lanes[0];
-            for z in 0..64 {
-                data[base + cols::A_PRIME_PRIME_0_0_BITS + z] = FE::from(bit(a_pp_0_0, z));
-            }
-
-            // === IOTA ===
-            // A'''[0][0] = A''[0][0] XOR RC[round]
-            let a_ppp_0_0 = a_pp_0_0 ^ KECCAK_RC[round];
-            for limb in 0..4 {
-                data[base + cols::A_PRIME_PRIME_PRIME_0_0_LIMBS + limb] =
-                    FE::from(limb16(a_ppp_0_0, limb));
-            }
-
-            // Compute output state for this round
-            let mut output = a_pp_lanes;
-            output[0] = a_ppp_0_0;
-            state = output;
+            state = fill_round(
+                &mut data,
+                row_idx,
+                round,
+                &preimage,
+                &state,
+                op.timestamp,
+                op.state_addr,
+                true,
+            );
         }
     }
 
-    // Fill padding rows: step flags rotate but mu=0 and export=0.
-    // export is NOT set on padding rows so that Multiplicity::Column(EXPORT)
-    // only fires on real permutation final rounds.
-    for row_idx in n_real_rows..num_rows {
-        let base = row_idx * cols::NUM_COLUMNS;
-        let round = row_idx % 24;
-        data[base + cols::STEP_FLAGS + round] = FE::one();
-        // export stays 0 on padding (unlike real rows where export=1 on round 23)
-        // mu stays 0 (padding), all state columns stay 0
+    // Fill padding rows with valid zero-input dummy rounds.
+    let mut row_idx = n_real_rows;
+    while row_idx < num_rows {
+        let preimage = [0u64; 25];
+        let mut state = preimage;
+        let rounds = (num_rows - row_idx).min(24);
 
-        // Padding iota: A''[0][0]=0, so A'''[0][0] = RC[round]
-        let rc = KECCAK_RC[round];
-        for limb in 0..4 {
-            data[base + cols::A_PRIME_PRIME_PRIME_0_0_LIMBS + limb] = FE::from(limb16(rc, limb));
+        for round in 0..rounds {
+            state = fill_round(&mut data, row_idx, round, &preimage, &state, 0, 0, false);
+            row_idx += 1;
         }
     }
 
@@ -376,19 +454,39 @@ pub fn generate_keccak_trace(
 /// Keccak constraint kinds.
 #[derive(Debug, Clone, Copy)]
 enum KeccakConstraintKind {
-    /// preimage[x][y][limb] = a[x][y][limb]
-    PreimageEqualsA(usize), // flat index into the 100 limbs
-    /// c'[x][z] = c[(x-1)%5][z] XOR c[(x+1)%5][(z-1)%64]
+    /// sum(step_flags) = 1
+    StepFlagsSumOne,
+    /// first = step_flags[0] * mu
+    FirstMatchesStep0Mu,
+    /// step_flags[i] = next.step_flags[(i+1) mod 24]
+    StepFlagRotation(usize),
+    /// step_flags[0] * (preimage[x][y][limb] - a[x][y][limb]) = 0
+    FirstStepPreimageEqualsA(usize),
+    /// (1 - step_flags[23]) * (preimage - next.preimage) = 0
+    PreimageConsistency(usize),
+    /// (1 - step_flags[23]) * (col - next.col) = 0
+    TransitionConsistency(usize),
+    /// first * (preimage_limb - byte0 - 256*byte1) = 0
+    InputByteLimb(usize),
+    /// export * (output_limb - byte0 - 256*byte1) = 0
+    OutputByteLimb { x: usize, y: usize, limb: usize },
+    /// export = step_flags[23] * mu
+    ExportMatchesFinalStep,
+    /// c'[x][z] = c[x][z] XOR c[(x-1)%5][z] XOR c[(x+1)%5][(z-1)%64]
     ThetaCPrime { x: usize, z: usize },
+    /// sum_y a'[x][y][z] - c'[x][z] ∈ {0, 2, 4}
+    ThetaParity { x: usize, z: usize },
     /// a''[x][y][limb] = sum of chi bits * 2^k (degree 3)
     ChiLimb { x: usize, y: usize, limb: usize },
     /// a''[0][0][limb] = sum of a_pp_0_0_bits * 2^k
     APP00LimbFromBits(usize),
     /// a'''[0][0][limb] = XOR(a''[0][0], RC[round]) selected by step_flags
     IotaLimb(usize),
-    /// a[x][y][limb] = sum of (a'[x][y][z] XOR c'[x][z]) * 2^k
-    /// This links A (limbs) to A' (bits) via theta
+    /// a[x][y][limb] = sum of (a'[x][y][z] XOR c[x][z] XOR c'[x][z]) * 2^k
+    /// This links A (limbs) to A' (bits) via theta.
     ALimbFromAPrime { x: usize, y: usize, limb: usize },
+    /// (1 - step_flags[23]) * (output_limb - next.a_limb) = 0
+    NextAFromOutput { x: usize, y: usize, limb: usize },
 }
 
 struct KeccakConstraint {
@@ -397,29 +495,108 @@ struct KeccakConstraint {
 }
 
 impl KeccakConstraint {
+    #[inline]
+    fn xor2<F>(a: &FieldElement<F>, b: &FieldElement<F>) -> FieldElement<F>
+    where
+        F: IsField,
+    {
+        let two = FieldElement::<F>::from(2u64);
+        a.clone() + b.clone() - two * a.clone() * b.clone()
+    }
+
+    #[inline]
+    fn xor3<F>(a: &FieldElement<F>, b: &FieldElement<F>, c: &FieldElement<F>) -> FieldElement<F>
+    where
+        F: IsField,
+    {
+        let ab = Self::xor2(a, b);
+        Self::xor2(&ab, c)
+    }
+
     #[allow(clippy::assign_op_pattern)]
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    fn compute<F, E>(
+        &self,
+        local: &TableView<F, E>,
+        next: Option<&TableView<F, E>>,
+    ) -> FieldElement<F>
     where
         F: IsSubFieldOf<E>,
         E: IsField,
     {
         let get =
-            |col: usize| -> FieldElement<F> { step.get_main_evaluation_element(0, col).clone() };
+            |col: usize| -> FieldElement<F> { local.get_main_evaluation_element(0, col).clone() };
+        let get_next = |col: usize| -> FieldElement<F> {
+            next.expect("missing next row")
+                .get_main_evaluation_element(0, col)
+                .clone()
+        };
         let one = FieldElement::<F>::one();
-        let two = FieldElement::<F>::from(2u64);
 
         match self.kind {
-            KeccakConstraintKind::PreimageEqualsA(flat_idx) => {
-                get(cols::PREIMAGE + flat_idx) - get(cols::A + flat_idx)
+            KeccakConstraintKind::StepFlagsSumOne => {
+                let mut sum = FieldElement::<F>::zero();
+                for i in 0..24 {
+                    sum = sum + get(cols::STEP_FLAGS + i);
+                }
+                sum - one
+            }
+            KeccakConstraintKind::FirstMatchesStep0Mu => {
+                get(cols::FIRST) - get(cols::STEP_FLAGS) * get(cols::MU)
+            }
+            KeccakConstraintKind::StepFlagRotation(i) => {
+                get(cols::STEP_FLAGS + i) - get_next(cols::STEP_FLAGS + ((i + 1) % 24))
+            }
+            KeccakConstraintKind::FirstStepPreimageEqualsA(flat_idx) => {
+                get(cols::STEP_FLAGS) * (get(cols::PREIMAGE + flat_idx) - get(cols::A + flat_idx))
+            }
+            KeccakConstraintKind::PreimageConsistency(flat_idx) => {
+                let not_final = one.clone() - get(cols::STEP_FLAGS + 23);
+                not_final * (get(cols::PREIMAGE + flat_idx) - get_next(cols::PREIMAGE + flat_idx))
+            }
+            KeccakConstraintKind::TransitionConsistency(col) => {
+                let not_final = one.clone() - get(cols::STEP_FLAGS + 23);
+                not_final * (get(col) - get_next(col))
+            }
+            KeccakConstraintKind::InputByteLimb(flat_idx) => {
+                let lane_idx = flat_idx / 4;
+                let limb = flat_idx % 4;
+                let x = lane_idx % 5;
+                let y = lane_idx / 5;
+                let byte0 = get(cols::PREIMAGE_BYTES + lane_byte_idx(x, y, limb * 2));
+                let byte1 = get(cols::PREIMAGE_BYTES + lane_byte_idx(x, y, limb * 2 + 1));
+                let limb_val = get(cols::PREIMAGE + flat_idx);
+                get(cols::FIRST) * (limb_val - byte0 - FieldElement::<F>::from(256u64) * byte1)
+            }
+            KeccakConstraintKind::OutputByteLimb { x, y, limb } => {
+                let byte0 = get(cols::OUTPUT_BYTES + lane_byte_idx(x, y, limb * 2));
+                let byte1 = get(cols::OUTPUT_BYTES + lane_byte_idx(x, y, limb * 2 + 1));
+                let output_limb = if x == 0 && y == 0 {
+                    get(cols::A_PRIME_PRIME_PRIME_0_0_LIMBS + limb)
+                } else {
+                    get(cols::A_PRIME_PRIME + lane_limb_idx(x, y, limb))
+                };
+                get(cols::EXPORT) * (output_limb - byte0 - FieldElement::<F>::from(256u64) * byte1)
+            }
+            KeccakConstraintKind::ExportMatchesFinalStep => {
+                get(cols::EXPORT) - get(cols::STEP_FLAGS + 23) * get(cols::MU)
             }
             KeccakConstraintKind::ThetaCPrime { x, z } => {
-                // c'[x][z] = c[(x-1)%5][z] XOR c[(x+1)%5][(z-1)%64]
-                // XOR: a + b - 2ab
+                // c'[x][z] = c[x][z] XOR c[(x-1)%5][z] XOR c[(x+1)%5][(z-1)%64]
+                let c_self = get(cols::C + parity_idx(x, z));
                 let c_left = get(cols::C + parity_idx((x + 4) % 5, z));
                 let c_right = get(cols::C + parity_idx((x + 1) % 5, (z + 63) % 64));
                 let cp = get(cols::C_PRIME + parity_idx(x, z));
-                let xor_val = c_left.clone() + c_right.clone() - two * c_left * c_right;
-                cp - xor_val
+                cp - Self::xor3(&c_self, &c_left, &c_right)
+            }
+            KeccakConstraintKind::ThetaParity { x, z } => {
+                let mut sum = FieldElement::<F>::zero();
+                for y in 0..5 {
+                    sum = sum + get(cols::A_PRIME + a_prime_idx(x, y, z));
+                }
+                let diff = sum - get(cols::C_PRIME + parity_idx(x, z));
+                diff.clone()
+                    * (diff.clone() - FieldElement::<F>::from(2u64))
+                    * (diff - FieldElement::<F>::from(4u64))
             }
             KeccakConstraintKind::ChiLimb { x, y, limb } => {
                 // Compute pi^{-1}: b[bx][by] comes from a'[sx][sy] with rotation
@@ -443,8 +620,7 @@ impl KeccakConstraint {
 
                     // chi: bxy XOR ((!bx1y) AND bx2y) = bxy + (1-bx1y)*bx2y - 2*bxy*(1-bx1y)*bx2y
                     let not_b1_and_b2 = (one.clone() - bx1y) * bx2y.clone();
-                    let chi_bit =
-                        bxy.clone() + not_b1_and_b2.clone() - two.clone() * bxy * not_b1_and_b2;
+                    let chi_bit = Self::xor2(&bxy, &not_b1_and_b2);
 
                     let coeff = FieldElement::<F>::from(1u64 << k);
                     limb_val = limb_val + chi_bit * coeff;
@@ -472,8 +648,7 @@ impl KeccakConstraint {
                         let a_bit = get(cols::A_PRIME_PRIME_0_0_BITS + z);
                         let rc_bit_val = (rc >> z) & 1;
                         let rc_bit = FieldElement::<F>::from(rc_bit_val);
-                        // XOR: a + b - 2ab
-                        let xor_bit = a_bit.clone() + rc_bit.clone() - two.clone() * a_bit * rc_bit;
+                        let xor_bit = Self::xor2(&a_bit, &rc_bit);
                         let coeff = FieldElement::<F>::from(1u64 << k);
                         round_limb = round_limb + xor_bit * coeff;
                     }
@@ -482,20 +657,28 @@ impl KeccakConstraint {
                 get(cols::A_PRIME_PRIME_PRIME_0_0_LIMBS + limb) - iota_limb
             }
             KeccakConstraintKind::ALimbFromAPrime { x, y, limb } => {
-                // a[x][y][limb] = sum_{k=0}^{15} (a'[x][y][16*limb+k] XOR c'[x][16*limb+k]) * 2^k
-                // Since a_bit = a' XOR c', and a_bit is the original bit of a[x][y]:
-                // XOR: a' + c' - 2*a'*c'
+                // a[x][y][limb] = sum_{k=0}^{15} (a'[x][y][z] XOR c[x][z] XOR c'[x][z]) * 2^k
                 let mut sum = FieldElement::<F>::zero();
                 for k in 0..16 {
                     let z = limb * 16 + k;
                     let ap = get(cols::A_PRIME + a_prime_idx(x, y, z));
+                    let c = get(cols::C + parity_idx(x, z));
                     let cp = get(cols::C_PRIME + parity_idx(x, z));
-                    // a_bit = ap XOR cp = ap + cp - 2*ap*cp
-                    let a_bit = ap.clone() + cp.clone() - two.clone() * ap * cp;
+                    let a_bit = Self::xor3(&ap, &c, &cp);
                     let coeff = FieldElement::<F>::from(1u64 << k);
                     sum = sum + a_bit * coeff;
                 }
                 get(cols::A + lane_limb_idx(x, y, limb)) - sum
+            }
+            KeccakConstraintKind::NextAFromOutput { x, y, limb } => {
+                let not_final = one - get(cols::STEP_FLAGS + 23);
+                let output = if x == 0 && y == 0 {
+                    get(cols::A_PRIME_PRIME_PRIME_0_0_LIMBS + limb)
+                } else {
+                    get(cols::A_PRIME_PRIME + lane_limb_idx(x, y, limb))
+                };
+                let next_a = get_next(cols::A + lane_limb_idx(x, y, limb));
+                not_final * (output - next_a)
             }
         }
     }
@@ -504,12 +687,22 @@ impl KeccakConstraint {
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for KeccakConstraint {
     fn degree(&self) -> usize {
         match self.kind {
-            KeccakConstraintKind::PreimageEqualsA(_) => 1,
-            KeccakConstraintKind::ThetaCPrime { .. } => 2,
+            KeccakConstraintKind::StepFlagsSumOne => 1,
+            KeccakConstraintKind::FirstMatchesStep0Mu => 2,
+            KeccakConstraintKind::StepFlagRotation(_) => 1,
+            KeccakConstraintKind::FirstStepPreimageEqualsA(_) => 2,
+            KeccakConstraintKind::PreimageConsistency(_) => 2,
+            KeccakConstraintKind::TransitionConsistency(_) => 2,
+            KeccakConstraintKind::InputByteLimb(_) => 2,
+            KeccakConstraintKind::OutputByteLimb { .. } => 2,
+            KeccakConstraintKind::ExportMatchesFinalStep => 2,
+            KeccakConstraintKind::ThetaCPrime { .. } => 3,
+            KeccakConstraintKind::ThetaParity { .. } => 3,
             KeccakConstraintKind::ChiLimb { .. } => 3,
             KeccakConstraintKind::APP00LimbFromBits(_) => 1,
             KeccakConstraintKind::IotaLimb(_) => 2,
-            KeccakConstraintKind::ALimbFromAPrime { .. } => 2,
+            KeccakConstraintKind::ALimbFromAPrime { .. } => 3,
+            KeccakConstraintKind::NextAFromOutput { .. } => 2,
         }
     }
 
@@ -518,7 +711,13 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for KeccakConstr
     }
 
     fn end_exemptions(&self) -> usize {
-        0
+        match self.kind {
+            KeccakConstraintKind::StepFlagRotation(_)
+            | KeccakConstraintKind::PreimageConsistency(_)
+            | KeccakConstraintKind::TransitionConsistency(_)
+            | KeccakConstraintKind::NextAFromOutput { .. } => 1,
+            _ => 0,
+        }
     }
 
     fn evaluate(
@@ -533,7 +732,12 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for KeccakConstr
                 rap_challenges: _,
                 ..
             } => {
-                let val = self.compute(frame.get_evaluation_step(0));
+                let next = if self.end_exemptions() > 0 {
+                    Some(frame.get_evaluation_step(1))
+                } else {
+                    None
+                };
+                let val = self.compute(frame.get_evaluation_step(0), next);
                 transition_evaluations[self.constraint_idx] = val.to_extension();
             }
             TransitionEvaluationContext::Verifier {
@@ -542,7 +746,12 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for KeccakConstr
                 rap_challenges: _,
                 ..
             } => {
-                let val = self.compute(frame.get_evaluation_step(0));
+                let next = if self.end_exemptions() > 0 {
+                    Some(frame.get_evaluation_step(1))
+                } else {
+                    None
+                };
+                let val = self.compute(frame.get_evaluation_step(0), next);
                 transition_evaluations[self.constraint_idx] = val;
             }
         }
@@ -552,17 +761,26 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for KeccakConstr
 /// Create all Keccak constraints. Returns constraints and the next available index.
 ///
 /// Constraint groups:
-/// - IS_BIT: step_flags(24), export(1), mu(1), c(320), c'(320), a'(1600), a_pp_0_0_bits(64) = 2,330
+/// - IS_BIT: step_flags(24), first(1), export(1), mu(1), c(320), c'(320), a'(1600), a_pp_0_0_bits(64) = 2,331
+/// - Step flags sum to one: 1
+/// - first matches step_flags[0] * mu: 1
 /// - Step flag rotation: 24 (transition)
-/// - Preimage = A: 100
+/// - First-step preimage = A: 100
 /// - Preimage consistency: 100 (transition)
-/// - Theta C' (XOR): 320
+/// - Timestamp/state-address consistency: 4 (transition)
+/// - Input byte ↔ limb consistency: 100
+/// - Output byte ↔ limb consistency: 100
+/// - Export matches final-step real row: 1
+/// - Theta C' (xor3): 320
+/// - Theta parity link: 320
 /// - A limb from A' (theta link): 100
-/// - Chi limb: 100 (degree 3)
+/// - Chi limb: 100
 /// - A''[0][0] limb from bits: 4
 /// - Iota limb: 4
+/// - Next-round A linkage: 100 (transition)
+/// - lane_addr = state_addr + 8*lane_idx: 50
 ///
-/// Total: ~2,958 (step flag rotation and preimage consistency deferred)
+/// Total: 3,660
 pub fn create_constraints(
     constraint_idx_start: usize,
 ) -> (
@@ -576,12 +794,14 @@ pub fn create_constraints(
     // --- IS_BIT constraints (via template) ---
 
     // Collect all boolean column indices
-    let mut bit_cols: Vec<usize> = Vec::with_capacity(2330);
+    let mut bit_cols: Vec<usize> = Vec::with_capacity(2331);
 
     // step_flags[0..24]
     for i in 0..24 {
         bit_cols.push(cols::STEP_FLAGS + i);
     }
+    // first
+    bit_cols.push(cols::FIRST);
     // export
     bit_cols.push(cols::EXPORT);
     // mu
@@ -620,20 +840,65 @@ pub fn create_constraints(
         }};
     }
 
-    // NOTE: StepFlagRotation and PreimageConsistency constraints require next-row access,
-    // which the current framework doesn't support in TransitionConstraint::compute().
-    // These are deferred until the framework supports multi-step constraint evaluation.
-    // The trace generation still computes correct values for these relationships.
+    // --- Step flags sum to one (1 constraint) ---
+    add!(KeccakConstraintKind::StepFlagsSumOne);
 
-    // --- Preimage = A (100 constraints) ---
-    for flat_idx in 0..100 {
-        add!(KeccakConstraintKind::PreimageEqualsA(flat_idx));
+    // --- first = step_flags[0] * mu (1 constraint) ---
+    add!(KeccakConstraintKind::FirstMatchesStep0Mu);
+
+    // --- Step flag rotation (24 constraints) ---
+    for i in 0..24 {
+        add!(KeccakConstraintKind::StepFlagRotation(i));
     }
 
-    // --- Theta C' XOR (320 constraints) ---
+    // --- First-step preimage = A (100 constraints) ---
+    for flat_idx in 0..100 {
+        add!(KeccakConstraintKind::FirstStepPreimageEqualsA(flat_idx));
+    }
+
+    // --- Preimage consistency (100 constraints) ---
+    for flat_idx in 0..100 {
+        add!(KeccakConstraintKind::PreimageConsistency(flat_idx));
+    }
+
+    // --- Timestamp and state address consistency (4 constraints) ---
+    for col in [
+        cols::TIMESTAMP_0,
+        cols::TIMESTAMP_1,
+        cols::STATE_ADDR_0,
+        cols::STATE_ADDR_1,
+    ] {
+        add!(KeccakConstraintKind::TransitionConsistency(col));
+    }
+
+    // --- Input byte ↔ limb consistency (100 constraints) ---
+    for flat_idx in 0..100 {
+        add!(KeccakConstraintKind::InputByteLimb(flat_idx));
+    }
+
+    // --- Output byte ↔ limb consistency (100 constraints) ---
+    for y in 0..5 {
+        for x in 0..5 {
+            for limb in 0..4 {
+                add!(KeccakConstraintKind::OutputByteLimb { x, y, limb });
+            }
+        }
+    }
+
+    // --- Export matches final-step real row (1 constraint) ---
+    add!(KeccakConstraintKind::ExportMatchesFinalStep);
+
+    // --- Theta C' xor3 (320 constraints) ---
     for x in 0..5 {
         for z in 0..64 {
             add!(KeccakConstraintKind::ThetaCPrime { x, z });
+        }
+    }
+
+    // --- Theta parity link (320 constraints) ---
+    for x in 0..5 {
+        for z in 0..64 {
+            add!(KeccakConstraintKind::ThetaParity { x, z });
         }
     }
 
@@ -665,65 +930,45 @@ pub fn create_constraints(
         add!(KeccakConstraintKind::IotaLimb(limb));
     }
 
+    // --- Next-round A linkage (100 constraints) ---
+    for y in 0..5 {
+        for x in 0..5 {
+            for limb in 0..4 {
+                add!(KeccakConstraintKind::NextAFromOutput { x, y, limb });
+            }
+        }
+    }
+
+    // --- lane_addr = state_addr + 8*lane_idx (50 constraints) ---
+    for lane_idx in 0..25 {
+        let (c0, c1) = AddConstraint::new_pair(
+            vec![cols::FIRST, cols::EXPORT],
+            AddOperand::dword(cols::STATE_ADDR_0),
+            AddOperand::constant((lane_idx * 8) as i64),
+            AddOperand::from_dword_hl(cols::lane_addr(lane_idx)[0]),
+            idx,
+        );
+        constraints.push(Box::new(c0));
+        constraints.push(Box::new(c1));
+        idx += 2;
+    }
+
     (constraints, idx)
 }
 
-// =============================================================================
-// Bus interactions (placeholder — will be added incrementally)
-// =============================================================================
-
 /// Create bus interactions for the Keccak chip.
 ///
-/// - ECALL receiver: receives [timestamp, rv1] from CPU on the first round
-///   of each real permutation (step_flags[0] * mu).
-///
-/// MEMW interactions for memory reads/writes are handled by the trace builder
-/// (via collect_keccak_memw_ops), not by bus interactions on this table.
-/// This is the same pattern as the HALT table.
-///
-/// TODO: Add MEMW bus interactions from the keccak table to bind preimage/output
-/// columns to memory values (soundness requirement).
+/// - `EcallKeccak` receiver on the first row of each real permutation.
+/// - 25 `Memw` reads on `first`, binding the preimage to memory at `timestamp`.
+/// - 25 `Memw` writes on `export`, binding the final state to memory at `timestamp + 1`.
 pub fn bus_interactions() -> Vec<BusInteraction> {
-    let mut interactions = Vec::new();
-
-    // ECALL receiver: receives from CPU on the first round of each real permutation.
-    // Payload: [timestamp_lo, timestamp_hi, syscall_lo, syscall_hi]
-    // mult = step_flags[0] * mu (exactly one row per permutation receives)
+    let mut interactions = Vec::with_capacity(51);
     let syscall_lo = KECCAK_SYSCALL_NUMBER & 0xFFFF_FFFF;
     let syscall_hi = KECCAK_SYSCALL_NUMBER >> 32;
 
     interactions.push(BusInteraction::receiver(
         BusId::EcallKeccak,
-        Multiplicity::Linear(vec![
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::STEP_FLAGS, // step_flags[0]
-            },
-            // We want step_flags[0] * mu, but Multiplicity::Linear only supports
-            // linear combinations, not products. Since step_flags[0] and mu are
-            // both 0 or 1, and step_flags[0]=1 implies mu=1 for real rows,
-            // we can use just step_flags[0] as the multiplicity.
-            // For padding rows: step_flags[0]=1 on row 0 but mu=0.
-            // This would incorrectly receive on padding.
-            //
-            // Fix: use mu alone isn't right either (all 24 rows have mu=1).
-            // We need step_flags[0] * mu. Since we can't express products in
-            // Multiplicity::Linear, we'll add a dedicated column for this.
-            //
-            // WORKAROUND: Use step_flags[0] only. On padding rows, step_flags[0]=1
-            // on row 0, but the payload (timestamp=0, syscall=constants) won't match
-            // any CPU sender, causing bus imbalance only when there are keccak ECALLs.
-            // Actually, for programs with no keccak: CPU sends nothing on EcallKeccak,
-            // and padding keccak rows receive with step_flags[0] — this IS a problem.
-            //
-            // Better approach: use mu - (1 - step_flags[0])*mu = step_flags[0]*mu.
-            // But that's still a product.
-            //
-            // Simplest correct solution: For the ECALL, use the EXPORT flag instead.
-            // export=1 only on round 23 of real permutations (mu=1 and step_flags[23]=1).
-            // On padding: export=1 on the padding round-23 row, but mu=0 there... wait
-            // we set export=1 on padding round-23 rows. That's also a problem.
-        ]),
+        Multiplicity::Column(cols::FIRST),
         vec![
             BusValue::Packed {
                 start_column: cols::TIMESTAMP_0,
@@ -738,28 +983,82 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // Remove the broken Linear multiplicity and use a proper one.
-    // The issue is we need mult = step_flags[0] * mu but can only express linear combos.
-    // Solution: Don't set export=1 on padding rows, then use Multiplicity::Column(EXPORT)
-    // for the final-round interaction. But we need a first-round interaction for ECALL...
-    //
-    // Actually, the simplest approach: Use Multiplicity::Column(MU) and receive on
-    // a per-permutation basis by having the ECALL interaction fire on EVERY row with mu=1.
-    // That would be 24 receives per 1 send — won't balance.
-    //
-    // Final approach: Add a dedicated FIRST_MU column that is 1 only on the first round
-    // of real permutations. OR: just use step_flags[0] and DON'T set step_flags on padding.
-    // But step_flags must rotate for constraint correctness...
-    //
-    // OK let me just fix this properly: modify padding to NOT set export=1, and use
-    // export as the multiplicity. Export is only 1 when step_flags[23]=1 AND it's real.
+    for lane_idx in 0..25 {
+        let x = lane_idx % 5;
+        let y = lane_idx / 5;
+        let input_start = cols::PREIMAGE_BYTES + lane_byte_idx(x, y, 0);
+        let output_start = cols::OUTPUT_BYTES + lane_byte_idx(x, y, 0);
+        let addr_start = cols::lane_addr(lane_idx)[0];
 
-    // Actually, let me clear the broken interaction and do it right.
-    interactions.clear();
+        let mut read_values = Vec::with_capacity(24);
+        for byte in 0..8 {
+            read_values.push(BusValue::Packed {
+                start_column: input_start + byte,
+                packing: Packing::Direct,
+            });
+        }
+        read_values.push(BusValue::constant(0));
+        read_values.push(BusValue::Packed {
+            start_column: addr_start,
+            packing: Packing::DWordHL,
+        });
+        for byte in 0..8 {
+            read_values.push(BusValue::Packed {
+                start_column: input_start + byte,
+                packing: Packing::Direct,
+            });
+        }
+        read_values.push(BusValue::Packed {
+            start_column: cols::TIMESTAMP_0,
+            packing: Packing::Direct,
+        });
+        read_values.push(BusValue::Packed {
+            start_column: cols::TIMESTAMP_1,
+            packing: Packing::Direct,
+        });
+        read_values.push(BusValue::constant(0));
+        read_values.push(BusValue::constant(0));
+        read_values.push(BusValue::constant(1));
 
-    // TODO: Add EcallKeccak receiver (mult = export) once MEMW bus interactions
-    // are implemented. Without MEMW, enabling this would imbalance Bus 22 since
-    // the CPU sender has no matching keccak receiver for the state operations.
+        interactions.push(BusInteraction::sender(
+            BusId::Memw,
+            Multiplicity::Column(cols::FIRST),
+            read_values,
+        ));
+
+        let mut write_values = Vec::with_capacity(16);
+        write_values.push(BusValue::constant(0));
+        write_values.push(BusValue::Packed {
+            start_column: addr_start,
+            packing: Packing::DWordHL,
+        });
+        for byte in 0..8 {
+            write_values.push(BusValue::Packed {
+                start_column: output_start + byte,
+                packing: Packing::Direct,
+            });
+        }
+        write_values.push(BusValue::linear(vec![
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::TIMESTAMP_0,
+            },
+            LinearTerm::Constant(1),
+        ]));
+        write_values.push(BusValue::Packed {
+            start_column: cols::TIMESTAMP_1,
+            packing: Packing::Direct,
+        });
+        write_values.push(BusValue::constant(0));
+        write_values.push(BusValue::constant(0));
+        write_values.push(BusValue::constant(1));
+
+        interactions.push(BusInteraction::sender(
+            BusId::Memw,
+            Multiplicity::Column(cols::EXPORT),
+            write_values,
+        ));
+    }
 
     interactions
 }
