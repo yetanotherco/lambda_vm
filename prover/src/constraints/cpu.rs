@@ -1362,11 +1362,20 @@ pub fn create_all_cpu_constraints() -> (
     }
 
     // Extension bit zero constraints (SIGN template: !word_instr => ext_bit = 0)
-    other.push(Box::new(ExtBitZeroConstraint::new(next_idx, cols::RV1_EXT_BIT)));
+    other.push(Box::new(ExtBitZeroConstraint::new(
+        next_idx,
+        cols::RV1_EXT_BIT,
+    )));
     next_idx += 1;
-    other.push(Box::new(ExtBitZeroConstraint::new(next_idx, cols::RV2_EXT_BIT)));
+    other.push(Box::new(ExtBitZeroConstraint::new(
+        next_idx,
+        cols::RV2_EXT_BIT,
+    )));
     next_idx += 1;
-    other.push(Box::new(ExtBitZeroConstraint::new(next_idx, cols::RES_EXT_BIT)));
+    other.push(Box::new(ExtBitZeroConstraint::new(
+        next_idx,
+        cols::RES_EXT_BIT,
+    )));
     next_idx += 1;
 
     // Next PC (non-branching) constraints

@@ -514,7 +514,7 @@ fn test_dword_bl_repack_formula() {
 
 use crate::constraints::cpu::{
     Arg1LowerConstraint, Arg1UpperConstraint, BIT_FLAG_COLUMNS, BranchCondConstraint,
-    EbreakConstraint, NUM_CPU_CONSTRAINTS, NextPcAddConstraint, ExtBitZeroConstraint,
+    EbreakConstraint, ExtBitZeroConstraint, NUM_CPU_CONSTRAINTS, NextPcAddConstraint,
     create_add_constraints, create_all_cpu_constraints, create_is_bit_constraints,
     create_slt_res_zero_constraints,
 };
