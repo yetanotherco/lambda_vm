@@ -20,6 +20,8 @@ The #sign template operates on three variables:
 The #sign template operates on the following assumptions:
 #render_chip_assumptions(chip, config)
 
+If `sign` is set to $1$, `X` will be range-checked to be a halfword, and hence proving may fail if this is not ensured.
+
 = Constraints
 It takes only two constraints to compute the `sign` of `X`, given whether `X` represents a `signed` value or not. 
 When $#`signed` = 1$, the sign of `X` is equal to its most significant bit. 

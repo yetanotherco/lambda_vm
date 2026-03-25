@@ -17,9 +17,6 @@ desc = "Sign of `X`"
 
 
 [[assumptions]]
-desc = "`IS_HALF[X]`"
-
-[[assumptions]]
 desc = "`IS_BIT<signed>`"
 
 

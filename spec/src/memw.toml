@@ -6,36 +6,43 @@ name = "MEMW"
 name = "is_register"
 type = "Bit"
 desc = "Whether the address represents a register index"
+pad = 0
 
 [[variables.input]]
 name = "base_address"
 type = "DWordWL"
-desc = "The base address to read/write from/to, gets offset by $[0, 7]$, depending on how big the access is"
+desc = "The base address to read from/write to. Gets offset by $[0, 7]$ depending on the size of the access"
+pad = 0
 
 [[variables.input]]
 name = "value"
 type = ["BaseField", 8]
-desc = "The values to store in memory. For regular memory, these should be (up to) 8 range-checked `Byte`s; registers are stored as two range-checked `Word`s"
+desc = "The values to store in memory. For RAM, these should be (up to) 8 range-checked `Byte`s; registers are stored as two range-checked `Word`s"
+pad = 0
 
 [[variables.input]]
 name = "timestamp"
 type = "DWordWL"
-desc = "The timestamp at which this memory access is said to occur"
+desc = "The timestamp at which this memory access occurs"
+pad = 0
 
 [[variables.input]]
 name = "write2"
 type = "Bit"
 desc = "Whether to write exactly 2 values"
+pad = 0
 
 [[variables.input]]
 name = "write4"
 type = "Bit"
 desc = "Whether to write exactly 4 values"
+pad = 0
 
 [[variables.input]]
 name = "write8"
 type = "Bit"
 desc = "Whether to write exactly 8 values"
+pad = 0
 
 # Output
 
@@ -44,18 +51,21 @@ name = "old"
 type = ["BaseField", 8]
 desc = """The old value written at `base_address`. See `value` for information about representation.
 Only the elements corresponding to the `writeN` bits are guaranteed"""
+pad = 0
 
 # Auxiliary
 
 [[variables.auxiliary]]
-name = "add_limb_overflow"
+name = "carry"
 type = ["Bit", 7]
-desc = "Whether adding `i` to `base_address[0]` as a field element exceeds $2^32$"
+desc = "Whether `base_address[0] + i + 1` $>= 2^32$"
+pad = 0
 
 [[variables.auxiliary]]
 name = "old_timestamp"
 type = ["DWordWL", 8]
-desc = "The timestamp at which the address was last accessed"
+desc = "The timestamp at which address `base_address + i` was last accessed"
+pad = 0
 
 # Virtual
 
@@ -77,8 +87,8 @@ type = ["DWordWL", 7]
 desc = "`address_add[i] = base_address + i + 1`"
 def.iter = ["i", 0, 6]
 def.poly = ["arr",
-  ["+", ["idx", "base_address", 0], "i", 1, ["*", ["-", ["^", 2, 32]], ["idx", "add_limb_overflow", "i"]]],
-  ["+", ["idx", "base_address", 1], ["idx", "add_limb_overflow", "i"]]]
+  ["-", ["+", ["idx", "base_address", 0], "i", 1], ["*", ["^", 2, 32], ["idx", "carry", "i"]]],
+  ["+", ["idx", "base_address", 1], ["idx", "carry", "i"]]]
 
 [[variables.virtual]]
 name = "μ_sum"
@@ -92,12 +102,13 @@ def = ["+", "μ_read", "μ_write"]
 name = "μ_read"
 type = "Bit"
 desc = "Whether we are performing a read (and hence return `out`)"
+pad = 0
 
 [[variables.multiplicity]]
 name = "μ_write"
 type = "Bit"
 desc = "Whether we are performing a write (and hence not return `out`)"
-
+pad = 0
 
 [[assumptions]]
 desc = "`IS_WORD[base_address[i]]`"
@@ -126,6 +137,16 @@ name = "consistency"
 [[constraints.consistency]]
 kind = "template"
 tag = "IS_BIT"
+input = ["μ_read"]
+
+[[constraints.consistency]]
+kind = "template"
+tag = "IS_BIT"
+input = ["μ_write"]
+
+[[constraints.consistency]]
+kind = "template"
+tag = "IS_BIT"
 input = ["μ_sum"]
 
 [[constraints.consistency]]
@@ -136,7 +157,7 @@ poly = ["*", "w2", ["not", "μ_sum"]]
 [[constraints.consistency]]
 kind = "template"
 tag = "IS_BIT"
-input = [["idx", "add_limb_overflow", "i"]]
+input = [["idx", "carry", "i"]]
 iter = ["i", 0, 6]
 
 [[constraints.consistency]]
@@ -235,10 +256,10 @@ kind = "interaction"
 tag = "MEMW"
 input = ["is_register", "base_address", "value", "timestamp", "write2", "write4", "write8"]
 output = "old"
-multiplicity = "μ_read"
+multiplicity = ["-", "μ_read"]
 
 [[constraints.output]]
 kind = "interaction"
 tag = "MEMW"
 input = ["is_register", "base_address", "value", "timestamp", "write2", "write4", "write8"]
-multiplicity = "μ_write"
+multiplicity = ["-", "μ_write"]
