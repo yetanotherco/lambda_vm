@@ -1061,15 +1061,18 @@ pub trait IsStarkProver<
         // FRI commit phase from pre-computed evaluations (no initial FFT)
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        let (fri_last_value, fri_layers) =
+        let log_arity = air.context().proof_options.fri_log_arity as usize;
+        let log_final_poly_len = air.context().proof_options.fri_log_final_poly_len as usize;
+        let (fri_final_poly, fri_layers) =
             fri::commit_phase_from_evaluations::<Field, FieldExtension>(
                 domain.root_order as usize,
                 lde_evals,
                 transcript,
                 &coset_offset,
                 domain_size,
+                log_arity,
+                log_final_poly_len,
             );
-        let fri_final_poly = vec![fri_last_value];
         #[cfg(feature = "instruments")]
         let r4_merkle_dur = t_sub.elapsed();
 
@@ -1088,7 +1091,7 @@ pub trait IsStarkProver<
         let number_of_queries = air.options().fri_number_of_queries;
         let iotas = Self::sample_query_indexes(number_of_queries, domain, transcript);
 
-        let query_list = fri::query_phase(&fri_layers, &iotas);
+        let query_list = fri::query_phase(&fri_layers, &iotas, log_arity);
 
         let fri_layers_merkle_roots: Vec<_> = fri_layers
             .iter()
