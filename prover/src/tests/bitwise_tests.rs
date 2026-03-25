@@ -5,6 +5,7 @@ use crate::tables::bitwise::{
     generate_bitwise_trace, is_preprocessed, preprocessed_commitment, row_index,
 };
 use crate::tables::types::FE;
+use math::field::element::FieldElement;
 use stark::proof::options::ProofOptions;
 
 #[test]
@@ -93,8 +94,8 @@ fn test_zero_check() {
 #[test]
 fn test_bus_interactions_count() {
     let interactions = bus_interactions();
-    // Should have 11 interactions (one for each lookup type)
-    assert_eq!(interactions.len(), 11);
+    // Should have 10 interactions (one for each lookup type; HWSLC merged into HWSL)
+    assert_eq!(interactions.len(), 10);
 }
 
 #[test]
@@ -594,8 +595,12 @@ mod soundness_tests {
         let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
             vec![&sender_air, &receiver_air];
 
-        let result =
-            Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[]));
+        let result = Verifier::multi_verify(
+            &airs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero(),
+        );
 
         assert!(result, "Honest execution should be accepted");
     }
@@ -638,8 +643,12 @@ mod soundness_tests {
         let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
             vec![&sender_air, &receiver_air];
 
-        let result =
-            Verifier::multi_verify(&airs, &multi_proof, &mut DefaultTranscript::<E>::new(&[]));
+        let result = Verifier::multi_verify(
+            &airs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero(),
+        );
 
         // Without preprocessed support, malicious proof is ACCEPTED (vulnerability!)
         assert!(
@@ -709,6 +718,7 @@ mod soundness_tests {
             &verifier_airs,
             &multi_proof,
             &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero(),
         );
 
         // With preprocessed support, malicious proof is REJECTED (secure!)

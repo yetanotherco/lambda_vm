@@ -473,10 +473,18 @@ pub trait IsStarkProver<
     {
         let num_cols = trace.num_main_columns;
         trace.extract_columns_main_into(main_pool);
+        #[cfg(feature = "instruments")]
+        let t_sub = Instant::now();
         Self::expand_pool_to_lde::<Field>(main_pool, num_cols, domain, twiddles);
+        #[cfg(feature = "instruments")]
+        let main_lde_dur = t_sub.elapsed();
 
+        #[cfg(feature = "instruments")]
+        let t_sub = Instant::now();
         let (tree, root) = Self::commit_columns_bit_reversed(&main_pool[..num_cols])
             .ok_or(ProvingError::EmptyCommitment)?;
+        #[cfg(feature = "instruments")]
+        crate::instruments::accum_r1_main(main_lde_dur, t_sub.elapsed());
 
         // Pool buffers retain capacity; tree is returned to caller
         Ok((tree, root, None, None, 0))
@@ -508,8 +516,14 @@ pub trait IsStarkProver<
     {
         let num_cols = trace.num_main_columns;
         trace.extract_columns_main_into(main_pool);
+        #[cfg(feature = "instruments")]
+        let t_sub = Instant::now();
         Self::expand_pool_to_lde::<Field>(main_pool, num_cols, domain, twiddles);
+        #[cfg(feature = "instruments")]
+        let main_lde_dur = t_sub.elapsed();
 
+        #[cfg(feature = "instruments")]
+        let t_sub = Instant::now();
         let (precomputed_tree, precomputed_root) =
             Self::commit_columns_bit_reversed(&main_pool[..num_precomputed_cols])
                 .ok_or(ProvingError::EmptyCommitment)?;
@@ -517,6 +531,8 @@ pub trait IsStarkProver<
         let (mult_tree, mult_root) =
             Self::commit_columns_bit_reversed(&main_pool[num_precomputed_cols..num_cols])
                 .ok_or(ProvingError::EmptyCommitment)?;
+        #[cfg(feature = "instruments")]
+        crate::instruments::accum_r1_main(main_lde_dur, t_sub.elapsed());
 
         debug_assert_eq!(
             precomputed_root, precomputed_commitment,
@@ -829,6 +845,8 @@ pub trait IsStarkProver<
             round_1_result.bus_public_inputs.as_ref(),
             trace_length,
         );
+        #[cfg(feature = "instruments")]
+        let t_sub = Instant::now();
         let constraint_evaluations = evaluator.evaluate(
             air,
             &round_1_result.lde_trace,
@@ -837,9 +855,13 @@ pub trait IsStarkProver<
             boundary_coefficients,
             &round_1_result.rap_challenges,
         );
+        #[cfg(feature = "instruments")]
+        let constraints_dur = t_sub.elapsed();
 
         let number_of_parts = air.composition_poly_degree_bound(trace_length) / trace_length;
 
+        #[cfg(feature = "instruments")]
+        let t_sub = Instant::now();
         let lde_composition_poly_parts_evaluations = if number_of_parts == 2 {
             // Direct quotient decomposition: avoid full-size iFFT by algebraically
             // splitting H(x) = H₀(x²) + x·H₁(x²) using:
@@ -869,12 +891,21 @@ pub trait IsStarkProver<
                 })
                 .collect()
         };
+        #[cfg(feature = "instruments")]
+        let fft_dur = t_sub.elapsed();
 
+        #[cfg(feature = "instruments")]
+        let t_sub = Instant::now();
         let Some((composition_poly_merkle_tree, composition_poly_root)) =
             Self::commit_composition_polynomial(&lde_composition_poly_parts_evaluations)
         else {
             return Err(ProvingError::EmptyCommitment);
         };
+        #[cfg(feature = "instruments")]
+        let merkle_dur = t_sub.elapsed();
+
+        #[cfg(feature = "instruments")]
+        crate::instruments::store_r2_sub(constraints_dur, fft_dur, merkle_dur);
 
         Ok(Round2 {
             lde_composition_poly_evaluations: lde_composition_poly_parts_evaluations,
@@ -997,6 +1028,8 @@ pub trait IsStarkProver<
         let gammas = deep_composition_coefficients;
 
         // Compute p₀ (deep composition polynomial) as N evaluations on trace-size coset
+        #[cfg(feature = "instruments")]
+        let t_sub = Instant::now();
         let deep_evals = Self::compute_deep_composition_poly_evaluations(
             &round_1_result.lde_trace,
             round_2_result,
@@ -1007,18 +1040,26 @@ pub trait IsStarkProver<
             &gammas,
             &trace_term_coeffs,
         );
+        #[cfg(feature = "instruments")]
+        let other_dur_1 = t_sub.elapsed();
 
         // Extend N trace-coset evaluations to 2N LDE-coset evaluations via standard LDE.
         // deep_evals[i] = h(offset·ω_N^i) = f(ω_N^i) where f(x) = h(offset·x).
         // Standard iFFT+FFT recovers f and evaluates on the 2N-th roots: f(Ω^j) = h(offset·Ω^j).
         let domain_size = domain.lde_roots_of_unity_coset.len();
+        #[cfg(feature = "instruments")]
+        let t_sub = Instant::now();
         let deep_poly =
             Polynomial::interpolate_fft::<Field>(&deep_evals).expect("iFFT should succeed");
         let mut lde_evals = Polynomial::evaluate_fft::<Field>(&deep_poly, 1, Some(domain_size))
             .expect("FFT should succeed");
         in_place_bit_reverse_permute(&mut lde_evals);
+        #[cfg(feature = "instruments")]
+        let r4_fft_dur = t_sub.elapsed();
 
         // FRI commit phase from pre-computed evaluations (no initial FFT)
+        #[cfg(feature = "instruments")]
+        let t_sub = Instant::now();
         let (fri_last_value, fri_layers) =
             fri::commit_phase_from_evaluations::<Field, FieldExtension>(
                 domain.root_order as usize,
@@ -1027,8 +1068,12 @@ pub trait IsStarkProver<
                 &coset_offset,
                 domain_size,
             );
+        #[cfg(feature = "instruments")]
+        let r4_merkle_dur = t_sub.elapsed();
 
         // grinding: generate nonce and append it to the transcript
+        #[cfg(feature = "instruments")]
+        let t_sub = Instant::now();
         let security_bits = air.context().proof_options.grinding_factor;
         let mut nonce = None;
         if security_bits > 0 {
@@ -1050,6 +1095,12 @@ pub trait IsStarkProver<
 
         let deep_poly_openings =
             Self::open_deep_composition_poly(domain, round_1_result, round_2_result, &iotas);
+
+        #[cfg(feature = "instruments")]
+        {
+            let queries_dur = t_sub.elapsed();
+            crate::instruments::store_r4_sub(r4_fft_dur, r4_merkle_dur, other_dur_1, queries_dur);
+        }
 
         Round4 {
             fri_last_value,
@@ -1420,6 +1471,9 @@ pub trait IsStarkProver<
     {
         info!("Started proof generation...");
 
+        #[cfg(feature = "instruments")]
+        crate::instruments::reset_all();
+
         let num_airs = air_trace_pairs.len();
 
         // Check if any AIR has an auxiliary trace
@@ -1430,6 +1484,9 @@ pub trait IsStarkProver<
         // =====================================================================
         // Pre-pass: compute domains, twiddles, and max dimensions for pool allocation
         // =====================================================================
+
+        #[cfg(feature = "instruments")]
+        let phase_start = Instant::now();
 
         let mut domains = Vec::with_capacity(num_airs);
         let mut twiddle_caches: Vec<LdeTwiddles<Field>> = Vec::with_capacity(num_airs);
@@ -1452,6 +1509,17 @@ pub trait IsStarkProver<
             twiddle_caches.push(twiddles);
         }
 
+        // Spill all main trace tables to mmap before allocating pool buffers.
+        // This frees the heap-allocated main trace data (~120 cols × N rows × 8 bytes each),
+        // making room for the LDE pool buffers which are much larger (blowup_factor × N).
+        #[cfg(feature = "disk-spill")]
+        for (_, trace, _) in air_trace_pairs.iter_mut() {
+            trace
+                .main_table
+                .spill_to_disk()
+                .map_err(|e| ProvingError::WrongParameter(format!("disk-spill early main: {e}")))?;
+        }
+
         // Allocate K independent LDE column buffer pool sets for parallel table processing.
         let k = table_parallelism().min(num_airs).max(1);
         let mut pool_sets: Vec<PoolSet<Field, FieldExtension>> = (0..k)
@@ -1465,18 +1533,8 @@ pub trait IsStarkProver<
             })
             .collect();
 
-        // With disk-spill, move all main trace data from heap to mmap BEFORE
-        // allocating pools. For large programs (64M+ instructions) the total main
-        // trace data can exceed available RAM; spilling early converts it to
-        // demand-paged mmap so the OS can evict pages under memory pressure.
-        // extract_columns_main_into uses get() which reads transparently from mmap.
-        #[cfg(feature = "disk-spill")]
-        for (_, trace, _) in air_trace_pairs.iter_mut() {
-            trace
-                .main_table
-                .spill_to_disk()
-                .map_err(|e| ProvingError::WrongParameter(format!("disk-spill early main: {e}")))?;
-        }
+        #[cfg(feature = "instruments")]
+        let prepass_elapsed = phase_start.elapsed();
 
         // =====================================================================
         // Round 1, Phase A: Commit all main traces (parallel in chunks of K)
@@ -1484,10 +1542,14 @@ pub trait IsStarkProver<
         // All main trace commitments must be in the transcript before sampling
         // LogUp challenges. Pool buffers are reused across chunks.
 
+        #[cfg(feature = "instruments")]
+        let phase_start = Instant::now();
+
         let mut main_commits: Vec<MainCommitData<Field>> = Vec::with_capacity(num_airs);
 
-        // When disk-spill is enabled, spill each table's LDE from the pool to disk
-        // before the pool is overwritten by the next chunk.
+        // Spilled LDE trace tables: one per AIR, populated during Phase A (main) and Phase C (aux).
+        // In Rounds 2-4 these replace the reconstruct_round1 flow — LDE data is read from mmap
+        // instead of being recomputed from the trace.
         #[cfg(feature = "disk-spill")]
         let mut spilled_ldes: Vec<Option<LDETraceTable<Field, FieldExtension>>> =
             (0..num_airs).map(|_| None).collect();
@@ -1523,57 +1585,91 @@ pub trait IsStarkProver<
                 })
                 .collect();
 
-            // Sequential: spill LDE from pool (before it's overwritten) + append roots
-            #[allow(unused_variables)]
+            // Sequential: append roots to shared transcript (Fiat-Shamir ordering)
+            #[allow(unused_variables, unused_mut)]
             for (j, result) in chunk_results.into_iter().enumerate() {
-                #[allow(unused_mut)]
-                let (mut tree, root, mut pre_tree, pre_root, n_pre) = result?;
+                let (tree, root, pre_tree, pre_root, n_pre) = result?;
+                if let Some(ref pre_r) = pre_root {
+                    transcript.append_bytes(pre_r);
+                }
+                transcript.append_bytes(&root);
 
+                // Spill the main LDE columns from the pool to a temp-file mmap before
+                // the pool is overwritten by the next chunk. Also spill Merkle tree nodes
+                // to disk — they remain accessible through mmap for Rounds 2-4 openings.
                 #[cfg(feature = "disk-spill")]
                 {
                     let idx = chunk_start + j;
                     let (air, trace, _) = &air_trace_pairs[idx];
                     let num_main_cols = trace.num_main_columns;
-                    let pool = &pool_sets[j];
-
-                    // Spill main LDE columns from pool to disk
-                    spilled_ldes[idx] = Some(
-                        LDETraceTable::spill_main_from_pool(
-                            &pool.main,
-                            num_main_cols,
-                            air.step_size(),
-                            domains[idx].blowup_factor,
-                        )
-                        .map_err(|e| {
-                            ProvingError::WrongParameter(format!("disk-spill main LDE: {e}"))
-                        })?,
-                    );
-
-                    // Spill Merkle tree nodes to disk
-                    tree.spill_nodes_to_disk().map_err(|e| {
-                        ProvingError::WrongParameter(format!("disk-spill main tree: {e}"))
+                    let spilled = LDETraceTable::spill_main_from_pool(
+                        &pool_sets[j].main,
+                        num_main_cols,
+                        air.step_size(),
+                        domains[idx].blowup_factor,
+                    )
+                    .map_err(|e| {
+                        ProvingError::WrongParameter(format!(
+                            "disk-spill main LDE table {idx}: {e}"
+                        ))
                     })?;
-                    if let Some(ref mut pt) = pre_tree {
-                        pt.spill_nodes_to_disk().map_err(|e| {
+                    spilled_ldes[idx] = Some(spilled);
+                }
+
+                #[allow(unused_mut)]
+                let mut main_tree = Arc::new(tree);
+                #[cfg(feature = "disk-spill")]
+                {
+                    Arc::get_mut(&mut main_tree)
+                        .expect("sole Arc owner")
+                        .spill_nodes_to_disk()
+                        .map_err(|e| {
                             ProvingError::WrongParameter(format!(
-                                "disk-spill precomputed tree: {e}"
+                                "disk-spill main Merkle tree: {e}"
                             ))
                         })?;
-                    }
                 }
 
-                if let Some(ref pre_r) = pre_root {
-                    transcript.append_bytes(pre_r);
-                }
-                transcript.append_bytes(&root);
+                let precomputed_tree = pre_tree.map(|t| {
+                    let mut arc = Arc::new(t);
+                    #[cfg(feature = "disk-spill")]
+                    {
+                        Arc::get_mut(&mut arc)
+                            .expect("sole Arc owner")
+                            .spill_nodes_to_disk()
+                            .map_err(|e| {
+                                ProvingError::WrongParameter(format!(
+                                    "disk-spill precomputed Merkle tree: {e}"
+                                ))
+                            })
+                            .unwrap();
+                    }
+                    arc
+                });
+
                 main_commits.push(MainCommitData {
-                    main_tree: Arc::new(tree),
+                    main_tree,
                     main_root: root,
-                    precomputed_tree: pre_tree.map(Arc::new),
+                    precomputed_tree,
                     precomputed_root: pre_root,
                     num_precomputed_cols: n_pre,
                 });
             }
+        }
+
+        #[cfg(feature = "instruments")]
+        let main_commits_elapsed = phase_start.elapsed();
+
+        // Re-spill main traces that were rehydrated by extract_columns_main_into
+        // during Phase A. After Phase A the pool holds the LDE data (already
+        // snapshotted to mmap above), so the original trace data is no longer
+        // needed in heap — push it back to mmap to free RAM for aux trace building.
+        #[cfg(feature = "disk-spill")]
+        for (_, trace, _) in air_trace_pairs.iter_mut() {
+            trace
+                .main_table
+                .spill_to_disk()
+                .map_err(|e| ProvingError::WrongParameter(format!("disk-spill late main: {e}")))?;
         }
 
         // =====================================================================
@@ -1588,29 +1684,44 @@ pub trait IsStarkProver<
             Vec::new()
         };
 
-        // When disk-spill is enabled, spill all main trace data to disk now.
-        // Phase A is done (main LDE committed), so the original trace data is only
-        // needed for aux trace generation (Phase C). Spilling it here frees the
-        // heap Vec while keeping data accessible through mmap for build_auxiliary_trace.
-        #[cfg(feature = "disk-spill")]
-        for (_, trace, _) in air_trace_pairs.iter_mut() {
-            trace
-                .main_table
-                .spill_to_disk()
-                .map_err(|e| ProvingError::WrongParameter(format!("disk-spill main trace: {e}")))?;
-        }
-
         // =====================================================================
-        // Phase C: Build + commit aux traces in chunks of K
+        // Phase C + Rounds 2-4: Forked per table
         // =====================================================================
         // Each table gets an independent transcript fork (cloned from the shared
         // state after Phase B, domain-separated by table index). This matches
         // the verifier's forking and makes per-table proving independent.
+        //
+        // Split into two passes for parallelism:
+        //   Pass 1 (parallel): Build all auxiliary traces (fingerprint + batch inversion)
+        //   Pass 2 (sequential): Fork transcript → extract → LDE → commit (shared pool)
 
-        // Aux build and aux commit are merged into a single chunked loop so that
-        // at most K aux traces are alive at any time. Without this, all N aux
-        // traces would be allocated simultaneously — for large programs (N=500+
-        // table chunks) this easily exceeds available RAM.
+        // Pass 1: Build aux traces in parallel.
+        // Each build_auxiliary_trace has internal parallelism (batch_inverse, par_chunks),
+        // but outer parallelism over 12 tables also helps on high-core-count machines.
+        #[cfg(feature = "instruments")]
+        let phase_start = Instant::now();
+
+        #[cfg(feature = "parallel")]
+        let aux_iter = air_trace_pairs.par_iter_mut();
+        #[cfg(not(feature = "parallel"))]
+        let aux_iter = air_trace_pairs.iter_mut();
+        let bus_inputs_vec: Vec<Option<BusPublicInputs<FieldExtension>>> = aux_iter
+            .map(|(air, trace, _)| {
+                if air.has_aux_trace() {
+                    air.build_auxiliary_trace(*trace, &lookup_challenges)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        #[cfg(feature = "instruments")]
+        let aux_build_elapsed = phase_start.elapsed();
+
+        // Pass 2: Parallel fork transcript → extract → LDE → commit in chunks of K.
+        // Each table gets its own transcript fork and pool set.
+        #[cfg(feature = "instruments")]
+        let phase_start = Instant::now();
 
         // Pre-fork all transcripts (cheap, sequential — must match verifier ordering)
         let mut table_transcripts: Vec<_> = (0..num_airs)
@@ -1623,40 +1734,16 @@ pub trait IsStarkProver<
             })
             .collect();
 
+        // Parallel aux commit in chunks of K
         #[allow(clippy::type_complexity)]
         let mut aux_results: Vec<(
             Option<Arc<BatchedMerkleTree<FieldExtension>>>,
             Option<Commitment>,
         )> = Vec::with_capacity(num_airs);
 
-        let mut bus_inputs_vec: Vec<Option<BusPublicInputs<FieldExtension>>> =
-            Vec::with_capacity(num_airs);
-
         for chunk_start in (0..num_airs).step_by(k) {
             let chunk_end = (chunk_start + k).min(num_airs);
             let chunk_size = chunk_end - chunk_start;
-
-            // Step 1: Build aux traces for this chunk (parallel within chunk).
-            // The mutable borrow of air_trace_pairs ends after collect().
-            {
-                #[cfg(feature = "parallel")]
-                let iter = air_trace_pairs[chunk_start..chunk_end].par_iter_mut();
-                #[cfg(not(feature = "parallel"))]
-                let iter = air_trace_pairs[chunk_start..chunk_end].iter_mut();
-
-                let chunk_bus_inputs: Vec<Option<BusPublicInputs<FieldExtension>>> = iter
-                    .map(|(air, trace, _)| {
-                        if air.has_aux_trace() {
-                            air.build_auxiliary_trace(*trace, &lookup_challenges)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                bus_inputs_vec.extend(chunk_bus_inputs);
-            }
-
-            // Step 2: Extract aux columns → LDE → commit (parallel, using pools)
 
             #[cfg(feature = "parallel")]
             let iter = pool_sets[..chunk_size].par_iter_mut().enumerate();
@@ -1673,66 +1760,69 @@ pub trait IsStarkProver<
                     if air.has_aux_trace() {
                         let num_aux_cols = trace.num_aux_columns;
                         trace.extract_columns_aux_into(&mut pool.aux);
+                        #[cfg(feature = "instruments")]
+                        let t_sub = Instant::now();
                         Self::expand_pool_to_lde::<FieldExtension>(
                             &mut pool.aux,
                             num_aux_cols,
                             domain,
                             twiddles,
                         );
+                        #[cfg(feature = "instruments")]
+                        let aux_lde_dur = t_sub.elapsed();
+                        #[cfg(feature = "instruments")]
+                        let t_sub = Instant::now();
                         let (tree, root) =
                             Self::commit_columns_bit_reversed(&pool.aux[..num_aux_cols])
                                 .ok_or(ProvingError::EmptyCommitment)?;
-                        Ok((Some(tree), Some(root), num_aux_cols))
+                        #[cfg(feature = "instruments")]
+                        crate::instruments::accum_r1_aux(aux_lde_dur, t_sub.elapsed());
+                        Ok((Some(Arc::new(tree)), Some(root)))
                     } else {
-                        Ok((None, None, 0))
+                        Ok((None, None))
                     }
                 })
                 .collect();
 
-            // Step 3: Sequential — spill aux LDE + tree, append roots to transcripts
+            // Sequential: append aux roots to forked transcripts
             #[allow(unused_variables)]
             for (j, result) in chunk_aux.into_iter().enumerate() {
                 #[allow(unused_mut)]
-                let (mut aux_tree, aux_root, _num_aux_cols) = result?;
-
-                #[cfg(feature = "disk-spill")]
-                {
-                    let idx = chunk_start + j;
-                    if _num_aux_cols > 0 {
-                        let pool = &pool_sets[j];
-
-                        // Add aux LDE columns to the already-spilled table
-                        if let Some(ref mut spilled) = spilled_ldes[idx] {
-                            spilled
-                                .add_aux_from_pool(&pool.aux, _num_aux_cols)
-                                .map_err(|e| {
-                                    ProvingError::WrongParameter(format!("disk-spill aux LDE: {e}"))
-                                })?;
-                        }
-
-                        // Spill aux Merkle tree nodes to disk
-                        if let Some(ref mut tree) = aux_tree {
-                            tree.spill_nodes_to_disk().map_err(|e| {
-                                ProvingError::WrongParameter(format!("disk-spill aux tree: {e}"))
-                            })?;
-                        }
-                    }
-                }
-
+                let (mut aux_tree, aux_root) = result?;
                 if let Some(ref root) = aux_root {
                     table_transcripts[chunk_start + j].append_bytes(root);
                 }
-                aux_results.push((aux_tree.map(Arc::new), aux_root));
-            }
 
-            // Step 4 (disk-spill): Free aux trace data for this chunk.
-            // The aux data has been LDE'd, committed, and spilled to disk.
-            // Freeing it now caps peak heap at K aux traces instead of all N.
-            #[cfg(feature = "disk-spill")]
-            for idx in chunk_start..chunk_end {
-                let (_, trace, _) = &mut air_trace_pairs[idx];
-                trace.aux_table.data = Vec::new();
-                trace.aux_table.height = 0;
+                // Spill aux LDE columns from pool and aux Merkle tree nodes to disk.
+                #[cfg(feature = "disk-spill")]
+                {
+                    let idx = chunk_start + j;
+                    let (air, trace, _) = &air_trace_pairs[idx];
+                    if air.has_aux_trace() {
+                        let num_aux_cols = trace.num_aux_columns;
+                        if let Some(ref mut spilled) = spilled_ldes[idx] {
+                            spilled
+                                .add_aux_from_pool(&pool_sets[j].aux, num_aux_cols)
+                                .map_err(|e| {
+                                    ProvingError::WrongParameter(format!(
+                                        "disk-spill aux LDE table {idx}: {e}"
+                                    ))
+                                })?;
+                        }
+                    }
+                    if let Some(ref mut tree_arc) = aux_tree {
+                        Arc::get_mut(tree_arc)
+                            .expect("sole Arc owner")
+                            .spill_nodes_to_disk()
+                            .map_err(|e| {
+                                ProvingError::WrongParameter(format!(
+                                    "disk-spill aux Merkle tree {idx}: {e}"
+                                ))
+                            })?;
+                    }
+                }
+
+                aux_results.push((aux_tree, aux_root));
             }
         }
 
@@ -1757,6 +1847,9 @@ pub trait IsStarkProver<
             });
         }
 
+        #[cfg(feature = "instruments")]
+        let aux_commit_elapsed = phase_start.elapsed();
+
         #[cfg(feature = "debug-checks")]
         {
             let debug_pool = &mut pool_sets[0];
@@ -1773,109 +1866,111 @@ pub trait IsStarkProver<
         // =====================================================================
         // Rounds 2-4: Parallel per-table proving in chunks of K
         // =====================================================================
+        // Each chunk of K tables is processed in parallel. Each worker gets its
+        // own pool set and transcript fork. Pool sets are reused across chunks.
+        //
+        // disk-spill path: LDE data is read from mmap-backed spilled_ldes instead
+        // of being recomputed via reconstruct_round1. This avoids the peak memory
+        // spike of holding both the trace and its LDE in RAM simultaneously.
+
+        #[cfg(feature = "instruments")]
+        let phase_start = Instant::now();
+        #[cfg(feature = "instruments")]
+        let mut table_timings: Vec<(
+            String,
+            usize,
+            std::time::Duration,
+            crate::instruments::TableSubOps,
+        )> = Vec::with_capacity(num_airs);
 
         let mut proofs = Vec::with_capacity(num_airs);
 
+        // ----- disk-spill path: read from spilled LDEs -----
         #[cfg(feature = "disk-spill")]
         {
-            // All LDE data is now on disk. Free pool buffers and trace data
-            // to minimize memory during Rounds 2-4.
-            drop(pool_sets);
-            drop(twiddle_caches);
-            for (_, trace, _) in air_trace_pairs.iter_mut() {
-                trace.main_table.data = Vec::new();
-                trace.main_table.height = 0;
-                trace.aux_table.data = Vec::new();
-                trace.aux_table.height = 0;
-            }
+            for idx in 0..num_airs {
+                let (air, _trace, pub_inputs) = &air_trace_pairs[idx];
+                let metadata = &metadatas[idx];
+                let domain = &domains[idx];
+                let table_transcript = &mut table_transcripts[idx];
 
-            for chunk_start in (0..num_airs).step_by(k) {
-                let chunk_end = (chunk_start + k).min(num_airs);
+                #[cfg(feature = "instruments")]
+                let table_start = Instant::now();
 
-                let chunk_transcripts = &mut table_transcripts[chunk_start..chunk_end];
-                let chunk_ldes = &mut spilled_ldes[chunk_start..chunk_end];
+                // Take the spilled LDE (mmap-backed) — no LDE recomputation needed
+                let lde_trace = spilled_ldes[idx]
+                    .take()
+                    .expect("spilled LDE must exist for every AIR");
 
-                #[cfg(feature = "parallel")]
-                let iter = chunk_ldes
-                    .par_iter_mut()
-                    .zip(chunk_transcripts.par_iter_mut())
-                    .enumerate();
-                #[cfg(not(feature = "parallel"))]
-                let iter = chunk_ldes
-                    .iter_mut()
-                    .zip(chunk_transcripts.iter_mut())
-                    .enumerate();
+                // Build Round1 from the spilled LDE + stored Merkle trees
+                let main = Round1CommitmentData::<Field> {
+                    lde_trace_merkle_tree: Arc::clone(&metadata.main_merkle_tree),
+                    lde_trace_merkle_root: metadata.main_merkle_root,
+                    precomputed_merkle_tree: metadata
+                        .precomputed_merkle_tree
+                        .as_ref()
+                        .map(Arc::clone),
+                    precomputed_merkle_root: metadata.precomputed_merkle_root,
+                    num_precomputed_cols: metadata.num_precomputed_cols,
+                };
 
-                let chunk_results: Vec<Result<_, ProvingError>> = iter
-                    .map(|(j, (spilled_lde_opt, table_transcript))| {
-                        let idx = chunk_start + j;
-                        let (air, _, pub_inputs) = &air_trace_pairs[idx];
-                        let metadata = &metadatas[idx];
-                        let domain = &domains[idx];
-
-                        // Build Round1 directly from spilled data — no LDE recomputation!
-                        let lde_trace = spilled_lde_opt
-                            .take()
-                            .expect("spilled LDE must exist for each table");
-
-                        let main = Round1CommitmentData {
-                            lde_trace_merkle_tree: Arc::clone(&metadata.main_merkle_tree),
-                            lde_trace_merkle_root: metadata.main_merkle_root,
-                            precomputed_merkle_tree: metadata
-                                .precomputed_merkle_tree
-                                .as_ref()
-                                .map(Arc::clone),
-                            precomputed_merkle_root: metadata.precomputed_merkle_root,
-                            num_precomputed_cols: metadata.num_precomputed_cols,
-                        };
-
-                        let aux =
+                let aux = if air.has_aux_trace() {
+                    Some(Round1CommitmentData::<FieldExtension> {
+                        lde_trace_merkle_tree: Arc::clone(
                             metadata
                                 .aux_merkle_tree
                                 .as_ref()
-                                .map(|tree| Round1CommitmentData {
-                                    lde_trace_merkle_tree: Arc::clone(tree),
-                                    lde_trace_merkle_root: metadata
-                                        .aux_merkle_root
-                                        .expect("aux root must exist when aux tree exists"),
-                                    precomputed_merkle_tree: None,
-                                    precomputed_merkle_root: None,
-                                    num_precomputed_cols: 0,
-                                });
-
-                        let round_1_result = Round1 {
-                            lde_trace,
-                            main,
-                            aux,
-                            rap_challenges: metadata.rap_challenges.clone(),
-                            bus_public_inputs: metadata.bus_public_inputs.clone(),
-                        };
-
-                        if let Some(ref bpi) = round_1_result.bus_public_inputs {
-                            table_transcript.append_field_element(&bpi.table_contribution);
-                        }
-
-                        let proof = Self::prove_rounds_2_to_4(
-                            *air,
-                            *pub_inputs,
-                            &round_1_result,
-                            table_transcript,
-                            domain,
-                        )?;
-
-                        Ok(proof)
+                                .expect("aux tree must exist when has_aux_trace"),
+                        ),
+                        lde_trace_merkle_root: metadata
+                            .aux_merkle_root
+                            .expect("aux root must exist when has_aux_trace"),
+                        precomputed_merkle_tree: None,
+                        precomputed_merkle_root: None,
+                        num_precomputed_cols: 0,
                     })
-                    .collect();
+                } else {
+                    None
+                };
 
-                for result in chunk_results {
-                    proofs.push(result?);
+                let round_1_result = Round1 {
+                    lde_trace,
+                    main,
+                    aux,
+                    rap_challenges: metadata.rap_challenges.clone(),
+                    bus_public_inputs: metadata.bus_public_inputs.clone(),
+                };
+
+                if let Some(ref bpi) = round_1_result.bus_public_inputs {
+                    table_transcript.append_field_element(&bpi.table_contribution);
                 }
+
+                let proof = Self::prove_rounds_2_to_4(
+                    *air,
+                    *pub_inputs,
+                    &round_1_result,
+                    table_transcript,
+                    domain,
+                )?;
+
+                #[cfg(feature = "instruments")]
+                {
+                    let sub_ops = crate::instruments::take_round_sub_ops().unwrap_or_default();
+                    table_timings.push((
+                        air.name().to_string(),
+                        air_trace_pairs[idx].1.num_rows(),
+                        table_start.elapsed(),
+                        sub_ops,
+                    ));
+                }
+
+                proofs.push(proof);
             }
         }
 
+        // ----- non-disk-spill path: reconstruct LDE from trace (original flow) -----
         #[cfg(not(feature = "disk-spill"))]
         {
-            // Original flow: reconstruct LDE from traces + pool, then prove.
             for chunk_start in (0..num_airs).step_by(k) {
                 let chunk_end = (chunk_start + k).min(num_airs);
                 let chunk_size = chunk_end - chunk_start;
@@ -1901,6 +1996,11 @@ pub trait IsStarkProver<
                         let domain = &domains[idx];
                         let twiddles = &twiddle_caches[idx];
 
+                        #[cfg(feature = "instruments")]
+                        let table_start = Instant::now();
+
+                        #[cfg(feature = "instruments")]
+                        let lde_start = Instant::now();
                         let round_1_result = Self::reconstruct_round1(
                             *air,
                             *trace,
@@ -1910,6 +2010,8 @@ pub trait IsStarkProver<
                             &mut pool.main,
                             &mut pool.aux,
                         )?;
+                        #[cfg(feature = "instruments")]
+                        let lde_dur = lde_start.elapsed();
 
                         if let Some(ref bpi) = round_1_result.bus_public_inputs {
                             table_transcript.append_field_element(&bpi.table_contribution);
@@ -1923,6 +2025,23 @@ pub trait IsStarkProver<
                             domain,
                         )?;
 
+                        // Collect per-table sub-op timing via TLS.
+                        // Both the store (inside prove_rounds_2_to_4) and this take run on the
+                        // same rayon worker thread, so sub-ops are valid in both sequential and
+                        // parallel mode.
+                        #[cfg(feature = "instruments")]
+                        let table_timing = {
+                            let mut sub_ops =
+                                crate::instruments::take_round_sub_ops().unwrap_or_default();
+                            sub_ops.trace_lde += lde_dur;
+                            (
+                                air.name().to_string(),
+                                trace.num_rows(),
+                                table_start.elapsed(),
+                                sub_ops,
+                            )
+                        };
+
                         // Return column Vecs to pool (zero-copy move back)
                         let (main_cols, aux_cols) = round_1_result.lde_trace.into_columns();
                         for (slot, col) in pool.main.iter_mut().zip(main_cols) {
@@ -1932,17 +2051,42 @@ pub trait IsStarkProver<
                             *slot = col;
                         }
 
+                        #[cfg(feature = "instruments")]
+                        return Ok((proof, table_timing));
+                        #[cfg(not(feature = "instruments"))]
                         Ok(proof)
                     })
                     .collect();
 
                 for result in chunk_results {
+                    #[cfg(feature = "instruments")]
+                    {
+                        let (proof, timing) = result?;
+                        proofs.push(proof);
+                        table_timings.push(timing);
+                    }
+                    #[cfg(not(feature = "instruments"))]
                     proofs.push(result?);
                 }
             }
+        } // end #[cfg(not(feature = "disk-spill"))]
+
+        #[cfg(feature = "instruments")]
+        {
+            // Store timing data for the top-level report in prove_with_options.
+            // Uses a thread-local to avoid changing multi_prove's return type.
+            crate::instruments::store(crate::instruments::MultiProveTiming {
+                prepass: prepass_elapsed,
+                main_commits: main_commits_elapsed,
+                aux_build: aux_build_elapsed,
+                aux_commit: aux_commit_elapsed,
+                rounds_2_4: phase_start.elapsed(),
+                round1_sub: crate::instruments::take_r1_sub(),
+                table_timings,
+            });
         }
 
-        Ok(MultiProof::new(proofs))
+        Ok(MultiProof { proofs })
     }
 
     /// Generate a STARK proof for a single AIR/trace.
@@ -1984,11 +2128,6 @@ pub trait IsStarkProver<
         // ==========|   Round 2   |==========
         // ===================================
 
-        #[cfg(feature = "instruments")]
-        println!("- Started round 2: Compute composition polynomial");
-        #[cfg(feature = "instruments")]
-        let timer2 = Instant::now();
-
         // <<<< Receive challenge: 𝛽
         let beta = transcript.sample_field_element();
         let trace_length = domain.interpolation_domain_size;
@@ -2025,19 +2164,9 @@ pub trait IsStarkProver<
         // >>>> Send commitments: [H₁], [H₂]
         transcript.append_bytes(&round_2_result.composition_poly_root);
 
-        #[cfg(feature = "instruments")]
-        let elapsed2 = timer2.elapsed();
-        #[cfg(feature = "instruments")]
-        println!("  Time spent: {:?}", elapsed2);
-
         // ===================================
         // ==========|   Round 3   |==========
         // ===================================
-
-        #[cfg(feature = "instruments")]
-        println!("- Started round 3: Evaluate polynomial in out of domain elements");
-        #[cfg(feature = "instruments")]
-        let timer3 = Instant::now();
 
         // <<<< Receive challenge: z
         let z = transcript.sample_z_ood(
@@ -2045,6 +2174,8 @@ pub trait IsStarkProver<
             &domain.trace_roots_of_unity,
         );
 
+        #[cfg(feature = "instruments")]
+        let t_r3 = Instant::now();
         let round_3_result = Self::round_3_evaluate_polynomials_in_out_of_domain_element(
             air,
             domain,
@@ -2052,6 +2183,8 @@ pub trait IsStarkProver<
             &round_2_result,
             &z,
         );
+        #[cfg(feature = "instruments")]
+        let round_3_dur = t_r3.elapsed();
 
         // >>>> Send values: tⱼ(zgᵏ)
         let trace_ood_evaluations_columns = round_3_result.trace_ood_evaluations.columns();
@@ -2066,19 +2199,9 @@ pub trait IsStarkProver<
             transcript.append_field_element(element);
         }
 
-        #[cfg(feature = "instruments")]
-        let elapsed3 = timer3.elapsed();
-        #[cfg(feature = "instruments")]
-        println!("  Time spent: {:?}", elapsed3);
-
         // ===================================
         // ==========|   Round 4   |==========
         // ===================================
-
-        #[cfg(feature = "instruments")]
-        println!("- Started round 4: FRI");
-        #[cfg(feature = "instruments")]
-        let timer4 = Instant::now();
 
         // Part of this round is running FRI, which is an interactive
         // protocol on its own. Therefore we pass it the transcript
@@ -2094,19 +2217,23 @@ pub trait IsStarkProver<
         );
 
         #[cfg(feature = "instruments")]
-        let elapsed4 = timer4.elapsed();
-        #[cfg(feature = "instruments")]
-        println!("  Time spent: {:?}", elapsed4);
-
-        #[cfg(feature = "instruments")]
         {
-            let total_time = elapsed2 + elapsed3 + elapsed4;
-            println!(
-                " Fraction of proving time per round: {:.4} {:.4} {:.4}",
-                elapsed2.as_nanos() as f64 / total_time.as_nanos() as f64,
-                elapsed3.as_nanos() as f64 / total_time.as_nanos() as f64,
-                elapsed4.as_nanos() as f64 / total_time.as_nanos() as f64
-            );
+            let zero = std::time::Duration::ZERO;
+            let (r2_constraints, r2_fft, r2_merkle) =
+                crate::instruments::take_r2_sub().unwrap_or((zero, zero, zero));
+            let (r4_fft, r4_merkle, r4_deep_comp, r4_queries) =
+                crate::instruments::take_r4_sub().unwrap_or((zero, zero, zero, zero));
+            crate::instruments::store_round_sub_ops(crate::instruments::TableSubOps {
+                trace_lde: std::time::Duration::ZERO, // added by caller from lde_dur
+                constraints: r2_constraints,
+                comp_decompose: r2_fft,
+                comp_commit: r2_merkle,
+                ood: round_3_dur,
+                deep_comp: r4_deep_comp,
+                deep_extend: r4_fft,
+                fri_commit: r4_merkle,
+                queries: r4_queries,
+            });
         }
 
         info!("End proof generation");

@@ -10,7 +10,9 @@ use math::{
 };
 
 use crate::{
-    constraints::transition::TransitionConstraint, domain::Domain, lookup::BusPublicInputs,
+    constraints::transition::TransitionConstraint,
+    domain::Domain,
+    lookup::{BusPublicInputs, PackingShifts},
 };
 
 use super::{
@@ -78,6 +80,7 @@ where
         rap_challenges: &'a [FieldElement<E>],
         logup_alpha_powers: &'a [FieldElement<E>],
         logup_table_offset: &'a FieldElement<E>,
+        packing_shifts: &'a PackingShifts<F>,
     },
     Verifier {
         frame: &'a Frame<E, E>,
@@ -85,6 +88,7 @@ where
         rap_challenges: &'a [FieldElement<E>],
         logup_alpha_powers: &'a [FieldElement<E>],
         logup_table_offset: &'a FieldElement<E>,
+        packing_shifts: &'a PackingShifts<E>,
     },
 }
 
@@ -99,6 +103,7 @@ where
         rap_challenges: &'a [FieldElement<E>],
         logup_alpha_powers: &'a [FieldElement<E>],
         logup_table_offset: &'a FieldElement<E>,
+        packing_shifts: &'a PackingShifts<F>,
     ) -> Self {
         Self::Prover {
             frame,
@@ -106,6 +111,7 @@ where
             rap_challenges,
             logup_alpha_powers,
             logup_table_offset,
+            packing_shifts,
         }
     }
 
@@ -115,6 +121,7 @@ where
         rap_challenges: &'a [FieldElement<E>],
         logup_alpha_powers: &'a [FieldElement<E>],
         logup_table_offset: &'a FieldElement<E>,
+        packing_shifts: &'a PackingShifts<E>,
     ) -> Self {
         Self::Verifier {
             frame,
@@ -122,6 +129,7 @@ where
             rap_challenges,
             logup_alpha_powers,
             logup_table_offset,
+            packing_shifts,
         }
     }
 }

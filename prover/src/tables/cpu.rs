@@ -55,7 +55,11 @@
 
 use super::types::{BusId, DecodeEntry, FE, GoldilocksExtension, GoldilocksField};
 use crate::Error;
-use executor::vm::{instruction::decoding::Instruction, logs::Log, memory::U64HashMap};
+use executor::vm::{
+    instruction::{decoding::Instruction, execution::SyscallNumbers},
+    logs::Log,
+    memory::U64HashMap,
+};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
@@ -197,7 +201,7 @@ pub mod cols {
     pub const ARG1_6: usize = 52;
     pub const ARG1_7: usize = 53;
 
-    /// arg2_sign_bit: Sign bit of arg2 as 32-bit word
+    /// arg2_sign_bit: Sign bit of rv2 as 32-bit word (bit 31 of rv2; used to define arg2's extension)
     pub const ARG2_SIGN_BIT: usize = 54;
 
     /// arg2[0..8]: Extended rv2/imm as DWordBL (8 bytes)
@@ -286,6 +290,15 @@ pub struct CpuOperation {
 
     /// Whether branch is taken
     pub branch_cond: bool,
+
+    /// Whether this ECALL is a Commit syscall
+    pub ecall_commit: bool,
+
+    /// For Commit ECALLs: buffer address from x11
+    pub commit_buf_addr: u64,
+
+    /// For Commit ECALLs: byte count from x12
+    pub commit_count: u64,
 }
 
 impl CpuOperation {
@@ -353,48 +366,40 @@ impl CpuOperation {
         }
     }
 
-    /// Compute arg2 based on instruction type (returns imm or rv2 depending on opcode).
+    /// Compute arg2 following the spec formula exactly (CPU-CE62/CE63).
     ///
-    /// Per spec constraint for arg2[4:]:
-    /// (1-LOAD) * ((1-word_instr)*rv2[2] + signed*arg2_sign_bit*(2^32-1)) + (1-BEQ-BLT-STORE)*imm[1]
+    /// arg2[:4] = (1-LOAD)*rv2[:2] + (1-BEQ-BLT-STORE)*imm[0]
+    /// arg2[4:] = (1-LOAD)*((1-word_instr)*rv2[2] + signed*arg2_sign_bit*(2^32-1))
+    ///            + (1-BEQ-BLT-STORE)*imm[1]
     ///
-    /// For LOAD: uses imm (full 64-bit, for address calculation)
-    /// For STORE: uses rv2 (byte-decomposed data to store; address via separate ADD)
-    /// For BEQ/BLT: uses rv2 (full 64-bit, comparing register values)
-    /// Otherwise: uses imm (when rs2=0) or rv2, with sign extension for signed word instructions
+    /// Per CPU-A2, the decode guarantees that at most one of rv2/imm is non-zero
+    /// when STORE+LOAD+BEQ+BLT=0, so the addition acts as a selection.
     pub fn compute_arg2(&self) -> u64 {
-        if self.decode.op_load {
-            // LOAD: address = rv1 + imm, use full imm
-            self.decode.imm
-        } else if self.decode.op_store {
-            // STORE: arg2 = rv2 (byte-decomposed data to store)
-            // Address computed separately as res = arg1 + imm
-            self.rv2
-        } else if self.decode.op_beq || self.decode.op_blt {
-            // BEQ/BLT: compare rv1 vs rv2, use full rv2
-            self.rv2
-        } else {
-            // For other ops, use imm (when rs2=0) or rv2
-            let base = if self.decode.rs2 == 0 {
-                self.decode.imm
-            } else {
-                self.rv2
-            };
+        let d = &self.decode;
 
-            // For word instructions, apply sign/zero extension based on signed flag
-            if self.decode.word_instr {
-                let lower_32 = base & 0xFFFF_FFFF;
-                if self.decode.signed && Self::sign_bit_32(base) {
-                    // Sign extend: set upper 32 bits to all 1s
-                    lower_32 | (0xFFFF_FFFF_u64 << 32)
-                } else {
-                    // Zero extend: upper 32 bits are 0
-                    lower_32
-                }
+        // rv2 contribution: zeroed when LOAD (spec: (1-LOAD) factor)
+        let rv2_extended = if d.op_load {
+            0
+        } else if d.word_instr {
+            // Word-instruction sign/zero extension on upper 32 bits
+            let lower_32 = self.rv2 & 0xFFFF_FFFF;
+            if d.signed && Self::sign_bit_32(self.rv2) {
+                lower_32 | (0xFFFF_FFFF_u64 << 32)
             } else {
-                base
+                lower_32
             }
-        }
+        } else {
+            self.rv2
+        };
+
+        // imm contribution: zeroed when BEQ, BLT, or STORE (spec: (1-BEQ-BLT-STORE) factor)
+        let imm_contrib = if d.op_beq || d.op_blt || d.op_store {
+            0
+        } else {
+            d.imm
+        };
+
+        rv2_extended.wrapping_add(imm_contrib)
     }
 
     /// Extract sign bit of a 32-bit word (bit 31).
@@ -480,10 +485,63 @@ impl CpuOperation {
         }
     }
 
+    /// Collects IS_BYTE lookups for CPU byte range checks.
+    ///
+    /// The CPU has 27 byte columns that must be range-checked: RS1, RS2, RD,
+    /// ARG1[0..7], ARG2[0..7], RES[0..7]. Each generates one IS_BYTE lookup.
+    pub fn collect_byte_check_ops(&self) -> Vec<super::bitwise::BitwiseOperation> {
+        use super::bitwise::{BitwiseOperation, BitwiseOperationType};
+
+        let arg1 = self.compute_arg1();
+        let arg2 = self.compute_arg2();
+        let res = self.compute_res();
+
+        let mut ops = Vec::with_capacity(27);
+
+        // Register indices
+        ops.push(BitwiseOperation::single_byte(
+            BitwiseOperationType::IsByte,
+            self.decode.rs1,
+        ));
+        ops.push(BitwiseOperation::single_byte(
+            BitwiseOperationType::IsByte,
+            self.decode.rs2,
+        ));
+        ops.push(BitwiseOperation::single_byte(
+            BitwiseOperationType::IsByte,
+            self.decode.rd,
+        ));
+
+        // ARG1[0..7], ARG2[0..7], RES[0..7]
+        for i in 0..8 {
+            ops.push(BitwiseOperation::single_byte(
+                BitwiseOperationType::IsByte,
+                ((arg1 >> (i * 8)) & 0xFF) as u8,
+            ));
+        }
+        for i in 0..8 {
+            ops.push(BitwiseOperation::single_byte(
+                BitwiseOperationType::IsByte,
+                ((arg2 >> (i * 8)) & 0xFF) as u8,
+            ));
+        }
+        for i in 0..8 {
+            ops.push(BitwiseOperation::single_byte(
+                BitwiseOperationType::IsByte,
+                ((res >> (i * 8)) & 0xFF) as u8,
+            ));
+        }
+
+        ops
+    }
+
     /// Collects Bitwise table lookups generated by this CPU operation.
     pub fn collect_bitwise_ops(&self) -> Vec<super::bitwise::BitwiseOperation> {
         use super::bitwise::{BitwiseOperation, BitwiseOperationType};
         let mut lookups = Vec::new();
+
+        // Byte range checks: 27 IS_BYTE
+        lookups.extend(self.collect_byte_check_ops());
 
         // MSB16 lookups for sign bit extraction (when word_instr=1)
         if self.decode.word_instr {
@@ -574,16 +632,34 @@ impl CpuOperation {
     /// The DecodeEntry contains static instruction information. This method
     /// adds runtime values from the Log (register values, branch decisions, etc.).
     pub fn from_log(log: &Log, timestamp: u64, decode: DecodeEntry) -> Self {
+        let ecall_commit = decode.op_ecall && log.src1_val == SyscallNumbers::Commit as u64;
+        let (commit_buf_addr, commit_count) = if ecall_commit {
+            (log.src2_val, log.dst_val)
+        } else {
+            (0, 0)
+        };
+        // CM50: (1 - read_register2) * rv2[i] = 0. When read_register2=0, rv2 must be 0.
+        // For example, ECALL has read_register2=0 (rs2 defaults to 0). The commit buf_addr is
+        // carried separately in commit_buf_addr and does not go through rv2.
+        let rv2 = if !decode.read_register2 {
+            0
+        } else {
+            log.src2_val
+        };
+
         let mut op = Self {
             decode,
             timestamp,
             next_pc: log.next_pc,
             rv1: log.src1_val,
-            rv2: log.src2_val,
+            rv2,
             rvd: log.dst_val,
             res: log.dst_val, // Default: result is destination value
             is_equal: false,
             branch_cond: false,
+            ecall_commit,
+            commit_buf_addr,
+            commit_count,
         };
 
         // Compute runtime-specific values based on instruction type
@@ -690,11 +766,10 @@ pub fn generate_cpu_trace(
         data[base + cols::RS1] = FE::from(d.rs1 as u64);
         data[base + cols::RS2] = FE::from(d.rs2 as u64);
         data[base + cols::RD] = FE::from(d.rd as u64);
-        // Only set read/write register flags when register is a real register
-        // Skip x0 (hardwired zero) and x255 (virtual PC register for AUIPC/JAL)
-        // This matches trace_builder which only generates MEMW rows for real registers
-        data[base + cols::READ_REGISTER1] =
-            FE::from((d.read_register1 && d.rs1 != 0 && d.rs1 != 255) as u64);
+        // Skip x0 (hardwired zero). x255 is the register where the pc is stored
+        // (per spec decode.md). read_register1=1 for rs1=255 ensures the CM47 MEMW
+        // interaction is sent and rv1 is not forced to zero by CM48.
+        data[base + cols::READ_REGISTER1] = FE::from((d.read_register1 && d.rs1 != 0) as u64);
         data[base + cols::READ_REGISTER2] = FE::from((d.read_register2 && d.rs2 != 0) as u64);
         data[base + cols::WRITE_REGISTER] = FE::from((d.write_register && d.rd != 0) as u64);
         data[base + cols::MEMORY_2BYTES] = FE::from(d.memory_2bytes as u64);
@@ -764,7 +839,7 @@ pub fn generate_cpu_trace(
 
         // Compute and store arg2
         let arg2 = op.compute_arg2();
-        let arg2_sign_bit = d.word_instr && CpuOperation::sign_bit_32(arg2);
+        let arg2_sign_bit = d.word_instr && CpuOperation::sign_bit_32(op.rv2);
         data[base + cols::ARG2_SIGN_BIT] = FE::from(arg2_sign_bit as u64);
         for i in 0..8 {
             data[base + cols::ARG2[i]] = FE::from((arg2 >> (i * 8)) & 0xFF);
@@ -869,7 +944,6 @@ fn linear_term(bit: u32, column: usize) -> LinearTerm {
 /// - AND_BYTE, OR_BYTE, XOR_BYTE: for bitwise operations (×8 each)
 ///
 /// Note: LT interaction is TODO - needs proper DWordHHW packing to match LT table receiver.
-/// Note: IS_BYTE, MSB8, ZERO interactions are TODO for later.
 pub fn bus_interactions() -> Vec<BusInteraction> {
     use super::types::packed_decode as bits;
 
@@ -1202,10 +1276,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::MP_SELECTOR,
                 packing: Packing::Direct,
             },
-            // result (rvd) as DWordWL (2 words → 2 elements)
+            // result (res) as DWordBL (8 bytes → 2 elements) per spec CPU-CA44.
+            // Must send res (raw MUL output), not rvd. For MULW, rvd = sign_extend(res[31:0]),
+            // which can differ from res when bits [63:32] ≠ sign_extend(bit31) of res.
             BusValue::Packed {
-                start_column: cols::RVD_0,
-                packing: Packing::DWordWL,
+                start_column: cols::RES[0],
+                packing: Packing::DWordBL,
             },
             // muldiv_selector: 0=lo (MUL), 1=hi (MULH/MULHSU/MULHU)
             BusValue::Packed {
@@ -1239,10 +1315,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::SIGNED,
                 packing: Packing::Direct,
             },
-            // result (rvd) as DWordWL (2 words → 2 elements)
+            // result (res) as DWordBL (8 bytes → 2 elements) per spec CPU-CA45.
+            // Must send res (raw DVRM output), not rvd. For DIVW/REMW, rvd = sign_extend(res[31:0]),
+            // which can differ from res when bits [63:32] ≠ sign_extend(bit31) of res.
             BusValue::Packed {
-                start_column: cols::RVD_0,
-                packing: Packing::DWordWL,
+                start_column: cols::RES[0],
+                packing: Packing::DWordBL,
             },
             // muldiv_selector: 0=quotient (DIV), 1=remainder (REM)
             BusValue::Packed {
@@ -1864,11 +1942,59 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // ECALL interaction (CPU → HALT)
     // -------------------------------------------------------------------------
-    // When ECALL flag is set, send [timestamp, cast(rv1, DWordWL)] to the HALT table.
-    // rv1 = value of a7 register (syscall number). For sys_exit, rv1 = 93.
-    // If rv1 ≠ 93, bus doesn't balance → proof fails.
+    // IS_BYTE interactions (byte range checks, 27 total)
+    // CPU-CR29: IS_BYTE[rs1], CPU-CR30: IS_BYTE[rs2], CPU-CR31: IS_BYTE[rd]
+    // CPU-CR32.i: IS_BYTE[arg1[i]], CPU-CR33.i: IS_BYTE[arg2[i]], CPU-CR34.i: IS_BYTE[res[i]]
+    // -------------------------------------------------------------------------
+    // Range-check all 27 byte columns: RS1, RS2, RD, ARG1[0..7], ARG2[0..7], RES[0..7].
+    // Every CPU row (including padding) sends with Multiplicity::One.
+    let byte_columns: [usize; 27] = [
+        cols::RS1,
+        cols::RS2,
+        cols::RD,
+        cols::ARG1[0],
+        cols::ARG1[1],
+        cols::ARG1[2],
+        cols::ARG1[3],
+        cols::ARG1[4],
+        cols::ARG1[5],
+        cols::ARG1[6],
+        cols::ARG1[7],
+        cols::ARG2[0],
+        cols::ARG2[1],
+        cols::ARG2[2],
+        cols::ARG2[3],
+        cols::ARG2[4],
+        cols::ARG2[5],
+        cols::ARG2[6],
+        cols::ARG2[7],
+        cols::RES[0],
+        cols::RES[1],
+        cols::RES[2],
+        cols::RES[3],
+        cols::RES[4],
+        cols::RES[5],
+        cols::RES[6],
+        cols::RES[7],
+    ];
+    for col in byte_columns {
+        interactions.push(BusInteraction::sender(
+            BusId::IsByte,
+            Multiplicity::One,
+            vec![BusValue::Packed {
+                start_column: col,
+                packing: Packing::Direct,
+            }],
+        ));
+    }
+
+    // ECALL interaction (single shared bus for HALT and COMMIT)
+    // -------------------------------------------------------------------------
+    // Sends to both HALT and COMMIT tables. Each receiver pattern-matches on
+    // the syscall number in the payload.
+    // multiplicity = ECALL
+    // rv1 = value of a7 register (syscall number).
     interactions.push(BusInteraction::sender(
         BusId::Ecall,
         Multiplicity::Column(cols::ECALL),

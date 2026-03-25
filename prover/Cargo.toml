@@ -8,6 +8,7 @@ default = ["parallel"]
 parallel = ["stark/parallel", "math/parallel", "crypto/parallel", "dep:rayon"]
 debug-checks = ["stark/debug-checks"]
 disk-spill = ["stark/disk-spill"]
+instruments = ["stark/instruments"]
 
 [dependencies]
 stark = { path = "../crypto/stark" }
@@ -24,4 +25,8 @@ bincode = "1"
 
 [[bench]]
 name = "vm_prover_benchmark"
+harness = false
+
+[[bench]]
+name = "profile_vm_prover"
 harness = false

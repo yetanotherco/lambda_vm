@@ -3,9 +3,9 @@
 //! Verifies that proving and verification produce correct results when main
 //! traces, LDE columns, and Merkle tree nodes are spilled to disk via mmap.
 
+use crate::VmProof;
 use crate::tables::MaxRowsConfig;
 use crate::test_utils::asm_elf_bytes;
-use crate::VmProof;
 
 /// Prove + verify a small program end-to-end with disk-spill enabled.
 /// This exercises the full pipeline: trace generation, main-trace spill,
@@ -62,12 +62,30 @@ fn test_disk_spill_serialization_roundtrip() {
 #[test]
 fn test_print_struct_sizes() {
     use std::mem::size_of;
-    eprintln!("CpuOperation:     {} bytes", size_of::<crate::tables::cpu::CpuOperation>());
-    eprintln!("MemwOperation:    {} bytes", size_of::<crate::tables::memw::MemwOperation>());
-    eprintln!("LtOperation:      {} bytes", size_of::<crate::tables::lt::LtOperation>());
-    eprintln!("BranchOperation:  {} bytes", size_of::<crate::tables::branch::BranchOperation>());
-    eprintln!("BitwiseOperation: {} bytes", size_of::<crate::tables::bitwise::BitwiseOperation>());
-    eprintln!("ShiftOperation:   {} bytes", size_of::<crate::tables::shift::ShiftOperation>());
+    eprintln!(
+        "CpuOperation:     {} bytes",
+        size_of::<crate::tables::cpu::CpuOperation>()
+    );
+    eprintln!(
+        "MemwOperation:    {} bytes",
+        size_of::<crate::tables::memw::MemwOperation>()
+    );
+    eprintln!(
+        "LtOperation:      {} bytes",
+        size_of::<crate::tables::lt::LtOperation>()
+    );
+    eprintln!(
+        "BranchOperation:  {} bytes",
+        size_of::<crate::tables::branch::BranchOperation>()
+    );
+    eprintln!(
+        "BitwiseOperation: {} bytes",
+        size_of::<crate::tables::bitwise::BitwiseOperation>()
+    );
+    eprintln!(
+        "ShiftOperation:   {} bytes",
+        size_of::<crate::tables::shift::ShiftOperation>()
+    );
 }
 
 /// Test prove+verify with a larger program (2M instructions).
@@ -86,13 +104,16 @@ fn test_disk_spill_serialization_roundtrip_chunked() {
     let elf_bytes = asm_elf_bytes("sub");
     let opts = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2)
         .expect("blowup=2 is always valid");
-    let proof =
-        crate::prove_with_options(&elf_bytes, &opts, &MaxRowsConfig::small()).expect("prove failed");
+    let proof = crate::prove_with_options(&elf_bytes, &opts, &MaxRowsConfig::small())
+        .expect("prove failed");
 
     let bytes = bincode::serialize(&proof).expect("serialize failed");
     eprintln!("Chunked proof serialized: {} bytes", bytes.len());
 
     let proof2: VmProof = bincode::deserialize(&bytes).expect("deserialize failed");
     let valid = crate::verify_with_options(&proof2, &elf_bytes, &opts).expect("verify failed");
-    assert!(valid, "verification failed after serialization roundtrip (chunked)");
+    assert!(
+        valid,
+        "verification failed after serialization roundtrip (chunked)"
+    );
 }

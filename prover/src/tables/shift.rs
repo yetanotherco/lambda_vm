@@ -3,17 +3,18 @@
 //! Constrains: `out = in <</>>/>>> (shift mod (32 * (2 - word_instr)))`.
 //!
 //! Two-phase design:
-//! 1. Intra-limb shift by `bit_shift = shift mod 16` using HWSL/HWSLC lookups.
+//! 1. Intra-limb shift by `bit_shift = shift mod 16` using paired HWSL lookups (returning [SLL, SLLC]).
 //! 2. Full-limb shift by `limb_shift` (unary encoding of `shift >> 4`).
 //!
-//! ## Columns (27 total)
+//! ## Columns (26 total)
 //! - Input: `in[0..3]` (DWordHL), `shift` (Byte), `direction` (Bit), `signed` (Bit), `word_instr` (Bit)
 //! - Output: `out[0..1]` (DWordWL)
-//! - Auxiliary: `is_negative`, `bit_shift`, `zbs`, `X[0..4]`, `Y[0..3]`, `limb_shift[0..3]`
+//! - Auxiliary: `is_negative`, `bit_shift`, `zbs`, `X[0..4]`, `Y[0..3]`, `limb_shift_raw[0..2]`
+//! - Virtual: `limb_shift[3] = 1 - limb_shift_raw[0] - limb_shift_raw[1] - limb_shift_raw[2]`
 //! - Multiplicity: `μ`
 //!
-//! ## Bus Interactions (15 total)
-//! - Senders: MSB16, AND_BYTE (×3), ZERO, HWSL (×5), HWSLC (×4)
+//! ## Bus Interactions (11 total)
+//! - Senders: MSB16, AND_BYTE (×3), ZERO, HWSL (×5)
 //! - Receiver: SHIFT (from CPU)
 
 use math::field::element::FieldElement;
@@ -65,22 +66,22 @@ pub mod cols {
     pub const Y_2: usize = 20;
     pub const Y_3: usize = 21;
 
-    // limb_shift[0..3]: one-hot encoding of full-limb shift amount
-    pub const LIMB_SHIFT_0: usize = 22;
-    pub const LIMB_SHIFT_1: usize = 23;
-    pub const LIMB_SHIFT_2: usize = 24;
-    pub const LIMB_SHIFT_3: usize = 25;
+    // limb_shift_raw[0..2]: first 3 values of the one-hot limb_shift encoding.
+    // limb_shift[3] is virtual: 1 - limb_shift_raw[0] - limb_shift_raw[1] - limb_shift_raw[2]
+    pub const LIMB_SHIFT_RAW_0: usize = 22;
+    pub const LIMB_SHIFT_RAW_1: usize = 23;
+    pub const LIMB_SHIFT_RAW_2: usize = 24;
 
     // Multiplicity
-    pub const MU: usize = 26;
+    pub const MU: usize = 25;
 
-    pub const NUM_COLUMNS: usize = 27;
+    pub const NUM_COLUMNS: usize = 26;
 
     // Helpers for iteration
     pub const IN: [usize; 4] = [IN_0, IN_1, IN_2, IN_3];
     pub const X: [usize; 5] = [X_0, X_1, X_2, X_3, X_4];
     pub const Y: [usize; 4] = [Y_0, Y_1, Y_2, Y_3];
-    pub const LIMB_SHIFT: [usize; 4] = [LIMB_SHIFT_0, LIMB_SHIFT_1, LIMB_SHIFT_2, LIMB_SHIFT_3];
+    pub const LIMB_SHIFT_RAW: [usize; 3] = [LIMB_SHIFT_RAW_0, LIMB_SHIFT_RAW_1, LIMB_SHIFT_RAW_2];
 }
 
 // =========================================================================
@@ -127,7 +128,8 @@ impl ShiftOperation {
         }
     }
 
-    /// Compute HWSLC: halfword >> (16 - z)
+    /// Compute the carry output of HWSL: halfword >> (16 - z)
+    /// This is the second element of the HWSL pair [SLL, SLLC].
     fn hwslc(halfword: u16, z: u8) -> u16 {
         if z == 0 {
             0
@@ -344,9 +346,10 @@ pub fn generate_shift_trace(
         for i in 0..4 {
             data[base + cols::Y[i]] = FE::from(aux.y[i] as u64);
         }
-        for i in 0..4 {
-            data[base + cols::LIMB_SHIFT[i]] = FE::from(aux.limb_shift[i] as u64);
+        for i in 0..3 {
+            data[base + cols::LIMB_SHIFT_RAW[i]] = FE::from(aux.limb_shift[i] as u64);
         }
+        // limb_shift[3] is virtual: not stored in the trace
 
         // μ = 1 for all active rows (Bit)
         data[base + cols::MU] = FE::one();
@@ -369,7 +372,7 @@ pub fn generate_shift_trace(
 
 /// Creates all bus interactions for the SHIFT table.
 pub fn bus_interactions() -> Vec<BusInteraction> {
-    let mut interactions = Vec::with_capacity(15);
+    let mut interactions = Vec::with_capacity(11);
 
     // SHIFT-C14: MSB16[in[3]] → is_negative | signed
     interactions.push(BusInteraction::sender(
@@ -391,16 +394,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // SHIFT-C1: AND_BYTE[shift, 15] → bit_shift | left (= μ - direction)
     interactions.push(BusInteraction::sender(
         BusId::AndByte,
-        Multiplicity::Linear(vec![
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::MU,
-            },
-            LinearTerm::Column {
-                coefficient: -1,
-                column: cols::DIRECTION,
-            },
-        ]),
+        Multiplicity::Diff(cols::MU, cols::DIRECTION),
         vec![
             BusValue::Packed {
                 start_column: cols::SHIFT_AMOUNT,
@@ -460,15 +454,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // SHIFT-C4.i: HWSL[in[i], bit_shift] → X[i] for i∈[0,3] | 1 - zbs
-    // HWSL receiver: [x + 256*y (halfword), z (shift amount), SLL (result)]
-    let one_minus_zbs = Multiplicity::Linear(vec![
-        LinearTerm::Constant(1),
-        LinearTerm::Column {
-            coefficient: -1,
-            column: cols::ZBS,
-        },
-    ]);
+    // SHIFT-C4.i: HWSL[in[i], bit_shift] → [X[i], Y[i]] for i∈[0,3] | 1 - zbs
+    // HWSL receiver: [x + 256*y (halfword), z (shift amount), SLL, SLLC]
+    let one_minus_zbs = Multiplicity::Negated(cols::ZBS);
     for i in 0..4 {
         interactions.push(BusInteraction::sender(
             BusId::Hwsl,
@@ -486,12 +474,17 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     start_column: cols::X[i],
                     packing: Packing::Direct,
                 },
+                BusValue::Packed {
+                    start_column: cols::Y[i],
+                    packing: Packing::Direct,
+                },
             ],
         ));
     }
 
-    // SHIFT-C6: HWSL[extension, bit_shift] → X[4] | 1 - zbs
+    // SHIFT-C7: HWSL[extension, bit_shift] → [X[4], extension - X[4]] | 1 - zbs
     // extension = 65535 * is_negative (virtual)
+    // second output = extension - X[4] (the carry, expressed as a linear combination)
     interactions.push(BusInteraction::sender(
         BusId::Hwsl,
         one_minus_zbs.clone(),
@@ -508,30 +501,18 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::X_4,
                 packing: Packing::Direct,
             },
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 65535,
+                    column: cols::IS_NEGATIVE,
+                },
+                LinearTerm::Column {
+                    coefficient: -1,
+                    column: cols::X_4,
+                },
+            ]),
         ],
     ));
-
-    // SHIFT-C8.i: HWSLC[in[i], bit_shift] → Y[i] for i∈[0,3] | 1 - zbs
-    for i in 0..4 {
-        interactions.push(BusInteraction::sender(
-            BusId::Hwslc,
-            one_minus_zbs.clone(),
-            vec![
-                BusValue::Packed {
-                    start_column: cols::IN[i],
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::BIT_SHIFT,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::Y[i],
-                    packing: Packing::Direct,
-                },
-            ],
-        ));
-    }
 
     // SHIFT-C11: AND_BYTE[encoded_limb; shift, mask] | μ
     // encoded = (1 - ls[0]) + 15*ls[1] + 31*ls[2] + 47*ls[3]
@@ -554,23 +535,22 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 },
             ]),
             // result: encoded limb_shift
+            // = (1 - ls[0]) + 15*ls[1] + 31*ls[2] + 47*ls[3]
+            // substituting ls[3] = 1 - ls_raw[0] - ls_raw[1] - ls_raw[2]:
+            // = 48 - 48*ls_raw[0] - 32*ls_raw[1] - 16*ls_raw[2]
             BusValue::linear(vec![
-                LinearTerm::Constant(1),
+                LinearTerm::Constant(48),
                 LinearTerm::Column {
-                    coefficient: -1,
-                    column: cols::LIMB_SHIFT_0,
+                    coefficient: -48,
+                    column: cols::LIMB_SHIFT_RAW_0,
                 },
                 LinearTerm::Column {
-                    coefficient: 15,
-                    column: cols::LIMB_SHIFT_1,
+                    coefficient: -32,
+                    column: cols::LIMB_SHIFT_RAW_1,
                 },
                 LinearTerm::Column {
-                    coefficient: 31,
-                    column: cols::LIMB_SHIFT_2,
-                },
-                LinearTerm::Column {
-                    coefficient: 47,
-                    column: cols::LIMB_SHIFT_3,
+                    coefficient: -16,
+                    column: cols::LIMB_SHIFT_RAW_2,
                 },
             ]),
         ],
@@ -669,9 +649,17 @@ impl ShiftConstraint {
         // Get X, Y, limb_shift, in columns
         let get_x = |i: usize| step.get_main_evaluation_element(0, cols::X[i]).clone();
         let get_y = |i: usize| step.get_main_evaluation_element(0, cols::Y[i]).clone();
-        let get_ls = |i: usize| {
-            step.get_main_evaluation_element(0, cols::LIMB_SHIFT[i])
-                .clone()
+        let get_ls = |i: usize| -> FieldElement<F> {
+            if i < 3 {
+                step.get_main_evaluation_element(0, cols::LIMB_SHIFT_RAW[i])
+                    .clone()
+            } else {
+                // limb_shift[3] is virtual: 1 - ls_raw[0] - ls_raw[1] - ls_raw[2]
+                FieldElement::<F>::one()
+                    - step.get_main_evaluation_element(0, cols::LIMB_SHIFT_RAW[0])
+                    - step.get_main_evaluation_element(0, cols::LIMB_SHIFT_RAW[1])
+                    - step.get_main_evaluation_element(0, cols::LIMB_SHIFT_RAW[2])
+            }
         };
 
         // intra_limb_left[i]: X[0] for i=0, X[i]+Y[i-1] for i>0
@@ -757,9 +745,16 @@ impl ShiftConstraint {
             }
             ShiftConstraintKind::LimbShiftIsBit(i) => {
                 // limb_shift[i] * (1 - limb_shift[i]) = 0
-                let ls = step
-                    .get_main_evaluation_element(0, cols::LIMB_SHIFT[i])
-                    .clone();
+                // limb_shift[3] is virtual: 1 - ls_raw[0] - ls_raw[1] - ls_raw[2]
+                let ls = if i < 3 {
+                    step.get_main_evaluation_element(0, cols::LIMB_SHIFT_RAW[i])
+                        .clone()
+                } else {
+                    one.clone()
+                        - step.get_main_evaluation_element(0, cols::LIMB_SHIFT_RAW[0])
+                        - step.get_main_evaluation_element(0, cols::LIMB_SHIFT_RAW[1])
+                        - step.get_main_evaluation_element(0, cols::LIMB_SHIFT_RAW[2])
+                };
                 &ls * (&one - &ls)
             }
             ShiftConstraintKind::OutputMatchesShifted(i) => {
@@ -866,7 +861,7 @@ use super::bitwise::{BitwiseOperation, BitwiseOperationType};
 
 /// Collect BITWISE table lookups needed by a set of unique shift operations.
 ///
-/// Each unique operation (with its multiplicity) generates HWSL/HWSLC/AND_BYTE/MSB16/ZERO
+/// Each unique operation (with its multiplicity) generates HWSL/AND_BYTE/MSB16/ZERO
 /// lookups. The lookups must be generated per-unique-operation (matching the SHIFT table's
 /// deduplication and μ column), and repeated `multiplicity` times.
 pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseOperation> {
@@ -912,7 +907,9 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
         // C3: ZERO[bit_shift] | μ (= 1)
         bitwise_ops.push(BitwiseOperation::zero(aux.bit_shift as u32));
 
-        // C4.i + C6 + C8.i: HWSL/HWSLC lookups | 1-zbs
+        // C4.i + C7: HWSL paired lookups | 1-zbs
+        // Each HWSL lookup returns [SLL, SLLC], constraining both X[i] and Y[i]
+        // from the same input in a single bus interaction.
         if !aux.zbs {
             for i in 0..4 {
                 let x = (op.in_halves[i] & 0xFF) as u8;
@@ -924,7 +921,7 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
                     aux.bit_shift,
                 ));
             }
-            // C6: HWSL[extension, bit_shift]
+            // C7: HWSL[extension, bit_shift] → [X[4], extension - X[4]]
             let extension: u16 = if aux.is_negative { 0xFFFF } else { 0 };
             let ext_x = (extension & 0xFF) as u8;
             let ext_y = (extension >> 8) as u8;
@@ -934,18 +931,6 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
                 ext_y,
                 aux.bit_shift,
             ));
-
-            // C8.i: HWSLC lookups | 1-zbs
-            for i in 0..4 {
-                let x = (op.in_halves[i] & 0xFF) as u8;
-                let y = (op.in_halves[i] >> 8) as u8;
-                bitwise_ops.push(BitwiseOperation::shift_op(
-                    BitwiseOperationType::Hwslc,
-                    x,
-                    y,
-                    aux.bit_shift,
-                ));
-            }
         }
 
         // C11: AND_BYTE[shift, mask] | μ (= 1)
