@@ -876,19 +876,22 @@ fn collect_bitwise_from_memw_aligned(ops: &[MemwOperation]) -> Vec<BitwiseOperat
     let mut bitwise_ops = Vec::with_capacity(ops.len());
 
     for op in ops {
-        let low_0 = (op.base_address & 0xFF) as u8;
-        let mask: u8 = match op.width {
+        let low_half = (op.base_address & 0xFFFF) as u16;
+        let mask: u16 = match op.width {
             2 => 1,
             4 => 3,
             8 => 7,
             _ => 0,
         };
 
-        // AND_BYTE[low_0, mask] → expects result 0
-        bitwise_ops.push(BitwiseOperation::byte_op(
-            BitwiseOperationType::AndByte,
-            low_0,
-            mask,
+        // IS_HALF[base_address[0] + mask]
+        let value = low_half + mask;
+        let x = (value & 0xFF) as u8;
+        let y = ((value >> 8) & 0xFF) as u8;
+        bitwise_ops.push(BitwiseOperation::halfword(
+            BitwiseOperationType::IsHalf,
+            x,
+            y,
         ));
     }
 
