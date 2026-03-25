@@ -70,6 +70,9 @@ where
     pub rap_challenges: Vec<FieldElement<FieldExtension>>,
     /// The seed used to verify the proof-of-work nonce.
     pub grinding_seed: [u8; 32],
+    /// Log2 of the FRI folding arity per committed round.
+    /// 1 = standard arity-2, 2 = arity-4, 3 = arity-8.
+    pub fri_log_arity: usize,
 }
 
 pub type DeepPolynomialEvaluations<F> = (Vec<FieldElement<F>>, Vec<FieldElement<F>>);
@@ -240,6 +243,7 @@ pub trait IsStarkVerifier<
             iotas,
             rap_challenges,
             grinding_seed,
+            fri_log_arity: air.options().fri_log_arity as usize,
         }
     }
 
@@ -400,6 +404,8 @@ pub trait IsStarkVerifier<
             .collect::<Vec<FieldElement<Field>>>();
         FieldElement::inplace_batch_inverse(&mut evaluation_point_inverse).unwrap();
 
+        let log_arity = challenges.fri_log_arity;
+
         proof
             .query_list
             .iter()
@@ -415,6 +421,8 @@ pub trait IsStarkVerifier<
                     eval,
                     &deep_poly_evaluations[i],
                     &deep_poly_evaluations_sym[i],
+                    log_arity,
+                    domain,
                 );
                 result
             })
@@ -586,39 +594,22 @@ pub trait IsStarkVerifier<
         )
     }
 
-    /// Verifies the openings of a fold polynomial of an inner layer of FRI.
-    fn verify_fri_layer_openings(
-        merkle_root: &Commitment,
-        auth_path_sym: &Proof<Commitment>,
-        evaluation: &FieldElement<FieldExtension>,
-        evaluation_sym: &FieldElement<FieldExtension>,
-        iota: usize,
-    ) -> bool
-    where
-        FieldElement<Field>: AsBytes + Sync + Send,
-        FieldElement<FieldExtension>: AsBytes + Sync + Send,
-    {
-        let evaluations = if iota % 2 == 1 {
-            vec![evaluation_sym.clone(), evaluation.clone()]
-        } else {
-            vec![evaluation.clone(), evaluation_sym.clone()]
-        };
-
-        auth_path_sym.verify::<BatchedMerkleTreeBackend<FieldExtension>>(
-            merkle_root,
-            iota >> 1,
-            &evaluations,
-        )
-    }
-
-    /// Verify a single FRI query
+    /// Verify a single FRI query with variable-arity folding.
+    ///
+    /// The initial fold from DEEP composition is always arity-2 (combining `p₀(𝜐)` and `p₀(-𝜐)`).
+    /// Each subsequent committed FRI layer folds `2^log_arity` evaluations down to 1 using
+    /// `log_arity` sequential binary folds with squaring challenges.
+    ///
     /// `zetas`: the vector of all challenges sent by the verifier to the prover at the commit
-    /// phase to fold polynomials.
-    /// `iota`: the index challenge of this FRI query. This index uniquely determines two elements 𝜐 and -𝜐
-    /// of the evaluation domain of FRI layer 0.
+    /// phase to fold polynomials. `zetas[0]` is used for the initial DEEP fold, and `zetas[i+1]`
+    /// is the base challenge for committed layer `i` (squared internally for sub-folds).
+    /// `iota`: the index challenge of this FRI query. This index uniquely determines two elements
+    /// 𝜐 and -𝜐 of the evaluation domain of FRI layer 0.
     /// `evaluation_point_inv`: precomputed value of 𝜐⁻¹.
-    /// `deep_composition_evaluation`: precomputed value of p₀(𝜐), where p₀ is the deep composition polynomial.
-    /// `deep_composition_evaluation_sym`: precomputed value of p₀(-𝜐), where p₀ is the deep composition polynomial.
+    /// `deep_composition_evaluation`: precomputed value of p₀(𝜐).
+    /// `deep_composition_evaluation_sym`: precomputed value of p₀(-𝜐).
+    /// `log_arity`: log2 of the folding arity per committed round (1=arity-2, 2=arity-4, etc.)
+    /// `domain`: verifier domain for computing twiddle factors on-the-fly.
     fn verify_query_and_sym_openings(
         proof: &StarkProof<Field, FieldExtension, PI>,
         zetas: &[FieldElement<FieldExtension>],
@@ -627,79 +618,158 @@ pub trait IsStarkVerifier<
         evaluation_point_inv: FieldElement<Field>,
         deep_composition_evaluation: &FieldElement<FieldExtension>,
         deep_composition_evaluation_sym: &FieldElement<FieldExtension>,
+        log_arity: usize,
+        domain: &VerifierDomain<Field>,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
         let fri_layers_merkle_roots = &proof.fri_layers_merkle_roots;
-        let evaluation_point_vec: Vec<FieldElement<Field>> =
-            core::iter::successors(Some(evaluation_point_inv.square()), |evaluation_point| {
-                Some(evaluation_point.square())
-            })
-            .take(fri_layers_merkle_roots.len())
-            .collect();
+        let group_size = 1usize << log_arity;
 
         let p0_eval = deep_composition_evaluation;
         let p0_eval_sym = deep_composition_evaluation_sym;
 
-        // Reconstruct p₁(𝜐²)
+        // Initial fold: always arity-2 from DEEP composition.
+        // Reconstruct p₁(𝜐²) = (p₀(𝜐) + p₀(-𝜐)) + 𝜐⁻¹ · ζ₀ · (p₀(𝜐) - p₀(-𝜐))
         let mut v =
             (p0_eval + p0_eval_sym) + evaluation_point_inv * &zetas[0] * (p0_eval - p0_eval_sym);
         let mut index = iota;
 
         // Handle case with 0 FRI layers (trace_length <= 2)
-        // In this case, the fold loop below doesn't iterate, so we need to verify
-        // the final value directly here.
         if fri_layers_merkle_roots.is_empty() {
-            return v == proof.fri_final_poly[0];
+            return v == proof.fri_final_poly[index];
         }
 
-        // For each FRI layer, starting from the layer 1: use the proof to verify the validity of values pᵢ(−𝜐^(2ⁱ)) (given by the prover) and
-        // pᵢ(𝜐^(2ⁱ)) (computed on the previous iteration by the verifier). Then use them to obtain pᵢ₊₁(𝜐^(2ⁱ⁺¹)).
-        // Finally, check that the final value coincides with the given by the prover.
-        fri_layers_merkle_roots
-            .iter()
-            .enumerate()
-            .zip(&fri_decommitment.layers_auth_paths)
-            .zip(&fri_decommitment.layers_evaluations_sym)
-            .zip(evaluation_point_vec)
-            .fold(
-                true,
-                |result,
-                 (
-                    (((i, merkle_root), auth_path_sym), evaluation_sym_vec),
-                    evaluation_point_inv,
-                )| {
-                    // For arity-2 FRI each inner Vec has exactly one element.
-                    let evaluation_sym = &evaluation_sym_vec[0];
-                    // Verify opening Open(pᵢ(Dₖ), −𝜐^(2ⁱ)) and Open(pᵢ(Dₖ), 𝜐^(2ⁱ)).
-                    // `v` is pᵢ(𝜐^(2ⁱ)).
-                    // `evaluation_sym` is pᵢ(−𝜐^(2ⁱ)).
-                    let openings_ok = Self::verify_fri_layer_openings(
-                        merkle_root,
-                        auth_path_sym,
-                        &v,
-                        evaluation_sym,
-                        index,
-                    );
+        // Track the FRI domain for twiddle computation.
+        // After the initial arity-2 fold, the domain halves and the coset offset squares.
+        let mut current_domain_log_size = (domain.lde_length as u64).trailing_zeros() as u64 - 1;
+        let mut current_coset_offset = domain.coset_offset.square();
 
-                    // Update `v` with next value pᵢ₊₁(𝜐^(2ⁱ⁺¹)).
-                    v = (&v + evaluation_sym) + evaluation_point_inv * &zetas[i + 1] * (&v - evaluation_sym);
+        let mut result = true;
 
-                    // Update index for next iteration. The index of the squares in the next layer
-                    // is obtained by halving the current index. This is due to the bit-reverse
-                    // ordering of the elements in the Merkle tree.
-                    index >>= 1;
+        for (layer_idx, merkle_root) in fri_layers_merkle_roots.iter().enumerate() {
+            let siblings = &fri_decommitment.layers_evaluations_sym[layer_idx];
+            let auth_path = &fri_decommitment.layers_auth_paths[layer_idx];
 
-                    if i < fri_decommitment.layers_evaluations_sym.len() - 1 {
-                        result & openings_ok
-                    } else {
-                        // Check that final value is the given by the prover
-                        result & (v == proof.fri_final_poly[0]) & openings_ok
-                    }
-                },
-            )
+            // Reconstruct the full group: place `v` at position `index % group_size`,
+            // insert siblings at other positions.
+            let position_in_group = index % group_size;
+            let leaf_index = index / group_size;
+            let mut group: Vec<FieldElement<FieldExtension>> = Vec::with_capacity(group_size);
+            let mut sib_idx = 0;
+            for k in 0..group_size {
+                if k == position_in_group {
+                    group.push(v.clone());
+                } else {
+                    group.push(siblings[sib_idx].clone());
+                    sib_idx += 1;
+                }
+            }
+
+            // Verify Merkle opening for the full group at leaf_index.
+            result &= auth_path.verify::<BatchedMerkleTreeBackend<FieldExtension>>(
+                merkle_root,
+                leaf_index,
+                &group,
+            );
+
+            // Fold the group through log_arity sequential binary folds.
+            // The base challenge for this layer is zetas[layer_idx + 1].
+            v = Self::fold_group_verifier(
+                &group,
+                &zetas[layer_idx + 1],
+                log_arity,
+                current_domain_log_size,
+                leaf_index,
+                &current_coset_offset,
+            );
+
+            // Advance domain state: log_arity binary folds square the offset that many times.
+            index = leaf_index;
+            for _ in 0..log_arity {
+                current_domain_log_size -= 1;
+                current_coset_offset = current_coset_offset.square();
+            }
+        }
+
+        // Check that the final value matches the final polynomial at the residual index.
+        result &= v == proof.fri_final_poly[index];
+
+        result
+    }
+
+    /// Fold a group of `2^log_arity` evaluations (in bit-reversed order) down to a single
+    /// value using `log_arity` sequential binary folds with squaring challenges.
+    ///
+    /// This mirrors the prover's `fold_evaluations_in_place` but operates on a single
+    /// group rather than the full evaluation array. Twiddle factors are computed on-the-fly
+    /// from the domain parameters (negligible cost for the verifier).
+    ///
+    /// At each sub-fold level, pairs `(values[2j], values[2j+1])` are folded using:
+    ///   result_j = (lo + hi) + inv_twiddle_j · challenge · (lo - hi)
+    /// where `inv_twiddle_j` is the inverse of the coset point corresponding to position
+    /// `2j` in the current sub-domain.
+    fn fold_group_verifier(
+        group: &[FieldElement<FieldExtension>],
+        zeta_base: &FieldElement<FieldExtension>,
+        log_arity: usize,
+        domain_log_size: u64,
+        mut leaf_index: usize,
+        coset_offset: &FieldElement<Field>,
+    ) -> FieldElement<FieldExtension>
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    {
+        let mut values = group.to_vec();
+        let mut challenge = zeta_base.clone();
+        let mut current_domain_log = domain_log_size;
+        let mut current_offset = coset_offset.clone();
+
+        for _sub_fold in 0..log_arity {
+            let half = values.len() / 2;
+            let current_domain_size = 1u64 << current_domain_log;
+            let half_domain_order = current_domain_log; // = log2(current_domain_size)
+
+            // Get the primitive root for the current domain (Nth root of unity).
+            let omega = Field::get_primitive_root_of_unity(half_domain_order).unwrap();
+
+            // Compute inverse twiddles for this sub-fold level.
+            // The inv_twiddles correspond to pairs at global positions
+            // (leaf_index * values.len() + 2*j) in the full evaluation array.
+            // Each twiddle is 1/(coset_offset * omega^(bit_reverse(global_pair_idx, log(N/2))))
+            // where global_pair_idx = leaf_index * half + j.
+            let mut inv_twiddles: Vec<FieldElement<Field>> = Vec::with_capacity(half);
+            let half_log_bits = (current_domain_size / 2) as u64;
+            for j in 0..half {
+                let global_pair_idx = leaf_index * half + j;
+                let natural_idx = reverse_index(global_pair_idx, half_log_bits);
+                let twiddle = &current_offset * omega.pow(natural_idx as u64);
+                inv_twiddles.push(twiddle);
+            }
+            FieldElement::inplace_batch_inverse(&mut inv_twiddles).unwrap();
+
+            // Apply binary fold for each pair.
+            let mut folded: Vec<FieldElement<FieldExtension>> = Vec::with_capacity(half);
+            for j in 0..half {
+                let lo = &values[2 * j];
+                let hi = &values[2 * j + 1];
+                let sum = lo + hi;
+                let diff = lo - hi;
+                folded.push(&sum + &inv_twiddles[j] * &(&challenge * &diff));
+            }
+
+            values = folded;
+            challenge = challenge.square();
+            current_domain_log -= 1;
+            current_offset = current_offset.square();
+            leaf_index >>= 1;
+        }
+
+        debug_assert_eq!(values.len(), 1);
+        values.into_iter().next().unwrap()
     }
 
     fn reconstruct_deep_composition_poly_evaluations_for_all_queries(
@@ -1182,6 +1252,7 @@ pub trait IsStarkVerifier<
             iotas,
             rap_challenges,
             grinding_seed,
+            fri_log_arity: air.options().fri_log_arity as usize,
         }
     }
 
