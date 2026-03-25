@@ -267,7 +267,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     vec![
         // 1. Receive ECALL from CPU (mult = first)
         // Payload: [timestamp_lo, timestamp_hi, syscall_lo32, syscall_hi32]
-        // Hardcoded syscall number = 3 (Commit). Bus matching enforces CPU's rv1 == 3.
+        // Hardcoded syscall number = 64 (Commit). Bus matching enforces CPU's rv1 == 64.
         BusInteraction::receiver(
             BusId::EcallCommit,
             Multiplicity::Column(cols::FIRST),
@@ -280,8 +280,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     start_column: cols::TIMESTAMP_1,
                     packing: Packing::Direct,
                 },
-                BusValue::constant(3), // syscall number lo32 = Commit (3)
-                BusValue::constant(0), // syscall number hi32 = 0
+                BusValue::constant(64), // syscall number lo32 = Commit (64)
+                BusValue::constant(0),  // syscall number hi32 = 0
             ],
         ),
         // 2. Send to CommitNextByte (mult = mu - end)

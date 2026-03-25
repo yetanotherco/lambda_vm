@@ -1418,6 +1418,38 @@ fn expand_keccak_operations(cpu_ops: &[CpuOperation], elf: &Elf) -> Vec<KeccakOp
     expand_keccak_operations_from_state(cpu_ops, &initial_memory_state)
 }
 
+/// Collect IsByte lookups for keccak preimage and output bytes.
+///
+/// The keccak AIR sends IsByte for each of the 200 preimage bytes (on `first`)
+/// and 200 output bytes (on `export`). The bitwise table must account for these
+/// in its MU_IS_BYTE multiplicity column.
+fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec<BitwiseOperation> {
+    let mut ops = Vec::with_capacity(keccak_ops.len() * 400);
+    for op in keccak_ops {
+        // 200 preimage bytes (25 lanes × 8 bytes)
+        for lane in &op.input {
+            for byte_idx in 0..8u32 {
+                let byte_val = (lane >> (byte_idx * 8)) & 0xFF;
+                ops.push(BitwiseOperation::single_byte(
+                    BitwiseOperationType::IsByte,
+                    byte_val as u8,
+                ));
+            }
+        }
+        // 200 output bytes (25 lanes × 8 bytes)
+        for lane in &op.output {
+            for byte_idx in 0..8u32 {
+                let byte_val = (lane >> (byte_idx * 8)) & 0xFF;
+                ops.push(BitwiseOperation::single_byte(
+                    BitwiseOperationType::IsByte,
+                    byte_val as u8,
+                ));
+            }
+        }
+    }
+    ops
+}
+
 /// Collect bitwise lookups from COMMIT operations.
 ///
 /// The COMMIT table sends:
@@ -1867,6 +1899,8 @@ impl Traces {
 
         // Expand Keccak ECALL operations
         let keccak_ops = expand_keccak_operations(&cpu_ops, elf);
+        // KECCAK table sends IsByte for preimage and output bytes
+        bitwise_ops.extend(collect_bitwise_from_keccak(&keccak_ops));
 
         // CPU padding rows send IS_BYTE with all-zero values.
         // Add corresponding ops so the bitwise table multiplicities balance.
@@ -2089,6 +2123,10 @@ impl Traces {
         // COMMIT table sends IsByte and IsHalfword lookups
         bitwise_ops.extend(collect_bitwise_from_commit(&commit_ops));
 
+        // KECCAK table sends IsByte for preimage and output bytes
+        let keccak_ops = expand_keccak_operations_from_state(&cpu_ops, &MemoryState::new());
+        bitwise_ops.extend(collect_bitwise_from_keccak(&keccak_ops));
+
         // CPU padding rows send IS_BYTE with all-zero values.
         let num_padding_rows: usize = cpu_ops
             .chunks(max_rows.cpu)
@@ -2136,7 +2174,6 @@ impl Traces {
         let register_final_state = register_state.to_final_state_map();
 
         let commit_trace = commit::generate_commit_trace(&commit_ops);
-        let keccak_ops = expand_keccak_operations_from_state(&cpu_ops, &MemoryState::new());
         let keccak_trace = keccak::generate_keccak_trace(&keccak_ops);
 
         // Generate remaining traces in parallel (register, halt).

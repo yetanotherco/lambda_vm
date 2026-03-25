@@ -330,15 +330,15 @@ fn test_bus_interactions_count() {
     // - 1 BRANCH (branch/jump target calculation)
     // - 1 ECALL → HALT (send to HALT table, mult = ECALL - ECALL_COMMIT)
     // - 1 ECALL → COMMIT (send to COMMIT table, mult = ECALL_COMMIT)
+    // - 1 ECALL → KECCAK (send to KECCAK table, mult = ECALL_KECCAK)
     // - 27 IS_BYTE (byte range checks: RS1, RS2, RD, ARG1[0..7], ARG2[0..7], RES[0..7])
-    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 1 + 5 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 27 = 69
-    // Note: ECALL → KECCAK interaction not yet implemented (pending MEMW bus integration)
-    assert_eq!(interactions.len(), 69);
+    // Total: 8 + 8 + 8 + 2 + 1 + 1 + 1 + 1 + 5 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 27 = 70
+    assert_eq!(interactions.len(), 70);
 }
 
 #[test]
 fn test_column_count() {
-    assert_eq!(cols::NUM_COLUMNS, 76);
+    assert_eq!(cols::NUM_COLUMNS, 78);
 }
 
 #[test]

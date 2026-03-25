@@ -237,8 +237,14 @@ pub mod cols {
     /// branch_cond: Whether branch is taken
     pub const BRANCH_COND: usize = 75;
 
+    /// Keccak state address (DWordWL: lo32 and hi32).
+    /// Non-zero only for KeccakPermute ECALLs. Carried in the EcallKeccak bus
+    /// to directly bind the CPU's ECALL to the keccak chip's memory region.
+    pub const KECCAK_STATE_ADDR_0: usize = 76;
+    pub const KECCAK_STATE_ADDR_1: usize = 77;
+
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 76;
+    pub const NUM_COLUMNS: usize = 78;
 
     // -------------------------------------------------------------------------
     // Helper ranges for iteration
@@ -816,6 +822,10 @@ pub fn generate_cpu_trace(
         data[base + cols::ECALL] = FE::from(d.op_ecall as u64);
         data[base + cols::ECALL_COMMIT] = FE::from(op.ecall_commit as u64);
         data[base + cols::ECALL_KECCAK] = FE::from(op.ecall_keccak as u64);
+        data[base + cols::KECCAK_STATE_ADDR_0] =
+            FE::from(op.keccak_state_addr & 0xFFFF_FFFF);
+        data[base + cols::KECCAK_STATE_ADDR_1] =
+            FE::from(op.keccak_state_addr >> 32);
         data[base + cols::EBREAK] = FE::from(d.op_ebreak as u64);
 
         // Output columns
@@ -2087,7 +2097,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // -------------------------------------------------------------------------
     // Sends to the KECCAK table only for KeccakPermute ECALLs.
     // Payload matches the KECCAK receiver:
-    // [timestamp_lo, timestamp_hi, syscall_lo32, syscall_hi32]
+    // [timestamp_lo, timestamp_hi, syscall_lo32, syscall_hi32, state_addr_lo32, state_addr_hi32]
+    //
+    // Including state_addr directly binds the CPU's keccak ECALL to the keccak
+    // chip's memory region, rather than relying solely on transitive enforcement
+    // through the MEMW bus chain.
     interactions.push(BusInteraction::sender(
         BusId::EcallKeccak,
         Multiplicity::Column(cols::ECALL_KECCAK),
@@ -2109,6 +2123,14 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             ]),
             BusValue::Packed {
                 start_column: cols::RV1_2,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::KECCAK_STATE_ADDR_0,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::KECCAK_STATE_ADDR_1,
                 packing: Packing::Direct,
             },
         ],

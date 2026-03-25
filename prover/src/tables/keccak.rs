@@ -1,6 +1,6 @@
 //! Keccak-f[1600] permutation chip.
 //!
-//! A single wide table (2,638 columns) that proves Keccak-f[1600] permutations.
+//! A single wide table (3,139 columns) that proves Keccak-f[1600] permutations.
 //! Each permutation uses 24 rows (one per round). All intermediate values are
 //! stored as columns and verified via purely polynomial constraints — no lookups.
 //!
@@ -961,11 +961,17 @@ pub fn create_constraints(
 /// - `EcallKeccak` receiver on the first row of each real permutation.
 /// - 25 `Memw` reads on `first`, binding the preimage to memory at `timestamp`.
 /// - 25 `Memw` writes on `export`, binding the final state to memory at `timestamp + 1`.
+/// - `IsByte` range checks on preimage bytes (on `first`) and output bytes (on `export`).
 pub fn bus_interactions() -> Vec<BusInteraction> {
-    let mut interactions = Vec::with_capacity(51);
+    // 1 EcallKeccak + 25 Memw reads + 25 Memw writes + 200 IsByte preimage + 200 IsByte output
+    let mut interactions = Vec::with_capacity(451);
     let syscall_lo = KECCAK_SYSCALL_NUMBER & 0xFFFF_FFFF;
     let syscall_hi = KECCAK_SYSCALL_NUMBER >> 32;
 
+    // EcallKeccak receiver: binds (timestamp, syscall_number, state_addr) from the CPU.
+    // Including state_addr provides a direct binding between the CPU's ECALL and the
+    // keccak permutation's memory region, rather than relying solely on transitive
+    // enforcement through the MEMW bus.
     interactions.push(BusInteraction::receiver(
         BusId::EcallKeccak,
         Multiplicity::Column(cols::FIRST),
@@ -980,8 +986,48 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             },
             BusValue::constant(syscall_lo),
             BusValue::constant(syscall_hi),
+            BusValue::Packed {
+                start_column: cols::STATE_ADDR_0,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::STATE_ADDR_1,
+                packing: Packing::Direct,
+            },
         ],
     ));
+
+    // -------------------------------------------------------------------------
+    // IsByte range checks — defense in depth
+    // -------------------------------------------------------------------------
+    // Byte columns are already transitively range-checked through the MEMW bus
+    // (MEMW table enforces IsByte on its VALUE columns). These explicit checks
+    // ensure keccak byte columns remain sound even if MEMW range checks are
+    // refactored in the future.
+
+    // Preimage bytes: range-checked on `first` (where they enter the MEMW bus)
+    for i in 0..200 {
+        interactions.push(BusInteraction::sender(
+            BusId::IsByte,
+            Multiplicity::Column(cols::FIRST),
+            vec![BusValue::Packed {
+                start_column: cols::PREIMAGE_BYTES + i,
+                packing: Packing::Direct,
+            }],
+        ));
+    }
+
+    // Output bytes: range-checked on `export` (where they enter the MEMW bus)
+    for i in 0..200 {
+        interactions.push(BusInteraction::sender(
+            BusId::IsByte,
+            Multiplicity::Column(cols::EXPORT),
+            vec![BusValue::Packed {
+                start_column: cols::OUTPUT_BYTES + i,
+                packing: Packing::Direct,
+            }],
+        ));
+    }
 
     for lane_idx in 0..25 {
         let x = lane_idx % 5;
