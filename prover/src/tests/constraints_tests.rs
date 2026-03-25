@@ -514,7 +514,7 @@ fn test_dword_bl_repack_formula() {
 
 use crate::constraints::cpu::{
     Arg1LowerConstraint, Arg1UpperConstraint, BIT_FLAG_COLUMNS, BranchCondConstraint,
-    EbreakConstraint, NUM_CPU_CONSTRAINTS, NextPcAddConstraint, SignBitZeroConstraint,
+    EbreakConstraint, NUM_CPU_CONSTRAINTS, NextPcAddConstraint, ExtBitZeroConstraint,
     create_add_constraints, create_all_cpu_constraints, create_is_bit_constraints,
     create_slt_res_zero_constraints,
 };
@@ -600,8 +600,8 @@ fn test_arg1_upper_constraint_degree() {
 }
 
 #[test]
-fn test_sign_bit_zero_constraint_degree() {
-    let c = SignBitZeroConstraint::new(0);
+fn test_ext_bit_zero_constraint_degree() {
+    let c = ExtBitZeroConstraint::new(0, cpu_cols::RV1_EXT_BIT);
     assert_eq!(c.degree(), 2);
 }
 
@@ -625,11 +625,11 @@ fn test_create_all_cpu_constraints() {
     assert_eq!(is_bit.len(), 32);
     // ADD constraints: 2 (ADD+LOAD) + 2 (STORE: arg1+imm) + 2 (SUB+BEQ) + 2 (JALR) = 8
     assert_eq!(add.len(), 8);
-    // Other: branch_cond(1) + ebreak(1) + rv1_zero_forcing(3) + rv2_zero_forcing(3) + arg1(2) + arg2(2) + rvd(2) + slt_zero(7) + sign_bit_zero(1) + next_pc(2) = 24
-    assert_eq!(other.len(), 24);
+    // Other: branch_cond(1) + ebreak(1) + rv1_zero_forcing(3) + rv2_zero_forcing(3) + arg1(2) + arg2(2) + rvd(2) + slt_zero(7) + ext_bit_zero(3) + next_pc(2) = 26
+    assert_eq!(other.len(), 26);
 
-    // Total should be 32 + 8 + 24 = 64
-    assert_eq!(total, 64);
+    // Total should be 32 + 8 + 26 = 66
+    assert_eq!(total, 66);
     assert_eq!(total, NUM_CPU_CONSTRAINTS);
 }
 

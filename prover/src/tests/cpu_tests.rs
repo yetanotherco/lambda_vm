@@ -301,8 +301,8 @@ fn test_trace_generation_sign_bits() {
     let trace = generate_cpu_trace(&ops);
     let row0 = trace.main_table.get_row(0);
 
-    assert_eq!(row0[cols::RV1_SIGN_BIT], FE::one());
-    assert_eq!(row0[cols::RES_SIGN_BIT], FE::one());
+    assert_eq!(row0[cols::RV1_EXT_BIT], FE::one());
+    assert_eq!(row0[cols::RES_EXT_BIT], FE::one());
 }
 
 #[test]

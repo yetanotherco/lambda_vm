@@ -25,7 +25,7 @@
 //! ### Auxiliary
 //! - `rv1`: DWordWHH (3 cols) - value of register rs1
 //! - `rv2`: DWordWHH (3 cols) - value of register rs2
-//! - `rv1_sign_bit`, `arg2_sign_bit`, `res_sign_bit`: Bit (for word instruction extension)
+//! - `rv1_ext_bit`, `rv2_ext_bit`, `res_ext_bit`: Bit (for word instruction extension)
 //! - `arg1`: DWordBL (8 cols) - extended rv1
 //! - `arg2`: DWordBL (8 cols) - multiplexed rv2/imm
 //! - `res`: DWordBL (8 cols) - ALU result
@@ -47,8 +47,7 @@
 //! - MUL: for multiplication
 //! - DIVREM: for division/remainder
 //! - MEMW: for register and memory access
-//! - MSB16: for sign bit extraction
-//! - MSB8: for 32-bit sign bit extraction
+//! - MSB16: for sign/extension bit extraction (rv1, rv2, res)
 //! - ZERO: for equality check
 //! - BRANCH: for branch target calculation
 //! - ECALL: for system calls
@@ -188,8 +187,8 @@ pub mod cols {
     /// rv2[2]: Register rs2 value (Word - bits 32-63) [DWordWHH]
     pub const RV2_2: usize = 44;
 
-    /// rv1_sign_bit: Sign bit of rv1 as 32-bit word (for word_instr extension)
-    pub const RV1_SIGN_BIT: usize = 45;
+    /// rv1_ext_bit: Sign bit of rv1 as 32-bit word (for word_instr sign extension)
+    pub const RV1_EXT_BIT: usize = 45;
 
     /// arg1[0..8]: Extended rv1 as DWordBL (8 bytes)
     pub const ARG1_0: usize = 46;
@@ -201,8 +200,8 @@ pub mod cols {
     pub const ARG1_6: usize = 52;
     pub const ARG1_7: usize = 53;
 
-    /// arg2_sign_bit: Sign bit of rv2 as 32-bit word (bit 31 of rv2; used to define arg2's extension)
-    pub const ARG2_SIGN_BIT: usize = 54;
+    /// rv2_ext_bit: Sign bit of rv2 as 32-bit word (bit 31 of rv2; used for arg2 sign extension)
+    pub const RV2_EXT_BIT: usize = 54;
 
     /// arg2[0..8]: Extended rv2/imm as DWordBL (8 bytes)
     pub const ARG2_0: usize = 55;
@@ -214,8 +213,8 @@ pub mod cols {
     pub const ARG2_6: usize = 61;
     pub const ARG2_7: usize = 62;
 
-    /// res_sign_bit: Sign bit of res as 32-bit word
-    pub const RES_SIGN_BIT: usize = 63;
+    /// res_ext_bit: Sign bit of res as 32-bit word (for rvd sign extension)
+    pub const RES_EXT_BIT: usize = 63;
 
     /// res[0..8]: ALU result as DWordBL (8 bytes)
     pub const RES_0: usize = 64;
@@ -346,7 +345,7 @@ impl CpuOperation {
 
     /// Compute arg1 from rv1 based on word_instr and signed flags.
     ///
-    /// Per spec constraint: arg1[4:] = rv1[2] * (1 - word_instr) + (2^32 - 1) * rv1_sign_bit * signed
+    /// Per spec constraint: arg1[4:] = rv1[2] * (1 - word_instr) + (2^32 - 1) * rv1_ext_bit * signed
     ///
     /// For 64-bit instructions: pass through full rv1
     /// For unsigned word instructions: zero-extend from 32 bits
@@ -369,7 +368,7 @@ impl CpuOperation {
     /// Compute arg2 following the spec formula exactly (CPU-CE62/CE63).
     ///
     /// arg2[:4] = (1-LOAD)*rv2[:2] + (1-BEQ-BLT-STORE)*imm[0]
-    /// arg2[4:] = (1-LOAD)*((1-word_instr)*rv2[2] + signed*arg2_sign_bit*(2^32-1))
+    /// arg2[4:] = (1-LOAD)*((1-word_instr)*rv2[2] + signed*rv2_ext_bit*(2^32-1))
     ///            + (1-BEQ-BLT-STORE)*imm[1]
     ///
     /// Per CPU-A2, the decode guarantees that at most one of rv2/imm is non-zero
@@ -411,7 +410,7 @@ impl CpuOperation {
     ///
     /// According to spec constraints:
     /// - rvd[0] = res[:4] (lower 32 bits of res)
-    /// - rvd[1] = (1 - word_instr) * res[4:] + res_sign_bit * (2^32 - 1)
+    /// - rvd[1] = (1 - word_instr) * res[4:] + res_ext_bit * (2^32 - 1)
     ///
     /// For LOAD: rvd comes from the executor (loaded value), not this method.
     /// For all other operations: rvd is computed from res with sign extension.
@@ -421,8 +420,8 @@ impl CpuOperation {
 
         if self.decode.word_instr {
             // Sign extend from 32 bits
-            let res_sign_bit = Self::sign_bit_32(res);
-            if res_sign_bit {
+            let res_ext_bit = Self::sign_bit_32(res);
+            if res_ext_bit {
                 // Upper 32 bits = 0xFFFF_FFFF (sign extension)
                 res_lo | (0xFFFF_FFFF_u64 << 32)
             } else {
@@ -555,7 +554,7 @@ impl CpuOperation {
                 hi,
             ));
 
-            // rv2[1] for arg2_sign_bit
+            // rv2[1] for rv2_ext_bit
             let rv2_half = ((self.rv2 >> 16) & 0xFFFF) as u16;
             let lo = (rv2_half & 0xFF) as u8;
             let hi = ((rv2_half >> 8) & 0xFF) as u8;
@@ -565,11 +564,12 @@ impl CpuOperation {
                 hi,
             ));
 
-            // res[3] for res_sign_bit (MSB8 on byte at bits 24-31)
-            let res_byte = ((self.res >> 24) & 0xFF) as u8;
-            lookups.push(BitwiseOperation::single_byte(
-                BitwiseOperationType::Msb8,
-                res_byte,
+            // res::DWordHL[1] for res_ext_bit (MSB16 on half at bits 16-31)
+            let res_half = ((self.res >> 16) & 0xFFFF) as u16;
+            lookups.push(BitwiseOperation::halfword(
+                BitwiseOperationType::Msb16,
+                (res_half & 0xFF) as u8,
+                (res_half >> 8) as u8,
             ));
         }
 
@@ -827,9 +827,9 @@ pub fn generate_cpu_trace(
         data[base + cols::RV2_2] = FE::from(op.rv2 >> 32); // bits 32-63 (Word)
 
         // Sign bits - only set when word_instr=1, per spec constraint ext_sign_bits
-        // The constraint enforces: (rv1_sign_bit + arg2_sign_bit + res_sign_bit) * (1 - word_instr) = 0
-        let rv1_sign_bit = d.word_instr && CpuOperation::sign_bit_32(op.rv1);
-        data[base + cols::RV1_SIGN_BIT] = FE::from(rv1_sign_bit as u64);
+        // The constraint enforces: (rv1_ext_bit + rv2_ext_bit + res_ext_bit) * (1 - word_instr) = 0
+        let rv1_ext_bit = d.word_instr && CpuOperation::sign_bit_32(op.rv1);
+        data[base + cols::RV1_EXT_BIT] = FE::from(rv1_ext_bit as u64);
 
         // Compute and store arg1 as DWordBL (8 bytes)
         let arg1 = op.compute_arg1();
@@ -839,16 +839,16 @@ pub fn generate_cpu_trace(
 
         // Compute and store arg2
         let arg2 = op.compute_arg2();
-        let arg2_sign_bit = d.word_instr && CpuOperation::sign_bit_32(op.rv2);
-        data[base + cols::ARG2_SIGN_BIT] = FE::from(arg2_sign_bit as u64);
+        let rv2_ext_bit = d.word_instr && CpuOperation::sign_bit_32(op.rv2);
+        data[base + cols::RV2_EXT_BIT] = FE::from(rv2_ext_bit as u64);
         for i in 0..8 {
             data[base + cols::ARG2[i]] = FE::from((arg2 >> (i * 8)) & 0xFF);
         }
 
         // Result - computed from arg1/arg2 for ADD/SUB to satisfy constraints
         let res = op.compute_res();
-        let res_sign_bit = d.word_instr && CpuOperation::sign_bit_32(res);
-        data[base + cols::RES_SIGN_BIT] = FE::from(res_sign_bit as u64);
+        let res_ext_bit = d.word_instr && CpuOperation::sign_bit_32(res);
+        data[base + cols::RES_EXT_BIT] = FE::from(res_ext_bit as u64);
         for i in 0..8 {
             data[base + cols::RES[i]] = FE::from((res >> (i * 8)) & 0xFF);
         }
@@ -1096,10 +1096,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     }
 
     // -------------------------------------------------------------------------
-    // MSB16 interactions for sign bit extraction
+    // SIGN template: MSB16 interactions for extension bit extraction
     // -------------------------------------------------------------------------
-    // MSB16[rv1[1]] -> rv1_sign_bit, multiplicity = word_instr
-    // rv1[1] is a Half (bits 16-31), containing the sign bit at position 31
+    // SIGN(rv1[1], word_instr) -> rv1_ext_bit
+    // rv1[1] is a Half (bits 16-31), MSB16 extracts bit 31
     interactions.push(BusInteraction::sender(
         BusId::Msb16,
         Multiplicity::Column(cols::WORD_INSTR),
@@ -1109,13 +1109,13 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 packing: Packing::Direct,
             },
             BusValue::Packed {
-                start_column: cols::RV1_SIGN_BIT,
+                start_column: cols::RV1_EXT_BIT,
                 packing: Packing::Direct,
             },
         ],
     ));
 
-    // MSB16[rv2[1]] -> arg2_sign_bit, multiplicity = word_instr
+    // SIGN(rv2[1], word_instr) -> rv2_ext_bit
     interactions.push(BusInteraction::sender(
         BusId::Msb16,
         Multiplicity::Column(cols::WORD_INSTR),
@@ -1125,27 +1125,33 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 packing: Packing::Direct,
             },
             BusValue::Packed {
-                start_column: cols::ARG2_SIGN_BIT,
+                start_column: cols::RV2_EXT_BIT,
                 packing: Packing::Direct,
             },
         ],
     ));
 
     // -------------------------------------------------------------------------
-    // MSB8 interaction for res sign bit extraction
+    // MSB16 interaction for res sign bit extraction
     // -------------------------------------------------------------------------
-    // MSB8[res[3]] -> res_sign_bit, multiplicity = word_instr
-    // res[3] is the byte at bits 24-31, containing the sign bit at position 31
+    // MSB16[res::DWordHL[1]] -> res_ext_bit, multiplicity = word_instr
+    // res::DWordHL[1] is the half at bits 16-31 = res[2] + 256*res[3]
     interactions.push(BusInteraction::sender(
-        BusId::Msb8,
+        BusId::Msb16,
         Multiplicity::Column(cols::WORD_INSTR),
         vec![
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::RES[2],
+                },
+                LinearTerm::Column {
+                    coefficient: 256,
+                    column: cols::RES[3],
+                },
+            ]),
             BusValue::Packed {
-                start_column: cols::RES[3],
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::RES_SIGN_BIT,
+                start_column: cols::RES_EXT_BIT,
                 packing: Packing::Direct,
             },
         ],
