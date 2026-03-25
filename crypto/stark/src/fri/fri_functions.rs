@@ -45,23 +45,35 @@ pub fn fold_polynomial_doubled_inplace<F>(
 
 /// Evaluation-form FRI fold: given evaluations in bit-reversed order where
 /// consecutive pairs (2j, 2j+1) are conjugates (p(x_j), p(-x_j)), compute
-/// the folded evaluations: (lo + hi) + inv_twiddle[j] * zeta * (lo - hi)
+/// the folded evaluations: (lo + hi) + (zeta * inv_twiddle[j]) * (lo - hi)
 /// = 2 * (p_even(x_j²) + zeta * p_odd(x_j²))
 ///
 /// After folding, the N/2 results are evaluations on the squared coset
 /// in bit-reversed order, preserving conjugate pairing for the next fold.
+///
+/// Optimization: precomputes `zeta * inv_twiddle[j]` (E×F multiply, cheap)
+/// once per twiddle, then the inner loop uses a single E×E multiply per
+/// element instead of two (E×E then F×E) in the unfused version.
 pub fn fold_evaluations_in_place<F: IsSubFieldOf<E>, E: IsField>(
     evals: &mut Vec<FieldElement<E>>,
     zeta: &FieldElement<E>,
     inv_twiddles: &[FieldElement<F>],
 ) {
     let half = evals.len() / 2;
+
+    // Precompute zeta * inv_twiddle[j] for all j.
+    // Each is an E×F multiply (3 base muls for cubic extension).
+    // This replaces a per-element E×E + F×E (9+3 = 12 base muls)
+    // with a per-element E×E (9 base muls) + a one-time N/2 × E×F (3 base muls).
+    let zeta_inv_tw: Vec<FieldElement<E>> =
+        inv_twiddles[..half].iter().map(|tw| tw * zeta).collect();
+
     for j in 0..half {
         let lo = &evals[2 * j];
         let hi = &evals[2 * j + 1];
         let sum = lo + hi;
         let diff = lo - hi;
-        evals[j] = &sum + &(&inv_twiddles[j] * &(zeta * &diff));
+        evals[j] = &sum + &(&zeta_inv_tw[j] * &diff);
     }
     evals.truncate(half);
 }
