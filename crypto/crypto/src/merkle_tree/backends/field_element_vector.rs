@@ -1,5 +1,6 @@
 use core::marker::PhantomData;
 
+use crate::hash::poseidon::Poseidon;
 use crate::merkle_tree::traits::IsMerkleTreeBackend;
 use alloc::vec::Vec;
 use digest::{Digest, Output};
@@ -98,6 +99,32 @@ where
         let mut result_hash = [0_u8; NUM_BYTES];
         result_hash.copy_from_slice(&hasher.finalize());
         result_hash
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct BatchPoseidonTree<P: Poseidon + Default> {
+    _poseidon: PhantomData<P>,
+}
+
+impl<P> IsMerkleTreeBackend for BatchPoseidonTree<P>
+where
+    P: Poseidon + Default,
+    Vec<FieldElement<P::F>>: Sync + Send,
+    FieldElement<P::F>: Sync + Send,
+{
+    type Node = FieldElement<P::F>;
+    type Data = Vec<FieldElement<P::F>>;
+
+    fn hash_data(input: &Vec<FieldElement<P::F>>) -> FieldElement<P::F> {
+        P::hash_many(input)
+    }
+
+    fn hash_new_parent(
+        left: &FieldElement<P::F>,
+        right: &FieldElement<P::F>,
+    ) -> FieldElement<P::F> {
+        P::hash(left, right)
     }
 }
 
