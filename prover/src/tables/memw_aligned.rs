@@ -280,21 +280,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // w2 multiplicity
-    let w2_mult = Multiplicity::Linear(vec![
-        LinearTerm::Column {
-            coefficient: 1,
-            column: cols::WRITE2,
-        },
-        LinearTerm::Column {
-            coefficient: 1,
-            column: cols::WRITE4,
-        },
-        LinearTerm::Column {
-            coefficient: 1,
-            column: cols::WRITE8,
-        },
-    ]);
+    // w2 multiplicity: write2 + write4 + write8
+    let w2_mult = Multiplicity::Sum3(cols::WRITE2, cols::WRITE4, cols::WRITE8);
 
     // CM18/19: byte 1 with w2
     // For aligned accesses, adding 1 to the low byte never overflows to hi word
