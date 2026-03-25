@@ -1,3 +1,6 @@
+#[cfg(all(feature = "disk-spill", feature = "wasm"))]
+compile_error!("disk-spill and wasm features are mutually exclusive");
+
 use crate::domain::Domain;
 use crate::table::Table;
 use itertools::Itertools;
@@ -150,6 +153,15 @@ where
         self.num_aux_columns = num_aux_columns;
     }
 
+    /// Spill the main trace data to disk via mmap.
+    /// After this call, `main_table.data` is freed but all accessors
+    /// (`get_main`, `columns_main`, `extract_columns_main_into`) continue
+    /// to work transparently through mmap.
+    #[cfg(feature = "disk-spill")]
+    pub fn spill_main_to_disk(&mut self) -> std::io::Result<()> {
+        self.main_table.spill_to_disk()
+    }
+
     pub fn compute_trace_polys_main<S>(&self) -> Vec<Polynomial<FieldElement<F>>>
     where
         S: IsFFTField + IsSubFieldOf<F>,
@@ -201,6 +213,35 @@ where
     pub(crate) aux_columns: Vec<Vec<FieldElement<E>>>,
     pub(crate) lde_step_size: usize,
     pub(crate) blowup_factor: usize,
+    /// When `disk-spill` is enabled and data has been spilled to disk,
+    /// this holds the mmap backing. Access methods read from here instead
+    /// of `main_columns`/`aux_columns` (which are empty after spill).
+    #[cfg(feature = "disk-spill")]
+    pub(crate) mmap_backing: Option<MmapBacking>,
+}
+
+/// File-backed mmap storage for LDE column data.
+///
+/// Columns are stored in separate files for main and aux (since they may be
+/// spilled at different times during Phase A and Phase B of proving).
+/// Each file has column-major layout:
+/// ```text
+/// [col_0][col_1]...[col_N]
+/// ```
+/// Each column occupies `num_rows * elem_size` contiguous bytes.
+/// Elements are stored as their native in-memory representation,
+/// which is valid because `FieldElement<F>` is `#[repr(transparent)]`.
+#[cfg(feature = "disk-spill")]
+pub(crate) struct MmapBacking {
+    main_mmap: memmap2::Mmap,
+    _main_file: std::fs::File,
+    aux_mmap: Option<memmap2::Mmap>,
+    _aux_file: Option<std::fs::File>,
+    num_rows: usize,
+    num_main_cols: usize,
+    num_aux_cols: usize,
+    main_elem_size: usize,
+    aux_elem_size: usize,
 }
 
 impl<F, E> LDETraceTable<F, E>
@@ -223,24 +264,39 @@ where
             aux_columns,
             lde_step_size,
             blowup_factor,
+            #[cfg(feature = "disk-spill")]
+            mmap_backing: None,
         }
     }
 
     /// Consume self and return the owned column vectors.
+    /// When mmap-backed (disk-spill), returns empty Vecs since columns were freed.
     #[allow(clippy::type_complexity)]
     pub fn into_columns(self) -> (Vec<Vec<FieldElement<F>>>, Vec<Vec<FieldElement<E>>>) {
         (self.main_columns, self.aux_columns)
     }
 
     pub fn num_main_cols(&self) -> usize {
+        #[cfg(feature = "disk-spill")]
+        if let Some(ref backing) = self.mmap_backing {
+            return backing.num_main_cols;
+        }
         self.main_columns.len()
     }
 
     pub fn num_aux_cols(&self) -> usize {
+        #[cfg(feature = "disk-spill")]
+        if let Some(ref backing) = self.mmap_backing {
+            return backing.num_aux_cols;
+        }
         self.aux_columns.len()
     }
 
     pub fn num_rows(&self) -> usize {
+        #[cfg(feature = "disk-spill")]
+        if let Some(ref backing) = self.mmap_backing {
+            return backing.num_rows;
+        }
         if self.main_columns.is_empty() {
             0
         } else {
@@ -251,21 +307,51 @@ where
     /// Get a single main-trace element by (row, col).
     #[inline]
     pub fn get_main(&self, row: usize, col: usize) -> &FieldElement<F> {
+        #[cfg(feature = "disk-spill")]
+        if let Some(ref backing) = self.mmap_backing {
+            debug_assert!(
+                row < backing.num_rows && col < backing.num_main_cols,
+                "get_main out of bounds: row={row}, col={col}, num_rows={}, num_main_cols={}",
+                backing.num_rows,
+                backing.num_main_cols
+            );
+            let offset = (col * backing.num_rows + row) * backing.main_elem_size;
+            // SAFETY: FieldElement<F> is #[repr(transparent)] over F::BaseType.
+            // The mmap is page-aligned and elements are contiguously packed at
+            // multiples of main_elem_size, so alignment is satisfied.
+            // The data was written from identical types on the same machine.
+            return unsafe { &*(backing.main_mmap.as_ptr().add(offset) as *const FieldElement<F>) };
+        }
         &self.main_columns[col][row]
     }
 
     /// Get a single aux-trace element by (row, col).
     #[inline]
     pub fn get_aux(&self, row: usize, col: usize) -> &FieldElement<E> {
+        #[cfg(feature = "disk-spill")]
+        if let Some(ref backing) = self.mmap_backing {
+            debug_assert!(
+                row < backing.num_rows && col < backing.num_aux_cols,
+                "get_aux out of bounds: row={row}, col={col}, num_rows={}, num_aux_cols={}",
+                backing.num_rows,
+                backing.num_aux_cols
+            );
+            let aux_mmap = backing
+                .aux_mmap
+                .as_ref()
+                .expect("aux mmap must exist when accessing aux columns");
+            let offset = (col * backing.num_rows + row) * backing.aux_elem_size;
+            // SAFETY: Same as get_main — repr(transparent) + page-aligned mmap.
+            return unsafe { &*(aux_mmap.as_ptr().add(offset) as *const FieldElement<E>) };
+        }
         &self.aux_columns[col][row]
     }
 
     /// Gather a full main-trace row into an owned Vec.
     /// Used by `open_trace_polys` (called ~30 times per table, allocation is negligible).
     pub fn gather_main_row(&self, row_idx: usize) -> Vec<FieldElement<F>> {
-        self.main_columns
-            .iter()
-            .map(|col| col[row_idx].clone())
+        (0..self.num_main_cols())
+            .map(|col| self.get_main(row_idx, col).clone())
             .collect()
     }
 
@@ -277,18 +363,65 @@ where
         col_start: usize,
         col_end: usize,
     ) -> Vec<FieldElement<F>> {
-        self.main_columns[col_start..col_end]
-            .iter()
-            .map(|col| col[row_idx].clone())
+        (col_start..col_end)
+            .map(|col| self.get_main(row_idx, col).clone())
             .collect()
     }
 
     /// Gather a full aux-trace row into an owned Vec.
     pub fn gather_aux_row(&self, row_idx: usize) -> Vec<FieldElement<E>> {
-        self.aux_columns
-            .iter()
-            .map(|col| col[row_idx].clone())
+        (0..self.num_aux_cols())
+            .map(|col| self.get_aux(row_idx, col).clone())
             .collect()
+    }
+
+    /// Read mmap-backed data back into heap Vecs for fast parallel access.
+    ///
+    /// When LDE data is on disk (mmap), parallel access causes page fault contention.
+    /// This method bulk-reads all columns into heap Vecs (sequential I/O), then drops
+    /// the mmap backing. After rehydration, `get_main`/`get_aux` read from RAM.
+    ///
+    /// No-op if data is already in memory (no mmap backing).
+    #[cfg(feature = "disk-spill")]
+    pub fn rehydrate(&mut self) {
+        let backing = match self.mmap_backing.take() {
+            Some(b) => b,
+            None => return,
+        };
+
+        // Read main columns from mmap into Vecs
+        let mut main_columns = Vec::with_capacity(backing.num_main_cols);
+        for col in 0..backing.num_main_cols {
+            let mut column = Vec::with_capacity(backing.num_rows);
+            let base_offset = col * backing.num_rows * backing.main_elem_size;
+            for row in 0..backing.num_rows {
+                let offset = base_offset + row * backing.main_elem_size;
+                let elem =
+                    unsafe { &*(backing.main_mmap.as_ptr().add(offset) as *const FieldElement<F>) };
+                column.push(elem.clone());
+            }
+            main_columns.push(column);
+        }
+        self.main_columns = main_columns;
+
+        // Read aux columns from mmap into Vecs
+        if let Some(ref aux_mmap) = backing.aux_mmap {
+            let mut aux_columns = Vec::with_capacity(backing.num_aux_cols);
+            for col in 0..backing.num_aux_cols {
+                let mut column = Vec::with_capacity(backing.num_rows);
+                let base_offset = col * backing.num_rows * backing.aux_elem_size;
+                for row in 0..backing.num_rows {
+                    let offset = base_offset + row * backing.aux_elem_size;
+                    let elem =
+                        unsafe { &*(aux_mmap.as_ptr().add(offset) as *const FieldElement<E>) };
+                    column.push(elem.clone());
+                }
+                aux_columns.push(column);
+            }
+            self.aux_columns = aux_columns;
+        }
+
+        // mmap backing dropped here — temp files closed
     }
 
     pub fn num_steps(&self) -> usize {
@@ -299,6 +432,121 @@ where
 
     pub fn step_to_row(&self, step: usize) -> usize {
         self.lde_step_size * step
+    }
+
+    /// Write pool column data to a temp file, mmap it, and return an mmap-backed
+    /// LDETraceTable. The pool buffers are NOT consumed — they keep their capacity
+    /// for reuse by the next chunk.
+    ///
+    /// This is used during Phase A to snapshot the main LDE columns from the pool
+    /// before the pool is overwritten by the next chunk.
+    #[cfg(feature = "disk-spill")]
+    pub fn spill_main_from_pool(
+        main_pool: &[Vec<FieldElement<F>>],
+        num_main_cols: usize,
+        trace_step_size: usize,
+        blowup_factor: usize,
+    ) -> std::io::Result<Self> {
+        let num_rows = if num_main_cols > 0 {
+            main_pool[0].len()
+        } else {
+            0
+        };
+
+        let main_elem_size = std::mem::size_of::<FieldElement<F>>();
+        let (main_mmap, main_file) =
+            Self::write_pool_columns_to_mmap(&main_pool[..num_main_cols], main_elem_size)?;
+
+        let lde_step_size = trace_step_size * blowup_factor;
+        let aux_elem_size = std::mem::size_of::<FieldElement<E>>();
+
+        Ok(Self {
+            main_columns: Vec::new(),
+            aux_columns: Vec::new(),
+            lde_step_size,
+            blowup_factor,
+            mmap_backing: Some(MmapBacking {
+                main_mmap,
+                _main_file: main_file,
+                aux_mmap: None,
+                _aux_file: None,
+                num_rows,
+                num_main_cols,
+                num_aux_cols: 0,
+                main_elem_size,
+                aux_elem_size,
+            }),
+        })
+    }
+
+    /// Add aux LDE columns from the pool to an already-spilled LDETraceTable.
+    ///
+    /// Used during Phase B to attach aux data to a table whose main LDE was
+    /// already spilled in Phase A.
+    #[cfg(feature = "disk-spill")]
+    pub fn add_aux_from_pool(
+        &mut self,
+        aux_pool: &[Vec<FieldElement<E>>],
+        num_aux_cols: usize,
+    ) -> std::io::Result<()> {
+        if num_aux_cols == 0 {
+            return Ok(());
+        }
+
+        let aux_elem_size = std::mem::size_of::<FieldElement<E>>();
+        let (aux_mmap, aux_file) =
+            Self::write_pool_columns_to_mmap(&aux_pool[..num_aux_cols], aux_elem_size)?;
+
+        let backing = self
+            .mmap_backing
+            .as_mut()
+            .expect("add_aux_from_pool requires main already spilled");
+        backing.aux_mmap = Some(aux_mmap);
+        backing._aux_file = Some(aux_file);
+        backing.num_aux_cols = num_aux_cols;
+
+        Ok(())
+    }
+
+    /// Write borrowed pool columns to a temp file and mmap them.
+    /// Does NOT consume the pool — columns keep their capacity.
+    ///
+    /// Note: the concrete element types are `FieldElement<Goldilocks>` (8 bytes,
+    /// `#[repr(transparent)]` over `u64`) and `FieldElement<Degree3Extension>`
+    /// (24 bytes, `#[repr(transparent)]` over `[u64; 3]`). Neither has padding,
+    /// so the raw byte round-trip is well-defined.
+    #[cfg(feature = "disk-spill")]
+    fn write_pool_columns_to_mmap<T>(
+        columns: &[Vec<T>],
+        elem_size: usize,
+    ) -> std::io::Result<(memmap2::Mmap, std::fs::File)> {
+        use std::io::Write;
+
+        let num_cols = columns.len();
+        let num_rows = if num_cols > 0 { columns[0].len() } else { 0 };
+        debug_assert!(
+            columns.iter().all(|c| c.len() == num_rows),
+            "all columns must have the same length"
+        );
+        let total_bytes = (num_cols * num_rows * elem_size) as u64;
+
+        let file = tempfile::tempfile()?;
+        file.set_len(total_bytes)?;
+        {
+            let mut writer = std::io::BufWriter::new(&file);
+            for col in columns {
+                // SAFETY: FieldElement<F/E> is #[repr(transparent)] over BaseType,
+                // so the Vec has the same byte layout as a contiguous array.
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(col.as_ptr() as *const u8, col.len() * elem_size)
+                };
+                writer.write_all(bytes)?;
+            }
+            writer.flush()?;
+        }
+        // SAFETY: We own the file exclusively.
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+        Ok((mmap, file))
     }
 }
 
@@ -499,6 +747,103 @@ where
     }
 
     Table::new(table_data, table_width)
+}
+
+#[cfg(all(test, feature = "disk-spill"))]
+mod disk_spill_tests {
+    use super::*;
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
+    use math::field::goldilocks::GoldilocksField;
+
+    type F = GoldilocksField;
+    type E = Degree3GoldilocksExtensionField;
+
+    /// Spill main LDE columns from a simulated pool, then verify `get_main()`
+    /// returns the correct values from the mmap backing.
+    #[test]
+    fn test_lde_spill_main_roundtrip() {
+        let num_cols = 3;
+        let num_rows = 16;
+
+        // Simulate pool: column-major Vec<Vec<FE>>
+        let pool: Vec<Vec<FieldElement<F>>> = (0..num_cols)
+            .map(|c| {
+                (0..num_rows)
+                    .map(|r| FieldElement::<F>::from((c * num_rows + r) as u64))
+                    .collect()
+            })
+            .collect();
+
+        let lde = LDETraceTable::<F, E>::spill_main_from_pool(
+            &pool, num_cols, /*trace_step_size=*/ 1, /*blowup_factor=*/ 1,
+        )
+        .expect("spill_main_from_pool failed");
+
+        assert_eq!(lde.num_main_cols(), num_cols);
+        assert_eq!(lde.num_rows(), num_rows);
+        assert!(
+            lde.main_columns.is_empty(),
+            "main_columns should be empty after spill"
+        );
+
+        // Verify every element
+        for (c, pool_col) in pool.iter().enumerate() {
+            for (r, pool_val) in pool_col.iter().enumerate() {
+                assert_eq!(
+                    lde.get_main(r, c),
+                    pool_val,
+                    "mismatch at (row={r}, col={c})"
+                );
+            }
+        }
+    }
+
+    /// Spill main + aux LDE columns and verify both are accessible.
+    #[test]
+    fn test_lde_spill_main_and_aux_roundtrip() {
+        let num_main = 2;
+        let num_aux = 2;
+        let num_rows = 8;
+
+        let main_pool: Vec<Vec<FieldElement<F>>> = (0..num_main)
+            .map(|c| {
+                (0..num_rows)
+                    .map(|r| FieldElement::<F>::from((c * num_rows + r) as u64))
+                    .collect()
+            })
+            .collect();
+
+        let aux_pool: Vec<Vec<FieldElement<E>>> = (0..num_aux)
+            .map(|c| {
+                (0..num_rows)
+                    .map(|r| FieldElement::<E>::from((100 + c * num_rows + r) as u64))
+                    .collect()
+            })
+            .collect();
+
+        let mut lde = LDETraceTable::<F, E>::spill_main_from_pool(&main_pool, num_main, 1, 1)
+            .expect("spill_main_from_pool failed");
+
+        lde.add_aux_from_pool(&aux_pool, num_aux)
+            .expect("add_aux_from_pool failed");
+
+        assert_eq!(lde.num_main_cols(), num_main);
+        assert_eq!(lde.num_aux_cols(), num_aux);
+
+        // Verify main
+        for (c, main_col) in main_pool.iter().enumerate() {
+            for (r, main_val) in main_col.iter().enumerate() {
+                assert_eq!(lde.get_main(r, c), main_val);
+            }
+        }
+
+        // Verify aux
+        for (c, aux_col) in aux_pool.iter().enumerate() {
+            for (r, aux_val) in aux_col.iter().enumerate() {
+                assert_eq!(lde.get_aux(r, c), aux_val);
+            }
+        }
+    }
 }
 
 pub fn columns2rows<F>(columns: Vec<Vec<F>>) -> Vec<Vec<F>>

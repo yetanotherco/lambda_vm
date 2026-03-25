@@ -1521,6 +1521,44 @@ impl Traces {
         }
     }
 
+    /// Spill all main trace tables from heap to mmap files.
+    #[cfg(feature = "disk-spill")]
+    pub fn spill_all_main_to_disk(&mut self) -> std::io::Result<()> {
+        for t in &mut self.cpus {
+            t.main_table.spill_to_disk()?;
+        }
+        self.bitwise.main_table.spill_to_disk()?;
+        for t in &mut self.lts {
+            t.main_table.spill_to_disk()?;
+        }
+        for t in &mut self.shifts {
+            t.main_table.spill_to_disk()?;
+        }
+        for t in &mut self.memws {
+            t.main_table.spill_to_disk()?;
+        }
+        for t in &mut self.loads {
+            t.main_table.spill_to_disk()?;
+        }
+        self.decode.main_table.spill_to_disk()?;
+        for t in &mut self.muls {
+            t.main_table.spill_to_disk()?;
+        }
+        for t in &mut self.dvrms {
+            t.main_table.spill_to_disk()?;
+        }
+        for t in &mut self.pages {
+            t.main_table.spill_to_disk()?;
+        }
+        self.register.main_table.spill_to_disk()?;
+        for t in &mut self.branches {
+            t.main_table.spill_to_disk()?;
+        }
+        self.halt.main_table.spill_to_disk()?;
+        self.commit.main_table.spill_to_disk()?;
+        Ok(())
+    }
+
     /// Extract page configurations from ELF only (deterministic from binary).
     ///
     /// Returns PageConfigs for pages covered by ELF segments, with their
