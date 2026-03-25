@@ -30,12 +30,12 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  PROGRAM: executor/programs/asm/fib_iterative_2M.s
-  ELF: executor/program_artifacts/asm/fib_iterative_2M.elf
+  PROGRAM: executor/programs/asm/fib_iterative_8M.s
+  ELF: executor/program_artifacts/asm/fib_iterative_8M.elf
   BENCH_RUNS_PR: 3
   BENCH_RUNS_BASELINE: 3
-  GROWTH_PROGRAMS: "fib_iterative_250k fib_iterative_500k fib_iterative_1M fib_iterative_2M"
-  GROWTH_STEPS: "250000 500000 1000000 2000000"
+  GROWTH_PROGRAMS: "fib_iterative_1M fib_iterative_2M fib_iterative_4M fib_iterative_8M"
+  GROWTH_STEPS: "1000000 2000000 4000000 8000000"
 
 jobs:
   benchmark:
@@ -79,6 +79,13 @@ jobs:
       - name: Compile benchmark ELFs
         run: |
           mkdir -p executor/program_artifacts/asm
+          # Compile main benchmark ELF
+          MAIN_SRC="$PROGRAM"
+          MAIN_OUT="$ELF"
+          if [ ! -f "$MAIN_OUT" ] && [ -f "$MAIN_SRC" ]; then
+            clang --target=riscv64 -march=rv64im -fuse-ld=lld -nostdlib -Wl,-e,main \
+              "$MAIN_SRC" -o "$MAIN_OUT"
+          fi
           for prog in $GROWTH_PROGRAMS; do
             SRC="executor/programs/asm/${prog}.s"
             OUT="executor/program_artifacts/asm/${prog}.elf"
