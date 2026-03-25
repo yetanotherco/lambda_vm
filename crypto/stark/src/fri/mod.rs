@@ -49,10 +49,10 @@ where
         // Fold evaluations in-place (no FFT needed)
         fold_evaluations_in_place(&mut evals, &zeta, &inv_twiddles);
 
-        // Build Merkle tree from consecutive pairs
-        let leaves: Vec<[FieldElement<E>; 2]> = evals
+        // Build Merkle tree from consecutive pairs (Vec leaf for variable-arity compatibility)
+        let leaves: Vec<Vec<FieldElement<E>>> = evals
             .chunks_exact(2)
-            .map(|chunk| [chunk[0].clone(), chunk[1].clone()])
+            .map(|chunk| chunk.to_vec())
             .collect();
         let merkle_tree = FriLayerMerkleTree::build(&leaves)
             .expect("FRI commit: Merkle tree construction must succeed");
@@ -102,10 +102,10 @@ where
 
                 let mut index = *iota_s;
                 for layer in fri_layers {
-                    // symmetric element
+                    // symmetric element (wrapped in Vec for variable-arity FRI compatibility)
                     let evaluation_sym = layer.evaluation[index ^ 1].clone();
                     let auth_path_sym = layer.merkle_tree.get_proof_by_pos(index >> 1).unwrap();
-                    layers_evaluations_sym.push(evaluation_sym);
+                    layers_evaluations_sym.push(vec![evaluation_sym]);
                     layers_auth_paths_sym.push(auth_path_sym);
 
                     index >>= 1;

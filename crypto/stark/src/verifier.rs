@@ -210,8 +210,10 @@ pub trait IsStarkVerifier<
         // >>>> Send challenge 𝜁ₙ₋₁
         zetas.push(transcript.sample_field_element());
 
-        // <<<< Receive value: pₙ
-        transcript.append_field_element(&proof.fri_last_value);
+        // <<<< Receive value: pₙ (all coefficients of the final polynomial)
+        for coeff in &proof.fri_final_poly {
+            transcript.append_field_element(coeff);
+        }
 
         // Receive grinding value
         let security_bits = air.context().proof_options.grinding_factor;
@@ -650,7 +652,7 @@ pub trait IsStarkVerifier<
         // In this case, the fold loop below doesn't iterate, so we need to verify
         // the final value directly here.
         if fri_layers_merkle_roots.is_empty() {
-            return v == proof.fri_last_value;
+            return v == proof.fri_final_poly[0];
         }
 
         // For each FRI layer, starting from the layer 1: use the proof to verify the validity of values pᵢ(−𝜐^(2ⁱ)) (given by the prover) and
@@ -666,9 +668,11 @@ pub trait IsStarkVerifier<
                 true,
                 |result,
                  (
-                    (((i, merkle_root), auth_path_sym), evaluation_sym),
+                    (((i, merkle_root), auth_path_sym), evaluation_sym_vec),
                     evaluation_point_inv,
                 )| {
+                    // For arity-2 FRI each inner Vec has exactly one element.
+                    let evaluation_sym = &evaluation_sym_vec[0];
                     // Verify opening Open(pᵢ(Dₖ), −𝜐^(2ⁱ)) and Open(pᵢ(Dₖ), 𝜐^(2ⁱ)).
                     // `v` is pᵢ(𝜐^(2ⁱ)).
                     // `evaluation_sym` is pᵢ(−𝜐^(2ⁱ)).
@@ -692,7 +696,7 @@ pub trait IsStarkVerifier<
                         result & openings_ok
                     } else {
                         // Check that final value is the given by the prover
-                        result & (v == proof.fri_last_value) & openings_ok
+                        result & (v == proof.fri_final_poly[0]) & openings_ok
                     }
                 },
             )
@@ -1148,8 +1152,10 @@ pub trait IsStarkVerifier<
         // >>>> Send challenge 𝜁ₙ₋₁
         zetas.push(transcript.sample_field_element());
 
-        // <<<< Receive value: pₙ
-        transcript.append_field_element(&proof.fri_last_value);
+        // <<<< Receive value: pₙ (all coefficients of the final polynomial)
+        for coeff in &proof.fri_final_poly {
+            transcript.append_field_element(coeff);
+        }
 
         // Receive grinding value
         let security_bits = air.context().proof_options.grinding_factor;

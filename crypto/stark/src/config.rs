@@ -1,5 +1,5 @@
 use crypto::merkle_tree::{
-    backends::types::{BatchKeccak256Backend, Keccak256Backend, PairKeccak256Backend},
+    backends::types::{BatchKeccak256Backend, Keccak256Backend},
     merkle::MerkleTree,
 };
 
@@ -19,6 +19,6 @@ pub type Commitment = [u8; COMMITMENT_SIZE];
 pub type BatchedMerkleTreeBackend<F> = BatchKeccak256Backend<F>;
 pub type BatchedMerkleTree<F> = MerkleTree<BatchedMerkleTreeBackend<F>>;
 
-// FRI layer uses fixed-size pairs for efficiency (avoids Vec allocation per pair)
-pub type FriLayerMerkleTreeBackend<F> = PairKeccak256Backend<F>;
+// FRI layer uses batch backend to support variable-arity FRI (generalizes over leaf width)
+pub type FriLayerMerkleTreeBackend<F> = BatchKeccak256Backend<F>;
 pub type FriLayerMerkleTree<F> = MerkleTree<FriLayerMerkleTreeBackend<F>>;

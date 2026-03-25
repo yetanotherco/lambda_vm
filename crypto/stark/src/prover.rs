@@ -254,8 +254,9 @@ pub struct Round3<F: IsField> {
 
 /// A container for the results of the fourth round of the STARK Prove protocol.
 pub struct Round4<F: IsSubFieldOf<E>, E: IsField> {
-    /// The final value resulting from folding the Deep composition polynomial all the way down to a constant value.
-    fri_last_value: FieldElement<E>,
+    /// The final polynomial resulting from folding the Deep composition polynomial all the way down.
+    /// For arity-2 FRI this is a single constant; for higher arity it may have degree > 0.
+    fri_final_poly: Vec<FieldElement<E>>,
     /// The commitments to the fold polynomials of the inner layers of FRI.
     fri_layers_merkle_roots: Vec<Commitment>,
     /// The values and proofs of validity of the evaluations of the trace polynomials and the composition polynomials
@@ -1068,6 +1069,7 @@ pub trait IsStarkProver<
                 &coset_offset,
                 domain_size,
             );
+        let fri_final_poly = vec![fri_last_value];
         #[cfg(feature = "instruments")]
         let r4_merkle_dur = t_sub.elapsed();
 
@@ -1103,7 +1105,7 @@ pub trait IsStarkProver<
         }
 
         Round4 {
-            fri_last_value,
+            fri_final_poly,
             fri_layers_merkle_roots,
             deep_poly_openings,
             query_list,
@@ -2046,7 +2048,7 @@ pub trait IsStarkProver<
             // [pₖ]
             fri_layers_merkle_roots: round_4_result.fri_layers_merkle_roots,
             // pₙ
-            fri_last_value: round_4_result.fri_last_value,
+            fri_final_poly: round_4_result.fri_final_poly,
             // Open(p₀(D₀), 𝜐ₛ), Open(pₖ(Dₖ), −𝜐ₛ^(2ᵏ))
             query_list: round_4_result.query_list,
             // Open(H₁(D_LDE, 𝜐₀), Open(H₂(D_LDE, 𝜐₀), Open(tⱼ(D_LDE), 𝜐₀)

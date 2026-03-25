@@ -8,5 +8,8 @@ use crate::config::Commitment;
 #[serde(bound = "")]
 pub struct FriDecommitment<F: IsField> {
     pub layers_auth_paths: Vec<Proof<Commitment>>,
-    pub layers_evaluations_sym: Vec<FieldElement<F>>,
+    /// For each FRI layer, the sibling evaluations at the queried position.
+    /// Vec<Vec<FE>> supports higher-arity FRI where arity-k folds k values per layer.
+    /// For arity-2 (current default) each inner Vec has exactly one element.
+    pub layers_evaluations_sym: Vec<Vec<FieldElement<F>>>,
 }
