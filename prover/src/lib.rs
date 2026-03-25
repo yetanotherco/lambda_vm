@@ -498,6 +498,13 @@ pub fn prove_with_options(
     // Page tables are derived from the prover's MemoryState (all accessed pages).
     let mut traces = Traces::from_elf_and_logs(&program, &result.logs, max_rows)?;
 
+    {
+        let memw_rows: usize = traces.memws.iter().map(|t| t.num_rows()).sum();
+        let memw_a_rows: usize = traces.memw_aligneds.iter().map(|t| t.num_rows()).sum();
+        eprintln!("MEMW   chunks={}, rows={}", traces.memws.len(), memw_rows);
+        eprintln!("MEMW_A chunks={}, rows={}", traces.memw_aligneds.len(), memw_a_rows);
+    }
+
     #[cfg(feature = "instruments")]
     let trace_build_elapsed = phase_start.elapsed();
 
