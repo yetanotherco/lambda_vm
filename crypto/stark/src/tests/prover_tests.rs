@@ -26,6 +26,8 @@ fn test_domain_constructor() {
         fri_number_of_queries: 1,
         coset_offset,
         grinding_factor,
+        fri_log_arity: 1,
+        fri_log_final_poly_len: 0,
     };
 
     let domain = Domain::new(
@@ -117,6 +119,8 @@ fn barycentric_trace_eval_matches_horner_trace_eval() {
         fri_number_of_queries: 1,
         coset_offset,
         grinding_factor: 0,
+        fri_log_arity: 1,
+        fri_log_final_poly_len: 0,
     };
 
     let air = simple_fibonacci::FibonacciAIR::<GoldilocksField>::new(&proof_options);
@@ -185,6 +189,8 @@ fn test_decompose_and_extend_d2_matches_original() {
         fri_number_of_queries: 1,
         coset_offset: 3,
         grinding_factor: 0,
+        fri_log_arity: 1,
+        fri_log_final_poly_len: 0,
     };
 
     // We need an AIR with composition_poly_degree_bound = 2 * trace_length.
