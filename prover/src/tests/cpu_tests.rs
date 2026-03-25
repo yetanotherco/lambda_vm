@@ -286,7 +286,7 @@ fn test_trace_generation_res_dwordbl() {
 }
 
 #[test]
-fn test_trace_generation_sign_bits() {
+fn test_trace_generation_ext_bits() {
     let ops = ops4(CpuOperation {
         decode: DecodeEntry {
             word_instr: true,

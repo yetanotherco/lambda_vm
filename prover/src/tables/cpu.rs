@@ -826,8 +826,8 @@ pub fn generate_cpu_trace(
         data[base + cols::RV2_1] = FE::from((op.rv2 >> 16) & 0xFFFF); // bits 16-31 (Half)
         data[base + cols::RV2_2] = FE::from(op.rv2 >> 32); // bits 32-63 (Word)
 
-        // Sign bits - only set when word_instr=1, per spec constraint ext_sign_bits
-        // The constraint enforces: (rv1_ext_bit + rv2_ext_bit + res_ext_bit) * (1 - word_instr) = 0
+        // Extension bits - only set when word_instr=1, per SIGN template
+        // The constraint enforces: (1 - word_instr) * ext_bit = 0 for each ext bit
         let rv1_ext_bit = d.word_instr && CpuOperation::sign_bit_32(op.rv1);
         data[base + cols::RV1_EXT_BIT] = FE::from(rv1_ext_bit as u64);
 
@@ -1132,7 +1132,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // MSB16 interaction for res sign bit extraction
+    // MSB16 interaction for res extension bit extraction
     // -------------------------------------------------------------------------
     // MSB16[res::DWordHL[1]] -> res_ext_bit, multiplicity = word_instr
     // res::DWordHL[1] is the half at bits 16-31 = res[2] + 256*res[3]
