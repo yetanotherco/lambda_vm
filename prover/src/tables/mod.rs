@@ -45,11 +45,13 @@ pub use types::BusId;
 /// Effective width = main_cols + 3 × bus_interactions (extension field = 3× cost).
 /// MEMW (effective width 127) at 2^19 is the baseline; other tables are scaled
 /// proportionally: max_rows = (127 × 2^19) / effective_width, rounded to 2^N.
+/// (* MEMW_A formula gives 2^20, but set to 2^19 to match MEMW chunk geometry;
+///    benchmarks show better parallel throughput with smaller chunks.)
 ///
 /// | Table   | Main | Bus | Eff.width | Max rows |
 /// |---------|------|-----|-----------|----------|
 /// | MEMW    |  49  |  26 |    127    |  2^19    |
-/// | MEMW_A  |  30  |  20 |     90    |  2^20    |
+/// | MEMW_A  |  30  |  20 |     90    |  2^19 *  |
 /// | CPU     |  74  |  40 |    194    |  2^19    |
 /// | DVRM    |  34  |  34 |    136    |  2^19    |
 /// | MUL     |  26  |  16 |     74    |  2^20    |
@@ -60,7 +62,7 @@ pub use types::BusId;
 pub mod max_rows {
     pub const CPU: usize = 1 << 19; // 524,288   — eff. width 194
     pub const MEMW: usize = 1 << 19; // 524,288  — eff. width 127 (baseline)
-    pub const MEMW_A: usize = 1 << 20; // 1,048,576 — eff. width 90
+    pub const MEMW_A: usize = 1 << 19; // 524,288 — eff. width 90
     pub const DVRM: usize = 1 << 19; // 524,288  — eff. width 136
     pub const MUL: usize = 1 << 20; // 1,048,576 — eff. width 74
     pub const LT: usize = 1 << 21; // 2,097,152  — eff. width 42
