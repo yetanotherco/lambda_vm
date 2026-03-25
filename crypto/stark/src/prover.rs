@@ -1888,83 +1888,120 @@ pub trait IsStarkProver<
         // ----- disk-spill path: read from spilled LDEs -----
         #[cfg(feature = "disk-spill")]
         {
-            for idx in 0..num_airs {
-                let (air, _trace, pub_inputs) = &air_trace_pairs[idx];
-                let metadata = &metadatas[idx];
-                let domain = &domains[idx];
-                let table_transcript = &mut table_transcripts[idx];
+            for chunk_start in (0..num_airs).step_by(k) {
+                let chunk_end = (chunk_start + k).min(num_airs);
 
-                #[cfg(feature = "instruments")]
-                let table_start = Instant::now();
-
-                // Take the spilled LDE (mmap-backed) — no LDE recomputation needed
-                let lde_trace = spilled_ldes[idx]
-                    .take()
-                    .expect("spilled LDE must exist for every AIR");
-
-                // Build Round1 from the spilled LDE + stored Merkle trees
-                let main = Round1CommitmentData::<Field> {
-                    lde_trace_merkle_tree: Arc::clone(&metadata.main_merkle_tree),
-                    lde_trace_merkle_root: metadata.main_merkle_root,
-                    precomputed_merkle_tree: metadata
-                        .precomputed_merkle_tree
-                        .as_ref()
-                        .map(Arc::clone),
-                    precomputed_merkle_root: metadata.precomputed_merkle_root,
-                    num_precomputed_cols: metadata.num_precomputed_cols,
-                };
-
-                let aux = if air.has_aux_trace() {
-                    Some(Round1CommitmentData::<FieldExtension> {
-                        lde_trace_merkle_tree: Arc::clone(
-                            metadata
-                                .aux_merkle_tree
-                                .as_ref()
-                                .expect("aux tree must exist when has_aux_trace"),
-                        ),
-                        lde_trace_merkle_root: metadata
-                            .aux_merkle_root
-                            .expect("aux root must exist when has_aux_trace"),
-                        precomputed_merkle_tree: None,
-                        precomputed_merkle_root: None,
-                        num_precomputed_cols: 0,
+                // Pre-take spilled LDEs for the chunk (needs &mut, can't do inside par_iter)
+                let chunk_ldes: Vec<_> = (chunk_start..chunk_end)
+                    .map(|i| {
+                        spilled_ldes[i]
+                            .take()
+                            .expect("spilled LDE must exist for every AIR")
                     })
-                } else {
-                    None
-                };
+                    .collect();
 
-                let round_1_result = Round1 {
-                    lde_trace,
-                    main,
-                    aux,
-                    rap_challenges: metadata.rap_challenges.clone(),
-                    bus_public_inputs: metadata.bus_public_inputs.clone(),
-                };
+                let chunk_transcripts = &mut table_transcripts[chunk_start..chunk_end];
 
-                if let Some(ref bpi) = round_1_result.bus_public_inputs {
-                    table_transcript.append_field_element(&bpi.table_contribution);
+                #[cfg(feature = "parallel")]
+                let iter = chunk_ldes
+                    .into_par_iter()
+                    .zip(chunk_transcripts.par_iter_mut())
+                    .enumerate();
+                #[cfg(not(feature = "parallel"))]
+                let iter = chunk_ldes
+                    .into_iter()
+                    .zip(chunk_transcripts.iter_mut())
+                    .enumerate();
+
+                let chunk_results: Vec<Result<_, ProvingError>> = iter
+                    .map(|(j, (lde_trace, table_transcript))| {
+                        let idx = chunk_start + j;
+                        let (air, _trace, pub_inputs) = &air_trace_pairs[idx];
+                        let metadata = &metadatas[idx];
+                        let domain = &domains[idx];
+
+                        #[cfg(feature = "instruments")]
+                        let table_start = Instant::now();
+
+                        let main = Round1CommitmentData::<Field> {
+                            lde_trace_merkle_tree: Arc::clone(&metadata.main_merkle_tree),
+                            lde_trace_merkle_root: metadata.main_merkle_root,
+                            precomputed_merkle_tree: metadata
+                                .precomputed_merkle_tree
+                                .as_ref()
+                                .map(Arc::clone),
+                            precomputed_merkle_root: metadata.precomputed_merkle_root,
+                            num_precomputed_cols: metadata.num_precomputed_cols,
+                        };
+
+                        let aux = if air.has_aux_trace() {
+                            Some(Round1CommitmentData::<FieldExtension> {
+                                lde_trace_merkle_tree: Arc::clone(
+                                    metadata
+                                        .aux_merkle_tree
+                                        .as_ref()
+                                        .expect("aux tree must exist when has_aux_trace"),
+                                ),
+                                lde_trace_merkle_root: metadata
+                                    .aux_merkle_root
+                                    .expect("aux root must exist when has_aux_trace"),
+                                precomputed_merkle_tree: None,
+                                precomputed_merkle_root: None,
+                                num_precomputed_cols: 0,
+                            })
+                        } else {
+                            None
+                        };
+
+                        let round_1_result = Round1 {
+                            lde_trace,
+                            main,
+                            aux,
+                            rap_challenges: metadata.rap_challenges.clone(),
+                            bus_public_inputs: metadata.bus_public_inputs.clone(),
+                        };
+
+                        if let Some(ref bpi) = round_1_result.bus_public_inputs {
+                            table_transcript.append_field_element(&bpi.table_contribution);
+                        }
+
+                        let proof = Self::prove_rounds_2_to_4(
+                            *air,
+                            *pub_inputs,
+                            &round_1_result,
+                            table_transcript,
+                            domain,
+                        )?;
+
+                        #[cfg(feature = "instruments")]
+                        {
+                            let sub_ops =
+                                crate::instruments::take_round_sub_ops().unwrap_or_default();
+                            return Ok((
+                                proof,
+                                (
+                                    air.name().to_string(),
+                                    air_trace_pairs[idx].1.num_rows(),
+                                    table_start.elapsed(),
+                                    sub_ops,
+                                ),
+                            ));
+                        }
+                        #[cfg(not(feature = "instruments"))]
+                        Ok(proof)
+                    })
+                    .collect();
+
+                for result in chunk_results {
+                    #[cfg(feature = "instruments")]
+                    {
+                        let (proof, timing) = result?;
+                        proofs.push(proof);
+                        table_timings.push(timing);
+                    }
+                    #[cfg(not(feature = "instruments"))]
+                    proofs.push(result?);
                 }
-
-                let proof = Self::prove_rounds_2_to_4(
-                    *air,
-                    *pub_inputs,
-                    &round_1_result,
-                    table_transcript,
-                    domain,
-                )?;
-
-                #[cfg(feature = "instruments")]
-                {
-                    let sub_ops = crate::instruments::take_round_sub_ops().unwrap_or_default();
-                    table_timings.push((
-                        air.name().to_string(),
-                        air_trace_pairs[idx].1.num_rows(),
-                        table_start.elapsed(),
-                        sub_ops,
-                    ));
-                }
-
-                proofs.push(proof);
             }
         }
 
