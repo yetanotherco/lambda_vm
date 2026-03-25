@@ -573,8 +573,7 @@ fn mul_non_canonical_inputs() {
         (GOLDILOCKS_PRIME + 1, u64::MAX),
         (u64::MAX - 1, 2),
     ];
-    let ref_mul =
-        |a: u64, b: u64| ((a as u128 * b as u128) % GOLDILOCKS_PRIME as u128) as u64;
+    let ref_mul = |a: u64, b: u64| ((a as u128 * b as u128) % GOLDILOCKS_PRIME as u128) as u64;
     for (a, b) in test_cases {
         let result = F::mul(&a, &b);
         assert_eq!(

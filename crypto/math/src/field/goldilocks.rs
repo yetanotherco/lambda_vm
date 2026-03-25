@@ -287,11 +287,7 @@ pub(crate) fn dot_product_2(a0: u64, b0: u64, a1: u64, b1: u64) -> u64 {
 /// This is the critical building block for Fp3 multiplication (the extension
 /// field used by the VM's STARK prover).
 #[inline(always)]
-pub(crate) fn dot_product_3(
-    a0: u64, b0: u64,
-    a1: u64, b1: u64,
-    a2: u64, b2: u64,
-) -> u64 {
+pub(crate) fn dot_product_3(a0: u64, b0: u64, a1: u64, b1: u64, a2: u64, b2: u64) -> u64 {
     let prod0 = (a0 as u128) * (b0 as u128);
     let prod1 = (a1 as u128) * (b1 as u128);
     let prod2 = (a2 as u128) * (b2 as u128);
