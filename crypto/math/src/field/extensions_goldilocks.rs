@@ -6,7 +6,7 @@
 use crate::field::{
     element::FieldElement,
     errors::FieldError,
-    goldilocks::{GOLDILOCKS_PRIME, GoldilocksField},
+    goldilocks::{GOLDILOCKS_PRIME, GoldilocksField, dot_product_2, dot_product_3, mul_by_7_raw},
     traits::{HasDefaultTranscript, IsField, IsSubFieldOf},
 };
 use crate::traits::{AsBytes, ByteConversion};
@@ -106,33 +106,39 @@ impl IsField for Degree2GoldilocksExtensionField {
         [a[0] + b[0], a[1] + b[1]]
     }
 
-    /// Returns the multiplication of `a` and `b`:
-    /// (a0 + a1*w) * (b0 + b1*w) = (a0*b0 + W*a1*b1) + (a0*b1 + a1*b0)*w
-    /// where w^2 = W = 7
+    /// Multiplication using fused dot products for fewer reductions.
+    /// (a0 + a1*w) * (b0 + b1*w) = (a0*b0 + 7*a1*b1) + (a0*b1 + a1*b0)*w
+    ///
+    /// Uses dot_product_2 to compute each output component with a single
+    /// reduce128 instead of separate mul + reduce per product.
     #[inline(always)]
     fn mul(a: &Self::BaseType, b: &Self::BaseType) -> Self::BaseType {
-        let a0b0 = a[0] * b[0];
-        let a1b1 = a[1] * b[1];
-        let z = (a[0] + a[1]) * (b[0] + b[1]);
+        let (a0, a1) = (*a[0].value(), *a[1].value());
+        let (b0, b1) = (*b[0].value(), *b[1].value());
+        let b1_7 = mul_by_7_raw(b1);
 
-        // W * a1b1 = 7 * a1b1
-        let w_a1b1 = mul_by_7(&a1b1);
+        // c0 = a0*b0 + a1*(7*b1)
+        let c0 = dot_product_2(a0, b0, a1, b1_7);
+        // c1 = a0*b1 + a1*b0
+        let c1 = dot_product_2(a0, b1, a1, b0);
 
-        [a0b0 + w_a1b1, z - a0b0 - a1b1]
+        [FpE::from_raw(c0), FpE::from_raw(c1)]
     }
 
-    /// Returns the square of `a`:
-    /// (a0 + a1*w)^2 = (a0^2 + W*a1^2) + 2*a0*a1*w
+    /// Squaring using fused dot product for the first component.
+    /// (a0 + a1*w)^2 = (a0^2 + 7*a1^2) + 2*a0*a1*w
     #[inline(always)]
     fn square(a: &Self::BaseType) -> Self::BaseType {
-        let a0_sq = a[0].square();
-        let a1_sq = a[1].square();
-        let a0a1 = a[0] * a[1];
+        let (a0, a1) = (*a[0].value(), *a[1].value());
+        let a1_7 = mul_by_7_raw(a1);
 
-        // W * a1^2 = 7 * a1^2
-        let w_a1_sq = mul_by_7(&a1_sq);
+        // c0 = a0*a0 + a1*(7*a1) via single-reduction dot product
+        let c0 = dot_product_2(a0, a0, a1, a1_7);
+        // c1 = 2 * a0 * a1
+        let c1 = <GoldilocksField as IsField>::mul(&a0, &a1);
+        let c1 = GoldilocksField::double(&c1);
 
-        [a0_sq + w_a1_sq, a0a1.double()]
+        [FpE::from_raw(c0), FpE::from_raw(c1)]
     }
 
     /// Returns the component-wise subtraction of `a` and `b`
@@ -272,42 +278,57 @@ impl IsField for Degree3GoldilocksExtensionField {
         [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
     }
 
-    /// Returns the multiplication of `a` and `b`:
+    /// Multiplication using schoolbook with fused dot products.
     /// (a0 + a1*w + a2*w^2) * (b0 + b1*w + b2*w^2) mod (w^3 - 2)
+    ///
+    /// Expanding and applying w^3 = 2:
+    ///   c0 = a0*b0 + 2*(a1*b2 + a2*b1)
+    ///   c1 = a0*b1 + a1*b0 + 2*a2*b2
+    ///   c2 = a0*b2 + a1*b1 + a2*b0
+    ///
+    /// Each component is computed as a single dot_product_3 (9 raw muls,
+    /// 3 reduce128 calls) instead of Karatsuba (6 muls, 6 reduce128 + many
+    /// add/sub). The reduction savings outweigh the extra multiplications.
     #[inline(always)]
     fn mul(a: &Self::BaseType, b: &Self::BaseType) -> Self::BaseType {
-        let v0 = a[0] * b[0];
-        let v1 = a[1] * b[1];
-        let v2 = a[2] * b[2];
+        let (a0, a1, a2) = (*a[0].value(), *a[1].value(), *a[2].value());
+        let (b0, b1, b2) = (*b[0].value(), *b[1].value(), *b[2].value());
 
-        // c0 = v0 + 2 * ((a1 + a2)(b1 + b2) - v1 - v2)
-        // c1 = (a0 + a1)(b0 + b1) - v0 - v1 + 2 * v2
-        // c2 = (a0 + a2)(b0 + b2) - v0 + v1 - v2
-        let t0 = (a[1] + a[2]) * (b[1] + b[2]) - v1 - v2;
-        let t1 = (a[0] + a[1]) * (b[0] + b[1]) - v0 - v1;
-        let t2 = (a[0] + a[2]) * (b[0] + b[2]) - v0 - v2;
+        // Precompute 2*b1 and 2*b2 for the w^3 = 2 reduction
+        let b1_2 = GoldilocksField::double(&b1);
+        let b2_2 = GoldilocksField::double(&b2);
 
-        [v0 + t0.double(), t1 + v2.double(), t2 + v1]
+        // c0 = a0*b0 + a1*(2*b2) + a2*(2*b1)
+        let c0 = dot_product_3(a0, b0, a1, b2_2, a2, b1_2);
+        // c1 = a0*b1 + a1*b0 + a2*(2*b2)
+        let c1 = dot_product_3(a0, b1, a1, b0, a2, b2_2);
+        // c2 = a0*b2 + a1*b1 + a2*b0
+        let c2 = dot_product_3(a0, b2, a1, b1, a2, b0);
+
+        [FpE::from_raw(c0), FpE::from_raw(c1), FpE::from_raw(c2)]
     }
 
-    /// Returns the square of `a`
+    /// Squaring using fused dot products.
+    /// (a0 + a1*w + a2*w^2)^2 mod (w^3 - 2):
+    ///   c0 = a0^2 + 4*a1*a2
+    ///   c1 = 2*a0*a1 + 2*a2^2
+    ///   c2 = 2*a0*a2 + a1^2
     #[inline(always)]
     fn square(a: &Self::BaseType) -> Self::BaseType {
-        let s0 = a[0].square();
-        let s1 = a[1].square();
-        let s2 = a[2].square();
-        let a01 = a[0] * a[1];
-        let a02 = a[0] * a[2];
-        let a12 = a[1] * a[2];
+        let (a0, a1, a2) = (*a[0].value(), *a[1].value(), *a[2].value());
 
-        // c0 = s0 + 4 * a12
-        // c1 = 2 * a01 + 2 * s2
-        // c2 = 2 * a02 + s1
-        [
-            s0 + a12.double().double(),
-            a01.double() + s2.double(),
-            a02.double() + s1,
-        ]
+        let a0_2 = GoldilocksField::double(&a0);
+        let a2_4 = GoldilocksField::double(&GoldilocksField::double(&a2));
+
+        // c0 = a0*a0 + a1*(4*a2) — using dot_product_2
+        let c0 = dot_product_2(a0, a0, a1, a2_4);
+        // c1 = (2*a0)*a1 + (2*a2)*a2 — using dot_product_2
+        let a2_2 = GoldilocksField::double(&a2);
+        let c1 = dot_product_2(a0_2, a1, a2_2, a2);
+        // c2 = a1*a1 + (2*a0)*a2 — using dot_product_2
+        let c2 = dot_product_2(a1, a1, a0_2, a2);
+
+        [FpE::from_raw(c0), FpE::from_raw(c1), FpE::from_raw(c2)]
     }
 
     /// Returns the component-wise subtraction of `a` and `b`
@@ -528,12 +549,8 @@ impl HasDefaultTranscript for Degree3GoldilocksExtensionField {
 // =====================================================
 
 /// Multiply a field element by 7 (the quadratic non-residue).
-/// Uses 7 = 8 - 1 to break the dependency chain (3 serial doubles then 1 sub,
-/// vs 2 doubles + 2 dependent adds).
+/// Wraps the raw u64 implementation for use with FieldElement types.
 #[inline(always)]
 fn mul_by_7(a: &FpE) -> FpE {
-    let a2 = a.double();
-    let a4 = a2.double();
-    let a8 = a4.double();
-    a8 - *a
+    FpE::from_raw(mul_by_7_raw(*a.value()))
 }

@@ -80,12 +80,15 @@ impl IsField for GoldilocksField {
         let (sum, over) = a.overflowing_add(*b);
         let (mut sum, over) = sum.overflowing_add((over as u64) * EPSILON);
         if over {
-            // Double overflow requires both inputs > ORDER, which is exceedingly rare.
+            // Double overflow requires a + b >= 2^65 - EPSILON.
+            // If either input <= p, then a + b <= p + (2^64-1) = 2^65 - EPSILON - 1,
+            // which is below the threshold. Therefore both must exceed p.
             unsafe {
                 assume(*a > GOLDILOCKS_PRIME && *b > GOLDILOCKS_PRIME);
             }
             branch_hint();
-            sum += EPSILON; // Cannot overflow.
+            // After double overflow, sum < EPSILON, so sum + EPSILON < 2^64.
+            sum += EPSILON;
         }
         sum
     }
@@ -96,6 +99,10 @@ impl IsField for GoldilocksField {
         let (diff, under) = a.overflowing_sub(*b);
         let (mut diff, under) = diff.overflowing_sub((under as u64) * EPSILON);
         if under {
+            // Double underflow requires a - b + 2^64 < EPSILON, i.e., b > a + p.
+            // Since b < 2^64 = p + EPSILON, we get a < EPSILON - 1.
+            // At a = EPSILON - 1, the minimum b for first underflow already gives
+            // diff1 = EPSILON, so diff1 - EPSILON = 0 (no second underflow).
             unsafe {
                 assume(*a < EPSILON - 1 && *b > GOLDILOCKS_PRIME);
             }
@@ -238,6 +245,87 @@ unsafe fn add_no_canonicalize_trashing_input(x: u64, y: u64) -> u64 {
 unsafe fn add_no_canonicalize_trashing_input(x: u64, y: u64) -> u64 {
     let (res_wrapped, carry) = x.overflowing_add(y);
     res_wrapped.wrapping_add(EPSILON * (carry as u64))
+}
+
+// =====================================================
+// FUSED MULTIPLY-ACCUMULATE (inspired by Plonky3)
+// =====================================================
+
+/// Compute a0*b0 + a1*b1 mod p in a single reduction pass.
+///
+/// Instead of reducing each product separately (2 reduce128 calls),
+/// this sums the u128 products and reduces once. When the sum overflows u128,
+/// we correct by adding 2^128 mod p = EPSILON^2 = (2^32 - 1)^2.
+///
+/// This is the critical building block for extension field multiplication:
+/// each Fp2 mul needs two dot products instead of three separate mul+reduce.
+#[inline(always)]
+pub(crate) fn dot_product_2(a0: u64, b0: u64, a1: u64, b1: u64) -> u64 {
+    let prod0 = (a0 as u128) * (b0 as u128);
+    let prod1 = (a1 as u128) * (b1 as u128);
+    let (sum, overflow) = prod0.overflowing_add(prod1);
+
+    let reduced = reduce128(sum);
+
+    if overflow {
+        // True value is sum + 2^128. Since 2^128 mod p = EPSILON^2,
+        // add EPSILON^2 = (2^32-1)^2 = 2^64 - 2^33 + 1.
+        // This value is < p, and reduced < 2p, so their sum < 3p < 2^64 + p,
+        // satisfying the precondition for add_no_canonicalize.
+        branch_hint();
+        const EPSILON_SQ: u64 = EPSILON.wrapping_mul(EPSILON);
+        unsafe { add_no_canonicalize_trashing_input(reduced, EPSILON_SQ) }
+    } else {
+        reduced
+    }
+}
+
+/// Compute a0*b0 + a1*b1 + a2*b2 mod p in a single reduction pass.
+///
+/// Accumulates three u128 products, tracking overflow count (at most 2).
+/// Each overflow adds 2^128 mod p = EPSILON^2 to the result.
+/// This is the critical building block for Fp3 multiplication (the extension
+/// field used by the VM's STARK prover).
+#[inline(always)]
+pub(crate) fn dot_product_3(
+    a0: u64, b0: u64,
+    a1: u64, b1: u64,
+    a2: u64, b2: u64,
+) -> u64 {
+    let prod0 = (a0 as u128) * (b0 as u128);
+    let prod1 = (a1 as u128) * (b1 as u128);
+    let prod2 = (a2 as u128) * (b2 as u128);
+
+    let (sum01, over1) = prod0.overflowing_add(prod1);
+    let (sum012, over2) = sum01.overflowing_add(prod2);
+    let overflow_count = (over1 as u64) + (over2 as u64);
+
+    let mut reduced = reduce128(sum012);
+
+    if overflow_count > 0 {
+        // Each overflow represents +2^128 to the true sum.
+        // 2^128 mod p = EPSILON^2 = (2^32 - 1)^2 = 2^64 - 2^33 + 1.
+        // Safety: reduced < 2^64, EPSILON_SQ < p, so sum < 2^64 + p.
+        branch_hint();
+        const EPSILON_SQ: u64 = EPSILON.wrapping_mul(EPSILON);
+        reduced = unsafe { add_no_canonicalize_trashing_input(reduced, EPSILON_SQ) };
+        if overflow_count > 1 {
+            branch_hint();
+            reduced = unsafe { add_no_canonicalize_trashing_input(reduced, EPSILON_SQ) };
+        }
+    }
+
+    reduced
+}
+
+/// Multiply a raw u64 field element by 7 (the Fp2 non-residue).
+/// Uses 7 = 8 - 1 for a straight-line computation.
+#[inline(always)]
+pub(crate) fn mul_by_7_raw(a: u64) -> u64 {
+    let a2 = GoldilocksField::double(&a);
+    let a4 = GoldilocksField::double(&a2);
+    let a8 = GoldilocksField::double(&a4);
+    GoldilocksField::sub(&a8, &a)
 }
 
 /// Inversion using optimized addition chain for a^(p-2).
