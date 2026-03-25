@@ -121,7 +121,7 @@ impl GoldilocksCubicProofOptions {
             fri_number_of_queries,
             coset_offset: 3,
             grinding_factor,
-            fri_log_arity: 1,
+            fri_log_arity: 2, // arity-4: halves FRI Merkle tree count
             fri_log_final_poly_len: 0,
         })
     }

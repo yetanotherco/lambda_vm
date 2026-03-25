@@ -744,7 +744,7 @@ pub trait IsStarkVerifier<
             // Each successive sub-fold halves `half`, so the product `leaf_index * half` correctly
             // tracks the pair position in the correspondingly smaller domain.
             let mut inv_twiddles: Vec<FieldElement<Field>> = Vec::with_capacity(half);
-            let half_log_bits = (current_domain_size / 2) as u64;
+            let half_log_bits = current_domain_size / 2;
             for j in 0..half {
                 let global_pair_idx = leaf_index * half + j;
                 let natural_idx = reverse_index(global_pair_idx, half_log_bits);
