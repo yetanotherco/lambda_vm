@@ -12,6 +12,7 @@ use crate::tables::types::FE;
 
 fn op(
     timestamp: u64,
+    index: u64,
     address: u64,
     count: u64,
     first: bool,
@@ -20,6 +21,7 @@ fn op(
 ) -> CommitOperation {
     CommitOperation {
         timestamp,
+        index,
         address,
         count,
         first,
@@ -36,8 +38,8 @@ fn op(
 fn test_commit_single_byte() {
     // count=1: first row (first=1, count=1, value=0x41) + end row (end=1, count=0)
     let ops = vec![
-        op(100, 0x1000, 1, true, false, 0x41),
-        op(100, 0x1001, 0, false, true, 0),
+        op(100, 0, 0x1000, 1, true, false, 0x41),
+        op(100, 1, 0x1001, 0, false, true, 0),
     ];
     let trace = generate_commit_trace(&ops);
 
@@ -50,6 +52,7 @@ fn test_commit_single_byte() {
     assert_eq!(r0[cols::VALUE], FE::from(0x41u64));
     assert_eq!(r0[cols::MU], FE::one());
     assert_eq!(r0[cols::TIMESTAMP_0], FE::from(100u64));
+    assert_eq!(r0[cols::INDEX], FE::zero());
 
     // Row 0: address = 0x1000
     assert_eq!(r0[cols::ADDRESS_0], FE::from(0x1000u64));
@@ -74,6 +77,7 @@ fn test_commit_single_byte() {
     assert_eq!(r1[cols::COUNT_0], FE::zero());
     assert_eq!(r1[cols::VALUE], FE::zero());
     assert_eq!(r1[cols::MU], FE::one());
+    assert_eq!(r1[cols::INDEX], FE::one());
 
     // Row 1: count_decr = all 0xFFFF (count=0 → underflow)
     assert_eq!(r1[cols::COUNT_DECR_0], FE::from(0xFFFFu64));
@@ -86,10 +90,10 @@ fn test_commit_single_byte() {
 fn test_commit_multi_byte() {
     // count=3: 3 data rows + 1 end row = 4 rows
     let ops = vec![
-        op(200, 0x2000, 3, true, false, b'H'),
-        op(200, 0x2001, 2, false, false, b'i'),
-        op(200, 0x2002, 1, false, false, b'!'),
-        op(200, 0x2003, 0, false, true, 0),
+        op(200, 10, 0x2000, 3, true, false, b'H'),
+        op(200, 11, 0x2001, 2, false, false, b'i'),
+        op(200, 12, 0x2002, 1, false, false, b'!'),
+        op(200, 13, 0x2003, 0, false, true, 0),
     ];
     let trace = generate_commit_trace(&ops);
 
@@ -99,6 +103,7 @@ fn test_commit_multi_byte() {
     assert_eq!(r0[cols::END], FE::zero());
     assert_eq!(r0[cols::COUNT_0], FE::from(3u64));
     assert_eq!(r0[cols::VALUE], FE::from(b'H' as u64));
+    assert_eq!(r0[cols::INDEX], FE::from(10u64));
 
     // Row 1: middle row, count decrement 3→2
     let r1 = trace.main_table.get_row(1);
@@ -106,17 +111,20 @@ fn test_commit_multi_byte() {
     assert_eq!(r1[cols::END], FE::zero());
     assert_eq!(r1[cols::COUNT_0], FE::from(2u64));
     assert_eq!(r1[cols::VALUE], FE::from(b'i' as u64));
+    assert_eq!(r1[cols::INDEX], FE::from(11u64));
 
     // Row 2: middle row, count decrement 2→1
     let r2 = trace.main_table.get_row(2);
     assert_eq!(r2[cols::COUNT_0], FE::from(1u64));
     assert_eq!(r2[cols::VALUE], FE::from(b'!' as u64));
+    assert_eq!(r2[cols::INDEX], FE::from(12u64));
 
     // Row 3: end row
     let r3 = trace.main_table.get_row(3);
     assert_eq!(r3[cols::FIRST], FE::zero());
     assert_eq!(r3[cols::END], FE::one());
     assert_eq!(r3[cols::COUNT_0], FE::zero());
+    assert_eq!(r3[cols::INDEX], FE::from(13u64));
 
     // All rows share timestamp and mu=1
     for row in 0..4 {
@@ -135,7 +143,7 @@ fn test_commit_multi_byte() {
 #[test]
 fn test_commit_zero_count() {
     // count=0: single row with first=1 AND end=1
-    let ops = vec![op(50, 0x3000, 0, true, true, 0)];
+    let ops = vec![op(50, 7, 0x3000, 0, true, true, 0)];
     let trace = generate_commit_trace(&ops);
     let r0 = trace.main_table.get_row(0);
 
@@ -143,6 +151,7 @@ fn test_commit_zero_count() {
     assert_eq!(r0[cols::END], FE::one());
     assert_eq!(r0[cols::COUNT_0], FE::zero());
     assert_eq!(r0[cols::MU], FE::one());
+    assert_eq!(r0[cols::INDEX], FE::from(7u64));
 
     // count_decr = all 0xFFFF when count=0
     assert_eq!(r0[cols::COUNT_DECR_0], FE::from(0xFFFFu64));
@@ -154,7 +163,7 @@ fn test_commit_zero_count() {
 #[test]
 fn test_commit_trace_padding() {
     // 1 real row → padded to 4 (minimum power of 2)
-    let ops = vec![op(10, 0x100, 0, true, true, 0)];
+    let ops = vec![op(10, 0, 0x100, 0, true, true, 0)];
     let trace = generate_commit_trace(&ops);
     assert_eq!(trace.num_rows(), 4);
 
@@ -169,6 +178,7 @@ fn test_commit_trace_padding() {
         assert_eq!(r[cols::VALUE], FE::zero());
         assert_eq!(r[cols::ADDRESS_0], FE::zero());
         assert_eq!(r[cols::TIMESTAMP_0], FE::zero());
+        assert_eq!(r[cols::INDEX], FE::zero());
     }
 }
 
@@ -176,12 +186,12 @@ fn test_commit_trace_padding() {
 fn test_commit_trace_dimensions() {
     // 5 rows → next power of 2 = 8
     let ops: Vec<_> = (0..5)
-        .map(|i| op(300, 0x4000 + i, 5 - i, i == 0, i == 4, (0x60 + i) as u8))
+        .map(|i| op(300, i, 0x4000 + i, 5 - i, i == 0, i == 4, (0x60 + i) as u8))
         .collect();
     let trace = generate_commit_trace(&ops);
 
     assert_eq!(trace.num_rows(), 8);
-    assert_eq!(cols::NUM_COLUMNS, 18);
+    assert_eq!(cols::NUM_COLUMNS, 19);
 }
 
 // =========================================================================
@@ -329,7 +339,7 @@ fn test_padding_satisfies_constraints() {
 #[test]
 fn test_count_decr_at_zero() {
     // count=0 -> count_decr halfwords all 0xFFFF
-    let ops = vec![op(1, 0, 0, true, true, 0)];
+    let ops = vec![op(1, 0, 0, 0, true, true, 0)];
     let trace = generate_commit_trace(&ops);
     let r0 = trace.main_table.get_row(0);
 
@@ -346,7 +356,7 @@ fn test_count_decr_at_zero() {
 #[test]
 fn test_address_incr_overflow() {
     // address = 0xFFFF_FFFF_FFFF_FFFF -> address+1 wraps to 0
-    let ops = vec![op(1, u64::MAX, 1, true, false, 0xFF)];
+    let ops = vec![op(1, 0, u64::MAX, 1, true, false, 0xFF)];
     let trace = generate_commit_trace(&ops);
     let r0 = trace.main_table.get_row(0);
 
@@ -378,7 +388,7 @@ fn test_address_incr_overflow() {
 fn test_large_timestamp() {
     // Timestamp with both hi and lo words populated
     let ts: u64 = 0x0000_0001_0000_0064; // hi=1, lo=100
-    let ops = vec![op(ts, 0x5000, 1, true, false, 0xAB)];
+    let ops = vec![op(ts, 0, 0x5000, 1, true, false, 0xAB)];
     let trace = generate_commit_trace(&ops);
     let r0 = trace.main_table.get_row(0);
 
@@ -404,7 +414,7 @@ fn test_minimum_table_size() {
 fn test_address_incr_halfword_carry() {
     // address = 0xFFFF -> address+1 = 0x10000
     // Tests carry propagation across halfwords within the low 32-bit word
-    let ops = vec![op(1, 0xFFFF, 1, true, false, 0)];
+    let ops = vec![op(1, 0, 0xFFFF, 1, true, false, 0)];
     let trace = generate_commit_trace(&ops);
     let r0 = trace.main_table.get_row(0);
 
@@ -419,7 +429,7 @@ fn test_address_incr_halfword_carry() {
 fn test_bus_interactions_count() {
     use crate::tables::commit::bus_interactions;
     let interactions = bus_interactions();
-    assert_eq!(interactions.len(), 16);
+    assert_eq!(interactions.len(), 18);
 }
 
 #[test]

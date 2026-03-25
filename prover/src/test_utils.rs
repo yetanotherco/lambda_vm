@@ -352,20 +352,6 @@ pub fn collect_bitwise_ops_from_load(
         .collect()
 }
 
-/// Collect LT operations from MEMW operations.
-///
-/// The MEMW table sends LT lookups for:
-/// - Timestamp ordering: old_timestamp[i] < timestamp
-/// - Overflow checking: base_address < base_address + offset
-pub fn collect_lt_lookups_from_memw(
-    memw_ops: &[crate::tables::memw::MemwOperation],
-) -> Vec<LtOperation> {
-    memw_ops
-        .iter()
-        .flat_map(|op| op.collect_lt_lookups())
-        .collect()
-}
-
 // =============================================================================
 // Minimal Trace Generation (for testing/benchmarking only)
 // =============================================================================
@@ -380,7 +366,7 @@ pub fn generate_minimal_bitwise_trace(ops: &[BitwiseOperation]) -> TraceTable<F,
     use std::collections::HashMap;
 
     // Collect unique (lo_byte, hi_byte, shift) tuples and count multiplicities per lookup type
-    let mut row_data: HashMap<(u8, u8, u8), [u64; 11]> = HashMap::new();
+    let mut row_data: HashMap<(u8, u8, u8), [u64; 10]> = HashMap::new();
 
     for op in ops {
         let key = (op.x, op.y, op.z);
@@ -395,9 +381,8 @@ pub fn generate_minimal_bitwise_trace(ops: &[BitwiseOperation]) -> TraceTable<F,
             BitwiseOperationType::IsHalf => 7,
             BitwiseOperationType::IsB20 => 8,
             BitwiseOperationType::Hwsl => 9,
-            BitwiseOperationType::Hwslc => 10,
         };
-        row_data.entry(key).or_insert([0; 11])[mu_idx] += 1;
+        row_data.entry(key).or_insert([0; 10])[mu_idx] += 1;
     }
 
     // Need at least 4 rows for FRI, pad to power of 2
@@ -455,7 +440,6 @@ pub fn generate_minimal_bitwise_trace(ops: &[BitwiseOperation]) -> TraceTable<F,
         data[base + bitwise_cols::MU_IS_HALF] = FE::from(mus[7]);
         data[base + bitwise_cols::MU_IS_B20] = FE::from(mus[8]);
         data[base + bitwise_cols::MU_HWSL] = FE::from(mus[9]);
-        data[base + bitwise_cols::MU_HWSLC] = FE::from(mus[10]);
     }
 
     TraceTable::new_main(data, bitwise_cols::NUM_COLUMNS, 1)
