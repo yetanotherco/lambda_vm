@@ -1,6 +1,7 @@
 pub mod air_tests;
 pub mod boundary_tests;
 pub mod bus_tests;
+pub mod fri_arity_tests;
 pub mod fri_tests;
 pub mod proof_options_tests;
 pub mod prove_verify_roundtrip_tests;

@@ -716,7 +716,7 @@ pub trait IsStarkVerifier<
         zeta_base: &FieldElement<FieldExtension>,
         log_arity: usize,
         domain_log_size: u64,
-        mut leaf_index: usize,
+        leaf_index: usize,
         coset_offset: &FieldElement<Field>,
     ) -> FieldElement<FieldExtension>
     where
@@ -737,10 +737,12 @@ pub trait IsStarkVerifier<
             let omega = Field::get_primitive_root_of_unity(half_domain_order).unwrap();
 
             // Compute inverse twiddles for this sub-fold level.
-            // The inv_twiddles correspond to pairs at global positions
-            // (leaf_index * values.len() + 2*j) in the full evaluation array.
-            // Each twiddle is 1/(coset_offset * omega^(bit_reverse(global_pair_idx, log(N/2))))
-            // where global_pair_idx = leaf_index * half + j.
+            // `global_pair_idx = leaf_index * half + j` gives the pair position in the full
+            // evaluation array. `leaf_index` stays constant across sub-folds because:
+            //   - sub-fold 1: half = group_size/2. global_pair_idx = leaf_index * (group_size/2) + j. ✓
+            //   - sub-fold 2: half = group_size/4. global_pair_idx = leaf_index * (group_size/4) + j. ✓
+            // Each successive sub-fold halves `half`, so the product `leaf_index * half` correctly
+            // tracks the pair position in the correspondingly smaller domain.
             let mut inv_twiddles: Vec<FieldElement<Field>> = Vec::with_capacity(half);
             let half_log_bits = (current_domain_size / 2) as u64;
             for j in 0..half {
@@ -765,7 +767,6 @@ pub trait IsStarkVerifier<
             challenge = challenge.square();
             current_domain_log -= 1;
             current_offset = current_offset.square();
-            leaf_index >>= 1;
         }
 
         debug_assert_eq!(values.len(), 1);

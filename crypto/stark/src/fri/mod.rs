@@ -21,9 +21,18 @@ use self::fri_functions::{
 /// Supports configurable folding arity (`log_arity` binary folds per Merkle commit)
 /// and early termination (`log_final_poly_len` remaining evaluations sent as coefficients).
 ///
-/// With `log_arity=1, log_final_poly_len=0` this reproduces the standard arity-2 FRI.
-/// With `log_arity=2` (arity-4), each round folds twice before committing, halving
-/// the number of Merkle trees.
+/// Protocol structure (matches the verifier's expectations):
+/// - Round 0: receive challenge ζ₀, fold **1×** (always arity-2 initial fold), commit p₁.
+///   This corresponds to the verifier's "initial fold: always arity-2 from DEEP composition".
+/// - Rounds 1+: receive challenge ζₖ, fold **log_arity×**, commit pₖ.
+///   The verifier folds each committed layer's group by log_arity sub-folds using ζₖ.
+/// - Last round: fold log_arity×, **no commit** — send final polynomial coefficients.
+///
+/// `total_folds` is adjusted so that `(total_folds - 1)` is divisible by `log_arity`,
+/// ensuring every non-initial round does exactly `log_arity` folds.
+/// The final polynomial may have > 1 element when `log_arity > 1`.
+///
+/// For `log_arity=1` this reproduces the standard arity-2 FRI exactly.
 pub fn commit_phase_from_evaluations<F: IsFFTField + IsSubFieldOf<E>, E: IsField>(
     number_layers: usize,
     mut evals: Vec<FieldElement<E>>,
@@ -42,21 +51,44 @@ where
 {
     let mut inv_twiddles = compute_coset_twiddles_inv(coset_offset, domain_size);
 
-    // Total binary folds: the old code always did at least 1 fold (the "final fold"),
-    // plus (number_layers - 1) committed folds. Early termination reduces by log_final_poly_len.
-    let total_folds = number_layers.max(1).saturating_sub(log_final_poly_len);
+    // Maximum binary folds available given the domain and desired final poly length.
+    let max_folds = number_layers.max(1).saturating_sub(log_final_poly_len);
+
+    // Adjust total_folds so that (total_folds - 1) is divisible by log_arity.
+    // This ensures every non-initial round does exactly log_arity folds, matching
+    // the verifier which always folds log_arity times per committed layer.
+    // For log_arity=1 this is a no-op (any value satisfies (T-1) % 1 == 0).
+    let total_folds = if max_folds == 0 {
+        0
+    } else {
+        // Largest T ≤ max_folds with T = 1 + n*log_arity for integer n ≥ 0.
+        let n = (max_folds - 1) / log_arity;
+        1 + n * log_arity
+    };
+
+    // Number of committed FRI layers: all rounds except the last (final poly round).
     let num_committed_rounds = if total_folds > 0 {
+        // Round 0 always commits (1 fold). Rounds 1..k commit every log_arity folds.
+        // Total committed = 1 + (total_folds - 1) / log_arity - 1 = (total_folds - 1) / log_arity.
         (total_folds - 1) / log_arity
     } else {
         0
     };
+
+    // Leaf grouping for Merkle trees: verifier always folds log_arity sub-folds per layer.
+    let group_size = 1usize << log_arity;
+
     let mut fri_layer_list = Vec::with_capacity(num_committed_rounds);
     let mut current_coset_offset = coset_offset.clone();
     let mut current_domain_size = domain_size;
     let mut folds_done = 0;
+    let mut is_first_round = true;
 
     while folds_done < total_folds {
-        let folds_this_round = log_arity.min(total_folds - folds_done);
+        // Round 0 always folds exactly 1 time (the "initial arity-2 fold").
+        // All subsequent rounds fold exactly log_arity times.
+        let folds_this_round = if is_first_round { 1 } else { log_arity };
+        is_first_round = false;
         let is_last_round = folds_done + folds_this_round >= total_folds;
 
         // <<<< Receive challenge: one per committed round
@@ -74,9 +106,10 @@ where
         }
         folds_done += folds_this_round;
 
-        // Commit post-fold evaluations (skip for last round — final poly sent separately)
+        // Commit post-fold evaluations (skip for last round — final poly sent separately).
+        // Leaves always group `group_size = 2^log_arity` elements so the verifier
+        // can open and fold an entire arity-k coset at each query.
         if !is_last_round {
-            let group_size = 1usize << folds_this_round;
             let leaves: Vec<Vec<FieldElement<E>>> = evals
                 .chunks_exact(group_size)
                 .map(|chunk| chunk.to_vec())
