@@ -109,25 +109,23 @@ The interactions with the wider system.
 
 We constrain `arg1`, `arg2` and `rvd` to correspond to the wanted values, including the appropriate sign/zero extension, depending on `word_instr`.
 
-| Tag | Description | Multiplicity |
-|-----|-------------|--------------|
-| `CPU-CE57` | (`rv1_sign_bit` or `arg2_sign_bit` or `res_sign_bit`) => `word_instr` |  |
-| | _polynomial:_ `(rv1_sign_bit + arg2_sign_bit + res_sign_bit) * (1 - word_instr) = 0` | |
-| `CPU-CE58` | `MSB16[rv1_sign_bit; rv1[1]]` | word_instr |
-| `CPU-CE59` | `arg1[:4]` = `rv1[:2]` |  |
-| | _polynomial:_ `(arg1::DWordWL)[0] - (rv1::DWordWL)[0] = 0` | |
-| `CPU-CE60` | `arg1[4:]` = `rv1[2]` dot (1 - `word_instr`) + (2^(32) - 1) dot `rv1_sign_bit` dot `signed` |  |
-| | _polynomial:_ `(arg1::DWordWL)[1] - (1 - word_instr) * rv1[2] - signed * rv1_sign_bit * (2^32 - 1) = 0` | |
-| `CPU-CE61` | `MSB16[arg2_sign_bit; rv2[1]]` | word_instr |
-| `CPU-CE62` | `arg2[:4]` = (1 - `LOAD`) dot `rv2[:2]` + (1 - `BEQ` - `BLT` - `STORE`) dot `imm[0]` |  |
-| | _polynomial:_ `(arg2::DWordWL)[0] - (1 - LOAD) * (rv2::DWordWL)[0] - (1 - BEQ - BLT - STORE) * imm[0] = 0` | |
-| `CPU-CE63` | `arg2[4:]` = (1 - `LOAD`) dot ((1 - `word_instr`) dot `rv2[2]` + `signed` dot `arg2_sign_bit` dot (2^(32) - 1)) + (1 - `BEQ` - `BLT` - `STORE`) dot `imm[1]` |  |
-| | _polynomial:_ `(arg2::DWordWL)[1] - (1 - LOAD) * (1 - word_instr) * rv2[2] - (1 - LOAD) * signed * arg2_sign_bit * (2^32 - 1) - (1 - BEQ - BLT - STORE) * imm[1] = 0` | |
-| `CPU-CE64` | `MSB8[res_sign_bit; res[3]]` | word_instr |
-| `CPU-CE65` | `!LOAD` => `rvd[0]` = `res[:4]` |  |
-| | _polynomial:_ `(1 - LOAD) * (rvd[0] - (res::DWordWL)[0]) = 0` | |
-| `CPU-CE66` | `!LOAD` => `rvd[1]` = (1 - `word_instr`) dot `res[4:]` + `res_sign_bit` dot (2^(32) - 1) |  |
-| | _polynomial:_ `(1 - LOAD) * (rvd[1] - (1 - word_instr) * (res::DWordWL)[1] - res_sign_bit * (2^32 - 1)) = 0` | |
+| Tag | Description |
+|-----|-------------|
+| `CPU-CE57` | `SIGN<rv1_ext_bit; rv1[1], word_instr>` |
+| `CPU-CE58` | `arg1[:4]` = `rv1[:2]` |
+| | _polynomial:_ `(arg1::DWordWL)[0] - (rv1::DWordWL)[0] = 0` |
+| `CPU-CE59` | `arg1[4:]` = `rv1[2]` dot (1 - `word_instr`) + (2^(32) - 1) dot `rv1_ext_bit` dot `signed` |
+| | _polynomial:_ `(arg1::DWordWL)[1] - (1 - word_instr) * rv1[2] - signed * rv1_ext_bit * (2^32 - 1) = 0` |
+| `CPU-CE60` | `SIGN<rv2_ext_bit; rv2[1], word_instr>` |
+| `CPU-CE61` | `arg2[:4]` = (1 - `LOAD`) dot `rv2[:2]` + (1 - `BEQ` - `BLT` - `STORE`) dot `imm[0]` |
+| | _polynomial:_ `(arg2::DWordWL)[0] - (1 - LOAD) * (rv2::DWordWL)[0] - (1 - BEQ - BLT - STORE) * imm[0] = 0` |
+| `CPU-CE62` | `arg2[4:]` = (1 - `LOAD`) dot ((1 - `word_instr`) dot `rv2[2]` + `signed` dot `rv2_ext_bit` dot (2^(32) - 1)) + (1 - `BEQ` - `BLT` - `STORE`) dot `imm[1]` |
+| | _polynomial:_ `(arg2::DWordWL)[1] - (1 - LOAD) * (1 - word_instr) * rv2[2] - (1 - LOAD) * signed * rv2_ext_bit * (2^32 - 1) - (1 - BEQ - BLT - STORE) * imm[1] = 0` |
+| `CPU-CE63` | `SIGN<res_ext_bit; (res::DWordHL)[1], word_instr>` |
+| `CPU-CE64` | `!LOAD` => `rvd[0]` = `res[:4]` |
+| | _polynomial:_ `(1 - LOAD) * (rvd[0] - (res::DWordWL)[0]) = 0` |
+| `CPU-CE65` | `!LOAD` => `rvd[1]` = (1 - `word_instr`) dot `res[4:]` + `res_ext_bit` dot (2^(32) - 1) |
+| | _polynomial:_ `(1 - LOAD) * (rvd[1] - (1 - word_instr) * (res::DWordWL)[1] - res_ext_bit * (2^32 - 1)) = 0` |
 
 ## Other constraints
 
@@ -135,11 +133,11 @@ For [cpu:c:is_equal], note that [cpu:c:sub] sets `res` to be the difference betw
 
 | Tag | Description | Multiplicity |
 |-----|-------------|--------------|
-| `CPU-CO67` | `ZERO[is_equal; res[0] + res[1] + res[2] + res[3] + res[4] + res[5] + res[6] + res[7]]` | BEQ |
-| `CPU-CO68` | `branch_cond` = `JALR` or (`BLT` and (`res` xor `invert`)) or (`BEQ` and (`is_equal` xor `invert`)) |  |
+| `CPU-CO66` | `ZERO[is_equal; res[0] + res[1] + res[2] + res[3] + res[4] + res[5] + res[6] + res[7]]` | BEQ |
+| `CPU-CO67` | `branch_cond` = `JALR` or (`BLT` and (`res` xor `invert`)) or (`BEQ` and (`is_equal` xor `invert`)) |  |
 | | _polynomial:_ `-branch_cond + JALR + res[0] * (1 - mp_selector) * BLT + (1 - res[0]) * mp_selector * BLT + is_equal * (1 - mp_selector) * BEQ + (1 - is_equal) * mp_selector * BEQ = 0` | |
-| `CPU-CO69` | `BRANCH[next_pc; pc, imm, arg1::DWordWL, JALR]` | branch_cond |
-| `CPU-CO70` | `ADD<next_pc; pc, (2 * c_type_instruction + 4 * (1 - c_type_instruction)) * 1::DWordWL>` |  |
+| `CPU-CO68` | `BRANCH[next_pc; pc, imm, arg1::DWordWL, JALR]` | branch_cond |
+| `CPU-CO69` | `ADD<next_pc; pc, (2 * c_type_instruction + 4 * (1 - c_type_instruction)) * 1::DWordWL>` |  |
 
 > **Note:** Document the choice to not have a multiplicity column here for padding
 
@@ -202,11 +200,11 @@ This approach minimizes the number of dependent lookups, increasing only multipl
 |------|------|-------------|
 | `rv1` | `DWordWHH` | The value of register `rs1` |
 | `rv2` | `DWordWHH` | The value of register `rs2` |
-| `rv1_sign_bit` | `Bit` | The sign bit of `rv1` if seen as a 32-bit word |
+| `rv1_ext_bit` | `Bit` | The sign bit of `rv1` if seen as a 32-bit word, used for sign extension with `word_instr` |
 | `arg1` | `DWordBL` | The extended version of `rv1`, depending on `word_instr` |
-| `arg2_sign_bit` | `Bit` | The sign bit of `arg2` if seen as a 32-bit word |
+| `rv2_ext_bit` | `Bit` | The sign bit of `rv2` if seen as a 32-bit word, used for sign extension with `word_instr` |
 | `arg2` | `DWordBL` | A multiplexed version of `rv2` and `imm`, to be used as second argument to ALU calls |
-| `res_sign_bit` | `Bit` | The sign bit of `res`, if seen as a 32-bit word |
+| `res_ext_bit` | `Bit` | The sign bit of `res`, if seen as a 32-bit word, used for sign extension with `word_instr` |
 | `res` | `DWordBL` | The ALU result |
 | `is_equal` | `Bit` | Whether `rv1` and `arg2` are equal |
 | `branch_cond` | `Bit` | Whether a branch is taken, i.e., the branch condition |

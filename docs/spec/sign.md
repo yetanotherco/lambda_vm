@@ -6,6 +6,8 @@ It constrains that `sign` is set to `1` when both `X`'s most significant bit and
 
 = Assumptions The  template operates on the following assumptions:
 
+If `sign` is set to `1`, `X` will be range-checked to be a halfword, and hence proving may fail if this is not ensured.
+
 = Constraints It takes only two constraints to compute the `sign` of `X`, given whether `X` represents a `signed` value or not. When ``signed` = 1`, the sign of `X` is equal to its most significant bit. This value is extracted in [sign:c:sign_if_signed]. If `X` is unsigned (i.e., ``signed` = 0`), its sign is always `0`. This is constrained by [sign:c:sign_if_unsigned].
 
 ## Columns
@@ -27,8 +29,7 @@ It constrains that `sign` is set to `1` when both `X`'s most significant bit and
 
 | Tag | Range | Description |
 |-----|-------|-------------|
-| `SIGN-A1` |  | `IS_HALF[X]` |
-| `SIGN-A2` |  | `IS_BIT<signed>` |
+| `SIGN-A1` |  | `IS_BIT<signed>` |
 
 ## Constraints
 
