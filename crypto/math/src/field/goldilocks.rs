@@ -270,8 +270,8 @@ pub(crate) fn dot_product_2(a0: u64, b0: u64, a1: u64, b1: u64) -> u64 {
     if overflow {
         // True value is sum + 2^128. Since 2^128 mod p = EPSILON^2,
         // add EPSILON^2 = (2^32-1)^2 = 2^64 - 2^33 + 1.
-        // This value is < p, and reduced < 2p, so their sum < 3p < 2^64 + p,
-        // satisfying the precondition for add_no_canonicalize.
+        // Safety: reduced < 2^64 (it's a u64), EPSILON_SQ < p,
+        // so reduced + EPSILON_SQ < 2^64 + p, satisfying add_no_canonicalize's precondition.
         branch_hint();
         const EPSILON_SQ: u64 = EPSILON.wrapping_mul(EPSILON);
         unsafe { add_no_canonicalize_trashing_input(reduced, EPSILON_SQ) }
