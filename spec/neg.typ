@@ -1,10 +1,13 @@
 #import "/book.typ": book-page, et
 #import "/src.typ": load_config, load_chip
-#import "/chip.typ": render_chip_column_table, render_chip_assumptions, render_constraint_table
+#import "/chip.typ": render_chip_column_table, render_chip_assumptions, render_constraint_table, set_nr_interactions, get_nr_interactions,
 
 #let config = load_config()
 #let chip = load_chip("src/neg.toml", config)
 #show: book-page(chip.name)
+
+#set_nr_interactions(chip)
+#let nr_interactions = get_nr_interactions(chip)
 
 #let neg = raw(chip.name)
 
@@ -12,6 +15,7 @@
 It requires `cond` to be a bit.
 
 = Variables
+This template introduces #nr_interactions interaction(s).
 #render_chip_column_table(chip, config)
 
 = Assumptions

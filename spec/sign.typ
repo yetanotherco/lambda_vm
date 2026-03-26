@@ -1,11 +1,13 @@
 #import "/book.typ": book-page
 #import "/src.typ": load_config, load_chip
-#import "/chip.typ": render_chip_column_table,   render_chip_assumptions, render_constraint_table
-
+#import "/chip.typ": render_chip_column_table,   render_chip_assumptions, render_constraint_table, set_nr_interactions, get_nr_interactions,
 
 #let config = load_config()
 #let chip = load_chip("src/sign.toml", config)
 #show: book-page(chip.name)
+
+#set_nr_interactions(chip)
+#let nr_interactions = get_nr_interactions(chip)
 
 #let sign = raw(chip.name)
 
@@ -13,7 +15,7 @@
 It constrains that `sign` is set to `1` when both `X`'s most significant bit and `signed` are $1$, and $0$ otherwise.
 
 = Variables
-The #sign template operates on three variables:
+The #sign template operates on three variables and introduces #nr_interactions interaction(s):
 #render_chip_column_table(chip, config)
 
 = Assumptions

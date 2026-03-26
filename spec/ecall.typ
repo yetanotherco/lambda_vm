@@ -4,6 +4,8 @@
   render_chip_column_table,
   total_nr_variables,
   total_nr_instantiated_columns,
+  set_nr_interactions,
+  get_nr_interactions,
   render_constraint_table,
   render_chip_assumptions,
   render_chip_padding_table,
@@ -32,8 +34,10 @@ where `A0`-`A7` are symbolic names for the registers `x10`-`x17`
 == Columns
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
+#set_nr_interactions(chip)
+#let nr_halt_interactions = get_nr_interactions(chip)
 
-The #halt chip leverages #nr_variables variable, spanning #nr_columns columns:
+The #halt chip leverages #nr_variables variable, spanning #nr_columns columns and leverages #nr_halt_interactions interaction(s):
 #render_chip_column_table(chip, config)
 
 == Assumptions
@@ -76,8 +80,10 @@ As such, no padding is defined.
 == Columns
 #let nr_variables = total_nr_variables(chip)
 #let nr_columns = total_nr_instantiated_columns(chip, config)
+#set_nr_interactions(chip)
+#let nr_commit_interactions = get_nr_interactions(chip)
 
-The #commit chip leverages #nr_variables variables, spanning #nr_columns columns:
+The #commit chip leverages #nr_variables variables, spanning #nr_columns columns and leverages #nr_commit_interactions interactions:
 #render_chip_column_table(chip, config)
 
 == Constraints
