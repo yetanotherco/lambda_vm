@@ -876,8 +876,8 @@ fn collect_bitwise_from_memw_aligned(ops: &[MemwOperation]) -> Vec<BitwiseOperat
     let mut bitwise_ops = Vec::with_capacity(ops.len());
 
     for op in ops {
-        let low_half = (op.base_address & 0xFFFF) as u16;
-        let mask: u16 = match op.width {
+        let low_half = (op.base_address & 0xFFFF) as u32;
+        let mask: u32 = match op.width {
             2 => 1,
             4 => 3,
             8 => 7,
@@ -886,6 +886,10 @@ fn collect_bitwise_from_memw_aligned(ops: &[MemwOperation]) -> Vec<BitwiseOperat
 
         // IS_HALF[base_address[0] + mask]
         let value = low_half + mask;
+        debug_assert!(
+            value <= 0xFFFF,
+            "misaligned: base_address[0] + mask overflows halfword"
+        );
         let x = (value & 0xFF) as u8;
         let y = ((value >> 8) & 0xFF) as u8;
         bitwise_ops.push(BitwiseOperation::halfword(
