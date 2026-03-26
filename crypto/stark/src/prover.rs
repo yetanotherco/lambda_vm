@@ -1631,18 +1631,6 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let main_commits_elapsed = phase_start.elapsed();
 
-        // Re-spill main traces that were rehydrated by extract_columns_main_into
-        // during Phase A. After Phase A the pool holds the LDE data (already
-        // snapshotted to mmap above), so the original trace data is no longer
-        // needed in heap — push it back to mmap to free RAM for aux trace building.
-        #[cfg(feature = "disk-spill")]
-        for (_, trace, _) in air_trace_pairs.iter_mut() {
-            trace
-                .main_table
-                .spill_to_disk()
-                .map_err(|e| ProvingError::WrongParameter(format!("disk-spill late main: {e}")))?;
-        }
-
         // =====================================================================
         // Round 1, Phase B: Sample shared LogUp challenges
         // =====================================================================
