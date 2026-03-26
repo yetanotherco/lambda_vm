@@ -576,6 +576,24 @@ pub fn create_memw_aligned_air(proof_options: &ProofOptions) -> VmAir {
     .with_name("MEMW_A")
 }
 
+/// Create MEMW_A_DUMMY AIR: same bus interactions as MEMW_A but zero AIR constraints.
+///
+/// Used to isolate whether performance cost comes from constraint evaluation vs bus interaction cost.
+pub fn create_memw_aligned_dummy_air(proof_options: &ProofOptions) -> VmAir {
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: memw_aligned_bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        memw_aligned_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        vec![],
+    )
+    .with_name("MEMW_A_DUMMY")
+}
+
 /// Create LOAD AIR with constraints and bus interactions.
 pub fn create_load_air(proof_options: &ProofOptions) -> VmAir {
     let transition_constraints = load_constraints();
