@@ -670,7 +670,7 @@ jobs:
 
             // --- Section 1: Primary benchmark ---
             const nLabel = parseInt(runs) > 1 ? ` (median of ${runs})` : '';
-            let body = `## Benchmark — fib_iterative_2M${nLabel}\n\n`;
+            let body = `## Benchmark — fib_iterative_8M${nLabel}\n\n`;
             body += `<sub>Table parallelism: 32 (auto = cores / 3)</sub>\n\n`;
             body += `| Metric | main | PR | Δ |\n`;
             body += `|--------|------|----|---|\n`;
@@ -725,8 +725,8 @@ jobs:
             if (prGrowthHeaps) {
               const prHeaps = prGrowthHeaps.split('/');
               const baseHeaps = baseGrowthHeaps ? baseGrowthHeaps.split('/') : null;
-              const labels = ['250k', '500k', '1M', '2M'];
-              const programs = ['fib_iterative_250k', 'fib_iterative_500k', 'fib_iterative_1M', 'fib_iterative_2M'];
+              const labels = ['1M', '2M', '4M', '8M'];
+              const programs = ['fib_iterative_1M', 'fib_iterative_2M', 'fib_iterative_4M', 'fib_iterative_8M'];
 
               body += `\n## Memory Growth\n\n`;
               body += `<sub>Measured with \`TABLE_PARALLELISM=1\` (sequential) · best of 2 samples per point</sub>\n\n`;
@@ -791,6 +791,7 @@ jobs:
             // Find existing comment (check both old and new markers for transition)
             const existing = comments.find(c =>
               c.user.type === 'Bot' && (
+                c.body.includes('Benchmark — fib_iterative_8M') ||
                 c.body.includes('Benchmark — fib_iterative_2M') ||
                 c.body.includes('Benchmark — fib_iterative_372k')
               )
