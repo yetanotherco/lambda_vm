@@ -33,6 +33,7 @@ use self::fri_functions::{
 /// The final polynomial may have > 1 element when `log_arity > 1`.
 ///
 /// For `log_arity=1` this reproduces the standard arity-2 FRI exactly.
+#[allow(clippy::type_complexity)]
 pub fn commit_phase_from_evaluations<F: IsFFTField + IsSubFieldOf<E>, E: IsField>(
     number_layers: usize,
     mut evals: Vec<FieldElement<E>>,

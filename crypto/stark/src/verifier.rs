@@ -610,6 +610,7 @@ pub trait IsStarkVerifier<
     /// `deep_composition_evaluation_sym`: precomputed value of p₀(-𝜐).
     /// `log_arity`: log2 of the folding arity per committed round (1=arity-2, 2=arity-4, etc.)
     /// `domain`: verifier domain for computing twiddle factors on-the-fly.
+    #[allow(clippy::too_many_arguments)]
     fn verify_query_and_sym_openings(
         proof: &StarkProof<Field, FieldExtension, PI>,
         zetas: &[FieldElement<FieldExtension>],
