@@ -1587,36 +1587,8 @@ pub trait IsStarkProver<
                 }
                 transcript.append_bytes(&root);
 
-                #[allow(unused_mut)]
-                let mut main_tree = Arc::new(tree);
-                #[cfg(feature = "disk-spill")]
-                {
-                    Arc::get_mut(&mut main_tree)
-                        .expect("sole Arc owner")
-                        .spill_nodes_to_disk()
-                        .map_err(|e| {
-                            ProvingError::WrongParameter(format!(
-                                "disk-spill main Merkle tree: {e}"
-                            ))
-                        })?;
-                }
-
-                let precomputed_tree = pre_tree.map(|t| {
-                    let mut arc = Arc::new(t);
-                    #[cfg(feature = "disk-spill")]
-                    {
-                        Arc::get_mut(&mut arc)
-                            .expect("sole Arc owner")
-                            .spill_nodes_to_disk()
-                            .map_err(|e| {
-                                ProvingError::WrongParameter(format!(
-                                    "disk-spill precomputed Merkle tree: {e}"
-                                ))
-                            })
-                            .unwrap();
-                    }
-                    arc
-                });
+                let main_tree = Arc::new(tree);
+                let precomputed_tree = pre_tree.map(Arc::new);
 
                 main_commits.push(MainCommitData {
                     main_tree,
@@ -1746,21 +1718,9 @@ pub trait IsStarkProver<
             // Sequential: append aux roots to forked transcripts
             #[allow(unused_variables)]
             for (j, result) in chunk_aux.into_iter().enumerate() {
-                #[allow(unused_mut)]
-                let (mut aux_tree, aux_root) = result?;
+                let (aux_tree, aux_root) = result?;
                 if let Some(ref root) = aux_root {
                     table_transcripts[chunk_start + j].append_bytes(root);
-                }
-
-                // Spill aux Merkle tree nodes to disk.
-                #[cfg(feature = "disk-spill")]
-                if let Some(ref mut tree_arc) = aux_tree {
-                    Arc::get_mut(tree_arc)
-                        .expect("sole Arc owner")
-                        .spill_nodes_to_disk()
-                        .map_err(|e| {
-                            ProvingError::WrongParameter(format!("disk-spill aux Merkle tree: {e}"))
-                        })?;
                 }
 
                 aux_results.push((aux_tree, aux_root));
