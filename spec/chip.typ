@@ -24,6 +24,49 @@
   .sum()
 }
 
+#let set_nr_interactions(chip) = {
+  let constraints = chip
+    .constraints
+    .values()
+    .flatten()
+
+  // nr. of direct interactions
+  let nr-direct-interactions = constraints
+    .filter(c=>c.kind == "interaction")
+    .map(c => {
+      let x = c.at("iter", default: (0, 0, 0))
+      x.at(2) - x.at(1) + 1
+    })
+    .sum(default: 0)
+  
+  let template-constraints = constraints.filter(c=>c.kind == "template")
+
+  context {
+    let lookup-table = query(<interaction_count>).map(x => x.value).sum(default:(:))
+
+    // nr. of indirect interactions through templates
+    let nr-indirect-interactions = template-constraints
+      .map(c => {
+        let x = c.at("iter", default: (0, 0, 0))
+        let iter-size = x.at(2) - x.at(1) + 1
+
+        let template-interactions = lookup-table.at(c.tag, default: 0)
+        iter-size * template-interactions 
+      })
+      .sum(default: 0)
+
+    let total-nr-interactions = nr-direct-interactions + nr-indirect-interactions
+
+    [#metadata((chip.name: total-nr-interactions)) <interaction_count>]
+  }
+}
+
+#let get_nr_interactions(chip) = {
+  context {
+    query(<interaction_count>).map(c=>c.value).sum().at(chip.name)
+  }
+}
+
 // Return a list of iterators needed by `obj`. Taken from `iters` or `iter`.
 // Prepend `name` to every iterator, if given.
 #let iters_of(obj, name: none) = {
