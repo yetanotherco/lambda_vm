@@ -25,7 +25,7 @@ The #lt chip constrains an indicator bit for the less-than relation, signed or u
 #set_nr_interactions(chip)
 #let nr_interactions = get_nr_interactions(chip)
 
-The `LT` chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
+The #lt chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
 #render_chip_column_table(chip, config)
 
 = Assumptions

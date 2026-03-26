@@ -25,7 +25,7 @@ The #branch chip computes the target address of a branching instruction.
 #set_nr_interactions(chip)
 #let nr_interactions = get_nr_interactions(chip)
 
-The `BRANCH` chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
+The #branch chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
 #render_chip_column_table(chip, config)
 
 = Assumptions

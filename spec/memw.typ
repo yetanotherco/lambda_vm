@@ -29,7 +29,7 @@ in order to satisfy the design of the memory argument (@memory).
 #set_nr_interactions(chip)
 #let nr_memw_interactions = get_nr_interactions(chip)
 
-The `MEMW` chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_memw_interactions interaction(s):
+The #memw chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_memw_interactions interaction(s):
 #render_chip_column_table(chip, config)
 
 = Assumptions

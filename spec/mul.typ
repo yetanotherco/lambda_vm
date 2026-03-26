@@ -27,7 +27,7 @@ as well as providing access to the low and high halfs of the multiplication resu
 #set_nr_interactions(chip)
 #let nr_interactions = get_nr_interactions(chip)
 
-The `MUL` chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
+The #mul chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
 #render_chip_column_table(chip, config)
 
 #let stackrel(top, bottom) = {

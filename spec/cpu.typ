@@ -26,7 +26,7 @@ It bases its decisions on the entry of the `DECODE` table (@decode) correspondin
 #set_nr_interactions(chip)
 #let nr_interactions = get_nr_interactions(chip)
 
-The `CPU` chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
+The #cpu chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
 #render_chip_column_table(chip, config)
 
 = Assumptions
